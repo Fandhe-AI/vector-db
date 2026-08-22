@@ -13,9 +13,10 @@
 //!   増分・全体再構築の両方に共通で、比較の本質と無関係なため）。
 //! - 共有 CI ランナーのノイズを吸収するため、ウォームアップ 1 回の後、増分・全体再構築を
 //!   各複数回計測し、外れ値に弱い平均ではなく中央値同士で比較する。
-//! - 判定閾値（1/10）は spec 所定の分母を維持する。ワークロード側（ベースライン行数を
-//!   厚め・増分行数を薄めに取る）でマージンを確保し、debug/release いずれのビルド
-//!   設定でも安定して通るようにする（実測値・spec 本文は転記しない）。
+//! - 判定閾値・ワークロード規模はいずれも本テスト固有の計測パラメータであり、
+//!   debug/release いずれのビルド設定でも安定して通るようマージンを持たせている
+//!   （spec 所定の完了条件の値そのものではなく、実測値・spec 本文も転記しない。
+//!   対象ビヘイビアは TASK-143／PERSIST-2／`docs/spec/04-behavior/persistence.md` を参照）。
 //!
 //! `tests/persistence.rs` とのヘルパ（`unique_db_path` / `CleanupGuard` / 行生成）共通化
 //! （`tests/common/mod.rs` 化）は本 Issue のスコープ外とし、小さく複製するに留める
@@ -68,15 +69,15 @@ const EMBEDDING_DIM: usize = 128;
 const BASELINE_ROWS: u64 = 100_000;
 
 /// 1 回の増分書き込みで追加する行数（ベースラインに対して十分小さく保ち、
-/// 増分が全体再構築の 1/10 以下で終わるという期待に現実的なマージンを持たせる）。
+/// 判定閾値に対して現実的なマージンを持たせる）。
 const INCREMENTAL_ROWS: u64 = 400;
 
 /// ノイズ対策として、増分・全体再構築それぞれを複数回計測し中央値を取る回数。
 const MEASUREMENT_ROUNDS: usize = 3;
 
 /// 判定閾値の分母（増分書き込みは全体再構築の `1 / RATIO_THRESHOLD_DENOM` 以下の
-/// 時間で完了すること）。TASK-143 完了条件所定の値を維持し、緩和しない
-/// （`.claude/rules/coding-rust.md` のアサーション弱体化禁止に従う）。
+/// 時間で完了すること）。本テストの計測パラメータであり、アサーション弱体化は行わない
+/// （`.claude/rules/coding-rust.md` 参照）。対象ビヘイビアは TASK-143／PERSIST-2 を参照。
 const RATIO_THRESHOLD_DENOM: u32 = 10;
 
 /// 外部クレート非依存の決定的擬似乱数生成器（xorshift32）。
@@ -154,10 +155,10 @@ fn median(mut values: Vec<Duration>) -> Duration {
     values[values.len() / 2]
 }
 
-// 対象ビヘイビア: PERSIST-2（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
-// TASK-143: 増分書き込みが全体再構築の 1/10 以下の時間で完了することを検証する。
+// 対象ビヘイビア: PERSIST-2（ポインタ: docs/spec/04-behavior/persistence.md、TASK-143）。
+// 増分書き込みが全体再構築より十分速いことを判定閾値（RATIO_THRESHOLD_DENOM）で検証する。
 #[test]
-fn persist2_incremental_write_completes_within_tenth_of_full_rebuild() {
+fn persist2_incremental_write_completes_within_ratio_threshold_of_full_rebuild() {
     // 1. ベースライン DB を事前構築する（この書き込み自体は計測対象外）。
     let baseline_path = unique_db_path("baseline");
     let _baseline_cleanup = CleanupGuard(baseline_path.clone());
