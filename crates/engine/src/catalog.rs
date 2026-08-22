@@ -478,6 +478,46 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
     }
 }
 
+/// write トランザクション内でカタログテーブルから `table_name` のスキーマを取得する
+/// （TASK-146）。`insert_row_into_table` / `insert_rows_into_table` の共通前段処理。
+/// カタログテーブル自体が未作成の場合・該当エントリが存在しない場合のいずれも
+/// `CatalogError::TableNotFound` に一本化する（他テーブルの存在情報を漏らさない
+/// fail-closed な扱い。security.md「アクセス制御の不備」）。
+fn require_table_schema_write(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+) -> Result<TableSchema> {
+    let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(table_name.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let guard = catalog_table
+        .get(table_name)?
+        .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+    decode_schema(table_name, guard.value())
+}
+
+/// read トランザクション内でカタログテーブルに `table_name` が定義済みかを確認する
+/// （TASK-146）。`get_row_from_table` / `scan_table_page` の共通前段処理。スキーマ本体は
+/// 呼び出し元が使わないため取得・デコードしない（[`require_table_schema_write`] と異なり
+/// 存在確認のみ）。判定方針は同様に fail-closed。
+fn require_table_exists_read(read_txn: &redb::ReadTransaction, table_name: &str) -> Result<()> {
+    let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(table_name.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if catalog_table.get(table_name)?.is_none() {
+        return Err(CatalogError::TableNotFound(table_name.to_string()));
+    }
+    Ok(())
+}
+
 /// カタログ DDL API。`Storage`（`storage.rs`）の拡張として実装し、
 /// `Storage::db()` を経由して `ROWS_TABLE` とは別のテーブル（[`CATALOG_TABLE`]）
 /// のみを読み書きする。行データへは一切アクセスしない（TABLE-4/TABLE-5）。
@@ -604,19 +644,7 @@ impl Storage {
         validate_identifier(table_name)?;
         let write_txn = self.db().begin_write()?;
         {
-            let schema = {
-                let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
-                    Ok(t) => t,
-                    Err(redb::TableError::TableDoesNotExist(_)) => {
-                        return Err(CatalogError::TableNotFound(table_name.to_string()))
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let guard = catalog_table
-                    .get(table_name)?
-                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-                decode_schema(table_name, guard.value())?
-            };
+            let schema = require_table_schema_write(&write_txn, table_name)?;
             schema.validate_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
@@ -645,19 +673,7 @@ impl Storage {
         }
         let write_txn = self.db().begin_write()?;
         {
-            let schema = {
-                let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
-                    Ok(t) => t,
-                    Err(redb::TableError::TableDoesNotExist(_)) => {
-                        return Err(CatalogError::TableNotFound(table_name.to_string()))
-                    }
-                    Err(e) => return Err(e.into()),
-                };
-                let guard = catalog_table
-                    .get(table_name)?
-                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-                decode_schema(table_name, guard.value())?
-            };
+            let schema = require_table_schema_write(&write_txn, table_name)?;
             let row_table_name = user_rows_table_name(table_name);
             let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
             let mut row_table = write_txn.open_table(row_table_def)?;
@@ -678,16 +694,7 @@ impl Storage {
     pub fn get_row_from_table(&self, table_name: &str, id: u64) -> Result<StorageRow> {
         validate_identifier(table_name)?;
         let read_txn = self.db().begin_read()?;
-        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(CatalogError::TableNotFound(table_name.to_string()))
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if catalog_table.get(table_name)?.is_none() {
-            return Err(CatalogError::TableNotFound(table_name.to_string()));
-        }
+        require_table_exists_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
         let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let row_table = match read_txn.open_table(row_table_def) {
@@ -720,16 +727,7 @@ impl Storage {
         }
 
         let read_txn = self.db().begin_read()?;
-        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(CatalogError::TableNotFound(table_name.to_string()))
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if catalog_table.get(table_name)?.is_none() {
-            return Err(CatalogError::TableNotFound(table_name.to_string()));
-        }
+        require_table_exists_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
         let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let row_table = match read_txn.open_table(row_table_def) {
