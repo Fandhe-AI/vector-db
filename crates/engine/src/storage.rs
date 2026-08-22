@@ -1077,14 +1077,22 @@ mod tests {
             let (backend, raw_db) = open_fresh();
             let storage = Storage { db: raw_db };
 
+            // embedding/metadata は空スライスにしない。空だと encoder/decoder が
+            // これらのフィールドを常に欠落させる退行があっても電源断前後の比較が
+            // 偶然一致してしまい、「全フィールド保持」を検証したことにならない。
+            let row1_embedding = [0.5_f32, -1.0, 2.25];
+            let row1_metadata = b"row1-metadata".to_vec();
+            let row2_embedding = [3.0_f32, 0.0, -4.5, 1.25];
+            let row2_metadata = b"row2-metadata".to_vec();
+
             storage
                 .put(
                     1,
                     &RowInput {
                         tenant_id: "tenant-a",
                         visibility: Visibility::Public,
-                        embedding: &[],
-                        metadata: &[],
+                        embedding: &row1_embedding,
+                        metadata: &row1_metadata,
                     },
                 )
                 .expect("put row 1 via production Storage API");
@@ -1094,8 +1102,8 @@ mod tests {
                     &RowInput {
                         tenant_id: "tenant-b",
                         visibility: Visibility::Private,
-                        embedding: &[],
-                        metadata: &[],
+                        embedding: &row2_embedding,
+                        metadata: &row2_metadata,
                     },
                 )
                 .expect("put row 2 via production Storage API");
@@ -1137,6 +1145,14 @@ mod tests {
             );
             assert_eq!(row1_after.tenant_id, "tenant-a");
             assert_eq!(row1_after.visibility, Visibility::Public);
+            assert_eq!(
+                row1_after.embedding, row1_embedding,
+                "row 1 の embedding フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+            assert_eq!(
+                row1_after.metadata, row1_metadata,
+                "row 1 の metadata フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
 
             let row2_after = recovered_storage
                 .get(2)
@@ -1147,6 +1163,14 @@ mod tests {
             );
             assert_eq!(row2_after.tenant_id, "tenant-b");
             assert_eq!(row2_after.visibility, Visibility::Private);
+            assert_eq!(
+                row2_after.embedding, row2_embedding,
+                "row 2 の embedding フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+            assert_eq!(
+                row2_after.metadata, row2_metadata,
+                "row 2 の metadata フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
         }
 
         // 否定コントロール: `sync_data()` を呼ばない限り `write()` の内容は

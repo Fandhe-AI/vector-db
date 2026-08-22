@@ -388,6 +388,15 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
         "commit に到達しなかったトランザクションの内容は電源断後に見えてはならない \
          （部分 write-back 像を使っても、ルートページは未コミットのため不到達）"
     );
+    for i in 0..64u64 {
+        assert_eq!(
+            get_row(&recovered, 1_000 + i),
+            None,
+            "id={}: commit に到達しなかった未コミット行が部分 write-back \
+             （他の行の write() 混入）によって可視化されてはならない",
+            1_000 + i
+        );
+    }
 }
 
 // シナリオ 3: 部分 write-back 像（page cache の書き戻し順序不定の近似）から再オープンした
@@ -491,6 +500,16 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
                      最後のコミット時点の内容と完全一致していなければならない \
                      （黙示的な欠落・すり替わりは fail-closed 違反として扱う）"
                 );
+                for i in 0..extra_writes {
+                    assert_eq!(
+                        get_row(&recovered, 100 + i),
+                        None,
+                        "seed={seed}, id={}: commit に到達しなかった未コミット行が部分 \
+                         write-back によって可視化されてはならない（部分適用像を \
+                         「正常」と誤判定してはならない）",
+                        100 + i
+                    );
+                }
                 opened_consistent += 1;
             }
         }
