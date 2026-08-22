@@ -1,0 +1,18 @@
+# wire-server: PostgreSQL wire プロトコル v3 互換の自作実装を持つバイナリクレート。
+# engine（コアロジック）を呼び出す接続ハンドリング層（.claude/rules/delegation-impl.md 参照）。
+# 外部プロトコルライブラリには依存しない方針（.claude/rules/dependency-policy.md）。
+[package]
+name = "wire-server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wire-server"
+path = "src/main.rs"
+
+[dependencies]
+# ワークスペース内 private クレートへの path 依存（バージョン指定なし）。
+# deny.toml の [bans] allow-wildcard-paths = true が本パターンを許容する。
+engine = { path = "../engine" }
