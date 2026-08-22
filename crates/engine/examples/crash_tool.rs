@@ -23,7 +23,12 @@
 
 use std::io::Write as _;
 
-use engine::storage::{RowInput, Storage};
+use engine::storage::{RowInput, Storage, Visibility};
+
+/// write/verify で固定して使うテナント識別子。本ツールは単一テナントの
+/// クラッシュ耐性（PERSIST-1）検証のみが目的で、RLS ポリシー評価そのものは
+/// 対象外のため、`RowInput::tenant_id` は固定値で足りる。
+const CRASH_TOOL_TENANT_ID: &str = "crash-tool-tenant";
 
 /// stdout への進捗出力間隔（行数）。`scripts/crash_test.sh` が
 /// 「書き込みが実際に進み始めた」ことを検知する同期点の頻度を決める
@@ -147,6 +152,8 @@ fn write_inner(path: &str) -> Result<(), String> {
     for row_no in 1..=MAX_ROWS {
         let (embedding, metadata) = derive_row(next_id);
         let row = RowInput {
+            tenant_id: CRASH_TOOL_TENANT_ID,
+            visibility: Visibility::Public,
             embedding: &embedding,
             metadata: &metadata,
         };
@@ -200,6 +207,22 @@ fn verify_inner(path: &str) -> Result<u64, String> {
                 return Err(format!(
                     "id gap or disorder: expected={expected_id} actual={}",
                     row.id
+                ));
+            }
+            // write が書き込んだ RLS フィールド（`tenant_id`・`visibility`）も
+            // 再オープン後に破損なく往復することを検証する（write 側の固定値と
+            // 突き合わせる。値そのものの意味検証ではなく、クラッシュ耐性
+            // オラクルの対象を write が実際に書く列に追随させるための確認）。
+            if row.tenant_id != CRASH_TOOL_TENANT_ID {
+                return Err(format!(
+                    "tenant_id mismatch at id={}: expected={CRASH_TOOL_TENANT_ID} actual={}",
+                    row.id, row.tenant_id
+                ));
+            }
+            if row.visibility != Visibility::Public {
+                return Err(format!(
+                    "visibility mismatch at id={}: expected=Public actual={:?}",
+                    row.id, row.visibility
                 ));
             }
             let (expected_embedding, expected_metadata) = derive_row(row.id);
