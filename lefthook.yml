@@ -29,8 +29,9 @@ pre-commit:
     # 拡張子 `.env` は旧パターンの検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
+        re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
         for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -qE '(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'; then
+          if printf '%s\n' "$f" | grep -qE "$re"; then
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
             exit 1
           fi
