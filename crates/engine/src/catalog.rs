@@ -555,6 +555,28 @@ impl Storage {
 mod tests {
     use super::*;
 
+    /// テストごとに一意な DB ファイルパスを払い出す（`storage.rs` の同名ヘルパーと
+    /// 同じ方針）。`list_tables` のテストは `Storage`（redb ファイル）を必要とするため、
+    /// この unit test モジュールにも複製する。
+    fn unique_db_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vector-db-engine-catalog-unit-{label}-{}-{seq}.redb",
+            std::process::id()
+        ));
+        path
+    }
+
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn validate_schema_rejects_more_than_one_vector_column() {
         let schema = TableSchema::new(
@@ -677,5 +699,59 @@ mod tests {
             vec![ColumnDef::new("body", ColumnType::Text, false)],
         );
         assert!(no_vector.validate_embedding_dim(384).is_err());
+    }
+
+    // --- Storage::list_tables ---------------------------------------------
+    // MAX_LIST_TABLES 上限超過時の Err 分岐（security.md「無制限リソース確保」対応）と、
+    // カタログテーブル未作成（空 DB）時の Ok(Vec::new()) 分岐を検証する。
+    // `MAX_LIST_TABLES` / `CATALOG_TABLE` が非公開のため、`tests/catalog.rs`
+    // （クレート外の統合テスト）ではなくこの unit test モジュールに置く。
+
+    #[test]
+    fn list_tables_returns_empty_vec_when_catalog_table_not_yet_created() {
+        let path = unique_db_path("list-tables-empty");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // 1 テーブルも create_table していない状態（catalog テーブル自体が未作成）。
+        let tables = storage.list_tables().expect("list_tables on empty db");
+        assert!(tables.is_empty());
+    }
+
+    #[test]
+    fn list_tables_rejects_when_exceeding_max_list_tables() {
+        let path = unique_db_path("list-tables-exceeds-max");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // MAX_LIST_TABLES を超える件数を用意する。create_table を MAX_LIST_TABLES+1 回
+        // 呼ぶと write txn ごとのコミットコストでテストが極端に遅くなるため、
+        // 単一の write txn へ直接まとめて挿入する（create_table の O(1) 契約検証は
+        // table4 系の統合テストの責務であり、ここでの目的は list_tables 自体の
+        // DoS 対策（security.md「無制限リソース確保」）の検証）。
+        let schema = TableSchema::new(
+            "seed",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let encoded = encode_schema(&schema).expect("encode seed schema");
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let mut table = write_txn.open_table(CATALOG_TABLE).expect("open_table");
+                for i in 0..=MAX_LIST_TABLES {
+                    let name = format!("t{i}");
+                    table
+                        .insert(name.as_str(), encoded.as_slice())
+                        .expect("insert seed row");
+                }
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        let result = storage.list_tables();
+        assert!(
+            matches!(result, Err(CatalogError::Invalid(_))),
+            "expected Err(Invalid) once table count exceeds MAX_LIST_TABLES, got {result:?}"
+        );
     }
 }
