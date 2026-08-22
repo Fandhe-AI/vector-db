@@ -1,0 +1,25 @@
+# 開発コンテナの compose 定義（make docker-build / docker-shell / docker-ci から利用）。
+# 詳細は Dockerfile 冒頭のコメント参照。Fandhe-AI/rust-ai-library と同一方針。
+services:
+  dev:
+    build:
+      context: .
+      args:
+        # macOS の Docker Desktop では既定 1000 で問題ない。Linux ホストでは
+        # `HOST_UID=$(id -u) docker compose build` で所有権を合わせられる
+        # （環境変数名を HOST_UID とするのは、`UID` が Bash の読み取り専用変数で
+        # `UID=$(id -u)` の形の指定が失敗するため。PR #6 codex-review P2 指摘の是正）
+        UID: ${HOST_UID:-1000}
+    volumes:
+      - .:/work
+      # cargo のレジストリ・ビルドキャッシュを named volume に載せ、再ビルドを高速化する
+      - cargo-registry:/usr/local/cargo/registry
+      - target-cache:/work/target
+    working_dir: /work
+    command: bash
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  target-cache:

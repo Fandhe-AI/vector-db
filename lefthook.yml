@@ -1,0 +1,78 @@
+# Git hooks 定義（lefthook）。`make hooks`（lefthook install）で導入する。
+#
+# 方針（.claude/rules/conventional-commits.md・security.md。Fandhe-AI/rust-ai-library と同一）:
+# - --no-verify によるスキップは禁止
+# - Cargo.toml 未追加（TASK-66 の workspace 作成予定）の間、cargo 系ジョブはスキップする
+#   （Makefile の HAS_CARGO 判定と同一方針）
+# - 重いチェック（clippy・test）は pre-push に置き、pre-commit は整形チェックのみで軽量に保つ
+
+pre-commit:
+  parallel: true
+  jobs:
+    # staged の .rs のみ rustfmt --check（整形は make fmt / PostToolUse フックで実施済みの想定）。
+    # rustfmt 単体は Cargo.toml を読まず既定 edition 2015 で検査してしまうため、
+    # workspace の正である Cargo.toml の edition を明示指定する
+    - name: rustfmt-check
+      glob: "*.rs"
+      run: |
+        if [ -f Cargo.toml ] && command -v rustfmt >/dev/null 2>&1; then
+          ed=$(sed -n 's/^edition *= *"\([0-9]\{4\}\)".*/\1/p' Cargo.toml | head -n1)
+          rustfmt --edition "${ed:-2021}" --check -- {staged_files}
+        else
+          echo "skip: Cargo.toml 未追加または rustfmt 未導入"
+        fi
+
+    # 秘密情報の混入検査（.claude/rules/security.md）。資格情報ファイルの stage を拒否する。
+    # 判定は create-commit スキルの RE_CREDFILE / RE_CREDFILE_OK の対と同一の正規表現を
+    # ベースにする（PR #6 codex P1 / Bugbot 指摘の是正: `(^|/)` アンカーでサブディレクトリ
+    # 内の `.env.*` も検出し、拡張子なしの SSH 鍵 `id_rsa` / `id_ed25519` も拒否する。
+    # 一方 `.env.example` 等の雛形・`id_rsa.pub` 等の公開鍵は許可リストで通す。
+    # 拡張子 `.env` は旧パターンの検出範囲を維持するため追加している）
+    - name: secrets-guard
+      run: |
+        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
+        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
+        re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
+        re_ok='\.(example|sample|template|pub)$'
+        for f in {staged_files}; do
+          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
+            echo "NG: 秘密情報ファイルがステージされています: $f" >&2
+            exit 1
+          fi
+        done
+
+commit-msg:
+  jobs:
+    # Conventional Commits 形式の検証（.claude/rules/conventional-commits.md）。
+    # オフラインで完結する軽量な正規表現検査とし、正式な commitlint（config-conventional +
+    # commitlint.config.mjs）は CI（lint-docs の commitlint ジョブ）・make lint-commits が担う。
+    # Merge / Revert / fixup コミットは対象外とする
+    - name: conventional-commits
+      run: |
+        msg="$(head -n1 {1})"
+        case "$msg" in
+          Merge*|Revert*|fixup!*|squash!*) exit 0 ;;
+        esac
+        if ! printf '%s' "$msg" | grep -qE '^(feat|fix|perf|refactor|test|docs|build|ci|chore)(\([^)]+\))?!?: .+'; then
+          echo "NG: Conventional Commits 形式ではありません: $msg" >&2
+          echo "形式: <type>(<scope>): <説明>  （type: feat|fix|perf|refactor|test|docs|build|ci|chore）" >&2
+          exit 1
+        fi
+
+pre-push:
+  jobs:
+    # clippy・test は CI と同一条件（Cargo.toml 未追加ならスキップ）
+    - name: clippy
+      run: |
+        if [ -f Cargo.toml ]; then
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+        else
+          echo "skip: Cargo.toml 未追加"
+        fi
+    - name: test
+      run: |
+        if [ -f Cargo.toml ]; then
+          cargo test --workspace --all-features
+        else
+          echo "skip: Cargo.toml 未追加"
+        fi
