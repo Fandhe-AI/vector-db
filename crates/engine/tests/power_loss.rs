@@ -435,7 +435,16 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
 
         let mut rng = Xorshift64::new(seed);
         let subset = random_subset(&mut rng, total_log_len);
+        let durable_before = backend.durable_snapshot();
         let crash_image = backend.crash_image(&subset);
+        // subset が実際にバイト列を変化させていることを確認する。`random_subset` は
+        // 空集合を返しうるため、これがないと当該反復が `crash_image == durable_before`
+        // （＝シナリオ 1 相当の空検証）に縮退していても気づけない。
+        assert_ne!(
+            crash_image, durable_before,
+            "seed={seed}: 選ばれた部分集合が電源断像へ何も反映していない \
+             （空検証に縮退している）"
+        );
         drop(db);
 
         match reopen_from_image(crash_image) {
@@ -462,29 +471,19 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
     // 実測した Ok/Err の内訳を記録する（`cargo test -- --nocapture` で観測し、
     // `docs/design/crash-tolerance-reverification.md` の結果表へ転記する。未計測のまま
     // 「多くは拒否される」等と根拠なく報告書に書かないための実測値）。
+    //
+    // 注意: `Err`（拒否）は fail-closed の観点では合格の結果であり、本テストは
+    // `rejected` の値そのものをアサートしない（拒否が発生しても失敗にしてはならない）。
+    // モジュール doc「モデルの限界」に記載の通り、本探索が扱う部分集合は abort された
+    // トランザクションの書き込み（新規割当ページのみ）に限られ、コミット済みツリーには
+    // 構造的に干渉できないため、この探索空間では実測上 `rejected == 0` が続いている
+    // （`redb` の頑健性の実証ではなく、探索空間の限界に起因する）。拒否経路が実際に
+    // 機能することは、コミット済み像への直接バイト破損を用いた
+    // `power_loss_scenario3_corrupted_durable_image_is_rejected`（否定コントロール）で
+    // 別途検証している。
     println!(
         "power_loss scenario3: seed_count={seed_count} extra_writes={extra_writes} \
          opened_and_consistent={opened_consistent} rejected_fail_closed={rejected}"
-    );
-
-    // モジュール doc「モデルの限界」に記載の通り、本探索が扱う部分集合は abort された
-    // トランザクションの書き込み（新規割当ページのみ）に限られ、コミット済みツリーには
-    // 構造的に干渉できない。したがって `rejected == 0` かつ全反復が内容一致でオープンに
-    // 成功することは、この探索空間における必然（モデルの限界に起因する）であって、
-    // `redb` の頑健性の実証ではない。この不変条件を明示的に固定する（将来ハーネスや
-    // `redb` の内部実装が変わり、この前提が崩れた場合に検知できるようにするため）。
-    // 拒否経路が実際に機能することは、コミット済み像への直接バイト破損を用いた
-    // `power_loss_scenario3_corrupted_durable_image_is_rejected`（否定コントロール）で
-    // 別途検証している。
-    assert_eq!(
-        rejected, 0,
-        "seed_count={seed_count}: 本モデルの部分集合探索はコミット済みツリーへ構造的に \
-         干渉できないため rejected は常に 0 のはず（モジュール doc「モデルの限界」参照）。\
-         0 でなくなった場合はモデルの前提が崩れているので原因を調査すること"
-    );
-    assert_eq!(
-        opened_consistent, seed_count,
-        "seed_count={seed_count}: 上記と同じ理由で全反復がオープン成功・内容一致のはず"
     );
 }
 
@@ -513,8 +512,9 @@ fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
     let result = reopen_from_image(corrupted_image);
     assert!(
         result.is_err(),
-        "コミット済み像の先頭 64 バイト（redb のヘッダ領域）を反転させた場合、\
-         reopen_from_image は明示的な Err を返さなければならない（fail-closed）。\
+        "コミット済み像の先頭 64 バイトを反転させた場合、reopen_from_image は \
+         明示的な Err を返さなければならない（fail-closed。実測でこの反転が \
+         Err を引き起こすことを確認済み。内部レイアウトの主張はしない）。\
          Ok になった場合はハーネスが破損を検出できていないことを意味し、\
          run_partial_writeback_search の rejected==0 が「拒否経路が機能しない」ことに \
          起因していないかを疑う必要がある"
