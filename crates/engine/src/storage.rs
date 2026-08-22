@@ -1,10 +1,12 @@
-//! `redb` ベースの永続化層（TASK-140、対象ビヘイビア: PERSIST-1, PERSIST-2, PERSIST-4。
-//! ポインタ: `docs/spec/05-tasks.md` TASK-140・`docs/spec/04-behavior/persistence.md`）。
+//! `redb` ベースの永続化層（TASK-140/TASK-141、対象ビヘイビア: PERSIST-1, PERSIST-2,
+//! PERSIST-3, PERSIST-4。ポインタ: `docs/spec/05-tasks.md` TASK-140・TASK-141・
+//! `docs/spec/04-behavior/persistence.md`）。
 //!
-//! 責務境界: ベクトル行（id・埋め込み・メタデータ）の永続化 API を提供する。
-//! 後続の検索カーネル・カタログ層（TASK-124〜、TASK-85〜）から呼び出される想定で、
-//! 本モジュールは行の意味（テナント境界・可視性ラベル等の RLS フィールド、TASK-141）
-//! には関与しない。呼び出し元がメタデータ列にどのようなバイト列を格納するかを決める。
+//! 責務境界: ベクトル行（id・テナント ID・可視性ラベル・埋め込み・メタデータ）の永続化 API を
+//! 提供する。後続の検索カーネル・カタログ層（TASK-124〜、TASK-85〜）から呼び出される想定で、
+//! 本モジュールは `tenant_id`・`visibility` をスキーマとして同居保持するが、
+//! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない（評価は TASK-133 以降の
+//! 呼び出し元の責務）。呼び出し元がメタデータ列にどのようなバイト列を格納するかは別途決める。
 //!
 //! 分離レベル（PERSIST-4）: `redb` の契約をそのまま宣言する。書き込みトランザクションは
 //! `redb::Database::begin_write` が排他ロックを取ることで直列化され、読み取りトランザクション
@@ -20,9 +22,17 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 /// バイト列。テーブル名は `docs/spec` 側の成果物指定に依存しないローカルな識別子。
 const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
-/// 行エンコーディングの先頭バイト。将来のスキーマ拡張（TASK-141 の RLS フィールド同居等）
-/// に備え、デコード側は未知バージョンを fail-closed に拒否する。
-const ROW_FORMAT_VERSION: u8 = 1;
+/// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
+/// `visibility`）を同居させるレイアウトへ拡張した。v1 の行は RLS フィールドを持たず、
+/// 暗黙のデフォルトテナント・可視性で読み出すのは fail-open（P0 違反）になるため、
+/// デコード側は v1 を含む未知バージョンを一律 fail-closed に拒否する
+/// （マイグレーションは提供しない。実装着手直後で永続データの互換性保証は不要）。
+const ROW_FORMAT_VERSION: u8 = 2;
+
+/// `tenant_id` の UTF-8 バイト長上限。デコード時・エンコード時ともこの値を超える
+/// 長さフィールドを `Vec`/`String` へのアロケーションに使う前に拒否する
+/// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
+const MAX_TENANT_ID_LEN: u16 = 256;
 
 /// 埋め込み次元数の上限。デコード時にこの値を超える `dim` を確認した場合、
 /// `Vec::with_capacity` へ渡す前に拒否する（未検証の長さフィールドを無制限アロケーションに
@@ -116,8 +126,51 @@ where
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// RLS 相当のテナント境界判定に使う可視性ラベル（対象ビヘイビア: PERSIST-3）。
+///
+/// 本モジュールはこの値をスキーマとして同居保持するのみで、ポリシー評価（どの値なら
+/// 呼び出し元へ返してよいか）は行わない（評価は TASK-133 以降の呼び出し元の責務）。
+/// 永続化表現は 1 バイトの固定コードで、デコード時に未知のバイト値を検出した場合は
+/// 既知の値へ黙殺フォールバックせず `StorageError::Codec` で拒否する（fail-closed。
+/// 「未知値 → Public 扱い」は情報漏えいに直結するため行わない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// テナント内で広く共有される可視性ラベル。
+    Public,
+    /// テナント内でも限定共有される可視性ラベル。
+    Private,
+}
+
+impl Visibility {
+    const PUBLIC_BYTE: u8 = 0x01;
+    const PRIVATE_BYTE: u8 = 0x02;
+
+    fn to_byte(self) -> u8 {
+        match self {
+            Visibility::Public => Self::PUBLIC_BYTE,
+            Visibility::Private => Self::PRIVATE_BYTE,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Result<Self> {
+        match byte {
+            Self::PUBLIC_BYTE => Ok(Visibility::Public),
+            Self::PRIVATE_BYTE => Ok(Visibility::Private),
+            other => Err(StorageError::Codec(format!(
+                "unknown visibility byte: {other}"
+            ))),
+        }
+    }
+}
+
 /// 永続化予定の行データ（呼び出し側が構築する入力形）。
 pub struct RowInput<'a> {
+    /// RLS 相当のテナント境界判定に使う不透明な識別子（対象ビヘイビア: PERSIST-3）。
+    /// 空文字列はテナント境界判定を曖昧にするため、エンコード時に拒否する（fail-closed）。
+    pub tenant_id: &'a str,
+    /// RLS 相当の可視性ラベル（対象ビヘイビア: PERSIST-3）。ポリシー評価はこの型の
+    /// 呼び出し元（TASK-133 以降）の責務であり、本モジュールは値をそのまま保持する。
+    pub visibility: Visibility,
     pub embedding: &'a [f32],
     /// 呼び出し元が定義する不透明なメタデータバイト列（本モジュールは中身を解釈しない）。
     pub metadata: &'a [u8],
@@ -127,6 +180,10 @@ pub struct RowInput<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub id: u64,
+    /// RLS 相当のテナント境界判定に使う不透明な識別子（対象ビヘイビア: PERSIST-3）。
+    pub tenant_id: String,
+    /// RLS 相当の可視性ラベル（対象ビヘイビア: PERSIST-3）。[`RowInput::visibility`] 参照。
+    pub visibility: Visibility,
     pub embedding: Vec<f32>,
     pub metadata: Vec<u8>,
 }
@@ -289,12 +346,30 @@ impl Storage {
 
 /// 行を固定レイアウトでエンコードする（serde 系依存を増やさない方針。dependency-policy.md）。
 ///
-/// レイアウト:
-/// `[version: u8][dim: u32 le][embedding: dim * f32 le][metadata_len: u32 le][metadata bytes]`
+/// レイアウト（v2、対象ビヘイビア: PERSIST-3）:
+/// `[version: u8=2][tenant_len: u16 le][tenant bytes][visibility: u8]`
+/// `[dim: u32 le][embedding: dim * f32 le][metadata_len: u32 le][metadata bytes]`
 ///
-/// バージョンバイトと非構造化のメタデータバイト列により、TASK-141（RLS フィールド同居）・
-/// TASK-146（次元固定カタログ）等の後続スキーマ拡張が非互換変更なしに行えるようにしている。
+/// RLS フィールド（`tenant_id`・`visibility`）を先頭側に置くのは、後続の RLS 事前フィルタ
+/// （TASK-133）が embedding をデコードせずテナント判定できる余地を残すため。
+/// バージョンバイトと非構造化のメタデータバイト列により、TASK-146（次元固定カタログ）等の
+/// 後続スキーマ拡張が非互換変更なしに行えるようにしている。
 fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
+    if row.tenant_id.is_empty() {
+        return Err(StorageError::Codec(
+            "tenant_id must not be empty".to_string(),
+        ));
+    }
+    let tenant_bytes = row.tenant_id.as_bytes();
+    let tenant_len = u16::try_from(tenant_bytes.len()).map_err(|_| {
+        StorageError::Codec(format!("tenant_id too long: {} bytes", tenant_bytes.len()))
+    })?;
+    if tenant_len > MAX_TENANT_ID_LEN {
+        return Err(StorageError::Codec(format!(
+            "tenant_id length {tenant_len} exceeds limit {MAX_TENANT_ID_LEN}"
+        )));
+    }
+
     let dim = u32::try_from(row.embedding.len()).map_err(|_| {
         StorageError::Codec(format!("embedding dim too large: {}", row.embedding.len()))
     })?;
@@ -311,8 +386,13 @@ fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
         )));
     }
 
-    let mut buf = Vec::with_capacity(1 + 4 + row.embedding.len() * 4 + 4 + row.metadata.len());
+    let mut buf = Vec::with_capacity(
+        1 + 2 + tenant_bytes.len() + 1 + 4 + row.embedding.len() * 4 + 4 + row.metadata.len(),
+    );
     buf.push(ROW_FORMAT_VERSION);
+    buf.extend_from_slice(&tenant_len.to_le_bytes());
+    buf.extend_from_slice(tenant_bytes);
+    buf.push(row.visibility.to_byte());
     buf.extend_from_slice(&dim.to_le_bytes());
     for v in row.embedding {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -335,6 +415,46 @@ fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
         )));
     }
     let mut offset = 1usize;
+
+    let tenant_len_bytes = buf.get(offset..offset + 2).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at tenant_len field".to_string())
+    })?;
+    let tenant_len_arr: [u8; 2] = tenant_len_bytes
+        .try_into()
+        .map_err(|_| StorageError::Codec("tenant_len field is not 2 bytes".to_string()))?;
+    let tenant_len = u16::from_le_bytes(tenant_len_arr);
+    if tenant_len > MAX_TENANT_ID_LEN {
+        return Err(StorageError::Codec(format!(
+            "tenant_id length {tenant_len} exceeds limit {MAX_TENANT_ID_LEN}"
+        )));
+    }
+    offset = offset
+        .checked_add(2)
+        .ok_or_else(|| StorageError::Codec("offset overflow after tenant_len field".to_string()))?;
+
+    let tenant_end = offset
+        .checked_add(tenant_len as usize)
+        .ok_or_else(|| StorageError::Codec("offset overflow after tenant_id field".to_string()))?;
+    let tenant_bytes = buf.get(offset..tenant_end).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at tenant_id field".to_string())
+    })?;
+    if tenant_bytes.is_empty() {
+        return Err(StorageError::Codec(
+            "tenant_id must not be empty".to_string(),
+        ));
+    }
+    let tenant_id = std::str::from_utf8(tenant_bytes)
+        .map_err(|_| StorageError::Codec("tenant_id is not valid UTF-8".to_string()))?
+        .to_string();
+    offset = tenant_end;
+
+    let visibility_byte = *buf.get(offset).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at visibility field".to_string())
+    })?;
+    let visibility = Visibility::from_byte(visibility_byte)?;
+    offset = offset
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Codec("offset overflow after visibility field".to_string()))?;
 
     let dim_bytes = buf
         .get(offset..offset + 4)
@@ -401,6 +521,8 @@ fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 
     Ok(Row {
         id,
+        tenant_id,
+        visibility,
         embedding,
         metadata: metadata_bytes.to_vec(),
     })
@@ -411,7 +533,18 @@ mod tests {
     use super::*;
 
     fn sample_row(embedding: &[f32], metadata: &[u8]) -> Vec<u8> {
+        sample_row_with_rls("tenant-a", Visibility::Public, embedding, metadata)
+    }
+
+    fn sample_row_with_rls(
+        tenant_id: &str,
+        visibility: Visibility,
+        embedding: &[f32],
+        metadata: &[u8],
+    ) -> Vec<u8> {
         encode_row(&RowInput {
+            tenant_id,
+            visibility,
             embedding,
             metadata,
         })
@@ -422,9 +555,11 @@ mod tests {
     fn row_roundtrips_through_encode_decode() {
         let embedding = vec![0.5_f32, -1.0, 2.25];
         let metadata = b"opaque".to_vec();
-        let buf = sample_row(&embedding, &metadata);
+        let buf = sample_row_with_rls("tenant-a", Visibility::Private, &embedding, &metadata);
         let row = decode_row(7, &buf).unwrap();
         assert_eq!(row.id, 7);
+        assert_eq!(row.tenant_id, "tenant-a");
+        assert_eq!(row.visibility, Visibility::Private);
         assert_eq!(row.embedding, embedding);
         assert_eq!(row.metadata, metadata);
     }
@@ -435,6 +570,86 @@ mod tests {
         let row = decode_row(1, &buf).unwrap();
         assert!(row.embedding.is_empty());
         assert!(row.metadata.is_empty());
+    }
+
+    #[test]
+    fn decode_row_rejects_version1_row_without_rls_fields() {
+        // v1（RLS フィールドを持たない）行を模したバッファ。version=1 の行を暗黙の
+        // デフォルトテナントとして読み出すのは fail-open（P0 違反）であり、拒否しなければ
+        // ならない。
+        let mut v1_buf = Vec::new();
+        v1_buf.push(1u8); // ROW_FORMAT_VERSION（旧 v1）
+        v1_buf.extend_from_slice(&0u32.to_le_bytes()); // dim=0
+        v1_buf.extend_from_slice(&0u32.to_le_bytes()); // metadata_len=0
+        let err = decode_row(1, &v1_buf).expect_err("v1 row must be rejected");
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_row_rejects_unknown_visibility_byte() {
+        let mut buf = sample_row(&[1.0], b"m");
+        // レイアウト: [version][tenant_len(2)][tenant bytes]["tenant-a" は 8 バイト][visibility]
+        let visibility_offset = 1 + 2 + "tenant-a".len();
+        buf[visibility_offset] = 0xFF;
+        let err = decode_row(1, &buf).expect_err("unknown visibility byte must be rejected");
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn encode_row_rejects_empty_tenant_id() {
+        let result = encode_row(&RowInput {
+            tenant_id: "",
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &[],
+        });
+        assert!(matches!(result, Err(StorageError::Codec(_))));
+    }
+
+    #[test]
+    fn encode_row_rejects_oversized_tenant_id() {
+        let huge_tenant = "t".repeat((MAX_TENANT_ID_LEN as usize) + 1);
+        let result = encode_row(&RowInput {
+            tenant_id: &huge_tenant,
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &[],
+        });
+        assert!(matches!(result, Err(StorageError::Codec(_))));
+    }
+
+    #[test]
+    fn decode_row_rejects_non_utf8_tenant_bytes() {
+        let mut buf = sample_row(&[1.0], b"m");
+        // "tenant-a" の先頭バイトを不正な UTF-8 継続バイトへ書き換える。
+        let tenant_start = 1 + 2;
+        buf[tenant_start] = 0xFF;
+        let err = decode_row(1, &buf).expect_err("non-UTF-8 tenant_id must be rejected");
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_row_rejects_tenant_len_exceeding_limit() {
+        let mut buf = sample_row(&[1.0], b"m");
+        let oversized = MAX_TENANT_ID_LEN + 1;
+        buf[1..3].copy_from_slice(&oversized.to_le_bytes());
+        let err = decode_row(1, &buf).expect_err("oversized tenant_len must be rejected");
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_row_rejects_zero_length_tenant_id() {
+        // encode_row 経由では空 tenant_id を作れないため（エンコード時に拒否される）、
+        // decode_row 側の空 tenant_id 拒否パス（RLS が黙って無効化される fail-open 経路）を
+        // 単体で検証するために、tenant_len=0 の一貫したバッファを直接組み立てる。
+        let mut buf = Vec::new();
+        buf.push(ROW_FORMAT_VERSION);
+        buf.extend_from_slice(&0u16.to_le_bytes()); // tenant_len = 0
+        buf.push(Visibility::Public.to_byte());
+        buf.extend_from_slice(&0u32.to_le_bytes()); // dim = 0
+        buf.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
+        let err = decode_row(1, &buf).expect_err("zero-length tenant_id must be rejected");
+        assert!(matches!(err, StorageError::Codec(_)));
     }
 
     #[test]
@@ -468,7 +683,9 @@ mod tests {
         // decode_row は Vec::with_capacity を呼ぶ前に dim の上限検証で拒否するべき。
         let mut buf = sample_row(&[1.0], b"m");
         let oversized = MAX_EMBEDDING_DIM + 1;
-        buf[1..5].copy_from_slice(&oversized.to_le_bytes());
+        // レイアウト: [version(1)][tenant_len(2)]["tenant-a"(8)][visibility(1)][dim(4)]。
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        buf[dim_offset..dim_offset + 4].copy_from_slice(&oversized.to_le_bytes());
         assert!(decode_row(1, &buf).is_err());
     }
 
@@ -476,6 +693,8 @@ mod tests {
     fn encode_row_rejects_oversized_metadata() {
         let huge = vec![0u8; (MAX_METADATA_LEN as usize) + 1];
         let result = encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
             embedding: &[],
             metadata: &huge,
         });
@@ -514,6 +733,8 @@ mod tests {
                 (
                     i,
                     RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
                         embedding: &embeddings[i as usize],
                         metadata: b"m",
                     },
@@ -553,6 +774,8 @@ mod tests {
             .put(
                 1,
                 &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
                     embedding: &[1.0],
                     metadata: b"m",
                 },
@@ -581,6 +804,8 @@ mod tests {
                 (
                     i,
                     RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
                         embedding: &[],
                         metadata: &big_metadata,
                     },
