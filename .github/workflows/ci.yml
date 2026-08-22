@@ -70,6 +70,7 @@ jobs:
   # 第三者 action（actions/checkout）は SHA 固定で参照する
   # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
   # private submodule（docs/spec）は取得しない（spec 抜きでビルド・テストが成立する方針を維持）。
+  # branch protection の必須チェックへ追加する運用は rust-ci と同様ユーザー作業（PR 本文参照）。
   crash-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
