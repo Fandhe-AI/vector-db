@@ -16,8 +16,7 @@ use engine::storage::{RowInput, Storage, Visibility};
 
 /// `storage.rs::ROWS_TABLE` と同一のテーブル定義（`pub(crate)` のため本クレート外の
 /// ここでは参照できず、`tests/persistence.rs` と同じ流儀でローカルに再宣言する）。
-/// 行データの生バイト列を検証するテスト（TABLE-4/TABLE-5「既存行のバイト列が
-/// 不変のまま」）でのみ使う。
+/// 行データの生バイト列を検証するテスト（TABLE-4/TABLE-5）でのみ使う。
 const ROWS_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rows");
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -59,7 +58,7 @@ fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     }
 }
 
-// --- TABLE-1: テーブル単位での次元固定 -------------------------------------
+// --- TABLE-1 -----------------------------------------------------------
 
 #[test]
 fn table1_schema_roundtrip_preserves_declared_dimension() {
@@ -140,7 +139,7 @@ fn table1_multiple_tables_with_different_dimensions_coexist() {
     assert_eq!(large.vector_dim(), Some(1536));
 }
 
-// --- TABLE-4: `CREATE TABLE` はカタログのみの O(1) 変更 ---------------------
+// --- TABLE-4 -------------------------------------------------------------
 
 /// 指定行数のダミー行を書き込んだ DB を用意する（性能検証の前提データ）。
 fn seed_rows(storage: &Storage, count: u64) {
@@ -157,8 +156,8 @@ fn seed_rows(storage: &Storage, count: u64) {
 /// drop 済みであること（redb はファイルロックの都合上、同一ファイルへの
 /// 複数ハンドル同時オープンを許さない。`tests/persistence.rs` と同じ制約）。
 /// `Storage::scan()` はエンコード後の値をデコードして返すため、デコード→再エンコードが
-/// 恒等写像でない将来の変更を見逃し得る。TABLE-4/TABLE-5 の「既存行のバイト列が
-/// 完全に不変」という契約は、この生バイト列比較でのみ厳密に検証できる。
+/// 恒等写像でない将来の変更を見逃し得る。TABLE-4/TABLE-5 の検証は、この生バイト列
+/// 比較でのみ厳密に行える。
 fn read_raw_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>)> {
     let db = redb::Database::open(path).expect("reopen raw database for row inspection");
     let read_txn = db.begin_read().expect("begin_read");
@@ -247,8 +246,7 @@ fn table4_create_table_latency_is_independent_of_row_count() {
     let median_large = large_durations[ROUNDS / 2];
 
     // 行数が 10 倍でも create_table の中央値時間が極端に増加しないこと
-    // （行数依存なら比率は行数比に漸近するはずだが、O(1) 操作であれば
-    // ノイズの範囲に収まる）。マージンを広めに取り flaky 化を避ける。
+    // （TABLE-4）。マージンを広めに取り flaky 化を避ける。
     let ratio = median_large.as_secs_f64().max(1e-9) / median_small.as_secs_f64().max(1e-9);
     assert!(
         ratio < 5.0,
@@ -256,7 +254,7 @@ fn table4_create_table_latency_is_independent_of_row_count() {
     );
 }
 
-// --- TABLE-5: `ALTER TABLE ADD COLUMN` は既存行を不変のまま完了 -------------
+// --- TABLE-5 -------------------------------------------------------------
 
 #[test]
 fn table5_alter_table_add_column_preserves_existing_row_bytes() {
@@ -297,8 +295,8 @@ fn table5_alter_table_add_column_preserves_existing_row_bytes() {
 
 #[test]
 fn table5_alter_table_add_column_rejects_not_nullable() {
-    // TABLE-5 の前提（新列バイトを持たない既存行は NULL 扱い）は追加列が
-    // nullable であることに依存するため、`nullable: false` は fail-closed に拒否する。
+    // 追加列は nullable であることを要求し、`nullable: false` は fail-closed に
+    // 拒否する（TABLE-5）。
     let path = unique_db_path("table5-reject-not-nullable");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -388,7 +386,7 @@ fn table5_alter_table_add_column_latency_is_independent_of_row_count() {
     );
 }
 
-// --- TABLE-6: 識別子・型・次元の fail-closed 検証（encode / decode 両側） ---
+// --- TABLE-6 -------------------------------------------------------------
 
 #[test]
 fn table6_create_table_rejects_invalid_identifiers() {

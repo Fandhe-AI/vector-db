@@ -4,8 +4,8 @@
 //! 責務境界: `VECTOR(N)` 列型を含むテーブル定義（[`TableSchema`]）の DDL
 //! （`CREATE TABLE`・`ALTER TABLE ADD COLUMN`）と、その永続化（`storage.rs` の
 //! `redb::Database` を共有する専用テーブル）を担う。行データそのもの
-//! （`ROWS_TABLE`）には一切アクセスしない（TABLE-4/TABLE-5 の「既存行数に非依存」を
-//! 実現するための設計上の境界）。行エンコーダーの列対応・NULL 解決（TASK-86）・
+//! （`ROWS_TABLE`）には一切アクセスしない設計上の境界とする（TABLE-4/TABLE-5）。
+//! 行エンコーダーの列対応・NULL 解決（TASK-86）・
 //! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）・SQL surface からの
 //! DDL 受理は本モジュールの責務外で、後続タスクが本モジュールの API に依存する。
 //!
@@ -22,7 +22,7 @@ use crate::storage::Storage;
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
-/// カタログの読み書き（TABLE-4/TABLE-5 の O(1) 契約）が行データに触れないようにする。
+/// カタログの読み書き（TABLE-4/TABLE-5）が行データに触れないようにする。
 const CATALOG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("catalog");
 
 /// カタログのテキスト形式フォーマットバージョン識別子。値の追加・変更は
@@ -37,7 +37,7 @@ const MAX_IDENTIFIER_LEN: usize = 63;
 
 /// `VECTOR(N)` の次元数上限。`storage.rs::MAX_EMBEDDING_DIM` と同値を維持する
 /// （カタログで宣言可能な次元が永続化層で扱える上限を超えないようにするため）。
-/// 0 はテーブル単位で次元固定という TABLE-1 の趣旨に反するため、下限は 1 とする。
+/// 下限は 1 とする（TABLE-1）。
 const MAX_VECTOR_DIM: u32 = 65_536;
 
 // 上記コメントの「同値を維持する」という前提を、単なる複製定数のコメントに留めず
@@ -126,8 +126,8 @@ pub type Result<T> = std::result::Result<T, CatalogError>;
 pub enum ColumnType {
     /// 可変長テキスト列。
     Text,
-    /// 固定次元の埋め込み列（`VECTOR(N)`）。次元 `N` はテーブル単位で固定される
-    /// （TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は encode・decode 両側で拒否する。
+    /// 固定次元の埋め込み列（`VECTOR(N)`、TABLE-1）。0 と `MAX_VECTOR_DIM` 超過は
+    /// encode・decode 両側で拒否する。
     Vector(u32),
 }
 
@@ -137,8 +137,7 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
     /// `ALTER TABLE ADD COLUMN` で追加された列は暗黙 nullable とする（TABLE-5）。
-    /// 「新列バイトを持たない既存行は NULL 扱い」という契約を担う情報であり、
-    /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務。
+    /// 実際の行デコード時の NULL 解決は行エンコーダー（TASK-86）の責務であり、
     /// 本モジュールはこのフラグを保持・往復させるのみ。
     pub nullable: bool,
 }
@@ -154,7 +153,7 @@ impl ColumnDef {
 }
 
 /// テーブル定義。列の宣言順を保持する（`ALTER TABLE ADD COLUMN` は末尾追記のみを
-/// 許可し、既存行の再エンコードを要求しないレイアウトを前提とする。TABLE-5）。
+/// 許可する。TABLE-5）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub name: String,
@@ -169,8 +168,7 @@ impl TableSchema {
         }
     }
 
-    /// 宣言済みの埋め込み次元（`VECTOR(N)` 列のうち最初に見つかったもの）。
-    /// TABLE-1 の「テーブル単位で次元固定」を表現するヘルパ。
+    /// 宣言済みの埋め込み次元（`VECTOR(N)` 列のうち最初に見つかったもの、TABLE-1）。
     pub fn vector_dim(&self) -> Option<u32> {
         self.columns.iter().find_map(|c| match c.ty {
             ColumnType::Vector(dim) => Some(dim),
@@ -179,8 +177,8 @@ impl TableSchema {
     }
 
     /// 挿入経路（TASK-86 以降）が、宣言済み次元と一致しない埋め込みを拒否するための
-    /// 検証ヘルパ（TABLE-1）。`VECTOR` 列を持たないテーブルへの呼び出しも fail-closed
-    /// に拒否する。
+    /// 検証ヘルパ（TABLE-1）。`VECTOR` 列を持たないテーブルへの呼び出しも
+    /// fail-closed に拒否する。
     pub fn validate_embedding_dim(&self, dim: usize) -> Result<()> {
         let expected = self
             .vector_dim()
@@ -254,10 +252,9 @@ fn validate_column(column: &ColumnDef) -> Result<()> {
 /// スキーマ全体の検証（テーブル名・列定義・列数上限・列名重複・`VECTOR` 列数）。
 /// `create_table`・`alter_table_add_column`（追加後のスキーマ）の両方から呼ばれる。
 ///
-/// TABLE-1（「次元はテーブル単位で固定」）を満たすため、`VECTOR` 列は高々 1 つに
-/// 制限する。複数の `VECTOR` 列を許すと [`TableSchema::vector_dim`] が先頭列のみを
-/// 見て後続列を黙殺する fail-open な状態になり得るため、ここで拒否する
-/// （.claude/rules/security.md「不安全な設計」）。
+/// `VECTOR` 列は高々 1 つに制限する（TABLE-1）。複数の `VECTOR` 列を許すと
+/// [`TableSchema::vector_dim`] が先頭列のみを見て後続列を黙殺する fail-open な
+/// 状態になり得るため、ここで拒否する（.claude/rules/security.md「不安全な設計」）。
 fn validate_schema(schema: &TableSchema) -> Result<()> {
     validate_identifier(&schema.name)?;
     if schema.columns.is_empty() {
@@ -288,7 +285,7 @@ fn validate_schema(schema: &TableSchema) -> Result<()> {
     }
     if vector_column_count > 1 {
         return Err(CatalogError::Invalid(format!(
-            "table must declare at most one VECTOR column (TABLE-1: dimension is fixed per table), got {vector_column_count}"
+            "table must declare at most one VECTOR column, got {vector_column_count}"
         )));
     }
     Ok(())
@@ -436,12 +433,10 @@ fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
 
 /// カタログ DDL API。`Storage`（`storage.rs`）の拡張として実装し、
 /// `Storage::db()` を経由して `ROWS_TABLE` とは別のテーブル（[`CATALOG_TABLE`]）
-/// のみを読み書きする。行データへは一切アクセスしない
-/// （TABLE-4/TABLE-5 の「既存行数に非依存」の根拠）。
+/// のみを読み書きする。行データへは一切アクセスしない（TABLE-4/TABLE-5）。
 impl Storage {
     /// 新規テーブルを定義する（TABLE-4）。同名テーブルが既に存在する場合は
-    /// 上書きせず `Err` を返す。カタログテーブルのみを触る単一 write txn で完結し、
-    /// `ROWS_TABLE` の内容・行数に依存しない O(1) 操作となる。
+    /// 上書きせず `Err` を返す。カタログテーブルのみを触る単一 write txn で完結する。
     pub fn create_table(&self, schema: &TableSchema) -> Result<()> {
         // スキーマ検証は `encode_schema` 内の `validate_schema` に集約する（write txn を
         // 開く前に fail-closed に拒否される。ここで別途 `validate_schema` を呼ぶ必要はない）。
@@ -460,17 +455,14 @@ impl Storage {
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。追加列は暗黙 nullable として
     /// 保持され、既存行のバイト列には一切触れない（`ROWS_TABLE` 非アクセス）。
-    /// 「新列バイトが無い既存行は NULL 扱い」という TABLE-5 の前提は追加列が
-    /// nullable であることに依存するため、`column.nullable == false` は
-    /// fail-closed に拒否する（NOT NULL 制約を、バイトを持たない既存行に対して
-    /// 事実上満たせないまま永続化することを防ぐ。security.md「不安全な設計」）。
-    /// 対象テーブル不存在・列名重複も `Err`。
+    /// `column.nullable == false` は fail-closed に拒否する
+    /// （security.md「不安全な設計」）。対象テーブル不存在・列名重複も `Err`。
     pub fn alter_table_add_column(&self, table_name: &str, column: ColumnDef) -> Result<()> {
         validate_identifier(table_name)?;
         validate_column(&column)?;
         if !column.nullable {
             return Err(CatalogError::Invalid(
-                "column added via ALTER TABLE ADD COLUMN must be nullable (TABLE-5)".to_string(),
+                "column added via ALTER TABLE ADD COLUMN must be nullable".to_string(),
             ));
         }
         let write_txn = self.db().begin_write()?;
@@ -726,7 +718,7 @@ mod tests {
 
         // MAX_LIST_TABLES を超える件数を用意する。create_table を MAX_LIST_TABLES+1 回
         // 呼ぶと write txn ごとのコミットコストでテストが極端に遅くなるため、
-        // 単一の write txn へ直接まとめて挿入する（create_table の O(1) 契約検証は
+        // 単一の write txn へ直接まとめて挿入する（create_table 自体の性能特性検証は
         // table4 系の統合テストの責務であり、ここでの目的は list_tables 自体の
         // DoS 対策（security.md「無制限リソース確保」）の検証）。
         let schema = TableSchema::new(
