@@ -188,7 +188,13 @@ impl VectorArena {
     /// 行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
     /// （モジュールドキュメントのスコープ境界を参照）。
     pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
-        let schema = storage.get_table_schema(table_name)?;
+        // スキーマ取得・カタログゲート（他テーブル存在チェック）・`ROWS_TABLE` 走査を
+        // すべて単一の `read_txn`（同一スナップショット）上で行う。別トランザクションに
+        // 分かれていると、ゲート判定通過後・走査前に他テーブルの行が並行挿入されても
+        // 検出できない TOCTOU が生じる（TASK-87 P1 レビュー指摘対応。モジュール
+        // ドキュメントのスコープ境界参照）。
+        let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
+        let (schema, tables) = Storage::schema_and_tables_in_txn(&read_txn, table_name)?;
         let expected_dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
         if expected_dim == 0 || expected_dim > crate::storage::MAX_EMBEDDING_DIM {
             return Err(ArenaError::InvalidDim);
@@ -196,7 +202,7 @@ impl VectorArena {
 
         // カタログゲート: 対象テーブル以外のユーザーテーブルが存在する場合、
         // `ROWS_TABLE` の全行を対象テーブルへ安全に帰属させられないため拒否する。
-        for other in storage.list_tables()? {
+        for other in tables {
             if other != table_name {
                 return Err(ArenaError::MultipleTablesPresent {
                     requested: table_name.to_string(),
@@ -205,7 +211,6 @@ impl VectorArena {
             }
         }
 
-        let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
         let table = match read_txn.open_table(ROWS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
@@ -371,5 +376,88 @@ mod tests {
         // usize::MAX 近傍の dim を渡しても checked_mul が Err に落ちるだけで panic しない。
         let result = check_capacity(usize::MAX / 2, u32::MAX, usize::MAX, usize::MAX);
         assert!(matches!(result, Err(ArenaError::CapacityExceeded)));
+    }
+
+    /// `tests/arena.rs`（統合テスト）と同方針の一意 DB パス払い出しヘルパー。
+    /// `schema_and_tables_in_txn` は `pub(crate)` のため、統合テストからは呼べず
+    /// このモジュール内 unit test でのみ検証できる。
+    fn unique_db_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vector-db-engine-arena-unit-{label}-{}-{seq}.redb",
+            std::process::id()
+        ));
+        path
+    }
+
+    // TASK-87 P1 レビュー指摘（カタログゲートと行走査の TOCTOU）への回帰テスト。
+    // 対象テーブル `a` について `schema_and_tables_in_txn` を呼んだ read_txn を
+    // 保持したまま、*その後* に別テーブル `b` を作成・行を書き込んでも、同一
+    // read_txn 上で見えるテーブル一覧・ROWS_TABLE の行数はどちらも書き込み前の
+    // スナップショットのまま（ゲート判定と行走査が同一スナップショットで一致する
+    // こと）を検証する。
+    #[test]
+    fn schema_and_tables_in_txn_observes_a_single_snapshot_across_concurrent_writes() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+        use crate::storage::{RowInput, Visibility};
+
+        let path = unique_db_path("toctou");
+        let storage = Storage::open(&path).expect("open storage");
+
+        let schema_a = TableSchema::new(
+            "a",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(4), false)],
+        );
+        storage.create_table(&schema_a).expect("create table a");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[0.0, 1.0, 2.0, 3.0],
+                    metadata: &[],
+                },
+            )
+            .expect("put row into a");
+
+        // ゲート判定用のスナップショットを先に確立する。
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let (_schema, tables) =
+            Storage::schema_and_tables_in_txn(&read_txn, "a").expect("schema_and_tables_in_txn");
+        assert_eq!(tables, vec!["a".to_string()]);
+
+        // read_txn 確立後に別テーブル・同次元の行を並行挿入する（TOCTOU 再現）。
+        let schema_b = TableSchema::new(
+            "b",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(4), false)],
+        );
+        storage.create_table(&schema_b).expect("create table b");
+        storage
+            .put(
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[9.0, 9.0, 9.0, 9.0],
+                    metadata: &[],
+                },
+            )
+            .expect("put row into b");
+
+        // 同一 read_txn 上では、後発の書き込みは一切見えない。テーブル一覧・
+        // ROWS_TABLE の行数のどちらも、read_txn 確立時点のスナップショットのまま。
+        let (_schema, tables_again) =
+            Storage::schema_and_tables_in_txn(&read_txn, "a").expect("schema_and_tables_in_txn");
+        assert_eq!(tables_again, vec!["a".to_string()]);
+
+        let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
+        assert_eq!(table.len().expect("table len"), 1);
+
+        drop(read_txn);
+        let _ = std::fs::remove_file(&path);
     }
 }
