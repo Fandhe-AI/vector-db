@@ -1,0 +1,151 @@
+//! `engine::txn::WriteTxn::log_batch`（[`ROWS_TABLE`] とバッチ台帳
+//! [`crate::storage::BATCH_LOG_TABLE`] を同一トランザクションで扱う経路）の統合テスト
+//! （TASK-90、対象ビヘイビア: TABLE-10。ポインタ: `docs/spec/05-tasks.md` TASK-90・
+//! `docs/spec/04-behavior/data-model.md` TABLE-10）。
+//!
+//! `crates/engine/examples/crash_tool_cross_table.rs` + `scripts/crash_test_cross_table.sh`
+//! はプロセス外からの SIGKILL に対する耐性を検証するのに対し、本ファイルは
+//! プロセス内テストとして「commit で両テーブルへ原子的に反映される」「commit 前に drop・
+//! `abort` した場合は両テーブルとも破棄される」という 2 テーブル横断トランザクションの
+//! 原子性そのものを検証する（クラッシュ回帰テストとは独立に、通常経路での正しさを保証する）。
+
+use engine::storage::{RowInput, Storage, Visibility};
+
+static UNIQUE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// テストごとに一意な DB ファイルパスを払い出す
+/// （`crates/engine/tests/txn_isolation.rs` の同名ヘルパーと同じ方針）。
+fn unique_db_path(label: &str) -> std::path::PathBuf {
+    use std::sync::atomic::Ordering;
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "vector-db-engine-cross-table-txn-{label}-{}-{seq}.redb",
+        std::process::id()
+    ));
+    path
+}
+
+struct CleanupGuard(std::path::PathBuf);
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
+    RowInput {
+        tenant_id: "tenant-a",
+        visibility: Visibility::Public,
+        embedding,
+        metadata,
+    }
+}
+
+// 対象ビヘイビア: TABLE-10（詳細は関数名・ポインタ: docs/spec/04-behavior/data-model.md）。
+#[test]
+fn table10_commit_reflects_both_tables_atomically() {
+    let path = unique_db_path("commit-both");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let embedding = [1.0_f32, 2.0, 3.0];
+    let metadata = [9_u8, 8, 7];
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&embedding, &metadata)).expect("put row 0");
+    txn.put(1, &row(&embedding, &metadata)).expect("put row 1");
+    txn.log_batch(0, 2).expect("log_batch");
+    txn.commit().expect("commit");
+
+    assert_eq!(storage.get(0).expect("get row 0").embedding, embedding);
+    assert_eq!(storage.get(1).expect("get row 1").embedding, embedding);
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        vec![(0, 2)]
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。commit 前に drop した場合は両テーブルとも破棄される
+// （`redb::WriteTransaction` の Drop 契約に委譲。`txn.rs` のドキュメントコメント参照）。
+#[test]
+fn table10_drop_without_commit_discards_both_tables() {
+    let path = unique_db_path("drop-discards-both");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+        txn.log_batch(0, 1).expect("log_batch");
+        // commit も abort も呼ばずスコープを抜ける。
+    }
+
+    let get_err = storage.get(0).expect_err("row must not exist after drop");
+    assert!(matches!(
+        get_err,
+        engine::storage::StorageError::NotFound(0)
+    ));
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        Vec::<(u64, u64)>::new()
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。明示的な abort でも両テーブルとも破棄される。
+#[test]
+fn table10_abort_discards_both_tables() {
+    let path = unique_db_path("abort-discards-both");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    txn.log_batch(0, 1).expect("log_batch");
+    txn.abort().expect("abort");
+
+    let get_err = storage.get(0).expect_err("row must not exist after abort");
+    assert!(matches!(
+        get_err,
+        engine::storage::StorageError::NotFound(0)
+    ));
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        Vec::<(u64, u64)>::new()
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。複数バッチのコミット後に「batch_log の row_count 合計 ==
+// 行総数」というテーブル間不変条件が成立し、reopen（プロセス内での再オープン）後も
+// 維持されることを確認する。
+#[test]
+fn table10_batch_totals_match_row_count_and_survive_reopen() {
+    let path = unique_db_path("totals-survive-reopen");
+    let _cleanup = CleanupGuard(path.clone());
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let mut next_id: u64 = 0;
+        for batch_seq in 0..3_u64 {
+            let mut txn = storage.begin_write().expect("begin_write");
+            for _ in 0..4 {
+                txn.put(next_id, &row(&[next_id as f32], &[next_id as u8]))
+                    .expect("put row");
+                next_id += 1;
+            }
+            txn.log_batch(batch_seq, 4).expect("log_batch");
+            txn.commit().expect("commit");
+        }
+    }
+
+    // 同一パスを再オープンし、ディスクへ確定した状態のみを見ていることを確認する。
+    let storage = Storage::open(&path).expect("reopen storage");
+    let (rows, cursor) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(cursor, None);
+    assert_eq!(rows.len(), 12);
+
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 4), (1, 4), (2, 4)]);
+    let total_from_log: u64 = batch_log.iter().map(|(_, count)| count).sum();
+    assert_eq!(total_from_log, rows.len() as u64);
+}

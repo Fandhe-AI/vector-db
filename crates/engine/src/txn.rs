@@ -11,7 +11,9 @@
 
 use redb::ReadableDatabase;
 
-use crate::storage::{decode_row, encode_row, Row, RowInput, Storage, StorageError, ROWS_TABLE};
+use crate::storage::{
+    decode_row, encode_row, Row, RowInput, Storage, StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
+};
 
 /// engine が宣言する分離レベル（対象ビヘイビア: TABLE-3）。
 ///
@@ -123,6 +125,21 @@ impl WriteTxn {
         let encoded = encode_row(row)?;
         let mut table = self.txn.open_table(ROWS_TABLE)?;
         table.insert(id, encoded.as_slice())?;
+        Ok(())
+    }
+
+    /// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）へ 1 エントリを書き込む
+    /// （TASK-90、対象ビヘイビア: TABLE-10）。[`WriteTxn::put`] と同一の
+    /// `redb::WriteTransaction`（`self.txn`）内で操作するため、[`WriteTxn::commit`]・
+    /// [`WriteTxn::abort`] のどちらを呼んでも [`ROWS_TABLE`] への行書き込みと本エントリは
+    /// 常に運命を共にする（2 テーブル横断で原子的にコミット／破棄される）。
+    ///
+    /// `batch_seq` を呼び出し元の設計（例: 0 起点の連番）と異なる値で 2 度書き込むと
+    /// 既存エントリを上書きする（`redb` の `insert` 契約）。呼び出し元は連番管理の
+    /// 責務を負う（本モジュールは重複検出をしない）。
+    pub fn log_batch(&mut self, batch_seq: u64, row_count: u64) -> crate::storage::Result<()> {
+        let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
+        table.insert(batch_seq, row_count)?;
         Ok(())
     }
 

@@ -26,6 +26,16 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 /// 直接構築するために参照する。
 pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
+/// バッチ台帳テーブル（TASK-90、対象ビヘイビア: TABLE-10。ポインタ:
+/// `docs/spec/05-tasks.md` TASK-90・`docs/spec/04-behavior/data-model.md` TABLE-10）。
+/// キーはバッチ通番（`batch_seq`、0 起点で連番）、値はそのバッチで [`ROWS_TABLE`] へ
+/// 書き込んだ行数。[`ROWS_TABLE`] と同一の `redb::WriteTransaction` 内でのみ書き込む
+/// （`txn.rs` の [`crate::txn::WriteTxn::log_batch`]）ことで、2 テーブル横断の
+/// トランザクション原子性（同時にコミットされる／同時に破棄される）を製品コード経路で
+/// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
+/// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
+pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
+
 /// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
 /// `visibility`）を同居させるレイアウトへ拡張した。v1 の行は RLS フィールドを持たず、
 /// 暗黙のデフォルトテナント・可視性で読み出すのは fail-open（P0 違反）になるため、
@@ -361,6 +371,26 @@ impl Storage {
             None
         };
         Ok((out, cursor_for_next))
+    }
+
+    /// [`BATCH_LOG_TABLE`] の全エントリを `batch_seq` 昇順で読み出す（対象ビヘイビア:
+    /// TABLE-10）。再起動後の検証・採番再開専用の読み取りで、[`Storage::scan_page`] の
+    /// ような上限付きページングは持たない（バッチ台帳は 1 コミット 1 エントリのため
+    /// 行データ本体よりオーダーが小さく、クラッシュ耐性検証（並行書き込みなし）の
+    /// 用途では十分小さい前提。将来の大規模運用時は呼び出し元でページングを追加すること）。
+    pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(BATCH_LOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (k, v) = entry?;
+            out.push((k.value(), v.value()));
+        }
+        Ok(out)
     }
 }
 
