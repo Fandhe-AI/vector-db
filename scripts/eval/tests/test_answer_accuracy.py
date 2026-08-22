@@ -114,6 +114,30 @@ class LoadConfigTest(unittest.TestCase):
             with self.assertRaises(aa.ConfigError):
                 aa.load_config(config_path)
 
+    def test_http_endpoint_on_non_loopback_host_rejected(self):
+        # P0: http を非 loopback ホストへ向ける設定は、実行時に全サンプル UNKNOWN で
+        # 失敗させるのではなく load_config の時点で ConfigError にする。
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            raw = _valid_config_dict(tmp_dir)
+            raw["llm_endpoint"] = "http://example.invalid/v1/chat/completions"
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            with self.assertRaises(aa.ConfigError):
+                aa.load_config(config_path)
+
+    def test_https_endpoint_on_non_loopback_host_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            raw = _valid_config_dict(tmp_dir)
+            raw["llm_endpoint"] = "https://example.invalid/v1/chat/completions"
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+
+            config = aa.load_config(config_path)
+            self.assertEqual(config.llm_endpoint, "https://example.invalid/v1/chat/completions")
+
 
 class LoadDatasetTest(unittest.TestCase):
     def test_missing_path_raises_dataset_error(self):
@@ -640,7 +664,7 @@ class LoadDatasetHardLimitsTest(unittest.TestCase):
     def test_oversized_line_raises_without_json_parsing(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_path = Path(tmp) / "data.jsonl"
-            data_path.write_text("x" * (aa.HARD_MAX_DATASET_LINE_BYTES + 10) + "\n", encoding="utf-8")
+            data_path.write_text("x" * (aa.HARD_MAX_DATASET_LINE_CHARS + 10) + "\n", encoding="utf-8")
             with self.assertRaises(aa.DatasetError):
                 aa.load_dataset(data_path)
 
@@ -695,6 +719,16 @@ class ScoreAnswerPromptInjectionTest(unittest.TestCase):
         # サニタイズ後の本文に区切りトークンが残っていないこと（境界の偽装を防ぐ）。
         body_only = wrapped.split("\n", 1)[1].rsplit("\n", 1)[0]
         self.assertNotIn(aa.PROMPT_FIELD_DELIMITER, body_only)
+
+    def test_sanitize_does_not_splice_delimiter_back_together(self):
+        # 空文字列への置換だと、区切りトークンを分割して埋め込む入力
+        # ("@@@FI" + DELIMITER + "ELD@@@") で除去後に前後の断片が結合し
+        # 区切りトークンが再構成されてしまう（1 パスの非空置換で防ぐ）。
+        delim = aa.PROMPT_FIELD_DELIMITER
+        prefix_len = len(delim) // 2
+        splice_payload = delim[:prefix_len] + delim + delim[prefix_len:]
+        sanitized = aa._sanitize_for_prompt(splice_payload)
+        self.assertNotIn(delim, sanitized)
 
     def test_wrapped_field_is_bounded_by_delimiter(self):
         wrapped = aa._wrap_untrusted_field("Question", "what is 2+2?")

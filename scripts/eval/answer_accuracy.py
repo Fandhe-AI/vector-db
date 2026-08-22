@@ -55,7 +55,7 @@ RETRY_BACKOFF_BASE_SECONDS = 0.5
 # 巨大フィールドの無制限送信（DoS・暴走課金）を防ぐ（fail-closed: 超過は DatasetError）。
 HARD_MAX_DATASET_FILE_BYTES = 50_000_000
 HARD_MAX_DATASET_RECORDS = 10_000
-HARD_MAX_DATASET_LINE_BYTES = 200_000
+HARD_MAX_DATASET_LINE_CHARS = 200_000
 HARD_MAX_DATASET_FIELD_CHARS = 20_000
 
 # 採点プロンプトへ埋め込む question/expected_answer/generated_answer の区切りに使うトークン。
@@ -189,6 +189,17 @@ def load_config(config_path: Path) -> EvalConfig:
     parsed_endpoint = urlparse(llm_endpoint)
     if parsed_endpoint.scheme not in ("http", "https"):
         raise ConfigError("llm_endpoint must use http or https scheme")
+    # _post_json は資格情報（API キー）を https のみで送信し、http は loopback 限定で
+    # キーを送らず続行する。ここで拒否せず _post_json 側の判定にのみ頼ると、
+    # http を非 loopback ホストへ向ける設定不正がロード時には通り、全サンプルが
+    # 実行時に UNKNOWN で失敗して「正答率 0%・判定不能率 100%」という誤解を招く
+    # レポートだけが残る（設定不正は load_config で即エラー終了させる方針に反する）。
+    if parsed_endpoint.scheme == "http" and not _is_loopback_host(parsed_endpoint.hostname):
+        raise ConfigError(
+            "llm_endpoint uses http on a non-loopback host; "
+            "use https for non-loopback hosts (http is only allowed for "
+            "127.0.0.0/8, ::1, or localhost)"
+        )
 
     model = _require_type(raw["model"], str, "model")
     api_key_env = _require_type(raw["api_key_env"], str, "api_key_env")
@@ -273,14 +284,14 @@ def load_dataset(data_path: Path) -> list[dict[str, str]]:
         while True:
             # readline(limit+1) を使う: 素の `for line in f` は改行のない巨大な 1 行を
             # 上限チェック前に丸ごとメモリへ確保してしまうため、読み取り自体を上限で止める。
-            chunk = f.readline(HARD_MAX_DATASET_LINE_BYTES + 1)
+            chunk = f.readline(HARD_MAX_DATASET_LINE_CHARS + 1)
             if chunk == "":
                 break
             line_no += 1
-            if len(chunk) > HARD_MAX_DATASET_LINE_BYTES:
+            if len(chunk) > HARD_MAX_DATASET_LINE_CHARS:
                 raise DatasetError(
                     f"line at {data_path}:{line_no} exceeds "
-                    f"{HARD_MAX_DATASET_LINE_BYTES} byte limit"
+                    f"{HARD_MAX_DATASET_LINE_CHARS} byte limit"
                 )
             line = chunk.strip()
             if not line:
@@ -450,8 +461,13 @@ def _sanitize_for_prompt(value: str) -> str:
     攻撃者が制御しうる generated_answer が PROMPT_FIELD_DELIMITER と同じ文字列を
     出力した場合、除去しないとブロック境界を偽装されうる（「攻撃者が出力できる文字列は
     区切りとして機能しない」という原則に基づく）。
+
+    置換先は空文字列ではなく PROMPT_FIELD_DELIMITER を含まない固定トークンにする:
+    空文字列に置換すると、区切りトークンの一部を分割して埋め込む入力
+    （例: "@@@FI" + DELIMITER + "ELD@@@"）で、除去後に前後の断片が結合し
+    区切りトークンが再構成されてしまう（1 パスの非空置換ならこの再構成は起きない）。
     """
-    return value.replace(PROMPT_FIELD_DELIMITER, "")
+    return value.replace(PROMPT_FIELD_DELIMITER, "[REDACTED-DELIMITER]")
 
 
 def _wrap_untrusted_field(label: str, value: str) -> str:
