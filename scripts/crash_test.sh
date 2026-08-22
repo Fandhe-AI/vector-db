@@ -37,7 +37,22 @@ if [ ! -x "${BIN}" ]; then
 fi
 
 WORKDIR="$(mktemp -d)"
-trap 'rm -rf "${WORKDIR}"' EXIT
+if [ ! -d "${WORKDIR}" ]; then
+  echo "ERROR: mktemp -d failed to create a working directory" >&2
+  exit 1
+fi
+
+# INT/TERM は bash の trap ハンドラ実行後もスクリプトの次の文から実行を継続する
+# 仕様があるため、EXIT と INT/TERM を同一 trap にまとめると中断時に WORKDIR 削除後も
+# ループが続行し、以降の参照が不可解なエラーで異常終了する。cleanup（削除処理）は
+# EXIT 用に分離し、INT/TERM では明示的に exit 130 で打ち切ることでハンドラ実行後の
+# 継続を防ぐ（130 は SIGINT の慣例終了コードだが、本スクリプトでは TERM 受信時も
+# 同じ値で統一して打ち切る）。
+cleanup() {
+  rm -rf "${WORKDIR}"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 DB_PATH="${WORKDIR}/crash_test.redb"
 WRITE_LOG="${WORKDIR}/write.log"
 
@@ -100,6 +115,10 @@ for i in $(seq 1 "${ITERATIONS}"); do
     cat "${WRITE_LOG}" >&2
     exit 1
   fi
+
+  # wait で reap 済みの PID は OS に回収され再利用され得るため、以降のエラーパスで
+  # 誤って無関係な別プロセスへ kill してしまわないようクリアしておく。
+  writer_pid=""
 
   verify_output="$("${BIN}" verify "${DB_PATH}")"
   echo "${verify_output}"
