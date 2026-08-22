@@ -133,6 +133,11 @@ pub type Result<T> = std::result::Result<T, StorageError>;
 /// 永続化表現は 1 バイトの固定コードで、デコード時に未知のバイト値を検出した場合は
 /// 既知の値へ黙殺フォールバックせず `StorageError::Codec` で拒否する（fail-closed。
 /// 「未知値 → Public 扱い」は情報漏えいに直結するため行わない）。
+///
+/// この 2 値構成・未知値拒否の方針は `docs/spec/04-behavior/data-model.md` TABLE-7・
+/// TABLE-9（ポインタ表記）の記述と照合済み（spec submodule を初期化のうえ確認。追加の
+/// 可視性ラベルは spec 上に見当たらなかった）。将来 spec 側でラベルが追加された場合は
+/// `ROW_FORMAT_VERSION` 更新を伴う破壊的変更として扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Visibility {
     /// テナント内で広く共有される可視性ラベル。
