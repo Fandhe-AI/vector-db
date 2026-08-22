@@ -13,14 +13,20 @@
 //! スコープ境界（重要・TASK-91 と同根）: 行とカタログ上のユーザーテーブルを関連付ける
 //! 永続化上の機構（行ごとのテーブル識別子）は本リポジトリにまだ実装されていない
 //! （[`crate::storage::ROWS_TABLE`] は単一の平坦なテーブルで、異なる次元のテーブルの
-//! 行が同居し得る。`crates/engine/tests/multi_dim_tables.rs` 参照）。そのため
-//! [`VectorArena::build`] は呼び出し元にテーブル名を要求し、カタログ
-//! （[`crate::catalog`]）に**そのテーブルしか存在しない**ことを確認してから走査する
-//! （fail-closed ゲート）。カタログに他のユーザーテーブルが 1 つでも存在する場合は、
-//! 行とテーブルを安全に対応付けられないため `Err` で拒否する（黙って全行を混在させる
-//! fail-open は行わない）。次元不一致の行を検出した場合も同様に、部分的なアリーナを
-//! 返さず `Err` で拒否する。複数テーブルが同居する DB からテーブル単位でアリーナを
-//! 構築する機構（行への永続的なテーブル識別子付与）は後続タスクの管轄とする。
+//! 行が同居し得る。`crates/engine/tests/multi_dim_tables.rs` 参照）。[`VectorArena::build`]
+//! はテーブル名を受け取り、カタログ（[`crate::catalog`]）に**そのテーブルしか存在しない**
+//! ことを確認してから走査する（他のユーザーテーブルが 1 つでも存在する場合は
+//! `Err(MultipleTablesPresent)` で拒否する）。
+//!
+//! **このゲートだけでは行の帰属を証明できない**（TASK-87 P1 レビュー指摘）:
+//! [`crate::storage::Storage::put`]・[`crate::storage::Storage::put_batch`] は
+//! テーブル名・スキーマを要求せず、カタログにテーブルが 1 つも存在しない状態でも
+//! `ROWS_TABLE` へ行を書き込める。そのため「対象テーブルしかカタログに存在しない」
+//! ことは、「`ROWS_TABLE` の全行が対象テーブルの書き込みによるもの」を含意しない
+//! （対象テーブル作成より前に書かれた行が存在しても検出できない）。この帰属を
+//! 検証可能にする機構（行への永続的なテーブル識別子付与）は TASK-91 の管轄であり、
+//! 実装されるまで [`VectorArena::build`] は `pub(crate)` に留め、クレート外へ公開する
+//! テーブルスコープ API としては提供しない。
 //!
 //! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
 //! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
@@ -33,11 +39,21 @@ use crate::storage::{decode_row, Storage, StorageError, Visibility, ROWS_TABLE};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+///
+/// `#[allow(dead_code)]`: [`VectorArena::build`] が `pub(crate)`（TASK-87 P1
+/// レビュー指摘対応）となり、現状クレート内の呼び出し元は `#[cfg(test)]` のみのため、
+/// 通常ビルドでは到達不能と判定される。TASK-91（行への永続的なテーブル識別子付与）で
+/// 呼び出し元が追加され次第この属性は不要になる。
+#[allow(dead_code)]
 const MAX_ARENA_ROWS: usize = 1_000_000;
 
 /// アリーナが確保してよい総バイト量（`vectors: Vec<f32>` 相当）の上限。
 /// `MAX_ARENA_ROWS` だけでは次元数が大きい場合に依然として巨大確保になり得るため、
 /// 行数とバイト量の両方で上限を課す（`storage.rs` の `MAX_SCAN_TOTAL_BYTES` と同方針）。
+///
+/// `#[allow(dead_code)]`: [`MAX_ARENA_ROWS`] と同じ理由（`VectorArena::build` の
+/// `pub(crate)` 化）。
+#[allow(dead_code)]
 const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
 /// アリーナ構築層の公開エラー型。`storage.rs` の設計メモ（`StorageError` への
@@ -60,9 +76,10 @@ pub enum ArenaError {
     /// `expected_dim` と一致しない次元の行を検出した。黙殺スキップせず拒否する
     /// （部分的なアリーナを返さない。fail-open を避けるための判断）。
     DimMismatch { id: u64, expected: u32, found: u32 },
-    /// カタログに要求したテーブル以外のユーザーテーブルが存在するため、行と
-    /// テーブルを安全に対応付けられない（モジュールドキュメントのスコープ境界参照）。
-    /// fail-closed に拒否する。
+    /// カタログに要求したテーブル以外のユーザーテーブルが存在する（fail-closed に
+    /// 拒否する）。このゲートは「他のユーザーテーブルが存在しない」ことのみを保証し、
+    /// 対象テーブル作成前に書かれた孤立行の混入までは検出できない
+    /// （モジュールドキュメントのスコープ境界参照。TASK-87 P1 レビュー指摘）。
     MultipleTablesPresent { requested: String, other: String },
 }
 
@@ -121,9 +138,13 @@ pub type Result<T> = std::result::Result<T, ArenaError>;
 /// （`row_count * dim`）を返す。
 ///
 /// 上限値（`max_rows`・`max_bytes`）を引数として受け取る形に切り出しているのは、
-/// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、統合テスト
-/// （`tests/arena.rs`）からは境界値検証（ちょうど上限・上限+1 等）を再現できないため。
-/// 境界値検証は本ファイル内の `#[cfg(test)]` モジュールで行う。
+/// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、境界値検証
+/// （ちょうど上限・上限+1 等）を本ファイル内の `#[cfg(test)]` モジュールから
+/// 直接パラメータ化して再現するため。
+///
+/// `#[allow(dead_code)]`: [`MAX_ARENA_ROWS`] と同じ理由（`VectorArena::build` の
+/// `pub(crate)` 化）。
+#[allow(dead_code)]
 fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize) -> Result<usize> {
     if row_count > max_rows {
         return Err(ArenaError::CapacityExceeded);
@@ -172,10 +193,10 @@ impl VectorArena {
     /// 混入しても検出できないため。TASK-87 P1 レビュー指摘への対応）。
     ///
     /// カタログに `table_name` 以外のユーザーテーブルが 1 つでも存在する場合は
-    /// `Err(ArenaError::MultipleTablesPresent)` で拒否する。[`crate::storage::ROWS_TABLE`]
-    /// は行ごとの永続的なテーブル識別子を持たないため（モジュールドキュメント参照）、
-    /// 「カタログ上のユーザーテーブルが対象の 1 つだけ」であることのみが、走査した
-    /// 全行が対象テーブルに帰属することを保証できる条件だからである。
+    /// `Err(ArenaError::MultipleTablesPresent)` で拒否する。ただし、このゲートは
+    /// 行の帰属を証明する十分条件ではない（モジュールドキュメントのスコープ境界参照。
+    /// TASK-87 P1 レビュー指摘）。そのため本関数は `pub(crate)` に留め、クレート外へ
+    /// 公開するテーブルスコープ API としては提供しない。
     ///
     /// 単一の `storage.db().begin_read()` で全行を走査し（[`crate::storage::Storage::scan_page`]
     /// は呼び出しごとに別トランザクションを開くためページ間のスナップショット一貫性がなく、
@@ -187,7 +208,12 @@ impl VectorArena {
     /// いて 1 行も書き込まれていない場合のみ空アリーナとして成功する）。次元不一致の
     /// 行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
     /// （モジュールドキュメントのスコープ境界を参照）。
-    pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
+    ///
+    /// `#[allow(dead_code)]`: 現状クレート内の呼び出し元は `#[cfg(test)]` のみ
+    /// （`pub(crate)` 化の理由は上記ドキュメント参照）。TASK-91 で本番の呼び出し元が
+    /// 追加され次第この属性は不要になる。
+    #[allow(dead_code)]
+    pub(crate) fn build(storage: &Storage, table_name: &str) -> Result<Self> {
         // スキーマ取得・カタログゲート（他テーブル存在チェック）・`ROWS_TABLE` 走査を
         // すべて単一の `read_txn`（同一スナップショット）上で行う。別トランザクションに
         // 分かれていると、ゲート判定通過後・走査前に他テーブルの行が並行挿入されても
@@ -330,6 +356,7 @@ impl VectorArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RowInput;
 
     #[test]
     fn capacity_check_accepts_at_row_limit() {
@@ -452,5 +479,516 @@ mod tests {
 
         drop(read_txn);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // 以下は旧 `tests/arena.rs`・`tests/arena_perf.rs`（統合テスト）からの移設分。
+    // `VectorArena::build` が `pub(crate)`（TASK-87 P1 レビュー指摘対応。モジュール
+    // ドキュメントのスコープ境界参照）となったため、クレート外の統合テストからは
+    // 到達できず、クレート内の `#[cfg(test)]` モジュールへ移す必要があった。
+
+    struct CleanupGuard(std::path::PathBuf);
+
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    const TENANT_ID: &str = "tenant-a";
+
+    /// 外部クレート非依存の決定的擬似乱数生成器（xorshift32）。テストデータ生成にのみ使う。
+    struct Xorshift32(u32);
+
+    impl Xorshift32 {
+        fn next_u32(&mut self) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x
+        }
+
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u32() as f64 / u32::MAX as f64) as f32
+        }
+    }
+
+    fn make_embedding(rng: &mut Xorshift32, dim: usize) -> Vec<f32> {
+        (0..dim).map(|_| rng.next_f32()).collect()
+    }
+
+    /// `table_name` の schema を組み立てる（`embedding` 列 1 本のみを持つ最小構成。
+    /// `multi_dim_tables.rs` と同方針）。
+    fn schema_for(table_name: &str, dim: u32) -> crate::catalog::TableSchema {
+        use crate::catalog::{ColumnDef, ColumnType};
+        crate::catalog::TableSchema::new(
+            table_name,
+            vec![ColumnDef::new("embedding", ColumnType::Vector(dim), false)],
+        )
+    }
+
+    // 対象ビヘイビア: TABLE-8。複数行を投入して build した結果が、行数・次元・各行の
+    // 内容とも Storage::get の読み直し結果と一致し、連続バッファの長さが len * dim と
+    // 一致すること（コールドスタート・アリーナの基本契約）を検証する。
+    #[test]
+    fn build_produces_contiguous_arena_matching_storage_rows() {
+        let path = unique_db_path("basic");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let dim: usize = 8;
+        storage
+            .create_table(&schema_for("docs", dim as u32))
+            .expect("create_table");
+
+        let mut rng = Xorshift32(0x1234_5678);
+        let embeddings: Vec<Vec<f32>> = (0..10).map(|_| make_embedding(&mut rng, dim)).collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, emb)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: TENANT_ID,
+                        visibility: if i % 2 == 0 {
+                            Visibility::Public
+                        } else {
+                            Visibility::Private
+                        },
+                        embedding: emb,
+                        metadata: b"m",
+                    },
+                )
+            })
+            .collect();
+        storage.put_batch(&rows).expect("seed rows");
+
+        let arena = VectorArena::build(&storage, "docs").expect("build arena");
+        assert_eq!(arena.table_name(), "docs");
+        assert_eq!(arena.dim(), dim as u32);
+        assert_eq!(arena.len(), 10);
+        assert!(!arena.is_empty());
+        assert_eq!(arena.vectors().len(), 10 * dim);
+        assert_eq!(arena.ids(), &(0u64..10).collect::<Vec<_>>()[..]);
+
+        for i in 0..10usize {
+            let expected_row = storage.get(i as u64).expect("read row back via storage");
+            assert_eq!(arena.vector(i), Some(expected_row.embedding.as_slice()));
+            assert_eq!(arena.tenant_id(i), Some(expected_row.tenant_id.as_str()));
+            assert_eq!(arena.visibility(i), Some(expected_row.visibility));
+        }
+
+        // 範囲外は panic せず None を返す。
+        assert_eq!(arena.vector(10), None);
+        assert_eq!(arena.tenant_id(10), None);
+        assert_eq!(arena.visibility(10), None);
+    }
+
+    // 対象ビヘイビア: TABLE-8。カタログに登録済みだが 1 行も書き込んでいないテーブル
+    // （ROWS_TABLE 未作成）は空アリーナとして成功すること。
+    #[test]
+    fn build_on_empty_table_returns_empty_arena() {
+        let path = unique_db_path("empty");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 16))
+            .expect("create_table");
+
+        let arena = VectorArena::build(&storage, "docs").expect("build arena on empty table");
+        assert_eq!(arena.dim(), 16);
+        assert_eq!(arena.len(), 0);
+        assert!(arena.is_empty());
+        assert!(arena.vectors().is_empty());
+        assert!(arena.ids().is_empty());
+    }
+
+    // 対象ビヘイビア: TABLE-8。次元不一致の行が 1 行でも混在していれば、部分的な
+    // アリーナを返さず Err(DimMismatch) で fail-closed に拒否すること
+    // （黙殺スキップは検索結果の欠落＝fail-open に相当するため禁止）。
+    #[test]
+    fn build_rejects_dimension_mismatch_without_partial_result() {
+        let path = unique_db_path("dim-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+
+        storage
+            .put(
+                0,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed matching-dim row");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed mismatched-dim row");
+
+        let err = VectorArena::build(&storage, "docs").expect_err("dim mismatch must be rejected");
+        match err {
+            ArenaError::DimMismatch {
+                id,
+                expected,
+                found,
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(expected, 4);
+                assert_eq!(found, 2);
+            }
+            other => panic!("expected DimMismatch, got {other:?}"),
+        }
+    }
+
+    // 対象ビヘイビア: TABLE-8。対象テーブルがカタログに存在しない場合、および
+    // `VECTOR` 列を持たない場合は `Err(InvalidDim)` で拒否すること。
+    #[test]
+    fn build_rejects_missing_table_and_table_without_vector_column() {
+        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+
+        let path = unique_db_path("invalid-dim");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // カタログに未登録のテーブル名。
+        assert!(VectorArena::build(&storage, "not_registered").is_err());
+
+        // VECTOR 列を持たないテーブル。
+        let text_only = TableSchema::new(
+            "notes",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        storage.create_table(&text_only).expect("create_table");
+        assert!(matches!(
+            VectorArena::build(&storage, "notes"),
+            Err(ArenaError::InvalidDim)
+        ));
+    }
+
+    // 対象ビヘイビア: TABLE-8（P1 レビュー指摘対応）。カタログに対象テーブル以外の
+    // ユーザーテーブルが存在する場合、たとえ同一次元であっても `build` は
+    // `Err(MultipleTablesPresent)` で拒否し、他テーブルの行を混入させないこと。
+    #[test]
+    fn build_rejects_when_another_table_coexists_even_with_same_dim() {
+        let path = unique_db_path("multi-table");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        storage
+            .create_table(&schema_for("docs_a", 4))
+            .expect("create_table docs_a");
+        storage
+            .create_table(&schema_for("docs_b", 4))
+            .expect("create_table docs_b");
+
+        // 同じ ROWS_TABLE へテーブル帰属の区別なく書き込まれる（永続化層の現行制約。
+        // モジュールドキュメント参照）。docs_b 側の行のみを書き込む。
+        storage
+            .put(
+                0,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"table=docs_b",
+                },
+            )
+            .expect("seed docs_b row");
+
+        let err =
+            VectorArena::build(&storage, "docs_a").expect_err("must reject when docs_b coexists");
+        match err {
+            ArenaError::MultipleTablesPresent { requested, other } => {
+                assert_eq!(requested, "docs_a");
+                assert_eq!(other, "docs_b");
+            }
+            other => panic!("expected MultipleTablesPresent, got {other:?}"),
+        }
+
+        // docs_b を対象に build しても、カタログに docs_a が残る限り同じゲートで拒否される
+        // （テーブル単位で安全に走査できるのは「カタログ上のユーザーテーブルが 1 つだけ」の
+        // ときに限られる。モジュールドキュメント参照）。
+        let err_b =
+            VectorArena::build(&storage, "docs_b").expect_err("must reject when docs_a coexists");
+        assert!(matches!(err_b, ArenaError::MultipleTablesPresent { .. }));
+    }
+
+    // 対象ビヘイビア: TABLE-8。アリーナは構築時点のスナップショットであり、build 後に
+    // 追加された行は反映されない（単一スナップショットで構築する契約）。再 build すれば
+    // 反映される。
+    #[test]
+    fn build_captures_a_snapshot_not_reflecting_later_writes() {
+        let path = unique_db_path("snapshot");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+
+        storage
+            .put(
+                0,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed initial row");
+
+        let arena_before = VectorArena::build(&storage, "docs").expect("build before extra write");
+        assert_eq!(arena_before.len(), 1);
+
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[3.0, 4.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed additional row after snapshot");
+
+        // build 前に取得した arena_before はそのまま（後続の put の影響を受けない）。
+        assert_eq!(arena_before.len(), 1);
+
+        let arena_after = VectorArena::build(&storage, "docs").expect("rebuild after extra write");
+        assert_eq!(arena_after.len(), 2);
+    }
+
+    // 対象ビヘイビア: TABLE-8（TASK-87 P1 レビュー指摘への回帰テスト。攻撃シナリオの再現）。
+    // カタログにテーブルが 1 つも存在しない状態で `Storage::put` により孤立行
+    // （どのテーブルにも属さない行）を書き込み、その後で対象テーブルを作成すると、
+    // カタログゲート（「対象テーブルしか存在しない」）は通過してしまう。しかし
+    // モジュールドキュメントのスコープ境界のとおり、このゲートは行の帰属を証明する
+    // 十分条件ではない。`build` は `pub(crate)` であるためクレート外へは公開されず、
+    // クレート内のこの回帰テストで「孤立行が混入した場合の挙動」を固定する。
+    // 現状の実装は孤立行の有無を検出できないため、混入を許容してしまう（既知の限界。
+    // 行への永続的なテーブル識別子付与は TASK-91 の管轄）。
+    #[test]
+    fn build_pub_crate_only_documents_orphan_row_limitation() {
+        let path = unique_db_path("orphan-row");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // カタログに 1 つもテーブルが存在しない状態で、同次元の行を書き込む
+        // （`Storage::put` はテーブル名・スキーマを要求しないため書き込める）。
+        storage
+            .put(
+                999,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"orphan",
+                },
+            )
+            .expect("seed orphan row before any table exists");
+
+        // その後に対象テーブルを作成する。カタログゲート（対象テーブルしか存在しない）は
+        // 通過するが、孤立行 id=999 は対象テーブルに属さない。
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table after orphan row was written");
+
+        let arena = VectorArena::build(&storage, "docs").expect("build arena");
+        // 既知の限界: 現状の実装は孤立行を検出できず、混入したまま返す。この事実を
+        // 固定するのが本テストの目的（`pub(crate)` 化・ドキュメント修正の裏付け）。
+        // 行への永続的なテーブル識別子付与（TASK-91）が実装され次第、このアサーションを
+        // 「孤立行を検出して Err を返す」側へ書き換える必要がある。
+        assert_eq!(arena.len(), 1);
+        assert_eq!(arena.ids(), &[999u64]);
+    }
+
+    // 以下、旧 `tests/arena_perf.rs`（統合テスト）からの移設分。「コールドスタート時に
+    // 一度だけアリーナを構築し、以降の検索はアリーナ上のスライスを参照する経路」が
+    // 「クエリの都度 `Storage::scan` で全行を読み直してデコードする経路」より十分速い
+    // ことを CI で検出可能にする（`tests/incremental_write_perf.rs`（TASK-143）と同一の
+    // 計測方針: ウォームアップ 1 回を除外・複数ラウンドの中央値比較・
+    // `Duration::saturating_mul` の整数比較で判定・判定閾値は本テスト固有の計測パラメータで
+    // spec の実測比そのものは転記しない）。
+    //
+    // 規模の選定: `Storage::scan()` は総バイト量 64MiB 超で `ScanLimitExceeded` を返す
+    // （`storage.rs` 参照）。本テストの行数・次元は、その上限に対して十分な余裕を残し、かつ
+    // debug ビルドでも CI 実行時間が長くなりすぎないよう小さく抑えている
+    // （ROWS × DIM × 4 バイト ≈ 5.1 MiB で 64MiB に対して十分小さい）。
+    mod perf {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// 計測対象テーブル名。カタログにこのテーブルのみを登録し、`VectorArena::build`
+        /// のテーブルスコープゲート（TASK-87 P1 レビュー指摘対応）を満たす。
+        const TABLE_NAME: &str = "docs";
+
+        /// 行数・次元（モジュールドキュメントの規模選定を参照）。
+        const ROWS: u64 = 5_000;
+        const DIM: usize = 128;
+
+        /// 1 ラウンドで実行するクエリ本数。
+        const QUERY_COUNT: usize = 40;
+
+        /// ノイズ対策として、両経路それぞれを複数回計測し中央値を取る回数。
+        const MEASUREMENT_ROUNDS: usize = 3;
+
+        /// 判定閾値の分母（アリーナ経路は都度読み直し経路の `1 / RATIO_THRESHOLD_DENOM`
+        /// 以下の時間で完了すること）。本テストの計測パラメータであり、アサーション
+        /// 弱体化は行わない（`.claude/rules/coding-rust.md` 参照）。
+        const RATIO_THRESHOLD_DENOM: u32 = 4;
+
+        fn make_vector(rng: &mut Xorshift32, dim: usize) -> Vec<f32> {
+            (0..dim).map(|_| rng.next_f32()).collect()
+        }
+
+        fn median(mut values: Vec<Duration>) -> Duration {
+            values.sort();
+            values[values.len() / 2]
+        }
+
+        /// 単純な内積（テスト内の素朴なスコアリング。検索カーネル本体は後続タスクの管轄。
+        /// モジュールドキュメント参照）。
+        fn dot(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+        }
+
+        fn best_score_over_arena(arena: &VectorArena, query: &[f32]) -> f32 {
+            let mut best = f32::MIN;
+            for i in 0..arena.len() {
+                let v = arena.vector(i).expect("index within arena bounds");
+                let score = dot(v, query);
+                if score > best {
+                    best = score;
+                }
+            }
+            best
+        }
+
+        fn best_score_over_rescan(storage: &Storage, query: &[f32]) -> f32 {
+            let rows = storage.scan().expect("scan within configured limits");
+            let mut best = f32::MIN;
+            for row in &rows {
+                let score = dot(&row.embedding, query);
+                if score > best {
+                    best = score;
+                }
+            }
+            best
+        }
+
+        fn seed_storage(path: &std::path::Path) -> Storage {
+            let storage = Storage::open(path).expect("open storage");
+            storage
+                .create_table(&schema_for(TABLE_NAME, DIM as u32))
+                .expect("create_table");
+            let mut rng = Xorshift32(0x2545_f491);
+            let rows: Vec<(u64, Vec<f32>)> = (0..ROWS)
+                .map(|id| (id, make_vector(&mut rng, DIM)))
+                .collect();
+            let batch: Vec<(u64, RowInput<'_>)> = rows
+                .iter()
+                .map(|(id, emb)| {
+                    (
+                        *id,
+                        RowInput {
+                            tenant_id: TENANT_ID,
+                            visibility: Visibility::Public,
+                            embedding: emb,
+                            metadata: b"m",
+                        },
+                    )
+                })
+                .collect();
+            storage.put_batch(&batch).expect("seed dataset");
+            storage
+        }
+
+        fn make_queries(seed: u32) -> Vec<Vec<f32>> {
+            let mut rng = Xorshift32(seed | 1);
+            (0..QUERY_COUNT)
+                .map(|_| make_vector(&mut rng, DIM))
+                .collect()
+        }
+
+        // 対象ビヘイビア: TABLE-8。「コールドスタート時に一度だけアリーナを構築し、以降の
+        // クエリはアリーナ走査で完結する経路」が「クエリの都度 Storage::scan で全行を
+        // 読み直しデコードする経路」より十分速いことを、判定閾値（RATIO_THRESHOLD_DENOM）で
+        // 検証する。
+        #[test]
+        fn table8_arena_query_path_completes_within_ratio_threshold_of_rescan_path() {
+            let path = unique_db_path("perf-dataset");
+            let _cleanup = CleanupGuard(path.clone());
+            let storage = seed_storage(&path);
+
+            // ウォームアップ 1 回（ファイルシステムキャッシュ等の初回コストを計測から
+            // 除外する。既存 perf テスト tests/incremental_write_perf.rs と同方針）。
+            {
+                let warmup_queries = make_queries(0xabad_1dea);
+                let arena = VectorArena::build(&storage, TABLE_NAME).expect("warmup build arena");
+                for q in &warmup_queries {
+                    std::hint::black_box(best_score_over_arena(&arena, q));
+                }
+                for q in &warmup_queries {
+                    std::hint::black_box(best_score_over_rescan(&storage, q));
+                }
+            }
+
+            let mut arena_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+            let mut rescan_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+
+            for round in 0..MEASUREMENT_ROUNDS as u32 {
+                let queries = make_queries(0x9e37_79b9u32.wrapping_add(round));
+
+                // 経路 (a): コールドスタート・アリーナを一度 build し、各クエリはアリーナ
+                // 走査で完結する。build 自体もこの経路のコストとして計測に含める
+                // （都度読み直し経路の各クエリが redb からの読み直しコストを含むのと
+                // 対称にするため）。
+                let started = Instant::now();
+                let arena =
+                    VectorArena::build(&storage, TABLE_NAME).expect("build arena (measured)");
+                for q in &queries {
+                    std::hint::black_box(best_score_over_arena(&arena, q));
+                }
+                arena_durations.push(started.elapsed());
+
+                // 経路 (b): 各クエリごとに Storage::scan() で全行を読み直しデコードする。
+                let started = Instant::now();
+                for q in &queries {
+                    std::hint::black_box(best_score_over_rescan(&storage, q));
+                }
+                rescan_durations.push(started.elapsed());
+            }
+
+            let t_arena = median(arena_durations);
+            let t_rescan = median(rescan_durations);
+            let ratio = t_arena.as_secs_f64() / t_rescan.as_secs_f64().max(f64::EPSILON);
+
+            // プログラム出力文字列は英語規約（CI ログから経年変化を追跡できるようにする）。
+            println!(
+                "table8 arena vs rescan perf: t_arena={t_arena:?} t_rescan={t_rescan:?} ratio={ratio:.4}"
+            );
+
+            assert!(
+                t_arena.saturating_mul(RATIO_THRESHOLD_DENOM) <= t_rescan,
+                "arena query path ({t_arena:?}) must complete within 1/{RATIO_THRESHOLD_DENOM} of the \
+                 rescan path ({t_rescan:?}), ratio={ratio:.4}"
+            );
+        }
     }
 }

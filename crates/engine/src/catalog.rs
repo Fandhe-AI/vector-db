@@ -515,6 +515,11 @@ impl Storage {
     /// （別トランザクションに分かれていると、ゲート判定後・走査前に他テーブルの
     /// 行が並行挿入されても検出できない TOCTOU が生じるため）。本メソッドはその
     /// 前半（スキーマ取得＋テーブル一覧）を呼び出し元の `read_txn` 上で行う。
+    ///
+    /// `#[allow(dead_code)]`: 唯一の呼び出し元 `VectorArena::build` が `pub(crate)`
+    /// （TASK-87 P1 レビュー指摘対応）となり、通常ビルドでは `#[cfg(test)]` からしか
+    /// 到達しないため。TASK-91 で本番の呼び出し元が追加され次第この属性は不要になる。
+    #[allow(dead_code)]
     pub(crate) fn schema_and_tables_in_txn(
         read_txn: &redb::ReadTransaction,
         table_name: &str,
