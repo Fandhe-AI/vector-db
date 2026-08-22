@@ -510,12 +510,17 @@ impl Storage {
     /// 保持する単一の `redb::ReadTransaction` 上で行う（`pub(crate)`、`arena.rs` 専用の
     /// 内部ヘルパー。クレート外へ公開する API ではないため `pub` にはしない）。
     ///
-    /// `VectorArena::build`（`pub`。TASK-87 P1 レビュー指摘対応）は、対象テーブルの
+    /// `VectorArena::build`（`pub(crate)`）は、対象テーブルの
     /// スキーマ取得・カタログ上の他テーブル存在チェック（テーブルスコープゲート）・
     /// `ROWS_TABLE` の行走査を同一スナップショット上で完結させる必要がある
     /// （別トランザクションに分かれていると、ゲート判定後・走査前に他テーブルの
     /// 行が並行挿入されても検出できない TOCTOU が生じるため）。本メソッドはその
     /// 前半（スキーマ取得＋テーブル一覧）を呼び出し元の `read_txn` 上で行う。
+    ///
+    /// `VectorArena::build` が `pub(crate)` で現状の呼び出し元がテストのみのため、
+    /// lib ターゲット単体では未使用と判定される。検索カーネル本体（後続タスク）が
+    /// 呼び出し元として加わるまでの間、許容する。
+    #[allow(dead_code)]
     pub(crate) fn schema_and_tables_in_txn(
         read_txn: &redb::ReadTransaction,
         table_name: &str,
