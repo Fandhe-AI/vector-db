@@ -6,13 +6,19 @@
 # クリーンなコンテナで即実行できる構成にする。
 # Fandhe-AI/rust-ai-library の Dockerfile と同一方針（実機 GPU 前提が無い分を簡素化）。
 #
-# ベースはメジャー版固定の rust:1-slim-bookworm とする。ツールチェーンの正は
-# リポジトリルートの rust-toolchain.toml（channel = "stable"）であり、/work で
-# マウントされたワークスペースでの cargo / rustup 実行はイメージ既定版ではなく
-# stable を解決する。未導入のまま非 root の dev ユーザーで cargo を実行すると
-# stable の自動インストールが root 所有の RUSTUP_HOME への書き込みで権限エラーに
-# なるため、イメージビルド時に components ごと導入しておく（rust-ai-library の教訓）。
-FROM rust:1-slim-bookworm
+# ベースイメージは digest 固定とする（PR #6 codex-review P2 指摘の是正。同一タグでも
+# 内容が更新されるため、digest 固定で同一コミット → 同一環境の再現性を担保し、
+# 更新は本行の書き換えという明示的な変更として行う）。
+# 一方 Rust toolchain 自体は意図的に stable 追従のままとする: ツールチェーンの正は
+# リポジトリルートの rust-toolchain.toml（channel = "stable"・単一真実源）であり、
+# /work でマウントされたワークスペースでの cargo / rustup 実行は本ファイルでの固定に
+# かかわらず rust-toolchain.toml を解決するため、イメージ側だけ版固定しても実行時に
+# 上書きされ効果がない。stable 事前導入はビルド時キャッシュと権限対策が目的:
+# 未導入のまま非 root の dev ユーザーで cargo を実行すると stable の自動インストールが
+# root 所有の RUSTUP_HOME への書き込みで権限エラーになる（rust-ai-library の教訓）。
+# digest の更新手順: `curl -s https://hub.docker.com/v2/repositories/library/rust/tags/1-slim-bookworm`
+# の digest（multi-arch manifest list）を転記する。
+FROM rust:1-slim-bookworm@sha256:94e9efa4033213dbb70d4f665527e7ece3944ddb7ba1dd2e43f6fd6e2490af58
 
 # ビルド・検証に必要な最小ツールのみ導入する（レイヤ削減のため 1 RUN に集約）。
 # nodejs / npm: make ci の lint-md / lint-editorconfig / lint-commits（npx 実行）に必要。

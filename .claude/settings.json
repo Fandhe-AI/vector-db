@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2024 -- \"$f\" 2>/dev/null;; esac; exit 0'"
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); case \"$f\" in *.rs) if [ -f Cargo.toml ] && command -v rustfmt >/dev/null 2>&1; then ed=$(sed -n \"s/^edition *= *\\\"\\([0-9]\\{4\\}\\)\\\".*/\\1/p\" Cargo.toml | head -n1); rustfmt --edition \"${ed:-2021}\" -- \"$f\"; fi;; esac'"
           }
         ]
       }

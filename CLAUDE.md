@@ -110,4 +110,4 @@ main セッションはオーケストレーションに徹し、調査・実装
 ## hooks（settings.json）
 
 - **SessionStart**: 日本語・委譲・Conventional Commits・`--no-verify` 禁止・spec 漏えい注意・依存承認制のリマインダーを表示
-- **PostToolUse**（Edit|Write）: `*.rs` 編集後に `rustfmt --edition 2024` で自動整形（jq / rustfmt 未導入時は何もしない）
+- **PostToolUse**（Edit|Write）: `*.rs` 編集後に rustfmt で自動整形。edition は workspace の正である `Cargo.toml` から取得し（lefthook.yml の rustfmt-check と同一方針）、Cargo.toml / jq / rustfmt 未導入時は何もしない。整形失敗は隠さず hook のエラーとして報告される
