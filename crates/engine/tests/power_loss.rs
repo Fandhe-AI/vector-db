@@ -1,7 +1,9 @@
 //! 電源断シミュレーションによるクラッシュ耐性の再検証テスト（TASK-145、ポインタ:
-//! `docs/spec/05-tasks.md`。PERSIST-1・PERSIST-3、ポインタ:
-//! `docs/spec/04-behavior/persistence.md` を電源断シナリオへ拡張して再検証する）。
-//! 詳細は `docs/design/crash-tolerance-reverification.md` を参照。
+//! `docs/spec/05-tasks.md`）。任意の durable ストレージに一般的に求められる特性
+//! （commit 完了後のデータ生存・未 commit 分の完全な除去）を電源断シナリオへ拡張して
+//! 再検証する。関連ビヘイビア: PERSIST-1・PERSIST-3（ポインタ:
+//! `docs/spec/04-behavior/persistence.md`）。詳細は
+//! `docs/design/crash-tolerance-reverification.md` を参照。
 //!
 //! 実機の電源断は CI で再現できないため、`redb::StorageBackend`（`redb =4.2.0`。
 //! `crates/engine/Cargo.toml` の既承認済み依存。新規依存は追加しない）をテストスコープで
@@ -32,9 +34,9 @@
 //! バックエンド差し替え済みの `redb::Database` 自体は `redb::Builder::create_with_backend`
 //! で raw に開く（本ファイルのシナリオ 1・2・3 はこの raw `redb::Database` を直接操作
 //! する。`tests/persistence.rs` と同じ前提）。本番の `Storage::put`/`Storage::get`
-//! （＝実際の `encode_row`/`decode_row`）経由での電源断シナリオ（旧シナリオ 4・
-//! PERSIST-3）は `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテストへ
-//! 移設した（`Storage` の private フィールドへ crate 内から直接アクセスすることで、
+//! （＝実際の `encode_row`/`decode_row`）経由での電源断シナリオ（旧シナリオ 4）は
+//! `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテストへ移設した
+//! （`Storage` の private フィールドへ crate 内から直接アクセスすることで、
 //! 公開 API へバックエンド差し替え用のコンストラクタを増やさないため）。
 
 use std::io;
@@ -275,8 +277,8 @@ fn get_row(db: &Database, id: u64) -> Option<Vec<u8>> {
         .map(|guard| guard.value().to_vec())
 }
 
-// シナリオ 1（PERSIST-1 の電源断拡張）: commit 完了（応答済み）後に電源断しても、
-// 再オープンでコミット済み行がすべて読める。
+// シナリオ 1: commit 完了（応答済み）後に電源断しても、再オープンでコミット済み行が
+// すべて読める（任意の durable ストレージに一般的に求められる特性）。
 //
 // `Storage::put`（≒ 本テストの `insert_row`）が返った時点で `redb` の既定 durability
 // （`Durability::Immediate`）により `sync_data()` まで完了しているため、`durable_snapshot()`
@@ -302,8 +304,9 @@ fn power_loss_scenario1_committed_data_survives_crash_after_commit_response() {
     assert_eq!(get_row(&recovered, 2), Some(b"committed-b".to_vec()));
 }
 
-// シナリオ 2（PERSIST-1 の電源断拡張）: トランザクション途中（最終 sync 前）で電源断すると、
-// 当該トランザクションは丸ごと消え、既存コミット済みデータは無傷で、DB は正常に開ける。
+// シナリオ 2: トランザクション途中（最終 sync 前）で電源断すると、当該トランザクションは
+// 丸ごと消え、既存コミット済みデータは無傷で、DB は正常に開ける
+// （任意の durable ストレージに一般的に求められる特性）。
 #[test]
 fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     let (backend, db) = open_fresh();
@@ -546,7 +549,7 @@ fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
     );
 }
 
-// 旧シナリオ 4（PERSIST-3 の電源断拡張。ポインタ: `docs/spec/04-behavior/persistence.md`）は
-// `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテスト
+// 旧シナリオ 4（commit 完了後の電源断像から再オープンしても、行に含まれる全フィールドが
+// 保持されることの検証）は `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテスト
 // （`storage::tests::power_loss::power_loss_scenario4_rls_fields_survive_crash_after_commit`）
 // へ移設した（モジュール doc 参照）。

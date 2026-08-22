@@ -882,10 +882,12 @@ mod tests {
     }
 
     /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:
-    /// `docs/spec/05-tasks.md`。PERSIST-3、ポインタ: `docs/spec/04-behavior/persistence.md`
-    /// を電源断シナリオへ拡張して再検証する。他シナリオは
+    /// `docs/spec/05-tasks.md`）。commit 完了後の電源断像から再オープンしても、行に
+    /// 含まれる全フィールドが保持されるという、任意の durable ストレージに一般的に
+    /// 求められる特性を検証する（関連ビヘイビア: PERSIST-3、ポインタ:
+    /// `docs/spec/04-behavior/persistence.md`）。他シナリオは
     /// `crates/engine/tests/power_loss.rs`（raw `redb::Database` を直接操作する統合テスト）
-    /// を参照）。
+    /// を参照。
     ///
     /// 本サブモジュールを `crate` 内の `#[cfg(test)]` に閉じているのは、本番の
     /// `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で検証
@@ -909,8 +911,8 @@ mod tests {
         ///   `write()` はこの `log` に積むのみで `durable` を更新しない。`sync_data()` が
         ///   呼ばれて初めて `log` を `durable` へ反映する（`crates/engine/tests/power_loss.rs`
         ///   の `PowerLossBackend` と同じ commit/sync 契約。sync を経ない書き込みが
-        ///   durable 像へ紛れ込むと、シナリオ 4 が「commit 完了後の電源断でも PERSIST-3
-        ///   のデータが保持される」ことを検証したことにならないため、この分離が本質）。
+        ///   durable 像へ紛れ込むと、シナリオ 4 が「commit 完了後の電源断でもデータが
+        ///   保持される」ことを検証したことにならないため、この分離が本質）。
         #[derive(Debug)]
         struct BackendState {
             durable: Vec<u8>,
@@ -1054,7 +1056,8 @@ mod tests {
             redb::Builder::new().create_with_backend(PowerLossBackend::from_bytes(image))
         }
 
-        // シナリオ 4（PERSIST-3 の電源断拡張）: RLS フィールドが電源断後も無傷で保持される。
+        // シナリオ 4: 行に含まれる全フィールド（テナント識別子・可視性を含む）が
+        // 電源断後も無傷で保持される（任意の durable ストレージに一般的に求められる特性）。
         // `PowerLossBackend` で差し替えた `redb::Database` を、本モジュール（`storage` の
         // 子孫）の特権で `Storage { db }` へ直接渡し（公開 API のバイパス用コンストラクタは
         // 追加しない）、書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の
@@ -1091,8 +1094,8 @@ mod tests {
             // `Storage::put` の commit が実際に `sync_data()` まで完了していることを
             // 確認してから `durable_snapshot()` を電源断像として使う。ここを確認しないと、
             // 仮に `PowerLossBackend::write` が sync を待たず durable へ書き戻す実装（本来は
-            // 契約違反）へ退行しても本テストが検出できず、「commit 完了後の電源断で
-            // PERSIST-3 のデータが保持される」という主張を支えられなくなる。
+            // 契約違反）へ退行しても本テストが検出できず、「commit 完了後の電源断でも
+            // 行のデータが保持される」という主張を支えられなくなる。
             assert_eq!(
                 backend.pending_write_count(),
                 0,
