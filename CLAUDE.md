@@ -6,10 +6,10 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 
 - **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` submodule）。**spec 本文を public 資産へ転記しない**（[spec-confidentiality](.claude/rules/spec-confidentiality.md)）
 - 接続プロトコル: PostgreSQL wire プロトコル v3 互換の自作実装（外部プロトコルライブラリ非依存）
-- 想定クレート構成: `engine`（コアロジック）＋ `wire-server`（バイナリ）の workspace
+- クレート構成: `engine`（コアロジック）＋ `wire-server`（バイナリ）の workspace（`crates/`）
 - 永続化: `redb` ベース / 安全性: RLS 相当のテナント境界・fail-closed のエラー契約（`wire_code`）
 - 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）
-- ステータス: 実装未着手（タスクは spec リポの `05-tasks.md`（TASK-66〜154）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
+- ステータス: workspace 雛形構築済み（TASK-66）。検索カーネル・認証等は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜154）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
 
 ## Repository Structure
 
@@ -35,7 +35,8 @@ vector-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-└── crates/                        # （実装着手後）engine / wire-server workspace
+├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
+└── crates/                        # engine（lib）/ wire-server（bin）workspace
 ```
 
 ## 委譲方針（必読）
