@@ -175,6 +175,22 @@ endif
 ci: lint-docs fmt-check lint test deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
+# 評価スクリプト（scripts/eval。TASK-118）
+# --------------------------------------------------
+
+# python3 は開発コンテナ（Dockerfile）に含まれず、CI（ci.yml）にも組み込まれていない
+# 独立ターゲットのため、未導入時は cargo 系（HAS_CARGO）と違い silent skip にしない
+# （false-green 回避。yamllint と同一方針）。`ci` には含めない（docker-ci を壊さないため）。
+.PHONY: test-eval
+test-eval: ## scripts/eval のユニットテストを実行する（TASK-118。python3 が必要）
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 -m unittest discover scripts/eval/tests; \
+	else \
+		echo "python3 未導入: scripts/eval のテストには python3 が必要です" >&2; \
+		exit 1; \
+	fi
+
+# --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
 # --------------------------------------------------
 
