@@ -158,6 +158,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため test をスキップ"
 endif
 
+.PHONY: crash-test
+crash-test: ## クラッシュ耐性回帰テスト（TASK-142・PERSIST-1。scripts/crash_test.sh を実行）
+ifdef HAS_CARGO
+	scripts/crash_test.sh
+else
+	@echo "skip: Cargo.toml 未追加のため crash-test をスキップ"
+endif
+
 .PHONY: crash-test-cross-table
 crash-test-cross-table: ## 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト（TASK-90・TABLE-10。scripts/crash_test_cross_table.sh を実行）
 ifdef HAS_CARGO
@@ -180,7 +188,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test-cross-table deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-cross-table deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
