@@ -161,16 +161,13 @@ fn scan_all(storage: &Storage) -> (Duration, usize) {
         let (page, next_cursor) = storage
             .scan_page(cursor, 512)
             .expect("scan_page should succeed");
-        let page_len = page.len();
-        total_rows += page_len;
-        if next_cursor.is_none() {
-            break;
-        }
-        cursor = next_cursor;
-        // 空ページが続く異常系での無限ループを防ぐガード
-        // （`tests/multi_dim_tables.rs` の `assert_rows_match` と同じ方針）。
-        if page_len == 0 {
-            break;
+        total_rows += page.len();
+        match next_cursor {
+            None => break,
+            // 安全弁: cursor が前進しない場合の無限ループを防ぐガード
+            // （`tests/multi_dim_tables.rs` の `assert_rows_match` と同じ方針）。
+            Some(next) if cursor.is_some_and(|prev| next <= prev) => break,
+            Some(next) => cursor = Some(next),
         }
     }
     (started.elapsed(), total_rows)
