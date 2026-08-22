@@ -905,10 +905,17 @@ mod tests {
         /// - `durable`: 直近の `sync_data()` 完了時点のバイト列（電源断後も必ず残る像）。
         /// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新する（モデルの限界。
         ///   `set_len` はメタデータ操作として即時 durable 化する単純化を置いている）。
+        /// - `log`: 直近の `sync_data()` 以降に発行された `write()` の記録（発行順）。
+        ///   `write()` はこの `log` に積むのみで `durable` を更新しない。`sync_data()` が
+        ///   呼ばれて初めて `log` を `durable` へ反映する（`crates/engine/tests/power_loss.rs`
+        ///   の `PowerLossBackend` と同じ commit/sync 契約。sync を経ない書き込みが
+        ///   durable 像へ紛れ込むと、シナリオ 4 が「commit 完了後の電源断でも PERSIST-3
+        ///   のデータが保持される」ことを検証したことにならないため、この分離が本質）。
         #[derive(Debug)]
         struct BackendState {
             durable: Vec<u8>,
             len: usize,
+            log: Vec<(u64, Vec<u8>)>,
         }
 
         impl BackendState {
@@ -916,6 +923,7 @@ mod tests {
                 Self {
                     durable: Vec::new(),
                     len: 0,
+                    log: Vec::new(),
                 }
             }
 
@@ -924,22 +932,35 @@ mod tests {
                 Self {
                     durable: bytes,
                     len,
+                    log: Vec::new(),
                 }
             }
 
-            /// `durable` を `len` にリサイズ（不足分はゼロ埋め）した基底バッファ。
+            /// `durable` を `len` にリサイズ（不足分はゼロ埋め）した基底バッファに、
+            /// 未 sync の `log` をすべて適用した「見かけ上の現在の状態」を返す
+            /// （sync 前の自分の書き込みは redb 自身には見える必要がある。read-your-writes）。
             fn current(&self) -> Vec<u8> {
                 let mut buf = self.durable.clone();
                 buf.resize(self.len, 0);
+                for (offset, data) in &self.log {
+                    let start = *offset as usize;
+                    let end = start + data.len();
+                    if end > buf.len() {
+                        buf.resize(end, 0);
+                    }
+                    buf[start..end].copy_from_slice(data);
+                }
                 buf
             }
         }
 
         /// OS の page cache を模した `redb::StorageBackend` 実装。実ファイルを一切使わず、
         /// メモリ上の [`BackendState`] だけで完結する（テストの決定論性・実行速度のため）。
-        /// 本シナリオは commit 完了後の電源断のみを検証するため、`write()` は即座に
-        /// `durable` へ反映する（`sync_data()` を待つ部分 write-back の探索は
-        /// `crates/engine/tests/power_loss.rs` のシナリオ 2・3 が担う）。
+        /// `write()` は `log` に積むのみで `durable`（電源断後も必ず残る像）を更新せず、
+        /// `sync_data()` の時点で初めて `log` を `durable` へ反映する
+        /// （`crates/engine/tests/power_loss.rs` の `PowerLossBackend` と同じ commit/sync
+        /// 契約。部分 write-back の探索は同ファイルのシナリオ 2・3 が担い、本モジュールは
+        /// 「sync 済みの durable 像」から再オープンする経路のみを検証する）。
         #[derive(Debug, Clone)]
         struct PowerLossBackend {
             state: Arc<Mutex<BackendState>>,
@@ -961,6 +982,14 @@ mod tests {
             /// 直近 `sync_data()` 時点のバイト列（電源断で必ず残る像）を取得する。
             fn durable_snapshot(&self) -> Vec<u8> {
                 self.state.lock().expect("lock poisoned").durable.clone()
+            }
+
+            /// 直近 `sync_data()` 以降に記録された未 sync の `write()` 件数。
+            /// 「commit が実際に sync まで完了しているか」を検証するために使う
+            /// （否定コントロール・シナリオ 4 のどちらも、この値が意図した状態
+            /// （0 件／1 件以上）であることを確認したうえで durable 像を比較する）。
+            fn pending_write_count(&self) -> usize {
+                self.state.lock().expect("lock poisoned").log.len()
             }
         }
 
@@ -988,6 +1017,7 @@ mod tests {
                 let len =
                     usize::try_from(len).map_err(|_| io::Error::other("len does not fit usize"))?;
                 state.len = len;
+                // メタデータ操作は即時 durable 化する単純化（構造体 doc 参照）。
                 state.durable.resize(len, 0);
                 Ok(())
             }
@@ -996,16 +1026,13 @@ mod tests {
                 let mut state = self.state.lock().expect("lock poisoned");
                 let synced = state.current();
                 state.durable = synced;
+                state.log.clear();
                 Ok(())
             }
 
             fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
                 let mut state = self.state.lock().expect("lock poisoned");
-                let end = offset as usize + data.len();
-                if end > state.durable.len() {
-                    state.durable.resize(end, 0);
-                }
-                state.durable[offset as usize..end].copy_from_slice(data);
+                state.log.push((offset, data.to_vec()));
                 Ok(())
             }
         }
@@ -1061,6 +1088,18 @@ mod tests {
                 )
                 .expect("put row 2 via production Storage API");
 
+            // `Storage::put` の commit が実際に `sync_data()` まで完了していることを
+            // 確認してから `durable_snapshot()` を電源断像として使う。ここを確認しないと、
+            // 仮に `PowerLossBackend::write` が sync を待たず durable へ書き戻す実装（本来は
+            // 契約違反）へ退行しても本テストが検出できず、「commit 完了後の電源断で
+            // PERSIST-3 のデータが保持される」という主張を支えられなくなる。
+            assert_eq!(
+                backend.pending_write_count(),
+                0,
+                "Storage::put の commit 完了後は log が sync 済みで空になっているはず \
+                 （0 件でなければ、まだ sync されていない書き込みを電源断像に含めてしまう）"
+            );
+
             let row1_before = storage
                 .get(1)
                 .expect("decode row 1 via production Storage API before crash");
@@ -1096,6 +1135,44 @@ mod tests {
             );
             assert_eq!(row2_after.tenant_id, "tenant-b");
             assert_eq!(row2_after.visibility, Visibility::Private);
+        }
+
+        // 否定コントロール: `sync_data()` を呼ばない限り `write()` の内容は
+        // `durable_snapshot()`（＝電源断で必ず残る像）へ反映されないことを直接確認する。
+        // これがないと、`PowerLossBackend::write` が sync を待たず即座に `durable` を
+        // 書き換える実装（commit/sync 契約違反）へ退行しても、シナリオ 4 は偶然
+        // 成功し続けてしまう（恒真化）。`StorageBackend` トレイトのメソッドを
+        // `redb::Database` を介さず直接呼び、モデルの sync ゲーティングだけを検証する。
+        #[test]
+        fn power_loss_backend_durable_image_excludes_writes_until_sync_data() {
+            let backend = PowerLossBackend::new();
+
+            backend
+                .write(0, b"uncommitted-write")
+                .expect("write to backend");
+            assert_eq!(
+                backend.pending_write_count(),
+                1,
+                "write() は log に記録されているはず（0 件だと本テストは何も検証していない）"
+            );
+            assert!(
+                backend.durable_snapshot().is_empty(),
+                "sync_data() を呼ぶ前は、write() の内容が durable_snapshot()（電源断で \
+                 必ず残る像）へ反映されていてはならない"
+            );
+
+            backend.sync_data().expect("sync_data");
+            assert_eq!(
+                backend.pending_write_count(),
+                0,
+                "sync_data() 後は log が空になっているはず"
+            );
+            assert_eq!(
+                backend.durable_snapshot(),
+                b"uncommitted-write",
+                "sync_data() を呼んだ後は、write() の内容が durable_snapshot() へ \
+                 反映されていなければならない"
+            );
         }
     }
 }
