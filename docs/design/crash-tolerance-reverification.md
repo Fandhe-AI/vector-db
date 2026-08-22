@@ -112,8 +112,9 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 ## 観察
 
-- シナリオ 1 が使うテスト用 builder（`redb::Builder::new().create_with_backend(...)`、
-  `cache_size` 既定 1GiB）上の raw `redb::Database` は commit が `Durability::Immediate`
+- シナリオ 1 が使うテスト用 builder（`redb::Builder::new().create_with_backend(...)`。
+  `open_fresh()` 経由のため他シナリオと同じく `set_cache_size` で 16KiB に設定済み）上の
+  raw `redb::Database` は commit が `Durability::Immediate`
   （既定）で動作しており、`commit()` が返る時点で当該トランザクションの書き込みが
   `sync_data()` まで完了していることをテスト側の `pending_write_count()`（バックエンドへの
   未 sync 書き込み件数）観測で確認した（シナリオ 1 のテスト内アサーション）。この観測は
