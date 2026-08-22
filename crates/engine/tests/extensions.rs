@@ -555,6 +555,199 @@ fn ext2_insert_rows_into_table_discards_whole_transaction_on_mid_batch_failure()
     );
 }
 
+// --- scan_table_page ページング契約（TASK-146 レビュー指摘対応） ------------------
+// `catalog.rs::scan_table_page` は `storage.rs::scan_page`（TASK-140/141）と同じ
+// カーソル・打ち切り契約を独自実装で再現している。`storage.rs` 側の同名テストと
+// 対になる形でテーブルスコープ版を検証する。
+
+#[test]
+fn ext2_scan_table_page_resumes_via_after_cursor_across_pages() {
+    // `after: Some(cursor)` からの継続読み出し（`cursor.checked_add(1)` 起点計算）を
+    // 3 ページに分けて検証する。
+    let path = unique_db_path("scan-page-resume");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    storage
+        .create_table(&vector_table_schema("docs", 1))
+        .expect("create_table(docs)");
+
+    let embeddings: Vec<[f32; 1]> = (0..25u64).map(|i| [i as f32]).collect();
+    let rows: Vec<(u64, RowInput<'_>)> = (0..25u64)
+        .map(|i| {
+            (
+                i,
+                RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &embeddings[i as usize],
+                    metadata: b"m",
+                },
+            )
+        })
+        .collect();
+    storage
+        .insert_rows_into_table("docs", &rows)
+        .expect("seed 25 rows");
+
+    let (page1, cursor1) = storage
+        .scan_table_page("docs", None, 10)
+        .expect("first page");
+    assert_eq!(page1.len(), 10);
+    assert_eq!(page1.first().map(|r| r.id), Some(0));
+    assert_eq!(page1.last().map(|r| r.id), Some(9));
+    assert_eq!(cursor1, Some(9));
+
+    let (page2, cursor2) = storage
+        .scan_table_page("docs", cursor1, 10)
+        .expect("second page");
+    assert_eq!(page2.len(), 10);
+    assert_eq!(page2.first().map(|r| r.id), Some(10));
+    assert_eq!(page2.last().map(|r| r.id), Some(19));
+    assert_eq!(cursor2, Some(19));
+
+    let (page3, cursor3) = storage
+        .scan_table_page("docs", cursor2, 10)
+        .expect("third (partial) page");
+    assert_eq!(page3.len(), 5);
+    assert_eq!(page3.first().map(|r| r.id), Some(20));
+    assert_eq!(page3.last().map(|r| r.id), Some(24));
+    // 末尾未満の件数しか返らなかったので、続きがないことを示す `None` を返す。
+    assert_eq!(cursor3, None);
+}
+
+#[test]
+fn ext2_scan_table_page_byte_budget_caps_page_and_resume_covers_all_rows_without_gaps_or_duplicates(
+) {
+    // `MAX_SCAN_PAGE_BYTES` によるバイト上限打ち切り分岐（行数上限 limit=100 には
+    // 遠く及ばない件数でも、メタデータのバイト量合計が上限を超えると打ち切られる）。
+    // カーソル再開で全ページを結合し、欠落・重複がないこと（＝全行一致）まで確認する。
+    let path = unique_db_path("scan-page-bytes");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    storage
+        .create_table(&vector_table_schema("docs", 1))
+        .expect("create_table(docs)");
+
+    // 最大メタデータ長相当（4 MiB）の行を 5 件用意する。エンコード済みバイト量の合計は
+    // すぐに `MAX_SCAN_PAGE_BYTES`（16 MiB）を超えるため、バイト上限で打ち切られるはずである。
+    let big_metadata = vec![0u8; 4 * 1024 * 1024];
+    let embedding = [1.0f32];
+    let rows: Vec<(u64, RowInput<'_>)> = (0..5u64)
+        .map(|i| {
+            (
+                i,
+                RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &embedding,
+                    metadata: &big_metadata,
+                },
+            )
+        })
+        .collect();
+    storage
+        .insert_rows_into_table("docs", &rows)
+        .expect("seed large rows");
+
+    let (page1, cursor1) = storage
+        .scan_table_page("docs", None, 100)
+        .expect("first page capped by byte budget");
+    assert!(
+        page1.len() < 5,
+        "byte budget must cap the page before the row limit (100) is reached, got {} rows",
+        page1.len()
+    );
+    assert!(
+        !page1.is_empty(),
+        "at least one row must be returned even under a tight byte budget"
+    );
+    assert!(
+        cursor1.is_some(),
+        "a capped page must report a continuation cursor"
+    );
+
+    let mut all_ids: Vec<u64> = page1.iter().map(|r| r.id).collect();
+    let mut cursor = cursor1;
+    loop {
+        let (page, next_cursor) = storage
+            .scan_table_page("docs", cursor, 100)
+            .expect("subsequent page after byte-budget cap");
+        all_ids.extend(page.iter().map(|r| r.id));
+        if next_cursor.is_none() {
+            break;
+        }
+        cursor = next_cursor;
+    }
+    all_ids.sort_unstable();
+    assert_eq!(
+        all_ids,
+        (0..5u64).collect::<Vec<_>>(),
+        "resuming via cursors after byte-budget caps must yield all rows exactly once"
+    );
+}
+
+#[test]
+fn ext2_scan_table_page_limit_zero_returns_empty_page() {
+    let path = unique_db_path("scan-page-limit-zero");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    storage
+        .create_table(&vector_table_schema("docs", 1))
+        .expect("create_table(docs)");
+    storage
+        .insert_row_into_table(
+            "docs",
+            1,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: b"m",
+            },
+        )
+        .expect("seed row");
+
+    let (page, cursor) = storage
+        .scan_table_page("docs", None, 0)
+        .expect("limit=0 must not error");
+    assert!(page.is_empty());
+    assert_eq!(cursor, None);
+}
+
+#[test]
+fn ext2_scan_table_page_after_u64_max_returns_empty_page() {
+    // `after == Some(u64::MAX)` は `checked_add(1)` がオーバーフローする境界値。
+    // 「これ以上続きがない」ことを示す空ページを返す（`storage.rs::scan_page` と同じ契約）。
+    let path = unique_db_path("scan-page-after-max");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    storage
+        .create_table(&vector_table_schema("docs", 1))
+        .expect("create_table(docs)");
+    storage
+        .insert_row_into_table(
+            "docs",
+            u64::MAX,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: b"m",
+            },
+        )
+        .expect("seed row at id=u64::MAX");
+
+    let (page, cursor) = storage
+        .scan_table_page("docs", Some(u64::MAX), 10)
+        .expect("after=u64::MAX must not error");
+    assert!(page.is_empty());
+    assert_eq!(cursor, None);
+}
+
 #[test]
 fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
     let path = unique_db_path("ext2-notfound");
