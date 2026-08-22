@@ -287,11 +287,13 @@ fn mixed_dim_rows_roundtrip_intact() {
     fn assert_rows_match(storage: &Storage, expected: &[RowRef<'_>]) {
         // 上限付きページングで全行を読み切る（`scan()` ではなく `scan_page` を使う方針。
         // `docs/design/concurrent-write-verification.md` の既存知見に従う）。
+        // ページサイズは総行数（PER_TABLE_ROWS * テーブル数）未満に固定し、cursor が
+        // 複数ページへ跨って進行する経路・`page_len == 0` ガードの分岐を実際に通す。
         let mut all_rows = Vec::new();
         let mut cursor = None;
         loop {
             let (page, next_cursor) = storage
-                .scan_page(cursor, 64)
+                .scan_page(cursor, 16)
                 .expect("scan_page should succeed");
             let page_len = page.len();
             all_rows.extend(page);

@@ -15,10 +15,29 @@
 //! （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::storage::{RowInput, Storage, Visibility};
+
+/// 全書き込み行に付与するダミーのテナント識別子（`RowInput::tenant_id` は RLS 相当の
+/// テナント境界判定用フィールド（`storage.rs` 参照）であり、本ハーネスはテナント境界の
+/// 判定経路を検証しないため固定値を使う。テーブル帰属の記録は `metadata_for` 側で行う）。
+const TENANT_ID: &str = "bench-tenant";
+
+static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 実行終了時（panic 時含む）に一時 DB ファイルを確実に削除するガード
+/// （`tests/multi_dim_tables.rs` の `CleanupGuard` と同じ方針。手動実行専用ツールのため
+/// ヘルパ共通化はせず複製する）。
+struct CleanupGuard(PathBuf);
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// 混在 DB 側で使う 3 次元（テストと同一の既定値。TASK-91 上、データセット選定自体は
 /// 人間の判断事項のため、決定論的な合成ベクトルを既定とする）。
@@ -35,10 +54,13 @@ const BATCH_SIZE: u64 = 20;
 /// 小メタデータ列（テーブル名を模した固定長ダミー相当のサイズ）。
 const METADATA_LEN: usize = 64;
 
+/// 一意な一時 DB ファイルパスを払い出す（プロセス ID のみでは panic 後の残置ファイルと
+/// PID 再利用時に衝突しうるため、プロセス内連番も組み合わせる）。
 fn unique_db_path(label: &str) -> PathBuf {
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
     path.push(format!(
-        "vector-db-engine-task91-bench-{label}-{}.redb",
+        "vector-db-engine-task91-bench-{label}-{}-{seq}.redb",
         std::process::id()
     ));
     path
@@ -49,10 +71,15 @@ fn embedding_for(id: u64, dim: u32) -> Vec<f32> {
     (0..dim).map(|i| (id + i as u64) as f32).collect()
 }
 
-fn metadata_for(id: u64) -> Vec<u8> {
+/// `table_name` はテスト側（`tests/multi_dim_tables.rs`）と同じくテーブル帰属を
+/// メタデータへ記録する目的でのみ使う（行ストア自体はテーブル関連付けを持たない）。
+fn metadata_for(id: u64, table_name: &str) -> Vec<u8> {
     let mut buf = vec![0u8; METADATA_LEN];
     let id_bytes = id.to_le_bytes();
+    let name_bytes = table_name.as_bytes();
+    let name_len = name_bytes.len().min(METADATA_LEN - id_bytes.len());
     buf[..id_bytes.len()].copy_from_slice(&id_bytes);
+    buf[id_bytes.len()..id_bytes.len() + name_len].copy_from_slice(&name_bytes[..name_len]);
     buf
 }
 
@@ -100,13 +127,15 @@ fn write_table(storage: &Storage, table_name: &str, dim: u32, id_base: u64) -> V
         let embeddings: Vec<Vec<f32>> = (0..BATCH_SIZE)
             .map(|offset| embedding_for(batch_base + offset, dim))
             .collect();
-        let metadatas: Vec<Vec<u8>> = (0..BATCH_SIZE).map(metadata_for).collect();
+        let metadatas: Vec<Vec<u8>> = (0..BATCH_SIZE)
+            .map(|offset| metadata_for(batch_base + offset, table_name))
+            .collect();
         let rows: Vec<(u64, RowInput<'_>)> = (0..BATCH_SIZE as usize)
             .map(|i| {
                 (
                     batch_base + i as u64,
                     RowInput {
-                        tenant_id: table_name,
+                        tenant_id: TENANT_ID,
                         visibility: Visibility::Public,
                         embedding: &embeddings[i],
                         metadata: &metadatas[i],
@@ -132,11 +161,17 @@ fn scan_all(storage: &Storage) -> (Duration, usize) {
         let (page, next_cursor) = storage
             .scan_page(cursor, 512)
             .expect("scan_page should succeed");
-        total_rows += page.len();
+        let page_len = page.len();
+        total_rows += page_len;
         if next_cursor.is_none() {
             break;
         }
         cursor = next_cursor;
+        // 空ページが続く異常系での無限ループを防ぐガード
+        // （`tests/multi_dim_tables.rs` の `assert_rows_match` と同じ方針）。
+        if page_len == 0 {
+            break;
+        }
     }
     (started.elapsed(), total_rows)
 }
@@ -164,6 +199,7 @@ fn main() {
 
     // (a) 単一次元（768）のみのベースライン DB。
     let baseline_path = unique_db_path("baseline-single-768");
+    let _baseline_guard = CleanupGuard(baseline_path.clone());
     {
         let storage = Storage::open(&baseline_path).expect("open baseline storage");
         storage
@@ -187,10 +223,11 @@ fn main() {
             file_size(&baseline_path)
         );
     }
-    let _ = std::fs::remove_file(&baseline_path);
+    drop(_baseline_guard);
 
     // (b) 384/768/1536 混在 DB。各テーブル同一行数（ROWS_PER_TABLE）をバッチ書き込みする。
     let mixed_path = unique_db_path("mixed-384-768-1536");
+    let _mixed_guard = CleanupGuard(mixed_path.clone());
     {
         let storage = Storage::open(&mixed_path).expect("open mixed storage");
         let table_names = ["docs_384", "docs_768", "docs_1536"];
@@ -204,13 +241,15 @@ fn main() {
         }
 
         let mut all_latencies = Vec::new();
-        let overall_start = Instant::now();
         for (idx, (name, dim)) in table_names.iter().zip(MIXED_DIMS.iter()).enumerate() {
             let id_base = idx as u64 * 10_000_000;
             let latencies = write_table(&storage, name, *dim, id_base);
             all_latencies.extend(latencies);
         }
-        let total = overall_start.elapsed();
+        // baseline 側と同じ基準（バッチ計測区間の合計。テーブル間の embedding/metadata
+        // 生成コストを含まない）で `total` を算出し、`rows_per_sec` を公平に比較できる
+        // ようにする（wall-clock を使うと生成コスト分だけ不利に見えてしまう）。
+        let total: Duration = all_latencies.iter().sum();
         let rows = ROWS_PER_TABLE * table_names.len() as u64;
         let result = summarize(all_latencies, total, rows);
         print_write_result("mixed(384/768/1536)", &result);
@@ -221,5 +260,5 @@ fn main() {
             file_size(&mixed_path)
         );
     }
-    let _ = std::fs::remove_file(&mixed_path);
+    drop(_mixed_guard);
 }
