@@ -132,7 +132,12 @@ impl StorageBackend for PowerLossBackend {
     fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
         let state = self.state.lock().expect("lock poisoned");
         let current = state.current();
-        let start = offset as usize;
+        // `write`/`set_len` と同じく `usize::try_from` で検証する。32-bit 環境では
+        // `u64` の offset が `usize::MAX` を超え得るため、truncating cast（`as usize`）
+        // だと下位ビットへ切り詰められ、範囲外エラーにならず別位置のデータを誤って
+        // 返す恐れがある（read/write の契約不整合）。
+        let start = usize::try_from(offset)
+            .map_err(|_| io::Error::other("read offset does not fit usize"))?;
         let end = start
             .checked_add(out.len())
             .ok_or_else(|| io::Error::other("read range overflow"))?;
@@ -162,7 +167,11 @@ impl StorageBackend for PowerLossBackend {
                 }
                 let end = start.saturating_add(data.len());
                 if end > len {
-                    data.truncate(len - start);
+                    // `start < len` はこの分岐に到達する時点で保証済み（上の
+                    // `if start >= len` 早期 return 参照）なので理論上は減算が
+                    // アンダーフローしないが、生の `-` を残さない方針（coding-rust.md）
+                    // に合わせて `saturating_sub` にしておく。
+                    data.truncate(len.saturating_sub(start));
                 }
                 true
             });
