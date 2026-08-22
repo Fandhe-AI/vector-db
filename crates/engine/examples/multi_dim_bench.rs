@@ -117,39 +117,51 @@ fn summarize(mut latencies: Vec<Duration>, total: Duration, rows: u64) -> WriteR
     }
 }
 
-/// `table_name`（次元 `dim`）へ `id_base` から `ROWS_PER_TABLE` 行を `put_batch` で
-/// 書き込み、バッチごとの所要時間を集めて返す。
+/// `table_name`（次元 `dim`）へ、`id_base` を起点に `batch_idx` 番目の 1 バッチ
+/// （`BATCH_SIZE` 行）を `put_batch` で書き込み、所要時間を返す（1 呼び出し = 1 バッチ）。
+/// baseline（単一テーブル連続書き込み）・mixed（テーブル間バッチ巡回書き込み）の
+/// どちらの呼び出しパターンにも使う共通の最小単位。
+fn write_one_batch(
+    storage: &Storage,
+    table_name: &str,
+    dim: u32,
+    id_base: u64,
+    batch_idx: u64,
+) -> Duration {
+    let batch_base = id_base + batch_idx * BATCH_SIZE;
+    let embeddings: Vec<Vec<f32>> = (0..BATCH_SIZE)
+        .map(|offset| embedding_for(batch_base + offset, dim))
+        .collect();
+    let metadatas: Vec<Vec<u8>> = (0..BATCH_SIZE)
+        .map(|offset| metadata_for(batch_base + offset, table_name))
+        .collect();
+    let rows: Vec<(u64, RowInput<'_>)> = (0..BATCH_SIZE as usize)
+        .map(|i| {
+            (
+                batch_base + i as u64,
+                RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &embeddings[i],
+                    metadata: &metadatas[i],
+                },
+            )
+        })
+        .collect();
+    let started = Instant::now();
+    storage
+        .put_batch(&rows)
+        .expect("put_batch should succeed against a healthy database");
+    started.elapsed()
+}
+
+/// `table_name`（次元 `dim`）へ `id_base` から `ROWS_PER_TABLE` 行を、テーブル単独で
+/// 連続 `put_batch` して書き込み、バッチごとの所要時間を集めて返す（baseline 用）。
 fn write_table(storage: &Storage, table_name: &str, dim: u32, id_base: u64) -> Vec<Duration> {
     let batches = ROWS_PER_TABLE / BATCH_SIZE;
-    let mut latencies = Vec::with_capacity(batches as usize);
-    for batch_idx in 0..batches {
-        let batch_base = id_base + batch_idx * BATCH_SIZE;
-        let embeddings: Vec<Vec<f32>> = (0..BATCH_SIZE)
-            .map(|offset| embedding_for(batch_base + offset, dim))
-            .collect();
-        let metadatas: Vec<Vec<u8>> = (0..BATCH_SIZE)
-            .map(|offset| metadata_for(batch_base + offset, table_name))
-            .collect();
-        let rows: Vec<(u64, RowInput<'_>)> = (0..BATCH_SIZE as usize)
-            .map(|i| {
-                (
-                    batch_base + i as u64,
-                    RowInput {
-                        tenant_id: TENANT_ID,
-                        visibility: Visibility::Public,
-                        embedding: &embeddings[i],
-                        metadata: &metadatas[i],
-                    },
-                )
-            })
-            .collect();
-        let started = Instant::now();
-        storage
-            .put_batch(&rows)
-            .expect("put_batch should succeed against a healthy database");
-        latencies.push(started.elapsed());
-    }
-    latencies
+    (0..batches)
+        .map(|batch_idx| write_one_batch(storage, table_name, dim, id_base, batch_idx))
+        .collect()
 }
 
 /// `Storage::scan_page` で全行を読み切り、所要時間と読み取り件数を返す。
@@ -222,7 +234,10 @@ fn main() {
     }
     drop(_baseline_guard);
 
-    // (b) 384/768/1536 混在 DB。各テーブル同一行数（ROWS_PER_TABLE）をバッチ書き込みする。
+    // (b) 384/768/1536 混在 DB。「交互に書き込む」を実測するため、3 テーブルを
+    // バッチ単位で巡回（round-robin）しながら書き込む（テーブルごとに全バッチを
+    // 書き終えてから次のテーブルへ進む連続書き込みにはしない。ADR の「異なる次元
+    // テーブルへ交互に書き込んでも劣化なし」という結論の測定条件と一致させる）。
     let mixed_path = unique_db_path("mixed-384-768-1536");
     let _mixed_guard = CleanupGuard(mixed_path.clone());
     {
@@ -237,11 +252,15 @@ fn main() {
                 .unwrap_or_else(|e| panic!("create_table({name}) should succeed: {e}"));
         }
 
-        let mut all_latencies = Vec::new();
-        for (idx, (name, dim)) in table_names.iter().zip(MIXED_DIMS.iter()).enumerate() {
-            let id_base = idx as u64 * 10_000_000;
-            let latencies = write_table(&storage, name, *dim, id_base);
-            all_latencies.extend(latencies);
+        let batches_per_table = ROWS_PER_TABLE / BATCH_SIZE;
+        let mut all_latencies =
+            Vec::with_capacity((batches_per_table as usize) * table_names.len());
+        for batch_idx in 0..batches_per_table {
+            for (idx, (name, dim)) in table_names.iter().zip(MIXED_DIMS.iter()).enumerate() {
+                let id_base = idx as u64 * 10_000_000;
+                let latency = write_one_batch(&storage, name, *dim, id_base, batch_idx);
+                all_latencies.push(latency);
+            }
         }
         // baseline 側と同じ基準（バッチ計測区間の合計。テーブル間の embedding/metadata
         // 生成コストを含まない）で `total` を算出し、`rows_per_sec` を公平に比較できる
