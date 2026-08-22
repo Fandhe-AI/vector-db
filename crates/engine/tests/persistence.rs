@@ -1,9 +1,10 @@
-//! `engine::storage::Storage` の統合テスト（TASK-140、対象ビヘイビア:
-//! PERSIST-1, PERSIST-2, PERSIST-4。ポインタ: `docs/spec/04-behavior/persistence.md`）。
+//! `engine::storage::Storage` の統合テスト（TASK-140/TASK-141、対象ビヘイビア:
+//! PERSIST-1, PERSIST-2, PERSIST-3, PERSIST-4。ポインタ:
+//! `docs/spec/04-behavior/persistence.md`）。
 //!
-//! PERSIST-1・PERSIST-4 の検証は `Storage` の公開 API だけでは表現できないトランザクション
-//! 境界に踏み込むため、テストスコープでのみ `redb` を直接操作する
-//! （`crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。
+//! PERSIST-1・PERSIST-3・PERSIST-4 の検証は `Storage` の公開 API だけでは表現できない
+//! トランザクション境界・生バイト列に踏み込むため、テストスコープでのみ `redb` を
+//! 直接操作する（`crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。
 //! TASK-142・TASK-143 は本ファイルのスコープ外（ポインタ: `docs/spec/05-tasks.md`）。
 
 use std::path::PathBuf;
@@ -13,8 +14,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use engine::storage::{RowInput, Storage, StorageError};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use engine::storage::{RowInput, Storage, StorageError, Visibility};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 
 /// `Storage` 内部の行テーブルと同一の名前・型（キー: 行 ID、値: エンコード済みバイト列）。
 /// テスト側は行の中身を解釈しないため、値のエンコード詳細に依存しない。
@@ -44,7 +45,18 @@ impl Drop for CleanupGuard {
 }
 
 fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
+    row_with_rls("tenant-a", Visibility::Public, embedding, metadata)
+}
+
+fn row_with_rls<'a>(
+    tenant_id: &'a str,
+    visibility: Visibility,
+    embedding: &'a [f32],
+    metadata: &'a [u8],
+) -> RowInput<'a> {
     RowInput {
+        tenant_id,
+        visibility,
         embedding,
         metadata,
     }
@@ -356,5 +368,128 @@ fn storage_get_rejects_corrupted_row_bytes() {
     assert!(
         matches!(err, StorageError::Codec(_)),
         "expected a decode failure (StorageError::Codec), got: {err}"
+    );
+}
+
+// 対象ビヘイビア: PERSIST-3（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
+// 複数テナント・複数 visibility の行が put_batch → 再オープン後も get / scan で
+// tenant_id・visibility を含めて同居保持されていることを確認する。
+#[test]
+fn persist3_tenant_and_visibility_survive_reopen_across_get_and_scan() {
+    let path = unique_db_path("persist3-reopen");
+    let _cleanup = CleanupGuard(path.clone());
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let rows = vec![
+            (
+                1u64,
+                row_with_rls("tenant-a", Visibility::Public, &[1.0, 2.0], b"a-public"),
+            ),
+            (
+                2u64,
+                row_with_rls("tenant-a", Visibility::Private, &[3.0], b"a-private"),
+            ),
+            (
+                3u64,
+                row_with_rls(
+                    "tenant-b",
+                    Visibility::Public,
+                    &[4.0, 5.0, 6.0],
+                    b"b-public",
+                ),
+            ),
+        ];
+        storage.put_batch(&rows).expect("seed multi-tenant rows");
+    } // Storage を drop し、再オープンで永続化されていることを検証する。
+
+    let storage = Storage::open(&path).expect("reopen storage");
+
+    let row1 = storage.get(1).expect("row 1 must survive reopen");
+    assert_eq!(row1.tenant_id, "tenant-a");
+    assert_eq!(row1.visibility, Visibility::Public);
+    assert_eq!(row1.metadata, b"a-public");
+
+    let row2 = storage.get(2).expect("row 2 must survive reopen");
+    assert_eq!(row2.tenant_id, "tenant-a");
+    assert_eq!(row2.visibility, Visibility::Private);
+    assert_eq!(row2.metadata, b"a-private");
+
+    let row3 = storage.get(3).expect("row 3 must survive reopen");
+    assert_eq!(row3.tenant_id, "tenant-b");
+    assert_eq!(row3.visibility, Visibility::Public);
+    assert_eq!(row3.metadata, b"b-public");
+
+    let mut scanned = storage.scan().expect("scan after reopen");
+    scanned.sort_by_key(|r| r.id);
+    assert_eq!(scanned.len(), 3);
+    assert_eq!(
+        scanned
+            .iter()
+            .map(|r| (r.id, r.tenant_id.as_str(), r.visibility))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "tenant-a", Visibility::Public),
+            (2, "tenant-a", Visibility::Private),
+            (3, "tenant-b", Visibility::Public),
+        ]
+    );
+}
+
+// 対象ビヘイビア: PERSIST-3（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
+// tenant_id・visibility が行本体とは別テーブル（別カラムファミリ相当）に分離されず、
+// ROWS_TABLE の単一値バイト列に行本体と同一エントリとして同居していることを、
+// raw redb ハンドルでバイト列を直接検査して確認する。
+#[test]
+fn persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table() {
+    let path = unique_db_path("persist3-colocated");
+    let _cleanup = CleanupGuard(path.clone());
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .put(
+                1,
+                &row_with_rls("tenant-x", Visibility::Private, &[7.0], b"meta"),
+            )
+            .expect("seed row");
+    }
+
+    let db = Database::open(&path).expect("reopen raw database");
+    let read_txn = db.begin_read().expect("begin read txn");
+
+    // データベース内に ROWS_TABLE 以外のテーブル（RLS フィールド専用の別テーブル等）が
+    // 作られていないこと。`list_tables` で実際のテーブル集合を検査することで、
+    // 「別テーブルに分離されていない」ことを直接確認する（部分文字列一致による
+    // 間接証拠ではなく、テーブル構成そのものを見る）。
+    let table_names: Vec<String> = read_txn
+        .list_tables()
+        .expect("list tables")
+        .map(|t| t.name().to_string())
+        .collect();
+    assert_eq!(
+        table_names,
+        vec!["rows".to_string()],
+        "expected exactly the ROWS_TABLE ('rows'); RLS fields must not live in a separate table"
+    );
+
+    let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
+    let guard = table.get(1u64).expect("get row 1").expect("row 1 exists");
+    let raw = guard.value();
+
+    // レイアウト: [version(1)][tenant_len(2) le]["tenant-x"(8)][visibility(1)]...
+    // 位置指定で tenant_id・visibility の両方が同一エントリのバイト列内にあることを
+    // 確認する（部分文字列探索ではなく、実際のオンディスクレイアウトを検査する）。
+    let tenant_start = 1 + 2;
+    let tenant_end = tenant_start + "tenant-x".len();
+    assert_eq!(
+        raw.get(tenant_start..tenant_end),
+        Some(b"tenant-x".as_slice()),
+        "encoded row bytes must contain the tenant_id inline at the expected offset"
+    );
+    assert_eq!(
+        raw.get(tenant_end).copied(),
+        Some(0x02u8), // Visibility::Private の永続化コード
+        "encoded row bytes must contain the visibility byte immediately after tenant_id"
     );
 }
