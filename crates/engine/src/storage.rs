@@ -41,7 +41,7 @@ const MAX_TENANT_ID_LEN: u16 = 256;
 /// 埋め込み次元数の上限。デコード時にこの値を超える `dim` を確認した場合、
 /// `Vec::with_capacity` へ渡す前に拒否する（未検証の長さフィールドを無制限アロケーションに
 /// 使わない。.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-const MAX_EMBEDDING_DIM: u32 = 65_536;
+pub(crate) const MAX_EMBEDDING_DIM: u32 = 65_536;
 
 /// メタデータ列のバイト長上限。埋め込みと同様、デコード前に上限検証する。
 const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
