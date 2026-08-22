@@ -1,0 +1,49 @@
+# EditorConfig（https://editorconfig.org）
+# リポジトリ全体のインデント・改行・文字コード規約。
+# rustfmt 4 スペース・YAML/TOML/JSON 2 スペース・Makefile タブに合わせている
+# （Fandhe-AI/rust-ai-library-v1 と同一方針）。
+
+# これ以上上位ディレクトリの .editorconfig を検索しない
+root = true
+
+# 全ファイル共通の既定値
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust ソース（rustfmt 既定の 4 スペースに準拠）
+[*.rs]
+indent_style = space
+indent_size = 4
+
+# TOML 設定（Cargo.toml・deny.toml 等）
+[*.toml]
+indent_style = space
+indent_size = 2
+
+# YAML（.github/workflows・compose.yaml・lefthook.yml）
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# JSON（skills-lock.json・.claude/settings.json 等）
+[*.json]
+indent_style = space
+indent_size = 2
+
+# シェルスクリプト
+[*.sh]
+indent_style = space
+indent_size = 4
+
+# Markdown（行末 2 スペースの強制改行記法を壊さないため末尾空白を保持）
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile（レシピ行はハードタブ必須）
+[Makefile]
+indent_style = tab

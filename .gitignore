@@ -1,0 +1,20 @@
+# Rust ビルド成果物
+target/
+
+# ローカル作業ディレクトリ（git 管理外）
+_/
+
+# macOS
+.DS_Store
+
+# エディタ
+*.swp
+*~
+.idea/
+
+# Claude Code ローカル設定
+.claude/settings.local.json
+.claude/worktrees/
+
+# 環境変数
+.env*
