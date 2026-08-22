@@ -18,6 +18,13 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
+/// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
+/// `crates/engine/tests/power_loss.rs` 統合テストの双方から `#[path]` 経由で
+/// 同一ソースを取り込む。テストコードのみで使うため通常ビルドには含めない。
+#[cfg(test)]
+mod power_loss_model;
+
 /// 行データを格納するテーブル。キーは行 ID（`u64`）、値は [`encode_row`] でエンコードした
 /// バイト列。テーブル名は `docs/spec` 側の成果物指定に依存しないローカルな識別子。
 ///
@@ -905,172 +912,13 @@ mod tests {
     /// テスト専用の `redb::Database`（`StorageBackend` 差し替え済み）を渡せる。
     mod power_loss {
         use super::*;
-        use std::io;
-        use std::sync::{Arc, Mutex};
 
+        // 電源断シミュレーション用 `StorageBackend` の基本実装（`BackendState`/
+        // `PowerLossBackend`）は `crates/engine/tests/power_loss.rs` と共有する
+        // ため `power_loss_model`（`crate::storage::power_loss_model`）へ分離済み。
+        // 詳細・分離理由は同モジュールの doc を参照。
+        use crate::storage::power_loss_model::PowerLossBackend;
         use redb::StorageBackend;
-
-        /// [`PowerLossBackend`] が保持する内部状態。
-        ///
-        /// - `durable`: 直近の `sync_data()` 完了時点のバイト列（電源断後も必ず残る像）。
-        /// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新する（モデルの限界。
-        ///   `set_len` はメタデータ操作として即時 durable 化する単純化を置いている）。
-        /// - `log`: 直近の `sync_data()` 以降に発行された `write()` の記録（発行順）。
-        ///   `write()` はこの `log` に積むのみで `durable` を更新しない。`sync_data()` が
-        ///   呼ばれて初めて `log` を `durable` へ反映する（`crates/engine/tests/power_loss.rs`
-        ///   の `PowerLossBackend` と同じ commit/sync 契約。sync を経ない書き込みが
-        ///   durable 像へ紛れ込むと、シナリオ 4 の検証意図が成立しなくなるため、
-        ///   この分離が本質）。
-        #[derive(Debug)]
-        struct BackendState {
-            durable: Vec<u8>,
-            len: usize,
-            log: Vec<(u64, Vec<u8>)>,
-        }
-
-        impl BackendState {
-            fn new() -> Self {
-                Self {
-                    durable: Vec::new(),
-                    len: 0,
-                    log: Vec::new(),
-                }
-            }
-
-            fn from_bytes(bytes: Vec<u8>) -> Self {
-                let len = bytes.len();
-                Self {
-                    durable: bytes,
-                    len,
-                    log: Vec::new(),
-                }
-            }
-
-            /// `durable` を `len` にリサイズ（不足分はゼロ埋め）した基底バッファに、
-            /// 未 sync の `log` をすべて適用した「見かけ上の現在の状態」を返す
-            /// （sync 前の自分の書き込みは redb 自身には見える必要がある。read-your-writes）。
-            ///
-            /// `write()` は現在の `len` を越える offset へも書けて構わない（POSIX の
-            /// write が EOF を越えて暗黙にファイルを伸長するのと同じ振る舞いを許容する
-            /// ため、ここでは `end` に合わせて `buf` を伸長する）。一方 `set_len` による
-            /// 明示的な縮小後は、`log` 自体が新しい長さへ切り詰め済み（`set_len` 参照）
-            /// のため、縮小後 EOF より後ろの pending write がここで幽霊のように復活する
-            /// ことはない。
-            fn current(&self) -> Vec<u8> {
-                let mut buf = self.durable.clone();
-                buf.resize(self.len, 0);
-                for (offset, data) in &self.log {
-                    let start = *offset as usize;
-                    let end = start + data.len();
-                    if end > buf.len() {
-                        buf.resize(end, 0);
-                    }
-                    buf[start..end].copy_from_slice(data);
-                }
-                buf
-            }
-        }
-
-        /// OS の page cache を模した `redb::StorageBackend` 実装。実ファイルを一切使わず、
-        /// メモリ上の [`BackendState`] だけで完結する（テストの決定論性・実行速度のため）。
-        /// `write()` は `log` に積むのみで `durable`（電源断後も必ず残る像）を更新せず、
-        /// `sync_data()` の時点で初めて `log` を `durable` へ反映する
-        /// （`crates/engine/tests/power_loss.rs` の `PowerLossBackend` と同じ commit/sync
-        /// 契約。部分 write-back の探索は同ファイルのシナリオ 2・3 が担い、本モジュールは
-        /// 「sync 済みの durable 像」から再オープンする経路のみを検証する）。
-        #[derive(Debug, Clone)]
-        struct PowerLossBackend {
-            state: Arc<Mutex<BackendState>>,
-        }
-
-        impl PowerLossBackend {
-            fn new() -> Self {
-                Self {
-                    state: Arc::new(Mutex::new(BackendState::new())),
-                }
-            }
-
-            fn from_bytes(bytes: Vec<u8>) -> Self {
-                Self {
-                    state: Arc::new(Mutex::new(BackendState::from_bytes(bytes))),
-                }
-            }
-
-            /// 直近 `sync_data()` 時点のバイト列（電源断で必ず残る像）を取得する。
-            fn durable_snapshot(&self) -> Vec<u8> {
-                self.state.lock().expect("lock poisoned").durable.clone()
-            }
-
-            /// 直近 `sync_data()` 以降に記録された未 sync の `write()` 件数。
-            /// 「commit が実際に sync まで完了しているか」を検証するために使う
-            /// （否定コントロール・シナリオ 4 のどちらも、この値が意図した状態
-            /// （0 件／1 件以上）であることを確認したうえで durable 像を比較する）。
-            fn pending_write_count(&self) -> usize {
-                self.state.lock().expect("lock poisoned").log.len()
-            }
-        }
-
-        impl StorageBackend for PowerLossBackend {
-            fn len(&self) -> io::Result<u64> {
-                Ok(self.state.lock().expect("lock poisoned").len as u64)
-            }
-
-            fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-                let state = self.state.lock().expect("lock poisoned");
-                let current = state.current();
-                let start = offset as usize;
-                let end = start
-                    .checked_add(out.len())
-                    .ok_or_else(|| io::Error::other("read range overflow"))?;
-                let slice = current
-                    .get(start..end)
-                    .ok_or_else(|| io::Error::other("read out of bounds"))?;
-                out.copy_from_slice(slice);
-                Ok(())
-            }
-
-            fn set_len(&self, len: u64) -> io::Result<()> {
-                let mut state = self.state.lock().expect("lock poisoned");
-                let len =
-                    usize::try_from(len).map_err(|_| io::Error::other("len does not fit usize"))?;
-                let old_len = state.len;
-                state.len = len;
-                // メタデータ操作は即時 durable 化する単純化（構造体 doc 参照）。
-                state.durable.resize(len, 0);
-                if len < old_len {
-                    // 縮小時、新しい EOF 以降の pending write は破棄し、EOF をまたぐ
-                    // write は新しい長さに合わせて切り詰める。切り詰めないと、`current`/
-                    // `apply_subset` が後で len を越えて再拡張してしまい、`len()` と
-                    // 実際のスナップショットが矛盾する（電源断像として不正確になる）。
-                    state.log.retain_mut(|(offset, data)| {
-                        let start = *offset as usize;
-                        if start >= len {
-                            return false;
-                        }
-                        let end = start.saturating_add(data.len());
-                        if end > len {
-                            data.truncate(len - start);
-                        }
-                        true
-                    });
-                }
-                Ok(())
-            }
-
-            fn sync_data(&self) -> io::Result<()> {
-                let mut state = self.state.lock().expect("lock poisoned");
-                let synced = state.current();
-                state.durable = synced;
-                state.log.clear();
-                Ok(())
-            }
-
-            fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-                let mut state = self.state.lock().expect("lock poisoned");
-                state.log.push((offset, data.to_vec()));
-                Ok(())
-            }
-        }
 
         /// 新規（空）の [`PowerLossBackend`] 上に `redb::Database` を開く。
         fn open_fresh() -> (PowerLossBackend, redb::Database) {

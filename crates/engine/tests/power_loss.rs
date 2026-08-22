@@ -36,67 +36,35 @@
 //! `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテストへ移設した
 //! （`Storage` の private フィールドへ crate 内から直接アクセスすることで、
 //! 公開 API へバックエンド差し替え用のコンストラクタを増やさないため）。
+//! `BackendState`/`PowerLossBackend` の基本実装（commit/sync 契約のモデル本体）は
+//! 両テストで共有する必要があるため `crate::storage::power_loss_model` へ分離し、
+//! 本ファイルは `#[path]` で同一ソースを取り込んだ上で、部分 write-back 固有の
+//! 探索（`apply_subset`/`crash_image`）だけを拡張 `impl` として追加している。
 
-use std::io;
-use std::sync::{Arc, Mutex};
-
-use redb::{Database, ReadableDatabase, StorageBackend, TableDefinition};
+use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// テスト対象のテーブル定義（`crates/engine/src/storage.rs` の `ROWS_TABLE` と同一の
 /// キー・値型。本ファイルは行の中身を解釈しないため、値のエンコード詳細に依存しない）。
 const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
-/// [`PowerLossBackend`] が保持する内部状態。
-///
-/// - `durable`: 直近の `sync_data()` 完了時点のバイト列（電源断後も必ず残る像）。
-/// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新する（モデルの限界を参照）。
-/// - `log`: 直近の `sync_data()` 以降に発行された `write()` の記録（発行順）。
-///   電源断シミュレーションでは、この一部（部分集合）だけが `durable` に反映された状態を
-///   再現することで、write-back の並べ替え・部分反映を近似する。
-#[derive(Debug)]
-struct BackendState {
-    durable: Vec<u8>,
-    len: usize,
-    log: Vec<(u64, Vec<u8>)>,
-}
+// `BackendState`/`PowerLossBackend`（commit/sync 契約のモデル本体）は
+// `crates/engine/src/storage.rs` の `#[cfg(test)]` ユニットテストと共有するため、
+// 同一ソースを `#[path]` でこのテストバイナリへも取り込む（`crate::storage::power_loss_model`
+// 参照）。ここでは部分 write-back 固有の探索（`apply_subset`/`crash_image`）だけを
+// 拡張 `impl` として追加する。
+#[path = "../src/storage/power_loss_model.rs"]
+mod power_loss_model;
+use power_loss_model::{BackendState, PowerLossBackend};
 
 impl BackendState {
-    fn new() -> Self {
-        Self {
-            durable: Vec::new(),
-            len: 0,
-            log: Vec::new(),
-        }
-    }
-
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        let len = bytes.len();
-        Self {
-            durable: bytes,
-            len,
-            log: Vec::new(),
-        }
-    }
-
-    /// `durable` を `len` にリサイズ（不足分はゼロ埋め）した基底バッファ。
-    fn base(&self) -> Vec<u8> {
+    /// `log` のうち `indices` に含まれるものだけを、記録順（`indices` は昇順を期待）で
+    /// 基底バッファ（`durable` を `len` にリサイズしたもの）へ適用した結果を返す。
+    /// 全 `indices` を渡せば `current()` と同じ「現在の見かけ上の状態」になり、空を渡せば
+    /// 「直近 sync 時点のまま」の電源断像になる（部分 write-back の並べ替え近似。
+    /// シナリオ 2・3 専用）。
+    fn apply_subset(&self, indices: &[usize]) -> Vec<u8> {
         let mut buf = self.durable.clone();
         buf.resize(self.len, 0);
-        buf
-    }
-
-    /// `log` のうち `indices` に含まれるものだけを、記録順（`indices` は昇順を期待）で
-    /// 基底バッファへ適用した結果を返す。全 `indices` を渡せば「現在の見かけ上の状態」
-    /// （sync 前も含めた読み取り側の view）になり、空を渡せば「直近 sync 時点のまま」の
-    /// 電源断像になる。
-    ///
-    /// `write()` は現在の `len` を越える offset へも書けて構わない（POSIX の write が
-    /// EOF を越えて暗黙にファイルを伸長するのと同じ振る舞いを許容するため、ここでは
-    /// `end` に合わせて `buf` を伸長する）。一方 `set_len` による明示的な縮小後は、
-    /// `log` 自体が新しい長さへ切り詰め済み（`set_len` 参照）のため、縮小後 EOF より
-    /// 後ろの pending write がここで幽霊のように復活することはない。
-    fn apply_subset(&self, indices: &[usize]) -> Vec<u8> {
-        let mut buf = self.base();
         for &i in indices {
             let (offset, data) = &self.log[i];
             let start = *offset as usize;
@@ -108,115 +76,16 @@ impl BackendState {
         }
         buf
     }
-
-    fn current(&self) -> Vec<u8> {
-        let all: Vec<usize> = (0..self.log.len()).collect();
-        self.apply_subset(&all)
-    }
-}
-
-/// OS の page cache を模した `redb::StorageBackend` 実装。実ファイルを一切使わず、
-/// メモリ上の [`BackendState`] だけで完結する（テストの決定論性・実行速度のため）。
-///
-/// `Arc<Mutex<..>>` で状態を共有し、`redb::Database` へ所有権を渡した後も、
-/// テスト側は clone したハンドルから任意時点のスナップショットを取得できる
-/// （「電源断」＝そのスナップショットのみを初期像として新しい `Database` を開き直すこと）。
-#[derive(Debug, Clone)]
-struct PowerLossBackend {
-    state: Arc<Mutex<BackendState>>,
 }
 
 impl PowerLossBackend {
-    fn new() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(BackendState::new())),
-        }
-    }
-
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(BackendState::from_bytes(bytes))),
-        }
-    }
-
-    /// 直近 `sync_data()` 時点のバイト列（電源断で必ず残る像）を取得する。
-    fn durable_snapshot(&self) -> Vec<u8> {
-        self.state.lock().expect("lock poisoned").durable.clone()
-    }
-
-    /// 直近 `sync_data()` 以降に記録された `write()` の件数。
-    fn pending_write_count(&self) -> usize {
-        self.state.lock().expect("lock poisoned").log.len()
-    }
-
     /// 指定した部分集合（`log` へのインデックス。昇順であること）だけを直近 sync 像へ
-    /// 適用した「電源断時点の像」を返す。
+    /// 適用した「電源断時点の像」を返す（シナリオ 2・3 専用）。
     fn crash_image(&self, subset: &[usize]) -> Vec<u8> {
         self.state
             .lock()
             .expect("lock poisoned")
             .apply_subset(subset)
-    }
-}
-
-impl StorageBackend for PowerLossBackend {
-    fn len(&self) -> io::Result<u64> {
-        Ok(self.state.lock().expect("lock poisoned").len as u64)
-    }
-
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        let state = self.state.lock().expect("lock poisoned");
-        let current = state.current();
-        let start = offset as usize;
-        let end = start
-            .checked_add(out.len())
-            .ok_or_else(|| io::Error::other("read range overflow"))?;
-        let slice = current
-            .get(start..end)
-            .ok_or_else(|| io::Error::other("read out of bounds"))?;
-        out.copy_from_slice(slice);
-        Ok(())
-    }
-
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        let mut state = self.state.lock().expect("lock poisoned");
-        let len = usize::try_from(len).map_err(|_| io::Error::other("len does not fit usize"))?;
-        let old_len = state.len;
-        state.len = len;
-        // メタデータ操作は即時 durable 化する単純化（モジュール doc の「モデルの限界」参照）。
-        state.durable.resize(len, 0);
-        if len < old_len {
-            // 縮小時、新しい EOF 以降の pending write は破棄し、EOF をまたぐ write は
-            // 新しい長さに合わせて切り詰める。切り詰めないと `current`/`apply_subset` が
-            // 後で len を越えて再拡張してしまい、`len()` と実際のスナップショットが
-            // 矛盾する（電源断像として不正確になる）。
-            state.log.retain_mut(|(offset, data)| {
-                let start = *offset as usize;
-                if start >= len {
-                    return false;
-                }
-                let end = start.saturating_add(data.len());
-                if end > len {
-                    data.truncate(len - start);
-                }
-                true
-            });
-        }
-        Ok(())
-    }
-
-    fn sync_data(&self) -> io::Result<()> {
-        let mut state = self.state.lock().expect("lock poisoned");
-        let synced = state.current();
-        state.durable = synced;
-        state.log.clear();
-        Ok(())
-    }
-
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        let mut state = self.state.lock().expect("lock poisoned");
-        state.log.push((offset, data.to_vec()));
-        Ok(())
     }
 }
 
