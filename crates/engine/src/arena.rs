@@ -24,9 +24,12 @@
 //! `ROWS_TABLE` へ行を書き込める。そのため「対象テーブルしかカタログに存在しない」
 //! ことは、「`ROWS_TABLE` の全行が対象テーブルの書き込みによるもの」を含意しない
 //! （対象テーブル作成より前に書かれた行が存在しても検出できない）。この帰属を
-//! 検証可能にする機構（行への永続的なテーブル識別子付与）は TASK-91 の管轄であり、
-//! 実装されるまで [`VectorArena::build`] は `pub(crate)` に留め、クレート外へ公開する
-//! テーブルスコープ API としては提供しない。
+//! 検証可能にする機構（行への永続的なテーブル識別子付与）は TASK-91 の管轄である。
+//! そのため [`VectorArena::build`] の契約は「テーブルスコープ」ではなく
+//! **「ストアスコープ」**（`ROWS_TABLE` 全体を、カタログが単一のベクトルテーブルしか
+//! 持たないという条件下で走査する）として公開する。孤立行（対象テーブル作成前に
+//! 書かれ、次元が一致する行）が含まれ得ることは既知の限界として明文化し（黙殺せず
+//! テスト・ドキュメントで固定する）、テーブル単位の帰属保証は TASK-91 まで持ち越す。
 //!
 //! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
 //! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
@@ -39,21 +42,11 @@ use crate::storage::{decode_row, Storage, StorageError, Visibility, ROWS_TABLE};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
-///
-/// `#[allow(dead_code)]`: [`VectorArena::build`] が `pub(crate)`（TASK-87 P1
-/// レビュー指摘対応）となり、現状クレート内の呼び出し元は `#[cfg(test)]` のみのため、
-/// 通常ビルドでは到達不能と判定される。TASK-91（行への永続的なテーブル識別子付与）で
-/// 呼び出し元が追加され次第この属性は不要になる。
-#[allow(dead_code)]
 const MAX_ARENA_ROWS: usize = 1_000_000;
 
 /// アリーナが確保してよい総バイト量（`vectors: Vec<f32>` 相当）の上限。
 /// `MAX_ARENA_ROWS` だけでは次元数が大きい場合に依然として巨大確保になり得るため、
 /// 行数とバイト量の両方で上限を課す（`storage.rs` の `MAX_SCAN_TOTAL_BYTES` と同方針）。
-///
-/// `#[allow(dead_code)]`: [`MAX_ARENA_ROWS`] と同じ理由（`VectorArena::build` の
-/// `pub(crate)` 化）。
-#[allow(dead_code)]
 const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
 /// アリーナ構築層の公開エラー型。`storage.rs` の設計メモ（`StorageError` への
@@ -141,10 +134,6 @@ pub type Result<T> = std::result::Result<T, ArenaError>;
 /// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、境界値検証
 /// （ちょうど上限・上限+1 等）を本ファイル内の `#[cfg(test)]` モジュールから
 /// 直接パラメータ化して再現するため。
-///
-/// `#[allow(dead_code)]`: [`MAX_ARENA_ROWS`] と同じ理由（`VectorArena::build` の
-/// `pub(crate)` 化）。
-#[allow(dead_code)]
 fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize) -> Result<usize> {
     if row_count > max_rows {
         return Err(ArenaError::CapacityExceeded);
@@ -168,9 +157,10 @@ fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize)
 /// （`redb::ReadTransaction` のスナップショット契約をそのまま引き継ぐ）。
 #[derive(Debug)]
 pub struct VectorArena {
-    /// 構築対象のテーブル名（カタログ上の識別子）。行への永続的なテーブル識別子が
-    /// まだ存在しないため（モジュールドキュメント参照）、[`VectorArena::build`] が
-    /// カタログゲートで検証した対象を呼び出し元が失わないよう保持する。
+    /// 構築時に `build` へ渡されたテーブル名（カタログゲートで「このテーブルしか
+    /// 存在しないことを検証した」対象。行への永続的なテーブル識別子がまだ存在しない
+    /// ため、`vectors`/`ids` の全行がこのテーブルに帰属することの保証ではない
+    /// （モジュールドキュメントのストアスコープ契約を参照）。
     table_name: String,
     dim: u32,
     /// 行 ID 昇順・row-major の連続バッファ。長さは常に `ids.len() * dim` と一致する。
@@ -195,8 +185,11 @@ impl VectorArena {
     /// カタログに `table_name` 以外のユーザーテーブルが 1 つでも存在する場合は
     /// `Err(ArenaError::MultipleTablesPresent)` で拒否する。ただし、このゲートは
     /// 行の帰属を証明する十分条件ではない（モジュールドキュメントのスコープ境界参照。
-    /// TASK-87 P1 レビュー指摘）。そのため本関数は `pub(crate)` に留め、クレート外へ
-    /// 公開するテーブルスコープ API としては提供しない。
+    /// TASK-87 P1 レビュー指摘）。契約は「ストアスコープ」（`ROWS_TABLE` 全体を、
+    /// カタログが単一のベクトルテーブルしか持たない条件下で走査する）であり、対象
+    /// テーブル作成前に書かれた次元一致の孤立行が含まれ得ることは既知の限界として
+    /// 明文化する。テーブル単位の帰属保証（行への永続的なテーブル識別子付与）は
+    /// TASK-91 の管轄。
     ///
     /// 単一の `storage.db().begin_read()` で全行を走査し（[`crate::storage::Storage::scan_page`]
     /// は呼び出しごとに別トランザクションを開くためページ間のスナップショット一貫性がなく、
@@ -209,11 +202,7 @@ impl VectorArena {
     /// 行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
     /// （モジュールドキュメントのスコープ境界を参照）。
     ///
-    /// `#[allow(dead_code)]`: 現状クレート内の呼び出し元は `#[cfg(test)]` のみ
-    /// （`pub(crate)` 化の理由は上記ドキュメント参照）。TASK-91 で本番の呼び出し元が
-    /// 追加され次第この属性は不要になる。
-    #[allow(dead_code)]
-    pub(crate) fn build(storage: &Storage, table_name: &str) -> Result<Self> {
+    pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
         // スキーマ取得・カタログゲート（他テーブル存在チェック）・`ROWS_TABLE` 走査を
         // すべて単一の `read_txn`（同一スナップショット）上で行う。別トランザクションに
         // 分かれていると、ゲート判定通過後・走査前に他テーブルの行が並行挿入されても
@@ -303,7 +292,8 @@ impl VectorArena {
         })
     }
 
-    /// 構築対象のテーブル名（カタログ上の識別子）。
+    /// 構築時に `build` へ渡されたテーブル名（カタログゲートで検証した対象。
+    /// 全行の帰属保証ではない。上記フィールドのドキュメント参照）。
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
@@ -482,9 +472,9 @@ mod tests {
     }
 
     // 以下は旧 `tests/arena.rs`・`tests/arena_perf.rs`（統合テスト）からの移設分。
-    // `VectorArena::build` が `pub(crate)`（TASK-87 P1 レビュー指摘対応。モジュール
-    // ドキュメントのスコープ境界参照）となったため、クレート外の統合テストからは
-    // 到達できず、クレート内の `#[cfg(test)]` モジュールへ移す必要があった。
+    // `VectorArena::build` は `pub` だが、`schema_and_tables_in_txn`（`pub(crate)`）を
+    // 経由するテスト（TOCTOU 回帰テスト）と同居させるため、クレート内の
+    // `#[cfg(test)]` モジュールへ移設したまま保持している。
 
     struct CleanupGuard(std::path::PathBuf);
 
@@ -779,12 +769,12 @@ mod tests {
     // （どのテーブルにも属さない行）を書き込み、その後で対象テーブルを作成すると、
     // カタログゲート（「対象テーブルしか存在しない」）は通過してしまう。しかし
     // モジュールドキュメントのスコープ境界のとおり、このゲートは行の帰属を証明する
-    // 十分条件ではない。`build` は `pub(crate)` であるためクレート外へは公開されず、
-    // クレート内のこの回帰テストで「孤立行が混入した場合の挙動」を固定する。
-    // 現状の実装は孤立行の有無を検出できないため、混入を許容してしまう（既知の限界。
-    // 行への永続的なテーブル識別子付与は TASK-91 の管轄）。
+    // 十分条件ではない。`build` の契約は「ストアスコープ」であり、この回帰テストで
+    // 「孤立行が混入した場合の挙動」を固定する。現状の実装は孤立行の有無を検出できない
+    // ため、混入を許容してしまう（既知の限界。行への永続的なテーブル識別子付与は
+    // TASK-91 の管轄）。
     #[test]
-    fn build_pub_crate_only_documents_orphan_row_limitation() {
+    fn build_documents_orphan_row_limitation() {
         let path = unique_db_path("orphan-row");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
