@@ -3,10 +3,10 @@
 //! 関連: EXT-2（`docs/spec/04-behavior/extensions.md`））。
 //!
 //! `crates/engine/tests/catalog.rs`（TASK-85）は単一次元のみを前提にカタログ DDL
-//! の正しさを検証する。本ファイルは「異なる `VECTOR(N)` を宣言した複数テーブルが
-//! 同一 `Storage`（同一 redb ファイル）内で共存できること」を、カタログ層
-//! （`catalog.rs`）・行ストア層（`storage.rs`）の双方にわたって検証する
-//! TASK-91 固有の回帰テストである。
+//! の正しさを検証する。本ファイルは、異なる次元を宣言した複数テーブルを単一
+//! `Storage`（同一 redb ファイル）へ `create_table` した上で、カタログ層
+//! （`catalog.rs`）・行ストア層（`storage.rs`）の双方にわたって既存 API の
+//! 挙動を検証する TASK-91 固有の回帰テストである。
 //!
 //! スコープ境界（重要）: 行とユーザーテーブル（カタログ上のテーブル名）を関連付ける
 //! 機構は本リポジトリにまだ実装されていない（後続タスクの管轄）。そのため本ファイルの
@@ -103,9 +103,9 @@ fn id_base_for(table_idx: usize) -> u64 {
     table_idx as u64 * ID_RANGE_STRIDE
 }
 
-/// 対象ビヘイビア: TABLE-2。異なる `VECTOR(N)` を宣言した 3 テーブルが単一 `Storage`
-/// に共存でき、`list_tables` / `get_table_schema` それぞれから次元宣言を正しく
-/// 読み戻せることを検証する。
+/// 対象ビヘイビア: TABLE-2。異なる次元を宣言した 3 テーブルを単一 `Storage` へ
+/// `create_table` し、`list_tables` / `get_table_schema` それぞれから次元宣言を
+/// 正しく読み戻せることを検証する。
 #[test]
 fn create_tables_with_distinct_dims_coexist() {
     let path = unique_db_path("create-coexist");
@@ -133,7 +133,7 @@ fn create_tables_with_distinct_dims_coexist() {
     }
 }
 
-/// 対象ビヘイビア: TABLE-2（永続共存）。3 テーブルを作成した DB を close → 再 `open`
+/// 対象ビヘイビア: TABLE-2。3 テーブルを作成した DB を close → 再 `open`
 /// しても、各テーブルの次元宣言が不変であることを検証する。
 #[test]
 fn schemas_survive_reopen() {
@@ -162,9 +162,9 @@ fn schemas_survive_reopen() {
     }
 }
 
-/// 対象ビヘイビア: TABLE-2（fail-closed な次元検証）。各テーブルの
-/// `validate_embedding_dim` が自テーブルの次元のみを受理し、他テーブルの次元・
-/// 0・上限超過を拒否することを検証する（テーブル間の次元混同を防ぐ境界）。
+/// 対象ビヘイビア: TABLE-2。各テーブルの `validate_embedding_dim` が自テーブルの
+/// 次元のみを受理し、他テーブルの次元・0・上限超過を拒否することを検証する
+/// （テーブル間の次元混同を防ぐ境界）。
 #[test]
 fn dim_validation_is_fail_closed() {
     let path = unique_db_path("dim-validation");
@@ -198,10 +198,10 @@ fn dim_validation_is_fail_closed() {
     }
 }
 
-/// 対象ビヘイビア: TABLE-2（行ストアの物理共存）。3 テーブル分の行を id レンジで
-/// 分離して同一 redb ファイルへ混在格納し、`scan_page` で全行を読み切って
-/// 件数・embedding 長・値・metadata が完全一致すること（混線 0 件）を検証する。
-/// 再オープン後にも同一検証を行い、永続化後も破損・混線がないことを確認する。
+/// 対象ビヘイビア: TABLE-2。3 テーブル分の行を id レンジで分離して同一 redb
+/// ファイルへ混在格納し、`scan_page` で全行を読み切って件数・embedding 長・値・
+/// metadata が完全一致すること（混線 0 件）を検証する。再オープン後にも同一検証
+/// を行い、永続化後も破損・混線がないことを確認する。
 #[test]
 fn mixed_dim_rows_roundtrip_intact() {
     let path = unique_db_path("mixed-rows");

@@ -1,5 +1,5 @@
-//! `engine::storage::Storage` の複数次元テーブル共存・実測ハーネス（TASK-91、
-//! 対象ビヘイビア: TABLE-2。ポインタ: `docs/spec/05-tasks.md` TASK-91）。
+//! `engine::storage::Storage` の複数次元テーブル実測ハーネス（TASK-91、
+//! 対象ビヘイビア: TABLE-2）。
 //!
 //! `cargo test` の対象には含めない手動実行専用ツール（`cargo run -p engine --release
 //! --example multi_dim_bench` で実行する）。時間依存の測定値を CI のアサーションに
