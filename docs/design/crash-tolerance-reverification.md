@@ -1,11 +1,10 @@
 # クラッシュ耐性再検証レポート: 電源断シナリオ
 
 - ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
-- 対応: TASK-145（MS-1・基盤・工程管理・並行フォローアップ）
+- 対応: TASK-145（ポインタ: `docs/spec/05-tasks.md`）
 - 前提: TASK-140（`redb` 永続化層、Issue #16 / PR #118 でマージ済み）・TASK-141（PR #120 でマージ済み）
-- 対象ビヘイビア: なし（基盤）。ただし PERSIST-1・PERSIST-3
-  （ポインタ: `docs/spec/04-behavior/persistence.md`）の不変条件を電源断シナリオへ
-  拡張する形で再現している
+- 対象ビヘイビア: PERSIST-1・PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）を
+  電源断シナリオへ拡張する形で再検証している
 
 ## 目的
 
@@ -180,9 +179,7 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 - 実デバイス・実 OS 環境での電源断試験（残リスク節を参照。別途ユーザー承認のうえ
   Issue 化する）
-- `docs/spec` submodule の変更（spec リポ側の作業。本リポからは触らない。
-  spec 側の宿題記述の消し込みが必要な場合は spec リポ側の課題としてユーザーに
-  別途報告する）
+- `docs/spec` submodule の変更（spec リポ側の作業。本リポからは触らない）
 - `Storage::open`（本番が実際に使う唯一のオープン経路）自体への `StorageBackend`
   差し替えフック追加。代わりに `test-support` feature 限定の別コンストラクタ
   `Storage::from_database_for_testing` を追加し、`Storage::open` 自体は

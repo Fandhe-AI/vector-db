@@ -1,6 +1,7 @@
-//! 電源断シミュレーションによるクラッシュ耐性の再検証テスト（TASK-145、対象ビヘイビア:
-//! なし（基盤タスク）。PERSIST-1・PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）
-//! を電源断シナリオへ拡張して再現する）。
+//! 電源断シミュレーションによるクラッシュ耐性の再検証テスト（TASK-145、ポインタ:
+//! `docs/spec/05-tasks.md`。PERSIST-1・PERSIST-3、ポインタ:
+//! `docs/spec/04-behavior/persistence.md` を電源断シナリオへ拡張して再検証する）。
+//! 詳細は `docs/design/crash-tolerance-reverification.md` を参照。
 //!
 //! 実機の電源断は CI で再現できないため、`redb::StorageBackend`（`redb =4.2.0`。
 //! `crates/engine/Cargo.toml` の既承認済み依存。新規依存は追加しない）をテストスコープで
