@@ -62,7 +62,14 @@ impl Storage {
     /// `redb::Database::begin_write` の排他ロックにより他の書き込みトランザクションと
     /// 直列化される（同時に開けるのは 1 本のみ。先行トランザクションが commit/abort
     /// するまで本呼び出しはブロックする）。戻り値の [`WriteTxn`] は明示的に
-    /// [`WriteTxn::commit`] するまで変更を確定しない。
+    /// [`WriteTxn::commit`] するまで変更を確定しない（[`WriteTxn`] のドキュメント
+    /// コメント参照）。
+    ///
+    /// 設計メモ: この排他ロックはタイムアウトを持たず、呼び出し元が [`WriteTxn`] を
+    /// 保持し続ける限り他の書き込みを無期限にブロックする。本モジュール自体には
+    /// untrusted 入力からの到達経路はないが、後続の SQL surface（TASK-85〜）から
+    /// 呼び出す際は、無制限ブロック（DoS）を防ぐ上位側のタイムアウト・キャンセル
+    /// 制御を検討すること。
     pub fn begin_write(&self) -> crate::storage::Result<WriteTxn> {
         let txn = self.db().begin_write()?;
         Ok(WriteTxn { txn })
@@ -101,6 +108,10 @@ impl ReadSnapshot {
 /// `redb::Database::begin_write` の排他ロックにより、生存している間は他の書き込み
 /// トランザクションの `begin_write` をブロックする（直列化）。[`WriteTxn::commit`] を
 /// 呼ぶまで、書き込んだ行は他のトランザクションから見えない。
+///
+/// [`WriteTxn::commit`]・[`WriteTxn::abort`] のどちらも呼ばずに drop した場合は、
+/// 内部の `redb::WriteTransaction` の `Drop` 実装により自動的に abort される
+/// （redb 4.2.0 の契約。書き込みは確定せず、排他ロックは解放される）。
 pub struct WriteTxn {
     txn: redb::WriteTransaction,
 }

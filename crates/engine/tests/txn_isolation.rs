@@ -99,6 +99,45 @@ fn table3_write_txn_abort_discards_uncommitted_writes() {
 }
 
 // 対象ビヘイビア: TABLE-3（詳細は関数名・ポインタ: docs/spec/04-behavior/data-model.md）。
+// WriteTxn::commit / WriteTxn::abort のどちらも呼ばずに drop した場合、
+// redb::WriteTransaction の Drop 実装により自動的に abort されることを固定する
+// （txn.rs の WriteTxn ドキュメントコメント参照）。
+#[test]
+fn table3_write_txn_drop_without_commit_or_abort_auto_aborts() {
+    let path = unique_db_path("drop-auto-aborts");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut txn = storage.begin_write().expect("begin write txn");
+        txn.put(1, &row(&[1.0], b"dropped"))
+            .expect("put before drop");
+        // commit も abort も呼ばずにスコープを抜けて drop させる。
+    }
+
+    let err = storage
+        .get(1)
+        .expect_err("dropped-without-commit write must not be visible");
+    assert!(
+        matches!(err, StorageError::NotFound(_)),
+        "expected row 1 to be reported as NotFound after drop, got: {err}"
+    );
+
+    // 排他ロックも解放されている（drop 後に新しい書き込みトランザクションを開始できる）ことを確認する。
+    let mut next_txn = storage
+        .begin_write()
+        .expect("begin_write must not block after the prior WriteTxn was dropped");
+    next_txn
+        .put(2, &row(&[2.0], b"after-drop"))
+        .expect("put after drop");
+    next_txn.commit().expect("commit after drop");
+    assert_eq!(
+        storage.get(2).expect("row 2 committed").metadata,
+        b"after-drop"
+    );
+}
+
+// 対象ビヘイビア: TABLE-3（詳細は関数名・ポインタ: docs/spec/04-behavior/data-model.md）。
 // PERSIST-4 と同一根拠（`crates/engine/tests/persistence.rs` の
 // `persist4_writes_are_serialized_and_reads_see_snapshot` は redb 直接操作で検証済み）。
 // 本テストは engine の公開 txn API（`Storage::begin_write`）経由でのみ検証するため重複しない。
@@ -147,15 +186,22 @@ fn table3_begin_write_serializes_concurrent_writers_via_public_txn_api() {
     second_started_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("second writer did not start in time");
-    // 2 本目が begin_write の排他ロック待ちで止まっていることを確認するための短い待機
-    // （タイミング計測ではなく、明らかにブロックされていることの確認が目的。
-    // persistence.rs の persist4 テストと同じ手法）。
-    thread::sleep(Duration::from_millis(200));
-    assert!(
-        !second_acquired.load(std::sync::atomic::Ordering::SeqCst),
-        "second begin_write must not have acquired the exclusive write lock \
-         while the first write txn is still open"
-    );
+    // 2 本目が begin_write の排他ロック待ちで止まっていることを確認するための短い待機。
+    // second_started_tx の送信は begin_write 呼び出しの直前であり、それ自体は
+    // 「ロック待ちでブロックされている」ことまでは保証しない（送信後スレッドが
+    // begin_write に到達する前にスケジューラに横取りされる可能性がある）。
+    // 1 回のスリープ後の単発チェックではその隙間を見逃しうるため、待機窓の間
+    // 繰り返しポーリングして「一度も先行取得していない」ことを固定する
+    // （persistence.rs の persist4 テストの手法を、単発サンプリングから連続監視に強化）。
+    let poll_deadline = std::time::Instant::now() + Duration::from_millis(200);
+    while std::time::Instant::now() < poll_deadline {
+        assert!(
+            !second_acquired.load(std::sync::atomic::Ordering::SeqCst),
+            "second begin_write must not have acquired the exclusive write lock \
+             while the first write txn is still open"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     release_first_tx
         .send(())
