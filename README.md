@@ -28,10 +28,22 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 ```bash
 git clone git@github.com:Fandhe-AI/vector-db.git
 cd vector-db
-git submodule update --init   # docs/spec（private・要アクセス権）
+make setup   # サブモジュール → rustup → lefthook（git hooks）を一括構築
 ```
 
-`docs/spec`（`vector-db-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
+`docs/spec`（`vector-db-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで継続します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
+
+### タスクランナー（Makefile）
+
+| コマンド | 内容 |
+| -------- | ---- |
+| `make setup` | 開発環境の一括構築（submodule → rustup → lefthook） |
+| `make ci` | CI（`.github/workflows/ci.yml`）と同等のチェックをローカル一括実行 |
+| `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
+| `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（Cargo.toml 追加後に自動有効化） |
+| `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
+
+ターゲット一覧は `make help` で確認できます。
 
 ## ライセンス
 

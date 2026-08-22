@@ -1,0 +1,45 @@
+# cargo-deny 設定。`make deny` が本ファイルと Cargo.toml の両方が存在する時点で
+# 自動有効化され、`cargo deny --locked check advisories bans licenses sources` として
+# 実行される（実装未着手のため現時点では Makefile 側の HAS_CARGO 判定でスキップされる。
+# TASK-66 の workspace 作成後に有効化）。
+# 依存方針（.claude/rules/dependency-policy.md）: 依存最小・`=x.y.z` 完全固定・
+# 追加はユーザー承認制。Fandhe-AI/rust-ai-library の deny.toml と同一方針。
+
+[advisories]
+# RUSTSEC アドバイザリ監査（vulnerability / unmaintained / unsound / yanked）。
+# ignore へアドバイザリ ID を追加する場合は、理由・解消予定（追跡 Issue 番号）を
+# コメント付きで記録し、レビューを必須とする。
+version = 2
+
+[licenses]
+version = 2
+include-dev = true
+# 本リポは MIT OR Apache-2.0 のデュアルライセンス。依存もこれと互換な permissive
+# ライセンスのみ許可する。allow の拡張は依存追加のユーザー承認（dependency-policy.md）と
+# セットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しないことで fail-closed に検出する。
+allow = [
+    "MIT",
+    "Apache-2.0",
+]
+confidence-threshold = 0.8
+
+[sources]
+# git 依存・代替レジストリの混入をサプライチェーン観点で fail-closed 検出する
+# （全依存は crates.io 由来のみを許可）。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[bans]
+# 同一クレートの複数バージョン混入の検出。`=x.y.z` 完全固定方針では重複は原則
+# 発生しない前提だが、推移的依存経由の重複は依存元側の追随を待つほかなく "deny" では
+# ノイズが上回るため、警告に留めて CI ログで増加傾向を観測する（rust-ai-library と同一判断）。
+multiple-versions = "warn"
+
+# バージョン要求 `*` の依存宣言を拒否する（バージョン無指定はサプライチェーン上
+# 任意の最新版を受け入れる宣言であり、`=x.y.z` 完全固定方針に反するため fail-closed で弾く）。
+wildcards = "deny"
+# workspace 内クレート（engine / wire-server）は `publish = false` の private クレートで、
+# 相互参照はバージョン無しの path 依存（cargo 上は `*` 扱い）のため、private クレートの
+# path 依存に限り wildcards の対象外とする。
+allow-wildcard-paths = true
