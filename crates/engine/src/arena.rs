@@ -11,13 +11,16 @@
 //! 「一度デコードした連続バッファの提供」までを責務境界とする。
 //!
 //! スコープ境界（重要・TASK-91 と同根）: 行とカタログ上のユーザーテーブルを関連付ける
-//! 機構は本リポジトリにまだ実装されていない（[`crate::storage::ROWS_TABLE`] は
-//! 単一の平坦なテーブルで、異なる次元のテーブルの行が同居し得る。
-//! `crates/engine/tests/multi_dim_tables.rs` 参照）。そのため [`VectorArena::build`] は
-//! 「DB 内の全行が同一次元である」ことを前提とし、次元不一致の行が 1 行でもあれば
-//! 部分的なアリーナを返さず `Err` で拒否する（黙殺スキップは検索結果の欠落＝fail-open に
-//! 相当するため行わない）。複数テーブル（複数次元）が同居する DB からテーブル単位で
-//! アリーナを構築する機構は後続タスクの管轄とする。
+//! 永続化上の機構（行ごとのテーブル識別子）は本リポジトリにまだ実装されていない
+//! （[`crate::storage::ROWS_TABLE`] は単一の平坦なテーブルで、異なる次元のテーブルの
+//! 行が同居し得る。`crates/engine/tests/multi_dim_tables.rs` 参照）。そのため
+//! [`VectorArena::build`] は呼び出し元にテーブル名を要求し、カタログ
+//! （[`crate::catalog`]）に**そのテーブルしか存在しない**ことを確認してから走査する
+//! （fail-closed ゲート）。カタログに他のユーザーテーブルが 1 つでも存在する場合は、
+//! 行とテーブルを安全に対応付けられないため `Err` で拒否する（黙って全行を混在させる
+//! fail-open は行わない）。次元不一致の行を検出した場合も同様に、部分的なアリーナを
+//! 返さず `Err` で拒否する。複数テーブルが同居する DB からテーブル単位でアリーナを
+//! 構築する機構（行への永続的なテーブル識別子付与）は後続タスクの管轄とする。
 //!
 //! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
 //! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
@@ -25,7 +28,7 @@
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
-use crate::catalog::TableSchema;
+use crate::catalog::{CatalogError, TableSchema};
 use crate::storage::{decode_row, Storage, StorageError, Visibility, ROWS_TABLE};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
@@ -46,7 +49,10 @@ const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 pub enum ArenaError {
     /// 永続化層側で発生したエラー（`redb` バックエンドエラー・行デコード失敗等）。
     Storage(StorageError),
+    /// カタログ層側で発生したエラー（対象テーブル不存在・識別子不正等）。
+    Catalog(CatalogError),
     /// `expected_dim` が不正（`0` または [`crate::storage::MAX_EMBEDDING_DIM`] 超過）。
+    /// 対象テーブルが `VECTOR` 列を持たない場合もこの variant を返す。
     InvalidDim,
     /// アリーナ構築対象の行数・総バイト量がアロケーション前の上限
     /// （[`MAX_ARENA_ROWS`]・[`MAX_ARENA_TOTAL_BYTES`]）を超過した。fail-closed に拒否する。
@@ -54,12 +60,17 @@ pub enum ArenaError {
     /// `expected_dim` と一致しない次元の行を検出した。黙殺スキップせず拒否する
     /// （部分的なアリーナを返さない。fail-open を避けるための判断）。
     DimMismatch { id: u64, expected: u32, found: u32 },
+    /// カタログに要求したテーブル以外のユーザーテーブルが存在するため、行と
+    /// テーブルを安全に対応付けられない（モジュールドキュメントのスコープ境界参照）。
+    /// fail-closed に拒否する。
+    MultipleTablesPresent { requested: String, other: String },
 }
 
 impl std::fmt::Display for ArenaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ArenaError::Storage(e) => write!(f, "arena storage error: {e}"),
+            ArenaError::Catalog(e) => write!(f, "arena catalog error: {e}"),
             ArenaError::InvalidDim => write!(f, "invalid expected_dim for arena build"),
             ArenaError::CapacityExceeded => write!(f, "arena capacity exceeded"),
             ArenaError::DimMismatch {
@@ -70,6 +81,10 @@ impl std::fmt::Display for ArenaError {
                 f,
                 "embedding dim mismatch at row id={id}: expected={expected} found={found}"
             ),
+            ArenaError::MultipleTablesPresent { requested, other } => write!(
+                f,
+                "cannot scope arena to table={requested}: another table={other} is present in the catalog"
+            ),
         }
     }
 }
@@ -78,9 +93,11 @@ impl std::error::Error for ArenaError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ArenaError::Storage(e) => Some(e),
+            ArenaError::Catalog(e) => Some(e),
             ArenaError::InvalidDim
             | ArenaError::CapacityExceeded
-            | ArenaError::DimMismatch { .. } => None,
+            | ArenaError::DimMismatch { .. }
+            | ArenaError::MultipleTablesPresent { .. } => None,
         }
     }
 }
@@ -88,6 +105,12 @@ impl std::error::Error for ArenaError {
 impl From<StorageError> for ArenaError {
     fn from(e: StorageError) -> Self {
         ArenaError::Storage(e)
+    }
+}
+
+impl From<CatalogError> for ArenaError {
+    fn from(e: CatalogError) -> Self {
+        ArenaError::Catalog(e)
     }
 }
 
@@ -124,6 +147,10 @@ fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize)
 /// （`redb::ReadTransaction` のスナップショット契約をそのまま引き継ぐ）。
 #[derive(Debug)]
 pub struct VectorArena {
+    /// 構築対象のテーブル名（カタログ上の識別子）。行への永続的なテーブル識別子が
+    /// まだ存在しないため（モジュールドキュメント参照）、[`VectorArena::build`] が
+    /// カタログゲートで検証した対象を呼び出し元が失わないよう保持する。
+    table_name: String,
     dim: u32,
     /// 行 ID 昇順・row-major の連続バッファ。長さは常に `ids.len() * dim` と一致する。
     vectors: Vec<f32>,
@@ -136,22 +163,46 @@ pub struct VectorArena {
 }
 
 impl VectorArena {
-    /// `storage` の現時点のスナップショットから、次元 `expected_dim` の
-    /// アリーナを構築する（対象ビヘイビア: TABLE-8）。
+    /// `storage` の現時点のスナップショットから、カタログ上のテーブル `table_name`
+    /// を対象としたアリーナを構築する（対象ビヘイビア: TABLE-8）。
     ///
-    /// `expected_dim` は呼び出し元がカタログ（[`TableSchema::vector_dim`]）から
-    /// 取得することを想定する。単一の `storage.db().begin_read()` で全行を走査し
-    /// （[`crate::storage::Storage::scan_page`] は呼び出しごとに別トランザクションを
-    /// 開くためページ間のスナップショット一貫性がなく、アリーナ構築には使えない）、
-    /// アロケーション前に行数・総バイト量の上限を検証してから確保する
-    /// （無制限 `Vec::with_capacity` 禁止。.claude/rules/coding-rust.md）。
+    /// `expected_dim` はカタログ（[`Storage::get_table_schema`] →
+    /// [`TableSchema::vector_dim`]）から取得し、呼び出し元からは受け取らない
+    /// （呼び出し元が渡す次元値をテーブル識別の代用にすると、同一次元の別テーブルが
+    /// 混入しても検出できないため。TASK-87 P1 レビュー指摘への対応）。
     ///
-    /// テーブル未作成（1 行も書き込まれていない）DB は空アリーナとして成功する。
-    /// 次元不一致の行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
+    /// カタログに `table_name` 以外のユーザーテーブルが 1 つでも存在する場合は
+    /// `Err(ArenaError::MultipleTablesPresent)` で拒否する。[`crate::storage::ROWS_TABLE`]
+    /// は行ごとの永続的なテーブル識別子を持たないため（モジュールドキュメント参照）、
+    /// 「カタログ上のユーザーテーブルが対象の 1 つだけ」であることのみが、走査した
+    /// 全行が対象テーブルに帰属することを保証できる条件だからである。
+    ///
+    /// 単一の `storage.db().begin_read()` で全行を走査し（[`crate::storage::Storage::scan_page`]
+    /// は呼び出しごとに別トランザクションを開くためページ間のスナップショット一貫性がなく、
+    /// アリーナ構築には使えない）、アロケーション前に行数・総バイト量の上限を検証してから
+    /// 確保する（無制限 `Vec::with_capacity` 禁止。.claude/rules/coding-rust.md）。
+    ///
+    /// 対象テーブルがカタログに存在しない場合・`VECTOR` 列を持たない場合は
+    /// `Err`（テーブル未作成の空アリーナという特別扱いはしない。カタログに登録されて
+    /// いて 1 行も書き込まれていない場合のみ空アリーナとして成功する）。次元不一致の
+    /// 行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
     /// （モジュールドキュメントのスコープ境界を参照）。
-    pub fn build(storage: &Storage, expected_dim: u32) -> Result<Self> {
+    pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
+        let schema = storage.get_table_schema(table_name)?;
+        let expected_dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
         if expected_dim == 0 || expected_dim > crate::storage::MAX_EMBEDDING_DIM {
             return Err(ArenaError::InvalidDim);
+        }
+
+        // カタログゲート: 対象テーブル以外のユーザーテーブルが存在する場合、
+        // `ROWS_TABLE` の全行を対象テーブルへ安全に帰属させられないため拒否する。
+        for other in storage.list_tables()? {
+            if other != table_name {
+                return Err(ArenaError::MultipleTablesPresent {
+                    requested: table_name.to_string(),
+                    other,
+                });
+            }
         }
 
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
@@ -159,6 +210,7 @@ impl VectorArena {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok(VectorArena {
+                    table_name: table_name.to_string(),
                     dim: expected_dim,
                     vectors: Vec::new(),
                     ids: Vec::new(),
@@ -211,12 +263,18 @@ impl VectorArena {
         }
 
         Ok(VectorArena {
+            table_name: table_name.to_string(),
             dim: expected_dim,
             vectors,
             ids,
             tenant_ids,
             visibilities,
         })
+    }
+
+    /// 構築対象のテーブル名（カタログ上の識別子）。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     /// 埋め込みの次元数。

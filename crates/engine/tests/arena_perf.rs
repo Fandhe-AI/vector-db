@@ -23,7 +23,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use engine::arena::VectorArena;
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::storage::{RowInput, Storage, Visibility};
+
+/// 計測対象テーブル名。カタログにこのテーブルのみを登録し、`VectorArena::build`
+/// のテーブルスコープゲート（TASK-87 P1 レビュー指摘対応）を満たす。
+const TABLE_NAME: &str = "docs";
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +126,16 @@ fn best_score_over_rescan(storage: &Storage, query: &[f32]) -> f32 {
 
 fn seed_storage(path: &std::path::Path) -> Storage {
     let storage = Storage::open(path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE_NAME,
+            vec![ColumnDef::new(
+                "embedding",
+                ColumnType::Vector(DIM as u32),
+                false,
+            )],
+        ))
+        .expect("create_table");
     let mut rng = Xorshift32(0x2545_f491);
     let rows: Vec<(u64, Vec<f32>)> = (0..ROWS)
         .map(|id| (id, make_vector(&mut rng, DIM)))
@@ -164,7 +179,7 @@ fn table8_arena_query_path_completes_within_ratio_threshold_of_rescan_path() {
     // 既存 perf テスト tests/incremental_write_perf.rs と同方針）。
     {
         let warmup_queries = make_queries(0xabad_1dea);
-        let arena = VectorArena::build(&storage, DIM as u32).expect("warmup build arena");
+        let arena = VectorArena::build(&storage, TABLE_NAME).expect("warmup build arena");
         for q in &warmup_queries {
             std::hint::black_box(best_score_over_arena(&arena, q));
         }
@@ -183,7 +198,7 @@ fn table8_arena_query_path_completes_within_ratio_threshold_of_rescan_path() {
         // 完結する。build 自体もこの経路のコストとして計測に含める（都度読み直し経路の
         // 各クエリが redb からの読み直しコストを含むのと対称にするため）。
         let started = Instant::now();
-        let arena = VectorArena::build(&storage, DIM as u32).expect("build arena (measured)");
+        let arena = VectorArena::build(&storage, TABLE_NAME).expect("build arena (measured)");
         for q in &queries {
             std::hint::black_box(best_score_over_arena(&arena, q));
         }
