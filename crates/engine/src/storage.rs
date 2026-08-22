@@ -36,11 +36,24 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// バッチ台帳テーブル（TASK-90、対象ビヘイビア: TABLE-10。ポインタ:
 /// `docs/spec/05-tasks.md` TASK-90・`docs/spec/04-behavior/data-model.md` TABLE-10）。
 /// キーはバッチ通番（`batch_seq`、0 起点で連番）、値はそのバッチで [`ROWS_TABLE`] へ
-/// 書き込んだ行数。[`ROWS_TABLE`] と同一の `redb::WriteTransaction` 内でのみ書き込む
-/// （`txn.rs` の [`crate::txn::WriteTxn::log_batch`]）ことで、2 テーブル横断の
+/// 新規挿入した行数。[`ROWS_TABLE`] と同一の `redb::WriteTransaction` 内でのみ書き込む
+/// （`txn.rs` の [`crate::txn::BatchWriteTxn::log_batch`]）ことで、2 テーブル横断の
 /// トランザクション原子性（同時にコミットされる／同時に破棄される）を製品コード経路で
 /// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
 /// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
+///
+/// **契約の適用範囲（重要）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の行総数」という
+/// 不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ書き込んだ場合に
+/// のみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・`EmptyBatch`・
+/// `UnloggedRows`・上書き非カウントの各チェック）によって保証される。[`Storage::put`]・
+/// [`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を経由しない別経路）は
+/// 台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
+/// [`crate::txn::BatchWriteTxn`] を同一 DB・同一テーブルに対して混在させると、上記の
+/// 不変条件は成立しなくなる。これは型システムでは検出できない呼び出し元の責務であり、
+/// 本モジュールは意図的にそれを強制しない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf
+/// 対応。「台帳合計 == 行総数」を保証する範囲を、実際に型で保証できる範囲まで明文化して
+/// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
+/// [`crate::txn::BatchWriteTxn`] に一本化すること。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
 /// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
@@ -118,25 +131,24 @@ pub enum StorageError {
     /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した。
     /// `scan` の呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
     ScanLimitExceeded,
-    /// [`crate::txn::WriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
+    /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
     /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
     /// に拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
     DuplicateBatchSeq(u64),
-    /// [`crate::txn::WriteTxn`] の内部カウンタ（直近の `log_batch` 以降に `put` した
+    /// [`crate::txn::BatchWriteTxn`] の内部カウンタ（直近の `log_batch` 以降に `put` した
     /// 行数）が `u64` を溢れた。実運用では到達し得ない防御的分岐だが、undefined な
     /// ラップアラウンドで台帳の行数契約を壊さないよう checked 演算で明示的に検出する
     /// （coding-rust.md「整数演算は checked_* / saturating_* を使う」対応）。
     PendingRowCountOverflow,
-    /// [`crate::txn::WriteTxn::log_batch`] を 1 回以上呼んだトランザクションで、直近の
-    /// `log_batch` 以降に新規挿入した行（含まれる行数は引数の `u64`）を台帳へ記録
-    /// しないまま [`crate::txn::WriteTxn::commit`] しようとした。台帳に記録されない
-    /// 行が commit で確定すると「台帳の row_count 合計 == 行総数」という TABLE-10 の
-    /// 不変条件を公開 API だけで壊せるため fail-closed に拒否する
-    /// （security.md「不安全な設計」対応。他テナント情報は含まない）。
+    /// [`crate::txn::BatchWriteTxn`] で新規挿入した行を、直近の `log_batch` 以降まだ台帳へ
+    /// 記録しないまま [`crate::txn::BatchWriteTxn::commit`] しようとした。台帳に記録され
+    /// ない行が commit で確定すると「台帳の row_count 合計 == 行総数」という TABLE-10 の
+    /// 不変条件を [`crate::txn::BatchWriteTxn`] の公開 API だけで壊せるため fail-closed に
+    /// 拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
     UnloggedRows(u64),
-    /// [`crate::txn::WriteTxn::log_batch`] を、直近の呼び出し以降 1 件も
-    /// [`crate::txn::WriteTxn::put`]（新規挿入）していない状態で呼んだ。クラッシュ
+    /// [`crate::txn::BatchWriteTxn::log_batch`] を、直近の呼び出し以降 1 件も
+    /// [`crate::txn::BatchWriteTxn::put`]（新規挿入）していない状態で呼んだ。クラッシュ
     /// 検証ツールの検証オラクル（台帳の各エントリ値 == 実際にコミットされたバッチ
     /// サイズ）と食い違うゼロ件エントリを台帳へ残さないよう fail-closed に拒否する。
     EmptyBatch,

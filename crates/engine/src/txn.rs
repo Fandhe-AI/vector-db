@@ -59,7 +59,8 @@ impl Storage {
         Ok(ReadSnapshot { txn })
     }
 
-    /// 書き込みトランザクションを開始する（TABLE-3）。
+    /// 書き込みトランザクションを開始する（TABLE-3。バッチ台帳を使わない素の複数行
+    /// コミット用）。
     ///
     /// `redb::Database::begin_write` の排他ロックにより他の書き込みトランザクションと
     /// 直列化される（同時に開けるのは 1 本のみ。先行トランザクションが commit/abort
@@ -67,17 +68,35 @@ impl Storage {
     /// [`WriteTxn::commit`] するまで変更を確定しない（[`WriteTxn`] のドキュメント
     /// コメント参照）。
     ///
+    /// [`ROWS_TABLE`] + [`crate::storage::BATCH_LOG_TABLE`] を同一トランザクションで
+    /// 扱う 2 テーブル横断コミット（TASK-90、対象ビヘイビア: TABLE-10）が必要な場合は
+    /// [`Storage::begin_batch_write`] を使うこと。[`WriteTxn`] にはバッチ台帳を操作する
+    /// API を持たせていない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf 対応。
+    /// [`BatchWriteTxn`] のドキュメントコメントの「型分離の理由」参照）。
+    ///
     /// 設計メモ: この排他ロックはタイムアウトを持たず、呼び出し元が [`WriteTxn`] を
     /// 保持し続ける限り他の書き込みを無期限にブロックする。本モジュール自体には
     /// untrusted 入力からの到達経路はないが、後続の SQL surface（TASK-85〜）から
     /// 呼び出す際は、無制限ブロック（DoS）を防ぐ上位側のタイムアウト・キャンセル
-    /// 制御を検討すること。
+    /// 制御を検討すること（[`Storage::begin_batch_write`] も同じ排他ロック契約）。
     pub fn begin_write(&self) -> crate::storage::Result<WriteTxn> {
         let txn = self.db().begin_write()?;
-        Ok(WriteTxn {
+        Ok(WriteTxn { txn })
+    }
+
+    /// バッチ台帳付き書き込みトランザクションを開始する（TASK-90、対象ビヘイビア:
+    /// TABLE-10。[`ROWS_TABLE`] + [`crate::storage::BATCH_LOG_TABLE`] を同一
+    /// トランザクションで扱う 2 テーブル横断コミット用）。
+    ///
+    /// 排他ロックの契約は [`Storage::begin_write`] と同じ（同一 `redb::Database` の
+    /// 書き込みトランザクションを共有するため、[`WriteTxn`] と [`BatchWriteTxn`] は
+    /// 互いに同時オープンできない）。戻り値の [`BatchWriteTxn`] が保証する不変条件は
+    /// [`BatchWriteTxn`] のドキュメントコメント参照。
+    pub fn begin_batch_write(&self) -> crate::storage::Result<BatchWriteTxn> {
+        let txn = self.db().begin_write()?;
+        Ok(BatchWriteTxn {
             txn,
             pending_row_count: 0,
-            used_log_batch: false,
         })
     }
 }
@@ -109,38 +128,98 @@ impl ReadSnapshot {
     }
 }
 
-/// [`Storage::begin_write`] が返す書き込みトランザクションハンドル（TABLE-3）。
+/// [`Storage::begin_write`] が返す書き込みトランザクションハンドル（TABLE-3。バッチ
+/// 台帳を使わない素の複数行コミット専用）。
 ///
 /// `redb::Database::begin_write` の排他ロックにより、生存している間は他の書き込み
-/// トランザクションの `begin_write` をブロックする（直列化）。[`WriteTxn::commit`] を
-/// 呼ぶまで、書き込んだ行は他のトランザクションから見えない。
+/// トランザクションの `begin_write`／`begin_batch_write` をブロックする（直列化）。
+/// [`WriteTxn::commit`] を呼ぶまで、書き込んだ行は他のトランザクションから見えない。
 ///
 /// [`WriteTxn::commit`]・[`WriteTxn::abort`] のどちらも呼ばずに drop した場合は、
 /// 内部の `redb::WriteTransaction` の `Drop` 実装により自動的に abort される
 /// （redb 4.2.0 の契約。書き込みは確定せず、排他ロックは解放される）。
+///
+/// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）を操作する API は持たない。
+/// TABLE-10 の 2 テーブル横断コミットが必要な場合は [`BatchWriteTxn`]（
+/// [`Storage::begin_batch_write`] が返す）を使うこと（型分離の理由は
+/// [`BatchWriteTxn`] のドキュメントコメント参照）。
 pub struct WriteTxn {
     txn: redb::WriteTransaction,
-    /// 直近の [`WriteTxn::log_batch`] 呼び出し以降（または `WriteTxn` 生成以降）に
-    /// [`WriteTxn::put`] で**新規挿入**した件数（既存 ID への上書きは含まない）。
-    /// 呼び出し元から任意の行数を申告させず [`WriteTxn`] 自身が実書き込みを数える
-    /// ことで、「台帳の値 == そのバッチで `ROWS_TABLE` へ新規追加した行数」という
-    /// 契約を公開 API だけで保証する（PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l・
-    /// PRRT_kwDOUAKASM6bbc_I 対応）。
-    pending_row_count: u64,
-    /// このトランザクションで [`WriteTxn::log_batch`] を 1 回以上呼んだかどうか。
-    /// `WriteTxn` は「バッチ台帳を使わない素の複数行コミット」（TABLE-3。
-    /// `crates/engine/tests/txn_isolation.rs` 等）と「行 + バッチ台帳を同一
-    /// トランザクションで扱う 2 テーブル横断コミット」（TABLE-10）の両方の用途で
-    /// 使われる。台帳を一切使わない前者の契約は変えたくないため、[`WriteTxn::commit`]
-    /// の「未台帳行が残っていないか」検証は、このトランザクションで `log_batch` を
-    /// 一度でも呼んで TABLE-10 の契約に「参加」した場合のみ有効化する
-    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4 対応）。
-    used_log_batch: bool,
 }
 
 impl WriteTxn {
     /// 単一行を書き込む（commit するまで確定しない。[`Storage::put`] と同じ
-    /// upsert セマンティクス・エンコーディング契約）。[`WriteTxn::log_batch`] 向けの
+    /// upsert セマンティクス・エンコーディング契約）。
+    pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
+        let encoded = encode_row(row)?;
+        let mut table = self.txn.open_table(ROWS_TABLE)?;
+        table.insert(id, encoded.as_slice())?;
+        Ok(())
+    }
+
+    /// トランザクションをコミットし、書き込みを確定する。
+    pub fn commit(self) -> crate::storage::Result<()> {
+        self.txn.commit()?;
+        Ok(())
+    }
+
+    /// トランザクションを明示的に中断し、書き込みを破棄する。
+    pub fn abort(self) -> crate::storage::Result<()> {
+        self.txn.abort()?;
+        Ok(())
+    }
+}
+
+/// [`Storage::begin_batch_write`] が返す、バッチ台帳付き書き込みトランザクション
+/// ハンドル（TASK-90、対象ビヘイビア: TABLE-10。[`ROWS_TABLE`] +
+/// [`crate::storage::BATCH_LOG_TABLE`] を同一トランザクションで扱う）。
+///
+/// # 型分離の理由（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf 対応）
+///
+/// 当初は `WriteTxn` 1 型に `log_batch` を持たせ、「`log_batch` を 1 回以上呼んだ
+/// トランザクションのみ commit 時に未台帳行を検証する」というインスタンス単位の
+/// フラグで TABLE-3 用途と TABLE-10 用途を両立させていた。しかしこの設計では、
+/// 同一 DB に対して「台帳を使わない `put` だけの `WriteTxn` で commit」→「別
+/// トランザクションで台帳ありの `put` + `log_batch` を commit」という**トランザクション
+/// をまたいだ**操作の組み合わせにより、台帳を経由しない行を公開 API だけで作り込め、
+/// 「台帳の row_count 合計 == 行総数」という不変条件を破れてしまう
+/// （codex レビューが指摘した具体例）。そこで TABLE-3 用の `WriteTxn` からは
+/// `log_batch` を完全に撤去し、TABLE-10 用の `BatchWriteTxn` を独立した型として
+/// 分離した。
+///
+/// # 契約の適用範囲（重要）
+///
+/// 型分離をもってしても、[`Storage::put`]・[`Storage::put_batch`]・
+/// [`WriteTxn::put`] は本モジュールとは独立に [`ROWS_TABLE`] へ直接書き込めるため、
+/// 「台帳の row_count 合計 == 行総数」という不変条件を DB 全体に対して型システムで
+/// 強制することはできない。この不変条件が保証されるのは、**あるテーブルへの書き込みを
+/// `BatchWriteTxn` だけで行った場合に限る**（[`crate::storage::BATCH_LOG_TABLE`] の
+/// ドキュメントコメント参照）。`BatchWriteTxn` と他の書き込み経路を同一 DB・同一
+/// テーブルに対して混在させないことは呼び出し元の責務であり、本モジュールは意図的に
+/// それを検出・拒否しない（`Storage::put` 等からは `BatchWriteTxn` の存在自体が
+/// 見えないため、混在検出には DB 全体のスキャンを要し、書き込みの都度その代償を
+/// 払うことは本 PR のスコープでは正当化されないと判断した）。
+///
+/// `BatchWriteTxn` 単体としては、以下をすべて満たしてはじめて `commit` が成功する:
+/// - 新規挿入した行はすべて [`BatchWriteTxn::log_batch`] で台帳へ記録済みであること
+///   （[`StorageError::UnloggedRows`]）
+/// - `log_batch` は 1 件以上の新規挿入を伴って呼ばれること（[`StorageError::EmptyBatch`]）
+/// - `batch_seq` は重複しないこと（[`StorageError::DuplicateBatchSeq`]）
+/// - 同一 ID への 2 回目以降の `put`（upsert による上書き）は行数としてカウントしない
+pub struct BatchWriteTxn {
+    txn: redb::WriteTransaction,
+    /// 直近の [`BatchWriteTxn::log_batch`] 呼び出し以降（または `BatchWriteTxn`
+    /// 生成以降）に [`BatchWriteTxn::put`] で**新規挿入**した件数（既存 ID への
+    /// 上書きは含まない）。呼び出し元から任意の行数を申告させず自身が実書き込みを
+    /// 数えることで、「台帳の値 == そのバッチで `ROWS_TABLE` へ新規追加した行数」
+    /// という契約を保証する（PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l・
+    /// PRRT_kwDOUAKASM6bbc_I 対応）。
+    pending_row_count: u64,
+}
+
+impl BatchWriteTxn {
+    /// 単一行を書き込む（commit するまで確定しない。[`Storage::put`] と同じ
+    /// upsert セマンティクス・エンコーディング契約）。[`BatchWriteTxn::log_batch`] 向けの
     /// 内部カウンタ（`pending_row_count`）は、`redb::Table::insert` の戻り値
     /// （上書き前の旧値）を見て**新規挿入のときのみ**増やす。同一 ID への 2 回目以降の
     /// `put`（上書き）はカウントしない。カウントしてしまうと同一 ID への複数回 put
@@ -165,15 +244,16 @@ impl WriteTxn {
     }
 
     /// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）へ、直近の `log_batch` 以降に
-    /// 実際に [`WriteTxn::put`] で**新規挿入**した行数（既存 ID への上書きは含まない）を
-    /// 1 エントリとして書き込む（TASK-90、対象ビヘイビア: TABLE-10）。同一 ID への
-    /// 複数回 `put` は `pending_row_count` を増やさないため、`log_batch(seq, 99)` の
-    /// ような過大申告だけでなく「同一 ID への put の繰り返し」でも実在行数を超える値を
-    /// 記録できない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
-    /// [`WriteTxn::put`] と同一の `redb::WriteTransaction`（`self.txn`）内で操作するため、
-    /// [`WriteTxn::commit`]・[`WriteTxn::abort`] のどちらを呼んでも [`ROWS_TABLE`] への
-    /// 行書き込みと本エントリは常に運命を共にする（2 テーブル横断で原子的に
-    /// コミット／破棄される）。
+    /// 実際に [`BatchWriteTxn::put`] で**新規挿入**した行数（既存 ID への上書きは
+    /// 含まない）を 1 エントリとして書き込む（TASK-90、対象ビヘイビア: TABLE-10）。
+    /// 同一 ID への複数回 `put` は `pending_row_count` を増やさないため、
+    /// `log_batch(seq, 99)` のような過大申告だけでなく「同一 ID への put の
+    /// 繰り返し」でも実在行数を超える値を記録できない
+    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。[`BatchWriteTxn::put`] と
+    /// 同一の `redb::WriteTransaction`（`self.txn`）内で操作するため、
+    /// [`BatchWriteTxn::commit`]・[`BatchWriteTxn::abort`] のどちらを呼んでも
+    /// [`ROWS_TABLE`] への行書き込みと本エントリは常に運命を共にする（2 テーブル
+    /// 横断で原子的にコミット／破棄される）。
     ///
     /// `row_count` を呼び出し元から受け取らないのは、任意の値を渡せると
     /// `log_batch(seq, 0)` のみ・過大申告といった「実書き込み数と独立した値」を
@@ -182,7 +262,7 @@ impl WriteTxn {
     /// カウンタを 0 にリセットし、次の `log_batch` は「その後の `put` 件数」のみを
     /// 記録する。
     ///
-    /// 直近の `log_batch`（または `WriteTxn` 生成）以降 1 件も新規挿入していない
+    /// 直近の `log_batch`（または `BatchWriteTxn` 生成）以降 1 件も新規挿入していない
     /// 状態（`pending_row_count == 0`）で呼ぶと [`StorageError::EmptyBatch`] で
     /// fail-closed に拒否する。ゼロ件エントリを許すと、クラッシュ検証ツールの検証
     /// オラクル（台帳の各エントリ値 == 実際にコミットされたバッチサイズ）と食い違う
@@ -192,10 +272,6 @@ impl WriteTxn {
     /// 拒否する（`redb` の `insert` は無条件上書きのため、検出しないと呼び出し元の
     /// 採番バグ・再試行ミスがバッチ台帳の不変条件（`batch_seq` ごとに 1 エントリ）を
     /// 静かに破壊する。security.md「不安全な設計」対応）。
-    ///
-    /// 成功すると、このトランザクションは以後 [`WriteTxn::commit`] 時に「未台帳行が
-    /// 残っていないか」の検証対象になる（[`WriteTxn`] の `used_log_batch` フィールドの
-    /// ドキュメントコメント参照）。
     pub fn log_batch(&mut self, batch_seq: u64) -> crate::storage::Result<()> {
         if self.pending_row_count == 0 {
             return Err(StorageError::EmptyBatch);
@@ -206,22 +282,19 @@ impl WriteTxn {
         }
         table.insert(batch_seq, self.pending_row_count)?;
         self.pending_row_count = 0;
-        self.used_log_batch = true;
         Ok(())
     }
 
     /// トランザクションをコミットし、書き込みを確定する。
     ///
-    /// このトランザクションで [`WriteTxn::log_batch`] を 1 回以上呼んでいた場合
-    /// （TABLE-10 の 2 テーブル横断コミット契約に参加した場合）のみ、直近の
-    /// `log_batch` 以降に新規挿入したのに台帳へ記録していない行（`pending_row_count
-    /// != 0`）がないかを検証し、あれば [`StorageError::UnloggedRows`] で fail-closed に
-    /// 拒否する。台帳を一度も使っていないトランザクション（TABLE-3 の素の複数行
-    /// コミット。`crates/engine/tests/txn_isolation.rs` 等）はこの検証の対象外で、
-    /// 従来どおり `put` した内容をそのまま commit できる（PR #129 codex レビュー
-    /// PRRT_kwDOUAKASM6bbnm4 対応）。
+    /// 直近の `log_batch` 以降に新規挿入したのに台帳へ記録していない行
+    /// （`pending_row_count != 0`）がないかを常に検証し、あれば
+    /// [`StorageError::UnloggedRows`] で fail-closed に拒否する。`BatchWriteTxn` は
+    /// TABLE-10 専用の型であり（[`WriteTxn`] と分離済み）、この検証を無条件に適用
+    /// してよい（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4・PRRT_kwDOUAKASM6bbyWf
+    /// 対応）。
     pub fn commit(self) -> crate::storage::Result<()> {
-        if self.used_log_batch && self.pending_row_count != 0 {
+        if self.pending_row_count != 0 {
             return Err(StorageError::UnloggedRows(self.pending_row_count));
         }
         self.txn.commit()?;

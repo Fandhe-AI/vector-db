@@ -1,8 +1,9 @@
 //! TASK-90（対象ビヘイビア: TABLE-10。ポインタ: `docs/spec/05-tasks.md` TASK-90）の
 //! 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト用ツール。
 //!
-//! `engine::txn::WriteTxn`（[`ROWS_TABLE`] + `BATCH_LOG_TABLE` を同一トランザクションで
-//! 扱う `log_batch`）の公開 API のみを使うブラックボックスバイナリで、
+//! `engine::txn::BatchWriteTxn`（[`ROWS_TABLE`] + `BATCH_LOG_TABLE` を同一
+//! トランザクションで扱う `log_batch` を持つ TASK-90 専用の型）の公開 API のみを
+//! 使うブラックボックスバイナリで、
 //! `scripts/crash_test_cross_table.sh` から `write` サブコマンドをバックグラウンド起動され
 //! SIGKILL される想定、続けて `verify` サブコマンドで再オープン後の内容整合性を
 //! 検証される想定で作られている。単一テーブル・単一行コミットを検証する
@@ -186,8 +187,8 @@ fn write_inner(path: &str) -> Result<(), String> {
         // TABLE-10 の 2 テーブル横断コミットそのものを検証する経路。同一トランザクション
         // 内で行テーブル（BATCH 件）とバッチ台帳（1 エントリ）の両方へ書き込む。
         let mut txn = storage
-            .begin_write()
-            .map_err(|e| format!("begin_write failed: {e}"))?;
+            .begin_batch_write()
+            .map_err(|e| format!("begin_batch_write failed: {e}"))?;
         for _ in 0..BATCH {
             let (embedding, metadata) = derive_row(next_row_id);
             let row = RowInput {

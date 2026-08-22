@@ -1,6 +1,6 @@
-//! `engine::txn::WriteTxn::log_batch`（[`ROWS_TABLE`] とバッチ台帳
-//! [`crate::storage::BATCH_LOG_TABLE`] を同一トランザクションで扱う経路）の統合テスト
-//! （TASK-90、対象ビヘイビア: TABLE-10。ポインタ: `docs/spec/05-tasks.md` TASK-90・
+//! `engine::txn::BatchWriteTxn`（[`ROWS_TABLE`] とバッチ台帳
+//! [`crate::storage::BATCH_LOG_TABLE`] を同一トランザクションで扱う TASK-90 専用の型）の
+//! 統合テスト（対象ビヘイビア: TABLE-10。ポインタ: `docs/spec/05-tasks.md` TASK-90・
 //! `docs/spec/04-behavior/data-model.md` TABLE-10）。
 //!
 //! `crates/engine/examples/crash_tool_cross_table.rs` + `scripts/crash_test_cross_table.sh`
@@ -8,6 +8,11 @@
 //! プロセス内テストとして「commit で両テーブルへ原子的に反映される」「commit 前に drop・
 //! `abort` した場合は両テーブルとも破棄される」という 2 テーブル横断トランザクションの
 //! 原子性そのものを検証する（クラッシュ回帰テストとは独立に、通常経路での正しさを保証する）。
+//!
+//! `BatchWriteTxn` は TABLE-10 専用の型で、バッチ台帳を使わない TABLE-3 の素の複数行
+//! コミット（`engine::txn::WriteTxn`）は `crates/engine/tests/txn_isolation.rs` が
+//! 別途カバーする（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf 対応で型を分離した。
+//! `txn.rs` の `BatchWriteTxn` ドキュメントコメント「型分離の理由」参照）。
 
 use engine::storage::{RowInput, Storage, Visibility};
 
@@ -52,7 +57,7 @@ fn table10_commit_reflects_both_tables_atomically() {
     let embedding = [1.0_f32, 2.0, 3.0];
     let metadata = [9_u8, 8, 7];
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&embedding, &metadata)).expect("put row 0");
     txn.put(1, &row(&embedding, &metadata)).expect("put row 1");
     txn.log_batch(0).expect("log_batch");
@@ -75,7 +80,7 @@ fn table10_drop_without_commit_discards_both_tables() {
     let storage = Storage::open(&path).expect("open storage");
 
     {
-        let mut txn = storage.begin_write().expect("begin_write");
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
         txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
         txn.log_batch(0).expect("log_batch");
         // commit も abort も呼ばずスコープを抜ける。
@@ -99,7 +104,7 @@ fn table10_abort_discards_both_tables() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
     txn.log_batch(0).expect("log_batch");
     txn.abort().expect("abort");
@@ -127,7 +132,7 @@ fn table10_batch_totals_match_row_count_and_survive_reopen() {
         let storage = Storage::open(&path).expect("open storage");
         let mut next_id: u64 = 0;
         for batch_seq in 0..3_u64 {
-            let mut txn = storage.begin_write().expect("begin_write");
+            let mut txn = storage.begin_batch_write().expect("begin_batch_write");
             for _ in 0..4 {
                 txn.put(next_id, &row(&[next_id as f32], &[next_id as u8]))
                     .expect("put row");
@@ -160,12 +165,12 @@ fn table10_log_batch_rejects_duplicate_seq_and_preserves_existing_entry() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
     txn.log_batch(0).expect("log_batch first write");
     txn.commit().expect("commit first batch");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
     let err = txn
         .log_batch(0)
@@ -202,7 +207,7 @@ fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
     txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
     txn.put(2, &row(&[3.0], &[3])).expect("put row 2");
@@ -220,27 +225,76 @@ fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
     );
 }
 
-// 対象ビヘイビア: TABLE-10。log_batch を一度も呼ばないトランザクションは、TABLE-3 の
-// 素の複数行コミットとして従来どおり扱われ、「未台帳行チェック」の対象にならない
-// こと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4 対応。commit の doc コメント
-// 「used_log_batch」フィールドの契約参照）。バッチ台帳を使わない
-// `crates/engine/tests/txn_isolation.rs` の既存経路が壊れないことの回帰確認でもある。
+// 対象ビヘイビア: TABLE-10。BatchWriteTxn は log_batch を一度も呼ばない commit を
+// 一切許さない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4・PRRT_kwDOUAKASM6bbyWf
+// 対応。put した行がある限り、log_batch で台帳へ記録しないと commit できない）。
+// 台帳を使わない「素の複数行コミット」用途（TABLE-3）は型ごと分離した
+// `engine::txn::WriteTxn`（`crates/engine/tests/txn_isolation.rs` がカバー）の責務であり、
+// `BatchWriteTxn` はこの検証を無条件に適用してよい。
 #[test]
-fn table10_put_then_commit_without_log_batch_succeeds_as_plain_write_txn() {
-    let path = unique_db_path("put-commit-without-log-batch");
+fn table10_batch_write_txn_rejects_commit_of_unlogged_put_even_without_any_log_batch_call() {
+    let path = unique_db_path("commit-rejects-unlogged-with-no-log-batch-call");
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
-    txn.commit().expect("commit without log_batch must succeed");
+    // log_batch を一度も呼ばずに commit を試みる。
+    let err = txn
+        .commit()
+        .expect_err("commit without any log_batch call must be rejected");
+    assert!(matches!(
+        err,
+        engine::storage::StorageError::UnloggedRows(1)
+    ));
 
-    assert_eq!(storage.get(0).expect("get row 0").embedding, [1.0]);
-    assert_eq!(
-        storage.scan_batch_log().expect("scan_batch_log"),
-        Vec::<(u64, u64)>::new(),
-        "batch_log must stay empty when log_batch is never called"
-    );
+    let get_err = storage
+        .get(0)
+        .expect_err("row from rejected commit must not exist");
+    assert!(matches!(
+        get_err,
+        engine::storage::StorageError::NotFound(0)
+    ));
+}
+
+// 対象ビヘイビア: TABLE-10。既知の制限を明文化する回帰テスト
+// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf 対応）。`engine::txn::WriteTxn`
+// （TABLE-3・台帳を経由しない）と `BatchWriteTxn`（TABLE-10）を同一 DB・同一
+// `ROWS_TABLE` に対して混在させると、型分離だけでは「台帳の row_count 合計 ==
+// 行総数」という不変条件を強制できない。`Storage::put`・`Storage::put_batch` も
+// 同様に台帳を経由せず `ROWS_TABLE` へ書き込めるため、この不変条件は
+// `BatchWriteTxn` だけを使い続けた場合にのみ保証される契約であることを
+// `txn.rs`（`BatchWriteTxn` ドキュメントコメント「契約の適用範囲」）・
+// `storage.rs`（`BATCH_LOG_TABLE` ドキュメントコメント）に明記している。
+// 本テストは、その契約外の挙動が将来のリファクタで無自覚に変わっていないかを
+// 検出するためのピン留めであり、「これが正しい」という主張ではない。
+#[test]
+fn table10_mixing_plain_write_txn_with_batch_write_txn_is_a_documented_out_of_contract_limitation()
+{
+    let path = unique_db_path("mixing-plain-and-batch-write-txn-is-out-of-contract");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // TABLE-3: 台帳を経由しない素の WriteTxn で行 0 を commit する。
+    let mut plain_txn = storage.begin_write().expect("begin_write");
+    plain_txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    plain_txn.commit().expect("commit via plain WriteTxn");
+
+    // TABLE-10: 別トランザクションで BatchWriteTxn を使い、行 1 だけを台帳へ記録する。
+    // BatchWriteTxn 単体としては不変条件（UnloggedRows・EmptyBatch・重複禁止）を
+    // すべて満たしており、この commit 自体は正しく成功する。
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    batch_txn.log_batch(0).expect("log_batch for row 1");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    // 実在行は 2 行（id=0, id=1）だが、台帳合計は BatchWriteTxn が扱った 1 行分のみ。
+    // これが「BatchWriteTxn だけを使った場合にのみ不変条件が成立する」という契約の
+    // 適用範囲外の挙動そのものであり、本テストはこれを意図的に許容・記録する。
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 1)]);
 }
 
 // 対象ビヘイビア: TABLE-10。直近の log_batch（または WriteTxn 生成）以降 1 件も put
@@ -252,7 +306,7 @@ fn table10_log_batch_with_no_prior_put_is_rejected_as_empty_batch() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     let err = txn
         .log_batch(0)
         .expect_err("log_batch with zero pending puts must be rejected");
@@ -276,7 +330,7 @@ fn table10_commit_rejects_rows_put_after_last_log_batch() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
     txn.log_batch(0).expect("log_batch for row 0");
     // log_batch 後にさらに put するが、この行は 2 度目の log_batch で記録しないまま
@@ -314,7 +368,7 @@ fn table10_log_batch_does_not_double_count_overwritten_id_within_same_batch() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let mut txn = storage.begin_write().expect("begin_write");
+    let mut txn = storage.begin_batch_write().expect("begin_batch_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0 (first)");
     // 同じ行 ID 0 へ 2 回目の put（upsert による上書き）。新規挿入ではないため
     // pending_row_count は増えないはず。
