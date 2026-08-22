@@ -10,32 +10,26 @@
 //! （スコアリング・top-k・SIMD/GPU 経路）は後続タスクの管轄であり、本モジュールは
 //! 「一度デコードした連続バッファの提供」までを責務境界とする。
 //!
-//! スコープ境界: 行とカタログ上のユーザーテーブルを関連付ける永続化上の機構
-//! （行ごとのテーブル識別子）は本リポジトリにまだ実装されていない
-//! （[`crate::storage::ROWS_TABLE`] は単一の平坦なテーブルで、異なる次元のテーブルの
-//! 行が同居し得る。`crates/engine/tests/multi_dim_tables.rs` 参照）。[`VectorArena::build`]
-//! はテーブル名を受け取り、カタログ（[`crate::catalog`]）に**そのテーブルしか存在しない**
-//! ことを確認してから走査する（他のユーザーテーブルが 1 つでも存在する場合は
-//! `Err(MultipleTablesPresent)` で拒否する）。
+//! テーブル帰属: `catalog.rs` のテーブルスコープ行 API（TASK-146、対象ビヘイビア:
+//! EXT-1, EXT-2）が、テーブルごとに独立した動的 redb テーブル
+//! （[`crate::catalog::user_rows_table_name`] が指す `user_rows/{table_name}`）へ行を
+//! 分離して永続化する。[`VectorArena::build`] はこの対象テーブル専用のテーブルだけを
+//! 走査するため、他テーブルの行が次元一致だけで混入することはない
+//! （かつてのスコープ外事項だった「行への永続的なテーブル識別子」の欠如は解消済み）。
+//! カタログ・行テーブルの両方を単一の `redb::ReadTransaction` 上で扱うことで、
+//! スキーマ取得と行走査の間に他テーブルの並行書き込みが挟まる TOCTOU も避ける。
 //!
-//! **このゲートだけでは行の帰属を証明できない**: [`crate::storage::Storage::put`]・
-//! [`crate::storage::Storage::put_batch`] はテーブル名・スキーマを要求せず、カタログに
-//! テーブルが 1 つも存在しない状態でも `ROWS_TABLE` へ行を書き込める。そのため
-//! 「対象テーブルしかカタログに存在しない」ことは、「`ROWS_TABLE` の全行が対象テーブル
-//! の書き込みによるもの」を含意しない（対象テーブル作成より前に書かれた行が存在しても
-//! 検出できない）。この帰属を検証可能にする永続的な機構が整うまで、[`VectorArena::build`]
-//! は `pub(crate)` に限定し、クレート外への公開 API とはしない（対象ビヘイビア: TABLE-8。
-//! ポインタ: TASK-91）。孤立行（対象テーブル作成前に書かれ、次元が一致する行）が
-//! 含まれ得ることは既知の限界として明文化し（黙殺せずテスト・ドキュメントで固定する）。
+//! [`VectorArena::build`] は現状の呼び出し元がテストのみのため `pub(crate)` に留める
+//! （検索カーネル本体が呼び出し元として加わり次第、クレート外への公開を検討する）。
 //!
 //! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
 //! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
 //! （`storage.rs`・`txn.rs` と同一の責務境界。評価は TASK-133 以降の呼び出し元の責務）。
 
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
-use crate::catalog::CatalogError;
-use crate::storage::{decode_row, Storage, StorageError, Visibility, ROWS_TABLE};
+use crate::catalog::{self, CatalogError};
+use crate::storage::{decode_row, Storage, StorageError, Visibility};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
@@ -71,11 +65,6 @@ pub enum ArenaError {
     /// `expected_dim` と一致しない次元の行を検出した。黙殺スキップせず拒否する
     /// （部分的なアリーナを返さない。fail-open を避けるための判断）。
     DimMismatch { id: u64, expected: u32, found: u32 },
-    /// カタログに要求したテーブル以外のユーザーテーブルが存在する（fail-closed に
-    /// 拒否する）。このゲートは「他のユーザーテーブルが存在しない」ことのみを保証し、
-    /// 対象テーブル作成前に書かれた孤立行の混入までは検出できない
-    /// （モジュールドキュメントのスコープ境界参照）。
-    MultipleTablesPresent { requested: String, other: String },
 }
 
 impl std::fmt::Display for ArenaError {
@@ -93,10 +82,6 @@ impl std::fmt::Display for ArenaError {
                 f,
                 "embedding dim mismatch at row id={id}: expected={expected} found={found}"
             ),
-            ArenaError::MultipleTablesPresent { requested, other } => write!(
-                f,
-                "cannot scope arena to table={requested}: another table={other} is present in the catalog"
-            ),
         }
     }
 }
@@ -108,8 +93,7 @@ impl std::error::Error for ArenaError {
             ArenaError::Catalog(e) => Some(e),
             ArenaError::InvalidDim
             | ArenaError::CapacityExceeded
-            | ArenaError::DimMismatch { .. }
-            | ArenaError::MultipleTablesPresent { .. } => None,
+            | ArenaError::DimMismatch { .. } => None,
         }
     }
 }
@@ -188,52 +172,47 @@ impl VectorArena {
     /// （呼び出し元が渡す次元値をテーブル識別の代用にすると、同一次元の別テーブルが
     /// 混入しても検出できないため）。
     ///
-    /// カタログに `table_name` 以外のユーザーテーブルが 1 つでも存在する場合は
-    /// `Err(ArenaError::MultipleTablesPresent)` で拒否する。ただし、このゲートは
-    /// 行の帰属を証明する十分条件ではない（モジュールドキュメントのスコープ境界参照）。
-    /// 対象テーブル作成前に書かれた次元一致の孤立行が含まれ得ることは既知の限界として
-    /// 明文化する（テスト `build_documents_orphan_row_limitation` 参照）。この限界が
-    /// あるため本メソッドは `pub(crate)` に留め、クレート外には公開しない。
+    /// 走査対象は `table_name` に対応する行テーブル
+    /// （[`crate::catalog::user_rows_table_name`] が指す `user_rows/{table_name}`。
+    /// TASK-146・EXT-1/EXT-2）のみで、他テーブルの行は保存先そのものが分離されている
+    /// ため次元一致だけで混入することはない（対象ビヘイビア: TABLE-8）。
     ///
-    /// 単一の `storage.db().begin_read()` で全行を走査し（[`crate::storage::Storage::scan_page`]
+    /// 単一の `storage.db().begin_read()` 上でカタログのスキーマ取得・対象テーブルの行走査を
+    /// 行う（[`crate::storage::Storage::scan_page`]・[`crate::storage::Storage::scan_table_page`]
     /// は呼び出しごとに別トランザクションを開くためページ間のスナップショット一貫性がなく、
-    /// アリーナ構築には使えない）、アロケーション前に行数・総バイト量の上限を検証してから
+    /// アリーナ構築には使えない）。アロケーション前に行数・総バイト量の上限を検証してから
     /// 確保する（無制限 `Vec::with_capacity` 禁止。.claude/rules/coding-rust.md）。
     ///
     /// 対象テーブルがカタログに存在しない場合・`VECTOR` 列を持たない場合は
     /// `Err`（テーブル未作成の空アリーナという特別扱いはしない。カタログに登録されて
     /// いて 1 行も書き込まれていない場合のみ空アリーナとして成功する）。次元不一致の
     /// 行を検出した場合はスキップせず `Err(ArenaError::DimMismatch)` を返す
-    /// （モジュールドキュメントのスコープ境界を参照）。
+    /// （部分的なアリーナを返さない fail-closed な判断。通常この分岐へは到達しない。
+    /// `insert_row_into_table`/`insert_rows_into_table` が挿入時に次元検証済みのため、
+    /// 事後にスキーマ・行データが手で書き換えられた場合の防御として残す）。
     ///
-    // crate 外へ公開しないため（上記のスコープ境界を参照）、現状の呼び出し元は
-    // テストのみで lib ターゲット単体では未使用と判定される。検索カーネル本体
-    // （後続タスク）が呼び出し元として加わるまでの間、許容する。
+    // `VectorArena::build` は現状の呼び出し元がテストのみで、lib ターゲット単体では
+    // 未使用と判定される。検索カーネル本体（後続タスク）が呼び出し元として加わるまでの
+    // 間、許容する。
     #[allow(dead_code)]
     pub(crate) fn build(storage: &Storage, table_name: &str) -> Result<Self> {
-        // スキーマ取得・カタログゲート（他テーブル存在チェック）・`ROWS_TABLE` 走査を
-        // すべて単一の `read_txn`（同一スナップショット）上で行う。別トランザクションに
-        // 分かれていると、ゲート判定通過後・走査前に他テーブルの行が並行挿入されても
-        // 検出できない TOCTOU が生じる（モジュールドキュメントのスコープ境界参照）。
+        // スキーマ取得・対象テーブルの行走査を単一の `read_txn`（同一スナップショット）上で
+        // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
+        // 並行書き込みが挟まってもスナップショットの一貫性が保証できない。
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
-        let (schema, tables) = Storage::schema_and_tables_in_txn(&read_txn, table_name)?;
+        let schema = catalog::get_table_schema_in_txn(&read_txn, table_name)?;
         let expected_dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
         if expected_dim == 0 || expected_dim > crate::storage::MAX_EMBEDDING_DIM {
             return Err(ArenaError::InvalidDim);
         }
 
-        // カタログゲート: 対象テーブル以外のユーザーテーブルが存在する場合、
-        // `ROWS_TABLE` の全行を対象テーブルへ安全に帰属させられないため拒否する。
-        for other in tables {
-            if other != table_name {
-                return Err(ArenaError::MultipleTablesPresent {
-                    requested: table_name.to_string(),
-                    other,
-                });
-            }
-        }
-
-        let table = match read_txn.open_table(ROWS_TABLE) {
+        // 対象テーブル専用の行テーブル（`user_rows/{table_name}`）だけを開く。
+        // `catalog::user_rows_table_name` は識別子検証を行わないが、直前の
+        // `get_table_schema_in_txn` がカタログ照会の前段で `validate_identifier` を
+        // 通しているため、ここで改めて検証する必要はない。
+        let row_table_name = catalog::user_rows_table_name(table_name);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let table = match read_txn.open_table(row_table_def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok(VectorArena {
@@ -396,8 +375,8 @@ mod tests {
     }
 
     /// `tests/arena.rs`（統合テスト）と同方針の一意 DB パス払い出しヘルパー。
-    /// `schema_and_tables_in_txn` は `pub(crate)` のため、統合テストからは呼べず
-    /// このモジュール内 unit test でのみ検証できる。
+    /// `VectorArena::build`・`catalog::get_table_schema_in_txn` が `pub(crate)` のため、
+    /// 統合テストからは呼べずこのモジュール内 unit test でのみ検証できる。
     fn unique_db_path(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -410,15 +389,14 @@ mod tests {
         path
     }
 
-    // カタログゲートと行走査の TOCTOU への回帰テスト（対象ビヘイビア: TABLE-8）。
-    // 対象テーブル `a` について `schema_and_tables_in_txn` を呼んだ read_txn を
-    // 保持したまま、*その後* に別テーブル `b` を作成・行を書き込んでも、同一
-    // read_txn 上で見えるテーブル一覧・ROWS_TABLE の行数はどちらも書き込み前の
-    // スナップショットのまま（ゲート判定と行走査が同一スナップショットで一致する
-    // こと）を検証する。
+    // スキーマ取得と行走査の TOCTOU への回帰テスト（対象ビヘイビア: TABLE-8）。
+    // 対象テーブル `a` についてスキーマを取得した read_txn を保持したまま、*その後*に
+    // 別テーブル `b` を作成・行を書き込んでも、同一 read_txn 上で見える対象テーブル `a`
+    // の行テーブル内容は書き込み前のスナップショットのまま（`b` への並行書き込みが
+    // `a` の走査結果へ影響しないこと）を検証する。
     #[test]
-    fn schema_and_tables_in_txn_observes_a_single_snapshot_across_concurrent_writes() {
-        use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    fn get_table_schema_in_txn_observes_a_single_snapshot_across_concurrent_writes() {
+        use crate::catalog::{self, ColumnDef, ColumnType, TableSchema};
         use crate::storage::{RowInput, Visibility};
 
         let path = unique_db_path("toctou");
@@ -430,7 +408,8 @@ mod tests {
         );
         storage.create_table(&schema_a).expect("create table a");
         storage
-            .put(
+            .insert_row_into_table(
+                "a",
                 1,
                 &RowInput {
                     tenant_id: "tenant-a",
@@ -439,13 +418,12 @@ mod tests {
                     metadata: &[],
                 },
             )
-            .expect("put row into a");
+            .expect("insert row into a");
 
-        // ゲート判定用のスナップショットを先に確立する。
+        // スキーマ取得・行テーブルオープン用のスナップショットを先に確立する。
         let read_txn = storage.db().begin_read().expect("begin_read");
-        let (_schema, tables) =
-            Storage::schema_and_tables_in_txn(&read_txn, "a").expect("schema_and_tables_in_txn");
-        assert_eq!(tables, vec!["a".to_string()]);
+        let schema = catalog::get_table_schema_in_txn(&read_txn, "a").expect("get schema for a");
+        assert_eq!(schema.name, "a");
 
         // read_txn 確立後に別テーブル・同次元の行を並行挿入する（TOCTOU 再現）。
         let schema_b = TableSchema::new(
@@ -454,7 +432,8 @@ mod tests {
         );
         storage.create_table(&schema_b).expect("create table b");
         storage
-            .put(
+            .insert_row_into_table(
+                "b",
                 2,
                 &RowInput {
                     tenant_id: "tenant-a",
@@ -463,15 +442,16 @@ mod tests {
                     metadata: &[],
                 },
             )
-            .expect("put row into b");
+            .expect("insert row into b");
 
-        // 同一 read_txn 上では、後発の書き込みは一切見えない。テーブル一覧・
-        // ROWS_TABLE の行数のどちらも、read_txn 確立時点のスナップショットのまま。
-        let (_schema, tables_again) =
-            Storage::schema_and_tables_in_txn(&read_txn, "a").expect("schema_and_tables_in_txn");
-        assert_eq!(tables_again, vec!["a".to_string()]);
-
-        let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
+        // 同一 read_txn 上では、後発の書き込みは一切見えない。対象テーブル `a` の
+        // 行テーブルは read_txn 確立時点のスナップショットのまま 1 行だけを保持する。
+        let row_table_name = catalog::user_rows_table_name("a");
+        let row_table_def: redb::TableDefinition<u64, &[u8]> =
+            redb::TableDefinition::new(&row_table_name);
+        let table = read_txn
+            .open_table(row_table_def)
+            .expect("open row table for a");
         assert_eq!(table.len().expect("table len"), 1);
 
         drop(read_txn);
@@ -479,9 +459,9 @@ mod tests {
     }
 
     // 以下は旧 `tests/arena.rs`・`tests/arena_perf.rs`（統合テスト）からの移設分。
-    // `VectorArena::build` は `pub` だが、`schema_and_tables_in_txn`（`pub(crate)`）を
-    // 経由するテスト（TOCTOU 回帰テスト）と同居させるため、クレート内の
-    // `#[cfg(test)]` モジュールへ移設したまま保持している。
+    // `VectorArena::build` が `pub(crate)`（テーブルスコープの内部 API に依存する）
+    // ため、統合テストからは呼べず、クレート内の `#[cfg(test)]` モジュールへ
+    // 移設したまま保持している。
 
     struct CleanupGuard(std::path::PathBuf);
 
@@ -560,7 +540,9 @@ mod tests {
                 )
             })
             .collect();
-        storage.put_batch(&rows).expect("seed rows");
+        storage
+            .insert_rows_into_table("docs", &rows)
+            .expect("seed rows");
 
         let arena = VectorArena::build(&storage, "docs").expect("build arena");
         assert_eq!(arena.table_name(), "docs");
@@ -571,7 +553,9 @@ mod tests {
         assert_eq!(arena.ids(), &(0u64..10).collect::<Vec<_>>()[..]);
 
         for i in 0..10usize {
-            let expected_row = storage.get(i as u64).expect("read row back via storage");
+            let expected_row = storage
+                .get_row_from_table("docs", i as u64)
+                .expect("read row back via storage");
             assert_eq!(arena.vector(i), Some(expected_row.embedding.as_slice()));
             assert_eq!(arena.tenant_id(i), Some(expected_row.tenant_id.as_str()));
             assert_eq!(arena.visibility(i), Some(expected_row.visibility));
@@ -584,7 +568,7 @@ mod tests {
     }
 
     // 対象ビヘイビア: TABLE-8。カタログに登録済みだが 1 行も書き込んでいないテーブル
-    // （ROWS_TABLE 未作成）は空アリーナとして成功すること。
+    // （`user_rows/{table_name}` 未作成）は空アリーナとして成功すること。
     #[test]
     fn build_on_empty_table_returns_empty_arena() {
         let path = unique_db_path("empty");
@@ -615,7 +599,8 @@ mod tests {
             .expect("create_table");
 
         storage
-            .put(
+            .insert_row_into_table(
+                "docs",
                 0,
                 &RowInput {
                     tenant_id: TENANT_ID,
@@ -625,17 +610,30 @@ mod tests {
                 },
             )
             .expect("seed matching-dim row");
-        storage
-            .put(
-                1,
-                &RowInput {
+        // `insert_row_into_table` は挿入時点で次元検証するため、次元不一致行を通常経路で
+        // 作れない。`build` 側の防御（事後にスキーマ・行データが書き換えられた場合）を
+        // 検証するため、ここでは検証を経由しない生の write トランザクションで直接
+        // 対象テーブルの行テーブルへ次元不一致の行を書き込む。
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = catalog::user_rows_table_name("docs");
+                let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                    redb::TableDefinition::new(&row_table_name);
+                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let encoded = crate::storage::encode_row(&RowInput {
                     tenant_id: TENANT_ID,
                     visibility: Visibility::Public,
                     embedding: &[1.0, 2.0],
                     metadata: b"m",
-                },
-            )
-            .expect("seed mismatched-dim row");
+                })
+                .expect("encode mismatched-dim row");
+                row_table
+                    .insert(1u64, encoded.as_slice())
+                    .expect("insert mismatched-dim row bypassing dim validation");
+            }
+            write_txn.commit().expect("commit mismatched-dim row");
+        }
 
         let err = VectorArena::build(&storage, "docs").expect_err("dim mismatch must be rejected");
         match err {
@@ -677,11 +675,13 @@ mod tests {
         ));
     }
 
-    // 対象ビヘイビア: TABLE-8。カタログに対象テーブル以外の
-    // ユーザーテーブルが存在する場合、たとえ同一次元であっても `build` は
-    // `Err(MultipleTablesPresent)` で拒否し、他テーブルの行を混入させないこと。
+    // 対象ビヘイビア: TABLE-8（codex P1 対応）。複数テーブルが共存する状態で、
+    // 対象テーブル以外に書き込まれた行（次元が一致する行を含む）が混入しないこと、
+    // かつ対象テーブルの行はすべて取得できることを検証する。行はテーブルごとに
+    // 分離された動的 redb テーブル（`user_rows/{table_name}`）へ永続化されるため、
+    // 次元一致のみを根拠とした混入は起こり得ない。
     #[test]
-    fn build_rejects_when_another_table_coexists_even_with_same_dim() {
+    fn build_scopes_arena_to_the_requested_table_only() {
         let path = unique_db_path("multi-table");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
@@ -693,36 +693,55 @@ mod tests {
             .create_table(&schema_for("docs_b", 4))
             .expect("create_table docs_b");
 
-        // 同じ ROWS_TABLE へテーブル帰属の区別なく書き込まれる（永続化層の現行制約。
-        // モジュールドキュメント参照）。docs_b 側の行のみを書き込む。
         storage
-            .put(
+            .insert_row_into_table(
+                "docs_a",
                 0,
                 &RowInput {
                     tenant_id: TENANT_ID,
                     visibility: Visibility::Public,
                     embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"table=docs_a",
+                },
+            )
+            .expect("seed docs_a row");
+        storage
+            .insert_row_into_table(
+                "docs_b",
+                0,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[9.0, 9.0, 9.0, 9.0],
                     metadata: b"table=docs_b",
                 },
             )
             .expect("seed docs_b row");
+        // docs_b にはさらに、docs_a に存在しない ID の行も追加しておく（行数だけで
+        // 混入の有無を誤判定しないようにするため）。
+        storage
+            .insert_row_into_table(
+                "docs_b",
+                1,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[8.0, 8.0, 8.0, 8.0],
+                    metadata: b"table=docs_b",
+                },
+            )
+            .expect("seed second docs_b row");
 
-        let err =
-            VectorArena::build(&storage, "docs_a").expect_err("must reject when docs_b coexists");
-        match err {
-            ArenaError::MultipleTablesPresent { requested, other } => {
-                assert_eq!(requested, "docs_a");
-                assert_eq!(other, "docs_b");
-            }
-            other => panic!("expected MultipleTablesPresent, got {other:?}"),
-        }
+        let arena_a = VectorArena::build(&storage, "docs_a").expect("build arena for docs_a");
+        assert_eq!(arena_a.len(), 1);
+        assert_eq!(arena_a.ids(), &[0u64]);
+        assert_eq!(arena_a.vector(0), Some([1.0, 2.0, 3.0, 4.0].as_slice()));
 
-        // docs_b を対象に build しても、カタログに docs_a が残る限り同じゲートで拒否される
-        // （テーブル単位で安全に走査できるのは「カタログ上のユーザーテーブルが 1 つだけ」の
-        // ときに限られる。モジュールドキュメント参照）。
-        let err_b =
-            VectorArena::build(&storage, "docs_b").expect_err("must reject when docs_a coexists");
-        assert!(matches!(err_b, ArenaError::MultipleTablesPresent { .. }));
+        let arena_b = VectorArena::build(&storage, "docs_b").expect("build arena for docs_b");
+        assert_eq!(arena_b.len(), 2);
+        assert_eq!(arena_b.ids(), &[0u64, 1u64]);
+        assert_eq!(arena_b.vector(0), Some([9.0, 9.0, 9.0, 9.0].as_slice()));
+        assert_eq!(arena_b.vector(1), Some([8.0, 8.0, 8.0, 8.0].as_slice()));
     }
 
     // 対象ビヘイビア: TABLE-8。アリーナは構築時点のスナップショットであり、build 後に
@@ -738,7 +757,8 @@ mod tests {
             .expect("create_table");
 
         storage
-            .put(
+            .insert_row_into_table(
+                "docs",
                 0,
                 &RowInput {
                     tenant_id: TENANT_ID,
@@ -753,7 +773,8 @@ mod tests {
         assert_eq!(arena_before.len(), 1);
 
         storage
-            .put(
+            .insert_row_into_table(
+                "docs",
                 1,
                 &RowInput {
                     tenant_id: TENANT_ID,
@@ -771,59 +792,68 @@ mod tests {
         assert_eq!(arena_after.len(), 2);
     }
 
-    // 対象ビヘイビア: TABLE-8。カタログにテーブルが 1 つも存在しない状態で
-    // `Storage::put` により孤立行（どのテーブルにも属さない行）を書き込み、その後で
-    // 対象テーブルを作成すると、カタログゲート（「対象テーブルしか存在しない」）は
-    // 通過してしまう。しかしモジュールドキュメントのスコープ境界のとおり、このゲートは
-    // 行の帰属を証明する十分条件ではない。この回帰テストで「孤立行が混入した場合の挙動」
-    // を固定する。現状の実装は孤立行の有無を検出できないため、混入を許容してしまう
-    // （既知の限界。`build` を `pub(crate)` に留めている理由でもある）。
+    // 対象ビヘイビア: TABLE-8（codex P1 対応）。旧 `Storage::put`/`Storage::scan` 系の
+    // 平坦な行ストア（`storage.rs::ROWS_TABLE`）へ書き込まれた行は、テーブルスコープ行
+    // API（`insert_row_into_table` 等）が使う `user_rows/{table_name}` とは別の redb
+    // テーブルであるため、対象テーブルのアリーナには一切混入しないことを検証する
+    // （以前の実装は「行への永続的なテーブル識別子」が無く、この分離を保証できなかった）。
     #[test]
-    fn build_documents_orphan_row_limitation() {
-        let path = unique_db_path("orphan-row");
+    fn build_does_not_mix_in_rows_from_the_flat_legacy_row_store() {
+        use crate::storage::RowInput as FlatRowInput;
+
+        let path = unique_db_path("legacy-flat-store");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
 
-        // カタログに 1 つもテーブルが存在しない状態で、同次元の行を書き込む
-        // （`Storage::put` はテーブル名・スキーマを要求しないため書き込める）。
+        // 旧経路（テーブル帰属を持たない平坦な行ストア）へ、同次元の行を書き込む。
         storage
             .put(
                 999,
-                &RowInput {
+                &FlatRowInput {
                     tenant_id: TENANT_ID,
                     visibility: Visibility::Public,
                     embedding: &[1.0, 2.0, 3.0, 4.0],
-                    metadata: b"orphan",
+                    metadata: b"legacy-flat-store",
                 },
             )
-            .expect("seed orphan row before any table exists");
+            .expect("seed row into legacy flat row store");
 
-        // その後に対象テーブルを作成する。カタログゲート（対象テーブルしか存在しない）は
-        // 通過するが、孤立行 id=999 は対象テーブルに属さない。
         storage
             .create_table(&schema_for("docs", 4))
-            .expect("create_table after orphan row was written");
+            .expect("create_table");
+        storage
+            .insert_row_into_table(
+                "docs",
+                0,
+                &RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding: &[5.0, 6.0, 7.0, 8.0],
+                    metadata: b"table=docs",
+                },
+            )
+            .expect("seed row into table-scoped store");
 
         let arena = VectorArena::build(&storage, "docs").expect("build arena");
-        // 既知の限界: 現状の実装は孤立行を検出できず、混入したまま返す。この事実を
-        // 固定するのが本テストの目的。行への永続的なテーブル識別子付与が実装され次第、
-        // このアサーションを「孤立行を検出して Err を返す」側へ書き換える必要がある。
+        // 旧経路の行（id=999）は混入せず、テーブルスコープ経路の行（id=0）のみを保持する。
         assert_eq!(arena.len(), 1);
-        assert_eq!(arena.ids(), &[999u64]);
+        assert_eq!(arena.ids(), &[0u64]);
+        assert_eq!(arena.vector(0), Some([5.0, 6.0, 7.0, 8.0].as_slice()));
     }
 
     // 以下、旧 `tests/arena_perf.rs`（統合テスト）からの移設分。「コールドスタート時に
     // 一度だけアリーナを構築し、以降の検索はアリーナ上のスライスを参照する経路」が
-    // 「クエリの都度 `Storage::scan` で全行を読み直してデコードする経路」より十分速い
-    // ことを CI で検出可能にする（`tests/incremental_write_perf.rs`（TASK-143）と同一の
-    // 計測方針: ウォームアップ 1 回を除外・複数ラウンドの中央値比較・
+    // 「クエリの都度 `Storage::scan_table_page` でページングしながら読み直してデコードする
+    // 経路」より十分速いことを CI で検出可能にする（`tests/incremental_write_perf.rs`
+    // （TASK-143）と同一の計測方針: ウォームアップ 1 回を除外・複数ラウンドの中央値比較・
     // `Duration::saturating_mul` の整数比較で判定・判定閾値は本テスト固有の計測パラメータで
     // spec の実測比そのものは転記しない）。
     //
-    // 規模の選定: `Storage::scan()` は総バイト量 64MiB 超で `ScanLimitExceeded` を返す
-    // （`storage.rs` 参照）。本テストの行数・次元は、その上限に対して十分な余裕を残し、かつ
-    // debug ビルドでも CI 実行時間が長くなりすぎないよう小さく抑えている
-    // （ROWS × DIM × 4 バイト ≈ 5.1 MiB で 64MiB に対して十分小さい）。
+    // 規模の選定: `Storage::scan_table_page` は 1 ページあたり総バイト量
+    // `MAX_SCAN_PAGE_BYTES`（16MiB）超で次ページへ打ち切る（`storage.rs` 参照）。
+    // 本テストの行数・次元は、その上限に対して十分な余裕を残し、かつ debug ビルドでも
+    // CI 実行時間が長くなりすぎないよう小さく抑えている
+    // （ROWS × DIM × 4 バイト ≈ 2.6 MiB で 1 ページに収まる）。
     mod perf {
         use super::*;
         use std::time::{Duration, Instant};
@@ -875,12 +905,25 @@ mod tests {
         }
 
         fn best_score_over_rescan(storage: &Storage, query: &[f32]) -> f32 {
-            let rows = storage.scan().expect("scan within configured limits");
+            // テーブルスコープ経路（`scan_table_page`）でページングしながら都度読み直す。
+            // `Storage::scan`（`storage.rs` の平坦な `ROWS_TABLE` 走査）は本テストが使う
+            // テーブルスコープ行 API（`insert_rows_into_table`）とは別の redb テーブルを
+            // 参照するため、ここでは使えない。
             let mut best = f32::MIN;
-            for row in &rows {
-                let score = dot(&row.embedding, query);
-                if score > best {
-                    best = score;
+            let mut cursor: Option<u64> = None;
+            loop {
+                let (rows, next_cursor) = storage
+                    .scan_table_page(TABLE_NAME, cursor, crate::storage::MAX_SCAN_PAGE_LIMIT)
+                    .expect("scan_table_page within configured limits");
+                for row in &rows {
+                    let score = dot(&row.embedding, query);
+                    if score > best {
+                        best = score;
+                    }
+                }
+                match next_cursor {
+                    Some(c) => cursor = Some(c),
+                    None => break,
                 }
             }
             best
@@ -909,7 +952,9 @@ mod tests {
                     )
                 })
                 .collect();
-            storage.put_batch(&batch).expect("seed dataset");
+            storage
+                .insert_rows_into_table(TABLE_NAME, &batch)
+                .expect("seed dataset");
             storage
         }
 

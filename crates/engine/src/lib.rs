@@ -12,7 +12,8 @@
 //! `CREATE TABLE`／`ALTER TABLE ADD COLUMN`。対象ビヘイビア: TABLE-1, TABLE-4,
 //! TABLE-5, TABLE-6）・TASK-86（カタログスキーマ駆動の行エンコーダー。対象ビヘイビア:
 //! TABLE-7）・TASK-87（コールドスタート・ベクトルアリーナ。対象ビヘイビア:
-//! TABLE-8）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
+//! TABLE-8）・TASK-146（テーブル粒度次元固定・複数テーブル共存の拡張機能。対象ビヘイビア:
+//! EXT-1, EXT-2）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
 
 pub mod arena;
 pub mod catalog;
