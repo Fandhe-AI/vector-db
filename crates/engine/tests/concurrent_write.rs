@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use engine::storage::{RowInput, Storage};
+use engine::storage::{RowInput, Storage, Visibility};
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -86,10 +86,13 @@ fn concurrent_put_from_multiple_threads_persists_every_row_without_loss_or_dupli
                     let id = base_id + offset;
                     let embedding: Vec<f32> = (0..EMBEDDING_DIM).map(|i| (id + i as u64) as f32).collect();
                     let metadata = format!("thread={thread_idx}").into_bytes();
+                    let tenant_id = format!("tenant-{thread_idx}");
                     storage
                         .put(
                             id,
                             &RowInput {
+                                tenant_id: &tenant_id,
+                                visibility: Visibility::Public,
                                 embedding: &embedding,
                                 metadata: &metadata,
                             },
@@ -139,12 +142,15 @@ fn concurrent_put_batch_from_multiple_threads_persists_every_row_without_loss_or
                     })
                     .collect();
                 let metadata = format!("thread={thread_idx}").into_bytes();
+                let tenant_id = format!("tenant-{thread_idx}");
                 let rows: Vec<(u64, RowInput<'_>)> = (0..ROWS_PER_THREAD)
                     .map(|offset| {
                         let id = base_id + offset;
                         (
                             id,
                             RowInput {
+                                tenant_id: &tenant_id,
+                                visibility: Visibility::Public,
                                 embedding: &embeddings[offset as usize],
                                 metadata: &metadata,
                             },

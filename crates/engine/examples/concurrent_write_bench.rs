@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::storage::{RowInput, Storage};
+use engine::storage::{RowInput, Storage, Visibility};
 
 /// 768 次元 f32 埋め込み（現実的なベクトルサイズの想定値）。
 const EMBEDDING_DIM: usize = 768;
@@ -87,6 +87,7 @@ fn run_single_put(storage: Arc<Storage>, thread_count: u64) -> RunResult {
             let storage = Arc::clone(&storage);
             thread::spawn(move || {
                 let base_id = thread_idx * rows_per_thread * 1000;
+                let tenant_id = format!("tenant-{thread_idx}");
                 let mut latencies = Vec::with_capacity(rows_per_thread as usize);
                 for offset in 0..rows_per_thread {
                     let id = base_id + offset;
@@ -97,6 +98,8 @@ fn run_single_put(storage: Arc<Storage>, thread_count: u64) -> RunResult {
                         .put(
                             id,
                             &RowInput {
+                                tenant_id: &tenant_id,
+                                visibility: Visibility::Public,
                                 embedding: &embedding,
                                 metadata: &metadata,
                             },
@@ -126,6 +129,7 @@ fn run_put_batch(storage: Arc<Storage>, thread_count: u64) -> RunResult {
             let storage = Arc::clone(&storage);
             thread::spawn(move || {
                 let base_id = thread_idx * rows_per_thread * 1000;
+                let tenant_id = format!("tenant-{thread_idx}");
                 let mut latencies = Vec::with_capacity(batches_per_thread as usize);
                 for batch_idx in 0..batches_per_thread {
                     let batch_base = base_id + batch_idx * BATCH_SIZE;
@@ -140,6 +144,8 @@ fn run_put_batch(storage: Arc<Storage>, thread_count: u64) -> RunResult {
                             (
                                 batch_base + i as u64,
                                 RowInput {
+                                    tenant_id: &tenant_id,
+                                    visibility: Visibility::Public,
                                     embedding: &embeddings[i],
                                     metadata: &metadatas[i],
                                 },
