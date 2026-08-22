@@ -174,7 +174,14 @@ fn write_inner(path: &str) -> Result<(), String> {
     let mut handle = stdout.lock();
 
     for batch_no in 0..MAX_BATCHES {
-        let batch_seq = resume.next_batch_seq + batch_no;
+        // 既存台帳の最大通番が u64::MAX 付近の場合、無検査の加算だと debug では panic、
+        // release ではラップアラウンドして既存の batch_seq=0 を再利用してしまう
+        // （`log_batch` は重複キーを拒否しないため台帳が破壊される）。checked_add で
+        // 検出し fail-closed に終了する。
+        let batch_seq = resume
+            .next_batch_seq
+            .checked_add(batch_no)
+            .ok_or_else(|| "batch seq overflow while writing".to_string())?;
         // TABLE-10 の 2 テーブル横断コミットそのものを検証する経路。同一トランザクション
         // 内で行テーブル（BATCH 件）とバッチ台帳（1 エントリ）の両方へ書き込む。
         let mut txn = storage
