@@ -1,0 +1,15 @@
+# engine: コアロジック層（検索カーネル・認証・RLS 相当のテナント境界・redb 永続化）。
+# wire-server から呼ばれるライブラリクレート（.claude/rules/delegation-impl.md 参照）。
+# TASK-66 時点では雛形のみで依存を持たない。
+[package]
+name = "engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[dependencies]

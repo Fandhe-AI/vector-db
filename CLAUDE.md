@@ -6,10 +6,10 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 
 - **本リポは public**。仕様・ビヘイビア定義の SSOT は private リポ [vector-db-spec](https://github.com/Fandhe-AI/vector-db-spec)（`docs/spec` submodule）。**spec 本文を public 資産へ転記しない**（[spec-confidentiality](.claude/rules/spec-confidentiality.md)）
 - 接続プロトコル: PostgreSQL wire プロトコル v3 互換の自作実装（外部プロトコルライブラリ非依存）
-- 想定クレート構成: `engine`（コアロジック）＋ `wire-server`（バイナリ）の workspace
+- クレート構成: `engine`（コアロジック）＋ `wire-server`（バイナリ）の workspace（`crates/`）
 - 永続化: `redb` ベース / 安全性: RLS 相当のテナント境界・fail-closed のエラー契約（`wire_code`）
 - 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）
-- ステータス: 実装未着手（タスクは spec リポの `05-tasks.md`（TASK-66〜154）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
+- ステータス: workspace 雛形構築済み（TASK-66）。検索カーネル・認証等は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜154）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
 
 ## Repository Structure
 
@@ -20,14 +20,14 @@ vector-db/
 ├── Makefile                       # タスクランナー（make setup / make ci / docker-*）
 ├── lefthook.yml                   # git hooks（rustfmt・secrets-guard・Conventional Commits・clippy/test）
 ├── Dockerfile / compose.yaml      # 環境非依存の開発コンテナ（make docker-ci）
-├── deny.toml                      # cargo-deny 設定（Cargo.toml 追加後に make deny で有効化）
+├── deny.toml                      # cargo-deny 設定（make deny で有効化済み）
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── commitlint.config.mjs          # Conventional Commits 検証設定
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── docs/
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs ベースの CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）の CI
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
@@ -35,7 +35,8 @@ vector-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-└── crates/                        # （実装着手後）engine / wire-server workspace
+├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
+└── crates/                        # engine（lib）/ wire-server（bin）workspace
 ```
 
 ## 委譲方針（必読）
@@ -100,7 +101,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは Cargo.toml 追加後に自動有効化
+- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: commitlint で検証。`--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋AGENTS.md P0 観点（spec 漏えい・テナント境界・wire 入力検証）を確認

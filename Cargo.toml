@@ -1,0 +1,16 @@
+# vector-db workspace（TASK-66: 基盤・工程管理）。
+#
+# `engine`（コアロジック・検索カーネル・認証・RLS・redb 永続化）と
+# `wire-server`（pg wire v3 自作実装のバイナリ）の 2 クレート構成
+# （.claude/rules/delegation-impl.md のパスベース委譲マッピングと対応）。
+# 依存は本タスクでは追加しない（.claude/rules/dependency-policy.md: 追加はユーザー承認制）。
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/wire-server"]
+
+[workspace.package]
+# lefthook.yml の rustfmt-check（`sed -n 's/^edition *= *"..."'`）が行頭の
+# `edition = "..."` 形式をこのファイルから読むため、この位置・形式を維持すること。
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
