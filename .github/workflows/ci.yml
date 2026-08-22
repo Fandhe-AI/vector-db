@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # lint-docs（ドキュメント／設定ファイル系 lint）
+  # --------------------------------------------------
+  # Fandhe-AI/actions の lint-docs reusable workflow（lint ツールバージョンは
+  # 共通側で固定。agent-cli-skills の同名ジョブと同型）を呼び出す。
+  # 設定はそれぞれ `.markdownlint.jsonc` / `.markdownlintignore` /
+  # `.editorconfig` + `.editorconfig-checker.json` / `.yamllint` /
+  # `commitlint.config.mjs` を参照する。
+  #
+  # 必須チェックの集約: reusable 側の集約ジョブ `lint-docs / lint-docs-complete`
+  # （fail-closed。各 lint ジョブは boolean input の if: を持つ条件付きジョブとして
+  # 明示リストで skipped を判定する）を branch protection の必須チェックに使う。
+  # Rust 実装の着手時は rust-base-ci reusable workflow のジョブを本 workflow へ
+  # 追加し、必須チェックへその集約ジョブ（rust-base-ci-complete）を加えること。
+  lint-docs:
+    # Fandhe-AI/actions は可変タグ latest（move-latest-tag 管理で main へ追従）で
+    # 参照する（組織現行標準。AGENTS.md「CI・ワークフローの改変」の例外を参照）
+    uses: Fandhe-AI/actions/.github/workflows/lint-docs.yml@latest
+    permissions:
+      contents: read
+    with:
+      # public リポジトリのため GitHub ホステッド runner を明示指定（組織 runner 方針）
+      runner-label: ubuntu-latest
+      markdownlint: true
+      editorconfig: true
+      yamllint: true
+      # commitlint は PR の base/head から commit 範囲を取るため pull_request 専用
+      # （reusable 側は他イベントを fail-closed で拒否する）。push でも動く本
+      # workflow では event で切り替え、main への push では実行しない
+      commitlint: ${{ github.event_name == 'pull_request' }}

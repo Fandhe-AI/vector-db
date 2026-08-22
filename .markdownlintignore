@@ -1,0 +1,8 @@
+# markdownlint の除外パス。ルール設定本体は .markdownlint.jsonc を参照する。
+# .agents/skills/（upstream 配布のスキル実体。修正先は agent-cli-skills）と
+# docs/spec/（private submodule。lint 対象外）はリポジトリ管理外として除外する。
+_/
+.claude/
+.agents/skills/
+docs/spec/
+node_modules/
