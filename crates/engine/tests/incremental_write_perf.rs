@@ -13,6 +13,11 @@
 //!   増分・全体再構築の両方に共通で、比較の本質と無関係なため）。
 //! - 共有 CI ランナーのノイズを吸収するため、ウォームアップ 1 回の後、増分・全体再構築を
 //!   各複数回計測し、外れ値に弱い平均ではなく中央値同士で比較する。
+//! - 増分側の各ラウンドは、素の（ウォームアップ未適用の）ベースライン DB ファイルを
+//!   都度複製した上で計測する。1 つの DB に増分をラウンドをまたいで積み上げていくと、
+//!   計測時点の既存行数がラウンドごとに変化してしまい、全ラウンド固定の総行数で
+//!   計測する全体再構築側と比較条件がずれるため（増分後の総行数と全体再構築の総行数を
+//!   毎ラウンド一致させることが本テストの比較契約）。
 //! - 判定閾値・ワークロード規模はいずれも本テスト固有の計測パラメータであり、
 //!   debug/release いずれのビルド設定でも安定して通るようマージンを持たせている
 //!   （spec 所定の完了条件の値そのものではなく、実測値・spec 本文も転記しない。
@@ -170,22 +175,32 @@ fn persist2_incremental_write_completes_within_ratio_threshold_of_full_rebuild()
     drop(baseline_storage);
 
     // 2. ウォームアップ（ファイルシステムキャッシュ等の初回コストを計測から除外する）。
+    //    素のベースライン DB を複製した使い捨てファイル上で行い、以降の各ラウンドが
+    //    複製元とする `baseline_path` 自体は変更しない（3. 参照）。
     {
-        let storage = Storage::open(&baseline_path).expect("reopen baseline storage (warmup)");
+        let warmup_path = unique_db_path("warmup");
+        let _warmup_cleanup = CleanupGuard(warmup_path.clone());
+        std::fs::copy(&baseline_path, &warmup_path).expect("copy baseline for warmup");
+        let storage = Storage::open(&warmup_path).expect("open warmup storage");
         let warmup_rows = make_rows(BASELINE_ROWS, INCREMENTAL_ROWS, 0xdead_beef);
         storage
             .put_batch(&borrow_rows(&warmup_rows))
             .expect("warmup incremental batch write");
     }
 
-    // 3. 増分書き込みの所要時間を複数回計測する。各回は未使用の連番 ID 帯を使うことで、
-    //    ベースライン DB を毎回作り直さずに済ませる（テスト実行時間の抑制）。
+    // 3. 増分書き込みの所要時間を複数回計測する。各ラウンドは素のベースライン DB
+    //    （行数 = BASELINE_ROWS で固定）を新規ファイルへ複製してから書き込むことで、
+    //    計測時点の既存行数を毎ラウンド BASELINE_ROWS に揃える。これにより増分後の
+    //    総行数（BASELINE_ROWS + INCREMENTAL_ROWS）が、4. の全体再構築側が毎ラウンド
+    //    書き込む総行数と一致し、比較条件がラウンドをまたいでずれない。
     let mut incremental_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
     for round in 0..MEASUREMENT_ROUNDS as u64 {
-        let storage = Storage::open(&baseline_path).expect("reopen baseline storage");
-        let start_id = BASELINE_ROWS + INCREMENTAL_ROWS + round * INCREMENTAL_ROWS;
+        let round_path = unique_db_path(&format!("incremental-round-{round}"));
+        let _round_cleanup = CleanupGuard(round_path.clone());
+        std::fs::copy(&baseline_path, &round_path).expect("copy pristine baseline for round");
+        let storage = Storage::open(&round_path).expect("open round storage");
         let rows = make_rows(
-            start_id,
+            BASELINE_ROWS,
             INCREMENTAL_ROWS,
             0x9e37_79b9u32.wrapping_add(round as u32),
         );
