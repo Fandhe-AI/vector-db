@@ -207,6 +207,17 @@ impl Storage {
         Ok(Self { db })
     }
 
+    /// テスト専用の内部コンストラクタ。`StorageBackend` を差し替えた `redb::Database`
+    /// （例: `tests/power_loss.rs` の電源断シミュレーション用バックエンド）を、本番と
+    /// 同じ `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で
+    /// 検証できるようにする。`Storage::open`（`redb::Database::create` 固定）は本番経路
+    /// として維持し、本コンストラクタはバイパスしない。`test-support` feature でのみ
+    /// コンパイルされ、本番ビルドには含まれない。
+    #[cfg(feature = "test-support")]
+    pub fn from_database_for_testing(db: redb::Database) -> Self {
+        Self { db }
+    }
+
     /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1）。
     pub fn put(&self, id: u64, row: &RowInput<'_>) -> Result<()> {
         let encoded = encode_row(row)?;

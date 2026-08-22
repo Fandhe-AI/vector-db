@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex};
 
 use redb::{Database, ReadableDatabase, StorageBackend, TableDefinition};
 
+use engine::storage::{RowInput, Storage, Visibility};
+
 /// テスト対象のテーブル定義（`crates/engine/src/storage.rs` の `ROWS_TABLE` と同一の
 /// キー・値型。本ファイルは行の中身を解釈しないため、値のエンコード詳細に依存しない）。
 const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
@@ -308,22 +310,24 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     // 追い出しが発生し、commit 前でも `StorageBackend::write()` 経由で `log` に記録される
     // （それでも `commit()` を呼ばない＝ Immediate durability の最終 sync には到達しないため、
     // 電源断時点で `durable` には反映されない）。
+    let write_txn = db.begin_write().expect("begin write txn");
     {
-        let write_txn = db.begin_write().expect("begin write txn");
-        {
-            let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
-            for i in 0..64u64 {
-                table
-                    .insert(1_000 + i, &[0u8; 512][..])
-                    .expect("insert uncommitted row");
-            }
+        let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
+        for i in 0..64u64 {
             table
-                .insert(2u64, &b"never-committed"[..])
+                .insert(1_000 + i, &[0u8; 512][..])
                 .expect("insert uncommitted row");
         }
-        write_txn.abort().expect("abort uncommitted txn");
+        table
+            .insert(2u64, &b"never-committed"[..])
+            .expect("insert uncommitted row");
     }
 
+    // 電源断像は、トランザクションが commit も abort もしていない「途中」の時点で
+    // 採取する。先に `write_txn.abort()` を呼んでから採取すると、abort（正常な
+    // ロールバック処理）がバックエンドへ行う後始末の書き込みが電源断像に混入し得るため、
+    // 「トランザクション途中（最終 sync 前）の電源断」と「正常終了（abort 完了）後」を
+    // 混同することになる（指摘: abort 完了後の状態はクラッシュ像ではない）。
     let pending = backend.pending_write_count();
     assert!(
         pending > 0,
@@ -357,6 +361,11 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
          （growth のみに起因する差分ではないことを、同じ growth 後の長さを持つ \
          no_writeback_baseline との比較で担保する）"
     );
+
+    // 電源断像の採取が完了したので、ここでテストプロセスのリソース解放として
+    // abort する（採取済みの `crash_image_with_partial_writeback` は abort より前の
+    // スナップショットなので、この呼び出しが assertion に影響することはない）。
+    write_txn.abort().expect("abort uncommitted txn");
 
     drop(db);
     let recovered = reopen_from_image(crash_image_with_partial_writeback)
@@ -414,19 +423,19 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
 
         // commit まで到達しない追加の書き込みトランザクションを 1 本開始する
         // （page cache 上には乗るが、電源断時点でどこまで反映されているかは不定）。
+        let write_txn = db.begin_write().expect("begin write txn");
         {
-            let write_txn = db.begin_write().expect("begin write txn");
-            {
-                let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
-                for i in 0..extra_writes {
-                    table
-                        .insert(100 + i, &[0u8; 512][..])
-                        .expect("insert uncommitted row");
-                }
+            let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
+            for i in 0..extra_writes {
+                table
+                    .insert(100 + i, &[0u8; 512][..])
+                    .expect("insert uncommitted row");
             }
-            write_txn.abort().expect("abort uncommitted txn");
         }
 
+        // 電源断像（ログ長・部分集合・crash_image）は、トランザクションが commit も
+        // abort もしていない時点で採取する。scenario2 と同じ理由（abort 完了後に採取すると
+        // 正常なロールバック処理による後始末書き込みが電源断像に混入しかねない）による。
         let total_log_len = backend.pending_write_count();
         // 部分集合の探索が意味を持つには、まず「commit に到達しなかった書き込みが
         // 実際にバックエンドへ記録されている」ことが前提になる。これが 0 件のままだと
@@ -452,6 +461,11 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
             "seed={seed}: 選ばれた部分集合が電源断像へ何も反映していない \
              （空検証に縮退している）"
         );
+
+        // 電源断像の採取が完了したので、ここでテストプロセスのリソース解放として
+        // abort する（採取済みの `crash_image` は abort より前のスナップショットなので、
+        // この呼び出しが以降の assertion に影響することはない）。
+        write_txn.abort().expect("abort uncommitted txn");
         drop(db);
 
         match reopen_from_image(crash_image) {
@@ -528,75 +542,77 @@ fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
     );
 }
 
-/// `crates/engine/src/storage.rs` の行エンコーディング（同ファイル参照）を模した
-/// 最小限のエンコード（テストローカル。engine のプライベート実装には依存しない。
-/// エンコード方式は `tests/persistence.rs` の
-/// `persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table` と同一の
-/// 前提を踏襲する）。dim・metadata は本シナリオの検証対象外のため 0 固定とする。
-/// フィールド順序・オフセットの詳細は `crates/engine/src/storage.rs` を参照。
-fn encode_rls_row(tenant_id: &str, visibility_byte: u8) -> Vec<u8> {
-    let tenant_bytes = tenant_id.as_bytes();
-    let mut buf = Vec::new();
-    buf.push(2u8); // ROW_FORMAT_VERSION（v2）
-    buf.extend_from_slice(&(tenant_bytes.len() as u16).to_le_bytes());
-    buf.extend_from_slice(tenant_bytes);
-    buf.push(visibility_byte);
-    buf.extend_from_slice(&0u32.to_le_bytes()); // dim = 0
-    buf.extend_from_slice(&0u32.to_le_bytes()); // metadata_len = 0
-    buf
-}
-
 // シナリオ 4（PERSIST-3 の電源断拡張。ポインタ: `docs/spec/04-behavior/persistence.md`）:
 // RLS フィールドが電源断後も無傷で保持される。
-// `Storage` の公開 API は電源断シミュレーション用のバックエンド差し替えに対応していない
-// ため（`Storage::open` は `redb::Database::create` 固定）、raw `redb::Database` に対して
-// `encode_rls_row` で組み立てたバイト列を直接書き込み、再オープン後に RLS フィールドの
-// 位置を検査する（`tests/persistence.rs` の
-// `persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table` と同じ手法）。
+// `Storage::from_database_for_testing`（`crates/engine/src/storage.rs`、`test-support`
+// feature 限定）でバックエンド差し替え済み `redb::Database` を本番の `Storage` へ渡し、
+// 書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の
+// `encode_row`/`decode_row` を通す。テスト側でエンコード方式を複製しないため、
+// 本番エンコーダのフィールド欠落・順序変更・visibility 値誤りがあれば
+// このテストで検出できる。電源断前後どちらも `Storage::get`（＝実際の decode_row）で
+// 読み出して同じ内容が復元されることを確認する。
 #[test]
 fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
-    const VISIBILITY_PUBLIC: u8 = 0x01;
-    const VISIBILITY_PRIVATE: u8 = 0x02;
+    let (backend, raw_db) = open_fresh();
+    let storage = Storage::from_database_for_testing(raw_db);
 
-    let (backend, db) = open_fresh();
-    let row_a = encode_rls_row("tenant-a", VISIBILITY_PUBLIC);
-    let row_b = encode_rls_row("tenant-b", VISIBILITY_PRIVATE);
-    insert_row(&db, 1, &row_a);
-    insert_row(&db, 2, &row_b);
+    storage
+        .put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &[],
+            },
+        )
+        .expect("put row 1 via production Storage API");
+    storage
+        .put(
+            2,
+            &RowInput {
+                tenant_id: "tenant-b",
+                visibility: Visibility::Private,
+                embedding: &[],
+                metadata: &[],
+            },
+        )
+        .expect("put row 2 via production Storage API");
+
+    // 電源断前に、production decode_row 経由での読み出しが期待通りであることを
+    // 確認しておく（電源断後との比較基準）。
+    let row1_before = storage
+        .get(1)
+        .expect("decode row 1 via production Storage API before crash");
+    let row2_before = storage
+        .get(2)
+        .expect("decode row 2 via production Storage API before crash");
 
     let crash_image = backend.durable_snapshot();
-    drop(db);
+    drop(storage);
 
-    let recovered = reopen_from_image(crash_image).expect("reopen after crash must succeed");
+    let recovered_raw_db = reopen_from_image(crash_image).expect("reopen after crash must succeed");
 
-    let bytes1 = get_row(&recovered, 1).expect("row 1 must survive crash");
+    // 本番 `Storage::get`（＝実際の decode_row）経由で RLS フィールドが正しく
+    // 復元できること（PERSIST-3 の Storage 層再検証）。
+    let recovered_storage = Storage::from_database_for_testing(recovered_raw_db);
+    let row1_after = recovered_storage
+        .get(1)
+        .expect("decode row 1 via production Storage API after crash");
     assert_eq!(
-        bytes1, row_a,
-        "row 1 のバイト列は電源断前後で完全一致していなければならない"
+        row1_after, row1_before,
+        "row 1 は電源断前後で production decode_row の結果が完全一致していなければならない"
     );
-    let tenant_a_start = 1 + 2;
-    let tenant_a_end = tenant_a_start + "tenant-a".len();
-    assert_eq!(
-        bytes1.get(tenant_a_start..tenant_a_end),
-        Some(b"tenant-a".as_slice()),
-        "tenant_id は電源断後も期待するオフセットに残っていなければならない"
-    );
-    assert_eq!(
-        bytes1.get(tenant_a_end).copied(),
-        Some(VISIBILITY_PUBLIC),
-        "visibility バイトは電源断後も tenant_id 直後の期待するオフセットに残っていなければならない"
-    );
+    assert_eq!(row1_after.tenant_id, "tenant-a");
+    assert_eq!(row1_after.visibility, Visibility::Public);
 
-    let bytes2 = get_row(&recovered, 2).expect("row 2 must survive crash");
+    let row2_after = recovered_storage
+        .get(2)
+        .expect("decode row 2 via production Storage API after crash");
     assert_eq!(
-        bytes2, row_b,
-        "row 2 のバイト列は電源断前後で完全一致していなければならない"
+        row2_after, row2_before,
+        "row 2 は電源断前後で production decode_row の結果が完全一致していなければならない"
     );
-    let tenant_b_start = 1 + 2;
-    let tenant_b_end = tenant_b_start + "tenant-b".len();
-    assert_eq!(
-        bytes2.get(tenant_b_start..tenant_b_end),
-        Some(b"tenant-b".as_slice())
-    );
-    assert_eq!(bytes2.get(tenant_b_end).copied(), Some(VISIBILITY_PRIVATE));
+    assert_eq!(row2_after.tenant_id, "tenant-b");
+    assert_eq!(row2_after.visibility, Visibility::Private);
 }

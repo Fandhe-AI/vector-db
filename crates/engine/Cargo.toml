@@ -23,3 +23,15 @@ redb = "=4.2.0"
 # redb を直接操作する。新規依存の追加ではなく上記と同一クレート・バージョンを
 # テストスコープでも利用するのみ。
 redb = "=4.2.0"
+# tests/power_loss.rs（PERSIST-3 の電源断シナリオ）が、`StorageBackend` を差し替えた
+# `redb::Database` を本番の `Storage::put`/エンコーダ経由で検証できるように、
+# `test-support` feature を有効にした自己参照（自クレートを dev-dependencies として
+# 再宣言し、テストビルドでのみ追加 API を有効化する標準的な手法）。新規外部依存では
+# ない。
+engine = { path = ".", features = ["test-support"] }
+
+[features]
+# `Storage::from_database_for_testing`（バックエンド差し替え済み `redb::Database` を
+# 受け取る内部コンストラクタ）をテストビルドでのみ有効化する。本番ビルド（feature 無効）
+# には含まれない。
+test-support = []
