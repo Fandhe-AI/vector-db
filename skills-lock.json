@@ -5,7 +5,7 @@
       "source": "Fandhe-AI/agent-reference-skills",
       "sourceType": "github",
       "skillPath": "skills/amd-rocm/SKILL.md",
-      "computedHash": "9d0a1b39d46625f4ee3e6ee9540841f8ea753e7e9347a2789be8c17ce3a32276"
+      "computedHash": "9cf6e20283dfb722349d01939843477d8d924130d3d05333668e907f190bbaa7"
     },
     "apple-silicon": {
       "source": "Fandhe-AI/agent-reference-skills",
