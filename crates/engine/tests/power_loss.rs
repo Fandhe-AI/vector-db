@@ -16,6 +16,15 @@
 //!   反映される」という単純化で近似する）
 //! - `set_len`（ファイル長変更）はメタデータ操作として即時 durable 化する単純化を置く
 //!   （多くのファイルシステムでメタデータジャーナリングは別経路のため、単純化として妥当と判断）
+//! - シナリオ 3（[`run_partial_writeback_search`]）が探索する「部分集合」は、abort された
+//!   トランザクションの `write()` ログに限られる。`redb` は copy-on-write B-tree のため、
+//!   コミットに到達しなかったトランザクションの書き込みは新規割当ページ（既存のコミット済み
+//!   ルートが一切参照しない領域）にしか行かれない。したがって本モデルの部分集合探索は
+//!   **構造的に** コミット済みツリーへ干渉できず、`reopen_from_image` の `Err` 分岐へは
+//!   到達し得ない（これは `redb` の頑健性の実証ではなく、本ハーネスの探索空間の限界である）。
+//!   ハーネス自体が拒否を検出できることは、コミット済み像への直接バイト破損を用いた
+//!   `power_loss_scenario3_corrupted_durable_image_is_rejected`（否定コントロール）で
+//!   別途確認する。
 //!
 //! テストは `redb` を直接操作する（`tests/persistence.rs` と同じ前提。
 //! `crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。`Storage`（`crates/engine/src/storage.rs`）
@@ -295,8 +304,9 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     insert_row(&db, 1, b"pre-existing");
 
     // 直近 sync 時点（行 1 のコミット完了時点）のスナップショットをあらかじめ確保しておく。
-    // 以降の「未完了トランザクション」の書き込みは sync 前提で `log` に積まれるだけなので、
-    // このスナップショットが「トランザクション途中で電源断した場合の像」になる。
+    // 電源断像そのものではなく、後段で「部分 write-back が実際に電源断像へ混入したこと」
+    // （`assert_ne!`）を確認するためのベースライン（write-back が一切起きなかった場合の像）
+    // として使う。
     let pre_txn_image = backend.durable_snapshot();
 
     // 最終 sync（コミット）に到達しない書き込みを発生させる。`open_fresh` で cache_size を
@@ -320,15 +330,30 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
         write_txn.abort().expect("abort uncommitted txn");
     }
 
+    let pending = backend.pending_write_count();
     assert!(
-        backend.pending_write_count() > 0,
+        pending > 0,
         "未コミットのページ書き込みが log に記録されているはず \
          （0 件だと本テストは何も検証していないことになる）"
     );
 
+    // 「電源断時点の像」として、pre_txn_image（未コミット txn 開始前のスナップショット）
+    // ではなく、abort された txn が実際にバックエンドへ書き戻したページをすべて反映した像
+    // （crash_image(全 indices)）を使う。こうすることで、`open_fresh` の `set_cache_size`
+    // 縮小によって発生させた部分 write-back が実際に電源断像へ混入していることを
+    // `assert_ne!` で確認したうえで、それでもなお未コミット txn の内容は読めない
+    // （commit していないためルートページが更新されておらず、不到達）ことを検証する。
+    let all_indices: Vec<usize> = (0..pending).collect();
+    let crash_image_with_partial_writeback = backend.crash_image(&all_indices);
+    assert_ne!(
+        crash_image_with_partial_writeback, pre_txn_image,
+        "部分 write-back が電源断像へ実際に混入していなければ、本テストは \
+         シナリオ 1 相当の検証（コミット後の電源断）と区別がつかない"
+    );
+
     drop(db);
-    let recovered =
-        reopen_from_image(pre_txn_image).expect("reopen after mid-transaction crash must succeed");
+    let recovered = reopen_from_image(crash_image_with_partial_writeback)
+        .expect("reopen after mid-transaction crash must succeed");
     assert_eq!(
         get_row(&recovered, 1),
         Some(b"pre-existing".to_vec()),
@@ -337,7 +362,8 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     assert_eq!(
         get_row(&recovered, 2),
         None,
-        "commit に到達しなかったトランザクションの内容は電源断後に見えてはならない"
+        "commit に到達しなかったトランザクションの内容は電源断後に見えてはならない \
+         （部分 write-back 像を使っても、ルートページは未コミットのため不到達）"
     );
 }
 
@@ -439,6 +465,59 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
     println!(
         "power_loss scenario3: seed_count={seed_count} extra_writes={extra_writes} \
          opened_and_consistent={opened_consistent} rejected_fail_closed={rejected}"
+    );
+
+    // モジュール doc「モデルの限界」に記載の通り、本探索が扱う部分集合は abort された
+    // トランザクションの書き込み（新規割当ページのみ）に限られ、コミット済みツリーには
+    // 構造的に干渉できない。したがって `rejected == 0` かつ全反復が内容一致でオープンに
+    // 成功することは、この探索空間における必然（モデルの限界に起因する）であって、
+    // `redb` の頑健性の実証ではない。この不変条件を明示的に固定する（将来ハーネスや
+    // `redb` の内部実装が変わり、この前提が崩れた場合に検知できるようにするため）。
+    // 拒否経路が実際に機能することは、コミット済み像への直接バイト破損を用いた
+    // `power_loss_scenario3_corrupted_durable_image_is_rejected`（否定コントロール）で
+    // 別途検証している。
+    assert_eq!(
+        rejected, 0,
+        "seed_count={seed_count}: 本モデルの部分集合探索はコミット済みツリーへ構造的に \
+         干渉できないため rejected は常に 0 のはず（モジュール doc「モデルの限界」参照）。\
+         0 でなくなった場合はモデルの前提が崩れているので原因を調査すること"
+    );
+    assert_eq!(
+        opened_consistent, seed_count,
+        "seed_count={seed_count}: 上記と同じ理由で全反復がオープン成功・内容一致のはず"
+    );
+}
+
+// シナリオ 3 の否定コントロール: コミット済みの電源断像そのもの（`durable_snapshot()`）を
+// 直接バイト破損させた場合、`reopen_from_image` が実際に `Err` を返すことを確認する。
+// `run_partial_writeback_search` は abort された txn の部分集合適用ではコミット済みツリーへ
+// 構造的に干渉できず拒否経路（`Err` 分岐）へ到達し得ない（モジュール doc「モデルの限界」
+// 参照）。本テストはそれとは別に、ハーネス自体が破損像を実際に拒否できることを直接示す
+// （テストの拒否分岐が到達不能なコードではないことの証明）。
+#[test]
+fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
+    let (backend, db) = open_fresh();
+    insert_row(&db, 1, b"committed-before-corruption");
+
+    let mut corrupted_image = backend.durable_snapshot();
+    drop(db);
+
+    assert!(
+        corrupted_image.len() >= 64,
+        "破損させる先頭 64 バイトを確保できる程度にはコミット済み像が存在するはず"
+    );
+    for byte in corrupted_image.iter_mut().take(64) {
+        *byte = !*byte;
+    }
+
+    let result = reopen_from_image(corrupted_image);
+    assert!(
+        result.is_err(),
+        "コミット済み像の先頭 64 バイト（redb のヘッダ領域）を反転させた場合、\
+         reopen_from_image は明示的な Err を返さなければならない（fail-closed）。\
+         Ok になった場合はハーネスが破損を検出できていないことを意味し、\
+         run_partial_writeback_search の rejected==0 が「拒否経路が機能しない」ことに \
+         起因していないかを疑う必要がある"
     );
 }
 
