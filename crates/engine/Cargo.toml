@@ -13,3 +13,13 @@ name = "engine"
 path = "src/lib.rs"
 
 [dependencies]
+# TASK-140（永続化層）: オーナー承認済み（Issue #16）の唯一の依存。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+redb = "=4.2.0"
+
+[dev-dependencies]
+# tests/persistence.rs（対象ビヘイビア: PERSIST-1, PERSIST-4）が、Storage の公開 API
+# では表現できないトランザクション境界に踏み込んで検証するために同一バージョンの
+# redb を直接操作する。新規依存の追加ではなく上記と同一クレート・バージョンを
+# テストスコープでも利用するのみ。
+redb = "=4.2.0"
