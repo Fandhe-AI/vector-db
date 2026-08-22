@@ -25,6 +25,7 @@ vector-db/
 ├── commitlint.config.mjs          # Conventional Commits 検証設定
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── docs/
+│   ├── design/                    # 設計ドキュメント（ADR 形式・public）
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）の CI
