@@ -145,6 +145,27 @@ class LoadDatasetTest(unittest.TestCase):
             with self.assertRaises(aa.DatasetError):
                 aa.load_dataset(data_path)
 
+    def test_non_object_record_raises(self):
+        # レコードが JSON object でない（例: 配列）場合、後段の record[key] アクセスで
+        # 未処理の TypeError を起こす前に明示エラー化する。
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = Path(tmp) / "data.jsonl"
+            data_path.write_text(json.dumps(["a", "b"]), encoding="utf-8")
+            with self.assertRaises(aa.DatasetError):
+                aa.load_dataset(data_path)
+
+    def test_non_string_field_raises(self):
+        # id が非文字列（int 等）だと後段の _escape_markdown_table_cell() が
+        # 未処理の AttributeError を起こしうるため、型検証で明示エラー化する。
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = Path(tmp) / "data.jsonl"
+            data_path.write_text(
+                json.dumps({"id": 123, "question": "q", "context": "c", "expected_answer": "e"}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(aa.DatasetError):
+                aa.load_dataset(data_path)
+
 
 class SampleDatasetTest(unittest.TestCase):
     def test_sample_smaller_than_population(self):
@@ -184,6 +205,21 @@ class ParseScoreLabelTest(unittest.TestCase):
 
     def test_empty_output_is_unknown_fail_closed(self):
         label, reason = aa._parse_score_label("")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+    def test_whitespace_only_output_is_unknown_without_index_error(self):
+        # 空白のみの出力で text.strip().splitlines()[0] が IndexError を起こさないことを検証する。
+        label, reason = aa._parse_score_label("   \n  \n")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+    def test_prefix_match_is_not_treated_as_correct(self):
+        # 'CORRECTED' は CORRECT の前方一致だが意味が異なるため誤って正答扱いしない
+        # （fail-closed: 完全一致でない限り UNKNOWN）。
+        label, reason = aa._parse_score_label("CORRECTED after review")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+    def test_uncertain_correctness_is_not_treated_as_correct(self):
+        label, reason = aa._parse_score_label("CORRECTNESS is uncertain")
         self.assertEqual(label, aa.LABEL_UNKNOWN)
 
 
@@ -413,6 +449,50 @@ class MainWriteReportFailureTest(unittest.TestCase):
                 aa.write_report = original_write_report
 
             self.assertEqual(exit_code, 5)
+
+
+class PostJsonRetriesOsErrorTest(unittest.TestCase):
+    """ConnectionResetError 等の bare OSError もリトライ対象に含まれることを検証する。"""
+
+    def test_connection_reset_error_is_retried_then_succeeds(self):
+        attempts = {"n": 0}
+
+        class _FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def read(self, _n):
+                return json.dumps({"ok": True}).encode("utf-8")
+
+        class _FakeOpener:
+            def open(self, _req, timeout):  # noqa: ARG002
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise ConnectionResetError("connection reset by peer")
+                return _FakeResponse()
+
+        original_build_opener = aa.urllib.request.build_opener
+        original_sleep = aa.time.sleep
+        aa.urllib.request.build_opener = lambda *_args, **_kwargs: _FakeOpener()
+        aa.time.sleep = lambda _seconds: None
+        try:
+            result = aa._post_json(
+                "http://127.0.0.1:9/v1/chat/completions",
+                {"model": "dummy"},
+                None,
+                timeout_seconds=1,
+                max_retries=1,
+                max_response_bytes=1024,
+            )
+        finally:
+            aa.urllib.request.build_opener = original_build_opener
+            aa.time.sleep = original_sleep
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(attempts["n"], 2)
 
 
 if __name__ == "__main__":

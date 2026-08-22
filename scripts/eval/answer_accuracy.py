@@ -28,6 +28,7 @@ import http.client
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
@@ -231,9 +232,15 @@ def load_dataset(data_path: Path) -> list[dict[str, str]]:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise DatasetError(f"invalid JSON at {data_path}:{line_no}: {exc}") from exc
+            if not isinstance(record, dict):
+                raise DatasetError(f"record at {data_path}:{line_no} must be a JSON object")
             for key in ("id", "question", "context", "expected_answer"):
                 if key not in record:
                     raise DatasetError(f"record at {data_path}:{line_no} missing key '{key}'")
+                if not isinstance(record[key], str):
+                    raise DatasetError(
+                        f"record at {data_path}:{line_no} field '{key}' must be a string"
+                    )
             records.append(record)
 
     if not records:
@@ -288,7 +295,16 @@ def _post_json(
                 if len(raw) > max_response_bytes:
                     raise ValueError("response exceeded max_response_bytes limit")
                 return json.loads(raw.decode("utf-8"))
-        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ValueError) as exc:
+        except (
+            urllib.error.URLError,
+            http.client.HTTPException,
+            TimeoutError,
+            ValueError,
+            OSError,
+        ) as exc:
+            # OSError を追加で捕捉する: ConnectionResetError・ssl.SSLError 等の
+            # ソケット/TLS 例外は urllib.error.URLError でラップされず素通りするため、
+            # ここに含めないと一時的な接続断がリトライされず即 UNKNOWN 記録に落ちる。
             last_error = exc
             if attempt < max_retries:
                 time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
@@ -377,15 +393,26 @@ def _extract_message_text(response: dict[str, Any]) -> str:
         return ""
 
 
+_LABEL_TOKEN_RE = re.compile(r"^[A-Za-z]+")
+
+
 def _parse_score_label(text: str) -> tuple[str, str]:
-    """採点出力を厳格パースする。先頭行が CORRECT / INCORRECT 以外は UNKNOWN（不正解側）として返す。"""
-    if not text:
+    """採点出力を厳格パースする。先頭行の先頭トークンが CORRECT / INCORRECT に完全一致しない場合は
+    UNKNOWN（不正解側）として返す。
+
+    'CORRECTED' や 'CORRECTNESS is uncertain' 等、CORRECT を prefix に持つが意味の異なる
+    出力を誤って CORRECT 判定しないよう、先頭の英字トークンのみを取り出して等価比較する
+    （前方一致 startswith ではなく完全一致。fail-closed: 一致しなければ正答率の分子に計上しない）。
+    """
+    if not text or not text.strip():
         return LABEL_UNKNOWN, "empty response from grader"
 
     first_line = text.strip().splitlines()[0].strip()
-    if first_line.upper().startswith(LABEL_CORRECT):
+    match = _LABEL_TOKEN_RE.match(first_line)
+    token = match.group(0).upper() if match else ""
+    if token == LABEL_CORRECT:
         return LABEL_CORRECT, first_line
-    if first_line.upper().startswith(LABEL_INCORRECT):
+    if token == LABEL_INCORRECT:
         return LABEL_INCORRECT, first_line
     return LABEL_UNKNOWN, f"unparseable grader output: {first_line[:200]!r}"
 
