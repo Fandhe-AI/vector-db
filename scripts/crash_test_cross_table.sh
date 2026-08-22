@@ -6,10 +6,11 @@
 # `crates/engine/examples/crash_tool_cross_table.rs`（write/verify サブコマンド）を使い、
 # 書き込み進行中の engine::txn::WriteTxn（行テーブル + バッチ台帳を同一トランザクションで
 # 扱う log_batch 経由）プロセスを SIGKILL で強制終了させ、再オープン後の内容整合性
-# （テーブル間整合・バッチ整合）を検証する反復を行う。`scripts/crash_test.sh`
-# （TASK-142・PERSIST-1）と同方針だが、本スクリプトは 2 セット × 反復回数の 2 段構成で
-# 実行し、セットごとに新規 DB を作り直す（TASK-90 の受け入れ条件: 2 セット × 10 回 = 計 20
-# 回の SIGKILL 反復）。Makefile の crash-test-cross-table ターゲット・CI の
+# （テーブル間整合・バッチ整合）を検証する反復を行う。単一テーブルを対象とする
+# `scripts/crash_test.sh`（TASK-142・PERSIST-1。本ブランチの時点では未マージにつき、
+# マージ後に方針の整合を確認予定）と役割は近いが、本スクリプトは 2 セット × 反復回数の
+# 2 段構成で実行し、セットごとに新規 DB を作り直す（TASK-90 の受け入れ条件: 2 セット ×
+# 10 回 = 計 20 回の SIGKILL 反復）。Makefile の crash-test-cross-table ターゲット・CI の
 # crash-test-cross-table ジョブから呼ばれる。
 #
 # 使い方: scripts/crash_test_cross_table.sh [セット数（既定 2）] [反復回数（既定 10）]

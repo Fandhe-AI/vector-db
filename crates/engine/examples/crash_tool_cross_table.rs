@@ -5,8 +5,9 @@
 //! 扱う `log_batch`）の公開 API のみを使うブラックボックスバイナリで、
 //! `scripts/crash_test_cross_table.sh` から `write` サブコマンドをバックグラウンド起動され
 //! SIGKILL される想定、続けて `verify` サブコマンドで再オープン後の内容整合性を
-//! 検証される想定で作られている。`crates/engine/examples/crash_tool.rs`（TASK-142・
-//! PERSIST-1）と同じ write/verify の出力プロトコル様式を踏襲しつつ、本ツールは
+//! 検証される想定で作られている。単一テーブル・単一行コミットを検証する
+//! `crash_tool.rs`（TASK-142・PERSIST-1。本ブランチの時点では未マージにつき、
+//! マージ後に write/verify の出力プロトコル様式を追随予定）と役割は近いが、本ツールは
 //! 「行テーブルとバッチ台帳という 2 テーブルが常に運命を共にする」ことをオラクルとする点で
 //! 異なる（単一テーブルの単一行コミットではなく、複数行 + バッチ台帳 1 エントリを
 //! 1 トランザクションでコミットし続ける）。
@@ -26,8 +27,9 @@ use std::io::Write as _;
 
 use engine::storage::{RowInput, Storage, Visibility};
 
-/// write/verify で固定して使うテナント識別子（`crash_tool.rs` と同方針。単一テナントの
-/// クラッシュ耐性検証が目的で、RLS ポリシー評価そのものは対象外）。
+/// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が
+/// 目的で、RLS ポリシー評価そのものは対象外。TASK-142・PERSIST-1 のクラッシュ耐性
+/// ツールと同方針だが、当該ツールは本ブランチの時点では未マージ）。
 const CRASH_TOOL_TENANT_ID: &str = "crash-tool-cross-table-tenant";
 
 /// 1 トランザクションで書き込む行数（バッチサイズ）。行総数はこの値の倍数になる
@@ -67,8 +69,9 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-/// 決定的な擬似乱数生成器（splitmix64。`crash_tool.rs` と同一実装。追加依存を増やさない
-/// 方針 - dependency-policy.md）。
+/// 決定的な擬似乱数生成器（splitmix64。追加依存を増やさない方針 - dependency-policy.md。
+/// TASK-142・PERSIST-1 のクラッシュ耐性ツールと同一実装を意図しているが、当該ツールは
+/// 本ブランチの時点では未マージにつきマージ後に整合を確認予定）。
 struct DeterministicRng(u64);
 
 impl DeterministicRng {
@@ -85,8 +88,9 @@ impl DeterministicRng {
     }
 }
 
-/// 行 ID から埋め込み・メタデータを決定的に導出する（`crash_tool.rs::derive_row` と
-/// 同一方針。write が生成した内容を verify が同じ関数で再計算し突き合わせる）。
+/// 行 ID から埋め込み・メタデータを決定的に導出する（write が生成した内容を verify が
+/// 同じ関数で再計算し突き合わせる。TASK-142・PERSIST-1 の `derive_row` 相当と同方針だが、
+/// 当該実装は本ブランチの時点では未マージ）。
 fn derive_row(id: u64) -> (Vec<f32>, Vec<u8>) {
     let mut rng = DeterministicRng::seeded(id);
     let embedding = (0..EMBEDDING_DIM)
