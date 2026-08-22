@@ -80,6 +80,13 @@ const MAX_SCAN_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// 行数とバイト量の両方で上限を課す。
 const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// [`Storage::scan_batch_log`] が一度に確保してよいエントリ数の上限（[`MAX_SCAN_TOTAL_ROWS`]
+/// と同様、無制限 `Vec` 確保を避けるための契約。security.md「不安全な設計｜無制限リソース
+/// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
+/// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
+/// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する。
+const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -94,8 +101,9 @@ pub enum StorageError {
     /// 指定した行 ID が存在しない。
     NotFound(u64),
     /// [`Storage::scan`] の対象行数・バイト量が上限（[`MAX_SCAN_TOTAL_ROWS`]・
-    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過したため fail-closed に拒否した。
-    /// 呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
+    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過、または [`Storage::scan_batch_log`] のエントリ数が
+    /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した。
+    /// `scan` の呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
     ScanLimitExceeded,
 }
 
@@ -374,10 +382,12 @@ impl Storage {
     }
 
     /// [`BATCH_LOG_TABLE`] の全エントリを `batch_seq` 昇順で読み出す（対象ビヘイビア:
-    /// TABLE-10）。再起動後の検証・採番再開専用の読み取りで、[`Storage::scan_page`] の
-    /// ような上限付きページングは持たない（バッチ台帳は 1 コミット 1 エントリのため
-    /// 行データ本体よりオーダーが小さく、クラッシュ耐性検証（並行書き込みなし）の
-    /// 用途では十分小さい前提。将来の大規模運用時は呼び出し元でページングを追加すること）。
+    /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
+    ///
+    /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
+    /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で fail-closed
+    /// に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」対応。バッチ台帳は
+    /// コミットごとに増え続けるため、大きな DB では無制限確保がメモリ枯渇につながり得る）。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
@@ -387,6 +397,9 @@ impl Storage {
         };
         let mut out = Vec::new();
         for entry in table.iter()? {
+            if out.len() >= MAX_BATCH_LOG_ROWS {
+                return Err(StorageError::ScanLimitExceeded);
+            }
             let (k, v) = entry?;
             out.push((k.value(), v.value()));
         }
