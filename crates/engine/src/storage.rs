@@ -439,7 +439,10 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     }
     let mut offset = 1usize;
 
-    let tenant_len_bytes = buf.get(offset..offset + 2).ok_or_else(|| {
+    let tenant_len_field_end = offset
+        .checked_add(2)
+        .ok_or_else(|| StorageError::Codec("offset overflow at tenant_len field".to_string()))?;
+    let tenant_len_bytes = buf.get(offset..tenant_len_field_end).ok_or_else(|| {
         StorageError::Codec("row buffer truncated at tenant_len field".to_string())
     })?;
     let tenant_len_arr: [u8; 2] = tenant_len_bytes
@@ -479,8 +482,11 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
         .checked_add(1)
         .ok_or_else(|| StorageError::Codec("offset overflow after visibility field".to_string()))?;
 
+    let dim_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at dim field".to_string()))?;
     let dim_bytes = buf
-        .get(offset..offset + 4)
+        .get(offset..dim_field_end)
         .ok_or_else(|| StorageError::Codec("row buffer truncated at dim field".to_string()))?;
     let dim_arr: [u8; 4] = dim_bytes
         .try_into()
@@ -514,7 +520,10 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     }
     offset = embedding_end;
 
-    let metadata_len_bytes = buf.get(offset..offset + 4).ok_or_else(|| {
+    let metadata_len_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at metadata_len field".to_string()))?;
+    let metadata_len_bytes = buf.get(offset..metadata_len_field_end).ok_or_else(|| {
         StorageError::Codec("row buffer truncated at metadata_len field".to_string())
     })?;
     let metadata_len_arr: [u8; 4] = metadata_len_bytes
