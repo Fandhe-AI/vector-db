@@ -749,6 +749,38 @@ fn ext2_scan_table_page_after_u64_max_returns_empty_page() {
 }
 
 #[test]
+fn ext2_insert_rows_into_table_rejects_empty_batch_against_nonexistent_table() {
+    // codex レビュー指摘（PR #130・P1）対応の回帰テスト。`rows.is_empty()` の早期
+    // return をカタログ存在確認より先に置くと、存在しないテーブルへの空バッチ挿入が
+    // `Ok(())` になり「テーブル不存在は fail-closed に `Err`」という契約を空バッチ
+    // という入力値で迂回できてしまう。
+    let path = unique_db_path("ext2-empty-batch-notfound");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let err = storage
+        .insert_rows_into_table("ghost", &[])
+        .expect_err("empty batch against a nonexistent table must still be rejected");
+    assert!(matches!(err, CatalogError::TableNotFound(_)));
+}
+
+#[test]
+fn ext2_scan_table_page_rejects_limit_zero_against_nonexistent_table() {
+    // codex レビュー指摘（PR #130・P1／cursor Low）対応の回帰テスト。`limit == 0` の
+    // 早期 return をカタログ存在確認より先に置くと、存在しないテーブルへの limit=0
+    // 走査が空ページで成功してしまい、同じくテーブル不存在の fail-closed 契約を
+    // 迂回できてしまう。
+    let path = unique_db_path("ext2-limit-zero-notfound");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let err = storage
+        .scan_table_page("ghost", None, 0)
+        .expect_err("limit=0 scan against a nonexistent table must still be rejected");
+    assert!(matches!(err, CatalogError::TableNotFound(_)));
+}
+
+#[test]
 fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
     let path = unique_db_path("ext2-notfound");
     let _cleanup = CleanupGuard(path.clone());

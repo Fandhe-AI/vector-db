@@ -660,20 +660,26 @@ impl Storage {
     /// EXT-1, EXT-2）。[`insert_row_into_table`](Self::insert_row_into_table) のバッチ版。
     /// 1 行でもスキーマ取得・次元検証・エンコードに失敗した場合、write トランザクションは
     /// commit されずに破棄されるため（`redb::WriteTransaction` の drop 契約）、全体が
-    /// 未反映のまま拒否される。空スライスの場合はトランザクションを開かず即座に成功を返す
-    /// （`storage.rs::Storage::put_batch` と同じ方針）。
+    /// 未反映のまま拒否される。空スライスの場合も write トランザクション内でカタログ上の
+    /// テーブル存在を確認してから成功を返す（レビュー指摘対応: `rows.is_empty()` を
+    /// 存在確認より先に判定すると、存在しないテーブルへの空バッチ挿入が `Ok(())` になり
+    /// 「テーブル不存在は fail-closed に `Err`」という契約を空バッチで迂回できてしまう）。
     pub fn insert_rows_into_table(
         &self,
         table_name: &str,
         rows: &[(u64, RowInput<'_>)],
     ) -> Result<()> {
         validate_identifier(table_name)?;
-        if rows.is_empty() {
-            return Ok(());
-        }
         let write_txn = self.db().begin_write()?;
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
+            if rows.is_empty() {
+                // 行テーブルを開く必要はないが、上記の存在確認は既に済ませたうえで
+                // write txn を commit する（`storage.rs::Storage::put_batch` と同様、
+                // 空バッチは行データに触れず即座に成功として扱う）。
+                write_txn.commit()?;
+                return Ok(());
+            }
             let row_table_name = user_rows_table_name(table_name);
             let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
             let mut row_table = write_txn.open_table(row_table_def)?;
@@ -722,12 +728,15 @@ impl Storage {
     ) -> Result<(Vec<StorageRow>, Option<u64>)> {
         validate_identifier(table_name)?;
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
-        if limit == 0 {
-            return Ok((Vec::new(), None));
-        }
 
         let read_txn = self.db().begin_read()?;
         require_table_exists_read(&read_txn, table_name)?;
+        // `limit == 0` の早期 return は存在確認より後に置く（レビュー指摘対応: 先に
+        // 判定すると、存在しないテーブルへの limit=0 走査が空ページで成功してしまい、
+        // 「テーブル不存在は fail-closed に `Err`」という契約を迂回できてしまう）。
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
         let row_table_name = user_rows_table_name(table_name);
         let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let row_table = match read_txn.open_table(row_table_def) {
