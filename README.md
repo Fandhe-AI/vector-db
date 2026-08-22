@@ -41,7 +41,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make setup` | 開発環境の一括構築（submodule → rustup → lefthook） |
 | `make ci` | CI（`.github/workflows/ci.yml`）と同等のチェックをローカル一括実行 |
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
-| `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（Cargo.toml 追加後に自動有効化） |
+| `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
 
 ターゲット一覧は `make help` で確認できます。

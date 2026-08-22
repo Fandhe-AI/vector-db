@@ -20,14 +20,14 @@ vector-db/
 ├── Makefile                       # タスクランナー（make setup / make ci / docker-*）
 ├── lefthook.yml                   # git hooks（rustfmt・secrets-guard・Conventional Commits・clippy/test）
 ├── Dockerfile / compose.yaml      # 環境非依存の開発コンテナ（make docker-ci）
-├── deny.toml                      # cargo-deny 設定（Cargo.toml 追加後に make deny で有効化）
+├── deny.toml                      # cargo-deny 設定（make deny で有効化済み）
 ├── rust-toolchain.toml            # stable + rustfmt/clippy（単一真実源）
 ├── commitlint.config.mjs          # Conventional Commits 検証設定
 ├── skills-lock.json               # 導入スキルのロックファイル
 ├── docs/
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs ベースの CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）の CI
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
@@ -101,7 +101,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは Cargo.toml 追加後に自動有効化
+- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: commitlint で検証。`--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋AGENTS.md P0 観点（spec 漏えい・テナント境界・wire 入力検証）を確認
