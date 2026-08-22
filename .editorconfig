@@ -47,3 +47,7 @@ trim_trailing_whitespace = false
 # Makefile（レシピ行はハードタブ必須）
 [Makefile]
 indent_style = tab
+
+# .gitmodules（git submodule コマンドがタブインデントで生成・更新する）
+[.gitmodules]
+indent_style = tab

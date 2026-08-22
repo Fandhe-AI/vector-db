@@ -1,0 +1,26 @@
+{
+  // markdownlint 設定。リポジトリ直下のドキュメント（README.md・AGENTS.md 等）を lint する。
+  // CI は Fandhe-AI/actions/lint-docs reusable workflow（markdownlint-cli）が
+  // 本ファイルを自動探索で参照する（除外パスは .markdownlintignore を参照）。
+  // 方針: 既定ルールを基本 ON にしつつ、日本語ドキュメントの記法と衝突する
+  // 装飾系ルールのみ無効化して「緑のベースライン」を確保する
+  // （agent-cli-skills の同名設定と同方針）。
+  "default": true,
+
+  // line-length: 日本語と英語が混在し行が長くなるためノイズが多い
+  "MD013": false,
+  // inline HTML: テーブルや details 要素で使用するため許容
+  "MD033": false,
+  // 末尾に句読点を持つ見出し（日本語の「。」等）を許容
+  "MD026": false,
+  // bare URL: 本文中の素の URL を許容
+  "MD034": false,
+  // 強調を見出し代わりに使う記法を許容
+  "MD036": false,
+  // duplicate-heading: 「使い方」「注意事項」等の同名見出しの再出現を許容
+  "MD024": false,
+  // ordered list の連番スタイルは強制しない（手順番号で 1. 1. 1. を使う箇所あり）
+  "MD029": false,
+  // fenced-code-language: 言語指定なしコードフェンスを許容
+  "MD040": false
+}
