@@ -241,6 +241,105 @@ class ExtractMessageTextTest(unittest.TestCase):
         response = {"choices": [{"message": {"content": {"unexpected": "shape"}}}]}
         self.assertEqual(aa._extract_message_text(response), "")
 
+    def test_non_dict_choice_element_returns_empty_string(self):
+        # choices が非空でも要素が dict でない想定外形状（KeyError/TypeError の再現条件）。
+        self.assertEqual(aa._extract_message_text({"choices": [None]}), "")
+        self.assertEqual(aa._extract_message_text({"choices": [42]}), "")
+        self.assertEqual(aa._extract_message_text({"choices": ["x"]}), "")
+
+    def test_non_dict_message_returns_empty_string(self):
+        self.assertEqual(aa._extract_message_text({"choices": [{"message": "not-a-dict"}]}), "")
+
+    def test_choices_not_a_list_returns_empty_string(self):
+        self.assertEqual(aa._extract_message_text({"choices": {"unexpected": "shape"}}), "")
+
+
+class DryRunScoringPromptValidationTest(unittest.TestCase):
+    def test_dry_run_raises_when_scoring_prompt_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            raw = _valid_config_dict(tmp_dir)
+            raw["scoring_prompt_path"] = str(tmp_dir / "does-not-exist.txt")
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            with self.assertRaises(aa.DatasetError):
+                aa.run_evaluation(config, dry_run=True)
+
+
+class RunEvaluationPartialFailureTest(unittest.TestCase):
+    def test_sample_failure_is_isolated_and_report_still_produced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            call_count = {"n": 0}
+
+            def fake_generate_answer(_config, _api_key, _question, _context):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    raise RuntimeError("LLM request failed after 3 attempts: boom")
+                return "generated"
+
+            def fake_score_answer(*_args, **_kwargs):
+                return aa.LABEL_CORRECT, "matches"
+
+            original_generate = aa.generate_answer
+            original_score = aa.score_answer
+            aa.generate_answer = fake_generate_answer
+            aa.score_answer = fake_score_answer
+            try:
+                report = aa.run_evaluation(config, dry_run=False)
+            finally:
+                aa.generate_answer = original_generate
+                aa.score_answer = original_score
+
+            # 1 サンプル目が失敗しても 2 サンプル目まで到達し、結果は全件（部分結果含む）記録される。
+            self.assertEqual(report.total, 2)
+            self.assertEqual(report.results[0].label, aa.LABEL_UNKNOWN)
+            self.assertIn("sample failed", report.results[0].reason)
+            self.assertEqual(report.results[1].label, aa.LABEL_CORRECT)
+
+            out_path = aa.write_report(report, config)
+            self.assertTrue(out_path.exists())
+
+
+class RenderReportMarkdownEscapingTest(unittest.TestCase):
+    def test_pipe_and_newline_in_reason_do_not_break_table(self):
+        report = aa.EvalReport(
+            results=[
+                aa.SampleResult("s1", "q1", "a1", aa.LABEL_INCORRECT, "reason with | pipe\nand newline"),
+            ]
+        )
+        rendered = aa.render_report_markdown(
+            report,
+            aa.EvalConfig(
+                llm_endpoint="http://127.0.0.1:9/v1/chat/completions",
+                model="dummy",
+                api_key_env="EVAL_TEST_API_KEY",
+                data_path=Path("data.jsonl"),
+                scoring_prompt_path=Path("prompt.txt"),
+                sample_size=1,
+                max_sample_size=1,
+                timeout_seconds=30,
+                max_retries=2,
+                max_response_bytes=65536,
+                output_dir=Path("out"),
+            ),
+        )
+        table_lines = [line for line in rendered.splitlines() if line.startswith("| s1")]
+        self.assertEqual(len(table_lines), 1)
+        self.assertNotIn("\n", table_lines[0])
+        self.assertIn("\\|", table_lines[0])
+
+    def test_long_reason_is_truncated(self):
+        long_reason = "x" * 500
+        escaped = aa._escape_markdown_table_cell(long_reason)
+        self.assertLessEqual(len(escaped), aa.REPORT_CELL_MAX_CHARS + len("..."))
+
 
 if __name__ == "__main__":
     unittest.main()

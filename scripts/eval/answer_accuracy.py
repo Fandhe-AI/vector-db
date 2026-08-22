@@ -29,6 +29,7 @@ import json
 import os
 import random
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -42,6 +43,8 @@ HARD_MAX_SAMPLE_SIZE = 200
 HARD_MAX_TIMEOUT_SECONDS = 120
 HARD_MAX_RETRIES = 5
 HARD_MAX_RESPONSE_BYTES = 1_000_000
+# リトライ間隔（秒）。連続リトライによる相手側への負荷集中を避けるための指数バックオフの初期値。
+RETRY_BACKOFF_BASE_SECONDS = 0.5
 
 REQUIRED_CONFIG_KEYS = (
     "llm_endpoint",
@@ -287,6 +290,8 @@ def _post_json(
                 return json.loads(raw.decode("utf-8"))
         except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ValueError) as exc:
             last_error = exc
+            if attempt < max_retries:
+                time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2**attempt))
             continue
 
     raise RuntimeError(f"LLM request failed after {max_retries + 1} attempts: {last_error}")
@@ -350,15 +355,25 @@ def score_answer(
 
 
 def _extract_message_text(response: dict[str, Any]) -> str:
-    """OpenAI 互換レスポンスからテキストを取り出す。想定形状でなければ空文字を返す（呼び出し側で判定不能扱い）。"""
+    """OpenAI 互換レスポンスからテキストを取り出す。想定形状でなければ空文字を返す（呼び出し側で判定不能扱い）。
+
+    untrusted な外部（LLM API）からの応答は形状を一切信頼せず、辞書アクセス・添字アクセスで
+    発生し得る例外（AttributeError/KeyError/TypeError/IndexError）をすべて捕捉して fail-closed で
+    空文字に倒す（想定外形状で未処理の traceback により異常終了させない）。
+    """
     try:
         choices = response.get("choices", [])
-        if not choices:
+        if not isinstance(choices, list) or not choices:
             return ""
-        message = choices[0].get("message", {})
+        first_choice = choices[0]
+        if not isinstance(first_choice, dict):
+            return ""
+        message = first_choice.get("message", {})
+        if not isinstance(message, dict):
+            return ""
         content = message.get("content", "")
         return content if isinstance(content, str) else ""
-    except AttributeError:
+    except (AttributeError, KeyError, TypeError, IndexError):
         return ""
 
 
@@ -382,6 +397,15 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
 
     report = EvalReport(dry_run=dry_run)
 
+    # 採点プロンプトファイルは dry-run 経路でも読み込む（1 回だけ）。ここを省略すると
+    # README が「配線検証」と説明する dry-run 経路が、本番実行時にのみ露見する
+    # scoring_prompt_path の欠落・読み取り不可を検知できなくなる。読み込みをここに一本化し、
+    # 後段で再度 read_text() する二重読み込み（＝ガードされない 2 回目の OSError 経路）を作らない。
+    try:
+        scoring_prompt = config.scoring_prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DatasetError(f"failed to read scoring prompt: {config.scoring_prompt_path} ({exc})") from exc
+
     if dry_run:
         for record in sampled:
             report.results.append(
@@ -395,18 +419,23 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
             )
         return report
 
-    try:
-        scoring_prompt = config.scoring_prompt_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise DatasetError(f"failed to read scoring prompt: {config.scoring_prompt_path} ({exc})") from exc
-
     api_key = os.environ.get(config.api_key_env)
 
     for record in sampled:
-        generated = generate_answer(config, api_key, record["question"], record["context"])
-        label, reason = score_answer(
-            config, api_key, scoring_prompt, record["question"], record["expected_answer"], generated
-        )
+        # サンプル単位で例外を隔離する。1 サンプルの LLM 呼び出し失敗（リトライ上限到達の
+        # RuntimeError に加え、_post_json の except タプルが捕捉しない OSError 系
+        # （例: レスポンス読み取り中の ConnectionResetError・ssl.SSLError）も含む）で
+        # ループ全体を中断すると、それまでに完了した有料 LLM 呼び出し分の結果が
+        # write_report まで届かず失われる。想定外の例外も含めすべて判定不能として記録し
+        # 次サンプルへ進む（fail-closed: 失敗サンプルは正答率の分子に計上されない）。
+        try:
+            generated = generate_answer(config, api_key, record["question"], record["context"])
+            label, reason = score_answer(
+                config, api_key, scoring_prompt, record["question"], record["expected_answer"], generated
+            )
+        except Exception as exc:  # noqa: BLE001 - サンプル単位隔離のため意図的に広く捕捉
+            generated = ""
+            label, reason = LABEL_UNKNOWN, f"sample failed: {exc}"
         report.results.append(
             SampleResult(
                 sample_id=record["id"],
@@ -418,6 +447,19 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
         )
 
     return report
+
+
+# レポート本文の肥大化を防ぐための各セル文字数上限（UNKNOWN 時の 200 文字上限と揃える）。
+REPORT_CELL_MAX_CHARS = 200
+
+
+def _escape_markdown_table_cell(text: str) -> str:
+    """Markdown テーブルのセル用にエスケープする。'|' はテーブル区切りと衝突し、改行はセルを崩すため置換する。"""
+    escaped = text.replace("\\", "\\\\").replace("|", "\\|")
+    escaped = escaped.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if len(escaped) > REPORT_CELL_MAX_CHARS:
+        escaped = escaped[:REPORT_CELL_MAX_CHARS] + "..."
+    return escaped
 
 
 def render_report_markdown(report: EvalReport, config: EvalConfig) -> str:
@@ -442,7 +484,10 @@ def render_report_markdown(report: EvalReport, config: EvalConfig) -> str:
         "| --- | --- | --- |",
     ]
     for result in report.results:
-        lines.append(f"| {result.sample_id} | {result.label} | {result.reason} |")
+        sample_id = _escape_markdown_table_cell(result.sample_id)
+        label = _escape_markdown_table_cell(result.label)
+        reason = _escape_markdown_table_cell(result.reason)
+        lines.append(f"| {sample_id} | {label} | {reason} |")
     lines.append("")
     return "\n".join(lines)
 
