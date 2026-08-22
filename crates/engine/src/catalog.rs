@@ -40,6 +40,13 @@ const MAX_IDENTIFIER_LEN: usize = 63;
 /// 0 はテーブル単位で次元固定という TABLE-1 の趣旨に反するため、下限は 1 とする。
 const MAX_VECTOR_DIM: u32 = 65_536;
 
+// 上記コメントの「同値を維持する」という前提を、単なる複製定数のコメントに留めず
+// コンパイル時に強制する。片方だけを変更するとここでビルドが失敗し、ドリフトを防ぐ。
+const _: () = assert!(
+    MAX_VECTOR_DIM == crate::storage::MAX_EMBEDDING_DIM,
+    "catalog::MAX_VECTOR_DIM must stay in sync with storage::MAX_EMBEDDING_DIM"
+);
+
 /// 1 テーブルが持てる列数の上限。カタログ値のデコード時、この値を超える宣言列数は
 /// アロケーション前に拒否する（.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
 const MAX_COLUMN_COUNT: usize = 256;
@@ -436,7 +443,8 @@ impl Storage {
     /// 上書きせず `Err` を返す。カタログテーブルのみを触る単一 write txn で完結し、
     /// `ROWS_TABLE` の内容・行数に依存しない O(1) 操作となる。
     pub fn create_table(&self, schema: &TableSchema) -> Result<()> {
-        validate_schema(schema)?;
+        // スキーマ検証は `encode_schema` 内の `validate_schema` に集約する（write txn を
+        // 開く前に fail-closed に拒否される。ここで別途 `validate_schema` を呼ぶ必要はない）。
         let encoded = encode_schema(schema)?;
         let write_txn = self.db().begin_write()?;
         {
@@ -495,6 +503,10 @@ impl Storage {
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
     /// `Err(CatalogError::TableNotFound)`。
     pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
+        // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
+        // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
+        // 拒否し、両 API 間でエラーバリアントを揃える。
+        validate_identifier(table_name)?;
         let read_txn = self.db().begin_read()?;
         let table = match read_txn.open_table(CATALOG_TABLE) {
             Ok(t) => t,
@@ -527,7 +539,13 @@ impl Storage {
                     "too many tables: exceeds {MAX_LIST_TABLES}"
                 )));
             }
-            names.push(key.value().to_string());
+            let name = key.value();
+            // `get_table_schema` と同じ検証をここでも通す。通常経路で書かれるキーは
+            // すべて `create_table` の `validate_schema` を経ているため常に合法だが、
+            // 手書きの不正データが直接 redb へ書き込まれていた場合に、そのまま
+            // 一覧へ紛れ込ませない（`decode_schema` と同じ fail-closed 方針）。
+            validate_identifier(name)?;
+            names.push(name.to_string());
         }
         Ok(names)
     }
