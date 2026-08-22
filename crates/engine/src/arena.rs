@@ -28,7 +28,7 @@
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
-use crate::catalog::{CatalogError, TableSchema};
+use crate::catalog::CatalogError;
 use crate::storage::{decode_row, Storage, StorageError, Visibility, ROWS_TABLE};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
@@ -167,7 +167,7 @@ impl VectorArena {
     /// を対象としたアリーナを構築する（対象ビヘイビア: TABLE-8）。
     ///
     /// `expected_dim` はカタログ（[`Storage::get_table_schema`] →
-    /// [`TableSchema::vector_dim`]）から取得し、呼び出し元からは受け取らない
+    /// [`crate::catalog::TableSchema::vector_dim`]）から取得し、呼び出し元からは受け取らない
     /// （呼び出し元が渡す次元値をテーブル識別の代用にすると、同一次元の別テーブルが
     /// 混入しても検出できないため。TASK-87 P1 レビュー指摘への対応）。
     ///
@@ -325,13 +325,6 @@ impl VectorArena {
     pub fn visibility(&self, index: usize) -> Option<Visibility> {
         self.visibilities.get(index).copied()
     }
-}
-
-/// カタログのテーブルスキーマから、[`VectorArena::build`] へ渡す `expected_dim` を
-/// 取り出す補助関数。ベクトル列を持たないスキーマは `None` を返す（アリーナ構築対象外。
-/// [`TableSchema::vector_dim`] の契約をそのまま引き継ぐ）。
-pub fn expected_dim_from_schema(schema: &TableSchema) -> Option<u32> {
-    schema.vector_dim()
 }
 
 #[cfg(test)]
