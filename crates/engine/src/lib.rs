@@ -11,7 +11,8 @@
 //! トランザクション分離レベル。対象ビヘイビア: TABLE-3）・TASK-85（スキーマカタログ・
 //! `CREATE TABLE`／`ALTER TABLE ADD COLUMN`。対象ビヘイビア: TABLE-1, TABLE-4,
 //! TABLE-5, TABLE-6）・TASK-86（カタログスキーマ駆動の行エンコーダー。対象ビヘイビア:
-//! TABLE-7）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
+//! TABLE-7）・TASK-146（テーブル粒度次元固定・複数テーブル共存の拡張機能。対象ビヘイビア:
+//! EXT-1, EXT-2）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
 
 pub mod catalog;
 pub mod row_codec;
