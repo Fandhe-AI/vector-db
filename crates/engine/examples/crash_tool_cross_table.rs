@@ -202,7 +202,7 @@ fn write_inner(path: &str) -> Result<(), String> {
                 .checked_add(1)
                 .ok_or_else(|| "row id overflow after put".to_string())?;
         }
-        txn.log_batch(batch_seq, BATCH)
+        txn.log_batch(batch_seq)
             .map_err(|e| format!("log_batch failed: {e}"))?;
         txn.commit().map_err(|e| format!("commit failed: {e}"))?;
 

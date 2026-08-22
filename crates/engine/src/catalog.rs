@@ -481,6 +481,11 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::DuplicateBatchSeq(seq) => {
             CatalogError::Invalid(format!("duplicate batch seq: seq={seq}"))
         }
+        // `WriteTxn` の内部カウンタ（バッチ台帳専用）のエラーで、カタログ層の
+        // 行テーブル操作からは到達しない。`StorageError` の網羅性のためここでも扱う。
+        StorageError::PendingRowCountOverflow => {
+            CatalogError::Invalid("pending row count overflow".to_string())
+        }
     }
 }
 

@@ -123,6 +123,11 @@ pub enum StorageError {
     /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
     /// に拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
     DuplicateBatchSeq(u64),
+    /// [`crate::txn::WriteTxn`] の内部カウンタ（直近の `log_batch` 以降に `put` した
+    /// 行数）が `u64` を溢れた。実運用では到達し得ない防御的分岐だが、undefined な
+    /// ラップアラウンドで台帳の行数契約を壊さないよう checked 演算で明示的に検出する
+    /// （coding-rust.md「整数演算は checked_* / saturating_* を使う」対応）。
+    PendingRowCountOverflow,
 }
 
 impl fmt::Display for StorageError {
@@ -135,6 +140,9 @@ impl fmt::Display for StorageError {
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
             }
+            StorageError::PendingRowCountOverflow => {
+                write!(f, "pending row count overflow: split into smaller batches")
+            }
         }
     }
 }
@@ -146,7 +154,8 @@ impl std::error::Error for StorageError {
             StorageError::Codec(_)
             | StorageError::NotFound(_)
             | StorageError::ScanLimitExceeded
-            | StorageError::DuplicateBatchSeq(_) => None,
+            | StorageError::DuplicateBatchSeq(_)
+            | StorageError::PendingRowCountOverflow => None,
         }
     }
 }

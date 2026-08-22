@@ -55,7 +55,7 @@ fn table10_commit_reflects_both_tables_atomically() {
     let mut txn = storage.begin_write().expect("begin_write");
     txn.put(0, &row(&embedding, &metadata)).expect("put row 0");
     txn.put(1, &row(&embedding, &metadata)).expect("put row 1");
-    txn.log_batch(0, 2).expect("log_batch");
+    txn.log_batch(0).expect("log_batch");
     txn.commit().expect("commit");
 
     assert_eq!(storage.get(0).expect("get row 0").embedding, embedding);
@@ -77,7 +77,7 @@ fn table10_drop_without_commit_discards_both_tables() {
     {
         let mut txn = storage.begin_write().expect("begin_write");
         txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
-        txn.log_batch(0, 1).expect("log_batch");
+        txn.log_batch(0).expect("log_batch");
         // commit も abort も呼ばずスコープを抜ける。
     }
 
@@ -101,7 +101,7 @@ fn table10_abort_discards_both_tables() {
 
     let mut txn = storage.begin_write().expect("begin_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
-    txn.log_batch(0, 1).expect("log_batch");
+    txn.log_batch(0).expect("log_batch");
     txn.abort().expect("abort");
 
     let get_err = storage.get(0).expect_err("row must not exist after abort");
@@ -133,7 +133,7 @@ fn table10_batch_totals_match_row_count_and_survive_reopen() {
                     .expect("put row");
                 next_id += 1;
             }
-            txn.log_batch(batch_seq, 4).expect("log_batch");
+            txn.log_batch(batch_seq).expect("log_batch");
             txn.commit().expect("commit");
         }
     }
@@ -162,13 +162,13 @@ fn table10_log_batch_rejects_duplicate_seq_and_preserves_existing_entry() {
 
     let mut txn = storage.begin_write().expect("begin_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
-    txn.log_batch(0, 1).expect("log_batch first write");
+    txn.log_batch(0).expect("log_batch first write");
     txn.commit().expect("commit first batch");
 
     let mut txn = storage.begin_write().expect("begin_write");
     txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
     let err = txn
-        .log_batch(0, 99)
+        .log_batch(0)
         .expect_err("duplicate batch_seq must be rejected");
     assert!(matches!(
         err,
@@ -190,4 +190,39 @@ fn table10_log_batch_rejects_duplicate_seq_and_preserves_existing_entry() {
         get_err,
         engine::storage::StorageError::NotFound(1)
     ));
+}
+
+// 対象ビヘイビア: TABLE-10。log_batch はもう引数で row_count を受け取らず、直近の
+// log_batch 以降に実際に put した件数だけを記録する。呼び出し元が put の件数と
+// 無関係な値を台帳へ書き込む経路が存在しないことを確認する
+// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l 対応）。
+#[test]
+fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
+    let path = unique_db_path("log-batch-tracks-actual-puts");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // 1 バッチ目: 3 行 put してから log_batch。
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    txn.put(2, &row(&[3.0], &[3])).expect("put row 2");
+    txn.log_batch(0).expect("log_batch");
+    txn.commit().expect("commit batch 0");
+
+    // 2 バッチ目: 1 回も put せず log_batch すると、直近 log_batch 以降の実績どおり
+    // 0 が記録される（呼び出し元が任意の値を申告する余地がないことの確認）。
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.log_batch(1).expect("log_batch with zero puts");
+    txn.commit().expect("commit batch 1");
+
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 3), (1, 0)]);
+    let total_from_log: u64 = batch_log.iter().map(|(_, count)| count).sum();
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(
+        total_from_log,
+        rows.len() as u64,
+        "batch_log row_count total must always match actually-put rows"
+    );
 }

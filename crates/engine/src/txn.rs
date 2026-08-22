@@ -74,7 +74,10 @@ impl Storage {
     /// 制御を検討すること。
     pub fn begin_write(&self) -> crate::storage::Result<WriteTxn> {
         let txn = self.db().begin_write()?;
-        Ok(WriteTxn { txn })
+        Ok(WriteTxn {
+            txn,
+            pending_row_count: 0,
+        })
     }
 }
 
@@ -116,35 +119,59 @@ impl ReadSnapshot {
 /// （redb 4.2.0 の契約。書き込みは確定せず、排他ロックは解放される）。
 pub struct WriteTxn {
     txn: redb::WriteTransaction,
+    /// 直近の [`WriteTxn::log_batch`] 呼び出し以降（または `WriteTxn` 生成以降）に
+    /// [`WriteTxn::put`] で成功した書き込み件数。呼び出し元から任意の行数を申告させず
+    /// [`WriteTxn`] 自身が実書き込みを数えることで、「台帳の値 == そのバッチで
+    /// `ROWS_TABLE` へ書き込んだ行数」という契約を公開 API だけで保証する
+    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l 対応）。
+    pending_row_count: u64,
 }
 
 impl WriteTxn {
     /// 単一行を書き込む（commit するまで確定しない。[`Storage::put`] と同じ
-    /// エンコーディング契約）。
+    /// エンコーディング契約）。成功時のみ [`WriteTxn::log_batch`] 向けの内部カウンタ
+    /// （`pending_row_count`）を増やす（エンコード失敗等で行が書き込まれなかった場合は
+    /// カウントしない）。
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
         let mut table = self.txn.open_table(ROWS_TABLE)?;
         table.insert(id, encoded.as_slice())?;
+        // 呼び出し元にはトランザクション内で扱える行数の上限（TASK-90 の想定用途では
+        // バッチ 1 本あたり高々数千件）を課しており u64 を溢れさせることはできないが、
+        // coding-rust.md の checked 演算方針に合わせ、万一の溢れを黙って折り返さず
+        // fail-closed に検出する。
+        self.pending_row_count = self
+            .pending_row_count
+            .checked_add(1)
+            .ok_or(StorageError::PendingRowCountOverflow)?;
         Ok(())
     }
 
-    /// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）へ 1 エントリを書き込む
-    /// （TASK-90、対象ビヘイビア: TABLE-10）。[`WriteTxn::put`] と同一の
-    /// `redb::WriteTransaction`（`self.txn`）内で操作するため、[`WriteTxn::commit`]・
-    /// [`WriteTxn::abort`] のどちらを呼んでも [`ROWS_TABLE`] への行書き込みと本エントリは
-    /// 常に運命を共にする（2 テーブル横断で原子的にコミット／破棄される）。
+    /// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）へ、直近の `log_batch` 以降に
+    /// 実際に [`WriteTxn::put`] した行数を 1 エントリとして書き込む（TASK-90、対象
+    /// ビヘイビア: TABLE-10）。[`WriteTxn::put`] と同一の `redb::WriteTransaction`
+    /// （`self.txn`）内で操作するため、[`WriteTxn::commit`]・[`WriteTxn::abort`] の
+    /// どちらを呼んでも [`ROWS_TABLE`] への行書き込みと本エントリは常に運命を共にする
+    /// （2 テーブル横断で原子的にコミット／破棄される）。
+    ///
+    /// `row_count` を呼び出し元から受け取らないのは、任意の値を渡せると
+    /// `log_batch(seq, 0)` のみ・過大申告といった「実書き込み数と独立した値」を
+    /// 公開 API だけで永続化できてしまい、台帳の契約を保証できないため
+    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l 対応）。呼び出し成功後は
+    /// カウンタを 0 にリセットし、次の `log_batch` は「その後の `put` 件数」のみを
+    /// 記録する。
     ///
     /// 既存の `batch_seq` を渡すと [`StorageError::DuplicateBatchSeq`] で fail-closed に
     /// 拒否する（`redb` の `insert` は無条件上書きのため、検出しないと呼び出し元の
     /// 採番バグ・再試行ミスがバッチ台帳の不変条件（`batch_seq` ごとに 1 エントリ）を
-    /// 静かに破壊する。security.md「不安全な設計」対応）。呼び出し元は連番管理の
-    /// 責務を負うが、本メソッド自体が最後の防衛線として重複を検出する。
-    pub fn log_batch(&mut self, batch_seq: u64, row_count: u64) -> crate::storage::Result<()> {
+    /// 静かに破壊する。security.md「不安全な設計」対応）。
+    pub fn log_batch(&mut self, batch_seq: u64) -> crate::storage::Result<()> {
         let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
         if table.get(batch_seq)?.is_some() {
             return Err(StorageError::DuplicateBatchSeq(batch_seq));
         }
-        table.insert(batch_seq, row_count)?;
+        table.insert(batch_seq, self.pending_row_count)?;
+        self.pending_row_count = 0;
         Ok(())
     }
 
