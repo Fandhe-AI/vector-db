@@ -202,7 +202,6 @@ fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    // 1 バッチ目: 3 行 put してから log_batch。
     let mut txn = storage.begin_write().expect("begin_write");
     txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
     txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
@@ -210,20 +209,97 @@ fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
     txn.log_batch(0).expect("log_batch");
     txn.commit().expect("commit batch 0");
 
-    // 2 バッチ目: 1 回も put せず log_batch すると、直近 log_batch 以降の実績どおり
-    // 0 が記録される（呼び出し元が任意の値を申告する余地がないことの確認）。
-    let mut txn = storage.begin_write().expect("begin_write");
-    txn.log_batch(1).expect("log_batch with zero puts");
-    txn.commit().expect("commit batch 1");
-
     let batch_log = storage.scan_batch_log().expect("scan_batch_log");
-    assert_eq!(batch_log, vec![(0, 3), (1, 0)]);
+    assert_eq!(batch_log, vec![(0, 3)]);
     let total_from_log: u64 = batch_log.iter().map(|(_, count)| count).sum();
     let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
     assert_eq!(
         total_from_log,
         rows.len() as u64,
         "batch_log row_count total must always match actually-put rows"
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。log_batch を一度も呼ばないトランザクションは、TABLE-3 の
+// 素の複数行コミットとして従来どおり扱われ、「未台帳行チェック」の対象にならない
+// こと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4 対応。commit の doc コメント
+// 「used_log_batch」フィールドの契約参照）。バッチ台帳を使わない
+// `crates/engine/tests/txn_isolation.rs` の既存経路が壊れないことの回帰確認でもある。
+#[test]
+fn table10_put_then_commit_without_log_batch_succeeds_as_plain_write_txn() {
+    let path = unique_db_path("put-commit-without-log-batch");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    txn.commit().expect("commit without log_batch must succeed");
+
+    assert_eq!(storage.get(0).expect("get row 0").embedding, [1.0]);
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        Vec::<(u64, u64)>::new(),
+        "batch_log must stay empty when log_batch is never called"
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。直近の log_batch（または WriteTxn 生成）以降 1 件も put
+// していない状態で log_batch を呼ぶと EmptyBatch で拒否され、ゼロ件エントリを台帳へ
+// 残さないこと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm7 対応）。
+#[test]
+fn table10_log_batch_with_no_prior_put_is_rejected_as_empty_batch() {
+    let path = unique_db_path("log-batch-empty-batch-rejected");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    let err = txn
+        .log_batch(0)
+        .expect_err("log_batch with zero pending puts must be rejected");
+    assert!(matches!(err, engine::storage::StorageError::EmptyBatch));
+    txn.abort().expect("abort after rejected log_batch");
+
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        Vec::<(u64, u64)>::new(),
+        "no zero-count entry must be persisted"
+    );
+}
+
+// 対象ビヘイビア: TABLE-10。log_batch を 1 回以上呼んで TABLE-10 の契約に参加した
+// トランザクションで、log_batch 後に put した行を再び log_batch せず commit すると
+// UnloggedRows で拒否され、未台帳行が確定しないこと
+// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4 対応）。
+#[test]
+fn table10_commit_rejects_rows_put_after_last_log_batch() {
+    let path = unique_db_path("commit-rejects-unlogged-rows");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    txn.log_batch(0).expect("log_batch for row 0");
+    // log_batch 後にさらに put するが、この行は 2 度目の log_batch で記録しないまま
+    // commit を試みる。
+    txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    let err = txn.commit().expect_err("unlogged row must reject commit");
+    assert!(matches!(
+        err,
+        engine::storage::StorageError::UnloggedRows(1)
+    ));
+
+    // commit 自体が失敗しているため、行 0（log_batch 済み）を含めトランザクション
+    // 全体が未確定のまま。再オープンしても何も残っていないことを確認する。
+    let get_err = storage
+        .get(0)
+        .expect_err("row from rejected commit must not exist");
+    assert!(matches!(
+        get_err,
+        engine::storage::StorageError::NotFound(0)
+    ));
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        Vec::<(u64, u64)>::new()
     );
 }
 

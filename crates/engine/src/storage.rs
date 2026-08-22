@@ -128,6 +128,18 @@ pub enum StorageError {
     /// ラップアラウンドで台帳の行数契約を壊さないよう checked 演算で明示的に検出する
     /// （coding-rust.md「整数演算は checked_* / saturating_* を使う」対応）。
     PendingRowCountOverflow,
+    /// [`crate::txn::WriteTxn::log_batch`] を 1 回以上呼んだトランザクションで、直近の
+    /// `log_batch` 以降に新規挿入した行（含まれる行数は引数の `u64`）を台帳へ記録
+    /// しないまま [`crate::txn::WriteTxn::commit`] しようとした。台帳に記録されない
+    /// 行が commit で確定すると「台帳の row_count 合計 == 行総数」という TABLE-10 の
+    /// 不変条件を公開 API だけで壊せるため fail-closed に拒否する
+    /// （security.md「不安全な設計」対応。他テナント情報は含まない）。
+    UnloggedRows(u64),
+    /// [`crate::txn::WriteTxn::log_batch`] を、直近の呼び出し以降 1 件も
+    /// [`crate::txn::WriteTxn::put`]（新規挿入）していない状態で呼んだ。クラッシュ
+    /// 検証ツールの検証オラクル（台帳の各エントリ値 == 実際にコミットされたバッチ
+    /// サイズ）と食い違うゼロ件エントリを台帳へ残さないよう fail-closed に拒否する。
+    EmptyBatch,
 }
 
 impl fmt::Display for StorageError {
@@ -143,6 +155,10 @@ impl fmt::Display for StorageError {
             StorageError::PendingRowCountOverflow => {
                 write!(f, "pending row count overflow: split into smaller batches")
             }
+            StorageError::UnloggedRows(count) => {
+                write!(f, "unlogged rows before commit: count={count}")
+            }
+            StorageError::EmptyBatch => write!(f, "empty batch: no rows put since last log_batch"),
         }
     }
 }
@@ -155,7 +171,9 @@ impl std::error::Error for StorageError {
             | StorageError::NotFound(_)
             | StorageError::ScanLimitExceeded
             | StorageError::DuplicateBatchSeq(_)
-            | StorageError::PendingRowCountOverflow => None,
+            | StorageError::PendingRowCountOverflow
+            | StorageError::UnloggedRows(_)
+            | StorageError::EmptyBatch => None,
         }
     }
 }

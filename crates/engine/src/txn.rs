@@ -77,6 +77,7 @@ impl Storage {
         Ok(WriteTxn {
             txn,
             pending_row_count: 0,
+            used_log_batch: false,
         })
     }
 }
@@ -126,6 +127,15 @@ pub struct WriteTxn {
     /// 契約を公開 API だけで保証する（PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l・
     /// PRRT_kwDOUAKASM6bbc_I 対応）。
     pending_row_count: u64,
+    /// このトランザクションで [`WriteTxn::log_batch`] を 1 回以上呼んだかどうか。
+    /// `WriteTxn` は「バッチ台帳を使わない素の複数行コミット」（TABLE-3。
+    /// `crates/engine/tests/txn_isolation.rs` 等）と「行 + バッチ台帳を同一
+    /// トランザクションで扱う 2 テーブル横断コミット」（TABLE-10）の両方の用途で
+    /// 使われる。台帳を一切使わない前者の契約は変えたくないため、[`WriteTxn::commit`]
+    /// の「未台帳行が残っていないか」検証は、このトランザクションで `log_batch` を
+    /// 一度でも呼んで TABLE-10 の契約に「参加」した場合のみ有効化する
+    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4 対応）。
+    used_log_batch: bool,
 }
 
 impl WriteTxn {
@@ -172,22 +182,48 @@ impl WriteTxn {
     /// カウンタを 0 にリセットし、次の `log_batch` は「その後の `put` 件数」のみを
     /// 記録する。
     ///
+    /// 直近の `log_batch`（または `WriteTxn` 生成）以降 1 件も新規挿入していない
+    /// 状態（`pending_row_count == 0`）で呼ぶと [`StorageError::EmptyBatch`] で
+    /// fail-closed に拒否する。ゼロ件エントリを許すと、クラッシュ検証ツールの検証
+    /// オラクル（台帳の各エントリ値 == 実際にコミットされたバッチサイズ）と食い違う
+    /// ため（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm7 対応）。
+    ///
     /// 既存の `batch_seq` を渡すと [`StorageError::DuplicateBatchSeq`] で fail-closed に
     /// 拒否する（`redb` の `insert` は無条件上書きのため、検出しないと呼び出し元の
     /// 採番バグ・再試行ミスがバッチ台帳の不変条件（`batch_seq` ごとに 1 エントリ）を
     /// 静かに破壊する。security.md「不安全な設計」対応）。
+    ///
+    /// 成功すると、このトランザクションは以後 [`WriteTxn::commit`] 時に「未台帳行が
+    /// 残っていないか」の検証対象になる（[`WriteTxn`] の `used_log_batch` フィールドの
+    /// ドキュメントコメント参照）。
     pub fn log_batch(&mut self, batch_seq: u64) -> crate::storage::Result<()> {
+        if self.pending_row_count == 0 {
+            return Err(StorageError::EmptyBatch);
+        }
         let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
         if table.get(batch_seq)?.is_some() {
             return Err(StorageError::DuplicateBatchSeq(batch_seq));
         }
         table.insert(batch_seq, self.pending_row_count)?;
         self.pending_row_count = 0;
+        self.used_log_batch = true;
         Ok(())
     }
 
     /// トランザクションをコミットし、書き込みを確定する。
+    ///
+    /// このトランザクションで [`WriteTxn::log_batch`] を 1 回以上呼んでいた場合
+    /// （TABLE-10 の 2 テーブル横断コミット契約に参加した場合）のみ、直近の
+    /// `log_batch` 以降に新規挿入したのに台帳へ記録していない行（`pending_row_count
+    /// != 0`）がないかを検証し、あれば [`StorageError::UnloggedRows`] で fail-closed に
+    /// 拒否する。台帳を一度も使っていないトランザクション（TABLE-3 の素の複数行
+    /// コミット。`crates/engine/tests/txn_isolation.rs` 等）はこの検証の対象外で、
+    /// 従来どおり `put` した内容をそのまま commit できる（PR #129 codex レビュー
+    /// PRRT_kwDOUAKASM6bbnm4 対応）。
     pub fn commit(self) -> crate::storage::Result<()> {
+        if self.used_log_batch && self.pending_row_count != 0 {
+            return Err(StorageError::UnloggedRows(self.pending_row_count));
+        }
         self.txn.commit()?;
         Ok(())
     }

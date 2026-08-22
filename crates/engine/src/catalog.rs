@@ -486,6 +486,15 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::PendingRowCountOverflow => {
             CatalogError::Invalid("pending row count overflow".to_string())
         }
+        // `log_batch`/`commit` の未台帳行チェック・空バッチ拒否も同様にバッチ台帳
+        // 専用のエラーで、カタログ層（`db().begin_write()` による生 redb トランザクション
+        // 経由）からは到達しない。`StorageError` の網羅性のためここでも扱う。
+        StorageError::UnloggedRows(count) => {
+            CatalogError::Invalid(format!("unlogged rows before commit: count={count}"))
+        }
+        StorageError::EmptyBatch => {
+            CatalogError::Invalid("empty batch: no rows put since last log_batch".to_string())
+        }
     }
 }
 
