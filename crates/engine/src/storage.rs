@@ -51,7 +51,10 @@ const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
 /// [`MAX_METADATA_LEN`] 相当）が大量にある場合に一度に巨大なメモリ確保が発生し得る
 /// （security.md「不安全な設計｜無制限リソース確保（DoS）」）。後続タスクで検索カーネル等が
 /// 永続化層に依存する際は、この上限付きページングを使う前提とする。
-const MAX_SCAN_PAGE_LIMIT: u32 = 10_000;
+///
+/// `pub(crate)`: `catalog.rs`（TASK-146・EXT-1, EXT-2）のテーブルスコープ
+/// `scan_table_page` が、ここと同じ行数上限を適用するために再利用する。
+pub(crate) const MAX_SCAN_PAGE_LIMIT: u32 = 10_000;
 
 /// [`Storage::scan`] が一度に確保してよい行数の上限（無制限 `Vec` 確保を避けるための
 /// 契約。security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。超過時は
@@ -68,7 +71,10 @@ const MAX_SCAN_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// 上限。行数の上限（[`MAX_SCAN_PAGE_LIMIT`]）だけでは、最大サイズ（[`MAX_EMBEDDING_DIM`]・
 /// [`MAX_METADATA_LEN`] 相当）の行が並んだ場合に依然として数十 GB 規模の確保になり得るため、
 /// 行数とバイト量の両方で上限を課す。
-const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// `pub(crate)`: [`MAX_SCAN_PAGE_LIMIT`] と同じ理由で `catalog.rs` の
+/// `scan_table_page` が再利用する。
+pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。

@@ -13,12 +13,19 @@
 //! `redb::Database` ハンドルを共有し、カタログ専用のテーブル（[`CATALOG_TABLE`]）に
 //! 書き込む。`ROWS_TABLE` の行エンコーディング（v2, RLS フィールド同居）とは
 //! 独立したフォーマットを持つ。
+//!
+//! テーブルスコープ行 API（TASK-146、対象ビヘイビア: EXT-1, EXT-2。ポインタ:
+//! `docs/spec/05-tasks.md` TASK-146・`docs/spec/04-behavior/extensions.md`）:
+//! テーブルごとに動的な redb テーブル（`user_rows/{table_name}`）へ行を分離し、
+//! 挿入時に本モジュールの [`TableSchema::validate_embedding_dim`] で宣言次元との
+//! 完全一致を検証する。次元検証はここで完結し、RLS ポリシー評価（可視性判定）は
+//! 従来どおり呼び出し元（TASK-133 以降）の責務のまま変えない。
 
 use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::storage::Storage;
+use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -79,6 +86,9 @@ pub enum CatalogError {
     TableAlreadyExists(String),
     /// `ALTER TABLE ADD COLUMN` で追加しようとした列名が既存列と重複する。
     ColumnAlreadyExists(String),
+    /// テーブルスコープ行 API（TASK-146）で、指定した行 ID がそのテーブル内に
+    /// 存在しない。他テーブルの同一 ID は無関係（テーブル帰属した独立ストア）。
+    RowNotFound(u64),
 }
 
 impl fmt::Display for CatalogError {
@@ -91,6 +101,7 @@ impl fmt::Display for CatalogError {
             CatalogError::ColumnAlreadyExists(name) => {
                 write!(f, "column already exists: {name}")
             }
+            CatalogError::RowNotFound(id) => write!(f, "row not found: id={id}"),
         }
     }
 }
@@ -102,7 +113,8 @@ impl std::error::Error for CatalogError {
             CatalogError::Invalid(_)
             | CatalogError::TableNotFound(_)
             | CatalogError::TableAlreadyExists(_)
-            | CatalogError::ColumnAlreadyExists(_) => None,
+            | CatalogError::ColumnAlreadyExists(_)
+            | CatalogError::RowNotFound(_) => None,
         }
     }
 }
@@ -431,6 +443,30 @@ fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
     Ok(schema)
 }
 
+/// ユーザーテーブル `table_name` に対応する行ストア用の動的 redb テーブル名を組み立てる
+/// （TASK-146・EXT-2）。`validate_identifier` が `/` を含む文字列を許容しないため、
+/// 固定テーブル（`rows`／`catalog`）ともユーザーテーブル同士とも名前衝突しない。
+/// 呼び出し元は必ず先に `validate_identifier(table_name)` を通してから呼ぶこと
+/// （本関数自身は検証を行わない）。
+fn user_rows_table_name(table_name: &str) -> String {
+    format!("user_rows/{table_name}")
+}
+
+/// `storage.rs::StorageError` を `CatalogError` へ明示変換する。`CatalogError` は
+/// `redb::Error` への blanket `From` 実装を持つため（`storage.rs` の設計メモと同じ
+/// coherence 制約）、`redb::Error` そのものではない複合エラー型 `StorageError` からの
+/// 変換はここで個別に定義する。
+fn convert_storage_error(e: StorageError) -> CatalogError {
+    match e {
+        StorageError::Backend(err) => CatalogError::Backend(err),
+        StorageError::Codec(msg) => CatalogError::Invalid(msg),
+        StorageError::NotFound(id) => CatalogError::RowNotFound(id),
+        StorageError::ScanLimitExceeded => {
+            CatalogError::Invalid("scan limit exceeded: use scan_table_page".to_string())
+        }
+    }
+}
+
 /// カタログ DDL API。`Storage`（`storage.rs`）の拡張として実装し、
 /// `Storage::db()` を経由して `ROWS_TABLE` とは別のテーブル（[`CATALOG_TABLE`]）
 /// のみを読み書きする。行データへは一切アクセスしない（TABLE-4/TABLE-5）。
@@ -540,6 +576,194 @@ impl Storage {
             names.push(name.to_string());
         }
         Ok(names)
+    }
+
+    /// テーブルスコープで 1 行挿入する（TASK-146、対象ビヘイビア: EXT-1, EXT-2）。
+    ///
+    /// カタログからのスキーマ取得・次元検証・行書き込みを単一の write トランザクション内で
+    /// 行うことで、並行する DDL（`alter_table_add_column` 等）との整合を確保する。
+    /// テーブル不存在・`VECTOR` 列なし・次元不一致はすべて fail-closed に `Err` で拒否する
+    /// （security.md「不安全な設計」）。
+    pub fn insert_row_into_table(
+        &self,
+        table_name: &str,
+        id: u64,
+        row: &RowInput<'_>,
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        let write_txn = self.db().begin_write()?;
+        {
+            let schema = {
+                let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
+                    Ok(t) => t,
+                    Err(redb::TableError::TableDoesNotExist(_)) => {
+                        return Err(CatalogError::TableNotFound(table_name.to_string()))
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let guard = catalog_table
+                    .get(table_name)?
+                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                decode_schema(table_name, guard.value())?
+            };
+            schema.validate_embedding_dim(row.embedding.len())?;
+            let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
+            let row_table_name = user_rows_table_name(table_name);
+            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+            let mut row_table = write_txn.open_table(row_table_def)?;
+            row_table.insert(id, encoded.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// テーブルスコープで複数行を単一トランザクションで挿入する（TASK-146、対象ビヘイビア:
+    /// EXT-1, EXT-2）。[`insert_row_into_table`](Self::insert_row_into_table) のバッチ版。
+    /// 1 行でもスキーマ取得・次元検証・エンコードに失敗した場合、write トランザクションは
+    /// commit されずに破棄されるため（`redb::WriteTransaction` の drop 契約）、全体が
+    /// 未反映のまま拒否される。空スライスの場合はトランザクションを開かず即座に成功を返す
+    /// （`storage.rs::Storage::put_batch` と同じ方針）。
+    pub fn insert_rows_into_table(
+        &self,
+        table_name: &str,
+        rows: &[(u64, RowInput<'_>)],
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let write_txn = self.db().begin_write()?;
+        {
+            let schema = {
+                let catalog_table = match write_txn.open_table(CATALOG_TABLE) {
+                    Ok(t) => t,
+                    Err(redb::TableError::TableDoesNotExist(_)) => {
+                        return Err(CatalogError::TableNotFound(table_name.to_string()))
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let guard = catalog_table
+                    .get(table_name)?
+                    .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+                decode_schema(table_name, guard.value())?
+            };
+            let row_table_name = user_rows_table_name(table_name);
+            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+            let mut row_table = write_txn.open_table(row_table_def)?;
+            for (id, row) in rows {
+                schema.validate_embedding_dim(row.embedding.len())?;
+                let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
+                row_table.insert(*id, encoded.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// テーブルスコープで 1 行取得する（スナップショット読み取り。TASK-146、対象ビヘイビア:
+    /// EXT-1, EXT-2）。他テーブルの同一 ID は見えない（テーブル帰属した独立ストア）。
+    /// テーブル不存在・行不存在はいずれも fail-closed に `Err` を返す
+    /// （エラー内容に他テーブルの存在情報を含めない）。
+    pub fn get_row_from_table(&self, table_name: &str, id: u64) -> Result<StorageRow> {
+        validate_identifier(table_name)?;
+        let read_txn = self.db().begin_read()?;
+        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(CatalogError::TableNotFound(table_name.to_string()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if catalog_table.get(table_name)?.is_none() {
+            return Err(CatalogError::TableNotFound(table_name.to_string()));
+        }
+        let row_table_name = user_rows_table_name(table_name);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let row_table = match read_txn.open_table(row_table_def) {
+            Ok(t) => t,
+            // テーブルは定義済みだが 1 行も挿入していない（行テーブル自体が未作成）。
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(CatalogError::RowNotFound(id))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let guard = row_table.get(id)?.ok_or(CatalogError::RowNotFound(id))?;
+        crate::storage::decode_row(id, guard.value()).map_err(convert_storage_error)
+    }
+
+    /// テーブルスコープで行 ID 昇順に最大 `limit` 件を走査する上限付きページング API
+    /// （TASK-146、対象ビヘイビア: EXT-1, EXT-2）。`storage.rs::Storage::scan_page` と同じ
+    /// 行数上限（`MAX_SCAN_PAGE_LIMIT`）・バイト量上限（`MAX_SCAN_PAGE_BYTES`）を適用し、
+    /// 自テーブルの行のみを返す（他テーブルとの混線なし）。カーソル・打ち切り契約は
+    /// `scan_page` と同一。
+    pub fn scan_table_page(
+        &self,
+        table_name: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<(Vec<StorageRow>, Option<u64>)> {
+        validate_identifier(table_name)?;
+        let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let read_txn = self.db().begin_read()?;
+        let catalog_table = match read_txn.open_table(CATALOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(CatalogError::TableNotFound(table_name.to_string()))
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if catalog_table.get(table_name)?.is_none() {
+            return Err(CatalogError::TableNotFound(table_name.to_string()));
+        }
+        let row_table_name = user_rows_table_name(table_name);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let row_table = match read_txn.open_table(row_table_def) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
+            Err(e) => return Err(e.into()),
+        };
+
+        // カーソルの直後（`after + 1`）から走査を開始する。`storage.rs::scan_page` と同じ
+        // 契約: `after` が `u64::MAX` なら「これ以上続きがない」ため空ページを返す。
+        let start = match after {
+            Some(cursor) => match cursor.checked_add(1) {
+                Some(next) => next,
+                None => return Ok((Vec::new(), None)),
+            },
+            None => 0,
+        };
+
+        let mut out = Vec::new();
+        let mut bytes_used: usize = 0;
+        let mut capped = false;
+        for entry in row_table.range(start..)? {
+            if out.len() == limit {
+                capped = true;
+                break;
+            }
+            let (k, v) = entry?;
+            let id = k.value();
+            let raw = v.value();
+            if !out.is_empty()
+                && bytes_used.saturating_add(raw.len()) > crate::storage::MAX_SCAN_PAGE_BYTES
+            {
+                capped = true;
+                break;
+            }
+            out.push(crate::storage::decode_row(id, raw).map_err(convert_storage_error)?);
+            bytes_used = bytes_used.saturating_add(raw.len());
+        }
+
+        let cursor_for_next = if capped {
+            out.last().map(|r| r.id)
+        } else {
+            None
+        };
+        Ok((out, cursor_for_next))
     }
 }
 
