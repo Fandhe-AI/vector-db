@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -276,6 +277,12 @@ class RunEvaluationPartialFailureTest(unittest.TestCase):
             config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
             config = aa.load_config(config_path)
 
+            # このテストはサンプル単位隔離の検証が目的で、認証は本題ではない。
+            # 非 dry-run 経路は api_key_env の存在チェックを通過する必要があるため、
+            # config の api_key_env に対応するダミー値を設定する。
+            os.environ[config.api_key_env] = "dummy-test-key"
+            self.addCleanup(lambda: os.environ.pop(config.api_key_env, None))
+
             call_count = {"n": 0}
 
             def fake_generate_answer(_config, _api_key, _question, _context):
@@ -339,6 +346,73 @@ class RenderReportMarkdownEscapingTest(unittest.TestCase):
         long_reason = "x" * 500
         escaped = aa._escape_markdown_table_cell(long_reason)
         self.assertLessEqual(len(escaped), aa.REPORT_CELL_MAX_CHARS + len("..."))
+
+
+class RunEvaluationMissingApiKeyTest(unittest.TestCase):
+    """api_key_env が未設定/空のまま非 dry-run 実行すると早期に分かりやすいエラーで終了することを検証する。"""
+
+    def test_missing_api_key_env_raises_before_any_llm_call(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            os.environ.pop(config.api_key_env, None)
+
+            called = {"n": 0}
+
+            def fake_generate_answer(*_args, **_kwargs):
+                called["n"] += 1
+                return "should not be called"
+
+            original_generate = aa.generate_answer
+            aa.generate_answer = fake_generate_answer
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    aa.run_evaluation(config, dry_run=False)
+            finally:
+                aa.generate_answer = original_generate
+
+            self.assertIn(config.api_key_env, str(ctx.exception))
+            self.assertEqual(called["n"], 0)
+
+    def test_empty_api_key_env_raises(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            os.environ[config.api_key_env] = ""
+            self.addCleanup(lambda: os.environ.pop(config.api_key_env, None))
+
+            with self.assertRaises(RuntimeError):
+                aa.run_evaluation(config, dry_run=False)
+
+
+class MainWriteReportFailureTest(unittest.TestCase):
+    """write_report の OSError が main() で捕捉され、fail-closed な終了コードで報告されることを検証する。"""
+
+    def test_write_report_oserror_returns_nonzero_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_dict = _valid_config_dict(tmp_dir)
+            config_path.write_text(json.dumps(config_dict), encoding="utf-8")
+
+            original_write_report = aa.write_report
+
+            def failing_write_report(_report, _config):
+                raise OSError("simulated: output_dir not writable")
+
+            aa.write_report = failing_write_report
+            try:
+                exit_code = aa.main(["--config", str(config_path), "--dry-run"])
+            finally:
+                aa.write_report = original_write_report
+
+            self.assertEqual(exit_code, 5)
 
 
 if __name__ == "__main__":

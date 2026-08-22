@@ -419,7 +419,16 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
             )
         return report
 
-    api_key = os.environ.get(config.api_key_env)
+    # api_key_env は必須設定キーであり認証利用が前提の設計。実際の環境変数が
+    # 欠落したまま続行すると全サンプルが認証エラーで失敗し、「判定不能率 100%」の
+    # レポートだけが残って原因（キー未設定 or モデル不調）が運用者に分からなくなる。
+    # fail-closed のため、LLM 呼び出し前に明示チェックして分かりやすいエラーで終了する。
+    if config.api_key_env not in os.environ or not os.environ[config.api_key_env]:
+        raise RuntimeError(
+            f"environment variable '{config.api_key_env}' (config.api_key_env) is not set or empty. "
+            "Set it before running a non-dry-run evaluation."
+        )
+    api_key = os.environ[config.api_key_env]
 
     for record in sampled:
         # サンプル単位で例外を隔離する。1 サンプルの LLM 呼び出し失敗（リトライ上限到達の
@@ -530,7 +539,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"evaluation error: {exc}", file=sys.stderr)
         return 4
 
-    out_path = write_report(report, config)
+    # write_report は全サンプルの LLM 呼び出し完了後に走る。ここで捕捉しないと
+    # output_dir の書き込み不可（権限・親パスに同名ファイル存在等）による OSError が
+    # 未処理の traceback となり、run_evaluation 内で丁寧に守った「サンプル単位隔離に
+    # よる結果ロス防止」の意図がレポート書き出し段で崩れる。fail-closed で終了コードを返す。
+    try:
+        out_path = write_report(report, config)
+    except OSError as exc:
+        print(f"report write error: failed to write report to {config.output_dir} ({exc})", file=sys.stderr)
+        return 5
     print(f"report written to {out_path}")
     if not report.dry_run:
         print(f"accuracy: {report.accuracy:.1%} ({report.correct}/{report.total})")
