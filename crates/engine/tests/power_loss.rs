@@ -418,11 +418,10 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     }
 }
 
-// シナリオ 3: 部分 write-back 像（page cache の書き戻し順序不定の近似）から再オープンした
-// 場合、「正常に開けて内容は最後のコミット時点と一致」または「明示的なエラーで開けない
-// （fail-closed）」のいずれかでなければならない。応答済みコミットの黙示的消失・
-// 別内容へのすり替わりは 1 件でも観測されれば検証 NG として扱う（fail-closed 原則。
-// security.md「不安全な設計」）。
+// シナリオ 3（対応する契約: PERSIST-1・PERSIST-3。ポインタ: `docs/spec/04-behavior/persistence.md`）。
+// 部分 write-back 像（page cache の書き戻し順序不定の近似）からの再オープン結果を検証する。
+// 合否基準は本モジュール冒頭の TASK-145/PERSIST-1/PERSIST-3 ポインタ・security.md
+// 「不安全な設計」（fail-closed 原則）を参照し、本コメントには転記しない。
 //
 // CI 実行分は固定シード・有限反復（数秒以内）に収める。より広い探索は
 // `power_loss_scenario3_partial_writeback_extended_search`（`#[ignore]`）で行う。
@@ -509,15 +508,13 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
                 rejected += 1;
             }
             Ok(recovered) => {
-                // 開けた場合は、応答済みコミット（行 1）が消失・変質していないことを
-                // 必須要件とする（黙示的なデータ欠落・すり替わりは 1 件でも検証 NG）。
+                // 開けた場合の合否基準は PERSIST-1・PERSIST-3（ポインタ上記）を参照。
                 let row1 = get_row(&recovered, 1);
                 assert_eq!(
                     row1,
                     Some(b"committed-before-crash".to_vec()),
-                    "seed={seed}: 部分 write-back 像が開けた以上、応答済みコミット（行 1）は\
-                     最後のコミット時点の内容と完全一致していなければならない \
-                     （黙示的な欠落・すり替わりは fail-closed 違反として扱う）"
+                    "seed={seed}: 部分 write-back 像の再オープン後、行 1 の内容が\
+                     電源断前のコミット内容と不一致"
                 );
                 for i in 0..extra_writes {
                     assert_eq!(
