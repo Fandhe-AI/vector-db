@@ -47,16 +47,20 @@ commit（`sync_data()`）まで一切 `StorageBackend::write()` を呼ばない�
 | 2 | トランザクション途中（最終 sync 前）で電源断 → 当該トランザクションは丸ごと消え、既存コミット済みデータは無傷 | `power_loss_scenario2_mid_transaction_crash_discards_whole_transaction` |
 | 3 | 部分 write-back 像 → 「正常に開けて内容は最後のコミット時点と一致」または「明示的なエラーで開けない」のいずれか（後述の通り、本モデルの探索空間では前者のみが構造的に到達可能） | `power_loss_scenario3_partial_writeback_is_either_consistent_or_rejected`（CI・固定シード 32 反復）／ `power_loss_scenario3_partial_writeback_extended_search`（`#[ignore]`・ローカル 2048 反復） |
 | 3-否定コントロール | コミット済み電源断像を直接バイト破損させた場合に拒否経路（`Err`）が実際に機能する（ハーネス自体の拒否検出能力の確認） | `power_loss_scenario3_corrupted_durable_image_is_rejected` |
-| 4 | PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）の不変条件が電源断後も維持される | `power_loss_scenario4_rls_fields_survive_crash_after_commit` |
+| 4 | PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）の不変条件が電源断後も維持される | `crates/engine/src/storage.rs` 内 `storage::tests::power_loss::power_loss_scenario4_rls_fields_survive_crash_after_commit`（`#[cfg(test)]` ユニットテスト） |
 
-シナリオ 4 は、バックエンド差し替え済みの raw `redb::Database`（`redb::Builder::create_with_backend`
-で開く。シナリオ 1・2・3 と同じ）を、`test-support` feature 限定の
-`Storage::from_database_for_testing`（`crates/engine/src/storage.rs`）で本番の `Storage` へ渡し、
-書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の `encode_row`/`decode_row`
-（同ファイル参照）を経由させる。テスト側で行エンコーディングを複製しないため、電源断前後で
-`Storage::get` の結果を比較するだけで、本番エンコーダのフィールド欠落・順序変更・visibility
-値誤りも検出できる。実装は `crates/engine/tests/power_loss.rs` の
-`power_loss_scenario4_rls_fields_survive_crash_after_commit` を参照。
+シナリオ 1〜3・3-否定コントロールは `crates/engine/tests/power_loss.rs`（統合テスト）で
+バックエンド差し替え済みの raw `redb::Database`（`redb::Builder::create_with_backend` で開く）を
+直接操作する。シナリオ 4 のみ、`crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニット
+テストとして実装されている。統合テスト（`tests/` 配下）は crate 外部からのコンパイル単位のため
+`cfg(test)` を使えず、`Storage` の private フィールドへ触れられない。シナリオ 4 は本番の
+`Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由での検証が目的のため、
+`Storage` の公開 API へバックエンド差し替え用のコンストラクタを追加する代わりに、`storage` モジュールの
+子孫である `#[cfg(test)] mod power_loss` から `Storage { db }` の private フィールドへ直接
+アクセスする設計とした（`Storage::open`（`redb::Database::create` 固定）は本番の唯一の公開
+エントリポイントのまま維持し、公開 API 経由でのバイパス経路を作らない）。テスト側で行
+エンコーディングを複製しないため、電源断前後で `Storage::get` の結果を比較するだけで、本番
+エンコーダのフィールド欠落・順序変更・visibility 値誤りも検出できる。
 
 シナリオ 3 の合格基準は fail-closed 原則に従う: 応答済みコミットの黙示的な消失・
 別内容へのすり替わりが 1 件でも観測されれば検証 NG とし、アサーションを弱めたり
@@ -108,11 +112,13 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 ## 観察
 
-- 既定の `Storage::open`（`redb::Database::create`、`cache_size` 既定 1GiB）は commit が
-  `Durability::Immediate`（既定）で動作しており、`commit()` が返る時点で当該
-  トランザクションの書き込みが `sync_data()` まで完了していることをテスト側の
-  `pending_write_count()`（バックエンドへの未 sync 書き込み件数）観測で確認した
-  （シナリオ 1 のテスト内アサーション）。
+- シナリオ 1 が使うテスト用 builder（`redb::Builder::new().create_with_backend(...)`、
+  `cache_size` 既定 1GiB）上の raw `redb::Database` は commit が `Durability::Immediate`
+  （既定）で動作しており、`commit()` が返る時点で当該トランザクションの書き込みが
+  `sync_data()` まで完了していることをテスト側の `pending_write_count()`（バックエンドへの
+  未 sync 書き込み件数）観測で確認した（シナリオ 1 のテスト内アサーション）。この観測は
+  raw `redb::Database` に対するものであり、`Storage::open` を経由した検証ではない
+  （「検証範囲の限定」節参照）。
 - シナリオ 3 で「開けたが内容が最後のコミット時点と異なる」ケースは、CI 分・拡張分
   いずれの反復でも観測されなかった（0 件）。`opened_and_consistent`/
   `rejected_fail_closed` をカウントして実測したところ、CI 分・拡張分ともに
@@ -138,13 +144,13 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
   ため `redb::Builder::create_with_backend` で開く）を直接操作しており、`Storage::put`／
   `Storage::get` や `crates/engine/src/storage.rs` の行エンコーダは経由していない
   （「検証したシナリオ」節参照）。したがってシナリオ 1・2・3 の結論は
-  **`redb` に対するハーネス検証の範囲**に限定される。一方シナリオ 4 は、`test-support`
-  feature 限定の `Storage::from_database_for_testing`（同ファイル）でこの raw
-  `redb::Database` を本番の `Storage` へ渡し、`Storage::put`／`Storage::get`（＝実際の
-  `encode_row`／`decode_row`）を経由して検証している。`Storage::open`（本番の唯一の
-  公開エントリポイント。`redb::Database::create` 固定）自体はバイパスされないため、
-  `Storage::open` を通した電源断耐性そのものは引き続き本再検証の対象外である
-  （残リスクとして明示する）。
+  **`redb` に対するハーネス検証の範囲**に限定され、`Storage::open` を経由した検証では
+  ない。一方シナリオ 4 は、同じ raw `redb::Database` を `crates/engine/src/storage.rs` 内の
+  `#[cfg(test)] mod power_loss` から `Storage { db }` の private フィールドへ直接渡し、
+  `Storage::put`／`Storage::get`（＝実際の `encode_row`／`decode_row`）を経由して検証して
+  いる。`Storage::open`（本番の唯一の公開エントリポイント。`redb::Database::create` 固定）
+  自体はバイパスされないため、`Storage::open` を通した電源断耐性そのものは引き続き本
+  再検証の対象外である（残リスクとして明示する）。
 - **再検証で確認できた範囲**: 本シミュレーションモデルの下では、raw `redb::Database`
   は電源断シナリオ 1・2 において fail-closed（応答済みコミットの黙示的消失・
   すり替わりなし）を維持している。シナリオ 4 は、本番の `Storage::put`／`Storage::get`
@@ -158,13 +164,12 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 - **残リスク（未検証）**: `Storage::open`（本番が実際に使う唯一のオープン経路。
   `redb::Database::create` 固定）自体を経由した電源断耐性は本再検証の対象外のまま
   である。シナリオ 4 で `Storage::put`／`Storage::get`・行エンコーダは検証範囲に
-  含めたが、`Storage::open` の代わりに `Storage::from_database_for_testing`
-  （バックエンド差し替え済み `redb::Database` を受け取る `test-support` feature 限定の
-  コンストラクタ）を使っており、`Storage::open` 自体は差し替え不能なまま維持している
-  （「スコープ外」節参照）。`Storage::open` 経由の電源断耐性を検証するには、本番の
-  `open` 経路自体にテスト用 backend 注入を許す設計変更が必要であり、それには実装判断と
-  ユーザー承認を要する。実施する場合は別途 Issue 化してユーザーと合意のうえで対応する
-  （out-of-scope-tracking.md 準拠。本 PR では起票しない）。
+  含めたが、`Storage::open` の代わりに `#[cfg(test)] mod power_loss`（`crates/engine/src/storage.rs`
+  内。private フィールドへの直接構築で `Storage` を得る）を使っており、`Storage::open`
+  自体は差し替え不能なまま維持している（「スコープ外」節参照）。`Storage::open` 経由の
+  電源断耐性を検証するには、本番の `open` 経路自体にテスト用 backend 注入を許す設計変更が
+  必要であり、それには実装判断とユーザー承認を要する。実施する場合は別途 Issue 化して
+  ユーザーと合意のうえで対応する（out-of-scope-tracking.md 準拠。本 PR では起票しない）。
 - 「モデルの限界」節に記載の通り、実デバイスのファームウェア
   キャッシュ・OS page cache の実際の書き戻し順序・複数ページにまたがる非アトミックな
   デバイス書き込みは本再検証の対象外である。これらは `StorageBackend` より下位の層で
@@ -181,10 +186,12 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
   Issue 化する）
 - `docs/spec` submodule の変更（spec リポ側の作業。本リポからは触らない）
 - `Storage::open`（本番が実際に使う唯一のオープン経路）自体への `StorageBackend`
-  差し替えフック追加。代わりに `test-support` feature 限定の別コンストラクタ
-  `Storage::from_database_for_testing` を追加し、`Storage::open` 自体は
-  `redb::Database::create` 固定のまま維持した。シナリオ 1・2・3 は引き続き
-  `tests/persistence.rs` と同方針で raw `redb::Database` を直接操作する
+  差し替えフック追加、および公開 API へのバックエンド差し替え用コンストラクタ追加。
+  代わりにシナリオ 4 を `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテスト
+  として実装し、private フィールドへの直接構築で `Storage` を得ることで公開 API を
+  増やさずに検証した。`Storage::open` 自体は `redb::Database::create` 固定のまま維持した。
+  シナリオ 1・2・3 は引き続き `tests/persistence.rs` と同方針で raw `redb::Database` を
+  直接操作する
 - ヘッダ領域の特定フィールドのみを狙う等、より広範な・体系的な破損パターンでの
   オープン拒否経路の網羅的探索（否定コントロールにより拒否経路自体が機能することは
   確認済みだが、それは先頭 64 バイト反転という 1 パターンの確認に留まる。観察節参照）
@@ -193,9 +200,8 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 - `docs/spec/05-tasks.md`（TASK-145・TASK-140・TASK-141）
 - `docs/spec/04-behavior/persistence.md`（PERSIST-1・PERSIST-3）
-- `crates/engine/src/storage.rs`（永続化層本体。本再検証でシナリオ 4 検証用の
-  `test-support` feature 限定コンストラクタ `Storage::from_database_for_testing` を
-  追加した。`Storage::open` 自体は変更していない）
-- `crates/engine/tests/power_loss.rs`（本再検証のテストハーネス・シナリオ実装）
+- `crates/engine/src/storage.rs`（永続化層本体。シナリオ 4 は本ファイル内の
+  `#[cfg(test)] mod power_loss` として実装した。`Storage::open` 自体は変更していない）
+- `crates/engine/tests/power_loss.rs`（シナリオ 1〜3・3-否定コントロールのテストハーネス）
 - `crates/engine/tests/persistence.rs`（PERSIST-1/2/3/4 の通常系テスト。同じ
   「`redb` を直接操作する」方針を踏襲した参照実装）
