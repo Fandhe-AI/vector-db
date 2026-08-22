@@ -9,7 +9,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # PR ごとに一意な番号を group に含める（head_ref のみだと fork 間で同名ブランチの
+  # 別 PR が同一グループになり、互いの CI を cancel し合う。PR #4 codex P2 指摘）
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
