@@ -20,7 +20,11 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 /// 行データを格納するテーブル。キーは行 ID（`u64`）、値は [`encode_row`] でエンコードした
 /// バイト列。テーブル名は `docs/spec` 側の成果物指定に依存しないローカルな識別子。
-const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
+///
+/// `pub(crate)`: `txn.rs`（TASK-88・TABLE-3）が `Storage` の公開 API を経由せず、
+/// 同一テーブルに対する読み取りスナップショット・書き込みトランザクションハンドルを
+/// 直接構築するために参照する。
+pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
 /// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
 /// `visibility`）を同居させるレイアウトへ拡張した。v1 の行は RLS フィールドを持たず、
@@ -207,6 +211,16 @@ impl Storage {
         Ok(Self { db })
     }
 
+    /// 内部 `redb::Database` ハンドルへの `pub(crate)` アクセサ。
+    ///
+    /// `txn.rs`（TASK-88・TABLE-3）が宣言済み分離レベルのトランザクション API
+    /// （[`Storage::begin_read`](crate::txn) 相当）を実装する際に、`Storage` の外へ
+    /// `redb::Database` 型そのものをリークさせずに到達するための最小限の穴。
+    /// 公開 API・挙動は変更しない。
+    pub(crate) fn db(&self) -> &redb::Database {
+        &self.db
+    }
+
     /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1）。
     pub fn put(&self, id: u64, row: &RowInput<'_>) -> Result<()> {
         let encoded = encode_row(row)?;
@@ -357,7 +371,10 @@ impl Storage {
 /// （TASK-133）が embedding をデコードせずテナント判定できる余地を残すため。
 /// バージョンバイトと非構造化のメタデータバイト列により、TASK-146（次元固定カタログ）等の
 /// 後続スキーマ拡張が非互換変更なしに行えるようにしている。
-fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
+///
+/// `pub(crate)`: `txn.rs`（TASK-88）の書き込みトランザクションハンドルが、`Storage::put`
+/// と同一のエンコーディングで行を書き込むために再利用する。
+pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
     if row.tenant_id.is_empty() {
         return Err(StorageError::Codec(
             "tenant_id must not be empty".to_string(),
@@ -408,7 +425,10 @@ fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
 /// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
 /// 黙殺フォールバックで既知の型・デフォルト値へ落とさない）。添字アクセス `[]` ではなく
 /// `get()` を使い、境界外アクセスを未定義動作にしない。
-fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
+///
+/// `pub(crate)`: `txn.rs`（TASK-88）の読み取りスナップショットハンドルが、`Storage::get`
+/// と同一のデコード・fail-closed 契約で行を読み出すために再利用する。
+pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
