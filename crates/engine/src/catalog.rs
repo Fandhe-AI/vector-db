@@ -448,6 +448,13 @@ fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
 /// 固定テーブル（`rows`／`catalog`）ともユーザーテーブル同士とも名前衝突しない。
 /// 呼び出し元は必ず先に `validate_identifier(table_name)` を通してから呼ぶこと
 /// （本関数自身は検証を行わない）。
+///
+/// 将来 `drop_table` 相当の API を追加する実装者向けの申し送り: この動的テーブルは
+/// [`CATALOG_TABLE`] のエントリとは別ライフサイクルで管理されている（`create_table` は
+/// `CATALOG_TABLE` のみ書き込み、本関数が指す行テーブルは初回挿入まで未作成のまま）。
+/// `drop_table` を実装する際は `CATALOG_TABLE` のエントリ削除と同一 write トランザクション内で
+/// 本関数が返す行テーブルも削除しないと、テーブル再作成時に旧次元の行データが残留し
+/// EXT-2 の次元固定の不変条件を静かに破る恐れがある。
 fn user_rows_table_name(table_name: &str) -> String {
     format!("user_rows/{table_name}")
 }
@@ -461,8 +468,12 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::Backend(err) => CatalogError::Backend(err),
         StorageError::Codec(msg) => CatalogError::Invalid(msg),
         StorageError::NotFound(id) => CatalogError::RowNotFound(id),
+        // `scan_table_page` は `MAX_SCAN_PAGE_LIMIT` で事前にクランプしているため
+        // 通常この分岐には到達しない（`Storage::scan`（無制限走査）側でのみ発生しうる
+        // エラーの網羅性のためにここで扱う）。到達時の文言は「scan_table_page を使え」と
+        // 自己言及的にならないよう、呼び出し元 API 名を挙げずに一般化して書く。
         StorageError::ScanLimitExceeded => {
-            CatalogError::Invalid("scan limit exceeded: use scan_table_page".to_string())
+            CatalogError::Invalid("scan limit exceeded: use a bounded page scan".to_string())
         }
     }
 }

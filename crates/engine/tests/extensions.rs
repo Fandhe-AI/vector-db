@@ -484,6 +484,78 @@ fn ext2_state_survives_close_and_reopen() {
 }
 
 #[test]
+fn ext2_insert_rows_into_table_discards_whole_transaction_on_mid_batch_failure() {
+    // `storage.rs` の `persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure`
+    // に対応するテーブルスコープ版。`insert_rows_into_table` は write トランザクションを
+    // commit する前にバッチ内の各行を検証するため（本ファイル冒頭コメント・catalog.rs の
+    // `insert_rows_into_table` ドキュメンテーションコメント参照）、3 件目の次元不一致で
+    // 失敗した場合、先に検証を通過した 1・2 件目も含めて全体が未反映のまま拒否される
+    // ことを確認する。
+    let path = unique_db_path("ext2-batch-mid-failure");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    storage
+        .create_table(&vector_table_schema("small", 384))
+        .expect("create_table(small)");
+
+    let ok_embedding_1 = make_embedding(384, 1);
+    let ok_embedding_2 = make_embedding(384, 2);
+    let wrong_dim_embedding = make_embedding(768, 3); // small は 384 次元固定のため不一致。
+    let batch = vec![
+        (
+            1u64,
+            RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &ok_embedding_1,
+                metadata: b"ok-1",
+            },
+        ),
+        (
+            2u64,
+            RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &ok_embedding_2,
+                metadata: b"ok-2",
+            },
+        ),
+        (
+            3u64,
+            RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &wrong_dim_embedding,
+                metadata: b"bad-3",
+            },
+        ),
+    ];
+
+    let err = storage
+        .insert_rows_into_table("small", &batch)
+        .expect_err("batch containing a dimension mismatch must fail");
+    assert!(matches!(err, CatalogError::Invalid(_)));
+
+    // トランザクション全体が破棄され、先に検証を通過していた 1・2 件目も
+    // 一切反映されていないこと（`RowNotFound` まで確認し、別の理由での
+    // 読み取り失敗と区別する）。
+    for id in [1u64, 2] {
+        let err = storage
+            .get_row_from_table("small", id)
+            .expect_err(&format!("row {id} must not be visible after discard"));
+        assert!(matches!(err, CatalogError::RowNotFound(_)));
+    }
+    let (rows, _cursor) = storage
+        .scan_table_page("small", None, 100)
+        .expect("scan_table_page(small) after aborted batch");
+    assert!(
+        rows.is_empty(),
+        "no rows should be committed when the batch transaction is discarded, got: {rows:?}"
+    );
+}
+
+#[test]
 fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
     let path = unique_db_path("ext2-notfound");
     let _cleanup = CleanupGuard(path.clone());
