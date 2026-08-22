@@ -26,10 +26,14 @@
 //!   `power_loss_scenario3_corrupted_durable_image_is_rejected`（否定コントロール）で
 //!   別途確認する。
 //!
-//! テストは `redb` を直接操作する（`tests/persistence.rs` と同じ前提。
-//! `crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。`Storage`（`crates/engine/src/storage.rs`）
-//! の公開 API 越しには `StorageBackend` を差し替えられないため、raw `redb::Database` を
-//! `redb::Builder::create_with_backend` で開く。
+//! `Storage`（`crates/engine/src/storage.rs`）の公開 API（`Storage::open`）は
+//! `redb::Database::create` 固定で `StorageBackend` を差し替えられないため、
+//! バックエンド差し替え済みの `redb::Database` 自体は `redb::Builder::create_with_backend`
+//! で raw に開く（シナリオ 1・2・3 はこの raw `redb::Database` を直接操作する。
+//! `tests/persistence.rs` と同じ前提）。一方シナリオ 4 は、`test-support` feature 限定の
+//! `Storage::from_database_for_testing`（`crates/engine/src/storage.rs`）でこの raw
+//! `redb::Database` を本番の `Storage` へ渡し、書き込み・読み出しは本番の
+//! `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で行う。
 
 use std::io;
 use std::sync::{Arc, Mutex};
