@@ -43,7 +43,7 @@ WRITE_LOG="${WORKDIR}/write.log"
 
 # 進捗行（COMMITTED ...）が出るまでの最大待機（100ms 単位。値 300 = 30 秒）。実際に
 # 書き込みが始まっていない状態で kill しても回帰テストとして意味が無いため、
-# 開始同期をここで取る（コールド runner での初回 put_batch 遅延を見込んだ余裕）。
+# 開始同期をここで取る（コールド runner での初回 put 遅延を見込んだ余裕）。
 WRITE_START_TIMEOUT_TENTHS=300
 
 last_rows=0
@@ -99,8 +99,30 @@ for i in $(seq 1 "${ITERATIONS}"); do
     echo "ERROR: could not parse row count from verify output: ${verify_output}" >&2
     exit 1
   fi
-  if [ "${rows}" -lt "${last_rows}" ]; then
-    echo "ERROR: row count decreased across restarts (${last_rows} -> ${rows}), data loss suspected" >&2
+
+  # write.log の最後に完全に書き切られた `COMMITTED row=<n> rows=<total>` 行から
+  # 「kill 前に確認済みだった行数（acked）」を取り出す。`$` でパターンを終端に
+  # 固定しているため、kill が出力の途中で当たって行が切れた場合はマッチせず
+  # 1 つ前の完全な行が採用される（acked は実際より小さくなることはあっても
+  # 大きくなることはない＝false-fail しない）。
+  acked="$(grep -o '^COMMITTED row=[0-9]* rows=[0-9]*$' "${WRITE_LOG}" | tail -1 | sed -n 's/.*rows=\([0-9]*\)$/\1/p')"
+  if [ -n "${acked}" ]; then
+    # 「started」で確認した COMMITTED はコミット成功後にのみ出力されるため、
+    # 再オープン後の rows はその時点で確認済みだった acked 行数を下回ってはならない
+    # （下回れば、確認済みのはずのコミットが失われたことになる＝data loss）。
+    if [ "${rows}" -lt "${acked}" ]; then
+      echo "ERROR: row count ${rows} is below the last acknowledged commit (rows=${acked} from write.log), data loss suspected" >&2
+      exit 1
+    fi
+  fi
+
+  # "started" が true な時点で write は kill 前に少なくとも 1 回 COMMITTED を
+  # 出力済み（＝コミットが実際に成功した後にのみ出力される同期点を通過済み）
+  # なので、rows は必ず last_rows より真に増えているはずである。`-lt` のみだと
+  # 新規コミットが全て失われても rows == last_rows で見逃してしまう
+  # （data loss を検出できない）ため、`-le` で「増えていない」ケースも失敗にする。
+  if [ "${rows}" -le "${last_rows}" ]; then
+    echo "ERROR: row count did not increase across restarts (${last_rows} -> ${rows}) despite a committed write, data loss suspected" >&2
     exit 1
   fi
   last_rows="${rows}"

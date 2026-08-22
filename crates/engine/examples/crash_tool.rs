@@ -9,12 +9,15 @@
 //! engine クレートの内部実装（`storage.rs` の非公開関数等）には依存しない。
 //!
 //! サブコマンド:
-//! - `write <db_path>`: 固定バッチサイズで行を無限に近い反復でコミットし続ける。
-//!   1 バッチごとに `COMMITTED batch=<n> rows=<total>` を stdout へ出力する
-//!   （`scripts/crash_test.sh` が「書き込みが実際に進み始めてから kill する」ための
-//!   同期点）。再起動時は既存データの最大行 ID の続きから採番する。
-//! - `verify <db_path>`: 全行を上限付きページングで走査し、破損 0 件・ID 連続・
-//!   内容一致・行数がバッチサイズの倍数（部分コミット無し）を確認する。
+//! - `write <db_path>`: `Storage::put`（対象ビヘイビア: PERSIST-1）で行を 1 行ずつ
+//!   無限に近い反復でコミットし続ける。`PROGRESS_INTERVAL` 行ごとに
+//!   `COMMITTED row=<n> rows=<total>` を stdout へ出力する（`scripts/crash_test.sh`
+//!   が「書き込みが実際に進み始めてから kill する」ための同期点）。再起動時は
+//!   既存データの最大行 ID の続きから採番する。
+//! - `verify <db_path>`: 全行を上限付きページングで走査し、破損 0 件・ID が
+//!   0 から連続で欠番なし・内容一致を確認する（単一行コミットのため、途中で
+//!   kill されても「その時点までにコミット済みの行が過不足なく揃っている」ことが
+//!   PERSIST-1 のオラクルであり、バッチ単位の倍数制約は課さない）。
 //!   結果を `RESULT ok=true rows=<N>` / `RESULT ok=false reason=<...>` の 1 行で
 //!   stdout へ出力し、失敗時は非 0 終了する（fail-closed。空虚な成功を許さない）。
 
@@ -22,19 +25,22 @@ use std::io::Write as _;
 
 use engine::storage::{RowInput, Storage};
 
-/// 1 バッチのコミット行数。`verify` 側は総行数がこの倍数であることを
-/// 部分コミット（トランザクション原子性の崩れ）が無いことのオラクルとして使う。
-const BATCH_SIZE: u64 = 10;
+/// stdout への進捗出力間隔（行数）。`scripts/crash_test.sh` が
+/// 「書き込みが実際に進み始めた」ことを検知する同期点の頻度を決める
+/// （小さすぎると stdout I/O が支配的になり kill の当たりどころが偏るため、
+/// 1 行ごとではなくまとめて出力する）。
+const PROGRESS_INTERVAL: u64 = 10;
 /// 生成する埋め込みベクトルの次元数。
 const EMBEDDING_DIM: usize = 64;
 /// 生成するメタデータバイト列の長さ。
 const METADATA_LEN: usize = 32;
 /// `scan_page` の 1 回あたり取得件数。
 const PAGE_LIMIT: u32 = 10_000;
-/// write の自走上限（安全弁）。`scripts/crash_test.sh` は書き込み進行中に SIGKILL する
-/// 想定のため通常はここへ到達しない。到達した場合はテストダブルとして正常終了する
-/// （無限ループにしない。security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
-const MAX_BATCHES: u64 = 500_000;
+/// write の自走上限行数（安全弁）。`scripts/crash_test.sh` は書き込み進行中に
+/// SIGKILL する想定のため通常はここへ到達しない。到達した場合はテストダブルとして
+/// 正常終了する（無限ループにしない。security.md「不安全な設計｜無制限リソース確保
+/// （DoS）」対応）。
+const MAX_ROWS: u64 = 5_000_000;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -138,41 +144,30 @@ fn write_inner(path: &str) -> Result<(), String> {
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
 
-    for batch_no in 1..=MAX_BATCHES {
-        let mut derived: Vec<(u64, Vec<f32>, Vec<u8>)> = Vec::with_capacity(BATCH_SIZE as usize);
-        for offset in 0..BATCH_SIZE {
-            let id = next_id
-                .checked_add(offset)
-                .ok_or_else(|| "row id overflow while writing".to_string())?;
-            let (embedding, metadata) = derive_row(id);
-            derived.push((id, embedding, metadata));
-        }
-        let batch: Vec<(u64, RowInput<'_>)> = derived
-            .iter()
-            .map(|(id, embedding, metadata)| {
-                (
-                    *id,
-                    RowInput {
-                        embedding,
-                        metadata,
-                    },
-                )
-            })
-            .collect();
+    for row_no in 1..=MAX_ROWS {
+        let (embedding, metadata) = derive_row(next_id);
+        let row = RowInput {
+            embedding: &embedding,
+            metadata: &metadata,
+        };
+        // PERSIST-1 の単一行書き込み経路そのものを検証する（PERSIST-2 の
+        // `put_batch` は使わない。回帰対象がこの API 呼び出しであるため）。
         storage
-            .put_batch(&batch)
-            .map_err(|e| format!("put_batch failed: {e}"))?;
+            .put(next_id, &row)
+            .map_err(|e| format!("put failed: {e}"))?;
         next_id = next_id
-            .checked_add(BATCH_SIZE)
+            .checked_add(1)
             .ok_or_else(|| "row id overflow after commit".to_string())?;
 
-        // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する同期点
-        // なので、バッファリングで遅延しないよう毎回明示的に flush する。
-        writeln!(handle, "COMMITTED batch={batch_no} rows={next_id}")
-            .map_err(|e| format!("stdout write failed: {e}"))?;
-        handle
-            .flush()
-            .map_err(|e| format!("stdout flush failed: {e}"))?;
+        if row_no.is_multiple_of(PROGRESS_INTERVAL) {
+            // 進捗行はスクリプト側が「書き込みが実際に進み始めた」ことを検知する
+            // 同期点なので、バッファリングで遅延しないよう毎回明示的に flush する。
+            writeln!(handle, "COMMITTED row={row_no} rows={next_id}")
+                .map_err(|e| format!("stdout write failed: {e}"))?;
+            handle
+                .flush()
+                .map_err(|e| format!("stdout flush failed: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -231,13 +226,9 @@ fn verify_inner(path: &str) -> Result<u64, String> {
     if total_rows == 0 {
         return Err("no rows found".to_string());
     }
-    // put_batch は単一トランザクションで BATCH_SIZE 行をコミットするため、行数が
-    // その倍数でなければ部分コミット（原子性違反）が疑われる。
-    if !total_rows.is_multiple_of(BATCH_SIZE) {
-        return Err(format!(
-            "row count {total_rows} is not a multiple of batch size {BATCH_SIZE} \
-             (partial commit suspected)"
-        ));
-    }
+    // `put` は 1 行ずつ独立にコミットするため、バッチ単位の倍数制約は課さない。
+    // 上のループで expected_id との突き合わせ（0 起点で欠番なし）を既に確認済み
+    // であり、それ自体が「途中で kill されてもコミット済みの行が過不足なく
+    // 揃っている」ことの PERSIST-1 オラクルになっている。
     Ok(total_rows)
 }
