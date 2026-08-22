@@ -1080,5 +1080,35 @@ mod tests {
                  反映されていなければならない"
             );
         }
+
+        // 退行検出用: `write()` が現在の EOF を越える offset へ書き込んだ場合に
+        // `len()` が追従して伸長することを直接確認する。ここを確認しないと、
+        // `write()` が `log` へ積むだけで `state.len` を更新しない実装（EOF 越え
+        // write を無視する契約違反）へ退行しても検出できない。`len()` が古いままだと、
+        // `sync_data()` 後の `durable_snapshot()` の実長が `len()` の申告値を超え、
+        // `redb` から見た「ファイル長」と実データが矛盾する。
+        #[test]
+        fn power_loss_backend_write_past_eof_extends_len() {
+            let backend = PowerLossBackend::from_bytes(b"short".to_vec());
+            assert_eq!(backend.len().expect("len before write"), 5);
+
+            // 既存の 5 バイトより後ろ（offset 10）へ書き込み、EOF を越えて伸長させる。
+            backend.write(10, b"tail").expect("write past current EOF");
+            assert_eq!(
+                backend.len().expect("len after EOF-crossing write"),
+                14,
+                "write() が EOF を越えた分だけ len() も伸長しているはず"
+            );
+
+            backend.sync_data().expect("sync_data");
+            let durable = backend.durable_snapshot();
+            assert_eq!(
+                durable.len(),
+                backend.len().expect("len after sync_data") as usize,
+                "sync_data() 後は durable_snapshot() の実長が len() の申告値と \
+                 一致していなければならない（不一致は EOF 越え write で len が \
+                 追従しない退行の兆候）"
+            );
+        }
     }
 }

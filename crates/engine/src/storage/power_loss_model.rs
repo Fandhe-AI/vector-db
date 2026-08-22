@@ -22,8 +22,12 @@ use redb::StorageBackend;
 /// [`PowerLossBackend`] が保持する内部状態。
 ///
 /// - `durable`: 直近の `sync_data()` 完了時点のバイト列（電源断後も必ず残る像）。
-/// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新する（モデルの限界。
-///   `set_len` はメタデータ操作として即時 durable 化する単純化を置いている）。
+/// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新するほか、`write()` が
+///   現在の `len` を越える offset へ書き込んだ場合もその場で伸長する（POSIX の write
+///   が EOF を越えて暗黙にファイルを伸長するのと同じ振る舞い）。`durable`（実データ）
+///   の反映は `sync_data()` まで遅延する一方、`len` はメタデータとして即時更新する
+///   単純化を置いている。この即時性により `len()` と `sync_data()` 後の
+///   `durable_snapshot().len()` が常に一致する。
 /// - `log`: 直近の `sync_data()` 以降に発行された `write()` の記録（発行順）。
 ///   `write()` はこの `log` に積むのみで `durable` を更新しない。`sync_data()` が
 ///   呼ばれて初めて `log` を `durable` へ反映する。sync を経ない書き込みが durable 像へ
@@ -58,16 +62,21 @@ impl BackendState {
     /// 未 sync の `log` をすべて適用した「見かけ上の現在の状態」を返す
     /// （sync 前の自分の書き込みは redb 自身には見える必要がある。read-your-writes）。
     ///
-    /// `write()` は現在の `len` を越える offset へも書けて構わない（POSIX の
-    /// write が EOF を越えて暗黙にファイルを伸長するのと同じ振る舞いを許容する
-    /// ため、ここでは `end` に合わせて `buf` を伸長する）。一方 `set_len` による
-    /// 明示的な縮小後は、`log` 自体が新しい長さへ切り詰め済み（`set_len` 参照）
-    /// のため、縮小後 EOF より後ろの pending write がここで幽霊のように復活する
-    /// ことはない。
+    /// `write()` は現在の `len` を越える offset へも書けて構わない（POSIX の write が
+    /// EOF を越えて暗黙にファイルを伸長するのと同じ振る舞い）。この伸長自体は
+    /// `write()` 側で `len` を更新する時点で確定しているため、`buf.resize(self.len, 0)`
+    /// が既に `end` を包含している。以下の `if end > buf.len()` 分岐は、その不変条件が
+    /// 崩れていないことに対する安全網（到達しないはずのフォールバック）として残す。
+    /// 一方 `set_len` による明示的な縮小後は、`log` 自体が新しい長さへ切り詰め済み
+    /// （`set_len` 参照）のため、縮小後 EOF より後ろの pending write がここで
+    /// 幽霊のように復活することはない。
     pub(crate) fn current(&self) -> Vec<u8> {
         let mut buf = self.durable.clone();
         buf.resize(self.len, 0);
         for (offset, data) in &self.log {
+            // `log` に積まれる offset/end は `write()` が `usize::try_from`・
+            // `checked_add` で既に検証済み（同メソッド参照）なので、ここでの
+            // truncating cast・非 checked 加算は安全。
             let start = *offset as usize;
             let end = start + data.len();
             if end > buf.len() {
@@ -82,7 +91,9 @@ impl BackendState {
 /// OS の page cache を模した `redb::StorageBackend` 実装。実ファイルを一切使わず、
 /// メモリ上の [`BackendState`] だけで完結する（テストの決定論性・実行速度のため）。
 /// `write()` は `log` に積むのみで `durable`（電源断後も必ず残る像）を更新せず、
-/// `sync_data()` の時点で初めて `log` を `durable` へ反映する。
+/// `sync_data()` の時点で初めて `log` を `durable` へ反映する。`len` は `set_len` と
+/// 同じ扱いのメタデータ操作として `write()` が即時更新する（[`BackendState`] の
+/// フィールド doc 参照）。
 #[derive(Debug, Clone)]
 pub(crate) struct PowerLossBackend {
     pub(crate) state: Arc<Mutex<BackendState>>,
@@ -169,6 +180,17 @@ impl StorageBackend for PowerLossBackend {
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.lock().expect("lock poisoned");
+        // POSIX の write が EOF を越えて暗黙にファイルを伸長するのと同じ振る舞いを
+        // モデル化するため、`offset + data.len()` が現在の `len` を越える場合は
+        // `len` 自身もここで伸長する。log に積むだけで `len` を更新しないと、
+        // sync_data() 後に `durable`（= current() のスナップショット）の実長が
+        // `len` を上回り、`len()` と durable 像の長さが不整合になる。
+        let offset_usize = usize::try_from(offset)
+            .map_err(|_| io::Error::other("write offset does not fit usize"))?;
+        let end = offset_usize
+            .checked_add(data.len())
+            .ok_or_else(|| io::Error::other("write range overflow"))?;
+        state.len = state.len.max(end);
         state.log.push((offset, data.to_vec()));
         Ok(())
     }
