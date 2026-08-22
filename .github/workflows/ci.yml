@@ -45,3 +45,19 @@ jobs:
       # （reusable 側は他イベントを fail-closed で拒否する）。push でも動く本
       # workflow では event で切り替え、main への push では実行しない
       commitlint: ${{ github.event_name == 'pull_request' }}
+
+  # --------------------------------------------------
+  # rust-ci（Rust ベースライン品質ゲート: fmt / clippy / test / cargo-deny）
+  # --------------------------------------------------
+  # TASK-66 の workspace 追加（Cargo.toml）に伴い有効化。集約ジョブは reusable 側の
+  # `rust-base-ci-complete`（本呼び出しからは `rust-ci / rust-base-ci-complete` として
+  # 見える）。branch protection の必須チェックへ追加する運用はユーザー作業（PR 本文参照）。
+  rust-ci:
+    uses: Fandhe-AI/actions/.github/workflows/rust-base-ci.yml@latest
+    permissions:
+      contents: read
+    with:
+      # public リポジトリのため GitHub ホステッド runner を明示指定（lint-docs と同方針）
+      runner-label: ubuntu-latest
+      # make deny（Makefile の deny ターゲット）と同一のチェック集合
+      deny-checks: advisories bans licenses sources
