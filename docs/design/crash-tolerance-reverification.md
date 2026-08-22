@@ -11,8 +11,8 @@
 
 TASK-140 の永続化層（`crates/engine/src/storage.rs`）が、SIGKILL 以外の
 OS クラッシュ相当（電源断・fsync タイミング依存のクラッシュ）に対しても
-PERSIST-1（コミット済みデータの生存・未コミットの破棄）・PERSIST-3（RLS フィールドの
-永続化）を維持できているかを再検証し、結果を記録する。
+PERSIST-1・PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）の
+不変条件を維持できているかを再検証し、結果を記録する。
 
 ## 検証手法とシミュレーションモデル
 
@@ -48,15 +48,15 @@ commit（`sync_data()`）まで一切 `StorageBackend::write()` を呼ばない�
 | 2 | トランザクション途中（最終 sync 前）で電源断 → 当該トランザクションは丸ごと消え、既存コミット済みデータは無傷 | `power_loss_scenario2_mid_transaction_crash_discards_whole_transaction` |
 | 3 | 部分 write-back 像 → 「正常に開けて内容は最後のコミット時点と一致」または「明示的なエラーで開けない」のいずれか（後述の通り、本モデルの探索空間では前者のみが構造的に到達可能） | `power_loss_scenario3_partial_writeback_is_either_consistent_or_rejected`（CI・固定シード 32 反復）／ `power_loss_scenario3_partial_writeback_extended_search`（`#[ignore]`・ローカル 2048 反復） |
 | 3-否定コントロール | コミット済み電源断像を直接バイト破損させた場合に拒否経路（`Err`）が実際に機能する（ハーネス自体の拒否検出能力の確認） | `power_loss_scenario3_corrupted_durable_image_is_rejected` |
-| 4 | RLS フィールド（tenant_id・visibility）が v2 行レイアウト内に同居した状態のまま電源断後も無傷で保持される | `power_loss_scenario4_rls_fields_survive_crash_after_commit` |
+| 4 | PERSIST-3（ポインタ: `docs/spec/04-behavior/persistence.md`）の不変条件が電源断後も維持される | `power_loss_scenario4_rls_fields_survive_crash_after_commit` |
 
 シナリオ 4 は `Storage` の公開 API がバックエンド差し替えに対応していないため、
-`crates/engine/src/storage.rs` の v2 行レイアウトをテストローカルに再現したバイト列
-（`tests/persistence.rs` の `persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table`
-と同じ手法）を raw `redb::Database` へ直接書き込み、再オープン後に tenant_id・visibility
-バイトの位置を検査する。当初案では人間可読な文字列を不透明ペイロードとして書き込む
-簡易版だったが、それでは実質シナリオ 1 の再検証にしかならず PERSIST-3（RLS フィールドの
-行内同居）を検証していなかったため、v2 レイアウトを模した構成に修正した。
+`crates/engine/src/storage.rs` の行エンコーディング（同ファイル参照）をテストローカルに
+再現したバイト列（`tests/persistence.rs` の
+`persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table` と同じ手法）を
+raw `redb::Database` へ直接書き込み、再オープン後に RLS フィールドの位置を検査する。
+再現の具体的なバイト配置は `crates/engine/tests/power_loss.rs` の `encode_rls_row`
+（`crates/engine/src/storage.rs` を参照する形で実装）を参照。
 
 シナリオ 3 の合格基準は fail-closed 原則に従う: 応答済みコミットの黙示的な消失・
 別内容へのすり替わりが 1 件でも観測されれば検証 NG とし、アサーションを弱めたり
@@ -100,7 +100,7 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 | 3（部分 write-back、CI 分・固定シード 32 反復） | 常時 | 合格。32/32 反復で「正常に開けて行 1 の内容が完全一致」。オープン失敗（fail-closed 拒否）は 0 件（実測値。`cargo test -- --nocapture` で採取）。`Err`（拒否）自体は fail-closed の観点で合格の結果のため、`rejected` の値そのものはアサートしない（各反復では部分集合が実際に電源断像を変化させたことのみを `assert_ne!` で確認する） |
 | 3（部分 write-back、拡張・2048 反復、`--ignored`） | ローカルのみ（本 PR の作業時に再実行して確認） | 合格。2048/2048 反復で同上。オープン失敗は 0 件（実行時間は開発機で約 14.5 秒） |
 | 3-否定コントロール（コミット済み像の直接バイト破損） | 常時 | 合格。`durable_snapshot()` 先頭 64 バイトを反転させた像は `reopen_from_image` が明示的に `Err` を返す（拒否経路が実際に機能することを確認） |
-| 4（RLS フィールドの電源断耐性） | 常時 | 合格。tenant_id・visibility バイトが v2 行レイアウトの期待オフセットのまま電源断後も無傷 |
+| 4（PERSIST-3 の電源断耐性） | 常時 | 合格。`crates/engine/src/storage.rs` の行エンコーディングに従い期待オフセットのまま電源断後も無傷 |
 
 `cargo test -p engine`（CI 相当、`--ignored` を含まない）は engine クレート全体で
 数秒程度で完了する（本ハーネス単体、`--test power_loss` のみでは 0.2〜0.3 秒程度）。
@@ -136,21 +136,21 @@ B-tree のため、そうした書き込みは新規割当ページ（既存の�
 
 - **検証範囲の限定（重要）**: 本再検証のハーネス（`crates/engine/tests/power_loss.rs`）は
   `Storage::open`／`Storage::put` や `crates/engine/src/storage.rs` の行エンコーダを一切
-  経由していない。シナリオ 1・2・3 は raw `redb::Database` を直接操作し、シナリオ 4 は
-  v2 行レイアウトをテストローカルに複製したバイト列を raw `redb::Database` へ書き込んで
-  いる（「検証したシナリオ」節参照）。したがって以下の結論は **`redb` と複製レイアウトに
-  対するハーネス検証の範囲**に限定されるものであり、`Storage::open`／`Storage::put`・行
-  エンコーダ自体（TASK-140/TASK-141 の `Storage` 層本体）の電源断耐性は本再検証では
-  検証していない。これは「スコープ外」節に記載の通り、プロダクションコードへ test 用の
-  backend 差し替えフックを追加しない方針を踏襲した結果であり、**残リスク**として明示する。
+  経由していない。シナリオ 1・2・3 は raw `redb::Database` を直接操作し、シナリオ 4 も
+  同様に raw `redb::Database` へ直接書き込む方式で近似している（「検証したシナリオ」節
+  参照）。したがって以下の結論は **`redb` に対するハーネス検証の範囲**に限定されるもので
+  あり、`Storage::open`／`Storage::put`・行エンコーダ自体（TASK-140/TASK-141 の
+  `Storage` 層本体）の電源断耐性は本再検証では検証していない。これは「スコープ外」節に
+  記載の通り、
+  プロダクションコードへ test 用の backend 差し替えフックを追加しない方針を踏襲した
+  結果であり、**残リスク**として明示する。
 - **再検証で確認できた範囲**: 本シミュレーションモデルの下では、raw `redb::Database`
-  （シナリオ 4 は複製した v2 行レイアウトを含む）は電源断シナリオ 1・2・4 において
-  fail-closed（応答済みコミットの黙示的消失・すり替わりなし）を維持している。シナリオ 3
-  については、本モデルの部分集合探索が
+  は電源断シナリオ 1・2・4 において fail-closed（応答済みコミットの黙示的消失・
+  すり替わりなし）を維持している。シナリオ 3 については、本モデルの部分集合探索が
   構造的にコミット済みツリーへ干渉できない（「検証したシナリオ」節・「モデルの限界」節
   参照）ため、「開けて内容一致」以外の結果を観測しうる検証にはなっていない。拒否経路
   自体がハーネス内で機能することは否定コントロールで別途確認したが、シナリオ 3 が
-  意図した「部分 write-back パターンに対する fail-closed 挙動」の検証としては、
+  意図した部分 write-back パターンに対する fail-closed 挙動の検証としては、
   本モデルの探索空間の限界により確認できていない。
 - **残リスク（未検証）**: 上記「検証範囲の限定」に記載の通り、`Storage::open`／
   `Storage::put`・行エンコーダ自体を経由した電源断耐性は本再検証の対象外である。

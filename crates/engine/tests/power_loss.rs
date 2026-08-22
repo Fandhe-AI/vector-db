@@ -528,13 +528,12 @@ fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
     );
 }
 
-/// `crates/engine/src/storage.rs` の v2 行レイアウト（RLS フィールドを行本体に同居させる形式）
-/// を模した最小限のエンコード（テストローカル。engine のプライベート実装には依存しない。
-/// レイアウトは `tests/persistence.rs` の
+/// `crates/engine/src/storage.rs` の行エンコーディング（同ファイル参照）を模した
+/// 最小限のエンコード（テストローカル。engine のプライベート実装には依存しない。
+/// エンコード方式は `tests/persistence.rs` の
 /// `persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table` と同一の
 /// 前提を踏襲する）。dim・metadata は本シナリオの検証対象外のため 0 固定とする。
-///
-/// レイアウト: `[version(1)=2][tenant_len(2) le][tenant bytes][visibility(1)][dim(4) le=0][metadata_len(4) le=0]`
+/// フィールド順序・オフセットの詳細は `crates/engine/src/storage.rs` を参照。
 fn encode_rls_row(tenant_id: &str, visibility_byte: u8) -> Vec<u8> {
     let tenant_bytes = tenant_id.as_bytes();
     let mut buf = Vec::new();
@@ -547,12 +546,12 @@ fn encode_rls_row(tenant_id: &str, visibility_byte: u8) -> Vec<u8> {
     buf
 }
 
-// シナリオ 4（PERSIST-3 の電源断拡張）: RLS フィールド（tenant_id / visibility）が
-// v2 行レイアウト内に同居した状態のまま、電源断後も無傷で保持される。
+// シナリオ 4（PERSIST-3 の電源断拡張。ポインタ: `docs/spec/04-behavior/persistence.md`）:
+// RLS フィールドが電源断後も無傷で保持される。
 // `Storage` の公開 API は電源断シミュレーション用のバックエンド差し替えに対応していない
 // ため（`Storage::open` は `redb::Database::create` 固定）、raw `redb::Database` に対して
-// `encode_rls_row` で組み立てた v2 レイアウトのバイト列を直接書き込み、再オープン後に
-// tenant_id・visibility バイトの位置を検査する（`tests/persistence.rs` の
+// `encode_rls_row` で組み立てたバイト列を直接書き込み、再オープン後に RLS フィールドの
+// 位置を検査する（`tests/persistence.rs` の
 // `persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table` と同じ手法）。
 #[test]
 fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
