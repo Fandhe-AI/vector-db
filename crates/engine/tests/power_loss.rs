@@ -30,18 +30,17 @@
 //! `Storage`（`crates/engine/src/storage.rs`）の公開 API（`Storage::open`）は
 //! `redb::Database::create` 固定で `StorageBackend` を差し替えられないため、
 //! バックエンド差し替え済みの `redb::Database` 自体は `redb::Builder::create_with_backend`
-//! で raw に開く（シナリオ 1・2・3 はこの raw `redb::Database` を直接操作する。
-//! `tests/persistence.rs` と同じ前提）。一方シナリオ 4 は、`test-support` feature 限定の
-//! `Storage::from_database_for_testing`（`crates/engine/src/storage.rs`）でこの raw
-//! `redb::Database` を本番の `Storage` へ渡し、書き込み・読み出しは本番の
-//! `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で行う。
+//! で raw に開く（本ファイルのシナリオ 1・2・3 はこの raw `redb::Database` を直接操作
+//! する。`tests/persistence.rs` と同じ前提）。本番の `Storage::put`/`Storage::get`
+//! （＝実際の `encode_row`/`decode_row`）経由での電源断シナリオ（旧シナリオ 4・
+//! PERSIST-3）は `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテストへ
+//! 移設した（`Storage` の private フィールドへ crate 内から直接アクセスすることで、
+//! 公開 API へバックエンド差し替え用のコンストラクタを増やさないため）。
 
 use std::io;
 use std::sync::{Arc, Mutex};
 
 use redb::{Database, ReadableDatabase, StorageBackend, TableDefinition};
-
-use engine::storage::{RowInput, Storage, Visibility};
 
 /// テスト対象のテーブル定義（`crates/engine/src/storage.rs` の `ROWS_TABLE` と同一の
 /// キー・値型。本ファイルは行の中身を解釈しないため、値のエンコード詳細に依存しない）。
@@ -547,77 +546,7 @@ fn power_loss_scenario3_corrupted_durable_image_is_rejected() {
     );
 }
 
-// シナリオ 4（PERSIST-3 の電源断拡張。ポインタ: `docs/spec/04-behavior/persistence.md`）:
-// RLS フィールドが電源断後も無傷で保持される。
-// `Storage::from_database_for_testing`（`crates/engine/src/storage.rs`、`test-support`
-// feature 限定）でバックエンド差し替え済み `redb::Database` を本番の `Storage` へ渡し、
-// 書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の
-// `encode_row`/`decode_row` を通す。テスト側でエンコード方式を複製しないため、
-// 本番エンコーダのフィールド欠落・順序変更・visibility 値誤りがあれば
-// このテストで検出できる。電源断前後どちらも `Storage::get`（＝実際の decode_row）で
-// 読み出して同じ内容が復元されることを確認する。
-#[test]
-fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
-    let (backend, raw_db) = open_fresh();
-    let storage = Storage::from_database_for_testing(raw_db);
-
-    storage
-        .put(
-            1,
-            &RowInput {
-                tenant_id: "tenant-a",
-                visibility: Visibility::Public,
-                embedding: &[],
-                metadata: &[],
-            },
-        )
-        .expect("put row 1 via production Storage API");
-    storage
-        .put(
-            2,
-            &RowInput {
-                tenant_id: "tenant-b",
-                visibility: Visibility::Private,
-                embedding: &[],
-                metadata: &[],
-            },
-        )
-        .expect("put row 2 via production Storage API");
-
-    // 電源断前に、production decode_row 経由での読み出しが期待通りであることを
-    // 確認しておく（電源断後との比較基準）。
-    let row1_before = storage
-        .get(1)
-        .expect("decode row 1 via production Storage API before crash");
-    let row2_before = storage
-        .get(2)
-        .expect("decode row 2 via production Storage API before crash");
-
-    let crash_image = backend.durable_snapshot();
-    drop(storage);
-
-    let recovered_raw_db = reopen_from_image(crash_image).expect("reopen after crash must succeed");
-
-    // 本番 `Storage::get`（＝実際の decode_row）経由で RLS フィールドが正しく
-    // 復元できること（PERSIST-3 の Storage 層再検証）。
-    let recovered_storage = Storage::from_database_for_testing(recovered_raw_db);
-    let row1_after = recovered_storage
-        .get(1)
-        .expect("decode row 1 via production Storage API after crash");
-    assert_eq!(
-        row1_after, row1_before,
-        "row 1 は電源断前後で production decode_row の結果が完全一致していなければならない"
-    );
-    assert_eq!(row1_after.tenant_id, "tenant-a");
-    assert_eq!(row1_after.visibility, Visibility::Public);
-
-    let row2_after = recovered_storage
-        .get(2)
-        .expect("decode row 2 via production Storage API after crash");
-    assert_eq!(
-        row2_after, row2_before,
-        "row 2 は電源断前後で production decode_row の結果が完全一致していなければならない"
-    );
-    assert_eq!(row2_after.tenant_id, "tenant-b");
-    assert_eq!(row2_after.visibility, Visibility::Private);
-}
+// 旧シナリオ 4（PERSIST-3 の電源断拡張。ポインタ: `docs/spec/04-behavior/persistence.md`）は
+// `crates/engine/src/storage.rs` 内の `#[cfg(test)]` ユニットテスト
+// （`storage::tests::power_loss::power_loss_scenario4_rls_fields_survive_crash_after_commit`）
+// へ移設した（モジュール doc 参照）。

@@ -211,17 +211,6 @@ impl Storage {
         Ok(Self { db })
     }
 
-    /// テスト専用の内部コンストラクタ。`StorageBackend` を差し替えた `redb::Database`
-    /// （例: `tests/power_loss.rs` の電源断シミュレーション用バックエンド）を、本番と
-    /// 同じ `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で
-    /// 検証できるようにする。`Storage::open`（`redb::Database::create` 固定）は本番経路
-    /// として維持し、本コンストラクタはバイパスしない。`test-support` feature でのみ
-    /// コンパイルされ、本番ビルドには含まれない。
-    #[cfg(feature = "test-support")]
-    pub fn from_database_for_testing(db: redb::Database) -> Self {
-        Self { db }
-    }
-
     /// 内部 `redb::Database` ハンドルへの `pub(crate)` アクセサ。
     ///
     /// `txn.rs`（TASK-88・TABLE-3）が宣言済み分離レベルのトランザクション API
@@ -890,5 +879,223 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:
+    /// `docs/spec/05-tasks.md`。PERSIST-3、ポインタ: `docs/spec/04-behavior/persistence.md`
+    /// を電源断シナリオへ拡張して再検証する。他シナリオは
+    /// `crates/engine/tests/power_loss.rs`（raw `redb::Database` を直接操作する統合テスト）
+    /// を参照）。
+    ///
+    /// 本サブモジュールを `crate` 内の `#[cfg(test)]` に閉じているのは、本番の
+    /// `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で検証
+    /// しつつ、`Storage` の公開 API へバックエンド差し替え用のコンストラクタを一切
+    /// 増やさないため。`Storage { db }` の private フィールドへは同一クレート内の
+    /// 子モジュールから直接アクセスできるので、feature 限定の `pub fn` を用意せずに
+    /// テスト専用の `redb::Database`（`StorageBackend` 差し替え済み）を渡せる。
+    mod power_loss {
+        use super::*;
+        use std::io;
+        use std::sync::{Arc, Mutex};
+
+        use redb::StorageBackend;
+
+        /// [`PowerLossBackend`] が保持する内部状態。
+        ///
+        /// - `durable`: 直近の `sync_data()` 完了時点のバイト列（電源断後も必ず残る像）。
+        /// - `len`: 現在の見かけ上のファイル長。`set_len` で即時更新する（モデルの限界。
+        ///   `set_len` はメタデータ操作として即時 durable 化する単純化を置いている）。
+        #[derive(Debug)]
+        struct BackendState {
+            durable: Vec<u8>,
+            len: usize,
+        }
+
+        impl BackendState {
+            fn new() -> Self {
+                Self {
+                    durable: Vec::new(),
+                    len: 0,
+                }
+            }
+
+            fn from_bytes(bytes: Vec<u8>) -> Self {
+                let len = bytes.len();
+                Self {
+                    durable: bytes,
+                    len,
+                }
+            }
+
+            /// `durable` を `len` にリサイズ（不足分はゼロ埋め）した基底バッファ。
+            fn current(&self) -> Vec<u8> {
+                let mut buf = self.durable.clone();
+                buf.resize(self.len, 0);
+                buf
+            }
+        }
+
+        /// OS の page cache を模した `redb::StorageBackend` 実装。実ファイルを一切使わず、
+        /// メモリ上の [`BackendState`] だけで完結する（テストの決定論性・実行速度のため）。
+        /// 本シナリオは commit 完了後の電源断のみを検証するため、`write()` は即座に
+        /// `durable` へ反映する（`sync_data()` を待つ部分 write-back の探索は
+        /// `crates/engine/tests/power_loss.rs` のシナリオ 2・3 が担う）。
+        #[derive(Debug, Clone)]
+        struct PowerLossBackend {
+            state: Arc<Mutex<BackendState>>,
+        }
+
+        impl PowerLossBackend {
+            fn new() -> Self {
+                Self {
+                    state: Arc::new(Mutex::new(BackendState::new())),
+                }
+            }
+
+            fn from_bytes(bytes: Vec<u8>) -> Self {
+                Self {
+                    state: Arc::new(Mutex::new(BackendState::from_bytes(bytes))),
+                }
+            }
+
+            /// 直近 `sync_data()` 時点のバイト列（電源断で必ず残る像）を取得する。
+            fn durable_snapshot(&self) -> Vec<u8> {
+                self.state.lock().expect("lock poisoned").durable.clone()
+            }
+        }
+
+        impl StorageBackend for PowerLossBackend {
+            fn len(&self) -> io::Result<u64> {
+                Ok(self.state.lock().expect("lock poisoned").len as u64)
+            }
+
+            fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+                let state = self.state.lock().expect("lock poisoned");
+                let current = state.current();
+                let start = offset as usize;
+                let end = start
+                    .checked_add(out.len())
+                    .ok_or_else(|| io::Error::other("read range overflow"))?;
+                let slice = current
+                    .get(start..end)
+                    .ok_or_else(|| io::Error::other("read out of bounds"))?;
+                out.copy_from_slice(slice);
+                Ok(())
+            }
+
+            fn set_len(&self, len: u64) -> io::Result<()> {
+                let mut state = self.state.lock().expect("lock poisoned");
+                let len =
+                    usize::try_from(len).map_err(|_| io::Error::other("len does not fit usize"))?;
+                state.len = len;
+                state.durable.resize(len, 0);
+                Ok(())
+            }
+
+            fn sync_data(&self) -> io::Result<()> {
+                let mut state = self.state.lock().expect("lock poisoned");
+                let synced = state.current();
+                state.durable = synced;
+                Ok(())
+            }
+
+            fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+                let mut state = self.state.lock().expect("lock poisoned");
+                let end = offset as usize + data.len();
+                if end > state.durable.len() {
+                    state.durable.resize(end, 0);
+                }
+                state.durable[offset as usize..end].copy_from_slice(data);
+                Ok(())
+            }
+        }
+
+        /// 新規（空）の [`PowerLossBackend`] 上に `redb::Database` を開く。
+        fn open_fresh() -> (PowerLossBackend, redb::Database) {
+            let backend = PowerLossBackend::new();
+            let db = redb::Builder::new()
+                .create_with_backend(backend.clone())
+                .expect("open fresh database on PowerLossBackend");
+            (backend, db)
+        }
+
+        /// 指定バイト列を初期像として `redb::Database` を開き直す（「電源断後の再起動」に
+        /// 相当）。破損像で開けない場合は `Err` をそのまま返す。
+        fn reopen_from_image(
+            image: Vec<u8>,
+        ) -> std::result::Result<redb::Database, redb::DatabaseError> {
+            redb::Builder::new().create_with_backend(PowerLossBackend::from_bytes(image))
+        }
+
+        // シナリオ 4（PERSIST-3 の電源断拡張）: RLS フィールドが電源断後も無傷で保持される。
+        // `PowerLossBackend` で差し替えた `redb::Database` を、本モジュール（`storage` の
+        // 子孫）の特権で `Storage { db }` へ直接渡し（公開 API のバイパス用コンストラクタは
+        // 追加しない）、書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の
+        // `encode_row`/`decode_row` を経由させる。電源断前後どちらも `Storage::get` で
+        // 読み出して同じ内容が復元されることを確認する。
+        #[test]
+        fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
+            let (backend, raw_db) = open_fresh();
+            let storage = Storage { db: raw_db };
+
+            storage
+                .put(
+                    1,
+                    &RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[],
+                        metadata: &[],
+                    },
+                )
+                .expect("put row 1 via production Storage API");
+            storage
+                .put(
+                    2,
+                    &RowInput {
+                        tenant_id: "tenant-b",
+                        visibility: Visibility::Private,
+                        embedding: &[],
+                        metadata: &[],
+                    },
+                )
+                .expect("put row 2 via production Storage API");
+
+            let row1_before = storage
+                .get(1)
+                .expect("decode row 1 via production Storage API before crash");
+            let row2_before = storage
+                .get(2)
+                .expect("decode row 2 via production Storage API before crash");
+
+            let crash_image = backend.durable_snapshot();
+            drop(storage);
+
+            let recovered_raw_db =
+                reopen_from_image(crash_image).expect("reopen after crash must succeed");
+            let recovered_storage = Storage {
+                db: recovered_raw_db,
+            };
+
+            let row1_after = recovered_storage
+                .get(1)
+                .expect("decode row 1 via production Storage API after crash");
+            assert_eq!(
+                row1_after, row1_before,
+                "row 1 は電源断前後で production decode_row の結果が完全一致していなければならない"
+            );
+            assert_eq!(row1_after.tenant_id, "tenant-a");
+            assert_eq!(row1_after.visibility, Visibility::Public);
+
+            let row2_after = recovered_storage
+                .get(2)
+                .expect("decode row 2 via production Storage API after crash");
+            assert_eq!(
+                row2_after, row2_before,
+                "row 2 は電源断前後で production decode_row の結果が完全一致していなければならない"
+            );
+            assert_eq!(row2_after.tenant_id, "tenant-b");
+            assert_eq!(row2_after.visibility, Visibility::Private);
+        }
     }
 }
