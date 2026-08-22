@@ -6,8 +6,10 @@
 //! ワークスペース内での相互参照は path 依存に限る
 //! （.claude/rules/coding-rust.md: workspace 構成の責務境界を跨ぐ依存を作らない）。
 //!
-//! 対応: TASK-66（基盤・工程管理。ポインタ: `docs/spec/05-tasks.md`）。
-//! 検索カーネル・認証・RLS 等の実ロジックは後続タスクで追加する。
+//! 対応: TASK-66（基盤・工程管理）・TASK-140（`redb` 永続化層。ポインタ:
+//! `docs/spec/05-tasks.md`）。検索カーネル・認証・RLS 等の実ロジックは後続タスクで追加する。
+
+pub mod storage;
 
 /// engine クレートの識別子。
 ///
