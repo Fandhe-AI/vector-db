@@ -39,6 +39,17 @@ const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
 /// 永続化層に依存する際は、この上限付きページングを使う前提とする。
 const MAX_SCAN_PAGE_LIMIT: u32 = 10_000;
 
+/// [`Storage::scan`] が一度に確保してよい行数の上限（無制限 `Vec` 確保を避けるための
+/// 契約。security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。超過時は
+/// [`StorageError::ScanLimitExceeded`] で fail-closed に拒否し、呼び出し元へは
+/// 上限付きページング API [`Storage::scan_page`] の利用を促す。
+const MAX_SCAN_TOTAL_ROWS: usize = 100_000;
+
+/// [`Storage::scan`] が確保してよいデコード対象バイト量（エンコード済みバイト列長で近似）の
+/// 上限。[`MAX_SCAN_TOTAL_ROWS`] だけでは最大サイズの行が並んだ場合に巨大確保になり得るため、
+/// 行数とバイト量の両方で上限を課す（[`MAX_SCAN_PAGE_BYTES`] と同様の考え方）。
+const MAX_SCAN_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// [`Storage::scan_page`] が 1 ページで確保するデコード後バイト量（embedding + metadata）の
 /// 上限。行数の上限（[`MAX_SCAN_PAGE_LIMIT`]）だけでは、最大サイズ（[`MAX_EMBEDDING_DIM`]・
 /// [`MAX_METADATA_LEN`] 相当）の行が並んだ場合に依然として数十 GB 規模の確保になり得るため、
@@ -58,6 +69,10 @@ pub enum StorageError {
     Codec(String),
     /// 指定した行 ID が存在しない。
     NotFound(u64),
+    /// [`Storage::scan`] の対象行数・バイト量が上限（[`MAX_SCAN_TOTAL_ROWS`]・
+    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過したため fail-closed に拒否した。
+    /// 呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
+    ScanLimitExceeded,
 }
 
 impl fmt::Display for StorageError {
@@ -66,6 +81,7 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
+            StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
         }
     }
 }
@@ -74,7 +90,9 @@ impl std::error::Error for StorageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             StorageError::Backend(e) => Some(e),
-            StorageError::Codec(_) | StorageError::NotFound(_) => None,
+            StorageError::Codec(_)
+            | StorageError::NotFound(_)
+            | StorageError::ScanLimitExceeded => None,
         }
     }
 }
@@ -174,11 +192,12 @@ impl Storage {
 
     /// 全行をスナップショット読み取りで走査する（対象ビヘイビア: PERSIST-4）。
     ///
-    /// 行数に上限がなく、一度にすべての行を `Vec<Row>` へデコードして返すため、
-    /// 行数が大きいデータベースでは巨大なメモリ確保が発生し得る
-    /// （security.md「不安全な設計｜無制限リソース確保（DoS）」）。テスト・小規模データ用の
-    /// 簡易 API として残し、後続タスク（検索カーネル等）から呼び出す場合は
-    /// 上限付きの [`Storage::scan_page`] を使うこと。
+    /// 総行数が [`MAX_SCAN_TOTAL_ROWS`]、総バイト量（エンコード済みバイト列長で近似）が
+    /// [`MAX_SCAN_TOTAL_BYTES`] のいずれかを超える場合は、部分的な結果を黙って切り詰めず
+    /// [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する
+    /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    /// 大規模データベースを扱う呼び出し元（検索カーネル等）は、この上限を前提にせず
+    /// 上限付きページング API [`Storage::scan_page`] を使うこと。
     pub fn scan(&self) -> Result<Vec<Row>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(ROWS_TABLE) {
@@ -187,9 +206,17 @@ impl Storage {
             Err(e) => return Err(e.into()),
         };
         let mut out = Vec::new();
+        let mut bytes_used: usize = 0;
         for entry in table.iter()? {
             let (k, v) = entry?;
-            out.push(decode_row(k.value(), v.value())?);
+            let raw = v.value();
+            if out.len() >= MAX_SCAN_TOTAL_ROWS
+                || bytes_used.saturating_add(raw.len()) > MAX_SCAN_TOTAL_BYTES
+            {
+                return Err(StorageError::ScanLimitExceeded);
+            }
+            bytes_used = bytes_used.saturating_add(raw.len());
+            out.push(decode_row(k.value(), raw)?);
         }
         Ok(out)
     }
