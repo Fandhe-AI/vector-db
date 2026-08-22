@@ -2,10 +2,9 @@
 //! PERSIST-1, PERSIST-2, PERSIST-4。ポインタ: `docs/spec/04-behavior/persistence.md`）。
 //!
 //! PERSIST-1・PERSIST-4 の検証は `Storage` の公開 API だけでは表現できないトランザクション
-//! 境界（未コミットのまま中断・書き込みの直列化）に踏み込むため、テストスコープでのみ
-//! `redb` を直接操作する（`crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。
-//! プロセス強制終了（SIGKILL）を伴うクラッシュ再現の CI ジョブ化は TASK-142 のスコープ、
-//! 増分書き込みの所要時間比の回帰測定は TASK-143 のスコープのため、本ファイルには含めない。
+//! 境界に踏み込むため、テストスコープでのみ `redb` を直接操作する
+//! （`crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。
+//! TASK-142・TASK-143 は本ファイルのスコープ外（ポインタ: `docs/spec/05-tasks.md`）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,8 +50,7 @@ fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     }
 }
 
-// PERSIST-1: commit 前に書き込みトランザクションを中断した場合、直前にコミット済みの
-// データは無傷であり、中断された書き込みは反映されないこと（`redb` の ACID 保証）。
+// 対象ビヘイビア: PERSIST-1（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
 #[test]
 fn persist1_uncommitted_write_is_discarded_and_committed_data_survives_reopen() {
     let path = unique_db_path("persist1");
@@ -94,14 +92,20 @@ fn persist1_uncommitted_write_is_discarded_and_committed_data_survives_reopen() 
     assert_eq!(committed.embedding, vec![1.0, 2.0, 3.0]);
     assert_eq!(committed.metadata, b"committed");
 
+    // `NotFound` まで確認することで、abort が commit に退行して行 2 が書き込まれてしまう
+    // ケースが Codec エラー等の別理由の失敗と混同されて誤って pass するのを防ぐ
+    // （`is_err()` だけでは区別できない）。
+    let err = storage
+        .get(2)
+        .expect_err("aborted write must not be visible after reopen");
     assert!(
-        storage.get(2).is_err(),
-        "aborted write must not be visible after reopen"
+        matches!(err, StorageError::NotFound(_)),
+        "expected row 2 to be reported as NotFound, got: {err}"
     );
 }
 
-// PERSIST-2: 既存データを保持したまま増分書き込みが反映されること（全体再構築を伴わない
-// 追記の機能検証。所要時間比の回帰測定は TASK-143 のスコープのため本テストには含めない）。
+// 対象ビヘイビア: PERSIST-2（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
+// TASK-143 は本テストのスコープ外。
 #[test]
 fn persist2_incremental_write_preserves_existing_rows() {
     let path = unique_db_path("persist2");
@@ -148,10 +152,7 @@ fn persist2_incremental_write_preserves_existing_rows() {
     assert_eq!(appended.metadata, b"incremental");
 }
 
-// PERSIST-2: バッチ途中の行でエンコードが失敗した場合（例: メタデータ長超過）、
-// トランザクション全体が破棄され、それより前の行も一切反映されないこと
-// （`put_batch` は encode 失敗時に即 `Err` を返し、書き込みトランザクションが
-// commit されないまま drop = abort される想定）。
+// 対象ビヘイビア: PERSIST-2（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
 #[test]
 fn persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure() {
     let path = unique_db_path("persist2-partial-failure");
@@ -195,9 +196,7 @@ fn persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure() {
     );
 }
 
-// PERSIST-4: 書き込みトランザクションが直列化されること（`begin_write` の排他ロック）、
-// および書き込み進行中に開始した読み取りが開始時点のスナップショットを見ること
-// （未コミットの変更が見えないこと）を検証する。
+// 対象ビヘイビア: PERSIST-4（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
 #[test]
 fn persist4_writes_are_serialized_and_reads_see_snapshot() {
     let path = unique_db_path("persist4");
