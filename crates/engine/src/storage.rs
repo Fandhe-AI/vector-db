@@ -152,14 +152,17 @@ impl Visibility {
     const PUBLIC_BYTE: u8 = 0x01;
     const PRIVATE_BYTE: u8 = 0x02;
 
-    fn to_byte(self) -> u8 {
+    // `pub(crate)`: `row_codec.rs`（TASK-86）が独立フォーマットの行コーデックで
+    // 同じ `Visibility` 型を再利用し、未知バイトの `Err` 拒否をそのまま活かすための
+    // 最小限の公開範囲拡張（既存の v2 行フォーマット・`Storage` 公開 API 自体は変更しない）。
+    pub(crate) fn to_byte(self) -> u8 {
         match self {
             Visibility::Public => Self::PUBLIC_BYTE,
             Visibility::Private => Self::PRIVATE_BYTE,
         }
     }
 
-    fn from_byte(byte: u8) -> Result<Self> {
+    pub(crate) fn from_byte(byte: u8) -> Result<Self> {
         match byte {
             Self::PUBLIC_BYTE => Ok(Visibility::Public),
             Self::PRIVATE_BYTE => Ok(Visibility::Private),
