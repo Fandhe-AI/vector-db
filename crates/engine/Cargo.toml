@@ -18,8 +18,8 @@ path = "src/lib.rs"
 redb = "=4.2.0"
 
 [dev-dependencies]
-# tests/persistence.rs（対象ビヘイビア: PERSIST-1, PERSIST-4）が、Storage の公開 API
-# では表現できないトランザクション境界に踏み込んで検証するために同一バージョンの
-# redb を直接操作する。新規依存の追加ではなく上記と同一クレート・バージョンを
-# テストスコープでも利用するのみ。
+# tests/persistence.rs・tests/power_loss.rs（対象ビヘイビア: PERSIST-1, PERSIST-4）が、
+# Storage の公開 API では表現できないトランザクション境界・`StorageBackend` 差し替えに
+# 踏み込んで検証するために同一バージョンの redb を直接操作する。新規依存の追加ではなく
+# 上記と同一クレート・バージョンをテストスコープでも利用するのみ。
 redb = "=4.2.0"

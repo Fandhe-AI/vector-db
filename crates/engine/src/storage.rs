@@ -18,6 +18,13 @@ use std::path::Path;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+/// 電源断シミュレーション用 `redb::StorageBackend` の共通モデル（TASK-145）。
+/// 本クレートのユニットテスト（本モジュール下部の `tests::power_loss`）と
+/// `crates/engine/tests/power_loss.rs` 統合テストの双方から `#[path]` 経由で
+/// 同一ソースを取り込む。テストコードのみで使うため通常ビルドには含めない。
+#[cfg(test)]
+mod power_loss_model;
+
 /// 行データを格納するテーブル。キーは行 ID（`u64`）、値は [`encode_row`] でエンコードした
 /// バイト列。テーブル名は `docs/spec` 側の成果物指定に依存しないローカルな識別子。
 ///
@@ -442,7 +449,10 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     }
     let mut offset = 1usize;
 
-    let tenant_len_bytes = buf.get(offset..offset + 2).ok_or_else(|| {
+    let tenant_len_field_end = offset
+        .checked_add(2)
+        .ok_or_else(|| StorageError::Codec("offset overflow at tenant_len field".to_string()))?;
+    let tenant_len_bytes = buf.get(offset..tenant_len_field_end).ok_or_else(|| {
         StorageError::Codec("row buffer truncated at tenant_len field".to_string())
     })?;
     let tenant_len_arr: [u8; 2] = tenant_len_bytes
@@ -482,8 +492,11 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
         .checked_add(1)
         .ok_or_else(|| StorageError::Codec("offset overflow after visibility field".to_string()))?;
 
+    let dim_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at dim field".to_string()))?;
     let dim_bytes = buf
-        .get(offset..offset + 4)
+        .get(offset..dim_field_end)
         .ok_or_else(|| StorageError::Codec("row buffer truncated at dim field".to_string()))?;
     let dim_arr: [u8; 4] = dim_bytes
         .try_into()
@@ -517,7 +530,10 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     }
     offset = embedding_end;
 
-    let metadata_len_bytes = buf.get(offset..offset + 4).ok_or_else(|| {
+    let metadata_len_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at metadata_len field".to_string()))?;
+    let metadata_len_bytes = buf.get(offset..metadata_len_field_end).ok_or_else(|| {
         StorageError::Codec("row buffer truncated at metadata_len field".to_string())
     })?;
     let metadata_len_arr: [u8; 4] = metadata_len_bytes
@@ -882,5 +898,220 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:
+    /// `docs/spec/05-tasks.md`。関連ビヘイビア: PERSIST-3、ポインタ:
+    /// `docs/spec/04-behavior/persistence.md`）。検証対象の契約内容は上記ポインタ先を
+    /// 参照。他シナリオは
+    /// `crates/engine/tests/power_loss.rs`（raw `redb::Database` を直接操作する統合テスト）
+    /// を参照。
+    ///
+    /// 本サブモジュールを `crate` 内の `#[cfg(test)]` に閉じているのは、本番の
+    /// `Storage::put`/`Storage::get`（＝実際の `encode_row`/`decode_row`）経由で検証
+    /// しつつ、`Storage` の公開 API へバックエンド差し替え用のコンストラクタを一切
+    /// 増やさないため。`Storage { db }` の private フィールドへは同一クレート内の
+    /// 子モジュールから直接アクセスできるので、feature 限定の `pub fn` を用意せずに
+    /// テスト専用の `redb::Database`（`StorageBackend` 差し替え済み）を渡せる。
+    mod power_loss {
+        use super::*;
+
+        // 電源断シミュレーション用 `StorageBackend` の基本実装（`BackendState`/
+        // `PowerLossBackend`）は `crates/engine/tests/power_loss.rs` と共有する
+        // ため `power_loss_model`（`crate::storage::power_loss_model`）へ分離済み。
+        // 詳細・分離理由は同モジュールの doc を参照。
+        use crate::storage::power_loss_model::PowerLossBackend;
+        use redb::StorageBackend;
+
+        /// 新規（空）の [`PowerLossBackend`] 上に `redb::Database` を開く。
+        fn open_fresh() -> (PowerLossBackend, redb::Database) {
+            let backend = PowerLossBackend::new();
+            let db = redb::Builder::new()
+                .create_with_backend(backend.clone())
+                .expect("open fresh database on PowerLossBackend");
+            (backend, db)
+        }
+
+        /// 指定バイト列を初期像として `redb::Database` を開き直す（「電源断後の再起動」に
+        /// 相当）。破損像で開けない場合は `Err` をそのまま返す。
+        fn reopen_from_image(
+            image: Vec<u8>,
+        ) -> std::result::Result<redb::Database, redb::DatabaseError> {
+            redb::Builder::new().create_with_backend(PowerLossBackend::from_bytes(image))
+        }
+
+        // シナリオ 4（対応する契約: PERSIST-3。ポインタ: `docs/spec/04-behavior/persistence.md`）。
+        // `PowerLossBackend` で差し替えた `redb::Database` を、本モジュール（`storage` の
+        // 子孫）の特権で `Storage { db }` へ直接渡し（公開 API のバイパス用コンストラクタは
+        // 追加しない）、書き込み（`Storage::put`）・読み出し（`Storage::get`）ともに本番の
+        // `encode_row`/`decode_row` を経由させる。電源断前後どちらも `Storage::get` で
+        // 読み出して同じ内容が復元されることを確認する。
+        #[test]
+        fn power_loss_scenario4_rls_fields_survive_crash_after_commit() {
+            let (backend, raw_db) = open_fresh();
+            let storage = Storage { db: raw_db };
+
+            // embedding/metadata は空スライスにしない。空だと encoder/decoder が
+            // これらのフィールドを常に欠落させる退行があっても電源断前後の比較が
+            // 偶然一致してしまい、「全フィールド保持」を検証したことにならない。
+            let row1_embedding = [0.5_f32, -1.0, 2.25];
+            let row1_metadata = b"row1-metadata".to_vec();
+            let row2_embedding = [3.0_f32, 0.0, -4.5, 1.25];
+            let row2_metadata = b"row2-metadata".to_vec();
+
+            storage
+                .put(
+                    1,
+                    &RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &row1_embedding,
+                        metadata: &row1_metadata,
+                    },
+                )
+                .expect("put row 1 via production Storage API");
+            storage
+                .put(
+                    2,
+                    &RowInput {
+                        tenant_id: "tenant-b",
+                        visibility: Visibility::Private,
+                        embedding: &row2_embedding,
+                        metadata: &row2_metadata,
+                    },
+                )
+                .expect("put row 2 via production Storage API");
+
+            // `Storage::put` の commit が実際に `sync_data()` まで完了していることを
+            // 確認してから `durable_snapshot()` を電源断像として使う。ここを確認しないと、
+            // 仮に `PowerLossBackend::write` が sync を待たず durable へ書き戻す実装（本来は
+            // 契約違反）へ退行しても本テストが検出できなくなる。
+            assert_eq!(
+                backend.pending_write_count(),
+                0,
+                "Storage::put の commit 完了後は log が sync 済みで空になっているはず \
+                 （0 件でなければ、まだ sync されていない書き込みを電源断像に含めてしまう）"
+            );
+
+            let row1_before = storage
+                .get(1)
+                .expect("decode row 1 via production Storage API before crash");
+            let row2_before = storage
+                .get(2)
+                .expect("decode row 2 via production Storage API before crash");
+
+            let crash_image = backend.durable_snapshot();
+            drop(storage);
+
+            let recovered_raw_db =
+                reopen_from_image(crash_image).expect("reopen after crash must succeed");
+            let recovered_storage = Storage {
+                db: recovered_raw_db,
+            };
+
+            let row1_after = recovered_storage
+                .get(1)
+                .expect("decode row 1 via production Storage API after crash");
+            assert_eq!(
+                row1_after, row1_before,
+                "row 1 は電源断前後で production decode_row の結果が完全一致していなければならない"
+            );
+            assert_eq!(row1_after.tenant_id, "tenant-a");
+            assert_eq!(row1_after.visibility, Visibility::Public);
+            assert_eq!(
+                row1_after.embedding, row1_embedding,
+                "row 1 の embedding フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+            assert_eq!(
+                row1_after.metadata, row1_metadata,
+                "row 1 の metadata フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+
+            let row2_after = recovered_storage
+                .get(2)
+                .expect("decode row 2 via production Storage API after crash");
+            assert_eq!(
+                row2_after, row2_before,
+                "row 2 は電源断前後で production decode_row の結果が完全一致していなければならない"
+            );
+            assert_eq!(row2_after.tenant_id, "tenant-b");
+            assert_eq!(row2_after.visibility, Visibility::Private);
+            assert_eq!(
+                row2_after.embedding, row2_embedding,
+                "row 2 の embedding フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+            assert_eq!(
+                row2_after.metadata, row2_metadata,
+                "row 2 の metadata フィールドが電源断後も欠落・変質なく保持されているはず"
+            );
+        }
+
+        // 否定コントロール: `sync_data()` を呼ばない限り `write()` の内容は
+        // `durable_snapshot()`（＝電源断で必ず残る像）へ反映されないことを直接確認する。
+        // これがないと、`PowerLossBackend::write` が sync を待たず即座に `durable` を
+        // 書き換える実装（commit/sync 契約違反）へ退行しても、シナリオ 4 は偶然
+        // 成功し続けてしまう（恒真化）。`StorageBackend` トレイトのメソッドを
+        // `redb::Database` を介さず直接呼び、モデルの sync ゲーティングだけを検証する。
+        #[test]
+        fn power_loss_backend_durable_image_excludes_writes_until_sync_data() {
+            let backend = PowerLossBackend::new();
+
+            backend
+                .write(0, b"uncommitted-write")
+                .expect("write to backend");
+            assert_eq!(
+                backend.pending_write_count(),
+                1,
+                "write() は log に記録されているはず（0 件だと本テストは何も検証していない）"
+            );
+            assert!(
+                backend.durable_snapshot().is_empty(),
+                "sync_data() を呼ぶ前は、write() の内容が durable_snapshot()（電源断で \
+                 必ず残る像）へ反映されていてはならない"
+            );
+
+            backend.sync_data().expect("sync_data");
+            assert_eq!(
+                backend.pending_write_count(),
+                0,
+                "sync_data() 後は log が空になっているはず"
+            );
+            assert_eq!(
+                backend.durable_snapshot(),
+                b"uncommitted-write",
+                "sync_data() を呼んだ後は、write() の内容が durable_snapshot() へ \
+                 反映されていなければならない"
+            );
+        }
+
+        // 退行検出用: `write()` が現在の EOF を越える offset へ書き込んだ場合に
+        // `len()` が追従して伸長することを直接確認する。ここを確認しないと、
+        // `write()` が `log` へ積むだけで `state.len` を更新しない実装（EOF 越え
+        // write を無視する契約違反）へ退行しても検出できない。`len()` が古いままだと、
+        // `sync_data()` 後の `durable_snapshot()` の実長が `len()` の申告値を超え、
+        // `redb` から見た「ファイル長」と実データが矛盾する。
+        #[test]
+        fn power_loss_backend_write_past_eof_extends_len() {
+            let backend = PowerLossBackend::from_bytes(b"short".to_vec());
+            assert_eq!(backend.len().expect("len before write"), 5);
+
+            // 既存の 5 バイトより後ろ（offset 10）へ書き込み、EOF を越えて伸長させる。
+            backend.write(10, b"tail").expect("write past current EOF");
+            assert_eq!(
+                backend.len().expect("len after EOF-crossing write"),
+                14,
+                "write() が EOF を越えた分だけ len() も伸長しているはず"
+            );
+
+            backend.sync_data().expect("sync_data");
+            let durable = backend.durable_snapshot();
+            assert_eq!(
+                durable.len(),
+                backend.len().expect("len after sync_data") as usize,
+                "sync_data() 後は durable_snapshot() の実長が len() の申告値と \
+                 一致していなければならない（不一致は EOF 越え write で len が \
+                 追従しない退行の兆候）"
+            );
+        }
     }
 }
