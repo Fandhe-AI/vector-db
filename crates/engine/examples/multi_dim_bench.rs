@@ -95,12 +95,16 @@ struct WriteResult {
 fn summarize(mut latencies: Vec<Duration>, total: Duration, rows: u64) -> WriteResult {
     latencies.sort_unstable();
     let op_count = latencies.len();
+    // nearest-rank 法（rank = ceil(n * p)、0 始まり添字は rank - 1）で算出する。
+    // floor(n * p) をそのまま添字にすると 1 件上にずれる
+    // （例: n=40, p=0.95 で floor は idx=38 になるが正しくは idx=37）。
     let percentile = |p: f64| -> Duration {
         if op_count == 0 {
             return Duration::ZERO;
         }
-        let idx = ((op_count as f64) * p).floor() as usize;
-        latencies[idx.min(op_count - 1)]
+        let rank = ((op_count as f64) * p).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(op_count - 1);
+        latencies[idx]
     };
     let rows_per_sec = if total.as_secs_f64() > 0.0 {
         rows as f64 / total.as_secs_f64()
