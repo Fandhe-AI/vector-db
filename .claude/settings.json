@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'vector-db: 日本語でやりとり / 作業は subagent へ委譲し main 消費を抑える (delegation.md, delegation-impl.md) / Conventional Commits 厳守 (--no-verify 禁止) / docs/spec (private) の本文を public 資産へ転記しない (spec-confidentiality.md) / 依存追加はユーザー承認 + =x.y.z 完全固定 / implement-issue は計画承認後に実装'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh -c 'command -v jq >/dev/null 2>&1 || exit 0; f=$(jq -r \".tool_input.file_path // empty\"); case \"$f\" in *.rs) command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2024 -- \"$f\" 2>/dev/null;; esac; exit 0'"
+          }
+        ]
+      }
+    ]
+  }
+}
