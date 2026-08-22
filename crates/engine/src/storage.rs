@@ -33,6 +33,29 @@ mod power_loss_model;
 /// 直接構築するために参照する。
 pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
+/// バッチ台帳テーブル（TASK-90、対象ビヘイビア: TABLE-10。ポインタ:
+/// `docs/spec/05-tasks.md` TASK-90・`docs/spec/04-behavior/data-model.md` TABLE-10）。
+/// キーはバッチ通番（`batch_seq`、0 起点で連番）、値はそのバッチで [`ROWS_TABLE`] へ
+/// 新規挿入した行数。[`ROWS_TABLE`] と同一の `redb::WriteTransaction` 内でのみ書き込む
+/// （`txn.rs` の [`crate::txn::BatchWriteTxn::log_batch`]）ことで、2 テーブル横断の
+/// トランザクション原子性（同時にコミットされる／同時に破棄される）を製品コード経路で
+/// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
+/// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
+///
+/// **契約の適用範囲（重要）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の行総数」という
+/// 不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ書き込んだ場合に
+/// のみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・`EmptyBatch`・
+/// `UnloggedRows`・上書き非カウントの各チェック）によって保証される。[`Storage::put`]・
+/// [`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を経由しない別経路）は
+/// 台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
+/// [`crate::txn::BatchWriteTxn`] を同一 DB・同一テーブルに対して混在させると、上記の
+/// 不変条件は成立しなくなる。これは型システムでは検出できない呼び出し元の責務であり、
+/// 本モジュールは意図的にそれを強制しない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf
+/// 対応。「台帳合計 == 行総数」を保証する範囲を、実際に型で保証できる範囲まで明文化して
+/// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
+/// [`crate::txn::BatchWriteTxn`] に一本化すること。
+pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
+
 /// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
 /// `visibility`）を同居させるレイアウトへ拡張した。v1 の行は RLS フィールドを持たず、
 /// 暗黙のデフォルトテナント・可視性で読み出すのは fail-open（P0 違反）になるため、
@@ -83,6 +106,13 @@ const MAX_SCAN_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 /// `scan_table_page` が再利用する。
 pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 
+/// [`Storage::scan_batch_log`] が一度に確保してよいエントリ数の上限（[`MAX_SCAN_TOTAL_ROWS`]
+/// と同様、無制限 `Vec` 確保を避けるための契約。security.md「不安全な設計｜無制限リソース
+/// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
+/// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
+/// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する。
+const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -97,9 +127,31 @@ pub enum StorageError {
     /// 指定した行 ID が存在しない。
     NotFound(u64),
     /// [`Storage::scan`] の対象行数・バイト量が上限（[`MAX_SCAN_TOTAL_ROWS`]・
-    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過したため fail-closed に拒否した。
-    /// 呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
+    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過、または [`Storage::scan_batch_log`] のエントリ数が
+    /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した。
+    /// `scan` の呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
     ScanLimitExceeded,
+    /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
+    /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
+    /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
+    /// に拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
+    DuplicateBatchSeq(u64),
+    /// [`crate::txn::BatchWriteTxn`] の内部カウンタ（直近の `log_batch` 以降に `put` した
+    /// 行数）が `u64` を溢れた。実運用では到達し得ない防御的分岐だが、undefined な
+    /// ラップアラウンドで台帳の行数契約を壊さないよう checked 演算で明示的に検出する
+    /// （coding-rust.md「整数演算は checked_* / saturating_* を使う」対応）。
+    PendingRowCountOverflow,
+    /// [`crate::txn::BatchWriteTxn`] で新規挿入した行を、直近の `log_batch` 以降まだ台帳へ
+    /// 記録しないまま [`crate::txn::BatchWriteTxn::commit`] しようとした。台帳に記録され
+    /// ない行が commit で確定すると「台帳の row_count 合計 == 行総数」という TABLE-10 の
+    /// 不変条件を [`crate::txn::BatchWriteTxn`] の公開 API だけで壊せるため fail-closed に
+    /// 拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
+    UnloggedRows(u64),
+    /// [`crate::txn::BatchWriteTxn::log_batch`] を、直近の呼び出し以降 1 件も
+    /// [`crate::txn::BatchWriteTxn::put`]（新規挿入）していない状態で呼んだ。クラッシュ
+    /// 検証ツールの検証オラクル（台帳の各エントリ値 == 実際にコミットされたバッチ
+    /// サイズ）と食い違うゼロ件エントリを台帳へ残さないよう fail-closed に拒否する。
+    EmptyBatch,
 }
 
 impl fmt::Display for StorageError {
@@ -109,6 +161,16 @@ impl fmt::Display for StorageError {
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
             StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
+            StorageError::DuplicateBatchSeq(seq) => {
+                write!(f, "duplicate batch seq: seq={seq}")
+            }
+            StorageError::PendingRowCountOverflow => {
+                write!(f, "pending row count overflow: split into smaller batches")
+            }
+            StorageError::UnloggedRows(count) => {
+                write!(f, "unlogged rows before commit: count={count}")
+            }
+            StorageError::EmptyBatch => write!(f, "empty batch: no rows put since last log_batch"),
         }
     }
 }
@@ -119,7 +181,11 @@ impl std::error::Error for StorageError {
             StorageError::Backend(e) => Some(e),
             StorageError::Codec(_)
             | StorageError::NotFound(_)
-            | StorageError::ScanLimitExceeded => None,
+            | StorageError::ScanLimitExceeded
+            | StorageError::DuplicateBatchSeq(_)
+            | StorageError::PendingRowCountOverflow
+            | StorageError::UnloggedRows(_)
+            | StorageError::EmptyBatch => None,
         }
     }
 }
@@ -374,6 +440,31 @@ impl Storage {
             None
         };
         Ok((out, cursor_for_next))
+    }
+
+    /// [`BATCH_LOG_TABLE`] の全エントリを `batch_seq` 昇順で読み出す（対象ビヘイビア:
+    /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
+    ///
+    /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
+    /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で fail-closed
+    /// に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」対応。バッチ台帳は
+    /// コミットごとに増え続けるため、大きな DB では無制限確保がメモリ枯渇につながり得る）。
+    pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(BATCH_LOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            if out.len() >= MAX_BATCH_LOG_ROWS {
+                return Err(StorageError::ScanLimitExceeded);
+            }
+            let (k, v) = entry?;
+            out.push((k.value(), v.value()));
+        }
+        Ok(out)
     }
 }
 

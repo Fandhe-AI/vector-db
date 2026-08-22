@@ -28,7 +28,7 @@ vector-db/
 │   ├── design/                    # 設計ドキュメント（ADR 形式・public）
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test の CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table の CI
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
@@ -36,7 +36,7 @@ vector-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-├── scripts/                       # 補助スクリプト（crash_test.sh 等。make 経由で実行）
+├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_cross_table.sh 等。make 経由で実行）
 ├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
 └── crates/                        # engine（lib）/ wire-server（bin）workspace
 ```

@@ -475,6 +475,26 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::ScanLimitExceeded => {
             CatalogError::Invalid("scan limit exceeded: use a bounded page scan".to_string())
         }
+        // `log_batch`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
+        // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない
+        // 分岐だが `StorageError` の網羅性のためここでも扱い、Invalid へ一般化する。
+        StorageError::DuplicateBatchSeq(seq) => {
+            CatalogError::Invalid(format!("duplicate batch seq: seq={seq}"))
+        }
+        // `WriteTxn` の内部カウンタ（バッチ台帳専用）のエラーで、カタログ層の
+        // 行テーブル操作からは到達しない。`StorageError` の網羅性のためここでも扱う。
+        StorageError::PendingRowCountOverflow => {
+            CatalogError::Invalid("pending row count overflow".to_string())
+        }
+        // `log_batch`/`commit` の未台帳行チェック・空バッチ拒否も同様にバッチ台帳
+        // 専用のエラーで、カタログ層（`db().begin_write()` による生 redb トランザクション
+        // 経由）からは到達しない。`StorageError` の網羅性のためここでも扱う。
+        StorageError::UnloggedRows(count) => {
+            CatalogError::Invalid(format!("unlogged rows before commit: count={count}"))
+        }
+        StorageError::EmptyBatch => {
+            CatalogError::Invalid("empty batch: no rows put since last log_batch".to_string())
+        }
     }
 }
 
