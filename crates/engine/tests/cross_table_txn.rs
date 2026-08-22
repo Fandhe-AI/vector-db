@@ -149,3 +149,45 @@ fn table10_batch_totals_match_row_count_and_survive_reopen() {
     let total_from_log: u64 = batch_log.iter().map(|(_, count)| count).sum();
     assert_eq!(total_from_log, rows.len() as u64);
 }
+
+// 対象ビヘイビア: TABLE-10。既存 batch_seq への 2 度目の log_batch は
+// `StorageError::DuplicateBatchSeq` で拒否され、既存エントリを黙って上書きしないこと
+// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbFyu 対応）。呼び出し元の採番バグ・
+// 再試行ミスがあっても台帳の不変条件（batch_seq ごとに 1 エントリ）を守る。
+#[test]
+fn table10_log_batch_rejects_duplicate_seq_and_preserves_existing_entry() {
+    let path = unique_db_path("duplicate-batch-seq-rejected");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    txn.log_batch(0, 1).expect("log_batch first write");
+    txn.commit().expect("commit first batch");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    let err = txn
+        .log_batch(0, 99)
+        .expect_err("duplicate batch_seq must be rejected");
+    assert!(matches!(
+        err,
+        engine::storage::StorageError::DuplicateBatchSeq(0)
+    ));
+    // トランザクション自体は commit せず破棄し、行 1 も台帳の上書きも確定させない
+    // （呼び出し元は log_batch のエラーを見てトランザクション全体を中断する想定）。
+    txn.abort().expect("abort after duplicate detected");
+
+    assert_eq!(
+        storage.scan_batch_log().expect("scan_batch_log"),
+        vec![(0, 1)],
+        "existing batch_log entry must remain unchanged"
+    );
+    let get_err = storage
+        .get(1)
+        .expect_err("row from aborted duplicate txn must not exist");
+    assert!(matches!(
+        get_err,
+        engine::storage::StorageError::NotFound(1)
+    ));
+}

@@ -9,7 +9,7 @@
 //! ハンドルの取得に使われる想定であり、本モジュールはポリシー評価（RLS 事前フィルタ等）を
 //! 行わない（`storage.rs` と同方針）。
 
-use redb::ReadableDatabase;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::{
     decode_row, encode_row, Row, RowInput, Storage, StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
@@ -134,11 +134,16 @@ impl WriteTxn {
     /// [`WriteTxn::abort`] のどちらを呼んでも [`ROWS_TABLE`] への行書き込みと本エントリは
     /// 常に運命を共にする（2 テーブル横断で原子的にコミット／破棄される）。
     ///
-    /// `batch_seq` を呼び出し元の設計（例: 0 起点の連番）と異なる値で 2 度書き込むと
-    /// 既存エントリを上書きする（`redb` の `insert` 契約）。呼び出し元は連番管理の
-    /// 責務を負う（本モジュールは重複検出をしない）。
+    /// 既存の `batch_seq` を渡すと [`StorageError::DuplicateBatchSeq`] で fail-closed に
+    /// 拒否する（`redb` の `insert` は無条件上書きのため、検出しないと呼び出し元の
+    /// 採番バグ・再試行ミスがバッチ台帳の不変条件（`batch_seq` ごとに 1 エントリ）を
+    /// 静かに破壊する。security.md「不安全な設計」対応）。呼び出し元は連番管理の
+    /// 責務を負うが、本メソッド自体が最後の防衛線として重複を検出する。
     pub fn log_batch(&mut self, batch_seq: u64, row_count: u64) -> crate::storage::Result<()> {
         let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
+        if table.get(batch_seq)?.is_some() {
+            return Err(StorageError::DuplicateBatchSeq(batch_seq));
+        }
         table.insert(batch_seq, row_count)?;
         Ok(())
     }

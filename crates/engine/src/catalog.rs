@@ -475,6 +475,12 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::ScanLimitExceeded => {
             CatalogError::Invalid("scan limit exceeded: use a bounded page scan".to_string())
         }
+        // `log_batch`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
+        // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない
+        // 分岐だが `StorageError` の網羅性のためここでも扱い、Invalid へ一般化する。
+        StorageError::DuplicateBatchSeq(seq) => {
+            CatalogError::Invalid(format!("duplicate batch seq: seq={seq}"))
+        }
     }
 }
 

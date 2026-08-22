@@ -118,6 +118,11 @@ pub enum StorageError {
     /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した。
     /// `scan` の呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
     ScanLimitExceeded,
+    /// [`crate::txn::WriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
+    /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
+    /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
+    /// に拒否する（security.md「不安全な設計」対応。他テナント情報は含まない）。
+    DuplicateBatchSeq(u64),
 }
 
 impl fmt::Display for StorageError {
@@ -127,6 +132,9 @@ impl fmt::Display for StorageError {
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
             StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
+            StorageError::DuplicateBatchSeq(seq) => {
+                write!(f, "duplicate batch seq: seq={seq}")
+            }
         }
     }
 }
@@ -137,7 +145,8 @@ impl std::error::Error for StorageError {
             StorageError::Backend(e) => Some(e),
             StorageError::Codec(_)
             | StorageError::NotFound(_)
-            | StorageError::ScanLimitExceeded => None,
+            | StorageError::ScanLimitExceeded
+            | StorageError::DuplicateBatchSeq(_) => None,
         }
     }
 }

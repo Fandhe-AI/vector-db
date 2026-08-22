@@ -176,8 +176,9 @@ fn write_inner(path: &str) -> Result<(), String> {
     for batch_no in 0..MAX_BATCHES {
         // 既存台帳の最大通番が u64::MAX 付近の場合、無検査の加算だと debug では panic、
         // release ではラップアラウンドして既存の batch_seq=0 を再利用してしまう
-        // （`log_batch` は重複キーを拒否しないため台帳が破壊される）。checked_add で
-        // 検出し fail-closed に終了する。
+        // （`log_batch` は既存 batch_seq への上書きを DuplicateBatchSeq で拒否するが、
+        // 折り返し自体は checked_add で事前に検出し fail-closed に終了する方が
+        // 早期に・分かりやすいエラーで失敗できる）。
         let batch_seq = resume
             .next_batch_seq
             .checked_add(batch_no)
