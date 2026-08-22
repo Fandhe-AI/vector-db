@@ -15,11 +15,22 @@ version = 2
 version = 2
 include-dev = true
 # 本リポは MIT OR Apache-2.0 のデュアルライセンス。依存もこれと互換な permissive
-# ライセンスのみ許可する。allow の拡張は依存追加のユーザー承認（dependency-policy.md）と
-# セットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しないことで fail-closed に検出する。
+# ライセンスのみ許可する。allow には互換 permissive の代表集合（rust-ai-library の
+# Cargo.lock 全域実測で出現した SPDX 識別子集合と同一）を事前許可しておき、推移的依存が
+# BSD/ISC 等の一般的な permissive を持つだけで make deny が不要に失敗しないようにする
+# （PR #6 codex-review P2 指摘の是正）。ここに無い識別子の追加は依存追加のユーザー承認
+# （dependency-policy.md）とセットで行い、コピーレフト（GPL/LGPL/MPL 等）は列挙しない
+# ことで fail-closed に検出する。
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 

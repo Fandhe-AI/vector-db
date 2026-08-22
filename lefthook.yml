@@ -23,15 +23,19 @@ pre-commit:
         fi
 
     # 秘密情報の混入検査（.claude/rules/security.md）。資格情報ファイルの stage を拒否する。
-    # 判定は create-commit スキルの RE_CREDFILE と同一の正規表現をベースにする
-    # （PR #6 codex P1 / Bugbot 指摘の是正: `(^|/)` アンカーでサブディレクトリ内の
-    # `.env.*` も検出し、拡張子なしの SSH 鍵 `id_rsa` / `id_ed25519` も拒否する。
+    # 判定は create-commit スキルの RE_CREDFILE / RE_CREDFILE_OK の対と同一の正規表現を
+    # ベースにする（PR #6 codex P1 / Bugbot 指摘の是正: `(^|/)` アンカーでサブディレクトリ
+    # 内の `.env.*` も検出し、拡張子なしの SSH 鍵 `id_rsa` / `id_ed25519` も拒否する。
+    # 一方 `.env.example` 等の雛形・`id_rsa.pub` 等の公開鍵は許可リストで通す。
     # 拡張子 `.env` は旧パターンの検出範囲を維持するため追加している）
     - name: secrets-guard
       run: |
+        # 末尾の `grep -q .` は「拒否パターンに一致し、かつ許可リストに一致しない行が
+        # 実在するか」の判定（BSD grep は空入力への `-qv` が 0 を返すため `-qv` は使わない）
         re='(^|/)\.env(\..+)?$|(^|/)(id_rsa|id_ed25519)(\..+)?$|\.(pem|p12|pfx|key|env)$'
+        re_ok='\.(example|sample|template|pub)$'
         for f in {staged_files}; do
-          if printf '%s\n' "$f" | grep -qE "$re"; then
+          if printf '%s\n' "$f" | grep -E "$re" | grep -vE "$re_ok" | grep -q .; then
             echo "NG: 秘密情報ファイルがステージされています: $f" >&2
             exit 1
           fi
