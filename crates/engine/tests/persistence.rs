@@ -177,10 +177,15 @@ fn persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure() {
     );
 
     // トランザクション全体が破棄され、有効な行（1・2・4）も一切反映されていないこと。
+    // `NotFound` まで確認することで、「読み取り自体が別の理由で失敗した」ケースと
+    // 区別する（`is_err()` だけでは Backend エラー等も誤って合格し得るため）。
     for id in [1u64, 2, 4] {
-        assert!(
-            storage.get(id).is_err(),
+        let err = storage.get(id).expect_err(&format!(
             "row {id} must not be visible after the batch transaction was discarded"
+        ));
+        assert!(
+            matches!(err, StorageError::NotFound(_)),
+            "expected row {id} to be reported as NotFound, got: {err}"
         );
     }
     let scanned = storage.scan().expect("scan after aborted batch");
@@ -252,7 +257,16 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
     // 直列化の確認: 別スレッドから 2 本目の書き込みトランザクションを開始しようとしても、
     // 1 本目がコミットするまで `begin_write` は完了しない（排他ロックにより直列化される）
     // ことを確認する。
+    //
+    // `second_started_tx` の送信はスレッド生成直後（`begin_write` 呼び出し前）に発生する
+    // ため、それだけでは「スレッドがまだ `begin_write` に到達していない」可能性と
+    // 「`begin_write` がロック待ちでブロックされている」可能性を区別できない
+    // （前者でも `!is_finished()` は真になり、偽陽性になり得る）。そこで、
+    // `begin_write` が実際に返った直後にのみ真になる `second_acquired` を別途用意し、
+    // ロックについての積極的な証拠（「まだ取得できていない」）とする。
     let second_writer_db = Arc::clone(&db);
+    let second_acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let second_acquired_writer = Arc::clone(&second_acquired);
     let (second_started_tx, second_started_rx) = mpsc::channel::<()>();
     let second_writer = thread::spawn(move || {
         second_started_tx
@@ -261,6 +275,7 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
         let _write_txn = second_writer_db
             .begin_write()
             .expect("begin second write txn (blocks until first commits)");
+        second_acquired_writer.store(true, Ordering::SeqCst);
         // 直列化の確認のみが目的のため、2 本目は commit せず drop（abort）する。
     });
 
@@ -271,15 +286,33 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
     // （タイミング計測ではなく、明らかにブロックされていることの確認が目的）。
     thread::sleep(Duration::from_millis(200));
     assert!(
-        !second_writer.is_finished(),
-        "second begin_write must remain blocked while the first write txn is still open"
+        !second_acquired.load(Ordering::SeqCst),
+        "second begin_write must not have acquired the exclusive write lock \
+         while the first write txn is still open"
     );
 
     release_writer_tx
         .send(())
         .expect("release first writer to commit");
     writer.join().expect("writer thread panicked");
+
+    // ロック解放後に 2 本目が実際に進行することを、有限のデッドラインで確認する
+    // （リグレッションでロックが解放されないまま止まった場合に、テストが CI の
+    // タイムアウトまで無限に `join()` し続けるのではなく、明示的に失敗させるため）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !second_writer.is_finished() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        second_writer.is_finished(),
+        "second writer must complete once the first write txn is released \
+         (it appears still stuck on begin_write)"
+    );
     second_writer.join().expect("second writer thread panicked");
+    assert!(
+        second_acquired.load(Ordering::SeqCst),
+        "second begin_write must have acquired the lock after the first txn was released"
+    );
 
     // コミット後に新たに開始した読み取りは、コミット済みの行 2 を見えるようになる。
     let read_txn = db.begin_read().expect("begin read txn after commit");

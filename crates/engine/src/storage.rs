@@ -39,6 +39,12 @@ const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
 /// 永続化層に依存する際は、この上限付きページングを使う前提とする。
 const MAX_SCAN_PAGE_LIMIT: u32 = 10_000;
 
+/// [`Storage::scan_page`] が 1 ページで確保するデコード後バイト量（embedding + metadata）の
+/// 上限。行数の上限（[`MAX_SCAN_PAGE_LIMIT`]）だけでは、最大サイズ（[`MAX_EMBEDDING_DIM`]・
+/// [`MAX_METADATA_LEN`] 相当）の行が並んだ場合に依然として数十 GB 規模の確保になり得るため、
+/// 行数とバイト量の両方で上限を課す。
+const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -204,6 +210,10 @@ impl Storage {
     ///
     /// `limit` は [`MAX_SCAN_PAGE_LIMIT`] で切り詰める（呼び出し元が誤って大きな値を
     /// 渡しても一度の確保が上限を超えないようにする）。`limit == 0` は空ページを返す。
+    /// さらに、行数が上限未満でも、ページ内のデコード対象バイト量（embedding + metadata
+    /// 相当。エンコード済みバイト列長で近似）が [`MAX_SCAN_PAGE_BYTES`] を超える場合は
+    /// その時点でページを打ち切る（最大サイズの行が並んだ場合の巨大確保を避けるため。
+    /// 1 行のみで超過する場合はその 1 行を含めて返し、無限ループを避ける）。
     pub fn scan_page(&self, after: Option<u64>, limit: u32) -> Result<(Vec<Row>, Option<u64>)> {
         let limit = limit.min(MAX_SCAN_PAGE_LIMIT) as usize;
         if limit == 0 {
@@ -227,22 +237,29 @@ impl Storage {
             None => 0,
         };
 
-        let mut out = Vec::with_capacity(limit);
-        let mut next_cursor = None;
+        let mut out = Vec::new();
+        let mut bytes_used: usize = 0;
+        // 行数上限・バイト上限のいずれかで打ち切った場合のみ「続きがあるかもしれない」。
+        // イテレータが自然に尽きた（テーブル末尾に到達した）場合は打ち切りではない。
+        let mut capped = false;
         for entry in table.range(start..)? {
             if out.len() == limit {
+                capped = true;
                 break;
             }
             let (k, v) = entry?;
             let id = k.value();
-            out.push(decode_row(id, v.value())?);
-            next_cursor = Some(id);
+            let raw = v.value();
+            if !out.is_empty() && bytes_used.saturating_add(raw.len()) > MAX_SCAN_PAGE_BYTES {
+                capped = true;
+                break;
+            }
+            out.push(decode_row(id, raw)?);
+            bytes_used = bytes_used.saturating_add(raw.len());
         }
 
-        // ページが `limit` 件ぴったりで埋まった場合のみ「続きがあるかもしれない」として
-        // カーソルを返す。それ未満なら走査は末尾まで到達している。
-        let cursor_for_next = if out.len() == limit {
-            next_cursor
+        let cursor_for_next = if capped {
+            out.last().map(|r| r.id)
         } else {
             None
         };
@@ -527,6 +544,63 @@ mod tests {
             .scan_page(None, MAX_SCAN_PAGE_LIMIT + 1_000)
             .expect("scan with oversized limit request");
         assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn scan_page_caps_page_by_byte_budget_even_under_row_limit() {
+        let path = unique_db_path("scan-page-bytes");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // 最大メタデータ長（MAX_METADATA_LEN = 4 MiB）の行を 5 件用意する。行数上限
+        // （limit=100）には遠く及ばないが、エンコード済みバイト量の合計はすぐに
+        // MAX_SCAN_PAGE_BYTES（16 MiB）を超えるため、バイト上限で打ち切られるはずである。
+        let big_metadata = vec![0u8; MAX_METADATA_LEN as usize];
+        let rows: Vec<(u64, RowInput<'_>)> = (0..5u64)
+            .map(|i| {
+                (
+                    i,
+                    RowInput {
+                        embedding: &[],
+                        metadata: &big_metadata,
+                    },
+                )
+            })
+            .collect();
+        storage.put_batch(&rows).expect("seed large rows");
+
+        let (page1, cursor1) = storage
+            .scan_page(None, 100)
+            .expect("first page capped by byte budget");
+        assert!(
+            page1.len() < 5,
+            "byte budget must cap the page before the row limit (100) is reached, got {} rows",
+            page1.len()
+        );
+        assert!(
+            !page1.is_empty(),
+            "at least one row must be returned even under a tight byte budget"
+        );
+        assert!(
+            cursor1.is_some(),
+            "a capped page must report a continuation cursor"
+        );
+
+        // 続きのページを取得し、最終的に全 5 行を過不足なく読み切れること。
+        let mut all_ids: Vec<u64> = page1.iter().map(|r| r.id).collect();
+        let mut cursor = cursor1;
+        loop {
+            let (page, next_cursor) = storage
+                .scan_page(cursor, 100)
+                .expect("subsequent page after byte-budget cap");
+            all_ids.extend(page.iter().map(|r| r.id));
+            if next_cursor.is_none() {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        all_ids.sort_unstable();
+        assert_eq!(all_ids, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
