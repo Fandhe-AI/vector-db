@@ -303,12 +303,6 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     let (backend, db) = open_fresh();
     insert_row(&db, 1, b"pre-existing");
 
-    // 直近 sync 時点（行 1 のコミット完了時点）のスナップショットをあらかじめ確保しておく。
-    // 電源断像そのものではなく、後段で「部分 write-back が実際に電源断像へ混入したこと」
-    // （`assert_ne!`）を確認するためのベースライン（write-back が一切起きなかった場合の像）
-    // として使う。
-    let pre_txn_image = backend.durable_snapshot();
-
     // 最終 sync（コミット）に到達しない書き込みを発生させる。`open_fresh` で cache_size を
     // 小さく設定しているため、十分な件数を書けば `redb` 内部の write buffer から
     // 追い出しが発生し、commit 前でも `StorageBackend::write()` 経由で `log` に記録される
@@ -337,18 +331,31 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
          （0 件だと本テストは何も検証していないことになる）"
     );
 
-    // 「電源断時点の像」として、pre_txn_image（未コミット txn 開始前のスナップショット）
-    // ではなく、abort された txn が実際にバックエンドへ書き戻したページをすべて反映した像
-    // （crash_image(全 indices)）を使う。こうすることで、`open_fresh` の `set_cache_size`
-    // 縮小によって発生させた部分 write-back が実際に電源断像へ混入していることを
-    // `assert_ne!` で確認したうえで、それでもなお未コミット txn の内容は読めない
-    // （commit していないためルートページが更新されておらず、不到達）ことを検証する。
+    // 「電源断時点の像」として、abort された txn が実際にバックエンドへ書き戻した
+    // ページをすべて反映した像（crash_image(全 indices)）を使う。こうすることで、
+    // `open_fresh` の `set_cache_size` 縮小によって発生させた部分 write-back が
+    // 実際に電源断像へ混入していることを `assert_ne!` で確認したうえで、それでも
+    // なお未コミット txn の内容は読めない（commit していないためルートページが
+    // 更新されておらず、不到達）ことを検証する。
+    //
+    // 比較対象のベースラインには pre_txn_image（未コミット txn 開始前のスナップショット）
+    // ではなく `crash_image(&[])`（write() log を 1 件も適用しない像）を使う。
+    // `set_len` はモデルの単純化により `durable` を即時更新する（モジュール doc「モデルの限界」
+    // 参照）ため、txn 内でのファイル成長（growth）だけでも pre_txn_image とは長さが変わり、
+    // 実際に `write()` されたページ内容が反映されたかどうかに関わらず `assert_ne!` が
+    // 成立してしまう（＝ growth のみを検出して「write-back が混入した」と誤認する）。
+    // `crash_image(&[])` は同じ growth 後の長さ・durable を起点にしつつ log 適用のみを
+    // 0 件にした像なので、これとの差分は growth ではなく `write()` ログの内容適用に
+    // 起因することが保証される。
     let all_indices: Vec<usize> = (0..pending).collect();
+    let no_writeback_baseline = backend.crash_image(&[]);
     let crash_image_with_partial_writeback = backend.crash_image(&all_indices);
     assert_ne!(
-        crash_image_with_partial_writeback, pre_txn_image,
-        "部分 write-back が電源断像へ実際に混入していなければ、本テストは \
-         シナリオ 1 相当の検証（コミット後の電源断）と区別がつかない"
+        crash_image_with_partial_writeback, no_writeback_baseline,
+        "部分 write-back（write() ログの適用）が電源断像へ実際に混入していなければ、\
+         本テストは commit 前のページ write-back を検証したことにならない \
+         （growth のみに起因する差分ではないことを、同じ growth 後の長さを持つ \
+         no_writeback_baseline との比較で担保する）"
     );
 
     drop(db);
