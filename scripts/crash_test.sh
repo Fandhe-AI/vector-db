@@ -83,8 +83,23 @@ for i in $(seq 1 "${ITERATIONS}"); do
   wait_ms=$((10 + RANDOM % 291))
   sleep "0.$(printf '%03d' "${wait_ms}")"
 
-  kill -9 "${writer_pid}" 2>/dev/null
+  if ! kill -9 "${writer_pid}" 2>/dev/null; then
+    echo "ERROR: kill -9 failed for writer pid ${writer_pid} at iteration ${i} (writer may have already exited on its own, e.g. a put error or safety limit); this iteration cannot verify SIGKILL crash resilience" >&2
+    cat "${WRITE_LOG}" >&2
+    exit 1
+  fi
+
   wait "${writer_pid}" 2>/dev/null
+  writer_status=$?
+  # `wait` は SIGKILL で終了したプロセスに対して 128+9=137 を返す。
+  # それ以外（writer が kill 到達前に自発終了した等）は SIGKILL を検証できて
+  # いない反復であり、テストの目的（強制終了下での整合性検証）を満たさない
+  # ため fail-closed で拒否する。
+  if [ "${writer_status}" -ne 137 ]; then
+    echo "ERROR: writer pid ${writer_pid} did not terminate via SIGKILL at iteration ${i} (wait exit status=${writer_status}, expected 137); this iteration did not exercise a real SIGKILL crash" >&2
+    cat "${WRITE_LOG}" >&2
+    exit 1
+  fi
 
   verify_output="$("${BIN}" verify "${DB_PATH}")"
   echo "${verify_output}"
