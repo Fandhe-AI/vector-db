@@ -226,3 +226,37 @@ fn table10_log_batch_records_actual_put_count_not_caller_supplied_value() {
         "batch_log row_count total must always match actually-put rows"
     );
 }
+
+// 対象ビヘイビア: TABLE-10。同一トランザクション内で同じ行 ID へ 2 回 put（upsert に
+// よる上書き）しても、log_batch が記録する行数は実在する行数（新規挿入数）のままで
+// あり、put 回数と一致しないこと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
+// `redb::Table::insert` は既存 ID を上書きできるため、上書きも新規挿入と同様にカウント
+// すると「台帳の row_count 合計 == 行総数」という契約を公開 API だけで破れてしまう。
+#[test]
+fn table10_log_batch_does_not_double_count_overwritten_id_within_same_batch() {
+    let path = unique_db_path("log-batch-no-double-count-overwrite");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut txn = storage.begin_write().expect("begin_write");
+    txn.put(0, &row(&[1.0], &[1])).expect("put row 0 (first)");
+    // 同じ行 ID 0 へ 2 回目の put（upsert による上書き）。新規挿入ではないため
+    // pending_row_count は増えないはず。
+    txn.put(0, &row(&[9.0], &[9]))
+        .expect("put row 0 (overwrite)");
+    txn.put(1, &row(&[2.0], &[2])).expect("put row 1 (new)");
+    txn.log_batch(0).expect("log_batch");
+    txn.commit().expect("commit");
+
+    // 実在行は id=0（上書き後の値）・id=1 の 2 行のみ。
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(storage.get(0).expect("get row 0").embedding, [9.0]);
+
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(
+        batch_log,
+        vec![(0, 2)],
+        "overwrite of an existing id must not inflate the logged row count"
+    );
+}

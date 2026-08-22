@@ -120,39 +120,50 @@ impl ReadSnapshot {
 pub struct WriteTxn {
     txn: redb::WriteTransaction,
     /// 直近の [`WriteTxn::log_batch`] 呼び出し以降（または `WriteTxn` 生成以降）に
-    /// [`WriteTxn::put`] で成功した書き込み件数。呼び出し元から任意の行数を申告させず
-    /// [`WriteTxn`] 自身が実書き込みを数えることで、「台帳の値 == そのバッチで
-    /// `ROWS_TABLE` へ書き込んだ行数」という契約を公開 API だけで保証する
-    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l 対応）。
+    /// [`WriteTxn::put`] で**新規挿入**した件数（既存 ID への上書きは含まない）。
+    /// 呼び出し元から任意の行数を申告させず [`WriteTxn`] 自身が実書き込みを数える
+    /// ことで、「台帳の値 == そのバッチで `ROWS_TABLE` へ新規追加した行数」という
+    /// 契約を公開 API だけで保証する（PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l・
+    /// PRRT_kwDOUAKASM6bbc_I 対応）。
     pending_row_count: u64,
 }
 
 impl WriteTxn {
     /// 単一行を書き込む（commit するまで確定しない。[`Storage::put`] と同じ
-    /// エンコーディング契約）。成功時のみ [`WriteTxn::log_batch`] 向けの内部カウンタ
-    /// （`pending_row_count`）を増やす（エンコード失敗等で行が書き込まれなかった場合は
-    /// カウントしない）。
+    /// upsert セマンティクス・エンコーディング契約）。[`WriteTxn::log_batch`] 向けの
+    /// 内部カウンタ（`pending_row_count`）は、`redb::Table::insert` の戻り値
+    /// （上書き前の旧値）を見て**新規挿入のときのみ**増やす。同一 ID への 2 回目以降の
+    /// `put`（上書き）はカウントしない。カウントしてしまうと同一 ID への複数回 put
+    /// だけで実在行数より多い値を台帳へ記録でき、「台帳の row_count 合計 == 行総数」
+    /// という TABLE-10 の契約を公開 API だけで破れてしまうため
+    /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
         let mut table = self.txn.open_table(ROWS_TABLE)?;
-        table.insert(id, encoded.as_slice())?;
-        // 呼び出し元にはトランザクション内で扱える行数の上限（TASK-90 の想定用途では
-        // バッチ 1 本あたり高々数千件）を課しており u64 を溢れさせることはできないが、
-        // coding-rust.md の checked 演算方針に合わせ、万一の溢れを黙って折り返さず
-        // fail-closed に検出する。
-        self.pending_row_count = self
-            .pending_row_count
-            .checked_add(1)
-            .ok_or(StorageError::PendingRowCountOverflow)?;
+        let previous = table.insert(id, encoded.as_slice())?;
+        if previous.is_none() {
+            // 呼び出し元にはトランザクション内で扱える行数の上限（TASK-90 の想定用途
+            // ではバッチ 1 本あたり高々数千件）を課しており u64 を溢れさせることは
+            // できないが、coding-rust.md の checked 演算方針に合わせ、万一の溢れを
+            // 黙って折り返さず fail-closed に検出する。
+            self.pending_row_count = self
+                .pending_row_count
+                .checked_add(1)
+                .ok_or(StorageError::PendingRowCountOverflow)?;
+        }
         Ok(())
     }
 
     /// バッチ台帳（[`crate::storage::BATCH_LOG_TABLE`]）へ、直近の `log_batch` 以降に
-    /// 実際に [`WriteTxn::put`] した行数を 1 エントリとして書き込む（TASK-90、対象
-    /// ビヘイビア: TABLE-10）。[`WriteTxn::put`] と同一の `redb::WriteTransaction`
-    /// （`self.txn`）内で操作するため、[`WriteTxn::commit`]・[`WriteTxn::abort`] の
-    /// どちらを呼んでも [`ROWS_TABLE`] への行書き込みと本エントリは常に運命を共にする
-    /// （2 テーブル横断で原子的にコミット／破棄される）。
+    /// 実際に [`WriteTxn::put`] で**新規挿入**した行数（既存 ID への上書きは含まない）を
+    /// 1 エントリとして書き込む（TASK-90、対象ビヘイビア: TABLE-10）。同一 ID への
+    /// 複数回 `put` は `pending_row_count` を増やさないため、`log_batch(seq, 99)` の
+    /// ような過大申告だけでなく「同一 ID への put の繰り返し」でも実在行数を超える値を
+    /// 記録できない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
+    /// [`WriteTxn::put`] と同一の `redb::WriteTransaction`（`self.txn`）内で操作するため、
+    /// [`WriteTxn::commit`]・[`WriteTxn::abort`] のどちらを呼んでも [`ROWS_TABLE`] への
+    /// 行書き込みと本エントリは常に運命を共にする（2 テーブル横断で原子的に
+    /// コミット／破棄される）。
     ///
     /// `row_count` を呼び出し元から受け取らないのは、任意の値を渡せると
     /// `log_batch(seq, 0)` のみ・過大申告といった「実書き込み数と独立した値」を
