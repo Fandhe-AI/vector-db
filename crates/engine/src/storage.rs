@@ -32,6 +32,13 @@ const MAX_EMBEDDING_DIM: u32 = 65_536;
 /// メタデータ列のバイト長上限。埋め込みと同様、デコード前に上限検証する。
 const MAX_METADATA_LEN: u32 = 4 * 1024 * 1024;
 
+/// [`Storage::scan_page`] が 1 回の呼び出しで返す行数の上限。
+/// [`Storage::scan`] は行数に上限がなく、最大サイズの行（[`MAX_EMBEDDING_DIM`]・
+/// [`MAX_METADATA_LEN`] 相当）が大量にある場合に一度に巨大なメモリ確保が発生し得る
+/// （security.md「不安全な設計｜無制限リソース確保（DoS）」）。後続タスクで検索カーネル等が
+/// 永続化層に依存する際は、この上限付きページングを使う前提とする。
+const MAX_SCAN_PAGE_LIMIT: u32 = 10_000;
+
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
@@ -68,6 +75,12 @@ impl std::error::Error for StorageError {
 
 // `redb` の各操作（begin_write・open_table・commit 等）はそれぞれ異なるエラー型を返すが、
 // すべて `redb::Error` へ変換可能なので、ここで一括して `StorageError` へ橋渡しする。
+//
+// 設計メモ: この blanket impl（`E: Into<redb::Error>` を満たす任意の型から変換可能）は、
+// coherence 制約により `StorageError` へ他の `From` 実装を個別に追加することを妨げる
+// （`redb::Error` に変換可能な型は将来的にも本 impl に一元化される）。`StorageError` は
+// engine ⇔ wire-server のエラー契約（`wire_code`）の土台となる型のため、`redb` 以外の
+// エラー源を追加する際はこの制約を踏まえて設計を見直すこと。
 impl<E> From<E> for StorageError
 where
     E: Into<redb::Error>,
@@ -161,6 +174,12 @@ impl Storage {
 
     /// 全行をスナップショット読み取りで走査する（呼び出し時点でコミット済みの状態のみを
     /// 返し、走査中に他トランザクションが書き込んでも反映されない。PERSIST-4）。
+    ///
+    /// 行数に上限がなく、一度にすべての行を `Vec<Row>` へデコードして返すため、
+    /// 行数が大きいデータベースでは巨大なメモリ確保が発生し得る
+    /// （security.md「不安全な設計｜無制限リソース確保（DoS）」）。テスト・小規模データ用の
+    /// 簡易 API として残し、後続タスク（検索カーネル等）から呼び出す場合は
+    /// 上限付きの [`Storage::scan_page`] を使うこと。
     pub fn scan(&self) -> Result<Vec<Row>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(ROWS_TABLE) {
@@ -174,6 +193,60 @@ impl Storage {
             out.push(decode_row(k.value(), v.value())?);
         }
         Ok(out)
+    }
+
+    /// 行 ID 昇順で最大 `limit` 件を走査する上限付きページング API（[`scan`](Self::scan) の
+    /// 無制限確保を避けるための代替。PERSIST-4: 呼び出し時点のスナップショットを読む）。
+    ///
+    /// `after` に前回呼び出しで返した [`Row::id`] の最大値（カーソル）を渡すと、
+    /// その ID より大きい行から再開する。初回は `None` を渡す。
+    /// 戻り値の第 2 要素は次回呼び出しに渡すべきカーソル（続きがなければ `None`）。
+    ///
+    /// `limit` は [`MAX_SCAN_PAGE_LIMIT`] で切り詰める（呼び出し元が誤って大きな値を
+    /// 渡しても一度の確保が上限を超えないようにする）。`limit == 0` は空ページを返す。
+    pub fn scan_page(&self, after: Option<u64>, limit: u32) -> Result<(Vec<Row>, Option<u64>)> {
+        let limit = limit.min(MAX_SCAN_PAGE_LIMIT) as usize;
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
+
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(ROWS_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
+            Err(e) => return Err(e.into()),
+        };
+
+        // カーソルの直後（`after + 1`）から走査を開始する。`after` が `u64::MAX` の場合は
+        // 「これ以上続きがない」ことを意味するため、範囲を作らず空ページを返す。
+        let start = match after {
+            Some(cursor) => match cursor.checked_add(1) {
+                Some(next) => next,
+                None => return Ok((Vec::new(), None)),
+            },
+            None => 0,
+        };
+
+        let mut out = Vec::with_capacity(limit);
+        let mut next_cursor = None;
+        for entry in table.range(start..)? {
+            if out.len() == limit {
+                break;
+            }
+            let (k, v) = entry?;
+            let id = k.value();
+            out.push(decode_row(id, v.value())?);
+            next_cursor = Some(id);
+        }
+
+        // ページが `limit` 件ぴったりで埋まった場合のみ「続きがあるかもしれない」として
+        // カーソルを返す。それ未満なら走査は末尾まで到達している。
+        let cursor_for_next = if out.len() == limit {
+            next_cursor
+        } else {
+            None
+        };
+        Ok((out, cursor_for_next))
     }
 }
 
@@ -370,5 +443,99 @@ mod tests {
             metadata: &huge,
         });
         assert!(result.is_err());
+    }
+
+    /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
+    fn unique_db_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vector-db-engine-storage-{label}-{}-{seq}.redb",
+            std::process::id()
+        ));
+        path
+    }
+
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn scan_page_paginates_in_id_order_and_reports_continuation_cursor() {
+        let path = unique_db_path("scan-page");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let embeddings: Vec<[f32; 1]> = (0..25u64).map(|i| [i as f32]).collect();
+        let rows: Vec<(u64, RowInput<'_>)> = (0..25u64)
+            .map(|i| {
+                (
+                    i,
+                    RowInput {
+                        embedding: &embeddings[i as usize],
+                        metadata: b"m",
+                    },
+                )
+            })
+            .collect();
+        storage.put_batch(&rows).expect("seed rows");
+
+        let (page1, cursor1) = storage.scan_page(None, 10).expect("first page");
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page1.first().map(|r| r.id), Some(0));
+        assert_eq!(page1.last().map(|r| r.id), Some(9));
+        assert_eq!(cursor1, Some(9));
+
+        let (page2, cursor2) = storage.scan_page(cursor1, 10).expect("second page");
+        assert_eq!(page2.len(), 10);
+        assert_eq!(page2.first().map(|r| r.id), Some(10));
+        assert_eq!(page2.last().map(|r| r.id), Some(19));
+        assert_eq!(cursor2, Some(19));
+
+        let (page3, cursor3) = storage
+            .scan_page(cursor2, 10)
+            .expect("third (partial) page");
+        assert_eq!(page3.len(), 5);
+        assert_eq!(page3.first().map(|r| r.id), Some(20));
+        assert_eq!(page3.last().map(|r| r.id), Some(24));
+        // 末尾未満の件数しか返らなかったので、続きがないことを示す `None` を返す。
+        assert_eq!(cursor3, None);
+    }
+
+    #[test]
+    fn scan_page_clamps_limit_to_max_page_limit() {
+        let path = unique_db_path("scan-page-clamp");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    embedding: &[1.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed row");
+
+        // limit に MAX_SCAN_PAGE_LIMIT を超える値を渡しても panic せず、切り詰めて処理される。
+        let (page, _cursor) = storage
+            .scan_page(None, MAX_SCAN_PAGE_LIMIT + 1_000)
+            .expect("scan with oversized limit request");
+        assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn scan_page_with_zero_limit_returns_empty_page() {
+        let path = unique_db_path("scan-page-zero");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
+        assert!(page.is_empty());
+        assert_eq!(cursor, None);
     }
 }

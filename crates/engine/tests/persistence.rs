@@ -148,6 +148,48 @@ fn persist2_incremental_write_preserves_existing_rows() {
     assert_eq!(appended.metadata, b"incremental");
 }
 
+// PERSIST-2: バッチ途中の行でエンコードが失敗した場合（例: メタデータ長超過）、
+// トランザクション全体が破棄され、それより前の行も一切反映されないこと
+// （`put_batch` は encode 失敗時に即 `Err` を返し、書き込みトランザクションが
+// commit されないまま drop = abort される想定）。
+#[test]
+fn persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure() {
+    let path = unique_db_path("persist2-partial-failure");
+    let _cleanup = CleanupGuard(path.clone());
+
+    let storage = Storage::open(&path).expect("open storage");
+
+    // メタデータ長の上限を超える不正な行を 3 件目に混在させる。
+    // `engine::storage` の上限定数は非公開のため、実際に超過する値を直接使う。
+    const OVERSIZED_METADATA_LEN: usize = 4 * 1024 * 1024 + 1;
+    let oversized_metadata = vec![0u8; OVERSIZED_METADATA_LEN];
+    let batch = vec![
+        (1u64, row(&[1.0], b"ok-1")),
+        (2u64, row(&[2.0], b"ok-2")),
+        (3u64, row(&[3.0], &oversized_metadata)),
+        (4u64, row(&[4.0], b"ok-4")),
+    ];
+
+    let result = storage.put_batch(&batch);
+    assert!(
+        matches!(result, Err(StorageError::Codec(_))),
+        "batch containing an oversized row must fail with a codec error, got: {result:?}"
+    );
+
+    // トランザクション全体が破棄され、有効な行（1・2・4）も一切反映されていないこと。
+    for id in [1u64, 2, 4] {
+        assert!(
+            storage.get(id).is_err(),
+            "row {id} must not be visible after the batch transaction was discarded"
+        );
+    }
+    let scanned = storage.scan().expect("scan after aborted batch");
+    assert!(
+        scanned.is_empty(),
+        "no rows should be committed when the batch transaction is discarded, got: {scanned:?}"
+    );
+}
+
 // PERSIST-4: 書き込みトランザクションが直列化されること（`begin_write` の排他ロック）、
 // および書き込み進行中に開始した読み取りが開始時点のスナップショットを見ること
 // （未コミットの変更が見えないこと）を検証する。
