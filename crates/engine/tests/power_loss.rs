@@ -1,9 +1,7 @@
 //! 電源断シミュレーションによるクラッシュ耐性の再検証テスト（TASK-145、ポインタ:
-//! `docs/spec/05-tasks.md`）。任意の durable ストレージに一般的に求められる特性
-//! （commit 完了後のデータ生存・未 commit 分の完全な除去）を電源断シナリオへ拡張して
-//! 再検証する。関連ビヘイビア: PERSIST-1・PERSIST-3（ポインタ:
-//! `docs/spec/04-behavior/persistence.md`）。詳細は
-//! `docs/design/crash-tolerance-reverification.md` を参照。
+//! `docs/spec/05-tasks.md`）。関連ビヘイビア: PERSIST-1・PERSIST-3（ポインタ:
+//! `docs/spec/04-behavior/persistence.md`）。検証対象の契約内容は上記ポインタ先を
+//! 参照。詳細は `docs/design/crash-tolerance-reverification.md` を参照。
 //!
 //! 実機の電源断は CI で再現できないため、`redb::StorageBackend`（`redb =4.2.0`。
 //! `crates/engine/Cargo.toml` の既承認済み依存。新規依存は追加しない）をテストスコープで
@@ -91,6 +89,12 @@ impl BackendState {
     /// 基底バッファへ適用した結果を返す。全 `indices` を渡せば「現在の見かけ上の状態」
     /// （sync 前も含めた読み取り側の view）になり、空を渡せば「直近 sync 時点のまま」の
     /// 電源断像になる。
+    ///
+    /// `write()` は現在の `len` を越える offset へも書けて構わない（POSIX の write が
+    /// EOF を越えて暗黙にファイルを伸長するのと同じ振る舞いを許容するため、ここでは
+    /// `end` に合わせて `buf` を伸長する）。一方 `set_len` による明示的な縮小後は、
+    /// `log` 自体が新しい長さへ切り詰め済み（`set_len` 参照）のため、縮小後 EOF より
+    /// 後ろの pending write がここで幽霊のように復活することはない。
     fn apply_subset(&self, indices: &[usize]) -> Vec<u8> {
         let mut buf = self.base();
         for &i in indices {
@@ -177,9 +181,27 @@ impl StorageBackend for PowerLossBackend {
     fn set_len(&self, len: u64) -> io::Result<()> {
         let mut state = self.state.lock().expect("lock poisoned");
         let len = usize::try_from(len).map_err(|_| io::Error::other("len does not fit usize"))?;
+        let old_len = state.len;
         state.len = len;
         // メタデータ操作は即時 durable 化する単純化（モジュール doc の「モデルの限界」参照）。
         state.durable.resize(len, 0);
+        if len < old_len {
+            // 縮小時、新しい EOF 以降の pending write は破棄し、EOF をまたぐ write は
+            // 新しい長さに合わせて切り詰める。切り詰めないと `current`/`apply_subset` が
+            // 後で len を越えて再拡張してしまい、`len()` と実際のスナップショットが
+            // 矛盾する（電源断像として不正確になる）。
+            state.log.retain_mut(|(offset, data)| {
+                let start = *offset as usize;
+                if start >= len {
+                    return false;
+                }
+                let end = start.saturating_add(data.len());
+                if end > len {
+                    data.truncate(len - start);
+                }
+                true
+            });
+        }
         Ok(())
     }
 
@@ -277,8 +299,7 @@ fn get_row(db: &Database, id: u64) -> Option<Vec<u8>> {
         .map(|guard| guard.value().to_vec())
 }
 
-// シナリオ 1: commit 完了（応答済み）後に電源断しても、再オープンでコミット済み行が
-// すべて読める（任意の durable ストレージに一般的に求められる特性）。
+// シナリオ 1（対応する契約: PERSIST-1・PERSIST-3。ポインタ: `docs/spec/04-behavior/persistence.md`）。
 //
 // `Storage::put`（≒ 本テストの `insert_row`）が返った時点で `redb` の既定 durability
 // （`Durability::Immediate`）により `sync_data()` まで完了しているため、`durable_snapshot()`
@@ -304,9 +325,7 @@ fn power_loss_scenario1_committed_data_survives_crash_after_commit_response() {
     assert_eq!(get_row(&recovered, 2), Some(b"committed-b".to_vec()));
 }
 
-// シナリオ 2: トランザクション途中（最終 sync 前）で電源断すると、当該トランザクションは
-// 丸ごと消え、既存コミット済みデータは無傷で、DB は正常に開ける
-// （任意の durable ストレージに一般的に求められる特性）。
+// シナリオ 2（対応する契約: PERSIST-1・PERSIST-3。ポインタ: `docs/spec/04-behavior/persistence.md`）。
 #[test]
 fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
     let (backend, db) = open_fresh();
