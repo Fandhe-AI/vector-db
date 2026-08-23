@@ -167,9 +167,45 @@ impl VectorCore for EngineCore {
             return Err(CoreError::InvalidK { k });
         }
 
-        // アリーナ構築時に次元検証・容量上限検証を行う（`arena.rs::VectorArena::build`）ため、
-        // ここでは追加のスキーマ照会を行わずアリーナのエラーへ委譲する。
-        let arena = VectorArena::build(&self.storage, table)?;
+        // `query` の次元をカタログ照会だけで早期検証する（`VectorArena::build` へ進む前）。
+        // `VectorArena::build` は対象テーブル全行（最大 `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES`）
+        // をデコード・確保してから初めて `kernel.rs::CpuScalarProvider::search` が
+        // 次元不一致を検出する構造だと、次元不一致という軽量に判定できる入力であっても
+        // 全行デコード分のコスト（リソース増幅）を強いられてしまう
+        // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。Issue #32 レビュー
+        // 指摘）。ここでの早期拒否はエラー契約を変えず、`kernel.rs` が返すのと同じ
+        // `KernelError::DimMismatch` を用いる。
+        //
+        // テーブル不存在は [`Self::get_row`] と対称に [`CoreError::NotFound`] へ丸め込む
+        // （存在情報を漏らさない。security.md「アクセス制御の不備」）。それ以外のカタログ
+        // エラー（データ破損等）はそのまま伝播する。
+        let schema = match self.storage.get_table_schema(table) {
+            Ok(schema) => schema,
+            Err(CatalogError::TableNotFound(_)) => return Err(CoreError::NotFound),
+            Err(e) => return Err(CoreError::Catalog(e)),
+        };
+        let expected_dim = match schema.vector_dim() {
+            Some(dim) if dim != 0 && dim <= crate::storage::MAX_EMBEDDING_DIM => dim,
+            _ => return Err(CoreError::Arena(ArenaError::InvalidDim)),
+        };
+        if query.len() != expected_dim as usize {
+            return Err(CoreError::Kernel(KernelError::DimMismatch {
+                expected: expected_dim,
+                found: query.len(),
+            }));
+        }
+
+        // 次元検証を通過した後にのみアリーナを構築する。ここでの `TableNotFound` は
+        // 上記の早期照会と同一スナップショットではない（別トランザクション）ため、
+        // 直前の照会成立後にテーブルが削除された場合の理論的な競合窓のみで発生しうる。
+        // その場合も同様に存在情報を漏らさず `NotFound` へ丸め込む。
+        let arena = match VectorArena::build(&self.storage, table) {
+            Ok(arena) => arena,
+            Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
+                return Err(CoreError::NotFound)
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let is_visible = |idx: usize| -> bool {
             // `arena.tenant_id`/`arena.visibility` は `idx` がアリーナの行範囲内であれば
@@ -199,8 +235,9 @@ impl VectorCore for EngineCore {
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
             // `NotFound` に丸め込まず `CoreError::Catalog` としてそのまま伝播する
-            // （アクセス不可とデータ破損を区別する。`search` 経路が `ArenaError` を
-            // そのまま伝播するのと非対称にならないようにする）。
+            // （アクセス不可とデータ破損を区別する）。`search` 経路もテーブル不存在
+            // （`ArenaError::Catalog(CatalogError::TableNotFound)`）を同じく `NotFound` へ
+            // 丸め込んでおり、両経路は対称（Issue #32 レビュー指摘対応）。
             Err(CatalogError::TableNotFound(_) | CatalogError::RowNotFound(_)) => {
                 return Err(CoreError::NotFound)
             }

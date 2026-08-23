@@ -468,6 +468,128 @@ fn boundary_k_zero_and_k_over_limit_are_rejected() {
     ));
 }
 
+// レビュー指摘対応（Medium 1・Issue #32）: query の次元不一致は
+// `VectorArena::build`（対象テーブル全行のデコード・確保）へ進む前に、カタログ照会
+// だけで早期拒否されなければならない。これを直接計測せずに検証するため、対象テーブルへ
+// `redb` を直接操作してデコード不能な破損行を仕込んでおく。もし早期拒否が働かず
+// `VectorArena::build` が実際に全行を走査してしまえば、この破損行のデコードで
+// 別種のエラー（`CoreError::Arena`）になるはずで、期待どおり
+// `CoreError::Kernel(KernelError::DimMismatch)` が返ることは走査が発生しなかった証拠になる。
+#[test]
+fn dim_mismatch_is_rejected_before_scanning_table_rows() {
+    let dir = TempDir::new("dim-mismatch-early-reject");
+    let path = dir.db_path();
+    {
+        let core = EngineCore::open(&path).expect("open engine core");
+        core.storage()
+            .create_table(&schema_for("docs", 3))
+            .expect("create table");
+    }
+    {
+        let db = redb::Database::create(&path).expect("reopen raw database");
+        let write_txn = db.begin_write().expect("begin write txn");
+        {
+            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                redb::TableDefinition::new("user_rows/docs");
+            let mut table = write_txn.open_table(row_table_def).expect("open row table");
+            // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列
+            // （`get_row_surfaces_data_corruption_distinctly_from_not_found` と同手法）。
+            table
+                .insert(1u64, &[1u8][..])
+                .expect("insert malformed row");
+        }
+        write_txn.commit().expect("commit malformed row");
+    }
+
+    let core = EngineCore::open(&path).expect("reopen engine core");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // schema の次元（3）と異なる次元（2）のクエリを渡す。
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 1)
+        .expect_err("dim mismatch must be rejected");
+    assert!(
+        matches!(
+            err,
+            CoreError::Kernel(KernelError::DimMismatch {
+                expected: 3,
+                found: 2
+            })
+        ),
+        "expected early DimMismatch rejection (proving the malformed row was never scanned), got: {err}"
+    );
+}
+
+// レビュー指摘対応（Medium 2・Issue #32）: `search`・`get_row` はいずれもテーブル不存在を
+// `CoreError::NotFound` へ丸め込み、他テナントの存在情報を漏らさない契約で統一する
+// （security.md「アクセス制御の不備」）。
+#[test]
+fn search_and_get_row_agree_on_not_found_for_missing_table() {
+    let dir = TempDir::new("missing-table-symmetry");
+    let core = EngineCore::open(dir.db_path()).expect("open engine core");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let search_err = core
+        .search(&ctx, "not_registered", &[1.0, 0.0], 1)
+        .expect_err("search on missing table must fail");
+    let get_row_err = core
+        .get_row(&ctx, "not_registered", 1)
+        .expect_err("get_row on missing table must fail");
+
+    assert!(matches!(search_err, CoreError::NotFound));
+    assert!(matches!(get_row_err, CoreError::NotFound));
+}
+
+// レビュー指摘対応（Low・Issue #32）。`ctx` が `Public` のみ許可（既定コンストラクタ）の
+// 場合、同一テナントの `Visibility::Private` 行は `search` 結果から除外されること
+// （CORE-2: 可視性ラベル評価が正しく `search` 経路を通っていることの統合テスト）。
+#[test]
+fn search_excludes_private_rows_of_the_same_tenant_when_ctx_disallows_private() {
+    let dir = TempDir::new("private-visibility-excluded");
+    let core = EngineCore::open(dir.db_path()).expect("open engine core");
+    core.storage()
+        .create_table(&schema_for("docs", 2))
+        .expect("create table");
+    // Private 行がクエリに最も近い（マスクが効いていなければ検索結果の先頭に来る）。
+    seed_row(
+        &core,
+        "docs",
+        1,
+        "tenant-a",
+        Visibility::Private,
+        &[1.0, 0.0],
+    );
+    seed_row(
+        &core,
+        "docs",
+        2,
+        "tenant-a",
+        Visibility::Public,
+        &[0.5, 0.0],
+    );
+
+    // 既定コンストラクタは Public のみ許可（`PolicyContext::new` のドキュメント参照）。
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let hits = core
+        .search(&ctx, "docs", &[1.0, 0.0], 10)
+        .expect("search ok");
+
+    assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+
+    // `Visibility::Private` を明示許可すれば結果に含まれるようになることも併せて確認する
+    // （マスク自体が機能していることの対照実験）。
+    let ctx_with_private =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let hits_with_private = core
+        .search(&ctx_with_private, "docs", &[1.0, 0.0], 10)
+        .expect("search ok");
+    assert_eq!(
+        hits_with_private.iter().map(|h| h.id).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
 #[test]
 fn boundary_empty_table_search_returns_empty_results() {
     let dir = TempDir::new("boundary-empty");
