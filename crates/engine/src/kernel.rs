@@ -140,7 +140,13 @@ impl SearchProvider for CpuScalarProvider {
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+/// 内積（dot product）のスカラー参照実装（左から右への逐次和）。
+///
+/// `simd_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
+/// 指摘対応: 加算順序を分岐させると `SimdSearchProvider` と本 provider の Top-k
+/// 集合・順序が丸め誤差で食い違い得るため、`pub(crate)` にして共有し、
+/// 単一の加算順序であることを構造的に保証する）。
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 

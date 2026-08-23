@@ -1,15 +1,12 @@
 //! `simd_search.rs::SimdSearchProvider` の結合テスト（TASK-126・対象ビヘイビア:
 //! CORE-3, CORE-4, CORE-5・SEARCH-4）。
 //!
-//! 両 provider（`CpuScalarProvider`・`SimdSearchProvider`）とも総当たり実装のため、
-//! 決定的シードの合成データに対して Top-k 選出集合・順序が完全一致することを検証する
-//! （近似検索ではなく、参照実装との等価性そのものを主張する）。
-//!
-//! - `dim < 16` のケースはスコア値も bit 単位で一致することまで検証する
-//!   （`simd_search.rs::dot_vectorized` のドキュメント参照）。
-//! - `dim >= 16`（内積の加算順序が異なりうる）のケースは、境界（k 番目と k+1 番目）の
-//!   参照スコアに十分なマージンを確保したうえで、選出される id 集合・順序の一致のみを
-//!   主張する（浮動小数点の非結合性により生スコアが bit 単位で一致しない場合があるため）。
+//! 両 provider（`CpuScalarProvider`・`SimdSearchProvider`）とも総当たり実装かつ内積計算
+//! （`kernel.rs::dot`）を共有するため、決定的シードの合成データに対して Top-k 選出
+//! 集合・順序・スコア値が dim・並列度に関わらず bit 単位で完全一致することを検証する
+//! （近似検索ではなく、参照実装との等価性そのものを主張する。Issue #34 codex-review P1
+//! 指摘対応: 以前は provider 側に別の加算順序を持つ自前ベクトル化があり、`dim >= 16` で
+//! 丸め誤差により一致が崩れ得た）。
 //!
 //! `EngineCore` 経由の CORE-1/2/13 回帰は `tests/vector_core.rs` が既定構成
 //! （`SimdSearchProvider`）でそのまま担保する（本ファイルは provider 単体の契約検証）。
@@ -49,12 +46,6 @@ impl Rng {
     }
 }
 
-/// スカラー逐次和の内積（`kernel.rs::CpuScalarProvider` 内部実装と同じ加算順序）。
-/// [`assert_top_k_matches`] が境界マージンチェック用の参照スコアを全行分計算するのに使う。
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 /// 決定的シードで `(ids, vectors, query)` を合成する。
 fn synth_case(seed: u64, n: usize, dim: usize) -> (Vec<u64>, Vec<f32>, Vec<f32>) {
     let mut rng = Rng::new(seed);
@@ -67,10 +58,9 @@ fn synth_case(seed: u64, n: usize, dim: usize) -> (Vec<u64>, Vec<f32>, Vec<f32>)
     (ids, vectors, query)
 }
 
-/// 境界（k 番目・k+1 番目）の参照スコア差が十分なマージンを持つことを確認したうえで
-/// 両 provider の Top-k を比較する（浮動小数点誤差で境界の勝敗が入れ替わらないことの
-/// 事前条件チェック）。マージン不足の場合はテスト構成自体の誤りとして panic させる
-/// （fail-closed: 曖昧な入力でテストの green を偽装しない）。
+/// 両 provider の Top-k（集合・順序・スコア値）が bit 単位で完全一致することを検証する。
+/// `dot` を共有する構造上、加算順序の分岐は起こり得ないため、境界のスコア差（マージン）
+/// に関わらず常に厳密一致を主張できる。
 fn assert_top_k_matches(ids: &[u64], vectors: &[f32], dim: u32, query: &[f32], k: usize) {
     let scalar_input = SearchInput {
         ids,
@@ -88,56 +78,10 @@ fn assert_top_k_matches(ids: &[u64], vectors: &[f32], dim: u32, query: &[f32], k
     };
     let scalar = CpuScalarProvider.search(scalar_input).expect("scalar ok");
     let simd = SimdSearchProvider.search(simd_input).expect("simd ok");
-
-    let dim_usize = dim as usize;
-    if dim_usize < 16 {
-        assert_eq!(scalar, simd, "dim<16 must match bit-for-bit (ids/scores)");
-        return;
-    }
-
-    // 境界マージンチェック: 全行の参照スコア（スカラー逐次和 `dot`）を降順に並べ、
-    // k 番目と k+1 番目の差が丸め誤差より十分大きいことを確認してから id 集合・
-    // 順序を比較する。マージンが小さすぎると、加算順序差に起因する丸め誤差だけで
-    // 選出集合の境界が入れ替わりうるため（テスト構成自体の誤り。fail-closed: 曖昧な
-    // 入力でテストの green を偽装しない）。
-    let row_count = ids.len();
-    if row_count > k {
-        let mut all_scores: Vec<f32> = (0..row_count)
-            .map(|i| {
-                let start = i * dim_usize;
-                let end = start + dim_usize;
-                dot(&vectors[start..end], query)
-            })
-            .collect();
-        all_scores.sort_by(|a, b| b.total_cmp(a));
-        let boundary = all_scores[k - 1];
-        let next = all_scores[k];
-        let margin = boundary - next;
-        // 加算順序差に起因する誤差は `chunks_exact(8)` 化で高々 O(dim * f32::EPSILON *
-        // スコア規模) 程度（各要素の丸め誤差が線形に積み上がる上界）。安全係数 16 倍を
-        // 掛けて、この見積りより明確に大きい境界差だけを「安全」とみなす
-        // （1e-3 のような固定相対許容度は dim・スコア規模に依存せず恣意的なため使わない）。
-        let boundary_tolerance =
-            f32::EPSILON * (dim_usize as f32) * boundary.abs().max(next.abs()).max(1.0) * 16.0;
-        assert!(
-            margin > boundary_tolerance,
-            "test case has insufficient score margin at k-th boundary \
-             (margin={margin}, boundary_tolerance={boundary_tolerance}); pick a different seed/k"
-        );
-    }
-
-    let ids_match: Vec<u64> = simd.iter().map(|h| h.id).collect();
-    let expected_ids: Vec<u64> = scalar.iter().map(|h| h.id).collect();
-    assert_eq!(ids_match, expected_ids, "top-k id order must match");
-    for (s, m) in scalar.iter().zip(simd.iter()) {
-        assert_eq!(s.id, m.id);
-        assert!(
-            (s.score - m.score).abs() <= s.score.abs().max(m.score.abs()) * 1e-3 + 1e-4,
-            "score mismatch beyond fp accumulation-order tolerance: scalar={:?} simd={:?}",
-            s,
-            m
-        );
-    }
+    assert_eq!(
+        scalar, simd,
+        "top-k (ids/order/scores) must match bit-for-bit"
+    );
 }
 
 #[test]
@@ -162,11 +106,7 @@ fn matches_scalar_reference_for_various_n_dim_k() {
 #[test]
 fn matches_scalar_reference_with_duplicate_vectors_tie() {
     // 同一ベクトルの複製による同点を、選出段のタイブレーク（id 昇順）が両 provider で
-    // 一致することの確認に使う。dim < 16（`chunks_exact(8)` のフルチャンクが 1 個以下）を
-    // 選ぶ: `dot_vectorized`
-    // のドキュメントどおりこの範囲でのみスカラー逐次和と bit 単位で一致する
-    // （複数チャンクにまたがる dim では、値が同一でも加算順序自体が異なるため
-    // 一致しない）。
+    // 一致することの確認に使う。
     let dim = 8usize;
     let mut rng = Rng::new(42);
     let base = rng.next_vector(dim);

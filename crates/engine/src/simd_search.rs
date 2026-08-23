@@ -8,10 +8,14 @@
 //! （[`crate::kernel::KernelError`] を共用し、`core.rs` 側の Top-k 契約検証とも整合）。
 //!
 //! 依存最小方針（`.claude/rules/dependency-policy.md`）に従い新規クレートは追加しない。
-//! ベクトル化は `unsafe`・intrinsics を使わず `chunks_exact(8)` ＋複数アキュムレータの
-//! 安全な形にとどめ、release ビルドでの自動ベクトル化に委ねる。並列化は
-//! `std::thread::scope`（stable）による行範囲分割のみで、外部からのスレッド数・
-//! カーネル選択の上書き機構は設けない（CORE-12 の方針）。
+//! 内積計算は `kernel.rs::dot`（スカラー参照実装）をそのまま呼び出す。以前は
+//! `chunks_exact(8)` ＋複数アキュムレータの自前ベクトル化を持っていたが、
+//! `dim >= 16` で加算順序がスカラー参照実装と分岐し、丸め誤差により
+//! `CpuScalarProvider` と Top-k の集合・順序が食い違い得る不変条件違反があった
+//! （Issue #34 レビュー指摘対応）。単一の加算順序を構造的に保証するため
+//! `dot` を共有する形へ変更し、並列化のみを本 provider の役割とする
+//! （`std::thread::scope`（stable）による行範囲分割。外部からのスレッド数・
+//! カーネル選択の上書き機構は設けない。CORE-12 の方針）。
 //!
 //! 同時実行クエリ間の合計ワーカースレッド数は [`GLOBAL_WORKER_BUDGET`]（プロセス全体で
 //! 共有する `AtomicUsize`）で調停する（Issue #34 レビュー指摘対応。security.md
@@ -68,12 +72,12 @@ impl Drop for WorkerBudgetGuard {
 /// 単一スレッドへ縮退」という設計判断に対応）。
 const MIN_ROWS_PER_THREAD: usize = 1024;
 
-/// ベクトル化＋マルチスレッド並列の総当たり Top-k provider（TASK-126）。
+/// マルチスレッド並列の総当たり Top-k provider（TASK-126）。
 ///
 /// 総当たり（exhaustive）である点は [`crate::kernel::CpuScalarProvider`] と同じで、
-/// 近似検索ではない。したがって選出される Top-k 集合はスカラー参照実装と一致する
-/// （浮動小数点の加算順序差により個々のスコア値が bit 単位で一致しない場合はあるが、
-/// 集合・順序は一致する。`crates/engine/tests/simd_search.rs` で検証）。
+/// 近似検索ではない。内積計算は `kernel.rs::dot` を共有するため、選出される Top-k
+/// 集合・順序（同点タイブレーク含む）はスコア値も含めてスカラー参照実装と bit 単位で
+/// 一致する（`crates/engine/tests/simd_search.rs` で検証）。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SimdSearchProvider;
 
@@ -111,9 +115,20 @@ impl SearchProvider for SimdSearchProvider {
             1usize
         } else {
             let guard = WorkerBudgetGuard::acquire(desired_threads);
-            let granted = guard.granted().max(1);
-            _budget_guard = Some(guard);
-            granted
+            let granted = guard.granted();
+            if granted <= 1 {
+                // 確保できた枠が 1 以下だと下の `effective_threads <= 1` 分岐へ落ち、
+                // 実際には並列ワーカーを 1 つも起動しない。その場合にガードだけを
+                // 生存させ続けるとグローバル予算のスロットを検索終了まで無駄に
+                // 占有し、他の同時実行クエリを不必要に飢餓状態にする
+                // （Cursor Bugbot 指摘対応）。ここで即座に解放する。
+                drop(guard);
+                _budget_guard = None;
+                1usize
+            } else {
+                _budget_guard = Some(guard);
+                granted
+            }
         };
 
         let partials: Vec<TopKSelector> =
@@ -224,7 +239,7 @@ fn search_range(
             // `Ok` のまま。厳密な fail-closed ではない点は `kernel.rs` 側のコメント参照）。
             continue;
         };
-        let score = dot_vectorized(vector, query);
+        let score = crate::kernel::dot(vector, query);
         if !score.is_finite() {
             // 格納ベクトルの NaN/Inf 混入に対する除外
             // （`kernel.rs::CpuScalarProvider::search` と同じ理由）。
@@ -235,60 +250,9 @@ fn search_range(
     selector
 }
 
-/// 内積（dot product）を 8 要素幅のアキュムレータ配列でベクトル化して計算する。
-/// `unsafe`・intrinsics は使わず、release ビルド（opt-level 3）での自動ベクトル化
-/// （NEON/AVX2 相当）に委ねる安全な形にとどめる（依存最小方針・coding-rust.md
-/// 「`unsafe` は原則禁止」準拠）。
-///
-/// 添字アクセスは使わず `chunks_exact` ＋ イテレータ合成のみで書く（coding-rust.md の
-/// untrusted 入力に対する添字アクセス禁止方針を、格納済みベクトル経路にも一貫して
-/// 適用する）。
-///
-/// `dim < 16`（`chunks_exact(8)` が生成するフルチャンクが 1 個以下）の場合、本関数は
-/// `kernel.rs::dot`（スカラー実装の左から右への逐次加算）と bit 単位で同一の結果を返す
-/// （アキュムレータ各要素がちょうど 1 個の積しか保持せず、最終還元の加算順序が
-/// スカラー実装の逐次和と一致するため）。`dim >= 16` では複数チャンクにまたがる
-/// 加算順序がスカラー実装と異なるため、浮動小数点演算の非結合性により値が
-/// bit 単位では一致しない場合がある（総当たりであるため選出される集合・順序は
-/// 一致する。`crates/engine/tests/simd_search.rs` 参照）。
-fn dot_vectorized(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    let mut chunks_a = a.chunks_exact(8);
-    let mut chunks_b = b.chunks_exact(8);
-    for (chunk_a, chunk_b) in chunks_a.by_ref().zip(chunks_b.by_ref()) {
-        for (acc_lane, (&x, &y)) in acc.iter_mut().zip(chunk_a.iter().zip(chunk_b.iter())) {
-            *acc_lane += x * y;
-        }
-    }
-    let mut sum = 0f32;
-    for &lane in acc.iter() {
-        sum += lane;
-    }
-    for (&x, &y) in chunks_a.remainder().iter().zip(chunks_b.remainder().iter()) {
-        sum += x * y;
-    }
-    sum
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dot_vectorized_matches_sequential_sum_for_small_dims() {
-        // dim < 16（`chunks_exact(8)` のフルチャンクが 1 個以下）は本関数のドキュメント
-        // どおり bit 単位でスカラー逐次和と一致するはず。
-        for dim in [0usize, 1, 7, 8, 9, 15] {
-            let a: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.5 + 1.0).collect();
-            let b: Vec<f32> = (0..dim).map(|i| (i as f32) * -0.25 + 2.0).collect();
-            let sequential: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-            assert_eq!(
-                dot_vectorized(&a, &b),
-                sequential,
-                "dim={dim} must match bit-for-bit"
-            );
-        }
-    }
 
     #[test]
     fn top_k_returns_highest_dot_product_scores() {
@@ -482,11 +446,57 @@ mod tests {
         let simd_hits = SimdSearchProvider.search(make_input()).expect("simd ok");
         let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
 
-        let simd_ids: Vec<u64> = simd_hits.iter().map(|h| h.id).collect();
-        let scalar_ids: Vec<u64> = scalar_hits.iter().map(|h| h.id).collect();
+        // `dot` を共有するため id・score とも bit 単位で一致するはず（Issue #34
+        // codex-review P1 指摘対応: 以前の自前ベクトル化は dim>=16 で加算順序が
+        // 分岐し、値の一致は保証できなかった）。
         assert_eq!(
-            simd_ids, scalar_ids,
-            "SimdSearchProvider と CpuScalarProvider の選出 id 集合が一致すること"
+            simd_hits, scalar_hits,
+            "SimdSearchProvider と CpuScalarProvider の選出 id・score が一致すること"
+        );
+    }
+
+    #[test]
+    fn multi_thread_path_matches_scalar_reference_for_near_tie_scores_at_dim_ge_16() {
+        // codex-review P1 指摘の回帰テスト: `dim >= 16` かつマルチスレッド経路
+        // （`MIN_ROWS_PER_THREAD` を超える規模）で、複数行がほぼ同一スコア（僅差）に
+        // なるよう意図的に作った入力に対しても、`SimdSearchProvider` と
+        // `CpuScalarProvider` の Top-k が完全一致することを確認する。以前の自前
+        // ベクトル化（複数アキュムレータでの並び替え加算）は、この種の僅差入力で
+        // 丸め誤差により集合・順序がスカラー参照実装と食い違い得た。
+        use crate::kernel::CpuScalarProvider;
+
+        let dim = 32usize;
+        let row_count = MIN_ROWS_PER_THREAD * 3 + 11;
+        let mut ids = Vec::with_capacity(row_count);
+        let mut vectors = Vec::with_capacity(row_count * dim);
+        for i in 0..row_count {
+            ids.push(i as u64);
+            for d in 0..dim {
+                // 行ごとにベクトル要素の並び順だけを変える（総和はほぼ同じになるよう
+                // 値の集合を固定し、行内の順序を row index で回転させる）ことで、
+                // 内積の加算順序に依存する丸め誤差が出やすい「ほぼ同スコア」の
+                // 候補群を作る。
+                let phase = (i + d) % dim;
+                vectors.push(((phase % 17) as f32) * 0.1 - 0.8);
+            }
+        }
+        let query: Vec<f32> = (0..dim).map(|d| ((d % 13) as f32) * 0.1 - 0.6).collect();
+
+        let make_input = || SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: dim as u32,
+            query: &query,
+            k: 10,
+        };
+
+        let simd_hits = SimdSearchProvider.search(make_input()).expect("simd ok");
+        let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
+
+        assert_eq!(
+            simd_hits, scalar_hits,
+            "僅差スコアの Top-k 境界でも SimdSearchProvider と CpuScalarProvider の \
+             選出 id・順序・score が一致すること"
         );
     }
 
