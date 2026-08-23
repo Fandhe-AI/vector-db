@@ -147,10 +147,10 @@ fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize)
 /// （`redb::ReadTransaction` のスナップショット契約をそのまま引き継ぐ）。
 #[derive(Debug)]
 pub struct VectorArena {
-    /// 構築時に `build` へ渡されたテーブル名（カタログゲートで「このテーブルしか
-    /// 存在しないことを検証した」対象。行への永続的なテーブル識別子がまだ存在しない
-    /// ため、`vectors`/`ids` の全行がこのテーブルに帰属することの保証ではない
-    /// （モジュールドキュメントのスコープ境界を参照）。
+    /// 構築時に `build` へ渡されたテーブル名。`vectors`/`ids` の全行はこのテーブル専用の
+    /// 行テーブル（[`crate::catalog::user_rows_table_name`] が指す
+    /// `user_rows/{table_name}`）のみを走査した結果であり、他テーブルの行は保存先が
+    /// 分離されているため混入しない（モジュールドキュメントの「テーブル帰属」参照）。
     table_name: String,
     dim: u32,
     /// 行 ID 昇順・row-major の連続バッファ。長さは常に `ids.len() * dim` と一致する。
@@ -278,8 +278,8 @@ impl VectorArena {
         })
     }
 
-    /// 構築時に `build` へ渡されたテーブル名（カタログゲートで検証した対象。
-    /// 全行の帰属保証ではない。上記フィールドのドキュメント参照）。
+    /// 構築時に `build` へ渡されたテーブル名（全行がこのテーブルに帰属することを
+    /// 保証する。上記フィールドのドキュメント参照）。
     pub fn table_name(&self) -> &str {
         &self.table_name
     }
