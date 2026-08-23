@@ -14,8 +14,12 @@ use std::time::Duration;
 pub enum BenchError {
     /// 統計計算対象のサンプル列が空だった。
     EmptySamples,
-    /// 計測プロトコルの下限（warmup・計測回数など）を満たさない構成が渡された。
+    /// 計測プロトコルの下限・上限（warmup・計測回数など）を満たさない構成が渡された。
     ProtocolViolation(&'static str),
+    /// 比率計算の分母が 0 で、NaN/+inf など fail-open な値になりうる状態だった
+    /// （`ab::run_ab` の `median_ratio` 算出。回帰ゲートが NaN で暗黙に false 評価される
+    /// 事態を防ぐため、算出不能を明示的な `Err` として呼び出し側に伝える）。
+    DegenerateRatio(&'static str),
 }
 
 impl std::fmt::Display for BenchError {
@@ -24,6 +28,9 @@ impl std::fmt::Display for BenchError {
             BenchError::EmptySamples => write!(f, "empty sample set"),
             BenchError::ProtocolViolation(reason) => {
                 write!(f, "protocol violation: {reason}")
+            }
+            BenchError::DegenerateRatio(reason) => {
+                write!(f, "degenerate ratio: {reason}")
             }
         }
     }

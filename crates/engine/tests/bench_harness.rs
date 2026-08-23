@@ -13,7 +13,7 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 
-use harness::ab::{run_ab, AbMeasurement};
+use harness::ab::{median_ratio, run_ab, AbMeasurement};
 use harness::protocol::{run, Measurement, MeasurementConfig};
 use harness::rng::DeterministicRng;
 use harness::stats::{self, BenchError, Summary};
@@ -30,6 +30,18 @@ fn config_rejects_warmup_below_protocol_minimum() {
 #[test]
 fn config_rejects_measured_below_protocol_minimum() {
     let err = MeasurementConfig::new(20, 19, 0).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn config_rejects_iterations_above_protocol_maximum() {
+    // 開発者操作起点とはいえ、上限検証なしには measured_iterations がそのまま
+    // Vec::with_capacity に渡され無制限アロケーションを起こしうる
+    // （coding-rust.md: 無制限 Vec::with_capacity 禁止）。
+    let err = MeasurementConfig::new(20, u32::MAX, 0).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = MeasurementConfig::new(u32::MAX, 20, 0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
@@ -83,6 +95,35 @@ fn stats_summarize_matches_expected_statistics_for_known_samples() {
 fn stats_summarize_rejects_empty_samples() {
     let err = stats::summarize(&[]).unwrap_err();
     assert_eq!(err, BenchError::EmptySamples);
+}
+
+#[test]
+fn stats_summarize_interpolates_at_protocol_minimum_sample_count() {
+    // 計測プロトコル下限（20 サンプル）ちょうどでの実運用経路。
+    // last_index=19 のため q1 のランクは 0.25*19=4.75 と非整数になり、
+    // `percentile` の線形補間分岐（lower_index != upper_index）を必ず通る
+    // （n=9 の他テストは端数の出ない特殊ケースのみを通っていたため、本番で
+    // 必ず踏む経路を別途検証する）。
+    let samples: Vec<Duration> = (1..=20).map(Duration::from_millis).collect();
+    let summary = stats::summarize(&samples).expect("non-empty samples must summarize");
+
+    // 期待値: q1 rank=4.75 -> 5ms + (6ms-5ms)*0.75 = 5.75ms
+    //         median rank=9.5 -> 10ms + (11ms-10ms)*0.5 = 10.5ms
+    //         q3 rank=14.25 -> 15ms + (16ms-15ms)*0.25 = 15.25ms
+    let epsilon = Duration::from_nanos(1_000);
+    assert_duration_approx_eq(summary.q1, Duration::from_micros(5_750), epsilon);
+    assert_duration_approx_eq(summary.median, Duration::from_micros(10_500), epsilon);
+    assert_duration_approx_eq(summary.q3, Duration::from_micros(15_250), epsilon);
+}
+
+/// `Duration::from_secs_f64` を経由する補間結果は浮動小数演算の丸め誤差を含みうるため、
+/// 完全一致ではなく許容誤差付きで比較する。
+fn assert_duration_approx_eq(actual: Duration, expected: Duration, epsilon: Duration) {
+    let diff = actual.abs_diff(expected);
+    assert!(
+        diff <= epsilon,
+        "expected {expected:?} +/- {epsilon:?}, got {actual:?} (diff {diff:?})"
+    );
 }
 
 // rng: 同一シードの決定性・異なるシードでの非決定性・単位区間の範囲・次元。
@@ -142,6 +183,25 @@ fn run_ab_returns_measurements_for_both_paths_in_alternating_order() {
     for pair in recorded.chunks(2) {
         assert_eq!(pair, ['a', 'b']);
     }
+}
+
+#[test]
+fn median_ratio_rejects_zero_baseline_denominator_instead_of_producing_nan_or_inf() {
+    // B 側中央値が Duration::ZERO だと単純な a/b は NaN（両方 0）または +inf（a のみ
+    // 非 0）になり、`median_ratio < threshold` 等の回帰ゲートが NaN で暗黙に false
+    // 評価される fail-open を生む。実測タイマーに依存せず直接検証する。
+    let err = median_ratio(Duration::from_millis(1), Duration::ZERO).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+
+    let err = median_ratio(Duration::ZERO, Duration::ZERO).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+#[test]
+fn median_ratio_computes_finite_nonnegative_value_for_nonzero_denominator() {
+    let ratio = median_ratio(Duration::from_millis(1), Duration::from_millis(2)).unwrap();
+    assert!(ratio.is_finite() && ratio >= 0.0);
+    assert!((ratio - 0.5).abs() < f64::EPSILON);
 }
 
 // 空サンプル・不正構成でパニックしないこと（Err 経路）。

@@ -7,7 +7,7 @@
 //! 時間経過に伴う偏りが片方の経路だけに乗るのを防ぐ。
 
 use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::protocol::{Measurement, MeasurementConfig};
 use super::stats::{self, BenchError};
@@ -18,7 +18,8 @@ pub struct AbMeasurement {
     pub a: Measurement,
     pub b: Measurement,
     /// 中央値の比率（`a.summary.median` / `b.summary.median`）。
-    /// 1.0 未満なら A が B より高速。
+    /// 1.0 未満なら A が B より高速。分母（B の中央値）が 0 の場合は `run_ab` が
+    /// `Err(BenchError::DegenerateRatio)` を返すため、この値は常に有限かつ非負。
     pub median_ratio: f64,
 }
 
@@ -69,7 +70,7 @@ pub fn run_ab<T>(
     let summary_a = stats::summarize(&samples_a)?;
     let summary_b = stats::summarize(&samples_b)?;
 
-    let median_ratio = summary_a.median.as_secs_f64() / summary_b.median.as_secs_f64();
+    let median_ratio = median_ratio(summary_a.median, summary_b.median)?;
 
     Ok(AbMeasurement {
         a: Measurement {
@@ -82,4 +83,23 @@ pub fn run_ab<T>(
         },
         median_ratio,
     })
+}
+
+/// 中央値比率（a/b）を算出する。B 側が `Duration::ZERO`（極めて軽量なワークロード・
+/// 粗い clock 分解能等）だと単純な a/b は NaN（両方 0）または +inf（a のみ非 0）になり、
+/// `median_ratio < threshold` 等の回帰ゲートが NaN で暗黙に false 評価される fail-open を
+/// 生む（TASK-130 がこの入口を経由する契約のため fail-closed に倒す）。
+///
+/// `pub(crate)` として切り出し `tests/bench_harness.rs` から実測タイマーに依存せず
+/// 直接検証できるようにしている（本ファイルは `#[path]` 経由で bench クレート・
+/// テストクレート双方に取り込まれるため、bench コンパイル時（`--test` フラグなし）は
+/// `#[test]` 項目が丸ごと除去され、同じ場所に `#[cfg(test)] mod tests` を置くと
+/// `use super::*;` が unused import になってしまう）。
+pub(crate) fn median_ratio(median_a: Duration, median_b: Duration) -> Result<f64, BenchError> {
+    if median_b.is_zero() {
+        return Err(BenchError::DegenerateRatio(
+            "cannot compute median_ratio: baseline (b) median is zero",
+        ));
+    }
+    Ok(median_a.as_secs_f64() / median_b.as_secs_f64())
 }

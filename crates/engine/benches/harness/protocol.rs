@@ -28,6 +28,13 @@ const MIN_WARMUP_ITERATIONS: u32 = 20;
 /// 計測プロトコルが要求する計測回数の下限（`MIN_WARMUP_ITERATIONS` 同様の根拠）。
 const MIN_MEASURED_ITERATIONS: u32 = 20;
 
+/// warmup・計測回数の上限（coding-rust.md: 「長さフィールドは上限検証してから
+/// アロケーションに使う」「無制限 `Vec::with_capacity` 禁止」に対応）。
+/// `run`/`run_ab` は `measured_iterations` をそのまま `Vec::with_capacity` に渡すため、
+/// 開発者操作起点の巨大値でも上限検証なしには数十 GB 規模のアロケーションが発生しうる。
+/// `Duration`（16 bytes）× この上限 × 2（A/B 経路）でも数十 MB に収まる値を採用する。
+const MAX_ITERATIONS: u32 = 1_000_000;
+
 /// 単独計測の実行設定。
 ///
 /// フィールドは非公開とし、`new`（検証コンストラクタ）経由でのみ構築できる。
@@ -42,7 +49,8 @@ pub struct MeasurementConfig {
 
 impl MeasurementConfig {
     /// 検証コンストラクタ。プロトコル下限（warmup 20 回以上・計測 20 回以上）を
-    /// 満たさない場合は `Err(BenchError::ProtocolViolation)` を返す。
+    /// 満たさない場合、または `MAX_ITERATIONS` を超える場合は
+    /// `Err(BenchError::ProtocolViolation)` を返す。
     pub fn new(
         warmup_iterations: u32,
         measured_iterations: u32,
@@ -56,6 +64,16 @@ impl MeasurementConfig {
         if measured_iterations < MIN_MEASURED_ITERATIONS {
             return Err(BenchError::ProtocolViolation(
                 "measured_iterations below protocol minimum",
+            ));
+        }
+        if warmup_iterations > MAX_ITERATIONS {
+            return Err(BenchError::ProtocolViolation(
+                "warmup_iterations exceeds protocol maximum",
+            ));
+        }
+        if measured_iterations > MAX_ITERATIONS {
+            return Err(BenchError::ProtocolViolation(
+                "measured_iterations exceeds protocol maximum",
             ));
         }
         Ok(Self {
