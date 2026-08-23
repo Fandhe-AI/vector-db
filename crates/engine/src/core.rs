@@ -135,12 +135,21 @@ impl EngineCore {
     }
 
     /// 直接 `Storage` から構築する（テスト用途。呼び出し元が既に開いたハンドルを
-    /// 再利用したい場合に使う）。
+    /// 再利用したい場合に使う）。`test-support` feature 限定（下記 [`Self::storage`] 参照）。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
         Self { storage, provider }
     }
 
-    /// 保持している永続化ハンドルへの参照（テスト・呼び出し元の下位層直接操作用）。
+    /// 保持している永続化ハンドルへの参照（テスト用途限定）。
+    ///
+    /// `Storage` はテナント境界を判定しない生ハンドルであり、[`VectorCore::get_row`]・
+    /// [`VectorCore::search`] が経由する [`crate::policy::PolicyContext::is_visible`] の
+    /// 単一照合パスを迂回できる（security.md P0「テナント分離の検査を外す/緩める/
+    /// バイパス経路を作らない」）。そのため通常ビルド（`wire-server` を含む）の公開面には
+    /// 含めず、`test-support` feature 限定で `tests/` 配下の結合テストにのみ公開する
+    /// （`Cargo.toml` の self dev-dependency 経由で結合テストビルド時のみ有効化）。
+    #[cfg(any(test, feature = "test-support"))]
     pub fn storage(&self) -> &Storage {
         &self.storage
     }
@@ -188,8 +197,14 @@ impl VectorCore for EngineCore {
         let row = match self.storage.get_row_from_table(table, id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
-            // 合流させる。
-            Err(_) => return Err(CoreError::NotFound),
+            // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
+            // `NotFound` に丸め込まず `CoreError::Catalog` としてそのまま伝播する
+            // （アクセス不可とデータ破損を区別する。`search` 経路が `ArenaError` を
+            // そのまま伝播するのと非対称にならないようにする）。
+            Err(CatalogError::TableNotFound(_) | CatalogError::RowNotFound(_)) => {
+                return Err(CoreError::NotFound)
+            }
+            Err(e) => return Err(CoreError::Catalog(e)),
         };
         if !ctx.is_visible(&row.tenant_id, row.visibility) {
             return Err(CoreError::NotFound);

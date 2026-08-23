@@ -17,7 +17,18 @@ path = "src/lib.rs"
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 redb = "=4.2.0"
 
+[features]
+# レビュー指摘対応（Issue #32）: `EngineCore::storage`/`from_storage` はテナント境界の
+# 単一照合パス（`PolicyContext::is_visible`）を迂回できるため、通常ビルド（wire-server 含む）
+# には含めない。`tests/` 配下の結合テストのみへ限定して公開する（下記 self dev-dependency 参照）。
+test-support = []
+
 [dev-dependencies]
+# self dev-dependency（新規外部依存ではない。`path = "."` で自クレートを指すのみ・
+# Cargo.lock にエントリを追加しない）: `tests/` 配下の結合テストをビルドするときだけ
+# `test-support` feature を有効化し、`EngineCore::storage`/`from_storage`（テナント境界の
+# 単一照合パスを迂回する生ハンドル API）を通常ビルドの公開面から外す。
+engine = { path = ".", features = ["test-support"] }
 # tests/persistence.rs・tests/power_loss.rs（対象ビヘイビア: PERSIST-1, PERSIST-4）が、
 # Storage の公開 API では表現できないトランザクション境界・`StorageBackend` 差し替えに
 # 踏み込んで検証するために同一バージョンの redb を直接操作する。新規依存の追加ではなく

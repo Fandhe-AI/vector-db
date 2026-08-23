@@ -26,6 +26,10 @@ pub struct SearchHit {
 pub enum KernelError {
     /// クエリベクトルの次元がアリーナの次元と一致しない。
     DimMismatch { expected: u32, found: usize },
+    /// クエリベクトルの要素に非有限値（NaN・Inf）が含まれる。呼び出し元（wire 経路）からの
+    /// untrusted 入力のため、`total_cmp` の順序に頼らず明示的に拒否する
+    /// （coding-rust.md「untrusted 入力の扱い」対応。fail-closed）。
+    NonFiniteQuery,
 }
 
 impl fmt::Display for KernelError {
@@ -35,6 +39,7 @@ impl fmt::Display for KernelError {
                 f,
                 "kernel query dim mismatch: expected={expected} found={found}"
             ),
+            KernelError::NonFiniteQuery => write!(f, "kernel query contains non-finite value"),
         }
     }
 }
@@ -84,20 +89,32 @@ impl SearchProvider for CpuScalarProvider {
                 found: input.query.len(),
             });
         }
+        // クエリは wire 経路からの untrusted 入力であり得るため、次元検証の直後に
+        // 明示的に拒否する（`total_cmp` は NaN を最大値扱いにするため、ここで
+        // 弾かないと不正なクエリ 1 件が Top-k を恒久的に占有し得る）。
+        if input.query.iter().any(|v| !v.is_finite()) {
+            return Err(KernelError::NonFiniteQuery);
+        }
         if input.k == 0 || input.ids.is_empty() {
             return Ok(Vec::new());
         }
 
         // スコア最小のヒープを保持し、サイズ k を超えたら最小要素を捨てる
         // （Top-k 選出。事前に全件確保しない）。`f32` は全順序を持たないため
-        // `total_cmp` で比較し、NaN 混入時も panic せず一貫した順序を得る。
+        // 比較には `total_cmp` を使う（[`MinHeapItem`] 参照）。ただし NaN/Inf 混入行は
+        // 下記ループで `score.is_finite()` を確認して除外するため、ヒープに乗る
+        // スコアは常に有限値になる（`total_cmp` の全順序性は同点判定・整列の安定性の
+        // ためだけに使い、NaN の順序上の扱いには依存しない）。
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
 
+        // 同点タイブレーク（Low 指摘対応）: スコアが同じ場合は id が小さい方を「強い」候補
+        // として扱う（返却直前の `sort_by` が id 昇順で安定させるのと選出段の基準を揃える。
+        // ヒープ挿入順・入力順に依存しない決定的な選出にする）。
         struct MinHeapItem(SearchHit);
         impl PartialEq for MinHeapItem {
             fn eq(&self, other: &Self) -> bool {
-                self.0.score.total_cmp(&other.0.score) == std::cmp::Ordering::Equal
+                self.cmp(other) == std::cmp::Ordering::Equal
             }
         }
         impl Eq for MinHeapItem {}
@@ -108,7 +125,10 @@ impl SearchProvider for CpuScalarProvider {
         }
         impl Ord for MinHeapItem {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0.score.total_cmp(&other.0.score)
+                self.0
+                    .score
+                    .total_cmp(&other.0.score)
+                    .then(other.0.id.cmp(&self.0.id))
             }
         }
 
@@ -126,13 +146,21 @@ impl SearchProvider for CpuScalarProvider {
                 continue;
             };
             let score = dot(vector, input.query);
+            if !score.is_finite() {
+                // 格納ベクトルの NaN/Inf 混入、またはオーバーフローによる内積の非有限化
+                // （Medium 指摘対応）。`total_cmp` は +NaN を最大値扱いにするため、
+                // 有限値チェックなしでは 1 行の非有限スコアが Top-k を恒久的に占有し
+                // 正当な上位ヒットを押し出しかねない。fail-closed に当該行を除外する。
+                continue;
+            }
             let hit = SearchHit { id, score };
+            let candidate = MinHeapItem(hit);
             if heap.len() < input.k {
-                heap.push(Reverse(MinHeapItem(hit)));
+                heap.push(Reverse(candidate));
             } else if let Some(Reverse(top)) = heap.peek() {
-                if hit.score > top.0.score {
+                if candidate > *top {
                     heap.pop();
-                    heap.push(Reverse(MinHeapItem(hit)));
+                    heap.push(Reverse(candidate));
                 }
             }
         }
@@ -199,6 +227,74 @@ mod tests {
         let hits = CpuScalarProvider.search(input).expect("search ok");
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.id != 2));
+    }
+
+    #[test]
+    fn non_finite_query_is_rejected() {
+        let ids = [1u64];
+        let vectors = [1.0, 0.0];
+        let visible = always_visible;
+        for query in [
+            [f32::NAN, 0.0],
+            [f32::INFINITY, 0.0],
+            [0.0, f32::NEG_INFINITY],
+        ] {
+            let input = SearchInput {
+                ids: &ids,
+                vectors: &vectors,
+                dim: 2,
+                query: &query,
+                k: 1,
+                is_visible: &visible,
+            };
+            let err = CpuScalarProvider.search(input).unwrap_err();
+            assert_eq!(err, KernelError::NonFiniteQuery, "query={query:?}");
+        }
+    }
+
+    #[test]
+    fn non_finite_stored_score_is_excluded_and_legitimate_hits_keep_rank() {
+        let ids = [1u64, 2, 3];
+        // id=2 の行は NaN を含み、内積が NaN になる（Top-k を占有してはならない）。
+        let vectors = [1.0, 0.0, f32::NAN, 0.0, 2.0, 0.0];
+        let query = [1.0, 0.0];
+        let visible = always_visible;
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query,
+            k: 2,
+            is_visible: &visible,
+        };
+        let hits = CpuScalarProvider.search(input).expect("search ok");
+        assert_eq!(
+            hits,
+            vec![
+                SearchHit { id: 3, score: 2.0 },
+                SearchHit { id: 1, score: 1.0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn tied_scores_prefer_smaller_id_at_selection_boundary() {
+        let ids = [3u64, 2, 1];
+        // 3 行とも同スコア。k=1 のため、選出段のタイブレークで最終結果が決まる
+        // （挿入順は降順 id だが、結果は最小 id を選ぶ）。
+        let vectors = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let query = [1.0, 0.0];
+        let visible = always_visible;
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query,
+            k: 1,
+            is_visible: &visible,
+        };
+        let hits = CpuScalarProvider.search(input).expect("search ok");
+        assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
     }
 
     #[test]

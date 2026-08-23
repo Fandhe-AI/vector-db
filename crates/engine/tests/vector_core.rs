@@ -2,7 +2,6 @@
 //! 対象ビヘイビア: CORE-1（プロトコル非依存のコア API）・CORE-2（テナント境界の
 //! 単一照合パス）・CORE-13（実行バックエンド provider 注入）。境界系（次元・k 検証）も含む。
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -246,6 +245,50 @@ fn core2_get_row_does_not_distinguish_invisible_from_missing() {
     assert!(matches!(missing_row, Err(CoreError::NotFound)));
 }
 
+// レビュー指摘対応（Medium・Issue #32）: `get_row` はテーブル不存在・行不存在のみを
+// `CoreError::NotFound` に丸め込み、それ以外（デコード不正等のデータ破損）は
+// `CoreError::Catalog` としてそのまま伝播しなければならない。`Storage`/`EngineCore` の
+// 公開 API では意図的な破損データを作れないため、`tests/persistence.rs` と同じ手法で
+// テーブル固有の行テーブルへ `redb` を直接操作して不正なバイト列を書き込む。
+#[test]
+fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
+    let dir = TempDir::new("core-corrupt");
+    let path = dir.db_path();
+    {
+        let core = EngineCore::open(&path).expect("open engine core");
+        core.storage()
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        // `Storage`/`EngineCore` を閉じてから raw `redb::Database` で同一ファイルを
+        // 再度開く（redb はプロセス内で同一ファイルへの多重 `Database` を許容しない）。
+    }
+    {
+        let db = redb::Database::create(&path).expect("reopen raw database");
+        let write_txn = db.begin_write().expect("begin write txn");
+        {
+            // `catalog.rs::user_rows_table_name` と同一の命名規則（`user_rows/<table>`）。
+            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                redb::TableDefinition::new("user_rows/docs");
+            let mut table = write_txn.open_table(row_table_def).expect("open row table");
+            // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列。
+            table
+                .insert(1u64, &[1u8][..])
+                .expect("insert malformed row");
+        }
+        write_txn.commit().expect("commit malformed row");
+    }
+
+    let core = EngineCore::open(&path).expect("reopen engine core");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .get_row(&ctx, "docs", 1)
+        .expect_err("corrupted row must not be silently reported as NotFound");
+    assert!(
+        matches!(err, CoreError::Catalog(_)),
+        "expected CoreError::Catalog (data corruption surfaced distinctly), got: {err}"
+    );
+}
+
 /// negative test 用のダミー provider: `is_visible` を無視して常に全行を候補に含める
 /// （マスク無効化）。検査器（[`assert_no_cross_tenant_leak`]）がこの違反を実際に
 /// 検出できることを確認するための対照実験（CORE-2: 検査の実効性確認）。
@@ -438,13 +481,4 @@ fn boundary_empty_table_search_returns_empty_results() {
         .search(&ctx, "docs", &[1.0, 0.0], 5)
         .expect("search ok");
     assert!(hits.is_empty());
-}
-
-// 参照用（未使用 import の警告防止・将来の検査拡張に備えた共通ヘルパの明示公開）。
-#[allow(dead_code)]
-fn unique_tenants(hits: &[SearchHit], core: &EngineCore, table: &str) -> HashSet<String> {
-    hits.iter()
-        .filter_map(|h| core.storage().get_row_from_table(table, h.id).ok())
-        .map(|r| r.tenant_id)
-        .collect()
 }
