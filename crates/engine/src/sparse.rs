@@ -432,6 +432,8 @@ impl SparseIndex {
     /// より常に優先される。すなわち `k == 0` であっても、クエリが [`MAX_QUERY_BYTES`]・
     /// [`MAX_QUERY_TERMS`] を超えていれば空の `Vec` ではなく `Err` を返す（fail-closed の
     /// 原則を優先し、入力検証の可否が `k` の値に依存しない統一された契約とする）。
+    /// 実装上もバイト長検証 → `tokenize()` → 一意語数検証の全経路を終えてから
+    /// `k == 0` を判定する順序を維持する。
     ///
     /// 計算量: コーパスの全文書（`N` 件）についてクエリの一意語集合（`Q` 語）を
     /// `BTreeMap`（語彙数 `V`）で検索するため `O(N * Q * log V)`、その上で
@@ -456,15 +458,13 @@ impl SparseIndex {
                 max: MAX_QUERY_BYTES,
             });
         }
-        if k == 0 {
-            return Ok(Vec::new());
-        }
+
         let query_terms = tokenize(query);
-        if query_terms.is_empty() {
-            return Ok(Vec::new());
-        }
 
         // 重複クエリ語の IDF を二重計上しないよう一意化する（順序は不問。BTreeMap で決定的に）。
+        // `k == 0` の早期 return より前にここまで（バイト長・一意語数）の入力検証を
+        // すべて終える。入力検証の可否が `k` の値に依存しない統一された契約とするため
+        // （doc コメントの契約を参照）。
         let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
         for t in &query_terms {
             unique_terms.insert(t.clone(), ());
@@ -475,6 +475,12 @@ impl SparseIndex {
                 unique_terms: unique_terms.len(),
                 max: MAX_QUERY_TERMS,
             });
+        }
+
+        // 入力検証をすべて終えた後で、決定的な空結果ケース（`k == 0`・クエリがトークン
+        // を 1 つも含まない）を処理する。
+        if k == 0 || query_terms.is_empty() {
+            return Ok(Vec::new());
         }
 
         // 現在の Top-k 候補を保持する固定サイズ（最大 k 件）のヒープ。`Reverse` により
@@ -993,6 +999,24 @@ mod tests {
             SparseError::QueryTooLong {
                 len: MAX_QUERY_BYTES + 1,
                 max: MAX_QUERY_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn search_rejects_too_many_query_terms_even_when_k_is_zero() {
+        // バイト長は上限内でも一意語数が MAX_QUERY_TERMS を超えるクエリは、k == 0 でも
+        // TooManyQueryTerms を返す（tokenize → 一意化 → MAX_QUERY_TERMS 検証を終えてから
+        // k == 0 の早期 return を処理する順序の回帰検出）。
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let query = distinct_term_query(MAX_QUERY_TERMS + 1);
+        let err = idx.search(&query, 0).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyQueryTerms {
+                unique_terms: MAX_QUERY_TERMS + 1,
+                max: MAX_QUERY_TERMS,
             }
         );
     }
