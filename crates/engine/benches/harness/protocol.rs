@@ -17,11 +17,13 @@ use std::time::{Duration, Instant};
 
 use super::stats::{self, BenchError, Summary};
 
-/// 計測プロトコルが要求する warmup 回数の下限（TASK-158 参照）。
-/// この値を下回る `MeasurementConfig` は `new` が拒否する。
+/// warmup 回数の下限。極端に少ない回数では JIT・キャッシュ・周波数遷移等の
+/// ウォームアップ効果が計測フェーズへ持ち越され、統計値の再現性が損なわれるため
+/// 一定の下限を設ける。この値を下回る `MeasurementConfig` は `new` が拒否する。
 const MIN_WARMUP_ITERATIONS: u32 = 20;
 
-/// 計測プロトコルが要求する計測回数の下限（`MIN_WARMUP_ITERATIONS` 同様の根拠）。
+/// 計測回数の下限（`MIN_WARMUP_ITERATIONS` 同様、外れ値に頑健な要約統計値
+/// （中央値・四分位）を得るための最小サンプル数という一般的な統計上の根拠による）。
 const MIN_MEASURED_ITERATIONS: u32 = 20;
 
 /// warmup・計測回数の上限（coding-rust.md: 「長さフィールドは上限検証してから

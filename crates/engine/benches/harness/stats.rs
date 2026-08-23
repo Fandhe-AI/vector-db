@@ -45,12 +45,12 @@ pub struct Summary {
     pub q3: Duration,
 }
 
-/// 所要時間サンプル列から中央値・Q1/Q3 を算出する。
+/// 所要時間サンプル列から本モジュールの要約統計値を算出する。
 ///
-/// 方式: サンプルを昇順ソートした複製に対し、パーセンタイル位置を線形補間する
-/// （最近傍点法ではなく補間法を採用し、少数サンプルでも決定的な値を得る）。
-/// 空サンプルは `Err(BenchError::EmptySamples)` とし、呼び出し側に計測未実施を
-/// 判別可能にする（fail-closed）。
+/// 実装方式: サンプルを昇順ソートした複製に対し、パーセンタイル位置を線形補間する
+/// （最近傍点法ではなく補間法を採用し、少数サンプルでも決定的な値を得られるようにした
+/// 本モジュール内の実装選択）。空サンプルは `Err(BenchError::EmptySamples)` とし、
+/// 呼び出し側に計測未実施を判別可能にする（fail-closed）。
 pub fn summarize(samples: &[Duration]) -> Result<Summary, BenchError> {
     if samples.is_empty() {
         return Err(BenchError::EmptySamples);
@@ -67,8 +67,8 @@ pub fn summarize(samples: &[Duration]) -> Result<Summary, BenchError> {
 
 /// 昇順ソート済みサンプルに対する線形補間パーセンタイル。
 ///
-/// 添字アクセスは `get()` 経由で行い、境界計算のオーバーフローを避けるため
-/// `checked_*` 演算を使う（coding-rust.md: untrusted 入力の扱いに準じた防御的実装。
+/// 添字アクセスは `get()` 経由で行い、境界計算は `saturating_sub` で
+/// アンダーフローを避ける（coding-rust.md: untrusted 入力の扱いに準じた防御的実装。
 /// 本経路は untrusted 入力ではないが、同一の防御規律を保つ）。
 fn percentile(sorted: &[Duration], p: f64) -> Result<Duration, BenchError> {
     if sorted.is_empty() {

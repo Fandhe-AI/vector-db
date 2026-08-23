@@ -1,9 +1,8 @@
 //! `benches/harness/`（TASK-158 性能計測プロトコル基盤）の回帰テスト。
 //!
 //! 対象ビヘイビア ID なし（TASK-158 は基盤タスク。ポインタ: `docs/spec/05-tasks.md`
-//! TASK-158）。ビヘイビア ID を持たないため、本テストは「ハーネス自体の実装契約
-//! （下限値の拒否・決定的シード RNG・A/B の交互実行）を遵守すること」を
-//! 受け入れ条件として検証する。
+//! TASK-158）。ビヘイビア ID を持たないため、本テストは harness 自体の実装契約
+//! （各モジュールの公開 API が示す契約を遵守すること）を受け入れ条件として検証する。
 //!
 //! `#[path]` で `benches/harness/mod.rs` を直接取り込む（内部クレートを新設せず、
 //! `cargo bench` 入口〔`benches/measurement.rs`〕と同一ソースを共有する構成。
@@ -21,19 +20,19 @@ use std::time::Duration;
 // protocol::MeasurementConfig の下限拒否（fail-closed）。
 
 #[test]
-fn config_rejects_warmup_below_protocol_minimum() {
+fn config_rejects_warmup_below_min_warmup_iterations() {
     let err = MeasurementConfig::new(19, 20, 0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
 #[test]
-fn config_rejects_measured_below_protocol_minimum() {
+fn config_rejects_measured_below_min_measured_iterations() {
     let err = MeasurementConfig::new(20, 19, 0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
 #[test]
-fn config_rejects_iterations_above_protocol_maximum() {
+fn config_rejects_iterations_above_max_iterations() {
     // 開発者操作起点とはいえ、上限検証なしには measured_iterations がそのまま
     // Vec::with_capacity に渡され無制限アロケーションを起こしうる
     // （coding-rust.md: 無制限 Vec::with_capacity 禁止）。
@@ -45,7 +44,7 @@ fn config_rejects_iterations_above_protocol_maximum() {
 }
 
 #[test]
-fn default_config_matches_protocol_minimum_and_run_accepts_it() {
+fn default_config_matches_min_iterations_and_run_accepts_it() {
     let config = MeasurementConfig::default();
     // シードはこの検証では使わないが、下限だけでなくシード保持そのものが
     // 検証コンストラクタ・Default 双方から一貫して読めることを確認する。
@@ -97,8 +96,8 @@ fn stats_summarize_rejects_empty_samples() {
 }
 
 #[test]
-fn stats_summarize_interpolates_at_protocol_minimum_sample_count() {
-    // 計測プロトコル下限（20 サンプル）ちょうどでの実運用経路。
+fn stats_summarize_interpolates_at_min_measured_iterations_sample_count() {
+    // MIN_MEASURED_ITERATIONS（20 サンプル）ちょうどでの実運用経路。
     // last_index=19 のため q1 のランクは 0.25*19=4.75 と非整数になり、
     // `percentile` の線形補間分岐（lower_index != upper_index）を必ず通る
     // （n=9 の他テストは端数の出ない特殊ケースのみを通っていたため、本番で
