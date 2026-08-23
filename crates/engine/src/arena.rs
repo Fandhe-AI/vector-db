@@ -38,7 +38,10 @@ use crate::storage::{decode_row, Storage, StorageError, Visibility};
 #[allow(dead_code)]
 const MAX_ARENA_ROWS: usize = 1_000_000;
 
-/// アリーナが確保してよい総バイト量（`vectors: Vec<f32>` 相当）の上限。
+/// アリーナが確保してよい総バイト量の上限。`vectors: Vec<f32>` だけでなく、
+/// 同時に確保する `ids`・`tenant_ids`・`visibilities` の見積もりバイト量も合算した
+/// 総量として扱う（[`check_capacity`] 参照。codex レビュー指摘対応: 一部バッファのみを
+/// 上限対象にすると、他バッファの確保が上限検証をすり抜けて OOM を招き得るため）。
 /// `MAX_ARENA_ROWS` だけでは次元数が大きい場合に依然として巨大確保になり得るため、
 /// 行数とバイト量の両方で上限を課す（`storage.rs` の `MAX_SCAN_TOTAL_BYTES` と同方針）。
 /// `MAX_ARENA_ROWS` と同じ理由で lib ターゲット単体では未使用と判定される。
@@ -65,6 +68,13 @@ pub enum ArenaError {
     /// `expected_dim` と一致しない次元の行を検出した。黙殺スキップせず拒否する
     /// （部分的なアリーナを返さない。fail-open を避けるための判断）。
     DimMismatch { id: u64, expected: u32, found: u32 },
+    /// `check_capacity` によるアロケーション前の上限検証を通過した後、実際の
+    /// `Vec::try_reserve_exact` がメモリ不足で失敗した。`Vec::with_capacity`
+    /// （内部で確保失敗時に abort する）ではなく `try_reserve_exact` を使うことで、
+    /// OOM を allocator の abort ではなく `Err` として呼び出し元へ伝える
+    /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。メッセージは
+    /// プログラム出力文字列のため英語）。
+    AllocationFailed(String),
 }
 
 impl std::fmt::Display for ArenaError {
@@ -82,6 +92,7 @@ impl std::fmt::Display for ArenaError {
                 f,
                 "embedding dim mismatch at row id={id}: expected={expected} found={found}"
             ),
+            ArenaError::AllocationFailed(msg) => write!(f, "arena allocation failed: {msg}"),
         }
     }
 }
@@ -93,7 +104,8 @@ impl std::error::Error for ArenaError {
             ArenaError::Catalog(e) => Some(e),
             ArenaError::InvalidDim
             | ArenaError::CapacityExceeded
-            | ArenaError::DimMismatch { .. } => None,
+            | ArenaError::DimMismatch { .. }
+            | ArenaError::AllocationFailed(_) => None,
         }
     }
 }
@@ -113,8 +125,16 @@ impl From<CatalogError> for ArenaError {
 pub type Result<T> = std::result::Result<T, ArenaError>;
 
 /// [`VectorArena::build`] のアロケーション前上限検証（行数・総バイト量の両方、
-/// `checked_mul` によるオーバーフロー安全な演算）。成功時は確保すべき `f32` 要素数
-/// （`row_count * dim`）を返す。
+/// `checked_mul`/`checked_add` によるオーバーフロー安全な演算）。成功時は確保すべき
+/// `vectors: Vec<f32>` の要素数（`row_count * dim`）を返す。
+///
+/// `max_bytes` は `vectors` だけでなく、同時に確保する `ids: Vec<u64>`・
+/// `tenant_ids: Vec<String>`・`visibilities: Vec<Visibility>` の見積もりバイト量も
+/// 合算した総量として扱う（codex レビュー指摘対応: `vectors` のみを上限対象にすると、
+/// 最大 1M 行分の他バッファの確保が上限検証をすり抜け、`Vec::with_capacity` の
+/// 確保失敗時 abort（OOM abort）を招き得るため）。`tenant_ids` の 1 要素あたりは
+/// `String` 構造体自体のスタック分に加え、ヒープ上の文字列バイト列を最悪ケース
+/// （[`crate::storage::MAX_TENANT_ID_LEN`]）で見積もる。
 ///
 /// 上限値（`max_rows`・`max_bytes`）を引数として受け取る形に切り出しているのは、
 /// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、境界値検証
@@ -131,13 +151,46 @@ fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize)
     let total_floats = row_count
         .checked_mul(dim as usize)
         .ok_or(ArenaError::CapacityExceeded)?;
-    let total_bytes = total_floats
+    let vectors_bytes = total_floats
         .checked_mul(4)
+        .ok_or(ArenaError::CapacityExceeded)?;
+
+    let per_row_aux_bytes = per_row_aux_bytes().ok_or(ArenaError::CapacityExceeded)?;
+    let aux_bytes = row_count
+        .checked_mul(per_row_aux_bytes)
+        .ok_or(ArenaError::CapacityExceeded)?;
+
+    let total_bytes = vectors_bytes
+        .checked_add(aux_bytes)
         .ok_or(ArenaError::CapacityExceeded)?;
     if total_bytes > max_bytes {
         return Err(ArenaError::CapacityExceeded);
     }
     Ok(total_floats)
+}
+
+/// `ids: Vec<u64>`・`tenant_ids: Vec<String>`・`visibilities: Vec<Visibility>` の
+/// 1 行あたりの見積もりバイト数（[`check_capacity`] 専用のヘルパー、境界値テストからも
+/// 同じ値を参照できるよう関数として切り出す）。`tenant_ids` の 1 要素あたりは `String`
+/// 構造体自体のスタック分に加え、ヒープ上の文字列バイト列を最悪ケース
+/// （[`crate::storage::MAX_TENANT_ID_LEN`]）で見積もる。
+#[allow(dead_code)]
+fn per_row_aux_bytes() -> Option<usize> {
+    std::mem::size_of::<u64>()
+        .checked_add(std::mem::size_of::<String>())
+        .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
+        .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
+}
+
+/// `Vec::try_reserve_exact` の失敗を [`ArenaError::AllocationFailed`] へ変換する
+/// 共通ヘルパー（[`VectorArena::build`] 専用）。`Vec::with_capacity`（内部で確保失敗時に
+/// abort する）ではなく本関数経由で予約することで、`check_capacity` の上限検証を
+/// 通過した後にホスト側のメモリが実際に不足した場合でも、プロセスを OOM abort させず
+/// `Err` として呼び出し元へ伝える（security.md「不安全な設計｜無制限リソース確保（DoS）」
+/// 対応）。`what` はエラーメッセージに含める対象バッファ名（英語。プログラム出力文字列）。
+fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
+    buf.try_reserve_exact(additional)
+        .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }
 
 /// コールドスタート時に一括デコードした連続ベクトルバッファ（対象ビヘイビア: TABLE-8）。
@@ -239,11 +292,19 @@ impl VectorArena {
             MAX_ARENA_TOTAL_BYTES,
         )?;
 
-        // 検証を通過した後にのみ確保する。
-        let mut vectors = Vec::with_capacity(total_floats);
-        let mut ids = Vec::with_capacity(row_count);
-        let mut tenant_ids = Vec::with_capacity(row_count);
-        let mut visibilities = Vec::with_capacity(row_count);
+        // 検証を通過した後にのみ確保する。`Vec::with_capacity`（確保失敗時に abort する）
+        // ではなく `try_reserve_exact` を使い、メモリ不足を `Err(ArenaError::AllocationFailed)`
+        // として呼び出し元へ返す（codex レビュー指摘対応: `check_capacity` の
+        // アロケーション前上限検証を通過していても、実際のホストメモリが不足していれば
+        // 確保は失敗し得るため、OOM abort ではなく fail-closed な `Err` にする）。
+        let mut vectors: Vec<f32> = Vec::new();
+        try_reserve_exact(&mut vectors, total_floats, "vectors")?;
+        let mut ids: Vec<u64> = Vec::new();
+        try_reserve_exact(&mut ids, row_count, "ids")?;
+        let mut tenant_ids: Vec<String> = Vec::new();
+        try_reserve_exact(&mut tenant_ids, row_count, "tenant_ids")?;
+        let mut visibilities: Vec<Visibility> = Vec::new();
+        try_reserve_exact(&mut visibilities, row_count, "visibilities")?;
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
@@ -352,17 +413,44 @@ mod tests {
 
     #[test]
     fn capacity_check_accepts_at_byte_limit() {
-        // row_count * dim * 4 == max_bytes ちょうど。
+        // row_count * dim * 4（vectors）+ row_count * per_row_aux_bytes（ids・tenant_ids・
+        // visibilities の見積もり）== max_bytes ちょうど。
+        let row_count = 10usize;
+        let dim = 4u32;
+        let aux = per_row_aux_bytes().expect("aux bytes computation must not overflow in test");
+        let max_bytes = row_count * (dim as usize) * 4 + row_count * aux;
         assert_eq!(
-            check_capacity(10, 4, usize::MAX, 160).expect("within byte limit"),
+            check_capacity(row_count, dim, usize::MAX, max_bytes).expect("within byte limit"),
             40
         );
     }
 
     #[test]
     fn capacity_check_rejects_over_byte_limit() {
+        let row_count = 10usize;
+        let dim = 4u32;
+        let aux = per_row_aux_bytes().expect("aux bytes computation must not overflow in test");
+        let max_bytes = row_count * (dim as usize) * 4 + row_count * aux;
         assert!(matches!(
-            check_capacity(10, 4, usize::MAX, 159),
+            check_capacity(row_count, dim, usize::MAX, max_bytes - 1),
+            Err(ArenaError::CapacityExceeded)
+        ));
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P1 対応）。`vectors`（f32 埋め込みバッファ）の
+    // バイト量だけでは上限に収まっていても、`ids`・`tenant_ids`・`visibilities` の
+    // 見積もりバイト量を合算すると上限を超える場合に拒否すること
+    // （codex 指摘: 一部バッファのみを上限検証の対象にすると、他バッファの確保が
+    // 検証をすり抜けて OOM abort を招き得るため）。
+    #[test]
+    fn capacity_check_rejects_when_aux_buffers_push_total_over_limit() {
+        let row_count = 10usize;
+        let dim = 4u32;
+        let vectors_bytes = row_count * (dim as usize) * 4;
+        // vectors だけなら上限内だが、aux バッファ込みでは超過する上限値。
+        let max_bytes = vectors_bytes;
+        assert!(matches!(
+            check_capacity(row_count, dim, usize::MAX, max_bytes),
             Err(ArenaError::CapacityExceeded)
         ));
     }
@@ -372,6 +460,20 @@ mod tests {
         // usize::MAX 近傍の dim を渡しても checked_mul が Err に落ちるだけで panic しない。
         let result = check_capacity(usize::MAX / 2, u32::MAX, usize::MAX, usize::MAX);
         assert!(matches!(result, Err(ArenaError::CapacityExceeded)));
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P1 対応）。`check_capacity` の上限検証を素通りする
+    // ほど巨大な予約要求（`isize::MAX` バイト超）に対して、`try_reserve_exact` が
+    // `Vec::with_capacity` のように abort せず `Err(ArenaError::AllocationFailed)` を
+    // 返すことを検証する。`isize::MAX` 超のレイアウトは Rust のアロケーション API 契約上
+    // 実メモリを確保しようとする前に即座に拒否されるため、CI 環境で実際に大量のメモリを
+    // 消費せず決定的に再現できる。
+    #[test]
+    fn try_reserve_exact_converts_oversized_request_to_allocation_failed_without_aborting() {
+        let mut buf: Vec<u8> = Vec::new();
+        let oversized = (isize::MAX as usize).saturating_add(1);
+        let result = try_reserve_exact(&mut buf, oversized, "test buffer");
+        assert!(matches!(result, Err(ArenaError::AllocationFailed(_))));
     }
 
     /// `tests/arena.rs`（統合テスト）と同方針の一意 DB パス払い出しヘルパー。

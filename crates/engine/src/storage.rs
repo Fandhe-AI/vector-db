@@ -66,7 +66,10 @@ const ROW_FORMAT_VERSION: u8 = 2;
 /// `tenant_id` の UTF-8 バイト長上限。デコード時・エンコード時ともこの値を超える
 /// 長さフィールドを `Vec`/`String` へのアロケーションに使う前に拒否する
 /// （.claude/rules/coding-rust.md「untrusted 入力の扱い」）。
-const MAX_TENANT_ID_LEN: u16 = 256;
+///
+/// `pub(crate)`: `arena.rs`（TASK-87、対象ビヘイビア: TABLE-8）が、コールドスタート・
+/// アリーナ構築時に `tenant_id` 文字列群の総メモリ量を見積もる上限値として参照する。
+pub(crate) const MAX_TENANT_ID_LEN: u16 = 256;
 
 /// 埋め込み次元数の上限。デコード時にこの値を超える `dim` を確認した場合、
 /// `Vec::with_capacity` へ渡す前に拒否する（未検証の長さフィールドを無制限アロケーションに
