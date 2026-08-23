@@ -180,7 +180,12 @@ fn per_row_aux_bytes() -> Option<usize> {
 /// 通過した後にホスト側のメモリが実際に不足した場合でも、プロセスを OOM abort させず
 /// `Err` として呼び出し元へ伝える（security.md「不安全な設計｜無制限リソース確保（DoS）」
 /// 対応）。`what` はエラーメッセージに含める対象バッファ名（英語。プログラム出力文字列）。
-fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
+///
+/// `pub(crate)`: `core.rs::EngineCore::search` が、アリーナから可視行だけを抽出した
+/// 縮約入力ビューを構築する際にも同じ確保規律を使う（アリーナ本体が既に
+/// `check_capacity` 済みで上限内であることが分かっている行数からの抽出のため、
+/// 呼び出し元でも同じ fail-closed な確保パターンを再利用する。Issue #137 codex P0 対応）。
+pub(crate) fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
     buf.try_reserve_exact(additional)
         .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }

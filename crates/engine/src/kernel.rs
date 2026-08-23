@@ -46,32 +46,34 @@ impl fmt::Display for KernelError {
 
 impl std::error::Error for KernelError {}
 
-/// 実行バックエンドの入力ビュー。`core.rs` がアリーナのカラムナ表現から組み立てる。
-/// provider 側は所有権を持たず、呼び出し中だけ borrow する（object-safe を保つため
-/// ジェネリクスを持たない参照渡しに統一する）。
+/// 実行バックエンドの入力ビュー。`core.rs` がアリーナのカラムナ表現から、呼び出し元
+/// `PolicyContext` の下で可視な行だけを抽出した縮約ビューとして組み立てる（codex P0
+/// 指摘・Issue #137 対応）。provider 側は所有権を持たず、呼び出し中だけ borrow する
+/// （object-safe を保つためジェネリクスを持たない参照渡しに統一する）。
+///
+/// 可視性判定はここへ渡す前に `core.rs` 側で完結しており、本構造体には不可視行の
+/// id・ベクトルは一切含まれない。以前のバージョンはアリーナ全行を渡し、provider が
+/// 呼び出す「規約」の `is_visible` クロージャでマスクする設計だったが、provider が
+/// クロージャを無視すれば不可視行のベクトル・id を読み取れてしまう構造的な問題が
+/// あった（他テナントのデータをそもそも provider のアドレス空間へ渡さない、という
+/// より強い境界に変更した）。
 pub struct SearchInput<'a> {
     pub ids: &'a [u64],
     /// `ids.len() * dim` 要素のフラット化済みベクトル（行 i の embedding は
-    /// `vectors[i * dim .. (i + 1) * dim]`）。`arena.rs::VectorArena::vectors` と同じ表現。
+    /// `vectors[i * dim .. (i + 1) * dim]`）。可視行のみを含む（上記構造体ドキュメント
+    /// 参照）。
     pub vectors: &'a [f32],
     pub dim: u32,
     pub query: &'a [f32],
     pub k: usize,
-    /// 行インデックス（`ids`/`vectors` 上の位置）が結果候補として可視かどうかの判定。
-    /// `core.rs` が [`crate::policy::PolicyContext::is_visible`] を経由して構築する
-    /// クロージャで、provider 自身はテナント境界判定を行わない（CORE-2 の単一照合パス
-    /// を `core.rs` に閉じ込め、provider 実装の増加が判定ロジックの分岐点を増やさない
-    /// ようにするための設計）。
-    pub is_visible: &'a dyn Fn(usize) -> bool,
 }
 
 /// コアが依存する検索バックエンドの窓口（CORE-13）。object-safe（ジェネリクスなし・
 /// `&self` メソッドのみ）を維持し、`Box<dyn SearchProvider>` として `core.rs` に
 /// 保持されることを前提とする。
 pub trait SearchProvider: Send + Sync {
-    /// 総当たり Top-k 検索を行う。可視でない行（`input.is_visible` が `false` を返す行）は
-    /// 結果候補から除外する（マスク適用は Top-k 選出段で行い、除外行のスコアが
-    /// 上位 k 件の選出に影響しないようにする）。
+    /// `input` に含まれる行（呼び出し元があらかじめ可視行だけへ絞り込み済み）から
+    /// 総当たり Top-k 検索を行う。
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError>;
 }
 
@@ -134,9 +136,6 @@ impl SearchProvider for CpuScalarProvider {
 
         let mut heap: BinaryHeap<Reverse<MinHeapItem>> = BinaryHeap::new();
         for (idx, &id) in input.ids.iter().enumerate() {
-            if !(input.is_visible)(idx) {
-                continue;
-            }
             let start = idx.saturating_mul(dim);
             let end = start.saturating_add(dim);
             let Some(vector) = input.vectors.get(start..end) else {
@@ -180,9 +179,13 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    fn always_visible(_idx: usize) -> bool {
-        true
-    }
+    // 可視性マスクの適用（不可視行が Top-k に混ざらないこと）は、以前は本モジュールの
+    // `SearchInput::is_visible` クロージャで検証していたが、codex P0 指摘（Issue #137）
+    // 対応で `SearchInput` はコア側（`core.rs`）が可視行だけへ絞り込んだ縮約ビューのみを
+    // 受け取る設計へ変更した。そのため可視性マスクの検証は本モジュールの責務外になり、
+    // `crates/engine/tests/vector_core.rs::search_excludes_private_rows_of_the_same_tenant_when_ctx_disallows_private`
+    // （CORE-2）へ移動している。本モジュールはあくまで「渡された入力の中での Top-k 選出」
+    // のみを検証する。
 
     #[test]
     fn top_k_returns_highest_dot_product_scores() {
@@ -190,14 +193,12 @@ mod tests {
         // dim=2 の 4 行。クエリ [1.0, 0.0] との内積は id 昇順に 1.0, 2.0, 0.0, 3.0。
         let vectors = [1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 3.0, 0.0];
         let query = [1.0, 0.0];
-        let visible = always_visible;
         let input = SearchInput {
             ids: &ids,
             vectors: &vectors,
             dim: 2,
             query: &query,
             k: 2,
-            is_visible: &visible,
         };
         let hits = CpuScalarProvider.search(input).expect("search ok");
         assert_eq!(
@@ -210,30 +211,9 @@ mod tests {
     }
 
     #[test]
-    fn masked_rows_are_excluded_from_top_k() {
-        let ids = [1u64, 2, 3];
-        let vectors = [1.0, 0.0, 5.0, 0.0, 2.0, 0.0];
-        let query = [1.0, 0.0];
-        // 最高スコア行（idx=1, id=2, score=5.0）を不可視にする。
-        let visible = |idx: usize| idx != 1;
-        let input = SearchInput {
-            ids: &ids,
-            vectors: &vectors,
-            dim: 2,
-            query: &query,
-            k: 2,
-            is_visible: &visible,
-        };
-        let hits = CpuScalarProvider.search(input).expect("search ok");
-        assert_eq!(hits.len(), 2);
-        assert!(hits.iter().all(|h| h.id != 2));
-    }
-
-    #[test]
     fn non_finite_query_is_rejected() {
         let ids = [1u64];
         let vectors = [1.0, 0.0];
-        let visible = always_visible;
         for query in [
             [f32::NAN, 0.0],
             [f32::INFINITY, 0.0],
@@ -245,7 +225,6 @@ mod tests {
                 dim: 2,
                 query: &query,
                 k: 1,
-                is_visible: &visible,
             };
             let err = CpuScalarProvider.search(input).unwrap_err();
             assert_eq!(err, KernelError::NonFiniteQuery, "query={query:?}");
@@ -258,14 +237,12 @@ mod tests {
         // id=2 の行は NaN を含み、内積が NaN になる（Top-k を占有してはならない）。
         let vectors = [1.0, 0.0, f32::NAN, 0.0, 2.0, 0.0];
         let query = [1.0, 0.0];
-        let visible = always_visible;
         let input = SearchInput {
             ids: &ids,
             vectors: &vectors,
             dim: 2,
             query: &query,
             k: 2,
-            is_visible: &visible,
         };
         let hits = CpuScalarProvider.search(input).expect("search ok");
         assert_eq!(
@@ -284,14 +261,12 @@ mod tests {
         // （挿入順は降順 id だが、結果は最小 id を選ぶ）。
         let vectors = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
         let query = [1.0, 0.0];
-        let visible = always_visible;
         let input = SearchInput {
             ids: &ids,
             vectors: &vectors,
             dim: 2,
             query: &query,
             k: 1,
-            is_visible: &visible,
         };
         let hits = CpuScalarProvider.search(input).expect("search ok");
         assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
@@ -302,14 +277,12 @@ mod tests {
         let ids = [1u64];
         let vectors = [1.0, 0.0];
         let query = [1.0, 0.0, 0.0];
-        let visible = always_visible;
         let input = SearchInput {
             ids: &ids,
             vectors: &vectors,
             dim: 2,
             query: &query,
             k: 1,
-            is_visible: &visible,
         };
         let err = CpuScalarProvider.search(input).unwrap_err();
         assert_eq!(
@@ -326,14 +299,12 @@ mod tests {
         let ids = [1u64];
         let vectors = [1.0, 0.0];
         let query = [1.0, 0.0];
-        let visible = always_visible;
         let input = SearchInput {
             ids: &ids,
             vectors: &vectors,
             dim: 2,
             query: &query,
             k: 0,
-            is_visible: &visible,
         };
         let hits = CpuScalarProvider.search(input).expect("search ok");
         assert!(hits.is_empty());

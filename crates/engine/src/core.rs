@@ -12,13 +12,17 @@
 //! 不可視行と不存在行の応答を区別しない（存在情報を漏らさない。security.md 準拠）。
 //!
 //! `EngineCore::search` は [`SearchProvider`] を `Box<dyn SearchProvider>`（CORE-13）で
-//! 差し替え可能にしているが、`SearchInput::is_visible` は「provider が呼び出す」規約に
-//! すぎず、provider 実装がそれを無視したり、データセットに存在しない・不可視な行の
-//! `SearchHit` を返したりすることをコンパイラは防げない。そのため `EngineCore::search` は
-//! provider の戻り値をコア側の可視行 id 集合（`is_visible` をコア自身が全走査して構築する、
-//! provider の自己申告に依存しない集合）と突き合わせて再検証し、逸脱があれば結果を一切
-//! 返さず `CoreError::ProviderResultRejected` で拒否する（fail-closed。AGENTS.md P0
-//! 「テナント境界の弱体化」対応。テナント分離を provider 実装の正しさに依存させない）。
+//! 差し替え可能にしているが、provider は untrusted 実装（GPU/ANN バックエンド差し替え等）
+//! でありうる。テナント境界の適用を「provider が可視性チェックに従う」という規約だけに
+//! 委ねると、provider 実装がそれを無視して不可視行（他テナント行を含む）のベクトル・id を
+//! 読み取る／外部送信することを防げない（AGENTS.md P0「テナント境界の弱体化」）。そのため
+//! `EngineCore::search` は二重の防御を持つ: (1) `kernel::SearchInput` へは
+//! [`crate::policy::PolicyContext::is_visible`] で可視と判定した行だけを抽出した縮約ビューを
+//! 渡し、不可視データをそもそも provider のアドレス空間へ渡さない（`kernel.rs` のドキュメント
+//! 参照）。(2) それでも provider が戻り値へ縮約ビュー外の `id`（捏造や実装バグ）を含めた
+//! 場合に備え、戻り値をコア側で計算した可視行 id 集合と突き合わせて再検証し、逸脱があれば
+//! 結果を一切返さず `CoreError::ProviderResultRejected` で拒否する（fail-closed。テナント
+//! 分離を provider 実装の正しさに依存させない）。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -247,31 +251,56 @@ impl VectorCore for EngineCore {
             }
         };
 
-        // provider の戻り値をコア側で再検証するための可視行 id 集合。`is_visible` は
-        // 「provider が呼び出す」規約に過ぎず、provider が無視する・不正な `SearchHit` を
-        // 返すことを型システムは防げないため、provider の自己申告に依存せずコア自身が
-        // アリーナ全体を走査して構築する（AGENTS.md P0「テナント境界の弱体化」対応）。
-        let visible_ids: HashSet<u64> = arena
-            .ids()
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &id)| is_visible(idx).then_some(id))
-            .collect();
+        // 可視行だけを抽出した縮約入力ビューを構築する（codex P0 指摘・Issue #137 対応）。
+        // 以前は provider へアリーナ全行の ids/vectors を渡し、`is_visible` クロージャを
+        // 「provider が呼び出す」規約でマスクしていたが、provider がクロージャを無視すれば
+        // 不可視行（他テナント行を含む）のベクトル・id を読み取れてしまう構造上の問題が
+        // あった。ここでコア自身が可視行だけを抽出し、不可視データを provider の
+        // アドレス空間へそもそも渡さない（`SearchInput` に `is_visible` フィールドは
+        // もう存在しない。`kernel.rs` のドキュメント参照）。
+        //
+        // 事前に可視行数だけを数えてから `try_reserve_exact`（`arena.rs` と同じ確保規律。
+        // `Vec::with_capacity` は確保失敗時に abort するため使わない）で一括予約する。
+        // 抽出元のアリーナは既に `VectorArena::build` の `check_capacity` で行数・総バイト量の
+        // 上限内であることを確認済みのため、ここでの確保もその上限の範囲に収まる。
+        let dim = arena.dim() as usize;
+        let visible_row_count = (0..arena.len()).filter(|&idx| is_visible(idx)).count();
+        let mut visible_ids: Vec<u64> = Vec::new();
+        crate::arena::try_reserve_exact(&mut visible_ids, visible_row_count, "visible_ids")?;
+        let visible_floats = visible_row_count.saturating_mul(dim);
+        let mut visible_vectors: Vec<f32> = Vec::new();
+        crate::arena::try_reserve_exact(&mut visible_vectors, visible_floats, "visible_vectors")?;
+        for idx in 0..arena.len() {
+            if !is_visible(idx) {
+                continue;
+            }
+            // `idx < arena.len()` の範囲内なので `ids().get`/`vector` は必ず `Some`
+            // （`VectorArena::build` の不変条件）。万一崩れていても行をスキップするだけで
+            // panic しない（fail-closed）。
+            let (Some(&id), Some(vector)) = (arena.ids().get(idx), arena.vector(idx)) else {
+                continue;
+            };
+            visible_ids.push(id);
+            visible_vectors.extend_from_slice(vector);
+        }
+        // 縮約ビューを構築し終えたので、以降アリーナ本体（不可視行を含む全データ）は
+        // 参照しない。早期に破棄してピークメモリを縮約ビュー分まで戻す。
+        drop(arena);
 
         let input = SearchInput {
-            ids: arena.ids(),
-            vectors: arena.vectors(),
-            dim: arena.dim(),
+            ids: &visible_ids,
+            vectors: &visible_vectors,
+            dim: dim as u32,
             query,
             k,
-            is_visible: &is_visible,
         };
         let hits = self.provider.search(input)?;
 
-        // provider が返した各 hit の id が可視行 id 集合に属することを確認する。
-        // 1 件でも逸脱していれば結果を一切返さず fail-closed に拒否する（部分的な
-        // フィルタリングはしない。fail-open を避けるための判断）。
-        if hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
+        // provider が返した各 hit の id が縮約ビュー（＝可視行）の id 集合に属することを
+        // 確認する。1 件でも逸脱していれば結果を一切返さず fail-closed に拒否する
+        // （部分的なフィルタリングはしない。fail-open を避けるための判断）。
+        let visible_id_set: HashSet<u64> = visible_ids.iter().copied().collect();
+        if hits.iter().any(|hit| !visible_id_set.contains(&hit.id)) {
             return Err(CoreError::ProviderResultRejected);
         }
         Ok(hits)

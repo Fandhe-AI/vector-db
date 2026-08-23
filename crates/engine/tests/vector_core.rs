@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
@@ -289,38 +289,46 @@ fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
     );
 }
 
-/// negative test 用のダミー provider: `is_visible` を無視して常に全行を候補に含める
-/// （マスク無効化）。`EngineCore::search` のコア側再検証（provider の戻り値を可視行
-/// id 集合と突き合わせる。Issue #137 codex P0 対応）が、この違反を実際に検出して
-/// 拒否できることを確認する対照実験（CORE-2: 検査の実効性確認）。
-struct MaskIgnoringProvider;
+/// P0-1 検証用の計装 provider（Issue #137）: `SearchInput` に渡された `ids`・
+/// `vectors` の長さをそのまま記録してから `CpuScalarProvider` へ委譲する。かつて
+/// `MaskIgnoringProvider`（`is_visible` クロージャを無視して全行を候補にする provider）
+/// が実証していた「provider がマスクを無視すれば他テナント行を読める」という経路は、
+/// `SearchInput` 自体に不可視行のデータを含めない設計（`kernel.rs` のドキュメント参照）
+/// へ変更したことで構造的に塞がれた。本 provider は「コアが実際に可視行だけへ絞り込んだ
+/// 縮約ビューを渡していること」を provider 側の観測で裏付ける。
+struct CapturingProvider {
+    captured_ids: Arc<Mutex<Vec<u64>>>,
+    captured_vector_len: Arc<Mutex<usize>>,
+}
 
-impl SearchProvider for MaskIgnoringProvider {
+impl SearchProvider for CapturingProvider {
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
-        let unmasked = SearchInput {
-            ids: input.ids,
-            vectors: input.vectors,
-            dim: input.dim,
-            query: input.query,
-            k: input.k,
-            is_visible: &|_idx: usize| true,
-        };
-        CpuScalarProvider.search(unmasked)
+        *self.captured_ids.lock().expect("lock captured_ids") = input.ids.to_vec();
+        *self
+            .captured_vector_len
+            .lock()
+            .expect("lock captured_vector_len") = input.vectors.len();
+        CpuScalarProvider.search(input)
     }
 }
 
-// レビュー指摘対応（codex P0・Issue #137）: テナント境界の適用を
-// `SearchInput::is_visible` クロージャの「呼び出し規約」だけに委ねると、provider
-// 実装がそれを無視して他テナントの行を返しうる（`MaskIgnoringProvider` が実証）。
-// `EngineCore::search` は provider の戻り値をコア側で計算した可視行 id 集合と
-// 突き合わせて再検証するため、マスクを無視する provider を注入しても他テナントの
-// 行が呼び出し元へ届く前に `CoreError::ProviderResultRejected` で拒否されることを
-// 検証する（fail-closed。単一照合パスを provider 出力の再検証まで含めて維持する）。
+// レビュー指摘対応（codex P0-1・Issue #137）: `EngineCore::search` が provider へ
+// 渡す `SearchInput` に、他テナントの不可視行の id・ベクトルが一切含まれないこと
+// （＝可視行だけへ絞り込んだ縮約ビューであること）を、provider 側の観測で検証する。
+// dim=2・tenant-a の可視行が 1 件のみのデータセットに対し、`ids` が他テナント
+// （id=2, tenant-b）を含まず、`vectors` の長さが可視行数 × dim（1 * 2 = 2）に
+// 一致することを確認する。
 #[test]
-fn core2_negative_test_mask_ignoring_provider_is_rejected_by_core_side_revalidation() {
-    let dir = TempDir::new("core2-negative");
-    let core = EngineCore::with_provider(dir.db_path(), Box::new(MaskIgnoringProvider))
-        .expect("open engine core");
+fn search_projects_input_to_visible_rows_only_before_calling_provider() {
+    let dir = TempDir::new("p0-1-projection");
+    let captured_ids = Arc::new(Mutex::new(Vec::new()));
+    let captured_vector_len = Arc::new(Mutex::new(0usize));
+    let provider = CapturingProvider {
+        captured_ids: Arc::clone(&captured_ids),
+        captured_vector_len: Arc::clone(&captured_vector_len),
+    };
+    let core =
+        EngineCore::with_provider(dir.db_path(), Box::new(provider)).expect("open engine core");
     core.storage()
         .create_table(&schema_for("docs", 2))
         .expect("create table");
@@ -342,13 +350,22 @@ fn core2_negative_test_mask_ignoring_provider_is_rejected_by_core_side_revalidat
     );
 
     let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
-    let err = core.search(&ctx_a, "docs", &[1.0, 0.0], 10).expect_err(
-        "provider ignoring the visibility mask must be rejected by core-side re-validation",
-    );
+    let _ = core
+        .search(&ctx_a, "docs", &[1.0, 0.0], 10)
+        .expect("search ok");
 
-    assert!(
-        matches!(err, CoreError::ProviderResultRejected),
-        "expected ProviderResultRejected, got: {err}"
+    let ids = captured_ids.lock().expect("lock captured_ids");
+    assert_eq!(
+        ids.as_slice(),
+        &[1u64],
+        "provider must only observe the caller's own visible row ids"
+    );
+    let vector_len = *captured_vector_len
+        .lock()
+        .expect("lock captured_vector_len");
+    assert_eq!(
+        vector_len, 2,
+        "provider must only observe vectors for the visible rows (1 row * dim 2)"
     );
 }
 
