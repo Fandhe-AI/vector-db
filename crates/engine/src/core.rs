@@ -16,13 +16,17 @@
 //! でありうる。テナント境界の適用を「provider が可視性チェックに従う」という規約だけに
 //! 委ねると、provider 実装がそれを無視して不可視行（他テナント行を含む）のベクトル・id を
 //! 読み取る／外部送信することを防げない（AGENTS.md P0「テナント境界の弱体化」）。そのため
-//! `EngineCore::search` は二重の防御を持つ: (1) `kernel::SearchInput` へは
-//! [`crate::policy::PolicyContext::is_visible`] で可視と判定した行だけを抽出した縮約ビューを
-//! 渡し、不可視データをそもそも provider のアドレス空間へ渡さない（`kernel.rs` のドキュメント
-//! 参照）。(2) それでも provider が戻り値へ縮約ビュー外の `id`（捏造や実装バグ）を含めた
-//! 場合に備え、戻り値をコア側で計算した可視行 id 集合と突き合わせて再検証し、逸脱があれば
-//! 結果を一切返さず `CoreError::ProviderResultRejected` で拒否する（fail-closed。テナント
-//! 分離を provider 実装の正しさに依存させない）。
+//! `EngineCore::search` は二重の防御を持つ: (1) [`VectorArena::build_filtered`] へ
+//! [`crate::policy::PolicyContext::is_visible`] をそのまま述語として渡し、不可視行を
+//! アリーナ構築時点で確保しない（`arena.rs` のドキュメント参照。以前はアリーナ全行を
+//! 構築してから可視行だけを別バッファへ再確保・全コピーしており、1 検索あたりの
+//! ピークメモリが最大で 2 倍になっていたが、構築時フィルタにより単一確保で完結する。
+//! codex P2 対応）。`kernel::SearchInput` へはこの構築時フィルタ済みアリーナの
+//! `ids`/`vectors` をそのまま渡すため、不可視データはそもそも provider のアドレス空間へ
+//! 渡らない。(2) それでも provider が戻り値へアリーナ外の `id`（捏造や実装バグ）を
+//! 含めた場合に備え、戻り値をコア側で計算した可視行 id 集合と突き合わせて再検証し、
+//! 逸脱があれば結果を一切返さず `CoreError::ProviderResultRejected` で拒否する
+//! （fail-closed。テナント分離を provider 実装の正しさに依存させない）。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -231,7 +235,16 @@ impl VectorCore for EngineCore {
         // 上記の早期照会と同一スナップショットではない（別トランザクション）ため、
         // 直前の照会成立後にテーブルが削除された場合の理論的な競合窓のみで発生しうる。
         // その場合も同様に存在情報を漏らさず `NotFound` へ丸め込む。
-        let arena = match VectorArena::build(&self.storage, table) {
+        //
+        // `VectorArena::build_filtered` へ `ctx.is_visible` をそのまま述語として渡し、
+        // 不可視行（他テナント行を含む）をアリーナ構築時点で確保しない
+        // （codex P0/P2・Issue #137 対応。以前はアリーナ全行を構築してから可視行だけを
+        // 別バッファへ再確保・全コピーしており、1 検索あたりのピークメモリが最大で
+        // 2 倍になっていた。構築時フィルタにより単一確保で完結する。`arena.rs` の
+        // ドキュメント参照）。構築後のアリーナは `ctx` の下で可視な行だけを保持する。
+        let arena = match VectorArena::build_filtered(&self.storage, table, |tenant, visibility| {
+            ctx.is_visible(tenant, visibility)
+        }) {
             Ok(arena) => arena,
             Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
                 return Err(CoreError::NotFound)
@@ -239,56 +252,14 @@ impl VectorCore for EngineCore {
             Err(e) => return Err(e.into()),
         };
 
-        let is_visible = |idx: usize| -> bool {
-            // `arena.tenant_id`/`arena.visibility` は `idx` がアリーナの行範囲内であれば
-            // 必ず `Some` を返す（`VectorArena::build` の不変条件）。範囲外を渡すことは
-            // ないため、万一 `None` が来ても false 側（不可視）に倒す（fail-closed）。
-            match (arena.tenant_id(idx), arena.visibility(idx)) {
-                (Some(tenant), Some(visibility)) => ctx.is_visible(tenant, visibility),
-                _ => false,
-            }
-        };
-
-        // 可視行だけを抽出した縮約入力ビューを構築する（codex P0 指摘・Issue #137 対応）。
-        // 以前は provider へアリーナ全行の ids/vectors を渡し、`is_visible` クロージャを
-        // 「provider が呼び出す」規約でマスクしていたが、provider がクロージャを無視すれば
-        // 不可視行（他テナント行を含む）のベクトル・id を読み取れてしまう構造上の問題が
-        // あった。ここでコア自身が可視行だけを抽出し、不可視データを provider の
-        // アドレス空間へそもそも渡さない（`SearchInput` に `is_visible` フィールドは
-        // もう存在しない。`kernel.rs` のドキュメント参照）。
-        //
-        // 事前に可視行数だけを数えてから `try_reserve_exact`（`arena.rs` と同じ確保規律。
-        // `Vec::with_capacity` は確保失敗時に abort するため使わない）で一括予約する。
-        // 抽出元のアリーナは既に `VectorArena::build` の `check_capacity` で行数・総バイト量の
-        // 上限内であることを確認済みのため、ここでの確保もその上限の範囲に収まる。
-        let dim = arena.dim() as usize;
-        let visible_row_count = (0..arena.len()).filter(|&idx| is_visible(idx)).count();
-        let mut visible_ids: Vec<u64> = Vec::new();
-        crate::arena::try_reserve_exact(&mut visible_ids, visible_row_count, "visible_ids")?;
-        let visible_floats = visible_row_count.saturating_mul(dim);
-        let mut visible_vectors: Vec<f32> = Vec::new();
-        crate::arena::try_reserve_exact(&mut visible_vectors, visible_floats, "visible_vectors")?;
-        for idx in 0..arena.len() {
-            if !is_visible(idx) {
-                continue;
-            }
-            // `idx < arena.len()` の範囲内なので `ids().get`/`vector` は必ず `Some`
-            // （`VectorArena::build` の不変条件）。万一崩れていても行をスキップするだけで
-            // panic しない（fail-closed）。
-            let (Some(&id), Some(vector)) = (arena.ids().get(idx), arena.vector(idx)) else {
-                continue;
-            };
-            visible_ids.push(id);
-            visible_vectors.extend_from_slice(vector);
-        }
-        // 縮約ビューを構築し終えたので、以降アリーナ本体（不可視行を含む全データ）は
-        // 参照しない。早期に破棄してピークメモリを縮約ビュー分まで戻す。
-        drop(arena);
-
+        // アリーナは構築時点で可視行だけへ絞り込み済みのため、`ids`/`vectors` を
+        // そのまま `SearchInput` として provider へ渡せる（不可視データはそもそも
+        // provider のアドレス空間へ渡らない。`SearchInput` に `is_visible` フィールドは
+        // 存在しない。`kernel.rs` のドキュメント参照）。
         let input = SearchInput {
-            ids: &visible_ids,
-            vectors: &visible_vectors,
-            dim: dim as u32,
+            ids: arena.ids(),
+            vectors: arena.vectors(),
+            dim: arena.dim(),
             query,
             k,
         };
@@ -304,7 +275,9 @@ impl VectorCore for EngineCore {
         if hits.len() > k {
             return Err(CoreError::ProviderResultRejected);
         }
-        let visible_id_set: HashSet<u64> = visible_ids.iter().copied().collect();
+        // アリーナは構築時点で可視行だけへ絞り込み済みのため、`arena.ids()` がそのまま
+        // 可視行 id 集合になる。
+        let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
         let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
         let mut prev: Option<&SearchHit> = None;
         for hit in &hits {

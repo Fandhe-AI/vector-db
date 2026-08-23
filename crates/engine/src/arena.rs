@@ -24,9 +24,14 @@
 //! 本モジュールのスコープ外だが、`VectorArena` 自体はクレート外の呼び出し元
 //! （`crates/engine/tests/arena.rs` 等の統合テストを含む）から構築・参照できる。
 //!
-//! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
-//! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
-//! （`storage.rs`・`txn.rs` と同一の責務境界。評価は TASK-133 以降の呼び出し元の責務）。
+//! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持し、
+//! [`VectorArena::build_filtered`] は呼び出し元が渡す述語（`predicate`）の実行結果に
+//! 従って行を格納するかどうかを分岐するだけで、可視性判定ロジックそのもの
+//! （テナント一致判定・許可ラベル評価）は持たない。判定ロジックは
+//! `core.rs::EngineCore::search` が [`crate::policy::PolicyContext::is_visible`]
+//! （単一照合パス）から構築した述語として渡す（CORE-2 の判定ロジック集約を維持する。
+//! codex P2・Issue #137 対応で構築時フィルタ経路を追加。詳細は
+//! [`VectorArena::build_filtered`] のドキュメント参照）。
 
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
@@ -175,17 +180,18 @@ fn per_row_aux_bytes() -> Option<usize> {
 }
 
 /// `Vec::try_reserve_exact` の失敗を [`ArenaError::AllocationFailed`] へ変換する
-/// 共通ヘルパー（[`VectorArena::build`] 専用）。`Vec::with_capacity`（内部で確保失敗時に
-/// abort する）ではなく本関数経由で予約することで、`check_capacity` の上限検証を
-/// 通過した後にホスト側のメモリが実際に不足した場合でも、プロセスを OOM abort させず
-/// `Err` として呼び出し元へ伝える（security.md「不安全な設計｜無制限リソース確保（DoS）」
-/// 対応）。`what` はエラーメッセージに含める対象バッファ名（英語。プログラム出力文字列）。
+/// 共通ヘルパー（[`VectorArena::build_filtered`] 専用）。`Vec::with_capacity`（内部で
+/// 確保失敗時に abort する）ではなく本関数経由で予約することで、`check_capacity` の
+/// 上限検証を通過した後にホスト側のメモリが実際に不足した場合でも、プロセスを
+/// OOM abort させず `Err` として呼び出し元へ伝える（security.md「不安全な設計｜
+/// 無制限リソース確保（DoS）」対応）。`what` はエラーメッセージに含める対象バッファ名
+/// （英語。プログラム出力文字列）。
 ///
-/// `pub(crate)`: `core.rs::EngineCore::search` が、アリーナから可視行だけを抽出した
-/// 縮約入力ビューを構築する際にも同じ確保規律を使う（アリーナ本体が既に
-/// `check_capacity` 済みで上限内であることが分かっている行数からの抽出のため、
-/// 呼び出し元でも同じ fail-closed な確保パターンを再利用する。Issue #137 codex P0 対応）。
-pub(crate) fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
+/// 呼び出し元は本モジュール内に閉じる（`core.rs::EngineCore::search` はかつて可視行を
+/// 抽出した別バッファをここへ渡していたが、[`VectorArena::build_filtered`] が構築時
+/// フィルタで完結するようになったため、モジュール外から確保規律を借りる必要が
+/// なくなった。codex P2・Issue #137 対応）。
+fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
     buf.try_reserve_exact(additional)
         .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }
@@ -247,6 +253,37 @@ impl VectorArena {
     /// `insert_row_into_table`/`insert_rows_into_table` が挿入時に次元検証済みのため、
     /// 事後にスキーマ・行データが手で書き換えられた場合の防御として残す）。
     pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
+        Self::build_filtered(storage, table_name, |_, _| true)
+    }
+
+    /// [`Self::build`] の構築時フィルタ付き版（codex P2・Issue #137 対応）。
+    /// `predicate(tenant_id, visibility)` が `false` を返す行は、decode 直後に
+    /// 破棄してアリーナへ格納しない（`vectors`/`ids`/`tenant_ids`/`visibilities` の
+    /// いずれにも追加しない）。
+    ///
+    /// 呼び出し文脈: `core.rs::EngineCore::search` が
+    /// `|tenant, visibility| ctx.is_visible(tenant, visibility)` をそのまま渡すことで、
+    /// `PolicyContext` の下で不可視な行（他テナント行を含む）をそもそもアリーナへ確保
+    /// しない「構築時フィルタ」を実現する。以前は [`Self::build`] が対象テーブル全行の
+    /// アリーナを構築してから、`core.rs` 側が可視行だけの別バッファへ改めて確保・
+    /// 全コピーしていたため、1 検索あたりのピークメモリが最大で 2 倍（全行アリーナ ＋
+    /// 可視行コピー）になっていた。`predicate` を構築ループへ渡す設計にすることで、
+    /// 可視縮約ビューを単一確保・コピーなしで得られるようにする。
+    ///
+    /// アロケーション前の上限検証（[`check_capacity`]）は `predicate` の判定結果を
+    /// 知る前のテーブル全行数（`table.len()`）を上限として行う（`predicate` は行を
+    /// decode した後にしか評価できないため）。`predicate` によって実際に格納される
+    /// 行数はこの上限以下になるため、上限検証を弱めることにはならない。
+    ///
+    /// 次元不一致検証（[`ArenaError::DimMismatch`]）は `predicate` による可視性判定より
+    /// 前に行う。`predicate` が `false` を返す（＝呼び出し元から不可視）行であっても
+    /// データ破損の検出自体はスキップしない（[`Self::build`]・従来の全件検証と同じ
+    /// fail-closed な挙動を維持する。不可視行の破損を黙って読み飛ばすと、破損データの
+    /// 存在に誰も気付けなくなるため）。
+    pub fn build_filtered<F>(storage: &Storage, table_name: &str, mut predicate: F) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+    {
         // スキーマ取得・対象テーブルの行走査を単一の `read_txn`（同一スナップショット）上で
         // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
         // 並行書き込みが挟まってもスナップショットの一貫性が保証できない。
@@ -320,6 +357,12 @@ impl VectorArena {
                     expected: expected_dim,
                     found: found_dim,
                 });
+            }
+            // 構築時フィルタ（codex P2 対応）: `predicate` が `false` を返す行（呼び出し元
+            // から不可視）は、デコード直後にここで破棄しアリーナへ確保しない。次元検証
+            // （上記）は既に完了しているため、不可視行の破損検出を見逃すことはない。
+            if !predicate(&row.tenant_id, row.visibility) {
+                continue;
             }
             vectors.extend_from_slice(&row.embedding);
             ids.push(id);
@@ -842,6 +885,140 @@ mod tests {
         assert_eq!(arena_b.ids(), &[0u64, 1u64]);
         assert_eq!(arena_b.vector(0), Some([9.0, 9.0, 9.0, 9.0].as_slice()));
         assert_eq!(arena_b.vector(1), Some([8.0, 8.0, 8.0, 8.0].as_slice()));
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P2 対応・Issue #137）。`build_filtered` の
+    // `predicate` が `false` を返す行は、そもそもアリーナへ格納されない（`ids`・
+    // `vectors`・`tenant_ids`・`visibilities` のいずれにも現れない）ことを検証する。
+    // `build`（`predicate` 常に `true`）と同じデータセットに対して行うことで、
+    // 構築時フィルタが「後から除外する」のではなく「最初から格納しない」ことを
+    // 行数・内容の両面で確認する。
+    #[test]
+    fn build_filtered_excludes_rows_failing_the_predicate_at_construction_time() {
+        let path = unique_db_path("filtered-excludes");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+
+        storage
+            .insert_row_into_table(
+                "docs",
+                0,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed tenant-a row");
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[2.0, 0.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed tenant-b row");
+        storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[3.0, 0.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed tenant-a private row");
+
+        // tenant-a・Public の行だけを可視とする述語（`PolicyContext::is_visible` の
+        // 既定挙動と同じ形の判定を模す）。
+        let arena = VectorArena::build_filtered(&storage, "docs", |tenant, visibility| {
+            tenant == "tenant-a" && visibility == Visibility::Public
+        })
+        .expect("build_filtered ok");
+
+        assert_eq!(
+            arena.len(),
+            1,
+            "only the tenant-a/Public row must be stored"
+        );
+        assert_eq!(arena.ids(), &[0u64]);
+        assert_eq!(arena.vector(0), Some([1.0, 0.0].as_slice()));
+        assert_eq!(
+            arena.vectors().len(),
+            2,
+            "no capacity for excluded rows' vectors is retained in len()"
+        );
+        assert_eq!(arena.tenant_id(0), Some("tenant-a"));
+
+        // 除外された行（id=1, id=2）はどのインデックスにも現れない。
+        for idx in 0..arena.len() {
+            assert_ne!(arena.tenant_id(idx), Some("tenant-b"));
+        }
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P2 対応・Issue #137）。`predicate` が `false` を
+    // 返す（＝不可視な）行であっても、次元不一致のデータ破損検出はスキップしない
+    // ことを検証する（`build`・従来の全件検証と同じ fail-closed な挙動。不可視行の
+    // 破損を黙って読み飛ばすと誰も気付けなくなるため）。
+    #[test]
+    fn build_filtered_still_detects_dimension_mismatch_in_rows_excluded_by_the_predicate() {
+        let path = unique_db_path("filtered-dim-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+
+        // 述語で除外される想定のテナント（tenant-b）に、次元不一致の破損行を仕込む
+        // （`insert_row_into_table` は挿入時点で次元検証するため、
+        // `build_rejects_dimension_mismatch_without_partial_result` と同手法で
+        // 検証を経由しない生の write トランザクションで直接書き込む）。
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = catalog::user_rows_table_name("docs");
+                let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                    redb::TableDefinition::new(&row_table_name);
+                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let encoded = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0],
+                    metadata: b"m",
+                })
+                .expect("encode mismatched-dim row");
+                row_table
+                    .insert(0u64, encoded.as_slice())
+                    .expect("insert mismatched-dim row bypassing dim validation");
+            }
+            write_txn.commit().expect("commit mismatched-dim row");
+        }
+
+        // 述語は tenant-b を常に不可視として除外するが、次元不一致の検出はこの述語より
+        // 前に行われるため、不可視行であっても Err(DimMismatch) にならなければならない。
+        let err = VectorArena::build_filtered(&storage, "docs", |tenant, _| tenant != "tenant-b")
+            .expect_err("dim mismatch in an invisible row must still be rejected");
+        assert!(
+            matches!(
+                err,
+                ArenaError::DimMismatch {
+                    id: 0,
+                    expected: 4,
+                    found: 2
+                }
+            ),
+            "expected DimMismatch for the excluded row, got: {err:?}"
+        );
     }
 
     // 対象ビヘイビア: TABLE-8。アリーナは構築時点のスナップショットであり、build 後に
