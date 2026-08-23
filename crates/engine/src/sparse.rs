@@ -31,7 +31,11 @@
 //! 検証済みの文字数からのみ確保する。頻度・長さの演算はすべて `checked_*`/`saturating_*`
 //! を用い、オーバーフローを未定義動作にしない。呼び出し側はクエリ・文書の各トークン数を
 //! 妥当な範囲に収める契約とする（本モジュールは上限を強制しないが、線形処理のため
-//! 入力長に比例した処理時間のみを要求する）。
+//! 入力長に比例した処理時間のみを要求する）。本モジュールは現時点で storage/catalog/
+//! wire-server に未結線であり、`tokenize()` 内の添字アクセスは事前のループ境界チェックに
+//! より本モジュール単体では範囲内が証明可能（panic しない）。TASK-103 以降で実際に
+//! wire 入力経路へ接続する際は、AGENTS.md P0（受信データ経路での `[]` 禁止）に合わせて
+//! `get()` ベースへの置き換えを検討する。
 
 use std::collections::BTreeMap;
 
@@ -46,12 +50,18 @@ const DEFAULT_B: f64 = 0.75;
 
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `InvalidParams` が `f64` を保持するため `Eq` は導出しない（`PartialEq` のみ）。
+#[derive(Debug, Clone, PartialEq)]
 pub enum SparseError {
     /// コーパスが空で構築できない（Top-k 検索の対象が存在しないため）。
     EmptyCorpus,
     /// コーパス内に重複する `DocId` が存在する（統計の整合性が壊れるため拒否する）。
     DuplicateDocId(DocId),
+    /// `k1`・`b` が不正（有限でない、または定義域外）。fail-open な空結果を返す
+    /// 代わりに構築時点で拒否する（`.claude/rules/coding-rust.md`: エラー契約は
+    /// fail-closed とする）。
+    InvalidParams { k1: f64, b: f64 },
 }
 
 impl std::fmt::Display for SparseError {
@@ -60,6 +70,9 @@ impl std::fmt::Display for SparseError {
             SparseError::EmptyCorpus => write!(f, "sparse index corpus must not be empty"),
             SparseError::DuplicateDocId(id) => {
                 write!(f, "duplicate doc id in corpus: {id}")
+            }
+            SparseError::InvalidParams { k1, b } => {
+                write!(f, "invalid BM25 params: k1={k1}, b={b} (require k1 finite & >= 0.0, b finite & in [0.0, 1.0])")
             }
         }
     }
@@ -175,7 +188,15 @@ impl SparseIndex {
 
     /// `k1`・`b` を明示してインデックスを構築する（TASK-103 以降でのパラメータ調整用に
     /// 公開する）。
+    ///
+    /// `k1`・`b` は構築時に検証する（有限値かつ `k1 >= 0.0`・`b` は `[0.0, 1.0]`）。
+    /// 不正値は `search()` 内で NaN 伝播・ガード節（`if score > 0.0` 等）により
+    /// サイレントな空結果へ落ちてしまい fail-open になるため、ここで拒否して
+    /// fail-closed を保つ（`.claude/rules/coding-rust.md`）。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
+        if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
+            return Err(SparseError::InvalidParams { k1, b });
+        }
         if docs.is_empty() {
             return Err(SparseError::EmptyCorpus);
         }
@@ -453,5 +474,75 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, 1);
         assert!((results[0].score - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn score_matches_hand_computed_bm25_value_with_doc_len_ne_avgdl() {
+        // doc_len != avgdl のケース（文書長正規化項 len_norm が 1 にキャンセルしない）で
+        // 手計算値と一致することを確認する。b の符号反転・比率逆転・項の脱落等の回帰を
+        // 検出するための境界値テスト。
+        // doc1: "alpha alpha beta beta beta" (len=5)
+        // doc2: "beta" (len=1)
+        // avgdl = (5 + 1) / 2 = 3, N = 2
+        let docs = vec![(1u64, "alpha alpha beta beta beta"), (2u64, "beta")];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        // query "alpha": df(alpha) = 1 → idf = ln((2-1+0.5)/(1+0.5)+1) = ln(2.0)
+        let idf_alpha = ((2.0 - 1.0 + 0.5) / (1.0 + 0.5) + 1.0f64).ln();
+        // doc1 での f(alpha, doc1) = 2, k1=1.2, b=0.75, doc_len=5, avgdl=3
+        let k1 = 1.2f64;
+        let b = 0.75f64;
+        let f = 2.0f64;
+        let len_norm = 1.0 - b + b * (5.0 / 3.0);
+        let expected = idf_alpha * (f * (k1 + 1.0)) / (f + k1 * len_norm);
+
+        let results = idx.search("alpha", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 1);
+        assert!((results[0].score - expected).abs() < 1e-9);
+    }
+
+    // --- パラメータ検証（fail-closed） ---
+
+    #[test]
+    fn with_params_rejects_nan_k1() {
+        let docs = vec![(1u64, "alpha beta")];
+        let err = SparseIndex::with_params(&docs, f64::NAN, 0.75).unwrap_err();
+        assert!(matches!(err, SparseError::InvalidParams { .. }));
+    }
+
+    #[test]
+    fn with_params_rejects_negative_k1() {
+        let docs = vec![(1u64, "alpha beta")];
+        let err = SparseIndex::with_params(&docs, -1.0, 0.75).unwrap_err();
+        assert!(matches!(err, SparseError::InvalidParams { .. }));
+    }
+
+    #[test]
+    fn with_params_rejects_b_out_of_unit_range() {
+        let docs = vec![(1u64, "alpha beta")];
+        assert!(matches!(
+            SparseIndex::with_params(&docs, 1.2, 1.5).unwrap_err(),
+            SparseError::InvalidParams { .. }
+        ));
+        assert!(matches!(
+            SparseIndex::with_params(&docs, 1.2, -0.1).unwrap_err(),
+            SparseError::InvalidParams { .. }
+        ));
+    }
+
+    #[test]
+    fn with_params_rejects_infinite_b() {
+        let docs = vec![(1u64, "alpha beta")];
+        let err = SparseIndex::with_params(&docs, 1.2, f64::INFINITY).unwrap_err();
+        assert!(matches!(err, SparseError::InvalidParams { .. }));
+    }
+
+    #[test]
+    fn with_params_accepts_boundary_b_values() {
+        let docs = vec![(1u64, "alpha beta")];
+        assert!(SparseIndex::with_params(&docs, 1.2, 0.0).is_ok());
+        assert!(SparseIndex::with_params(&docs, 1.2, 1.0).is_ok());
+        assert!(SparseIndex::with_params(&docs, 0.0, 0.75).is_ok());
     }
 }
