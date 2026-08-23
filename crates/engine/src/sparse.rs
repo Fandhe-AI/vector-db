@@ -23,8 +23,13 @@
 //!
 //! トークナイザ（[`tokenize`]）は ASCII 英数字・アンダースコアの連続を単語トークンとし、
 //! CJK（ひらがな・カタカナ・CJK 統合漢字）はユニグラム＋文字バイグラムを生成する
-//! （小文字化した上で処理）。CJK ストップワード除去は TASK-105 の管轄のため、この境界を
-//! 差し替え可能な関数単位（[`tokenize`]）で切り出しておく。
+//! （小文字化した上で処理）。**対応範囲外の文字（全角英数字・アクセント付きラテン文字・
+//! ハングル・半角カタカナ等）は無音で破棄される**（トークンに含まれない、または単語の
+//! 途中で欠落したまま結合される）。この正規化（NFKC 等）による対応範囲拡張は TASK-105 の
+//! 管轄のため、この境界を差し替え可能な関数単位（[`tokenize`]）で切り出しておく。
+//!
+//! [`SparseIndex::search`] は現時点で文書集合への線形走査（`O(コーパス文書数)`）で実装する。
+//! 性能要件（インデックス構造化・枝刈り等）は TASK-103/104 での検証時に見直す。
 //!
 //! untrusted 入力の扱い: 将来 wire 経由のクエリ文字列が本モジュールへ渡る前提のため、
 //! すべての処理を入力長に対して線形に保ち（バイグラム生成含む）、`Vec::with_capacity` は
@@ -83,7 +88,9 @@ impl std::error::Error for SparseError {}
 /// Top-k 検索結果 1 件（文書 ID と BM25 スコア）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoredDoc {
+    /// スコア対象の文書 ID（呼び出し側が [`SparseIndex::build`]/`with_params` に渡した ID）。
     pub doc_id: DocId,
+    /// BM25 スコア（降順ソート済み。同点は `doc_id` 昇順でタイブレークする）。
     pub score: f64,
 }
 
@@ -112,6 +119,11 @@ fn is_cjk_char(c: char) -> bool {
 /// 入力長に対して線形（`O(n)`）に処理し、`Vec` の初期容量は入力の文字数（検証済みの
 /// 長さ）からのみ見積もる。トークンが 1 つも得られない入力（空文字列・記号のみ等）は
 /// 空の `Vec` を返す（呼び出し側はこれをエラーではなく空結果として扱う契約とする）。
+///
+/// 対応範囲は ASCII 単語文字と CJK（ひらがな・カタカナ・CJK 統合漢字）に限る。それ以外の
+/// 文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ等）は無音で破棄され、
+/// ASCII 単語の途中に出現した場合はその文字だけが欠落したまま前後が結合される
+/// （例: `"café"` → `["caf"]`）。対応範囲の拡張は TASK-105 の管轄とする。
 pub fn tokenize(text: &str) -> Vec<String> {
     let lower: Vec<char> = text.to_lowercase().chars().collect();
     // ASCII 単語 + CJK ユニグラム/バイグラムを見積もった容量（過小でも Vec は伸長するため
@@ -218,6 +230,9 @@ impl SparseIndex {
                 *counter = counter.saturating_add(1);
             }
 
+            // `doc_tokens.len()` が `u32::MAX` を超える場合は `u32::MAX` に飽和させる
+            // （文書長の理論上限を意図的に切り詰め、オーバーフローを未定義動作にしない）。
+            // 実運用でこの桁数の単一文書は想定しないが、fail-closed のため checked に倒す。
             let doc_len = u32::try_from(doc_tokens.len()).unwrap_or(u32::MAX);
             total_len = total_len.saturating_add(u64::from(doc_len));
 
@@ -233,12 +248,10 @@ impl SparseIndex {
             });
         }
 
+        // `entries.len() == docs.len()` であり、`docs.is_empty()` は関数冒頭で拒否済みの
+        // ため、ここでの `doc_count` は必ず 1 以上（0 除算にはならない）。
         let doc_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
-        let avg_doc_len = if doc_count == 0 {
-            0.0
-        } else {
-            total_len as f64 / f64::from(doc_count)
-        };
+        let avg_doc_len = total_len as f64 / f64::from(doc_count);
 
         Ok(SparseIndex {
             k1,
@@ -346,6 +359,32 @@ mod tests {
         assert_eq!(toks, vec!["vector", "検", "検索", "索"]);
     }
 
+    // --- 対応範囲外文字の無音破棄（現挙動の固定。モジュールコメント参照） ---
+
+    #[test]
+    fn tokenize_fullwidth_alnum_yields_no_tokens() {
+        // 全角英数字は ASCII 単語文字でも CJK レンジでもないため、無音で破棄される。
+        assert!(tokenize("ＶＥＣＴＯＲ").is_empty());
+    }
+
+    #[test]
+    fn tokenize_accented_latin_is_silently_truncated() {
+        // アクセント付きラテン文字（'é'）は対応範囲外のため欠落し、前後の ASCII 部分のみが
+        // 結合されたトークンとして残る。
+        assert_eq!(tokenize("café"), vec!["caf"]);
+    }
+
+    #[test]
+    fn tokenize_hangul_yields_no_tokens() {
+        assert!(tokenize("안녕").is_empty());
+    }
+
+    #[test]
+    fn tokenize_halfwidth_katakana_yields_no_tokens() {
+        // 半角カタカナは `is_cjk_char` のレンジ（全角カタカナ U+30A0..=U+30FF）に含まれない。
+        assert!(tokenize("ﾃｽﾄ").is_empty());
+    }
+
     // --- SparseIndex 構築・境界値 ---
 
     #[test]
@@ -423,6 +462,38 @@ mod tests {
         let first = idx.search("gamma delta", 10);
         let second = idx.search("gamma delta", 10);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn build_with_symbol_only_document_included_in_avg_doc_len() {
+        // 記号のみの文書（トークン化結果が空）が混在するコーパスでも構築・検索が
+        // 破綻しないことを確認する（avg_doc_len のゼロ割ガードの回帰検出）。
+        // doc2 のトークン数は 0 のため avgdl = (2 tokens + 0 tokens) / 2 docs = 1.0 となり、
+        // ゼロ割ガード（`avg_doc_len.max(f64::MIN_POSITIVE)`）を経由せず素の平均が使われる。
+        let docs = vec![(1u64, "alpha beta"), (2u64, "!!! ???")];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        let idf_alpha = ((2.0 - 1.0 + 0.5) / (1.0 + 0.5) + 1.0f64).ln();
+        let k1 = 1.2f64;
+        let b = 0.75f64;
+        let f = 1.0f64;
+        let len_norm = 1.0 - b + b * (2.0 / 1.0);
+        let expected = idf_alpha * (f * (k1 + 1.0)) / (f + k1 * len_norm);
+
+        let results = idx.search("alpha", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 1);
+        assert!((results[0].score - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_with_all_symbol_only_documents_does_not_panic() {
+        // 全文書がトークン化結果ゼロ（記号のみ）のコーパスは EmptyCorpus ではなく正常に
+        // 構築でき、検索も NaN・panic なく決定的に空を返す（avg_doc_len == 0.0 の経路を
+        // 実際に踏む唯一のケース）。
+        let docs = vec![(1u64, "!!!"), (2u64, "???")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        assert!(idx.search("alpha", 10).is_empty());
     }
 
     #[test]
