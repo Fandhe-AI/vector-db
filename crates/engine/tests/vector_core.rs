@@ -1,15 +1,22 @@
 //! `VectorCore` / `PolicyContext` / provider 注入の結合テスト（TASK-124）。
 //! 対象ビヘイビア: CORE-1（プロトコル非依存のコア API）・CORE-2（テナント境界の
 //! 単一照合パス）・CORE-13（実行バックエンド provider 注入）。境界系（次元・k 検証）も含む。
+//!
+//! シード手法（codex P0-2・Issue #137 対応）: `EngineCore` はテナント境界を迂回する
+//! 生ハンドルへの経路（旧 `storage()` アクセサ・`test-support` feature）を公開しない
+//! （`crates/engine/src/core.rs` のドキュメント参照）。そのため本ファイルのテストは、
+//! `engine::storage::Storage::open` で直接開いた `Storage` にテーブル作成・行投入を
+//! 済ませてから、その所有権ごと [`EngineCore::from_storage`] へ渡して `EngineCore` を
+//! 構築する（構築後は `EngineCore` から生 `Storage` へ戻る経路がない）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
-use engine::storage::{RowInput, Visibility};
+use engine::storage::{RowInput, Storage, Visibility};
 
 /// 自動削除される一時ディレクトリ（`redb` ファイルの置き場）。外部クレートに
 /// 依存しない最小実装（dependency-policy 準拠）。
@@ -54,14 +61,14 @@ fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
 }
 
 fn seed_row(
-    core: &EngineCore,
+    storage: &Storage,
     table: &str,
     id: u64,
     tenant: &str,
     visibility: Visibility,
     embedding: &[f32],
 ) {
-    core.storage()
+    storage
         .insert_row_into_table(
             table,
             id,
@@ -109,12 +116,12 @@ fn wire_like_adapter_search(
 #[test]
 fn core1_two_protocol_adapters_agree_via_object_safe_trait() {
     let dir = TempDir::new("core1");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
@@ -122,7 +129,7 @@ fn core1_two_protocol_adapters_agree_via_object_safe_trait() {
         &[1.0, 0.0],
     );
     seed_row(
-        &core,
+        &storage,
         "docs",
         2,
         "tenant-a",
@@ -130,13 +137,14 @@ fn core1_two_protocol_adapters_agree_via_object_safe_trait() {
         &[0.0, 1.0],
     );
     seed_row(
-        &core,
+        &storage,
         "docs",
         3,
         "tenant-a",
         Visibility::Public,
         &[2.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let core_ref: &dyn VectorCore = &core;
@@ -148,17 +156,21 @@ fn core1_two_protocol_adapters_agree_via_object_safe_trait() {
     assert_eq!(wire_ids, vec![3, 1]);
 }
 
-/// 実装から独立した検査器: 検索結果の行 ID から `Storage` を直接再読取して
-/// テナントを再計算する（`core.rs` の判定ロジックとは別経路で検証する。CORE-2）。
+/// 実装から独立した検査器: `EngineCore`（≒ `core.rs` の判定ロジック）を経由せず、
+/// 検索完了後に再度開いた `Storage` から直接行を読み直してテナントを再計算する
+/// （CORE-2）。`redb` はプロセス内で同一ファイルへの多重 `Database` を許容しないため、
+/// 呼び出し元は本関数を呼ぶ前に検証対象の `EngineCore`（`Storage` を内部所有する）を
+/// drop 済みにしておくこと（codex P0-2・Issue #137 対応: `EngineCore` から生 `Storage`
+/// を取り出す経路は公開しないため、独立検証はパスを再オープンする形にする）。
 fn assert_no_cross_tenant_leak(
-    core: &EngineCore,
+    path: &Path,
     table: &str,
     expected_tenant: &str,
     hits: &[SearchHit],
 ) {
+    let storage = Storage::open(path).expect("reopen storage for independent verification");
     for hit in hits {
-        let row = core
-            .storage()
+        let row = storage
             .get_row_from_table(table, hit.id)
             .expect("checker: row must exist for a returned hit");
         assert_eq!(
@@ -172,70 +184,76 @@ fn assert_no_cross_tenant_leak(
 #[test]
 fn core2_multi_tenant_search_has_zero_cross_tenant_leakage() {
     let dir = TempDir::new("core2-leak");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
-        .create_table(&schema_for("docs", 2))
-        .expect("create table");
-    // tenant-a と tenant-b を混在させ、tenant-b 側に最高スコアの行を置く
-    // （マスクが効いていなければ tenant-a の検索結果に混入する）。
-    seed_row(
-        &core,
-        "docs",
-        1,
-        "tenant-a",
-        Visibility::Public,
-        &[1.0, 0.0],
-    );
-    seed_row(
-        &core,
-        "docs",
-        2,
-        "tenant-a",
-        Visibility::Public,
-        &[0.5, 0.0],
-    );
-    seed_row(
-        &core,
-        "docs",
-        3,
-        "tenant-b",
-        Visibility::Public,
-        &[100.0, 0.0],
-    );
-    seed_row(
-        &core,
-        "docs",
-        4,
-        "tenant-b",
-        Visibility::Public,
-        &[50.0, 0.0],
-    );
+    let path = dir.db_path();
 
-    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
-    let hits = core
-        .search(&ctx_a, "docs", &[1.0, 0.0], 10)
-        .expect("search ok");
+    let hits = {
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        // tenant-a と tenant-b を混在させ、tenant-b 側に最高スコアの行を置く
+        // （マスクが効いていなければ tenant-a の検索結果に混入する）。
+        seed_row(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        seed_row(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+        seed_row(
+            &storage,
+            "docs",
+            3,
+            "tenant-b",
+            Visibility::Public,
+            &[100.0, 0.0],
+        );
+        seed_row(
+            &storage,
+            "docs",
+            4,
+            "tenant-b",
+            Visibility::Public,
+            &[50.0, 0.0],
+        );
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        core.search(&ctx_a, "docs", &[1.0, 0.0], 10)
+            .expect("search ok")
+        // `core`（内部の `Storage` を含む）はここで drop され、db ファイルが解放される。
+    };
 
     assert!(!hits.is_empty());
-    assert_no_cross_tenant_leak(&core, "docs", "tenant-a", &hits);
+    assert_no_cross_tenant_leak(&path, "docs", "tenant-a", &hits);
     assert!(hits.iter().all(|h| h.id == 1 || h.id == 2));
 }
 
 #[test]
 fn core2_get_row_does_not_distinguish_invisible_from_missing() {
     let dir = TempDir::new("core2-getrow");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-b",
         Visibility::Public,
         &[1.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
     let other_tenant_row = core.get_row(&ctx_a, "docs", 1);
@@ -255,12 +273,12 @@ fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
     let dir = TempDir::new("core-corrupt");
     let path = dir.db_path();
     {
-        let core = EngineCore::open(&path).expect("open engine core");
-        core.storage()
+        let storage = Storage::open(&path).expect("open storage");
+        storage
             .create_table(&schema_for("docs", 2))
             .expect("create table");
-        // `Storage`/`EngineCore` を閉じてから raw `redb::Database` で同一ファイルを
-        // 再度開く（redb はプロセス内で同一ファイルへの多重 `Database` を許容しない）。
+        // `Storage` を閉じてから raw `redb::Database` で同一ファイルを再度開く
+        // （redb はプロセス内で同一ファイルへの多重 `Database` を許容しない）。
     }
     {
         let db = redb::Database::create(&path).expect("reopen raw database");
@@ -327,13 +345,13 @@ fn search_projects_input_to_visible_rows_only_before_calling_provider() {
         captured_ids: Arc::clone(&captured_ids),
         captured_vector_len: Arc::clone(&captured_vector_len),
     };
-    let core =
-        EngineCore::with_provider(dir.db_path(), Box::new(provider)).expect("open engine core");
-    core.storage()
+
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
@@ -341,13 +359,14 @@ fn search_projects_input_to_visible_rows_only_before_calling_provider() {
         &[1.0, 0.0],
     );
     seed_row(
-        &core,
+        &storage,
         "docs",
         2,
         "tenant-b",
         Visibility::Public,
         &[100.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(provider));
 
     let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
     let _ = core
@@ -388,19 +407,19 @@ impl SearchProvider for FabricatingHitProvider {
 #[test]
 fn provider_returning_a_hit_absent_from_the_dataset_is_rejected() {
     let dir = TempDir::new("provider-fabricated-hit");
-    let core = EngineCore::with_provider(dir.db_path(), Box::new(FabricatingHitProvider))
-        .expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
         Visibility::Public,
         &[1.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(FabricatingHitProvider));
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let err = core
@@ -432,19 +451,20 @@ fn core13_custom_provider_injection_is_actually_called() {
     let provider = RecordingProvider {
         calls: Arc::clone(&calls),
     };
-    let core =
-        EngineCore::with_provider(dir.db_path(), Box::new(provider)).expect("open engine core");
-    core.storage()
+
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
         Visibility::Public,
         &[1.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(provider));
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -458,21 +478,31 @@ fn core13_custom_provider_injection_is_actually_called() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+// 対象ビヘイビア: CORE-13。既定コンストラクタ（`EngineCore::open`）が CPU-only
+// provider だけで全機能を成立させることを検証する。他のテストと異なり構築対象の
+// 制約（`open` が自らパスを開いて `Storage` を所有する）を保つため、シード用の
+// `Storage` は別スコープで開いて閉じてから、検証対象の `EngineCore::open` で
+// 同じパスを再度開く。
 #[test]
 fn core13_default_cpu_only_constructor_supports_full_functionality() {
     let dir = TempDir::new("core13-default");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core (default CPU provider)");
-    core.storage()
-        .create_table(&schema_for("docs", 3))
-        .expect("create table");
-    seed_row(
-        &core,
-        "docs",
-        1,
-        "tenant-a",
-        Visibility::Public,
-        &[1.0, 0.0, 0.0],
-    );
+    let path = dir.db_path();
+    {
+        let storage = Storage::open(&path).expect("open storage to seed");
+        storage
+            .create_table(&schema_for("docs", 3))
+            .expect("create table");
+        seed_row(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0, 0.0],
+        );
+    }
+
+    let core = EngineCore::open(&path).expect("open engine core (default CPU provider)");
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let hits = core
@@ -488,18 +518,19 @@ fn core13_default_cpu_only_constructor_supports_full_functionality() {
 #[test]
 fn boundary_query_dimension_mismatch_is_rejected() {
     let dir = TempDir::new("boundary-dim");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 3))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
         Visibility::Public,
         &[1.0, 0.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let err = core.search(&ctx, "docs", &[1.0, 0.0], 1).unwrap_err();
@@ -512,18 +543,19 @@ fn boundary_query_dimension_mismatch_is_rejected() {
 #[test]
 fn boundary_k_zero_and_k_over_limit_are_rejected() {
     let dir = TempDir::new("boundary-k");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
         Visibility::Public,
         &[1.0, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
     assert!(matches!(
@@ -548,8 +580,8 @@ fn dim_mismatch_is_rejected_before_scanning_table_rows() {
     let dir = TempDir::new("dim-mismatch-early-reject");
     let path = dir.db_path();
     {
-        let core = EngineCore::open(&path).expect("open engine core");
-        core.storage()
+        let storage = Storage::open(&path).expect("open storage");
+        storage
             .create_table(&schema_for("docs", 3))
             .expect("create table");
     }
@@ -599,8 +631,8 @@ fn non_finite_query_is_rejected_before_scanning_table_rows() {
     let dir = TempDir::new("non-finite-early-reject");
     let path = dir.db_path();
     {
-        let core = EngineCore::open(&path).expect("open engine core");
-        core.storage()
+        let storage = Storage::open(&path).expect("open storage");
+        storage
             .create_table(&schema_for("docs", 3))
             .expect("create table");
     }
@@ -659,13 +691,13 @@ fn search_and_get_row_agree_on_not_found_for_missing_table() {
 #[test]
 fn search_excludes_private_rows_of_the_same_tenant_when_ctx_disallows_private() {
     let dir = TempDir::new("private-visibility-excluded");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
     // Private 行がクエリに最も近い（マスクが効いていなければ検索結果の先頭に来る）。
     seed_row(
-        &core,
+        &storage,
         "docs",
         1,
         "tenant-a",
@@ -673,13 +705,14 @@ fn search_excludes_private_rows_of_the_same_tenant_when_ctx_disallows_private() 
         &[1.0, 0.0],
     );
     seed_row(
-        &core,
+        &storage,
         "docs",
         2,
         "tenant-a",
         Visibility::Public,
         &[0.5, 0.0],
     );
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     // 既定コンストラクタは Public のみ許可（`PolicyContext::new` のドキュメント参照）。
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -706,10 +739,11 @@ fn search_excludes_private_rows_of_the_same_tenant_when_ctx_disallows_private() 
 #[test]
 fn boundary_empty_table_search_returns_empty_results() {
     let dir = TempDir::new("boundary-empty");
-    let core = EngineCore::open(dir.db_path()).expect("open engine core");
-    core.storage()
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    storage
         .create_table(&schema_for("docs", 2))
         .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
     let hits = core

@@ -158,24 +158,19 @@ impl EngineCore {
         Ok(Self { storage, provider })
     }
 
-    /// 直接 `Storage` から構築する（テスト用途。呼び出し元が既に開いたハンドルを
-    /// 再利用したい場合に使う）。`test-support` feature 限定（下記 [`Self::storage`] 参照）。
-    #[cfg(any(test, feature = "test-support"))]
+    /// 既に開いた `Storage` の所有権を受け取って構築する（呼び出し元がテーブル作成・
+    /// 行投入等を `Storage` の公開 API で済ませてから `EngineCore` へ引き渡す用途。
+    /// `Storage::open` 自体は既に公開 API であるため、本関数はテナント境界の迂回経路を
+    /// 新設しない）。
+    ///
+    /// 一方向の所有権移動のみを許し、`EngineCore` から生の `Storage` を取り出す経路は
+    /// 公開しない（旧 `Self::storage` アクセサ・`test-support` feature を廃止した。
+    /// codex P0-2・Issue #137 対応）。構築後は [`VectorCore::get_row`]・
+    /// [`VectorCore::search`] が経由する [`crate::policy::PolicyContext::is_visible`] の
+    /// 単一照合パスだけが `Storage` への到達経路になる（security.md P0「テナント分離の
+    /// 検査を外す/緩める/バイパス経路を作らない」）。
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
         Self { storage, provider }
-    }
-
-    /// 保持している永続化ハンドルへの参照（テスト用途限定）。
-    ///
-    /// `Storage` はテナント境界を判定しない生ハンドルであり、[`VectorCore::get_row`]・
-    /// [`VectorCore::search`] が経由する [`crate::policy::PolicyContext::is_visible`] の
-    /// 単一照合パスを迂回できる（security.md P0「テナント分離の検査を外す/緩める/
-    /// バイパス経路を作らない」）。そのため通常ビルド（`wire-server` を含む）の公開面には
-    /// 含めず、`test-support` feature 限定で `tests/` 配下の結合テストにのみ公開する
-    /// （`Cargo.toml` の self dev-dependency 経由で結合テストビルド時のみ有効化）。
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn storage(&self) -> &Storage {
-        &self.storage
     }
 }
 
