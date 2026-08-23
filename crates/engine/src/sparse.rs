@@ -42,21 +42,28 @@
 //! `tokenize()` を呼ぶ前に文書 1 件のバイト長（`MAX_DOC_BYTES`）とコーパスの文書数
 //! （`MAX_CORPUS_DOCS`）を検証する。この 2 つは互いに独立な検証のため、両方の上限
 //! ちょうどの組み合わせだけではコーパス全体のバイト数を有界に保てない。そのため
-//! 走査済み文書のバイト長累計にも `MAX_CORPUS_BYTES` の上限を設ける。詳細は
+//! 走査済み文書のバイト長累計にも `MAX_CORPUS_BYTES` の上限を設ける。ただしバイト長
+//! の上限は `tokenize()` が生成するトークン数（＝ヒープ確保数）を直接制限しない
+//! （CJK 入力はユニグラム＋バイグラムにより 1 文字あたり最大 2 トークンを生じる
+//! ため、バイト長に比例しない）。そのため各文書を `tokenize()` した直後にも走査済み
+//! トークン数の累計に `MAX_CORPUS_TOKENS` の上限を設ける。詳細は
 //! [`SparseIndex::with_params`] を参照。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
 //! クエリはバイト長を `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` で上限検証し
 //! （詳細は [`SparseIndex::search`]）、文書はバイト長を `MAX_DOC_BYTES`、コーパスの
-//! 文書数を `MAX_CORPUS_DOCS`、コーパス全体のバイト長合計を `MAX_CORPUS_BYTES` で
-//! 上限検証する（詳細は [`SparseIndex::with_params`]）。いずれの検証も `tokenize()`
-//! を呼ぶ前にバイト長・件数のみを見る `O(1)` の判定で完結し、追加アロケーションを
-//! 要しない。公開関数 [`tokenize`] 自体はこれらの上限を強制しない（呼び出し側が
-//! 上限検証済みの入力のみを渡す契約とする。詳細は [`tokenize`] のドキュメントを
-//! 参照）。頻度・長さの演算はすべて `checked_*`/`saturating_*` を用い、オーバーフローを
-//! 未定義動作にしない。`tokenize()` 内の添字アクセスは事前のループ境界チェックにより
-//! 範囲内が証明可能（panic しない）。
+//! 文書数を `MAX_CORPUS_DOCS`、コーパス全体のバイト長合計を `MAX_CORPUS_BYTES`、
+//! コーパス全体のトークン数合計を `MAX_CORPUS_TOKENS` で上限検証する（詳細は
+//! [`SparseIndex::with_params`]）。バイト長・件数の検証は `tokenize()` を呼ぶ前に
+//! バイト長・件数のみを見る `O(1)` の判定で完結し追加アロケーションを要しないが、
+//! トークン数の検証（`MAX_CORPUS_TOKENS`）だけは性質上 `tokenize()` の結果
+//! （`Vec<String>` の長さ）が必要なため、`tokenize()` の直後・`term_freq`/`doc_freq`
+//! の構築前に判定する。公開関数 [`tokenize`] 自体はこれらの上限を強制しない
+//! （呼び出し側が上限検証済みの入力のみを渡す契約とする。詳細は [`tokenize`] の
+//! ドキュメントを参照）。頻度・長さの演算はすべて `checked_*`/`saturating_*` を用い、
+//! オーバーフローを未定義動作にしない。`tokenize()` 内の添字アクセスは事前の
+//! ループ境界チェックにより範囲内が証明可能（panic しない）。
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -114,12 +121,14 @@ const MAX_CORPUS_DOCS: usize = 100_000;
 ///
 /// [`MAX_DOC_BYTES`]・[`MAX_CORPUS_DOCS`] は互いに独立な検証のため、両方の上限
 /// ちょうど（1 MiB 文書 × 10 万件）を組み合わせると最大で約 100 GiB もの入力を
-/// 許してしまい、単体では OOM を防げない。`with_params()` はトークン化の過程で
-/// 各文書の `String` トークンを `term_freq`・`doc_freq` の双方（`BTreeMap` キーとして
-/// 別々にヒープ確保）に保持するため、実効メモリ使用量は入力バイト数の数倍規模に
-/// 増幅しうる。64 MiB はこの増幅を見込んでも実行時メモリを現実的な範囲に収めつつ、
-/// 単一の `SparseIndex` に載せるテキストコーパスとして十分実用的な規模を許容する
-/// 上限とする。
+/// 許してしまい、単体では OOM を防げない。64 MiB は単一の `SparseIndex` に載せる
+/// テキストコーパスの入力サイズとして十分実用的な規模を許容する上限とする。
+///
+/// ただしこのバイト長上限は入力テキストのサイズのみを制限し、`tokenize()` が
+/// 生成するトークン数（＝ヒープオブジェクト・`BTreeMap` ノードの生成数）を直接
+/// 制限しない。CJK 文字はユニグラム＋バイグラムを生成するため 1 文字（3 バイト）
+/// あたり最大 2 トークンを生じ、バイト数から見積もれる最悪ケースのトークン数は
+/// 大きい。実効的なヒープ割当量の上限は [`MAX_CORPUS_TOKENS`] が別途担う。
 const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
 
 // `MAX_CORPUS_BYTES` が `MAX_DOC_BYTES` の整数倍であることをコンパイル時に固定する。
@@ -127,6 +136,20 @@ const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
 // コーパスを組み立てるため（巨大な単一バッファの重複確保を避ける）、この関係が崩れると
 // 境界値テストの前提が壊れる。
 const _: () = assert!(MAX_CORPUS_BYTES.is_multiple_of(MAX_DOC_BYTES));
+
+/// [`SparseIndex::with_params`]（構築）が受け付けるコーパス全体のトークン数合計の上限。
+///
+/// [`MAX_CORPUS_BYTES`] は入力テキストのバイト数のみを制限し、`tokenize()` が
+/// 生成するトークン数を直接制限しない。CJK 文字はユニグラム＋バイグラムを生成する
+/// ため 1 文字（3 バイト）あたり最大 2 トークンとなり、64 MiB の CJK 主体の入力から
+/// 数千万規模のトークンが生じうる。各トークンは `term_freq`・`doc_freq` の双方の
+/// `BTreeMap` キーとして個別にヒープ確保される（`String` の見出し用ヒープ確保
+/// ×2／トークン、加えて `BTreeMap` ノードのオーバーヘッド）ため、トークン 1 件
+/// あたり数百バイト程度の実効メモリを要すると見積もる。800 万トークンはこの見積もり
+/// でも実行時メモリを概ね 1 GiB 程度の現実的な範囲に収めつつ、典型的な（CJK 一辺倒
+/// ではない）コーパスであれば [`MAX_CORPUS_BYTES`] に近いサイズでも許容できる規模の
+/// 上限とする。
+const MAX_CORPUS_TOKENS: usize = 8_000_000;
 
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
@@ -172,6 +195,14 @@ pub enum SparseError {
     /// `saturating_add` で求めて判定し、超過した時点で fail-closed に拒否する
     /// （オーバーフロー時は `total` を `usize::MAX` として報告し、必ず拒否する）。
     CorpusTooLarge { total: usize, max: usize },
+    /// コーパス全体のトークン数合計が [`MAX_CORPUS_TOKENS`] を超える。`CorpusTooLarge`
+    /// は入力テキストのバイト長のみを制限するため、CJK 主体の入力（ユニグラム＋
+    /// バイグラムで 1 文字あたり最大 2 トークンを生じる）ではトークン数・ヒープ確保数
+    /// がバイト長に比例しない（[`MAX_CORPUS_TOKENS`] のコメント参照）。`with_params()`
+    /// は各文書を `tokenize()` した直後（`term_freq`・`doc_freq` を構築する前）に、
+    /// それまでのトークン数の累計を `saturating_add` で求めて判定し、超過した時点で
+    /// fail-closed に拒否する。
+    TooManyTokens { total: usize, max: usize },
 }
 
 impl std::fmt::Display for SparseError {
@@ -201,6 +232,9 @@ impl std::fmt::Display for SparseError {
             }
             SparseError::CorpusTooLarge { total, max } => {
                 write!(f, "corpus too large: {total} bytes (max {max})")
+            }
+            SparseError::TooManyTokens { total, max } => {
+                write!(f, "too many tokens in corpus: {total} (max {max})")
             }
         }
     }
@@ -375,16 +409,21 @@ impl SparseIndex {
     /// サイレントな空結果へ落ちてしまい fail-open になるため、ここで拒否して
     /// fail-closed を保つ（`.claude/rules/coding-rust.md`）。
     ///
-    /// `docs` はコーパス全体のサイズを制限する 3 段の上限検証を、各文書に対して
-    /// `tokenize()`（アロケーションを伴う）を呼ぶ前に行う（`.claude/rules/coding-rust.md`:
-    /// untrusted 入力の長さは上限検証してから処理する）。文書数が [`MAX_CORPUS_DOCS`]
-    /// を超える場合は走査に入る前に [`SparseError::TooManyDocs`] で拒否し、各文書の
-    /// バイト長が [`MAX_DOC_BYTES`] を超える場合は該当文書の `tokenize()` を呼ぶ前に
+    /// `docs` はコーパス全体のサイズを制限する 4 段の上限検証を行う
+    /// （`.claude/rules/coding-rust.md`: untrusted 入力の長さは上限検証してから
+    /// 処理する）。文書数が [`MAX_CORPUS_DOCS`] を超える場合は走査に入る前に
+    /// [`SparseError::TooManyDocs`] で拒否し、各文書のバイト長が [`MAX_DOC_BYTES`]
+    /// を超える場合は該当文書の `tokenize()`（アロケーションを伴う）を呼ぶ前に
     /// [`SparseError::DocTooLong`] で拒否する。[`MAX_DOC_BYTES`]・[`MAX_CORPUS_DOCS`]
     /// は互いに独立な検証のため、それらの組み合わせだけでは総入力サイズを有界に
     /// 保てない（[`MAX_CORPUS_BYTES`] のコメント参照）。そのため、これまでに走査した
     /// 文書のバイト長の累計を `saturating_add` で求め、[`MAX_CORPUS_BYTES`] を超えた時点で
     /// 該当文書の `tokenize()` を呼ぶ前に [`SparseError::CorpusTooLarge`] で拒否する。
+    /// さらに、バイト長上限は `tokenize()` が生成するトークン数（CJK 入力では
+    /// バイト長に比例しない。[`MAX_CORPUS_TOKENS`] のコメント参照）を直接制限しない
+    /// ため、該当文書の `tokenize()` を呼んだ直後（`term_freq`・`doc_freq` を構築する
+    /// 前）に、それまでのトークン数の累計を `saturating_add` で求め、
+    /// [`MAX_CORPUS_TOKENS`] を超えた時点で [`SparseError::TooManyTokens`] で拒否する。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
         if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
             return Err(SparseError::InvalidParams { k1, b });
@@ -407,6 +446,11 @@ impl SparseIndex {
         // `usize::MAX` へ飽和させる（この桁数の入力は現実的に想定しないが、
         // fail-closed のため未定義動作にせず必ず MAX_CORPUS_BYTES 超過として扱う）。
         let mut corpus_bytes_seen: usize = 0;
+        // コーパス全体のトークン数累計（同様に `saturating_add` で飽和させる）。
+        // バイト長の累計だけでは CJK 主体の入力によるトークン数・ヒープ確保数の
+        // 増幅を捕捉できないため、こちらは各文書の `tokenize()` 直後に加算する
+        // （MAX_CORPUS_TOKENS のコメント参照）。
+        let mut corpus_tokens_seen: usize = 0;
 
         for &(doc_id, text) in docs {
             if seen_ids.insert(doc_id, ()).is_some() {
@@ -428,6 +472,16 @@ impl SparseIndex {
             }
 
             let doc_tokens = tokenize(text);
+            // `term_freq`/`doc_freq` の構築（トークンごとの追加ヒープ確保）に入る前に、
+            // ここまでのトークン数累計を検証する（MAX_CORPUS_TOKENS のコメント参照）。
+            corpus_tokens_seen = corpus_tokens_seen.saturating_add(doc_tokens.len());
+            if corpus_tokens_seen > MAX_CORPUS_TOKENS {
+                return Err(SparseError::TooManyTokens {
+                    total: corpus_tokens_seen,
+                    max: MAX_CORPUS_TOKENS,
+                });
+            }
+
             let mut term_freq: BTreeMap<String, u32> = BTreeMap::new();
             for tok in &doc_tokens {
                 let counter = term_freq.entry(tok.clone()).or_insert(0u32);
@@ -1062,6 +1116,58 @@ mod tests {
             SparseError::CorpusTooLarge {
                 total: MAX_CORPUS_BYTES + 1,
                 max: MAX_CORPUS_BYTES,
+            }
+        );
+    }
+
+    // --- コーパス全体のトークン数上限（fail-closed。MAX_CORPUS_TOKENS 境界） ---
+
+    /// 合計トークン数がちょうど `target_tokens` になるコーパスを、CJK の同一文字を
+    /// 繰り返した文書の組み合わせで構築する（token/byte 比を意図的に大きくし、
+    /// `MAX_CORPUS_BYTES` の遥か手前で `MAX_CORPUS_TOKENS` に到達させるため）。
+    /// `tokenize()` は同一 CJK 文字（3 バイト/文字）を N 回繰り返した入力から常に
+    /// `2 * N - 1` 個のトークン（ユニグラム N 個＋隣接バイグラム `N - 1` 個）を生成する
+    /// ため、この式を逆算して任意の奇数トークン数を持つ文書を組み立てられる。
+    /// 1 文書あたりの繰り返し数は `MAX_DOC_BYTES` を超えないよう上限を設ける。
+    fn cjk_corpus_with_token_count(target_tokens: usize) -> Vec<(DocId, String)> {
+        let max_n_per_doc = MAX_DOC_BYTES / 3;
+        let max_tokens_per_doc = 2 * max_n_per_doc - 1;
+
+        let mut docs: Vec<(DocId, String)> = Vec::new();
+        let mut remaining = target_tokens;
+        let mut doc_id: DocId = 0;
+        while remaining > 0 {
+            let mut t = remaining.min(max_tokens_per_doc);
+            if t.is_multiple_of(2) {
+                // 2 * N - 1 は常に奇数のため、偶数になった場合は 1 引いて次の文書へ
+                // 繰り越す（ループはいずれ収束し、最終的な合計は target_tokens に一致）。
+                t -= 1;
+            }
+            let n = t.div_ceil(2);
+            docs.push((doc_id, "東".repeat(n)));
+            doc_id += 1;
+            remaining -= t;
+        }
+        docs
+    }
+
+    #[test]
+    fn build_accepts_corpus_at_max_corpus_tokens_boundary() {
+        let owned_docs = cjk_corpus_with_token_count(MAX_CORPUS_TOKENS);
+        let docs: Vec<(DocId, &str)> = owned_docs.iter().map(|(id, t)| (*id, t.as_str())).collect();
+        assert!(SparseIndex::build(&docs).is_ok());
+    }
+
+    #[test]
+    fn build_rejects_corpus_exceeding_max_corpus_tokens() {
+        let owned_docs = cjk_corpus_with_token_count(MAX_CORPUS_TOKENS + 1);
+        let docs: Vec<(DocId, &str)> = owned_docs.iter().map(|(id, t)| (*id, t.as_str())).collect();
+        let err = SparseIndex::build(&docs).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyTokens {
+                total: MAX_CORPUS_TOKENS + 1,
+                max: MAX_CORPUS_TOKENS,
             }
         );
     }
