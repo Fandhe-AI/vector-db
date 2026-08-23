@@ -55,6 +55,12 @@ extract_item_block() {
   # パターン直後に識別子構成文字（英数字・アンダースコア）が続く場合は、より長い
   # 別名（例: `pub struct Row` に対する `pub struct RowInput`）への誤マッチとみなし
   # 除外する（単語境界判定）。
+  # attrbuf（直前の外側属性行の蓄積バッファ）は `#[...]` 行以外なら常にクリアして
+  # いたが、`///` ドキュメンテーションコメント行や、外側属性とアイテム本体の間の
+  # 空行を挟む配置（`#[derive(...)]\n///...\npub struct Foo`）でも先行する属性が
+  # 比較前に失われてしまい、属性の変更を見逃す可能性があった。ドキュメントコメント
+  # 行・空行は属性の連続とみなしてバッファを保持し、それ以外の実コード行でのみ
+  # クリアする（PR #139 レビュー対応: Cursor Bugbot 指摘）。
   local block
   block="$(awk -v item="${item_pattern}" '
     found {
@@ -69,6 +75,8 @@ extract_item_block() {
       next
     }
     /^#\[/ { attrbuf = attrbuf $0 "\n"; next }
+    /^[[:space:]]*\/\// { next }
+    /^[[:space:]]*$/ { next }
     { attrbuf = "" }
   ' "${file}")"
 
@@ -92,10 +100,16 @@ CORE_FILE="${REPO_ROOT}/crates/engine/src/core.rs"
 KERNEL_FILE="${REPO_ROOT}/crates/engine/src/kernel.rs"
 POLICY_FILE="${REPO_ROOT}/crates/engine/src/policy.rs"
 STORAGE_FILE="${REPO_ROOT}/crates/engine/src/storage.rs"
+CATALOG_FILE="${REPO_ROOT}/crates/engine/src/catalog.rs"
+ARENA_FILE="${REPO_ROOT}/crates/engine/src/arena.rs"
 
 # 抽出対象: (ソースファイル, awk 抽出パターン, スナップショット上のラベル)。
-# trait 本体（VectorCore・SearchProvider）に加え、両シグネチャが直接参照する公開型
-# （PolicyContext・SearchInput・SearchHit・Row・CoreError・KernelError）を含める。
+# trait 本体（VectorCore・SearchProvider）に加え、両シグネチャが直接・推移的に参照する
+# 公開型・公開コンストラクタを含める（PR #139 レビュー対応: codex-review P1 指摘。
+# `CoreError` の variant payload である `StorageError`/`CatalogError`/`ArenaError`/
+# `PolicyError`、`Row` の公開フィールド型である `Visibility`、`PolicyContext` の公開
+# コンストラクタ（`impl PolicyContext` ブロック丸ごと）まで対象を広げないと、
+# プロトコル層が実際に依存するこれらの API を破壊的に変更しても検知できないため）。
 ITEMS=(
   "${CORE_FILE}|pub trait VectorCore|crates/engine/src/core.rs :: VectorCore"
   "${KERNEL_FILE}|pub trait SearchProvider|crates/engine/src/kernel.rs :: SearchProvider"
@@ -104,7 +118,13 @@ ITEMS=(
   "${KERNEL_FILE}|pub enum KernelError|crates/engine/src/kernel.rs :: KernelError"
   "${KERNEL_FILE}|pub struct SearchInput|crates/engine/src/kernel.rs :: SearchInput"
   "${POLICY_FILE}|pub struct PolicyContext|crates/engine/src/policy.rs :: PolicyContext"
+  "${POLICY_FILE}|impl PolicyContext|crates/engine/src/policy.rs :: PolicyContext (公開コンストラクタ・メソッド)"
+  "${POLICY_FILE}|pub enum PolicyError|crates/engine/src/policy.rs :: PolicyError"
   "${STORAGE_FILE}|pub struct Row|crates/engine/src/storage.rs :: Row"
+  "${STORAGE_FILE}|pub enum Visibility|crates/engine/src/storage.rs :: Visibility"
+  "${STORAGE_FILE}|pub enum StorageError|crates/engine/src/storage.rs :: StorageError"
+  "${CATALOG_FILE}|pub enum CatalogError|crates/engine/src/catalog.rs :: CatalogError"
+  "${ARENA_FILE}|pub enum ArenaError|crates/engine/src/arena.rs :: ArenaError"
 )
 
 GENERATED_PARTS=()

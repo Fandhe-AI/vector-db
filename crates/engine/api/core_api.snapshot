@@ -62,6 +62,42 @@ pub struct PolicyContext {
     allowed_visibilities: HashSet<AllowedVisibility>,
 }
 
+# source: crates/engine/src/policy.rs :: PolicyContext (公開コンストラクタ・メソッド)
+impl PolicyContext {
+    pub fn new(tenant_id: &str) -> Result<Self, PolicyError> {
+        Self::with_visibilities(tenant_id, [Visibility::Public])
+    }
+    pub fn with_visibilities(
+        tenant_id: &str,
+        visibilities: impl IntoIterator<Item = Visibility>,
+    ) -> Result<Self, PolicyError> {
+        validate_tenant_id(tenant_id)?;
+        Ok(Self {
+            tenant_id: tenant_id.to_string(),
+            allowed_visibilities: visibilities
+                .into_iter()
+                .map(AllowedVisibility::from)
+                .collect(),
+        })
+    }
+    pub fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
+        row_tenant == self.tenant_id
+            && self
+                .allowed_visibilities
+                .contains(&AllowedVisibility::from(row_visibility))
+    }
+}
+
+# source: crates/engine/src/policy.rs :: PolicyError
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyError {
+    EmptyTenantId,
+    TenantIdTooLong { len: usize, max: u16 },
+}
+
 # source: crates/engine/src/storage.rs :: Row
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -70,4 +106,46 @@ pub struct Row {
     pub visibility: Visibility,
     pub embedding: Vec<f32>,
     pub metadata: Vec<u8>,
+}
+
+# source: crates/engine/src/storage.rs :: Visibility
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Private,
+}
+
+# source: crates/engine/src/storage.rs :: StorageError
+#[derive(Debug)]
+pub enum StorageError {
+    Backend(redb::Error),
+    Codec(String),
+    NotFound(u64),
+    ScanLimitExceeded,
+    DuplicateBatchSeq(u64),
+    PendingRowCountOverflow,
+    UnloggedRows(u64),
+    EmptyBatch,
+}
+
+# source: crates/engine/src/catalog.rs :: CatalogError
+#[derive(Debug)]
+pub enum CatalogError {
+    Backend(redb::Error),
+    Invalid(String),
+    TableNotFound(String),
+    TableAlreadyExists(String),
+    ColumnAlreadyExists(String),
+    RowNotFound(u64),
+}
+
+# source: crates/engine/src/arena.rs :: ArenaError
+#[derive(Debug)]
+pub enum ArenaError {
+    Storage(StorageError),
+    Catalog(CatalogError),
+    InvalidDim,
+    CapacityExceeded,
+    DimMismatch { id: u64, expected: u32, found: u32 },
+    AllocationFailed(String),
 }
