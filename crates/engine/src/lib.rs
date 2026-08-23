@@ -14,11 +14,15 @@
 //! TABLE-7）・TASK-146（テーブル粒度次元固定・複数テーブル共存の拡張機能。対象ビヘイビア:
 //! EXT-1, EXT-2）・TASK-90（2 テーブル横断トランザクション・クラッシュ耐性回帰テスト。対象
 //! ビヘイビア: TABLE-10）・TASK-87（コールドスタート・ベクトルアリーナ。対象ビヘイビア:
-//! TABLE-8）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
+//! TABLE-8）・TASK-102（検索カーネルの疎検索構成要素。BM25 Okapi。対象ビヘイビア:
+//! SEARCH-1, SEARCH-3。密検索との RRF 融合は TASK-103、評価ハーネス回帰テストは
+//! TASK-104 の管轄）。検索カーネルの残り構成要素（密検索等）・認証・RLS ポリシー評価は
+//! 後続タスクで追加する。
 
 pub mod arena;
 pub mod catalog;
 pub mod row_codec;
+pub mod sparse;
 pub mod storage;
 pub mod txn;
 
