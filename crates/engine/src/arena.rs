@@ -186,23 +186,126 @@ fn per_row_aux_bytes() -> Option<usize> {
         .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
 }
 
-/// `Vec::try_reserve` の失敗を [`ArenaError::AllocationFailed`] へ変換する共通ヘルパー
-/// （[`VectorArena::build_filtered`] 専用）。`Vec::with_capacity`・`Vec::push` の内部確保
-/// （失敗時に abort する）ではなく本関数経由で予約することで、`check_capacity` の
-/// 上限検証を通過した後にホスト側のメモリが実際に不足した場合でも、プロセスを
-/// OOM abort させず `Err` として呼び出し元へ伝える（security.md「不安全な設計｜
+/// `Vec::try_reserve_exact` の失敗を [`ArenaError::AllocationFailed`] へ変換する共通
+/// ヘルパー（[`GrowableArenaBuffers::ensure_capacity`] 専用）。`Vec::with_capacity`・
+/// `Vec::push` の内部確保（失敗時に abort する）ではなく本関数経由で予約することで、
+/// `check_capacity` の上限検証を通過した後にホスト側のメモリが実際に不足した場合でも、
+/// プロセスを OOM abort させず `Err` として呼び出し元へ伝える（security.md「不安全な設計｜
 /// 無制限リソース確保（DoS）」対応）。`what` はエラーメッセージに含める対象バッファ名
 /// （英語。プログラム出力文字列）。
 ///
-/// `try_reserve_exact`（要求量ちょうどだけ確保する厳密版）ではなく `try_reserve`
-/// （amortized 成長。実装が将来の追加分を見越して多めに確保しうる）を使う
-/// （codex 指摘・Issue #137 対応: `build_filtered` は可視行 1 件ごとに本関数を呼ぶため、
-/// 呼び出しのたびに要求量ちょうどだけ確保する方式だと、行を追加するたびに再確保が
-/// 発生し ―― 最悪 O(可視行数) 回の再確保・コピーになりうる。amortized 成長により
-/// 通常の `Vec::push` と同等の償却計算量を維持しつつ、確保失敗を `Err` として扱える）。
-fn try_reserve<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
-    buf.try_reserve(additional)
+/// `try_reserve`（amortized 成長。実装が将来の追加分を見越して多めに確保しうる）ではなく
+/// `try_reserve_exact`（要求量ちょうどだけ確保する厳密版）を使う（codex P1 指摘・
+/// Issue #137 対応: `try_reserve` は要求量より多く確保しうるため、`check_capacity` が
+/// 検証した論理必要量を超える実確保が起こり得る。[`GrowableArenaBuffers::ensure_capacity`]
+/// が amortized 成長そのものを「行数換算の capacity 目標」として自前で管理し、
+/// その目標値自体を `check_capacity` で検証してから本関数でちょうど確保することで、
+/// 実確保総量が上限を超えないことを保証する）。
+fn try_reserve_exact<T>(buf: &mut Vec<T>, additional: usize, what: &str) -> Result<()> {
+    buf.try_reserve_exact(additional)
         .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve {what}: {e}")))
+}
+
+/// [`VectorArena::build_filtered_with_limits`] が可視行を蓄積する 4 本のバッファ
+/// （`vectors`/`ids`/`tenant_ids`/`visibilities`）と、それらの「行数換算の capacity」を
+/// まとめて管理する内部ヘルパー（codex P1 指摘・Issue #137 対応）。
+///
+/// `Vec::try_reserve`（amortized 成長）は要求量より多く確保しうるため、
+/// `check_capacity` が検証した論理必要量（行を追加するたびの `visible_row_count`）
+/// だけを見て確保すると、実際に確保される capacity ベースの総バイト量が
+/// `MAX_ARENA_TOTAL_BYTES` を超えうる。本ヘルパーは amortized 成長を自前で管理し、
+/// 次に成長させる capacity（行数換算）の候補を、実際に `try_reserve_exact` で確保する
+/// **前**に `check_capacity` へそのまま通す（[`Self::ensure_capacity`] 参照）ことで、
+/// capacity ベースの確保量そのものが上限を超えないことを保証する。4 本のバッファは
+/// 常に同じ行数分だけまとめて成長させるため、capacity は単一のスカラー
+/// （[`Self::row_capacity`]）で管理できる。
+struct GrowableArenaBuffers {
+    vectors: Vec<f32>,
+    ids: Vec<u64>,
+    tenant_ids: Vec<String>,
+    visibilities: Vec<Visibility>,
+    /// 4 本のバッファが共通して確保済みの行数（capacity 換算。実際の `Vec::capacity()`
+    /// と一致するよう、成長は必ず [`Self::ensure_capacity`] 経由でのみ行う）。
+    row_capacity: usize,
+}
+
+impl GrowableArenaBuffers {
+    fn new() -> Self {
+        Self {
+            vectors: Vec::new(),
+            ids: Vec::new(),
+            tenant_ids: Vec::new(),
+            visibilities: Vec::new(),
+            row_capacity: 0,
+        }
+    }
+
+    /// 呼び出し元が次に追加する行を含めて `target_row_count` 行を保持できるよう、
+    /// 必要であれば 4 本のバッファの capacity を成長させる。呼び出し元は、行を
+    /// バッファへ追加する前に必ず本メソッドを呼ぶこと（`target_row_count` は
+    /// 呼び出し元側で `check_capacity` により論理必要量として検証済みの値を渡す。
+    /// `build_filtered_with_limits` 参照）。
+    fn ensure_capacity(
+        &mut self,
+        target_row_count: usize,
+        dim_usize: usize,
+        dim_u32: u32,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<()> {
+        if target_row_count <= self.row_capacity {
+            // 既存の capacity で足りる。amortized 成長で確保済みの分を再利用するだけで、
+            // 新規確保は発生しない（＝実確保総量は増えない）。
+            return Ok(());
+        }
+
+        // amortized 成長の候補（capacity を倍々に増やす。`checked_mul` がオーバーフロー
+        // する巨大な capacity では上限 `max_rows` へ丸める）。
+        let doubled = self.row_capacity.checked_mul(2).unwrap_or(max_rows);
+        let candidate = doubled.max(target_row_count).min(max_rows);
+
+        // 成長候補（capacity 換算の行数）に基づく総確保バイト量を、実際に
+        // `try_reserve_exact` で確保する前に検証する。`check_capacity` は
+        // vectors/ids/tenant_ids/visibilities 全体の見積もりバイト量を checked 演算で
+        // 計算する既存ヘルパーで、ここでは `candidate`（capacity 換算の行数）を渡す
+        // ことで「これから確保しようとしている capacity」自体を検証対象にする
+        // （`target_row_count`＝論理必要量ではない点が [`check_capacity`] の他の
+        // 呼び出しとの違い）。
+        let new_row_capacity = match check_capacity(candidate, dim_u32, max_rows, max_bytes) {
+            Ok(_) => candidate,
+            // amortized な先読み確保が上限を超えるなら、先読みを諦めて「今必要な分
+            // だけちょうど」へ縮退する（`try_reserve_exact` へ切り替える。codex P1
+            // 対応）。`target_row_count` は呼び出し元が既に `check_capacity` で
+            // 検証済みの値なので、この再検証は必ず成功するはずだが、呼び出し元との
+            // 不整合（バグ）があった場合に備えて `?` で fail-closed に伝播する。
+            Err(ArenaError::CapacityExceeded) => {
+                check_capacity(target_row_count, dim_u32, max_rows, max_bytes)?;
+                target_row_count
+            }
+            Err(e) => return Err(e),
+        };
+
+        let additional_rows = new_row_capacity - self.row_capacity;
+        let additional_floats = additional_rows
+            .checked_mul(dim_usize)
+            .ok_or(ArenaError::CapacityExceeded)?;
+        try_reserve_exact(&mut self.vectors, additional_floats, "vectors")?;
+        try_reserve_exact(&mut self.ids, additional_rows, "ids")?;
+        try_reserve_exact(&mut self.tenant_ids, additional_rows, "tenant_ids")?;
+        try_reserve_exact(&mut self.visibilities, additional_rows, "visibilities")?;
+        self.row_capacity = new_row_capacity;
+        Ok(())
+    }
+
+    /// 1 行分を 4 本のバッファへ追加する。呼び出し元が直前に
+    /// [`Self::ensure_capacity`] を呼び、十分な capacity を確保済みであること
+    /// （＝ここでの追加が再確保を発生させないこと）が前提。
+    fn push_row(&mut self, id: u64, embedding: &[f32], tenant_id: String, visibility: Visibility) {
+        self.vectors.extend_from_slice(embedding);
+        self.ids.push(id);
+        self.tenant_ids.push(tenant_id);
+        self.visibilities.push(visibility);
+    }
 }
 
 /// コールドスタート時に一括デコードした連続ベクトルバッファ（対象ビヘイビア: TABLE-8）。
@@ -290,11 +393,27 @@ impl VectorArena {
     /// `Vec::try_reserve`（amortized 成長。`Vec::with_capacity`/`push` の内部確保のように
     /// 失敗時 abort しない）で少しずつ確保する。
     ///
-    /// 次元不一致検証（[`ArenaError::DimMismatch`]）は `predicate` による可視性判定より
-    /// 前に行う。`predicate` が `false` を返す（＝呼び出し元から不可視）行であっても
-    /// データ破損の検出自体はスキップしない（[`Self::build`]・従来の全件検証と同じ
-    /// fail-closed な挙動を維持する。不可視行の破損を黙って読み飛ばすと、破損データの
-    /// 存在に誰も気付けなくなるため）。
+    /// 可視性判定（`predicate` 適用）は、embedding のデコード・次元検証より **前** に行う
+    /// （codex P0 指摘・Issue #137 対応）。行ごとにまず
+    /// [`crate::storage::decode_row_tenant_and_visibility`] で `tenant_id`・`visibility`
+    /// だけを安全に取得し（embedding・metadata へは触れない）、`predicate` が `false`
+    /// （＝呼び出し元から不可視）を返した行は、embedding のデコード・次元検証を一切
+    /// 行わずスキップする。以前は次元不一致検証を `predicate` 適用より前に行っていたため、
+    /// 他テナントの不可視行が破損しているだけで対象テナントの検索全体が失敗していた
+    /// （他テナントの状態による可用性干渉であり、`ArenaError::DimMismatch` のエラー経由で
+    /// 「他テナントの行が破損している」という存在情報を漏らすことにもなっていた。
+    /// security.md「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」）。
+    ///
+    /// 可視行（`predicate` が `true` を返した行）は、従来どおり embedding を含む完全
+    /// デコード・次元検証を行い、破損・次元不一致は fail-closed に `Err` を返す
+    /// （部分的なアリーナを返さない。`Self::build`・従来の全件検証と同じ挙動）。
+    ///
+    /// 不可視行の破損検出自体は、本関数の責務外（管理・整合性検査など別経路の責務。
+    /// spec 側のタスクに対応する場合は当該 TASK-nn を参照。本関数のスコープではない）。
+    /// 一方、行バイト列のヘッダ部（バージョン・`tenant_len`・`tenant_id`・`visibility`）
+    /// 自体が破損していて可視性を判定できない場合は、その行を「不可視だからスキップ」と
+    /// 判断できないため、[`Self::build`] と同じ fail-closed な方針で `Err` を返す
+    /// （`decode_row_tenant_and_visibility` のドキュメント参照）。
     pub fn build_filtered<F>(storage: &Storage, table_name: &str, predicate: F) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
@@ -365,17 +484,36 @@ impl VectorArena {
         // アロケーション上限検証には使わない（上記ドキュメント参照）。走査自体には
         // 使わないため取得しない。
         let dim = expected_dim as usize;
-        let mut vectors: Vec<f32> = Vec::new();
-        let mut ids: Vec<u64> = Vec::new();
-        let mut tenant_ids: Vec<String> = Vec::new();
-        let mut visibilities: Vec<Visibility> = Vec::new();
+        let mut buffers = GrowableArenaBuffers::new();
         // `predicate` を通過した（＝実際に格納する）行数。上限検証はこの値に対して行う。
         let mut visible_row_count: usize = 0;
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
             let id = k.value();
-            let row = decode_row(id, v.value()).map_err(ArenaError::from)?;
+            let buf = v.value();
+
+            // まず tenant_id・visibility だけを安全に取得する（embedding・metadata の
+            // デコードは行わない）。ヘッダ部自体が壊れていて可視性を判定できない場合は
+            // 「不可視だからスキップ」と判断できないため fail-closed に伝播する
+            // （`decode_row_tenant_and_visibility` のドキュメント参照。codex P0 対応・
+            // Issue #137）。
+            let (tenant_id, visibility) =
+                crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
+
+            // 構築時フィルタ（codex P0/P2 対応）: `predicate` が `false` を返す行（呼び出し元
+            // から不可視）は、embedding のデコード・次元検証を一切行わずここで打ち切る。
+            // 不可視行の embedding が破損していても、対象テナントの検索を失敗させない
+            // （他テナントの状態による可用性干渉・エラー経由の存在情報漏えいを避ける）。
+            // 不可視行の破損検出自体は本関数の責務外（別経路の責務。上記ドキュメント参照）。
+            if !predicate(&tenant_id, visibility) {
+                continue;
+            }
+
+            // ここに到達するのは可視行だけ。以降は embedding を含む完全デコードを行い、
+            // 次元不一致・デコードエラーは従来どおり fail-closed に伝播する
+            // （部分的なアリーナを返さない）。
+            let row = decode_row(id, buf).map_err(ArenaError::from)?;
             let found_dim =
                 u32::try_from(row.embedding.len()).map_err(|_| ArenaError::DimMismatch {
                     id,
@@ -389,12 +527,6 @@ impl VectorArena {
                     found: found_dim,
                 });
             }
-            // 構築時フィルタ（codex P2 対応）: `predicate` が `false` を返す行（呼び出し元
-            // から不可視）は、デコード直後にここで破棄しアリーナへ確保しない。次元検証
-            // （上記）は既に完了しているため、不可視行の破損検出を見逃すことはない。
-            if !predicate(&row.tenant_id, row.visibility) {
-                continue;
-            }
 
             // アロケーション前の上限検証（.claude/rules/security.md「不安全な設計｜
             // 無制限リソース確保（DoS）」対応）を、行を追加する直前に可視行数基準で行う
@@ -407,31 +539,25 @@ impl VectorArena {
                 .ok_or(ArenaError::CapacityExceeded)?;
             check_capacity(visible_row_count, expected_dim, max_rows, max_bytes)?;
 
-            // 検証を通過した後にのみ確保する。事前の全行分一括予約はせず、可視行 1 件
-            // ごとに `try_reserve`（amortized 成長。`Vec::with_capacity`/`push` の内部
-            // 確保のように失敗時 abort しない）で確保し、メモリ不足を
-            // `Err(ArenaError::AllocationFailed)` として呼び出し元へ返す
-            // （codex レビュー指摘対応: `check_capacity` のアロケーション前上限検証を
-            // 通過していても、実際のホストメモリが不足していれば確保は失敗し得るため、
-            // OOM abort ではなく fail-closed な `Err` にする）。
-            try_reserve(&mut vectors, dim, "vectors")?;
-            try_reserve(&mut ids, 1, "ids")?;
-            try_reserve(&mut tenant_ids, 1, "tenant_ids")?;
-            try_reserve(&mut visibilities, 1, "visibilities")?;
-
-            vectors.extend_from_slice(&row.embedding);
-            ids.push(id);
-            tenant_ids.push(row.tenant_id);
-            visibilities.push(row.visibility);
+            // capacity の成長は `GrowableArenaBuffers::ensure_capacity` に委ねる。
+            // amortized 成長の候補（capacity 換算の行数）自体を `check_capacity` で
+            // 検証してから `try_reserve_exact`（要求量ちょうど）で確保するため、
+            // `Vec::try_reserve`（要求量より多く確保しうる）を直接使う場合と異なり、
+            // 実際に確保される capacity ベースの総バイト量が上限を超えることはない
+            // （codex P1 対応・Issue #137。`GrowableArenaBuffers` のドキュメント参照）。
+            // メモリ不足時は `Err(ArenaError::AllocationFailed)` として呼び出し元へ返す
+            // （`Vec::with_capacity`/`push` の内部確保のように abort しない）。
+            buffers.ensure_capacity(visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
+            buffers.push_row(id, &row.embedding, row.tenant_id, row.visibility);
         }
 
         Ok(VectorArena {
             table_name: table_name.to_string(),
             dim: expected_dim,
-            vectors,
-            ids,
-            tenant_ids,
-            visibilities,
+            vectors: buffers.vectors,
+            ids: buffers.ids,
+            tenant_ids: buffers.tenant_ids,
+            visibilities: buffers.visibilities,
         })
     }
 
@@ -559,16 +685,16 @@ mod tests {
     }
 
     // 対象ビヘイビア: TABLE-8（codex P1 対応）。`check_capacity` の上限検証を素通りする
-    // ほど巨大な予約要求（`isize::MAX` バイト超）に対して、`try_reserve` が
+    // ほど巨大な予約要求（`isize::MAX` バイト超）に対して、`try_reserve_exact` が
     // `Vec::with_capacity`/`Vec::push` のように abort せず `Err(ArenaError::AllocationFailed)`
     // を返すことを検証する。`isize::MAX` 超のレイアウトは Rust のアロケーション API 契約上
     // 実メモリを確保しようとする前に即座に拒否されるため、CI 環境で実際に大量のメモリを
     // 消費せず決定的に再現できる。
     #[test]
-    fn try_reserve_converts_oversized_request_to_allocation_failed_without_aborting() {
+    fn try_reserve_exact_converts_oversized_request_to_allocation_failed_without_aborting() {
         let mut buf: Vec<u8> = Vec::new();
         let oversized = (isize::MAX as usize).saturating_add(1);
-        let result = try_reserve(&mut buf, oversized, "test buffer");
+        let result = try_reserve_exact(&mut buf, oversized, "test buffer");
         assert!(matches!(result, Err(ArenaError::AllocationFailed(_))));
     }
 
@@ -1025,23 +1151,111 @@ mod tests {
         }
     }
 
-    // 対象ビヘイビア: TABLE-8（codex P2 対応・Issue #137）。`predicate` が `false` を
-    // 返す（＝不可視な）行であっても、次元不一致のデータ破損検出はスキップしない
-    // ことを検証する（`build`・従来の全件検証と同じ fail-closed な挙動。不可視行の
-    // 破損を黙って読み飛ばすと誰も気付けなくなるため）。
+    /// `docs` テーブル（dim=4）の行テーブルへ、次元不一致（dim=2）で破損した行を
+    /// 検証を経由しない生の write トランザクションで直接書き込む
+    /// （`insert_row_into_table` は挿入時点で次元検証するため、通常経路では作れない。
+    /// `build_rejects_dimension_mismatch_without_partial_result` と同手法）。
+    fn seed_dimension_mismatched_row(storage: &Storage, id: u64, tenant_id: &str) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let row_table_name = catalog::user_rows_table_name("docs");
+            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                redb::TableDefinition::new(&row_table_name);
+            let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+            let encoded = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding: &[1.0, 2.0],
+                metadata: b"m",
+            })
+            .expect("encode mismatched-dim row");
+            row_table
+                .insert(id, encoded.as_slice())
+                .expect("insert mismatched-dim row bypassing dim validation");
+        }
+        write_txn.commit().expect("commit mismatched-dim row");
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P0 対応・Issue #137）。`predicate` が `false` を
+    // 返す（＝不可視な）行は、embedding の次元不一致検証を一切行わずスキップされる
+    // こと（＝データ破損があっても `Err` にならず、そもそも走査結果から除外される
+    // だけであること）を検証する。以前は不可視行でも次元不一致検出が先に走り、
+    // 他テナントの破損状態だけで対象テナントの検索全体が失敗していた（他テナントの
+    // 状態による可用性干渉。`build_filtered_still_detects_dimension_mismatch_in_rows_excluded_by_the_predicate`
+    // という逆方向の契約を検証していた旧テストを、この新契約へ反転更新したもの）。
     #[test]
-    fn build_filtered_still_detects_dimension_mismatch_in_rows_excluded_by_the_predicate() {
-        let path = unique_db_path("filtered-dim-mismatch");
+    fn build_filtered_skips_dimension_mismatched_rows_excluded_by_the_predicate_instead_of_failing()
+    {
+        let path = unique_db_path("filtered-dim-mismatch-skip");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
         storage
             .create_table(&schema_for("docs", 4))
             .expect("create_table");
 
-        // 述語で除外される想定のテナント（tenant-b）に、次元不一致の破損行を仕込む
-        // （`insert_row_into_table` は挿入時点で次元検証するため、
-        // `build_rejects_dimension_mismatch_without_partial_result` と同手法で
-        // 検証を経由しない生の write トランザクションで直接書き込む）。
+        seed_dimension_mismatched_row(&storage, 0, "tenant-b");
+
+        // 述語は tenant-b を常に不可視として除外する。以前の契約では次元不一致検出が
+        // 述語適用より前に走り Err(DimMismatch) になっていたが、新契約では embedding
+        // のデコードにすら到達せず、単に空のアリーナとして成功する。
+        let arena = VectorArena::build_filtered(&storage, "docs", |tenant, _| tenant != "tenant-b")
+            .expect("invisible row's dimension mismatch must not fail the search");
+        assert!(arena.is_empty());
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P0 対応・Issue #137）。他テナント（不可視）の破損行
+    // （次元不一致）が存在していても、対象テナントの可視行が正常であれば検索
+    // （`build_filtered`）が成功し、可視行だけを返すことを検証する。他テナントの
+    // データ破損状態が対象テナントの検索可用性へ干渉しないことの直接的な確認。
+    #[test]
+    fn build_filtered_succeeds_for_visible_tenant_despite_corrupted_invisible_rows_of_another_tenant(
+    ) {
+        let path = unique_db_path("filtered-dim-mismatch-other-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+
+        // tenant-b（不可視想定）の破損行。
+        seed_dimension_mismatched_row(&storage, 0, "tenant-b");
+        // tenant-a（可視想定）の正常な行。
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0, 3.0, 4.0],
+                    metadata: b"m",
+                },
+            )
+            .expect("seed tenant-a row");
+
+        let arena = VectorArena::build_filtered(&storage, "docs", |tenant, _| tenant == "tenant-a")
+            .expect("search for tenant-a must succeed even though tenant-b's row is corrupted");
+        assert_eq!(arena.len(), 1);
+        assert_eq!(arena.ids(), &[1u64]);
+        assert_eq!(arena.tenant_id(0), Some("tenant-a"));
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P0 対応・Issue #137）。行バイト列のヘッダ部
+    // （バージョン・`tenant_len`・`tenant_id`・`visibility`）自体が破損していて
+    // 可視性を判定できない場合は、`predicate` が全行を不可視と判定するとしても
+    // `Err` を維持すること（fail-closed）。ヘッダが読めない時点では「不可視だから
+    // スキップしてよい」と判断する根拠がないため、`decode_row_tenant_and_visibility`
+    // の失敗はそのまま伝播しなければならない
+    // （`crate::storage::decode_row_tenant_and_visibility` のドキュメント参照）。
+    #[test]
+    fn build_filtered_still_fails_when_row_header_itself_is_corrupted_regardless_of_predicate() {
+        let path = unique_db_path("filtered-header-corrupt");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create_table");
+
         {
             let write_txn = storage.db().begin_write().expect("begin_write");
             {
@@ -1049,34 +1263,21 @@ mod tests {
                 let row_table_def: redb::TableDefinition<u64, &[u8]> =
                     redb::TableDefinition::new(&row_table_name);
                 let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
-                let encoded = crate::storage::encode_row(&RowInput {
-                    tenant_id: "tenant-b",
-                    visibility: Visibility::Public,
-                    embedding: &[1.0, 2.0],
-                    metadata: b"m",
-                })
-                .expect("encode mismatched-dim row");
+                // version バイトのみで tenant_len 以降が一切ない、意図的な破損バイト列
+                // （`crates/engine/tests/vector_core.rs` の破損行テストと同手法）。
                 row_table
-                    .insert(0u64, encoded.as_slice())
-                    .expect("insert mismatched-dim row bypassing dim validation");
+                    .insert(0u64, &[1u8][..])
+                    .expect("insert header-corrupted row");
             }
-            write_txn.commit().expect("commit mismatched-dim row");
+            write_txn.commit().expect("commit header-corrupted row");
         }
 
-        // 述語は tenant-b を常に不可視として除外するが、次元不一致の検出はこの述語より
-        // 前に行われるため、不可視行であっても Err(DimMismatch) にならなければならない。
-        let err = VectorArena::build_filtered(&storage, "docs", |tenant, _| tenant != "tenant-b")
-            .expect_err("dim mismatch in an invisible row must still be rejected");
+        // 全行を不可視とする述語を渡しても、ヘッダ自体が読めないので `Err` のまま。
+        let err = VectorArena::build_filtered(&storage, "docs", |_, _| false)
+            .expect_err("header corruption must fail closed regardless of predicate");
         assert!(
-            matches!(
-                err,
-                ArenaError::DimMismatch {
-                    id: 0,
-                    expected: 4,
-                    found: 2
-                }
-            ),
-            "expected DimMismatch for the excluded row, got: {err:?}"
+            matches!(err, ArenaError::Storage(_)),
+            "expected ArenaError::Storage for header decode failure, got: {err:?}"
         );
     }
 
@@ -1151,6 +1352,85 @@ mod tests {
         for idx in 0..arena.len() {
             assert_eq!(arena.tenant_id(idx), Some("tenant-a"));
         }
+    }
+
+    // 対象ビヘイビア: TABLE-8（codex P1 対応・Issue #137）。`GrowableArenaBuffers` の
+    // amortized 成長（capacity を倍々に増やす）が、実際に確保する capacity ベースの
+    // 総バイト量を `max_bytes` の範囲内に収め続けることを検証する
+    // （`Vec::try_reserve` を素朴に使うと要求量より多く確保しうるため、この検証なしでは
+    // 実確保量が上限を超えうる）。
+    //
+    // `max_bytes` を「ちょうど 6 行分」に設定し、行数を 1 → 6 まで 1 件ずつ増やす。
+    // 素朴な倍々成長だと、5 行目を追加しようとした時点で capacity を 4 → 8 へ
+    // 倍加させたくなるが、8 行分は `max_bytes`（6 行分）を超える。本テストは、
+    // その時点で `ensure_capacity` が先読み成長を諦め「今必要な 5 行分だけちょうど」へ
+    // 縮退すること（＝実際の capacity が row_capacity として記録した値と一致し、
+    // どの時点でも `check_capacity(row_capacity, ...)` が成功する＝max_bytes を
+    // 超えないこと）を、内部状態（`row_capacity`・各 `Vec::capacity()`）を直接検査して
+    // 確認する。
+    #[test]
+    fn growable_arena_buffers_capacity_growth_never_exceeds_max_bytes() {
+        let dim_u32: u32 = 1;
+        let dim_usize: usize = 1;
+        let max_rows = 1_000usize; // 本テストでは行数上限ではなくバイト量上限を検証する。
+        let per_row_bytes = (dim_usize * 4)
+            + per_row_aux_bytes().expect("aux bytes computation must not overflow in test");
+        let max_bytes = per_row_bytes * 6; // ちょうど 6 行分。
+
+        let mut buffers = GrowableArenaBuffers::new();
+        let mut previous_row_capacity = 0usize;
+        for target_row_count in 1..=6usize {
+            buffers
+                .ensure_capacity(target_row_count, dim_usize, dim_u32, max_rows, max_bytes)
+                .expect("growth within max_bytes budget must succeed");
+            // `ensure_capacity` の内部計算（`additional_rows = new_row_capacity -
+            // self.row_capacity` を `try_reserve_exact` へ渡す）は「呼び出し元が毎回
+            // 直前に 1 行分を実際に push している」という不変条件（本番コードの
+            // `build_filtered_with_limits` のループと同じ形）に依存するため、テストでも
+            // 同じ順序（ensure_capacity → push_row）を守る。
+            buffers.push_row(
+                target_row_count as u64,
+                &vec![0.0f32; dim_usize],
+                "tenant-a".to_string(),
+                Visibility::Public,
+            );
+
+            // 実際に記録された capacity（＝実際に `try_reserve_exact` で確保した量）が、
+            // その時点でなお `max_bytes` の範囲内であることを、行った成長のたびに
+            // 直接検証する（素朴な倍々成長のままなら 8 行分を確保しようとして
+            // 上限超過になっていたはずの境界を含む）。
+            assert!(
+                check_capacity(buffers.row_capacity, dim_u32, max_rows, max_bytes).is_ok(),
+                "row_capacity={} at target={target_row_count} must stay within max_bytes",
+                buffers.row_capacity
+            );
+            assert!(
+                buffers.row_capacity >= target_row_count,
+                "row_capacity must always cover the requested target_row_count"
+            );
+            assert!(
+                buffers.row_capacity >= previous_row_capacity,
+                "row_capacity must never shrink across calls"
+            );
+            assert!(
+                buffers.vectors.capacity() >= buffers.row_capacity * dim_usize,
+                "vectors.capacity() must cover row_capacity * dim"
+            );
+            assert!(buffers.ids.capacity() >= buffers.row_capacity);
+            assert!(buffers.tenant_ids.capacity() >= buffers.row_capacity);
+            assert!(buffers.visibilities.capacity() >= buffers.row_capacity);
+
+            previous_row_capacity = buffers.row_capacity;
+        }
+
+        // 7 行目は max_bytes（6 行分）を超えるため、成長候補・縮退後のちょうど確保
+        // いずれの経路でも拒否される（`ensure_capacity` 呼び出し元は、この前段で
+        // `check_capacity(visible_row_count, ...)` により先に拒否される想定だが、
+        // `ensure_capacity` 単体でも fail-closed であることを確認する）。
+        let err = buffers
+            .ensure_capacity(7, dim_usize, dim_u32, max_rows, max_bytes)
+            .expect_err("growth beyond max_bytes budget must fail");
+        assert!(matches!(err, ArenaError::CapacityExceeded));
     }
 
     // 対象ビヘイビア: TABLE-8。アリーナは構築時点のスナップショットであり、build 後に
