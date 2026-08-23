@@ -455,7 +455,11 @@ fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
 /// `drop_table` を実装する際は `CATALOG_TABLE` のエントリ削除と同一 write トランザクション内で
 /// 本関数が返す行テーブルも削除しないと、テーブル再作成時に旧次元の行データが残留し
 /// EXT-2 の次元固定の不変条件を静かに破る恐れがある。
-fn user_rows_table_name(table_name: &str) -> String {
+///
+/// `pub(crate)` で公開する: `arena.rs`（TASK-87、対象ビヘイビア: TABLE-8）が
+/// コールドスタート・アリーナ構築時に、対象テーブルの行テーブルだけを単一の
+/// `read_txn` 上で直接開くために必要（クレート外へは公開しない）。
+pub(crate) fn user_rows_table_name(table_name: &str) -> String {
     format!("user_rows/{table_name}")
 }
 
@@ -602,51 +606,15 @@ impl Storage {
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
     /// `Err(CatalogError::TableNotFound)`。
     pub fn get_table_schema(&self, table_name: &str) -> Result<TableSchema> {
-        // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
-        // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
-        // 拒否し、両 API 間でエラーバリアントを揃える。
-        validate_identifier(table_name)?;
         let read_txn = self.db().begin_read()?;
-        let table = match read_txn.open_table(CATALOG_TABLE) {
-            Ok(t) => t,
-            // カタログテーブル未作成（1 テーブルも定義していない）は「存在しない」として扱う。
-            Err(redb::TableError::TableDoesNotExist(_)) => {
-                return Err(CatalogError::TableNotFound(table_name.to_string()))
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let guard = table
-            .get(table_name)?
-            .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
-        decode_schema(table_name, guard.value())
+        get_table_schema_in_txn(&read_txn, table_name)
     }
 
     /// 定義済みテーブル名の一覧をスナップショット読み取りで返す。件数上限
     /// （[`MAX_LIST_TABLES`]）を超える場合は `Err`（無制限 `Vec` 確保を防ぐ）。
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let read_txn = self.db().begin_read()?;
-        let table = match read_txn.open_table(CATALOG_TABLE) {
-            Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut names = Vec::new();
-        for entry in table.iter()? {
-            let (key, _value) = entry?;
-            if names.len() >= MAX_LIST_TABLES {
-                return Err(CatalogError::Invalid(format!(
-                    "too many tables: exceeds {MAX_LIST_TABLES}"
-                )));
-            }
-            let name = key.value();
-            // `get_table_schema` と同じ検証をここでも通す。通常経路で書かれるキーは
-            // すべて `create_table` の `validate_schema` を経ているため常に合法だが、
-            // 手書きの不正データが直接 redb へ書き込まれていた場合に、そのまま
-            // 一覧へ紛れ込ませない（`decode_schema` と同じ fail-closed 方針）。
-            validate_identifier(name)?;
-            names.push(name.to_string());
-        }
-        Ok(names)
+        list_tables_in_txn(&read_txn)
     }
 
     /// テーブルスコープで 1 行挿入する（TASK-146、対象ビヘイビア: EXT-1, EXT-2）。
@@ -803,6 +771,59 @@ impl Storage {
         };
         Ok((out, cursor_for_next))
     }
+}
+
+/// [`Storage::get_table_schema`]・[`crate::arena::VectorArena::build`]（TASK-87、
+/// 対象ビヘイビア: TABLE-8）が共有するトランザクションスコープの実装本体。
+/// `pub(crate)` で公開し、`arena.rs` が単一の `read_txn` 上でスキーマ取得と
+/// テーブルスコープ行テーブル（[`user_rows_table_name`]）のオープンを同一
+/// スナップショットで行えるようにする（TOCTOU 対策）。
+pub(crate) fn get_table_schema_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table_name: &str,
+) -> Result<TableSchema> {
+    // `alter_table_add_column` と同様、redb キーとして引く前に識別子を検証する。
+    // 不正形式の名前は `TableNotFound`（存在しない）ではなく `Invalid`（形式不正）で
+    // 拒否し、両 API 間でエラーバリアントを揃える。
+    validate_identifier(table_name)?;
+    let table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        // カタログテーブル未作成（1 テーブルも定義していない）は「存在しない」として扱う。
+        Err(redb::TableError::TableDoesNotExist(_)) => {
+            return Err(CatalogError::TableNotFound(table_name.to_string()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let guard = table
+        .get(table_name)?
+        .ok_or_else(|| CatalogError::TableNotFound(table_name.to_string()))?;
+    decode_schema(table_name, guard.value())
+}
+
+/// [`Storage::list_tables`] が共有するトランザクションスコープの実装本体。
+fn list_tables_in_txn(read_txn: &redb::ReadTransaction) -> Result<Vec<String>> {
+    let table = match read_txn.open_table(CATALOG_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut names = Vec::new();
+    for entry in table.iter()? {
+        let (key, _value) = entry?;
+        if names.len() >= MAX_LIST_TABLES {
+            return Err(CatalogError::Invalid(format!(
+                "too many tables: exceeds {MAX_LIST_TABLES}"
+            )));
+        }
+        let name = key.value();
+        // `get_table_schema_in_txn` と同じ検証をここでも通す。通常経路で書かれるキーは
+        // すべて `create_table` の `validate_schema` を経ているため常に合法だが、
+        // 手書きの不正データが直接 redb へ書き込まれていた場合に、そのまま
+        // 一覧へ紛れ込ませない（`decode_schema` と同じ fail-closed 方針）。
+        validate_identifier(name)?;
+        names.push(name.to_string());
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
