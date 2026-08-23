@@ -11,7 +11,7 @@
 //! 実装を置き換えるものではない。除去 ON/OFF 双方の挙動を同一の場所で比較測定する
 //! ために、あえて `SparseIndex` を介さず直接トークナイザを呼び分けている。
 
-use engine::sparse::tokenize_with_options;
+use engine::sparse::{tokenize_with_options, SparseIndex};
 use std::collections::{BTreeMap, HashSet};
 
 /// [`SparseIndex::build`]（既定パラメータ）と同じ Okapi BM25（`k1 = 1.2`, `b = 0.75`）を、
@@ -193,4 +193,23 @@ fn recall_at_20_computation_is_deterministic() {
     let first = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, true);
     let second = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, true);
     assert!((first - second).abs() < 1e-12);
+}
+
+/// 上記の `bm25_rank`/`recall_at_20` は `tokenize_with_options` を直接呼ぶ測定専用
+/// ヘルパで `SparseIndex` を介さないため、本番エントリポイント（既定で除去 ON の
+/// `tokenize()` を使う `SparseIndex::build`/`search`）の回帰はこの 1 件で検知する。
+/// 助詞ユニグラムのみのクエリは既定設定でトークンが 0 件になり、`search()` は
+/// 早期リターンで空結果を返す。`tokenize()` の既定が除去 OFF 相当に配線ミスした
+/// 場合は助詞ユニグラムがトークンとして残り、助詞を含むノイズ文書がヒットして
+/// 空結果でなくなるため、この配線崩れを検知できる。
+#[test]
+fn sparse_index_search_removes_particle_only_query_by_default() {
+    let docs = mini_corpus();
+    let idx = SparseIndex::build(&docs).expect("build");
+
+    let results = idx.search("の", 20).expect("search");
+    assert!(
+        results.is_empty(),
+        "助詞ユニグラムのみのクエリが SparseIndex::search 経由で空結果にならなかった: {results:?}"
+    );
 }
