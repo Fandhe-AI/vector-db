@@ -110,20 +110,9 @@ fn stats_summarize_interpolates_at_protocol_minimum_sample_count() {
     // 期待値: q1 rank=4.75 -> 5ms + (6ms-5ms)*0.75 = 5.75ms
     //         median rank=9.5 -> 10ms + (11ms-10ms)*0.5 = 10.5ms
     //         q3 rank=14.25 -> 15ms + (16ms-15ms)*0.25 = 15.25ms
-    let epsilon = Duration::from_nanos(1_000);
-    assert_duration_approx_eq(summary.q1, Duration::from_micros(5_750), epsilon);
-    assert_duration_approx_eq(summary.median, Duration::from_micros(10_500), epsilon);
-    assert_duration_approx_eq(summary.q3, Duration::from_micros(15_250), epsilon);
-}
-
-/// `Duration::from_secs_f64` を経由する補間結果は浮動小数演算の丸め誤差を含みうるため、
-/// 完全一致ではなく許容誤差付きで比較する。
-fn assert_duration_approx_eq(actual: Duration, expected: Duration, epsilon: Duration) {
-    let diff = actual.abs_diff(expected);
-    assert!(
-        diff <= epsilon,
-        "expected {expected:?} +/- {epsilon:?}, got {actual:?} (diff {diff:?})"
-    );
+    assert_eq!(summary.q1, Duration::from_micros(5_750));
+    assert_eq!(summary.median, Duration::from_micros(10_500));
+    assert_eq!(summary.q3, Duration::from_micros(15_250));
 }
 
 // rng: 同一シードの決定性・異なるシードでの非決定性・単位区間の範囲・次元。

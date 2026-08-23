@@ -50,7 +50,9 @@ fn main() {
         || dot_product_workload(config.seed()),
         || dot_product_workload(config.seed().wrapping_add(1)),
     )
-    .expect("smoke A/B workload must satisfy protocol minimums");
+    .expect(
+        "smoke A/B workload must satisfy protocol minimums and yield a non-zero baseline median",
+    );
     print_summary("ab.a", &ab.a);
     print_summary("ab.b", &ab.b);
     println!("ab.median_ratio={:.4}", ab.median_ratio);
