@@ -3,12 +3,16 @@
 # コア API シグネチャ差分検知チェック。
 #
 # `crates/engine/src/core.rs` の `pub trait VectorCore` と `crates/engine/src/kernel.rs`
-# の `pub trait SearchProvider` の定義ブロックを正規化抽出し、コミット済みの
-# ゴールデンファイル（crates/engine/api/core_api.snapshot）と比較する。差分があれば
-# プロトコル層（wire-server 等）に影響しうるコア API 変更が意図せず紛れ込んだ可能性が
-# あるとみなし、非 0 終了する（Makefile の core-api-check ターゲット・CI の
-# core-api-check ジョブから呼ばれる。cargo を使わない軽量テキストチェックのため
-# rust-ci ジョブとは独立に実行できる）。
+# の `pub trait SearchProvider`、および両シグネチャが参照する公開型
+# （`PolicyContext` / `SearchInput` / `SearchHit` / `Row` / `CoreError` / `KernelError`）の
+# 定義ブロックを正規化抽出し、コミット済みのゴールデンファイル
+# （crates/engine/api/core_api.snapshot）と比較する。trait 本文だけでなく参照先の
+# 公開型も対象に含めるのは、trait シグネチャ自体は変わらずとも `SearchInput` への
+# 必須フィールド追加等で互換性が破壊されるケースを見逃さないため（PR #139 レビュー
+# 対応）。差分があればプロトコル層（wire-server 等）に影響しうるコア API 変更が
+# 意図せず紛れ込んだ可能性があるとみなし、非 0 終了する（Makefile の
+# core-api-check ターゲット・CI の core-api-check ジョブから呼ばれる。cargo を
+# 使わない軽量テキストチェックのため rust-ci ジョブとは独立に実行できる）。
 #
 # 正当な API 変更時は本スクリプトを --update 付きで再実行してスナップショットを
 # 再生成し、その差分を明示的なコミットとしてレビューへ残す運用とする
@@ -30,29 +34,46 @@ elif [ "${1:-}" != "" ]; then
   exit 1
 fi
 
-# `file:trait_name` の対を 1 件抽出する。抽出規則: `^pub trait <trait_name>` 行から
-# 対応する `^}` 行までを 1 ブロックとして取り出し、`///`・`//` コメント行と空行を除去、
-# 行末空白を正規化する（インデントは保持し、実質的なシグネチャ差分だけを比較対象にする）。
-# 対象ブロックが 1 件も見つからない場合は fail-closed でエラー終了する（trait 名の
-# 変更・ファイル移動でチェックが空振り green になることを防ぐ）。
-extract_trait_block() {
+# `item_pattern`（例: `pub trait VectorCore`・`pub struct SearchInput`）に一致する行から
+# 対応する `^}` 行までを 1 ブロックとして取り出す。加えて、そのブロック直前に連続する
+# 外側属性行（`^#[...]`。`#[cfg(...)]`・`#[derive(...)]` 等）も抽出対象へ含める
+# （PR #139 レビュー対応: 抽出開始位置を trait/struct/enum 行固定にすると、直前の
+# `#[cfg(...)]` 等の変更が比較対象から漏れるため）。`///`・`//` コメント行と空行は
+# 除去し、行末空白を正規化する（インデントは保持し、実質的な差分だけを比較対象に
+# する）。対象ブロックが 1 件も見つからない場合は fail-closed でエラー終了する
+# （名前変更・ファイル移動でチェックが空振り green になることを防ぐ）。
+extract_item_block() {
   local file="$1"
-  local trait_name="$2"
+  local item_pattern="$2"
+  local item_label="$3"
 
   if [ ! -f "${file}" ]; then
     echo "ERROR: source file not found: ${file}" >&2
     return 1
   fi
 
+  # パターン直後に識別子構成文字（英数字・アンダースコア）が続く場合は、より長い
+  # 別名（例: `pub struct Row` に対する `pub struct RowInput`）への誤マッチとみなし
+  # 除外する（単語境界判定）。
   local block
-  block="$(awk -v trait="pub trait ${trait_name}" '
-    $0 ~ ("^" trait) { found = 1 }
-    found { print }
-    found && /^}/ { exit }
+  block="$(awk -v item="${item_pattern}" '
+    found {
+      print
+      if ($0 ~ /^}/) exit
+      next
+    }
+    $0 ~ ("^" item "([^A-Za-z0-9_]|$)") {
+      printf "%s", attrbuf
+      print
+      found = 1
+      next
+    }
+    /^#\[/ { attrbuf = attrbuf $0 "\n"; next }
+    { attrbuf = "" }
   ' "${file}")"
 
   if [ -z "${block}" ]; then
-    echo "ERROR: trait block not found: ${trait_name} in ${file}" >&2
+    echo "ERROR: item block not found: ${item_label} in ${file}" >&2
     return 1
   fi
   # 抽出末尾が `^}` で終わっていない場合（ファイル末尾まで到達して抜けた等）も、
@@ -60,27 +81,46 @@ extract_trait_block() {
   local last_line
   last_line="$(printf '%s\n' "${block}" | tail -n 1)"
   if [ "${last_line}" != "}" ]; then
-    echo "ERROR: trait block for ${trait_name} in ${file} has no closing brace (extraction incomplete)" >&2
+    echo "ERROR: item block for ${item_label} in ${file} has no closing brace (extraction incomplete)" >&2
     return 1
   fi
 
   printf '%s\n' "${block}" | sed -e '/^[[:space:]]*\/\/\//d' -e '/^[[:space:]]*\/\//d' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]*$//'
 }
 
-VECTOR_CORE_FILE="${REPO_ROOT}/crates/engine/src/core.rs"
-SEARCH_PROVIDER_FILE="${REPO_ROOT}/crates/engine/src/kernel.rs"
+CORE_FILE="${REPO_ROOT}/crates/engine/src/core.rs"
+KERNEL_FILE="${REPO_ROOT}/crates/engine/src/kernel.rs"
+POLICY_FILE="${REPO_ROOT}/crates/engine/src/policy.rs"
+STORAGE_FILE="${REPO_ROOT}/crates/engine/src/storage.rs"
 
-VECTOR_CORE_BLOCK="$(extract_trait_block "${VECTOR_CORE_FILE}" "VectorCore")" || exit 1
-SEARCH_PROVIDER_BLOCK="$(extract_trait_block "${SEARCH_PROVIDER_FILE}" "SearchProvider")" || exit 1
+# 抽出対象: (ソースファイル, awk 抽出パターン, スナップショット上のラベル)。
+# trait 本体（VectorCore・SearchProvider）に加え、両シグネチャが直接参照する公開型
+# （PolicyContext・SearchInput・SearchHit・Row・CoreError・KernelError）を含める。
+ITEMS=(
+  "${CORE_FILE}|pub trait VectorCore|crates/engine/src/core.rs :: VectorCore"
+  "${KERNEL_FILE}|pub trait SearchProvider|crates/engine/src/kernel.rs :: SearchProvider"
+  "${CORE_FILE}|pub enum CoreError|crates/engine/src/core.rs :: CoreError"
+  "${KERNEL_FILE}|pub struct SearchHit|crates/engine/src/kernel.rs :: SearchHit"
+  "${KERNEL_FILE}|pub enum KernelError|crates/engine/src/kernel.rs :: KernelError"
+  "${KERNEL_FILE}|pub struct SearchInput|crates/engine/src/kernel.rs :: SearchInput"
+  "${POLICY_FILE}|pub struct PolicyContext|crates/engine/src/policy.rs :: PolicyContext"
+  "${STORAGE_FILE}|pub struct Row|crates/engine/src/storage.rs :: Row"
+)
+
+GENERATED_PARTS=()
+for entry in "${ITEMS[@]}"; do
+  IFS='|' read -r file pattern label <<<"${entry}"
+  block="$(extract_item_block "${file}" "${pattern}" "${label}")" || exit 1
+  GENERATED_PARTS+=("# source: ${label}"$'\n'"${block}")
+done
 
 GENERATED="$(
   {
     echo "# generated by scripts/check_core_api.sh --update (TASK-125). Do not hand-edit."
-    echo "# source: crates/engine/src/core.rs :: VectorCore"
-    printf '%s\n' "${VECTOR_CORE_BLOCK}"
-    echo
-    echo "# source: crates/engine/src/kernel.rs :: SearchProvider"
-    printf '%s\n' "${SEARCH_PROVIDER_BLOCK}"
+    for part in "${GENERATED_PARTS[@]}"; do
+      echo
+      printf '%s\n' "${part}"
+    done
   }
 )"
 
