@@ -16,8 +16,10 @@
 //! ビヘイビア: TABLE-10）・TASK-87（コールドスタート・ベクトルアリーナ。対象ビヘイビア:
 //! TABLE-8）・TASK-102（検索カーネルの疎検索構成要素。BM25 Okapi。対象ビヘイビア:
 //! SEARCH-1, SEARCH-3。密検索との RRF 融合は TASK-103、評価ハーネス回帰テストは
-//! TASK-104 の管轄）。検索カーネルの残り構成要素（密検索等）・認証・RLS ポリシー評価は
-//! 後続タスクで追加する。
+//! TASK-104 の管轄）・TASK-124（`VectorCore` trait・`PolicyContext`・検索カーネル
+//! provider 層の製品コア。対象ビヘイビア: CORE-1, CORE-2, CORE-13）。プロトコル層
+//! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
+//! 差し替え等は後続タスクで拡張する。
 //!
 //! 性能系タスク（TASK-127・TASK-130・TASK-83 等）向けの計測プロトコル基盤は
 //! `benches/harness/`（TASK-158。lib 本体外・`cargo bench`／`tests/bench_harness.rs`
@@ -25,6 +27,9 @@
 
 pub mod arena;
 pub mod catalog;
+pub mod core;
+pub mod kernel;
+pub mod policy;
 pub mod row_codec;
 pub mod sparse;
 pub mod storage;
