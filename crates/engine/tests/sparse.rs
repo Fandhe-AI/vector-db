@@ -4,7 +4,7 @@
 //! `sparse` は storage/catalog に依存しない純関数的モジュールのため、他の統合テストの
 //! ような DB パスヘルパは不要。公開 API（`SparseIndex::build`/`search`）経由で
 //! 「キーワード一致文書が Top-k に入る」「同一入力なら同一順位（決定性）」を検証する。
-//! 定量的な Recall 等の受け入れ基準の回帰テスト化は TASK-104 の評価ハーネスの管轄。
+//! 関連: TASK-104。
 
 use engine::sparse::SparseIndex;
 
