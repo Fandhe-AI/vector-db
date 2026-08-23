@@ -23,7 +23,7 @@ fn keyword_match_document_is_in_top_k() {
     let corpus = sample_corpus();
     let idx = SparseIndex::build(&corpus).expect("build");
 
-    let results = idx.search("vector search embeddings", 3);
+    let results = idx.search("vector search embeddings", 3).expect("search");
     assert!(!results.is_empty());
     // 「vector」「search」「embeddings」を含む doc 1 が最上位に来ることを期待する。
     assert_eq!(results[0].doc_id, 1);
@@ -34,7 +34,7 @@ fn cjk_keyword_match_document_is_in_top_k() {
     let corpus = sample_corpus();
     let idx = SparseIndex::build(&corpus).expect("build");
 
-    let results = idx.search("東京 ベクトル検索", 3);
+    let results = idx.search("東京 ベクトル検索", 3).expect("search");
     assert!(!results.is_empty());
     assert_eq!(results[0].doc_id, 4);
 }
@@ -44,8 +44,8 @@ fn sparse_search_is_reproducible_across_repeated_calls() {
     let corpus = sample_corpus();
     let idx = SparseIndex::build(&corpus).expect("build");
 
-    let first = idx.search("hybrid sparse search", 5);
-    let second = idx.search("hybrid sparse search", 5);
+    let first = idx.search("hybrid sparse search", 5).expect("search");
+    let second = idx.search("hybrid sparse search", 5).expect("search");
     assert_eq!(
         first, second,
         "同一クエリ・同一インデックスは同一順位を返す（再現性）"
@@ -58,6 +58,6 @@ fn no_keyword_overlap_yields_empty_result() {
     let idx = SparseIndex::build(&corpus).expect("build");
 
     // コーパスに存在しない語のみのクエリはスコア > 0 の文書がなく空になる。
-    let results = idx.search("zzzznonexistentqueryterm", 5);
+    let results = idx.search("zzzznonexistentqueryterm", 5).expect("search");
     assert!(results.is_empty());
 }

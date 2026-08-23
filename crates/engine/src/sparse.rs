@@ -27,14 +27,20 @@
 //! 例: `"cafés"` → `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・
 //! `doc_freq`・`doc_len` の統計を汚染しうる。
 //!
-//! [`SparseIndex::search`] は文書集合への線形走査（`O(コーパス文書数)`）で実装する。
+//! [`SparseIndex::search`] は文書集合への線形走査で実装するが、走査中に各文書について
+//! クエリの一意語集合（最大 `Q` 語）を `BTreeMap` で検索するため、時間計算量は
+//! 文書数のみに比例するのではなく `O(N * Q * log V + M log k)`（`N`: コーパス文書数、
+//! `Q`: クエリの一意語数、`V`: コーパス全体の語彙数、`M`: スコア `> 0` の一致文書数）
+//! である。長いクエリは `N * Q` の積として CPU コストを増幅するため、一意語数の上限を
+//! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる
-//! （本モジュール自体は入力長の上限検証を行わない）。頻度・長さの演算はすべて
-//! `checked_*`/`saturating_*` を用い、オーバーフローを未定義動作にしない。
-//! `tokenize()` 内の添字アクセスは事前のループ境界チェックにより範囲内が証明可能
-//! （panic しない）。
+//! （本モジュール自体はクエリ・文書テキストの文字数上限検証を行わない）。クエリの
+//! 一意語数のみ `MAX_QUERY_TERMS` で上限検証する（詳細は [`SparseIndex::search`]）。
+//! 頻度・長さの演算はすべて `checked_*`/`saturating_*` を用い、オーバーフローを
+//! 未定義動作にしない。`tokenize()` 内の添字アクセスは事前のループ境界チェックにより
+//! 範囲内が証明可能（panic しない）。
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -47,6 +53,15 @@ pub type DocId = u64;
 const DEFAULT_K1: f64 = 1.2;
 /// BM25 の Okapi パラメータ既定値（文書長正規化の強さ）。
 const DEFAULT_B: f64 = 0.75;
+
+/// [`SparseIndex::search`] が受け付けるクエリの一意語数の上限。
+///
+/// `search()` は一致判定のためコーパスの全文書についてクエリの一意語集合を走査する
+/// ため、処理コストはコーパス文書数とクエリの一意語数の積に比例して増える
+/// （モジュールコメントの計算量を参照）。untrusted なクエリ文字列の語数を無制限に
+/// 許すと、この積によって CPU コストを増幅させられる。1024 語は通常のキーワード
+/// クエリを十分満たす一方、積を有界に保つための上限として妥当な値とする。
+const MAX_QUERY_TERMS: usize = 1024;
 
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
@@ -62,6 +77,11 @@ pub enum SparseError {
     /// 代わりに構築時点で拒否する（`.claude/rules/coding-rust.md`: エラー契約は
     /// fail-closed とする）。
     InvalidParams { k1: f64, b: f64 },
+    /// クエリの一意語数が [`MAX_QUERY_TERMS`] を超える。長いクエリはコーパス文書数との
+    /// 積で走査コストを増幅させるため（モジュールコメント参照）、`search()` の入口で
+    /// fail-closed に拒否する（`.claude/rules/coding-rust.md`: untrusted 入力の長さは
+    /// 上限検証してから処理する）。
+    TooManyQueryTerms { unique_terms: usize, max: usize },
 }
 
 impl std::fmt::Display for SparseError {
@@ -73,6 +93,9 @@ impl std::fmt::Display for SparseError {
             }
             SparseError::InvalidParams { k1, b } => {
                 write!(f, "invalid BM25 params: k1={k1}, b={b} (require k1 finite & >= 0.0, b finite & in [0.0, 1.0])")
+            }
+            SparseError::TooManyQueryTerms { unique_terms, max } => {
+                write!(f, "too many unique query terms: {unique_terms} (max {max})")
             }
         }
     }
@@ -93,8 +116,11 @@ pub struct ScoredDoc {
 ///
 /// `Ord` は最終的な検索結果の順序契約（スコア降順、同点は `doc_id` 昇順）で
 /// 「大きい方が良い」を表すよう実装する。`BinaryHeap<Reverse<Candidate>>` に載せることで
-/// 現在の k 件中「最も悪い」候補を `O(log k)` で特定・入れ替えでき、走査全体を
-/// `O(N log k)` 時間・`O(k)` 追加メモリで完結させる（`N` はコーパスの文書数）。
+/// 現在の k 件中「最も悪い」候補を `O(log k)` で特定・入れ替えでき、スコア計算済みの
+/// 候補（`M` 件、`M` はスコア `> 0` の一致文書数）から Top-k を選ぶ部分を
+/// `O(M log k)` 時間・`O(k)` 追加メモリで完結させる（全一致候補を `Vec` に蓄積してから
+/// 全体ソートする場合の `O(M log M)` 時間・`O(M)` 追加メモリより小さい。BM25 スコア
+/// 計算自体の計算量は [`SparseIndex::search`] のドキュメントを参照）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Candidate {
     score: f64,
@@ -301,13 +327,22 @@ impl SparseIndex {
     /// 返す仕様とする（エラーにはしない。決定的な空結果への fail-closed 寄りの挙動）。
     /// `k == 0` の場合、または `k` がコーパスの文書数を上回る場合もそれぞれ空/全件で
     /// 決定的に扱う。スコア同点時は `doc_id` 昇順でタイブレークする（再現性確保）。
-    pub fn search(&self, query: &str, k: usize) -> Vec<ScoredDoc> {
+    ///
+    /// 計算量: コーパスの全文書（`N` 件）についてクエリの一意語集合（`Q` 語）を
+    /// `BTreeMap`（語彙数 `V`）で検索するため `O(N * Q * log V)`、その上で
+    /// スコア `> 0` の一致文書（`M` 件）から Top-k をヒープ選出するため
+    /// `O(M log k)` を要する（合計 `O(N * Q * log V + M log k)`）。クエリの一意語数
+    /// `Q` が大きいほどコーパス全体との積で処理コストが増幅するため、`Q` が
+    /// [`MAX_QUERY_TERMS`] を超える場合は走査に入る前に
+    /// [`SparseError::TooManyQueryTerms`] で拒否する（fail-closed。
+    /// `.claude/rules/coding-rust.md`: untrusted 入力の長さは上限検証してから処理する）。
+    pub fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredDoc>, SparseError> {
         if k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let query_terms = tokenize(query);
         if query_terms.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // 重複クエリ語の IDF を二重計上しないよう一意化する（順序は不問。BTreeMap で決定的に）。
@@ -316,10 +351,18 @@ impl SparseIndex {
             unique_terms.insert(t.clone(), ());
         }
 
+        if unique_terms.len() > MAX_QUERY_TERMS {
+            return Err(SparseError::TooManyQueryTerms {
+                unique_terms: unique_terms.len(),
+                max: MAX_QUERY_TERMS,
+            });
+        }
+
         // 現在の Top-k 候補を保持する固定サイズ（最大 k 件）のヒープ。`Reverse` により
         // `Candidate` の自然順序（大きい方が良い）に対する min-heap として働くため、
         // `heap.peek()` は常に「保持中で最も悪い」候補を指す。悪い候補から順に入れ替える
-        // ことで、走査全体を全件バッファリング＋全体ソートではなく `O(N log k)` に抑える。
+        // ことで、スコア計算済みの候補から Top-k を選ぶ部分を全件バッファリング＋全体
+        // ソートではなく `O(M log k)` に抑える（`M`: スコア `> 0` の一致文書数）。
         let heap_capacity = k.min(self.docs.len());
         let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
         for doc in &self.docs {
@@ -369,7 +412,7 @@ impl SparseIndex {
             .map(|Reverse(Candidate { score, doc_id })| ScoredDoc { doc_id, score })
             .collect();
         scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
-        scored
+        Ok(scored)
     }
 
     /// `idf(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )`。`+ 1` により常に非負となるため、
@@ -473,22 +516,22 @@ mod tests {
     fn search_empty_query_returns_empty() {
         let docs = vec![(1u64, "alpha beta"), (2u64, "gamma delta")];
         let idx = SparseIndex::build(&docs).unwrap();
-        assert!(idx.search("", 10).is_empty());
-        assert!(idx.search("!!!", 10).is_empty());
+        assert!(idx.search("", 10).unwrap().is_empty());
+        assert!(idx.search("!!!", 10).unwrap().is_empty());
     }
 
     #[test]
     fn search_k_zero_returns_empty() {
         let docs = vec![(1u64, "alpha beta")];
         let idx = SparseIndex::build(&docs).unwrap();
-        assert!(idx.search("alpha", 0).is_empty());
+        assert!(idx.search("alpha", 0).unwrap().is_empty());
     }
 
     #[test]
     fn search_k_larger_than_corpus_returns_all_matching() {
         let docs = vec![(1u64, "alpha beta"), (2u64, "alpha gamma")];
         let idx = SparseIndex::build(&docs).unwrap();
-        let results = idx.search("alpha", 100);
+        let results = idx.search("alpha", 100).unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -497,7 +540,7 @@ mod tests {
         // 2 文書が完全に同一内容（同スコア）になるようにする。
         let docs = vec![(2u64, "alpha beta"), (1u64, "alpha beta")];
         let idx = SparseIndex::build(&docs).unwrap();
-        let results = idx.search("alpha", 10);
+        let results = idx.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 2);
         assert!((results[0].score - results[1].score).abs() < 1e-12);
         assert_eq!(results[0].doc_id, 1);
@@ -517,7 +560,7 @@ mod tests {
             (20u64, "alpha beta"),
         ];
         let idx = SparseIndex::build(&docs).unwrap();
-        let results = idx.search("alpha", 2);
+        let results = idx.search("alpha", 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].doc_id, 10);
         assert_eq!(results[1].doc_id, 20);
@@ -530,7 +573,7 @@ mod tests {
             (2u64, "vector databases store embeddings for search"),
         ];
         let idx = SparseIndex::build(&docs).unwrap();
-        let results = idx.search("vector embeddings", 10);
+        let results = idx.search("vector embeddings", 10).unwrap();
         assert_eq!(results[0].doc_id, 2);
     }
 
@@ -542,8 +585,8 @@ mod tests {
             (3u64, "gamma delta epsilon"),
         ];
         let idx = SparseIndex::build(&docs).unwrap();
-        let first = idx.search("gamma delta", 10);
-        let second = idx.search("gamma delta", 10);
+        let first = idx.search("gamma delta", 10).unwrap();
+        let second = idx.search("gamma delta", 10).unwrap();
         assert_eq!(first, second);
     }
 
@@ -563,7 +606,7 @@ mod tests {
         let len_norm = 1.0 - b + b * (2.0 / 1.0);
         let expected = idf_alpha * (f * (k1 + 1.0)) / (f + k1 * len_norm);
 
-        let results = idx.search("alpha", 10);
+        let results = idx.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, 1);
         assert!((results[0].score - expected).abs() < 1e-9);
@@ -580,7 +623,7 @@ mod tests {
         // ガード行そのものの実行はカバーしない。
         let docs = vec![(1u64, "!!!"), (2u64, "???")];
         let idx = SparseIndex::build(&docs).unwrap();
-        assert!(idx.search("alpha", 10).is_empty());
+        assert!(idx.search("alpha", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -590,7 +633,7 @@ mod tests {
             (2u64, "大阪府大阪市のレストラン"),
         ];
         let idx = SparseIndex::build(&docs).unwrap();
-        let results = idx.search("東京", 10);
+        let results = idx.search("東京", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, 1);
     }
@@ -605,7 +648,7 @@ mod tests {
         let expected_idf = ((3.0 - 3.0 + 0.5) / (3.0 + 0.5) + 1.0f64).ln();
         // 単一トークン文書（doc_len == avgdl）なので長さ正規化項は 1 になり、
         // score = idf * (1 * (k1+1)) / (1 + k1) = idf。
-        let results = idx.search("shared", 10);
+        let results = idx.search("shared", 10).unwrap();
         for r in &results {
             assert!((r.score - expected_idf).abs() < 1e-9);
         }
@@ -628,7 +671,7 @@ mod tests {
         let len_norm = 1.0 - b + b * (3.0 / 3.0);
         let expected = idf_alpha * (f * (k1 + 1.0)) / (f + k1 * len_norm);
 
-        let results = idx.search("alpha", 10);
+        let results = idx.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, 1);
         assert!((results[0].score - expected).abs() < 1e-9);
@@ -654,7 +697,7 @@ mod tests {
         let len_norm = 1.0 - b + b * (5.0 / 3.0);
         let expected = idf_alpha * (f * (k1 + 1.0)) / (f + k1 * len_norm);
 
-        let results = idx.search("alpha", 10);
+        let results = idx.search("alpha", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].doc_id, 1);
         assert!((results[0].score - expected).abs() < 1e-9);
@@ -702,5 +745,41 @@ mod tests {
         assert!(SparseIndex::with_params(&docs, 1.2, 0.0).is_ok());
         assert!(SparseIndex::with_params(&docs, 1.2, 1.0).is_ok());
         assert!(SparseIndex::with_params(&docs, 0.0, 0.75).is_ok());
+    }
+
+    // --- クエリの一意語数上限（fail-closed。MAX_QUERY_TERMS 境界） ---
+
+    /// `n` 個の相異なる ASCII 単語トークン（`"w0" "w1" ... "w{n-1}"`）からなるクエリ文字列
+    /// を組み立てる（`tokenize()` は ASCII 単語をそのまま 1 トークン化するため、
+    /// 一意語数がちょうど `n` になる）。
+    fn distinct_term_query(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn search_accepts_query_at_max_query_terms_boundary() {
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let query = distinct_term_query(MAX_QUERY_TERMS);
+        // 上限ちょうどは拒否されない（一致文書がないため結果は空だが、Err にはならない）。
+        assert!(idx.search(&query, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_rejects_query_exceeding_max_query_terms() {
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let query = distinct_term_query(MAX_QUERY_TERMS + 1);
+        let err = idx.search(&query, 10).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyQueryTerms {
+                unique_terms: MAX_QUERY_TERMS + 1,
+                max: MAX_QUERY_TERMS,
+            }
+        );
     }
 }
