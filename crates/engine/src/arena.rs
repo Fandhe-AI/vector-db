@@ -19,8 +19,10 @@
 //! カタログ・行テーブルの両方を単一の `redb::ReadTransaction` 上で扱うことで、
 //! スキーマ取得と行走査の間に他テーブルの並行書き込みが挟まる TOCTOU も避ける。
 //!
-//! [`VectorArena::build`] は現状の呼び出し元がテストのみのため `pub(crate)` に留める
-//! （検索カーネル本体が呼び出し元として加わり次第、クレート外への公開を検討する）。
+//! [`VectorArena::build`] は `pub` な公開エントリポイントであり、後続の検索カーネル
+//! （TASK-133 以降）がコールドスタート時に呼び出す想定の API である。検索カーネル本体は
+//! 本モジュールのスコープ外だが、`VectorArena` 自体はクレート外の呼び出し元
+//! （`crates/engine/tests/arena.rs` 等の統合テストを含む）から構築・参照できる。
 //!
 //! RLS との関係: `tenant_id`・`visibility` はデータとして同居保持するのみで、
 //! ポリシー評価（可視性判定・RLS 事前フィルタ）そのものは行わない
@@ -33,9 +35,6 @@ use crate::storage::{decode_row, Storage, StorageError, Visibility};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
-/// `VectorArena::build` が `pub(crate)` で現状の呼び出し元がテストのみのため、
-/// lib ターゲット単体では未使用と判定される（`#[cfg(test)]` を除くと到達しない）。
-#[allow(dead_code)]
 const MAX_ARENA_ROWS: usize = 1_000_000;
 
 /// アリーナが確保してよい総バイト量の上限。`vectors: Vec<f32>` だけでなく、
@@ -44,8 +43,6 @@ const MAX_ARENA_ROWS: usize = 1_000_000;
 /// 上限対象にすると、他バッファの確保が上限検証をすり抜けて OOM を招き得るため）。
 /// `MAX_ARENA_ROWS` だけでは次元数が大きい場合に依然として巨大確保になり得るため、
 /// 行数とバイト量の両方で上限を課す（`storage.rs` の `MAX_SCAN_TOTAL_BYTES` と同方針）。
-/// `MAX_ARENA_ROWS` と同じ理由で lib ターゲット単体では未使用と判定される。
-#[allow(dead_code)]
 const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
 /// アリーナ構築層の公開エラー型。`storage.rs` の設計メモ（`StorageError` への
@@ -140,10 +137,6 @@ pub type Result<T> = std::result::Result<T, ArenaError>;
 /// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、境界値検証
 /// （ちょうど上限・上限+1 等）を本ファイル内の `#[cfg(test)]` モジュールから
 /// 直接パラメータ化して再現するため。
-///
-/// `VectorArena::build` と同じ理由（呼び出し元がテストのみ）で lib ターゲット単体では
-/// 未使用と判定されるため許容する。
-#[allow(dead_code)]
 fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize) -> Result<usize> {
     if row_count > max_rows {
         return Err(ArenaError::CapacityExceeded);
@@ -174,7 +167,6 @@ fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize)
 /// 同じ値を参照できるよう関数として切り出す）。`tenant_ids` の 1 要素あたりは `String`
 /// 構造体自体のスタック分に加え、ヒープ上の文字列バイト列を最悪ケース
 /// （[`crate::storage::MAX_TENANT_ID_LEN`]）で見積もる。
-#[allow(dead_code)]
 fn per_row_aux_bytes() -> Option<usize> {
     std::mem::size_of::<u64>()
         .checked_add(std::mem::size_of::<String>())
@@ -218,7 +210,13 @@ pub struct VectorArena {
 
 impl VectorArena {
     /// `storage` の現時点のスナップショットから、カタログ上のテーブル `table_name`
-    /// を対象としたアリーナを構築する（対象ビヘイビア: TABLE-8）。
+    /// を対象としたアリーナを構築する公開エントリポイント（対象ビヘイビア: TABLE-8）。
+    ///
+    /// 呼び出し文脈: 後続の検索カーネル（TASK-133 以降）が、コールドスタート時
+    /// （プロセス起動直後・対象テーブルの初回クエリ時等）に本関数を呼び、以降のクエリは
+    /// 返された [`VectorArena`] 上のスライスを参照する想定の公開 API である。検索カーネル
+    /// 本体（スコアリング・top-k 選定）は本モジュールのスコープ外で、本関数は
+    /// 「一度デコードした連続バッファを返す」までを責務とする。
     ///
     /// `expected_dim` はカタログ（[`Storage::get_table_schema`] →
     /// [`crate::catalog::TableSchema::vector_dim`]）から取得し、呼び出し元からは受け取らない
@@ -243,12 +241,7 @@ impl VectorArena {
     /// （部分的なアリーナを返さない fail-closed な判断。通常この分岐へは到達しない。
     /// `insert_row_into_table`/`insert_rows_into_table` が挿入時に次元検証済みのため、
     /// 事後にスキーマ・行データが手で書き換えられた場合の防御として残す）。
-    ///
-    // `VectorArena::build` は現状の呼び出し元がテストのみで、lib ターゲット単体では
-    // 未使用と判定される。検索カーネル本体（後続タスク）が呼び出し元として加わるまでの
-    // 間、許容する。
-    #[allow(dead_code)]
-    pub(crate) fn build(storage: &Storage, table_name: &str) -> Result<Self> {
+    pub fn build(storage: &Storage, table_name: &str) -> Result<Self> {
         // スキーマ取得・対象テーブルの行走査を単一の `read_txn`（同一スナップショット）上で
         // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
         // 並行書き込みが挟まってもスナップショットの一貫性が保証できない。
