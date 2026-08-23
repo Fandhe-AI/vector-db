@@ -15,6 +15,10 @@
 //! EXT-1, EXT-2）・TASK-90（2 テーブル横断トランザクション・クラッシュ耐性回帰テスト。対象
 //! ビヘイビア: TABLE-10）・TASK-87（コールドスタート・ベクトルアリーナ。対象ビヘイビア:
 //! TABLE-8）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
+//!
+//! 性能系タスク（TASK-127・TASK-130・TASK-83 等）向けの計測プロトコル基盤は
+//! `benches/harness/`（TASK-158。lib 本体外・`cargo bench`／`tests/bench_harness.rs`
+//! から利用）を参照。
 
 pub mod arena;
 pub mod catalog;

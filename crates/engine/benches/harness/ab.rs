@@ -1,0 +1,85 @@
+//! interleaved A/B 計測（2 経路比較の相互実行）。
+//!
+//! GPU vs CPU-SIMD 等、2 経路を比較する性能検証タスク（TASK-130 等）が使う入口
+//! （TASK-158。計測プロトコルが定める 2 経路比較の実行方式に対応。ポインタ:
+//! `docs/spec/04-behavior/README.md` 前提条件節）。`protocol::run` と異なり、
+//! warmup も含めて A/B を 1 反復単位で交互実行することでサーマルスロットリング等の
+//! 時間経過に伴う偏りが片方の経路だけに乗るのを防ぐ。
+
+use std::hint::black_box;
+use std::time::Instant;
+
+use super::protocol::{Measurement, MeasurementConfig};
+use super::stats::{self, BenchError};
+
+/// A/B 比較の結果。経路別の `Measurement` に加え、中央値の比率（a/b）を保持する。
+#[derive(Debug, Clone)]
+pub struct AbMeasurement {
+    pub a: Measurement,
+    pub b: Measurement,
+    /// 中央値の比率（`a.summary.median` / `b.summary.median`）。
+    /// 1.0 未満なら A が B より高速。
+    pub median_ratio: f64,
+}
+
+/// 2 つのワークロードを 1 反復単位で交互実行し、経路別の統計値を返す。
+///
+/// `workload_a` と `workload_b` は毎反復ちょうど 1 回ずつ呼ばれる（非対称な反復配分は
+/// ドリフト排除という設計意図に反するため、`config` の warmup・計測回数はそのまま
+/// 両経路に等しく適用される。個別に回数を変える API は意図的に提供しない）。
+pub fn run_ab<T>(
+    config: &MeasurementConfig,
+    mut workload_a: impl FnMut() -> T,
+    mut workload_b: impl FnMut() -> T,
+) -> Result<AbMeasurement, BenchError> {
+    // warmup フェーズも交互実行する（サーマル状態を両経路で揃えた状態から
+    // 計測フェーズに入るため）。
+    for _ in 0..config.warmup_iterations() {
+        black_box(workload_a());
+        black_box(workload_b());
+    }
+
+    let measured = config.measured_iterations() as usize;
+    let mut samples_a = Vec::with_capacity(measured);
+    let mut samples_b = Vec::with_capacity(measured);
+
+    for _ in 0..config.measured_iterations() {
+        let start_a = Instant::now();
+        let result_a = workload_a();
+        let elapsed_a = start_a.elapsed();
+        black_box(result_a);
+        samples_a.push(elapsed_a);
+
+        let start_b = Instant::now();
+        let result_b = workload_b();
+        let elapsed_b = start_b.elapsed();
+        black_box(result_b);
+        samples_b.push(elapsed_b);
+    }
+
+    // 交互実行の対称性が崩れていないことの内部一貫性チェック（fail-closed）。
+    // 通常経路では samples_a/samples_b は常に同数になるはずで、ここに到達するのは
+    // 将来の実装変更でループ構造が壊れた場合のみ。
+    if samples_a.len() != samples_b.len() {
+        return Err(BenchError::ProtocolViolation(
+            "interleaved A/B iteration counts diverged",
+        ));
+    }
+
+    let summary_a = stats::summarize(&samples_a)?;
+    let summary_b = stats::summarize(&samples_b)?;
+
+    let median_ratio = summary_a.median.as_secs_f64() / summary_b.median.as_secs_f64();
+
+    Ok(AbMeasurement {
+        a: Measurement {
+            summary: summary_a,
+            samples: samples_a,
+        },
+        b: Measurement {
+            summary: summary_b,
+            samples: samples_b,
+        },
+        median_ratio,
+    })
+}
