@@ -410,41 +410,42 @@ mod tests {
     }
 
     #[test]
-    fn search_range_skips_only_the_row_whose_vectors_are_missing() {
-        // Issue #34 レビュー指摘の回帰テスト: 担当範囲内の 1 行だけ `vectors` が
-        // 不足している状況で、パーティション全体ではなく当該行だけが除外されることを
-        // `thread_count_for` の実際のスレッド数に依存せず直接検証する
-        // （`thread_count_for` は CI 環境のコア数に依存するため、マルチスレッド経路が
-        // 必ず選ばれる保証がなく、provider 経由のテストだけでは不十分）。
+    fn search_range_with_nonzero_offset_skips_only_the_row_straddling_the_vectors_boundary() {
+        // Issue #34 レビュー指摘の回帰テスト: 非 0 の `row_offset`（実際の並列パスで
+        // 各ワーカーが受け取る値）を使い、担当範囲の途中で `vectors` が尽きる状況で
+        // パーティション全体ではなく境界の 1 行だけが除外されることを、
+        // `thread_count_for` の実際のスレッド数（CI 環境のコア数依存）に依存せず
+        // 直接検証する。`row_offset = 0` だと `row = row_offset + idx` が旧実装の
+        // `row = idx` と区別できないため、必ず非 0 の offset で境界をまたぐケースにする。
         let dim = 2usize;
-        // 3 行分の id・スコアが立つはずだが、`vectors` は 2 行分（4 要素）しかない。
-        // `row_offset` を非 0 にして、絶対インデックス参照になっていることも検証する。
-        let ids = [10u64, 11, 12];
-        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        // 6 行分（0..6）の embedding のうち、末尾の行 5 だけ 1 要素分足りない
+        // （`vectors.len() == 11` は `6 * dim == 12` に対して 1 要素不足）。
+        let vectors = [
+            1.0f32, 0.0, // row 0
+            2.0, 0.0, // row 1
+            3.0, 0.0, // row 2
+            4.0, 0.0, // row 3
+            5.0, 0.0, // row 4
+            6.0, // row 5（1 要素欠落・境界外）
+        ];
         let query = [1.0f32, 0.0];
-        let row_offset = 5usize;
+        // 担当範囲は絶対行 4..6（id=100 → row 4, id=101 → row 5）。
+        let ids = [100u64, 101];
+        let row_offset = 4usize;
 
         let selector = search_range(&ids, &vectors, row_offset, dim, &query, 10);
         let hits = selector.into_sorted_vec();
 
-        // row_offset=5 のとき、id=10 は絶対行 5（vectors[10..12] は範囲外 → skip）、
-        // id=11 は絶対行 6（範囲外 → skip）、id=12 は絶対行 7（範囲外 → skip）になり
-        // 全て境界外になる。境界内に収まるケースも合わせて検証するため、
-        // row_offset=0 のケースも確認する。
-        assert!(hits.is_empty(), "all rows out of bounds when row_offset=5");
-
-        let selector = search_range(&ids, &vectors, 0, dim, &query, 10);
-        let hits = selector.into_sorted_vec();
-        // 絶対行 0（id=10）→ vectors[0..2]=[1,0] → score 1.0
-        // 絶対行 1（id=11）→ vectors[2..4]=[0,1] → score 0.0
-        // 絶対行 2（id=12）→ vectors[4..6] は範囲外 → skip（パーティション全体ではなく
-        // この 1 行だけが消えることが本テストの主張）
+        // row 4（id=100）は `vectors[8..10]` が範囲内 → score 5.0 で選出される。
+        // row 5（id=101）は `vectors[10..12]` が範囲外 → 当該行だけ除外される
+        // （パーティション全体が消える旧実装のバグなら空集合になり、このアサーションが
+        // 落ちる）。
         assert_eq!(
             hits,
-            vec![
-                SearchHit { id: 10, score: 1.0 },
-                SearchHit { id: 11, score: 0.0 },
-            ]
+            vec![SearchHit {
+                id: 100,
+                score: 5.0
+            }]
         );
     }
 
@@ -487,5 +488,35 @@ mod tests {
             simd_ids, scalar_ids,
             "SimdSearchProvider と CpuScalarProvider の選出 id 集合が一致すること"
         );
+    }
+
+    #[test]
+    fn scoped_worker_panic_is_mapped_to_worker_panicked_error_without_repanicking() {
+        // Issue #34 レビュー指摘の回帰テスト: `search()` のワーカー panic 処理が
+        // 使う「各ハンドルを必ず `join()` してから `collect::<Result<_, _>>()` する」
+        // パターンが実際に `KernelError::WorkerPanicked` へマップされ、
+        // `std::thread::scope` 自体が（`join()` されなかった場合のように）
+        // 再 panic しないことを検証する（`std::thread::scope` は panic した
+        // スレッドが 1 つでも `join()` されずに残っていた場合のみ、スコープ終了時に
+        // 自ら panic する。全ハンドルを `join()` 済みならその再 panic は起きない）。
+        //
+        // パニックメッセージが標準の panic hook 経由でテスト出力に出るのを避けるため、
+        // 一時的に無音の hook へ差し替える（`search()` 本体のワーカー panic 経路と
+        // 同一の join → collect → map_err の並びを、`SearchInput` を組み立てずに
+        // 直接検証する）。
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result: Result<Vec<i32>, KernelError> = std::thread::scope(|scope| {
+            let ok_handle = scope.spawn(|| 1i32);
+            let panicking_handle = scope.spawn(|| -> i32 { panic!("induced for test") });
+            vec![ok_handle, panicking_handle]
+                .into_iter()
+                .map(|h| h.join())
+                .collect::<Result<Vec<i32>, _>>()
+        })
+        .map_err(|_| KernelError::WorkerPanicked);
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(result, Err(KernelError::WorkerPanicked));
     }
 }
