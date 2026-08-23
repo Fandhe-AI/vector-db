@@ -18,6 +18,10 @@
 //! SEARCH-1, SEARCH-3。密検索との RRF 融合は TASK-103、評価ハーネス回帰テストは
 //! TASK-104 の管轄）。検索カーネルの残り構成要素（密検索等）・認証・RLS ポリシー評価は
 //! 後続タスクで追加する。
+//!
+//! 性能系タスク（TASK-127・TASK-130・TASK-83 等）向けの計測プロトコル基盤は
+//! `benches/harness/`（TASK-158。lib 本体外・`cargo bench`／`tests/bench_harness.rs`
+//! から利用）を参照。
 
 pub mod arena;
 pub mod catalog;

@@ -1,0 +1,40 @@
+//! 性能計測プロトコル基盤（TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。
+//!
+//! TASK-127（SIMD 検索ベンチ）・TASK-130（GPU vs CPU-SIMD A/B 回帰）・TASK-83 等、
+//! 性能系の受け入れ基準を測定・再測定するタスクは、独自に計測ループを書かず
+//! 必ず本モジュール経由で計測する契約とする。
+//!
+//! 対象ビヘイビア ID なし（基盤タスク。CORE-3〜6・SEARCH-4・SQL-1 等の測定条件を
+//! 担保する下支え）。
+//!
+//! # 利用側との契約
+//!
+//! - **決定性**: 入力生成は [`rng::DeterministicRng`] を通し、同一シードから常に
+//!   同一の測定入力を再生成できること。
+//! - **fail-closed**: プロトコル下限（warmup・計測回数）を回避できる構築経路を
+//!   設けない。[`protocol::MeasurementConfig::new`] は下限未満を `Err` で拒否する。
+//! - **同期完了の責務**: [`protocol::run`]・[`ab::run_ab`] に渡す `workload` は
+//!   呼び出し元が 1 回分の作業を同期的に完了させること（本基盤は完了同期を検証しない）。
+//! - **統合テストからの取り込み**: `cargo bench` 経由のベンチ入口だけでなく
+//!   `tests/bench_harness.rs` からも `#[path = "../benches/harness/mod.rs"]` で
+//!   同一ソースを取り込み、`cargo test` でプロトコル遵守の回帰を検証する
+//!   （crates/engine が内部モジュールを 2 経路から共有する構成。新規クレートは
+//!   追加しない）。
+//!
+//! # 暗号用途禁止
+//!
+//! 本モジュール群の RNG（[`rng::DeterministicRng`]）は非暗号 PRNG である。
+//! ベンチ・テストの入力生成専用とし、鍵・トークン等のセキュリティ用途に転用しない
+//! （OWASP A02）。
+
+// クレートルート直下の再 export は置かない: 本モジュールは `cargo bench`
+// バイナリ（`benches/measurement.rs`）と統合テスト（`tests/bench_harness.rs`）の
+// 2 つの独立したコンパイル単位から `#[path]` で取り込まれ、双方が使う識別子の
+// 集合が異なる。`pub use` でまとめて再 export すると、一方の単位でしか使わない
+// 識別子が他方で unused import として `-D warnings` に引っかかるため、
+// 各利用側はサブモジュール経由（`harness::protocol::...` 等）で必要な識別子のみ
+// 個別に import する。
+pub mod ab;
+pub mod protocol;
+pub mod rng;
+pub mod stats;

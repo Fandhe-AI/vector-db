@@ -23,3 +23,13 @@ redb = "=4.2.0"
 # 踏み込んで検証するために同一バージョンの redb を直接操作する。新規依存の追加ではなく
 # 上記と同一クレート・バージョンをテストスコープでも利用するのみ。
 redb = "=4.2.0"
+
+[[bench]]
+# TASK-158（性能計測プロトコル基盤）の実走スモーク入口。
+# harness = false: libtest のベンチハーネスは使わず `fn main` を直接実行する
+# （外部依存追加なしの自作計測プロトコル。.claude/rules/dependency-policy.md）。
+# test = false: `cargo test` の収集対象から外し、make ci の所要時間に影響させない
+# （手動実行専用。プロトコル遵守の回帰は tests/bench_harness.rs が別途担う）。
+name = "measurement"
+harness = false
+test = false
