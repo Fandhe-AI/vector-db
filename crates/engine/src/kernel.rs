@@ -1,10 +1,13 @@
 //! 検索カーネルの実行バックエンド provider 層（TASK-124・対象ビヘイビア: CORE-13）。
 //!
-//! `core.rs` の [`crate::core::EngineCore`] は具象バックエンド型（CPU-SIMD・GPU・将来
+//! `core.rs` の [`crate::core::EngineCore`] は具象バックエンド型（CPU 並列・GPU・将来
 //! ANN）へ直接依存せず、本モジュールが定義する object-safe な [`SearchProvider`] trait
-//! 経由で実行バックエンドを注入される。既定コンストラクタは本モジュールの
-//! [`CpuScalarProvider`]（総当たりスカラー参照実装）を登録し、CPU-only 構成のみで
-//! 全機能が成立することを保証する。SIMD 化・並列化は後続タスク（TASK-126）の範囲。
+//! 経由で実行バックエンドを注入される。本モジュールはスカラー参照実装
+//! [`CpuScalarProvider`] と、Top-k 選出の共通ヘルパ [`TopKSelector`] を提供する。
+//! `TopKSelector` は `crates/engine/src/parallel_search.rs::ParallelSearchProvider`（TASK-126）
+//! とも共用し、選出規約（スコア降順・同点 id 昇順・非有限値除外）の二重管理を防ぐ。
+//! 既定コンストラクタが実際にどちらの provider を注入するかは `core.rs::EngineCore::open`
+//! を参照。
 //!
 //! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12 の方針先取り。
 //! ディスパッチ決定表は TASK-155 の範囲）。
@@ -30,6 +33,11 @@ pub enum KernelError {
     /// untrusted 入力のため、`total_cmp` の順序に頼らず明示的に拒否する
     /// （coding-rust.md「untrusted 入力の扱い」対応。fail-closed）。
     NonFiniteQuery,
+    /// `parallel_search.rs::ParallelSearchProvider` の並列ワーカースレッドが panic した。
+    /// 部分結果を欠いたまま `Ok` を返すと該当パーティションの行が黙って選出対象から
+    /// 消える（実質 fail-open）ため、検索全体を失敗として呼び出し元へ伝播させる
+    /// （Issue #34 レビュー指摘対応）。
+    WorkerPanicked,
 }
 
 impl fmt::Display for KernelError {
@@ -40,6 +48,9 @@ impl fmt::Display for KernelError {
                 "kernel query dim mismatch: expected={expected} found={found}"
             ),
             KernelError::NonFiniteQuery => write!(f, "kernel query contains non-finite value"),
+            KernelError::WorkerPanicked => {
+                write!(f, "kernel search worker thread panicked")
+            }
         }
     }
 }
@@ -78,7 +89,8 @@ pub trait SearchProvider: Send + Sync {
 }
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
-/// による部分ソート）。SIMD 化・並列化はしない（TASK-126 の範囲）。
+/// による部分ソート）。単一スレッド・スカラー演算のみで、ベクトル化・並列化された
+/// [`crate::parallel_search::ParallelSearchProvider`]（TASK-126）の正解値検証用の参照実装も兼ねる。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuScalarProvider;
 
@@ -101,47 +113,17 @@ impl SearchProvider for CpuScalarProvider {
             return Ok(Vec::new());
         }
 
-        // スコア最小のヒープを保持し、サイズ k を超えたら最小要素を捨てる
-        // （Top-k 選出。事前に全件確保しない）。`f32` は全順序を持たないため
-        // 比較には `total_cmp` を使う（[`MinHeapItem`] 参照）。ただし NaN/Inf 混入行は
-        // 下記ループで `score.is_finite()` を確認して除外するため、ヒープに乗る
-        // スコアは常に有限値になる（`total_cmp` の全順序性は同点判定・整列の安定性の
-        // ためだけに使い、NaN の順序上の扱いには依存しない）。
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
-
-        // 同点タイブレーク（Low 指摘対応）: スコアが同じ場合は id が小さい方を「強い」候補
-        // として扱う（返却直前の `sort_by` が id 昇順で安定させるのと選出段の基準を揃える。
-        // ヒープ挿入順・入力順に依存しない決定的な選出にする）。
-        struct MinHeapItem(SearchHit);
-        impl PartialEq for MinHeapItem {
-            fn eq(&self, other: &Self) -> bool {
-                self.cmp(other) == std::cmp::Ordering::Equal
-            }
-        }
-        impl Eq for MinHeapItem {}
-        impl PartialOrd for MinHeapItem {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for MinHeapItem {
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                self.0
-                    .score
-                    .total_cmp(&other.0.score)
-                    .then(other.0.id.cmp(&self.0.id))
-            }
-        }
-
-        let mut heap: BinaryHeap<Reverse<MinHeapItem>> = BinaryHeap::new();
+        let mut selector = TopKSelector::new(input.k);
         for (idx, &id) in input.ids.iter().enumerate() {
             let start = idx.saturating_mul(dim);
             let end = start.saturating_add(dim);
             let Some(vector) = input.vectors.get(start..end) else {
                 // アリーナ側の不変条件（`vectors.len() == ids.len() * dim`）が破れている。
-                // untrusted 入力由来ではないが、添字アクセスで panic させず黙って
-                // スキップする（fail-closed: 壊れた行を結果に混入させない）。
+                // untrusted 入力由来ではないが、添字アクセスで panic させず該当行だけを
+                // 候補から除外する（呼び出し全体は `Ok` のまま。破損行 1 件を混入させない
+                // という意味では安全側だが、検索全体を拒否するわけではないため厳密な
+                // fail-closed ではない点に注意。共有参照実装として
+                // `parallel_search.rs::search_range` と同一の挙動を維持する）。
                 continue;
             };
             let score = dot(vector, input.query);
@@ -152,27 +134,102 @@ impl SearchProvider for CpuScalarProvider {
                 // 正当な上位ヒットを押し出しかねない。fail-closed に当該行を除外する。
                 continue;
             }
-            let hit = SearchHit { id, score };
-            let candidate = MinHeapItem(hit);
-            if heap.len() < input.k {
-                heap.push(Reverse(candidate));
-            } else if let Some(Reverse(top)) = heap.peek() {
-                if candidate > *top {
-                    heap.pop();
-                    heap.push(Reverse(candidate));
-                }
-            }
+            selector.push(SearchHit { id, score });
         }
-
-        let mut out: Vec<SearchHit> = heap.into_iter().map(|Reverse(item)| item.0).collect();
-        // スコア降順（内積が大きいほど上位）に整列して返す。同点は id 昇順で安定させる。
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
-        Ok(out)
+        Ok(selector.into_sorted_vec())
     }
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+/// 内積（dot product）のスカラー参照実装（左から右への逐次和）。
+///
+/// `parallel_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
+/// 指摘対応: 加算順序を分岐させると `ParallelSearchProvider` と本 provider の Top-k
+/// 集合・順序が丸め誤差で食い違い得るため、`pub(crate)` にして共有し、
+/// 単一の加算順序であることを構造的に保証する）。
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// ヒープ内の同点タイブレーク規約（Low 指摘対応）: スコアが同じ場合は id が小さい方を
+/// 「強い」候補として扱う（[`TopKSelector::into_sorted_vec`] の `sort_by` が返却直前に
+/// id 昇順で安定させるのと選出段の基準を揃え、ヒープ挿入順・入力順に依存しない決定的な
+/// 選出にする）。`f32` は全順序を持たないため `total_cmp` を使う。ただし非有限スコアは
+/// [`TopKSelector::push`] が事前に弾くため、ここで比較する値は常に有限値になる。
+struct MinHeapItem(SearchHit);
+impl PartialEq for MinHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for MinHeapItem {}
+impl PartialOrd for MinHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MinHeapItem {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .score
+            .total_cmp(&other.0.score)
+            .then(other.0.id.cmp(&self.0.id))
+    }
+}
+
+/// Top-k 選出の共通ヘルパ（対象ビヘイビア: CORE-4）。スコア最小のヒープを保持し、
+/// サイズ `k` を超えたら最小要素を捨てる方式（事前に全件確保しない・`O(n log k)`）。
+///
+/// [`CpuScalarProvider`]（本ファイル）と `parallel_search.rs::ParallelSearchProvider`
+/// （TASK-126）の両方から使われる。後者はスレッドごとに本セレクタで部分 Top-k を
+/// 選出したうえで、部分結果を同じセレクタへ再度 push してマージする
+/// （分割数・スレッド数に依らず選出規約が一意に決まる設計。CORE-3・SEARCH-4）。
+pub(crate) struct TopKSelector {
+    k: usize,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<MinHeapItem>>,
+}
+
+impl TopKSelector {
+    /// 容量 `k` の選出器を作る。`k == 0` の場合は何を push しても常に空集合を返す。
+    pub(crate) fn new(k: usize) -> Self {
+        Self {
+            k,
+            // `k` は `SearchProvider` trait 経由で外部（wire-server 等の呼び出し元）から
+            // 到達しうる値で、`core.rs` は `MAX_SEARCH_K` でクランプするが本 provider 自体は
+            // 検証しない。`with_capacity(k)` で事前確保すると未検証の巨大な `k` がそのまま
+            // アロケーションサイズになってしまう（coding-rust.md「無制限確保禁止」）ため、
+            // 事前確保はせず push 時に自然成長させる（旧 `CpuScalarProvider` 実装と同じ挙動。
+            // 実際に保持する要素数は `push` のロジックにより高々 `k` に抑えられる）。
+            heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    /// 候補 1 件を選出器へ投入する。非有限スコア（NaN/Inf）は fail-closed に無視する
+    /// （呼び出し元が事前に除外している場合でも、二重の安全網として機能する）。
+    pub(crate) fn push(&mut self, hit: SearchHit) {
+        if self.k == 0 || !hit.score.is_finite() {
+            return;
+        }
+        let candidate = MinHeapItem(hit);
+        if self.heap.len() < self.k {
+            self.heap.push(std::cmp::Reverse(candidate));
+        } else if let Some(std::cmp::Reverse(top)) = self.heap.peek() {
+            if candidate > *top {
+                self.heap.pop();
+                self.heap.push(std::cmp::Reverse(candidate));
+            }
+        }
+    }
+
+    /// 選出結果をスコア降順（同点は id 昇順）で確定して返す。
+    pub(crate) fn into_sorted_vec(self) -> Vec<SearchHit> {
+        let mut out: Vec<SearchHit> = self
+            .heap
+            .into_iter()
+            .map(|std::cmp::Reverse(item)| item.0)
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        out
+    }
 }
 
 #[cfg(test)]

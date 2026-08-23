@@ -33,7 +33,8 @@ use std::path::Path;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
-use crate::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::parallel_search::ParallelSearchProvider;
 use crate::policy::{PolicyContext, PolicyError};
 use crate::storage::{Row, Storage, StorageError};
 
@@ -142,8 +143,10 @@ pub trait VectorCore: Send + Sync {
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
 ///
 /// 実行バックエンド実装型へ直接依存せず `Box<dyn SearchProvider>` で保持する（CORE-13）。
-/// 既定コンストラクタ（[`Self::open`]）は CPU-only の [`CpuScalarProvider`] を注入し、
-/// この構成だけで全機能が成立する。
+/// 既定コンストラクタ（[`Self::open`]）は CPU-only の
+/// [`ParallelSearchProvider`](crate::parallel_search::ParallelSearchProvider)（TASK-126・
+/// マルチスレッド並列の総当たり Top-k。ベクトル化は行わない）を注入し、この構成だけで
+/// 全機能が成立する。
 pub struct EngineCore {
     storage: Storage,
     provider: Box<dyn SearchProvider>,
@@ -153,7 +156,7 @@ impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の CPU provider を注入した
     /// `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::with_provider(path, Box::new(CpuScalarProvider))
+        Self::with_provider(path, Box::new(ParallelSearchProvider))
     }
 
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。
@@ -195,8 +198,9 @@ impl VectorCore for EngineCore {
 
         // `query` の次元をカタログ照会だけで早期検証する（`VectorArena::build` へ進む前）。
         // `VectorArena::build` は対象テーブル全行（最大 `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES`）
-        // をデコード・確保してから初めて `kernel.rs::CpuScalarProvider::search` が
-        // 次元不一致を検出する構造だと、次元不一致という軽量に判定できる入力であっても
+        // をデコード・確保してから初めて provider（`kernel.rs::SearchProvider` 実装。既定は
+        // `parallel_search.rs::ParallelSearchProvider`）が次元不一致を検出する構造だと、次元不一致
+        // という軽量に判定できる入力であっても
         // 全行デコード分のコスト（リソース増幅）を強いられてしまう
         // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。Issue #32 レビュー
         // 指摘）。ここでの早期拒否はエラー契約を変えず、`kernel.rs` が返すのと同じ
@@ -223,8 +227,9 @@ impl VectorCore for EngineCore {
         // 次元検証と同じ理由で、非有限（NaN・Inf）query も `VectorArena::build` へ進む前に
         // 早期拒否する（Cursor Bugbot Medium 指摘・Issue #32 #137）。`query` は wire 経路
         // からの untrusted 入力であり得るため、正しい次元であっても
-        // `kernel.rs::CpuScalarProvider::search` 側の検証（`KernelError::NonFiniteQuery`）
-        // だけに委ねると、次元一致・値だけ不正なクエリで同種のリソース増幅（全行デコード後に
+        // provider 側の検証（`KernelError::NonFiniteQuery`。`kernel.rs::CpuScalarProvider`・
+        // `parallel_search.rs::ParallelSearchProvider` 共通の契約）だけに委ねると、次元一致・値だけ
+        // 不正なクエリで同種のリソース増幅（全行デコード後に
         // 拒否）が残る。ここでの早期拒否はエラー契約を変えず、`kernel.rs` が返すのと同じ
         // `KernelError::NonFiniteQuery` を用いる。
         if query.iter().any(|v| !v.is_finite()) {
