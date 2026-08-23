@@ -12,17 +12,56 @@
 //! 安全な形にとどめ、release ビルドでの自動ベクトル化に委ねる。並列化は
 //! `std::thread::scope`（stable）による行範囲分割のみで、外部からのスレッド数・
 //! カーネル選択の上書き機構は設けない（CORE-12 の方針）。
+//!
+//! 同時実行クエリ間の合計ワーカースレッド数は [`GLOBAL_WORKER_BUDGET`]（プロセス全体で
+//! 共有する `AtomicUsize`）で調停する（Issue #34 レビュー指摘対応。security.md
+//! 「不安全な設計｜無制限リソース確保（DoS）」）。予算を確保できない分は
+//! スレッドを追加せず単一スレッド相当まで縮退させるのみで、行の選出対象からの除外は
+//! 一切発生しない（[`SimdSearchProvider::search`] 参照）。
 
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider, TopKSelector};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// クエリ 1 件あたりのスレッド数上限（CORE-3 の並列度の趣旨に対応）。
-///
-/// この上限は **クエリ単独** に対するものであり、同時実行中のクエリ間でスレッド数を
-/// 共有・調停するグローバルなプールではない（`std::thread::scope` はクエリごとに
-/// スレッドを生成して合流する）。複数クエリが同時に到達した場合、OS スレッド総数は
-/// クエリ数 × 本上限まで増え得る。グローバルなスレッド予算・共有プールの導入は
-/// スコープ外（TASK-126 の範囲外。後続タスクで検討）。
 const MAX_THREADS_PER_QUERY: usize = 16;
+
+/// プロセス全体で共有するワーカースレッド予算。`MAX_THREADS_PER_QUERY` はクエリ単独の
+/// 上限に過ぎず、同時実行クエリの数だけスレッド総数が積み上がり得るため、
+/// 追加で確保する（呼び出し元スレッド自身の分を除く）ワーカー数をこの上限まで
+/// プロセス全体で調停する。
+const MAX_TOTAL_EXTRA_WORKER_THREADS: usize = 64;
+
+/// [`MAX_TOTAL_EXTRA_WORKER_THREADS`] を上限に、現在確保中の追加ワーカー数を
+/// プロセス全体で共有するカウンタ（`Ordering::SeqCst` で十分に保守的に同期する。
+/// 検索のホットパスではなく調停用のカウンタのため、性能より単純さを優先する）。
+static GLOBAL_WORKER_BUDGET: AtomicUsize = AtomicUsize::new(0);
+
+/// [`GLOBAL_WORKER_BUDGET`] から `desired` 件までの追加ワーカー枠を確保し、確保できた
+/// 件数（0 件の場合もあり得る）を返す `RAII` ガード。ガードの `Drop` で必ず解放するため、
+/// 途中で `?` によるアーリーリターンやワーカー panic が起きても予算がリークしない。
+struct WorkerBudgetGuard(usize);
+
+impl WorkerBudgetGuard {
+    fn acquire(desired: usize) -> Self {
+        let mut reserved = 0usize;
+        let _ = GLOBAL_WORKER_BUDGET.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            let available = MAX_TOTAL_EXTRA_WORKER_THREADS.saturating_sub(cur);
+            reserved = desired.min(available);
+            Some(cur.saturating_add(reserved))
+        });
+        Self(reserved)
+    }
+
+    fn granted(&self) -> usize {
+        self.0
+    }
+}
+
+impl Drop for WorkerBudgetGuard {
+    fn drop(&mut self) {
+        GLOBAL_WORKER_BUDGET.fetch_sub(self.0, Ordering::SeqCst);
+    }
+}
 
 /// スレッド分割の下限行数。担当行数がこれを下回るワーカーを作らないことで、
 /// 小規模テーブルでの無用なスレッド生成コストを避ける（CORE-3 の「行数が小さい場合は
@@ -57,48 +96,79 @@ impl SearchProvider for SimdSearchProvider {
         }
 
         let row_count = input.ids.len();
-        let thread_count = thread_count_for(row_count);
+        let desired_threads = thread_count_for(row_count);
 
-        let partials: Vec<TopKSelector> = if thread_count <= 1 {
-            vec![search_range(
-                input.ids,
-                input.vectors,
-                dim,
-                input.query,
-                input.k,
-            )]
+        // `desired_threads <= 1` の場合は追加ワーカーを 1 つも生成しないため、
+        // グローバル予算（`GLOBAL_WORKER_BUDGET`）を消費せず単一スレッド経路をそのまま使う。
+        // `desired_threads > 1` の場合のみ、これから生成する追加ワーカー数分の予算確保を
+        // 試みる。確保できた数（`effective_threads`）が同時実行クエリの多さにより
+        // `desired_threads` を下回ることがあるが、その場合はパーティション数を単に
+        // 減らすだけで、行を選出対象から除外することは一切ない（DoS 対策の縮退は
+        // 「並列度を落とす」形でのみ行い、fail-open にはしない）。
+        let _budget_guard;
+        let effective_threads = if desired_threads <= 1 {
+            _budget_guard = None;
+            1usize
         } else {
-            // 行範囲を均等分割し、各スレッドが担当範囲だけで部分 Top-k を選出する。
-            // `TopKSelector` は事前確保をせず push 時に自然成長するため、中間バッファは
-            // 「実際に保持する要素数が高々 k」という意味で有界（無制限 `with_capacity`
-            // 禁止。coding-rust.md・`kernel.rs::TopKSelector::new` 参照）。
-            let rows_per_thread = row_count.div_ceil(thread_count);
-            std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(thread_count);
-                let mut row_start = 0usize;
-                while row_start < row_count {
-                    let row_end = row_start.saturating_add(rows_per_thread).min(row_count);
-                    // `get()` による境界安全アクセス。通常はここで `None` にはならない
-                    // （`row_start..row_end` は `row_count` 以内に収まるよう構築している）が、
-                    // 添字アクセスによる panic を避けるため防御的に空スライスへ縮退させる
-                    // （fail-closed: 万一の不整合時も該当範囲を黙ってスキップする）。
-                    let ids_slice = input.ids.get(row_start..row_end).unwrap_or(&[]);
-                    let vec_start = row_start.saturating_mul(dim);
-                    let vec_end = row_end.saturating_mul(dim);
-                    let vectors_slice = input.vectors.get(vec_start..vec_end).unwrap_or(&[]);
-                    let query = input.query;
-                    let k = input.k;
-                    handles.push(
-                        scope.spawn(move || search_range(ids_slice, vectors_slice, dim, query, k)),
-                    );
-                    row_start = row_end;
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|_| TopKSelector::new(0)))
-                    .collect()
-            })
+            let guard = WorkerBudgetGuard::acquire(desired_threads);
+            let granted = guard.granted().max(1);
+            _budget_guard = Some(guard);
+            granted
         };
+
+        let partials: Vec<TopKSelector> =
+            if effective_threads <= 1 {
+                vec![search_range(
+                    input.ids,
+                    input.vectors,
+                    0,
+                    dim,
+                    input.query,
+                    input.k,
+                )]
+            } else {
+                // 行範囲を均等分割し、各スレッドが担当範囲だけで部分 Top-k を選出する。
+                // `TopKSelector` は事前確保をせず push 時に自然成長するため、中間バッファは
+                // 「実際に保持する要素数が高々 k」という意味で有界（無制限 `with_capacity`
+                // 禁止。coding-rust.md・`kernel.rs::TopKSelector::new` 参照）。
+                //
+                // `ids`・`vectors` はどちらも切り出さずスレッドへ丸ごと渡し、各ワーカーは
+                // 担当範囲の絶対行インデックス（`row_start` を起点とする）で `vectors` を
+                // 参照する（`search_range` 参照）。以前は `vectors.get(vec_start..vec_end)`
+                // が `None` の場合に担当範囲全体（数千行規模になり得る）を空スライスへ縮退させ、
+                // `CpuScalarProvider`（壊れた行 1 件だけを skip）と選出結果が食い違う
+                // バグがあった（Issue #34 レビュー指摘対応）。行単位の `get()` 失敗のみを
+                // skip する現在の形は、スレッド分割の有無・分割数に依らず
+                // `CpuScalarProvider` と同じ候補集合を走査することを保証する。
+                let rows_per_thread = row_count.div_ceil(effective_threads);
+                std::thread::scope(|scope| {
+                    let mut handles = Vec::with_capacity(effective_threads);
+                    let mut row_start = 0usize;
+                    while row_start < row_count {
+                        let row_end = row_start.saturating_add(rows_per_thread).min(row_count);
+                        // `ids` の担当範囲は `row_start..row_end ⊆ 0..row_count == ids.len()` と
+                        // なるよう構築しているため常に `Some` になるが、添字アクセスによる
+                        // panic を避けるため `get()` で防御的に取り出す。
+                        let ids_slice = input.ids.get(row_start..row_end).unwrap_or(&[]);
+                        let vectors = input.vectors;
+                        let query = input.query;
+                        let k = input.k;
+                        handles.push(scope.spawn(move || {
+                            search_range(ids_slice, vectors, row_start, dim, query, k)
+                        }));
+                        row_start = row_end;
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join())
+                        .collect::<Result<Vec<TopKSelector>, _>>()
+                })
+                // ワーカーが panic した場合、その分の部分結果を欠いたまま `Ok` を返すと
+                // 該当パーティションの行が黙って選出対象から消える（実質 fail-open。
+                // Issue #34 レビュー指摘対応）。検索全体を失敗として呼び出し元へ伝播させる
+                // （fail-closed。`KernelError::WorkerPanicked`）。
+                .map_err(|_| KernelError::WorkerPanicked)?
+            };
 
         // 部分結果を最終セレクタへ再投入してマージする。`TopKSelector` は
         // `kernel.rs::CpuScalarProvider` と共通の選出規約（スコア降順・同点 id
@@ -125,21 +195,38 @@ fn thread_count_for(row_count: usize) -> usize {
     available.min(by_rows).max(1)
 }
 
-/// 行範囲 `[0, ids.len())`（呼び出し元が担当範囲に絞り込み済み）に対して総当たり
-/// Top-k を選出する。単一スレッド経路・並列ワーカーの両方から呼ばれる共通処理。
-fn search_range(ids: &[u64], vectors: &[f32], dim: usize, query: &[f32], k: usize) -> TopKSelector {
+/// `ids`（担当範囲だけに絞り込み済み）と `vectors`（絞り込まず全行分。`row_offset` を
+/// 起点とする絶対行インデックスで参照する）に対して総当たり Top-k を選出する。
+/// 単一スレッド経路・並列ワーカーの両方から呼ばれる共通処理。
+///
+/// `vectors` を担当範囲で事前に切り出さず絶対インデックスで参照するのは、`get()` に
+/// よる境界チェックを行単位で行うためで、`kernel.rs::CpuScalarProvider::search`
+/// （行単位で `vectors.get(start..end)` を試し、失敗した 1 行だけを skip する）と
+/// 挙動を完全に一致させる（Issue #34 レビュー指摘対応。以前は担当範囲全体を
+/// 事前に切り出しており、範囲内の 1 行でも `vectors` が不足しているとパーティション
+/// 全体が消えて `CpuScalarProvider` と選出結果が食い違うバグがあった）。
+fn search_range(
+    ids: &[u64],
+    vectors: &[f32],
+    row_offset: usize,
+    dim: usize,
+    query: &[f32],
+    k: usize,
+) -> TopKSelector {
     let mut selector = TopKSelector::new(k);
     for (idx, &id) in ids.iter().enumerate() {
-        let start = idx.saturating_mul(dim);
+        let row = row_offset.saturating_add(idx);
+        let start = row.saturating_mul(dim);
         let end = start.saturating_add(dim);
         let Some(vector) = vectors.get(start..end) else {
             // `kernel.rs::CpuScalarProvider::search` と同じ理由（アリーナ側の不変条件
-            // 破れに対する fail-closed なスキップ）。
+            // 破れに対して、破損した当該行だけを候補から除外する。呼び出し全体は
+            // `Ok` のまま。厳密な fail-closed ではない点は `kernel.rs` 側のコメント参照）。
             continue;
         };
         let score = dot_vectorized(vector, query);
         if !score.is_finite() {
-            // 格納ベクトルの NaN/Inf 混入に対する fail-closed な除外
+            // 格納ベクトルの NaN/Inf 混入に対する除外
             // （`kernel.rs::CpuScalarProvider::search` と同じ理由）。
             continue;
         }
@@ -320,5 +407,85 @@ mod tests {
     #[test]
     fn provider_is_object_safe() {
         let _boxed: Box<dyn SearchProvider> = Box::new(SimdSearchProvider);
+    }
+
+    #[test]
+    fn search_range_skips_only_the_row_whose_vectors_are_missing() {
+        // Issue #34 レビュー指摘の回帰テスト: 担当範囲内の 1 行だけ `vectors` が
+        // 不足している状況で、パーティション全体ではなく当該行だけが除外されることを
+        // `thread_count_for` の実際のスレッド数に依存せず直接検証する
+        // （`thread_count_for` は CI 環境のコア数に依存するため、マルチスレッド経路が
+        // 必ず選ばれる保証がなく、provider 経由のテストだけでは不十分）。
+        let dim = 2usize;
+        // 3 行分の id・スコアが立つはずだが、`vectors` は 2 行分（4 要素）しかない。
+        // `row_offset` を非 0 にして、絶対インデックス参照になっていることも検証する。
+        let ids = [10u64, 11, 12];
+        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        let query = [1.0f32, 0.0];
+        let row_offset = 5usize;
+
+        let selector = search_range(&ids, &vectors, row_offset, dim, &query, 10);
+        let hits = selector.into_sorted_vec();
+
+        // row_offset=5 のとき、id=10 は絶対行 5（vectors[10..12] は範囲外 → skip）、
+        // id=11 は絶対行 6（範囲外 → skip）、id=12 は絶対行 7（範囲外 → skip）になり
+        // 全て境界外になる。境界内に収まるケースも合わせて検証するため、
+        // row_offset=0 のケースも確認する。
+        assert!(hits.is_empty(), "all rows out of bounds when row_offset=5");
+
+        let selector = search_range(&ids, &vectors, 0, dim, &query, 10);
+        let hits = selector.into_sorted_vec();
+        // 絶対行 0（id=10）→ vectors[0..2]=[1,0] → score 1.0
+        // 絶対行 1（id=11）→ vectors[2..4]=[0,1] → score 0.0
+        // 絶対行 2（id=12）→ vectors[4..6] は範囲外 → skip（パーティション全体ではなく
+        // この 1 行だけが消えることが本テストの主張）
+        assert_eq!(
+            hits,
+            vec![
+                SearchHit { id: 10, score: 1.0 },
+                SearchHit { id: 11, score: 0.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_thread_path_matches_scalar_reference_when_vectors_are_truncated() {
+        // レビューで実機再現された条件（dim=32, n=5000, 末尾 1 行分の vectors を
+        // truncate）を縮小再現し、`SimdSearchProvider`（マルチスレッド経路を強制する
+        // 規模）と `CpuScalarProvider` の選出集合が一致することを確認する。
+        use crate::kernel::CpuScalarProvider;
+
+        let dim = 16usize;
+        let row_count = MIN_ROWS_PER_THREAD * 2 + 3;
+        let mut ids = Vec::with_capacity(row_count);
+        let mut vectors = Vec::with_capacity(row_count * dim);
+        for i in 0..row_count {
+            ids.push(i as u64);
+            for d in 0..dim {
+                vectors.push(((i * dim + d) % 89) as f32 * 0.01 - 0.4);
+            }
+        }
+        // 末尾行 1 行分の vectors を truncate し、`ids.len() * dim != vectors.len()` の
+        // 不変条件破れを再現する。
+        vectors.truncate(vectors.len() - dim / 2);
+        let query: Vec<f32> = (0..dim).map(|d| (d as f32) * 0.05 - 0.3).collect();
+
+        let make_input = || SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: dim as u32,
+            query: &query,
+            k: 20,
+        };
+
+        let simd_hits = SimdSearchProvider.search(make_input()).expect("simd ok");
+        let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
+
+        let simd_ids: Vec<u64> = simd_hits.iter().map(|h| h.id).collect();
+        let scalar_ids: Vec<u64> = scalar_hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            simd_ids, scalar_ids,
+            "SimdSearchProvider と CpuScalarProvider の選出 id 集合が一致すること"
+        );
     }
 }

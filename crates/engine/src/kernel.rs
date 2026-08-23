@@ -33,6 +33,11 @@ pub enum KernelError {
     /// untrusted 入力のため、`total_cmp` の順序に頼らず明示的に拒否する
     /// （coding-rust.md「untrusted 入力の扱い」対応。fail-closed）。
     NonFiniteQuery,
+    /// `simd_search.rs::SimdSearchProvider` の並列ワーカースレッドが panic した。
+    /// 部分結果を欠いたまま `Ok` を返すと該当パーティションの行が黙って選出対象から
+    /// 消える（実質 fail-open）ため、検索全体を失敗として呼び出し元へ伝播させる
+    /// （Issue #34 レビュー指摘対応）。
+    WorkerPanicked,
 }
 
 impl fmt::Display for KernelError {
@@ -43,6 +48,9 @@ impl fmt::Display for KernelError {
                 "kernel query dim mismatch: expected={expected} found={found}"
             ),
             KernelError::NonFiniteQuery => write!(f, "kernel query contains non-finite value"),
+            KernelError::WorkerPanicked => {
+                write!(f, "kernel search worker thread panicked")
+            }
         }
     }
 }
@@ -111,8 +119,11 @@ impl SearchProvider for CpuScalarProvider {
             let end = start.saturating_add(dim);
             let Some(vector) = input.vectors.get(start..end) else {
                 // アリーナ側の不変条件（`vectors.len() == ids.len() * dim`）が破れている。
-                // untrusted 入力由来ではないが、添字アクセスで panic させず黙って
-                // スキップする（fail-closed: 壊れた行を結果に混入させない）。
+                // untrusted 入力由来ではないが、添字アクセスで panic させず該当行だけを
+                // 候補から除外する（呼び出し全体は `Ok` のまま。破損行 1 件を混入させない
+                // という意味では安全側だが、検索全体を拒否するわけではないため厳密な
+                // fail-closed ではない点に注意。共有参照実装として
+                // `simd_search.rs::search_range` と同一の挙動を維持する）。
                 continue;
             };
             let score = dot(vector, input.query);
