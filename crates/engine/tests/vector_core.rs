@@ -520,6 +520,51 @@ fn dim_mismatch_is_rejected_before_scanning_table_rows() {
     );
 }
 
+// レビュー指摘対応（Cursor Bugbot Medium・Issue #32 #137）: 正しい次元だが非有限
+// （NaN・Inf）の要素を含む query も、`dim_mismatch_is_rejected_before_scanning_table_rows`
+// と同じ手法（破損行を仕込んだテーブル）で `VectorArena::build` へ進む前に早期拒否
+// されなければならない。早期拒否が働かず全行走査してしまえば、この破損行のデコードで
+// 別種のエラー（`CoreError::Arena`）になるはずで、期待どおり
+// `CoreError::Kernel(KernelError::NonFiniteQuery)` が返ることは走査が発生しなかった証拠になる。
+#[test]
+fn non_finite_query_is_rejected_before_scanning_table_rows() {
+    let dir = TempDir::new("non-finite-early-reject");
+    let path = dir.db_path();
+    {
+        let core = EngineCore::open(&path).expect("open engine core");
+        core.storage()
+            .create_table(&schema_for("docs", 3))
+            .expect("create table");
+    }
+    {
+        let db = redb::Database::create(&path).expect("reopen raw database");
+        let write_txn = db.begin_write().expect("begin write txn");
+        {
+            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                redb::TableDefinition::new("user_rows/docs");
+            let mut table = write_txn.open_table(row_table_def).expect("open row table");
+            // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列
+            // （`get_row_surfaces_data_corruption_distinctly_from_not_found` と同手法）。
+            table
+                .insert(1u64, &[1u8][..])
+                .expect("insert malformed row");
+        }
+        write_txn.commit().expect("commit malformed row");
+    }
+
+    let core = EngineCore::open(&path).expect("reopen engine core");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // schema の次元（3）とは一致するが NaN を含むクエリを渡す。
+    let err = core
+        .search(&ctx, "docs", &[1.0, f32::NAN, 0.0], 1)
+        .expect_err("non-finite query must be rejected");
+    assert!(
+        matches!(err, CoreError::Kernel(KernelError::NonFiniteQuery)),
+        "expected early NonFiniteQuery rejection (proving the malformed row was never scanned), got: {err}"
+    );
+}
+
 // レビュー指摘対応（Medium 2・Issue #32）: `search`・`get_row` はいずれもテーブル不存在を
 // `CoreError::NotFound` へ丸め込み、他テナントの存在情報を漏らさない契約で統一する
 // （security.md「アクセス制御の不備」）。

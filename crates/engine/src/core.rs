@@ -194,8 +194,18 @@ impl VectorCore for EngineCore {
                 found: query.len(),
             }));
         }
+        // 次元検証と同じ理由で、非有限（NaN・Inf）query も `VectorArena::build` へ進む前に
+        // 早期拒否する（Cursor Bugbot Medium 指摘・Issue #32 #137）。`query` は wire 経路
+        // からの untrusted 入力であり得るため、正しい次元であっても
+        // `kernel.rs::CpuScalarProvider::search` 側の検証（`KernelError::NonFiniteQuery`）
+        // だけに委ねると、次元一致・値だけ不正なクエリで同種のリソース増幅（全行デコード後に
+        // 拒否）が残る。ここでの早期拒否はエラー契約を変えず、`kernel.rs` が返すのと同じ
+        // `KernelError::NonFiniteQuery` を用いる。
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(CoreError::Kernel(KernelError::NonFiniteQuery));
+        }
 
-        // 次元検証を通過した後にのみアリーナを構築する。ここでの `TableNotFound` は
+        // 次元・有限性検証を通過した後にのみアリーナを構築する。ここでの `TableNotFound` は
         // 上記の早期照会と同一スナップショットではない（別トランザクション）ため、
         // 直前の照会成立後にテーブルが削除された場合の理論的な競合窓のみで発生しうる。
         // その場合も同様に存在情報を漏らさず `NotFound` へ丸め込む。
