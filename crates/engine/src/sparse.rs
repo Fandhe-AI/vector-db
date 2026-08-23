@@ -22,18 +22,23 @@
 //! （`k1 = 1.2`, `b = 0.75`）を用いる。
 //!
 //! トークナイザ（[`tokenize`]）は ASCII 英数字・アンダースコアの連続を単語トークンとし、
-//! CJK（ひらがな・カタカナ・CJK 統合漢字）はユニグラム＋文字バイグラムを生成する
-//! （小文字化した上で処理）。**対応範囲外の文字（全角英数字・アクセント付きラテン文字・
-//! ハングル・半角カタカナ等）は無音で破棄される**（トークンに含まれない、または単語の
-//! 途中で欠落したまま結合される）。この正規化（NFKC 等）による対応範囲拡張は TASK-105 の
-//! 管轄のため、この境界を差し替え可能な関数単位（[`tokenize`]）で切り出しておく。
+//! CJK（ひらがな・カタカナ・CJK 統合漢字。カタカナ側は記号の `・`（U+30FB）・
+//! 長音符 `ー`（U+30FC）も含むレンジ判定のため取り込まれる）はユニグラム＋文字バイグラムを
+//! 生成する（小文字化した上で処理）。**対応範囲外の文字（全角英数字・アクセント付きラテン
+//! 文字・ハングル・半角カタカナ等）は無音で破棄される**。ASCII 単語の途中に出現した場合は
+//! その文字が欠落するだけでなく、**そこで単語が分割される**（前後が結合されるのではない。
+//! 例: `"cafés"` → `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・
+//! `doc_freq`・`doc_len` の統計を汚染しうる。この正規化（NFKC 等）による対応範囲拡張は
+//! TASK-105 の管轄のため、この境界を差し替え可能な関数単位（[`tokenize`]）で切り出しておく。
 //!
 //! [`SparseIndex::search`] は現時点で文書集合への線形走査（`O(コーパス文書数)`）で実装する。
 //! 性能要件（インデックス構造化・枝刈り等）は TASK-103/104 での検証時に見直す。
 //!
 //! untrusted 入力の扱い: 将来 wire 経由のクエリ文字列が本モジュールへ渡る前提のため、
-//! すべての処理を入力長に対して線形に保ち（バイグラム生成含む）、`Vec::with_capacity` は
-//! 検証済みの文字数からのみ確保する。頻度・長さの演算はすべて `checked_*`/`saturating_*`
+//! すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。`Vec::with_capacity` は
+//! 入力を `chars()` で数えた実際の文字数からのみ見積もり、それ以外の根拠（定数上限等）を
+//! 用いない（ただし本モジュール自体は入力長の上限検証を行わない。呼び出し側の契約に委ねる
+//! 点は次段落のとおり）。頻度・長さの演算はすべて `checked_*`/`saturating_*`
 //! を用い、オーバーフローを未定義動作にしない。呼び出し側はクエリ・文書の各トークン数を
 //! 妥当な範囲に収める契約とする（本モジュールは上限を強制しないが、線形処理のため
 //! 入力長に比例した処理時間のみを要求する）。本モジュールは現時点で storage/catalog/
@@ -101,11 +106,13 @@ fn is_ascii_word_char(c: char) -> bool {
 
 /// 小文字化した 1 文字が CJK（ひらがな・カタカナ・CJK 統合漢字）かどうか。
 /// `char` の範囲判定のみで実装し、外部の正規表現・Unicode データクレートに依存しない
-/// （`.claude/rules/dependency-policy.md`: 依存最小方針）。
+/// （`.claude/rules/dependency-policy.md`: 依存最小方針）。カタカナのレンジ
+/// （U+30A0..=U+30FF）は文字単位の判定のため、仮名以外の記号（中黒 `・` U+30FB・
+/// 長音符 `ー` U+30FC）も含めて CJK 扱いになる（意図的な仕様。除外はしない）。
 fn is_cjk_char(c: char) -> bool {
     matches!(c,
         '\u{3040}'..='\u{309F}' // ひらがな
-        | '\u{30A0}'..='\u{30FF}' // カタカナ
+        | '\u{30A0}'..='\u{30FF}' // カタカナ（記号の「・」「ー」を含むレンジ）
         | '\u{4E00}'..='\u{9FFF}' // CJK 統合漢字
     )
 }
@@ -122,8 +129,10 @@ fn is_cjk_char(c: char) -> bool {
 ///
 /// 対応範囲は ASCII 単語文字と CJK（ひらがな・カタカナ・CJK 統合漢字）に限る。それ以外の
 /// 文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ等）は無音で破棄され、
-/// ASCII 単語の途中に出現した場合はその文字だけが欠落したまま前後が結合される
-/// （例: `"café"` → `["caf"]`）。対応範囲の拡張は TASK-105 の管轄とする。
+/// ASCII 単語の途中に出現した場合はその文字が欠落するだけでなく**その位置で単語が
+/// 分割される**（前後が 1 トークンへ結合されるのではない。例: `"cafés"` →
+/// `["caf", "s"]`）。この分割で生じる偽トークンは統計（`term_freq`・`doc_freq`・
+/// `doc_len`）を汚染しうる。対応範囲の拡張は TASK-105 の管轄とする。
 pub fn tokenize(text: &str) -> Vec<String> {
     let lower: Vec<char> = text.to_lowercase().chars().collect();
     // ASCII 単語 + CJK ユニグラム/バイグラムを見積もった容量（過小でも Vec は伸長するため
@@ -166,6 +175,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// 1 文書分の統計（トークン頻度・文書長）。
 #[derive(Debug)]
 struct DocEntry {
+    /// この統計が属する文書の ID（呼び出し側が割り当てた ID をそのまま保持する）。
     doc_id: DocId,
     /// トークン → 出現回数。イテレーション順が出力に影響しないよう `BTreeMap` を用いる
     /// （決定性確保。`HashMap` はイテレーション順が不定なため使わない）。
@@ -181,12 +191,15 @@ struct DocEntry {
 /// （TASK-103 の RRF 融合から呼ばれる想定の純関数的コンポーネント）。
 #[derive(Debug)]
 pub struct SparseIndex {
+    /// BM25 の項飽和度パラメータ（構築時に有限値かつ `>= 0.0` を検証済み）。
     k1: f64,
+    /// BM25 の文書長正規化パラメータ（構築時に有限値かつ `[0.0, 1.0]` を検証済み）。
     b: f64,
     /// コーパス内の文書数（`N`）。
     doc_count: u32,
     /// 平均文書長（`avgdl`）。
     avg_doc_len: f64,
+    /// 文書ごとの統計（構築時の入力順を保持。`search()` はこの順に線形走査する）。
     docs: Vec<DocEntry>,
     /// トークン → 出現文書数（`df`）。`BTreeMap` で決定的な走査順を保つ。
     doc_freq: BTreeMap<String, u32>,
@@ -291,12 +304,20 @@ impl SparseIndex {
                 let Some(&f) = doc.term_freq.get(term) else {
                     continue;
                 };
+                // `term` はこの `doc` の `term_freq` に存在する（`f` を得た時点の前提）ため、
+                // build() 側で同じ `term` が必ず `doc_freq` にも計上済みであり、`df >= 1` が
+                // 保証される。`unwrap_or(&0)` は `doc_freq` の型契約を壊さないための防御的
+                // フォールバックであり、この呼び出し経路では実質到達しない。
                 let df = *self.doc_freq.get(term).unwrap_or(&0);
                 let idf = self.idf(df);
                 let numerator = f64::from(f) * (self.k1 + 1.0);
                 let len_norm = 1.0 - self.b
                     + self.b * (f64::from(doc.doc_len) / self.avg_doc_len.max(f64::MIN_POSITIVE));
                 let denominator = f64::from(f) + self.k1 * len_norm;
+                // `f >= 1`（`term_freq` にヒットした時点で出現回数は 1 以上）かつ `k1 >= 0`・
+                // `len_norm >= 0`（`b` は `[0.0, 1.0]` に検証済みのため）であり、
+                // `denominator = f + k1 * len_norm >= f >= 1.0` となる。よってこのガードは
+                // 実質到達しない（0 以下になる入力の組み合わせは構築時に拒否済み）。
                 if denominator > 0.0 {
                     score += idf * (numerator / denominator);
                 }
@@ -368,10 +389,18 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_accented_latin_is_silently_truncated() {
-        // アクセント付きラテン文字（'é'）は対応範囲外のため欠落し、前後の ASCII 部分のみが
-        // 結合されたトークンとして残る。
+    fn tokenize_accented_latin_is_silently_dropped() {
+        // アクセント付きラテン文字（'é'）は対応範囲外のため欠落する。単語末尾のケースだけ
+        // では「分割」と「結合」の挙動を区別できないため、区別可能なケースは
+        // tokenize_accented_latin_mid_word_splits_the_word で pin する。
         assert_eq!(tokenize("café"), vec!["caf"]);
+    }
+
+    #[test]
+    fn tokenize_accented_latin_mid_word_splits_the_word() {
+        // アクセント付きラテン文字が単語の途中に出現すると、その文字が欠落するだけでなく
+        // その位置で単語が分割される（前後の ASCII 部分が結合されるのではない）。
+        assert_eq!(tokenize("cafés"), vec!["caf", "s"]);
     }
 
     #[test]
@@ -489,8 +518,12 @@ mod tests {
     #[test]
     fn build_with_all_symbol_only_documents_does_not_panic() {
         // 全文書がトークン化結果ゼロ（記号のみ）のコーパスは EmptyCorpus ではなく正常に
-        // 構築でき、検索も NaN・panic なく決定的に空を返す（avg_doc_len == 0.0 の経路を
-        // 実際に踏む唯一のケース）。
+        // 構築でき、`avg_doc_len` は 0 除算なく 0.0 になる。ただし全文書の `term_freq` が
+        // 空のため、search() 内でどのクエリ語も `doc.term_freq.get(term)` にヒットせず、
+        // avg_doc_len を参照する `len_norm` の計算（0 除算ガード `max(f64::MIN_POSITIVE)`
+        // 含む）自体は実行されない。ここで確認するのは「avg_doc_len == 0.0 のまま
+        // 構築・検索が NaN・panic なく決定的に空を返す」ことであり、search() 内のゼロ割
+        // ガード行そのものの実行はカバーしない。
         let docs = vec![(1u64, "!!!"), (2u64, "???")];
         let idx = SparseIndex::build(&docs).unwrap();
         assert!(idx.search("alpha", 10).is_empty());
