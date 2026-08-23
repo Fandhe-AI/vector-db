@@ -3,7 +3,8 @@
 //! `wire-server`（pg wire v3）や他の将来プロトコル実装は、本モジュールが定義する
 //! [`VectorCore`] trait のみに依存する。コア API の変更なしにプロトコル実装を
 //! 追加・変更できることを構造で担保する（trait は object-safe。シグネチャ安定性の
-//! CI 機械チェックは TASK-125 の範囲）。
+//! CI 機械チェックは TASK-125 で導入済み。チェック実体は
+//! `scripts/check_core_api.sh` と `tests/core_api_stability.rs`）。
 //!
 //! [`EngineCore`] が製品実装で、`storage.rs`（永続化）・`catalog.rs`（スキーマ）・
 //! `arena.rs`（検索対象のカラムナビュー構築）・`kernel.rs`（実行バックエンド provider）・
