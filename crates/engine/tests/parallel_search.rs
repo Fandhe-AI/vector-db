@@ -1,7 +1,7 @@
-//! `simd_search.rs::SimdSearchProvider` の結合テスト（TASK-126・対象ビヘイビア:
+//! `parallel_search.rs::ParallelSearchProvider` の結合テスト（TASK-126・対象ビヘイビア:
 //! CORE-3, CORE-4, CORE-5・SEARCH-4）。
 //!
-//! 両 provider（`CpuScalarProvider`・`SimdSearchProvider`）とも総当たり実装かつ内積計算
+//! 両 provider（`CpuScalarProvider`・`ParallelSearchProvider`）とも総当たり実装かつ内積計算
 //! （`kernel.rs::dot`）を共有するため、決定的シードの合成データに対して Top-k 選出
 //! 集合・順序・スコア値が dim・並列度に関わらず bit 単位で完全一致することを検証する
 //! （近似検索ではなく、参照実装との等価性そのものを主張する。Issue #34 codex-review P1
@@ -9,10 +9,10 @@
 //! 丸め誤差により一致が崩れ得た）。
 //!
 //! `EngineCore` 経由の CORE-1/2/13 回帰は `tests/vector_core.rs` が既定構成
-//! （`SimdSearchProvider`）でそのまま担保する（本ファイルは provider 単体の契約検証）。
+//! （`ParallelSearchProvider`）でそのまま担保する（本ファイルは provider 単体の契約検証）。
 
 use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
-use engine::simd_search::SimdSearchProvider;
+use engine::parallel_search::ParallelSearchProvider;
 
 /// テスト専用の決定的シード xorshift64*（`benches/harness/rng.rs` と同系だが、
 /// 結合テストは bench クレートに依存しないため個別に持つ）。
@@ -77,7 +77,7 @@ fn assert_top_k_matches(ids: &[u64], vectors: &[f32], dim: u32, query: &[f32], k
         k,
     };
     let scalar = CpuScalarProvider.search(scalar_input).expect("scalar ok");
-    let simd = SimdSearchProvider.search(simd_input).expect("simd ok");
+    let simd = ParallelSearchProvider.search(simd_input).expect("simd ok");
     assert_eq!(
         scalar, simd,
         "top-k (ids/order/scores) must match bit-for-bit"
@@ -134,7 +134,7 @@ fn matches_scalar_reference_with_duplicate_vectors_tie() {
         k,
     };
     let scalar = CpuScalarProvider.search(scalar_input).expect("scalar ok");
-    let simd = SimdSearchProvider.search(simd_input).expect("simd ok");
+    let simd = ParallelSearchProvider.search(simd_input).expect("simd ok");
     assert_eq!(scalar, simd);
     // 同点タイブレークで id 昇順の最小 k 件（0,1,2）が選ばれるはず。
     let selected_ids: Vec<u64> = simd.iter().map(|h| h.id).collect();
@@ -170,7 +170,7 @@ fn matches_scalar_reference_with_non_finite_rows_mixed_in() {
         k: 3,
     };
     let scalar = CpuScalarProvider.search(scalar_input).expect("scalar ok");
-    let simd = SimdSearchProvider.search(simd_input).expect("simd ok");
+    let simd = ParallelSearchProvider.search(simd_input).expect("simd ok");
     assert_eq!(scalar, simd);
     assert_eq!(
         simd,
@@ -184,7 +184,7 @@ fn matches_scalar_reference_with_non_finite_rows_mixed_in() {
 
 #[test]
 fn multi_thread_path_matches_scalar_reference_at_scale() {
-    // `simd_search.rs::MIN_ROWS_PER_THREAD` を超える規模でマルチスレッド経路を
+    // `parallel_search.rs::MIN_ROWS_PER_THREAD` を超える規模でマルチスレッド経路を
     // 実際に使わせたうえで、スカラー参照実装と一致することを確認する（CORE-3・SEARCH-4）。
     let dim = 32usize;
     let n = 5000;
@@ -208,7 +208,7 @@ fn error_contract_matches_scalar_reference() {
             k: 1,
         })
         .unwrap_err();
-    let simd_err = SimdSearchProvider
+    let simd_err = ParallelSearchProvider
         .search(SearchInput {
             ids: &ids,
             vectors: &vectors,
@@ -237,7 +237,7 @@ fn error_contract_matches_scalar_reference() {
             k: 1,
         })
         .unwrap_err();
-    let simd_err = SimdSearchProvider
+    let simd_err = ParallelSearchProvider
         .search(SearchInput {
             ids: &ids,
             vectors: &vectors,
@@ -262,7 +262,7 @@ fn error_contract_matches_scalar_reference() {
             k: 5,
         })
         .expect("scalar ok");
-    let simd_hits = SimdSearchProvider
+    let simd_hits = ParallelSearchProvider
         .search(SearchInput {
             ids: &empty_ids,
             vectors: &empty_vectors,
@@ -274,7 +274,7 @@ fn error_contract_matches_scalar_reference() {
     assert!(scalar_hits.is_empty());
     assert!(simd_hits.is_empty());
 
-    let simd_k0 = SimdSearchProvider
+    let simd_k0 = ParallelSearchProvider
         .search(SearchInput {
             ids: &ids,
             vectors: &vectors,

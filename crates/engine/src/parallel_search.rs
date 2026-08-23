@@ -1,5 +1,6 @@
-//! ベクトル化＋マルチスレッド並列の総当たり Top-k 検索 provider（TASK-126・対象
-//! ビヘイビア: CORE-3, CORE-4, CORE-5・SEARCH-4）。
+//! マルチスレッド並列の総当たり Top-k 検索 provider（TASK-126・対象
+//! ビヘイビア: CORE-3, CORE-4, CORE-5・SEARCH-4）。本 provider が担うのは行範囲分割に
+//! よる並列化のみで、ベクトル化（SIMD）演算は行わない（下記の経緯参照）。
 //!
 //! `core.rs` の [`crate::core::EngineCore::open`] から `kernel.rs::SearchProvider` の
 //! 既定実装として注入される（`core.rs` が可視行のみに縮約した
@@ -21,7 +22,7 @@
 //! 共有する `AtomicUsize`）で調停する（Issue #34 レビュー指摘対応。security.md
 //! 「不安全な設計｜無制限リソース確保（DoS）」）。予算を確保できない分は
 //! スレッドを追加せず単一スレッド相当まで縮退させるのみで、行の選出対象からの除外は
-//! 一切発生しない（[`SimdSearchProvider::search`] 参照）。
+//! 一切発生しない（[`ParallelSearchProvider::search`] 参照）。
 
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider, TopKSelector};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,16 +73,17 @@ impl Drop for WorkerBudgetGuard {
 /// 単一スレッドへ縮退」という設計判断に対応）。
 const MIN_ROWS_PER_THREAD: usize = 1024;
 
-/// マルチスレッド並列の総当たり Top-k provider（TASK-126）。
+/// マルチスレッド並列の総当たり Top-k provider（TASK-126）。行範囲分割による
+/// 並列化のみを行い、ベクトル化（SIMD）演算は実装しない（モジュール冒頭コメント参照）。
 ///
 /// 総当たり（exhaustive）である点は [`crate::kernel::CpuScalarProvider`] と同じで、
 /// 近似検索ではない。内積計算は `kernel.rs::dot` を共有するため、選出される Top-k
 /// 集合・順序（同点タイブレーク含む）はスコア値も含めてスカラー参照実装と bit 単位で
-/// 一致する（`crates/engine/tests/simd_search.rs` で検証）。
+/// 一致する（`crates/engine/tests/parallel_search.rs` で検証）。
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SimdSearchProvider;
+pub struct ParallelSearchProvider;
 
-impl SearchProvider for SimdSearchProvider {
+impl SearchProvider for ParallelSearchProvider {
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
         let dim = input.dim as usize;
         if input.query.len() != dim {
@@ -173,16 +175,8 @@ impl SearchProvider for SimdSearchProvider {
                         }));
                         row_start = row_end;
                     }
-                    handles
-                        .into_iter()
-                        .map(|h| h.join())
-                        .collect::<Result<Vec<TopKSelector>, _>>()
-                })
-                // ワーカーが panic した場合、その分の部分結果を欠いたまま `Ok` を返すと
-                // 該当パーティションの行が黙って選出対象から消える（実質 fail-open。
-                // Issue #34 レビュー指摘対応）。検索全体を失敗として呼び出し元へ伝播させる
-                // （fail-closed。`KernelError::WorkerPanicked`）。
-                .map_err(|_| KernelError::WorkerPanicked)?
+                    join_all_or_panicked(handles)
+                })?
             };
 
         // 部分結果を最終セレクタへ再投入してマージする。`TopKSelector` は
@@ -197,6 +191,34 @@ impl SearchProvider for SimdSearchProvider {
         }
         Ok(merged.into_sorted_vec())
     }
+}
+
+/// `std::thread::scope` 配下で spawn した全ハンドルを必ず `join()` してから結果をまとめる。
+/// [`ParallelSearchProvider::search`] の並列経路から呼ばれる。
+///
+/// `collect::<Result<_, _>>()` を直接使うと最初の `Err`（panic）で早期リターンし、
+/// 残りのハンドルが `join()` されないまま関数を抜ける。`std::thread::scope` は
+/// 未 `join` のハンドルが残っているとスコープ終了時に自らそのハンドルを `join()` し、
+/// それが panic であれば `scope` 自体が再 panic する。その場合
+/// `KernelError::WorkerPanicked` へのマッピング（fail-closed）に到達せず、呼び出し元まで
+/// panic が伝播してしまう（Cursor Bugbot 指摘対応）。本関数は先に全ハンドルを `join()` し
+/// 尽くしてから判定することでこれを避ける。
+fn join_all_or_panicked(
+    handles: Vec<std::thread::ScopedJoinHandle<'_, TopKSelector>>,
+) -> Result<Vec<TopKSelector>, KernelError> {
+    let join_results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+    let mut partials = Vec::with_capacity(join_results.len());
+    let mut any_panicked = false;
+    for result in join_results {
+        match result {
+            Ok(partial) => partials.push(partial),
+            Err(_) => any_panicked = true,
+        }
+    }
+    if any_panicked {
+        return Err(KernelError::WorkerPanicked);
+    }
+    Ok(partials)
 }
 
 /// 利用可能な並列度を [`MAX_THREADS_PER_QUERY`] でクランプし、担当行数が
@@ -266,7 +288,7 @@ mod tests {
             query: &query,
             k: 2,
         };
-        let hits = SimdSearchProvider.search(input).expect("search ok");
+        let hits = ParallelSearchProvider.search(input).expect("search ok");
         assert_eq!(
             hits,
             vec![
@@ -292,7 +314,7 @@ mod tests {
                 query: &query,
                 k: 1,
             };
-            let err = SimdSearchProvider.search(input).unwrap_err();
+            let err = ParallelSearchProvider.search(input).unwrap_err();
             assert_eq!(err, KernelError::NonFiniteQuery, "query={query:?}");
         }
     }
@@ -309,7 +331,7 @@ mod tests {
             query: &query,
             k: 1,
         };
-        let err = SimdSearchProvider.search(input).unwrap_err();
+        let err = ParallelSearchProvider.search(input).unwrap_err();
         assert_eq!(
             err,
             KernelError::DimMismatch {
@@ -331,7 +353,7 @@ mod tests {
             query: &query,
             k: 0,
         };
-        let hits = SimdSearchProvider.search(input).expect("search ok");
+        let hits = ParallelSearchProvider.search(input).expect("search ok");
         assert!(hits.is_empty());
     }
 
@@ -359,7 +381,7 @@ mod tests {
                 query: &query,
                 k: 20,
             };
-            SimdSearchProvider.search(input).expect("search ok")
+            ParallelSearchProvider.search(input).expect("search ok")
         };
         let first = run();
         let second = run();
@@ -370,7 +392,7 @@ mod tests {
     // object-safety の固定（CORE-13）: `Box<dyn SearchProvider>` として保持できること。
     #[test]
     fn provider_is_object_safe() {
-        let _boxed: Box<dyn SearchProvider> = Box::new(SimdSearchProvider);
+        let _boxed: Box<dyn SearchProvider> = Box::new(ParallelSearchProvider);
     }
 
     #[test]
@@ -416,7 +438,7 @@ mod tests {
     #[test]
     fn multi_thread_path_matches_scalar_reference_when_vectors_are_truncated() {
         // レビューで実機再現された条件（dim=32, n=5000, 末尾 1 行分の vectors を
-        // truncate）を縮小再現し、`SimdSearchProvider`（マルチスレッド経路を強制する
+        // truncate）を縮小再現し、`ParallelSearchProvider`（マルチスレッド経路を強制する
         // 規模）と `CpuScalarProvider` の選出集合が一致することを確認する。
         use crate::kernel::CpuScalarProvider;
 
@@ -443,7 +465,9 @@ mod tests {
             k: 20,
         };
 
-        let simd_hits = SimdSearchProvider.search(make_input()).expect("simd ok");
+        let simd_hits = ParallelSearchProvider
+            .search(make_input())
+            .expect("simd ok");
         let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
 
         // `dot` を共有するため id・score とも bit 単位で一致するはず（Issue #34
@@ -451,7 +475,7 @@ mod tests {
         // 分岐し、値の一致は保証できなかった）。
         assert_eq!(
             simd_hits, scalar_hits,
-            "SimdSearchProvider と CpuScalarProvider の選出 id・score が一致すること"
+            "ParallelSearchProvider と CpuScalarProvider の選出 id・score が一致すること"
         );
     }
 
@@ -459,7 +483,7 @@ mod tests {
     fn multi_thread_path_matches_scalar_reference_for_near_tie_scores_at_dim_ge_16() {
         // codex-review P1 指摘の回帰テスト: `dim >= 16` かつマルチスレッド経路
         // （`MIN_ROWS_PER_THREAD` を超える規模）で、複数行がほぼ同一スコア（僅差）に
-        // なるよう意図的に作った入力に対しても、`SimdSearchProvider` と
+        // なるよう意図的に作った入力に対しても、`ParallelSearchProvider` と
         // `CpuScalarProvider` の Top-k が完全一致することを確認する。以前の自前
         // ベクトル化（複数アキュムレータでの並び替え加算）は、この種の僅差入力で
         // 丸め誤差により集合・順序がスカラー参照実装と食い違い得た。
@@ -490,43 +514,52 @@ mod tests {
             k: 10,
         };
 
-        let simd_hits = SimdSearchProvider.search(make_input()).expect("simd ok");
+        let simd_hits = ParallelSearchProvider
+            .search(make_input())
+            .expect("simd ok");
         let scalar_hits = CpuScalarProvider.search(make_input()).expect("scalar ok");
 
         assert_eq!(
             simd_hits, scalar_hits,
-            "僅差スコアの Top-k 境界でも SimdSearchProvider と CpuScalarProvider の \
+            "僅差スコアの Top-k 境界でも ParallelSearchProvider と CpuScalarProvider の \
              選出 id・順序・score が一致すること"
         );
     }
 
     #[test]
     fn scoped_worker_panic_is_mapped_to_worker_panicked_error_without_repanicking() {
-        // Issue #34 レビュー指摘の回帰テスト: `search()` のワーカー panic 処理が
-        // 使う「各ハンドルを必ず `join()` してから `collect::<Result<_, _>>()` する」
-        // パターンが実際に `KernelError::WorkerPanicked` へマップされ、
-        // `std::thread::scope` 自体が（`join()` されなかった場合のように）
-        // 再 panic しないことを検証する（`std::thread::scope` は panic した
-        // スレッドが 1 つでも `join()` されずに残っていた場合のみ、スコープ終了時に
-        // 自ら panic する。全ハンドルを `join()` 済みならその再 panic は起きない）。
+        // Cursor Bugbot 指摘の回帰テスト: `search()` の並列経路が使う
+        // `join_all_or_panicked` を直接検証する（`search()` 本体と同一の関数を通すため、
+        // 手書きの複製がドリフトして検知漏れになる余地がない）。
+        //
+        // 意図的にパニックするハンドルを 2 つ、先頭と末尾に置く。`collect::<Result<_,
+        // _>>()` を素朴に使う旧実装だと、先頭ハンドルの `join()` で最初の `Err` を
+        // 受け取った時点で早期リターンし、末尾のパニックするハンドルは一度も `join()`
+        // されない。`std::thread::scope` は未 `join` のハンドルが残っているとスコープ
+        // 終了時に自らそれを `join()` し、それも panic していればスコープ自身が
+        // 再 panic する（`KernelError::WorkerPanicked` へのマッピングに到達する前に
+        // panic が呼び出し元まで伝播してしまう。中間に正常終了するハンドルだけでは
+        // 未 `join` のまま残っても再 panic せずこのバグを見逃すため、末尾も必ず
+        // パニックさせる）。`join_all_or_panicked` は全ハンドルを先に `join()` し
+        // 尽くしてから判定するため、この再 panic が起きないことを以下で確認する。
         //
         // パニックメッセージが標準の panic hook 経由でテスト出力に出るのを避けるため、
-        // 一時的に無音の hook へ差し替える（`search()` 本体のワーカー panic 経路と
-        // 同一の join → collect → map_err の並びを、`SearchInput` を組み立てずに
-        // 直接検証する）。
+        // 一時的に無音の hook へ差し替える。
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let result: Result<Vec<i32>, KernelError> = std::thread::scope(|scope| {
-            let ok_handle = scope.spawn(|| 1i32);
-            let panicking_handle = scope.spawn(|| -> i32 { panic!("induced for test") });
-            vec![ok_handle, panicking_handle]
-                .into_iter()
-                .map(|h| h.join())
-                .collect::<Result<Vec<i32>, _>>()
-        })
-        .map_err(|_| KernelError::WorkerPanicked);
+        let result = std::thread::scope(|scope| {
+            let panicking_handle_a =
+                scope.spawn(|| -> TopKSelector { panic!("induced for test (first)") });
+            let ok_handle = scope.spawn(|| TopKSelector::new(1));
+            let panicking_handle_b =
+                scope.spawn(|| -> TopKSelector { panic!("induced for test (last)") });
+            join_all_or_panicked(vec![panicking_handle_a, ok_handle, panicking_handle_b])
+        });
         std::panic::set_hook(previous_hook);
 
-        assert_eq!(result, Err(KernelError::WorkerPanicked));
+        // `TopKSelector` は `PartialEq` を実装しないため `Ok` 側の値比較はできないが、
+        // `Err` 変種であることの確認だけで本テストの目的（fail-closed マッピングと
+        // 再 panic なし）には十分。
+        assert!(matches!(result, Err(KernelError::WorkerPanicked)));
     }
 }

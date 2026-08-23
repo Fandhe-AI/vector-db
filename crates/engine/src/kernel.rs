@@ -1,10 +1,10 @@
 //! 検索カーネルの実行バックエンド provider 層（TASK-124・対象ビヘイビア: CORE-13）。
 //!
-//! `core.rs` の [`crate::core::EngineCore`] は具象バックエンド型（CPU-SIMD・GPU・将来
+//! `core.rs` の [`crate::core::EngineCore`] は具象バックエンド型（CPU 並列・GPU・将来
 //! ANN）へ直接依存せず、本モジュールが定義する object-safe な [`SearchProvider`] trait
 //! 経由で実行バックエンドを注入される。本モジュールはスカラー参照実装
 //! [`CpuScalarProvider`] と、Top-k 選出の共通ヘルパ [`TopKSelector`] を提供する。
-//! `TopKSelector` は `crates/engine/src/simd_search.rs::SimdSearchProvider`（TASK-126）
+//! `TopKSelector` は `crates/engine/src/parallel_search.rs::ParallelSearchProvider`（TASK-126）
 //! とも共用し、選出規約（スコア降順・同点 id 昇順・非有限値除外）の二重管理を防ぐ。
 //! 既定コンストラクタが実際にどちらの provider を注入するかは `core.rs::EngineCore::open`
 //! を参照。
@@ -33,7 +33,7 @@ pub enum KernelError {
     /// untrusted 入力のため、`total_cmp` の順序に頼らず明示的に拒否する
     /// （coding-rust.md「untrusted 入力の扱い」対応。fail-closed）。
     NonFiniteQuery,
-    /// `simd_search.rs::SimdSearchProvider` の並列ワーカースレッドが panic した。
+    /// `parallel_search.rs::ParallelSearchProvider` の並列ワーカースレッドが panic した。
     /// 部分結果を欠いたまま `Ok` を返すと該当パーティションの行が黙って選出対象から
     /// 消える（実質 fail-open）ため、検索全体を失敗として呼び出し元へ伝播させる
     /// （Issue #34 レビュー指摘対応）。
@@ -90,7 +90,7 @@ pub trait SearchProvider: Send + Sync {
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
 /// による部分ソート）。単一スレッド・スカラー演算のみで、ベクトル化・並列化された
-/// [`crate::simd_search::SimdSearchProvider`]（TASK-126）の正解値検証用の参照実装も兼ねる。
+/// [`crate::parallel_search::ParallelSearchProvider`]（TASK-126）の正解値検証用の参照実装も兼ねる。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuScalarProvider;
 
@@ -123,7 +123,7 @@ impl SearchProvider for CpuScalarProvider {
                 // 候補から除外する（呼び出し全体は `Ok` のまま。破損行 1 件を混入させない
                 // という意味では安全側だが、検索全体を拒否するわけではないため厳密な
                 // fail-closed ではない点に注意。共有参照実装として
-                // `simd_search.rs::search_range` と同一の挙動を維持する）。
+                // `parallel_search.rs::search_range` と同一の挙動を維持する）。
                 continue;
             };
             let score = dot(vector, input.query);
@@ -142,8 +142,8 @@ impl SearchProvider for CpuScalarProvider {
 
 /// 内積（dot product）のスカラー参照実装（左から右への逐次和）。
 ///
-/// `simd_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
-/// 指摘対応: 加算順序を分岐させると `SimdSearchProvider` と本 provider の Top-k
+/// `parallel_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
+/// 指摘対応: 加算順序を分岐させると `ParallelSearchProvider` と本 provider の Top-k
 /// 集合・順序が丸め誤差で食い違い得るため、`pub(crate)` にして共有し、
 /// 単一の加算順序であることを構造的に保証する）。
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
@@ -179,7 +179,7 @@ impl Ord for MinHeapItem {
 /// Top-k 選出の共通ヘルパ（対象ビヘイビア: CORE-4）。スコア最小のヒープを保持し、
 /// サイズ `k` を超えたら最小要素を捨てる方式（事前に全件確保しない・`O(n log k)`）。
 ///
-/// [`CpuScalarProvider`]（本ファイル）と `simd_search.rs::SimdSearchProvider`
+/// [`CpuScalarProvider`]（本ファイル）と `parallel_search.rs::ParallelSearchProvider`
 /// （TASK-126）の両方から使われる。後者はスレッドごとに本セレクタで部分 Top-k を
 /// 選出したうえで、部分結果を同じセレクタへ再度 push してマージする
 /// （分割数・スレッド数に依らず選出規約が一意に決まる設計。CORE-3・SEARCH-4）。

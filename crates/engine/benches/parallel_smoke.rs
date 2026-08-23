@@ -1,16 +1,17 @@
-//! SIMD 検索カーネル（TASK-126）の p95 手動計測スモーク。対象ビヘイビア: CORE-3・
-//! CORE-5・SEARCH-4（数値基準は spec 参照。本ベンチは手動実行専用の計測入口を
+//! マルチスレッド並列検索カーネル（TASK-126）の p95 手動計測スモーク。対象ビヘイビア:
+//! CORE-3・CORE-5・SEARCH-4（数値基準は spec 参照。本ベンチは手動実行専用の計測入口を
 //! 提供するのみで、数値基準の回帰テスト化・CI 定期実行・対照エンジン比較は
 //! TASK-127 の範囲）。
 //!
-//! `cargo bench --bench simd_smoke -p engine` で手動実行する（`make ci` の対象外。
+//! `cargo bench --bench parallel_smoke -p engine` で手動実行する（`make ci` の対象外。
 //! `Cargo.toml` 側 `harness = false` / `test = false` は `benches/measurement.rs` と
 //! 同一方針。時間依存の測定値を CI アサーションへ混ぜない）。
 //!
-//! 10 万本×768 次元のテーブルを決定的シードで合成し、`SimdSearchProvider`
-//! （`core.rs::EngineCore::open` の既定 provider）へ単発クエリを繰り返し投げて
-//! p95 を計測する。`kernel.rs::SearchProvider` を直接呼び出し、`redb`/アリーナは
-//! 経由しない（provider 単体の計測入口。ストレージ層を含む end-to-end 計測は対象外）。
+//! 10 万本×768 次元のテーブルを決定的シードで合成し、`ParallelSearchProvider`
+//! （`core.rs::EngineCore::open` の既定 provider。ベクトル化は行わず並列化のみ）へ
+//! 単発クエリを繰り返し投げて p95 を計測する。`kernel.rs::SearchProvider` を直接呼び出し、
+//! `redb`/アリーナは経由しない（provider 単体の計測入口。ストレージ層を含む end-to-end
+//! 計測は対象外）。
 
 // `harness` は `benches/measurement.rs` と 2 つの独立したコンパイル単位（cargo bench
 // バイナリ）から取り込まれる共有ソースで、本ファイルは `protocol`・`rng` のみ使う
@@ -24,7 +25,7 @@ use harness::protocol::{run, MeasurementConfig};
 use harness::rng::DeterministicRng;
 
 use engine::kernel::{SearchInput, SearchProvider};
-use engine::simd_search::SimdSearchProvider;
+use engine::parallel_search::ParallelSearchProvider;
 
 const ROW_COUNT: usize = 100_000;
 const DIM: usize = 768;
@@ -39,7 +40,7 @@ fn main() {
     }
     let query = rng.next_vector(DIM);
 
-    let provider = SimdSearchProvider;
+    let provider = ParallelSearchProvider;
     let config = MeasurementConfig::new(20, 50, 1).expect("protocol minimums satisfied");
 
     let measurement = run(&config, || {
@@ -67,7 +68,7 @@ fn main() {
     let p95 = sorted.get(p95_idx).copied().unwrap_or_default();
 
     println!(
-        "simd_search: rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} q1={:?} q3={:?} p95={p95:?} n={}",
+        "parallel_search: rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} q1={:?} q3={:?} p95={p95:?} n={}",
         measurement.summary.median,
         measurement.summary.q1,
         measurement.summary.q3,
