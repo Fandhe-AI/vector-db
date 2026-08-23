@@ -40,3 +40,10 @@ redb = "=4.2.0"
 name = "measurement"
 harness = false
 test = false
+
+[[bench]]
+# TASK-126（SIMD 総当たり検索カーネル）の p95 手動計測入口。measurement 側の
+# harness = false / test = false と同一方針（手動実行専用・make ci 対象外）。
+name = "simd_smoke"
+harness = false
+test = false

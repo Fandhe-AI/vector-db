@@ -31,6 +31,7 @@ pub mod core;
 pub mod kernel;
 pub mod policy;
 pub mod row_codec;
+pub mod simd_search;
 pub mod sparse;
 pub mod storage;
 pub mod txn;
