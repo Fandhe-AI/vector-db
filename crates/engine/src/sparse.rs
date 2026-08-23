@@ -36,7 +36,9 @@
 //! `tokenize()` 内の添字アクセスは事前のループ境界チェックにより範囲内が証明可能
 //! （panic しない）。
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::collections::BinaryHeap;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
 pub type DocId = u64;
@@ -85,6 +87,37 @@ pub struct ScoredDoc {
     pub doc_id: DocId,
     /// BM25 スコア（降順ソート済み。同点は `doc_id` 昇順でタイブレークする）。
     pub score: f64,
+}
+
+/// [`SparseIndex::search`] が Top-k 選出中に走査する 1 件の候補。
+///
+/// `Ord` は最終的な検索結果の順序契約（スコア降順、同点は `doc_id` 昇順）で
+/// 「大きい方が良い」を表すよう実装する。`BinaryHeap<Reverse<Candidate>>` に載せることで
+/// 現在の k 件中「最も悪い」候補を `O(log k)` で特定・入れ替えでき、走査全体を
+/// `O(N log k)` 時間・`O(k)` 追加メモリで完結させる（`N` はコーパスの文書数）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Candidate {
+    score: f64,
+    doc_id: DocId,
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // スコアは `total_cmp` で全順序化する（NaN を含めても panic しない。スコアは
+        // 有限値のみを積むため NaN は理論上生じない）。同点時は `doc_id` が小さいほど
+        // 「良い」（`Ordering::Greater`）とするため、比較対象を入れ替えて逆順にする。
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.doc_id.cmp(&self.doc_id))
+    }
 }
 
 /// 小文字化した 1 文字が ASCII 単語トークンの構成要素かどうか。
@@ -283,7 +316,12 @@ impl SparseIndex {
             unique_terms.insert(t.clone(), ());
         }
 
-        let mut scored: Vec<ScoredDoc> = Vec::with_capacity(self.docs.len());
+        // 現在の Top-k 候補を保持する固定サイズ（最大 k 件）のヒープ。`Reverse` により
+        // `Candidate` の自然順序（大きい方が良い）に対する min-heap として働くため、
+        // `heap.peek()` は常に「保持中で最も悪い」候補を指す。悪い候補から順に入れ替える
+        // ことで、走査全体を全件バッファリング＋全体ソートではなく `O(N log k)` に抑える。
+        let heap_capacity = k.min(self.docs.len());
+        let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
         for doc in &self.docs {
             let mut score = 0.0f64;
             for term in unique_terms.keys() {
@@ -309,17 +347,28 @@ impl SparseIndex {
                 }
             }
             if score > 0.0 {
-                scored.push(ScoredDoc {
-                    doc_id: doc.doc_id,
+                let candidate = Candidate {
                     score,
-                });
+                    doc_id: doc.doc_id,
+                };
+                if heap.len() < k {
+                    heap.push(Reverse(candidate));
+                } else if let Some(Reverse(worst)) = heap.peek() {
+                    if candidate > *worst {
+                        heap.pop();
+                        heap.push(Reverse(candidate));
+                    }
+                }
             }
         }
 
-        // スコア降順、同点は doc_id 昇順（決定的タイブレーク。`total_cmp` は NaN を含めても
-        // panic しない全順序を与える。スコアは有限値のみを積むため NaN は理論上生じない）。
+        // ヒープの走査順は決定的な出力順を保証しないため、最終結果はスコア降順・
+        // 同点は doc_id 昇順で明示的にソートし直す（決定的タイブレーク。再現性確保）。
+        let mut scored: Vec<ScoredDoc> = heap
+            .into_iter()
+            .map(|Reverse(Candidate { score, doc_id })| ScoredDoc { doc_id, score })
+            .collect();
         scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
-        scored.truncate(k);
         scored
     }
 
@@ -453,6 +502,25 @@ mod tests {
         assert!((results[0].score - results[1].score).abs() < 1e-12);
         assert_eq!(results[0].doc_id, 1);
         assert_eq!(results[1].doc_id, 2);
+    }
+
+    #[test]
+    fn search_selection_boundary_prefers_smaller_doc_id_on_tie() {
+        // 4 文書すべてが同スコアになるようにし、k=2（コーパスの半分）で打ち切る。
+        // ヒープによる Top-k 選出でも、同点の切り捨て境界で doc_id が小さい方を
+        // 優先して残すこと（＝出力順のタイブレークだけでなく、選出自体の境界でも
+        // 同じ優先順位が一貫して使われること）を確認する。
+        let docs = vec![
+            (30u64, "alpha beta"),
+            (10u64, "alpha beta"),
+            (40u64, "alpha beta"),
+            (20u64, "alpha beta"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let results = idx.search("alpha", 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 10);
+        assert_eq!(results[1].doc_id, 20);
     }
 
     #[test]
