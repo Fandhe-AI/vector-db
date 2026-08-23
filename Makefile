@@ -174,6 +174,10 @@ else
 	@echo "skip: Cargo.toml 未追加のため crash-test-cross-table をスキップ"
 endif
 
+.PHONY: core-api-check
+core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差分検知（TASK-125・CORE-1。cargo 不要のテキスト比較）
+	scripts/check_core_api.sh
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
@@ -188,7 +192,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-cross-table deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）
