@@ -55,11 +55,14 @@ pub enum CoreError {
     /// 指定行が存在しない、または呼び出し元のテナント・可視性から見えない
     /// （区別しない。fail-closed）。
     NotFound,
-    /// `SearchProvider` が返却した [`SearchHit`] のうち少なくとも 1 件が、コア側で
-    /// 計算した可視行 id 集合（`ctx` の下で可視な、対象テーブル実在行の id 集合）に
-    /// 含まれていなかった。provider 実装が `SearchInput::is_visible` を無視した・
-    /// データセットに存在しない id を捏造した、のいずれの場合も区別せず拒否する
-    /// （fail-closed。他テナントの存在情報を漏らさないよう具体的な id は含めない）。
+    /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約
+    /// （以下のいずれか）を満たさなかった（codex P0/P1・Issue #137 対応。fail-closed）:
+    /// (1) 件数が要求 `k` を超える、(2) コア側で計算した可視行 id 集合に含まれない
+    /// `id` を含む（他テナントの id 捏造・実装バグを含む）、(3) `id` が重複する、
+    /// (4) スコアが非有限（NaN・Inf）、(5) スコア降順・同点は `id` 昇順という順序
+    /// 契約に違反する。違反の種類ごとにエラーを分けると provider 内部の実装詳細が
+    /// 呼び出し元へ漏れかねないため、区別せず本 variant に統一する（他テナントの
+    /// 存在情報も含めない）。
     ProviderResultRejected,
 }
 
@@ -291,12 +294,47 @@ impl VectorCore for EngineCore {
         };
         let hits = self.provider.search(input)?;
 
-        // provider が返した各 hit の id が縮約ビュー（＝可視行）の id 集合に属することを
-        // 確認する。1 件でも逸脱していれば結果を一切返さず fail-closed に拒否する
-        // （部分的なフィルタリングはしない。fail-open を避けるための判断）。
-        let visible_id_set: HashSet<u64> = visible_ids.iter().copied().collect();
-        if hits.iter().any(|hit| !visible_id_set.contains(&hit.id)) {
+        // provider が返した結果が Top-k の契約を満たすことをコア側で検証する
+        // （codex P1・Issue #137 対応）。可視集合所属だけでは「他テナントの行は
+        // 混入していないが、件数超過・id 重複・非有限スコア・順序違反」を見逃す
+        // ため、以下を単一走査で確認し、1 件でも違反すれば結果を一切返さず
+        // fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
+        //
+        // (1) 件数が要求 k を超えない。
+        if hits.len() > k {
             return Err(CoreError::ProviderResultRejected);
+        }
+        let visible_id_set: HashSet<u64> = visible_ids.iter().copied().collect();
+        let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
+        let mut prev: Option<&SearchHit> = None;
+        for hit in &hits {
+            // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、
+            // 後続の順序検証（`total_cmp`）が無意味になるため他の検証より先に弾く。
+            if !hit.score.is_finite() {
+                return Err(CoreError::ProviderResultRejected);
+            }
+            // (3) 縮約ビュー（＝可視行）の id 集合に属する（他テナント id・捏造 id の拒否）。
+            if !visible_id_set.contains(&hit.id) {
+                return Err(CoreError::ProviderResultRejected);
+            }
+            // (4) id が重複しない（同じ行が複数回返らない）。
+            if !seen_ids.insert(hit.id) {
+                return Err(CoreError::ProviderResultRejected);
+            }
+            // (5) スコア降順・同点は id 昇順（`kernel.rs::CpuScalarProvider` が実際に
+            // 返す順序と同じ契約。`total_cmp` は (2) で有限性を確認済みのため NaN の
+            // 順序上の扱いには依存しない）。
+            if let Some(p) = prev {
+                let out_of_order = match p.score.total_cmp(&hit.score) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => p.id >= hit.id,
+                    std::cmp::Ordering::Greater => false,
+                };
+                if out_of_order {
+                    return Err(CoreError::ProviderResultRejected);
+                }
+            }
+            prev = Some(hit);
         }
         Ok(hits)
     }

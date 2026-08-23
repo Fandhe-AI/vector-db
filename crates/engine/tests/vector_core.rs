@@ -388,20 +388,105 @@ fn search_projects_input_to_visible_rows_only_before_calling_provider() {
     );
 }
 
-/// negative test 用のダミー provider: `SearchInput` の内容を一切参照せず、対象
-/// データセットに存在しない id を捏造した `SearchHit` を返す。provider が
-/// テナント境界を無視するだけでなく、データセットに実在しない id をでっち上げる
-/// ケースも `EngineCore::search` のコア側再検証が拒否できることを確認する
-/// （codex P0 対応・Issue #137）。
-struct FabricatingHitProvider;
+/// negative test 用のダミー provider（codex P0/P1・Issue #137）: モードごとに Top-k
+/// 契約（可視集合所属・件数 <= k・id 一意性・スコア有限性・スコア降順＋同点 id 昇順）へ
+/// 個別に違反する `SearchHit` 列を返す。`EngineCore::search` のコア側検証が各違反を
+/// 個別に検出して拒否できることを確認する。
+enum MalformedHitMode {
+    /// データセットに存在しない id を捏造する（可視集合所属チェックの違反）。
+    Fabricated,
+    /// 要求 `k` を超える件数を返す（件数チェックの違反。他は正しい形式にする）。
+    TooMany,
+    /// 同じ id を複数回返す（一意性チェックの違反。スコア自体は正しい降順にする）。
+    Duplicate,
+    /// スコアに NaN を含める（有限性チェックの違反）。
+    NonFiniteScore,
+    /// スコア降順・同点 id 昇順の契約に違反する順序で返す（順序チェックの違反）。
+    Misordered,
+}
 
-impl SearchProvider for FabricatingHitProvider {
-    fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
-        Ok(vec![SearchHit {
-            id: 9_999,
-            score: 1.0,
-        }])
+struct MalformedHitProvider(MalformedHitMode);
+
+impl SearchProvider for MalformedHitProvider {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        match self.0 {
+            MalformedHitMode::Fabricated => Ok(vec![SearchHit {
+                id: 9_999,
+                score: 1.0,
+            }]),
+            MalformedHitMode::TooMany => {
+                // 可視行 2 件（呼び出し側は k=1 で呼ぶ）を両方返し、他の契約は満たす
+                // 正しい降順で件数チェックのみを単独で違反させる。
+                let mut ids = input.ids.to_vec();
+                ids.sort_unstable();
+                Ok(ids
+                    .into_iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(rank, id)| SearchHit {
+                        id,
+                        score: -(rank as f32),
+                    })
+                    .collect())
+            }
+            MalformedHitMode::Duplicate => {
+                let id = *input
+                    .ids
+                    .first()
+                    .expect("dataset must have at least one visible row");
+                Ok(vec![
+                    SearchHit { id, score: 2.0 },
+                    SearchHit { id, score: 1.0 },
+                ])
+            }
+            MalformedHitMode::NonFiniteScore => {
+                let id = *input
+                    .ids
+                    .first()
+                    .expect("dataset must have at least one visible row");
+                Ok(vec![SearchHit {
+                    id,
+                    score: f32::NAN,
+                }])
+            }
+            MalformedHitMode::Misordered => {
+                // 可視行 2 件を id 昇順のまま返す。スコアも昇順になるため、
+                // 「スコア降順」の契約に違反する。
+                let mut ids = input.ids.to_vec();
+                ids.sort_unstable();
+                Ok(ids
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, id)| SearchHit {
+                        id,
+                        score: rank as f32,
+                    })
+                    .collect())
+            }
+        }
     }
+}
+
+fn seed_two_visible_rows(storage: &Storage) {
+    storage
+        .create_table(&schema_for("docs", 2))
+        .expect("create table");
+    seed_row(
+        storage,
+        "docs",
+        1,
+        "tenant-a",
+        Visibility::Public,
+        &[1.0, 0.0],
+    );
+    seed_row(
+        storage,
+        "docs",
+        2,
+        "tenant-a",
+        Visibility::Public,
+        &[0.5, 0.0],
+    );
 }
 
 #[test]
@@ -419,12 +504,107 @@ fn provider_returning_a_hit_absent_from_the_dataset_is_rejected() {
         Visibility::Public,
         &[1.0, 0.0],
     );
-    let core = EngineCore::from_storage(storage, Box::new(FabricatingHitProvider));
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(MalformedHitProvider(MalformedHitMode::Fabricated)),
+    );
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let err = core
         .search(&ctx, "docs", &[1.0, 0.0], 10)
         .expect_err("provider returning an id absent from the dataset must be rejected");
+
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
+}
+
+// レビュー指摘対応（codex P1・Issue #137）: provider が要求件数 k を超える hit を返した
+// 場合、他の契約（id・スコア・順序）が正しくても拒否されること。
+#[test]
+fn provider_returning_more_hits_than_k_is_rejected() {
+    let dir = TempDir::new("provider-too-many-hits");
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    seed_two_visible_rows(&storage);
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(MalformedHitProvider(MalformedHitMode::TooMany)),
+    );
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 1)
+        .expect_err("provider returning more hits than k must be rejected");
+
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
+}
+
+// レビュー指摘対応（codex P1・Issue #137）: provider が同一 id を複数件返した場合、
+// 拒否されること（id の一意性契約）。
+#[test]
+fn provider_returning_a_duplicate_id_is_rejected() {
+    let dir = TempDir::new("provider-duplicate-id");
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    seed_two_visible_rows(&storage);
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(MalformedHitProvider(MalformedHitMode::Duplicate)),
+    );
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 10)
+        .expect_err("provider returning a duplicate id must be rejected");
+
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
+}
+
+// レビュー指摘対応（codex P1・Issue #137）: provider が非有限（NaN）スコアを返した
+// 場合、拒否されること（スコア有限性契約）。
+#[test]
+fn provider_returning_a_non_finite_score_is_rejected() {
+    let dir = TempDir::new("provider-non-finite-score");
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    seed_two_visible_rows(&storage);
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(MalformedHitProvider(MalformedHitMode::NonFiniteScore)),
+    );
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 10)
+        .expect_err("provider returning a non-finite score must be rejected");
+
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
+}
+
+// レビュー指摘対応（codex P1・Issue #137）: provider がスコア降順・同点 id 昇順の
+// 契約に違反する順序で返した場合、拒否されること。
+#[test]
+fn provider_returning_hits_out_of_score_order_is_rejected() {
+    let dir = TempDir::new("provider-misordered-hits");
+    let storage = Storage::open(dir.db_path()).expect("open storage");
+    seed_two_visible_rows(&storage);
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(MalformedHitProvider(MalformedHitMode::Misordered)),
+    );
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 10)
+        .expect_err("provider returning hits out of score order must be rejected");
 
     assert!(
         matches!(err, CoreError::ProviderResultRejected),
