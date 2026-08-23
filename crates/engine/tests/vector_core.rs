@@ -290,8 +290,9 @@ fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
 }
 
 /// negative test 用のダミー provider: `is_visible` を無視して常に全行を候補に含める
-/// （マスク無効化）。検査器（[`assert_no_cross_tenant_leak`]）がこの違反を実際に
-/// 検出できることを確認するための対照実験（CORE-2: 検査の実効性確認）。
+/// （マスク無効化）。`EngineCore::search` のコア側再検証（provider の戻り値を可視行
+/// id 集合と突き合わせる。Issue #137 codex P0 対応）が、この違反を実際に検出して
+/// 拒否できることを確認する対照実験（CORE-2: 検査の実効性確認）。
 struct MaskIgnoringProvider;
 
 impl SearchProvider for MaskIgnoringProvider {
@@ -308,9 +309,15 @@ impl SearchProvider for MaskIgnoringProvider {
     }
 }
 
+// レビュー指摘対応（codex P0・Issue #137）: テナント境界の適用を
+// `SearchInput::is_visible` クロージャの「呼び出し規約」だけに委ねると、provider
+// 実装がそれを無視して他テナントの行を返しうる（`MaskIgnoringProvider` が実証）。
+// `EngineCore::search` は provider の戻り値をコア側で計算した可視行 id 集合と
+// 突き合わせて再検証するため、マスクを無視する provider を注入しても他テナントの
+// 行が呼び出し元へ届く前に `CoreError::ProviderResultRejected` で拒否されることを
+// 検証する（fail-closed。単一照合パスを provider 出力の再検証まで含めて維持する）。
 #[test]
-#[should_panic(expected = "cross-tenant leak detected")]
-fn core2_negative_test_checker_detects_masking_bypass() {
+fn core2_negative_test_mask_ignoring_provider_is_rejected_by_core_side_revalidation() {
     let dir = TempDir::new("core2-negative");
     let core = EngineCore::with_provider(dir.db_path(), Box::new(MaskIgnoringProvider))
         .expect("open engine core");
@@ -335,14 +342,58 @@ fn core2_negative_test_checker_detects_masking_bypass() {
     );
 
     let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
-    let hits = core
-        .search(&ctx_a, "docs", &[1.0, 0.0], 10)
-        .expect("search ok");
+    let err = core.search(&ctx_a, "docs", &[1.0, 0.0], 10).expect_err(
+        "provider ignoring the visibility mask must be rejected by core-side re-validation",
+    );
 
-    // マスクを無効化した provider を注入したため、この呼び出しは tenant-b の行を
-    // 含んでしまい、検査器が違反を検出して panic するはず（この test 自体は
-    // `should_panic` で「検査器が違反を見逃さないこと」を確認する）。
-    assert_no_cross_tenant_leak(&core, "docs", "tenant-a", &hits);
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
+}
+
+/// negative test 用のダミー provider: `SearchInput` の内容を一切参照せず、対象
+/// データセットに存在しない id を捏造した `SearchHit` を返す。provider が
+/// テナント境界を無視するだけでなく、データセットに実在しない id をでっち上げる
+/// ケースも `EngineCore::search` のコア側再検証が拒否できることを確認する
+/// （codex P0 対応・Issue #137）。
+struct FabricatingHitProvider;
+
+impl SearchProvider for FabricatingHitProvider {
+    fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        Ok(vec![SearchHit {
+            id: 9_999,
+            score: 1.0,
+        }])
+    }
+}
+
+#[test]
+fn provider_returning_a_hit_absent_from_the_dataset_is_rejected() {
+    let dir = TempDir::new("provider-fabricated-hit");
+    let core = EngineCore::with_provider(dir.db_path(), Box::new(FabricatingHitProvider))
+        .expect("open engine core");
+    core.storage()
+        .create_table(&schema_for("docs", 2))
+        .expect("create table");
+    seed_row(
+        &core,
+        "docs",
+        1,
+        "tenant-a",
+        Visibility::Public,
+        &[1.0, 0.0],
+    );
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let err = core
+        .search(&ctx, "docs", &[1.0, 0.0], 10)
+        .expect_err("provider returning an id absent from the dataset must be rejected");
+
+    assert!(
+        matches!(err, CoreError::ProviderResultRejected),
+        "expected ProviderResultRejected, got: {err}"
+    );
 }
 
 /// CORE-13: 呼び出しがカスタム provider を通ることを記録する計装 provider。

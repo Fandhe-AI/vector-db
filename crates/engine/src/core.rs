@@ -10,7 +10,17 @@
 //! `policy.rs`（テナント境界・可視性判定）を束ねる。テナント判定は必ず
 //! [`crate::policy::PolicyContext::is_visible`] の単一照合パス経由で行い、
 //! 不可視行と不存在行の応答を区別しない（存在情報を漏らさない。security.md 準拠）。
+//!
+//! `EngineCore::search` は [`SearchProvider`] を `Box<dyn SearchProvider>`（CORE-13）で
+//! 差し替え可能にしているが、`SearchInput::is_visible` は「provider が呼び出す」規約に
+//! すぎず、provider 実装がそれを無視したり、データセットに存在しない・不可視な行の
+//! `SearchHit` を返したりすることをコンパイラは防げない。そのため `EngineCore::search` は
+//! provider の戻り値をコア側の可視行 id 集合（`is_visible` をコア自身が全走査して構築する、
+//! provider の自己申告に依存しない集合）と突き合わせて再検証し、逸脱があれば結果を一切
+//! 返さず `CoreError::ProviderResultRejected` で拒否する（fail-closed。AGENTS.md P0
+//! 「テナント境界の弱体化」対応。テナント分離を provider 実装の正しさに依存させない）。
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::arena::{ArenaError, VectorArena};
@@ -41,6 +51,12 @@ pub enum CoreError {
     /// 指定行が存在しない、または呼び出し元のテナント・可視性から見えない
     /// （区別しない。fail-closed）。
     NotFound,
+    /// `SearchProvider` が返却した [`SearchHit`] のうち少なくとも 1 件が、コア側で
+    /// 計算した可視行 id 集合（`ctx` の下で可視な、対象テーブル実在行の id 集合）に
+    /// 含まれていなかった。provider 実装が `SearchInput::is_visible` を無視した・
+    /// データセットに存在しない id を捏造した、のいずれの場合も区別せず拒否する
+    /// （fail-closed。他テナントの存在情報を漏らさないよう具体的な id は含めない）。
+    ProviderResultRejected,
 }
 
 impl std::fmt::Display for CoreError {
@@ -53,6 +69,10 @@ impl std::fmt::Display for CoreError {
             CoreError::Policy(e) => write!(f, "core policy error: {e}"),
             CoreError::InvalidK { k } => write!(f, "invalid k: {k} (must be 1..={MAX_SEARCH_K})"),
             CoreError::NotFound => write!(f, "not found"),
+            CoreError::ProviderResultRejected => write!(
+                f,
+                "search provider returned a hit outside the policy-visible id set"
+            ),
         }
     }
 }
@@ -227,6 +247,17 @@ impl VectorCore for EngineCore {
             }
         };
 
+        // provider の戻り値をコア側で再検証するための可視行 id 集合。`is_visible` は
+        // 「provider が呼び出す」規約に過ぎず、provider が無視する・不正な `SearchHit` を
+        // 返すことを型システムは防げないため、provider の自己申告に依存せずコア自身が
+        // アリーナ全体を走査して構築する（AGENTS.md P0「テナント境界の弱体化」対応）。
+        let visible_ids: HashSet<u64> = arena
+            .ids()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &id)| is_visible(idx).then_some(id))
+            .collect();
+
         let input = SearchInput {
             ids: arena.ids(),
             vectors: arena.vectors(),
@@ -236,6 +267,13 @@ impl VectorCore for EngineCore {
             is_visible: &is_visible,
         };
         let hits = self.provider.search(input)?;
+
+        // provider が返した各 hit の id が可視行 id 集合に属することを確認する。
+        // 1 件でも逸脱していれば結果を一切返さず fail-closed に拒否する（部分的な
+        // フィルタリングはしない。fail-open を避けるための判断）。
+        if hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
+            return Err(CoreError::ProviderResultRejected);
+        }
         Ok(hits)
     }
 
