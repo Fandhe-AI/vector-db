@@ -40,20 +40,23 @@
 //!
 //! [`SparseIndex::build`]/[`SparseIndex::with_params`] も同様の理由で、各文書に対して
 //! `tokenize()` を呼ぶ前に文書 1 件のバイト長（`MAX_DOC_BYTES`）とコーパスの文書数
-//! （`MAX_CORPUS_DOCS`）を検証する。詳細は [`SparseIndex::with_params`] を参照。
+//! （`MAX_CORPUS_DOCS`）を検証する。この 2 つは互いに独立な検証のため、両方の上限
+//! ちょうどの組み合わせだけではコーパス全体のバイト数を有界に保てない。そのため
+//! 走査済み文書のバイト長累計にも `MAX_CORPUS_BYTES` の上限を設ける。詳細は
+//! [`SparseIndex::with_params`] を参照。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
 //! クエリはバイト長を `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` で上限検証し
 //! （詳細は [`SparseIndex::search`]）、文書はバイト長を `MAX_DOC_BYTES`、コーパスの
-//! 文書数を `MAX_CORPUS_DOCS` で上限検証する（詳細は [`SparseIndex::with_params`]）。
-//! いずれの検証も `tokenize()` を呼ぶ前にバイト長・件数のみを見る `O(1)` の判定で
-//! 完結し、追加アロケーションを要しない。公開関数 [`tokenize`] 自体はこれらの上限を
-//! 強制しない（呼び出し側が上限検証済みの入力のみを渡す契約とする。詳細は
-//! [`tokenize`] のドキュメントを参照）。頻度・長さの演算はすべて
-//! `checked_*`/`saturating_*` を用い、オーバーフローを未定義動作にしない。
-//! `tokenize()` 内の添字アクセスは事前のループ境界チェックにより範囲内が証明可能
-//! （panic しない）。
+//! 文書数を `MAX_CORPUS_DOCS`、コーパス全体のバイト長合計を `MAX_CORPUS_BYTES` で
+//! 上限検証する（詳細は [`SparseIndex::with_params`]）。いずれの検証も `tokenize()`
+//! を呼ぶ前にバイト長・件数のみを見る `O(1)` の判定で完結し、追加アロケーションを
+//! 要しない。公開関数 [`tokenize`] 自体はこれらの上限を強制しない（呼び出し側が
+//! 上限検証済みの入力のみを渡す契約とする。詳細は [`tokenize`] のドキュメントを
+//! 参照）。頻度・長さの演算はすべて `checked_*`/`saturating_*` を用い、オーバーフローを
+//! 未定義動作にしない。`tokenize()` 内の添字アクセスは事前のループ境界チェックにより
+//! 範囲内が証明可能（panic しない）。
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -107,6 +110,24 @@ const MAX_DOC_BYTES: usize = 1024 * 1024;
 /// 妥当な値とする。
 const MAX_CORPUS_DOCS: usize = 100_000;
 
+/// [`SparseIndex::with_params`]（構築）が受け付けるコーパス全体のバイト長合計の上限。
+///
+/// [`MAX_DOC_BYTES`]・[`MAX_CORPUS_DOCS`] は互いに独立な検証のため、両方の上限
+/// ちょうど（1 MiB 文書 × 10 万件）を組み合わせると最大で約 100 GiB もの入力を
+/// 許してしまい、単体では OOM を防げない。`with_params()` はトークン化の過程で
+/// 各文書の `String` トークンを `term_freq`・`doc_freq` の双方（`BTreeMap` キーとして
+/// 別々にヒープ確保）に保持するため、実効メモリ使用量は入力バイト数の数倍規模に
+/// 増幅しうる。64 MiB はこの増幅を見込んでも実行時メモリを現実的な範囲に収めつつ、
+/// 単一の `SparseIndex` に載せるテキストコーパスとして十分実用的な規模を許容する
+/// 上限とする。
+const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
+
+// `MAX_CORPUS_BYTES` が `MAX_DOC_BYTES` の整数倍であることをコンパイル時に固定する。
+// 境界値テストは MAX_DOC_BYTES サイズの文書を複数回参照して MAX_CORPUS_BYTES ちょうどの
+// コーパスを組み立てるため（巨大な単一バッファの重複確保を避ける）、この関係が崩れると
+// 境界値テストの前提が壊れる。
+const _: () = assert!(MAX_CORPUS_BYTES.is_multiple_of(MAX_DOC_BYTES));
+
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
 ///
@@ -144,6 +165,13 @@ pub enum SparseError {
     /// （各文書の走査に入る前に）`docs.len()`（アロケーション不要）で判定し、
     /// fail-closed に拒否する。
     TooManyDocs { len: usize, max: usize },
+    /// コーパス全体のバイト長合計が [`MAX_CORPUS_BYTES`] を超える。`MAX_DOC_BYTES`・
+    /// `MAX_CORPUS_DOCS` は互いに独立な検証のため、両方の上限ちょうどの組み合わせでも
+    /// 巨大な入力を許してしまう（[`MAX_CORPUS_BYTES`] のコメント参照）。`with_params()`
+    /// は各文書の `tokenize()` を呼ぶ前に、それまでの文書バイト長の累計を
+    /// `saturating_add` で求めて判定し、超過した時点で fail-closed に拒否する
+    /// （オーバーフロー時は `total` を `usize::MAX` として報告し、必ず拒否する）。
+    CorpusTooLarge { total: usize, max: usize },
 }
 
 impl std::fmt::Display for SparseError {
@@ -170,6 +198,9 @@ impl std::fmt::Display for SparseError {
             }
             SparseError::TooManyDocs { len, max } => {
                 write!(f, "too many documents in corpus: {len} (max {max})")
+            }
+            SparseError::CorpusTooLarge { total, max } => {
+                write!(f, "corpus too large: {total} bytes (max {max})")
             }
         }
     }
@@ -344,12 +375,16 @@ impl SparseIndex {
     /// サイレントな空結果へ落ちてしまい fail-open になるため、ここで拒否して
     /// fail-closed を保つ（`.claude/rules/coding-rust.md`）。
     ///
-    /// `docs` はコーパス全体のサイズを制限する 2 段の上限検証を、各文書に対して
+    /// `docs` はコーパス全体のサイズを制限する 3 段の上限検証を、各文書に対して
     /// `tokenize()`（アロケーションを伴う）を呼ぶ前に行う（`.claude/rules/coding-rust.md`:
     /// untrusted 入力の長さは上限検証してから処理する）。文書数が [`MAX_CORPUS_DOCS`]
     /// を超える場合は走査に入る前に [`SparseError::TooManyDocs`] で拒否し、各文書の
     /// バイト長が [`MAX_DOC_BYTES`] を超える場合は該当文書の `tokenize()` を呼ぶ前に
-    /// [`SparseError::DocTooLong`] で拒否する。
+    /// [`SparseError::DocTooLong`] で拒否する。[`MAX_DOC_BYTES`]・[`MAX_CORPUS_DOCS`]
+    /// は互いに独立な検証のため、それらの組み合わせだけでは総入力サイズを有界に
+    /// 保てない（[`MAX_CORPUS_BYTES`] のコメント参照）。そのため、これまでに走査した
+    /// 文書のバイト長の累計を `saturating_add` で求め、[`MAX_CORPUS_BYTES`] を超えた時点で
+    /// 該当文書の `tokenize()` を呼ぶ前に [`SparseError::CorpusTooLarge`] で拒否する。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
         if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
             return Err(SparseError::InvalidParams { k1, b });
@@ -368,6 +403,10 @@ impl SparseIndex {
         let mut entries: Vec<DocEntry> = Vec::with_capacity(docs.len());
         let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
         let mut total_len: u64 = 0;
+        // コーパス全体のバイト長累計。`saturating_add` によりオーバーフロー時は
+        // `usize::MAX` へ飽和させる（この桁数の入力は現実的に想定しないが、
+        // fail-closed のため未定義動作にせず必ず MAX_CORPUS_BYTES 超過として扱う）。
+        let mut corpus_bytes_seen: usize = 0;
 
         for &(doc_id, text) in docs {
             if seen_ids.insert(doc_id, ()).is_some() {
@@ -378,6 +417,13 @@ impl SparseIndex {
                     doc_id,
                     len: text.len(),
                     max: MAX_DOC_BYTES,
+                });
+            }
+            corpus_bytes_seen = corpus_bytes_seen.saturating_add(text.len());
+            if corpus_bytes_seen > MAX_CORPUS_BYTES {
+                return Err(SparseError::CorpusTooLarge {
+                    total: corpus_bytes_seen,
+                    max: MAX_CORPUS_BYTES,
                 });
             }
 
@@ -982,6 +1028,40 @@ mod tests {
             SparseError::TooManyDocs {
                 len: MAX_CORPUS_DOCS + 1,
                 max: MAX_CORPUS_DOCS,
+            }
+        );
+    }
+
+    // --- コーパス全体のバイト長上限（fail-closed。MAX_CORPUS_BYTES 境界） ---
+
+    #[test]
+    fn build_accepts_corpus_at_max_corpus_bytes_boundary() {
+        // `MAX_DOC_BYTES` サイズの単一バッファを `MAX_CORPUS_BYTES / MAX_DOC_BYTES` 回
+        // 参照するコーパス（合計はちょうど `MAX_CORPUS_BYTES`）を組み立てる。文書ごとに
+        // 個別のバッファを確保せず、1 つの `text` を使い回すことで無駄な重複確保を避ける。
+        let text = "a".repeat(MAX_DOC_BYTES);
+        let doc_count = MAX_CORPUS_BYTES / MAX_DOC_BYTES;
+        let docs: Vec<(DocId, &str)> = (0..doc_count as u64)
+            .map(|id| (id, text.as_str()))
+            .collect();
+        assert!(SparseIndex::build(&docs).is_ok());
+    }
+
+    #[test]
+    fn build_rejects_corpus_exceeding_max_corpus_bytes() {
+        let text = "a".repeat(MAX_DOC_BYTES);
+        let doc_count = MAX_CORPUS_BYTES / MAX_DOC_BYTES;
+        let mut docs: Vec<(DocId, &str)> = (0..doc_count as u64)
+            .map(|id| (id, text.as_str()))
+            .collect();
+        // 1 バイトの文書を追加し、合計をちょうど MAX_CORPUS_BYTES + 1 にする。
+        docs.push((doc_count as u64, "a"));
+        let err = SparseIndex::build(&docs).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::CorpusTooLarge {
+                total: MAX_CORPUS_BYTES + 1,
+                max: MAX_CORPUS_BYTES,
             }
         );
     }
