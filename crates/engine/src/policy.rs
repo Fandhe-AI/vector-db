@@ -16,17 +16,49 @@ pub enum PolicyError {
     /// 空のテナント ID はテナント境界判定を曖昧にするため拒否する（fail-closed。
     /// `storage.rs::RowInput::tenant_id` の既存方針と整合）。
     EmptyTenantId,
+    /// テナント ID のバイト長が [`crate::storage::MAX_TENANT_ID_LEN`] を超過した。
+    /// storage 層（`encode_row`/`decode_row`）が受理する行の `tenant_id` 上限と
+    /// 同一の定数をそのまま参照する（二重定義しない）。`PolicyContext` がこの上限を
+    /// 超えるテナント ID を無制限に保持できてしまうと、`ctx.tenant_id()` を用いた
+    /// 呼び出し元がそのまま `RowInput::tenant_id` へ渡した際に storage 層で初めて
+    /// 拒否される、という契約の不一致が生じるため、構築時点で同じ上限を課す
+    /// （codex P1・Issue #137 対応）。
+    TenantIdTooLong { len: usize, max: u16 },
 }
 
 impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PolicyError::EmptyTenantId => write!(f, "policy context: tenant_id must not be empty"),
+            PolicyError::TenantIdTooLong { len, max } => write!(
+                f,
+                "policy context: tenant_id length {len} exceeds limit {max}"
+            ),
         }
     }
 }
 
 impl std::error::Error for PolicyError {}
+
+/// `tenant_id` の構築時検証（[`PolicyContext::new`]・[`PolicyContext::with_visibilities`]
+/// の共通前段）。所有化（`String` 化）する前に借用 `&str` のまま検証することで、
+/// 上限超過・空文字列の入力に対して不要なアロケーションを発生させない
+/// （untrusted 入力を無制限に確保しない方針。coding-rust.md 準拠）。
+fn validate_tenant_id(tenant_id: &str) -> Result<(), PolicyError> {
+    if tenant_id.is_empty() {
+        return Err(PolicyError::EmptyTenantId);
+    }
+    // `storage.rs` 側は `tenant_id.as_bytes().len()`（バイト長）で上限判定するため、
+    // ここでも `str::len()`（バイト長。文字数ではない）で揃える。
+    let len = tenant_id.len();
+    if len > crate::storage::MAX_TENANT_ID_LEN as usize {
+        return Err(PolicyError::TenantIdTooLong {
+            len,
+            max: crate::storage::MAX_TENANT_ID_LEN,
+        });
+    }
+    Ok(())
+}
 
 /// 呼び出し元（プロトコル層 → `core.rs`）が渡すアクセス主体のテナント境界・可視性文脈。
 ///
@@ -58,23 +90,25 @@ impl From<Visibility> for AllowedVisibility {
 
 impl PolicyContext {
     /// `Public` のみ可視の `PolicyContext` を構築する（既定・最小権限）。
-    /// 空テナント ID は `Err`（fail-closed）。
-    pub fn new(tenant_id: impl Into<String>) -> Result<Self, PolicyError> {
+    /// 空テナント ID・[`crate::storage::MAX_TENANT_ID_LEN`] 超過は `Err`（fail-closed）。
+    pub fn new(tenant_id: &str) -> Result<Self, PolicyError> {
         Self::with_visibilities(tenant_id, [Visibility::Public])
     }
 
     /// 許可可視性ラベル集合を明示指定して構築する。`Private` を見せる呼び出し元は
     /// ここへ明示的に `Visibility::Private` を含める必要がある（黙示の昇格を許さない）。
+    ///
+    /// `tenant_id` は借用 `&str` で受け取り、[`validate_tenant_id`] で検証してから
+    /// `String` へ所有化する（`impl Into<String>` で先に所有化してから検証すると、
+    /// 上限超過・不正な入力に対しても無条件にアロケーションが発生してしまうため。
+    /// codex P1・Issue #137 対応）。
     pub fn with_visibilities(
-        tenant_id: impl Into<String>,
+        tenant_id: &str,
         visibilities: impl IntoIterator<Item = Visibility>,
     ) -> Result<Self, PolicyError> {
-        let tenant_id = tenant_id.into();
-        if tenant_id.is_empty() {
-            return Err(PolicyError::EmptyTenantId);
-        }
+        validate_tenant_id(tenant_id)?;
         Ok(Self {
-            tenant_id,
+            tenant_id: tenant_id.to_string(),
             allowed_visibilities: visibilities
                 .into_iter()
                 .map(AllowedVisibility::from)
@@ -138,6 +172,32 @@ mod tests {
         assert_eq!(
             PolicyContext::new("").unwrap_err(),
             PolicyError::EmptyTenantId
+        );
+    }
+
+    // レビュー指摘対応（codex P1・Issue #137）: `storage.rs::MAX_TENANT_ID_LEN` ちょうどの
+    // 長さのテナント ID は構築を許可する（境界値の pass 側）。
+    #[test]
+    fn tenant_id_at_max_len_is_accepted() {
+        let max_len = crate::storage::MAX_TENANT_ID_LEN as usize;
+        let tenant_id = "t".repeat(max_len);
+        let ctx = PolicyContext::new(&tenant_id).expect("tenant_id at the limit must be accepted");
+        assert_eq!(ctx.tenant_id(), tenant_id);
+    }
+
+    // レビュー指摘対応（codex P1・Issue #137）: `storage.rs::MAX_TENANT_ID_LEN` を 1 バイト
+    // でも超えるテナント ID は構築時に拒否する（境界値の reject 側。fail-closed）。
+    // storage 層（`encode_row`）が同じ上限で拒否する行と契約を揃える。
+    #[test]
+    fn tenant_id_over_max_len_is_rejected() {
+        let max_len = crate::storage::MAX_TENANT_ID_LEN as usize;
+        let tenant_id = "t".repeat(max_len + 1);
+        assert_eq!(
+            PolicyContext::new(&tenant_id).unwrap_err(),
+            PolicyError::TenantIdTooLong {
+                len: max_len + 1,
+                max: crate::storage::MAX_TENANT_ID_LEN,
+            }
         );
     }
 }
