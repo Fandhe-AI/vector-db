@@ -1,10 +1,9 @@
 //! `benches/harness/`（TASK-158 性能計測プロトコル基盤）の回帰テスト。
 //!
-//! 対象ビヘイビア ID なし（TASK-158 は「なし（基盤。CORE-3〜6・SEARCH-4・SQL-1 等の
-//! 測定条件を担保）」。ポインタ: `docs/spec/05-tasks.md` TASK-158）。ビヘイビア ID を
-//! 持たないため、本テストは「ハーネス自体がプロトコル要件（warmup 20 回以上・
-//! 計測 20 回以上・中央値＋Q1/Q3・決定的シード RNG・interleaved A/B）を遵守すること」
-//! を受け入れ条件として検証する。
+//! 対象ビヘイビア ID なし（TASK-158 は基盤タスク。ポインタ: `docs/spec/05-tasks.md`
+//! TASK-158）。ビヘイビア ID を持たないため、本テストは「ハーネス自体の実装契約
+//! （下限値の拒否・決定的シード RNG・A/B の交互実行）を遵守すること」を
+//! 受け入れ条件として検証する。
 //!
 //! `#[path]` で `benches/harness/mod.rs` を直接取り込む（内部クレートを新設せず、
 //! `cargo bench` 入口〔`benches/measurement.rs`〕と同一ソースを共有する構成。
@@ -169,8 +168,11 @@ fn run_ab_returns_measurements_for_both_paths_in_alternating_order() {
 
     let recorded = order.into_inner().unwrap();
     assert_eq!(recorded.len(), 80); // (warmup 20 + 計測 20) * 2 経路
-    for pair in recorded.chunks(2) {
-        assert_eq!(pair, ['a', 'b']);
+                                    // 反復ごとに先行経路を入れ替える（偶数反復 A→B・奇数反復 B→A）ため、
+                                    // 各ペアは常に両経路を 1 回ずつ含み、かつ先行経路が交互に入れ替わる。
+    for (i, pair) in recorded.chunks(2).enumerate() {
+        let expected = if i % 2 == 0 { ['a', 'b'] } else { ['b', 'a'] };
+        assert_eq!(pair, expected);
     }
 }
 

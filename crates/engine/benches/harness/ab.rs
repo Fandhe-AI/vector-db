@@ -1,10 +1,11 @@
 //! interleaved A/B 計測（2 経路比較の相互実行）。
 //!
 //! GPU vs CPU-SIMD 等、2 経路を比較する性能検証タスク（TASK-130 等）が使う入口
-//! （TASK-158。計測プロトコルが定める 2 経路比較の実行方式に対応。ポインタ:
-//! `docs/spec/04-behavior/README.md` 前提条件節）。`protocol::run` と異なり、
+//! （TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。`protocol::run` と異なり、
 //! warmup も含めて A/B を 1 反復単位で交互実行することでサーマルスロットリング等の
-//! 時間経過に伴う偏りが片方の経路だけに乗るのを防ぐ。
+//! 時間経過に伴う偏りが片方の経路だけに乗るのを防ぐ。さらに反復ごとに先行経路を
+//! 入れ替え、実行順序そのものに起因する系統的バイアス（常に先行する経路が
+//! キャッシュ・分岐予測等で有利/不利になる効果）も相殺する。
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -28,34 +29,56 @@ pub struct AbMeasurement {
 /// `workload_a` と `workload_b` は毎反復ちょうど 1 回ずつ呼ばれる（非対称な反復配分は
 /// ドリフト排除という設計意図に反するため、`config` の warmup・計測回数はそのまま
 /// 両経路に等しく適用される。個別に回数を変える API は意図的に提供しない）。
+/// 反復ごとに先行経路を入れ替える（偶数反復 A→B・奇数反復 B→A）ため、
+/// 実行順序自体に起因する系統的バイアスは片方の経路にのみ乗らない。
 pub fn run_ab<T>(
     config: &MeasurementConfig,
     mut workload_a: impl FnMut() -> T,
     mut workload_b: impl FnMut() -> T,
 ) -> Result<AbMeasurement, BenchError> {
     // warmup フェーズも交互実行する（サーマル状態を両経路で揃えた状態から
-    // 計測フェーズに入るため）。
-    for _ in 0..config.warmup_iterations() {
-        black_box(workload_a());
-        black_box(workload_b());
+    // 計測フェーズに入るため）。先行経路は計測フェーズと同じ規則で反復ごとに
+    // 入れ替える（下記ループ内コメント参照）。
+    for i in 0..config.warmup_iterations() {
+        if i % 2 == 0 {
+            black_box(workload_a());
+            black_box(workload_b());
+        } else {
+            black_box(workload_b());
+            black_box(workload_a());
+        }
     }
 
     let measured = config.measured_iterations() as usize;
     let mut samples_a = Vec::with_capacity(measured);
     let mut samples_b = Vec::with_capacity(measured);
 
-    for _ in 0..config.measured_iterations() {
-        let start_a = Instant::now();
-        let result_a = workload_a();
-        let elapsed_a = start_a.elapsed();
-        black_box(result_a);
-        samples_a.push(elapsed_a);
+    for i in 0..config.measured_iterations() {
+        // 反復ごとに先行経路を入れ替える（偶数反復は A→B、奇数反復は B→A）。
+        // 常に同じ経路を先行実行すると、キャッシュ・分岐予測・周波数遷移等の
+        // 「直前に何を実行したか」に依存する効果が片方の経路にだけ系統的に
+        // 乗り、median_ratio が実際の性能差ではなく実行順序を反映しうる。
+        if i % 2 == 0 {
+            let start_a = Instant::now();
+            black_box(workload_a());
+            let elapsed_a = start_a.elapsed();
+            samples_a.push(elapsed_a);
 
-        let start_b = Instant::now();
-        let result_b = workload_b();
-        let elapsed_b = start_b.elapsed();
-        black_box(result_b);
-        samples_b.push(elapsed_b);
+            let start_b = Instant::now();
+            black_box(workload_b());
+            let elapsed_b = start_b.elapsed();
+            samples_b.push(elapsed_b);
+        } else {
+            let start_b = Instant::now();
+            black_box(workload_b());
+            let elapsed_b = start_b.elapsed();
+            samples_b.push(elapsed_b);
+
+            let start_a = Instant::now();
+            black_box(workload_a());
+            let elapsed_a = start_a.elapsed();
+            samples_a.push(elapsed_a);
+        }
     }
 
     // 交互実行の対称性が崩れていないことの内部一貫性チェック（fail-closed）。

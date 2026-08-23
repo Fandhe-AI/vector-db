@@ -1,8 +1,7 @@
 //! 所要時間サンプル列からの決定的な統計値算出。
 //!
 //! `protocol::run`（単独計測）・`ab::run_ab`（A/B 計測）の双方が計測フェーズ終了後に
-//! 呼び出す共通ユーティリティ（TASK-158。計測プロトコルが定める代表値の算出方式に
-//! 対応。ポインタ: `docs/spec/04-behavior/README.md` 前提条件節）。
+//! 呼び出す共通ユーティリティ（TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。
 
 use std::time::Duration;
 

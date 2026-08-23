@@ -1,8 +1,7 @@
 //! 決定的シードの疑似乱数生成器（xorshift64*）。
 //!
 //! ベンチ・回帰テストが使う入力データ（ベクトル・クエリ）を、同一シードから常に
-//! 同一系列で再生成できるようにするための専用モジュール（TASK-158。計測プロトコルが
-//! 求める入力再現性に対応。ポインタ: `docs/spec/04-behavior/README.md` 前提条件節・
+//! 同一系列で再生成できるようにするための専用モジュール（TASK-158。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-158）。
 //! アルゴリズムは public 参考実装
 //! [rust-ai-library](https://github.com/Fandhe-AI/rust-ai-library)

@@ -1,10 +1,9 @@
 //! 性能計測プロトコルのコア実行機構（単独計測）。
 //!
-//! TASK-127・TASK-130・TASK-83 等の性能系受け入れ検証タスクが、p95 レイテンシ等の
-//! 実測値を得る前に必ず経由する入口（TASK-158。ポインタ:
-//! `docs/spec/04-behavior/README.md` 前提条件節・`docs/spec/05-tasks.md` TASK-158）。
+//! TASK-127・TASK-130・TASK-83 等の性能系受け入れ検証タスクが、実測値を得る前に
+//! 必ず経由する入口（TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。
 //! warmup フェーズと計測フェーズを分離し、計測フェーズの各回所要時間を
-//! `stats::summarize` に渡して中央値・Q1/Q3 を得る。
+//! `stats::summarize` に渡して要約統計値を得る。
 //!
 //! # 呼び出し側の責務
 //!
@@ -18,11 +17,8 @@ use std::time::{Duration, Instant};
 
 use super::stats::{self, BenchError, Summary};
 
-/// 計測プロトコルが要求する warmup 回数の下限。
-///
-/// spec 側の性能計測プロトコル（ポインタ: `docs/spec/04-behavior/README.md`
-/// 前提条件節）と、参照元の public 実装 rust-ai-library `bench-harness` の既定値に
-/// 合わせた値。この値を下回る `MeasurementConfig` は `new` が拒否する。
+/// 計測プロトコルが要求する warmup 回数の下限（TASK-158 参照）。
+/// この値を下回る `MeasurementConfig` は `new` が拒否する。
 const MIN_WARMUP_ITERATIONS: u32 = 20;
 
 /// 計測プロトコルが要求する計測回数の下限（`MIN_WARMUP_ITERATIONS` 同様の根拠）。
@@ -130,9 +126,8 @@ pub fn run<T>(
     let mut samples = Vec::with_capacity(config.measured_iterations as usize);
     for _ in 0..config.measured_iterations {
         let start = Instant::now();
-        let result = workload();
+        black_box(workload());
         let elapsed = start.elapsed();
-        black_box(result);
         samples.push(elapsed);
     }
 
