@@ -19,13 +19,16 @@
 //! `k1 = 1.2`, `b = 0.75`。
 //!
 //! トークナイザ（[`tokenize`]）は ASCII 英数字・アンダースコアの連続を単語トークンとし、
-//! CJK（ひらがな・カタカナ・CJK 統合漢字。カタカナ側は記号の `・`（U+30FB）・
-//! 長音符 `ー`（U+30FC）も含むレンジ判定のため取り込まれる）はユニグラム＋文字バイグラムを
-//! 生成する（小文字化した上で処理）。対応範囲外の文字（全角英数字・アクセント付きラテン
-//! 文字・ハングル・半角カタカナ等）は無音で破棄される。ASCII 単語の途中に出現した場合は
-//! その文字が欠落するだけでなく、その位置で単語が分割される（前後が結合されるのではない。
-//! 例: `"cafés"` → `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・
-//! `doc_freq`・`doc_len` の統計を汚染しうる。
+//! CJK（ひらがな・カタカナ・CJK 統合漢字。カタカナ側は長音符 `ー`（U+30FC）を含むが
+//! 記号の中黒 `・`（U+30FB）は単語区切りとして除外する）はユニグラム＋文字バイグラムを
+//! 生成する（小文字化した上で処理）。既定（[`tokenize`]）ではユニグラムのうち助詞・
+//! 機能語（TASK-105・SEARCH-5 の CJK ストップワード除去。詳細は [`tokenize_with_options`]）
+//! の単独トークン化を抑制するが、CJK コンテンツ（内容語のバイグラム等）自体は保持する。
+//! 対応範囲外の文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ等）は
+//! 無音で破棄される。ASCII 単語の途中に出現した場合はその文字が欠落するだけでなく、
+//! その位置で単語が分割される（前後が結合されるのではない。例: `"cafés"` →
+//! `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・`doc_freq`・
+//! `doc_len` の統計を汚染しうる。
 //!
 //! [`SparseIndex::search`] は文書集合への線形走査で実装するが、走査中に各文書について
 //! クエリの一意語集合（最大 `Q` 語）を `BTreeMap` で検索するため、時間計算量は
@@ -293,39 +296,73 @@ fn is_ascii_word_char(c: char) -> bool {
 /// 小文字化した 1 文字が CJK（ひらがな・カタカナ・CJK 統合漢字）かどうか。
 /// `char` の範囲判定のみで実装し、外部の正規表現・Unicode データクレートに依存しない
 /// （`.claude/rules/dependency-policy.md`: 依存最小方針）。カタカナのレンジ
-/// （U+30A0..=U+30FF）は文字単位の判定のため、仮名以外の記号（中黒 `・` U+30FB・
-/// 長音符 `ー` U+30FC）も含めて CJK 扱いになる（意図的な仕様。除外はしない）。
+/// （U+30A0..=U+30FF）のうち中黒 `・`（U+30FB）は記号であり単語区切りとして扱うため
+/// このレンジから除外する（TASK-105・SEARCH-5 対応）。長音符 `ー`（U+30FC）は
+/// カタカナ語（例: 「サーバー」）の構成要素であり除外すると内容語が壊れるため、
+/// 引き続き CJK 扱いのまま保持する。
 fn is_cjk_char(c: char) -> bool {
     matches!(c,
         '\u{3040}'..='\u{309F}' // ひらがな
-        | '\u{30A0}'..='\u{30FF}' // カタカナ（記号の「・」「ー」を含むレンジ）
+        | '\u{30A0}'..='\u{30FA}' // カタカナ（中黒 U+30FB の手前まで）
+        | '\u{30FC}'..='\u{30FF}' // カタカナ（長音符 U+30FC 以降。中黒のみ除外）
         | '\u{4E00}'..='\u{9FFF}' // CJK 統合漢字
     )
 }
 
-/// クエリ・文書テキストをトークン列へ分割する（TASK-102 の簡易トークナイザ）。
+/// [`tokenize_with_options`] がユニグラムの単独トークン化を抑制する CJK 助詞・
+/// 形式的機能語の 1 文字集合（TASK-105・対象ビヘイビア SEARCH-5）。
+///
+/// このトークナイザは形態素解析を持たない文字 n-gram ベースのため、助詞を文法的に
+/// 正確に切り出すことはできない。そのため除去は「ユニグラムとして単独出現した場合」
+/// に限定し、バイグラムの構成要素として出現する場合（例: 「もの」の「の」）は除去
+/// しない。これにより CJK コンテンツ（内容語）自体は保持したまま、助詞の単独トークン
+/// 化のみを抑制する。
+const CJK_STOPWORD_UNIGRAMS: [char; 10] =
+    ['は', 'が', 'を', 'に', 'で', 'と', 'も', 'の', 'へ', 'や'];
+
+/// 小文字化した 1 文字が [`CJK_STOPWORD_UNIGRAMS`] に含まれる助詞・機能語かどうか。
+fn is_cjk_stopword_unigram(c: char) -> bool {
+    CJK_STOPWORD_UNIGRAMS.contains(&c)
+}
+
+/// クエリ・文書テキストをトークン列へ分割する（TASK-102 の簡易トークナイザ、
+/// CJK ストップワード除去は TASK-105・SEARCH-5 対応）。
+///
+/// [`tokenize_with_options`] を `remove_stopwords = true`（既定で除去 ON）で呼ぶ薄い
+/// ラッパ。詳細な挙動・契約は [`tokenize_with_options`] を参照。
+pub fn tokenize(text: &str) -> Vec<String> {
+    tokenize_with_options(text, true)
+}
+
+/// [`tokenize`] の除去有無を選べる版（TASK-105・対象ビヘイビア SEARCH-5）。
 ///
 /// 小文字化した上で、ASCII 英数字・アンダースコアの連続を単語トークンとし、CJK 文字は
-/// 文字ユニグラム＋隣接 2 文字のバイグラムを生成する。CJK ストップワード除去は含まない。
-/// 関連: TASK-105。
+/// 文字ユニグラム＋隣接 2 文字のバイグラムを生成する。`remove_stopwords = true` の場合、
+/// [`CJK_STOPWORD_UNIGRAMS`] に含まれる助詞・機能語がユニグラムとして単独出現した際に
+/// そのユニグラムだけを出力から除く（バイグラムは除去しない。「もの」の「の」のような
+/// 内容語内部の助詞文字を壊さないため）。除去有無で `SparseIndex::build`/`search` の
+/// 対称性は自動的に保たれる（`tokenize()` は常に除去 ON のため index/query 間で
+/// トークナイザが一致する）。除去有無による Recall@20 の比較測定は
+/// `crates/engine/tests/sparse_stopwords.rs` を参照。
 ///
 /// 入力長に対して線形（`O(n)`）に処理し、`Vec` の初期容量は入力を `chars()` で数えた
-/// 実際の文字数からのみ見積もる。トークンが 1 つも得られない入力（空文字列・記号のみ等）
-/// は空の `Vec` を返す（呼び出し側はこれをエラーではなく空結果として扱う契約とする）。
+/// 実際の文字数からのみ見積もる。トークンが 1 つも得られない入力（空文字列・記号のみ・
+/// 助詞のみ等）は空の `Vec` を返す（呼び出し側はこれをエラーではなく空結果として扱う
+/// 契約とする）。
 ///
 /// 対応範囲は ASCII 単語文字と CJK（ひらがな・カタカナ・CJK 統合漢字）に限る。それ以外の
-/// 文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ等）は無音で破棄され、
-/// ASCII 単語の途中に出現した場合はその文字が欠落するだけでなく**その位置で単語が
-/// 分割される**（前後が 1 トークンへ結合されるのではない。例: `"cafés"` →
-/// `["caf", "s"]`）。この分割で生じる偽トークンは統計（`term_freq`・`doc_freq`・
-/// `doc_len`）を汚染しうる。関連: TASK-105。
+/// 文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ・中黒 `・`
+/// U+30FB 等）は単語区切りとして無音で破棄され、ASCII 単語の途中に出現した場合は
+/// その文字が欠落するだけでなく**その位置で単語が分割される**（前後が 1 トークンへ
+/// 結合されるのではない。例: `"cafés"` → `["caf", "s"]`）。この分割で生じる偽トークンは
+/// 統計（`term_freq`・`doc_freq`・`doc_len`）を汚染しうる。
 ///
 /// 契約: この関数自体は `text` のバイト長・文字数に上限を設けない。呼び出し側
 /// （[`SparseIndex::with_params`]・[`SparseIndex::search`]）が `tokenize()` を呼ぶ前に
 /// それぞれの上限（`MAX_DOC_BYTES`・`MAX_QUERY_BYTES`）を検証する経路からのみ呼ばれる
 /// ことを前提とする。本関数を直接 untrusted 入力に対して呼ぶ場合は、呼び出し側で
 /// 同等の長さ検証を行うこと。
-pub fn tokenize(text: &str) -> Vec<String> {
+pub fn tokenize_with_options(text: &str, remove_stopwords: bool) -> Vec<String> {
     let lower: Vec<char> = text.to_lowercase().chars().collect();
     // ASCII 単語 + CJK ユニグラム/バイグラムを見積もった容量（過小でも Vec は伸長するため
     // 上限としての正確性は不要。検証済み長さの char 数のみを根拠にする）。
@@ -344,8 +381,11 @@ pub fn tokenize(text: &str) -> Vec<String> {
             tokens.push(std::mem::take(&mut word));
         }
         if is_cjk_char(c) {
-            // ユニグラム
-            tokens.push(c.to_string());
+            // ユニグラム（助詞の単独トークン化のみ抑制。バイグラムは除去しないため
+            // 内容語の一部として現れる助詞文字は保持される）。
+            if !(remove_stopwords && is_cjk_stopword_unigram(c)) {
+                tokens.push(c.to_string());
+            }
             // 直後の文字も CJK ならバイグラムを追加する（境界をまたぐ語の再現性向上）。
             if let Some(&next) = lower.get(i + 1) {
                 if is_cjk_char(next) {
@@ -715,6 +755,68 @@ mod tests {
     fn tokenize_halfwidth_katakana_yields_no_tokens() {
         // 半角カタカナは `is_cjk_char` のレンジ（全角カタカナ U+30A0..=U+30FF）に含まれない。
         assert!(tokenize("ﾃｽﾄ").is_empty());
+    }
+
+    // --- CJK ストップワード除去（TASK-105・対象ビヘイビア SEARCH-5） ---
+
+    #[test]
+    fn tokenize_particle_unigram_is_removed_by_default() {
+        // 「本の」→ ユニグラム(本, の) + バイグラム(本の) のうち、助詞「の」の
+        // 単独ユニグラムのみが既定（除去 ON）で出力から除かれる。
+        let toks = tokenize("本の");
+        assert_eq!(toks, vec!["本", "本の"]);
+        assert!(!toks.contains(&"の".to_string()));
+    }
+
+    #[test]
+    fn tokenize_with_options_remove_stopwords_false_keeps_particle_unigram() {
+        // 除去 OFF（`remove_stopwords = false`）では助詞ユニグラムも保持される
+        // （除去有無の比較測定のための対称 API。関連: SEARCH-5）。
+        let toks = tokenize_with_options("本の", false);
+        assert_eq!(toks, vec!["本", "本の", "の"]);
+    }
+
+    #[test]
+    fn tokenize_particle_inside_bigram_is_preserved() {
+        // 助詞文字が内容語の内部（バイグラム）に現れる場合は除去しない
+        // （例: 「もの」の「の」。CJK コンテンツ自体を保持する方針）。
+        let toks = tokenize("もの");
+        assert_eq!(toks, vec!["もの"]);
+        // 「も」「の」は単独ユニグラムとして除去されるが、バイグラム「もの」は残る。
+        assert!(toks.contains(&"もの".to_string()));
+        assert!(!toks.contains(&"も".to_string()));
+        assert!(!toks.contains(&"の".to_string()));
+    }
+
+    #[test]
+    fn tokenize_nakaguro_is_treated_as_separator() {
+        // 中黒「・」は記号として単語区切りに扱われ、トークンを生成しない
+        // （TASK-105 対応で is_cjk_char のレンジから除外）。
+        let toks = tokenize("東京・大阪");
+        assert!(!toks.iter().any(|t| t.contains('・')));
+        // 区切りの前後にある「東京」「大阪」はそれぞれ独立に CJK トークン化される
+        // （中黒をまたぐバイグラムは生成されない）。
+        assert!(toks.contains(&"東京".to_string()));
+        assert!(toks.contains(&"大阪".to_string()));
+        assert!(!toks.iter().any(|t| t.contains("京・")));
+        assert!(!toks.iter().any(|t| t.contains("・大")));
+    }
+
+    #[test]
+    fn tokenize_choonpu_is_preserved_as_cjk_content() {
+        // 長音符「ー」はカタカナ語の構成要素のため CJK 扱いのまま保持する
+        // （例: 「サーバー」。中黒のみを除外し長音符は除外しない）。
+        let toks = tokenize("サーバー");
+        assert!(toks.contains(&"サー".to_string()));
+        assert!(toks.contains(&"ーバ".to_string()));
+        assert!(toks.contains(&"バー".to_string()));
+    }
+
+    #[test]
+    fn tokenize_cjk_punctuation_still_yields_no_tokens() {
+        // 句読点「、」「。」は is_cjk_char のレンジ外のため、TASK-105 前後で挙動は
+        // 変わらずトークン化されない（現状挙動の固定）。
+        assert!(tokenize("、。").is_empty());
     }
 
     // --- SparseIndex 構築・境界値 ---
