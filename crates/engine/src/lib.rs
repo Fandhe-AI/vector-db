@@ -14,7 +14,10 @@
 //! TABLE-7）・TASK-146（テーブル粒度次元固定・複数テーブル共存の拡張機能。対象ビヘイビア:
 //! EXT-1, EXT-2）・TASK-90（2 テーブル横断トランザクション・クラッシュ耐性回帰テスト。対象
 //! ビヘイビア: TABLE-10）・TASK-87（コールドスタート・ベクトルアリーナ。対象ビヘイビア:
-//! TABLE-8）。検索カーネル・認証・RLS ポリシー評価等の実ロジックは後続タスクで追加する。
+//! TABLE-8）・TASK-124（`VectorCore` trait・`PolicyContext`・検索カーネル provider 層の
+//! 製品コア。対象ビヘイビア: CORE-1, CORE-2, CORE-13）。プロトコル層（`wire-server`）は
+//! `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド差し替え等は後続タスク
+//! で拡張する。
 //!
 //! 性能系タスク（TASK-127・TASK-130・TASK-83 等）向けの計測プロトコル基盤は
 //! `benches/harness/`（TASK-158。lib 本体外・`cargo bench`／`tests/bench_harness.rs`
@@ -22,6 +25,9 @@
 
 pub mod arena;
 pub mod catalog;
+pub mod core;
+pub mod kernel;
+pub mod policy;
 pub mod row_codec;
 pub mod storage;
 pub mod txn;

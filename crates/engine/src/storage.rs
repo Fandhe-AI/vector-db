@@ -532,13 +532,15 @@ pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
-/// 黙殺フォールバックで既知の型・デフォルト値へ落とさない）。添字アクセス `[]` ではなく
-/// `get()` を使い、境界外アクセスを未定義動作にしない。
+/// 行バイト列の先頭（バージョン・`tenant_id`・`visibility`）だけをデコードする
+/// [`decode_row`] の共有前段。embedding・metadata のバイト列へは触れないため、
+/// それらが破損していても本関数の成否には影響しない。
 ///
-/// `pub(crate)`: `txn.rs`（TASK-88）の読み取りスナップショットハンドルが、`Storage::get`
-/// と同一のデコード・fail-closed 契約で行を読み出すために再利用する。
-pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
+/// 呼び出し文脈: [`decode_row`]（フル デコード）と [`decode_row_tenant_and_visibility`]
+/// （ヘッダのみ）の両方がこの関数を呼ぶ。ロジックを 1 箇所に集約することで、
+/// 検証条件（`tenant_len` 上限・UTF-8・空文字列拒否等）が両者で食い違わないようにする。
+/// 成功時は `(tenant_id, visibility, visibility バイトの直後のオフセット)` を返す。
+fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
@@ -591,6 +593,37 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     offset = offset
         .checked_add(1)
         .ok_or_else(|| StorageError::Codec("offset overflow after visibility field".to_string()))?;
+
+    Ok((tenant_id, visibility, offset))
+}
+
+/// 行バイト列から `tenant_id`・`visibility` だけを取り出す（[`decode_row_header`] の
+/// 薄いラッパー）。embedding・metadata のデコードは行わない。
+///
+/// 呼び出し文脈: `arena.rs::VectorArena::build_filtered` が、可視性判定（呼び出し元の
+/// `predicate`）に必要な最小限の情報だけを、embedding のデコード（次元検証を含む）を
+/// 経ずに安全に取得するために使う。これにより、不可視行（他テナント行）の embedding
+/// 部分が破損していても、その破損を検出する前に `predicate` で弾いてスキップできる
+/// （他テナントのデータ破損状態が対象テナントの検索可用性へ干渉しない設計にする。
+/// codex P0 対応・Issue #137）。
+///
+/// ヘッダ部自体（バージョン・`tenant_len`・`tenant_id`・`visibility`）が破損していて
+/// 可視性を判定できない場合は、`decode_row_header` と同じ理由で `Err` を返す
+/// （呼び出し元はこの行を「不可視だからスキップ」とは判断できないため fail-closed。
+/// `arena.rs` 側のドキュメント参照）。
+pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(String, Visibility)> {
+    let (tenant_id, visibility, _offset_after_header) = decode_row_header(buf)?;
+    Ok((tenant_id, visibility))
+}
+
+/// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
+/// 黙殺フォールバックで既知の型・デフォルト値へ落とさない）。添字アクセス `[]` ではなく
+/// `get()` を使い、境界外アクセスを未定義動作にしない。
+///
+/// `pub(crate)`: `txn.rs`（TASK-88）の読み取りスナップショットハンドルが、`Storage::get`
+/// と同一のデコード・fail-closed 契約で行を読み出すために再利用する。
+pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
+    let (tenant_id, visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset
         .checked_add(4)

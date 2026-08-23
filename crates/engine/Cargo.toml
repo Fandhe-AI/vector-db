@@ -18,6 +18,13 @@ path = "src/lib.rs"
 redb = "=4.2.0"
 
 [dev-dependencies]
+# codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
+# dev-dependency で `EngineCore::storage`/`from_storage`（テナント境界の単一照合パス
+# `PolicyContext::is_visible` を迂回できる生ハンドル API）を結合テストビルドだけへ
+# 限定していたが、feature は公開面であり任意の依存元が有効化してテナント境界を
+# 迂回しうる構造だった。`EngineCore::from_storage` を一方向の所有権移動（`Storage` を
+# 渡すだけで取り出す経路を持たない）に設計変更し、feature 自体を廃止した
+# （`crates/engine/src/core.rs` のドキュメント参照）。
 # tests/persistence.rs・tests/power_loss.rs（対象ビヘイビア: PERSIST-1, PERSIST-4）が、
 # Storage の公開 API では表現できないトランザクション境界・`StorageBackend` 差し替えに
 # 踏み込んで検証するために同一バージョンの redb を直接操作する。新規依存の追加ではなく
