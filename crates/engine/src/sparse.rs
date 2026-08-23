@@ -38,13 +38,22 @@
 //! クエリのバイト長にも `MAX_QUERY_BYTES` の上限を設け、`tokenize()` を呼ぶ前に
 //! 検証する。
 //!
+//! [`SparseIndex::build`]/[`SparseIndex::with_params`] も同様の理由で、各文書に対して
+//! `tokenize()` を呼ぶ前に文書 1 件のバイト長（`MAX_DOC_BYTES`）とコーパスの文書数
+//! （`MAX_CORPUS_DOCS`）を検証する。詳細は [`SparseIndex::with_params`] を参照。
+//!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
-//! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる
-//! （本モジュール自体は文書テキストの文字数上限検証を行わない）。クエリはバイト長を
-//! `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` でそれぞれ上限検証する（詳細は
-//! [`SparseIndex::search`]）。頻度・長さの演算はすべて `checked_*`/`saturating_*` を
-//! 用い、オーバーフローを未定義動作にしない。`tokenize()` 内の添字アクセスは事前の
-//! ループ境界チェックにより範囲内が証明可能（panic しない）。
+//! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる。
+//! クエリはバイト長を `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` で上限検証し
+//! （詳細は [`SparseIndex::search`]）、文書はバイト長を `MAX_DOC_BYTES`、コーパスの
+//! 文書数を `MAX_CORPUS_DOCS` で上限検証する（詳細は [`SparseIndex::with_params`]）。
+//! いずれの検証も `tokenize()` を呼ぶ前にバイト長・件数のみを見る `O(1)` の判定で
+//! 完結し、追加アロケーションを要しない。公開関数 [`tokenize`] 自体はこれらの上限を
+//! 強制しない（呼び出し側が上限検証済みの入力のみを渡す契約とする。詳細は
+//! [`tokenize`] のドキュメントを参照）。頻度・長さの演算はすべて
+//! `checked_*`/`saturating_*` を用い、オーバーフローを未定義動作にしない。
+//! `tokenize()` 内の添字アクセスは事前のループ境界チェックにより範囲内が証明可能
+//! （panic しない）。
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -80,6 +89,24 @@ const MAX_QUERY_TERMS: usize = 1024;
 /// 繰り返し入力によるバイト数だけの増幅を有界に保つための上限とする。
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 
+/// [`SparseIndex::with_params`]（構築）が受け付ける 1 文書のバイト長の上限。
+///
+/// `with_params()` は各文書テキストに対して `tokenize()` を呼ぶため、
+/// [`MAX_QUERY_BYTES`] と同じ理由（アロケーションを伴う走査コストがバイト長に
+/// 比例する）で、文書 1 件のバイト長にも上限が必要になる。文書はクエリより
+/// 大きな単位（チャンク・段落等）になりうるため、[`MAX_QUERY_BYTES`]（16 KiB）の
+/// 64 倍にあたる 1 MiB を上限とする。
+const MAX_DOC_BYTES: usize = 1024 * 1024;
+
+/// [`SparseIndex::with_params`]（構築）が受け付けるコーパスの文書数の上限。
+///
+/// [`MAX_DOC_BYTES`] は 1 文書あたりのコストを有界にするが、文書数 `N` を
+/// 無制限に許すとコーパス全体の処理コスト（総バイト数は最悪 `N * MAX_DOC_BYTES`
+/// に達する）が無制限に増える。10 万件は単一の `SparseIndex` に載せるコーパス
+/// として十分大きい一方、`N * MAX_DOC_BYTES` の積を有界に保つための上限として
+/// 妥当な値とする。
+const MAX_CORPUS_DOCS: usize = 100_000;
+
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
 ///
@@ -104,6 +131,19 @@ pub enum SparseError {
     /// （[`MAX_QUERY_BYTES`] のコメント参照）。`tokenize()` を呼ぶ前に `query.len()`
     /// （アロケーション不要）で判定し、`search()` の入口で fail-closed に拒否する。
     QueryTooLong { len: usize, max: usize },
+    /// コーパス内の 1 文書のバイト長が [`MAX_DOC_BYTES`] を超える。`with_params()` は
+    /// 各文書に対して `tokenize()` を呼ぶため、`QueryTooLong` と同じ理由で
+    /// `tokenize()` を呼ぶ前に `text.len()`（アロケーション不要）で判定し、
+    /// fail-closed に拒否する。
+    DocTooLong {
+        doc_id: DocId,
+        len: usize,
+        max: usize,
+    },
+    /// コーパスの文書数が [`MAX_CORPUS_DOCS`] を超える。`with_params()` の入口で
+    /// （各文書の走査に入る前に）`docs.len()`（アロケーション不要）で判定し、
+    /// fail-closed に拒否する。
+    TooManyDocs { len: usize, max: usize },
 }
 
 impl std::fmt::Display for SparseError {
@@ -121,6 +161,15 @@ impl std::fmt::Display for SparseError {
             }
             SparseError::QueryTooLong { len, max } => {
                 write!(f, "query too long: {len} bytes (max {max})")
+            }
+            SparseError::DocTooLong { doc_id, len, max } => {
+                write!(
+                    f,
+                    "document too long: doc_id={doc_id}, {len} bytes (max {max})"
+                )
+            }
+            SparseError::TooManyDocs { len, max } => {
+                write!(f, "too many documents in corpus: {len} (max {max})")
             }
         }
     }
@@ -195,9 +244,9 @@ fn is_cjk_char(c: char) -> bool {
 /// 文字ユニグラム＋隣接 2 文字のバイグラムを生成する。CJK ストップワード除去は含まない。
 /// 関連: TASK-105。
 ///
-/// 入力長に対して線形（`O(n)`）に処理し、`Vec` の初期容量は入力の文字数（検証済みの
-/// 長さ）からのみ見積もる。トークンが 1 つも得られない入力（空文字列・記号のみ等）は
-/// 空の `Vec` を返す（呼び出し側はこれをエラーではなく空結果として扱う契約とする）。
+/// 入力長に対して線形（`O(n)`）に処理し、`Vec` の初期容量は入力を `chars()` で数えた
+/// 実際の文字数からのみ見積もる。トークンが 1 つも得られない入力（空文字列・記号のみ等）
+/// は空の `Vec` を返す（呼び出し側はこれをエラーではなく空結果として扱う契約とする）。
 ///
 /// 対応範囲は ASCII 単語文字と CJK（ひらがな・カタカナ・CJK 統合漢字）に限る。それ以外の
 /// 文字（全角英数字・アクセント付きラテン文字・ハングル・半角カタカナ等）は無音で破棄され、
@@ -205,6 +254,12 @@ fn is_cjk_char(c: char) -> bool {
 /// 分割される**（前後が 1 トークンへ結合されるのではない。例: `"cafés"` →
 /// `["caf", "s"]`）。この分割で生じる偽トークンは統計（`term_freq`・`doc_freq`・
 /// `doc_len`）を汚染しうる。関連: TASK-105。
+///
+/// 契約: この関数自体は `text` のバイト長・文字数に上限を設けない。呼び出し側
+/// （[`SparseIndex::with_params`]・[`SparseIndex::search`]）が `tokenize()` を呼ぶ前に
+/// それぞれの上限（`MAX_DOC_BYTES`・`MAX_QUERY_BYTES`）を検証する経路からのみ呼ばれる
+/// ことを前提とする。本関数を直接 untrusted 入力に対して呼ぶ場合は、呼び出し側で
+/// 同等の長さ検証を行うこと。
 pub fn tokenize(text: &str) -> Vec<String> {
     let lower: Vec<char> = text.to_lowercase().chars().collect();
     // ASCII 単語 + CJK ユニグラム/バイグラムを見積もった容量（過小でも Vec は伸長するため
@@ -288,12 +343,25 @@ impl SparseIndex {
     /// 不正値は `search()` 内で NaN 伝播・ガード節（`if score > 0.0` 等）により
     /// サイレントな空結果へ落ちてしまい fail-open になるため、ここで拒否して
     /// fail-closed を保つ（`.claude/rules/coding-rust.md`）。
+    ///
+    /// `docs` はコーパス全体のサイズを制限する 2 段の上限検証を、各文書に対して
+    /// `tokenize()`（アロケーションを伴う）を呼ぶ前に行う（`.claude/rules/coding-rust.md`:
+    /// untrusted 入力の長さは上限検証してから処理する）。文書数が [`MAX_CORPUS_DOCS`]
+    /// を超える場合は走査に入る前に [`SparseError::TooManyDocs`] で拒否し、各文書の
+    /// バイト長が [`MAX_DOC_BYTES`] を超える場合は該当文書の `tokenize()` を呼ぶ前に
+    /// [`SparseError::DocTooLong`] で拒否する。
     pub fn with_params(docs: &[(DocId, &str)], k1: f64, b: f64) -> Result<Self, SparseError> {
         if !k1.is_finite() || k1 < 0.0 || !b.is_finite() || !(0.0..=1.0).contains(&b) {
             return Err(SparseError::InvalidParams { k1, b });
         }
         if docs.is_empty() {
             return Err(SparseError::EmptyCorpus);
+        }
+        if docs.len() > MAX_CORPUS_DOCS {
+            return Err(SparseError::TooManyDocs {
+                len: docs.len(),
+                max: MAX_CORPUS_DOCS,
+            });
         }
 
         let mut seen_ids: BTreeMap<DocId, ()> = BTreeMap::new();
@@ -304,6 +372,13 @@ impl SparseIndex {
         for &(doc_id, text) in docs {
             if seen_ids.insert(doc_id, ()).is_some() {
                 return Err(SparseError::DuplicateDocId(doc_id));
+            }
+            if text.len() > MAX_DOC_BYTES {
+                return Err(SparseError::DocTooLong {
+                    doc_id,
+                    len: text.len(),
+                    max: MAX_DOC_BYTES,
+                });
             }
 
             let doc_tokens = tokenize(text);
@@ -352,6 +427,11 @@ impl SparseIndex {
     /// 返す仕様とする（エラーにはしない。決定的な空結果への fail-closed 寄りの挙動）。
     /// `k == 0` の場合、または `k` がコーパスの文書数を上回る場合もそれぞれ空/全件で
     /// 決定的に扱う。スコア同点時は `doc_id` 昇順でタイブレークする（再現性確保）。
+    ///
+    /// 契約: 入力検証（クエリのバイト長・一意語数の上限検証）は `k == 0` の早期 return
+    /// より常に優先される。すなわち `k == 0` であっても、クエリが [`MAX_QUERY_BYTES`]・
+    /// [`MAX_QUERY_TERMS`] を超えていれば空の `Vec` ではなく `Err` を返す（fail-closed の
+    /// 原則を優先し、入力検証の可否が `k` の値に依存しない統一された契約とする）。
     ///
     /// 計算量: コーパスの全文書（`N` 件）についてクエリの一意語集合（`Q` 語）を
     /// `BTreeMap`（語彙数 `V`）で検索するため `O(N * Q * log V)`、その上で
@@ -842,6 +922,72 @@ mod tests {
         let idx = SparseIndex::build(&docs).unwrap();
         let query = "a".repeat(MAX_QUERY_BYTES + 1);
         let err = idx.search(&query, 10).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::QueryTooLong {
+                len: MAX_QUERY_BYTES + 1,
+                max: MAX_QUERY_BYTES,
+            }
+        );
+    }
+
+    // --- 文書 1 件のバイト長上限（fail-closed。MAX_DOC_BYTES 境界） ---
+
+    #[test]
+    fn build_accepts_doc_at_max_doc_bytes_boundary() {
+        let text = "a".repeat(MAX_DOC_BYTES);
+        let docs = vec![(1u64, text.as_str())];
+        assert!(SparseIndex::build(&docs).is_ok());
+    }
+
+    #[test]
+    fn build_rejects_doc_exceeding_max_doc_bytes() {
+        let text = "a".repeat(MAX_DOC_BYTES + 1);
+        let docs = vec![(1u64, text.as_str())];
+        let err = SparseIndex::build(&docs).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::DocTooLong {
+                doc_id: 1,
+                len: MAX_DOC_BYTES + 1,
+                max: MAX_DOC_BYTES,
+            }
+        );
+    }
+
+    // --- コーパス文書数上限（fail-closed。MAX_CORPUS_DOCS 境界） ---
+
+    #[test]
+    fn build_accepts_corpus_at_max_corpus_docs_boundary() {
+        let docs: Vec<(DocId, &str)> = (0..MAX_CORPUS_DOCS as u64)
+            .map(|id| (id, "alpha"))
+            .collect();
+        assert!(SparseIndex::build(&docs).is_ok());
+    }
+
+    #[test]
+    fn build_rejects_corpus_exceeding_max_corpus_docs() {
+        let docs: Vec<(DocId, &str)> = (0..(MAX_CORPUS_DOCS as u64 + 1))
+            .map(|id| (id, "alpha"))
+            .collect();
+        let err = SparseIndex::build(&docs).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyDocs {
+                len: MAX_CORPUS_DOCS + 1,
+                max: MAX_CORPUS_DOCS,
+            }
+        );
+    }
+
+    // --- 入力検証の優先順位（fail-closed。k == 0 の早期 return より常に優先） ---
+
+    #[test]
+    fn search_rejects_overlong_query_even_when_k_is_zero() {
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let query = "a".repeat(MAX_QUERY_BYTES + 1);
+        let err = idx.search(&query, 0).unwrap_err();
         assert_eq!(
             err,
             SparseError::QueryTooLong {
