@@ -55,17 +55,44 @@ extract_item_block() {
   # パターン直後に識別子構成文字（英数字・アンダースコア）が続く場合は、より長い
   # 別名（例: `pub struct Row` に対する `pub struct RowInput`）への誤マッチとみなし
   # 除外する（単語境界判定）。
+  #
   # attrbuf（直前の外側属性行の蓄積バッファ）は `#[...]` 行以外なら常にクリアして
   # いたが、`///` ドキュメンテーションコメント行や、外側属性とアイテム本体の間の
   # 空行を挟む配置（`#[derive(...)]\n///...\npub struct Foo`）でも先行する属性が
   # 比較前に失われてしまい、属性の変更を見逃す可能性があった。ドキュメントコメント
   # 行・空行は属性の連続とみなしてバッファを保持し、それ以外の実コード行でのみ
-  # クリアする（PR #139 レビュー対応: Cursor Bugbot 指摘）。
+  # クリアする。加えて、`#[cfg_attr(\n  ...,\n)]` のように角括弧が複数行へまたがる
+  # 外側属性は、`^#[` 一致の先頭行だけを蓄積すると継続行が欠落していた。角括弧の
+  # 対応（`[` と `]` の出現数の差）を追跡し、開いた角括弧が閉じきるまで後続行を
+  # 無条件に属性の継続とみなして蓄積する（PR #139 レビュー対応: codex-review P1
+  # 指摘）。
+  #
+  # `found` 状態はブロック終端（`^}`）到達時に `exit` せず `found=0` に戻すのみと
+  # し、ファイル全体の走査を継続する。これにより、同一パターン（例:
+  # `impl PolicyContext`）が複数ブロックに分割されて出現する場合も、最初の
+  # 1 ブロックで打ち切らず全ブロックを抽出対象に含める（PR #139 レビュー対応:
+  # Cursor Bugbot 指摘）。
   local block
   block="$(awk -v item="${item_pattern}" '
+    function bracket_delta(s,    n, i, c, d) {
+      d = 0
+      n = length(s)
+      for (i = 1; i <= n; i++) {
+        c = substr(s, i, 1)
+        if (c == "[") d++
+        else if (c == "]") d--
+      }
+      return d
+    }
     found {
       print
-      if ($0 ~ /^}/) exit
+      if ($0 ~ /^}/) { found = 0; attrbuf = "" }
+      next
+    }
+    in_attr {
+      attrbuf = attrbuf $0 "\n"
+      attr_depth += bracket_delta($0)
+      if (attr_depth <= 0) in_attr = 0
       next
     }
     $0 ~ ("^" item "([^A-Za-z0-9_]|$)") {
@@ -74,7 +101,12 @@ extract_item_block() {
       found = 1
       next
     }
-    /^#\[/ { attrbuf = attrbuf $0 "\n"; next }
+    /^#\[/ {
+      attrbuf = attrbuf $0 "\n"
+      attr_depth = bracket_delta($0)
+      if (attr_depth > 0) in_attr = 1
+      next
+    }
     /^[[:space:]]*\/\// { next }
     /^[[:space:]]*$/ { next }
     { attrbuf = "" }
