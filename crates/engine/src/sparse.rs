@@ -32,15 +32,19 @@
 //! 文書数のみに比例するのではなく `O(N * Q * log V + M log k)`（`N`: コーパス文書数、
 //! `Q`: クエリの一意語数、`V`: コーパス全体の語彙数、`M`: スコア `> 0` の一致文書数）
 //! である。長いクエリは `N * Q` の積として CPU コストを増幅するため、一意語数の上限を
-//! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。
+//! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。ただし
+//! `tokenize()` 自体はクエリのバイト長に比例したコストを持つため、一意語数の少ない
+//! 繰り返し入力（同じ語や区切り文字の反復）はこの検証だけでは防げない。そのため
+//! クエリのバイト長にも `MAX_QUERY_BYTES` の上限を設け、`tokenize()` を呼ぶ前に
+//! 検証する。
 //!
 //! untrusted 入力の扱い: すべての処理を入力長に対して線形に保つ（バイグラム生成含む）。
 //! `Vec::with_capacity` は入力を `chars()` で数えた実際の文字数からのみ見積もる
-//! （本モジュール自体はクエリ・文書テキストの文字数上限検証を行わない）。クエリの
-//! 一意語数のみ `MAX_QUERY_TERMS` で上限検証する（詳細は [`SparseIndex::search`]）。
-//! 頻度・長さの演算はすべて `checked_*`/`saturating_*` を用い、オーバーフローを
-//! 未定義動作にしない。`tokenize()` 内の添字アクセスは事前のループ境界チェックにより
-//! 範囲内が証明可能（panic しない）。
+//! （本モジュール自体は文書テキストの文字数上限検証を行わない）。クエリはバイト長を
+//! `MAX_QUERY_BYTES`、一意語数を `MAX_QUERY_TERMS` でそれぞれ上限検証する（詳細は
+//! [`SparseIndex::search`]）。頻度・長さの演算はすべて `checked_*`/`saturating_*` を
+//! 用い、オーバーフローを未定義動作にしない。`tokenize()` 内の添字アクセスは事前の
+//! ループ境界チェックにより範囲内が証明可能（panic しない）。
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -63,6 +67,19 @@ const DEFAULT_B: f64 = 0.75;
 /// クエリを十分満たす一方、積を有界に保つための上限として妥当な値とする。
 const MAX_QUERY_TERMS: usize = 1024;
 
+/// [`SparseIndex::search`] が受け付けるクエリのバイト長の上限。
+///
+/// [`MAX_QUERY_TERMS`] は一意語数のみを制限するため、同じ語や区切り文字を大量に
+/// 繰り返すクエリ（一意語数は少数のままバイト長だけが増大する入力）を防げない。
+/// `tokenize()` はクエリ全体を小文字化して `Vec<char>` へ収集し各トークンごとに
+/// `String` を確保するため、その繰り返しはバイト長に比例した CPU・メモリを消費する。
+/// この検証は `query.len()`（バイト長）を `tokenize()` 呼び出し前に見るだけで済み、
+/// 追加アロケーションなしで `O(1)` に判定できる。16 KiB は
+/// `MAX_QUERY_TERMS`（1024 語）の一意語を平均的な単語長で表現するのに十分な余裕を
+/// 持たせつつ（1 語あたり数バイト～十数バイト換算で 1024 語は数 KiB 程度に収まる）、
+/// 繰り返し入力によるバイト数だけの増幅を有界に保つための上限とする。
+const MAX_QUERY_BYTES: usize = 16 * 1024;
+
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
 ///
@@ -82,6 +99,11 @@ pub enum SparseError {
     /// fail-closed に拒否する（`.claude/rules/coding-rust.md`: untrusted 入力の長さは
     /// 上限検証してから処理する）。
     TooManyQueryTerms { unique_terms: usize, max: usize },
+    /// クエリのバイト長が [`MAX_QUERY_BYTES`] を超える。`TooManyQueryTerms` は一意語数
+    /// のみを制限するため、同じ語・区切り文字の繰り返しによるバイト長の増大は防げない
+    /// （[`MAX_QUERY_BYTES`] のコメント参照）。`tokenize()` を呼ぶ前に `query.len()`
+    /// （アロケーション不要）で判定し、`search()` の入口で fail-closed に拒否する。
+    QueryTooLong { len: usize, max: usize },
 }
 
 impl std::fmt::Display for SparseError {
@@ -96,6 +118,9 @@ impl std::fmt::Display for SparseError {
             }
             SparseError::TooManyQueryTerms { unique_terms, max } => {
                 write!(f, "too many unique query terms: {unique_terms} (max {max})")
+            }
+            SparseError::QueryTooLong { len, max } => {
+                write!(f, "query too long: {len} bytes (max {max})")
             }
         }
     }
@@ -334,9 +359,23 @@ impl SparseIndex {
     /// `O(M log k)` を要する（合計 `O(N * Q * log V + M log k)`）。クエリの一意語数
     /// `Q` が大きいほどコーパス全体との積で処理コストが増幅するため、`Q` が
     /// [`MAX_QUERY_TERMS`] を超える場合は走査に入る前に
-    /// [`SparseError::TooManyQueryTerms`] で拒否する（fail-closed。
+    /// [`SparseError::TooManyQueryTerms`] で拒否する。また `tokenize()` はクエリ全体を
+    /// 走査してアロケーションを行うため、一意語数の少ない繰り返し入力（同じ語や区切り
+    /// 文字の反復）でもバイト長に比例したコストがかかる。そのためクエリのバイト長が
+    /// [`MAX_QUERY_BYTES`] を超える場合は、`tokenize()` を呼ぶ前に
+    /// [`SparseError::QueryTooLong`] で拒否する（両者とも fail-closed。
     /// `.claude/rules/coding-rust.md`: untrusted 入力の長さは上限検証してから処理する）。
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredDoc>, SparseError> {
+        // アロケーションを伴う `tokenize()` を呼ぶ前に、バイト長（`str::len()`。文字列を
+        // 走査しない `O(1)` 操作）で untrusted なクエリを検証する。一意語数の検証
+        // （`MAX_QUERY_TERMS`）だけでは、同じ語・区切り文字を大量に繰り返す入力の
+        // バイト長そのものの増大を防げないため、この検証が必要になる。
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(SparseError::QueryTooLong {
+                len: query.len(),
+                max: MAX_QUERY_BYTES,
+            });
+        }
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -779,6 +818,35 @@ mod tests {
             SparseError::TooManyQueryTerms {
                 unique_terms: MAX_QUERY_TERMS + 1,
                 max: MAX_QUERY_TERMS,
+            }
+        );
+    }
+
+    // --- クエリのバイト長上限（fail-closed。MAX_QUERY_BYTES 境界） ---
+
+    #[test]
+    fn search_accepts_query_at_max_query_bytes_boundary() {
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        // ASCII 単語文字のみからなる 1 トークン（一意語数は 1 のため MAX_QUERY_TERMS
+        // には抵触しない）で、バイト長だけを上限ちょうどにする。同じ語・区切り文字の
+        // 反復で一意語数を増やさずにバイト長だけを膨らませる攻撃形を模した境界値。
+        let query = "a".repeat(MAX_QUERY_BYTES);
+        assert_eq!(query.len(), MAX_QUERY_BYTES);
+        assert!(idx.search(&query, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_rejects_query_exceeding_max_query_bytes() {
+        let docs = vec![(1u64, "alpha")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let query = "a".repeat(MAX_QUERY_BYTES + 1);
+        let err = idx.search(&query, 10).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::QueryTooLong {
+                len: MAX_QUERY_BYTES + 1,
+                max: MAX_QUERY_BYTES,
             }
         );
     }
