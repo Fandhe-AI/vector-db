@@ -36,6 +36,19 @@ use crate::sparse::tokenize;
 /// （coding-rust.md「無制限確保禁止」）。
 const MAX_POOL_DEPTH: usize = 10_000;
 
+/// `query_text` のバイト長上限。[`LexicalOverlapReranker::rerank`] は `query_text` を
+/// `tokenize()`（`String`・`BTreeSet` を確保する）へ渡すため、`sparse.rs::MAX_QUERY_BYTES`
+/// と同じ理由・同じ値で `tokenize()` を呼ぶ前に `query_text.len()`（アロケーション不要）
+/// で判定し、[`rerank_candidates`] の入口で fail-closed に拒否する。
+const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
+
+/// 候補 1 件（`RerankCandidate::text`）のバイト長上限。`sparse.rs::MAX_DOC_BYTES` と
+/// 同じ理由・同じ値を採用する。候補件数自体は [`MAX_POOL_DEPTH`]（`cfg.pool_depth()`）で
+/// 別途上限があるため、この上限と合わせて候補側の走査・アロケーションコストの総量を
+/// 有界に保つ（[`MAX_CANDIDATE_TEXT_BYTES`] は 1 件あたり、[`MAX_POOL_DEPTH`] は件数の
+/// 上限で、互いに独立な検証のため両方が必要）。
+const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
+
 /// リランク対象の候補 1 件（[`crate::hybrid::HybridHit`] から融合スコアと文書テキストを
 /// 添えて渡す入力表現）。`text` はリランカーの素性計算専用であり、SQL・プラン文字列の
 /// 組み立てには使わない（coding-rust.md「untrusted 入力の扱い」）。
@@ -138,6 +151,16 @@ pub enum RerankError {
     InvalidOutputOrder,
     /// [`Reranker`] 実装の出力件数が要求した `final_k` を超えていた。
     OversizedResult { len: usize, max: usize },
+    /// `query_text` のバイト長が [`MAX_QUERY_TEXT_BYTES`] を超える。`reranker.rerank()`
+    /// （字句一致系実装は `tokenize()` を呼ぶ）へ渡す前に、[`rerank_candidates`] の
+    /// 入口で `query_text.len()`（アロケーション不要）により判定し fail-closed に
+    /// 拒否する（`sparse.rs::SparseError::QueryTooLong` と同じ理由）。
+    QueryTextTooLong { len: usize, max: usize },
+    /// 候補（`RerankCandidate::text`）のバイト長が [`MAX_CANDIDATE_TEXT_BYTES`] を
+    /// 超える。`reranker.rerank()` を呼ぶ前に候補の走査（`text.len()`。アロケーション
+    /// 不要）で判定し fail-closed に拒否する（`sparse.rs::SparseError::DocTooLong` と
+    /// 同じ理由）。
+    CandidateTextTooLong { id: u64, len: usize, max: usize },
 }
 
 impl fmt::Display for RerankError {
@@ -169,6 +192,13 @@ impl fmt::Display for RerankError {
             RerankError::OversizedResult { len, max } => {
                 write!(f, "reranker returned too many hits: {len} hits (max {max})")
             }
+            RerankError::QueryTextTooLong { len, max } => {
+                write!(f, "rerank query_text too long: {len} bytes (max {max})")
+            }
+            RerankError::CandidateTextTooLong { id, len, max } => write!(
+                f,
+                "rerank candidate text too long: id={id} {len} bytes (max {max})"
+            ),
         }
     }
 }
@@ -228,11 +258,17 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
 /// `core.rs` 相当の呼び出し元へ最終上位を返す統合点。TASK-107）。
 ///
 /// 入力検証（`reranker` 呼び出し前）: 候補件数 ≤ `cfg.pool_depth()`
-/// （[`RerankError::TooManyCandidates`]）・スコア有限性（[`RerankError::NonFiniteScore`]）・
-/// 融合スコア降順同点 id 昇順（[`RerankError::UnsortedInput`]）・id 重複なし
-/// （[`RerankError::DuplicateId`]）の順に検証する（`hybrid.rs::rrf_fuse` と同じ検証順序:
-/// 長さ→有限性→順序→重複。長さを最初に検証してから初めて残りの走査を許すのは
-/// coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」に従う）。
+/// （[`RerankError::TooManyCandidates`]）・`query_text` のバイト長 ≤
+/// [`MAX_QUERY_TEXT_BYTES`]（[`RerankError::QueryTextTooLong`]）・候補ごとのテキストの
+/// バイト長 ≤ [`MAX_CANDIDATE_TEXT_BYTES`]（[`RerankError::CandidateTextTooLong`]）・
+/// スコア有限性（[`RerankError::NonFiniteScore`]）・融合スコア降順同点 id 昇順
+/// （[`RerankError::UnsortedInput`]）・id 重複なし（[`RerankError::DuplicateId`]）の順に
+/// 検証する（`hybrid.rs::rrf_fuse` と同じ検証順序: 長さ→有限性→順序→重複。長さを最初に
+/// 検証してから初めて残りの走査を許すのは coding-rust.md「長さフィールドは上限検証して
+/// からアロケーションに使う」に従う。`query_text`・候補テキストの長さ検証は
+/// `reranker.rerank()`（[`LexicalOverlapReranker`] 等の実装が `tokenize()` へ渡す）を
+/// 呼ぶ前に行い、`sparse.rs::MAX_QUERY_BYTES`・`MAX_DOC_BYTES` と同じ理由で無制限な
+/// アロケーション・走査コストの増幅を防ぐ）。
 ///
 /// `final_k` は `1..=cfg.pool_depth()` を検証し、`0` または超過は [`RerankError::InvalidK`]
 /// （`hybrid.rs::hybrid_search` が `k` を `cfg.pool_depth()` 基準で検証するのと同じ理由:
@@ -265,6 +301,31 @@ pub fn rerank_candidates(
         return Err(RerankError::TooManyCandidates {
             len: candidates.len(),
             max: cfg.pool_depth(),
+        });
+    }
+
+    // `query_text` のバイト長を `reranker.rerank()` を呼ぶ（実装が `tokenize()` へ渡し
+    // `String`・`BTreeSet` を確保しうる）前に検証する（`sparse.rs::SparseError::QueryTooLong`
+    // と同じ理由: `query_text.len()` はアロケーションを伴わない）。
+    if query_text.len() > MAX_QUERY_TEXT_BYTES {
+        return Err(RerankError::QueryTextTooLong {
+            len: query_text.len(),
+            max: MAX_QUERY_TEXT_BYTES,
+        });
+    }
+
+    // 候補ごとのテキストのバイト長も同じ理由で `reranker.rerank()` を呼ぶ前に検証する
+    // （`sparse.rs::SparseError::DocTooLong` と同じ理由）。候補件数は直前の
+    // `TooManyCandidates` 検証により `cfg.pool_depth()`（`MAX_POOL_DEPTH` 以下）に
+    // 収まっているため、この走査コスト自体は有界。
+    if let Some(c) = candidates
+        .iter()
+        .find(|c| c.text.len() > MAX_CANDIDATE_TEXT_BYTES)
+    {
+        return Err(RerankError::CandidateTextTooLong {
+            id: c.id,
+            len: c.text.len(),
+            max: MAX_CANDIDATE_TEXT_BYTES,
         });
     }
 
@@ -602,6 +663,57 @@ mod tests {
         let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
         let err = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).unwrap_err();
         assert_eq!(err, RerankError::TooManyCandidates { len: 2, max: 1 });
+    }
+
+    #[test]
+    fn rerank_candidates_rejects_query_text_exceeding_max_bytes() {
+        let cfg = RerankConfig::default();
+        let oversized_query = "a".repeat(MAX_QUERY_TEXT_BYTES + 1);
+        let candidates = [cand(1, 1.0, "a")];
+        let err =
+            rerank_candidates(&IdentityReranker, &oversized_query, &candidates, &cfg).unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::QueryTextTooLong {
+                len: MAX_QUERY_TEXT_BYTES + 1,
+                max: MAX_QUERY_TEXT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn rerank_candidates_accepts_query_text_at_max_bytes_boundary() {
+        let cfg = RerankConfig::default();
+        let boundary_query = "a".repeat(MAX_QUERY_TEXT_BYTES);
+        let candidates = [cand(1, 1.0, "a")];
+        let hits =
+            rerank_candidates(&IdentityReranker, &boundary_query, &candidates, &cfg).expect("ok");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn rerank_candidates_rejects_candidate_text_exceeding_max_bytes() {
+        let cfg = RerankConfig::default();
+        let oversized_text = "a".repeat(MAX_CANDIDATE_TEXT_BYTES + 1);
+        let candidates = [cand(1, 1.0, oversized_text.as_str())];
+        let err = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::CandidateTextTooLong {
+                id: 1,
+                len: MAX_CANDIDATE_TEXT_BYTES + 1,
+                max: MAX_CANDIDATE_TEXT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn rerank_candidates_accepts_candidate_text_at_max_bytes_boundary() {
+        let cfg = RerankConfig::default();
+        let boundary_text = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        let candidates = [cand(1, 1.0, boundary_text.as_str())];
+        let hits = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).expect("ok");
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
