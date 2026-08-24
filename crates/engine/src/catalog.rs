@@ -1078,4 +1078,47 @@ mod tests {
             "expected Err(Invalid) once table count exceeds MAX_LIST_TABLES, got {result:?}"
         );
     }
+
+    // --- Storage::get_row_headers_from_table -------------------------------
+    // `rls.rs::PrefilterIndex::search` が失効行の再検証に使うヘルパー（TASK-133、
+    // 対象ビヘイビア: RLS-1〜4。codex-review P0 指摘・PR #151 対応）の `None` 分岐
+    // （該当 id の行が存在しない）を直接カバーする。本クレートには行削除 API がまだ
+    // 存在しないため、削除された行ではなく最初から未挿入の id で再現する
+    // （`rls.rs` 側の単体テストがこの分岐を担っていたが、`PrefilterIndex::search` から
+    // `storage` 引数を除去した設計変更により、そちらでは再現不能になったため本テストへ
+    // 移設した）。
+
+    #[test]
+    fn get_row_headers_from_table_returns_none_for_a_missing_id() {
+        let path = unique_db_path("row-headers-missing-id");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // id=1 は存在するが、id=999 は未挿入（削除相当）。行テーブル自体は存在するため
+        // `TableNotFound` ではなく `None` 分岐（`row_table.get(id)? == None`）を通る。
+        let headers = storage
+            .get_row_headers_from_table("docs", &[1, 999])
+            .expect("get_row_headers_from_table ok");
+        assert_eq!(headers.len(), 2);
+        assert!(headers[0].is_some());
+        assert!(headers[1].is_none());
+    }
 }
