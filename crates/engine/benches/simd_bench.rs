@@ -37,7 +37,7 @@
 mod harness;
 
 use harness::accept::{
-    check_p95_within_limit, check_recall_within_limit, p95_from_samples, recall_at_k,
+    check_p95_within_limit, check_recall_within_limit, p95_from_samples, recall_at_k, worst_recall,
 };
 use harness::protocol::{run, MeasurementConfig};
 use harness::rng::DeterministicRng;
@@ -53,8 +53,9 @@ const ROW_COUNT: usize = 100_000;
 const DIM: usize = 768;
 const TOP_K: usize = 20;
 
-/// Recall@k 判定に使うクエリ本数（複数クエリの平均で判定し、単一クエリの偶然による
-/// ぶれを抑える。本数自体は本ベンチ独自の実装選択で spec 由来の値ではない）。
+/// Recall@k 判定に使うクエリ本数（複数クエリの最小値〔worst-query〕で判定し、
+/// 単一クエリでの偶然の完全一致に判定全体が引きずられないようにする。
+/// 本数自体は本ベンチ独自の実装選択で spec 由来の値ではない）。
 const RECALL_QUERY_COUNT: usize = 20;
 
 /// `BENCH_MAX_P95_MS` 環境変数（ミリ秒・整数）を読み取り、CORE-3・SEARCH-4 の
@@ -165,8 +166,10 @@ fn main() {
     // `parallel_search.rs` の単体テストでも小規模に検証済み）。近似 provider が
     // 導入された時点で本チェックが実質的な Recall 受け入れゲートとして機能する
     // （spec ポインタ: TASK-127 CORE-4）。
+    // クエリ間の平均ではなく worst-query（最小値）で判定する
+    // （`harness::accept::worst_recall` のドキュメント参照）。
     let reference = CpuScalarProvider;
-    let mut recall_sum = 0.0f64;
+    let mut recalls = Vec::with_capacity(RECALL_QUERY_COUNT);
     for _ in 0..RECALL_QUERY_COUNT {
         let query = rng.next_vector(DIM);
 
@@ -195,14 +198,15 @@ fn main() {
             .map(|hit| hit.id)
             .collect();
 
-        recall_sum += recall_at_k(&expected, &actual).expect("non-empty reference top-k");
+        recalls.push(recall_at_k(&expected, &actual).expect("non-empty reference top-k"));
     }
-    let recall = recall_sum / RECALL_QUERY_COUNT as f64;
-    let recall_ok = check_recall_within_limit(recall, min_recall)
+    let recall_min =
+        worst_recall(&recalls).expect("RECALL_QUERY_COUNT queries yield a non-empty recall list");
+    let recall_ok = check_recall_within_limit(recall_min, min_recall)
         .expect("min_recall validated by min_recall_from_env");
     passed &= recall_ok;
     println!(
-        "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall={recall:.6} limit={min_recall:.6} pass={recall_ok}"
+        "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} limit={min_recall:.6} pass={recall_ok}"
     );
 
     // --- CORE-5: 対照エンジン比較（本 PR では未接続。判定関数のみ用意） ---

@@ -62,13 +62,35 @@ pub fn check_p95_within_limit(p95: Duration, max_p95: Duration) -> bool {
     p95 <= max_p95
 }
 
+/// 複数クエリの Recall@k 列から worst-query（最小値）を取り出す（CORE-4）。
+///
+/// 両 provider（`ParallelSearchProvider`・`CpuScalarProvider`）はいずれも厳密最近傍
+/// であり、本測定の本質は Top-k 完全一致の回帰チェックである。平均を採用すると
+/// 1 クエリだけ不一致でも他クエリの一致に埋もれて `min_recall` を通過しうる
+/// （例: 19 件完全一致・1 件不一致でも平均は 1.0 に近い高値を維持する）。
+/// worst-query（最小値）を採用することで単一クエリの不一致もそのまま判定へ反映する。
+/// `recalls` が空の場合は判定不能として `Err`（fail-closed。`recall_at_k`・
+/// `p95_from_samples` と同一の空入力拒否方針）。
+pub fn worst_recall(recalls: &[f64]) -> Result<f64, BenchError> {
+    recalls
+        .iter()
+        .copied()
+        .fold(None, |acc, value| match acc {
+            None => Some(value),
+            Some(min) => Some(f64::min(min, value)),
+        })
+        .ok_or(BenchError::EmptySamples)
+}
+
 /// Recall@k が下限（`min_recall`）以上かを判定する（CORE-4）。
-/// `min_recall` は `[0.0, 1.0]` の範囲外だと判定基準として意味を持たないため
-/// `Err`（fail-closed）とする。
+/// `min_recall` は `(0.0, 1.0]` の範囲外だと判定基準として意味を持たないため
+/// `Err`（fail-closed）とする。`0.0` を許容すると「どんな recall 値でも pass」
+/// となり CORE-4 のゲートが実質的に無効化されるため下限からも除外する
+/// （`simd_bench.rs` の `min_recall_from_env` と同一の不変条件）。
 pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, BenchError> {
-    if !(0.0..=1.0).contains(&min_recall) {
+    if !(min_recall > 0.0 && min_recall <= 1.0) {
         return Err(BenchError::ProtocolViolation(
-            "min_recall must be within [0.0, 1.0]",
+            "min_recall must be within (0.0, 1.0]",
         ));
     }
     Ok(recall >= min_recall)

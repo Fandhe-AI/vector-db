@@ -16,7 +16,7 @@ mod harness;
 
 use harness::accept::{
     check_contrast_ratio_within_limit, check_p95_within_limit, check_recall_within_limit,
-    p95_from_samples, recall_at_k,
+    p95_from_samples, recall_at_k, worst_recall,
 };
 use harness::stats::BenchError;
 use std::time::Duration;
@@ -71,6 +71,32 @@ fn recall_at_k_deduplicates_repeated_actual_ids() {
 #[test]
 fn recall_at_k_rejects_empty_expected_set() {
     let err = recall_at_k(&[], &[1, 2, 3]).unwrap_err();
+    assert_eq!(err, BenchError::EmptySamples);
+}
+
+// worst_recall（CORE-4）。
+
+#[test]
+fn worst_recall_picks_the_minimum_of_many_values() {
+    let recalls = vec![1.0; 19]
+        .into_iter()
+        .chain(std::iter::once(0.95))
+        .collect::<Vec<f64>>();
+    // 19 件が完全一致（1.0）でも 1 件の不一致（0.95）がそのまま判定に反映される
+    // ことを確認する（平均だと 0.9975 相当に埋もれてしまう回帰防止）。
+    let recall = worst_recall(&recalls).unwrap();
+    assert!((recall - 0.95).abs() < f64::EPSILON);
+}
+
+#[test]
+fn worst_recall_returns_the_single_value_for_singleton_input() {
+    let recall = worst_recall(&[0.5]).unwrap();
+    assert!((recall - 0.5).abs() < f64::EPSILON);
+}
+
+#[test]
+fn worst_recall_rejects_empty_input() {
+    let err = worst_recall(&[]).unwrap_err();
     assert_eq!(err, BenchError::EmptySamples);
 }
 
@@ -144,6 +170,15 @@ fn check_recall_within_limit_rejects_out_of_range_min_recall() {
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 
     let err = check_recall_within_limit(0.5, -0.1).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn check_recall_within_limit_rejects_zero_min_recall() {
+    // 0.0 を許容すると「どんな recall 値でも pass」となり CORE-4 のゲートが
+    // 実質的に無効化されるため、`min_recall_from_env`（simd_bench.rs）と同様に
+    // 下限からも除外する（`(0.0, 1.0]`）。
+    let err = check_recall_within_limit(0.0, 0.0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
