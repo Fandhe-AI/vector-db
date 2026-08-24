@@ -4,7 +4,8 @@
 //! `sparse` は storage/catalog に依存しない純関数的モジュールのため、他の統合テストの
 //! ような DB パスヘルパは不要。公開 API（`SparseIndex::build`/`search`）経由で
 //! 「キーワード一致文書が Top-k に入る」「同一入力なら同一順位（決定性）」を検証する。
-//! 関連: TASK-104。
+//! 関連: TASK-104。CJK ストップワード除去（TASK-105・対象ビヘイビア SEARCH-5）固有の
+//! 観点は `crates/engine/tests/sparse_stopwords.rs` を参照。
 
 use engine::sparse::SparseIndex;
 
