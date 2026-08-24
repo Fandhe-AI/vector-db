@@ -236,14 +236,15 @@ fn input_errors_are_identical_and_do_not_trigger_fallback_regardless_of_backend_
     );
     assert!(observer_healthy.events().is_empty());
 
-    // primary が既に実行時エラーを起こす縮退状態の場合: このモック
-    // （`FailingBackend`）は入力検証を行わず常にバックエンド実行エラーを
-    // 返すため、まず縮退イベントが 1 件発生し、続く CPU 縮退経路
-    // （`run_batch_search`）が同じ次元不一致検証を行って同一の `Err` を返す。
-    // 「入力エラーは常に primary 到達前に弾かれる」わけではなく、「縮退が
-    // 起きた場合でも CPU 経路の入力検証は primary と同じ結果を返す」ことが
-    // 本テストの主眼（縮退経路だけ検証が緩い、という構造的欠落がないことの
-    // 確認）。
+    // primary が実行時エラーを起こす状態（`FailingBackend`。呼ばれれば常に
+    // `BatchExecError::Backend` を返す）でも、不正入力は primary に到達する
+    // 前に `FallbackBatchEngine::batch_search` の先行入力検証
+    // （`batch_search.rs::validate_batch_queries`）で弾かれる（TASK-129・
+    // CORE-8 レビュー起因の P1 指摘対応・PR #152）。primary を検証前に呼ぶと、
+    // 不正入力 1 件で `runtime_latched` が恒久ラッチされ、以降の正当な検索
+    // まで CPU 縮退経路へ固定される可用性バグになるため、`FailingBackend` は
+    // 一度も呼ばれず、縮退イベントも一切発生しない（primary が健全なときと
+    // 完全に同一の `Err`・観測結果になることが本テストの主眼）。
     let observer_degraded = RecordingObserver::default();
     let engine_degraded = FallbackBatchEngine::build(
         &ids,
@@ -259,12 +260,78 @@ fn input_errors_are_identical_and_do_not_trigger_fallback_regardless_of_backend_
         Box::new(observer_degraded.clone()),
     )
     .expect("build ok");
-    let err_degraded = engine_degraded
-        .batch_search(&queries)
-        .expect_err("dim mismatch must be rejected even when the backend is otherwise failing");
+    let err_degraded = engine_degraded.batch_search(&queries).expect_err(
+        "dim mismatch must be rejected before the backend is ever invoked, \
+         even when the backend would otherwise fail",
+    );
     assert_eq!(err_degraded, err_healthy);
-    let events = observer_degraded.events();
-    assert_eq!(events.len(), 1);
+    assert!(
+        observer_degraded.events().is_empty(),
+        "input validation failures must not reach the primary backend or latch the runtime fallback"
+    );
+}
+
+// 回帰テスト（TASK-129・CORE-8 レビュー起因の P1 指摘対応・PR #152）:
+// 不正入力（先行入力検証で拒否される）は `runtime_latched` を先取りで
+// ラッチしない。もし誤って先取りラッチしていた場合、後続の正当なクエリは
+// 「既にラッチ済み」として primary を一切呼ばずに CPU 縮退経路へ直行して
+// しまい、縮退イベントが発生しない（＝ここで primary が実際に呼ばれたことを
+// 証明できない）。したがって「不正入力の直後に正当なクエリを送ると、
+// primary が実際に呼ばれて実行時エラーによる縮退イベントがちょうど 1 件
+// 発生する」ことを確認することで、不正入力側でラッチが起きていないことを
+// 間接的に証明する。
+#[test]
+fn invalid_query_does_not_prematurely_latch_the_runtime_fallback() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                "lost".to_string(),
+            ))) as Box<dyn BatchBackend>)
+        },
+        Box::new(observer.clone()),
+    )
+    .expect("build ok");
+
+    // 1 回目: 不正入力（次元不一致）。先行入力検証で拒否され、primary には
+    // 到達しない。
+    let ctx_a = ctx("tenant-a");
+    let bad_query = [1.0f32, 0.0, 0.0];
+    let bad_queries = vec![BatchQuery {
+        vector: &bad_query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+    engine
+        .batch_search(&bad_queries)
+        .expect_err("dim mismatch must be rejected");
+    assert!(observer.events().is_empty());
+
+    // 2 回目: 正当な入力。`runtime_latched` が 1 回目で先取りラッチされて
+    // いなければ、primary（`FailingBackend`）が実際に呼ばれて実行時エラーを
+    // 返し、CPU 縮退経路へ切り替わりつつ縮退イベントがちょうど 1 件発生する。
+    let good_query = [1.0f32, 0.0];
+    let good_queries = vec![BatchQuery {
+        vector: &good_query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+    let hits = engine
+        .batch_search(&good_queries)
+        .expect("valid query must still reach the primary backend");
+    assert_eq!(hits.len(), 1);
+    let events = observer.events();
+    assert_eq!(
+        events.len(),
+        1,
+        "the primary backend must have been invoked exactly once, by the valid query"
+    );
     assert_eq!(events[0].reason, FallbackReason::Runtime);
 }
 

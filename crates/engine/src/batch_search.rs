@@ -959,15 +959,26 @@ impl BatchEngine {
     }
 }
 
-/// [`BatchEngine::batch_search`] の走査パイプライン本体（TASK-129・CORE-8
-/// ポインタで [`BatchRowSource`] 越しに共有化。挙動はリファクタ前と不変）。
-/// `batch_fallback.rs::FallbackBatchEngine` の CPU 縮退経路もこの関数を直接
-/// 呼ぶため、GPU 参照実装（[`ResidentMatrix`]）と CPU 縮退用 f32 常駐行列は
-/// 検証・テナントマスク・選出後の独立再検証を完全に同一のコードパスで通る。
-pub(crate) fn run_batch_search<S: BatchRowSource>(
-    source: &S,
+/// クエリ列の入力検証（次元・非有限値・`k`・バッチ件数・`sum(k)`）。
+/// [`run_batch_search`] の走査本体（テナントマスク・計算量ガード・選出）とは
+/// 独立した関数として切り出す（TASK-129・CORE-8 レビュー起因の P1 指摘
+/// 対応・PR #152）。`batch_fallback.rs::FallbackBatchEngine::batch_search` は
+/// 公開差し替え点である `BatchBackend`（primary。実 GPU/外部実装に差し替え
+/// 可能）を呼び出す前に本関数を先行適用する。走査ロジックの内部（
+/// `run_batch_search`）だけで検証すると、primary 実装が入力検証を行わず
+/// 不正入力に対して `BatchExecError::Backend`（実行時エラー）を返した場合、
+/// 検証前に primary へ処理が渡ってしまい、不正入力 1 件で `runtime_latched`
+/// が恒久固定され、以降の正当な検索まで CPU 縮退経路へ固定されてしまう
+/// （可用性バグ。入力検証エラーとバックエンド実行エラーを峻別するという
+/// 本モジュール群の設計方針にも反する）。
+///
+/// 次元不一致・非有限値・`k` 範囲外は単一クエリだけを見て安価に判定できる
+/// 入力エラーであり、走査コストと無関係に最優先で報告する（`core.rs::search`
+/// と同じ方針。次元不一致のクライアントに計算量エラーを返さない）。
+pub(crate) fn validate_batch_queries(
+    dim: usize,
     queries: &[BatchQuery<'_>],
-) -> Result<Vec<BatchHit>, BatchSearchError> {
+) -> Result<(), BatchSearchError> {
     if queries.len() > MAX_BATCH_QUERIES {
         return Err(BatchSearchError::TooManyQueries {
             count: queries.len(),
@@ -975,17 +986,11 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         });
     }
 
-    // 事前検証パス（1 巡目）: 次元・非有限値・k をクエリごとに検証し、
-    // `sum(k)` を積算する。選出器の生成は `sum(k)` の上限検証（下記）を
-    // 通過してから行う（未検証の総量でヒープを成長させない）。次元不一致・
-    // 非有限値・k 範囲外は単一クエリだけを見て安価に判定できる入力エラー
-    // であり、走査コストと無関係に最優先で報告する（core.rs::search と同じ
-    // 方針。次元不一致のクライアントに計算量エラーを返さない）。
     let mut total_k: usize = 0;
     for (query_index, q) in queries.iter().enumerate() {
-        if q.vector.len() != source.dim() {
+        if q.vector.len() != dim {
             return Err(BatchSearchError::DimMismatch {
-                expected: source.dim(),
+                expected: dim,
                 found: q.vector.len(),
             });
         }
@@ -1011,6 +1016,24 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             max: MAX_BATCH_TOTAL_K,
         });
     }
+    Ok(())
+}
+
+/// [`BatchEngine::batch_search`] の走査パイプライン本体（TASK-129・CORE-8
+/// ポインタで [`BatchRowSource`] 越しに共有化。挙動はリファクタ前と不変）。
+/// `batch_fallback.rs::FallbackBatchEngine` の CPU 縮退経路もこの関数を直接
+/// 呼ぶため、GPU 参照実装（[`ResidentMatrix`]）と CPU 縮退用 f32 常駐行列は
+/// 検証・テナントマスク・選出後の独立再検証を完全に同一のコードパスで通る。
+pub(crate) fn run_batch_search<S: BatchRowSource>(
+    source: &S,
+    queries: &[BatchQuery<'_>],
+) -> Result<Vec<BatchHit>, BatchSearchError> {
+    // 事前検証パス（1 巡目）: [`validate_batch_queries`] を参照。単独関数を
+    // 通しても本関数単体で呼ばれた場合（`BatchEngine::batch_search`・CPU
+    // 縮退経路の `run_batch_search` 直接呼び出し）の検証は従来どおり保たれる
+    // （`FallbackBatchEngine::batch_search` からの先行呼び出しと合わせて
+    // 二重に実行されるが、入力に対する冪等な検証であり結果は変わらない）。
+    validate_batch_queries(source.dim(), queries)?;
 
     // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
     // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]

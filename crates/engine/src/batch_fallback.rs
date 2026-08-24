@@ -134,6 +134,18 @@ impl std::error::Error for BatchExecError {}
 /// - 同一クエリ内で id が重複しない
 /// - スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::into_sorted_vec` と
 ///   同じ規約）
+///
+/// 逆に、[`FallbackBatchEngine`] 経由で呼ばれる実装は `queries` を自前で
+/// 再検証する必要はない: [`FallbackBatchEngine::batch_search`] は
+/// `batch_search.rs::validate_batch_queries`（次元一致・非有限値なし・
+/// `k` が範囲内・バッチ件数上限内・`sum(k)` が上限内）を本 trait の呼び出し
+/// より前に適用する（TASK-129・CORE-8 レビュー起因の P1 指摘対応・PR #152）。
+/// この順序は可用性のための契約でもある: もし実装が独自の入力検証を行い、
+/// 不正入力に対して `BatchExecError::Backend`（実行時エラー）を返すと、
+/// `FallbackBatchEngine` はそれを「デバイスの恒久故障」と誤認して以降の
+/// 全呼び出しを CPU 縮退へ固定してしまう。入力検証エラーは常に
+/// `BatchExecError::Input` として返し、`BatchExecError::Backend` は実際の
+/// バックエンド実行障害（デバイスロスト等）専用に使うこと。
 pub trait BatchBackend: Send + Sync {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError>;
 }
@@ -632,26 +644,54 @@ impl FallbackBatchEngine {
         Ok(())
     }
 
-    /// バッチ検索を実行する（CORE-8 ポインタ）。primary が利用可能かつ実行時
-    /// ラッチ未発火なら primary を実行し、[`BatchExecError::Backend`]
-    /// （実行時エラー）の場合のみ CPU 縮退経路へ再実行しつつ `runtime_latched`
-    /// をラッチする（初回検知時のみ observer へ通知。以降は primary を再試行
-    /// せず直接 CPU 経路へ進む。「無制限の stderr 出力・primary への無駄な
-    /// 再試行コストを防ぐ」という CORE-8 レビュー起因の要件）。
-    /// [`BatchExecError::Input`]（入力エラー）は縮退させず `Err` をそのまま
-    /// 返す（TenantMaskViolation を含む `BatchSearchError` は常にこちら経由で、
-    /// 縮退イベントを発生させない）。primary が初期化失敗済み
-    /// （[`PrimarySlot::Unavailable`]）の場合は最初から CPU 経路を使う（追加の
-    /// 縮退イベントは発生させない。構築時に既に 1 件通知済みのため）。primary
-    /// が成功を返した場合も、その結果をそのまま信頼せず
-    /// [`Self::revalidate_primary_hits`] で独立再検証する（codex-review P0
-    /// 指摘対応・PR #152）。違反時は CPU 縮退へ再実行せず `Err` をそのまま
-    /// 返す（同メソッドのドキュメンテーションコメント参照）。
+    /// バッチ検索を実行する（CORE-8 ポインタ）。
+    ///
+    /// primary（[`BatchBackend`]。公開差し替え点で将来の実 GPU/外部実装に
+    /// 差し替え可能）・CPU 縮退経路のいずれを呼ぶよりも先に、共有の入力検証
+    /// [`crate::batch_search::validate_batch_queries`] を適用する（TASK-129・
+    /// CORE-8 レビュー起因の P1 指摘対応・PR #152）。この順序が重要な理由:
+    /// 検証前に primary へ処理を渡すと、入力検証を行わない実装が不正入力
+    /// （次元不一致・非有限値・`k` 範囲外・バッチ件数超過等）に対して
+    /// `BatchExecError::Backend`（実行時エラー）を返しうる。これを検知すると
+    /// 下記の実行時エラー処理が `runtime_latched` を恒久ラッチしてしまい、
+    /// 悪意ある/バグのある単一の不正入力だけで以降の正当な検索まで CPU
+    /// 縮退経路へ固定される可用性バグになる。先行検証により、不正入力は
+    /// primary 呼び出し・ラッチ更新・observer 通知のいずれも発生させずに
+    /// `Err` を返す。
+    ///
+    /// 先行検証を通過した後、primary が利用可能かつ実行時ラッチ未発火なら
+    /// primary を実行し、[`BatchExecError::Backend`]（実行時エラー）の場合
+    /// のみ CPU 縮退経路へ再実行しつつ `runtime_latched` をラッチする（初回
+    /// 検知時のみ observer へ通知。以降は primary を再試行せず直接 CPU 経路
+    /// へ進む。「無制限の stderr 出力・primary への無駄な再試行コストを防ぐ」
+    /// という CORE-8 レビュー起因の要件）。[`BatchExecError::Input`]（primary
+    /// 自身が返す入力エラー。上記の先行検証とは別に、primary 固有の検証
+    /// ロジックが返しうる `BatchSearchError`）は縮退させず `Err` をそのまま
+    /// 返す（TenantMaskViolation を含め、縮退イベントを発生させない）。primary
+    /// が初期化失敗済み（[`PrimarySlot::Unavailable`]）の場合は最初から CPU
+    /// 経路を使う（追加の縮退イベントは発生させない。構築時に既に 1 件
+    /// 通知済みのため）。primary が成功を返した場合も、その結果をそのまま
+    /// 信頼せず [`Self::revalidate_primary_hits`] で独立再検証する
+    /// （codex-review P0 指摘対応・PR #152）。違反時は CPU 縮退へ再実行せず
+    /// `Err` をそのまま返す（同メソッドのドキュメンテーションコメント参照）。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
     ) -> Result<Vec<BatchHit>, BatchSearchError> {
         use std::sync::atomic::Ordering;
+
+        // primary・CPU 縮退のどちらへも処理を渡す前に、入力自体の妥当性を
+        // 確定させる（本メソッドのドキュメンテーションコメント「先行検証」
+        // 参照）。`self.cpu.dim` は [`Self::build`] が `ResidentMatrix::build`
+        // （primary 用）と `CpuFallbackMatrix`（CPU 縮退用）の双方へ同じ
+        // `dim` 引数を渡して構築するため、両経路で共通の値として使える。
+        // これは `backend_factory`（[`Self::build`] の引数）が受け取った
+        // `ResidentMatrix` をそのまま primary の走査対象として使う、という
+        // 暗黙の契約に依存する: `backend_factory` が別の次元を持つ行列で
+        // primary を構築した場合、本チェックはその primary にとって正しい
+        // 検証にならない（現状の唯一の実装 [`GpuReferenceBackend::new`] は
+        // 渡された `ResidentMatrix` をそのまま使うためこの契約を満たす）。
+        crate::batch_search::validate_batch_queries(self.cpu.dim, queries)?;
 
         if self.runtime_latched.load(Ordering::Acquire) {
             return run_batch_search(&self.cpu, queries);
