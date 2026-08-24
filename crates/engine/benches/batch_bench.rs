@@ -8,19 +8,30 @@
 //! 標準出力には実測値と pass/fail のみを書き、注入された閾値そのものは出力しない
 //! （`.claude/rules/spec-confidentiality.md`）。
 //!
-//! - CORE-7（動的窓の劣化上限・アクティブなゲート）: 単発クエリを直接
-//!   `ParallelSearchProvider` へ渡す経路（A・CORE-3 相当）と、同一クエリを
-//!   [`engine::batch_search::DynamicWindowAggregator`] 経由でバッチ化して
-//!   `BatchEngine::batch_search` へ渡す経路（B）を `harness::ab::run_ab` で
-//!   interleaved 計測し、B の p95 が A に対して劣化率上限
-//!   （`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを判定する。
+//! - CORE-7（動的窓の劣化上限・アクティブなゲート）: 同一クエリを同一
+//!   `BatchEngine::batch_search`（同一 `ResidentMatrix`・f16 デコード・
+//!   テナントマスク・visibility フィルタを共有）へ渡す 2 経路を
+//!   `harness::ab::run_ab` で interleaved 計測する。A（CORE-3 相当）は
+//!   [`engine::batch_search::DynamicWindowAggregator`] を経由せず 1 件の
+//!   `BatchQuery` を直接組み立てて渡し、B は同じクエリを
+//!   `DynamicWindowAggregator::push`/`drain` に通してから渡す。両者の差分が
+//!   「動的窓集約それ自体のオーバーヘッド」のみになるよう、エンジン・行列・
+//!   マスク経路・k をすべて揃える（レビュー指摘対応: 以前は A 側が
+//!   `ParallelSearchProvider` への直接呼び出しだったため、f16 デコード・
+//!   テナントマスク・並列/非並列の違いまで丸ごと乗った差分になっており、
+//!   窓集約の真の劣化を検出できないゲートになっていた）。B の p95 が A に
+//!   対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを判定する。
 //! - CORE-6（GPU 経路 vs CPU-SIMD の p95 短縮率）・CORE-16（f16 常駐 vs f32 常駐の
 //!   p95 短縮率）: 実 GPU バックエンド未接続のため実測不能
 //!   （`crates/engine/src/batch_search.rs` モジュール冒頭コメント参照。CPU 上の
 //!   参照実装を GPU の代替として計測することはアサーション弱体化にあたるため行わない）。
-//!   `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in）が未設定の既定では「対象外」を
-//!   標準出力へ明示するのみで合否には数えない（`parallel_bench.rs` の CORE-5 opt-in
-//!   方式と同型）。フラグ指定時のみ「未測定＝判定不能」を fail-closed として扱う。
+//!   `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in）が未設定（空文字含む）の既定では
+//!   「対象外」を標準出力へ明示するのみで合否には数えない（`parallel_bench.rs` の
+//!   CORE-5 opt-in の骨格を踏襲するが、opt-in 判定は非空値ならすべて要求とみなす
+//!   よう本ファイル側で強化している。レビュー指摘対応: `"1"` 完全一致のみを
+//!   有効とみなす方式だと `"true"`/`"yes"` 等の non-"1" な truthy 値がサイレントに
+//!   「未設定」と同じ fail-open 側へ落ちるため）。フラグ指定時のみ
+//!   「未測定＝判定不能」を fail-closed として扱う。
 
 // `harness` の取り込み方針は `parallel_bench.rs` と同一（本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
@@ -33,8 +44,6 @@ use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
 
 use engine::batch_search::{BatchEngine, BatchQuery, DynamicWindowAggregator, ResidentMatrix};
-use engine::kernel::{SearchInput, SearchProvider};
-use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
@@ -69,10 +78,16 @@ fn max_degradation_pct_from_env() -> Result<f64, String> {
 }
 
 /// `BENCH_CORE6`/`BENCH_CORE16` 環境変数を読み取り、実 GPU 未接続の判定不能ゲートを
-/// opt-in で有効化するかを返す（`"1"` のときのみ有効）。`parallel_bench.rs` の
-/// `core5_requested_from_env` と同一方針。
+/// opt-in で有効化するかを返す。値が未設定・空文字のときのみ「対象外」（`false`）とし、
+/// それ以外の非空値はすべて opt-in 要求とみなす（レビュー指摘対応: 以前は `"1"` 完全
+/// 一致のみを有効とみなしており、`"true"`/`"yes"` 等の non-"1" な truthy 値を設定しても
+/// サイレントに「未設定」と同じ fail-open 側の「対象外」経路に落ちていた。opt-in
+/// ゲートの趣旨は「明示的な値が設定されていれば fail-closed 側で判定する」ことなので、
+/// 値の有無で判定し内容の解釈は行わない）。
 fn opt_in_requested_from_env(var: &str) -> bool {
-    std::env::var(var).map(|v| v.trim() == "1").unwrap_or(false)
+    std::env::var(var)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// GPU 未接続の opt-in ゲート 1 本分の標準出力・合否寄与を処理する（CORE-6/CORE-16 共通）。
@@ -115,14 +130,17 @@ fn main() {
 
     let mut passed = true;
 
-    // --- CORE-7: 動的窓経由のバッチ 1 件処理が、単発クエリの直接経路（CORE-3
-    // 相当・ParallelSearchProvider）に対してどれだけ劣化するかを interleaved
-    // A/B で計測する。---
+    // --- CORE-7: 動的窓集約それ自体のオーバーヘッドを、同一エンジン・同一
+    // 常駐行列・同一マスク経路（`BatchEngine::batch_search`）上で
+    // `DynamicWindowAggregator` を経由するか否かの差分だけに揃えて
+    // interleaved A/B で計測する。両ワークロードとも `query_a`/`query_b`
+    // （内容は同一）を毎回 `clone()` してから経路へ渡す点まで揃え、
+    // 「アグリゲータ経由か否か」以外の非対称性（クローン有無など）を
+    // 測定区間へ持ち込まない（レビュー指摘対応）。---
     let ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
     let matrix = ResidentMatrix::build(&ids, &tenant_ids, &visibilities, DIM, &vectors)
         .expect("resident matrix must build for well-formed synthetic input");
     let batch_engine = BatchEngine::new(matrix);
-    let direct_provider = ParallelSearchProvider;
 
     let query_a = rng.next_vector(DIM);
     let query_b = query_a.clone();
@@ -132,18 +150,17 @@ fn main() {
     // `Vec<u64>`（選出 id 列）へ揃える（`black_box` に渡す実体があれば十分で、
     // 経路間で結果の型を揃えること自体に測定上の意味はない）。
     let workload_a = || {
-        let input = SearchInput {
-            ids: &ids,
-            vectors: &vectors,
-            dim: DIM as u32,
-            query: &query_a,
+        let query = query_a.clone();
+        let batch_queries = [BatchQuery {
+            vector: &query,
             k: TOP_K,
-        };
-        direct_provider
-            .search(input)
-            .expect("direct single-query search must succeed for well-formed synthetic input")
+            ctx: &ctx,
+        }];
+        batch_engine
+            .batch_search(&batch_queries)
+            .expect("batch search must succeed for well-formed synthetic input")
             .into_iter()
-            .map(|hit| hit.id)
+            .flat_map(|hit| hit.hits.into_iter().map(|h| h.id))
             .collect::<Vec<u64>>()
     };
 
