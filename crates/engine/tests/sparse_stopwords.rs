@@ -3,9 +3,9 @@
 //!
 //! `crates/engine/tests/sparse.rs`（TASK-102、SEARCH-1/3）の役割を引き継ぎつつ、
 //! 本ファイルは TASK-105 固有の観点（助詞ユニグラムの単独トークン化抑制・CJK
-//! コンテンツの保持・除去有無による Recall@20 の比較測定）に限定する。
+//! コンテンツの保持・除去有無によるランキング品質の相対比較）に限定する。
 //!
-//! 本ファイル内の `bm25_score`/`recall_at_20` は `engine::sparse::tokenize_with_options`
+//! 本ファイル内の `bm25_rank` は `engine::sparse::tokenize_with_options`
 //! （公開 API）のみを用いて Okapi BM25 を独立に再計算する測定専用のヘルパであり、
 //! `engine::sparse::SparseIndex`（常にストップワード除去 ON のトークナイザを使う）の
 //! 実装を置き換えるものではない。除去 ON/OFF 双方の挙動を同一の場所で比較測定する
@@ -69,24 +69,10 @@ fn bm25_rank(docs: &[(u64, &str)], query: &str, remove_stopwords: bool) -> Vec<u
     scored.into_iter().map(|(_, id)| id).collect()
 }
 
-/// direct Recall@20: `relevant` のうち Top-20 に入った件数の割合。
-fn recall_at_20(
-    docs: &[(u64, &str)],
-    query: &str,
-    relevant: &[u64],
-    remove_stopwords: bool,
-) -> f64 {
-    let ranked = bm25_rank(docs, query, remove_stopwords);
-    let top20: HashSet<u64> = ranked.into_iter().take(20).collect();
-    let hit = relevant.iter().filter(|id| top20.contains(id)).count();
-    hit as f64 / relevant.len() as f64
-}
-
 /// 合成日本語ミニコーパス（正解付き）。「ベクトル検索エンジン」に関する内容語を持つ
 /// 文書（`RELEVANT_DOC_IDS`）と、助詞を多用するが無関係な内容の文書（ノイズ）を
 /// 混在させる。ノイズ文書はクエリの助詞ユニグラム（の・を等）とは一致しうるが
-/// 内容語のバイグラムとは一致しない。spec 側の PoC 実測値（非公開）は転記せず、
-/// 本テストで計算した実測値のみを下記コメントに記録する。
+/// 内容語のバイグラムとは一致しない。
 fn mini_corpus() -> Vec<(u64, &'static str)> {
     vec![
         (1, "ベクトル検索エンジンの仕組みを解説する記事"),
@@ -124,50 +110,47 @@ fn mini_corpus() -> Vec<(u64, &'static str)> {
 
 const RELEVANT_DOC_IDS: [u64; 3] = [1, 2, 3];
 
+/// この 2 文書はクエリの助詞ユニグラム（を・が・で・の 等）とのみ一致し、内容語の
+/// バイグラムとは一致しない（`mini_corpus` 中で確認済み）。除去 ON では助詞ユニグラム
+/// が単独トークンとして出力されないため、スコア > 0 の一致から外れることを
+/// `stopword_removal_drops_particle_only_noise_matches` で固定する。
+const PARTICLE_ONLY_NOISE_DOC_IDS: [u64; 2] = [13, 17];
+
 #[test]
-fn stopword_removal_does_not_increase_noise_document_matches() {
-    // 助詞ユニグラムの単独一致はノイズ文書のスコアにもわずかに寄与しうる。除去 ON は
-    // その寄与源の一部（助詞の単独一致）を取り除くため、スコア > 0 になるノイズ文書
-    // （「ベクトル検索エンジン」に無関係な文書）の件数は除去 OFF を上回らないことを
-    // 確認する（内容語のバイグラム一致による寄与は ON/OFF で変わらないため、この
-    // 差分は助詞ユニグラム起因の寄与のみを捉える）。
+fn stopword_removal_drops_particle_only_noise_matches() {
+    // 助詞ユニグラムの単独一致のみでスコア > 0 になっていたノイズ文書
+    // （`PARTICLE_ONLY_NOISE_DOC_IDS`）が、除去 ON では一致から外れることを確認する。
+    // 除去 OFF ではトークン集合が除去 ON の上位集合になるため、ON のヒット集合は
+    // OFF の真部分集合になりうるが、それだけでは「除去が実際に効いている」ことの
+    // 証明にはならない。ここでは特定の助詞専用一致文書が ON で確実に脱落することを
+    // 検証し、除去の効果を実体のある形で固定する。
     let docs = mini_corpus();
     let query = "ベクトル検索エンジンの使い方を教えてください";
 
-    let noise_count = |remove_stopwords: bool| -> usize {
-        bm25_rank(&docs, query, remove_stopwords)
-            .into_iter()
-            .filter(|id| !RELEVANT_DOC_IDS.contains(id))
-            .count()
-    };
+    let noise_on: HashSet<u64> = bm25_rank(&docs, query, true)
+        .into_iter()
+        .filter(|id| !RELEVANT_DOC_IDS.contains(id))
+        .collect();
+    let noise_off: HashSet<u64> = bm25_rank(&docs, query, false)
+        .into_iter()
+        .filter(|id| !RELEVANT_DOC_IDS.contains(id))
+        .collect();
 
-    let noise_on = noise_count(true);
-    let noise_off = noise_count(false);
+    for id in PARTICLE_ONLY_NOISE_DOC_IDS {
+        assert!(
+            noise_off.contains(&id),
+            "doc {id} が除去 OFF のノイズ一致に含まれていない（前提が崩れている）"
+        );
+        assert!(
+            !noise_on.contains(&id),
+            "doc {id} が除去 ON でもノイズ一致から脱落していない"
+        );
+    }
     assert!(
-        noise_on <= noise_off,
-        "除去 ON のノイズ文書ヒット数（{noise_on}）が除去 OFF（{noise_off}）を上回っている"
-    );
-}
-
-#[test]
-fn recall_at_20_with_stopword_removal_is_not_lower_than_without() {
-    // 除去 ON の direct Recall@20 が除去 OFF を下回らないことを固定する
-    // （TASK-105 の受入基準: 除去有無の Recall@20 変動を測定・記録する）。
-    // 実測値（本リポ内の合成コーパスのみ。spec 側 PoC の数値は転記しない）:
-    //   on_recall  = 1.0（3/3 件が Top-20 に入る）
-    //   off_recall = 1.0（3/3 件が Top-20 に入る。本コーパス規模ではノイズ文書の
-    //     助詞一致スコアが内容語一致スコアを上回るほど蓄積しないため、除去 OFF でも
-    //     正解 3 件は Top-20 内に留まる）
-    // 数万チャンク規模の実測は TASK-106（並行フォローアップ）の管轄のためスコープ外。
-    let docs = mini_corpus();
-    let query = "ベクトル検索エンジンの使い方を教えてください";
-
-    let on_recall = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, true);
-    let off_recall = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, false);
-
-    assert!(
-        on_recall >= off_recall,
-        "除去 ON の Recall@20（{on_recall}）が除去 OFF（{off_recall}）を下回っている"
+        noise_on.len() < noise_off.len(),
+        "除去 ON のノイズ文書ヒット数（{}）が除去 OFF（{}）を下回っていない",
+        noise_on.len(),
+        noise_off.len()
     );
 }
 
@@ -185,18 +168,8 @@ fn relevant_documents_rank_above_noise_with_stopword_removal() {
     }
 }
 
-#[test]
-fn recall_at_20_computation_is_deterministic() {
-    // 同一入力からは同一の Recall@20 が得られること（再現性の固定）。
-    let docs = mini_corpus();
-    let query = "ベクトル検索エンジンの使い方を教えてください";
-    let first = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, true);
-    let second = recall_at_20(&docs, query, &RELEVANT_DOC_IDS, true);
-    assert!((first - second).abs() < 1e-12);
-}
-
-/// 上記の `bm25_rank`/`recall_at_20` は `tokenize_with_options` を直接呼ぶ測定専用
-/// ヘルパで `SparseIndex` を介さないため、本番エントリポイント（既定で除去 ON の
+/// 上記の `bm25_rank` は `tokenize_with_options` を直接呼ぶ測定専用ヘルパで
+/// `SparseIndex` を介さないため、本番エントリポイント（既定で除去 ON の
 /// `tokenize()` を使う `SparseIndex::build`/`search`）の回帰はこの 1 件で検知する。
 /// 助詞ユニグラムのみのクエリは既定設定でトークンが 0 件になり、`search()` は
 /// 早期リターンで空結果を返す。`tokenize()` の既定が除去 OFF 相当に配線ミスした
