@@ -15,17 +15,26 @@
 //! trait object）はいずれも `SearchInput` と異なり構造的にその縮約を強制できない別個の
 //! オブジェクトのため、それぞれの検索結果を「同一の可視集合から構築されている／
 //! `input.ids` 外の id を返さない」という promissory な契約だけに委ねない。
-//! [`hybrid_search`] は密・疎双方のヒットを `input.ids` に含まれる id へ構造的に
-//! フィルタする（[`crate::kernel::SearchInput`] のドキュメントが同種の promissory な
-//! `is_visible` クロージャ規約から脱却した設計判断と同じ方向）。密側は provider の
-//! 戻り値に対する事後フィルタで十分だが、疎側は事後フィルタだけでは不十分（Issue #36
-//! codex-review P0 指摘対応）: `SparseIndex::search` は BM25 の統計（文書数・df）と
-//! Top-k のヒープ選出をインデックス全体（可視・不可視を問わないコーパス全体）を
-//! 母数に計算するため、事後フィルタでは不可視文書が Top-k の枠を占有して可視文書を
-//! 押し出す経路・不可視文書の内容が可視文書の順位へ影響する経路のいずれも防げない。
-//! そのため [`hybrid_search`] は `sparse_index.search()` ではなく
-//! [`crate::sparse::SparseIndex::search_within`]（統計・候補選出そのものを
-//! `visible_ids` へ縮約する API）を呼ぶ。
+//! [`hybrid_search`] は密・疎双方のヒットを `input.ids`（可視集合）に含まれる id
+//! のみへ限定してから融合する（[`crate::kernel::SearchInput`] のドキュメントが同種の
+//! promissory な `is_visible` クロージャ規約から脱却した設計判断と同じ方向）。
+//! 疎側は `SparseIndex::search()`（インデックス全体を母数に統計・Top-k を計算する
+//! API）ではなく [`crate::sparse::SparseIndex::search_within`]（統計・候補選出
+//! そのものを `visible_ids` へ縮約する API）を呼ぶ（Issue #36 codex-review P0
+//! 指摘対応）: `search()` を事後フィルタするだけでは、不可視文書が Top-k の枠を
+//! 占有して可視文書を押し出す経路・不可視文書の内容が可視文書の順位へ影響する経路の
+//! いずれも防げない。
+//! 密側の `provider`（[`crate::kernel::SearchProvider`] trait object）は `input`
+//! （＝ `SearchInput { ids: input.ids, .. }`）に渡した可視 id のみを走査する契約だが、
+//! `provider` は型では「`input.ids` 外の id を返さない」ことを強制できない別個の
+//! オブジェクトである。疎側と同じ理由で事後フィルタ（黙って不可視 id を除外する）
+//! では不十分（2 回目の codex-review P0 指摘対応）: 不可視 id が `cfg.pool_depth()`
+//! の候補枠を占有していた場合、事後フィルタは可視ヒットを復元できず、検索結果の
+//! 件数差から不可視データの有無が外部へ漏れる（sparse 側の pool 占有問題と同型）。
+//! そのため [`hybrid_search`] は密側の戻り値に可視集合外の id が 1 件でも含まれて
+//! いたら、その分だけ除外するのではなく検索全体を [`HybridError::ProviderResultRejected`]
+//! で拒否する（`core.rs::EngineCore::search` の provider 結果検証と同じ
+//! fail-closed の方向）。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
 
 use std::collections::BTreeMap;
@@ -145,9 +154,11 @@ pub enum HybridError {
     InvalidConfig,
     /// [`hybrid_search`] に渡された `k` が `0` または上限超過。
     InvalidK,
-    /// 融合対象の入力リスト（密・疎いずれか）に同一 id が複数回出現した。provider・
-    /// インデックス側の契約違反（バグ）として fail-closed に拒否する（部分的に正しい
-    /// 融合スコアを返すより、検索全体を失敗させる方が安全側）。
+    /// 融合対象の入力リスト（密・疎いずれか。`cfg.pool_depth()` による先頭切り詰め前の
+    /// 全件が対象。P1 レビュー指摘対応: 以前は `pool_depth` 件までしか重複検査して
+    /// おらず、それを超えた位置の重複を見逃していた）に同一 id が複数回出現した。
+    /// provider・インデックス側の契約違反（バグ）として fail-closed に拒否する
+    /// （部分的に正しい融合スコアを返すより、検索全体を失敗させる方が安全側）。
     DuplicateId,
     /// 融合対象の入力リスト（密・疎いずれか）が、それぞれの provider/index が定める
     /// 順位契約（スコア降順・同点 id 昇順）に従っていなかった。RRF は元スコアを見ず
@@ -165,6 +176,16 @@ pub enum HybridError {
     /// 有限性 → (5) 順序」の順で先に有限性を確認するのと同じ理由・同じ順序で、
     /// 本モジュールでも順序検証より先に本エラーを検知する。
     NonFiniteScore,
+    /// 密検索 `provider`（[`SearchProvider`] trait object）が、渡した
+    /// `input.ids`（可視集合）に含まれない id を 1 件でも返した（provider 実装の
+    /// 契約違反）。黙って不可視 id だけを除外すると、その id が `cfg.pool_depth()`
+    /// の候補枠を占有していた場合に可視ヒットを復元できず、検索結果の件数・順位の
+    /// 差から不可視データの有無が外部へ漏れうる（2 回目の codex-review P0 指摘対応。
+    /// `crate::sparse::SparseIndex::search_within` が疎側で同じ問題を統計計算段階の
+    /// 縮約で防ぐのに対し、密側は provider を型で強制できないため契約違反の検出時点
+    /// で検索全体を拒否する形で fail-closed を保つ。`core.rs::CoreError::ProviderResultRejected`
+    /// と同じ設計方向）。
+    ProviderResultRejected,
 }
 
 impl fmt::Display for HybridError {
@@ -180,6 +201,12 @@ impl fmt::Display for HybridError {
             }
             HybridError::NonFiniteScore => {
                 write!(f, "hybrid fusion input list contains a non-finite score")
+            }
+            HybridError::ProviderResultRejected => {
+                write!(
+                    f,
+                    "dense provider returned a hit outside the visible id set"
+                )
             }
         }
     }
@@ -209,8 +236,10 @@ impl From<SparseError> for HybridError {
 /// 順位のみを使う（RRF の定義）。
 ///
 /// 出力は融合スコア降順・同点は id 昇順（`f64::total_cmp` ベース）で確定する。
-/// 入力リスト内に同一 id が重複して出現した場合は [`HybridError::DuplicateId`] を返す
-/// （provider・インデックス側の契約違反を fail-closed に検知する）。
+/// 入力リスト（`dense`・`sparse` それぞれの全件。`pool_depth` による先頭切り詰め前）
+/// 内に同一 id が重複して出現した場合は [`HybridError::DuplicateId`] を返す
+/// （provider・インデックス側の契約違反を fail-closed に検知する。有限性・ソート順の
+/// 検証と同じ「全件」スコープで検査する）。
 /// 入力に非有限スコア（NaN・Inf）が含まれる場合は [`HybridError::NonFiniteScore`] を、
 /// ソート順契約に違反する場合は [`HybridError::UnsortedInput`] を返す。両者を検知
 /// する場合は必ず有限性検証を先に行う（非有限値は全順序を持たず、後続の順序検証が
@@ -242,6 +271,21 @@ pub fn rrf_fuse(
         return Err(HybridError::UnsortedInput);
     }
 
+    // 重複 id 検査は入力リスト全体（`dense`・`sparse` それぞれの全件）に対して行う。
+    // [`HybridError::DuplicateId`] のドキュメント・本関数のドキュメントが「入力リスト
+    // （＝全件）に同一 id が複数回出現した場合」と定めているため、有限性・ソート順の
+    // 検証と同じ走査範囲に揃える（P1 レビュー指摘対応。以前は `accumulate_ranked` が
+    // `take(cfg.pool_depth())` した範囲内でしか重複を検知せず、`pool_depth` を超えた
+    // 位置にのみ重複がある入力を見逃していた）。同一 id・同一スコアの重複は
+    // `is_sorted_desc_id_asc` の「同点は id 昇順」判定を id が等しいまますり抜ける
+    // ため（`id < prev_id` は偽になる）、順序検証だけでは重複を検出できない。
+    if has_duplicate_id(dense.iter().map(|h| h.id)) {
+        return Err(HybridError::DuplicateId);
+    }
+    if has_duplicate_id(sparse.iter().map(|d| d.doc_id)) {
+        return Err(HybridError::DuplicateId);
+    }
+
     // 融合マップの要素数は高々 `2 * pool_depth` に有界（`pool_depth` は
     // `RrfConfig::new` で検証済みの値のみが渡される契約）。id をキーにした
     // `BTreeMap` を使うことで、出現順・ハッシュ実装に依存しない決定的な走査順序を
@@ -254,14 +298,14 @@ pub fn rrf_fuse(
         cfg.k_const(),
         cfg.dense_weight(),
         &mut scores,
-    )?;
+    );
     accumulate_ranked(
         sparse.iter().map(|d| d.doc_id),
         cfg.pool_depth(),
         cfg.k_const(),
         cfg.sparse_weight(),
         &mut scores,
-    )?;
+    );
 
     let mut out: Vec<HybridHit> = scores
         .into_iter()
@@ -294,21 +338,33 @@ fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
     true
 }
 
+/// [`rrf_fuse`] の入力検証ヘルパ。`ids` の列（`dense`・`sparse` それぞれの全件。
+/// `pool_depth` による先頭切り詰め前）に同一 id が複数回出現するかを判定する。
+/// [`accumulate_ranked`] 側では検査しない（[`rrf_fuse`] が呼び出し元であり、
+/// 有限性・ソート順の検証と同じ「全件」スコープで一度だけ検査する設計）。
+fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return true;
+        }
+    }
+    false
+}
+
 /// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き id 列（先頭 `pool_depth` 件）を
 /// RRF スコアへ変換し、`scores` へ加算する。密・疎の両リストから同じロジックで
-/// 呼ばれることで、加算順序・重複検知の扱いを一本化する。
+/// 呼ばれることで加算順序を一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`]
+/// で入力リスト全体の重複なしを事前に検証済みのため、`ids` の先頭 `pool_depth` 件も
+/// 重複しないことが保証されており、本関数自体は重複検知を行わない。
 fn accumulate_ranked(
     ids: impl Iterator<Item = u64>,
     pool_depth: usize,
     k_const: f64,
     weight: f64,
     scores: &mut BTreeMap<u64, f64>,
-) -> Result<(), HybridError> {
-    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+) {
     for (idx, id) in ids.take(pool_depth).enumerate() {
-        if !seen.insert(id) {
-            return Err(HybridError::DuplicateId);
-        }
         // 1-based 順位。`idx` は `take(pool_depth)` により高々 `pool_depth - 1`
         // （`pool_depth <= MAX_POOL_DEPTH`）に収まるため `as f64` 変換で精度は失われない。
         let rank = (idx as f64) + 1.0;
@@ -316,7 +372,6 @@ fn accumulate_ranked(
         let entry = scores.entry(id).or_insert(0.0);
         *entry += contribution;
     }
-    Ok(())
 }
 
 /// 密検索 provider と疎検索インデックスを RRF で統合検索する入口
@@ -340,13 +395,14 @@ fn accumulate_ranked(
 /// 契約: `input`（[`SearchInput`]）は `core.rs` と同じく「呼び出し元が可視行のみへ
 /// 縮約済み」であることが前提であり、テナント境界はこの層より上で完結する（本関数は
 /// 境界を弱めない）。密側は `provider`（`input` と別個の trait object であり
-/// 「`input.ids` 外の id を返さない」ことは型では強制されない）の戻り値を
-/// `input.ids` へ事後フィルタして契約違反を吸収する（モジュールドキュメント参照。
-/// `provider` 実装が契約に反して可視集合外の id を返しても不可視行の id が結果へ
-/// 混入しない）。疎側は事後フィルタだけでは不十分なため（モジュールドキュメント
-/// 参照。統計計算・Top-k 選出そのものが可視集合外の文書に影響されうる）、
+/// 「`input.ids` 外の id を返さない」ことは型では強制されない）の戻り値を検証し、
+/// `input.ids`（可視集合）外の id が 1 件でも含まれていたら黙って除外せず
+/// [`HybridError::ProviderResultRejected`] で検索全体を拒否する（モジュール
+/// ドキュメント参照。事後フィルタだと不可視 id が `cfg.pool_depth()` の候補枠を
+/// 占有した場合に可視ヒットを復元できず、結果件数の差から不可視データの有無が
+/// 外部へ漏れうるため）。疎側も同じ理由で事後フィルタは使わず、
 /// `sparse_index.search()` ではなく統計・候補選出を `visible_ids` へ縮約する
-/// [`crate::sparse::SparseIndex::search_within`] を呼ぶ。
+/// [`crate::sparse::SparseIndex::search_within`] を呼ぶ（モジュールドキュメント参照）。
 ///
 /// 出力の順序契約: [`rrf_fuse`] が返す融合スコア降順・同点 id 昇順の順序をそのまま
 /// 維持して `k` 件へ `truncate` する。RRF 同点グループ（同一融合スコアを持つ id 群）の
@@ -376,14 +432,15 @@ pub fn hybrid_search(
     };
     // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
     // 返さない」ことは型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
-    // provider が返したヒットは `input.ids`（可視集合）へ構造的にフィルタしてから
-    // 融合する（フィルタは部分集合を取るだけなのでスコア降順・同点 id 昇順の順位契約は
-    // 保たれる）。
-    let dense_hits: Vec<SearchHit> = provider
-        .search(dense_input)?
-        .into_iter()
-        .filter(|hit| visible_ids.contains(&hit.id))
-        .collect();
+    // 事後フィルタ（不可視 id だけを黙って除外する）はしない: 不可視 id が
+    // `cfg.pool_depth()` の候補枠を占有していた場合、フィルタ後に可視ヒットを
+    // 復元できず、結果件数の差から不可視データの有無が外部へ漏れる（2 回目の
+    // codex-review P0 指摘対応。モジュールドキュメント参照）。1 件でも可視集合外の
+    // id が含まれていたら検索全体を拒否する（fail-closed）。
+    let dense_hits: Vec<SearchHit> = provider.search(dense_input)?;
+    if dense_hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
+        return Err(HybridError::ProviderResultRejected);
+    }
     // 疎側は `sparse_index.search()`（インデックス全体を母数に統計・Top-k を計算する
     // API）ではなく `search_within()`（[`SparseIndex::search_within`]）を使う。
     // `search()` の後段フィルタ（旧実装）は「不可視文書が Top-k のプールを占有して
@@ -558,6 +615,22 @@ mod tests {
     }
 
     #[test]
+    fn rrf_fuse_rejects_duplicate_id_beyond_pool_depth() {
+        // [P1] レビュー指摘対応: 以前は `accumulate_ranked` が `take(cfg.pool_depth())`
+        // した範囲内でしか重複 id を検査していなかったため、`pool_depth` を超えた
+        // 位置にのみ重複がある入力を見逃していた（`rrf_fuse`/`HybridError::DuplicateId`
+        // の「入力リスト（全件）に同一 id が複数回出現した場合」という契約と不整合）。
+        // `pool_depth=1` に対し、id=1 が rank=1（index 0）と rank=3（index 2）の
+        // 両方に出現する入力（スコアは降順を維持したまま）を与え、`take(1)` の範囲外
+        // （index 2）にしか重複が現れない場合でも `DuplicateId` を返すことを確認する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
+        let dense = [hit(1, 5.0), hit(2, 4.0), hit(1, 3.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::DuplicateId);
+    }
+
+    #[test]
     fn rrf_fuse_rejects_dense_input_not_sorted_by_score_descending() {
         let cfg = RrfConfig::default();
         // スコア昇順（本来は降順であるべき契約に違反）。
@@ -720,9 +793,9 @@ mod tests {
     }
 
     /// [`SearchProvider`] の契約違反（`input.ids` に含まれない id を返す実装バグ）を
-    /// 模したモック provider。`hybrid_search` が密検索側にも `visible_ids` フィルタを
-    /// 適用していることを検証するために使う（`input` の中身は無視して固定の
-    /// [`SearchHit`] 列を返す）。
+    /// 模したモック provider。`hybrid_search` が密検索側の契約違反を検出して
+    /// fail-closed に拒否することを検証するために使う（`input` の中身は無視して
+    /// 固定の [`SearchHit`] 列を返す）。
     struct LeakyProvider;
     impl SearchProvider for LeakyProvider {
         fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
@@ -737,12 +810,15 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_search_filters_dense_hits_to_visible_ids() {
-        // [Medium] レビュー指摘対応（テナント境界）: `provider.search()` が
-        // `input.ids`（可視集合）外の id を返す契約違反を起こしても、
-        // `hybrid_search` は融合結果へその id を混入させないことを確認する。
+    fn hybrid_search_rejects_dense_provider_returning_invisible_id() {
+        // [P0] レビュー指摘対応（テナント境界。2 回目の codex-review）:
+        // `provider.search()` が `input.ids`（可視集合）外の id を返す契約違反を
+        // 起こした場合、以前は黙って不可視 id だけを除外していたが、これだと
+        // 不可視 id が `cfg.pool_depth()` の候補枠を占有していたケースで可視ヒットを
+        // 復元できず、結果件数の差から不可視データの有無が外部へ漏れうる。
+        // `hybrid_search` は検索全体を `ProviderResultRejected` で拒否すべき。
         // `SearchProvider` は trait object のため「可視集合外の id を返さない」ことは
-        // 型では強制されず、構造的なフィルタで担保する必要がある。
+        // 型では強制されず、fail-closed な検証で担保する必要がある。
         let cfg = RrfConfig::default();
         let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
         let ids = [1u64];
@@ -755,18 +831,8 @@ mod tests {
             query: &query,
             k: 1,
         };
-        let hits = hybrid_search(&LeakyProvider, input, &index, "nomatch", 10, &cfg).expect("ok");
-        assert!(
-            hits.iter().all(|h| h.id != 99),
-            "invisible id from a non-conforming dense provider must not leak into hybrid results: {hits:?}"
-        );
-        assert_eq!(
-            hits,
-            vec![HybridHit {
-                id: 1,
-                score: 1.0 / 61.0
-            }]
-        );
+        let err = hybrid_search(&LeakyProvider, input, &index, "nomatch", 10, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::ProviderResultRejected);
     }
 
     #[test]
@@ -879,10 +945,22 @@ mod tests {
             k: 1,
         };
         let hits = hybrid_search(&CpuScalarProvider, input, &index, "cat", 1, &cfg).expect("ok");
-        // 可視集合は id=1 のみ（密側も疎側も id=1 だけが候補になりうる）。旧経路
-        // （`search()` + 事後フィルタ）であれば疎側の Top-1 プールを不可視文書が
-        // 占有し、可視文書 id=1 が疎側の融合対象からこぼれ落ちて結果が変わりうる。
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, 1);
+        // [Cursor Medium] レビュー指摘対応: 件数・id だけの緩い assert では、旧経路
+        // （`search()` + 事後フィルタ）でも「たまたま」空でない結果を返すケースを
+        // 見逃しうる。可視集合は id=1 のみ（密側も疎側も id=1 だけが候補になりうる）
+        // ため、両リストとも id=1 が rank=1 になり、融合スコアは
+        // `dense_weight/(k_const+1) + sparse_weight/(k_const+1) = 2.0/61.0`
+        // （既定 `RrfConfig`: k_const=60.0・dense_weight=sparse_weight=1.0。RRF は
+        // 元のスコア値ではなく順位のみを使うため BM25 スコアの実値には依存しない）
+        // に確定する。旧経路（`search()` + 事後フィルタ）であれば疎側の Top-1
+        // プールを不可視文書が占有し、可視文書 id=1 が疎側の融合対象からこぼれ落ちて
+        // 空 or 異なるスコアの結果になる。
+        assert_eq!(
+            hits,
+            vec![HybridHit {
+                id: 1,
+                score: 2.0 / 61.0
+            }]
+        );
     }
 }
