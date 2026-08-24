@@ -1,9 +1,8 @@
 //! CJK ストップワード除去（TASK-105、対象ビヘイビア: SEARCH-5。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-105・`docs/spec/04-behavior/search.md`）の統合テスト。
 //!
-//! `crates/engine/tests/sparse.rs`（TASK-102、SEARCH-1/3）の役割を引き継ぎつつ、
-//! 本ファイルは TASK-105 固有の観点（助詞ユニグラムの単独トークン化抑制・CJK
-//! コンテンツの保持・除去有無によるランキング品質の相対比較）に限定する。
+//! `crates/engine/tests/sparse.rs`（TASK-102、SEARCH-1/3）とは対象を分け、本ファイルは
+//! `engine::sparse::tokenize_with_options`（除去有無を選べる公開 API）の挙動のみを扱う。
 //!
 //! 本ファイル内の `bm25_rank` は `engine::sparse::tokenize_with_options`
 //! （公開 API）のみを用いて Okapi BM25 を独立に再計算する測定専用のヘルパであり、
