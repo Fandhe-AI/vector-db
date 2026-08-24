@@ -24,14 +24,14 @@
 use std::collections::HashSet;
 
 use crate::arena::{ArenaError, VectorArena};
+use crate::catalog::CatalogError;
 use crate::core::{provider_result_is_valid, validate_search_k, MAX_SEARCH_K};
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::Storage;
 
-/// [`PrefilterIndex`] のエラー型。`core.rs::CoreError` と対称の設計だが、`NotFound`・
-/// `Policy` は持たない（テーブル不存在は [`RlsError::Arena`] に含まれ、`PolicyContext` の
-/// 構築時検証は呼び出し元の責務で本モジュールには到達しない）。
+/// [`PrefilterIndex`] のエラー型。`core.rs::CoreError` と対称の設計。`Policy` は持たない
+/// （`PolicyContext` の構築時検証は呼び出し元の責務で本モジュールには到達しない）。
 #[derive(Debug)]
 pub enum RlsError {
     Arena(ArenaError),
@@ -40,6 +40,12 @@ pub enum RlsError {
     InvalidK {
         k: usize,
     },
+    /// 指定テーブルが存在しない（`core.rs::CoreError::NotFound` と同一契約: 不可視と
+    /// 不存在を区別しない。[`PrefilterIndex::build`] が `ArenaError::Catalog`
+    /// （`CatalogError::TableNotFound`）を捕捉してこの variant へ丸め込み、`Display` へ
+    /// テーブル名を含めない。他テナントの存在情報を漏らさないため
+    /// （security.md P0「エラー経由で存在情報を漏らさない」）。
+    NotFound,
     /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約に違反した
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
     /// `provider_result_is_valid` で行う。fail-closed: 違反があれば結果を一切返さない）。
@@ -54,6 +60,7 @@ impl std::fmt::Display for RlsError {
             RlsError::InvalidK { k } => {
                 write!(f, "invalid k: {k} (must be 1..={MAX_SEARCH_K})")
             }
+            RlsError::NotFound => write!(f, "not found"),
             RlsError::ProviderResultRejected => write!(
                 f,
                 "search provider returned a hit outside the policy-visible id set"
@@ -96,12 +103,20 @@ impl PrefilterIndex {
     /// （事前フィルタ・RLS-1: 不可視行はこの構築時点でアリーナへ確保されない）。
     ///
     /// `ctx` は構築中の述語としてのみ使い、構造体には保持しない（モジュールドキュメント
-    /// 参照）。テーブル不存在・容量超過・次元不整合は [`RlsError::Arena`] へ丸め込まれる
+    /// 参照）。テーブル不存在は `core.rs::EngineCore::search`/`get_row` と対称に
+    /// [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。security.md P0）。
+    /// 容量超過・次元不整合はそのまま [`RlsError::Arena`] へ伝播する
     /// （`VectorArena::build_filtered` の契約をそのまま継承）。
     pub fn build(storage: &Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
-        let arena = VectorArena::build_filtered(storage, table, |tenant, visibility| {
+        let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
-        })?;
+        }) {
+            Ok(arena) => arena,
+            Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
+                return Err(RlsError::NotFound)
+            }
+            Err(e) => return Err(e.into()),
+        };
         let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
         Ok(Self {
             arena,
@@ -305,6 +320,25 @@ mod tests {
             .search(&CpuScalarProvider, &[1.0, 0.0], 5)
             .expect("search ok");
         assert!(hits.is_empty());
+    }
+
+    // `core.rs::EngineCore::search`/`get_row` と対称: テーブル不存在は他テナントの
+    // 存在情報を漏らさず `RlsError::NotFound` へ丸め込まれ、`Display` にテーブル名を
+    // 含まない（本 Issue のレビュー指摘対応）。
+    #[test]
+    fn build_returns_not_found_without_leaking_table_name_for_missing_table() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let result = PrefilterIndex::build(&storage, "no_such_table", &ctx);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing table must be rejected"),
+        };
+        assert!(matches!(err, RlsError::NotFound));
+        assert_eq!(err.to_string(), "not found");
+        assert!(!err.to_string().contains("no_such_table"));
     }
 
     #[test]
