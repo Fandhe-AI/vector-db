@@ -118,3 +118,65 @@ pub fn check_contrast_ratio_within_limit(
     }
     Ok(median_ratio <= max_ratio)
 }
+
+/// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
+/// （`max_degradation_pct`）以内かを判定する（TASK-130・CORE-7 ポインタ:
+/// 動的窓集約を経由することによる単発クエリ経路の劣化上限）。
+///
+/// 劣化率は `(candidate - baseline) / baseline * 100`（%）。`candidate` が
+/// `baseline` より速い（劣化なし）場合は負値になり、`max_degradation_pct` が
+/// 正である限り自動的に判定を通過する。`baseline` が `Duration::ZERO` だと
+/// 除算不能（NaN/inf 化し暗黙の fail-open を招く）なため `Err`
+/// （`ab::median_ratio` と同一の fail-closed 方針）。
+pub fn check_degradation_within_limit(
+    baseline_p95: Duration,
+    candidate_p95: Duration,
+    max_degradation_pct: f64,
+) -> Result<bool, BenchError> {
+    if baseline_p95.is_zero() {
+        return Err(BenchError::DegenerateRatio(
+            "cannot compute degradation: baseline p95 is zero",
+        ));
+    }
+    if !max_degradation_pct.is_finite() || max_degradation_pct < 0.0 {
+        return Err(BenchError::ProtocolViolation(
+            "max_degradation_pct must be a finite, non-negative value",
+        ));
+    }
+    let degradation_pct = (candidate_p95.as_secs_f64() - baseline_p95.as_secs_f64())
+        / baseline_p95.as_secs_f64()
+        * 100.0;
+    Ok(degradation_pct <= max_degradation_pct)
+}
+
+/// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 短縮率が下限
+/// （`min_improvement_pct`）以上かを判定する（TASK-130・CORE-6/CORE-16 ポインタ:
+/// GPU 経路・f16 常駐経路の性能受け入れ）。
+///
+/// 本 PR の時点では呼び出し元（`batch_bench.rs`）から未接続（実 GPU バックエンド
+/// 未接続のため。opt-in fail-closed で「判定不能」を扱う。判定ロジックのみ
+/// 先行実装し `tests/batch_accept.rs` で単体検証する）。
+///
+/// 短縮率は `(baseline - candidate) / baseline * 100`（%）。`baseline` が
+/// `Duration::ZERO` だと除算不能なため `Err`（`check_degradation_within_limit` と
+/// 同一の fail-closed 方針）。
+pub fn check_improvement_at_least(
+    baseline_p95: Duration,
+    candidate_p95: Duration,
+    min_improvement_pct: f64,
+) -> Result<bool, BenchError> {
+    if baseline_p95.is_zero() {
+        return Err(BenchError::DegenerateRatio(
+            "cannot compute improvement: baseline p95 is zero",
+        ));
+    }
+    if !min_improvement_pct.is_finite() || min_improvement_pct <= 0.0 {
+        return Err(BenchError::ProtocolViolation(
+            "min_improvement_pct must be a finite, positive value",
+        ));
+    }
+    let improvement_pct = (baseline_p95.as_secs_f64() - candidate_p95.as_secs_f64())
+        / baseline_p95.as_secs_f64()
+        * 100.0;
+    Ok(improvement_pct >= min_improvement_pct)
+}

@@ -60,3 +60,15 @@ test = false
 name = "parallel_bench"
 harness = false
 test = false
+
+[[bench]]
+# TASK-130（バッチ高速化の受け入れ基準検証）の回帰ゲート入口。CORE-7（動的窓の
+# 劣化上限）をアクティブなゲートとして実測し、CORE-6/CORE-16（実 GPU 未接続）は
+# opt-in fail-closed で扱う（`batch_bench.rs` 冒頭コメント参照）。harness = false /
+# test = false は上記ベンチと同一方針。`make bench-batch`（Makefile）・
+# `.github/workflows/bench.yml`（workflow_dispatch）から実行する。判定ロジック自体
+# （時間非依存）は harness/accept.rs にあり tests/batch_accept.rs で make ci 側から
+# 回帰検証する。
+name = "batch_bench"
+harness = false
+test = false
