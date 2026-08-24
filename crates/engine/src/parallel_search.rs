@@ -2,10 +2,10 @@
 //! ビヘイビア: CORE-3, CORE-4, CORE-5・SEARCH-4）。本 provider が担うのは行範囲分割に
 //! よる並列化のみで、ベクトル化（SIMD）演算は行わない（下記の経緯参照）。
 //!
-//! `core.rs` の [`crate::core::EngineCore::open`] から `kernel.rs::SearchProvider` の
-//! 既定実装として注入される（`core.rs` が可視行のみに縮約した
-//! [`crate::kernel::SearchInput`] を受け取る構造は不変。可視性判定は本 provider の
-//! 責務外）。エラー契約・入力検証は `kernel.rs::CpuScalarProvider` と同一
+//! `core.rs` の [`crate::core::EngineCore::open`] からは `search_engine.rs::default_engine`
+//! （TASK-131・CORE-9）経由で `kernel.rs::SearchProvider` の既定実装として選択・注入される
+//! （`core.rs` が可視行のみに縮約した [`crate::kernel::SearchInput`] を受け取る構造は
+//! 不変。可視性判定は本 provider の責務外）。エラー契約・入力検証は `kernel.rs::CpuScalarProvider` と同一
 //! （[`crate::kernel::KernelError`] を共用し、`core.rs` 側の Top-k 契約検証とも整合）。
 //!
 //! 依存最小方針（`.claude/rules/dependency-policy.md`）に従い新規クレートは追加しない。

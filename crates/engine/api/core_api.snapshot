@@ -12,6 +12,7 @@ pub mod parallel_search;
 pub mod policy;
 pub mod rerank;
 pub mod row_codec;
+pub mod search_engine;
 pub mod sparse;
 pub mod storage;
 pub mod txn;
