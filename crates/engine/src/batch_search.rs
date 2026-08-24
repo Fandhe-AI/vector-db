@@ -1091,16 +1091,29 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
     // [`ResidentMatrix::build`] で [`MAX_BATCH_ROWS`] 以下に制限済みのため、
     // ここでの全件走査も既存の `tenant_row_counts` 数え上げと同じ計算量
     // クラスに収まる。
-    let mut all_public_row_count: usize = 0;
+    //
+    // `tenant_public_row_counts` は codex P1 指摘対応（二重課金バグ修正）:
+    // バッチテナントに属する `Public` 行についても、テナント別の内訳を
+    // 別途持つ。下記の追加積和項でこの内訳が必要になる。
     let mut extra_public_row_count: usize = 0;
+    let mut tenant_public_row_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    tenant_public_row_counts
+        .try_reserve(batch_tenants.len())
+        .map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve tenant public row counts: {e}"
+            ))
+        })?;
     for (tenant, visibility) in source.tenant_ids().iter().zip(source.visibilities().iter()) {
         let is_public = *visibility == Visibility::Public;
-        if is_public {
-            all_public_row_count = all_public_row_count.saturating_add(1);
-        }
         if batch_tenants.contains(tenant.as_str()) {
             let count = tenant_row_counts.entry(tenant.as_str()).or_insert(0);
             *count = count.saturating_add(1);
+            if is_public {
+                let public_count = tenant_public_row_counts.entry(tenant.as_str()).or_insert(0);
+                *public_count = public_count.saturating_add(1);
+            }
         } else if is_public {
             extra_public_row_count = extra_public_row_count.saturating_add(1);
         }
@@ -1112,10 +1125,28 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
     // Public` の分岐がテナント一致を短絡する）ため、`ctx.tenant_id()` 自身を
     // 行テナントとして渡しても許可集合の判定だけが漏れなく取れる（新規の
     // `PolicyContext` API を増やさず、単一照合パス `is_visible` のみを使う）。
-    let public_grant_query_count = queries
-        .iter()
-        .filter(|q| q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public))
-        .count();
+    //
+    // `tenant_public_grant_query_counts` は codex P1 指摘対応: テナント別の
+    // 内訳（下記の二重課金回避に使う）。
+    let mut public_grant_query_count: usize = 0;
+    let mut tenant_public_grant_query_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    tenant_public_grant_query_counts
+        .try_reserve(batch_tenants.len())
+        .map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve tenant public grant query counts: {e}"
+            ))
+        })?;
+    for q in queries {
+        if q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public) {
+            public_grant_query_count = public_grant_query_count.saturating_add(1);
+            let count = tenant_public_grant_query_counts
+                .entry(q.ctx.tenant_id())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
 
     // `Public` 許可クエリが 1 件も無ければ、バッチ外テナントの行はどのみち
     // 到達不能（下記の行外側ループの `row_is_reachable` 判定と対応）。その
@@ -1149,23 +1180,65 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
 
     // TABLE-9 用の追加積和項: `Public` 行はテナント境界を跨いで `Public`
     // 許可済みクエリからも参照されるため、上記のテナント単位の積和だけでは
-    // 実走査コストを課金しきれない（下記の行外側ループ参照）。実コストの
-    // 厳密な上限として「データセット全体の `Public` 行数 × `Public` 許可
-    // クエリ数」を使う（バッチ内テナントの同一テナント分の重複を差し引かない
-    // 過大側の見積もりであり、`compute_tenant_work` のドキュメンテーション
-    // コメントが述べる「全行数 × 全クエリ数」と同じ安全側の単純化。
-    // `checked_*` 演算で確定的に拒否する）。この項が
-    // `id_to_tenant`／行外側ループで実際に走査しうる
-    // `extra_public_row_count` 分のコストも上界として覆う。
-    let cross_tenant_public_work =
-        compute_tenant_work(all_public_row_count, public_grant_query_count, source.dim())?;
-    tenant_work
-        .checked_add(cross_tenant_public_work)
-        .filter(|&total| total <= MAX_BATCH_WORK)
-        .ok_or(BatchSearchError::WorkBudgetExceeded {
+    // 実走査コストを課金しきれない（下記の行外側ループ参照）。ただし、
+    // バッチテナントに属する `Public` 行と「その行と同一テナントの」
+    // `Public` 許可クエリとの組は、既に `tenant_work`（そのテナントの
+    // 全行数 × 全クエリ数）に含まれている（行外側ループも同一テナントの
+    // クエリ集合 `query_indices` 側で走査し、`public_grant_query_indices`
+    // 側は他テナントのものだけに絞る。下記の候補集合構築のコメント参照）。
+    // ここで単純に「データセット全体の `Public` 行数 × `Public` 許可クエリ数」
+    // を加算すると、この同一テナント分が二重に計上され、実コストが
+    // `MAX_BATCH_WORK` 以下の正当なバッチを誤って拒否しうる（codex P1
+    // 指摘対応）。
+    //
+    // そのため、テナントごとの `Public` 行には「他テナントの `Public`
+    // 許可クエリ数」（`public_grant_query_count` から自テナント分の
+    // `tenant_public_grant_query_counts` を差し引いた値）だけを掛ける。
+    // バッチテナントに属さない `Public` 行（`extra_public_row_count`）は
+    // 元々どのバッチテナントとも同一テナントの積和に含まれていないため、
+    // 従来どおり `public_grant_query_count` をそのまま掛けて安全側に丸める。
+    let mut cross_tenant_public_work = compute_tenant_work(
+        extra_public_row_count,
+        public_grant_query_count,
+        source.dim(),
+    )?;
+    for &tenant in &batch_tenants {
+        let public_rows = tenant_public_row_counts.get(tenant).copied().unwrap_or(0);
+        if public_rows == 0 {
+            continue;
+        }
+        let own_grant_queries = tenant_public_grant_query_counts
+            .get(tenant)
+            .copied()
+            .unwrap_or(0);
+        // `own_grant_queries` は `public_grant_query_count` の部分集合の
+        // 件数であるため `saturating_sub` で常に非負に収まる。
+        let other_grant_queries = public_grant_query_count.saturating_sub(own_grant_queries);
+        let term = compute_tenant_work(public_rows, other_grant_queries, source.dim())?;
+        cross_tenant_public_work = cross_tenant_public_work.checked_add(term).ok_or(
+            BatchSearchError::WorkBudgetExceeded {
+                work: usize::MAX,
+                max: MAX_BATCH_WORK,
+            },
+        )?;
+    }
+    // `checked_add` のオーバーフローと、加算成功後の `MAX_BATCH_WORK` 超過を
+    // 区別して報告する（codex P1 指摘対応）。公開エラー契約上 `work` は
+    // 「実際の総積和演算数」であるべきで、加算に成功した場合はその実値を
+    // 返す。`usize::MAX` は `checked_add` が実際にオーバーフローした場合
+    // （＝真の総和が `usize` で表現不能）にのみ用いる。
+    let total_work = tenant_work.checked_add(cross_tenant_public_work).ok_or(
+        BatchSearchError::WorkBudgetExceeded {
             work: usize::MAX,
             max: MAX_BATCH_WORK,
-        })?;
+        },
+    )?;
+    if total_work > MAX_BATCH_WORK {
+        return Err(BatchSearchError::WorkBudgetExceeded {
+            work: total_work,
+            max: MAX_BATCH_WORK,
+        });
+    }
 
     // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
     // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
@@ -2397,10 +2470,13 @@ mod tests {
     #[test]
     fn batch_search_charges_foreign_tenant_public_rows_reachable_via_table9() {
         // tenant-a 単独では compute_tenant_work(1, MAX_BATCH_QUERIES,
-        // MAX_BATCH_DIM) ≈ 3.36e7 で全く問題にならない規模だが、tenant-c の
-        // `Public` 行 400 件を加えた `all_public_row_count`（401）×
-        // `public_grant_query_count`（MAX_BATCH_QUERIES）× dim は
-        // MAX_BATCH_WORK（1e10）を超過する（401 * 4096 * 8192 ≈ 1.35e10）。
+        // MAX_BATCH_DIM) = 33,554,432 で全く問題にならない規模だが、
+        // tenant-c の `Public` 行 400 件（`extra_public_row_count`）×
+        // `public_grant_query_count`（MAX_BATCH_QUERIES）× dim を加えると
+        // MAX_BATCH_WORK（1e10）を超過する（400 * 4096 * 8192 =
+        // 13,421,772,800）。tenant-a 自身の `Public` 行は同一テナントの
+        // クエリとの組が `tenant_work` に既に含まれるため、追加積和項からは
+        // 除外される（codex P1 指摘対応: 二重課金回避）。
         let matrix = build_tenant_a_and_foreign_public_matrix(400);
         let engine = BatchEngine::new(matrix);
 
@@ -2420,7 +2496,14 @@ mod tests {
         match err {
             BatchSearchError::WorkBudgetExceeded { work, max } => {
                 assert_eq!(max, MAX_BATCH_WORK);
-                assert_eq!(work, usize::MAX, "checked-add overflow sentinel expected");
+                // codex P1 指摘対応: `checked_add` 自体はオーバーフローしていない
+                // （通常の予算超過）ため、`work` には実際の総積和演算数
+                // （33,554,432 + 13,421,772,800）を返す。`usize::MAX` は
+                // `checked_add` が真にオーバーフローした場合専用のセンチネル。
+                assert_eq!(
+                    work, 13_455_327_232,
+                    "actual total work expected, not the overflow sentinel"
+                );
             }
             other => panic!("expected WorkBudgetExceeded, got {other:?}"),
         }
