@@ -143,6 +143,16 @@ pub enum BatchSearchError {
     /// （テナント混入の疑い。`core.rs::CoreError::ProviderResultRejected` と同じ
     /// fail-closed 思想。結果を一切返さない）。
     TenantMaskViolation,
+    /// `batch_fallback.rs::BatchBackend`（差し替え可能な primary バックエンド。
+    /// TASK-129・CORE-8 ポインタ）が返した結果が、id・可視性以外の構造契約
+    /// （クエリ数との整合・件数上限 `k`・id 重複なし・スコア有限性・
+    /// スコア降順/同点 id 昇順）を満たさなかった。`core.rs::CoreError::
+    /// ProviderResultRejected` と同じ「untrusted provider 出力を信頼済み
+    /// 集合と突き合わせて検証し、1 件でも違反すれば結果を一切返さない」
+    /// fail-closed 思想を、id/tenant 混入固有の [`Self::TenantMaskViolation`]
+    /// とは別に区別する（構造契約違反と可視性違反は異なる原因として wire_code
+    /// 設計上も切り分けたいため）。
+    PrimaryResultRejected,
 }
 
 impl fmt::Display for BatchSearchError {
@@ -199,6 +209,10 @@ impl fmt::Display for BatchSearchError {
             BatchSearchError::TenantMaskViolation => {
                 write!(f, "batch_search: result violated per-query tenant mask")
             }
+            BatchSearchError::PrimaryResultRejected => write!(
+                f,
+                "batch_search: primary backend result violated batch result contract"
+            ),
         }
     }
 }

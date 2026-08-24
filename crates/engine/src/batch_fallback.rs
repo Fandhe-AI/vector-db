@@ -13,6 +13,14 @@
 //! CPU-SIMD 経路（`kernel.rs::CpuScalarProvider` と同じ選出規約）と構成的に
 //! 一致する。
 //!
+//! [`BatchBackend`] は将来の実 GPU/外部実装が差し込まれる公開差し替え点であり、
+//! `Ok` を返した場合でも [`FallbackBatchEngine`] はその内容を無条件に信頼しない
+//! （codex-review P0 指摘対応・PR #152）。primary が成功を返しても、
+//! [`FallbackBatchEngine`] が構築時から保持する信頼済み CPU 常駐行列を基準に
+//! `FallbackBatchEngine::revalidate_primary_hits` が独立に再検証し（結果件数・
+//! 各クエリの `k`・id の存在・可視性・重複なし・スコア有限性・順序）、違反が
+//! あれば結果を一切返さず `Err` で fail-closed に拒否する。
+//!
 //! # データ所有権・二重常駐について
 //!
 //! CORE-16 ポインタの方針（CPU 経路は f32 のまま維持）を満たすため、CPU 縮退
@@ -23,12 +31,14 @@
 //! （[`FallbackBatchEngine::build`] が同じ `MAX_BATCH_TOTAL_BYTES` 予算で
 //! 独立に検証）のどちらも無制限確保にはならない設計とする。
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::batch_search::{
     run_batch_search, BatchEngine, BatchHit, BatchQuery, BatchRowSource, BatchSearchError,
     ResidentMatrix, MAX_BATCH_TOTAL_BYTES,
 };
+use crate::kernel::SearchHit;
 use crate::storage::Visibility;
 
 /// primary バックエンド実行時のエラー種別（CORE-8 ポインタ）。GPU デバイス
@@ -107,6 +117,23 @@ impl std::error::Error for BatchExecError {}
 /// テストは本体へテスト専用の公開 API・feature を追加せず、本 trait を
 /// テストコード側で実装したモックを差し込むことで実現する（test-support
 /// feature 撤廃（Issue #137 対応）の方針を踏襲）。
+///
+/// # 公開差し替え点としての契約（codex-review P0 指摘対応・PR #152）
+///
+/// 本 trait は将来の実 GPU/外部実装が差し込まれる公開点であり、
+/// [`FallbackBatchEngine`] は実装が誠実であることを前提にしない。`Ok` を
+/// 返す場合、実装は以下を満たすことが期待される契約とする（満たさなくても
+/// 型としては受理されるが、[`FallbackBatchEngine::batch_search`] が
+/// `Self::revalidate_primary_hits` で独立に再検証し、違反があれば結果を
+/// 一切返さず `Err` を返す）:
+/// - `Vec<BatchHit>` の長さが `queries.len()` と一致する
+/// - 各クエリの `hits.len()` が対応する `BatchQuery::k` 以下
+/// - 各 `SearchHit::id` はそのバックエンドが走査対象とした常駐行列に実在する
+///   行の id で、かつ対応するクエリの `BatchQuery::ctx.is_visible(..)` を満たす
+/// - 各 `SearchHit::score` は有限値
+/// - 同一クエリ内で id が重複しない
+/// - スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::into_sorted_vec` と
+///   同じ規約）
 pub trait BatchBackend: Send + Sync {
     fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError>;
 }
@@ -461,6 +488,150 @@ impl FallbackBatchEngine {
         )
     }
 
+    /// primary バックエンド（[`BatchBackend`]）が返した成功結果を、
+    /// `FallbackBatchEngine` が構築時から保持する信頼済み CPU 常駐行列
+    /// （`self.cpu`。`Storage` 由来の実データであり untrusted ではない。
+    /// [`Self::build`] のドキュメンテーションコメント「信頼境界」参照）を
+    /// 基準に独立再検証する（codex-review P0 指摘対応・PR #152）。
+    ///
+    /// `BatchBackend` は object-safe な公開差し替え点であり、将来の実
+    /// GPU/外部実装が結果件数・`k`・id の存在・可視性を満たさない
+    /// `Vec<BatchHit>` を返しうる。`run_batch_search`（`batch_search.rs`）が
+    /// 自身の `TopKSelector` の出力を再検証する既存ロジック（本ファイル
+    /// 冒頭 import の `run_batch_search` が呼ぶ末尾チェック）は、選出器が
+    /// 構造的に保証済みの性質（件数上限・重複なし・有限値・順序）を前提に
+    /// id/tenant の可視性だけを見ており、`GpuReferenceBackend`
+    /// （`run_batch_search` を内部で通る現状唯一の実装）には十分だが、
+    /// 任意の `BatchBackend` 実装には不十分である。そのため本メソッドは
+    /// `core.rs::CoreError::ProviderResultRejected` と同じ「untrusted provider
+    /// 出力を信頼済み集合と突き合わせて検証し、1 件でも違反すれば結果を
+    /// 一切返さない」設計を踏襲し、構造契約（クエリ数との整合・件数上限・
+    /// id 重複なし・スコア有限性・スコア降順/同点 id 昇順）と id/tenant/
+    /// 可視性の両方を検証する。
+    ///
+    /// 検証コストは呼び出しごとに O(matching_rows + sum(hits)) 増える
+    /// （`id_to_tenant` の構築が主要因）。これは「バックエンドを信頼しない」
+    /// ことの対価であり、無条件で `Ok(hits)` を返す旧実装より高コストだが、
+    /// テナント境界（security.md P0）を優先する。
+    ///
+    /// 違反を検知した場合、CPU 縮退への再実行・`runtime_latched` のラッチ・
+    /// `FallbackObserver` への通知のいずれも行わず `Err` をそのまま返す
+    /// （`BatchExecError::Input`/`TenantMaskViolation` の扱いと同じ方針。
+    /// モジュール冒頭の [`FallbackBatchEngine`] ドキュメンテーションコメント
+    /// 「入力検証エラーは縮退させず fail-closed に `Err` をそのまま返す」を
+    /// 適用する）。理由: `runtime_latched` は「GPU デバイスの恒久故障」を
+    /// 表すためのラッチであり（[`FallbackBatchEngine`] のフィールドコメント
+    /// 参照）、結果契約違反はデバイス故障とは異なる種類の異常である。もし
+    /// ここでラッチすると、2 回目以降の呼び出しは CPU 縮退経由で `Ok` を
+    /// 返すようになり、検知したテナント混入・構造違反の兆候を暗黙に
+    /// 消してしまう（fail-open 化。security.md「fail-closed を維持する」に
+    /// 反する）。呼び出しのたびに検証し、違反があれば毎回 `Err` を返す方が
+    /// 安全側である。
+    fn revalidate_primary_hits(
+        &self,
+        queries: &[BatchQuery<'_>],
+        hits: &[BatchHit],
+    ) -> Result<(), BatchSearchError> {
+        // (0) 全体の結果構造がクエリ数と整合すること。件数不足・過剰の
+        // どちらも同じ違反として扱う（`zip` で暗黙に切り詰めると、過剰分の
+        // 検証をすり抜けてしまうため、比較を先に行う）。
+        if hits.len() != queries.len() {
+            return Err(BatchSearchError::PrimaryResultRejected);
+        }
+
+        // このバッチに登場するテナント集合（`run_batch_search` の
+        // `batch_tenants` と同じ考え方）。`id_to_tenant` をこの集合に
+        // 属する行だけへ絞ることで、バッチ外テナントの id が万一混入しても
+        // マップ不在 → 違反として確実に拒否できる（fail-closed 側の効果）。
+        let mut batch_tenants: HashSet<&str> = HashSet::new();
+        batch_tenants.try_reserve(queries.len()).map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve batch tenants for primary result revalidation: {e}"
+            ))
+        })?;
+        for q in queries {
+            batch_tenants.insert(q.ctx.tenant_id());
+        }
+
+        // id → (tenant, visibility) の逆引き表。`self.cpu.ids` は
+        // `ResidentMatrix::build`（[`Self::build`] 内で先に呼ばれる）が
+        // 一意性を検証済みのため、id は (tenant, visibility) を一意に決める。
+        let matching_row_count = self
+            .cpu
+            .tenant_ids
+            .iter()
+            .filter(|t| batch_tenants.contains(t.as_str()))
+            .count();
+        let mut id_to_tenant: HashMap<u64, (&str, Visibility)> = HashMap::new();
+        id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve id-tenant map for primary result revalidation: {e}"
+            ))
+        })?;
+        for ((id, tenant), visibility) in self
+            .cpu
+            .ids
+            .iter()
+            .zip(self.cpu.tenant_ids.iter())
+            .zip(self.cpu.visibilities.iter())
+        {
+            if batch_tenants.contains(tenant.as_str()) {
+                id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
+            }
+        }
+
+        for (q, batch_hit) in queries.iter().zip(hits) {
+            // (1) 件数が要求 k を超えない。
+            if batch_hit.hits.len() > q.k {
+                return Err(BatchSearchError::PrimaryResultRejected);
+            }
+
+            let mut seen_ids: HashSet<u64> = HashSet::new();
+            seen_ids.try_reserve(batch_hit.hits.len()).map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve seen-id set for primary result revalidation: {e}"
+                ))
+            })?;
+            let mut prev: Option<&SearchHit> = None;
+            for hit in &batch_hit.hits {
+                // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を
+                // 持たず、後続の順序検証（`total_cmp`）が無意味になるため
+                // 他の検証より先に弾く（`core.rs::search` と同じ順序）。
+                if !hit.score.is_finite() {
+                    return Err(BatchSearchError::PrimaryResultRejected);
+                }
+                // (3) id が重複しない（同じ行が同一クエリ内で複数回返らない）。
+                if !seen_ids.insert(hit.id) {
+                    return Err(BatchSearchError::PrimaryResultRejected);
+                }
+                // (4) スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::
+                // into_sorted_vec` が実際に返す順序と同じ契約）。
+                if let Some(p) = prev {
+                    let out_of_order = match p.score.total_cmp(&hit.score) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => p.id >= hit.id,
+                        std::cmp::Ordering::Greater => false,
+                    };
+                    if out_of_order {
+                        return Err(BatchSearchError::PrimaryResultRejected);
+                    }
+                }
+                prev = Some(hit);
+
+                // (5) id が信頼済み常駐行列に存在し、かつそのクエリの
+                // `PolicyContext::is_visible` を満たす（他テナント id・
+                // 捏造 id・可視性偽装のいずれも拒否する。テナント混入固有の
+                // 違反のため `TenantMaskViolation` を使う）。
+                match id_to_tenant.get(&hit.id) {
+                    Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
+                    _ => return Err(BatchSearchError::TenantMaskViolation),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// バッチ検索を実行する（CORE-8 ポインタ）。primary が利用可能かつ実行時
     /// ラッチ未発火なら primary を実行し、[`BatchExecError::Backend`]
     /// （実行時エラー）の場合のみ CPU 縮退経路へ再実行しつつ `runtime_latched`
@@ -471,7 +642,11 @@ impl FallbackBatchEngine {
     /// 返す（TenantMaskViolation を含む `BatchSearchError` は常にこちら経由で、
     /// 縮退イベントを発生させない）。primary が初期化失敗済み
     /// （[`PrimarySlot::Unavailable`]）の場合は最初から CPU 経路を使う（追加の
-    /// 縮退イベントは発生させない。構築時に既に 1 件通知済みのため）。
+    /// 縮退イベントは発生させない。構築時に既に 1 件通知済みのため）。primary
+    /// が成功を返した場合も、その結果をそのまま信頼せず
+    /// [`Self::revalidate_primary_hits`] で独立再検証する（codex-review P0
+    /// 指摘対応・PR #152）。違反時は CPU 縮退へ再実行せず `Err` をそのまま
+    /// 返す（同メソッドのドキュメンテーションコメント参照）。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
@@ -484,7 +659,20 @@ impl FallbackBatchEngine {
 
         match &self.primary {
             PrimarySlot::Available(backend) => match backend.batch_search(queries) {
-                Ok(hits) => Ok(hits),
+                Ok(hits) => {
+                    // primary バックエンドは公開差し替え点（[`BatchBackend`]）であり、
+                    // 将来の実 GPU/外部実装が任意の `Vec<BatchHit>` を返しうる
+                    // （codex-review P0 指摘対応・PR #152）。`GpuReferenceBackend`
+                    // （現状唯一の実装）は内部で `run_batch_search` を通るため
+                    // 自己無矛盾だが、`BatchBackend` トレイト自体はそれを保証しない。
+                    // ここで信頼済み CPU 常駐行列（`self.cpu`）を基準に、
+                    // `core.rs::CoreError::ProviderResultRejected` と同じ
+                    // 「untrusted provider 出力を独立に再検証する」設計で
+                    // 成功結果も無条件で信頼しない（詳細は
+                    // `Self::revalidate_primary_hits` 参照）。
+                    self.revalidate_primary_hits(queries, &hits)?;
+                    Ok(hits)
+                }
                 Err(BatchExecError::Input(e)) => Err(e),
                 Err(BatchExecError::Backend(err)) => {
                     // ラッチの初回発火（false → true）に成功した呼び出しだけが
@@ -1129,6 +1317,365 @@ mod tests {
             backend.call_count(),
             1,
             "primary must be retried only once before the runtime latch engages"
+        );
+    }
+
+    // --- codex-review P0 指摘対応（PR #152）: primary バックエンド成功結果の
+    // 独立再検証（`revalidate_primary_hits`）の回帰テスト群。
+    //
+    // `BatchBackend` は公開差し替え点であり、将来の実 GPU/外部実装が任意の
+    // `Vec<BatchHit>` を返しうる。以下のテストは `Ok` を返しつつ結果契約に
+    // 違反する「悪性バックエンド」を模したモックを使い、成功結果であっても
+    // 無条件で信頼せず拒否されることを確認する。
+
+    /// 任意の `Vec<BatchHit>` を返す悪性バックエンドのモック（クエリ内容を
+    /// 無視し、クロージャで用意した結果をそのまま返す。`BatchHit`/`SearchHit`
+    /// は `Clone` ではないため、呼び出しごとに結果を構築するクロージャとして
+    /// 保持する）。
+    struct MaliciousBackend<F: Fn() -> Vec<BatchHit> + Send + Sync> {
+        make_hits: F,
+    }
+
+    impl<F: Fn() -> Vec<BatchHit> + Send + Sync> BatchBackend for MaliciousBackend<F> {
+        fn batch_search(
+            &self,
+            _queries: &[BatchQuery<'_>],
+        ) -> Result<Vec<BatchHit>, BatchExecError> {
+            Ok((self.make_hits)())
+        }
+    }
+
+    // 捏造 id（常駐行列に存在しない id）を返す悪性バックエンドは拒否される。
+    #[test]
+    fn revalidation_rejects_fabricated_id_not_in_matrix() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![crate::kernel::SearchHit {
+                                id: 9_999,
+                                score: 1.0,
+                            }],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::TenantMaskViolation);
+    }
+
+    // 他テナントの実在 id（tenant-b の行 id=3）を tenant-a のクエリへ混入させる
+    // 悪性バックエンドは拒否される（本指摘のコア: マスク漏れ・結果破損による
+    // 他テナントの存在情報漏えいを防ぐ）。
+    #[test]
+    fn revalidation_rejects_other_tenant_id() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![crate::kernel::SearchHit { id: 3, score: 1.0 }],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::TenantMaskViolation);
+    }
+
+    // クエリの `k` を超える件数を返す悪性バックエンドは拒否される（id 自体は
+    // 有効なテナント内 id でも件数上限違反として弾く）。
+    #[test]
+    fn revalidation_rejects_hit_count_over_k() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                crate::kernel::SearchHit { id: 1, score: 2.0 },
+                                crate::kernel::SearchHit { id: 2, score: 1.0 },
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 1,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // 結果件数（`Vec<BatchHit>` の長さ）がクエリ数（1 件）より多い悪性
+    // バックエンドは拒否される（`zip` による暗黙の切り詰めで過剰分の検証を
+    // すり抜けないことの回帰）。
+    #[test]
+    fn revalidation_rejects_result_count_more_than_queries() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || vec![BatchHit { hits: vec![] }, BatchHit { hits: vec![] }],
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // 結果件数がクエリ数（1 件）より少ない（0 件）悪性バックエンドも同様に
+    // 拒否される。
+    #[test]
+    fn revalidation_rejects_result_count_fewer_than_queries() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: Vec::new,
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // 同一クエリ内で id が重複する悪性バックエンドは拒否される。
+    #[test]
+    fn revalidation_rejects_duplicate_id_within_one_query() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                crate::kernel::SearchHit { id: 1, score: 2.0 },
+                                crate::kernel::SearchHit { id: 1, score: 1.0 },
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // 非有限スコア（NaN）を返す悪性バックエンドは拒否される。
+    #[test]
+    fn revalidation_rejects_non_finite_score() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![crate::kernel::SearchHit {
+                                id: 1,
+                                score: f32::NAN,
+                            }],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // スコア降順・同点 id 昇順の契約に違反する悪性バックエンドは拒否される。
+    #[test]
+    fn revalidation_rejects_out_of_order_hits() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                // 昇順（本来は降順であるべき）で返す違反。
+                                crate::kernel::SearchHit { id: 1, score: 1.0 },
+                                crate::kernel::SearchHit { id: 2, score: 2.0 },
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // ポジティブコントロール: 正当な `GpuReferenceBackend`（`run_batch_search` を
+    // 内部で通る）の結果は独立再検証を通過し、オラクル（可視行だけを渡した
+    // `CpuScalarProvider::search`）と完全一致する。これがないと、
+    // 「常に拒否する」誤った実装でも上の否定的テスト群がすべて通ってしまう。
+    #[test]
+    fn revalidation_accepts_legitimate_gpu_reference_backend_and_matches_oracle() {
+        let engine = build_engine_with_backend(
+            |matrix| Ok(Box::new(GpuReferenceBackend::new(matrix)) as Box<dyn BatchBackend>),
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx_a,
+        }];
+        let hits = engine.batch_search(&queries).expect("search ok");
+
+        let ids = [1u64, 2, 3, 4];
+        let tenant_ids = ["tenant-a", "tenant-a", "tenant-b", "tenant-b"];
+        let vectors_per_row = [[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]];
+        let expected = oracle_search(&ids, &tenant_ids, &vectors_per_row, &ctx_a, &query, 2);
+        assert_eq!(hits[0].hits, expected);
+    }
+
+    // ポジティブコントロール（複数クエリ・複数テナント版）: 単一クエリだけの
+    // 上のテストでは `revalidate_primary_hits` 内部のクエリ別 `zip`・
+    // クエリごとの `seen_ids` リセット・複数テナントにまたがる
+    // `batch_tenants`/`id_to_tenant` 構築を検証できない（`FailingBackend` 経由の
+    // 既存テストは CPU 縮退経路を通るため `revalidate_primary_hits` 自体を
+    // 経由しない）。2 クエリ・2 テナントで primary（`GpuReferenceBackend`）を
+    // 実行し、各クエリの結果がそれぞれのオラクルと一致することを確認する。
+    #[test]
+    fn revalidation_accepts_legitimate_multi_query_multi_tenant_batch_and_matches_oracle() {
+        let engine = build_engine_with_backend(
+            |matrix| Ok(Box::new(GpuReferenceBackend::new(matrix)) as Box<dyn BatchBackend>),
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let ctx_b = ctx("tenant-b");
+        let query_a = [1.0f32, 1.0];
+        let query_b = [1.0f32, 1.0];
+        let queries = vec![
+            BatchQuery {
+                vector: &query_a,
+                k: 2,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &query_b,
+                k: 2,
+                ctx: &ctx_b,
+            },
+        ];
+        let hits = engine.batch_search(&queries).expect("search ok");
+        assert_eq!(hits.len(), 2);
+
+        let ids = [1u64, 2, 3, 4];
+        let tenant_ids = ["tenant-a", "tenant-a", "tenant-b", "tenant-b"];
+        let vectors_per_row = [[1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]];
+        let expected_a = oracle_search(&ids, &tenant_ids, &vectors_per_row, &ctx_a, &query_a, 2);
+        let expected_b = oracle_search(&ids, &tenant_ids, &vectors_per_row, &ctx_b, &query_b, 2);
+        assert_eq!(hits[0].hits, expected_a);
+        assert_eq!(hits[1].hits, expected_b);
+    }
+
+    // ラッチしない・縮退イベントを発生させないことの回帰: 違反検知後の
+    // 2 回目以降の呼び出しも `Err` を返し続け（CPU 縮退へ静かに切り替わらない）、
+    // observer への通知も一切発生しない（違反はデバイス恒久故障とは異なる
+    // 種類の異常であり、`runtime_latched` を流用すると 2 回目以降が `Ok` を
+    // 返すようになり検知結果が消えてしまうため。`revalidate_primary_hits` の
+    // ドキュメンテーションコメント「ラッチ決定」参照）。
+    #[test]
+    fn revalidation_violation_does_not_latch_and_emits_no_fallback_event() {
+        let observer = std::sync::Arc::new(RecordingObserver::new());
+        struct ArcObserver(std::sync::Arc<RecordingObserver>);
+        impl FallbackObserver for ArcObserver {
+            fn on_fallback(&self, event: FallbackEvent) {
+                self.0.on_fallback(event);
+            }
+        }
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![crate::kernel::SearchHit { id: 3, score: 1.0 }],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(ArcObserver(observer.clone())),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+
+        for _ in 0..3 {
+            let err = engine.batch_search(&queries).unwrap_err();
+            assert_eq!(err, BatchSearchError::TenantMaskViolation);
+        }
+        assert!(
+            observer.events().is_empty(),
+            "a result-contract violation must not be treated as a fallback trigger"
         );
     }
 }
