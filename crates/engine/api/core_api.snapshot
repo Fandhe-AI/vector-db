@@ -2,6 +2,7 @@
 
 # source: crates/engine/src/lib.rs :: reachability (pub mod / pub use)
 pub mod arena;
+pub mod batch_search;
 pub mod catalog;
 pub mod core;
 pub mod hybrid;
