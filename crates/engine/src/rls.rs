@@ -84,6 +84,11 @@ impl From<KernelError> for RlsError {
 /// 可視率・ポリシーが変わる場合は [`Self::build`] を呼び直して再構築する必要がある。
 pub struct PrefilterIndex {
     arena: VectorArena,
+    /// `arena.ids()` と同一集合の `HashSet` キャッシュ（[`Self::build`] 時に一度だけ構築）。
+    /// [`Self::search`] は provider 結果の可視性再検証（`provider_result_is_valid`）で
+    /// このキャッシュを使い回し、クエリ毎の再構築コストを避ける（本モジュールが解決対象と
+    /// する「クエリ毎の前段コスト」をここで再生産しないため。モジュール doc 参照）。
+    visible_id_set: HashSet<u64>,
 }
 
 impl PrefilterIndex {
@@ -97,7 +102,11 @@ impl PrefilterIndex {
         let arena = VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
         })?;
-        Ok(Self { arena })
+        let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
+        Ok(Self {
+            arena,
+            visible_id_set,
+        })
     }
 
     /// 保持済みインデックスに対して Top-k 検索を行う（over-fetch なし・RLS-3:
@@ -138,8 +147,7 @@ impl PrefilterIndex {
         };
         let hits = provider.search(input)?;
 
-        let visible_id_set: HashSet<u64> = self.arena.ids().iter().copied().collect();
-        if !provider_result_is_valid(&hits, k, &visible_id_set) {
+        if !provider_result_is_valid(&hits, k, &self.visible_id_set) {
             return Err(RlsError::ProviderResultRejected);
         }
         Ok(hits)

@@ -235,9 +235,10 @@ fn rls2_lower_visibility_rate_does_not_regress_search_only_latency() {
             durations.push(start.elapsed());
         }
         durations.sort();
-        // p95: ソート済み配列の 95 パーセンタイル位置（`TIMED_TRIALS=20` なら添字 19、
-        // すなわち最大値。試行数が小さいため近似だが、`tests/incremental_write_perf.rs`
-        // と同じく中央値ではなく外れ値側を見ることで悪化を見逃さない側に倒す）。
+        // p95: ソート済み配列の 95 パーセンタイル位置（`TIMED_TRIALS=20` なら添字 18、
+        // すなわち 20 件中 19 番目 = 2 番目に大きい値。試行数が小さいため近似だが、
+        // `tests/incremental_write_perf.rs` と同じく中央値ではなく外れ値側を見ることで
+        // 悪化を見逃さない側に倒す）。
         let idx = ((durations.len() as f64) * 0.95).ceil() as usize;
         let idx = idx.saturating_sub(1).min(durations.len() - 1);
         durations[idx]
