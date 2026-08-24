@@ -29,6 +29,14 @@ const PAGE_LIMIT: u32 = 10_000;
 /// テーブルでも呼び出し元テナントの可視行数だけに比例した確保量に収まる。
 const MAX_VISIBLE_ROWS: usize = 100_000;
 
+/// [`visible_rows`] が 1 回の呼び出しで走査してよい総行数（可視・不可視を問わない）の
+/// 上限。`MAX_VISIBLE_ROWS` は出力（確保量）を抑えるが、他テナントの不可視行を
+/// 大量に格納したテーブルでは出力がほぼ増えないまま `next` が尽きるまで全ページの
+/// デコード・`PolicyContext::is_visible` 評価が実行され、計算量 DoS 経路になる
+/// （codex-review 指摘・PR #153）。総走査行数にも明示的な上限を設け、超過時は
+/// 部分結果を返さず [`TenantError::TooManyRowsScanned`] で fail-closed に拒否する。
+const MAX_SCANNED_ROWS: usize = 1_000_000;
+
 /// [`visible_rows`]・[`verify_hits`] のエラー型。`Display`・`Debug`・
 /// `std::error::Error::source` のいずれにもテナント ID・行 id・テーブル名を含めず、
 /// 他テナントの存在情報を漏らさない（`rls.rs::RlsError` と同じ契約。security.md P0）。
@@ -40,6 +48,11 @@ pub enum TenantError {
     /// 可視行数が [`MAX_VISIBLE_ROWS`] を超えたため、走査を打ち切って fail-closed に
     /// 拒否した（部分的な結果を黙って返さない）。
     TooManyVisibleRows { max: usize },
+    /// 総走査行数（可視・不可視を問わない）が [`MAX_SCANNED_ROWS`] を超えたため、
+    /// 走査を打ち切って fail-closed に拒否した。大量の不可視行を持つテーブルに対する
+    /// 計算量 DoS（出力は増えないまま全ページのデコード・ポリシー評価を強制される
+    /// 経路）を防ぐ（security.md テナント境界 P0。codex-review 指摘・PR #153）。
+    TooManyRowsScanned { max: usize },
     /// [`verify_hits`] に渡された id が、走査対象テーブルの可視行集合に含まれない
     /// （不可視行・捏造 id のいずれも区別せず本 variant に統一する。他テナントの
     /// 存在情報を漏らさないため。security.md P0）。
@@ -59,6 +72,9 @@ impl std::fmt::Display for TenantError {
             TenantError::TooManyVisibleRows { max } => {
                 write!(f, "too many visible rows: limit={max}")
             }
+            TenantError::TooManyRowsScanned { max } => {
+                write!(f, "too many rows scanned: limit={max}")
+            }
             TenantError::HitOutsideVisibleSet => {
                 write!(f, "hit id is outside the policy-visible row set")
             }
@@ -76,6 +92,10 @@ impl std::fmt::Debug for TenantError {
             TenantError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantError::TooManyVisibleRows { max } => f
                 .debug_struct("TooManyVisibleRows")
+                .field("max", max)
+                .finish(),
+            TenantError::TooManyRowsScanned { max } => f
+                .debug_struct("TooManyRowsScanned")
                 .field("max", max)
                 .finish(),
             TenantError::HitOutsideVisibleSet => f.write_str("HitOutsideVisibleSet"),
@@ -105,9 +125,12 @@ impl From<CatalogError> for TenantError {
 /// TABLE-11 の参照実装）。
 ///
 /// 可視行数が [`MAX_VISIBLE_ROWS`] を超える場合は部分結果を返さず
-/// [`TenantError::TooManyVisibleRows`] で拒否する。テーブル不存在は
-/// [`CatalogError::TableNotFound`] のまま [`TenantError::Catalog`] へ伝播する
-/// （存在情報の扱いは呼び出し元の責務）。
+/// [`TenantError::TooManyVisibleRows`] で拒否する。総走査行数（可視・不可視を
+/// 問わない）が [`MAX_SCANNED_ROWS`] を超える場合も同様に部分結果を返さず
+/// [`TenantError::TooManyRowsScanned`] で拒否する（他テナントの不可視行を大量に
+/// 格納したテーブルに対する計算量 DoS を防ぐ。security.md テナント境界 P0）。
+/// テーブル不存在は [`CatalogError::TableNotFound`] のまま [`TenantError::Catalog`]
+/// へ伝播する（存在情報の扱いは呼び出し元の責務）。
 pub fn visible_rows(
     storage: &Storage,
     table: &str,
@@ -115,10 +138,17 @@ pub fn visible_rows(
 ) -> Result<Vec<Row>, TenantError> {
     let mut out = Vec::new();
     let mut after: Option<u64> = None;
+    let mut scanned: usize = 0;
     loop {
         let (page, next) = storage.scan_table_page(table, after, PAGE_LIMIT)?;
         if page.is_empty() && next.is_none() {
             break;
+        }
+        scanned = scanned.saturating_add(page.len());
+        if scanned > MAX_SCANNED_ROWS {
+            return Err(TenantError::TooManyRowsScanned {
+                max: MAX_SCANNED_ROWS,
+            });
         }
         for row in page {
             if ctx.is_visible(&row.tenant_id, row.visibility) {
