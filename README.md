@@ -55,7 +55,7 @@ gh variable set BENCH_MAX_P95_MS
 gh variable set BENCH_MIN_RECALL
 ```
 
-未設定のまま schedule/`workflow_dispatch` を実行すると `crates/engine/benches/simd_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+未設定のまま schedule/`workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
 ## ライセンス
 

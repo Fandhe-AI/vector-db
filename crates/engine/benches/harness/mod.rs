@@ -1,6 +1,6 @@
 //! 性能計測プロトコル基盤（TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。
 //!
-//! TASK-127（SIMD 検索ベンチ）・TASK-130（GPU vs CPU-SIMD A/B 回帰）・TASK-83 等、
+//! TASK-127（性能・Recall 受け入れ基準の回帰ベンチ）・TASK-130（GPU vs CPU-SIMD A/B 回帰）・TASK-83 等、
 //! 性能系の受け入れ基準を測定・再測定するタスクは、独自に計測ループを書かず
 //! 必ず本モジュール経由で計測する契約とする。
 //!

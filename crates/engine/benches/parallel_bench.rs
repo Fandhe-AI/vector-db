@@ -1,6 +1,14 @@
 //! 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。ポインタ: `docs/spec/05-tasks.md`
 //! TASK-127・対象ビヘイビア CORE-3, CORE-4, CORE-5, SEARCH-4）。
 //!
+//! 実測対象は `ParallelSearchProvider`（TASK-126）であり、`kernel::dot` の
+//! スレッド並列化のみを行う（ベクトル化＝SIMD 演算は実装していない。
+//! `parallel_search.rs` モジュール冒頭のコメント参照）。SIMD カーネルが
+//! 未導入の現時点では本ベンチも SIMD の性能回帰を検出しない——ファイル名・
+//! ドキュメントは「スカラー並列実装の回帰ベンチ」である実態に合わせている。
+//! SIMD provider/カーネルが導入された際は、本ベンチの測定対象をそちらへ
+//! 差し替える（ファイル名の再検討も含む）。
+//!
 //! `parallel_smoke.rs`（TASK-126 の手動計測スモーク）と異なり、本ベンチは数値基準との
 //! 突き合わせまで行い、基準未達なら非ゼロ終了する回帰ゲートとして機能する
 //! （`harness/accept.rs` の判定ヘルパを利用）。`.github/workflows/bench.yml`
@@ -110,14 +118,14 @@ fn main() {
     let max_p95 = match max_p95_from_env() {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("simd_bench: {msg}");
+            eprintln!("parallel_bench: {msg}");
             std::process::exit(1);
         }
     };
     let min_recall = match min_recall_from_env() {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("simd_bench: {msg}");
+            eprintln!("parallel_bench: {msg}");
             std::process::exit(1);
         }
     };
@@ -215,7 +223,7 @@ fn main() {
     );
 
     if !passed {
-        eprintln!("simd_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/SEARCH-4)");
+        eprintln!("parallel_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/SEARCH-4)");
         std::process::exit(1);
     }
 }
