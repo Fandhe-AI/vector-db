@@ -1,0 +1,419 @@
+//! `batch_fallback.rs::FallbackBatchEngine` の結合テスト（TASK-129・対象
+//! ビヘイビア: CORE-8）。
+//!
+//! クレート外部（`engine` の公開 API のみ）からエラー注入バックエンドを
+//! 差し込み、GPU バックエンドの初期化失敗・実行時エラーの双方で CPU-SIMD
+//! 縮退経路（`kernel.rs::CpuScalarProvider` と同じ選出規約）へ panic なしに
+//! 切り替わること・Top-k がオラクルと一致すること・ログ可視化イベントが
+//! 要因を正しく反映することを検証する。
+
+use std::sync::{Arc, Mutex};
+
+use engine::batch_fallback::{
+    BatchBackend, BatchBackendError, BatchExecError, FallbackBatchEngine, FallbackEvent,
+    FallbackObserver, FallbackReason,
+};
+use engine::batch_search::{BatchHit, BatchQuery, BatchSearchError, ResidentMatrix};
+use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
+use engine::policy::PolicyContext;
+use engine::storage::Visibility;
+
+fn ctx(tenant: &str) -> PolicyContext {
+    PolicyContext::new(tenant).expect("valid tenant id")
+}
+
+/// 発生した縮退イベントを記録するオブザーバ（テストコード側の実装。本体へ
+/// テスト専用 API を追加しない）。
+#[derive(Clone, Default)]
+struct RecordingObserver(Arc<Mutex<Vec<FallbackEvent>>>);
+
+impl RecordingObserver {
+    fn events(&self) -> Vec<FallbackEvent> {
+        self.0.lock().expect("lock").clone()
+    }
+}
+
+impl FallbackObserver for RecordingObserver {
+    fn on_fallback(&self, event: FallbackEvent) {
+        self.0.lock().expect("lock").push(event);
+    }
+}
+
+/// primary バックエンドの実行時エラーを注入するモック。
+struct FailingBackend(BatchBackendError);
+
+impl BatchBackend for FailingBackend {
+    fn batch_search(&self, _queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        Err(BatchExecError::Backend(self.0.clone()))
+    }
+}
+
+/// primary バックエンドが入力エラー（`BatchSearchError`）を返すことを模した
+/// モック（縮退トリガにならないことの検証用）。
+struct InputErrorBackend(BatchSearchError);
+
+impl BatchBackend for InputErrorBackend {
+    fn batch_search(&self, _queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        Err(BatchExecError::Input(self.0.clone()))
+    }
+}
+
+/// 4 行・dim=2・tenant-a/tenant-b が各 2 行のフィクスチャ。
+fn fixture() -> ([u64; 4], [String; 4], [Visibility; 4], usize, [f32; 8]) {
+    let ids = [1u64, 2, 3, 4];
+    let tenant_ids = [
+        "tenant-a".to_string(),
+        "tenant-a".to_string(),
+        "tenant-b".to_string(),
+        "tenant-b".to_string(),
+    ];
+    let visibilities = [
+        Visibility::Public,
+        Visibility::Public,
+        Visibility::Public,
+        Visibility::Public,
+    ];
+    #[rustfmt::skip]
+    let vectors = [
+        1.0, 0.0,
+        0.0, 1.0,
+        2.0, 0.0,
+        0.0, 2.0,
+    ];
+    (ids, tenant_ids, visibilities, 2, vectors)
+}
+
+/// オラクル: `PolicyContext::is_visible` で可視行だけへ絞り込んだうえで
+/// `kernel::CpuScalarProvider::search`（CORE-3 と同一の選出規約: スコア降順・
+/// 同点 id 昇順・非有限値除外）を呼ぶ。縮退経路の Top-k と完全一致することを
+/// 期待する。
+fn oracle_search(
+    ids: &[u64],
+    tenant_ids: &[String],
+    dim: usize,
+    vectors: &[f32],
+    ctx: &PolicyContext,
+    query: &[f32],
+    k: usize,
+) -> Vec<SearchHit> {
+    let mut visible_ids = Vec::new();
+    let mut visible_vectors = Vec::new();
+    for (row_idx, (id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {
+        if ctx.is_visible(tenant, Visibility::Public) {
+            visible_ids.push(*id);
+            let start = row_idx * dim;
+            visible_vectors.extend_from_slice(&vectors[start..start + dim]);
+        }
+    }
+    CpuScalarProvider
+        .search(SearchInput {
+            ids: &visible_ids,
+            vectors: &visible_vectors,
+            dim: dim as u32,
+            query,
+            k,
+        })
+        .expect("oracle search ok")
+}
+
+// CORE-8: 初期化失敗注入 → 構築 `Ok`（CPU 専用モード）・検索 `Ok`・イベント
+// ちょうど 1 件（要因=init・切り替え先=cpu-simd）・Top-k がオラクル一致。
+#[test]
+fn init_failure_falls_back_to_cpu_and_matches_oracle() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+
+    let engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| Err(BatchBackendError::InitFailed("no gpu device".to_string())),
+        Box::new(observer.clone()),
+    )
+    .expect("build succeeds in cpu-only mode despite init failure");
+
+    let events = observer.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason, FallbackReason::Init);
+    assert_eq!(events[0].target, "cpu-simd");
+
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 2,
+        ctx: &ctx_a,
+    }];
+    let hits = engine
+        .batch_search(&queries)
+        .expect("search does not surface an error to the client");
+    assert_eq!(hits.len(), 1);
+    let expected = oracle_search(&ids, &tenant_ids, dim, &vectors, &ctx_a, &query, 2);
+    assert_eq!(hits[0].hits, expected);
+}
+
+// CORE-8: 実行時エラー注入（デバイスロスト・カーネル起動失敗・転送失敗の
+// 各種別）→ 検索 `Ok`・イベント要因=Runtime・Top-k がオラクル一致。
+#[test]
+fn runtime_errors_fall_back_to_cpu_and_match_oracle() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+
+    for backend_err in [
+        BatchBackendError::DeviceLost("device lost".to_string()),
+        BatchBackendError::KernelLaunchFailed("launch failed".to_string()),
+        BatchBackendError::TransferFailed("transfer failed".to_string()),
+    ] {
+        let observer = RecordingObserver::default();
+        let engine = FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            move |_matrix: ResidentMatrix| {
+                Ok(Box::new(FailingBackend(backend_err.clone())) as Box<dyn BatchBackend>)
+            },
+            Box::new(observer.clone()),
+        )
+        .expect("build succeeds; primary initializes fine");
+
+        let ctx_b = ctx("tenant-b");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx_b,
+        }];
+        let hits = engine.batch_search(&queries).expect("search ok");
+        let expected = oracle_search(&ids, &tenant_ids, dim, &vectors, &ctx_b, &query, 2);
+        assert_eq!(hits[0].hits, expected);
+
+        let events = observer.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, FallbackReason::Runtime);
+        assert_eq!(events[0].target, "cpu-simd");
+    }
+}
+
+// 入力エラー（次元不一致・非有限値・k=0/上限超過・容量超過）は、primary が
+// 健全なときも縮退が起きているときも同一の `Err` を返し、縮退イベントは
+// 発生しない（不正入力を縮退で黙殺しない、という設計の要）。
+#[test]
+fn input_errors_are_identical_and_do_not_trigger_fallback_regardless_of_backend_health() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let ctx_a = ctx("tenant-a");
+
+    // dim=2 の常駐行列に対して 3 次元クエリを渡す（次元不一致）。
+    let bad_query = [1.0f32, 0.0, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &bad_query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+
+    // primary 健全時。
+    let observer_healthy = RecordingObserver::default();
+    let engine_healthy = FallbackBatchEngine::build_with_gpu_reference(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        Box::new(observer_healthy.clone()),
+    )
+    .expect("build ok");
+    let err_healthy = engine_healthy
+        .batch_search(&queries)
+        .expect_err("dim mismatch must be rejected");
+    assert_eq!(
+        err_healthy,
+        BatchSearchError::DimMismatch {
+            expected: dim,
+            found: 3
+        }
+    );
+    assert!(observer_healthy.events().is_empty());
+
+    // primary が既に実行時エラーを起こす縮退状態の場合: このモック
+    // （`FailingBackend`）は入力検証を行わず常にバックエンド実行エラーを
+    // 返すため、まず縮退イベントが 1 件発生し、続く CPU 縮退経路
+    // （`run_batch_search`）が同じ次元不一致検証を行って同一の `Err` を返す。
+    // 「入力エラーは常に primary 到達前に弾かれる」わけではなく、「縮退が
+    // 起きた場合でも CPU 経路の入力検証は primary と同じ結果を返す」ことが
+    // 本テストの主眼（縮退経路だけ検証が緩い、という構造的欠落がないことの
+    // 確認）。
+    let observer_degraded = RecordingObserver::default();
+    let engine_degraded = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                "lost".to_string(),
+            ))) as Box<dyn BatchBackend>)
+        },
+        Box::new(observer_degraded.clone()),
+    )
+    .expect("build ok");
+    let err_degraded = engine_degraded
+        .batch_search(&queries)
+        .expect_err("dim mismatch must be rejected even when the backend is otherwise failing");
+    assert_eq!(err_degraded, err_healthy);
+    let events = observer_degraded.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].reason, FallbackReason::Runtime);
+}
+
+// primary が TenantMaskViolation 等の入力エラーを返した場合、縮退トリガには
+// ならず fail-closed に `Err` をそのまま返すことを確認する（security.md
+// 「不安全な設計」対応）。
+#[test]
+fn tenant_mask_violation_from_primary_is_not_treated_as_fallback_trigger() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(
+                Box::new(InputErrorBackend(BatchSearchError::TenantMaskViolation))
+                    as Box<dyn BatchBackend>,
+            )
+        },
+        Box::new(observer.clone()),
+    )
+    .expect("build ok");
+
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+    let err = engine
+        .batch_search(&queries)
+        .expect_err("tenant mask violation must not be masked by fallback");
+    assert_eq!(err, BatchSearchError::TenantMaskViolation);
+    assert!(observer.events().is_empty());
+}
+
+// マルチテナントバッチで縮退後も他テナント行の混入が 0 件であることを検証する
+// （テナント境界。security.md P0）。
+#[test]
+fn fallback_search_does_not_leak_rows_across_tenants() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                "lost".to_string(),
+            ))) as Box<dyn BatchBackend>)
+        },
+        Box::new(observer),
+    )
+    .expect("build ok");
+
+    let ctx_a = ctx("tenant-a");
+    let ctx_b = ctx("tenant-b");
+    let query = [1.0f32, 1.0];
+    let queries = vec![
+        BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        },
+        BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_b,
+        },
+    ];
+    let hits = engine.batch_search(&queries).expect("search ok");
+    assert_eq!(hits.len(), 2);
+    for hit in &hits[0].hits {
+        assert!(
+            ids[..2].contains(&hit.id),
+            "tenant-a result leaked a non-tenant-a row id={}",
+            hit.id
+        );
+    }
+    for hit in &hits[1].hits {
+        assert!(
+            ids[2..].contains(&hit.id),
+            "tenant-b result leaked a non-tenant-b row id={}",
+            hit.id
+        );
+    }
+}
+
+// 正常時（primary 成功）はイベント 0 件・縮退再実行が発生しないことを確認する。
+#[test]
+fn healthy_primary_emits_no_fallback_event() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build_with_gpu_reference(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        Box::new(observer.clone()),
+    )
+    .expect("build ok");
+
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+    let hits = engine.batch_search(&queries).expect("search ok");
+    assert_eq!(hits.len(), 1);
+    assert!(observer.events().is_empty());
+}
+
+// 決定性: 同一入力の再実行が同一結果を返す。
+#[test]
+fn fallback_search_is_deterministic_across_repeated_calls() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(Box::new(FailingBackend(BatchBackendError::TransferFailed(
+                "transfer".to_string(),
+            ))) as Box<dyn BatchBackend>)
+        },
+        Box::new(observer),
+    )
+    .expect("build ok");
+
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 1.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 2,
+        ctx: &ctx_a,
+    }];
+    let first = engine.batch_search(&queries).expect("search ok");
+    let second = engine.batch_search(&queries).expect("search ok");
+    assert_eq!(first[0].hits, second[0].hits);
+}

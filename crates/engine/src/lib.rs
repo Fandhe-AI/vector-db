@@ -26,7 +26,9 @@
 //! SEARCH-8。方式（クロスエンコーダ等）の最終選定・効果測定回帰は後続タスクの管轄）・
 //! TASK-128（バッチクエリ・一括インデクシング専用の検索エンジン `batch_search`。対象
 //! ビヘイビア: CORE-6, CORE-7, CORE-16。単発クエリ経路 `core::EngineCore` へは
-//! 構造的に接続しない）。プロトコル層
+//! 構造的に接続しない）・TASK-129（`batch_search` の GPU バックエンド初期化失敗・
+//! 実行時エラーからの CPU-SIMD 縮退機構 `batch_fallback`。対象ビヘイビア: CORE-8。
+//! 縮退経路は `batch_search::run_batch_search` を GPU 参照実装と共有する）。プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!
@@ -35,6 +37,7 @@
 //! から利用）を参照。
 
 pub mod arena;
+pub mod batch_fallback;
 pub mod batch_search;
 pub mod catalog;
 pub mod core;
