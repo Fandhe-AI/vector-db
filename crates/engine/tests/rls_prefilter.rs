@@ -81,10 +81,13 @@ fn schema_for(table_name: &str, dim: u32) -> TableSchema {
 }
 
 /// 決定的な合成コーパスを構築する。行 `id`（`1..=num_rows`）ごとに `rng.next_f64() < visible_rate`
-/// で対象テナント（[`TARGET_TENANT`]・`Public`）か他テナント（[`OTHER_TENANT`]・`Public`）かを
+/// で対象テナント（[`TARGET_TENANT`]・`Public`）か他テナント（[`OTHER_TENANT`]・`Private`）かを
 /// 振り分け、埋め込みは `[-1.0, 1.0)` の一様乱数（`DIM` 次元）で生成する（構造上、対象
 /// テナントの可視行だけが `PrefilterIndex` へ入る。RLS-1 の混入検証に使うため、対象テナント行
-/// の id 集合を独立に返す）。
+/// の id 集合を独立に返す）。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視になった
+/// ため、他テナント行は `Private` にしてテナント分離そのものを検証する（ポインタ:
+/// TABLE-9。本ファイルの `ctx` は既定の `Public` のみ許可のため、`Private` の他テナント行は
+/// 引き続き不可視）。
 ///
 /// `seed` はコーパスごとに変え、可視率間でコーパス自体が偏らないようにする。
 fn seed_corpus(
@@ -120,11 +123,16 @@ fn seed_corpus(
     let rows: Vec<(u64, RowInput<'_>)> = (1..=num_rows)
         .map(|id| {
             let idx = (id - 1) as usize;
+            let visibility = if tenants[idx] == TARGET_TENANT {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
             (
                 id,
                 RowInput {
                     tenant_id: tenants[idx],
-                    visibility: Visibility::Public,
+                    visibility,
                     embedding: &embeddings[idx],
                     metadata: &[],
                 },

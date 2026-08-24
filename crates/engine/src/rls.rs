@@ -324,7 +324,9 @@ mod tests {
     }
 
     // 対象ビヘイビア: RLS-1。他テナント・不可視行は構築時点でインデックスへ含まれず、
-    // 検索結果にも混入しない。
+    // 検索結果にも混入しない。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
+    // なったため、他テナント行の不可視性を検証する行は `Private` にする（ポインタ:
+    // TABLE-9）。
     #[test]
     fn build_excludes_invisible_rows_and_search_never_returns_them() {
         let dir = tempdir();
@@ -345,7 +347,7 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -368,7 +370,9 @@ mod tests {
         assert_eq!(hits[0].id, 1);
     }
 
-    // 対象ビヘイビア: RLS-1。可視行が 0 件でも空結果を返す（拒否ではない）。
+    // 対象ビヘイビア: RLS-1。可視行が 0 件でも空結果を返す（拒否ではない）。TASK-89
+    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、可視行 0 件を保つ
+    // 行は `Private` にする（ポインタ: TABLE-9）。
     #[test]
     fn empty_visible_set_returns_empty_result() {
         let dir = tempdir();
@@ -381,7 +385,7 @@ mod tests {
             "docs",
             1,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
 
@@ -463,7 +467,9 @@ mod tests {
     }
 
     // ctx 束縛の検証: 同一テーブルでも構築時 ctx のテナントに紐づく行しか返らない
-    // （一致 ctx での正常系）。
+    // （一致 ctx での正常系）。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
+    // なったため、テナントごとの束縛を検証する行は `Private` にする（ポインタ:
+    // TABLE-9）。
     #[test]
     fn index_is_bound_to_the_tenant_used_at_build_time() {
         let dir = tempdir();
@@ -476,7 +482,7 @@ mod tests {
             "docs",
             1,
             "tenant-a",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -484,18 +490,20 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
 
-        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
         let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
         let hits = index_a
             .search(&ctx_a, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert!(hits.iter().all(|h| h.id == 1));
 
-        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let ctx_b = PolicyContext::with_visibilities("tenant-b", [Visibility::Private])
+            .expect("valid tenant");
         let index_b = PrefilterIndex::build(&storage, "docs", &ctx_b).expect("build index");
         let hits = index_b
             .search(&ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10)
@@ -807,6 +815,9 @@ mod tests {
 
     // `len`/`is_empty` は構築時 ctx との一致を要求し、別テナントの ctx（tenant-b。
     // 自身の可視行を持つ）を渡した場合はどちらも `RlsError::ContextMismatch` になる。
+    // TASK-89（TABLE-9）で `Public` 行はテナント間相互可視になったため、
+    // `index_a.len(&ctx_a) == 1` という前提を保つため tenant-b 側は `Private` にする
+    // （ポインタ: TABLE-9）。
     #[test]
     fn len_and_is_empty_reject_a_context_different_from_the_one_used_at_build_time() {
         let dir = tempdir();
@@ -827,7 +838,7 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
 

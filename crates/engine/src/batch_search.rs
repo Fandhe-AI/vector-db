@@ -1200,6 +1200,16 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         };
         // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く
         // （`tenant_query_indices` のキー集合は `batch_tenants` と一致する）。
+        //
+        // スコープ注記（TASK-89・対象ビヘイビア: TABLE-9）: この事前絞り込みは
+        // `row_tenant` の文字列一致だけで行うため、`policy.rs::PolicyContext::
+        // is_visible` が獲得した「`Public` 行はテナント間相互可視」という拡張は
+        // 本経路（バッチ API）には及ばない（下記 `is_visible` 呼び出しは常に
+        // 同一テナントの行に対してのみ実行される）。`batch_search`/
+        // `batch_fallback` は `core::EngineCore`／`rls::PrefilterIndex` とは
+        // 独立した経路（`lib.rs` 参照）であり、本タスクでは行動を変更しない
+        // （狭める方向の相違のため安全側だが、`EngineCore` 経路とは可視集合が
+        // 異なりうる。追跡は out-of-scope-tracking に従う）。
         let Some(query_indices) = tenant_query_indices.get(row_tenant) else {
             continue;
         };
@@ -1622,9 +1632,32 @@ mod tests {
         ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).expect("valid matrix")
     }
 
+    /// [`build_two_tenant_matrix`] と同じ id・テナント・ベクトル配置だが、全行
+    /// `Private` にした版。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
+    /// なったため、テナント分離そのものを検証するテストは本フィクスチャを使う
+    /// （ポインタ: TABLE-9）。
+    fn build_two_tenant_matrix_private() -> ResidentMatrix {
+        let ids = vec![1u64, 2, 3, 4];
+        let tenants = vec![
+            "tenant-a".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string(),
+            "tenant-b".to_string(),
+        ];
+        let visibilities = vec![Visibility::Private; 4];
+        let vectors = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).expect("valid matrix")
+    }
+
     /// [`PolicyContext::new`]（`Public` のみ許可）のテスト用ショートハンド。
     fn ctx(tenant_id: &str) -> PolicyContext {
         PolicyContext::new(tenant_id).expect("valid tenant")
+    }
+
+    /// `Private` を明示許可した [`PolicyContext`] のテスト用ショートハンド
+    /// （[`build_two_tenant_matrix_private`] と組で使う）。
+    fn private_ctx(tenant_id: &str) -> PolicyContext {
+        PolicyContext::with_visibilities(tenant_id, [Visibility::Private]).expect("valid tenant")
     }
 
     // CORE-7 ポインタ・テナント境界（P0）: 混在テナントバッチで混入 0 件。
@@ -1634,13 +1667,15 @@ mod tests {
     // 持たない（型定義から削除済み）。テナント境界は `ctx`（`PolicyContext`）
     // 経由でのみ engine 側が決定するため、本テストは「`tenant-a` の
     // `PolicyContext` を渡すクエリが、行列に同居する `tenant-b` の行へは
-    // 構造的に到達できない」ことを検証する。
+    // 構造的に到達できない」ことを検証する。TASK-89（TABLE-9）で `Public` 行は
+    // テナント間相互可視になったため、`Private` フィクスチャで検証する
+    // （ポインタ: TABLE-9）。
     #[test]
     fn batch_search_excludes_other_tenant_rows() {
-        let matrix = build_two_tenant_matrix();
+        let matrix = build_two_tenant_matrix_private();
         let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
-        let ctx_a = ctx("tenant-a");
+        let ctx_a = private_ctx("tenant-a");
         let queries = vec![BatchQuery {
             vector: &query_vec,
             k: 10,
@@ -1665,14 +1700,16 @@ mod tests {
     // を偽装する経路を提供しない。`tenant-a` の `PolicyContext` で発行した
     // クエリが `tenant-b` の行を一切返さないことを、バッチ内に両テナントの
     // クエリが混在する状況でも確認する（`tenant-b` 側のクエリも同時に検証し、
-    // 相互のテナント越え漏えいが無いことを両方向で確認する）。
+    // 相互のテナント越え漏えいが無いことを両方向で確認する）。TASK-89
+    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、`Private`
+    // フィクスチャで検証する（ポインタ: TABLE-9）。
     #[test]
     fn batch_search_cannot_cross_tenant_boundary_via_policy_context() {
-        let matrix = build_two_tenant_matrix();
+        let matrix = build_two_tenant_matrix_private();
         let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
-        let ctx_a = ctx("tenant-a");
-        let ctx_b = ctx("tenant-b");
+        let ctx_a = private_ctx("tenant-a");
+        let ctx_b = private_ctx("tenant-b");
         let queries = vec![
             BatchQuery {
                 vector: &query_vec,
@@ -1751,15 +1788,17 @@ mod tests {
     // codex レビュー指摘対応（行外側ループへの構造変更）: 複数クエリが異なる
     // テナントを持つバッチで、選出器とクエリの対応がずれていないことを検証する
     // （行外側ループ・選出器の事前生成・共有 `row_buf` の組み合わせで、選出器の
-    // 取り違えが起きうる構造のため）。
+    // 取り違えが起きうる構造のため）。テナント間の行が結果に混ざらないことも
+    // 併せて確認するため、TASK-89（TABLE-9）以降は `Private` フィクスチャで
+    // 検証する（`Public` は相互可視のため分離を検証できない。ポインタ: TABLE-9）。
     #[test]
     fn batch_search_keeps_per_query_results_correct_across_different_tenants() {
-        let matrix = build_two_tenant_matrix();
+        let matrix = build_two_tenant_matrix_private();
         let engine = BatchEngine::new(matrix);
         let query_a = [1.0f32, 0.0];
         let query_b = [0.0f32, 1.0];
-        let ctx_a = ctx("tenant-a");
-        let ctx_b = ctx("tenant-b");
+        let ctx_a = private_ctx("tenant-a");
+        let ctx_b = private_ctx("tenant-b");
         let queries = vec![
             BatchQuery {
                 vector: &query_a,
@@ -2135,7 +2174,10 @@ mod tests {
     // 10 行だけ（10 * MAX_BATCH_QUERIES * MAX_BATCH_DIM ≈ 3.36 × 10^8 <
     // MAX_BATCH_WORK）なので許可されるべきことを確認する（行数は実行時間を
     // 抑えるため境界からは離れた小さい値を選ぶ。境界そのものの検証は
-    // `compute_batch_work_accepts_exactly_at_limit` 等が別途担う）。
+    // `compute_batch_work_accepts_exactly_at_limit` 等が別途担う）。TASK-89
+    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、tenant-b 側は
+    // `Private` にして「`ctx_a` が実際に見るのは tenant-a の行だけ」という前提を
+    // 保つ（ポインタ: TABLE-9）。
     #[test]
     fn batch_search_work_budget_charges_only_matching_tenant_rows() {
         let tenant_a_rows = 10usize;
@@ -2147,7 +2189,9 @@ mod tests {
             .chain(std::iter::repeat_n("tenant-b".to_string(), tenant_b_rows))
             .collect();
         tenants.truncate(rows);
-        let visibilities: Vec<Visibility> = std::iter::repeat_n(Visibility::Public, rows).collect();
+        let visibilities: Vec<Visibility> = std::iter::repeat_n(Visibility::Public, tenant_a_rows)
+            .chain(std::iter::repeat_n(Visibility::Private, tenant_b_rows))
+            .collect();
         let vectors: Vec<f32> = std::iter::repeat_n(0.0f32, rows * dim).collect();
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, dim, &vectors)
             .expect("valid matrix");

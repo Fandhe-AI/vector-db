@@ -5,6 +5,11 @@
 //! 呼び出し側が独自にテナント文字列を比較する経路を作らないことで、判定ロジックの
 //! 分岐を 1 箇所に集約し fail-closed を維持する（TASK-133 以降の RLS ポリシー評価は
 //! このパスを拡張する前提で設計している）。
+//!
+//! TASK-89（対象ビヘイビア: TABLE-9）で、`Public` 可視性ラベルの行はテナント間で
+//! 相互可視（自テナントか否かを問わない）というセマンティクスをこの単一照合パスへ
+//! 統合した。テーブル単位の物理分離は本タスクのスコープ外（[`crate::tenant`] の
+//! モジュールドキュメント参照）。
 
 use std::collections::HashSet;
 
@@ -127,16 +132,28 @@ impl PolicyContext {
         &self.tenant_id
     }
 
-    /// テナント一致判定と可視性ラベル評価を単一の照合パスで行う（CORE-2）。
+    /// テナント一致判定と可視性ラベル評価を単一の照合パスで行う（CORE-2・
+    /// TASK-89・対象ビヘイビア: TABLE-9）。
     ///
-    /// `row_tenant` が自テナントと一致し、かつ `row_visibility` が許可集合に含まれる
-    /// 場合にのみ `true`。呼び出し側（検索カーネル・行取得）はこのメソッド以外で
-    /// テナント比較を行わない。
+    /// 判定は 2 通り:
+    /// - `row_visibility == Public` かつ許可集合に `Public` を含む場合、`row_tenant`
+    ///   が自テナントと異なっていても可視（テナント間の相互可視性。TABLE-9）。
+    ///   許可集合に `Public` を含まない ctx には、この経路では他テナント行を
+    ///   見せない（fail-closed。黙示の拡大をしない）。
+    /// - それ以外は従来どおり、`row_tenant` が自テナントと一致し、かつ
+    ///   `row_visibility` が許可集合に含まれる場合にのみ可視（`Private` は
+    ///   テナント越境不可のまま）。
+    ///
+    /// 呼び出し側（検索カーネル・行取得）はこのメソッド以外でテナント比較を
+    /// 行わない。
     pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
-        row_tenant == self.tenant_id
-            && self
-                .allowed_visibilities
-                .contains(&AllowedVisibility::from(row_visibility))
+        let allowed = self
+            .allowed_visibilities
+            .contains(&AllowedVisibility::from(row_visibility));
+        if !allowed {
+            return false;
+        }
+        row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
 }
 
@@ -151,14 +168,24 @@ mod tests {
         assert!(ctx.is_visible("tenant-a", Visibility::Public));
     }
 
-    // 対象ビヘイビア: CORE-2。他テナントは不可視（可視性ラベルに関わらず）。
+    // 対象ビヘイビア: TABLE-9。他テナントの `Public` 行は、許可集合に `Public`
+    // を含む ctx には可視（相互可視性）。`Private` はテナント越境不可のまま。
     #[test]
-    fn other_tenant_is_not_visible() {
+    fn other_tenant_public_row_is_visible_when_public_is_allowed() {
         let ctx =
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
-        assert!(!ctx.is_visible("tenant-b", Visibility::Public));
+        assert!(ctx.is_visible("tenant-b", Visibility::Public));
         assert!(!ctx.is_visible("tenant-b", Visibility::Private));
+    }
+
+    // 対象ビヘイビア: TABLE-9（fail-closed）。`Public` を許可集合に含まない ctx
+    // には、他テナントの `Public` 行も見せない（黙示の拡大をしない）。
+    #[test]
+    fn other_tenant_public_row_is_not_visible_without_public_grant() {
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        assert!(!ctx.is_visible("tenant-b", Visibility::Public));
     }
 
     // 対象ビヘイビア: CORE-2。Private は明示付与なしでは不可視（既定は最小権限）。

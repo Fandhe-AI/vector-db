@@ -746,6 +746,14 @@ mod tests {
         PolicyContext::new(tenant).expect("valid tenant id")
     }
 
+    /// `Private` を明示許可した [`PolicyContext`] のテスト用ショートハンド。
+    /// TASK-89（TABLE-9）で `Public` 行はテナント間相互可視になったため、
+    /// テナント分離そのものを検証するテストは `Private` フィクスチャと組で使う
+    /// （ポインタ: TABLE-9）。
+    fn private_ctx(tenant: &str) -> PolicyContext {
+        PolicyContext::with_visibilities(tenant, [Visibility::Private]).expect("valid tenant id")
+    }
+
     struct RecordingObserver {
         events: std::sync::Mutex<Vec<FallbackEvent>>,
     }
@@ -938,6 +946,46 @@ mod tests {
         .expect("build ok")
     }
 
+    /// [`build_engine_with_backend`] と同じ id・テナント・ベクトル配置だが、全行
+    /// `Private` にした版。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
+    /// なったため、テナント分離そのものを検証するテストは本フィクスチャを使う
+    /// （ポインタ: TABLE-9）。
+    fn build_engine_with_backend_private(
+        backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
+        observer: Box<dyn FallbackObserver>,
+    ) -> FallbackBatchEngine {
+        let ids = [1u64, 2, 3, 4];
+        let tenant_ids = [
+            "tenant-a".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string(),
+            "tenant-b".to_string(),
+        ];
+        let visibilities = [
+            Visibility::Private,
+            Visibility::Private,
+            Visibility::Private,
+            Visibility::Private,
+        ];
+        #[rustfmt::skip]
+        let vectors = [
+            1.0, 0.0,
+            0.0, 1.0,
+            2.0, 0.0,
+            0.0, 2.0,
+        ];
+        FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &vectors,
+            backend_factory,
+            observer,
+        )
+        .expect("build ok")
+    }
+
     /// primary バックエンドの実行時エラーを注入するモック（本体へテスト専用
     /// API を追加せず、`BatchBackend` trait をテストコード側で実装する
     /// エラー注入手段。Issue #137 対応の test-support feature 撤廃方針を踏襲）。
@@ -1000,6 +1048,15 @@ mod tests {
 
     // オラクル: 可視行だけを渡した `kernel::CpuScalarProvider::search` の結果
     // （スコア降順・同点 id 昇順まで完全一致）と縮退後の Top-k を突き合わせる。
+    //
+    // `batch_search.rs::run_batch_search` は行外側ループの計算量最適化として、行を
+    // その `tenant_id` に一致するクエリだけへ絞り込んでから `PolicyContext::is_visible`
+    // を評価する（`tenant_query_indices`）。この事前絞り込みはテナント文字列の一致で
+    // 行うため、TASK-89（TABLE-9）で `PolicyContext::is_visible` が獲得した「`Public`
+    // 行はテナント間相互可視」という拡張はバッチ経路には及ばない（`batch_search`
+    // API は本タスクのスコープ外。狭める方向の相違であり安全側だが、`EngineCore`/
+    // `PrefilterIndex` 経路とは可視集合が異なりうる点に注意）。オラクルもこの
+    // 構造的絞り込みを反映し、`tenant == ctx.tenant_id()` の行だけを候補にする。
     fn oracle_search(
         ids: &[u64],
         tenant_ids: &[&str],
@@ -1012,7 +1069,7 @@ mod tests {
         let mut visible_ids = Vec::new();
         let mut visible_vectors = Vec::new();
         for ((&id, &tenant), row) in ids.iter().zip(tenant_ids).zip(vectors_per_row) {
-            if ctx.is_visible(tenant, Visibility::Public) {
+            if tenant == ctx.tenant_id() && ctx.is_visible(tenant, Visibility::Public) {
                 visible_ids.push(id);
                 visible_vectors.extend_from_slice(row);
             }
@@ -1222,11 +1279,13 @@ mod tests {
     }
 
     // マルチテナントバッチで縮退後も他テナント行の混入 0 件であること・
-    // クエリごとに独立した結果順序が保たれることを検証する。
+    // クエリごとに独立した結果順序が保たれることを検証する。TASK-89
+    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、`Private`
+    // フィクスチャで検証する（ポインタ: TABLE-9）。
     #[test]
     fn fallback_search_does_not_leak_rows_across_tenants_in_multi_tenant_batch() {
         let observer = RecordingObserver::new();
-        let engine = build_engine_with_backend(
+        let engine = build_engine_with_backend_private(
             |_matrix| {
                 Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
                     "lost".to_string(),
@@ -1234,8 +1293,8 @@ mod tests {
             },
             Box::new(observer),
         );
-        let ctx_a = ctx("tenant-a");
-        let ctx_b = ctx("tenant-b");
+        let ctx_a = private_ctx("tenant-a");
+        let ctx_b = private_ctx("tenant-b");
         let query_a = [1.0f32, 1.0];
         let query_b = [1.0f32, 1.0];
         let queries = vec![
@@ -1416,10 +1475,12 @@ mod tests {
 
     // 他テナントの実在 id（tenant-b の行 id=3）を tenant-a のクエリへ混入させる
     // 悪性バックエンドは拒否される（本指摘のコア: マスク漏れ・結果破損による
-    // 他テナントの存在情報漏えいを防ぐ）。
+    // 他テナントの存在情報漏えいを防ぐ）。TASK-89（TABLE-9）で `Public` 行は
+    // テナント間相互可視になったため、id=3 が引き続き tenant-a から不可視で
+    // あることを保つ `Private` フィクスチャで検証する（ポインタ: TABLE-9）。
     #[test]
     fn revalidation_rejects_other_tenant_id() {
-        let engine = build_engine_with_backend(
+        let engine = build_engine_with_backend_private(
             |_matrix| {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
@@ -1431,7 +1492,7 @@ mod tests {
             },
             Box::new(RecordingObserver::new()),
         );
-        let ctx_a = ctx("tenant-a");
+        let ctx_a = private_ctx("tenant-a");
         let query = [1.0f32, 0.0];
         let queries = vec![BatchQuery {
             vector: &query,

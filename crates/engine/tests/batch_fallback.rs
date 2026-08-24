@@ -87,6 +87,13 @@ fn fixture() -> ([u64; 4], [String; 4], [Visibility; 4], usize, [f32; 8]) {
 /// `kernel::CpuScalarProvider::search`（CORE-3 と同一の選出規約: スコア降順・
 /// 同点 id 昇順・非有限値除外）を呼ぶ。縮退経路の Top-k と完全一致することを
 /// 期待する。
+///
+/// `batch_search.rs::run_batch_search` は行外側ループの計算量最適化として、行を
+/// その `tenant_id` に一致するクエリだけへ絞り込んでから `PolicyContext::is_visible`
+/// を評価する（`tenant_query_indices`）。TASK-89（TABLE-9）で `is_visible` が獲得した
+/// 「`Public` 行はテナント間相互可視」という拡張はこの事前絞り込みには及ばない
+/// （`batch_search`/`batch_fallback` API は本タスクのスコープ外。`src/batch_fallback.rs`
+/// の同名オラクル参照）。本オラクルも `tenant == ctx.tenant_id()` の行だけを候補にする。
 fn oracle_search(
     ids: &[u64],
     tenant_ids: &[String],
@@ -99,7 +106,7 @@ fn oracle_search(
     let mut visible_ids = Vec::new();
     let mut visible_vectors = Vec::new();
     for (row_idx, (id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {
-        if ctx.is_visible(tenant, Visibility::Public) {
+        if tenant == ctx.tenant_id() && ctx.is_visible(tenant, Visibility::Public) {
             visible_ids.push(*id);
             let start = row_idx * dim;
             visible_vectors.extend_from_slice(&vectors[start..start + dim]);
@@ -373,10 +380,13 @@ fn tenant_mask_violation_from_primary_is_not_treated_as_fallback_trigger() {
 }
 
 // マルチテナントバッチで縮退後も他テナント行の混入が 0 件であることを検証する
-// （テナント境界。security.md P0）。
+// （テナント境界。security.md P0）。TASK-89（TABLE-9）で `Public` 行はテナント間
+// 相互可視になったため、越境しないことの検証は `Private` 行のフィクスチャで
+// 行う（`Public` を使うと分離を検証できなくなるため。ポインタ: TABLE-9）。
 #[test]
 fn fallback_search_does_not_leak_rows_across_tenants() {
-    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let (ids, tenant_ids, _visibilities, dim, vectors) = fixture();
+    let visibilities = [Visibility::Private; 4];
     let observer = RecordingObserver::default();
     let engine = FallbackBatchEngine::build(
         &ids,
@@ -393,8 +403,10 @@ fn fallback_search_does_not_leak_rows_across_tenants() {
     )
     .expect("build ok");
 
-    let ctx_a = ctx("tenant-a");
-    let ctx_b = ctx("tenant-b");
+    let ctx_a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Private]).expect("valid tenant");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
     let query = [1.0f32, 1.0];
     let queries = vec![
         BatchQuery {
