@@ -196,6 +196,18 @@ endif
 ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
+# 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-simd
+bench-simd: ## TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から定期実行）
+ifdef HAS_CARGO
+	cargo bench --bench simd_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-simd をスキップ"
+endif
+
+# --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
 

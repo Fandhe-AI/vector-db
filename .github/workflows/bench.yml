@@ -1,0 +1,41 @@
+name: Bench
+
+# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の定期実行。crates/engine/benches/simd_bench.rs
+# は時間依存の測定値を含むため PR CI（ci.yml）のアサーションには混ぜず、本 workflow を
+# 週次 schedule + workflow_dispatch（手動起動）で独立実行する。private submodule
+# （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
+# 方針）。
+on:
+  schedule:
+    # 毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは独立した時間帯にする。
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # schedule/workflow_dispatch はいずれも ref = デフォルトブランチ固定のため、
+  # workflow 名のみで group を一意化すれば十分（ci.yml の PR 番号切り分けは不要）。
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # bench-simd（TASK-127 回帰ベンチ実行）
+  # --------------------------------------------------
+  # 生の steps を持つ独立ジョブとして定義するため、第三者 action（actions/checkout）は
+  # ci.yml の crash-test 系ジョブと同一の SHA 固定で参照する（AGENTS.md「CI・ワークフロー
+  # の改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
+  bench-simd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-simd
+        run: make bench-simd

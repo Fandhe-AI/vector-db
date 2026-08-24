@@ -9,6 +9,11 @@
 //! `Cargo.toml` 側で `test = false` を指定しているため `cargo test` の対象には
 //! 含まれない（プロトコル遵守そのものの回帰検証は `tests/bench_harness.rs` が担う）。
 
+// TASK-127 で `harness::accept`（受け入れ判定ヘルパ）が harness へ追加された。
+// 本ファイルは `ab`/`protocol`/`rng` のみ使い `accept` を経由しないため、
+// バイナリターゲットでは未到達の `pub` 項目が dead_code として警告されうる
+// （`parallel_smoke.rs` と同一の理由・対処。`harness/mod.rs` 自体は変更しない）。
+#[allow(dead_code)]
 mod harness;
 
 use harness::ab::run_ab;

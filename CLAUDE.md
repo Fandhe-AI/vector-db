@@ -29,6 +29,7 @@ vector-db/
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check の CI
+│   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準の回帰ベンチ（週次 schedule + workflow_dispatch）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
