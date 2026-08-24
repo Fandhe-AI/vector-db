@@ -4,6 +4,7 @@
 pub mod arena;
 pub mod catalog;
 pub mod core;
+pub mod gpu_search;
 pub mod hybrid;
 pub mod kernel;
 pub mod parallel_search;

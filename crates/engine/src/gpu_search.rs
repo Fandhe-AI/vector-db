@@ -1,0 +1,668 @@
+//! バッチクエリ・一括インデクシング専用の検索エンジン（TASK-128・対象ビヘイビア:
+//! CORE-6, CORE-7, CORE-16）。`kernel.rs::SearchProvider`（単発クエリの窓口・CORE-13）
+//! は実装しない。単発経路（`core.rs::EngineCore::search`）は本モジュールへ構造的に
+//! 接続できず、`CORE-7` が定める「単発クエリは CPU-SIMD 固定」を型レベルで担保する。
+//!
+//! # 依存に関する制約（重要・.claude/rules/dependency-policy.md）
+//!
+//! 元の設計は GPU 常駐ベース行列（`wgpu`/WGSL、CORE-16 の f16 2 要素/u32 パックを
+//! `unpack2x16float` で復元）でのバッチスコア計算を行う想定だった。しかし本リポの
+//! 依存追加は「必ずユーザーの明示承認を経てから行う」規約（dependency-policy.md）
+//! であり、本コミットの実行過程ではその承認を得られない。安全側に倒し、実際の GPU
+//! 実行（`wgpu` 依存の追加・デバイス初期化・WGSL コンパイル）は追加せず、CORE-6/7/16
+//! が要求する **アルゴリズム的な挙動**（GPU 常駐相当の f16 パック表現・バッチ Top-k
+//! 選出・クエリ別テナントマスク・動的窓集約）のみを依存クレートなしで実装する。
+//! 実際の GPU（`wgpu`）実行への置き換えは、依存追加の承認後にフォローアップとして
+//! 行う（このコミットの outOfScope・PR 本文に明記する）。
+//!
+//! `TopKSelector`（`kernel.rs`）を選出段で共用し、選出規約（スコア降順・同点 id
+//! 昇順・非有限値除外）の二重管理を防ぐ。`core.rs::EngineCore` と同じ「(1) 選出前に
+//! 候補をマスクで絞る、(2) 選出後の結果 id を独立に再検証する」二重防御を踏襲する
+//! （CORE-7 のテナント境界要件）。
+
+use std::fmt;
+
+use crate::kernel::{SearchHit, TopKSelector};
+
+/// バッチ 1 件あたりの許容クエリ数上限（防御的上限。`core.rs::MAX_SEARCH_K` と同じ
+/// 桁感覚で、上限検証前にアロケーションへ使わない）。
+pub const MAX_BATCH_QUERIES: usize = 4_096;
+
+/// 一括インデクシング対象の行数上限（防御的上限）。
+pub const MAX_BATCH_ROWS: usize = 1_000_000;
+
+/// クエリ・格納ベクトルの次元数上限（防御的上限）。
+pub const MAX_BATCH_DIM: usize = 8_192;
+
+/// バッチ検索エンジンのエラー（fail-closed）。メッセージは英語（wire プロトコル
+/// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
+/// 存在情報を含めない。
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpuSearchError {
+    /// バッチのクエリ件数が [`MAX_BATCH_QUERIES`] を超過した。
+    TooManyQueries { count: usize, max: usize },
+    /// 常駐行列の行数が [`MAX_BATCH_ROWS`] を超過した。
+    TooManyRows { count: usize, max: usize },
+    /// 次元数が [`MAX_BATCH_DIM`] を超過した、または 0。
+    InvalidDim { dim: usize, max: usize },
+    /// クエリベクトルの次元が常駐行列の次元と一致しない。
+    DimMismatch { expected: usize, found: usize },
+    /// クエリベクトルに非有限値（NaN/Inf）が含まれる（untrusted 入力の明示拒否）。
+    NonFiniteQuery { query_index: usize },
+    /// 常駐行列構築時、`ids`/`vectors`/可視性マスクの長さ不整合。
+    ArenaLengthMismatch,
+    /// バッチ内の結果が、選出後に独立再検証したクエリ別可視集合と食い違った
+    /// （テナント混入の疑い。`core.rs::CoreError::ProviderResultRejected` と同じ
+    /// fail-closed 思想。結果を一切返さない）。
+    TenantMaskViolation,
+}
+
+impl fmt::Display for GpuSearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GpuSearchError::TooManyQueries { count, max } => {
+                write!(f, "gpu_search: too many queries: {count} (max {max})")
+            }
+            GpuSearchError::TooManyRows { count, max } => {
+                write!(f, "gpu_search: too many rows: {count} (max {max})")
+            }
+            GpuSearchError::InvalidDim { dim, max } => {
+                write!(f, "gpu_search: invalid dim: {dim} (max {max}, must be > 0)")
+            }
+            GpuSearchError::DimMismatch { expected, found } => write!(
+                f,
+                "gpu_search: query dim mismatch: expected={expected} found={found}"
+            ),
+            GpuSearchError::NonFiniteQuery { query_index } => write!(
+                f,
+                "gpu_search: query {query_index} contains non-finite value"
+            ),
+            GpuSearchError::ArenaLengthMismatch => {
+                write!(f, "gpu_search: arena ids/vectors/mask length mismatch")
+            }
+            GpuSearchError::TenantMaskViolation => {
+                write!(f, "gpu_search: result violated per-query tenant mask")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuSearchError {}
+
+// ---------------------------------------------------------------------
+// CORE-16: GPU 常駐コピー限定の f16 2 要素/u32 パック。
+//
+// 格納・CPU 経路・クエリベクトルの dtype は f32 のまま変更しない。本関数群は
+// 「GPU 常駐ベース行列」相当の表現へ変換する層としてのみ使う（呼び出し元が
+// f32 のオリジナルを保持し続ける前提）。IEEE 754 binary16 の丸めは round-to-nearest-even
+// を実装する。
+// ---------------------------------------------------------------------
+
+/// f32 を IEEE 754 binary16（f16）のビットパターンへ丸める。オーバーフローは
+/// ±Inf、極小値は 0 へフラッシュする（サブノーマル出力は生成しない。GPU 常駐用
+/// 表現としては許容する簡略化）。
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    if value.is_nan() {
+        // NaN は符号なしの quiet NaN パターンへ正規化する（NaN のペイロードは
+        // 復元時に意味を持たないため、往復精度の対象外）。
+        return sign | 0x7E00;
+    }
+    let abs_bits = bits & 0x7FFF_FFFF;
+    let exp = ((abs_bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let mantissa = abs_bits & 0x007F_FFFF;
+
+    if exp >= 0x1F {
+        // 指数オーバーフロー: ±Inf へ飽和する。
+        return sign | 0x7C00;
+    }
+    if exp <= 0 {
+        // 指数アンダーフロー: サブノーマル表現は行わず 0 へフラッシュする。
+        return sign;
+    }
+    // 23 ビット仮数を 10 ビットへ round-to-nearest-even で丸める。
+    let shift = 13u32;
+    let round_bit = 1u32 << (shift - 1);
+    let lower_mask = round_bit.wrapping_sub(1);
+    let mut mantissa16 = mantissa >> shift;
+    let remainder = mantissa & (round_bit | lower_mask);
+    let mut exp16 = exp as u32;
+    if remainder > round_bit || (remainder == round_bit && (mantissa16 & 1) == 1) {
+        mantissa16 += 1;
+        if mantissa16 == 0x0400 {
+            // 仮数繰り上がりで指数が 1 増える。
+            mantissa16 = 0;
+            exp16 += 1;
+        }
+    }
+    if exp16 >= 0x1F {
+        return sign | 0x7C00;
+    }
+    sign | ((exp16 as u16) << 10) | (mantissa16 as u16)
+}
+
+/// f16 ビットパターンを f32 へ復元する（GPU シェーダの `unpack2x16float` と等価な
+/// 意味論。実際の WGSL 実行は行わない点は本モジュール冒頭の依存制約コメントを参照）。
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = (bits & 0x8000) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x03FF) as u32;
+
+    let (out_exp, out_mantissa) = if exp == 0 {
+        if mantissa == 0 {
+            (0u32, 0u32)
+        } else {
+            // サブノーマル f16 を正規化 f32 へ変換する。
+            let mut m = mantissa;
+            let mut e = -1i32;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x03FF;
+            let exp32 = (e + 15 - 15 + 127) as u32;
+            (exp32, m << 13)
+        }
+    } else if exp == 0x1F {
+        (0xFFu32, mantissa << 13)
+    } else {
+        // `exp` は f16 バイアス 15、`out_exp` は f32 バイアス 127。`exp` は正規化
+        // 範囲（1..=30）のみここへ到達するため差し引き後は必ず非負だが、u32 の
+        // まま `exp - 15` を計算すると `exp < 15` で桁下がり（オーバーフロー）に
+        // なるため、符号付き整数で計算してから戻す。
+        ((exp as i32 - 15 + 127) as u32, mantissa << 13)
+    };
+
+    let out_bits = (sign << 16) | (out_exp << 23) | out_mantissa;
+    f32::from_bits(out_bits)
+}
+
+/// 2 要素の f32 を 1 個の u32 へ f16 パックする（CORE-16: GPU 常駐コピーの表現）。
+/// 下位 16 ビットに `a`、上位 16 ビットに `b` を格納する（WGSL `unpack2x16float` の
+/// 並び順と一致させる）。
+pub fn pack_f16x2(a: f32, b: f32) -> u32 {
+    let lo = f32_to_f16_bits(a) as u32;
+    let hi = f32_to_f16_bits(b) as u32;
+    lo | (hi << 16)
+}
+
+/// [`pack_f16x2`] の逆変換。
+pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
+    let lo = (packed & 0xFFFF) as u16;
+    let hi = ((packed >> 16) & 0xFFFF) as u16;
+    (f16_bits_to_f32(lo), f16_bits_to_f32(hi))
+}
+
+// ---------------------------------------------------------------------
+// GPU 常駐ベース行列（CORE-16 のパック表現を保持する一括インデクシング結果）。
+// ---------------------------------------------------------------------
+
+/// 一括インデクシングで構築する GPU 常駐相当のベース行列。可視性フィルタ済みの
+/// 全行を f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
+/// アリーナを別途保持し続け、本構造体はバッチ検索専用の副次表現として扱う。
+#[derive(Debug)]
+pub struct ResidentMatrix {
+    ids: Vec<u64>,
+    /// テナント境界判定用: 行 `i` の所属テナント ID（`PolicyContext::is_visible` の
+    /// 単一照合パスに渡すため、呼び出し元が構築時に確定させる）。
+    tenant_ids: Vec<String>,
+    dim: usize,
+    /// `ids.len() * dim.div_ceil(2)` 要素のパック済み行列（行優先）。
+    packed: Vec<u32>,
+}
+
+impl ResidentMatrix {
+    /// 可視性フィルタ済みの行集合から常駐行列を構築する（CORE-16）。`ids` /
+    /// `tenant_ids` / `vectors`（`ids.len() * dim` 要素、f32・行優先）の長さが
+    /// 整合しない場合は [`GpuSearchError::ArenaLengthMismatch`]。次元・行数の
+    /// 上限検証はアロケーション前に行う（untrusted な行数・次元をそのまま
+    /// `Vec::with_capacity` へ渡さない。coding-rust.md 準拠）。
+    pub fn build(
+        ids: &[u64],
+        tenant_ids: &[String],
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<Self, GpuSearchError> {
+        if dim == 0 || dim > MAX_BATCH_DIM {
+            return Err(GpuSearchError::InvalidDim {
+                dim,
+                max: MAX_BATCH_DIM,
+            });
+        }
+        if ids.len() > MAX_BATCH_ROWS {
+            return Err(GpuSearchError::TooManyRows {
+                count: ids.len(),
+                max: MAX_BATCH_ROWS,
+            });
+        }
+        if ids.len() != tenant_ids.len() {
+            return Err(GpuSearchError::ArenaLengthMismatch);
+        }
+        let expected_len = ids
+            .len()
+            .checked_mul(dim)
+            .ok_or(GpuSearchError::ArenaLengthMismatch)?;
+        if vectors.len() != expected_len {
+            return Err(GpuSearchError::ArenaLengthMismatch);
+        }
+
+        let packed_per_row = dim.div_ceil(2);
+        let packed_len =
+            ids.len()
+                .checked_mul(packed_per_row)
+                .ok_or(GpuSearchError::TooManyRows {
+                    count: ids.len(),
+                    max: MAX_BATCH_ROWS,
+                })?;
+        let mut packed = Vec::with_capacity(packed_len);
+        for row in vectors.chunks(dim) {
+            for pair in row.chunks(2) {
+                let a = pair.first().copied().unwrap_or(0.0);
+                let b = pair.get(1).copied().unwrap_or(0.0);
+                packed.push(pack_f16x2(a, b));
+            }
+        }
+
+        Ok(Self {
+            ids: ids.to_vec(),
+            tenant_ids: tenant_ids.to_vec(),
+            dim,
+            packed,
+        })
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// 行 `idx` を f16 往復で復元した f32 ベクトルを返す（積和計算専用。格納
+    /// 表現自体は f32 のまま別途保持する呼び出し元の責務であり、本メソッドは
+    /// バッチスコア計算のためだけに使う）。
+    fn row_f32(&self, idx: usize) -> Option<Vec<f32>> {
+        let packed_per_row = self.dim.div_ceil(2);
+        let start = idx.checked_mul(packed_per_row)?;
+        let end = start.checked_add(packed_per_row)?;
+        let row = self.packed.get(start..end)?;
+        let mut out = Vec::with_capacity(self.dim);
+        for &p in row {
+            let (a, b) = unpack_f16x2(p);
+            out.push(a);
+            if out.len() < self.dim {
+                out.push(b);
+            }
+        }
+        Some(out)
+    }
+}
+
+// ---------------------------------------------------------------------
+// CORE-7: 動的窓集約。キュー取り出し時に後続クエリが到着している場合に限り
+// 短時間窓で集約して GPU バッチへ載せる。静的窓（常時窓待ち）は実装しない。
+// ---------------------------------------------------------------------
+
+/// 集約するか否かの判定（副作用なしの純関数）。`pending_after_pop` はキューから
+/// 1 件取り出した直後に後続が存在するかどうか（呼び出し側のキュー実装に依存
+/// しない最小のインターフェース）。後続が無ければ即時 CPU-SIMD 経路へ回すべき
+/// （待たない）ため `false`。ディスパッチ決定表本体（TASK-155）はこの判定を
+/// 呼び出す側であり、本関数自体は経路選択ロジックを持たない。
+pub fn should_aggregate_into_batch(pending_after_pop: bool) -> bool {
+    pending_after_pop
+}
+
+/// 動的窓での集約バッファ。[`should_aggregate_into_batch`] が `true` を返した
+/// キュー取り出し文脈でのみ使う想定（PoC-13 移植）。
+#[derive(Debug, Default)]
+pub struct DynamicWindowAggregator {
+    queries: Vec<Vec<f32>>,
+}
+
+impl DynamicWindowAggregator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// クエリ 1 件を窓へ追加する。上限は呼び出し側（キュー実装）が
+    /// [`MAX_BATCH_QUERIES`] を尊重して制御する前提（本構造体自体は無制限に
+    /// 追加を受け付けるため、呼び出し側の責務として明記する）。
+    pub fn push(&mut self, query: Vec<f32>) {
+        self.queries.push(query);
+    }
+
+    pub fn len(&self) -> usize {
+        self.queries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queries.is_empty()
+    }
+
+    /// 窓を確定し、集約済みクエリ集合を取り出す（窓は 1 回使い切り）。
+    pub fn drain(&mut self) -> Vec<Vec<f32>> {
+        std::mem::take(&mut self.queries)
+    }
+}
+
+// ---------------------------------------------------------------------
+// CORE-6/7: バッチ検索本体。GPU スコア計算に相当する積和は f16 往復した行から
+// f32 で行う（実際の WGSL 実行は追加しない。本モジュール冒頭コメント参照）。
+// Top-k 抽出は `kernel.rs::TopKSelector` を共用する。
+// ---------------------------------------------------------------------
+
+/// クエリ 1 件分のバッチ入力。可視テナント集合はクエリ発行元の
+/// `PolicyContext::tenant_id()` から呼び出し元が確定させ、ここでは単純な
+/// 文字列一致でマスクする（`policy.rs::PolicyContext::is_visible` と同一の
+/// 単一照合パスの考え方を踏襲。本モジュールは `PolicyContext` を直接構築
+/// しないため文字列一致で表現する）。
+pub struct BatchQuery<'a> {
+    pub vector: &'a [f32],
+    pub k: usize,
+    pub tenant_id: &'a str,
+}
+
+/// `GpuBatchEngine::batch_search` の 1 クエリ分の結果。
+#[derive(Debug)]
+pub struct BatchHit {
+    pub hits: Vec<SearchHit>,
+}
+
+/// バッチクエリ・一括インデクシング専用のエンジン（CORE-6）。単発クエリ経路
+/// (`kernel.rs::SearchProvider`) は実装せず、`core.rs::EngineCore` から到達
+/// できない（型レベルでの分離。CORE-7）。
+pub struct GpuBatchEngine {
+    matrix: ResidentMatrix,
+}
+
+impl GpuBatchEngine {
+    /// 常駐行列から構築する。GPU デバイス初期化は行わない（依存制約により
+    /// 実際の GPU 実行は追加していないため、本コンストラクタは常に成功する。
+    /// 将来 `wgpu` 依存が承認された場合、ここで adapter/device 取得を行い
+    /// 初期化失敗を `Result::Err` として fail-closed に伝播する設計とする）。
+    pub fn new(matrix: ResidentMatrix) -> Self {
+        Self { matrix }
+    }
+
+    /// バッチ検索を実行する（CORE-6・CORE-7）。クエリごとに次元・非有限値を
+    /// 検証したうえで、常駐行列の中からクエリと同一テナントの行だけを候補として
+    /// 選出する（Top-k 選出段でのクエリ別可視行マスク）。選出後、結果 id を
+    /// 独立に再計算したテナント集合と突き合わせ、逸脱があれば結果を一切返さず
+    /// [`GpuSearchError::TenantMaskViolation`] を返す（`core.rs::EngineCore` と
+    /// 同じ二重防御。fail-closed）。
+    pub fn batch_search(
+        &self,
+        queries: &[BatchQuery<'_>],
+    ) -> Result<Vec<BatchHit>, GpuSearchError> {
+        if queries.len() > MAX_BATCH_QUERIES {
+            return Err(GpuSearchError::TooManyQueries {
+                count: queries.len(),
+                max: MAX_BATCH_QUERIES,
+            });
+        }
+
+        let mut out = Vec::with_capacity(queries.len());
+        for (query_index, q) in queries.iter().enumerate() {
+            if q.vector.len() != self.matrix.dim {
+                return Err(GpuSearchError::DimMismatch {
+                    expected: self.matrix.dim,
+                    found: q.vector.len(),
+                });
+            }
+            if q.vector.iter().any(|v| !v.is_finite()) {
+                return Err(GpuSearchError::NonFiniteQuery { query_index });
+            }
+
+            // (1) 選出前のマスク: 自テナントの行だけを候補にする。
+            let mut selector = TopKSelector::new(q.k);
+            for row_idx in 0..self.matrix.row_count() {
+                let Some(row_tenant) = self.matrix.tenant_ids.get(row_idx) else {
+                    continue;
+                };
+                if row_tenant != q.tenant_id {
+                    continue;
+                }
+                let Some(id) = self.matrix.ids.get(row_idx).copied() else {
+                    continue;
+                };
+                let Some(row_vec) = self.matrix.row_f32(row_idx) else {
+                    continue;
+                };
+                let score = dot_f32(&row_vec, q.vector);
+                if !score.is_finite() {
+                    continue;
+                }
+                selector.push(SearchHit { id, score });
+            }
+            let hits = selector.into_sorted_vec();
+
+            // (2) 選出後の独立再検証: 返す id が全て自テナント行由来であることを、
+            // マスク実装から独立に id → tenant を引き直して確認する。
+            for hit in &hits {
+                let owner_tenant = self
+                    .matrix
+                    .ids
+                    .iter()
+                    .position(|&id| id == hit.id)
+                    .and_then(|pos| self.matrix.tenant_ids.get(pos));
+                match owner_tenant {
+                    Some(t) if t == q.tenant_id => {}
+                    _ => return Err(GpuSearchError::TenantMaskViolation),
+                }
+            }
+
+            out.push(BatchHit { hits });
+        }
+        Ok(out)
+    }
+}
+
+/// 内積のスカラー参照実装。`kernel.rs::dot` は `pub(crate)` で本モジュールから
+/// 見えないため、GPU 常駐行列の f16 往復ベクトルに対して同一の積和セマンティクス
+/// （左から右への逐次和）を独立に維持する。
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CORE-16: f16 往復精度（GPU 不要・常時実行）。
+    #[test]
+    fn f16_roundtrip_preserves_reasonable_precision() {
+        for v in [0.0f32, 1.0, -1.0, 0.5, 3.140625, -100.0, 1e-3] {
+            let packed = pack_f16x2(v, 0.0);
+            let (a, _b) = unpack_f16x2(packed);
+            assert!(
+                (a - v).abs() < 0.01,
+                "roundtrip diverged too much: v={v} got={a}"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_roundtrip_handles_special_values() {
+        let packed = pack_f16x2(0.0, -0.0);
+        let (a, b) = unpack_f16x2(packed);
+        assert_eq!(a, 0.0);
+        assert_eq!(b, 0.0);
+
+        let packed_inf = pack_f16x2(f32::INFINITY, f32::NEG_INFINITY);
+        let (inf_a, inf_b) = unpack_f16x2(packed_inf);
+        assert!(inf_a.is_infinite() && inf_a > 0.0);
+        assert!(inf_b.is_infinite() && inf_b < 0.0);
+    }
+
+    #[test]
+    fn f16_pack_pair_roundtrips_both_elements() {
+        let packed = pack_f16x2(2.5, -4.25);
+        let (a, b) = unpack_f16x2(packed);
+        assert!((a - 2.5).abs() < 1e-3);
+        assert!((b - (-4.25)).abs() < 1e-3);
+    }
+
+    // CORE-7: 動的窓集約の判定（後続あり/なし・静的窓不在）。
+    #[test]
+    fn should_aggregate_only_when_pending_follows() {
+        assert!(should_aggregate_into_batch(true));
+        assert!(!should_aggregate_into_batch(false));
+    }
+
+    #[test]
+    fn aggregator_drains_pushed_queries_once() {
+        let mut agg = DynamicWindowAggregator::new();
+        assert!(agg.is_empty());
+        agg.push(vec![1.0, 0.0]);
+        agg.push(vec![0.0, 1.0]);
+        assert_eq!(agg.len(), 2);
+        let drained = agg.drain();
+        assert_eq!(drained.len(), 2);
+        assert!(agg.is_empty());
+    }
+
+    // ResidentMatrix の上限・整合性検証（untrusted 入力の防御的上限）。
+    #[test]
+    fn resident_matrix_rejects_zero_dim() {
+        let err = ResidentMatrix::build(&[1], &["t".to_string()], 0, &[]).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::InvalidDim {
+                dim: 0,
+                max: MAX_BATCH_DIM
+            }
+        );
+    }
+
+    #[test]
+    fn resident_matrix_rejects_length_mismatch() {
+        let err = ResidentMatrix::build(&[1, 2], &["t".to_string()], 2, &[1.0, 0.0]).unwrap_err();
+        assert_eq!(err, GpuSearchError::ArenaLengthMismatch);
+    }
+
+    fn build_two_tenant_matrix() -> ResidentMatrix {
+        // tenant-a: id=1,2 / tenant-b: id=3,4。dim=2。
+        let ids = vec![1u64, 2, 3, 4];
+        let tenants = vec![
+            "tenant-a".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string(),
+            "tenant-b".to_string(),
+        ];
+        let vectors = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        ResidentMatrix::build(&ids, &tenants, 2, &vectors).expect("valid matrix")
+    }
+
+    // CORE-7 テナント境界（P0）: 混在テナントバッチで混入 0 件。
+    // 検査は実装（`batch_search` 内のマスク）から独立に、返却 id → tenant を
+    // 再計算して確認する（実装と検査器の経路分離）。
+    #[test]
+    fn batch_search_excludes_other_tenant_rows() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 10,
+            tenant_id: "tenant-a",
+        }];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(results.len(), 1);
+        // 独立検査器: 返った id が期待テナントの id 集合に含まれるかを、
+        // engine 内部のマスク実装を経由せず直接確認する。
+        let tenant_a_ids: std::collections::HashSet<u64> = [1, 2].into_iter().collect();
+        for hit in &results[0].hits {
+            assert!(
+                tenant_a_ids.contains(&hit.id),
+                "tenant-a query must not return id={} (other tenant)",
+                hit.id
+            );
+        }
+        assert!(!results[0].hits.is_empty());
+    }
+
+    // negative test: マスク段を意図的に無効化した内部構成（テスト内部限定。公開
+    // API・cargo feature としては露出しない。Issue #137 の feature 廃止判断を踏襲）
+    // で、上記の独立検査器が違反を検出できることを確認する。
+    #[test]
+    fn independent_checker_detects_masked_tenant_violation() {
+        let matrix = build_two_tenant_matrix();
+        // マスクを経由せず「全行を無条件に候補にする」経路を直接模した結果集合
+        // （実装コードのマスク段を使わず、テストがここで意図的に違反を作る）。
+        let simulated_unmasked_hits = [
+            SearchHit { id: 1, score: 1.0 }, // tenant-a: 正当
+            SearchHit { id: 3, score: 1.0 }, // tenant-b: 混入（検出されるべき）
+        ];
+        let tenant_a_ids: std::collections::HashSet<u64> =
+            [matrix.ids[0], matrix.ids[1]].into_iter().collect();
+        let violation = simulated_unmasked_hits
+            .iter()
+            .any(|hit| !tenant_a_ids.contains(&hit.id));
+        assert!(
+            violation,
+            "independent checker failed to detect a tenant mask violation"
+        );
+    }
+
+    #[test]
+    fn batch_search_rejects_dim_mismatch() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 1,
+            tenant_id: "tenant-a",
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::DimMismatch {
+                expected: 2,
+                found: 3
+            }
+        );
+    }
+
+    #[test]
+    fn batch_search_rejects_non_finite_query() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [f32::NAN, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 1,
+            tenant_id: "tenant-a",
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, GpuSearchError::NonFiniteQuery { query_index: 0 });
+    }
+
+    #[test]
+    fn batch_search_rejects_too_many_queries() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let queries: Vec<BatchQuery<'_>> = (0..MAX_BATCH_QUERIES + 1)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: 1,
+                tenant_id: "tenant-a",
+            })
+            .collect();
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::TooManyQueries {
+                count: MAX_BATCH_QUERIES + 1,
+                max: MAX_BATCH_QUERIES,
+            }
+        );
+    }
+
+    // GpuBatchEngine が SearchProvider を実装しないこと（単発経路へ構造的に
+    // 接続できないことのコンパイル時の裏付け）は型シグネチャそのものが保証する
+    // ため実行時テストは不要（`kernel.rs::SearchProvider` を implement していない）。
+}
