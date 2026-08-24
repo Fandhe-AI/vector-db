@@ -184,20 +184,29 @@ const ASCII_IDS: [&str; 8] = ["API", "TODO", "v2", "memo", "draft", "id01", "ver
 const NUM_DOCS: usize = 5000;
 const NUM_QUERIES: usize = 100;
 
+/// [`zipf_index`] が使う累積重み（重み `1/(i+1)` の累積和）を 1 度だけ構築する。
+/// コーパス生成中（拒否ループ含む）で数万回呼ばれるため、呼び出しごとの
+/// 重みベクトル再構築を避ける。
+fn build_zipf_cumulative_weights(n: usize) -> Vec<f64> {
+    let mut acc = 0.0;
+    let mut cumulative = Vec::with_capacity(n);
+    for i in 0..n {
+        acc += 1.0 / (i as f64 + 1.0);
+        cumulative.push(acc);
+    }
+    cumulative
+}
+
 /// Zipf 近似分布（重み `1/(i+1)`）で `CONTENT_VOCAB` の添字を選ぶ。先頭語ほど高頻度、
 /// 末尾語ほど低頻度になり、QA セットの正解集合を小さく絞り込める語彙分布を作る。
-fn zipf_index(rng: &mut Xorshift64, n: usize) -> usize {
-    let weights: Vec<f64> = (0..n).map(|i| 1.0 / (i as f64 + 1.0)).collect();
-    let total: f64 = weights.iter().sum();
+/// `cumulative_weights` は [`build_zipf_cumulative_weights`] の事前計算結果。
+fn zipf_index(rng: &mut Xorshift64, cumulative_weights: &[f64]) -> usize {
+    let total = *cumulative_weights.last().unwrap_or(&0.0);
     let r = rng.next_f64() * total;
-    let mut acc = 0.0;
-    for (i, w) in weights.iter().enumerate() {
-        acc += w;
-        if r <= acc {
-            return i;
-        }
+    match cumulative_weights.iter().position(|&acc| r <= acc) {
+        Some(i) => i,
+        None => cumulative_weights.len().saturating_sub(1),
     }
-    n - 1
 }
 
 /// 合成コーパスの 1 文書。`keywords` は生成時に既知の「正解キーワード集合」
@@ -224,12 +233,13 @@ fn generate_corpus(seed: u64) -> (Vec<Doc>, Vec<QaCase>) {
     let mut rng = Xorshift64::new(seed);
     let mut docs = Vec::with_capacity(NUM_DOCS);
     let mut inverted: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
+    let zipf_weights = build_zipf_cumulative_weights(CONTENT_VOCAB.len());
 
     for doc_id in 0..NUM_DOCS as u64 {
         let num_keywords = 3 + rng.next_range(4); // 3..=6
         let mut kw_set: BTreeSet<usize> = BTreeSet::new();
         while kw_set.len() < num_keywords {
-            kw_set.insert(zipf_index(&mut rng, CONTENT_VOCAB.len()));
+            kw_set.insert(zipf_index(&mut rng, &zipf_weights));
         }
         let kw_vec: Vec<usize> = kw_set.iter().copied().collect();
 
@@ -408,7 +418,7 @@ fn tokenize_ascii_only(text: &str) -> Vec<String> {
 fn cjk_tokenizer_impact_on_ja_corpus() {
     let (docs, qa) = generate_corpus(0x5EED_C0FF_EE42_1337);
 
-    // 井然性の検証: コーパスが sparse.rs の各上限（MAX_CORPUS_DOCS・MAX_DOC_BYTES・
+    // 健全性の検証: コーパスが sparse.rs の各上限（MAX_CORPUS_DOCS・MAX_DOC_BYTES・
     // MAX_CORPUS_BYTES）に収まること。無制限なコーパス生成を許さない設計指針を
     // 測定ハーネス自身にも適用する。
     assert!(!docs.is_empty());
@@ -507,8 +517,12 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     assert_eq!(hits20[2], 0, "ASCII のみの Recall@20 hit 数が変化した");
     assert_eq!(hits100[2], 0, "ASCII のみの Recall@100 hit 数が変化した");
 
-    // 期待方向: ASCII のみ構成（CJK トークン全除去）は日本語主体コーパスで
-    // 大きく劣化するはずである（CJK トークンを使わない変種は内容語を拾えない）。
+    // 注記: 本 QA セットのクエリは CONTENT_VOCAB（純 CJK 語彙）のみから構成される
+    // ため、ASCII のみ構成では query_ascii が構造的に空集合となり、rank() は
+    // 恒等的に空を返す（Recall@20/100 = 0.0000 は劣化度の実測値ではなく、空
+    // クエリによる自明値）。この assert は「除去 ON が空クエリ構成を上回る」
+    // という構造的に真な回帰チェックであり、劣化度の実測検証ではない
+    // （詳細は docs/design/cjk-tokenizer-impact-ja-corpus.md「考察」参照）。
     assert!(
         hits100[0] > hits100[2],
         "除去 ON が ASCII のみ構成を上回ることを期待したが逆転した"
