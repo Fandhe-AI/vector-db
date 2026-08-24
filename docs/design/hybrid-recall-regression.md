@@ -50,6 +50,17 @@
   非公開閾値ゲート」、層 A は「PR ごとに走る public な固定値ゲート」という役割分担を
   設計判断として採用する
 
+  トリガを絞るだけでは不十分な点にも注意が必要である: `workflow_dispatch` は
+  本来任意の ref を選んで手動起動できるため、Makefile・テストコードを書き換えた
+  任意 ref を選んで実行すれば `pull_request` と同じ経路（書き換えたコードが
+  `HYBRID_RECALL_MIN_*` を受け取り標準出力へ書き出す）で spec 閾値を漏えいできる
+  （PR #147 codex-review 継続指摘）。そのため `recall-regression` job には
+  `if: github.ref == 'refs/heads/main'` を付け、main 以外の ref を選んで
+  `workflow_dispatch` を起動した場合は job ごとスキップする。`actions/checkout` も
+  dispatch 側の ref 選択に依存させず `ref: main` で明示的に固定し、if 条件と
+  checkout 対象の両方で「main の trusted なコードのみが層 B を実行できる」ことを
+  保証する（`schedule` は常に既定ブランチで走るため、この制約による影響はない）
+
 ### コーパス・QA セットの生成
 
 `crates/engine/tests/hybrid_recall.rs` は決定的シード付き擬似乱数（xorshift64*。

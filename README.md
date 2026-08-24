@@ -79,6 +79,8 @@ gh variable set HYBRID_RECALL_MIN_R100_LARGE
 
 **`pull_request` トリガを持たせない理由（spec 機密保持が優先）**: `pull_request` で起動する job は PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行するため、もし層 B を PR トリガにすると、PR がコードを書き換えて `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから spec の数値基準を取得できてしまいます（`.claude/rules/spec-confidentiality.md` の P0 違反）。そのため層 B は既定ブランチの trusted なコードのみが走る `schedule`／`workflow_dispatch` に限定し、**PR のマージ判定は層 A（spec 数値を含まない public な固定値回帰。`.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行）が担う**、という役割分担にしています（`docs/design/hybrid-recall-regression.md` 参照）。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
 
+**`workflow_dispatch` は main ブランチのコードのみで実行されます**: `workflow_dispatch` は本来任意の ref を選んで起動できるため、トリガを絞るだけでは「trusted なコードのみが層 B を実行する」前提を満たせません（Makefile・テストを書き換えた任意 ref を手動実行すれば同じ経路で spec 閾値を漏えいできてしまうため）。`recall-regression` job は `if: github.ref == 'refs/heads/main'` で main 以外の ref を選んだ場合は実行自体をスキップし、`actions/checkout` も dispatch 側の ref 選択に依存させず常に `ref: main` を取得します。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。

@@ -24,6 +24,15 @@ name: Recall
 # `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
 # 役割分担にする（README「Recall 回帰ハーネスの repo variables」・
 # `docs/design/hybrid-recall-regression.md` 参照）。
+#
+# `workflow_dispatch` は任意の ref を選択して起動できるため、トリガを絞るだけでは
+# 「main の trusted なコードのみが層 B を実行する」前提を満たせない
+# （Makefile・テストを書き換えた任意 ref を手動実行すれば同じ経路で spec 閾値を
+# public Actions ログへ漏えいできてしまう。PR #147 codex-review 継続指摘）。
+# そのため recall-regression job は `if: github.ref == 'refs/heads/main'` で
+# main ブランチでの実行にのみ限定し、`actions/checkout` の対象も dispatch 側の
+# ref 選択に依存させず `ref: main` で固定する。他 ref を選んで `workflow_dispatch`
+# を起動した場合は job がスキップされる。
 on:
   workflow_dispatch: {}
   schedule:
@@ -46,6 +55,10 @@ jobs:
   # 第三者 action（actions/checkout）は ci.yml・bench.yml と同一の SHA 固定で参照する
   # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
   recall-regression:
+    # `workflow_dispatch` で main 以外の ref が選ばれた場合は job ごとスキップする
+    # （冒頭コメント参照。spec 閾値を任意 ref の書き換えコードへ渡さないための
+    # fail-closed な制約。`schedule` は常に既定ブランチで走るため影響しない）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -53,6 +66,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （`if: github.ref == 'refs/heads/main'` と合わせた二重の固定。
+          # 万一 if 条件をすり抜けても untrusted な ref のコードを実行しない）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run recall-regression
