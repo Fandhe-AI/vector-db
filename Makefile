@@ -208,6 +208,18 @@ else
 endif
 
 # --------------------------------------------------
+# バッチ高速化の受け入れ基準検証（TASK-130。crates/engine/benches/batch_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-batch
+bench-batch: ## TASK-130 のバッチ高速化受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から手動実行）
+ifdef HAS_CARGO
+	cargo bench --bench batch_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-batch をスキップ"
+endif
+
+# --------------------------------------------------
 # ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
 # --------------------------------------------------
 
