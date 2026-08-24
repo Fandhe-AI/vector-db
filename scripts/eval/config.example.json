@@ -1,0 +1,14 @@
+{
+    "_comment": "暫定値（オーナー承認前）。正式測定の実行前に評価設計（採点基準・サンプル数）の承認を得ること。詳細は README.md を参照。",
+    "llm_endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+    "model": "dummy-model",
+    "api_key_env": "EVAL_LLM_API_KEY",
+    "data_path": "scripts/eval/fixtures/sample.jsonl",
+    "scoring_prompt_path": "scripts/eval/fixtures/scoring_prompt.txt",
+    "sample_size": 3,
+    "max_sample_size": 50,
+    "timeout_seconds": 30,
+    "max_retries": 2,
+    "max_response_bytes": 65536,
+    "output_dir": "_/reports"
+}
