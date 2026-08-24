@@ -606,6 +606,69 @@ class RunEvaluationMissingApiKeyTest(unittest.TestCase):
                 aa.run_evaluation(config, dry_run=False)
 
 
+class WriteReportNoOverwriteTest(unittest.TestCase):
+    """P1: 同一 timestamp のレポートファイル名が衝突しても既存レポートを無警告で上書きしないことを検証する。"""
+
+    class _FrozenDatetime:
+        """datetime.now() を固定値にする差し替え用スタブ（同一秒・同一マイクロ秒の連続実行を再現する）。"""
+
+        @staticmethod
+        def now(tz=None):
+            from datetime import datetime as real_datetime
+
+            return real_datetime(2026, 1, 1, 12, 0, 0, 123456, tzinfo=tz)
+
+    def _frozen_config(self, tmp_dir: Path) -> "aa.EvalConfig":
+        config_path = tmp_dir / "config.json"
+        config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+        return aa.load_config(config_path)
+
+    def test_same_timestamp_does_not_overwrite_existing_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config = self._frozen_config(tmp_dir)
+            report_a = aa.EvalReport(results=[aa.SampleResult("a", "q", "g", aa.LABEL_CORRECT, "first run")])
+            report_b = aa.EvalReport(results=[aa.SampleResult("b", "q", "g", aa.LABEL_INCORRECT, "second run")])
+
+            original_datetime = aa.datetime
+            aa.datetime = self._FrozenDatetime
+            try:
+                first_path = aa.write_report(report_a, config)
+                second_path = aa.write_report(report_b, config)
+            finally:
+                aa.datetime = original_datetime
+
+            # 同一 timestamp でもパスが再採番され、先行レポートの内容が失われない。
+            self.assertNotEqual(first_path, second_path)
+            self.assertTrue(first_path.exists())
+            self.assertTrue(second_path.exists())
+            self.assertIn("first run", first_path.read_text(encoding="utf-8"))
+            self.assertIn("second run", second_path.read_text(encoding="utf-8"))
+
+    def test_exhausted_rename_attempts_raise_oserror_without_overwrite(self):
+        # timestamp・ランダムサフィックスの両方を固定して全候補名を衝突させると、
+        # 再採番上限の到達後に既存ファイルを壊さず OSError で明示エラーになる。
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config = self._frozen_config(tmp_dir)
+            report = aa.EvalReport(results=[aa.SampleResult("a", "q", "g", aa.LABEL_CORRECT, "kept")])
+
+            original_datetime = aa.datetime
+            original_token_hex = aa.secrets.token_hex
+            aa.datetime = self._FrozenDatetime
+            aa.secrets.token_hex = lambda _n: "deadbeef"
+            try:
+                first_path = aa.write_report(report, config)  # 素の timestamp 名を占有
+                aa.write_report(report, config)  # サフィックス "deadbeef" 名を占有
+                with self.assertRaises(OSError):
+                    aa.write_report(report, config)  # 全候補名が衝突 → 明示エラー
+            finally:
+                aa.datetime = original_datetime
+                aa.secrets.token_hex = original_token_hex
+
+            self.assertIn("kept", first_path.read_text(encoding="utf-8"))
+
+
 class MainWriteReportFailureTest(unittest.TestCase):
     """write_report の OSError が main() で捕捉され、fail-closed な終了コードで報告されることを検証する。"""
 

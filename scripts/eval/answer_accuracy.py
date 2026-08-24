@@ -736,13 +736,41 @@ def render_report_markdown(report: EvalReport, config: EvalConfig) -> str:
     return "\n".join(lines)
 
 
+# レポートファイル名衝突時の再採番上限。上限到達時は上書きせず OSError で
+# 明示エラー終了させる（main() の write error 経路・終了コード 5 に乗る）。
+MAX_REPORT_WRITE_ATTEMPTS = 5
+
+
 def write_report(report: EvalReport, config: EvalConfig) -> Path:
-    """レポートを output_dir（既定 `_/reports/`。git 管理外）へ書き出す。"""
+    """レポートを output_dir（既定 `_/reports/`。git 管理外）へ排他的作成で書き出す。
+
+    無警告上書きの防止: 旧実装は秒精度 timestamp のファイル名を write_text() で
+    書いており、同一秒に 2 回実行すると先行実行の有料評価結果が無警告で失われた。
+    ファイル名をマイクロ秒精度にしたうえで open(mode="x")（排他的作成）で書き出し、
+    それでも衝突した場合はランダムサフィックスで再採番する（上限
+    MAX_REPORT_WRITE_ATTEMPTS 回。使い尽くしたら既存ファイルを壊さず OSError）。
+    既存ファイルを切り詰める経路をコード上に残さない。
+    """
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = config.output_dir / f"answer_accuracy_{timestamp}.md"
-    out_path.write_text(render_report_markdown(report, config), encoding="utf-8")
-    return out_path
+    content = render_report_markdown(report, config)
+    last_path: Path | None = None
+    for attempt in range(MAX_REPORT_WRITE_ATTEMPTS):
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        unique_suffix = "" if attempt == 0 else f"_{secrets.token_hex(4)}"
+        out_path = config.output_dir / f"answer_accuracy_{timestamp}{unique_suffix}.md"
+        try:
+            # mode="x": 既存ファイルがあると FileExistsError になり、決して切り詰めない。
+            with out_path.open("x", encoding="utf-8") as f:
+                f.write(content)
+        except FileExistsError:
+            last_path = out_path
+            continue
+        return out_path
+    raise OSError(
+        f"failed to create a unique report file in {config.output_dir} after "
+        f"{MAX_REPORT_WRITE_ATTEMPTS} attempts (last tried: {last_path}); "
+        "existing reports were left untouched"
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
