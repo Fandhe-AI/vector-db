@@ -156,17 +156,21 @@ impl<'s> PrefilterIndex<'s> {
     ///
     /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
-    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に現在の
-    /// ストレージ世代（[`Storage::current_generation`]）を [`Self::build`] 時の値と比較し、
-    /// 不一致なら provider を呼ばずに [`RlsError::IndexStale`] で拒否する（呼び出し元は
-    /// [`Self::build`] を呼び直すこと）。世代はストレージ全体の書き込みコミットのたびに
-    /// 単調増加する（`crate::storage::bump_generation_and_commit`）ため、一致は
-    /// 「構築時点から行集合・内容とも一切変更されていない」ことを意味する（行の
-    /// tenant/visibility 変更・embedding 更新・新規挿入のいずれも検出する。旧版の
-    /// ヒット/全行ヘッダ照合はこれに包含されるため撤廃した）。一致後に provider を 1 回
-    /// 呼び、戻り値を `provider_result_is_valid`（`core.rs`）で検証する（違反は
-    /// [`RlsError::ProviderResultRejected`]）。返却結果はこの世代確認時点のストレージ
-    /// スナップショットに対して一貫する。TASK-133・RLS-1〜4 参照。
+    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に
+    /// [`crate::storage::Storage::begin_generation_snapshot`] で読み取りスナップショットを
+    /// 開始し、その場で読んだ世代を [`Self::build`] 時の値と比較する。不一致なら provider を
+    /// 呼ばずに [`RlsError::IndexStale`] で拒否する（呼び出し元は [`Self::build`] を
+    /// 呼び直すこと）。世代はストレージ全体の書き込みコミットのたびに単調増加する
+    /// （`crate::storage::bump_generation_and_commit`）ため、一致は「構築時点から行集合・
+    /// 内容とも一切変更されていない」ことを意味する（行の tenant/visibility 変更・
+    /// embedding 更新・新規挿入のいずれも検出する）。一致後に provider を 1 回呼び、戻り値を
+    /// `provider_result_is_valid`（`core.rs`）で検証する（違反は
+    /// [`RlsError::ProviderResultRejected`]）。開始したスナップショットは本メソッドが
+    /// `Vec<SearchHit>` を返し終えるまでローカル変数として生存させ、その間 redb の
+    /// MVCC 契約により pin され続ける（`GenerationSnapshot` のドキュメント参照）ため、
+    /// 世代確認後・provider 実行中・結果確定までの間に別の書き込みがコミットされても、
+    /// 本メソッドの返却結果は世代確認時点のスナップショットに対して一貫する。
+    /// TASK-133・RLS-1〜4 参照。
     pub fn search(
         &self,
         ctx: &PolicyContext,
@@ -191,11 +195,14 @@ impl<'s> PrefilterIndex<'s> {
 
         // 失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
         // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
-        let current_generation = self
+        // `generation_snapshot` は関数末尾（`Ok(hits)` を返すまで）生存させる:
+        // redb の read txn は書き込みをブロックしない（MVCC）ため、保持を
+        // provider 呼び出しをまたいで延ばしても書き込み側の DoS 要因にはならない。
+        let generation_snapshot = self
             .storage
-            .current_generation()
+            .begin_generation_snapshot()
             .map_err(|_| RlsError::IndexStale)?;
-        if current_generation != self.built_generation {
+        if generation_snapshot.generation() != self.built_generation {
             return Err(RlsError::IndexStale);
         }
 
