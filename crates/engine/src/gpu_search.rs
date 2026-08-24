@@ -3,6 +3,12 @@
 //! は実装しない。単発経路（`core.rs::EngineCore::search`）は本モジュールへ構造的に
 //! 接続できず、`CORE-7` が定める「単発クエリは CPU-SIMD 固定」を型レベルで担保する。
 //!
+//! `Gpu` を冠する型名・モジュール名だが、現段階は CPU 上で GPU 常駐相当の
+//! アルゴリズム的挙動を再現する **CPU リファレンス実装**である。実際の GPU
+//! 実行（`wgpu`）は未導入で、下記「依存に関する制約」節が理由と導入条件を示す
+//! （TASK-128 参照。命名は将来 `wgpu` 実行へ差し替える際の API 破壊を避けるため
+//! 維持する）。
+//!
 //! # 依存に関する制約（重要・.claude/rules/dependency-policy.md）
 //!
 //! 元の設計は GPU 常駐ベース行列（`wgpu`/WGSL、CORE-16 の f16 2 要素/u32 パックを
@@ -42,6 +48,13 @@ pub const MAX_BATCH_DIM: usize = 8_192;
 /// バイト量の両方で上限を課す）。
 pub const MAX_BATCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
+/// `BatchQuery::k` の許容上限（防御的上限）。`core.rs::MAX_SEARCH_K` と同じ値を
+/// 独立に定義する（`core.rs` の定数は非公開で本モジュールから参照できないため）。
+/// `kernel.rs::TopKSelector` 自体は `k` を検証しないため、複数クエリを同時に
+/// 処理するバッチ経路では本モジュールが未検証の巨大な `k` をそのまま
+/// 使わないよう明示的に拒否する。
+pub const MAX_BATCH_K: usize = 10_000;
+
 /// バッチ検索エンジンのエラー（fail-closed）。メッセージは英語（wire プロトコル
 /// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
 /// 存在情報を含めない。
@@ -62,6 +75,13 @@ pub enum GpuSearchError {
     NonFiniteQuery { query_index: usize },
     /// 常駐行列構築時、`ids`/`vectors`/可視性マスクの長さ不整合。
     ArenaLengthMismatch,
+    /// 常駐行列構築時、`ids` に重複があった。id → tenant を一意に定められないと
+    /// 選出後の独立再検証（id ベース）が成立しないため fail-closed で拒否する
+    /// （codex レビュー指摘対応。重複行そのものの id は他テナントの存在情報を
+    /// 漏らしうるためエラーには含めない）。
+    DuplicateRowId,
+    /// クエリの `k` が [`MAX_BATCH_K`] を超過した、または 0。
+    InvalidK { k: usize, max: usize },
     /// バッチ内の結果が、選出後に独立再検証したクエリ別可視集合と食い違った
     /// （テナント混入の疑い。`core.rs::CoreError::ProviderResultRejected` と同じ
     /// fail-closed 思想。結果を一切返さない）。
@@ -94,6 +114,12 @@ impl fmt::Display for GpuSearchError {
             ),
             GpuSearchError::ArenaLengthMismatch => {
                 write!(f, "gpu_search: arena ids/vectors/mask length mismatch")
+            }
+            GpuSearchError::DuplicateRowId => {
+                write!(f, "gpu_search: resident matrix contains duplicate row ids")
+            }
+            GpuSearchError::InvalidK { k, max } => {
+                write!(f, "gpu_search: invalid k: {k} (must be 1..={max})")
             }
             GpuSearchError::TenantMaskViolation => {
                 write!(f, "gpu_search: result violated per-query tenant mask")
@@ -168,17 +194,23 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
         if mantissa == 0 {
             (0u32, 0u32)
         } else {
-            // サブノーマル f16 を正規化 f32 へ変換する。
+            // サブノーマル f16（値 = mantissa * 2^-24）を正規化 f32 へ変換する。
+            // 仮数の最上位ビット（0x0400）が立つまで左シフトして正規化し、
+            // シフト回数 `k` を使って指数を求める。初期値 `e = -14` は
+            // 「f16 サブノーマルの指数は -14 固定（f16 バイアス 15 で
+            // biased exponent = 1 相当）」を表し、1 シフトごとに 1 減らす
+            // ことで非正規化した分の指数を差し引く。ループ後は
+            // `e = -14 - k` であり、f32 バイアス 127 を足した
+            // `exp32 = 113 - k` が正しい biased exponent になる
+            // （旧実装は `e` の初期値が `-1` になっており `exp32 = 126 - k` を
+            // 返していたため、値が 2^13 倍ずれていた）。
             let mut m = mantissa;
-            let mut e = -1i32;
+            let mut e = -14i32;
             while m & 0x0400 == 0 {
                 m <<= 1;
                 e -= 1;
             }
             m &= 0x03FF;
-            // f16 バイアス 15 の指数 `e` を f32 バイアス 127 へ変換する（+15 で
-            // 一旦 f16 バイアスへ戻してから -15+127 するのではなく、素直に +127 で
-            // 直接変換する）。
             let exp32 = (e + 127) as u32;
             (exp32, m << 13)
         }
@@ -219,6 +251,8 @@ pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
 /// 一括インデクシングで構築する GPU 常駐相当のベース行列。可視性フィルタ済みの
 /// 全行を f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
 /// アリーナを別途保持し続け、本構造体はバッチ検索専用の副次表現として扱う。
+/// 現段階は CPU 上でこの表現を保持・走査する CPU リファレンス実装であり、
+/// 実際の GPU 常駐（`wgpu` バッファ）ではない（モジュール冒頭コメント参照）。
 #[derive(Debug)]
 pub struct ResidentMatrix {
     ids: Vec<u64>,
@@ -317,6 +351,19 @@ impl ResidentMatrix {
             return Err(GpuSearchError::ArenaLengthMismatch);
         }
 
+        // id の一意性を検証する（容量・長さチェックより後に置き、cheap な拒否経路
+        // （`CapacityExceeded`・`ArenaLengthMismatch`）を先に済ませてから、
+        // 検証コスト・確保量が `ids.len()` に比例する本チェックへ進む）。重複を
+        // 許すと id → tenant が一意に定まらず、`GpuBatchEngine::batch_search` の
+        // 選出後独立再検証（id ベース）が異なるテナントの行を取り違えうる
+        // （codex レビュー指摘対応）。
+        let mut seen_ids = std::collections::HashSet::with_capacity(ids.len());
+        for &id in ids {
+            if !seen_ids.insert(id) {
+                return Err(GpuSearchError::DuplicateRowId);
+            }
+        }
+
         let mut packed = Vec::with_capacity(packed_len);
         for row in vectors.chunks(dim) {
             for pair in row.chunks(2) {
@@ -342,15 +389,17 @@ impl ResidentMatrix {
         self.dim
     }
 
-    /// 行 `idx` を f16 往復で復元した f32 ベクトルを返す（積和計算専用。格納
-    /// 表現自体は f32 のまま別途保持する呼び出し元の責務であり、本メソッドは
-    /// バッチスコア計算のためだけに使う）。
-    fn row_f32(&self, idx: usize) -> Option<Vec<f32>> {
+    /// 行 `idx` を f16 往復で復元し、呼び出し元が用意したバッファへ書き込む
+    /// （積和計算専用。格納表現自体は f32 のまま別途保持する呼び出し元の責務で
+    /// あり、本メソッドはバッチスコア計算のためだけに使う）。バッファを
+    /// 呼び出し元が使い回すことで、`GpuBatchEngine::batch_search` がクエリ数
+    /// 分だけ同一行を毎回ヒープ確保し直す（codex レビュー指摘対応）のを避ける。
+    fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
         let packed_per_row = self.dim.div_ceil(2);
         let start = idx.checked_mul(packed_per_row)?;
         let end = start.checked_add(packed_per_row)?;
         let row = self.packed.get(start..end)?;
-        let mut out = Vec::with_capacity(self.dim);
+        out.clear();
         for &p in row {
             let (a, b) = unpack_f16x2(p);
             out.push(a);
@@ -358,7 +407,7 @@ impl ResidentMatrix {
                 out.push(b);
             }
         }
-        Some(out)
+        Some(())
     }
 }
 
@@ -434,7 +483,9 @@ pub struct BatchHit {
 
 /// バッチクエリ・一括インデクシング専用のエンジン（CORE-6）。単発クエリ経路
 /// (`kernel.rs::SearchProvider`) は実装せず、`core.rs::EngineCore` から到達
-/// できない（型レベルでの分離。CORE-7）。
+/// できない（型レベルでの分離。CORE-7）。現段階はスコア計算を CPU で行う
+/// リファレンス実装であり、GPU ディスパッチは行わない（モジュール冒頭コメント
+/// 参照。[`GpuBatchEngine::new`] のドキュメンテーションコメントに導入条件を示す）。
 pub struct GpuBatchEngine {
     matrix: ResidentMatrix,
 }
@@ -448,12 +499,19 @@ impl GpuBatchEngine {
         Self { matrix }
     }
 
-    /// バッチ検索を実行する（CORE-6・CORE-7）。クエリごとに次元・非有限値を
+    /// バッチ検索を実行する（CORE-6・CORE-7）。クエリごとに次元・非有限値・`k` を
     /// 検証したうえで、常駐行列の中からクエリと同一テナントの行だけを候補として
     /// 選出する（Top-k 選出段でのクエリ別可視行マスク）。選出後、結果 id を
     /// 独立に再計算したテナント集合と突き合わせ、逸脱があれば結果を一切返さず
     /// [`GpuSearchError::TenantMaskViolation`] を返す（`core.rs::EngineCore` と
     /// 同じ二重防御。fail-closed）。
+    ///
+    /// 行列走査はクエリ外側ではなく行外側でループする（codex レビュー指摘対応:
+    /// 旧実装はクエリループの内側で行を毎回 f16→f32 デコードしており、
+    /// クエリ数×行数×dim のデコード・ヒープ確保が発生していた）。行 1 件を
+    /// 1 回だけデコードし、そのバッチに含まれるテナントと一致する全クエリへ
+    /// 使い回す。選出結果の各クエリ内順序（スコア降順・同点 id 昇順）は
+    /// `TopKSelector` が保証するため、走査順序の変更による結果の変化はない。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
@@ -465,7 +523,8 @@ impl GpuBatchEngine {
             });
         }
 
-        let mut out = Vec::with_capacity(queries.len());
+        // 事前検証パス: 次元・非有限値・k をクエリごとに検証し、選出器を用意する。
+        let mut selectors: Vec<TopKSelector> = Vec::with_capacity(queries.len());
         for (query_index, q) in queries.iter().enumerate() {
             if q.vector.len() != self.matrix.dim {
                 return Err(GpuSearchError::DimMismatch {
@@ -476,41 +535,77 @@ impl GpuBatchEngine {
             if q.vector.iter().any(|v| !v.is_finite()) {
                 return Err(GpuSearchError::NonFiniteQuery { query_index });
             }
+            if q.k == 0 || q.k > MAX_BATCH_K {
+                return Err(GpuSearchError::InvalidK {
+                    k: q.k,
+                    max: MAX_BATCH_K,
+                });
+            }
+            selectors.push(TopKSelector::new(q.k));
+        }
 
-            // (1) 選出前のマスク: 自テナントの行だけを候補にする。
-            let mut selector = TopKSelector::new(q.k);
-            for row_idx in 0..self.matrix.row_count() {
-                let Some(row_tenant) = self.matrix.tenant_ids.get(row_idx) else {
-                    continue;
-                };
-                if row_tenant != q.tenant_id {
+        // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
+        // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
+        // で上限検証済みのため、集合サイズもそれに従う）。
+        let batch_tenants: std::collections::HashSet<&str> =
+            queries.iter().map(|q| q.tenant_id).collect();
+
+        // id → tenant の逆引き表（選出後の独立再検証用）。`ResidentMatrix::build`
+        // が id の重複を拒否しているため、id は tenant を一意に決める
+        // （[`GpuSearchError::DuplicateRowId`] 参照）。選出段のマスク実装（行 index
+        // からの文字列比較）とは別経路でこの表を組むことで、二重防御を維持する。
+        // このバッチのテナントに属さない行は登録しない（マップを
+        // `MAX_BATCH_ROWS` 全件分確保しないための最適化であると同時に、
+        // バッチ外テナントの id が万一 hit に混入した場合を確実に
+        // マップ不在 → `TenantMaskViolation` にする fail-closed 側の効果も持つ）。
+        let mut id_to_tenant: std::collections::HashMap<u64, &str> =
+            std::collections::HashMap::new();
+        for (id, tenant) in self.matrix.ids.iter().zip(self.matrix.tenant_ids.iter()) {
+            if batch_tenants.contains(tenant.as_str()) {
+                id_to_tenant.insert(*id, tenant.as_str());
+            }
+        }
+
+        // 行外側ループ: 行 1 件につき 1 回だけデコードし、一致する全クエリへ使う。
+        let mut row_buf: Vec<f32> = Vec::with_capacity(self.matrix.dim);
+        for row_idx in 0..self.matrix.row_count() {
+            let Some(row_tenant) = self.matrix.tenant_ids.get(row_idx).map(String::as_str) else {
+                continue;
+            };
+            // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く。
+            if !batch_tenants.contains(row_tenant) {
+                continue;
+            }
+            let Some(id) = self.matrix.ids.get(row_idx).copied() else {
+                continue;
+            };
+            if self.matrix.row_f32_into(row_idx, &mut row_buf).is_none() {
+                continue;
+            }
+
+            for (q, selector) in queries.iter().zip(selectors.iter_mut()) {
+                // (1) 選出前のマスク: 自テナントの行だけを候補にする。
+                if q.tenant_id != row_tenant {
                     continue;
                 }
-                let Some(id) = self.matrix.ids.get(row_idx).copied() else {
-                    continue;
-                };
-                let Some(row_vec) = self.matrix.row_f32(row_idx) else {
-                    continue;
-                };
-                let score = dot_f32(&row_vec, q.vector);
+                let score = dot_f32(&row_buf, q.vector);
                 if !score.is_finite() {
                     continue;
                 }
                 selector.push(SearchHit { id, score });
             }
+        }
+
+        let mut out = Vec::with_capacity(queries.len());
+        for (q, selector) in queries.iter().zip(selectors) {
             let hits = selector.into_sorted_vec();
 
             // (2) 選出後の独立再検証: 返す id が全て自テナント行由来であることを、
-            // マスク実装から独立に id → tenant を引き直して確認する。
+            // マスク実装（行 index からの文字列比較）から独立に id → tenant の
+            // 逆引き表で確認する。
             for hit in &hits {
-                let owner_tenant = self
-                    .matrix
-                    .ids
-                    .iter()
-                    .position(|&id| id == hit.id)
-                    .and_then(|pos| self.matrix.tenant_ids.get(pos));
-                match owner_tenant {
-                    Some(t) if t == q.tenant_id => {}
+                match id_to_tenant.get(&hit.id) {
+                    Some(&t) if t == q.tenant_id => {}
                     _ => return Err(GpuSearchError::TenantMaskViolation),
                 }
             }
@@ -556,6 +651,39 @@ mod tests {
         let (inf_a, inf_b) = unpack_f16x2(packed_inf);
         assert!(inf_a.is_infinite() && inf_a > 0.0);
         assert!(inf_b.is_infinite() && inf_b < 0.0);
+    }
+
+    // CORE-16 codex レビュー指摘対応: サブノーマル f16 の復元値を厳密一致で検証する
+    // （`f16_roundtrip_preserves_reasonable_precision` の絶対誤差 `< 0.01` 判定では
+    // サブノーマル域の値が 2^13 倍ずれても誤差が閾値未満に収まり検出できない。
+    // また `f32_to_f16_bits` はサブノーマルを生成しないため往復テストでは
+    // `f16_bits_to_f32` のサブノーマル経路自体を通過できない。ここではビット列を
+    // 直接与えて `unpack_f16x2` の公開契約どおり `unpack2x16float` と同じ厳密値に
+    // 一致することを確認する）。
+    #[test]
+    fn f16_bits_to_f32_matches_exact_subnormal_values() {
+        // bits=0x0001（mantissa=1） は最小の正のサブノーマル: 1 * 2^-24。
+        let (lo, hi) = unpack_f16x2(0x0001);
+        assert_eq!(lo, 1.0f32 / 16_777_216.0);
+        assert_eq!(hi, 0.0);
+
+        // hi レーン側（上位 16 ビット）も同じ経路を通ることを確認する。
+        let (lo2, hi2) = unpack_f16x2(0x0001_0000);
+        assert_eq!(lo2, 0.0);
+        assert_eq!(hi2, 1.0f32 / 16_777_216.0);
+
+        // bits=0x0200（mantissa=0x200=512） は 512 * 2^-24 = 2^-15。
+        let (v, _) = unpack_f16x2(0x0200);
+        assert_eq!(v, 512.0f32 / 16_777_216.0);
+
+        // bits=0x03FF（mantissa=0x3FF=1023、最大のサブノーマル） は 1023 * 2^-24。
+        let (v, _) = unpack_f16x2(0x03FF);
+        assert_eq!(v, 1023.0f32 / 16_777_216.0);
+
+        // 符号ビットもサブノーマル経路と独立に正しく伝播することを確認する
+        // （bits=0x8001 は 0x0001 の符号反転）。
+        let (v, _) = unpack_f16x2(0x8001);
+        assert_eq!(v, -(1.0f32 / 16_777_216.0));
     }
 
     #[test]
@@ -626,6 +754,18 @@ mod tests {
         assert_eq!(err, GpuSearchError::ArenaLengthMismatch);
     }
 
+    // codex レビュー指摘対応: id 重複は fail-closed で拒否する（重複を許すと
+    // id → tenant が一意に定まらず、`batch_search` の選出後独立再検証（id ベース）
+    // が別テナントの行を取り違えうるため）。
+    #[test]
+    fn resident_matrix_rejects_duplicate_ids() {
+        let ids = [1u64, 1];
+        let tenants = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        let err = ResidentMatrix::build(&ids, &tenants, 2, &vectors).unwrap_err();
+        assert_eq!(err, GpuSearchError::DuplicateRowId);
+    }
+
     fn build_two_tenant_matrix() -> ResidentMatrix {
         // tenant-a: id=1,2 / tenant-b: id=3,4。dim=2。
         let ids = vec![1u64, 2, 3, 4];
@@ -665,6 +805,71 @@ mod tests {
             );
         }
         assert!(!results[0].hits.is_empty());
+    }
+
+    // codex レビュー指摘対応（行外側ループへの構造変更）: 複数クエリが異なる
+    // テナントを持つバッチで、選出器とクエリの対応がずれていないことを検証する
+    // （行外側ループ・選出器の事前生成・共有 `row_buf` の組み合わせで、選出器の
+    // 取り違えが起きうる構造のため）。
+    #[test]
+    fn batch_search_keeps_per_query_results_correct_across_different_tenants() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_a = [1.0f32, 0.0];
+        let query_b = [0.0f32, 1.0];
+        let queries = vec![
+            BatchQuery {
+                vector: &query_a,
+                k: 10,
+                tenant_id: "tenant-a",
+            },
+            BatchQuery {
+                vector: &query_b,
+                k: 10,
+                tenant_id: "tenant-b",
+            },
+        ];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].hits.first().map(|h| h.id), Some(1));
+        assert_eq!(results[1].hits.first().map(|h| h.id), Some(4));
+        let tenant_a_ids: std::collections::HashSet<u64> = [1, 2].into_iter().collect();
+        let tenant_b_ids: std::collections::HashSet<u64> = [3, 4].into_iter().collect();
+        for hit in &results[0].hits {
+            assert!(tenant_a_ids.contains(&hit.id));
+        }
+        for hit in &results[1].hits {
+            assert!(tenant_b_ids.contains(&hit.id));
+        }
+    }
+
+    // codex レビュー指摘対応: 同一テナント・異なるベクトルの複数クエリが、
+    // 共有される行デコード（`row_buf`）を経由してもクエリごとに正しいスコアで
+    // 選出されることを検証する（`k` もクエリごとに異なる値を与え、事前生成した
+    // 選出器がクエリと 1:1 で対応することも確認する）。
+    #[test]
+    fn batch_search_scores_each_query_independently_against_shared_decoded_row() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_a = [1.0f32, 0.0];
+        let query_b = [0.0f32, 1.0];
+        let queries = vec![
+            BatchQuery {
+                vector: &query_a,
+                k: 1,
+                tenant_id: "tenant-a",
+            },
+            BatchQuery {
+                vector: &query_b,
+                k: 10,
+                tenant_id: "tenant-a",
+            },
+        ];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].hits.len(), 1, "k=1 must be honored");
+        assert_eq!(results[0].hits.first().map(|h| h.id), Some(1));
+        assert_eq!(results[1].hits.first().map(|h| h.id), Some(2));
     }
 
     // negative test: マスク段を意図的に無効化した内部構成（テスト内部限定。公開
@@ -722,6 +927,44 @@ mod tests {
         }];
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(err, GpuSearchError::NonFiniteQuery { query_index: 0 });
+    }
+
+    // codex レビュー指摘対応: 行外側ループへの構造変更後もクエリ間で選出器が
+    // 独立に保たれることを踏まえ、`k` の防御的上限を検証する（`kernel.rs::
+    // TopKSelector` 自体は `k` を検証しないため、本モジュールが未検証の巨大な
+    // `k` をそのまま複数選出器へ使わないことを確認する）。
+    #[test]
+    fn batch_search_rejects_invalid_k() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 0,
+            tenant_id: "tenant-a",
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::InvalidK {
+                k: 0,
+                max: MAX_BATCH_K
+            }
+        );
+
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: MAX_BATCH_K + 1,
+            tenant_id: "tenant-a",
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::InvalidK {
+                k: MAX_BATCH_K + 1,
+                max: MAX_BATCH_K
+            }
+        );
     }
 
     #[test]
