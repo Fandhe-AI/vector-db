@@ -20,7 +20,10 @@
 //! provider 層の製品コア。対象ビヘイビア: CORE-1, CORE-2, CORE-13）・TASK-103
 //! （密検索 provider（`kernel.rs`/`parallel_search.rs`）と疎検索（`sparse.rs`）を
 //! RRF で融合するハイブリッド検索。対象ビヘイビア: SEARCH-1, SEARCH-3。
-//! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-107
+//! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-133（`rls.rs`。
+//! `PolicyContext`（TASK-124）と接続する事前フィルタ方式のテナント境界コア実装。対象
+//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` へのキャッシュ統合は
+//! 後続タスクの管轄）・TASK-107
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
 //! 方式差し替えと、依存追加なしの参照実装 2 種。対象ビヘイビア: SEARCH-6, SEARCH-7,
 //! SEARCH-8。方式（クロスエンコーダ等）の最終選定・効果測定回帰は後続タスクの管轄）・
@@ -45,6 +48,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod rerank;
+pub mod rls;
 pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
