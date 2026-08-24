@@ -12,15 +12,20 @@ name: Recall
 # 本ハーネスは決定的合成コーパス（外部接続不要）のため、`bench.yml` と異なり schedule
 # トリガも設定する（週次。CI 混雑回避のため PR/push トリガとは独立した深夜 UTC 帯）。
 #
-# `pull_request` トリガも設定し、層 B を PR のマージ判定に組み込めるようにする（PR #147
-# codex-review 指摘対応。`bench.yml` の `BENCH_CORE5` opt-in パターンを踏襲）。
-# `HYBRID_RECALL_MIN_*`（Actions variables）が未設定の場合、
-# `crates/engine/tests/hybrid_recall.rs` 側が「ゲート未設定＝明示的に対象外」を出力して
-# 成功終了する（fail-closed にはしない）ため、本 job を required check に指定しても
-# variables 設定前の PR を塞がない。設定済みの場合のみ fail-closed で閾値判定する。
+# `pull_request` トリガは意図的に設定しない（PR #147 codex-review P0 指摘で追加後に
+# 巻き戻した。`pull_request` で起動する job は PR 側の untrusted なコード
+# （Makefile・テストコード含む）を checkout して実行するため、PR がコードを書き換えて
+# `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public
+# Actions ログから spec の数値基準を取得できてしまう
+# ——`.claude/rules/spec-confidentiality.md` の P0 違反。層 B（spec 閾値ゲート）は
+# 既定ブランチの trusted なコードのみが走る `schedule`（週次）＋ `workflow_dispatch`
+# （手動）に限定する。PR のマージ判定は層 A（`crates/engine/tests/hybrid_recall.rs`
+# の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
+# `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
+# 役割分担にする（README「Recall 回帰ハーネスの repo variables」・
+# `docs/design/hybrid-recall-regression.md` 参照）。
 on:
   workflow_dispatch: {}
-  pull_request: {}
   schedule:
     - cron: "0 4 * * 1" # 毎週月曜 04:00 UTC（bench.yml 想定の 03:00 UTC 帯と重ならないようずらす）
 
@@ -28,9 +33,10 @@ permissions:
   contents: read
 
 concurrency:
-  # PR ごとに一意な番号を group に含める（ci.yml と同一方針。PR #4 codex P2 指摘。
-  # workflow_dispatch・schedule は PR 番号を持たないため ref にフォールバックする）。
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に含めて
+  # 同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針。`pull_request`
+  # トリガは持たないため PR 番号ベースの group 分けは不要）。
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

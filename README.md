@@ -67,7 +67,7 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
-`.github/workflows/recall.yml`（`workflow_dispatch` ＋ `pull_request` ＋ 週次 `schedule`）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/recall.yml`（`workflow_dispatch` ＋ 週次 `schedule`。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
 gh variable set HYBRID_RECALL_MIN_R20_SMALL
@@ -75,7 +75,9 @@ gh variable set HYBRID_RECALL_MIN_R20_LARGE
 gh variable set HYBRID_RECALL_MIN_R100_LARGE
 ```
 
-**variables を設定するとゲートが有効化されます。** 未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。この opt-in 方式により、本 job を PR の required check に指定しても variables 設定前の PR を塞ぎません。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
+**variables を設定するとゲートが有効化されます。** 未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。
+
+**`pull_request` トリガを持たせない理由（spec 機密保持が優先）**: `pull_request` で起動する job は PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行するため、もし層 B を PR トリガにすると、PR がコードを書き換えて `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから spec の数値基準を取得できてしまいます（`.claude/rules/spec-confidentiality.md` の P0 違反）。そのため層 B は既定ブランチの trusted なコードのみが走る `schedule`／`workflow_dispatch` に限定し、**PR のマージ判定は層 A（spec 数値を含まない public な固定値回帰。`.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行）が担う**、という役割分担にしています（`docs/design/hybrid-recall-regression.md` 参照）。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
 
 ## ライセンス
 

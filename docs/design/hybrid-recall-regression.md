@@ -23,11 +23,12 @@
 
 ## 検証設計
 
-### 2 層構成（PR CI と閾値ゲートの分離）
+### 2 層構成（PR CI と閾値ゲートの分離。役割分担は spec 機密保持が優先）
 
 - **層 A**（`#[test]`。常時 `cargo test` 対象）: 決定的コーパスでのヒット数を固定値
   アサーションで回帰トラッキングする（TASK-106 と同方式）。spec の数値基準を使わない
-  ため public 資産に閾値を持ち込まない
+  ため public 資産に閾値を持ち込まない。`.github/workflows/ci.yml` の `cargo test`
+  で PR ごとに常時実行されるため、**PR のマージ判定は層 A が担う**
 - **層 B**（`#[ignore]`。`make recall-regression` 経由）: spec 由来の Recall 下限
   （`HYBRID_RECALL_MIN_R20_SMALL`・`HYBRID_RECALL_MIN_R20_LARGE`・
   `HYBRID_RECALL_MIN_R100_LARGE`。`.github/workflows/recall.yml` が Actions
@@ -36,10 +37,18 @@
   出力して成功終了し（`crates/engine/benches/parallel_bench.rs::
   core5_requested_from_env` と同じ opt-in パターン）、設定済みで非数値・範囲外は
   fail-closed でテスト失敗とする。ログには実測値と pass/fail のみを出力する
-  （README「Recall 回帰ハーネスの repo variables」参照）。`.github/workflows/
-  recall.yml` は `pull_request` トリガでも層 B を実行するため、この opt-in 方式に
-  より required check 化しても variables 設定前の PR を塞がない（PR #147
-  codex-review 指摘対応）
+  （README「Recall 回帰ハーネスの repo variables」参照）。
+
+  `.github/workflows/recall.yml` は `pull_request` トリガを**意図的に持たない**
+  （`workflow_dispatch` ＋ 週次 `schedule` のみ）。`pull_request` で起動する job は
+  PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行する
+  ため、層 B を PR トリガにすると PR がコードを書き換えて `HYBRID_RECALL_MIN_*`
+  （spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから
+  spec の数値基準を取得できてしまう（`.claude/rules/spec-confidentiality.md` の
+  P0 違反。PR #147 codex-review で一度 `pull_request` トリガを追加したが、この
+  P0 指摘により巻き戻した）。この経緯から、層 B は「trusted なコードのみが走る
+  非公開閾値ゲート」、層 A は「PR ごとに走る public な固定値ゲート」という役割分担を
+  設計判断として採用する
 
 ### コーパス・QA セットの生成
 
@@ -138,12 +147,8 @@ Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいず
 `.github/workflows/recall.yml` 専用にする判断を再検討する
 （`crates/engine/tests/hybrid_recall.rs::hybrid_recall_large_scale_regression` の
 ドキュメンテーションコメントと同方針）。なお `.github/workflows/recall.yml` は
-本 PR から `pull_request` トリガでも層 B（`make recall-regression` は `cargo test
---release`）を実行するため、PR ごとに release ビルド＋大規模段（20,000 件）の
-実行コストが追加される。variables 未設定時は測定自体を実行せず早期 return する
-ため層 A ほど重くはならないが、ビルド自体のコストは残る。実測後、CI 所要時間が
-問題になる場合はスケジュール専用（`pull_request` を外す）へ戻す判断を追って
-検討する。
+`pull_request` トリガを持たない（「2 層構成」参照。spec 機密保持が優先）ため、
+PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に限られる。
 
 ## 既知の制約・スコープ外
 
