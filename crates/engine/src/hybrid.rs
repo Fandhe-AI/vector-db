@@ -31,8 +31,7 @@ use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
 /// （coding-rust.md「無制限確保禁止」）。
 const MAX_POOL_DEPTH: usize = 10_000;
 
-/// RRF 融合の設定（対象ビヘイビア: SEARCH-1 の既定構成。数値・構成は spec 本文を転記せず
-/// 本モジュールの既定値としてのみ表現する）。
+/// RRF 融合の設定（本モジュールの既定値。関連: TASK-103）。
 ///
 /// - `k_const`: RRF のランク減衰定数（一般的な既定値 60.0 を採用）。
 /// - `dense_weight` / `sparse_weight`: 密・疎それぞれの寄与の重み（既定は等重み 1.0）。
@@ -149,6 +148,15 @@ pub enum HybridError {
     /// `provider_returning_hits_out_of_score_order_is_rejected` と対になる検証を、
     /// 本モジュールでも独立に行う（fail-closed）。
     UnsortedInput,
+    /// 融合対象の入力リスト（密・疎いずれか）に非有限スコア（NaN・Inf）が含まれていた。
+    /// `f64::total_cmp` は NaN にもビットパターンに基づく全順序を与えてしまうため、
+    /// 有限性を確認しないまま [`UnsortedInput`](HybridError::UnsortedInput) の順序検証
+    /// （`is_sorted_desc_id_asc`）だけに頼ると、NaN が「たまたま」順序契約を満たす
+    /// ビットパターンで紛れ込んだ場合に検出できず、無意味な順位で融合されてしまう
+    /// （fail-open）。`core.rs::EngineCore::search` の provider 結果検証が「(2) スコア
+    /// 有限性 → (5) 順序」の順で先に有限性を確認するのと同じ理由・同じ順序で、
+    /// 本モジュールでも順序検証より先に本エラーを検知する。
+    NonFiniteScore,
 }
 
 impl fmt::Display for HybridError {
@@ -161,6 +169,9 @@ impl fmt::Display for HybridError {
             HybridError::DuplicateId => write!(f, "duplicate id in hybrid fusion input list"),
             HybridError::UnsortedInput => {
                 write!(f, "hybrid fusion input list is not sorted by rank contract")
+            }
+            HybridError::NonFiniteScore => {
+                write!(f, "hybrid fusion input list contains a non-finite score")
             }
         }
     }
@@ -192,11 +203,27 @@ impl From<SparseError> for HybridError {
 /// 出力は融合スコア降順・同点は id 昇順（`f64::total_cmp` ベース）で確定する。
 /// 入力リスト内に同一 id が重複して出現した場合は [`HybridError::DuplicateId`] を返す
 /// （provider・インデックス側の契約違反を fail-closed に検知する）。
+/// 入力に非有限スコア（NaN・Inf）が含まれる場合は [`HybridError::NonFiniteScore`] を、
+/// ソート順契約に違反する場合は [`HybridError::UnsortedInput`] を返す。両者を検知
+/// する場合は必ず有限性検証を先に行う（非有限値は全順序を持たず、後続の順序検証が
+/// 無意味になるため。[`HybridError::NonFiniteScore`] のドキュメント参照）。
 pub fn rrf_fuse(
     dense: &[SearchHit],
     sparse: &[ScoredDoc],
     cfg: &RrfConfig,
 ) -> Result<Vec<HybridHit>, HybridError> {
+    // スコアの有限性を順序検証より先に確認する（[`HybridError::NonFiniteScore`] の
+    // ドキュメント参照）。`f64::total_cmp` は NaN にもビットパターン依存の全順序を
+    // 与えてしまうため、有限性を確認しないまま順序検証だけに頼ると NaN が偶然
+    // 順序契約を満たすビットパターンで紛れ込んだ場合に検出できない
+    // （`core.rs::EngineCore::search` の provider 結果検証と同じ検証順序）。
+    if dense.iter().any(|h| !h.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+    if sparse.iter().any(|d| !d.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+
     // RRF は元スコアを見ず順位のみを使うため、入力がソート済みであることをここで
     // 検証してから初めて信頼する（ドキュメントコメント・[`HybridError::UnsortedInput`]
     // 参照。ソート順を検証なしで信頼すると不正な順序が黙って誤った融合スコアを生む）。
@@ -472,6 +499,39 @@ mod tests {
     }
 
     #[test]
+    fn rrf_fuse_rejects_non_finite_dense_score() {
+        // [P1] レビュー指摘対応: `f64::total_cmp` は NaN にもビットパターン依存の
+        // 全順序を与えるため、有限性検証を欠くと NaN が順序検証をすり抜けうる。
+        // dense 側に NaN を含む列は `NonFiniteScore` で拒否されるべき。
+        let cfg = RrfConfig::default();
+        let dense = [hit(1, f32::NAN)];
+        let sparse: [ScoredDoc; 0] = [];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::NonFiniteScore);
+    }
+
+    #[test]
+    fn rrf_fuse_rejects_non_finite_sparse_score() {
+        let cfg = RrfConfig::default();
+        let dense: [SearchHit; 0] = [];
+        let sparse = [doc(1, f64::INFINITY)];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::NonFiniteScore);
+    }
+
+    #[test]
+    fn rrf_fuse_rejects_non_finite_score_before_checking_sort_order() {
+        // 非有限スコアが先頭に混ざり、かつ列全体としては（非有限値を除けば）順序
+        // 契約に違反していないケースでも、有限性検証が先に走るため `UnsortedInput`
+        // ではなく `NonFiniteScore` を返すことを確認する（検証順序の固定）。
+        let cfg = RrfConfig::default();
+        let dense = [hit(1, f32::NAN), hit(2, 1.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::NonFiniteScore);
+    }
+
+    #[test]
     fn rrf_fuse_rejects_duplicate_id_within_a_list() {
         let cfg = RrfConfig::default();
         let dense = [hit(1, 3.0), hit(1, 2.0)];
@@ -731,6 +791,14 @@ mod tests {
         // `input.ids` に含まれない id は疎検索側でヒットしても結果へ混入しない
         // ことを確認する。id=99 は `sparse_index` には存在するが `input.ids`
         // （可視集合）には含まれない。
+        //
+        // [P2-1] レビュー指摘対応: 従来は dense 側が id=1 に必ずヒットする構成のため、
+        // 疎側フィルタが no-op（機能していない）でも `h.id != 99` の緩い assert が
+        // 偶然通り得る作りだった。`id=1` は密・疎の両方で 1 位ヒットする構成（両者の
+        // BM25 スコアが同点になる id=1・id=99 のうち可視な id=1 のみが疎側の融合対象に
+        // 残る）にしたうえで、[`hybrid_search_filters_dense_hits_to_visible_ids`] と
+        // 同様に融合スコアの厳密一致まで検証し、疎側フィルタが実際に効いていること
+        // （効いていなければ id=99 も融合されスコア・件数が変わる）を担保する。
         let cfg = RrfConfig::default();
         let index =
             SparseIndex::build(&[(1, "shared term"), (99, "shared term")]).expect("build ok");
@@ -746,6 +814,19 @@ mod tests {
         };
         let hits =
             hybrid_search(&CpuScalarProvider, input, &index, "shared term", 10, &cfg).expect("ok");
+        // dense 側は id=1（dot product = 1.0*1.0 = 1.0）のみが 1 位、疎側は id=1・id=99
+        // が同点 1 位だが id=99 は可視集合外のためフィルタで除外され、id=1 のみが
+        // 疎側の融合対象として残る。両リストとも id=1 が rank=1 のため、融合スコアは
+        // `dense_weight/(k_const+1) + sparse_weight/(k_const+1) = 2.0/61.0`
+        // （既定 `RrfConfig`: k_const=60.0・dense_weight=sparse_weight=1.0）に確定する。
+        // 疎側フィルタが機能していなければ id=99 も融合されて件数・スコアが変わる。
+        assert_eq!(
+            hits,
+            vec![HybridHit {
+                id: 1,
+                score: 2.0 / 61.0
+            }]
+        );
         assert!(
             hits.iter().all(|h| h.id != 99),
             "invisible id must not leak into hybrid results: {hits:?}"
