@@ -13,7 +13,7 @@ use engine::batch_fallback::{
     BatchBackend, BatchBackendError, BatchExecError, FallbackBatchEngine, FallbackEvent,
     FallbackObserver, FallbackReason,
 };
-use engine::batch_search::{BatchHit, BatchQuery, BatchSearchError, ResidentMatrix};
+use engine::batch_search::{BatchEngine, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix};
 use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
@@ -495,4 +495,62 @@ fn fallback_search_is_deterministic_across_repeated_calls() {
     let first = engine.batch_search(&queries).expect("search ok");
     let second = engine.batch_search(&queries).expect("search ok");
     assert_eq!(first[0].hits, second[0].hits);
+}
+
+// 対象ビヘイビア: TABLE-9（レビュー起因の回帰・クレート外部からの公開 API
+// 経由確認）。`engine::batch_search::BatchEngine`（`batch_search.rs::
+// run_batch_search` を直接呼ぶ経路）と `FallbackBatchEngine`（CPU 縮退経路。
+// 内部で同じ `run_batch_search` を呼ぶ）の双方で、tenant-a のクエリが
+// tenant-b の `Public` 行を実際に返すことを、engine 公開 API のみから確認
+// する（`src/batch_search.rs`・`src/batch_fallback.rs` 内の同種ユニット
+// テストは `pub(crate)` API 経由のため、`wire-server` から見える公開面の
+// 回帰はこの結合テストが担う）。混入 0 件だけでは相互可視性の実装を
+// 保証しないため、tenant-b の id が実際に返ることまで確認する。
+#[test]
+fn batch_search_and_fallback_both_include_other_tenant_public_rows() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 4,
+        ctx: &ctx_a,
+    }];
+
+    // `BatchEngine`（primary 実装。`ResidentMatrix` を直接持つ）。
+    let matrix = ResidentMatrix::build(&ids, &tenant_ids, &visibilities, dim, &vectors)
+        .expect("valid matrix");
+    let primary_engine = BatchEngine::new(matrix);
+    let primary_hits = primary_engine
+        .batch_search(&queries)
+        .expect("primary search ok");
+    let primary_ids: std::collections::HashSet<u64> =
+        primary_hits[0].hits.iter().map(|h| h.id).collect();
+    assert!(
+        primary_ids.contains(&3) || primary_ids.contains(&4),
+        "BatchEngine must exercise TABLE-9 mutual visibility, not just absent"
+    );
+
+    // `FallbackBatchEngine`（CPU 縮退専用に構築。primary は常に失敗させ、
+    // CPU 縮退経路の `run_batch_search` を確実に通す）。
+    let observer = RecordingObserver::default();
+    let fallback_engine = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| Err(BatchBackendError::InitFailed("no gpu device".to_string())),
+        Box::new(observer),
+    )
+    .expect("build succeeds in cpu-only mode");
+    let fallback_hits = fallback_engine
+        .batch_search(&queries)
+        .expect("fallback search ok");
+    let fallback_ids: std::collections::HashSet<u64> =
+        fallback_hits[0].hits.iter().map(|h| h.id).collect();
+    assert_eq!(
+        primary_ids, fallback_ids,
+        "BatchEngine and FallbackBatchEngine（CPU 縮退経路）must agree on TABLE-9 visibility"
+    );
 }

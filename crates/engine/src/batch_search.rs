@@ -2368,6 +2368,101 @@ mod tests {
         );
     }
 
+    /// TASK-89（TABLE-9）レビュー起因の追加テスト用フィクスチャ: tenant-a を
+    /// 1 行、バッチに登場しない tenant-c を `extra_rows` 行、共に `Public` で
+    /// 持つ常駐行列。`tenant-c` はどのクエリのテナントとも一致しないため、
+    /// TABLE-9 対応前は行外側ループのゲートで最初から除外され課金対象にも
+    /// ならなかった。以下の 2 テストは、この「バッチに登場しないテナントの
+    /// `Public` 行」が計算量ガードへ正しく計上されること（過大な
+    /// `extra_rows` は `WorkBudgetExceeded`）と、`Public` を許可しないクエリ
+    /// では逆にこの拡張分のコストを一切払わないこと（`public_grant_query_
+    /// count_nonzero` ゲートが効くこと）の両方を確認する。
+    fn build_tenant_a_and_foreign_public_matrix(extra_rows: usize) -> ResidentMatrix {
+        let rows = 1 + extra_rows;
+        let dim = MAX_BATCH_DIM;
+        let ids: Vec<u64> = (0..rows as u64).collect();
+        let tenants: Vec<String> = std::iter::once("tenant-a".to_string())
+            .chain(std::iter::repeat_n("tenant-c".to_string(), extra_rows))
+            .collect();
+        let visibilities: Vec<Visibility> = std::iter::repeat_n(Visibility::Public, rows).collect();
+        let vectors: Vec<f32> = std::iter::repeat_n(0.0f32, rows * dim).collect();
+        ResidentMatrix::build(&ids, &tenants, &visibilities, dim, &vectors).expect("valid matrix")
+    }
+
+    // TASK-89（TABLE-9）レビュー起因の回帰: バッチに 1 件も登場しないテナント
+    // （tenant-c）の `Public` 行であっても、`Public` を許可するクエリからは
+    // TABLE-9 により到達しうるため、その分の積和コストが計算量ガードに
+    // 計上され `WorkBudgetExceeded` になることを確認する（過小計上のまま
+    // 走査本体まで進むと、計算量 DoS ガードに穴が空く）。
+    #[test]
+    fn batch_search_charges_foreign_tenant_public_rows_reachable_via_table9() {
+        // tenant-a 単独では compute_tenant_work(1, MAX_BATCH_QUERIES,
+        // MAX_BATCH_DIM) ≈ 3.36e7 で全く問題にならない規模だが、tenant-c の
+        // `Public` 行 400 件を加えた `all_public_row_count`（401）×
+        // `public_grant_query_count`（MAX_BATCH_QUERIES）× dim は
+        // MAX_BATCH_WORK（1e10）を超過する（401 * 4096 * 8192 ≈ 1.35e10）。
+        let matrix = build_tenant_a_and_foreign_public_matrix(400);
+        let engine = BatchEngine::new(matrix);
+
+        let query_vec: Vec<f32> = std::iter::repeat_n(0.0f32, MAX_BATCH_DIM).collect();
+        // 既定の `ctx()` は `Public` のみ許可（`public_grant_query_count` に
+        // 数えられる）。
+        let ctx_a = ctx("tenant-a");
+        let queries: Vec<BatchQuery<'_>> = (0..MAX_BATCH_QUERIES)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: 1,
+                ctx: &ctx_a,
+            })
+            .collect();
+
+        let err = engine.batch_search(&queries).unwrap_err();
+        match err {
+            BatchSearchError::WorkBudgetExceeded { work, max } => {
+                assert_eq!(max, MAX_BATCH_WORK);
+                assert_eq!(work, usize::MAX, "checked-add overflow sentinel expected");
+            }
+            other => panic!("expected WorkBudgetExceeded, got {other:?}"),
+        }
+    }
+
+    // TASK-89（TABLE-9）レビュー起因の回帰（上のテストと対で確認）:
+    // `Public` を許可しないクエリ（`Private` のみ許可）だけのバッチでは、
+    // `public_grant_query_count` が 0 になり、バッチに登場しない tenant-c の
+    // `Public` 行はそもそも到達不能（TABLE-9 は `Public` 許可クエリにしか
+    // 効かない）。この場合は同じ常駐行列（tenant-c 側の行数は上のテストと
+    // 同じ 400 件）でもコストを一切払わず成功し、tenant-c の id も一切
+    // 返らないことを確認する（`public_grant_query_count_nonzero` ゲートの
+    // 回帰）。
+    #[test]
+    fn batch_search_does_not_charge_foreign_public_rows_when_no_query_grants_public() {
+        let matrix = build_tenant_a_and_foreign_public_matrix(400);
+        let engine = BatchEngine::new(matrix);
+
+        let query_vec: Vec<f32> = std::iter::repeat_n(0.0f32, MAX_BATCH_DIM).collect();
+        let ctx_a = private_ctx("tenant-a");
+        let queries: Vec<BatchQuery<'_>> = (0..MAX_BATCH_QUERIES)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: 1,
+                ctx: &ctx_a,
+            })
+            .collect();
+
+        let results = engine
+            .batch_search(&queries)
+            .expect("must succeed: no query in this batch grants Public");
+        // tenant-a 自身の唯一の行（id=0）も `Public` だが、ctx は `Private`
+        // のみ許可のためこの行自体も不可視。結果は全クエリで空になる。
+        for hit_set in &results {
+            assert!(
+                hit_set.hits.is_empty(),
+                "no row must be visible: tenant-a's own row is Public but ctx only grants Private, \
+                 and tenant-c is unreachable without a Public grant"
+            );
+        }
+    }
+
     // codex レビュー追加指摘対応: 次元不一致という軽量に判定できる入力エラーは
     // `compute_batch_work` の計算量ガードより先に報告されるべき（core.rs::search
     // と同じ「安価で具体的なエラーを優先する」方針）。work budget 超過を
