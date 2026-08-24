@@ -208,6 +208,18 @@ else
 endif
 
 # --------------------------------------------------
+# ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
+# --------------------------------------------------
+
+.PHONY: recall-regression
+recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため recall-regression をスキップ"
+endif
+
+# --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
 
