@@ -61,6 +61,12 @@ const RECALL_QUERY_COUNT: usize = 20;
 /// p95 上限として使う `Duration` を得る。未設定・非数値・0 以下は fail-closed で
 /// 判定不能として扱う（数値そのものは spec が SSOT。本ファイルにはデフォルト値を
 /// 持たない——`.claude/rules/spec-confidentiality.md`）。
+///
+/// GitHub Actions では未設定の repo variable（`vars.*`）は空文字列に解決されるため
+/// （`.github/workflows/bench.yml` 参照）、CI での未設定時に実際にたどるのは
+/// `std::env::var` の `Err`（"is not set"）ではなく、空文字列パース失敗の
+/// "must be a positive integer" エラーである。いずれの経路でも fail-closed で
+/// 非ゼロ終了する点は変わらない。
 fn max_p95_from_env() -> Result<Duration, String> {
     let raw = std::env::var("BENCH_MAX_P95_MS")
         .map_err(|_| "BENCH_MAX_P95_MS is not set (see .github/workflows/bench.yml vars)")?;
@@ -74,10 +80,18 @@ fn max_p95_from_env() -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
-/// `BENCH_MIN_RECALL` 環境変数（`[0.0, 1.0]` の浮動小数点）を読み取り、CORE-4 の
+/// `BENCH_MIN_RECALL` 環境変数（`(0.0, 1.0]` の浮動小数点）を読み取り、CORE-4 の
 /// Recall@k 下限として使う値を得る。範囲外・未設定・非数値は fail-closed で
 /// 判定不能として扱う（`harness::accept::check_recall_within_limit` も同じ範囲を
 /// 再検証するが、ここでは早期に人間可読なエラーを出すために先立って検証する）。
+/// `0.0` は「どんな recall 値でも pass」となり CORE-4 のゲートを実質的に
+/// 無効化するため、`max_p95_from_env` が `0` を拒否するのと対称に下限からも除外する。
+///
+/// GitHub Actions では未設定の repo variable（`vars.*`）は空文字列に解決されるため
+/// （`.github/workflows/bench.yml` 参照）、実運用で未設定時にたどるのは主に
+/// 数値パース失敗のエラーメッセージであり、`std::env::var` の `Err`（環境変数自体が
+/// 存在しない場合）は主にローカル実行時の経路になる。いずれの経路でも fail-closed
+/// で非ゼロ終了する点は変わらない。
 fn min_recall_from_env() -> Result<f64, String> {
     let raw = std::env::var("BENCH_MIN_RECALL")
         .map_err(|_| "BENCH_MIN_RECALL is not set (see .github/workflows/bench.yml vars)")?;
@@ -85,8 +99,8 @@ fn min_recall_from_env() -> Result<f64, String> {
         .trim()
         .parse()
         .map_err(|_| "BENCH_MIN_RECALL must be a floating-point number".to_string())?;
-    if !(0.0..=1.0).contains(&value) {
-        return Err("BENCH_MIN_RECALL must be within [0.0, 1.0]".to_string());
+    if !(value > 0.0 && value <= 1.0) {
+        return Err("BENCH_MIN_RECALL must be within (0.0, 1.0]".to_string());
     }
     Ok(value)
 }
