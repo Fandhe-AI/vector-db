@@ -5,12 +5,15 @@
 //!
 //! `crates/engine/tests/cjk_tokenizer_impact.rs`（TASK-106）の決定的合成コーパス生成
 //! （自前 xorshift64*・外部クレート不使用）＋ Recall 実測＋固定値アサーションによる
-//! 回帰トラッキング方式を踏襲し、疎（BM25）側と同じ「AND 一致度」を密ベクトルにも
-//! one-hot 符号化で持たせる（[`one_hot_sum`] のドキュメント参照）ことで
-//! `engine::hybrid::hybrid_search`（密・疎の RRF 融合）を通しで測定する。測定は
-//! production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
-//! [`hybrid_search`]＋[`RrfConfig::default`]）のみを使用し、production コード
-//! （`crates/engine/src/`）は変更しない。
+//! 回帰トラッキング方式を踏襲する。正解判定は文書の潜在トピック集合
+//! （[`Doc::keywords`]）から独立に構築し、疎チャネル（テキスト）・密チャネル
+//! （ベクトル）はいずれもその非完全な観測（lossy view）として生成する
+//! （[`generate_corpus`] のドキュメント参照）。これにより疎のみ／密のみでしか
+//! 見つからない正解例が構造的に生まれ、Recall が 1.0（理論上限への 100% 到達）に
+//! 機械的に張り付かない。`engine::hybrid::hybrid_search`（密・疎の RRF 融合）を
+//! 通しで測定する。測定は production API（[`SparseIndex::build`]・
+//! [`ParallelSearchProvider`]・[`hybrid_search`]＋[`RrfConfig::default`]）のみを
+//! 使用し、production コード（`crates/engine/src/`）は変更しない。
 //!
 //! 2 段のスケール条件（小規模・大規模）を持つ:
 //! - 小規模段（`SMALL_NUM_DOCS` 件オーダ）: Recall@20（SEARCH-1 対応）
@@ -23,9 +26,12 @@
 //!   （`.claude/rules/spec-confidentiality.md`）。
 //! - 層 B（`#[ignore]`・`make recall-regression` 経由）: spec 由来の Recall 下限
 //!   （`HYBRID_RECALL_MIN_*` 環境変数。`.github/workflows/recall.yml` が Actions
-//!   variables から注入）と実測値を比較する閾値ゲート。未設定・非数値・範囲外は
-//!   fail-closed でテスト失敗とし、ログには実測値と pass/fail のみを出力する
-//!   （`crates/engine/benches/parallel_bench.rs` と同方針）。実測値（Recall@k）は
+//!   variables から注入）と実測値を比較する閾値ゲート。未設定・空文字列は
+//!   「ゲート未設定＝明示的に対象外」として成功終了し（silent skip にはしない。
+//!   `parallel_bench.rs::core5_requested_from_env` と同じ opt-in 方式）、設定済みで
+//!   非数値・範囲外は fail-closed でテスト失敗とする（[`GateThreshold`] 参照）。
+//!   ログには実測値と pass/fail のみを出力する（`crates/engine/benches/
+//!   parallel_bench.rs` と同方針）。実測値（Recall@k）は
 //!   [`RecallResult::recall20`]/[`RecallResult::recall100`] が定義するとおり
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
 //!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
@@ -92,9 +98,15 @@ const FILLER_WORDS: [&str; 10] = [
     "the", "a", "an", "of", "for", "and", "with", "in", "on", "note",
 ];
 
-/// 合成コーパス 1 文書（`keywords` は生成時に既知の「正解トピック集合」＝トピック
-/// インデックス（[`topic_token`] 参照）で、QA セットの正解文書判定と密ベクトル合成の
-/// 両方に使う）。
+/// 合成コーパス 1 文書。`keywords` は生成時に既知の「正解（潜在）トピック集合」＝
+/// トピックインデックス（[`topic_token`] 参照）で、QA セットの正解文書判定
+/// （[`generate_qa_set`] の `inverted` 構築）にのみ使う——`text`（疎チャネル）・
+/// `vector`（密チャネル）はいずれもこの潜在集合の非完全な観測（lossy view。
+/// [`generate_corpus`] のドロップアウト／デコイのドキュメント参照）であり、
+/// 正解判定そのものには使わない。正解集合の生成（`keywords`）と検索特徴量
+/// （`text`・`vector`）を分離することで、疎のみ／密のみでしか見つからない
+/// 正解例・どちらからも見つけにくい正解例が構造的に生まれ、Recall が
+/// 天井（1.0）に張り付かない現実的な分布になる（codex-review 指摘対応）。
 struct Doc {
     id: u64,
     text: String,
@@ -111,12 +123,14 @@ struct QaCase {
 }
 
 /// トピック `idx` を「密ベクトル空間の次元 `idx`」へ直接対応させる one-hot 構成
-/// （次元数 = `vocab_size`）。密ベクトルは基底ベクトル（[`one_hot_sum`]）の和として
-/// 合成するため、キーワード集合の共通部分数（`|doc.keywords ∩ query_topics|`）が
-/// そのまま内積のスコアになる——BM25 が AND 一致の文書を上位に置く挙動と同型の、
-/// 密チャネル側の決定的な信号を作るための設計（ランダム方向ベクトルの平均では
-/// トピック間のクロス項ノイズが AND 一致信号を上回りうるため採用しない。
-/// `docs/design/hybrid-recall-regression.md` 参照）。
+/// （次元数 = `vocab_size`）。密ベクトルは基底ベクトル（この関数）の和として
+/// 合成するため、与えた次元集合との共通部分数がそのまま内積のスコアになる——
+/// BM25 が AND 一致の文書を上位に置く挙動と同型の、密チャネル側の決定的な信号を
+/// 作るための設計（ランダム方向ベクトルの平均ではトピック間のクロス項ノイズが
+/// AND 一致信号を上回り、スコアの再現性・解釈性が失われるため採用しない。
+/// `docs/design/hybrid-recall-regression.md` 参照）。与える次元集合は文書の潜在
+/// トピック集合そのものとは限らない（[`generate_corpus`] のドロップアウト／デコイに
+/// よる lossy view）ため、密ベクトルと疎テキストが常に一致するとは限らない。
 fn one_hot_sum(vocab_size: usize, indices: impl IntoIterator<Item = usize>) -> Vec<f32> {
     let mut v = vec![0.0f32; vocab_size];
     for idx in indices {
@@ -154,11 +168,36 @@ fn zipf_index(rng: &mut Xorshift64, cumulative_weights: &[f64]) -> usize {
 /// 規模を決めることで無制限アロケーションを防ぐ（coding-rust.md「untrusted 入力の扱い」）。
 const MAX_CORPUS_DOCS_GUARD: usize = 100_000;
 
+/// fixture パラメータ（spec 由来の数値基準ではなく、本テストハーネスが Recall を
+/// 1.0 未満の現実的な分布にするために実験的に選んだ確率）。文書の潜在トピック集合
+/// （[`Doc::keywords`]）のうち、テキスト（疎チャネル）へ反映されず脱落する確率。
+/// 「latent トピックはあるが埋め込み・索引が捉え損ねる」を模する（[`generate_corpus`]
+/// のドキュメント参照）。
+const TEXT_KEYWORD_DROPOUT_PROB: f64 = 0.18;
+
+/// fixture パラメータ（同上）。潜在トピック集合のうち密ベクトルへ反映されず脱落する
+/// 確率。
+const VECTOR_KEYWORD_DROPOUT_PROB: f64 = 0.18;
+
+/// fixture パラメータ（同上）。密ベクトルに、文書の潜在トピック集合に含まれない
+/// 無関係な次元が 1 つ紛れ込む（decoy）確率。埋め込みが無関係トピックへ誤って
+/// 反応する状況を模し、密チャネルの偽陽性（クラウディング）を作る。
+const VECTOR_DECOY_PROB: f64 = 0.12;
+
 /// 決定的シード付き擬似乱数でトピック相関コーパスと QA セット（`direct` カテゴリ相当:
 /// 最も出現頻度の低いキーワード 2 語の AND 組み合わせ）を生成する。`num_docs`・
 /// `num_queries`・`vocab_size` は呼び出し側（テスト内定数）が固定し、環境変数からは
 /// 受け取らない。`vocab_size` はコーパス規模に応じて選ぶ（QA 正解集合の絞り込み度を
 /// 保つため。[`topic_token`] のドキュメント参照）。
+///
+/// 正解判定（`inverted` → QA の `correct`）は文書の潜在トピック集合
+/// （[`Doc::keywords`]）から構築し、疎チャネル（`text`）・密チャネル（`vector`）は
+/// いずれもこの潜在集合の非完全な観測として独立に生成する
+/// （[`TEXT_KEYWORD_DROPOUT_PROB`]・[`VECTOR_KEYWORD_DROPOUT_PROB`]・
+/// [`VECTOR_DECOY_PROB`]）。ドロップアウト・デコイはいずれも 0/1 の one-hot 次元への
+/// 操作のみで、浮動小数点の連続ノイズは加えない——`ParallelSearchProvider`
+/// の加算順序（並列分割）に依存する丸め誤差を避け、層 A の固定値アサーションが
+/// スレッド数に左右されず再現可能であることを保証するため。
 fn generate_corpus(
     seed: u64,
     num_docs: usize,
@@ -183,8 +222,28 @@ fn generate_corpus(
             kw_set.insert(zipf_index(&mut rng, &zipf_weights));
         }
 
+        // 正解判定用の inverted index は潜在トピック集合 `kw_set` から構築する
+        // （疎・密いずれの lossy view にも依存しない。ground truth の独立性）。
+        for &kw_idx in &kw_set {
+            inverted.entry(kw_idx).or_default().push(doc_id);
+        }
+
+        // ---- 疎チャネル（テキスト）の lossy view: 潜在トピックを確率的に脱落させる ----
+        let mut text_keywords: Vec<usize> = kw_set
+            .iter()
+            .copied()
+            .filter(|_| rng.next_f64() >= TEXT_KEYWORD_DROPOUT_PROB)
+            .collect();
+        if text_keywords.is_empty() {
+            // 全脱落は疎チャネルを完全に無効化してしまうため、最低 1 語は残す
+            // （`num_keywords >= 3` により `kw_set` は必ず非空）。
+            if let Some(&first) = kw_set.iter().next() {
+                text_keywords.push(first);
+            }
+        }
+
         let mut text = String::new();
-        for (i, &kw_idx) in kw_set.iter().enumerate() {
+        for (i, &kw_idx) in text_keywords.iter().enumerate() {
             if i > 0 {
                 text.push(' ');
                 text.push_str(FILLER_WORDS[rng.next_range(FILLER_WORDS.len())]);
@@ -193,14 +252,20 @@ fn generate_corpus(
             text.push_str(&topic_token(kw_idx));
         }
 
-        for &kw_idx in &kw_set {
-            inverted.entry(kw_idx).or_default().push(doc_id);
+        // ---- 密チャネル（ベクトル）の lossy view: 脱落＋無関係トピックの混入 ----
+        let mut vector_keywords: Vec<usize> = kw_set
+            .iter()
+            .copied()
+            .filter(|_| rng.next_f64() >= VECTOR_KEYWORD_DROPOUT_PROB)
+            .collect();
+        if rng.next_f64() < VECTOR_DECOY_PROB {
+            let decoy = zipf_index(&mut rng, &zipf_weights);
+            if !kw_set.contains(&decoy) {
+                vector_keywords.push(decoy);
+            }
         }
-        // 密ベクトルは文書のキーワード集合そのものを one-hot の和として符号化する
-        // （[`one_hot_sum`] のドキュメント参照）。疎（BM25）側と同じ「AND 一致度」の
-        // 信号を密チャネルにも持たせ、RRF 融合（等重み）で片方の信号がもう片方の
-        // ノイズに押し流されないようにする。
-        let vector = one_hot_sum(vocab_size, kw_set.iter().copied());
+        let vector = one_hot_sum(vocab_size, vector_keywords.iter().copied());
+
         docs.push(Doc {
             id: doc_id,
             text,
@@ -216,7 +281,14 @@ fn generate_corpus(
 /// 各文書から最も出現頻度の低いキーワード 2 語（AND 組み合わせ）を選び、正解集合が
 /// コーパス全体に対して十分に絞り込まれた `direct` クエリを構成する
 /// （`cjk_tokenizer_impact.rs::generate_qa_set` と同方式）。密クエリベクトルは選んだ
-/// 2 語を [`one_hot_sum`] で符号化したもの（疎クエリと対応する AND 信号）。
+/// 2 語を [`one_hot_sum`] で符号化したもの（疎クエリと対応する AND 信号。クエリ自体は
+/// 潜在トピック集合から直接構成する「意図が明確なクエリ」であり、[`generate_corpus`]
+/// の lossy view はドキュメント側にのみ適用する）。
+///
+/// 正規化済み語ペア（`(min(a,b), max(a,b))`）を [`BTreeSet`] で追跡し、同一ペアの
+/// 重複登録を除外する（codex-review 指摘対応。重複を許すと Recall が特定の語ペアへ
+/// 偏り、少数の「簡単な」クエリの繰り返しで指標が水増しされるため）。重複除外の結果
+/// `qa.len()` は `num_queries` を下回りうる（コーパス中のユニークな語ペア数が上限のため）。
 fn generate_qa_set(
     rng: &mut Xorshift64,
     docs: &[Doc],
@@ -231,6 +303,7 @@ fn generate_qa_set(
     }
 
     let mut qa = Vec::with_capacity(num_queries);
+    let mut seen_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
     for &doc_idx in &order {
         if qa.len() >= num_queries {
             break;
@@ -242,6 +315,11 @@ fn generate_qa_set(
         let mut kws: Vec<usize> = doc.keywords.iter().copied().collect();
         kws.sort_by_key(|k| inverted.get(k).map_or(0, Vec::len));
         let (a, b) = (kws[0], kws[1]);
+
+        let pair = (a.min(b), a.max(b));
+        if !seen_pairs.insert(pair) {
+            continue;
+        }
 
         let set_a: BTreeSet<u64> = inverted.get(&a).into_iter().flatten().copied().collect();
         let set_b: BTreeSet<u64> = inverted.get(&b).into_iter().flatten().copied().collect();
@@ -393,6 +471,9 @@ fn hybrid_recall_small_scale_regression() {
     for case in &qa {
         assert!(!case.correct.is_empty());
     }
+    // QA 件数（[`generate_qa_set`] の語ペア重複除外後）も決定的コーパスに対しては
+    // 固定値であり、フィクスチャが実質的に縮退していないことの回帰トラッキングを兼ねる。
+    assert_eq!(qa.len(), 60, "重複除外後の QA 件数が変化した");
 
     let r = measure_recall(&docs, &qa);
     println!(
@@ -409,17 +490,14 @@ fn hybrid_recall_small_scale_regression() {
         r.total_correct
     );
 
-    // `total_correct` は理論上限（`ceil20` = Σmin(20,|correct_q|)）より大きくなりうる:
-    // Zipf 分布による語彙選択のばらつきで、一部クエリの正解集合が 20 件を超えることが
-    // あるため（`cjk_tokenizer_impact.rs` と同じ天井効果）。`recall20()`（分母は
-    // `ceil20`）で層 B と同じ意味の値を扱いつつ、`hits20 == ceil20`
-    // （達成可能な上限に対して 100%）であることを固定値で回帰トラッキングする。
-    assert_eq!(r.total_correct, 182, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 178, "Recall@20 の理論上限が変化した");
-    assert_eq!(
-        r.hits20, 178,
-        "小規模段の Recall@20 hit 数が変化した（理論上限に対し 100%）"
-    );
+    // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
+    // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
+    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`hits20`/`ceil20`/
+    // `total_correct` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの
+    // 変更で数値が変化した場合はこのテストが失敗する）。
+    assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
+    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
 }
 
 // ---------- 層 A: 大規模段（数万件オーダ。SEARCH-2 対応。固定値回帰トラッキング） ----------
@@ -447,6 +525,7 @@ fn hybrid_recall_large_scale_regression() {
     for case in &qa {
         assert!(!case.correct.is_empty());
     }
+    assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
 
     let r = measure_recall(&docs, &qa);
     println!(
@@ -466,54 +545,76 @@ fn hybrid_recall_large_scale_regression() {
         r.total_correct
     );
 
-    // `hybrid_recall_small_scale_regression` と同じ天井効果（一部クエリの正解集合が
-    // 20/100 件を超えるため `total_correct` は理論上限より大きい）。`recall20()`/
-    // `recall100()`（分母は `ceil20`/`ceil100`）で層 B と同じ意味の値を扱いつつ、
-    // `hits == ceil`（達成可能な上限に対して 100%）であることを固定値で回帰
-    // トラッキングする。
-    assert_eq!(r.total_correct, 1217, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 333, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.ceil100, 736, "Recall@100 の理論上限が変化した");
-    assert_eq!(
-        r.hits20, 333,
-        "大規模段の Recall@20 hit 数が変化した（理論上限に対し 100%）"
-    );
-    assert_eq!(
-        r.hits100, 736,
-        "大規模段の Recall@100 hit 数が変化した（理論上限に対し 100%）"
-    );
+    // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
+    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
+    // `total_correct` を固定値で回帰トラッキングする。
+    assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
+    assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
+    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make recall-regression` 専用） ----------
 
-/// `HYBRID_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）を読み取る。未設定・
-/// 非数値・範囲外は fail-closed（`Err`）とし、呼び出し側でテスト失敗として扱う
-/// （`crates/engine/benches/parallel_bench.rs::min_recall_from_env` と同方針）。
-/// 数値そのもの（spec の Recall 下限）はこのファイル・ログのいずれにもハードコード
-/// しない（`.claude/rules/spec-confidentiality.md`）。
-fn min_recall_from_env(var: &str) -> Result<f64, String> {
-    let raw = std::env::var(var)
-        .map_err(|_| format!("{var} is not set (see .github/workflows/recall.yml vars)"))?;
-    let value: f64 = raw
-        .trim()
+/// `HYBRID_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果。
+enum GateThreshold {
+    /// 環境変数が未設定、または GitHub Actions の未設定 repo variable が解決する
+    /// 空文字列（`.github/workflows/bench.yml` の `BENCH_MAX_P95_MS` 等と同じ経路。
+    /// `crates/engine/benches/parallel_bench.rs::min_recall_from_env` 冒頭コメント
+    /// 参照）。ゲートが repo variables 未設定の PR を塞がないよう、この場合は
+    /// fail ではなく「ゲート未設定＝明示的に対象外」として扱う（silent skip には
+    /// しない。`parallel_bench.rs::core5_requested_from_env` の opt-in 方式と同型）。
+    NotConfigured,
+    /// 設定済みで `(0.0, 1.0]` の範囲内。この場合のみ実測値と比較する。
+    Value(f64),
+}
+
+/// `HYBRID_RECALL_MIN_*` 環境変数を読み取る。未設定・空文字列は
+/// [`GateThreshold::NotConfigured`]（ゲート対象外）、非数値・範囲外は
+/// fail-closed（`Err`。呼び出し側でテスト失敗として扱う）、それ以外は
+/// [`GateThreshold::Value`] を返す。数値そのもの（spec の Recall 下限）はこの
+/// ファイル・ログのいずれにもハードコードしない（`.claude/rules/spec-confidentiality.md`）。
+fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
+    let raw = match std::env::var(var) {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok(GateThreshold::NotConfigured),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{var} is not valid unicode"));
+        }
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(GateThreshold::NotConfigured);
+    }
+    let value: f64 = trimmed
         .parse()
         .map_err(|_| format!("{var} must be a floating-point number"))?;
     if !(value > 0.0 && value <= 1.0) {
         return Err(format!("{var} must be within (0.0, 1.0]"));
     }
-    Ok(value)
+    Ok(GateThreshold::Value(value))
 }
 
 /// TASK-104（SEARCH-1）層 B: 小規模段 Recall@20（[`RecallResult::recall20`]。分母は
 /// 理論上限 `ceil20`）が `HYBRID_RECALL_MIN_R20_SMALL`（Actions variables 由来）以上
-/// であることを確認する閾値ゲート。未設定・非数値・範囲外は fail-closed でテスト失敗
-/// とする（skip しない）。ログには実測値と pass/fail のみを出力し、注入された閾値の
-/// 数値は出力しない。
+/// であることを確認する閾値ゲート。未設定は「対象外」として明示的に成功終了し
+/// （[`GateThreshold::NotConfigured`]）、設定済みで非数値・範囲外は fail-closed で
+/// テスト失敗とする（skip しない）。ログには実測値と pass/fail のみを出力し、
+/// 注入された閾値の数値は出力しない。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_small_scale_threshold_gate() {
-    let min_r20 = min_recall_from_env("HYBRID_RECALL_MIN_R20_SMALL")
-        .expect("HYBRID_RECALL_MIN_R20_SMALL invalid");
+    let min_r20 = match recall_threshold_from_env("HYBRID_RECALL_MIN_R20_SMALL") {
+        Ok(GateThreshold::NotConfigured) => {
+            println!(
+                "hybrid_recall_small_scale_threshold_gate: HYBRID_RECALL_MIN_R20_SMALL not configured; gate not enabled (explicit no-op, not a failure)"
+            );
+            return;
+        }
+        Ok(GateThreshold::Value(v)) => v,
+        Err(msg) => panic!("HYBRID_RECALL_MIN_R20_SMALL invalid: {msg}"),
+    };
 
     let (docs, qa) = generate_corpus(
         SMALL_SEED,
@@ -534,15 +635,26 @@ fn hybrid_recall_small_scale_threshold_gate() {
 
 /// TASK-104（SEARCH-2）層 B: 大規模段 Recall@20・Recall@100 がそれぞれ
 /// `HYBRID_RECALL_MIN_R20_LARGE`・`HYBRID_RECALL_MIN_R100_LARGE` 以上であることを
-/// 確認する閾値ゲート。契約は
-/// [`hybrid_recall_small_scale_threshold_gate`] と同一。
+/// 確認する閾値ゲート。契約は [`hybrid_recall_small_scale_threshold_gate`] と同一だが、
+/// 2 つの下限を独立に解決する（片方のみ設定済みの場合は設定済みの側だけを判定し、
+/// 未設定側は「対象外」を出力する。両方未設定の場合のみコーパス生成前に早期return
+/// して成功終了する）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
-    let min_r20 = min_recall_from_env("HYBRID_RECALL_MIN_R20_LARGE")
-        .expect("HYBRID_RECALL_MIN_R20_LARGE invalid");
-    let min_r100 = min_recall_from_env("HYBRID_RECALL_MIN_R100_LARGE")
-        .expect("HYBRID_RECALL_MIN_R100_LARGE invalid");
+    let min_r20 = recall_threshold_from_env("HYBRID_RECALL_MIN_R20_LARGE")
+        .unwrap_or_else(|msg| panic!("HYBRID_RECALL_MIN_R20_LARGE invalid: {msg}"));
+    let min_r100 = recall_threshold_from_env("HYBRID_RECALL_MIN_R100_LARGE")
+        .unwrap_or_else(|msg| panic!("HYBRID_RECALL_MIN_R100_LARGE invalid: {msg}"));
+
+    if matches!(min_r20, GateThreshold::NotConfigured)
+        && matches!(min_r100, GateThreshold::NotConfigured)
+    {
+        println!(
+            "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R20_LARGE/HYBRID_RECALL_MIN_R100_LARGE not configured; gate not enabled (explicit no-op, not a failure)"
+        );
+        return;
+    }
 
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
@@ -553,18 +665,39 @@ fn hybrid_recall_large_scale_threshold_gate() {
     let r = measure_recall(&docs, &qa);
     let recall20 = r.recall20();
     let recall100 = r.recall100();
-    let pass20 = recall20 >= min_r20;
-    let pass100 = recall100 >= min_r100;
 
-    println!(
-        "hybrid_recall_large_scale_threshold_gate: recall@20={recall20:.4} pass20={pass20} recall@100={recall100:.4} pass100={pass100}"
-    );
+    let mut pass = true;
+    match min_r20 {
+        GateThreshold::Value(min) => {
+            let pass20 = recall20 >= min;
+            pass &= pass20;
+            println!(
+                "hybrid_recall_large_scale_threshold_gate: recall@20={recall20:.4} pass20={pass20}"
+            );
+        }
+        GateThreshold::NotConfigured => {
+            println!(
+                "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R20_LARGE not configured; sub-check not enabled"
+            );
+        }
+    }
+    match min_r100 {
+        GateThreshold::Value(min) => {
+            let pass100 = recall100 >= min;
+            pass &= pass100;
+            println!(
+                "hybrid_recall_large_scale_threshold_gate: recall@100={recall100:.4} pass100={pass100}"
+            );
+        }
+        GateThreshold::NotConfigured => {
+            println!(
+                "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R100_LARGE not configured; sub-check not enabled"
+            );
+        }
+    }
+
     assert!(
-        pass20,
-        "large-scale Recall@20 below HYBRID_RECALL_MIN_R20_LARGE"
-    );
-    assert!(
-        pass100,
-        "large-scale Recall@100 below HYBRID_RECALL_MIN_R100_LARGE"
+        pass,
+        "large-scale Recall@20/Recall@100 below configured HYBRID_RECALL_MIN_* threshold"
     );
 }
