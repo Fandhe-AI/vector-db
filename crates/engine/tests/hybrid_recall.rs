@@ -25,7 +25,10 @@
 //!   （`HYBRID_RECALL_MIN_*` 環境変数。`.github/workflows/recall.yml` が Actions
 //!   variables から注入）と実測値を比較する閾値ゲート。未設定・非数値・範囲外は
 //!   fail-closed でテスト失敗とし、ログには実測値と pass/fail のみを出力する
-//!   （`crates/engine/benches/parallel_bench.rs` と同方針）。
+//!   （`crates/engine/benches/parallel_bench.rs` と同方針）。実測値（Recall@k）は
+//!   [`RecallResult::recall20`]/[`RecallResult::recall100`] が定義するとおり
+//!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
+//!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了
@@ -260,12 +263,35 @@ fn generate_qa_set(
 // ---------- Recall 測定ヘルパ（production API 経由。engine::hybrid::hybrid_search） ----------
 
 /// Recall@20・Recall@100 の実測結果（ヒット数と理論上限）。
+///
+/// `total_correct`（正解集合の総数）を分母にすると、正解集合が k 件を超えるクエリが
+/// 混ざった場合に理論上の最大値が 1.0 未満に頭打ちになる（天井効果）。本ハーネスの
+/// [`recall20`](RecallResult::recall20)/[`recall100`](RecallResult::recall100) は
+/// 分母に理論上限 `ceil20`/`ceil100`（Σmin(k,\|correct_q\|)）を使い、達成可能な上限に
+/// 対する到達率として層 A（回帰トラッキング）・層 B（spec 閾値ゲート）の両方で同じ
+/// 意味の値を扱えるようにする。`total_correct` 自体は層 A の固定値アサーション対象
+/// として残す。
 struct RecallResult {
     total_correct: usize,
     hits20: usize,
     hits100: usize,
     ceil20: usize,
     ceil100: usize,
+}
+
+impl RecallResult {
+    /// Recall@20 = hits20 / ceil20（理論上限に対する到達率）。`ceil20 == 0` は
+    /// QA セットが空の場合のみ起こり得る呼び出し側の不変条件違反であり、
+    /// その場合は NaN となって呼び出し側の `>=` 比較が false（fail-closed）になる。
+    fn recall20(&self) -> f64 {
+        self.hits20 as f64 / self.ceil20 as f64
+    }
+
+    /// Recall@100 = hits100 / ceil100（[`recall20`](Self::recall20) と同じ理由で
+    /// 理論上限を分母にする）。
+    fn recall100(&self) -> f64 {
+        self.hits100 as f64 / self.ceil100 as f64
+    }
 }
 
 /// [`SparseIndex::build`]・[`ParallelSearchProvider`]・[`hybrid_search`]
@@ -376,15 +402,17 @@ fn hybrid_recall_small_scale_regression() {
         r.total_correct
     );
     println!(
-        "Recall@20={:.4} ({}/{})",
-        r.hits20 as f64 / r.total_correct as f64,
+        "Recall@20={:.4} ({}/{} of ceil20; total_correct={})",
+        r.recall20(),
         r.hits20,
+        r.ceil20,
         r.total_correct
     );
 
     // `total_correct` は理論上限（`ceil20` = Σmin(20,|correct_q|)）より大きくなりうる:
     // Zipf 分布による語彙選択のばらつきで、一部クエリの正解集合が 20 件を超えることが
-    // あるため（`cjk_tokenizer_impact.rs` と同じ天井効果）。`hits20 == ceil20`
+    // あるため（`cjk_tokenizer_impact.rs` と同じ天井効果）。`recall20()`（分母は
+    // `ceil20`）で層 B と同じ意味の値を扱いつつ、`hits20 == ceil20`
     // （達成可能な上限に対して 100%）であることを固定値で回帰トラッキングする。
     assert_eq!(r.total_correct, 182, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 178, "Recall@20 の理論上限が変化した");
@@ -428,18 +456,21 @@ fn hybrid_recall_large_scale_regression() {
         r.total_correct
     );
     println!(
-        "Recall@20={:.4} ({}/{})  Recall@100={:.4} ({}/{})",
-        r.hits20 as f64 / r.total_correct as f64,
+        "Recall@20={:.4} ({}/{} of ceil20)  Recall@100={:.4} ({}/{} of ceil100; total_correct={})",
+        r.recall20(),
         r.hits20,
-        r.total_correct,
-        r.hits100 as f64 / r.total_correct as f64,
+        r.ceil20,
+        r.recall100(),
         r.hits100,
+        r.ceil100,
         r.total_correct
     );
 
     // `hybrid_recall_small_scale_regression` と同じ天井効果（一部クエリの正解集合が
-    // 20/100 件を超えるため `total_correct` は理論上限より大きい）。`hits == ceil`
-    // （達成可能な上限に対して 100%）であることを固定値で回帰トラッキングする。
+    // 20/100 件を超えるため `total_correct` は理論上限より大きい）。`recall20()`/
+    // `recall100()`（分母は `ceil20`/`ceil100`）で層 B と同じ意味の値を扱いつつ、
+    // `hits == ceil`（達成可能な上限に対して 100%）であることを固定値で回帰
+    // トラッキングする。
     assert_eq!(r.total_correct, 1217, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 333, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 736, "Recall@100 の理論上限が変化した");
@@ -473,10 +504,11 @@ fn min_recall_from_env(var: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-/// TASK-104（SEARCH-1）層 B: 小規模段 Recall@20 が `HYBRID_RECALL_MIN_R20_SMALL`
-/// （Actions variables 由来）以上であることを確認する閾値ゲート。未設定・非数値・
-/// 範囲外は fail-closed でテスト失敗とする（skip しない）。ログには実測値と pass/fail
-/// のみを出力し、注入された閾値の数値は出力しない。
+/// TASK-104（SEARCH-1）層 B: 小規模段 Recall@20（[`RecallResult::recall20`]。分母は
+/// 理論上限 `ceil20`）が `HYBRID_RECALL_MIN_R20_SMALL`（Actions variables 由来）以上
+/// であることを確認する閾値ゲート。未設定・非数値・範囲外は fail-closed でテスト失敗
+/// とする（skip しない）。ログには実測値と pass/fail のみを出力し、注入された閾値の
+/// 数値は出力しない。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_small_scale_threshold_gate() {
@@ -490,7 +522,7 @@ fn hybrid_recall_small_scale_threshold_gate() {
         SMALL_VOCAB_SIZE,
     );
     let r = measure_recall(&docs, &qa);
-    let recall20 = r.hits20 as f64 / r.total_correct as f64;
+    let recall20 = r.recall20();
     let pass = recall20 >= min_r20;
 
     println!("hybrid_recall_small_scale_threshold_gate: recall@20={recall20:.4} pass={pass}");
@@ -519,8 +551,8 @@ fn hybrid_recall_large_scale_threshold_gate() {
         LARGE_VOCAB_SIZE,
     );
     let r = measure_recall(&docs, &qa);
-    let recall20 = r.hits20 as f64 / r.total_correct as f64;
-    let recall100 = r.hits100 as f64 / r.total_correct as f64;
+    let recall20 = r.recall20();
+    let recall100 = r.recall100();
     let pass20 = recall20 >= min_r20;
     let pass100 = recall100 >= min_r100;
 

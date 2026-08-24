@@ -77,10 +77,15 @@ k_const 60）に一致する。
 
 ### 指標
 
-Recall@20（小規模段）・Recall@20/Recall@100（大規模段）を、正解文書の総数
-（`total_correct`）に対する hit 数として測定し、理論上限（`ceil` =
-Σmin(k,\|correct_q\|)）に対する到達率（`hits == ceil` か）も併せて回帰トラッキング
-する。
+Recall@20（小規模段）・Recall@20/Recall@100（大規模段）は、正解文書の総数
+（`total_correct`）ではなく理論上限（`ceil` = Σmin(k,\|correct_q\|)）を分母とする
+到達率（`hits / ceil`）として測定する。正解集合が k 件を超えるクエリが混ざると
+`total_correct` を分母にした場合に理論上の最大値が 1.0 未満へ頭打ちになり
+（層 A・層 B で分母の意味が揃わなくなる問題があったため）、層 A（回帰トラッキング）・
+層 B（spec 閾値ゲート）とも `ceil` を分母に統一している
+（`crates/engine/tests/hybrid_recall.rs::RecallResult::recall20`/`recall100`）。
+`hits == ceil`（到達率 100%）かどうかも層 A の固定値アサーションで併せて
+回帰トラッキングする。
 
 ## 実測結果
 
@@ -94,11 +99,16 @@ Recall@20（小規模段）・Recall@20/Recall@100（大規模段）を、正解
 
 いずれの段も `hits == ceil`（理論上限に対して 100%）を達成している。`total_correct`
 が `ceil` より大きいのは、一部クエリの正解集合が k（20/100）を超えるため
-（TASK-106 と同じ天井効果。「Recall@k」を `hits/total_correct` として素朴に表示すると
-1.0 未満になるが、達成可能な上限に対しては 100% である）。
+（TASK-106 と同じ天井効果）。「指標」で述べたとおり Recall@k は `hits/ceil` で
+測定するため、この天井効果があっても層 A・層 B とも到達率 100% を基準にできる。
 
-大規模段のデバッグビルド実行時間は約 4.5 秒であり、PR CI（`cargo test`）に含めても
-許容範囲と判断し、層 A の両テストとも `#[ignore]` にしていない。
+大規模段のデバッグビルド実行時間はローカル実測で約 4.5 秒であり、PR CI
+（`cargo test`）に含めても許容範囲と判断し、層 A の両テストとも `#[ignore]` に
+していない。ただし `ubuntu-latest`（GitHub Actions ランナー）での実測はまだ行って
+おらず、CI 実測後に実行時間が悪化していれば `#[ignore]` 側へ移し
+`.github/workflows/recall.yml` 専用にする判断を再検討する
+（`crates/engine/tests/hybrid_recall.rs::hybrid_recall_large_scale_regression` の
+ドキュメンテーションコメントと同方針）。
 
 ## 既知の制約・スコープ外
 
