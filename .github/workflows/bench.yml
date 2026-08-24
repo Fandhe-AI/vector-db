@@ -38,4 +38,12 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-simd
+        # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
+        # にはハードコードしない。リポジトリの Actions variables（`vars.*`。secrets では
+        # ない——secrets だと bench の出力ログがマスクされ判定結果が読めなくなる）から
+        # 注入する。未設定の場合は `simd_bench.rs` 側が fail-closed で非ゼロ終了する
+        # （`crates/engine/benches/simd_bench.rs` 参照）。
+        env:
+          BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
+          BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
         run: make bench-simd

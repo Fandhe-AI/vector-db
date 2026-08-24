@@ -58,6 +58,17 @@ fn recall_at_k_ignores_extra_actual_ids_beyond_expected_set() {
 }
 
 #[test]
+fn recall_at_k_deduplicates_repeated_actual_ids() {
+    // actual に重複 id が含まれても、集合演算前に重複除去するため Recall は
+    // 1.0 を超えない（重複除去しないと expected=[1,2] / actual=[1,1,2,2] で
+    // matched=4 となり recall=2.0 という不正値になる）。
+    let expected = vec![1, 2];
+    let actual = vec![1, 1, 2, 2];
+    let recall = recall_at_k(&expected, &actual).unwrap();
+    assert!((recall - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
 fn recall_at_k_rejects_empty_expected_set() {
     let err = recall_at_k(&[], &[1, 2, 3]).unwrap_err();
     assert_eq!(err, BenchError::EmptySamples);

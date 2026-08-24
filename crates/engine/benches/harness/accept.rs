@@ -23,14 +23,18 @@ use super::stats::BenchError;
 ///
 /// Recall@k = |被検結果 ∩ 厳密結果| / |厳密結果|。id の集合演算のみで判定し、
 /// スコア値・並び順には依存しない（同点近傍が実装間で順序入れ替わっても
-/// Recall を過小評価しない）。`expected`（厳密結果の id 列）が空の場合は
+/// Recall を過小評価しない）。`actual_ids` は重複除去してから集合演算する
+/// ため、被検側の実装が同一 id を複数回返しても Recall が 1.0 を超えない
+/// （fail-closed。重複を許すと判定関数が異常値でも `min_recall` 判定を
+/// 素通りしてしまう）。`expected`（厳密結果の id 列）が空の場合は
 /// 判定不能として `Err`（fail-closed。0 件の正解に対する「一致率」は定義できない）。
 pub fn recall_at_k(expected_ids: &[u64], actual_ids: &[u64]) -> Result<f64, BenchError> {
     if expected_ids.is_empty() {
         return Err(BenchError::EmptySamples);
     }
     let expected: std::collections::HashSet<u64> = expected_ids.iter().copied().collect();
-    let matched = actual_ids.iter().filter(|id| expected.contains(id)).count();
+    let actual: std::collections::HashSet<u64> = actual_ids.iter().copied().collect();
+    let matched = actual.intersection(&expected).count();
     Ok(matched as f64 / expected.len() as f64)
 }
 
