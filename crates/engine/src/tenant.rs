@@ -47,7 +47,12 @@ pub enum TenantError {
 impl std::fmt::Display for TenantError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TenantError::Catalog(e) => write!(f, "tenant boundary catalog error: {e}"),
+            // `CatalogError` の `Display`（`TableNotFound` のテーブル名・`RowNotFound` の
+            // 行 ID を含む）をそのまま展開しない。認可前の呼び出し・エラーログ経由で
+            // 他テナントの存在情報が漏れるのを防ぐため、識別子・バックエンド詳細を含まない
+            // 固定文言に丸める（security.md テナント境界 P0）。原因の詳細は
+            // `std::error::Error::source` 経由（内部診断用途）でのみ辿れる。
+            TenantError::Catalog(_) => write!(f, "tenant boundary catalog error"),
             TenantError::TooManyVisibleRows { max } => {
                 write!(f, "too many visible rows: limit={max}")
             }
@@ -58,7 +63,14 @@ impl std::fmt::Display for TenantError {
     }
 }
 
-impl std::error::Error for TenantError {}
+impl std::error::Error for TenantError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TenantError::Catalog(e) => Some(e),
+            TenantError::TooManyVisibleRows { .. } | TenantError::HitOutsideVisibleSet => None,
+        }
+    }
+}
 
 impl From<CatalogError> for TenantError {
     fn from(e: CatalogError) -> Self {
