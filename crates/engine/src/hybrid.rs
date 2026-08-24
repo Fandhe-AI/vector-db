@@ -35,6 +35,12 @@
 //! いたら、その分だけ除外するのではなく検索全体を [`HybridError::ProviderResultRejected`]
 //! で拒否する（`core.rs::EngineCore::search` の provider 結果検証と同じ
 //! fail-closed の方向）。
+//! [`rrf_fuse`] はさらに 2 種類のリソース安全性検証を行う（3 回目の codex-review P1
+//! 指摘対応）: (1) 融合前に各入力リストの長さが `cfg.pool_depth()` を超えないことを
+//! 検証し、契約違反の provider/index が巨大な結果を返した場合の無制限なメモリ・CPU
+//! 消費を防ぐ（[`HybridError::TooManyCandidates`]）。(2) 融合後の加算結果の有限性を
+//! 検証し、有限な重み（`dense_weight`/`sparse_weight`）同士の加算がオーバーフローして
+//! `+Inf` になった場合を検知する（[`HybridError::NonFiniteScore`]）。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
 
 use std::collections::BTreeMap;
@@ -154,11 +160,12 @@ pub enum HybridError {
     InvalidConfig,
     /// [`hybrid_search`] に渡された `k` が `0` または上限超過。
     InvalidK,
-    /// 融合対象の入力リスト（密・疎いずれか。`cfg.pool_depth()` による先頭切り詰め前の
-    /// 全件が対象。P1 レビュー指摘対応: 以前は `pool_depth` 件までしか重複検査して
-    /// おらず、それを超えた位置の重複を見逃していた）に同一 id が複数回出現した。
-    /// provider・インデックス側の契約違反（バグ）として fail-closed に拒否する
-    /// （部分的に正しい融合スコアを返すより、検索全体を失敗させる方が安全側）。
+    /// 融合対象の入力リスト（密・疎いずれか。全件が対象。[`TooManyCandidates`]
+    /// (HybridError::TooManyCandidates) により各リストは高々 `cfg.pool_depth()` 件に
+    /// 制限されるため「全件」と「先頭 `pool_depth` 件」は常に一致する）に同一 id が
+    /// 複数回出現した。provider・インデックス側の契約違反（バグ）として fail-closed
+    /// に拒否する（部分的に正しい融合スコアを返すより、検索全体を失敗させる方が
+    /// 安全側）。
     DuplicateId,
     /// 融合対象の入力リスト（密・疎いずれか）が、それぞれの provider/index が定める
     /// 順位契約（スコア降順・同点 id 昇順）に従っていなかった。RRF は元スコアを見ず
@@ -167,15 +174,32 @@ pub enum HybridError {
     /// `provider_returning_hits_out_of_score_order_is_rejected` と対になる検証を、
     /// 本モジュールでも独立に行う（fail-closed）。
     UnsortedInput,
-    /// 融合対象の入力リスト（密・疎いずれか）に非有限スコア（NaN・Inf）が含まれていた。
+    /// 融合対象の入力リスト（密・疎いずれか）に非有限スコア（NaN・Inf）が含まれていた、
+    /// または各リストの入力自体は有限でも RRF の融合（`weight / (k_const + rank)` の
+    /// 加算）結果が非有限（Inf）へオーバーフローした（3 回目の codex-review P1 指摘
+    /// 対応: `RrfConfig::new` は重みの有限性・正数のみを検証し上限は課さないため、
+    /// 密・疎双方の重みに極端に大きい値（例: `f64::MAX` 近傍）を指定し、同一 id が
+    /// 両リストの上位順位に現れると、個々の入力は有限でも加算後のスコアが `f64::MAX`
+    /// を超えて `+Inf` になりうる。融合前の入力検証だけでは検知できないため、
+    /// [`accumulate_ranked`] による加算後の `scores` にも同じ検証をかける）。
     /// `f64::total_cmp` は NaN にもビットパターンに基づく全順序を与えてしまうため、
     /// 有限性を確認しないまま [`UnsortedInput`](HybridError::UnsortedInput) の順序検証
     /// （`is_sorted_desc_id_asc`）だけに頼ると、NaN が「たまたま」順序契約を満たす
     /// ビットパターンで紛れ込んだ場合に検出できず、無意味な順位で融合されてしまう
     /// （fail-open）。`core.rs::EngineCore::search` の provider 結果検証が「(2) スコア
     /// 有限性 → (5) 順序」の順で先に有限性を確認するのと同じ理由・同じ順序で、
-    /// 本モジュールでも順序検証より先に本エラーを検知する。
+    /// 本モジュールでも順序検証より先に入力の有限性を検知する（融合後の有限性検証は
+    /// 加算そのものが終わった後にしか行えないため、これとは別に行う）。
     NonFiniteScore,
+    /// 融合対象の入力リスト（密・疎いずれか）の長さが `cfg.pool_depth()` を超えていた
+    /// （3 回目の codex-review P1 指摘対応）。[`rrf_fuse`] は各リストの先頭
+    /// `cfg.pool_depth()` 件のみを融合対象として使うが、以前は長さそのものを検証せず
+    /// 全件を [`is_sorted_desc_id_asc`]・重複検査（`BTreeSet` への全件挿入）に通して
+    /// いたため、契約違反の provider・呼び出し元が `cfg.pool_depth()`（高々
+    /// `MAX_POOL_DEPTH`）を大きく超える件数を返すとその分だけ無制限にメモリ・CPU を
+    /// 消費できた（coding-rust.md「無制限確保禁止」違反）。融合前（有限性・ソート順・
+    /// 重複検査より先）に長さを検証し、超過は fail-closed に拒否する。
+    TooManyCandidates { len: usize, max: usize },
     /// 密検索 `provider`（[`SearchProvider`] trait object）が、渡した
     /// `input.ids`（可視集合）に含まれない id を 1 件でも返した（provider 実装の
     /// 契約違反）。黙って不可視 id だけを除外すると、その id が `cfg.pool_depth()`
@@ -208,6 +232,12 @@ impl fmt::Display for HybridError {
                     "dense provider returned a hit outside the visible id set"
                 )
             }
+            HybridError::TooManyCandidates { len, max } => {
+                write!(
+                    f,
+                    "hybrid fusion input list too long: {len} candidates (max {max})"
+                )
+            }
         }
     }
 }
@@ -228,27 +258,49 @@ impl From<SparseError> for HybridError {
 
 /// 密・疎それぞれの Top-k 結果を RRF で融合する純粋関数。
 ///
-/// `dense`・`sparse` はそれぞれ呼び出し元の provider/index が定める順位契約
-/// （[`SearchHit`] はスコア降順・同点 id 昇順、[`ScoredDoc`] は同様の契約）に従って
-/// 既にソート済みであることを前提とする。各リストの先頭 `cfg.pool_depth` 件のみを
-/// 融合対象として採用し、1-based 順位 `r` に対し `weight / (k_const + r)` を id ごとに
-/// 加算する（両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず
-/// 順位のみを使う（RRF の定義）。
+/// `dense`・`sparse` はそれぞれ長さが `cfg.pool_depth()` 以下であり（超過は
+/// [`HybridError::TooManyCandidates`]。3 回目の codex-review P1 指摘対応）、
+/// 呼び出し元の provider/index が定める順位契約（[`SearchHit`] はスコア降順・
+/// 同点 id 昇順、[`ScoredDoc`] は同様の契約）に従って既にソート済みであることを
+/// 前提とする。1-based 順位 `r` に対し `weight / (k_const + r)` を id ごとに加算する
+/// （両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず順位のみを
+/// 使う（RRF の定義）。
 ///
 /// 出力は融合スコア降順・同点は id 昇順（`f64::total_cmp` ベース）で確定する。
-/// 入力リスト（`dense`・`sparse` それぞれの全件。`pool_depth` による先頭切り詰め前）
-/// 内に同一 id が重複して出現した場合は [`HybridError::DuplicateId`] を返す
-/// （provider・インデックス側の契約違反を fail-closed に検知する。有限性・ソート順の
-/// 検証と同じ「全件」スコープで検査する）。
-/// 入力に非有限スコア（NaN・Inf）が含まれる場合は [`HybridError::NonFiniteScore`] を、
-/// ソート順契約に違反する場合は [`HybridError::UnsortedInput`] を返す。両者を検知
-/// する場合は必ず有限性検証を先に行う（非有限値は全順序を持たず、後続の順序検証が
-/// 無意味になるため。[`HybridError::NonFiniteScore`] のドキュメント参照）。
+/// 各リストの長さが `cfg.pool_depth()` を超える場合は、後続のアロケーションを伴う
+/// 検証（重複検査の `BTreeSet` 構築等）へ進む前に [`HybridError::TooManyCandidates`]
+/// を返す（coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
+/// 入力リスト内に同一 id が重複して出現した場合は [`HybridError::DuplicateId`] を返す
+/// （provider・インデックス側の契約違反を fail-closed に検知する）。
+/// 入力に非有限スコア（NaN・Inf）が含まれる場合、またはリスト自体は有限でも融合の
+/// 加算結果が非有限（Inf）へオーバーフローした場合は [`HybridError::NonFiniteScore`]
+/// を、ソート順契約に違反する場合は [`HybridError::UnsortedInput`] を返す。長さ・
+/// 入力有限性・ソート順・重複はこの順で検証する（[`HybridError::NonFiniteScore`]・
+/// [`HybridError::TooManyCandidates`] のドキュメント参照）。
 pub fn rrf_fuse(
     dense: &[SearchHit],
     sparse: &[ScoredDoc],
     cfg: &RrfConfig,
 ) -> Result<Vec<HybridHit>, HybridError> {
+    // 長さ検証を他のどの検証よりも先に行う。以降の検証（有限性・ソート順・重複）は
+    // いずれも入力を線形走査し、重複検査（[`has_duplicate_id`]）は走査した分だけ
+    // `BTreeSet` へ挿入するため、長さを検証せずに通すと契約違反の provider/index が
+    // `cfg.pool_depth()`（高々 `MAX_POOL_DEPTH`）を大きく超える件数を返した場合に
+    // 無制限にメモリ・CPU を消費できてしまう（[`HybridError::TooManyCandidates`]
+    // のドキュメント参照）。
+    if dense.len() > cfg.pool_depth() {
+        return Err(HybridError::TooManyCandidates {
+            len: dense.len(),
+            max: cfg.pool_depth(),
+        });
+    }
+    if sparse.len() > cfg.pool_depth() {
+        return Err(HybridError::TooManyCandidates {
+            len: sparse.len(),
+            max: cfg.pool_depth(),
+        });
+    }
+
     // スコアの有限性を順序検証より先に確認する（[`HybridError::NonFiniteScore`] の
     // ドキュメント参照）。`f64::total_cmp` は NaN にもビットパターン依存の全順序を
     // 与えてしまうため、有限性を確認しないまま順序検証だけに頼ると NaN が偶然
@@ -271,14 +323,10 @@ pub fn rrf_fuse(
         return Err(HybridError::UnsortedInput);
     }
 
-    // 重複 id 検査は入力リスト全体（`dense`・`sparse` それぞれの全件）に対して行う。
-    // [`HybridError::DuplicateId`] のドキュメント・本関数のドキュメントが「入力リスト
-    // （＝全件）に同一 id が複数回出現した場合」と定めているため、有限性・ソート順の
-    // 検証と同じ走査範囲に揃える（P1 レビュー指摘対応。以前は `accumulate_ranked` が
-    // `take(cfg.pool_depth())` した範囲内でしか重複を検知せず、`pool_depth` を超えた
-    // 位置にのみ重複がある入力を見逃していた）。同一 id・同一スコアの重複は
-    // `is_sorted_desc_id_asc` の「同点は id 昇順」判定を id が等しいまますり抜ける
-    // ため（`id < prev_id` は偽になる）、順序検証だけでは重複を検出できない。
+    // 重複 id 検査は入力リスト全体（`dense`・`sparse` それぞれの全件。長さ検証を
+    // 通過済みのため高々 `cfg.pool_depth()` 件）に対して行う。同一 id・同一スコアの
+    // 重複は `is_sorted_desc_id_asc` の「同点は id 昇順」判定を id が等しいまますり
+    // 抜けるため（`id < prev_id` は偽になる）、順序検証だけでは重複を検出できない。
     if has_duplicate_id(dense.iter().map(|h| h.id)) {
         return Err(HybridError::DuplicateId);
     }
@@ -306,6 +354,17 @@ pub fn rrf_fuse(
         cfg.sparse_weight(),
         &mut scores,
     );
+
+    // 融合後の有限性検証（3 回目の codex-review P1 指摘対応。[`HybridError::NonFiniteScore`]
+    // のドキュメント参照）。`RrfConfig::new` は重み（`dense_weight`/`sparse_weight`）の
+    // 有限性・正数のみを検証し上限は課さないため、個々の入力・加算前の各寄与
+    // （`weight / (k_const + rank)`）が有限でも、同一 id が密・疎双方の上位順位に
+    // 現れて寄与を加算した結果が `f64::MAX` を超えて `+Inf` へオーバーフローしうる。
+    // 融合前の入力検証（有限性・ソート順・重複）だけでは検知できないため、加算後の
+    // `scores` に対して独立に検証する。
+    if scores.values().any(|score| !score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
 
     let mut out: Vec<HybridHit> = scores
         .into_iter()
@@ -339,9 +398,10 @@ fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
 }
 
 /// [`rrf_fuse`] の入力検証ヘルパ。`ids` の列（`dense`・`sparse` それぞれの全件。
-/// `pool_depth` による先頭切り詰め前）に同一 id が複数回出現するかを判定する。
-/// [`accumulate_ranked`] 側では検査しない（[`rrf_fuse`] が呼び出し元であり、
-/// 有限性・ソート順の検証と同じ「全件」スコープで一度だけ検査する設計）。
+/// `rrf_fuse` の長さ検証を通過済みのため高々 `cfg.pool_depth()` 件）に同一 id が
+/// 複数回出現するかを判定する。[`accumulate_ranked`] 側では検査しない（[`rrf_fuse`]
+/// が呼び出し元であり、有限性・ソート順の検証と同じ「全件」スコープで一度だけ
+/// 検査する設計）。
 fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
     let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     for id in ids {
@@ -431,13 +491,25 @@ pub fn hybrid_search(
         k: cfg.pool_depth(),
     };
     // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
-    // 返さない」ことは型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
+    // 返さない」「要求した `k`（＝ `cfg.pool_depth()`）以下の件数しか返さない」ことは
+    // いずれも型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
+    let dense_hits: Vec<SearchHit> = provider.search(dense_input)?;
+    // 長さ検証を可視性走査より先に行う（3 回目の codex-review P1 指摘対応）。
+    // `rrf_fuse` 自身も同じ長さ検証を行うが、ここで早期に拒否することで、契約違反
+    // provider が `cfg.pool_depth()` を大きく超える件数を返した場合に直後の可視性
+    // 走査（`.iter().any(...)`）が不要な O(n) コストを払わずに済む
+    // （[`HybridError::TooManyCandidates`] のドキュメント参照）。
+    if dense_hits.len() > cfg.pool_depth() {
+        return Err(HybridError::TooManyCandidates {
+            len: dense_hits.len(),
+            max: cfg.pool_depth(),
+        });
+    }
     // 事後フィルタ（不可視 id だけを黙って除外する）はしない: 不可視 id が
     // `cfg.pool_depth()` の候補枠を占有していた場合、フィルタ後に可視ヒットを
     // 復元できず、結果件数の差から不可視データの有無が外部へ漏れる（2 回目の
     // codex-review P0 指摘対応。モジュールドキュメント参照）。1 件でも可視集合外の
     // id が含まれていたら検索全体を拒否する（fail-closed）。
-    let dense_hits: Vec<SearchHit> = provider.search(dense_input)?;
     if dense_hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
         return Err(HybridError::ProviderResultRejected);
     }
@@ -557,12 +629,11 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fuse_truncates_to_pool_depth() {
+    fn rrf_fuse_accepts_input_list_at_pool_depth_boundary() {
         let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
-        let dense = [hit(1, 3.0), hit(2, 2.0)];
+        let dense = [hit(1, 3.0)];
         let sparse: [ScoredDoc; 0] = [];
         let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
-        // pool_depth=1 のため dense の 2 位（id=2）は融合対象に入らない。
         assert_eq!(
             fused,
             vec![HybridHit {
@@ -570,6 +641,22 @@ mod tests {
                 score: 1.0 / 61.0
             }]
         );
+    }
+
+    #[test]
+    fn rrf_fuse_rejects_input_list_exceeding_pool_depth() {
+        // [P1] レビュー指摘対応（3 回目の codex-review）: 以前は各リストの長さを
+        // 検証せず `cfg.pool_depth()` を超える件数もそのまま `is_sorted_desc_id_asc`・
+        // `has_duplicate_id`（`BTreeSet` へ全件挿入）へ通していたため、契約違反の
+        // provider/index が巨大な結果を返すと無制限にメモリ・CPU を消費できた。
+        // `pool_depth=1` に対し dense を 2 件（id は重複なし）渡すと、以前は先頭
+        // 1 件だけを融合対象として静かに切り詰めていたが、現在は長さ超過そのものを
+        // `TooManyCandidates` で拒否する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
+        let dense = [hit(1, 3.0), hit(2, 2.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::TooManyCandidates { len: 2, max: 1 });
     }
 
     #[test]
@@ -606,6 +693,23 @@ mod tests {
     }
 
     #[test]
+    fn rrf_fuse_rejects_score_that_overflows_to_infinity_after_fusion() {
+        // [P1] レビュー指摘対応（3 回目の codex-review）: `RrfConfig::new` は重みの
+        // 有限性・正数のみを検証し上限は課さないため、密・疎双方の重みへ `f64::MAX`
+        // 近傍を指定して同一 id を両リストの 1 位に置くと、個々の寄与
+        // （`weight / (k_const + 1)`）は有限でも加算後の合計が `f64::MAX` を超えて
+        // `+Inf` になりうる。融合前の入力（`dense`/`sparse` それぞれのスコア）は
+        // 有限のままであり、`rrf_fuse` 冒頭の入力有限性検証だけでは検知できない
+        // （融合後の加算結果に対する検証で初めて検知できることを確認する）。
+        let k_const = 1e-300; // rank=1 の分母 (k_const + 1) をほぼ 1 にし、寄与を weight に近づける。
+        let cfg = RrfConfig::new(k_const, f64::MAX, f64::MAX, 1).unwrap();
+        let dense = [hit(1, 1.0)];
+        let sparse = [doc(1, 1.0)];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::NonFiniteScore);
+    }
+
+    #[test]
     fn rrf_fuse_rejects_duplicate_id_within_a_list() {
         let cfg = RrfConfig::default();
         let dense = [hit(1, 3.0), hit(1, 2.0)];
@@ -615,19 +719,31 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fuse_rejects_duplicate_id_beyond_pool_depth() {
-        // [P1] レビュー指摘対応: 以前は `accumulate_ranked` が `take(cfg.pool_depth())`
-        // した範囲内でしか重複 id を検査していなかったため、`pool_depth` を超えた
-        // 位置にのみ重複がある入力を見逃していた（`rrf_fuse`/`HybridError::DuplicateId`
-        // の「入力リスト（全件）に同一 id が複数回出現した場合」という契約と不整合）。
-        // `pool_depth=1` に対し、id=1 が rank=1（index 0）と rank=3（index 2）の
-        // 両方に出現する入力（スコアは降順を維持したまま）を与え、`take(1)` の範囲外
-        // （index 2）にしか重複が現れない場合でも `DuplicateId` を返すことを確認する。
+    fn rrf_fuse_rejects_duplicate_id_within_pool_depth_bound() {
+        // [P1] レビュー指摘対応（初回）: 重複 id 検査は入力リストの全件（長さ検証
+        // 通過後は高々 `cfg.pool_depth()` 件）に対して行われるべきで、
+        // `accumulate_ranked` の走査窓だけに限定してはならない。長さ検証
+        // （3 回目の codex-review P1 指摘対応。[`rrf_fuse_rejects_input_list_exceeding_pool_depth`]
+        // 参照）により `cfg.pool_depth()` を超える入力はこの検証へ到達する前に
+        // `TooManyCandidates` で拒否されるため、`pool_depth` 件ちょうどの範囲内に
+        // 重複がある入力で検証する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
+        let dense = [hit(1, 5.0), hit(1, 3.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::DuplicateId);
+    }
+
+    #[test]
+    fn rrf_fuse_rejects_input_list_exceeding_pool_depth_before_checking_duplicates() {
+        // 長さ検証は重複検査より先に行われる（検証順序の固定）。`pool_depth` を
+        // 超える長さの入力に重複 id が含まれていても、返るエラーは `DuplicateId`
+        // ではなく `TooManyCandidates` である。
         let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
         let dense = [hit(1, 5.0), hit(2, 4.0), hit(1, 3.0)];
         let sparse: [ScoredDoc; 0] = [];
         let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
-        assert_eq!(err, HybridError::DuplicateId);
+        assert_eq!(err, HybridError::TooManyCandidates { len: 3, max: 1 });
     }
 
     #[test]
@@ -833,6 +949,44 @@ mod tests {
         };
         let err = hybrid_search(&LeakyProvider, input, &index, "nomatch", 10, &cfg).unwrap_err();
         assert_eq!(err, HybridError::ProviderResultRejected);
+    }
+
+    /// [`SearchProvider`] の契約違反（要求した `input.k` を超える件数を返す実装バグ）を
+    /// 模したモック provider。返す id はすべて可視集合内かつ順位契約
+    /// （スコア降順・重複なし）を満たすため、契約違反は「件数」のみに限定される。
+    struct OverflowingProvider;
+    impl SearchProvider for OverflowingProvider {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            Ok(vec![
+                SearchHit { id: 1, score: 3.0 },
+                SearchHit { id: 2, score: 2.0 },
+                SearchHit { id: 3, score: 1.0 },
+            ])
+        }
+    }
+
+    #[test]
+    fn hybrid_search_rejects_dense_provider_returning_more_hits_than_pool_depth() {
+        // [P1] レビュー指摘対応（3 回目の codex-review）: `provider.search()` が
+        // 要求した `k`（＝ `cfg.pool_depth()`）を超える件数を返す契約違反を起こした
+        // 場合、`hybrid_search` 経由でも `rrf_fuse` の長さ検証（`TooManyCandidates`）
+        // を通ることを確認する。`pool_depth=1` に対し 3 件（すべて可視・順位契約は
+        // 満たす）を返す provider を使う。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
+        let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
+        let ids = [1u64, 2, 3];
+        let vectors = [1.0f32, 1.0, 1.0];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        let err =
+            hybrid_search(&OverflowingProvider, input, &index, "nomatch", 1, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::TooManyCandidates { len: 3, max: 1 });
     }
 
     #[test]
