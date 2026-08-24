@@ -1,0 +1,64 @@
+name: Bench
+
+# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の実行。crates/engine/benches/parallel_bench.rs
+# は時間依存の測定値を含むため PR CI（ci.yml）のアサーションには混ぜず、本 workflow を
+# 独立実行する。private submodule（docs/spec）は取得しない（README「開発環境構築」:
+# ビルド・テストは spec 抜きで成立する方針）。
+#
+# schedule トリガは意図的に外している（workflow_dispatch のみ）。CORE-5（対照エンジン
+# との中央値比較）は対照エンジンクレートの導入承認待ちで未接続であり、
+# `crates/engine/benches/parallel_bench.rs` は既定では CORE-5 を「対象外」として
+# 合否判定から明示的に除外する opt-in 方式にしている（`BENCH_CORE5=1` を注入した
+# 場合のみ「未測定＝判定不能」を fail-closed として反映する。`parallel_bench.rs`
+# 冒頭コメント参照）。対照エンジン接続がまだ完了していない段階での定期実行は
+# 誤検出・運用負担のリスクがあるため、CORE-5 が実測接続され `BENCH_CORE5=1` を
+# 既定で有効化できるようになるまでは手動実行（workflow_dispatch）のみとする。
+# CORE-5 接続後、schedule トリガ（例: `- cron: "0 3 * * 1"` 毎週月曜 03:00 UTC。
+# CI 混雑を避けるため PR/push トリガーとは独立した時間帯にする）を再度追加すること。
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # workflow_dispatch は任意の ref を選択して起動できる（デフォルトブランチ固定では
+  # ない）ため、workflow 名のみで group を一意化すると別 ref 向けの実行が先行実行を
+  # キャンセルしてしまう。ref を group に含め、同一 ref の重複実行のみ
+  # キャンセル対象にする（ci.yml の PR 番号切り分けと同種の意図）。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # bench-parallel（TASK-127 回帰ベンチ実行）
+  # --------------------------------------------------
+  # 生の steps を持つ独立ジョブとして定義するため、第三者 action（actions/checkout）は
+  # ci.yml の crash-test 系ジョブと同一の SHA 固定で参照する（AGENTS.md「CI・ワークフロー
+  # の改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
+  bench-parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-parallel
+        # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
+        # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
+        # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値の
+        # 数値そのものは載せない——`crates/engine/benches/parallel_bench.rs` が
+        # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
+        # BENCH_MIN_RECALL が未設定の場合は `parallel_bench.rs` 側が fail-closed で
+        # 非ゼロ終了する。BENCH_CORE5 は repo variable が未設定（既定）なら CORE-5 を
+        # 対象外として扱う opt-in フラグで、CORE-5 接続後にリポジトリ管理者が
+        # `gh variable set BENCH_CORE5 1` で有効化する想定（`parallel_bench.rs` 冒頭
+        # コメント参照）。
+        env:
+          BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
+          BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
+          BENCH_CORE5: ${{ vars.BENCH_CORE5 }}
+        run: make bench-parallel

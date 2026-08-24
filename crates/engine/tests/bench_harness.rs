@@ -8,6 +8,12 @@
 //! `cargo bench` 入口〔`benches/measurement.rs`〕と同一ソースを共有する構成。
 //! `harness/mod.rs` のモジュールドキュメント参照）。
 
+// TASK-127 で `harness::accept`（受け入れ判定ヘルパ）が harness へ追加された。
+// 本ファイルは harness 自体の実装契約（ab/protocol/rng/stats）を検証する専用テストで
+// `accept` は `tests/bench_accept.rs` 側が検証するため経由しない。未到達の `pub` 項目が
+// dead_code として警告されうる（`measurement.rs`・`parallel_smoke.rs` と同一の理由・
+// 対処。`harness/mod.rs` 自体は変更しない）。
+#[allow(dead_code)]
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 

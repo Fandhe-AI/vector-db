@@ -1,8 +1,12 @@
 //! 性能計測プロトコル基盤（TASK-158。ポインタ: `docs/spec/05-tasks.md` TASK-158）。
 //!
-//! TASK-127（SIMD 検索ベンチ）・TASK-130（GPU vs CPU-SIMD A/B 回帰）・TASK-83 等、
+//! TASK-127（性能・Recall 受け入れ基準の回帰ベンチ）・TASK-130（GPU vs CPU-SIMD A/B 回帰）・TASK-83 等、
 //! 性能系の受け入れ基準を測定・再測定するタスクは、独自に計測ループを書かず
 //! 必ず本モジュール経由で計測する契約とする。
+//!
+//! [`accept`] は測定結果（p95・Recall・対照比）を数値基準と突き合わせる時間非依存の
+//! 判定ヘルパを提供する（TASK-127）。計測そのもの（`protocol`・`ab`）とは責務を分け、
+//! `tests/bench_accept.rs` から実測タイマーに依存せず単体検証できるようにしている。
 //!
 //! 対象ビヘイビア ID なし（基盤タスク。CORE-3〜6・SEARCH-4・SQL-1 等の測定条件を
 //! 担保する下支え）。
@@ -35,6 +39,7 @@
 // 各利用側はサブモジュール経由（`harness::protocol::...` 等）で必要な識別子のみ
 // 個別に import する。
 pub mod ab;
+pub mod accept;
 pub mod protocol;
 pub mod rng;
 pub mod stats;

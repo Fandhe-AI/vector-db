@@ -47,3 +47,16 @@ test = false
 name = "parallel_smoke"
 harness = false
 test = false
+
+[[bench]]
+# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の回帰ゲート入口。実測対象は
+# `ParallelSearchProvider`（スカラー並列実装。SIMD 演算は未実装）であり、ファイル名も
+# それに合わせる（`parallel_bench.rs` 冒頭コメント参照）。harness = false / test = false
+# は上記 2 ベンチと同一方針（時間依存の測定値を make ci のアサーションへ混ぜない）。
+# `make bench-parallel`（Makefile）・`.github/workflows/bench.yml`
+# （workflow_dispatch による手動実行。CORE-5 未接続の間は schedule 停止中）から
+# 実行する。判定ロジック自体（時間非依存）は harness/accept.rs にあり
+# tests/bench_accept.rs で make ci 側から回帰検証する。
+name = "parallel_bench"
+harness = false
+test = false

@@ -46,6 +46,24 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ターゲット一覧は `make help` で確認できます。
 
+### 回帰ベンチの repo variables（TASK-127）
+
+`.github/workflows/bench.yml`（`workflow_dispatch` のみ。理由は後述）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）と `BENCH_MIN_RECALL`（Recall@k 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+
+```bash
+gh variable set BENCH_MAX_P95_MS
+gh variable set BENCH_MIN_RECALL
+```
+
+未設定のまま `workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+
+CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続です（TASK-127。`.claude/rules/dependency-policy.md`。Issue #35 で追跡中）。CORE-5 の判定は `BENCH_CORE5` repo variable による opt-in 方式です。
+
+- 未設定（既定）: CORE-5 は「対象外」として標準出力へ明示され、合否判定には含まれません。CORE-3（p95 レイテンシ）・CORE-4（Recall@k）のみで合否を返します
+- `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
+
+対照エンジン接続がまだ完了していない段階での定期実行は誤検出・運用負担のリスクがあるため、`bench.yml` は schedule トリガを意図的に外し `workflow_dispatch`（手動実行）のみとしています。CORE-5 接続後、bench.yml 冒頭コメントの手順に従って schedule トリガを再度追加し、`BENCH_CORE5=1` を既定で有効化してください。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。
