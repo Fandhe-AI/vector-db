@@ -447,7 +447,14 @@ def _post_json(
 
 
 def generate_answer(config: EvalConfig, api_key: str | None, question: str, context: str) -> str:
-    """質問＋上位コンテキストを LLM に送って回答を生成させる（回答生成フェーズ）。"""
+    """質問＋上位コンテキストを LLM に送って回答を生成させる（回答生成フェーズ）。
+
+    fail-closed: レスポンスが想定形状でない・content が空の場合は RuntimeError を送出する。
+    _extract_message_text() の空文字列をそのまま返すと、API 異常が「空の回答」として
+    grader に渡って INCORRECT（不正解）に計上され、正答率をモデル性能とは無関係に
+    引き下げてしまう。例外化して run_evaluation() のサンプル単位隔離に乗せ、
+    UNKNOWN（判定不能）として記録させる（API 異常とモデルの不正解を混同しない）。
+    """
     payload = {
         "model": config.model,
         "messages": [
@@ -465,7 +472,13 @@ def generate_answer(config: EvalConfig, api_key: str | None, question: str, cont
         config.max_retries,
         config.max_response_bytes,
     )
-    return _extract_message_text(response)
+    answer = _extract_message_text(response)
+    if not answer.strip():
+        raise RuntimeError(
+            "answer generation returned an empty or malformed response "
+            "(missing/unexpected 'choices' shape or empty content)"
+        )
+    return answer
 
 
 def _sanitize_for_prompt(value: str) -> str:

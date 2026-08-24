@@ -470,6 +470,67 @@ class ExtractMessageTextTest(unittest.TestCase):
         self.assertEqual(aa._extract_message_text({"choices": {"unexpected": "shape"}}), "")
 
 
+class GenerateAnswerMalformedResponseTest(unittest.TestCase):
+    """P1: 回答生成の API 異常（形状不正・空 content）を INCORRECT でなく UNKNOWN として集計させることを検証する。"""
+
+    def _generate_with_response(self, response: dict) -> str:
+        def fake_post_json(_endpoint, _payload, _api_key, _timeout, _retries, _max_bytes):
+            return response
+
+        original_post_json = aa._post_json
+        aa._post_json = fake_post_json
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config = aa.load_config(
+                    _write_config(tmp, {"llm_endpoint": "http://127.0.0.1:9/v1/chat/completions"})
+                )
+                return aa.generate_answer(config, None, "q", "c")
+        finally:
+            aa._post_json = original_post_json
+
+    def test_missing_choices_raises_runtime_error(self):
+        # choices 欠落の異常応答を「空の回答」として grader に渡さない（例外化）。
+        with self.assertRaises(RuntimeError):
+            self._generate_with_response({})
+
+    def test_empty_content_raises_runtime_error(self):
+        with self.assertRaises(RuntimeError):
+            self._generate_with_response({"choices": [{"message": {"content": "   "}}]})
+
+    def test_valid_content_is_returned(self):
+        answer = self._generate_with_response({"choices": [{"message": {"content": "Paris"}}]})
+        self.assertEqual(answer, "Paris")
+
+    def test_malformed_generation_response_is_recorded_as_unknown(self):
+        # run_evaluation() のサンプル単位隔離により、API 異常サンプルは INCORRECT では
+        # なく UNKNOWN（判定不能）として記録され、正答率の分母にのみ入ることを検証する。
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            os.environ[config.api_key_env] = "dummy-test-key"
+            self.addCleanup(lambda: os.environ.pop(config.api_key_env, None))
+
+            def fake_post_json(_endpoint, _payload, _api_key, _timeout, _retries, _max_bytes):
+                # 回答生成が choices 欠落の異常応答を受けるケース。generate_answer() が
+                # 例外化するため採点フェーズには到達しない。
+                return {}
+
+            original_post_json = aa._post_json
+            aa._post_json = fake_post_json
+            try:
+                report = aa.run_evaluation(config, dry_run=False)
+            finally:
+                aa._post_json = original_post_json
+
+            self.assertEqual(report.total, 2)
+            for result in report.results:
+                self.assertEqual(result.label, aa.LABEL_UNKNOWN)
+                self.assertIn("sample failed", result.reason)
+
+
 class DryRunScoringPromptValidationTest(unittest.TestCase):
     def test_dry_run_raises_when_scoring_prompt_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
