@@ -35,8 +35,8 @@ use std::path::Path;
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
-use crate::parallel_search::ParallelSearchProvider;
 use crate::policy::{PolicyContext, PolicyError};
+use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 
 /// 検索 `k` の上限。上限検証前にアロケーションへ使わないための防御的定数
@@ -144,20 +144,20 @@ pub trait VectorCore: Send + Sync {
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
 ///
 /// 実行バックエンド実装型へ直接依存せず `Box<dyn SearchProvider>` で保持する（CORE-13）。
-/// 既定コンストラクタ（[`Self::open`]）は CPU-only の
-/// [`ParallelSearchProvider`](crate::parallel_search::ParallelSearchProvider)（TASK-126・
-/// マルチスレッド並列の総当たり Top-k。ベクトル化は行わない）を注入し、この構成だけで
-/// 全機能が成立する。
+/// 既定コンストラクタ（[`Self::open`]）は `search_engine::default_engine()`（TASK-131・
+/// CORE-9。現時点は CPU-only のマルチスレッド並列総当たり Top-k、ベクトル化は行わない）を
+/// 注入し、この構成だけで全機能が成立する。将来の ANN provider 追加は
+/// `search_engine.rs` 側の選択肢拡張で完結し、本構造体・`VectorCore` の API は変わらない。
 pub struct EngineCore {
     storage: Storage,
     provider: Box<dyn SearchProvider>,
 }
 
 impl EngineCore {
-    /// 指定パスの `redb` データベースを開き、既定の CPU provider を注入した
-    /// `EngineCore` を構築する。
+    /// 指定パスの `redb` データベースを開き、既定の検索エンジン
+    /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::with_provider(path, Box::new(ParallelSearchProvider))
+        Self::with_provider(path, search_engine::default_engine())
     }
 
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。

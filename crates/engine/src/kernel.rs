@@ -6,8 +6,8 @@
 //! [`CpuScalarProvider`] と、Top-k 選出の共通ヘルパ [`TopKSelector`] を提供する。
 //! `TopKSelector` は `crates/engine/src/parallel_search.rs::ParallelSearchProvider`（TASK-126）
 //! とも共用し、選出規約（スコア降順・同点 id 昇順・非有限値除外）の二重管理を防ぐ。
-//! 既定コンストラクタが実際にどちらの provider を注入するかは `core.rs::EngineCore::open`
-//! を参照。
+//! 既定コンストラクタが実際にどちらの provider を注入するかは `search_engine.rs`
+//! （TASK-131・CORE-9 の差し替え点確定化レイヤ）経由で `core.rs::EngineCore::open` を参照。
 //!
 //! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12 の方針先取り。
 //! ディスパッチ決定表は TASK-155 の範囲）。

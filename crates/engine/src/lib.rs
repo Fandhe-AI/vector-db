@@ -26,7 +26,9 @@
 //! SEARCH-8。方式（クロスエンコーダ等）の最終選定・効果測定回帰は後続タスクの管轄）・
 //! TASK-128（バッチクエリ・一括インデクシング専用の検索エンジン `batch_search`。対象
 //! ビヘイビア: CORE-6, CORE-7, CORE-16。単発クエリ経路 `core::EngineCore` へは
-//! 構造的に接続しない）。プロトコル層
+//! 構造的に接続しない）・TASK-131（`search_engine.rs`。CORE-9 の差し替え点を
+//! `kernel.rs::SearchProvider`（CORE-13）へ一本化する検索エンジン選択・構築レイヤ。
+//! `core::EngineCore::open` の既定 provider 構築経路）。プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!
@@ -44,6 +46,7 @@ pub mod parallel_search;
 pub mod policy;
 pub mod rerank;
 pub mod row_codec;
+pub mod search_engine;
 pub mod sparse;
 pub mod storage;
 pub mod txn;
