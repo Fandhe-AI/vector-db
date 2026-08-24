@@ -191,6 +191,55 @@ class LoadDatasetTest(unittest.TestCase):
                 aa.load_dataset(data_path)
 
 
+class LoadDatasetReadFailureTest(unittest.TestCase):
+    """P1: データ読み取り経路の OSError・不正 UTF-8 を未処理 traceback にせず DatasetError へ変換する。"""
+
+    def test_invalid_utf8_dataset_raises_dataset_error(self):
+        # UnicodeDecodeError は OSError のサブクラスではないため、OSError のみの捕捉では
+        # 不正エンコーディングのファイルが未処理 traceback になる（fail-closed 経路の検証）。
+        with tempfile.TemporaryDirectory() as tmp:
+            data_path = Path(tmp) / "data.jsonl"
+            data_path.write_bytes(b'\xff\xfe\x00invalid utf-8 bytes\x80\x81')
+            with self.assertRaises(aa.DatasetError):
+                aa.load_dataset(data_path)
+
+    def test_directory_data_path_raises_dataset_error(self):
+        # data_path にディレクトリを指定すると exists() は通過し open() が
+        # IsADirectoryError（OSError 系）を送出する。DatasetError へ変換されることを検証する。
+        with tempfile.TemporaryDirectory() as tmp:
+            dir_path = Path(tmp) / "data-as-dir"
+            dir_path.mkdir()
+            with self.assertRaises(aa.DatasetError):
+                aa.load_dataset(dir_path)
+
+
+class ScoringPromptReadFailureTest(unittest.TestCase):
+    """P1: 採点プロンプト読み込みの不正 UTF-8 も DatasetError（明示エラー終了経路）へ変換する。"""
+
+    def test_invalid_utf8_scoring_prompt_raises_dataset_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+
+            config.scoring_prompt_path.write_bytes(b'\xff\xfe\x80 broken prompt')
+
+            with self.assertRaises(aa.DatasetError):
+                aa.run_evaluation(config, dry_run=True)
+
+
+class ConfigReadFailureTest(unittest.TestCase):
+    """P1: 設定ファイルの不正 UTF-8 も ConfigError（明示エラー終了経路）へ変換する。"""
+
+    def test_invalid_utf8_config_raises_config_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.json"
+            config_path.write_bytes(b'\xff\xfe\x80 broken config')
+            with self.assertRaises(aa.ConfigError):
+                aa.load_config(config_path)
+
+
 class SampleDatasetTest(unittest.TestCase):
     def test_sample_smaller_than_population(self):
         records = [{"id": str(i)} for i in range(10)]

@@ -168,9 +168,11 @@ def _require_type(value: Any, expected: type, key: str) -> Any:
 
 def load_config(config_path: Path) -> EvalConfig:
     """設定ファイルを読み込み検証する。必須キー欠落・型不正・上限超過は ConfigError で即終了させる。"""
+    # UnicodeError も捕捉する: 不正な UTF-8 の設定ファイルは UnicodeDecodeError
+    # （OSError ではない）を送出するため、明示エラー終了経路（ConfigError）へ変換する。
     try:
         raw_text = config_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"failed to read config file: {config_path} ({exc})") from exc
 
     try:
@@ -279,46 +281,54 @@ def load_dataset(data_path: Path) -> list[dict[str, str]]:
         )
 
     records: list[dict[str, str]] = []
-    with data_path.open(encoding="utf-8") as f:
-        line_no = 0
-        while True:
-            # readline(limit+1) を使う: 素の `for line in f` は改行のない巨大な 1 行を
-            # 上限チェック前に丸ごとメモリへ確保してしまうため、読み取り自体を上限で止める。
-            chunk = f.readline(HARD_MAX_DATASET_LINE_CHARS + 1)
-            if chunk == "":
-                break
-            line_no += 1
-            if len(chunk) > HARD_MAX_DATASET_LINE_CHARS:
-                raise DatasetError(
-                    f"line at {data_path}:{line_no} exceeds "
-                    f"{HARD_MAX_DATASET_LINE_CHARS} byte limit"
-                )
-            line = chunk.strip()
-            if not line:
-                continue
-            if len(records) >= HARD_MAX_DATASET_RECORDS:
-                raise DatasetError(
-                    f"dataset at {data_path} exceeds {HARD_MAX_DATASET_RECORDS} record limit"
-                )
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise DatasetError(f"invalid JSON at {data_path}:{line_no}: {exc}") from exc
-            if not isinstance(record, dict):
-                raise DatasetError(f"record at {data_path}:{line_no} must be a JSON object")
-            for key in ("id", "question", "context", "expected_answer"):
-                if key not in record:
-                    raise DatasetError(f"record at {data_path}:{line_no} missing key '{key}'")
-                if not isinstance(record[key], str):
+    # open()〜readline() の読み取り経路全体を try で覆う: ファイルオープン失敗
+    # （権限不足・ディレクトリ指定・競合削除等の OSError）や不正な UTF-8 バイト列
+    # （UnicodeDecodeError。OSError のサブクラスではないため別途捕捉が必要）を
+    # 変換しないまま main() の外へ抜けさせると未処理 traceback になる。
+    # データ読み取り経路全体を DatasetError（fail-closed の明示エラー終了経路）へ変換する。
+    try:
+        with data_path.open(encoding="utf-8") as f:
+            line_no = 0
+            while True:
+                # readline(limit+1) を使う: 素の `for line in f` は改行のない巨大な 1 行を
+                # 上限チェック前に丸ごとメモリへ確保してしまうため、読み取り自体を上限で止める。
+                chunk = f.readline(HARD_MAX_DATASET_LINE_CHARS + 1)
+                if chunk == "":
+                    break
+                line_no += 1
+                if len(chunk) > HARD_MAX_DATASET_LINE_CHARS:
                     raise DatasetError(
-                        f"record at {data_path}:{line_no} field '{key}' must be a string"
+                        f"line at {data_path}:{line_no} exceeds "
+                        f"{HARD_MAX_DATASET_LINE_CHARS} byte limit"
                     )
-                if len(record[key]) > HARD_MAX_DATASET_FIELD_CHARS:
+                line = chunk.strip()
+                if not line:
+                    continue
+                if len(records) >= HARD_MAX_DATASET_RECORDS:
                     raise DatasetError(
-                        f"record at {data_path}:{line_no} field '{key}' exceeds "
-                        f"{HARD_MAX_DATASET_FIELD_CHARS} character limit"
+                        f"dataset at {data_path} exceeds {HARD_MAX_DATASET_RECORDS} record limit"
                     )
-            records.append(record)
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise DatasetError(f"invalid JSON at {data_path}:{line_no}: {exc}") from exc
+                if not isinstance(record, dict):
+                    raise DatasetError(f"record at {data_path}:{line_no} must be a JSON object")
+                for key in ("id", "question", "context", "expected_answer"):
+                    if key not in record:
+                        raise DatasetError(f"record at {data_path}:{line_no} missing key '{key}'")
+                    if not isinstance(record[key], str):
+                        raise DatasetError(
+                            f"record at {data_path}:{line_no} field '{key}' must be a string"
+                        )
+                    if len(record[key]) > HARD_MAX_DATASET_FIELD_CHARS:
+                        raise DatasetError(
+                            f"record at {data_path}:{line_no} field '{key}' exceeds "
+                            f"{HARD_MAX_DATASET_FIELD_CHARS} character limit"
+                        )
+                records.append(record)
+    except (OSError, UnicodeError) as exc:
+        raise DatasetError(f"failed to read dataset file: {data_path} ({exc})") from exc
 
     if not records:
         raise DatasetError(f"dataset at {data_path} contains no records")
@@ -579,9 +589,12 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
     # README が「配線検証」と説明する dry-run 経路が、本番実行時にのみ露見する
     # scoring_prompt_path の欠落・読み取り不可を検知できなくなる。読み込みをここに一本化し、
     # 後段で再度 read_text() する二重読み込み（＝ガードされない 2 回目の OSError 経路）を作らない。
+    # UnicodeError も捕捉する: read_text(encoding="utf-8") は不正な UTF-8 バイト列で
+    # UnicodeDecodeError（OSError ではなく UnicodeError 系）を送出するため、OSError のみの
+    # 捕捉では不正エンコーディングのプロンプトファイルが未処理 traceback になる。
     try:
         scoring_prompt = config.scoring_prompt_path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise DatasetError(f"failed to read scoring prompt: {config.scoring_prompt_path} ({exc})") from exc
 
     if dry_run:
