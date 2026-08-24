@@ -565,6 +565,19 @@ impl FallbackBatchEngine {
             batch_tenants.insert(q.ctx.tenant_id());
         }
 
+        // ポインタ: TASK-89 / TABLE-9（`policy.rs::PolicyContext::is_visible` の
+        // 判定に整合させる）。`run_batch_search`（`batch_search.rs`）側から
+        // バッチ外テナントの行が返りうるケースがあるため、この独立
+        // 再検証（`revalidate_primary_hits`）はその経路とは別に自前で
+        // `id_to_tenant` を組むため、`run_batch_search` と同じ拡張をここにも
+        // 反映しないと、正当な hit を `TenantMaskViolation` として誤検知する
+        // （`ctx.tenant_id()` を行テナントとして渡すことで許可集合だけを
+        // `is_visible` 経由で判定する。`batch_search.rs::run_batch_search` の
+        // 同名ロジック参照）。
+        let public_grant_query_count_nonzero = queries
+            .iter()
+            .any(|q| q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public));
+
         // id → (tenant, visibility) の逆引き表。`self.cpu.ids` は
         // `ResidentMatrix::build`（[`Self::build`] 内で先に呼ばれる）が
         // 一意性を検証済みのため、id は (tenant, visibility) を一意に決める。
@@ -572,7 +585,11 @@ impl FallbackBatchEngine {
             .cpu
             .tenant_ids
             .iter()
-            .filter(|t| batch_tenants.contains(t.as_str()))
+            .zip(self.cpu.visibilities.iter())
+            .filter(|(t, v)| {
+                batch_tenants.contains(t.as_str())
+                    || (public_grant_query_count_nonzero && **v == Visibility::Public)
+            })
             .count();
         let mut id_to_tenant: HashMap<u64, (&str, Visibility)> = HashMap::new();
         id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
@@ -587,7 +604,9 @@ impl FallbackBatchEngine {
             .zip(self.cpu.tenant_ids.iter())
             .zip(self.cpu.visibilities.iter())
         {
-            if batch_tenants.contains(tenant.as_str()) {
+            let is_reachable_public =
+                public_grant_query_count_nonzero && *visibility == Visibility::Public;
+            if batch_tenants.contains(tenant.as_str()) || is_reachable_public {
                 id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
             }
         }
@@ -744,6 +763,13 @@ mod tests {
 
     fn ctx(tenant: &str) -> PolicyContext {
         PolicyContext::new(tenant).expect("valid tenant id")
+    }
+
+    /// `Private` を明示許可した [`PolicyContext`] のテスト用ショートハンド。
+    /// テナント分離そのものを検証するテストは `Private` フィクスチャと組で使う
+    /// （ポインタ: TASK-89 / TABLE-9）。
+    fn private_ctx(tenant: &str) -> PolicyContext {
+        PolicyContext::with_visibilities(tenant, [Visibility::Private]).expect("valid tenant id")
     }
 
     struct RecordingObserver {
@@ -938,6 +964,45 @@ mod tests {
         .expect("build ok")
     }
 
+    /// [`build_engine_with_backend`] と同じ id・テナント・ベクトル配置だが、全行
+    /// `Private` にした版。テナント分離そのものを検証するテストは本フィクスチャを
+    /// 使う（ポインタ: TASK-89 / TABLE-9）。
+    fn build_engine_with_backend_private(
+        backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
+        observer: Box<dyn FallbackObserver>,
+    ) -> FallbackBatchEngine {
+        let ids = [1u64, 2, 3, 4];
+        let tenant_ids = [
+            "tenant-a".to_string(),
+            "tenant-a".to_string(),
+            "tenant-b".to_string(),
+            "tenant-b".to_string(),
+        ];
+        let visibilities = [
+            Visibility::Private,
+            Visibility::Private,
+            Visibility::Private,
+            Visibility::Private,
+        ];
+        #[rustfmt::skip]
+        let vectors = [
+            1.0, 0.0,
+            0.0, 1.0,
+            2.0, 0.0,
+            0.0, 2.0,
+        ];
+        FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &vectors,
+            backend_factory,
+            observer,
+        )
+        .expect("build ok")
+    }
+
     /// primary バックエンドの実行時エラーを注入するモック（本体へテスト専用
     /// API を追加せず、`BatchBackend` trait をテストコード側で実装する
     /// エラー注入手段。Issue #137 対応の test-support feature 撤廃方針を踏襲）。
@@ -1000,6 +1065,14 @@ mod tests {
 
     // オラクル: 可視行だけを渡した `kernel::CpuScalarProvider::search` の結果
     // （スコア降順・同点 id 昇順まで完全一致）と縮退後の Top-k を突き合わせる。
+    //
+    // `batch_search.rs::run_batch_search` は行外側ループの計算量最適化として、
+    // 行をその `tenant_id` に一致するクエリ集合に加え、TASK-89（TABLE-9）
+    // 対応で他テナントの `Public` 許可クエリからも候補にする
+    // （`public_grant_query_indices`）。最終判定は常に
+    // `PolicyContext::is_visible` の単一照合パスへ委ねるため、オラクルも
+    // 同じ述語（`ctx.is_visible(tenant, Visibility::Public)`）だけで
+    // 可視行を絞り込む（テナント一致の事前フィルタは行わない）。
     fn oracle_search(
         ids: &[u64],
         tenant_ids: &[&str],
@@ -1222,11 +1295,12 @@ mod tests {
     }
 
     // マルチテナントバッチで縮退後も他テナント行の混入 0 件であること・
-    // クエリごとに独立した結果順序が保たれることを検証する。
+    // クエリごとに独立した結果順序が保たれることを検証する。`Private`
+    // フィクスチャで検証する（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn fallback_search_does_not_leak_rows_across_tenants_in_multi_tenant_batch() {
         let observer = RecordingObserver::new();
-        let engine = build_engine_with_backend(
+        let engine = build_engine_with_backend_private(
             |_matrix| {
                 Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
                     "lost".to_string(),
@@ -1234,8 +1308,8 @@ mod tests {
             },
             Box::new(observer),
         );
-        let ctx_a = ctx("tenant-a");
-        let ctx_b = ctx("tenant-b");
+        let ctx_a = private_ctx("tenant-a");
+        let ctx_b = private_ctx("tenant-b");
         let query_a = [1.0f32, 1.0];
         let query_b = [1.0f32, 1.0];
         let queries = vec![
@@ -1416,10 +1490,11 @@ mod tests {
 
     // 他テナントの実在 id（tenant-b の行 id=3）を tenant-a のクエリへ混入させる
     // 悪性バックエンドは拒否される（本指摘のコア: マスク漏れ・結果破損による
-    // 他テナントの存在情報漏えいを防ぐ）。
+    // 他テナントの存在情報漏えいを防ぐ）。id=3 が引き続き tenant-a から不可視で
+    // あることを保つ `Private` フィクスチャで検証する（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn revalidation_rejects_other_tenant_id() {
-        let engine = build_engine_with_backend(
+        let engine = build_engine_with_backend_private(
             |_matrix| {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
@@ -1431,7 +1506,7 @@ mod tests {
             },
             Box::new(RecordingObserver::new()),
         );
-        let ctx_a = ctx("tenant-a");
+        let ctx_a = private_ctx("tenant-a");
         let query = [1.0f32, 0.0];
         let queries = vec![BatchQuery {
             vector: &query,
@@ -1679,7 +1754,10 @@ mod tests {
     // observer への通知も一切発生しない（違反はデバイス恒久故障とは異なる
     // 種類の異常であり、`runtime_latched` を流用すると 2 回目以降が `Ok` を
     // 返すようになり検知結果が消えてしまうため。`revalidate_primary_hits` の
-    // ドキュメンテーションコメント「ラッチ決定」参照）。
+    // ドキュメンテーションコメント「ラッチ決定」参照）。id=3 が引き続き tenant-a
+    // から不可視であることを保つ `Private` フィクスチャで検証する
+    // （`revalidation_rejects_other_tenant_id` と同じ方針。ポインタ:
+    // TASK-89 / TABLE-9）。
     #[test]
     fn revalidation_violation_does_not_latch_and_emits_no_fallback_event() {
         let observer = std::sync::Arc::new(RecordingObserver::new());
@@ -1689,7 +1767,7 @@ mod tests {
                 self.0.on_fallback(event);
             }
         }
-        let engine = build_engine_with_backend(
+        let engine = build_engine_with_backend_private(
             |_matrix| {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
@@ -1701,7 +1779,7 @@ mod tests {
             },
             Box::new(ArcObserver(observer.clone())),
         );
-        let ctx_a = ctx("tenant-a");
+        let ctx_a = private_ctx("tenant-a");
         let query = [1.0f32, 0.0];
         let queries = vec![BatchQuery {
             vector: &query,
