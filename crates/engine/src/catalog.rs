@@ -704,24 +704,28 @@ impl Storage {
     }
 
     /// テーブルスコープで複数行の `tenant_id`・`visibility`（ヘッダのみ）を一括取得する
-    /// （TASK-133、対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が構築時
-    /// スナップショット上の Top-k ヒット id ごとに検索時点の現在の行状態を再検証し、
-    /// インデックス構築後の update/delete による失効行の漏えいを防ぐために呼ぶ
+    /// （TASK-133、対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が provider を
+    /// 呼ぶ**前**にアリーナの全 id について検索時点の現在の行状態を再検証し、インデックス
+    /// 構築後の update/delete による失効行のベクトルが provider へ渡ることを防ぐために呼ぶ
     /// （codex-review P0 指摘・PR #151 対応）。embedding・metadata はデコードせず
     /// `decode_row_tenant_and_visibility` のみを使う（[`Self::get_row_from_table`] と異なり
-    /// 埋め込み全体を読まないため、ヒット件数分呼んでも DoS 耐性を保つ）。
+    /// 埋め込み全体を読まないため、アリーナの全行数分呼んでも DoS 耐性を保つ）。
     ///
     /// `ids` に対応する 1 回の `read_txn` だけを張る（id ごとに個別トランザクションを
-    /// 張らない）。戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在しない
-    /// （削除済み、または行テーブル自体が未作成）場合はその位置に `None` を入れる
+    /// 張らない）。これにより、1 回の呼び出しで検証する id 集合は単一のストレージ
+    /// スナップショットに対して一貫する（`rls.rs::PrefilterIndex::search` の「一貫性契約」
+    /// ドキュメント参照）。戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在
+    /// しない（削除済み、または行テーブル自体が未作成）場合はその位置に `None` を入れる
     /// （`CatalogError::RowNotFound` へ丸め込まない。呼び出し元が「削除済み行は不可視扱いに
     /// する」という fail-closed 判断を行えるようにするため。テーブル自体が不存在の場合のみ
     /// 通常どおり `CatalogError::TableNotFound` を返す）。
     ///
     /// `ids.len()` に上限は課さない（無制限確保を避けるための呼び出し元側の責務。現在の
-    /// 唯一の呼び出し元 `rls.rs::PrefilterIndex::search` は `provider_result_is_valid` で
-    /// 事前に `hits.len() <= k <= MAX_SEARCH_K` を確認済みの `hits` から `ids` を作るため
-    /// 無制限にならない。将来別の呼び出し元を追加する場合は同様の上限を先に満たすこと）。
+    /// 唯一の呼び出し元 `rls.rs::PrefilterIndex::search` は、`PrefilterIndex::build`
+    /// （`VectorArena::build_filtered` 経由の構築）時点で `arena.rs::MAX_ARENA_ROWS`
+    /// （1,000,000 行）により上限が課されたアリーナの全 id（`self.arena.ids()`。呼び出し元・
+    /// provider の入力に依存しない値）を渡すため無制限にならない。将来別の呼び出し元を
+    /// 追加する場合は同様の上限を先に満たすこと）。
     pub(crate) fn get_row_headers_from_table(
         &self,
         table_name: &str,

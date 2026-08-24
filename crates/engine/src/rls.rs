@@ -14,9 +14,10 @@
 //! [`crate::arena::VectorArena::build_filtered`] を呼び、可視行だけを保持する縮約ビューを
 //! 作る。以後の検索はこの構築時スナップショットのベクトル・id 集合に対してのみ行われる
 //! （書き込みは検索対象の追加/除外としては反映されない）。ただし
-//! [`PrefilterIndex::search`] は返却直前に候補ヒットの現在の行状態
-//! （`tenant_id`・`visibility`）をストレージへ引き直して再検証するため、構築後に
-//! update/delete で失効した行はスナップショットに残っていても返らない（下記・
+//! [`PrefilterIndex::search`] は **provider を呼ぶ前** にアリーナが保持する全 id の現在の
+//! 行状態（`tenant_id`・`visibility`）をストレージへ引き直して構築時の値と厳密に照合する
+//! ため、構築後に update/delete で失効した行はスナップショットに残っていても provider へ
+//! ベクトルが渡ることすらなく検索全体が拒否される（下記「失効行の全件事前検証」・
 //! codex-review P0 指摘・PR #151 対応）。`PrefilterIndex` は構築時に束縛した
 //! `PolicyContext` の複製（テナント ID・許可可視性集合）を保持し、
 //! [`PrefilterIndex::search`] は呼び出し時に渡された `PolicyContext` とこの複製の完全一致
@@ -25,14 +26,21 @@
 //! （テナント境界 P0。codex-review P0 指摘・PR #151 対応: 以前は `search` が ctx を
 //! 受け取らず、構築時 ctx との一致を検証していなかった）。
 //!
-//! **失効行の再検証（codex-review P0 指摘・PR #151 対応）**: 構築時 ctx との一致だけでは
-//! 「インデックス構築後にストレージ側で該当行の tenant/visibility が変更・削除された」
-//! ケースを検出できない（ctx 自体は変わらないため）。[`PrefilterIndex::search`] は
-//! provider から候補ヒットを受け取った後、[`crate::storage::Storage::get_row_headers_from_table`]
-//! で該当 id の現在の `tenant_id`・`visibility` を読み直し、`ctx.is_visible` で
-//! 再照合する。1 件でも「現在は不可視/不存在」であれば、部分的に結果を間引くのではなく
-//! クエリ全体を [`RlsError::IndexStale`] で fail-closed に拒否する（呼び出し元へ
-//! [`PrefilterIndex::build`] の再実行を要求する。テナント境界 P0）。
+//! **失効行の全件事前検証（codex-review P0 指摘・PR #151 対応）**: 構築時 ctx との一致
+//! だけでは「インデックス構築後にストレージ側で該当行の tenant/visibility が変更・削除
+//! された」ケースを検出できない（ctx 自体は変わらないため）。当初はヒット確定後にヒット
+//! id だけを再検証していたが、これには 2 つの P0 があった: (1) provider は検証より前に
+//! アリーナの全ベクトルを観測済みのため、事後拒否では provider（untrusted）が既に失効行の
+//! ベクトルを見た事実を取り消せない、(2) ヘッダ取得とその後の可視性評価・結果返却の間に
+//! 別の書き込みが挟まっても検出できない（TOCTOU）。[`PrefilterIndex::search`] は
+//! provider を呼ぶ**前**に、[`crate::storage::Storage::get_row_headers_from_table`]
+//! （1 回の呼び出しで単一の read トランザクション上に閉じる）でアリーナの**全 id**の
+//! 現在の `tenant_id`・`visibility` を読み直し、構築時にアリーナへ格納した値と厳密に
+//! 一致するか照合する。1 件でも不一致・不存在であれば provider を一切呼ばずに
+//! [`RlsError::IndexStale`] で fail-closed に拒否する（呼び出し元へ
+//! [`PrefilterIndex::build`] の再実行を要求する。テナント境界 P0）。設計判断の詳細・
+//! 一貫性契約（返却結果がどの時点のスナップショットに対して一貫するか）は
+//! [`PrefilterIndex::search`] のドキュメント参照。
 //! なお、tenant/visibility は変わらず embedding 本体だけが更新された場合のスコアは
 //! 依然として構築時点の値のまま返る（この再検証はテナント境界の失効検出が目的で、
 //! embedding 鮮度の保証はスコープ外。完全な鮮度が必要な呼び出し元は `build` を
@@ -92,12 +100,14 @@ pub enum RlsError {
     /// に拒否する（`Display` はテナント ID・可視性集合を含まない。テナント境界 P0・
     /// codex-review P0 指摘・PR #151 対応）。
     ContextMismatch,
-    /// [`PrefilterIndex::search`] が候補ヒットの現在の行状態を再検証した結果、構築時点の
-    /// スナップショットに残っている行が検索時点では不可視・不存在になっていた
-    /// （テーブル側の update/delete によるポリシー失効）。`Display` は id・テナント ID を
-    /// 含めない（他テナントの存在情報を漏らさないため。security.md P0）。呼び出し元は
-    /// [`PrefilterIndex::build`] を呼び直して再構築すること（codex-review P0 指摘・
-    /// PR #151 対応）。
+    /// [`PrefilterIndex::search`] が provider を呼ぶ**前**にアリーナの全 id の現在の行状態を
+    /// 再検証した結果、構築時点のスナップショットに残っている行のうち 1 件以上が検索時点
+    /// では構築時と異なる状態（tenant/visibility の変更・行の削除）になっていた（テーブル
+    /// 側の update/delete によるポリシー失効）。この検証は provider 呼び出しより前に完了
+    /// するため、失効行のベクトルが provider（untrusted）へ渡ることはない。`Display` は
+    /// id・テナント ID を含めない（他テナントの存在情報を漏らさないため。security.md P0）。
+    /// 呼び出し元は [`PrefilterIndex::build`] を呼び直して再構築すること（codex-review P0
+    /// 指摘・PR #151 対応）。
     IndexStale,
     /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約に違反した
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
@@ -230,21 +240,77 @@ impl<'s> PrefilterIndex<'s> {
     /// テナント境界の照合が完結する構造にする）。
     ///
     /// 一致後は `core.rs::EngineCore::search` と同一の前段検証（`k` の範囲・`query` の
-    /// 次元/有限性）を行った上で provider を 1 回だけ呼び、戻り値を共有ヘルパ
+    /// 次元/有限性）を行う。
+    ///
+    /// **失効行の全件事前検証（codex-review P0 指摘・PR #151 対応）**: 以前はヒット確定後に
+    /// ヒット id だけを再検証していたが、これには 2 つの P0 があった。(1) provider は
+    /// 検証より前にアリーナの**全ベクトル**を観測済みのため、事後に `IndexStale` で
+    /// 拒否しても provider（untrusted）が既に失効行のベクトルを見た事実は取り消せない。
+    /// (2) ヘッダ取得の `read_txn` は取得完了時に閉じ、その後の `ctx.is_visible` 評価から
+    /// `Ok(hits)` 返却までの間に別の書き込みが挟まっても検出できない（TOCTOU）。
+    /// 本実装はこれらを 1 つの機構で解消する: provider を呼ぶ**前**に、アリーナが保持する
+    /// **全 id**（ヒットだけでなく全件。`self.storage.get_row_headers_from_table` は
+    /// 呼び出しごとに単一の `read_txn` を張るため、この全件チェックは 1 つの一貫した
+    /// スナップショット上で行われる）について、現在の `tenant_id`・`visibility` を
+    /// [`crate::arena::VectorArena::tenant_id`]・[`crate::arena::VectorArena::visibility`]
+    /// が保持する**構築時の値**と正確に一致するか検証する（`ctx.is_visible` の再評価では
+    /// なく厳密な等値比較。可視性を保ったまま Public→Private のように値が変わっただけの
+    /// 行も「構築時と状態が変わった」ものとして検出するため）。1 件でも不一致・不存在で
+    /// あれば、provider を一切呼ばずに [`RlsError::IndexStale`] で fail-closed に拒否する
+    /// （(1) の解消: 失効行のベクトルが provider のアドレス空間へ渡ること自体を防ぐ）。
+    /// 全件一致した場合のみ、その直後に provider を呼ぶ。
+    ///
+    /// **一貫性契約**: 全件検証の完了から provider 呼び出しまでの間・provider 呼び出しから
+    /// 返却までの間に別の書き込みトランザクションがコミットされても、本メソッドはそれを
+    /// 検出するための追加読み取りを行わない（後述の理由により、全件検証以降は
+    /// ストレージへ一切アクセスしない）。したがって本メソッドの返却値は
+    /// **「全件検証を行った時点のストレージスナップショットに対して一貫」**であり、
+    /// 「呼び出しが返った瞬間の最新状態」との一致は保証しない。次回の `search` 呼び出しは
+    /// 改めて全件検証をやり直すため、失効は次回呼び出し以降に確実に検出される
+    /// （永続的な見逃しにはならない）。
+    ///
+    /// **全件検証後にヒット限定の再検証を行わない理由**（(2) の解消）: `hits` は直後の
+    /// `provider_result_is_valid` により必ずアリーナの `visible_id_set`（＝全件検証の対象
+    /// だった id 集合）の部分集合であることが保証される。`get_row_headers_from_table` は
+    /// 呼び出しのたびに新しい `read_txn`（redb のスナップショット分離）を張るため、
+    /// 全件検証と同じ `read_txn` を使い回さない限り、ヒット限定の再検証は「同じ id 集合の
+    /// 部分集合に対して**別の**スナップショットで再読取りする」操作になり、全件検証より
+    /// 弱い保証しか生まない（別スナップショットである以上、全件検証時点では見えていな
+    /// かった別の書き込みを新たに拾ってしまう可能性があり、それは「全件検証時点の
+    /// スナップショットに対して一貫」という上記契約とは別の話になる）。一方、
+    /// `get_row_headers_from_table` の呼び出しを `rls.rs` から橋渡しして同一 `read_txn`
+    /// を使い回す設計（呼び出し元へ `redb::ReadTransaction` を公開する、または
+    /// `search` 全体を `catalog.rs` 側のメソッドとして実装し直す）は、`ReadTransaction` と
+    /// そこから開いた `redb::ReadOnlyTable` を同一構造体に保持する自己参照構造が必要になり
+    /// （安全に実現するには `unsafe` か新規依存が要る。いずれも
+    /// `.claude/rules/coding-rust.md`・`.claude/rules/dependency-policy.md` で原則禁止）、
+    /// かつ untrusted かつ実行時間が不定な provider 呼び出しの間 `read_txn` を握り続ける
+    /// ことになり、それ自体がリソース保持の観点で望ましくない。以上の理由から、
+    /// 「provider 呼び出し前の全件検証」を単一の情報源とし、ヒット限定の事後再検証は行わない
+    /// （全件検証の結果を超える追加情報を生まないため冗長）。
+    ///
+    /// **全件検証のコスト**（DoS 耐性）: 検証対象はアリーナの id 数（`self.arena.len()`）で、
+    /// [`Self::build`] が使う [`crate::arena::VectorArena::build_filtered`] の構築時容量
+    /// 上限（`arena.rs::MAX_ARENA_ROWS` = 1,000,000 行）により既に上限が課されている。
+    /// つまり本検証は既存の DoS 対策の範囲内であり、新たに無制限な確保・走査を持ち込まない
+    /// （行ごとに読むのはヘッダ（`tenant_id`・`visibility`）のみで embedding は読まない。
+    /// [`crate::storage::Storage::get_row_headers_from_table`] のドキュメント参照）。
+    /// 一方、従来のヒット限定検証（`O(k)`、`k <= MAX_SEARCH_K = 10,000`）と比べるとコストは
+    /// 増加する（最大 100 倍・`String` アロケーションを伴う）。この設計変更のトレードオフ
+    /// （本モジュールが元々解決対象としていた「クエリ毎の前段コスト」の一部を再び持ち込む
+    /// 形になる点）はテナント境界 P0 の是正を優先した結果であり、呼び出し元への性能影響は
+    /// 別途フォローアップの検討対象とする。
+    ///
+    /// 全件検証を通過した場合のみ provider を 1 回呼び、戻り値を共有ヘルパ
     /// `provider_result_is_valid`（`core.rs`）で再検証する。provider は untrusted
     /// 実装でありうるため、1 件でも契約違反があれば結果を一切返さず
     /// [`RlsError::ProviderResultRejected`] で拒否する（fail-closed。`core.rs`
-    /// モジュールドキュメントの二重防御と同じ設計。この検証は構築時アリーナの
-    /// `visible_id_set`（メモリ上・I/O なし）とだけ突き合わせるため、ストレージへの
-    /// 再検証読み取りより先に行う。provider が捏造した id で本モジュールを
-    /// ストレージ探索オラクルにできないようにするため）。
-    ///
-    /// 上記を通過したヒットについて、[`Self::build`] に渡されたストレージ（`self.storage`。
-    /// 引数では受け取らない。モジュール doc「再検証対象ストレージの束縛」参照）から該当 id
-    /// の**現在の** `tenant_id`・`visibility` を読み直し、`ctx.is_visible` で再照合する
-    /// （構築後の update/delete による失効検出。モジュールドキュメント参照）。1 件でも
-    /// 「現在は不可視/不存在」であれば、部分的に間引かずクエリ全体を
-    /// [`RlsError::IndexStale`] で fail-closed に拒否する。
+    /// モジュールドキュメントの二重防御と同じ設計）。全件検証で使う id は
+    /// `self.arena.ids()`（[`Self::build`] 時に確定した、呼び出し元・provider の入力に
+    /// 一切依存しない値）のみであり、provider が捏造した id がストレージ読み取りへ
+    /// 渡ることはない（provider をストレージ探索オラクルにできない。この検証順序に
+    /// なったことで、ヒット確定後にストレージを読んでいた以前の版よりもオラクル耐性は
+    /// 強化されている）。
     pub fn search(
         &self,
         ctx: &PolicyContext,
@@ -267,9 +333,44 @@ impl<'s> PrefilterIndex<'s> {
             return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
         }
 
-        // 保持済みアリーナは構築時点で可視行だけへ絞り込み済みのため、`ids`/`vectors` を
-        // そのまま provider へ渡せる（不可視データは provider のアドレス空間へ渡らない。
-        // `core.rs::EngineCore::search` と同じ境界）。
+        // 失効行の全件事前検証（上記ドキュメント参照）。`self.arena.ids()` は構築時に
+        // 確定済みの信頼できる id 一覧であり、provider・呼び出し元の入力を経由しない。
+        // `CatalogError`（redb I/O エラー・行ヘッダのデコード不正のいずれも含む）は
+        // 種別を区別せず一律 `IndexStale` に丸め込む。`build` は同種のエラーを
+        // `RlsError::Arena` へ透過するのに対し非対称だが、ここでは「現在の状態を
+        // 確認できない」こと自体を fail-closed に「再構築が必要」として扱うのが目的であり、
+        // エラー種別の詳細を呼び出し元へ伝える必要がない（他テナントの存在情報も
+        // 含めない。security.md P0）。
+        let arena_ids = self.arena.ids();
+        let headers = self
+            .storage
+            .get_row_headers_from_table(self.arena.table_name(), arena_ids)
+            .map_err(|_| RlsError::IndexStale)?;
+        if headers.len() != arena_ids.len() {
+            return Err(RlsError::IndexStale);
+        }
+        for (index, header) in headers.iter().enumerate() {
+            let Some((current_tenant, current_visibility)) = header else {
+                // 構築時には存在した行が検索時点では存在しない（削除相当）。
+                return Err(RlsError::IndexStale);
+            };
+            // 構築時アリーナが保持する tenant_id・visibility との厳密な等値比較。
+            // `ctx.is_visible` の再評価ではない点に注意（上記ドキュメント参照）:
+            // 可視性を保ったまま値が変化した行（例: Public→Private だが ctx が両方
+            // 許可）も「構築時と状態が変わった」ものとして検出するため。
+            let built_tenant = self.arena.tenant_id(index);
+            let built_visibility = self.arena.visibility(index);
+            if built_tenant != Some(current_tenant.as_str())
+                || built_visibility != Some(*current_visibility)
+            {
+                return Err(RlsError::IndexStale);
+            }
+        }
+
+        // 保持済みアリーナは構築時点で可視行だけへ絞り込み済みであり、かつ上記の全件検証を
+        // 通過したため、`ids`/`vectors` をそのまま provider へ渡せる（不可視・失効データは
+        // provider のアドレス空間へ渡らない。`core.rs::EngineCore::search` と同じ境界＋
+        // 本モジュール独自の失効検出）。
         let input = SearchInput {
             ids: self.arena.ids(),
             vectors: self.arena.vectors(),
@@ -281,35 +382,6 @@ impl<'s> PrefilterIndex<'s> {
 
         if !provider_result_is_valid(&hits, k, &self.visible_id_set) {
             return Err(RlsError::ProviderResultRejected);
-        }
-
-        // 失効行の再検証（codex-review P0 指摘・PR #151 対応）: ここまでの検証は構築時
-        // スナップショットの範囲内にヒットが収まっていることしか確認しない。構築後に
-        // ストレージ側で該当行の tenant/visibility が変更・削除されていれば、依然として
-        // 古い状態のまま返してしまう。1 回の read トランザクションでヒット id 分の
-        // ヘッダだけを引き直し、`ctx.is_visible` で現在の可視性を再照合する。
-        // `get_row_headers_from_table` の呼び出し件数は `hits.len()`。`hits` は直前の
-        // `provider_result_is_valid` で `hits.len() <= k <= MAX_SEARCH_K` を確認済みのため、
-        // ここで無制限にはならない（`get_row_headers_from_table` 自体は `pub(crate)` で
-        // 上限を持たないため、将来別の呼び出し元を追加する場合はこの前提を呼び出し側で
-        // 満たすこと）。
-        let hit_ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
-        // `CatalogError`（redb I/O エラー・行ヘッダのデコード不正のいずれも含む）は
-        // 種別を区別せず一律 `IndexStale` に丸め込む。`build` は同種のエラーを
-        // `RlsError::Arena` へ透過するのに対し非対称だが、ここでは「現在の可視性を
-        // 確認できない」こと自体を fail-closed に「再構築が必要」として扱うのが目的であり、
-        // エラー種別の詳細を呼び出し元へ伝える必要がない（他テナントの存在情報も
-        // 含めない。security.md P0）。
-        let headers = self
-            .storage
-            .get_row_headers_from_table(self.arena.table_name(), &hit_ids)
-            .map_err(|_| RlsError::IndexStale)?;
-        let all_still_visible = headers.len() == hit_ids.len()
-            && headers
-                .iter()
-                .all(|h| matches!(h, Some((tenant, vis)) if ctx.is_visible(tenant, *vis)));
-        if !all_still_visible {
-            return Err(RlsError::IndexStale);
         }
 
         Ok(hits)
@@ -903,5 +975,130 @@ mod tests {
             index_a.is_empty(&ctx_b),
             Err(RlsError::ContextMismatch)
         ));
+    }
+
+    /// 呼び出し回数を記録してから [`CpuScalarProvider`] へ委譲する計装 provider
+    /// （`tests/rls_prefilter.rs::CountingProvider` と同型の複製。crate 内 unit test
+    /// モジュールから統合テストのヘルパーへは到達できないため複製する）。
+    /// 失効行の全件事前検証（codex-review P0 指摘・PR #151 対応）が provider 呼び出し**前**に
+    /// 完結していることを、この呼び出し回数で直接観測する。
+    struct RecordingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl RecordingProvider {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl SearchProvider for RecordingProvider {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            CpuScalarProvider.search(input)
+        }
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0・指摘 1）: 失効した行が
+    // Top-k の**外**（クエリに対するスコアが最下位）であっても、provider は一切呼ばれない
+    // ことを呼び出し回数で直接検証する。従来のヒット限定の事後検証では、この行は
+    // 元々 Top-1 に入らないため再検証対象にすらならず、provider は失効行のベクトルを
+    // 含むアリーナ全体を既に観測済みだった（漏えいが検出前に完了していた）。全件事前検証
+    // により、provider はそもそも呼ばれない。
+    #[test]
+    fn search_rejects_before_calling_provider_even_when_the_stale_row_is_outside_top_k() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        // クエリ [1.0, 0.0] に対する内積スコア: id=1 が最高位（1.0）、id=2 が中位（0.5）、
+        // id=3 が最下位（0.1）。k=1 なら id=3 は本来 Top-k に入らない。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            3,
+            "tenant-a",
+            Visibility::Public,
+            &[0.1, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // 構築後、Top-1 には入らない id=3 だけを他テナントへ書き換える。
+        insert(
+            &storage,
+            "docs",
+            3,
+            "tenant-b",
+            Visibility::Public,
+            &[0.1, 0.0],
+        );
+
+        let provider = RecordingProvider::new();
+        let result = index.search(&ctx, &provider, &[1.0, 0.0], 1);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "provider must not be called once any arena row fails the pre-check"
+        );
+    }
+
+    // codex-review P0 指摘・PR #151 対応: ストレージが構築後に変化していない場合は、
+    // 全件事前検証を通過して provider がちょうど 1 回呼ばれ、結果が返ることを確認する
+    // （全件検証の追加が過剰拒否・provider 呼び出し省略を引き起こしていないことのガード）。
+    #[test]
+    fn search_calls_provider_exactly_once_when_no_row_is_stale() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        let provider = RecordingProvider::new();
+        let hits = index
+            .search(&ctx, &provider, &[1.0, 0.0], 1)
+            .expect("search ok");
+        assert_eq!(provider.call_count(), 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
     }
 }
