@@ -12,14 +12,31 @@
 //! 限定し、本モジュール独自のテナント比較を新設しない（security.md P0）。
 //! [`PrefilterIndex::build`] は構築時に渡された `PolicyContext` の可視性述語で
 //! [`crate::arena::VectorArena::build_filtered`] を呼び、可視行だけを保持する縮約ビューを
-//! 作る。以後の検索はこの構築時スナップショットに対してのみ行われ、構築後の書き込みは
-//! 反映しない（[`PrefilterIndex::build`] のドキュメント参照）。`PrefilterIndex` は構築時に
-//! 束縛した `PolicyContext` の複製（テナント ID・許可可視性集合）を保持し、
+//! 作る。以後の検索はこの構築時スナップショットのベクトル・id 集合に対してのみ行われる
+//! （書き込みは検索対象の追加/除外としては反映されない）。ただし
+//! [`PrefilterIndex::search`] は返却直前に候補ヒットの現在の行状態
+//! （`tenant_id`・`visibility`）をストレージへ引き直して再検証するため、構築後に
+//! update/delete で失効した行はスナップショットに残っていても返らない（下記・
+//! codex-review P0 指摘・PR #151 対応）。`PrefilterIndex` は構築時に束縛した
+//! `PolicyContext` の複製（テナント ID・許可可視性集合）を保持し、
 //! [`PrefilterIndex::search`] は呼び出し時に渡された `PolicyContext` とこの複製の完全一致
 //! （`PartialEq`）を fail-closed に照合する。別テナント・可視性が狭化/拡大された ctx で
 //! 同一インデックスを転用しようとした場合は [`RlsError::ContextMismatch`] で拒否する
 //! （テナント境界 P0。codex-review P0 指摘・PR #151 対応: 以前は `search` が ctx を
 //! 受け取らず、構築時 ctx との一致を検証していなかった）。
+//!
+//! **失効行の再検証（codex-review P0 指摘・PR #151 対応）**: 構築時 ctx との一致だけでは
+//! 「インデックス構築後にストレージ側で該当行の tenant/visibility が変更・削除された」
+//! ケースを検出できない（ctx 自体は変わらないため）。[`PrefilterIndex::search`] は
+//! provider から候補ヒットを受け取った後、[`crate::storage::Storage::get_row_headers_from_table`]
+//! で該当 id の現在の `tenant_id`・`visibility` を読み直し、`ctx.is_visible` で
+//! 再照合する。1 件でも「現在は不可視/不存在」であれば、部分的に結果を間引くのではなく
+//! クエリ全体を [`RlsError::IndexStale`] で fail-closed に拒否する（呼び出し元へ
+//! [`PrefilterIndex::build`] の再実行を要求する。テナント境界 P0）。
+//! なお、tenant/visibility は変わらず embedding 本体だけが更新された場合のスコアは
+//! 依然として構築時点の値のまま返る（この再検証はテナント境界の失効検出が目的で、
+//! embedding 鮮度の保証はスコープ外。完全な鮮度が必要な呼び出し元は `build` を
+//! 呼び直すこと）。
 //!
 //! `core.rs::EngineCore`（`VectorCore::search`）への prefilter インデックスのキャッシュ
 //! 統合・API 変更は本タスクのスコープ外（`VectorCore` trait のシグネチャは変更しない）。
@@ -59,6 +76,13 @@ pub enum RlsError {
     /// に拒否する（`Display` はテナント ID・可視性集合を含まない。テナント境界 P0・
     /// codex-review P0 指摘・PR #151 対応）。
     ContextMismatch,
+    /// [`PrefilterIndex::search`] が候補ヒットの現在の行状態を再検証した結果、構築時点の
+    /// スナップショットに残っている行が検索時点では不可視・不存在になっていた
+    /// （テーブル側の update/delete によるポリシー失効）。`Display` は id・テナント ID を
+    /// 含めない（他テナントの存在情報を漏らさないため。security.md P0）。呼び出し元は
+    /// [`PrefilterIndex::build`] を呼び直して再構築すること（codex-review P0 指摘・
+    /// PR #151 対応）。
+    IndexStale,
     /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約に違反した
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
     /// `provider_result_is_valid` で行う。fail-closed: 違反があれば結果を一切返さない）。
@@ -77,6 +101,10 @@ impl std::fmt::Display for RlsError {
             RlsError::ContextMismatch => write!(
                 f,
                 "policy context does not match the context the index was built with"
+            ),
+            RlsError::IndexStale => write!(
+                f,
+                "prefilter index is stale: rebuild required before searching again"
             ),
             RlsError::ProviderResultRejected => write!(
                 f,
@@ -104,8 +132,11 @@ impl From<KernelError> for RlsError {
 ///
 /// [`Self::build`] 構築時に束縛した [`PolicyContext`] の可視性述語で
 /// [`VectorArena::build_filtered`] を呼び、可視行のみのカラムナ表現を保持する。
-/// 構築後の書き込みはこのインデックスへ反映されない（構築時点のスナップショット）。
-/// 可視率・ポリシーが変わる場合は [`Self::build`] を呼び直して再構築する必要がある。
+/// 検索対象の候補集合（構築時点でどの行が挙がるか）は構築後の書き込みを反映しない
+/// スナップショットのままだが、[`Self::search`] は返却直前にヒット行の現在の
+/// tenant/visibility をストレージへ再照合するため、構築後に失効した行は結果に混入しない
+/// （モジュールドキュメント「失効行の再検証」参照）。可視率・ポリシーが大きく変わる場合や
+/// embedding 本体の鮮度が必要な場合は [`Self::build`] を呼び直して再構築する必要がある。
 ///
 /// [`Self::len`]・[`Self::is_empty`]・[`Self::dim`]・[`Self::table_name`] は `ctx` を
 /// 要求しない点に注意: これらは構築時 ctx のテナントに束縛されたメタデータ（可視行数・
@@ -173,10 +204,21 @@ impl PrefilterIndex {
     /// `provider_result_is_valid`（`core.rs`）で再検証する。provider は untrusted
     /// 実装でありうるため、1 件でも契約違反があれば結果を一切返さず
     /// [`RlsError::ProviderResultRejected`] で拒否する（fail-closed。`core.rs`
-    /// モジュールドキュメントの二重防御と同じ設計）。
+    /// モジュールドキュメントの二重防御と同じ設計。この検証は構築時アリーナの
+    /// `visible_id_set`（メモリ上・I/O なし）とだけ突き合わせるため、ストレージへの
+    /// 再検証読み取りより先に行う。provider が捏造した id で本モジュールを
+    /// ストレージ探索オラクルにできないようにするため）。
+    ///
+    /// 上記を通過したヒットについて、`storage`（`table` は [`Self::build`] に渡したものと
+    /// 同一であること）から該当 id の**現在の** `tenant_id`・`visibility` を読み直し、
+    /// `ctx.is_visible` で再照合する（構築後の update/delete による失効検出。モジュール
+    /// ドキュメント参照）。1 件でも「現在は不可視/不存在」であれば、部分的に間引かず
+    /// クエリ全体を [`RlsError::IndexStale`] で fail-closed に拒否する（別の `storage` を
+    /// 渡した場合は全ヒットが不存在扱いになり、同じく `IndexStale` になる）。
     pub fn search(
         &self,
         ctx: &PolicyContext,
+        storage: &Storage,
         provider: &dyn SearchProvider,
         query: &[f32],
         k: usize,
@@ -211,6 +253,35 @@ impl PrefilterIndex {
         if !provider_result_is_valid(&hits, k, &self.visible_id_set) {
             return Err(RlsError::ProviderResultRejected);
         }
+
+        // 失効行の再検証（codex-review P0 指摘・PR #151 対応）: ここまでの検証は構築時
+        // スナップショットの範囲内にヒットが収まっていることしか確認しない。構築後に
+        // ストレージ側で該当行の tenant/visibility が変更・削除されていれば、依然として
+        // 古い状態のまま返してしまう。1 回の read トランザクションでヒット id 分の
+        // ヘッダだけを引き直し、`ctx.is_visible` で現在の可視性を再照合する。
+        // `get_row_headers_from_table` の呼び出し件数は `hits.len()`。`hits` は直前の
+        // `provider_result_is_valid` で `hits.len() <= k <= MAX_SEARCH_K` を確認済みのため、
+        // ここで無制限にはならない（`get_row_headers_from_table` 自体は `pub(crate)` で
+        // 上限を持たないため、将来別の呼び出し元を追加する場合はこの前提を呼び出し側で
+        // 満たすこと）。
+        let hit_ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        // `CatalogError`（redb I/O エラー・行ヘッダのデコード不正のいずれも含む）は
+        // 種別を区別せず一律 `IndexStale` に丸め込む。`build` は同種のエラーを
+        // `RlsError::Arena` へ透過するのに対し非対称だが、ここでは「現在の可視性を
+        // 確認できない」こと自体を fail-closed に「再構築が必要」として扱うのが目的であり、
+        // エラー種別の詳細を呼び出し元へ伝える必要がない（他テナントの存在情報も
+        // 含めない。security.md P0）。
+        let headers = storage
+            .get_row_headers_from_table(self.arena.table_name(), &hit_ids)
+            .map_err(|_| RlsError::IndexStale)?;
+        let all_still_visible = headers.len() == hit_ids.len()
+            && headers
+                .iter()
+                .all(|h| matches!(h, Some((tenant, vis)) if ctx.is_visible(tenant, *vis)));
+        if !all_still_visible {
+            return Err(RlsError::IndexStale);
+        }
+
         Ok(hits)
     }
 
@@ -262,10 +333,18 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    // プロセス内グローバル通番。`SystemTime::now()` の実測分解能はプラットフォームにより
+    // ナノ秒より粗いため、同一 tick で並行実行された複数スレッドが `duration_since` の値だけで
+    // 一時ディレクトリ名を組み立てると衝突しうる（`storage.rs::tests::unique_db_path`・
+    // `arena.rs` の同種ヘルパーと同じ `SEQ.fetch_add` 対策。並列テスト実行時の
+    // `DatabaseAlreadyOpen` フレーク回避）。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn tempdir() -> TempDir {
         let mut dir = std::env::temp_dir();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = format!(
-            "engine-rls-test-{}-{}",
+            "engine-rls-test-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -335,7 +414,7 @@ mod tests {
         assert_eq!(index.len(), 1);
 
         let hits = index
-            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
@@ -363,7 +442,7 @@ mod tests {
         assert!(index.is_empty());
 
         let hits = index
-            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 5)
+            .search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 5)
             .expect("search ok");
         assert!(hits.is_empty());
     }
@@ -398,11 +477,17 @@ mod tests {
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
         assert!(matches!(
-            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 0),
+            index.search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 0),
             Err(RlsError::InvalidK { k: 0 })
         ));
         assert!(matches!(
-            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], MAX_SEARCH_K + 1),
+            index.search(
+                &ctx,
+                &storage,
+                &CpuScalarProvider,
+                &[1.0, 0.0],
+                MAX_SEARCH_K + 1
+            ),
             Err(RlsError::InvalidK { .. })
         ));
     }
@@ -426,11 +511,11 @@ mod tests {
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
         assert!(matches!(
-            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0, 0.0], 1),
+            index.search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0, 0.0], 1),
             Err(RlsError::Kernel(KernelError::DimMismatch { .. }))
         ));
         assert!(matches!(
-            index.search(&ctx, &CpuScalarProvider, &[f32::NAN, 0.0], 1),
+            index.search(&ctx, &storage, &CpuScalarProvider, &[f32::NAN, 0.0], 1),
             Err(RlsError::Kernel(KernelError::NonFiniteQuery))
         ));
     }
@@ -464,14 +549,14 @@ mod tests {
         let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
         let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
         let hits = index_a
-            .search(&ctx_a, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx_a, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert!(hits.iter().all(|h| h.id == 1));
 
         let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
         let index_b = PrefilterIndex::build(&storage, "docs", &ctx_b).expect("build index");
         let hits = index_b
-            .search(&ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx_b, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert!(hits.iter().all(|h| h.id == 2));
     }
@@ -508,7 +593,7 @@ mod tests {
         let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
 
         let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
-        let result = index_a.search(&ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10);
+        let result = index_a.search(&ctx_b, &storage, &CpuScalarProvider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::ContextMismatch)));
     }
 
@@ -537,7 +622,7 @@ mod tests {
 
         let ctx_narrowed = PolicyContext::new("tenant-a").expect("valid tenant");
         assert!(matches!(
-            index.search(&ctx_narrowed, &CpuScalarProvider, &[1.0, 0.0], 10),
+            index.search(&ctx_narrowed, &storage, &CpuScalarProvider, &[1.0, 0.0], 10),
             Err(RlsError::ContextMismatch)
         ));
 
@@ -547,7 +632,7 @@ mod tests {
                 .expect("valid tenant");
         assert_eq!(ctx_same, ctx_private);
         let hits = index
-            .search(&ctx_same, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx_same, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("identical context must be accepted");
         assert_eq!(hits.len(), 1);
     }
@@ -580,7 +665,7 @@ mod tests {
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
         assert!(matches!(
-            index.search(&ctx_widened, &CpuScalarProvider, &[1.0, 0.0], 10),
+            index.search(&ctx_widened, &storage, &CpuScalarProvider, &[1.0, 0.0], 10),
             Err(RlsError::ContextMismatch)
         ));
     }
@@ -615,7 +700,148 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
-        let result = index.search(&ctx, &RogueProvider, &[1.0, 0.0], 1);
+        let result = index.search(&ctx, &storage, &RogueProvider, &[1.0, 0.0], 1);
         assert!(matches!(result, Err(RlsError::ProviderResultRejected)));
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: インデックス構築後に対象行の
+    // tenant_id がストレージ側で書き換わり（構築時に可視だった行が他テナントへ移った）、
+    // 同一 ctx で検索してもスナップショットに残った旧行を返さず `RlsError::IndexStale` で
+    // fail-closed に拒否する。これが本 P0 指摘そのもの（build 後の失効行の漏えい）。
+    #[test]
+    fn search_rejects_when_a_hit_row_tenant_changed_after_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // 構築後に行 1 を他テナントへ書き換える（同一 id への upsert）。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-b",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let result = index.search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: tenant_id は変わらず
+    // visibility だけが構築時 ctx の許可範囲外へ書き換わった場合も同様に
+    // `RlsError::IndexStale` で拒否する。
+    #[test]
+    fn search_rejects_when_a_hit_row_visibility_changed_after_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // 構築後に行 1 の visibility を ctx が許可しない Private へ書き換える。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+
+        let result = index.search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // 未変更のストレージに対しては引き続き正常にヒットを返すことを確認する
+    // （再検証の追加で過剰拒否（over-rejection）を起こしていないことのガード）。
+    #[test]
+    fn search_still_returns_hits_when_storage_is_unchanged_since_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        let hits = index
+            .search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .expect("search ok");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: 行削除相当のケース
+    // （現時点で本クレートに行削除 API はないため、構築時とは別の `Storage` を検索時に渡し、
+    // 「ヒット id がストレージ上に存在しない」再検証パス（`get_row_headers_from_table` の
+    // `None` 分岐）を再現する。ドキュメント記載どおり、構築時と異なる `storage` を渡した
+    // 場合は全ヒットが不存在扱いになり `RlsError::IndexStale` になることを確認する）。
+    #[test]
+    fn search_rejects_when_a_hit_row_is_absent_from_the_storage_passed_to_search() {
+        let dir_a = tempdir();
+        let storage_a = open_storage(dir_a.path());
+        storage_a
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage_a,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage_a, "docs", &ctx).expect("build index");
+
+        // 検索時には別の `Storage`（同じテーブルは存在するが id=1 は存在しない）を渡す。
+        // 行テーブル自体は存在させる（`TableNotFound` ではなく `None` 分岐を通すため）。
+        let dir_b = tempdir();
+        let storage_b = open_storage(dir_b.path());
+        storage_b
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage_b,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let result = index.search(&ctx, &storage_b, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
     }
 }

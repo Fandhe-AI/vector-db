@@ -25,7 +25,7 @@ use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
+use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -701,6 +701,55 @@ impl Storage {
         };
         let guard = row_table.get(id)?.ok_or(CatalogError::RowNotFound(id))?;
         crate::storage::decode_row(id, guard.value()).map_err(convert_storage_error)
+    }
+
+    /// テーブルスコープで複数行の `tenant_id`・`visibility`（ヘッダのみ）を一括取得する
+    /// （TASK-133、対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が構築時
+    /// スナップショット上の Top-k ヒット id ごとに検索時点の現在の行状態を再検証し、
+    /// インデックス構築後の update/delete による失効行の漏えいを防ぐために呼ぶ
+    /// （codex-review P0 指摘・PR #151 対応）。embedding・metadata はデコードせず
+    /// `decode_row_tenant_and_visibility` のみを使う（[`Self::get_row_from_table`] と異なり
+    /// 埋め込み全体を読まないため、ヒット件数分呼んでも DoS 耐性を保つ）。
+    ///
+    /// `ids` に対応する 1 回の `read_txn` だけを張る（id ごとに個別トランザクションを
+    /// 張らない）。戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在しない
+    /// （削除済み、または行テーブル自体が未作成）場合はその位置に `None` を入れる
+    /// （`CatalogError::RowNotFound` へ丸め込まない。呼び出し元が「削除済み行は不可視扱いに
+    /// する」という fail-closed 判断を行えるようにするため。テーブル自体が不存在の場合のみ
+    /// 通常どおり `CatalogError::TableNotFound` を返す）。
+    ///
+    /// `ids.len()` に上限は課さない（無制限確保を避けるための呼び出し元側の責務。現在の
+    /// 唯一の呼び出し元 `rls.rs::PrefilterIndex::search` は `provider_result_is_valid` で
+    /// 事前に `hits.len() <= k <= MAX_SEARCH_K` を確認済みの `hits` から `ids` を作るため
+    /// 無制限にならない。将来別の呼び出し元を追加する場合は同様の上限を先に満たすこと）。
+    pub(crate) fn get_row_headers_from_table(
+        &self,
+        table_name: &str,
+        ids: &[u64],
+    ) -> Result<Vec<Option<(String, Visibility)>>> {
+        validate_identifier(table_name)?;
+        let read_txn = self.db().begin_read()?;
+        require_table_exists_read(&read_txn, table_name)?;
+        let row_table_name = user_rows_table_name(table_name);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let row_table = match read_txn.open_table(row_table_def) {
+            Ok(t) => t,
+            // 行テーブル自体が未作成（1 行も挿入していない）= 全 id が不存在。
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![None; ids.len()]),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            match row_table.get(id)? {
+                None => out.push(None),
+                Some(guard) => {
+                    let header = crate::storage::decode_row_tenant_and_visibility(guard.value())
+                        .map_err(convert_storage_error)?;
+                    out.push(Some(header));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// テーブルスコープで行 ID 昇順に最大 `limit` 件を走査する上限付きページング API
