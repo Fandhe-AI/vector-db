@@ -22,8 +22,10 @@
 //!   （[`min_recall_from_env`]。両 provider とも厳密最近傍のため、本質的には
 //!   並列実装の Top-k 一致を確認する回帰チェック。詳細は本文の CORE-4 セクション参照）
 //! - CORE-5: 対照エンジンとの中央値比較。対照エンジンクレートの導入がユーザー承認必須
-//!   （`.claude/rules/dependency-policy.md`）のため本 PR では未接続（判定関数
-//!   [`harness::accept::check_contrast_ratio_within_limit`] のみ用意。
+//!   （`.claude/rules/dependency-policy.md`）のため本 PR では未接続。未接続の間は
+//!   「未測定」を「判定不能＝fail」として扱う（fail-closed。判定関数
+//!   [`harness::accept::check_contrast_ratio_within_limit`] のみ先行実装済み。
+//!   接続後にこのゲートは自動的に実測ベースの判定へ切り替わる。
 //!   `Cargo.toml`・PR 本文の「対象外・承認事項」参照）
 //!
 //! 数値基準（p95 上限・Recall 下限）・測定条件は spec（TASK-127）が SSOT。本ファイルには
@@ -224,13 +226,22 @@ fn main() {
         "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
     );
 
-    // --- CORE-5: 対照エンジン比較（本 PR では未接続。判定関数のみ用意） ---
+    // --- CORE-5: 対照エンジン比較（本 PR では未接続） ---
+    // 対照エンジンクレートの導入がユーザー承認必須のため実測できない
+    // （`.claude/rules/dependency-policy.md`）。未接続のまま CORE-3/CORE-4 のみで
+    // 受理を成功させると CORE-5 の回帰を見逃すため、未測定を判定不能＝fail として
+    // 扱う（fail-closed。接続後は `check_contrast_ratio_within_limit` による実測
+    // 判定へ切り替える）。
+    let core5_ok = false;
+    passed &= core5_ok;
     println!(
-        "contrast_ratio: not measured in this run (contrast engine dependency pending user approval; see harness::accept::check_contrast_ratio_within_limit)"
+        "contrast_ratio: not measured in this run (contrast engine dependency pending user approval; see harness::accept::check_contrast_ratio_within_limit) pass={core5_ok}"
     );
 
     if !passed {
-        eprintln!("parallel_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/SEARCH-4)");
+        eprintln!(
+            "parallel_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/CORE-5/SEARCH-4)"
+        );
         std::process::exit(1);
     }
 }
