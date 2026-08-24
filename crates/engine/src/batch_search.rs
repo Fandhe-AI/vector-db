@@ -143,6 +143,16 @@ pub enum BatchSearchError {
     /// （テナント混入の疑い。`core.rs::CoreError::ProviderResultRejected` と同じ
     /// fail-closed 思想。結果を一切返さない）。
     TenantMaskViolation,
+    /// `batch_fallback.rs::BatchBackend`（差し替え可能な primary バックエンド。
+    /// TASK-129・CORE-8 ポインタ）が返した結果が、id・可視性以外の構造契約
+    /// （クエリ数との整合・件数上限 `k`・id 重複なし・スコア有限性・
+    /// スコア降順/同点 id 昇順）を満たさなかった。`core.rs::CoreError::
+    /// ProviderResultRejected` と同じ「untrusted provider 出力を信頼済み
+    /// 集合と突き合わせて検証し、1 件でも違反すれば結果を一切返さない」
+    /// fail-closed 思想を、id/tenant 混入固有の [`Self::TenantMaskViolation`]
+    /// とは別に区別する（構造契約違反と可視性違反は異なる原因として wire_code
+    /// 設計上も切り分けたいため）。
+    PrimaryResultRejected,
 }
 
 impl fmt::Display for BatchSearchError {
@@ -199,6 +209,10 @@ impl fmt::Display for BatchSearchError {
             BatchSearchError::TenantMaskViolation => {
                 write!(f, "batch_search: result violated per-query tenant mask")
             }
+            BatchSearchError::PrimaryResultRejected => write!(
+                f,
+                "batch_search: primary backend result violated batch result contract"
+            ),
         }
     }
 }
@@ -834,10 +848,63 @@ pub struct BatchHit {
     pub hits: Vec<SearchHit>,
 }
 
+/// バッチ走査パイプラインの行ソース抽象（TASK-129・CORE-8 ポインタ）。
+/// [`ResidentMatrix`]（f16 パック常駐行列。GPU 経路の CPU 参照実装）と
+/// `batch_fallback.rs` の CPU 縮退用 f32 常駐行列の双方から、検証・テナント
+/// マスク・選出後の独立再検証という共通パイプライン（[`run_batch_search`]）を
+/// 共有するための内部抽象。呼び出し元は具象型を静的に知っているため `dyn` 化
+/// せずジェネリクスで単相化する（object-safe である必要はない）。この抽象を
+/// 介して両経路が同一の走査・マスクロジックを通ることが、CORE-8 が要求する
+/// 「縮退後の Top-k 結果が CPU-SIMD 経路の結果と一致する」契約の構成的な
+/// 裏付けになる（縮退経路だけ検査が緩い、という構造的な欠落を防ぐ）。
+pub(crate) trait BatchRowSource {
+    fn row_count(&self) -> usize;
+    fn dim(&self) -> usize;
+    fn ids(&self) -> &[u64];
+    fn tenant_ids(&self) -> &[String];
+    fn visibilities(&self) -> &[Visibility];
+    /// 行 `idx` を f32 として解決し `out` へ書き込む（積和計算専用）。
+    /// [`ResidentMatrix`] は f16 往復デコード、CPU 縮退経路は f32 原本の
+    /// スライス参照というように、表現方式の差分だけがここに現れる。
+    fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()>;
+}
+
+impl BatchRowSource for ResidentMatrix {
+    fn row_count(&self) -> usize {
+        self.ids.len()
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn ids(&self) -> &[u64] {
+        &self.ids
+    }
+
+    fn tenant_ids(&self) -> &[String] {
+        &self.tenant_ids
+    }
+
+    fn visibilities(&self) -> &[Visibility] {
+        &self.visibilities
+    }
+
+    fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
+        // `ResidentMatrix` の同名の inherent メソッドを呼ぶ（メソッド解決は
+        // inherent メソッドをトレイトメソッドより優先するため、ここでの
+        // `self.row_f32_into(...)` は無限再帰にならない）。
+        ResidentMatrix::row_f32_into(self, idx, out)
+    }
+}
+
 /// バッチクエリ・一括インデクシング専用のエンジン（CORE-6/7 ポインタ）。
 /// 単発クエリ経路（`kernel.rs::SearchProvider`）は実装せず、`core.rs::EngineCore`
 /// から到達できない（型レベルでの分離）。現段階はスコア計算を CPU で行う
-/// 参照実装であり、GPU 実行は行わない（モジュール冒頭コメント参照）。
+/// 参照実装であり、GPU 実行は行わない（モジュール冒頭コメント参照）。GPU
+/// バックエンドの初期化失敗・実行時エラーからの CPU-SIMD 縮退は
+/// `batch_fallback.rs::FallbackBatchEngine`（TASK-129・CORE-8 ポインタ）が
+/// 本エンジンを primary バックエンドとしてラップして扱う。
 pub struct BatchEngine {
     matrix: ResidentMatrix,
 }
@@ -888,276 +955,308 @@ impl BatchEngine {
         &self,
         queries: &[BatchQuery<'_>],
     ) -> Result<Vec<BatchHit>, BatchSearchError> {
-        if queries.len() > MAX_BATCH_QUERIES {
-            return Err(BatchSearchError::TooManyQueries {
-                count: queries.len(),
-                max: MAX_BATCH_QUERIES,
+        run_batch_search(&self.matrix, queries)
+    }
+}
+
+/// クエリ列の入力検証（次元・非有限値・`k`・バッチ件数・`sum(k)`）。
+/// [`run_batch_search`] の走査本体（テナントマスク・計算量ガード・選出）とは
+/// 独立した関数として切り出す（TASK-129・CORE-8 レビュー起因の P1 指摘
+/// 対応・PR #152）。`batch_fallback.rs::FallbackBatchEngine::batch_search` は
+/// 公開差し替え点である `BatchBackend`（primary。実 GPU/外部実装に差し替え
+/// 可能）を呼び出す前に本関数を先行適用する。走査ロジックの内部（
+/// `run_batch_search`）だけで検証すると、primary 実装が入力検証を行わず
+/// 不正入力に対して `BatchExecError::Backend`（実行時エラー）を返した場合、
+/// 検証前に primary へ処理が渡ってしまい、不正入力 1 件で `runtime_latched`
+/// が恒久固定され、以降の正当な検索まで CPU 縮退経路へ固定されてしまう
+/// （可用性バグ。入力検証エラーとバックエンド実行エラーを峻別するという
+/// 本モジュール群の設計方針にも反する）。
+///
+/// 次元不一致・非有限値・`k` 範囲外は単一クエリだけを見て安価に判定できる
+/// 入力エラーであり、走査コストと無関係に最優先で報告する（`core.rs::search`
+/// と同じ方針。次元不一致のクライアントに計算量エラーを返さない）。
+pub(crate) fn validate_batch_queries(
+    dim: usize,
+    queries: &[BatchQuery<'_>],
+) -> Result<(), BatchSearchError> {
+    if queries.len() > MAX_BATCH_QUERIES {
+        return Err(BatchSearchError::TooManyQueries {
+            count: queries.len(),
+            max: MAX_BATCH_QUERIES,
+        });
+    }
+
+    let mut total_k: usize = 0;
+    for (query_index, q) in queries.iter().enumerate() {
+        if q.vector.len() != dim {
+            return Err(BatchSearchError::DimMismatch {
+                expected: dim,
+                found: q.vector.len(),
             });
         }
-
-        // 事前検証パス（1 巡目）: 次元・非有限値・k をクエリごとに検証し、
-        // `sum(k)` を積算する。選出器の生成は `sum(k)` の上限検証（下記）を
-        // 通過してから行う（未検証の総量でヒープを成長させない）。次元不一致・
-        // 非有限値・k 範囲外は単一クエリだけを見て安価に判定できる入力エラー
-        // であり、走査コストと無関係に最優先で報告する（core.rs::search と同じ
-        // 方針。次元不一致のクライアントに計算量エラーを返さない）。
-        let mut total_k: usize = 0;
-        for (query_index, q) in queries.iter().enumerate() {
-            if q.vector.len() != self.matrix.dim {
-                return Err(BatchSearchError::DimMismatch {
-                    expected: self.matrix.dim,
-                    found: q.vector.len(),
-                });
-            }
-            if q.vector.iter().any(|v| !v.is_finite()) {
-                return Err(BatchSearchError::NonFiniteQuery { query_index });
-            }
-            if q.k == 0 || q.k > MAX_BATCH_K {
-                return Err(BatchSearchError::InvalidK {
-                    k: q.k,
-                    max: MAX_BATCH_K,
-                });
-            }
-            total_k = total_k
-                .checked_add(q.k)
-                .ok_or(BatchSearchError::TotalKExceeded {
-                    total_k: usize::MAX,
-                    max: MAX_BATCH_TOTAL_K,
-                })?;
+        if q.vector.iter().any(|v| !v.is_finite()) {
+            return Err(BatchSearchError::NonFiniteQuery { query_index });
         }
-        if total_k > MAX_BATCH_TOTAL_K {
-            return Err(BatchSearchError::TotalKExceeded {
-                total_k,
+        if q.k == 0 || q.k > MAX_BATCH_K {
+            return Err(BatchSearchError::InvalidK {
+                k: q.k,
+                max: MAX_BATCH_K,
+            });
+        }
+        total_k = total_k
+            .checked_add(q.k)
+            .ok_or(BatchSearchError::TotalKExceeded {
+                total_k: usize::MAX,
                 max: MAX_BATCH_TOTAL_K,
-            });
-        }
-
-        // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
-        // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
-        // で上限検証済みのため、集合サイズもそれに従う）。`ctx.tenant_id()` は
-        // `PolicyContext` の検証済みアクセサであり、呼び出し元が別途指定できる
-        // 生の文字列ではない（codex P0 指摘対応）。`HashSet::with_capacity`
-        // ではなく `try_reserve`（フォールブル）で確保する（codex P1 指摘対応）。
-        // 計算量ガード（下記）より前に構築する: ガードが課金すべき行数は
-        // 常駐行列の全行ではなく、このバッチのテナント集合に一致する行数
-        // だからである。
-        let mut batch_tenants: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        batch_tenants.try_reserve(queries.len()).map_err(|e| {
-            BatchSearchError::AllocationFailed(format!("failed to reserve batch tenants: {e}"))
-        })?;
-        for q in queries {
-            batch_tenants.insert(q.ctx.tenant_id());
-        }
-
-        // テナントごとのクエリ件数（codex P1 指摘対応: 計算量ガードを
-        // テナント単位で精緻化するため。集合サイズはバッチのテナント集合と
-        // 同じ上限に従うため `try_reserve` の予約量は `batch_tenants.len()`
-        // で十分）。
-        let mut tenant_query_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        tenant_query_counts
-            .try_reserve(batch_tenants.len())
-            .map_err(|e| {
-                BatchSearchError::AllocationFailed(format!(
-                    "failed to reserve tenant query counts: {e}"
-                ))
             })?;
-        for q in queries {
-            let count = tenant_query_counts.entry(q.ctx.tenant_id()).or_insert(0);
+    }
+    if total_k > MAX_BATCH_TOTAL_K {
+        return Err(BatchSearchError::TotalKExceeded {
+            total_k,
+            max: MAX_BATCH_TOTAL_K,
+        });
+    }
+    Ok(())
+}
+
+/// [`BatchEngine::batch_search`] の走査パイプライン本体（TASK-129・CORE-8
+/// ポインタで [`BatchRowSource`] 越しに共有化。挙動はリファクタ前と不変）。
+/// `batch_fallback.rs::FallbackBatchEngine` の CPU 縮退経路もこの関数を直接
+/// 呼ぶため、GPU 参照実装（[`ResidentMatrix`]）と CPU 縮退用 f32 常駐行列は
+/// 検証・テナントマスク・選出後の独立再検証を完全に同一のコードパスで通る。
+pub(crate) fn run_batch_search<S: BatchRowSource>(
+    source: &S,
+    queries: &[BatchQuery<'_>],
+) -> Result<Vec<BatchHit>, BatchSearchError> {
+    // 事前検証パス（1 巡目）: [`validate_batch_queries`] を参照。単独関数を
+    // 通しても本関数単体で呼ばれた場合（`BatchEngine::batch_search`・CPU
+    // 縮退経路の `run_batch_search` 直接呼び出し）の検証は従来どおり保たれる
+    // （`FallbackBatchEngine::batch_search` からの先行呼び出しと合わせて
+    // 二重に実行されるが、入力に対する冪等な検証であり結果は変わらない）。
+    validate_batch_queries(source.dim(), queries)?;
+
+    // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
+    // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
+    // で上限検証済みのため、集合サイズもそれに従う）。`ctx.tenant_id()` は
+    // `PolicyContext` の検証済みアクセサであり、呼び出し元が別途指定できる
+    // 生の文字列ではない（codex P0 指摘対応）。`HashSet::with_capacity`
+    // ではなく `try_reserve`（フォールブル）で確保する（codex P1 指摘対応）。
+    // 計算量ガード（下記）より前に構築する: ガードが課金すべき行数は
+    // 常駐行列の全行ではなく、このバッチのテナント集合に一致する行数
+    // だからである。
+    let mut batch_tenants: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    batch_tenants.try_reserve(queries.len()).map_err(|e| {
+        BatchSearchError::AllocationFailed(format!("failed to reserve batch tenants: {e}"))
+    })?;
+    for q in queries {
+        batch_tenants.insert(q.ctx.tenant_id());
+    }
+
+    // テナントごとのクエリ件数（codex P1 指摘対応: 計算量ガードを
+    // テナント単位で精緻化するため。集合サイズはバッチのテナント集合と
+    // 同じ上限に従うため `try_reserve` の予約量は `batch_tenants.len()`
+    // で十分）。
+    let mut tenant_query_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    tenant_query_counts
+        .try_reserve(batch_tenants.len())
+        .map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve tenant query counts: {e}"
+            ))
+        })?;
+    for q in queries {
+        let count = tenant_query_counts.entry(q.ctx.tenant_id()).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    // テナントごとの一致行数（走査時に実際にデコード対象となる行数。
+    // 下記の行外側ループが `tenant_query_indices` に対応クエリを持たない
+    // 行を除外するため、それらの行は最初からデコードされない）。この
+    // 数え上げ自体は O(rows) の線形走査で、[`MAX_BATCH_ROWS`] により
+    // 上限が課されているため、走査本体（O(matching_rows * dim) の
+    // デコード + テナント別の行×クエリ積和）よりも十分軽量である。
+    let mut tenant_row_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    tenant_row_counts
+        .try_reserve(batch_tenants.len())
+        .map_err(|e| {
+            BatchSearchError::AllocationFailed(format!("failed to reserve tenant row counts: {e}"))
+        })?;
+    for tenant in source.tenant_ids().iter() {
+        if batch_tenants.contains(tenant.as_str()) {
+            let count = tenant_row_counts.entry(tenant.as_str()).or_insert(0);
             *count = count.saturating_add(1);
         }
-
-        // テナントごとの一致行数（走査時に実際にデコード対象となる行数。
-        // 下記の行外側ループが `tenant_query_indices` に対応クエリを持たない
-        // 行を除外するため、それらの行は最初からデコードされない）。この
-        // 数え上げ自体は O(rows) の線形走査で、[`MAX_BATCH_ROWS`] により
-        // 上限が課されているため、走査本体（O(matching_rows * dim) の
-        // デコード + テナント別の行×クエリ積和）よりも十分軽量である。
-        let mut tenant_row_counts: std::collections::HashMap<&str, usize> =
-            std::collections::HashMap::new();
-        tenant_row_counts
-            .try_reserve(batch_tenants.len())
-            .map_err(|e| {
-                BatchSearchError::AllocationFailed(format!(
-                    "failed to reserve tenant row counts: {e}"
-                ))
-            })?;
-        for tenant in self.matrix.tenant_ids.iter() {
-            if batch_tenants.contains(tenant.as_str()) {
-                let count = tenant_row_counts.entry(tenant.as_str()).or_insert(0);
-                *count = count.saturating_add(1);
-            }
-        }
-        // `id_to_tenant` のフォールブル予約量として使う（テナントごとの
-        // 一致行数の総和 = バッチのテナント集合に一致する行数の総和）。
-        let matching_row_count: usize = tenant_row_counts.values().sum();
-
-        // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応・
-        // codex P1 追加指摘対応）。個別クエリの入力エラー（次元不一致・
-        // 非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、実際に走査
-        // されるテナントごとの (行数, クエリ数) の積を合算した総積和演算数を
-        // 走査（選出器確保・行デコード）開始前に確定的に拒否する。「全一致
-        // 行数 × 全クエリ数」で一括課金すると、複数テナントが混在するバッチ
-        // では実コストより過大に見積もり、正当な入力を誤って拒否しうる
-        // （`compute_batch_work` のドキュメンテーションコメント参照）。
-        let work_pairs = batch_tenants.iter().map(|&tenant| {
-            let rows = tenant_row_counts.get(tenant).copied().unwrap_or(0);
-            let tenant_queries = tenant_query_counts.get(tenant).copied().unwrap_or(0);
-            (rows, tenant_queries)
-        });
-        compute_batch_work(work_pairs, self.matrix.dim())?;
-
-        // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
-        // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
-        // 内部ヒープも `q.k`（バッチ全体で `sum(k) <= MAX_BATCH_TOTAL_K` を
-        // 検証済み）分だけフォールブルに予約する（codex P1 指摘対応:
-        // `Vec::with_capacity` も `TopKSelector::push` 内部の `BinaryHeap::push`
-        // による amortized 成長も失敗時に abort するため使わない。
-        // `try_reserve_exact` は `ResidentMatrix::build` 用に定義済みの
-        // 共通ヘルパーを再利用する）。
-        let mut selectors: Vec<TopKSelector> = Vec::new();
-        try_reserve_exact(&mut selectors, queries.len(), "selectors")?;
-        for q in queries {
-            let mut selector = TopKSelector::new(q.k);
-            selector.try_reserve(q.k).map_err(|e| {
-                BatchSearchError::AllocationFailed(format!("failed to reserve selector heap: {e}"))
-            })?;
-            selectors.push(selector);
-        }
-
-        // テナントごとのクエリ index 一覧（Cursor Medium 指摘対応: work budget は
-        // テナント別 `行数 × クエリ数 × dim` へ精緻化済みだが、実走査が依然
-        // 「デコード済み各行 × バッチの全クエリ」を舐めて `is_visible` を判定する
-        // O(matching_rows * queries.len()) のネストループのままだと、課金と
-        // 実 wall-clock コストが乖離する。行外側ループが「その行のテナントに
-        // 属するクエリ集合」だけを走査できるよう、事前にテナント → クエリ index
-        // の一覧を構築する。各 `Vec<usize>` の容量は `tenant_query_counts` で
-        // 既に数えたテナントごとのクエリ件数ちょうどに `try_reserve_exact` で
-        // 予約するため、後続の `push` が amortized 成長で abort することはない）。
-        let mut tenant_query_indices: std::collections::HashMap<&str, Vec<usize>> =
-            std::collections::HashMap::new();
-        tenant_query_indices
-            .try_reserve(tenant_query_counts.len())
-            .map_err(|e| {
-                BatchSearchError::AllocationFailed(format!(
-                    "failed to reserve tenant query indices: {e}"
-                ))
-            })?;
-        for (&tenant, &count) in tenant_query_counts.iter() {
-            let mut indices: Vec<usize> = Vec::new();
-            try_reserve_exact(&mut indices, count, "tenant query indices")?;
-            tenant_query_indices.insert(tenant, indices);
-        }
-        for (idx, q) in queries.iter().enumerate() {
-            if let Some(indices) = tenant_query_indices.get_mut(q.ctx.tenant_id()) {
-                indices.push(idx);
-            }
-        }
-
-        // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
-        // `ResidentMatrix::build` が id の重複を拒否しているため、id は
-        // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
-        // 参照）。選出段のマスク実装（行 index からの `PolicyContext::is_visible`
-        // 呼び出し）とは別経路でこの表を組むことで、二重防御を維持する。
-        // このバッチのテナントに属さない行は登録しない（マップを
-        // `MAX_BATCH_ROWS` 全件分確保しないための最適化であると同時に、
-        // バッチ外テナントの id が万一 hit に混入した場合を確実に
-        // マップ不在 → `TenantMaskViolation` にする fail-closed 側の効果も持つ）。
-        // `HashMap::with_capacity` ではなく `try_reserve`（フォールブル）で
-        // 確保する（codex P1 指摘対応）。予約量は上で数えた `matching_row_count`
-        // をそのまま再利用する。
-        let mut id_to_tenant: std::collections::HashMap<u64, (&str, Visibility)> =
-            std::collections::HashMap::new();
-        id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
-            BatchSearchError::AllocationFailed(format!("failed to reserve id-tenant map: {e}"))
-        })?;
-        for ((id, tenant), visibility) in self
-            .matrix
-            .ids
-            .iter()
-            .zip(self.matrix.tenant_ids.iter())
-            .zip(self.matrix.visibilities.iter())
-        {
-            if batch_tenants.contains(tenant.as_str()) {
-                id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
-            }
-        }
-
-        // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行のテナントに
-        // 属するクエリ集合だけを走査する（Cursor Medium 指摘対応: 以前は
-        // クエリ側をバッチ全体で舐める O(matching_rows * queries.len()) の
-        // ネストループになっており、work budget をテナント別に精緻化しても
-        // 実 wall-clock コストは一致しなかった。`tenant_query_indices` で
-        // 行のテナントに属するクエリ index だけへ絞ることで、内側ループの
-        // 反復回数がテナント別課金と一致する）。`row_buf` は
-        // `Vec::with_capacity`（abort-on-OOM）ではなく `try_reserve_exact` で
-        // フォールブルに確保する（codex P1 指摘対応）。
-        let mut row_buf: Vec<f32> = Vec::new();
-        try_reserve_exact(&mut row_buf, self.matrix.dim(), "row_buf")?;
-        for row_idx in 0..self.matrix.row_count() {
-            let Some(row_tenant) = self.matrix.tenant_ids.get(row_idx).map(String::as_str) else {
-                continue;
-            };
-            // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く
-            // （`tenant_query_indices` のキー集合は `batch_tenants` と一致する）。
-            let Some(query_indices) = tenant_query_indices.get(row_tenant) else {
-                continue;
-            };
-            let Some(row_visibility) = self.matrix.visibilities.get(row_idx).copied() else {
-                continue;
-            };
-            let Some(id) = self.matrix.ids.get(row_idx).copied() else {
-                continue;
-            };
-            if self.matrix.row_f32_into(row_idx, &mut row_buf).is_none() {
-                continue;
-            }
-
-            for &qi in query_indices {
-                // untrusted 入力由来の添字ではなく、直前に `enumerate()` で
-                // 自前生成した内部インデックスだが、coding-rust.md の方針に
-                // 揃えて `[]` ではなく `get`/`get_mut` で明示的に処理する。
-                let (Some(q), Some(selector)) = (queries.get(qi), selectors.get_mut(qi)) else {
-                    continue;
-                };
-                // (1) 選出前のマスク: `PolicyContext::is_visible` を満たす
-                // 行だけを候補にする（codex P0 指摘対応: テナント文字列の
-                // 等価比較だけでなく可視性ラベルも判定する。テナント一致は
-                // `tenant_query_indices` の絞り込みで既に保証済みだが、
-                // 可視性（`Visibility::Private` 等）の判定はここでしか
-                // できないため引き続き呼び出す）。
-                if !q.ctx.is_visible(row_tenant, row_visibility) {
-                    continue;
-                }
-                let score = crate::kernel::dot(&row_buf, q.vector);
-                if !score.is_finite() {
-                    continue;
-                }
-                selector.push(SearchHit { id, score });
-            }
-        }
-
-        // `out` も `Vec::with_capacity`（abort-on-OOM）ではなく
-        // `try_reserve_exact` でフォールブルに確保する（codex P1 指摘対応）。
-        let mut out: Vec<BatchHit> = Vec::new();
-        try_reserve_exact(&mut out, queries.len(), "batch results")?;
-        for (q, selector) in queries.iter().zip(selectors) {
-            let hits = selector.into_sorted_vec();
-
-            // (2) 選出後の独立再検証: 返す id が全て `PolicyContext::is_visible`
-            // を満たす行由来であることを、マスク実装（行 index からの判定）
-            // から独立に id → (tenant, visibility) の逆引き表で確認する。
-            for hit in &hits {
-                match id_to_tenant.get(&hit.id) {
-                    Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
-                    _ => return Err(BatchSearchError::TenantMaskViolation),
-                }
-            }
-
-            out.push(BatchHit { hits });
-        }
-        Ok(out)
     }
+    // `id_to_tenant` のフォールブル予約量として使う（テナントごとの
+    // 一致行数の総和 = バッチのテナント集合に一致する行数の総和）。
+    let matching_row_count: usize = tenant_row_counts.values().sum();
+
+    // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応・
+    // codex P1 追加指摘対応）。個別クエリの入力エラー（次元不一致・
+    // 非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、実際に走査
+    // されるテナントごとの (行数, クエリ数) の積を合算した総積和演算数を
+    // 走査（選出器確保・行デコード）開始前に確定的に拒否する。「全一致
+    // 行数 × 全クエリ数」で一括課金すると、複数テナントが混在するバッチ
+    // では実コストより過大に見積もり、正当な入力を誤って拒否しうる
+    // （`compute_batch_work` のドキュメンテーションコメント参照）。
+    let work_pairs = batch_tenants.iter().map(|&tenant| {
+        let rows = tenant_row_counts.get(tenant).copied().unwrap_or(0);
+        let tenant_queries = tenant_query_counts.get(tenant).copied().unwrap_or(0);
+        (rows, tenant_queries)
+    });
+    compute_batch_work(work_pairs, source.dim())?;
+
+    // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
+    // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
+    // 内部ヒープも `q.k`（バッチ全体で `sum(k) <= MAX_BATCH_TOTAL_K` を
+    // 検証済み）分だけフォールブルに予約する（codex P1 指摘対応:
+    // `Vec::with_capacity` も `TopKSelector::push` 内部の `BinaryHeap::push`
+    // による amortized 成長も失敗時に abort するため使わない。
+    // `try_reserve_exact` は `ResidentMatrix::build` 用に定義済みの
+    // 共通ヘルパーを再利用する）。
+    let mut selectors: Vec<TopKSelector> = Vec::new();
+    try_reserve_exact(&mut selectors, queries.len(), "selectors")?;
+    for q in queries {
+        let mut selector = TopKSelector::new(q.k);
+        selector.try_reserve(q.k).map_err(|e| {
+            BatchSearchError::AllocationFailed(format!("failed to reserve selector heap: {e}"))
+        })?;
+        selectors.push(selector);
+    }
+
+    // テナントごとのクエリ index 一覧（Cursor Medium 指摘対応: work budget は
+    // テナント別 `行数 × クエリ数 × dim` へ精緻化済みだが、実走査が依然
+    // 「デコード済み各行 × バッチの全クエリ」を舐めて `is_visible` を判定する
+    // O(matching_rows * queries.len()) のネストループのままだと、課金と
+    // 実 wall-clock コストが乖離する。行外側ループが「その行のテナントに
+    // 属するクエリ集合」だけを走査できるよう、事前にテナント → クエリ index
+    // の一覧を構築する。各 `Vec<usize>` の容量は `tenant_query_counts` で
+    // 既に数えたテナントごとのクエリ件数ちょうどに `try_reserve_exact` で
+    // 予約するため、後続の `push` が amortized 成長で abort することはない）。
+    let mut tenant_query_indices: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    tenant_query_indices
+        .try_reserve(tenant_query_counts.len())
+        .map_err(|e| {
+            BatchSearchError::AllocationFailed(format!(
+                "failed to reserve tenant query indices: {e}"
+            ))
+        })?;
+    for (&tenant, &count) in tenant_query_counts.iter() {
+        let mut indices: Vec<usize> = Vec::new();
+        try_reserve_exact(&mut indices, count, "tenant query indices")?;
+        tenant_query_indices.insert(tenant, indices);
+    }
+    for (idx, q) in queries.iter().enumerate() {
+        if let Some(indices) = tenant_query_indices.get_mut(q.ctx.tenant_id()) {
+            indices.push(idx);
+        }
+    }
+
+    // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
+    // `ResidentMatrix::build` が id の重複を拒否しているため、id は
+    // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
+    // 参照）。選出段のマスク実装（行 index からの `PolicyContext::is_visible`
+    // 呼び出し）とは別経路でこの表を組むことで、二重防御を維持する。
+    // このバッチのテナントに属さない行は登録しない（マップを
+    // `MAX_BATCH_ROWS` 全件分確保しないための最適化であると同時に、
+    // バッチ外テナントの id が万一 hit に混入した場合を確実に
+    // マップ不在 → `TenantMaskViolation` にする fail-closed 側の効果も持つ）。
+    // `HashMap::with_capacity` ではなく `try_reserve`（フォールブル）で
+    // 確保する（codex P1 指摘対応）。予約量は上で数えた `matching_row_count`
+    // をそのまま再利用する。
+    let mut id_to_tenant: std::collections::HashMap<u64, (&str, Visibility)> =
+        std::collections::HashMap::new();
+    id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
+        BatchSearchError::AllocationFailed(format!("failed to reserve id-tenant map: {e}"))
+    })?;
+    for ((id, tenant), visibility) in source
+        .ids()
+        .iter()
+        .zip(source.tenant_ids().iter())
+        .zip(source.visibilities().iter())
+    {
+        if batch_tenants.contains(tenant.as_str()) {
+            id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
+        }
+    }
+
+    // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行のテナントに
+    // 属するクエリ集合だけを走査する（Cursor Medium 指摘対応: 以前は
+    // クエリ側をバッチ全体で舐める O(matching_rows * queries.len()) の
+    // ネストループになっており、work budget をテナント別に精緻化しても
+    // 実 wall-clock コストは一致しなかった。`tenant_query_indices` で
+    // 行のテナントに属するクエリ index だけへ絞ることで、内側ループの
+    // 反復回数がテナント別課金と一致する）。`row_buf` は
+    // `Vec::with_capacity`（abort-on-OOM）ではなく `try_reserve_exact` で
+    // フォールブルに確保する（codex P1 指摘対応）。
+    let mut row_buf: Vec<f32> = Vec::new();
+    try_reserve_exact(&mut row_buf, source.dim(), "row_buf")?;
+    for row_idx in 0..source.row_count() {
+        let Some(row_tenant) = source.tenant_ids().get(row_idx).map(String::as_str) else {
+            continue;
+        };
+        // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く
+        // （`tenant_query_indices` のキー集合は `batch_tenants` と一致する）。
+        let Some(query_indices) = tenant_query_indices.get(row_tenant) else {
+            continue;
+        };
+        let Some(row_visibility) = source.visibilities().get(row_idx).copied() else {
+            continue;
+        };
+        let Some(id) = source.ids().get(row_idx).copied() else {
+            continue;
+        };
+        if source.row_f32_into(row_idx, &mut row_buf).is_none() {
+            continue;
+        }
+
+        for &qi in query_indices {
+            // untrusted 入力由来の添字ではなく、直前に `enumerate()` で
+            // 自前生成した内部インデックスだが、coding-rust.md の方針に
+            // 揃えて `[]` ではなく `get`/`get_mut` で明示的に処理する。
+            let (Some(q), Some(selector)) = (queries.get(qi), selectors.get_mut(qi)) else {
+                continue;
+            };
+            // (1) 選出前のマスク: `PolicyContext::is_visible` を満たす
+            // 行だけを候補にする（codex P0 指摘対応: テナント文字列の
+            // 等価比較だけでなく可視性ラベルも判定する。テナント一致は
+            // `tenant_query_indices` の絞り込みで既に保証済みだが、
+            // 可視性（`Visibility::Private` 等）の判定はここでしか
+            // できないため引き続き呼び出す）。
+            if !q.ctx.is_visible(row_tenant, row_visibility) {
+                continue;
+            }
+            let score = crate::kernel::dot(&row_buf, q.vector);
+            if !score.is_finite() {
+                continue;
+            }
+            selector.push(SearchHit { id, score });
+        }
+    }
+
+    // `out` も `Vec::with_capacity`（abort-on-OOM）ではなく
+    // `try_reserve_exact` でフォールブルに確保する（codex P1 指摘対応）。
+    let mut out: Vec<BatchHit> = Vec::new();
+    try_reserve_exact(&mut out, queries.len(), "batch results")?;
+    for (q, selector) in queries.iter().zip(selectors) {
+        let hits = selector.into_sorted_vec();
+
+        // (2) 選出後の独立再検証: 返す id が全て `PolicyContext::is_visible`
+        // を満たす行由来であることを、マスク実装（行 index からの判定）
+        // から独立に id → (tenant, visibility) の逆引き表で確認する。
+        for hit in &hits {
+            match id_to_tenant.get(&hit.id) {
+                Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
+                _ => return Err(BatchSearchError::TenantMaskViolation),
+            }
+        }
+
+        out.push(BatchHit { hits });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
