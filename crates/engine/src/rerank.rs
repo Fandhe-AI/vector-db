@@ -522,7 +522,20 @@ impl Reranker for LexicalOverlapReranker {
     ) -> Result<Vec<RerankedHit>, RerankError> {
         // [`Reranker`] は公開 trait のため、[`rerank_candidates`] を経由せずこの
         // `rerank()` を直接呼び出す経路が型上ありうる（`rerank_candidates` の入口検証は
-        // 迂回可能）。`tokenize()`（`String`・`BTreeSet` を確保する）を呼ぶ前に、
+        // 迂回可能）。空文字列・短文の候補を大量に渡すとバイト長検証だけでは
+        // 上限を超えないまま件数だけが無制限に増幅しうるため、`tokenize()`
+        // （`String`・`BTreeSet` を確保する）や `Vec` 確保（`overlap_ranked`）より
+        // 前に、この実装自身でも件数を [`MAX_POOL_DEPTH`] で検証する
+        // （`rerank_candidates` の `TooManyCandidates` 検証と同じ契約。直接呼び出し
+        // 経路では `cfg.pool_depth()` を持たないため [`MAX_POOL_DEPTH`] 自体を上限に
+        // 使う）。
+        if candidates.len() > MAX_POOL_DEPTH {
+            return Err(RerankError::TooManyCandidates {
+                len: candidates.len(),
+                max: MAX_POOL_DEPTH,
+            });
+        }
+
         // この実装自身でも [`validate_text_lengths`] により長さを検証し、未検証の
         // 巨大な `query_text`・候補テキストがそのまま `tokenize()` へ渡る経路を構造的に
         // 防ぐ（`rerank_candidates` 経由の呼び出しでは二重検証になるが、コストは
@@ -855,6 +868,28 @@ mod tests {
                 id: 1,
                 len: MAX_CANDIDATE_TEXT_BYTES + 1,
                 max: MAX_CANDIDATE_TEXT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_candidate_count_exceeding_max_pool_depth() {
+        // codex-review P1 / Bugbot Medium 指摘対応: 公開 trait Reranker::rerank を
+        // rerank_candidates を経由せず直接呼び出した場合、合計バイト長が
+        // MAX_TOTAL_CANDIDATE_TEXT_BYTES を超えない短文候補を MAX_POOL_DEPTH 件超
+        // 渡しても、tokenize()・Vec 確保（overlap_ranked）より前に件数超過として
+        // 拒否されることを確認する。
+        let reranker = LexicalOverlapReranker::default();
+        let text = "a";
+        let candidates: Vec<RerankCandidate<'_>> = (0..(MAX_POOL_DEPTH as u64 + 1))
+            .map(|i| cand(i, -(i as f64), text))
+            .collect();
+        let err = reranker.rerank("q", &candidates, 1).unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::TooManyCandidates {
+                len: MAX_POOL_DEPTH + 1,
+                max: MAX_POOL_DEPTH,
             }
         );
     }
