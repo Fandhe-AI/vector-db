@@ -1,0 +1,55 @@
+name: Recall
+
+# TASK-104（ハイブリッド検索カーネルの Recall 受け入れ基準の回帰テスト化。対象
+# ビヘイビア: SEARCH-1, SEARCH-2）の閾値ゲート実行。`crates/engine/tests/hybrid_recall.rs`
+# の層 B（`#[ignore]` 付き。spec 由来の Recall 下限と比較する閾値ゲート）を
+# `make recall-regression` 経由で実行する。層 A（決定的コーパスの固定値回帰）は
+# `.github/workflows/ci.yml` の `cargo test` に自動的に含まれるため、本 workflow の対象は
+# 層 B のみ。`.github/workflows/bench.yml`（TASK-127）を雛形にする。private submodule
+# （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
+# 方針）。
+#
+# 本ハーネスは決定的合成コーパス（外部接続不要）のため、`bench.yml` と異なり schedule
+# トリガも設定する（週次。CI 混雑回避のため PR/push トリガとは独立した深夜 UTC 帯）。
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 4 * * 1" # 毎週月曜 04:00 UTC（bench.yml 想定の 03:00 UTC 帯と重ならないようずらす）
+
+permissions:
+  contents: read
+
+concurrency:
+  # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に含めて
+  # 同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針）。
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --------------------------------------------------
+  # recall-regression（TASK-104 層 B 閾値ゲート実行）
+  # --------------------------------------------------
+  # 第三者 action（actions/checkout）は ci.yml・bench.yml と同一の SHA 固定で参照する
+  # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
+  recall-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run recall-regression
+        # 数値基準（Recall 下限）は spec（TASK-104・SEARCH-1, SEARCH-2）が SSOT のため
+        # 本ワークフローにはハードコードしない。リポジトリの Actions variables（`vars.*`）
+        # から注入する（bench.yml と同方式）。未設定・非数値・範囲外の場合は
+        # `crates/engine/tests/hybrid_recall.rs` 側が fail-closed で非ゼロ終了する。
+        # 実測ログには実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
+        # 出力しない。
+        env:
+          HYBRID_RECALL_MIN_R20_SMALL: ${{ vars.HYBRID_RECALL_MIN_R20_SMALL }}
+          HYBRID_RECALL_MIN_R20_LARGE: ${{ vars.HYBRID_RECALL_MIN_R20_LARGE }}
+          HYBRID_RECALL_MIN_R100_LARGE: ${{ vars.HYBRID_RECALL_MIN_R100_LARGE }}
+        run: make recall-regression

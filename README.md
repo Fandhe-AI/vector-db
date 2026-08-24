@@ -43,6 +43,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
+| `make bench-parallel` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
 
 ターゲット一覧は `make help` で確認できます。
 
@@ -63,6 +64,18 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 - `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
 
 対照エンジン接続がまだ完了していない段階での定期実行は誤検出・運用負担のリスクがあるため、`bench.yml` は schedule トリガを意図的に外し `workflow_dispatch`（手動実行）のみとしています。CORE-5 接続後、bench.yml 冒頭コメントの手順に従って schedule トリガを再度追加し、`BENCH_CORE5=1` を既定で有効化してください。
+
+### Recall 回帰ハーネスの repo variables（TASK-104）
+
+`.github/workflows/recall.yml`（`workflow_dispatch` ＋ 週次 `schedule`）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+
+```bash
+gh variable set HYBRID_RECALL_MIN_R20_SMALL
+gh variable set HYBRID_RECALL_MIN_R20_LARGE
+gh variable set HYBRID_RECALL_MIN_R100_LARGE
+```
+
+未設定のまま実行すると `crates/engine/tests/hybrid_recall.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
 
 ## ライセンス
 
