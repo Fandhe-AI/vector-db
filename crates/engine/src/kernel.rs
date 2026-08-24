@@ -203,6 +203,23 @@ impl TopKSelector {
         }
     }
 
+    /// 内部ヒープへ `additional` 件分の容量をフォールブルに予約する。[`Self::new`]
+    /// があえて事前確保しない理由（未検証の `k` を確保サイズへ直接使わない）とは
+    /// 矛盾しない: 本メソッドは呼び出し元が別途総量を上限検証済みであることを
+    /// 前提にした任意 API である（`gpu_search.rs::GpuBatchEngine::batch_search` が
+    /// バッチ全体の `sum(k)` を検証してから各選出器へ呼ぶ想定）。呼び出し元が
+    /// 本メソッドを使わず素朴に `push` するだけの経路（`CpuScalarProvider`・
+    /// `ParallelSearchProvider`）は今までどおり amortized 成長のままでよい
+    /// （codex P1 指摘対応: `BinaryHeap::push` の内部確保は abort-on-OOM のため、
+    /// 総量が上限検証済みの呼び出し元には `Result` 契約の確保手段を用意する。
+    /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    pub(crate) fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.heap.try_reserve(additional)
+    }
+
     /// 候補 1 件を選出器へ投入する。非有限スコア（NaN/Inf）は fail-closed に無視する
     /// （呼び出し元が事前に除外している場合でも、二重の安全網として機能する）。
     pub(crate) fn push(&mut self, hit: SearchHit) {
