@@ -6,13 +6,15 @@ name: Bench
 # ビルド・テストは spec 抜きで成立する方針）。
 #
 # schedule トリガは意図的に外している（workflow_dispatch のみ）。CORE-5（対照エンジン
-# との中央値比較）が対照エンジンクレートの導入承認待ちで未接続の間、parallel_bench.rs
-# は CORE-5 を「未測定＝判定不能」として fail-closed に固定判定する（回帰検出ではなく
-# 恒常的に失敗する）。この状態で schedule を有効化すると「毎週確実に失敗するだけの
-# ジョブ」になり、実際の回帰検出との区別がつかなくなるため、CORE-5 が実測接続されるまで
-# 定期実行は行わず手動実行のみとする。CORE-5 接続後、schedule トリガ（例:
-# `- cron: "0 3 * * 1"` 毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
-# 独立した時間帯にする）を再度追加すること。
+# との中央値比較）は対照エンジンクレートの導入承認待ちで未接続であり、
+# `crates/engine/benches/parallel_bench.rs` は既定では CORE-5 を「対象外」として
+# 合否判定から明示的に除外する opt-in 方式にしている（`BENCH_CORE5=1` を注入した
+# 場合のみ「未測定＝判定不能」を fail-closed として反映する。`parallel_bench.rs`
+# 冒頭コメント参照）。対照エンジン接続がまだ完了していない段階での定期実行は
+# 誤検出・運用負担のリスクがあるため、CORE-5 が実測接続され `BENCH_CORE5=1` を
+# 既定で有効化できるようになるまでは手動実行（workflow_dispatch）のみとする。
+# CORE-5 接続後、schedule トリガ（例: `- cron: "0 3 * * 1"` 毎週月曜 03:00 UTC。
+# CI 混雑を避けるため PR/push トリガーとは独立した時間帯にする）を再度追加すること。
 on:
   workflow_dispatch: {}
 
@@ -48,9 +50,14 @@ jobs:
         # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
         # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値の
         # 数値そのものは載せない——`crates/engine/benches/parallel_bench.rs` が
-        # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。未設定の場合は
-        # `parallel_bench.rs` 側が fail-closed で非ゼロ終了する。
+        # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
+        # BENCH_MIN_RECALL が未設定の場合は `parallel_bench.rs` 側が fail-closed で
+        # 非ゼロ終了する。BENCH_CORE5 は repo variable が未設定（既定）なら CORE-5 を
+        # 対象外として扱う opt-in フラグで、CORE-5 接続後にリポジトリ管理者が
+        # `gh variable set BENCH_CORE5 1` で有効化する想定（`parallel_bench.rs` 冒頭
+        # コメント参照）。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
+          BENCH_CORE5: ${{ vars.BENCH_CORE5 }}
         run: make bench-parallel

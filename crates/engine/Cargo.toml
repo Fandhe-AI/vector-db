@@ -54,8 +54,9 @@ test = false
 # それに合わせる（`parallel_bench.rs` 冒頭コメント参照）。harness = false / test = false
 # は上記 2 ベンチと同一方針（時間依存の測定値を make ci のアサーションへ混ぜない）。
 # `make bench-parallel`（Makefile）・`.github/workflows/bench.yml`
-# （週次 schedule + workflow_dispatch）から実行する。判定ロジック自体（時間非依存）は
-# harness/accept.rs にあり tests/bench_accept.rs で make ci 側から回帰検証する。
+# （workflow_dispatch による手動実行。CORE-5 未接続の間は schedule 停止中）から
+# 実行する。判定ロジック自体（時間非依存）は harness/accept.rs にあり
+# tests/bench_accept.rs で make ci 側から回帰検証する。
 name = "parallel_bench"
 harness = false
 test = false

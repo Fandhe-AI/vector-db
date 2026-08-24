@@ -57,7 +57,12 @@ gh variable set BENCH_MIN_RECALL
 
 未設定のまま `workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-なお両変数を設定しても、CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続であり、接続されるまで本ベンチは意図的に fail-closed（非ゼロ終了）します（TASK-127。`.claude/rules/dependency-policy.md`）。これにより「回帰検出ではなく毎週確実に失敗するだけのジョブ」になるのを避けるため、`bench.yml` は schedule トリガを意図的に外し `workflow_dispatch`（手動実行）のみとしています。CORE-5 接続後、bench.yml 冒頭コメントの手順に従って schedule トリガを再度追加してください。
+CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続です（TASK-127。`.claude/rules/dependency-policy.md`。Issue #35 で追跡中）。CORE-5 の判定は `BENCH_CORE5` repo variable による opt-in 方式です。
+
+- 未設定（既定）: CORE-5 は「対象外」として標準出力へ明示され、合否判定には含まれません。CORE-3（p95 レイテンシ）・CORE-4（Recall@k）のみで合否を返します
+- `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
+
+対照エンジン接続がまだ完了していない段階での定期実行は誤検出・運用負担のリスクがあるため、`bench.yml` は schedule トリガを意図的に外し `workflow_dispatch`（手動実行）のみとしています。CORE-5 接続後、bench.yml 冒頭コメントの手順に従って schedule トリガを再度追加し、`BENCH_CORE5=1` を既定で有効化してください。
 
 ## ライセンス
 
