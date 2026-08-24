@@ -138,12 +138,17 @@ impl From<KernelError> for RlsError {
 /// （モジュールドキュメント「失効行の再検証」参照）。可視率・ポリシーが大きく変わる場合や
 /// embedding 本体の鮮度が必要な場合は [`Self::build`] を呼び直して再構築する必要がある。
 ///
-/// [`Self::len`]・[`Self::is_empty`]・[`Self::dim`]・[`Self::table_name`] は `ctx` を
-/// 要求しない点に注意: これらは構築時 ctx のテナントに束縛されたメタデータ（可視行数・
-/// テーブル名等）を返すため、[`Self::search`] と同様に「構築時 ctx を保持する呼び出し元
-/// のみが扱ってよい」という前提の上で成立する。呼び出し元がインデックスを別テナントの
-/// 文脈へ渡さない運用を守る必要がある（現状は `search` のみが fail-closed な照合ゲートを
-/// 持つ。アクセサへの ctx 必須化は本 P0 のスコープ外・将来の検討事項）。
+/// アクセサの `ctx` 必須化方針（codex-review P0 指摘・PR #151 対応）: [`Self::len`]・
+/// [`Self::is_empty`] は構築元テナントの可視行数・行の有無という**存在情報**を返すため、
+/// `ctx` を必須化し [`Self::built_ctx`] との完全一致を [`Self::search`] と同一の
+/// fail-closed ゲートで照合する（一致しなければ [`RlsError::ContextMismatch`]）。
+/// キャッシュ取り違え等で別テナント用の `PrefilterIndex` を受け取った呼び出し元が、
+/// `search` を拒否されてもこれらのアクセサ経由で存在情報を得られてしまう経路を塞ぐ。
+/// 一方 [`Self::dim`]・[`Self::table_name`] は `ctx` を要求しない: `dim` はテーブル定義
+/// （`CREATE TABLE` 時に宣言される次元数）であり全テナント共通でテナント間の違いを
+/// 持たない値、`table_name` は呼び出し元が [`Self::build`] へ自ら渡した引数の単純な
+/// 反映であり、いずれも本インデックスから新たに得られる情報を持たない
+/// （非機微と判断し対象外とした）。
 pub struct PrefilterIndex {
     arena: VectorArena,
     /// `arena.ids()` と同一集合の `HashSet` キャッシュ（[`Self::build`] 時に一度だけ構築）。
@@ -285,22 +290,40 @@ impl PrefilterIndex {
         Ok(hits)
     }
 
-    /// インデックスが保持する可視行数。
-    pub fn len(&self) -> usize {
-        self.arena.len()
+    /// インデックスが保持する可視行数を返す（テナント境界 P0・codex-review P0 指摘・
+    /// PR #151 対応）。
+    ///
+    /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
+    /// ならない。[`Self::search`] と同一のゲートで、一致しない場合は可視行数（存在情報）を
+    /// 一切返さず [`RlsError::ContextMismatch`] で fail-closed に拒否する（キャッシュ
+    /// 取り違え等で別テナント用インデックスを受け取った呼び出し元が、検索を拒否されても
+    /// 本メソッド経由で行数を取得できてしまう経路を塞ぐため。struct doc 参照）。
+    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+        if ctx != &self.built_ctx {
+            return Err(RlsError::ContextMismatch);
+        }
+        Ok(self.arena.len())
     }
 
-    /// 可視行が 0 件か。
-    pub fn is_empty(&self) -> bool {
-        self.arena.is_empty()
+    /// 可視行が 0 件かを返す（テナント境界 P0・codex-review P0 指摘・PR #151 対応）。
+    /// `ctx` の照合方針は [`Self::len`] と同一（構築時 ctx との完全一致必須・
+    /// 不一致は [`RlsError::ContextMismatch`]）。
+    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+        if ctx != &self.built_ctx {
+            return Err(RlsError::ContextMismatch);
+        }
+        Ok(self.arena.is_empty())
     }
 
-    /// 検索対象ベクトルの次元。
+    /// 検索対象ベクトルの次元。テーブル定義（`CREATE TABLE` 宣言次元）であり全テナント
+    /// 共通の値のため `ctx` を要求しない（struct doc「アクセサの ctx 必須化方針」参照）。
     pub fn dim(&self) -> u32 {
         self.arena.dim()
     }
 
-    /// 構築元のテーブル名。
+    /// 構築元のテーブル名。呼び出し元が [`Self::build`] へ自ら渡した引数の単純な反映で、
+    /// 本インデックスから新たに得られる情報がないため `ctx` を要求しない（struct doc
+    /// 「アクセサの ctx 必須化方針」参照）。
     pub fn table_name(&self) -> &str {
         self.arena.table_name()
     }
@@ -411,7 +434,7 @@ mod tests {
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
-        assert_eq!(index.len(), 1);
+        assert_eq!(index.len(&ctx).expect("len ok"), 1);
 
         let hits = index
             .search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 10)
@@ -439,7 +462,7 @@ mod tests {
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
-        assert!(index.is_empty());
+        assert!(index.is_empty(&ctx).expect("is_empty ok"));
 
         let hits = index
             .search(&ctx, &storage, &CpuScalarProvider, &[1.0, 0.0], 5)
@@ -843,5 +866,53 @@ mod tests {
 
         let result = index.search(&ctx, &storage_b, &CpuScalarProvider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: `len`/`is_empty` は構築元
+    // テナントの可視行数・行の有無という存在情報を返すため、`search` と同一の ctx 照合
+    // ゲートを持つ。別テナント（tenant-b。自身の可視行を持つ）の ctx を tenant-a の
+    // インデックスへ渡した場合、`search` は拒否されるだけでなく `len`/`is_empty` からも
+    // 存在情報を得られないことを確認する。
+    #[test]
+    fn len_and_is_empty_reject_a_context_different_from_the_one_used_at_build_time() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
+
+        // 一致する ctx では引き続き正常に値を返す（過剰拒否のガード）。
+        assert_eq!(index_a.len(&ctx_a).expect("len ok"), 1);
+        assert!(!index_a.is_empty(&ctx_a).expect("is_empty ok"));
+
+        // 別テナントの ctx（tenant-b。tenant-a のインデックスへ渡す）はどちらも拒否する。
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        assert!(matches!(
+            index_a.len(&ctx_b),
+            Err(RlsError::ContextMismatch)
+        ));
+        assert!(matches!(
+            index_a.is_empty(&ctx_b),
+            Err(RlsError::ContextMismatch)
+        ));
     }
 }

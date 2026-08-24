@@ -175,7 +175,7 @@ fn rls1_no_cross_tenant_leakage_across_visibility_rates() {
 
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build prefilter index");
         assert_eq!(
-            index.len(),
+            index.len(&ctx).expect("len ok"),
             target_ids.len(),
             "prefilter index must hold exactly the target-tenant rows (rate={visible_rate})"
         );
