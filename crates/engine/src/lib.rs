@@ -17,7 +17,10 @@
 //! TABLE-8）・TASK-102（検索カーネルの疎検索構成要素。BM25 Okapi。対象ビヘイビア:
 //! SEARCH-1, SEARCH-3。密検索との RRF 融合は TASK-103、評価ハーネス回帰テストは
 //! TASK-104 の管轄）・TASK-124（`VectorCore` trait・`PolicyContext`・検索カーネル
-//! provider 層の製品コア。対象ビヘイビア: CORE-1, CORE-2, CORE-13）。プロトコル層
+//! provider 層の製品コア。対象ビヘイビア: CORE-1, CORE-2, CORE-13）・TASK-103
+//! （密検索 provider（`kernel.rs`/`parallel_search.rs`）と疎検索（`sparse.rs`）を
+//! RRF で融合するハイブリッド検索。対象ビヘイビア: SEARCH-1, SEARCH-3。
+//! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）。プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!
@@ -28,6 +31,7 @@
 pub mod arena;
 pub mod catalog;
 pub mod core;
+pub mod hybrid;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;

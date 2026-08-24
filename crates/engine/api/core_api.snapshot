@@ -4,6 +4,7 @@
 pub mod arena;
 pub mod catalog;
 pub mod core;
+pub mod hybrid;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
