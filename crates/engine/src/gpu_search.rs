@@ -80,6 +80,12 @@ pub enum GpuSearchError {
     /// （codex レビュー指摘対応。重複行そのものの id は他テナントの存在情報を
     /// 漏らしうるためエラーには含めない）。
     DuplicateRowId,
+    /// 常駐行列構築時、`tenant_ids` の要素が [`crate::storage::MAX_TENANT_ID_LEN`]
+    /// を超過した（Cursor Bugbot 指摘対応: 容量チェックが `MAX_TENANT_ID_LEN` で
+    /// 予算計上する一方、実際の各要素長を検証せずに `clone` していたため、想定を
+    /// 超える長さの文字列で予算超過が起こり得た）。実際の文字列は他テナントの
+    /// 存在情報を漏らしうるため含めない。
+    TenantIdTooLong { len: usize, max: usize },
     /// クエリの `k` が [`MAX_BATCH_K`] を超過した、または 0。
     InvalidK { k: usize, max: usize },
     /// バッチ内の結果が、選出後に独立再検証したクエリ別可視集合と食い違った
@@ -117,6 +123,9 @@ impl fmt::Display for GpuSearchError {
             }
             GpuSearchError::DuplicateRowId => {
                 write!(f, "gpu_search: resident matrix contains duplicate row ids")
+            }
+            GpuSearchError::TenantIdTooLong { len, max } => {
+                write!(f, "gpu_search: tenant_id length {len} exceeds limit {max}")
             }
             GpuSearchError::InvalidK { k, max } => {
                 write!(f, "gpu_search: invalid k: {k} (must be 1..={max})")
@@ -364,6 +373,22 @@ impl ResidentMatrix {
             }
         }
 
+        // `tenant_ids` の各要素長を検証する（Cursor Bugbot 指摘対応: 上の容量
+        // チェックは `per_row_aux_bytes` を `MAX_TENANT_ID_LEN` で見積もって
+        // いるが、実際の要素長を検証せずに `tenant_ids.to_vec()` していたため、
+        // 見積もりを超える長さの文字列が混入すると総確保量が
+        // `MAX_BATCH_TOTAL_BYTES` の予算を超過し得た）。`storage.rs::encode_row`
+        // の tenant_id 長検証と同じ上限を fail-closed で適用する。
+        for tenant in tenant_ids {
+            let len = tenant.len();
+            if len > crate::storage::MAX_TENANT_ID_LEN as usize {
+                return Err(GpuSearchError::TenantIdTooLong {
+                    len,
+                    max: crate::storage::MAX_TENANT_ID_LEN as usize,
+                });
+            }
+        }
+
         let mut packed = Vec::with_capacity(packed_len);
         for row in vectors.chunks(dim) {
             for pair in row.chunks(2) {
@@ -588,7 +613,7 @@ impl GpuBatchEngine {
                 if q.tenant_id != row_tenant {
                     continue;
                 }
-                let score = dot_f32(&row_buf, q.vector);
+                let score = crate::kernel::dot(&row_buf, q.vector);
                 if !score.is_finite() {
                     continue;
                 }
@@ -614,13 +639,6 @@ impl GpuBatchEngine {
         }
         Ok(out)
     }
-}
-
-/// 内積のスカラー参照実装。`kernel.rs::dot` は `pub(crate)` で本モジュールから
-/// 見えないため、GPU 常駐行列の f16 往復ベクトルに対して同一の積和セマンティクス
-/// （左から右への逐次和）を独立に維持する。
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 #[cfg(test)]
@@ -764,6 +782,25 @@ mod tests {
         let vectors = [1.0f32, 0.0, 0.0, 1.0];
         let err = ResidentMatrix::build(&ids, &tenants, 2, &vectors).unwrap_err();
         assert_eq!(err, GpuSearchError::DuplicateRowId);
+    }
+
+    // Cursor Bugbot 指摘対応: 容量チェックは `MAX_TENANT_ID_LEN` で予算計上する
+    // だけで、実際の各 `tenant_ids` 要素長を検証していなかった。上限超過の
+    // tenant_id を含む入力を fail-closed で拒否することを確認する。
+    #[test]
+    fn resident_matrix_rejects_oversized_tenant_id() {
+        let ids = [1u64];
+        let oversized = "t".repeat(crate::storage::MAX_TENANT_ID_LEN as usize + 1);
+        let tenants = [oversized.clone()];
+        let vectors = [1.0f32, 0.0];
+        let err = ResidentMatrix::build(&ids, &tenants, 2, &vectors).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::TenantIdTooLong {
+                len: oversized.len(),
+                max: crate::storage::MAX_TENANT_ID_LEN as usize,
+            }
+        );
     }
 
     fn build_two_tenant_matrix() -> ResidentMatrix {
