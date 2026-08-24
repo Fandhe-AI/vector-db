@@ -5,6 +5,11 @@
 //! 呼び出し側が独自にテナント文字列を比較する経路を作らないことで、判定ロジックの
 //! 分岐を 1 箇所に集約し fail-closed を維持する（TASK-133 以降の RLS ポリシー評価は
 //! このパスを拡張する前提で設計している）。
+//!
+//! TASK-89（対象ビヘイビア: TABLE-9）の可視性判定はこの単一照合パスへ統合した。
+//! 判定の詳細は [`PolicyContext::is_visible`] の実装・テストを参照（ポインタ:
+//! TASK-89 / TABLE-9。spec 本文は転記しない）。テーブル単位の物理分離は本タスクの
+//! スコープ外（[`crate::tenant`] のモジュールドキュメント参照）。
 
 use std::collections::HashSet;
 
@@ -127,16 +132,21 @@ impl PolicyContext {
         &self.tenant_id
     }
 
-    /// テナント一致判定と可視性ラベル評価を単一の照合パスで行う（CORE-2）。
+    /// テナント一致判定と可視性ラベル評価を単一の照合パスで行う（CORE-2・
+    /// TASK-89・対象ビヘイビア: TABLE-9）。判定条件は下記実装本体と
+    /// このファイルのテストを参照（ポインタ: TABLE-9。挙動の詳細は spec 本文を
+    /// 転記しないためここでは記述しない）。
     ///
-    /// `row_tenant` が自テナントと一致し、かつ `row_visibility` が許可集合に含まれる
-    /// 場合にのみ `true`。呼び出し側（検索カーネル・行取得）はこのメソッド以外で
-    /// テナント比較を行わない。
+    /// 呼び出し側（検索カーネル・行取得）はこのメソッド以外でテナント比較を
+    /// 行わない。
     pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
-        row_tenant == self.tenant_id
-            && self
-                .allowed_visibilities
-                .contains(&AllowedVisibility::from(row_visibility))
+        let allowed = self
+            .allowed_visibilities
+            .contains(&AllowedVisibility::from(row_visibility));
+        if !allowed {
+            return false;
+        }
+        row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
 }
 
@@ -151,14 +161,22 @@ mod tests {
         assert!(ctx.is_visible("tenant-a", Visibility::Public));
     }
 
-    // 対象ビヘイビア: CORE-2。他テナントは不可視（可視性ラベルに関わらず）。
+    // 対象ビヘイビア: TABLE-9。
     #[test]
-    fn other_tenant_is_not_visible() {
+    fn other_tenant_public_row_is_visible_when_public_is_allowed() {
         let ctx =
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
-        assert!(!ctx.is_visible("tenant-b", Visibility::Public));
+        assert!(ctx.is_visible("tenant-b", Visibility::Public));
         assert!(!ctx.is_visible("tenant-b", Visibility::Private));
+    }
+
+    // 対象ビヘイビア: TABLE-9（fail-closed）。
+    #[test]
+    fn other_tenant_public_row_is_not_visible_without_public_grant() {
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        assert!(!ctx.is_visible("tenant-b", Visibility::Public));
     }
 
     // 対象ビヘイビア: CORE-2。Private は明示付与なしでは不可視（既定は最小権限）。
