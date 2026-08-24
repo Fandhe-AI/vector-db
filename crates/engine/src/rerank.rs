@@ -180,10 +180,9 @@ impl std::error::Error for RerankError {}
 /// この trait を実装して差し替える想定（オーナー判断・依存承認後に追加実装）。
 ///
 /// 実装契約: `candidates` に含まれる id 以外を返してはならず、返す件数は `final_k`
-/// 以下、スコアは有限、出力は融合スコア降順・同点 id 昇順でなくてよい（呼び出し元の
-/// [`rerank_candidates`] が独自スコアで再ソートするため）——ただし出力検証
-/// （[`rerank_candidates`]）は id 集合・件数・有限性のみを見て順序は問わない点に注意
-/// （リランカーは元候補の順序を無視して独自順位を作るのが本来の目的のため）。
+/// 以下、スコアは有限、かつ出力は実装が算出した独自スコアの降順・同点 id 昇順で
+/// 返さなければならない（[`rerank_candidates`] が [`RerankError::InvalidOutputOrder`]
+/// で検証する。呼び出し元側での再ソートは行わない）。
 pub trait Reranker: Send + Sync {
     /// `query_text` と `candidates`（高々 `final_k` 呼び出し元が要求する以上の件数を
     /// 含みうる）から再順位付け後の上位 `final_k` 件を返す。
@@ -424,20 +423,14 @@ impl Reranker for LexicalOverlapReranker {
             .collect();
 
         // 字句重なり件数の多い順（同点は候補順＝融合スコア降順を保つ安定ソート）で
-        // 並べ替え、その位置から字句一致順位 rank_lexical（1-based）を得る。
+        // 並べ替える。並べ替え後の位置（enumerate の rank_idx）がそのまま字句一致順位
+        // rank_lexical（1-based）になるため、BTreeMap 経由の再引きは不要（id 集合の
+        // 不一致による `expect` 到達不能パスをそもそも作らない）。
         overlap_ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
 
-        let mut lexical_rank: std::collections::BTreeMap<u64, usize> =
-            std::collections::BTreeMap::new();
-        for (rank_idx, (id, _, _)) in overlap_ranked.iter().enumerate() {
-            lexical_rank.insert(*id, rank_idx.saturating_add(1));
-        }
-
         let mut scores: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
-        for (id, rank_fused, _) in &overlap_ranked {
-            let rank_lexical = *lexical_rank
-                .get(id)
-                .expect("lexical_rank was built from the same id set as overlap_ranked");
+        for (rank_idx, (id, rank_fused, _)) in overlap_ranked.iter().enumerate() {
+            let rank_lexical = rank_idx.saturating_add(1);
             let contribution_fused = self.fused_weight / (self.k_const + *rank_fused as f64);
             let contribution_lexical = self.lexical_weight / (self.k_const + rank_lexical as f64);
             let entry = scores.entry(*id).or_insert(0.0);
@@ -568,28 +561,21 @@ mod tests {
 
     #[test]
     fn lexical_overlap_reranker_tie_breaks_by_id_ascending() {
-        let cfg = RerankConfig::new(10, 3).unwrap();
-        // id=5・id=6 とも字句一致件数・融合スコア寄与が同一になる構成（両方とも
-        // クエリと一致しない文書のため字句重なり 0、融合スコアは互いに異なるが
-        // 順位融合後に同点になるよう入力の rank そのものを同一にはできないため、
-        // ここでは同点を作るために対称な重みを用いた別テストへ委譲せず、単に
-        // 決定的なタイブレーク（id 昇順）が最終出力の同点グループに適用されることを
-        // 別のシンプルな同点ケースで確認する。
-        let candidates = [cand(6, 1.0, "x"), cand(5, 1.0, "x")];
-        // 候補入力は融合スコア降順・同点 id 昇順の契約が必要なため、id 順に並べ直す。
-        let candidates = {
-            let mut v = candidates.to_vec();
-            v.sort_by(|a, b| {
-                b.fused_score
-                    .total_cmp(&a.fused_score)
-                    .then(a.id.cmp(&b.id))
-            });
-            v
-        };
+        // 真の同点スコアを作るため、rank_fused と rank_lexical が入れ替わる構成にする
+        // （既定の等重み: fused_weight = lexical_weight = 1.0）。
+        // id=5: rank_fused=1（融合スコア降順で先頭）・rank_lexical=2（字句重なり少）
+        // id=6: rank_fused=2                       ・rank_lexical=1（字句重なり多）
+        // スコア = weight/(k+rank_fused) + weight/(k+rank_lexical) は rank の組が
+        // 入れ替わっているだけなので id=5・id=6 で厳密に一致し、同点タイブレーク
+        // （id 昇順）分岐（本ファイル `LexicalOverlapReranker::rerank` の
+        // `.then(a.id.cmp(&b.id))`）を実際に通過する。
+        let cfg = RerankConfig::new(10, 2).unwrap();
+        let candidates = [cand(5, 3.0, "alpha"), cand(6, 2.0, "alpha bravo")];
         let reranker = LexicalOverlapReranker::default();
-        let hits = rerank_candidates(&reranker, "nomatch", &candidates, &cfg).expect("ok");
+        let hits = rerank_candidates(&reranker, "alpha bravo", &candidates, &cfg).expect("ok");
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].id, 5);
+        assert_eq!(hits[0].score, hits[1].score, "must be a true score tie");
+        assert_eq!(hits[0].id, 5, "tie must break by ascending id");
         assert_eq!(hits[1].id, 6);
     }
 
