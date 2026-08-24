@@ -346,6 +346,10 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
     let hybrid_cfg = RrfConfig::default();
     let rerank_cfg = RerankConfig::default();
     let reranker = LexicalOverlapReranker::default();
+    // クエリ・プールの二重ループ内で毎回線形探索しないよう、id → text のルック
+    // アップテーブルをループ外で 1 度だけ構築する（doc 数 × プール数の掛け算を避ける）。
+    let doc_text_by_id: BTreeMap<u64, &str> =
+        docs.iter().map(|d| (d.id, d.text.as_str())).collect();
 
     let mut total_correct = 0usize;
     let mut baseline_hits20 = 0usize;
@@ -404,10 +408,7 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
             .map(|h| RerankCandidate {
                 id: h.id,
                 fused_score: h.score,
-                text: docs
-                    .iter()
-                    .find(|d| d.id == h.id)
-                    .map_or("", |d| d.text.as_str()),
+                text: doc_text_by_id.get(&h.id).copied().unwrap_or(""),
             })
             .collect();
         let reranked = rerank_candidates(&reranker, &case.query_text, &candidates, &rerank_cfg)
@@ -549,12 +550,17 @@ enum GateThreshold {
     Value(f64),
 }
 
-/// `RERANK_RECALL_MIN_R20_LARGE` 環境変数を読み取る（`(0.0, 1.0]` の絶対下限）。
-/// 未設定・空文字列は [`GateThreshold::NotConfigured`]、非数値・範囲外は
-/// fail-closed（`Err`）、それ以外は [`GateThreshold::Value`] を返す。数値そのもの
-/// （spec の Recall 下限）はこのファイル・ログのいずれにもハードコードしない
-/// （`.claude/rules/spec-confidentiality.md`）。
-fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
+/// 環境変数を f64 として読み取り、`validate` で許容範囲を検査する共通ヘルパ
+/// （[`recall_threshold_from_env`]/[`improvement_threshold_from_env`] が範囲だけを
+/// 差し替えて再利用する）。未設定・空文字列は [`GateThreshold::NotConfigured`]、
+/// 非数値・範囲外は fail-closed（`Err`）、それ以外は [`GateThreshold::Value`] を
+/// 返す。数値そのもの（spec の Recall 下限）はこのファイル・ログのいずれにも
+/// ハードコードしない（`.claude/rules/spec-confidentiality.md`）。
+fn threshold_from_env(
+    var: &str,
+    validate: impl Fn(f64) -> bool,
+    range_desc: &str,
+) -> Result<GateThreshold, String> {
     let raw = match std::env::var(var) {
         Ok(v) => v,
         Err(std::env::VarError::NotPresent) => return Ok(GateThreshold::NotConfigured),
@@ -569,19 +575,25 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     let value: f64 = trimmed
         .parse()
         .map_err(|_| format!("{var} must be a floating-point number"))?;
-    if !(value > 0.0 && value <= 1.0) {
-        return Err(format!("{var} must be within (0.0, 1.0]"));
+    if !validate(value) {
+        return Err(format!("{var} must be within {range_desc}"));
     }
     Ok(GateThreshold::Value(value))
 }
 
-/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る（改善幅 = after − baseline
-/// の下限）。改善幅は最大でも `1.0`（after=1.0, baseline=0.0 の極端な場合）だが、
-/// 通常は小さい正の値を想定するため許容範囲は [`recall_threshold_from_env`] と同じ
-/// `(0.0, 1.0]` とする（改善幅 0 以下＝改善なしは値として設定する意味がないため、
-/// 下限も他の `RERANK_RECALL_MIN_*` と同じ検証関数を再利用する）。
+/// `RERANK_RECALL_MIN_R20_LARGE` 環境変数を読み取る（`(0.0, 1.0]` の絶対下限。
+/// 0 は「Recall@20 が 0 でよい」という無意味な設定になるため許容しない）。
+fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
+    threshold_from_env(var, |v| v > 0.0 && v <= 1.0, "(0.0, 1.0]")
+}
+
+/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る（改善幅 = after −
+/// baseline の下限）。改善幅 0 は「改善は必須ではないが悪化は許さない」という
+/// 正当な設定であり（層 A が独立にアサートする `after_hits20 >= baseline_hits20`
+/// と同じ意図）、[`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり
+/// `[0.0, 1.0]`（0 を含む）を許容範囲とする。
 fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
-    recall_threshold_from_env(var)
+    threshold_from_env(var, |v| (0.0..=1.0).contains(&v), "[0.0, 1.0]")
 }
 
 /// `RERANK_RECALL_REQUIRE_THRESHOLDS` 環境変数（`"1"` のときのみ true）。
@@ -593,14 +605,20 @@ fn strict_thresholds_required() -> bool {
         .unwrap_or(false)
 }
 
-/// [`recall_threshold_from_env`]/[`improvement_threshold_from_env`] を読み取り、
-/// [`GateThreshold::NotConfigured`] を strict モード（[`strict_thresholds_required`]）
-/// に応じて分岐させる共通ヘルパ（`hybrid_recall.rs::resolve_gate_threshold` と
-/// 同一の役割）。strict モード有効時の未設定は fail-closed（`panic!`）、無効時は
-/// `None`（呼び出し側で「対象外」を出力して early return する）。非数値・範囲外は
-/// strict モードの有無によらず常に fail-closed とする。
-fn resolve_gate_threshold(var: &str) -> Option<f64> {
-    match recall_threshold_from_env(var) {
+/// `resolver`（[`recall_threshold_from_env`] または [`improvement_threshold_from_env`]）
+/// を読み取り、[`GateThreshold::NotConfigured`] を strict モード
+/// （[`strict_thresholds_required`]）に応じて分岐させる共通ヘルパ（`hybrid_recall.rs::
+/// resolve_gate_threshold` と同一の役割）。strict モード有効時の未設定は
+/// fail-closed（`panic!`）、無効時は `None`（呼び出し側で「対象外」を出力して
+/// early return する）。非数値・範囲外は strict モードの有無によらず常に
+/// fail-closed とする。[`resolve_gate_threshold`]/[`resolve_improvement_gate_
+/// threshold`] が resolver だけを差し替えて再利用し、strict モード時の panic
+/// メッセージ等の実装を層 B の 2 つの閾値（絶対下限・改善幅）間でドリフトさせない。
+fn resolve_gate_threshold_with(
+    var: &str,
+    resolver: impl Fn(&str) -> Result<GateThreshold, String>,
+) -> Option<f64> {
+    match resolver(var) {
         Ok(GateThreshold::Value(v)) => Some(v),
         Ok(GateThreshold::NotConfigured) => {
             if strict_thresholds_required() {
@@ -612,6 +630,18 @@ fn resolve_gate_threshold(var: &str) -> Option<f64> {
         }
         Err(msg) => panic!("{var} invalid: {msg}"),
     }
+}
+
+/// [`RERANK_RECALL_MIN_R20_LARGE`] 用の [`resolve_gate_threshold_with`]。
+fn resolve_gate_threshold(var: &str) -> Option<f64> {
+    resolve_gate_threshold_with(var, recall_threshold_from_env)
+}
+
+/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 用の [`resolve_gate_threshold_with`]
+/// （許容範囲 `[0.0, 1.0]` の [`improvement_threshold_from_env`] を使う点のみ
+/// [`resolve_gate_threshold`] と異なる）。
+fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
+    resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
 /// TASK-108（SEARCH-7）層 B: 大規模段のリランキング後の最終 Recall@20 が
@@ -627,20 +657,8 @@ fn resolve_gate_threshold(var: &str) -> Option<f64> {
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make rerank-regression で実行する"]
 fn rerank_recall_large_scale_threshold_gate() {
     let min_r20_abs = resolve_gate_threshold("RERANK_RECALL_MIN_R20_LARGE");
-    let min_r20_improvement = match improvement_threshold_from_env(
-        "RERANK_RECALL_MIN_R20_IMPROVEMENT",
-    ) {
-        Ok(GateThreshold::Value(v)) => Some(v),
-        Ok(GateThreshold::NotConfigured) => {
-            if strict_thresholds_required() {
-                panic!(
-                    "RERANK_RECALL_MIN_R20_IMPROVEMENT is not configured but RERANK_RECALL_REQUIRE_THRESHOLDS=1 (strict mode: this run must evaluate all RERANK_RECALL_MIN_* thresholds; see .github/workflows/recall.yml and the recall-gate environment variables)"
-                );
-            }
-            None
-        }
-        Err(msg) => panic!("RERANK_RECALL_MIN_R20_IMPROVEMENT invalid: {msg}"),
-    };
+    let min_r20_improvement =
+        resolve_improvement_gate_threshold("RERANK_RECALL_MIN_R20_IMPROVEMENT");
 
     if min_r20_abs.is_none() && min_r20_improvement.is_none() {
         println!(
