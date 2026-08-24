@@ -25,13 +25,19 @@
 //!   spec の数値基準は使わないため public 資産に閾値を持ち込まない
 //!   （`.claude/rules/spec-confidentiality.md`）。
 //! - 層 B（`#[ignore]`・`make recall-regression` 経由）: spec 由来の Recall 下限
-//!   （`HYBRID_RECALL_MIN_*` 環境変数。`.github/workflows/recall.yml` が Actions
-//!   variables から注入）と実測値を比較する閾値ゲート。未設定・空文字列は
-//!   「ゲート未設定＝明示的に対象外」として成功終了し（silent skip にはしない。
-//!   `parallel_bench.rs::core5_requested_from_env` と同じ opt-in 方式）、設定済みで
-//!   非数値・範囲外は fail-closed でテスト失敗とする（[`GateThreshold`] 参照）。
-//!   ログには実測値と pass/fail のみを出力する（`crates/engine/benches/
-//!   parallel_bench.rs` と同方針）。実測値（Recall@k）は
+//!   （`HYBRID_RECALL_MIN_*` 環境変数。`.github/workflows/recall.yml` が
+//!   environment `recall-gate` の Actions variables から注入）と実測値を比較する
+//!   閾値ゲート。既定（非 strict）では未設定・空文字列を「ゲート未設定＝明示的に
+//!   対象外」として成功終了する（silent skip にはしない。
+//!   `parallel_bench.rs::core5_requested_from_env` と同じ opt-in 方式）。
+//!   `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（`recall.yml` の `workflow_dispatch`
+//!   実行時のみ注入される strict モードフラグ）が立っている場合は、未設定も
+//!   非数値・範囲外と同様に fail-closed でテスト失敗とする——environment 作成漏れ・
+//!   variable 名の誤り・variable の誤削除により「一度も評価していない run」が
+//!   基準を満たした run と同じ green になる事故を防ぐ（PR #147 codex-review P1
+//!   継続指摘対応。[`GateThreshold`]・[`resolve_gate_threshold`] 参照）。ログには
+//!   実測値と pass/fail のみを出力する（`crates/engine/benches/parallel_bench.rs`
+//!   と同方針）。実測値（Recall@k）は
 //!   [`RecallResult::recall20`]/[`RecallResult::recall100`] が定義するとおり
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
 //!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
@@ -559,22 +565,20 @@ fn hybrid_recall_large_scale_regression() {
 
 /// `HYBRID_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果。
 enum GateThreshold {
-    /// 環境変数が未設定、または GitHub Actions の未設定 repo variable が解決する
-    /// 空文字列（`.github/workflows/bench.yml` の `BENCH_MAX_P95_MS` 等と同じ経路。
-    /// `crates/engine/benches/parallel_bench.rs::min_recall_from_env` 冒頭コメント
-    /// 参照）。ゲートが repo variables 未設定の PR を塞がないよう、この場合は
-    /// fail ではなく「ゲート未設定＝明示的に対象外」として扱う（silent skip には
-    /// しない。`parallel_bench.rs::core5_requested_from_env` の opt-in 方式と同型）。
+    /// 環境変数が未設定、または GitHub Actions の未設定 repo/environment variable が
+    /// 解決する空文字列（`.github/workflows/bench.yml` の `BENCH_MAX_P95_MS` 等と
+    /// 同じ経路。`crates/engine/benches/parallel_bench.rs::min_recall_from_env`
+    /// 冒頭コメント参照）。
     NotConfigured,
     /// 設定済みで `(0.0, 1.0]` の範囲内。この場合のみ実測値と比較する。
     Value(f64),
 }
 
 /// `HYBRID_RECALL_MIN_*` 環境変数を読み取る。未設定・空文字列は
-/// [`GateThreshold::NotConfigured`]（ゲート対象外）、非数値・範囲外は
-/// fail-closed（`Err`。呼び出し側でテスト失敗として扱う）、それ以外は
-/// [`GateThreshold::Value`] を返す。数値そのもの（spec の Recall 下限）はこの
-/// ファイル・ログのいずれにもハードコードしない（`.claude/rules/spec-confidentiality.md`）。
+/// [`GateThreshold::NotConfigured`]、非数値・範囲外は fail-closed（`Err`。呼び出し側で
+/// テスト失敗として扱う）、それ以外は [`GateThreshold::Value`] を返す。数値そのもの
+/// （spec の Recall 下限）はこのファイル・ログのいずれにもハードコードしない
+/// （`.claude/rules/spec-confidentiality.md`）。
 fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     let raw = match std::env::var(var) {
         Ok(v) => v,
@@ -596,24 +600,64 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     Ok(GateThreshold::Value(value))
 }
 
+/// `HYBRID_RECALL_REQUIRE_THRESHOLDS` 環境変数（`"1"` のときのみ true）。
+/// `.github/workflows/recall.yml` の `workflow_dispatch` 実行時のみ注入される
+/// strict モードフラグ（PR #147 codex-review P1 継続指摘対応）。
+///
+/// strict モードが無効（ローカル `make recall-regression`・仮に PR 経由で
+/// `--ignored` を明示指定して実行した場合）は、閾値未設定を「対象外」として
+/// 明示的に成功終了する opt-in 挙動を維持する
+/// （`parallel_bench.rs::core5_requested_from_env` と同型）。
+///
+/// strict モードが有効な場合は未設定を「一度も評価していない run」とみなし、
+/// 非数値・範囲外と同様に fail-closed でテスト失敗とする。これにより
+/// environment 作成漏れ・variable 名の打ち間違い・variable の誤削除で
+/// `HYBRID_RECALL_MIN_*` が読めなくなった週次 run が、実際に基準を満たした
+/// run と同じ green として埋もれる事故を防ぐ（PR #147 codex-review P1 指摘対応）。
+fn strict_thresholds_required() -> bool {
+    std::env::var("HYBRID_RECALL_REQUIRE_THRESHOLDS")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// [`recall_threshold_from_env`] を読み取り、[`GateThreshold::NotConfigured`] を
+/// strict モード（[`strict_thresholds_required`]）に応じて分岐させる共通ヘルパ。
+/// strict モード有効時の未設定は fail-closed（`panic!`）、無効時は `None`
+/// （呼び出し側で「対象外」を出力して early return する）。非数値・範囲外は
+/// strict モードの有無によらず常に fail-closed とする。
+fn resolve_gate_threshold(var: &str) -> Option<f64> {
+    match recall_threshold_from_env(var) {
+        Ok(GateThreshold::Value(v)) => Some(v),
+        Ok(GateThreshold::NotConfigured) => {
+            if strict_thresholds_required() {
+                panic!(
+                    "{var} is not configured but HYBRID_RECALL_REQUIRE_THRESHOLDS=1 (strict mode: this run must evaluate all HYBRID_RECALL_MIN_* thresholds; see .github/workflows/recall.yml and the recall-gate environment variables)"
+                );
+            }
+            None
+        }
+        Err(msg) => panic!("{var} invalid: {msg}"),
+    }
+}
+
 /// TASK-104（SEARCH-1）層 B: 小規模段 Recall@20（[`RecallResult::recall20`]。分母は
 /// 理論上限 `ceil20`）が `HYBRID_RECALL_MIN_R20_SMALL`（Actions variables 由来）以上
-/// であることを確認する閾値ゲート。未設定は「対象外」として明示的に成功終了し
-/// （[`GateThreshold::NotConfigured`]）、設定済みで非数値・範囲外は fail-closed で
-/// テスト失敗とする（skip しない）。ログには実測値と pass/fail のみを出力し、
+/// であることを確認する閾値ゲート。未設定は既定（非 strict）では「対象外」として
+/// 明示的に成功終了し、strict モード（[`strict_thresholds_required`]）では
+/// fail-closed でテスト失敗とする。設定済みで非数値・範囲外は常に fail-closed
+/// でテスト失敗とする（skip しない）。ログには実測値と pass/fail のみを出力し、
 /// 注入された閾値の数値は出力しない。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_small_scale_threshold_gate() {
-    let min_r20 = match recall_threshold_from_env("HYBRID_RECALL_MIN_R20_SMALL") {
-        Ok(GateThreshold::NotConfigured) => {
+    let min_r20 = match resolve_gate_threshold("HYBRID_RECALL_MIN_R20_SMALL") {
+        Some(v) => v,
+        None => {
             println!(
                 "hybrid_recall_small_scale_threshold_gate: HYBRID_RECALL_MIN_R20_SMALL not configured; gate not enabled (explicit no-op, not a failure)"
             );
             return;
         }
-        Ok(GateThreshold::Value(v)) => v,
-        Err(msg) => panic!("HYBRID_RECALL_MIN_R20_SMALL invalid: {msg}"),
     };
 
     let (docs, qa) = generate_corpus(
@@ -637,19 +681,16 @@ fn hybrid_recall_small_scale_threshold_gate() {
 /// `HYBRID_RECALL_MIN_R20_LARGE`・`HYBRID_RECALL_MIN_R100_LARGE` 以上であることを
 /// 確認する閾値ゲート。契約は [`hybrid_recall_small_scale_threshold_gate`] と同一だが、
 /// 2 つの下限を独立に解決する（片方のみ設定済みの場合は設定済みの側だけを判定し、
-/// 未設定側は「対象外」を出力する。両方未設定の場合のみコーパス生成前に早期return
-/// して成功終了する）。
+/// 未設定側は既定では「対象外」を出力する。両方未設定かつ非 strict の場合のみ
+/// コーパス生成前に早期 return して成功終了する。strict モードでは
+/// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
-    let min_r20 = recall_threshold_from_env("HYBRID_RECALL_MIN_R20_LARGE")
-        .unwrap_or_else(|msg| panic!("HYBRID_RECALL_MIN_R20_LARGE invalid: {msg}"));
-    let min_r100 = recall_threshold_from_env("HYBRID_RECALL_MIN_R100_LARGE")
-        .unwrap_or_else(|msg| panic!("HYBRID_RECALL_MIN_R100_LARGE invalid: {msg}"));
+    let min_r20 = resolve_gate_threshold("HYBRID_RECALL_MIN_R20_LARGE");
+    let min_r100 = resolve_gate_threshold("HYBRID_RECALL_MIN_R100_LARGE");
 
-    if matches!(min_r20, GateThreshold::NotConfigured)
-        && matches!(min_r100, GateThreshold::NotConfigured)
-    {
+    if min_r20.is_none() && min_r100.is_none() {
         println!(
             "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R20_LARGE/HYBRID_RECALL_MIN_R100_LARGE not configured; gate not enabled (explicit no-op, not a failure)"
         );
@@ -668,28 +709,28 @@ fn hybrid_recall_large_scale_threshold_gate() {
 
     let mut pass = true;
     match min_r20 {
-        GateThreshold::Value(min) => {
+        Some(min) => {
             let pass20 = recall20 >= min;
             pass &= pass20;
             println!(
                 "hybrid_recall_large_scale_threshold_gate: recall@20={recall20:.4} pass20={pass20}"
             );
         }
-        GateThreshold::NotConfigured => {
+        None => {
             println!(
                 "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R20_LARGE not configured; sub-check not enabled"
             );
         }
     }
     match min_r100 {
-        GateThreshold::Value(min) => {
+        Some(min) => {
             let pass100 = recall100 >= min;
             pass &= pass100;
             println!(
                 "hybrid_recall_large_scale_threshold_gate: recall@100={recall100:.4} pass100={pass100}"
             );
         }
-        GateThreshold::NotConfigured => {
+        None => {
             println!(
                 "hybrid_recall_large_scale_threshold_gate: HYBRID_RECALL_MIN_R100_LARGE not configured; sub-check not enabled"
             );

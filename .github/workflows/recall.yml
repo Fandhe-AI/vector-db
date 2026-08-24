@@ -9,8 +9,17 @@ name: Recall
 # （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
 # 方針）。
 #
-# 本ハーネスは決定的合成コーパス（外部接続不要）のため、`bench.yml` と異なり schedule
-# トリガも設定する（週次。CI 混雑回避のため PR/push トリガとは独立した深夜 UTC 帯）。
+# `schedule` トリガは意図的に外している（`workflow_dispatch` のみ。`bench.yml` の
+# `BENCH_CORE5` 未接続時と同型の判断。PR #147 codex-review P1 継続指摘対応）。
+# `HYBRID_RECALL_MIN_*` を environment `recall-gate` の variables として設定・
+# strict モード（下記）が正しく機能することを確認できるまでは、無人で定期実行される
+# `schedule` を有効にしない——environment 未作成・variable 名の誤り・variable の
+# 誤削除で閾値が読めなくなった場合、strict モード導入前は「一度も評価していない run」
+# と「基準を満たした run」が同じ green として埋もれてしまうため。environment
+# `recall-gate` の variables 設定・strict モードでの手動実行（`workflow_dispatch`）
+# による疎通確認が済んだら、`- cron: "0 4 * * 1"`（毎週月曜 04:00 UTC。`bench.yml`
+# 想定の 03:00 UTC 帯と重ならないようずらす）で `schedule` を再度追加すること
+# （README「Recall 回帰ハーネスの repo variables」参照）。
 #
 # `pull_request` トリガは意図的に設定しない（PR #147 codex-review P0 指摘で追加後に
 # 巻き戻した。`pull_request` で起動する job は PR 側の untrusted なコード
@@ -18,9 +27,9 @@ name: Recall
 # `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public
 # Actions ログから spec の数値基準を取得できてしまう
 # ——`.claude/rules/spec-confidentiality.md` の P0 違反。層 B（spec 閾値ゲート）は
-# 既定ブランチの trusted なコードのみが走る `schedule`（週次）＋ `workflow_dispatch`
-# （手動）に限定する。PR のマージ判定は層 A（`crates/engine/tests/hybrid_recall.rs`
-# の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
+# 既定ブランチの trusted なコードのみが走る `workflow_dispatch`（手動。将来的には
+# `schedule` も）に限定する。PR のマージ判定は層 A（`crates/engine/tests/
+# hybrid_recall.rs` の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
 # `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
 # 役割分担にする（README「Recall 回帰ハーネスの repo variables」・
 # `docs/design/hybrid-recall-regression.md` 参照）。
@@ -56,10 +65,15 @@ name: Recall
 # 既存の `if: github.ref == 'refs/heads/main'`・`checkout ref: main` は
 # defense-in-depth として維持する（environment 保護がバイパスされた場合の
 # 追加防御。単独では実行境界として不十分な点は上記のとおり）。
+#
+# `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（下の Run step 参照）は strict モードを
+# 有効化するフラグで、`HYBRID_RECALL_MIN_*` が未設定の場合を「一度も評価していない
+# run」として fail-closed にする（`crates/engine/tests/hybrid_recall.rs::
+# resolve_gate_threshold` 参照。ローカル `make recall-regression` にはこのフラグを
+# 注入しないため、そちらは従来どおり未設定を opt-in で「対象外」として成功終了する。
+# PR #147 codex-review P1 継続指摘対応）。
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "0 4 * * 1" # 毎週月曜 04:00 UTC（bench.yml 想定の 03:00 UTC 帯と重ならないようずらす）
 
 permissions:
   contents: read
@@ -80,7 +94,7 @@ jobs:
   recall-regression:
     # `workflow_dispatch` で main 以外の ref が選ばれた場合は job ごとスキップする
     # （冒頭コメント参照。spec 閾値を任意 ref の書き換えコードへ渡さないための
-    # fail-closed な制約。`schedule` は常に既定ブランチで走るため影響しない）。
+    # fail-closed な制約）。
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -107,12 +121,21 @@ jobs:
         # `environment:` 参照。main のみに制限した deployment branch policy 付き）の
         # Actions variables（`vars.*`）から注入する。参照記法は repo レベル variables
         # と同じ `vars.*` だが、job に `environment:` を指定しているため解決スコープが
-        # environment レベルに切り替わる。未設定（空文字列に解決される）場合は
-        # `crates/engine/tests/hybrid_recall.rs` 側が「ゲート未設定＝明示的に対象外」を
-        # 出力して成功終了し、設定済みで非数値・範囲外の場合のみ fail-closed で非ゼロ
-        # 終了する。実測ログには実測値と pass/fail のみが出力され、注入された閾値の
-        # 数値そのものは出力しない。
+        # environment レベルに切り替わる。
+        #
+        # `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント参照）を
+        # 常に注入する: `HYBRID_RECALL_MIN_*` が未設定（environment 作成漏れ・
+        # variable 名の誤り・variable の誤削除を含む）の場合、この workflow からの
+        # 実行では fail-closed でテスト失敗とし、「一度も評価していない run」を
+        # green にしない。ローカルの `make recall-regression` にはこのフラグを
+        # 注入しないため、そちらは未設定を「対象外」として成功終了する opt-in
+        # 挙動を維持する（`crates/engine/tests/hybrid_recall.rs::
+        # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログには
+        # 実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
+        # 出力しない。
         env:
+          HYBRID_RECALL_REQUIRE_THRESHOLDS: "1"
           HYBRID_RECALL_MIN_R20_SMALL: ${{ vars.HYBRID_RECALL_MIN_R20_SMALL }}
           HYBRID_RECALL_MIN_R20_LARGE: ${{ vars.HYBRID_RECALL_MIN_R20_LARGE }}
           HYBRID_RECALL_MIN_R100_LARGE: ${{ vars.HYBRID_RECALL_MIN_R100_LARGE }}

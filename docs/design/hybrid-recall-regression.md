@@ -31,16 +31,20 @@
   で PR ごとに常時実行されるため、**PR のマージ判定は層 A が担う**
 - **層 B**（`#[ignore]`。`make recall-regression` 経由）: spec 由来の Recall 下限
   （`HYBRID_RECALL_MIN_R20_SMALL`・`HYBRID_RECALL_MIN_R20_LARGE`・
-  `HYBRID_RECALL_MIN_R100_LARGE`。`.github/workflows/recall.yml` が Actions
-  variables から注入）と実測値を比較する閾値ゲート。未設定（GitHub Actions では
-  空文字列に解決される repo variable も含む）は「ゲート未設定＝明示的に対象外」を
-  出力して成功終了し（`crates/engine/benches/parallel_bench.rs::
-  core5_requested_from_env` と同じ opt-in パターン）、設定済みで非数値・範囲外は
-  fail-closed でテスト失敗とする。ログには実測値と pass/fail のみを出力する
-  （README「Recall 回帰ハーネスの repo variables」参照）。
+  `HYBRID_RECALL_MIN_R100_LARGE`。`.github/workflows/recall.yml` が environment
+  `recall-gate` の Actions variables から注入）と実測値を比較する閾値ゲート。
+  ローカルの `make recall-regression`（`HYBRID_RECALL_REQUIRE_THRESHOLDS` を
+  注入しない）では未設定（GitHub Actions では空文字列に解決される variable も
+  含む）は「ゲート未設定＝明示的に対象外」を出力して成功終了し
+  （`crates/engine/benches/parallel_bench.rs::core5_requested_from_env` と同じ
+  opt-in パターン）、設定済みで非数値・範囲外は fail-closed でテスト失敗とする。
+  `recall.yml` からの実行は strict モード（下記「strict モードによる誤 green
+  防止」参照）が既定で有効なため、未設定も fail-closed になる。ログには実測値と
+  pass/fail のみを出力する（README「Recall 回帰ハーネスの repo variables」参照）。
 
   `.github/workflows/recall.yml` は `pull_request` トリガを**意図的に持たない**
-  （`workflow_dispatch` ＋ 週次 `schedule` のみ）。`pull_request` で起動する job は
+  （現状 `workflow_dispatch` のみ。`schedule` は下記「strict モードによる誤 green
+  防止」の疎通確認後に再追加する）。`pull_request` で起動する job は
   PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行する
   ため、層 B を PR トリガにすると PR がコードを書き換えて `HYBRID_RECALL_MIN_*`
   （spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから
@@ -79,8 +83,31 @@
   改変 YAML から `if`／`checkout ref` を外して `workflow_dispatch` したとしても
   environment 自体にアクセスできず閾値を取得できない。`if:
   github.ref == 'refs/heads/main'`・`checkout ref: main` は environment 保護に
-  対する defense-in-depth として維持する（`schedule` は常に既定ブランチで走るため、
-  これらの制約による影響はない）
+  対する defense-in-depth として維持する。
+
+### strict モードによる誤 green 防止（`HYBRID_RECALL_REQUIRE_THRESHOLDS`）
+
+層 B の opt-in 方式（未設定＝「対象外」として成功終了）は PR 実行を想定した
+設計だったが、`recall.yml` からの実行（現状 `workflow_dispatch` のみ）では
+別の問題を生む: environment `recall-gate` の作成漏れ・variable 名の打ち間違い・
+variable の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、opt-in 方式では
+「一度も評価していない run」が「基準を満たした run」と同じ green になり、閾値
+ゲートが実質的に機能を失っていても気付けない（codex-review P1 継続指摘）。
+
+そこで `crates/engine/tests/hybrid_recall.rs` に `HYBRID_RECALL_REQUIRE_THRESHOLDS`
+環境変数（`"1"` のときのみ true。[`strict_thresholds_required`]）による strict
+モードを追加した。`recall.yml` は Run step で常にこのフラグを注入し、strict
+モード下では未設定を非数値・範囲外と同様に fail-closed でテスト失敗とする
+（[`resolve_gate_threshold`]）。ローカルの `make recall-regression` にはこの
+フラグを注入しないため、そちらは従来どおり opt-in 挙動を維持する。
+
+`.github/workflows/bench.yml`（TASK-127）で codex-review に受理された前例
+（CORE-5 未接続の間は `schedule` を有効化せず `workflow_dispatch` のみに限定し、
+接続確認後に `schedule` を再度追加する）と同型の判断として、`recall.yml` も
+`schedule` トリガを一旦外し `workflow_dispatch` のみとした。environment
+`recall-gate` の variables 設定・strict モードでの手動実行による疎通確認が
+済んでから `schedule`（週次）を再度追加する（README「Recall 回帰ハーネスの
+repo variables」参照）。
 
 ### コーパス・QA セットの生成
 
@@ -206,3 +233,5 @@ PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に�
 
 [`SparseIndex::build`]: ../../crates/engine/src/sparse.rs
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs
+[`strict_thresholds_required`]: ../../crates/engine/tests/hybrid_recall.rs
+[`resolve_gate_threshold`]: ../../crates/engine/tests/hybrid_recall.rs
