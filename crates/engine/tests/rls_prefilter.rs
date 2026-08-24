@@ -183,7 +183,7 @@ fn rls1_no_cross_tenant_leakage_across_visibility_rates() {
         for query_idx in 0..5u64 {
             let query = random_query(9000 + rate_idx as u64 * 10 + query_idx);
             let hits = index
-                .search(&CpuScalarProvider, &query, 20)
+                .search(&ctx, &CpuScalarProvider, &query, 20)
                 .expect("search ok");
             for hit in &hits {
                 assert!(
@@ -222,7 +222,7 @@ fn rls2_lower_visibility_rate_does_not_regress_search_only_latency() {
         let query = random_query(seed * 100);
         for _ in 0..WARMUP_TRIALS {
             let _ = index
-                .search(&CpuScalarProvider, &query, 20)
+                .search(&ctx, &CpuScalarProvider, &query, 20)
                 .expect("warmup search");
         }
 
@@ -230,7 +230,7 @@ fn rls2_lower_visibility_rate_does_not_regress_search_only_latency() {
         for _ in 0..TIMED_TRIALS {
             let start = Instant::now();
             let _ = index
-                .search(&CpuScalarProvider, &query, 20)
+                .search(&ctx, &CpuScalarProvider, &query, 20)
                 .expect("timed search");
             durations.push(start.elapsed());
         }
@@ -300,7 +300,9 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
 
     // ケース 1: k(10) > 可視件数(5) → min(k, 5) = 5 件、呼び出し 1 回・要求 k=10。
     let provider = CountingProvider::new();
-    let hits = index.search(&provider, &query, 10).expect("search ok");
+    let hits = index
+        .search(&ctx, &provider, &query, 10)
+        .expect("search ok");
     assert_eq!(hits.len(), 5);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -314,7 +316,7 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
 
     // ケース 2: k(3) < 可視件数(5) → min(k, 5) = 3 件、呼び出し 1 回・要求 k=3。
     let provider = CountingProvider::new();
-    let hits = index.search(&provider, &query, 3).expect("search ok");
+    let hits = index.search(&ctx, &provider, &query, 3).expect("search ok");
     assert_eq!(hits.len(), 3);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -370,7 +372,7 @@ fn rls4_recall_matches_full_scan_theoretical_upper_bound() {
         scored.truncate(K);
 
         let hits = index
-            .search(&CpuScalarProvider, &query, K)
+            .search(&ctx, &CpuScalarProvider, &query, K)
             .expect("search ok");
 
         let actual: Vec<(u64, f32)> = hits.into_iter().map(|h| (h.id, h.score)).collect();

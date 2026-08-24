@@ -13,10 +13,13 @@
 //! [`PrefilterIndex::build`] は構築時に渡された `PolicyContext` の可視性述語で
 //! [`crate::arena::VectorArena::build_filtered`] を呼び、可視行だけを保持する縮約ビューを
 //! 作る。以後の検索はこの構築時スナップショットに対してのみ行われ、構築後の書き込みは
-//! 反映しない（[`PrefilterIndex::build`] のドキュメント参照）。`ctx` は構築呼び出しの
-//! 引数としてのみ使い構造体へ保持しないことで、「構築時 ctx と検索時 ctx が食い違う」
-//! 誤用余地を API 面に残さず、別テナントの文脈でインデックスを転用する経路を構造的に塞ぐ
-//! （テナント境界 P0）。
+//! 反映しない（[`PrefilterIndex::build`] のドキュメント参照）。`PrefilterIndex` は構築時に
+//! 束縛した `PolicyContext` の複製（テナント ID・許可可視性集合）を保持し、
+//! [`PrefilterIndex::search`] は呼び出し時に渡された `PolicyContext` とこの複製の完全一致
+//! （`PartialEq`）を fail-closed に照合する。別テナント・可視性が狭化/拡大された ctx で
+//! 同一インデックスを転用しようとした場合は [`RlsError::ContextMismatch`] で拒否する
+//! （テナント境界 P0。codex-review P0 指摘・PR #151 対応: 以前は `search` が ctx を
+//! 受け取らず、構築時 ctx との一致を検証していなかった）。
 //!
 //! `core.rs::EngineCore`（`VectorCore::search`）への prefilter インデックスのキャッシュ
 //! 統合・API 変更は本タスクのスコープ外（`VectorCore` trait のシグネチャは変更しない）。
@@ -30,8 +33,12 @@ use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::Storage;
 
-/// [`PrefilterIndex`] のエラー型。`core.rs::CoreError` と対称の設計。`Policy` は持たない
-/// （`PolicyContext` の構築時検証は呼び出し元の責務で本モジュールには到達しない）。
+/// [`PrefilterIndex`] のエラー型。`core.rs::CoreError` とおおむね対称の設計だが、
+/// `Policy` は持たず（`PolicyContext` の構築時検証は呼び出し元の責務で本モジュールには
+/// 到達しない）、[`RlsError::ContextMismatch`] は `core.rs` 側に対応がない
+/// （`EngineCore::search` はクエリ毎にアリーナを再構築するため構築時 ctx と検索時 ctx の
+/// 食い違いという状態自体が存在しない。本モジュール特有のインデックス再利用に伴う
+/// エラー種別）。
 #[derive(Debug)]
 pub enum RlsError {
     Arena(ArenaError),
@@ -46,6 +53,12 @@ pub enum RlsError {
     /// テーブル名を含めない。他テナントの存在情報を漏らさないため
     /// （security.md P0「エラー経由で存在情報を漏らさない」）。
     NotFound,
+    /// [`PrefilterIndex::search`] に渡された `PolicyContext` が構築時に束縛した
+    /// `PolicyContext` と一致しない（テナント ID・許可可視性集合のいずれかが異なる）。
+    /// 別テナントへの転用・可視性の狭化/拡大のいずれも区別せず本 variant で fail-closed
+    /// に拒否する（`Display` はテナント ID・可視性集合を含まない。テナント境界 P0・
+    /// codex-review P0 指摘・PR #151 対応）。
+    ContextMismatch,
     /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約に違反した
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
     /// `provider_result_is_valid` で行う。fail-closed: 違反があれば結果を一切返さない）。
@@ -61,6 +74,10 @@ impl std::fmt::Display for RlsError {
                 write!(f, "invalid k: {k} (must be 1..={MAX_SEARCH_K})")
             }
             RlsError::NotFound => write!(f, "not found"),
+            RlsError::ContextMismatch => write!(
+                f,
+                "policy context does not match the context the index was built with"
+            ),
             RlsError::ProviderResultRejected => write!(
                 f,
                 "search provider returned a hit outside the policy-visible id set"
@@ -89,6 +106,13 @@ impl From<KernelError> for RlsError {
 /// [`VectorArena::build_filtered`] を呼び、可視行のみのカラムナ表現を保持する。
 /// 構築後の書き込みはこのインデックスへ反映されない（構築時点のスナップショット）。
 /// 可視率・ポリシーが変わる場合は [`Self::build`] を呼び直して再構築する必要がある。
+///
+/// [`Self::len`]・[`Self::is_empty`]・[`Self::dim`]・[`Self::table_name`] は `ctx` を
+/// 要求しない点に注意: これらは構築時 ctx のテナントに束縛されたメタデータ（可視行数・
+/// テーブル名等）を返すため、[`Self::search`] と同様に「構築時 ctx を保持する呼び出し元
+/// のみが扱ってよい」という前提の上で成立する。呼び出し元がインデックスを別テナントの
+/// 文脈へ渡さない運用を守る必要がある（現状は `search` のみが fail-closed な照合ゲートを
+/// 持つ。アクセサへの ctx 必須化は本 P0 のスコープ外・将来の検討事項）。
 pub struct PrefilterIndex {
     arena: VectorArena,
     /// `arena.ids()` と同一集合の `HashSet` キャッシュ（[`Self::build`] 時に一度だけ構築）。
@@ -96,17 +120,25 @@ pub struct PrefilterIndex {
     /// このキャッシュを使い回し、クエリ毎の再構築コストを避ける（本モジュールが解決対象と
     /// する「クエリ毎の前段コスト」をここで再生産しないため。モジュール doc 参照）。
     visible_id_set: HashSet<u64>,
+    /// [`Self::build`] に渡された `PolicyContext` の複製（テナント ID・許可可視性集合）。
+    /// [`Self::search`] はこの複製と呼び出し時の `PolicyContext` の完全一致を照合する
+    /// ゲートとして使う（`is_visible` の追加呼び出しには使わない。可視性判定そのものは
+    /// [`Self::build`] 時点の [`VectorArena::build_filtered`] で完結している）。
+    /// codex-review P0 指摘・PR #151 対応: 転用・ポリシー失効の検出に必須（モジュール
+    /// doc 参照）。
+    built_ctx: PolicyContext,
 }
 
 impl PrefilterIndex {
     /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する
     /// （事前フィルタ・RLS-1: 不可視行はこの構築時点でアリーナへ確保されない）。
     ///
-    /// `ctx` は構築中の述語としてのみ使い、構造体には保持しない（モジュールドキュメント
-    /// 参照）。テーブル不存在は `core.rs::EngineCore::search`/`get_row` と対称に
-    /// [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。security.md P0）。
-    /// 容量超過・次元不整合はそのまま [`RlsError::Arena`] へ伝播する
-    /// （`VectorArena::build_filtered` の契約をそのまま継承）。
+    /// `ctx` は可視行の絞り込み述語として使うと同時に、[`Self::search`] での転用検出用に
+    /// 複製して保持する（モジュールドキュメント参照）。テーブル不存在は
+    /// `core.rs::EngineCore::search`/`get_row` と対称に [`RlsError::NotFound`] へ丸め込む
+    /// （存在情報を漏らさない。security.md P0）。容量超過・次元不整合はそのまま
+    /// [`RlsError::Arena`] へ伝播する（`VectorArena::build_filtered` の契約をそのまま
+    /// 継承）。
     pub fn build(storage: &Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
@@ -121,23 +153,37 @@ impl PrefilterIndex {
         Ok(Self {
             arena,
             visible_id_set,
+            built_ctx: ctx.clone(),
         })
     }
 
     /// 保持済みインデックスに対して Top-k 検索を行う（over-fetch なし・RLS-3:
     /// 要求 `k` のまま provider を 1 回だけ呼び、追加フェッチを行わない）。
     ///
-    /// `core.rs::EngineCore::search` と同一の前段検証（`k` の範囲・`query` の次元/有限性）を
-    /// 行った上で provider を 1 回だけ呼び、戻り値を共有ヘルパ `provider_result_is_valid`
-    /// （`core.rs`）で再検証する。provider は untrusted 実装でありうるため、1 件でも
-    /// 契約違反があれば結果を一切返さず [`RlsError::ProviderResultRejected`] で拒否する
-    /// （fail-closed。`core.rs` モジュールドキュメントの二重防御と同じ設計）。
+    /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致
+    /// （テナント ID・許可可視性集合の両方）していなければならない。一致しない場合は
+    /// 別テナントへの転用・可視性の狭化/拡大のいずれであっても区別せず
+    /// [`RlsError::ContextMismatch`] で fail-closed に拒否する（テナント境界 P0・
+    /// codex-review P0 指摘・PR #151 対応。`batch_search.rs` が `PolicyContext` を
+    /// クエリ引数として型レベルで要求する既存パターンと整合させ、`search` 単体で
+    /// テナント境界の照合が完結する構造にする）。
+    ///
+    /// 一致後は `core.rs::EngineCore::search` と同一の前段検証（`k` の範囲・`query` の
+    /// 次元/有限性）を行った上で provider を 1 回だけ呼び、戻り値を共有ヘルパ
+    /// `provider_result_is_valid`（`core.rs`）で再検証する。provider は untrusted
+    /// 実装でありうるため、1 件でも契約違反があれば結果を一切返さず
+    /// [`RlsError::ProviderResultRejected`] で拒否する（fail-closed。`core.rs`
+    /// モジュールドキュメントの二重防御と同じ設計）。
     pub fn search(
         &self,
+        ctx: &PolicyContext,
         provider: &dyn SearchProvider,
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchHit>, RlsError> {
+        if ctx != &self.built_ctx {
+            return Err(RlsError::ContextMismatch);
+        }
         validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
 
         if query.len() != self.arena.dim() as usize {
@@ -289,7 +335,7 @@ mod tests {
         assert_eq!(index.len(), 1);
 
         let hits = index
-            .search(&CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
@@ -317,7 +363,7 @@ mod tests {
         assert!(index.is_empty());
 
         let hits = index
-            .search(&CpuScalarProvider, &[1.0, 0.0], 5)
+            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 5)
             .expect("search ok");
         assert!(hits.is_empty());
     }
@@ -352,11 +398,11 @@ mod tests {
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
         assert!(matches!(
-            index.search(&CpuScalarProvider, &[1.0, 0.0], 0),
+            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 0),
             Err(RlsError::InvalidK { k: 0 })
         ));
         assert!(matches!(
-            index.search(&CpuScalarProvider, &[1.0, 0.0], MAX_SEARCH_K + 1),
+            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], MAX_SEARCH_K + 1),
             Err(RlsError::InvalidK { .. })
         ));
     }
@@ -380,18 +426,17 @@ mod tests {
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
         assert!(matches!(
-            index.search(&CpuScalarProvider, &[1.0, 0.0, 0.0], 1),
+            index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0, 0.0], 1),
             Err(RlsError::Kernel(KernelError::DimMismatch { .. }))
         ));
         assert!(matches!(
-            index.search(&CpuScalarProvider, &[f32::NAN, 0.0], 1),
+            index.search(&ctx, &CpuScalarProvider, &[f32::NAN, 0.0], 1),
             Err(RlsError::Kernel(KernelError::NonFiniteQuery))
         ));
     }
 
     // ctx 束縛の検証: 同一テーブルでも構築時 ctx のテナントに紐づく行しか返らない
-    // （構築後に別テナントの ctx で検索しても構造上そのテナントの行へ到達できない —
-    // `search` は `ctx` を引数に取らないため、この事実は型シグネチャで保証される）。
+    // （一致 ctx での正常系）。
     #[test]
     fn index_is_bound_to_the_tenant_used_at_build_time() {
         let dir = tempdir();
@@ -419,16 +464,125 @@ mod tests {
         let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
         let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
         let hits = index_a
-            .search(&CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx_a, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert!(hits.iter().all(|h| h.id == 1));
 
         let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
         let index_b = PrefilterIndex::build(&storage, "docs", &ctx_b).expect("build index");
         let hits = index_b
-            .search(&CpuScalarProvider, &[1.0, 0.0], 10)
+            .search(&ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10)
             .expect("search ok");
         assert!(hits.iter().all(|h| h.id == 2));
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: 構築時とは別テナントの ctx
+    // でインデックスを転用しようとした場合、可視行が存在していても
+    // `RlsError::ContextMismatch` で fail-closed に拒否される（構築時可視行の内容に
+    // 関わらず拒否されることを示すため、あえて `tenant-b` にも可視行を用意する）。
+    #[test]
+    fn search_rejects_a_different_tenant_context_than_the_one_used_at_build_time() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index_a = PrefilterIndex::build(&storage, "docs", &ctx_a).expect("build index");
+
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let result = index_a.search(&ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::ContextMismatch)));
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: 構築時とは許可可視性集合が
+    // 狭い ctx（Private 許可の取り消し。構築後のポリシー失効を模す）は転用とみなし拒否する。
+    #[test]
+    fn search_rejects_a_context_narrowed_from_build_time_visibility() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+
+        let ctx_private =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx_private).expect("build index");
+
+        let ctx_narrowed = PolicyContext::new("tenant-a").expect("valid tenant");
+        assert!(matches!(
+            index.search(&ctx_narrowed, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::ContextMismatch)
+        ));
+
+        // 構築時と完全一致する ctx（別インスタンスだが値は等しい）は受理される。
+        let ctx_same =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        assert_eq!(ctx_same, ctx_private);
+        let hits = index
+            .search(&ctx_same, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .expect("identical context must be accepted");
+        assert_eq!(hits.len(), 1);
+    }
+
+    // codex-review P0 指摘・PR #151 対応（テナント境界 P0）: 構築時よりも許可可視性集合が
+    // 広い ctx（構築時に持たなかった Private 許可が事後付与された ctx）も転用とみなし
+    // 拒否する。構築時インデックスは Public 行しか保持していないため
+    // `VectorArena::build_filtered` の再絞り込みは行われず、拡大された許可がそのまま
+    // 反映されてしまわないことを確認する。
+    #[test]
+    fn search_rejects_a_context_widened_from_build_time_visibility() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let ctx_public_only = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx_public_only).expect("build index");
+
+        let ctx_widened =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        assert!(matches!(
+            index.search(&ctx_widened, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::ContextMismatch)
+        ));
     }
 
     // 不正 provider（可視集合外の id を捏造して返す）は fail-closed に拒否される
@@ -461,7 +615,7 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
 
-        let result = index.search(&RogueProvider, &[1.0, 0.0], 1);
+        let result = index.search(&ctx, &RogueProvider, &[1.0, 0.0], 1);
         assert!(matches!(result, Err(RlsError::ProviderResultRejected)));
     }
 }

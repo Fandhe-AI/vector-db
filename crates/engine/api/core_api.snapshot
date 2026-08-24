@@ -74,7 +74,7 @@ pub struct SearchInput<'a> {
 }
 
 # source: crates/engine/src/policy.rs :: PolicyContext
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext {
     tenant_id: String,
     allowed_visibilities: HashSet<AllowedVisibility>,
