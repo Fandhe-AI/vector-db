@@ -366,9 +366,15 @@ impl FallbackBatchEngine {
         let primary = match backend_factory(resident) {
             Ok(backend) => PrimarySlot::Available(backend),
             Err(init_err) => {
-                debug_assert_eq!(init_err.reason(), FallbackReason::Init);
+                // `backend_factory` の戻り値型は `BatchBackendError` 全種別を
+                // 許容するため、初期化時にも Runtime 相当のエラー（実 GPU
+                // 接続時のデバイス確保中の転送失敗等）が返り得る。panic させず
+                // `init_err.reason()` の判別結果をそのまま可視化する
+                // （coding-rust.md「ライブラリコードでは Result を返し、panic
+                // させない」・モジュール冒頭コメントの「初期化失敗と実行時
+                // エラーを区別する」設計方針に従う）。
                 observer.on_fallback(FallbackEvent {
-                    reason: FallbackReason::Init,
+                    reason: init_err.reason(),
                     target: "cpu-simd",
                 });
                 PrimarySlot::Unavailable
@@ -698,6 +704,48 @@ mod tests {
         // 検索を重ねても追加の縮退イベントは発生しない（構築時の 1 件のみ）。
         engine.batch_search(&queries).expect("search ok");
         assert_eq!(observer.events().len(), 1);
+    }
+
+    // CORE-8 レビュー起因の回帰テスト: `backend_factory`（初期化）が Runtime
+    // 分類のエラー（実 GPU 接続時のデバイス確保中の転送失敗等）を返しても
+    // panic せず、[`FallbackEvent::reason`] が実際の分類（Runtime）を反映する
+    // ことを検証する（誤って `FallbackReason::Init` にハードコードしない）。
+    #[test]
+    fn init_time_runtime_classified_error_does_not_panic_and_reports_runtime_reason() {
+        let observer = std::sync::Arc::new(RecordingObserver::new());
+        let observer_for_engine: Box<dyn FallbackObserver> = {
+            struct ArcObserver(std::sync::Arc<RecordingObserver>);
+            impl FallbackObserver for ArcObserver {
+                fn on_fallback(&self, event: FallbackEvent) {
+                    self.0.on_fallback(event);
+                }
+            }
+            Box::new(ArcObserver(observer.clone()))
+        };
+
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Err(BatchBackendError::TransferFailed(
+                    "device probe transfer".to_string(),
+                ))
+            },
+            observer_for_engine,
+        );
+
+        let events_after_build = observer.events();
+        assert_eq!(events_after_build.len(), 1);
+        assert_eq!(events_after_build[0].reason, FallbackReason::Runtime);
+        assert_eq!(events_after_build[0].target, "cpu-simd");
+
+        // CPU 縮退経路として引き続き検索は成功する。
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx_a,
+        }];
+        engine.batch_search(&queries).expect("search ok");
     }
 
     // CORE-8: 実行時エラー注入（デバイスロスト・カーネル起動失敗・転送失敗の
