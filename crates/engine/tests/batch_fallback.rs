@@ -88,12 +88,12 @@ fn fixture() -> ([u64; 4], [String; 4], [Visibility; 4], usize, [f32; 8]) {
 /// 同点 id 昇順・非有限値除外）を呼ぶ。縮退経路の Top-k と完全一致することを
 /// 期待する。
 ///
-/// `batch_search.rs::run_batch_search` は行外側ループの計算量最適化として、行を
-/// その `tenant_id` に一致するクエリだけへ絞り込んでから `PolicyContext::is_visible`
-/// を評価する（`tenant_query_indices`）。TASK-89（TABLE-9）で `is_visible` が獲得した
-/// 「`Public` 行はテナント間相互可視」という拡張はこの事前絞り込みには及ばない
-/// （`batch_search`/`batch_fallback` API は本タスクのスコープ外。`src/batch_fallback.rs`
-/// の同名オラクル参照）。本オラクルも `tenant == ctx.tenant_id()` の行だけを候補にする。
+/// `batch_search.rs::run_batch_search` は行外側ループの計算量最適化として、
+/// 行をその `tenant_id` に一致するクエリ集合に加え、TASK-89（TABLE-9）対応で
+/// 他テナントの `Public` 許可クエリからも候補にする。最終判定は常に
+/// `PolicyContext::is_visible` の単一照合パスへ委ねるため、本オラクルも
+/// 同じ述語だけで可視行を絞り込む（テナント一致の事前フィルタは行わない。
+/// `src/batch_fallback.rs` の同名オラクル参照）。
 fn oracle_search(
     ids: &[u64],
     tenant_ids: &[String],
@@ -106,7 +106,7 @@ fn oracle_search(
     let mut visible_ids = Vec::new();
     let mut visible_vectors = Vec::new();
     for (row_idx, (id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {
-        if tenant == ctx.tenant_id() && ctx.is_visible(tenant, Visibility::Public) {
+        if ctx.is_visible(tenant, Visibility::Public) {
             visible_ids.push(*id);
             let start = row_idx * dim;
             visible_vectors.extend_from_slice(&vectors[start..start + dim]);

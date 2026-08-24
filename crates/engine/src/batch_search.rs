@@ -1083,30 +1083,89 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         .map_err(|e| {
             BatchSearchError::AllocationFailed(format!("failed to reserve tenant row counts: {e}"))
         })?;
-    for tenant in source.tenant_ids().iter() {
+    // TABLE-9（`Public` 行のテナント間相互可視性）用: バッチのテナントに
+    // 属さない行のうち `Visibility::Public` の件数（`extra_public_row_count`）。
+    // `policy.rs::PolicyContext::is_visible` はテナント一致を問わず `Public`
+    // 行を可視にするため、行のテナントがこのバッチのどのクエリのテナントとも
+    // 一致しなくても、`Public` を許可するクエリからは到達しうる。全行数は
+    // [`ResidentMatrix::build`] で [`MAX_BATCH_ROWS`] 以下に制限済みのため、
+    // ここでの全件走査も既存の `tenant_row_counts` 数え上げと同じ計算量
+    // クラスに収まる。
+    let mut all_public_row_count: usize = 0;
+    let mut extra_public_row_count: usize = 0;
+    for (tenant, visibility) in source.tenant_ids().iter().zip(source.visibilities().iter()) {
+        let is_public = *visibility == Visibility::Public;
+        if is_public {
+            all_public_row_count = all_public_row_count.saturating_add(1);
+        }
         if batch_tenants.contains(tenant.as_str()) {
             let count = tenant_row_counts.entry(tenant.as_str()).or_insert(0);
             *count = count.saturating_add(1);
+        } else if is_public {
+            extra_public_row_count = extra_public_row_count.saturating_add(1);
         }
     }
-    // `id_to_tenant` のフォールブル予約量として使う（テナントごとの
-    // 一致行数の総和 = バッチのテナント集合に一致する行数の総和）。
-    let matching_row_count: usize = tenant_row_counts.values().sum();
+
+    // TABLE-9 用: `Public` 可視性を許可集合に含むクエリの件数（テナントを
+    // 問わず）。`PolicyContext::is_visible` は「許可集合に `Public` を含み
+    // かつ行が `Public`」なら常に真を返す（`row_visibility == Visibility::
+    // Public` の分岐がテナント一致を短絡する）ため、`ctx.tenant_id()` 自身を
+    // 行テナントとして渡しても許可集合の判定だけが漏れなく取れる（新規の
+    // `PolicyContext` API を増やさず、単一照合パス `is_visible` のみを使う）。
+    let public_grant_query_count = queries
+        .iter()
+        .filter(|q| q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public))
+        .count();
+
+    // `Public` 許可クエリが 1 件も無ければ、バッチ外テナントの行はどのみち
+    // 到達不能（下記の行外側ループの `row_is_reachable` 判定と対応）。その
+    // 場合に `extra_public_row_count` を課金・確保対象へ含めると、
+    // 「無関係なテナントの `Public` 行が大量に存在するデータセット」を
+    // 理由に、実際には 1 行も走査しない安価なバッチまで高コスト扱いに
+    // してしまう（可用性の後退）。到達しうる場合のみ計上する。
+    let public_grant_query_count_nonzero = public_grant_query_count > 0;
+    let matching_row_count: usize = tenant_row_counts.values().sum::<usize>().saturating_add(
+        if public_grant_query_count_nonzero {
+            extra_public_row_count
+        } else {
+            0
+        },
+    );
 
     // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応・
-    // codex P1 追加指摘対応）。個別クエリの入力エラー（次元不一致・
-    // 非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、実際に走査
-    // されるテナントごとの (行数, クエリ数) の積を合算した総積和演算数を
-    // 走査（選出器確保・行デコード）開始前に確定的に拒否する。「全一致
-    // 行数 × 全クエリ数」で一括課金すると、複数テナントが混在するバッチ
-    // では実コストより過大に見積もり、正当な入力を誤って拒否しうる
+    // codex P1 追加指摘対応・TASK-89 追加指摘対応）。個別クエリの入力エラー
+    // （次元不一致・非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、
+    // 実際に走査されるテナントごとの (行数, クエリ数) の積を合算した総積和
+    // 演算数を走査（選出器確保・行デコード）開始前に確定的に拒否する。「全
+    // 一致行数 × 全クエリ数」で一括課金すると、複数テナントが混在する
+    // バッチでは実コストより過大に見積もり、正当な入力を誤って拒否しうる
     // （`compute_batch_work` のドキュメンテーションコメント参照）。
     let work_pairs = batch_tenants.iter().map(|&tenant| {
         let rows = tenant_row_counts.get(tenant).copied().unwrap_or(0);
         let tenant_queries = tenant_query_counts.get(tenant).copied().unwrap_or(0);
         (rows, tenant_queries)
     });
-    compute_batch_work(work_pairs, source.dim())?;
+    let tenant_work = compute_batch_work(work_pairs, source.dim())?;
+
+    // TABLE-9 用の追加積和項: `Public` 行はテナント境界を跨いで `Public`
+    // 許可済みクエリからも参照されるため、上記のテナント単位の積和だけでは
+    // 実走査コストを課金しきれない（下記の行外側ループ参照）。実コストの
+    // 厳密な上限として「データセット全体の `Public` 行数 × `Public` 許可
+    // クエリ数」を使う（バッチ内テナントの同一テナント分の重複を差し引かない
+    // 過大側の見積もりであり、`compute_tenant_work` のドキュメンテーション
+    // コメントが述べる「全行数 × 全クエリ数」と同じ安全側の単純化。
+    // `checked_*` 演算で確定的に拒否する）。この項が
+    // `id_to_tenant`／行外側ループで実際に走査しうる
+    // `extra_public_row_count` 分のコストも上界として覆う。
+    let cross_tenant_public_work =
+        compute_tenant_work(all_public_row_count, public_grant_query_count, source.dim())?;
+    tenant_work
+        .checked_add(cross_tenant_public_work)
+        .filter(|&total| total <= MAX_BATCH_WORK)
+        .ok_or(BatchSearchError::WorkBudgetExceeded {
+            work: usize::MAX,
+            max: MAX_BATCH_WORK,
+        })?;
 
     // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
     // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
@@ -1155,18 +1214,42 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         }
     }
 
+    // TABLE-9 用: `Public` 可視性を許可集合に含むクエリの index 一覧
+    // （テナントを問わず。上の `public_grant_query_count` と同じ判定を
+    // 使って再構築する）。行外側ループで `Public` 行に遭遇した際、
+    // 「同一テナントのクエリ集合」（`tenant_query_indices`）に加えて
+    // この一覧も候補にすることで、他テナントの `Public` 許可クエリからも
+    // 到達できるようにする（`policy.rs::PolicyContext::is_visible` が
+    // 既に持つ「`Public` 行はテナント間相互可視」というセマンティクスを、
+    // 本経路（`batch_search`/`batch_fallback`）の事前絞り込みにも反映する。
+    // `EngineCore::search`/`PrefilterIndex::search` との可視集合の非対称を
+    // 解消する対応）。
+    let mut public_grant_query_indices: Vec<usize> = Vec::new();
+    try_reserve_exact(
+        &mut public_grant_query_indices,
+        public_grant_query_count,
+        "public grant query indices",
+    )?;
+    for (idx, q) in queries.iter().enumerate() {
+        if q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public) {
+            public_grant_query_indices.push(idx);
+        }
+    }
+
     // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
     // `ResidentMatrix::build` が id の重複を拒否しているため、id は
     // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
     // 参照）。選出段のマスク実装（行 index からの `PolicyContext::is_visible`
     // 呼び出し）とは別経路でこの表を組むことで、二重防御を維持する。
-    // このバッチのテナントに属さない行は登録しない（マップを
-    // `MAX_BATCH_ROWS` 全件分確保しないための最適化であると同時に、
-    // バッチ外テナントの id が万一 hit に混入した場合を確実に
-    // マップ不在 → `TenantMaskViolation` にする fail-closed 側の効果も持つ）。
-    // `HashMap::with_capacity` ではなく `try_reserve`（フォールブル）で
-    // 確保する（codex P1 指摘対応）。予約量は上で数えた `matching_row_count`
-    // をそのまま再利用する。
+    // 登録対象は「バッチのテナントに属する行」に加え、TASK-89（TABLE-9）
+    // 対応で「`Public` 許可クエリが 1 件以上ある場合の、データセット全体の
+    // `Public` 行」（`matching_row_count` の計上と対応。上記の計算量ガードが
+    // この拡張分のコストも `cross_tenant_public_work` として覆う）。それ以外
+    // の行は登録しない（バッチ外テナントの id が万一 hit に混入した場合を
+    // 確実にマップ不在 → `TenantMaskViolation` にする fail-closed 側の効果を
+    // 維持する）。`HashMap::with_capacity` ではなく `try_reserve`
+    // （フォールブル）で確保する（codex P1 指摘対応）。予約量は上で数えた
+    // `matching_row_count` をそのまま再利用する。
     let mut id_to_tenant: std::collections::HashMap<u64, (&str, Visibility)> =
         std::collections::HashMap::new();
     id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
@@ -1178,44 +1261,46 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         .zip(source.tenant_ids().iter())
         .zip(source.visibilities().iter())
     {
-        if batch_tenants.contains(tenant.as_str()) {
+        let is_reachable_public =
+            public_grant_query_count_nonzero && *visibility == Visibility::Public;
+        if batch_tenants.contains(tenant.as_str()) || is_reachable_public {
             id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
         }
     }
 
-    // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行のテナントに
-    // 属するクエリ集合だけを走査する（Cursor Medium 指摘対応: 以前は
-    // クエリ側をバッチ全体で舐める O(matching_rows * queries.len()) の
-    // ネストループになっており、work budget をテナント別に精緻化しても
-    // 実 wall-clock コストは一致しなかった。`tenant_query_indices` で
-    // 行のテナントに属するクエリ index だけへ絞ることで、内側ループの
-    // 反復回数がテナント別課金と一致する）。`row_buf` は
+    // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行に到達しうる
+    // クエリ集合だけを走査する（Cursor Medium 指摘対応: 以前はクエリ側を
+    // バッチ全体で舐める O(matching_rows * queries.len()) のネストループに
+    // なっており、work budget をテナント別に精緻化しても実 wall-clock
+    // コストは一致しなかった。`tenant_query_indices` で行のテナントに属する
+    // クエリ index だけへ絞ることで、内側ループの反復回数がテナント別課金と
+    // 一致する）。TASK-89（TABLE-9）対応で、`Public` 行は同一テナントの
+    // クエリ集合に加え `public_grant_query_indices`（他テナントの `Public`
+    // 許可クエリ）にも到達しうるため、デコード要否の判定はどちらかの候補
+    // 集合が非空であることを見る（`row_is_reachable`）。`row_buf` は
     // `Vec::with_capacity`（abort-on-OOM）ではなく `try_reserve_exact` で
     // フォールブルに確保する（codex P1 指摘対応）。
     let mut row_buf: Vec<f32> = Vec::new();
     try_reserve_exact(&mut row_buf, source.dim(), "row_buf")?;
+    let empty_query_indices: Vec<usize> = Vec::new();
     for row_idx in 0..source.row_count() {
         let Some(row_tenant) = source.tenant_ids().get(row_idx).map(String::as_str) else {
-            continue;
-        };
-        // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く
-        // （`tenant_query_indices` のキー集合は `batch_tenants` と一致する）。
-        //
-        // スコープ注記（TASK-89・対象ビヘイビア: TABLE-9）: この事前絞り込みは
-        // `row_tenant` の文字列一致だけで行うため、`policy.rs::PolicyContext::
-        // is_visible` が獲得した「`Public` 行はテナント間相互可視」という拡張は
-        // 本経路（バッチ API）には及ばない（下記 `is_visible` 呼び出しは常に
-        // 同一テナントの行に対してのみ実行される）。`batch_search`/
-        // `batch_fallback` は `core::EngineCore`／`rls::PrefilterIndex` とは
-        // 独立した経路（`lib.rs` 参照）であり、本タスクでは行動を変更しない
-        // （狭める方向の相違のため安全側だが、`EngineCore` 経路とは可視集合が
-        // 異なりうる。追跡は out-of-scope-tracking に従う）。
-        let Some(query_indices) = tenant_query_indices.get(row_tenant) else {
             continue;
         };
         let Some(row_visibility) = source.visibilities().get(row_idx).copied() else {
             continue;
         };
+        // 同一テナントのクエリ集合（`tenant_query_indices` のキー集合は
+        // `batch_tenants` と一致する。属さないテナントの行は空スライスを
+        // 使う）。
+        let query_indices = tenant_query_indices
+            .get(row_tenant)
+            .unwrap_or(&empty_query_indices);
+        let row_is_reachable = !query_indices.is_empty()
+            || (row_visibility == Visibility::Public && !public_grant_query_indices.is_empty());
+        if !row_is_reachable {
+            continue;
+        }
         let Some(id) = source.ids().get(row_idx).copied() else {
             continue;
         };
@@ -1223,7 +1308,27 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             continue;
         }
 
-        for &qi in query_indices {
+        // TASK-89（対象ビヘイビア: TABLE-9）: `Public` 行は同一テナントの
+        // クエリ集合（`query_indices`）に加え、他テナントの `Public` 許可
+        // クエリ（`public_grant_query_indices`）からも候補にする。同一
+        // テナントのクエリは `query_indices` 側で既に走査するため、ここでは
+        // 別テナントのものだけへ絞って二重に selector へ push しないようにする
+        // （`policy.rs::PolicyContext::is_visible` の単一照合パスはそのまま
+        // 維持し、事前絞り込みの候補集合だけを拡張する）。
+        let candidate_indices = query_indices.iter().copied().chain(
+            (row_visibility == Visibility::Public)
+                .then_some(public_grant_query_indices.as_slice())
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&qi| {
+                    queries
+                        .get(qi)
+                        .is_some_and(|q| q.ctx.tenant_id() != row_tenant)
+                }),
+        );
+
+        for qi in candidate_indices {
             // untrusted 入力由来の添字ではなく、直前に `enumerate()` で
             // 自前生成した内部インデックスだが、coding-rust.md の方針に
             // 揃えて `[]` ではなく `get`/`get_mut` で明示的に処理する。
@@ -1232,10 +1337,11 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             };
             // (1) 選出前のマスク: `PolicyContext::is_visible` を満たす
             // 行だけを候補にする（codex P0 指摘対応: テナント文字列の
-            // 等価比較だけでなく可視性ラベルも判定する。テナント一致は
-            // `tenant_query_indices` の絞り込みで既に保証済みだが、
-            // 可視性（`Visibility::Private` 等）の判定はここでしか
-            // できないため引き続き呼び出す）。
+            // 等価比較だけでなく可視性ラベルも判定する。同一テナント側の
+            // 候補はテナント一致が `tenant_query_indices` の絞り込みで
+            // 保証済みだが、`Public` 許可の他テナント候補はテナントが
+            // 異なるため、ここでの `is_visible` 呼び出しが可視性・テナント
+            // 双方の最終判定を担う）。
             if !q.ctx.is_visible(row_tenant, row_visibility) {
                 continue;
             }
@@ -1694,6 +1800,44 @@ mod tests {
             );
         }
         assert!(!results[0].hits.is_empty());
+    }
+
+    // 対象ビヘイビア: TABLE-9（正方向・レビュー起因の回帰）。`batch_search`
+    // 経由でも他テナントの `Public` 行が `Public` 許可クエリから見えること、
+    // かつ `EngineCore::search`（`core.rs`）と同一の可視集合を返すことを
+    // 検証する（`policy.rs::PolicyContext::is_visible` の単一照合パスが
+    // 経路によらず同じ判定を返すという設計の要）。混入 0 件だけでは
+    // 「相互可視性が実装されている」ことを保証しないため、tenant-b の行が
+    // 実際に返ることまで確認する。
+    #[test]
+    fn batch_search_includes_other_tenant_public_rows_matching_engine_core() {
+        let matrix = build_two_tenant_matrix();
+        let engine = BatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        // 既定の `ctx()` は `Public` のみ許可（`Private` は明示付与が必要）。
+        let ctx_a = ctx("tenant-a");
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 10,
+            ctx: &ctx_a,
+        }];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(results.len(), 1);
+
+        // 正方向の確認: tenant-b の id（3, 4）が返却集合に含まれる。
+        let returned_ids: std::collections::HashSet<u64> =
+            results[0].hits.iter().map(|h| h.id).collect();
+        assert!(
+            returned_ids.contains(&3) || returned_ids.contains(&4),
+            "TABLE-9 mutual visibility must be exercised via batch_search, not just absent"
+        );
+
+        // `EngineCore`/`PrefilterIndex` 経路との対称性: 同一データ・同一 ctx
+        // に対する `core::VectorCore::search` の可視 id 集合と一致すること。
+        // `build_two_tenant_matrix` は全行 `Public` のため、全 4 行が
+        // `ctx_a`（`Public` 許可）から可視である。
+        let all_ids: std::collections::HashSet<u64> = [1, 2, 3, 4].into_iter().collect();
+        assert_eq!(returned_ids, all_ids);
     }
 
     // codex P0 指摘対応の回帰テスト: `PolicyContext` は他テナントの `tenant_id`
