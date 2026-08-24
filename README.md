@@ -57,6 +57,8 @@ gh variable set BENCH_MIN_RECALL
 
 未設定のまま schedule/`workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
+なお両変数を設定しても、CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続であり、接続されるまで本ベンチは意図的に fail-closed（非ゼロ終了）します（TASK-127。`.claude/rules/dependency-policy.md`）。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。
