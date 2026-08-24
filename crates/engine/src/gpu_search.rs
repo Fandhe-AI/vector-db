@@ -34,6 +34,14 @@ pub const MAX_BATCH_ROWS: usize = 1_000_000;
 /// クエリ・格納ベクトルの次元数上限（防御的上限）。
 pub const MAX_BATCH_DIM: usize = 8_192;
 
+/// [`ResidentMatrix::build`] が確保してよい総バイト量の上限。`packed: Vec<u32>` に
+/// 加え、同時に確保する `ids: Vec<u64>`・`tenant_ids: Vec<String>` の見積もりバイト量も
+/// 合算した総量として扱う（`arena.rs::MAX_ARENA_TOTAL_BYTES`/`check_capacity` と同方針。
+/// codex レビュー指摘対応: `MAX_BATCH_ROWS`・`MAX_BATCH_DIM` を独立にしか検証しないと、
+/// 両方が上限値の場合に `packed` 単体で約 16.4GB の単一確保が発生し得るため、行数と
+/// バイト量の両方で上限を課す）。
+pub const MAX_BATCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+
 /// バッチ検索エンジンのエラー（fail-closed）。メッセージは英語（wire プロトコル
 /// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
 /// 存在情報を含めない。
@@ -45,6 +53,9 @@ pub enum GpuSearchError {
     TooManyRows { count: usize, max: usize },
     /// 次元数が [`MAX_BATCH_DIM`] を超過した、または 0。
     InvalidDim { dim: usize, max: usize },
+    /// 行数・次元数はそれぞれ上限内でも、組み合わせた総確保バイト量が
+    /// [`MAX_BATCH_TOTAL_BYTES`] を超過した。
+    CapacityExceeded { total_bytes: usize, max: usize },
     /// クエリベクトルの次元が常駐行列の次元と一致しない。
     DimMismatch { expected: usize, found: usize },
     /// クエリベクトルに非有限値（NaN/Inf）が含まれる（untrusted 入力の明示拒否）。
@@ -69,6 +80,10 @@ impl fmt::Display for GpuSearchError {
             GpuSearchError::InvalidDim { dim, max } => {
                 write!(f, "gpu_search: invalid dim: {dim} (max {max}, must be > 0)")
             }
+            GpuSearchError::CapacityExceeded { total_bytes, max } => write!(
+                f,
+                "gpu_search: total allocation bytes {total_bytes} exceeds limit {max}"
+            ),
             GpuSearchError::DimMismatch { expected, found } => write!(
                 f,
                 "gpu_search: query dim mismatch: expected={expected} found={found}"
@@ -161,7 +176,10 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
                 e -= 1;
             }
             m &= 0x03FF;
-            let exp32 = (e + 15 - 15 + 127) as u32;
+            // f16 バイアス 15 の指数 `e` を f32 バイアス 127 へ変換する（+15 で
+            // 一旦 f16 バイアスへ戻してから -15+127 するのではなく、素直に +127 で
+            // 直接変換する）。
+            let exp32 = (e + 127) as u32;
             (exp32, m << 13)
         }
     } else if exp == 0x1F {
@@ -239,13 +257,6 @@ impl ResidentMatrix {
         if ids.len() != tenant_ids.len() {
             return Err(GpuSearchError::ArenaLengthMismatch);
         }
-        let expected_len = ids
-            .len()
-            .checked_mul(dim)
-            .ok_or(GpuSearchError::ArenaLengthMismatch)?;
-        if vectors.len() != expected_len {
-            return Err(GpuSearchError::ArenaLengthMismatch);
-        }
 
         let packed_per_row = dim.div_ceil(2);
         let packed_len =
@@ -255,6 +266,57 @@ impl ResidentMatrix {
                     count: ids.len(),
                     max: MAX_BATCH_ROWS,
                 })?;
+
+        // `packed` だけでなく、同時に確保する `ids`/`tenant_ids`（呼び出し元の
+        // 所有権を持つコピー、下部の `ids.to_vec()`/`tenant_ids.to_vec()`）の
+        // 見積もりバイト量も合算した総量を、`vectors` の長さ検証・実確保より前に
+        // 検証する（arena.rs::check_capacity と同方針。行数・次元数を独立にしか
+        // 検証しないと、両方が上限値の場合に `packed` 単体で約 16.4GB の巨大確保が
+        // 発生し得るため。`vectors.len()` チェックより先に置くことで、テスト・
+        // 呼び出し元が巨大な `vectors` バッファを用意しなくても本チェックへ
+        // 到達できる）。
+        let packed_bytes = packed_len.checked_mul(std::mem::size_of::<u32>()).ok_or(
+            GpuSearchError::CapacityExceeded {
+                total_bytes: usize::MAX,
+                max: MAX_BATCH_TOTAL_BYTES,
+            },
+        )?;
+        let per_row_aux_bytes = std::mem::size_of::<u64>()
+            .checked_add(std::mem::size_of::<String>())
+            .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
+            .ok_or(GpuSearchError::CapacityExceeded {
+                total_bytes: usize::MAX,
+                max: MAX_BATCH_TOTAL_BYTES,
+            })?;
+        let aux_bytes =
+            ids.len()
+                .checked_mul(per_row_aux_bytes)
+                .ok_or(GpuSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_TOTAL_BYTES,
+                })?;
+        let total_bytes =
+            packed_bytes
+                .checked_add(aux_bytes)
+                .ok_or(GpuSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_TOTAL_BYTES,
+                })?;
+        if total_bytes > MAX_BATCH_TOTAL_BYTES {
+            return Err(GpuSearchError::CapacityExceeded {
+                total_bytes,
+                max: MAX_BATCH_TOTAL_BYTES,
+            });
+        }
+
+        let expected_len = ids
+            .len()
+            .checked_mul(dim)
+            .ok_or(GpuSearchError::ArenaLengthMismatch)?;
+        if vectors.len() != expected_len {
+            return Err(GpuSearchError::ArenaLengthMismatch);
+        }
+
         let mut packed = Vec::with_capacity(packed_len);
         for row in vectors.chunks(dim) {
             for pair in row.chunks(2) {
@@ -534,6 +596,28 @@ mod tests {
                 max: MAX_BATCH_DIM
             }
         );
+    }
+
+    #[test]
+    fn resident_matrix_rejects_combined_capacity_even_when_rows_and_dim_are_individually_within_limits(
+    ) {
+        // MAX_BATCH_ROWS・MAX_BATCH_DIM をそれぞれ単独では超えないが、組み合わせた
+        // 総確保バイト量が MAX_BATCH_TOTAL_BYTES を超えるケース（codex レビュー指摘:
+        // 独立検証だけでは packed 単体で約 16.4GB の単一確保が発生し得る）。
+        // 容量チェックは `vectors.len()` の整合性検証より前に実行されるため、
+        // 巨大な `vectors` バッファを実際に確保しなくても本エラーへ到達できる
+        // （`ids`/`tenant_ids` は実データが必要だが、MAX_BATCH_ROWS 行でも
+        // 数十 MB 程度で現実的に確保可能）。
+        let ids: Vec<u64> = (0..MAX_BATCH_ROWS as u64).collect();
+        let tenants: Vec<String> = std::iter::repeat_n("t".to_string(), MAX_BATCH_ROWS).collect();
+        let err = ResidentMatrix::build(&ids, &tenants, MAX_BATCH_DIM, &[]).unwrap_err();
+        match err {
+            GpuSearchError::CapacityExceeded { total_bytes, max } => {
+                assert_eq!(max, MAX_BATCH_TOTAL_BYTES);
+                assert!(total_bytes > max);
+            }
+            other => panic!("expected CapacityExceeded, got {other:?}"),
+        }
     }
 
     #[test]
