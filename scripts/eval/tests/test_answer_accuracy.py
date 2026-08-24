@@ -606,6 +606,80 @@ class RunEvaluationMissingApiKeyTest(unittest.TestCase):
                 aa.run_evaluation(config, dry_run=False)
 
 
+class ScoreAnswerLegacyScoringPromptTest(unittest.TestCase):
+    """P1: 採点プロンプト側に旧方式の固定ラベル出力指示が残っていても判定トークン方式が優先されることを検証する。"""
+
+    LEGACY_SCORING_PROMPT = (
+        "You are a strict grader. Compare the candidate answer against the expected answer.\n"
+        'Respond with exactly one line starting with "CORRECT" or "INCORRECT", followed by a\n'
+        "one-sentence reason. Any other output format is treated as ungradable."
+    )
+
+    def _score_with_legacy_prompt(self, grader_behavior) -> tuple[str, str]:
+        """固定ラベル指示を含む採点プロンプトで score_answer() を実行するヘルパー。
+
+        grader_behavior は system メッセージを受け取り grader の応答本文を返す関数。
+        """
+        captured = {}
+
+        def fake_post_json(_endpoint, payload, _api_key, _timeout, _retries, _max_bytes):
+            captured["system"] = payload["messages"][0]["content"]
+            return {"choices": [{"message": {"content": grader_behavior(captured["system"])}}]}
+
+        original_post_json = aa._post_json
+        aa._post_json = fake_post_json
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                config = aa.load_config(
+                    _write_config(tmp, {"llm_endpoint": "http://127.0.0.1:9/v1/chat/completions"})
+                )
+                result = aa.score_answer(
+                    config, None, self.LEGACY_SCORING_PROMPT, "q", "expected", "candidate"
+                )
+        finally:
+            aa._post_json = original_post_json
+
+        # 判定トークン指示は採点プロンプトの後（＝上書きが明示された位置）に付与され、
+        # 採点プロンプト内の形式指示よりも優先することが宣言されている。
+        self.assertIn(self.LEGACY_SCORING_PROMPT, captured["system"])
+        self.assertGreater(
+            captured["system"].index("Output format (mandatory"),
+            captured["system"].index(self.LEGACY_SCORING_PROMPT),
+        )
+        self.assertIn("overrides any other instruction", captured["system"])
+        return result
+
+    def test_token_response_is_judged_correct_despite_legacy_prompt(self):
+        # grader が判定トークン指示に従えば、旧方式プロンプトが混在していても正しく判定される。
+        def emit_correct_token(system_message: str) -> str:
+            for line in system_message.splitlines():
+                if line.startswith("- If the candidate answer is correct:"):
+                    return line.rsplit(" ", 1)[-1]
+            raise AssertionError("verdict token instruction not found in system message")
+
+        label, _ = self._score_with_legacy_prompt(emit_correct_token)
+        self.assertEqual(label, aa.LABEL_CORRECT)
+
+    def test_fixed_label_response_following_legacy_prompt_is_unknown(self):
+        # grader が旧方式プロンプト側の固定ラベル指示に従った場合は fail-closed で UNKNOWN
+        # （固定文字列の出力が正答計上されることはない）。
+        label, _ = self._score_with_legacy_prompt(lambda _system: "CORRECT: matches expected")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+
+class FixtureScoringPromptConsistencyTest(unittest.TestCase):
+    """同梱の採点プロンプト fixture が判定トークン方式と矛盾する固定ラベル出力指示を含まないことを検証する。"""
+
+    def test_fixture_scoring_prompt_has_no_fixed_label_format_instruction(self):
+        fixture_path = Path(__file__).resolve().parent.parent / "fixtures" / "scoring_prompt.txt"
+        content = fixture_path.read_text(encoding="utf-8")
+        # 出力形式は verdict_instruction（system 側）に委ねるため、fixture 側に
+        # 固定ラベル語の出力指示を残さない（grader を矛盾させ全サンプル UNKNOWN に
+        # する失敗モードの再発防止）。
+        self.assertNotIn('"CORRECT"', content)
+        self.assertNotIn('"INCORRECT"', content)
+
+
 class WriteReportNoOverwriteTest(unittest.TestCase):
     """P1: 同一 timestamp のレポートファイル名が衝突しても既存レポートを無警告で上書きしないことを検証する。"""
 
