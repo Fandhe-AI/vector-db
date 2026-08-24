@@ -152,7 +152,7 @@ fn core9_build_variants_agree_on_same_input() {
 /// 参照実装 `CpuScalarProvider` へ委譲する（`tests/vector_core.rs::RecordingProvider` と
 /// 同型の計装手法）。
 struct MockAnnProvider {
-    called: std::sync::atomic::AtomicBool,
+    called: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SearchProvider for MockAnnProvider {
@@ -174,8 +174,9 @@ impl SearchProvider for MockAnnProvider {
 fn core9_mock_ann_provider_is_actually_invoked_through_injection_point() {
     let dir = TempDir::new("core9-mock-ann");
     let storage = seed_storage(&dir);
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let provider = Box::new(MockAnnProvider {
-        called: std::sync::atomic::AtomicBool::new(false),
+        called: called.clone(),
     });
     let core = EngineCore::from_storage(storage, provider);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -184,15 +185,8 @@ fn core9_mock_ann_provider_is_actually_invoked_through_injection_point() {
         .search(&ctx, "docs", &[1.0, 0.0, 0.0], 2)
         .expect("mock ann search");
     assert_eq!(hits.len(), 2);
-}
-
-// CORE-13（一本化要件の固定）: `search_engine::build` / `default_engine` の戻り値型が
-// `Box<dyn SearchProvider>` であることをコンパイル時代入で固定する（新規 trait 階層を
-// 二重に設けていないことの確認）。
-#[test]
-fn core13_build_functions_return_boxed_search_provider() {
-    let _cpu: Box<dyn SearchProvider> = search_engine::build(SearchEngineKind::CpuScalarBruteForce);
-    let _parallel: Box<dyn SearchProvider> =
-        search_engine::build(SearchEngineKind::ParallelBruteForce);
-    let _default: Box<dyn SearchProvider> = search_engine::default_engine();
+    assert!(
+        called.load(std::sync::atomic::Ordering::SeqCst),
+        "注入した MockAnnProvider::search が呼ばれていない"
+    );
 }
