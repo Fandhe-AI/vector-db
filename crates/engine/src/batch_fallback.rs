@@ -306,6 +306,14 @@ impl FallbackBatchEngine {
         // 側の容量検証（`batch_search.rs::ResidentMatrix::build` の
         // `packed_bytes`/`aux_bytes` 検証、`vectors.len()` チェックより前に
         // 置かれている）と同じ設計方針で、実データ確保より前に配置する。
+        //
+        // `CpuFallbackMatrix` は f32 ベクトル本体だけでなく `ids`/`tenant_ids`/
+        // `visibilities` も独立に複製して保持する（下部の `owned_*` 構築）ため、
+        // 容量予算はベクトル本体（f32_bytes）と aux バイト（Cursor Bugbot 指摘
+        // 対応: `ids`/`tenant_ids`/`visibilities` の複製分）の両方を合算した
+        // 総量で検証する。aux 側の見積もりは `ResidentMatrix::build` の
+        // `per_row_aux_bytes`（`batch_search.rs`）と同じ式（`u64` + `String` +
+        // `MAX_TENANT_ID_LEN` + `Visibility` のサイズ）を用い、二重管理を避ける。
         let f32_bytes = ids
             .len()
             .checked_mul(dim)
@@ -314,9 +322,31 @@ impl FallbackBatchEngine {
                 total_bytes: usize::MAX,
                 max: MAX_BATCH_TOTAL_BYTES,
             })?;
-        if f32_bytes > MAX_BATCH_TOTAL_BYTES {
+        let per_row_aux_bytes = std::mem::size_of::<u64>()
+            .checked_add(std::mem::size_of::<String>())
+            .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
+            .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
+            .ok_or(BatchSearchError::CapacityExceeded {
+                total_bytes: usize::MAX,
+                max: MAX_BATCH_TOTAL_BYTES,
+            })?;
+        let aux_bytes =
+            ids.len()
+                .checked_mul(per_row_aux_bytes)
+                .ok_or(BatchSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_TOTAL_BYTES,
+                })?;
+        let fallback_total_bytes =
+            f32_bytes
+                .checked_add(aux_bytes)
+                .ok_or(BatchSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_TOTAL_BYTES,
+                })?;
+        if fallback_total_bytes > MAX_BATCH_TOTAL_BYTES {
             return Err(BatchSearchError::CapacityExceeded {
-                total_bytes: f32_bytes,
+                total_bytes: fallback_total_bytes,
                 max: MAX_BATCH_TOTAL_BYTES,
             });
         }
@@ -577,6 +607,42 @@ mod tests {
         );
         let err = match result {
             Ok(_) => panic!("expected CapacityExceeded, got Ok"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, BatchSearchError::CapacityExceeded { .. }));
+    }
+
+    // Cursor Bugbot 指摘対応（PR #152）: `FallbackBatchEngine::build` の容量検証が
+    // f32 ベクトル本体（`f32_bytes`）のみで、`ids`/`tenant_ids`/`visibilities` の
+    // 複製分（aux バイト。`CpuFallbackMatrix` が独立に保持する）が計上されて
+    // いなかった欠落の回帰テスト。本テストは f32 ベクトル本体だけなら
+    // `MAX_BATCH_TOTAL_BYTES`（1 GiB）に収まるが、aux バイトを加算すると
+    // 超過する境界（rows=1,000,000 [`MAX_BATCH_ROWS`] ・dim=200: f32_bytes は
+    // 約 0.75 GiB・aux_bytes は約 0.27 GiB・合算で約 1.01 GiB）を選び、
+    // aux バイトを計上しない実装では見逃されていた `CapacityExceeded` を
+    // 拾えることを固定する。
+    #[test]
+    fn build_rejects_fallback_matrix_capacity_over_limit_due_to_aux_bytes_alone() {
+        let dim = 200usize;
+        let rows = 1_000_000usize; // MAX_BATCH_ROWS ちょうど
+        let ids: Vec<u64> = (0..rows as u64).collect();
+        let tenant_ids: Vec<String> = vec!["tenant-a".to_string(); rows];
+        let visibilities = vec![Visibility::Public; rows];
+        let vectors = vec![0.0f32; 1]; // 意図的に短い: 容量チェックが長さ検証より先に走ることを確認する
+        let observer = Box::new(RecordingObserver::new());
+        let result = FallbackBatchEngine::build_with_gpu_reference(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            observer,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "expected CapacityExceeded once aux bytes are counted, got Ok \
+                 (f32 body alone would fit under MAX_BATCH_TOTAL_BYTES)"
+            ),
             Err(e) => e,
         };
         assert!(matches!(err, BatchSearchError::CapacityExceeded { .. }));
