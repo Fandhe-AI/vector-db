@@ -65,7 +65,13 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), PolicyError> {
 /// テナント ID と許可可視性ラベル集合を同居させ、判定 API を [`Self::is_visible`] に
 /// 集約する（CORE-2: 独立のテナント層を作らない設計）。既定は最も狭い許可
 /// （`Public` のみ）で、`Private` を見せるには構築時に明示付与する。
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` は `rls.rs::PrefilterIndex::search` が構築時 ctx と検索時 ctx の
+/// 完全一致（テナント ID・許可可視性集合の両方）を fail-closed に照合するために持つ
+/// （TASK-133・別テナント／可視性が狭化・拡大された ctx でのインデックス転用を検出する
+/// ための同値判定。security.md P0「テナント分離の検査を外す/緩める/バイパス経路を
+/// 作らない」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext {
     tenant_id: String,
     allowed_visibilities: HashSet<AllowedVisibility>,

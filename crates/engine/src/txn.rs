@@ -12,7 +12,8 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::{
-    decode_row, encode_row, Row, RowInput, Storage, StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
+    bump_generation_and_commit, decode_row, encode_row, Row, RowInput, Storage, StorageError,
+    BATCH_LOG_TABLE, ROWS_TABLE,
 };
 
 /// engine が宣言する分離レベル（対象ビヘイビア: TABLE-3）。
@@ -157,10 +158,15 @@ impl WriteTxn {
         Ok(())
     }
 
-    /// トランザクションをコミットし、書き込みを確定する。
+    /// トランザクションをコミットし、書き込みを確定する（`bump_generation_and_commit`
+    /// 経由。TASK-133 P1 対応）。呼び出し元が 1 度も [`Self::put`] を呼ばずに commit した
+    /// 場合も世代を進める（TASK-133 P2 対応の判断: 「実際に書き込みがあったか」を
+    /// `WriteTxn` に持たせるには専用の追跡カウンタが要り、`BatchWriteTxn`
+    /// （`pending_row_count`）と同種の複雑さを持ち込む。`catalog.rs::insert_rows_into_table`
+    /// の空バッチ経路のような呼び出し元が明確に判定できるケースのみを対象に是正し、
+    /// 本型は fail-closed（過剰な失効はあっても見逃しはない）を優先して現状維持する）。
     pub fn commit(self) -> crate::storage::Result<()> {
-        self.txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(self.txn)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
@@ -293,12 +299,18 @@ impl BatchWriteTxn {
     /// TABLE-10 専用の型であり（[`WriteTxn`] と分離済み）、この検証を無条件に適用
     /// してよい（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4・PRRT_kwDOUAKASM6bbyWf
     /// 対応）。
+    ///
+    /// `put`/`log_batch` を 1 度も呼ばずに commit した場合（`pending_row_count == 0`）も
+    /// 世代を進める（TASK-133 P2 対応の判断: `pending_row_count` は直近の `log_batch`
+    /// 以降の未記録件数であり 0 は「未記録行がない」ことしか意味せず「一度も書き込んで
+    /// いない」こととは区別できないため、これを根拠に世代更新をスキップすると、実際に
+    /// 書き込み済みのバッチを誤って no-op 扱いする回帰を生みかねない。[`WriteTxn::commit`]
+    /// と同じ理由で fail-closed 優先の現状維持とする）。
     pub fn commit(self) -> crate::storage::Result<()> {
         if self.pending_row_count != 0 {
             return Err(StorageError::UnloggedRows(self.pending_row_count));
         }
-        self.txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(self.txn)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。

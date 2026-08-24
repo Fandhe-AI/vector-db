@@ -56,6 +56,15 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// [`crate::txn::BatchWriteTxn`] に一本化すること。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
+/// ストレージ全体の書き込み世代カウンタ（TASK-133 P1・対象ビヘイビア: RLS-1〜4）。
+/// 単一の固定キー [`GENERATION_KEY`] に対する値（u64）を [`bump_generation_and_commit`]
+/// だけが更新する。`crate::rls::PrefilterIndex` が構築後の失効検出に使う。
+pub(crate) const GENERATION_TABLE: TableDefinition<&str, u64> =
+    TableDefinition::new("storage_generation");
+
+/// [`GENERATION_TABLE`] の唯一のキー（ストレージ全体で 1 カウンタ）。
+const GENERATION_KEY: &str = "generation";
+
 /// 行エンコーディングの先頭バイト。v2（TASK-141）で RLS フィールド（`tenant_id`・
 /// `visibility`）を同居させるレイアウトへ拡張した。v1 の行は RLS フィールドを持たず、
 /// 暗黙のデフォルトテナント・可視性で読み出すのは fail-open（P0 違反）になるため、
@@ -155,6 +164,9 @@ pub enum StorageError {
     /// 検証ツールの検証オラクル（台帳の各エントリ値 == 実際にコミットされたバッチ
     /// サイズ）と食い違うゼロ件エントリを台帳へ残さないよう fail-closed に拒否する。
     EmptyBatch,
+    /// [`GENERATION_TABLE`] のカウンタが `u64` を溢れた（到達し得ない防御的分岐。
+    /// coding-rust.md「整数演算は checked_*/saturating_* を使う」対応）。
+    GenerationCounterOverflow,
 }
 
 impl fmt::Display for StorageError {
@@ -174,6 +186,9 @@ impl fmt::Display for StorageError {
                 write!(f, "unlogged rows before commit: count={count}")
             }
             StorageError::EmptyBatch => write!(f, "empty batch: no rows put since last log_batch"),
+            StorageError::GenerationCounterOverflow => {
+                write!(f, "storage generation counter overflow")
+            }
         }
     }
 }
@@ -188,7 +203,8 @@ impl std::error::Error for StorageError {
             | StorageError::DuplicateBatchSeq(_)
             | StorageError::PendingRowCountOverflow
             | StorageError::UnloggedRows(_)
-            | StorageError::EmptyBatch => None,
+            | StorageError::EmptyBatch
+            | StorageError::GenerationCounterOverflow => None,
         }
     }
 }
@@ -211,6 +227,33 @@ where
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// 書き込みコミット直前に [`GENERATION_TABLE`] を +1 してからコミットする
+/// （TASK-133 P1 対応）。本クレート内の書き込みコミット（`Storage::put`/`put_batch`・
+/// `crate::catalog` の DDL/DML・`crate::txn::WriteTxn`/`BatchWriteTxn`）は
+/// `write_txn.commit()` を直接呼ばずすべて本関数を経由する。将来の書き込み API 追加も
+/// 本関数を呼ぶだけで世代カウントの経路網羅が保たれる。
+///
+/// テーブル単位ではなくストレージ全体で 1 カウンタにした: `Storage::put`/`put_batch`
+/// は対象テーブル名を持たない旧 API のため、テーブル単位にすると経路によって
+/// カウンタ更新対象を誤る余地が生まれる（誤りは fail-open に直結する）。単一カウンタは
+/// 無関係なテーブルへの書き込みでも既存インデックスを失効させる（過剰拒否）が、
+/// fail-closed 方向のため許容する。
+pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> Result<()> {
+    {
+        let mut gen_table = write_txn.open_table(GENERATION_TABLE)?;
+        let current = gen_table
+            .get(GENERATION_KEY)?
+            .map(|v| v.value())
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or(StorageError::GenerationCounterOverflow)?;
+        gen_table.insert(GENERATION_KEY, next)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
 
 /// RLS 相当のテナント境界判定に使う可視性ラベル（対象ビヘイビア: PERSIST-3）。
 ///
@@ -314,8 +357,7 @@ impl Storage {
             let mut table = write_txn.open_table(ROWS_TABLE)?;
             table.insert(id, encoded.as_slice())?;
         }
-        write_txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(write_txn)
     }
 
     /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2）。
@@ -332,8 +374,21 @@ impl Storage {
                 table.insert(*id, encoded.as_slice())?;
             }
         }
-        write_txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(write_txn)
+    }
+
+    /// 現在の書き込み世代を返す（TASK-133 P1 対応。読み取り専用。1 回の `read_txn` を
+    /// 開いて閉じるだけの単純な値取得で、スナップショットは保持しない）。
+    /// `crate::rls::PrefilterIndex::build`/`search` が失効検出の前後比較に使う
+    /// （安全性は呼び出し元が前後の値を比較することで担保する。本メソッド自体は
+    /// 世代値以外の一貫性を何も保証しない）。
+    pub(crate) fn current_generation(&self) -> Result<u64> {
+        let read_txn = self.db.begin_read()?;
+        match read_txn.open_table(GENERATION_TABLE) {
+            Ok(t) => Ok(t.get(GENERATION_KEY)?.map(|v| v.value()).unwrap_or(0)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// 行 ID を指定して 1 行取得する（スナップショット読み取り）。
@@ -894,6 +949,55 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な
+    // 読み取り操作では増加しないことを確認する。
+    #[test]
+    fn current_generation_increments_only_on_write_commits() {
+        let path = unique_db_path("generation");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        assert_eq!(storage.current_generation().expect("gen 0"), 0);
+
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("put row 1");
+        assert_eq!(storage.current_generation().expect("gen after put"), 1);
+
+        storage
+            .put_batch(&[(
+                2,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[2.0],
+                    metadata: &[],
+                },
+            )])
+            .expect("put_batch row 2");
+        assert_eq!(
+            storage.current_generation().expect("gen after put_batch"),
+            2
+        );
+
+        // 読み取りのみの操作は世代を進めない。
+        let _ = storage.get(1).expect("get row 1");
+        let _ = storage.scan().expect("scan");
+        assert_eq!(
+            storage.current_generation().expect("gen after reads"),
+            2,
+            "read-only operations must not bump the generation counter"
+        );
     }
 
     #[test]

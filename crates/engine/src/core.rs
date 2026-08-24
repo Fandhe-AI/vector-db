@@ -41,8 +41,68 @@ use crate::storage::{Row, Storage, StorageError};
 
 /// 検索 `k` の上限。上限検証前にアロケーションへ使わないための防御的定数
 /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。`catalog.rs::MAX_LIST_TABLES`
-/// と同程度の桁に揃える）。
-const MAX_SEARCH_K: usize = 10_000;
+/// と同程度の桁に揃える）。`rls.rs`（TASK-133）の `PrefilterIndex::search` も同一の上限を
+/// 共有するため `pub(crate)`（二重定義しない）。
+pub(crate) const MAX_SEARCH_K: usize = 10_000;
+
+/// `k` の範囲検証（`k == 0` または [`MAX_SEARCH_K`] 超過を拒否）。`core.rs::EngineCore::search`
+/// と `rls.rs::PrefilterIndex::search` が同一の上限判定を共有するためのヘルパー
+/// （二重管理を防ぐ）。呼び出し元はエラー型ごとに `Err(k)` を自分の variant へ写像する。
+pub(crate) fn validate_search_k(k: usize) -> Result<(), usize> {
+    if k == 0 || k > MAX_SEARCH_K {
+        Err(k)
+    } else {
+        Ok(())
+    }
+}
+
+/// `SearchProvider` 戻り値の Top-k 契約検証（本ファイルのモジュールドキュメント (1)〜(5)、
+/// および [`VectorCore::search`] 実装内コメント参照）。`core.rs::EngineCore::search` と
+/// `rls.rs::PrefilterIndex::search` の両方が provider を「untrusted 実装でありうる」前提で
+/// 扱うため、単一走査の検証ロジックを本関数へ集約する（二重管理・契約の食い違いを防ぐ。
+/// fail-closed: 1 件でも違反すれば `false` を返し、呼び出し元は結果を一切返さず拒否する）。
+pub(crate) fn provider_result_is_valid(
+    hits: &[SearchHit],
+    k: usize,
+    visible_id_set: &HashSet<u64>,
+) -> bool {
+    // (1) 件数が要求 k を超えない。
+    if hits.len() > k {
+        return false;
+    }
+    let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
+    let mut prev: Option<&SearchHit> = None;
+    for hit in hits {
+        // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、後続の順序
+        // 検証（`total_cmp`）が無意味になるため他の検証より先に弾く。
+        if !hit.score.is_finite() {
+            return false;
+        }
+        // (3) 縮約ビュー（＝可視行）の id 集合に属する（他テナント id・捏造 id の拒否）。
+        if !visible_id_set.contains(&hit.id) {
+            return false;
+        }
+        // (4) id が重複しない（同じ行が複数回返らない）。
+        if !seen_ids.insert(hit.id) {
+            return false;
+        }
+        // (5) スコア降順・同点は id 昇順（`kernel.rs::CpuScalarProvider` が実際に返す順序と
+        // 同じ契約。`total_cmp` は (2) で有限性を確認済みのため NaN の順序上の扱いには
+        // 依存しない）。
+        if let Some(p) = prev {
+            let out_of_order = match p.score.total_cmp(&hit.score) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => p.id >= hit.id,
+                std::cmp::Ordering::Greater => false,
+            };
+            if out_of_order {
+                return false;
+            }
+        }
+        prev = Some(hit);
+    }
+    true
+}
 
 /// `VectorCore` 公開 API のエラー型。下位層（`storage`/`catalog`/`arena`/`kernel`/`policy`）
 /// のエラーを一本化しつつ、不可視行と不存在行を [`CoreError::NotFound`] に統合する
@@ -193,9 +253,7 @@ impl VectorCore for EngineCore {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchHit>, CoreError> {
-        if k == 0 || k > MAX_SEARCH_K {
-            return Err(CoreError::InvalidK { k });
-        }
+        validate_search_k(k).map_err(|k| CoreError::InvalidK { k })?;
 
         // `query` の次元をカタログ照会だけで早期検証する（`VectorArena::build` へ進む前）。
         // `VectorArena::build` は対象テーブル全行（最大 `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES`）
@@ -274,46 +332,15 @@ impl VectorCore for EngineCore {
         // provider が返した結果が Top-k の契約を満たすことをコア側で検証する
         // （codex P1・Issue #137 対応）。可視集合所属だけでは「他テナントの行は
         // 混入していないが、件数超過・id 重複・非有限スコア・順序違反」を見逃す
-        // ため、以下を単一走査で確認し、1 件でも違反すれば結果を一切返さず
+        // ため、共有ヘルパ `provider_result_is_valid`（`rls.rs::PrefilterIndex::search`
+        // と共通、TASK-133）で単一走査を確認し、1 件でも違反すれば結果を一切返さず
         // fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
         //
-        // (1) 件数が要求 k を超えない。
-        if hits.len() > k {
-            return Err(CoreError::ProviderResultRejected);
-        }
         // アリーナは構築時点で可視行だけへ絞り込み済みのため、`arena.ids()` がそのまま
         // 可視行 id 集合になる。
         let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
-        let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
-        let mut prev: Option<&SearchHit> = None;
-        for hit in &hits {
-            // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、
-            // 後続の順序検証（`total_cmp`）が無意味になるため他の検証より先に弾く。
-            if !hit.score.is_finite() {
-                return Err(CoreError::ProviderResultRejected);
-            }
-            // (3) 縮約ビュー（＝可視行）の id 集合に属する（他テナント id・捏造 id の拒否）。
-            if !visible_id_set.contains(&hit.id) {
-                return Err(CoreError::ProviderResultRejected);
-            }
-            // (4) id が重複しない（同じ行が複数回返らない）。
-            if !seen_ids.insert(hit.id) {
-                return Err(CoreError::ProviderResultRejected);
-            }
-            // (5) スコア降順・同点は id 昇順（`kernel.rs::CpuScalarProvider` が実際に
-            // 返す順序と同じ契約。`total_cmp` は (2) で有限性を確認済みのため NaN の
-            // 順序上の扱いには依存しない）。
-            if let Some(p) = prev {
-                let out_of_order = match p.score.total_cmp(&hit.score) {
-                    std::cmp::Ordering::Less => true,
-                    std::cmp::Ordering::Equal => p.id >= hit.id,
-                    std::cmp::Ordering::Greater => false,
-                };
-                if out_of_order {
-                    return Err(CoreError::ProviderResultRejected);
-                }
-            }
-            prev = Some(hit);
+        if !provider_result_is_valid(&hits, k, &visible_id_set) {
+            return Err(CoreError::ProviderResultRejected);
         }
         Ok(hits)
     }

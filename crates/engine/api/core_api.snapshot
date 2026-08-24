@@ -11,6 +11,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod rerank;
+pub mod rls;
 pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
@@ -74,7 +75,7 @@ pub struct SearchInput<'a> {
 }
 
 # source: crates/engine/src/policy.rs :: PolicyContext
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext {
     tenant_id: String,
     allowed_visibilities: HashSet<AllowedVisibility>,
@@ -144,6 +145,7 @@ pub enum StorageError {
     PendingRowCountOverflow,
     UnloggedRows(u64),
     EmptyBatch,
+    GenerationCounterOverflow,
 }
 
 # source: crates/engine/src/catalog.rs :: CatalogError
