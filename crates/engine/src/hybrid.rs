@@ -16,8 +16,16 @@
 //! オブジェクトのため、それぞれの検索結果を「同一の可視集合から構築されている／
 //! `input.ids` 外の id を返さない」という promissory な契約だけに委ねない。
 //! [`hybrid_search`] は密・疎双方のヒットを `input.ids` に含まれる id へ構造的に
-//! フィルタしてから融合する（[`crate::kernel::SearchInput`] のドキュメントが同種の
-//! promissory な `is_visible` クロージャ規約から脱却した設計判断と同じ方向）。
+//! フィルタする（[`crate::kernel::SearchInput`] のドキュメントが同種の promissory な
+//! `is_visible` クロージャ規約から脱却した設計判断と同じ方向）。密側は provider の
+//! 戻り値に対する事後フィルタで十分だが、疎側は事後フィルタだけでは不十分（Issue #36
+//! codex-review P0 指摘対応）: `SparseIndex::search` は BM25 の統計（文書数・df）と
+//! Top-k のヒープ選出をインデックス全体（可視・不可視を問わないコーパス全体）を
+//! 母数に計算するため、事後フィルタでは不可視文書が Top-k の枠を占有して可視文書を
+//! 押し出す経路・不可視文書の内容が可視文書の順位へ影響する経路のいずれも防げない。
+//! そのため [`hybrid_search`] は `sparse_index.search()` ではなく
+//! [`crate::sparse::SparseIndex::search_within`]（統計・候補選出そのものを
+//! `visible_ids` へ縮約する API）を呼ぶ。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
 
 use std::collections::BTreeMap;
@@ -315,8 +323,10 @@ fn accumulate_ranked(
 /// （CORE-3〜5 実装の密検索 provider・`sparse.rs` の疎検索との統合点）。
 ///
 /// 密側は `provider.search()` を `k = cfg.pool_depth` で実行し（`input.k` は本関数が
-/// 上書きするため呼び出し元の値は無視される）、疎側は `sparse_index.search(query_text,
-/// cfg.pool_depth)` を実行する。[`rrf_fuse`] で融合した後、先頭 `k` 件へ切り詰めて返す。
+/// 上書きするため呼び出し元の値は無視される）、疎側は
+/// `sparse_index.search_within(query_text, cfg.pool_depth, &visible_ids)`
+/// （[`crate::sparse::SparseIndex::search_within`]）を実行する。[`rrf_fuse`] で
+/// 融合した後、先頭 `k` 件へ切り詰めて返す。
 ///
 /// `k` は `1..=cfg.pool_depth()` を検証し、`0` または超過は [`HybridError::InvalidK`]。
 /// `cfg.pool_depth()` 自体が `MAX_POOL_DEPTH` 以下であることは [`RrfConfig::new`] が
@@ -329,12 +339,14 @@ fn accumulate_ranked(
 ///
 /// 契約: `input`（[`SearchInput`]）は `core.rs` と同じく「呼び出し元が可視行のみへ
 /// 縮約済み」であることが前提であり、テナント境界はこの層より上で完結する（本関数は
-/// 境界を弱めない）。`sparse_index`・`provider` はいずれも `input` と別個のオブジェクト
-/// （`provider` は object-safe な trait であり「`input.ids` 外の id を返さない」ことは
-/// 型では強制されない）で同一の縮約を構造的に強制できないため、双方の検索結果は
-/// `input.ids` に含まれる id へフィルタしてから融合する（モジュールドキュメント参照。
-/// 呼び出し元が誤って別集合から構築した `sparse_index` を渡しても、または `provider`
-/// 実装が契約に反して可視集合外の id を返しても、不可視行の id が結果へ混入しない）。
+/// 境界を弱めない）。密側は `provider`（`input` と別個の trait object であり
+/// 「`input.ids` 外の id を返さない」ことは型では強制されない）の戻り値を
+/// `input.ids` へ事後フィルタして契約違反を吸収する（モジュールドキュメント参照。
+/// `provider` 実装が契約に反して可視集合外の id を返しても不可視行の id が結果へ
+/// 混入しない）。疎側は事後フィルタだけでは不十分なため（モジュールドキュメント
+/// 参照。統計計算・Top-k 選出そのものが可視集合外の文書に影響されうる）、
+/// `sparse_index.search()` ではなく統計・候補選出を `visible_ids` へ縮約する
+/// [`crate::sparse::SparseIndex::search_within`] を呼ぶ。
 ///
 /// 出力の順序契約: [`rrf_fuse`] が返す融合スコア降順・同点 id 昇順の順序をそのまま
 /// 維持して `k` 件へ `truncate` する。RRF 同点グループ（同一融合スコアを持つ id 群）の
@@ -364,19 +376,24 @@ pub fn hybrid_search(
     };
     // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
     // 返さない」ことは型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
-    // `sparse_index` 側と同じ理由（モジュールドキュメント参照）で、provider が返した
-    // ヒットも `input.ids`（可視集合）へ構造的にフィルタしてから融合する。フィルタは
-    // 部分集合を取るだけなのでスコア降順・同点 id 昇順の順位契約は保たれる。
+    // provider が返したヒットは `input.ids`（可視集合）へ構造的にフィルタしてから
+    // 融合する（フィルタは部分集合を取るだけなのでスコア降順・同点 id 昇順の順位契約は
+    // 保たれる）。
     let dense_hits: Vec<SearchHit> = provider
         .search(dense_input)?
         .into_iter()
         .filter(|hit| visible_ids.contains(&hit.id))
         .collect();
-    let sparse_hits: Vec<ScoredDoc> = sparse_index
-        .search(query_text, cfg.pool_depth())?
-        .into_iter()
-        .filter(|doc| visible_ids.contains(&doc.doc_id))
-        .collect();
+    // 疎側は `sparse_index.search()`（インデックス全体を母数に統計・Top-k を計算する
+    // API）ではなく `search_within()`（[`SparseIndex::search_within`]）を使う。
+    // `search()` の後段フィルタ（旧実装）は「不可視文書が Top-k のプールを占有して
+    // 可視文書を押し出す」「`doc_count`/`doc_freq` を通じて不可視文書の内容・存在が
+    // 可視文書の順位へ影響する」という 2 つの経路でテナント境界を弱めてしまう
+    // （後段フィルタでは統計計算・候補選出そのものへの影響を防げない。Issue #36
+    // codex-review P0 指摘対応）。`search_within` は統計・Top-k 選出の両方を
+    // `visible_ids` へ縮約した上で計算するため、この 2 経路をともに断つ。
+    let sparse_hits: Vec<ScoredDoc> =
+        sparse_index.search_within(query_text, cfg.pool_depth(), &visible_ids)?;
 
     let mut fused = rrf_fuse(&dense_hits, &sparse_hits, cfg)?;
     fused.truncate(k);
@@ -831,5 +848,41 @@ mod tests {
             hits.iter().all(|h| h.id != 99),
             "invisible id must not leak into hybrid results: {hits:?}"
         );
+    }
+
+    #[test]
+    fn hybrid_search_sparse_side_does_not_let_invisible_docs_occupy_the_pool() {
+        // [P0] レビュー指摘対応（Issue #36 codex-review）: `hybrid_search` が
+        // `SparseIndex::search()`（インデックス全体を母数に Top-k を選出する旧経路）を
+        // 呼んでいた場合、`pool_depth` が小さいと不可視文書が疎側の Top-k プールを
+        // 独占し、事後フィルタでは可視文書を復元できなかった（`sparse.rs` の
+        // `search_within_excludes_invisible_docs_from_pool_occupation` 参照）。
+        // `pool_depth=1` の狭いプールに対し、可視文書 id=1 は "cat" 1 回のみだが、
+        // sparse_index 全体には id=1 を除きすべて "cat" を大量に繰り返す不可視文書
+        // （id=2〜11）が存在し、`search()` なら Top-1 を独占する構成にする。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
+        let mut docs: Vec<(u64, &str)> = vec![(1, "cat")];
+        let filler: Vec<(u64, &str)> = (2u64..=11)
+            .map(|id| (id, "cat cat cat cat cat cat cat cat cat cat"))
+            .collect();
+        docs.extend(filler.iter().copied());
+        let index = SparseIndex::build(&docs).expect("build ok");
+
+        let ids = [1u64];
+        let vectors = [1.0f32];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        let hits = hybrid_search(&CpuScalarProvider, input, &index, "cat", 1, &cfg).expect("ok");
+        // 可視集合は id=1 のみ（密側も疎側も id=1 だけが候補になりうる）。旧経路
+        // （`search()` + 事後フィルタ）であれば疎側の Top-1 プールを不可視文書が
+        // 占有し、可視文書 id=1 が疎側の融合対象からこぼれ落ちて結果が変わりうる。
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
     }
 }

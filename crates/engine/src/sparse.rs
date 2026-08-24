@@ -4,7 +4,13 @@
 //!
 //! 責務境界: コーパスからトークン頻度・文書長統計を持つ [`SparseIndex`] を構築し、
 //! クエリに対する BM25 スコア降順の Top-k 検索を提供する純関数的な API を提供し、
-//! storage/catalog とは結線しない。
+//! storage/catalog とは結線しない。[`SparseIndex::search`] はインデックス全体
+//! （構築時のコーパス全体）を母数に統計・Top-k を計算するのに対し、
+//! [`SparseIndex::search_within`] は呼び出し元が渡す可視集合（`visible_ids`）へ
+//! 統計計算・候補選出そのものを縮約する版であり、`hybrid.rs::hybrid_search`
+//! （TASK-103）がテナント境界（RLS 相当）を保つために後者を使う（Issue #36
+//! codex-review P0 指摘対応。事後フィルタでは防げない理由は
+//! [`SparseIndex::search_within`] のドキュメントを参照）。
 //!
 //! Okapi BM25（公知のアルゴリズム）を実装する。クエリ語 `q` に対する文書 `d` のスコアは
 //! 各語 `t` について
@@ -70,6 +76,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
@@ -435,6 +442,13 @@ pub struct SparseIndex {
     docs: Vec<DocEntry>,
     /// トークン → 出現文書数（`df`）。`BTreeMap` で決定的な走査順を保つ。
     doc_freq: BTreeMap<String, u32>,
+    /// `DocId` → `docs` 内のインデックス。[`SparseIndex::search_within`] が
+    /// `visible_ids`（呼び出し元の可視集合）から該当文書へ `O(log n)` で辿るために使う
+    /// （Issue #36 codex-review P0 指摘対応。`docs` は構築時の入力順であり `doc_id` で
+    /// ソートされていないため、この逆引きマップなしでは可視集合ごとに線形走査が
+    /// 必要になる）。値は構築時に自分自身が割り当てた `docs` のインデックスのみを
+    /// 保持するため、`search_within` からの参照は常に範囲内である。
+    id_index: BTreeMap<DocId, usize>,
 }
 
 impl SparseIndex {
@@ -481,6 +495,7 @@ impl SparseIndex {
 
         let mut seen_ids: BTreeMap<DocId, ()> = BTreeMap::new();
         let mut entries: Vec<DocEntry> = Vec::with_capacity(docs.len());
+        let mut id_index: BTreeMap<DocId, usize> = BTreeMap::new();
         let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
         let mut total_len: u64 = 0;
         // コーパス全体のバイト長累計。`saturating_add` によりオーバーフロー時は
@@ -540,6 +555,10 @@ impl SparseIndex {
                 *counter = counter.saturating_add(1);
             }
 
+            // `id_index` は自分がこれから push する要素自身のインデックスのみを記録する
+            // ため、値は常に `entries` の範囲内になる（範囲外を指す不変条件違反は
+            // 構造的に起こり得ない）。
+            id_index.insert(doc_id, entries.len());
             entries.push(DocEntry {
                 doc_id,
                 term_freq,
@@ -559,6 +578,7 @@ impl SparseIndex {
             avg_doc_len,
             docs: entries,
             doc_freq,
+            id_index,
         })
     }
 
@@ -683,10 +703,153 @@ impl SparseIndex {
 
     /// `idf(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )`。`+ 1` により常に非負となるため、
     /// 負の IDF に対する特別な補正処理は不要（モジュールコメントの式を参照）。
+    /// インデックス全体（`self.doc_count`）を母数とする。可視集合へ縮約した母数を使う
+    /// 場合は [`Self::idf_for`] を直接呼ぶ（[`Self::search_within`] 参照）。
     fn idf(&self, df: u32) -> f64 {
-        let n = f64::from(self.doc_count);
+        Self::idf_for(f64::from(self.doc_count), df)
+    }
+
+    /// [`Self::idf`] の母数 `n`（文書数）を外部から指定できる版。`search()` は
+    /// インデックス全体の `self.doc_count` を、`search_within()` は可視集合に縮約した
+    /// 部分集合の文書数を、それぞれ `n` として渡すことで同一の IDF 計算式を共有する。
+    fn idf_for(n: f64, df: u32) -> f64 {
         let df = f64::from(df);
         ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
+    }
+
+    /// [`Self::search`] の可視性縮約版（Issue #36 codex-review P0 指摘対応）。
+    ///
+    /// `search()` は文書数（N）・逆文書頻度（df）をインデックス全体（構築時の
+    /// コーパス全体）から計算するため、呼び出し元が結果を `visible_ids` で事後
+    /// フィルタするだけでは (a) `visible_ids` 外の文書が Top-k のヒープ選出枠
+    /// （`k` 件のプール）を占有して可視文書を押し出す、(b) `doc_count`/`doc_freq`
+    /// を通じて可視集合外の文書の内容・存在が可視文書の IDF・順位へ影響する、
+    /// という 2 つの経路でテナント境界（RLS 相当）を弱める。件数・順位の違いから
+    /// 他テナントの存在情報を推測できてしまうため、事後フィルタでは防げない
+    /// （統計計算・候補選出そのものを可視集合へ限定する必要がある）。
+    ///
+    /// 本メソッドは統計（文書数・平均文書長・df）と Top-k のヒープ選出の両方を
+    /// `visible_ids` に含まれる文書だけへ限定して計算し直す。`visible_ids` に
+    /// 含まれるがインデックス構築時のコーパスに存在しない id は無視する
+    /// （該当文書が単に存在しないものとして扱うだけであり、可視性判定そのものを
+    /// 緩めるものではない。可視性判定自体は `visible_ids` を渡す呼び出し元
+    /// （`hybrid.rs::hybrid_search`）の責務のまま変わらない）。
+    ///
+    /// クエリのバイト長・一意語数検証、`k == 0`・無トークンクエリでの空結果、
+    /// 同点 `doc_id` 昇順のタイブレークといった契約は [`Self::search`] と同一。
+    pub fn search_within(
+        &self,
+        query: &str,
+        k: usize,
+        visible_ids: &BTreeSet<DocId>,
+    ) -> Result<Vec<ScoredDoc>, SparseError> {
+        // 入力検証（クエリのバイト長・一意語数上限）は `search()` と同一の順序・契約を
+        // 維持する（`k == 0`・空可視集合より常に優先する）。
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(SparseError::QueryTooLong {
+                len: query.len(),
+                max: MAX_QUERY_BYTES,
+            });
+        }
+
+        let query_terms = tokenize(query);
+
+        let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
+        for t in &query_terms {
+            unique_terms.insert(t.clone(), ());
+        }
+
+        if unique_terms.len() > MAX_QUERY_TERMS {
+            return Err(SparseError::TooManyQueryTerms {
+                unique_terms: unique_terms.len(),
+                max: MAX_QUERY_TERMS,
+            });
+        }
+
+        if k == 0 || query_terms.is_empty() || visible_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 可視文書のみへ縮約した部分集合。`id_index` は構築時に自分自身の `docs`
+        // インデックスのみを記録しているため範囲外を指すことはないが、`.get()` で
+        // 明示的に防御し、万一の不整合時は当該文書を候補から除外する
+        // （fail-closed。範囲外アクセスで panic させない）。
+        let subset: Vec<&DocEntry> = visible_ids
+            .iter()
+            .filter_map(|id| self.id_index.get(id))
+            .filter_map(|&idx| self.docs.get(idx))
+            .collect();
+
+        if subset.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 統計（N・avgdl・df）は縮約後の部分集合のみから計算する。インデックス全体の
+        // `self.doc_count`/`self.avg_doc_len`/`self.doc_freq`（可視集合外の文書を含む
+        // 統計）は一切参照しない。これにより不可視文書の内容・存在が可視文書の
+        // スコア・順位へ影響する経路（本メソッド追加の動機（b））を断つ。
+        let local_n = subset.len();
+        let local_total_len: u64 = subset.iter().map(|d| u64::from(d.doc_len)).sum();
+        let local_avg_doc_len = local_total_len as f64 / local_n as f64;
+
+        // 可視部分集合内での df（クエリ語ごとに何件の可視文書が含むか）を数え直す
+        // （インデックス全体の `self.doc_freq` は使わない）。
+        let mut local_doc_freq: BTreeMap<&str, u32> = BTreeMap::new();
+        for term in unique_terms.keys() {
+            let df = subset
+                .iter()
+                .filter(|d| d.term_freq.contains_key(term))
+                .count();
+            // `df <= local_n <= self.docs.len() <= MAX_CORPUS_DOCS` であり `u32` へ
+            // 安全に収まるが、将来の変更に備え `try_from` 失敗時は飽和させる
+            // （coding-rust.md: 整数演算は checked/saturating を用いる）。
+            local_doc_freq.insert(term.as_str(), u32::try_from(df).unwrap_or(u32::MAX));
+        }
+
+        // 選出ロジック（ヒープ・タイブレーク）は `search()` と同一だが、母数を
+        // 可視部分集合（`local_n`・`local_avg_doc_len`・`local_doc_freq`）に限定する
+        // ことで、`visible_ids` 外の文書が Top-k のプールを占有できないようにする
+        // （本メソッド追加の動機（a））。
+        let heap_capacity = k.min(local_n);
+        let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
+        for doc in &subset {
+            let mut score = 0.0f64;
+            for term in unique_terms.keys() {
+                let Some(&f) = doc.term_freq.get(term) else {
+                    continue;
+                };
+                let df = *local_doc_freq.get(term.as_str()).unwrap_or(&0);
+                let idf = Self::idf_for(local_n as f64, df);
+                let numerator = f64::from(f) * (self.k1 + 1.0);
+                let len_norm = 1.0 - self.b
+                    + self.b * (f64::from(doc.doc_len) / local_avg_doc_len.max(f64::MIN_POSITIVE));
+                let denominator = f64::from(f) + self.k1 * len_norm;
+                if denominator > 0.0 {
+                    score += idf * (numerator / denominator);
+                }
+            }
+            if score > 0.0 {
+                let candidate = Candidate {
+                    score,
+                    doc_id: doc.doc_id,
+                };
+                if heap.len() < k {
+                    heap.push(Reverse(candidate));
+                } else if let Some(Reverse(worst)) = heap.peek() {
+                    if candidate > *worst {
+                        heap.pop();
+                        heap.push(Reverse(candidate));
+                    }
+                }
+            }
+        }
+
+        let mut scored: Vec<ScoredDoc> = heap
+            .into_iter()
+            .map(|Reverse(Candidate { score, doc_id })| ScoredDoc { doc_id, score })
+            .collect();
+        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+        Ok(scored)
     }
 }
 
@@ -916,6 +1079,103 @@ mod tests {
         let first = idx.search("gamma delta", 10).unwrap();
         let second = idx.search("gamma delta", 10).unwrap();
         assert_eq!(first, second);
+    }
+
+    // --- search_within（Issue #36 codex-review P0 指摘対応: テナント境界縮約） ---
+
+    #[test]
+    fn search_within_excludes_invisible_docs_from_pool_occupation() {
+        // [P0] `search()`（インデックス全体を母数に Top-k を選出する API）を事後
+        // フィルタするだけでは、不可視文書が Top-k のプールを占有して可視文書を
+        // 押し出す経路を防げない。doc_id=3 は "cat" を大量に繰り返すため
+        // `search()` では 1 位を独占するが、可視集合 `{1, 2}` には含まれない。
+        let docs = vec![
+            (1u64, "cat"),
+            (2u64, "cat"),
+            (3u64, "cat cat cat cat cat cat cat cat cat cat"),
+        ];
+        let idx = SparseIndex::build(&docs).expect("build ok");
+
+        // 旧実装が脆弱だったことの回帰確認: `search()` は k=1 で不可視の id=3 だけを
+        // 返す（呼び出し元がこれを可視集合で事後フィルタすると空になり、可視文書
+        // id=1・id=2 のどちらも返せない）。
+        let legacy = idx.search("cat", 1).expect("search ok");
+        assert_eq!(legacy[0].doc_id, 3);
+
+        // `search_within` は id=3 を候補にすら含めないため、k=1 でも可視文書
+        // （id=1・id=2 は同点のため doc_id 昇順で id=1）が正しく返る。
+        let visible: BTreeSet<u64> = [1u64, 2u64].into_iter().collect();
+        let scoped = idx
+            .search_within("cat", 1, &visible)
+            .expect("search_within ok");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].doc_id, 1);
+    }
+
+    #[test]
+    fn search_within_statistics_are_isolated_from_invisible_docs() {
+        // [P0] 可視文書の IDF・avgdl（＝スコア）が、共有インデックスに含まれる
+        // 不可視文書の有無・内容によって変化しないことを確認する（`doc_count`/
+        // `doc_freq` を通じた統計汚染の防止）。同一の可視部分集合（id=1 のみが
+        // "cat" を含む）に対し、共有インデックスへ大量の不可視文書（"cat" を含む
+        // ものを含む）を追加しても `search_within` のスコアは不変であるべき。
+        let small_docs = vec![(1u64, "cat"), (2u64, "dog")];
+        let small_idx = SparseIndex::build(&small_docs).expect("build ok");
+        let visible: BTreeSet<u64> = [1u64].into_iter().collect();
+        let small_result = small_idx
+            .search_within("cat", 10, &visible)
+            .expect("search_within ok");
+
+        let mut large_docs: Vec<(u64, &str)> = vec![(1u64, "cat"), (2u64, "dog")];
+        let filler: Vec<(u64, &str)> = (100u64..150).map(|id| (id, "cat cat cat")).collect();
+        large_docs.extend(filler.iter().copied());
+        let large_idx = SparseIndex::build(&large_docs).expect("build ok");
+        let large_result = large_idx
+            .search_within("cat", 10, &visible)
+            .expect("search_within ok");
+
+        assert_eq!(
+            small_result, large_result,
+            "invisible corpus growth must not change visible-only score"
+        );
+    }
+
+    #[test]
+    fn search_within_ignores_visible_ids_absent_from_corpus() {
+        // `visible_ids` に構築時のコーパスへ存在しない id が混ざっていても panic せず、
+        // 単に無視されることを確認する（呼び出し元の可視集合が本インデックス外の id を
+        // 含みうる契約。`hybrid.rs::hybrid_search` の呼び出し文脈を参照）。
+        let docs = vec![(1u64, "cat"), (2u64, "dog")];
+        let idx = SparseIndex::build(&docs).expect("build ok");
+        let visible: BTreeSet<u64> = [1u64, 999u64].into_iter().collect();
+        let result = idx
+            .search_within("cat", 10, &visible)
+            .expect("search_within ok");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].doc_id, 1);
+    }
+
+    #[test]
+    fn search_within_empty_visible_ids_returns_empty() {
+        let docs = vec![(1u64, "cat")];
+        let idx = SparseIndex::build(&docs).expect("build ok");
+        let visible: BTreeSet<u64> = BTreeSet::new();
+        let result = idx
+            .search_within("cat", 10, &visible)
+            .expect("search_within ok");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn search_within_query_too_long_is_rejected_before_visible_ids_check() {
+        // [Low 相当の一貫性確認] `search()` と同じ契約: クエリのバイト長検証は
+        // 可視集合の中身（空かどうか等）より常に優先される。
+        let docs = vec![(1u64, "cat")];
+        let idx = SparseIndex::build(&docs).expect("build ok");
+        let visible: BTreeSet<u64> = BTreeSet::new();
+        let long_query = "a".repeat(17 * 1024);
+        let err = idx.search_within(&long_query, 10, &visible).unwrap_err();
+        assert!(matches!(err, SparseError::QueryTooLong { .. }));
     }
 
     #[test]
