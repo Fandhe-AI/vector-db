@@ -25,7 +25,7 @@ use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
+use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -499,6 +499,11 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::EmptyBatch => {
             CatalogError::Invalid("empty batch: no rows put since last log_batch".to_string())
         }
+        // `bump_generation_and_commit`（TASK-133 P1 対応）はカタログ層の DDL/DML commit
+        // からも呼ばれるため到達しうる。u64 の枯渇は現実的に起こらないが網羅性のため扱う。
+        StorageError::GenerationCounterOverflow => {
+            CatalogError::Invalid("storage generation counter overflow".to_string())
+        }
     }
 }
 
@@ -560,8 +565,7 @@ impl Storage {
             }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
-        write_txn.commit()?;
-        Ok(())
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。追加列は暗黙 nullable として
@@ -599,8 +603,7 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
-        write_txn.commit()?;
-        Ok(())
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
@@ -640,8 +643,7 @@ impl Storage {
             let mut row_table = write_txn.open_table(row_table_def)?;
             row_table.insert(id, encoded.as_slice())?;
         }
-        write_txn.commit()?;
-        Ok(())
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブルスコープで複数行を単一トランザクションで挿入する（TASK-146、対象ビヘイビア:
@@ -665,8 +667,8 @@ impl Storage {
                 // 行テーブルを開く必要はないが、上記の存在確認は既に済ませたうえで
                 // write txn を commit する（`storage.rs::Storage::put_batch` と同様、
                 // 空バッチは行データに触れず即座に成功として扱う）。
-                write_txn.commit()?;
-                return Ok(());
+                return crate::storage::bump_generation_and_commit(write_txn)
+                    .map_err(convert_storage_error);
             }
             let row_table_name = user_rows_table_name(table_name);
             let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
@@ -677,8 +679,7 @@ impl Storage {
                 row_table.insert(*id, encoded.as_slice())?;
             }
         }
-        write_txn.commit()?;
-        Ok(())
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブルスコープで 1 行取得する（スナップショット読み取り。TASK-146、対象ビヘイビア:
@@ -701,47 +702,6 @@ impl Storage {
         };
         let guard = row_table.get(id)?.ok_or(CatalogError::RowNotFound(id))?;
         crate::storage::decode_row(id, guard.value()).map_err(convert_storage_error)
-    }
-
-    /// テーブルスコープで複数行の `tenant_id`・`visibility`（ヘッダのみ）を一括取得する
-    /// （TASK-133・対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が使う）。
-    /// embedding・metadata はデコードしない（`decode_row_tenant_and_visibility` のみ使用）。
-    ///
-    /// `ids` に対応する 1 回の `read_txn` だけを張る（単一スナップショットで一貫）。
-    /// 戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在しない場合はその位置に
-    /// `None` を入れる（`CatalogError::RowNotFound` へは丸め込まない）。テーブル自体が
-    /// 不存在の場合のみ `CatalogError::TableNotFound` を返す。
-    ///
-    /// `ids.len()` に上限は課さない（呼び出し元の責務。`rls.rs::PrefilterIndex::search` は
-    /// `arena.rs::MAX_ARENA_ROWS` で上限が課された id 集合を渡す）。
-    pub(crate) fn get_row_headers_from_table(
-        &self,
-        table_name: &str,
-        ids: &[u64],
-    ) -> Result<Vec<Option<(String, Visibility)>>> {
-        validate_identifier(table_name)?;
-        let read_txn = self.db().begin_read()?;
-        require_table_exists_read(&read_txn, table_name)?;
-        let row_table_name = user_rows_table_name(table_name);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-        let row_table = match read_txn.open_table(row_table_def) {
-            Ok(t) => t,
-            // 行テーブル自体が未作成（1 行も挿入していない）= 全 id が不存在。
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![None; ids.len()]),
-            Err(e) => return Err(e.into()),
-        };
-        let mut out = Vec::with_capacity(ids.len());
-        for &id in ids {
-            match row_table.get(id)? {
-                None => out.push(None),
-                Some(guard) => {
-                    let header = crate::storage::decode_row_tenant_and_visibility(guard.value())
-                        .map_err(convert_storage_error)?;
-                    out.push(Some(header));
-                }
-            }
-        }
-        Ok(out)
     }
 
     /// テーブルスコープで行 ID 昇順に最大 `limit` 件を走査する上限付きページング API
@@ -1069,43 +1029,5 @@ mod tests {
             matches!(result, Err(CatalogError::Invalid(_))),
             "expected Err(Invalid) once table count exceeds MAX_LIST_TABLES, got {result:?}"
         );
-    }
-
-    // --- Storage::get_row_headers_from_table -------------------------------
-    // TASK-133・対象ビヘイビア: RLS-1〜4。該当 id が存在しない場合の `None` 分岐を検証する
-    // （本クレートに行削除 API がないため、未挿入 id で再現する）。
-
-    #[test]
-    fn get_row_headers_from_table_returns_none_for_a_missing_id() {
-        let path = unique_db_path("row-headers-missing-id");
-        let _guard = CleanupGuard(path.clone());
-        let storage = Storage::open(&path).expect("open storage");
-        storage
-            .create_table(&TableSchema::new(
-                "docs",
-                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
-            ))
-            .expect("create table");
-        storage
-            .insert_row_into_table(
-                "docs",
-                1,
-                &RowInput {
-                    tenant_id: "tenant-a",
-                    visibility: Visibility::Public,
-                    embedding: &[1.0, 0.0],
-                    metadata: &[],
-                },
-            )
-            .expect("insert row");
-
-        // id=1 は存在するが、id=999 は未挿入（削除相当）。行テーブル自体は存在するため
-        // `TableNotFound` ではなく `None` 分岐（`row_table.get(id)? == None`）を通る。
-        let headers = storage
-            .get_row_headers_from_table("docs", &[1, 999])
-            .expect("get_row_headers_from_table ok");
-        assert_eq!(headers.len(), 2);
-        assert!(headers[0].is_some());
-        assert!(headers[1].is_none());
     }
 }

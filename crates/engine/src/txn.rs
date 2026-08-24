@@ -12,7 +12,8 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::{
-    decode_row, encode_row, Row, RowInput, Storage, StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
+    bump_generation_and_commit, decode_row, encode_row, Row, RowInput, Storage, StorageError,
+    BATCH_LOG_TABLE, ROWS_TABLE,
 };
 
 /// engine が宣言する分離レベル（対象ビヘイビア: TABLE-3）。
@@ -157,10 +158,10 @@ impl WriteTxn {
         Ok(())
     }
 
-    /// トランザクションをコミットし、書き込みを確定する。
+    /// トランザクションをコミットし、書き込みを確定する（`bump_generation_and_commit`
+    /// 経由。TASK-133 P1 対応）。
     pub fn commit(self) -> crate::storage::Result<()> {
-        self.txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(self.txn)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
@@ -297,8 +298,7 @@ impl BatchWriteTxn {
         if self.pending_row_count != 0 {
             return Err(StorageError::UnloggedRows(self.pending_row_count));
         }
-        self.txn.commit()?;
-        Ok(())
+        bump_generation_and_commit(self.txn)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。

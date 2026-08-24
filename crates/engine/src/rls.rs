@@ -33,6 +33,9 @@ use crate::storage::Storage;
 pub enum RlsError {
     Arena(ArenaError),
     Kernel(KernelError),
+    /// [`crate::storage::Storage::current_generation`] の読み取り失敗（[`Self::build`]
+    /// 時のみ発生。`search` 時は [`RlsError::IndexStale`] へ丸め込む）。
+    Storage(crate::storage::StorageError),
     /// `k == 0` または [`MAX_SEARCH_K`] 超過。
     InvalidK {
         k: usize,
@@ -58,6 +61,7 @@ impl std::fmt::Display for RlsError {
         match self {
             RlsError::Arena(e) => write!(f, "rls prefilter arena error: {e}"),
             RlsError::Kernel(e) => write!(f, "rls prefilter kernel error: {e}"),
+            RlsError::Storage(e) => write!(f, "rls prefilter storage error: {e}"),
             RlsError::InvalidK { k } => {
                 write!(f, "invalid k: {k} (must be 1..={MAX_SEARCH_K})")
             }
@@ -92,6 +96,12 @@ impl From<KernelError> for RlsError {
     }
 }
 
+impl From<crate::storage::StorageError> for RlsError {
+    fn from(e: crate::storage::StorageError) -> Self {
+        RlsError::Storage(e)
+    }
+}
+
 /// 事前フィルタ方式の再利用可能インデックス（TASK-133・RLS-1〜4）。
 ///
 /// [`Self::build`] 構築時に束縛した [`PolicyContext`] の可視性述語で
@@ -110,6 +120,9 @@ pub struct PrefilterIndex<'s> {
     visible_id_set: HashSet<u64>,
     /// [`Self::build`] に渡された `PolicyContext` の複製。`ctx` 照合ゲートに使う。
     built_ctx: PolicyContext,
+    /// [`Self::build`] 時に読んだストレージ世代（[`Storage::current_generation`]）。
+    /// [`Self::search`] の失効検出に使う。
+    built_generation: u64,
 }
 
 impl<'s> PrefilterIndex<'s> {
@@ -117,6 +130,9 @@ impl<'s> PrefilterIndex<'s> {
     /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
     /// security.md P0）。容量超過・次元不整合は [`RlsError::Arena`] へ伝播する。
     pub fn build(storage: &'s Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
+        // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
+        // コミットされても、その変更を見落とさない方向の順序。`search` の doc 参照）。
+        let built_generation = storage.current_generation()?;
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
         }) {
@@ -132,6 +148,7 @@ impl<'s> PrefilterIndex<'s> {
             storage,
             visible_id_set,
             built_ctx: ctx.clone(),
+            built_generation,
         })
     }
 
@@ -139,13 +156,16 @@ impl<'s> PrefilterIndex<'s> {
     ///
     /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
-    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に
-    /// アリーナ全行の現在の `tenant_id`・`visibility` を再取得し、構築時にアリーナへ
-    /// 格納した値と厳密に一致するか検証する。1 件でも不一致・不存在があれば provider を
-    /// 呼ばずに [`RlsError::IndexStale`] で拒否する（呼び出し元は [`Self::build`] を
-    /// 呼び直すこと）。全件一致後に provider を 1 回呼び、戻り値を
-    /// `provider_result_is_valid`（`core.rs`）で検証する（違反は
-    /// [`RlsError::ProviderResultRejected`]）。返却結果はこの再検証時点のストレージ
+    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に現在の
+    /// ストレージ世代（[`Storage::current_generation`]）を [`Self::build`] 時の値と比較し、
+    /// 不一致なら provider を呼ばずに [`RlsError::IndexStale`] で拒否する（呼び出し元は
+    /// [`Self::build`] を呼び直すこと）。世代はストレージ全体の書き込みコミットのたびに
+    /// 単調増加する（`crate::storage::bump_generation_and_commit`）ため、一致は
+    /// 「構築時点から行集合・内容とも一切変更されていない」ことを意味する（行の
+    /// tenant/visibility 変更・embedding 更新・新規挿入のいずれも検出する。旧版の
+    /// ヒット/全行ヘッダ照合はこれに包含されるため撤廃した）。一致後に provider を 1 回
+    /// 呼び、戻り値を `provider_result_is_valid`（`core.rs`）で検証する（違反は
+    /// [`RlsError::ProviderResultRejected`]）。返却結果はこの世代確認時点のストレージ
     /// スナップショットに対して一貫する。TASK-133・RLS-1〜4 参照。
     pub fn search(
         &self,
@@ -169,36 +189,16 @@ impl<'s> PrefilterIndex<'s> {
             return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
         }
 
-        // 失効行の全件事前検証（上記ドキュメント参照）。`arena_ids` は構築時に確定済みの
-        // 信頼できる id 一覧で、provider・呼び出し元の入力を経由しない。`CatalogError` は
-        // 種別を区別せず一律 `IndexStale` に丸め込む（fail-closed。他テナントの存在情報も
-        // 含めない。security.md P0）。
-        let arena_ids = self.arena.ids();
-        let headers = self
+        // 失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
+        // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
+        let current_generation = self
             .storage
-            .get_row_headers_from_table(self.arena.table_name(), arena_ids)
+            .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
-        if headers.len() != arena_ids.len() {
+        if current_generation != self.built_generation {
             return Err(RlsError::IndexStale);
         }
-        for (index, header) in headers.iter().enumerate() {
-            let Some((current_tenant, current_visibility)) = header else {
-                // 構築時には存在した行が検索時点では存在しない（削除相当）。
-                return Err(RlsError::IndexStale);
-            };
-            // 構築時アリーナが保持する tenant_id・visibility との厳密な等値比較
-            // （`ctx.is_visible` の再評価ではない）。
-            let built_tenant = self.arena.tenant_id(index);
-            let built_visibility = self.arena.visibility(index);
-            if built_tenant != Some(current_tenant.as_str())
-                || built_visibility != Some(*current_visibility)
-            {
-                return Err(RlsError::IndexStale);
-            }
-        }
 
-        // 上記の全件検証を通過したため、`ids`/`vectors` をそのまま provider へ渡せる
-        // （不可視・失効データは provider のアドレス空間へ渡らない）。
         let input = SearchInput {
             ids: self.arena.ids(),
             vectors: self.arena.vectors(),
@@ -690,6 +690,74 @@ mod tests {
             "tenant-a",
             Visibility::Private,
             &[1.0, 0.0],
+        );
+
+        let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // tenant_id・visibility は変わらず embedding だけが構築後に書き換わった場合も
+    // 世代カウンタの不一致により `RlsError::IndexStale` で拒否する（TASK-133 P1 対応）。
+    #[test]
+    fn search_rejects_when_embedding_only_is_updated_after_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // tenant/visibility は同一のまま embedding だけを書き換える。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[0.0, 1.0],
+        );
+
+        let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // 構築後に新規可視行が挿入された場合も世代カウンタの不一致により
+    // `RlsError::IndexStale` で拒否する（TASK-133 P1 対応）。
+    #[test]
+    fn search_rejects_when_a_new_visible_row_is_inserted_after_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // 構築後に ctx から可視な新規行を挿入する。
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.0, 1.0],
         );
 
         let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);

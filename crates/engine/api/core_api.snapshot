@@ -144,6 +144,7 @@ pub enum StorageError {
     PendingRowCountOverflow,
     UnloggedRows(u64),
     EmptyBatch,
+    GenerationCounterOverflow,
 }
 
 # source: crates/engine/src/catalog.rs :: CatalogError

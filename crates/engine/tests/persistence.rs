@@ -456,19 +456,23 @@ fn persist3_on_disk_row_entry_layout_via_raw_redb() {
     let db = Database::open(&path).expect("reopen raw database");
     let read_txn = db.begin_read().expect("begin read txn");
 
-    // データベース内に ROWS_TABLE 以外のテーブル（RLS フィールド専用の別テーブル等）が
-    // 作られていないこと。`list_tables` で実際のテーブル集合を検査することで、
-    // 「別テーブルに分離されていない」ことを直接確認する（部分文字列一致による
-    // 間接証拠ではなく、テーブル構成そのものを見る）。
-    let table_names: Vec<String> = read_txn
+    // データベース内に ROWS_TABLE 以外の RLS フィールド専用テーブルが作られていないこと。
+    // `list_tables` で実際のテーブル集合を検査することで、「別テーブルに分離されて
+    // いない」ことを直接確認する（部分文字列一致による間接証拠ではなく、テーブル構成
+    // そのものを見る）。`storage_generation`（TASK-133 P1・全書き込みコミットで単調増加
+    // する世代カウンタ。`crate::storage::bump_generation_and_commit` 参照）は RLS
+    // フィールドとは無関係の別用途テーブルのため許容する。
+    let mut table_names: Vec<String> = read_txn
         .list_tables()
         .expect("list tables")
         .map(|t| t.name().to_string())
         .collect();
+    table_names.sort();
     assert_eq!(
         table_names,
-        vec!["rows".to_string()],
-        "expected exactly the ROWS_TABLE ('rows'); RLS fields must not live in a separate table"
+        vec!["rows".to_string(), "storage_generation".to_string()],
+        "expected only ROWS_TABLE ('rows') and the generation counter table; \
+         RLS fields must not live in a separate table"
     );
 
     let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
