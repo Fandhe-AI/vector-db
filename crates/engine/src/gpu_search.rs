@@ -55,6 +55,24 @@ pub const MAX_BATCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 /// 使わないよう明示的に拒否する。
 pub const MAX_BATCH_K: usize = 10_000;
 
+/// バッチ全体で許容する `sum(k)`（各クエリの `k` の総和）の上限（防御的上限。
+/// codex P1 指摘対応）。クエリごとの `k` は [`MAX_BATCH_K`] で個別に上限を
+/// 課しているが、[`MAX_BATCH_QUERIES`] × `MAX_BATCH_K`（最大 4,096 万）まで
+/// 積が達しうる。`TopKSelector` は 1 クエリあたり最終的に高々 `k` 個の要素を
+/// 保持する（`kernel.rs::TopKSelector::push` 参照）ため、全選出器が保持しうる
+/// 要素数の総和はバッチ全体の `sum(k)` で抑えられる。1 個の常駐行列が持つ
+/// 行数を超える数の hit を選出しても意味がない（[`MAX_BATCH_ROWS`] 行しか
+/// 実データが存在しない）ため、`sum(k)` の上限を [`MAX_BATCH_ROWS`] と
+/// 同じ桁に揃える。
+pub const MAX_BATCH_TOTAL_K: usize = MAX_BATCH_ROWS;
+
+/// [`DynamicWindowAggregator`] が確保してよい総バイト量の上限（防御的上限。
+/// `ResidentMatrix::build` の [`MAX_BATCH_TOTAL_BYTES`] と同じ 1 GiB の
+/// 桁感覚。codex P1 指摘対応: 以前は `DynamicWindowAggregator::push` が
+/// 件数・次元・総容量を検証せず、内部 `Vec<Vec<f32>>` を無制限に成長
+/// させていた）。
+pub const MAX_BATCH_AGGREGATOR_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+
 /// バッチ検索エンジンのエラー（fail-closed）。メッセージは英語（wire プロトコル
 /// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
 /// 存在情報を含めない。
@@ -66,8 +84,10 @@ pub enum GpuSearchError {
     TooManyRows { count: usize, max: usize },
     /// 次元数が [`MAX_BATCH_DIM`] を超過した、または 0。
     InvalidDim { dim: usize, max: usize },
-    /// 行数・次元数はそれぞれ上限内でも、組み合わせた総確保バイト量が
-    /// [`MAX_BATCH_TOTAL_BYTES`] を超過した。
+    /// 行数・次元数はそれぞれ上限内でも、組み合わせた総確保バイト量が上限
+    /// （`ResidentMatrix::build` の [`MAX_BATCH_TOTAL_BYTES`]、または
+    /// `DynamicWindowAggregator` の [`MAX_BATCH_AGGREGATOR_TOTAL_BYTES`]）を
+    /// 超過した。
     CapacityExceeded { total_bytes: usize, max: usize },
     /// クエリベクトルの次元が常駐行列の次元と一致しない。
     DimMismatch { expected: usize, found: usize },
@@ -88,6 +108,19 @@ pub enum GpuSearchError {
     TenantIdTooLong { len: usize, max: usize },
     /// クエリの `k` が [`MAX_BATCH_K`] を超過した、または 0。
     InvalidK { k: usize, max: usize },
+    /// バッチ全体の `sum(k)` が [`MAX_BATCH_TOTAL_K`] を超過した（codex P1
+    /// 指摘対応: クエリ数・`k` を個別に上限検証するだけでは積が無制限になり、
+    /// 通常のヒープ確保（`kernel.rs::TopKSelector` 内部の `BinaryHeap`）で
+    /// 数千万要素規模の成長が起こり得た）。
+    TotalKExceeded { total_k: usize, max: usize },
+    /// `DynamicWindowAggregator::push` に渡されたクエリの次元が、同じ窓に
+    /// 先に積まれたクエリの次元と一致しない（codex P1 指摘対応）。
+    /// `DimMismatch`（常駐行列に対するクエリ次元不一致）と意図的に区別する:
+    /// 呼び出し元（wire-server 等）がエラーを一括処理する場合でも、
+    /// 「クエリがテーブルの次元に合わない」のか「同じ窓の他クエリと次元が
+    /// 揃っていない」のかを区別できるようにするため（`wire_code` 契約上、
+    /// 別条件として扱いうる）。
+    WindowDimMismatch { expected: usize, found: usize },
     /// `check_capacity` 相当のアロケーション前上限検証を通過した後、実際の
     /// `try_reserve_exact` がメモリ不足で失敗した（Cursor Bugbot 指摘対応:
     /// `ResidentMatrix::build` は上限検証後も `HashSet::with_capacity`・
@@ -138,6 +171,14 @@ impl fmt::Display for GpuSearchError {
             GpuSearchError::InvalidK { k, max } => {
                 write!(f, "gpu_search: invalid k: {k} (must be 1..={max})")
             }
+            GpuSearchError::TotalKExceeded { total_k, max } => write!(
+                f,
+                "gpu_search: total k across batch {total_k} exceeds limit {max}"
+            ),
+            GpuSearchError::WindowDimMismatch { expected, found } => write!(
+                f,
+                "gpu_search: dynamic window aggregator dim mismatch: expected={expected} found={found}"
+            ),
             GpuSearchError::AllocationFailed(msg) => {
                 write!(f, "gpu_search: allocation failed: {msg}")
             }
@@ -541,10 +582,18 @@ pub fn should_aggregate_into_batch(pending_after_pop: bool) -> bool {
 }
 
 /// 動的窓での集約バッファ。[`should_aggregate_into_batch`] が `true` を返した
-/// キュー取り出し文脈でのみ使う想定（PoC-13 移植）。
+/// キュー取り出し文脈でのみ使う想定（PoC-13 移植）。件数・次元・総バイト量は
+/// [`Self::push`] 自身が検証する（codex P1 指摘対応: 以前は公開 API である
+/// `push` が無検証で内部 `Vec` を無制限に成長させており、呼び出し側の自己
+/// 規律のみに依存していた。呼び出し側のキュー実装がバグっていても本構造体
+/// 単体で fail-closed に上限を保証する）。
 #[derive(Debug, Default)]
 pub struct DynamicWindowAggregator {
     queries: Vec<Vec<f32>>,
+    /// 最初の [`Self::push`] で確定する次元。以降の `push` はこの次元との
+    /// 一致を要求する（次元混在バッチを拒否する。[`Self::drain`] で窓を
+    /// 使い切ると次の窓のためにリセットされる）。
+    dim: Option<usize>,
 }
 
 impl DynamicWindowAggregator {
@@ -552,11 +601,96 @@ impl DynamicWindowAggregator {
         Self::default()
     }
 
-    /// クエリ 1 件を窓へ追加する。上限は呼び出し側（キュー実装）が
-    /// [`MAX_BATCH_QUERIES`] を尊重して制御する前提（本構造体自体は無制限に
-    /// 追加を受け付けるため、呼び出し側の責務として明記する）。
-    pub fn push(&mut self, query: Vec<f32>) {
+    /// クエリ 1 件を窓へ追加する。以下を fail-closed に検証してから
+    /// フォールブルに確保する:
+    /// - 件数が [`MAX_BATCH_QUERIES`] を超えないこと
+    /// - 次元が 1 以上 [`MAX_BATCH_DIM`] 以下で、既存クエリと同一であること
+    ///   （1 件目の `push` で次元を確定する）
+    /// - 累積総バイト量が [`MAX_BATCH_AGGREGATOR_TOTAL_BYTES`] を超えないこと
+    ///
+    /// 内部 `Vec<Vec<f32>>` の成長は `Vec::push`（失敗時に abort する内部
+    /// 確保）ではなく `try_reserve_exact` で行う（`ResidentMatrix::build` 用の
+    /// 共通ヘルパーを再利用。coding-rust.md「無制限確保禁止」準拠）。渡された
+    /// `query: Vec<f32>` 自体は呼び出し元が既に確保済みの所有権を移動する
+    /// だけなので、要素本体の再確保は発生しない。
+    pub fn push(&mut self, query: Vec<f32>) -> Result<(), GpuSearchError> {
+        if self.queries.len() >= MAX_BATCH_QUERIES {
+            return Err(GpuSearchError::TooManyQueries {
+                count: self.queries.len() + 1,
+                max: MAX_BATCH_QUERIES,
+            });
+        }
+        let dim = query.len();
+        if dim == 0 || dim > MAX_BATCH_DIM {
+            return Err(GpuSearchError::InvalidDim {
+                dim,
+                max: MAX_BATCH_DIM,
+            });
+        }
+        if let Some(expected) = self.dim {
+            if expected != dim {
+                return Err(GpuSearchError::WindowDimMismatch {
+                    expected,
+                    found: dim,
+                });
+            }
+        }
+
+        let per_query_bytes = dim.checked_mul(std::mem::size_of::<f32>()).ok_or(
+            GpuSearchError::CapacityExceeded {
+                total_bytes: usize::MAX,
+                max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
+            },
+        )?;
+        let next_count =
+            self.queries
+                .len()
+                .checked_add(1)
+                .ok_or(GpuSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
+                })?;
+        let total_bytes =
+            next_count
+                .checked_mul(per_query_bytes)
+                .ok_or(GpuSearchError::CapacityExceeded {
+                    total_bytes: usize::MAX,
+                    max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
+                })?;
+        if total_bytes > MAX_BATCH_AGGREGATOR_TOTAL_BYTES {
+            return Err(GpuSearchError::CapacityExceeded {
+                total_bytes,
+                max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
+            });
+        }
+
+        // amortized 成長: capacity が尽きたときだけ倍々に増やし、`push` の
+        // たびに `try_reserve_exact(1)` する（= 呼び出し回数分の再確保・
+        // memcpy が発生する）のを避ける。成長候補は既知の絶対上限
+        // [`MAX_BATCH_QUERIES`] で頭打ちにするため、`arena.rs::
+        // GrowableArenaBuffers::ensure_capacity` のような追加の容量見積もり
+        // 検証（`check_capacity` 相当）は不要（本構造体の要素は `Vec<f32>`
+        // ハンドルのみで、成長候補自体の総バイト量は上の総バイト量チェックが
+        // 別途カバーする）。
+        if self.queries.len() == self.queries.capacity() {
+            let next_capacity = self
+                .queries
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(MAX_BATCH_QUERIES)
+                .clamp(4, MAX_BATCH_QUERIES);
+            let additional = next_capacity.saturating_sub(self.queries.capacity());
+            if additional > 0 {
+                try_reserve_exact(
+                    &mut self.queries,
+                    additional,
+                    "dynamic window aggregator queries",
+                )?;
+            }
+        }
+        self.dim = Some(dim);
         self.queries.push(query);
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -567,8 +701,11 @@ impl DynamicWindowAggregator {
         self.queries.is_empty()
     }
 
-    /// 窓を確定し、集約済みクエリ集合を取り出す（窓は 1 回使い切り）。
+    /// 窓を確定し、集約済みクエリ集合を取り出す（窓は 1 回使い切り）。次元の
+    /// 確定状態もリセットし、次の窓では別次元のバッチを受け付けられるように
+    /// する。
     pub fn drain(&mut self) -> Vec<Vec<f32>> {
+        self.dim = None;
         std::mem::take(&mut self.queries)
     }
 }
@@ -638,13 +775,10 @@ impl GpuBatchEngine {
             });
         }
 
-        // 事前検証パス: 次元・非有限値・k をクエリごとに検証し、選出器を用意する。
-        // 選出器コンテナ（`Vec<TopKSelector>`）は `Vec::with_capacity`
-        // （失敗時に abort する内部確保）ではなく `try_reserve_exact` で
-        // フォールブルに確保する（codex P1 指摘対応。`ResidentMatrix::build`
-        // 用に定義済みの共通ヘルパーを再利用）。
-        let mut selectors: Vec<TopKSelector> = Vec::new();
-        try_reserve_exact(&mut selectors, queries.len(), "selectors")?;
+        // 事前検証パス（1 巡目）: 次元・非有限値・k をクエリごとに検証し、
+        // `sum(k)` を積算する。選出器の生成は `sum(k)` の上限検証（下記）を
+        // 通過してから行う（未検証の総量でヒープを成長させない）。
+        let mut total_k: usize = 0;
         for (query_index, q) in queries.iter().enumerate() {
             if q.vector.len() != self.matrix.dim {
                 return Err(GpuSearchError::DimMismatch {
@@ -661,6 +795,28 @@ impl GpuBatchEngine {
                     max: MAX_BATCH_K,
                 });
             }
+            total_k = total_k
+                .checked_add(q.k)
+                .ok_or(GpuSearchError::TotalKExceeded {
+                    total_k: usize::MAX,
+                    max: MAX_BATCH_TOTAL_K,
+                })?;
+        }
+        if total_k > MAX_BATCH_TOTAL_K {
+            return Err(GpuSearchError::TotalKExceeded {
+                total_k,
+                max: MAX_BATCH_TOTAL_K,
+            });
+        }
+
+        // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
+        // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保する（codex P1
+        // 指摘対応: `Vec::with_capacity` は失敗時に abort するため使わない。
+        // `try_reserve_exact` は `ResidentMatrix::build` 用に定義済みの
+        // 共通ヘルパーを再利用する）。
+        let mut selectors: Vec<TopKSelector> = Vec::new();
+        try_reserve_exact(&mut selectors, queries.len(), "selectors")?;
+        for q in queries {
             selectors.push(TopKSelector::new(q.k));
         }
 
@@ -884,12 +1040,73 @@ mod tests {
     fn aggregator_drains_pushed_queries_once() {
         let mut agg = DynamicWindowAggregator::new();
         assert!(agg.is_empty());
-        agg.push(vec![1.0, 0.0]);
-        agg.push(vec![0.0, 1.0]);
+        agg.push(vec![1.0, 0.0]).expect("push ok");
+        agg.push(vec![0.0, 1.0]).expect("push ok");
         assert_eq!(agg.len(), 2);
         let drained = agg.drain();
         assert_eq!(drained.len(), 2);
         assert!(agg.is_empty());
+    }
+
+    // codex P1 指摘対応: `push` は件数上限（`MAX_BATCH_QUERIES`）を超えると
+    // 内部 `Vec` を無制限に成長させず fail-closed に拒否する。
+    #[test]
+    fn aggregator_push_rejects_over_max_queries() {
+        let mut agg = DynamicWindowAggregator::new();
+        for _ in 0..MAX_BATCH_QUERIES {
+            agg.push(vec![1.0, 0.0]).expect("push ok");
+        }
+        let err = agg.push(vec![1.0, 0.0]).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::TooManyQueries {
+                count: MAX_BATCH_QUERIES + 1,
+                max: MAX_BATCH_QUERIES,
+            }
+        );
+    }
+
+    // codex P1 指摘対応: 次元は 1 件目の `push` で確定し、以降の `push` は
+    // 同一次元しか受け付けない（次元混在バッチを拒否する）。
+    #[test]
+    fn aggregator_push_rejects_dimension_mismatch_after_first_push() {
+        let mut agg = DynamicWindowAggregator::new();
+        agg.push(vec![1.0, 0.0]).expect("push ok");
+        let err = agg.push(vec![1.0, 0.0, 0.0]).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::WindowDimMismatch {
+                expected: 2,
+                found: 3
+            }
+        );
+    }
+
+    // codex P1 指摘対応: 次元 0 のクエリは受け付けない（`MAX_BATCH_DIM` と
+    // 同じ検証を `ResidentMatrix::build` と揃える）。
+    #[test]
+    fn aggregator_push_rejects_zero_dim() {
+        let mut agg = DynamicWindowAggregator::new();
+        let err = agg.push(vec![]).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::InvalidDim {
+                dim: 0,
+                max: MAX_BATCH_DIM
+            }
+        );
+    }
+
+    // codex P1 指摘対応: `drain` は次元の確定状態もリセットするため、次の窓は
+    // 別次元のバッチを受け付けられる。
+    #[test]
+    fn aggregator_drain_resets_dimension_for_next_window() {
+        let mut agg = DynamicWindowAggregator::new();
+        agg.push(vec![1.0, 0.0]).expect("push ok");
+        agg.drain();
+        agg.push(vec![1.0, 0.0, 0.0])
+            .expect("次元 3 の別窓は許可される");
+        assert_eq!(agg.len(), 1);
     }
 
     // Cursor Bugbot 指摘対応: 上限検証済みの量を超えて `try_reserve_exact` が
@@ -1205,6 +1422,60 @@ mod tests {
             GpuSearchError::InvalidK {
                 k: MAX_BATCH_K + 1,
                 max: MAX_BATCH_K
+            }
+        );
+    }
+
+    // codex P1 指摘対応: `sum(k)` がちょうど [`MAX_BATCH_TOTAL_K`] に等しい
+    // 境界（超過ではない）は許可されることを確認する。この確認がないと
+    // `batch_search_rejects_total_k_over_limit`（超過側のみ検証）だけでは
+    // 比較演算子の off-by-one（`>` を `>=` に取り違える等）を検出できない。
+    #[test]
+    fn batch_search_accepts_total_k_exactly_at_limit() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        // 100 件 * k=10_000 = 1,000,000 == MAX_BATCH_TOTAL_K ちょうど。
+        let query_count = MAX_BATCH_TOTAL_K / MAX_BATCH_K;
+        assert_eq!(query_count * MAX_BATCH_K, MAX_BATCH_TOTAL_K);
+        let queries: Vec<BatchQuery<'_>> = (0..query_count)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: MAX_BATCH_K,
+                tenant_id: "tenant-a",
+            })
+            .collect();
+        let results = engine
+            .batch_search(&queries)
+            .expect("sum(k) at the limit must be accepted");
+        assert_eq!(results.len(), query_count);
+    }
+
+    // codex P1 指摘対応: 各クエリの `k` は個別に [`MAX_BATCH_K`] 以内でも、
+    // バッチ全体の `sum(k)` が [`MAX_BATCH_TOTAL_K`] を超える場合は
+    // fail-closed に拒否する（個別上限のみでは積が無制限になり得たため）。
+    #[test]
+    fn batch_search_rejects_total_k_over_limit() {
+        let matrix = build_two_tenant_matrix();
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        // 101 件 * k=10_000 = 1,010,000 > MAX_BATCH_TOTAL_K(1,000,000)。
+        // 各クエリの k は MAX_BATCH_K(10_000) ちょうどで個別上限は満たす。
+        let query_count = MAX_BATCH_TOTAL_K / MAX_BATCH_K + 1;
+        let queries: Vec<BatchQuery<'_>> = (0..query_count)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: MAX_BATCH_K,
+                tenant_id: "tenant-a",
+            })
+            .collect();
+        let expected_total_k = query_count * MAX_BATCH_K;
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(
+            err,
+            GpuSearchError::TotalKExceeded {
+                total_k: expected_total_k,
+                max: MAX_BATCH_TOTAL_K,
             }
         );
     }
