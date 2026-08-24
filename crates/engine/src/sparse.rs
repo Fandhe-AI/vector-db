@@ -342,7 +342,7 @@ pub fn tokenize(text: &str) -> Vec<String> {
 /// そのユニグラムだけを出力から除く（バイグラムは除去しない。「もの」の「の」のような
 /// 内容語内部の助詞文字を壊さないため）。除去有無で `SparseIndex::build`/`search` の
 /// 対称性は自動的に保たれる（`tokenize()` は常に除去 ON のため index/query 間で
-/// トークナイザが一致する）。除去有無による Recall@20 の比較測定は
+/// トークナイザが一致する）。除去有無によるランキング品質の比較測定は
 /// `crates/engine/tests/sparse_stopwords.rs` を参照。
 ///
 /// 入力長に対して線形（`O(n)`）に処理し、`Vec` の初期容量は入力を `chars()` で数えた
