@@ -22,10 +22,11 @@ permissions:
   contents: read
 
 concurrency:
-  # workflow_dispatch は ref = デフォルトブランチ固定のため、workflow 名のみで
-  # group を一意化すれば十分（ci.yml の PR 番号切り分けは不要）。schedule 再追加時も
-  # 同様にデフォルトブランチ固定のため変更不要。
-  group: ${{ github.workflow }}
+  # workflow_dispatch は任意の ref を選択して起動できる（デフォルトブランチ固定では
+  # ない）ため、workflow 名のみで group を一意化すると別 ref 向けの実行が先行実行を
+  # キャンセルしてしまう。ref を group に含め、同一 ref の重複実行のみ
+  # キャンセル対象にする（ci.yml の PR 番号切り分けと同種の意図）。
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
