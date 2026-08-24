@@ -255,27 +255,6 @@ pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> R
     Ok(())
 }
 
-/// [`Storage::begin_generation_snapshot`] が返す、読み取りスナップショットと世代の
-/// ペア（TASK-133 P0 対応）。**契約**: 本値の生存期間 == その世代を前提にした処理の
-/// 一貫性保証期間。保持している間は内部の `redb::ReadTransaction` が開始時点の
-/// スナップショットを pin し続ける（redb の MVCC 契約により、保持中に他の書き込みが
-/// コミットされても、このスナップショットおよび [`Self::generation`] の値は変化しない）。
-/// `redb` の read txn は書き込みをブロックしない（MVCC）ため、保持を長引かせても
-/// 書き込み側の DoS 要因にはならない。
-pub(crate) struct GenerationSnapshot {
-    // フィールド自体は使わないが、drop されるまでスナップショットを pin し続けるために
-    // 保持する（読み取りには使わない。`generation` だけを公開する）。
-    _txn: redb::ReadTransaction,
-    generation: u64,
-}
-
-impl GenerationSnapshot {
-    /// このスナップショット開始時点の書き込み世代。
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
-    }
-}
-
 /// RLS 相当のテナント境界判定に使う可視性ラベル（対象ビヘイビア: PERSIST-3）。
 ///
 /// 本モジュールはこの値をスキーマとして同居保持するのみで、ポリシー評価（どの値なら
@@ -398,29 +377,18 @@ impl Storage {
         bump_generation_and_commit(write_txn)
     }
 
-    /// 現在の書き込み世代を返す（TASK-133 P1 対応。読み取り専用）。世代の値だけを使い
-    /// スナップショットは保持しない呼び出し元向けの薄いラッパー
-    /// （[`Self::begin_generation_snapshot`] を呼んで即座に値だけ取り出す）。
-    /// `crate::rls::PrefilterIndex::build` が構築時の世代記録に使う。
+    /// 現在の書き込み世代を返す（TASK-133 P1 対応。読み取り専用。1 回の `read_txn` を
+    /// 開いて閉じるだけの単純な値取得で、スナップショットは保持しない）。
+    /// `crate::rls::PrefilterIndex::build`/`search` が失効検出の前後比較に使う
+    /// （安全性は呼び出し元が前後の値を比較することで担保する。本メソッド自体は
+    /// 世代値以外の一貫性を何も保証しない）。
     pub(crate) fn current_generation(&self) -> Result<u64> {
-        Ok(self.begin_generation_snapshot()?.generation())
-    }
-
-    /// 読み取りスナップショットを開始し、その場で世代を読んで [`GenerationSnapshot`] として
-    /// 返す（TASK-133 P0 対応）。`crate::rls::PrefilterIndex::search` が、世代確認から
-    /// 検索結果確定までを単一スナップショットに一貫させるため、戻り値を結果確定まで
-    /// 生存させたまま保持する（契約は [`GenerationSnapshot`] のドキュメント参照）。
-    pub(crate) fn begin_generation_snapshot(&self) -> Result<GenerationSnapshot> {
-        let txn = self.db.begin_read()?;
-        let generation = match txn.open_table(GENERATION_TABLE) {
-            Ok(t) => t.get(GENERATION_KEY)?.map(|v| v.value()).unwrap_or(0),
-            Err(redb::TableError::TableDoesNotExist(_)) => 0,
-            Err(e) => return Err(e.into()),
-        };
-        Ok(GenerationSnapshot {
-            _txn: txn,
-            generation,
-        })
+        let read_txn = self.db.begin_read()?;
+        match read_txn.open_table(GENERATION_TABLE) {
+            Ok(t) => Ok(t.get(GENERATION_KEY)?.map(|v| v.value()).unwrap_or(0)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// 行 ID を指定して 1 行取得する（スナップショット読み取り）。

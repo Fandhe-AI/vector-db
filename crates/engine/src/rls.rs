@@ -156,20 +156,18 @@ impl<'s> PrefilterIndex<'s> {
     ///
     /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
-    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に
-    /// [`crate::storage::Storage::begin_generation_snapshot`] で世代を読み、
-    /// [`Self::build`] 時の値と比較する（不一致は provider を呼ばずに
-    /// [`RlsError::IndexStale`]）。世代はストレージ全体の書き込みコミットのたびに単調増加
-    /// する（`crate::storage::bump_generation_and_commit`）ため、一致は「構築時点から行集合・
-    /// 内容とも一切変更されていない」ことを意味する。一致後に provider を 1 回呼び、戻り値を
-    /// `provider_result_is_valid`（`core.rs`）で検証する（違反は
-    /// [`RlsError::ProviderResultRejected`]）。**返却直前にもう一度世代を読み直し**、
-    /// 事前確認時の値と再度一致することを確認してから `Ok(hits)` を返す（不一致は結果を
-    /// 破棄し [`RlsError::IndexStale`]）。read txn の保持（`GenerationSnapshot`）は古い
-    /// スナップショットを pin するだけで書き込みをブロックしないため、事前確認〜結果返却の
-    /// 間に別の書き込みがコミットされうる。事後の世代再確認により、その間に競合する書き込みが
-    /// あった場合は結果を確定させず破棄する（事後確認と破棄判定の間のごく短い残余ウィンドウは
-    /// 呼び出し側が次回検索の世代照合で扱う）。TASK-133・RLS-1〜4 参照。
+    /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**と
+    /// provider から結果を受け取った**後**の 2 回、
+    /// [`crate::storage::Storage::current_generation`] を呼んで [`Self::build`] 時の値と
+    /// 比較する（いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体の
+    /// 書き込みコミットのたびに単調増加する（`crate::storage::bump_generation_and_commit`）
+    /// ため、両方で一致することは「事前確認から事後確認までの間、行集合・内容とも一切
+    /// 変更されていない」ことを意味する（安全性はこの前後比較のみで担保しており、
+    /// `current_generation` 自体は世代値以外の一貫性を保証しない）。事前確認を通過した
+    /// 場合のみ provider を呼び、戻り値を `provider_result_is_valid`（`core.rs`）で検証する
+    /// （違反は [`RlsError::ProviderResultRejected`]）。事前・事後の確認自体は互いに独立した
+    /// 読み取りであり、事後確認と `Ok(hits)` 返却の間に残るごく短いウィンドウは次回検索の
+    /// 世代照合で扱う。TASK-133・RLS-1〜4 参照。
     pub fn search(
         &self,
         ctx: &PolicyContext,
@@ -194,11 +192,11 @@ impl<'s> PrefilterIndex<'s> {
 
         // 事前の失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
         // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
-        let generation_snapshot = self
+        let pre_generation = self
             .storage
-            .begin_generation_snapshot()
+            .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
-        if generation_snapshot.generation() != self.built_generation {
+        if pre_generation != self.built_generation {
             return Err(RlsError::IndexStale);
         }
 
@@ -215,14 +213,13 @@ impl<'s> PrefilterIndex<'s> {
             return Err(RlsError::ProviderResultRejected);
         }
 
-        // 事後の失効再検証（上記ドキュメント参照）。read txn の保持は書き込みをブロック
-        // しないため、事前確認〜ここまでの間に別の書き込みがコミットされている可能性がある。
-        // 新しいスナップショットで世代を読み直し、不一致なら結果を破棄する。
-        let post_generation_snapshot = self
+        // 事後の失効再検証（上記ドキュメント参照）。事前確認〜ここまでの間に別の書き込みが
+        // コミットされている可能性があるため、世代を読み直して不一致なら結果を破棄する。
+        let post_generation = self
             .storage
-            .begin_generation_snapshot()
+            .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
-        if post_generation_snapshot.generation() != self.built_generation {
+        if post_generation != self.built_generation {
             return Err(RlsError::IndexStale);
         }
 

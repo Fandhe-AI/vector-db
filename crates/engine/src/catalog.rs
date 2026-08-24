@@ -664,11 +664,14 @@ impl Storage {
         {
             let schema = require_table_schema_write(&write_txn, table_name)?;
             if rows.is_empty() {
-                // 行テーブルを開く必要はないが、上記の存在確認は既に済ませたうえで
-                // write txn を commit する（`storage.rs::Storage::put_batch` と同様、
-                // 空バッチは行データに触れず即座に成功として扱う）。
-                return crate::storage::bump_generation_and_commit(write_txn)
-                    .map_err(convert_storage_error);
+                // 存在確認以外に何も変更しないため、commit（＝世代を進める）せず
+                // write txn を破棄する（`redb::WriteTransaction` は commit/abort の
+                // どちらも呼ばずに drop すると自動的に abort される契約。TASK-133 P2
+                // 対応: 空バッチだけで既存 `PrefilterIndex` を不要に失効させない）。
+                // `storage.rs::Storage::put_batch` と同様、空バッチは行データに
+                // 触れず即座に成功として扱う。
+                drop(write_txn);
+                return Ok(());
             }
             let row_table_name = user_rows_table_name(table_name);
             let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
@@ -1028,6 +1031,60 @@ mod tests {
         assert!(
             matches!(result, Err(CatalogError::Invalid(_))),
             "expected Err(Invalid) once table count exceeds MAX_LIST_TABLES, got {result:?}"
+        );
+    }
+
+    // --- Storage::insert_rows_into_table（空バッチ） -------------------------
+    // TASK-133 P2 対応: 空バッチは既存行・スキーマを一切変更しないため、世代カウンタ
+    // （`crate::storage::bump_generation_and_commit` が管理）を進めてはならない
+    // （進めると空バッチだけで既存 `PrefilterIndex` を不要に失効させてしまう）。
+
+    #[test]
+    fn insert_rows_into_table_with_empty_batch_does_not_bump_generation() {
+        let path = unique_db_path("insert-rows-empty-batch-generation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+
+        // `create_table` 自体の世代（DDL も commit のたびに世代を進める）を基準にする。
+        let generation_before = storage.current_generation().expect("generation before");
+
+        storage
+            .insert_rows_into_table("docs", &[])
+            .expect("empty batch insert must succeed as a no-op");
+
+        assert_eq!(
+            storage.current_generation().expect("generation after"),
+            generation_before,
+            "empty batch insert must not bump the storage generation counter"
+        );
+
+        // 対称性の確認: 実際に行を書き込むバッチは引き続き世代を進める。
+        storage
+            .insert_rows_into_table(
+                "docs",
+                &[(
+                    1,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: crate::storage::Visibility::Public,
+                        embedding: &[1.0, 0.0],
+                        metadata: &[],
+                    },
+                )],
+            )
+            .expect("non-empty batch insert");
+        assert_eq!(
+            storage
+                .current_generation()
+                .expect("generation after non-empty batch"),
+            generation_before + 1,
+            "a non-empty batch insert must still bump the storage generation counter"
         );
     }
 }
