@@ -18,3 +18,10 @@ _/
 
 # 環境変数
 .env*
+
+# 評価スクリプトの実設定（TASK-118。実エンドポイント・接続情報を含みうるため git 管理外）
+scripts/eval/config.json
+
+# Python バイトコードキャッシュ
+__pycache__/
+*.pyc
