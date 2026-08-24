@@ -107,3 +107,24 @@ jobs:
         run: rustup show
       - name: Run crash-test-cross-table
         run: make crash-test-cross-table
+
+  # --------------------------------------------------
+  # core-api-check（コア API シグネチャ差分検知。TASK-125・対象ビヘイビア CORE-1）
+  # --------------------------------------------------
+  # プロトコル層（wire-server 等）の追加・変更がコア API（VectorCore/SearchProvider）の
+  # シグネチャ変更を伴わないことを scripts/check_core_api.sh（cargo 不要のテキスト比較）
+  # で機械チェックする。rust-ci（reusable workflow）とは異なり生の steps を持つ独立
+  # ジョブとして定義するため、第三者 action（actions/checkout）は SHA 固定で参照する
+  # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions
+  # のみ）。テキスト比較のみで Rust toolchain は不要なため checkout のみで完結する。
+  # branch protection の必須チェックへ追加する運用は rust-ci と同様ユーザー作業（PR 本文参照）。
+  core-api-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Run core-api-check
+        run: make core-api-check
