@@ -8,19 +8,24 @@
 //! 標準出力には実測値と pass/fail のみを書き、注入された閾値そのものは出力しない
 //! （`.claude/rules/spec-confidentiality.md`）。
 //!
-//! - CORE-7（動的窓の劣化上限・アクティブなゲート）: 同一クエリを同一
-//!   `BatchEngine::batch_search`（同一 `ResidentMatrix`・f16 デコード・
-//!   テナントマスク・visibility フィルタを共有）へ渡す 2 経路を
-//!   `harness::ab::run_ab` で interleaved 計測する。A（CORE-3 相当）は
-//!   [`engine::batch_search::DynamicWindowAggregator`] を経由せず 1 件の
-//!   `BatchQuery` を直接組み立てて渡し、B は同じクエリを
-//!   `DynamicWindowAggregator::push`/`drain` に通してから渡す。両者の差分が
-//!   「動的窓集約それ自体のオーバーヘッド」のみになるよう、エンジン・行列・
-//!   マスク経路・k をすべて揃える（レビュー指摘対応: 以前は A 側が
-//!   `ParallelSearchProvider` への直接呼び出しだったため、f16 デコード・
-//!   テナントマスク・並列/非並列の違いまで丸ごと乗った差分になっており、
-//!   窓集約の真の劣化を検出できないゲートになっていた）。B の p95 が A に
-//!   対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを判定する。
+//! - CORE-7（動的窓の劣化上限・アクティブなゲート）: [`engine::batch_search::
+//!   DynamicWindowAggregator`] の `push`/`drain` それ自体のオーバーヘッドのみを
+//!   測定区間に含める（レビュー指摘対応: 以前は A/B どちらも同一の
+//!   `BatchEngine::batch_search`〔10 万行 × dim 768 の全走査〕を測定区間に含めて
+//!   いたため、全走査のミリ秒級コストの前で `push`/`drain` のナノ〜マイクロ秒級の
+//!   差分が埋もれ、実質どんな劣化を注入しても pass してしまう判別力のないゲートに
+//!   なっていた）。A（対照。集約器を経由しない）は `Vec<Vec<f32>>` へクエリを
+//!   直接 `push`（`Vec::push`。検証なし）する経路、B（被検）は同じ本数のクエリを
+//!   `DynamicWindowAggregator::push` に通してから `drain` する経路とし、両者とも
+//!   1 反復あたり [`AGG_BATCH_SIZE`] 本のクエリを処理する（1 本ずつだとナノ秒級
+//!   すぎて `Instant` の分解能・測定オーバーヘッドに埋もれるため、実運用の窓サイズを
+//!   模した本数へ増幅してから測る。値の根拠はモジュール末尾の `local_smoke` テスト
+//!   参照）。差分は「集約器の検証・容量管理・所有権移動オーバーヘッド」のみになる。
+//!   B の p95 が A に対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを
+//!   判定する。`BatchEngine::batch_search` 自体（f16 デコード・テナントマスク・
+//!   visibility フィルタ・全走査）は本ゲートの測定対象外とする（CORE-3/CORE-5 側の
+//!   ゲート〔`parallel_bench.rs`〕が別途担う関心事であり、本ゲートに混ぜると
+//!   再び判別力を失う）。
 //! - CORE-6（GPU 経路 vs CPU-SIMD の p95 短縮率）・CORE-16（f16 常駐 vs f32 常駐の
 //!   p95 短縮率）: 実 GPU バックエンド未接続のため実測不能
 //!   （`crates/engine/src/batch_search.rs` モジュール冒頭コメント参照。CPU 上の
@@ -30,8 +35,17 @@
 //!   CORE-5 opt-in の骨格を踏襲するが、opt-in 判定は非空値ならすべて要求とみなす
 //!   よう本ファイル側で強化している。レビュー指摘対応: `"1"` 完全一致のみを
 //!   有効とみなす方式だと `"true"`/`"yes"` 等の non-"1" な truthy 値がサイレントに
-//!   「未設定」と同じ fail-open 側へ落ちるため）。フラグ指定時のみ
-//!   「未測定＝判定不能」を fail-closed として扱う。
+//!   「未設定」と同じ fail-open 側へ落ちるため）。フラグ指定時は「実 GPU 経路が
+//!   未実装のため本フラグはまだ使用不可（GPU 実行への置き換え後に有効化される。
+//!   `batch_search.rs` モジュール冒頭コメント参照）」ことを明示し、無条件で
+//!   `pass=false` とする（レビュー指摘対応: 以前は「opt-in する」という運用上の
+//!   誘導文言だけがあり、`check_improvement_at_least`〔判定ロジック本体〕を呼ぶ
+//!   実測経路が存在しない不一致があった）。あわせて、判定ロジック自体の配線
+//!   （env フラグ読み取り → 実測 → `check_improvement_at_least` 呼び出し →
+//!   標準出力）が壊れていないかを CPU 経路同士の疎通測定で確認する
+//!   （[`run_wiring_smoke`]）。これは GPU 実測の代替ではなく合否にも数えない
+//!   ——同一 CPU 経路同士なので改善率は意味を持たない——が、配線そのものが
+//!   `panic`/`Err` せず最後まで動くことだけを確認する。
 
 // `harness` の取り込み方針は `parallel_bench.rs` と同一（本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
@@ -39,28 +53,42 @@
 mod harness;
 
 use harness::ab::run_ab;
-use harness::accept::{check_degradation_within_limit, p95_from_samples};
+use harness::accept::{
+    check_degradation_within_limit, check_improvement_at_least, p95_from_samples,
+};
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
 
 use engine::batch_search::{BatchEngine, BatchQuery, DynamicWindowAggregator, ResidentMatrix};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
+use std::time::Instant;
 
-/// 測定条件（行数・次元・k）。`parallel_bench.rs` と同一値を用いる（測定条件そのものは
-/// spec の SSOT だが、既存ベンチ（TASK-127）がすでに同じ値を公開コードへ含んでいる
-/// ため新規の漏えいではない）。
-const ROW_COUNT: usize = 100_000;
-const DIM: usize = 768;
-const TOP_K: usize = 20;
+/// CORE-7 ゲートで 1 反復あたり集約器へ通すクエリ本数。1 本単位では `push`/`drain`
+/// が数百ナノ秒程度で終わり `Instant` の分解能・関数呼び出しオーバーヘッドへ
+/// 埋もれるため、実運用の動的窓サイズ相当の本数へ増幅してから測る（値の根拠は
+/// 本ファイル末尾の `local_smoke` テスト参照。値そのものは spec の閾値ではなく
+/// 本ベンチ固有の測定条件）。
+const AGG_BATCH_SIZE: usize = 256;
+
+/// CORE-7 ゲートで集約するクエリの次元数。
+const AGG_QUERY_DIM: usize = 768;
+
+/// CORE-6/CORE-16 の配線疎通測定（[`run_wiring_smoke`]）専用の合成データセット規模。
+/// GPU 実測の代替ではなく「関数呼び出しが最後まで動くこと」の確認が目的のため、
+/// `BatchEngine::batch_search` が現実的な時間で完走する程度の小規模で十分とし、
+/// `AGG_BATCH_SIZE` 系のミリ秒級 CORE-7 計測と混同しないよう独立した定数にする。
+const SMOKE_ROW_COUNT: usize = 2_000;
+const SMOKE_DIM: usize = 64;
+const SMOKE_TOP_K: usize = 5;
 
 /// CORE-7 ゲートの計測に使うテナント ID（本ベンチ専用の合成データ。実データではない）。
 const BENCH_TENANT: &str = "task-130-bench-tenant";
 
 /// `BENCH_BATCH_MAX_DEGRADATION_PCT` 環境変数（パーセント・浮動小数点）を読み取り、
 /// CORE-7 の劣化率上限として使う値を得る。未設定・非数値・負値は fail-closed で
-/// 判定不能として扱う（数値そのものは spec が SSOT。本ファイルにはデフォルト値を
-/// 持たない——`.claude/rules/spec-confidentiality.md`）。
+/// 判定不能として扱う(数値そのものは spec が SSOT。本ファイルにはデフォルト値を
+/// 持たない——`.claude/rules/spec-confidentiality.md`)。
 fn max_degradation_pct_from_env() -> Result<f64, String> {
     let raw = std::env::var("BENCH_BATCH_MAX_DEGRADATION_PCT").map_err(|_| {
         "BENCH_BATCH_MAX_DEGRADATION_PCT is not set (see .github/workflows/bench.yml vars)"
@@ -90,21 +118,89 @@ fn opt_in_requested_from_env(var: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// CORE-6/CORE-16 opt-in フラグの「配線」だけを CPU 経路同士で疎通確認する
+/// （[`check_improvement_at_least`] を実際に呼ぶ実測経路が存在しない、という
+/// レビュー指摘への対応）。`baseline`/`candidate` はどちらも同一の
+/// `BatchEngine::batch_search`（CPU 参照実装）を同一入力で 1 回ずつ呼んで得た
+/// 実測時間であり、同一経路同士のため改善率に意味はない（GPU 実測の代替では
+/// ない）。ここで確認したいのは「env 読み取り → 実測 → `check_improvement_at_least`
+/// 呼び出し → 標準出力」という配線が `panic`/`Err` せず最後まで通ること自体であり、
+/// 戻り値の pass/fail は疎通確認の対象外として全体の合否（`passed`）には反映しない。
+/// 関数呼び出し自体が `Err` を返した場合（= 配線が壊れている）は疎通確認の失敗として
+/// 呼び出し元へ伝える。
+fn run_wiring_smoke(
+    label: &str,
+    batch_engine: &BatchEngine,
+    ctx: &PolicyContext,
+) -> Result<(), String> {
+    let query = vec![0.1_f32; SMOKE_DIM];
+    let batch_queries = [BatchQuery {
+        vector: &query,
+        k: SMOKE_TOP_K,
+        ctx,
+    }];
+
+    let start_baseline = Instant::now();
+    batch_engine
+        .batch_search(&batch_queries)
+        .map_err(|err| format!("{label} wiring smoke: baseline batch_search failed: {err}"))?;
+    let baseline = start_baseline.elapsed();
+
+    let start_candidate = Instant::now();
+    batch_engine
+        .batch_search(&batch_queries)
+        .map_err(|err| format!("{label} wiring smoke: candidate batch_search failed: {err}"))?;
+    let candidate = start_candidate.elapsed();
+
+    // 疎通確認専用の暫定しきい値（spec の受け入れ基準値ではない。CPU 経路同士の
+    // 比較で `check_improvement_at_least` の入力検証（有限・正値）を満たすためだけの
+    // 値で、判定結果自体は合否に使わない）。
+    const WIRING_SENTINEL_PCT: f64 = 0.001;
+    match check_improvement_at_least(baseline, candidate, WIRING_SENTINEL_PCT) {
+        Ok(result) => {
+            println!(
+                "{label}_wiring_smoke: baseline={baseline:?} candidate={candidate:?} \
+                 result={result} (CPU-vs-CPU plumbing check only; not a GPU measurement; \
+                 not counted toward pass/fail)"
+            );
+            Ok(())
+        }
+        Err(err) => Err(format!(
+            "{label} wiring smoke: check_improvement_at_least failed: {err}"
+        )),
+    }
+}
+
 /// GPU 未接続の opt-in ゲート 1 本分の標準出力・合否寄与を処理する（CORE-6/CORE-16 共通）。
 /// 既定（未設定）では「対象外」を明示するのみで合否に数えない（silent skip にしない）。
-/// フラグ指定時は「未測定＝判定不能」を fail-closed として合否へ反映する。
-fn report_gpu_unconnected_gate(label: &str, var: &str) -> bool {
+/// フラグ指定時は「実 GPU 経路が未実装のため本フラグはまだ使用不可」であることを明示し
+/// `pass=false` とする（レビュー指摘対応: `check_improvement_at_least` を呼ぶ実測経路が
+/// 存在しないまま「opt-in する」とだけ案内していた不一致を解消する）。あわせて配線疎通
+/// （[`run_wiring_smoke`]）を実行し、疎通自体が壊れていれば `Err` として報告する。
+fn report_gpu_unconnected_gate(
+    label: &str,
+    var: &str,
+    batch_engine: &BatchEngine,
+    ctx: &PolicyContext,
+) -> Result<bool, String> {
     let requested = opt_in_requested_from_env(var);
     if requested {
         println!(
-            "{label}: not measured in this run (real GPU backend not connected; see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) requested=true pass=false"
+            "{label}: not usable yet (real GPU backend not implemented; this flag will be \
+             enabled once the GPU execution path replaces the CPU reference implementation; \
+             see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) \
+             requested=true pass=false"
         );
-        false
+        run_wiring_smoke(label, batch_engine, ctx)?;
+        Ok(false)
     } else {
         println!(
-            "{label}: out of scope for this run (real GPU backend not connected; not counted toward pass/fail; set {var}=1 to opt in once connected; see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) requested=false"
+            "{label}: out of scope for this run (real GPU backend not implemented; not counted \
+             toward pass/fail; set {var}=1 to see the not-usable-yet message once opted in; \
+             see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) \
+             requested=false"
         );
-        true
+        Ok(true)
     }
 }
 
@@ -118,72 +214,31 @@ fn main() {
     };
 
     let mut rng = DeterministicRng::new(1);
-    let ids: Vec<u64> = (0..ROW_COUNT as u64).collect();
-    let tenant_ids: Vec<String> =
-        std::iter::repeat_n(BENCH_TENANT.to_string(), ROW_COUNT).collect();
-    let visibilities: Vec<Visibility> =
-        std::iter::repeat_n(Visibility::Public, ROW_COUNT).collect();
-    let mut vectors = Vec::with_capacity(ROW_COUNT * DIM);
-    for _ in 0..ROW_COUNT {
-        vectors.extend(rng.next_vector(DIM));
-    }
-
     let mut passed = true;
 
-    // --- CORE-7: 動的窓集約それ自体のオーバーヘッドを、同一エンジン・同一
-    // 常駐行列・同一マスク経路（`BatchEngine::batch_search`）上で
-    // `DynamicWindowAggregator` を経由するか否かの差分だけに揃えて
-    // interleaved A/B で計測する。両ワークロードとも `query_a`/`query_b`
-    // （内容は同一）を毎回 `clone()` してから経路へ渡す点まで揃え、
-    // 「アグリゲータ経由か否か」以外の非対称性（クローン有無など）を
-    // 測定区間へ持ち込まない（レビュー指摘対応）。---
-    let ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
-    let matrix = ResidentMatrix::build(&ids, &tenant_ids, &visibilities, DIM, &vectors)
-        .expect("resident matrix must build for well-formed synthetic input");
-    let batch_engine = BatchEngine::new(matrix);
-
-    let query_a = rng.next_vector(DIM);
-    let query_b = query_a.clone();
+    // --- CORE-7: 動的窓集約それ自体のオーバーヘッドを、`BatchEngine::batch_search`
+    // を測定区間から除外したうえで interleaved A/B で計測する（モジュール冒頭
+    // コメント参照）。A（対照）は検証なしの `Vec::push`、B（被検）は
+    // `DynamicWindowAggregator::push`/`drain` を通す点だけが差分になるよう揃える。---
+    let query_base = rng.next_vector(AGG_QUERY_DIM);
     let config = MeasurementConfig::new(20, 50, 1).expect("protocol minimums satisfied");
 
-    // 両ワークロードは `run_ab::<T>` の単一型制約を満たすため、戻り値を
-    // `Vec<u64>`（選出 id 列）へ揃える（`black_box` に渡す実体があれば十分で、
-    // 経路間で結果の型を揃えること自体に測定上の意味はない）。
     let workload_a = || {
-        let query = query_a.clone();
-        let batch_queries = [BatchQuery {
-            vector: &query,
-            k: TOP_K,
-            ctx: &ctx,
-        }];
-        batch_engine
-            .batch_search(&batch_queries)
-            .expect("batch search must succeed for well-formed synthetic input")
-            .into_iter()
-            .flat_map(|hit| hit.hits.into_iter().map(|h| h.id))
-            .collect::<Vec<u64>>()
+        let mut queries: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
+        for _ in 0..AGG_BATCH_SIZE {
+            queries.push(query_base.clone());
+        }
+        queries
     };
 
-    let mut window = DynamicWindowAggregator::new();
     let workload_b = || {
-        window
-            .push(query_b.clone())
-            .expect("single query must satisfy dynamic window limits");
-        let drained = window.drain();
-        let batch_queries: Vec<BatchQuery<'_>> = drained
-            .iter()
-            .map(|q| BatchQuery {
-                vector: q,
-                k: TOP_K,
-                ctx: &ctx,
-            })
-            .collect();
-        batch_engine
-            .batch_search(&batch_queries)
-            .expect("batch search must succeed for well-formed synthetic input")
-            .into_iter()
-            .flat_map(|hit| hit.hits.into_iter().map(|h| h.id))
-            .collect::<Vec<u64>>()
+        let mut window = DynamicWindowAggregator::new();
+        for _ in 0..AGG_BATCH_SIZE {
+            window
+                .push(query_base.clone())
+                .expect("well-formed synthetic query must satisfy window limits");
+        }
+        window.drain()
     };
 
     let ab = run_ab(&config, workload_a, workload_b)
@@ -197,13 +252,56 @@ fn main() {
     // （閾値は spec が SSOT であり public リポの Actions ログへ能動的に書き出さない。
     // モジュール冒頭コメント参照）。
     println!(
-        "dynamic_window_degradation: rows={ROW_COUNT} dim={DIM} k={TOP_K} direct_median={:?} direct_p95={p95_a:?} windowed_median={:?} windowed_p95={p95_b:?} pass={degradation_ok}",
+        "dynamic_window_degradation: batch_size={AGG_BATCH_SIZE} dim={AGG_QUERY_DIM} direct_median={:?} direct_p95={p95_a:?} windowed_median={:?} windowed_p95={p95_b:?} pass={degradation_ok}",
         ab.a.summary.median, ab.b.summary.median,
     );
 
-    // --- CORE-6 / CORE-16: 実 GPU 未接続のため opt-in fail-closed ゲート ---
-    let core6_ok = report_gpu_unconnected_gate("gpu_vs_cpu_simd_p95", "BENCH_CORE6");
-    let core16_ok = report_gpu_unconnected_gate("f16_resident_vs_f32_resident_p95", "BENCH_CORE16");
+    // --- CORE-6 / CORE-16: 実 GPU 未接続の opt-in fail-closed ゲート＋配線疎通確認 ---
+    // 配線疎通用の合成データ（実データではない・GPU 実測の代替ではない）。
+    let smoke_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
+    let smoke_ids: Vec<u64> = (0..SMOKE_ROW_COUNT as u64).collect();
+    let smoke_tenant_ids: Vec<String> =
+        std::iter::repeat_n(BENCH_TENANT.to_string(), SMOKE_ROW_COUNT).collect();
+    let smoke_visibilities: Vec<Visibility> =
+        std::iter::repeat_n(Visibility::Public, SMOKE_ROW_COUNT).collect();
+    let mut smoke_vectors = Vec::with_capacity(SMOKE_ROW_COUNT * SMOKE_DIM);
+    for _ in 0..SMOKE_ROW_COUNT {
+        smoke_vectors.extend(rng.next_vector(SMOKE_DIM));
+    }
+    let smoke_matrix = ResidentMatrix::build(
+        &smoke_ids,
+        &smoke_tenant_ids,
+        &smoke_visibilities,
+        SMOKE_DIM,
+        &smoke_vectors,
+    )
+    .expect("resident matrix must build for well-formed synthetic smoke input");
+    let smoke_batch_engine = BatchEngine::new(smoke_matrix);
+
+    let core6_ok = match report_gpu_unconnected_gate(
+        "gpu_vs_cpu_simd_p95",
+        "BENCH_CORE6",
+        &smoke_batch_engine,
+        &smoke_ctx,
+    ) {
+        Ok(ok) => ok,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
+    let core16_ok = match report_gpu_unconnected_gate(
+        "f16_resident_vs_f32_resident_p95",
+        "BENCH_CORE16",
+        &smoke_batch_engine,
+        &smoke_ctx,
+    ) {
+        Ok(ok) => ok,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
     passed &= core6_ok;
     passed &= core16_ok;
 

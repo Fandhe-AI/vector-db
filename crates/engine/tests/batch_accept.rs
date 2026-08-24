@@ -256,8 +256,13 @@ fn batch_engine_f16_packed_recall_does_not_degrade_vs_f32_exact() {
 
 #[test]
 fn dynamic_window_aggregated_batch_excludes_other_tenant_rows() {
-    // tenant-a: id=1,2 / tenant-b: id=3,4。dim=2。全行 Public
-    // （`batch_search.rs::build_two_tenant_matrix` と同一構成）。
+    // tenant-a: id=1,2 / tenant-b: id=3,4。dim=2。全行 Private
+    // （`batch_search.rs::build_two_tenant_matrix_private` と同一構成。TASK-133
+    // マージ後の `PolicyContext::is_visible` は `Visibility::Public` 行を
+    // 他テナントにも意図的に見せる〔TABLE-9 ポインタ〕ため、テナント分離
+    // そのものを検証する本テストは `Private` フィクスチャを使う。`Public` の
+    // まま流用すると「別テナントの Public 行が見える」という仕様どおりの
+    // 挙動を分離違反と誤検知する）。
     let ids = vec![1u64, 2, 3, 4];
     let tenant_ids = vec![
         "tenant-a".to_string(),
@@ -265,14 +270,18 @@ fn dynamic_window_aggregated_batch_excludes_other_tenant_rows() {
         "tenant-b".to_string(),
         "tenant-b".to_string(),
     ];
-    let visibilities = vec![Visibility::Public; 4];
+    let visibilities = vec![Visibility::Private; 4];
     let vectors = vec![1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
     let matrix =
         ResidentMatrix::build(&ids, &tenant_ids, &visibilities, 2, &vectors).expect("valid matrix");
     let engine = BatchEngine::new(matrix);
 
-    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
-    let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    // `Private` 行を見るには明示的な許可が要る（黙示の昇格を許さない設計。
+    // `policy.rs::PolicyContext::with_visibilities` 参照）。
+    let ctx_a =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Private]).expect("valid tenant");
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
     let query_a = vec![1.0f32, 0.0];
     let query_b = vec![0.0f32, 1.0];
 
