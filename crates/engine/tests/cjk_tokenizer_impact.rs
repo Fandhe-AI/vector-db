@@ -244,8 +244,8 @@ fn generate_corpus(seed: u64) -> (Vec<Doc>, Vec<QaCase>) {
         let kw_vec: Vec<usize> = kw_set.iter().copied().collect();
 
         let mut text = String::new();
-        // Markdown 見出し・箇条書き・地の文を混在させる（「Markdown・雑多メモを含む
-        // 日本語主体コーパス」という対象ドメインを模す）。
+        // Markdown 見出し・箇条書き・地の文を混在させる（対象ドメインの詳細は
+        // TASK-106 参照）。
         match rng.next_range(3) {
             0 => text.push_str("## "),
             1 => text.push_str("- "),
@@ -452,9 +452,16 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     let mut total_correct = 0usize;
     let mut hits20 = [0usize; 3];
     let mut hits100 = [0usize; 3];
+    // Recall@k の理論上限（ADR「考察」の天井効果の根拠）: 1 クエリの正解数が k を
+    // 超える場合、そのクエリからは高々 k 件しか回収できない。Σmin(k, |correct_q|)
+    // が達成可能な hit 数の上限となる。
+    let mut ceil20 = 0usize;
+    let mut ceil100 = 0usize;
 
     for case in &qa {
         total_correct += case.correct.len();
+        ceil20 += case.correct.len().min(20);
+        ceil100 += case.correct.len().min(100);
 
         let query_on: BTreeSet<String> = tokenize_with_options(&case.query, true)
             .into_iter()
@@ -516,6 +523,27 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     assert_eq!(hits100[1], 1635, "除去 OFF の Recall@100 hit 数が変化した");
     assert_eq!(hits20[2], 0, "ASCII のみの Recall@20 hit 数が変化した");
     assert_eq!(hits100[2], 0, "ASCII のみの Recall@100 hit 数が変化した");
+
+    // 天井効果の回帰チェック（ADR「考察」の「実測が理論上限の 99% 超」という主張を
+    // 固定する）。理論上限（ceil20・ceil100）自体も QA セットが変われば動くため、
+    // 決定的コーパスに対する既知値として固定し、実測 hit 数が理論上限の 99% を
+    // 上回ることをアサートする。整数演算のみで比較する（hits * 100 > ceil * 99）。
+    assert_eq!(
+        ceil20, 938,
+        "Recall@20 の理論上限（Σmin(20,|correct_q|)）が変化した"
+    );
+    assert_eq!(
+        ceil100, 1644,
+        "Recall@100 の理論上限（Σmin(100,|correct_q|)）が変化した"
+    );
+    assert!(
+        hits20[0] * 100 > ceil20 * 99,
+        "除去 ON の Recall@20 が理論上限の 99% を下回った"
+    );
+    assert!(
+        hits100[0] * 100 > ceil100 * 99,
+        "除去 ON の Recall@100 が理論上限の 99% を下回った"
+    );
 
     // 注記: 本 QA セットのクエリは CONTENT_VOCAB（純 CJK 語彙）のみから構成される
     // ため、ASCII のみ構成では query_ascii が構造的に空集合となり、rank() は
