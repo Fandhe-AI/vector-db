@@ -11,12 +11,13 @@
 //! テナント境界）はこの層より上（`core.rs` 相当）で完結している前提であり、
 //! [`hybrid_search`] へ渡す `input`（[`crate::kernel::SearchInput`]）は呼び出し元が
 //! あらかじめ可視行のみへ縮約済みであることを契約とする。ただし `sparse_index`
-//! （[`crate::sparse::SparseIndex`]）は `SearchInput` と異なり構造的にその縮約を強制
-//! できない別個のオブジェクトのため、`sparse_index.search()` の結果を「同一の可視集合
-//! から構築されている」という promissory な契約だけに委ねない。[`hybrid_search`] は
-//! 疎検索側のヒットを `input.ids` に含まれる id へ構造的にフィルタしてから融合する
-//! （[`crate::kernel::SearchInput`] のドキュメントが同種の promissory な `is_visible`
-//! クロージャ規約から脱却した設計判断と同じ方向）。
+//! （[`crate::sparse::SparseIndex`]）・`provider`（[`crate::kernel::SearchProvider`]
+//! trait object）はいずれも `SearchInput` と異なり構造的にその縮約を強制できない別個の
+//! オブジェクトのため、それぞれの検索結果を「同一の可視集合から構築されている／
+//! `input.ids` 外の id を返さない」という promissory な契約だけに委ねない。
+//! [`hybrid_search`] は密・疎双方のヒットを `input.ids` に含まれる id へ構造的に
+//! フィルタしてから融合する（[`crate::kernel::SearchInput`] のドキュメントが同種の
+//! promissory な `is_visible` クロージャ規約から脱却した設計判断と同じ方向）。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
 
 use std::collections::BTreeMap;
@@ -301,10 +302,18 @@ fn accumulate_ranked(
 ///
 /// 契約: `input`（[`SearchInput`]）は `core.rs` と同じく「呼び出し元が可視行のみへ
 /// 縮約済み」であることが前提であり、テナント境界はこの層より上で完結する（本関数は
-/// 境界を弱めない）。`sparse_index` は `input` と別個のオブジェクトで同一の縮約を
-/// 構造的に強制できないため、`sparse_index.search()` の結果は `input.ids` に含まれる
-/// id へフィルタしてから融合する（モジュールドキュメント参照。呼び出し元が誤って
-/// 別集合から構築した `sparse_index` を渡しても、不可視行の id が結果へ混入しない）。
+/// 境界を弱めない）。`sparse_index`・`provider` はいずれも `input` と別個のオブジェクト
+/// （`provider` は object-safe な trait であり「`input.ids` 外の id を返さない」ことは
+/// 型では強制されない）で同一の縮約を構造的に強制できないため、双方の検索結果は
+/// `input.ids` に含まれる id へフィルタしてから融合する（モジュールドキュメント参照。
+/// 呼び出し元が誤って別集合から構築した `sparse_index` を渡しても、または `provider`
+/// 実装が契約に反して可視集合外の id を返しても、不可視行の id が結果へ混入しない）。
+///
+/// 出力の順序契約: [`rrf_fuse`] が返す融合スコア降順・同点 id 昇順の順序をそのまま
+/// 維持して `k` 件へ `truncate` する。RRF 同点グループ（同一融合スコアを持つ id 群）の
+/// 途中で `k` 打ち切りが起こりうるが、その場合も含めタイブレークは常に id 昇順で
+/// 決定的である（`fused` は `truncate` 前の時点で既に id 昇順にソート済みの同点グループ
+/// を持つため、どの位置で打ち切っても採用される id 集合は再現可能）。
 pub fn hybrid_search(
     provider: &dyn SearchProvider,
     input: SearchInput<'_>,
@@ -326,7 +335,16 @@ pub fn hybrid_search(
         query: input.query,
         k: cfg.pool_depth(),
     };
-    let dense_hits = provider.search(dense_input)?;
+    // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
+    // 返さない」ことは型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
+    // `sparse_index` 側と同じ理由（モジュールドキュメント参照）で、provider が返した
+    // ヒットも `input.ids`（可視集合）へ構造的にフィルタしてから融合する。フィルタは
+    // 部分集合を取るだけなのでスコア降順・同点 id 昇順の順位契約は保たれる。
+    let dense_hits: Vec<SearchHit> = provider
+        .search(dense_input)?
+        .into_iter()
+        .filter(|hit| visible_ids.contains(&hit.id))
+        .collect();
     let sparse_hits: Vec<ScoredDoc> = sparse_index
         .search(query_text, cfg.pool_depth())?
         .into_iter()
@@ -622,6 +640,88 @@ mod tests {
             err,
             HybridError::Sparse(SparseError::QueryTooLong { .. })
         ));
+    }
+
+    /// [`SearchProvider`] の契約違反（`input.ids` に含まれない id を返す実装バグ）を
+    /// 模したモック provider。`hybrid_search` が密検索側にも `visible_ids` フィルタを
+    /// 適用していることを検証するために使う（`input` の中身は無視して固定の
+    /// [`SearchHit`] 列を返す）。
+    struct LeakyProvider;
+    impl SearchProvider for LeakyProvider {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            // id=1（可視）と id=99（不可視のはず）の両方を、スコア降順・同点 id 昇順の
+            // 順位契約を満たしたまま返す（provider の順位契約自体には違反していない。
+            // あくまで可視集合の境界を無視した契約違反のみを模す）。
+            Ok(vec![
+                SearchHit { id: 1, score: 2.0 },
+                SearchHit { id: 99, score: 1.0 },
+            ])
+        }
+    }
+
+    #[test]
+    fn hybrid_search_filters_dense_hits_to_visible_ids() {
+        // [Medium] レビュー指摘対応（テナント境界）: `provider.search()` が
+        // `input.ids`（可視集合）外の id を返す契約違反を起こしても、
+        // `hybrid_search` は融合結果へその id を混入させないことを確認する。
+        // `SearchProvider` は trait object のため「可視集合外の id を返さない」ことは
+        // 型では強制されず、構造的なフィルタで担保する必要がある。
+        let cfg = RrfConfig::default();
+        let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
+        let ids = [1u64];
+        let vectors = [1.0f32];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        let hits = hybrid_search(&LeakyProvider, input, &index, "nomatch", 10, &cfg).expect("ok");
+        assert!(
+            hits.iter().all(|h| h.id != 99),
+            "invisible id from a non-conforming dense provider must not leak into hybrid results: {hits:?}"
+        );
+        assert_eq!(
+            hits,
+            vec![HybridHit {
+                id: 1,
+                score: 1.0 / 61.0
+            }]
+        );
+    }
+
+    #[test]
+    fn hybrid_search_truncates_dense_candidates_exceeding_pool_depth() {
+        // [Low] レビュー指摘対応: `accumulate_ranked` の `take(pool_depth)` が、
+        // 実 provider（`CpuScalarProvider`）が `pool_depth` を超える現実的な候補数を
+        // 持つケースでも機能することを統合レベルで確認する。
+        // `pool_depth=3` に対し可視行を 10 件用意し、dense 側の Top-k
+        // （`k = cfg.pool_depth()` で呼ばれる）が 3 件に絞られたうえで融合されることを
+        // 検証する（dim=1・スコアは id と同値になるよう構成し、上位 3 件が
+        // id=10,9,8 であることを固定値で確認する）。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 3).unwrap();
+        let ids: Vec<u64> = (1..=10).collect();
+        let vectors: Vec<f32> = ids.iter().map(|&id| id as f32).collect();
+        let query = [1.0f32];
+        let docs: Vec<(u64, &str)> = vec![(1, "unrelated")];
+        let index = SparseIndex::build(&docs).expect("build ok");
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 10,
+        };
+        let hits =
+            hybrid_search(&CpuScalarProvider, input, &index, "nomatch", 3, &cfg).expect("ok");
+        let returned_ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            returned_ids,
+            vec![10, 9, 8],
+            "dense pool must be truncated to pool_depth=3 (top-3 by dot-product score)"
+        );
     }
 
     #[test]
