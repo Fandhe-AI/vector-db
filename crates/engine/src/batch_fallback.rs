@@ -239,7 +239,10 @@ impl BatchRowSource for CpuFallbackMatrix {
 
 /// primary バックエンドの保持状態。初期化失敗を検知した後は毎回 primary の
 /// 呼び出しを試みず（無駄な失敗呼び出しを避ける）、以降の `batch_search` は
-/// 常に CPU 縮退経路を使う。
+/// 常に CPU 縮退経路を使う。実行時エラー（デバイスロスト等）による恒久故障の
+/// ラッチは `FallbackBatchEngine::runtime_latched`（`AtomicBool`）が別途担う
+/// （`&self` の `batch_search` から更新できるよう `PrimarySlot` 自体は不変の
+/// まま、ラッチ判定だけ内部可変性で扱う。CORE-8 レビュー起因）。
 enum PrimarySlot {
     Available(Box<dyn BatchBackend>),
     Unavailable,
@@ -249,12 +252,21 @@ enum PrimarySlot {
 /// （通常は [`GpuReferenceBackend`]）を実行し、バックエンド実行エラー
 /// （[`BatchExecError::Backend`]）の場合のみ CPU-SIMD 縮退経路
 /// （`batch_search.rs::run_batch_search` を CPU 縮退用行列で呼ぶ。CORE-3 と
-/// 同一カーネル）へ 1 回だけ再実行する（リトライループを作らない。DoS
-/// 抑止）。入力検証エラー（[`BatchExecError::Input`]）は縮退させず fail-closed
-/// に `Err` をそのまま返す（不正入力を縮退で黙殺しない、という本モジュールの
-/// 設計の要）。
+/// 同一カーネル）へ再実行する。ただし実行時エラー（デバイスロスト・カーネル
+/// 起動失敗・転送失敗）は GPU デバイスの恒久故障を示すことが多いため、初回
+/// 検知時に `runtime_latched` をラッチし、以降の呼び出しは primary を再試行
+/// せず直接 CPU 経路を使う（無制限の stderr 出力・primary への無駄な再試行
+/// コストを防ぐ。CORE-8 レビュー起因）。入力検証エラー
+/// （[`BatchExecError::Input`]）は縮退させず fail-closed に `Err` をそのまま
+/// 返す（不正入力を縮退で黙殺しない、という本モジュールの設計の要）。
 pub struct FallbackBatchEngine {
     primary: PrimarySlot,
+    /// primary の実行時エラーによる恒久故障ラッチ（CORE-8 レビュー起因）。
+    /// `false`→`true` の遷移が最初に成功した呼び出しだけが縮退イベントを
+    /// observer へ通知し、以降の呼び出しは黙って CPU 経路を使う
+    /// （`compare_exchange` で二重通知を防ぐ。`&self` の `batch_search` から
+    /// 更新するため `AtomicBool` による内部可変性を用いる）。
+    runtime_latched: std::sync::atomic::AtomicBool,
     cpu: CpuFallbackMatrix,
     observer: Box<dyn FallbackObserver>,
 }
@@ -282,16 +294,18 @@ impl FallbackBatchEngine {
         backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
         observer: Box<dyn FallbackObserver>,
     ) -> Result<Self, BatchSearchError> {
-        // primary（f16 パック常駐行列）を構築する。次元・行数・容量・重複 id・
-        // tenant_id 長の検証はここで一元的に行われ（`ResidentMatrix::build`）、
-        // CPU 縮退用の f32 行列はこの検証を通過した後に同じ元データから
-        // 独立に構築する（検証ロジックの二重管理を避ける）。
-        let resident = ResidentMatrix::build(ids, tenant_ids, visibilities, dim, vectors)?;
-
         // CPU 縮退用 f32 行列の容量検証（本モジュール冒頭コメント「データ
-        // 所有権・二重常駐について」参照）。primary の f16 パックは
-        // `ResidentMatrix::build` が独立に `MAX_BATCH_TOTAL_BYTES` で検証済み
-        // であり、本チェックは f32 原本コピー分を同じ予算で追加検証する。
+        // 所有権・二重常駐について」参照）。`ResidentMatrix::build`（f16 パック、
+        // f32 のおよそ半分のバイト数）より先に本チェックを置く: f32 原本は
+        // f16 パックの約 2 倍のバイト量になるため、f16 側は
+        // `MAX_BATCH_TOTAL_BYTES` に収まるが f32 側だけが超過する行数・次元の
+        // 組み合わせが実在する。`ResidentMatrix::build` を先に呼ぶと、その
+        // 組み合わせでは f16 側の検証を素通りしてから `vectors.len()` の長さ
+        // チェック（巨大バッファが必要でテスト到達が困難）へ進んでしまい、
+        // 本チェックへのテストカバレッジが失われるため、`ResidentMatrix::build`
+        // 側の容量検証（`batch_search.rs::ResidentMatrix::build` の
+        // `packed_bytes`/`aux_bytes` 検証、`vectors.len()` チェックより前に
+        // 置かれている）と同じ設計方針で、実データ確保より前に配置する。
         let f32_bytes = ids
             .len()
             .checked_mul(dim)
@@ -306,6 +320,12 @@ impl FallbackBatchEngine {
                 max: MAX_BATCH_TOTAL_BYTES,
             });
         }
+
+        // primary（f16 パック常駐行列）を構築する。次元・行数・容量（f16 分）・
+        // 重複 id・tenant_id 長の検証はここで一元的に行われ
+        // （`ResidentMatrix::build`）、CPU 縮退用の f32 行列はこの検証を通過した
+        // 後に同じ元データから独立に構築する（検証ロジックの二重管理を避ける）。
+        let resident = ResidentMatrix::build(ids, tenant_ids, visibilities, dim, vectors)?;
 
         // 以降のフォールブル確保は `ResidentMatrix::build` と同方針
         // （`Vec::with_capacity`・`to_vec()`・`String::clone` は abort-on-OOM
@@ -383,6 +403,7 @@ impl FallbackBatchEngine {
 
         Ok(Self {
             primary,
+            runtime_latched: std::sync::atomic::AtomicBool::new(false),
             cpu,
             observer,
         })
@@ -410,27 +431,46 @@ impl FallbackBatchEngine {
         )
     }
 
-    /// バッチ検索を実行する（CORE-8 ポインタ）。primary が利用可能なら primary
-    /// を実行し、[`BatchExecError::Backend`]（実行時エラー）の場合のみ CPU
-    /// 縮退経路へ 1 回だけ再実行する。[`BatchExecError::Input`]（入力エラー）は
-    /// 縮退させず `Err` をそのまま返す（TenantMaskViolation を含む
-    /// `BatchSearchError` は常にこちら経由で、縮退イベントを発生させない）。
-    /// primary が初期化失敗済み（[`PrimarySlot::Unavailable`]）の場合は
-    /// 最初から CPU 経路を使う（追加の縮退イベントは発生させない。構築時に
-    /// 既に 1 件通知済みのため）。
+    /// バッチ検索を実行する（CORE-8 ポインタ）。primary が利用可能かつ実行時
+    /// ラッチ未発火なら primary を実行し、[`BatchExecError::Backend`]
+    /// （実行時エラー）の場合のみ CPU 縮退経路へ再実行しつつ `runtime_latched`
+    /// をラッチする（初回検知時のみ observer へ通知。以降は primary を再試行
+    /// せず直接 CPU 経路へ進む。「無制限の stderr 出力・primary への無駄な
+    /// 再試行コストを防ぐ」という CORE-8 レビュー起因の要件）。
+    /// [`BatchExecError::Input`]（入力エラー）は縮退させず `Err` をそのまま
+    /// 返す（TenantMaskViolation を含む `BatchSearchError` は常にこちら経由で、
+    /// 縮退イベントを発生させない）。primary が初期化失敗済み
+    /// （[`PrimarySlot::Unavailable`]）の場合は最初から CPU 経路を使う（追加の
+    /// 縮退イベントは発生させない。構築時に既に 1 件通知済みのため）。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
     ) -> Result<Vec<BatchHit>, BatchSearchError> {
+        use std::sync::atomic::Ordering;
+
+        if self.runtime_latched.load(Ordering::Acquire) {
+            return run_batch_search(&self.cpu, queries);
+        }
+
         match &self.primary {
             PrimarySlot::Available(backend) => match backend.batch_search(queries) {
                 Ok(hits) => Ok(hits),
                 Err(BatchExecError::Input(e)) => Err(e),
                 Err(BatchExecError::Backend(err)) => {
-                    self.observer.on_fallback(FallbackEvent {
-                        reason: err.reason(),
-                        target: "cpu-simd",
-                    });
+                    // ラッチの初回発火（false → true）に成功した呼び出しだけが
+                    // observer へ通知する。`compare_exchange` の失敗（既に他の
+                    // 呼び出しがラッチ済み）は通知しない: 同時実行下でも
+                    // イベント二重発行を避けるための直列化点。
+                    if self
+                        .runtime_latched
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.observer.on_fallback(FallbackEvent {
+                            reason: err.reason(),
+                            target: "cpu-simd",
+                        });
+                    }
                     run_batch_search(&self.cpu, queries)
                 }
             },
@@ -508,18 +548,20 @@ mod tests {
     }
 
     // CPU 縮退用 f32 行列の容量検証（本モジュール冒頭コメント「データ所有権・
-    // 二重常駐について」対応）。行数・次元それぞれは上限内でも、f32 原本の
-    // 総確保バイト量が `MAX_BATCH_TOTAL_BYTES` を超える組み合わせは拒否する。
+    // 二重常駐について」対応）。f32 原本は f16 パック（`ResidentMatrix::build`
+    // が独立に検証）のおよそ 2 倍のバイト量になるため、f16 側は
+    // `MAX_BATCH_TOTAL_BYTES`（1 GiB）に収まるが f32 側だけが超過する境界が
+    // 存在する（f16 packed ≈ rows*dim*2 + 補助データ、f32 原本 = rows*dim*4）。
+    // 本テストは dim=8192（`MAX_BATCH_DIM` 上限）・rows=40,000 でその境界を
+    // 選び、f16 は約 0.62 GiB（収まる）・f32 は約 1.22 GiB（超過）となる
+    // 組み合わせを使う。`FallbackBatchEngine::build` は本チェックを
+    // `ResidentMatrix::build` より前に実行するため（同関数のコメント参照）、
+    // `vectors` は境界チェックへ到達する前段では参照されず、テストのために
+    // 数 GB のバッファを実際に確保する必要はない（意図的に短い配列で足りる）。
     #[test]
     fn build_rejects_fallback_matrix_capacity_over_limit() {
-        // dim * rows * 4 bytes が 1 GiB を超えるが、`ResidentMatrix::build` の
-        // f16 パック単体（半分のバイト数）は 1 GiB に収まらない規模なので、
-        // まず先に `ResidentMatrix::build` 側で拒否される可能性がある。
-        // ここでは f32 側だけが超過する境界（f16 は収まるが f32 は超える）を
-        // 作れないため、いずれにせよ `CapacityExceeded` が返ることを確認する
-        // （どちらのチェックで拒否されても fail-closed という契約は同じ）。
         let dim = 8_192usize;
-        let rows = 200_000usize; // 8192 * 200000 * 4 bytes ≈ 6.55 GiB
+        let rows = 40_000usize; // f16 packed ≈0.62 GiB（収まる）・f32 原本 ≈1.22 GiB（超過）
         let ids: Vec<u64> = (0..rows as u64).collect();
         let tenant_ids: Vec<String> = vec!["tenant-a".to_string(); rows];
         let visibilities = vec![Visibility::Public; rows];
@@ -605,14 +647,47 @@ mod tests {
     /// primary バックエンドの実行時エラーを注入するモック（本体へテスト専用
     /// API を追加せず、`BatchBackend` trait をテストコード側で実装する
     /// エラー注入手段。Issue #137 対応の test-support feature 撤廃方針を踏襲）。
-    struct FailingBackend(BatchBackendError);
+    /// `calls` は呼び出し回数を記録し、`runtime_latched` ラッチ発火後は
+    /// primary が再試行されないこと（CORE-8 レビュー起因の要件）を
+    /// 呼び出し回数で直接検証できるようにする。
+    struct FailingBackend {
+        err: BatchBackendError,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FailingBackend {
+        fn new(err: BatchBackendError) -> Self {
+            Self {
+                err,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
 
     impl BatchBackend for FailingBackend {
         fn batch_search(
             &self,
             _queries: &[BatchQuery<'_>],
         ) -> Result<Vec<BatchHit>, BatchExecError> {
-            Err(BatchExecError::Backend(self.0.clone()))
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BatchExecError::Backend(self.err.clone()))
+        }
+    }
+
+    /// `FailingBackend` を `Arc` 越しにテストコードと `FallbackBatchEngine`
+    /// の両方から共有するための委譲実装（`runtime_error_latches_after_first_
+    /// failure_and_stops_retrying_primary` が呼び出し回数をエンジン構築後にも
+    /// 検査できるようにするため）。
+    impl BatchBackend for std::sync::Arc<FailingBackend> {
+        fn batch_search(
+            &self,
+            queries: &[BatchQuery<'_>],
+        ) -> Result<Vec<BatchHit>, BatchExecError> {
+            self.as_ref().batch_search(queries)
         }
     }
 
@@ -760,7 +835,9 @@ mod tests {
         ] {
             let observer = RecordingObserver::new();
             let engine = build_engine_with_backend(
-                |_matrix| Ok(Box::new(FailingBackend(backend_err.clone())) as Box<dyn BatchBackend>),
+                |_matrix| {
+                    Ok(Box::new(FailingBackend::new(backend_err.clone())) as Box<dyn BatchBackend>)
+                },
                 Box::new(observer),
             );
 
@@ -795,7 +872,7 @@ mod tests {
         }
         let engine = build_engine_with_backend(
             |_matrix| {
-                Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
                     "lost".to_string(),
                 ))) as Box<dyn BatchBackend>)
             },
@@ -857,7 +934,7 @@ mod tests {
         let observer = RecordingObserver::new();
         let engine = build_engine_with_backend(
             |_matrix| {
-                Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
                     "lost".to_string(),
                 ))) as Box<dyn BatchBackend>)
             },
@@ -917,16 +994,19 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
-    // 決定性: 同一入力の再実行が同一結果を返すことを確認する（CPU 縮退経路が
-    // 内部状態を持ち越して結果が揺れないこと）。
+    // 決定性: 同一入力の再実行が同一結果を返すことを確認する（1 回目で
+    // `runtime_latched` がラッチされた後の 2 回目以降も、CPU 縮退経路が内部
+    // 状態を持ち越さず結果が揺れないこと）。
     #[test]
     fn fallback_search_is_deterministic_across_repeated_calls() {
         let observer = RecordingObserver::new();
         let engine = build_engine_with_backend(
             |_matrix| {
-                Ok(Box::new(FailingBackend(BatchBackendError::TransferFailed(
-                    "transfer".to_string(),
-                ))) as Box<dyn BatchBackend>)
+                Ok(
+                    Box::new(FailingBackend::new(BatchBackendError::TransferFailed(
+                        "transfer".to_string(),
+                    ))) as Box<dyn BatchBackend>,
+                )
             },
             Box::new(observer),
         );
@@ -940,5 +1020,49 @@ mod tests {
         let first = engine.batch_search(&queries).expect("search ok");
         let second = engine.batch_search(&queries).expect("search ok");
         assert_eq!(first[0].hits, second[0].hits);
+    }
+
+    // CORE-8 レビュー起因の回帰テスト: 実行時エラーによる恒久故障ラッチの
+    // 検証。primary が呼び出しのたびに実行時エラーを返す状況で
+    // `batch_search` を複数回呼んでも、primary の呼び出し回数はラッチ発火の
+    // 1 回に留まり（無駄な再試行コストを防ぐ）、observer への通知も 1 件に
+    // 留まる（無制限の stderr 出力を防ぐ）ことを、`FailingBackend::call_count`
+    // で直接検証する（イベント件数だけでは primary 再試行の有無を証明できない
+    // ため）。
+    #[test]
+    fn runtime_error_latches_after_first_failure_and_stops_retrying_primary() {
+        let backend = std::sync::Arc::new(FailingBackend::new(BatchBackendError::DeviceLost(
+            "lost".to_string(),
+        )));
+
+        // `Box<dyn BatchBackend>` として engine へ所有権を渡しつつ、テスト側で
+        // 呼び出し回数を検査できるよう `Arc` 越しに共有する
+        // （`impl BatchBackend for Arc<FailingBackend>` を下で定義）。
+        let backend_for_engine = backend.clone();
+        let observer = RecordingObserver::new();
+        let engine = build_engine_with_backend(
+            move |_matrix| Ok(Box::new(backend_for_engine) as Box<dyn BatchBackend>),
+            Box::new(observer),
+        );
+
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 1,
+            ctx: &ctx_a,
+        }];
+
+        for _ in 0..5 {
+            engine
+                .batch_search(&queries)
+                .expect("search ok via cpu fallback");
+        }
+
+        assert_eq!(
+            backend.call_count(),
+            1,
+            "primary must be retried only once before the runtime latch engages"
+        );
     }
 }
