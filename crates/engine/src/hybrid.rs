@@ -31,12 +31,19 @@ const MAX_POOL_DEPTH: usize = 10_000;
 /// - `k_const`: RRF のランク減衰定数（一般的な既定値 60.0 を採用）。
 /// - `dense_weight` / `sparse_weight`: 密・疎それぞれの寄与の重み（既定は等重み 1.0）。
 /// - `pool_depth`: 密・疎それぞれから融合対象として取り込む先頭順位数。
+///
+/// フィールドは非 `pub`（private）とし、[`RrfConfig::new`] による検証済み構築のみを
+/// 許可する。`rrf_fuse`/`accumulate_ranked` は「`pool_depth` は `RrfConfig::new` で
+/// 検証済みの値のみが渡される」ことを契約として前提にしており、構造体リテラルでの
+/// 直接構築（`RrfConfig { k_const: f64::NAN, .. }` 等）を許すと検証を迂回でき、
+/// NaN スコアが黙って返る fail-open な経路になりうる（security.md「不安全な設計」）。
+/// フィールド値の参照は [`RrfConfig::k_const`] 等のアクセサ経由で行う。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RrfConfig {
-    pub k_const: f64,
-    pub dense_weight: f64,
-    pub sparse_weight: f64,
-    pub pool_depth: usize,
+    k_const: f64,
+    dense_weight: f64,
+    sparse_weight: f64,
+    pool_depth: usize,
 }
 
 impl Default for RrfConfig {
@@ -53,7 +60,9 @@ impl Default for RrfConfig {
 impl RrfConfig {
     /// 検証付きコンストラクタ。`pool_depth` は `1..=MAX_POOL_DEPTH`、`k_const`・重みは
     /// 有限かつ正であることを構築時に検証し、違反は `Err`（fail-closed）。
-    /// これにより [`rrf_fuse`]・[`hybrid_search`] は妥当性検証済みの設定のみを扱える。
+    /// フィールドが非 `pub` のため、`RrfConfig` を構築する経路はこの関数（と
+    /// 常に妥当な値を返す [`Default::default`]）のみに限定される。これにより
+    /// [`rrf_fuse`]・[`hybrid_search`] は妥当性検証済みの設定のみを扱える。
     pub fn new(
         k_const: f64,
         dense_weight: f64,
@@ -78,6 +87,26 @@ impl RrfConfig {
             sparse_weight,
             pool_depth,
         })
+    }
+
+    /// RRF のランク減衰定数（検証済み: 有限かつ正）。
+    pub fn k_const(&self) -> f64 {
+        self.k_const
+    }
+
+    /// 密検索側の寄与の重み（検証済み: 有限かつ正）。
+    pub fn dense_weight(&self) -> f64 {
+        self.dense_weight
+    }
+
+    /// 疎検索側の寄与の重み（検証済み: 有限かつ正）。
+    pub fn sparse_weight(&self) -> f64 {
+        self.sparse_weight
+    }
+
+    /// 融合対象として取り込む先頭順位数（検証済み: `1..=MAX_POOL_DEPTH`）。
+    pub fn pool_depth(&self) -> usize {
+        self.pool_depth
     }
 }
 
@@ -180,16 +209,16 @@ pub fn rrf_fuse(
 
     accumulate_ranked(
         dense.iter().map(|h| h.id),
-        cfg.pool_depth,
-        cfg.k_const,
-        cfg.dense_weight,
+        cfg.pool_depth(),
+        cfg.k_const(),
+        cfg.dense_weight(),
         &mut scores,
     )?;
     accumulate_ranked(
         sparse.iter().map(|d| d.doc_id),
-        cfg.pool_depth,
-        cfg.k_const,
-        cfg.sparse_weight,
+        cfg.pool_depth(),
+        cfg.k_const(),
+        cfg.sparse_weight(),
         &mut scores,
     )?;
 
@@ -278,10 +307,10 @@ pub fn hybrid_search(
         vectors: input.vectors,
         dim: input.dim,
         query: input.query,
-        k: cfg.pool_depth,
+        k: cfg.pool_depth(),
     };
     let dense_hits = provider.search(dense_input)?;
-    let sparse_hits = sparse_index.search(query_text, cfg.pool_depth)?;
+    let sparse_hits = sparse_index.search(query_text, cfg.pool_depth())?;
 
     let mut fused = rrf_fuse(&dense_hits, &sparse_hits, cfg)?;
     fused.truncate(k);
@@ -305,10 +334,10 @@ mod tests {
     #[test]
     fn rrf_config_default_matches_expected_values() {
         let cfg = RrfConfig::default();
-        assert_eq!(cfg.k_const, 60.0);
-        assert_eq!(cfg.dense_weight, 1.0);
-        assert_eq!(cfg.sparse_weight, 1.0);
-        assert_eq!(cfg.pool_depth, 200);
+        assert_eq!(cfg.k_const(), 60.0);
+        assert_eq!(cfg.dense_weight(), 1.0);
+        assert_eq!(cfg.sparse_weight(), 1.0);
+        assert_eq!(cfg.pool_depth(), 200);
     }
 
     #[test]
