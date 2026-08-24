@@ -176,6 +176,7 @@ endif
 
 .PHONY: core-api-check
 core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差分検知（TASK-125・CORE-1。cargo 不要のテキスト比較）
+	scripts/check_core_api.sh --self-test
 	scripts/check_core_api.sh
 
 .PHONY: deny

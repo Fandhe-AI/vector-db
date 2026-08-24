@@ -18,7 +18,15 @@
 # 再生成し、その差分を明示的なコミットとしてレビューへ残す運用とする
 # （変更を禁止するチェックではなく、変わったことを可視化するチェック）。
 #
-# 使い方: scripts/check_core_api.sh [--update]
+# `--self-test` は extract_item_block 自体の回帰テストモード。実ソースを使わず
+# その場で用意した fixture に対して抽出結果を検証するため、
+# `crates/engine/src/policy.rs` 等が「たまたま今は複数行属性・複数 impl ブロックを
+# 含まない」状態でも、抽出ロジックの回帰（PR #139 レビュー対応の 2 点）を検知できる
+# （make core-api-check・CI の core-api-check ジョブから呼ばれる。fixture 相当を
+# 恒久的にソースへ埋め込むのは公開 API を汚すため避け、スクリプト内蔵の自己テストと
+# する）。
+#
+# 使い方: scripts/check_core_api.sh [--update|--self-test]
 
 set -u
 
@@ -28,9 +36,11 @@ SNAPSHOT="${REPO_ROOT}/crates/engine/api/core_api.snapshot"
 MODE="check"
 if [ "${1:-}" = "--update" ]; then
   MODE="update"
+elif [ "${1:-}" = "--self-test" ]; then
+  MODE="self-test"
 elif [ "${1:-}" != "" ]; then
   echo "ERROR: unknown argument: ${1}" >&2
-  echo "usage: $(basename "$0") [--update]" >&2
+  echo "usage: $(basename "$0") [--update|--self-test]" >&2
   exit 1
 fi
 
@@ -127,6 +137,100 @@ extract_item_block() {
 
   printf '%s\n' "${block}" | sed -e '/^[[:space:]]*\/\/\//d' -e '/^[[:space:]]*\/\//d' -e '/^[[:space:]]*$/d' -e 's/[[:space:]]*$//'
 }
+
+# extract_item_block の回帰テスト（PR #139 レビュー対応: codex-review P1「複数行の
+# 外側属性が欠落する」・Cursor Bugbot「同一パターンの複数 impl ブロックのうち最初の
+# 1 件で走査を打ち切る」の 2 点を fixture で固定する）。`crates/engine/src` の実ソースは
+# 現時点で複数行属性・複数 inherent impl ブロックを含まないため、実ソース経由の
+# `check_core_api.sh`（引数なし）の green だけではこの 2 点の回帰を検知できない。
+# 一時ディレクトリに fixture を書き出し、期待する抽出結果と突き合わせる。
+self_test() {
+  local tmp
+  tmp="$(mktemp -d)" || {
+    echo "ERROR: mktemp -d failed" >&2
+    return 1
+  }
+  # シェル終了時に一時ディレクトリを必ず片付ける。
+  trap 'rm -rf "${tmp}"' RETURN
+
+  local failed=0
+
+  # fixture 1: `#[cfg_attr(...)]` が複数行へ折り返される公開 fn。
+  local attr_file="${tmp}/multiline_attr.rs"
+  cat >"${attr_file}" <<'EOF'
+#[cfg_attr(
+    feature = "foo",
+    derive(Debug)
+)]
+pub fn hello(x: i32) -> i32 {
+    x + 1
+}
+EOF
+  local attr_expected
+  attr_expected="$(cat <<'EOF'
+#[cfg_attr(
+feature = "foo",
+derive(Debug)
+)]
+pub fn hello(x: i32) -> i32 {
+x + 1
+}
+EOF
+)"
+  # extract_item_block はインデントを保持するが、期待値の比較は sed で行末空白と
+  # インデントを正規化した上で行う（fixture のインデント量そのものは本テストの
+  # 検証対象ではないため）。
+  local attr_actual
+  attr_actual="$(extract_item_block "${attr_file}" "pub fn hello" "self-test: multiline cfg_attr" 2>&1)"
+  if [ "$(printf '%s\n' "${attr_actual}" | sed -e 's/^[[:space:]]*//')" != "${attr_expected}" ]; then
+    echo "FAIL: self-test multiline cfg_attr — attribute continuation lines were not captured" >&2
+    echo "--- actual ---" >&2
+    printf '%s\n' "${attr_actual}" >&2
+    failed=1
+  fi
+
+  # fixture 2: 同一型に対する分割された複数の inherent impl ブロック。
+  local impl_file="${tmp}/multi_impl.rs"
+  cat >"${impl_file}" <<'EOF'
+pub struct Foo {
+    pub a: i32,
+}
+
+impl Foo {
+    pub fn a(&self) -> i32 {
+        self.a
+    }
+}
+
+pub struct Bar;
+
+impl Foo {
+    pub fn b(&self) -> i32 {
+        42
+    }
+}
+EOF
+  local impl_actual
+  impl_actual="$(extract_item_block "${impl_file}" "impl Foo" "self-test: multiple inherent impl blocks" 2>&1)"
+  local impl_block_count
+  impl_block_count="$(printf '%s\n' "${impl_actual}" | grep -c '^impl Foo {')"
+  if [ "${impl_block_count}" != "2" ]; then
+    echo "FAIL: self-test multiple inherent impl blocks — expected 2 impl blocks, got ${impl_block_count}" >&2
+    echo "--- actual ---" >&2
+    printf '%s\n' "${impl_actual}" >&2
+    failed=1
+  fi
+
+  if [ "${failed}" -eq 0 ]; then
+    echo "ok: extract_item_block self-test passed"
+  fi
+  return "${failed}"
+}
+
+if [ "${MODE}" = "self-test" ]; then
+  self_test
+  exit $?
+fi
 
 CORE_FILE="${REPO_ROOT}/crates/engine/src/core.rs"
 KERNEL_FILE="${REPO_ROOT}/crates/engine/src/kernel.rs"
