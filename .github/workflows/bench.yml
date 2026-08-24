@@ -1,22 +1,28 @@
 name: Bench
 
-# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の定期実行。crates/engine/benches/parallel_bench.rs
+# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の実行。crates/engine/benches/parallel_bench.rs
 # は時間依存の測定値を含むため PR CI（ci.yml）のアサーションには混ぜず、本 workflow を
-# 週次 schedule + workflow_dispatch（手動起動）で独立実行する。private submodule
-# （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
-# 方針）。
+# 独立実行する。private submodule（docs/spec）は取得しない（README「開発環境構築」:
+# ビルド・テストは spec 抜きで成立する方針）。
+#
+# schedule トリガは意図的に外している（workflow_dispatch のみ）。CORE-5（対照エンジン
+# との中央値比較）が対照エンジンクレートの導入承認待ちで未接続の間、parallel_bench.rs
+# は CORE-5 を「未測定＝判定不能」として fail-closed に固定判定する（回帰検出ではなく
+# 恒常的に失敗する）。この状態で schedule を有効化すると「毎週確実に失敗するだけの
+# ジョブ」になり、実際の回帰検出との区別がつかなくなるため、CORE-5 が実測接続されるまで
+# 定期実行は行わず手動実行のみとする。CORE-5 接続後、schedule トリガ（例:
+# `- cron: "0 3 * * 1"` 毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
+# 独立した時間帯にする）を再度追加すること。
 on:
-  schedule:
-    # 毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは独立した時間帯にする。
-    - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  # schedule/workflow_dispatch はいずれも ref = デフォルトブランチ固定のため、
-  # workflow 名のみで group を一意化すれば十分（ci.yml の PR 番号切り分けは不要）。
+  # workflow_dispatch は ref = デフォルトブランチ固定のため、workflow 名のみで
+  # group を一意化すれば十分（ci.yml の PR 番号切り分けは不要）。schedule 再追加時も
+  # 同様にデフォルトブランチ固定のため変更不要。
   group: ${{ github.workflow }}
   cancel-in-progress: true
 

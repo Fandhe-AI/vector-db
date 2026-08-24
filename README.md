@@ -48,16 +48,16 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ### 回帰ベンチの repo variables（TASK-127）
 
-`.github/workflows/bench.yml`（週次 schedule + `workflow_dispatch`）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）と `BENCH_MIN_RECALL`（Recall@k 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/bench.yml`（`workflow_dispatch` のみ。理由は後述）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）と `BENCH_MIN_RECALL`（Recall@k 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
 gh variable set BENCH_MAX_P95_MS
 gh variable set BENCH_MIN_RECALL
 ```
 
-未設定のまま schedule/`workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+未設定のまま `workflow_dispatch` を実行すると `crates/engine/benches/parallel_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-なお両変数を設定しても、CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続であり、接続されるまで本ベンチは意図的に fail-closed（非ゼロ終了）します（TASK-127。`.claude/rules/dependency-policy.md`）。
+なお両変数を設定しても、CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続であり、接続されるまで本ベンチは意図的に fail-closed（非ゼロ終了）します（TASK-127。`.claude/rules/dependency-policy.md`）。これにより「回帰検出ではなく毎週確実に失敗するだけのジョブ」になるのを避けるため、`bench.yml` は schedule トリガを意図的に外し `workflow_dispatch`（手動実行）のみとしています。CORE-5 接続後、bench.yml 冒頭コメントの手順に従って schedule トリガを再度追加してください。
 
 ## ライセンス
 
