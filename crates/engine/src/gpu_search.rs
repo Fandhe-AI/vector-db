@@ -88,6 +88,14 @@ pub enum GpuSearchError {
     TenantIdTooLong { len: usize, max: usize },
     /// クエリの `k` が [`MAX_BATCH_K`] を超過した、または 0。
     InvalidK { k: usize, max: usize },
+    /// `check_capacity` 相当のアロケーション前上限検証を通過した後、実際の
+    /// `try_reserve_exact` がメモリ不足で失敗した（Cursor Bugbot 指摘対応:
+    /// `ResidentMatrix::build` は上限検証後も `HashSet::with_capacity`・
+    /// `Vec::with_capacity`・`to_vec()`（失敗時に abort する内部確保）を
+    /// 使っていたため、`arena.rs::ArenaError::AllocationFailed` と同じ方針で
+    /// フォールブルな確保へ置き換えた。security.md「不安全な設計｜無制限
+    /// リソース確保（DoS）」対応。メッセージはプログラム出力文字列のため英語）。
+    AllocationFailed(String),
     /// バッチ内の結果が、選出後に独立再検証したクエリ別可視集合と食い違った
     /// （テナント混入の疑い。`core.rs::CoreError::ProviderResultRejected` と同じ
     /// fail-closed 思想。結果を一切返さない）。
@@ -129,6 +137,9 @@ impl fmt::Display for GpuSearchError {
             }
             GpuSearchError::InvalidK { k, max } => {
                 write!(f, "gpu_search: invalid k: {k} (must be 1..={max})")
+            }
+            GpuSearchError::AllocationFailed(msg) => {
+                write!(f, "gpu_search: allocation failed: {msg}")
             }
             GpuSearchError::TenantMaskViolation => {
                 write!(f, "gpu_search: result violated per-query tenant mask")
@@ -287,6 +298,21 @@ pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
 // GPU 常駐ベース行列（CORE-16 のパック表現を保持する一括インデクシング結果）。
 // ---------------------------------------------------------------------
 
+/// `Vec::try_reserve_exact` の失敗を [`GpuSearchError::AllocationFailed`] へ変換する
+/// 共通ヘルパー（[`ResidentMatrix::build`] 専用。`arena.rs` の同名ヘルパーと同方針
+/// だが `pub(crate)` ではないため個別に持つ）。`try_reserve`（amortized 成長）では
+/// なく `try_reserve_exact`（要求量ちょうど）を使うのは、呼び出し元が
+/// アロケーション前に検証済みの論理必要量どおりに実確保量を抑えるため
+/// （`arena.rs::try_reserve_exact` と同じ理由）。
+fn try_reserve_exact<T>(
+    buf: &mut Vec<T>,
+    additional: usize,
+    what: &str,
+) -> Result<(), GpuSearchError> {
+    buf.try_reserve_exact(additional)
+        .map_err(|e| GpuSearchError::AllocationFailed(format!("failed to reserve {what}: {e}")))
+}
+
 /// 一括インデクシングで構築する GPU 常駐相当のベース行列。可視性フィルタ済みの
 /// 全行を f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
 /// アリーナを別途保持し続け、本構造体はバッチ検索専用の副次表現として扱う。
@@ -396,7 +422,12 @@ impl ResidentMatrix {
         // 許すと id → tenant が一意に定まらず、`GpuBatchEngine::batch_search` の
         // 選出後独立再検証（id ベース）が異なるテナントの行を取り違えうる
         // （codex レビュー指摘対応）。
-        let mut seen_ids = std::collections::HashSet::with_capacity(ids.len());
+        // `HashSet::with_capacity` は失敗時に abort するため使わず、
+        // `try_reserve`（フォールブル）で確保する（Cursor Bugbot 指摘対応）。
+        let mut seen_ids = std::collections::HashSet::new();
+        seen_ids.try_reserve(ids.len()).map_err(|e| {
+            GpuSearchError::AllocationFailed(format!("failed to reserve id set: {e}"))
+        })?;
         for &id in ids {
             if !seen_ids.insert(id) {
                 return Err(GpuSearchError::DuplicateRowId);
@@ -419,7 +450,13 @@ impl ResidentMatrix {
             }
         }
 
-        let mut packed = Vec::with_capacity(packed_len);
+        // 以降の 3 本のバッファはいずれも `check_capacity` 相当の上限検証を
+        // 通過済みの量だけを `try_reserve_exact`（フォールブル・要求量ちょうど）で
+        // 確保する。`Vec::with_capacity`・`to_vec()` は失敗時に abort するため
+        // 使わない（Cursor Bugbot 指摘対応。`arena.rs::try_reserve_exact` と
+        // 同方針）。
+        let mut packed: Vec<u32> = Vec::new();
+        try_reserve_exact(&mut packed, packed_len, "packed")?;
         for row in vectors.chunks(dim) {
             for pair in row.chunks(2) {
                 let a = pair.first().copied().unwrap_or(0.0);
@@ -428,9 +465,25 @@ impl ResidentMatrix {
             }
         }
 
+        let mut owned_ids: Vec<u64> = Vec::new();
+        try_reserve_exact(&mut owned_ids, ids.len(), "ids")?;
+        owned_ids.extend_from_slice(ids);
+
+        // `tenant_ids` はコンテナ（`Vec<String>` が保持する `String` ハンドル分）
+        // だけを事前検証済みの要素数ぶん確保する。各要素の実体（ヒープ上の
+        // 文字列バイト列）は `MAX_TENANT_ID_LEN` で上限検証済みの小さい固定長
+        // なので、`String::clone` 自体の確保は `arena.rs` の既存 `push_row`
+        // 経路（呼び出し元が既に所有する `String` を移動するだけ）と同様、
+        // 通常のアロケータ確保のままとする。
+        let mut owned_tenant_ids: Vec<String> = Vec::new();
+        try_reserve_exact(&mut owned_tenant_ids, tenant_ids.len(), "tenant_ids")?;
+        for tenant in tenant_ids {
+            owned_tenant_ids.push(tenant.clone());
+        }
+
         Ok(Self {
-            ids: ids.to_vec(),
-            tenant_ids: tenant_ids.to_vec(),
+            ids: owned_ids,
+            tenant_ids: owned_tenant_ids,
             dim,
             packed,
         })
@@ -825,6 +878,20 @@ mod tests {
         let drained = agg.drain();
         assert_eq!(drained.len(), 2);
         assert!(agg.is_empty());
+    }
+
+    // Cursor Bugbot 指摘対応: 上限検証済みの量を超えて `try_reserve_exact` が
+    // 実際にメモリ不足になった場合、`Vec::with_capacity`/`push` のように abort
+    // せず `Err(GpuSearchError::AllocationFailed)` を返すことを検証する
+    // （`arena.rs` の同種テストと同方針）。`isize::MAX` 超のレイアウトは Rust の
+    // アロケーション API 契約上、実メモリを確保しようとする前に即座に拒否
+    // されるため、CI 環境で実際に大量のメモリを消費せず決定的に再現できる。
+    #[test]
+    fn try_reserve_exact_converts_oversized_request_to_allocation_failed_without_aborting() {
+        let mut buf: Vec<u8> = Vec::new();
+        let oversized = (isize::MAX as usize).saturating_add(1);
+        let result = try_reserve_exact(&mut buf, oversized, "test buffer");
+        assert!(matches!(result, Err(GpuSearchError::AllocationFailed(_))));
     }
 
     // ResidentMatrix の上限・整合性検証（untrusted 入力の防御的上限）。
