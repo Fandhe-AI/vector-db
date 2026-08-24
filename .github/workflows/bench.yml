@@ -39,10 +39,11 @@ jobs:
         run: rustup show
       - name: Run bench-parallel
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
-        # にはハードコードしない。リポジトリの Actions variables（`vars.*`。secrets では
-        # ない——secrets だと bench の出力ログがマスクされ判定結果が読めなくなる）から
-        # 注入する。未設定の場合は `parallel_bench.rs` 側が fail-closed で非ゼロ終了する
-        # （`crates/engine/benches/parallel_bench.rs` 参照）。
+        # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
+        # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値の
+        # 数値そのものは載せない——`crates/engine/benches/parallel_bench.rs` が
+        # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。未設定の場合は
+        # `parallel_bench.rs` 側が fail-closed で非ゼロ終了する。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}

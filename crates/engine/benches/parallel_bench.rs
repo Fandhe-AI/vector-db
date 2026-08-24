@@ -31,10 +31,12 @@
 //! `BENCH_MIN_RECALL`）から注入する（`.claude/rules/spec-confidentiality.md`:
 //! spec 本文・数値基準を public 資産へ転記しない。`harness/accept.rs` の判定関数が
 //! 閾値を引数で受け取る設計と整合させる）。値は `.github/workflows/bench.yml` が
-//! リポジトリの Actions variables（`vars.*`。secrets ではなく variables を使うのは、
-//! 本ベンチが実測値と閾値を両方 stdout へ出力するため——secrets だと GitHub が
-//! ログをマスクし判定結果が読めなくなる）から渡す想定。未設定・不正値の場合は
+//! リポジトリの Actions variables（`vars.*`）から渡す想定。未設定・不正値の場合は
 //! fail-closed で非ゼロ終了する（本ファイルにデフォルト値を持たない）。
+//!
+//! 標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しない
+//! （本 workflow は public リポの Actions ログとして残るため。閾値は spec が SSOT
+//! であり、能動的にログへ書き出さない運用とする。`.claude/rules/spec-confidentiality.md`）。
 
 // `harness` は `benches/measurement.rs`・`benches/parallel_smoke.rs` と同様、独立した
 // コンパイル単位（cargo bench バイナリ）から取り込まれる共有ソース。本ファイルが
@@ -160,8 +162,11 @@ fn main() {
     let p95 = p95_from_samples(&measurement.samples).expect("non-empty samples must yield a p95");
     let p95_ok = check_p95_within_limit(p95, max_p95);
     passed &= p95_ok;
+    // limit（BENCH_MAX_P95_MS の実測値）は意図的にログへ出力しない。閾値は spec が
+    // SSOT であり、public リポの Actions ログへ能動的に書き出さない
+    // （モジュール冒頭コメント参照）。
     println!(
-        "p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} limit={max_p95:?} pass={p95_ok}",
+        "p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} pass={p95_ok}",
         measurement.summary.median,
     );
 
@@ -213,8 +218,10 @@ fn main() {
     let recall_ok = check_recall_within_limit(recall_min, min_recall)
         .expect("min_recall validated by min_recall_from_env");
     passed &= recall_ok;
+    // limit（BENCH_MIN_RECALL の実測値）は意図的にログへ出力しない（p95_latency と
+    // 同一方針。モジュール冒頭コメント参照）。
     println!(
-        "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} limit={min_recall:.6} pass={recall_ok}"
+        "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
     );
 
     // --- CORE-5: 対照エンジン比較（本 PR では未接続。判定関数のみ用意） ---
