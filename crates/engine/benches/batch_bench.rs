@@ -19,8 +19,14 @@
 //!   `DynamicWindowAggregator::push` に通してから `drain` する経路とし、両者とも
 //!   1 反復あたり [`AGG_BATCH_SIZE`] 本のクエリを処理する（1 本ずつだとナノ秒級
 //!   すぎて `Instant` の分解能・測定オーバーヘッドに埋もれるため、実運用の窓サイズを
-//!   模した本数へ増幅してから測る。値の根拠はモジュール末尾の `local_smoke` テスト
-//!   参照）。差分は「集約器の検証・容量管理・所有権移動オーバーヘッド」のみになる。
+//!   模した本数へ増幅してから測る）。差分は「集約器の検証・容量管理・所有権移動
+//!   オーバーヘッド」のみになる。測定区間へ渡すクエリ本体（`Vec<f32>`）は
+//!   `run_ab` 呼び出し前に反復回数分すべて事前生成し（[`build_query_pool`]）、
+//!   各反復では事前生成済みの所有権を `Vec::pop` で取り出すだけにする（レビュー
+//!   指摘対応: 以前は各反復の測定区間内で `query_base.clone()`〔dim 768 の
+//!   確保・コピー、1 バッチあたり約 768 KiB〕を毎回行っており、この共通コストが
+//!   両経路の測定時間を支配して `push`/`drain` の差分が p95 比率へ現れない
+//!   ——あるいは無関係な確保コストの揺らぎで誤 fail しうる——状態になっていた）。
 //!   B の p95 が A に対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを
 //!   判定する。`BatchEngine::batch_search` 自体（f16 デコード・テナントマスク・
 //!   visibility フィルタ・全走査）は本ゲートの測定対象外とする（CORE-3/CORE-5 側の
@@ -66,9 +72,8 @@ use std::time::Instant;
 
 /// CORE-7 ゲートで 1 反復あたり集約器へ通すクエリ本数。1 本単位では `push`/`drain`
 /// が数百ナノ秒程度で終わり `Instant` の分解能・関数呼び出しオーバーヘッドへ
-/// 埋もれるため、実運用の動的窓サイズ相当の本数へ増幅してから測る（値の根拠は
-/// 本ファイル末尾の `local_smoke` テスト参照。値そのものは spec の閾値ではなく
-/// 本ベンチ固有の測定条件）。
+/// 埋もれるため、実運用の動的窓サイズ相当の本数へ増幅してから測る（値そのものは
+/// spec の閾値ではなく本ベンチ固有の測定条件）。
 const AGG_BATCH_SIZE: usize = 256;
 
 /// CORE-7 ゲートで集約するクエリの次元数。
@@ -204,6 +209,25 @@ fn report_gpu_unconnected_gate(
     }
 }
 
+/// CORE-7 A/B 計測の測定区間からクエリ確保・コピーを追い出すための事前生成
+/// プール。`total_iterations` バッチ分（各バッチ [`AGG_BATCH_SIZE`] 本）を
+/// 呼び出し時（= `run_ab` 呼び出し前・測定区間外）にまとめて `clone` し、
+/// 測定区間側は `Vec::pop` で取り出すだけにする（モジュール冒頭コメント参照。
+/// レビュー指摘対応: 測定区間内の `clone` が両経路のコストを支配していた
+/// 問題の是正）。
+fn build_query_pool(rng: &mut DeterministicRng, total_iterations: usize) -> Vec<Vec<Vec<f32>>> {
+    let base = rng.next_vector(AGG_QUERY_DIM);
+    let mut pool: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+    for _ in 0..total_iterations {
+        let mut batch: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
+        for _ in 0..AGG_BATCH_SIZE {
+            batch.push(base.clone());
+        }
+        pool.push(batch);
+    }
+    pool
+}
+
 fn main() {
     let max_degradation_pct = match max_degradation_pct_from_env() {
         Ok(v) => v,
@@ -219,23 +243,42 @@ fn main() {
     // --- CORE-7: 動的窓集約それ自体のオーバーヘッドを、`BatchEngine::batch_search`
     // を測定区間から除外したうえで interleaved A/B で計測する（モジュール冒頭
     // コメント参照）。A（対照）は検証なしの `Vec::push`、B（被検）は
-    // `DynamicWindowAggregator::push`/`drain` を通す点だけが差分になるよう揃える。---
-    let query_base = rng.next_vector(AGG_QUERY_DIM);
+    // `DynamicWindowAggregator::push`/`drain` を通す点だけが差分になるよう揃える。
+    // クエリ本体（`Vec<f32>`）は測定開始前にすべて事前生成し（[`build_query_pool`]）、
+    // 各反復の測定区間内では `Vec::pop`（O(1)・確保もコピーもしない所有権移動）で
+    // 取り出すだけにする（レビュー指摘対応: 以前は各反復の測定区間内で
+    // `query_base.clone()` を `AGG_BATCH_SIZE` 回行っており、この確保・コピーの
+    // 共通コストが両経路の測定時間を支配して `push`/`drain` の差分が p95 比率へ
+    // 現れない状態になっていた）。---
     let config = MeasurementConfig::new(20, 50, 1).expect("protocol minimums satisfied");
+    // `run_ab` は warmup・計測の両フェーズで各経路をちょうど 1 回ずつ呼ぶ
+    // （`harness::ab::run_ab` の契約）ため、必要な「バッチ」総数は
+    // warmup_iterations + measured_iterations と一致する。
+    let total_iterations = (config.warmup_iterations() as usize)
+        .checked_add(config.measured_iterations() as usize)
+        .expect("MeasurementConfig::new bounds iteration counts within usize");
+    let mut pool_a = build_query_pool(&mut rng, total_iterations);
+    let mut pool_b = build_query_pool(&mut rng, total_iterations);
 
-    let workload_a = || {
+    let workload_a = move || {
+        let batch = pool_a
+            .pop()
+            .expect("query pool sized to warmup + measured iteration count");
         let mut queries: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
-        for _ in 0..AGG_BATCH_SIZE {
-            queries.push(query_base.clone());
+        for query in batch {
+            queries.push(query);
         }
         queries
     };
 
-    let workload_b = || {
+    let workload_b = move || {
+        let batch = pool_b
+            .pop()
+            .expect("query pool sized to warmup + measured iteration count");
         let mut window = DynamicWindowAggregator::new();
-        for _ in 0..AGG_BATCH_SIZE {
+        for query in batch {
             window
-                .push(query_base.clone())
+                .push(query)
                 .expect("well-formed synthetic query must satisfy window limits");
         }
         window.drain()
