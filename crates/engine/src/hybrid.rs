@@ -8,10 +8,15 @@
 //! を id ごとに加算する）で統合する、純粋関数的な層として追加する。
 //!
 //! `sparse.rs` と同様に storage・catalog・policy とは結線しない。可視性判定（RLS 相当の
-//! テナント境界）はこの層より上（`core.rs` 相当）で完結している前提とし、
-//! [`hybrid_search`] へ渡す `input`（[`crate::kernel::SearchInput`]）と `sparse_index`
-//! はどちらも呼び出し元があらかじめ同一の可視行集合から構築済みであることを契約とする
-//! （本モジュールは境界を弱めない。[`crate::kernel::SearchInput`] のドキュメント参照）。
+//! テナント境界）はこの層より上（`core.rs` 相当）で完結している前提であり、
+//! [`hybrid_search`] へ渡す `input`（[`crate::kernel::SearchInput`]）は呼び出し元が
+//! あらかじめ可視行のみへ縮約済みであることを契約とする。ただし `sparse_index`
+//! （[`crate::sparse::SparseIndex`]）は `SearchInput` と異なり構造的にその縮約を強制
+//! できない別個のオブジェクトのため、`sparse_index.search()` の結果を「同一の可視集合
+//! から構築されている」という promissory な契約だけに委ねない。[`hybrid_search`] は
+//! 疎検索側のヒットを `input.ids` に含まれる id へ構造的にフィルタしてから融合する
+//! （[`crate::kernel::SearchInput`] のドキュメントが同種の promissory な `is_visible`
+//! クロージャ規約から脱却した設計判断と同じ方向）。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
 
 use std::collections::BTreeMap;
@@ -285,11 +290,21 @@ fn accumulate_ranked(
 /// 上書きするため呼び出し元の値は無視される）、疎側は `sparse_index.search(query_text,
 /// cfg.pool_depth)` を実行する。[`rrf_fuse`] で融合した後、先頭 `k` 件へ切り詰めて返す。
 ///
-/// `k` は `1..=MAX_POOL_DEPTH` を検証し、`0` または超過は [`HybridError::InvalidK`]。
+/// `k` は `1..=cfg.pool_depth()` を検証し、`0` または超過は [`HybridError::InvalidK`]。
+/// `cfg.pool_depth()` 自体が `MAX_POOL_DEPTH` 以下であることは [`RrfConfig::new`] が
+/// 構築時に保証済みのため、ここでの上限は常に `cfg.pool_depth()` を基準にする（密・疎
+/// 双方とも融合対象は先頭 `cfg.pool_depth()` 件までしか取り込まれないため、`k` が
+/// それを超えると要求された件数を満たせないまま静かに縮退する。上限を
+/// `MAX_POOL_DEPTH` 固定にすると `cfg.pool_depth()` がそれより小さい既定構成
+/// （`RrfConfig::default()` は 200）で `k` が縮退域に入っても検出できないため、
+/// `cfg.pool_depth()` を基準にして fail-closed に拒否する）。
 ///
 /// 契約: `input`（[`SearchInput`]）は `core.rs` と同じく「呼び出し元が可視行のみへ
-/// 縮約済み」であることが前提。`sparse_index` も同一の可視集合から構築されている
-/// ことが前提であり、テナント境界はこの層より上で完結する（本関数は境界を弱めない）。
+/// 縮約済み」であることが前提であり、テナント境界はこの層より上で完結する（本関数は
+/// 境界を弱めない）。`sparse_index` は `input` と別個のオブジェクトで同一の縮約を
+/// 構造的に強制できないため、`sparse_index.search()` の結果は `input.ids` に含まれる
+/// id へフィルタしてから融合する（モジュールドキュメント参照。呼び出し元が誤って
+/// 別集合から構築した `sparse_index` を渡しても、不可視行の id が結果へ混入しない）。
 pub fn hybrid_search(
     provider: &dyn SearchProvider,
     input: SearchInput<'_>,
@@ -298,9 +313,11 @@ pub fn hybrid_search(
     k: usize,
     cfg: &RrfConfig,
 ) -> Result<Vec<HybridHit>, HybridError> {
-    if k == 0 || k > MAX_POOL_DEPTH {
+    if k == 0 || k > cfg.pool_depth() {
         return Err(HybridError::InvalidK);
     }
+
+    let visible_ids: std::collections::BTreeSet<u64> = input.ids.iter().copied().collect();
 
     let dense_input = SearchInput {
         ids: input.ids,
@@ -310,7 +327,11 @@ pub fn hybrid_search(
         k: cfg.pool_depth(),
     };
     let dense_hits = provider.search(dense_input)?;
-    let sparse_hits = sparse_index.search(query_text, cfg.pool_depth())?;
+    let sparse_hits: Vec<ScoredDoc> = sparse_index
+        .search(query_text, cfg.pool_depth())?
+        .into_iter()
+        .filter(|doc| visible_ids.contains(&doc.doc_id))
+        .collect();
 
     let mut fused = rrf_fuse(&dense_hits, &sparse_hits, cfg)?;
     fused.truncate(k);
@@ -511,6 +532,28 @@ mod tests {
     }
 
     #[test]
+    fn hybrid_search_rejects_k_over_pool_depth_even_within_max_pool_depth() {
+        // [Medium] レビュー指摘対応: `k` の検証は `MAX_POOL_DEPTH` 固定ではなく
+        // `cfg.pool_depth()` を基準にする。`pool_depth=1`（`MAX_POOL_DEPTH` 未満）の
+        // 構成で `k=2` を渡すと、密・疎とも融合対象は先頭 1 件しか取り込まれず
+        // 要求件数を満たせないまま静かに縮退しうるため、`InvalidK` で拒否する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 1).unwrap();
+        let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
+        let ids: [u64; 0] = [];
+        let vectors: [f32; 0] = [];
+        let query: [f32; 0] = [];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 0,
+            query: &query,
+            k: 1,
+        };
+        let err = hybrid_search(&CpuScalarProvider, input, &index, "q", 2, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::InvalidK);
+    }
+
+    #[test]
     fn hybrid_search_on_empty_corpus_returns_empty() {
         let cfg = RrfConfig::default();
         // 密側は行を持たず（`ids`/`vectors` が空）、疎側もクエリと一致しない
@@ -552,5 +595,60 @@ mod tests {
             err,
             HybridError::Kernel(KernelError::DimMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn hybrid_search_propagates_sparse_error() {
+        // [Low] レビュー指摘対応: `HybridError::Sparse`（`From<SparseError>` 経由の
+        // 伝播）を検証するテストが未網羅だったため追加する。`MAX_QUERY_BYTES`
+        // （sparse.rs）を超えるクエリ文字列で `SparseError::QueryTooLong` を誘発する。
+        let cfg = RrfConfig::default();
+        let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
+        let ids = [1u64];
+        let vectors = [1.0f32];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        // sparse.rs::MAX_QUERY_BYTES（16 KiB）を超える長さのクエリ文字列。
+        let long_query = "a".repeat(17 * 1024);
+        let err =
+            hybrid_search(&CpuScalarProvider, input, &index, &long_query, 5, &cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            HybridError::Sparse(SparseError::QueryTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn hybrid_search_filters_sparse_hits_to_visible_ids() {
+        // [Medium] レビュー指摘対応（テナント境界）: `sparse_index` が `input.ids`
+        // より広い集合（他テナントの文書を含みうる集合）から構築されていても、
+        // `input.ids` に含まれない id は疎検索側でヒットしても結果へ混入しない
+        // ことを確認する。id=99 は `sparse_index` には存在するが `input.ids`
+        // （可視集合）には含まれない。
+        let cfg = RrfConfig::default();
+        let index =
+            SparseIndex::build(&[(1, "shared term"), (99, "shared term")]).expect("build ok");
+        let ids = [1u64];
+        let vectors = [1.0f32];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        let hits =
+            hybrid_search(&CpuScalarProvider, input, &index, "shared term", 10, &cfg).expect("ok");
+        assert!(
+            hits.iter().all(|h| h.id != 99),
+            "invisible id must not leak into hybrid results: {hits:?}"
+        );
     }
 }
