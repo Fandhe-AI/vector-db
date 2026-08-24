@@ -1,30 +1,18 @@
-//! バッチクエリ・一括インデクシング専用の検索エンジン（TASK-128・対象ビヘイビア:
-//! CORE-6, CORE-7, CORE-16）。`kernel.rs::SearchProvider`（単発クエリの窓口・CORE-13）
-//! は実装しない。単発経路（`core.rs::EngineCore::search`）は本モジュールへ構造的に
-//! 接続できず、`CORE-7` が定める「単発クエリは CPU-SIMD 固定」を型レベルで担保する。
+//! バッチクエリ・一括インデクシング専用の検索エンジン（TASK-128 ポインタ:
+//! CORE-6, CORE-7, CORE-16）。`kernel.rs::SearchProvider`（単発クエリの窓口）は
+//! 実装せず、単発経路（`core.rs::EngineCore::search`）から本モジュールへは
+//! 構造的に接続できない。
 //!
-//! `Gpu` を冠する型名・モジュール名だが、現段階は CPU 上で GPU 常駐相当の
-//! アルゴリズム的挙動を再現する **CPU リファレンス実装**である。実際の GPU
-//! 実行（`wgpu`）は未導入で、下記「依存に関する制約」節が理由と導入条件を示す
-//! （TASK-128 参照。命名は将来 `wgpu` 実行へ差し替える際の API 破壊を避けるため
-//! 維持する）。
-//!
-//! # 依存に関する制約（重要・.claude/rules/dependency-policy.md）
-//!
-//! 元の設計は GPU 常駐ベース行列（`wgpu`/WGSL、CORE-16 の f16 2 要素/u32 パックを
-//! `unpack2x16float` で復元）でのバッチスコア計算を行う想定だった。しかし本リポの
-//! 依存追加は「必ずユーザーの明示承認を経てから行う」規約（dependency-policy.md）
-//! であり、本コミットの実行過程ではその承認を得られない。安全側に倒し、実際の GPU
-//! 実行（`wgpu` 依存の追加・デバイス初期化・WGSL コンパイル）は追加せず、CORE-6/7/16
-//! が要求する **アルゴリズム的な挙動**（GPU 常駐相当の f16 パック表現・バッチ Top-k
-//! 選出・クエリ別テナントマスク・動的窓集約）のみを依存クレートなしで実装する。
-//! 実際の GPU（`wgpu`）実行への置き換えは、依存追加の承認後にフォローアップとして
-//! 行う（このコミットの outOfScope・PR 本文に明記する）。
+//! 常駐ベース行列を f16 2 要素/u32 パックで保持・走査する CPU 上の参照実装で
+//! あり、実際の GPU（`wgpu`）実行は行わない。依存追加はユーザーの明示承認を
+//! 経てから行う規約（.claude/rules/dependency-policy.md）のため、承認前は
+//! アルゴリズム的な挙動（f16 パック表現・バッチ Top-k 選出・クエリ別テナント
+//! マスク・動的窓集約）のみを依存クレートなしで実装する。GPU 実行への置き換えは
+//! 承認後のフォローアップとする（TASK-128 ポインタ）。
 //!
 //! `TopKSelector`（`kernel.rs`）を選出段で共用し、選出規約（スコア降順・同点 id
 //! 昇順・非有限値除外）の二重管理を防ぐ。`core.rs::EngineCore` と同じ「(1) 選出前に
-//! 候補をマスクで絞る、(2) 選出後の結果 id を独立に再検証する」二重防御を踏襲する
-//! （CORE-7 のテナント境界要件）。
+//! 候補をマスクで絞る、(2) 選出後の結果 id を独立に再検証する」二重防御を踏襲する。
 
 use std::fmt;
 
@@ -75,7 +63,7 @@ pub const MAX_BATCH_TOTAL_K: usize = MAX_BATCH_ROWS;
 /// させていた）。
 pub const MAX_BATCH_AGGREGATOR_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
-/// `GpuBatchEngine::batch_search` 1 回の走査で許容する総積和演算数
+/// `BatchEngine::batch_search` 1 回の走査で許容する総積和演算数
 /// （`rows × queries × dim` の概算値）の上限（防御的上限。codex P1 指摘対応:
 /// 計算量 DoS 対策）。行数（[`MAX_BATCH_ROWS`]=100 万）・クエリ数
 /// （[`MAX_BATCH_QUERIES`]=4,096）・次元（[`MAX_BATCH_DIM`]=8,192）は
@@ -95,7 +83,7 @@ pub const MAX_BATCH_WORK: usize = 10_000_000_000;
 /// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
 /// 存在情報を含めない。
 #[derive(Debug, Clone, PartialEq)]
-pub enum GpuSearchError {
+pub enum BatchSearchError {
     /// バッチのクエリ件数が [`MAX_BATCH_QUERIES`] を超過した。
     TooManyQueries { count: usize, max: usize },
     /// 常駐行列の行数が [`MAX_BATCH_ROWS`] を超過した。
@@ -157,73 +145,73 @@ pub enum GpuSearchError {
     TenantMaskViolation,
 }
 
-impl fmt::Display for GpuSearchError {
+impl fmt::Display for BatchSearchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GpuSearchError::TooManyQueries { count, max } => {
-                write!(f, "gpu_search: too many queries: {count} (max {max})")
+            BatchSearchError::TooManyQueries { count, max } => {
+                write!(f, "batch_search: too many queries: {count} (max {max})")
             }
-            GpuSearchError::TooManyRows { count, max } => {
-                write!(f, "gpu_search: too many rows: {count} (max {max})")
+            BatchSearchError::TooManyRows { count, max } => {
+                write!(f, "batch_search: too many rows: {count} (max {max})")
             }
-            GpuSearchError::InvalidDim { dim, max } => {
-                write!(f, "gpu_search: invalid dim: {dim} (max {max}, must be > 0)")
+            BatchSearchError::InvalidDim { dim, max } => {
+                write!(f, "batch_search: invalid dim: {dim} (max {max}, must be > 0)")
             }
-            GpuSearchError::CapacityExceeded { total_bytes, max } => write!(
+            BatchSearchError::CapacityExceeded { total_bytes, max } => write!(
                 f,
-                "gpu_search: total allocation bytes {total_bytes} exceeds limit {max}"
+                "batch_search: total allocation bytes {total_bytes} exceeds limit {max}"
             ),
-            GpuSearchError::DimMismatch { expected, found } => write!(
+            BatchSearchError::DimMismatch { expected, found } => write!(
                 f,
-                "gpu_search: query dim mismatch: expected={expected} found={found}"
+                "batch_search: query dim mismatch: expected={expected} found={found}"
             ),
-            GpuSearchError::NonFiniteQuery { query_index } => write!(
+            BatchSearchError::NonFiniteQuery { query_index } => write!(
                 f,
-                "gpu_search: query {query_index} contains non-finite value"
+                "batch_search: query {query_index} contains non-finite value"
             ),
-            GpuSearchError::ArenaLengthMismatch => {
-                write!(f, "gpu_search: arena ids/vectors/mask length mismatch")
+            BatchSearchError::ArenaLengthMismatch => {
+                write!(f, "batch_search: arena ids/vectors/mask length mismatch")
             }
-            GpuSearchError::DuplicateRowId => {
-                write!(f, "gpu_search: resident matrix contains duplicate row ids")
+            BatchSearchError::DuplicateRowId => {
+                write!(f, "batch_search: resident matrix contains duplicate row ids")
             }
-            GpuSearchError::TenantIdTooLong { len, max } => {
-                write!(f, "gpu_search: tenant_id length {len} exceeds limit {max}")
+            BatchSearchError::TenantIdTooLong { len, max } => {
+                write!(f, "batch_search: tenant_id length {len} exceeds limit {max}")
             }
-            GpuSearchError::InvalidK { k, max } => {
-                write!(f, "gpu_search: invalid k: {k} (must be 1..={max})")
+            BatchSearchError::InvalidK { k, max } => {
+                write!(f, "batch_search: invalid k: {k} (must be 1..={max})")
             }
-            GpuSearchError::TotalKExceeded { total_k, max } => write!(
+            BatchSearchError::TotalKExceeded { total_k, max } => write!(
                 f,
-                "gpu_search: total k across batch {total_k} exceeds limit {max}"
+                "batch_search: total k across batch {total_k} exceeds limit {max}"
             ),
-            GpuSearchError::WindowDimMismatch { expected, found } => write!(
+            BatchSearchError::WindowDimMismatch { expected, found } => write!(
                 f,
-                "gpu_search: dynamic window aggregator dim mismatch: expected={expected} found={found}"
+                "batch_search: dynamic window aggregator dim mismatch: expected={expected} found={found}"
             ),
-            GpuSearchError::WorkBudgetExceeded { work, max } => write!(
+            BatchSearchError::WorkBudgetExceeded { work, max } => write!(
                 f,
-                "gpu_search: batch work budget {work} exceeds limit {max}"
+                "batch_search: batch work budget {work} exceeds limit {max}"
             ),
-            GpuSearchError::AllocationFailed(msg) => {
-                write!(f, "gpu_search: allocation failed: {msg}")
+            BatchSearchError::AllocationFailed(msg) => {
+                write!(f, "batch_search: allocation failed: {msg}")
             }
-            GpuSearchError::TenantMaskViolation => {
-                write!(f, "gpu_search: result violated per-query tenant mask")
+            BatchSearchError::TenantMaskViolation => {
+                write!(f, "batch_search: result violated per-query tenant mask")
             }
         }
     }
 }
 
-impl std::error::Error for GpuSearchError {}
+impl std::error::Error for BatchSearchError {}
 
 // ---------------------------------------------------------------------
-// CORE-16: GPU 常駐コピー限定の f16 2 要素/u32 パック。
+// CORE-16 ポインタ: 常駐コピー限定の f16 2 要素/u32 パック。
 //
 // 格納・CPU 経路・クエリベクトルの dtype は f32 のまま変更しない。本関数群は
-// 「GPU 常駐ベース行列」相当の表現へ変換する層としてのみ使う（呼び出し元が
-// f32 のオリジナルを保持し続ける前提）。IEEE 754 binary16 の丸めは round-to-nearest-even
-// を実装する。
+// 常駐ベース行列相当の表現へ変換する層としてのみ使う（呼び出し元が f32 の
+// オリジナルを保持し続ける前提）。IEEE 754 binary16 の丸めは
+// round-to-nearest-even を実装する。
 // ---------------------------------------------------------------------
 
 /// f32 を IEEE 754 binary16（f16）のビットパターンへ丸める。オーバーフローは
@@ -345,9 +333,9 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(out_bits)
 }
 
-/// 2 要素の f32 を 1 個の u32 へ f16 パックする（CORE-16: GPU 常駐コピーの表現）。
-/// 下位 16 ビットに `a`、上位 16 ビットに `b` を格納する（WGSL `unpack2x16float` の
-/// 並び順と一致させる）。
+/// 2 要素の f32 を 1 個の u32 へ f16 パックする（CORE-16 ポインタ: 常駐コピーの
+/// 表現）。下位 16 ビットに `a`、上位 16 ビットに `b` を格納する
+/// （`unpack2x16float` 相当の並び順と一致させる）。
 pub fn pack_f16x2(a: f32, b: f32) -> u32 {
     let lo = f32_to_f16_bits(a) as u32;
     let hi = f32_to_f16_bits(b) as u32;
@@ -362,10 +350,10 @@ pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
 }
 
 // ---------------------------------------------------------------------
-// GPU 常駐ベース行列（CORE-16 のパック表現を保持する一括インデクシング結果）。
+// 常駐ベース行列（CORE-16 ポインタ: パック表現を保持する一括インデクシング結果）。
 // ---------------------------------------------------------------------
 
-/// `Vec::try_reserve_exact` の失敗を [`GpuSearchError::AllocationFailed`] へ変換する
+/// `Vec::try_reserve_exact` の失敗を [`BatchSearchError::AllocationFailed`] へ変換する
 /// 共通ヘルパー（[`ResidentMatrix::build`] 専用。`arena.rs` の同名ヘルパーと同方針
 /// だが `pub(crate)` ではないため個別に持つ）。`try_reserve`（amortized 成長）では
 /// なく `try_reserve_exact`（要求量ちょうど）を使うのは、呼び出し元が
@@ -375,27 +363,27 @@ fn try_reserve_exact<T>(
     buf: &mut Vec<T>,
     additional: usize,
     what: &str,
-) -> Result<(), GpuSearchError> {
+) -> Result<(), BatchSearchError> {
     buf.try_reserve_exact(additional)
-        .map_err(|e| GpuSearchError::AllocationFailed(format!("failed to reserve {what}: {e}")))
+        .map_err(|e| BatchSearchError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }
 
-/// `GpuBatchEngine::batch_search` の走査開始前に総積和演算数（`rows × queries
+/// `BatchEngine::batch_search` の走査開始前に総積和演算数（`rows × queries
 /// × dim`）を見積もり、[`MAX_BATCH_WORK`] 超過を fail-closed に拒否する
 /// （codex P1 指摘対応: 計算量 DoS 対策）。積のオーバーフロー自体も超過と
 /// みなす。実データ（常駐行列・クエリ列）を確保せずに境界値を直接検証できる
 /// よう独立関数へ切り出す（`arena.rs::check_capacity` と同じテスト容易性の
 /// 考え方）。
-fn compute_batch_work(rows: usize, queries: usize, dim: usize) -> Result<usize, GpuSearchError> {
+fn compute_batch_work(rows: usize, queries: usize, dim: usize) -> Result<usize, BatchSearchError> {
     let work = rows
         .checked_mul(queries)
         .and_then(|v| v.checked_mul(dim))
-        .ok_or(GpuSearchError::WorkBudgetExceeded {
+        .ok_or(BatchSearchError::WorkBudgetExceeded {
             work: usize::MAX,
             max: MAX_BATCH_WORK,
         })?;
     if work > MAX_BATCH_WORK {
-        return Err(GpuSearchError::WorkBudgetExceeded {
+        return Err(BatchSearchError::WorkBudgetExceeded {
             work,
             max: MAX_BATCH_WORK,
         });
@@ -403,11 +391,11 @@ fn compute_batch_work(rows: usize, queries: usize, dim: usize) -> Result<usize, 
     Ok(work)
 }
 
-/// 一括インデクシングで構築する GPU 常駐相当のベース行列。可視性フィルタ済みの
-/// 全行を f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
+/// 一括インデクシングで構築する常駐ベース行列。可視性フィルタ済みの全行を
+/// f16 2 要素/u32 パックで保持する。呼び出し元（`core.rs` 相当）は元の f32
 /// アリーナを別途保持し続け、本構造体はバッチ検索専用の副次表現として扱う。
-/// 現段階は CPU 上でこの表現を保持・走査する CPU リファレンス実装であり、
-/// 実際の GPU 常駐（`wgpu` バッファ）ではない（モジュール冒頭コメント参照）。
+/// 現段階は CPU 上でこの表現を保持・走査する参照実装であり、実際の GPU
+/// 実行は行わない（モジュール冒頭コメント参照）。
 #[derive(Debug)]
 pub struct ResidentMatrix {
     ids: Vec<u64>,
@@ -415,7 +403,7 @@ pub struct ResidentMatrix {
     /// 単一照合パスに渡すため、呼び出し元が構築時に確定させる）。
     tenant_ids: Vec<String>,
     /// 可視性ラベル。`tenant_ids[i]` と対で `PolicyContext::is_visible` の
-    /// 単一照合パスへ渡す（codex P0 指摘対応: `GpuBatchEngine::batch_search`
+    /// 単一照合パスへ渡す（codex P0 指摘対応: `BatchEngine::batch_search`
     /// はテナント文字列の等価比較だけでなく、この可視性ラベルも合わせて
     /// `PolicyContext::is_visible` で判定する）。
     visibilities: Vec<Visibility>,
@@ -425,14 +413,14 @@ pub struct ResidentMatrix {
 }
 
 impl ResidentMatrix {
-    /// 可視性フィルタ済みの行集合から常駐行列を構築する（CORE-16）。`ids` /
+    /// 可視性フィルタ済みの行集合から常駐行列を構築する（CORE-16 ポインタ）。`ids` /
     /// `tenant_ids` / `visibilities` / `vectors`（`ids.len() * dim` 要素、
-    /// f32・行優先）の長さが整合しない場合は [`GpuSearchError::ArenaLengthMismatch`]。
+    /// f32・行優先）の長さが整合しない場合は [`BatchSearchError::ArenaLengthMismatch`]。
     /// 次元・行数の上限検証はアロケーション前に行う（untrusted な行数・次元を
     /// そのまま `Vec::with_capacity` へ渡さない。coding-rust.md 準拠）。
     ///
     /// `visibilities[i]` は `tenant_ids[i]` と対応する行 `i` の可視性ラベルで、
-    /// `GpuBatchEngine::batch_search` が `PolicyContext::is_visible` の単一
+    /// `BatchEngine::batch_search` が `PolicyContext::is_visible` の単一
     /// 照合パスへ渡す（codex P0 指摘対応）。
     ///
     /// # 信頼境界（P0 レビュー対応で明文化）
@@ -453,28 +441,28 @@ impl ResidentMatrix {
         visibilities: &[Visibility],
         dim: usize,
         vectors: &[f32],
-    ) -> Result<Self, GpuSearchError> {
+    ) -> Result<Self, BatchSearchError> {
         if dim == 0 || dim > MAX_BATCH_DIM {
-            return Err(GpuSearchError::InvalidDim {
+            return Err(BatchSearchError::InvalidDim {
                 dim,
                 max: MAX_BATCH_DIM,
             });
         }
         if ids.len() > MAX_BATCH_ROWS {
-            return Err(GpuSearchError::TooManyRows {
+            return Err(BatchSearchError::TooManyRows {
                 count: ids.len(),
                 max: MAX_BATCH_ROWS,
             });
         }
         if ids.len() != tenant_ids.len() || ids.len() != visibilities.len() {
-            return Err(GpuSearchError::ArenaLengthMismatch);
+            return Err(BatchSearchError::ArenaLengthMismatch);
         }
 
         let packed_per_row = dim.div_ceil(2);
         let packed_len =
             ids.len()
                 .checked_mul(packed_per_row)
-                .ok_or(GpuSearchError::TooManyRows {
+                .ok_or(BatchSearchError::TooManyRows {
                     count: ids.len(),
                     max: MAX_BATCH_ROWS,
                 })?;
@@ -488,7 +476,7 @@ impl ResidentMatrix {
         // 呼び出し元が巨大な `vectors` バッファを用意しなくても本チェックへ
         // 到達できる）。
         let packed_bytes = packed_len.checked_mul(std::mem::size_of::<u32>()).ok_or(
-            GpuSearchError::CapacityExceeded {
+            BatchSearchError::CapacityExceeded {
                 total_bytes: usize::MAX,
                 max: MAX_BATCH_TOTAL_BYTES,
             },
@@ -497,26 +485,26 @@ impl ResidentMatrix {
             .checked_add(std::mem::size_of::<String>())
             .and_then(|v| v.checked_add(crate::storage::MAX_TENANT_ID_LEN as usize))
             .and_then(|v| v.checked_add(std::mem::size_of::<Visibility>()))
-            .ok_or(GpuSearchError::CapacityExceeded {
+            .ok_or(BatchSearchError::CapacityExceeded {
                 total_bytes: usize::MAX,
                 max: MAX_BATCH_TOTAL_BYTES,
             })?;
         let aux_bytes =
             ids.len()
                 .checked_mul(per_row_aux_bytes)
-                .ok_or(GpuSearchError::CapacityExceeded {
+                .ok_or(BatchSearchError::CapacityExceeded {
                     total_bytes: usize::MAX,
                     max: MAX_BATCH_TOTAL_BYTES,
                 })?;
         let total_bytes =
             packed_bytes
                 .checked_add(aux_bytes)
-                .ok_or(GpuSearchError::CapacityExceeded {
+                .ok_or(BatchSearchError::CapacityExceeded {
                     total_bytes: usize::MAX,
                     max: MAX_BATCH_TOTAL_BYTES,
                 })?;
         if total_bytes > MAX_BATCH_TOTAL_BYTES {
-            return Err(GpuSearchError::CapacityExceeded {
+            return Err(BatchSearchError::CapacityExceeded {
                 total_bytes,
                 max: MAX_BATCH_TOTAL_BYTES,
             });
@@ -525,26 +513,26 @@ impl ResidentMatrix {
         let expected_len = ids
             .len()
             .checked_mul(dim)
-            .ok_or(GpuSearchError::ArenaLengthMismatch)?;
+            .ok_or(BatchSearchError::ArenaLengthMismatch)?;
         if vectors.len() != expected_len {
-            return Err(GpuSearchError::ArenaLengthMismatch);
+            return Err(BatchSearchError::ArenaLengthMismatch);
         }
 
         // id の一意性を検証する（容量・長さチェックより後に置き、cheap な拒否経路
         // （`CapacityExceeded`・`ArenaLengthMismatch`）を先に済ませてから、
         // 検証コスト・確保量が `ids.len()` に比例する本チェックへ進む）。重複を
-        // 許すと id → tenant が一意に定まらず、`GpuBatchEngine::batch_search` の
+        // 許すと id → tenant が一意に定まらず、`BatchEngine::batch_search` の
         // 選出後独立再検証（id ベース）が異なるテナントの行を取り違えうる
         // （codex レビュー指摘対応）。
         // `HashSet::with_capacity` は失敗時に abort するため使わず、
         // `try_reserve`（フォールブル）で確保する（Cursor Bugbot 指摘対応）。
         let mut seen_ids = std::collections::HashSet::new();
         seen_ids.try_reserve(ids.len()).map_err(|e| {
-            GpuSearchError::AllocationFailed(format!("failed to reserve id set: {e}"))
+            BatchSearchError::AllocationFailed(format!("failed to reserve id set: {e}"))
         })?;
         for &id in ids {
             if !seen_ids.insert(id) {
-                return Err(GpuSearchError::DuplicateRowId);
+                return Err(BatchSearchError::DuplicateRowId);
             }
         }
 
@@ -557,7 +545,7 @@ impl ResidentMatrix {
         for tenant in tenant_ids {
             let len = tenant.len();
             if len > crate::storage::MAX_TENANT_ID_LEN as usize {
-                return Err(GpuSearchError::TenantIdTooLong {
+                return Err(BatchSearchError::TenantIdTooLong {
                     len,
                     max: crate::storage::MAX_TENANT_ID_LEN as usize,
                 });
@@ -596,7 +584,7 @@ impl ResidentMatrix {
         for tenant in tenant_ids {
             let mut owned = String::new();
             owned.try_reserve_exact(tenant.len()).map_err(|e| {
-                GpuSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
+                BatchSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
             })?;
             owned.push_str(tenant);
             owned_tenant_ids.push(owned);
@@ -628,7 +616,7 @@ impl ResidentMatrix {
     /// 行 `idx` を f16 往復で復元し、呼び出し元が用意したバッファへ書き込む
     /// （積和計算専用。格納表現自体は f32 のまま別途保持する呼び出し元の責務で
     /// あり、本メソッドはバッチスコア計算のためだけに使う）。バッファを
-    /// 呼び出し元が使い回すことで、`GpuBatchEngine::batch_search` がクエリ数
+    /// 呼び出し元が使い回すことで、`BatchEngine::batch_search` がクエリ数
     /// 分だけ同一行を毎回ヒープ確保し直す（codex レビュー指摘対応）のを避ける。
     fn row_f32_into(&self, idx: usize, out: &mut Vec<f32>) -> Option<()> {
         let packed_per_row = self.dim.div_ceil(2);
@@ -648,25 +636,23 @@ impl ResidentMatrix {
 }
 
 // ---------------------------------------------------------------------
-// CORE-7: 動的窓集約。キュー取り出し時に後続クエリが到着している場合に限り
-// 短時間窓で集約して GPU バッチへ載せる。静的窓（常時窓待ち）は実装しない。
+// CORE-7 ポインタ: 動的窓集約バッファ。
 // ---------------------------------------------------------------------
 
 /// 集約するか否かの判定（副作用なしの純関数）。`pending_after_pop` はキューから
 /// 1 件取り出した直後に後続が存在するかどうか（呼び出し側のキュー実装に依存
-/// しない最小のインターフェース）。後続が無ければ即時 CPU-SIMD 経路へ回すべき
-/// （待たない）ため `false`。ディスパッチ決定表本体（TASK-155）はこの判定を
-/// 呼び出す側であり、本関数自体は経路選択ロジックを持たない。
+/// しない最小のインターフェース）。ディスパッチ決定表本体（TASK-155 ポインタ）
+/// はこの判定を呼び出す側であり、本関数自体は経路選択ロジックを持たない。
 pub fn should_aggregate_into_batch(pending_after_pop: bool) -> bool {
     pending_after_pop
 }
 
 /// 動的窓での集約バッファ。[`should_aggregate_into_batch`] が `true` を返した
-/// キュー取り出し文脈でのみ使う想定（PoC-13 移植）。件数・次元・総バイト量は
-/// [`Self::push`] 自身が検証する（codex P1 指摘対応: 以前は公開 API である
-/// `push` が無検証で内部 `Vec` を無制限に成長させており、呼び出し側の自己
-/// 規律のみに依存していた。呼び出し側のキュー実装がバグっていても本構造体
-/// 単体で fail-closed に上限を保証する）。
+/// キュー取り出し文脈でのみ使う想定。件数・次元・総バイト量は [`Self::push`]
+/// 自身が検証する（codex P1 指摘対応: 以前は公開 API である `push` が無検証で
+/// 内部 `Vec` を無制限に成長させており、呼び出し側の自己規律のみに依存していた。
+/// 呼び出し側のキュー実装がバグっていても本構造体単体で fail-closed に上限を
+/// 保証する）。
 #[derive(Debug, Default)]
 pub struct DynamicWindowAggregator {
     queries: Vec<Vec<f32>>,
@@ -693,23 +679,23 @@ impl DynamicWindowAggregator {
     /// 共通ヘルパーを再利用。coding-rust.md「無制限確保禁止」準拠）。渡された
     /// `query: Vec<f32>` 自体は呼び出し元が既に確保済みの所有権を移動する
     /// だけなので、要素本体の再確保は発生しない。
-    pub fn push(&mut self, query: Vec<f32>) -> Result<(), GpuSearchError> {
+    pub fn push(&mut self, query: Vec<f32>) -> Result<(), BatchSearchError> {
         if self.queries.len() >= MAX_BATCH_QUERIES {
-            return Err(GpuSearchError::TooManyQueries {
+            return Err(BatchSearchError::TooManyQueries {
                 count: self.queries.len() + 1,
                 max: MAX_BATCH_QUERIES,
             });
         }
         let dim = query.len();
         if dim == 0 || dim > MAX_BATCH_DIM {
-            return Err(GpuSearchError::InvalidDim {
+            return Err(BatchSearchError::InvalidDim {
                 dim,
                 max: MAX_BATCH_DIM,
             });
         }
         if let Some(expected) = self.dim {
             if expected != dim {
-                return Err(GpuSearchError::WindowDimMismatch {
+                return Err(BatchSearchError::WindowDimMismatch {
                     expected,
                     found: dim,
                 });
@@ -717,7 +703,7 @@ impl DynamicWindowAggregator {
         }
 
         let per_query_bytes = dim.checked_mul(std::mem::size_of::<f32>()).ok_or(
-            GpuSearchError::CapacityExceeded {
+            BatchSearchError::CapacityExceeded {
                 total_bytes: usize::MAX,
                 max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
             },
@@ -726,19 +712,19 @@ impl DynamicWindowAggregator {
             self.queries
                 .len()
                 .checked_add(1)
-                .ok_or(GpuSearchError::CapacityExceeded {
+                .ok_or(BatchSearchError::CapacityExceeded {
                     total_bytes: usize::MAX,
                     max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
                 })?;
         let total_bytes =
             next_count
                 .checked_mul(per_query_bytes)
-                .ok_or(GpuSearchError::CapacityExceeded {
+                .ok_or(BatchSearchError::CapacityExceeded {
                     total_bytes: usize::MAX,
                     max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
                 })?;
         if total_bytes > MAX_BATCH_AGGREGATOR_TOTAL_BYTES {
-            return Err(GpuSearchError::CapacityExceeded {
+            return Err(BatchSearchError::CapacityExceeded {
                 total_bytes,
                 max: MAX_BATCH_AGGREGATOR_TOTAL_BYTES,
             });
@@ -791,8 +777,8 @@ impl DynamicWindowAggregator {
 }
 
 // ---------------------------------------------------------------------
-// CORE-6/7: バッチ検索本体。GPU スコア計算に相当する積和は f16 往復した行から
-// f32 で行う（実際の WGSL 実行は追加しない。本モジュール冒頭コメント参照）。
+// CORE-6/7 ポインタ: バッチ検索本体。スコア計算の積和は f16 往復した行から
+// f32 で行う（実際の GPU 実行は追加しない。本モジュール冒頭コメント参照）。
 // Top-k 抽出は `kernel.rs::TopKSelector` を共用する。
 // ---------------------------------------------------------------------
 
@@ -802,7 +788,7 @@ impl DynamicWindowAggregator {
 /// 呼び出し元が任意の文字列を指定するだけで他テナントの行を検索できて
 /// しまっていた。本モジュールが独自にテナント文字列を比較する経路は作らず、
 /// `PolicyContext` をテナント境界判定の唯一の正当な入力経路とする engine
-/// 全体の既定パターン（`policy.rs` モジュール冒頭コメント・CORE-2）に揃える。
+/// 全体の既定パターン（`policy.rs` モジュール冒頭コメント・CORE-2 ポインタ）に揃える。
 /// `PolicyContext` は空文字列・長さ超過のテナント ID を構築時に拒否する
 /// （`policy.rs::PolicyContext::new`）ため、本構造体はテナント ID の検証を
 /// 重複して行わない）。
@@ -812,37 +798,36 @@ pub struct BatchQuery<'a> {
     pub ctx: &'a PolicyContext,
 }
 
-/// `GpuBatchEngine::batch_search` の 1 クエリ分の結果。
+/// `BatchEngine::batch_search` の 1 クエリ分の結果。
 #[derive(Debug)]
 pub struct BatchHit {
     pub hits: Vec<SearchHit>,
 }
 
-/// バッチクエリ・一括インデクシング専用のエンジン（CORE-6）。単発クエリ経路
-/// (`kernel.rs::SearchProvider`) は実装せず、`core.rs::EngineCore` から到達
-/// できない（型レベルでの分離。CORE-7）。現段階はスコア計算を CPU で行う
-/// リファレンス実装であり、GPU ディスパッチは行わない（モジュール冒頭コメント
-/// 参照。[`GpuBatchEngine::new`] のドキュメンテーションコメントに導入条件を示す）。
-pub struct GpuBatchEngine {
+/// バッチクエリ・一括インデクシング専用のエンジン（CORE-6/7 ポインタ）。
+/// 単発クエリ経路（`kernel.rs::SearchProvider`）は実装せず、`core.rs::EngineCore`
+/// から到達できない（型レベルでの分離）。現段階はスコア計算を CPU で行う
+/// 参照実装であり、GPU 実行は行わない（モジュール冒頭コメント参照）。
+pub struct BatchEngine {
     matrix: ResidentMatrix,
 }
 
-impl GpuBatchEngine {
+impl BatchEngine {
     /// 常駐行列から構築する。GPU デバイス初期化は行わない（依存制約により
     /// 実際の GPU 実行は追加していないため、本コンストラクタは常に成功する。
-    /// 将来 `wgpu` 依存が承認された場合、ここで adapter/device 取得を行い
-    /// 初期化失敗を `Result::Err` として fail-closed に伝播する設計とする）。
+    /// 将来 GPU 実行を追加する場合、ここで初期化失敗を `Result::Err` として
+    /// fail-closed に伝播する設計とする）。
     pub fn new(matrix: ResidentMatrix) -> Self {
         Self { matrix }
     }
 
-    /// バッチ検索を実行する（CORE-6・CORE-7）。クエリごとに次元・非有限値・`k` を
+    /// バッチ検索を実行する（CORE-6・CORE-7 ポインタ）。クエリごとに次元・非有限値・`k` を
     /// 検証したうえで、常駐行列の中からクエリの [`PolicyContext::is_visible`]
     /// を満たす行だけを候補として選出する（Top-k 選出段でのクエリ別可視行
     /// マスク。codex P0 指摘対応: テナント文字列の等価比較ではなく
     /// `PolicyContext::is_visible` の単一照合パスを使う）。選出後、結果 id を
     /// 独立に再計算した (tenant, visibility) 集合と突き合わせ、逸脱があれば
-    /// 結果を一切返さず [`GpuSearchError::TenantMaskViolation`] を返す
+    /// 結果を一切返さず [`BatchSearchError::TenantMaskViolation`] を返す
     /// （`core.rs::EngineCore` と同じ二重防御。fail-closed）。
     ///
     /// 行列走査はクエリ外側ではなく行外側でループする（codex レビュー指摘対応:
@@ -852,16 +837,21 @@ impl GpuBatchEngine {
     /// 使い回す。選出結果の各クエリ内順序（スコア降順・同点 id 昇順）は
     /// `TopKSelector` が保証するため、走査順序の変更による結果の変化はない。
     ///
-    /// 走査開始前に総積和演算数（`rows × queries × dim`）を [`MAX_BATCH_WORK`]
-    /// と照合する（codex P1 指摘対応: 計算量 DoS 対策。`sum(k)` の上限
-    /// （[`MAX_BATCH_TOTAL_K`]）を満たしていても、常駐行列の全行を最大
-    /// クエリ数で走査させられてしまうため、独立に上限を課す）。
+    /// 走査開始前に総積和演算数（`rows × queries × dim`。`rows` はバッチの
+    /// テナント集合に実際に一致する行数で、常駐行列の全行数ではない）を
+    /// [`MAX_BATCH_WORK`] と照合する（codex P1 指摘対応: 計算量 DoS 対策。
+    /// `sum(k)` の上限（[`MAX_BATCH_TOTAL_K`]）を満たしていても、走査対象の
+    /// 行を最大クエリ数で走査させられてしまうため、独立に上限を課す。
+    /// Cursor Medium 指摘対応: 課金対象を常駐行列の全行数にすると、バッチが
+    /// ごく一部のテナントしか触れない場合でも過大に見積もり、実際には走査
+    /// しない行分まで `WorkBudgetExceeded` の原因になってしまうため、実走査
+    /// 対象の行数に揃える）。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
-    ) -> Result<Vec<BatchHit>, GpuSearchError> {
+    ) -> Result<Vec<BatchHit>, BatchSearchError> {
         if queries.len() > MAX_BATCH_QUERIES {
-            return Err(GpuSearchError::TooManyQueries {
+            return Err(BatchSearchError::TooManyQueries {
                 count: queries.len(),
                 max: MAX_BATCH_QUERIES,
             });
@@ -876,39 +866,72 @@ impl GpuBatchEngine {
         let mut total_k: usize = 0;
         for (query_index, q) in queries.iter().enumerate() {
             if q.vector.len() != self.matrix.dim {
-                return Err(GpuSearchError::DimMismatch {
+                return Err(BatchSearchError::DimMismatch {
                     expected: self.matrix.dim,
                     found: q.vector.len(),
                 });
             }
             if q.vector.iter().any(|v| !v.is_finite()) {
-                return Err(GpuSearchError::NonFiniteQuery { query_index });
+                return Err(BatchSearchError::NonFiniteQuery { query_index });
             }
             if q.k == 0 || q.k > MAX_BATCH_K {
-                return Err(GpuSearchError::InvalidK {
+                return Err(BatchSearchError::InvalidK {
                     k: q.k,
                     max: MAX_BATCH_K,
                 });
             }
             total_k = total_k
                 .checked_add(q.k)
-                .ok_or(GpuSearchError::TotalKExceeded {
+                .ok_or(BatchSearchError::TotalKExceeded {
                     total_k: usize::MAX,
                     max: MAX_BATCH_TOTAL_K,
                 })?;
         }
         if total_k > MAX_BATCH_TOTAL_K {
-            return Err(GpuSearchError::TotalKExceeded {
+            return Err(BatchSearchError::TotalKExceeded {
                 total_k,
                 max: MAX_BATCH_TOTAL_K,
             });
         }
 
-        // 走査開始前の計算量ガード（codex P1 指摘対応）。個別クエリの入力
-        // エラー（次元不一致・非有限値・k 範囲外）を上の 1 巡目で先に確定させた
-        // 上で、常駐行列の行数・次元とクエリ件数から求まる総積和演算数を
-        // 走査（選出器確保・行デコード）開始前に確定的に拒否する。
-        compute_batch_work(self.matrix.row_count(), queries.len(), self.matrix.dim())?;
+        // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
+        // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
+        // で上限検証済みのため、集合サイズもそれに従う）。`ctx.tenant_id()` は
+        // `PolicyContext` の検証済みアクセサであり、呼び出し元が別途指定できる
+        // 生の文字列ではない（codex P0 指摘対応）。`HashSet::with_capacity`
+        // ではなく `try_reserve`（フォールブル）で確保する（codex P1 指摘対応）。
+        // 計算量ガード（下記）より前に構築する: ガードが課金すべき行数は
+        // 常駐行列の全行ではなく、このバッチのテナント集合に一致する行数
+        // だからである。
+        let mut batch_tenants: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        batch_tenants.try_reserve(queries.len()).map_err(|e| {
+            BatchSearchError::AllocationFailed(format!("failed to reserve batch tenants: {e}"))
+        })?;
+        for q in queries {
+            batch_tenants.insert(q.ctx.tenant_id());
+        }
+
+        // バッチのテナント集合に一致する行数（走査時に実際にデコード対象と
+        // なる行数。下記の行外側ループが `batch_tenants.contains(row_tenant)`
+        // で除外する行は最初からデコードされない）。この数え上げ自体は
+        // O(rows) の線形走査で、[`MAX_BATCH_ROWS`] により上限が課されている
+        // ため、走査本体（O(rows * dim) のデコード + O(rows * queries) の
+        // マスク判定）よりも十分軽量である。
+        let matching_row_count = self
+            .matrix
+            .tenant_ids
+            .iter()
+            .filter(|tenant| batch_tenants.contains(tenant.as_str()))
+            .count();
+
+        // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応）。
+        // 個別クエリの入力エラー（次元不一致・非有限値・k 範囲外）を上の
+        // 1 巡目で先に確定させた上で、実際に走査対象となる行数
+        // （`matching_row_count`。常駐行列の全行数ではない）・次元・クエリ件数
+        // から求まる総積和演算数を走査（選出器確保・行デコード）開始前に
+        // 確定的に拒否する。常駐行列の全行数を課金すると、バッチが一部の
+        // テナントしか触れない場合でも過大に見積もられ、誤って拒否しうる。
+        compute_batch_work(matching_row_count, queries.len(), self.matrix.dim())?;
 
         // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
         // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
@@ -923,28 +946,14 @@ impl GpuBatchEngine {
         for q in queries {
             let mut selector = TopKSelector::new(q.k);
             selector.try_reserve(q.k).map_err(|e| {
-                GpuSearchError::AllocationFailed(format!("failed to reserve selector heap: {e}"))
+                BatchSearchError::AllocationFailed(format!("failed to reserve selector heap: {e}"))
             })?;
             selectors.push(selector);
         }
 
-        // このバッチに登場するテナント集合（`HashSet` にして行外側ループから
-        // O(1) で参照できるようにする。バッチのクエリ件数は [`MAX_BATCH_QUERIES`]
-        // で上限検証済みのため、集合サイズもそれに従う）。`ctx.tenant_id()` は
-        // `PolicyContext` の検証済みアクセサであり、呼び出し元が別途指定できる
-        // 生の文字列ではない（codex P0 指摘対応）。`HashSet::with_capacity`
-        // ではなく `try_reserve`（フォールブル）で確保する（codex P1 指摘対応）。
-        let mut batch_tenants: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        batch_tenants.try_reserve(queries.len()).map_err(|e| {
-            GpuSearchError::AllocationFailed(format!("failed to reserve batch tenants: {e}"))
-        })?;
-        for q in queries {
-            batch_tenants.insert(q.ctx.tenant_id());
-        }
-
         // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
         // `ResidentMatrix::build` が id の重複を拒否しているため、id は
-        // (tenant, visibility) を一意に決める（[`GpuSearchError::DuplicateRowId`]
+        // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
         // 参照）。選出段のマスク実装（行 index からの `PolicyContext::is_visible`
         // 呼び出し）とは別経路でこの表を組むことで、二重防御を維持する。
         // このバッチのテナントに属さない行は登録しない（マップを
@@ -952,21 +961,12 @@ impl GpuBatchEngine {
         // バッチ外テナントの id が万一 hit に混入した場合を確実に
         // マップ不在 → `TenantMaskViolation` にする fail-closed 側の効果も持つ）。
         // `HashMap::with_capacity` ではなく `try_reserve`（フォールブル）で
-        // 確保する（codex P1 指摘対応）。予約量は `self.matrix.row_count()`
-        // ではなく実際に一致する行数を先に数えて使う: バッチが常駐行列の
-        // ごく一部のテナントしか触れない場合でも `MAX_BATCH_ROWS` 相当を
-        // 毎回コミットしないため（このマップは追加参照を持たない
-        // `(&str, Visibility)` を値に持つのみで数え上げ自体は軽量）。
-        let matching_row_count = self
-            .matrix
-            .tenant_ids
-            .iter()
-            .filter(|tenant| batch_tenants.contains(tenant.as_str()))
-            .count();
+        // 確保する（codex P1 指摘対応）。予約量は上で数えた `matching_row_count`
+        // をそのまま再利用する。
         let mut id_to_tenant: std::collections::HashMap<u64, (&str, Visibility)> =
             std::collections::HashMap::new();
         id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
-            GpuSearchError::AllocationFailed(format!("failed to reserve id-tenant map: {e}"))
+            BatchSearchError::AllocationFailed(format!("failed to reserve id-tenant map: {e}"))
         })?;
         for ((id, tenant), visibility) in self
             .matrix
@@ -1031,7 +1031,7 @@ impl GpuBatchEngine {
             for hit in &hits {
                 match id_to_tenant.get(&hit.id) {
                     Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
-                    _ => return Err(GpuSearchError::TenantMaskViolation),
+                    _ => return Err(BatchSearchError::TenantMaskViolation),
                 }
             }
 
@@ -1045,7 +1045,7 @@ impl GpuBatchEngine {
 mod tests {
     use super::*;
 
-    // CORE-16: f16 往復精度（GPU 不要・常時実行）。
+    // CORE-16 ポインタ: f16 往復精度。
     #[test]
     fn f16_roundtrip_preserves_reasonable_precision() {
         for v in [0.0f32, 1.0, -1.0, 0.5, 3.140625, -100.0, 1e-3] {
@@ -1071,7 +1071,7 @@ mod tests {
         assert!(inf_b.is_infinite() && inf_b < 0.0);
     }
 
-    // CORE-16 codex レビュー指摘対応: サブノーマル f16 の復元値を厳密一致で検証する
+    // CORE-16 ポインタ・codex レビュー指摘対応: サブノーマル f16 の復元値を厳密一致で検証する
     // （`f16_roundtrip_preserves_reasonable_precision` の絶対誤差 `< 0.01` 判定では
     // サブノーマル域の値が 2^13 倍ずれても誤差が閾値未満に収まり検出できない）。
     // ここではビット列を直接与えて `unpack_f16x2` の公開契約どおり
@@ -1178,7 +1178,7 @@ mod tests {
         assert!((b - (-4.25)).abs() < 1e-3);
     }
 
-    // CORE-7: 動的窓集約の判定（後続あり/なし・静的窓不在）。
+    // CORE-7 ポインタ: 動的窓集約の判定（後続あり/なし）。
     #[test]
     fn should_aggregate_only_when_pending_follows() {
         assert!(should_aggregate_into_batch(true));
@@ -1208,7 +1208,7 @@ mod tests {
         let err = agg.push(vec![1.0, 0.0]).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::TooManyQueries {
+            BatchSearchError::TooManyQueries {
                 count: MAX_BATCH_QUERIES + 1,
                 max: MAX_BATCH_QUERIES,
             }
@@ -1224,7 +1224,7 @@ mod tests {
         let err = agg.push(vec![1.0, 0.0, 0.0]).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::WindowDimMismatch {
+            BatchSearchError::WindowDimMismatch {
                 expected: 2,
                 found: 3
             }
@@ -1239,7 +1239,7 @@ mod tests {
         let err = agg.push(vec![]).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::InvalidDim {
+            BatchSearchError::InvalidDim {
                 dim: 0,
                 max: MAX_BATCH_DIM
             }
@@ -1260,7 +1260,7 @@ mod tests {
 
     // Cursor Bugbot 指摘対応: 上限検証済みの量を超えて `try_reserve_exact` が
     // 実際にメモリ不足になった場合、`Vec::with_capacity`/`push` のように abort
-    // せず `Err(GpuSearchError::AllocationFailed)` を返すことを検証する
+    // せず `Err(BatchSearchError::AllocationFailed)` を返すことを検証する
     // （`arena.rs` の同種テストと同方針）。`isize::MAX` 超のレイアウトは Rust の
     // アロケーション API 契約上、実メモリを確保しようとする前に即座に拒否
     // されるため、CI 環境で実際に大量のメモリを消費せず決定的に再現できる。
@@ -1269,7 +1269,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let oversized = (isize::MAX as usize).saturating_add(1);
         let result = try_reserve_exact(&mut buf, oversized, "test buffer");
-        assert!(matches!(result, Err(GpuSearchError::AllocationFailed(_))));
+        assert!(matches!(result, Err(BatchSearchError::AllocationFailed(_))));
     }
 
     // ResidentMatrix の上限・整合性検証（untrusted 入力の防御的上限）。
@@ -1279,7 +1279,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::InvalidDim {
+            BatchSearchError::InvalidDim {
                 dim: 0,
                 max: MAX_BATCH_DIM
             }
@@ -1303,7 +1303,7 @@ mod tests {
         let err =
             ResidentMatrix::build(&ids, &tenants, &visibilities, MAX_BATCH_DIM, &[]).unwrap_err();
         match err {
-            GpuSearchError::CapacityExceeded { total_bytes, max } => {
+            BatchSearchError::CapacityExceeded { total_bytes, max } => {
                 assert_eq!(max, MAX_BATCH_TOTAL_BYTES);
                 assert!(total_bytes > max);
             }
@@ -1321,7 +1321,7 @@ mod tests {
             &[1.0, 0.0],
         )
         .unwrap_err();
-        assert_eq!(err, GpuSearchError::ArenaLengthMismatch);
+        assert_eq!(err, BatchSearchError::ArenaLengthMismatch);
     }
 
     // codex レビュー指摘対応: id 重複は fail-closed で拒否する（重複を許すと
@@ -1334,7 +1334,7 @@ mod tests {
         let visibilities = [Visibility::Public, Visibility::Public];
         let vectors = [1.0f32, 0.0, 0.0, 1.0];
         let err = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap_err();
-        assert_eq!(err, GpuSearchError::DuplicateRowId);
+        assert_eq!(err, BatchSearchError::DuplicateRowId);
     }
 
     // Cursor Bugbot 指摘対応: 容量チェックは `MAX_TENANT_ID_LEN` で予算計上する
@@ -1350,7 +1350,7 @@ mod tests {
         let err = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::TenantIdTooLong {
+            BatchSearchError::TenantIdTooLong {
                 len: oversized.len(),
                 max: crate::storage::MAX_TENANT_ID_LEN as usize,
             }
@@ -1374,7 +1374,7 @@ mod tests {
         let vectors = [1.0f32, 0.0];
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors)
             .expect("valid matrix");
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx = PolicyContext::new(&multibyte_tenant).expect("valid tenant");
         let queries = vec![BatchQuery {
@@ -1409,7 +1409,7 @@ mod tests {
         PolicyContext::new(tenant_id).expect("valid tenant")
     }
 
-    // CORE-7 テナント境界（P0）: 混在テナントバッチで混入 0 件。
+    // CORE-7 ポインタ・テナント境界（P0）: 混在テナントバッチで混入 0 件。
     // 検査は実装（`batch_search` 内のマスク）から独立に、返却 id → tenant を
     // 再計算して確認する（実装と検査器の経路分離）。codex P0 指摘対応:
     // `BatchQuery` はもはや呼び出し元が指定する生の `tenant_id: &str` を
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn batch_search_excludes_other_tenant_rows() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries = vec![BatchQuery {
@@ -1451,7 +1451,7 @@ mod tests {
     #[test]
     fn batch_search_cannot_cross_tenant_boundary_via_policy_context() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         let ctx_b = ctx("tenant-b");
@@ -1488,8 +1488,8 @@ mod tests {
 
     // codex P0 指摘対応: `Visibility::Private` の行は、`PolicyContext::new`
     // （既定・最小権限で `Public` のみ許可）では不可視のままであることを
-    // 確認する（`policy.rs::private_requires_explicit_grant` と同じ CORE-2
-    // の既定方針を `batch_search` 経路でも維持する）。
+    // 確認する（`policy.rs::private_requires_explicit_grant` と同じ CORE-2 ポインタの
+    // 既定方針を `batch_search` 経路でも維持する）。
     #[test]
     fn batch_search_excludes_private_rows_without_explicit_grant() {
         let ids = [1u64, 2];
@@ -1498,7 +1498,7 @@ mod tests {
         let vectors = [1.0f32, 0.0, 1.0, 0.0];
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors)
             .expect("valid matrix");
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries = vec![BatchQuery {
@@ -1537,7 +1537,7 @@ mod tests {
     #[test]
     fn batch_search_keeps_per_query_results_correct_across_different_tenants() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_a = [1.0f32, 0.0];
         let query_b = [0.0f32, 1.0];
         let ctx_a = ctx("tenant-a");
@@ -1575,7 +1575,7 @@ mod tests {
     #[test]
     fn batch_search_scores_each_query_independently_against_shared_decoded_row() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_a = [1.0f32, 0.0];
         let query_b = [0.0f32, 1.0];
         let ctx_a = ctx("tenant-a");
@@ -1624,7 +1624,7 @@ mod tests {
     #[test]
     fn batch_search_rejects_dim_mismatch() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries = vec![BatchQuery {
@@ -1635,7 +1635,7 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::DimMismatch {
+            BatchSearchError::DimMismatch {
                 expected: 2,
                 found: 3
             }
@@ -1645,7 +1645,7 @@ mod tests {
     #[test]
     fn batch_search_rejects_non_finite_query() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [f32::NAN, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries = vec![BatchQuery {
@@ -1654,7 +1654,7 @@ mod tests {
             ctx: &ctx_a,
         }];
         let err = engine.batch_search(&queries).unwrap_err();
-        assert_eq!(err, GpuSearchError::NonFiniteQuery { query_index: 0 });
+        assert_eq!(err, BatchSearchError::NonFiniteQuery { query_index: 0 });
     }
 
     // codex レビュー指摘対応: 行外側ループへの構造変更後もクエリ間で選出器が
@@ -1664,7 +1664,7 @@ mod tests {
     #[test]
     fn batch_search_rejects_invalid_k() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries = vec![BatchQuery {
@@ -1675,7 +1675,7 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::InvalidK {
+            BatchSearchError::InvalidK {
                 k: 0,
                 max: MAX_BATCH_K
             }
@@ -1689,7 +1689,7 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::InvalidK {
+            BatchSearchError::InvalidK {
                 k: MAX_BATCH_K + 1,
                 max: MAX_BATCH_K
             }
@@ -1703,7 +1703,7 @@ mod tests {
     #[test]
     fn batch_search_accepts_total_k_exactly_at_limit() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         // 100 件 * k=10_000 = 1,000,000 == MAX_BATCH_TOTAL_K ちょうど。
@@ -1728,7 +1728,7 @@ mod tests {
     #[test]
     fn batch_search_rejects_total_k_over_limit() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         // 101 件 * k=10_000 = 1,010,000 > MAX_BATCH_TOTAL_K(1,000,000)。
@@ -1745,7 +1745,7 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::TotalKExceeded {
+            BatchSearchError::TotalKExceeded {
                 total_k: expected_total_k,
                 max: MAX_BATCH_TOTAL_K,
             }
@@ -1755,7 +1755,7 @@ mod tests {
     #[test]
     fn batch_search_rejects_too_many_queries() {
         let matrix = build_two_tenant_matrix();
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
         let query_vec = [1.0f32, 0.0];
         let ctx_a = ctx("tenant-a");
         let queries: Vec<BatchQuery<'_>> = (0..MAX_BATCH_QUERIES + 1)
@@ -1768,7 +1768,7 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::TooManyQueries {
+            BatchSearchError::TooManyQueries {
                 count: MAX_BATCH_QUERIES + 1,
                 max: MAX_BATCH_QUERIES,
             }
@@ -1787,7 +1787,7 @@ mod tests {
     fn compute_batch_work_rejects_over_limit() {
         let err = compute_batch_work(1_000, MAX_BATCH_QUERIES, MAX_BATCH_DIM).unwrap_err();
         match err {
-            GpuSearchError::WorkBudgetExceeded { work, max } => {
+            BatchSearchError::WorkBudgetExceeded { work, max } => {
                 assert_eq!(max, MAX_BATCH_WORK);
                 assert!(work > max);
             }
@@ -1817,7 +1817,7 @@ mod tests {
         let err = compute_batch_work(usize::MAX, usize::MAX, usize::MAX).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::WorkBudgetExceeded {
+            BatchSearchError::WorkBudgetExceeded {
                 work: usize::MAX,
                 max: MAX_BATCH_WORK,
             }
@@ -1839,7 +1839,7 @@ mod tests {
         let vectors: Vec<f32> = std::iter::repeat_n(0.0f32, rows * dim).collect();
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, dim, &vectors)
             .expect("valid matrix");
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
 
         let query_vec: Vec<f32> = std::iter::repeat_n(0.0f32, dim).collect();
         let ctx_a = ctx("tenant-a");
@@ -1852,12 +1852,65 @@ mod tests {
             .collect();
         let err = engine.batch_search(&queries).unwrap_err();
         match err {
-            GpuSearchError::WorkBudgetExceeded { work, max } => {
+            BatchSearchError::WorkBudgetExceeded { work, max } => {
                 assert_eq!(max, MAX_BATCH_WORK);
                 assert!(work > max);
             }
             other => panic!("expected WorkBudgetExceeded, got {other:?}"),
         }
+    }
+
+    // Cursor Medium 指摘対応: 計算量ガードの課金対象は常駐行列の全行数ではなく、
+    // バッチのテナント集合に実際に一致する行数（＝走査時に実際にデコードされる
+    // 行数）でなければならない。tenant-a を 10 行・tenant-b を 990 行持つ
+    // 常駐行列（全 1,000 行）に対し、tenant-a だけを最大クエリ数で検索する
+    // バッチは、全行数（1,000）を課金すれば
+    // `batch_search_rejects_work_budget_over_limit` と同じ構成で
+    // `WorkBudgetExceeded` になってしまうが、実際に走査するのは tenant-a の
+    // 10 行だけ（10 * MAX_BATCH_QUERIES * MAX_BATCH_DIM ≈ 3.36 × 10^8 <
+    // MAX_BATCH_WORK）なので許可されるべきことを確認する（行数は実行時間を
+    // 抑えるため境界からは離れた小さい値を選ぶ。境界そのものの検証は
+    // `compute_batch_work_accepts_exactly_at_limit` 等が別途担う）。
+    #[test]
+    fn batch_search_work_budget_charges_only_matching_tenant_rows() {
+        let tenant_a_rows = 10usize;
+        let tenant_b_rows = 990usize;
+        let rows = tenant_a_rows + tenant_b_rows;
+        let dim = MAX_BATCH_DIM;
+        let ids: Vec<u64> = (0..rows as u64).collect();
+        let mut tenants: Vec<String> = std::iter::repeat_n("tenant-a".to_string(), tenant_a_rows)
+            .chain(std::iter::repeat_n("tenant-b".to_string(), tenant_b_rows))
+            .collect();
+        tenants.truncate(rows);
+        let visibilities: Vec<Visibility> = std::iter::repeat_n(Visibility::Public, rows).collect();
+        let vectors: Vec<f32> = std::iter::repeat_n(0.0f32, rows * dim).collect();
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, dim, &vectors)
+            .expect("valid matrix");
+        let engine = BatchEngine::new(matrix);
+
+        // 全行数（1,000）で課金すると work = 1,000 * MAX_BATCH_QUERIES *
+        // MAX_BATCH_DIM は MAX_BATCH_WORK を超過する（上の
+        // `batch_search_rejects_work_budget_over_limit` と同一規模）ことを
+        // 前提として明示する。
+        assert!(compute_batch_work(rows, MAX_BATCH_QUERIES, dim).is_err());
+        // tenant-a の行数だけで課金すれば上限内であることも前提として明示する。
+        assert!(compute_batch_work(tenant_a_rows, MAX_BATCH_QUERIES, dim).is_ok());
+
+        let query_vec: Vec<f32> = std::iter::repeat_n(0.0f32, dim).collect();
+        let ctx_a = ctx("tenant-a");
+        let queries: Vec<BatchQuery<'_>> = (0..MAX_BATCH_QUERIES)
+            .map(|_| BatchQuery {
+                vector: &query_vec,
+                k: 1,
+                ctx: &ctx_a,
+            })
+            .collect();
+
+        let result = engine.batch_search(&queries);
+        assert!(
+            result.is_ok(),
+            "expected success when only the small tenant-a slice is searched, got {result:?}"
+        );
     }
 
     // codex レビュー追加指摘対応: 次元不一致という軽量に判定できる入力エラーは
@@ -1875,7 +1928,7 @@ mod tests {
         let vectors: Vec<f32> = std::iter::repeat_n(0.0f32, rows * dim).collect();
         let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, dim, &vectors)
             .expect("valid matrix");
-        let engine = GpuBatchEngine::new(matrix);
+        let engine = BatchEngine::new(matrix);
 
         // rows * MAX_BATCH_QUERIES * dim は MAX_BATCH_WORK を超過する規模
         // （`batch_search_rejects_work_budget_over_limit` と同一構成）。
@@ -1898,14 +1951,14 @@ mod tests {
         let err = engine.batch_search(&queries).unwrap_err();
         assert_eq!(
             err,
-            GpuSearchError::DimMismatch {
+            BatchSearchError::DimMismatch {
                 expected: dim,
                 found: dim - 1,
             }
         );
     }
 
-    // GpuBatchEngine が SearchProvider を実装しないこと（単発経路へ構造的に
+    // BatchEngine が SearchProvider を実装しないこと（単発経路へ構造的に
     // 接続できないことのコンパイル時の裏付け）は型シグネチャそのものが保証する
     // ため実行時テストは不要（`kernel.rs::SearchProvider` を implement していない）。
 }

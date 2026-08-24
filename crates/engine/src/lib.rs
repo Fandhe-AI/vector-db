@@ -24,7 +24,7 @@
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
 //! 方式差し替えと、依存追加なしの参照実装 2 種。対象ビヘイビア: SEARCH-6, SEARCH-7,
 //! SEARCH-8。方式（クロスエンコーダ等）の最終選定・効果測定回帰は後続タスクの管轄）・
-//! TASK-128（バッチクエリ・一括インデクシング専用の検索エンジン `gpu_search`。対象
+//! TASK-128（バッチクエリ・一括インデクシング専用の検索エンジン `batch_search`。対象
 //! ビヘイビア: CORE-6, CORE-7, CORE-16。単発クエリ経路 `core::EngineCore` へは
 //! 構造的に接続しない）。プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
@@ -35,9 +35,9 @@
 //! から利用）を参照。
 
 pub mod arena;
+pub mod batch_search;
 pub mod catalog;
 pub mod core;
-pub mod gpu_search;
 pub mod hybrid;
 pub mod kernel;
 pub mod parallel_search;

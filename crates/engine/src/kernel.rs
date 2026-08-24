@@ -206,7 +206,7 @@ impl TopKSelector {
     /// 内部ヒープへ `additional` 件分の容量をフォールブルに予約する。[`Self::new`]
     /// があえて事前確保しない理由（未検証の `k` を確保サイズへ直接使わない）とは
     /// 矛盾しない: 本メソッドは呼び出し元が別途総量を上限検証済みであることを
-    /// 前提にした任意 API である（`gpu_search.rs::GpuBatchEngine::batch_search` が
+    /// 前提にした任意 API である（`batch_search.rs::BatchEngine::batch_search` が
     /// バッチ全体の `sum(k)` を検証してから各選出器へ呼ぶ想定）。呼び出し元が
     /// 本メソッドを使わず素朴に `push` するだけの経路（`CpuScalarProvider`・
     /// `ParallelSearchProvider`）は今までどおり amortized 成長のままでよい
