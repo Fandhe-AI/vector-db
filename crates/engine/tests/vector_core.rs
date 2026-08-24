@@ -181,6 +181,7 @@ fn assert_no_cross_tenant_leak(
     }
 }
 
+// 越境しないことの検証は `Private` 行で行う（ポインタ: TASK-89 / TABLE-9）。
 #[test]
 fn core2_multi_tenant_search_has_zero_cross_tenant_leakage() {
     let dir = TempDir::new("core2-leak");
@@ -214,7 +215,7 @@ fn core2_multi_tenant_search_has_zero_cross_tenant_leakage() {
             "docs",
             3,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[100.0, 0.0],
         );
         seed_row(
@@ -222,7 +223,7 @@ fn core2_multi_tenant_search_has_zero_cross_tenant_leakage() {
             "docs",
             4,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[50.0, 0.0],
         );
         let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
@@ -238,6 +239,8 @@ fn core2_multi_tenant_search_has_zero_cross_tenant_leakage() {
     assert!(hits.iter().all(|h| h.id == 1 || h.id == 2));
 }
 
+// 不可視であることを前提にしたこの検証は `Private` 行で行う
+// （ポインタ: TASK-89 / TABLE-9）。
 #[test]
 fn core2_get_row_does_not_distinguish_invisible_from_missing() {
     let dir = TempDir::new("core2-getrow");
@@ -250,7 +253,7 @@ fn core2_get_row_does_not_distinguish_invisible_from_missing() {
         "docs",
         1,
         "tenant-b",
-        Visibility::Public,
+        Visibility::Private,
         &[1.0, 0.0],
     );
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
@@ -335,7 +338,8 @@ impl SearchProvider for CapturingProvider {
 // （＝可視行だけへ絞り込んだ縮約ビューであること）を、provider 側の観測で検証する。
 // dim=2・tenant-a の可視行が 1 件のみのデータセットに対し、`ids` が他テナント
 // （id=2, tenant-b）を含まず、`vectors` の長さが可視行数 × dim（1 * 2 = 2）に
-// 一致することを確認する。
+// 一致することを確認する。id=2 を不可視のまま保つには `Private` を使う
+// （ポインタ: TASK-89 / TABLE-9）。
 #[test]
 fn search_projects_input_to_visible_rows_only_before_calling_provider() {
     let dir = TempDir::new("p0-1-projection");
@@ -363,7 +367,7 @@ fn search_projects_input_to_visible_rows_only_before_calling_provider() {
         "docs",
         2,
         "tenant-b",
-        Visibility::Public,
+        Visibility::Private,
         &[100.0, 0.0],
     );
     let core = EngineCore::from_storage(storage, Box::new(provider));

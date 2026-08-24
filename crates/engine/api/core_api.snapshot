@@ -16,6 +16,7 @@ pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
 pub mod storage;
+pub mod tenant;
 pub mod txn;
 
 # source: crates/engine/src/core.rs :: VectorCore
@@ -103,10 +104,13 @@ impl PolicyContext {
         &self.tenant_id
     }
     pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
-        row_tenant == self.tenant_id
-            && self
-                .allowed_visibilities
-                .contains(&AllowedVisibility::from(row_visibility))
+        let allowed = self
+            .allowed_visibilities
+            .contains(&AllowedVisibility::from(row_visibility));
+        if !allowed {
+            return false;
+        }
+        row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
 }
 
