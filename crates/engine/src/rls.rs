@@ -374,7 +374,6 @@ impl<'s> SearchTimeFilter<'s> {
         }
 
         let mut selector = kernel::TopKSelector::new(k);
-        let mut visible_id_set: HashSet<u64> = HashSet::new();
         for idx in 0..self.arena.len() {
             let (Some(tenant), Some(visibility)) =
                 (self.arena.tenant_id(idx), self.arena.visibility(idx))
@@ -394,7 +393,6 @@ impl<'s> SearchTimeFilter<'s> {
             let Some(vector) = self.arena.vector(idx) else {
                 continue;
             };
-            visible_id_set.insert(id);
             let score = kernel::dot(vector, query);
             if !score.is_finite() {
                 // 格納ベクトルの NaN/Inf 混入・オーバーフローによる非有限化を除外する
@@ -405,8 +403,15 @@ impl<'s> SearchTimeFilter<'s> {
         }
         let hits = selector.into_sorted_vec();
 
-        // 返却直前の機械検証（二重防御。上記ドキュメント参照）。
-        if !provider_result_is_valid(&hits, k, &visible_id_set) {
+        // 返却直前の機械検証（件数上限・スコア有限性・重複なし・順序の 4 点。
+        // `PrefilterIndex::search` と異なり本型は `dyn SearchProvider` を経由せず、
+        // `hits` は上記ループで `ctx.is_visible` を通過した行からのみ inline 生成される
+        // ため、id 集合が可視行に属するかの検証は自己ループの同語反復になり
+        // `dyn SearchProvider` 越しの防御という本来の意義を持たない。そのため
+        // `visible_id_set` は全行分ではなく `hits` 自身の id から構築し、他 4 項目の
+        // 検証にのみ使う（`hits` の id は元々可視行由来なので (3) は常に真になる）。
+        let hit_id_set: HashSet<u64> = hits.iter().map(|hit| hit.id).collect();
+        if !provider_result_is_valid(&hits, k, &hit_id_set) {
             return Err(RlsError::ProviderResultRejected);
         }
 
