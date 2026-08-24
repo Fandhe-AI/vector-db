@@ -380,9 +380,8 @@ fn tenant_mask_violation_from_primary_is_not_treated_as_fallback_trigger() {
 }
 
 // マルチテナントバッチで縮退後も他テナント行の混入が 0 件であることを検証する
-// （テナント境界。security.md P0）。TASK-89（TABLE-9）で `Public` 行はテナント間
-// 相互可視になったため、越境しないことの検証は `Private` 行のフィクスチャで
-// 行う（`Public` を使うと分離を検証できなくなるため。ポインタ: TABLE-9）。
+// （テナント境界。security.md P0）。越境しないことの検証は `Private` 行の
+// フィクスチャで行う（ポインタ: TASK-89 / TABLE-9）。
 #[test]
 fn fallback_search_does_not_leak_rows_across_tenants() {
     let (ids, tenant_ids, _visibilities, dim, vectors) = fixture();
@@ -504,8 +503,8 @@ fn fallback_search_is_deterministic_across_repeated_calls() {
 // tenant-b の `Public` 行を実際に返すことを、engine 公開 API のみから確認
 // する（`src/batch_search.rs`・`src/batch_fallback.rs` 内の同種ユニット
 // テストは `pub(crate)` API 経由のため、`wire-server` から見える公開面の
-// 回帰はこの結合テストが担う）。混入 0 件だけでは相互可視性の実装を
-// 保証しないため、tenant-b の id が実際に返ることまで確認する。
+// 回帰はこの結合テストが担う）。混入 0 件だけでは判定の正方向を保証しないため、
+// tenant-b の id が実際に返ることまで確認する（ポインタ: TASK-89 / TABLE-9）。
 #[test]
 fn batch_search_and_fallback_both_include_other_tenant_public_rows() {
     let (ids, tenant_ids, visibilities, dim, vectors) = fixture();

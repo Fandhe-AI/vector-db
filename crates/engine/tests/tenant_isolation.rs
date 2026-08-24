@@ -3,7 +3,7 @@
 //! `crates/engine/tests/rls_prefilter.rs`（TASK-133）のシード手法（決定的
 //! xorshift64*・`unique_db_path` 方式）を踏襲し、本番検索経路（`core.rs::EngineCore::search`
 //! と `rls.rs::PrefilterIndex::search` の両方）に対して 200 試行 × 4 テナント巡回で
-//! テナント境界の混入 0 件（TABLE-11）と `Public` 行の相互可視性（TABLE-9）を検証する。
+//! テナント境界の混入 0 件（TABLE-11）と可視性判定（TABLE-9）を検証する。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -238,18 +238,16 @@ fn table11_zero_cross_tenant_leakage_across_200_trials_via_both_search_paths() {
         }
     }
 
-    // 対象ビヘイビア: TABLE-9（正方向）。混入 0 件だけでは「相互可視性が実装されている」
-    // ことの退行を検知できないため、他テナントの `Public` 行が実際に Top-k へ現れた
-    // 試行が 1 件以上あったことも確認する。
+    // 対象ビヘイビア: TABLE-9（正方向）。混入 0 件だけでは判定の正方向側の退行を
+    // 検知できないため、他テナントの `Public` 行が実際に Top-k へ現れた試行が
+    // 1 件以上あったことも確認する。
     assert!(
         foreign_visible_hit_seen,
-        "expected at least one trial to surface another tenant's Public row \
-         (TABLE-9 mutual visibility must be exercised, not just absent)"
+        "expected at least one trial to surface a cross-tenant hit (see PolicyContext::is_visible)"
     );
 }
 
-// 対象ビヘイビア: TABLE-9（fail-closed）。`Public` を許可集合に含まない ctx には、
-// 他テナントの `Public` 行を見せない。`Private` のみ許可の ctx でも越境しない。
+// 対象ビヘイビア: TABLE-9（fail-closed）。詳細は `PolicyContext::is_visible` を参照。
 #[test]
 fn table9_fail_closed_without_public_grant_and_private_never_crosses_tenant() {
     const ROWS_PER_TENANT: u64 = 30;
@@ -279,8 +277,7 @@ fn table9_fail_closed_without_public_grant_and_private_never_crosses_tenant() {
         assert_eq!(
             row.visibility,
             Visibility::Private,
-            "Private-only ctx must not see Public rows without an explicit Public grant \
-             (id={})",
+            "Private-only ctx must only see Private rows (see PolicyContext::is_visible) (id={})",
             row.id
         );
     }
@@ -296,7 +293,7 @@ fn table9_fail_closed_without_public_grant_and_private_never_crosses_tenant() {
     assert_eq!(actual, expected);
 
     // `Public`・`Private` 両方許可の ctx でも、`Private` 行は依然として他テナントへは
-    // 越境しない（相互可視性は `Public` に限定される）ことを確認する。
+    // 越境しないことを確認する（ポインタ: TASK-89 / TABLE-9）。
     let ctx_both =
         PolicyContext::with_visibilities(TENANTS[0], [Visibility::Public, Visibility::Private])
             .expect("valid tenant");

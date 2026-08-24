@@ -35,9 +35,9 @@
 //! TASK-131（`search_engine.rs`。CORE-9 の差し替え点を `kernel.rs::SearchProvider`
 //! （CORE-13）へ一本化する検索エンジン選択・構築レイヤ。`core::EngineCore::open`
 //! の既定 provider 構築経路）・TASK-89（`tenant.rs`。行単位テナント境界の行ストア
-//! 統合層と、`policy.rs::PolicyContext::is_visible`（CORE-2）への `Public` 行相互
-//! 可視性の統合。対象ビヘイビア: TABLE-9, TABLE-11。テーブル単位物理分離は
-//! `tenant.rs` のモジュールドキュメント参照のとおりスコープ外）。プロトコル層
+//! 統合層と `policy.rs::PolicyContext::is_visible`（CORE-2）との統合。対象
+//! ビヘイビア: TABLE-9, TABLE-11。詳細は `tenant.rs`・`policy.rs` の
+//! モジュールドキュメント参照）。プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!

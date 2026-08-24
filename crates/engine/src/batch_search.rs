@@ -1083,14 +1083,12 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         .map_err(|e| {
             BatchSearchError::AllocationFailed(format!("failed to reserve tenant row counts: {e}"))
         })?;
-    // TABLE-9（`Public` 行のテナント間相互可視性）用: バッチのテナントに
-    // 属さない行のうち `Visibility::Public` の件数（`extra_public_row_count`）。
-    // `policy.rs::PolicyContext::is_visible` はテナント一致を問わず `Public`
-    // 行を可視にするため、行のテナントがこのバッチのどのクエリのテナントとも
-    // 一致しなくても、`Public` を許可するクエリからは到達しうる。全行数は
-    // [`ResidentMatrix::build`] で [`MAX_BATCH_ROWS`] 以下に制限済みのため、
-    // ここでの全件走査も既存の `tenant_row_counts` 数え上げと同じ計算量
-    // クラスに収まる。
+    // ポインタ: TASK-89 / TABLE-9。バッチのテナントに属さない行のうち
+    // `Visibility::Public` の件数（`extra_public_row_count`）を、
+    // `policy.rs::PolicyContext::is_visible` の判定と整合する形で数える
+    // （詳細は `policy.rs` 参照）。全行数は [`ResidentMatrix::build`] で
+    // [`MAX_BATCH_ROWS`] 以下に制限済みのため、ここでの全件走査も既存の
+    // `tenant_row_counts` 数え上げと同じ計算量クラスに収まる。
     //
     // `tenant_public_row_counts` は codex P1 指摘対応（二重課金バグ修正）:
     // バッチテナントに属する `Public` 行についても、テナント別の内訳を
@@ -1287,16 +1285,14 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         }
     }
 
-    // TABLE-9 用: `Public` 可視性を許可集合に含むクエリの index 一覧
-    // （テナントを問わず。上の `public_grant_query_count` と同じ判定を
-    // 使って再構築する）。行外側ループで `Public` 行に遭遇した際、
-    // 「同一テナントのクエリ集合」（`tenant_query_indices`）に加えて
-    // この一覧も候補にすることで、他テナントの `Public` 許可クエリからも
-    // 到達できるようにする（`policy.rs::PolicyContext::is_visible` が
-    // 既に持つ「`Public` 行はテナント間相互可視」というセマンティクスを、
-    // 本経路（`batch_search`/`batch_fallback`）の事前絞り込みにも反映する。
-    // `EngineCore::search`/`PrefilterIndex::search` との可視集合の非対称を
-    // 解消する対応）。
+    // ポインタ: TASK-89 / TABLE-9。`Public` 可視性を許可集合に含むクエリの
+    // index 一覧（テナントを問わず。上の `public_grant_query_count` と同じ
+    // 判定を使って再構築する）。行外側ループで `Public` 行に遭遇した際、
+    // 「同一テナントのクエリ集合」（`tenant_query_indices`）に加えてこの
+    // 一覧も候補にすることで、`policy.rs::PolicyContext::is_visible` の
+    // 判定と本経路（`batch_search`/`batch_fallback`）の事前絞り込みを
+    // 整合させる（`EngineCore::search`/`PrefilterIndex::search` との可視
+    // 集合の非対称を解消する対応。詳細は `policy.rs` 参照）。
     let mut public_grant_query_indices: Vec<usize> = Vec::new();
     try_reserve_exact(
         &mut public_grant_query_indices,
@@ -1812,9 +1808,8 @@ mod tests {
     }
 
     /// [`build_two_tenant_matrix`] と同じ id・テナント・ベクトル配置だが、全行
-    /// `Private` にした版。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
-    /// なったため、テナント分離そのものを検証するテストは本フィクスチャを使う
-    /// （ポインタ: TABLE-9）。
+    /// `Private` にした版。テナント分離そのものを検証するテストは本フィクスチャを
+    /// 使う（ポインタ: TASK-89 / TABLE-9）。
     fn build_two_tenant_matrix_private() -> ResidentMatrix {
         let ids = vec![1u64, 2, 3, 4];
         let tenants = vec![
@@ -1846,9 +1841,8 @@ mod tests {
     // 持たない（型定義から削除済み）。テナント境界は `ctx`（`PolicyContext`）
     // 経由でのみ engine 側が決定するため、本テストは「`tenant-a` の
     // `PolicyContext` を渡すクエリが、行列に同居する `tenant-b` の行へは
-    // 構造的に到達できない」ことを検証する。TASK-89（TABLE-9）で `Public` 行は
-    // テナント間相互可視になったため、`Private` フィクスチャで検証する
-    // （ポインタ: TABLE-9）。
+    // 構造的に到達できない」ことを検証する。`Private` フィクスチャで検証する
+    // （ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn batch_search_excludes_other_tenant_rows() {
         let matrix = build_two_tenant_matrix_private();
@@ -1875,13 +1869,12 @@ mod tests {
         assert!(!results[0].hits.is_empty());
     }
 
-    // 対象ビヘイビア: TABLE-9（正方向・レビュー起因の回帰）。`batch_search`
-    // 経由でも他テナントの `Public` 行が `Public` 許可クエリから見えること、
-    // かつ `EngineCore::search`（`core.rs`）と同一の可視集合を返すことを
-    // 検証する（`policy.rs::PolicyContext::is_visible` の単一照合パスが
-    // 経路によらず同じ判定を返すという設計の要）。混入 0 件だけでは
-    // 「相互可視性が実装されている」ことを保証しないため、tenant-b の行が
-    // 実際に返ることまで確認する。
+    // 対象ビヘイビア: TABLE-9（正方向・レビュー起因の回帰）。`batch_search` が
+    // `EngineCore::search`（`core.rs`）と同一の可視集合を返すことを検証する
+    // （`policy.rs::PolicyContext::is_visible` の単一照合パスが経路によらず
+    // 同じ判定を返すという設計の要）。混入 0 件だけでは判定の正方向を保証
+    // しないため、tenant-b の行が実際に返ることまで確認する（ポインタ:
+    // TASK-89 / TABLE-9）。
     #[test]
     fn batch_search_includes_other_tenant_public_rows_matching_engine_core() {
         let matrix = build_two_tenant_matrix();
@@ -1917,9 +1910,8 @@ mod tests {
     // を偽装する経路を提供しない。`tenant-a` の `PolicyContext` で発行した
     // クエリが `tenant-b` の行を一切返さないことを、バッチ内に両テナントの
     // クエリが混在する状況でも確認する（`tenant-b` 側のクエリも同時に検証し、
-    // 相互のテナント越え漏えいが無いことを両方向で確認する）。TASK-89
-    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、`Private`
-    // フィクスチャで検証する（ポインタ: TABLE-9）。
+    // 相互のテナント越え漏えいが無いことを両方向で確認する）。`Private`
+    // フィクスチャで検証する（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn batch_search_cannot_cross_tenant_boundary_via_policy_context() {
         let matrix = build_two_tenant_matrix_private();
@@ -2006,8 +1998,8 @@ mod tests {
     // テナントを持つバッチで、選出器とクエリの対応がずれていないことを検証する
     // （行外側ループ・選出器の事前生成・共有 `row_buf` の組み合わせで、選出器の
     // 取り違えが起きうる構造のため）。テナント間の行が結果に混ざらないことも
-    // 併せて確認するため、TASK-89（TABLE-9）以降は `Private` フィクスチャで
-    // 検証する（`Public` は相互可視のため分離を検証できない。ポインタ: TABLE-9）。
+    // 併せて確認するため `Private` フィクスチャで検証する（ポインタ:
+    // TASK-89 / TABLE-9）。
     #[test]
     fn batch_search_keeps_per_query_results_correct_across_different_tenants() {
         let matrix = build_two_tenant_matrix_private();
@@ -2391,10 +2383,9 @@ mod tests {
     // 10 行だけ（10 * MAX_BATCH_QUERIES * MAX_BATCH_DIM ≈ 3.36 × 10^8 <
     // MAX_BATCH_WORK）なので許可されるべきことを確認する（行数は実行時間を
     // 抑えるため境界からは離れた小さい値を選ぶ。境界そのものの検証は
-    // `compute_batch_work_accepts_exactly_at_limit` 等が別途担う）。TASK-89
-    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、tenant-b 側は
+    // `compute_batch_work_accepts_exactly_at_limit` 等が別途担う）。tenant-b 側は
     // `Private` にして「`ctx_a` が実際に見るのは tenant-a の行だけ」という前提を
-    // 保つ（ポインタ: TABLE-9）。
+    // 保つ（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn batch_search_work_budget_charges_only_matching_tenant_rows() {
         let tenant_a_rows = 10usize;
@@ -2540,8 +2531,7 @@ mod tests {
         for hit_set in &results {
             assert!(
                 hit_set.hits.is_empty(),
-                "no row must be visible: tenant-a's own row is Public but ctx only grants Private, \
-                 and tenant-c is unreachable without a Public grant"
+                "no row must be visible for this ctx (see PolicyContext::is_visible)"
             );
         }
     }

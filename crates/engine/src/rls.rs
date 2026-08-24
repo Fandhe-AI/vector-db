@@ -324,9 +324,8 @@ mod tests {
     }
 
     // 対象ビヘイビア: RLS-1。他テナント・不可視行は構築時点でインデックスへ含まれず、
-    // 検索結果にも混入しない。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
-    // なったため、他テナント行の不可視性を検証する行は `Private` にする（ポインタ:
-    // TABLE-9）。
+    // 検索結果にも混入しない。他テナント行の不可視性を検証する行は `Private` にする
+    // （ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn build_excludes_invisible_rows_and_search_never_returns_them() {
         let dir = tempdir();
@@ -370,9 +369,8 @@ mod tests {
         assert_eq!(hits[0].id, 1);
     }
 
-    // 対象ビヘイビア: RLS-1。可視行が 0 件でも空結果を返す（拒否ではない）。TASK-89
-    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、可視行 0 件を保つ
-    // 行は `Private` にする（ポインタ: TABLE-9）。
+    // 対象ビヘイビア: RLS-1。可視行が 0 件でも空結果を返す（拒否ではない）。
+    // 可視行 0 件を保つ行は `Private` にする（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn empty_visible_set_returns_empty_result() {
         let dir = tempdir();
@@ -467,9 +465,8 @@ mod tests {
     }
 
     // ctx 束縛の検証: 同一テーブルでも構築時 ctx のテナントに紐づく行しか返らない
-    // （一致 ctx での正常系）。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
-    // なったため、テナントごとの束縛を検証する行は `Private` にする（ポインタ:
-    // TABLE-9）。
+    // （一致 ctx での正常系）。テナントごとの束縛を検証する行は `Private` にする
+    // （ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn index_is_bound_to_the_tenant_used_at_build_time() {
         let dir = tempdir();
@@ -815,9 +812,8 @@ mod tests {
 
     // `len`/`is_empty` は構築時 ctx との一致を要求し、別テナントの ctx（tenant-b。
     // 自身の可視行を持つ）を渡した場合はどちらも `RlsError::ContextMismatch` になる。
-    // TASK-89（TABLE-9）で `Public` 行はテナント間相互可視になったため、
     // `index_a.len(&ctx_a) == 1` という前提を保つため tenant-b 側は `Private` にする
-    // （ポインタ: TABLE-9）。
+    // （ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn len_and_is_empty_reject_a_context_different_from_the_one_used_at_build_time() {
         let dir = tempdir();

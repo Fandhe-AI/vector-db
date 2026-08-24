@@ -191,8 +191,7 @@ mod tests {
         )
     }
 
-    // 対象ビヘイビア: TABLE-9。他テナントの `Public` 行は可視行集合へ含まれる
-    // （相互可視性）。
+    // 対象ビヘイビア: TABLE-9。
     #[test]
     fn visible_rows_includes_other_tenant_public_rows() {
         let path = unique_db_path("visible-public");

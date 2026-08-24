@@ -565,9 +565,9 @@ impl FallbackBatchEngine {
             batch_tenants.insert(q.ctx.tenant_id());
         }
 
-        // TASK-89（TABLE-9）: `Public` 行はテナント間相互可視のため、`Public`
-        // 許可クエリが 1 件でもあれば、バッチ外テナントの `Public` 行も
-        // `run_batch_search`（`batch_search.rs`）側から返りうる。この独立
+        // ポインタ: TASK-89 / TABLE-9（`policy.rs::PolicyContext::is_visible` の
+        // 判定に整合させる）。`run_batch_search`（`batch_search.rs`）側から
+        // バッチ外テナントの行が返りうるケースがあるため、この独立
         // 再検証（`revalidate_primary_hits`）はその経路とは別に自前で
         // `id_to_tenant` を組むため、`run_batch_search` と同じ拡張をここにも
         // 反映しないと、正当な hit を `TenantMaskViolation` として誤検知する
@@ -766,9 +766,8 @@ mod tests {
     }
 
     /// `Private` を明示許可した [`PolicyContext`] のテスト用ショートハンド。
-    /// TASK-89（TABLE-9）で `Public` 行はテナント間相互可視になったため、
     /// テナント分離そのものを検証するテストは `Private` フィクスチャと組で使う
-    /// （ポインタ: TABLE-9）。
+    /// （ポインタ: TASK-89 / TABLE-9）。
     fn private_ctx(tenant: &str) -> PolicyContext {
         PolicyContext::with_visibilities(tenant, [Visibility::Private]).expect("valid tenant id")
     }
@@ -966,9 +965,8 @@ mod tests {
     }
 
     /// [`build_engine_with_backend`] と同じ id・テナント・ベクトル配置だが、全行
-    /// `Private` にした版。TASK-89（TABLE-9）で `Public` 行はテナント間相互可視に
-    /// なったため、テナント分離そのものを検証するテストは本フィクスチャを使う
-    /// （ポインタ: TABLE-9）。
+    /// `Private` にした版。テナント分離そのものを検証するテストは本フィクスチャを
+    /// 使う（ポインタ: TASK-89 / TABLE-9）。
     fn build_engine_with_backend_private(
         backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
         observer: Box<dyn FallbackObserver>,
@@ -1297,9 +1295,8 @@ mod tests {
     }
 
     // マルチテナントバッチで縮退後も他テナント行の混入 0 件であること・
-    // クエリごとに独立した結果順序が保たれることを検証する。TASK-89
-    // （TABLE-9）で `Public` 行はテナント間相互可視になったため、`Private`
-    // フィクスチャで検証する（ポインタ: TABLE-9）。
+    // クエリごとに独立した結果順序が保たれることを検証する。`Private`
+    // フィクスチャで検証する（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn fallback_search_does_not_leak_rows_across_tenants_in_multi_tenant_batch() {
         let observer = RecordingObserver::new();
@@ -1493,9 +1490,8 @@ mod tests {
 
     // 他テナントの実在 id（tenant-b の行 id=3）を tenant-a のクエリへ混入させる
     // 悪性バックエンドは拒否される（本指摘のコア: マスク漏れ・結果破損による
-    // 他テナントの存在情報漏えいを防ぐ）。TASK-89（TABLE-9）で `Public` 行は
-    // テナント間相互可視になったため、id=3 が引き続き tenant-a から不可視で
-    // あることを保つ `Private` フィクスチャで検証する（ポインタ: TABLE-9）。
+    // 他テナントの存在情報漏えいを防ぐ）。id=3 が引き続き tenant-a から不可視で
+    // あることを保つ `Private` フィクスチャで検証する（ポインタ: TASK-89 / TABLE-9）。
     #[test]
     fn revalidation_rejects_other_tenant_id() {
         let engine = build_engine_with_backend_private(
@@ -1758,10 +1754,10 @@ mod tests {
     // observer への通知も一切発生しない（違反はデバイス恒久故障とは異なる
     // 種類の異常であり、`runtime_latched` を流用すると 2 回目以降が `Ok` を
     // 返すようになり検知結果が消えてしまうため。`revalidate_primary_hits` の
-    // ドキュメンテーションコメント「ラッチ決定」参照）。TASK-89（TABLE-9）で
-    // `Public` 行はテナント間相互可視になったため、id=3 が引き続き tenant-a
+    // ドキュメンテーションコメント「ラッチ決定」参照）。id=3 が引き続き tenant-a
     // から不可視であることを保つ `Private` フィクスチャで検証する
-    // （`revalidation_rejects_other_tenant_id` と同じ方針。ポインタ: TABLE-9）。
+    // （`revalidation_rejects_other_tenant_id` と同じ方針。ポインタ:
+    // TASK-89 / TABLE-9）。
     #[test]
     fn revalidation_violation_does_not_latch_and_emits_no_fallback_event() {
         let observer = std::sync::Arc::new(RecordingObserver::new());
