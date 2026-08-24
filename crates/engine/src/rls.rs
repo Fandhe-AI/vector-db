@@ -25,6 +25,18 @@
 //! 静的ポリシー＝事前フィルタ（[`PrefilterIndex`]）／動的ポリシー＝検索時フィルタ
 //! （[`SearchTimeFilter`]）の使い分け・切り替え判断は呼び出し元の責務とする
 //! （本モジュールは両方の API を提供するのみ）。
+//!
+//! **可用性面の非対称性（呼び出し元は切り替え判断時に必ず確認すること）**:
+//! [`PrefilterIndex::build`] は `ctx` の可視性述語を [`VectorArena::build_filtered`] へ
+//! 渡すため、アリーナ容量上限（`arena.rs::MAX_ARENA_ROWS`/`MAX_ARENA_TOTAL_BYTES`）の
+//! 判定は「呼び出しテナントの可視行数」基準になる。一方 [`SearchTimeFilter::build`] は
+//! 無フィルタの [`VectorArena::build`]（内部で `build_filtered(|_,_| true)`）を呼ぶため、
+//! 同じ容量上限判定が「テーブル全体（全テナント合算）の行数・バイト量」基準になる
+//! ——他テナントのデータ量が対象テナントの検索可用性へ干渉しうる、
+//! [`VectorArena::build_filtered`] のドキュメントが「以前のバグとして修正した」と記す
+//! まさにその干渉を、本フォールバック経路で再導入する形になる。「1 個のアリーナで
+//! 任意の ctx を後から評価する」という [`SearchTimeFilter`] の設計上不可避なトレード
+//! オフだが、[`PrefilterIndex`] と同一の可用性契約であるかのように扱わないこと。
 
 use std::collections::HashSet;
 
@@ -294,6 +306,13 @@ impl<'s> SearchTimeFilter<'s> {
     /// 一切評価しない（[`Self::search`] 呼び出し時に都度評価する）。
     /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
     /// security.md P0。[`PrefilterIndex::build`] と同一契約）。
+    ///
+    /// **[`PrefilterIndex::build`] と異なる可用性契約**: 本メソッドは無フィルタの
+    /// [`VectorArena::build`] を呼ぶため、アリーナ容量上限超過（`RlsError::Arena`
+    /// 経由の `ArenaError::CapacityExceeded`）の判定基準は「テーブル全体（全テナント
+    /// 合算）の行数・バイト量」になる（`PrefilterIndex::build` の「呼び出しテナントの
+    /// 可視行数」基準とは非対称）。詳細はモジュール doc「可用性面の非対称性」の項を
+    /// 参照。
     pub fn build(storage: &'s Storage, table: &str) -> Result<Self, RlsError> {
         // 世代を先に読んでからアリーナを構築する（`PrefilterIndex::build` と同じ順序。
         // アリーナ構築中に別の書き込みがコミットされても見落とさない方向）。
@@ -1338,6 +1357,62 @@ mod tests {
         let hits = filter.search(&ctx, &[1.0, 0.0], 10).expect("search ok");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
+    }
+
+    // 対象ビヘイビア: RLS-1 と RLS-3 の判別テスト（本 Issue のレビュー指摘対応）。
+    // 不可視行が可視行よりスコア上位に来て k 枠を奪う状況を作る
+    // （tenant-b の 2 行が最上位スコアを占め、ctx=tenant-a・k=2 では tenant-a の
+    // 2 行のみが正解）。「全行で top-k を選んでから可視性でフィルタする」誤実装
+    // （可視性を最後に後付けする RLS-3 違反の典型パターン）だと、上位 k 件がすべて
+    // 不可視行で埋まり最終結果が空になる。可視性判定をスコア計算前に行う正しい実装
+    // でのみ `[3, 4]` が返る。
+    #[test]
+    fn search_time_filter_visibility_is_applied_before_top_k_selection_not_after() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-b",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Public,
+            &[0.9, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            3,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            4,
+            "tenant-a",
+            Visibility::Public,
+            &[0.4, 0.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 2).expect("search ok");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, 3);
+        assert_eq!(hits[1].id, 4);
     }
 
     // fail-closed 系: k == 0 / MAX_SEARCH_K 超過は InvalidK。
