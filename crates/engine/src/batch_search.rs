@@ -368,27 +368,57 @@ fn try_reserve_exact<T>(
         .map_err(|e| BatchSearchError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }
 
-/// `BatchEngine::batch_search` の走査開始前に総積和演算数（`rows × queries
-/// × dim`）を見積もり、[`MAX_BATCH_WORK`] 超過を fail-closed に拒否する
-/// （codex P1 指摘対応: 計算量 DoS 対策）。積のオーバーフロー自体も超過と
-/// みなす。実データ（常駐行列・クエリ列）を確保せずに境界値を直接検証できる
-/// よう独立関数へ切り出す（`arena.rs::check_capacity` と同じテスト容易性の
-/// 考え方）。
-fn compute_batch_work(rows: usize, queries: usize, dim: usize) -> Result<usize, BatchSearchError> {
-    let work = rows
-        .checked_mul(queries)
+/// 1 テナント分の積和演算数（`rows × queries × dim`）を checked 演算で計算する。
+/// 積のオーバーフローは [`MAX_BATCH_WORK`] 超過とみなす（[`compute_batch_work`]
+/// 専用のヘルパー。境界値を直接検証できるよう独立関数へ切り出す）。
+fn compute_tenant_work(rows: usize, queries: usize, dim: usize) -> Result<usize, BatchSearchError> {
+    rows.checked_mul(queries)
         .and_then(|v| v.checked_mul(dim))
         .ok_or(BatchSearchError::WorkBudgetExceeded {
             work: usize::MAX,
             max: MAX_BATCH_WORK,
-        })?;
-    if work > MAX_BATCH_WORK {
-        return Err(BatchSearchError::WorkBudgetExceeded {
-            work,
-            max: MAX_BATCH_WORK,
-        });
+        })
+}
+
+/// `BatchEngine::batch_search` の走査開始前に総積和演算数を見積もり、
+/// [`MAX_BATCH_WORK`] 超過を fail-closed に拒否する（codex P1 指摘対応:
+/// 計算量 DoS 対策）。
+///
+/// `per_tenant` はテナントごとの `(行数, クエリ数)` ペア（バッチのテナント
+/// 集合と 1 対 1 対応する想定）。単純に「全一致行数 × 全クエリ数」で課金
+/// すると、複数テナントが混在するバッチで過大計上になる（codex P1 指摘対応:
+/// 実際の走査は行ごとに `PolicyContext::is_visible` を満たすクエリとしか
+/// 積和しないため、実コストはテナントごとの `行数 × クエリ数` の総和で
+/// あり、`(全行数) × (全クエリ数)` はテナント間の組み合わせも含む厳密な
+/// 上位互換ではあるが不必要に過大 — 例: tenant-a/b が各 1,000 行・各 1,000
+/// クエリの場合、実コストは `1,000 * 1,000 + 1,000 * 1,000` だが、
+/// `(全行数) × (全クエリ数)` は `2,000 * 2,000` と 2 倍に見積もる）。
+/// テナントごとの積を [`compute_tenant_work`] で個別に checked 演算し、
+/// 総和も checked 演算で合算する（積・和のどちらのオーバーフローも
+/// [`MAX_BATCH_WORK`] 超過とみなす）。実データ（常駐行列・クエリ列）を
+/// 確保せずに境界値を直接検証できるよう独立関数へ切り出す
+/// （`arena.rs::check_capacity` と同じテスト容易性の考え方）。
+fn compute_batch_work(
+    per_tenant: impl IntoIterator<Item = (usize, usize)>,
+    dim: usize,
+) -> Result<usize, BatchSearchError> {
+    let mut total: usize = 0;
+    for (rows, queries) in per_tenant {
+        let tenant_work = compute_tenant_work(rows, queries, dim)?;
+        total = total
+            .checked_add(tenant_work)
+            .ok_or(BatchSearchError::WorkBudgetExceeded {
+                work: usize::MAX,
+                max: MAX_BATCH_WORK,
+            })?;
+        if total > MAX_BATCH_WORK {
+            return Err(BatchSearchError::WorkBudgetExceeded {
+                work: total,
+                max: MAX_BATCH_WORK,
+            });
+        }
     }
-    Ok(work)
+    Ok(total)
 }
 
 /// 一括インデクシングで構築する常駐ベース行列。可視性フィルタ済みの全行を
@@ -837,15 +867,16 @@ impl BatchEngine {
     /// 使い回す。選出結果の各クエリ内順序（スコア降順・同点 id 昇順）は
     /// `TopKSelector` が保証するため、走査順序の変更による結果の変化はない。
     ///
-    /// 走査開始前に総積和演算数（`rows × queries × dim`。`rows` はバッチの
-    /// テナント集合に実際に一致する行数で、常駐行列の全行数ではない）を
-    /// [`MAX_BATCH_WORK`] と照合する（codex P1 指摘対応: 計算量 DoS 対策。
-    /// `sum(k)` の上限（[`MAX_BATCH_TOTAL_K`]）を満たしていても、走査対象の
-    /// 行を最大クエリ数で走査させられてしまうため、独立に上限を課す。
-    /// Cursor Medium 指摘対応: 課金対象を常駐行列の全行数にすると、バッチが
-    /// ごく一部のテナントしか触れない場合でも過大に見積もり、実際には走査
-    /// しない行分まで `WorkBudgetExceeded` の原因になってしまうため、実走査
-    /// 対象の行数に揃える）。
+    /// 走査開始前に総積和演算数を [`MAX_BATCH_WORK`] と照合する（codex P1
+    /// 指摘対応: 計算量 DoS 対策。`sum(k)` の上限（[`MAX_BATCH_TOTAL_K`]）を
+    /// 満たしていても、走査対象の行を最大クエリ数で走査させられてしまうため、
+    /// 独立に上限を課す）。課金はテナントごとの `行数 × クエリ数 × dim` の
+    /// 総和で行う（Cursor Medium 指摘対応: 常駐行列の全行数を課金すると、
+    /// バッチがごく一部のテナントしか触れない場合でも過大に見積もる。
+    /// codex P1 追加指摘対応: 「全一致行数 × 全クエリ数」も、複数テナントが
+    /// 混在するバッチでは実際に走査しないテナント間の組み合わせまで課金
+    /// してしまい過大計上になる。[`compute_batch_work`] のドキュメンテーション
+    /// コメント参照）。
     pub fn batch_search(
         &self,
         queries: &[BatchQuery<'_>],
@@ -911,27 +942,63 @@ impl BatchEngine {
             batch_tenants.insert(q.ctx.tenant_id());
         }
 
-        // バッチのテナント集合に一致する行数（走査時に実際にデコード対象と
-        // なる行数。下記の行外側ループが `batch_tenants.contains(row_tenant)`
-        // で除外する行は最初からデコードされない）。この数え上げ自体は
-        // O(rows) の線形走査で、[`MAX_BATCH_ROWS`] により上限が課されている
-        // ため、走査本体（O(rows * dim) のデコード + O(rows * queries) の
-        // マスク判定）よりも十分軽量である。
-        let matching_row_count = self
-            .matrix
-            .tenant_ids
-            .iter()
-            .filter(|tenant| batch_tenants.contains(tenant.as_str()))
-            .count();
+        // テナントごとのクエリ件数（codex P1 指摘対応: 計算量ガードを
+        // テナント単位で精緻化するため。集合サイズはバッチのテナント集合と
+        // 同じ上限に従うため `try_reserve` の予約量は `batch_tenants.len()`
+        // で十分）。
+        let mut tenant_query_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        tenant_query_counts
+            .try_reserve(batch_tenants.len())
+            .map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve tenant query counts: {e}"
+                ))
+            })?;
+        for q in queries {
+            let count = tenant_query_counts.entry(q.ctx.tenant_id()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
 
-        // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応）。
-        // 個別クエリの入力エラー（次元不一致・非有限値・k 範囲外）を上の
-        // 1 巡目で先に確定させた上で、実際に走査対象となる行数
-        // （`matching_row_count`。常駐行列の全行数ではない）・次元・クエリ件数
-        // から求まる総積和演算数を走査（選出器確保・行デコード）開始前に
-        // 確定的に拒否する。常駐行列の全行数を課金すると、バッチが一部の
-        // テナントしか触れない場合でも過大に見積もられ、誤って拒否しうる。
-        compute_batch_work(matching_row_count, queries.len(), self.matrix.dim())?;
+        // テナントごとの一致行数（走査時に実際にデコード対象となる行数。
+        // 下記の行外側ループが `batch_tenants.contains(row_tenant)` で除外する
+        // 行は最初からデコードされない）。この数え上げ自体は O(rows) の線形
+        // 走査で、[`MAX_BATCH_ROWS`] により上限が課されているため、走査本体
+        // （O(rows * dim) のデコード + O(rows * queries) のマスク判定）よりも
+        // 十分軽量である。
+        let mut tenant_row_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        tenant_row_counts
+            .try_reserve(batch_tenants.len())
+            .map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve tenant row counts: {e}"
+                ))
+            })?;
+        for tenant in self.matrix.tenant_ids.iter() {
+            if batch_tenants.contains(tenant.as_str()) {
+                let count = tenant_row_counts.entry(tenant.as_str()).or_insert(0);
+                *count = count.saturating_add(1);
+            }
+        }
+        // `id_to_tenant` のフォールブル予約量として使う（テナントごとの
+        // 一致行数の総和 = バッチのテナント集合に一致する行数の総和）。
+        let matching_row_count: usize = tenant_row_counts.values().sum();
+
+        // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応・
+        // codex P1 追加指摘対応）。個別クエリの入力エラー（次元不一致・
+        // 非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、実際に走査
+        // されるテナントごとの (行数, クエリ数) の積を合算した総積和演算数を
+        // 走査（選出器確保・行デコード）開始前に確定的に拒否する。「全一致
+        // 行数 × 全クエリ数」で一括課金すると、複数テナントが混在するバッチ
+        // では実コストより過大に見積もり、正当な入力を誤って拒否しうる
+        // （`compute_batch_work` のドキュメンテーションコメント参照）。
+        let work_pairs = batch_tenants.iter().map(|&tenant| {
+            let rows = tenant_row_counts.get(tenant).copied().unwrap_or(0);
+            let tenant_queries = tenant_query_counts.get(tenant).copied().unwrap_or(0);
+            (rows, tenant_queries)
+        });
+        compute_batch_work(work_pairs, self.matrix.dim())?;
 
         // 事前検証パス（2 巡目）: `sum(k)` の上限検証を通過した後、選出器
         // コンテナ（`Vec<TopKSelector>`）をフォールブルに確保し、各選出器の
@@ -1785,7 +1852,7 @@ mod tests {
     // 直接テストと同じ考え方）。
     #[test]
     fn compute_batch_work_rejects_over_limit() {
-        let err = compute_batch_work(1_000, MAX_BATCH_QUERIES, MAX_BATCH_DIM).unwrap_err();
+        let err = compute_batch_work([(1_000, MAX_BATCH_QUERIES)], MAX_BATCH_DIM).unwrap_err();
         match err {
             BatchSearchError::WorkBudgetExceeded { work, max } => {
                 assert_eq!(max, MAX_BATCH_WORK);
@@ -1800,12 +1867,12 @@ mod tests {
     // 検出用。過大側のみのテストでは `>` と `>=` の取り違えを検出できない）。
     #[test]
     fn compute_batch_work_accepts_exactly_at_limit() {
-        // 1,000,000 * 100 * 100 = MAX_BATCH_WORK(10^10) ちょうど。
+        // 1,000,000 * 100 * 100 = MAX_BATCH_WORK(10^10) ちょうど（単一テナント）。
         let rows = 1_000_000usize;
         let queries = 100usize;
         let dim = 100usize;
         assert_eq!(rows * queries * dim, MAX_BATCH_WORK);
-        let work = compute_batch_work(rows, queries, dim).expect("work at the limit must pass");
+        let work = compute_batch_work([(rows, queries)], dim).expect("work at the limit must pass");
         assert_eq!(work, MAX_BATCH_WORK);
     }
 
@@ -1814,7 +1881,7 @@ mod tests {
     // （coding-rust.md「整数演算は checked_*/saturating_* を使う」準拠）。
     #[test]
     fn compute_batch_work_does_not_overflow_on_huge_inputs() {
-        let err = compute_batch_work(usize::MAX, usize::MAX, usize::MAX).unwrap_err();
+        let err = compute_batch_work([(usize::MAX, usize::MAX)], usize::MAX).unwrap_err();
         assert_eq!(
             err,
             BatchSearchError::WorkBudgetExceeded {
@@ -1822,6 +1889,53 @@ mod tests {
                 max: MAX_BATCH_WORK,
             }
         );
+    }
+
+    // codex P1 指摘対応: テナントごとの積の合算（総和）自体が `usize` を
+    // オーバーフローする場合も panic せず `WorkBudgetExceeded` を返すことを
+    // 確認する（`compute_tenant_work` 単体の overflow 検出だけでは
+    // `compute_batch_work` 内の合算 `checked_add` の回帰を検出できないため）。
+    // 1 つ目のテナントは上限内に収まる小さな work（`total` が早期リターン
+    // されない）を持たせ、2 つ目のテナントは単体では overflow しない
+    // （`rows * queries * dim` が `usize::MAX` に収まる）が、既存の `total`
+    // への加算では `usize::MAX` を超えるように選ぶ。
+    #[test]
+    fn compute_batch_work_does_not_overflow_when_per_tenant_sum_overflows() {
+        let per_tenant = [(1usize, 1usize), (usize::MAX, 1usize)];
+        let err = compute_batch_work(per_tenant, 1).unwrap_err();
+        assert_eq!(
+            err,
+            BatchSearchError::WorkBudgetExceeded {
+                work: usize::MAX,
+                max: MAX_BATCH_WORK,
+            }
+        );
+    }
+
+    // codex P1 追加指摘対応: レビューで指摘された具体例（tenant-a/b が各
+    // 1,000 行、バッチ全体で合計 1,000 クエリ（tenant-a/b に 500 件ずつ）、
+    // dim=8,192）を直接検証する。「全一致行数（2,000）× 全クエリ数
+    // （1,000）」で一括課金すると 2,000 * 1,000 * 8,192 ≈ 1.6384 × 10^10 で
+    // `MAX_BATCH_WORK`（10^10）を超過し、正当な入力を誤って拒否してしまう
+    // （＝今回のバグ）。テナントごとの正しい課金
+    // `1,000 * 500 * 8,192 + 1,000 * 500 * 8,192` = 8.192 × 10^9 は
+    // `MAX_BATCH_WORK` の範囲内であり、受理されるべきことを確認する。
+    #[test]
+    fn compute_batch_work_matches_codex_review_example() {
+        let dim = 8_192usize;
+        let per_tenant = [(1_000usize, 500usize), (1_000usize, 500usize)];
+
+        // 誤った「全一致行数 × 全クエリ数」の一括課金は超過することを前提として
+        // 明示する（この誤った計算式が起こす過大計上こそが今回のバグ）。
+        let naive_total_rows = 2_000usize;
+        let naive_total_queries = 1_000usize;
+        assert!(naive_total_rows * naive_total_queries * dim > MAX_BATCH_WORK);
+
+        // テナントごとの正しい課金は上限内で受理される。
+        let work = compute_batch_work(per_tenant, dim)
+            .expect("per-tenant work budget must accept the codex review example");
+        assert_eq!(work, 1_000 * 500 * dim * 2);
+        assert!(work <= MAX_BATCH_WORK);
     }
 
     // codex P1 指摘対応: `batch_search` 経由でも計算量ガードが実際に効くことを
@@ -1892,9 +2006,11 @@ mod tests {
         // MAX_BATCH_DIM は MAX_BATCH_WORK を超過する（上の
         // `batch_search_rejects_work_budget_over_limit` と同一規模）ことを
         // 前提として明示する。
-        assert!(compute_batch_work(rows, MAX_BATCH_QUERIES, dim).is_err());
-        // tenant-a の行数だけで課金すれば上限内であることも前提として明示する。
-        assert!(compute_batch_work(tenant_a_rows, MAX_BATCH_QUERIES, dim).is_ok());
+        assert!(compute_batch_work([(rows, MAX_BATCH_QUERIES)], dim).is_err());
+        // tenant-a の行数だけで課金すれば上限内であることも前提として明示する
+        // （本テストのバッチは tenant-a のみを検索するため、テナントごとの
+        // 課金でも単一テナント分＝この値と一致する）。
+        assert!(compute_batch_work([(tenant_a_rows, MAX_BATCH_QUERIES)], dim).is_ok());
 
         let query_vec: Vec<f32> = std::iter::repeat_n(0.0f32, dim).collect();
         let ctx_a = ctx("tenant-a");
