@@ -220,6 +220,18 @@ else
 endif
 
 # --------------------------------------------------
+# リランキング効果測定 Recall 閾値ゲート（TASK-108。crates/engine/tests/rerank_recall.rs 層 B）
+# --------------------------------------------------
+
+.PHONY: rerank-regression
+rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test rerank_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため rerank-regression をスキップ"
+endif
+
+# --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
 
