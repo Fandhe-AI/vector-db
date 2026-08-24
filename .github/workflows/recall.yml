@@ -9,6 +9,11 @@ name: Recall
 # （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
 # 方針）。
 #
+# TASK-108（リランキング効果測定・対象ビヘイビア: SEARCH-7）の層 B
+# （`crates/engine/tests/rerank_recall.rs`。`make rerank-regression` 経由）も
+# 同一 job（`recall-regression`）・同一 environment（`recall-gate`）から実行する
+# （検証設計・実測経緯は `docs/design/rerank-recall-regression.md` 参照）。
+#
 # `schedule` トリガは意図的に外している（`workflow_dispatch` のみ。`bench.yml` の
 # `BENCH_CORE5` 未接続時と同型の判断。PR #147 codex-review P1 継続指摘対応）。
 # `HYBRID_RECALL_MIN_*` を environment `recall-gate` の variables として設定・
@@ -140,3 +145,25 @@ jobs:
           HYBRID_RECALL_MIN_R20_LARGE: ${{ vars.HYBRID_RECALL_MIN_R20_LARGE }}
           HYBRID_RECALL_MIN_R100_LARGE: ${{ vars.HYBRID_RECALL_MIN_R100_LARGE }}
         run: make recall-regression
+      - name: Run rerank-regression
+        # TASK-108（SEARCH-7）の層 B（`crates/engine/tests/rerank_recall.rs`）。
+        # 数値基準（リランキング後の Recall@20 絶対下限・baseline からの改善幅の
+        # 下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
+        # `Run recall-regression` step と同じ environment `recall-gate`
+        # （job の `environment:` 参照）の Actions variables から注入する。
+        #
+        # `RERANK_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント参照）を
+        # 常に注入する: `RERANK_RECALL_MIN_*` が未設定の場合、この workflow からの
+        # 実行では fail-closed でテスト失敗とし、「一度も評価していない run」を
+        # green にしない。ローカルの `make rerank-regression` にはこのフラグを
+        # 注入しないため、そちらは未設定を「対象外」として成功終了する opt-in
+        # 挙動を維持する（`crates/engine/tests/rerank_recall.rs::
+        # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログには
+        # 実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
+        # 出力しない。
+        env:
+          RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
+          RERANK_RECALL_MIN_R20_LARGE: ${{ vars.RERANK_RECALL_MIN_R20_LARGE }}
+          RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ vars.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
+        run: make rerank-regression

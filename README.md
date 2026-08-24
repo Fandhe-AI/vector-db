@@ -92,6 +92,17 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 
 **閾値 variables は repo レベルではなく Environment `recall-gate` に置きます**: `workflow_dispatch` は本来任意の ref を選んで起動でき、選択した ref の workflow YAML がそのまま実行されます。そのため `if: github.ref == 'refs/heads/main'`・`checkout ref: main` のような YAML 内の条件だけでは実行境界になりません——write 権限者が別ブランチでこのガードを外した `recall.yml` を push して `workflow_dispatch` すれば、そのブランチの YAML が実行されてしまうためです。加えて repo レベルの Actions variables はどのブランチのどの workflow からも参照できるため、YAML 内の条件式では閾値の参照そのものを防げません。そこで閾値は repo レベルではなく Environment `recall-gate`（deployment branch policy で `main` のみに制限）の variables として設定し、`recall-regression` job に `environment: recall-gate` を指定します。main 以外の ref から起動した run は environment `recall-gate` にアクセスできないため、別ブランチの改変 YAML から `if`／`checkout ref` を外して `workflow_dispatch` したとしても閾値を取得できません。`if: github.ref == 'refs/heads/main'`・`checkout ref: main` は environment 保護に対する defense-in-depth として維持しています。
 
+### リランキング効果測定 Recall 閾値ゲートの repo variables（TASK-108）
+
+`.github/workflows/recall.yml` の同一 `recall-regression` job は、上記に続けて `crates/engine/tests/rerank_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）も `make rerank-regression` 経由で実行し、`RERANK_RECALL_MIN_R20_LARGE`（リランキング後の最終 Recall@20 の絶対下限）・`RERANK_RECALL_MIN_R20_IMPROVEMENT`（baseline＝リランキングなしからの改善幅の下限）を同じ Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。設計・実測経緯は `docs/design/rerank-recall-regression.md` を参照してください。Environment `recall-gate` は上記手順ですでに作成済みのため、追加で行うのは variables の設定のみです。
+
+```bash
+gh variable set RERANK_RECALL_MIN_R20_LARGE --env recall-gate
+gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
+```
+
+挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo variables」と同一です。ローカルの `make rerank-regression`（`RERANK_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`RERANK_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。
