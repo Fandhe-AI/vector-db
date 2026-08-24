@@ -49,6 +49,13 @@ const MAX_QUERY_TEXT_BYTES: usize = 16 * 1024;
 /// 上限で、互いに独立な検証のため両方が必要）。
 const MAX_CANDIDATE_TEXT_BYTES: usize = 1024 * 1024;
 
+/// 候補テキスト（`RerankCandidate::text`）の合計バイト長上限。`sparse.rs::MAX_CORPUS_BYTES`
+/// と同じ理由: [`MAX_CANDIDATE_TEXT_BYTES`]（1 件あたり）・[`MAX_POOL_DEPTH`]（件数）は
+/// それぞれ独立な上限のため、両方の上限値ちょうどの入力（1 MiB × 10,000 件 ≈ 10 GiB）を
+/// 同時に許すと `tokenize()` の総コストが無制限に近い規模へ増幅しうる（CPU DoS）。
+/// `sparse.rs` の値をそのまま踏襲する。
+const MAX_TOTAL_CANDIDATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
+
 /// リランク対象の候補 1 件（[`crate::hybrid::HybridHit`] から融合スコアと文書テキストを
 /// 添えて渡す入力表現）。`text` はリランカーの素性計算専用であり、SQL・プラン文字列の
 /// 組み立てには使わない（coding-rust.md「untrusted 入力の扱い」）。
@@ -161,6 +168,12 @@ pub enum RerankError {
     /// 不要）で判定し fail-closed に拒否する（`sparse.rs::SparseError::DocTooLong` と
     /// 同じ理由）。
     CandidateTextTooLong { id: u64, len: usize, max: usize },
+    /// 候補テキスト（`RerankCandidate::text`）の合計バイト長が
+    /// [`MAX_TOTAL_CANDIDATE_TEXT_BYTES`] を超える。`reranker.rerank()`
+    /// （`tokenize()` を候補ごとに呼びうる）を呼ぶ前に `checked_add` による累計で
+    /// 判定し fail-closed に拒否する（`sparse.rs::SparseError::CorpusTooLarge` と
+    /// 同じ理由: 候補ごとの上限だけでは合計コストが無制限に増幅しうる）。
+    TotalCandidateTextTooLong { total: usize, max: usize },
 }
 
 impl fmt::Display for RerankError {
@@ -198,6 +211,10 @@ impl fmt::Display for RerankError {
             RerankError::CandidateTextTooLong { id, len, max } => write!(
                 f,
                 "rerank candidate text too long: id={id} {len} bytes (max {max})"
+            ),
+            RerankError::TotalCandidateTextTooLong { total, max } => write!(
+                f,
+                "rerank candidate text total too long: {total} bytes (max {max})"
             ),
         }
     }
@@ -242,6 +259,60 @@ fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
     true
 }
 
+/// `query_text`・`candidates` のバイト長検証ヘルパ（[`MAX_QUERY_TEXT_BYTES`]・
+/// [`MAX_CANDIDATE_TEXT_BYTES`]・[`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]）。[`rerank_candidates`]
+/// だけでなく [`LexicalOverlapReranker::rerank`] からも直接呼ぶ（公開 trait
+/// [`Reranker`] は `rerank_candidates` を経由せず直接呼び出すことも型上できてしまうため、
+/// `rerank_candidates` の入口検証だけでは trait 実装を直接呼ぶ経路で未検証の巨大な
+/// テキストがそのまま `tokenize()` へ渡りうる。`tokenize()` を呼ぶ実装自身がこの
+/// 検証を内部で行うことで、迂回できない構造にする）。件数は呼び出し元
+/// （[`rerank_candidates`] の `TooManyCandidates` 検証、または [`MAX_POOL_DEPTH`] 自体）で
+/// 別途上限があるため、ここでの走査コスト自体は有界。
+fn validate_text_lengths(
+    query_text: &str,
+    candidates: &[RerankCandidate<'_>],
+) -> Result<(), RerankError> {
+    if query_text.len() > MAX_QUERY_TEXT_BYTES {
+        return Err(RerankError::QueryTextTooLong {
+            len: query_text.len(),
+            max: MAX_QUERY_TEXT_BYTES,
+        });
+    }
+
+    if let Some(c) = candidates
+        .iter()
+        .find(|c| c.text.len() > MAX_CANDIDATE_TEXT_BYTES)
+    {
+        return Err(RerankError::CandidateTextTooLong {
+            id: c.id,
+            len: c.text.len(),
+            max: MAX_CANDIDATE_TEXT_BYTES,
+        });
+    }
+
+    // 候補ごとの上限だけでは合計コストが無制限に増幅しうるため（[`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]
+    // のコメント参照）、`checked_add` で合計を求めて検証する。`usize` オーバーフローは
+    // 未定義動作にせず、オーバーフローした時点で fail-closed に拒否する
+    // （coding-rust.md「整数演算は checked_* / saturating_* を使う」）。
+    let mut total: usize = 0;
+    for c in candidates {
+        total = total
+            .checked_add(c.text.len())
+            .ok_or(RerankError::TotalCandidateTextTooLong {
+                total: usize::MAX,
+                max: MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+            })?;
+        if total > MAX_TOTAL_CANDIDATE_TEXT_BYTES {
+            return Err(RerankError::TotalCandidateTextTooLong {
+                total,
+                max: MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// [`rerank_candidates`] の入力検証ヘルパ。`ids` の列に同一 id が複数回出現するかを
 /// 判定する（`hybrid.rs::has_duplicate_id` と同じロジック）。
 fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
@@ -261,14 +332,19 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
 /// （[`RerankError::TooManyCandidates`]）・`query_text` のバイト長 ≤
 /// [`MAX_QUERY_TEXT_BYTES`]（[`RerankError::QueryTextTooLong`]）・候補ごとのテキストの
 /// バイト長 ≤ [`MAX_CANDIDATE_TEXT_BYTES`]（[`RerankError::CandidateTextTooLong`]）・
-/// スコア有限性（[`RerankError::NonFiniteScore`]）・融合スコア降順同点 id 昇順
+/// 候補テキスト合計のバイト長 ≤ [`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]
+/// （[`RerankError::TotalCandidateTextTooLong`]）・スコア有限性
+/// （[`RerankError::NonFiniteScore`]）・融合スコア降順同点 id 昇順
 /// （[`RerankError::UnsortedInput`]）・id 重複なし（[`RerankError::DuplicateId`]）の順に
 /// 検証する（`hybrid.rs::rrf_fuse` と同じ検証順序: 長さ→有限性→順序→重複。長さを最初に
 /// 検証してから初めて残りの走査を許すのは coding-rust.md「長さフィールドは上限検証して
 /// からアロケーションに使う」に従う。`query_text`・候補テキストの長さ検証は
-/// `reranker.rerank()`（[`LexicalOverlapReranker`] 等の実装が `tokenize()` へ渡す）を
-/// 呼ぶ前に行い、`sparse.rs::MAX_QUERY_BYTES`・`MAX_DOC_BYTES` と同じ理由で無制限な
-/// アロケーション・走査コストの増幅を防ぐ）。
+/// [`validate_text_lengths`] を通じて `reranker.rerank()`（[`LexicalOverlapReranker`] 等の
+/// 実装が `tokenize()` へ渡す）を呼ぶ前に行い、`sparse.rs::MAX_QUERY_BYTES`・
+/// `MAX_DOC_BYTES`・`MAX_CORPUS_BYTES` と同じ理由で無制限なアロケーション・走査コストの
+/// 増幅を防ぐ。[`Reranker`] は公開 trait のためこの `rerank_candidates` を経由しない
+/// 直接呼び出しも型上ありうる。そのため同じ検証を [`LexicalOverlapReranker::rerank`]
+/// 自身も内部で行い、直接呼び出しでも迂回できない構造にしている）。
 ///
 /// `final_k` は `1..=cfg.pool_depth()` を検証し、`0` または超過は [`RerankError::InvalidK`]
 /// （`hybrid.rs::hybrid_search` が `k` を `cfg.pool_depth()` 基準で検証するのと同じ理由:
@@ -304,30 +380,12 @@ pub fn rerank_candidates(
         });
     }
 
-    // `query_text` のバイト長を `reranker.rerank()` を呼ぶ（実装が `tokenize()` へ渡し
-    // `String`・`BTreeSet` を確保しうる）前に検証する（`sparse.rs::SparseError::QueryTooLong`
-    // と同じ理由: `query_text.len()` はアロケーションを伴わない）。
-    if query_text.len() > MAX_QUERY_TEXT_BYTES {
-        return Err(RerankError::QueryTextTooLong {
-            len: query_text.len(),
-            max: MAX_QUERY_TEXT_BYTES,
-        });
-    }
-
-    // 候補ごとのテキストのバイト長も同じ理由で `reranker.rerank()` を呼ぶ前に検証する
-    // （`sparse.rs::SparseError::DocTooLong` と同じ理由）。候補件数は直前の
+    // `query_text`・候補ごとのテキスト・候補テキスト合計のバイト長を `reranker.rerank()`
+    // を呼ぶ（実装が `tokenize()` へ渡し `String`・`BTreeSet` を確保しうる）前に検証する
+    // （[`validate_text_lengths`] のドキュメント参照。候補件数は直前の
     // `TooManyCandidates` 検証により `cfg.pool_depth()`（`MAX_POOL_DEPTH` 以下）に
-    // 収まっているため、この走査コスト自体は有界。
-    if let Some(c) = candidates
-        .iter()
-        .find(|c| c.text.len() > MAX_CANDIDATE_TEXT_BYTES)
-    {
-        return Err(RerankError::CandidateTextTooLong {
-            id: c.id,
-            len: c.text.len(),
-            max: MAX_CANDIDATE_TEXT_BYTES,
-        });
-    }
+    // 収まっているため、この走査コスト自体は有界）。
+    validate_text_lengths(query_text, candidates)?;
 
     // スコアの有限性を順序検証より先に確認する（`hybrid.rs::rrf_fuse` と同じ理由:
     // `f64::total_cmp` は NaN にもビットパターン依存の全順序を与えるため、有限性を
@@ -462,6 +520,15 @@ impl Reranker for LexicalOverlapReranker {
         candidates: &[RerankCandidate<'_>],
         final_k: usize,
     ) -> Result<Vec<RerankedHit>, RerankError> {
+        // [`Reranker`] は公開 trait のため、[`rerank_candidates`] を経由せずこの
+        // `rerank()` を直接呼び出す経路が型上ありうる（`rerank_candidates` の入口検証は
+        // 迂回可能）。`tokenize()`（`String`・`BTreeSet` を確保する）を呼ぶ前に、
+        // この実装自身でも [`validate_text_lengths`] により長さを検証し、未検証の
+        // 巨大な `query_text`・候補テキストがそのまま `tokenize()` へ渡る経路を構造的に
+        // 防ぐ（`rerank_candidates` 経由の呼び出しでは二重検証になるが、コストは
+        // 候補件数に対して線形かつ [`MAX_POOL_DEPTH`] で有界なため許容する）。
+        validate_text_lengths(query_text, candidates)?;
+
         // クエリ側トークンは候補ごとの重なり計算で使い回すため一度だけ計算する。
         let query_tokens: std::collections::BTreeSet<String> =
             tokenize(query_text).into_iter().collect();
@@ -714,6 +781,82 @@ mod tests {
         let candidates = [cand(1, 1.0, boundary_text.as_str())];
         let hits = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).expect("ok");
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn rerank_candidates_accepts_total_candidate_text_at_max_bytes_boundary() {
+        // MAX_CANDIDATE_TEXT_BYTES 上限の候補を MAX_TOTAL_CANDIDATE_TEXT_BYTES ちょうどに
+        // なる件数だけ並べても受理される（境界値。整数演算は各要素が上限一杯でも
+        // オーバーフローしないことも合わせて確認する）。
+        let doc_count = MAX_TOTAL_CANDIDATE_TEXT_BYTES / MAX_CANDIDATE_TEXT_BYTES;
+        let cfg = RerankConfig::new(doc_count, 1).unwrap();
+        let text = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        let candidates: Vec<RerankCandidate<'_>> = (0..doc_count as u64)
+            .map(|i| cand(i, (doc_count - i as usize) as f64, text.as_str()))
+            .collect();
+        let hits = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).expect("ok");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn rerank_candidates_rejects_total_candidate_text_exceeding_max_bytes() {
+        // 候補 1 件あたりは MAX_CANDIDATE_TEXT_BYTES 以内でも、合計が
+        // MAX_TOTAL_CANDIDATE_TEXT_BYTES を超えれば拒否する（sparse.rs::CorpusTooLarge
+        // 相当。1 件あたりの上限のみでは合計コストが無制限に増幅しうるため）。
+        let doc_count = MAX_TOTAL_CANDIDATE_TEXT_BYTES / MAX_CANDIDATE_TEXT_BYTES;
+        let cfg = RerankConfig::new(doc_count + 1, 1).unwrap();
+        let text = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        let mut candidates: Vec<RerankCandidate<'_>> = (0..doc_count as u64)
+            .map(|i| cand(i, (doc_count - i as usize) as f64, text.as_str()))
+            .collect();
+        // 合計をちょうど MAX_TOTAL_CANDIDATE_TEXT_BYTES + 1 バイトにする 1 バイト候補を
+        // 融合スコア最小として追加する。
+        candidates.push(cand(doc_count as u64, -1.0, "a"));
+        let err = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::TotalCandidateTextTooLong {
+                total: MAX_TOTAL_CANDIDATE_TEXT_BYTES + 1,
+                max: MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_oversized_query_text() {
+        // codex-review P1 指摘対応: 公開 trait Reranker::rerank を rerank_candidates を
+        // 経由せず直接呼び出しても、実装内部の validate_text_lengths 呼び出しにより
+        // MAX_QUERY_TEXT_BYTES 検証が迂回されないことを確認する。
+        let reranker = LexicalOverlapReranker::default();
+        let oversized_query = "a".repeat(MAX_QUERY_TEXT_BYTES + 1);
+        let candidates = [cand(1, 1.0, "a")];
+        let err = reranker
+            .rerank(&oversized_query, &candidates, 1)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::QueryTextTooLong {
+                len: MAX_QUERY_TEXT_BYTES + 1,
+                max: MAX_QUERY_TEXT_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_oversized_candidate_text() {
+        // 同上（候補テキスト側）。tokenize() が呼ばれる前に拒否されることを確認する。
+        let reranker = LexicalOverlapReranker::default();
+        let oversized_text = "a".repeat(MAX_CANDIDATE_TEXT_BYTES + 1);
+        let candidates = [cand(1, 1.0, oversized_text.as_str())];
+        let err = reranker.rerank("q", &candidates, 1).unwrap_err();
+        assert_eq!(
+            err,
+            RerankError::CandidateTextTooLong {
+                id: 1,
+                len: MAX_CANDIDATE_TEXT_BYTES + 1,
+                max: MAX_CANDIDATE_TEXT_BYTES,
+            }
+        );
     }
 
     #[test]
