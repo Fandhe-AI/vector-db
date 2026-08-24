@@ -613,27 +613,35 @@ def _extract_message_text(response: dict[str, Any]) -> str:
 
 
 def _parse_score_label(text: str, correct_token: str, incorrect_token: str) -> tuple[str, str]:
-    """採点出力を厳格パースする。この呼び出し専用に生成された不透明トークン
-    （correct_token / incorrect_token）が先頭行に含まれるかどうかのみで判定する。
+    """採点出力を厳格パースする。strip 済み先頭行がこの呼び出し専用に生成された
+    不透明トークン（correct_token / incorrect_token）に完全一致する場合のみ判定する。
 
     固定ラベル語（"CORRECT" 等）ではなくランダムトークンの厳格一致で判定することが
-    score_answer() の第二防御層の要（_generate_verdict_tokens() のコメント参照）。
-    トークンは呼び出しごとの乱数のため、先頭行にそのトークンが現れること自体が
-    「grader がこの呼び出しの指示に従って出力した」ことの証明になる（untrusted
-    フィールド側から事前に埋め込むことはできない）。両トークンが同時に現れる曖昧な
-    出力・どちらのトークンも含まない出力（固定ラベル語のみ・空文字・想定外形式等）は
+    score_answer() の第二防御層の要（_generate_verdict_tokens() のコメント参照。
+    untrusted フィールド側は値を知り得ず事前に埋め込めない）。判定は 2 段階:
+
+    1. 曖昧性チェック（先行・応答全体）: 両トークンが応答のどこかに同時に出現する
+       場合は UNKNOWN。system 指示のテンプレート（correct 行・incorrect 行の並記）を
+       そのまま echo した混乱応答を、先頭行だけ見て CORRECT に計上しない。
+    2. 完全一致チェック（先頭行）: strip 済み先頭行がトークンと完全一致（==）した
+       場合のみ CORRECT / INCORRECT へ写像する。前後に任意文字を伴う部分一致
+       （規約違反出力）は受理しない。
+
+    どちらにも該当しない出力（固定ラベル語のみ・空文字・前後装飾付き・想定外形式等）は
     fail-closed で UNKNOWN（不正解側）として返し、正答率の分子には計上しない。
     """
     if not text or not text.strip():
         return LABEL_UNKNOWN, "empty response from grader"
 
-    first_line = text.strip().splitlines()[0].strip()
-    has_correct = correct_token in first_line
-    has_incorrect = incorrect_token in first_line
-    if has_correct and not has_incorrect:
-        return LABEL_CORRECT, first_line[:200]
-    if has_incorrect and not has_correct:
-        return LABEL_INCORRECT, first_line[:200]
+    stripped = text.strip()
+    if correct_token in stripped and incorrect_token in stripped:
+        return LABEL_UNKNOWN, "ambiguous grader output: both verdict tokens present"
+
+    first_line = stripped.splitlines()[0].strip()
+    if first_line == correct_token:
+        return LABEL_CORRECT, first_line
+    if first_line == incorrect_token:
+        return LABEL_INCORRECT, first_line
     return LABEL_UNKNOWN, f"unparseable grader output: {first_line[:200]!r}"
 
 

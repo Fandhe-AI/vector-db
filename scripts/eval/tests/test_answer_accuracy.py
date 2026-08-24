@@ -275,9 +275,36 @@ class ParseScoreLabelTest(unittest.TestCase):
         label, _ = self._parse(self.incorrect_token)
         self.assertEqual(label, aa.LABEL_INCORRECT)
 
-    def test_token_with_surrounding_text_on_first_line_parsed(self):
-        label, _ = self._parse(f"Verdict: {self.correct_token}.")
+    def test_token_with_leading_trailing_whitespace_parsed(self):
+        # strip で除去される前後空白のみ許容する（完全一致判定の範囲内）。
+        label, _ = self._parse(f"  {self.correct_token}  \n")
         self.assertEqual(label, aa.LABEL_CORRECT)
+
+    def test_token_with_surrounding_text_is_unknown(self):
+        # 前後に任意文字を伴う部分一致（規約違反出力）は受理しない（完全一致のみ）。
+        label, _ = self._parse(f"Verdict: {self.correct_token}.")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+    def test_token_with_trailing_text_is_unknown(self):
+        label, _ = self._parse(f"{self.correct_token} です")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+
+    def test_two_line_template_echo_is_unknown(self):
+        # system 指示のテンプレート（correct 行→incorrect 行）をそのまま echo した
+        # 混乱応答を、先頭行のみの検査で CORRECT に計上しない（応答全体の曖昧性チェック）。
+        echoed = (
+            f"- If the candidate answer is correct: {self.correct_token}\n"
+            f"- If the candidate answer is incorrect: {self.incorrect_token}"
+        )
+        label, reason = self._parse(echoed)
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
+        self.assertIn("ambiguous", reason)
+
+    def test_both_tokens_across_lines_is_unknown(self):
+        # 先頭行が correct トークン単独でも、後続行に incorrect トークンが現れる
+        # 曖昧応答は正答側に倒さない。
+        label, _ = self._parse(f"{self.correct_token}\n{self.incorrect_token}")
+        self.assertEqual(label, aa.LABEL_UNKNOWN)
 
     def test_fixed_correct_label_is_unknown_fail_closed(self):
         # 攻撃側が事前に知り得る固定文字列 "CORRECT" では正答判定に到達できない
