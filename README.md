@@ -46,6 +46,17 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 
 ターゲット一覧は `make help` で確認できます。
 
+### 回帰ベンチの repo variables（TASK-127）
+
+`.github/workflows/bench.yml`（週次 schedule + `workflow_dispatch`）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）と `BENCH_MIN_RECALL`（Recall@k 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+
+```bash
+gh variable set BENCH_MAX_P95_MS
+gh variable set BENCH_MIN_RECALL
+```
+
+未設定のまま schedule/`workflow_dispatch` を実行すると `crates/engine/benches/simd_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+
 ## ライセンス
 
 MIT OR Apache-2.0 のデュアルライセンスです（[LICENSE-MIT](./LICENSE-MIT) / [LICENSE-APACHE](./LICENSE-APACHE)）。
