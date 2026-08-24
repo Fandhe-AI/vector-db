@@ -33,6 +33,29 @@ name: Recall
 # main ブランチでの実行にのみ限定し、`actions/checkout` の対象も dispatch 側の
 # ref 選択に依存させず `ref: main` で固定する。他 ref を選んで `workflow_dispatch`
 # を起動した場合は job がスキップされる。
+#
+# ただし上記の `if`／`checkout ref: main` は本 workflow YAML 自体に書かれた条件であり、
+# write 権限者が別ブランチでこのガードを外した recall.yml を push して
+# `workflow_dispatch` すれば、選択した ref の YAML がそのまま実行される
+# （workflow_dispatch は選択 ref の workflow 定義を使う）。加えて repo レベルの
+# Actions variables（`vars.*`）はどのブランチのどの workflow からも読めるため、
+# YAML 内の if 条件だけでは `HYBRID_RECALL_MIN_*` の参照を防げない
+# （Cursor Bugbot High 指摘）。
+#
+# そのため実行境界は YAML の条件式ではなく GitHub Environments のブランチ保護で作る:
+# `recall-regression` job に `environment: recall-gate` を指定し、
+# `HYBRID_RECALL_MIN_*` は repo レベルではなく environment `recall-gate` の
+# variables として設定する（参照記法 `vars.*` は変わらず、environment 指定により
+# 解決スコープが repo レベルから environment レベルへ切り替わる）。environment
+# `recall-gate` は deployment branch policy で `main` のみに制限して作成する
+# （リポジトリ管理者作業。README「Recall 回帰ハーネスの repo variables」参照）。
+# これにより main 以外の ref から起動した run は environment `recall-gate` に
+# アクセスできず、その run 内の variables 参照はすべて未設定（空文字列）に解決される
+# ——別ブランチの改変 YAML から `if`／`checkout ref` を外して workflow_dispatch した
+# としても、`recall-gate` environment 自体にアクセスできないため閾値を取得できない。
+# 既存の `if: github.ref == 'refs/heads/main'`・`checkout ref: main` は
+# defense-in-depth として維持する（environment 保護がバイパスされた場合の
+# 追加防御。単独では実行境界として不十分な点は上記のとおり）。
 on:
   workflow_dispatch: {}
   schedule:
@@ -61,6 +84,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment 保護（deployment branch policy で main のみに制限。
+    # リポジトリ管理者が事前に作成する）が実際の実行境界。`vars.HYBRID_RECALL_MIN_*`
+    # はこの environment の variables として設定し、repo レベルには置かない
+    # （冒頭コメント参照。Cursor Bugbot High 指摘対応）。
+    environment: recall-gate
     permissions:
       contents: read
     steps:
@@ -75,8 +103,11 @@ jobs:
         run: rustup show
       - name: Run recall-regression
         # 数値基準（Recall 下限）は spec（TASK-104・SEARCH-1, SEARCH-2）が SSOT のため
-        # 本ワークフローにはハードコードしない。リポジトリの Actions variables（`vars.*`）
-        # から注入する（bench.yml と同方式）。未設定（空文字列に解決される）場合は
+        # 本ワークフローにはハードコードしない。environment `recall-gate`（上の
+        # `environment:` 参照。main のみに制限した deployment branch policy 付き）の
+        # Actions variables（`vars.*`）から注入する。参照記法は repo レベル variables
+        # と同じ `vars.*` だが、job に `environment:` を指定しているため解決スコープが
+        # environment レベルに切り替わる。未設定（空文字列に解決される）場合は
         # `crates/engine/tests/hybrid_recall.rs` 側が「ゲート未設定＝明示的に対象外」を
         # 出力して成功終了し、設定済みで非数値・範囲外の場合のみ fail-closed で非ゼロ
         # 終了する。実測ログには実測値と pass/fail のみが出力され、注入された閾値の

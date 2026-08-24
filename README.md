@@ -67,19 +67,22 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
-`.github/workflows/recall.yml`（`workflow_dispatch` ＋ 週次 `schedule`。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/recall.yml`（`workflow_dispatch` ＋ 週次 `schedule`。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）を GitHub Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください（`gh api` または Settings > Environments）。
 
-```bash
-gh variable set HYBRID_RECALL_MIN_R20_SMALL
-gh variable set HYBRID_RECALL_MIN_R20_LARGE
-gh variable set HYBRID_RECALL_MIN_R100_LARGE
-```
+1. Environment `recall-gate` を作成し、deployment branch policy で `main` のみに制限する
+2. その environment に閾値 variables を設定する:
+
+   ```bash
+   gh variable set HYBRID_RECALL_MIN_R20_SMALL --env recall-gate
+   gh variable set HYBRID_RECALL_MIN_R20_LARGE --env recall-gate
+   gh variable set HYBRID_RECALL_MIN_R100_LARGE --env recall-gate
+   ```
 
 **variables を設定するとゲートが有効化されます。** 未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。
 
 **`pull_request` トリガを持たせない理由（spec 機密保持が優先）**: `pull_request` で起動する job は PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行するため、もし層 B を PR トリガにすると、PR がコードを書き換えて `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから spec の数値基準を取得できてしまいます（`.claude/rules/spec-confidentiality.md` の P0 違反）。そのため層 B は既定ブランチの trusted なコードのみが走る `schedule`／`workflow_dispatch` に限定し、**PR のマージ判定は層 A（spec 数値を含まない public な固定値回帰。`.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行）が担う**、という役割分担にしています（`docs/design/hybrid-recall-regression.md` 参照）。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
 
-**`workflow_dispatch` は main ブランチのコードのみで実行されます**: `workflow_dispatch` は本来任意の ref を選んで起動できるため、トリガを絞るだけでは「trusted なコードのみが層 B を実行する」前提を満たせません（Makefile・テストを書き換えた任意 ref を手動実行すれば同じ経路で spec 閾値を漏えいできてしまうため）。`recall-regression` job は `if: github.ref == 'refs/heads/main'` で main 以外の ref を選んだ場合は実行自体をスキップし、`actions/checkout` も dispatch 側の ref 選択に依存させず常に `ref: main` を取得します。
+**閾値 variables は repo レベルではなく Environment `recall-gate` に置きます**: `workflow_dispatch` は本来任意の ref を選んで起動でき、選択した ref の workflow YAML がそのまま実行されます。そのため `if: github.ref == 'refs/heads/main'`・`checkout ref: main` のような YAML 内の条件だけでは実行境界になりません——write 権限者が別ブランチでこのガードを外した `recall.yml` を push して `workflow_dispatch` すれば、そのブランチの YAML が実行されてしまうためです。加えて repo レベルの Actions variables はどのブランチのどの workflow からも参照できるため、YAML 内の条件式では閾値の参照そのものを防げません。そこで閾値は repo レベルではなく Environment `recall-gate`（deployment branch policy で `main` のみに制限）の variables として設定し、`recall-regression` job に `environment: recall-gate` を指定します。main 以外の ref から起動した run は environment `recall-gate` にアクセスできないため、別ブランチの改変 YAML から `if`／`checkout ref` を外して `workflow_dispatch` したとしても閾値を取得できません。`if: github.ref == 'refs/heads/main'`・`checkout ref: main` は environment 保護に対する defense-in-depth として維持しています。
 
 ## ライセンス
 

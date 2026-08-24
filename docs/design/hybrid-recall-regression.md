@@ -57,9 +57,30 @@
   （PR #147 codex-review 継続指摘）。そのため `recall-regression` job には
   `if: github.ref == 'refs/heads/main'` を付け、main 以外の ref を選んで
   `workflow_dispatch` を起動した場合は job ごとスキップする。`actions/checkout` も
-  dispatch 側の ref 選択に依存させず `ref: main` で明示的に固定し、if 条件と
-  checkout 対象の両方で「main の trusted なコードのみが層 B を実行できる」ことを
-  保証する（`schedule` は常に既定ブランチで走るため、この制約による影響はない）
+  dispatch 側の ref 選択に依存させず `ref: main` で明示的に固定する。
+
+  ただし `if`／`checkout ref` は workflow YAML 自体に書かれた条件であり、
+  workflow_dispatch は選択した ref の YAML 定義をそのまま実行するため、write
+  権限者が別ブランチでこのガードを外した `recall.yml` を push して
+  `workflow_dispatch` すれば実行境界として機能しない。加えて repo レベルの
+  Actions variables はどのブランチのどの workflow からも読めるため、YAML 内の
+  if 条件だけでは `HYBRID_RECALL_MIN_*` の参照自体を防げない
+  （Cursor Bugbot High 指摘）。
+
+  そのため実際の実行境界は YAML の条件式ではなく GitHub Environments の
+  ブランチ保護で作る: `recall-regression` job に `environment: recall-gate`
+  を指定し、`HYBRID_RECALL_MIN_*` は repo レベルではなく environment
+  `recall-gate` の variables として設定する（参照記法は repo レベル variables と
+  同じ `vars.*` だが、job の `environment:` 指定により解決スコープが
+  environment レベルへ切り替わる）。environment `recall-gate` は deployment
+  branch policy で `main` のみに制限して作成する（リポジトリ管理者作業。
+  README「Recall 回帰ハーネスの repo variables」参照）。main 以外の ref から
+  起動した run は environment `recall-gate` にアクセスできないため、別ブランチの
+  改変 YAML から `if`／`checkout ref` を外して `workflow_dispatch` したとしても
+  environment 自体にアクセスできず閾値を取得できない。`if:
+  github.ref == 'refs/heads/main'`・`checkout ref: main` は environment 保護に
+  対する defense-in-depth として維持する（`schedule` は常に既定ブランチで走るため、
+  これらの制約による影響はない）
 
 ### コーパス・QA セットの生成
 
