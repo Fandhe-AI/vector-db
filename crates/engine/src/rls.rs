@@ -1273,8 +1273,11 @@ mod tests {
     // SearchTimeFilter（TASK-134・RLS-1, RLS-3）
     // ------------------------------------------------------------------
 
-    // 対象ビヘイビア: RLS-1。複数テナント・可視性混在データで、検索結果に不許可行の
-    // 混入が 0 件であること（結果全件を `ctx.is_visible` で機械照合する）。
+    // 対象ビヘイビア: RLS-1（TASK-89 / TABLE-9 の可視性判定を前提とする）。複数テナント・
+    // 可視性混在データで、検索結果に不許可行の混入が 0 件であること（結果全件を
+    // `ctx.is_visible` で機械照合する）。他テナント・不可視行の判別には `Private` を使う
+    // （`Public` は TASK-89 でテナント横断の共有可視性へ変わったため、`Public` では
+    // 他テナント不可視の判別ができない。`PrefilterIndex` 側の同種テストと同方針）。
     #[test]
     fn search_time_filter_never_returns_invisible_rows() {
         let dir = tempdir();
@@ -1287,7 +1290,7 @@ mod tests {
             "docs",
             1,
             "tenant-a",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -1295,7 +1298,7 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -1303,24 +1306,27 @@ mod tests {
             "docs",
             3,
             "tenant-a",
-            Visibility::Private,
+            Visibility::Public,
             &[1.0, 0.0],
         );
 
-        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
 
         let hits = filter.search(&ctx, &[1.0, 0.0], 10).expect("search ok");
-        // id=2（他テナント）・id=3（自テナントだが Private で ctx 未許可）はいずれも
-        // 混入しない（RLS-1）。
+        // id=2（他テナントの Private）・id=3（自テナントだが Public で ctx 未許可）は
+        // いずれも混入しない（RLS-1）。
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
     }
 
-    // 対象ビヘイビア: RLS-1（動的ポリシー）。同一 `SearchTimeFilter` インスタンスに対し
-    // 異なる `PolicyContext` で連続検索し、各回とも当該 ctx の可視行のみが返ること
-    // （再構築不要のフォールバック特性の確認。`PrefilterIndex` はこの用途では
-    // ctx ごとに再構築が必要）。
+    // 対象ビヘイビア: RLS-1（動的ポリシー・TASK-89 / TABLE-9 の可視性判定を前提とする）。
+    // 同一 `SearchTimeFilter` インスタンスに対し異なる `PolicyContext` で連続検索し、
+    // 各回とも当該 ctx の可視行のみが返ること（再構築不要のフォールバック特性の確認。
+    // `PrefilterIndex` はこの用途では ctx ごとに再構築が必要）。テナントごとの分離を
+    // 判別するため `Private` を使う（`Public` はテナント横断の共有可視性のため判別に
+    // 使えない）。
     #[test]
     fn search_time_filter_reuses_the_same_instance_across_different_policy_contexts() {
         let dir = tempdir();
@@ -1333,7 +1339,7 @@ mod tests {
             "docs",
             1,
             "tenant-a",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -1341,17 +1347,19 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
 
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
 
-        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
         let hits_a = filter.search(&ctx_a, &[1.0, 0.0], 10).expect("search ok");
         assert_eq!(hits_a.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1]);
 
-        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let ctx_b = PolicyContext::with_visibilities("tenant-b", [Visibility::Private])
+            .expect("valid tenant");
         let hits_b = filter.search(&ctx_b, &[1.0, 0.0], 10).expect("search ok");
         assert_eq!(hits_b.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
     }
@@ -1408,13 +1416,14 @@ mod tests {
         assert_eq!(hits[0].id, 1);
     }
 
-    // 対象ビヘイビア: RLS-1 と RLS-3 の判別テスト（本 Issue のレビュー指摘対応）。
-    // 不可視行が可視行よりスコア上位に来て k 枠を奪う状況を作る
-    // （tenant-b の 2 行が最上位スコアを占め、ctx=tenant-a・k=2 では tenant-a の
-    // 2 行のみが正解）。「全行で top-k を選んでから可視性でフィルタする」誤実装
-    // （可視性を最後に後付けする RLS-3 違反の典型パターン）だと、上位 k 件がすべて
-    // 不可視行で埋まり最終結果が空になる。可視性判定をスコア計算前に行う正しい実装
-    // でのみ `[3, 4]` が返る。
+    // 対象ビヘイビア: RLS-1 と RLS-3 の判別テスト（本 Issue のレビュー指摘対応・TASK-89 /
+    // TABLE-9 の可視性判定を前提とする）。不可視行が可視行よりスコア上位に来て k 枠を
+    // 奪う状況を作る（tenant-b の 2 行が最上位スコアを占め、ctx=tenant-a・k=2 では
+    // tenant-a の 2 行のみが正解）。「全行で top-k を選んでから可視性でフィルタする」
+    // 誤実装（可視性を最後に後付けする RLS-3 違反の典型パターン）だと、上位 k 件が
+    // すべて不可視行で埋まり最終結果が空になる。可視性判定をスコア計算前に行う正しい
+    // 実装でのみ `[3, 4]` が返る。tenant-b の行は `Private` にする（`Public` はテナント
+    // 横断の共有可視性のため他テナント不可視の判別に使えない）。
     #[test]
     fn search_time_filter_visibility_is_applied_before_top_k_selection_not_after() {
         let dir = tempdir();
@@ -1427,7 +1436,7 @@ mod tests {
             "docs",
             1,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -1435,7 +1444,7 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[0.9, 0.0],
         );
         insert(
@@ -1642,7 +1651,9 @@ mod tests {
     }
 
     // `len`/`is_empty` は渡された ctx の可視性述語で都度判定する（`PrefilterIndex` と
-    // 異なり ContextMismatch を返さない）。
+    // 異なり ContextMismatch を返さない）。テナントごとの分離を判別するため `Private` を
+    // 使う（`Public` は TASK-89 / TABLE-9 でテナント横断の共有可視性へ変わったため
+    // 判別に使えない）。
     #[test]
     fn search_time_filter_len_and_is_empty_use_the_given_context_each_time() {
         let dir = tempdir();
@@ -1655,7 +1666,7 @@ mod tests {
             "docs",
             1,
             "tenant-a",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
         insert(
@@ -1663,17 +1674,19 @@ mod tests {
             "docs",
             2,
             "tenant-b",
-            Visibility::Public,
+            Visibility::Private,
             &[1.0, 0.0],
         );
 
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
 
-        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
         assert_eq!(filter.len(&ctx_a), 1);
         assert!(!filter.is_empty(&ctx_a));
 
-        let ctx_c = PolicyContext::new("tenant-c").expect("valid tenant");
+        let ctx_c = PolicyContext::with_visibilities("tenant-c", [Visibility::Private])
+            .expect("valid tenant");
         assert_eq!(filter.len(&ctx_c), 0);
         assert!(filter.is_empty(&ctx_c));
     }
