@@ -30,6 +30,7 @@ vector-db/
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check の CI
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準の回帰ベンチ（workflow_dispatch。CORE-5 未接続の間は schedule 停止中）
+│   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義
