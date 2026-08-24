@@ -149,8 +149,11 @@ impl std::error::Error for GpuSearchError {}
 // ---------------------------------------------------------------------
 
 /// f32 を IEEE 754 binary16（f16）のビットパターンへ丸める。オーバーフローは
-/// ±Inf、極小値は 0 へフラッシュする（サブノーマル出力は生成しない。GPU 常駐用
-/// 表現としては許容する簡略化）。
+/// ±Inf へ飽和し、指数アンダーフロー域はサブノーマル f16 として正しく
+/// round-to-nearest-even で丸める（codex レビュー指摘対応: 以前は `exp <= 0`
+/// を一律 0 へフラッシュしており、`unpack_f16x2` の「`unpack2x16float` と等価」
+/// という公開契約に違反していた。検索スコアの精度劣化を避けるため
+/// flush-to-zero を仕様として残す選択はしない）。
 fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -160,6 +163,11 @@ fn f32_to_f16_bits(value: f32) -> u16 {
         return sign | 0x7E00;
     }
     let abs_bits = bits & 0x7FFF_FFFF;
+    if abs_bits == 0 {
+        // +0.0/-0.0 は下のサブノーマル変換（暗黙ビット付与）に通すと非ゼロに
+        // なってしまうため、符号だけを残して個別に返す。
+        return sign;
+    }
     let exp = ((abs_bits >> 23) & 0xFF) as i32 - 127 + 15;
     let mantissa = abs_bits & 0x007F_FFFF;
 
@@ -168,8 +176,30 @@ fn f32_to_f16_bits(value: f32) -> u16 {
         return sign | 0x7C00;
     }
     if exp <= 0 {
-        // 指数アンダーフロー: サブノーマル表現は行わず 0 へフラッシュする。
-        return sign;
+        // 指数アンダーフロー域: サブノーマル f16（もしくは丸めた結果としての 0）
+        // へ変換する。入力を暗黙ビット付き 24 bit 仮数 `1.mantissa` として扱い、
+        // 下位ビットの正規化丸めと同じ round-to-nearest-even ロジックを、
+        // シフト量 `14 - exp`（`exp <= 0` なので 14 以上）で適用する。
+        // 仮数繰り上がりでシフト結果が 0x0400（=10 bit 目）に達した場合、
+        // f16 のビット割付（exp フィールドが mantissa フィールドの直上）により
+        // 自動的に「最小正規化数（biased exp = 1, mantissa = 0）」へ桁上がり
+        // する（別分岐は不要）。
+        let full_mantissa = 0x0080_0000u32 | mantissa;
+        // `exp` が非常に小さい（f32 の極小サブノーマル入力を含む）場合、
+        // シフト量は理論上非常に大きくなりうる。`full_mantissa` は高々 24 bit
+        // のため、シフト量が 25 以上であれば `round_bit` が `full_mantissa` の
+        // 最大値を必ず上回り丸め上げは発生しない（結果は常に 0）。u32 シフトの
+        // オーバーフローを避けるため、その保証が成り立つ範囲でシフト量を
+        // 頭打ちにする。
+        let shift = (14 - exp).min(30) as u32;
+        let round_bit = 1u32 << (shift - 1);
+        let lower_mask = round_bit - 1;
+        let mut mantissa16 = full_mantissa >> shift;
+        let remainder = full_mantissa & (round_bit | lower_mask);
+        if remainder > round_bit || (remainder == round_bit && (mantissa16 & 1) == 1) {
+            mantissa16 += 1;
+        }
+        return sign | (mantissa16 as u16);
     }
     // 23 ビット仮数を 10 ビットへ round-to-nearest-even で丸める。
     let shift = 13u32;
@@ -673,11 +703,9 @@ mod tests {
 
     // CORE-16 codex レビュー指摘対応: サブノーマル f16 の復元値を厳密一致で検証する
     // （`f16_roundtrip_preserves_reasonable_precision` の絶対誤差 `< 0.01` 判定では
-    // サブノーマル域の値が 2^13 倍ずれても誤差が閾値未満に収まり検出できない。
-    // また `f32_to_f16_bits` はサブノーマルを生成しないため往復テストでは
-    // `f16_bits_to_f32` のサブノーマル経路自体を通過できない。ここではビット列を
-    // 直接与えて `unpack_f16x2` の公開契約どおり `unpack2x16float` と同じ厳密値に
-    // 一致することを確認する）。
+    // サブノーマル域の値が 2^13 倍ずれても誤差が閾値未満に収まり検出できない）。
+    // ここではビット列を直接与えて `unpack_f16x2` の公開契約どおり
+    // `unpack2x16float` と同じ厳密値に一致することを確認する。
     #[test]
     fn f16_bits_to_f32_matches_exact_subnormal_values() {
         // bits=0x0001（mantissa=1） は最小の正のサブノーマル: 1 * 2^-24。
@@ -702,6 +730,74 @@ mod tests {
         // （bits=0x8001 は 0x0001 の符号反転）。
         let (v, _) = unpack_f16x2(0x8001);
         assert_eq!(v, -(1.0f32 / 16_777_216.0));
+    }
+
+    // codex レビュー指摘対応: `pack_f16x2`（`f32_to_f16_bits`）がサブノーマル域
+    // （`exp <= 0`）を一律 0 へフラッシュしていたバグの回帰テスト。サブノーマル
+    // f16 として厳密表現可能な値（k * 2^-24）は pack→unpack で厳密に一致する
+    // ことを確認する（`unpack_f16x2` は既にサブノーマルへ対応済みのため、この
+    // 往復テストで初めて `f32_to_f16_bits` 側のサブノーマル生成経路も検証できる）。
+    #[test]
+    fn f16_pack_roundtrips_exact_subnormal_values() {
+        // 最小の正のサブノーマル: 1 * 2^-24。
+        let packed = pack_f16x2(1.0f32 / 16_777_216.0, 0.0);
+        let (lo, _) = unpack_f16x2(packed);
+        assert_eq!(lo, 1.0f32 / 16_777_216.0);
+
+        // 負値・hi レーンも同じ経路を通ることを確認する（512 * 2^-24 = 2^-15）。
+        let packed = pack_f16x2(0.0, -(512.0f32 / 16_777_216.0));
+        let (_, hi) = unpack_f16x2(packed);
+        assert_eq!(hi, -(512.0f32 / 16_777_216.0));
+
+        // 最大のサブノーマル: 1023 * 2^-24。
+        let packed = pack_f16x2(1023.0f32 / 16_777_216.0, 0.0);
+        let (v, _) = unpack_f16x2(packed);
+        assert_eq!(v, 1023.0f32 / 16_777_216.0);
+    }
+
+    // 境界値: サブノーマル域での round-to-nearest-even 丸めを検証する
+    // （flush-to-zero を仕様として残さない、という codex レビュー指摘対応の
+    // 判断が実際に効いていることを確認する）。
+    #[test]
+    fn f16_pack_rounds_subnormal_boundary_values_to_nearest_even() {
+        // 0 と最小サブノーマル (2^-24) のちょうど中間 (2^-25) は round-to-even で
+        // 「偶数」側の 0 へ丸まる（f16 の 0 はサブノーマル仮数ビット列 0 であり
+        // 偶数）。
+        let tie_to_zero = 1.0f32 / 33_554_432.0; // 2^-25
+        let (v, _) = unpack_f16x2(pack_f16x2(tie_to_zero, 0.0));
+        assert_eq!(v, 0.0, "exact tie must round to even (zero)");
+
+        // 中間点よりわずかに大きい値は切り上げられ、最小サブノーマルになる
+        // （2^-25 の直後の f32 表現可能値を使う）。
+        let just_above_tie = f32::from_bits(tie_to_zero.to_bits() + 1);
+        let (v, _) = unpack_f16x2(pack_f16x2(just_above_tie, 0.0));
+        assert_eq!(
+            v,
+            1.0f32 / 16_777_216.0,
+            "value above the tie must round up"
+        );
+
+        // サブノーマル最大値 (1023 * 2^-24) と最小正規化数 (1024 * 2^-24 = 2^-14)
+        // のちょうど中間 (1023.5 * 2^-24) は、丸め前の仮数下位ビットが奇数
+        // (1023) のため round-to-even で偶数側 (1024 = 最小正規化数) へ切り上がる。
+        let tie_to_normal = 1023.5f32 / 16_777_216.0;
+        let (v, _) = unpack_f16x2(pack_f16x2(tie_to_normal, 0.0));
+        assert_eq!(
+            v,
+            1.0f32 / 16_384.0,
+            "tie at the subnormal/normal boundary must carry into the smallest normal"
+        );
+    }
+
+    // 真のゼロ（+0.0/-0.0）はサブノーマル変換の暗黙ビット付与を経由せず、
+    // そのまま符号付きゼロへ変換されることを確認する。
+    #[test]
+    fn f16_pack_preserves_signed_zero() {
+        let (a, b) = unpack_f16x2(pack_f16x2(0.0, -0.0));
+        assert_eq!(a, 0.0);
+        assert!(a.is_sign_positive());
+        assert_eq!(b, 0.0);
+        assert!(b.is_sign_negative());
     }
 
     #[test]
