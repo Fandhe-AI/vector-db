@@ -59,6 +59,13 @@ HARD_MAX_DATASET_RECORDS = 10_000
 HARD_MAX_DATASET_LINE_CHARS = 200_000
 HARD_MAX_DATASET_FIELD_CHARS = 20_000
 
+# 採点プロンプト・設定ファイルの読み込み上限（文字数。データセット行上限と同オーダー）。
+# read_text() の無条件全読みは、巨大ファイル指定時に HARD_MAX_REQUEST_BYTES の
+# 判定へ到達する前の読み込み時点でメモリ枯渇し得るため、bounded read
+# （上限 +1 文字）で読み込み自体を止めて超過を検知する（fail-closed: 超過は明示エラー）。
+HARD_MAX_SCORING_PROMPT_CHARS = 200_000
+HARD_MAX_CONFIG_FILE_CHARS = 200_000
+
 # 採点プロンプトへ埋め込む question/expected_answer/generated_answer の区切りに使うトークン。
 # 攻撃者（generated_answer は別 LLM 生成のため untrusted）がこの文字列そのものを出力しても
 # 区切りとして混同されないよう、埋め込み前に _sanitize_for_prompt() でこのトークンを除去する。
@@ -186,10 +193,16 @@ def load_config(config_path: Path) -> EvalConfig:
     """設定ファイルを読み込み検証する。必須キー欠落・型不正・上限超過は ConfigError で即終了させる。"""
     # UnicodeError も捕捉する: 不正な UTF-8 の設定ファイルは UnicodeDecodeError
     # （OSError ではない）を送出するため、明示エラー終了経路（ConfigError）へ変換する。
+    # bounded read（上限 +1 文字）: 巨大ファイル指定時に全読みでメモリ枯渇させない。
     try:
-        raw_text = config_path.read_text(encoding="utf-8")
+        with config_path.open(encoding="utf-8") as f:
+            raw_text = f.read(HARD_MAX_CONFIG_FILE_CHARS + 1)
     except (OSError, UnicodeError) as exc:
         raise ConfigError(f"failed to read config file: {config_path} ({exc})") from exc
+    if len(raw_text) > HARD_MAX_CONFIG_FILE_CHARS:
+        raise ConfigError(
+            f"config file at {config_path} exceeds {HARD_MAX_CONFIG_FILE_CHARS} character limit"
+        )
 
     try:
         raw: dict[str, Any] = json.loads(raw_text)
@@ -678,13 +691,21 @@ def run_evaluation(config: EvalConfig, dry_run: bool) -> EvalReport:
     # README が「配線検証」と説明する dry-run 経路が、本番実行時にのみ露見する
     # scoring_prompt_path の欠落・読み取り不可を検知できなくなる。読み込みをここに一本化し、
     # 後段で再度 read_text() する二重読み込み（＝ガードされない 2 回目の OSError 経路）を作らない。
-    # UnicodeError も捕捉する: read_text(encoding="utf-8") は不正な UTF-8 バイト列で
+    # UnicodeError も捕捉する: UTF-8 読み込みは不正な UTF-8 バイト列で
     # UnicodeDecodeError（OSError ではなく UnicodeError 系）を送出するため、OSError のみの
     # 捕捉では不正エンコーディングのプロンプトファイルが未処理 traceback になる。
+    # bounded read（上限 +1 文字）: read_text() の無条件全読みだと巨大ファイル指定時に
+    # HARD_MAX_REQUEST_BYTES の判定前にメモリ枯渇し得るため、読み込み自体を上限で止める。
     try:
-        scoring_prompt = config.scoring_prompt_path.read_text(encoding="utf-8")
+        with config.scoring_prompt_path.open(encoding="utf-8") as f:
+            scoring_prompt = f.read(HARD_MAX_SCORING_PROMPT_CHARS + 1)
     except (OSError, UnicodeError) as exc:
         raise DatasetError(f"failed to read scoring prompt: {config.scoring_prompt_path} ({exc})") from exc
+    if len(scoring_prompt) > HARD_MAX_SCORING_PROMPT_CHARS:
+        raise DatasetError(
+            f"scoring prompt at {config.scoring_prompt_path} exceeds "
+            f"{HARD_MAX_SCORING_PROMPT_CHARS} character limit"
+        )
 
     if dry_run:
         for record in sampled:

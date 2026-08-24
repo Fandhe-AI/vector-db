@@ -240,6 +240,52 @@ class ConfigReadFailureTest(unittest.TestCase):
                 aa.load_config(config_path)
 
 
+class ReadSizeLimitTest(unittest.TestCase):
+    """P1: 採点プロンプト・設定ファイルの読み込みにハード上限を課し、無制限全読みによるメモリ枯渇を防ぐ。"""
+
+    def test_oversized_scoring_prompt_raises_dataset_error(self):
+        original_limit = aa.HARD_MAX_SCORING_PROMPT_CHARS
+        aa.HARD_MAX_SCORING_PROMPT_CHARS = 16
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_dir = Path(tmp)
+                config_path = tmp_dir / "config.json"
+                config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+                config = aa.load_config(config_path)
+                config.scoring_prompt_path.write_text("x" * 17, encoding="utf-8")
+                with self.assertRaises(aa.DatasetError):
+                    aa.run_evaluation(config, dry_run=True)
+        finally:
+            aa.HARD_MAX_SCORING_PROMPT_CHARS = original_limit
+
+    def test_scoring_prompt_within_limit_still_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            config_path = tmp_dir / "config.json"
+            config_path.write_text(json.dumps(_valid_config_dict(tmp_dir)), encoding="utf-8")
+            config = aa.load_config(config_path)
+            report = aa.run_evaluation(config, dry_run=True)
+            self.assertTrue(report.dry_run)
+
+    def test_oversized_config_file_raises_config_error(self):
+        original_limit = aa.HARD_MAX_CONFIG_FILE_CHARS
+        aa.HARD_MAX_CONFIG_FILE_CHARS = 32
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_dir = Path(tmp)
+                config_path = tmp_dir / "config.json"
+                # 上限超過だが JSON としては妥当な内容: サイズ検証が JSON パースより
+                # 先に行われる（パース対象のメモリ確保自体を上限で止める）ことを確認する。
+                config_path.write_text(
+                    json.dumps({"padding": "x" * 100}), encoding="utf-8"
+                )
+                with self.assertRaises(aa.ConfigError) as ctx:
+                    aa.load_config(config_path)
+        finally:
+            aa.HARD_MAX_CONFIG_FILE_CHARS = original_limit
+        self.assertIn("character limit", str(ctx.exception))
+
+
 class SampleDatasetTest(unittest.TestCase):
     def test_sample_smaller_than_population(self):
         records = [{"id": str(i)} for i in range(10)]
