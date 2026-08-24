@@ -1,21 +1,9 @@
-//! `engine::rls::PrefilterIndex` の結合テスト（TASK-133、対象ビヘイビア: RLS-1, RLS-2,
-//! RLS-3, RLS-4。ポインタ: `docs/spec/04-behavior/rls.md`）。
+//! `engine::rls::PrefilterIndex` の結合テスト（TASK-133・対象ビヘイビア: RLS-1〜4）。
 //!
 //! `crates/engine/tests/vector_core.rs`（TASK-124）のシード手法（`Storage::open` で
 //! 直接テーブル作成・行投入してから production API へ渡す）と、
 //! `crates/engine/tests/hybrid_recall.rs`（TASK-104）の決定的合成コーパス生成
 //! （自前 xorshift64*・外部クレート不使用）を踏襲する。
-//!
-//! 4 つのテストがそれぞれ 1 つの対象ビヘイビアに対応する:
-//! - `rls1_no_cross_tenant_leakage_across_visibility_rates`: 混入 0 件の機械検証
-//! - `rls2_lower_visibility_rate_does_not_regress_search_only_latency`: 可視率が
-//!   下がるほど検索専用レイテンシが悪化しないこと（構築コストは計測対象外）
-//! - `rls3_search_calls_provider_exactly_once_with_requested_k`: over-fetch 倍率 1 倍
-//! - `rls4_recall_matches_full_scan_theoretical_upper_bound`: 追加損失ゼロ
-//!
-//! spec の数値基準・実測値は転記しない（`.claude/rules/spec-confidentiality.md`）。
-//! 判定はいずれも「本テストが独立に算出した理論値・相対比較」で行う
-//! （`tests/hybrid_recall.rs` 層 A の既存方式に倣う）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -154,8 +142,8 @@ fn random_query(seed: u64) -> Vec<f32> {
     (0..DIM).map(|_| rng.next_f32_signed()).collect()
 }
 
-// 対象ビヘイビア: RLS-1。可視率（90/50/30/10%）× 複数クエリで検索し、全ヒットが
-// 許可集合（[`TARGET_TENANT`]）に属することを機械検証する（混入 0 件）。
+// 対象ビヘイビア: RLS-1。複数の可視率・複数クエリで検索し、全ヒットが許可集合
+// （[`TARGET_TENANT`]）に属することを機械検証する（テナント境界 P0）。
 #[test]
 fn rls1_no_cross_tenant_leakage_across_visibility_rates() {
     const NUM_ROWS: u64 = 4_000;
@@ -197,9 +185,7 @@ fn rls1_no_cross_tenant_leakage_across_visibility_rates() {
 }
 
 // 対象ビヘイビア: RLS-2。可視率ごとに `PrefilterIndex` を事前構築し（構築時間は計測対象外）、
-// 検索のみの所要時間をウォームアップ後に複数試行計測して p95 を算出する。可視部分集合のみを
-// 走査する構造上、低可視率ほどスキャン量が減るため、低可視率側の p95 が高可視率側の p95 を
-// 上回らないことを（CI ノイズ吸収のマージン付き相対比較で）検証する。
+// 検索専用の所要時間を p95 で相対比較する（CI ノイズ吸収のマージン付き）。
 #[test]
 fn rls2_lower_visibility_rate_does_not_regress_search_only_latency() {
     const NUM_ROWS: u64 = 20_000;
@@ -255,8 +241,7 @@ fn rls2_lower_visibility_rate_does_not_regress_search_only_latency() {
 }
 
 /// [`rls3_search_calls_provider_exactly_once_with_requested_k`] 用の計装 provider。
-/// 呼び出し回数と要求 `k` を記録してから [`CpuScalarProvider`] へ委譲する
-/// （over-fetch なし・RLS-3 の直接観測）。
+/// 呼び出し回数と要求 `k` を記録してから [`CpuScalarProvider`] へ委譲する。
 struct CountingProvider {
     calls: AtomicUsize,
     requested_ks: Mutex<Vec<usize>>,
@@ -283,8 +268,7 @@ impl SearchProvider for CountingProvider {
 }
 
 // 対象ビヘイビア: RLS-3。1 検索につき provider 呼び出しが 1 回・要求件数がちょうど
-// 呼び出し元の k（追加フェッチなし）で、`min(k, 可視件数)` 件を充足することを検証する
-// （over-fetch 倍率 1 倍）。
+// 呼び出し元の k であることを検証する。
 #[test]
 fn rls3_search_calls_provider_exactly_once_with_requested_k() {
     let path = unique_db_path("rls3");
@@ -330,18 +314,17 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
 }
 
 /// 内積スコア（[`engine::kernel::CpuScalarProvider`] と同じ尺度・左から右への逐次和）。
-/// 本テストが独立に理論上限を算出するための複製（production コードは変更しない）。
+/// 本テストが独立に参照値を算出するための複製（production コードは変更しない）。
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-// 対象ビヘイビア: RLS-4。テスト側で独立に「全行スキャン→許可集合でフィルタ→Top-20」の
-// 理論上限を算出し、`PrefilterIndex` の Top-20 と完全一致（追加損失ゼロ）することを検証する。
-// タイブレーク規則（スコア降順・同点 id 昇順）は `PrefilterIndex::search` が委譲する
-// `CpuScalarProvider`（`kernel.rs::TopKSelector`）と同一の規則を本テスト側でも用いるため、
-// 同点タイの影響を受けない（一意なスコアを要求する必要がない）。
+// 対象ビヘイビア: RLS-4。テスト側で独立に「全行スキャン→許可集合でフィルタ→Top-K」を
+// 算出し、`PrefilterIndex` の Top-K と一致することを検証する。タイブレーク規則
+// （スコア降順・同点 id 昇順）は `PrefilterIndex::search` が委譲する `CpuScalarProvider`
+// と同一の規則を本テスト側でも用いる。
 #[test]
-fn rls4_recall_matches_full_scan_theoretical_upper_bound() {
+fn rls4_top_k_matches_independently_computed_full_scan_ranking() {
     const NUM_ROWS: u64 = 3_000;
     const K: usize = 20;
 
@@ -356,9 +339,9 @@ fn rls4_recall_matches_full_scan_theoretical_upper_bound() {
     for query_idx in 0..5u64 {
         let query = random_query(8000 + query_idx);
 
-        // 「全行スキャン→許可集合でフィルタ→Top-K」の理論上限を独立に算出する
-        // （`PrefilterIndex` を経由しない。`Storage::get_row_from_table` で対象テナント行を
-        // 直接読み直し、`PrefilterIndex::search` と同じスコア降順・同点 id 昇順で並べる）。
+        // 「全行スキャン→許可集合でフィルタ→Top-K」を独立に算出する（`PrefilterIndex` を
+        // 経由しない。`Storage::get_row_from_table` で対象テナント行を直接読み直し、
+        // `PrefilterIndex::search` と同じスコア降順・同点 id 昇順で並べる）。
         let mut scored: Vec<(u64, f32)> = target_ids
             .iter()
             .map(|&id| {
@@ -379,7 +362,7 @@ fn rls4_recall_matches_full_scan_theoretical_upper_bound() {
         assert_eq!(
             actual, scored,
             "PrefilterIndex top-{K} must match the independently computed full-scan \
-             theoretical upper bound exactly (query={query_idx})"
+             ranking (query={query_idx})"
         );
     }
 }

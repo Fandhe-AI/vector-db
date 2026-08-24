@@ -704,28 +704,16 @@ impl Storage {
     }
 
     /// テーブルスコープで複数行の `tenant_id`・`visibility`（ヘッダのみ）を一括取得する
-    /// （TASK-133、対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が provider を
-    /// 呼ぶ**前**にアリーナの全 id について検索時点の現在の行状態を再検証し、インデックス
-    /// 構築後の update/delete による失効行のベクトルが provider へ渡ることを防ぐために呼ぶ
-    /// （codex-review P0 指摘・PR #151 対応）。embedding・metadata はデコードせず
-    /// `decode_row_tenant_and_visibility` のみを使う（[`Self::get_row_from_table`] と異なり
-    /// 埋め込み全体を読まないため、アリーナの全行数分呼んでも DoS 耐性を保つ）。
+    /// （TASK-133・対象ビヘイビア: RLS-1〜4。`rls.rs::PrefilterIndex::search` が使う）。
+    /// embedding・metadata はデコードしない（`decode_row_tenant_and_visibility` のみ使用）。
     ///
-    /// `ids` に対応する 1 回の `read_txn` だけを張る（id ごとに個別トランザクションを
-    /// 張らない）。これにより、1 回の呼び出しで検証する id 集合は単一のストレージ
-    /// スナップショットに対して一貫する（`rls.rs::PrefilterIndex::search` の「一貫性契約」
-    /// ドキュメント参照）。戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在
-    /// しない（削除済み、または行テーブル自体が未作成）場合はその位置に `None` を入れる
-    /// （`CatalogError::RowNotFound` へ丸め込まない。呼び出し元が「削除済み行は不可視扱いに
-    /// する」という fail-closed 判断を行えるようにするため。テーブル自体が不存在の場合のみ
-    /// 通常どおり `CatalogError::TableNotFound` を返す）。
+    /// `ids` に対応する 1 回の `read_txn` だけを張る（単一スナップショットで一貫）。
+    /// 戻り値は `ids` と同じ順序・同じ長さの `Vec` で、該当行が存在しない場合はその位置に
+    /// `None` を入れる（`CatalogError::RowNotFound` へは丸め込まない）。テーブル自体が
+    /// 不存在の場合のみ `CatalogError::TableNotFound` を返す。
     ///
-    /// `ids.len()` に上限は課さない（無制限確保を避けるための呼び出し元側の責務。現在の
-    /// 唯一の呼び出し元 `rls.rs::PrefilterIndex::search` は、`PrefilterIndex::build`
-    /// （`VectorArena::build_filtered` 経由の構築）時点で `arena.rs::MAX_ARENA_ROWS`
-    /// （1,000,000 行）により上限が課されたアリーナの全 id（`self.arena.ids()`。呼び出し元・
-    /// provider の入力に依存しない値）を渡すため無制限にならない。将来別の呼び出し元を
-    /// 追加する場合は同様の上限を先に満たすこと）。
+    /// `ids.len()` に上限は課さない（呼び出し元の責務。`rls.rs::PrefilterIndex::search` は
+    /// `arena.rs::MAX_ARENA_ROWS` で上限が課された id 集合を渡す）。
     pub(crate) fn get_row_headers_from_table(
         &self,
         table_name: &str,
@@ -1084,13 +1072,8 @@ mod tests {
     }
 
     // --- Storage::get_row_headers_from_table -------------------------------
-    // `rls.rs::PrefilterIndex::search` が失効行の再検証に使うヘルパー（TASK-133、
-    // 対象ビヘイビア: RLS-1〜4。codex-review P0 指摘・PR #151 対応）の `None` 分岐
-    // （該当 id の行が存在しない）を直接カバーする。本クレートには行削除 API がまだ
-    // 存在しないため、削除された行ではなく最初から未挿入の id で再現する
-    // （`rls.rs` 側の単体テストがこの分岐を担っていたが、`PrefilterIndex::search` から
-    // `storage` 引数を除去した設計変更により、そちらでは再現不能になったため本テストへ
-    // 移設した）。
+    // TASK-133・対象ビヘイビア: RLS-1〜4。該当 id が存在しない場合の `None` 分岐を検証する
+    // （本クレートに行削除 API がないため、未挿入 id で再現する）。
 
     #[test]
     fn get_row_headers_from_table_returns_none_for_a_missing_id() {
