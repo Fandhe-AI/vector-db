@@ -67,7 +67,7 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
-`.github/workflows/recall.yml`（`workflow_dispatch` ＋ 週次 `schedule`）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/recall.yml`（`workflow_dispatch` ＋ `pull_request` ＋ 週次 `schedule`）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
 gh variable set HYBRID_RECALL_MIN_R20_SMALL
@@ -75,7 +75,7 @@ gh variable set HYBRID_RECALL_MIN_R20_LARGE
 gh variable set HYBRID_RECALL_MIN_R100_LARGE
 ```
 
-未設定のまま実行すると `crates/engine/tests/hybrid_recall.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
+**variables を設定するとゲートが有効化されます。** 未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。この opt-in 方式により、本 job を PR の required check に指定しても variables 設定前の PR を塞ぎません。決定的コーパスでの回帰トラッキング自体（層 A・固定値アサーション）は `make ci`（`cargo test`）に含まれており、こちらは repo variables 不要です。
 
 ## ライセンス
 

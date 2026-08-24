@@ -11,8 +11,16 @@ name: Recall
 #
 # 本ハーネスは決定的合成コーパス（外部接続不要）のため、`bench.yml` と異なり schedule
 # トリガも設定する（週次。CI 混雑回避のため PR/push トリガとは独立した深夜 UTC 帯）。
+#
+# `pull_request` トリガも設定し、層 B を PR のマージ判定に組み込めるようにする（PR #147
+# codex-review 指摘対応。`bench.yml` の `BENCH_CORE5` opt-in パターンを踏襲）。
+# `HYBRID_RECALL_MIN_*`（Actions variables）が未設定の場合、
+# `crates/engine/tests/hybrid_recall.rs` 側が「ゲート未設定＝明示的に対象外」を出力して
+# 成功終了する（fail-closed にはしない）ため、本 job を required check に指定しても
+# variables 設定前の PR を塞がない。設定済みの場合のみ fail-closed で閾値判定する。
 on:
   workflow_dispatch: {}
+  pull_request: {}
   schedule:
     - cron: "0 4 * * 1" # 毎週月曜 04:00 UTC（bench.yml 想定の 03:00 UTC 帯と重ならないようずらす）
 
@@ -20,9 +28,9 @@ permissions:
   contents: read
 
 concurrency:
-  # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に含めて
-  # 同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針）。
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # PR ごとに一意な番号を group に含める（ci.yml と同一方針。PR #4 codex P2 指摘。
+  # workflow_dispatch・schedule は PR 番号を持たないため ref にフォールバックする）。
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -44,10 +52,11 @@ jobs:
       - name: Run recall-regression
         # 数値基準（Recall 下限）は spec（TASK-104・SEARCH-1, SEARCH-2）が SSOT のため
         # 本ワークフローにはハードコードしない。リポジトリの Actions variables（`vars.*`）
-        # から注入する（bench.yml と同方式）。未設定・非数値・範囲外の場合は
-        # `crates/engine/tests/hybrid_recall.rs` 側が fail-closed で非ゼロ終了する。
-        # 実測ログには実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
-        # 出力しない。
+        # から注入する（bench.yml と同方式）。未設定（空文字列に解決される）場合は
+        # `crates/engine/tests/hybrid_recall.rs` 側が「ゲート未設定＝明示的に対象外」を
+        # 出力して成功終了し、設定済みで非数値・範囲外の場合のみ fail-closed で非ゼロ
+        # 終了する。実測ログには実測値と pass/fail のみが出力され、注入された閾値の
+        # 数値そのものは出力しない。
         env:
           HYBRID_RECALL_MIN_R20_SMALL: ${{ vars.HYBRID_RECALL_MIN_R20_SMALL }}
           HYBRID_RECALL_MIN_R20_LARGE: ${{ vars.HYBRID_RECALL_MIN_R20_LARGE }}
