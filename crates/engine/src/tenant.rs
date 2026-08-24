@@ -29,9 +29,11 @@ const PAGE_LIMIT: u32 = 10_000;
 /// テーブルでも呼び出し元テナントの可視行数だけに比例した確保量に収まる。
 const MAX_VISIBLE_ROWS: usize = 100_000;
 
-/// [`visible_rows`]・[`verify_hits`] のエラー型。`Display` にテナント ID・行 id を含めず、
+/// [`visible_rows`]・[`verify_hits`] のエラー型。`Display`・`Debug`・
+/// `std::error::Error::source` のいずれにもテナント ID・行 id・テーブル名を含めず、
 /// 他テナントの存在情報を漏らさない（`rls.rs::RlsError` と同じ契約。security.md P0）。
-#[derive(Debug)]
+/// `CatalogError` を内部に保持するが、識別子を含む詳細は外部へ一切露出しない
+/// （下記 `Debug`・`Error::source` の手書き実装を参照）。
 pub enum TenantError {
     /// [`crate::catalog`] 側のエラー（テーブル不存在・行破損・redb バックエンドエラー等）。
     Catalog(CatalogError),
@@ -50,8 +52,9 @@ impl std::fmt::Display for TenantError {
             // `CatalogError` の `Display`（`TableNotFound` のテーブル名・`RowNotFound` の
             // 行 ID を含む）をそのまま展開しない。認可前の呼び出し・エラーログ経由で
             // 他テナントの存在情報が漏れるのを防ぐため、識別子・バックエンド詳細を含まない
-            // 固定文言に丸める（security.md テナント境界 P0）。原因の詳細は
-            // `std::error::Error::source` 経由（内部診断用途）でのみ辿れる。
+            // 固定文言に丸める（security.md テナント境界 P0）。原因の詳細は本型の外へは
+            // 一切公開しない（`Debug`・`Error::source` も同様にサニタイズ済み。内部診断が
+            // 必要な場合は本型を経由しない別経路を用意すること）。
             TenantError::Catalog(_) => write!(f, "tenant boundary catalog error"),
             TenantError::TooManyVisibleRows { max } => {
                 write!(f, "too many visible rows: limit={max}")
@@ -63,12 +66,31 @@ impl std::fmt::Display for TenantError {
     }
 }
 
+impl std::fmt::Debug for TenantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `#[derive(Debug)]` は `CatalogError`（`TableNotFound` のテーブル名・
+        // `RowNotFound` の行 ID 等）をそのまま展開してしまい、`Display` で
+        // 隠した情報がパニック出力・`{:?}` ログ経由で再露出する（security.md
+        // テナント境界 P0）。variant 名のみを出力し、内部の識別情報は含めない。
+        match self {
+            TenantError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
+            TenantError::TooManyVisibleRows { max } => f
+                .debug_struct("TooManyVisibleRows")
+                .field("max", max)
+                .finish(),
+            TenantError::HitOutsideVisibleSet => f.write_str("HitOutsideVisibleSet"),
+        }
+    }
+}
+
 impl std::error::Error for TenantError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            TenantError::Catalog(e) => Some(e),
-            TenantError::TooManyVisibleRows { .. } | TenantError::HitOutsideVisibleSet => None,
-        }
+        // `CatalogError` をそのまま `source()` で返すと、`Display` で固定文言に
+        // 丸めた識別情報（テーブル名・行 ID 等）が一般的なエラーチェーン出力
+        // （`anyhow` 等の `{:#}` 展開・ログ収集基盤）経由で再露出する
+        // （security.md テナント境界 P0）。原因チェーンはここで打ち切り、常に
+        // `None` を返す。
+        None
     }
 }
 
