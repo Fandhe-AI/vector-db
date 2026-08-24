@@ -863,9 +863,16 @@ impl BatchEngine {
     /// 行列走査はクエリ外側ではなく行外側でループする（codex レビュー指摘対応:
     /// 旧実装はクエリループの内側で行を毎回 f16→f32 デコードしており、
     /// クエリ数×行数×dim のデコード・ヒープ確保が発生していた）。行 1 件を
-    /// 1 回だけデコードし、そのバッチに含まれるテナントと一致する全クエリへ
-    /// 使い回す。選出結果の各クエリ内順序（スコア降順・同点 id 昇順）は
-    /// `TopKSelector` が保証するため、走査順序の変更による結果の変化はない。
+    /// 1 回だけデコードし、その行のテナントに属するクエリ集合だけへ使い回す
+    /// （Cursor Medium 指摘対応: 以前は内側ループがバッチの全クエリを舐めて
+    /// `PolicyContext::is_visible` でテナント一致を都度判定しており、work
+    /// budget をテナント別に精緻化しても実 wall-clock コストは
+    /// O(matching_rows * queries.len()) のままだった。事前にテナントごとの
+    /// クエリ index 一覧（`tenant_query_indices`）を作り、行のテナントに
+    /// 対応する index だけを走査することで、内側ループの反復回数が
+    /// テナント別課金と一致する）。選出結果の各クエリ内順序（スコア降順・
+    /// 同点 id 昇順）は `TopKSelector` が保証するため、走査順序の変更による
+    /// 結果の変化はない。
     ///
     /// 走査開始前に総積和演算数を [`MAX_BATCH_WORK`] と照合する（codex P1
     /// 指摘対応: 計算量 DoS 対策。`sum(k)` の上限（[`MAX_BATCH_TOTAL_K`]）を
@@ -961,11 +968,11 @@ impl BatchEngine {
         }
 
         // テナントごとの一致行数（走査時に実際にデコード対象となる行数。
-        // 下記の行外側ループが `batch_tenants.contains(row_tenant)` で除外する
-        // 行は最初からデコードされない）。この数え上げ自体は O(rows) の線形
-        // 走査で、[`MAX_BATCH_ROWS`] により上限が課されているため、走査本体
-        // （O(rows * dim) のデコード + O(rows * queries) のマスク判定）よりも
-        // 十分軽量である。
+        // 下記の行外側ループが `tenant_query_indices` に対応クエリを持たない
+        // 行を除外するため、それらの行は最初からデコードされない）。この
+        // 数え上げ自体は O(rows) の線形走査で、[`MAX_BATCH_ROWS`] により
+        // 上限が課されているため、走査本体（O(matching_rows * dim) の
+        // デコード + テナント別の行×クエリ積和）よりも十分軽量である。
         let mut tenant_row_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         tenant_row_counts
@@ -1018,6 +1025,35 @@ impl BatchEngine {
             selectors.push(selector);
         }
 
+        // テナントごとのクエリ index 一覧（Cursor Medium 指摘対応: work budget は
+        // テナント別 `行数 × クエリ数 × dim` へ精緻化済みだが、実走査が依然
+        // 「デコード済み各行 × バッチの全クエリ」を舐めて `is_visible` を判定する
+        // O(matching_rows * queries.len()) のネストループのままだと、課金と
+        // 実 wall-clock コストが乖離する。行外側ループが「その行のテナントに
+        // 属するクエリ集合」だけを走査できるよう、事前にテナント → クエリ index
+        // の一覧を構築する。各 `Vec<usize>` の容量は `tenant_query_counts` で
+        // 既に数えたテナントごとのクエリ件数ちょうどに `try_reserve_exact` で
+        // 予約するため、後続の `push` が amortized 成長で abort することはない）。
+        let mut tenant_query_indices: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        tenant_query_indices
+            .try_reserve(tenant_query_counts.len())
+            .map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve tenant query indices: {e}"
+                ))
+            })?;
+        for (&tenant, &count) in tenant_query_counts.iter() {
+            let mut indices: Vec<usize> = Vec::new();
+            try_reserve_exact(&mut indices, count, "tenant query indices")?;
+            tenant_query_indices.insert(tenant, indices);
+        }
+        for (idx, q) in queries.iter().enumerate() {
+            if let Some(indices) = tenant_query_indices.get_mut(q.ctx.tenant_id()) {
+                indices.push(idx);
+            }
+        }
+
         // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
         // `ResidentMatrix::build` が id の重複を拒否しているため、id は
         // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
@@ -1047,19 +1083,26 @@ impl BatchEngine {
             }
         }
 
-        // 行外側ループ: 行 1 件につき 1 回だけデコードし、一致する全クエリへ使う。
-        // `row_buf` は `Vec::with_capacity`（abort-on-OOM）ではなく
-        // `try_reserve_exact` でフォールブルに確保する（codex P1 指摘対応）。
+        // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行のテナントに
+        // 属するクエリ集合だけを走査する（Cursor Medium 指摘対応: 以前は
+        // クエリ側をバッチ全体で舐める O(matching_rows * queries.len()) の
+        // ネストループになっており、work budget をテナント別に精緻化しても
+        // 実 wall-clock コストは一致しなかった。`tenant_query_indices` で
+        // 行のテナントに属するクエリ index だけへ絞ることで、内側ループの
+        // 反復回数がテナント別課金と一致する）。`row_buf` は
+        // `Vec::with_capacity`（abort-on-OOM）ではなく `try_reserve_exact` で
+        // フォールブルに確保する（codex P1 指摘対応）。
         let mut row_buf: Vec<f32> = Vec::new();
         try_reserve_exact(&mut row_buf, self.matrix.dim(), "row_buf")?;
         for row_idx in 0..self.matrix.row_count() {
             let Some(row_tenant) = self.matrix.tenant_ids.get(row_idx).map(String::as_str) else {
                 continue;
             };
-            // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く。
-            if !batch_tenants.contains(row_tenant) {
+            // このバッチ内に同一テナントのクエリが 1 件も無ければデコードを省く
+            // （`tenant_query_indices` のキー集合は `batch_tenants` と一致する）。
+            let Some(query_indices) = tenant_query_indices.get(row_tenant) else {
                 continue;
-            }
+            };
             let Some(row_visibility) = self.matrix.visibilities.get(row_idx).copied() else {
                 continue;
             };
@@ -1070,10 +1113,19 @@ impl BatchEngine {
                 continue;
             }
 
-            for (q, selector) in queries.iter().zip(selectors.iter_mut()) {
+            for &qi in query_indices {
+                // untrusted 入力由来の添字ではなく、直前に `enumerate()` で
+                // 自前生成した内部インデックスだが、coding-rust.md の方針に
+                // 揃えて `[]` ではなく `get`/`get_mut` で明示的に処理する。
+                let (Some(q), Some(selector)) = (queries.get(qi), selectors.get_mut(qi)) else {
+                    continue;
+                };
                 // (1) 選出前のマスク: `PolicyContext::is_visible` を満たす
                 // 行だけを候補にする（codex P0 指摘対応: テナント文字列の
-                // 等価比較だけでなく可視性ラベルも判定する）。
+                // 等価比較だけでなく可視性ラベルも判定する。テナント一致は
+                // `tenant_query_indices` の絞り込みで既に保証済みだが、
+                // 可視性（`Visibility::Private` 等）の判定はここでしか
+                // できないため引き続き呼び出す）。
                 if !q.ctx.is_visible(row_tenant, row_visibility) {
                     continue;
                 }
