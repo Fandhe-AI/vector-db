@@ -371,11 +371,10 @@ fn storage_get_rejects_corrupted_row_bytes() {
     );
 }
 
-// 対象ビヘイビア: PERSIST-3（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
-// 複数テナント・複数 visibility の行が put_batch → 再オープン後も get / scan で
-// tenant_id・visibility を含めて同居保持されていることを確認する。
+// 対象ビヘイビア: PERSIST-3（詳細はポインタ先を参照: docs/spec/04-behavior/persistence.md）。
+// 検証手段: put_batch → 再オープン → get / scan での読み戻し確認。
 #[test]
-fn persist3_tenant_and_visibility_survive_reopen_across_get_and_scan() {
+fn persist3_reopen_roundtrip_via_get_and_scan() {
     let path = unique_db_path("persist3-reopen");
     let _cleanup = CleanupGuard(path.clone());
 
@@ -436,12 +435,11 @@ fn persist3_tenant_and_visibility_survive_reopen_across_get_and_scan() {
     );
 }
 
-// 対象ビヘイビア: PERSIST-3（詳細は関数名・ポインタ: docs/spec/04-behavior/persistence.md）。
-// tenant_id・visibility が行本体とは別テーブル（別カラムファミリ相当）に分離されず、
-// ROWS_TABLE の単一値バイト列に行本体と同一エントリとして同居していることを、
-// raw redb ハンドルでバイト列を直接検査して確認する。
+// 対象ビヘイビア: PERSIST-3（詳細はポインタ先を参照: docs/spec/04-behavior/persistence.md）。
+// 検証手段: raw redb ハンドルでのテーブル構成（list_tables）と
+// エンコード済みバイト列のオフセット検査。
 #[test]
-fn persist3_rls_fields_are_colocated_in_single_row_entry_not_a_separate_table() {
+fn persist3_on_disk_row_entry_layout_via_raw_redb() {
     let path = unique_db_path("persist3-colocated");
     let _cleanup = CleanupGuard(path.clone());
 

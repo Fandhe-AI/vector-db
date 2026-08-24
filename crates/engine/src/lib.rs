@@ -29,6 +29,7 @@ pub mod arena;
 pub mod catalog;
 pub mod core;
 pub mod kernel;
+pub mod parallel_search;
 pub mod policy;
 pub mod row_codec;
 pub mod sparse;
