@@ -470,15 +470,22 @@ impl ResidentMatrix {
         owned_ids.extend_from_slice(ids);
 
         // `tenant_ids` はコンテナ（`Vec<String>` が保持する `String` ハンドル分）
-        // だけを事前検証済みの要素数ぶん確保する。各要素の実体（ヒープ上の
-        // 文字列バイト列）は `MAX_TENANT_ID_LEN` で上限検証済みの小さい固定長
-        // なので、`String::clone` 自体の確保は `arena.rs` の既存 `push_row`
-        // 経路（呼び出し元が既に所有する `String` を移動するだけ）と同様、
-        // 通常のアロケータ確保のままとする。
+        // をフォールブルに確保したうえで、各要素の実体（ヒープ上の文字列
+        // バイト列）も `String::clone`（abort-on-OOM）ではなく
+        // `try_reserve_exact` + `push_str` でフォールブルに構築する
+        // （codex P1 指摘対応: 各要素は `MAX_TENANT_ID_LEN` で上限検証済みの
+        // 小さい固定長だが、最大 `MAX_BATCH_ROWS`（100 万）回 `clone` が
+        // 呼ばれるため、ホスト側のメモリ不足時に `Result` 契約を経ずに
+        // abort しうる経路として残さない）。
         let mut owned_tenant_ids: Vec<String> = Vec::new();
         try_reserve_exact(&mut owned_tenant_ids, tenant_ids.len(), "tenant_ids")?;
         for tenant in tenant_ids {
-            owned_tenant_ids.push(tenant.clone());
+            let mut owned = String::new();
+            owned.try_reserve_exact(tenant.len()).map_err(|e| {
+                GpuSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
+            })?;
+            owned.push_str(tenant);
+            owned_tenant_ids.push(owned);
         }
 
         Ok(Self {
@@ -632,7 +639,12 @@ impl GpuBatchEngine {
         }
 
         // 事前検証パス: 次元・非有限値・k をクエリごとに検証し、選出器を用意する。
-        let mut selectors: Vec<TopKSelector> = Vec::with_capacity(queries.len());
+        // 選出器コンテナ（`Vec<TopKSelector>`）は `Vec::with_capacity`
+        // （失敗時に abort する内部確保）ではなく `try_reserve_exact` で
+        // フォールブルに確保する（codex P1 指摘対応。`ResidentMatrix::build`
+        // 用に定義済みの共通ヘルパーを再利用）。
+        let mut selectors: Vec<TopKSelector> = Vec::new();
+        try_reserve_exact(&mut selectors, queries.len(), "selectors")?;
         for (query_index, q) in queries.iter().enumerate() {
             if q.vector.len() != self.matrix.dim {
                 return Err(GpuSearchError::DimMismatch {
@@ -963,6 +975,36 @@ mod tests {
                 len: oversized.len(),
                 max: crate::storage::MAX_TENANT_ID_LEN as usize,
             }
+        );
+    }
+
+    // codex P1 指摘対応: `tenant_ids` の各要素を `String::clone`（abort-on-OOM）
+    // ではなく `try_reserve_exact` + `push_str` でフォールブルに構築するよう
+    // 変更したため、マルチバイト UTF-8（バイト長と文字数が異なる）を含む
+    // tenant_id でも内容が過不足なく複製されることを回帰確認する。内部
+    // フィールドは非公開のため、`batch_search` のテナント一致マスクを
+    // 経由した機能的な等価性チェックで検証する（1 バイトでも欠落・破損
+    // すれば文字列比較が食い違い、該当行が誤ってマスクされるかクエリ側
+    // マスクに一致しなくなるため十分な検出力を持つ）。
+    #[test]
+    fn resident_matrix_preserves_multibyte_tenant_id_via_fallible_clone() {
+        let multibyte_tenant = "tenant-日本語-🎉".to_string();
+        let ids = [1u64];
+        let tenants = [multibyte_tenant.clone()];
+        let vectors = [1.0f32, 0.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, 2, &vectors).expect("valid matrix");
+        let engine = GpuBatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 1,
+            tenant_id: &multibyte_tenant,
+        }];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(
+            results[0].hits.first().map(|h| h.id),
+            Some(1),
+            "tenant_id must round-trip byte-for-byte through the fallible clone"
         );
     }
 
