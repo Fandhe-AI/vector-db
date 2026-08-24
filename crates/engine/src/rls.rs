@@ -157,20 +157,19 @@ impl<'s> PrefilterIndex<'s> {
     /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
     /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**に
-    /// [`crate::storage::Storage::begin_generation_snapshot`] で読み取りスナップショットを
-    /// 開始し、その場で読んだ世代を [`Self::build`] 時の値と比較する。不一致なら provider を
-    /// 呼ばずに [`RlsError::IndexStale`] で拒否する（呼び出し元は [`Self::build`] を
-    /// 呼び直すこと）。世代はストレージ全体の書き込みコミットのたびに単調増加する
-    /// （`crate::storage::bump_generation_and_commit`）ため、一致は「構築時点から行集合・
-    /// 内容とも一切変更されていない」ことを意味する（行の tenant/visibility 変更・
-    /// embedding 更新・新規挿入のいずれも検出する）。一致後に provider を 1 回呼び、戻り値を
+    /// [`crate::storage::Storage::begin_generation_snapshot`] で世代を読み、
+    /// [`Self::build`] 時の値と比較する（不一致は provider を呼ばずに
+    /// [`RlsError::IndexStale`]）。世代はストレージ全体の書き込みコミットのたびに単調増加
+    /// する（`crate::storage::bump_generation_and_commit`）ため、一致は「構築時点から行集合・
+    /// 内容とも一切変更されていない」ことを意味する。一致後に provider を 1 回呼び、戻り値を
     /// `provider_result_is_valid`（`core.rs`）で検証する（違反は
-    /// [`RlsError::ProviderResultRejected`]）。開始したスナップショットは本メソッドが
-    /// `Vec<SearchHit>` を返し終えるまでローカル変数として生存させ、その間 redb の
-    /// MVCC 契約により pin され続ける（`GenerationSnapshot` のドキュメント参照）ため、
-    /// 世代確認後・provider 実行中・結果確定までの間に別の書き込みがコミットされても、
-    /// 本メソッドの返却結果は世代確認時点のスナップショットに対して一貫する。
-    /// TASK-133・RLS-1〜4 参照。
+    /// [`RlsError::ProviderResultRejected`]）。**返却直前にもう一度世代を読み直し**、
+    /// 事前確認時の値と再度一致することを確認してから `Ok(hits)` を返す（不一致は結果を
+    /// 破棄し [`RlsError::IndexStale`]）。read txn の保持（`GenerationSnapshot`）は古い
+    /// スナップショットを pin するだけで書き込みをブロックしないため、事前確認〜結果返却の
+    /// 間に別の書き込みがコミットされうる。事後の世代再確認により、その間に競合する書き込みが
+    /// あった場合は結果を確定させず破棄する（事後確認と破棄判定の間のごく短い残余ウィンドウは
+    /// 呼び出し側が次回検索の世代照合で扱う）。TASK-133・RLS-1〜4 参照。
     pub fn search(
         &self,
         ctx: &PolicyContext,
@@ -193,11 +192,8 @@ impl<'s> PrefilterIndex<'s> {
             return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
         }
 
-        // 失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
+        // 事前の失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
         // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
-        // `generation_snapshot` は関数末尾（`Ok(hits)` を返すまで）生存させる:
-        // redb の read txn は書き込みをブロックしない（MVCC）ため、保持を
-        // provider 呼び出しをまたいで延ばしても書き込み側の DoS 要因にはならない。
         let generation_snapshot = self
             .storage
             .begin_generation_snapshot()
@@ -217,6 +213,17 @@ impl<'s> PrefilterIndex<'s> {
 
         if !provider_result_is_valid(&hits, k, &self.visible_id_set) {
             return Err(RlsError::ProviderResultRejected);
+        }
+
+        // 事後の失効再検証（上記ドキュメント参照）。read txn の保持は書き込みをブロック
+        // しないため、事前確認〜ここまでの間に別の書き込みがコミットされている可能性がある。
+        // 新しいスナップショットで世代を読み直し、不一致なら結果を破棄する。
+        let post_generation_snapshot = self
+            .storage
+            .begin_generation_snapshot()
+            .map_err(|_| RlsError::IndexStale)?;
+        if post_generation_snapshot.generation() != self.built_generation {
+            return Err(RlsError::IndexStale);
         }
 
         Ok(hits)
@@ -960,5 +967,55 @@ mod tests {
         assert_eq!(provider.call_count(), 1);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, 1);
+    }
+
+    /// provider 自身が `search` 呼び出し内で（`self.storage` を通じて）ストレージへ
+    /// 書き込みコミットを行う計装 provider。事前の世代確認〜事後の世代再確認の間に
+    /// 別の書き込みが割り込むケースを決定的に再現するために使う。
+    struct WritingDuringSearchProvider<'s> {
+        storage: &'s Storage,
+    }
+    impl SearchProvider for WritingDuringSearchProvider<'_> {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            self.storage
+                .insert_row_into_table(
+                    "docs",
+                    999,
+                    &RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.0, 0.0],
+                        metadata: &[],
+                    },
+                )
+                .expect("write during provider search");
+            CpuScalarProvider.search(input)
+        }
+    }
+
+    // 事後の世代再検証（codex 指摘対応）: provider 実行中にストレージへの書き込みが
+    // コミットされた場合、事前確認は通過していても事後の世代再確認で不一致が検出され
+    // `RlsError::IndexStale` になることを検証する。
+    #[test]
+    fn search_rejects_when_storage_is_written_to_during_provider_execution() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        let provider = WritingDuringSearchProvider { storage: &storage };
+        let result = index.search(&ctx, &provider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
     }
 }
