@@ -78,6 +78,20 @@ pub enum RlsError {
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
     /// `provider_result_is_valid` で行う。fail-closed: 違反があれば結果を一切返さない）。
     ProviderResultRejected,
+    /// [`SearchTimeFilter::build`] が無フィルタで対象テーブル全行を decode した際、
+    /// いずれかの行で次元不一致（[`ArenaError::DimMismatch`]）を検出した。`build` には
+    /// `ctx` を渡さないため、この行が呼び出し元とは無関係な他テナントの行である
+    /// 可能性がある。`ArenaError::DimMismatch` の `Display` は行 id を含むため、
+    /// そのまま `RlsError::Arena` へ委譲すると他テナントの行 id という存在情報を
+    /// 漏らしてしまう（security.md P0）。本 variant の `Display` は id・テナント ID を
+    /// 一切含まない。[`PrefilterIndex::build`] は `predicate`（＝呼び出し元 `ctx` の
+    /// 可視性述語）を通過した行だけを decode するため、`ArenaError::DimMismatch` が
+    /// 出るのは呼び出し元 `ctx` から可視な行に限られる（可視行の id は呼び出し元が
+    /// 既に到達できる情報であり、存在情報の漏えいにならない。`PolicyContext::is_visible`
+    /// の可視性判定次第では他テナントの行も可視になり得るが、それは「呼び出し元から
+    /// 見えている」という前提の範囲内であり対称の問題は起きない。`PrefilterIndex::build`
+    /// は引き続き `RlsError::Arena` を返す）。
+    TableCorrupted,
 }
 
 impl std::fmt::Display for RlsError {
@@ -102,6 +116,9 @@ impl std::fmt::Display for RlsError {
                 f,
                 "search provider returned a hit outside the policy-visible id set"
             ),
+            RlsError::TableCorrupted => {
+                write!(f, "table contains a row that failed validation during scan")
+            }
         }
     }
 }
@@ -313,6 +330,13 @@ impl<'s> SearchTimeFilter<'s> {
     /// 合算）の行数・バイト量」になる（`PrefilterIndex::build` の「呼び出しテナントの
     /// 可視行数」基準とは非対称）。詳細はモジュール doc「可用性面の非対称性」の項を
     /// 参照。
+    ///
+    /// 次元不一致行の検出は [`RlsError::TableCorrupted`] へ丸め込む（`ArenaError`
+    /// をそのまま `.into()` しない）: 本メソッドは `ctx` を受け取らず全行を無条件に
+    /// decode するため、検出された行が呼び出し元とは無関係な他テナントの行である
+    /// 可能性があり、`ArenaError::DimMismatch` の `Display`（行 id を含む）をそのまま
+    /// 伝播すると他テナントの存在情報を漏らす（security.md P0。[`RlsError::TableCorrupted`]
+    /// のドキュメント参照）。
     pub fn build(storage: &'s Storage, table: &str) -> Result<Self, RlsError> {
         // 世代を先に読んでからアリーナを構築する（`PrefilterIndex::build` と同じ順序。
         // アリーナ構築中に別の書き込みがコミットされても見落とさない方向）。
@@ -322,6 +346,9 @@ impl<'s> SearchTimeFilter<'s> {
             Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
                 return Err(RlsError::NotFound)
             }
+            // 上記ドキュメント参照: 検出行が他テナントの行かもしれないため id を含む
+            // `Display` をそのまま伝播しない。
+            Err(ArenaError::DimMismatch { .. }) => return Err(RlsError::TableCorrupted),
             Err(e) => return Err(e.into()),
         };
         Ok(Self {
@@ -430,6 +457,15 @@ impl<'s> SearchTimeFilter<'s> {
     /// `ctx` の可視性述語で数えた可視行数を返す（存在情報のため `ctx` 必須。
     /// [`PrefilterIndex::len`] と異なり `ContextMismatch` は返さず、渡された `ctx` で
     /// 都度判定する——[`Self`] は構築時にポリシーを束縛しないため）。
+    ///
+    /// **[`Self::search`] の返却件数との乖離（片方向のみ）**: `is_empty(ctx)` が `true`
+    /// なら `search` は必ず 0 件を返す（両者とも同じ `ctx.is_visible` 述語で判定する
+    /// ため）。逆に `len(ctx) >= 1`（`is_empty(ctx)` が `false`）であっても `search` が
+    /// 0 件になり得る——`search` はさらに、id/vector を取得できない行（アリーナの
+    /// 不変条件破れ）・スコアが非有限になる行（格納ベクトルへの NaN/Inf 混入）も除外
+    /// するため（[`Self::search`] 参照）。`len`/`is_empty` はこれらを判定しない。
+    /// [`PrefilterIndex::len`]/[`PrefilterIndex::is_empty`] も同じ片方向の乖離を持つ
+    /// （`search` に渡した `SearchProvider` が破損行・非有限スコア行を除外しうるため）。
     pub fn len(&self, ctx: &PolicyContext) -> usize {
         (0..self.arena.len())
             .filter(
@@ -442,7 +478,8 @@ impl<'s> SearchTimeFilter<'s> {
     }
 
     /// 可視行が 0 件かを返す（`ctx` 判定は [`Self::len`] と同じ述語。先頭から可視行が
-    /// 見つかり次第打ち切るため全件走査の [`Self::len`] より軽い）。
+    /// 見つかり次第打ち切るため全件走査の [`Self::len`] より軽い）。[`Self::search`] との
+    /// 乖離は [`Self::len`] のドキュメント参照。
     pub fn is_empty(&self, ctx: &PolicyContext) -> bool {
         !(0..self.arena.len()).any(|idx| {
             match (self.arena.tenant_id(idx), self.arena.visibility(idx)) {
@@ -1485,6 +1522,64 @@ mod tests {
 
         let result = SearchTimeFilter::build(&storage, "no_such_table");
         assert!(matches!(result, Err(RlsError::NotFound)));
+    }
+
+    // 対象ビヘイビア: RLS-1（本レビュー指摘対応）。`SearchTimeFilter::build` は `ctx` を
+    // 受け取らず全行を無条件に decode するため、次元不一致で壊れた行が呼び出し元とは
+    // 無関係な他テナント（tenant-b）に属していても、その行 id を含む
+    // `ArenaError::DimMismatch` をそのまま伝播しない（`RlsError::TableCorrupted` へ
+    // 丸め込み、`Display` に行 id を含まない）ことを検証する。
+    // `insert_row_into_table` は挿入時点で次元検証するため、`arena.rs::tests` と同じ手法
+    // （検証を経由しない生の write トランザクション）で次元不一致行を直接書き込む。
+    #[test]
+    fn search_time_filter_build_maps_a_foreign_tenants_corrupted_row_to_a_non_identifying_error() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create table");
+        // tenant-a の正常行（呼び出し元想定のテナント）。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 2.0, 3.0, 4.0],
+        );
+        // 呼び出し元とは無関係な tenant-b の行 id=2 を、次元不一致状態で直接書き込む。
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = crate::catalog::user_rows_table_name("docs");
+                let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                    redb::TableDefinition::new(&row_table_name);
+                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let encoded = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 2.0],
+                    metadata: &[],
+                })
+                .expect("encode mismatched-dim row for tenant-b");
+                row_table
+                    .insert(2u64, encoded.as_slice())
+                    .expect("insert mismatched-dim row bypassing dim validation");
+            }
+            write_txn.commit().expect("commit mismatched-dim row");
+        }
+
+        let result = SearchTimeFilter::build(&storage, "docs");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("corrupted row must be rejected"),
+        };
+        assert!(matches!(err, RlsError::TableCorrupted));
+        let rendered = err.to_string();
+        // 他テナント（tenant-b）の行 id・テナント ID のいずれも `Display` へ現れない
+        // （security.md P0: エラー経由で他テナントの存在情報を漏らさない）。
+        assert!(!rendered.contains('2'));
+        assert!(!rendered.contains("tenant-b"));
     }
 
     // fail-closed 系: build 後に書き込みコミットで世代が進んだ後の search は IndexStale。
