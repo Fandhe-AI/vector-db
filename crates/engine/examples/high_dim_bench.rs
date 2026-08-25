@@ -159,6 +159,17 @@ fn print_latency_row(label: &str, s: &LatencyStats) {
     );
 }
 
+/// パート B 専用の行出力。ヘッダーの 4 列目は `max` ではなく `db_size` であり、
+/// `print_latency_row`（4 列目に `s.max` を出す）を使うと db_size ラベルに反して
+/// 常に max レイテンシが出力され、再実行時に latency と DB size を取り違える恐れが
+/// あった（Cursor Bugbot 指摘）。db_size は明示的な数値列として出す。
+fn print_engine_row(label: &str, s: &LatencyStats, db_size_bytes: u64) {
+    println!(
+        "{:<38} | {:>10.3?} | {:>10.3?} | {:>10} bytes",
+        label, s.p50, s.p95, db_size_bytes
+    );
+}
+
 fn run_part_a() {
     println!(
         "\n=== Part A: single-shot query dimension scaling (row_count={PROVIDER_ROW_COUNT}, k={PROVIDER_TOP_K}) ==="
@@ -288,7 +299,7 @@ fn run_part_b() {
         stats
     };
     let size_solo = file_size(&path_solo);
-    print_latency_row(&format!("solo(2000 only) [{size_solo} bytes]"), &stats_solo);
+    print_engine_row("solo(2000 only)", &stats_solo, size_solo);
 
     // (b) 768 + 2000 次元テーブル共存 DB。
     let path_coexist = unique_db_path("coexist-768-2000");
@@ -303,10 +314,7 @@ fn run_part_b() {
         stats
     };
     let size_coexist = file_size(&path_coexist);
-    print_latency_row(
-        &format!("coexist(768+2000) [{size_coexist} bytes]"),
-        &stats_coexist,
-    );
+    print_engine_row("coexist(768+2000)", &stats_coexist, size_coexist);
 
     let delta_pct = |a: Duration, b: Duration| -> f64 {
         if b.as_secs_f64() > 0.0 {
