@@ -260,8 +260,10 @@ impl PrefilterSnapshot {
     /// provider から結果を受け取った**後**の 2 回、`storage`（呼び出し元が渡す。
     /// キャッシュ経由の再利用時も構築時と同一の `Storage` を渡す契約）の
     /// [`crate::storage::Storage::current_generation`] を呼んで構築時の値と比較する
-    /// （いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体の
-    /// 書き込みコミットのたびに単調増加する（`crate::storage::bump_generation_and_commit`）
+    /// （いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体で、
+    /// 実書き込みを伴うコミットのたびに単調増加する（`crate::storage::commit_write_txn`
+    /// が `has_writes == true` のときのみ `crate::storage::bump_generation_and_commit`
+    /// に委譲する契約。Issue #175。put を伴わない no-op commit では世代は進まない）
     /// ため、両方で一致することは「事前確認から事後確認までの間、行集合・内容とも一切
     /// 変更されていない」ことを意味する（安全性はこの前後比較のみで担保しており、
     /// `current_generation` 自体は世代値以外の一貫性を保証しない）。事前確認を通過した
@@ -1221,6 +1223,81 @@ mod tests {
 
         let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // 構築後に `crate::txn::WriteTxn` 経由で行を上書きした場合も、`ROWS_TABLE` 直接の
+    // `insert_row_into_table`（catalog.rs 経由）と同様に世代カウンタの不一致により
+    // `RlsError::IndexStale` で拒否する（Issue #175。「実書き込みの有無」判定の消費者側
+    // 退行検査。世代はストレージ全体で 1 つのため、対象テーブル外の書き込みでも失効する
+    // 現行契約自体は変えない）。
+    #[test]
+    fn search_rejects_after_write_txn_overwrite_commit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // WriteTxn 経由で行 1 の embedding を上書きする（RowInput の tenant_id は
+        // catalog.rs 側テーブル名プレフィックスの都合上、insert 側と別経路の
+        // 生 put のため id は catalog 側と衝突しない別 id を使う）。
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(
+            1_000_000,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[0.0, 1.0],
+                metadata: &[],
+            },
+        )
+        .expect("put");
+        txn.commit().expect("commit with put");
+
+        let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // put を 1 度も呼ばない `WriteTxn` の commit（no-op commit）は世代を進めないため
+    // （Issue #175）、構築済みインデックスはそのまま `search` を継続できる。
+    // 本 Issue の効果（実書き込みなし commit で世代を不変にすることによる過剰失効の
+    // 削減）を消費者側で固定する。
+    #[test]
+    fn search_still_succeeds_after_noop_write_txn_commit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        let txn = storage.begin_write().expect("begin_write");
+        txn.commit().expect("commit without put");
+
+        let result = index
+            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .expect("search should still succeed after no-op commit");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
     }
 
     // 構築後に新規可視行が挿入された場合も世代カウンタの不一致により
