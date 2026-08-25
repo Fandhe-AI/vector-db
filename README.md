@@ -44,7 +44,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
-| `make bench-parallel` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
+| `make bench-parallel` / `make bench-c1` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
 
 ターゲット一覧は `make help` で確認できます。
 
@@ -74,6 +74,16 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
 - `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡中で、`BENCH_CORE6`／`BENCH_CORE16` repo variable による opt-in 方式のまま維持します（未設定＝既定で対象外）。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。
+
+### C1 p95 専有環境再測定（TASK-83）
+
+`make bench-c1`（`crates/engine/benches/sql_c1_bench.rs`）は SQL 表層（`EngineCore::execute_sql`）経由の C1（純粋 Top-k）p95 を測定します。閾値は上記の `BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL` を同じ repo variables として再利用します（追加の variable 設定は不要です）。`.github/workflows/bench.yml` の `bench-c1` ジョブは `workflow_dispatch` 限定で、`bench-parallel`／`bench-batch` と異なり週次 `schedule` には含めません（GitHub ホステッド runner が専有環境ではないため。詳細は `docs/design/c1-p95-dedicated-env-reverification.md` 参照）。
+
+`BENCH_DEDICATED_ENV=1` は Conditional Go 条件7（専有環境での p95 再測定）の判定を有効化する opt-in フラグです。他プロセスと CPU/IO を共有しない専有環境で実行する場合にのみ設定してください（自動検出はできないため運用者の明示宣言に限ります）。未設定（既定）の場合、p95・Recall の pass/fail 自体は出力されますが、条件7 の判定対象からは明示的に除外されます。
+
+```bash
+BENCH_MAX_P95_MS=<spec 値> BENCH_MIN_RECALL=<spec 値> BENCH_DEDICATED_ENV=1 make bench-c1
+```
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 

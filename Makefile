@@ -233,6 +233,18 @@ else
 endif
 
 # --------------------------------------------------
+# C1（純粋 Top-k）SQL 表層 p95 専有環境再測定（TASK-83。crates/engine/benches/sql_c1_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-c1
+bench-c1: ## TASK-83（Conditional Go 条件7）の SQL 表層 C1 p95 再測定ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から workflow_dispatch のみで実行。schedule 化はしない）
+ifdef HAS_CARGO
+	cargo bench --bench sql_c1_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-c1 をスキップ"
+endif
+
+# --------------------------------------------------
 # ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
 # --------------------------------------------------
 

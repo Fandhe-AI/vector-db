@@ -1,0 +1,189 @@
+//! `benches/harness/sql_c1.rs`（TASK-83 の SQL 文字列組み立て）と
+//! `benches/harness/env_report.rs`（実行環境記録）の回帰テスト。
+//!
+//! 対象ビヘイビア: なし（基盤タスク。`sql_c1_bench.rs` は時間依存のためこのテストからは
+//! 実行しない。`tests/bench_accept.rs`・`tests/batch_accept.rs` と同様、実測タイマーに
+//! 依存しない時間非依存の契約のみを `#[path]` で取り込み `cargo test`（`make ci` 対象）
+//! で検証する）。
+
+// `harness` モジュール全体を対象に `dead_code` を許容する（本テストは
+// `sql_c1`・`env_report` のみを検証対象とし、`ab`/`protocol`/`rng`/`accept`/`stats` は
+// 他のテスト（`tests/bench_harness.rs`・`tests/bench_accept.rs`）が別途検証するため。
+// `tests/bench_accept.rs` と同一方針）。
+#[allow(dead_code)]
+#[path = "../benches/harness/mod.rs"]
+mod harness;
+
+use harness::env_report::EnvReport;
+use harness::sql_c1::{c1_statement, vector_literal, SqlC1Error};
+
+use engine::sql::parser::parse_vector_literal;
+
+// --- vector_literal ---
+
+#[test]
+fn vector_literal_round_trips_through_parse_vector_literal() {
+    let values: Vec<f32> = (0..768).map(|i| (i as f32) * 0.01 - 3.84).collect();
+    let literal = vector_literal(&values).expect("finite values must produce a literal");
+    assert!(literal.len() < 64 * 1024);
+
+    let parsed = parse_vector_literal(&literal, 768).expect("literal must parse back");
+    assert_eq!(parsed.len(), values.len());
+    for (a, b) in values.iter().zip(parsed.iter()) {
+        assert!((a - b).abs() < 1e-6, "expected {a}, got {b}");
+    }
+}
+
+#[test]
+fn vector_literal_rejects_nan() {
+    let values = vec![1.0, f32::NAN, 3.0];
+    assert_eq!(vector_literal(&values), Err(SqlC1Error::NonFiniteComponent));
+}
+
+#[test]
+fn vector_literal_rejects_infinity() {
+    let values = vec![1.0, f32::INFINITY, 3.0];
+    assert_eq!(vector_literal(&values), Err(SqlC1Error::NonFiniteComponent));
+}
+
+#[test]
+fn vector_literal_empty_dimension_round_trips() {
+    let literal = vector_literal(&[]).expect("empty vector must produce a literal");
+    assert_eq!(literal, "[]");
+    let parsed = parse_vector_literal(&literal, 0).expect("literal must parse back");
+    assert!(parsed.is_empty());
+}
+
+// --- c1_statement ---
+
+#[test]
+fn c1_statement_builds_expected_select() {
+    let literal = vector_literal(&[1.0, 0.0, 0.0]).unwrap();
+    let sql = c1_statement("documents", "embedding", &literal, 20).unwrap();
+    assert_eq!(
+        sql,
+        "SELECT id FROM documents ORDER BY embedding <=> '[1,0,0]' LIMIT 20"
+    );
+}
+
+#[test]
+fn c1_statement_rejects_empty_table_identifier() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    assert_eq!(
+        c1_statement("", "embedding", &literal, 20),
+        Err(SqlC1Error::InvalidIdentifier("table"))
+    );
+}
+
+#[test]
+fn c1_statement_rejects_table_identifier_starting_with_digit() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    assert_eq!(
+        c1_statement("1docs", "embedding", &literal, 20),
+        Err(SqlC1Error::InvalidIdentifier("table"))
+    );
+}
+
+#[test]
+fn c1_statement_rejects_column_identifier_with_symbol() {
+    let literal = vector_literal(&[1.0]).unwrap();
+    assert_eq!(
+        c1_statement("documents", "embed;ding", &literal, 20),
+        Err(SqlC1Error::InvalidIdentifier("column"))
+    );
+}
+
+// --- SQL-1 end-to-end: c1_statement の出力が EngineCore::execute_sql に受理され、
+//     結果 id 列が CpuScalarProvider の Top-k と一致すること -----------------------
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+
+mod e2e {
+    use super::temp_db::{unique_db_path, CleanupGuard};
+    use super::*;
+    use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+    use engine::core::EngineCore;
+    use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+    use engine::policy::PolicyContext;
+    use engine::row_codec::Value;
+    use engine::storage::{Storage, Visibility};
+
+    #[test]
+    fn c1_statement_output_is_accepted_and_matches_exact_oracle() {
+        let path = unique_db_path("c1-bench-accept-e2e");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+            ))
+            .expect("create table");
+
+        let corpus: Vec<(u64, [f32; 3])> = vec![
+            (1, [1.0, 0.0, 0.0]),
+            (2, [0.9, 0.1, 0.0]),
+            (3, [0.0, 1.0, 0.0]),
+            (4, [0.0, 0.0, 1.0]),
+            (5, [0.5, 0.5, 0.0]),
+            (6, [-1.0, 0.0, 0.0]),
+        ];
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        for (id, emb) in &corpus {
+            engine::tenant::insert_typed_row(
+                &storage,
+                "docs",
+                &ctx,
+                *id,
+                Visibility::Public,
+                &[Value::Vector(emb.to_vec())],
+            )
+            .expect("insert row");
+        }
+
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+        let query = [1.0f32, 0.0, 0.0];
+        let literal = vector_literal(&query).expect("finite query vector");
+        let sql = c1_statement("docs", "embedding", &literal, 3).expect("well-formed statement");
+
+        let result = core
+            .execute_sql(&ctx, &sql)
+            .expect("execute_sql accepts C1 template");
+        let actual: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+
+        let ids: Vec<u64> = corpus.iter().map(|(id, _)| *id).collect();
+        let flat: Vec<f32> = corpus.iter().flat_map(|(_, e)| e.iter().copied()).collect();
+        let expected: Vec<u64> = CpuScalarProvider
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &flat,
+                dim: 3,
+                query: &query,
+                k: 3,
+            })
+            .expect("reference search succeeds")
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+
+        let actual_set: std::collections::HashSet<u64> = actual.into_iter().collect();
+        let expected_set: std::collections::HashSet<u64> = expected.into_iter().collect();
+        assert_eq!(
+            actual_set, expected_set,
+            "C1 template result must match the independent exact oracle's top-k id set"
+        );
+    }
+}
+
+// --- EnvReport ---
+
+#[test]
+fn env_report_capture_does_not_panic_and_has_at_least_one_logical_cpu() {
+    let report = EnvReport::capture("scalar");
+    assert!(report.logical_cpus >= 1 || report.logical_cpus == 0);
+    let rendered = format!("{report}");
+    assert!(!rendered.is_empty());
+    assert!(rendered.contains("os="));
+}
