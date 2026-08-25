@@ -46,7 +46,7 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(stream, &store);
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
@@ -64,7 +64,7 @@ fn spawn_server_accepting_one_joinable(
 
     let handle = std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(stream, &store);
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
@@ -82,7 +82,7 @@ fn spawn_server_with_accept_loop(
     let limiter = ConnectionLimiter::new(max_connections);
 
     std::thread::spawn(move || {
-        wire_server::server::accept_loop(listener, store, limiter, io_timeout);
+        wire_server::server::accept_loop_with_limiter(listener, store, limiter, io_timeout);
     });
 
     addr
@@ -333,7 +333,7 @@ fn wire10_negative_startup_length_returns_08p01() {
 }
 
 /// WIRE-10: 宣言長より実送信が短い（途中切断）StartupMessage を受けても panic
-/// せず、応答なしで正常にクローズすること（`handle_connection` を包むスレッドの
+/// せず、応答なしで正常にクローズすること（`handle_connection_bounded` を包むスレッドの
 /// `join()` が `Ok` であることで確認する）。
 #[test]
 fn wire10_truncated_startup_closes_without_panic() {

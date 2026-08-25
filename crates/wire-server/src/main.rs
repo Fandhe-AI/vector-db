@@ -17,9 +17,9 @@
 //! する（TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
 //! 再解決による TOCTOU も作らない。TASK-67 review 是正・TASK-70 で移設）。同時接続数
 //! 上限・認証前後の読み取りタイムアウトは [`wire_server::limits`] の契約値を
-//! [`wire_server::server::accept_loop`] が適用する（TASK-69）。TLS 導入
-//! （TASK-72・WIRE-9）時は [`wire_server::bind_guard::TransportSecurity`] に variant を
-//! 追加し、ここで渡す値を実行時の TLS 設定有無に応じて切り替える。
+//! [`wire_server::server::accept_loop_with_limiter`] が適用する（TASK-69）。
+//! TLS 導入（TASK-72・WIRE-9）時は [`wire_server::bind_guard::TransportSecurity`]
+//! に variant を追加し、ここで渡す値を実行時の TLS 設定有無に応じて切り替える。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -114,7 +114,7 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     eprintln!("wire-server: listening on {bind_addr}");
 
-    server::accept_loop(
+    server::accept_loop_with_limiter(
         listener,
         store,
         limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS),

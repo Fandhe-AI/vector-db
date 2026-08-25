@@ -1,6 +1,6 @@
 //! wire-server の結合テスト（TASK-69・対象ビヘイビア WIRE-5, WIRE-6）。
 //!
-//! ephemeral port（`127.0.0.1:0`）で `wire_server::server::accept_loop` を起動し、
+//! ephemeral port（`127.0.0.1:0`）で `wire_server::server::accept_loop_with_limiter` を起動し、
 //! `std::net::TcpStream` で生バイトを送受信する自作クライアントを用いる
 //! （`tests/wire_auth.rs` と同じ流儀。結合テスト間でモジュールを共有しないため
 //! ヘルパーはこのファイル内に閉じる）。
@@ -41,7 +41,7 @@ fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
     path
 }
 
-/// `wire_server::server::accept_loop` をサーバースレッドで起動し、
+/// `wire_server::server::accept_loop_with_limiter` をサーバースレッドで起動し、
 /// `(接続先アドレス, リミッターのクローン)` を返す。呼び出し元はリミッターの
 /// `active()` を観測して、拒否時に枠が消費されていないことを間接確認できる。
 fn spawn_server(
@@ -56,7 +56,12 @@ fn spawn_server(
     let limiter_for_loop = limiter.clone();
 
     std::thread::spawn(move || {
-        wire_server::server::accept_loop(listener, store, limiter_for_loop, read_timeout);
+        wire_server::server::accept_loop_with_limiter(
+            listener,
+            store,
+            limiter_for_loop,
+            read_timeout,
+        );
     });
 
     (addr, limiter)

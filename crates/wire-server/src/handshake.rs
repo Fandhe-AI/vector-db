@@ -1,7 +1,7 @@
 //! PostgreSQL wire プロトコル v3 のハンドシェイク・簡易クエリ最小応答を担う。
 //!
 //! `main.rs` の接続受け付けループ（`TcpListener` + thread-per-connection）から
-//! 1 接続 1 スレッドで [`handle_connection`] が呼ばれる。認証の実照合は
+//! 1 接続 1 スレッドで [`handle_connection_bounded`] が呼ばれる。認証の実照合は
 //! `auth::verify` に委譲し、本モジュールはメッセージのフレーミング（読み書き・
 //! 長さ検証）と応答メッセージの組み立てに専念する。
 //!
@@ -56,7 +56,7 @@ impl From<FrameError> for HandshakeError {
     fn from(e: FrameError) -> Self {
         match e {
             // I/O 異常（タイムアウト等）はフレーミング分類ではなく通常の I/O エラー
-            // として扱う（呼び出し元の `handle_connection` が `Err` を返す経路と
+            // として扱う（呼び出し元の `handle_connection_bounded` が `Err` を返す経路と
             // 揃える）。
             FrameError::Io(io_err) => HandshakeError::Io(io_err),
             other => HandshakeError::Frame(other),
@@ -64,7 +64,7 @@ impl From<FrameError> for HandshakeError {
     }
 }
 
-/// `handle_connection` の戻り値型（`io::Result<()>`）へ `?` で直接畳み込めるようにする
+/// `handle_connection_bounded` の戻り値型（`io::Result<()>`）へ `?` で直接畳み込めるようにする
 /// 変換。`Protocol`/`Frame` 側は `io::ErrorKind::InvalidData` に写像し、呼び出し元
 /// （`main.rs`）にはログ用途の文字列のみを残す（詳細な違反理由をクライアントへ
 /// 返すことはない）。
@@ -438,18 +438,24 @@ fn respond_and_close(
     }
 }
 
-/// 1 接続ぶんのハンドシェイク・認証・最小クエリループ全体。`server::accept_loop`
-/// の接続受け付けスレッドから呼ばれる。戻り値の `Err` はネットワーク I/O 異常
-/// （クライアント切断・読み取りタイムアウト等）を表し、呼び出し元はログのみで
-/// スレッドを終了してよい（他接続には影響させない）。
+/// 1 接続ぶんのハンドシェイク・認証・最小クエリループ全体。
+/// `server::accept_loop_with_limiter` の接続受け付けスレッドから呼ばれる。
+/// 戻り値の `Err` はネットワーク I/O 異常（クライアント切断・読み取り
+/// タイムアウト等）を表し、呼び出し元はログのみでスレッドを終了してよい
+/// （他接続には影響させない）。
 ///
-/// 読み取りタイムアウト（`limits::READ_TIMEOUT`）は呼び出し元の `server::accept_loop`
-/// が受理直後に一度だけソケットへ設定済みであり、本関数はそれを認証前後で
-/// 変更しない（WIRE-5: 接続全体に同一の期限を適用する）。タイムアウト由来の
-/// `io::Error`（`TimedOut` / `WouldBlock`）はここで捕捉して ErrorResponse を書く
-/// ことはせず、そのまま `Err` として呼び出し元へ返す（応答なしでクローズする
-/// ことが WIRE-5 の契約）。
-pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
+/// 読み取りタイムアウト（`limits::READ_TIMEOUT`）は呼び出し元の
+/// `server::accept_loop_with_limiter` が受理直後に一度だけソケットへ設定済み
+/// であり、本関数はそれを認証前後で変更しない（WIRE-5: 接続全体に同一の期限を
+/// 適用する）。タイムアウト由来の `io::Error`（`TimedOut` / `WouldBlock`）は
+/// ここで捕捉して ErrorResponse を書くことはせず、そのまま `Err` として
+/// 呼び出し元へ返す（応答なしでクローズすることが WIRE-5 の契約）。
+///
+/// 対応: TASK-69（WIRE-5）。旧 3 引数シグネチャ（`post_auth_idle_timeout` を
+/// 直接受け取る形）は [`handle_connection`]（deprecated 互換ラッパー）として
+/// 維持する（codex-review / Cursor Bugbot 再指摘: 別名ラッパーでは後方互換に
+/// ならず、旧名・旧シグネチャをそのまま残す必要がある）。
+pub fn handle_connection_bounded(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
     let username = match negotiate_startup(&mut stream) {
         Ok(u) => u,
         Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
@@ -473,8 +479,8 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
             Ok(())
         }
         Ok(ctx) => {
-            // 読み取りタイムアウトは `server::accept_loop` が接続全体に一度だけ
-            // 設定済み（WIRE-5）であり、ここで切り替えない。
+            // 読み取りタイムアウトは `server::accept_loop_with_limiter` が接続全体に
+            // 一度だけ設定済み（WIRE-5）であり、ここで切り替えない。
             write_authentication_ok(&mut stream)?;
             // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
             // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。
@@ -493,29 +499,32 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
     }
 }
 
-/// 旧 `(stream, store, post_auth_idle_timeout)` 3 引数シグネチャの
-/// [`handle_connection`] との後方互換ラッパー。
+/// 旧 `(stream, store, post_auth_idle_timeout)` 3 引数シグネチャとの後方互換
+/// ラッパー（**旧名・旧シグネチャをそのまま維持**。codex-review / Cursor
+/// Bugbot 再指摘: 別名のラッパーを追加するだけでは呼び出し元のコンパイルが
+/// 通らず後方互換にならないため、新実装は [`handle_connection_bounded`]
+/// という別名へ移し、この名前・シグネチャの方を互換層として残す）。
 ///
 /// TASK-69（WIRE-5）で読み取りタイムアウトは認証前後で切り替えない単一値方式
-/// （`server::accept_loop` が受理直後に一度だけ設定する）へ統一され、
-/// `handle_connection` 本体はタイムアウトを受け取らない 2 引数シグネチャへ
-/// 移行した。本関数はすでに公開 API として利用側に届いている可能性のある旧
-/// シグネチャを維持しつつ、内部では新実装（[`handle_connection`]）へ委譲する
+/// （`server::accept_loop_with_limiter` が受理直後に一度だけ設定する）へ統一
+/// され、本体の実装はタイムアウトを受け取らない 2 引数シグネチャへ移行した。
+/// 本関数はすでに公開 API として利用側に届いている可能性のある旧シグネチャを
+/// 維持しつつ、内部では新実装（[`handle_connection_bounded`]）へ委譲する
 /// （`server::bind_loopback` と同じ後方互換方針）。
 ///
 /// `post_auth_idle_timeout` は WIRE-5 の単一タイムアウト契約により**無視**する
 /// （認証前後で値を切り替える経路自体が存在しないため）。新規コードは
-/// `handle_connection` を直接呼ぶこと。
+/// `handle_connection_bounded` を直接呼ぶこと。
 #[deprecated(
     since = "0.1.0",
-    note = "use handle_connection(stream, store) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
+    note = "use handle_connection_bounded(stream, store) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
 )]
-pub fn handle_connection_with_idle_timeout(
+pub fn handle_connection(
     stream: TcpStream,
     store: &UserStore,
     _post_auth_idle_timeout: Duration,
 ) -> io::Result<()> {
-    handle_connection(stream, store)
+    handle_connection_bounded(stream, store)
 }
 
 /// BackendKeyData の secret フィールド用のプロセス内カウンタ（接続ごとに異なる値を
@@ -853,15 +862,16 @@ mod tests {
         server.join().expect("server thread must not panic");
     }
 
-    /// P1 review 再指摘（codex-review PRRT_kwDOUAKASM6b_Fs-）の再現ケース: 旧
-    /// 3 引数シグネチャの [`handle_connection_with_idle_timeout`] を呼んでも
-    /// panic せず、新実装（[`handle_connection`]）へ委譲されること。無効な
+    /// P1 review 再指摘（codex-review / Cursor Bugbot: 別名ラッパーでは
+    /// 後方互換にならない）の再現ケース: 旧名・旧 3 引数シグネチャの
+    /// [`handle_connection`]（deprecated）を呼んでも panic せず、新実装
+    /// （[`handle_connection_bounded`]）へ委譲されること。無効な
     /// StartupMessage（負の長さ）を送り、応答なしで正常にクローズすることまで
     /// 確認する（`post_auth_idle_timeout` は無視される契約のため、値そのものは
     /// 検証しない）。
     #[test]
     #[allow(deprecated)]
-    fn handle_connection_with_idle_timeout_compat_wrapper_delegates_without_panic() {
+    fn handle_connection_compat_wrapper_delegates_without_panic() {
         let dir = std::env::temp_dir().join(format!(
             "wire-server-handshake-test-legacy-{}-{}",
             std::process::id(),
@@ -880,8 +890,8 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accept");
-            let result =
-                handle_connection_with_idle_timeout(stream, &store, Duration::from_secs(300));
+            // 旧名・旧シグネチャをそのまま呼ぶ（互換性の実体はここで検証する）。
+            let result = handle_connection(stream, &store, Duration::from_secs(300));
             assert!(
                 result.is_ok(),
                 "malformed startup must close without I/O error"

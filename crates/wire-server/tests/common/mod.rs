@@ -49,14 +49,14 @@ pub fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::Soc
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(stream, &store);
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
     addr
 }
 
-/// `wire_server::server::accept_loop` 経由でサーバースレッドを起動する
+/// `wire_server::server::accept_loop_with_limiter` 経由でサーバースレッドを起動する
 /// （接続スロット解放の確認に使う）。
 pub fn spawn_server_with_accept_loop(
     users_path: &std::path::Path,
@@ -69,7 +69,7 @@ pub fn spawn_server_with_accept_loop(
     let limiter = ConnectionLimiter::new(max_connections);
 
     std::thread::spawn(move || {
-        wire_server::server::accept_loop(listener, store, limiter, io_timeout);
+        wire_server::server::accept_loop_with_limiter(listener, store, limiter, io_timeout);
     });
 
     addr
@@ -114,7 +114,7 @@ pub fn send_startup_message(stream: &mut TcpStream, username: &str, database: &s
 /// 接続スロットが解放されるまで短い間隔でリトライし、解放後の TCP 接続を
 /// 返す（SSLRequest の 'N' 応答まで到達した時点で解放済みと判定する）。
 ///
-/// `server::accept_loop` は同時接続数の上限を超える接続を、ハンドシェイクへ
+/// `server::accept_loop_with_limiter` は同時接続数の上限を超える接続を、ハンドシェイクへ
 /// 進ませず `limits::ConnectionLimiter::try_acquire` 失敗時に `53300` の
 /// ErrorResponse を返してから即座にクローズする（`limits::reject_too_many_connections`
 /// 経由）。そのため SSLRequest の応答が 1 バイトも来ず EOF/タイムアウトになる

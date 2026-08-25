@@ -49,14 +49,14 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(stream, &store);
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
     addr
 }
 
-// `wire_server::server::accept_loop` 経由（同時接続数上限・読み取りタイムアウトを
+// `wire_server::server::accept_loop_with_limiter` 経由（同時接続数上限・読み取りタイムアウトを
 // 実際に適用した状態でのハンドシェイク検証）は WIRE-5/WIRE-6 固有の関心事のため
 // `tests/wire_limits.rs` へ集約した（D1: 本ファイルは認証フロー自体の検証に専念する）。
 

@@ -1,6 +1,7 @@
 //! 接続資源保護（読み取りタイムアウト・同時接続数リミッター）を担う共有モジュール。
 //!
-//! `server::accept_loop` から呼ばれ、未認証クライアントの大量接続・Slowloris による
+//! `server::accept_loop_with_limiter` から呼ばれ、未認証クライアントの大量接続・
+//! Slowloris による
 //! スレッド／メモリ枯渇を防ぐ。契約値（読み取りタイムアウト・同時接続数上限・
 //! 上限超過時の SQLSTATE）をこのモジュールに集約し、`handshake.rs` や `server.rs`
 //! に暫定値が分散しないようにする。
@@ -16,8 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// 接続全体（認証前後を問わず）に適用する読み取り・書き込みタイムアウト（WIRE-5）。
-/// `server::accept_loop` が受理直後に一度だけ設定し、`handshake::handle_connection`
-/// 側では変更しない（認証前後で値を切り替える経路を作らない）。
+/// `server::accept_loop_with_limiter` が受理直後に一度だけ設定し、
+/// `handshake::handle_connection_bounded` 側では変更しない（認証前後で値を
+/// 切り替える経路を作らない）。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 同時接続数の上限（WIRE-6）。
@@ -30,7 +32,7 @@ pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// 上限超過接続への拒否応答（[`reject_too_many_connections`]）を書き込むために
 /// 同時に生成できるワーカースレッド数の上限（review 是正・WIRE-6）。
 ///
-/// `server::accept_loop` は本体をブロックさせないため拒否応答の書き込みを
+/// `server::accept_loop_with_limiter` は本体をブロックさせないため拒否応答の書き込みを
 /// 使い捨てスレッドへ委譲するが、`MAX_CONNECTIONS` の枠管理外で無制限に
 /// `std::thread::spawn` すると、攻撃者が上限到達後に接続を連続作成することで
 /// スレッド・スタックなどの OS 資源を無制限に消費できてしまう（DoS）。
@@ -111,7 +113,7 @@ impl Drop for ConnectionPermit {
     }
 }
 
-/// 同時接続数の共有リミッター。`server::accept_loop` がクローンを保持し、
+/// 同時接続数の共有リミッター。`server::accept_loop_with_limiter` がクローンを保持し、
 /// 受理のたびに [`ConnectionLimiter::try_acquire`] を呼ぶ。
 #[derive(Clone)]
 pub struct ConnectionLimiter {
@@ -180,7 +182,7 @@ pub fn apply_read_timeout(stream: &TcpStream, timeout: Duration) -> io::Result<(
 /// `write_error_response` には依存せず自己完結させる（TASK-68/71 との衝突回避）。
 /// フィールドは S/C/M のみで、他テナント・存在情報・ピア識別情報は含めない。
 ///
-/// 呼び出し元（`server::accept_loop`）はこの関数を呼ぶ時点でまだ
+/// 呼び出し元（`server::accept_loop_with_limiter`）はこの関数を呼ぶ時点でまだ
 /// `std::thread::spawn` へ到達していない（スレッドを生成せずに拒否する）。
 /// 書き込み失敗は無視する（拒否経路で新たなブロッキング点・panic を作らないため。
 /// クライアントが応答を受け取れなくても、最終的に `shutdown` で接続は閉じる）。

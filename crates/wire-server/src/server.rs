@@ -6,7 +6,7 @@
 //! 検証（TLS 未構成時は loopback 限定。TASK-70・WIRE-7）は [`crate::bind_guard`]
 //! へ、同時接続数の有界化・読み取りタイムアウトの契約値は [`crate::limits`]
 //! （TASK-69・WIRE-5, WIRE-6）へ、wire プロトコルそのものの解釈は
-//! [`crate::handshake::handle_connection`] へそれぞれ委譲する。
+//! [`crate::handshake::handle_connection_bounded`] へそれぞれ委譲する。
 //!
 //! 対応: TASK-67 の review 是正（loopback bind の TOCTOU 排除。TASK-70 で
 //! [`crate::bind_guard`] へ移設・拡張）。TASK-69（WIRE-5, WIRE-6。接続資源保護）。
@@ -73,7 +73,7 @@ pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
 /// 接続受け付けループ本体。1 接続 1 スレッドで処理するが、以下の防御を課す
 /// （WIRE-5, WIRE-6。契約値・実装は [`crate::limits`] に集約）:
 ///
-/// - `limiter` の枠を確保できない接続は [`crate::handshake::handle_connection`] へ
+/// - `limiter` の枠を確保できない接続は [`crate::handshake::handle_connection_bounded`] へ
 ///   進ませず、`limiter` の枠も消費しない短命な使い捨てスレッドへ
 ///   [`limits::reject_too_many_connections`] を委譲し、`53300`
 ///   （too_many_connections）の ErrorResponse を返してから即座にクローズする。
@@ -86,11 +86,16 @@ pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
 ///   無制限 `thread::spawn` によるスレッド／スタック枯渇 DoS を防ぐ）
 /// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ設定してから
 ///   ハンドシェイクへ渡す（認証前後を問わず同一値を維持する。WIRE-5）。超過時は
-///   `handle_connection` が応答を書かずに `Err` を返し、スレッド終了で枠が解放される
+///   `handle_connection_bounded` が応答を書かずに `Err` を返し、スレッド終了で枠が解放される
 ///
 /// 各スレッドの panic は `std::thread::spawn` の join ハンドルを無視することで
 /// プロセス全体へは波及させない（他接続の継続稼働を優先する）。
-pub fn accept_loop(
+///
+/// 対応: TASK-69（WIRE-5, WIRE-6）。旧 5 引数シグネチャ（`max_connections` を
+/// 直接受け取る形）は [`accept_loop`]（deprecated 互換ラッパー）として維持する
+/// （codex-review / Cursor Bugbot 再指摘: 別名ラッパーでは後方互換にならず、
+/// 旧名・旧シグネチャをそのまま残す必要がある）。
+pub fn accept_loop_with_limiter(
     listener: TcpListener,
     store: Arc<UserStore>,
     limiter: ConnectionLimiter,
@@ -170,7 +175,7 @@ pub fn accept_loop(
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・panic
             // いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
-            if let Err(e) = crate::handshake::handle_connection(stream, &store) {
+            if let Err(e) = crate::handshake::handle_connection_bounded(stream, &store) {
                 eprintln!("wire-server: connection error: {e}");
             }
         });
@@ -179,24 +184,25 @@ pub fn accept_loop(
 
 /// 同時接続数の暫定上限だった旧定数。TASK-69（WIRE-6）で
 /// [`crate::limits::MAX_CONNECTIONS`] が正式な契約値として上限を管理するように
-/// なったため、`accept_loop` 本体は本定数を参照しない。すでに公開 API
-/// （`pub const MAX_CONCURRENT_CONNECTIONS`）として利用側に届いている可能性が
-/// あるため、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に従い削除せず
+/// なったため、`accept_loop_with_limiter` 本体は本定数を参照しない。すでに公開
+/// API（`pub const MAX_CONCURRENT_CONNECTIONS`）として利用側に届いている可能性
+/// があるため、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に従い削除せず
 /// 残す（[`bind_loopback`] と同じ後方互換方針）。
 #[deprecated(since = "0.1.0", note = "use crate::limits::MAX_CONNECTIONS instead")]
 pub const MAX_CONCURRENT_CONNECTIONS: usize = limits::MAX_CONNECTIONS;
 
 /// 認証前フェーズにのみ課していた I/O 期限の旧定数。TASK-69（WIRE-5）で
 /// [`crate::limits::READ_TIMEOUT`] が接続全体（認証前後を問わず）へ適用する
-/// 単一の契約値になったため、`accept_loop` 本体は本定数を参照しない。
+/// 単一の契約値になったため、`accept_loop_with_limiter` 本体は本定数を参照
+/// しない。
 #[deprecated(since = "0.1.0", note = "use crate::limits::READ_TIMEOUT instead")]
 pub const CONNECTION_IO_TIMEOUT: Duration = limits::READ_TIMEOUT;
 
 /// 認証後のセッションに課していた緩いアイドル期限の旧定数。WIRE-5 の契約が
 /// 「認証前後で同一の読み取りタイムアウトを適用する」単一値方式へ統一された
-/// ため、`accept_loop`／`handle_connection` のどちらもこの値で挙動を切り替える
-/// ことはない。[`accept_loop_legacy`] が受け取る同名引数もこの理由で無視する
-/// （doc 参照）。
+/// ため、`accept_loop_with_limiter`／`handle_connection_bounded` のどちらも
+/// この値で挙動を切り替えることはない。[`accept_loop`]（deprecated 互換
+/// ラッパー）が受け取る同名引数もこの理由で無視する（doc 参照）。
 #[deprecated(
     since = "0.1.0",
     note = "post-auth idle timeout switching was removed by WIRE-5 (single read_timeout contract); this value is unused"
@@ -204,31 +210,36 @@ pub const CONNECTION_IO_TIMEOUT: Duration = limits::READ_TIMEOUT;
 pub const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// 旧 `(listener, store, max_connections, io_timeout, post_auth_idle_timeout)`
-/// 5 引数シグネチャの [`accept_loop`] との後方互換ラッパー。
+/// 5 引数シグネチャとの後方互換ラッパー（**旧名・旧シグネチャをそのまま維持**。
+/// codex-review / Cursor Bugbot 再指摘: 別名のラッパーを追加するだけでは
+/// 呼び出し元のコンパイルが通らず後方互換にならないため、新実装は
+/// [`accept_loop_with_limiter`] という別名へ移し、この名前・シグネチャの方を
+/// 互換層として残す）。
 ///
-/// TASK-69（WIRE-5, WIRE-6）で `accept_loop` 本体は
+/// TASK-69（WIRE-5, WIRE-6）で本体の実装は
 /// `(listener, store, limiter: ConnectionLimiter, read_timeout)` の 4 引数へ
 /// 移行し、認証前後で読み取りタイムアウトを切り替える経路も廃止した（WIRE-5:
 /// 接続全体に同一の期限を適用する単一値方式）。本関数はすでに公開 API として
 /// 利用側に届いている可能性のある旧シグネチャを維持しつつ、内部では新実装
-/// （[`ConnectionLimiter::new`] と `io_timeout`）へ委譲する（[`bind_loopback`]
-/// と同じ後方互換方針）。
+/// （[`accept_loop_with_limiter`] と [`ConnectionLimiter::new`]）へ委譲する
+/// （[`bind_loopback`] と同じ後方互換方針）。
 ///
 /// `post_auth_idle_timeout` は WIRE-5 の単一タイムアウト契約により**無視**する
 /// （認証前後で値を切り替える経路自体が存在しないため、渡された値を使う先が
-/// ない）。新規コードは `accept_loop` を `ConnectionLimiter` とともに直接呼ぶこと。
+/// ない）。新規コードは `accept_loop_with_limiter` を `ConnectionLimiter` と
+/// ともに直接呼ぶこと。
 #[deprecated(
     since = "0.1.0",
-    note = "use accept_loop(listener, store, ConnectionLimiter::new(max_connections), read_timeout) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
+    note = "use accept_loop_with_limiter(listener, store, ConnectionLimiter::new(max_connections), read_timeout) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
 )]
-pub fn accept_loop_legacy(
+pub fn accept_loop(
     listener: TcpListener,
     store: Arc<UserStore>,
     max_connections: usize,
     io_timeout: Duration,
     _post_auth_idle_timeout: Duration,
 ) {
-    accept_loop(
+    accept_loop_with_limiter(
         listener,
         store,
         ConnectionLimiter::new(max_connections),
@@ -281,7 +292,7 @@ mod tests {
         let limiter = ConnectionLimiter::new(1);
 
         std::thread::spawn(move || {
-            accept_loop(listener, store, limiter, Duration::from_secs(5));
+            accept_loop_with_limiter(listener, store, limiter, Duration::from_secs(5));
         });
 
         // 1 本目: 上限(1)に達する接続。ハンドシェイクを進めず接続だけ保持する。
@@ -341,7 +352,7 @@ mod tests {
         let limiter = ConnectionLimiter::new(1);
 
         std::thread::spawn(move || {
-            accept_loop(listener, store, limiter, short_timeout);
+            accept_loop_with_limiter(listener, store, limiter, short_timeout);
         });
 
         // 1 本目: 何も送らず保持する（クライアント側では明示的に close しない。
@@ -379,14 +390,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// P1 review 再指摘（codex-review PRRT_kwDOUAKASM6b_Fs-）の再現ケース: 旧
-    /// 5 引数シグネチャの [`accept_loop_legacy`] を経由しても、新実装
-    /// （`ConnectionLimiter` ベースの `accept_loop`）と同じ fail-closed 挙動
-    /// （上限超過接続への `53300` 応答）が得られること。`post_auth_idle_timeout`
-    /// 引数は無視される契約のため、呼び出し時の値そのものは検証しない。
+    /// P1 review 再指摘（codex-review / Cursor Bugbot: 別名ラッパーでは
+    /// 後方互換にならない）の再現ケース: 旧名・旧 5 引数シグネチャの
+    /// [`accept_loop`]（deprecated）を経由しても、新実装（[`accept_loop_with_limiter`]）
+    /// と同じ fail-closed 挙動（上限超過接続への `53300` 応答）が得られること。
+    /// `post_auth_idle_timeout` 引数は無視される契約のため、呼び出し時の値
+    /// そのものは検証しない。
     #[test]
     #[allow(deprecated)]
-    fn accept_loop_legacy_compat_wrapper_enforces_connection_limit() {
+    fn accept_loop_compat_wrapper_enforces_connection_limit() {
         let dir = std::env::temp_dir().join(format!(
             "wire-server-server-test-legacy-{}-{}",
             std::process::id(),
@@ -404,7 +416,8 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
 
         std::thread::spawn(move || {
-            accept_loop_legacy(
+            // 旧名・旧シグネチャをそのまま呼ぶ（互換性の実体はここで検証する）。
+            accept_loop(
                 listener,
                 store,
                 1,
