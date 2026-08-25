@@ -9,34 +9,19 @@
 //! 応答（成否・`wire_code`・エラー文言）も後続の読み取り結果も変化しないことを、
 //! 本体の判定 API に依存しないテスト側オラクル（期待値のベタ書き）で確認する。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::row_codec::Value as RowCodecValue;
+use engine::sql::exec::Cell;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::{self, TenantWriteError};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-row-id-scope-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出しは共通ヘルパへ委譲する（Issue #173・Bugbot Low 指摘・PR #194）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const TABLE: &str = "docs";
 const DIM: u32 = 2;
@@ -287,4 +272,221 @@ fn table12_search_tolerates_the_same_id_held_by_two_tenants_as_public_rows() {
         "both visible rows (own row and the other tenant's Public row) must be returned"
     );
     assert!(hits.iter().all(|h| h.id == 1));
+}
+
+// (f) 対象ビヘイビア: TABLE-12 の読み取り経路への波及（Bugbot High 指摘・PR #194）。
+// 同一 `id` の可視行が 2 テナント分あるとき、SQL 投影が「あるテナントの embedding と
+// 別テナントのスカラー列」を混ぜて返さないこと。`sql/exec.rs` が行の同定を行 `id` から
+// アリーナのスロット番号へ切り替えたことの回帰テスト（id ベースのままだと
+// embedding は先勝ち・スカラー列は後勝ちで解決され、両者が食い違う）。
+#[test]
+fn table12_sql_projection_never_mixes_embedding_and_scalars_across_tenants() {
+    let path = unique_db_path("sql-mix");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+
+    // 双方 id=100（スロット番号 0/1 とずれる値を選ぶ。投影が本来の行 id を返すことも
+    // ここで固定する）。embedding と body はテナントごとに別の値にする。
+    let a = ctx(TENANT_A);
+    let b = ctx(TENANT_B);
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &a,
+        100,
+        Visibility::Public,
+        &[
+            RowCodecValue::Vector(vec![1.0, 0.0]),
+            RowCodecValue::Text("body-a".to_string()),
+        ],
+    )
+    .expect("tenant-a row id=100");
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &b,
+        100,
+        Visibility::Public,
+        &[
+            RowCodecValue::Vector(vec![0.0, 1.0]),
+            RowCodecValue::Text("body-b".to_string()),
+        ],
+    )
+    .expect("tenant-b row id=100");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let result = core
+        .execute_sql(
+            &a,
+            "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+        )
+        .expect("select must succeed with a duplicated row id across tenants");
+    assert_eq!(result.rows.len(), 2, "both visible rows must be returned");
+    for row in &result.rows {
+        assert_eq!(row.id, 100, "projection must return the real row id");
+        // embedding と body は必ず同じ行（同じテナント）由来であること。
+        let embedding = row.cells.get(1).cloned();
+        let body = row.cells.get(2).cloned();
+        match (embedding, body) {
+            (Some(Cell::Vector(v)), Some(Cell::Text(t))) => {
+                let expected_body = if v == vec![1.0, 0.0] {
+                    "body-a"
+                } else if v == vec![0.0, 1.0] {
+                    "body-b"
+                } else {
+                    panic!("unexpected embedding: {v:?}")
+                };
+                assert_eq!(
+                    t, expected_body,
+                    "embedding and scalar columns must come from the same row"
+                );
+            }
+            other => panic!("unexpected projection cells: {other:?}"),
+        }
+    }
+}
+
+// (g) 対象ビヘイビア: TABLE-12（Bugbot Medium 指摘・PR #194）。ハイブリッド検索
+// （疎コーパスを構築する経路）でも、同一 `id` の可視行が 2 テナント分あるときに
+// `SparseIndex::build` の `DuplicateDocId` で失敗せず、両行が独立に扱われること。
+#[test]
+fn table12_hybrid_sql_tolerates_the_same_id_held_by_two_tenants() {
+    let path = unique_db_path("sql-hybrid-dup");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+
+    let a = ctx(TENANT_A);
+    let b = ctx(TENANT_B);
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &a,
+        100,
+        Visibility::Public,
+        &[
+            RowCodecValue::Vector(vec![1.0, 0.0]),
+            RowCodecValue::Text("vector database tenant a".to_string()),
+        ],
+    )
+    .expect("tenant-a row id=100");
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &b,
+        100,
+        Visibility::Public,
+        &[
+            RowCodecValue::Vector(vec![0.0, 1.0]),
+            RowCodecValue::Text("vector database tenant b".to_string()),
+        ],
+    )
+    .expect("tenant-b row id=100");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let result = core
+        .execute_sql(
+            &a,
+            "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'vector database') LIMIT 10",
+        )
+        .expect("hybrid select must succeed with a duplicated row id across tenants");
+    assert_eq!(
+        result.rows.len(),
+        2,
+        "both visible rows must be fused independently"
+    );
+    let bodies: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| match r.cells.get(2) {
+            Some(Cell::Text(t)) => t.clone(),
+            other => panic!("unexpected body cell: {other:?}"),
+        })
+        .collect();
+    assert!(bodies.contains(&"vector database tenant a".to_string()));
+    assert!(bodies.contains(&"vector database tenant b".to_string()));
+}
+
+// (h) 対象ビヘイビア: RECOVER-4・TABLE-12（codex-review P0 指摘・PR #194）。
+// テナント境界付きバッチ API（`tenant::insert_rows`）の認可・重複契約。
+#[test]
+fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
+    let (storage, _cleanup) = open_seeded("guarded-batch");
+    let a = ctx(TENANT_A);
+    let b = ctx(TENANT_B);
+
+    // 他テナント名義の行が 1 件でも混ざるバッチは Forbidden（1 件も書かれない）。
+    let mixed = vec![
+        (1u64, row(TENANT_A, &[1.0, 0.0], b"a1")),
+        (2u64, row(TENANT_B, &[0.0, 1.0], b"b2")),
+    ];
+    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &mixed)
+        .expect_err("a batch containing another tenant's row must be rejected");
+    assert!(matches!(err, TenantWriteError::Forbidden));
+    assert_eq!(err.wire_code(), "42501");
+    assert!(storage.get_row_from_table(TABLE, TENANT_A, 1).is_err());
+
+    // バッチ内の id 重複は IdConflict（後勝ちで先行行を黙って上書きしない）。
+    let dup = vec![
+        (5u64, row(TENANT_A, &[1.0, 0.0], b"first")),
+        (5u64, row(TENANT_A, &[0.0, 1.0], b"second")),
+    ];
+    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &dup)
+        .expect_err("duplicate ids within one batch must be rejected");
+    assert!(matches!(err, TenantWriteError::IdConflict));
+    assert!(storage.get_row_from_table(TABLE, TENANT_A, 5).is_err());
+
+    // 正常系: 自テナント名義のバッチは成功し、他テナントは同じ id を独立に使える。
+    let batch_a = vec![
+        (1u64, row(TENANT_A, &[1.0, 0.0], b"a1")),
+        (2u64, row(TENANT_A, &[0.5, 0.5], b"a2")),
+    ];
+    engine::tenant::insert_rows(&storage, TABLE, &a, &batch_a).expect("own-tenant batch ok");
+    let batch_b = vec![(1u64, row(TENANT_B, &[0.0, 1.0], b"b1"))];
+    engine::tenant::insert_rows(&storage, TABLE, &b, &batch_b)
+        .expect("another tenant may reuse the same id");
+    assert_eq!(
+        storage
+            .get_row_from_table(TABLE, TENANT_A, 1)
+            .expect("tenant-a row")
+            .metadata,
+        b"a1".to_vec()
+    );
+    assert_eq!(
+        storage
+            .get_row_from_table(TABLE, TENANT_B, 1)
+            .expect("tenant-b row")
+            .metadata,
+        b"b1".to_vec()
+    );
+
+    // 既存行と衝突するバッチは IdConflict（既存行は不変）。
+    let conflict = vec![(2u64, row(TENANT_A, &[0.0, 0.0], b"overwrite"))];
+    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &conflict)
+        .expect_err("existing id within the same tenant must conflict");
+    assert!(matches!(err, TenantWriteError::IdConflict));
+    assert_eq!(
+        storage
+            .get_row_from_table(TABLE, TENANT_A, 2)
+            .expect("tenant-a row 2")
+            .metadata,
+        b"a2".to_vec()
+    );
 }

@@ -578,6 +578,15 @@ impl From<PolicyError> for CoreError {
 pub trait VectorCore: Send + Sync {
     /// `table` に対して `query` の Top-k 検索を行う。`ctx` のテナント・可視性を満たさない
     /// 行は結果に含めない（CORE-2）。
+    ///
+    /// 返却される [`SearchHit::id`] は行 `id` であり、その一意性スコープはテナント内
+    /// （対象ビヘイビア: TABLE-12）。したがって**同一 `id` の hit が複数返り得る**
+    /// （自テナントの行と、他テナントの `Public` 行が同じ `id` を持つ場合。いずれも
+    /// `ctx` から可視な行であり、テナント境界の侵害ではない）。`id` だけでどちらの
+    /// 行かを区別する必要がある呼び出し元は、行の取得（[`Self::get_row`]。テナント
+    /// 名前空間内の点取得）と併せて判断すること。SQL 表層（`sql::exec`）は内部で
+    /// 行の同定をアリーナのスロット番号で行うため、投影結果に別テナントの行の値が
+    /// 混ざることはない。
     fn search(
         &self,
         ctx: &PolicyContext,
