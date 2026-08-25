@@ -44,7 +44,7 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
-| `make bench-parallel` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
+| `make bench-parallel` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`precision-regression` は目標値未確定のため `.github/workflows/recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |
 | `make e2e-three-client` | TASK-73（WIRE-1）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
 
 ターゲット一覧は `make help` で確認できます。
@@ -125,6 +125,30 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 ```
 
 挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo variables」と同一です。ローカルの `make rerank-regression`（`RERANK_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`RERANK_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。
+
+### `precision` 評価ハーネス（TASK-163）
+
+`crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の評価基準
+（Top-1 Accuracy・MRR@10・正解不在クエリでの誤返却率。SEARCH-10）を、決定的合成
+コーパス（正解不在クエリを含む）上で実測する評価ハーネスです。設計判断・実測結果・
+パラメータ感度スイープの記録は `docs/design/precision-eval-regression.md` を
+参照してください。
+
+- 層 A（`cargo test -p engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
+  での実測値を固定値で回帰トラッキングします。spec の数値基準は使いません。
+- 層 B（`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
+  `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
+  （未設定ならローカルでは「ゲート未設定＝明示的に対象外」として成功終了。
+  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）による閾値ゲートと、
+  `PrecisionPolicy` の閾値を差し替えるパラメータ感度スイープ
+  （`precision_eval_policy_sweep`）を実行します。
+- **`.github/workflows/recall.yml` への接続は行っていません**: spec は「目標値確定
+  まで `precision` をリリースゲートに含めない」としているため、上記の
+  `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。
+  `docs/design/precision-eval-regression.md` の実測値・感度表をもとに目標値が
+  確定したのち、`RERANK_RECALL_MIN_*` 等と同様に `recall-gate` の Actions
+  variables として設定し、`recall.yml` の `recall-regression` job に
+  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` 付きの step を追加してください。
 
 ## ライセンス
 

@@ -110,6 +110,8 @@ SCALAR 事後フィルタ）の後**・**`RlsSafetyNet::apply` の前**に適用
 ## 申し送り
 
 - TASK-163: 上記仮置き値の実測・目標値確定。正解不在クエリを含む評価セット拡張
+  （評価ハーネス・実測結果は `docs/design/precision-eval-regression.md` 参照。
+  目標値の確定はユーザー判断待ち）
 - TASK-164: `ModeSource::PlannerEstimate` 追加時もゲートは `ResolvedMode.mode` のみを
   見るため変更不要
 - TASK-165: wire 経由・3 クライアントでの空集合応答受信確認（`wire-server` は現時点で

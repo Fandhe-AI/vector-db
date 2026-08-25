@@ -265,6 +265,18 @@ else
 endif
 
 # --------------------------------------------------
+# precision モード評価基準ゲート（TASK-163。crates/engine/tests/precision_eval.rs 層 B）
+# --------------------------------------------------
+
+.PHONY: precision-regression
+precision-regression: ## TASK-163 の precision モード評価基準（Top-1 Accuracy・MRR@10・誤返却率）閾値ゲートと感度スイープを実行する（目標値未確定のため .github/workflows/recall.yml には未接続。ci には含めない）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test precision_eval -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため precision-regression をスキップ"
+endif
+
+# --------------------------------------------------
 # 評価スクリプト（scripts/eval。TASK-118）
 # --------------------------------------------------
 
