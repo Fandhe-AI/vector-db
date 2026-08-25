@@ -234,8 +234,9 @@ where
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// 書き込みコミット直前に [`GENERATION_TABLE`] を +1 してからコミットする
-/// （TASK-133 P1 対応）。本クレート内の書き込みコミット（`Storage::put`/`put_batch`・
-/// `crate::catalog` の DDL/DML・`crate::txn::WriteTxn`/`BatchWriteTxn`）は
+/// （TASK-133 P1 対応）。本クレート内の実書き込みを伴う書き込みコミット
+/// （`Storage::put`/`put_batch`・`crate::catalog` の DDL/DML・
+/// [`commit_write_txn`] 経由の `crate::txn::WriteTxn`/`BatchWriteTxn`）は
 /// `write_txn.commit()` を直接呼ばずすべて本関数を経由する。将来の書き込み API 追加も
 /// 本関数を呼ぶだけで世代カウントの経路網羅が保たれる。
 ///
@@ -258,6 +259,32 @@ pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> R
     }
     write_txn.commit()?;
     Ok(())
+}
+
+/// `crate::txn::WriteTxn`/`BatchWriteTxn` の commit 経路を一本化する集約点
+/// （Issue #175・TASK-133 P2 対応）。`has_writes` は呼び出し元（`txn.rs`）が
+/// 自身のハンドルで redb のテーブルに触れる操作（`put`・`log_batch` 等）を
+/// 1 回でも行ったかを追跡した結果を渡す契約とする。
+///
+/// - `has_writes == true`: [`bump_generation_and_commit`] に委譲し、従来どおり
+///   世代を進めてからコミットする。
+/// - `has_writes == false`: 変更が何もないため durable write を発生させず、
+///   `write_txn.abort()` で閉じて世代を進めない（`crate::catalog` の空バッチ
+///   経路が commit せず drop（= abort）で閉じているのと同方針）。
+///
+/// fail-closed の判断: `has_writes` の真偽は本関数ではなく呼び出し元の追跡に
+/// 依存する。呼び出し元がテーブルに触れたかどうかの判定に迷う場合は `true`
+/// （世代を進める）側に倒すことが `txn.rs` 側の契約であり、本関数はそれを
+/// 前提に「過剰失効はあっても見逃し（fail-open）はない」設計とする
+/// （見逃しは `crate::rls::PrefilterIndex` の RLS 相当の失効検出を素通りさせ、
+/// 他テナント行の混入・削除済み可視性の残存に直結するため P0）。
+pub(crate) fn commit_write_txn(write_txn: redb::WriteTransaction, has_writes: bool) -> Result<()> {
+    if has_writes {
+        bump_generation_and_commit(write_txn)
+    } else {
+        write_txn.abort()?;
+        Ok(())
+    }
 }
 
 /// RLS 相当のテナント境界判定に使う可視性ラベル（対象ビヘイビア: PERSIST-3）。
@@ -978,6 +1005,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
     #[test]
     fn decode_row_tenant_and_visibility_matches_full_decode_header() {
         // ヘッダのみ decode（本 PR で借用 &str 化した経路）が、フル decode の
@@ -1067,26 +1098,6 @@ mod tests {
             let full_result = decode_row(1, &buf);
             assert!(header_result.is_err(), "header decode should fail-closed");
             assert!(full_result.is_err(), "full decode should fail-closed");
-        }
-    }
-
-    /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-storage-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
-    }
-
-    struct CleanupGuard(std::path::PathBuf);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
         }
     }
 

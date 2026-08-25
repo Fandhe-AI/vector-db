@@ -13,9 +13,6 @@
 //! 読み出した embedding に対しテスト側でコサイン類似度の brute-force top-k を計算し、
 //! データ層の挙動を確認するに留める。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::{CpuScalarProvider, KernelError};
@@ -23,27 +20,11 @@ use engine::policy::PolicyContext;
 use engine::search_engine;
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`multi_dim_tables.rs` と同じ方針）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-task146-extensions-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT_ID: &str = "tenant-a";
 

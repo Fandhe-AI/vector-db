@@ -12,8 +12,6 @@
 //! 直接シードは `tests/rls_prefilter.rs` の流儀を踏襲する。
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::kernel::{CpuScalarProvider, SearchHit};
@@ -57,27 +55,12 @@ impl Xorshift64 {
 }
 
 // ---------- テスト共通のセットアップ ----------
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`tests/rls_prefilter.rs` と同方式。
-/// 並列 `cargo test` 実行でも衝突しない）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-rls-security-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const DIM: u32 = 12;
 const TABLE: &str = "docs";
