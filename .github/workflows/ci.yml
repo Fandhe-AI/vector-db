@@ -130,6 +130,25 @@ jobs:
         run: make core-api-check
 
   # --------------------------------------------------
+  # sort-determinism-check（ソート非決定性 API 再混入検知。TASK-84・対応 Issue #61）
+  # --------------------------------------------------
+  # RRF 融合結果等のスコア順 Top-k で同点タイブレークを省略する非決定的ソート API
+  # （`sort_unstable_by`/`sort_unstable_by_key`/`select_nth_unstable_by(_key)`）の
+  # 再混入を scripts/check_sort_determinism.sh（cargo 不要のテキスト比較）で機械
+  # チェックする。core-api-check と同様の理由で独立ジョブとし、第三者 action は
+  # 同一 SHA 固定を使う。判断の根拠は docs/design/rrf-tie-break-determinism.md 参照。
+  sort-determinism-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Run sort-determinism-check
+        run: make sort-determinism-check
+
+  # --------------------------------------------------
   # cross-check（aarch64 クロスコンパイル確認。TASK-156・対象ビヘイビア CORE-14）
   # --------------------------------------------------
   # `isa.rs` の NEON カーネル（`#[cfg(target_arch = "aarch64")]`）が x86_64 の
