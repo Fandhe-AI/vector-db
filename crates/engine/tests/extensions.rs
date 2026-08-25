@@ -13,7 +13,13 @@
 //! 読み出した embedding に対しテスト側でコサイン類似度の brute-force top-k を計算し、
 //! データ層の挙動を確認するに留める。
 
+use std::path::PathBuf;
+
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
+use engine::core::{CoreError, EngineCore, VectorCore};
+use engine::kernel::{CpuScalarProvider, KernelError};
+use engine::policy::PolicyContext;
+use engine::search_engine;
 use engine::storage::{RowInput, Storage, Visibility};
 
 // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
@@ -44,7 +50,13 @@ impl Xorshift32 {
 
 /// `dim` 次元・`seed` に基づく決定論的な埋め込みを生成する。
 fn make_embedding(dim: u32, seed: u32) -> Vec<f32> {
-    let mut rng = Xorshift32(seed | 1); // seed 0 は xorshift の不動点になるため奇数化する。
+    // seed 0 は xorshift の不動点になるため非ゼロへ置換する。`seed | 1` だと
+    // 隣接する偶奇シード（0/1・2/3 等）が同じ値へ潰れ、実質半数の異なる
+    // ベクトルしか得られなくなる問題があった。置換先を実際に使われる seed=1
+    // と衝突しない u32::MAX にすることで、0 と 1 を含むすべての隣接シードが
+    // 異なるベクトルを生成する。
+    let seeded = if seed == 0 { u32::MAX } else { seed };
+    let mut rng = Xorshift32(seeded);
     (0..dim).map(|_| rng.next_f32()).collect()
 }
 
@@ -67,6 +79,25 @@ fn vector_table_schema(name: &str, dim: u32) -> TableSchema {
             ColumnDef::new("body", ColumnType::Text, true),
         ],
     )
+}
+
+/// 隣接シード（0/1・2/3 等）が同一ベクトルへ潰れないことを確認する回帰テスト。
+/// `seed | 1` による奇数化では偶奇の隣接シードが同値化し、データセットが実質
+/// 半数の異なるベクトルしか持たなくなる不具合があったため、0 のみを非ゼロへ
+/// 置換する現行実装（`make_embedding`）で隣接シードが異なるベクトルを
+/// 生成することを保証する。
+#[test]
+fn make_embedding_adjacent_seeds_produce_distinct_vectors() {
+    for seed in 0..8u32 {
+        let a = make_embedding(16, seed);
+        let b = make_embedding(16, seed + 1);
+        assert_ne!(
+            a,
+            b,
+            "adjacent seeds {seed} and {} must not collapse to the same embedding",
+            seed + 1
+        );
+    }
 }
 
 // --- EXT-1: 既定 768 次元での挿入・読み出し・検索動作 ------------------------------
@@ -814,4 +845,217 @@ fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
         )
         .expect_err("insert with embedding into VECTOR-less table must fail");
     assert!(matches!(err, CatalogError::Invalid(_)));
+}
+
+// --- EXT-2: 2000 次元テーブルの共存・検索経路（TASK-151。対象ビヘイビア: EXT-2。
+// ポインタ: `docs/spec/05-tasks.md` TASK-151・`docs/spec/04-behavior/extensions.md`
+// EXT-2・`docs/spec/06-roadmap.md` MS-6）--------------------------------------------
+//
+// ここまでの `ext2_*` 群（TASK-146）はカタログ・行ストア層（`Storage` API）を直接
+// 検証する。本節は `EngineCore::search`（`core.rs`）→ 既定検索 provider
+// （`search_engine::default_engine()`）という製品の実検索経路まで通し、2000 次元
+// テーブルが 768 次元テーブルと同一 `Storage` に共存した状態でも正しく・
+// テーブル境界を越えずに検索できることを確認する（`tests/multi_dim_tables.rs`
+// （TASK-91）・`tests/search_engine.rs`（TASK-131・CORE-9）の手法を踏襲）。
+//
+// production コード（`crates/engine/src/`）は変更しない（本 Issue のスコープ外）。
+// 実測（性能・SIMD/GPU 相対比較）は `examples/high_dim_bench.rs` と
+// `docs/design/high-dim-2000-reverification.md` が担い、本ファイルは正しさのみを扱う。
+
+/// 768 / 2000 次元それぞれで検証する行数（`MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES`
+/// の範囲内。2000 次元 × 200 行 × 4 バイトは約 1.6 MiB で十分に小さい）。
+const HIGH_DIM_ROW_COUNT: u32 = 200;
+
+/// `emb768` / `emb2000` へ割り当てる行 ID のオフセット。両テーブルの ID 範囲を
+/// 重ならないよう分離し、検索結果の hit ID がどちらのテーブル由来かをテストで
+/// 判別できるようにする（テーブル境界を越えた混入を検出するための前提）。
+const EMB768_ID_OFFSET: u64 = 0;
+const EMB2000_ID_OFFSET: u64 = 10_000;
+
+/// `dim` 次元のテーブル `name` を作成し、決定論的な埋め込み `HIGH_DIM_ROW_COUNT` 行を
+/// `id_offset` を起点とする ID で挿入した `Storage` を返す準備ヘルパー。呼び出し元が
+/// 複数テーブルを同一 `Storage` に積み上げるために使う（`insert_rows_into_table` は
+/// テーブル単位のバッチ API のため）。`id_offset` はテーブルごとに重ならない値を渡し、
+/// 検索結果の hit ID からテーブル帰属を検証できるようにする。
+fn seed_high_dim_table(storage: &Storage, name: &str, dim: u32, id_offset: u64) {
+    storage
+        .create_table(&vector_table_schema(name, dim))
+        .unwrap_or_else(|e| panic!("create_table({name}) failed: {e}"));
+
+    let embeddings: Vec<Vec<f32>> = (0..HIGH_DIM_ROW_COUNT)
+        .map(|i| make_embedding(dim, i + 1))
+        .collect();
+    let rows: Vec<(u64, RowInput<'_>)> = embeddings
+        .iter()
+        .enumerate()
+        .map(|(i, embedding)| {
+            (
+                id_offset + i as u64,
+                RowInput {
+                    tenant_id: TENANT_ID,
+                    visibility: Visibility::Public,
+                    embedding,
+                    metadata: b"m",
+                },
+            )
+        })
+        .collect();
+    storage
+        .insert_rows_into_table(name, &rows)
+        .unwrap_or_else(|e| panic!("insert_rows_into_table({name}) failed: {e}"));
+}
+
+/// `dim` 次元の embedding 群（`seed_high_dim_table` と同一の決定論的生成規則）を
+/// 単独で再構築する（テスト側で query ベクトルを取り出すために使う。`Storage` は
+/// 所有権が `EngineCore::from_storage` へ移るため、挿入した embedding をテスト側で
+/// 再度読み出す代わりに同じ生成規則で再現する）。
+fn high_dim_embeddings(dim: u32) -> Vec<Vec<f32>> {
+    (0..HIGH_DIM_ROW_COUNT)
+        .map(|i| make_embedding(dim, i + 1))
+        .collect()
+}
+
+/// 768 次元テーブル `emb768` と 2000 次元テーブル `emb2000` の両方を持つ `Storage` を
+/// `path` に構築する（新規作成のみ。close・reopen はテスト側で行う）。
+fn build_coexisting_high_dim_storage(path: &PathBuf) -> Storage {
+    let storage = Storage::open(path).expect("open storage");
+    seed_high_dim_table(&storage, "emb768", 768, EMB768_ID_OFFSET);
+    seed_high_dim_table(&storage, "emb2000", 2000, EMB2000_ID_OFFSET);
+    storage
+}
+
+#[test]
+fn ext2_2000_dim_table_coexists_with_768_dim_table_and_search_is_exact() {
+    // `tests/search_engine.rs::core9_default_engine_matches_cpu_scalar_reference` と
+    // 同じ手法（既定 provider と参照実装 `CpuScalarProvider` を別 `Storage` へ同一データで
+    // 構築し、結果が完全一致することを確認する）。`parallel_search.rs` 冒頭コメントの
+    // 通り、内積計算は共有ヘルパー `kernel.rs::dot` を経由し加算順序をスカラー参照実装と
+    // 揃えているため、2000 次元でもスコアまで含めた完全一致を期待できる
+    // （近似判定に倒すとテスト側の許容誤差設計という別の複雑さを持ち込むため避ける）。
+    let path_default = unique_db_path("ext2-hd-coexist-default");
+    let _cleanup_default = CleanupGuard(path_default.clone());
+    let storage_default = build_coexisting_high_dim_storage(&path_default);
+    let core_default = EngineCore::from_storage(storage_default, search_engine::default_engine());
+
+    let path_reference = unique_db_path("ext2-hd-coexist-reference");
+    let _cleanup_reference = CleanupGuard(path_reference.clone());
+    let storage_reference = build_coexisting_high_dim_storage(&path_reference);
+    let core_reference = EngineCore::from_storage(storage_reference, Box::new(CpuScalarProvider));
+
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    const TOP_K: usize = 10;
+
+    for (table, dim, id_offset) in [
+        ("emb768", 768u32, EMB768_ID_OFFSET),
+        ("emb2000", 2000u32, EMB2000_ID_OFFSET),
+    ] {
+        let embeddings = high_dim_embeddings(dim);
+        // クエリは挿入済み embedding の 1 件（テーブル境界・provider 差し替え等価性の
+        // 確認が目的であり、自己一致が Top-1 になることまでは主張しない。raw dot
+        // product は非正規化ベクトルでは自己一致が最大内積になるとは限らないため）。
+        let query = &embeddings[3];
+
+        let hits_default = core_default
+            .search(&ctx, table, query, TOP_K)
+            .unwrap_or_else(|e| panic!("default engine search({table}) failed: {e}"));
+        let hits_reference = core_reference
+            .search(&ctx, table, query, TOP_K)
+            .unwrap_or_else(|e| panic!("reference engine search({table}) failed: {e}"));
+
+        assert_eq!(
+            hits_default, hits_reference,
+            "default provider と CpuScalarProvider の Top-k が {table}（dim={dim}）で不一致"
+        );
+        assert!(
+            hits_default.len() <= TOP_K,
+            "{table}: hit 件数が k を超過: {}",
+            hits_default.len()
+        );
+        // `emb768`・`emb2000` は重ならない ID 範囲（`EMB768_ID_OFFSET` /
+        // `EMB2000_ID_OFFSET`）へ挿入しているため、hit の ID が検索対象テーブルの
+        // 範囲内に収まっていることを確認すれば、他テーブルの行が誤って混入して
+        // いないことを検出できる。
+        let id_range = id_offset..(id_offset + HIGH_DIM_ROW_COUNT as u64);
+        assert!(
+            hits_default.iter().all(|hit| id_range.contains(&hit.id)),
+            "{table}: 自テーブルの id 範囲 {id_range:?} 外の hit が混入: {hits_default:?}"
+        );
+    }
+}
+
+#[test]
+fn ext2_2000_dim_search_query_dim_mismatch_is_rejected_per_table_fail_closed() {
+    // 曖昧な次元不一致は拒否側に倒す（coding-rust.md「エラー契約は fail-closed」）。
+    // 2000 次元クエリを 768 次元テーブルへ、768 次元クエリを 2000 次元テーブルへ
+    // 投げてもテナント・他テーブルの行が漏れずに拒否されることを確認する。
+    let path = unique_db_path("ext2-hd-dim-mismatch");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = build_coexisting_high_dim_storage(&path);
+    let core = EngineCore::from_storage(storage, search_engine::default_engine());
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+
+    let query_2000 = make_embedding(2000, 999);
+    let err = core
+        .search(&ctx, "emb768", &query_2000, 10)
+        .expect_err("2000-dim query against a 768-dim table must be rejected");
+    assert!(matches!(
+        err,
+        CoreError::Kernel(KernelError::DimMismatch {
+            expected: 768,
+            found: 2000,
+        })
+    ));
+
+    let query_768 = make_embedding(768, 998);
+    let err = core
+        .search(&ctx, "emb2000", &query_768, 10)
+        .expect_err("768-dim query against a 2000-dim table must be rejected");
+    assert!(matches!(
+        err,
+        CoreError::Kernel(KernelError::DimMismatch {
+            expected: 2000,
+            found: 768,
+        })
+    ));
+}
+
+#[test]
+fn ext2_2000_dim_search_results_survive_close_and_reopen() {
+    // `ext2_state_survives_close_and_reopen`（データ層版）の検索経路版。2000 次元
+    // テーブルが 768 次元テーブルと共存した状態で永続化され、再オープン後も
+    // `EngineCore::search` から同一の Top-k が得られることを確認する。
+    let path = unique_db_path("ext2-hd-persist");
+    let _cleanup = CleanupGuard(path.clone());
+
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    const TOP_K: usize = 10;
+    let query = high_dim_embeddings(2000)[5].clone();
+
+    // close 前（初回構築した `Storage`・`EngineCore`）の検索結果を、drop（close 相当）
+    // する前にこのスコープ内で確定させる。ここで `hits_before` を取らずに再オープンで
+    // 代用すると、比較が「2 回の post-close 読み出し」同士になり、close/reopen を
+    // 挟んだ永続化の検証にならない。
+    let hits_before = {
+        let storage = build_coexisting_high_dim_storage(&path);
+        let core = EngineCore::from_storage(storage, search_engine::default_engine());
+        let hits = core
+            .search(&ctx, "emb2000", &query, TOP_K)
+            .expect("search before close");
+        // ここでスコープを抜けて `core`（と内部の `storage`）が drop される
+        // （close 相当。`ext2_state_survives_close_and_reopen` と同じ手法）。
+        hits
+    };
+
+    let hits_after = {
+        let storage = Storage::open(&path).expect("reopen storage after close");
+        let core = EngineCore::from_storage(storage, search_engine::default_engine());
+        core.search(&ctx, "emb2000", &query, TOP_K)
+            .expect("search after reopen")
+    };
+
+    assert_eq!(
+        hits_before, hits_after,
+        "close/reopen の前後で 2000 次元テーブルの Top-k が変化した"
+    );
+    assert!(!hits_before.is_empty(), "hit が 0 件");
 }

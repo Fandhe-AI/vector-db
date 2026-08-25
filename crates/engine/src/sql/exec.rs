@@ -13,16 +13,19 @@
 //! RLS は **`HINT ORDER` の内容に関係なく**、唯一の実効的な防御である候補構築時の
 //! 暗黙事前フィルタ（`VectorArena::build_filtered_with_rows_in_txn` の `predicate`。
 //! `WHERE` 句の `visible()` 呼び出し（[`BoundStatement::rls_predicate_present`]）の
-//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。加えて
-//! [`crate::sql::plan::apply_rls_safety_net`] を最終結果へ無条件に適用するが、この
-//! 安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補集合）
-//! 由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とすことは
-//! ない。無効化できない構造にしてあるのは、候補集合の構築元が将来広がった場合の
-//! defense-in-depth としてで、「独立した 2 つの検査が効いている」という意味では
-//! ない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で RLS 段を
-//! 後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
-//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。RLS の暗黙適用フック
-//! （[`crate::rls::ImplicitRlsHook`]）経由で述語を取得する（TASK-137・RLS-6, RLS-7）。
+//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。この
+//! 事前フィルタの述語は RLS の暗黙適用フック（[`crate::rls::ImplicitRlsHook`]）
+//! 経由で取得する（TASK-137・RLS-6, RLS-7）。加えて
+//! [`crate::rls::RlsSafetyNet`]（TASK-136・RLS-5）を最終結果へ無条件に適用するが、
+//! この安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補
+//! 集合）由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とす
+//! ことはない。無効化できない構造にしてあるのは、候補集合の構築元が将来広がった
+//! 場合の defense-in-depth としてで、「独立した 2 つの検査が効いている」という
+//! 意味ではない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で
+//! RLS 段を後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
+//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。安全網通過済みの
+//! `hits` は [`crate::rls::RlsVerifiedHits`]（witness 型）としてのみ投影段へ渡り、
+//! 生の `Vec<(u64, f64)>` から投影へ到達する経路は型として存在しない。
 //!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
@@ -36,12 +39,12 @@ use crate::core;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
-use crate::rls::ImplicitRlsHook;
+use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
-use crate::sql::plan::{self, ExecutionPlan};
+use crate::sql::plan::ExecutionPlan;
 use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
@@ -535,30 +538,68 @@ pub fn execute_statement(
             .collect()
     };
 
-    // RLS 実行時安全網（RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
+    // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
     // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
     // フィールドを持たせておらず（`plan.rs` のドキュメント参照）、呼び出しを
     // 迂回する経路が型として存在しない。`arena` は候補構築と同一スナップショットの
     // テナント・可視性ラベルを保持しているため、`storage` の再取得なしに安全網を
     // 評価できる。現状は事前フィルタと同じ `arena` から再判定するため、この安全網
     // 単体で不可視行を追加で落とすことはない（defense-in-depth。モジュール
-    // ドキュメント参照）。
-    let hits: Vec<(u64, f64)> = plan::apply_rls_safety_net(
-        hits,
-        |id| {
-            let index = *arena_index_by_id.get(&id)?;
-            let tenant = arena.tenant_id(index)?.to_string();
-            let visibility = arena.visibility(index)?;
-            Some((tenant, visibility))
-        },
-        |tenant, visibility| ctx.is_visible(tenant, visibility),
-    );
+    // ドキュメント参照）。戻り値の [`RlsVerifiedHits`]（witness 型）は
+    // [`project_rows`] へのみ渡り、安全網を経由しない生の `hits` から投影へ
+    // 到達する経路は型として存在しない（`rls.rs` の型ドキュメント参照）。
+    let verified: RlsVerifiedHits = RlsSafetyNet::new(ctx).apply(hits, |id| {
+        let index = *arena_index_by_id.get(&id)?;
+        let tenant = arena.tenant_id(index)?;
+        let visibility = arena.visibility(index)?;
+        Some((tenant, visibility))
+    });
 
-    // 投影: `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と
-    // 同一スナップショットで保持しておいた embedding（`arena`）・デコード済み
-    // スカラー列（`candidate_columns`）から返却行を構築する（上記コメント参照。
-    // 候補選択後に対象行が更新・削除されても、投影は候補選択時点の値を返す
-    // ため、RLS・スカラー WHERE・embedding が候補選択と投影とで食い違うことはない）。
+    let rows = project_rows(
+        verified,
+        &bound.projection,
+        schema,
+        &arena,
+        &arena_index_by_id,
+        &candidate_columns,
+    )?;
+
+    let columns = bound
+        .projection
+        .iter()
+        .map(|col| match col {
+            ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
+                name: name.clone(),
+                ty: schema
+                    .columns
+                    .get(*index)
+                    .map(|c| c.ty)
+                    .unwrap_or(ColumnType::Text),
+            },
+        })
+        .collect();
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// 投影段（TASK-136・RLS-5）。引数を [`RlsVerifiedHits`]（witness 型）に固定する
+/// ことで、[`RlsSafetyNet::apply`] を経由しない生の `Vec<(u64, f64)>` から本関数へ
+/// 到達する経路を型として作れなくする（`execute_statement` からのみ呼ばれる）。
+/// `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と同一
+/// スナップショットで保持しておいた embedding（`arena`）・デコード済みスカラー列
+/// （`candidate_columns`）から返却行を構築する（候補選択後に対象行が更新・削除
+/// されても、投影は候補選択時点の値を返すため、RLS・スカラー WHERE・embedding が
+/// 候補選択と投影とで食い違うことはない）。
+fn project_rows(
+    verified: RlsVerifiedHits,
+    projection: &[ProjectedColumn],
+    schema: &TableSchema,
+    arena: &VectorArena,
+    arena_index_by_id: &HashMap<u64, usize>,
+    candidate_columns: &HashMap<u64, Vec<Value>>,
+) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+    let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
     for (id, score) in hits {
         let index = *arena_index_by_id
@@ -576,8 +617,8 @@ pub fn execute_statement(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "search hit id missing from candidate scalar columns".to_string(),
             })?;
-        let mut cells = Vec::with_capacity(bound.projection.len());
-        for col in &bound.projection {
+        let mut cells = Vec::with_capacity(projection.len());
+        for col in projection {
             match col {
                 ProjectedColumn::Id => cells.push(Cell::Integer(id)),
                 ProjectedColumn::Column { index, .. } => {
@@ -607,24 +648,7 @@ pub fn execute_statement(
         }
         rows.push(ResultRow { id, score, cells });
     }
-
-    let columns = bound
-        .projection
-        .iter()
-        .map(|col| match col {
-            ProjectedColumn::Id => ColumnMeta::Id,
-            ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
-                name: name.clone(),
-                ty: schema
-                    .columns
-                    .get(*index)
-                    .map(|c| c.ty)
-                    .unwrap_or(ColumnType::Text),
-            },
-        })
-        .collect();
-
-    Ok(QueryResult { columns, rows })
+    Ok(rows)
 }
 
 #[cfg(test)]

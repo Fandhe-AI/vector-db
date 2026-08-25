@@ -271,7 +271,7 @@ fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// ISA 別カーネルの共通本体。`LANES` 個ずつのレーンアキュムレータへ `f32::mul_add`
-/// （FMA 契約）で積算し、`chunks_exact` の端数（`remainder()`）はスカラーで処理、
+/// （FMA 契約）で積算し、`as_chunks` の端数はスカラーで処理、
 /// 最後にレーン和を固定順（インデックス昇順）で畳む。添字アクセス（`[]`）は使わず
 /// `zip`／イテレータのみで書く（.claude/rules/coding-rust.md）。同一 ISA・同一 LANES
 /// では常に同じ演算順序になるため、`kernel.rs::dot` 経由で呼ぶ全 provider
@@ -285,12 +285,10 @@ fn dot_lanes<const LANES: usize>(a: &[f32], b: &[f32]) -> f32 {
     let b = &b[..len];
 
     let mut lanes = [0f32; LANES];
-    let a_chunks = a.chunks_exact(LANES);
-    let b_chunks = b.chunks_exact(LANES);
-    let a_rem = a_chunks.remainder();
-    let b_rem = b_chunks.remainder();
+    let (a_chunks, a_rem) = a.as_chunks::<LANES>();
+    let (b_chunks, b_rem) = b.as_chunks::<LANES>();
 
-    for (a_chunk, b_chunk) in a_chunks.zip(b_chunks) {
+    for (a_chunk, b_chunk) in a_chunks.iter().zip(b_chunks.iter()) {
         for (lane, (x, y)) in lanes.iter_mut().zip(a_chunk.iter().zip(b_chunk.iter())) {
             *lane = x.mul_add(*y, *lane);
         }

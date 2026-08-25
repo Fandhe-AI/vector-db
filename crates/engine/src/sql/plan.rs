@@ -15,15 +15,25 @@
 //! 記述に過ぎず、RLS の適用そのものを外す・弱める手段にはならない
 //! （security.md「fail-open にする変更は P0」）。
 //!
-//! 加えて、最終結果に対して [`apply_rls_safety_net`] を無条件に適用する。現状は
-//! この事前フィルタと同じ `arena`（`ctx.is_visible` を通過済みの候補集合）由来の
-//! テナント・可視性ラベルで再判定するため、今この経路単体では不可視行を追加で
-//! 落とすことはない（事前フィルタが唯一の実効的な防御線）。それでも安全網を
-//! `Option` や条件分岐で無効化できない構造にしておくのは、候補集合の構築元が
-//! 将来広がった場合（例: 事前フィルタを経由しない別経路の追加）に、その時点の
-//! `exec.rs` 側の変更漏れだけで RLS 違反が起こらないようにする構造的な歯止め
+//! 加えて、`exec.rs` は最終結果に対して [`crate::rls::RlsSafetyNet`]（TASK-136・
+//! RLS-5）を無条件に適用する。現状はこの事前フィルタと同じ `arena`
+//! （`ctx.is_visible` を通過済みの候補集合）由来のテナント・可視性ラベルで
+//! 再判定するため、今この経路単体では不可視行を追加で落とすことはない
+//! （事前フィルタが唯一の実効的な防御線）。それでも安全網を `Option` や条件分岐で
+//! 無効化できない構造にしておくのは、候補集合の構築元が将来広がった場合
+//! （例: 事前フィルタを経由しない別経路の追加）に、その時点の `exec.rs` 側の
+//! 変更漏れだけで RLS 違反が起こらないようにする構造的な歯止め
 //! （defense-in-depth）としてであり、「今の実行経路で 2 つの独立した検査が
-//! 効いている」という主張ではない。
+//! 効いている」という主張ではない。安全網の実装・witness 型（通過済み hits
+//! だけを持ち出せる型）は `rls.rs` 側の管轄（TASK-136 で `sql::plan` から
+//! 再配置）で、本モジュールはそれを分岐させる真偽値を [`ExecutionPlan`] に
+//! 持たせない設計だけを担う。
+//!
+//! [`apply_rls_safety_net`] は TASK-136 で `crate::rls::RlsSafetyNet` へ実装を
+//! 再配置した後も、main へマージ済みの公開 `pub fn` との互換性のために
+//! `#[deprecated]` 付きで残す（PR #192 codex-review P1 対応）。呼び出し元
+//! （`sql::exec`）はすでに `RlsSafetyNet` を直接使っており、本関数はワーク
+//! スペース内では未参照。
 
 /// `HINT ORDER(...)` が受理する評価段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,10 +116,10 @@ pub enum PlanError {
 }
 
 /// [`crate::sql::parser::BoundStatement`] から導出する、`exec.rs` が直接参照する
-/// 実行方針。RLS 安全網（[`apply_rls_safety_net`]）は `HINT ORDER` の内容に関わらず
-/// `exec.rs` が無条件に呼び出す契約であり、その適用有無を分岐させる真偽値は
-/// この構造体に持たせない（boolean フィールドを経由させないことで「安全網を
-/// 無効化できる `ExecutionPlan` を作れない」ことを型で保証する）。
+/// 実行方針。RLS 安全網（[`crate::rls::RlsSafetyNet`]）は `HINT ORDER` の内容に
+/// 関わらず `exec.rs` が無条件に呼び出す契約であり、その適用有無を分岐させる
+/// 真偽値はこの構造体に持たせない（boolean フィールドを経由させないことで
+/// 「安全網を無効化できる `ExecutionPlan` を作れない」ことを型で保証する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionPlan {
     /// SCALAR 条件を候補構築時（`on_visible_row`）に事前適用するか。
@@ -127,13 +137,25 @@ impl ExecutionPlan {
     }
 }
 
-/// RLS 実行時安全網（RLS-5）。`hits`（DISTANCE 段が返した `(id, score)` の順序付き列）
-/// から、`is_visible(tenant_id, visibility)` が `false` を返す行、および
-/// `tenant_id`/`visibility` を引けない行（データ不整合。fail-closed に除去）を除く。
+/// RLS 実行時安全網（RLS-5）の旧 API（TASK-76）。TASK-136 で実装を
+/// [`crate::rls::RlsSafetyNet`] へ再配置した後も、main へマージ済みの公開 API
+/// との互換性のために残す（PR #192 codex-review P1 対応）。
 ///
-/// `HINT ORDER` の内容・`rls_predicate_present` の有無に関係なく `exec.rs` から
-/// 無条件に呼ばれる契約（本モジュールの先頭ドキュメント参照）。`hits` の相対順序は
-/// 保つ（`filter` ベースで安定。要素の並べ替えは行わない）。
+/// `hits`（DISTANCE 段が返した `(id, score)` の順序付き列）から、
+/// `is_visible(tenant_id, visibility)` が `false` を返す行、および
+/// `tenant_id`/`visibility` を引けない行（データ不整合。fail-closed に除去）を除く。
+/// `hits` の相対順序は保つ（`filter` ベースで安定。要素の並べ替えは行わない）。
+///
+/// `RlsSafetyNet::apply` へ内部委譲しない: `RlsSafetyNet` は判定ロジックを
+/// `PolicyContext::is_visible` に固定することで「呼び出し元が判定を差し替えて
+/// 検査を弱められない」契約を保証しており（`rls.rs` モジュールドキュメント参照）、
+/// 本関数の `is_visible: F` のような任意の述語注入を許す口を新設すると、その
+/// 契約自体を破ることになる（security.md P0「テナント境界の検査を外す/緩める
+/// 経路を作らない」）。互換性のためだけに `RlsSafetyNet` 側の設計を緩めるのは
+/// 本末転倒のため、本関数は旧実装をそのまま保持し、
+/// `sql::plan::tests::deprecated_wrapper_matches_rls_safety_net` で
+/// `RlsSafetyNet::apply` と同一入力に対し同一結果になることをテストで固定する。
+#[deprecated(note = "use crate::rls::RlsSafetyNet instead")]
 pub fn apply_rls_safety_net<F>(
     hits: Vec<(u64, f64)>,
     tenant_and_visibility: impl Fn(u64) -> Option<(String, crate::storage::Visibility)>,
@@ -153,7 +175,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Visibility;
 
     // --- Stage / parse_stage_name ------------------------------------------------
 
@@ -275,41 +296,60 @@ mod tests {
         assert!(!ExecutionPlan::from_evaluation_order(order).scalar_prefilter);
     }
 
-    // --- apply_rls_safety_net -----------------------------------------------------
+    // --- 旧 API 互換（apply_rls_safety_net）---------------------------------------
 
+    /// PR #192 codex-review P1 対応: `#[deprecated]` で復元した旧 API
+    /// `apply_rls_safety_net` が、現行実装 `crate::rls::RlsSafetyNet::apply` と
+    /// 同一入力に対し同一結果（生き残る id・順序・除去件数）を返すことを固定する。
+    /// テナント不一致による除去（fail-closed の可視性判定）と、ラベルを引けない
+    /// id の除去（`None` 分岐。データ不整合時の fail-closed）の両方を含める
+    /// （どちらも通す自明なケースだけでは互換性の証明にならないため）。
     #[test]
-    fn safety_net_removes_invisible_ids_and_keeps_order() {
-        let hits = vec![(1, 0.1), (2, 0.2), (3, 0.3)];
-        // id=2 は tenant-b（呼び出し側の is_visible が false を返す想定）。
-        let lookup = |id: u64| -> Option<(String, Visibility)> {
-            match id {
-                1 => Some(("tenant-a".to_string(), Visibility::Public)),
-                2 => Some(("tenant-b".to_string(), Visibility::Public)),
-                3 => Some(("tenant-a".to_string(), Visibility::Private)),
-                _ => None,
-            }
-        };
-        let filtered = apply_rls_safety_net(hits, lookup, |tenant, _| tenant == "tenant-a");
-        assert_eq!(filtered, vec![(1, 0.1), (3, 0.3)]);
-    }
+    #[allow(deprecated)]
+    fn deprecated_wrapper_matches_rls_safety_net() {
+        use crate::policy::PolicyContext;
+        use crate::rls::RlsSafetyNet;
+        use crate::storage::Visibility;
+        use std::collections::HashMap;
 
-    #[test]
-    fn safety_net_fail_closed_drops_ids_with_missing_tenant_info() {
-        let hits = vec![(1, 0.1), (99, 0.9)];
-        let lookup = |id: u64| -> Option<(String, Visibility)> {
-            if id == 1 {
-                Some(("tenant-a".to_string(), Visibility::Public))
-            } else {
-                None
-            }
-        };
-        let filtered = apply_rls_safety_net(hits, lookup, |_, _| true);
-        assert_eq!(filtered, vec![(1, 0.1)]);
-    }
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
 
-    #[test]
-    fn safety_net_on_empty_hits_returns_empty() {
-        let filtered: Vec<(u64, f64)> = apply_rls_safety_net(Vec::new(), |_| None, |_, _| true);
-        assert!(filtered.is_empty());
+        // id 1: 同一テナント Public（可視）。
+        // id 2: 他テナント Private（不可視・テナント不一致）。
+        // id 3: 同一テナント Private（可視）。
+        // id 4: ラベルなし（データ不整合。fail-closed に除去）。
+        let mut labels: HashMap<u64, (String, Visibility)> = HashMap::new();
+        labels.insert(1, ("tenant-a".to_string(), Visibility::Public));
+        labels.insert(2, ("tenant-b".to_string(), Visibility::Private));
+        labels.insert(3, ("tenant-a".to_string(), Visibility::Private));
+
+        let hits: Vec<(u64, f64)> = vec![(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4)];
+
+        let old_result = apply_rls_safety_net(
+            hits.clone(),
+            |id| labels.get(&id).cloned(),
+            |tenant, visibility| ctx.is_visible(tenant, visibility),
+        );
+
+        let net = RlsSafetyNet::new(&ctx);
+        let verified = net.apply(hits, |id| {
+            labels
+                .get(&id)
+                .map(|(tenant, visibility)| (tenant.as_str(), *visibility))
+        });
+
+        assert_eq!(
+            old_result,
+            verified.hits().to_vec(),
+            "deprecated apply_rls_safety_net must match RlsSafetyNet::apply"
+        );
+        assert_eq!(old_result, vec![(1, 0.1), (3, 0.3)]);
+        assert_eq!(
+            verified.dropped(),
+            2,
+            "id 2 (tenant mismatch) and id 4 (no label) must be dropped"
+        );
     }
 }
