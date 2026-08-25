@@ -350,6 +350,139 @@ pub fn insert_row(
     Ok(())
 }
 
+/// `table` へ複数行をまとめて挿入する（[`insert_row`] のバッチ版。TASK-95・
+/// 対象ビヘイビア: RECOVER-4, TABLE-12, RLS-9）。
+///
+/// 認可・重複検出の契約は [`insert_row`] と同一で、バッチ全体を単一の write
+/// トランザクションで処理する（1 件でも拒否されれば commit せず全体が未反映になる。
+/// `redb::WriteTransaction` の drop 契約）。
+///
+/// - `row.tenant_id` が `ctx` と不一致な行が 1 件でもあれば [`TenantWriteError::Forbidden`]
+///   （ストレージへ触れる前に全件を検査する）
+/// - 物理キーは `(ctx.tenant_id(), id)`（TABLE-12）。既存行との衝突、および
+///   **同一バッチ内の id 重複**はいずれも [`TenantWriteError::IdConflict`]。後者を
+///   検出しないと、バッチ内の後勝ちで先行行が黙って上書きされ、[`insert_row`] が
+///   守っている「既存行を上書きしない」契約をバッチ経由で迂回できてしまう
+/// - 他テナントが同じ `id` を保持していても成功する（別キーのため。RLS-9）
+///
+/// 空バッチはテーブル存在確認のみを行い、世代を進めずに成功する
+/// （`catalog.rs::Storage::insert_rows_into_table` と同じ扱い。無変更コミットで
+/// 既存インデックスを不要に失効させない）。
+pub fn insert_rows(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    rows: &[(u64, RowInput<'_>)],
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を全件検査する
+    // （security.md P0。[`insert_row`] と同じ単一照合パス `PolicyContext::is_owner`）。
+    if rows.iter().any(|(_, row)| !ctx.is_owner(row.tenant_id)) {
+        return Err(TenantWriteError::Forbidden);
+    }
+    // バッチ内の id 重複検出（上記ドキュメント参照）。件数は呼び出し元のスライス長で
+    // 上限が決まるため、確保はフォールブルにする（無制限 `with_capacity` を使わない。
+    // coding-rust.md）。
+    let mut seen_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    seen_ids.try_reserve(rows.len()).map_err(|_| {
+        TenantWriteError::Storage(StorageError::Codec(
+            "failed to reserve batch id set".to_string(),
+        ))
+    })?;
+    for (id, _) in rows {
+        if !seen_ids.insert(*id) {
+            return Err(TenantWriteError::IdConflict);
+        }
+    }
+
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        if rows.is_empty() {
+            drop(write_txn);
+            return Ok(());
+        }
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        for (id, row) in rows {
+            schema.validate_embedding_dim(row.embedding.len())?;
+            let key = (ctx.tenant_id(), *id);
+            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
+                return Err(TenantWriteError::IdConflict);
+            }
+            let encoded = encode_row(row)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+        }
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(())
+}
+
+/// スキーマ列順の型付き値列から 1 行挿入する（`catalog.rs::Storage::insert_typed_row` の
+/// テナント境界付き版。TASK-95・対象ビヘイビア: RECOVER-4, TABLE-12）。
+///
+/// 行の `tenant_id` は**引数で受け取らず** `ctx`（サーバー側導出テナント。WIRE-2・
+/// RLS-6）から導出する（クライアント自己申告のテナントを書き込みへ持ち込む経路を
+/// 作らない。security.md P0）。重複検出・物理キーの扱いは [`insert_row`] と同一。
+pub fn insert_typed_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    visibility: crate::storage::Visibility,
+    values: &[crate::row_codec::Value],
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table has no VECTOR column".to_string(),
+                ))
+            })?;
+        let embedding = match values.get(vector_idx) {
+            Some(crate::row_codec::Value::Vector(v)) => v.clone(),
+            _ => {
+                return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                    "VECTOR column value missing or not a Vector".to_string(),
+                )))
+            }
+        };
+        schema.validate_embedding_dim(embedding.len())?;
+        let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+            .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+        let row = RowInput {
+            tenant_id: ctx.tenant_id(),
+            visibility,
+            embedding: &embedding,
+            metadata: &metadata,
+        };
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        let key = (ctx.tenant_id(), id);
+        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
+            return Err(TenantWriteError::IdConflict);
+        }
+        let encoded = encode_row(&row)?;
+        row_table
+            .insert(key, encoded.as_slice())
+            .map_err(CatalogError::from)?;
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(())
+}
+
 /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// `row.tenant_id` が `ctx` のテナントと不一致なら

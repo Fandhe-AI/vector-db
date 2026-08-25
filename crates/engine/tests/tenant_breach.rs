@@ -160,23 +160,31 @@ fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) {
             id += 1;
         }
     }
-    let inputs: Vec<(u64, RowInput<'_>)> = rows
-        .iter()
-        .map(|(id, emb, tenant, vis)| {
-            (
-                *id,
-                RowInput {
-                    tenant_id: tenant,
-                    visibility: *vis,
-                    embedding: emb,
-                    metadata: &[],
-                },
-            )
-        })
-        .collect();
-    storage
-        .insert_rows_into_table(TABLE, &inputs)
-        .expect("seed corpus batch insert");
+    // 投入はテナント境界付きバッチ API（`tenant::insert_rows`）経由で行う
+    // （codex-review P0 指摘・PR #194 対応で `Storage::insert_rows_into_table` は
+    // `pub(crate)` 化した）。ガード付き API は 1 バッチ内のテナント混在を
+    // `Forbidden` で拒否するため、テナントごとにバッチを分ける。
+    for tenant in tenants {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let inputs: Vec<(u64, RowInput<'_>)> = rows
+            .iter()
+            .filter(|(_, _, row_tenant, _)| *row_tenant == tenant)
+            .map(|(id, emb, row_tenant, vis)| {
+                (
+                    *id,
+                    RowInput {
+                        tenant_id: row_tenant,
+                        visibility: *vis,
+                        embedding: emb,
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        tenant::insert_rows(storage, TABLE, &ctx, &inputs).expect("seed corpus batch insert");
+    }
 }
 
 // 対象ビヘイビア: RECOVER-4。テナント境界を越える書き込み（INSERT/UPDATE/DELETE）試行が

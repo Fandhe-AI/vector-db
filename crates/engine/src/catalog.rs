@@ -770,13 +770,14 @@ impl Storage {
     /// 存在確認より先に判定すると、存在しないテーブルへの空バッチ挿入が `Ok(())` になり
     /// 「テーブル不存在は fail-closed に `Err`」という契約を空バッチで迂回できてしまう）。
     ///
-    /// 既知の課題（codex-review P0 指摘・PR #194。`insert_row_into_table` と同型）:
-    /// 本メソッドもテナント境界チェックを行わない生の書き込み経路のまま `pub` を維持して
-    /// いる（`crate::tenant` 側に対応するガード付きバッチ挿入 API がまだ無いため。生 API を
-    /// `pub(crate)` 化した場合の外部呼び出し元移行はテスト側の対応を要し、本 PR の
-    /// スコープ外として次 PR へ持ち越す）。新規のクレート外呼び出しをこの API に追加しない
-    /// こと。
-    pub fn insert_rows_into_table(
+    /// `pub(crate)`（codex-review P0 指摘・PR #194 対応）: 本メソッドはテナント境界
+    /// チェックを一切行わない生の書き込み経路で、クレート外へ公開すると任意の
+    /// `tenant_id` 名義での書き込み・既存行の上書きが可能になる
+    /// （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+    /// クレート外・テストからのバッチ投入は [`crate::tenant::insert_rows`]
+    /// （`PolicyContext` 必須のガード付きバッチ API）を経由すること。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_rows_into_table(
         &self,
         table_name: &str,
         rows: &[(u64, RowInput<'_>)],
@@ -820,10 +821,12 @@ impl Storage {
     /// `VECTOR` 列を持たない・`values` の対応する位置が `Value::Vector` でない場合は
     /// fail-closed に `Err`。
     ///
-    /// 既知の課題（codex-review P0 指摘・PR #194。`insert_row_into_table` と同型）:
-    /// 本メソッドもテナント境界チェックを行わない生の書き込み経路のまま `pub` を維持して
-    /// いる。理由・対応方針は [`Self::insert_rows_into_table`] の同種コメントを参照。
-    pub fn insert_typed_row(
+    /// `pub(crate)`（codex-review P0 指摘・PR #194 対応）: [`Self::insert_rows_into_table`]
+    /// と同じ理由でクレート外へは公開しない（`tenant_id` を引数で受け取る生の経路）。
+    /// クレート外・テストからの型付き行投入は [`crate::tenant::insert_typed_row`]
+    /// （`PolicyContext` から `tenant_id` を導出するガード付き API）を経由すること。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_typed_row(
         &self,
         table_name: &str,
         id: u64,

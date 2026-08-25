@@ -113,19 +113,23 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
                 *slot = rng.next_f32_signed();
             }
             let body = format!("{lang} document about vectors {}", unique_keyword(id));
-            storage
-                .insert_typed_row(
-                    TABLE,
-                    id,
-                    tenant,
-                    visibility,
-                    &[
-                        Value::Vector(emb),
-                        Value::Text(lang.to_string()),
-                        Value::Text(body),
-                    ],
-                )
-                .expect("insert row");
+            // テナント境界付き API 経由（`tenant_id` は `ctx` から導出される）。
+            let ctx =
+                PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                    .expect("valid tenant");
+            engine::tenant::insert_typed_row(
+                storage,
+                TABLE,
+                &ctx,
+                id,
+                visibility,
+                &[
+                    Value::Vector(emb),
+                    Value::Text(lang.to_string()),
+                    Value::Text(body),
+                ],
+            )
+            .expect("insert row");
             truths.push(RowTruth {
                 id,
                 tenant,

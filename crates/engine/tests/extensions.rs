@@ -180,9 +180,10 @@ fn ext1_brute_force_top_k_ranks_self_match_first() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("insert_rows_into_table");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("insert_rows");
 
     let (all_rows, _cursor) = storage
         .scan_table_page("docs", None, 100)
@@ -400,9 +401,10 @@ fn ext2_scan_table_page_returns_only_own_table_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("small", &small_rows)
-        .expect("seed small");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "small", &ctx, &small_rows).expect("seed small");
 
     let mid_embeddings: Vec<Vec<f32>> = (100..103u64)
         .map(|i| make_embedding(768, i as u32 + 1))
@@ -422,9 +424,7 @@ fn ext2_scan_table_page_returns_only_own_table_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("mid", &mid_rows)
-        .expect("seed mid");
+    engine::tenant::insert_rows(&storage, "mid", &ctx, &mid_rows).expect("seed mid");
 
     let (small_page, _) = storage
         .scan_table_page("small", None, 100)
@@ -570,10 +570,13 @@ fn ext2_insert_rows_into_table_discards_whole_transaction_on_mid_batch_failure()
         ),
     ];
 
-    let err = storage
-        .insert_rows_into_table("small", &batch)
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    let err = engine::tenant::insert_rows(&storage, "small", &ctx, &batch)
         .expect_err("batch containing a dimension mismatch must fail");
-    assert!(matches!(err, CatalogError::Invalid(_)));
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+    ));
 
     // トランザクション全体が破棄され、先に検証を通過していた 1・2 件目も
     // 一切反映されていないこと（`RowNotFound` まで確認し、別の理由での
@@ -624,9 +627,10 @@ fn ext2_scan_table_page_resumes_via_after_cursor_across_pages() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed 25 rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed 25 rows");
 
     let (page1, cursor1) = storage
         .scan_table_page("docs", None, 10)
@@ -694,9 +698,10 @@ fn ext2_scan_table_page_byte_budget_caps_page_and_resume_covers_all_rows_without
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed large rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed large rows");
 
     let (page1, cursor1) = storage
         .scan_table_page("docs", None, 100)
@@ -813,10 +818,13 @@ fn ext2_insert_rows_into_table_rejects_empty_batch_against_nonexistent_table() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let err = storage
-        .insert_rows_into_table("ghost", &[])
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    let err = engine::tenant::insert_rows(&storage, "ghost", &ctx, &[])
         .expect_err("empty batch against a nonexistent table must still be rejected");
-    assert!(matches!(err, CatalogError::TableNotFound(_)));
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::TableNotFound(_))
+    ));
 }
 
 #[test]
@@ -952,9 +960,9 @@ fn seed_high_dim_table(storage: &Storage, name: &str, dim: u32, id_offset: u64) 
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(name, &rows)
-        .unwrap_or_else(|e| panic!("insert_rows_into_table({name}) failed: {e}"));
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(storage, name, &ctx, &rows)
+        .unwrap_or_else(|e| panic!("tenant::insert_rows({name}) failed: {e}"));
 }
 
 /// `dim` 次元の embedding 群（`seed_high_dim_table` と同一の決定論的生成規則）を

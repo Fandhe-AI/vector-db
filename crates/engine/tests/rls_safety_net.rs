@@ -32,6 +32,37 @@ use engine::storage::{RowInput, Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// テナント境界付きバッチ API（`engine::tenant::insert_rows`）はバッチ内のテナント混在を
+/// `Forbidden` で拒否するため、テナントごとに分割して投入するテスト用ヘルパ
+/// （codex-review P0 指摘・PR #194 対応で `Storage::insert_rows_into_table` は
+/// `pub(crate)` 化した）。
+fn seed_rows_grouped_by_tenant(storage: &Storage, table: &str, rows: &[(u64, RowInput<'_>)]) {
+    let mut tenants: Vec<&str> = rows.iter().map(|(_, r)| r.tenant_id).collect();
+    tenants.sort_unstable();
+    tenants.dedup();
+    for tenant in tenants {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let batch: Vec<(u64, RowInput<'_>)> = rows
+            .iter()
+            .filter(|(_, r)| r.tenant_id == tenant)
+            .map(|(id, r)| {
+                (
+                    *id,
+                    RowInput {
+                        tenant_id: r.tenant_id,
+                        visibility: r.visibility,
+                        embedding: r.embedding,
+                        metadata: r.metadata,
+                    },
+                )
+            })
+            .collect();
+        engine::tenant::insert_rows(storage, table, &ctx, &batch).expect("seed rows");
+    }
+}
+
 // ---------- 決定的擬似乱数（xorshift64*。`tests/rls_security.rs` と同一実装） ----------
 
 struct Xorshift64 {
@@ -144,9 +175,7 @@ fn seed_multi_tenant_corpus(
             },
         ));
     }
-    storage
-        .insert_rows_into_table(TABLE, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, TABLE, &rows);
     truth
 }
 
@@ -308,15 +337,21 @@ fn execute_sql_hint_order_rls_last_matches_default_order() {
         (6, [0.5, 0.5]),
     ];
     for (id, emb) in rows {
-        storage
-            .insert_typed_row(
-                TABLE,
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[engine::row_codec::Value::Vector(emb.to_vec())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[engine::row_codec::Value::Vector(emb.to_vec())],
+        )
+        .expect("insert row");
     }
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");

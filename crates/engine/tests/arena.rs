@@ -78,9 +78,10 @@ fn table8_build_produces_arena_matching_inserted_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed rows");
 
     let arena = VectorArena::build(&storage, "docs").expect("build arena via public API");
     assert_eq!(arena.table_name(), "docs");

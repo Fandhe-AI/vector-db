@@ -52,15 +52,21 @@ fn setup_lang_corpus(storage: &Storage) {
         (5, [0.0, 1.0], "ja"),
     ];
     for (id, emb, lang) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+        )
+        .expect("insert row");
     }
 }
 
@@ -179,15 +185,21 @@ fn setup_multi_tenant_table(storage: &Storage) {
         (4, "tenant-b", Visibility::Private),
     ];
     for (id, tenant, visibility) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                tenant,
-                visibility,
-                &[Value::Vector(vec![1.0, 0.0])],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            id,
+            visibility,
+            &[Value::Vector(vec![1.0, 0.0])],
+        )
+        .expect("insert row");
     }
 }
 
@@ -300,15 +312,21 @@ fn hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders() {
             Some(b) => Value::Text(b.to_string()),
             None => Value::Null,
         };
-        storage
-            .insert_typed_row(
-                "docs",
-                row.id,
-                row.tenant,
-                row.visibility,
-                &[Value::Vector(row.embedding.to_vec()), value],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities(row.tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            row.id,
+            row.visibility,
+            &[Value::Vector(row.embedding.to_vec()), value],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);

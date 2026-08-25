@@ -52,6 +52,38 @@ impl Xorshift64 {
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+/// テナント境界付きバッチ API（`engine::tenant::insert_rows`）はバッチ内のテナント混在を
+/// `Forbidden` で拒否するため、テナントごとに分割して投入するテスト用ヘルパ
+/// （codex-review P0 指摘・PR #194 対応で `Storage::insert_rows_into_table` は
+/// `pub(crate)` 化した）。可視性は `Public`/`Private` 双方を許可した `PolicyContext`
+/// で投入するが、書き込み認可（`is_owner`）は可視性ラベルを見ないため結果に影響しない。
+fn seed_rows_grouped_by_tenant(storage: &Storage, table: &str, rows: &[(u64, RowInput<'_>)]) {
+    let mut tenants: Vec<&str> = rows.iter().map(|(_, r)| r.tenant_id).collect();
+    tenants.sort_unstable();
+    tenants.dedup();
+    for tenant in tenants {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let batch: Vec<(u64, RowInput<'_>)> = rows
+            .iter()
+            .filter(|(_, r)| r.tenant_id == tenant)
+            .map(|(id, r)| {
+                (
+                    *id,
+                    RowInput {
+                        tenant_id: r.tenant_id,
+                        visibility: r.visibility,
+                        embedding: r.embedding,
+                        metadata: r.metadata,
+                    },
+                )
+            })
+            .collect();
+        engine::tenant::insert_rows(storage, table, &ctx, &batch).expect("seed rows");
+    }
+}
+
 const DIM: u32 = 8;
 const TABLE: &str = "docs";
 const TENANTS: [&str; 4] = ["tenant-0", "tenant-1", "tenant-2", "tenant-3"];
@@ -111,9 +143,7 @@ fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) -> Vec<RowMet
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(TABLE, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, TABLE, &rows);
     metas
 }
 
