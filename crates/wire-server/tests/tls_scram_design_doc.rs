@@ -1,8 +1,5 @@
-//! TASK-72（WIRE-9）の受け入れ条件「対象ビヘイビア ID に対応するテストを追加する」に
-//! 対応するテスト。TASK-72 はランタイム実装を伴わない設計ドキュメント作成タスクである
-//! ため、成果物（`docs/design/tls-scram-design.md`）の存在と必須セクションの完全性を
-//! 検証することでビヘイビア対応とする。TLS・SCRAM の実装本体に対するテストは、実装
-//! コードが追加される後続タスク側で追加する。
+//! TASK-72（WIRE-9）に対応するテスト。成果物（`docs/design/tls-scram-design.md`）
+//! の存在と必須ポインタ表記・見出し構造を検証する。
 
 use std::fs;
 use std::path::PathBuf;
@@ -40,10 +37,8 @@ fn design_doc_exists() {
 fn design_doc_has_required_pointers_and_sections() {
     let content = read_design_doc();
 
-    // spec-confidentiality に従い spec 本文は転記しないが、対応するタスク・
-    // ビヘイビア ID へのポインタ表記は必須とする。この不変条件は文書の言い回し
-    // やステータス（Proposed → Accepted 遷移を予定）が変わっても保たれるべき
-    // ものなので、それらは意図的にアサートしない。
+    // spec-confidentiality に従い spec 本文は転記しない。TASK-72・WIRE-9 への
+    // ポインタ表記が保たれていることのみを検証する。
     assert!(
         content.contains("TASK-72"),
         "TASK-72 へのポインタ表記が見つからない"
@@ -54,9 +49,7 @@ fn design_doc_has_required_pointers_and_sections() {
     );
 }
 
-/// 必須の見出し構造（`##` レベル）を検証する。本タスクは「導入方式確定」ではなく
-/// 論点整理・調査タスクであるため、決定内容そのものではなく確定前提の論点整理
-/// セクションが存在することを構造面で担保する。
+/// 必須の見出し構造（`##` レベル）を検証する。
 #[test]
 fn design_doc_has_required_heading_structure() {
     let content = read_design_doc();
@@ -80,6 +73,8 @@ fn design_doc_has_required_heading_structure() {
 /// 未確定のまま「導入方式確定」等を名乗るとタスク完了の契約を満たさないため、
 /// タイトル・ステータス行に「確定」の語が含まれる場合は Proposed 以外の
 /// ステータス表記（Accepted 等、決定が実際に確定した状態）でなければならない。
+/// 「調査」等の語がタイトルに併記されていても「確定」の語自体が含まれていれば
+/// 確定主張とみなす（誤って通過させないため、語による除外はしない）。
 #[test]
 fn design_doc_does_not_claim_finalized_while_proposed() {
     let content = read_design_doc();
@@ -93,7 +88,7 @@ fn design_doc_does_not_claim_finalized_while_proposed() {
         .expect("タイトル行が見つからない");
 
     let is_proposed = status_line.contains("Proposed");
-    let title_claims_finalized = title_line.contains("確定") && !title_line.contains("調査");
+    let title_claims_finalized = title_line.contains("確定");
 
     assert!(
         !(is_proposed && title_claims_finalized),
