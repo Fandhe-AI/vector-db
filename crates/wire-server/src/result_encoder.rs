@@ -8,7 +8,12 @@
 //! （TASK-73・WIRE-1）。
 //!
 //! 型写像（すべて format code 0 = text）:
-//! - `ColumnMeta::Id` → `int8`（OID 20, typlen 8）
+//! - `ColumnMeta::Id` → `numeric`（OID 1700, typlen -1）。engine の行 ID は
+//!   `u64` 全域（`u64::MAX` を含む）を有効値とするため、符号付き 64bit の
+//!   `int8`（OID 20）では `i64::MAX` を超える正当な ID を表現できない
+//!   （PR #210 レビュー指摘）。10進テキスト表現は `int8`/`numeric` のどちらでも
+//!   同一であり、`numeric` として公告することで値域制限なく全 `u64` 値を
+//!   そのまま送出できる
 //! - `ColumnMeta::Scalar{ty: Text}` → `text`（OID 25, typlen -1）
 //! - `ColumnMeta::Scalar{ty: Vector(_)}` → `text`（OID 25。値は `[v1,v2,...]` 形式）
 //! - `ColumnMeta::Computed{..}` → `text`（OID 25。実行時型のため text 固定）
@@ -30,8 +35,8 @@ pub struct EncodeError;
 /// 型写像表を参照）。
 fn column_type_oid_and_len(meta: &ColumnMeta) -> (i32, i16) {
     match meta {
-        ColumnMeta::Id => (20, 8),               // int8
-        ColumnMeta::Scalar { .. } => (25, -1),   // text（Vector も text 表現で返す）
+        ColumnMeta::Id => (1700, -1), // numeric（u64 全域を表現するため int8 ではなく numeric）
+        ColumnMeta::Scalar { .. } => (25, -1), // text（Vector も text 表現で返す）
         ColumnMeta::Computed { .. } => (25, -1), // text
     }
 }
@@ -78,21 +83,16 @@ pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeE
 
 /// `Cell` の text フォーマット表現。`Null` は `None`（`DataRow` の -1 長へ写像）。
 ///
-/// `Cell::Integer` は `u64` 全域を保持しうるが、本モジュールは `id` 列を
-/// `int8`（OID 20, signed 64bit）として公告している（型写像表参照）。
-/// `i64::MAX` を超える値をそのまま10進テキストで送ると、`int8` として decode
-/// する規約準拠クライアント（signed 64bit 前提）が値域外エラー・誤変換を
-/// 起こしうる（Bugbot 指摘・PR #210）。fail-closed の方針
-/// （`.claude/rules/coding-rust.md`）に従い、宣言した型の値域を超える場合は
-/// 黙って不正確な値を返さず `Err(EncodeError)` とする（呼び出し元
-/// `simple_query` はこれを内部エラー `XX000` として扱う）。
+/// `Cell::Integer` は `u64` 全域（`u64::MAX` を含む）を保持しうる。本モジュール
+/// は `id` 列を `numeric`（OID 1700, 型写像表参照）として公告しており、
+/// `numeric` の text 表現は符号無し10進整数をそのまま送出してよい（`int8` の
+/// ような signed 64bit 制約が無い）ため、`i64` への変換は行わず値域制限なく
+/// `to_string()` する（PR #210 レビュー指摘: 旧実装は `i64::try_from` で
+/// `i64::MAX` 超の正当な ID を `EncodeError`/`XX000` にしていた）。
 fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     match cell {
         Cell::Null => Ok(None),
-        Cell::Integer(v) => {
-            let signed = i64::try_from(*v).map_err(|_| EncodeError)?;
-            Ok(Some(signed.to_string()))
-        }
+        Cell::Integer(v) => Ok(Some(v.to_string())),
         Cell::Text(s) => Ok(Some(s.clone())),
         Cell::Vector(v) => {
             let joined = v
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn data_row_integer_cell_within_i64_range_encodes_as_signed_decimal() {
+    fn data_row_integer_cell_within_i64_range_encodes_as_decimal() {
         let row = ResultRow {
             id: i64::MAX as u64,
             score: 0.0,
@@ -257,17 +257,20 @@ mod tests {
     }
 
     #[test]
-    fn data_row_integer_cell_beyond_i64_max_is_rejected() {
-        // `id` 列は int8（signed 64bit）として公告するため、`i64::MAX` を超える
-        // `u64` 値をそのまま10進テキストで返すと signed decode 前提のクライアント
-        // が誤動作しうる（Bugbot 指摘・PR #210）。fail-closed に `EncodeError` と
-        // する。
+    fn data_row_integer_cell_beyond_i64_max_encodes_as_decimal() {
+        // `id` 列は `numeric`（OID 1700）として公告するため（型写像表参照）、
+        // `i64::MAX` を超える正当な `u64` 行 ID も値域制限なくそのまま10進
+        // テキストで送出できる（PR #210 レビュー指摘: 旧実装は int8 前提で
+        // `EncodeError`/`XX000` にしていた）。
         let row = ResultRow {
             id: u64::MAX,
             score: 0.0,
             cells: vec![Cell::Integer(u64::MAX)],
         };
-        assert!(encode_data_row(&row).is_err());
+        let msg = encode_data_row(&row).expect("encode");
+        let cell_len = i32_at(&msg, 7) as usize;
+        let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
+        assert_eq!(text, u64::MAX.to_string());
     }
 
     #[test]

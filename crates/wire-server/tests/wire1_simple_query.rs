@@ -70,7 +70,7 @@ fn new_core_single_tenant() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
 }
 
 /// C1 相当（`ORDER BY <=> LIMIT`）: `RowDescription`・`DataRow`・
-/// `CommandComplete("SELECT n")` が返り、id 列（`int8`）が期待どおりであること。
+/// `CommandComplete("SELECT n")` が返り、id 列（`numeric`）が期待どおりであること。
 #[test]
 fn wire1_c1_query_returns_row_description_and_data_rows() {
     let (core, _guard) = new_core_single_tenant();
