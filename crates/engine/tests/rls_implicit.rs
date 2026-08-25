@@ -103,8 +103,8 @@ fn is_allowed(row: &RowTruth, viewer_tenant: &str, allow_private: bool) -> bool 
     }
 }
 
-/// `body` に「その行だけが持つ一意なキーワード」を埋め込む（C4 の疎コーパス側からの
-/// 混入検出に使う。行 id を含むトークンなので他の行の body とは一致しない）。
+/// `body` に「その行だけが持つ一意なキーワード」を埋め込む（他行への混入検出に使う。
+/// 行 id を含むトークンなので他の行の body とは一致しない）。
 fn unique_keyword(id: u64) -> String {
     format!("uniquetoken{id}")
 }
@@ -187,7 +187,7 @@ fn query_vec() -> String {
 // --- RLS-7（TASK-137） -----------------------------------------------------------
 
 #[test]
-fn rls7_c1_without_predicate_matches_with_predicate_and_leaks_nothing() {
+fn rls7_topk_query_visibility_regression() {
     let path = unique_db_path("rls7-c1");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -213,14 +213,14 @@ fn rls7_c1_without_predicate_matches_with_predicate_and_leaks_nothing() {
                 );
                 let r1 = core
                     .execute_sql(&ctx, &sql_no_pred)
-                    .expect("C1 without predicate should succeed");
+                    .expect("query should succeed");
                 let r2 = core
                     .execute_sql(&ctx, &sql_pred)
-                    .expect("C1 with predicate should succeed");
+                    .expect("query should succeed");
                 assert_eq!(
                     result_ids(&r1),
                     result_ids(&r2),
-                    "tenant={tenant} allow_private={allow_private} k={k}: predicate presence must not change the result"
+                    "tenant={tenant} allow_private={allow_private} k={k}"
                 );
                 for id in result_ids(&r1) {
                     assert!(
@@ -234,7 +234,7 @@ fn rls7_c1_without_predicate_matches_with_predicate_and_leaks_nothing() {
 }
 
 #[test]
-fn rls7_c2_scalar_filter_without_predicate_leaks_nothing() {
+fn rls7_scalar_filtered_query_visibility_regression() {
     let path = unique_db_path("rls7-c2");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -260,14 +260,13 @@ fn rls7_c2_scalar_filter_without_predicate_leaks_nothing() {
 
     let r1 = core
         .execute_sql(&ctx, &sql_no_pred)
-        .expect("C2 without predicate should succeed");
+        .expect("query should succeed");
     let r2 = core
         .execute_sql(&ctx, &sql_pred)
-        .expect("C2 with predicate should succeed");
+        .expect("query should succeed");
     assert_eq!(result_ids(&r1), result_ids(&r2));
 
     let got: HashSet<u64> = result_ids(&r1).into_iter().collect();
-    // under-fetch なし: 許可集合 ∩ lang=ja の件数と k=20 の小さい方まで返る。
     assert_eq!(got.len(), allowed_ja.len().min(20));
     for id in &got {
         assert!(allowed.contains(id), "disallowed row leaked: id={id}");
@@ -276,7 +275,7 @@ fn rls7_c2_scalar_filter_without_predicate_leaks_nothing() {
 }
 
 #[test]
-fn rls7_c4_hybrid_without_predicate_leaks_nothing_including_sparse_side() {
+fn rls7_hybrid_query_visibility_regression() {
     let path = unique_db_path("rls7-c4");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -284,7 +283,6 @@ fn rls7_c4_hybrid_without_predicate_leaks_nothing_including_sparse_side() {
     let core = new_core(storage);
     let q = query_vec();
 
-    // tenant-a・Public のみ許可。tenant-b の Private 行（不可視）のキーワードで検索する。
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let allowed = allowed_set(&truths, "tenant-a", false);
 
@@ -299,16 +297,16 @@ fn rls7_c4_hybrid_without_predicate_leaks_nothing_including_sparse_side() {
     );
     let result = core
         .execute_sql(&ctx, &sql_invisible)
-        .expect("C4 hybrid execution should succeed");
+        .expect("query should succeed");
     assert!(
         !result_ids(&result).contains(&invisible_row.id),
-        "sparse side leaked an invisible row via its unique keyword"
+        "disallowed row leaked: id={}",
+        invisible_row.id
     );
     for id in result_ids(&result) {
         assert!(allowed.contains(&id), "disallowed row leaked: id={id}");
     }
 
-    // 陽性対照: 可視行のキーワードなら検索できる（フィルタが効きすぎて全滅していないことの確認）。
     let visible_row = truths
         .iter()
         .find(|t| is_allowed(t, "tenant-a", false))
@@ -319,7 +317,7 @@ fn rls7_c4_hybrid_without_predicate_leaks_nothing_including_sparse_side() {
     );
     let result_visible = core
         .execute_sql(&ctx, &sql_visible)
-        .expect("C4 hybrid execution should succeed");
+        .expect("query should succeed");
     assert!(
         result_ids(&result_visible).contains(&visible_row.id),
         "visible row with its own unique keyword should be retrievable"
@@ -327,7 +325,7 @@ fn rls7_c4_hybrid_without_predicate_leaks_nothing_including_sparse_side() {
 }
 
 #[test]
-fn rls7_predicate_alteration_cannot_widen_visibility() {
+fn rls7_predicate_alteration_rejected() {
     let path = unique_db_path("rls7-alteration");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -346,9 +344,7 @@ fn rls7_predicate_alteration_cannot_widen_visibility() {
     for sql in altered_forms {
         let err = core
             .execute_sql(&ctx, &sql)
-            .expect_err("altered/self-declared predicate form must be rejected");
-        // 実装時の実際の分類（`42601`/`22000` 等）に関わらず、`Err` かつ行を返さない
-        // ことのみを必須条件とする（改変によって可視性を広げられないことの検証）。
+            .expect_err("should be rejected");
         assert!(!err.wire_code().is_empty(), "sql={sql:?}");
     }
 }
@@ -356,7 +352,7 @@ fn rls7_predicate_alteration_cannot_widen_visibility() {
 // --- RLS-6（TASK-137） -----------------------------------------------------------
 
 #[test]
-fn rls6_tenant_is_derived_only_from_policy_context() {
+fn rls6_tenant_scoping_regression() {
     let path = unique_db_path("rls6-derivation");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -364,33 +360,26 @@ fn rls6_tenant_is_derived_only_from_policy_context() {
     let core = new_core(storage);
     let q = query_vec();
 
-    // SQL テキスト中に他テナントの文字列リテラルを含めても、実際のテナント判定は
-    // `ctx` からのみ行われる（`lang` 列に 'tenant-b' を書いても該当行が無いだけで、
-    // テナント境界そのものには影響しない）。
     let sql =
         format!("SELECT * FROM docs WHERE lang = 'tenant-b' ORDER BY embedding <=> '{q}' LIMIT 10");
 
     for &tenant in TENANTS.iter() {
         let ctx = PolicyContext::new(tenant).expect("valid tenant");
         let allowed = allowed_set(&truths, tenant, false);
-        let result = core
-            .execute_sql(&ctx, &sql)
-            .expect("scalar filter with no matching rows should still succeed");
+        let result = core.execute_sql(&ctx, &sql).expect("query should succeed");
         assert!(result_ids(&result).is_empty());
         for id in result_ids(&result) {
             assert!(allowed.contains(&id));
         }
     }
 
-    // 同一 SQL・異なる ctx で結果がそれぞれのオラクル許可集合の部分集合であることを、
-    // マッチする条件でも確認する。
     let sql_topk = format!("SELECT * FROM docs ORDER BY embedding <=> '{q}' LIMIT 10");
     for &tenant in TENANTS.iter() {
         let ctx = PolicyContext::new(tenant).expect("valid tenant");
         let allowed = allowed_set(&truths, tenant, false);
         let result = core
             .execute_sql(&ctx, &sql_topk)
-            .expect("C1 should succeed");
+            .expect("query should succeed");
         for id in result_ids(&result) {
             assert!(
                 allowed.contains(&id),
@@ -401,7 +390,7 @@ fn rls6_tenant_is_derived_only_from_policy_context() {
 }
 
 #[test]
-fn rls6_sql_cannot_reference_tenant_column_or_session_settings() {
+fn rls6_disallowed_sql_forms_rejected() {
     let path = unique_db_path("rls6-no-tenant-column");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -415,7 +404,7 @@ fn rls6_sql_cannot_reference_tenant_column_or_session_settings() {
     );
     let err = core
         .execute_sql(&ctx, &sql_unknown_column)
-        .expect_err("tenant_id is not a queryable column");
+        .expect_err("should be rejected");
     assert_eq!(err.wire_code(), "22000");
 
     for sql in [
@@ -423,9 +412,7 @@ fn rls6_sql_cannot_reference_tenant_column_or_session_settings() {
         "SELECT set_config('vector_db.tenant', 'tenant-b', false)",
         format!("SELECT * FROM docs ORDER BY embedding <=> '{q}' LIMIT 10; SELECT 1").as_str(),
     ] {
-        let err = core
-            .execute_sql(&ctx, sql)
-            .expect_err("session-setting / multi-statement forms must be rejected");
+        let err = core.execute_sql(&ctx, sql).expect_err("should be rejected");
         assert_eq!(err.wire_code(), "42601", "sql={sql:?}");
     }
 }
@@ -433,7 +420,7 @@ fn rls6_sql_cannot_reference_tenant_column_or_session_settings() {
 // --- RLS-6/7（TASK-137）: `VectorCore::search`（trait 経由）でも同じ契約 ----------
 
 #[test]
-fn rls_hook_is_the_only_path_for_vector_core_search() {
+fn rls_trait_search_path_visibility_regression() {
     let path = unique_db_path("rls-hook-trait-path");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -452,7 +439,7 @@ fn rls_hook_is_the_only_path_for_vector_core_search() {
             let allowed = allowed_set(&truths, tenant, allow_private);
             let hits = core
                 .search(&ctx, TABLE, &query, 20)
-                .expect("VectorCore::search should succeed");
+                .expect("search should succeed");
             for hit in hits {
                 assert!(
                     allowed.contains(&hit.id),
