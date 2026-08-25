@@ -85,6 +85,13 @@ pub const MAX_SALT_LEN: usize = 64;
 /// [`Argon2KdfSemaphore::acquire`] がブロッキング待機する（公平性は問わない
 /// 簡素な実装でよい。認証は 1 接続あたり 1 回のみで再試行させない契約
 /// （WIRE-3）のため、待機自体が新たな DoS 経路にはならない）。
+///
+/// この 2 GiB は `hash_raw` の呼び出し元全体（`hash-password` サブコマンド・
+/// テスト等、任意の `Params` を渡しうる経路）を対象にした理論上の最悪値。
+/// `auth::verify` の認証パス限定では、`UserStore::load_from_file` が
+/// `RECOMMENDED_PARAMS`（m ≈ 19 MiB）への完全一致以外のレコードを起動時に
+/// 拒否する（P0 review 指摘: タイミング側チャネル対策）ため、実際の最悪ケースは
+/// 8 × 19 MiB ≈ 152 MiB に収まる。
 pub const MAX_CONCURRENT_ARGON2_KDF: usize = 8;
 
 /// [`MAX_CONCURRENT_ARGON2_KDF`] を上限とするブロッキング・カウンティング

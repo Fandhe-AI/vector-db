@@ -11,13 +11,12 @@ use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
 
-/// テスト実行時間短縮のための軽量 Argon2id パラメータ。本番既定値は
-/// `auth::DEFAULT_PARAMS`（`wire-server hash-password` サブコマンド）。
-const TEST_PARAMS: argon2id::Params = argon2id::Params {
-    m_cost_kib: 64,
-    t_cost: 1,
-    p_cost: 1,
-};
+/// `UserStore::load_from_file` は P0 review 是正により Argon2id パラメータが
+/// `argon2id::RECOMMENDED_PARAMS` と完全一致するレコードのみを受理する（既知・
+/// 未知ユーザーの KDF コストを常に一致させ、タイミング側チャネルで存在情報が
+/// 漏れないようにするため）。したがって結合テストの user store フィクスチャも
+/// 軽量パラメータではなく本番既定値をそのまま使う必要がある。
+const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 
 fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -188,7 +187,18 @@ fn wire1_successful_cleartext_auth_reaches_ready_for_query() {
     // AuthenticationOk ('R', code=0)
     let mut header = [0u8; 1];
     stream.read_exact(&mut header).expect("read auth ok type");
-    assert_eq!(header[0], b'R');
+    if header[0] != b'R' {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len.saturating_sub(4)];
+        stream.read_exact(&mut body).expect("read body");
+        let body_str = String::from_utf8_lossy(&body);
+        panic!(
+            "expected AuthenticationOk ('R'); got message type {:?}, body: {body_str:?}",
+            header[0] as char
+        );
+    }
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).expect("read len");
     let mut code_buf = [0u8; 4];

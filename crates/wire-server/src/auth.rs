@@ -109,6 +109,15 @@ impl UserStore {
     /// `username:tenant_id:phc` 形式のファイルをロードする。重複 username・空
     /// username/tenant_id・不正 PHC・`PolicyContext` が拒否する tenant_id はすべて
     /// 起動失敗として扱う（fail-closed。実行時に初めて発覚させない）。
+    ///
+    /// PHC の Argon2id パラメータは [`argon2id::RECOMMENDED_PARAMS`]（[`dummy_phc`] が
+    /// 使う値）への完全一致のみを受理する（P0 review 指摘: 個々のレコードが
+    /// 「許容範囲内」の異なる m/t/p を持てると、レコードごとに実際の KDF 計算
+    /// コストが変わり、未知ユーザー用のダミー PHC とのコスト差が
+    /// `AUTH_FAILURE_DELAY` の固定遅延で吸収しきれない場合、応答時間からユーザーの
+    /// 存在・レコードのコスト特性が列挙されうる。「認証エラー時に存在情報を
+    /// 漏らさない」テナント境界基準に反するため、範囲受理をやめ単一の既定値へ
+    /// 完全一致させることで既知・未知ユーザーの KDF コストを常に一致させる）。
     pub fn load_from_file(path: &Path) -> Result<Self, LoadError> {
         let content = std::fs::read_to_string(path)?;
         let mut users = HashMap::new();
@@ -134,15 +143,26 @@ impl UserStore {
             if tenant_id.is_empty() {
                 return Err(LoadError::EmptyTenantId { line: line_no });
             }
-            // 構文検証（parse_phc）に加え、m_cost_kib 等の値がロード後の初回ログイン時に
-            // OOM を招く極端な範囲でないかを起動時に検証する（fail-closed。実行時に
-            // 初めて発覚させない。レビュー指摘: m が異常に大きい構文的に正しい PHC が
-            // `hash_raw` 呼び出し時まで検出されないと、1 テナントの認証失敗ではなく
-            // プロセス全体のクラッシュに波及しうる）。
+            // 構文検証（parse_phc）に加え、Argon2id パラメータが
+            // `argon2id::RECOMMENDED_PARAMS` と完全一致することを検証する
+            // （fail-closed。実行時に初めて発覚させない）。この完全一致検証は
+            // 以下の両方を兼ねる:
+            // (1) OOM 対策: m_cost_kib 等が極端な範囲の構文的に正しい PHC が
+            //     `hash_raw` 呼び出し時まで検出されずプロセス全体のクラッシュに
+            //     波及することを防ぐ（`RECOMMENDED_PARAMS` が `validate_params`
+            //     の運用上限内であることは
+            //     `argon2id::tests::validate_params_accepts_recommended_params`
+            //     で回帰確認済みのため、完全一致は自動的に上限内を意味する）
+            // (2) タイミング側チャネル対策（P0 review 指摘）: 個々のレコードが
+            //     異なる m/t/p を持てると、既知ユーザーの KDF コストが未知
+            //     ユーザー用ダミー PHC（常に `RECOMMENDED_PARAMS`）と食い違い、
+            //     `AUTH_FAILURE_DELAY` の固定遅延で吸収しきれない差が応答時間に
+            //     現れてユーザーの存在・レコードのコスト特性を列挙されうる
             let (params, _, _) =
                 argon2id::parse_phc(phc).map_err(|_| LoadError::InvalidPhc { line: line_no })?;
-            argon2id::validate_params(&params)
-                .map_err(|_| LoadError::InvalidPhc { line: line_no })?;
+            if params != argon2id::RECOMMENDED_PARAMS {
+                return Err(LoadError::InvalidPhc { line: line_no });
+            }
             engine::policy::PolicyContext::new(tenant_id)
                 .map_err(|_| LoadError::InvalidTenantId { line: line_no })?;
 
@@ -229,6 +249,15 @@ fn dummy_phc() -> &'static str {
 /// パスワード・未知ユーザーのいずれも同一の `verify_phc` 経路（＝同一のセマフォ）を
 /// 通るため、同時実行数に起因する遅延も両者に等しく作用し、列挙攻撃対策の
 /// タイミング対称性は維持される。
+///
+/// この対称性が成立する前提は、既知ユーザーの実レコードと未知ユーザー用
+/// [`dummy_phc`] とで Argon2id パラメータ（m/t/p）が常に一致していることであり、
+/// それは `UserStore::load_from_file` が `argon2id::RECOMMENDED_PARAMS` への完全
+/// 一致以外のレコードを起動時に拒否することで保証される（P0 review 指摘: レコード
+/// ごとにパラメータが異なると KDF コストが変わり、`AUTH_FAILURE_DELAY` の下限で
+/// 吸収しきれないタイミング差からユーザー存在が漏えいし得た）。加えて実測では
+/// release ビルドの `RECOMMENDED_PARAMS` での KDF 実行時間は `AUTH_FAILURE_DELAY`
+/// を十分下回るため、この下限 sleep が実運用でも変動を吸収する。
 pub fn verify(
     store: &UserStore,
     username: &str,
@@ -441,9 +470,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// 構文的には正しいが `m_cost_kib` が運用上限を超える PHC を起動時に拒否すること
-    /// （レビュー指摘: `hash_raw` 呼び出し時まで検出されないと OOM でプロセス全体が
-    /// 落ちるため、`load_from_file` の時点で fail-closed にする）。
+    /// 構文的には正しいが `m_cost_kib` が `RECOMMENDED_PARAMS` と一致しない PHC を
+    /// 起動時に拒否すること（レビュー指摘: `hash_raw` 呼び出し時まで検出されないと
+    /// OOM でプロセス全体が落ちるため、`load_from_file` の時点で fail-closed に
+    /// する。現在は完全一致検証がこの範囲外検出も自動的に兼ねる）。
     #[test]
     fn load_from_file_rejects_oversized_m_cost() {
         let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
@@ -461,9 +491,9 @@ mod tests {
     }
 
     /// レビュー指摘: `MAX_M_COST_KIB` を 2 GiB から 256 MiB へ引き下げた回帰確認。
-    /// 新上限をわずかに超えるだけの PHC も起動時に拒否されること
-    /// （旧上限では通過していた範囲）。salt は下限（8 バイト）以上の有効値にし、
-    /// m_cost の検証だけを分離する。
+    /// 新上限をわずかに超える PHC も起動時に拒否されること（`RECOMMENDED_PARAMS`
+    /// への完全一致検証により、範囲外はすべて自動的に拒否される）。salt は下限
+    /// （8 バイト）以上の有効値にし、m_cost の検証だけを分離する。
     #[test]
     fn load_from_file_rejects_m_cost_above_reduced_ceiling() {
         let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
@@ -571,6 +601,74 @@ mod tests {
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
         assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0 review 指摘の再現ケース: 旧仕様では「運用上限内」なら受理していた
+    /// m/t/p（ここでは m=8,t=1,p=1。`RECOMMENDED_PARAMS` とは異なる値）を、
+    /// `RECOMMENDED_PARAMS` への完全一致要求により起動時に拒否すること。個々の
+    /// レコードが異なる KDF コストを持てると、未知ユーザー用ダミー PHC との
+    /// コスト差からユーザーの存在・レコードのコスト特性が列挙されうるため
+    /// （タイミング側チャネル対策）。
+    #[test]
+    fn load_from_file_rejects_in_range_params_that_are_not_canonical() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_noncanonical_params.txt");
+        std::fs::write(
+            &path,
+            "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$aGFzaA\n",
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PHC パラメータが `RECOMMENDED_PARAMS` に完全一致するレコードは受理される
+    /// こと（拒否側だけでなく許容側の境界も明示する）。
+    #[test]
+    fn load_from_file_accepts_params_equal_to_recommended_params() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_canonical_accept.txt");
+        let phc = dummy_phc();
+        std::fs::write(&path, format!("alice:tenant-a:{phc}\n")).expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(
+            result.is_ok(),
+            "RECOMMENDED_PARAMS-equal PHC must be accepted"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0 review 指摘の中核となる回帰確認: `load_from_file` を通過した実ユーザー
+    /// レコードの Argon2id パラメータが、未知ユーザー用ダミー PHC（[`dummy_phc`]）の
+    /// パラメータと常に一致すること。実時間の統計比較ではなく、両者が経由する
+    /// PHC のパラメータそのものが一致することを検証することで、タイミング側
+    /// チャネルの原因（レコードごとの KDF コスト差）を構造的に排除したことを
+    /// 確認する。
+    #[test]
+    fn load_from_file_enforces_same_kdf_params_as_dummy_phc() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_matches_dummy_params.txt");
+        let salt = b"0123456789abcdef";
+        let real_phc = argon2id::encode_phc(b"correct-horse", salt, &argon2id::RECOMMENDED_PARAMS)
+            .expect("valid recommended params");
+        std::fs::write(&path, format!("alice:tenant-a:{real_phc}\n")).expect("write fixture");
+
+        let store = UserStore::load_from_file(&path).expect("recommended params must be accepted");
+        let real_record_phc = &store.users.get("alice").expect("alice loaded").phc;
+
+        let (real_params, _, _) = argon2id::parse_phc(real_record_phc).expect("valid phc");
+        let (dummy_params, _, _) = argon2id::parse_phc(dummy_phc()).expect("valid phc");
+        assert_eq!(
+            real_params, dummy_params,
+            "known-user record params must equal the dummy PHC params (P0: no per-record KDF \
+             cost variance that could leak user existence via timing)"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }
