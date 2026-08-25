@@ -1,12 +1,10 @@
-//! `engine::sql::allowlist` の統合テスト（TASK-74、対象ビヘイビア: SQL-8。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-74・`docs/spec/04-behavior/sql-surface.md` SQL-8）。
+//! `engine::sql::allowlist` の統合テスト（TASK-74・SQL-8 参照。docs/spec/05-tasks.md・
+//! docs/spec/04-behavior/sql-surface.md）。
 //!
 //! `tests/catalog.rs` と同じ流儀（`unique_db_path` / `CleanupGuard`）で実 `Storage`
-//! （temp redb ファイル）上に `Catalog::create_table` したテーブルを構築し、
-//! `impl TableLookup for Storage`（`catalog.rs`）を介した実カタログ照会付きの
+//! 上にテーブルを構築し、`impl TableLookup for Storage` を介した実カタログ照会付きの
 //! `validate_statement` を検証する（`sql::allowlist` モジュール内の単体テストは
-//! storage 非依存のフェイク `TableLookup` を使うため、本ファイルは実カタログとの
-//! 結合を確認する責務を持つ）。
+//! storage 非依存のフェイクを使うため、本ファイルは実カタログとの結合を確認する）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

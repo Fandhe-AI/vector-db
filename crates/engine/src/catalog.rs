@@ -805,19 +805,13 @@ impl Storage {
     }
 }
 
-/// `sql::allowlist::validate_statement`（TASK-74、対象ビヘイビア: SQL-8）から FROM
-/// テーブルのカタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す
-/// `CatalogError` を SQL 表層の `wire_code` 契約へ分類し直す:
-/// `TableNotFound` は「存在しない」（`Ok(false)`）、識別子形式不正（`Invalid`。
-/// `validate_identifier` 由来、クライアントが渡した SQL 内の識別子そのものの検証
-/// 失敗）はテーブル参照として構文的に成立しないため `42601`、それ以外（`redb` I/O
-/// 由来の `Backend`、格納済みスキーマのデコード失敗 `CorruptSchema` を含む）は
-/// カタログ照会自体の失敗として `XX000` とし、受理側へは倒さない（fail-closed。
-/// `.claude/rules/security.md`「不安全な設計」対応）。`CorruptSchema` を `Invalid`
-/// と同一視しない理由: 前者は格納済みバイト列由来の断片を detail に含み得るため、
-/// `42601` エラーメッセージへそのまま返すとストレージ破損時に内部データが wire
-/// クライアントへ漏れる（Issue #55 レビュー指摘。`Backend` 系と同じ汎用メッセージへ
-/// 丸めて情報漏えいを避ける）。
+/// `sql::allowlist::validate_statement`（TASK-74・SQL-8 参照）から FROM テーブルの
+/// カタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す `CatalogError`
+/// を SQL 表層のエラー契約へ分類し直し、識別子形式不正のみ拒否側（構文エラー）へ
+/// 倒す。それ以外（カタログ照会自体の失敗を含む）は受理側へ倒さず fail-closed に
+/// エラー伝播する（`.claude/rules/security.md`「不安全な設計」対応）。格納済み
+/// スキーマのデコード失敗は識別子形式不正と区別し、内部データ断片がエラー
+/// メッセージ経由で漏れないよう汎用メッセージへ丸める（security.md「情報漏えい」対応）。
 impl TableLookup for Storage {
     fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
         match self.get_table_schema(name) {

@@ -1,20 +1,14 @@
-//! AST 許可リスト検証（TASK-74 の成果物、対象ビヘイビア: SQL-8。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-74・`docs/spec/04-behavior/sql-surface.md` SQL-8・
-//! `docs/spec/04-behavior/error-format.md` ERR-2）。
+//! AST 許可リスト検証（TASK-74・SQL-8・ERR-2 参照。docs/spec/05-tasks.md・
+//! docs/spec/04-behavior/sql-surface.md・docs/spec/04-behavior/error-format.md）。
 //!
 //! 責務境界: [`lexer`](crate::sql::lexer) が返すトークン列を、明示的に許可した
-//! 形状（単一 `SELECT`・単一 `FROM` テーブル・許可した `WHERE`・単一 `ORDER BY` 式・
-//! `LIMIT`）だけに一致するか再帰下降で判定する。**許可リスト**として実装するため、
-//! 判定に使うキーワードは文法が直接必要とする最小集合のみで、それ以外の字句
-//! （`DISTINCT`・`JOIN`・`GROUP`・`HAVING`・`OFFSET` 等）は個別に検出せず、期待する
-//! 位置に来ないというだけで構造的に拒否する（fail-closed。未知・未対応構文は
-//! 既定で拒否側に落ちる）。
+//! 形状だけに一致するか再帰下降で判定する。**許可リスト**として実装するため、
+//! 期待しない字句・構文は個別に検出せず、期待する位置に来ないというだけで
+//! 構造的に拒否する（fail-closed。未知・未対応構文は既定で拒否側に落ちる）。
 //!
 //! 受理側（実在テーブルに対する検索・取得の実行）は本モジュールの管轄外で、
-//! SQL-11／TASK-75 以降が [`ValidatedStatement`] を土台に実装する。本モジュールは
-//! 「許可形状の構造判定を通過させる」ところまでに責務を留める。ベクトルリテラル・
-//! 文字列値そのものの妥当性（長さ上限等）も値レベルの検証（ERR-2 `22000` 管轄）として
-//! 本モジュールの外に置く（本モジュールが返すのは `42601`・`42P01` のみ）。
+//! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
+//! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 
@@ -47,23 +41,23 @@ fn truncate_for_error(s: &str) -> String {
     }
 }
 
-/// SQL 表層のエラー型。`wire_code()` が ERR-2 の `wire_code` 写像へ対応する。
-/// engine 全体の共通エラー型統合は wire-server 側タスクの管轄のため、
-/// 本モジュールローカルの型として定義する（TASK-74 計画の設計方針）。
+/// SQL 表層のエラー型。ERR-2 参照（docs/spec/04-behavior/error-format.md）。
+/// engine 全体の共通エラー型統合は他タスクの管轄のため、本モジュールローカルの
+/// 型として定義する。
 #[derive(Debug, Clone)]
 pub enum SqlSurfaceError {
-    /// 許可リスト外の構文（構文解析失敗を含む）。ERR-2: `42601`。
+    /// 許可リスト外の構文（構文解析失敗を含む）。
     UnsupportedSyntax { detail: String },
-    /// FROM に指定したテーブルがスキーマカタログに存在しない。ERR-2: `42P01`。
+    /// FROM に指定したテーブルがスキーマカタログに存在しない。
     UndefinedTable { name: String },
     /// カタログ照会（`TableLookup`）側の内部エラー（redb I/O 等）。受理・拒否のいずれにも
     /// 倒さず、fail-closed にエラー伝播する（`.claude/rules/security.md`
-    /// 「不安全な設計」: Backend エラー時も受理側へ倒さない）。ERR-2: `XX000`。
+    /// 「不安全な設計」対応）。
     Internal { detail: String },
 }
 
 impl SqlSurfaceError {
-    /// ERR-2（`docs/spec/04-behavior/error-format.md`）の SQLSTATE 風ワイヤーコード写像。
+    /// ERR-2（docs/spec/04-behavior/error-format.md）の wire_code 写像。
     pub fn wire_code(&self) -> &'static str {
         match self {
             SqlSurfaceError::UnsupportedSyntax { .. } => "42601",
@@ -120,26 +114,25 @@ pub trait TableLookup {
     fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError>;
 }
 
-/// `ORDER BY` 式の許可形状（SQL-1〜4）。
+/// `ORDER BY` 式の許可形状。TASK-74・SQL-8 参照（docs/spec/05-tasks.md）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderByForm {
-    /// `<column> <=> '<literal>'`（密ベクトル距離、SQL-1/SQL-2/SQL-3）。
+    /// 距離演算子形。
     Distance { column: String },
-    /// `<name>(...)`（`hybrid_rrf(...)`・`HYBRID(...)` 等の関数形、SQL-4）。
-    /// 引数は本モジュールでは構造（括弧の対応・許可トークンのみ）しか見ず、
-    /// 意味（融合方式のパラメータ等）は TASK-75 以降が解釈する。
+    /// 関数呼び出し形。引数は本モジュールでは構造（括弧の対応・許可トークンのみ）
+    /// しか見ず、意味は後続タスクが解釈する。
     FunctionCall { name: String },
 }
 
-/// 許可形状の構造判定を通過した SQL 文（TASK-75 以降のパーサー・実行計画の土台）。
+/// 許可形状の構造判定を通過した SQL 文（後続タスクのパーサー・実行計画の土台）。
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
-/// 妥当性（存在する列か・ベクトル次元と一致するか等）は検証しない。
+/// 妥当性は検証しない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
     pub order_by: OrderByForm,
-    /// WHERE 句の有無（内容の意味論的検証は TASK-75 以降）。
+    /// WHERE 句の有無（内容の意味論的検証は本モジュールの管轄外）。
     pub has_where: bool,
     pub limit: u32,
 }
@@ -214,9 +207,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `select_list := '*' | ident (',' ident)*`（SQL-1〜4 は列投影の具体形を
-    /// 規定していないため、`*` と単純な列名リストのみを許可する保守的な選択。
-    /// 式・エイリアス・`DISTINCT` は許可しない）。
+    /// SELECT リストの許可形状（`*` または単純な列名リストのみ）。
     fn parse_select_list(&mut self) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             self.advance();
@@ -230,10 +221,8 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `where_expr := predicate (AND predicate)*`
-    /// `predicate := ident '=' string_literal | ident '(' ')'`
-    /// （スカラー等価条件 SQL-2、RLS 述語呼び出し形 SQL-3 の 2 形を許可し、
-    /// `OR`・括弧によるネスト・比較演算子の拡張は許可しない）。
+    /// WHERE 句の許可形状（等価条件・述語呼び出し形の 2 種のみ。`OR`・括弧による
+    /// ネスト・比較演算子の拡張は許可しない）。
     fn parse_where(&mut self) -> Result<(), SqlSurfaceError> {
         loop {
             self.expect_ident()?;
@@ -261,7 +250,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `order_expr := ident DistanceOp string_literal | ident '(' arg_list ')'`
+    /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。
     fn parse_order_by(&mut self) -> Result<OrderByForm, SqlSurfaceError> {
         let name = self.expect_ident()?;
         match self.peek() {
@@ -282,35 +271,23 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `hybrid_rrf(...)`／`HYBRID(...)`（SQL-4）の引数部分。意味は解釈せず、
-    /// 括弧の対応が取れた許可トークン（識別子・文字列・数値・カンマ・入れ子丸括弧）
-    /// のみで構成されているかだけを構造的に検証する（キーワード・`;` の混入は拒否。
-    /// インジェクション的な文の混入を防ぐ fail-closed な設計）。
-    /// 空引数（`f()`）も許可する。カンマ区切りの `値 (',' 値)*` 構造を厳密に要求し、
-    /// 区切りカンマなしの連続トークン・カンマのみの空要素列・先頭/末尾カンマは
-    /// すべて拒否する（Issue #55 レビュー指摘）。入れ子丸括弧は識別子に隣接しない
-    /// 独立したグループ（例: `(embedding)`）としてのみ 1 値扱いとし、識別子に
-    /// 直接後続する `(`（`foo(...)` の形）はネストした関数呼び出しの解釈を
-    /// 持たないため区切りカンマなしの連結として拒否側に倒す。
+    /// 関数呼び出し形 ORDER BY 式の引数部分。意味は解釈せず、括弧の対応が取れた
+    /// 許可トークン（識別子・文字列・数値・カンマ・入れ子丸括弧）のみで構成されて
+    /// いるかを構造的に検証する（fail-closed。キーワード・`;` 等の混入は拒否）。
+    /// カンマ区切りの値リスト構造を厳密に要求し、区切りなしの連続トークン・
+    /// 空要素列・先頭/末尾カンマは拒否する。値/区切りの期待状態はネストの深さ
+    /// ごとに独立したスタックで追跡し、丸括弧の深さに関係なく同じ規律を適用する
+    /// （入れ子丸括弧の内側だけ規律が緩む非対称を作らない）。
     fn parse_arg_list(&mut self) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct(')'))) {
             return Ok(());
         }
-        // `expect_value` を丸括弧の深さごとに独立したスタックで追跡する。
-        // 先頭要素（index 0）が呼び出し直下（depth 0）、以降 `(` を消費するたびに
-        // 新しいフレームを push し、値/区切りの期待状態をネストの深さごとに
-        // 独立させる。旧実装は `depth == 0` の場合しか検査していなかったため、
-        // 入れ子丸括弧の内側（`depth >= 1`）では区切り規律が無効化されており、
-        // `hybrid_rrf((foo('q')))` や `hybrid_rrf((a b c))` のように 1 段カッコで
-        // 包むだけで「識別子直後の `(` を拒否する」契約や区切りカンマ必須の構造
-        // 検証をバイパスできた（Issue #55 レビュー指摘）。各深さのフレームで同じ
-        // 規律（値の直後は `,` か `)` のみ、`,` の直後は値のみ）を適用することで
-        // ネストの深さに関係なく一貫して拒否側に倒す。
+        // 深さごとの値/区切り期待状態スタック。先頭が呼び出し直下（depth 0）で、
+        // `(` を消費するたびにフレームを push する。untrusted 入力由来のトークン列
+        // を扱うため、取得は常に `Option` 経路で行い空スタックによる panic を防ぐ
+        // （coding-rust.md: 受信データ経路での unwrap/expect/添字アクセス禁止）。
         let mut expect_value: Vec<bool> = vec![true];
         loop {
-            // untrusted 入力由来のトークン列を解析するため、スタックの取得は
-            // 常に `last_mut()` の `Option` 経路で行い、空スタックによる panic を防ぐ
-            // （coding-rust.md: 受信データ経路での unwrap/expect/添字アクセス禁止）。
             match self.advance() {
                 Some(Token::Ident(_)) | Some(Token::StringLiteral(_)) | Some(Token::Number(_)) => {
                     let cur = expect_value.last_mut().ok_or_else(|| {
@@ -387,8 +364,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `LIMIT` の後続がなければ statement は終了する。省略可能な単一末尾セミコロンの
-    /// 後に余剰トークンがあれば複数 statement とみなして拒否する（SQL-8）。
+    /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
+    /// みなして拒否する。
     fn expect_end_of_statement(&mut self) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct(';'))) {
             self.advance();
@@ -410,8 +387,7 @@ struct ParsedShape {
     limit: u32,
 }
 
-/// `statement := SELECT select_list FROM table_ref [WHERE where_expr]
-/// ORDER BY order_expr LIMIT limit_num [';']`
+/// 許可した statement 形状を先頭から再帰下降で判定する。
 fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 

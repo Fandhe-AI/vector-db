@@ -63,10 +63,8 @@
 //! 経由する（詳細は `buffer_pool.rs` モジュールドキュメント参照）。
 //!
 //! TASK-74（対象ビヘイビア: SQL-8）: `sql.rs` が SQL 表層の入口。受信 SQL テキストに
-//! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）で受理範囲外構文を
-//! `42601`、カタログ未存在テーブルを `42P01` として決定的に拒否する（`error-format.md`
-//! ERR-2 写像）。受理側の実行計画は TASK-75 以降の管轄（詳細は `sql.rs` モジュール
-//! ドキュメント参照）。
+//! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
+//! （詳細は `sql.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
