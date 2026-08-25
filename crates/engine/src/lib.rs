@@ -77,6 +77,15 @@
 //! 昇格しない。機械検証は `tests/tenant_breach.rs`（詳細は `tenant.rs` モジュール
 //! ドキュメント参照）。
 //!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9）: 行 `id` の一意性スコープは
+//! テナント内であり、行ストア（`catalog.rs` の `user_rows/{table}`）の物理キーを
+//! `(tenant_id, id)` で名前空間化する（`catalog.rs::user_rows_table_def`）。
+//! `tenant.rs::insert_row` の重複検出はサーバー側導出テナントの名前空間内だけを見るため、
+//! 他テナント行の存在有無が `23505` の有無として観測される経路を構造的に持たない
+//! （codex-review P0 指摘・PR #194 対応）。旧フォーマット（キーが `id` のみ）の DB は
+//! `catalog.rs::map_row_table_error` が fail-closed に拒否する。読み取り側で同一 `id` の
+//! 可視行が複数現れうる点の扱いは `core.rs::provider_result_is_valid` を参照。
+//!
 //! TASK-156（対象ビヘイビア: CORE-14）: `isa.rs` が CPU 命令セット（AVX2+FMA・
 //! AVX-512・NEON）の実行時検出を提供し、`dispatch.rs::detect_current_isa`
 //! （決定表の ISA 入力）・`kernel.rs::dot`（`CpuScalarProvider` 等が共有する内積

@@ -92,7 +92,7 @@ fn table8_build_produces_arena_matching_inserted_rows() {
 
     for i in 0..10usize {
         let expected_row = storage
-            .get_row_from_table("docs", i as u64)
+            .get_row_from_table("docs", TENANT_ID, i as u64)
             .expect("read row back via storage");
         assert_eq!(arena.vector(i), Some(expected_row.embedding.as_slice()));
         assert_eq!(arena.tenant_id(i), Some(expected_row.tenant_id.as_str()));

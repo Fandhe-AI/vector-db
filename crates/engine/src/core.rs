@@ -43,7 +43,7 @@
 //! `provider_result_is_valid`）はキャッシュ経路・非キャッシュ経路のいずれでも
 //! `PrefilterSnapshot::search_with`／[`EngineCore::search_uncached`] が同一に適用する。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -80,16 +80,26 @@ pub(crate) fn validate_search_k(k: usize) -> Result<(), usize> {
 /// `rls.rs::PrefilterIndex::search` の両方が provider を「untrusted 実装でありうる」前提で
 /// 扱うため、単一走査の検証ロジックを本関数へ集約する（二重管理・契約の食い違いを防ぐ。
 /// fail-closed: 1 件でも違反すれば `false` を返し、呼び出し元は結果を一切返さず拒否する）。
+///
+/// 第 3 引数は「可視行の id → その id を持つ可視行の件数」の多重集合（[`visible_id_counts`]
+/// で構築する）。単なる `HashSet<u64>` ではないのは、行 `id` の一意性スコープが
+/// テナント内に閉じた（対象ビヘイビア: TABLE-12）ことで、1 つの `PolicyContext` から
+/// 可視な行に同一 `id` が複数現れうるため（自テナント行と、他テナントの `Public` 行が
+/// 同じ `id` を持つ場合）。件数を上限として重複を許すことで、(4) の防御力
+/// （「provider は実在する可視行の数を超えて同じ id を返せない」）を落とさずに
+/// TABLE-12 が正当化する構成を受理する。set へ戻す（＝重複を一律拒否する）と、
+/// 他テナントが同じ `id` の `Public` 行を作るだけで検索が失敗する
+/// テナント間の可用性干渉になるため戻してはならない。
 pub(crate) fn provider_result_is_valid(
     hits: &[SearchHit],
     k: usize,
-    visible_id_set: &HashSet<u64>,
+    visible_id_counts: &HashMap<u64, usize>,
 ) -> bool {
     // (1) 件数が要求 k を超えない。
     if hits.len() > k {
         return false;
     }
-    let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
+    let mut seen_ids: HashMap<u64, usize> = HashMap::with_capacity(hits.len());
     let mut prev: Option<&SearchHit> = None;
     for hit in hits {
         // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、後続の順序
@@ -97,21 +107,32 @@ pub(crate) fn provider_result_is_valid(
         if !hit.score.is_finite() {
             return false;
         }
-        // (3) 縮約ビュー（＝可視行）の id 集合に属する（他テナント id・捏造 id の拒否）。
-        if !visible_id_set.contains(&hit.id) {
+        // (3) 縮約ビュー（＝可視行）の id 集合に属する（不可視 id・捏造 id の拒否）。
+        let Some(available) = visible_id_counts.get(&hit.id) else {
             return false;
-        }
-        // (4) id が重複しない（同じ行が複数回返らない）。
-        if !seen_ids.insert(hit.id) {
+        };
+        // (4) 同じ id の出現回数が、その id を持つ可視行の実数を超えない
+        // （同じ行を複数回返す provider の拒否。TABLE-12 により id の重複自体は
+        // 起こりうるため、集合ではなく多重集合で判定する。上記ドキュメント参照）。
+        let seen = seen_ids.entry(hit.id).or_insert(0);
+        *seen = match seen.checked_add(1) {
+            Some(next) => next,
+            None => return false,
+        };
+        if *seen > *available {
             return false;
         }
         // (5) スコア降順・同点は id 昇順（`kernel.rs::CpuScalarProvider` が実際に返す順序と
         // 同じ契約。`total_cmp` は (2) で有限性を確認済みのため NaN の順序上の扱いには
         // 依存しない）。
         if let Some(p) = prev {
+            // 同点時は id 昇順。TABLE-12 により同点・同 id の並びが正当に起こりうる
+            // （異なるテナントの同一 id 行が同じスコアになる場合）ため、狭義単調増加
+            // （`p.id >= hit.id` を違反とする）ではなく広義単調増加で判定する。
+            // 同一行の重複返却は (4) の多重集合上限が引き続き遮断する。
             let out_of_order = match p.score.total_cmp(&hit.score) {
                 std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Equal => p.id >= hit.id,
+                std::cmp::Ordering::Equal => p.id > hit.id,
                 std::cmp::Ordering::Greater => false,
             };
             if out_of_order {
@@ -121,6 +142,19 @@ pub(crate) fn provider_result_is_valid(
         prev = Some(hit);
     }
     true
+}
+
+/// 可視行の id 列（`arena.ids()` 等）から [`provider_result_is_valid`] の第 3 引数
+/// （id → 可視行件数の多重集合）を構築する共通ヘルパ。`core.rs`・`rls.rs`・
+/// `sql/exec.rs` の 3 経路が同一の構築方法を共有し、片側だけが集合へ退化するのを防ぐ
+/// （TABLE-12 の重複 id の扱いは 1 か所で決める）。
+pub(crate) fn visible_id_counts(ids: &[u64]) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let entry = counts.entry(*id).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+    counts
 }
 
 /// [`PrefilterCache`] のエントリ数上限（TASK-169・security.md「不安全な設計｜
@@ -783,8 +817,8 @@ impl EngineCore {
         //
         // アリーナは構築時点で可視行だけへ絞り込み済みのため、`arena.ids()` がそのまま
         // 可視行 id 集合になる。
-        let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
-        if !provider_result_is_valid(&hits, k, &visible_id_set) {
+        let visible_id_counts = visible_id_counts(arena.ids());
+        if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(CoreError::ProviderResultRejected);
         }
         Ok(hits)
@@ -885,7 +919,14 @@ impl VectorCore for EngineCore {
     }
 
     fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError> {
-        let row = match self.storage.get_row_from_table(table, id) {
+        // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、`id`
+        // 単独では行を一意に指せない。点取得はサーバー側導出テナント
+        // （`ctx.tenant_id()`。`wire-protocol.md` WIRE-2・RLS-6）の名前空間内のみを
+        // 対象とし、他テナントの `Public` 行を `id` 指定で引く経路は設けない
+        // （他テナント行の存在探査になりうるため fail-closed 側へ倒す。RLS-9）。
+        // 取得後も従来どおり `is_visible` を通し、可視性ラベルの判定は
+        // `policy.rs` の単一照合パスに委譲する。
+        let row = match self.storage.get_row_from_table(table, ctx.tenant_id(), id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
@@ -1030,7 +1071,7 @@ mod tests {
         // データが不変であることを確認する（拒否が実際に永続化を止めていること）。
         let row = core
             .storage
-            .get_row_from_table("docs", 1)
+            .get_row_from_table("docs", "tenant-b", 1)
             .expect("row still present");
         assert_eq!(row.tenant_id, "tenant-b");
     }

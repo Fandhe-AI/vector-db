@@ -103,7 +103,7 @@ fn ext1_insert_and_read_back_768_dim_rows() {
 
     for (i, embedding) in embeddings.iter().enumerate() {
         let row = storage
-            .get_row_from_table("docs", i as u64)
+            .get_row_from_table("docs", TENANT_ID, i as u64)
             .unwrap_or_else(|e| panic!("get_row_from_table failed for id={i}: {e}"));
         assert_eq!(row.id, i as u64);
         assert_eq!(row.embedding.len(), 768);
@@ -210,7 +210,7 @@ fn ext2_multiple_tables_with_distinct_dims_coexist() {
 
     for (name, dim) in dims {
         let row = storage
-            .get_row_from_table(name, 1)
+            .get_row_from_table(name, TENANT_ID, 1)
             .unwrap_or_else(|e| panic!("get_row_from_table({name}) failed: {e}"));
         assert_eq!(row.embedding.len(), dim as usize);
     }
@@ -324,10 +324,10 @@ fn ext2_same_id_coexists_independently_across_tables() {
     .expect("insert into mid id=42");
 
     let small_row = storage
-        .get_row_from_table("small", 42)
+        .get_row_from_table("small", TENANT_ID, 42)
         .expect("get small id=42");
     let mid_row = storage
-        .get_row_from_table("mid", 42)
+        .get_row_from_table("mid", TENANT_ID, 42)
         .expect("get mid id=42");
 
     assert_eq!(small_row.embedding, small_embedding);
@@ -458,10 +458,10 @@ fn ext2_state_survives_close_and_reopen() {
     {
         let storage = Storage::open(&path).expect("open storage (second)");
         let small_row = storage
-            .get_row_from_table("small", 1)
+            .get_row_from_table("small", TENANT_ID, 1)
             .expect("get small id=1 after reopen");
         let mid_row = storage
-            .get_row_from_table("mid", 1)
+            .get_row_from_table("mid", TENANT_ID, 1)
             .expect("get mid id=1 after reopen");
         assert_eq!(small_row.embedding.len(), 384);
         assert_eq!(mid_row.embedding.len(), 768);
@@ -550,7 +550,7 @@ fn ext2_insert_rows_into_table_discards_whole_transaction_on_mid_batch_failure()
     // 読み取り失敗と区別する）。
     for id in [1u64, 2] {
         let err = storage
-            .get_row_from_table("small", id)
+            .get_row_from_table("small", TENANT_ID, id)
             .expect_err(&format!("row {id} must not be visible after discard"));
         assert!(matches!(err, CatalogError::RowNotFound(_)));
     }
@@ -604,18 +604,27 @@ fn ext2_scan_table_page_resumes_via_after_cursor_across_pages() {
     assert_eq!(page1.len(), 10);
     assert_eq!(page1.first().map(|r| r.id), Some(0));
     assert_eq!(page1.last().map(|r| r.id), Some(9));
-    assert_eq!(cursor1, Some(9));
+    // カーソルは行ストアの物理キーと同形の `(tenant_id, id)`（対象ビヘイビア: TABLE-12）。
+    assert_eq!(cursor1, Some((TENANT_ID.to_string(), 9)));
 
     let (page2, cursor2) = storage
-        .scan_table_page("docs", cursor1, 10)
+        .scan_table_page(
+            "docs",
+            cursor1.as_ref().map(|(t, id)| (t.as_str(), *id)),
+            10,
+        )
         .expect("second page");
     assert_eq!(page2.len(), 10);
     assert_eq!(page2.first().map(|r| r.id), Some(10));
     assert_eq!(page2.last().map(|r| r.id), Some(19));
-    assert_eq!(cursor2, Some(19));
+    assert_eq!(cursor2, Some((TENANT_ID.to_string(), 19)));
 
     let (page3, cursor3) = storage
-        .scan_table_page("docs", cursor2, 10)
+        .scan_table_page(
+            "docs",
+            cursor2.as_ref().map(|(t, id)| (t.as_str(), *id)),
+            10,
+        )
         .expect("third (partial) page");
     assert_eq!(page3.len(), 5);
     assert_eq!(page3.first().map(|r| r.id), Some(20));
@@ -680,7 +689,11 @@ fn ext2_scan_table_page_byte_budget_caps_page_and_resume_covers_all_rows_without
     let mut cursor = cursor1;
     loop {
         let (page, next_cursor) = storage
-            .scan_table_page("docs", cursor, 100)
+            .scan_table_page(
+                "docs",
+                cursor.as_ref().map(|(t, id)| (t.as_str(), *id)),
+                100,
+            )
             .expect("subsequent page after byte-budget cap");
         all_ids.extend(page.iter().map(|r| r.id));
         if next_cursor.is_none() {
@@ -754,8 +767,8 @@ fn ext2_scan_table_page_after_u64_max_returns_empty_page() {
     .expect("seed row at id=u64::MAX");
 
     let (page, cursor) = storage
-        .scan_table_page("docs", Some(u64::MAX), 10)
-        .expect("after=u64::MAX must not error");
+        .scan_table_page("docs", Some((TENANT_ID, u64::MAX)), 10)
+        .expect("after=(tenant, u64::MAX) must not error");
     assert!(page.is_empty());
     assert_eq!(cursor, None);
 }
@@ -820,7 +833,7 @@ fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
     ));
 
     let err = storage
-        .get_row_from_table("ghost", 1)
+        .get_row_from_table("ghost", TENANT_ID, 1)
         .expect_err("get from nonexistent table must fail");
     assert!(matches!(err, CatalogError::TableNotFound(_)));
 

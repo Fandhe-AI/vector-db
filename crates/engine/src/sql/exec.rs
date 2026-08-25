@@ -422,16 +422,23 @@ pub fn execute_statement(
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;
 
-    let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
+    let visible_id_counts = core::visible_id_counts(arena.ids());
     // `id -> arena 内インデックス` の対応表。投影段で embedding を
     // `arena.vector(index)`（候補構築と同一スナップショットのバッファ）から
     // 引くために使う（`storage` への再アクセスを行わない）。
-    let arena_index_by_id: HashMap<u64, usize> = arena
-        .ids()
-        .iter()
-        .enumerate()
-        .map(|(idx, id)| (*id, idx))
-        .collect();
+    //
+    // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）のため、
+    // 自テナント行と他テナントの `Public` 行が同一 `id` を持つ場合、可視集合に同じ
+    // `id` が複数現れうる。その場合は**アリーナ内で最初に現れた行**へ決定的に解決する
+    // （`or_insert` で先勝ち。走査順は物理キー `(tenant_id, id)` 昇順で決定的）。
+    // どちらの行も当該 `ctx` から可視なためテナント境界の侵害にはならないが、投影結果が
+    // どちらの行に対応するかは `id` だけでは区別できない。読み取り経路の行識別を
+    // テナント修飾する設計は spec 側の未確定事項（TABLE-12 は書き込み経路の契約）で、
+    // 本 PR のスコープ外として据え置く。
+    let mut arena_index_by_id: HashMap<u64, usize> = HashMap::with_capacity(arena.ids().len());
+    for (idx, id) in arena.ids().iter().enumerate() {
+        arena_index_by_id.entry(*id).or_insert(idx);
+    }
 
     // DISTANCE 段。
     let hits: Vec<(u64, f64)> = match &bound.ranking {
@@ -444,7 +451,7 @@ pub fn execute_statement(
                 k: bound.limit,
             };
             let raw = provider.search(input).map_err(map_kernel_error)?;
-            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_set) {
+            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_counts) {
                 return Err(SqlSurfaceError::Internal {
                     detail: "search provider returned a result violating the top-k contract"
                         .to_string(),
@@ -482,7 +489,13 @@ pub fn execute_statement(
                     k: cfg.pool_depth(),
                 };
                 let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                if dense_hits.iter().any(|h| !visible_id_set.contains(&h.id)) {
+                // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                // キー存在で判定する。TABLE-12 の重複 id については
+                // `core::provider_result_is_valid` のドキュメント参照）。
+                if dense_hits
+                    .iter()
+                    .any(|h| !visible_id_counts.contains_key(&h.id))
+                {
                     return Err(SqlSurfaceError::Internal {
                         detail: "search provider returned a hit outside the visible id set"
                             .to_string(),

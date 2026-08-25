@@ -147,9 +147,17 @@ fn assert_no_cross_tenant_leak(
 ) {
     let storage = Storage::open(path).expect("reopen storage for independent verification");
     for hit in hits {
+        // 行ストアの物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12）。
+        // 期待テナントの名前空間で引けること自体が「返された hit が当該テナントの行で
+        // ある」ことの独立検証になり、名前空間外の行なら取得自体が失敗する。
         let row = storage
-            .get_row_from_table(table, hit.id)
-            .expect("checker: row must exist for a returned hit");
+            .get_row_from_table(table, expected_tenant, hit.id)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "cross-tenant leak detected: hit id={} is not a row of tenant={expected_tenant}",
+                    hit.id
+                )
+            });
         assert_eq!(
             row.tenant_id, expected_tenant,
             "cross-tenant leak detected: hit id={} belongs to tenant={}",

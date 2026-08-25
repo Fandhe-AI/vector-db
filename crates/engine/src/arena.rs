@@ -33,7 +33,7 @@
 //! codex P2・Issue #137 対応で構築時フィルタ経路を追加。詳細は
 //! [`VectorArena::build_filtered`] のドキュメント参照）。
 
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::catalog::{self, CatalogError};
 use crate::storage::{decode_row, Storage, StorageError, Visibility};
@@ -618,8 +618,11 @@ impl VectorArena {
         // `get_table_schema_in_txn` がカタログ照会の前段で `validate_identifier` を
         // 通しているため、ここで改めて検証する必要はない。
         let row_table_name = catalog::user_rows_table_name(table_name);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-        let table = match read_txn.open_table(row_table_def) {
+        // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12。定義は
+        // `catalog::user_rows_table_def`）。全件走査は従来どおりテーブル全行を列挙し
+        // （テナントで絞らない）、可視性判定は `predicate`（呼び出し元の
+        // `PolicyContext::is_visible`）へ委譲する契約を変えない。
+        let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Ok(VectorArena {
@@ -631,7 +634,9 @@ impl VectorArena {
                     visibilities: Vec::new(),
                 });
             }
-            Err(e) => return Err(StorageError::from(e).into()),
+            // 旧フォーマット（キーが `id` のみ）の DB は
+            // `catalog::map_row_table_error` 経由で fail-closed に拒否する（TABLE-12）。
+            Err(e) => return Err(ArenaError::Catalog(catalog::map_row_table_error(e))),
         };
 
         // `table.len()` は redb 側の集計値（テーブル全行数。不可視行を含む）で、
@@ -644,7 +649,9 @@ impl VectorArena {
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
-            let id = k.value();
+            // 複合キーの第 2 要素が行 `id`（第 1 要素のテナントは行データ側のヘッダと
+            // 同一。可視性判定は従来どおり行データ由来の値で行う）。
+            let (_key_tenant, id) = k.value();
             let buf = v.value();
 
             // まず tenant_id・visibility だけを安全に取得する（embedding・metadata の
@@ -1021,10 +1028,8 @@ mod tests {
         // 同一 read_txn 上では、後発の書き込みは一切見えない。対象テーブル `a` の
         // 行テーブルは read_txn 確立時点のスナップショットのまま 1 行だけを保持する。
         let row_table_name = catalog::user_rows_table_name("a");
-        let row_table_def: redb::TableDefinition<u64, &[u8]> =
-            redb::TableDefinition::new(&row_table_name);
         let table = read_txn
-            .open_table(row_table_def)
+            .open_table(catalog::user_rows_table_def(&row_table_name))
             .expect("open row table for a");
         assert_eq!(table.len().expect("table len"), 1);
 
@@ -1226,7 +1231,7 @@ mod tests {
 
         for i in 0..10usize {
             let expected_row = storage
-                .get_row_from_table("docs", i as u64)
+                .get_row_from_table("docs", TENANT_ID, i as u64)
                 .expect("read row back via storage");
             assert_eq!(arena.vector(i), Some(expected_row.embedding.as_slice()));
             assert_eq!(arena.tenant_id(i), Some(expected_row.tenant_id.as_str()));
@@ -1290,9 +1295,9 @@ mod tests {
             let write_txn = storage.db().begin_write().expect("begin_write");
             {
                 let row_table_name = catalog::user_rows_table_name("docs");
-                let row_table_def: redb::TableDefinition<u64, &[u8]> =
-                    redb::TableDefinition::new(&row_table_name);
-                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let mut row_table = write_txn
+                    .open_table(catalog::user_rows_table_def(&row_table_name))
+                    .expect("open row table");
                 let encoded = crate::storage::encode_row(&RowInput {
                     tenant_id: TENANT_ID,
                     visibility: Visibility::Public,
@@ -1300,8 +1305,9 @@ mod tests {
                     metadata: b"m",
                 })
                 .expect("encode mismatched-dim row");
+                // 物理キーは `(tenant_id, id)`（TABLE-12）。
                 row_table
-                    .insert(1u64, encoded.as_slice())
+                    .insert((TENANT_ID, 1u64), encoded.as_slice())
                     .expect("insert mismatched-dim row bypassing dim validation");
             }
             write_txn.commit().expect("commit mismatched-dim row");
@@ -1503,9 +1509,9 @@ mod tests {
         let write_txn = storage.db().begin_write().expect("begin_write");
         {
             let row_table_name = catalog::user_rows_table_name("docs");
-            let row_table_def: redb::TableDefinition<u64, &[u8]> =
-                redb::TableDefinition::new(&row_table_name);
-            let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+            let mut row_table = write_txn
+                .open_table(catalog::user_rows_table_def(&row_table_name))
+                .expect("open row table");
             let encoded = crate::storage::encode_row(&RowInput {
                 tenant_id,
                 visibility: Visibility::Public,
@@ -1514,7 +1520,7 @@ mod tests {
             })
             .expect("encode mismatched-dim row");
             row_table
-                .insert(id, encoded.as_slice())
+                .insert((tenant_id, id), encoded.as_slice())
                 .expect("insert mismatched-dim row bypassing dim validation");
         }
         write_txn.commit().expect("commit mismatched-dim row");
@@ -1604,13 +1610,13 @@ mod tests {
             let write_txn = storage.db().begin_write().expect("begin_write");
             {
                 let row_table_name = catalog::user_rows_table_name("docs");
-                let row_table_def: redb::TableDefinition<u64, &[u8]> =
-                    redb::TableDefinition::new(&row_table_name);
-                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let mut row_table = write_txn
+                    .open_table(catalog::user_rows_table_def(&row_table_name))
+                    .expect("open row table");
                 // version バイトのみで tenant_len 以降が一切ない、意図的な破損バイト列
                 // （`crates/engine/tests/vector_core.rs` の破損行テストと同手法）。
                 row_table
-                    .insert(0u64, &[1u8][..])
+                    .insert(("tenant-a", 0u64), &[1u8][..])
                     .expect("insert header-corrupted row");
             }
             write_txn.commit().expect("commit header-corrupted row");
@@ -1986,10 +1992,15 @@ mod tests {
             // 参照するため、ここでは使えない。
             let mut checksum = 0.0f64;
             let mut visited = 0usize;
-            let mut cursor: Option<u64> = None;
+            // カーソルは物理キーと同形の `(tenant_id, id)`（TABLE-12）。
+            let mut cursor: Option<(String, u64)> = None;
             loop {
                 let (rows, next_cursor) = storage
-                    .scan_table_page(TABLE_NAME, cursor, crate::storage::MAX_SCAN_PAGE_LIMIT)
+                    .scan_table_page(
+                        TABLE_NAME,
+                        cursor.as_ref().map(|(t, id)| (t.as_str(), *id)),
+                        crate::storage::MAX_SCAN_PAGE_LIMIT,
+                    )
                     .expect("scan_table_page within configured limits");
                 for row in &rows {
                     let first = row.embedding.first().copied().unwrap_or(0.0) as f64;

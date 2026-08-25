@@ -23,10 +23,11 @@
 //! テーブル単位分離を検討する場合は、本モジュールの可視性フィルタと独立した設計判断
 //! として扱うこと。
 
-use redb::{ReadableTable, TableDefinition};
+use redb::ReadableTable;
 
 use crate::catalog::{
-    require_table_schema_write, user_rows_table_name, validate_identifier, CatalogError,
+    map_row_table_error, require_table_schema_write, user_rows_table_def, user_rows_table_name,
+    validate_identifier, CatalogError,
 };
 use crate::policy::PolicyContext;
 use crate::storage::{
@@ -152,10 +153,13 @@ pub fn visible_rows(
     ctx: &PolicyContext,
 ) -> Result<Vec<Row>, TenantError> {
     let mut out = Vec::new();
-    let mut after: Option<u64> = None;
+    // カーソルは行ストアの物理キーと同じ `(tenant_id, id)` 形（TABLE-12）。`id` 単独では
+    // 再開位置を表現できず、テナントをまたぐ走査で行を取りこぼす。
+    let mut after: Option<(String, u64)> = None;
     let mut scanned: usize = 0;
     loop {
-        let (page, next) = storage.scan_table_page(table, after, PAGE_LIMIT)?;
+        let cursor = after.as_ref().map(|(t, id)| (t.as_str(), *id));
+        let (page, next) = storage.scan_table_page(table, cursor, PAGE_LIMIT)?;
         if page.is_empty() && next.is_none() {
             break;
         }
@@ -297,9 +301,15 @@ impl From<StorageError> for TenantWriteError {
 /// `row.tenant_id` が `ctx` のテナントと不一致なら
 /// [`TenantWriteError::Forbidden`]（他テナント名義での新規行書き込み・テナント
 /// 付け替えの試行を遮断。判定は [`PolicyContext::is_owner`] の単一照合パス経由）。
-/// 挿入先 `id` に既存行がある場合は、その行の所有者を問わず
-/// [`TenantWriteError::IdConflict`]（上書きによる他テナント行の破壊を防ぎつつ、
-/// 所有テナントの存在情報を漏らさない）。
+///
+/// 重複検出のスコープ（対象ビヘイビア: TABLE-12・RLS-9。codex-review P0 指摘・PR #194）:
+/// 行ストアの物理キーは `(tenant_id, id)` で名前空間化されており、既存行の照会は
+/// **サーバー側導出テナント（`ctx.tenant_id()`）の名前空間内だけ**を対象とする
+/// （クライアント自己申告の `row.tenant_id` はキー構築に用いない）。したがって
+/// 同一テナント内の重複のみ [`TenantWriteError::IdConflict`]（`23505`）となり、
+/// 他テナントが同じ `id` を保持していても本経路は通常どおり成功する。他テナント行の
+/// 有無で分岐する処理を一切持たないため、応答（成否・`wire_code`・文言）からも
+/// 実行経路の分岐からも他テナントの存在情報を観測できない（fail-closed）。
 ///
 /// スキーマ取得・次元検証・所有権判定・書き込みを単一の write トランザクション内で
 /// 行い、失敗時は commit せずトランザクションを破棄する（`redb::WriteTransaction` の
@@ -323,16 +333,17 @@ pub fn insert_row(
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
         let row_table_name = user_rows_table_name(table);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let mut row_table = write_txn
-            .open_table(row_table_def)
-            .map_err(CatalogError::from)?;
-        if row_table.get(id).map_err(CatalogError::from)?.is_some() {
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
+        let key = (ctx.tenant_id(), id);
+        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
             return Err(TenantWriteError::IdConflict);
         }
         let encoded = encode_row(row)?;
         row_table
-            .insert(id, encoded.as_slice())
+            .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
@@ -365,17 +376,21 @@ pub fn update_row(
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
         let row_table_name = user_rows_table_name(table);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let mut row_table = write_txn
-            .open_table(row_table_def)
-            .map_err(CatalogError::from)?;
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        // 物理キーの名前空間化（TABLE-12）により、他テナントの行はそもそも別キーで
+        // 到達不能（構造的な遮断）。既存行の所有者照合は `is_owner` の単一照合パスに
+        // 残し、二重防御とする（旧フォーマット行の混在等でヘッダのテナントが
+        // キーと食い違う場合も fail-closed 側に倒れる）。
         // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用（`insert`）と
         // 衝突しないようにする。
-        let owns_existing = match row_table.get(id).map_err(CatalogError::from)? {
+        let key = (ctx.tenant_id(), id);
+        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
             Some(guard) => {
                 let (existing_tenant, _existing_visibility) =
                     decode_row_tenant_and_visibility(guard.value())?;
-                ctx.is_owner(&existing_tenant)
+                ctx.is_owner(existing_tenant)
             }
             None => false,
         };
@@ -384,7 +399,7 @@ pub fn update_row(
         }
         let encoded = encode_row(row)?;
         row_table
-            .insert(id, encoded.as_slice())
+            .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
@@ -409,22 +424,23 @@ pub fn delete_row(
         // `insert_row`/`update_row` と同じ前段を通す。
         require_table_schema_write(&write_txn, table)?;
         let row_table_name = user_rows_table_name(table);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
         let mut row_table = write_txn
-            .open_table(row_table_def)
-            .map_err(CatalogError::from)?;
-        let owns_existing = match row_table.get(id).map_err(CatalogError::from)? {
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+        // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
+        let key = (ctx.tenant_id(), id);
+        let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
             Some(guard) => {
                 let (existing_tenant, _existing_visibility) =
                     decode_row_tenant_and_visibility(guard.value())?;
-                ctx.is_owner(&existing_tenant)
+                ctx.is_owner(existing_tenant)
             }
             None => false,
         };
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        row_table.remove(id).map_err(CatalogError::from)?;
+        row_table.remove(&key).map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
@@ -591,7 +607,7 @@ mod tests {
             .expect("unguarded write succeeds by construction");
 
         let after = storage
-            .get_row_from_table("docs", 1)
+            .get_row_from_table("docs", "tenant-a", 1)
             .expect("read back row");
         assert_eq!(after.tenant_id, "tenant-a");
     }

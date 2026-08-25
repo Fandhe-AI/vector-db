@@ -97,22 +97,34 @@ fn victim_ctx() -> PolicyContext {
 }
 
 /// テーブル全行を `scan_table_page` でカーソルが尽きるまで巡回して収集する、実装非依存の
-/// チェッカー。`(tenant_id, visibility, embedding, metadata)` を id 昇順に保持する。
-fn snapshot_table(storage: &Storage) -> BTreeMap<u64, (String, bool, Vec<f32>, Vec<u8>)> {
+/// チェッカー。キーは行ストアの物理キーと同じ `(tenant_id, id)`（対象ビヘイビア: TABLE-12。
+/// 行 `id` の一意性スコープがテナント内のため、`id` 単独をキーにすると異なるテナントの
+/// 同一 `id` の行が畳み込まれ、越境書き込みの検出が甘くなる）。値は
+/// `(visibility, embedding, metadata)`。
+/// スナップショットの値: `(is_public, embedding, metadata)`。
+type RowSnapshotValue = (bool, Vec<f32>, Vec<u8>);
+/// スナップショット全体: キーは物理キーと同形の `(tenant_id, id)`（TABLE-12）。
+type TableSnapshot = BTreeMap<(String, u64), RowSnapshotValue>;
+
+fn snapshot_table(storage: &Storage) -> TableSnapshot {
     let mut out = BTreeMap::new();
-    let mut after: Option<u64> = None;
+    // カーソルも物理キーと同形。
+    let mut after: Option<(String, u64)> = None;
     loop {
         let (page, next) = storage
-            .scan_table_page(TABLE, after, 10_000)
+            .scan_table_page(
+                TABLE,
+                after.as_ref().map(|(t, id)| (t.as_str(), *id)),
+                10_000,
+            )
             .expect("scan_table_page ok");
         if page.is_empty() && next.is_none() {
             break;
         }
         for row in page {
             out.insert(
-                row.id,
+                (row.tenant_id.clone(), row.id),
                 (
-                    row.tenant_id.clone(),
                     matches!(row.visibility, Visibility::Public),
                     row.embedding.clone(),
                     row.metadata.clone(),
@@ -180,60 +192,58 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
     let attacker = attacker_ctx();
 
     // tenant-b の Public 行と Private 行の両方を標的に含める。
+    // スナップショットのキーは `(tenant_id, id)`（TABLE-12）。
     let victim_ids: Vec<u64> = before
-        .iter()
-        .filter(|(_, (tenant, ..))| tenant == TENANT_B)
-        .map(|(id, _)| *id)
+        .keys()
+        .filter(|(tenant, _)| tenant == TENANT_B)
+        .map(|(_, id)| *id)
         .collect();
     assert!(victim_ids.len() >= 20, "seed must contain tenant-b rows");
-    let victim_public_id = *before
+    let victim_public_id = before
         .iter()
-        .find(|(_, (tenant, is_public, ..))| tenant == TENANT_B && *is_public)
-        .map(|(id, _)| id)
+        .find(|((tenant, _), (is_public, ..))| tenant == TENANT_B && *is_public)
+        .map(|((_, id), _)| *id)
         .expect("seed must contain a tenant-b public row");
-    let victim_private_id = *before
+    let victim_private_id = before
         .iter()
-        .find(|(_, (tenant, is_public, ..))| tenant == TENANT_B && !*is_public)
-        .map(|(id, _)| id)
+        .find(|((tenant, _), (is_public, ..))| tenant == TENANT_B && !*is_public)
+        .map(|((_, id), _)| *id)
         .expect("seed must contain a tenant-b private row");
 
     let mut results: Vec<Result<(), TenantWriteError>> = Vec::new();
 
-    // INSERT 10 回: 偶数回は tenant-b 名義で新規 id へ（Forbidden 期待）、
-    // 奇数回は tenant-a 名義で tenant-b の既存 id へ上書き試行（IdConflict 期待）。
+    // INSERT 10 回: いずれも「他テナント（tenant-b）名義の行を書き込む」越境試行
+    // （Forbidden 期待）。偶数回は未使用 id、奇数回は tenant-b の既存 id を対象にし、
+    // 対象 id の使用状況にかかわらず同じ拒否になることも併せて確認する。
+    //
+    // 注意（TABLE-12・RLS-9）: 「自テナント名義で他テナントの既存 id へ INSERT する」
+    // 操作はもはや越境ではなく、自テナントの名前空間への正当な挿入として成功する
+    // （物理キーが `(tenant_id, id)` で名前空間化されたため、他テナント行は上書き
+    // されない）。その契約の検証は `tests/row_id_tenant_scope.rs` が担う。
     for i in 0..10u64 {
-        let new_id = 100_000 + i;
-        if i % 2 == 0 {
-            let row = RowInput {
-                tenant_id: TENANT_B,
-                visibility: Visibility::Public,
-                embedding: &[1.0; DIM as usize],
-                metadata: &[],
-            };
-            let r = tenant::insert_row(&storage, TABLE, &attacker, new_id, &row);
-            assert!(matches!(r, Err(TenantWriteError::Forbidden)));
-            results.push(r);
+        let target = if i % 2 == 0 {
+            100_000 + i
         } else {
-            let target = victim_ids[(i as usize) % victim_ids.len()];
-            let row = RowInput {
-                tenant_id: TENANT_A,
-                visibility: Visibility::Public,
-                embedding: &[1.0; DIM as usize],
-                metadata: &[],
-            };
-            let r = tenant::insert_row(&storage, TABLE, &attacker, target, &row);
-            assert!(matches!(r, Err(TenantWriteError::IdConflict)));
-            results.push(r);
-        }
+            victim_ids[(i as usize) % victim_ids.len()]
+        };
+        let row = RowInput {
+            tenant_id: TENANT_B,
+            visibility: Visibility::Public,
+            embedding: &[1.0; DIM as usize],
+            metadata: &[],
+        };
+        let r = tenant::insert_row(&storage, TABLE, &attacker, target, &row);
+        assert!(matches!(r, Err(TenantWriteError::Forbidden)));
+        results.push(r);
     }
 
     // UPDATE 10 回: 偶数回は tenant-b の行（Public/Private 交互）を tenant-a ctx で
     // 更新（NotFound 期待）。奇数回は tenant-a 自身の行を tenant-b へ付け替える試行
     // （Forbidden 期待）。
     let attacker_own_ids: Vec<u64> = before
-        .iter()
-        .filter(|(_, (tenant, ..))| tenant == TENANT_A)
-        .map(|(id, _)| *id)
+        .keys()
+        .filter(|(tenant, _)| tenant == TENANT_A)
+        .map(|(_, id)| *id)
         .collect();
     for i in 0..10u64 {
         if i % 2 == 0 {
@@ -340,8 +350,8 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
     // RECOVER-4 の「読み取り 10 回」に対応する 10 個の標的（tenant-b の Private 行）。
     let victim_ids: Vec<u64> = before
         .iter()
-        .filter(|(_, (tenant, is_public, ..))| tenant == TENANT_B && !*is_public)
-        .map(|(id, _)| *id)
+        .filter(|((tenant, _), (is_public, ..))| tenant == TENANT_B && !*is_public)
+        .map(|((_, id), _)| *id)
         .take(10)
         .collect();
     assert!(
@@ -353,8 +363,8 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
     // 攻撃側が「見てよい」集合（自テナントの全行 + 他テナントの Public 行）。
     let allowed_ids: std::collections::HashSet<u64> = before
         .iter()
-        .filter(|(_, (tenant, is_public, ..))| tenant == TENANT_A || *is_public)
-        .map(|(id, _)| *id)
+        .filter(|((tenant, _), (is_public, ..))| tenant == TENANT_A || *is_public)
+        .map(|((_, id), _)| *id)
         .collect();
     for id in &victim_ids {
         assert!(
@@ -377,7 +387,8 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
             SearchTimeFilter::build(&storage, TABLE).expect("build search-time filter");
 
         for (i, victim_id) in victim_ids.iter().enumerate() {
-            let query = &before[victim_id].2;
+            // 値は `(is_public, embedding, metadata)`、キーは `(tenant_id, id)`（TABLE-12）。
+            let query = &before[&(TENANT_B.to_string(), *victim_id)].1;
             let hits = if i % 2 == 0 {
                 prefilter
                     .search(&attacker, &CpuScalarProvider, query, 5)
@@ -403,8 +414,12 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
         let victim = victim_ctx();
         let victim_index =
             PrefilterIndex::build(&storage, TABLE, &victim).expect("build prefilter index");
-        let mismatched =
-            victim_index.search(&attacker, &CpuScalarProvider, &before[&victim_ids[0]].2, 5);
+        let mismatched = victim_index.search(
+            &attacker,
+            &CpuScalarProvider,
+            &before[&(TENANT_B.to_string(), victim_ids[0])].1,
+            5,
+        );
         assert!(matches!(
             mismatched,
             Err(engine::rls::RlsError::ContextMismatch)
@@ -431,7 +446,7 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
         assert!(matches!(get_result, Err(engine::core::CoreError::NotFound)));
     }
 
-    let query = &before[&victim_ids[0]].2;
+    let query = &before[&(TENANT_B.to_string(), victim_ids[0])].1;
     let hits = core
         .search(&attacker, TABLE, query, 5)
         .expect("core search ok");
@@ -489,10 +504,10 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
     };
     tenant::insert_row(&storage, TABLE, &owner, new_id, &insert_row).expect("owner insert ok");
 
-    let own_id = *before
-        .iter()
-        .find(|(_, (t, ..))| t == TENANT_A)
-        .map(|(id, _)| id)
+    let own_id = before
+        .keys()
+        .find(|(t, _)| t == TENANT_A)
+        .map(|(_, id)| *id)
         .expect("seed must contain a tenant-a row");
     let update_row_input = RowInput {
         tenant_id: TENANT_A,
@@ -503,26 +518,28 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
     tenant::update_row(&storage, TABLE, &owner, own_id, &update_row_input)
         .expect("owner update ok");
 
-    let delete_target = *before
-        .iter()
-        .filter(|(id, (t, ..))| t == TENANT_A && **id != own_id)
-        .map(|(id, _)| id)
+    let delete_target = before
+        .keys()
+        .filter(|(t, id)| t == TENANT_A && *id != own_id)
+        .map(|(_, id)| *id)
         .next()
         .expect("seed must contain another tenant-a row");
     tenant::delete_row(&storage, TABLE, &owner, delete_target).expect("owner delete ok");
 
+    // スナップショットのキーは `(tenant_id, id)`（TABLE-12）。
+    let key = |id: u64| (TENANT_A.to_string(), id);
     let after = snapshot_table(&storage);
-    assert!(after.contains_key(&new_id));
-    assert_eq!(after[&own_id].3, update_row_input.metadata.to_vec());
-    assert!(!after.contains_key(&delete_target));
+    assert!(after.contains_key(&key(new_id)));
+    assert_eq!(after[&key(own_id)].2, update_row_input.metadata.to_vec());
+    assert!(!after.contains_key(&key(delete_target)));
 
     // 期待した 3 件（insert 1・update 1・delete 1）以外に差分がないこと。
     let mut changed: Vec<u64> = Vec::new();
-    let all_ids: std::collections::HashSet<u64> =
-        before.keys().chain(after.keys()).copied().collect();
-    for id in all_ids {
-        if before.get(&id) != after.get(&id) {
-            changed.push(id);
+    let all_keys: std::collections::HashSet<(String, u64)> =
+        before.keys().chain(after.keys()).cloned().collect();
+    for k in all_keys {
+        if before.get(&k) != after.get(&k) {
+            changed.push(k.1);
         }
     }
     changed.sort_unstable();

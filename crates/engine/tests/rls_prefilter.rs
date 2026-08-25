@@ -341,7 +341,7 @@ fn rls4_top_k_matches_independently_computed_full_scan_ranking() {
             .iter()
             .map(|&id| {
                 let row = storage
-                    .get_row_from_table("docs", id)
+                    .get_row_from_table("docs", TARGET_TENANT, id)
                     .expect("row must exist");
                 (id, dot(&row.embedding, &query))
             })
