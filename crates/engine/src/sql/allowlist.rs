@@ -291,6 +291,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// パーサー位置に応じた文脈的キーワード照合（PR #189 レビュー指摘対応・P1）。
+    /// `INSERT`/`INTO`/`VALUES`/`USING`/`OPERATION_ID` は
+    /// [`lexer::Keyword`] へ含めない（`lexer.rs` の設計メモ参照）ため、
+    /// [`Token::Ident`] を大文字小文字を区別せず文字列比較して INSERT 許可形状の
+    /// 期待位置でのみキーワードとして扱う。同名の一般識別子（テーブル名・列名）は
+    /// `expect_ident` を通る位置に置かれる限り、本メソッドの対象外として素通しする。
+    fn expect_contextual_keyword(&mut self, word: &str) -> Result<(), SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => Ok(()),
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected keyword {word}, got {other:?}"
+            ))),
+        }
+    }
+
+    /// 次のトークンが文脈的キーワード `word` に一致するかを消費せずに判定する
+    /// （`parse_operation_id_clause` が `USING` 句の有無で分岐するために使う）。
+    fn peek_contextual_keyword(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
+    }
+
     fn expect_punct(&mut self, c: char) -> Result<(), SqlSurfaceError> {
         match self.advance() {
             Some(Token::Punct(p)) if *p == c => Ok(()),
@@ -481,8 +502,8 @@ impl<'a> Parser<'a> {
     /// USING OPERATION_ID '<id>' [;]` の単一行形のみを受理する（SQL-10、TASK-80）。
     /// 複数行 VALUES・RETURNING・可視性ラベル指定は構造的に受理しない。
     fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
-        self.expect_keyword(Keyword::Insert)?;
-        self.expect_keyword(Keyword::Into)?;
+        self.expect_contextual_keyword("INSERT")?;
+        self.expect_contextual_keyword("INTO")?;
         let table_name = self.expect_ident()?;
 
         self.expect_punct('(')?;
@@ -496,7 +517,7 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(')')?;
 
-        self.expect_keyword(Keyword::Values)?;
+        self.expect_contextual_keyword("VALUES")?;
         self.expect_punct('(')?;
         let mut values = vec![self.expect_literal()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
@@ -537,14 +558,13 @@ impl<'a> Parser<'a> {
     /// （数値・識別子等）は許可リスト外として `42601` へ落ちる
     /// （`expect_keyword`/`expect_string_literal` が `UnsupportedSyntax` を返す）。
     fn parse_operation_id_clause(&mut self) -> Result<OperationId, SqlSurfaceError> {
-        match self.peek() {
-            Some(Token::Keyword(Keyword::Using)) => {
-                self.advance();
-                self.expect_keyword(Keyword::OperationId)?;
-                let raw = self.expect_string_literal()?;
-                OperationId::parse(&raw)
-            }
-            _ => Err(SqlSurfaceError::missing_operation_id()),
+        if self.peek_contextual_keyword("USING") {
+            self.advance();
+            self.expect_contextual_keyword("OPERATION_ID")?;
+            let raw = self.expect_string_literal()?;
+            OperationId::parse(&raw)
+        } else {
+            Err(SqlSurfaceError::missing_operation_id())
         }
     }
 }

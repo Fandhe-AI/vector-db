@@ -34,18 +34,17 @@ pub enum Keyword {
     Order,
     By,
     Limit,
-    /// TASK-80・SQL-10: `INSERT INTO ... VALUES (...) USING OPERATION_ID '...'` の
-    /// 書き込み系許可形状で使う（`sql::allowlist::Parser::parse_insert`）。
-    Insert,
-    Into,
-    Values,
-    /// `USING OPERATION_ID '<id>'` 文末専用句の先頭キーワード。SQL-12
-    /// （TASK-161、`USING MODE` 等）は別タスクの管轄で、本タスクでは
-    /// `OperationId` に続く形のみを許可リストとして受理する。
-    Using,
-    OperationId,
 }
 
+/// TASK-80・SQL-10 の `INSERT`/`INTO`/`VALUES`/`USING`/`OPERATION_ID` は
+/// [`Keyword`] へ含めない（PR #189 レビュー指摘対応・P1）。この 5 語を無条件で
+/// `Token::Keyword` 化すると、既存の SELECT 許可形状（`sql::allowlist`）が
+/// 受理してきた同名のテーブル名・列名（`catalog::validate_identifier` は
+/// これらを識別子として許可している）が `expect_ident` を通過できなくなり、
+/// 引用識別子の回避策もないまま公開クエリ構文を無告知に破壊してしまう。
+/// 代わりに常に [`Token::Ident`] として字句解析し、`sql::allowlist::Parser` が
+/// INSERT 許可形状のパーサー位置でのみ文脈的に大文字小文字を無視して照合する
+/// （`Parser::expect_contextual_keyword`）。
 fn keyword_from_str(s: &str) -> Option<Keyword> {
     // 大文字小文字を区別しない ASCII 大文字比較（SQL 予約語の慣習に合わせる）。
     match s.to_ascii_uppercase().as_str() {
@@ -56,11 +55,6 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
         "ORDER" => Some(Keyword::Order),
         "BY" => Some(Keyword::By),
         "LIMIT" => Some(Keyword::Limit),
-        "INSERT" => Some(Keyword::Insert),
-        "INTO" => Some(Keyword::Into),
-        "VALUES" => Some(Keyword::Values),
-        "USING" => Some(Keyword::Using),
-        "OPERATION_ID" => Some(Keyword::OperationId),
         _ => None,
     }
 }
@@ -306,20 +300,40 @@ mod tests {
     }
 
     #[test]
-    fn tokenizes_insert_operation_id_keywords() {
-        // TASK-80・SQL-10: INSERT 許可形状・USING OPERATION_ID 文末句が使う 5 語が
-        // Token::Keyword として認識されることを固定する。
+    fn insert_operation_id_words_lex_as_plain_idents() {
+        // PR #189 レビュー指摘対応（P1）: INSERT 許可形状・USING OPERATION_ID
+        // 文末句が使う 5 語は Token::Keyword 化せず、常に Token::Ident として
+        // 字句解析されることを固定する（文脈的キーワード化は
+        // `sql::allowlist::Parser` 側の責務）。
         let tokens =
             tokenize("INSERT INTO t VALUES USING OPERATION_ID").expect("tokenize should succeed");
         assert_eq!(
             tokens,
             vec![
-                Token::Keyword(Keyword::Insert),
-                Token::Keyword(Keyword::Into),
+                Token::Ident("INSERT".to_string()),
+                Token::Ident("INTO".to_string()),
                 Token::Ident("t".to_string()),
-                Token::Keyword(Keyword::Values),
-                Token::Keyword(Keyword::Using),
-                Token::Keyword(Keyword::OperationId),
+                Token::Ident("VALUES".to_string()),
+                Token::Ident("USING".to_string()),
+                Token::Ident("OPERATION_ID".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_operation_id_words_remain_usable_as_ordinary_identifiers() {
+        // PR #189 レビュー指摘対応（P1）: `catalog::validate_identifier` が許可する
+        // 同名のテーブル名・列名（例: `values`）が、SELECT 許可形状の
+        // `expect_ident` 位置で引き続き受理できることを固定する
+        // （`SELECT values FROM documents` が構文破壊しない回帰テスト）。
+        let tokens = tokenize("SELECT values FROM documents").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Select),
+                Token::Ident("values".to_string()),
+                Token::Keyword(Keyword::From),
+                Token::Ident("documents".to_string()),
             ]
         );
     }

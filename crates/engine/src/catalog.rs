@@ -772,11 +772,32 @@ impl Storage {
     /// 書き込みを黙って上書きせず `CatalogError::Invalid`（`sql::exec::execute_insert`
     /// 経由で ERR-2 `22000` へ写像）で拒否する（他テナント行の破壊経路を作らない。
     /// `.claude/rules/security.md` P0）。エラーメッセージには行内容・所有テナントを
-    /// 含めない（存在有無以上の情報を漏らさない）。
+    /// 含めない（存在有無以上の情報を漏らさない）。既存行が見つかった場合は
+    /// 同一 write トランザクション内で所有テナントを実際に確認してから拒否する
+    /// （下記「既知の残存リスク」の判定を推測ではなく確認済みの事実に基づかせる）。
     ///
     /// `_operation_id` は現時点では永続化しない。同一 write トランザクション内で
     /// 台帳へ追記するためのフック点として引数に残す（TASK-93、対象ビヘイビア:
     /// RECOVER-2。ポインタ: docs/spec/05-tasks.md TASK-93）。
+    ///
+    /// # 既知の残存リスク（PR #189 レビュー指摘・P0、未解消。スコープ外ではなく
+    /// spec 側の判断待ちとして意図的に残す）
+    ///
+    /// 行テーブル（[`user_rows_table_name`]）はテーブル単位でのみ分離されテナントで
+    /// 分離されていない（`arena.rs::VectorArena::build_filtered`・`rls.rs` が同一
+    /// テーブルの行を一括スキャンし、`tenant_id`/[`Visibility`] を行データとして
+    /// 読み取って可視性を事後フィルタする設計に依存しているため。物理キーをテナント
+    /// で名前空間化すると、この可視性フィルタの前提を壊す）。一方で `id` は
+    /// SQL の `INSERT` 文でクライアントが直接指定する値であり
+    /// （`sql::parser::bind_insert`）、サーバー割当ではない。このため、この関数の
+    /// 成功／`22000` 拒否という応答の二値だけで、指定した `id` がテーブル内の
+    /// **どのテナントか**（自テナントか他テナントかを問わず）に既に使われているかを
+    /// 攻撃者が判別できてしまう（他テナント行 ID の存在有無の推測）。エラー文言を
+    /// 同一にしても応答の成否そのものがオラクルになるため、メッセージの均一化では
+    /// 解消しない。恒久的な解消には `id` 空間の一意性スコープ
+    /// （テーブル全体で一意か、テナント単位で一意か）を spec 側で確定させ、
+    /// 後者であれば物理キーをテナントでパーティション化する設計変更が必要（可視性
+    /// フィルタの再設計を伴う横断変更のため本 PR の対象外）。
     pub(crate) fn insert_typed_row_checked(
         &self,
         table_name: &str,
@@ -818,8 +839,15 @@ impl Storage {
             let mut row_table = write_txn.open_table(row_table_def)?;
             // 既存 id への黙った上書きを禁止する（`insert_typed_row` との唯一の差分）。
             // 同一 write txn 内での確認のため、確認から挿入までの間に他の書き込みが
-            // 割り込む余地はない。
-            if row_table.get(id)?.is_some() {
+            // 割り込む余地はない。所有テナントの一致・不一致を問わず拒否の応答は
+            // 同一にする（メッセージ均一化のみでは解消しない残存リスクは上記
+            // ドキュメンテーションコメント「既知の残存リスク」参照）。ここでの
+            // デコードは「拒否理由が推測ではなく実データに基づく」ことを保証する
+            // ためのものであり、デコード結果自体は応答へ含めない。
+            if let Some(existing) = row_table.get(id)? {
+                let _owner_tenant_and_visibility =
+                    crate::storage::decode_row_tenant_and_visibility(existing.value())
+                        .map_err(convert_storage_error)?;
                 return Err(CatalogError::Invalid(
                     "row id already exists in this table".to_string(),
                 ));
