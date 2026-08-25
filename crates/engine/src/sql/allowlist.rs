@@ -198,32 +198,32 @@ pub enum Projection {
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
 /// 妥当性は検証しない（`sql::parser::bind` の責務）。
 ///
-/// フィールドは `pub(crate)`（クレート内の `sql::parser` 等からは直接参照できるが、
-/// クレート外からは構造体リテラル構築・フィールド直読みのいずれも不可）とし、外部へは
-/// 個別のアクセサーメソッド（[`ValidatedStatement::table_name`] 等）でのみ値を公開する。
-/// TASK-161（SQL-12）で `search_mode` フィールドを追加した際、当時全フィールドが
-/// `pub` だったため既存の構造体リテラル構築コードが必須フィールド不足でコンパイル
-/// 不能になる破壊的変更を作ってしまった（AGENTS.md「公開 API・エラー契約の互換性
-/// （P1）」）。アクセサー経由の設計にすることで、今後フィールドを追加してもクレート
-/// 外の呼び出し元を壊さない。本構造体はクレート外から直接構築するものではなく、
-/// [`validate_sql`] の戻り値としてのみ取得する。
+/// `#[non_exhaustive]`: TASK-161（SQL-12）で `search_mode` フィールドを追加した際、
+/// 既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
+/// 変更となった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド
+/// 追加が同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応
+/// にする（フィールド自体は既存の直読み互換性を保つため `pub` のまま維持する）。
+/// 加えて個別のアクセサーメソッド（[`ValidatedStatement::table_name`] 等）も公開し、
+/// 将来的な内部表現変更の余地を残す。本構造体はクレート外から直接構築するものでは
+/// なく、[`validate_sql`] の戻り値としてのみ取得する。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
-    pub(crate) table_name: String,
-    pub(crate) projection: Projection,
-    pub(crate) order_by: OrderByForm,
+    pub table_name: String,
+    pub projection: Projection,
+    pub order_by: OrderByForm,
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
-    pub(crate) where_predicates: Vec<WherePredicate>,
-    pub(crate) limit: u32,
+    pub where_predicates: Vec<WherePredicate>,
+    pub limit: u32,
     /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
     /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
     /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
     /// を経由する `sql::parser::bind_with_session` が検証する。
-    pub(crate) search_mode: Option<String>,
+    pub search_mode: Option<String>,
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。未指定時は
     /// [`EvaluationOrder::DEFAULT`]（既存 TASK-75 の固定順 RLS→SCALAR→DISTANCE）。
-    pub(crate) evaluation_order: EvaluationOrder,
+    pub evaluation_order: EvaluationOrder,
 }
 
 impl ValidatedStatement {
