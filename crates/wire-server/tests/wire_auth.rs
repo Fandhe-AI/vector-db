@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
@@ -52,6 +53,27 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
         if let Ok((stream, _)) = listener.accept() {
             let _ = wire_server::handshake::handle_connection(stream, &store);
         }
+    });
+
+    addr
+}
+
+/// `wire_server::server::accept_loop` 経由でサーバースレッドを起動し、接続先アドレス
+/// を返す。`spawn_server_accepting_one` と異なり、認証前フェーズの Slowloris 対策
+/// （同時接続数上限・I/O タイムアウト）を実際に適用した状態でハンドシェイクを
+/// 検証するために使う（review 指摘: 認証後のセッションにこのタイムアウトが
+/// 引き継がれないことの回帰確認）。
+fn spawn_server_with_accept_loop(
+    users_path: &std::path::Path,
+    max_connections: usize,
+    io_timeout: Duration,
+) -> std::net::SocketAddr {
+    let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop(listener, store, max_connections, io_timeout);
     });
 
     addr
@@ -255,8 +277,98 @@ fn wire2_database_param_does_not_affect_authentication_outcome() {
 
     let mut header = [0u8; 1];
     stream.read_exact(&mut header).expect("read response type");
-    assert_eq!(
-        header[0], b'R',
-        "authentication must succeed regardless of the self-reported database parameter"
-    );
+    if header[0] != b'R' {
+        // 失敗時は SQLSTATE を含めて診断する（`28P01` なら認証そのものの不一致、
+        // `08P01` ならテストクライアント側のフレーミング齟齬で、原因が全く異なる。
+        // 後続の flake 調査を「もう一度落として見る」から「1 回のログで切り分ける」
+        // に変えるための最小限の追加読み取り）。
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len.saturating_sub(4)];
+        stream.read_exact(&mut body).expect("read body");
+        let body_str = String::from_utf8_lossy(&body);
+        panic!(
+            "authentication must succeed regardless of the self-reported database parameter; \
+             got message type {:?}, body: {body_str:?}",
+            header[0] as char
+        );
+    }
+}
+
+/// レビュー指摘の再現ケース: `server::accept_loop` の認証前 I/O タイムアウトは
+/// StartupMessage を送らない接続には引き続き働くが、認証成功後のセッションには
+/// 適用され続けないこと（対話的クライアント・コネクションプールの正当なアイドルを
+/// 切断しない）。
+#[test]
+fn wire_pre_auth_timeout_still_applies_but_post_auth_session_survives_idle() {
+    let short_timeout = Duration::from_millis(150);
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let addr = spawn_server_with_accept_loop(&users_path, 4, short_timeout);
+
+    // 1) 認証前タイムアウトは引き続き働く: 何も送らない接続は
+    //    `short_timeout` 経過後にサーバー側から切断される。
+    {
+        let mut stalled = TcpStream::connect(addr).expect("connect stalled");
+        std::thread::sleep(short_timeout * 3);
+        let mut buf = [0u8; 1];
+        let n = stalled.read(&mut buf).unwrap_or(0);
+        assert_eq!(
+            n, 0,
+            "pre-auth idle connection must still be closed by the server-side timeout"
+        );
+    }
+
+    // 2) 認証成功後のセッションは、認証前タイムアウトの何倍もアイドルしても
+    //    切断されないこと。アイドル後に簡易クエリを送っても正常に応答が返る
+    //    （EOF にならない）ことで生存を確認する。
+    {
+        let mut stream = TcpStream::connect(addr).expect("connect for auth");
+        send_ssl_request_and_startup(&mut stream, "alice", "db");
+        let _ = read_auth_request_type(&mut stream);
+        send_password_message(&mut stream, "correct-horse");
+
+        let mut header = [0u8; 1];
+        stream.read_exact(&mut header).expect("read auth ok type");
+        assert_eq!(header[0], b'R');
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).expect("read len");
+        let mut code_buf = [0u8; 4];
+        stream.read_exact(&mut code_buf).expect("read code");
+        assert_eq!(i32::from_be_bytes(code_buf), 0, "AuthenticationOk expected");
+
+        // ReadyForQuery まで読み飛ばす。
+        let mut msg_type = read_message_type_discarding_body(&mut stream);
+        let mut safety = 0;
+        while msg_type != b'Z' {
+            safety += 1;
+            assert!(safety < 20, "too many messages before ReadyForQuery");
+            msg_type = read_message_type_discarding_body(&mut stream);
+        }
+
+        // 認証前タイムアウトの何倍もアイドルする（クリアされていなければ、
+        // ここで接続が切断されているはず）。
+        std::thread::sleep(short_timeout * 3);
+
+        // アイドル後に簡易クエリを送り、EOF ではなく正常な応答
+        // （未実装 ErrorResponse）が返ることで接続が生きていることを確認する。
+        let mut query = Vec::new();
+        query.push(b'Q');
+        let body = b"SELECT 1\0";
+        let total_len = (4 + body.len()) as i32;
+        query.extend_from_slice(&total_len.to_be_bytes());
+        query.extend_from_slice(body);
+        stream
+            .write_all(&query)
+            .expect("send simple query after idling past the pre-auth timeout window");
+
+        let mut resp_header = [0u8; 1];
+        stream.read_exact(&mut resp_header).expect(
+            "post-auth session must still be open after idling past the pre-auth timeout window",
+        );
+        assert_eq!(
+            resp_header[0], b'E',
+            "expected ErrorResponse (simple query not yet implemented), not a closed connection"
+        );
+    }
 }

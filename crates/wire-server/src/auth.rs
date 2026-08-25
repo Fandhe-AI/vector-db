@@ -480,4 +480,52 @@ mod tests {
         assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
         let _ = std::fs::remove_file(&path);
     }
+
+    /// レビュー指摘の再現ケース: hash フィールドが decode 後
+    /// `argon2id::MAX_HASH_LEN`（64 バイト）を超える PHC を起動時に拒否すること
+    /// （上限がないと、認証試行のたびに大きな出力バッファを確保し続ける経路になる）。
+    #[test]
+    fn load_from_file_rejects_hash_longer_than_max_hash_len() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_oversized_hash.txt");
+        // "AAAAAAAAAAAAAAAAAAAAAA" は 16 バイト（下限 8 バイト以上）の有効な salt。
+        // 87 文字の 'A' は 65 バイト（上限 64 バイトを 1 バイト超える）に decode
+        // される hash フィールド。salt は有効値にして hash 上限の検証だけを分離する。
+        let oversized_hash = "A".repeat(87);
+        std::fs::write(
+            &path,
+            format!(
+                "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA${oversized_hash}\n"
+            ),
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// レビュー指摘の再現ケース: salt フィールドが decode 後
+    /// `argon2id::MAX_SALT_LEN`（64 バイト）を超える PHC を起動時に拒否すること
+    /// （hash 上限と同じ形のリソース消費経路。上限がないと `compute_h0` が認証試行の
+    /// たびに大きな `Vec` を確保し続ける）。
+    #[test]
+    fn load_from_file_rejects_salt_longer_than_max_salt_len() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_oversized_salt.txt");
+        // 87 文字の 'A' は 65 バイト（上限 64 バイトを 1 バイト超える）に decode
+        // される salt フィールド。"aGFzaA" は "hash"（4 バイト、下限以上上限以下）に
+        // decode される有効な hash。hash は有効値にして salt 上限の検証だけを
+        // 分離する。
+        let oversized_salt = "A".repeat(87);
+        std::fs::write(
+            &path,
+            format!("alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1${oversized_salt}$aGFzaA\n"),
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
 }

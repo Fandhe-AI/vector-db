@@ -54,6 +54,25 @@ pub const MAX_P_COST: u32 = 64;
 pub const MAX_TOTAL_WORK_KIB: u64 =
     (RECOMMENDED_PARAMS.m_cost_kib as u64) * (RECOMMENDED_PARAMS.t_cost as u64) * 20;
 
+/// PHC の hash フィールド（decode 後バイト長）の上限。この実装が生成する形式
+/// （[`encode_phc`]）は常に 32 バイトだが、hash 長は decode 後の untrusted 値であり
+/// `verify_phc` はそれをそのまま `hash_raw` の `out_len` として渡す。上限がないと、
+/// 認証試行のたびに [`h_prime`]（可変長ハッシュ関数。`out_len` に比例した `Vec` を
+/// 確保して繰り返しハッシュする）へ大きな出力長を渡し続けることになり、m_cost と
+/// 同様にメモリ/CPU を消費し続ける経路になる（review 指摘）。生成形式の 2 倍の余裕
+/// （64 バイト）を上限とし、これを超える PHC は起動時に fail-closed で拒否する。
+pub const MAX_HASH_LEN: usize = 64;
+
+/// PHC の salt フィールド（decode 後バイト長）の上限。[`generate_salt`] が生成する
+/// のは 16 バイトだが、salt も hash と同じく decode 後の untrusted 値であり、
+/// `compute_h0` は認証試行のたびに `salt.len()` に比例した `Vec` を確保する
+/// （`hash_raw` の呼び出し経路上、salt 長を検証せずに通すと hash 長と同じ形の
+/// リソース消費経路になる。review 指摘）。[`MAX_HASH_LEN`] と同じ 64 バイトを
+/// 上限とし、これを超える PHC は起動時に fail-closed で拒否する。
+///
+/// [`generate_salt`]: super::generate_salt
+pub const MAX_SALT_LEN: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Argon2Error {
     /// メモリ量がレーン数に対して小さすぎる（RFC 9106: m は 8*p 以上必須）。
@@ -638,10 +657,17 @@ pub fn parse_phc(phc: &str) -> Result<(Params, Vec<u8>, Vec<u8>), Argon2Error> {
     // （毎回の認証試行時）で `hash_raw` が `InvalidParam` を返し続けて恒久的な
     // ログイン不能を招く（fail-closed だが検出が遅すぎるレビュー指摘）。
     //
-    // salt は RFC 9106 §3.1 の推奨下限（8 バイト以上）を decode 後に検証する。
-    // 空 salt だけを拒否していると、8 バイト未満の弱い salt を含む構文的に正しい
-    // PHC が起動時ロードを通過してしまう（review 指摘）。
-    if salt.len() < 8 || hash.len() < 4 {
+    // salt は RFC 9106 §3.1 の推奨下限（8 バイト以上）に加え上限（[`MAX_SALT_LEN`]）
+    // も decode 後に検証する。空 salt だけを拒否していると、8 バイト未満の弱い salt
+    // を含む構文的に正しい PHC が起動時ロードを通過してしまう（review 指摘）。上限が
+    // ないと、`compute_h0` が認証試行のたびに `salt.len()` に比例した `Vec` を
+    // 確保し続ける（hash と同じ形のリソース消費経路。review 指摘）。
+    //
+    // hash も下限（4 バイト）に加え上限（[`MAX_HASH_LEN`]）を検証する。上限がないと
+    // 巨大な hash フィールドを持つ構文的に正しい PHC が起動時ロードを通過し、
+    // 認証試行のたびに `hash_raw`/`h_prime` が大きな出力バッファを確保し続ける
+    // （review 指摘。m_cost 同様のリソース消費経路）。
+    if salt.len() < 8 || salt.len() > MAX_SALT_LEN || hash.len() < 4 || hash.len() > MAX_HASH_LEN {
         return Err(Argon2Error::MalformedPhc);
     }
     Ok((params, salt, hash))
@@ -774,6 +800,48 @@ mod tests {
         let hash = b64_encode(&[0u8; 32]); // 32 バイトの有効な hash
         let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
         assert_eq!(parse_phc(&phc), Err(Argon2Error::MalformedPhc));
+    }
+
+    /// レビュー指摘の再現ケース: hash フィールドが decode 後 [`MAX_HASH_LEN`]
+    /// （64 バイト）を超える PHC を `parse_phc` 単体で拒否すること。salt は下限以上の
+    /// 有効値にし、hash 上限のチェックだけを分離してピン留めする。
+    #[test]
+    fn parse_phc_rejects_hash_longer_than_max_hash_len() {
+        let salt = b64_encode(&[0u8; 16]);
+        let hash = b64_encode(&[0u8; MAX_HASH_LEN + 1]); // 上限を 1 バイト超える hash
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert_eq!(parse_phc(&phc), Err(Argon2Error::MalformedPhc));
+    }
+
+    /// hash 長がちょうど [`MAX_HASH_LEN`] のときは受理されること（境界の許容側を
+    /// 明示し、上限チェックが `>` であって `>=` ではないことをテストで固定する）。
+    #[test]
+    fn parse_phc_accepts_hash_at_max_hash_len_boundary() {
+        let salt = b64_encode(&[0u8; 16]);
+        let hash = b64_encode(&[0u8; MAX_HASH_LEN]);
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert!(parse_phc(&phc).is_ok());
+    }
+
+    /// レビュー指摘の再現ケース: salt フィールドが decode 後 [`MAX_SALT_LEN`]
+    /// （64 バイト）を超える PHC を `parse_phc` 単体で拒否すること。hash は下限以上
+    /// 上限以下の有効値にし、salt 上限のチェックだけを分離してピン留めする。
+    #[test]
+    fn parse_phc_rejects_salt_longer_than_max_salt_len() {
+        let salt = b64_encode(&[0u8; MAX_SALT_LEN + 1]); // 上限を 1 バイト超える salt
+        let hash = b64_encode(&[0u8; 32]);
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert_eq!(parse_phc(&phc), Err(Argon2Error::MalformedPhc));
+    }
+
+    /// salt 長がちょうど [`MAX_SALT_LEN`] のときは受理されること（境界の許容側を
+    /// 明示し、上限チェックが `>` であって `>=` ではないことをテストで固定する）。
+    #[test]
+    fn parse_phc_accepts_salt_at_max_salt_len_boundary() {
+        let salt = b64_encode(&[0u8; MAX_SALT_LEN]);
+        let hash = b64_encode(&[0u8; 32]);
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert!(parse_phc(&phc).is_ok());
     }
 
     #[test]

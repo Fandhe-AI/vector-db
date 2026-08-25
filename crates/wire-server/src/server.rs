@@ -5,10 +5,11 @@
 //! 防御（loopback 限定・同時接続数上限・I/O タイムアウト）に限り、wire プロトコル
 //! そのものの解釈は [`crate::handshake::handle_connection`] に委譲する。
 //!
-//! 対応: TASK-67 の review 是正（P0 2 件）。TLS（TASK-72・WIRE-9）が実装されるまで
-//! 非ループバック bind を拒否し、Slowloris 対策として接続数上限・I/O タイムアウトを
-//! 課す。本格的な接続ライフサイクル管理（段階的タイムアウト・ヘルスチェック等）は
-//! TASK-69（WIRE-8）の管轄であり、本モジュールは暫定の防御的デフォルトに留める。
+//! 対応: TASK-67 の review 是正。TLS（TASK-72・WIRE-9）が実装されるまで非ループバック
+//! bind を拒否し（[`bind_loopback`]）、Slowloris 対策として認証前フェーズに限り
+//! 接続数上限・I/O タイムアウトを課す（[`accept_loop`]）。本格的な接続ライフサイクル
+//! 管理（段階的タイムアウト・ヘルスチェック・認証後アイドル管理等）は TASK-69
+//! （WIRE-8）の管轄であり、本モジュールは暫定の防御的デフォルトに留める。
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -22,17 +23,26 @@ use crate::auth::UserStore;
 /// テナント単位の細分化は TASK-69 の管轄。
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
-/// 認証前・認証後のメッセージ受信いずれの読み取り・書き込みにも設ける I/O 期限
-/// （Slowloris 対策: StartupMessage 等を送らない/受け取らない接続がスレッドと
-/// 接続枠を無期限に占有するのを防ぐ）。正当な操作を妨げない範囲で保守的な値とし、
-/// フェーズ別のきめ細かい期限設計は TASK-69 の管轄。
+/// **認証前**（StartupMessage 受信〜認証応答完了まで）にのみ課す読み取り・書き込みの
+/// I/O 期限（Slowloris 対策: StartupMessage 等を送らない/受け取らない接続がスレッドと
+/// 接続枠を無期限に占有するのを防ぐ）。認証成功後は
+/// [`crate::handshake::handle_connection`] がこのタイムアウトを解除する
+/// （対話的クライアント・コネクションプールの正当なアイドルを切断しないため。
+/// review 指摘）。認証後のセッション生存期間管理（keepalive・アイドルタイムアウト等）
+/// は TASK-69（WIRE-8）の管轄。
 pub const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `bind_addr` が解決するすべてのアドレスが loopback であることを検証する。
-/// TLS（TASK-72・WIRE-9）が実装されるまで、cleartext password 認証の平文パスワードを
-/// 非ループバックの通信路へ公開しない（fail-closed。`main.rs::run_server` が
-/// `TcpListener::bind` の前に呼ぶ）。
-pub fn validate_loopback_bind(bind_addr: &str) -> Result<(), String> {
+/// `bind_addr` を解決し、すべてのアドレスが loopback であることを検証したうえで
+/// 解決済みの [`SocketAddr`] 列を返す。TLS（TASK-72・WIRE-9）が実装されるまで、
+/// cleartext password 認証の平文パスワードを非ループバックの通信路へ公開しない
+/// （fail-closed）。
+///
+/// 呼び出し元は返り値の `SocketAddr`（数値アドレス）へ直接 bind すること。
+/// `bind_addr`（文字列）を検証後に再度 `TcpListener::bind` へ渡すと、ホスト名の
+/// 場合は DNS 解決がもう一度走り、検証時と bind 時で異なるアドレスへ解決される
+/// TOCTOU（検証時 loopback・bind 時に外部アドレス）が成立しうる（review 指摘）。
+/// [`bind_loopback`] がこの契約を守った単一の入口を提供する。
+fn validate_loopback_bind(bind_addr: &str) -> Result<Vec<SocketAddr>, String> {
     let addrs: Vec<SocketAddr> = bind_addr
         .to_socket_addrs()
         .map_err(|e| format!("cannot resolve bind address {bind_addr}: {e}"))?
@@ -52,7 +62,19 @@ pub fn validate_loopback_bind(bind_addr: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(addrs)
+}
+
+/// `bind_addr` の loopback 検証と実際の bind を 1 つの入口にまとめる。
+/// `main.rs::run_server` はこの関数だけを呼び、`TcpListener::bind` を直接
+/// 呼ばない（[`validate_loopback_bind`] のドキュメント参照。文字列の再解決による
+/// TOCTOU を構造的に作らないための唯一の bind 経路とする）。
+pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
+    let addrs = validate_loopback_bind(bind_addr)?;
+    // `&[SocketAddr]` も `ToSocketAddrs` を実装するが、これは単に列挙を返すだけで
+    // DNS 解決は発生しない（数値アドレスなので再解決の余地がない）。
+    TcpListener::bind(addrs.as_slice())
+        .map_err(|e| format!("failed to bind {bind_addr} ({addrs:?}): {e}"))
 }
 
 /// 同時接続数の枠 1 つぶんの所有権。`Drop` で確実に解放する（RAII。早期 return や
@@ -162,7 +184,9 @@ mod tests {
 
     #[test]
     fn validate_loopback_bind_accepts_loopback_addresses() {
-        assert!(validate_loopback_bind("127.0.0.1:0").is_ok());
+        let addrs = validate_loopback_bind("127.0.0.1:0").expect("loopback address accepted");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()));
         assert!(validate_loopback_bind("localhost:0").is_ok());
     }
 
@@ -172,6 +196,29 @@ mod tests {
         assert!(result.is_err());
         let msg = result.expect_err("must be rejected");
         assert!(msg.contains("TLS"), "message should explain why: {msg}");
+    }
+
+    /// レビュー指摘の再現ケース（TOCTOU）: `bind_loopback` は検証済みの数値
+    /// `SocketAddr` へ直接 bind し、返された listener は実際に接続を受理できる
+    /// こと（`bind_addr` 文字列を再度 `TcpListener::bind` へ渡す経路が残っていない
+    /// ことの外形的確認）。
+    #[test]
+    fn bind_loopback_binds_to_validated_addr_and_accepts_connections() {
+        let listener = bind_loopback("127.0.0.1:0").expect("loopback bind must succeed");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(addr.ip().is_loopback());
+
+        let client = TcpStream::connect(addr).expect("connect to bound listener");
+        let (_accepted, _peer) = listener.accept().expect("listener must accept connection");
+        drop(client);
+    }
+
+    /// レビュー指摘の再現ケース: 非ループバックアドレスは bind 自体が行われず
+    /// `Err` になること（`validate_loopback_bind` 単体テストの外形確認）。
+    #[test]
+    fn bind_loopback_rejects_non_loopback_address() {
+        let result = bind_loopback("0.0.0.0:0");
+        assert!(result.is_err());
     }
 
     /// 枠の取得・解放（RAII）がネットワークを介さず単体で検証できること。

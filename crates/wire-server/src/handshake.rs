@@ -393,6 +393,15 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
             Ok(())
         }
         Ok(_ctx) => {
+            // `server::accept_loop` が認証前フェーズの Slowloris 対策として設定した
+            // I/O タイムアウトを解除する。認証成功後もタイムアウトを残すと、対話的
+            // クライアント・コネクションプールの正当なアイドル（数十秒〜）が切断
+            // される（review 指摘）。認証前の接続数上限・タイムアウトによる防御は
+            // ここまでで役目を終えており、認証後のセッション生存期間管理
+            // （keepalive・アイドルタイムアウト等）は TASK-69（WIRE-8）の管轄とする。
+            stream.set_read_timeout(None)?;
+            stream.set_write_timeout(None)?;
+
             write_authentication_ok(&mut stream)?;
             // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
             // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。

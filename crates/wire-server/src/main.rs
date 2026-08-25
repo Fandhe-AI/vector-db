@@ -10,13 +10,13 @@
 //! ログ・引数に残さない）。
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
-//! `--bind` は [`wire_server::server::validate_loopback_bind`] により非ループバック
-//! アドレスを起動時に fail-closed で拒否する（TLS 未実装のうちは平文パスワードを
-//! 非ループバックへ公開しない。review 是正）。接続数上限・I/O タイムアウトは
+//! `--bind` は [`wire_server::server::bind_loopback`] により非ループバックアドレスを
+//! 起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind する
+//! （TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
+//! 再解決による TOCTOU も作らない。review 是正）。接続数上限・認証前 I/O タイムアウトは
 //! [`wire_server::server::accept_loop`] が課す。本格的な接続管理・bind 方式の
 //! 拡張は TASK-69・TASK-70 の管轄。
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -72,11 +72,6 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    if let Err(msg) = server::validate_loopback_bind(&bind_addr) {
-        eprintln!("wire-server: {msg}");
-        return ExitCode::FAILURE;
-    }
-
     let store = match UserStore::load_from_file(&users_path) {
         Ok(s) => s,
         Err(e) => {
@@ -86,10 +81,13 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     let store = Arc::new(store);
 
-    let listener = match TcpListener::bind(&bind_addr) {
+    // `server::bind_loopback` は loopback 検証と bind を単一の入口にまとめており、
+    // `bind_addr`（文字列）を別途 `TcpListener::bind` へ渡すことはしない
+    // （検証時と bind 時で DNS 再解決が起きる TOCTOU を作らないため。review 指摘）。
+    let listener = match server::bind_loopback(&bind_addr) {
         Ok(l) => l,
-        Err(e) => {
-            eprintln!("wire-server: failed to bind {bind_addr}: {e}");
+        Err(msg) => {
+            eprintln!("wire-server: {msg}");
             return ExitCode::FAILURE;
         }
     };
