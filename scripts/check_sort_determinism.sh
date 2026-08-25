@@ -69,7 +69,10 @@ fi
 #      （`\s*` はマスク後の空白へそのまま一致するため、ブロックコメントを挟んだ
 #      呼び出しも 1 つの正規表現でまたいで検知できる）。
 #   2. マスク後のテキストに対して API 呼び出しパターンを走査する（API 名と
-#      `(` の間の改行・空白を許容する `\s*`。2 回目の codex-review P1 指摘対応）。
+#      `(` の間の改行・空白を許容する `\s*`。2 回目の codex-review P1 指摘対応）に加え、
+#      turbofish 付き呼び出し（`sort_unstable_by::<_>(...)` 等）の API 名と `(` の
+#      間に挟まる `::<...>` も許容する（3 回目の codex-review P1 指摘対応。中身は
+#      `[^>]*` で単一行・複数行いずれのネストなし turbofish もマッチする）。
 #      `// sort-determinism: allow ...` 許可マーカーの判定は、マーカー自体が
 #      コメント中にしか書けないため、マスク前の元テキスト（`@lines`）を参照する。
 #
@@ -177,7 +180,7 @@ scan_dir() {
         push @lineno_of_pos, ($ln) x length($text);
         $joined .= $text;
       }
-      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*\(/gs) {
+      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*(?:::\s*<[^>]*>\s*)?\(/gs) {
         my $start_ln = $lineno_of_pos[$-[0]];
         my $end_ln = $lineno_of_pos[$+[0] - 1] // $start_ln;
         my $allowed = 0;
@@ -252,6 +255,25 @@ fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by(|a, b| a.cmp(b));
 }
 EOF
+  # fixture 11: 検知すべきケース（turbofish 付き呼び出し・単一行。
+  # `sort_unstable_by::<_>(...)` のように API 名と `(` の間に `::<...>` が
+  # 挟まる形式は Rust として有効だが、`\s*\(` のみの旧パターンでは検知漏れに
+  # なっていたという 3 回目の codex-review P1 指摘の再現ケース）。
+  cat >"${tmp}/detect_turbofish.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by::<_>(|a, b| a.cmp(b));
+}
+EOF
+  # fixture 12: 検知すべきケース（turbofish 付き呼び出し・複数引数の
+  # ジェネリクスかつ複数行）。
+  cat >"${tmp}/detect_turbofish_multiline.rs" <<'EOF'
+fn f(v: &mut [(i32, i32)]) {
+    v.select_nth_unstable_by_key::<_, _>(
+        0,
+        |x| x.0,
+    );
+}
+EOF
   # fixture 3: 検知してはならないケース（コメント行・許可マーカー・整数の
   # sort_unstable（引数なし、パターン対象外）・文字列全体としての言及）。
   cat >"${tmp}/allowed.rs" <<'EOF'
@@ -318,6 +340,14 @@ EOF
   fi
   if ! printf '%s\n' "${local_detected}" | grep -q "detect_after_string_continuation.rs.*sort_unstable_by"; then
     echo "FAIL: self-test did not detect sort_unstable_by after a string literal with a line-continuation escape in detect_after_string_continuation.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_turbofish.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect turbofish-qualified sort_unstable_by::<_>(...) in detect_turbofish.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_turbofish_multiline.rs.*select_nth_unstable_by_key"; then
+    echo "FAIL: self-test did not detect multiline turbofish-qualified select_nth_unstable_by_key::<_, _>(...) in detect_turbofish_multiline.rs" >&2
     failed=1
   fi
   if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs"; then
