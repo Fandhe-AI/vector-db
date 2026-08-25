@@ -633,7 +633,13 @@ pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
 /// （ヘッダのみ）の両方がこの関数を呼ぶ。ロジックを 1 箇所に集約することで、
 /// 検証条件（`tenant_len` 上限・UTF-8・空文字列拒否等）が両者で食い違わないようにする。
 /// 成功時は `(tenant_id, visibility, visibility バイトの直後のオフセット)` を返す。
-fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
+///
+/// `tenant_id` は `buf` を借用した `&str`（所有化しない）。呼び出し元は `buf` の
+/// 生存期間中のみこの値を参照できる。ヘッダ比較（可視性判定）の経路を行ごとの
+/// ヒープアロケーションなしで処理するための設計（Issue #174。PR #151 の性能
+/// フォローアップ）。行を所有化して保持する必要がある場合（[`decode_row`] が
+/// `Row` を構築する場合）は、呼び出し元が明示的に `.to_string()` する。
+fn decode_row_header(buf: &[u8]) -> Result<(&str, Visibility, usize)> {
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
@@ -675,8 +681,7 @@ fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
         ));
     }
     let tenant_id = std::str::from_utf8(tenant_bytes)
-        .map_err(|_| StorageError::Codec("tenant_id is not valid UTF-8".to_string()))?
-        .to_string();
+        .map_err(|_| StorageError::Codec("tenant_id is not valid UTF-8".to_string()))?;
     offset = tenant_end;
 
     let visibility_byte = *buf.get(offset).ok_or_else(|| {
@@ -704,7 +709,11 @@ fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
 /// 可視性を判定できない場合は、`decode_row_header` と同じ理由で `Err` を返す
 /// （呼び出し元はこの行を「不可視だからスキップ」とは判断できないため fail-closed。
 /// `arena.rs` 側のドキュメント参照）。
-pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(String, Visibility)> {
+///
+/// `tenant_id` は `buf` を借用した `&str`（[`decode_row_header`] 参照）。ヘッダ比較
+/// のみを行う呼び出し元（`PolicyContext::is_visible` への受け渡し）は借用のまま
+/// 完結するため、この経路は行ごとのヒープアロケーションを伴わない（Issue #174）。
+pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visibility)> {
     let (tenant_id, visibility, _offset_after_header) = decode_row_header(buf)?;
     Ok((tenant_id, visibility))
 }
@@ -789,7 +798,7 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 
     Ok(Row {
         id,
-        tenant_id,
+        tenant_id: tenant_id.to_string(),
         visibility,
         embedding,
         metadata: metadata_bytes.to_vec(),
@@ -967,6 +976,98 @@ mod tests {
             metadata: &huge,
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_row_tenant_and_visibility_matches_full_decode_header() {
+        // ヘッダのみ decode（本 PR で借用 &str 化した経路）が、フル decode の
+        // Row.tenant_id / Row.visibility と常に一致することを示す同等性テスト
+        // （Issue #174: 借用化で判定結果が変わっていないことの担保）。
+        let cases: &[(&str, Visibility)] = &[
+            ("tenant-a", Visibility::Public),
+            ("tenant-b", Visibility::Private),
+            ("テナント-あ", Visibility::Public), // マルチバイト UTF-8
+            (
+                "t".repeat(MAX_TENANT_ID_LEN as usize).leak(),
+                Visibility::Private,
+            ), // 上限ちょうど
+        ];
+        for &(tenant_id, visibility) in cases {
+            let buf = sample_row_with_rls(tenant_id, visibility, &[1.0, 2.0], b"meta");
+            let (header_tenant, header_visibility) =
+                decode_row_tenant_and_visibility(&buf).unwrap();
+            let row = decode_row(1, &buf).unwrap();
+            assert_eq!(header_tenant, row.tenant_id);
+            assert_eq!(header_visibility, row.visibility);
+        }
+    }
+
+    #[test]
+    fn decode_row_tenant_and_visibility_borrows_from_input_buffer() {
+        // 返却 &str が buf そのものを指すこと（コピーでなく借用であること）を
+        // ポインタ範囲と長さで確認する（Issue #174: ヘッダ比較経路の非アロケーション化の
+        // 決定的な証明。#[global_allocator] によるカウントは並列テスト下で非決定的になり
+        // やすく依存追加も避けたいため採用しない）。
+        let buf = sample_row_with_rls("tenant-a", Visibility::Public, &[1.0], b"m");
+        let (tenant_id, _visibility) = decode_row_tenant_and_visibility(&buf).unwrap();
+        let buf_range = buf.as_ptr_range();
+        assert!(buf_range.contains(&tenant_id.as_ptr()));
+        assert_eq!(tenant_id.len(), "tenant-a".len());
+    }
+
+    #[test]
+    fn decode_row_tenant_and_visibility_fails_closed_on_same_header_corruptions_as_decode_row() {
+        // ヘッダ破損時、ヘッダのみ decode とフル decode の両方が Err を返すこと
+        // （fail-closed の契約が借用化後も維持されていることの確認。Issue #174）。
+        let corrupt_cases: Vec<Vec<u8>> = vec![
+            Vec::new(), // 空バッファ
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                buf[0] = 0xFF; // 未知版数
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let oversized = MAX_TENANT_ID_LEN + 1;
+                buf[1..3].copy_from_slice(&oversized.to_le_bytes()); // tenant_len 上限超過
+                buf
+            },
+            {
+                // ヘッダ領域自体（visibility バイトの直前）で切り詰める。末尾（dim/metadata）
+                // のみの切り詰めはヘッダのみ decode の成否に影響しないため、ヘッダ decode も
+                // 失敗させるにはヘッダ領域内で切り詰める必要がある。
+                let buf = sample_row(&[1.0], b"m");
+                let visibility_offset = 1 + 2 + "tenant-a".len();
+                buf[..visibility_offset].to_vec()
+            },
+            {
+                let mut buf = Vec::new();
+                buf.push(ROW_FORMAT_VERSION);
+                buf.extend_from_slice(&0u16.to_le_bytes()); // tenant_len = 0（空 tenant_id）
+                buf.push(Visibility::Public.to_byte());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let tenant_start = 1 + 2;
+                buf[tenant_start] = 0xFF; // 非 UTF-8
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let visibility_offset = 1 + 2 + "tenant-a".len();
+                buf[visibility_offset] = 0xFF; // 未知 visibility バイト
+                buf
+            },
+        ];
+        for buf in corrupt_cases {
+            let header_result = decode_row_tenant_and_visibility(&buf);
+            let full_result = decode_row(1, &buf);
+            assert!(header_result.is_err(), "header decode should fail-closed");
+            assert!(full_result.is_err(), "full decode should fail-closed");
+        }
     }
 
     /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
