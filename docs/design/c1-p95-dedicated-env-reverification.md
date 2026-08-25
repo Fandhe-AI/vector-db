@@ -18,9 +18,9 @@ Top-k）の p95 レイテンシを他プロセスと共有しない専有環境�
 過去の PoC 実測値そのものは spec が SSOT であり、本ドキュメントへは転記しない
 （`.claude/rules/spec-confidentiality.md`）。
 
-2026-08-22 改訂で TASK-158（性能計測プロトコル基盤 `crates/engine/benches/harness/`）
-を必ず経由して計測する契約が追加された（warmup 20 回以上・計測 20 回以上・中央値＋
-Q1/Q3・決定的シード RNG・interleaved A/B）。
+TASK-158（性能計測プロトコル基盤 `crates/engine/benches/harness/`）の契約
+（warmup 20 回以上・計測 20 回以上・中央値＋Q1/Q3・決定的シード RNG・interleaved A/B）
+に従って計測する。
 
 既存 `benches/parallel_bench.rs`（TASK-127）は `SearchProvider` を直接叩く provider
 単体の p95 であり、`EngineCore::execute_sql`（SQL 表層。`sql::exec::execute_statement`）

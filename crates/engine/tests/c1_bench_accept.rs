@@ -208,13 +208,19 @@ mod e2e {
 // --- EnvReport ---
 
 #[test]
-fn env_report_capture_does_not_panic_and_has_at_least_one_logical_cpu() {
+fn env_report_capture_does_not_panic_and_renders_logical_cpus_consistently() {
     let report = EnvReport::capture("scalar");
-    // `report.logical_cpus >= 1 || report.logical_cpus == 0` は `usize` の全値域を
-    // covering するトートロジーになってしまうため、テスト名が意図する「論理コア数は
-    // 最低 1」を実際に検証する条件だけを残す。
-    assert!(report.logical_cpus >= 1);
+    // `EnvReport::capture` は `std::thread::available_parallelism()` 失敗時に
+    // `logical_cpus == 0`（fail-closed で「不明」を表す）を返す契約なので、
+    // `>= 1` を固定で要求しない。ここでは capture がパニックしないことと、
+    // `Display` が契約どおり `0` を "unavailable" として描画する（それ以外は
+    // 実際の論理コア数を描画する）ことを検証する。
     let rendered = format!("{report}");
     assert!(!rendered.is_empty());
     assert!(rendered.contains("os="));
+    if report.logical_cpus == 0 {
+        assert!(rendered.contains("logical_cpus=unavailable"));
+    } else {
+        assert!(rendered.contains(&format!("logical_cpus={}", report.logical_cpus)));
+    }
 }
