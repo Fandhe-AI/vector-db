@@ -138,7 +138,7 @@ fn set_search_mode_recall_then_select_resolves_to_session_variable() {
 }
 
 #[test]
-fn set_search_mode_precision_gates_select_execution_but_allows_bind() {
+fn set_search_mode_precision_gates_select_execution_to_confidence_filtered_results() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
@@ -148,14 +148,17 @@ fn set_search_mode_precision_gates_select_execution_but_allows_bind() {
         .expect("SET search_mode = 'precision' should succeed");
     assert_eq!(outcome, SqlOutcome::SetSearchMode(SearchMode::Precision));
 
-    // TASK-161（SQL-12）は `precision` の構文・優先順位解決までを担い、実行契約
-    // （確信度判定・空集合 fail-closed 応答）は TASK-162・SEARCH-9 の管轄。実行時は
-    // `recall` 相当の結果を `precision` の名の下に返す fail-open を避けるため
-    // `22000`（構文上受理された値が実行不能）で拒否する。
-    let err = core
+    // TASK-162（SEARCH-9）: `precision` は候補生成（`recall` と共通）の結果へ確信度
+    // 判定を適用する。本コーパス（cosine(query, id1)=1.0／cosine(query, id2)≈0.994／
+    // cosine(query, id3)=0.0）は Top-1・Top-2 のマージンが既定閾値（0.05）未満のため
+    // 空集合（0 行）の**通常応答**として返る（エラーではない。fail-closed）。
+    let outcome = core
         .execute_sql_in_session(&ctx, &mut session, SELECT_NO_MODE)
-        .expect_err("precision execution should be rejected until TASK-162 lands");
-    assert_eq!(err.wire_code(), "22000");
+        .expect("precision execution must succeed with an empty result, not an error");
+    match outcome {
+        SqlOutcome::Query(result) => assert!(result.rows.is_empty()),
+        other => panic!("expected SqlOutcome::Query, got {other:?}"),
+    }
 }
 
 // --- 4〜5. クエリ句とセッション変数の優先順位 -------------------------------------
@@ -177,19 +180,26 @@ fn query_clause_recall_wins_over_session_precision() {
 }
 
 #[test]
-fn query_clause_precision_wins_over_session_recall_and_is_rejected_at_execution() {
+fn query_clause_precision_wins_over_session_recall_and_applies_confidence_gate() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
     core.execute_sql_in_session(&ctx, &mut session, "SET search_mode = 'recall'")
         .expect("SET should succeed");
 
+    // `USING MODE 'precision'` がセッション変数 `recall` に優先し（TASK-161・SQL-12
+    // が担う優先順位解決）、実行契約（TASK-162・SEARCH-9）が適用される。本コーパスは
+    // マージン不足のため空集合（0 行）の通常応答になる（`recall` へ黙ってフォール
+    // バックしない。フォールバックすると 3 行返り、この検査で区別できる）。
     let sql =
         "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 3 USING MODE 'precision'";
-    let err = core
+    let outcome = core
         .execute_sql_in_session(&ctx, &mut session, sql)
-        .expect_err("query clause must win over session variable, not silently fall back");
-    assert_eq!(err.wire_code(), "22000");
+        .expect("query clause 'precision' must win over session 'recall' and succeed");
+    match outcome {
+        SqlOutcome::Query(result) => assert!(result.rows.is_empty()),
+        other => panic!("expected SqlOutcome::Query, got {other:?}"),
+    }
 }
 
 // --- 6. 失敗した SET はセッションを変更しない -------------------------------------
@@ -320,20 +330,24 @@ fn stateless_execute_sql_still_resolves_default_recall_mode() {
 // --- 10. 決定性 ---------------------------------------------------------------------
 
 #[test]
-fn same_input_yields_same_wire_code_across_repeated_calls() {
+fn same_input_yields_same_result_across_repeated_calls() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let mut session = SessionState::default();
     let sql =
         "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 3 USING MODE 'precision'";
 
-    let first = core
-        .execute_sql_in_session(&ctx, &mut session, sql)
-        .expect_err("precision execution should be rejected")
-        .wire_code();
-    let second = core
-        .execute_sql_in_session(&ctx, &mut session, sql)
-        .expect_err("precision execution should be rejected")
-        .wire_code();
+    let extract_ids = |core: &EngineCore, session: &mut SessionState| -> Vec<u64> {
+        match core
+            .execute_sql_in_session(&ctx, session, sql)
+            .expect("precision execution should succeed")
+        {
+            SqlOutcome::Query(result) => result.rows.iter().map(|r| r.id).collect(),
+            other => panic!("expected SqlOutcome::Query, got {other:?}"),
+        }
+    };
+
+    let first = extract_ids(&core, &mut session);
+    let second = extract_ids(&core, &mut session);
     assert_eq!(first, second);
 }

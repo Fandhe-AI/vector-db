@@ -13,6 +13,7 @@ pub mod isa;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
+pub mod precision;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
