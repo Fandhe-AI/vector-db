@@ -53,7 +53,9 @@
 //! `dispatch.rs::select_execution_path` という副作用なしの決定表 1 箇所へ集約する。
 //! 経路を外部から上書きする機構は設けない（CORE-12。詳細は `dispatch.rs` の
 //! モジュールドキュメント参照）。上記各モジュールから `select_execution_path` を
-//! 実際に呼び出す配線は後続タスクの管轄（本タスク時点では未接続）。
+//! 実際に呼び出す配線は後続タスクの管轄（本タスク時点では未接続。単発クエリ経路の
+//! provider 不在・dim 検証上限の不一致、バッチ経路のキュー層不在という具体的な
+//! 阻害要因は `dispatch.rs`・`batch_fallback.rs` のモジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;

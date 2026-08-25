@@ -19,6 +19,30 @@
 //! 責務分担になる設計だが、`select_execution_path` から本モジュールを実際に呼び出す
 //! 配線は後続タスクの管轄（本タスク時点では未接続）。
 //!
+//! # 実配線調査で判明した阻害要因（TASK-155 レビュー起因）
+//!
+//! [`FallbackBatchEngine::batch_search`] の冒頭で `select_execution_path` を呼び、
+//! 単発クエリ（`batch_size == 1`）を CPU-SIMD 経路へ直行させる配線を試作したが、
+//! 以下の理由で安全に導入できないことを確認した:
+//!
+//! - `select_execution_path` の `pending_after_pop` 入力（動的窓判定用）を供給する
+//!   キュー層が存在しない。`batch_search.rs::should_aggregate_into_batch` は
+//!   `dispatch.rs` とテストからのみ呼ばれ、本番の呼び出し元を持たない
+//!   （`batch_search.rs::DynamicWindowAggregator` も同様に本番の呼び出し元なし）。
+//!   そのため本メソッドの呼び出しが実際には集約済みバッチの一部（単発 1 件に
+//!   見えても動的窓に入るはずだった呼び出し）であっても区別できない。
+//! - 上記の制約下で `pending_after_pop: false` 固定にして単発クエリを primary
+//!   未到達にすると、`revalidate_primary_hits`・恒久故障ラッチ等の primary 実行
+//!   経路を単発クエリのバッチで検証しているテスト群（`revalidation_rejects_*`・
+//!   `runtime_error_latches_after_first_failure_and_stops_retrying_primary`・
+//!   `input_errors_from_primary_are_not_treated_as_fallback_trigger` 等、
+//!   `cargo test -p engine --lib batch_fallback` で 26 件中 12 件）が primary
+//!   未呼び出しのため意図した障害注入を検証できなくなり red になることを実測で
+//!   確認した。
+//!
+//! キュー層（`pending_after_pop` を実データで供給する上位呼び出し元）の追加と、
+//! 上記テスト群の複数クエリバッチへの書き換えをセットで行う後続タスクの管轄とする。
+//!
 //! [`BatchBackend`] は将来の実 GPU/外部実装が差し込まれる公開差し替え点であり、
 //! `Ok` を返した場合でも [`FallbackBatchEngine`] はその内容を無条件に信頼しない
 //! （codex-review P0 指摘対応・PR #152）。primary が成功を返しても、

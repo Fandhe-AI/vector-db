@@ -9,6 +9,27 @@
 //! バッチ実行経路）は、実行前にここへ入力を渡して経路を確定してから、
 //! 対応する provider・エンジンを構築・実行する想定である。
 //!
+//! # 実配線調査で判明した具体的な阻害要因（未接続のまま。TASK-155 レビュー起因）
+//!
+//! 単発クエリ経路（`core.rs::EngineCore::open`・`search_engine.rs`、CORE-9）への配線を
+//! 試みたが、以下 2 点により安全に接続できないことを確認した:
+//!
+//! - `kernel.rs` が提供する provider は現状 `CpuScalarProvider`／
+//!   `ParallelSearchProvider`（スレッド構成の違いのみで、ISA 別の SIMD 幅・GPU 実装を
+//!   持たない）に限られ、本モジュールが返す `ExecutionPath::CpuSimd { width }`／
+//!   `ExecutionPath::Gpu` を実際に分岐させる先が存在しない。
+//! - `dim` の検証上限が不一致（[`DispatchInput::dim`] のドキュメント参照）。本モジュールは
+//!   `batch_search::MAX_BATCH_DIM`（8_192）を使うが、単発クエリ経路は独立してより大きい
+//!   `storage::MAX_EMBEDDING_DIM`（65_536）で検証しており、そのまま接続すると
+//!   現在成功している 8_193〜65_536 次元のクエリを誤って拒否する。
+//!
+//! `batch_fallback.rs::FallbackBatchEngine::batch_search` への配線も試みたが、
+//! こちらも安全に接続できないことを確認した（詳細は `batch_fallback.rs` モジュール
+//! ドキュメントの「実配線調査で判明した阻害要因」参照）。
+//!
+//! いずれも SIMD 幅／GPU provider の実装・キュー層の追加・ISA 実行時検出
+//! （TASK-156・CORE-14）を要する後続タスクの管轄とする。
+//!
 //! `batch_search.rs::should_aggregate_into_batch`（動的窓集約の判定）は本モジュールが
 //! 呼び出す既存の純関数であり、二重に判定ロジックを持たない（同モジュールの
 //! ドキュメンテーションコメントに明記の契約）。`batch_fallback.rs` が実装する
