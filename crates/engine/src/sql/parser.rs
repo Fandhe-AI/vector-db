@@ -59,6 +59,13 @@ pub enum Ranking {
 /// 束縛済みの SQL 文（[`exec::execute_statement`](crate::sql::exec::execute_statement)
 /// が直接実行する入力形）。
 ///
+/// **TASK-161 で意図的に非公開化した破壊的変更（BREAKING CHANGE）**: 全フィールドを
+/// `pub` から `pub(crate)` へ変更し `#[non_exhaustive]` を付与した。クレート外からの
+/// 直接のフィールド参照・構造体リテラル構築は今後不可能。構築は [`BoundStatement::new`]
+/// ／[`BoundStatement::with_mode`]、読み取りは [`BoundStatement::table`] 等の各アクセサー
+/// メソッドを使う（詳細は PR #188 の Breaking Changes 節を参照。TASK-164 拡張点の前方
+/// 互換確保とカプセル化のため）。
+///
 /// `#[non_exhaustive]`: TASK-161（SQL-12）で `mode` フィールドを追加した際、既存の
 /// 構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的変更と
 /// なった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド追加が

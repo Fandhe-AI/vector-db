@@ -198,6 +198,13 @@ pub enum Projection {
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
 /// 妥当性は検証しない（`sql::parser::bind` の責務）。
 ///
+/// **TASK-161 で意図的に非公開化した破壊的変更（BREAKING CHANGE）**: 全フィールドを
+/// `pub` から `pub(crate)` へ変更し `#[non_exhaustive]` を付与した。クレート外からの
+/// 直接のフィールド参照・構造体リテラル構築は今後不可能。構築は
+/// [`ValidatedStatement::new`]／[`ValidatedStatement::with_search_mode`]、読み取りは
+/// [`ValidatedStatement::table_name`] 等の各アクセサーメソッドを使う（詳細は PR #188 の
+/// Breaking Changes 節を参照。TASK-164 拡張点の前方互換確保とカプセル化のため）。
+///
 /// `#[non_exhaustive]`: TASK-161（SQL-12）で `search_mode` フィールドを追加した際、
 /// 既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
 /// 変更となった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド

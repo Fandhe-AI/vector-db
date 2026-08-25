@@ -58,6 +58,11 @@ impl SearchMode {
 /// `SessionVariable` と `Default` の間へ新しい variant を追加する想定。本タスク
 /// （TASK-161）では未実装）。
 ///
+/// **TASK-161 で意図的に付与した破壊的変更（BREAKING CHANGE）**: `#[non_exhaustive]` を
+/// 付与したため、クレート外で本 enum を網羅的に `match` していたコードは
+/// `_ => ...` 等のワイルドカードアーム追加が必須になる（詳細は PR #188 の
+/// Breaking Changes 節を参照）。
+///
 /// `#[non_exhaustive]`: 将来 TASK-164 で `PlannerEstimate` 等の variant を追加した際、
 /// クレート外の `match` 式が網羅性エラーでコンパイル不能になる破壊的変更を防ぐ
 /// （AGENTS.md「公開 API・エラー契約の互換性（P1）」。PR #188 レビュー指摘対応:
@@ -72,6 +77,12 @@ pub enum ModeSource {
 }
 
 /// 優先順位解決を終えた実効モードと、その指定元。
+///
+/// **TASK-161 で意図的に非公開化した破壊的変更（BREAKING CHANGE）**: 全フィールドを
+/// `pub` から `pub(crate)` へ変更し `#[non_exhaustive]` を付与した。クレート外からの
+/// 直接のフィールド参照・構造体リテラル構築は今後不可能。構築は [`ResolvedMode::new`]、
+/// 読み取りは [`ResolvedMode::mode`]／[`ResolvedMode::source`] を使う（詳細は PR #188 の
+/// Breaking Changes 節を参照。TASK-164 拡張点の前方互換確保とカプセル化のため）。
 ///
 /// `#[non_exhaustive]`: 本構造体に将来フィールドを追加しても（例:
 /// `ModeSource::PlannerEstimate` 導入時の付随情報）、既存の構造体リテラル構築コードが
