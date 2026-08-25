@@ -6,6 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
@@ -17,16 +18,30 @@ use wire_server::auth::{argon2id, UserStore};
 /// 軽量パラメータではなく本番既定値をそのまま使う必要がある。
 const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 
+/// フィクスチャ用一時ディレクトリ名の一意性を pid・時刻の組だけに委ねないための
+/// プロセス内単調カウンタ（Issue #172）。同一テストバイナリ内の複数テストは
+/// libtest により同一 pid で並行実行されるため、クロック分解能が粗い環境
+/// （VM 等）では pid+nanos だけでは同時刻ヒットが構造的にあり得た。`Relaxed` で
+/// 十分な理由: カウンタの値そのものに他スレッドとの happens-before 関係は不要で、
+/// 「同一プロセス内で値が重複して払い出されない」ことだけが要件のため。
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
+    let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "wire-server-wire-auth-test-{}-{}",
+        "wire-server-wire-auth-test-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
-            .as_nanos()
+            .as_nanos(),
+        seq
     ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // `create_dir_all` は既存ディレクトリを黙って再利用してしまい、名前が
+    // 万一衝突した場合に他テストの truncate 直後の空ファイルを読みうる
+    // （Issue #172 の H1 仮説）。カウンタ付与で衝突を構造的に不可能にした上で、
+    // `create_dir`（既存なら `Err`）にして衝突が起きたら panic で顕在化させる。
+    std::fs::create_dir(&dir).expect("create unique fixture dir");
     let path = dir.join("users.txt");
 
     let mut content = String::new();
@@ -36,7 +51,15 @@ fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
             .expect("valid phc encoding");
         content.push_str(&format!("{username}:{tenant_id}:{phc}\n"));
     }
-    std::fs::write(&path, content).expect("write user store fixture");
+    std::fs::write(&path, &content).expect("write user store fixture");
+    // 書き込み直後に読み戻して内容一致を確認する。他プロセス・他テストによる
+    // 割り込みがあれば、ここで即座に検出できる（Issue #172: フィクスチャ破損の
+    // 早期発見）。
+    let readback = std::fs::read_to_string(&path).expect("read back user store fixture");
+    assert_eq!(
+        readback, content,
+        "fixture file content must match what was just written (possible fixture race)"
+    );
     path
 }
 
@@ -44,6 +67,17 @@ fn write_user_store_file(records: &[(&str, &str, &str)]) -> std::path::PathBuf {
 /// 1 接続だけ受理してスレッドを終了する（テストのシーケンス制御を単純にするため）。
 fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketAddr {
     let store = UserStore::load_from_file(users_path).expect("valid user store");
+    // フィクスチャが空ファイルとして読まれた場合（Issue #172 の H1 仮説: 一時
+    // ディレクトリ名の衝突により他テストの truncate 中身を読んでしまう競合）、
+    // 空ストアは「常に 28P01」という誤テスト失敗を招く。ここで即座に検出し
+    // 原因を切り分け可能にする（`write_user_store_file` は空ストアを意図して
+    // 呼ばれることがないため、空は常に fixture race を示す）。
+    assert!(
+        !store.is_empty(),
+        "fixture race: user store loaded from {users_path:?} is empty; \
+         this indicates the fixture temp dir name collided with another test \
+         (Issue #172 H1)"
+    );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
 
@@ -54,6 +88,65 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
     });
 
     addr
+}
+
+/// 失敗時診断ヘルパー（Issue #172）: `wire1`/`wire2` で期待外の応答（`R` 以外）を
+/// 受け取った際、追加の再現実験なしに H1〜H3 のどれに該当するかを 1 回のログで
+/// 切り分けられるようにする。
+///
+/// 出力する情報:
+/// - 受信したメッセージ型・SQLSTATE を含む本文（フレーミング齟齬 H4 か認証不一致か）
+/// - フィクスチャファイルの再読込結果（バイト長・`alice:` 行の有無。H1: フィクスチャ
+///   衝突で空/破損ファイルを読んでいないか）
+/// - フィクスチャの PHC に対する `verify_phc` の呼び出しテストスレッドでの再計算
+///   （`Ok(true)` ならサーバー側の一過性事象 H2/H3、`Ok(false)`/`Err` ならフィクスチャ
+///   /KDF 側 H1 寄り）
+///
+/// パニックメッセージにのみ出力し、平文パスワード・PHC 全体は含めない
+/// （診断はテスト実行者のみが見るログだが、コード規約上の一般原則として抑制する）。
+fn diagnose_unexpected_auth_response(
+    users_path: &std::path::Path,
+    type_byte: u8,
+    body: &str,
+) -> String {
+    let refetch = std::fs::read_to_string(users_path);
+    let fixture_summary = match &refetch {
+        Ok(s) => format!(
+            "len={} bytes, has_alice_line={}",
+            s.len(),
+            s.lines().any(|l| l.starts_with("alice:"))
+        ),
+        Err(e) => format!("<unreadable: {e:?}>"),
+    };
+
+    let recompute_summary = match &refetch {
+        Ok(s) => match s.lines().find(|l| l.starts_with("alice:")) {
+            Some(line) => match line.splitn(3, ':').nth(2) {
+                Some(phc) => match argon2id::verify_phc(phc, b"correct-horse") {
+                    Ok(true) => {
+                        "Ok(true) -- KDF matches; likely a transient server-side event (H2/H3)"
+                            .to_string()
+                    }
+                    Ok(false) => {
+                        "Ok(false) -- KDF does not match fixture password (H1 fixture mismatch)"
+                            .to_string()
+                    }
+                    Err(e) => format!("Err({e:?}) -- KDF execution error (H2)"),
+                },
+                None => "<no phc field on alice line>".to_string(),
+            },
+            None => "<no alice line in fixture; H1 fixture race>".to_string(),
+        },
+        Err(_) => "<fixture unreadable, skipped>".to_string(),
+    };
+
+    format!(
+        "authentication must succeed regardless of the self-reported database parameter; \
+         got message type {:?}, body: {body:?}; \
+         fixture reread: {fixture_summary}; \
+         testthread KDF recompute: {recompute_summary}",
+        type_byte as char
+    )
 }
 
 // `wire_server::server::accept_loop_with_limiter` 経由（同時接続数上限・読み取りタイムアウトを
@@ -162,8 +255,8 @@ fn wire1_successful_cleartext_auth_reaches_ready_for_query() {
         stream.read_exact(&mut body).expect("read body");
         let body_str = String::from_utf8_lossy(&body);
         panic!(
-            "expected AuthenticationOk ('R'); got message type {:?}, body: {body_str:?}",
-            header[0] as char
+            "{}",
+            diagnose_unexpected_auth_response(&users_path, header[0], &body_str)
         );
     }
     let mut len_buf = [0u8; 4];
@@ -278,10 +371,81 @@ fn wire2_database_param_does_not_affect_authentication_outcome() {
         stream.read_exact(&mut body).expect("read body");
         let body_str = String::from_utf8_lossy(&body);
         panic!(
-            "authentication must succeed regardless of the self-reported database parameter; \
-             got message type {:?}, body: {body_str:?}",
-            header[0] as char
+            "{}",
+            diagnose_unexpected_auth_response(&users_path, header[0], &body_str)
         );
+    }
+}
+
+/// フィクスチャ一時ディレクトリ名が連続生成でも重複しないことの軽量回帰確認
+/// （Issue #172: `FIXTURE_SEQ` カウンタ導入の直接検証）。
+#[test]
+fn write_user_store_file_generates_unique_fixture_dirs() {
+    let path_a = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let path_b = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    assert_ne!(
+        path_a.parent(),
+        path_b.parent(),
+        "consecutive fixture generations must not reuse the same temp dir"
+    );
+}
+
+/// opt-in の負荷再現テスト（Issue #172）。CI の既定実行には含めない
+/// （`#[ignore]`）。高負荷下でのみ非再現だったフレークを、多スレッド×多反復の
+/// 完全な認証シーケンスで再現しやすくする。規模は環境変数で調整できる:
+/// `WIRE_AUTH_STRESS_THREADS`（既定 4）・`WIRE_AUTH_STRESS_ITERATIONS`（既定 10）。
+///
+/// debug ビルドでは Argon2id が遅く既定パラメータでは重いため、`--release` 推奨:
+/// `cargo test --release -p wire-server --test wire_auth -- --ignored --nocapture`
+#[test]
+#[ignore = "opt-in stress harness for Issue #172; run explicitly with --release --ignored"]
+fn wire_auth_stress_parallel_successful_auth() {
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    let threads = env_usize("WIRE_AUTH_STRESS_THREADS", 4);
+    let iterations = env_usize("WIRE_AUTH_STRESS_ITERATIONS", 10);
+
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            std::thread::spawn(move || {
+                for _ in 0..iterations {
+                    let users_path =
+                        write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+                    let addr = spawn_server_accepting_one(&users_path);
+                    let mut stream = TcpStream::connect(addr).expect("connect");
+
+                    send_ssl_request_and_startup(&mut stream, "alice", "irrelevant-db-name");
+                    let auth_code = read_auth_request_type(&mut stream);
+                    assert_eq!(auth_code, 3);
+
+                    send_password_message(&mut stream, "correct-horse");
+
+                    let mut header = [0u8; 1];
+                    stream.read_exact(&mut header).expect("read auth response");
+                    if header[0] != b'R' {
+                        let mut len_buf = [0u8; 4];
+                        stream.read_exact(&mut len_buf).expect("read len");
+                        let len = i32::from_be_bytes(len_buf) as usize;
+                        let mut body = vec![0u8; len.saturating_sub(4)];
+                        stream.read_exact(&mut body).expect("read body");
+                        let body_str = String::from_utf8_lossy(&body);
+                        panic!(
+                            "{}",
+                            diagnose_unexpected_auth_response(&users_path, header[0], &body_str)
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("stress worker thread must not panic");
     }
 }
 

@@ -18,35 +18,17 @@
 //! 依存するため、引き続き `src/arena.rs` 内のユニットテストの責務とする
 //! （クレート外からは呼べないため）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::arena::{ArenaError, VectorArena};
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::policy::PolicyContext;
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`tests/extensions.rs` と同じ方針）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-task87-arena-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製。
+// `tests/power_loss.rs`・`tests/bench_accept.rs` と同じ `#[path]` 取り込み方式）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT_ID: &str = "tenant-a";
 

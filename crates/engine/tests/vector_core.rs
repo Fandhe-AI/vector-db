@@ -9,7 +9,7 @@
 //! 済ませてから、その所有権ごと [`EngineCore::from_storage`] へ渡して `EngineCore` を
 //! 構築する（構築後は `EngineCore` から生 `Storage` へ戻る経路がない）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -18,36 +18,11 @@ use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, Sea
 use engine::policy::PolicyContext;
 use engine::storage::{RowInput, Storage, Visibility};
 
-/// 自動削除される一時ディレクトリ（`redb` ファイルの置き場）。外部クレートに
-/// 依存しない最小実装（dependency-policy 準拠）。
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "engine-vector-core-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self(dir)
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.0.join("db.redb")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// 一時ディレクトリ（`TempDir`）は Issue #173 で `crates/engine/src/test_util/temp_db.rs`
+// へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::TempDir;
 
 fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
     engine::catalog::TableSchema::new(

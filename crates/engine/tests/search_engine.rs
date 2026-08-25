@@ -6,44 +6,17 @@
 //! `tests/vector_core.rs` と同じ手法（`EngineCore` がテナント境界を迂回する生ハンドルを
 //! 公開しないため）。
 
-use std::path::PathBuf;
-
 use engine::core::{EngineCore, VectorCore};
 use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::search_engine::{self, SearchEngineKind};
 use engine::storage::{RowInput, Storage, Visibility};
 
-/// 自動削除される一時ディレクトリ（`redb` ファイルの置き場）。外部クレートに
-/// 依存しない最小実装（dependency-policy 準拠。`tests/vector_core.rs` と同型）。
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "engine-search-engine-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self(dir)
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.0.join("db.redb")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// 一時ディレクトリ（`TempDir`）は Issue #173 で `crates/engine/src/test_util/temp_db.rs`
+// へ一本化した（旧: `tests/vector_core.rs` と同型のローカル複製）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::TempDir;
 
 fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
     engine::catalog::TableSchema::new(

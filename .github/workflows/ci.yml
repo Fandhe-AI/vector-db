@@ -128,3 +128,30 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Run core-api-check
         run: make core-api-check
+
+  # --------------------------------------------------
+  # cross-check（aarch64 クロスコンパイル確認。TASK-156・対象ビヘイビア CORE-14）
+  # --------------------------------------------------
+  # `isa.rs` の NEON カーネル（`#[cfg(target_arch = "aarch64")]`）が x86_64 の
+  # rust-ci ジョブではコンパイル対象に入らないため、`cargo check --target
+  # aarch64-unknown-linux-gnu`（リンクしないためクロスリンカ不要）で構文・型検査
+  # だけ別途確認する。rust-ci（reusable workflow）とは異なり生の steps を持つ独立
+  # ジョブとして定義するため、第三者 action（actions/checkout）は SHA 固定で参照する
+  # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions
+  # のみ）。private submodule（docs/spec）は取得しない（spec 抜きでビルドが成立する方針を
+  # 維持）。branch protection の必須チェックへ追加する運用は他ジョブと同様ユーザー作業
+  # （PR 本文参照）。
+  cross-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Add aarch64-unknown-linux-gnu target
+        run: rustup target add aarch64-unknown-linux-gnu
+      - name: Run check-cross
+        run: make check-cross

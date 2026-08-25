@@ -6,32 +6,15 @@
 //! `validate_statement` を検証する（`sql::allowlist` モジュール内の単体テストは
 //! storage 非依存のフェイクを使うため、本ファイルは実カタログとの結合を確認する）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::sql::allowlist::validate_statement;
 use engine::storage::Storage;
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-sql-allowlist-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn open_storage_with_documents_table(label: &str) -> (Storage, CleanupGuard) {
     let path = unique_db_path(label);

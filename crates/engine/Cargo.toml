@@ -50,8 +50,9 @@ test = false
 
 [[bench]]
 # TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の回帰ゲート入口。実測対象は
-# `ParallelSearchProvider`（スカラー並列実装。SIMD 演算は未実装）であり、ファイル名も
-# それに合わせる（`parallel_bench.rs` 冒頭コメント参照）。harness = false / test = false
+# `ParallelSearchProvider`（スレッド並列＋ TASK-156 の実行時 SIMD 検出カーネル。
+# ファイル名は元々のスカラー並列実装当時のものを維持している。`parallel_bench.rs`
+# 冒頭コメント参照）。harness = false / test = false
 # は上記 2 ベンチと同一方針（時間依存の測定値を make ci のアサーションへ混ぜない）。
 # `make bench-parallel`（Makefile）・`.github/workflows/bench.yml`
 # （workflow_dispatch による手動実行。CORE-5 未接続の間は schedule 停止中）から
