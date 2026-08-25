@@ -569,6 +569,25 @@ pub fn encode_phc(password: &[u8], salt: &[u8], params: &Params) -> Result<Strin
     ))
 }
 
+/// [`encode_phc`] と異なり Argon2id 計算を一切行わず、指定した salt/hash バイト列を
+/// そのまま base64 エンコードして PHC 文字列を組み立てる。`auth.rs` の未知ユーザー
+/// 用ダミー PHC（列挙攻撃・タイミングオラクル対策）の構築に使う: `encode_phc` で
+/// 構築すると構築時に 1 回・照合時（`verify_phc`）にもう 1 回、合計 2 回分の
+/// Argon2id 計算コストがかかり、コールドスタート直後の未知ユーザー試行だけ実ユーザー
+/// の失敗経路（`verify_phc` 1 回分）の約 2 倍のコストになってタイミング均一性が
+/// 崩れる（review 指摘）。本関数はハッシュ計算を行わないため、ダミー PHC の構築自体は
+/// 無視できるコストで済み、実際の Argon2id 計算は照合時の 1 回のみになる。
+pub fn synthesize_phc_without_hashing(params: &Params, salt: &[u8], hash: &[u8]) -> String {
+    format!(
+        "$argon2id$v=19$m={},t={},p={}${}${}",
+        params.m_cost_kib,
+        params.t_cost,
+        params.p_cost,
+        b64_encode(salt),
+        b64_encode(hash)
+    )
+}
+
 /// PHC 文字列をパラメータ・salt・hash に分解する（ユーザーストアのロード時検証・
 /// 照合の両方から呼ばれる）。形式不一致はすべて [`Argon2Error::MalformedPhc`] に
 /// 畳み込み、詳細な失敗理由を外部へ出さない（fail-closed）。
@@ -618,7 +637,11 @@ pub fn parse_phc(phc: &str) -> Result<(Params, Vec<u8>, Vec<u8>), Argon2Error> {
     // decode される構文的に正しい PHC が load 時には通過し、`verify_phc` 呼び出し
     // （毎回の認証試行時）で `hash_raw` が `InvalidParam` を返し続けて恒久的な
     // ログイン不能を招く（fail-closed だが検出が遅すぎるレビュー指摘）。
-    if salt.is_empty() || hash.len() < 4 {
+    //
+    // salt は RFC 9106 §3.1 の推奨下限（8 バイト以上）を decode 後に検証する。
+    // 空 salt だけを拒否していると、8 バイト未満の弱い salt を含む構文的に正しい
+    // PHC が起動時ロードを通過してしまう（review 指摘）。
+    if salt.len() < 8 || hash.len() < 4 {
         return Err(Argon2Error::MalformedPhc);
     }
     Ok((params, salt, hash))
@@ -728,16 +751,29 @@ mod tests {
     }
 
     /// レビュー指摘の再現ケース: 構文的には正しいが hash フィールドが decode 後
-    /// 4 バイト未満（"aA" は 1 バイトに decode される）の PHC を `parse_phc` 単体で
-    /// 拒否すること。`auth.rs::load_from_file_rejects_hash_shorter_than_4_bytes` は
+    /// 4 バイト未満の PHC を `parse_phc` 単体で拒否すること。salt は下限（8 バイト）
+    /// 以上の有効値にし、hash 長のチェックだけを分離してピン留めする
+    /// （`auth.rs::load_from_file_rejects_hash_shorter_than_4_bytes` は
     /// `LoadError::InvalidPhc` に畳み込まれた結果だけを検査するため、この分岐
-    /// （`hash.len() < 4`）自体を直接ピン留めする。
+    /// （`hash.len() < 4`）自体を直接確認する目的）。
     #[test]
     fn parse_phc_rejects_hash_shorter_than_4_bytes() {
-        assert_eq!(
-            parse_phc("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aA"),
-            Err(Argon2Error::MalformedPhc)
-        );
+        let salt = b64_encode(&[0u8; 16]); // 16 バイト（下限 8 バイト以上）の有効な salt
+        let hash = b64_encode(&[0u8; 1]); // 1 バイトに decode される hash（下限 4 バイト未満）
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert_eq!(parse_phc(&phc), Err(Argon2Error::MalformedPhc));
+    }
+
+    /// レビュー指摘の再現ケース: 構文的には正しいが salt フィールドが decode 後
+    /// RFC 9106 §3.1 の推奨下限（8 バイト）未満の PHC を `parse_phc` 単体で
+    /// 拒否すること。hash は下限（4 バイト）以上の有効値にし、salt 長のチェックだけを
+    /// 分離してピン留めする。
+    #[test]
+    fn parse_phc_rejects_salt_shorter_than_8_bytes() {
+        let salt = b64_encode(&[0u8; 7]); // 7 バイトに decode される salt（下限 8 バイト未満）
+        let hash = b64_encode(&[0u8; 32]); // 32 バイトの有効な hash
+        let phc = format!("$argon2id$v=19$m=8,t=1,p=1${salt}${hash}");
+        assert_eq!(parse_phc(&phc), Err(Argon2Error::MalformedPhc));
     }
 
     #[test]

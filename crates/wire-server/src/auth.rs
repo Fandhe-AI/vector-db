@@ -192,19 +192,24 @@ impl AuthFailure {
 
 /// 未知ユーザーに対しても実ユーザーと同一コスト・同一応答時間で照合を走らせるための
 /// ダミー PHC レコード（列挙攻撃・タイミングオラクル対策。WIRE-2）。
-/// salt は固定値でよい（値自体は秘密ではなく、真のユーザー kdf と同一パラメータで
-/// 計算コストを揃えることだけが目的のため）。プロセス内で一度だけ生成して再利用する。
+/// salt・hash は固定値でよい（値自体は秘密ではなく、真のユーザー kdf と同一
+/// パラメータで計算コストを揃えることだけが目的のため）。プロセス内で一度だけ
+/// 生成して再利用する。
+///
+/// [`argon2id::synthesize_phc_without_hashing`] で組み立て、`encode_phc` は使わない
+/// （`encode_phc` は構築時に実際に Argon2id を計算するため、構築コスト 1 回 +
+/// `verify()` 側の `verify_phc` 呼び出し 1 回で計 2 回分のコストがかかる。
+/// `OnceLock` の初回呼び出し＝コールドスタート直後の未知ユーザー試行だけ約 2 倍の
+/// コストになり、実ユーザーの失敗経路（`verify_phc` 1 回分）とタイミングが揃わなく
+/// なる。review 指摘）。
 fn dummy_phc() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
-        // `RECOMMENDED_PARAMS`・固定 salt・固定パスワードはすべてコンパイル時定数
-        // （untrusted 入力を一切経由しない）なので `encode_phc` は失敗しえない。
-        argon2id::encode_phc(
-            b"dummy-password-never-matches",
-            b"0000000000000000",
+        argon2id::synthesize_phc_without_hashing(
             &argon2id::RECOMMENDED_PARAMS,
+            b"0000000000000000",
+            &[0u8; 32],
         )
-        .expect("recommended params are always valid")
     })
 }
 
@@ -286,6 +291,21 @@ mod tests {
         let salt = b"0123456789abcdef";
         let phc = argon2id::encode_phc(password, salt, &TEST_PARAMS).expect("valid phc");
         UserStore::from_records(vec![(username, tenant_id, Box::leak(phc.into_boxed_str()))])
+    }
+
+    /// `dummy_phc()` が `synthesize_phc_without_hashing`（実ハッシュ計算なし）で
+    /// 組み立てられた後も、構文的に有効な PHC として `parse_phc`/`verify_phc` を
+    /// 通り、かつ任意のパスワードに対して必ず不一致になること。前者が崩れると
+    /// `verify()` は `unwrap_or(false)` で不一致扱いにはなるものの
+    /// `verify_phc` 自体を通らず、dummy 経路が担うコスト整合性（review 指摘）が
+    /// 失われる。後者が崩れると固定の合成 hash が偶然一致し得る形になっていないかを
+    /// 確認する回帰チェックになる。
+    #[test]
+    fn dummy_phc_parses_and_never_matches_any_password() {
+        assert!(
+            !argon2id::verify_phc(dummy_phc(), b"anything").expect("dummy phc must parse"),
+            "dummy phc must never match a real password"
+        );
     }
 
     /// 正しいユーザー名・パスワードでの照合成功と、tenant_id がユーザーストア由来で
@@ -384,9 +404,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("users_oversized_m_cost.txt");
+        // salt は下限（8 バイト）以上の有効値にし、m_cost の検証だけを分離する。
         std::fs::write(
             &path,
-            "alice:tenant-a:$argon2id$v=19$m=999999999,t=1,p=1$c2FsdA$aGFzaA\n",
+            "alice:tenant-a:$argon2id$v=19$m=999999999,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$aGFzaA\n",
         )
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
@@ -396,7 +417,8 @@ mod tests {
 
     /// レビュー指摘: `MAX_M_COST_KIB` を 2 GiB から 256 MiB へ引き下げた回帰確認。
     /// 新上限をわずかに超えるだけの PHC も起動時に拒否されること
-    /// （旧上限では通過していた範囲）。
+    /// （旧上限では通過していた範囲）。salt は下限（8 バイト）以上の有効値にし、
+    /// m_cost の検証だけを分離する。
     #[test]
     fn load_from_file_rejects_m_cost_above_reduced_ceiling() {
         let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
@@ -405,7 +427,9 @@ mod tests {
         let over_ceiling = argon2id::MAX_M_COST_KIB as u64 + 1;
         std::fs::write(
             &path,
-            format!("alice:tenant-a:$argon2id$v=19$m={over_ceiling},t=1,p=1$c2FsdA$aGFzaA\n"),
+            format!(
+                "alice:tenant-a:$argon2id$v=19$m={over_ceiling},t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$aGFzaA\n"
+            ),
         )
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
@@ -423,11 +447,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("users_short_hash.txt");
-        // "c2FsdA" は "salt"（4 バイト）に decode される salt。"aA" は 1 バイトにしか
-        // decode されない hash フィールド（`hash_raw` の下限 4 バイト未満）。
+        // "AAAAAAAAAAAAAAAAAAAAAA" は 16 バイト（下限 8 バイト以上）の有効な salt。
+        // "AA" は 1 バイトにしか decode されない hash フィールド
+        // （`hash_raw` の下限 4 バイト未満）。salt は有効値にして hash 長の検証だけを
+        // 分離する。
         std::fs::write(
             &path,
-            "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aA\n",
+            "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$AAAAAAAAAAAAAAAAAAAAAA$AA\n",
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// レビュー指摘の再現ケース: RFC 9106 の salt 下限（8 バイト以上）未満の salt を
+    /// 含む PHC を起動時に拒否すること（短 hash と同じ fail-closed の起動時検証）。
+    #[test]
+    fn load_from_file_rejects_salt_shorter_than_8_bytes() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_short_salt.txt");
+        // "AAAAAAAAAA" は 7 バイト（下限 8 バイト未満）に decode される salt。
+        // "aGFzaA" は "hash"（4 バイト、下限以上）に decode される有効な hash
+        // フィールド。hash は有効値にして salt 長の検証だけを分離する。
+        std::fs::write(
+            &path,
+            "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$AAAAAAAAAA$aGFzaA\n",
         )
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
