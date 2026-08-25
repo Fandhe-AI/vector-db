@@ -24,7 +24,7 @@ use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
-use crate::storage::{Storage, StorageError};
+use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
 /// `cfg.pool_depth()` に渡す（[`hybrid::RrfConfig::new`] の検証を通過する範囲で、
@@ -203,11 +203,18 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
     }
 }
 
-/// [`BoundStatement`] を実行する（TASK-75 の公開 API）。`schema` は呼び出し元
-/// （`core.rs::EngineCore::execute_sql`）が `sql::parser::bind` へ渡したのと同一の
-/// スキーマを渡す。
+/// [`BoundStatement`] を実行する（TASK-75 の公開 API）。`read_txn`・`schema` は
+/// 呼び出し元（`core.rs::EngineCore::execute_sql`）が単一の read トランザクション上で
+/// `catalog::get_table_schema_in_txn` により取得し、`sql::parser::bind` へ渡したのと
+/// 同一のものを渡す契約とする（Issue #56 レビュー指摘対応・codex P1: スキーマ取得
+/// （`bind` 用）と候補走査（[`VectorArena::build_filtered_with_rows_in_txn`]）が別
+/// read トランザクションに分かれていると、その間に並行 DDL（`alter_table_add_column`
+/// 等）がコミットされた場合、`bind` が束縛した旧スキーマで新スナップショットの行を
+/// 走査することになり、新設列の欠落や `row_codec` デコード失敗（スキーマ世代不一致）
+/// が生じ得た。同一 `read_txn` を型で強制することで、スキーマ取得・bind・候補走査を
+/// 単一スナップショットへ閉じ込める）。
 pub fn execute_statement(
-    storage: &Storage,
+    read_txn: &redb::ReadTransaction,
     provider: &dyn SearchProvider,
     ctx: &PolicyContext,
     schema: &TableSchema,
@@ -327,8 +334,8 @@ pub fn execute_statement(
         Ok(true)
     };
 
-    let arena = VectorArena::build_filtered_with_rows(
-        storage,
+    let arena = VectorArena::build_filtered_with_rows_in_txn(
+        read_txn,
         &bound.table,
         |tenant, visibility| ctx.is_visible(tenant, visibility),
         on_visible_row,
