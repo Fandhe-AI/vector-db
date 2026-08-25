@@ -11,11 +11,10 @@
 
 `docs/design/multi-dim-table-coexistence.md`（TASK-91）は 384/768/1536 次元での
 複数次元テーブル共存を検証し、「2000 次元級の再検証は別タスクの管轄」と明記して
-スコープ外とした。TASK-160（PoC-14）は合成ベクトルで 2000 次元の CPU-SIMD/GPU
-バンド幅を検証済みだが、MS-6 での EXT-2 最終確定に向けて (i) 2000 次元での
-CPU-SIMD/GPU 相対性能の再検証と、(ii) 実埋め込みに近い分布・複数次元テーブル
-共存という残宿題が残っている。本 ADR はそのうち本リポジトリの管轄範囲
-（production 検索経路での複数次元共存・その実測）を扱う。
+スコープ外とした。2000 次元での残タスクの詳細は `docs/spec/05-tasks.md`
+（TASK-151・TASK-160）・`docs/spec/06-roadmap.md`（MS-6）・
+`docs/spec/04-behavior/extensions.md`（EXT-2）を参照。本 ADR はそのうち
+本リポジトリの管轄範囲（production 検索経路での複数次元共存・その実測）を扱う。
 
 **位置づけ**: 実装をブロックしない並行フォローアップ。production コード
 （`crates/engine/src/`）の変更は行わず、既存 API に対する検証テスト・実測
@@ -38,12 +37,9 @@ CPU-SIMD/GPU 相対性能の再検証と、(ii) 実埋め込みに近い分布�
 3. **2000 次元共存の end-to-end（同ファイル パート B）**: (a) 2000 次元テーブル
    単独 DB、(b) 768 + 2000 次元テーブル共存 DB（各テーブル同一行数）を作り、
    `EngineCore::search` での 2000 次元テーブル検索 p50/p95 を比較した。
-4. **CPU-SIMD / GPU の相対性能再検証（PoC-14 ハーネス再実行）**: 本リポジトリの
-   worktree では `docs/spec` submodule が未初期化（`git submodule status` で
-   `-` 接頭辞、内容なし）であり、private ハーネス（`docs/spec/03-poc/f16-quantization-bandwidth/impl/`）
-   に本セッションからアクセスできない。共有 checkout に対する
-   `git submodule update --init`（ネットワーク・グローバル状態変更を伴う）を
-   本セッション判断で実行することは避け、fail-closed に「未測定」として記録する
+4. **CPU-SIMD / GPU の相対性能再検証（PoC-14 ハーネス再実行）**: 本セッションからは
+   private ハーネス（`docs/spec/03-poc/f16-quantization-bandwidth/`。TASK-160・
+   PoC-14）にアクセスできず、fail-closed に「未測定」として記録する
    （下記「制約・スコープ外」)。
 
 ## 実測環境
@@ -147,19 +143,17 @@ run-to-run 変動の節で扱う。
   スレッド並列で 1 回目 3.51 倍・2 回目 2.69 倍）。共有仮想化環境での 1 回の実測に
   基づく比率を確定値として扱わない（詳細・上振れ時の仮説はパート A 実測結果の
   コラム参照。製品コードへの SIMD 導入判断は Issue #177 / #109 の管轄）。
-- **GPU/CPU-SIMD の相対性能そのものは今回再検証できなかった**。EXT-2 の
-  「2000 次元での GPU 優位性が768 次元と同様に維持されるか」という判断材料は
-  本 ADR では提供できていない（下記「制約・スコープ外」参照）。
+- **GPU/CPU-SIMD の相対性能そのものは今回再検証できなかった**。EXT-2 の判断条件は
+  `docs/spec/04-behavior/extensions.md`（EXT-2）参照。本 ADR では該当する判断材料を
+  提供できていない（下記「制約・スコープ外」参照）。
 
 ## 制約・スコープ外
 
-1. **CPU-SIMD / GPU の相対性能再検証（PoC-14 ハーネス）は未実施**。本セッション
-   の worktree で `docs/spec` submodule が未初期化のため、private ハーネス
-   （`docs/spec/03-poc/f16-quantization-bandwidth/impl/`）を実行できなかった。
-   submodule が初期化済みの環境（`git -C docs/spec status --short` が確認できる
-   状態）で、`CARGO_TARGET_DIR` を submodule 外（例: scratchpad）に向けて
-   `cargo run --release` を再実行し、768/2000 次元の CPU-SIMD p95・GPU バッチ
-   p95・クエリあたり償却時間を回収の上、本 ADR の該当節を追記する必要がある。
+1. **CPU-SIMD / GPU の相対性能再検証（PoC-14 ハーネス）は未実施**。本セッションからは
+   private ハーネス（`docs/spec/03-poc/f16-quantization-bandwidth/`。TASK-160・
+   PoC-14）にアクセスできなかった。submodule が初期化済みの環境で同ハーネスを
+   再実行し、本 ADR の該当節を追記する必要がある（再実行手順・回収すべき測定項目は
+   ハーネス側の定義に従う。本 ADR では転記しない）。
 2. **実埋め込み分布での再確認は未実施**。本 ADR・`tests/extensions.rs`・
    `examples/high_dim_bench.rs` はいずれも決定論的な合成ベクトル（xorshift32）
    を使う。2000 次元の実埋め込みモデル・データセットの選定はオーナー判断事項。
