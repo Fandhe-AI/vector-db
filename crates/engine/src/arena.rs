@@ -652,6 +652,7 @@ impl VectorArena {
             // 「不可視だからスキップ」と判断できないため fail-closed に伝播する
             // （`decode_row_tenant_and_visibility` のドキュメント参照。codex P0 対応・
             // Issue #137）。
+            // `tenant_id` は `buf` を借用した `&str`（ヒープアロケーションなし。Issue #174）。
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
 
@@ -660,7 +661,7 @@ impl VectorArena {
             // 不可視行の embedding が破損していても、対象テナントの検索を失敗させない
             // （他テナントの状態による可用性干渉・エラー経由の存在情報漏えいを避ける）。
             // 不可視行の破損検出自体は本関数の責務外（別経路の責務。上記ドキュメント参照）。
-            if !predicate(&tenant_id, visibility) {
+            if !predicate(tenant_id, visibility) {
                 continue;
             }
 
@@ -1878,14 +1879,28 @@ mod tests {
     // 「クエリの都度 `Storage::scan_table_page` でページングしながら読み直してデコードする
     // 経路」より十分速いことを CI で検出可能にする（`tests/incremental_write_perf.rs`
     // （TASK-143）と同一の計測方針: ウォームアップ 1 回を除外・複数ラウンドの中央値比較・
-    // `Duration::saturating_mul` の整数比較で判定・判定閾値は本テスト固有の計測パラメータで
-    // spec の実測比そのものは転記しない）。
+    // 判定閾値は本テスト固有の計測パラメータで spec の実測比そのものは転記しない）。
     //
     // 規模の選定: `Storage::scan_table_page` は 1 ページあたり総バイト量
     // `MAX_SCAN_PAGE_BYTES`（16MiB）超で次ページへ打ち切る（`storage.rs` 参照）。
     // 本テストの行数・次元は、その上限に対して十分な余裕を残し、かつ debug ビルドでも
     // CI 実行時間が長くなりすぎないよう小さく抑えている
     // （ROWS × DIM × 4 バイト ≈ 2.6 MiB で 1 ページに収まる）。
+    //
+    // 計測対象の設計（Issue #171・フレーキー解消）: 両経路の消費者を「全行のベクトル
+    // スライスへアクセスし軽量なチェックサムを積算するだけ」に絞り、内積等の
+    // スコアリングは計測から外す。スコアリングコストは両経路に等しく乗る共通項であり、
+    // それが全体時間に占める割合（=比率を 1 に近づける希釈度合い）は CPU 特性・
+    // ビルド最適化・I/O 特性によって環境ごとに変わるため、ラウンド数や中央値では
+    // 解消できない環境依存の下限を生む。TABLE-8 が検証したい性質は「一度デコードした
+    // 連続バッファの提供によりクエリごとの再読込・再デコードを不要にする」ことに
+    // 限られ、スコアリングは検索カーネル（`kernel.rs` / `parallel_search.rs`）の管轄で
+    // アリーナの性質ではないため、計測対象から除外して問題ない。
+    //
+    // あわせて、両経路が「同一量のデータを処理している」ことを処理量カウンタ
+    // （走査行数・チェックサム一致）で決定的に検証する。実時間比較だけでは
+    // コンパイラ最適化による消去や比較条件のずれを見逃しうるため、これらは
+    // 負荷に依存しない不変条件として毎ラウンド確認する。
     mod perf {
         use super::*;
         use std::time::Instant;
@@ -1898,7 +1913,9 @@ mod tests {
         const ROWS: u64 = 5_000;
         const DIM: usize = 128;
 
-        /// 1 ラウンドで実行するクエリ本数。
+        /// 1 ラウンドで実行するクエリ反復回数（各回、全行のベクトルスライスへ
+        /// アクセスしチェックサムを積算する。`RATIO_THRESHOLD_DENOM` の理論下限
+        /// `≈ 1 / QUERY_COUNT` を決めるパラメータでもある）。
         const QUERY_COUNT: usize = 40;
 
         /// ノイズ対策として、複数ラウンド計測しラウンドごとの比率（`t_arena / t_rescan`）の
@@ -1916,12 +1933,11 @@ mod tests {
         /// 以下の時間で完了すること）。本テストの計測パラメータであり、アサーション
         /// 弱体化は行わない（`.claude/rules/coding-rust.md` 参照）。
         ///
-        /// 開発機では 4 倍（0.25）を安定して満たすが、GitHub Actions の共有ランナーでは
-        /// rescan 経路自体の I/O コストが相対的に小さくなり、warmup・best-of-7 を適用しても
-        /// 実測比が 0.33〜0.36 程度に留まることを確認した（`main` ブランチでも同一テストが
-        /// 同水準で失敗する再現を確認済み。CI 実行環境固有の特性であり、本 PR の変更とは
-        /// 無関係）。閾値をランナー実測に合わせて 2 倍（0.5）へ調整し、それでも
-        /// 「アリーナ経路は都度読み直しより明確に高速」という TABLE-8 の検証意図は保つ。
+        /// 両経路の消費者をチェックサム積算のみに絞ったことで、比率の理論下限は
+        /// `≈ 1 / QUERY_COUNT`（本テストの設定では 0.025 程度）まで下がり、
+        /// 閾値 1/2（0.5）に対して環境非依存の十分なマージンを持つ計測条件になった。
+        /// これは検証の弱体化ではなく計測条件の是正であり、閾値の数値自体は
+        /// 変更していない（Issue #171）。
         const RATIO_THRESHOLD_DENOM: u32 = 2;
 
         fn make_vector(rng: &mut Xorshift32, dim: usize) -> Vec<f32> {
@@ -1941,47 +1957,52 @@ mod tests {
             }
         }
 
-        /// 単純な内積（テスト内の素朴なスコアリング。検索カーネル本体は後続タスクの管轄。
-        /// モジュールドキュメント参照）。
-        fn dot(a: &[f32], b: &[f32]) -> f32 {
-            a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-        }
-
-        fn best_score_over_arena(arena: &VectorArena, query: &[f32]) -> f32 {
-            let mut best = f32::MIN;
+        /// アリーナ経路の消費者。全行のベクトルスライスへアクセスし、先頭・末尾要素を
+        /// `f64` へ積算した軽量チェックサムを返す（モジュールドキュメント参照:
+        /// スコアリングを含めないことで比率希釈の環境依存性を避ける）。戻り値の
+        /// `usize` は走査した行数で、`access_checksum_over_rescan` との比較条件
+        /// （同一データ量を処理していること）を検証するために使う。
+        /// `std::hint::black_box` を通し、コンパイラによる消去を防ぐ。
+        fn access_checksum_over_arena(arena: &VectorArena) -> (f64, usize) {
+            let mut checksum = 0.0f64;
+            let mut visited = 0usize;
             for i in 0..arena.len() {
                 let v = arena.vector(i).expect("index within arena bounds");
-                let score = dot(v, query);
-                if score > best {
-                    best = score;
-                }
+                let first = v.first().copied().unwrap_or(0.0) as f64;
+                let last = v.last().copied().unwrap_or(0.0) as f64;
+                checksum = std::hint::black_box(checksum + first + last);
+                visited += 1;
             }
-            best
+            (checksum, visited)
         }
 
-        fn best_score_over_rescan(storage: &Storage, query: &[f32]) -> f32 {
+        /// 都度読み直し経路の消費者。`access_checksum_over_arena` と同じ積算方式
+        /// （行 ID 昇順・同一の先頭・末尾要素加算）を用い、チェックサムが決定的に
+        /// 一致するようにする。
+        fn access_checksum_over_rescan(storage: &Storage) -> (f64, usize) {
             // テーブルスコープ経路（`scan_table_page`）でページングしながら都度読み直す。
             // `Storage::scan`（`storage.rs` の平坦な `ROWS_TABLE` 走査）は本テストが使う
             // テーブルスコープ行 API（`insert_rows_into_table`）とは別の redb テーブルを
             // 参照するため、ここでは使えない。
-            let mut best = f32::MIN;
+            let mut checksum = 0.0f64;
+            let mut visited = 0usize;
             let mut cursor: Option<u64> = None;
             loop {
                 let (rows, next_cursor) = storage
                     .scan_table_page(TABLE_NAME, cursor, crate::storage::MAX_SCAN_PAGE_LIMIT)
                     .expect("scan_table_page within configured limits");
                 for row in &rows {
-                    let score = dot(&row.embedding, query);
-                    if score > best {
-                        best = score;
-                    }
+                    let first = row.embedding.first().copied().unwrap_or(0.0) as f64;
+                    let last = row.embedding.last().copied().unwrap_or(0.0) as f64;
+                    checksum = std::hint::black_box(checksum + first + last);
+                    visited += 1;
                 }
                 match next_cursor {
                     Some(c) => cursor = Some(c),
                     None => break,
                 }
             }
-            best
+            (checksum, visited)
         }
 
         fn seed_storage(path: &std::path::Path) -> Storage {
@@ -2013,17 +2034,12 @@ mod tests {
             storage
         }
 
-        fn make_queries(seed: u32) -> Vec<Vec<f32>> {
-            let mut rng = Xorshift32(seed | 1);
-            (0..QUERY_COUNT)
-                .map(|_| make_vector(&mut rng, DIM))
-                .collect()
-        }
-
         // 対象ビヘイビア: TABLE-8。「コールドスタート時に一度だけアリーナを構築し、以降の
         // クエリはアリーナ走査で完結する経路」が「クエリの都度 Storage::scan で全行を
         // 読み直しデコードする経路」より十分速いことを、判定閾値（RATIO_THRESHOLD_DENOM）で
-        // 検証する。
+        // 検証する。消費者はスコアリングを含まないチェックサム積算に限定し（モジュール
+        // ドキュメント参照）、あわせて処理量（走査行数・チェックサム一致）を毎ラウンド
+        // 検証することで、実時間比較だけでは見逃しうる比較条件のずれを防ぐ。
         #[test]
         fn table8_arena_query_path_completes_within_ratio_threshold_of_rescan_path() {
             let path = unique_db_path("perf-dataset");
@@ -2033,13 +2049,12 @@ mod tests {
             // ウォームアップ 1 回（ファイルシステムキャッシュ等の初回コストを計測から
             // 除外する。既存 perf テスト tests/incremental_write_perf.rs と同方針）。
             {
-                let warmup_queries = make_queries(0xabad_1dea);
                 let arena = VectorArena::build(&storage, TABLE_NAME).expect("warmup build arena");
-                for q in &warmup_queries {
-                    std::hint::black_box(best_score_over_arena(&arena, q));
+                for _ in 0..QUERY_COUNT {
+                    std::hint::black_box(access_checksum_over_arena(&arena));
                 }
-                for q in &warmup_queries {
-                    std::hint::black_box(best_score_over_rescan(&storage, q));
+                for _ in 0..QUERY_COUNT {
+                    std::hint::black_box(access_checksum_over_rescan(&storage));
                 }
             }
 
@@ -2047,26 +2062,30 @@ mod tests {
             let mut round_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
 
             for round in 0..MEASUREMENT_ROUNDS as u32 {
-                let queries = make_queries(0x9e37_79b9u32.wrapping_add(round));
+                // ラウンドごとに計測順を交互にし、ランナー負荷の系統的なドリフト
+                // （例: 前半ラウンドほど空いている／混んでいる）が一方の経路にだけ
+                // 有利・不利に働くのを相殺する。
+                let arena_first = round % 2 == 0;
 
-                // 経路 (a): コールドスタート・アリーナを一度 build し、各クエリはアリーナ
-                // 走査で完結する。build 自体もこの経路のコストとして計測に含める
-                // （都度読み直し経路の各クエリが redb からの読み直しコストを含むのと
-                // 対称にするため）。
-                let started = Instant::now();
-                let arena =
-                    VectorArena::build(&storage, TABLE_NAME).expect("build arena (measured)");
-                for q in &queries {
-                    std::hint::black_box(best_score_over_arena(&arena, q));
-                }
-                let t_arena_round = started.elapsed();
+                let (t_arena_round, t_rescan_round, arena_checksum, rescan_checksum) =
+                    if arena_first {
+                        let (t_arena, arena_checksum) = measure_arena_round(&storage);
+                        let (t_rescan, rescan_checksum) = measure_rescan_round(&storage);
+                        (t_arena, t_rescan, arena_checksum, rescan_checksum)
+                    } else {
+                        let (t_rescan, rescan_checksum) = measure_rescan_round(&storage);
+                        let (t_arena, arena_checksum) = measure_arena_round(&storage);
+                        (t_arena, t_rescan, arena_checksum, rescan_checksum)
+                    };
 
-                // 経路 (b): 各クエリごとに Storage::scan() で全行を読み直しデコードする。
-                let started = Instant::now();
-                for q in &queries {
-                    std::hint::black_box(best_score_over_rescan(&storage, q));
-                }
-                let t_rescan_round = started.elapsed();
+                // 処理量検証: 両経路が同一データ量（全 ROWS 行 × QUERY_COUNT 反復分）を
+                // 処理し、かつ同一の値を積算したことを確認する。コンパイラ最適化に
+                // よる消去や、比較条件のずれ（例: 片方だけ行数が違う）を負荷に依存せず
+                // 検出する。
+                assert_eq!(
+                    arena_checksum, rescan_checksum,
+                    "arena and rescan paths must process identical data (round={round})"
+                );
 
                 // 比率は同一ラウンド内のペアで計算する（`MEASUREMENT_ROUNDS`
                 // ドキュメンテーションコメント参照。異なるラウンドの最小値同士を
@@ -2090,6 +2109,39 @@ mod tests {
                  rescan path across a majority of rounds, median_ratio={ratio:.4} \
                  rounds={round_durations:?}"
             );
+        }
+
+        /// 1 ラウンド分のアリーナ経路計測。build 自体もこの経路のコストとして計測に
+        /// 含める（都度読み直し経路の各反復が redb からの読み直しコストを含むのと
+        /// 対称にするため）。`arena.len()` が全行数と一致することも検証する。
+        fn measure_arena_round(storage: &Storage) -> (std::time::Duration, f64) {
+            let started = Instant::now();
+            let arena = VectorArena::build(storage, TABLE_NAME).expect("build arena (measured)");
+            assert_eq!(
+                arena.len(),
+                ROWS as usize,
+                "arena must hold all seeded rows"
+            );
+            let mut checksum = 0.0f64;
+            for _ in 0..QUERY_COUNT {
+                let (c, visited) = access_checksum_over_arena(&arena);
+                assert_eq!(visited, ROWS as usize, "arena path must visit all rows");
+                checksum += c;
+            }
+            (started.elapsed(), checksum)
+        }
+
+        /// 1 ラウンド分の都度読み直し経路計測。反復ごとに `scan_table_page` で
+        /// 全行を読み直し、走査行数が全行数と一致することを検証する。
+        fn measure_rescan_round(storage: &Storage) -> (std::time::Duration, f64) {
+            let started = Instant::now();
+            let mut checksum = 0.0f64;
+            for _ in 0..QUERY_COUNT {
+                let (c, visited) = access_checksum_over_rescan(storage);
+                assert_eq!(visited, ROWS as usize, "rescan path must visit all rows");
+                checksum += c;
+            }
+            (started.elapsed(), checksum)
         }
     }
 }
