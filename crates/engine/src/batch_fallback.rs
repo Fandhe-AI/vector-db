@@ -741,6 +741,23 @@ impl FallbackBatchEngine {
         // 渡された `ResidentMatrix` をそのまま使うためこの契約を満たす）。
         crate::batch_search::validate_batch_queries(self.cpu.dim, queries)?;
 
+        // 空バッチ（`queries.is_empty()`）を先行検証直後に確定的に扱う（Cursor Bugbot
+        // Medium 指摘対応・PR #158）。`validate_batch_queries` は件数 0 を有効な入力
+        // として受理する（走査すべき行が単に存在しないだけであり、`batch_search.rs`
+        // 全体の契約として空バッチはエラーではない）一方、`DispatchInput::for_batch`
+        // は `batch_size == 0` を不正入力として拒否する（決定表が確定させるべき経路が
+        // 存在しないため。`dispatch.rs` の fail-closed な検証方針）。この 2 つの
+        // 契約差を先行検証の直後で吸収せずに `runtime_latched` の後段まで進めると、
+        // 空バッチの成否が「これまでに primary が実行時失敗して縮退済みか」という
+        // 無関係な状態に依存してしまう（ラッチ済みなら `run_batch_search` へ直行して
+        // 成功、未ラッチなら後段の `DispatchInput::for_batch` が `InvalidBatchSize` を
+        // 返し失敗、という同一入力に対する非決定的な挙動）。ここで確定させることで、
+        // 空バッチは常に成功（空の結果）となり、`dispatch` の経路選択自体を
+        // 呼び出さない（選択すべき経路が存在しないため）。
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
         if self.runtime_latched.load(Ordering::Acquire) {
             return run_batch_search(&self.cpu, queries);
         }
@@ -758,13 +775,8 @@ impl FallbackBatchEngine {
             PrimarySlot::Available(_) => Some(GpuCapability::proven()),
             PrimarySlot::Unavailable => None,
         };
-        let dispatch_input = DispatchInput::for_batch(
-            gpu,
-            dispatch::detect_current_isa(),
-            self.cpu.dim,
-            queries.len(),
-        )
-        .map_err(to_batch_search_error)?;
+        let dispatch_input = DispatchInput::for_batch(gpu, self.cpu.dim, queries.len())
+            .map_err(to_batch_search_error)?;
         let execution_path =
             dispatch::select_execution_path(dispatch_input).map_err(to_batch_search_error)?;
 

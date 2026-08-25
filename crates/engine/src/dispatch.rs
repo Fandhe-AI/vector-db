@@ -81,10 +81,11 @@ pub enum DetectedIsa {
 }
 
 /// コンパイル時ターゲットのみに基づく保守的な ISA 下限検出（モジュールドキュメント
-/// 「ISA の完全な実行時検出」の項参照）。呼び出し元（`core.rs::EngineCore::search`）が
-/// 任意の [`DetectedIsa`] を偽装できないよう、`DispatchInput` のコンストラクタは
-/// この関数の戻り値のみを受け取る想定である（`isa` フィールド自体は private のため、
-/// 呼び出し元が別の値を混入させる経路はない）。
+/// 「ISA の完全な実行時検出」の項参照）。呼び出し元が任意の [`DetectedIsa`] を
+/// 偽装できないよう、[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]
+/// は `isa` を引数に取らず、内部でこの関数の戻り値のみを使う（codex-review P1
+/// 指摘対応・PR #158。`isa` フィールド自体も private のため、呼び出し元が別の値を
+/// 混入させる経路は構造的に存在しない）。
 pub fn detect_current_isa() -> DetectedIsa {
     if cfg!(target_arch = "aarch64") {
         // aarch64 の baseline ISA は Neon（128 bit）を含むことがアーキテクチャ仕様上
@@ -210,13 +211,24 @@ impl DispatchInput {
     /// 経路は `batch_fallback.rs::FallbackBatchEngine` を経由しないため GPU backend の
     /// 構築結果自体を持ちえず、これは実装漏れではなく設計上の制約である。
     ///
+    /// `isa` は引数に取らず、本コンストラクタが内部で [`detect_current_isa`] を呼んで
+    /// 固定する（codex-review P1 指摘対応・PR #158: 旧版は `isa` を呼び出し元から
+    /// 引数で受け取っており、`DispatchInput` のフィールドを private 化していても
+    /// crate 外から任意の未検証 [`DetectedIsa`]（例: 実機で対応していない
+    /// `Avx512`）を経路選択へ持ち込めてしまっていた。CORE-12 の「未検証指定による
+    /// 経路上書きを構造的に排除する」契約は、`isa` を外部入力として受け取らないこと
+    /// でのみ型で保証できる）。
+    ///
     /// `dim` は 0、または `storage::MAX_EMBEDDING_DIM` 超過で `Err`（fail-closed）。
-    pub fn for_single_query(
-        isa: DetectedIsa,
-        dim: usize,
-        pending_after_pop: bool,
-    ) -> Result<Self, DispatchError> {
-        Self::new(None, isa, dim, DimLimit::SingleQuery, 1, pending_after_pop)
+    pub fn for_single_query(dim: usize, pending_after_pop: bool) -> Result<Self, DispatchError> {
+        Self::new(
+            None,
+            detect_current_isa(),
+            dim,
+            DimLimit::SingleQuery,
+            1,
+            pending_after_pop,
+        )
     }
 
     /// `batch_fallback.rs::FallbackBatchEngine::batch_search`／`batch_search.rs` の
@@ -225,14 +237,23 @@ impl DispatchInput {
     /// 選べるが、値自体は `dispatch` モジュール外から偽装できない）。バッチ経路は
     /// 待機キューを持たないため `pending_after_pop` は常に `false` として扱う。
     ///
+    /// `isa` は [`Self::for_single_query`] と同じ理由で引数に取らず、内部で
+    /// [`detect_current_isa`] を呼んで固定する（codex-review P1 指摘対応・PR #158）。
+    ///
     /// `dim` は 0、または `batch_search::MAX_BATCH_DIM` 超過で `Err`（fail-closed）。
     pub fn for_batch(
         gpu: Option<GpuCapability>,
-        isa: DetectedIsa,
         dim: usize,
         batch_size: usize,
     ) -> Result<Self, DispatchError> {
-        Self::new(gpu, isa, dim, DimLimit::Batch, batch_size, false)
+        Self::new(
+            gpu,
+            detect_current_isa(),
+            dim,
+            DimLimit::Batch,
+            batch_size,
+            false,
+        )
     }
 
     fn new(
@@ -376,10 +397,23 @@ mod tests {
         GpuCapability::proven()
     }
 
+    /// `isa` を任意の [`DetectedIsa`] へ差し替えた [`DispatchInput`] を組み立てる
+    /// テスト専用ヘルパー。`isa` フィールドは private だが、`mod tests` は
+    /// `dispatch` モジュールの子であるため struct-update 構文でアクセスできる
+    /// （codex-review P1 指摘対応・PR #158: 公開 `for_single_query`／`for_batch` は
+    /// もはや `isa` を引数に取らず内部で [`detect_current_isa`] を呼んで固定するため、
+    /// ISA ごとの決定表網羅走査は crate 内 unit テストでのみ、この struct-update
+    /// 経由で行う。`GpuCapability` を仮に付与する既存パターンと同じ考え方）。
+    fn with_isa(input: DispatchInput, isa: DetectedIsa) -> DispatchInput {
+        DispatchInput { isa, ..input }
+    }
+
     #[test]
     fn single_query_without_pending_uses_cpu_simd() {
-        let input =
-            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, false).expect("valid input");
+        let input = with_isa(
+            DispatchInput::for_single_query(8, false).expect("valid input"),
+            DetectedIsa::Scalar,
+        );
         assert_eq!(
             select_execution_path(input).expect("valid input"),
             ExecutionPath::CpuSimd {
@@ -395,8 +429,10 @@ mod tests {
     /// クエリ経路が追加された場合」を模した入力を組み立てて確認する。
     #[test]
     fn single_query_with_pending_promotes_to_batch_row_reaches_gpu_if_capability_were_present() {
-        let base =
-            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, true).expect("valid input");
+        let base = with_isa(
+            DispatchInput::for_single_query(8, true).expect("valid input"),
+            DetectedIsa::Scalar,
+        );
         assert_eq!(base.dim_limit, DimLimit::SingleQuery);
         let hypothetical = DispatchInput {
             gpu: Some(gpu()),
@@ -423,8 +459,10 @@ mod tests {
     #[test]
     fn batch_prefers_gpu_when_available_even_for_single_item_batch() {
         for batch_size in [1usize, 2, MAX_BATCH_QUERIES] {
-            let input = DispatchInput::for_batch(Some(gpu()), DetectedIsa::Scalar, 8, batch_size)
-                .expect("valid input");
+            let input = with_isa(
+                DispatchInput::for_batch(Some(gpu()), 8, batch_size).expect("valid input"),
+                DetectedIsa::Scalar,
+            );
             assert_eq!(
                 select_execution_path(input).expect("valid input"),
                 ExecutionPath::Gpu,
@@ -436,8 +474,10 @@ mod tests {
     #[test]
     fn gpu_unavailable_always_falls_back_to_cpu_simd() {
         for batch_size in [1usize, 2, MAX_BATCH_QUERIES] {
-            let input = DispatchInput::for_batch(None, DetectedIsa::Avx2Fma, 8, batch_size)
-                .expect("valid input");
+            let input = with_isa(
+                DispatchInput::for_batch(None, 8, batch_size).expect("valid input"),
+                DetectedIsa::Avx2Fma,
+            );
             assert_eq!(
                 select_execution_path(input).expect("valid input"),
                 ExecutionPath::CpuSimd {
@@ -457,7 +497,10 @@ mod tests {
             (DetectedIsa::Avx512, SimdWidth::W512),
         ];
         for (isa, expected_width) in cases {
-            let input = DispatchInput::for_single_query(isa, 8, false).expect("valid input");
+            let input = with_isa(
+                DispatchInput::for_single_query(8, false).expect("valid input"),
+                isa,
+            );
             assert_eq!(
                 select_execution_path(input).expect("valid input"),
                 ExecutionPath::CpuSimd {
@@ -472,7 +515,7 @@ mod tests {
     fn zero_dim_is_rejected_for_single_query() {
         let max = crate::storage::MAX_EMBEDDING_DIM as usize;
         assert_eq!(
-            DispatchInput::for_single_query(DetectedIsa::Scalar, 0, false).unwrap_err(),
+            DispatchInput::for_single_query(0, false).unwrap_err(),
             DispatchError::InvalidDim { dim: 0, max }
         );
     }
@@ -480,7 +523,7 @@ mod tests {
     #[test]
     fn dim_over_limit_is_rejected_for_batch() {
         assert_eq!(
-            DispatchInput::for_batch(None, DetectedIsa::Scalar, MAX_BATCH_DIM + 1, 1).unwrap_err(),
+            DispatchInput::for_batch(None, MAX_BATCH_DIM + 1, 1).unwrap_err(),
             DispatchError::InvalidDim {
                 dim: MAX_BATCH_DIM + 1,
                 max: MAX_BATCH_DIM
@@ -494,14 +537,14 @@ mod tests {
     #[test]
     fn single_query_dim_limit_is_wider_than_batch_dim_limit() {
         let dim = MAX_BATCH_DIM + 1;
-        assert!(DispatchInput::for_single_query(DetectedIsa::Scalar, dim, false).is_ok());
-        assert!(DispatchInput::for_batch(None, DetectedIsa::Scalar, dim, 1).is_err());
+        assert!(DispatchInput::for_single_query(dim, false).is_ok());
+        assert!(DispatchInput::for_batch(None, dim, 1).is_err());
     }
 
     #[test]
     fn zero_batch_size_is_rejected() {
         assert_eq!(
-            DispatchInput::for_batch(None, DetectedIsa::Scalar, 8, 0).unwrap_err(),
+            DispatchInput::for_batch(None, 8, 0).unwrap_err(),
             DispatchError::InvalidBatchSize {
                 batch_size: 0,
                 max: MAX_BATCH_QUERIES
@@ -512,8 +555,7 @@ mod tests {
     #[test]
     fn batch_size_over_limit_is_rejected() {
         assert_eq!(
-            DispatchInput::for_batch(None, DetectedIsa::Scalar, 8, MAX_BATCH_QUERIES + 1)
-                .unwrap_err(),
+            DispatchInput::for_batch(None, 8, MAX_BATCH_QUERIES + 1).unwrap_err(),
             DispatchError::InvalidBatchSize {
                 batch_size: MAX_BATCH_QUERIES + 1,
                 max: MAX_BATCH_QUERIES
@@ -524,12 +566,20 @@ mod tests {
     #[test]
     fn determinism_same_input_yields_same_output_across_repeated_calls() {
         let cases = [
-            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, false).expect("valid input"),
-            DispatchInput::for_batch(Some(gpu()), DetectedIsa::Avx512, 8, 4).expect("valid input"),
+            with_isa(
+                DispatchInput::for_single_query(8, false).expect("valid input"),
+                DetectedIsa::Scalar,
+            ),
+            with_isa(
+                DispatchInput::for_batch(Some(gpu()), 8, 4).expect("valid input"),
+                DetectedIsa::Avx512,
+            ),
             DispatchInput {
                 pending_after_pop: true,
-                ..DispatchInput::for_batch(Some(gpu()), DetectedIsa::Scalar, 8, 1)
-                    .expect("valid input")
+                ..with_isa(
+                    DispatchInput::for_batch(Some(gpu()), 8, 1).expect("valid input"),
+                    DetectedIsa::Scalar,
+                )
             },
         ];
         for input in cases {
@@ -549,8 +599,10 @@ mod tests {
         for pending in [false, true] {
             let input = DispatchInput {
                 gpu: Some(gpu()),
-                ..DispatchInput::for_single_query(DetectedIsa::Scalar, 8, pending)
-                    .expect("valid input")
+                ..with_isa(
+                    DispatchInput::for_single_query(8, pending).expect("valid input"),
+                    DetectedIsa::Scalar,
+                )
             };
             let expected = if should_aggregate_into_batch(pending) {
                 ExecutionPath::Gpu
@@ -583,8 +635,10 @@ mod tests {
             for isa in isa_variants {
                 for batch_size in batch_sizes {
                     let gpu_opt = if gpu_present { Some(gpu()) } else { None };
-                    let input =
-                        DispatchInput::for_batch(gpu_opt, isa, 8, batch_size).expect("valid input");
+                    let input = with_isa(
+                        DispatchInput::for_batch(gpu_opt, 8, batch_size).expect("valid input"),
+                        isa,
+                    );
                     let expected = if gpu_present {
                         ExecutionPath::Gpu
                     } else {
@@ -610,8 +664,11 @@ mod tests {
                     let gpu_opt = if gpu_present { Some(gpu()) } else { None };
                     let input = DispatchInput {
                         gpu: gpu_opt,
-                        ..DispatchInput::for_single_query(isa, 8, pending_after_pop)
-                            .expect("valid input")
+                        ..with_isa(
+                            DispatchInput::for_single_query(8, pending_after_pop)
+                                .expect("valid input"),
+                            isa,
+                        )
                     };
                     let treated_as_batch = should_aggregate_into_batch(pending_after_pop);
                     let expected = if treated_as_batch && gpu_present {

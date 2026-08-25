@@ -342,6 +342,77 @@ fn invalid_query_does_not_prematurely_latch_the_runtime_fallback() {
     assert_eq!(events[0].reason, FallbackReason::Runtime);
 }
 
+// 回帰テスト（Cursor Bugbot Medium 指摘対応・PR #158）: 空バッチ
+// （`queries.is_empty()`）は `runtime_latched` の状態に関わらず常に成功
+// （空の結果）を返す。`batch_search.rs::validate_batch_queries` は件数 0 を
+// 有効な入力として受理する一方、`DispatchInput::for_batch` は
+// `batch_size == 0` を不正入力として拒否するため、`FallbackBatchEngine::
+// batch_search` が両者の間で経路選択（`dispatch::select_execution_path`）を
+// 呼び出してしまうと、空バッチの成否が「これまでに primary が実行時失敗して
+// `runtime_latched` 済みか」という無関係な状態に依存する非決定的な挙動に
+// なってしまう。ラッチ未発火（primary 健全）・ラッチ発火済み（CPU 縮退済み）
+// の双方で空バッチが同一の `Ok(vec![])` を返すことを確認する。
+#[test]
+fn empty_batch_always_succeeds_regardless_of_runtime_latch_state() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let empty_queries: Vec<BatchQuery<'_>> = Vec::new();
+
+    // ラッチ未発火（primary 健全）。
+    let observer_healthy = RecordingObserver::default();
+    let engine_healthy = FallbackBatchEngine::build_with_gpu_reference(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        Box::new(observer_healthy.clone()),
+    )
+    .expect("build ok");
+    assert!(engine_healthy
+        .batch_search(&empty_queries)
+        .expect("empty batch must succeed while primary is healthy")
+        .is_empty());
+    assert!(observer_healthy.events().is_empty());
+
+    // ラッチ発火済み（実行時エラーで一度 CPU 縮退へ切り替わった後）。
+    let observer_latched = RecordingObserver::default();
+    let engine_latched = FallbackBatchEngine::build(
+        &ids,
+        &tenant_ids,
+        &visibilities,
+        dim,
+        &vectors,
+        |_matrix: ResidentMatrix| {
+            Ok(Box::new(FailingBackend(BatchBackendError::DeviceLost(
+                "lost".to_string(),
+            ))) as Box<dyn BatchBackend>)
+        },
+        Box::new(observer_latched.clone()),
+    )
+    .expect("build ok");
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 1,
+        ctx: &ctx_a,
+    }];
+    engine_latched
+        .batch_search(&queries)
+        .expect("valid query triggers runtime fallback and latches it");
+    assert_eq!(observer_latched.events().len(), 1, "latch must be armed");
+
+    assert!(engine_latched
+        .batch_search(&empty_queries)
+        .expect("empty batch must succeed identically after the runtime latch is armed")
+        .is_empty());
+    assert_eq!(
+        observer_latched.events().len(),
+        1,
+        "the empty batch itself must not emit an additional fallback event"
+    );
+}
+
 // primary が TenantMaskViolation 等の入力エラーを返した場合、縮退トリガには
 // ならず fail-closed に `Err` をそのまま返すことを確認する（security.md
 // 「不安全な設計」対応）。

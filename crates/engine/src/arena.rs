@@ -1569,7 +1569,7 @@ mod tests {
     // （ROWS × DIM × 4 バイト ≈ 2.6 MiB で 1 ページに収まる）。
     mod perf {
         use super::*;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
         /// 計測対象テーブル名。カタログにこのテーブルのみを登録し、`VectorArena::build`
         /// のテーブルスコープゲートを満たす。
@@ -1582,12 +1582,15 @@ mod tests {
         /// 1 ラウンドで実行するクエリ本数。
         const QUERY_COUNT: usize = 40;
 
-        /// ノイズ対策として、両経路それぞれを複数回計測し最小値（best-of-N）を取る回数。
-        /// 中央値ではなく最小値を採用する理由: 共有 CI ランナーはスケジューラの割り込み・
-        /// 隣接ジョブの負荷により両経路が同時に一時的な遅延を受けるが、その遅延は
-        /// ラウンドごとに独立に発生するため、複数ラウンドの最小値を取ることで
-        /// 「ランナーノイズが乗っていない実測」に最も近づく（CI 環境での
-        /// flaky 化対応。ラウンド数を増やすほど最小値が真値へ収束する）。
+        /// ノイズ対策として、複数ラウンド計測しラウンドごとの比率（`t_arena / t_rescan`）の
+        /// 中央値を判定に使う回数（codex-review P2 指摘対応・PR #158: 旧版は両経路
+        /// それぞれ独立に最小値（best-of-N）を取ってから比率を計算していたが、これは
+        /// 「アリーナ経路がたまたま速かったラウンド」と「都度読み直し経路がたまたま
+        /// 遅かったラウンド」が別ラウンドでも組み合わさってしまい、実際には一度も
+        /// 両立していない好条件同士を比較することで、持続的な性能回帰を過小評価しうる。
+        /// 同一ラウンド内でペアの比率を取ってから中央値を選ぶことで、ランナーノイズへの
+        /// 頑健性（少数ラウンドの外れ値には引きずられない）を保ちつつ、大半のラウンドで
+        /// 一貫して悪化する回帰は検出できるようにする）。
         const MEASUREMENT_ROUNDS: usize = 7;
 
         /// 判定閾値の分母（アリーナ経路は都度読み直し経路の `1 / RATIO_THRESHOLD_DENOM`
@@ -1606,13 +1609,17 @@ mod tests {
             (0..dim).map(|_| rng.next_f32()).collect()
         }
 
-        /// best-of-N: 複数ラウンドの最小値を採用する（`MEASUREMENT_ROUNDS` のドキュメント
-        /// コメント参照。中央値ではなくランナーノイズに最も強い最小値を使う）。
-        fn best_of(values: Vec<Duration>) -> Duration {
-            values
-                .into_iter()
-                .min()
-                .expect("at least one measurement round")
+        /// 複数ラウンドの比率（`t_arena / t_rescan`。同一ラウンド内のペアで計算済み）の
+        /// 中央値を取る（`MEASUREMENT_ROUNDS` のドキュメントコメント参照）。
+        fn median_ratio(mut ratios: Vec<f64>) -> f64 {
+            assert!(!ratios.is_empty(), "at least one measurement round");
+            ratios.sort_by(|a, b| a.partial_cmp(b).expect("ratio is finite"));
+            let mid = ratios.len() / 2;
+            if ratios.len() % 2 == 1 {
+                ratios[mid]
+            } else {
+                (ratios[mid - 1] + ratios[mid]) / 2.0
+            }
         }
 
         /// 単純な内積（テスト内の素朴なスコアリング。検索カーネル本体は後続タスクの管轄。
@@ -1717,8 +1724,8 @@ mod tests {
                 }
             }
 
-            let mut arena_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
-            let mut rescan_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
+            let mut round_ratios = Vec::with_capacity(MEASUREMENT_ROUNDS);
+            let mut round_durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
 
             for round in 0..MEASUREMENT_ROUNDS as u32 {
                 let queries = make_queries(0x9e37_79b9u32.wrapping_add(round));
@@ -1733,29 +1740,36 @@ mod tests {
                 for q in &queries {
                     std::hint::black_box(best_score_over_arena(&arena, q));
                 }
-                arena_durations.push(started.elapsed());
+                let t_arena_round = started.elapsed();
 
                 // 経路 (b): 各クエリごとに Storage::scan() で全行を読み直しデコードする。
                 let started = Instant::now();
                 for q in &queries {
                     std::hint::black_box(best_score_over_rescan(&storage, q));
                 }
-                rescan_durations.push(started.elapsed());
+                let t_rescan_round = started.elapsed();
+
+                // 比率は同一ラウンド内のペアで計算する（`MEASUREMENT_ROUNDS`
+                // ドキュメンテーションコメント参照。異なるラウンドの最小値同士を
+                // 比較しない）。
+                round_ratios.push(
+                    t_arena_round.as_secs_f64() / t_rescan_round.as_secs_f64().max(f64::EPSILON),
+                );
+                round_durations.push((t_arena_round, t_rescan_round));
             }
 
-            let t_arena = best_of(arena_durations);
-            let t_rescan = best_of(rescan_durations);
-            let ratio = t_arena.as_secs_f64() / t_rescan.as_secs_f64().max(f64::EPSILON);
+            let ratio = median_ratio(round_ratios);
 
             // プログラム出力文字列は英語規約（CI ログから経年変化を追跡できるようにする）。
             println!(
-                "table8 arena vs rescan perf: t_arena={t_arena:?} t_rescan={t_rescan:?} ratio={ratio:.4}"
+                "table8 arena vs rescan perf: median_ratio={ratio:.4} rounds={round_durations:?}"
             );
 
             assert!(
-                t_arena.saturating_mul(RATIO_THRESHOLD_DENOM) <= t_rescan,
-                "arena query path ({t_arena:?}) must complete within 1/{RATIO_THRESHOLD_DENOM} of the \
-                 rescan path ({t_rescan:?}), ratio={ratio:.4}"
+                ratio * f64::from(RATIO_THRESHOLD_DENOM) <= 1.0,
+                "arena query path must complete within 1/{RATIO_THRESHOLD_DENOM} of the \
+                 rescan path across a majority of rounds, median_ratio={ratio:.4} \
+                 rounds={round_durations:?}"
             );
         }
     }

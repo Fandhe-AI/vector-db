@@ -327,11 +327,7 @@ impl VectorCore for EngineCore {
         // 到達しないが、決定表が返しうる全 variant を網羅させることで、将来
         // 単発クエリ経路へ GPU capability を持ち込む変更が発生した際にコンパイル
         // エラーで検出できるようにする（`dispatch.rs` モジュールドキュメント参照）。
-        let dispatch_input = DispatchInput::for_single_query(
-            dispatch::detect_current_isa(),
-            expected_dim as usize,
-            false,
-        )?;
+        let dispatch_input = DispatchInput::for_single_query(expected_dim as usize, false)?;
         match dispatch::select_execution_path(dispatch_input)? {
             ExecutionPath::CpuSimd { .. } => {}
             ExecutionPath::Gpu => return Err(CoreError::GpuPathUnavailable),
