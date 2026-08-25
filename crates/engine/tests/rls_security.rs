@@ -179,6 +179,49 @@ fn random_query(seed: u64) -> Vec<f32> {
     (0..DIM).map(|_| rng.next_f32_signed()).collect()
 }
 
+/// `tenant_count` テナント均等割り当ての下で目標可視率 `visible_rate` を実際に
+/// 達成するために各テナントへ一律適用すべき private_rate を算出する。
+///
+/// viewer の実可視率は「Public 行（全テナント共通で可視）」と「Private 行のうち
+/// 自テナント分（`1/tenant_count` の確率で自テナントに属する）」の合算になる:
+/// `visible_rate = public_rate + (1 - public_rate) / tenant_count`。
+/// これを `public_rate` について解くと `(visible_rate * tenant_count - 1) / (tenant_count - 1)`
+/// となる（codex-review 指摘: 旧実装は `private_rate = 1 - visible_rate` を 2 テナントへ
+/// そのまま適用しており、Private 行の約半数が viewer 自身の行になる分だけ実可視率が
+/// 目標より高くなっていた。低可視率 10% を実際に生成するには `tenant_count >= 10` が要る）。
+fn private_rate_for_visible_rate(visible_rate: f64, tenant_count: usize) -> f64 {
+    let t = tenant_count as f64;
+    let public_rate = ((visible_rate * t - 1.0) / (t - 1.0)).clamp(0.0, 1.0);
+    1.0 - public_rate
+}
+
+/// 目標可視率マトリクステスト（`rls1_prefilter_...`/`rls1_search_time_filter_...`）で
+/// 共有するテナント名一覧。10 テナント均等割り当てで初めて可視率 10% を正確に生成できる
+/// （[`private_rate_for_visible_rate`] のコメント参照）。
+const RATE_MATRIX_TENANT_NAMES: [&str; 10] = [
+    "tenant-a", "tenant-b", "tenant-c", "tenant-d", "tenant-e", "tenant-f", "tenant-g", "tenant-h",
+    "tenant-i", "tenant-j",
+];
+
+/// 許可集合の実測可視率が目標 `visible_rate` に近いことを許容誤差内で検証する
+/// （codex-review 指摘対応: 生成方法を変えただけでは目標可視率を実際に生成できて
+/// いる保証にならないため、実測比率を assertion で担保する）。
+fn assert_visible_ratio_close_to_target(
+    allowed_len: usize,
+    total_rows: u64,
+    visible_rate: f64,
+    viewer: &str,
+    rate_idx: usize,
+) {
+    const TOLERANCE: f64 = 0.03;
+    let actual = allowed_len as f64 / total_rows as f64;
+    assert!(
+        (actual - visible_rate).abs() <= TOLERANCE,
+        "generated corpus did not realize the intended visible rate \
+         (viewer={viewer}, rate_idx={rate_idx}, target={visible_rate}, actual={actual})"
+    );
+}
+
 // ---------- 機械チェッカー ----------
 
 /// 検索結果 `hits` を許可集合 `allowed` に対して検査し、違反件数を返す。
@@ -263,23 +306,26 @@ fn assert_result_count_matches_visible_ceiling(hits: &[SearchHit], allowed_len: 
 
 // ---------- 本体テスト: PrefilterIndex ----------
 
-// 対象ビヘイビア: RLS-1。可視率（テナントごとの Private 比率。90% / 50% / 10%）×
-// 複数テナント視点（tenant-a・tenant-b）× 複数 k（可視行数未満・可視行数超過）を横断し、
+// 対象ビヘイビア: RLS-1。可視率（viewer の実測可視率。90% / 50% / 10%）×
+// 複数テナント視点（先頭 2 テナント）× 複数 k（可視行数未満・可視行数超過）を横断し、
 // `PrefilterIndex::search` の全試行で不許可行の混入 0 件を検証する。各 viewer は
 // `PolicyContext::with_visibilities([Public, Private])` で自テナントの Private 行を
 // 要求するため、他テナントの Private 行が混入すれば `row_tenant == self.tenant_id` の
 // 判定が壊れていない限り検出できる（テナント境界の判定分岐そのものを踏む構成。
 // Public のみ許可の既定 ctx では全テナント共通で可視になり判定分岐を踏まないため
-// 採用しない）。
+// 採用しない）。10 テナント均等割り当てにして低可視率 10% の経路も実際に生成する
+// （[`private_rate_for_visible_rate`] 参照。codex-review 指摘対応）。
 #[test]
 fn rls1_prefilter_no_violations_across_rate_tenant_k_matrix() {
     const NUM_ROWS: u64 = 3_000;
+    const TENANT_COUNT: usize = RATE_MATRIX_TENANT_NAMES.len();
 
     for (rate_idx, &visible_rate) in [0.9, 0.5, 0.1].iter().enumerate() {
-        // private_rate = 1 - visible_rate: 可視率が下がるほど各テナントの行が
-        // Private（自テナント限定）に振れる割合が増える。
-        let private_rate = 1.0 - visible_rate;
-        let tenants: [(&str, f64); 2] = [("tenant-a", private_rate), ("tenant-b", private_rate)];
+        let private_rate = private_rate_for_visible_rate(visible_rate, TENANT_COUNT);
+        let tenants: Vec<(&str, f64)> = RATE_MATRIX_TENANT_NAMES
+            .iter()
+            .map(|&name| (name, private_rate))
+            .collect();
 
         let path = unique_db_path(&format!("rls1-pf-{rate_idx}"));
         let _cleanup = CleanupGuard(path.clone());
@@ -287,11 +333,18 @@ fn rls1_prefilter_no_violations_across_rate_tenant_k_matrix() {
         let seed = 5000 + rate_idx as u64;
         let truth = seed_multi_tenant_corpus(&storage, NUM_ROWS, &tenants, seed);
 
-        for &(viewer, _) in &tenants {
+        for &(viewer, _) in &tenants[..2] {
             let ctx =
                 PolicyContext::with_visibilities(viewer, [Visibility::Public, Visibility::Private])
                     .expect("valid tenant");
             let allowed = allowed_ids(&truth, viewer, true);
+            assert_visible_ratio_close_to_target(
+                allowed.len(),
+                NUM_ROWS,
+                visible_rate,
+                viewer,
+                rate_idx,
+            );
 
             let index = PrefilterIndex::build(&storage, TABLE, &ctx).expect("build index");
             assert_eq!(
@@ -351,14 +404,20 @@ fn rls1_prefilter_zero_visible_tenant_returns_empty_without_error() {
 // ---------- 本体テスト: SearchTimeFilter ----------
 
 // 対象ビヘイビア: RLS-1。`PrefilterIndex` と同じマトリクス（可視率 × テナント視点 × k）を
-// `SearchTimeFilter::search` に対して検証する（TASK-134 経路）。
+// `SearchTimeFilter::search` に対して検証する（TASK-134 経路）。10 テナント均等割り当てに
+// して低可視率 10% の経路も実際に生成する（[`private_rate_for_visible_rate`] 参照。
+// codex-review 指摘対応）。
 #[test]
 fn rls1_search_time_filter_no_violations_across_rate_tenant_k_matrix() {
     const NUM_ROWS: u64 = 3_000;
+    const TENANT_COUNT: usize = RATE_MATRIX_TENANT_NAMES.len();
 
     for (rate_idx, &visible_rate) in [0.9, 0.5, 0.1].iter().enumerate() {
-        let private_rate = 1.0 - visible_rate;
-        let tenants: [(&str, f64); 2] = [("tenant-a", private_rate), ("tenant-b", private_rate)];
+        let private_rate = private_rate_for_visible_rate(visible_rate, TENANT_COUNT);
+        let tenants: Vec<(&str, f64)> = RATE_MATRIX_TENANT_NAMES
+            .iter()
+            .map(|&name| (name, private_rate))
+            .collect();
 
         let path = unique_db_path(&format!("rls1-stf-{rate_idx}"));
         let _cleanup = CleanupGuard(path.clone());
@@ -368,11 +427,18 @@ fn rls1_search_time_filter_no_violations_across_rate_tenant_k_matrix() {
 
         let filter = SearchTimeFilter::build(&storage, TABLE).expect("build filter");
 
-        for &(viewer, _) in &tenants {
+        for &(viewer, _) in &tenants[..2] {
             let ctx =
                 PolicyContext::with_visibilities(viewer, [Visibility::Public, Visibility::Private])
                     .expect("valid tenant");
             let allowed = allowed_ids(&truth, viewer, true);
+            assert_visible_ratio_close_to_target(
+                allowed.len(),
+                NUM_ROWS,
+                visible_rate,
+                viewer,
+                rate_idx,
+            );
 
             assert_eq!(
                 filter.len(&ctx).expect("len ok"),
