@@ -79,6 +79,30 @@ pub const MAX_BATCH_AGGREGATOR_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 /// （10^10 = 100 億回）を独立の上限として設ける。
 pub const MAX_BATCH_WORK: usize = 10_000_000_000;
 
+/// [`row_buffer_pool`] が保持してよいアイドルバッファの総バイト量上限（TASK-157・
+/// CORE-15 ポインタ。設定値であり、外部入力からは到達不能な内部定数。CORE-12 と
+/// 同じ「上書き機構自体を設けない」方針）。1 行分の f32 スクラッチバッファ
+/// （最大 [`MAX_BATCH_DIM`] 要素 = 32KiB）を複数サイズクラス分アイドル保持できる
+/// 程度の桁とし、[`MAX_BATCH_TOTAL_BYTES`]（常駐行列本体の上限。1 GiB）と比べて
+/// 十分小さい値に抑える（プールは性能最適化であり、常駐行列本体の予算を圧迫しない）。
+const ROW_BUFFER_POOL_QUOTA_BYTES: usize = 16 * 1024 * 1024;
+
+/// バッチ経路の行デコード用スクラッチバッファのプロセス共有プール（TASK-157・
+/// CORE-15 ポインタ）。`run_batch_search` の複数回呼び出し（`BatchEngine::batch_search`・
+/// `batch_fallback.rs::FallbackBatchEngine` 経由の双方）間でアロケータ呼び出しを
+/// 削減するための最適化であり、プールが空でもフォールブルな新規確保にフォールバック
+/// するため正当性には影響しない。`Mutex` はテスト・複数スレッドからの並行呼び出しに
+/// 対して安全側に倒す（`BatchBackend: Send + Sync` の契約と整合）。
+fn row_buffer_pool() -> &'static std::sync::Mutex<crate::buffer_pool::BufferPool> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<crate::buffer_pool::BufferPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        std::sync::Mutex::new(crate::buffer_pool::BufferPool::new(
+            ROW_BUFFER_POOL_QUOTA_BYTES,
+        ))
+    })
+}
+
 /// バッチ検索エンジンのエラー（fail-closed）。メッセージは英語（wire プロトコル
 /// 互換性・運用ツール連携のため。japanese-style.md 準拠）。他テナントのデータ・
 /// 存在情報を含めない。
@@ -1350,8 +1374,20 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
     // 集合が非空であることを見る（`row_is_reachable`）。`row_buf` は
     // `Vec::with_capacity`（abort-on-OOM）ではなく `try_reserve_exact` で
     // フォールブルに確保する（codex P1 指摘対応）。
-    let mut row_buf: Vec<f32> = Vec::new();
-    try_reserve_exact(&mut row_buf, source.dim(), "row_buf")?;
+    // TASK-157（対象ビヘイビア: CORE-15）: 行デコード用スクラッチバッファは
+    // プロセス共有のサイズクラス別プール（`buffer_pool.rs`）から取得する。
+    // `run_batch_search` は `BatchEngine::batch_search`（GPU 参照実装）・
+    // `FallbackBatchEngine`（CPU 縮退経路）の双方から呼ばれる共通パイプラインで
+    // あるため、繰り返し呼び出される実運用でアロケータ呼び出しが呼び出し回数に
+    // 比例して増え続けるのを避ける（プールが空・容量不足の場合はフォールブルな
+    // 新規確保にフォールバックするため、プール自体は最適化であり正当性には
+    // 影響しない）。次元は本モジュールが既に検証済みの [`MAX_BATCH_DIM`] を
+    // 上限として渡す（本モジュール独自の追加上限は新設しない）。
+    let mut row_buf = row_buffer_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .acquire(source.dim(), MAX_BATCH_DIM)
+        .map_err(|e| BatchSearchError::AllocationFailed(e.to_string()))?;
     let empty_query_indices: Vec<usize> = Vec::new();
     for row_idx in 0..source.row_count() {
         let Some(row_tenant) = source.tenant_ids().get(row_idx).map(String::as_str) else {
@@ -1374,7 +1410,7 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         let Some(id) = source.ids().get(row_idx).copied() else {
             continue;
         };
-        if source.row_f32_into(row_idx, &mut row_buf).is_none() {
+        if source.row_f32_into(row_idx, &mut row_buf.buf).is_none() {
             continue;
         }
 
@@ -1415,13 +1451,22 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             if !q.ctx.is_visible(row_tenant, row_visibility) {
                 continue;
             }
-            let score = crate::kernel::dot(&row_buf, q.vector);
+            let score = crate::kernel::dot(&row_buf.buf, q.vector);
             if !score.is_finite() {
                 continue;
             }
             selector.push(SearchHit { id, score });
         }
     }
+
+    // 行外側ループが終わり `row_buf` を使い終えたら、プールへ返却する
+    // （TASK-157・CORE-15 ポインタ）。以降の処理（選出結果の取り出し・独立
+    // 再検証）は `row_buf` を参照しないため、ここで返却して次回呼び出しでの
+    // 再利用可能性を最大化する。
+    row_buffer_pool()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .release(row_buf);
 
     // `out` も `Vec::with_capacity`（abort-on-OOM）ではなく
     // `try_reserve_exact` でフォールブルに確保する（codex P1 指摘対応）。
