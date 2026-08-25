@@ -13,13 +13,33 @@
 //!
 //! `core.rs::EngineCore`（`VectorCore::search`）への prefilter インデックスのキャッシュ
 //! 統合・API 変更は本タスクのスコープ外（`VectorCore` trait のシグネチャは変更しない）。
+//!
+//! 本モジュールはさらに [`SearchTimeFilter`]（TASK-134・対象ビヘイビア: RLS-1, RLS-3）を
+//! 提供する。[`PrefilterIndex`] は構築時に `PolicyContext` を束縛するため、ポリシーが
+//! リクエスト単位で動的に変わるワークロードでは毎回の再構築コストがかかる。
+//! [`SearchTimeFilter`] はそのフォールバックで、可視行の縮約ビュー（アリーナ）を保持せず、
+//! `search` 呼び出しごとにストレージをストリーミング走査して異なる `PolicyContext` を
+//! 受け取れる。可視性判定は全行アリーナを外部（`SearchProvider`）へ渡すマスク方式ではなく、
+//! 可視性判定とスコア計算を単一パスで trust boundary（本モジュール）内に閉じて行う
+//! （[`SearchInput`] の「可視行のみを含む縮約ビュー」契約を維持するため）。
+//! 静的ポリシー＝事前フィルタ（[`PrefilterIndex`]）／動的ポリシー＝検索時フィルタ
+//! （[`SearchTimeFilter`]）の使い分け・切り替え判断は呼び出し元の責務とする
+//! （本モジュールは両方の API を提供するのみ）。
+//!
+//! [`SearchTimeFilter`] は容量上限（[`crate::arena::MAX_ARENA_ROWS`]/
+//! [`crate::arena::MAX_ARENA_TOTAL_BYTES`]、[`crate::arena::check_capacity`] 経由）を
+//! [`PrefilterIndex`] と同じく「呼び出しテナントの可視行数・バイト量」基準で検査する
+//! （両型とも他テナントのデータ量が対象テナントの検索可用性へ干渉しない契約で揃えている。
+//! 詳細は [`SearchTimeFilter`] のドキュメント参照）。
 
 use std::collections::HashSet;
+
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::core::{provider_result_is_valid, validate_search_k, MAX_SEARCH_K};
-use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{self, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::Storage;
 
@@ -251,6 +271,289 @@ impl<'s> PrefilterIndex<'s> {
     /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
     pub fn table_name(&self) -> &str {
         self.arena.table_name()
+    }
+}
+
+/// 検索時フィルタ方式の再利用可能インデックス（TASK-134・RLS-1, RLS-3）。
+///
+/// [`PrefilterIndex`] との本質的な差分は「`PolicyContext` を構築時に束縛しない」こと。
+/// [`PrefilterIndex`] のような可視行の縮約ビュー（[`VectorArena`]）は保持しない。
+/// [`Self::search`]・[`Self::len`]・[`Self::is_empty`] が呼び出しの都度、単一の
+/// `redb::ReadTransaction` 上でテーブル行をストリーミング走査し、`ctx.is_visible` を
+/// 通過した行だけを扱う（同一インスタンスをリクエスト単位で異なるポリシーへ使い回せる、
+/// 動的ポリシー用のフォールバック）。
+///
+/// **アリーナ保持方式（旧実装）からの是正（codex P0）**: 旧実装は `ctx` を持たない
+/// [`VectorArena::build`]（無フィルタ）でテーブル全行を一括デコードして保持していたため、
+/// アリーナ容量上限（[`crate::arena::MAX_ARENA_ROWS`]/[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）
+/// の判定基準が「テーブル全体（全テナント合算）の行数・バイト量」になり、対象テナントと
+/// 無関係な他テナントの行量だけで検索全体が `CapacityExceeded` になり得た
+/// （[`VectorArena::build_filtered`] のドキュメントが「以前のバグとして修正した」と記す
+/// cross-tenant 可用性干渉と同種の問題を、この新公開経路で再導入していた）。本実装は
+/// アリーナを一切保持せず、[`Self::search`] が行ごとに `tenant_id`/`visibility` を
+/// 先に decode して `ctx.is_visible` を評価し、不可視行は embedding の decode・
+/// スコア計算を一切行わずスキップする（[`VectorArena::build_filtered`] と同じ
+/// 「可視性判定を embedding decode より前に行う」順序。不可視行の破損状態が対象テナントの
+/// 検索を失敗させることも、その存在情報を漏らすこともない）。容量上限
+/// （[`crate::arena::check_capacity`] を [`crate::arena::MAX_ARENA_ROWS`]/
+/// [`crate::arena::MAX_ARENA_TOTAL_BYTES`] で呼ぶ）は可視行の行数・バイト量にのみ適用する
+/// ため、他テナント行はカウントに入らず、[`PrefilterIndex`] と同じ「呼び出しテナントの
+/// 可視行数」基準で揃う。Top-k 選出は要求 k 件（`k <= `[`MAX_SEARCH_K`]）分のヒープにしか
+/// 保持しないため実メモリの無制限確保はそもそも起きないが、容量上限自体は
+/// [`PrefilterIndex`] と同一の「呼び出しテナントの論理データ量」契約として適用する。
+///
+/// **世代の事前・事後照合（[`PrefilterIndex`]）が本型に不要な理由**: [`PrefilterIndex`]
+/// は構築時スナップショットを保持し続けるため、`search` 時点のストレージ状態との食い違い
+/// （失効）を検出する必要がある。本型はアリーナを保持せず、`search`・`len`・`is_empty`
+/// いずれも呼び出しの都度、単一の read トランザクション上でテーブルを走査する
+/// （＝走査自体が常に「現在の」スナップショット）ため、構築時と検索時の状態が食い違う
+/// という状態自体が生じない。
+///
+/// 可視性判定とスコア計算は本モジュール（trust boundary 内）で完結させ、不可視行の
+/// id・ベクトルを [`SearchProvider`] のアドレス空間へ一切渡さない（provider を経由せず
+/// 本型が自前でスコア計算するため、そもそも `SearchProvider` のアドレス空間が存在しない）。
+pub struct SearchTimeFilter<'s> {
+    storage: &'s Storage,
+    table_name: String,
+    /// [`Self::build`] 時にカタログスキーマから取得・検証済みの埋め込み次元。
+    /// テーブルにベクトル列を追加する経路（`ALTER TABLE`）は存在しないため
+    /// （[`crate::catalog::Storage::alter_table_add_column`] は列追加のみ）、
+    /// 構築後に変わらない値としてキャッシュしてよい。
+    dim: u32,
+}
+
+impl<'s> SearchTimeFilter<'s> {
+    /// `table` の存在とベクトル次元だけを検証する（行走査は行わない。O(スキーマ) の
+    /// コストでテーブル行数に依存しない）。テーブル不存在は [`RlsError::NotFound`] へ
+    /// 丸め込む（存在情報を漏らさない。security.md P0。[`PrefilterIndex::build`] と
+    /// 同一契約）。
+    pub fn build(storage: &'s Storage, table: &str) -> Result<Self, RlsError> {
+        let read_txn = storage
+            .db()
+            .begin_read()
+            .map_err(crate::storage::StorageError::from)?;
+        let dim = match crate::arena::validated_vector_dim_in_txn(&read_txn, table) {
+            Ok(dim) => dim,
+            Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
+                return Err(RlsError::NotFound)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            storage,
+            table_name: table.to_string(),
+            dim,
+        })
+    }
+
+    /// `ctx` の可視性述語で Top-k 検索を行う（RLS-1: 不許可行の混入 0 件・RLS-3:
+    /// over-fetch なしで k 件充足）。契約は上記型ドキュメント参照。
+    ///
+    /// `k`・`query` の検証（[`PrefilterIndex::search`] と同一契約）の後、単一の
+    /// read トランザクション上でテーブル行を走査する。行ごとにまず
+    /// [`crate::storage::decode_row_tenant_and_visibility`] で `tenant_id`/`visibility`
+    /// のみを decode し、`ctx.is_visible` が偽の行は embedding decode・スコア計算を
+    /// 行わずスキップする。可視行は完全 decode 後、可視行数基準の容量検査
+    /// （[`crate::arena::check_capacity`]）を経て [`kernel::dot`] でスコア計算し、
+    /// [`kernel::TopKSelector::push`] へ渡す。次元不一致（[`ArenaError::DimMismatch`]）は
+    /// この時点で呼び出し元 `ctx` から可視と確定した行のみで起こるため、行 id を含めて
+    /// fail-closed に伝播してよい（[`PrefilterIndex::build`] と同じ契約。上記型ドキュメント
+    /// 参照）。最後に `provider_result_is_valid`（`core.rs`。件数上限・スコア有限性・
+    /// 重複なし・順序を検証）で選出結果を機械照合する（違反は
+    /// [`RlsError::ProviderResultRejected`]）。
+    pub fn search(
+        &self,
+        ctx: &PolicyContext,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>, RlsError> {
+        self.search_with_limits(
+            ctx,
+            query,
+            k,
+            crate::arena::MAX_ARENA_ROWS,
+            crate::arena::MAX_ARENA_TOTAL_BYTES,
+        )
+    }
+
+    /// [`Self::search`] の容量上限パラメータ化版。実装は本関数に集約し、[`Self::search`]
+    /// は本番用の定数（[`crate::arena::MAX_ARENA_ROWS`]・[`crate::arena::MAX_ARENA_TOTAL_BYTES`]）
+    /// で呼び出すだけの薄いラッパーにする（`arena.rs::VectorArena::build_filtered_with_limits`
+    /// と同じ理由: 本番の 1,000,000 行・1 GiB 相当のデータセットをテストごとに用意するのは
+    /// 非現実的なため、境界値検証を `#[cfg(test)]` から小さい上限値で再現する）。
+    fn search_with_limits(
+        &self,
+        ctx: &PolicyContext,
+        query: &[f32],
+        k: usize,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<SearchHit>, RlsError> {
+        validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
+
+        if query.len() != self.dim as usize {
+            return Err(RlsError::Kernel(KernelError::DimMismatch {
+                expected: self.dim,
+                found: query.len(),
+            }));
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
+        }
+
+        let Some(table) = self.open_row_table()? else {
+            // 1 行も書き込まれていないテーブル（`VectorArena::build` の空アリーナ相当）。
+            return Ok(Vec::new());
+        };
+
+        let mut selector = kernel::TopKSelector::new(k);
+        let mut visible_row_count: usize = 0;
+        for entry in table.iter().map_err(crate::storage::StorageError::from)? {
+            let (key, value) = entry.map_err(crate::storage::StorageError::from)?;
+            let id = key.value();
+            let buf = value.value();
+
+            // 可視性判定を embedding decode より前に行う（上記型ドキュメント参照。
+            // `VectorArena::build_filtered` と同じ順序）。
+            let (tenant_id, visibility) =
+                crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
+            if !ctx.is_visible(&tenant_id, visibility) {
+                continue;
+            }
+
+            // ここに到達するのは呼び出し元 `ctx` から可視な行のみ。次元不一致はこの行
+            // 自身の id を含めて fail-closed に伝播してよい（呼び出し元が既に到達できる
+            // 情報。`PrefilterIndex::build` と同じ契約。上記型ドキュメント参照）。
+            let row = crate::storage::decode_row(id, buf).map_err(ArenaError::from)?;
+            let found_dim =
+                u32::try_from(row.embedding.len()).map_err(|_| ArenaError::DimMismatch {
+                    id,
+                    expected: self.dim,
+                    found: u32::MAX,
+                })?;
+            if found_dim != self.dim {
+                return Err(ArenaError::DimMismatch {
+                    id,
+                    expected: self.dim,
+                    found: found_dim,
+                }
+                .into());
+            }
+
+            // 容量上限は可視行のみに適用する（他テナント行はカウントに入らない。
+            // 上記型ドキュメント参照）。`arena.rs::check_capacity` をそのまま再利用し、
+            // 判定ロジックを重複実装しない。
+            visible_row_count = visible_row_count
+                .checked_add(1)
+                .ok_or(ArenaError::CapacityExceeded)?;
+            crate::arena::check_capacity(visible_row_count, self.dim, max_rows, max_bytes)
+                .map_err(RlsError::from)?;
+
+            let score = kernel::dot(&row.embedding, query);
+            if !score.is_finite() {
+                // 格納ベクトルの NaN/Inf 混入・オーバーフローによる非有限化を除外する
+                // （`kernel.rs::CpuScalarProvider` と同方針）。
+                continue;
+            }
+            selector.push(SearchHit { id, score });
+        }
+        let hits = selector.into_sorted_vec();
+
+        // 返却直前の機械検証（件数上限・スコア有限性・重複なし・順序の 4 点。
+        // `PrefilterIndex::search` と異なり本型は `dyn SearchProvider` を経由せず、
+        // `hits` は上記ループで `ctx.is_visible` を通過した行からのみ inline 生成される
+        // ため、id 集合が可視行に属するかの検証は自己ループの同語反復になり
+        // `dyn SearchProvider` 越しの防御という本来の意義を持たない。そのため
+        // `visible_id_set` は全行分ではなく `hits` 自身の id から構築し、他 4 項目の
+        // 検証にのみ使う（`hits` の id は元々可視行由来なので (3) は常に真になる）。
+        let hit_id_set: HashSet<u64> = hits.iter().map(|hit| hit.id).collect();
+        if !provider_result_is_valid(&hits, k, &hit_id_set) {
+            return Err(RlsError::ProviderResultRejected);
+        }
+
+        Ok(hits)
+    }
+
+    /// `ctx` の可視性述語で数えた可視行数を返す（存在情報のため `ctx` 必須。
+    /// [`PrefilterIndex::len`] と異なり `ContextMismatch` は返さず、渡された `ctx` で
+    /// 都度判定する——[`Self`] は構築時にポリシーを束縛しないため）。ヘッダのみ decode
+    /// して数える全件走査（embedding decode・容量上限検査は行わない。カウントのみで
+    /// 追加のアロケーションを伴わないため）。
+    ///
+    /// **[`Self::search`] の返却件数との乖離（片方向のみ）**: `is_empty(ctx)` が `true`
+    /// なら `search` は必ず 0 件を返す（両者とも同じ `ctx.is_visible` 述語で判定する
+    /// ため）。逆に `len(ctx) >= 1`（`is_empty(ctx)` が `false`）であっても `search` が
+    /// 0 件になり得る——`search` はさらに、次元不一致行（fail-closed に `Err` を返す）・
+    /// スコアが非有限になる行（格納ベクトルへの NaN/Inf 混入）も除外するため
+    /// （[`Self::search`] 参照）。`len`/`is_empty` はこれらを判定しない。
+    /// [`PrefilterIndex::len`]/[`PrefilterIndex::is_empty`] も同じ片方向の乖離を持つ
+    /// （`search` に渡した `SearchProvider` が破損行・非有限スコア行を除外しうるため）。
+    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+        let Some(table) = self.open_row_table()? else {
+            return Ok(0);
+        };
+        let mut count: usize = 0;
+        for entry in table.iter().map_err(crate::storage::StorageError::from)? {
+            let (_key, value) = entry.map_err(crate::storage::StorageError::from)?;
+            let (tenant_id, visibility) =
+                crate::storage::decode_row_tenant_and_visibility(value.value())
+                    .map_err(ArenaError::from)?;
+            if ctx.is_visible(&tenant_id, visibility) {
+                count = count.checked_add(1).ok_or(ArenaError::CapacityExceeded)?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// 可視行が 0 件かを返す（`ctx` 判定は [`Self::len`] と同じ述語。先頭から可視行が
+    /// 見つかり次第打ち切るため全件走査の [`Self::len`] より軽い）。[`Self::search`] との
+    /// 乖離は [`Self::len`] のドキュメント参照。
+    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+        let Some(table) = self.open_row_table()? else {
+            return Ok(true);
+        };
+        for entry in table.iter().map_err(crate::storage::StorageError::from)? {
+            let (_key, value) = entry.map_err(crate::storage::StorageError::from)?;
+            let (tenant_id, visibility) =
+                crate::storage::decode_row_tenant_and_visibility(value.value())
+                    .map_err(ArenaError::from)?;
+            if ctx.is_visible(&tenant_id, visibility) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// 検索対象ベクトルの次元（`ctx` 不要。テーブル定義由来の非機微情報）。
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// `self.table_name` の行テーブルを新しい read トランザクション上で開く
+    /// （[`Self::search`]・[`Self::len`]・[`Self::is_empty`] 共通のエントリポイント）。
+    /// 1 行も書き込まれていない（テーブル未作成）場合は `Ok(None)`
+    /// （[`VectorArena::build`] の空アリーナ相当）。`redb::ReadOnlyTable` は内部で
+    /// トランザクションガードを `Arc` 保持するため、返り値は呼び出し元が `read_txn` を
+    /// 生かし続けなくても単独で使える（`redb::ReadTransaction::open_table` の戻り値契約）。
+    fn open_row_table(&self) -> Result<Option<redb::ReadOnlyTable<u64, &'static [u8]>>, RlsError> {
+        let read_txn = self
+            .storage
+            .db()
+            .begin_read()
+            .map_err(crate::storage::StorageError::from)?;
+        let row_table_name = crate::catalog::user_rows_table_name(&self.table_name);
+        let row_table_def: redb::TableDefinition<u64, &[u8]> =
+            redb::TableDefinition::new(&row_table_name);
+        match read_txn.open_table(row_table_def) {
+            Ok(t) => Ok(Some(t)),
+            Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+            Err(e) => Err(crate::storage::StorageError::from(e).into()),
+        }
     }
 }
 
@@ -1021,5 +1324,537 @@ mod tests {
         let provider = WritingDuringSearchProvider { storage: &storage };
         let result = index.search(&ctx, &provider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // ------------------------------------------------------------------
+    // SearchTimeFilter（TASK-134・RLS-1, RLS-3）
+    // ------------------------------------------------------------------
+
+    // 対象ビヘイビア: RLS-1（TASK-89 / TABLE-9 の可視性判定を前提とする）。複数テナント・
+    // 可視性混在データで、検索結果に不許可行の混入が 0 件であること（結果全件を
+    // `ctx.is_visible` で機械照合する）。他テナント・不可視行の判別には `Private` を使う
+    // （`Public` は TASK-89 でテナント横断の共有可視性へ変わったため、`Public` では
+    // 他テナント不可視の判別ができない。`PrefilterIndex` 側の同種テストと同方針）。
+    #[test]
+    fn search_time_filter_never_returns_invisible_rows() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            3,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 10).expect("search ok");
+        // id=2（他テナントの Private）・id=3（自テナントだが Public で ctx 未許可）は
+        // いずれも混入しない（RLS-1）。
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
+    }
+
+    // 対象ビヘイビア: RLS-1（動的ポリシー・TASK-89 / TABLE-9 の可視性判定を前提とする）。
+    // 同一 `SearchTimeFilter` インスタンスに対し異なる `PolicyContext` で連続検索し、
+    // 各回とも当該 ctx の可視行のみが返ること（再構築不要のフォールバック特性の確認。
+    // `PrefilterIndex` はこの用途では ctx ごとに再構築が必要）。テナントごとの分離を
+    // 判別するため `Private` を使う（`Public` はテナント横断の共有可視性のため判別に
+    // 使えない）。
+    #[test]
+    fn search_time_filter_reuses_the_same_instance_across_different_policy_contexts() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        let hits_a = filter.search(&ctx_a, &[1.0, 0.0], 10).expect("search ok");
+        assert_eq!(hits_a.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1]);
+
+        let ctx_b = PolicyContext::with_visibilities("tenant-b", [Visibility::Private])
+            .expect("valid tenant");
+        let hits_b = filter.search(&ctx_b, &[1.0, 0.0], 10).expect("search ok");
+        assert_eq!(hits_b.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2]);
+    }
+
+    // 対象ビヘイビア: RLS-3。可視行数 >= k のとき結果がちょうど k 件で、単一パスのみで
+    // 充足する（over-fetch なし）。
+    #[test]
+    fn search_time_filter_returns_exactly_k_hits_when_enough_visible_rows_exist() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        for (id, x) in [(1, 1.0), (2, 0.8), (3, 0.6), (4, 0.4)] {
+            insert(
+                &storage,
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[x, 0.0],
+            );
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 2).expect("search ok");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[1].id, 2);
+    }
+
+    // 対象ビヘイビア: RLS-3。可視行数 < k のときは可視行全件を返し、エラーにしない。
+    #[test]
+    fn search_time_filter_returns_all_visible_rows_when_fewer_than_k() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 10).expect("search ok");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
+    }
+
+    // 対象ビヘイビア: RLS-1 と RLS-3 の判別テスト（本 Issue のレビュー指摘対応・TASK-89 /
+    // TABLE-9 の可視性判定を前提とする）。不可視行が可視行よりスコア上位に来て k 枠を
+    // 奪う状況を作る（tenant-b の 2 行が最上位スコアを占め、ctx=tenant-a・k=2 では
+    // tenant-a の 2 行のみが正解）。「全行で top-k を選んでから可視性でフィルタする」
+    // 誤実装（可視性を最後に後付けする RLS-3 違反の典型パターン）だと、上位 k 件が
+    // すべて不可視行で埋まり最終結果が空になる。可視性判定をスコア計算前に行う正しい
+    // 実装でのみ `[3, 4]` が返る。tenant-b の行は `Private` にする（`Public` はテナント
+    // 横断の共有可視性のため他テナント不可視の判別に使えない）。
+    #[test]
+    fn search_time_filter_visibility_is_applied_before_top_k_selection_not_after() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-b",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Private,
+            &[0.9, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            3,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            4,
+            "tenant-a",
+            Visibility::Public,
+            &[0.4, 0.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 2).expect("search ok");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, 3);
+        assert_eq!(hits[1].id, 4);
+    }
+
+    // fail-closed 系: k == 0 / MAX_SEARCH_K 超過は InvalidK。
+    #[test]
+    fn search_time_filter_rejects_k_zero_and_over_limit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        assert!(matches!(
+            filter.search(&ctx, &[1.0, 0.0], 0),
+            Err(RlsError::InvalidK { k: 0 })
+        ));
+        assert!(matches!(
+            filter.search(&ctx, &[1.0, 0.0], MAX_SEARCH_K + 1),
+            Err(RlsError::InvalidK { .. })
+        ));
+    }
+
+    // fail-closed 系: 次元不一致・非有限クエリは Kernel(...)。
+    #[test]
+    fn search_time_filter_rejects_dim_mismatch_and_non_finite_query() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        assert!(matches!(
+            filter.search(&ctx, &[1.0, 0.0, 0.0], 1),
+            Err(RlsError::Kernel(KernelError::DimMismatch { .. }))
+        ));
+        assert!(matches!(
+            filter.search(&ctx, &[f32::NAN, 0.0], 1),
+            Err(RlsError::Kernel(KernelError::NonFiniteQuery))
+        ));
+    }
+
+    // fail-closed 系: 存在しないテーブルは NotFound（存在情報を漏らさない）。
+    #[test]
+    fn search_time_filter_build_returns_not_found_for_missing_table() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+
+        let result = SearchTimeFilter::build(&storage, "no_such_table");
+        assert!(matches!(result, Err(RlsError::NotFound)));
+    }
+
+    // 対象ビヘイビア: RLS-1（構造的是正: ストリーミング走査への切り替え）。
+    // `SearchTimeFilter::build` は行走査自体を行わないため、次元不一致で壊れた行が
+    // 呼び出し元とは無関係な他テナント（tenant-b）に属していても `build` 自体は成功する。
+    // さらに `search`（ctx=tenant-a）はその破損行を可視性判定の時点で除外し、embedding の
+    // decode を一切行わないため、破損に触れずエラーにもならず正常な結果を返す
+    // （他テナントの破損状態が対象テナントの検索可用性へ干渉しないことの直接確認）。
+    // `insert_row_into_table` は挿入時点で次元検証するため、`arena.rs::tests` と同じ手法
+    // （検証を経由しない生の write トランザクション）で次元不一致行を直接書き込む。
+    #[test]
+    fn search_time_filter_skips_a_foreign_tenants_corrupted_row_without_decoding_it() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 4))
+            .expect("create table");
+        // tenant-a の正常行（呼び出し元想定のテナント）。
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 2.0, 3.0, 4.0],
+        );
+        // 呼び出し元とは無関係な tenant-b の行 id=2 を、次元不一致状態で直接書き込む。
+        // `Private`（テナント横断で不可視。TASK-89 / TABLE-9 で `Public` はテナント横断の
+        // 共有可視性になったため、可視性の分離判別には `Private` を使う）にする。
+        {
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = crate::catalog::user_rows_table_name("docs");
+                let row_table_def: redb::TableDefinition<u64, &[u8]> =
+                    redb::TableDefinition::new(&row_table_name);
+                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let encoded = crate::storage::encode_row(&RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: &[1.0, 2.0],
+                    metadata: &[],
+                })
+                .expect("encode mismatched-dim row for tenant-b");
+                row_table
+                    .insert(2u64, encoded.as_slice())
+                    .expect("insert mismatched-dim row bypassing dim validation");
+            }
+            write_txn.commit().expect("commit mismatched-dim row");
+        }
+
+        // build は行走査をしないため、他テナントの破損行があっても成功する。
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build must not scan rows");
+
+        // ctx=tenant-a（既定は Public のみ許可）は tenant-b の Private 行（id=2）を
+        // 不可視にする。破損行 id=2 は可視性判定の時点でスキップされ embedding decode に
+        // 到達しないため、search はエラーにならない。
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let hits = filter
+            .search(&ctx, &[1.0, 2.0, 3.0, 4.0], 10)
+            .expect("corrupted foreign-tenant row must not affect this tenant's search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, 1);
+    }
+
+    // 対象ビヘイビア: RLS-1（codex P0 の直接的な再現テスト）。容量上限（ここでは
+    // `search_with_limits` 経由で小さい `max_rows` を注入）が「呼び出しテナントの可視行数」
+    // 基準であり、対象テナントと無関係な他テナントの行量に左右されないことを検証する
+    // （`arena.rs::build_filtered_capacity_check_is_based_on_visible_rows_not_total_table_rows`
+    // と同じ構造）。tenant-b（不可視想定）の行を上限を上回る本数だけ挿入しても、
+    // tenant-a（可視想定）の行が上限以下なら search は成功する。
+    #[test]
+    fn search_time_filter_capacity_check_is_based_on_visible_rows_not_total_table_rows() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+
+        // tenant-b（不可視想定）の行を、可視行数の上限（3）を上回る本数だけ挿入する。
+        for id in 0..8u64 {
+            insert(
+                &storage,
+                "docs",
+                id,
+                "tenant-b",
+                Visibility::Private,
+                &[9.0, 9.0],
+            );
+        }
+        // tenant-a（可視想定）の行は上限（3）以下の 2 件のみ。
+        for id in 8..10u64 {
+            insert(
+                &storage,
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[1.0, 1.0],
+            );
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let max_rows = 3usize;
+        let max_bytes = usize::MAX; // 本テストでは行数上限だけを検証対象にする。
+        let hits = filter
+            .search_with_limits(&ctx, &[1.0, 1.0], 10, max_rows, max_bytes)
+            .expect(
+                "capacity check must be based on the 2 visible rows (<= max_rows), \
+                 not the 10 total table rows (> max_rows)",
+            );
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.id == 8 || h.id == 9));
+    }
+
+    // 対象ビヘイビア: RLS-1。可視行数自体が上限を超えるテナントの検索は、他テナントの
+    // 存在に関係なく `CapacityExceeded` で拒否される（fail-closed。無制限確保を防ぐ本来の
+    // 目的が保たれていることの確認）。
+    #[test]
+    fn search_time_filter_capacity_check_rejects_when_own_visible_rows_exceed_the_limit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+
+        for id in 0..4u64 {
+            insert(
+                &storage,
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[1.0, 1.0],
+            );
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let max_rows = 3usize; // 可視行 4 件 > 上限 3 件。
+        let max_bytes = usize::MAX;
+        let result = filter.search_with_limits(&ctx, &[1.0, 1.0], 10, max_rows, max_bytes);
+        assert!(matches!(
+            result,
+            Err(RlsError::Arena(ArenaError::CapacityExceeded))
+        ));
+    }
+
+    // 世代の事前・事後照合を撤廃したことの直接確認（上記型ドキュメント参照）:
+    // `build` 後に別の書き込みがコミットされていても、`search` は都度ストレージを
+    // ストリーミング走査するため、新規行を含めた最新状態を返す（`IndexStale` にはならない）。
+    #[test]
+    fn search_time_filter_reflects_writes_committed_after_build() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.5, 0.0],
+        );
+
+        let hits = filter
+            .search(&ctx, &[1.0, 0.0], 10)
+            .expect("search must reflect the write committed after build");
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the row inserted after build must be visible to the next search"
+        );
+    }
+
+    // 選出規約: スコア降順・同点 id 昇順が `CpuScalarProvider` の結果と一致する
+    // （`TopKSelector` 共用の回帰確認）。
+    #[test]
+    fn search_time_filter_selection_matches_cpu_scalar_provider_tie_break() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        // 3 行とも同スコア（1.0）。タイブレークは id 昇順。
+        for id in [3u64, 2, 1] {
+            insert(
+                &storage,
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[1.0, 0.0],
+            );
+        }
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let hits = filter.search(&ctx, &[1.0, 0.0], 1).expect("search ok");
+        assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
+    }
+
+    // `len`/`is_empty` は渡された ctx の可視性述語で都度判定する（`PrefilterIndex` と
+    // 異なり ContextMismatch を返さない）。テナントごとの分離を判別するため `Private` を
+    // 使う（`Public` は TASK-89 / TABLE-9 でテナント横断の共有可視性へ変わったため
+    // 判別に使えない）。
+    #[test]
+    fn search_time_filter_len_and_is_empty_use_the_given_context_each_time() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-b",
+            Visibility::Private,
+            &[1.0, 0.0],
+        );
+
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+
+        let ctx_a = PolicyContext::with_visibilities("tenant-a", [Visibility::Private])
+            .expect("valid tenant");
+        assert_eq!(filter.len(&ctx_a).expect("len ok"), 1);
+        assert!(!filter.is_empty(&ctx_a).expect("is_empty ok"));
+
+        let ctx_c = PolicyContext::with_visibilities("tenant-c", [Visibility::Private])
+            .expect("valid tenant");
+        assert_eq!(filter.len(&ctx_c).expect("len ok"), 0);
+        assert!(filter.is_empty(&ctx_c).expect("is_empty ok"));
+    }
+
+    #[test]
+    fn search_time_filter_dim_and_table_name_do_not_require_a_context() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 3))
+            .expect("create table");
+        let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
+        assert_eq!(filter.dim(), 3);
+        assert_eq!(filter.table_name(), "docs");
     }
 }

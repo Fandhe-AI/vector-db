@@ -23,7 +23,9 @@
 //! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-133（`rls.rs`。
 //! `PolicyContext`（TASK-124）と接続する事前フィルタ方式のテナント境界コア実装。対象
 //! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` へのキャッシュ統合は
-//! 後続タスクの管轄）・TASK-107
+//! 後続タスクの管轄）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
+//! 検索時フィルタ方式によるテナント境界フォールバック。対象ビヘイビア: RLS-1, RLS-3。
+//! `PrefilterIndex`（TASK-133）との使い分けは呼び出し元の責務）・TASK-107
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
 //! 方式差し替えと、依存追加なしの参照実装 2 種。対象ビヘイビア: SEARCH-6, SEARCH-7,
 //! SEARCH-8。方式（クロスエンコーダ等）の最終選定・効果測定回帰は後続タスクの管轄）・

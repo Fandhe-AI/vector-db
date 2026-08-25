@@ -39,8 +39,10 @@ use crate::catalog::{self, CatalogError};
 use crate::storage::{decode_row, Storage, StorageError, Visibility};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
-/// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
-const MAX_ARENA_ROWS: usize = 1_000_000;
+/// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。`pub(crate)`:
+/// `rls.rs::SearchTimeFilter`（TASK-134、ストリーミング走査。アリーナを保持しないが
+/// 可視行の論理データ量上限は本モジュールと揃える）が同じ数値を参照する。
+pub(crate) const MAX_ARENA_ROWS: usize = 1_000_000;
 
 /// アリーナが確保してよい総バイト量の上限。`vectors: Vec<f32>` だけでなく、
 /// 同時に確保する `ids`・`tenant_ids`・`visibilities` の見積もりバイト量も合算した
@@ -48,7 +50,8 @@ const MAX_ARENA_ROWS: usize = 1_000_000;
 /// 上限対象にすると、他バッファの確保が上限検証をすり抜けて OOM を招き得るため）。
 /// `MAX_ARENA_ROWS` だけでは次元数が大きい場合に依然として巨大確保になり得るため、
 /// 行数とバイト量の両方で上限を課す（`storage.rs` の `MAX_SCAN_TOTAL_BYTES` と同方針）。
-const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+/// `pub(crate)`: [`MAX_ARENA_ROWS`] と同じ理由で `rls.rs::SearchTimeFilter` が参照する。
+pub(crate) const MAX_ARENA_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 
 /// アリーナ構築層の公開エラー型。`storage.rs` の設計メモ（`StorageError` への
 /// blanket `From<E: Into<redb::Error>>` impl）が存在するため coherence 制約上
@@ -149,7 +152,15 @@ pub type Result<T> = std::result::Result<T, ArenaError>;
 /// `MAX_ARENA_ROWS`・`MAX_ARENA_TOTAL_BYTES` が private 定数であり、境界値検証
 /// （ちょうど上限・上限+1 等）を本ファイル内の `#[cfg(test)]` モジュールから
 /// 直接パラメータ化して再現するため。
-fn check_capacity(row_count: usize, dim: u32, max_rows: usize, max_bytes: usize) -> Result<usize> {
+/// `pub(crate)`: `rls.rs::SearchTimeFilter`（TASK-134、ストリーミング走査）が可視行の
+/// 論理データ量上限を本モジュールと同じ判定ロジックで検査するために再利用する
+/// （容量上限の重複実装を避ける）。
+pub(crate) fn check_capacity(
+    row_count: usize,
+    dim: u32,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<usize> {
     if row_count > max_rows {
         return Err(ArenaError::CapacityExceeded);
     }
@@ -308,6 +319,23 @@ impl GrowableArenaBuffers {
     }
 }
 
+/// テーブルスキーマから埋め込み次元を取得し検証する（`0 < dim <= MAX_EMBEDDING_DIM`）。
+/// `pub(crate)`: [`VectorArena::build_filtered_with_limits`]・
+/// `rls.rs::SearchTimeFilter::build`（TASK-134）が共有する（同じ検証ロジックの重複実装を
+/// 避けるため）。呼び出し元が単一の `read_txn` 上でスキーマ取得・行走査を行う契約は
+/// 呼び出し元側の責務（本関数はスキーマ取得のみ行う）。
+pub(crate) fn validated_vector_dim_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table_name: &str,
+) -> Result<u32> {
+    let schema = catalog::get_table_schema_in_txn(read_txn, table_name)?;
+    let dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
+    if dim == 0 || dim > crate::storage::MAX_EMBEDDING_DIM {
+        return Err(ArenaError::InvalidDim);
+    }
+    Ok(dim)
+}
+
 /// コールドスタート時に一括デコードした連続ベクトルバッファ（対象ビヘイビア: TABLE-8）。
 ///
 /// [`VectorArena::build`] が単一の読み取りスナップショットから構築する。構築後に
@@ -453,11 +481,7 @@ impl VectorArena {
         // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
         // 並行書き込みが挟まってもスナップショットの一貫性が保証できない。
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
-        let schema = catalog::get_table_schema_in_txn(&read_txn, table_name)?;
-        let expected_dim = schema.vector_dim().ok_or(ArenaError::InvalidDim)?;
-        if expected_dim == 0 || expected_dim > crate::storage::MAX_EMBEDDING_DIM {
-            return Err(ArenaError::InvalidDim);
-        }
+        let expected_dim = validated_vector_dim_in_txn(&read_txn, table_name)?;
 
         // 対象テーブル専用の行テーブル（`user_rows/{table_name}`）だけを開く。
         // `catalog::user_rows_table_name` は識別子検証を行わないが、直前の
