@@ -8,23 +8,16 @@
 //! 受信データ（SSLRequest/StartupMessage/PasswordMessage/簡易クエリ）はすべて
 //! untrusted 入力として扱い、`unwrap`/`expect`/添字アクセスを用いず `get()`・
 //! `checked_*` で処理する（`.claude/rules/coding-rust.md` P0）。
+//! メッセージ長の検証・fail-closed なエラー分類は `crate::framing` に集約する。
 //!
-//! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
-//! メッセージ長の上限は本タスクでは暫定値であり、正式な上限体系は TASK-68 で
-//! 置換される（ポインタ: `docs/spec/05-tasks.md` TASK-68）。
+//! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
+//! TASK-68（正式なフレーミング上限体系。対象ビヘイビア WIRE-4, WIRE-10）。
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 
 use crate::auth::{self, UserStore};
-
-/// StartupMessage・SSLRequest 等、認証前の最初のパケットに許す暫定上限バイト数。
-/// 実際の StartupMessage は数百バイト程度で足りるため、通常利用を妨げない範囲で
-/// 小さく設定する（正式な上限は TASK-68）。
-const PROVISIONAL_STARTUP_MAX_LEN: usize = 32 * 1024;
-
-/// PasswordMessage・簡易クエリなど認証後の一般メッセージに許す暫定上限バイト数。
-const PROVISIONAL_MESSAGE_MAX_LEN: usize = 64 * 1024;
+use crate::framing::{self, FrameError};
 
 /// StartupMessage が名乗るべきプロトコルバージョン（3.0 = major 3, minor 0）。
 const PROTOCOL_VERSION_3_0: i32 = 0x0003_0000;
@@ -36,16 +29,20 @@ const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 /// SQLSTATE `0A000`（feature_not_supported）。簡易クエリ実行未実装・拡張クエリ
 /// プロトコル受信時の応答に用いる。
 const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
-/// SQLSTATE `08P01`（protocol_violation）。StartupMessage の構文・バージョン不正に
-/// 用いる。
-const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
+/// SQLSTATE `08P01`（protocol_violation）。StartupMessage の構文・バージョン不正
+/// （フレーミング以外のプロトコル違反）に用いる。フレーミング由来の分類・値は
+/// `framing::SQLSTATE_PROTOCOL_VIOLATION` を単一の真実源とする。
+const SQLSTATE_PROTOCOL_VIOLATION: &str = framing::SQLSTATE_PROTOCOL_VIOLATION;
 
 #[derive(Debug)]
 enum HandshakeError {
     Io(io::Error),
     /// fail-closed に倒すプロトコル違反（詳細は理由をログ用途にのみ保持し、
-    /// クライアントへは SQLSTATE 経由の定型メッセージのみ返す）。
+    /// クライアントへは SQLSTATE 経由の定型メッセージのみ返す）。フレーミング外の
+    /// 構文違反（パラメータ解析・型ごとの形状検証等）に用いる。
     Protocol(&'static str),
+    /// `framing` モジュールが検出したフレーミング違反（WIRE-4/WIRE-10）。
+    Frame(FrameError),
 }
 
 impl From<io::Error> for HandshakeError {
@@ -54,14 +51,30 @@ impl From<io::Error> for HandshakeError {
     }
 }
 
+impl From<FrameError> for HandshakeError {
+    fn from(e: FrameError) -> Self {
+        match e {
+            // I/O 異常（タイムアウト等）はフレーミング分類ではなく通常の I/O エラー
+            // として扱う（呼び出し元の `handle_connection` が `Err` を返す経路と
+            // 揃える）。
+            FrameError::Io(io_err) => HandshakeError::Io(io_err),
+            other => HandshakeError::Frame(other),
+        }
+    }
+}
+
 /// `handle_connection` の戻り値型（`io::Result<()>`）へ `?` で直接畳み込めるようにする
-/// 変換。`Protocol` 側は `io::ErrorKind::InvalidData` に写像し、呼び出し元（`main.rs`）
-/// にはログ用途の文字列のみを残す（詳細な違反理由をクライアントへ返すことはない）。
+/// 変換。`Protocol`/`Frame` 側は `io::ErrorKind::InvalidData` に写像し、呼び出し元
+/// （`main.rs`）にはログ用途の文字列のみを残す（詳細な違反理由をクライアントへ
+/// 返すことはない）。
 impl From<HandshakeError> for io::Error {
     fn from(e: HandshakeError) -> Self {
         match e {
             HandshakeError::Io(io_err) => io_err,
             HandshakeError::Protocol(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+            HandshakeError::Frame(frame_err) => {
+                io::Error::new(io::ErrorKind::InvalidData, frame_err.to_string())
+            }
         }
     }
 }
@@ -69,48 +82,12 @@ impl From<HandshakeError> for io::Error {
 type Result<T> = std::result::Result<T, HandshakeError>;
 
 // ---------------------------------------------------------------------------
-// 低レベル読み書きプリミティブ（長さ上限検証つき）
+// 低レベル読み書きプリミティブ
 // ---------------------------------------------------------------------------
-
-fn read_i32_be(stream: &mut TcpStream) -> Result<i32> {
-    let mut buf = [0u8; 4];
-    stream.read_exact(&mut buf)?;
-    Ok(i32::from_be_bytes(buf))
-}
-
-/// 長さフィールドを検証してからアロケーションする（無制限 `Vec::with_capacity`
-/// 禁止。coding-rust.md 準拠）。`len` は呼び出し元が `max` 以内であることを確認済み
-/// の値のみを渡す契約。
-fn read_exact_bytes(stream: &mut TcpStream, len: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf)?;
-    Ok(buf)
-}
 
 fn write_all(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
     stream.write_all(data)?;
     Ok(())
-}
-
-/// 先頭の length(4 バイト, 自身を含む) を読み、`min_total..=max_total` の範囲か
-/// 検証したうえで残りのボディを読み取る。SSLRequest/GSSENCRequest/CancelRequest/
-/// StartupMessage はいずれもこの共通フレームに従う。
-fn read_length_prefixed_body(
-    stream: &mut TcpStream,
-    min_total: usize,
-    max_total: usize,
-) -> Result<Vec<u8>> {
-    let total_len = read_i32_be(stream)?;
-    if total_len < 0 {
-        return Err(HandshakeError::Protocol("negative message length"));
-    }
-    let total_len = total_len as usize;
-    if total_len < min_total || total_len > max_total {
-        return Err(HandshakeError::Protocol("message length out of bounds"));
-    }
-    // total_len は length フィールド自身の 4 バイトを含む。
-    let body_len = total_len - 4;
-    read_exact_bytes(stream, body_len)
 }
 
 /// null 終端 C 文字列を `body[*pos..]` から読み取り、UTF-8 として検証する
@@ -226,7 +203,7 @@ fn negotiate_startup(stream: &mut TcpStream) -> Result<String> {
     let mut ssl_seen = false;
     let mut gssenc_seen = false;
     loop {
-        let body = read_length_prefixed_body(stream, 8, PROVISIONAL_STARTUP_MAX_LEN)?;
+        let body = framing::read_startup_frame(stream)?;
         let code_bytes: [u8; 4] = body
             .get(0..4)
             .and_then(|s| s.try_into().ok())
@@ -302,12 +279,18 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
 /// Argon2id 照合へそのまま渡すと、フレーミングの曖昧さがパスワード照合の意味論に
 /// 混入するため fail-closed で拒否する）。
 fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut type_byte = [0u8; 1];
-    stream.read_exact(&mut type_byte)?;
-    if type_byte[0] != b'p' {
+    let type_byte = match framing::read_typed_frame_header(stream)? {
+        Some(b) => b,
+        None => return Err(HandshakeError::Protocol("expected PasswordMessage")),
+    };
+    if type_byte != b'p' {
         return Err(HandshakeError::Protocol("expected PasswordMessage"));
     }
-    let body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
+    let body = framing::read_length_prefixed_body(
+        stream,
+        framing::MIN_TYPED_MESSAGE_LEN,
+        framing::MAX_MESSAGE_LEN,
+    )?;
     let end = body
         .len()
         .checked_sub(1)
@@ -345,17 +328,15 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// 管轄で現状は未実装のため、本関数ではまだ参照しない。
 fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) -> Result<()> {
     loop {
-        let mut type_byte = [0u8; 1];
-        match stream.read_exact(&mut type_byte) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
+        let type_byte = match framing::read_typed_frame_header(stream)? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
 
-        match type_byte[0] {
+        match type_byte {
             b'Q' => {
                 // 最小 5（length 4 バイト + 終端 NUL 1 バイト）。空 body は拒否する。
-                let body = read_length_prefixed_body(stream, 5, PROVISIONAL_MESSAGE_MAX_LEN)?;
+                let body = framing::read_length_prefixed_body(stream, 5, framing::MAX_MESSAGE_LEN)?;
                 let end = body
                     .len()
                     .checked_sub(1)
@@ -382,13 +363,17 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
             }
             b'X' => {
                 // Terminate は length=4（body 厳密に空）以外を fail-closed で拒否する。
-                let _body = read_length_prefixed_body(stream, 4, 4)?;
+                let _body = framing::read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
             }
             _ => {
                 // 拡張クエリプロトコル等の未対応メッセージ。長さは検証のうえ読み捨て、
                 // fail-closed でエラー応答後に切断する（TASK-71 で正式化予定）。
-                let _body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
+                let _body = framing::read_length_prefixed_body(
+                    stream,
+                    framing::MIN_TYPED_MESSAGE_LEN,
+                    framing::MAX_MESSAGE_LEN,
+                )?;
                 write_error_response(
                     stream,
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -396,6 +381,40 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
                 )?;
                 return Ok(());
             }
+        }
+    }
+}
+
+/// `negotiate_startup`・`read_password_message`・`post_auth_loop` いずれのエラーも
+/// ここへ集約して応答を分岐する（WIRE-4/WIRE-10）。
+///
+/// - `sqlstate()` が `Some`（`Protocol`・`Frame(TooLarge)`・`Frame(Malformed)`）:
+///   固定の英語メッセージで ErrorResponse を送ってから切断する（送信失敗は無視。
+///   相手が既に切断していれば送信自体が失敗しうるが、その場合も fail-closed に
+///   切断で終わる）。`Frame` 由来のメッセージは `FrameError::client_message()` を、
+///   `Protocol` 由来は呼び出し元が渡す `fallback_message` を用いる（`Protocol` は
+///   フレーミング外の構文違反であり、`FrameError` に対応するメッセージを持たない
+///   ため）。
+/// - `Frame(Truncated)`: 相手が既に切断しているため応答を送らずに `Ok(())`。
+/// - `Io`: サーバー側の異常として `Err` をそのまま返す（呼び出し元の
+///   `server::accept_loop` がログに残す）。
+fn respond_and_close(
+    stream: &mut TcpStream,
+    err: HandshakeError,
+    fallback_message: &str,
+) -> io::Result<()> {
+    match err {
+        HandshakeError::Io(e) => Err(e),
+        HandshakeError::Frame(FrameError::Truncated) => Ok(()),
+        HandshakeError::Frame(frame_err) => {
+            if let Some(sqlstate) = frame_err.sqlstate() {
+                let _ = write_error_response(stream, sqlstate, frame_err.client_message());
+            }
+            Ok(())
+        }
+        HandshakeError::Protocol(_) => {
+            let _ = write_error_response(stream, SQLSTATE_PROTOCOL_VIOLATION, fallback_message);
+            Ok(())
         }
     }
 }
@@ -414,33 +433,14 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
 pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
     let username = match negotiate_startup(&mut stream) {
         Ok(u) => u,
-        Err(HandshakeError::Io(e)) => return Err(e),
-        Err(HandshakeError::Protocol(_)) => {
-            // StartupMessage 自体が不正な場合はまだ認証ラウンドに入っていないため、
-            // fail-closed で接続を閉じる（詳細メッセージはクライアントへ返さない。
-            // WIRE-10 の正式なフレーミング検証は TASK-68 の管轄）。
-            let _ = write_error_response(
-                &mut stream,
-                SQLSTATE_PROTOCOL_VIOLATION,
-                "invalid startup packet",
-            );
-            return Ok(());
-        }
+        Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
     };
 
     write_authentication_cleartext_password(&mut stream)?;
 
     let password = match read_password_message(&mut stream) {
         Ok(p) => p,
-        Err(HandshakeError::Io(e)) => return Err(e),
-        Err(HandshakeError::Protocol(_)) => {
-            let _ = write_error_response(
-                &mut stream,
-                SQLSTATE_PROTOCOL_VIOLATION,
-                "invalid password message",
-            );
-            return Ok(());
-        }
+        Err(e) => return respond_and_close(&mut stream, e, "invalid password message"),
     };
 
     // ポインタ: TASK-67・WIRE-3。
@@ -468,15 +468,7 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
 
             match post_auth_loop(&mut stream, &ctx) {
                 Ok(()) => Ok(()),
-                Err(HandshakeError::Io(e)) => Err(e),
-                Err(HandshakeError::Protocol(_)) => {
-                    let _ = write_error_response(
-                        &mut stream,
-                        SQLSTATE_PROTOCOL_VIOLATION,
-                        "invalid message frame",
-                    );
-                    Ok(())
-                }
+                Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
             }
         }
     }
@@ -493,6 +485,7 @@ fn connection_counter() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn parse_startup_params_extracts_user_and_ignores_database() {

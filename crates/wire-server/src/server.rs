@@ -1,64 +1,72 @@
-//! TCP 接続の受け付け・bind アドレスの loopback 検証を担う。
+//! TCP 接続の受け付け・bind アドレスの通信路保護要件検証を担う。
 //!
 //! `main.rs::run_server` から呼ばれる（`tests/` からの結合テストが同じ挙動を
 //! 直接検証できるよう lib.rs 経由で公開する）。responsibility はソケットレベルの
-//! 防御（loopback 限定・接続の受理／拒否ループ）に限り、同時接続数の有界化・
-//! 読み取りタイムアウトの契約値は [`crate::limits`]（TASK-69・WIRE-5, WIRE-6）へ、
-//! wire プロトコルそのものの解釈は [`crate::handshake::handle_connection`] へ
-//! それぞれ委譲する。
+//! 防御（accept ループ・接続の受理／拒否）に限り、bind アドレスの通信路保護要件
+//! 検証（TLS 未構成時は loopback 限定。TASK-70・WIRE-7）は [`crate::bind_guard`]
+//! へ、同時接続数の有界化・読み取りタイムアウトの契約値は [`crate::limits`]
+//! （TASK-69・WIRE-5, WIRE-6）へ、wire プロトコルそのものの解釈は
+//! [`crate::handshake::handle_connection`] へそれぞれ委譲する。
 //!
-//! 対応: TASK-67 の review 是正（loopback bind の TOCTOU 排除）。TLS（TASK-72・
-//! WIRE-9）が実装されるまで非ループバック bind を拒否する（[`bind_loopback`]）。
+//! 対応: TASK-67 の review 是正（loopback bind の TOCTOU 排除。TASK-70 で
+//! [`crate::bind_guard`] へ移設・拡張）。TASK-69（WIRE-5, WIRE-6。接続資源保護）。
 
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::UserStore;
+use crate::bind_guard::{GuardedBindAddrs, TransportSecurity};
 use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
 
-/// `bind_addr` を解決し、すべてのアドレスが loopback であることを検証したうえで
-/// 解決済みの [`SocketAddr`] 列を返す。TLS（TASK-72・WIRE-9）が実装されるまで、
-/// cleartext password 認証の平文パスワードを非ループバックの通信路へ公開しない
-/// （fail-closed）。
+/// 旧 TASK-67 review 是正時点の公開 API との後方互換ラッパー。
 ///
-/// 呼び出し元は返り値の `SocketAddr`（数値アドレス）へ直接 bind すること。
-/// `bind_addr`（文字列）を検証後に再度 `TcpListener::bind` へ渡すと、ホスト名の
-/// 場合は DNS 解決がもう一度走り、検証時と bind 時で異なるアドレスへ解決される
-/// TOCTOU（検証時 loopback・bind 時に外部アドレス）が成立しうる（review 指摘）。
-/// [`bind_loopback`] がこの契約を守った単一の入口を提供する。
-fn validate_loopback_bind(bind_addr: &str) -> Result<Vec<SocketAddr>, String> {
-    let addrs: Vec<SocketAddr> = bind_addr
-        .to_socket_addrs()
-        .map_err(|e| format!("cannot resolve bind address {bind_addr}: {e}"))?
-        .collect();
-    if addrs.is_empty() {
-        return Err(format!(
-            "bind address {bind_addr} did not resolve to any socket address"
-        ));
-    }
-    for addr in &addrs {
-        if !addr.ip().is_loopback() {
-            return Err(format!(
+/// TASK-70（WIRE-7）で本体の実装は [`crate::bind_guard::GuardedBindAddrs`]
+/// （TLS 有無に応じた通信路保護要件を型で表現できる形）へ移設・拡張したが、
+/// 本関数はすでに公開 API（`pub fn bind_loopback`）として利用側に届いている
+/// ため、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に従い削除せず
+/// 残す。内部では [`GuardedBindAddrs::resolve`]（[`TransportSecurity::Cleartext`]
+/// 固定 = 従来どおり loopback 限定）を呼ぶだけの薄いラッパーであり、挙動・
+/// エラーメッセージ文言は旧実装と同一（[`crate::bind_guard::BindGuardError`]
+/// の `Display` が旧 `validate_loopback_bind` と同じ文言を維持している）。
+///
+/// 新規コードは `GuardedBindAddrs::resolve` を直接呼ぶこと（TLS 導入時に
+/// `TransportSecurity` へ variant が増えても、本ラッパーは cleartext 固定の
+/// 意味論を変えない）。
+///
+/// 対応: PR #182 レビュー是正。[`crate::bind_guard::BindGuardError`] の
+/// `Display` は新 API 向けに `bind_addr` を含む文脈情報を足しており
+/// （`NonLoopback` に `(from {bind_addr})` 等）、旧 `validate_loopback_bind` /
+/// `bind_loopback` のエラー文言とは異なる。本ラッパーは呼び出し側が診断・
+/// 照合に利用しうる旧文言（`failed to bind {bind_addr} ({addrs:?}): {e}` /
+/// `refusing to bind non-loopback address {addr}: ...`）を `BindGuardError`
+/// の `Display` に委譲せず個別に再現し、公開 API の互換性を保つ。
+#[deprecated(
+    since = "0.1.0",
+    note = "use crate::bind_guard::GuardedBindAddrs::resolve(..., TransportSecurity::Cleartext) instead"
+)]
+pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
+    use crate::bind_guard::BindGuardError;
+
+    let guarded = GuardedBindAddrs::resolve(bind_addr, TransportSecurity::Cleartext).map_err(
+        |e| match e {
+            BindGuardError::Resolve { bind_addr, source } => {
+                format!("cannot resolve bind address {bind_addr}: {source}")
+            }
+            BindGuardError::NoAddress { bind_addr } => {
+                format!("bind address {bind_addr} did not resolve to any socket address")
+            }
+            BindGuardError::NonLoopback { addr, .. } => format!(
                 "refusing to bind non-loopback address {addr}: cleartext password \
                  authentication is not yet protected by TLS (TASK-72/WIRE-9); \
                  bind to a loopback address (e.g. 127.0.0.1) or place a trusted TLS \
                  terminator in front of this listener"
-            ));
-        }
-    }
-    Ok(addrs)
-}
-
-/// `bind_addr` の loopback 検証と実際の bind を 1 つの入口にまとめる。
-/// `main.rs::run_server` はこの関数だけを呼び、`TcpListener::bind` を直接
-/// 呼ばない（[`validate_loopback_bind`] のドキュメント参照。文字列の再解決による
-/// TOCTOU を構造的に作らないための唯一の bind 経路とする）。
-pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
-    let addrs = validate_loopback_bind(bind_addr)?;
-    // `&[SocketAddr]` も `ToSocketAddrs` を実装するが、これは単に列挙を返すだけで
-    // DNS 解決は発生しない（数値アドレスなので再解決の余地がない）。
-    TcpListener::bind(addrs.as_slice())
+            ),
+        },
+    )?;
+    let addrs = guarded.addrs().to_vec();
+    guarded
+        .bind()
         .map_err(|e| format!("failed to bind {bind_addr} ({addrs:?}): {e}"))
 }
 
@@ -175,43 +183,20 @@ mod tests {
     use std::io::Read;
     use std::net::TcpStream;
 
+    /// P1 review 是正の再現ケース: 削除された公開 API との後方互換ラッパー
+    /// `bind_loopback` が、新実装（`GuardedBindAddrs`）と同じ fail-closed 挙動
+    /// （loopback は許可・非 loopback は拒否）を維持していること。
     #[test]
-    fn validate_loopback_bind_accepts_loopback_addresses() {
-        let addrs = validate_loopback_bind("127.0.0.1:0").expect("loopback address accepted");
-        assert!(!addrs.is_empty());
-        assert!(addrs.iter().all(|a| a.ip().is_loopback()));
-        assert!(validate_loopback_bind("localhost:0").is_ok());
-    }
-
-    #[test]
-    fn validate_loopback_bind_rejects_wildcard_address() {
-        let result = validate_loopback_bind("0.0.0.0:5432");
-        assert!(result.is_err());
-        let msg = result.expect_err("must be rejected");
-        assert!(msg.contains("TLS"), "message should explain why: {msg}");
-    }
-
-    /// レビュー指摘の再現ケース（TOCTOU）: `bind_loopback` は検証済みの数値
-    /// `SocketAddr` へ直接 bind し、返された listener は実際に接続を受理できる
-    /// こと（`bind_addr` 文字列を再度 `TcpListener::bind` へ渡す経路が残っていない
-    /// ことの外形的確認）。
-    #[test]
-    fn bind_loopback_binds_to_validated_addr_and_accepts_connections() {
+    #[allow(deprecated)]
+    fn bind_loopback_compat_wrapper_accepts_loopback_and_rejects_non_loopback() {
         let listener = bind_loopback("127.0.0.1:0").expect("loopback bind must succeed");
-        let addr = listener.local_addr().expect("local addr");
-        assert!(addr.ip().is_loopback());
+        drop(listener);
 
-        let client = TcpStream::connect(addr).expect("connect to bound listener");
-        let (_accepted, _peer) = listener.accept().expect("listener must accept connection");
-        drop(client);
-    }
-
-    /// レビュー指摘の再現ケース: 非ループバックアドレスは bind 自体が行われず
-    /// `Err` になること（`validate_loopback_bind` 単体テストの外形確認）。
-    #[test]
-    fn bind_loopback_rejects_non_loopback_address() {
-        let result = bind_loopback("0.0.0.0:0");
-        assert!(result.is_err());
+        let err = bind_loopback("0.0.0.0:0").expect_err("non-loopback bind must be rejected");
+        assert!(
+            err.contains("refusing to bind non-loopback address"),
+            "unexpected error message: {err}"
+        );
     }
 
     /// レビュー指摘の再現ケース: 同時接続数の上限を超える接続は、ハンドシェイクへ
