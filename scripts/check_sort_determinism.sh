@@ -35,7 +35,7 @@
 #
 # 使い方: scripts/check_sort_determinism.sh [--self-test]
 
-set -u
+set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -59,15 +59,35 @@ fi
 #   - 行頭（先頭の空白を許容）が `//` で始まるコメント行
 #   - マッチ開始行〜終了行のいずれかに `// sort-determinism: allow ...`
 #     マーカーを持つ行（複数行にまたがる呼び出しでも終端側のマーカーを許容する）
+#
+# fail-closed: `find`・`perl` の失敗（構文エラー・実行不能・読み取り失敗等）を
+# 握り潰さず scan_dir の非ゼロ終了として呼び出し元へ伝播する（2回目の
+# codex-review P1 指摘対応。従来は `perl ... | sed ...` を素通しし、末尾の
+# `sed` が成功すれば `set -u` のみではパイプライン全体が成功扱いになっていた。
+# `pipefail`（ファイル先頭で有効化）に加え、本関数内では `find`/`perl` を
+# 個別にコマンド置換で実行し `$?` を明示チェックすることで、process
+# substitution 経由でも失敗を確実に検知する）。
 scan_dir() {
   local dir="$1"
   if [ ! -d "${dir}" ]; then
     return 0
   fi
 
+  local file_list
+  file_list="$(find "${dir}" -type f -name '*.rs')"
+  local find_status=$?
+  if [ "${find_status}" -ne 0 ]; then
+    echo "ERROR: find failed under ${dir} (exit ${find_status})" >&2
+    return 1
+  fi
+  if [ -z "${file_list}" ]; then
+    return 0
+  fi
+
   local file
   while IFS= read -r file; do
-    perl -0777 -ne '
+    local out
+    out="$(perl -0777 -ne '
       my @lines = split /\n/, $_, -1;
       # 行頭コメント行（`//`・`///`・`//!`）を除いた「実コード」だけを 1 本の
       # 文字列へ結合し、結合後の各文字位置が元のどの行番号に属するかを保持する。
@@ -93,8 +113,16 @@ scan_dir() {
         next if $allowed;
         print "$start_ln:$lines[$start_ln - 1]\n";
       }
-    ' "${file}" | sed "s#^#${file}:#"
-  done < <(find "${dir}" -type f -name '*.rs')
+    ' "${file}")"
+    local perl_status=$?
+    if [ "${perl_status}" -ne 0 ]; then
+      echo "ERROR: perl scan failed for ${file} (exit ${perl_status})" >&2
+      return 1
+    fi
+    if [ -n "${out}" ]; then
+      printf '%s\n' "${out}" | sed "s#^#${file}:#"
+    fi
+  done <<<"${file_list}"
 }
 
 if [ "${MODE}" = "self-test" ]; then
@@ -150,6 +178,12 @@ fn f(v: &mut Vec<i32>) {
 EOF
 
   local_detected="$(scan_dir "${tmp}")"
+  scan_status=$?
+  if [ "${scan_status}" -ne 0 ]; then
+    echo "FAIL: scan_dir exited non-zero (${scan_status}) during self-test fixture scan" >&2
+    rm -rf "${tmp}"
+    exit 1
+  fi
   if ! printf '%s\n' "${local_detected}" | grep -q "detect_me.rs.*sort_unstable_by"; then
     echo "FAIL: self-test did not detect sort_unstable_by in detect_me.rs" >&2
     failed=1
@@ -183,11 +217,15 @@ EOF
 fi
 
 FOUND="$(
-  {
-    scan_dir "${REPO_ROOT}/crates/engine/src"
+  scan_dir "${REPO_ROOT}/crates/engine/src" &&
     scan_dir "${REPO_ROOT}/crates/wire-server/src"
-  }
 )"
+FOUND_STATUS=$?
+if [ "${FOUND_STATUS}" -ne 0 ]; then
+  echo "ERROR: scan_dir failed (exit ${FOUND_STATUS}); sort-determinism check could not be" >&2
+  echo "completed. Failing closed (see scripts/check_sort_determinism.sh scan_dir)." >&2
+  exit 1
+fi
 
 if [ -n "${FOUND}" ]; then
   echo "ERROR: non-deterministic sort API (re)introduced. Score-ordered Top-k must use a" >&2
