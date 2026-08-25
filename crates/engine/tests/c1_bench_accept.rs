@@ -15,8 +15,9 @@
 mod harness;
 
 use harness::env_report::EnvReport;
-use harness::sql_c1::{c1_statement, vector_literal, SqlC1Error};
+use harness::sql_c1::{c1_statement, vector_literal, SqlC1Error, MAX_VECTOR_LITERAL_BYTES};
 
+use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::parser::parse_vector_literal;
 
 // --- vector_literal ---
@@ -52,6 +53,33 @@ fn vector_literal_empty_dimension_round_trips() {
     assert_eq!(literal, "[]");
     let parsed = parse_vector_literal(&literal, 0).expect("literal must parse back");
     assert!(parsed.is_empty());
+}
+
+#[test]
+fn max_vector_literal_bytes_matches_parser_boundary() {
+    // `harness::sql_c1::MAX_VECTOR_LITERAL_BYTES` は private な
+    // `sql::parser::MAX_VECTOR_LITERAL_BYTES` の手動複製値。この境界テストは
+    // harness 側の定数を基準に `parse_vector_literal` の受理・拒否境界を突き合わせる
+    // ことで、parser 側の定数が将来変更されたときにこのテストが真っ先に落ちる形で
+    // ドリフトを検知する。
+    let padding_len = MAX_VECTOR_LITERAL_BYTES - 2; // `[` と `]` の 2 バイトを引く
+    let padding = "0".repeat(padding_len);
+
+    let literal_at_limit = format!("[{padding}]");
+    assert_eq!(literal_at_limit.len(), MAX_VECTOR_LITERAL_BYTES);
+    // 中身は数値として不正（"0" の連続）なので InvalidInput になるのは想定内。
+    // ここで確認したいのは PayloadTooLarge にならないことだけ。
+    if let Err(SqlSurfaceError::PayloadTooLarge { .. }) = parse_vector_literal(&literal_at_limit, 1)
+    {
+        panic!("literal exactly at MAX_VECTOR_LITERAL_BYTES must not be rejected as too large");
+    }
+
+    let literal_over_limit = format!("[{padding}0]");
+    assert_eq!(literal_over_limit.len(), MAX_VECTOR_LITERAL_BYTES + 1);
+    assert!(matches!(
+        parse_vector_literal(&literal_over_limit, 1),
+        Err(SqlSurfaceError::PayloadTooLarge { .. })
+    ));
 }
 
 // --- c1_statement ---
@@ -182,7 +210,10 @@ mod e2e {
 #[test]
 fn env_report_capture_does_not_panic_and_has_at_least_one_logical_cpu() {
     let report = EnvReport::capture("scalar");
-    assert!(report.logical_cpus >= 1 || report.logical_cpus == 0);
+    // `report.logical_cpus >= 1 || report.logical_cpus == 0` は `usize` の全値域を
+    // covering するトートロジーになってしまうため、テスト名が意図する「論理コア数は
+    // 最低 1」を実際に検証する条件だけを残す。
+    assert!(report.logical_cpus >= 1);
     let rendered = format!("{report}");
     assert!(!rendered.is_empty());
     assert!(rendered.contains("os="));

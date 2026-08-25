@@ -15,9 +15,13 @@
 use std::fmt::Write as _;
 
 /// ベクトルリテラルの生バイト長上限（`sql::parser::MAX_VECTOR_LITERAL_BYTES` と
-/// 同一値。当該定数は private のため独自に定義する。SQL-1 の受理形状に合わせて
-/// アロケーション前にこの長さで拒否する）。
-const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
+/// 同一値のつもりで手動複製した定数。当該定数は private のため独自に定義する。
+/// SQL-1 の受理形状に合わせて上限超過分の追記コストを打ち切る。
+/// `pub` にしているのは `tests/c1_bench_accept.rs` の
+/// `max_vector_literal_bytes_matches_parser_boundary` が、この値ちょうどの境界で
+/// `parser::parse_vector_literal` の受理・拒否を突き合わせてドリフトを検知するため
+/// （parser 側の定数が変わればそのテストが最初に落ちる）。
+pub const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 
 /// ベンチ・回帰テストが生成した SQL 文字列の構造検証・生成失敗を表す（`harness`
 /// 全体で単一のエラー型を持つ `stats::BenchError` とは責務が異なる——こちらは
@@ -69,8 +73,10 @@ fn is_valid_identifier(name: &str) -> bool {
 /// ことは `tests/c1_bench_accept.rs` で確認する）。非有限値（NaN・Inf）は
 /// `sql::parser::parse_vector_literal` 側も拒否するため生成時点で fail-closed に
 /// 拒否し、無意味な計測（常に構文エラーになるクエリの p95 を測ってしまう事態）を
-/// 未然に防ぐ。生成後のバイト長が [`MAX_VECTOR_LITERAL_BYTES`] を超える場合も
-/// 同様に拒否する（アロケーション前の上限検証。coding-rust.md）。
+/// 未然に防ぐ。バイト長が [`MAX_VECTOR_LITERAL_BYTES`] を超える場合も同様に拒否する。
+/// 検証は各成分を `write!` で追記するたびに行い、上限超過を検知した時点で成長を
+/// 打ち切る（一括アロケーション前の事前検証ではないが、無制限に成長し続けさせない
+/// 意味で有界性は保つ。coding-rust.md「untrusted 入力の扱い」）。
 pub fn vector_literal(values: &[f32]) -> Result<String, SqlC1Error> {
     if values.iter().any(|v| !v.is_finite()) {
         return Err(SqlC1Error::NonFiniteComponent);
