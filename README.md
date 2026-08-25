@@ -91,7 +91,7 @@ CORE-5（対照エンジンとの中央値比較）は対照エンジンクレ�
    ```
 
 3. `RERANK_RECALL_MIN_R20_LARGE`／`RERANK_RECALL_MIN_R20_IMPROVEMENT`（下記 TASK-108 参照）も同じ Environment `recall-gate` に設定する（strict モードは 5 変数すべてを必須とするため）
-4. `gh workflow run recall.yml --ref main` で **main を ref に指定して** 本 workflow を手動実行し、`gh run watch` で `recall-regression` job が **skip ではなく実際に実行され**、strict モード（下記）のもとで 5 変数すべてが正しく評価されて green になることを確認する（main 以外の ref を指定すると job が skip されて green に見えるため注意。手順 5・6 参照）
+4. `gh workflow run recall.yml --ref main` で **main を ref に指定して** 本 workflow を手動実行し、`gh run watch` で `recall-regression` job が **skip ではなく実際に実行され**、strict モード（下記）のもとで 5 変数すべてが正しく評価されて green になることを確認する（main 以外の ref を指定すると job が skip されて green に見えるため注意）
 5. 疎通確認が済めば、`schedule` トリガ（週次・#168 で再追加済み）により以降は自動実行されます
 
 **variables を設定するとゲートが有効化されます。** ローカルの `make recall-regression`（`HYBRID_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。

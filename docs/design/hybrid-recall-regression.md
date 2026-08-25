@@ -104,10 +104,12 @@ variable の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、
 `.github/workflows/bench.yml`（TASK-127）で codex-review に受理された前例
 （CORE-5 未接続の間は `schedule` を有効化せず `workflow_dispatch` のみに限定し、
 接続確認後に `schedule` を再度追加する）と同型の判断として、`recall.yml` も
-一旦 `schedule` トリガを外し `workflow_dispatch` のみとしていた。environment
-`recall-gate` の variables 設定・strict モードでの手動実行による疎通確認を経て、
-Issue #168 で `schedule`（週次・月曜 04:00 UTC）を再度追加済み（README
-「Recall 回帰ハーネスの repo variables」参照）。
+一旦 `schedule` トリガを外し `workflow_dispatch` のみとしていた。Issue #168 の
+オーナー判断により `schedule`（週次・月曜 04:00 UTC）を再度追加済みだが、
+environment `recall-gate` の variables 設定・strict モードでの手動実行による
+疎通確認はリポジトリ管理者作業として別途必要（未実施のまま週次 run が走った
+場合は fail-closed で red になる。false green にはならない。README「Recall
+回帰ハーネスの repo variables」参照）。
 
 ### コーパス・QA セットの生成
 
