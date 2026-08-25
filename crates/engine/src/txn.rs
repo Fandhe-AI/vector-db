@@ -206,10 +206,8 @@ impl WriteTxn {
 /// テーブルに対して混在させないことは呼び出し元の責務であり、本モジュールは意図的に
 /// それを検出・拒否しない。
 ///
-/// この適用範囲は暫定ではなく恒久的な契約である（Issue #133 で解消要否を検討し、
-/// 書き込み経路の統合ではなく契約の恒久化を選択した。判断・検討した代替案の詳細は
-/// `docs/design/batch-ledger-scope.md`、対応する private spec 側の記述は
-/// `docs/spec/05-tasks.md`（TASK-90・TASK-93）参照）。
+/// 適用範囲の検討経緯（Issue #133）は `docs/design/batch-ledger-scope.md` にポインタを、
+/// 判断の詳細は private spec 側 `docs/spec/05-tasks.md`（TASK-90・TASK-93）に記載する。
 ///
 /// `BatchWriteTxn` 単体としては、以下をすべて満たしてはじめて `commit` が成功する:
 /// - 新規挿入した行はすべて [`BatchWriteTxn::log_batch`] で台帳へ記録済みであること

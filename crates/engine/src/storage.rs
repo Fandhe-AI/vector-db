@@ -55,9 +55,8 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
 /// [`crate::txn::BatchWriteTxn`] に一本化すること。
 ///
-/// この適用範囲は Issue #133 で解消要否を検討したうえで恒久化した契約である。判断・検討した
-/// 代替案の詳細は `docs/design/batch-ledger-scope.md`、対応する private spec 側の記述は
-/// `docs/spec/05-tasks.md`（TASK-90・TASK-93）参照。
+/// 適用範囲の検討経緯（Issue #133）は `docs/design/batch-ledger-scope.md` にポインタを、
+/// 判断の詳細は private spec 側 `docs/spec/05-tasks.md`（TASK-90・TASK-93）に記載する。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
 /// ストレージ全体の書き込み世代カウンタ（TASK-133 P1・対象ビヘイビア: RLS-1〜4）。
