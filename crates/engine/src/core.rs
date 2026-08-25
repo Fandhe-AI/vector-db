@@ -678,6 +678,11 @@ pub struct EngineCore {
     /// [`VectorCore::search`] 実装がこれを経由して事前フィルタインデックスを再利用する
     /// （詳細は [`PrefilterCache`] のドキュメント参照）。
     prefilter_cache: PrefilterCache,
+    /// `precision` モードの実行契約を制御するサーバー側設定値（TASK-162・SEARCH-9）。
+    /// クエリ・セッション変数から到達できる経路を持たない（差し替えは
+    /// [`Self::with_precision_policy`] のみ。`crate::precision` モジュール
+    /// ドキュメントの fail-open 不在の設計制約を参照）。
+    precision_policy: crate::precision::PrecisionPolicy,
 }
 
 impl EngineCore {
@@ -697,6 +702,7 @@ impl EngineCore {
             storage,
             provider,
             prefilter_cache: PrefilterCache::new(),
+            precision_policy: crate::precision::PrecisionPolicy::default(),
         })
     }
 
@@ -716,6 +722,7 @@ impl EngineCore {
             storage,
             provider,
             prefilter_cache: PrefilterCache::new(),
+            precision_policy: crate::precision::PrecisionPolicy::default(),
         }
     }
 
@@ -724,6 +731,16 @@ impl EngineCore {
     /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
     pub fn prefilter_cache_stats(&self) -> PrefilterCacheStats {
         self.prefilter_cache.stats()
+    }
+
+    /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
+    /// 差し替えたビルダーを返す（TASK-162・SEARCH-9）。所有権を消費するビルダー
+    /// メソッドとし、`&mut self` セッターは公開しない（構築後に一部だけ差し替えて
+    /// 中途半端な状態を作れないようにする）。`SessionState`・SQL 構文からはこの値へ
+    /// 到達できない（`crate::precision` モジュールドキュメント参照）。
+    pub fn with_precision_policy(mut self, policy: crate::precision::PrecisionPolicy) -> Self {
+        self.precision_policy = policy;
+        self
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
@@ -862,6 +879,7 @@ impl EngineCore {
                     ctx,
                     &schema,
                     &bound,
+                    &self.precision_policy,
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }

@@ -118,6 +118,16 @@ const _: () = assert!(
     "sql::exec's hybrid pool_depth derivation assumes core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH"
 );
 
+// `precision` 時の `k_eff = bound.limit.max(2)`（`LIMIT 1` でも Top-2 を取得する
+// ための下限）が常に `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に
+// 固定する（`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を
+// 検証済みのため、`k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の
+// 場合のみ）。
+const _: () = assert!(
+    2 <= core::MAX_SEARCH_K,
+    "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"
+);
+
 /// 投影結果 1 セル。`row_codec::Value` の公開 enum は変更せず、`id` 疑似列
 /// （`u64`）を表現するため独自の enum を持つ。
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Float`・`Bool`
@@ -313,20 +323,15 @@ pub fn execute_statement(
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundStatement,
+    precision_policy: &crate::precision::PrecisionPolicy,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // TASK-161（SQL-12）: `precision` の実行契約（確信度判定・空集合 fail-closed 応答）
-    // は TASK-162・対象ビヘイビア SEARCH-9 の管轄で、本タスクでは未実装。束縛
-    // （`sql::parser::bind_with_session`）自体は `precision` を正しく解決するが、
-    // ここで実行を拒否することで「confidence フィルタなしの recall 相当の結果を
-    // `precision` の名の下に返す」という fail-open を作らない（TASK-162 がこの
-    // ゲートを実際の実行契約へ置き換える）。既存 `hybrid_rrf` の 2 引数形（構造は
-    // 受理しつつ実行不能として `22000` で拒否する。`sql::parser::bind_ranking`
-    // 参照）と同じ「構造は受理・実行時点で不可」の分類を踏襲する。
-    if bound.mode.mode == crate::sql::mode::SearchMode::Precision {
-        return Err(SqlSurfaceError::invalid_input(
-            "precision mode execution is not yet implemented in this build",
-        ));
-    }
+    // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
+    // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
+    // 切り出してあり、本関数は適用位置（DISTANCE 段＋事後 SCALAR フィルタの後・
+    // `RlsSafetyNet::apply` の前）を決めるだけの薄い配線を担う（詳細は
+    // `crate::precision` モジュールドキュメント「PRECISION ゲート段」参照）。
+    // `recall`（既定）の実行経路はこの分岐に触れないため一切変わらない。
+    let is_precision = bound.mode.mode == crate::sql::mode::SearchMode::Precision;
 
     // HINT ORDER（未指定なら既定の RLS→SCALAR→DISTANCE）から導出する実行方針。
     // `scalar_prefilter` のみが分岐点（`ExecutionPlan::from_evaluation_order` の
@@ -559,6 +564,17 @@ pub fn execute_statement(
     // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
     let visible_id_counts = core::visible_id_counts(&slot_ids);
 
+    // `precision` 時は DISTANCE 段の取得件数を `bound.limit` より広く取る
+    // （`LIMIT 1` でも Top-2 を取得し、`precision::apply_gate` のマージン判定を
+    // 行えるようにする。`crate::precision` モジュールドキュメント参照）。`recall`
+    // 時は従来どおり `bound.limit`。`2 <= core::MAX_SEARCH_K` は下記 `const _` で
+    // 固定するため、`k_eff` は常に provider・RRF 設定の許容範囲に収まる。
+    let k_eff = if is_precision {
+        bound.limit.max(2)
+    } else {
+        bound.limit
+    };
+
     // DISTANCE 段。
     let hits: Vec<(u64, f64)> = match &bound.ranking {
         Ranking::Distance { query } => {
@@ -567,10 +583,10 @@ pub fn execute_statement(
                 vectors: arena.vectors(),
                 dim: arena.dim(),
                 query,
-                k: bound.limit,
+                k: k_eff,
             };
             let raw = provider.search(input).map_err(map_kernel_error)?;
-            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_counts) {
+            if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
                 return Err(SqlSurfaceError::Internal {
                     detail: "search provider returned a result violating the top-k contract"
                         .to_string(),
@@ -581,7 +597,7 @@ pub fn execute_statement(
         Ranking::Hybrid {
             query, query_text, ..
         } => {
-            let pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH);
+            let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
             let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
                 SqlSurfaceError::Internal {
                     detail: "invalid hybrid RRF config".to_string(),
@@ -592,7 +608,7 @@ pub fn execute_statement(
                 vectors: arena.vectors(),
                 dim: arena.dim(),
                 query,
-                k: bound.limit,
+                k: k_eff,
             };
             let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
                 // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
@@ -622,7 +638,7 @@ pub fn execute_statement(
                 }
                 let mut fused =
                     hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                fused.truncate(bound.limit);
+                fused.truncate(k_eff);
                 fused
             } else {
                 let doc_refs: Vec<(DocId, &str)> = sparse_docs
@@ -632,15 +648,8 @@ pub fn execute_statement(
                 let sparse_index = SparseIndex::build(&doc_refs)
                     .map_err(HybridError::Sparse)
                     .map_err(map_hybrid_error)?;
-                hybrid::hybrid_search(
-                    provider,
-                    input,
-                    &sparse_index,
-                    query_text,
-                    bound.limit,
-                    &cfg,
-                )
-                .map_err(map_hybrid_error)?
+                hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
+                    .map_err(map_hybrid_error)?
             };
             fused.into_iter().map(|h| (h.id, h.score)).collect()
         }
@@ -708,6 +717,81 @@ pub fn execute_statement(
             filtered.push((slot_id, score));
         }
         filtered
+    };
+
+    // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
+    // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
+    // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
+    // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
+    // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
+    // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
+    // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
+    // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
+    // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
+    // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
+    // 挙動は変わらない（SEARCH-1〜8 不変）。
+    let hits: Vec<(u64, f64)> = if is_precision {
+        // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
+        // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
+        // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
+        // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
+        // DoS 対策）。
+        let thresholds = match &bound.ranking {
+            Ranking::Distance { .. } => precision_policy.dense(),
+            Ranking::Hybrid { .. } => precision_policy.hybrid(),
+        };
+        let want = bound
+            .limit
+            .min(precision_policy.max_results())
+            .saturating_add(1);
+        let take_n = want.min(hits.len());
+        let mut conf: Vec<f64> = Vec::with_capacity(take_n);
+        match &bound.ranking {
+            Ranking::Distance { query } => {
+                for (slot_id, _score) in hits.iter().take(take_n) {
+                    let slot =
+                        usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
+                            detail: "candidate slot index out of range".to_string(),
+                        })?;
+                    let embedding =
+                        arena
+                            .vector(slot)
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "candidate arena index out of range".to_string(),
+                            })?;
+                    // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
+                    // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
+                    // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
+                    // （fail-closed。`crate::precision::cosine_similarity` の
+                    // ドキュメント参照）。
+                    conf.push(crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0));
+                }
+            }
+            Ranking::Hybrid { .. } => {
+                // 正規化に使う重み・ランク減衰定数は DISTANCE 段で使ったものと
+                // 同一の固定値（`60.0, 1.0, 1.0`）で、`pool_depth` は正規化の
+                // 計算式に現れないため既定値で構わない
+                // （`crate::precision::rrf_normalized` のドキュメント参照）。
+                let cfg = RrfConfig::default();
+                for (_slot_id, score) in hits.iter().take(take_n) {
+                    conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
+                }
+            }
+        }
+        let n = crate::precision::apply_gate(
+            &conf,
+            &thresholds,
+            bound.limit,
+            precision_policy.max_results(),
+        )
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("precision gate contract violation: {e}"),
+        })?;
+        let mut truncated = hits;
+        truncated.truncate(n);
+        truncated
+    } else {
+        hits
     };
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
