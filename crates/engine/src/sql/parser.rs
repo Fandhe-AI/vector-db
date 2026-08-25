@@ -16,8 +16,10 @@
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
-    FunctionArg, OrderByForm, Projection, ValidatedStatement, WherePredicate,
+    FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedInsert, ValidatedStatement,
+    WherePredicate,
 };
+use crate::sql::using_operation_id::OperationId;
 
 /// ベクトルリテラルの生バイト長上限（SQL-1）。アロケーション（`Vec<f32>` の確保・
 /// カンマ分割）に入る前にこの長さで拒否する。
@@ -69,6 +71,22 @@ pub struct BoundStatement {
     pub rls_predicate_present: bool,
     pub ranking: Ranking,
     pub limit: usize,
+}
+
+/// 束縛済みの INSERT 文（SQL-10、TASK-80。
+/// [`exec::execute_insert`](crate::sql::exec::execute_insert) が直接実行する入力形）。
+/// テナント・可視性はここでは決定しない（`exec::execute_insert` がサーバー側で
+/// `PolicyContext` から導出・固定する。`.claude/rules/security.md` P0
+/// 「クライアント指定のテナントを信用しない」）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundInsert {
+    pub table: String,
+    /// 行キー（疑似列 `id`。列リストへの指定必須）。
+    pub id: u64,
+    /// `schema.columns` の列順に対応する値列（`catalog::insert_typed_row`/
+    /// `insert_typed_row_checked` の `values` 契約と同一。`id` 疑似列は含まない）。
+    pub values: Vec<crate::row_codec::Value>,
+    pub operation_id: OperationId,
 }
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -313,6 +331,123 @@ pub fn bind(
         rls_predicate_present,
         ranking,
         limit,
+    })
+}
+
+/// [`ValidatedInsert`] を `schema` と照合して [`BoundInsert`] へ束縛する
+/// （SQL-10、TASK-80 の公開 API）。`schema` は呼び出し元
+/// （`core.rs::EngineCore::execute_insert_sql`）が `Storage::get_table_schema` で
+/// 取得済みのものを渡す。
+///
+/// 検出する違反はすべて [`SqlSurfaceError::InvalidInput`]（`22000`）:
+/// 列名重複・列リストに疑似列 `id` を含まない・`id` 値が `u64` として解釈不能
+/// （範囲外を含む）・未知の列名・列型とリテラル種別の不一致（`VECTOR` 列に
+/// 数値、`TEXT` 列にベクトルリテラルを渡す等）・非 nullable 列の欠落。
+/// ベクトルリテラル自体の形式・次元・64 KiB 上限は既存の [`parse_vector_literal`]
+/// をそのまま再利用する（アロケーション前のサイズ検証を二重管理しない）。
+///
+/// テナント・可視性はここで解決しない（`exec::execute_insert` の責務。
+/// クライアントが列リストへ `tenant_id`・可視性ラベル相当の名前を指定しても、
+/// スキーマ上の実列として照合されるだけで RLS フィールドへは書き込まれない）。
+pub fn bind_insert(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+) -> Result<BoundInsert, SqlSurfaceError> {
+    if stmt.columns.len() != stmt.values.len() {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT column count does not match value count",
+        ));
+    }
+
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in &stmt.columns {
+        if !seen_columns.insert(name.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in INSERT column list: {name}"
+            )));
+        }
+    }
+
+    let id_pos = stmt.columns.iter().position(|c| c == "id").ok_or_else(|| {
+        SqlSurfaceError::invalid_input("INSERT column list must include the id pseudo-column")
+    })?;
+    let id_literal = stmt
+        .values
+        .get(id_pos)
+        .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for id pseudo-column"))?;
+    let id: u64 = match id_literal {
+        InsertLiteral::Number(n) => n
+            .parse()
+            .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed id value: {n}")))?,
+        InsertLiteral::String(_) => {
+            return Err(SqlSurfaceError::invalid_input(
+                "id pseudo-column value must be a number",
+            ))
+        }
+    };
+
+    let mut values: Vec<crate::row_codec::Value> =
+        vec![crate::row_codec::Value::Null; schema.columns.len()];
+    let mut provided = vec![false; schema.columns.len()];
+
+    for (name, literal) in stmt.columns.iter().zip(stmt.values.iter()) {
+        if name == "id" {
+            // 疑似列 `id` は行キーとして上で処理済みであり、スキーマ実列とは
+            // 照合しない（既存の SELECT 側 `bind` と同様、実カラム名 `id` を
+            // 持つスキーマではその実列を本 INSERT 形から指定する手段がない。
+            // 既知の制約としてドキュメント化する）。
+            continue;
+        }
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let column = schema
+            .columns
+            .get(col_idx)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let value = match (column.ty, literal) {
+            (ColumnType::Vector(dim), InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Vector(parse_vector_literal(s, dim)?)
+            }
+            (ColumnType::Vector(_), InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a vector literal, got a number"
+                )))
+            }
+            (ColumnType::Text, InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Text(s.clone())
+            }
+            (ColumnType::Text, InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal, got a number"
+                )))
+            }
+        };
+        if let Some(slot) = values.get_mut(col_idx) {
+            *slot = value;
+        }
+        if let Some(flag) = provided.get_mut(col_idx) {
+            *flag = true;
+        }
+    }
+
+    for (idx, column) in schema.columns.iter().enumerate() {
+        let is_provided = provided.get(idx).copied().unwrap_or(false);
+        if !is_provided && !column.nullable {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {:?} is not nullable but was not provided",
+                column.name
+            )));
+        }
+    }
+
+    Ok(BoundInsert {
+        table: stmt.table_name.clone(),
+        id,
+        values,
+        operation_id: stmt.operation_id.clone(),
     })
 }
 
@@ -614,6 +749,115 @@ mod tests {
     fn rejects_hybrid_four_arg_form_with_non_text_second_column() {
         let err = bind_sql(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, '[0.1,0.2,0.3]', embedding, 'q') LIMIT 5",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_insert（SQL-10、TASK-80） ----------------------------------------
+
+    fn bind_insert_sql(sql: &str) -> Result<BoundInsert, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt =
+            crate::sql::allowlist::validate_insert(sql, &lookup).expect("must pass allowlist");
+        bind_insert(&stmt, &docs_schema())
+    }
+
+    #[test]
+    fn binds_insert_with_all_columns() {
+        let bound = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body, lang) VALUES (1, '[0.1,0.2,0.3]', 'hello', 'ja') USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_insert should succeed");
+        assert_eq!(bound.table, "documents");
+        assert_eq!(bound.id, 1);
+        assert_eq!(bound.operation_id.as_str(), "op-0001");
+        assert_eq!(
+            bound.values,
+            vec![
+                crate::row_codec::Value::Vector(vec![0.1, 0.2, 0.3]),
+                crate::row_codec::Value::Text("hello".to_string()),
+                crate::row_codec::Value::Text("ja".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn binds_insert_leaving_nullable_column_null_when_omitted() {
+        let bound = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-0001'",
+        )
+        .expect("bind_insert should succeed");
+        assert_eq!(
+            bound.values,
+            vec![
+                crate::row_codec::Value::Vector(vec![0.1, 0.2, 0.3]),
+                crate::row_codec::Value::Text("hello".to_string()),
+                crate::row_codec::Value::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_insert_missing_id_pseudo_column() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (embedding, body) VALUES ('[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_id_value_out_of_u64_range() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (18446744073709551616, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_unknown_column() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, nope) VALUES (1, '[0.1,0.2,0.3]', 'x') USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_type_mismatch_number_for_text_column() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 42) USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_type_mismatch_string_for_vector_column_wrong_dim() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2]', 'hello') USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_missing_non_nullable_column() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2,0.3]') USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_insert_duplicate_column_in_list() {
+        let err = bind_insert_sql(
+            "INSERT INTO documents (id, id) VALUES (1, 2) USING OPERATION_ID 'op-0001'",
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");

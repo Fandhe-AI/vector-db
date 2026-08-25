@@ -34,6 +34,16 @@ pub enum Keyword {
     Order,
     By,
     Limit,
+    /// TASK-80・SQL-10: `INSERT INTO ... VALUES (...) USING OPERATION_ID '...'` の
+    /// 書き込み系許可形状で使う（`sql::allowlist::Parser::parse_insert`）。
+    Insert,
+    Into,
+    Values,
+    /// `USING OPERATION_ID '<id>'` 文末専用句の先頭キーワード。SQL-12
+    /// （TASK-161、`USING MODE` 等）は別タスクの管轄で、本タスクでは
+    /// `OperationId` に続く形のみを許可リストとして受理する。
+    Using,
+    OperationId,
 }
 
 fn keyword_from_str(s: &str) -> Option<Keyword> {
@@ -46,6 +56,11 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
         "ORDER" => Some(Keyword::Order),
         "BY" => Some(Keyword::By),
         "LIMIT" => Some(Keyword::Limit),
+        "INSERT" => Some(Keyword::Insert),
+        "INTO" => Some(Keyword::Into),
+        "VALUES" => Some(Keyword::Values),
+        "USING" => Some(Keyword::Using),
+        "OPERATION_ID" => Some(Keyword::OperationId),
         _ => None,
     }
 }
@@ -286,6 +301,25 @@ mod tests {
                 Token::Ident("docs".to_string()),
                 Token::Keyword(Keyword::Limit),
                 Token::Number("10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_insert_operation_id_keywords() {
+        // TASK-80・SQL-10: INSERT 許可形状・USING OPERATION_ID 文末句が使う 5 語が
+        // Token::Keyword として認識されることを固定する。
+        let tokens =
+            tokenize("INSERT INTO t VALUES USING OPERATION_ID").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Insert),
+                Token::Keyword(Keyword::Into),
+                Token::Ident("t".to_string()),
+                Token::Keyword(Keyword::Values),
+                Token::Keyword(Keyword::Using),
+                Token::Keyword(Keyword::OperationId),
             ]
         );
     }

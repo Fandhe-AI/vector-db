@@ -128,6 +128,14 @@ pub struct QueryResult {
     pub rows: Vec<ResultRow>,
 }
 
+/// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。単一行 INSERT の
+/// みを受理するため常に `1` になるが、`INSERT 0 1` 相当の wire 応答（TASK-73）へ
+/// 写像しやすいよう件数フィールドとして保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -546,6 +554,52 @@ pub fn execute_statement(
         .collect();
 
     Ok(QueryResult { columns, rows })
+}
+
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80 の公開 API）。
+/// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
+/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
+///
+/// テナントは `ctx.tenant_id()` からサーバー側で導出し（クライアントが列リストへ
+/// テナント相当の値を指定しても無視される。`.claude/rules/security.md` P0
+/// 「クライアント指定のテナントを信用しない」）、可視性は常に `Visibility::Private`
+/// に固定する（`PolicyContext::is_visible` は `Public` 行を他テナントへも可視と
+/// するため、既定 `Public` は越境露出になる。fail-closed に `Private` を採用する）。
+///
+/// 単一の write トランザクション（[`crate::catalog::Storage::insert_typed_row_checked`]）
+/// で完結し、既存 `id` への黙った上書きは行わない（拒否は `22000`）。
+pub fn execute_insert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::catalog::CatalogError;
+    use crate::storage::Visibility;
+
+    storage
+        .insert_typed_row_checked(
+            &bound.table,
+            bound.id,
+            ctx.tenant_id(),
+            Visibility::Private,
+            &bound.values,
+            &bound.operation_id,
+        )
+        .map_err(|e| match e {
+            CatalogError::TableNotFound(name) => SqlSurfaceError::UndefinedTable { name },
+            // 既存 id 衝突・スキーマ不整合等はいずれも「受理構文だが値が不正」
+            // として `22000` へ丸め込む。行内容・所有テナントは含めない
+            // （security.md「エラー・ログ経由で他テナントのデータ・存在情報を
+            // 漏らさない」）。
+            CatalogError::Invalid(_) => {
+                SqlSurfaceError::invalid_input("insert rejected: invalid row or duplicate id")
+            }
+            _ => SqlSurfaceError::Internal {
+                detail: "insert failed".to_string(),
+            },
+        })?;
+
+    Ok(InsertOutcome { rows_affected: 1 })
 }
 
 #[cfg(test)]

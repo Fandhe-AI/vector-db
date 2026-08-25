@@ -767,6 +767,68 @@ impl Storage {
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
+    /// SQL 表層の `INSERT ... USING OPERATION_ID '<id>'`（SQL-10、TASK-80）から呼ばれる
+    /// [`Self::insert_typed_row`] の亜種。`insert_typed_row` と異なり、既存 `id` への
+    /// 書き込みを黙って上書きせず `CatalogError::Invalid`（`sql::exec::execute_insert`
+    /// 経由で ERR-2 `22000` へ写像）で拒否する（他テナント行の破壊経路を作らない。
+    /// `.claude/rules/security.md` P0）。エラーメッセージには行内容・所有テナントを
+    /// 含めない（存在有無以上の情報を漏らさない）。
+    ///
+    /// `_operation_id` は現時点では永続化しない。同一 write トランザクション内で
+    /// 台帳へ追記するためのフック点として引数に残す（TASK-93、対象ビヘイビア:
+    /// RECOVER-2。ポインタ: docs/spec/05-tasks.md TASK-93）。
+    pub(crate) fn insert_typed_row_checked(
+        &self,
+        table_name: &str,
+        id: u64,
+        tenant_id: &str,
+        visibility: Visibility,
+        values: &[RowCodecValue],
+        _operation_id: &crate::sql::using_operation_id::OperationId,
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        let write_txn = self.db().begin_write()?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let vector_idx = schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+                .ok_or_else(|| CatalogError::Invalid("table has no VECTOR column".to_string()))?;
+            let embedding = match values.get(vector_idx) {
+                Some(RowCodecValue::Vector(v)) => v.clone(),
+                _ => {
+                    return Err(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    ))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let metadata = row_codec::encode_scalar_columns(&schema, values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            let row_input = RowInput {
+                tenant_id,
+                visibility,
+                embedding: &embedding,
+                metadata: &metadata,
+            };
+            let encoded = crate::storage::encode_row(&row_input).map_err(convert_storage_error)?;
+            let row_table_name = user_rows_table_name(table_name);
+            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+            let mut row_table = write_txn.open_table(row_table_def)?;
+            // 既存 id への黙った上書きを禁止する（`insert_typed_row` との唯一の差分）。
+            // 同一 write txn 内での確認のため、確認から挿入までの間に他の書き込みが
+            // 割り込む余地はない。
+            if row_table.get(id)?.is_some() {
+                return Err(CatalogError::Invalid(
+                    "row id already exists in this table".to_string(),
+                ));
+            }
+            row_table.insert(id, encoded.as_slice())?;
+        }
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+    }
+
     /// テーブルスコープで 1 行取得する（スナップショット読み取り。TASK-146、対象ビヘイビア:
     /// EXT-1, EXT-2）。他テーブルの同一 ID は見えない（テーブル帰属した独立ストア）。
     /// テーブル不存在・行不存在はいずれも fail-closed に `Err` を返す
@@ -1281,5 +1343,75 @@ mod tests {
             &[RowCodecValue::Null],
         );
         assert!(matches!(result, Err(CatalogError::Invalid(_))));
+    }
+
+    // --- insert_typed_row_checked（SQL-10、TASK-80） ---------------------------
+
+    fn test_operation_id() -> crate::sql::using_operation_id::OperationId {
+        crate::sql::using_operation_id::OperationId::parse("op-0001").expect("valid operation_id")
+    }
+
+    #[test]
+    fn insert_typed_row_checked_inserts_new_row() {
+        let path = unique_db_path("insert-typed-row-checked-new");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+            ))
+            .expect("create table");
+
+        storage
+            .insert_typed_row_checked(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Private,
+                &[RowCodecValue::Vector(vec![1.0, 2.0, 3.0])],
+                &test_operation_id(),
+            )
+            .expect("insert new row should succeed");
+        let row = storage.get_row_from_table("docs", 1).expect("get row");
+        assert_eq!(row.embedding, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn insert_typed_row_checked_rejects_existing_id_without_overwriting() {
+        let path = unique_db_path("insert-typed-row-checked-existing");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+            ))
+            .expect("create table");
+        storage
+            .insert_typed_row_checked(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Private,
+                &[RowCodecValue::Vector(vec![1.0, 2.0, 3.0])],
+                &test_operation_id(),
+            )
+            .expect("first insert should succeed");
+
+        let result = storage.insert_typed_row_checked(
+            "docs",
+            1,
+            "tenant-b",
+            Visibility::Private,
+            &[RowCodecValue::Vector(vec![9.0, 9.0, 9.0])],
+            &test_operation_id(),
+        );
+        assert!(matches!(result, Err(CatalogError::Invalid(_))));
+
+        // 上書きされていないことを確認する（元のテナント・値のまま）。
+        let row = storage.get_row_from_table("docs", 1).expect("get row");
+        assert_eq!(row.tenant_id, "tenant-a");
+        assert_eq!(row.embedding, vec![1.0, 2.0, 3.0]);
     }
 }
