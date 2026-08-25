@@ -16,8 +16,9 @@
 //! サブコマンド:
 //! - `write <db_path>`: `BATCH` 件の行 put + `log_batch` を 1 トランザクションで
 //!   コミットし続ける。`COMMITTED batch=<seq> rows=<total>` を stdout へ出力する
-//!   （`scripts/crash_test_cross_table.sh` の開始同期点）。再起動時は `scan_page`・
-//!   `scan_batch_log` から採番（行 ID・バッチ通番）を再開する。
+//!   （`scripts/crash_test_cross_table.sh` の開始同期点）。再起動時は `scan_page`（行 ID）・
+//!   `batch_log_max_seq`（バッチ通番。Issue #132 で `scan_batch_log` 全件走査から
+//!   移行。台帳件数の上限に依存せず再開できる）から採番を再開する。
 //! - `verify <db_path>`: 行 ID の 0 起点連続性・内容一致（行）、`batch_seq` の
 //!   0 起点連続性（台帳）、さらに「台帳の row_count 合計 == 行総数」（テーブル間整合）と
 //!   「行総数が BATCH の倍数」（バッチ整合）を検証する。結果を
@@ -112,8 +113,11 @@ struct ResumeState {
     next_batch_seq: u64,
 }
 
-/// `scan_page`（行テーブル）・`scan_batch_log`（バッチ台帳）の両方から採番を再開する
-/// （クラッシュ → 再起動 → 再クラッシュを反復するために必要）。
+/// `scan_page`（行テーブル）・`batch_log_max_seq`（バッチ台帳）の両方から採番を再開する
+/// （クラッシュ → 再起動 → 再クラッシュを反復するために必要）。バッチ台帳側は
+/// `scan_batch_log` の全件走査ではなく `batch_log_max_seq`（redb の B-tree 末尾キー
+/// 取得のみ・O(log n)）を使うため、台帳件数が `MAX_BATCH_LOG_ROWS` を超えても
+/// 再開経路自体は上限に依存しない（Issue #132）。
 fn find_resume_state(storage: &Storage) -> Result<ResumeState, String> {
     let mut cursor: Option<u64> = None;
     let mut last_row_id: Option<u64> = None;
@@ -136,20 +140,15 @@ fn find_resume_state(storage: &Storage) -> Result<ResumeState, String> {
         None => 0,
     };
 
-    let batch_log = storage
-        .scan_batch_log()
-        .map_err(|e| format!("scan_batch_log failed: {e}"))?;
-    let next_batch_seq = batch_log
-        .iter()
-        .map(|(seq, _)| *seq)
-        .max()
-        .map(|max_seq| {
-            max_seq
-                .checked_add(1)
-                .ok_or_else(|| "batch seq overflow while resuming".to_string())
-        })
-        .transpose()?
-        .unwrap_or(0);
+    let next_batch_seq = match storage
+        .batch_log_max_seq()
+        .map_err(|e| format!("batch_log_max_seq failed: {e}"))?
+    {
+        Some(max_seq) => max_seq
+            .checked_add(1)
+            .ok_or_else(|| "batch seq overflow while resuming".to_string())?,
+        None => 0,
+    };
 
     Ok(ResumeState {
         next_row_id,
