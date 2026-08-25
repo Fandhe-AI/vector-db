@@ -161,6 +161,38 @@ pub fn read_length_prefixed_body<R: Read>(
     Ok(body)
 }
 
+/// 型付きメッセージの長さフィールド（4 バイト、自身を含む）のみを読み検証する。
+/// `read_length_prefixed_body` と同じ分類（`TooLarge`/`Malformed`）を用いるが、
+/// 本文は読まない（呼び出し元が本文を解釈せず有界 lingering drain へ委ねる用途、
+/// 例: `protocol_dispatch::reject_and_close` 前の未対応メッセージ拒否）。
+///
+/// 未対応の型バイトであっても、宣言長を検証せずに固定応答（`0A000`）を返すと、
+/// 長さフィールド欠落・範囲外の malformed frame まで「未対応機能」として扱って
+/// しまい、既存の framing/protocol error 契約（`54000`/`08P01`）を迂回してしまう
+/// （レビュー指摘の回帰防止。ポインタ: TASK-71・WIRE-8）。
+pub fn validate_typed_message_length_prefix<R: Read>(
+    reader: &mut R,
+    min_total: usize,
+    max_total: usize,
+) -> Result<usize, FrameError> {
+    let max_total = max_total.min(MAX_MESSAGE_LEN);
+    let total_len = read_i32_be(reader)?;
+    if total_len < 0 {
+        return Err(FrameError::Malformed("negative message length"));
+    }
+    let total_len = total_len as usize;
+    if total_len > MAX_MESSAGE_LEN {
+        return Err(FrameError::TooLarge {
+            declared: total_len,
+            max: MAX_MESSAGE_LEN,
+        });
+    }
+    if total_len < min_total || total_len > max_total {
+        return Err(FrameError::Malformed("message length out of bounds"));
+    }
+    Ok(total_len)
+}
+
 /// StartupMessage（SSLRequest/GSSENCRequest/CancelRequest を含む、認証前の最初の
 /// パケット）を読み取る。`MIN_STARTUP_LEN..=MAX_STARTUP_LEN` の範囲外は
 /// `Malformed`（`08P01`）に写像する（WIRE-10。`MAX_MESSAGE_LEN` 超過であっても
