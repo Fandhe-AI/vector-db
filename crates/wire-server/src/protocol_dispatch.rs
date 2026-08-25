@@ -59,14 +59,17 @@ pub(crate) const LINGER_DRAIN_MAX_BYTES: usize = 64 * 1024;
 /// `handshake::write_error_response`（io::Result 版）を実体として渡す。
 type WriteErrorResponseFn = fn(&mut TcpStream, &str, &str) -> io::Result<()>;
 
-/// 未対応メッセージへの応答（SQLSTATE 0A000 + 固定英語メッセージ）と、有界な
-/// lingering close を行う（WIRE-8 の本体）。ReadyForQuery は送らない。呼び出し元
-/// （`handshake::post_auth_loop`）はこの関数が返った後にループを抜けて `Ok(())` を
-/// 返し、`stream` の drop によって接続を閉じる契約とする。
+/// 未対応メッセージへの応答（SQLSTATE 0A000 + 分類ごとの固定英語メッセージ）と、
+/// 有界な lingering close を行う（WIRE-8 の本体）。ReadyForQuery は送らない。
+/// 呼び出し元（`handshake::post_auth_loop`）はこの関数が返った後にループを抜けて
+/// `Ok(())` を返し、`stream` の drop によって接続を閉じる契約とする。
 ///
-/// `ExtendedQuery` / `UnsupportedFeature` のいずれも同じ応答（0A000）で扱う。
-/// `Unknown` も現状は同じ 0A000 で扱う（`docs/spec` 未参照のためコード変更範囲を
-/// 最小化する判断。08P01 への区別は別途スコープ外として記録する）。
+/// SQLSTATE は `ExtendedQuery` / `UnsupportedFeature` / `Unknown` のいずれも
+/// `0A000` で統一する（`docs/spec/04-behavior/error-format.md` の判定境界を確認
+/// 済み: `0A000` は SQL 以前のプロトコルメッセージ種別レベルの未対応に適用する分類で
+/// あり、`08P01` は起動メッセージ不正専用（WIRE-10 管轄、本経路とは別の契機）のため
+/// 認証後の未知/未対応バイトには適用しない）。一方でメッセージ文言は分類ごとに
+/// 事実に即した表現へ分ける（[`response_message`]）。
 pub(crate) fn reject_and_close(
     stream: &mut TcpStream,
     kind: FrontendMessageKind,
@@ -79,15 +82,38 @@ pub(crate) fn reject_and_close(
         describe_kind(kind)
     );
 
-    write_error_response(
-        stream,
-        "0A000",
-        "extended query protocol is not supported on this connection",
-    )?;
+    write_error_response(stream, "0A000", response_message(kind))?;
     stream.flush()?;
 
     reject_and_close_with(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
     Ok(())
+}
+
+/// 分類ごとの応答メッセージ文言。`ExtendedQuery` 以外（COPY・関数呼び出し系・
+/// 未知の型バイト）に対して「拡張クエリプロトコル」と述べるのは事実と異なるため、
+/// 分類名を分けて表現する。
+fn response_message(kind: FrontendMessageKind) -> &'static str {
+    match kind {
+        FrontendMessageKind::ExtendedQuery(_) => {
+            "extended query protocol is not supported on this connection"
+        }
+        FrontendMessageKind::UnsupportedFeature(_) => {
+            "COPY and function call protocol messages are not supported on this connection"
+        }
+        // 認証後に来るべきでない 'p'（PasswordMessage）や、既知の型バイト集合に
+        // 該当しない値をまとめて扱う。protocol_violation（08P01）は起動メッセージ
+        // 不正専用のため使わず、feature_not_supported（0A000）のまま文言のみ
+        // 「未対応の型バイト」であることを明示する。
+        FrontendMessageKind::Unknown(_) => {
+            "this frontend message type is not supported on this connection"
+        }
+        // SimpleQuery / Terminate は `handshake::post_auth_loop` の既存分岐で
+        // 処理され本関数には到達しない契約だが、`classify` の全域性を保つために
+        // 網羅しておく。
+        FrontendMessageKind::SimpleQuery | FrontendMessageKind::Terminate => {
+            "this frontend message type is not supported on this connection"
+        }
+    }
 }
 
 fn describe_kind(kind: FrontendMessageKind) -> String {
@@ -154,6 +180,22 @@ fn reject_and_close_with(stream: &mut TcpStream, timeout: Duration, max_bytes: u
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn response_message_differs_by_classification() {
+        // ExtendedQuery / UnsupportedFeature / Unknown で文言を分け、
+        // 「拡張クエリプロトコル」という事実と異なる文言を UnsupportedFeature・
+        // Unknown に流用しないことを保証する（レビュー指摘の回帰防止）。
+        let extended = response_message(FrontendMessageKind::ExtendedQuery(b'P'));
+        let unsupported = response_message(FrontendMessageKind::UnsupportedFeature(b'F'));
+        let unknown = response_message(FrontendMessageKind::Unknown(b'?'));
+
+        assert!(extended.contains("extended query protocol"));
+        assert!(!unsupported.contains("extended query protocol"));
+        assert!(!unknown.contains("extended query protocol"));
+        assert_ne!(extended, unsupported);
+        assert_ne!(extended, unknown);
+    }
 
     #[test]
     fn classify_maps_all_256_type_bytes_without_panicking() {

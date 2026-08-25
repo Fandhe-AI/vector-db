@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use common::{
     authenticate_to_ready_for_query, expect_connection_closed, expect_error_response_with_sqlstate,
-    send_length_prefixed_message, spawn_server_accepting_one, spawn_server_with_accept_loop,
-    write_user_store_file,
+    expect_error_response_with_sqlstate_and_message, send_length_prefixed_message,
+    spawn_server_accepting_one, spawn_server_with_accept_loop, write_user_store_file,
 };
 
 /// ポインタ: TASK-71・WIRE-8。Parse+Bind+Describe+Execute+Sync をパイプライン
@@ -93,6 +93,8 @@ fn simple_query_still_keeps_connection_open() {
 
 /// ポインタ: TASK-71・WIRE-8。未知の型バイトも従来どおり拒否＋切断される
 /// （`protocol_dispatch::classify` の `Unknown` 分類が回帰しないことの確認）。
+/// メッセージ文言が「拡張クエリプロトコル」を名乗らないこと（レビュー指摘の
+/// 回帰防止）も合わせて確認する。
 #[test]
 fn wire8_unknown_message_type_is_rejected_and_closed() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
@@ -102,8 +104,36 @@ fn wire8_unknown_message_type_is_rejected_and_closed() {
     send_length_prefixed_message(&mut stream, b'?', b"");
     stream.shutdown(Shutdown::Write).ok();
 
-    expect_error_response_with_sqlstate(&mut stream, "0A000");
+    expect_error_response_with_sqlstate_and_message(
+        &mut stream,
+        "0A000",
+        "this frontend message type is not supported",
+    );
     expect_connection_closed(&mut stream);
+}
+
+/// ポインタ: TASK-71・WIRE-8。COPY・関数呼び出し系（`UnsupportedFeature`）は
+/// `ExtendedQuery` と同じ SQLSTATE `0A000` で拒否されるが、メッセージ文言は
+/// 「拡張クエリプロトコル」を名乗らず COPY/FunctionCall であることを正しく
+/// 述べること（レビュー指摘: 文言が分類ごとに事実へ即すことの確認）。
+#[test]
+fn wire8_unsupported_feature_message_type_gets_distinct_message_text() {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+
+    for type_byte in [b'F', b'd', b'c', b'f'] {
+        let addr = spawn_server_accepting_one(&users_path);
+        let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
+
+        send_length_prefixed_message(&mut stream, type_byte, b"");
+        stream.shutdown(Shutdown::Write).ok();
+
+        expect_error_response_with_sqlstate_and_message(
+            &mut stream,
+            "0A000",
+            "COPY and function call protocol messages are not supported",
+        );
+        expect_connection_closed(&mut stream);
+    }
 }
 
 /// ポインタ: TASK-71・WIRE-8。拒否後に接続スロットが解放され、次の接続が

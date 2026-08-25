@@ -200,6 +200,25 @@ pub fn send_length_prefixed_message(stream: &mut TcpStream, type_byte: u8, body:
 
 /// ErrorResponse（'E'）を読み取り、SQLSTATE が期待値と一致することを確認する。
 pub fn expect_error_response_with_sqlstate(stream: &mut TcpStream, expected_sqlstate: &str) {
+    expect_error_response_body(stream, expected_sqlstate, None);
+}
+
+/// ErrorResponse（'E'）を読み取り、SQLSTATE 及び（指定時）メッセージ本文の部分
+/// 一致を確認する。分類ごとにメッセージ文言が分かれていること
+/// （`protocol_dispatch::response_message`）の結合テスト側の回帰防止に使う。
+pub fn expect_error_response_with_sqlstate_and_message(
+    stream: &mut TcpStream,
+    expected_sqlstate: &str,
+    expected_message_substr: &str,
+) {
+    expect_error_response_body(stream, expected_sqlstate, Some(expected_message_substr));
+}
+
+fn expect_error_response_body(
+    stream: &mut TcpStream,
+    expected_sqlstate: &str,
+    expected_message_substr: Option<&str>,
+) {
     let mut header = [0u8; 1];
     stream.read_exact(&mut header).expect("read type");
     assert_eq!(header[0], b'E', "expected ErrorResponse");
@@ -213,6 +232,12 @@ pub fn expect_error_response_with_sqlstate(stream: &mut TcpStream, expected_sqls
         body_str.contains(expected_sqlstate),
         "expected SQLSTATE {expected_sqlstate}, got: {body_str:?}"
     );
+    if let Some(expected_message_substr) = expected_message_substr {
+        assert!(
+            body_str.contains(expected_message_substr),
+            "expected message containing {expected_message_substr:?}, got: {body_str:?}"
+        );
+    }
 }
 
 /// 応答読み取り後に接続が閉じられている（追加の読み取りが EOF になる）ことを
