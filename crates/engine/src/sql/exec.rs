@@ -6,7 +6,8 @@
 //! TASK-76 の管轄でありここでは提供しない）。RLS 段は `WHERE` 句の `visible()` 呼び出し
 //! （[`BoundStatement::rls_predicate_present`]）の有無に**関係なく**無条件に適用する
 //! （SQL-3・RLS-7: RLS 強制は述語の有無に依存しない。security.md P0「テナント分離の
-//! 検査を外す/緩める/バイパス経路を作らない」）。
+//! 検査を外す/緩める/バイパス経路を作らない」）。述語は
+//! [`crate::rls::ImplicitRlsHook`] 経由で無条件に取得する（TASK-137・RLS-7）。
 //!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
@@ -20,6 +21,7 @@ use crate::core;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
+use crate::rls::ImplicitRlsHook;
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
@@ -375,10 +377,11 @@ pub fn execute_statement(
         Ok(true)
     };
 
+    let rls_hook = ImplicitRlsHook::new(ctx);
     let arena = VectorArena::build_filtered_with_rows_in_txn(
         read_txn,
         &bound.table,
-        |tenant, visibility| ctx.is_visible(tenant, visibility),
+        rls_hook.predicate(),
         on_visible_row,
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;

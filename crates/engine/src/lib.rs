@@ -65,6 +65,12 @@
 //! TASK-74（対象ビヘイビア: SQL-8）: `sql.rs` が SQL 表層の入口。受信 SQL テキストに
 //! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
 //! （詳細は `sql.rs` モジュールドキュメント参照）。
+//!
+//! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が、認証済み
+//! セッションから導出された `PolicyContext` のみを入力に候補集合構築（C1〜C4）へ
+//! 可視性フィルタを無条件適用する単一注入点。`core.rs::EngineCore::search`/`get_row`・
+//! `sql/exec.rs::execute_statement` が共通で経由する（詳細は `rls.rs` モジュール
+//! ドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
