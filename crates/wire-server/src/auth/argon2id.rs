@@ -33,10 +33,23 @@ pub const RECOMMENDED_PARAMS: Params = Params {
     p_cost: 1,
 };
 
+/// `m_cost_kib` の上限（2 GiB）。ユーザーストアの PHC 行は構文的に正しければ任意の
+/// 巨大値を持ちうる untrusted 入力であり、上限なしに `hash_raw` へ通すと
+/// `m_prime` ブロック数に比例した `Vec` 確保で OOM を招く（1 テナントの認証失敗では
+/// なくプロセス全体のクラッシュに波及するため、ロード時に fail-closed で拒否する）。
+pub const MAX_M_COST_KIB: u32 = 2 * 1024 * 1024;
+/// `t_cost`（パス数）の上限。CPU 時間の異常な引き伸ばしを防ぐ。
+pub const MAX_T_COST: u32 = 64;
+/// `p_cost`（レーン数）の上限。レーンごとの作業領域確保・スレッド分の CPU 消費を防ぐ。
+pub const MAX_P_COST: u32 = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Argon2Error {
     /// メモリ量がレーン数に対して小さすぎる（RFC 9106: m は 8*p 以上必須）。
     MemoryTooSmall,
+    /// `m_cost_kib` / `t_cost` / `p_cost` が [`MAX_M_COST_KIB`] 等の運用上限を超える
+    /// （構文的には正しい PHC でも、計算資源の異常確保を防ぐため拒否する）。
+    ParamOutOfRange(&'static str),
     /// レーン数・パス数・出力長が 0（RFC 9106 の定義域外）。
     InvalidParam(&'static str),
     /// PHC 文字列がこの実装が生成する形式（`$argon2id$v=19$m=..,t=..,p=..$salt$hash`）と
@@ -48,10 +61,39 @@ impl std::fmt::Display for Argon2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Argon2Error::MemoryTooSmall => write!(f, "argon2id: m_cost too small for p_cost"),
+            Argon2Error::ParamOutOfRange(name) => {
+                write!(f, "argon2id: parameter exceeds resource ceiling: {name}")
+            }
             Argon2Error::InvalidParam(name) => write!(f, "argon2id: invalid parameter: {name}"),
             Argon2Error::MalformedPhc => write!(f, "argon2id: malformed PHC string"),
         }
     }
+}
+
+/// `hash_raw` が実際に計算資源を確保する前に課すパラメータ検証をロード時にも再利用
+/// できるよう切り出したもの（`auth.rs::UserStore::load_from_file` から呼ばれる）。
+/// 構文検証（[`parse_phc`]）とは独立に、値の範囲（下限は RFC 9106 の `m >= 8*p`、
+/// 上限は [`MAX_M_COST_KIB`] 等の運用上限）を検証する。
+pub fn validate_params(params: &Params) -> Result<(), Argon2Error> {
+    let p = params.p_cost;
+    let m = params.m_cost_kib;
+    let t = params.t_cost;
+    if p == 0 || t == 0 {
+        return Err(Argon2Error::InvalidParam("p_cost/t_cost must be >= 1"));
+    }
+    if m < p.saturating_mul(8) {
+        return Err(Argon2Error::MemoryTooSmall);
+    }
+    if m > MAX_M_COST_KIB {
+        return Err(Argon2Error::ParamOutOfRange("m_cost_kib"));
+    }
+    if t > MAX_T_COST {
+        return Err(Argon2Error::ParamOutOfRange("t_cost"));
+    }
+    if p > MAX_P_COST {
+        return Err(Argon2Error::ParamOutOfRange("p_cost"));
+    }
+    Ok(())
 }
 
 impl std::error::Error for Argon2Error {}
@@ -364,17 +406,12 @@ pub fn hash_raw(
     params: &Params,
     out_len: usize,
 ) -> Result<Vec<u8>, Argon2Error> {
+    validate_params(params)?;
     let p = params.p_cost;
     let m = params.m_cost_kib;
     let t = params.t_cost;
-    if p == 0 || t == 0 {
-        return Err(Argon2Error::InvalidParam("p_cost/t_cost must be >= 1"));
-    }
     if out_len < 4 {
         return Err(Argon2Error::InvalidParam("out_len must be >= 4"));
-    }
-    if m < p.saturating_mul(8) {
-        return Err(Argon2Error::MemoryTooSmall);
     }
 
     let m_prime = 4 * p * (m / (4 * p));

@@ -134,7 +134,15 @@ impl UserStore {
             if tenant_id.is_empty() {
                 return Err(LoadError::EmptyTenantId { line: line_no });
             }
-            argon2id::parse_phc(phc).map_err(|_| LoadError::InvalidPhc { line: line_no })?;
+            // 構文検証（parse_phc）に加え、m_cost_kib 等の値がロード後の初回ログイン時に
+            // OOM を招く極端な範囲でないかを起動時に検証する（fail-closed。実行時に
+            // 初めて発覚させない。レビュー指摘: m が異常に大きい構文的に正しい PHC が
+            // `hash_raw` 呼び出し時まで検出されないと、1 テナントの認証失敗ではなく
+            // プロセス全体のクラッシュに波及しうる）。
+            let (params, _, _) =
+                argon2id::parse_phc(phc).map_err(|_| LoadError::InvalidPhc { line: line_no })?;
+            argon2id::validate_params(&params)
+                .map_err(|_| LoadError::InvalidPhc { line: line_no })?;
             engine::policy::PolicyContext::new(tenant_id)
                 .map_err(|_| LoadError::InvalidTenantId { line: line_no })?;
 
@@ -361,6 +369,24 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("users_bad_phc.txt");
         std::fs::write(&path, "alice:tenant-a:not-a-valid-phc\n").expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 構文的には正しいが `m_cost_kib` が運用上限を超える PHC を起動時に拒否すること
+    /// （レビュー指摘: `hash_raw` 呼び出し時まで検出されないと OOM でプロセス全体が
+    /// 落ちるため、`load_from_file` の時点で fail-closed にする）。
+    #[test]
+    fn load_from_file_rejects_oversized_m_cost() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_oversized_m_cost.txt");
+        std::fs::write(
+            &path,
+            "alice:tenant-a:$argon2id$v=19$m=999999999,t=1,p=1$c2FsdA$aGFzaA\n",
+        )
+        .expect("write fixture");
         let result = UserStore::load_from_file(&path);
         assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
         let _ = std::fs::remove_file(&path);
