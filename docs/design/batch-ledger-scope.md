@@ -1,6 +1,6 @@
 # ADR: バッチ台帳（TABLE-10）の適用範囲と書き込み経路非統合の判断
 
-- ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
+- ステータス: Accepted
 - 対応: Issue #133
 - 前提: TASK-90（PR #129 でバッチ台帳の型分離・契約範囲の明文化を実施済み）・TASK-140・TASK-88
 - 関連: `docs/spec/05-tasks.md`（TASK-90・TASK-93）・`docs/spec/04-behavior/data-model.md`（TABLE-10）・
@@ -73,7 +73,7 @@ DB 全体の不変条件としては型システムでは強制されない。�
 「あるテーブルへの書き込みを `BatchWriteTxn` だけで行った場合」に固定したまま、ドキュメントと
 ピン留めテストで維持する。
 
-## 判断（Proposed）
+## 判断（Accepted）
 
 **選択肢 D（恒久化）を採用する。DB 全体でのバッチ台帳整合は不要と判断し、書き込み経路の統合は
 行わない。**
