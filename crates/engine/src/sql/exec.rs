@@ -45,6 +45,7 @@ use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
 use crate::sql::plan::ExecutionPlan;
+use crate::sql::udf_call;
 use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
@@ -119,19 +120,37 @@ const _: () = assert!(
 
 /// 投影結果 1 セル。`row_codec::Value` の公開 enum は変更せず、`id` 疑似列
 /// （`u64`）を表現するため独自の enum を持つ。
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Float`・`Bool`
+/// variant を追加した（宣言的 UDF・組み込み関数呼び出しの結果列。`row_codec::Value`
+/// は変更しない方針を踏襲する）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Null,
     Integer(u64),
     Text(String),
     Vector(Vec<f32>),
+    /// 式項目（TASK-79・SQL-9）の `Scalar` 型評価結果。
+    Float(f64),
+    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
+    Bool(bool),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
+///
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant を
+/// 追加した。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
-    Scalar { name: String, ty: ColumnType },
+    Scalar {
+        name: String,
+        ty: ColumnType,
+    },
+    /// 式項目（TASK-79・SQL-9）。`ColumnType` を持たない（`Cell::Float`/`Cell::Bool`/
+    /// `Cell::Vector` のいずれになるかは実行時の評価結果の型による）。
+    Computed {
+        name: String,
+    },
 }
 
 /// 投影結果 1 行。
@@ -179,6 +198,13 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         ArenaError::CapacityExceeded => {
             SqlSurfaceError::payload_too_large("candidate set exceeds arena capacity")
         }
+        // TASK-79（SQL-9）: `WHERE` 式述語の評価（`sql::udf_call::eval`）が 0 除算・
+        // 非有限値等で fail-closed に拒否した場合（`expr_eval_error_to_arena` 参照）。
+        // データ破損・実装バグ（`Storage`/`Catalog`/`InvalidDim`/`DimMismatch`/
+        // `AllocationFailed`）とは異なり、入力値に起因する「受理構文だが値が不正」
+        // として `22000` へ写像する（`sql::parser::bind_in_session` の他の
+        // `InvalidInput` と同じ分類）。
+        ArenaError::InvalidInput(detail) => SqlSurfaceError::invalid_input(detail),
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
@@ -186,6 +212,22 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         | ArenaError::AllocationFailed(_) => SqlSurfaceError::Internal {
             detail: "arena build failed".to_string(),
         },
+    }
+}
+
+/// `sql::udf_call::eval` が返す [`SqlSurfaceError`] を、`on_visible_row`（行フック。
+/// 戻り値が [`ArenaError`] に固定されている）から返せる形へ写像する（TASK-79・
+/// SQL-9）。`map_arena_error` がこの逆写像（`ArenaError` → `SqlSurfaceError`）を
+/// 呼び出し元で行い、`22000`／`54000` の wire_code を保つ（`arena.rs` は sql 表層の
+/// 型に依存しないため、両関数の対で往復させる）。
+fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
+    match e {
+        SqlSurfaceError::PayloadTooLarge { detail } => {
+            let _ = detail;
+            ArenaError::CapacityExceeded
+        }
+        SqlSurfaceError::InvalidInput { detail } => ArenaError::InvalidInput(detail),
+        other => ArenaError::Storage(StorageError::Codec(other.to_string())),
     }
 }
 
@@ -350,7 +392,11 @@ pub fn execute_statement(
         .iter()
         .filter_map(|col| match col {
             ProjectedColumn::Column { index, .. } => Some(*index),
-            ProjectedColumn::Id => None,
+            // `Computed`（TASK-79・SQL-9）は候補構築時に保持した `candidate_columns`
+            // （`Text` 列のデコード結果）を参照しない。評価に使うのは `arena` 由来の
+            // `id`／embedding のみ（`sql::udf_call::eval` 参照。`TEXT` 列参照は
+            // 束縛段で拒否済み）。
+            ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
     if !plan.scalar_prefilter {
@@ -367,100 +413,118 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
-    let on_visible_row =
-        |slot: usize, id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
-            // `id` は投影の `ResultRow.id` としてのみ使い、行の同定には使わない
-            // （同定は `slot`。上記 `candidate_columns` のコメント参照）。
-            let _ = id;
-            // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
-            // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
-            // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
-            // 値を保持しないクエリでも 1 行分の巨大な一時確保が先に発生し得た
-            // （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
-            // `scan_scalar_columns` は構造検証のみを行い `Text` 値を `metadata` 借用の
-            // `&str` として返すため、ここではヒープ確保が一切発生しない。フィルタ条件
-            // の突合も借用のまま行い、投影・hybrid 本文として実際に必要な列だけを
-            // 下のループで選択的に複製する。
-            let scanned = row_codec::scan_scalar_columns(schema, metadata)
-                .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
-            // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
-            // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
-            // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
-            if plan.scalar_prefilter {
-                for filter in &bound.scalar_filters {
-                    match scanned.get(filter.column_index) {
-                        Some(Some(t)) if *t == filter.value => {}
-                        _ => return Ok(false),
+    let on_visible_row = |slot: usize,
+                          id: u64,
+                          embedding: &[f32],
+                          metadata: &[u8]|
+     -> std::result::Result<bool, ArenaError> {
+        // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
+        // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
+        // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
+        // 値を保持しないクエリでも 1 行分の巨大な一時確保が先に発生し得た
+        // （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
+        // `scan_scalar_columns` は構造検証のみを行い `Text` 値を `metadata` 借用の
+        // `&str` として返すため、ここではヒープ確保が一切発生しない。フィルタ条件
+        // の突合も借用のまま行い、投影・hybrid 本文として実際に必要な列だけを
+        // 下のループで選択的に複製する。
+        let scanned = row_codec::scan_scalar_columns(schema, metadata)
+            .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+        // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
+        // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
+        // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
+        if plan.scalar_prefilter {
+            for filter in &bound.scalar_filters {
+                match scanned.get(filter.column_index) {
+                    Some(Some(t)) if *t == filter.value => {}
+                    _ => return Ok(false),
+                }
+            }
+            // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
+            // 既存の等価条件と同じ SCALAR 段の一部として事前適用する。可視行
+            // （RLS-8 の暗黙適用を通過した行）にのみ到達するため、不可視行では
+            // 式が一切評価されない。評価エラー（0 除算・非有限値等）は当該行を
+            // 黙ってスキップせず、クエリ全体の失敗として fail-closed に伝播する
+            // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
+            for expr in &bound.expr_filters {
+                match udf_call::eval(expr, id, embedding).map_err(expr_eval_error_to_arena)? {
+                    udf_call::ExprValue::Bool(true) => {}
+                    udf_call::ExprValue::Bool(false) => return Ok(false),
+                    // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
+                    // `Bool` に限定済みのため到達しない（`ExprType::Bool` 検査参照）。
+                    _ => {
+                        return Err(ArenaError::InvalidInput(
+                            "WHERE expression did not evaluate to a boolean".to_string(),
+                        ))
                     }
                 }
             }
-            if is_hybrid {
-                if let Some(idx) = text_column_index {
-                    if let Some(Some(t)) = scanned.get(idx) {
-                        if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
-                            return Err(ArenaError::CapacityExceeded);
-                        }
-                        let owned = try_alloc_text_for_budget(
-                            t,
-                            &mut sparse_bytes,
-                            crate::sparse::MAX_CORPUS_BYTES,
-                        )?;
-                        // 疎コーパスの文書 id もスロット番号（`DocId = u64`）にする。
-                        // 行 `id` を使うと、同一 `id` の可視行が 2 テナント分あるときに
-                        // `SparseIndex::build` が `DuplicateDocId` で失敗し、ハイブリッド
-                        // SQL 全体が落ちる（Bugbot Medium 指摘。対象ビヘイビア: TABLE-12）。
-                        let doc_id =
-                            u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
-                        sparse_docs.push((doc_id, owned));
+        }
+        if is_hybrid {
+            if let Some(idx) = text_column_index {
+                if let Some(Some(t)) = scanned.get(idx) {
+                    if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
+                        return Err(ArenaError::CapacityExceeded);
                     }
-                    // NULL 本文は疎側に含めない（密のみへ寄与する）。
+                    let owned = try_alloc_text_for_budget(
+                        t,
+                        &mut sparse_bytes,
+                        crate::sparse::MAX_CORPUS_BYTES,
+                    )?;
+                    // 疎コーパスの文書 id もスロット番号（`DocId = u64`）にする。
+                    // 行 `id` を使うと、同一 `id` の可視行が 2 テナント分あるときに
+                    // `SparseIndex::build` が `DuplicateDocId` で失敗し、ハイブリッド
+                    // SQL 全体が落ちる（Bugbot Medium 指摘。対象ビヘイビア: TABLE-12）。
+                    let doc_id = u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+                    sparse_docs.push((doc_id, owned));
+                }
+                // NULL 本文は疎側に含めない（密のみへ寄与する）。
+            }
+        }
+        // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
+        // ただし投影で実際に参照される列（`needed_column_indices`）だけを複製し、
+        // それ以外は `Value::Null` として保持する（複製しない）。行を保持することで
+        // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は
+        // 複製する列ごとに）を、それぞれの確保の**前**に検証し、上限超過は
+        // fail-closed に `ArenaError::CapacityExceeded`（`map_arena_error` 経由で
+        // `PayloadTooLarge`）として拒否する（投影列を持たない `SELECT id ...` でも、
+        // 候補行数に比例する `Vec<Value>` 構造体分だけで無制限に積み上がらない
+        // ようにする）。行単位の上限は「投影された列と hybrid 本文 1 本のみが複製
+        // 対象になる」という構造そのものが担保する（必要な列だけを、必要な分だけ
+        // 確保前に検証してから複製するため、行あたりの複製量は投影列の実バイト数
+        // を超えない）。
+        candidate_scalar_bytes = try_accumulate_budget(
+            candidate_scalar_bytes,
+            row_struct_bytes,
+            MAX_CANDIDATE_SCALAR_BYTES,
+        )?;
+        let mut kept: Vec<Value> = Vec::new();
+        kept.try_reserve_exact(scanned.len()).map_err(|e| {
+            ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
+        })?;
+        for (idx, slot) in scanned.into_iter().enumerate() {
+            if !needed_column_indices.contains(&idx) {
+                kept.push(Value::Null);
+                continue;
+            }
+            match slot {
+                None => kept.push(Value::Null),
+                Some(t) => {
+                    let owned = try_alloc_text_for_budget(
+                        t,
+                        &mut candidate_scalar_bytes,
+                        MAX_CANDIDATE_SCALAR_BYTES,
+                    )?;
+                    kept.push(Value::Text(owned));
                 }
             }
-            // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
-            // ただし投影で実際に参照される列（`needed_column_indices`）だけを複製し、
-            // それ以外は `Value::Null` として保持する（複製しない）。行を保持することで
-            // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は
-            // 複製する列ごとに）を、それぞれの確保の**前**に検証し、上限超過は
-            // fail-closed に `ArenaError::CapacityExceeded`（`map_arena_error` 経由で
-            // `PayloadTooLarge`）として拒否する（投影列を持たない `SELECT id ...` でも、
-            // 候補行数に比例する `Vec<Value>` 構造体分だけで無制限に積み上がらない
-            // ようにする）。行単位の上限は「投影された列と hybrid 本文 1 本のみが複製
-            // 対象になる」という構造そのものが担保する（必要な列だけを、必要な分だけ
-            // 確保前に検証してから複製するため、行あたりの複製量は投影列の実バイト数
-            // を超えない）。
-            candidate_scalar_bytes = try_accumulate_budget(
-                candidate_scalar_bytes,
-                row_struct_bytes,
-                MAX_CANDIDATE_SCALAR_BYTES,
-            )?;
-            let mut kept: Vec<Value> = Vec::new();
-            kept.try_reserve_exact(scanned.len()).map_err(|e| {
-                ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
-            })?;
-            for (idx, slot) in scanned.into_iter().enumerate() {
-                if !needed_column_indices.contains(&idx) {
-                    kept.push(Value::Null);
-                    continue;
-                }
-                match slot {
-                    None => kept.push(Value::Null),
-                    Some(t) => {
-                        let owned = try_alloc_text_for_budget(
-                            t,
-                            &mut candidate_scalar_bytes,
-                            MAX_CANDIDATE_SCALAR_BYTES,
-                        )?;
-                        kept.push(Value::Text(owned));
-                    }
-                }
-            }
-            // `slot` は「これから push される行の添字」（アリーナ側の契約）。ここでの
-            // push により `candidate_columns[slot] == kept` が成立する。両者がずれた場合は
-            // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
-            debug_assert_eq!(candidate_columns.len(), slot);
-            candidate_columns.push(kept);
-            Ok(true)
-        };
+        }
+        // `slot` は「これから push される行の添字」（アリーナ側の契約）。ここでの
+        // push により `candidate_columns[slot] == kept` が成立する。両者がずれた場合は
+        // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
+        debug_assert_eq!(candidate_columns.len(), slot);
+        candidate_columns.push(kept);
+        Ok(true)
+    };
 
     let rls_hook = ImplicitRlsHook::new(ctx);
     let arena = VectorArena::build_filtered_with_rows_in_txn(
@@ -591,21 +655,59 @@ pub fn execute_statement(
     let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
         hits
     } else {
-        hits.into_iter()
-            .filter(|(slot_id, _)| {
-                // `slot_id` はアリーナのスロット番号（上記参照）。範囲外は
-                // データ不整合として fail-closed に除去する。
-                match usize::try_from(*slot_id)
-                    .ok()
-                    .and_then(|slot| candidate_columns.get(slot))
-                {
-                    Some(columns) => bound.scalar_filters.iter().all(|f| {
-                        matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value)
-                    }),
-                    None => false,
+        // TASK-79（SQL-9）: `WHERE` の式述語も既存の等価条件と同じ SCALAR 事後
+        // フィルタの一部として扱う（DISTANCE 先行時。§モジュールドキュメント参照）。
+        // 評価に使う embedding は候補選択と同一スナップショットの `arena` から
+        // （投影段と同じ経路。再取得なし）。評価エラーはこの場で fail-closed に
+        // クエリ全体の失敗として伝播する（当該行だけを黙ってスキップしない。
+        // `on_visible_row` の事前フィルタ経路と同じ方針）。
+        let mut filtered = Vec::with_capacity(hits.len());
+        for (slot_id, score) in hits {
+            // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
+            // として fail-closed に除去する。
+            let Some(slot) = usize::try_from(slot_id).ok() else {
+                continue;
+            };
+            let Some(columns) = candidate_columns.get(slot) else {
+                continue;
+            };
+            let scalar_ok = bound.scalar_filters.iter().all(
+                |f| matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value),
+            );
+            if !scalar_ok {
+                continue;
+            }
+            if !bound.expr_filters.is_empty() {
+                let Some(embedding) = arena.vector(slot) else {
+                    continue;
+                };
+                let Some(row_id) = arena.ids().get(slot).copied() else {
+                    continue;
+                };
+                let mut expr_ok = true;
+                for expr in &bound.expr_filters {
+                    match udf_call::eval(expr, row_id, embedding)? {
+                        udf_call::ExprValue::Bool(true) => {}
+                        udf_call::ExprValue::Bool(false) => {
+                            expr_ok = false;
+                            break;
+                        }
+                        // 束縛段が型を `Bool` に限定済みのため到達しない。
+                        _ => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "WHERE expression did not evaluate to a boolean"
+                                    .to_string(),
+                            })
+                        }
+                    }
                 }
-            })
-            .collect()
+                if !expr_ok {
+                    continue;
+                }
+            }
+            filtered.push((slot_id, score));
+        }
+        filtered
     };
 
     // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
@@ -649,6 +751,7 @@ pub fn execute_statement(
                     .map(|c| c.ty)
                     .unwrap_or(ColumnType::Text),
             },
+            ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
         })
         .collect();
 
@@ -722,6 +825,17 @@ fn project_rows(
                                 })
                             }
                         },
+                    }
+                }
+                ProjectedColumn::Computed { expr, .. } => {
+                    // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
+                    // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
+                    // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
+                    // （行値・テナントを含まない固定文言。`sql::udf_call::eval` 参照）。
+                    match udf_call::eval(expr, id, embedding)? {
+                        udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        udf_call::ExprValue::Vector(v) => cells.push(Cell::Vector(v)),
+                        udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                     }
                 }
             }

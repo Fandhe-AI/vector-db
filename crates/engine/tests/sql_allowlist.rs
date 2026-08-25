@@ -102,9 +102,14 @@ fn rejects_unsupported_syntax_before_touching_the_catalog() {
 #[test]
 fn never_silently_executes_an_unrecognized_where_condition_as_unfiltered_top_k() {
     // 未対応 WHERE 条件が黙殺されず明示的に拒否されることを固定する（SQL-8）。
+    // TASK-79（SQL-9）で `<expr> <cmp> <expr>` 形の式述語（`1 = 1` 等の数値比較を
+    // 含む）を正式に受理するようになったため、旧 `1 = 1` はもはや「未対応構文」の
+    // 例として不適切になった（意図した仕様拡張であり、非回帰ではない）。本テストの
+    // 意図（`OR` によるバイパスを黙って許可しない）を保つため、依然として拒否される
+    // `OR` 結合へ置き換える。
     let (storage, _guard) = open_storage_with_documents_table("no-silent-fallback");
     let err = validate_statement(
-        "SELECT * FROM documents WHERE lang = 'ja' AND 1 = 1 ORDER BY embedding <=> '[0.1]' LIMIT 10",
+        "SELECT * FROM documents WHERE lang = 'ja' OR lang = 'en' ORDER BY embedding <=> '[0.1]' LIMIT 10",
         &storage,
     )
     .expect_err("unrecognized WHERE condition must be rejected, never silently dropped");

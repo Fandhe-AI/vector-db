@@ -20,6 +20,7 @@ use crate::sql::allowlist::{
     WherePredicate,
 };
 use crate::sql::plan::EvaluationOrder;
+use crate::sql::udf_call::Expr;
 use crate::sql::using_operation_id::OperationId;
 
 /// ベクトルリテラルの生バイト長上限（SQL-1）。アロケーション（`Vec<f32>` の確保・
@@ -31,10 +32,20 @@ const MAX_VECTOR_LITERAL_BYTES: usize = 64 * 1024;
 /// の列順インデックス（[`crate::row_codec::decode_scalar_columns`] が返す `Vec` の
 /// 添字と一致する。`VECTOR` 列の位置は常に `row_codec::Value::Null` が入るため、
 /// `exec.rs` はその位置を投影する際 `storage::Row::embedding` を別途参照する）。
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant を
+/// 追加した（宣言的 UDF・組み込み関数呼び出しを結果列位置で束縛した式）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProjectedColumn {
     Id,
-    Column { index: usize, name: String },
+    Column {
+        index: usize,
+        name: String,
+    },
+    /// 式項目（TASK-79・SQL-9）。`name` は `AS <alias>` の指定値、省略時は関数名。
+    Computed {
+        name: String,
+        expr: crate::sql::udf_call::BoundExpr,
+    },
 }
 
 /// SCALAR 段（`WHERE <列> = '<literal>'`）で適用する等価条件 1 件。
@@ -91,6 +102,11 @@ pub struct BoundStatement {
     /// `PolicyContext::is_visible` を適用する）。本フィールドは束縛結果の可観測性
     /// （テスト・診断）のためだけに保持する。
     pub(crate) rls_predicate_present: bool,
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済みで、レジストリを
+    /// 参照せず単独で評価できる。既存の `scalar_filters` と同じ SCALAR 段の一部として
+    /// 扱う（`sql::exec` のモジュールドキュメント参照。既定順では候補構築時の行フックで
+    /// 事前適用し、`HINT ORDER` で DISTANCE 先行時は DISTANCE 段の後で事後適用する）。
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
     pub(crate) ranking: Ranking,
     pub(crate) limit: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
@@ -129,6 +145,7 @@ impl BoundStatement {
             projection,
             scalar_filters,
             rls_predicate_present,
+            expr_filters: Vec::new(),
             ranking,
             limit,
             mode: crate::sql::mode::resolve_mode(None, None),
@@ -163,6 +180,11 @@ impl BoundStatement {
     /// **実行側の RLS 適用はこの値の有無に依存しない**（可観測性のためだけの値）。
     pub fn rls_predicate_present(&self) -> bool {
         self.rls_predicate_present
+    }
+
+    /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済み。
+    pub fn expr_filters(&self) -> &[crate::sql::udf_call::BoundExpr] {
+        &self.expr_filters
     }
 
     /// DISTANCE 段のランキング方式。
@@ -366,6 +388,17 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
 /// `Storage::get_table_schema` で取得済みのものを渡す。セッション変数を持たない
 /// エントリポイント向けの後方互換 API で、[`bind_with_session`]（TASK-161）へ
 /// `session_mode: None` で委譲する。
+/// `AS <alias>` を省略した SELECT 式項目の既定列名（TASK-79・SQL-9）。頂点の
+/// 関数呼び出し名を使う（`Expr::Call` 以外が頂点の式は SELECT リストの構文上
+/// 現れない＝`allowlist::Parser::parse_select_item` は必ず `ident '(' ... ')'` から
+/// 式項目を作るため `name` は常に取得できる）。
+fn default_expr_alias(expr: &Expr) -> String {
+    match expr {
+        Expr::Call { name, .. } => name.clone(),
+        _ => "expr".to_string(),
+    }
+}
+
 pub fn bind(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
@@ -375,22 +408,48 @@ pub fn bind(
 
 /// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
 /// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
-/// 束縛する（TASK-161 の公開 API）。`stmt.search_mode`（クエリ句 `USING MODE` の生
-/// リテラル）を [`SearchMode::parse_literal`] で検証し、`session_mode` とあわせて
-/// [`mode::resolve_mode`] で優先順位解決する（クエリ句 > セッション変数 > 既定）。
-/// クエリ句のリテラルが `recall`／`precision` 以外の場合は
-/// [`SqlSurfaceError::InvalidInput`]（`22000`。構文上受理された値が不正）で
-/// fail-closed に拒否し、黙って既定モードへ落とさない。
+/// 束縛する（TASK-161 の公開 API）。UDF レジストリを持たないエントリポイント向けの
+/// 後方互換 API で、[`bind_in_session`]（TASK-79）へ空レジストリで委譲する。
 pub fn bind_with_session(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     session_mode: Option<SearchMode>,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_in_session(
+        stmt,
+        schema,
+        session_mode,
+        &crate::sql::udf_call::UdfRegistry::default(),
+    )
+}
+
+/// [`ValidatedStatement`] を `schema`・`session_mode`・UDF レジストリ `udfs`
+/// （呼び出し元の [`crate::sql::mode::SessionState::udfs`]）と照合して
+/// [`BoundStatement`] へ束縛する（TASK-79・SQL-9 の公開 API。TASK-161 の
+/// `bind_with_session` を UDF 呼び出しの束縛（結果列・`WHERE` 式述語）へ拡張した
+/// もの）。`stmt.search_mode`（クエリ句 `USING MODE` の生リテラル）を
+/// [`SearchMode::parse_literal`] で検証し、`session_mode` とあわせて
+/// [`mode::resolve_mode`] で優先順位解決する（クエリ句 > セッション変数 > 既定）。
+/// クエリ句のリテラルが `recall`／`precision` 以外の場合は
+/// [`SqlSurfaceError::InvalidInput`]（`22000`。構文上受理された値が不正）で
+/// fail-closed に拒否し、黙って既定モードへ落とさない。
+pub fn bind_in_session(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundStatement, SqlSurfaceError> {
     let query_mode = match &stmt.search_mode {
         Some(literal) => Some(SearchMode::parse_literal(literal)?),
         None => None,
     };
     let resolved_mode = mode::resolve_mode(query_mode, session_mode);
+
+    // TASK-79・SQL-9: 1 つの `SELECT` 文（結果列＋`WHERE` の全式項目）で共有する
+    // インライン展開後ノード数の予算（[`crate::sql::udf_call::MAX_EXPR_NODES`]）。
+    // 多段 UDF 呼び出しによる展開後の指数的膨張を、文単位で歯止めする
+    // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
     let projection = match &stmt.projection {
         Projection::All => {
@@ -428,9 +487,40 @@ pub fn bind_with_session(
             }
             cols
         }
+        Projection::Items(items) => {
+            let mut cols = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    crate::sql::allowlist::SelectItem::Column(name) => {
+                        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                            cols.push(ProjectedColumn::Column {
+                                index,
+                                name: name.clone(),
+                            });
+                            continue;
+                        }
+                        if name == "id" {
+                            cols.push(ProjectedColumn::Id);
+                            continue;
+                        }
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "unknown column: {name}"
+                        )));
+                    }
+                    crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
+                        let (bound, _ty) =
+                            crate::sql::udf_call::bind_expr(expr, schema, udfs, &mut node_budget)?;
+                        let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
+                        cols.push(ProjectedColumn::Computed { name, expr: bound });
+                    }
+                }
+            }
+            cols
+        }
     };
 
     let mut scalar_filters = Vec::with_capacity(stmt.where_predicates.len());
+    let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
     for predicate in &stmt.where_predicates {
         match predicate {
@@ -446,6 +536,16 @@ pub fn bind_with_session(
                 // （`is_allowed_where_predicate_name`）。名前の再検証はしない
                 // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
                 rls_predicate_present = true;
+            }
+            WherePredicate::Expression(expr) => {
+                let (bound, ty) =
+                    crate::sql::udf_call::bind_expr(expr, schema, udfs, &mut node_budget)?;
+                if ty != crate::sql::udf_call::ExprType::Bool {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "WHERE expression must evaluate to a boolean (use a comparison)",
+                    ));
+                }
+                expr_filters.push(bound);
             }
         }
     }
@@ -467,6 +567,7 @@ pub fn bind_with_session(
         projection,
         scalar_filters,
         rls_predicate_present,
+        expr_filters,
         ranking,
         limit,
         mode: resolved_mode,

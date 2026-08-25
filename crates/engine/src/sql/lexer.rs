@@ -28,10 +28,16 @@ pub enum Token {
     Ident(String),
     StringLiteral(String),
     Number(String),
-    /// `(` `)` `,` `*` `=` `;`
+    /// `(` `)` `,` `*` `=` `;` `+` `-` `/` `>` `<`（TASK-79・SQL-9 で `+ - / > <` を追加。
+    /// `*` は SELECT リストの `*` と式内の乗算の両方を表す。文脈による使い分けは
+    /// `allowlist::Parser` の管轄）。
     Punct(char),
     /// `<=>`（密ベクトル距離演算子）
     DistanceOp,
+    /// `<=`（TASK-79・SQL-9: 式述語の比較演算子）。
+    Le,
+    /// `>=`（TASK-79・SQL-9: 式述語の比較演算子）。
+    Ge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +121,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         }
 
         // SQL コメントは許可リスト外として fail-closed に拒否する（緩和は後続タスク判断）。
+        // TASK-79・SQL-9: `-`（減算）・`/`（除算）を式演算子として追加する際も、
+        // コメント検出は演算子トークン化より必ず先に行う（順序を入れ替えると
+        // `--`/`/*` を無条件に許可してしまう fail-closed の後退になる）。
         if c == '-' {
             let mut lookahead = chars.clone();
             lookahead.next();
@@ -124,6 +133,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     byte_offset: offset,
                 });
             }
+            tokens.push(Token::Punct('-'));
+            chars.next();
+            continue;
         }
         if c == '/' {
             let mut lookahead = chars.clone();
@@ -134,6 +146,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     byte_offset: offset,
                 });
             }
+            tokens.push(Token::Punct('/'));
+            chars.next();
+            continue;
         }
 
         // 二重引用符識別子は許可リスト外（受理範囲を単純化するため）。
@@ -152,7 +167,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
         }
 
         if c == '<' {
-            // `<=>` のみを認識する。それ以外（`<`・`<=`・`<>`）は許可リスト外。
+            // 最長一致: `<=>`（距離演算子）→ `<=`（比較演算子）→ `<`（比較演算子）の順で
+            // 判定する（TASK-79・SQL-9 で `<=`・裸の `<` を式述語の比較演算子として
+            // 追加。`<>` はどの分岐にも一致しないため 2 つの `Punct` トークンに分かれ、
+            // 許可リスト（`allowlist::Parser`）側の文法が受理しないことで構造的に
+            // 拒否される＝字句解析段階では拒否しない）。
             let mut lookahead = chars.clone();
             lookahead.next();
             if matches!(lookahead.peek(), Some(&(_, '='))) {
@@ -163,14 +182,31 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
                     chars = lookahead;
                     continue;
                 }
+                tokens.push(Token::Le);
+                chars = lookahead;
+                continue;
             }
-            return Err(LexError {
-                message: "unsupported operator starting with '<'".to_string(),
-                byte_offset: offset,
-            });
+            tokens.push(Token::Punct('<'));
+            chars.next();
+            continue;
         }
 
-        if matches!(c, '(' | ')' | ',' | '*' | '=' | ';') {
+        if c == '>' {
+            // `>=`（比較演算子）→ `>`（比較演算子）の最長一致（TASK-79・SQL-9）。
+            let mut lookahead = chars.clone();
+            lookahead.next();
+            if matches!(lookahead.peek(), Some(&(_, '='))) {
+                lookahead.next();
+                tokens.push(Token::Ge);
+                chars = lookahead;
+                continue;
+            }
+            tokens.push(Token::Punct('>'));
+            chars.next();
+            continue;
+        }
+
+        if matches!(c, '(' | ')' | ',' | '*' | '=' | ';' | '+') {
             tokens.push(Token::Punct(c));
             chars.next();
             continue;
@@ -256,16 +292,40 @@ fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexE
 /// 呼び出し元がメインループで先読みした ASCII 文字境界の直後からしか呼ばないため
 /// 通常あり得ないが、untrusted 入力経路では添字直接アクセス（`input[start..]`）を
 /// 使わず `get()` で明示的に処理する（coding-rust.md）。
+/// TASK-79・SQL-9: 整数に加え `<digits>.<digits>` の小数リテラルを 1 トークンとして
+/// 認識する。先頭 `.`（`.5`）・末尾 `.`（`1.`）・2 個目以降の `.`（`1..2`）は本関数の
+/// 対象外（呼び出し元のメインループは整数部までしか消費しないため、残った `.` は
+/// 「未対応文字」として `tokenize` が fail-closed に拒否する）。指数表記は非対応。
 fn lex_number(input: &str, start: usize) -> (String, usize) {
     let Some(rest) = input.get(start..) else {
         return (String::new(), start);
     };
+    let mut chars = rest.char_indices().peekable();
     let mut end = 0usize;
-    for c in rest.chars() {
+    while let Some(&(_, c)) = chars.peek() {
         if c.is_ascii_digit() {
             end += c.len_utf8();
+            chars.next();
         } else {
             break;
+        }
+    }
+    // 小数部は「`.` の直後に少なくとも 1 桁の数字が続く」場合のみ消費する
+    // （1 文字先読みで確定させ、`1.` のような末尾 `.` を誤って飲み込まない）。
+    if let Some(&(_, '.')) = chars.peek() {
+        let mut lookahead = chars.clone();
+        lookahead.next();
+        if matches!(lookahead.peek(), Some(&(_, d)) if d.is_ascii_digit()) {
+            end += '.'.len_utf8();
+            chars.next();
+            while let Some(&(_, c)) = chars.peek() {
+                if c.is_ascii_digit() {
+                    end += c.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
         }
     }
     let word = rest.get(..end).unwrap_or_default().to_string();
@@ -456,8 +516,75 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lone_less_than() {
-        assert!(tokenize("a < b").is_err());
+    fn accepts_lone_less_than_as_comparison_operator() {
+        // TASK-79・SQL-9: 式述語の比較演算子として単独の `<` を受理するようになった
+        // （旧 `rejects_lone_less_than` の置き換え。構文上その位置を受理するかどうかは
+        // `allowlist::Parser` の管轄で、本テストは字句解析段階の受理のみを確認する）。
+        let tokens = tokenize("a < b").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("a".to_string()),
+                Token::Punct('<'),
+                Token::Ident("b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_arithmetic_and_comparison_operators() {
+        // TASK-79・SQL-9: `+ - / > < >= <=` を式演算子として追加。`<=>`（距離演算子）
+        // との最長一致・`*`（乗算と SELECT * の両方に使う既存トークン）を確認する。
+        let tokens = tokenize("1.5 + 2 - 3 * 4 / 5 > 6 >= 7 < 8 <= 9 <=> 10")
+            .expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Number("1.5".to_string()),
+                Token::Punct('+'),
+                Token::Number("2".to_string()),
+                Token::Punct('-'),
+                Token::Number("3".to_string()),
+                Token::Punct('*'),
+                Token::Number("4".to_string()),
+                Token::Punct('/'),
+                Token::Number("5".to_string()),
+                Token::Punct('>'),
+                Token::Number("6".to_string()),
+                Token::Ge,
+                Token::Number("7".to_string()),
+                Token::Punct('<'),
+                Token::Number("8".to_string()),
+                Token::Le,
+                Token::Number("9".to_string()),
+                Token::DistanceOp,
+                Token::Number("10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_decimal_number_literal() {
+        let tokens = tokenize("2.0").expect("tokenize should succeed");
+        assert_eq!(tokens, vec![Token::Number("2.0".to_string())]);
+    }
+
+    #[test]
+    fn rejects_trailing_dot_number_literal() {
+        // `1.` は整数部 `1` のみを 1 トークンとして消費し、残った `.` が
+        // 「未対応文字」として拒否される（小数部は「`.` の直後に数字」の場合のみ
+        // 消費するため）。
+        assert!(tokenize("1. ").is_err());
+    }
+
+    #[test]
+    fn rejects_leading_dot_number_literal() {
+        assert!(tokenize(".5").is_err());
+    }
+
+    #[test]
+    fn rejects_double_dot_number_literal() {
+        assert!(tokenize("1..2").is_err());
     }
 
     #[test]
