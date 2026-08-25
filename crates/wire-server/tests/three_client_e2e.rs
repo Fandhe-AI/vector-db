@@ -1,10 +1,8 @@
 //! 無改造の実クライアント 3 種（`psql`／Python `psycopg`／Node.js `pg`）から
-//! `wire-server` バイナリへ実接続し、C1〜C4（純粋 Top-k・スカラー条件付き・
-//! RLS・ハイブリッド。列定義は `crates/engine/src/sql/parser.rs` 参照）の実行・
-//! 誤りパスワードの拒否を検証する層 B の統合テスト（TASK-73、対象ビヘイビア:
-//! WIRE-1。codex-review P2 指摘・PR #210: C1 のみの検証では C2〜C4 固有の構文・
-//! 列構成・型変換が各ドライバで正常に扱われることを保証できないため、C2〜C4 も
-//! 独立オラクルと照合する）。
+//! `wire-server` バイナリへ実接続し、C1〜C4（定義は TASK-73／ビヘイビア
+//! WIRE-1、`crates/engine/src/sql/parser.rs` 参照）の実行・誤りパスワードの
+//! 拒否を検証する層 B の統合テスト（codex-review P2 指摘・PR #210: 各ドライバ
+//! での挙動差異を独立オラクルと照合し保証する）。
 //!
 //! 責務境界: 層 A（`tests/wire1_simple_query.rs`）が生バイトの wire クライアント
 //! で常時（`make ci`）回帰保護する契約と同じバイト列を、実クライアント経由で
@@ -122,9 +120,8 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
 /// テーブルを持つ一時 DB を用意する（層 A の
 /// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ seed
 /// 方針。可視性の非対称は同テストのドキュメンテーションコメント参照）。
-/// `lang`（C2 のスカラー条件付き Top-k 用）・`body`（C4 のハイブリッド用）を
-/// `embedding` に加えて持たせ、C1〜C4 すべてを同じ 3 行のコーパスで検証できる
-/// ようにする（codex-review P2 指摘・PR #210）。
+/// C1〜C4（TASK-73／WIRE-1）すべてを同じ 3 行のコーパスで検証できるよう
+/// 列を構成する（codex-review P2 指摘・PR #210）。
 fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -179,22 +176,17 @@ fn write_users_file(path: &Path) {
     std::fs::write(path, content).expect("write users file");
 }
 
-/// C1（純粋 Top-k。列は id のみ）。
+/// C1（TASK-73／WIRE-1）。
 const C1_SQL: &str = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
-/// C2（スカラー条件付き Top-k。`id, lang` の 2 列を返し、`lang`（Text 型）の
-/// 型変換が各ドライバで正しく行われることも合わせて検証する）。
+/// C2（TASK-73／WIRE-1）。各ドライバでの型変換も合わせて検証する。
 const C2_SQL: &str =
     "SELECT id, lang FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
-/// C3（RLS。`visible()` の有無で結果が変わらないことを検証する。
-/// `crates/engine/tests/sql_surface.rs`
+/// C3（TASK-73／WIRE-1。`crates/engine/tests/sql_surface.rs`
 /// `sql3_rls_is_enforced_regardless_of_visible_predicate_presence` と同じ契約）。
 const C3_SQL: &str =
     "SELECT id FROM docs WHERE visible() ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
-/// C4（ハイブリッド）。全行の `body` に含まれない語をクエリ語に選び、疎側候補が
-/// 0 件となることで密のみのランキングへ縮退させる（`crates/engine/tests/sql_surface.rs`
+/// C4（TASK-73／WIRE-1。`crates/engine/tests/sql_surface.rs`
 /// `sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text` と同じ契約）。
-/// この場合、疎側の寄与が全行で等しく（0 件）なるため RRF 融合後の順序は密側の
-/// 順位のみで決まり、C1 と同じ独立オラクルで期待値を照合できる。
 const C4_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'zzz-term-absent-from-any-seed-body') LIMIT 3";
 
 /// psql（無改造）で任意の SQL を実行し、返却された各行を `|` 区切りで結合した
@@ -331,14 +323,12 @@ fn run_pg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
 }
 
 /// 3 クライアント（psql / psycopg / pg）それぞれで、3 テナントいずれの
-/// ユーザーで接続しても C1〜C4 の結果が独立オラクル（seed 表からの距離降順。
-/// `Visibility::Public` はテナント跨ぎで可視。層 A の
-/// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ可視性
-/// 契約）と一致すること・誤りパスワードが拒否されることを検証する
-/// （codex-review P2 指摘・PR #210: C1 だけでは C2〜C4 固有の構文・列構成・
-/// 型変換の各ドライバでの正常動作を保証できないため、C2〜C4 も独立オラクルと
-/// 照合する）。ツール未導入・スクリプト失敗は silent skip せず `panic!` で
-/// 失敗させる（本ファイル先頭のドキュメンテーションコメント参照）。
+/// ユーザーで接続しても C1〜C4（TASK-73／WIRE-1）の結果が独立オラクルと一致
+/// すること・誤りパスワードが拒否されることを検証する（可視性契約は層 A の
+/// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ。
+/// codex-review P2 指摘・PR #210）。ツール未導入・スクリプト失敗は silent
+/// skip せず `panic!` で失敗させる（本ファイル先頭のドキュメンテーション
+/// コメント参照）。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
 fn three_clients_run_c1_through_c4_and_reject_wrong_password() {
@@ -350,17 +340,11 @@ fn three_clients_run_c1_through_c4_and_reject_wrong_password() {
     let server = spawn_wire_server(&users_path, &db_path);
     let port = server.port;
 
-    // クエリ `[1.0,0.0]` からの距離昇順オラクル（seed 表: tenant-a=(1,0)距離0・
-    // tenant-b=(0,1)距離1・tenant-c=(-1,0)距離2）。`Public` 行は全テナントから
-    // 可視のため、どのユーザーで接続してもこの 3 件が返る（C1・C3・C4）。
+    // 独立オラクル（TASK-73／WIRE-1。各定数のドキュメンテーションコメント
+    // 参照）。
     let expected_c1 = vec!["1".to_string(), "2".to_string(), "3".to_string()];
-    // C2: `lang = 'ja'` で tenant-b（id 2, lang=en）を除外した残り 2 件を、
-    // 同じ距離昇順で返す（`SELECT id, lang` の 2 列を `|` 区切りで検証）。
     let expected_c2 = vec!["1|ja".to_string(), "3|ja".to_string()];
-    // C3: `visible()` の有無で結果は変わらない契約のため C1 と同じ期待値。
     let expected_c3 = expected_c1.clone();
-    // C4: 全行の body に含まれない語をクエリ語に使い密のみへ縮退させるため、
-    // C1 と同じ期待値になる（`C4_SQL` のドキュメンテーションコメント参照）。
     let expected_c4 = expected_c1.clone();
 
     for (user, pw) in [
