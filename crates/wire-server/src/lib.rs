@@ -17,10 +17,15 @@
 //! - [`limits`]: 読み取りタイムアウト・共有接続数リミッター（TASK-69・WIRE-5, WIRE-6）
 //! - [`protocol_dispatch`][]: 認証後メッセージの型バイト分類と、拡張クエリ
 //!   プロトコル等の未対応メッセージへの fail-closed 拒否応答＋切断（TASK-71・WIRE-8）
+//! - [`simple_query`][]: 簡易クエリ（'Q'）1 文の `engine::core::EngineCore` への
+//!   委譲・成功/失敗応答の組み立て（TASK-73・WIRE-1）
+//! - [`result_encoder`][]: `RowDescription`/`DataRow`/`CommandComplete`/
+//!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
-//! TASK-70（対象ビヘイビア WIRE-7）、TASK-71（対象ビヘイビア WIRE-8）。
+//! TASK-70（対象ビヘイビア WIRE-7）、TASK-71（対象ビヘイビア WIRE-8）、
+//! TASK-73（対象ビヘイビア WIRE-1: 簡易クエリを engine SQL 表層へ接続）。
 
 pub mod auth;
 pub mod bind_guard;
@@ -28,4 +33,6 @@ pub mod framing;
 pub mod handshake;
 pub mod limits;
 pub mod protocol_dispatch;
+pub mod result_encoder;
 pub mod server;
+pub mod simple_query;

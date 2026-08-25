@@ -192,6 +192,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
 endif
 
+.PHONY: e2e-three-client
+e2e-three-client: ## TASK-73（WIRE-1）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
+ifdef HAS_CARGO
+	cargo test -p wire-server --test three_client_e2e -- --ignored
+else
+	@echo "skip: Cargo.toml 未追加のため e2e-three-client をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
