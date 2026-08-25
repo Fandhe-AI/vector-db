@@ -969,25 +969,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-storage-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
-    }
-
-    struct CleanupGuard(std::path::PathBuf);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
     // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な
     // 読み取り操作では増加しないことを確認する。

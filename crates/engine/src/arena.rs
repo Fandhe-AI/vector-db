@@ -951,20 +951,11 @@ mod tests {
         assert!(matches!(result, Err(ArenaError::AllocationFailed(_))));
     }
 
-    /// `tests/arena.rs`（統合テスト）と同方針の一意 DB パス払い出しヘルパー。
-    /// `VectorArena::build`・`catalog::get_table_schema_in_txn` が `pub(crate)` のため、
-    /// 統合テストからは呼べずこのモジュール内 unit test でのみ検証できる。
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-arena-unit-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
-    }
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    // `VectorArena::build`・`catalog::get_table_schema_in_txn` が `pub(crate)` のため、
+    // 統合テストからは呼べずこのモジュール内 unit test でのみ検証できる点は変わらない。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
     // スキーマ取得と行走査の TOCTOU への回帰テスト（対象ビヘイビア: TABLE-8）。
     // 対象テーブル `a` についてスキーマを取得した read_txn を保持したまま、*その後*に
@@ -981,6 +972,7 @@ mod tests {
         use redb::ReadableTableMetadata;
 
         let path = unique_db_path("toctou");
+        let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
 
         let schema_a = TableSchema::new(
@@ -1036,7 +1028,6 @@ mod tests {
         assert_eq!(table.len().expect("table len"), 1);
 
         drop(read_txn);
-        let _ = std::fs::remove_file(&path);
     }
 
     // 対象ビヘイビア: SQL-2（Issue #56 レビュー指摘対応・codex P1）。
@@ -1054,6 +1045,7 @@ mod tests {
         use crate::storage::{RowInput, Visibility};
 
         let path = unique_db_path("alter-table-toctou");
+        let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
 
         let schema = TableSchema::new(
@@ -1143,21 +1135,12 @@ mod tests {
         assert_eq!(decoded_bodies, vec![Some("seed".to_string())]);
 
         drop(read_txn);
-        let _ = std::fs::remove_file(&path);
     }
 
     // 以下は旧 `tests/arena.rs`・`tests/arena_perf.rs`（統合テスト）からの移設分。
     // `VectorArena::build` が `pub(crate)`（テーブルスコープの内部 API に依存する）
     // ため、統合テストからは呼べず、クレート内の `#[cfg(test)]` モジュールへ
     // 移設したまま保持している。
-
-    struct CleanupGuard(std::path::PathBuf);
-
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
 
     const TENANT_ID: &str = "tenant-a";
 

@@ -1437,30 +1437,7 @@ mod tests {
         ));
     }
 
-    // 簡易テンポラリディレクトリ（外部クレート非依存。dependency-policy 準拠）。
-    struct TempDir(std::path::PathBuf);
-    impl TempDir {
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    fn tempdir() -> TempDir {
-        let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "engine-core-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
-    }
+    // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::tempdir;
 }

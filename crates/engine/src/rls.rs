@@ -744,41 +744,10 @@ mod tests {
         )
     }
 
-    // 簡易テンポラリディレクトリ（外部クレート非依存。dependency-policy 準拠。
-    // `core.rs::tests::TempDir` と同型の複製）。
-    struct TempDir(std::path::PathBuf);
-    impl TempDir {
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    // プロセス内グローバル通番。`SystemTime::now()` の実測分解能はプラットフォームにより
-    // ナノ秒より粗いため、同一 tick で並行実行された複数スレッドが `duration_since` の値だけで
-    // 一時ディレクトリ名を組み立てると衝突しうる（`storage.rs::tests::unique_db_path`・
-    // `arena.rs` の同種ヘルパーと同じ `SEQ.fetch_add` 対策。並列テスト実行時の
-    // `DatabaseAlreadyOpen` フレーク回避）。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn tempdir() -> TempDir {
-        let mut dir = std::env::temp_dir();
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let unique = format!(
-            "engine-rls-test-{}-{}-{seq}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
-    }
+    // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: `SEQ` 通番対策込みでこのモジュール内に
+    // 複製していたが、`DatabaseAlreadyOpen` フレーク対策が他の複製へ波及しなかったため）。
+    use crate::test_util::temp_db::tempdir;
 
     fn open_storage(dir: &std::path::Path) -> Storage {
         Storage::open(dir.join("db.redb")).expect("open storage")

@@ -91,6 +91,13 @@ pub mod storage;
 pub mod tenant;
 pub mod txn;
 
+/// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
+/// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
+#[cfg(test)]
+mod test_util {
+    pub mod temp_db;
+}
+
 /// engine クレートの識別子。
 ///
 /// wire-server がリンク時にこのクレートへ到達可能であることを確認するための
