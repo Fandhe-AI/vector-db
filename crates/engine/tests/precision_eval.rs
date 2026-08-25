@@ -39,14 +39,16 @@
 //! # 2 層構成
 //!
 //! - 層 A（`#[test]`・`make ci` 対象）: 決定的コーパスでの QA 件数・Top-1 命中数・
-//!   MRR 分子（整数集計）・誤返却件数を固定値アサーションで回帰トラッキングする。
-//!   spec の数値基準は使わない（`.claude/rules/spec-confidentiality.md`）。
+//!   MRR 順位別命中分布（`rank -> 件数` を丸ごと固定値アサーション。総ヒット件数
+//!   のみだと順位の入れ替わりを検知できないため）・誤返却件数を固定値アサーションで
+//!   回帰トラッキングする。spec の数値基準は使わない
+//!   （`.claude/rules/spec-confidentiality.md`）。
 //! - 層 B（`#[ignore]`・`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
 //!   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
 //!   （`hybrid_recall.rs::resolve_gate_threshold` と同型の解決規則）による閾値ゲート。
-//!   spec は「目標値確定まで `precision` をリリースゲートに含めない」としているため、
-//!   `.github/workflows/recall.yml` への接続は本タスクでは行わない（申し送り。README
-//!   参照）。
+//!   TASK-163 のスコープは実測・判断材料の提示までであり目標値の確定は含まないため、
+//!   `.github/workflows/recall.yml` への接続は本タスクでは行わない（目標値確定後の
+//!   フォローアップとする。申し送り・README 参照）。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
 //!   小さな格子で差し替え、3 指標の変化を `println!` で表示する（目標値確定の判断
 //!   材料。production の既定値は変更しない）。
@@ -79,7 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // と同一の取り込み方式）。
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
-use temp_db::unique_db_path;
+use temp_db::{unique_db_path, CleanupGuard};
 
 // ---------- RNG ヘルパ（`DeterministicRng::next_u64` から導出。TASK-158 準拠） ----------
 
@@ -407,12 +409,15 @@ fn vector_literal(v: &[f32]) -> String {
 
 /// 単一テナント・`Visibility::Public` でコーパス全件を投入した `EngineCore` を返す
 /// （RLS 検査を迂回する API は使わない。security.md「テナント境界」）。
-fn setup_core(docs: &[Doc], vocab_size: usize) -> EngineCore {
+/// 呼び出し側は返る `CleanupGuard` を `EngineCore` と同じスコープ（テスト関数末尾
+/// まで）で保持すること。`tests/sql_precision_mode.rs` と同じ流儀で `CleanupGuard`
+/// を `Storage::open` より先に宣言し（`Drop` は宣言の逆順のため、先に宣言した
+/// ガードは `Storage` の後に drop され、redb のファイルハンドルが閉じてから
+/// 一時ファイルを削除できる。`temp_db.rs` の Windows 向け注意参照）、一時 DB
+/// ファイルの残留を防ぐ。
+fn setup_core(docs: &[Doc], vocab_size: usize) -> (EngineCore, CleanupGuard) {
     let path = unique_db_path("precision-eval-corpus");
-    // `CleanupGuard` は `Storage` より先に生成すると Windows でファイルハンドルが
-    // 開いたままになるため、ここでは `Storage` のリークを許容する一時 DB として扱う
-    // （`hybrid_recall.rs` はコーパスが不変のため元々 `CleanupGuard` を使っていない
-    // のと同じ理由: プロセス終了までに DB ファイルを再利用しない使い捨て測定）。
+    let guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
     storage
         .create_table(&TableSchema::new(
@@ -440,7 +445,10 @@ fn setup_core(docs: &[Doc], vocab_size: usize) -> EngineCore {
         .expect("insert row");
     }
 
-    EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+    (
+        EngineCore::from_storage(storage, Box::new(CpuScalarProvider)),
+        guard,
+    )
 }
 
 /// クエリ結果の行 ID 列を返す（`sql_precision_mode.rs::result_ids` と同型の
@@ -451,7 +459,7 @@ fn result_ids(core: &EngineCore, ctx: &PolicyContext, sql: &str) -> Vec<u64> {
     result.rows.iter().map(|r| r.id).collect()
 }
 
-/// ランキング方式（hybrid が主・dense が副。§2.1）。
+/// ランキング方式（hybrid が主・dense が副。SEARCH-10）。
 #[derive(Clone, Copy)]
 enum Ranking {
     Hybrid,
@@ -490,12 +498,13 @@ struct EvalResult {
     n_qzero: usize,
     top1_hits: usize,
     coverage_hits: usize,
+    coverage_row_count: usize,
     mrr_hits_by_rank: BTreeMap<usize, usize>,
     false_returns: usize,
 }
 
 impl EvalResult {
-    /// Top-1 Accuracy = top1_hits / n_qplus（空集合は不正解扱い。§2.2）。
+    /// Top-1 Accuracy = top1_hits / n_qplus（空集合は不正解扱い。SEARCH-10）。
     fn top1_accuracy(&self) -> f64 {
         self.top1_hits as f64 / self.n_qplus as f64
     }
@@ -528,6 +537,20 @@ impl EvalResult {
         }
         self.top1_hits as f64 / self.coverage_hits as f64
     }
+
+    /// 診断値: 非空クエリ 1 件あたりの平均返却行数。SEARCH-10 の 3 指標
+    /// （Top-1 Accuracy・MRR@10・誤返却率）はいずれもゲート通過の有無・先頭行のみに
+    /// 依存し `PrecisionPolicy::max_results` の値そのものには反応しない構造のため、
+    /// `precision_eval_policy_sweep` で `max_results` を差し替えても 3 指標が
+    /// 変化しない（`docs/design/precision-eval-regression.md` 記載の既知の観察）。
+    /// 本値は `max_results` の効果を直接反映する唯一の測定値として、感度スイープの
+    /// 判断材料に加える（層 A のアサート対象外）。
+    fn avg_result_rows(&self) -> f64 {
+        if self.coverage_hits == 0 {
+            return 0.0;
+        }
+        self.coverage_row_count as f64 / self.coverage_hits as f64
+    }
 }
 
 /// [`Ranking`] 1 方式分の 3 指標＋診断値を、production の SQL 経路（`EngineCore::
@@ -542,6 +565,7 @@ fn measure(
 ) -> EvalResult {
     let mut top1_hits = 0usize;
     let mut coverage_hits = 0usize;
+    let mut coverage_row_count = 0usize;
     let mut mrr_hits_by_rank: BTreeMap<usize, usize> = BTreeMap::new();
 
     for case in qa {
@@ -549,6 +573,7 @@ fn measure(
         let precision_ids = result_ids(core, ctx, &precision_sql);
         if let Some(&top1) = precision_ids.first() {
             coverage_hits += 1;
+            coverage_row_count += precision_ids.len();
             if case.correct.contains(&top1) {
                 top1_hits += 1;
             }
@@ -579,6 +604,7 @@ fn measure(
         n_qzero: no_answer.len(),
         top1_hits,
         coverage_hits,
+        coverage_row_count,
         mrr_hits_by_rank,
         false_returns,
     }
@@ -622,8 +648,15 @@ const QA_SEED_OFFSET: u64 = 0x0001;
 const NO_ANSWER_SEED_OFFSET: u64 = 0x0002;
 
 /// 決定的コーパス・QA/Q0 セットを一括生成する（層 A・層 B・感度スイープが共有する
-/// フィクスチャ構築ロジック）。
-fn build_fixture() -> (EngineCore, PolicyContext, Vec<QaCase>, Vec<NoAnswerCase>) {
+/// フィクスチャ構築ロジック）。返る `CleanupGuard` は呼び出し側が `EngineCore` と
+/// 同じスコープで保持し、一時 DB ファイルの削除を保証する（[`setup_core`] 参照）。
+fn build_fixture() -> (
+    EngineCore,
+    CleanupGuard,
+    PolicyContext,
+    Vec<QaCase>,
+    Vec<NoAnswerCase>,
+) {
     let (docs, inverted) = generate_corpus(CORPUS_SEED, NUM_DOCS, VOCAB_SIZE);
     assert_corpus_within_limits(&docs);
 
@@ -642,10 +675,10 @@ fn build_fixture() -> (EngineCore, PolicyContext, Vec<QaCase>, Vec<NoAnswerCase>
     );
     no_answer.extend(generate_out_of_vocab_set(VOCAB_SIZE, NUM_QZERO_OOV));
 
-    let core = setup_core(&docs, VOCAB_SIZE);
+    let (core, guard) = setup_core(&docs, VOCAB_SIZE);
     let ctx = PolicyContext::new("precision-eval-tenant").expect("valid tenant");
 
-    (core, ctx, qa, no_answer)
+    (core, guard, ctx, qa, no_answer)
 }
 
 /// TASK-163（SEARCH-10）層 A: hybrid ランキング（主）での 3 指標を実測し、固定値で
@@ -654,7 +687,7 @@ fn build_fixture() -> (EngineCore, PolicyContext, Vec<QaCase>, Vec<NoAnswerCase>
 /// 失敗する。
 #[test]
 fn precision_eval_hybrid_regression() {
-    let (core, ctx, qa, no_answer) = build_fixture();
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
     assert_eq!(qa.len(), 100, "重複除外後の Q+ 件数が変化した");
     assert_eq!(no_answer.len(), 55, "Q0 件数が変化した");
 
@@ -668,10 +701,13 @@ fn precision_eval_hybrid_regression() {
     // 失敗する）。
     assert_eq!(r.top1_hits, 60, "hybrid Top-1 命中数が変化した");
     assert_eq!(r.coverage_hits, 65, "hybrid coverage 件数が変化した");
+    // `rank -> 件数` の分布そのものを固定値アサートする（`.values().sum()` のみだと
+    // 総ヒット件数は不変のまま順位が入れ替わる劣化（例: 1 位ヒットが 5 位へ後退）を
+    // 検知できないため。BTreeMap の `Debug` 出力はキー昇順で決定的）。
     assert_eq!(
-        r.mrr_hits_by_rank.values().sum::<usize>(),
-        92,
-        "hybrid MRR@10 命中クエリ数が変化した"
+        format!("{:?}", r.mrr_hits_by_rank),
+        "{1: 76, 2: 4, 3: 2, 4: 3, 5: 1, 6: 1, 7: 1, 8: 2, 9: 1, 10: 1}",
+        "hybrid MRR@10 の順位別命中分布が変化した"
     );
     assert_eq!(r.false_returns, 7, "hybrid 誤返却件数が変化した");
 }
@@ -681,17 +717,18 @@ fn precision_eval_hybrid_regression() {
 /// 同一契約）。
 #[test]
 fn precision_eval_dense_regression() {
-    let (core, ctx, qa, no_answer) = build_fixture();
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
 
     let r = measure(&core, &ctx, Ranking::Dense, &qa, &no_answer);
     print_eval_result("dense", &r);
 
     assert_eq!(r.top1_hits, 10, "dense Top-1 命中数が変化した");
     assert_eq!(r.coverage_hits, 10, "dense coverage 件数が変化した");
+    // 理由は [`precision_eval_hybrid_regression`] のコメント参照（順位分布そのものを固定値アサートする）。
     assert_eq!(
-        r.mrr_hits_by_rank.values().sum::<usize>(),
-        85,
-        "dense MRR@10 命中クエリ数が変化した"
+        format!("{:?}", r.mrr_hits_by_rank),
+        "{1: 75, 2: 3, 3: 3, 5: 1, 8: 2, 10: 1}",
+        "dense MRR@10 の順位別命中分布が変化した"
     );
     assert_eq!(r.false_returns, 0, "dense 誤返却件数が変化した");
 }
@@ -788,7 +825,7 @@ fn precision_eval_threshold_gate() {
         return;
     }
 
-    let (core, ctx, qa, no_answer) = build_fixture();
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
     let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
 
     let mut pass = true;
@@ -847,7 +884,14 @@ fn precision_eval_policy_sweep() {
     let ctx = PolicyContext::new("precision-eval-tenant").expect("valid tenant");
 
     println!("=== TASK-163 precision パラメータ感度スイープ（hybrid。判断材料専用） ===");
-    println!("hybrid_min_top1  hybrid_min_margin  max_results  top1_acc  mrr10  false_return_rate");
+    // Top-1 Accuracy・MRR@10・誤返却率はゲート通過の有無・先頭行のみに依存し
+    // `max_results` そのものには反応しない（構造上の理由は [`EvalResult::
+    // avg_result_rows`] 参照）。`avg_result_rows`（非空クエリ 1 件あたりの平均返却
+    // 行数）を併記し、`max_results` を差し替えたことの効果が表から読み取れるように
+    // する。
+    println!(
+        "hybrid_min_top1  hybrid_min_margin  max_results  top1_acc  mrr10  false_return_rate  avg_result_rows"
+    );
     for &hybrid_min_top1 in &[0.90, 0.98, 0.995] {
         for &hybrid_min_margin in &[0.001, 0.005, 0.02] {
             for &max_results in &[1usize, 3] {
@@ -859,13 +903,15 @@ fn precision_eval_policy_sweep() {
                     max_results,
                 )
                 .expect("swept policy must construct");
-                let core = setup_core(&docs, VOCAB_SIZE).with_precision_policy(policy);
+                let (core, _guard) = setup_core(&docs, VOCAB_SIZE);
+                let core = core.with_precision_policy(policy);
                 let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
                 println!(
-                    "{hybrid_min_top1:.3}  {hybrid_min_margin:.3}  {max_results}  {:.4}  {:.4}  {:.4}",
+                    "{hybrid_min_top1:.3}  {hybrid_min_margin:.3}  {max_results}  {:.4}  {:.4}  {:.4}  {:.4}",
                     r.top1_accuracy(),
                     r.mrr10(),
-                    r.false_return_rate()
+                    r.false_return_rate(),
+                    r.avg_result_rows(),
                 );
             }
         }

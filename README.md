@@ -142,8 +142,8 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
   `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）による閾値ゲートと、
   `PrecisionPolicy` の閾値を差し替えるパラメータ感度スイープ
   （`precision_eval_policy_sweep`）を実行します。
-- **`.github/workflows/recall.yml` への接続は行っていません**: spec は「目標値確定
-  まで `precision` をリリースゲートに含めない」としているため、上記の
+- **`.github/workflows/recall.yml` への接続は行っていません**: TASK-163 のスコープは
+  実測・判断材料の提示までであり目標値の確定は含まないため、上記の
   `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。
   `docs/design/precision-eval-regression.md` の実測値・感度表をもとに目標値が
   確定したのち、`RERANK_RECALL_MIN_*` 等と同様に `recall-gate` の Actions
