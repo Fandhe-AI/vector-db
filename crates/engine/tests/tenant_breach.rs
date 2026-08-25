@@ -436,7 +436,9 @@ fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
 
     for victim_id in &victim_ids {
-        let get_result = core.get_row(&attacker, TABLE, *victim_id);
+        // 点取得のキーは `(tenant_id, id)`（TABLE-12）。被害側テナントの行キーを
+        // 直接指定しても、不可視のため `NotFound` に統一される（RLS-9）。
+        let get_result = core.get_row(&attacker, TABLE, TENANT_B, *victim_id);
         assert!(matches!(get_result, Err(engine::core::CoreError::NotFound)));
     }
 

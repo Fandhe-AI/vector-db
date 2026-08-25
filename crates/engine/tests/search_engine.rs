@@ -7,7 +7,7 @@
 //! 公開しないため）。
 
 use engine::core::{EngineCore, VectorCore};
-use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::search_engine::{self, SearchEngineKind};
 use engine::storage::{RowInput, Storage, Visibility};
@@ -137,7 +137,7 @@ impl SearchProvider for MockAnnProvider {
     fn search(
         &self,
         input: SearchInput<'_>,
-    ) -> Result<Vec<SearchHit>, engine::kernel::KernelError> {
+    ) -> Result<Vec<CandidateHit>, engine::kernel::KernelError> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         CpuScalarProvider.search(input)
     }

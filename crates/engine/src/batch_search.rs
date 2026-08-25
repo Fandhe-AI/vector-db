@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use crate::kernel::{SearchHit, TopKSelector};
+use crate::kernel::{CandidateHit, TopKSelector};
 use crate::policy::PolicyContext;
 use crate::storage::Visibility;
 
@@ -879,7 +879,7 @@ pub struct BatchQuery<'a> {
 /// `BatchEngine::batch_search` の 1 クエリ分の結果。
 #[derive(Debug)]
 pub struct BatchHit {
-    pub hits: Vec<SearchHit>,
+    pub hits: Vec<CandidateHit>,
 }
 
 /// バッチ走査パイプラインの行ソース抽象（TASK-129・CORE-8 ポインタ）。
@@ -1464,7 +1464,7 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             if !score.is_finite() {
                 continue;
             }
-            selector.push(SearchHit { id, score });
+            selector.push(CandidateHit { id, score });
         }
     }
 
@@ -2128,8 +2128,8 @@ mod tests {
         // マスクを経由せず「全行を無条件に候補にする」経路を直接模した結果集合
         // （実装コードのマスク段を使わず、テストがここで意図的に違反を作る）。
         let simulated_unmasked_hits = [
-            SearchHit { id: 1, score: 1.0 }, // tenant-a: 正当
-            SearchHit { id: 3, score: 1.0 }, // tenant-b: 混入（検出されるべき）
+            CandidateHit { id: 1, score: 1.0 }, // tenant-a: 正当
+            CandidateHit { id: 3, score: 1.0 }, // tenant-b: 混入（検出されるべき）
         ];
         let tenant_a_ids: std::collections::HashSet<u64> =
             [matrix.ids[0], matrix.ids[1]].into_iter().collect();

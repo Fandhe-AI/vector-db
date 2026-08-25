@@ -51,7 +51,7 @@ use std::sync::{Arc, RwLock};
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
-use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
 use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
@@ -91,7 +91,7 @@ pub(crate) fn validate_search_k(k: usize) -> Result<(), usize> {
 /// 他テナントが同じ `id` の `Public` 行を作るだけで検索が失敗する
 /// テナント間の可用性干渉になるため戻してはならない。
 pub(crate) fn provider_result_is_valid(
-    hits: &[SearchHit],
+    hits: &[CandidateHit],
     k: usize,
     visible_id_counts: &HashMap<u64, usize>,
 ) -> bool {
@@ -100,7 +100,7 @@ pub(crate) fn provider_result_is_valid(
         return false;
     }
     let mut seen_ids: HashMap<u64, usize> = HashMap::with_capacity(hits.len());
-    let mut prev: Option<&SearchHit> = None;
+    let mut prev: Option<&CandidateHit> = None;
     for hit in hits {
         // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、後続の順序
         // 検証（`total_cmp`）が無意味になるため他の検証より先に弾く。
@@ -148,6 +148,51 @@ pub(crate) fn provider_result_is_valid(
 /// （id → 可視行件数の多重集合）を構築する共通ヘルパ。`core.rs`・`rls.rs`・
 /// `sql/exec.rs` の 3 経路が同一の構築方法を共有し、片側だけが集合へ退化するのを防ぐ
 /// （TABLE-12 の重複 id の扱いは 1 か所で決める）。
+/// 候補アリーナのスロット番号（0..n）を provider 入力用の `Vec<u64>` として作る
+/// （対象ビヘイビア: TABLE-12）。
+///
+/// provider へ渡す識別子に行 `id` を使えないのは、行 `id` の一意性スコープが
+/// テナント内に閉じており、1 つの可視集合に同じ `id` の行が複数含まれうるため
+/// （自テナント行と他テナントの `Public` 行）。スロット番号は可視集合内で一意かつ
+/// `(tenant_id, id)` の行と 1 対 1 に対応するので、provider 結果の重複検証・
+/// ヒットの行解決の双方が曖昧にならない（`sql/exec.rs` も同じ方式）。
+/// 確保はフォールブル（`try_reserve_exact`）で行う（coding-rust.md「無制限確保禁止」）。
+pub(crate) fn slot_ids_for(arena: &VectorArena) -> Result<Vec<u64>, ArenaError> {
+    let len = arena.ids().len();
+    let mut slot_ids: Vec<u64> = Vec::new();
+    slot_ids
+        .try_reserve_exact(len)
+        .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve slot ids: {e}")))?;
+    for slot in 0..len {
+        let slot_id = u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+        slot_ids.push(slot_id);
+    }
+    Ok(slot_ids)
+}
+
+/// provider が返した候補ヒット（識別子はスロット番号）を、テナント修飾済みの
+/// 公開ヒット [`CandidateHit`] → [`crate::kernel::SearchHit`] へ解決する
+/// （対象ビヘイビア: TABLE-12・RLS-9。codex-review P1 指摘・PR #194）。
+///
+/// スロットが範囲外（provider の契約違反・データ不整合）の場合は `None` を返し、
+/// 呼び出し元は結果を一切返さず fail-closed に拒否する（部分的な解決はしない）。
+/// `String` 確保はここ（高々 `k` 件）でのみ発生し、候補行ごとに走る
+/// `TopKSelector::push` のホットパスには入らない。
+pub(crate) fn resolve_slot_hits(
+    arena: &VectorArena,
+    candidates: &[CandidateHit],
+) -> Option<Vec<SearchHit>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(candidates.len()).ok()?;
+    for hit in candidates {
+        let slot = usize::try_from(hit.id).ok()?;
+        let tenant = arena.tenant_id(slot)?;
+        let id = *arena.ids().get(slot)?;
+        out.push(SearchHit::new(tenant, id, hit.score));
+    }
+    Some(out)
+}
+
 pub(crate) fn visible_id_counts(ids: &[u64]) -> HashMap<u64, usize> {
     let mut counts: HashMap<u64, usize> = HashMap::with_capacity(ids.len());
     for id in ids {
@@ -487,7 +532,7 @@ pub enum CoreError {
     /// 指定行が存在しない、または呼び出し元のテナント・可視性から見えない
     /// （区別しない。fail-closed）。
     NotFound,
-    /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約
+    /// `SearchProvider` が返却した `Vec<`[`CandidateHit`]`>` が Top-k の契約
     /// （以下のいずれか）を満たさなかった（codex P0/P1・Issue #137 対応。fail-closed）:
     /// (1) 件数が要求 `k` を超える、(2) コア側で計算した可視行 id 集合に含まれない
     /// `id` を含む（他テナントの id 捏造・実装バグを含む）、(3) `id` が重複する、
@@ -579,7 +624,7 @@ pub trait VectorCore: Send + Sync {
     /// `table` に対して `query` の Top-k 検索を行う。`ctx` のテナント・可視性を満たさない
     /// 行は結果に含めない（CORE-2）。
     ///
-    /// 返却される [`SearchHit::id`] は行 `id` であり、その一意性スコープはテナント内
+    /// 返却される [`CandidateHit::id`] は行 `id` であり、その一意性スコープはテナント内
     /// （対象ビヘイビア: TABLE-12）。したがって**同一 `id` の hit が複数返り得る**
     /// （自テナントの行と、他テナントの `Public` 行が同じ `id` を持つ場合。いずれも
     /// `ctx` から可視な行であり、テナント境界の侵害ではない）。`id` だけでどちらの
@@ -597,7 +642,20 @@ pub trait VectorCore: Send + Sync {
 
     /// `table` から `id` の行を 1 件取得する。不可視・不存在は区別せず
     /// [`CoreError::NotFound`] を返す。
-    fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError>;
+    /// `(tenant_id, id)` で行を 1 件取得する（対象ビヘイビア: TABLE-12・RLS-9）。
+    ///
+    /// 行 `id` の一意性スコープはテナント内に閉じているため、行を指すには所有テナントが
+    /// 必要（[`crate::kernel::SearchHit::tenant_id`] をそのまま渡せる契約。
+    /// codex-review P1 指摘・PR #194）。取得できるのは `ctx` から**可視な**行のみで、
+    /// 不存在と不可視は区別せず [`CoreError::NotFound`] に統一する（他テナント行の
+    /// 存在探査に使えないようにする fail-closed な扱い。security.md P0）。
+    fn get_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<Row, CoreError>;
 }
 
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
@@ -881,8 +939,11 @@ impl EngineCore {
         // そのまま `SearchInput` として provider へ渡せる（不可視データはそもそも
         // provider のアドレス空間へ渡らない。`SearchInput` に `is_visible` フィールドは
         // 存在しない。`kernel.rs` のドキュメント参照）。
+        // provider へ渡す識別子はスロット番号（[`slot_ids_for`] のドキュメント参照。
+        // 行 `id` は 1 つの可視集合内で一意とは限らないため識別子に使えない。TABLE-12）。
+        let slot_ids = slot_ids_for(&arena)?;
         let input = SearchInput {
-            ids: arena.ids(),
+            ids: &slot_ids,
             vectors: arena.vectors(),
             dim: arena.dim(),
             query,
@@ -897,13 +958,13 @@ impl EngineCore {
         // search_with` と共通、TASK-133）で単一走査を確認し、1 件でも違反すれば結果を
         // 一切返さず fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
         //
-        // アリーナは構築時点で可視行だけへ絞り込み済みのため、`arena.ids()` がそのまま
-        // 可視行 id 集合になる。
-        let visible_id_counts = visible_id_counts(arena.ids());
+        // 検証対象はスロット識別子の集合（スロットは重複しないため各件数は 1）。
+        let visible_id_counts = visible_id_counts(&slot_ids);
         if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(CoreError::ProviderResultRejected);
         }
-        Ok(hits)
+        // 検証を通過した候補だけをテナント修飾済みヒットへ解決する（TABLE-12・RLS-9）。
+        resolve_slot_hits(&arena, &hits).ok_or(CoreError::ProviderResultRejected)
     }
 }
 
@@ -1000,15 +1061,21 @@ impl VectorCore for EngineCore {
         self.search_with_snapshot(table, ctx, query, k, snapshot)
     }
 
-    fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError> {
-        // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、`id`
-        // 単独では行を一意に指せない。点取得はサーバー側導出テナント
-        // （`ctx.tenant_id()`。`wire-protocol.md` WIRE-2・RLS-6）の名前空間内のみを
-        // 対象とし、他テナントの `Public` 行を `id` 指定で引く経路は設けない
-        // （他テナント行の存在探査になりうるため fail-closed 側へ倒す。RLS-9）。
-        // 取得後も従来どおり `is_visible` を通し、可視性ラベルの判定は
-        // `policy.rs` の単一照合パスに委譲する。
-        let row = match self.storage.get_row_from_table(table, ctx.tenant_id(), id) {
+    fn get_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<Row, CoreError> {
+        // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）のため、
+        // 点取得のキーは `(tenant_id, id)`。`tenant_id` は検索結果
+        // （[`crate::kernel::SearchHit::tenant_id`]）等から呼び出し元が渡す行の帰属で、
+        // 認可には一切使わない（認可・可視性判定は下の `is_visible` の単一照合パスのみ）。
+        // 存在しない行・`ctx` から不可視な行（他テナントの `Private` 行を含む）は
+        // 区別せず `NotFound` に統一するため、他テナント行の存在探査には使えない
+        // （fail-closed。RLS-9・security.md P0）。
+        let row = match self.storage.get_row_from_table(table, tenant_id, id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
@@ -1104,8 +1171,8 @@ mod tests {
             .expect("insert row");
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let not_found = core.get_row(&ctx, "docs", 999);
-        let invisible = core.get_row(&ctx, "docs", 1);
+        let not_found = core.get_row(&ctx, "docs", "tenant-a", 999);
+        let invisible = core.get_row(&ctx, "docs", "tenant-a", 1);
         assert!(matches!(not_found, Err(CoreError::NotFound)));
         assert!(matches!(invisible, Err(CoreError::NotFound)));
     }
@@ -1607,9 +1674,9 @@ mod tests {
     fn search_rejects_a_rogue_provider_result_even_on_a_cache_hit() {
         struct RogueProvider;
         impl SearchProvider for RogueProvider {
-            fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
                 // アリーナ外の id を返す不正 provider。
-                Ok(vec![SearchHit {
+                Ok(vec![CandidateHit {
                     id: 999,
                     score: 1.0,
                 }])

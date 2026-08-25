@@ -877,10 +877,12 @@ impl Storage {
     /// `(tenant_id, id)`）。他テーブル・他テナントの同一 `id` は見えない。
     ///
     /// `tenant_id` を引数で必須化しているのは TABLE-12 で行 `id` の一意性スコープが
-    /// テナント内に閉じたためで、`id` 単独ではもはや行を一意に指せない。呼び出し元
-    /// （`core.rs::EngineCore::get_row`）はサーバー側導出テナント
-    /// （`PolicyContext::tenant_id`）を渡し、他テナントの `Public` 行を `id` 指定で
-    /// 引く経路は設けない（存在探査の経路を作らない fail-closed な解決。RLS-9）。
+    /// テナント内に閉じたためで、`id` 単独ではもはや行を一意に指せない。本メソッド自体は
+    /// 認可を行わない生の取得経路であり（`tenant_id` は「どの名前空間を引くか」の指定に
+    /// すぎない）、可視性判定は呼び出し元（`core.rs::EngineCore::get_row` →
+    /// `PolicyContext::is_visible`）が行う。呼び出し元は不存在と不可視を区別せず
+    /// `NotFound` に統一する契約のため、本 API 経由で他テナント行の存在を観測できる
+    /// 公開経路は生まれない（fail-closed。RLS-9）。
     /// テーブル不存在・行不存在はいずれも fail-closed に `Err` を返す
     /// （エラー内容に他テーブル・他テナントの存在情報を含めない）。
     pub fn get_row_from_table(

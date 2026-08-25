@@ -46,7 +46,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
 
 /// 検索プールの深さ・k の上限。`core.rs::MAX_SEARCH_K`（同じく 10_000）と同桁を採用し、
@@ -140,7 +140,7 @@ impl RrfConfig {
 
 /// 融合後の検索結果 1 件（行 ID と RRF スコア）。
 ///
-/// `crate::kernel::SearchHit`（`score: f32`、内積スコア）・`crate::sparse::ScoredDoc`
+/// `crate::kernel::CandidateHit`（`score: f32`、内積スコア）・`crate::sparse::ScoredDoc`
 /// （`score: f64`、BM25 スコア）とは尺度が異なる値のため、型を分けて取り違えを防ぐ。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HybridHit {
@@ -260,7 +260,7 @@ impl From<SparseError> for HybridError {
 ///
 /// `dense`・`sparse` はそれぞれ長さが `cfg.pool_depth()` 以下であり（超過は
 /// [`HybridError::TooManyCandidates`]。3 回目の codex-review P1 指摘対応）、
-/// 呼び出し元の provider/index が定める順位契約（[`SearchHit`] はスコア降順・
+/// 呼び出し元の provider/index が定める順位契約（[`CandidateHit`] はスコア降順・
 /// 同点 id 昇順、[`ScoredDoc`] は同様の契約）に従って既にソート済みであることを
 /// 前提とする。1-based 順位 `r` に対し `weight / (k_const + r)` を id ごとに加算する
 /// （両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず順位のみを
@@ -278,7 +278,7 @@ impl From<SparseError> for HybridError {
 /// 入力有限性・ソート順・重複はこの順で検証する（[`HybridError::NonFiniteScore`]・
 /// [`HybridError::TooManyCandidates`] のドキュメント参照）。
 pub fn rrf_fuse(
-    dense: &[SearchHit],
+    dense: &[CandidateHit],
     sparse: &[ScoredDoc],
     cfg: &RrfConfig,
 ) -> Result<Vec<HybridHit>, HybridError> {
@@ -375,8 +375,8 @@ pub fn rrf_fuse(
 }
 
 /// [`rrf_fuse`] の入力検証ヘルパ。`(score, id)` の列が「スコア降順、同点は id 昇順」
-/// （[`SearchHit`]・[`ScoredDoc`] 双方のドキュメントが定める順位契約）に従っているかを
-/// 判定する。`SearchHit`（`f32`）・`ScoredDoc`（`f64`）双方から `f64` へ変換して同一の
+/// （[`CandidateHit`]・[`ScoredDoc`] 双方のドキュメントが定める順位契約）に従っているかを
+/// 判定する。`CandidateHit`（`f32`）・`ScoredDoc`（`f64`）双方から `f64` へ変換して同一の
 /// 判定ロジックを共有する（`f32` → `f64` は常に値を保存する拡大変換のため精度劣化なし）。
 fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
     let mut prev: Option<(f64, u64)> = None;
@@ -493,7 +493,7 @@ pub fn hybrid_search(
     // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
     // 返さない」「要求した `k`（＝ `cfg.pool_depth()`）以下の件数しか返さない」ことは
     // いずれも型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
-    let dense_hits: Vec<SearchHit> = provider.search(dense_input)?;
+    let dense_hits: Vec<CandidateHit> = provider.search(dense_input)?;
     // 長さ検証を可視性走査より先に行う（3 回目の codex-review P1 指摘対応）。
     // `rrf_fuse` 自身も同じ長さ検証を行うが、ここで早期に拒否することで、契約違反
     // provider が `cfg.pool_depth()` を大きく超える件数を返した場合に直後の可視性
@@ -542,8 +542,8 @@ mod tests {
     use crate::kernel::CpuScalarProvider;
     use crate::sparse::SparseIndex;
 
-    fn hit(id: u64, score: f32) -> SearchHit {
-        SearchHit { id, score }
+    fn hit(id: u64, score: f32) -> CandidateHit {
+        CandidateHit { id, score }
     }
 
     fn doc(doc_id: u64, score: f64) -> ScoredDoc {
@@ -716,7 +716,7 @@ mod tests {
     #[test]
     fn rrf_fuse_rejects_non_finite_sparse_score() {
         let cfg = RrfConfig::default();
-        let dense: [SearchHit; 0] = [];
+        let dense: [CandidateHit; 0] = [];
         let sparse = [doc(1, f64::INFINITY)];
         let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
         assert_eq!(err, HybridError::NonFiniteScore);
@@ -802,7 +802,7 @@ mod tests {
     fn rrf_fuse_rejects_sparse_input_with_tie_break_id_descending() {
         let cfg = RrfConfig::default();
         // 同点スコアだが id が降順（本来は id 昇順であるべき契約に違反）。
-        let dense: [SearchHit; 0] = [];
+        let dense: [CandidateHit; 0] = [];
         let sparse = [doc(2, 1.0), doc(1, 1.0)];
         let err = rrf_fuse(&dense, &sparse, &cfg).unwrap_err();
         assert_eq!(err, HybridError::UnsortedInput);
@@ -812,7 +812,7 @@ mod tests {
     fn rrf_fuse_accepts_correctly_tie_broken_input() {
         let cfg = RrfConfig::default();
         // 同点スコアで id 昇順（契約通り）。
-        let dense: [SearchHit; 0] = [];
+        let dense: [CandidateHit; 0] = [];
         let sparse = [doc(1, 1.0), doc(2, 1.0)];
         let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
         assert_eq!(fused.len(), 2);
@@ -953,16 +953,16 @@ mod tests {
     /// [`SearchProvider`] の契約違反（`input.ids` に含まれない id を返す実装バグ）を
     /// 模したモック provider。`hybrid_search` が密検索側の契約違反を検出して
     /// fail-closed に拒否することを検証するために使う（`input` の中身は無視して
-    /// 固定の [`SearchHit`] 列を返す）。
+    /// 固定の [`CandidateHit`] 列を返す）。
     struct LeakyProvider;
     impl SearchProvider for LeakyProvider {
-        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
             // id=1（可視）と id=99（不可視のはず）の両方を、スコア降順・同点 id 昇順の
             // 順位契約を満たしたまま返す（provider の順位契約自体には違反していない。
             // あくまで可視集合の境界を無視した契約違反のみを模す）。
             Ok(vec![
-                SearchHit { id: 1, score: 2.0 },
-                SearchHit { id: 99, score: 1.0 },
+                CandidateHit { id: 1, score: 2.0 },
+                CandidateHit { id: 99, score: 1.0 },
             ])
         }
     }
@@ -998,11 +998,11 @@ mod tests {
     /// （スコア降順・重複なし）を満たすため、契約違反は「件数」のみに限定される。
     struct OverflowingProvider;
     impl SearchProvider for OverflowingProvider {
-        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
             Ok(vec![
-                SearchHit { id: 1, score: 3.0 },
-                SearchHit { id: 2, score: 2.0 },
-                SearchHit { id: 3, score: 1.0 },
+                CandidateHit { id: 1, score: 3.0 },
+                CandidateHit { id: 2, score: 2.0 },
+                CandidateHit { id: 3, score: 1.0 },
             ])
         }
     }

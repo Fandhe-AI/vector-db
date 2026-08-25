@@ -29,6 +29,7 @@ use crate::catalog::{
     map_row_table_error, require_table_schema_write, user_rows_table_def, user_rows_table_name,
     validate_identifier, CatalogError,
 };
+use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
 use crate::storage::{
     bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
@@ -187,8 +188,9 @@ pub fn visible_rows(
     Ok(out)
 }
 
-/// 検索結果の id 集合 `hits` が、`table` に対する `ctx` の可視集合へすべて収まって
-/// いることを fail-closed に検証する（TABLE-11: 200 試行 × 4 テナント巡回検証の
+/// 検索結果 `hits` が、`table` に対する `ctx` の可視集合へすべて収まって
+/// いることを **`(tenant_id, id)` の完全な行キー**で fail-closed に検証する
+/// （TABLE-11: 200 試行 × 4 テナント巡回検証の
 /// 混入 0 件アサーションを、`EngineCore::search`/`PrefilterIndex::search` の内部実装と
 /// 独立した経路で裏付けるためのヘルパ）。
 ///
@@ -198,11 +200,23 @@ pub fn verify_hits(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
-    hits: &[u64],
+    hits: &[SearchHit],
 ) -> Result<(), TenantError> {
     let visible = visible_rows(storage, table, ctx)?;
-    let visible_ids: std::collections::HashSet<u64> = visible.iter().map(|r| r.id).collect();
-    if hits.iter().all(|id| visible_ids.contains(id)) {
+    // 照合キーは行 `id` 単独ではなく完全な行キー `(tenant_id, id)`（対象ビヘイビア:
+    // TABLE-12・RLS-9。codex-review P1 指摘・PR #194）。`id` だけの集合で照合すると、
+    // 「可視な行（例: 他テナントの `Public` 行）と同じ `id` を持つ不可視行（別テナントの
+    // `Private` 行）」由来のヒットを見逃す——`id` は可視集合に存在してしまうため。
+    // ヒット側のテナントは `SearchHit::tenant_id`（検索経路が行の帰属として付与した値）
+    // を使う。
+    let visible_keys: std::collections::HashSet<(&str, u64)> = visible
+        .iter()
+        .map(|r| (r.tenant_id.as_str(), r.id))
+        .collect();
+    if hits
+        .iter()
+        .all(|hit| visible_keys.contains(&(hit.tenant_id.as_str(), hit.id)))
+    {
         Ok(())
     } else {
         Err(TenantError::HitOutsideVisibleSet)
@@ -683,9 +697,12 @@ mod tests {
             .expect("seed rows");
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        assert!(verify_hits(&storage, "docs", &ctx, &[1]).is_ok());
+        // 照合キーは `(tenant_id, id)`（TABLE-12・RLS-9）。
+        let own_hit = SearchHit::new("tenant-a", 1, 1.0);
+        let foreign_private_hit = SearchHit::new("tenant-b", 2, 0.5);
+        assert!(verify_hits(&storage, "docs", &ctx, std::slice::from_ref(&own_hit)).is_ok());
         assert!(matches!(
-            verify_hits(&storage, "docs", &ctx, &[1, 2]),
+            verify_hits(&storage, "docs", &ctx, &[own_hit, foreign_private_hit]),
             Err(TenantError::HitOutsideVisibleSet)
         ));
     }

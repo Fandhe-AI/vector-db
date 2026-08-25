@@ -11,7 +11,7 @@
 //! `EngineCore` 経由の CORE-1/2/13 回帰は `tests/vector_core.rs` が既定構成
 //! （`ParallelSearchProvider`）でそのまま担保する（本ファイルは provider 単体の契約検証）。
 
-use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 
 /// テスト専用の決定的シード xorshift64*（`benches/harness/rng.rs` と同系だが、
@@ -175,9 +175,9 @@ fn matches_scalar_reference_with_non_finite_rows_mixed_in() {
     assert_eq!(
         simd,
         vec![
-            SearchHit { id: 4, score: 3.0 },
-            SearchHit { id: 2, score: 2.0 },
-            SearchHit { id: 1, score: 1.0 },
+            CandidateHit { id: 4, score: 3.0 },
+            CandidateHit { id: 2, score: 2.0 },
+            CandidateHit { id: 1, score: 1.0 },
         ]
     );
 }

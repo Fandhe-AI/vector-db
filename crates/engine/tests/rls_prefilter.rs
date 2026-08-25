@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::rls::PrefilterIndex;
 use engine::storage::{RowInput, Storage, Visibility};
@@ -252,7 +252,7 @@ impl CountingProvider {
 }
 
 impl SearchProvider for CountingProvider {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requested_ks
             .lock()

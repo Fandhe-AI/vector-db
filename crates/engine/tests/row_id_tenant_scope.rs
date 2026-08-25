@@ -11,12 +11,12 @@
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
-use engine::kernel::CpuScalarProvider;
+use engine::kernel::{CpuScalarProvider, SearchHit};
 use engine::policy::PolicyContext;
 use engine::row_codec::Value as RowCodecValue;
 use engine::sql::exec::Cell;
 use engine::storage::{RowInput, Storage, Visibility};
-use engine::tenant::{self, TenantWriteError};
+use engine::tenant::{self, TenantError, TenantWriteError};
 
 // 一時 DB パス払い出しは共通ヘルパへ委譲する（Issue #173・Bugbot Low 指摘・PR #194）。
 #[path = "../src/test_util/temp_db.rs"]
@@ -27,6 +27,7 @@ const TABLE: &str = "docs";
 const DIM: u32 = 2;
 const TENANT_A: &str = "tenant-a";
 const TENANT_B: &str = "tenant-b";
+const TENANT_C: &str = "tenant-c";
 
 fn schema() -> TableSchema {
     TableSchema::new(
@@ -489,4 +490,94 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
             .metadata,
         b"a2".to_vec()
     );
+}
+
+// (i) 対象ビヘイビア: TABLE-12・RLS-9（codex-review P1 指摘・PR #194）。
+// `tenant::verify_hits` は `(tenant_id, id)` の完全な行キーで照合する。
+// 3 テナント構成にするのが要点で、「可視な行（tenant-b の `Public` 行 id=1）と
+// 同じ `id` を持つ不可視行（tenant-c の `Private` 行 id=1）」由来のヒットは、
+// id だけの集合照合では可視集合に含まれてしまい見逃される。
+#[test]
+fn rls9_verify_hits_detects_an_invisible_row_sharing_an_id_with_a_visible_row() {
+    let (storage, _cleanup) = open_seeded("verify-hits-row-key");
+    let a = ctx(TENANT_A);
+    let b = ctx(TENANT_B);
+    let c = ctx(TENANT_C);
+    // tenant-b の Public 行（tenant-a から可視）と、同じ id を持つ tenant-c の
+    // Private 行（tenant-a から不可視）。
+    engine::tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[1.0, 0.0], b"b1"))
+        .expect("tenant-b public row id=1");
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &c,
+        1,
+        &RowInput {
+            tenant_id: TENANT_C,
+            visibility: Visibility::Private,
+            embedding: &[0.0, 1.0],
+            metadata: b"c1",
+        },
+    )
+    .expect("tenant-c private row id=1");
+
+    // 検索用 ctx は tenant-a（Public のみ許可）。
+    let viewer = PolicyContext::new(TENANT_A).expect("valid tenant");
+    let _ = &a;
+
+    // 可視行由来のヒットは受理される。
+    let visible_hit = SearchHit::new(TENANT_B, 1, 1.0);
+    engine::tenant::verify_hits(&storage, TABLE, &viewer, std::slice::from_ref(&visible_hit))
+        .expect("a hit on a visible row must be accepted");
+
+    // 不可視行（tenant-c の Private 行）由来のヒットは、`id` が可視集合に存在していても
+    // 拒否されなければならない（id だけの照合では見逃される退行の防止）。
+    let invisible_hit = SearchHit::new(TENANT_C, 1, 1.0);
+    let err = engine::tenant::verify_hits(
+        &storage,
+        TABLE,
+        &viewer,
+        std::slice::from_ref(&invisible_hit),
+    )
+    .expect_err("a hit on an invisible row that shares an id with a visible row must be rejected");
+    assert!(matches!(err, TenantError::HitOutsideVisibleSet));
+}
+
+// (j) 対象ビヘイビア: TABLE-12・RLS-9（codex-review P1 指摘・PR #194）。
+// 検索結果 `SearchHit` は `(tenant_id, id)` で行を一意に解決でき、他テナントの
+// `Public` 行のヒットが同 id の自テナント行へ解決されない。
+#[test]
+fn table12_search_hits_resolve_to_the_exact_row_via_tenant_and_id() {
+    let (storage, _cleanup) = open_seeded("hit-resolution");
+    let a = ctx(TENANT_A);
+    let b = ctx(TENANT_B);
+    engine::tenant::insert_row(&storage, TABLE, &a, 1, &row(TENANT_A, &[1.0, 0.0], b"a1"))
+        .expect("tenant-a row id=1");
+    engine::tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[0.9, 0.1], b"b1"))
+        .expect("tenant-b public row id=1");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let viewer = PolicyContext::new(TENANT_A).expect("valid tenant");
+    let hits = core
+        .search(&viewer, TABLE, &[1.0, 0.0], 10)
+        .expect("search ok");
+    assert_eq!(hits.len(), 2);
+    // 各ヒットは自分自身の行へ解決される（テナントを取り違えない）。
+    for hit in &hits {
+        let row = core
+            .get_row(&viewer, TABLE, &hit.tenant_id, hit.id)
+            .expect("hit must resolve to an existing, visible row");
+        assert_eq!(row.tenant_id, hit.tenant_id);
+        assert_eq!(row.id, hit.id);
+        let expected_metadata: &[u8] = if hit.tenant_id == TENANT_A {
+            b"a1"
+        } else {
+            b"b1"
+        };
+        assert_eq!(row.metadata, expected_metadata.to_vec());
+    }
+    // 両テナントのヒットが 1 件ずつ含まれること（同一 id が畳み込まれていない）。
+    let mut tenants: Vec<&str> = hits.iter().map(|h| h.tenant_id.as_str()).collect();
+    tenants.sort_unstable();
+    assert_eq!(tenants, vec![TENANT_A, TENANT_B]);
 }

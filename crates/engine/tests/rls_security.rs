@@ -242,18 +242,15 @@ fn checker_negative_control_detects_fabricated_violations() {
 
     // 正常系: 全ヒットが許可集合内・重複なし・k 以内 → 違反 0 件。
     let clean_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit { id: 2, score: 0.5 },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 2, 0.5),
     ];
     assert_eq!(count_policy_violations(&clean_hits, &allowed, 5), 0);
 
     // 不許可 id の混入。
     let leaked_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit {
-            id: 999,
-            score: 0.9,
-        },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 999, 0.9),
     ];
     assert!(
         count_policy_violations(&leaked_hits, &allowed, 5) > 0,
@@ -262,8 +259,8 @@ fn checker_negative_control_detects_fabricated_violations() {
 
     // 重複 id。
     let duplicate_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit { id: 1, score: 1.0 },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 1, 1.0),
     ];
     assert!(
         count_policy_violations(&duplicate_hits, &allowed, 5) > 0,

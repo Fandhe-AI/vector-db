@@ -194,7 +194,9 @@ fn table11_zero_cross_tenant_leakage_across_200_trials_via_both_search_paths() {
             }
 
             // 独立検証 2: `tenant.rs::verify_hits`（本タスクの統合層自体の検証を兼ねる）。
-            tenant::verify_hits(&storage, TABLE, ctx, &hit_ids)
+            // 照合は `(tenant_id, id)` の完全な行キーで行う（TABLE-12・RLS-9。
+            // `hits` はテナント修飾済み）。
+            tenant::verify_hits(&storage, TABLE, ctx, &hits)
                 .expect("tenant::verify_hits must accept PrefilterIndex hits");
         }
         // `indices` はここで drop され、`storage` の借用が終わる（次フェーズで

@@ -94,6 +94,14 @@
 //! `catalog.rs::map_row_table_error` が fail-closed に拒否する。読み取り側で同一 `id` の
 //! 可視行が複数現れうる点の扱いは `core.rs::provider_result_is_valid` を参照。
 //!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9・codex-review P1 対応）: 公開の
+//! 検索結果型 `kernel.rs::SearchHit` は `(tenant_id, id)` で行を一意に解決できる
+//! テナント修飾済みヒットとし、`core::VectorCore::get_row` も `(tenant_id, id)` を
+//! キーに取る（行 `id` の一意性スコープがテナント内のため `id` 単独では行を指せない）。
+//! `SearchProvider` の戻り値は候補ヒット `kernel.rs::CandidateHit`（識別子は呼び出し元
+//! 定義。`core.rs`・`sql/exec.rs` は候補アリーナのスロット番号を渡す）で、テナントの
+//! 解決は provider の外側で行う（ホットパスへヒープ確保を持ち込まないため）。
+//!
 //! TASK-156（対象ビヘイビア: CORE-14）: `isa.rs` が CPU 命令セット（AVX2+FMA・
 //! AVX-512・NEON）の実行時検出を提供し、`dispatch.rs::detect_current_isa`
 //! （決定表の ISA 入力）・`kernel.rs::dot`（`CpuScalarProvider` 等が共有する内積
