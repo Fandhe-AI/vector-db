@@ -117,6 +117,9 @@ impl PolicyContext {
         }
         row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
+    pub fn is_owner(&self, row_tenant: &str) -> bool {
+        row_tenant == self.tenant_id
+    }
 }
 
 # source: crates/engine/src/policy.rs :: PolicyError

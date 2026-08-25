@@ -1,11 +1,19 @@
-//! 行単位テナント境界の行ストア統合層（TASK-89・対象ビヘイビア: TABLE-9, TABLE-11）。
+//! 行単位テナント境界の行ストア統合層（TASK-89・対象ビヘイビア: TABLE-9, TABLE-11。
+//! TASK-95・対象ビヘイビア: RECOVER-4 の書き込みガード API を追加）。
 //!
 //! `policy.rs::PolicyContext::is_visible` の単一照合パス（CORE-2）へすべての可視性
 //! 判定を委譲し、本モジュール独自のテナント比較は持たない（security.md P0）。
-//! 提供する API は「行ストア（`catalog.rs` のテーブルスコープ行 API）を安全な上限内で
-//! 走査し、可視行だけを列挙・検証する」統合層のみ。呼び出し元は主に
-//! `tests/tenant_isolation.rs`（TABLE-11 の 200 試行 × 4 テナント巡回検証）で、
-//! 独立に期待集合を算出するための参照実装として使う。
+//! 提供する API は大きく 2 系統:
+//!
+//! - 読み取り側（[`visible_rows`]・[`verify_hits`]）: 行ストア（`catalog.rs` のテーブル
+//!   スコープ行 API）を安全な上限内で走査し、可視行だけを列挙・検証する統合層。
+//!   呼び出し元は主に `tests/tenant_isolation.rs`（TABLE-11 の 200 試行 × 4 テナント
+//!   巡回検証）で、独立に期待集合を算出するための参照実装として使う。
+//! - 書き込み側（[`insert_row`]・[`update_row`]・[`delete_row`]）: `PolicyContext::is_owner`
+//!   （書き込み認可の単一照合パス）による所有権判定を経由してのみ行ストアを変更する
+//!   ガード API（RECOVER-4）。`crate::core::EngineCore` の薄い委譲メソッドを経由して
+//!   wire 層が DML を行う唯一の入口として設計している。生の UPDATE/DELETE を
+//!   `Storage` の公開 API として新設しない（ガードを迂回できる経路を増やさない）。
 //!
 //! ## 設計記録: テーブル単位の物理分離は本タスクのスコープ外
 //!
@@ -15,9 +23,16 @@
 //! テーブル単位分離を検討する場合は、本モジュールの可視性フィルタと独立した設計判断
 //! として扱うこと。
 
-use crate::catalog::CatalogError;
+use redb::{ReadableTable, TableDefinition};
+
+use crate::catalog::{
+    require_table_schema_write, user_rows_table_name, validate_identifier, CatalogError,
+};
 use crate::policy::PolicyContext;
-use crate::storage::{Row, Storage};
+use crate::storage::{
+    bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
+    Storage, StorageError,
+};
 
 /// 1 ページあたりの走査件数（`catalog.rs::Storage::scan_table_page` の内部上限
 /// `MAX_SCAN_PAGE_LIMIT` と同じ桁）。
@@ -188,6 +203,234 @@ pub fn verify_hits(
     } else {
         Err(TenantError::HitOutsideVisibleSet)
     }
+}
+
+/// [`insert_row`]・[`update_row`]・[`delete_row`] のエラー型（TASK-95・対象ビヘイビア:
+/// RECOVER-4）。`Display`・`Debug`・`std::error::Error::source` のいずれにもテナント ID・
+/// 行 id・テーブル名を含めず、他テナントの存在情報を漏らさない（[`TenantError`] と同じ
+/// 契約。security.md P0）。
+pub enum TenantWriteError {
+    /// 呼び出し元が入力した `RowInput::tenant_id` が `ctx` のテナントと不一致
+    /// （クライアント自身の入力に起因するため存在情報を含まない）。他テナント名義の
+    /// 新規行の書き込み・自テナント行の他テナントへの付け替え試行の両方がここに入る。
+    Forbidden,
+    /// UPDATE/DELETE 対象行が不存在、または `ctx` が所有しない行（区別しない。
+    /// 存在情報を漏らさないため fail-closed に統一する。security.md P0）。
+    NotFound,
+    /// INSERT 先 id に既存行がある（所有者を問わず同一 variant。上書きによる他テナント
+    /// 行の破壊を遮断しつつ、所有テナントの存在情報を漏らさない）。
+    IdConflict,
+    /// [`crate::catalog`] 側のエラー（テーブル不存在・行破損・redb バックエンドエラー等）。
+    Catalog(CatalogError),
+    /// [`crate::storage`] 側のエンコード/デコードエラー（`RowInput` の入力検証失敗等）。
+    Storage(StorageError),
+}
+
+impl TenantWriteError {
+    /// SQLSTATE 風 `wire_code`（coding-rust.md「エラー型は SQLSTATE 風 wire_code の設計に
+    /// 従う」）。`Forbidden` → `42501`（テナント帰属不一致）・`NotFound` → `P0002`
+    /// （行不在）は ERR-2 の分類表（`docs/spec/04-behavior/error-format.md`）が
+    /// 明示する写像（`Forbidden` は RECOVER-4 の記述と対応）。行 id 重複（INSERT
+    /// 上書き拒否）は ERR-2 の分類表に専用ラベルが無いため、`operation_id` 重複と同じ
+    /// unique_violation 系統として暫定で `23505` を割り当てる（正式な写像は未確定。
+    /// PR レビューでユーザーへ報告し、必要なら spec リポ側の課題として起票する）。
+    pub fn wire_code(&self) -> &'static str {
+        match self {
+            TenantWriteError::Forbidden => "42501",
+            TenantWriteError::NotFound => "P0002",
+            TenantWriteError::IdConflict => "23505",
+            TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
+        }
+    }
+}
+
+impl std::fmt::Display for TenantWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TenantWriteError::Forbidden => {
+                write!(f, "tenant write forbidden: not the row owner")
+            }
+            TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
+            TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
+            // `CatalogError`/`StorageError` の `Display` をそのまま展開しない（`TenantError`
+            // と同じ理由。security.md テナント境界 P0）。
+            TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
+            TenantWriteError::Storage(_) => write!(f, "tenant write storage error"),
+        }
+    }
+}
+
+impl std::fmt::Debug for TenantWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `#[derive(Debug)]` は内部の `CatalogError`/`StorageError` をそのまま展開し、
+        // `Display` で隠した情報がパニック出力・`{:?}` ログ経由で再露出する
+        // （security.md テナント境界 P0）。variant 名のみを出力する。
+        match self {
+            TenantWriteError::Forbidden => f.write_str("Forbidden"),
+            TenantWriteError::NotFound => f.write_str("NotFound"),
+            TenantWriteError::IdConflict => f.write_str("IdConflict"),
+            TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
+            TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
+        }
+    }
+}
+
+impl std::error::Error for TenantWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // `TenantError::source` と同じ理由で原因チェーンをここで打ち切る
+        // （security.md テナント境界 P0）。
+        None
+    }
+}
+
+impl From<CatalogError> for TenantWriteError {
+    fn from(e: CatalogError) -> Self {
+        TenantWriteError::Catalog(e)
+    }
+}
+
+impl From<StorageError> for TenantWriteError {
+    fn from(e: StorageError) -> Self {
+        TenantWriteError::Storage(e)
+    }
+}
+
+/// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
+///
+/// `row.tenant_id` が `ctx` のテナントと不一致なら
+/// [`TenantWriteError::Forbidden`]（他テナント名義での新規行書き込み・テナント
+/// 付け替えの試行を遮断。判定は [`PolicyContext::is_owner`] の単一照合パス経由）。
+/// 挿入先 `id` に既存行がある場合は、その行の所有者を問わず
+/// [`TenantWriteError::IdConflict`]（上書きによる他テナント行の破壊を防ぎつつ、
+/// 所有テナントの存在情報を漏らさない）。
+///
+/// スキーマ取得・次元検証・所有権判定・書き込みを単一の write トランザクション内で
+/// 行い、失敗時は commit せずトランザクションを破棄する（`redb::WriteTransaction` の
+/// drop 契約により abort。判定と書き込みの間に TOCTOU を作らない。redb は単一
+/// ライタで書き込みを直列化する）。
+pub fn insert_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    row: &RowInput<'_>,
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を ctx と照合する
+    // （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+    if !ctx.is_owner(row.tenant_id) {
+        return Err(TenantWriteError::Forbidden);
+    }
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        schema.validate_embedding_dim(row.embedding.len())?;
+        let row_table_name = user_rows_table_name(table);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let mut row_table = write_txn
+            .open_table(row_table_def)
+            .map_err(CatalogError::from)?;
+        if row_table.get(id).map_err(CatalogError::from)?.is_some() {
+            return Err(TenantWriteError::IdConflict);
+        }
+        let encoded = encode_row(row)?;
+        row_table
+            .insert(id, encoded.as_slice())
+            .map_err(CatalogError::from)?;
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(())
+}
+
+/// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
+///
+/// `row.tenant_id` が `ctx` のテナントと不一致なら
+/// [`TenantWriteError::Forbidden`]（自テナント行を他テナントへ付け替える試行を含む）。
+/// 対象行が不存在、または既存行の所有者が `ctx` と一致しない場合は
+/// **区別せず** [`TenantWriteError::NotFound`]（他テナントの存在情報を漏らさない。
+/// security.md P0）。
+///
+/// スキーマ取得・次元検証・既存行の所有権判定・書き込みを単一の write トランザクション
+/// 内で行う（[`insert_row`] と同じ TOCTOU 対策）。
+pub fn update_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    row: &RowInput<'_>,
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    if !ctx.is_owner(row.tenant_id) {
+        return Err(TenantWriteError::Forbidden);
+    }
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        schema.validate_embedding_dim(row.embedding.len())?;
+        let row_table_name = user_rows_table_name(table);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let mut row_table = write_txn
+            .open_table(row_table_def)
+            .map_err(CatalogError::from)?;
+        // `AccessGuard` の借用をこのブロック内に閉じ込め、後続の可変借用（`insert`）と
+        // 衝突しないようにする。
+        let owns_existing = match row_table.get(id).map_err(CatalogError::from)? {
+            Some(guard) => {
+                let (existing_tenant, _existing_visibility) =
+                    decode_row_tenant_and_visibility(guard.value())?;
+                ctx.is_owner(&existing_tenant)
+            }
+            None => false,
+        };
+        if !owns_existing {
+            return Err(TenantWriteError::NotFound);
+        }
+        let encoded = encode_row(row)?;
+        row_table
+            .insert(id, encoded.as_slice())
+            .map_err(CatalogError::from)?;
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(())
+}
+
+/// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
+///
+/// 対象行が不存在、または既存行の所有者が `ctx` と一致しない場合は
+/// **区別せず** [`TenantWriteError::NotFound`]（[`update_row`] と同じ契約。
+/// security.md P0）。
+pub fn delete_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+) -> Result<(), TenantWriteError> {
+    validate_identifier(table)?;
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    {
+        // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
+        // `insert_row`/`update_row` と同じ前段を通す。
+        require_table_schema_write(&write_txn, table)?;
+        let row_table_name = user_rows_table_name(table);
+        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+        let mut row_table = write_txn
+            .open_table(row_table_def)
+            .map_err(CatalogError::from)?;
+        let owns_existing = match row_table.get(id).map_err(CatalogError::from)? {
+            Some(guard) => {
+                let (existing_tenant, _existing_visibility) =
+                    decode_row_tenant_and_visibility(guard.value())?;
+                ctx.is_owner(&existing_tenant)
+            }
+            None => false,
+        };
+        if !owns_existing {
+            return Err(TenantWriteError::NotFound);
+        }
+        row_table.remove(id).map_err(CatalogError::from)?;
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(())
 }
 
 #[cfg(test)]

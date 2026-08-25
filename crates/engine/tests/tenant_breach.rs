@@ -1,0 +1,594 @@
+//! `engine::tenant`（TASK-95・対象ビヘイビア: RECOVER-4）の機械検証。
+//!
+//! テナント境界を越える読み取り・書き込み（INSERT/UPDATE/DELETE）の試行が
+//! 全件拒否され、対象データが試行前後で不変であることを検証する。
+//!
+//! `tests/tenant_isolation.rs`（TASK-89）・`tests/rls_security.rs`（TASK-133）の
+//! シード手法（決定的 xorshift64*・`unique_db_path` + `CleanupGuard`）を踏襲し、
+//! テスト側だけが持つグラウンドトゥルースを独立オラクルとして使う
+//! （`PolicyContext::is_visible`/`is_owner` の実装バグからも独立させるため、本体の
+//! 判定 API はオラクル側で再利用しない）。
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::{EngineCore, VectorCore};
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::rls::{PrefilterIndex, SearchTimeFilter};
+use engine::storage::{RowInput, Storage, Visibility};
+use engine::tenant::{self, TenantWriteError};
+
+// ---------- 決定的擬似乱数（xorshift64*。他の tenant/rls 結合テストと同一実装） ----------
+
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn next_f64(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn next_f32_signed(&mut self) -> f32 {
+        (self.next_f64() * 2.0 - 1.0) as f32
+    }
+}
+
+// ---------- テスト共通のセットアップ ----------
+
+static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_db_path(label: &str) -> PathBuf {
+    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "vector-db-engine-tenant-breach-{label}-{}-{seq}.redb",
+        std::process::id()
+    ));
+    path
+}
+
+struct CleanupGuard(PathBuf);
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+const DIM: u32 = 8;
+const TABLE: &str = "docs";
+const TENANT_A: &str = "tenant-a";
+const TENANT_B: &str = "tenant-b";
+
+fn schema() -> TableSchema {
+    TableSchema::new(
+        TABLE,
+        vec![ColumnDef::new("embedding", ColumnType::Vector(DIM), false)],
+    )
+}
+
+/// 攻撃側（tenant-a）が保持しうる最も広い許可可視性（`Public`・`Private` の両方）を持つ
+/// `PolicyContext`。読み取り側検証では「最も広い許可でも越境できないこと」を示すために
+/// 使う。書き込み側の認可（`is_owner`）は可視性ラベルを見ないため、この ctx でも
+/// tenant-b 名義の書き込みは一貫して拒否される想定。
+fn attacker_ctx() -> PolicyContext {
+    PolicyContext::with_visibilities(TENANT_A, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant")
+}
+
+fn victim_ctx() -> PolicyContext {
+    PolicyContext::new(TENANT_B).expect("valid tenant")
+}
+
+/// テーブル全行を `scan_table_page` でカーソルが尽きるまで巡回して収集する、実装非依存の
+/// チェッカー。`(tenant_id, visibility, embedding, metadata)` を id 昇順に保持する。
+fn snapshot_table(storage: &Storage) -> BTreeMap<u64, (String, bool, Vec<f32>, Vec<u8>)> {
+    let mut out = BTreeMap::new();
+    let mut after: Option<u64> = None;
+    loop {
+        let (page, next) = storage
+            .scan_table_page(TABLE, after, 10_000)
+            .expect("scan_table_page ok");
+        if page.is_empty() && next.is_none() {
+            break;
+        }
+        for row in page {
+            out.insert(
+                row.id,
+                (
+                    row.tenant_id.clone(),
+                    matches!(row.visibility, Visibility::Public),
+                    row.embedding.clone(),
+                    row.metadata.clone(),
+                ),
+            );
+        }
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    out
+}
+
+/// 決定的な合成コーパスを構築する: tenant-a・tenant-b それぞれ `rows_per_tenant` 行、
+/// `Public`/`Private` 混在。id は 1..=2*rows_per_tenant を tenant-a → tenant-b の順に
+/// 割り当てる。
+fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) {
+    storage.create_table(&schema()).expect("create table");
+    let mut rng = Xorshift64::new(seed);
+    let tenants = [TENANT_A, TENANT_B];
+    let mut rows: Vec<(u64, Vec<f32>, &'static str, Visibility)> = Vec::new();
+    let mut id = 1u64;
+    for tenant in tenants {
+        for _ in 0..rows_per_tenant {
+            let visibility = if rng.next_f64() < 0.5 {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            let embedding: Vec<f32> = (0..DIM).map(|_| rng.next_f32_signed()).collect();
+            rows.push((id, embedding, tenant, visibility));
+            id += 1;
+        }
+    }
+    let inputs: Vec<(u64, RowInput<'_>)> = rows
+        .iter()
+        .map(|(id, emb, tenant, vis)| {
+            (
+                *id,
+                RowInput {
+                    tenant_id: tenant,
+                    visibility: *vis,
+                    embedding: emb,
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    storage
+        .insert_rows_into_table(TABLE, &inputs)
+        .expect("seed corpus batch insert");
+}
+
+// 対象ビヘイビア: RECOVER-4。テナント境界を越える書き込み（INSERT/UPDATE/DELETE）試行が
+// 全件拒否され、対象データが試行前後で不変であることを検証する。
+#[test]
+fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
+    let path = unique_db_path("write-breach");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_corpus(&storage, 20, 1000);
+
+    let before = snapshot_table(&storage);
+    let attacker = attacker_ctx();
+
+    // tenant-b の Public 行と Private 行の両方を標的に含める。
+    let victim_ids: Vec<u64> = before
+        .iter()
+        .filter(|(_, (tenant, ..))| tenant == TENANT_B)
+        .map(|(id, _)| *id)
+        .collect();
+    assert!(victim_ids.len() >= 20, "seed must contain tenant-b rows");
+    let victim_public_id = *before
+        .iter()
+        .find(|(_, (tenant, is_public, ..))| tenant == TENANT_B && *is_public)
+        .map(|(id, _)| id)
+        .expect("seed must contain a tenant-b public row");
+    let victim_private_id = *before
+        .iter()
+        .find(|(_, (tenant, is_public, ..))| tenant == TENANT_B && !*is_public)
+        .map(|(id, _)| id)
+        .expect("seed must contain a tenant-b private row");
+
+    let mut results: Vec<Result<(), TenantWriteError>> = Vec::new();
+
+    // INSERT 10 回: 偶数回は tenant-b 名義で新規 id へ（Forbidden 期待）、
+    // 奇数回は tenant-a 名義で tenant-b の既存 id へ上書き試行（IdConflict 期待）。
+    for i in 0..10u64 {
+        let new_id = 100_000 + i;
+        if i % 2 == 0 {
+            let row = RowInput {
+                tenant_id: TENANT_B,
+                visibility: Visibility::Public,
+                embedding: &[1.0; DIM as usize],
+                metadata: &[],
+            };
+            let r = tenant::insert_row(&storage, TABLE, &attacker, new_id, &row);
+            assert!(matches!(r, Err(TenantWriteError::Forbidden)));
+            results.push(r);
+        } else {
+            let target = victim_ids[(i as usize) % victim_ids.len()];
+            let row = RowInput {
+                tenant_id: TENANT_A,
+                visibility: Visibility::Public,
+                embedding: &[1.0; DIM as usize],
+                metadata: &[],
+            };
+            let r = tenant::insert_row(&storage, TABLE, &attacker, target, &row);
+            assert!(matches!(r, Err(TenantWriteError::IdConflict)));
+            results.push(r);
+        }
+    }
+
+    // UPDATE 10 回: 偶数回は tenant-b の行（Public/Private 交互）を tenant-a ctx で
+    // 更新（NotFound 期待）。奇数回は tenant-a 自身の行を tenant-b へ付け替える試行
+    // （Forbidden 期待）。
+    let attacker_own_ids: Vec<u64> = before
+        .iter()
+        .filter(|(_, (tenant, ..))| tenant == TENANT_A)
+        .map(|(id, _)| *id)
+        .collect();
+    for i in 0..10u64 {
+        if i % 2 == 0 {
+            let target = if i % 4 == 0 {
+                victim_public_id
+            } else {
+                victim_private_id
+            };
+            let row = RowInput {
+                tenant_id: TENANT_A,
+                visibility: Visibility::Public,
+                embedding: &[2.0; DIM as usize],
+                metadata: &[],
+            };
+            let r = tenant::update_row(&storage, TABLE, &attacker, target, &row);
+            assert!(matches!(r, Err(TenantWriteError::NotFound)));
+            results.push(r);
+        } else {
+            let own_id = attacker_own_ids[(i as usize) % attacker_own_ids.len()];
+            let row = RowInput {
+                tenant_id: TENANT_B,
+                visibility: Visibility::Public,
+                embedding: &[2.0; DIM as usize],
+                metadata: &[],
+            };
+            let r = tenant::update_row(&storage, TABLE, &attacker, own_id, &row);
+            assert!(matches!(r, Err(TenantWriteError::Forbidden)));
+            results.push(r);
+        }
+    }
+
+    // DELETE 10 回: tenant-b の行（Public を必ず含む）を tenant-a ctx で削除試行
+    // （NotFound 期待）。
+    for i in 0..10u64 {
+        let target = if i == 0 {
+            victim_public_id
+        } else {
+            victim_ids[(i as usize) % victim_ids.len()]
+        };
+        let r = tenant::delete_row(&storage, TABLE, &attacker, target);
+        assert!(matches!(r, Err(TenantWriteError::NotFound)));
+        results.push(r);
+    }
+
+    // 全 30 件が Err であること（成功件数 0）。
+    assert_eq!(results.len(), 30);
+    assert!(results.iter().all(|r| r.is_err()));
+
+    // エラーの Display/Debug 文字列に被害側テナント名・対象 id が含まれないこと
+    // （security.md P0「存在情報を漏らさない」の回帰検証）。
+    for r in &results {
+        if let Err(e) = r {
+            let display = format!("{e}");
+            let debug = format!("{e:?}");
+            assert!(
+                !display.contains(TENANT_B),
+                "Display leaked tenant: {display}"
+            );
+            assert!(!debug.contains(TENANT_B), "Debug leaked tenant: {debug}");
+            assert!(
+                !display.contains(&victim_public_id.to_string()),
+                "Display leaked row id: {display}"
+            );
+            assert!(
+                !debug.contains(&victim_public_id.to_string()),
+                "Debug leaked row id: {debug}"
+            );
+        }
+    }
+
+    // 試行後、テーブル全体が試行前と完全一致すること（差分 0 件）。
+    let after = snapshot_table(&storage);
+    assert_eq!(
+        before, after,
+        "table contents must be unchanged after all rejected attempts"
+    );
+
+    // 永続イメージの不変性も確認する（RECOVER-4: 「対象データが試行前後で不変」は
+    // プロセス内ビューだけでなくディスク上の状態を指す。ハンドルを閉じて再オープンし、
+    // commit されなかった拒否試行がディスクにも一切反映されていないことを検証する）。
+    drop(storage);
+    let reopened = Storage::open(&path).expect("reopen storage after breach attempts");
+    let after_reopen = snapshot_table(&reopened);
+    assert_eq!(
+        before, after_reopen,
+        "persisted table contents must be unchanged after reopening the database"
+    );
+}
+
+// 対象ビヘイビア: RECOVER-4。読み取り経路（PrefilterIndex/SearchTimeFilter/
+// tenant::visible_rows/EngineCore::get_row/EngineCore::search/EngineCore::execute_sql）を
+// 巡回し、他テナントの Private 行が一切返らないことを検証する。
+#[test]
+fn recover4_read_breach_attempts_never_return_foreign_private_rows() {
+    let path = unique_db_path("read-breach");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    // rows_per_tenant=40（期待値約 20 件/テナント/可視性）で、後段の 10 標的サンプリング
+    // （RECOVER-4 の「読み取り 10 回」）に十分な tenant-b Private 行数を確保する。
+    seed_corpus(&storage, 40, 2000);
+
+    let before = snapshot_table(&storage);
+    let attacker = attacker_ctx();
+    // RECOVER-4 の「読み取り 10 回」に対応する 10 個の標的（tenant-b の Private 行）。
+    let victim_ids: Vec<u64> = before
+        .iter()
+        .filter(|(_, (tenant, is_public, ..))| tenant == TENANT_B && !*is_public)
+        .map(|(id, _)| *id)
+        .take(10)
+        .collect();
+    assert!(
+        victim_ids.len() >= 10,
+        "seed must contain at least 10 tenant-b private rows, got {}",
+        victim_ids.len()
+    );
+
+    // 攻撃側が「見てよい」集合（自テナントの全行 + 他テナントの Public 行）。
+    let allowed_ids: std::collections::HashSet<u64> = before
+        .iter()
+        .filter(|(_, (tenant, is_public, ..))| tenant == TENANT_A || *is_public)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &victim_ids {
+        assert!(
+            !allowed_ids.contains(id),
+            "sanity: victim private row {id} must not be in the allowed set"
+        );
+    }
+
+    let mut exposures = 0u32;
+    let mut attempts = 0u32;
+
+    // フェーズ 1: `PrefilterIndex`/`SearchTimeFilter`（`&Storage` を借用する経路）。
+    // 10 標的のうち偶数インデックスを `PrefilterIndex::search`、奇数インデックスを
+    // `SearchTimeFilter::search` に割り当てる（計 10 試行の一部）。クエリベクトルには
+    // 標的自身の埋め込みをそのまま使い、最近傍として最も露出しやすい条件にする。
+    {
+        let prefilter =
+            PrefilterIndex::build(&storage, TABLE, &attacker).expect("build prefilter index");
+        let search_time =
+            SearchTimeFilter::build(&storage, TABLE).expect("build search-time filter");
+
+        for (i, victim_id) in victim_ids.iter().enumerate() {
+            let query = &before[victim_id].2;
+            let hits = if i % 2 == 0 {
+                prefilter
+                    .search(&attacker, &CpuScalarProvider, query, 5)
+                    .expect("prefilter search ok")
+            } else {
+                search_time
+                    .search(&attacker, query, 5)
+                    .expect("search-time filter search ok")
+            };
+            attempts += 1;
+            for h in &hits {
+                assert!(allowed_ids.contains(&h.id));
+                if h.id == *victim_id {
+                    exposures += 1;
+                }
+            }
+        }
+
+        // `PrefilterIndex` は構築時 ctx と検索時 ctx の完全一致を要求する
+        // （TASK-133・[`engine::rls::RlsError::ContextMismatch`]）。victim ctx で構築した
+        // インデックスを attacker ctx で検索する試行は、越境の前にこの整合性検査で
+        // fail-closed に拒否される（上記の 10 試行とは別の、越境試行としての追加検証）。
+        let victim = victim_ctx();
+        let victim_index =
+            PrefilterIndex::build(&storage, TABLE, &victim).expect("build prefilter index");
+        let mismatched =
+            victim_index.search(&attacker, &CpuScalarProvider, &before[&victim_ids[0]].2, 5);
+        assert!(matches!(
+            mismatched,
+            Err(engine::rls::RlsError::ContextMismatch)
+        ));
+
+        // `tenant::visible_rows` は個別の検索試行としては数えないが、可視集合そのものに
+        // 10 標的が一切含まれないことを別途確認する（読み取り経路の網羅）。
+        let visible = tenant::visible_rows(&storage, TABLE, &attacker).expect("visible_rows ok");
+        for victim_id in &victim_ids {
+            assert!(!visible.iter().any(|r| r.id == *victim_id));
+        }
+        assert!(visible.iter().all(|r| allowed_ids.contains(&r.id)));
+    }
+    assert_eq!(attempts, 10, "phase 1 must account for exactly 10 attempts");
+
+    // フェーズ 2: `EngineCore`（`Storage` の所有権を取る経路）。`get_row`・`search`・
+    // `execute_sql` を巡回し、フェーズ 1 と別の 10 標的（tenant-b Public 行も含めて
+    // 網羅する目的で同じ 10 件を再利用）に対して全経路が拒否・非露出であることを
+    // 追加確認する（別集計・フェーズ 1 の 10 件を上書きしない）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+
+    for victim_id in &victim_ids {
+        let get_result = core.get_row(&attacker, TABLE, *victim_id);
+        assert!(matches!(get_result, Err(engine::core::CoreError::NotFound)));
+    }
+
+    let query = &before[&victim_ids[0]].2;
+    let hits = core
+        .search(&attacker, TABLE, query, 5)
+        .expect("core search ok");
+    for h in &hits {
+        assert!(allowed_ids.contains(&h.id));
+        if victim_ids.contains(&h.id) {
+            exposures += 1;
+        }
+    }
+
+    // `execute_sql` はプレースホルダを持たないため、許可リスト経由のベクトルリテラルへ
+    // 標的の埋め込みをそのまま埋め込む（SQL 表層は本タスクのスコープ外だが、読み取り
+    // 経路の網羅のため最小限の SELECT を 1 件だけ通す）。
+    let literal: String = query
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id FROM {TABLE} ORDER BY embedding <=> '[{literal}]' LIMIT 5");
+    let query_result = core.execute_sql(&attacker, &sql).expect("execute_sql ok");
+    for row in &query_result.rows {
+        assert!(allowed_ids.contains(&row.id));
+        if victim_ids.contains(&row.id) {
+            exposures += 1;
+        }
+    }
+
+    assert_eq!(
+        exposures, 0,
+        "victim private row content must never be exposed to the attacker across any read path"
+    );
+}
+
+// 対象ビヘイビア: RECOVER-4（正方向）。自テナント名義の書き込みは成功することを確認し、
+// 拒否一辺倒の実装による誤 green を防ぐ。
+#[test]
+fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
+    let path = unique_db_path("owner-writes");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_corpus(&storage, 5, 3000);
+
+    let owner =
+        PolicyContext::with_visibilities(TENANT_A, [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+
+    // 直接 `tenant::*` API 経由。
+    let before = snapshot_table(&storage);
+    let new_id = 900_001u64;
+    let insert_row = RowInput {
+        tenant_id: TENANT_A,
+        visibility: Visibility::Public,
+        embedding: &[0.5; DIM as usize],
+        metadata: &[],
+    };
+    tenant::insert_row(&storage, TABLE, &owner, new_id, &insert_row).expect("owner insert ok");
+
+    let own_id = *before
+        .iter()
+        .find(|(_, (t, ..))| t == TENANT_A)
+        .map(|(id, _)| id)
+        .expect("seed must contain a tenant-a row");
+    let update_row_input = RowInput {
+        tenant_id: TENANT_A,
+        visibility: Visibility::Private,
+        embedding: &[0.75; DIM as usize],
+        metadata: &[],
+    };
+    tenant::update_row(&storage, TABLE, &owner, own_id, &update_row_input)
+        .expect("owner update ok");
+
+    let delete_target = *before
+        .iter()
+        .filter(|(id, (t, ..))| t == TENANT_A && **id != own_id)
+        .map(|(id, _)| id)
+        .next()
+        .expect("seed must contain another tenant-a row");
+    tenant::delete_row(&storage, TABLE, &owner, delete_target).expect("owner delete ok");
+
+    let after = snapshot_table(&storage);
+    assert!(after.contains_key(&new_id));
+    assert_eq!(after[&own_id].3, update_row_input.metadata.to_vec());
+    assert!(!after.contains_key(&delete_target));
+
+    // 期待した 3 件（insert 1・update 1・delete 1）以外に差分がないこと。
+    let mut changed: Vec<u64> = Vec::new();
+    let all_ids: std::collections::HashSet<u64> =
+        before.keys().chain(after.keys()).copied().collect();
+    for id in all_ids {
+        if before.get(&id) != after.get(&id) {
+            changed.push(id);
+        }
+    }
+    changed.sort_unstable();
+    let mut expected = vec![new_id, own_id, delete_target];
+    expected.sort_unstable();
+    assert_eq!(changed, expected);
+
+    // `EngineCore` 委譲メソッド経由でも 1 件ずつ成功することを確認する。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let another_new_id = 900_002u64;
+    let insert_row2 = RowInput {
+        tenant_id: TENANT_A,
+        visibility: Visibility::Public,
+        embedding: &[0.25; DIM as usize],
+        metadata: &[],
+    };
+    core.insert_row(&owner, TABLE, another_new_id, &insert_row2)
+        .expect("EngineCore::insert_row ok");
+    let update_row2 = RowInput {
+        tenant_id: TENANT_A,
+        visibility: Visibility::Public,
+        embedding: &[0.1; DIM as usize],
+        metadata: &[],
+    };
+    core.update_row(&owner, TABLE, another_new_id, &update_row2)
+        .expect("EngineCore::update_row ok");
+    core.delete_row(&owner, TABLE, another_new_id)
+        .expect("EngineCore::delete_row ok");
+}
+
+// 対象ビヘイビア: RECOVER-4（負方向・検査器の実効性）。ガードを経由しない生の
+// `Storage::insert_row_into_table` で tenant-b 行を上書きした場合、`snapshot_table` の
+// 前後比較が差分を検出できることを確認する（実装と検査器の経路分離・fail しうることの
+// 確認）。
+#[test]
+fn recover4_checker_detects_unguarded_mutation() {
+    let path = unique_db_path("checker-detects");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    seed_corpus(&storage, 5, 4000);
+
+    let before = snapshot_table(&storage);
+    let victim_id = *before
+        .iter()
+        .find(|(_, (t, ..))| t == TENANT_B)
+        .map(|(id, _)| id)
+        .expect("seed must contain a tenant-b row");
+
+    // ガードを迂回した生の書き込み（テナント境界を無視する）。
+    storage
+        .insert_row_into_table(
+            TABLE,
+            victim_id,
+            &RowInput {
+                tenant_id: TENANT_A,
+                visibility: Visibility::Public,
+                embedding: &[9.0; DIM as usize],
+                metadata: &[],
+            },
+        )
+        .expect("unguarded write succeeds by construction");
+
+    let after = snapshot_table(&storage);
+    assert_ne!(
+        before, after,
+        "checker must detect the unguarded mutation as a difference"
+    );
+    assert_eq!(after[&victim_id].0, TENANT_A);
+}

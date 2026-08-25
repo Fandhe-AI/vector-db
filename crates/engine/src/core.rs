@@ -322,6 +322,45 @@ impl EngineCore {
         let bound = crate::sql::parser::bind(&stmt, &schema)?;
         crate::sql::exec::execute_statement(&read_txn, self.provider.as_ref(), ctx, &schema, &bound)
     }
+
+    /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// `crate::tenant::insert_row`（テナント境界付き書き込みガード）への薄い委譲のみで、
+    /// テナント比較・所有権判定のロジックは本メソッドに書かない。`VectorCore` trait
+    /// へは昇格しない固有メソッド（`execute_sql` と同じ理由。`core-api-check` の対象外。
+    /// wire 層が DML を行う際の入口はこのメソッド経由を想定し、SQL `INSERT` 表層
+    /// （TASK-80/81/120）はこの経路の上に載せる前提）。
+    pub fn insert_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+        row: &crate::storage::RowInput<'_>,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::insert_row(&self.storage, table, ctx, id, row)
+    }
+
+    /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲のみ。
+    pub fn update_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+        row: &crate::storage::RowInput<'_>,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::update_row(&self.storage, table, ctx, id, row)
+    }
+
+    /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲のみ。
+    pub fn delete_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::delete_row(&self.storage, table, ctx, id)
+    }
 }
 
 impl VectorCore for EngineCore {
@@ -537,6 +576,54 @@ mod tests {
         let invisible = core.get_row(&ctx, "docs", 1);
         assert!(matches!(not_found, Err(CoreError::NotFound)));
         assert!(matches!(invisible, Err(CoreError::NotFound)));
+    }
+
+    // 対象ビヘイビア: RECOVER-4。`EngineCore::update_row`/`delete_row` は
+    // `crate::tenant` の書き込みガードへ委譲するだけであることの結合確認
+    // （テナント境界の実質的な検証は `tests/tenant_breach.rs` 側。ここでは
+    // `EngineCore` からの委譲経路そのものが `NotFound` を返すことだけを確認する）。
+    #[test]
+    fn update_and_delete_row_reject_other_tenant_as_not_found() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        let attacker = PolicyContext::new("tenant-a").expect("valid tenant");
+        let update_input = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[0.0, 1.0],
+            metadata: &[],
+        };
+        assert!(matches!(
+            core.update_row(&attacker, "docs", 1, &update_input),
+            Err(crate::tenant::TenantWriteError::NotFound)
+        ));
+        assert!(matches!(
+            core.delete_row(&attacker, "docs", 1),
+            Err(crate::tenant::TenantWriteError::NotFound)
+        ));
+
+        // データが不変であることを確認する（拒否が実際に永続化を止めていること）。
+        let row = core
+            .storage
+            .get_row_from_table("docs", 1)
+            .expect("row still present");
+        assert_eq!(row.tenant_id, "tenant-b");
     }
 
     // 簡易テンポラリディレクトリ（外部クレート非依存。dependency-policy 準拠）。

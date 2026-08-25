@@ -223,7 +223,11 @@ impl TableSchema {
 /// 空文字列・非 ASCII・区切り文字混入・長さ上限超過を fail-closed に拒否する。
 /// encode 側・decode 側の両方から呼ばれ、永続データが手で書き換えられた場合も
 /// 同じ検証を通す。
-fn validate_identifier(s: &str) -> Result<()> {
+///
+/// `pub(crate)`: `tenant.rs`（TASK-95・対象ビヘイビア: RECOVER-4）が書き込みガード API
+/// （`insert_row`/`update_row`/`delete_row`）内の同一 write トランザクションから、
+/// テーブル名検証をここへ委譲する（重複実装を作らない。クレート外へは公開しない）。
+pub(crate) fn validate_identifier(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(CatalogError::Invalid("identifier is empty".to_string()));
     }
@@ -541,7 +545,11 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
 /// カタログテーブル自体が未作成の場合・該当エントリが存在しない場合のいずれも
 /// `CatalogError::TableNotFound` に一本化する（他テーブルの存在情報を漏らさない
 /// fail-closed な扱い。security.md「アクセス制御の不備」）。
-fn require_table_schema_write(
+///
+/// `pub(crate)`: `tenant.rs`（TASK-95・対象ビヘイビア: RECOVER-4）の書き込みガード API が、
+/// 同一 write トランザクション内で「スキーマ取得 → 所有権判定 → 書き込み」を行うために
+/// ここへ委譲する（クレート外へは公開しない）。
+pub(crate) fn require_table_schema_write(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<TableSchema> {
