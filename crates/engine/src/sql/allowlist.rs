@@ -25,6 +25,19 @@ const MAX_ERROR_DETAIL_LEN: usize = 200;
 /// 「不安全な設計」対応）。
 const MAX_ARG_NESTING_DEPTH: usize = 32;
 
+/// ORDER BY の関数呼び出し形で許可する関数名を照合する（大文字小文字を区別しない）。
+/// 未知の名前は fail-closed に拒否し、識別子であれば任意の名前を関数呼び出しとして
+/// 受理してしまう構造上の抜け穴を作らない。
+fn is_allowed_order_by_function_name(name: &str) -> bool {
+    matches!(name.to_ascii_uppercase().as_str(), "HYBRID_RRF" | "HYBRID")
+}
+
+/// WHERE の述語呼び出し形（空引数）で許可する述語名を照合する（大文字小文字を
+/// 区別しない）。未知の名前は fail-closed に拒否する。
+fn is_allowed_where_predicate_name(name: &str) -> bool {
+    matches!(name.to_ascii_uppercase().as_str(), "VISIBLE")
+}
+
 fn truncate_for_error(s: &str) -> String {
     if s.len() <= MAX_ERROR_DETAIL_LEN {
         return s.to_string();
@@ -124,6 +137,16 @@ pub enum OrderByForm {
     FunctionCall { name: String },
 }
 
+/// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前
+/// （[`is_allowed_where_predicate_name`]）のみを通過させる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WherePredicate {
+    /// 列と文字列リテラルの等価条件。
+    Equality { column: String },
+    /// 許可された名前の述語呼び出し形（空引数）。
+    PredicateCall { name: String },
+}
+
 /// 許可形状の構造判定を通過した SQL 文（後続タスクのパーサー・実行計画の土台）。
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
 /// 妥当性は検証しない。
@@ -132,8 +155,8 @@ pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
     pub order_by: OrderByForm,
-    /// WHERE 句の有無（内容の意味論的検証は本モジュールの管轄外）。
-    pub has_where: bool,
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
+    pub where_predicates: Vec<WherePredicate>,
     pub limit: u32,
 }
 
@@ -222,18 +245,27 @@ impl<'a> Parser<'a> {
     }
 
     /// WHERE 句の許可形状（等価条件・述語呼び出し形の 2 種のみ。`OR`・括弧による
-    /// ネスト・比較演算子の拡張は許可しない）。
-    fn parse_where(&mut self) -> Result<(), SqlSurfaceError> {
+    /// ネスト・比較演算子の拡張は許可しない）。述語呼び出し形は許可された名前
+    /// （[`is_allowed_where_predicate_name`]）のみを受理し、未知の名前は拒否する。
+    fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
+        let mut predicates = Vec::new();
         loop {
-            self.expect_ident()?;
+            let name = self.expect_ident()?;
             match self.peek() {
                 Some(Token::Punct('=')) => {
                     self.advance();
                     self.expect_string_literal()?;
+                    predicates.push(WherePredicate::Equality { column: name });
                 }
                 Some(Token::Punct('(')) => {
+                    if !is_allowed_where_predicate_name(&name) {
+                        return Err(SqlSurfaceError::unsupported(format!(
+                            "unsupported WHERE predicate: {name}"
+                        )));
+                    }
                     self.advance();
                     self.expect_punct(')')?;
+                    predicates.push(WherePredicate::PredicateCall { name });
                 }
                 other => {
                     return Err(SqlSurfaceError::unsupported(format!(
@@ -247,10 +279,12 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        Ok(())
+        Ok(predicates)
     }
 
-    /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。
+    /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。関数呼び出し形は
+    /// 許可された名前（[`is_allowed_order_by_function_name`]）のみを受理し、
+    /// 未知の名前は拒否する。
     fn parse_order_by(&mut self) -> Result<OrderByForm, SqlSurfaceError> {
         let name = self.expect_ident()?;
         match self.peek() {
@@ -260,6 +294,11 @@ impl<'a> Parser<'a> {
                 Ok(OrderByForm::Distance { column: name })
             }
             Some(Token::Punct('(')) => {
+                if !is_allowed_order_by_function_name(&name) {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "unsupported ORDER BY function: {name}"
+                    )));
+                }
                 self.advance();
                 self.parse_arg_list()?;
                 self.expect_punct(')')?;
@@ -382,7 +421,7 @@ impl<'a> Parser<'a> {
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
 struct ParsedShape {
     table_name: String,
-    has_where: bool,
+    where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
 }
@@ -396,12 +435,11 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
-    let has_where = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
         p.advance();
-        p.parse_where()?;
-        true
+        p.parse_where()?
     } else {
-        false
+        Vec::new()
     };
 
     p.expect_keyword(Keyword::Order)?;
@@ -418,7 +456,7 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
 
     Ok(ParsedShape {
         table_name,
-        has_where,
+        where_predicates,
         order_by,
         limit,
     })
@@ -446,7 +484,7 @@ pub fn validate_statement(
     Ok(ValidatedStatement {
         table_name: shape.table_name,
         order_by: shape.order_by,
-        has_where: shape.has_where,
+        where_predicates: shape.where_predicates,
         limit: shape.limit,
     })
 }
@@ -482,18 +520,18 @@ mod tests {
         }
     }
 
-    // --- 受理系（C1〜C4 相当の構造判定通過） -------------------------------
+    // --- 受理系（許可した SQL 表層の構造判定通過） -------------------------
 
     #[test]
-    fn accepts_c1_dense_top_k() {
+    fn accepts_basic_select_with_order_by_distance() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2]' LIMIT 20",
             &lookup,
         )
-        .expect("C1 shape should be accepted");
+        .expect("basic shape should be accepted");
         assert_eq!(stmt.table_name, "documents");
-        assert!(!stmt.has_where);
+        assert!(stmt.where_predicates.is_empty());
         assert_eq!(stmt.limit, 20);
         assert_eq!(
             stmt.order_by,
@@ -504,46 +542,66 @@ mod tests {
     }
 
     #[test]
-    fn accepts_c2_scalar_filtered_top_k() {
+    fn accepts_select_with_where_equality() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents WHERE lang = 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
             &lookup,
         )
-        .expect("C2 shape should be accepted");
-        assert!(stmt.has_where);
+        .expect("WHERE equality shape should be accepted");
+        assert_eq!(
+            stmt.where_predicates,
+            vec![WherePredicate::Equality {
+                column: "lang".to_string()
+            }]
+        );
     }
 
     #[test]
-    fn accepts_c3_rls_predicate_call_form() {
+    fn accepts_select_with_where_predicate_call() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents WHERE visible() ORDER BY embedding <=> '[0.1]' LIMIT 5",
             &lookup,
         )
-        .expect("C3 shape should be accepted");
-        assert!(stmt.has_where);
+        .expect("WHERE predicate-call shape should be accepted");
+        assert_eq!(
+            stmt.where_predicates,
+            vec![WherePredicate::PredicateCall {
+                name: "visible".to_string()
+            }]
+        );
     }
 
     #[test]
-    fn accepts_c3_combined_scalar_and_rls_predicate() {
+    fn accepts_select_with_combined_where_predicates() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents WHERE lang = 'ja' AND visible() ORDER BY embedding <=> '[0.1]' LIMIT 5",
             &lookup,
         )
         .expect("combined WHERE predicates should be accepted");
-        assert!(stmt.has_where);
+        assert_eq!(
+            stmt.where_predicates,
+            vec![
+                WherePredicate::Equality {
+                    column: "lang".to_string()
+                },
+                WherePredicate::PredicateCall {
+                    name: "visible".to_string()
+                },
+            ]
+        );
     }
 
     #[test]
-    fn accepts_c4_hybrid_function_call_form() {
+    fn accepts_select_with_order_by_function_call() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, 'query text') LIMIT 20",
             &lookup,
         )
-        .expect("C4 function-call shape should be accepted");
+        .expect("function-call shape should be accepted");
         assert_eq!(
             stmt.order_by,
             OrderByForm::FunctionCall {
@@ -553,18 +611,32 @@ mod tests {
     }
 
     #[test]
-    fn accepts_c4_hybrid_keyword_form() {
+    fn accepts_select_with_order_by_function_call_alternate_allowed_name() {
         let lookup = catalog_with(&["documents"]);
         let stmt = validate_statement(
             "SELECT * FROM documents ORDER BY HYBRID(embedding, 'query text') LIMIT 20",
             &lookup,
         )
-        .expect("C4 HYBRID(...) shape should be accepted");
+        .expect("alternate allowed function name should be accepted");
         assert_eq!(
             stmt.order_by,
             OrderByForm::FunctionCall {
                 name: "HYBRID".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn rejects_order_by_function_call_with_unknown_name() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY attacker_controlled(embedding) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_where_predicate_call_with_unknown_name() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents WHERE unknown() ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
     }
 
@@ -599,9 +671,8 @@ mod tests {
     fn accepts_hybrid_args_with_nested_paren_group() {
         // 入れ子丸括弧そのもの（identifier に隣接しない、括弧単独のグループ）は
         // depth 0 の 1 値として引き続き許可される。identifier 直後に区切りなしで
-        // `(` が続く形（`foo(...)`）は本来の対象（区切りカンマなしの連結）に
-        // 該当するため、区切り必須のまま拒否側に倒す（このモジュールは関数呼び出しの
-        // ネストを解釈しない設計、TASK-74 計画方針）。
+        // `(` が続く形（`foo(...)`）は区切りカンマなしの連結として拒否側に倒す
+        // （このモジュールは関数呼び出しのネストを解釈しない）。
         let lookup = catalog_with(&["documents"]);
         validate_statement(
             "SELECT * FROM documents ORDER BY hybrid_rrf((embedding), 'q') LIMIT 5",
@@ -760,7 +831,6 @@ mod tests {
 
     #[test]
     fn rejects_dollar_parameter_placeholder_in_order_by() {
-        // `$n` パラメータ形式は MVP では未対応（SQL-1）。
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY embedding <=> $1 LIMIT 5",
         );

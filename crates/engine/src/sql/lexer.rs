@@ -192,11 +192,9 @@ fn advance_to(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>, byte_o
     }
 }
 
-/// `'...'` 文字列リテラルを読む。`''` を単一の `'` へのエスケープとして扱う
-/// （TASK-74 計画のエスケープ規約）。閉じ引用符が見つからない場合は `Err`。
-/// リテラルの内容自体（ベクトル形式・長さ上限）は検証しない
-/// （値レベルの検証は ERR-2 `22000` 管轄・TASK-75 以降の責務。本レイヤは
-/// 文字列として正しく閉じているかのみを構造的に見る）。
+/// `'...'` 文字列リテラルを読む。`''` を単一の `'` へのエスケープとして扱う。
+/// 閉じ引用符が見つからない場合は `Err`。リテラルの内容自体の意味論的妥当性は
+/// 検証しない（本レイヤは文字列として正しく閉じているかのみを構造的に見る）。
 fn lex_string_literal(input: &str, start: usize) -> Result<(String, usize), LexError> {
     let bytes = input.as_bytes();
     // start は呼び出し元で確認済みの `'` の位置。
@@ -337,7 +335,6 @@ mod tests {
 
     #[test]
     fn rejects_dollar_parameter_placeholder() {
-        // `$n` パラメータ形式は MVP では未対応（SQL-1）。未知文字として字句解析段階で拒否する。
         assert!(tokenize("embedding <=> $1").is_err());
     }
 

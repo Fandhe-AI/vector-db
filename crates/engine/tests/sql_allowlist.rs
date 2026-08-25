@@ -50,24 +50,46 @@ fn open_storage_with_documents_table(label: &str) -> (Storage, CleanupGuard) {
 }
 
 #[test]
-fn accepts_c1_against_real_catalog() {
-    let (storage, _guard) = open_storage_with_documents_table("c1");
+fn accepts_basic_select_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("basic-select");
     let stmt = validate_statement(
         "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
         &storage,
     )
-    .expect("C1 shape against a real table must be accepted");
+    .expect("basic shape against a real table must be accepted");
     assert_eq!(stmt.table_name, "documents");
 }
 
 #[test]
-fn accepts_c2_against_real_catalog() {
-    let (storage, _guard) = open_storage_with_documents_table("c2");
+fn accepts_select_with_where_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("where-clause");
     validate_statement(
         "SELECT * FROM documents WHERE lang = 'ja' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
         &storage,
     )
-    .expect("C2 shape against a real table must be accepted");
+    .expect("WHERE clause shape against a real table must be accepted");
+}
+
+#[test]
+fn rejects_order_by_function_call_with_unknown_name_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("unknown-function");
+    let err = validate_statement(
+        "SELECT * FROM documents ORDER BY attacker_controlled(embedding) LIMIT 10",
+        &storage,
+    )
+    .expect_err("unknown ORDER BY function name must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+#[test]
+fn rejects_where_predicate_call_with_unknown_name_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("unknown-predicate");
+    let err = validate_statement(
+        "SELECT * FROM documents WHERE unknown() ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        &storage,
+    )
+    .expect_err("unknown WHERE predicate name must be rejected");
+    assert_eq!(err.wire_code(), "42601");
 }
 
 #[test]
