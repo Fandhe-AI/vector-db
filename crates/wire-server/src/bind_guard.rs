@@ -16,9 +16,15 @@ use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 
 /// 通信路の保護状態。TLS 実装（TASK-72・WIRE-9）導入時にこの enum へ variant を
 /// 追加し、[`GuardedBindAddrs::resolve`] 内の match を exhaustiveness で更新させる
-/// ことで、「TLS を足したらガードの分岐も必ず書く」ことを型で強制する
-/// （`#[non_exhaustive]` は付けない。crate 内 match が漏れなく更新されることが目的）。
+/// ことで、「TLS を足したらガードの分岐も必ず書く」ことを型で強制する。
+///
+/// `#[non_exhaustive]` は crate 内（本 crate 内）の match には影響しない
+/// （`non_exhaustive` が抑制するのは他 crate からの exhaustive match のみ）ため、
+/// 上記の内部強制目的を損なわずに付与できる。本 enum は `pub mod bind_guard` 経由で
+/// crate 外にも公開されており、付けないと将来 variant 追加時に下流クレートの
+/// exhaustive match を破壊しうる（PR #182 レビュー指摘）ため付与する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransportSecurity {
     /// TLS 未構成（cleartext password 認証を平文 TCP で行う）。loopback 限定。
     Cleartext,

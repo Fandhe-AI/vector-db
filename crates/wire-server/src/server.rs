@@ -37,15 +37,41 @@ use crate::bind_guard::{GuardedBindAddrs, TransportSecurity};
 /// 新規コードは `GuardedBindAddrs::resolve` を直接呼ぶこと（TLS 導入時に
 /// `TransportSecurity` へ variant が増えても、本ラッパーは cleartext 固定の
 /// 意味論を変えない）。
+///
+/// 対応: PR #182 レビュー是正。[`crate::bind_guard::BindGuardError`] の
+/// `Display` は新 API 向けに `bind_addr` を含む文脈情報を足しており
+/// （`NonLoopback` に `(from {bind_addr})` 等）、旧 `validate_loopback_bind` /
+/// `bind_loopback` のエラー文言とは異なる。本ラッパーは呼び出し側が診断・
+/// 照合に利用しうる旧文言（`failed to bind {bind_addr} ({addrs:?}): {e}` /
+/// `refusing to bind non-loopback address {addr}: ...`）を `BindGuardError`
+/// の `Display` に委譲せず個別に再現し、公開 API の互換性を保つ。
 #[deprecated(
     since = "0.1.0",
     note = "use crate::bind_guard::GuardedBindAddrs::resolve(..., TransportSecurity::Cleartext) instead"
 )]
 pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
-    GuardedBindAddrs::resolve(bind_addr, TransportSecurity::Cleartext)
-        .map_err(|e| e.to_string())?
+    use crate::bind_guard::BindGuardError;
+
+    let guarded = GuardedBindAddrs::resolve(bind_addr, TransportSecurity::Cleartext).map_err(
+        |e| match e {
+            BindGuardError::Resolve { bind_addr, source } => {
+                format!("cannot resolve bind address {bind_addr}: {source}")
+            }
+            BindGuardError::NoAddress { bind_addr } => {
+                format!("bind address {bind_addr} did not resolve to any socket address")
+            }
+            BindGuardError::NonLoopback { addr, .. } => format!(
+                "refusing to bind non-loopback address {addr}: cleartext password \
+                 authentication is not yet protected by TLS (TASK-72/WIRE-9); \
+                 bind to a loopback address (e.g. 127.0.0.1) or place a trusted TLS \
+                 terminator in front of this listener"
+            ),
+        },
+    )?;
+    let addrs = guarded.addrs().to_vec();
+    guarded
         .bind()
-        .map_err(|e| format!("failed to bind {bind_addr}: {e}"))
+        .map_err(|e| format!("failed to bind {bind_addr} ({addrs:?}): {e}"))
 }
 
 /// 同時接続数の暫定上限（防御的な小さめの定数）。本格的な運用上限の決定・
