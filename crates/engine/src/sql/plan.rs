@@ -106,16 +106,15 @@ pub enum PlanError {
 }
 
 /// [`crate::sql::parser::BoundStatement`] から導出する、`exec.rs` が直接参照する
-/// 実行方針。RLS 安全網は `HINT ORDER` の内容によらず常に `true` 固定とし、
-/// 「安全網を無効化できる `ExecutionPlan` を作れない」ことを型で保証する。
+/// 実行方針。RLS 安全網（[`apply_rls_safety_net`]）は `HINT ORDER` の内容に関わらず
+/// `exec.rs` が無条件に呼び出す契約であり、その適用有無を分岐させる真偽値は
+/// この構造体に持たせない（boolean フィールドを経由させないことで「安全網を
+/// 無効化できる `ExecutionPlan` を作れない」ことを型で保証する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionPlan {
     /// SCALAR 条件を候補構築時（`on_visible_row`）に事前適用するか。
     /// `false` の場合、DISTANCE 段の後に事後フィルタとして適用する。
     pub scalar_prefilter: bool,
-    /// RLS 安全網（[`apply_rls_safety_net`]）を最終結果へ適用するか。
-    /// 常に `true`（`HINT ORDER` で無効化する経路は存在しない）。
-    pub rls_safety_net: bool,
 }
 
 impl ExecutionPlan {
@@ -124,7 +123,6 @@ impl ExecutionPlan {
     pub fn from_evaluation_order(order: EvaluationOrder) -> Self {
         ExecutionPlan {
             scalar_prefilter: order.scalar_before_distance(),
-            rls_safety_net: true,
         }
     }
 }
@@ -265,20 +263,6 @@ mod tests {
     }
 
     // --- ExecutionPlan ---------------------------------------------------------------
-
-    #[test]
-    fn execution_plan_always_enables_rls_safety_net() {
-        use Stage::*;
-        for perm in [
-            [Rls, Scalar, Distance],
-            [Distance, Scalar, Rls],
-            [Distance, Rls, Scalar],
-        ] {
-            let order = EvaluationOrder::try_from_stages(&perm).unwrap();
-            let plan = ExecutionPlan::from_evaluation_order(order);
-            assert!(plan.rls_safety_net, "perm={perm:?}");
-        }
-    }
 
     #[test]
     fn execution_plan_scalar_prefilter_follows_scalar_before_distance() {

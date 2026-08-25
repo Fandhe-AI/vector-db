@@ -260,8 +260,9 @@ pub fn execute_statement(
     bound: &BoundStatement,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // HINT ORDER（未指定なら既定の RLS→SCALAR→DISTANCE）から導出する実行方針。
-    // `scalar_prefilter` のみが分岐点で、`rls_safety_net` は常に `true`
-    // （`ExecutionPlan::from_evaluation_order` のドキュメント参照。TASK-76・SQL-7）。
+    // `scalar_prefilter` のみが分岐点（`ExecutionPlan::from_evaluation_order` の
+    // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
+    // フィールドを持たせず、下記で無条件に呼び出す。
     let plan = ExecutionPlan::from_evaluation_order(bound.evaluation_order);
 
     // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
@@ -531,27 +532,24 @@ pub fn execute_statement(
             .collect()
     };
 
-    // RLS 実行時安全網（RLS-5）。`HINT ORDER` の内容・`plan.rls_safety_net` の値に
-    // 関係なく常に適用する（モジュールドキュメント参照。`plan.rls_safety_net` は
-    // 常に `true` だが、意図の可観測性のため明示的に参照する）。`arena` は候補構築と
-    // 同一スナップショットのテナント・可視性ラベルを保持しているため、`storage` の
-    // 再取得なしに安全網を評価できる。現状は事前フィルタと同じ `arena` から
-    // 再判定するため、この安全網単体で不可視行を追加で落とすことはない
-    // （defense-in-depth。モジュールドキュメント参照）。
-    let hits: Vec<(u64, f64)> = if plan.rls_safety_net {
-        plan::apply_rls_safety_net(
-            hits,
-            |id| {
-                let index = *arena_index_by_id.get(&id)?;
-                let tenant = arena.tenant_id(index)?.to_string();
-                let visibility = arena.visibility(index)?;
-                Some((tenant, visibility))
-            },
-            |tenant, visibility| ctx.is_visible(tenant, visibility),
-        )
-    } else {
-        hits
-    };
+    // RLS 実行時安全網（RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
+    // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
+    // フィールドを持たせておらず（`plan.rs` のドキュメント参照）、呼び出しを
+    // 迂回する経路が型として存在しない。`arena` は候補構築と同一スナップショットの
+    // テナント・可視性ラベルを保持しているため、`storage` の再取得なしに安全網を
+    // 評価できる。現状は事前フィルタと同じ `arena` から再判定するため、この安全網
+    // 単体で不可視行を追加で落とすことはない（defense-in-depth。モジュール
+    // ドキュメント参照）。
+    let hits: Vec<(u64, f64)> = plan::apply_rls_safety_net(
+        hits,
+        |id| {
+            let index = *arena_index_by_id.get(&id)?;
+            let tenant = arena.tenant_id(index)?.to_string();
+            let visibility = arena.visibility(index)?;
+            Some((tenant, visibility))
+        },
+        |tenant, visibility| ctx.is_visible(tenant, visibility),
+    );
 
     // 投影: `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と
     // 同一スナップショットで保持しておいた embedding（`arena`）・デコード済み
