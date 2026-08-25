@@ -18,7 +18,8 @@
 //! 委ねると、provider 実装がそれを無視して不可視行（他テナント行を含む）のベクトル・id を
 //! 読み取る／外部送信することを防げない（AGENTS.md P0「テナント境界の弱体化」）。そのため
 //! `EngineCore::search` は二重の防御を持つ: (1) [`VectorArena::build_filtered`] へ
-//! [`crate::policy::PolicyContext::is_visible`] をそのまま述語として渡し、不可視行を
+//! [`crate::rls::ImplicitRlsHook::predicate`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7）を
+//! 渡し、不可視行を
 //! アリーナ構築時点で確保しない（`arena.rs` のドキュメント参照。以前はアリーナ全行を
 //! 構築してから可視行だけを別バッファへ再確保・全コピーしており、1 検索あたりの
 //! ピークメモリが最大で 2 倍になっていたが、構築時フィルタにより単一確保で完結する。
@@ -52,7 +53,7 @@ use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
-use crate::rls::{PrefilterSnapshot, RlsError};
+use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
@@ -794,7 +795,7 @@ impl VectorCore for EngineCore {
             }
             Err(e) => return Err(CoreError::Catalog(e)),
         };
-        if !ctx.is_visible(&row.tenant_id, row.visibility) {
+        if !ImplicitRlsHook::new(ctx).is_visible(&row.tenant_id, row.visibility) {
             return Err(CoreError::NotFound);
         }
         Ok(row)

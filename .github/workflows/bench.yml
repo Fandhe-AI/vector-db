@@ -5,18 +5,21 @@ name: Bench
 # 独立実行する。private submodule（docs/spec）は取得しない（README「開発環境構築」:
 # ビルド・テストは spec 抜きで成立する方針）。
 #
-# schedule トリガは意図的に外している（workflow_dispatch のみ）。CORE-5（対照エンジン
-# との中央値比較）は対照エンジンクレートの導入承認待ちで未接続であり、
-# `crates/engine/benches/parallel_bench.rs` は既定では CORE-5 を「対象外」として
-# 合否判定から明示的に除外する opt-in 方式にしている（`BENCH_CORE5=1` を注入した
-# 場合のみ「未測定＝判定不能」を fail-closed として反映する。`parallel_bench.rs`
-# 冒頭コメント参照）。対照エンジン接続がまだ完了していない段階での定期実行は
-# 誤検出・運用負担のリスクがあるため、CORE-5 が実測接続され `BENCH_CORE5=1` を
-# 既定で有効化できるようになるまでは手動実行（workflow_dispatch）のみとする。
-# CORE-5 接続後、schedule トリガ（例: `- cron: "0 3 * * 1"` 毎週月曜 03:00 UTC。
-# CI 混雑を避けるため PR/push トリガーとは独立した時間帯にする）を再度追加すること。
+# schedule トリガ（毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
+# 独立した時間帯にする）は #168 で再追加済み。BENCH_MAX_P95_MS・BENCH_MIN_RECALL・
+# BENCH_BATCH_MAX_DEGRADATION_PCT の repo variables 未設定のまま schedule 実行された
+# 場合は `parallel_bench.rs` / `batch_bench.rs` 側の fail-closed により run が red に
+# なる（「一度も評価していない run」が green として埋もれることはない）。CORE-5
+# （対照エンジンとの中央値比較）は対照エンジンクレートの導入承認待ちで未接続のため
+# 引き続き Issue #176 で追跡し、`BENCH_CORE5` repo variable が未設定（既定）の間は
+# 「対象外」として合否判定から明示的に除外する opt-in 方式を維持する（`parallel_bench.rs`
+# 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）も
+# 実 GPU バックエンド未接続のため Issue #178 で追跡し、同様に opt-in のまま維持する
+# （`batch_bench.rs` 冒頭コメント参照）。
 on:
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
@@ -54,9 +57,9 @@ jobs:
         # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
         # BENCH_MIN_RECALL が未設定の場合は `parallel_bench.rs` 側が fail-closed で
         # 非ゼロ終了する。BENCH_CORE5 は repo variable が未設定（既定）なら CORE-5 を
-        # 対象外として扱う opt-in フラグで、CORE-5 接続後にリポジトリ管理者が
-        # `gh variable set BENCH_CORE5 1` で有効化する想定（`parallel_bench.rs` 冒頭
-        # コメント参照）。
+        # 対象外として扱う opt-in フラグで、CORE-5 接続後（Issue #176）にリポジトリ
+        # 管理者が `gh variable set BENCH_CORE5 1` で有効化する想定（`parallel_bench.rs`
+        # 冒頭コメント参照）。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
@@ -68,9 +71,9 @@ jobs:
   # --------------------------------------------------
   # CORE-7（動的窓の劣化上限）はアクティブなゲートとして実測する。CORE-6（GPU vs
   # CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため
-  # opt-in fail-closed で扱う（`batch_bench.rs` 冒頭コメント参照）。bench-parallel
-  # ジョブと同様、schedule トリガは意図的に外している（実 GPU 接続まで
-  # workflow_dispatch のみ）。
+  # opt-in fail-closed で扱う（`batch_bench.rs` 冒頭コメント参照。Issue #178 で
+  # 追跡）。bench-parallel ジョブと同様、schedule / workflow_dispatch の両方で
+  # 実行する（#168）。
   bench-batch:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -86,9 +89,9 @@ jobs:
         # ハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する。
         # BENCH_BATCH_MAX_DEGRADATION_PCT が未設定の場合は `batch_bench.rs` 側が
         # fail-closed で非ゼロ終了する。BENCH_CORE6/BENCH_CORE16 は repo variable が
-        # 未設定（既定）なら対象外として扱う opt-in フラグで、実 GPU 接続後に
-        # リポジトリ管理者が `gh variable set BENCH_CORE6 1` 等で有効化する想定
-        # （`batch_bench.rs` 冒頭コメント参照）。
+        # 未設定（既定）なら対象外として扱う opt-in フラグで、実 GPU 接続後（Issue
+        # #178）にリポジトリ管理者が `gh variable set BENCH_CORE6 1` 等で有効化する
+        # 想定（`batch_bench.rs` 冒頭コメント参照）。
         env:
           BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ vars.BENCH_BATCH_MAX_DEGRADATION_PCT }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}

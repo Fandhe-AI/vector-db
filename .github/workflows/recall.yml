@@ -14,16 +14,14 @@ name: Recall
 # 同一 job（`recall-regression`）・同一 environment（`recall-gate`）から実行する
 # （検証設計・実測経緯は `docs/design/rerank-recall-regression.md` 参照）。
 #
-# `schedule` トリガは意図的に外している（`workflow_dispatch` のみ。`bench.yml` の
-# `BENCH_CORE5` 未接続時と同型の判断。PR #147 codex-review P1 継続指摘対応）。
-# `HYBRID_RECALL_MIN_*` を environment `recall-gate` の variables として設定・
-# strict モード（下記）が正しく機能することを確認できるまでは、無人で定期実行される
-# `schedule` を有効にしない——environment 未作成・variable 名の誤り・variable の
-# 誤削除で閾値が読めなくなった場合、strict モード導入前は「一度も評価していない run」
-# と「基準を満たした run」が同じ green として埋もれてしまうため。environment
-# `recall-gate` の variables 設定・strict モードでの手動実行（`workflow_dispatch`）
-# による疎通確認が済んだら、`- cron: "0 4 * * 1"`（毎週月曜 04:00 UTC。`bench.yml`
-# 想定の 03:00 UTC 帯と重ならないようずらす）で `schedule` を再度追加すること
+# `schedule` トリガ（毎週月曜 04:00 UTC。`bench.yml`（03:00 UTC）と重ならないよう
+# ずらす）は #168 で再追加済み。`schedule` は default branch（main）の workflow
+# 定義・最新 commit のみを実行するため `github.ref` は常に `refs/heads/main` に
+# なり、下記の `if: github.ref == 'refs/heads/main'`・`checkout ref: main`・
+# environment `recall-gate` の保護がそのまま有効に働く。`HYBRID_RECALL_MIN_*` /
+# `RERANK_RECALL_MIN_*`（下記 strict モード参照）が environment `recall-gate` に
+# 未設定のまま schedule 実行された場合は fail-closed で run が red になり、
+# 「一度も評価していない run」が green として埋もれることはない
 # （README「Recall 回帰ハーネスの repo variables」参照）。
 #
 # `pull_request` トリガは意図的に設定しない（PR #147 codex-review P0 指摘で追加後に
@@ -32,8 +30,8 @@ name: Recall
 # `HYBRID_RECALL_MIN_*`（spec 由来の非公開閾値）を標準出力へ書き出すだけで public
 # Actions ログから spec の数値基準を取得できてしまう
 # ——`.claude/rules/spec-confidentiality.md` の P0 違反。層 B（spec 閾値ゲート）は
-# 既定ブランチの trusted なコードのみが走る `workflow_dispatch`（手動。将来的には
-# `schedule` も）に限定する。PR のマージ判定は層 A（`crates/engine/tests/
+# 既定ブランチの trusted なコードのみが走る `workflow_dispatch`（手動）・`schedule`
+# （週次自動。#168 で再追加済み）に限定する。PR のマージ判定は層 A（`crates/engine/tests/
 # hybrid_recall.rs` の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
 # `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
 # 役割分担にする（README「Recall 回帰ハーネスの repo variables」・
@@ -79,6 +77,8 @@ name: Recall
 # PR #147 codex-review P1 継続指摘対応）。
 on:
   workflow_dispatch: {}
+  schedule:
+    - cron: "0 4 * * 1"
 
 permissions:
   contents: read
