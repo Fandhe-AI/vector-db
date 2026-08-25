@@ -1,15 +1,18 @@
 //! `EngineCore::execute_insert_sql` の結合テスト（TASK-80、対象ビヘイビア: SQL-10。
 //! ポインタ: `docs/spec/05-tasks.md` TASK-80・`docs/spec/04-behavior/sql-surface.md`・
-//! `docs/spec/04-behavior/recovery.md` RECOVER-1）。
+//! `docs/spec/04-behavior/recovery.md` RECOVER-1・`data-model.md` TABLE-12・
+//! `rls.md` RLS-9）。
 //!
-//! `tests/sql_surface.rs`・`tests/sql_allowlist.rs` と同じ流儀（`unique_db_path` /
-//! `CleanupGuard`、実 `Storage` 上にテーブルを構築）で、`INSERT ... USING
-//! OPERATION_ID '<id>'` の受理・文末専用句の省略拒否・statement 単位スコープを
-//! 検証する。台帳系（同一 `operation_id` の再送拒否 `23505`・内容不一致 `22023`）は
-//! 本タスクの管轄外（TASK-93・TASK-94・TASK-101 が後続で扱う）。
-
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+//! 実 `Storage` 上にテーブルを構築し、`INSERT ... USING OPERATION_ID '<id>'` の
+//! 受理・文末専用句の省略拒否・statement 単位スコープ・行 `id` 衝突の扱いを検証する。
+//!
+//! 行 `id` 衝突（`23505`）は **同一テナントの名前空間内**でのみ発生する（行ストアの
+//! 物理キーが `(tenant_id, id)` のため。TABLE-12・RLS-9）。他テナントの行 `id` の
+//! 有無で応答が変化しないことを、本体の判定 API に依存しないテスト側オラクル
+//! （期待値のベタ書き）で確認する。
+//!
+//! 台帳系（同一 `operation_id` の内容不一致 `22023`・台帳への永続化）は本タスクの
+//! 管轄外（TASK-93・TASK-94・TASK-101 が後続で扱う）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -17,24 +20,10 @@ use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::storage::{Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-sql-operation-id-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出しは共通ヘルパへ委譲する（Issue #173）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
     let storage = Storage::open(path).expect("open storage");
@@ -174,30 +163,32 @@ fn operation_id_clause_does_not_carry_over_to_the_next_statement() {
     assert_eq!(err.wire_code(), "23502");
 }
 
-// --- 既存 id への INSERT は上書きせず拒否（22000） ------------------------------
+// --- 行 id 衝突は同一テナント内スコープ（TABLE-12・RLS-9・SQL-10） ---------------
+
+/// 3 列すべてを指定する INSERT 文を組み立てる（テスト側の期待値を明示するため、
+/// SQL 文字列は各テストで直接読める形に保つ）。
+fn insert_sql(id: u64, body: &str, operation_id: &str) -> String {
+    format!(
+        "INSERT INTO documents (id, embedding, body) VALUES ({id}, '[0.1,0.2,0.3]', '{body}') USING OPERATION_ID '{operation_id}'"
+    )
+}
 
 #[test]
-fn insert_into_existing_id_is_rejected_without_overwriting() {
+fn insert_into_existing_id_of_same_tenant_is_rejected_with_23505_without_overwriting() {
     let path = unique_db_path("insert-existing-id");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);
     let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-    core.execute_insert_sql(
-        &write_ctx,
-        "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID 'op-0001'",
-    )
-    .expect("first insert should succeed");
+    core.execute_insert_sql(&write_ctx, &insert_sql(1, "hello", "op-0001"))
+        .expect("first insert should succeed");
 
     let err = core
-        .execute_insert_sql(
-            &write_ctx,
-            "INSERT INTO documents (id, embedding, body) VALUES (1, '[9.0,9.0,9.0]', 'overwrite') USING OPERATION_ID 'op-0002'",
-        )
-        .expect_err("insert into existing id must be rejected");
-    assert_eq!(err.wire_code(), "22000");
+        .execute_insert_sql(&write_ctx, &insert_sql(1, "overwrite", "op-0002"))
+        .expect_err("insert into an existing id of the same tenant must be rejected");
+    assert_eq!(err.wire_code(), "23505");
 
-    // 元の値のまま(上書きされていない)ことを読み戻しで確認する。
+    // 元の値のまま（上書きされていない）ことを読み戻しで確認する。
     let read_ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
@@ -208,6 +199,134 @@ fn insert_into_existing_id_is_rejected_without_overwriting() {
         )
         .expect("select should succeed");
     assert_eq!(result.rows.len(), 1);
+}
+
+#[test]
+fn insert_succeeds_when_only_another_tenant_holds_the_same_id() {
+    // TABLE-12・RLS-9: 行 `id` の一意性はテナント内スコープ。他テナントが同じ `id` を
+    // 保持していても、自テナントの INSERT は通常どおり成功する。
+    let path = unique_db_path("insert-cross-tenant-same-id");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+
+    let tenant_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let tenant_b = PolicyContext::new("tenant-b").expect("valid tenant");
+
+    core.execute_insert_sql(&tenant_a, &insert_sql(1, "owned-by-a", "op-a-0001"))
+        .expect("tenant-a insert should succeed");
+    let outcome = core
+        .execute_insert_sql(&tenant_b, &insert_sql(1, "owned-by-b", "op-b-0001"))
+        .expect("tenant-b insert of the same id must succeed (per-tenant id namespace)");
+    assert_eq!(outcome.rows_affected, 1);
+
+    // 双方の行が独立して残っている（後勝ちの上書きが起きていない）。
+    for (ctx, expected_body) in [(&tenant_a, "owned-by-a"), (&tenant_b, "owned-by-b")] {
+        let read_ctx = PolicyContext::with_visibilities(
+            ctx.tenant_id(),
+            [Visibility::Public, Visibility::Private],
+        )
+        .expect("valid tenant");
+        let result = core
+            .execute_sql(
+                &read_ctx,
+                "SELECT id, body FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+            )
+            .expect("select should succeed");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows.first().map(|r| r.cells.len()),
+            Some(2),
+            "projection must yield id and body"
+        );
+        let body = match result.rows.first().and_then(|r| r.cells.get(1)) {
+            Some(engine::sql::exec::Cell::Text(t)) => t.clone(),
+            other => panic!("unexpected cell: {other:?}"),
+        };
+        assert_eq!(body, expected_body);
+    }
+}
+
+#[test]
+fn insert_response_is_identical_regardless_of_other_tenant_rows() {
+    // 他テナント行の有無が INSERT 応答（成否・`rows_affected`）に一切影響しないことを
+    // 確認する（存在オラクルの遮断。security.md P0）。DB を 2 つ用意し、片方にだけ
+    // 他テナントの同一 `id` 行を先に入れる。
+    let path_with = unique_db_path("insert-oracle-with-other-tenant");
+    let _guard_with = CleanupGuard(path_with.clone());
+    let path_without = unique_db_path("insert-oracle-without-other-tenant");
+    let _guard_without = CleanupGuard(path_without.clone());
+
+    let core_with = new_core_with_documents_table(&path_with);
+    let core_without = new_core_with_documents_table(&path_without);
+
+    let tenant_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    core_with
+        .execute_insert_sql(&tenant_b, &insert_sql(1, "owned-by-b", "op-b-0001"))
+        .expect("seeding another tenant's row should succeed");
+
+    let tenant_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sql = insert_sql(1, "hello", "op-a-0001");
+    let with = core_with.execute_insert_sql(&tenant_a, &sql);
+    let without = core_without.execute_insert_sql(&tenant_a, &sql);
+
+    let with = with.expect("insert must succeed even if another tenant holds the same id");
+    let without = without.expect("insert must succeed when the id is unused");
+    assert_eq!(with.rows_affected, without.rows_affected);
+    assert_eq!(with.rows_affected, 1);
+}
+
+#[test]
+fn error_response_of_same_tenant_conflict_is_identical_regardless_of_other_tenant_rows() {
+    // 衝突（`23505`）側の応答も、他テナント行の有無で `wire_code`・文言が変化しない。
+    let path_with = unique_db_path("conflict-oracle-with-other-tenant");
+    let _guard_with = CleanupGuard(path_with.clone());
+    let path_without = unique_db_path("conflict-oracle-without-other-tenant");
+    let _guard_without = CleanupGuard(path_without.clone());
+
+    let core_with = new_core_with_documents_table(&path_with);
+    let core_without = new_core_with_documents_table(&path_without);
+
+    let tenant_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    let tenant_b = PolicyContext::new("tenant-b").expect("valid tenant");
+    for core in [&core_with, &core_without] {
+        core.execute_insert_sql(&tenant_a, &insert_sql(1, "hello", "op-a-0001"))
+            .expect("first insert should succeed");
+    }
+    core_with
+        .execute_insert_sql(&tenant_b, &insert_sql(1, "owned-by-b", "op-b-0001"))
+        .expect("seeding another tenant's row should succeed");
+
+    let sql = insert_sql(1, "hello", "op-a-0002");
+    let err_with = core_with
+        .execute_insert_sql(&tenant_a, &sql)
+        .expect_err("duplicate id in the same tenant must be rejected");
+    let err_without = core_without
+        .execute_insert_sql(&tenant_a, &sql)
+        .expect_err("duplicate id in the same tenant must be rejected");
+
+    assert_eq!(err_with.wire_code(), "23505");
+    assert_eq!(err_with.wire_code(), err_without.wire_code());
+    assert_eq!(err_with.to_string(), err_without.to_string());
+}
+
+#[test]
+fn resending_the_same_operation_id_statement_is_rejected_with_23505() {
+    // SQL-10 の再送判定: 同一 `operation_id` を持つ同一文を再送すると、行 `id` の
+    // 重複により `23505` が返る。呼び出し元（wire 層・クライアント）はこれを
+    // 「先行実行が commit 済み」と解釈できる。判定が成立するのは同一テナント内
+    // スコープに限られる（他テナントの同一 `id` は別キーのため衝突しない。TABLE-12）。
+    let path = unique_db_path("insert-resend");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let sql = insert_sql(1, "hello", "op-0001");
+    core.execute_insert_sql(&ctx, &sql)
+        .expect("first execution should commit");
+    let err = core
+        .execute_insert_sql(&ctx, &sql)
+        .expect_err("resend must be rejected as already committed");
+    assert_eq!(err.wire_code(), "23505");
 }
 
 // --- 他テナントからは不可視（Private 固定の RLS 効果） ---------------------------

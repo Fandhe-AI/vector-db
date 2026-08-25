@@ -16,8 +16,9 @@
 //! サブコマンド:
 //! - `write <db_path>`: `BATCH` 件の行 put + `log_batch` を 1 トランザクションで
 //!   コミットし続ける。`COMMITTED batch=<seq> rows=<total>` を stdout へ出力する
-//!   （`scripts/crash_test_cross_table.sh` の開始同期点）。再起動時は `scan_page`・
-//!   `scan_batch_log` から採番（行 ID・バッチ通番）を再開する。
+//!   （`scripts/crash_test_cross_table.sh` の開始同期点）。再起動時は `scan_page`（行 ID）・
+//!   `batch_log_max_seq`（バッチ通番。Issue #132 で `scan_batch_log` 全件走査から
+//!   移行。台帳件数の上限に依存せず再開できる）から採番を再開する。
 //! - `verify <db_path>`: 行 ID の 0 起点連続性・内容一致（行）、`batch_seq` の
 //!   0 起点連続性（台帳）、さらに「台帳の row_count 合計 == 行総数」（テーブル間整合）と
 //!   「行総数が BATCH の倍数」（バッチ整合）を検証する。結果を
@@ -26,7 +27,7 @@
 
 use std::io::Write as _;
 
-use engine::storage::{RowInput, Storage, Visibility};
+use engine::storage::{RowInput, Storage, StorageError, Visibility};
 
 /// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が
 /// 目的で、RLS ポリシー評価そのものは対象外。TASK-142・PERSIST-1 のクラッシュ耐性
@@ -112,8 +113,11 @@ struct ResumeState {
     next_batch_seq: u64,
 }
 
-/// `scan_page`（行テーブル）・`scan_batch_log`（バッチ台帳）の両方から採番を再開する
-/// （クラッシュ → 再起動 → 再クラッシュを反復するために必要）。
+/// `scan_page`（行テーブル）・`batch_log_max_seq`（バッチ台帳）の両方から採番を再開する
+/// （クラッシュ → 再起動 → 再クラッシュを反復するために必要）。バッチ台帳側は
+/// `scan_batch_log` の全件走査ではなく `batch_log_max_seq`（redb の B-tree 末尾キー
+/// 取得のみ・O(log n)）を使うため、台帳件数が `MAX_BATCH_LOG_ROWS` を超えても
+/// 再開経路自体は上限に依存しない（Issue #132）。
 fn find_resume_state(storage: &Storage) -> Result<ResumeState, String> {
     let mut cursor: Option<u64> = None;
     let mut last_row_id: Option<u64> = None;
@@ -136,20 +140,15 @@ fn find_resume_state(storage: &Storage) -> Result<ResumeState, String> {
         None => 0,
     };
 
-    let batch_log = storage
-        .scan_batch_log()
-        .map_err(|e| format!("scan_batch_log failed: {e}"))?;
-    let next_batch_seq = batch_log
-        .iter()
-        .map(|(seq, _)| *seq)
-        .max()
-        .map(|max_seq| {
-            max_seq
-                .checked_add(1)
-                .ok_or_else(|| "batch seq overflow while resuming".to_string())
-        })
-        .transpose()?
-        .unwrap_or(0);
+    let next_batch_seq = match storage
+        .batch_log_max_seq()
+        .map_err(|e| format!("batch_log_max_seq failed: {e}"))?
+    {
+        Some(max_seq) => max_seq
+            .checked_add(1)
+            .ok_or_else(|| "batch seq overflow while resuming".to_string())?,
+        None => 0,
+    };
 
     Ok(ResumeState {
         next_row_id,
@@ -282,9 +281,25 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     }
 
     // バッチ台帳側: batch_seq の 0 起点連続性・row_count 合計。
-    let mut batch_log = storage
-        .scan_batch_log()
-        .map_err(|e| format!("scan_batch_log failed: {e}"))?;
+    //
+    // `StorageError::ScanLimitExceeded` の `Display` はそのまま使わない（Issue #131・
+    // PR #193 codex レビュー再指摘対応）: 固定文言 `"scan limit exceeded: use scan_page"`
+    // は `Storage::scan` 専用の代替 API 案内であり、台帳（`scan_batch_log`。ページング API
+    // を持たない）には当てはまらない。加えて台帳エントリ数を削減する compact/rotate 相当の
+    // API・運用手順も本リポには存在しない（通常の compaction は論理エントリ数を減らさず、
+    // rotation で台帳を捨てれば検証対象そのものを失うため、いずれも実行可能な代替手段では
+    // ない: PR #193 codex レビュー再指摘対応）。実行不能な手段を示唆せず、「このツールでは
+    // 上限を超えた台帳を検証できない」という事実のみを明示する
+    // （`storage.rs::Storage::scan_batch_log` のドキュメンテーションコメント参照）。
+    let mut batch_log = storage.scan_batch_log().map_err(|e| match e {
+        StorageError::ScanLimitExceeded => {
+            "scan_batch_log failed: batch log exceeds the scan limit of this tool; \
+             cross-table verification cannot be performed on this ledger \
+             (no paginated ledger API is available yet)"
+                .to_string()
+        }
+        other => format!("scan_batch_log failed: {other}"),
+    })?;
     batch_log.sort_by_key(|(seq, _)| *seq);
     let mut expected_seq: u64 = 0;
     let mut total_from_log: u64 = 0;

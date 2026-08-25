@@ -597,8 +597,9 @@ fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
 }
 
 /// `RERANK_RECALL_REQUIRE_THRESHOLDS` 環境変数（`"1"` のときのみ true）。
-/// `.github/workflows/recall.yml` の `workflow_dispatch` 実行時のみ注入される
-/// strict モードフラグ（`hybrid_recall.rs::strict_thresholds_required` と同型）。
+/// `.github/workflows/recall.yml` からの実行（dispatch / schedule）時のみ
+/// 注入される strict モードフラグ（`hybrid_recall.rs::strict_thresholds_required`
+/// と同型）。
 fn strict_thresholds_required() -> bool {
     std::env::var("RERANK_RECALL_REQUIRE_THRESHOLDS")
         .map(|v| v.trim() == "1")

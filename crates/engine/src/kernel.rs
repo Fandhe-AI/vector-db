@@ -16,14 +16,61 @@
 
 use std::fmt;
 
-/// 検索結果 1 件（行 ID とスコア）。
+/// **候補**検索結果 1 件（候補識別子とスコア）。[`SearchProvider`] の戻り値型。
+///
+/// `id` は行 `id` とは限らない「呼び出し元が定義した候補識別子」で、[`SearchInput::ids`]
+/// に渡された値がそのまま返る（詳細は同フィールドのドキュメント参照）。行 `id` の
+/// 一意性スコープはテナント内に閉じている（対象ビヘイビア: TABLE-12）ため、
+/// 呼び出し元（`core.rs`・`sql/exec.rs`）は候補集合内で一意なスロット番号を渡し、
+/// 行の同定（テナント・行 id への解決）は provider の外側で行う。
+///
+/// 公開 API（[`crate::core::VectorCore::search`]・`rls.rs` の各 `search`）が返すのは
+/// テナント修飾済みの [`SearchHit`] であり、本型は provider 境界のみで使う。
+/// `Copy` を維持するのは、`TopKSelector::push` が候補行ごと（最大で可視行数分＝
+/// 検索 1 回あたり最大 `arena::MAX_ARENA_ROWS` 回）呼ばれるホットパスであり、
+/// ヒープ確保を伴うフィールドを持たせられないため。
 ///
 /// スコアは内積（dot product）で定義する（`arena.rs` の既存テストが検証基準に
 /// 使っている尺度と揃える）。値が大きいほど上位。
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SearchHit {
+pub struct CandidateHit {
     pub id: u64,
     pub score: f32,
+}
+
+/// 検索結果 1 件（**行を一意に解決できる**テナント修飾済みのヒット）。
+///
+/// 対象ビヘイビア: TABLE-12・RLS-9（ポインタ: `docs/spec/04-behavior/data-model.md`
+/// TABLE-12・`rls.md` RLS-9）。行 `id` の一意性スコープはテナント内に閉じているため、
+/// `id` 単独では行を一意に指せない（自テナント行と他テナントの `Public` 行が同じ `id`
+/// を持ちうる）。本型は所有テナントを併せて公開し、`(tenant_id, id)` で
+/// [`crate::core::VectorCore::get_row`] から実際の行へ解決できる契約とする
+/// （codex-review P1 指摘・PR #194 対応）。
+///
+/// `tenant_id` は「そのヒットの行が属するテナント」であり、検索した
+/// `PolicyContext` のテナントとは限らない（他テナントの `Public` 行が可視な場合）。
+/// 本型が生成されるのは呼び出し元が可視性判定（`PolicyContext::is_visible`）を
+/// 通した行だけであり、不可視行のテナント名が本型経由で漏れることはない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    /// ヒットした行が属するテナント（サーバー側で保持している行の帰属）。
+    pub tenant_id: String,
+    /// ヒットした行の `id`（テナント内で一意。TABLE-12）。
+    pub id: u64,
+    /// 内積スコア。値が大きいほど上位。
+    pub score: f32,
+}
+
+impl SearchHit {
+    /// テナント修飾済みヒットを構築する（呼び出し元は候補スロット →
+    /// `(tenant_id, id)` の解決を済ませてから呼ぶ）。
+    pub fn new(tenant_id: impl Into<String>, id: u64, score: f32) -> Self {
+        SearchHit {
+            tenant_id: tenant_id.into(),
+            id,
+            score,
+        }
+    }
 }
 
 /// [`SearchProvider::search`] が返すエラー。
@@ -71,6 +118,14 @@ impl std::error::Error for KernelError {}
 /// あった（他テナントのデータをそもそも provider のアドレス空間へ渡さない、という
 /// より強い境界に変更した）。
 pub struct SearchInput<'a> {
+    /// `vectors` の行と 1 対 1 に対応する識別子。**呼び出し元が定義する識別子**であり、
+    /// 行 `id` とは限らない（provider は値の意味を解釈せず、そのまま
+    /// [`CandidateHit::id`] として返す）。行 `id` の一意性スコープはテナント内に閉じている
+    /// （対象ビヘイビア: TABLE-12）ため、同一 `id` の可視行が複数含まれうる文脈では
+    /// 呼び出し元が一意な識別子を渡す責務を負う: SQL 表層（`sql::exec`）は候補アリーナの
+    /// スロット番号を渡し（投影・RRF 融合・疎コーパスの結合キーを一意にするため）、
+    /// `core::EngineCore::search` は行 `id` をそのまま渡す（結果を id で返す契約のため。
+    /// 重複しうることは `VectorCore::search` のドキュメント参照）。
     pub ids: &'a [u64],
     /// `ids.len() * dim` 要素のフラット化済みベクトル（行 i の embedding は
     /// `vectors[i * dim .. (i + 1) * dim]`）。可視行のみを含む（上記構造体ドキュメント
@@ -87,17 +142,19 @@ pub struct SearchInput<'a> {
 pub trait SearchProvider: Send + Sync {
     /// `input` に含まれる行（呼び出し元があらかじめ可視行だけへ絞り込み済み）から
     /// 総当たり Top-k 検索を行う。
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError>;
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError>;
 }
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
-/// による部分ソート）。単一スレッド・スカラー演算のみで、ベクトル化・並列化された
+/// による部分ソート）を単一スレッドで行う。内積カーネル自体は `isa.rs`
+/// （TASK-156・CORE-14）の実行時検出結果に従う（`dot` 参照。対応 CPU では SIMD、
+/// 非対応環境ではスカラー逐次和）。スレッド並列化された
 /// [`crate::parallel_search::ParallelSearchProvider`]（TASK-126）の正解値検証用の参照実装も兼ねる。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuScalarProvider;
 
 impl SearchProvider for CpuScalarProvider {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         let dim = input.dim as usize;
         if input.query.len() != dim {
             return Err(KernelError::DimMismatch {
@@ -136,20 +193,24 @@ impl SearchProvider for CpuScalarProvider {
                 // 正当な上位ヒットを押し出しかねない。fail-closed に当該行を除外する。
                 continue;
             }
-            selector.push(SearchHit { id, score });
+            selector.push(CandidateHit { id, score });
         }
         Ok(selector.into_sorted_vec())
     }
 }
 
-/// 内積（dot product）のスカラー参照実装（左から右への逐次和）。
+/// 内積（dot product）。実体は `isa.rs::current().dot`（TASK-156・CORE-14）へ
+/// 委譲し、実行時検出された ISA（AVX2+FMA・AVX-512・NEON。非対応環境では
+/// `isa::dot_scalar` と同じ左から右への逐次和）を使う。
 ///
-/// `parallel_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
-/// 指摘対応: 加算順序を分岐させると `ParallelSearchProvider` と本 provider の Top-k
-/// 集合・順序が丸め誤差で食い違い得るため、`pub(crate)` にして共有し、
-/// 単一の加算順序であることを構造的に保証する）。
+/// `parallel_search.rs::search_range`・`batch_search.rs`・`rls.rs` からも同一関数
+/// として呼ばれる（Issue #34 レビュー指摘対応: 加算順序を分岐させると
+/// `ParallelSearchProvider` 等と本 provider の Top-k 集合・順序が丸め誤差で
+/// 食い違い得るため、`pub(crate)` にして共有し、単一のカーネル・単一の加算順序で
+/// あることを構造的に保証する。ISA 検出はプロセス内で単調なため、実行中に加算順序が
+/// 変わることはない）。
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    crate::isa::current().dot(a, b)
 }
 
 /// ヒープ内の同点タイブレーク規約（Low 指摘対応）: スコアが同じ場合は id が小さい方を
@@ -157,7 +218,7 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// id 昇順で安定させるのと選出段の基準を揃え、ヒープ挿入順・入力順に依存しない決定的な
 /// 選出にする）。`f32` は全順序を持たないため `total_cmp` を使う。ただし非有限スコアは
 /// [`TopKSelector::push`] が事前に弾くため、ここで比較する値は常に有限値になる。
-struct MinHeapItem(SearchHit);
+struct MinHeapItem(CandidateHit);
 impl PartialEq for MinHeapItem {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == std::cmp::Ordering::Equal
@@ -224,7 +285,7 @@ impl TopKSelector {
 
     /// 候補 1 件を選出器へ投入する。非有限スコア（NaN/Inf）は fail-closed に無視する
     /// （呼び出し元が事前に除外している場合でも、二重の安全網として機能する）。
-    pub(crate) fn push(&mut self, hit: SearchHit) {
+    pub(crate) fn push(&mut self, hit: CandidateHit) {
         if self.k == 0 || !hit.score.is_finite() {
             return;
         }
@@ -239,9 +300,10 @@ impl TopKSelector {
         }
     }
 
-    /// 選出結果をスコア降順（同点は id 昇順）で確定して返す。
-    pub(crate) fn into_sorted_vec(self) -> Vec<SearchHit> {
-        let mut out: Vec<SearchHit> = self
+    /// 選出結果をスコア降順（同点は候補識別子 [`CandidateHit::id`] の昇順）で確定して返す
+    /// （`docs/design/rrf-tie-break-determinism.md` の順序契約）。
+    pub(crate) fn into_sorted_vec(self) -> Vec<CandidateHit> {
+        let mut out: Vec<CandidateHit> = self
             .heap
             .into_iter()
             .map(|std::cmp::Reverse(item)| item.0)
@@ -280,8 +342,8 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                SearchHit { id: 4, score: 3.0 },
-                SearchHit { id: 2, score: 2.0 }
+                CandidateHit { id: 4, score: 3.0 },
+                CandidateHit { id: 2, score: 2.0 }
             ]
         );
     }
@@ -324,8 +386,8 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                SearchHit { id: 3, score: 2.0 },
-                SearchHit { id: 1, score: 1.0 }
+                CandidateHit { id: 3, score: 2.0 },
+                CandidateHit { id: 1, score: 1.0 }
             ]
         );
     }
@@ -345,7 +407,36 @@ mod tests {
             k: 1,
         };
         let hits = CpuScalarProvider.search(input).expect("search ok");
-        assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
+        assert_eq!(hits, vec![CandidateHit { id: 1, score: 1.0 }]);
+    }
+
+    // TASK-84（対応 Issue #61）: PoC-10 が指摘した「同点タイブレーク欠如による
+    // 非決定性」の回帰テスト。`tied_scores_prefer_smaller_id_at_selection_boundary`
+    // は k=1（単一勝者）のみを検証するため、本テストは k>1 で複数件が採用される
+    // 場合の順序全体（id 昇順）を検証する。挿入順は id 降順（シャッフル相当）で
+    // 与え、`push` の走査順に依存せず結果が id 昇順になることを確認する。
+    #[test]
+    fn tied_scores_are_ordered_by_id_ascending_when_multiple_survive() {
+        let ids = [5u64, 4, 3, 2, 1];
+        // 5 行とも同スコア（内積はすべて 1.0）。
+        let vectors = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let query = [1.0, 0.0];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query,
+            k: 3,
+        };
+        let hits = CpuScalarProvider.search(input).expect("search ok");
+        assert_eq!(
+            hits,
+            vec![
+                CandidateHit { id: 1, score: 1.0 },
+                CandidateHit { id: 2, score: 1.0 },
+                CandidateHit { id: 3, score: 1.0 },
+            ]
+        );
     }
 
     #[test]

@@ -6,8 +6,6 @@
 //! テナント境界の混入 0 件（TABLE-11）と可視性判定（TABLE-9）を検証する。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
@@ -47,25 +45,18 @@ impl Xorshift64 {
 }
 
 // ---------- テスト共通のセットアップ ----------
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-tenant-isolation-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
 
 const DIM: u32 = 8;
 const TABLE: &str = "docs";
@@ -126,9 +117,7 @@ fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) -> Vec<RowMet
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(TABLE, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, TABLE, &rows);
     metas
 }
 
@@ -205,7 +194,9 @@ fn table11_zero_cross_tenant_leakage_across_200_trials_via_both_search_paths() {
             }
 
             // 独立検証 2: `tenant.rs::verify_hits`（本タスクの統合層自体の検証を兼ねる）。
-            tenant::verify_hits(&storage, TABLE, ctx, &hit_ids)
+            // 照合は `(tenant_id, id)` の完全な行キーで行う（TABLE-12・RLS-9。
+            // `hits` はテナント修飾済み）。
+            tenant::verify_hits(&storage, TABLE, ctx, &hits)
                 .expect("tenant::verify_hits must accept PrefilterIndex hits");
         }
         // `indices` はここで drop され、`storage` の借用が終わる（次フェーズで

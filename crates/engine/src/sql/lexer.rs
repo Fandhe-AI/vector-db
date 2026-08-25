@@ -13,6 +13,15 @@
 /// 許可リストの文法が直接必要とする最小集合だけを [`Token::Keyword`] として
 /// 区別する。それ以外の英字トークンはすべて [`Token::Ident`] として扱い、
 /// 文法（許可リスト側）がこれらを期待しない位置に置くことで構造的に拒否させる。
+///
+/// `USING`・`SET`（TASK-161・SQL-12）は本レイヤでは予約語化しない。カタログ上は
+/// 有効な識別子（テーブル名・列名）として従来どおり `Ident` になる語のため、
+/// 字句解析の時点で無条件にキーワード化すると、その識別子が使えなくなる
+/// 未告知の破壊的変更になる。構文上その語が必須の位置（`LIMIT` 直後の
+/// `USING MODE ...`、statement 先頭の `SET search_mode = ...`）でのみ、
+/// `allowlist` 側が `Ident` の文字列を大文字小文字を区別せず照合して
+/// 文脈的にキーワードとして扱う（`allowlist.rs::parse_using_clause`・
+/// `allowlist.rs::validate_sql` 参照）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     Keyword(Keyword),
@@ -321,6 +330,33 @@ mod tests {
     }
 
     #[test]
+    fn tokenizes_using_and_set_as_plain_idents() {
+        // TASK-161（SQL-12）: `USING`／`SET` は字句解析の時点ではキーワード化しない
+        // （`allowlist` 側が LIMIT 直後／statement 先頭という文脈でのみキーワードとして
+        // 扱う。カタログ上有効な識別子としての `using`／`set` を字句解析段階で
+        // 破壊的に奪わないための設計）。
+        let tokens = tokenize("using MODE 'recall'").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("using".to_string()),
+                Token::Ident("MODE".to_string()),
+                Token::StringLiteral("recall".to_string()),
+            ]
+        );
+        let tokens = tokenize("SET search_mode = 'precision'").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("SET".to_string()),
+                Token::Ident("search_mode".to_string()),
+                Token::Punct('='),
+                Token::StringLiteral("precision".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn insert_operation_id_words_remain_usable_as_ordinary_identifiers() {
         // PR #189 レビュー指摘対応（P1）: `catalog::validate_identifier` が許可する
         // 同名のテーブル名・列名（例: `values`）が、SELECT 許可形状の
@@ -339,11 +375,40 @@ mod tests {
     }
 
     #[test]
+    fn using_and_set_remain_valid_identifiers_outside_their_keyword_positions() {
+        // P1 修正の回帰: `using`／`set` はテーブル名・列名としての `Ident` 位置
+        // （`FROM`・投影・`ORDER BY` 等）で従来どおり使用できる。
+        let tokens = tokenize("SELECT using FROM set").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Select),
+                Token::Ident("using".to_string()),
+                Token::Keyword(Keyword::From),
+                Token::Ident("set".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn keyword_matching_is_case_insensitive() {
         let tokens = tokenize("select * from docs limit 1").expect("tokenize should succeed");
         assert_eq!(tokens[0], Token::Keyword(Keyword::Select));
         assert_eq!(tokens[2], Token::Keyword(Keyword::From));
         assert_eq!(tokens[4], Token::Keyword(Keyword::Limit));
+    }
+
+    #[test]
+    fn hint_is_a_context_dependent_ident_not_a_reserved_keyword() {
+        // HINT ORDER(...) は LIMIT 直後の所定位置でのみ allowlist 側が文脈依存で
+        // 認識する語であり、字句解析の時点では常に通常の識別子として扱う
+        // （後方互換性: `hint` を列名・テーブル名として使う既存 SQL を拒否しない）。
+        let tokens = tokenize("HINT ORDER(RLS)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Ident("HINT".to_string()));
+        assert_eq!(tokens[1], Token::Keyword(Keyword::Order));
+
+        let tokens = tokenize("hint order(rls)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Ident("hint".to_string()));
     }
 
     #[test]

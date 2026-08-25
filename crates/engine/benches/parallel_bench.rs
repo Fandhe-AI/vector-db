@@ -2,18 +2,19 @@
 //! TASK-127・対象ビヘイビア CORE-3, CORE-4, CORE-5, SEARCH-4）。
 //!
 //! 実測対象は `ParallelSearchProvider`（TASK-126）であり、`kernel::dot` の
-//! スレッド並列化のみを行う（ベクトル化＝SIMD 演算は実装していない。
-//! `parallel_search.rs` モジュール冒頭のコメント参照）。SIMD カーネルが
-//! 未導入の現時点では本ベンチも SIMD の性能回帰を検出しない——ファイル名・
-//! ドキュメントは「スカラー並列実装の回帰ベンチ」である実態に合わせている。
-//! SIMD provider/カーネルが導入された際は、本ベンチの測定対象をそちらへ
-//! 差し替える（ファイル名の再検討も含む）。
+//! スレッド並列化を行う。`kernel::dot` の実体は TASK-156（CORE-14）で
+//! `isa::current().dot` へ委譲され、実行時検出された CPU 命令セット
+//! （AVX2+FMA・AVX-512・NEON。非対応環境ではスカラー逐次和）を使うため、本ベンチは
+//! スレッド並列化と SIMD 化の双方が乗った実測になる（`parallel_search.rs`・
+//! `isa.rs` モジュール冒頭のコメント参照）。x86_64 実機での数値実測（p95 等）と
+//! CORE-14 の Must 化判断は TASK-156 の範囲外であり、本ベンチの回帰基準値自体は
+//! 未接続のまま（ファイル名は導入当時のものを維持）。
 //!
 //! `parallel_smoke.rs`（TASK-126 の手動計測スモーク）と異なり、本ベンチは数値基準との
 //! 突き合わせまで行い、基準未達なら非ゼロ終了する回帰ゲートとして機能する
 //! （`harness/accept.rs` の判定ヘルパを利用）。`.github/workflows/bench.yml`
-//! （`workflow_dispatch` による手動実行。CORE-5 未接続の間は schedule 停止中。
-//! 同ファイル冒頭コメント参照）から実行される想定で、`make ci` の対象にはしない
+//! （週次 schedule + workflow_dispatch による実行。CORE-5 は Issue #176 まで
+//! opt-in のまま。同ファイル冒頭コメント参照）から実行される想定で、`make ci` の対象にはしない
 //! （時間依存の測定値を CI アサーションへ混ぜない既存方針。`parallel_smoke.rs`
 //! と同一）。
 //!
@@ -26,7 +27,7 @@
 //!   （`.claude/rules/dependency-policy.md`）のため本 PR では未接続。CORE-5 の判定は
 //!   `BENCH_CORE5=1` が設定された場合のみ opt-in で有効化する（[`core5_requested_from_env`]）。
 //!   既定（未設定）では CORE-3/CORE-4 のみで合否を返し、CORE-5 は「対象外（未接続・
-//!   Issue #35 で追跡中）」であることを標準出力へ明示する（silent skip にしない）。
+//!   Issue #176 で追跡中）」であることを標準出力へ明示する（silent skip にしない）。
 //!   `BENCH_CORE5=1` を指定した場合は、未接続＝判定不能を fail-closed として扱う
 //!   （判定関数 [`harness::accept::check_contrast_ratio_within_limit`] のみ先行実装済み。
 //!   実測接続後は同フラグの下で自動的に実測ベースの判定へ切り替わる）。
@@ -252,7 +253,7 @@ fn main() {
     // 対照エンジンクレートの導入がユーザー承認必須のため実測できない
     // （`.claude/rules/dependency-policy.md`）。`core5_requested_from_env` のドキュメント
     // 参照。フラグ未指定（既定）では CORE-5 を判定対象から明示的に除外し、その旨を
-    // 標準出力へ書く（silent skip にしない。Issue #35 で追跡中）。フラグ指定時のみ
+    // 標準出力へ書く（silent skip にしない。Issue #176 で追跡中）。フラグ指定時のみ
     // 「未測定＝判定不能」を fail-closed として受理判定に反映する。
     let core5_requested = core5_requested_from_env();
     if core5_requested {

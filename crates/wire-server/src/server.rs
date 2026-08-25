@@ -252,6 +252,12 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
+    /// プロセス内単調カウンタ（`tests/wire_auth.rs` と同一クラスの競合対策。
+    /// Issue #172: lib テストバイナリ内でも同一 pid で並列実行されるため）。
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     /// P1 review 是正の再現ケース: 削除された公開 API との後方互換ラッパー
     /// `bind_loopback` が、新実装（`GuardedBindAddrs`）と同じ fail-closed 挙動
@@ -274,15 +280,19 @@ mod tests {
     /// （Slowloris 対策・WIRE-6）。
     #[test]
     fn accept_loop_rejects_connection_over_capacity_with_53300() {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-server-test-{}-{}",
+            "wire-server-server-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = Arc::new(UserStore::load_from_file(&path).expect("valid empty store"));
@@ -328,15 +338,19 @@ mod tests {
     /// で応答なしに切断され、接続枠が解放されて後続接続を受け付けられること（WIRE-5）。
     #[test]
     fn accept_loop_releases_permit_after_read_timeout() {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-server-test-{}-{}",
+            "wire-server-server-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = Arc::new(UserStore::load_from_file(&path).expect("valid empty store"));
@@ -399,15 +413,19 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn accept_loop_compat_wrapper_enforces_connection_limit() {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-server-test-legacy-{}-{}",
+            "wire-server-server-test-legacy-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = Arc::new(UserStore::load_from_file(&path).expect("valid empty store"));

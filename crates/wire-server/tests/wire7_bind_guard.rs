@@ -9,8 +9,13 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
+/// プロセス内単調カウンタ（`wire_auth.rs` と同一クラスの競合対策。Issue #172）。
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// テストごとに衝突しない一時ユーザーストアディレクトリ／ファイルを保持し、
 /// `Drop` でディレクトリごと確実に削除するガード（対応: TASK-70 review 指摘。
@@ -25,15 +30,19 @@ struct TempUserStore {
 
 impl TempUserStore {
     fn new() -> Self {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-wire7-test-{}-{}",
+            "wire-server-wire7-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         Self { dir, path }
