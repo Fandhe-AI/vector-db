@@ -93,9 +93,15 @@ pub mod txn;
 
 /// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
 /// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
+///
+/// `temp_db` 自身の自己テスト（`temp_db_tests`）は本モジュール配下でのみ
+/// コンパイル・実行される（Issue #201 レビュー対応）。`tests/*.rs` 側は
+/// `#[path = "../src/test_util/temp_db.rs"] mod temp_db;` で `temp_db.rs` 単体のみを
+/// 取り込むため、結合テストバイナリごとの重複実行は発生しない。
 #[cfg(test)]
 mod test_util {
     pub mod temp_db;
+    mod temp_db_tests;
 }
 
 /// engine クレートの識別子。

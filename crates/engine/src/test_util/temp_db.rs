@@ -74,7 +74,7 @@ fn validate_label(label: &str) {
 /// `temp_dir()` 配下に残った `vector-db-` 接頭辞のエントリを数え、生成・削除の失敗時に
 /// panic メッセージ／`eprintln!` へ埋め込む診断情報を組み立てる（発生時診断。実行中の
 /// 正常経路では呼ばれない＝ログ過多にならない）。
-fn describe_temp_dir_state() -> String {
+pub(crate) fn describe_temp_dir_state() -> String {
     let dir = std::env::temp_dir();
     let writable = std::fs::metadata(&dir)
         .map(|m| !m.permissions().readonly())
@@ -237,69 +237,4 @@ impl Drop for TempDir {
 /// 呼び出し側の既存記法 `let dir = tempdir();` を維持する。
 pub fn tempdir() -> TempDir {
     TempDir::new("tempdir")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unique_db_path_returns_distinct_paths_for_consecutive_calls() {
-        let a = unique_db_path("dup-check");
-        let b = unique_db_path("dup-check");
-        assert_ne!(a, b, "consecutive calls must not collide");
-    }
-
-    #[test]
-    fn unique_db_path_rejects_path_traversal_labels() {
-        let result = std::panic::catch_unwind(|| unique_db_path(".."));
-        assert!(result.is_err(), "label \"..\" must be rejected");
-
-        let result = std::panic::catch_unwind(|| unique_db_path("a/b"));
-        assert!(result.is_err(), "label containing '/' must be rejected");
-    }
-
-    #[test]
-    fn cleanup_guard_removes_the_file_and_tolerates_missing_file() {
-        let path = unique_db_path("cleanup-guard");
-        std::fs::write(&path, b"placeholder").expect("seed placeholder file");
-        {
-            let _guard = CleanupGuard(path.clone());
-        }
-        assert!(!path.exists(), "CleanupGuard must remove the file on drop");
-
-        // 既に無い場合も panic しない（二重 drop 相当の状況を模擬）。
-        drop(CleanupGuard(path));
-    }
-
-    #[test]
-    fn tempdir_creates_and_removes_a_directory() {
-        let dir = TempDir::new("tempdir-basic");
-        let path = dir.path().to_path_buf();
-        assert!(path.is_dir(), "TempDir::new must create the directory");
-        drop(dir);
-        assert!(!path.exists(), "TempDir drop must remove the directory");
-    }
-
-    #[test]
-    fn tempdir_db_path_is_inside_the_directory() {
-        let dir = TempDir::new("tempdir-dbpath");
-        assert_eq!(dir.db_path(), dir.path().join("db.redb"));
-    }
-
-    #[test]
-    fn describe_temp_dir_state_reports_the_temp_dir_path_without_panicking() {
-        // 発生時診断（panic メッセージ・`eprintln!` に埋め込む文字列）が、実際に
-        // `temp_dir()` の実体パスを含み、呼び出し自体が panic しないことを確認する
-        // （このヘルパは通常経路では呼ばれないため、生成・削除の失敗経路以外に
-        // 検証手段がない）。
-        let description = describe_temp_dir_state();
-        let expected_path = std::env::temp_dir();
-        assert!(
-            description.contains(&expected_path.display().to_string()),
-            "description must mention the temp_dir() path: {description}"
-        );
-        assert!(description.contains("writable="));
-        assert!(description.contains("leftover_vector_db_entries="));
-    }
 }
