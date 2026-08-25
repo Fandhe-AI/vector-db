@@ -389,6 +389,16 @@ fn sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text() {
 // 同点融合スコアを持つ行群が `LIMIT` 境界を跨ぐ場合でも決定的であることを検証する。
 // `hybrid.rs`・`crates/engine/tests/hybrid.rs` のユニット・統合レベルの検証を
 // SQL 表層（`EngineCore::execute_sql`）まで通しで確認する回帰テスト。
+//
+// SQL 表層の密側候補プールは `pool_depth = LIMIT.max(200)`（`sql/exec.rs` 参照）で
+// 可視行数を常に上回るため、可視行はすべて密側ランキングに含まれる（密側から
+// 完全に除外される行は作れない。`crates/engine/tests/hybrid.rs` のユニットテストが
+// 使う「密側/疎側どちらかのみで得点させる」構成は SQL 表層では使えない）。そこで
+// 本テストは「密ランクと疎ランクを入れ替えた 2 行」で融合後スコアの完全一致
+// （タイ）を作る: `RrfConfig` は密・疎の重み・`k_const` が共通のため、行 A
+// （密 rank i・疎 rank j）と行 B（密 rank j・疎 rank i）は
+// `1/(k_const+i+1) + 1/(k_const+j+1)` の加算が可換であることから、i と j の
+// 具体値によらず浮動小数点として完全一致する。
 #[test]
 fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
     let path = unique_db_path("sql4-tie-boundary");
@@ -404,21 +414,18 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
         ))
         .expect("create table");
 
-    // `crates/engine/tests/hybrid.rs` の
-    // `hybrid_search_tie_group_across_limit_boundary_is_deterministic_and_matches_oracle`
-    // と同じコーパス構成: id 30〜32 は密ベクトルのみクエリに近く（疎側は
-    // 「anchor」を含まないため候補外）、id 10〜12 は「anchor」を含む（疎側で
-    // ヒット）が密ベクトルはクエリと直交（密側の内積は 0 で三者とも同値タイ）。
-    // SQL 表層は `pool_depth = LIMIT.max(既定値)` を密側 `k` に使うため
-    // （`sql/exec.rs` 参照）、可視 6 行すべてが密プールに入り、id 10〜12 は
-    // 密側で内積 0 の同点グループ（id 昇順でタイブレーク）を形成する。
-    let rows: [(u64, [f32; 2], Option<&str>); 6] = [
-        (30, [0.9, 0.1], Some("unrelated content alpha")),
-        (31, [0.8, 0.1], Some("unrelated content beta")),
-        (32, [0.7, 0.1], Some("unrelated content gamma")),
-        (10, [0.0, 1.0], Some("anchor anchor anchor")),
-        (11, [0.0, -1.0], Some("anchor anchor")),
-        (12, [0.0, 2.0], Some("anchor")),
+    // id=1（行 A）: 密ランク 0（内積最大）・疎ランク 1（tf=1、文書長 3 語）。
+    // id=2（行 B）: 密ランク 1（内積 2 位）・疎ランク 0（tf=3、文書長 3 語で
+    // id=1 と揃えているため BM25 は tf のみで単調に順位付けされる）。
+    // 密・疎のランクの組が入れ替わっているため融合スコアは常に完全一致する
+    // （上記コメント参照）。id=90〜92 は `anchor` を含まない埋め草行で、密内積を
+    // 行 A・B より小さくして密ランク 2 以降に押し出す（タイ組の構成に影響しない）。
+    let rows: [(u64, [f32; 2], Option<&str>); 5] = [
+        (1, [1.0, 0.0], Some("anchor filler filler")),
+        (2, [0.9, 0.0], Some("anchor anchor anchor")),
+        (90, [0.1, 0.0], None),
+        (91, [0.05, 0.0], None),
+        (92, [0.01, 0.0], None),
     ];
     for (id, emb, body) in rows {
         let value = match body {
@@ -438,17 +445,18 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
 
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-    // LIMIT 4 は密側同点グループ（id 10, 11, 12。密内積 0 で三者同値）3 件のうち
-    // 全件を含み、さらに疎ヒットの寄与で二番目に高い id=30 が続く位置になる
-    // （疎ヒットの BM25 は文書長で差が付くため三者間の RRF 合計スコアには
-    // 差が出るが、密側の同点タイブレーク（id 昇順）自体が LIMIT 境界の
-    // 決定性に影響しないことは、この LIMIT 位置に依らず以下の反復実行で
-    // 確認する）。
+    // LIMIT 1 は行 A・B の完全同点タイ組（id 1, 2）のうち id 昇順で先頭の id=1 のみを
+    // 含む位置になる。すなわちタイ組の途中を LIMIT が横切る。
     let sql =
-        "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 4";
+        "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 1";
 
     let baseline = core.execute_sql(&ctx, sql).expect("hybrid SQL-4 ok");
     let baseline_ids = result_ids(&baseline);
+    assert_eq!(
+        baseline_ids,
+        vec![1u64],
+        "tie group {{1,2}} must be cut after the smaller id"
+    );
     for trial in 1..20 {
         let result = core
             .execute_sql(&ctx, sql)
@@ -459,28 +467,21 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
             "trial={trial} diverged from baseline"
         );
     }
-    // id 10〜12 は密内積 0（同点）だが疎側 BM25 の寄与差により RRF 合計スコアは
-    // 文書長が短いほど高くなる（`sparse.rs` の BM25 長さ正規化の帰結）ため
-    // id 昇順とは限らない順位になりうる。ここでは値そのものではなく、密同点
-    // グループが全件 Top-4 に含まれ、かつ密ベクトルのみで一致する id 30〜32 の
-    // 中では最上位（id=30）だけが混ざることを確認する（同点タイブレークが
-    // LIMIT 境界を跨いでも壊れていないことの構造的な確認）。
-    assert_eq!(
-        baseline_ids
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-        [10u64, 11, 12, 30]
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>(),
-        "baseline_ids={baseline_ids:?}"
-    );
+
+    // LIMIT 2 ならタイ組（id 1, 2）を全件含み、id 昇順で並ぶことも確認する。
+    let sql_full_group =
+        "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 2";
+    let full_group = core
+        .execute_sql(&ctx, sql_full_group)
+        .expect("hybrid SQL-4 ok (full tie group)");
+    assert_eq!(result_ids(&full_group), vec![1u64, 2u64]);
 
     // 2 構文形（`hybrid_rrf(...)` / `HYBRID(...)`）でも同一 Top-k であることを
     // 同時に確認する（既存の
     // `sql4_hybrid_rrf_and_hybrid_syntax_forms_return_identical_topk` と同種の
     // 検証を、同点境界コーパスでも独立に確認する）。
     let sql_kw =
-        "SELECT * FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 4";
+        "SELECT * FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 1";
     let result_kw = core.execute_sql(&ctx, sql_kw).expect("HYBRID form ok");
     assert_eq!(result_ids(&result_kw), baseline_ids);
 }

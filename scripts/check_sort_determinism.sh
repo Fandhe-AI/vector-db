@@ -2,20 +2,17 @@
 # TASK-84（対応 Issue #61。ポインタ: docs/spec/05-tasks.md TASK-84）の
 # ソート非決定性再混入検知チェック。
 #
-# PoC-10（`docs/spec/03-poc/query-protocol-comparison`）が発見した「同点タイブレーク
-# 欠如による非決定性」（`sort_unstable_by`/`sort_unstable_by_key`/
-# `select_nth_unstable_by(_key)` は同点要素の相対順序を保証しないため、ハッシュ由来の
-# 挿入順・スレッドスケジューリング次第で Top-k の並びが実行ごとに変わりうる）が
-# `crates/engine/src`・`crates/wire-server/src` へ再混入していないかを、`cargo` を
-# 使わない軽量な `grep` ベースで検知する（`check_core_api.sh` と同様、rust-ci ジョブとは
-# 独立に実行できる）。
+# 動機（詳細は非公開 PoC-10 側の管轄のため本文へ転記しない。ポインタ:
+# `docs/spec/03-poc/query-protocol-comparison`。判断の全体像は
+# `docs/design/rrf-tie-break-determinism.md` 参照）: `sort_unstable_by`/
+# `sort_unstable_by_key`/`select_nth_unstable_by(_key)`（同点要素の相対順序を
+# 保証しない不安定ソート API）が `crates/engine/src`・`crates/wire-server/src`
+# へ再混入していないかを、`cargo` を使わない軽量な `grep` ベースで検知する
+# （`check_core_api.sh` と同様、rust-ci ジョブとは独立に実行できる）。
 #
 # 検知対象（行頭コメント `//`・`///`・`//!` は除外し、実コード行のみを走査）:
 #   - `sort_unstable_by(` / `sort_unstable_by_key(`
 #   - `select_nth_unstable_by(` / `select_nth_unstable_by_key(`
-# これらはいずれも同点要素の相対順序を保証しない（安定ソートではない）ため、
-# ハッシュ由来の挿入順・スレッドスケジューリング次第で同点グループの並びが
-# 実行ごとに変わりうる（PoC-10 が指摘した非決定性の直接原因）。
 #
 # `partial_cmp(...).unwrap()/.expect(...)` は当初検知対象に含める案もあったが、
 # 安定ソート（`sort_by`）と組み合わせた「非有限値が来たら panic で止める」テスト
@@ -55,27 +52,48 @@ fi
 # 危険な `partial_cmp` 使用を検知する。マッチ行を stdout へ出力し、1 件も
 # 無ければ何も出力しない（呼び出し側が出力有無で成否判定する）。
 #
-# `grep -n` の対象は `*.rs` ファイル全体だが、以下を誤検知として除外する:
+# API 名と `(` の間に改行・空白を挟んだ呼び出し（例:
+# `v.sort_unstable_by\n    (|a, b| ...)`）でも検知を回避できないよう、行単位の
+# `grep -E` ではなく `perl` でファイル全体を 1 つの文字列として走査する
+# （2 回目の codex-review P1 指摘対応）。以下を誤検知として除外する:
 #   - 行頭（先頭の空白を許容）が `//` で始まるコメント行
-#   - 行末に `// sort-determinism: allow ...` マーカーを持つ行
+#   - マッチ開始行〜終了行のいずれかに `// sort-determinism: allow ...`
+#     マーカーを持つ行（複数行にまたがる呼び出しでも終端側のマーカーを許容する）
 scan_dir() {
   local dir="$1"
   if [ ! -d "${dir}" ]; then
     return 0
   fi
 
-  local pattern
-  pattern='sort_unstable_by\(|sort_unstable_by_key\(|select_nth_unstable_by\(|select_nth_unstable_by_key\('
-
-  # `find` の出力を `grep -f` ではなく個別に渡すのは、0 件時に GNU/BSD grep 間で
-  # 終了コードの扱いが割れる `xargs` 経由を避け、ループ内で行頭コメント除外の
-  # 2 段 grep を安定して適用するため。
   local file
   while IFS= read -r file; do
-    grep -nE "${pattern}" "${file}" 2>/dev/null |
-      grep -vE '^[0-9]+:[[:space:]]*//' |
-      grep -vE 'sort-determinism: allow ' |
-      sed "s#^#${file}:#"
+    perl -0777 -ne '
+      my @lines = split /\n/, $_, -1;
+      # 行頭コメント行（`//`・`///`・`//!`）を除いた「実コード」だけを 1 本の
+      # 文字列へ結合し、結合後の各文字位置が元のどの行番号に属するかを保持する。
+      # これにより `sort_unstable_by\n    (` のように API 名と `(` の間に改行や
+      # 空白を挟んだ呼び出しも 1 つの正規表現でまたいで検知できる。
+      my $joined = "";
+      my @lineno_of_pos;
+      for my $i (0 .. $#lines) {
+        my $ln = $i + 1;
+        my $line = $lines[$i];
+        next if $line =~ m{^\s*//};
+        my $text = $line . "\n";
+        push @lineno_of_pos, ($ln) x length($text);
+        $joined .= $text;
+      }
+      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*\(/gs) {
+        my $start_ln = $lineno_of_pos[$-[0]];
+        my $end_ln = $lineno_of_pos[$+[0] - 1] // $start_ln;
+        my $allowed = 0;
+        for my $l ($start_ln .. $end_ln) {
+          if ($lines[$l - 1] =~ /sort-determinism: allow /) { $allowed = 1; last; }
+        }
+        next if $allowed;
+        print "$start_ln:$lines[$start_ln - 1]\n";
+      }
+    ' "${file}" | sed "s#^#${file}:#"
   done < <(find "${dir}" -type f -name '*.rs')
 }
 
@@ -98,6 +116,21 @@ fn f(v: &mut [i32], k: usize) {
     v.select_nth_unstable_by_key(k, |x| *x);
 }
 EOF
+  # fixture 4: 検知すべきケース（API 名と `(` の間に改行を挟んだ呼び出し。
+  # 行単位の `grep -E` では回避できてしまっていた 2 回目の codex-review P1
+  # 指摘の再現ケース）。
+  cat >"${tmp}/detect_multiline.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by
+        (|a, b| a.cmp(b));
+}
+EOF
+  # fixture 5: 検知すべきケース（API 名と `(` の間に空白のみを挟んだ呼び出し）。
+  cat >"${tmp}/detect_whitespace.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by   (|a, b| a.cmp(b));
+}
+EOF
   # fixture 3: 検知してはならないケース（コメント行・許可マーカー・整数の
   # sort_unstable（引数なし、パターン対象外）・文字列全体としての言及）。
   cat >"${tmp}/allowed.rs" <<'EOF'
@@ -105,6 +138,14 @@ EOF
 fn f(ids: &mut Vec<u64>, v: &mut Vec<i32>) {
     ids.sort_unstable(); // 引数なし sort_unstable は本チェックの対象パターン外
     v.sort_unstable_by(|a, b| a.cmp(b)); // sort-determinism: allow 全順序の整数比較のみ
+}
+EOF
+  # fixture 6: 検知してはならないケース（改行を挟んだ呼び出しの許可マーカーが
+  # 呼び出し終端側の行にある場合。マーカー検索がマッチ範囲全体を見ることの確認）。
+  cat >"${tmp}/allowed_multiline.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by
+        (|a, b| a.cmp(b)); // sort-determinism: allow 全順序の整数比較のみ
 }
 EOF
 
@@ -117,8 +158,16 @@ EOF
     echo "FAIL: self-test did not detect select_nth_unstable_by_key in detect_select_nth.rs" >&2
     failed=1
   fi
-  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs"; then
-    echo "FAIL: self-test false-positive on allowed.rs (comment / allow-marker / sort_unstable without comparator should not match)" >&2
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_multiline.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by split across lines in detect_multiline.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_whitespace.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by with whitespace before '(' in detect_whitespace.rs" >&2
+    failed=1
+  fi
+  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs"; then
+    echo "FAIL: self-test false-positive on allowed*.rs (comment / allow-marker / sort_unstable without comparator should not match)" >&2
     echo "--- detected ---" >&2
     printf '%s\n' "${local_detected}" >&2
     failed=1
