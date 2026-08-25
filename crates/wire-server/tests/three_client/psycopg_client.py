@@ -9,6 +9,13 @@ security.md P0）、`autocommit=True` で `execute()` する（非 autocommit �
 拒否されるため。ハーネス側の設計判断は `docs/design/three-client-e2e-harness.md`
 参照）。
 
+`psycopg.ClientCursor` を明示的に使う（既定の `Cursor` は `autocommit=True` でも
+サーバーサイドパラメータバインドを伴う拡張クエリプロトコル（Parse/Bind/Execute）
+で送信するため。本サーバーは拡張クエリメッセージ未対応のため拒否する。
+`ClientCursor` は SQL をクライアント側で文字列合成してから簡易クエリ
+プロトコル（'Q' メッセージ）で送るため、WIRE-1 の検証対象と一致する。
+codex-review 指摘・PR #210）。
+
 環境変数:
 - WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD: 接続情報。
 - WIRE_SQL: 実行する SQL 文。
@@ -47,7 +54,7 @@ def main() -> int:
             autocommit=True,
             connect_timeout=5,
         ) as conn:
-            with conn.cursor() as cur:
+            with psycopg.ClientCursor(conn) as cur:
                 cur.execute(sql)
                 for row in cur.fetchall():
                     print(row[0])

@@ -77,21 +77,33 @@ pub fn encode_row_description(columns: &[ColumnMeta]) -> Result<Vec<u8>, EncodeE
 }
 
 /// `Cell` の text フォーマット表現。`Null` は `None`（`DataRow` の -1 長へ写像）。
-fn cell_to_text(cell: &Cell) -> Option<String> {
+///
+/// `Cell::Integer` は `u64` 全域を保持しうるが、本モジュールは `id` 列を
+/// `int8`（OID 20, signed 64bit）として公告している（型写像表参照）。
+/// `i64::MAX` を超える値をそのまま10進テキストで送ると、`int8` として decode
+/// する規約準拠クライアント（signed 64bit 前提）が値域外エラー・誤変換を
+/// 起こしうる（Bugbot 指摘・PR #210）。fail-closed の方針
+/// （`.claude/rules/coding-rust.md`）に従い、宣言した型の値域を超える場合は
+/// 黙って不正確な値を返さず `Err(EncodeError)` とする（呼び出し元
+/// `simple_query` はこれを内部エラー `XX000` として扱う）。
+fn cell_to_text(cell: &Cell) -> Result<Option<String>, EncodeError> {
     match cell {
-        Cell::Null => None,
-        Cell::Integer(v) => Some(v.to_string()),
-        Cell::Text(s) => Some(s.clone()),
+        Cell::Null => Ok(None),
+        Cell::Integer(v) => {
+            let signed = i64::try_from(*v).map_err(|_| EncodeError)?;
+            Ok(Some(signed.to_string()))
+        }
+        Cell::Text(s) => Ok(Some(s.clone())),
         Cell::Vector(v) => {
             let joined = v
                 .iter()
                 .map(|f| f.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            Some(format!("[{joined}]"))
+            Ok(Some(format!("[{joined}]")))
         }
-        Cell::Float(f) => Some(f.to_string()),
-        Cell::Bool(b) => Some(if *b { "t".to_string() } else { "f".to_string() }),
+        Cell::Float(f) => Ok(Some(f.to_string())),
+        Cell::Bool(b) => Ok(Some(if *b { "t".to_string() } else { "f".to_string() })),
     }
 }
 
@@ -103,7 +115,7 @@ pub fn encode_data_row(row: &ResultRow) -> Result<Vec<u8>, EncodeError> {
     let mut body = Vec::new();
     body.extend_from_slice(&field_count.to_be_bytes());
     for cell in &row.cells {
-        match cell_to_text(cell) {
+        match cell_to_text(cell)? {
             None => body.extend_from_slice(&(-1i32).to_be_bytes()),
             Some(text) => {
                 let bytes = text.as_bytes();
@@ -229,6 +241,33 @@ mod tests {
         let first_len = i32_at(&msg, 7) as usize;
         assert_eq!(first_len, 1);
         assert_eq!(slice_at(&msg, 11, first_len), b"t");
+    }
+
+    #[test]
+    fn data_row_integer_cell_within_i64_range_encodes_as_signed_decimal() {
+        let row = ResultRow {
+            id: i64::MAX as u64,
+            score: 0.0,
+            cells: vec![Cell::Integer(i64::MAX as u64)],
+        };
+        let msg = encode_data_row(&row).expect("encode");
+        let cell_len = i32_at(&msg, 7) as usize;
+        let text = std::str::from_utf8(slice_at(&msg, 11, cell_len)).expect("utf8");
+        assert_eq!(text, i64::MAX.to_string());
+    }
+
+    #[test]
+    fn data_row_integer_cell_beyond_i64_max_is_rejected() {
+        // `id` 列は int8（signed 64bit）として公告するため、`i64::MAX` を超える
+        // `u64` 値をそのまま10進テキストで返すと signed decode 前提のクライアント
+        // が誤動作しうる（Bugbot 指摘・PR #210）。fail-closed に `EncodeError` と
+        // する。
+        let row = ResultRow {
+            id: u64::MAX,
+            score: 0.0,
+            cells: vec![Cell::Integer(u64::MAX)],
+        };
+        assert!(encode_data_row(&row).is_err());
     }
 
     #[test]
