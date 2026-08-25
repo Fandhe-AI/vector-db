@@ -12,7 +12,7 @@
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
@@ -165,6 +165,18 @@ pub fn execute_statement(
     // 構築の途中で無制限に近いメモリを確保してから拒否することになる）。
     let mut sparse_bytes: usize = 0;
 
+    // RLS → SCALAR 段（`on_visible_row`）で候補選択に使ったのと同一の read
+    // トランザクション由来のデコード済みスカラー列を、投影段でそのまま再利用する
+    // ために保持する（Issue #56 レビュー指摘対応・codex P1 / Bugbot Medium:
+    // 以前は投影段で `storage.get_row_from_table` により id ごとに**別スナップショット**
+    // を再取得しており、可視性のみ再検証してスカラー WHERE 条件は再検証していなかった
+    // ため、候補選択後に行が更新されるとスカラー条件不一致の値や候補選択時と異なる
+    // embedding を旧 score と組み合わせて返し得た。ここで候補構築時の行データを
+    // 保持して投影に流用することで、SQL 実行全体を単一スナップショット
+    // （`VectorArena::build_filtered_with_rows` が開く read トランザクション）に
+    // 閉じ込め、再取得によるスナップショット不一致の窓をなくす）。
+    let mut candidate_columns: HashMap<u64, Vec<Value>> = HashMap::new();
+
     let on_visible_row = |id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
         let decoded = row_codec::decode_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
@@ -190,6 +202,8 @@ pub fn execute_statement(
                 // NULL 本文は疎側に含めない（密のみへ寄与する）。
             }
         }
+        // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
+        candidate_columns.insert(id, decoded);
         Ok(true)
     };
 
@@ -202,6 +216,15 @@ pub fn execute_statement(
     .map_err(|e| map_arena_error(&bound.table, e))?;
 
     let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
+    // `id -> arena 内インデックス` の対応表。投影段で embedding を
+    // `arena.vector(index)`（候補構築と同一スナップショットのバッファ）から
+    // 引くために使う（`storage` への再アクセスを行わない）。
+    let arena_index_by_id: HashMap<u64, usize> = arena
+        .ids()
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| (*id, idx))
+        .collect();
 
     // DISTANCE 段。
     let hits: Vec<(u64, f64)> = match &bound.ranking {
@@ -284,23 +307,28 @@ pub fn execute_statement(
         }
     };
 
-    // 投影: ヒット id ごとに再取得し、二重防御として再度可視性を確認してから
-    // スカラーペイロードをデコードして返却行を構築する（並行書き込みに対する
-    // 二重防御。`sql::exec` モジュールドキュメント参照）。
+    // 投影: `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と
+    // 同一スナップショットで保持しておいた embedding（`arena`）・デコード済み
+    // スカラー列（`candidate_columns`）から返却行を構築する（上記コメント参照。
+    // 候補選択後に対象行が更新・削除されても、投影は候補選択時点の値を返す
+    // ため、RLS・スカラー WHERE・embedding が候補選択と投影とで食い違うことはない）。
     let mut rows = Vec::with_capacity(hits.len());
     for (id, score) in hits {
-        let row = storage.get_row_from_table(&bound.table, id).map_err(|_| {
-            SqlSurfaceError::Internal {
-                detail: "row disappeared between candidate selection and projection".to_string(),
-            }
-        })?;
-        if !ctx.is_visible(&row.tenant_id, row.visibility) {
-            return Err(SqlSurfaceError::Internal {
-                detail: "row became invisible between candidate selection and projection"
-                    .to_string(),
-            });
-        }
-        let decoded = row_codec::decode_scalar_columns(schema, &row.metadata)?;
+        let index = *arena_index_by_id
+            .get(&id)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "search hit id missing from candidate arena".to_string(),
+            })?;
+        let embedding = arena
+            .vector(index)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "candidate arena index out of range".to_string(),
+            })?;
+        let decoded = candidate_columns
+            .get(&id)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "search hit id missing from candidate scalar columns".to_string(),
+            })?;
         let mut cells = Vec::with_capacity(bound.projection.len());
         for col in &bound.projection {
             match col {
@@ -314,7 +342,7 @@ pub fn execute_statement(
                                 detail: "projected column index out of range".to_string(),
                             })?;
                     match column.ty {
-                        ColumnType::Vector(_) => cells.push(Cell::Vector(row.embedding.clone())),
+                        ColumnType::Vector(_) => cells.push(Cell::Vector(embedding.to_vec())),
                         ColumnType::Text => match decoded.get(*index) {
                             Some(Value::Text(t)) => cells.push(Cell::Text(t.clone())),
                             Some(Value::Null) | None => cells.push(Cell::Null),

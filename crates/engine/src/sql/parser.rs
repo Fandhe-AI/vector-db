@@ -251,21 +251,24 @@ pub fn bind(
         Projection::Columns(names) => {
             let mut cols = Vec::with_capacity(names.len());
             for name in names {
+                // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
+                // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、
+                // スキーマが `id` という実カラムを持っていても常に行キー疑似列へ
+                // マップされ、実カラムの値を `SELECT id` で取得する経路がなかった）。
+                if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                    cols.push(ProjectedColumn::Column {
+                        index,
+                        name: name.clone(),
+                    });
+                    continue;
+                }
                 if name == "id" {
                     cols.push(ProjectedColumn::Id);
                     continue;
                 }
-                let index = schema
-                    .columns
-                    .iter()
-                    .position(|c| &c.name == name)
-                    .ok_or_else(|| {
-                        SqlSurfaceError::invalid_input(format!("unknown column: {name}"))
-                    })?;
-                cols.push(ProjectedColumn::Column {
-                    index,
-                    name: name.clone(),
-                });
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "unknown column: {name}"
+                )));
             }
             cols
         }
@@ -458,6 +461,36 @@ mod tests {
                     name: "body".to_string()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn binds_real_id_column_over_pseudo_column_when_schema_declares_it() {
+        // Issue #56 レビュー指摘対応（P1/Medium: User id column is shadowed）:
+        // カタログ上に実カラム `id`（`ColumnType::Text`）が存在する場合、
+        // `SELECT id` は行キー疑似列ではなくその実カラムへ束縛されなければならない。
+        let schema = TableSchema::new(
+            "labeled_docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("id", ColumnType::Text, false),
+            ],
+        );
+        let lookup = FakeCatalog {
+            tables: ["labeled_docs"].into_iter().collect(),
+        };
+        let stmt = validate_statement(
+            "SELECT id FROM labeled_docs ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+            &lookup,
+        )
+        .expect("must pass allowlist");
+        let bound = bind(&stmt, &schema).expect("bind should succeed");
+        assert_eq!(
+            bound.projection,
+            vec![ProjectedColumn::Column {
+                index: 1,
+                name: "id".to_string()
+            }]
         );
     }
 
