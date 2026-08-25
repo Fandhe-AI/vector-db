@@ -185,8 +185,15 @@ fn validate_input(text: &str, config: &ChunkingConfig) -> Result<(), ChunkingErr
 
 /// ATX 見出し行かどうかを判定する（`#` 1〜3 個＋空白で始まる行。4 段以上は
 /// 境界にしない。PoC 同等の判定範囲）。
+///
+/// 行頭の空白は CommonMark 仕様に合わせて 0〜3 個までのみ見出し扱いとする
+/// （4 個以上のインデントはインデントコードブロックとなり見出しにはならない）。
 fn is_atx_heading(line: &str) -> bool {
-    let trimmed_start = line.trim_start_matches(' ');
+    let leading_spaces = line.chars().take_while(|&c| c == ' ').count();
+    if leading_spaces >= 4 {
+        return false;
+    }
+    let trimmed_start = &line[leading_spaces..];
     let hashes = trimmed_start.chars().take_while(|&c| c == '#').count();
     if hashes == 0 || hashes > 3 {
         return false;
@@ -197,11 +204,21 @@ fn is_atx_heading(line: &str) -> bool {
     )
 }
 
-/// fenced code block の開始・終了デリミタ行かどうかを判定する
-/// （```` ``` ```` または `~~~` で始まる行。言語指定の有無は問わない）。
-fn is_fence_delimiter(line: &str) -> bool {
+/// fenced code block のデリミタ文字種（```` ``` ```` か `~~~` か）を判定する。
+/// デリミタ行でなければ `None`。
+///
+/// CommonMark 仕様上、閉じフェンスは開始フェンスと同じ文字種でなければ
+/// ならない（異なる文字種の行はフェンス内部の通常テキストとして扱う）。
+/// `chunk_markdown` がこの戻り値を使ってフェンスの開始・終了を対応付ける。
+fn fence_delimiter_kind(line: &str) -> Option<char> {
     let trimmed = line.trim_start_matches(' ');
-    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    if trimmed.starts_with("```") {
+        Some('`')
+    } else if trimmed.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
 }
 
 /// 行の並び（1 始まり行番号付き）から前後の空行を除いた [`Chunk`] を作る。
@@ -241,8 +258,9 @@ pub fn chunk_generic(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>, 
         .map(|(i, l)| (i.saturating_add(1), l))
         .collect();
 
-    let mut chunks =
-        Vec::with_capacity(numbered_lines.len().div_ceil(config.lines_per_chunk.max(1)));
+    // lines_per_chunk == 0 は validate_input が事前に Err 化するため、
+    // ここでは常に 1 以上（0 除算しない）。
+    let mut chunks = Vec::with_capacity(numbered_lines.len().div_ceil(config.lines_per_chunk));
     let mut index = 0usize;
     for window in numbered_lines.chunks(config.lines_per_chunk) {
         if let Some(chunk) = trim_block(index, window) {
@@ -314,7 +332,7 @@ fn split_oversized_section(
 /// Markdown ファイルを見出し単位でチャンク化する。
 ///
 /// ATX 見出し（[`is_atx_heading`]）の行を節の開始境界とし、最初の見出しより
-/// 前の前文は独立した 1 節として扱う。fenced code block（[`is_fence_delimiter`]）
+/// 前の前文は独立した 1 節として扱う。fenced code block（[`fence_delimiter_kind`]）
 /// 内の `#` 行は見出しと見なさない。`config.max_markdown_section_chars` を
 /// 超える節は [`split_oversized_section`] で段落単位に詰め直す。
 pub fn chunk_markdown(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>, ChunkingError> {
@@ -327,16 +345,23 @@ pub fn chunk_markdown(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>,
         .collect();
 
     // 見出し境界で節へ分割する（fence 内の見出しらしき行は境界にしない）。
+    // 閉じフェンスは開始フェンスと同じ文字種の行でのみ成立させる
+    // （fence_delimiter_kind のドキュメント参照）。異なる文字種の行は
+    // フェンス内部の通常行として扱い、開閉状態を変化させない。
     let mut sections: Vec<Vec<(usize, &str)>> = Vec::new();
     let mut current: Vec<(usize, &str)> = Vec::new();
-    let mut in_fence = false;
+    let mut fence_kind: Option<char> = None;
     for &(ln, l) in &numbered_lines {
-        if is_fence_delimiter(l) {
-            in_fence = !in_fence;
+        if let Some(kind) = fence_delimiter_kind(l) {
+            match fence_kind {
+                None => fence_kind = Some(kind),
+                Some(open) if open == kind => fence_kind = None,
+                Some(_) => {}
+            }
             current.push((ln, l));
             continue;
         }
-        if !in_fence && is_atx_heading(l) && !current.is_empty() {
+        if fence_kind.is_none() && is_atx_heading(l) && !current.is_empty() {
             sections.push(std::mem::take(&mut current));
         }
         current.push((ln, l));
@@ -409,10 +434,10 @@ mod tests {
 
     #[test]
     fn fence_delimiter_detection() {
-        assert!(is_fence_delimiter("```"));
-        assert!(is_fence_delimiter("```rust"));
-        assert!(is_fence_delimiter("~~~"));
-        assert!(!is_fence_delimiter("plain text"));
+        assert_eq!(fence_delimiter_kind("```"), Some('`'));
+        assert_eq!(fence_delimiter_kind("```rust"), Some('`'));
+        assert_eq!(fence_delimiter_kind("~~~"), Some('~'));
+        assert_eq!(fence_delimiter_kind("plain text"), None);
     }
 
     #[test]

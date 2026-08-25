@@ -93,6 +93,19 @@ fn markdown_fenced_code_not_heading() {
 }
 
 #[test]
+fn markdown_fence_requires_matching_delimiter_kind() {
+    // 開始が ``` の fence の内側に ~~~ 始まりの行が現れても、閉じ扱いに
+    // せず fence 継続として扱う（CommonMark: 閉じフェンスは開始と同じ文字種）。
+    let config = ChunkingConfig::default();
+    let text = "# heading\n```text\n~~~\n# not a heading\n```\n\nafter\n";
+    let chunks = chunk_markdown(text, &config).expect("markdown chunks");
+
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].text.contains("# not a heading"));
+    assert!(chunks[0].text.contains("after"));
+}
+
+#[test]
 fn markdown_oversized_section_split_by_paragraph() {
     let long_paragraph_a = "a".repeat(400);
     let long_paragraph_b = "b".repeat(400);
@@ -119,17 +132,17 @@ fn markdown_oversized_section_split_by_paragraph() {
 #[test]
 fn crlf_input_is_normalized() {
     let config = ChunkingConfig::default();
-    let lf = "# heading\r\nbody one\r\nbody two\r\n";
-    let crlf = "# heading\nbody one\nbody two\n";
+    let crlf = "# heading\r\nbody one\r\nbody two\r\n";
+    let lf = "# heading\nbody one\nbody two\n";
 
-    let lf_chunks = chunk_markdown(lf, &config).expect("crlf chunks");
-    let crlf_chunks = chunk_markdown(crlf, &config).expect("lf chunks");
+    let crlf_chunks = chunk_markdown(crlf, &config).expect("crlf chunks");
+    let lf_chunks = chunk_markdown(lf, &config).expect("lf chunks");
 
-    assert_eq!(lf_chunks.len(), crlf_chunks.len());
-    for chunk in &lf_chunks {
+    assert_eq!(crlf_chunks.len(), lf_chunks.len());
+    for chunk in &crlf_chunks {
         assert!(!chunk.text.contains('\r'));
     }
-    assert_eq!(lf_chunks[0].text, crlf_chunks[0].text);
+    assert_eq!(crlf_chunks[0].text, lf_chunks[0].text);
 }
 
 #[test]
