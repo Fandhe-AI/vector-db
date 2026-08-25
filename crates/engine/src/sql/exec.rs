@@ -264,6 +264,20 @@ pub fn execute_statement(
     schema: &TableSchema,
     bound: &BoundStatement,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // TASK-161（SQL-12）: `precision` の実行契約（確信度判定・空集合 fail-closed 応答）
+    // は TASK-162・対象ビヘイビア SEARCH-9 の管轄で、本タスクでは未実装。束縛
+    // （`sql::parser::bind_with_session`）自体は `precision` を正しく解決するが、
+    // ここで実行を拒否することで「confidence フィルタなしの recall 相当の結果を
+    // `precision` の名の下に返す」という fail-open を作らない（TASK-162 がこの
+    // ゲートを実際の実行契約へ置き換える）。既存 `hybrid_rrf` の 2 引数形（構造は
+    // 受理しつつ実行不能として `22000` で拒否する。`sql::parser::bind_ranking`
+    // 参照）と同じ「構造は受理・実行時点で不可」の分類を踏襲する。
+    if bound.mode.mode == crate::sql::mode::SearchMode::Precision {
+        return Err(SqlSurfaceError::invalid_input(
+            "precision mode execution is not yet implemented in this build",
+        ));
+    }
+
     // HINT ORDER（未指定なら既定の RLS→SCALAR→DISTANCE）から導出する実行方針。
     // `scalar_prefilter` のみが分岐点（`ExecutionPlan::from_evaluation_order` の
     // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
