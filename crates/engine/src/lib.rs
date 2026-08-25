@@ -56,10 +56,16 @@
 //! `batch_fallback.rs::FallbackBatchEngine::batch_search`（バッチ経路）が実際に
 //! `select_execution_path` の戻り値を見て実行を分岐する（配線済み。詳細は
 //! `dispatch.rs` モジュールドキュメント参照）。
+//!
+//! TASK-157（対象ビヘイビア: CORE-15）: `buffer_pool.rs` がバッチ経路の中間バッファを
+//! サイズクラス別・総量上限・グローバル LRU で管理するプールを提供し、
+//! `batch_search.rs::run_batch_search` の行デコード用スクラッチバッファがこれを
+//! 経由する（詳細は `buffer_pool.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
 pub mod batch_search;
+pub mod buffer_pool;
 pub mod catalog;
 pub mod core;
 pub mod dispatch;
