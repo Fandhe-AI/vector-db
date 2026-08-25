@@ -80,16 +80,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     let mut chars = input.char_indices().peekable();
 
     while let Some(&(offset, c)) = chars.peek() {
+        // 空白の読み飛ばしはトークンを生成しないため、上限判定より先に処理する。
+        // 先に判定すると、ちょうど MAX_TOKEN_COUNT 個のトークンを生成する入力が
+        // 末尾の空白 1 文字の有無だけで成否が変わってしまう（読み飛ばしのみで
+        // ループが終わる場合と、空白を読む前に上限判定へ触れてしまう場合の非対称）。
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
         if tokens.len() >= MAX_TOKEN_COUNT {
             return Err(LexError {
                 message: "too many tokens".to_string(),
                 byte_offset: offset,
             });
-        }
-
-        if c.is_whitespace() {
-            chars.next();
-            continue;
         }
 
         // SQL コメントは許可リスト外として fail-closed に拒否する（緩和は後続タスク判断）。
@@ -347,6 +351,28 @@ mod tests {
     fn rejects_input_exceeding_max_len() {
         let huge = "a".repeat(MAX_INPUT_LEN + 1);
         assert!(tokenize(&huge).is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_max_token_count_without_trailing_whitespace() {
+        let input = "*".repeat(MAX_TOKEN_COUNT);
+        let tokens = tokenize(&input).expect("exactly MAX_TOKEN_COUNT tokens should be accepted");
+        assert_eq!(tokens.len(), MAX_TOKEN_COUNT);
+    }
+
+    #[test]
+    fn accepts_exactly_max_token_count_with_trailing_whitespace() {
+        // 上限判定は空白の読み飛ばしより後に行うため、ちょうど MAX_TOKEN_COUNT 個の
+        // トークンを生成する入力は末尾空白の有無に関係なく同じ結果になる。
+        let input = format!("{} ", "*".repeat(MAX_TOKEN_COUNT));
+        let tokens = tokenize(&input).expect("trailing whitespace must not affect the boundary");
+        assert_eq!(tokens.len(), MAX_TOKEN_COUNT);
+    }
+
+    #[test]
+    fn rejects_more_than_max_token_count() {
+        let input = "*".repeat(MAX_TOKEN_COUNT + 1);
+        assert!(tokenize(&input).is_err());
     }
 
     #[test]

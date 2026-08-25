@@ -16,15 +16,6 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。
 const MAX_ERROR_DETAIL_LEN: usize = 200;
 
-/// `parse_arg_list` が許容する丸括弧の最大ネスト深さ。字句解析側に入力長・ネスト
-/// 段数の上限がないため、`expect_value` を深さごとに保持するスタック（`Vec<bool>`）
-/// は攻撃者が選ぶ入れ子段数に比例してヒープを消費しうる。このモジュールは
-/// ネストした関数呼び出しの意味を一切解釈しない設計であり、正当な入力が
-/// この深さを超えることはないため、上限超過は無制限リソース確保を防ぐため
-/// fail-closed に拒否する（coding-rust.md「untrusted 入力の扱い」・security.md
-/// 「不安全な設計」対応）。
-const MAX_ARG_NESTING_DEPTH: usize = 32;
-
 /// ORDER BY の関数呼び出し形で許可する関数名を照合する（大文字小文字を区別しない）。
 /// 未知の名前は fail-closed に拒否し、識別子であれば任意の名前を関数呼び出しとして
 /// 受理してしまう構造上の抜け穴を作らない。
@@ -162,7 +153,7 @@ pub struct ValidatedStatement {
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
 /// 再帰下降だが文法の深さは定数（statement → select_list/where/order_by の 1 階層）で、
-/// 深いネストによるスタック消費は発生しない（`arg_list` の丸括弧対応のみ非再帰ループで数える）。
+/// 深いネストによるスタック消費は発生しない。
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -300,7 +291,7 @@ impl<'a> Parser<'a> {
                     )));
                 }
                 self.advance();
-                self.parse_arg_list()?;
+                self.parse_order_by_function_args(&name)?;
                 self.expect_punct(')')?;
                 Ok(OrderByForm::FunctionCall { name })
             }
@@ -310,96 +301,23 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// 関数呼び出し形 ORDER BY 式の引数部分。意味は解釈せず、括弧の対応が取れた
-    /// 許可トークン（識別子・文字列・数値・カンマ・入れ子丸括弧）のみで構成されて
-    /// いるかを構造的に検証する（fail-closed。キーワード・`;` 等の混入は拒否）。
-    /// カンマ区切りの値リスト構造を厳密に要求し、区切りなしの連続トークン・
-    /// 空要素列・先頭/末尾カンマは拒否する。値/区切りの期待状態はネストの深さ
-    /// ごとに独立したスタックで追跡し、丸括弧の深さに関係なく同じ規律を適用する
-    /// （入れ子丸括弧の内側だけ規律が緩む非対称を作らない）。
-    fn parse_arg_list(&mut self) -> Result<(), SqlSurfaceError> {
-        if matches!(self.peek(), Some(Token::Punct(')'))) {
-            return Ok(());
-        }
-        // 深さごとの値/区切り期待状態スタック。先頭が呼び出し直下（depth 0）で、
-        // `(` を消費するたびにフレームを push する。untrusted 入力由来のトークン列
-        // を扱うため、取得は常に `Option` 経路で行い空スタックによる panic を防ぐ
-        // （coding-rust.md: 受信データ経路での unwrap/expect/添字アクセス禁止）。
-        let mut expect_value: Vec<bool> = vec![true];
-        loop {
-            match self.advance() {
-                Some(Token::Ident(_)) | Some(Token::StringLiteral(_)) | Some(Token::Number(_)) => {
-                    let cur = expect_value.last_mut().ok_or_else(|| {
-                        SqlSurfaceError::unsupported("internal argument list depth underflow")
-                    })?;
-                    if !*cur {
-                        return Err(SqlSurfaceError::unsupported(
-                            "expected ',' or ')' between argument list values",
-                        ));
-                    }
-                    *cur = false;
-                }
-                Some(Token::Punct('(')) => {
-                    let cur = expect_value.last_mut().ok_or_else(|| {
-                        SqlSurfaceError::unsupported("internal argument list depth underflow")
-                    })?;
-                    if !*cur {
-                        // 識別子や値の直後に区切りカンマなしで `(` が続く形
-                        // （`foo(...)` 等）。関数呼び出しのネストは解釈しないため拒否。
-                        return Err(SqlSurfaceError::unsupported(
-                            "expected ',' or ')' between argument list values",
-                        ));
-                    }
-                    // 入れ子丸括弧グループ全体を現在の深さの 1 値として扱う。
-                    *cur = false;
-                    if expect_value.len() >= MAX_ARG_NESTING_DEPTH {
-                        return Err(SqlSurfaceError::unsupported(
-                            "argument list nesting depth exceeds the allowed maximum",
-                        ));
-                    }
-                    expect_value.push(true);
-                }
-                Some(Token::Punct(')')) => {
-                    if expect_value.len() <= 1 {
-                        let cur = expect_value.last().copied().unwrap_or(true);
-                        if cur {
-                            return Err(SqlSurfaceError::unsupported(
-                                "unexpected ')' in argument list: missing value",
-                            ));
-                        }
-                        // 呼び出し元の `expect_punct(')')` が消費すべき閉じ括弧に達した。
-                        // `advance()` 直後で `pos >= 1` が保証されるため `saturating_sub`
-                        // は防御的措置（coding-rust.md「整数演算は checked/saturating を使う」）。
-                        self.pos = self.pos.saturating_sub(1);
-                        return Ok(());
-                    }
-                    // 入れ子フレームを閉じる。空グループ（`()`）は値として認めず拒否する。
-                    let closed_frame_expects_value = expect_value.pop().ok_or_else(|| {
-                        SqlSurfaceError::unsupported("internal argument list depth underflow")
-                    })?;
-                    if closed_frame_expects_value {
-                        return Err(SqlSurfaceError::unsupported(
-                            "unexpected ')' in argument list: missing value",
-                        ));
-                    }
-                }
-                Some(Token::Punct(',')) => {
-                    let cur = expect_value.last_mut().ok_or_else(|| {
-                        SqlSurfaceError::unsupported("internal argument list depth underflow")
-                    })?;
-                    if *cur {
-                        return Err(SqlSurfaceError::unsupported(
-                            "unexpected ',' in argument list: missing value",
-                        ));
-                    }
-                    *cur = true;
-                }
-                other => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "unsupported token in argument list: {other:?}"
-                    )))
-                }
+    /// 許可された ORDER BY 関数ごとに、引数の個数・位置・トークン種別を明示的に
+    /// 解析する。`name` は [`is_allowed_order_by_function_name`] を通過済みの
+    /// 前提で呼ばれる。呼び出し元の `expect_punct(')')` が閉じ括弧を消費するため、
+    /// ここでは許可した引数トークン列のみを消費し、過不足があれば
+    /// （空引数・余剰引数・意味を解釈しない括弧グループを含め）その時点で拒否する
+    /// （fail-closed）。
+    fn parse_order_by_function_args(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+        match name.to_ascii_uppercase().as_str() {
+            "HYBRID_RRF" | "HYBRID" => {
+                self.expect_ident()?;
+                self.expect_punct(',')?;
+                self.expect_string_literal()?;
+                Ok(())
             }
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "unsupported ORDER BY function: {other}"
+            ))),
         }
     }
 
@@ -640,89 +558,60 @@ mod tests {
         );
     }
 
-    // parse_arg_list の区切り構造回帰テスト（Issue #55 レビュー指摘）。
+    // 許可された ORDER BY 関数の引数形状回帰テスト。
     #[test]
-    fn rejects_hybrid_args_without_comma_separator() {
+    fn rejects_order_by_function_call_with_empty_args() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY HYBRID() LIMIT 5");
+    }
+
+    #[test]
+    fn rejects_order_by_function_call_with_single_arg() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_order_by_function_call_with_too_many_args() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, 'q', 'extra') LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_order_by_function_call_missing_comma_between_args() {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding 'q') LIMIT 5",
         );
     }
 
     #[test]
-    fn rejects_hybrid_args_all_commas_no_values() {
-        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY hybrid_rrf(,,,) LIMIT 5");
-    }
-
-    #[test]
-    fn rejects_hybrid_args_trailing_comma() {
+    fn rejects_order_by_function_call_with_trailing_comma() {
         assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding,) LIMIT 5",
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, 'q',) LIMIT 5",
         );
     }
 
     #[test]
-    fn rejects_hybrid_args_leading_comma() {
+    fn rejects_order_by_function_call_with_wrong_second_arg_type() {
         assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY hybrid_rrf(,embedding) LIMIT 5",
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, 123) LIMIT 5",
         );
     }
 
     #[test]
-    fn accepts_hybrid_args_with_nested_paren_group() {
-        // 入れ子丸括弧そのもの（identifier に隣接しない、括弧単独のグループ）は
-        // depth 0 の 1 値として引き続き許可される。identifier 直後に区切りなしで
-        // `(` が続く形（`foo(...)`）は区切りカンマなしの連結として拒否側に倒す
-        // （このモジュールは関数呼び出しのネストを解釈しない）。
-        let lookup = catalog_with(&["documents"]);
-        validate_statement(
+    fn rejects_order_by_function_call_with_nested_paren_group_as_arg() {
+        // 括弧グループは意味を持たないため、第 1 引数の位置に来ても拒否する。
+        assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY hybrid_rrf((embedding), 'q') LIMIT 5",
-            &lookup,
-        )
-        .expect("standalone nested paren group argument should still be accepted");
+        );
     }
 
     #[test]
-    fn rejects_hybrid_args_identifier_immediately_followed_by_paren() {
+    fn rejects_order_by_function_call_with_nested_call_as_arg() {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, foo('q')) LIMIT 5",
         );
-    }
-
-    #[test]
-    fn rejects_hybrid_args_identifier_followed_by_paren_wrapped_in_nested_group() {
-        // Issue #55 レビュー指摘の再現ケース: 識別子直後の `(` を拒否する契約は、
-        // 呼び出し直下（depth 0）だけでなく入れ子丸括弧の内側（depth >= 1）でも
-        // 同様に働かなければならない。1 段カッコで包むだけでバイパスできてはならない。
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY hybrid_rrf((foo('q'))) LIMIT 5",
-        );
-    }
-
-    #[test]
-    fn rejects_hybrid_args_without_comma_separator_inside_nested_group() {
-        // 同上: 区切りカンマなしの連続トークン（`a b c`）も入れ子丸括弧の内側で
-        // 拒否されなければならない（depth 0 の `hybrid_rrf(a b c)` と対称であること）。
-        assert_rejected_as_syntax_error(
-            "SELECT * FROM documents ORDER BY hybrid_rrf((a b c)) LIMIT 5",
-        );
-    }
-
-    #[test]
-    fn rejects_hybrid_args_empty_nested_paren_group() {
-        // 入れ子丸括弧の空グループ（`()`）は値として認めない。
-        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY hybrid_rrf(()) LIMIT 5");
-    }
-
-    #[test]
-    fn rejects_hybrid_args_nesting_depth_beyond_maximum() {
-        // untrusted 入力による無制限の入れ子でスタックが際限なく伸びないよう、
-        // ネスト深さに上限を設けて fail-closed に拒否する。
-        let opens = "(".repeat(MAX_ARG_NESTING_DEPTH + 1);
-        let closes = ")".repeat(MAX_ARG_NESTING_DEPTH + 1);
-        let sql = format!(
-            "SELECT * FROM documents ORDER BY hybrid_rrf({opens}embedding{closes}) LIMIT 5"
-        );
-        assert_rejected_as_syntax_error(&sql);
     }
 
     #[test]
