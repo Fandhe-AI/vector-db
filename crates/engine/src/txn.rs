@@ -74,6 +74,8 @@ impl Storage {
     /// [`Storage::begin_batch_write`] を使うこと。[`WriteTxn`] にはバッチ台帳を操作する
     /// API を持たせていない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf 対応。
     /// [`BatchWriteTxn`] のドキュメントコメントの「型分離の理由」参照）。
+    /// 本メソッドが返す [`WriteTxn`] はバッチ台帳の不変条件の適用範囲外（Issue #133・
+    /// `docs/design/batch-ledger-scope.md` 参照）。
     ///
     /// 設計メモ: この排他ロックはタイムアウトを持たず、呼び出し元が [`WriteTxn`] を
     /// 保持し続ける限り他の書き込みを無期限にブロックする。本モジュール自体には
@@ -193,7 +195,7 @@ impl WriteTxn {
 /// `log_batch` を完全に撤去し、TABLE-10 用の `BatchWriteTxn` を独立した型として
 /// 分離した。
 ///
-/// # 契約の適用範囲（重要）
+/// # 契約の適用範囲（重要・恒久契約）
 ///
 /// 型分離をもってしても、[`Storage::put`]・[`Storage::put_batch`]・
 /// [`WriteTxn::put`] は本モジュールとは独立に [`ROWS_TABLE`] へ直接書き込めるため、
@@ -202,9 +204,10 @@ impl WriteTxn {
 /// `BatchWriteTxn` だけで行った場合に限る**（[`crate::storage::BATCH_LOG_TABLE`] の
 /// ドキュメントコメント参照）。`BatchWriteTxn` と他の書き込み経路を同一 DB・同一
 /// テーブルに対して混在させないことは呼び出し元の責務であり、本モジュールは意図的に
-/// それを検出・拒否しない（`Storage::put` 等からは `BatchWriteTxn` の存在自体が
-/// 見えないため、混在検出には DB 全体のスキャンを要し、書き込みの都度その代償を
-/// 払うことは本 PR のスコープでは正当化されないと判断した）。
+/// それを検出・拒否しない。
+///
+/// 適用範囲の検討経緯（Issue #133）は `docs/design/batch-ledger-scope.md` にポインタを、
+/// 判断の詳細は private spec 側 `docs/spec/05-tasks.md`（TASK-90・TASK-93）に記載する。
 ///
 /// `BatchWriteTxn` 単体としては、以下をすべて満たしてはじめて `commit` が成功する:
 /// - 新規挿入した行はすべて [`BatchWriteTxn::log_batch`] で台帳へ記録済みであること

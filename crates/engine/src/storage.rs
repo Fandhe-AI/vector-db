@@ -42,18 +42,21 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
 /// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
 ///
-/// **契約の適用範囲（重要）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の行総数」という
-/// 不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ書き込んだ場合に
-/// のみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・`EmptyBatch`・
-/// `UnloggedRows`・上書き非カウントの各チェック）によって保証される。[`Storage::put`]・
-/// [`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を経由しない別経路）は
-/// 台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
+/// **契約の適用範囲（重要・恒久契約）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の
+/// 行総数」という不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ
+/// 書き込んだ場合にのみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・
+/// `EmptyBatch`・`UnloggedRows`・上書き非カウントの各チェック）によって保証される。
+/// [`Storage::put`]・[`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を
+/// 経由しない別経路）は台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
 /// [`crate::txn::BatchWriteTxn`] を同一 DB・同一テーブルに対して混在させると、上記の
 /// 不変条件は成立しなくなる。これは型システムでは検出できない呼び出し元の責務であり、
 /// 本モジュールは意図的にそれを強制しない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf
 /// 対応。「台帳合計 == 行総数」を保証する範囲を、実際に型で保証できる範囲まで明文化して
 /// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
 /// [`crate::txn::BatchWriteTxn`] に一本化すること。
+///
+/// 適用範囲の検討経緯（Issue #133）は `docs/design/batch-ledger-scope.md` にポインタを、
+/// 判断の詳細は private spec 側 `docs/spec/05-tasks.md`（TASK-90・TASK-93）に記載する。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
 /// ストレージ全体の書き込み世代カウンタ（TASK-133 P1・対象ビヘイビア: RLS-1〜4）。
@@ -352,6 +355,10 @@ impl Storage {
     }
 
     /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1）。
+    ///
+    /// バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路（恒久契約。
+    /// `docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が必要な場合は
+    /// [`Storage::begin_batch_write`] が返す [`crate::txn::BatchWriteTxn`] を使うこと。
     pub fn put(&self, id: u64, row: &RowInput<'_>) -> Result<()> {
         let encoded = encode_row(row)?;
         let write_txn = self.db.begin_write()?;
@@ -364,6 +371,11 @@ impl Storage {
 
     /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2）。
     /// 空スライスの場合はトランザクションを開かず即座に成功を返す。
+    ///
+    /// [`Storage::put`] と同様、バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路
+    /// （恒久契約。`docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が
+    /// 必要な場合は [`Storage::begin_batch_write`] が返す [`crate::txn::BatchWriteTxn`] を
+    /// 使うこと。
     pub fn put_batch(&self, rows: &[(u64, RowInput<'_>)]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
