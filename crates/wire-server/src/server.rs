@@ -21,6 +21,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::UserStore;
+use crate::bind_guard::{GuardedBindAddrs, TransportSecurity};
+
+/// 旧 TASK-67 review 是正時点の公開 API との後方互換ラッパー。
+///
+/// TASK-70（WIRE-7）で本体の実装は [`crate::bind_guard::GuardedBindAddrs`]
+/// （TLS 有無に応じた通信路保護要件を型で表現できる形）へ移設・拡張したが、
+/// 本関数はすでに公開 API（`pub fn bind_loopback`）として利用側に届いている
+/// ため、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に従い削除せず
+/// 残す。内部では [`GuardedBindAddrs::resolve`]（[`TransportSecurity::Cleartext`]
+/// 固定 = 従来どおり loopback 限定）を呼ぶだけの薄いラッパーであり、挙動・
+/// エラーメッセージ文言は旧実装と同一（[`crate::bind_guard::BindGuardError`]
+/// の `Display` が旧 `validate_loopback_bind` と同じ文言を維持している）。
+///
+/// 新規コードは `GuardedBindAddrs::resolve` を直接呼ぶこと（TLS 導入時に
+/// `TransportSecurity` へ variant が増えても、本ラッパーは cleartext 固定の
+/// 意味論を変えない）。
+#[deprecated(
+    since = "0.1.0",
+    note = "use crate::bind_guard::GuardedBindAddrs::resolve(..., TransportSecurity::Cleartext) instead"
+)]
+pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
+    GuardedBindAddrs::resolve(bind_addr, TransportSecurity::Cleartext)
+        .map_err(|e| e.to_string())?
+        .bind()
+        .map_err(|e| format!("failed to bind {bind_addr}: {e}"))
+}
 
 /// 同時接続数の暫定上限（防御的な小さめの定数）。本格的な運用上限の決定・
 /// テナント単位の細分化は TASK-69 の管轄。
@@ -152,6 +178,22 @@ pub fn accept_loop(
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// P1 review 是正の再現ケース: 削除された公開 API との後方互換ラッパー
+    /// `bind_loopback` が、新実装（`GuardedBindAddrs`）と同じ fail-closed 挙動
+    /// （loopback は許可・非 loopback は拒否）を維持していること。
+    #[test]
+    #[allow(deprecated)]
+    fn bind_loopback_compat_wrapper_accepts_loopback_and_rejects_non_loopback() {
+        let listener = bind_loopback("127.0.0.1:0").expect("loopback bind must succeed");
+        drop(listener);
+
+        let err = bind_loopback("0.0.0.0:0").expect_err("non-loopback bind must be rejected");
+        assert!(
+            err.contains("refusing to bind non-loopback address"),
+            "unexpected error message: {err}"
+        );
+    }
 
     /// 枠の取得・解放（RAII）がネットワークを介さず単体で検証できること。
     #[test]
