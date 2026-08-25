@@ -480,7 +480,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         Self::build_filtered_with_rows_and_limits(
             storage,
@@ -518,7 +518,7 @@ impl VectorArena {
             storage,
             table_name,
             predicate,
-            |_id, _metadata| Ok(true),
+            |_slot, _id, _metadata| Ok(true),
             max_rows,
             max_bytes,
         )
@@ -540,7 +540,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
         Self::build_filtered_with_rows_and_limits_in_txn(
@@ -572,7 +572,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         Self::build_filtered_with_rows_and_limits_in_txn(
             read_txn,
@@ -609,7 +609,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         let expected_dim = validated_vector_dim_in_txn(read_txn, table_name)?;
 
@@ -694,7 +694,15 @@ impl VectorArena {
             // 呼び出し元のスカラー等価条件を適用する。`false` はアリーナへ格納せず
             // スキップし（容量検証の対象にも含めない）、`Err` は fail-closed に
             // 全体を拒否する（[`Self::build_filtered_with_rows`] のドキュメント参照）。
-            if !on_visible_row(id, &row.metadata)? {
+            // 第 1 引数はこの行がアリーナへ格納される場合のスロット番号
+            // （`VectorArena::ids()`/`vectors()`/`tenant_ids()` の添字）。呼び出し元
+            // （`sql/exec.rs`）が候補行の付随データ（スカラー列・疎コーパス）を
+            // 行 `id` ではなくスロット番号で対応づけられるようにするための契約
+            // （対象ビヘイビア: TABLE-12。行 `id` の一意性スコープがテナント内に
+            // 閉じたため、`id` は 1 つの可視集合内で行を一意に指せない。スロット番号は
+            // `(tenant_id, id)` の行と 1 対 1 に対応する）。呼び出し元側で
+            // 別カウンタを持たせない（本ループの push 条件とドリフトさせない）。
+            if !on_visible_row(visible_row_count, id, &row.metadata)? {
                 continue;
             }
 
@@ -1125,7 +1133,7 @@ mod tests {
             &read_txn,
             "docs",
             |_tenant, _visibility| true,
-            |_id, metadata| {
+            |_slot, _id, metadata| {
                 let decoded = row_codec::decode_scalar_columns(&bound_schema, metadata)
                     .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
                 decoded_bodies.push(match decoded.get(1) {
