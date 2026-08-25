@@ -30,8 +30,8 @@
 //!   閾値ゲート。既定（非 strict）では未設定・空文字列を「ゲート未設定＝明示的に
 //!   対象外」として成功終了する（silent skip にはしない。
 //!   `parallel_bench.rs::core5_requested_from_env` と同じ opt-in 方式）。
-//!   `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（`recall.yml` の `workflow_dispatch`
-//!   実行時のみ注入される strict モードフラグ）が立っている場合は、未設定も
+//!   `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（`recall.yml` からの実行（dispatch /
+//!   schedule）時のみ注入される strict モードフラグ）が立っている場合は、未設定も
 //!   非数値・範囲外と同様に fail-closed でテスト失敗とする——environment 作成漏れ・
 //!   variable 名の誤り・variable の誤削除により「一度も評価していない run」が
 //!   基準を満たした run と同じ green になる事故を防ぐ（PR #147 codex-review P1
@@ -601,8 +601,8 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
 }
 
 /// `HYBRID_RECALL_REQUIRE_THRESHOLDS` 環境変数（`"1"` のときのみ true）。
-/// `.github/workflows/recall.yml` の `workflow_dispatch` 実行時のみ注入される
-/// strict モードフラグ（PR #147 codex-review P1 継続指摘対応）。
+/// `.github/workflows/recall.yml` からの実行（dispatch / schedule）時のみ
+/// 注入される strict モードフラグ（PR #147 codex-review P1 継続指摘対応）。
 ///
 /// strict モードが無効（ローカル `make recall-regression`・仮に PR 経由で
 /// `--ignored` を明示指定して実行した場合）は、閾値未設定を「対象外」として

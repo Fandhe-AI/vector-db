@@ -299,6 +299,19 @@ mod tests {
     }
 
     #[test]
+    fn hint_is_a_context_dependent_ident_not_a_reserved_keyword() {
+        // HINT ORDER(...) は LIMIT 直後の所定位置でのみ allowlist 側が文脈依存で
+        // 認識する語であり、字句解析の時点では常に通常の識別子として扱う
+        // （後方互換性: `hint` を列名・テーブル名として使う既存 SQL を拒否しない）。
+        let tokens = tokenize("HINT ORDER(RLS)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Ident("HINT".to_string()));
+        assert_eq!(tokens[1], Token::Keyword(Keyword::Order));
+
+        let tokens = tokenize("hint order(rls)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Ident("hint".to_string()));
+    }
+
+    #[test]
     fn tokenizes_distance_operator() {
         let tokens = tokenize("embedding <=> 'x'").expect("tokenize should succeed");
         assert_eq!(
