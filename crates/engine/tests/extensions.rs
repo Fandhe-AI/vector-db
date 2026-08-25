@@ -50,7 +50,13 @@ impl Xorshift32 {
 
 /// `dim` 次元・`seed` に基づく決定論的な埋め込みを生成する。
 fn make_embedding(dim: u32, seed: u32) -> Vec<f32> {
-    let mut rng = Xorshift32(seed | 1); // seed 0 は xorshift の不動点になるため奇数化する。
+    // seed 0 は xorshift の不動点になるため非ゼロへ置換する。`seed | 1` だと
+    // 隣接する偶奇シード（0/1・2/3 等）が同じ値へ潰れ、実質半数の異なる
+    // ベクトルしか得られなくなる問題があった。置換先を実際に使われる seed=1
+    // と衝突しない u32::MAX にすることで、0 と 1 を含むすべての隣接シードが
+    // 異なるベクトルを生成する。
+    let seeded = if seed == 0 { u32::MAX } else { seed };
+    let mut rng = Xorshift32(seeded);
     (0..dim).map(|_| rng.next_f32()).collect()
 }
 
@@ -73,6 +79,25 @@ fn vector_table_schema(name: &str, dim: u32) -> TableSchema {
             ColumnDef::new("body", ColumnType::Text, true),
         ],
     )
+}
+
+/// 隣接シード（0/1・2/3 等）が同一ベクトルへ潰れないことを確認する回帰テスト。
+/// `seed | 1` による奇数化では偶奇の隣接シードが同値化し、データセットが実質
+/// 半数の異なるベクトルしか持たなくなる不具合があったため、0 のみを非ゼロへ
+/// 置換する現行実装（`make_embedding`）で隣接シードが異なるベクトルを
+/// 生成することを保証する。
+#[test]
+fn make_embedding_adjacent_seeds_produce_distinct_vectors() {
+    for seed in 0..8u32 {
+        let a = make_embedding(16, seed);
+        let b = make_embedding(16, seed + 1);
+        assert_ne!(
+            a,
+            b,
+            "adjacent seeds {seed} and {} must not collapse to the same embedding",
+            seed + 1
+        );
+    }
 }
 
 // --- EXT-1: 既定 768 次元での挿入・読み出し・検索動作 ------------------------------

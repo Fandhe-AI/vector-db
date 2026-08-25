@@ -80,7 +80,13 @@ impl Xorshift32 {
 }
 
 fn make_embedding(dim: u32, seed: u32) -> Vec<f32> {
-    let mut rng = Xorshift32(seed | 1);
+    // seed 0 は xorshift の不動点になるため非ゼロへ置換する。`seed | 1` だと
+    // 隣接する偶奇シード（0/1・2/3 等）が同じ値へ潰れ、実質半数の異なる
+    // ベクトルしか得られなくなる問題があった。置換先を実際に使われる seed=1
+    // と衝突しない u32::MAX にすることで、0 と 1 を含むすべての隣接シードが
+    // 異なるベクトルを生成する（`tests/extensions.rs::make_embedding` と同型修正）。
+    let seeded = if seed == 0 { u32::MAX } else { seed };
+    let mut rng = Xorshift32(seeded);
     (0..dim).map(|_| rng.next_f32()).collect()
 }
 
