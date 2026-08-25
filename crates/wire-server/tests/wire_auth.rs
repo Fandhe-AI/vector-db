@@ -1,8 +1,9 @@
 //! wire-server の結合テスト（TASK-67・対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
 //!
 //! ephemeral port（`127.0.0.1:0`）でサーバースレッドを起動し、`std::net::TcpStream`
-//! で生バイトを送受信する自作クライアントを用いる（`psql` 等の外部プロセスは CI に
-//! 存在しないため対象外。実機確認は手元検証に委ねる）。
+//! で生バイトを送受信する自作クライアントを用いる。実 `psql`／`psycopg`／`pg`
+//! による無改造クライアント検証は `tests/three_client_e2e.rs`（`#[ignore]`。
+//! TASK-73・WIRE-1）が別途担う。
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

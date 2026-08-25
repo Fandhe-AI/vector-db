@@ -297,6 +297,16 @@ pub fn verify(
         Ok(tenant_id) => {
             // tenant_id はロード時に `PolicyContext::new` で検証済みだが、契約変更に
             // 備えて再検証する（fail-closed。ここでの失敗も認証失敗として扱う）。
+            //
+            // `Public` のみ許可し `Private` は含めない（既定・最小権限）。
+            // `wire1_three_tenant_visibility_public_shared_private_hidden`
+            // （`crates/wire-server/tests/wire1_simple_query.rs`）が、認証した
+            // テナント自身の `Private` 行であっても wire 経由の SELECT では
+            // 不可視であることを回帰確認しており、ここを `Private` 許可へ
+            // 広げるとその境界を壊す（codex-review P1・PR #210 指摘の検討過程で
+            // 確認。テナント越境ではなく自テナント自身の可視性でも意図的に
+            // 最小権限のまま。対応は `simple_query.rs` 側で wire の INSERT 自体を
+            // 公開しない方針とした）。
             engine::policy::PolicyContext::new(&tenant_id).map_err(|_| AuthFailure)
         }
         Err(()) => Err(AuthFailure),
