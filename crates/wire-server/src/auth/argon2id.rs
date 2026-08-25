@@ -166,6 +166,10 @@ fn compute_h0(
     out
 }
 
+/// 常に `h_prime(1024, ..)` の戻り値（固定長 1024 バイト）のみを受け取る内部専用の
+/// 変換であり、untrusted 入力（PHC 文字列由来のバイト列）は経由しない。
+/// `i` は `block.iter_mut()`（要素数 128 固定）由来のため `i*8+8 <= 1024` が常に成立し、
+/// スライス添字は境界内に収まる。
 fn bytes_to_block(bytes: &[u8]) -> Block {
     let mut block = [0u64; BLOCK_QWORDS];
     for (i, word) in block.iter_mut().enumerate() {
@@ -226,6 +230,9 @@ fn g(x: &Block, y: &Block) -> Block {
 
     // 8x8 の 16 バイトレジスタ行列とみなし、まず行方向（連続する 16 ワード = 1 行）へ。
     for i in 0..8 {
+        // `r` は固定長 128 要素の配列、`i` は `0..8` の固定範囲（untrusted 入力に
+        // 依存しない）なので `16*i..16*i+16` は常に `r` の境界内に収まり、
+        // `try_into()` は失敗しない。
         let mut v: [u64; 16] = r[16 * i..16 * i + 16].try_into().expect("16 words");
         p_round(&mut v);
         r[16 * i..16 * i + 16].copy_from_slice(&v);
@@ -497,6 +504,9 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
         if len == 1 {
             return None;
         }
+        // 直前の `len == 1` ガードにより、ここに到達する chunk は常に長さ 2 以上
+        // （`bytes.chunks(4)` は最後の chunk のみ 4 未満になりうる）。untrusted な
+        // PHC 文字列由来でも `chunk[0]`・`chunk[1]` の添字アクセスは境界内。
         let c0 = val(chunk[0])?;
         let c1 = val(chunk[1])?;
         let n = c0 << 18 | c1 << 12;
@@ -571,7 +581,13 @@ pub fn parse_phc(phc: &str) -> Result<(Params, Vec<u8>, Vec<u8>), Argon2Error> {
 
     let salt = b64_decode(salt_field).ok_or(Argon2Error::MalformedPhc)?;
     let hash = b64_decode(hash_field).ok_or(Argon2Error::MalformedPhc)?;
-    if salt.is_empty() || hash.is_empty() {
+    // `hash_raw` は RFC 9106 の H'（可変長ハッシュ）呼び出し前提として `out_len >= 4`
+    // を要求する（下記 `out_len < 4` チェック参照）。この下限を decode 後の hash
+    // フィールドにも起動時（`auth.rs::load_from_file`）に適用しないと、3 バイト以下に
+    // decode される構文的に正しい PHC が load 時には通過し、`verify_phc` 呼び出し
+    // （毎回の認証試行時）で `hash_raw` が `InvalidParam` を返し続けて恒久的な
+    // ログイン不能を招く（fail-closed だが検出が遅すぎるレビュー指摘）。
+    if salt.is_empty() || hash.len() < 4 {
         return Err(Argon2Error::MalformedPhc);
     }
     Ok((params, salt, hash))
@@ -680,6 +696,19 @@ mod tests {
         );
     }
 
+    /// レビュー指摘の再現ケース: 構文的には正しいが hash フィールドが decode 後
+    /// 4 バイト未満（"aA" は 1 バイトに decode される）の PHC を `parse_phc` 単体で
+    /// 拒否すること。`auth.rs::load_from_file_rejects_hash_shorter_than_4_bytes` は
+    /// `LoadError::InvalidPhc` に畳み込まれた結果だけを検査するため、この分岐
+    /// （`hash.len() < 4`）自体を直接ピン留めする。
+    #[test]
+    fn parse_phc_rejects_hash_shorter_than_4_bytes() {
+        assert_eq!(
+            parse_phc("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aA"),
+            Err(Argon2Error::MalformedPhc)
+        );
+    }
+
     #[test]
     fn hash_raw_rejects_memory_too_small_for_lanes() {
         let params = Params {
@@ -691,6 +720,25 @@ mod tests {
             hash_raw(b"pw", b"salt", &[], &[], &params, 32),
             Err(Argon2Error::MemoryTooSmall)
         );
+    }
+
+    /// レビュー指摘: RFC 9106 KAT（m=32, p=4 → seg_len=2）は `fill_segment` の
+    /// data-independent アドレッシングにおける `i % 128 == 0` のアドレスブロック
+    /// 再生成分岐（seg_len > 128 で複数回踏む経路。本番 `RECOMMENDED_PARAMS` 相当）を
+    /// 通過しない。m=576, p=1 → seg_len=144(>128) の round-trip 検証でこの分岐を
+    /// カバーする（数値 KAT ではなく、暗号処理が完走し一致・不一致を正しく判定する
+    /// ことを確認する機能テスト）。
+    #[test]
+    fn hash_raw_covers_large_seg_len_address_block_regeneration() {
+        let params = Params {
+            m_cost_kib: 576,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let salt = b"0123456789abcdef";
+        let phc = encode_phc(b"correct horse battery staple", salt, &params).expect("valid params");
+        assert!(verify_phc(&phc, b"correct horse battery staple").expect("valid phc"));
+        assert!(!verify_phc(&phc, b"wrong password").expect("valid phc"));
     }
 
     #[test]

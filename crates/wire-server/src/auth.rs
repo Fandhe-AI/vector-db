@@ -197,6 +197,8 @@ impl AuthFailure {
 fn dummy_phc() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
+        // `RECOMMENDED_PARAMS`・固定 salt・固定パスワードはすべてコンパイル時定数
+        // （untrusted 入力を一切経由しない）なので `encode_phc` は失敗しえない。
         argon2id::encode_phc(
             b"dummy-password-never-matches",
             b"0000000000000000",
@@ -385,6 +387,28 @@ mod tests {
         std::fs::write(
             &path,
             "alice:tenant-a:$argon2id$v=19$m=999999999,t=1,p=1$c2FsdA$aGFzaA\n",
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 構文的には正しいが decode 後の hash フィールドが 4 バイト未満（`hash_raw` が
+    /// 要求する `out_len >= 4` の下限を満たさない）の PHC を起動時に拒否すること
+    /// （レビュー指摘: この検証がないと load は通過し、`verify()` が常に
+    /// `hash_raw` の `InvalidParam` で不一致扱いになり続け、恒久的なログイン不能に
+    /// なるのを起動時に前倒しで検出する）。
+    #[test]
+    fn load_from_file_rejects_hash_shorter_than_4_bytes() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_short_hash.txt");
+        // "c2FsdA" は "salt"（4 バイト）に decode される salt。"aA" は 1 バイトにしか
+        // decode されない hash フィールド（`hash_raw` の下限 4 バイト未満）。
+        std::fs::write(
+            &path,
+            "alice:tenant-a:$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aA\n",
         )
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
