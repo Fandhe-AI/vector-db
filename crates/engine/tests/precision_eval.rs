@@ -4,8 +4,10 @@
 //! `precision` モード（TASK-162。`crates/engine/src/precision.rs`）の評価基準を
 //! 実測する評価ハーネス。`tests/hybrid_recall.rs`（TASK-104）・
 //! `tests/rerank_recall.rs`（TASK-108）と同じ「決定的合成コーパス＋2 層構成
-//! （層 A 固定値回帰／層 B spec 閾値ゲート）」方式を踏襲するが、対象が Recall では
-//! なく **Top-1 Accuracy・MRR@10・正解不在クエリでの誤返却率** である点が異なる。
+//! （層 A 固定値回帰／層 B spec 閾値ゲート）」方式を踏襲する。SEARCH-10 の評価指標
+//! 定義・実測値・目標値確定の判断材料は spec 側（上記ポインタ）と
+//! `docs/design/precision-eval-regression.md` に記録し、本ファイルには転記しない
+//! （`.claude/rules/spec-confidentiality.md`）。
 //!
 //! # 測定経路
 //!
@@ -18,40 +20,19 @@
 //! **dense**（`embedding <=> ...`）を副として同一コーパスで併測する
 //! （`PrecisionPolicy` が dense/hybrid 別閾値を持つため）。
 //!
-//! # 指標定義
-//!
-//! QA セットを「正解あり Q+」「正解不在 Q0」に分ける。
-//!
-//! - **Top-1 Accuracy**（Q+ が分母）: `precision` 出力が非空かつ先頭行 id が正解集合に
-//!   含まれるクエリの割合。**空集合は不正解扱い**（fail-closed 側の保守的な定義）。
-//! - **MRR@10**（Q+ が分母）: `recall` モード `LIMIT 10`（候補生成段は precision と
-//!   共通。SEARCH-9）の順位列で最初の正解の逆順位（10 位以内に無ければ 0）の平均。
-//!   `precision` 出力そのものではなく共通の候補生成段で測る理由: 既定
-//!   `max_results`（1）では `precision` 出力の MRR は Top-1 Accuracy と数学的に同値へ
-//!   退化し、別指標として測る意味がなくなるため（ユーザー確認事項。ADR
-//!   `docs/design/precision-eval-regression.md` 参照）。
-//! - **誤返却率**（Q0 が分母）: 正解が存在しないクエリで `precision` 出力が非空になる
-//!   割合。
-//!
-//! 診断値（層 A のアサート対象外・`println!` のみ）: coverage（Q+ で非空を返した
-//! 割合）・条件付き Top-1 精度（非空のうち先頭が正解の割合）。
-//!
 //! # 2 層構成
 //!
-//! - 層 A（`#[test]`・`make ci` 対象）: 決定的コーパスでの QA 件数・Top-1 命中数・
-//!   MRR 順位別命中分布（`rank -> 件数` を丸ごと固定値アサーション。総ヒット件数
-//!   のみだと順位の入れ替わりを検知できないため）・誤返却件数を固定値アサーションで
-//!   回帰トラッキングする。spec の数値基準は使わない
+//! - 層 A（`#[test]`・`make ci` 対象）: 決定的コーパスでの実測値を固定値アサーション
+//!   で回帰トラッキングする。spec の数値基準は使わない
 //!   （`.claude/rules/spec-confidentiality.md`）。
 //! - 層 B（`#[ignore]`・`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
 //!   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
 //!   （`hybrid_recall.rs::resolve_gate_threshold` と同型の解決規則）による閾値ゲート。
-//!   TASK-163 のスコープは実測・判断材料の提示までであり目標値の確定は含まないため、
-//!   `.github/workflows/recall.yml` への接続は本タスクでは行わない（目標値確定後の
-//!   フォローアップとする。申し送り・README 参照）。
+//!   `.github/workflows/recall.yml` への接続は本タスクでは行わない（README 参照）。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
-//!   小さな格子で差し替え、3 指標の変化を `println!` で表示する（目標値確定の判断
-//!   材料。production の既定値は変更しない）。
+//!   小さな格子で差し替え、指標の変化を `println!` で表示する（目標値確定の判断
+//!   材料。production の既定値は変更しない。実測結果は
+//!   `docs/design/precision-eval-regression.md` 参照）。
 //!
 //! # TASK-158（性能計測プロトコル基盤）準拠
 //!

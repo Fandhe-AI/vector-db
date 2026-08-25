@@ -128,11 +128,10 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 
 ### `precision` 評価ハーネス（TASK-163）
 
-`crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の評価基準
-（Top-1 Accuracy・MRR@10・正解不在クエリでの誤返却率。SEARCH-10）を、決定的合成
-コーパス（正解不在クエリを含む）上で実測する評価ハーネスです。設計判断・実測結果・
-パラメータ感度スイープの記録は `docs/design/precision-eval-regression.md` を
-参照してください。
+`crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の
+SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエリを含む）上で実測する
+評価ハーネスです。設計判断の記録は `docs/design/precision-eval-regression.md`
+を参照してください（指標の定義・実測値・パラメータ感度は spec 側で管理します）。
 
 - 層 A（`cargo test -p engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
   での実測値を固定値で回帰トラッキングします。spec の数値基準は使いません。
@@ -145,8 +144,7 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 - **`.github/workflows/recall.yml` への接続は行っていません**: TASK-163 のスコープは
   実測・判断材料の提示までであり目標値の確定は含まないため、上記の
   `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。
-  `docs/design/precision-eval-regression.md` の実測値・感度表をもとに目標値が
-  確定したのち、`RERANK_RECALL_MIN_*` 等と同様に `recall-gate` の Actions
+  目標値が確定したのち、`RERANK_RECALL_MIN_*` 等と同様に `recall-gate` の Actions
   variables として設定し、`recall.yml` の `recall-regression` job に
   `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` 付きの step を追加してください。
 
