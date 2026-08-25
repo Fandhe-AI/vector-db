@@ -196,7 +196,15 @@ pub enum Projection {
 /// 許可形状の構造判定を通過した SQL 文（後続タスクのパーサー・実行計画の土台）。
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
 /// 妥当性は検証しない（`sql::parser::bind` の責務）。
+///
+/// `#[non_exhaustive]`: TASK-161（SQL-12）で `search_mode` フィールドを追加した際、
+/// 既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
+/// 変更となった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド
+/// 追加が同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応
+/// にする。本構造体はクレート外から直接構築するものではなく、[`validate_sql`] の
+/// 戻り値としてのみ取得する。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,

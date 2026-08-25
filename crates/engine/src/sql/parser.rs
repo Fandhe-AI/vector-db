@@ -57,7 +57,15 @@ pub enum Ranking {
 
 /// 束縛済みの SQL 文（[`exec::execute_statement`](crate::sql::exec::execute_statement)
 /// が直接実行する入力形）。
+///
+/// `#[non_exhaustive]`: TASK-161（SQL-12）で `mode` フィールドを追加した際、既存の
+/// 構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的変更と
+/// なった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド追加が
+/// 同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応にする。
+/// 本構造体はクレート外から直接構築するものではなく、[`bind_with_session`] の戻り値
+/// としてのみ取得する。
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct BoundStatement {
     pub table: String,
     pub projection: Vec<ProjectedColumn>,
