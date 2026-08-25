@@ -30,7 +30,7 @@ fn wire8_parse_bind_execute_sync_pipeline_gets_0a000_then_eof() {
     // Parse('P') + Bind('B') + Describe('D') + Execute('E') + Sync('S') を
     // 1 回の write_all でまとめて送る（クライアントのパイプライン送信を模す）。
     let mut pipeline = Vec::new();
-    for type_byte in [b'P', b'B', b'D', b'E', b'S'] {
+    for type_byte in *b"PBDES" {
         let total_len = 4i32; // 空 body
         pipeline.push(type_byte);
         pipeline.extend_from_slice(&total_len.to_be_bytes());
@@ -48,7 +48,7 @@ fn wire8_parse_bind_execute_sync_pipeline_gets_0a000_then_eof() {
 fn wire8_each_extended_message_alone_is_rejected_and_closed() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
 
-    for type_byte in [b'P', b'B', b'D', b'E', b'S', b'C', b'H'] {
+    for type_byte in *b"PBDESCH" {
         let addr = spawn_server_accepting_one(&users_path);
         let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
@@ -120,7 +120,7 @@ fn wire8_unknown_message_type_is_rejected_and_closed() {
 fn wire8_unsupported_feature_message_type_gets_distinct_message_text() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
 
-    for type_byte in [b'F', b'd', b'c', b'f'] {
+    for type_byte in *b"Fdcf" {
         let addr = spawn_server_accepting_one(&users_path);
         let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 

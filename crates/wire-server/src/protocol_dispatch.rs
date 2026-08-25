@@ -65,11 +65,8 @@ type WriteErrorResponseFn = fn(&mut TcpStream, &str, &str) -> io::Result<()>;
 /// `Ok(())` を返し、`stream` の drop によって接続を閉じる契約とする。
 ///
 /// SQLSTATE は `ExtendedQuery` / `UnsupportedFeature` / `Unknown` のいずれも
-/// `0A000` で統一する（`docs/spec/04-behavior/error-format.md` の判定境界を確認
-/// 済み: `0A000` は SQL 以前のプロトコルメッセージ種別レベルの未対応に適用する分類で
-/// あり、`08P01` は起動メッセージ不正専用（WIRE-10 管轄、本経路とは別の契機）のため
-/// 認証後の未知/未対応バイトには適用しない）。一方でメッセージ文言は分類ごとに
-/// 事実に即した表現へ分ける（[`response_message`]）。
+/// `0A000` で統一する（ポインタ: TASK-71・WIRE-8、`docs/spec/04-behavior/error-format.md`）。
+/// 一方でメッセージ文言は分類ごとに事実に即した表現へ分ける（[`response_message`]）。
 pub(crate) fn reject_and_close(
     stream: &mut TcpStream,
     kind: FrontendMessageKind,
@@ -101,9 +98,9 @@ fn response_message(kind: FrontendMessageKind) -> &'static str {
             "COPY and function call protocol messages are not supported on this connection"
         }
         // 認証後に来るべきでない 'p'（PasswordMessage）や、既知の型バイト集合に
-        // 該当しない値をまとめて扱う。protocol_violation（08P01）は起動メッセージ
-        // 不正専用のため使わず、feature_not_supported（0A000）のまま文言のみ
-        // 「未対応の型バイト」であることを明示する。
+        // 該当しない値をまとめて扱う（ポインタ: TASK-71・WIRE-8、
+        // `docs/spec/04-behavior/error-format.md`）。文言のみ「未対応の型バイト」
+        // であることを明示する。
         FrontendMessageKind::Unknown(_) => {
             "this frontend message type is not supported on this connection"
         }
