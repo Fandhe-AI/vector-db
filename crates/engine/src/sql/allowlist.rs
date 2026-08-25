@@ -12,7 +12,9 @@
 
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
-use crate::sql::udf_call::{BinOp, Expr, MAX_CALL_ARGS, MAX_EXPR_DEPTH, MAX_UDF_PARAMS};
+use crate::sql::udf_call::{
+    BinOp, Expr, MAX_CALL_ARGS, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+};
 use crate::sql::using_operation_id::OperationId;
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
@@ -430,11 +432,33 @@ pub struct ValidatedInsert {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// 式ノード（`Expr::Number` / `Ident` / `Binary` / `Call`）の残り生成可能数。
+    /// `parse_add_expr` / `parse_mul_expr` の左結合ループは `depth` を増やさず
+    /// `lhs` に木を積み続けるため、`MAX_EXPR_DEPTH`（構文解析の再帰段数）だけでは
+    /// "1+1+...+1" のような同一深さの連鎖入力を制限できない。ノード生成のたびに
+    /// 本フィールドを課金し、AST 全体のノード数を UDF 本体と同じ [`MAX_EXPR_NODES`]
+    /// で頭打ちにすることで、ノード予算枯渇後の `Box<Expr>` 再帰的 drop による
+    /// スタック消費も定数に抑える（security.md「不安全な設計｜無制限リソース確保
+    /// （DoS）」対応。1 文（`Parser` 1 インスタンス）につき共有）。
+    expr_node_budget: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            expr_node_budget: MAX_EXPR_NODES,
+        }
+    }
+
+    /// 式ノードを 1 つ生成する直前に呼び、予算を消費する。予算枯渇時は
+    /// fail-closed に拒否する（[`Self::expr_node_budget`] 参照）。
+    fn consume_expr_node(&mut self) -> Result<(), SqlSurfaceError> {
+        self.expr_node_budget = self.expr_node_budget.checked_sub(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+        })?;
+        Ok(())
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -692,6 +716,7 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let rhs = self.parse_mul_expr(depth + 1)?;
+            self.consume_expr_node()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -711,6 +736,7 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let rhs = self.parse_primary_expr(depth + 1)?;
+            self.consume_expr_node()?;
             lhs = Expr::Binary {
                 op,
                 lhs: Box::new(lhs),
@@ -726,6 +752,7 @@ impl<'a> Parser<'a> {
         match self.peek().cloned() {
             Some(Token::Number(n)) => {
                 self.advance();
+                self.consume_expr_node()?;
                 Ok(Expr::Number(n))
             }
             Some(Token::Punct('(')) => {
@@ -739,6 +766,7 @@ impl<'a> Parser<'a> {
                 if matches!(self.peek(), Some(Token::Punct('('))) {
                     self.parse_call_expr(name, depth)
                 } else {
+                    self.consume_expr_node()?;
                     Ok(Expr::Ident(name))
                 }
             }
@@ -766,6 +794,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(')')?;
+        self.consume_expr_node()?;
         Ok(Expr::Call { name, args })
     }
 
@@ -1574,6 +1603,23 @@ mod tests {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE lang != 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
+    }
+
+    #[test]
+    fn rejects_long_left_associative_arithmetic_chain_by_node_budget() {
+        // `parse_add_expr`/`parse_mul_expr` の左結合ループは `depth` を増やさずに
+        // `lhs` へ木を積み続けるため、"1+1+...+1" のような同一深さの連鎖入力は
+        // `MAX_EXPR_DEPTH`（構文解析の再帰段数チェック）をすり抜けうる。ノード数
+        // 予算（`Parser::expr_node_budget`、[`MAX_EXPR_NODES`] 共有）がこの形の
+        // 入力も頭打ちにすることを確認する（`54000`。ノード予算エラー後の
+        // `Box<Expr>` 再帰的 drop によるスタック消費を定数に抑える対応）。
+        let chain: String = "1+".repeat(600) + "1";
+        let sql = format!(
+            "SELECT * FROM documents WHERE {chain} > 0 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000", "err={err:?}");
     }
 
     #[test]

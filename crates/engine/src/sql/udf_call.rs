@@ -30,11 +30,17 @@ pub const MAX_UDF_PARAMS: usize = 32;
 pub const MAX_CALL_ARGS: usize = 32;
 /// 式の構文解析時の再帰深さ上限（スタック消費の上限。`54000`）。
 pub const MAX_EXPR_DEPTH: usize = 32;
-/// UDF インライン展開後の式ノード数上限（多段呼び出しによる指数的膨張への歯止め。
-/// `54000`）。
+/// UDF インライン展開後の式ノード数上限（多段呼び出しによる指数的膨張への歯止め）。
+/// `sql::allowlist::Parser` はこれと同一の値を構文解析時のノード数予算
+/// （`Parser::expr_node_budget`）としても共有し、左結合ループが `MAX_EXPR_DEPTH`
+/// をすり抜けて木を積み続ける入力（"1+1+...+1" 等）を頭打ちにする（`54000`）。
 pub const MAX_EXPR_NODES: usize = 1024;
 /// セッションが保持できる UDF 定義数上限（`54000`）。
 pub const MAX_SESSION_UDFS: usize = 64;
+/// `f64` の 52 bit 仮数部で整数値を正確に表現できる上限（`2^53`）。行 `id`
+/// （[`id_as_finite_scalar`]）・整数の数値リテラル（[`bind_expr_in`] の
+/// `Expr::Number` 束縛）の双方で同一の正確表現境界として共有する。
+const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
 
 /// 式の二項演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,15 +220,25 @@ pub fn define_function(
             "too many function parameters",
         ));
     }
+    // パラメータ名は SQL 識別子として大文字小文字を区別しない扱いに正規化する
+    // （引用なし識別子の大文字小文字はどちらで書いても同一パラメータを指す）。
+    // 重複検査・本体の参照検証（`validate_closed_expr`）・呼び出し時の `BindEnv`
+    // キー・参照解決（`bind_expr_in`）の全経路でこの正規形（小文字）に統一する
+    // ことで、`CREATE FUNCTION f(V) AS v` のような引用なし識別子の大文字小文字が
+    // 経路ごとに食い違い、本体参照が誤って undefined reference 判定される不整合
+    // を構造的に防ぐ。
     let mut seen = std::collections::HashSet::new();
+    let mut normalized_params = Vec::with_capacity(params.len());
     for p in params {
         catalog::validate_identifier(p)
             .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid parameter name: {p}")))?;
-        if !seen.insert(p.to_ascii_lowercase()) {
+        let normalized = p.to_ascii_lowercase();
+        if !seen.insert(normalized.clone()) {
             return Err(SqlSurfaceError::invalid_input(format!(
                 "duplicate parameter name: {p}"
             )));
         }
+        normalized_params.push(normalized);
     }
 
     // 本体式は列参照を持たない閉じた関数であること（`schema: None`）を確認するため
@@ -231,12 +247,12 @@ pub fn define_function(
     // 型検査は「構造的に閉じているか（列参照・未知名の不在）」の確認に留め、
     // 型の厳密な検査は呼び出し（インライン展開）時に呼び出し元の引数型で行う）。
     let mut node_budget = MAX_EXPR_NODES;
-    validate_closed_expr(body, params, registry, &mut node_budget)?;
+    validate_closed_expr(body, &normalized_params, registry, &mut node_budget)?;
 
     registry.defs.insert(
         lower,
         UdfDefinition {
-            params: params.to_vec(),
+            params: normalized_params,
             body: body.clone(),
         },
     );
@@ -260,7 +276,10 @@ fn validate_closed_expr(
     match expr {
         Expr::Number(_) => Ok(()),
         Expr::Ident(name) => {
-            if params.iter().any(|p| p == name) {
+            // `params` は `define_function` で正規化済み（小文字）。本体側の参照は
+            // 引用なし識別子として書かれた原文字列のままなので、比較のたびに同じ
+            // 正規形へそろえる（呼び出し時の `bind_expr_in` の参照解決と一貫させる）。
+            if params.iter().any(|p| *p == name.to_ascii_lowercase()) {
                 Ok(())
             } else {
                 Err(SqlSurfaceError::invalid_input(format!(
@@ -362,6 +381,29 @@ fn bind_expr_in(
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     match expr {
         Expr::Number(raw) => {
+            // 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を
+            // 生成する）は `f64::from_str` が黙って最近接値へ丸めうる
+            // （`raw.parse::<f64>()` はエラーにならない）。`id_as_finite_scalar` と
+            // 同じ「`2^53` を超える整数は `f64` で正確に表現できない」境界を、丸め
+            // 変換の *前* に整数として検査することで、`WHERE id = 9007199254740993`
+            // のような大きな整数リテラルが精度欠落によって別の値（例:
+            // `9007199254740992`）と黙って同一視されるのを防ぐ（fail-closed。
+            // security.md「不安全な設計」対応）。
+            let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+            if is_integer_literal {
+                let as_int: u64 = raw.parse().map_err(|_| {
+                    // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
+                    // `f64` で正確に表現できないことに変わりはない。
+                    SqlSurfaceError::invalid_input(
+                        "integer literal exceeds the range that can be exactly represented",
+                    )
+                })?;
+                if as_int > MAX_EXACT_F64_INT {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "integer literal exceeds the range that can be exactly represented",
+                    ));
+                }
+            }
             let v: f64 = raw
                 .parse()
                 .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
@@ -373,7 +415,11 @@ fn bind_expr_in(
             Ok((BoundExpr::Number(v), ExprType::Scalar))
         }
         Expr::Ident(name) => {
-            if let Some((bound, ty)) = env.params.get(name) {
+            // `env.params`（UDF 本体束縛時のみ非空）のキーは `define_function` で
+            // 正規化済み（小文字）。本体の参照側も同じ正規形へそろえて引く
+            // （`validate_closed_expr` の参照検証と一貫させる。外側コンテキストでは
+            // `env.params` が常に空のため、列名の大文字小文字扱いには影響しない）。
+            if let Some((bound, ty)) = env.params.get(name.to_ascii_lowercase().as_str()) {
                 // パラメータ参照の展開は、構文上は 1 ノードでも実際には既に展開済みの
                 // `BoundExpr` 部分木をまるごとクローンする（UDF 連鎖・多重参照時に
                 // 展開結果が指数的に膨張しうる経路）。構文ノード数（直前の
@@ -546,7 +592,6 @@ fn bind_call(
 /// 無条件に `as f64` で丸めると、`WHERE id = <literal>` のような等価述語が精度欠落
 /// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22000` で拒否する）。
 fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
-    const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
     if id > MAX_EXACT_F64_INT {
         return Err(SqlSurfaceError::invalid_input(
             "row id exceeds the range that can be exactly represented for comparison",
@@ -935,6 +980,23 @@ mod tests {
     }
 
     #[test]
+    fn param_name_case_is_ignored_between_declaration_and_body_reference() {
+        // `CREATE FUNCTION f(V) AS v`: 引用なし識別子はパラメータ宣言（`V`）と
+        // 本体参照（`v`）の大文字小文字が食い違っても同一パラメータとして解決
+        // されるべき（定義時検証・呼び出し時のインライン展開の双方で一貫させる）。
+        let mut registry = UdfRegistry::default();
+        define_function(&mut registry, "f", &["V".to_string()], &ident("v")).unwrap();
+
+        let schema = schema_with_vector();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(&call("f", vec![num("7")]), &schema, &registry, &mut budget)
+            .expect("call should bind: parameter case must resolve regardless of declared case");
+        assert_eq!(ty, ExprType::Scalar);
+        let value = eval(&bound, 1, &[0.0, 0.0, 0.0]).expect("eval should succeed");
+        assert_eq!(value, ExprValue::Scalar(7.0));
+    }
+
+    #[test]
     fn redefining_a_function_is_rejected() {
         let mut registry = UdfRegistry::default();
         define_function(&mut registry, "f", &["x".to_string()], &ident("x")).unwrap();
@@ -1003,10 +1065,30 @@ mod tests {
 
     #[test]
     fn id_beyond_f64_exact_range_is_rejected_not_silently_rounded() {
+        // `id_as_finite_scalar` は評価時に大きな `id` を拒否するが、リテラル側も
+        // `f64` へ暗黙丸め変換されたままだと `WHERE id = 9007199254740993` が
+        // 精度欠落により `id = 9007199254740992` の行にも一致してしまう。整数
+        // リテラルの正確表現域チェックは束縛（`bind_expr`）時点で先に働くべきなので、
+        // ここでは bind 自体が `22000` で拒否されることを確認する
+        // （評価まで到達させない、より早い fail-closed）。
         let schema = schema_with_vector();
         let registry = UdfRegistry::default();
         let mut budget = MAX_EXPR_NODES;
         let expr = bin(BinOp::Eq, ident("id"), num("9007199254740993"));
+        let err = bind_expr(&expr, &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn row_id_beyond_f64_exact_range_is_rejected_at_eval_time_independently_of_literal_check() {
+        // 上のテストはリテラル側の正確表現域チェック（bind 時）を確認する。本テストは
+        // `id_as_finite_scalar`（eval 時、行 `id` 側）が独立した多重防御として機能する
+        // ことを確認する: リテラルは小さく bind を通過させ、行 `id` の方を
+        // `2^53` 超に設定して eval が `22000` で拒否することを見る。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = bin(BinOp::Eq, ident("id"), num("42"));
         let (bound, _) =
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         let err = eval(&bound, 9_007_199_254_740_993, &[0.0, 0.0, 0.0]).unwrap_err();
