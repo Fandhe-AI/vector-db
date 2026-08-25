@@ -281,6 +281,28 @@ fn stateless_execute_sql_rejects_set_search_mode() {
 }
 
 #[test]
+fn stateless_execute_sql_rejects_set_search_mode_with_42601_regardless_of_literal_validity() {
+    // codex-review P1 指摘対応: `execute_sql` は statement 種別（SET か SELECT か）のみで
+    // 拒否を判定し、`SET` のリテラル値が妥当（`recall`／`precision`）か無効（`fuzzy` 等）
+    // かに関わらず同じ `42601` を返す。以前は内部で `execute_sql_in_session` へ委譲して
+    // いたため、リテラル値の妥当性検証（`SearchMode::parse_literal`）が先に走り、無効な
+    // 値だけ `22000` を返す非決定的な契約になっていた（同じ「非対応 statement」のはずが
+    // 値によってエラーコードが変わっていた）。
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let valid_literal_err = core
+        .execute_sql(&ctx, "SET search_mode = 'recall'")
+        .expect_err("SET with a valid literal must still be rejected on this entry point");
+    let invalid_literal_err = core
+        .execute_sql(&ctx, "SET search_mode = 'fuzzy'")
+        .expect_err("SET with an invalid literal must also be rejected on this entry point");
+
+    assert_eq!(valid_literal_err.wire_code(), "42601");
+    assert_eq!(invalid_literal_err.wire_code(), "42601");
+}
+
+#[test]
 fn stateless_execute_sql_still_resolves_default_recall_mode() {
     let (core, _guard) = new_core_with_docs();
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");

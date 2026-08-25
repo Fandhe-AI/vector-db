@@ -646,17 +646,40 @@ impl EngineCore {
         ctx: &PolicyContext,
         sql: &str,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        // セッション変数を持たない後方互換 API（TASK-75 由来）。TASK-161 が追加した
-        // [`execute_sql_in_session`] へ、呼び出しの間だけ生存する空の
-        // `SessionState` で委譲する（`SET`/`EXPLAIN` 等セッションを要する statement は
-        // このエントリポイントでは受理しない。黙った no-op にしない）。
-        let mut session = crate::sql::mode::SessionState::default();
-        match self.execute_sql_in_session(ctx, &mut session, sql)? {
-            crate::sql::SqlOutcome::Query(result) => Ok(result),
-            crate::sql::SqlOutcome::SetSearchMode(_) => {
+        // セッション変数を持たない後方互換 API（TASK-75 由来）。`SET search_mode` 等
+        // セッションを要する statement はこのエントリポイントでは受理しない
+        // （黙った no-op にしない）。
+        //
+        // statement 種別の判定を [`crate::sql::allowlist::validate_sql`] で先に行い、
+        // `SetSearchMode` はリテラル値の妥当性を検証する前に一律 `42601` で拒否する
+        // （codex-review P1 指摘対応: 以前は `execute_sql_in_session` へ委譲していたため、
+        // 内部で `SearchMode::parse_literal` が先に走り、無効なリテラル値（例:
+        // `SET search_mode = 'fuzzy'`）は `22000` を返す一方、有効な値は `42601` を
+        // 返すという、同じ「このエントリポイントでは非対応」の statement が値によって
+        // 異なるエラーコードを返す非決定的な契約になっていた。fail-closed の観点でも
+        // エラー契約は入力の意味論的妥当性に関わらず一貫させるべきであり、statement
+        // 種別のみで判定する）。
+        match crate::sql::allowlist::validate_sql(sql, &self.storage)? {
+            crate::sql::allowlist::Statement::SetSearchMode { .. } => {
                 Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
                     "SET search_mode requires a session-aware entry point",
                 ))
+            }
+            crate::sql::allowlist::Statement::Select(_) => {
+                // `SELECT` と判定済みのため、[`Self::execute_sql_in_session`] が
+                // `SqlOutcome::SetSearchMode` を返すことはない（同一 `sql` を
+                // `validate_sql` で 2 度構文解析するが、副作用のない決定的なパースの
+                // ため安全側に倒した単純さを優先する）。
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_) => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected SetSearchMode outcome for a statement                                      already classified as Select"
+                                .to_string(),
+                        })
+                    }
+                }
             }
         }
     }
