@@ -7,8 +7,7 @@
 //! 直接操作する（`crates/engine/Cargo.toml` の `[dev-dependencies]` 参照）。
 //! TASK-142・TASK-143 は本ファイルのスコープ外（ポインタ: `docs/spec/05-tasks.md`）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -21,28 +20,11 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 /// テスト側は行の中身を解釈しないため、値のエンコード詳細に依存しない。
 const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`cargo test` のデフォルト並列実行でも
-/// 衝突しないよう、プロセス ID とプロセス内連番を組み合わせる）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-persist-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     row_with_rls("tenant-a", Visibility::Public, embedding, metadata)

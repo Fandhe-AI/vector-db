@@ -5,7 +5,6 @@
 //! `crates/engine/tests/hybrid_recall.rs`（TASK-104）の決定的合成コーパス生成
 //! （自前 xorshift64*・外部クレート不使用）を踏襲する。
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -48,26 +47,11 @@ impl Xorshift64 {
 
 // ---------- テスト共通のセットアップ ----------
 
-static UNIQUE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`tests/incremental_write_perf.rs` と
-/// 同方式。デフォルトの並列 `cargo test` 実行でも衝突しない）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-rls-prefilter-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const DIM: u32 = 16;
 const TARGET_TENANT: &str = "tenant-target";
@@ -320,10 +304,14 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
     );
 }
 
-/// 内積スコア（[`engine::kernel::CpuScalarProvider`] と同じ尺度・左から右への逐次和）。
-/// 本テストが独立に参照値を算出するための複製（production コードは変更しない）。
+/// 内積スコア。[`engine::kernel::CpuScalarProvider`] が使うカーネルと同一の
+/// `engine::isa::current().dot` へ委譲する（TASK-156・CORE-14 対応: SIMD 化で
+/// 加算順序が変わり得るため、本テストのように production の Top-K と float 完全一致
+/// で比較する箇所は、算術カーネル自体は本番経路と共有しつつ、順位ロジック
+/// （全行スキャン→許可集合フィルタ→ソート、という手順そのもの）は本テストが独立に
+/// 組み立てることで、`PrefilterIndex` の実装を経由しない検証という趣旨を保つ）。
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    engine::isa::current().dot(a, b)
 }
 
 // 対象ビヘイビア: RLS-4。テスト側で独立に「全行スキャン→許可集合でフィルタ→Top-K」を

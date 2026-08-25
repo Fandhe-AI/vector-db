@@ -179,6 +179,14 @@ core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差�
 	scripts/check_core_api.sh --self-test
 	scripts/check_core_api.sh
 
+.PHONY: check-cross
+check-cross: ## TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）
+ifdef HAS_CARGO
+	cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
@@ -200,7 +208,7 @@ ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-che
 # --------------------------------------------------
 
 .PHONY: bench-parallel
-bench-parallel: ## TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から定期実行）
+bench-parallel: ## TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 ifdef HAS_CARGO
 	cargo bench --bench parallel_bench -p engine
 else
@@ -212,7 +220,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-batch
-bench-batch: ## TASK-130 のバッチ高速化受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から手動実行）
+bench-batch: ## TASK-130 のバッチ高速化受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 ifdef HAS_CARGO
 	cargo bench --bench batch_bench -p engine
 else

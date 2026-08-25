@@ -22,8 +22,9 @@
 //! RRF で融合するハイブリッド検索。対象ビヘイビア: SEARCH-1, SEARCH-3。
 //! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-133（`rls.rs`。
 //! `PolicyContext`（TASK-124）と接続する事前フィルタ方式のテナント境界コア実装。対象
-//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` へのキャッシュ統合は
-//! 後続タスクの管轄）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
+//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` は TASK-169
+//! （`core::PrefilterCache`）経由でこのインデックスをキャッシュし世代整合を保った上で
+//! 再利用する）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
 //! 検索時フィルタ方式によるテナント境界フォールバック。対象ビヘイビア: RLS-1, RLS-3。
 //! `PrefilterIndex`（TASK-133）との使い分けは呼び出し元の責務）・TASK-107
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
@@ -67,6 +68,16 @@
 //! TASK-74（対象ビヘイビア: SQL-8）: `sql.rs` が SQL 表層の入口。受信 SQL テキストに
 //! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
 //! （詳細は `sql.rs` モジュールドキュメント参照）。
+//!
+//! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
+//! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
+//!
+//! TASK-156（対象ビヘイビア: CORE-14）: `isa.rs` が CPU 命令セット（AVX2+FMA・
+//! AVX-512・NEON）の実行時検出を提供し、`dispatch.rs::detect_current_isa`
+//! （決定表の ISA 入力）・`kernel.rs::dot`（`CpuScalarProvider` 等が共有する内積
+//! カーネル）双方の実体がこれへ委譲する。SIMD カーネル（`unsafe` を含む）は検出
+//! 成功時のみ構築される sealed トークン経由でしか呼び出せない（詳細は `isa.rs`
+//! モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -76,6 +87,7 @@ pub mod catalog;
 pub mod core;
 pub mod dispatch;
 pub mod hybrid;
+pub mod isa;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
@@ -88,6 +100,19 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+
+/// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
+/// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
+///
+/// `temp_db` 自身の自己テスト（`temp_db_tests`）は本モジュール配下でのみ
+/// コンパイル・実行される（Issue #201 レビュー対応）。`tests/*.rs` 側は
+/// `#[path = "../src/test_util/temp_db.rs"] mod temp_db;` で `temp_db.rs` 単体のみを
+/// 取り込むため、結合テストバイナリごとの重複実行は発生しない。
+#[cfg(test)]
+mod test_util {
+    pub mod temp_db;
+    mod temp_db_tests;
+}
 
 /// engine クレートの識別子。
 ///

@@ -13,7 +13,9 @@
 //! RLS は **`HINT ORDER` の内容に関係なく**、唯一の実効的な防御である候補構築時の
 //! 暗黙事前フィルタ（`VectorArena::build_filtered_with_rows_in_txn` の `predicate`。
 //! `WHERE` 句の `visible()` 呼び出し（[`BoundStatement::rls_predicate_present`]）の
-//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。加えて
+//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。この
+//! 事前フィルタの述語は RLS の暗黙適用フック（[`crate::rls::ImplicitRlsHook`]）
+//! 経由で取得する（TASK-137・RLS-6, RLS-7）。加えて
 //! [`crate::rls::RlsSafetyNet`]（TASK-136・RLS-5）を最終結果へ無条件に適用するが、
 //! この安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補
 //! 集合）由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とす
@@ -37,7 +39,7 @@ use crate::core;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
-use crate::rls::{RlsSafetyNet, RlsVerifiedHits};
+use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
@@ -414,10 +416,11 @@ pub fn execute_statement(
         Ok(true)
     };
 
+    let rls_hook = ImplicitRlsHook::new(ctx);
     let arena = VectorArena::build_filtered_with_rows_in_txn(
         read_txn,
         &bound.table,
-        |tenant, visibility| ctx.is_visible(tenant, visibility),
+        rls_hook.predicate(),
         on_visible_row,
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;

@@ -43,8 +43,8 @@
   pass/fail のみを出力する（README「Recall 回帰ハーネスの repo variables」参照）。
 
   `.github/workflows/recall.yml` は `pull_request` トリガを**意図的に持たない**
-  （現状 `workflow_dispatch` のみ。`schedule` は下記「strict モードによる誤 green
-  防止」の疎通確認後に再追加する）。`pull_request` で起動する job は
+  （`workflow_dispatch` + 週次 `schedule`。下記「strict モードによる誤 green
+  防止」の疎通確認後、Issue #168 で `schedule` を再追加済み）。`pull_request` で起動する job は
   PR 側の untrusted なコード（Makefile・テストコード含む）を checkout して実行する
   ため、層 B を PR トリガにすると PR がコードを書き換えて `HYBRID_RECALL_MIN_*`
   （spec 由来の非公開閾値）を標準出力へ書き出すだけで public な Actions ログから
@@ -104,10 +104,12 @@ variable の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、
 `.github/workflows/bench.yml`（TASK-127）で codex-review に受理された前例
 （CORE-5 未接続の間は `schedule` を有効化せず `workflow_dispatch` のみに限定し、
 接続確認後に `schedule` を再度追加する）と同型の判断として、`recall.yml` も
-`schedule` トリガを一旦外し `workflow_dispatch` のみとした。environment
-`recall-gate` の variables 設定・strict モードでの手動実行による疎通確認が
-済んでから `schedule`（週次）を再度追加する（README「Recall 回帰ハーネスの
-repo variables」参照）。
+一旦 `schedule` トリガを外し `workflow_dispatch` のみとしていた。Issue #168 の
+オーナー判断により `schedule`（週次・月曜 04:00 UTC）を再度追加済みだが、
+environment `recall-gate` の variables 設定・strict モードでの手動実行による
+疎通確認はリポジトリ管理者作業として別途必要（未実施のまま週次 run が走った
+場合は fail-closed で red になる。false green にはならない。README「Recall
+回帰ハーネスの repo variables」参照）。
 
 ### コーパス・QA セットの生成
 

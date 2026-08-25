@@ -23,38 +23,17 @@
 //!   （spec 所定の完了条件の値そのものではなく、実測値・spec 本文も転記しない。
 //!   対象ビヘイビアは TASK-143／PERSIST-2／`docs/spec/04-behavior/persistence.md` を参照）。
 //!
-//! `tests/persistence.rs` とのヘルパ（`unique_db_path` / `CleanupGuard` / 行生成）共通化
-//! （`tests/common/mod.rs` 化）は本 Issue のスコープ外とし、小さく複製するに留める
-//! （既存ファイルへの変更を避けスコープを最小化する意図）。
+//! `tests/persistence.rs` とのヘルパ（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+//! `crates/engine/src/test_util/temp_db.rs` へ一本化した。行生成ヘルパはこのファイル固有の
+//! ままとし、小さく複製するに留める（既存ファイルへの変更を避けスコープを最小化する意図）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`cargo test` のデフォルト並列実行でも
-/// 衝突しないよう、プロセス ID とプロセス内連番を組み合わせる）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-persist2-perf-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 /// 全行に付与するダミーのテナント識別子（本テストは性能測定のみが目的で、
 /// テナント境界の判定経路には踏み込まない。空文字列は `RowInput` 側で拒否されるため
