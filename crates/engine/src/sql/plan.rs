@@ -28,6 +28,12 @@
 //! だけを持ち出せる型）は `rls.rs` 側の管轄（TASK-136 で `sql::plan` から
 //! 再配置）で、本モジュールはそれを分岐させる真偽値を [`ExecutionPlan`] に
 //! 持たせない設計だけを担う。
+//!
+//! [`apply_rls_safety_net`] は TASK-136 で `crate::rls::RlsSafetyNet` へ実装を
+//! 再配置した後も、main へマージ済みの公開 `pub fn` との互換性のために
+//! `#[deprecated]` 付きで残す（PR #192 codex-review P1 対応）。呼び出し元
+//! （`sql::exec`）はすでに `RlsSafetyNet` を直接使っており、本関数はワーク
+//! スペース内では未参照。
 
 /// `HINT ORDER(...)` が受理する評価段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -129,6 +135,41 @@ impl ExecutionPlan {
             scalar_prefilter: order.scalar_before_distance(),
         }
     }
+}
+
+/// RLS 実行時安全網（RLS-5）の旧 API（TASK-76）。TASK-136 で実装を
+/// [`crate::rls::RlsSafetyNet`] へ再配置した後も、main へマージ済みの公開 API
+/// との互換性のために残す（PR #192 codex-review P1 対応）。
+///
+/// `hits`（DISTANCE 段が返した `(id, score)` の順序付き列）から、
+/// `is_visible(tenant_id, visibility)` が `false` を返す行、および
+/// `tenant_id`/`visibility` を引けない行（データ不整合。fail-closed に除去）を除く。
+/// `hits` の相対順序は保つ（`filter` ベースで安定。要素の並べ替えは行わない）。
+///
+/// `RlsSafetyNet::apply` へ内部委譲しない: `RlsSafetyNet` は判定ロジックを
+/// `PolicyContext::is_visible` に固定することで「呼び出し元が判定を差し替えて
+/// 検査を弱められない」契約を保証しており（`rls.rs` モジュールドキュメント参照）、
+/// 本関数の `is_visible: F` のような任意の述語注入を許す口を新設すると、その
+/// 契約自体を破ることになる（security.md P0「テナント境界の検査を外す/緩める
+/// 経路を作らない」）。互換性のためだけに `RlsSafetyNet` 側の設計を緩めるのは
+/// 本末転倒のため、本関数は旧実装をそのまま保持し、
+/// `sql::plan::tests::deprecated_wrapper_matches_rls_safety_net` で
+/// `RlsSafetyNet::apply` と同一入力に対し同一結果になることをテストで固定する。
+#[deprecated(note = "use crate::rls::RlsSafetyNet instead")]
+pub fn apply_rls_safety_net<F>(
+    hits: Vec<(u64, f64)>,
+    tenant_and_visibility: impl Fn(u64) -> Option<(String, crate::storage::Visibility)>,
+    is_visible: F,
+) -> Vec<(u64, f64)>
+where
+    F: Fn(&str, crate::storage::Visibility) -> bool,
+{
+    hits.into_iter()
+        .filter(|(id, _)| match tenant_and_visibility(*id) {
+            Some((tenant, visibility)) => is_visible(&tenant, visibility),
+            None => false,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -253,5 +294,62 @@ mod tests {
         let order = EvaluationOrder::try_from_stages(&[Stage::Distance, Stage::Scalar, Stage::Rls])
             .unwrap();
         assert!(!ExecutionPlan::from_evaluation_order(order).scalar_prefilter);
+    }
+
+    // --- 旧 API 互換（apply_rls_safety_net）---------------------------------------
+
+    /// PR #192 codex-review P1 対応: `#[deprecated]` で復元した旧 API
+    /// `apply_rls_safety_net` が、現行実装 `crate::rls::RlsSafetyNet::apply` と
+    /// 同一入力に対し同一結果（生き残る id・順序・除去件数）を返すことを固定する。
+    /// テナント不一致による除去（fail-closed の可視性判定）と、ラベルを引けない
+    /// id の除去（`None` 分岐。データ不整合時の fail-closed）の両方を含める
+    /// （どちらも通す自明なケースだけでは互換性の証明にならないため）。
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_wrapper_matches_rls_safety_net() {
+        use crate::policy::PolicyContext;
+        use crate::rls::RlsSafetyNet;
+        use crate::storage::Visibility;
+        use std::collections::HashMap;
+
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+
+        // id 1: 同一テナント Public（可視）。
+        // id 2: 他テナント Private（不可視・テナント不一致）。
+        // id 3: 同一テナント Private（可視）。
+        // id 4: ラベルなし（データ不整合。fail-closed に除去）。
+        let mut labels: HashMap<u64, (String, Visibility)> = HashMap::new();
+        labels.insert(1, ("tenant-a".to_string(), Visibility::Public));
+        labels.insert(2, ("tenant-b".to_string(), Visibility::Private));
+        labels.insert(3, ("tenant-a".to_string(), Visibility::Private));
+
+        let hits: Vec<(u64, f64)> = vec![(1, 0.1), (2, 0.2), (3, 0.3), (4, 0.4)];
+
+        let old_result = apply_rls_safety_net(
+            hits.clone(),
+            |id| labels.get(&id).cloned(),
+            |tenant, visibility| ctx.is_visible(tenant, visibility),
+        );
+
+        let net = RlsSafetyNet::new(&ctx);
+        let verified = net.apply(hits, |id| {
+            labels
+                .get(&id)
+                .map(|(tenant, visibility)| (tenant.as_str(), *visibility))
+        });
+
+        assert_eq!(
+            old_result,
+            verified.hits().to_vec(),
+            "deprecated apply_rls_safety_net must match RlsSafetyNet::apply"
+        );
+        assert_eq!(old_result, vec![(1, 0.1), (3, 0.3)]);
+        assert_eq!(
+            verified.dropped(),
+            2,
+            "id 2 (tenant mismatch) and id 4 (no label) must be dropped"
+        );
     }
 }
