@@ -39,6 +39,7 @@ use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
 use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
+use redb::ReadableDatabase;
 
 /// 検索 `k` の上限。上限検証前にアロケーションへ使わないための防御的定数
 /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。`catalog.rs::MAX_LIST_TABLES`
@@ -267,6 +268,57 @@ impl EngineCore {
     /// 検査を外す/緩める/バイパス経路を作らない」）。
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
         Self { storage, provider }
+    }
+
+    /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
+    /// `VectorCore` trait への昇格は行わない固有メソッドとする（`crates/engine/api/
+    /// core_api.snapshot`・`make core-api-check` が対象とするのは `VectorCore`
+    /// trait 本体のみのため、本メソッドの追加はコア API シグネチャ安定性チェックに
+    /// 影響しない。trait への統合可否は wire 統合タスク（TASK-68〜73）が判断する）。
+    ///
+    /// `sql::allowlist::validate_statement`（構造検証）→
+    /// `sql::parser::bind`（意味論検証・束縛）→ `sql::exec::execute_statement`
+    /// （RLS→SCALAR→DISTANCE 固定順の実行）の順に呼ぶ。RLS 適用は `ctx` の下で
+    /// 無条件に行われ、SQL 文中の `visible()` 呼び出しの有無に依存しない（SQL-3・
+    /// RLS-7。`sql::exec` のモジュールドキュメント参照）。
+    ///
+    /// スキーマ取得（`bind` 用）・候補走査（`sql::exec::execute_statement` 内の
+    /// `VectorArena::build_filtered_with_rows_in_txn`）を単一の `read_txn`
+    /// （同一スナップショット）上で行う（Issue #56 レビュー指摘対応・codex P1:
+    /// 以前は `Storage::get_table_schema` が別トランザクションでスキーマを取得し、
+    /// `execute_statement` がさらに別トランザクションで行走査していたため、この間に
+    /// `alter_table_add_column` がコミットされると、`bind` が束縛した旧スキーマで
+    /// 新スナップショットの行を検索することになり、新設列の欠落や `row_codec`
+    /// デコード失敗（`XX000` 相当）を招き得た。`catalog::get_table_schema_in_txn` で
+    /// スキーマを取得したのと同一の `read_txn` を `execute_statement` へ渡すことで、
+    /// スキーマ取得・bind・候補走査を単一スナップショットへ閉じ込める）。
+    pub fn execute_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_statement(sql, &self.storage)?;
+        let read_txn = self.storage.db().begin_read().map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!(
+                    "failed to begin read transaction: {}",
+                    StorageError::from(e)
+                ),
+            }
+        })?;
+        let schema =
+            crate::catalog::get_table_schema_in_txn(&read_txn, &stmt.table_name).map_err(|e| {
+                match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!("failed to load table schema: {other}"),
+                    },
+                }
+            })?;
+        let bound = crate::sql::parser::bind(&stmt, &schema)?;
+        crate::sql::exec::execute_statement(&read_txn, self.provider.as_ref(), ctx, &schema, &bound)
     }
 }
 

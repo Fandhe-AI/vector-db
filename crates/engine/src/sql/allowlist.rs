@@ -58,6 +58,14 @@ pub enum SqlSurfaceError {
     /// 倒さず、fail-closed にエラー伝播する（`.claude/rules/security.md`
     /// 「不安全な設計」対応）。
     Internal { detail: String },
+    /// 構造は許可リストを通過したが、束縛（`sql::parser::bind`、TASK-75）が値・引数を
+    /// 意味論的に不正と判定した（未知の列名・列型不一致・ベクトルリテラルの不正形式・
+    /// 非有限値・次元不一致、`LIMIT` 範囲外、hybrid の 2 引数形（実行不能）等。ERR-2:
+    /// `22000`）。
+    InvalidInput { detail: String },
+    /// untrusted 入力のサイズがアロケーション前の上限を超過した（ベクトルリテラル
+    /// 64 KiB 超過、候補集合の容量上限超過等。ERR-2: `54000`）。
+    PayloadTooLarge { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -67,6 +75,8 @@ impl SqlSurfaceError {
             SqlSurfaceError::UnsupportedSyntax { .. } => "42601",
             SqlSurfaceError::UndefinedTable { .. } => "42P01",
             SqlSurfaceError::Internal { .. } => "XX000",
+            SqlSurfaceError::InvalidInput { .. } => "22000",
+            SqlSurfaceError::PayloadTooLarge { .. } => "54000",
         }
     }
 
@@ -86,6 +96,22 @@ impl SqlSurfaceError {
             name: truncate_for_error(&name.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::parser::bind`（TASK-75）が束縛時の値・引数不正を報告するために
+    /// 使う。他の variant と同じ切り詰め規約を経由する。
+    pub(crate) fn invalid_input(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::InvalidInput {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
+
+    /// `pub(crate)`: `sql::parser::bind`・`sql::exec`（TASK-75）がアロケーション前の
+    /// サイズ上限超過を報告するために使う。
+    pub(crate) fn payload_too_large(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::PayloadTooLarge {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 impl std::fmt::Display for SqlSurfaceError {
@@ -96,6 +122,10 @@ impl std::fmt::Display for SqlSurfaceError {
             }
             SqlSurfaceError::UndefinedTable { name } => write!(f, "undefined table: {name}"),
             SqlSurfaceError::Internal { detail } => write!(f, "internal error: {detail}"),
+            SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
+            SqlSurfaceError::PayloadTooLarge { detail } => {
+                write!(f, "payload too large: {detail}")
+            }
         }
     }
 }
@@ -118,33 +148,59 @@ pub trait TableLookup {
     fn table_exists(&self, name: &str) -> Result<bool, SqlSurfaceError>;
 }
 
+/// ORDER BY 関数呼び出し形（`FunctionCall`, TASK-75）の 1 引数。本モジュールは
+/// トークン種別（識別子／文字列リテラル）のみを構造として保持し、列名としての
+/// 妥当性・リテラルの意味論的解釈は `sql::parser::bind`（TASK-75）の責務とする。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionArg {
+    Ident(String),
+    StringLiteral(String),
+}
+
 /// `ORDER BY` 式の許可形状。TASK-74・SQL-8 参照（docs/spec/05-tasks.md）。
+/// TASK-75 でリテラル値・関数引数を保持するよう拡張した（構造判定だけでなく、
+/// 後続の束縛（`sql::parser::bind`）がベクトルリテラル解析・hybrid 引数解釈に使う）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderByForm {
-    /// 距離演算子形。
-    Distance { column: String },
-    /// 関数呼び出し形。引数は本モジュールでは構造（括弧の対応・許可トークンのみ）
-    /// しか見ず、意味は後続タスクが解釈する。
-    FunctionCall { name: String },
+    /// 距離演算子形（`<列> <=> '<ベクトルリテラル>'`）。
+    Distance { column: String, literal: String },
+    /// 関数呼び出し形。引数トークン列は構造（括弧の対応・許可トークン種別のみ）を
+    /// 保持し、個数・意味の解釈は `sql::parser::bind` が行う（TASK-75 時点で
+    /// `hybrid_rrf`/`HYBRID` は 2 引数形・4 引数形の両方を構造上受理するが、
+    /// 実行可能（束縛成功）なのは 4 引数形のみ。2 引数形は構造は受理しつつ束縛時に
+    /// `SqlSurfaceError::InvalidInput`（`22000`）で拒否する。既存 2 引数形の
+    /// マーシャリング・許可リスト受理そのものは変更しない）。
+    FunctionCall {
+        name: String,
+        args: Vec<FunctionArg>,
+    },
 }
 
 /// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前
 /// （[`is_allowed_where_predicate_name`]）のみを通過させる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
-    /// 列と文字列リテラルの等価条件。
-    Equality { column: String },
+    /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
+    Equality { column: String, value: String },
     /// 許可された名前の述語呼び出し形（空引数）。
     PredicateCall { name: String },
 }
 
+/// SELECT リストの許可形状（TASK-75）。`*` か、単純な列名リストのみ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Projection {
+    All,
+    Columns(Vec<String>),
+}
+
 /// 許可形状の構造判定を通過した SQL 文（後続タスクのパーサー・実行計画の土台）。
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
-/// 妥当性は検証しない。
+/// 妥当性は検証しない（`sql::parser::bind` の責務）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub table_name: String,
+    pub projection: Projection,
     pub order_by: OrderByForm,
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub where_predicates: Vec<WherePredicate>,
@@ -222,17 +278,17 @@ impl<'a> Parser<'a> {
     }
 
     /// SELECT リストの許可形状（`*` または単純な列名リストのみ）。
-    fn parse_select_list(&mut self) -> Result<(), SqlSurfaceError> {
+    fn parse_select_list(&mut self) -> Result<Projection, SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             self.advance();
-            return Ok(());
+            return Ok(Projection::All);
         }
-        self.expect_ident()?;
+        let mut columns = vec![self.expect_ident()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            self.expect_ident()?;
+            columns.push(self.expect_ident()?);
         }
-        Ok(())
+        Ok(Projection::Columns(columns))
     }
 
     /// WHERE 句の許可形状（等価条件・述語呼び出し形の 2 種のみ。`OR`・括弧による
@@ -245,8 +301,11 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(Token::Punct('=')) => {
                     self.advance();
-                    self.expect_string_literal()?;
-                    predicates.push(WherePredicate::Equality { column: name });
+                    let value = self.expect_string_literal()?;
+                    predicates.push(WherePredicate::Equality {
+                        column: name,
+                        value,
+                    });
                 }
                 Some(Token::Punct('(')) => {
                     if !is_allowed_where_predicate_name(&name) {
@@ -281,8 +340,11 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Some(Token::DistanceOp) => {
                 self.advance();
-                self.expect_string_literal()?;
-                Ok(OrderByForm::Distance { column: name })
+                let literal = self.expect_string_literal()?;
+                Ok(OrderByForm::Distance {
+                    column: name,
+                    literal,
+                })
             }
             Some(Token::Punct('(')) => {
                 if !is_allowed_order_by_function_name(&name) {
@@ -291,9 +353,9 @@ impl<'a> Parser<'a> {
                     )));
                 }
                 self.advance();
-                self.parse_order_by_function_args(&name)?;
+                let args = self.parse_order_by_function_args(&name)?;
                 self.expect_punct(')')?;
-                Ok(OrderByForm::FunctionCall { name })
+                Ok(OrderByForm::FunctionCall { name, args })
             }
             other => Err(SqlSurfaceError::unsupported(format!(
                 "unsupported ORDER BY expression near {other:?}"
@@ -307,13 +369,31 @@ impl<'a> Parser<'a> {
     /// ここでは許可した引数トークン列のみを消費し、過不足があれば
     /// （空引数・余剰引数・意味を解釈しない括弧グループを含め）その時点で拒否する
     /// （fail-closed）。
-    fn parse_order_by_function_args(&mut self, name: &str) -> Result<(), SqlSurfaceError> {
+    ///
+    /// `hybrid_rrf`/`HYBRID` は 2 引数形（`(<vec列>, '<query text>')`。TASK-74 で
+    /// 受理済みの既存構造。マージ済み挙動を変えないため構造としては引き続き受理する）と
+    /// 4 引数形（`(<vec列>, '<vec リテラル>', <text列>, '<query text>')`。TASK-75・
+    /// SQL-4 の実行可能形）の両方を構造上受理する。実行可能かどうか（束縛成功）は
+    /// `sql::parser::bind` が判定し、2 引数形は `SqlSurfaceError::InvalidInput`
+    /// （`22000`。「実行不能」）で拒否する（advisor 方針: 既存の 2 引数形受理を壊さず
+    /// 追加する）。
+    fn parse_order_by_function_args(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<FunctionArg>, SqlSurfaceError> {
         match name.to_ascii_uppercase().as_str() {
             "HYBRID_RRF" | "HYBRID" => {
-                self.expect_ident()?;
+                let mut args = Vec::new();
+                args.push(FunctionArg::Ident(self.expect_ident()?));
                 self.expect_punct(',')?;
-                self.expect_string_literal()?;
-                Ok(())
+                args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
+                if matches!(self.peek(), Some(Token::Punct(','))) {
+                    self.advance();
+                    args.push(FunctionArg::Ident(self.expect_ident()?));
+                    self.expect_punct(',')?;
+                    args.push(FunctionArg::StringLiteral(self.expect_string_literal()?));
+                }
+                Ok(args)
             }
             other => Err(SqlSurfaceError::unsupported(format!(
                 "unsupported ORDER BY function: {other}"
@@ -339,6 +419,7 @@ impl<'a> Parser<'a> {
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
 struct ParsedShape {
     table_name: String,
+    projection: Projection,
     where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
@@ -349,7 +430,7 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
-    p.parse_select_list()?;
+    let projection = p.parse_select_list()?;
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
 
@@ -374,6 +455,7 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
 
     Ok(ParsedShape {
         table_name,
+        projection,
         where_predicates,
         order_by,
         limit,
@@ -401,6 +483,7 @@ pub fn validate_statement(
 
     Ok(ValidatedStatement {
         table_name: shape.table_name,
+        projection: shape.projection,
         order_by: shape.order_by,
         where_predicates: shape.where_predicates,
         limit: shape.limit,
@@ -454,7 +537,8 @@ mod tests {
         assert_eq!(
             stmt.order_by,
             OrderByForm::Distance {
-                column: "embedding".to_string()
+                column: "embedding".to_string(),
+                literal: "[0.1,0.2]".to_string(),
             }
         );
     }
@@ -470,7 +554,8 @@ mod tests {
         assert_eq!(
             stmt.where_predicates,
             vec![WherePredicate::Equality {
-                column: "lang".to_string()
+                column: "lang".to_string(),
+                value: "ja".to_string(),
             }]
         );
     }
@@ -503,7 +588,8 @@ mod tests {
             stmt.where_predicates,
             vec![
                 WherePredicate::Equality {
-                    column: "lang".to_string()
+                    column: "lang".to_string(),
+                    value: "ja".to_string(),
                 },
                 WherePredicate::PredicateCall {
                     name: "visible".to_string()
@@ -523,7 +609,11 @@ mod tests {
         assert_eq!(
             stmt.order_by,
             OrderByForm::FunctionCall {
-                name: "hybrid_rrf".to_string()
+                name: "hybrid_rrf".to_string(),
+                args: vec![
+                    FunctionArg::Ident("embedding".to_string()),
+                    FunctionArg::StringLiteral("query text".to_string()),
+                ],
             }
         );
     }
@@ -539,9 +629,48 @@ mod tests {
         assert_eq!(
             stmt.order_by,
             OrderByForm::FunctionCall {
-                name: "HYBRID".to_string()
+                name: "HYBRID".to_string(),
+                args: vec![
+                    FunctionArg::Ident("embedding".to_string()),
+                    FunctionArg::StringLiteral("query text".to_string()),
+                ],
             }
         );
+    }
+
+    // TASK-75・SQL-4: 4 引数形（`<vec列>, '<vec リテラル>', <text列>, '<query text>'`）を
+    // 構造として受理する（既存 2 引数形の受理は変更しない。実行可能性の判定は
+    // `sql::parser::bind` の管轄）。
+    #[test]
+    fn accepts_select_with_order_by_function_call_four_args() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, '[0.1,0.2]', body, 'query text') LIMIT 20",
+            &lookup,
+        )
+        .expect("4-arg function-call shape should be accepted");
+        assert_eq!(
+            stmt.order_by,
+            OrderByForm::FunctionCall {
+                name: "hybrid_rrf".to_string(),
+                args: vec![
+                    FunctionArg::Ident("embedding".to_string()),
+                    FunctionArg::StringLiteral("[0.1,0.2]".to_string()),
+                    FunctionArg::Ident("body".to_string()),
+                    FunctionArg::StringLiteral("query text".to_string()),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_select_with_order_by_function_call_four_args_alternate_name() {
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(
+            "SELECT * FROM documents ORDER BY HYBRID(embedding, '[0.1,0.2]', body, 'query text') LIMIT 20",
+            &lookup,
+        )
+        .expect("4-arg HYBRID shape should be accepted");
     }
 
     #[test]

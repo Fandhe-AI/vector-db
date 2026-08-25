@@ -455,6 +455,43 @@ impl VectorArena {
         )
     }
 
+    /// [`Self::build_filtered`] へ、可視行（RLS 述語 `predicate` を通過した行）ごとに
+    /// 呼ばれる第 2 段のフック `on_visible_row(id, metadata)` を追加した版（TASK-75、
+    /// 対象ビヘイビア: SQL-2）。
+    ///
+    /// 呼び出し文脈: `sql::exec`（TASK-75）が `WHERE <列> = '<literal>'`
+    /// （スカラー等価条件）の事前フィルタをここで適用する。`on_visible_row` が
+    /// `Ok(false)` を返した行は、`predicate`（RLS 段）を通過した行と同様に
+    /// embedding をデコード済みだが、アリーナへは格納しない（`vectors`/`ids`/
+    /// `tenant_ids`/`visibilities` のいずれにも追加せず、アリーナ容量の上限検証
+    /// （[`check_capacity`]）の対象からも除外する）。`predicate`（RLS 段）→
+    /// `on_visible_row`（SCALAR 段）の評価順序は固定であり、[`Self::build_filtered`]
+    /// と同じく可視行だけが `on_visible_row` に到達する（不可視行の metadata は一切
+    /// デコードしない。呼び出し元がこの順序を入れ替えることはできない）。
+    ///
+    /// `on_visible_row` が `Err` を返した場合（例: `row_codec::decode_scalar_columns`
+    /// のデコード失敗）は、当該行を黙ってスキップせず fail-closed にアリーナ構築全体を
+    /// 拒否する（部分的なアリーナを返さない。[`Self::build_filtered`] の既存契約と同方針）。
+    pub fn build_filtered_with_rows<F, G>(
+        storage: &Storage,
+        table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        Self::build_filtered_with_rows_and_limits(
+            storage,
+            table_name,
+            predicate,
+            on_visible_row,
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+    }
+
     /// [`Self::build_filtered`] の上限値パラメータ化版。実装は本関数に集約し、
     /// [`Self::build_filtered`] は本番用の定数（[`MAX_ARENA_ROWS`]・
     /// [`MAX_ARENA_TOTAL_BYTES`]）で呼び出すだけの薄いラッパーにする。
@@ -470,18 +507,111 @@ impl VectorArena {
     fn build_filtered_with_limits<F>(
         storage: &Storage,
         table_name: &str,
-        mut predicate: F,
+        predicate: F,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
     {
-        // スキーマ取得・対象テーブルの行走査を単一の `read_txn`（同一スナップショット）上で
-        // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
-        // 並行書き込みが挟まってもスナップショットの一貫性が保証できない。
+        Self::build_filtered_with_rows_and_limits(
+            storage,
+            table_name,
+            predicate,
+            |_id, _metadata| Ok(true),
+            max_rows,
+            max_bytes,
+        )
+    }
+
+    /// [`Self::build_filtered_with_rows_and_limits_in_txn`] を `storage` から新規に
+    /// 開いた `read_txn` 上で呼ぶ薄いラッパー（[`Self::build_filtered_with_rows`]・
+    /// [`Self::build_filtered_with_limits`] が共有する）。スキーマ取得・行走査を
+    /// 単一の `read_txn`（同一スナップショット）上で行う（別トランザクションに
+    /// 分かれていると、スキーマ取得後・走査前に対象テーブルへの並行書き込みが
+    /// 挟まってもスナップショットの一貫性が保証できない）。
+    fn build_filtered_with_rows_and_limits<F, G>(
+        storage: &Storage,
+        table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
-        let expected_dim = validated_vector_dim_in_txn(&read_txn, table_name)?;
+        Self::build_filtered_with_rows_and_limits_in_txn(
+            &read_txn,
+            table_name,
+            predicate,
+            on_visible_row,
+            max_rows,
+            max_bytes,
+        )
+    }
+
+    /// [`Self::build_filtered_with_rows`] の、呼び出し元が管理する既存 `read_txn` を
+    /// 受け取る版（TASK-75、対象ビヘイビア: SQL-2。Issue #56 レビュー指摘対応・codex P1）。
+    ///
+    /// 呼び出し文脈: `sql::exec::execute_statement_in_txn` が、`core.rs::EngineCore::
+    /// execute_sql` で `catalog::get_table_schema_in_txn` によりスキーマを取得したのと
+    /// **同一の** `read_txn` をここへ渡す。これにより「`sql::parser::bind` が束縛した
+    /// スキーマ」と「本関数が走査する行データのスキーマ世代」が常に同一スナップショット
+    /// 由来になることを型で強制する（呼び出し元が別トランザクションを渡す・スキーマだけ
+    /// 別経路で取得するミスを、シグネチャ上で構造的に防ぐ）。[`Self::build_filtered_with_rows`]
+    /// （`Storage` から新規に `read_txn` を開く版）と異なり、本関数はトランザクションを
+    /// 開始しない。
+    pub(crate) fn build_filtered_with_rows_in_txn<F, G>(
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        Self::build_filtered_with_rows_and_limits_in_txn(
+            read_txn,
+            table_name,
+            predicate,
+            on_visible_row,
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+    }
+
+    /// [`Self::build_filtered_with_limits`] の行フック付き版。呼び出し元が管理する
+    /// `read_txn` 上で実行する実装本体（[`Self::build_filtered_with_rows_and_limits`]・
+    /// `sql::exec::execute_statement_in_txn`（TASK-75・Issue #56 レビュー指摘対応）が
+    /// 共有する）。
+    ///
+    /// スキーマ取得（[`validated_vector_dim_in_txn`]）・対象テーブルの行走査を、
+    /// 呼び出し元から渡された**同一** `read_txn`（同一スナップショット）上で行う。
+    /// 呼び出し元がスキーマを別トランザクションで取得してから本関数へ渡した場合、
+    /// スキーマ取得後・走査前に対象テーブルへの並行 DDL（`alter_table_add_column` 等）が
+    /// 挟まるとスナップショットの一貫性が保証できない（codex P1 指摘・Issue #56:
+    /// `sql::parser::bind` が束縛したスキーマ世代と、本関数が走査する行データの
+    /// スキーマ世代が食い違い、新設列の欠落や `row_codec` デコード失敗を招き得た）。
+    /// 本関数自身はどのトランザクションでスキーマを取得したかを検証しない
+    /// （契約は「呼び出し元が bind に使ったスキーマと同一の `read_txn` を渡すこと」。
+    /// `core.rs::EngineCore::execute_sql` のドキュメント参照）。
+    fn build_filtered_with_rows_and_limits_in_txn<F, G>(
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
+        mut predicate: F,
+        mut on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        let expected_dim = validated_vector_dim_in_txn(read_txn, table_name)?;
 
         // 対象テーブル専用の行テーブル（`user_rows/{table_name}`）だけを開く。
         // `catalog::user_rows_table_name` は識別子検証を行わないが、直前の
@@ -550,6 +680,14 @@ impl VectorArena {
                     expected: expected_dim,
                     found: found_dim,
                 });
+            }
+
+            // SCALAR 段（TASK-75）: RLS 段（`predicate`）を通過した行の metadata に対し
+            // 呼び出し元のスカラー等価条件を適用する。`false` はアリーナへ格納せず
+            // スキップし（容量検証の対象にも含めない）、`Err` は fail-closed に
+            // 全体を拒否する（[`Self::build_filtered_with_rows`] のドキュメント参照）。
+            if !on_visible_row(id, &row.metadata)? {
+                continue;
             }
 
             // アロケーション前の上限検証（.claude/rules/security.md「不安全な設計｜
@@ -805,6 +943,113 @@ mod tests {
             .open_table(row_table_def)
             .expect("open row table for a");
         assert_eq!(table.len().expect("table len"), 1);
+
+        drop(read_txn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 対象ビヘイビア: SQL-2（Issue #56 レビュー指摘対応・codex P1）。
+    // `core.rs::EngineCore::execute_sql` は `catalog::get_table_schema_in_txn` で
+    // スキーマを取得した `read_txn` を、そのまま `VectorArena::build_filtered_with_rows_in_txn`
+    // へ渡す契約になった。本テストは、その契約どおり同一 `read_txn` を渡す限り、
+    // スキーマ取得後に並行 `alter_table_add_column` がコミットされても、行走査が
+    // 取得済みスキーマと矛盾する新スナップショット（新設列を含む行）を観測しないこと
+    // （＝新設列の欠落や `row_codec` デコード失敗を招かないこと）を検証する。
+    #[test]
+    fn build_filtered_with_rows_in_txn_stays_consistent_with_schema_across_concurrent_alter_table()
+    {
+        use crate::catalog::{self, ColumnDef, ColumnType, TableSchema};
+        use crate::row_codec;
+        use crate::storage::{RowInput, Visibility};
+
+        let path = unique_db_path("alter-table-toctou");
+        let storage = Storage::open(&path).expect("open storage");
+
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(4), false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[0.0, 1.0, 2.0, 3.0],
+                    metadata: &row_codec::encode_scalar_columns(
+                        &schema,
+                        &[
+                            row_codec::Value::Null,
+                            row_codec::Value::Text("seed".to_string()),
+                        ],
+                    )
+                    .expect("encode metadata for seed row"),
+                },
+            )
+            .expect("insert seed row");
+
+        // `core.rs::EngineCore::execute_sql` の契約どおり、スキーマ取得と行走査に使う
+        // `read_txn` をここで一本化する（`bind` 相当のスキーマ取得）。
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound_schema = catalog::get_table_schema_in_txn(&read_txn, "docs").expect("get schema");
+        assert_eq!(bound_schema.columns.len(), 2);
+
+        // `read_txn` 確立後に列追加 DDL がコミットされ、さらに新スキーマ前提の行が
+        // 挿入される（レビュー指摘が懸念した並行 DDL の再現）。
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("tag", ColumnType::Text, true))
+            .expect("alter table add column");
+        let new_schema = storage.get_table_schema("docs").expect("get new schema");
+        assert_eq!(new_schema.columns.len(), 3);
+        storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Private,
+                    embedding: &[4.0, 5.0, 6.0, 7.0],
+                    metadata: &row_codec::encode_scalar_columns(
+                        &new_schema,
+                        &[
+                            row_codec::Value::Null,
+                            row_codec::Value::Text("post-alter".to_string()),
+                            row_codec::Value::Text("new-tag".to_string()),
+                        ],
+                    )
+                    .expect("encode metadata for post-alter row"),
+                },
+            )
+            .expect("insert post-alter row");
+
+        // 取得済み `bound_schema`（2 列）で `read_txn` 上の行走査・デコードを行う。
+        // `read_txn` 確立前の 1 行のみが観測され、そのデコードは `bound_schema` と
+        // 矛盾なく成功すること（新設列を含む行が混入したり、デコード失敗
+        // （XX000 相当）が起きたりしないこと）を検証する。
+        let mut decoded_bodies: Vec<Option<String>> = Vec::new();
+        let arena = VectorArena::build_filtered_with_rows_in_txn(
+            &read_txn,
+            "docs",
+            |_tenant, _visibility| true,
+            |_id, metadata| {
+                let decoded = row_codec::decode_scalar_columns(&bound_schema, metadata)
+                    .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+                decoded_bodies.push(match decoded.get(1) {
+                    Some(row_codec::Value::Text(t)) => Some(t.clone()),
+                    _ => None,
+                });
+                Ok(true)
+            },
+        )
+        .expect("build_filtered_with_rows_in_txn must observe a schema-consistent snapshot");
+
+        assert_eq!(arena.ids(), &[1]);
+        assert_eq!(decoded_bodies, vec![Some("seed".to_string())]);
 
         drop(read_txn);
         let _ = std::fs::remove_file(&path);

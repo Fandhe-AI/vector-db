@@ -125,7 +125,7 @@ const MAX_DOC_BYTES: usize = 1024 * 1024;
 /// に達する）が無制限に増える。10 万件は単一の `SparseIndex` に載せるコーパス
 /// として十分大きい一方、`N * MAX_DOC_BYTES` の積を有界に保つための上限として
 /// 妥当な値とする。
-const MAX_CORPUS_DOCS: usize = 100_000;
+pub(crate) const MAX_CORPUS_DOCS: usize = 100_000;
 
 /// [`SparseIndex::with_params`]（構築）が受け付けるコーパス全体のバイト長合計の上限。
 ///
@@ -139,7 +139,7 @@ const MAX_CORPUS_DOCS: usize = 100_000;
 /// 制限しない。CJK 文字はユニグラム＋バイグラムを生成するため 1 文字（3 バイト）
 /// あたり最大 2 トークンを生じ、バイト数から見積もれる最悪ケースのトークン数は
 /// 大きい。実効的なヒープ割当量の上限は [`MAX_CORPUS_TOKENS`] が別途担う。
-const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CORPUS_BYTES: usize = 64 * 1024 * 1024;
 
 // `MAX_CORPUS_BYTES` が `MAX_DOC_BYTES` の整数倍であることをコンパイル時に固定する。
 // 境界値テストは MAX_DOC_BYTES サイズの文書を複数回参照して MAX_CORPUS_BYTES ちょうどの
