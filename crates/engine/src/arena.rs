@@ -773,9 +773,15 @@ impl VectorArena {
         self.visibilities.get(index).copied()
     }
 
-    /// このアリーナが保持するバッファのヒープ使用量の概算バイト数（`vectors`・`ids`・
-    /// `tenant_ids`・`visibilities` の要素サイズ合計。`String` の内部確保分を含み、
-    /// 構造体自体のスタックサイズ・アロケータのオーバーヘッドは含まない大まかな目安）。
+    /// このアリーナが保持するバッファの実確保量ベースの概算ヒープ使用量バイト数
+    /// （`vectors`・`ids`・`visibilities`・`tenant_ids` は要素数ではなく
+    /// `Vec::capacity()` を使う。`len()` ベースだと amortized 成長で確保済みの
+    /// 未使用 capacity 分を見逃し、総量上限の判定が実際の確保量を過小評価する
+    /// ため（codex-review P1 対応・PR #191）。`tenant_ids: Vec<String>` は
+    /// 各要素 `String` の内部確保分（`capacity()`）に加え、`Vec<String>` 自体の
+    /// backing allocation（`String` 構造体 1 個分のサイズ × capacity）も計上する。
+    /// 構造体自体のスタックサイズ・アロケータのオーバーヘッド（malloc ヘッダ等）は
+    /// 含まない大まかな目安（=保守的な上振れ推定であり、下振れはしない）。
     ///
     /// 呼び出し文脈: `core.rs::PrefilterCache`（TASK-133 後続。RLS-1〜4）がキャッシュに
     /// 常駐させる `PrefilterSnapshot`（内部に本アリーナを保持）の総量上限判定に使う。
@@ -784,18 +790,29 @@ impl VectorArena {
     pub(crate) fn approx_heap_bytes(&self) -> usize {
         let vectors_bytes = self
             .vectors
-            .len()
+            .capacity()
             .saturating_mul(std::mem::size_of::<f32>());
-        let ids_bytes = self.ids.len().saturating_mul(std::mem::size_of::<u64>());
+        let ids_bytes = self
+            .ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>());
         let visibilities_bytes = self
             .visibilities
-            .len()
+            .capacity()
             .saturating_mul(std::mem::size_of::<Visibility>());
-        let tenant_ids_bytes = self
+        // 各 String の内部確保分（未使用 capacity 込み）。
+        let tenant_strings_bytes = self
             .tenant_ids
             .iter()
             .map(|s| s.capacity())
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        // `Vec<String>` 自体の backing allocation（`String` の構造体サイズ ×
+        // capacity）。未使用 capacity 分も含めて計上する。
+        let tenant_vec_bytes = self
+            .tenant_ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>());
+        let tenant_ids_bytes = tenant_strings_bytes.saturating_add(tenant_vec_bytes);
         vectors_bytes
             .saturating_add(ids_bytes)
             .saturating_add(visibilities_bytes)
@@ -873,6 +890,51 @@ mod tests {
         // usize::MAX 近傍の dim を渡しても checked_mul が Err に落ちるだけで panic しない。
         let result = check_capacity(usize::MAX / 2, u32::MAX, usize::MAX, usize::MAX);
         assert!(matches!(result, Err(ArenaError::CapacityExceeded)));
+    }
+
+    // 対象ビヘイビア: security.md「不安全な設計｜無制限リソース確保（DoS）」
+    // （codex-review P1 対応・PR #191）。`approx_heap_bytes` は `Vec::len()` ではなく
+    // `Vec::capacity()` ベースで課金しなければならない。amortized 成長で確保済みの
+    // 未使用 capacity（`len() < capacity()`）を意図的に作り、len ベースの旧計算より
+    // 大きい値が返ることを確認する（旧実装は未使用 capacity を無視し、実確保量を
+    // 過小評価していた＝本テストは退行防止）。
+    #[test]
+    fn approx_heap_bytes_charges_unused_vec_capacity_not_just_len() {
+        let mut vectors = Vec::with_capacity(64);
+        vectors.extend(std::iter::repeat_n(1.0f32, 4));
+        let mut ids = Vec::with_capacity(64);
+        ids.push(1u64);
+        let mut visibilities = Vec::with_capacity(64);
+        visibilities.push(Visibility::Public);
+        let mut tenant_ids: Vec<String> = Vec::with_capacity(64);
+        let mut s = String::with_capacity(256);
+        s.push_str("tenant-a");
+        tenant_ids.push(s);
+
+        let arena = VectorArena {
+            table_name: "t".to_string(),
+            dim: 4,
+            vectors,
+            ids,
+            tenant_ids,
+            visibilities,
+        };
+
+        // len ベースだった旧実装が返していたはずの値（要素数のみ）。
+        let len_based = arena.vectors.len() * std::mem::size_of::<f32>()
+            + arena.ids.len() * std::mem::size_of::<u64>()
+            + arena.visibilities.len() * std::mem::size_of::<Visibility>()
+            + arena.tenant_ids.iter().map(String::capacity).sum::<usize>();
+
+        let actual = arena.approx_heap_bytes();
+        assert!(
+            actual > len_based,
+            "capacity-based estimate must charge unused Vec/String capacity, \
+             actual={actual} len_based={len_based}"
+        );
+        // Vec<String> 自体の backing allocation（String 構造体サイズ × capacity）も
+        // 計上されていること。
+        assert!(actual >= arena.tenant_ids.capacity() * std::mem::size_of::<String>());
     }
 
     // 対象ビヘイビア: TABLE-8（codex P1 対応）。`check_capacity` の上限検証を素通りする

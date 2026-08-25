@@ -179,6 +179,27 @@ impl From<crate::storage::StorageError> for RlsError {
 /// [`Self::len`]・[`Self::is_empty`] は可視行数・行の有無という存在情報を返すため、
 /// [`Self::built_ctx`] との完全一致を要求する（不一致は [`RlsError::ContextMismatch`]）。
 /// [`Self::dim`]・[`Self::table_name`] は非機微情報のため `ctx` を要求しない。
+/// `HashSet<T>` の `capacity()`（保持要素数ではなく確保済み容量）から、実バケット数の
+/// 保守的な上限バイト数を見積もる（[`PrefilterSnapshot::approx_heap_bytes`] から呼ぶ。
+/// codex-review P1 対応・PR #191）。
+///
+/// `std::collections::HashSet` の実装基盤 `hashbrown` は最大負荷率 7/8 で 2 のべき乗
+/// サイズのテーブルを確保するため、実バケット数は `capacity() * 8 / 7` 以上になる。
+/// ここでは `capacity()` を `8/7` 倍してから次の 2 のべき乗へ切り上げることで、
+/// 実バケット数を下回らない（安全側＝上振れの）見積もりにする。1 バケットあたり
+/// 要素サイズ + control byte 1 byte を課金する。オーバーフロー時は `usize::MAX` に
+/// 飽和させる（総量上限判定を通過させない fail-closed 側に倒す。
+/// .claude/rules/coding-rust.md: 整数演算は checked/saturating を使う）。
+fn hash_set_conservative_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let scaled_up = capacity.saturating_mul(8) / 7;
+    let buckets = scaled_up.checked_next_power_of_two().unwrap_or(usize::MAX);
+    let per_bucket = std::mem::size_of::<T>().saturating_add(1);
+    buckets.saturating_mul(per_bucket)
+}
+
 /// 事前フィルタ方式の再利用可能インデックスのうち、`&Storage` 参照を持たない
 /// 内部スナップショット部分（TASK-133・TASK-169・RLS-1〜4）。
 ///
@@ -345,12 +366,21 @@ impl PrefilterSnapshot {
     /// このスナップショットが常駐時に占める概算ヒープ使用量
     /// （`core.rs::PrefilterCache` の容量上限判定に使う。[`VectorArena::approx_heap_bytes`]
     /// と `visible_id_set` の概算合計。詳細は同メソッドのドキュメント参照）。
+    ///
+    /// `visible_id_set: HashSet<u64>` は `len()`（要素数）ではなく `capacity()`
+    /// （現在のテーブルサイズで確保済みの容量。未使用分含む）を基準に見積もる
+    /// （codex-review P1 対応・PR #191。`len()` ベースは amortized 成長で確保済みの
+    /// 未使用容量・swiss table の control byte オーバーヘッドを無視し、実確保量を
+    /// 過小評価するため）。`hashbrown`（`std::collections::HashSet` の実装基盤）は
+    /// 最大負荷率 7/8 でテーブルを 2 のべき乗サイズに確保するため、実バケット数は
+    /// `capacity() * 8 / 7` 以上になる。ここでは `capacity()` をそのまま `8/7` 倍し
+    /// 2 のべき乗へ切り上げて実バケット数の保守的な上限を見積もり、1 バケットあたり
+    /// 要素（`u64`）8 byte + control byte 1 byte で概算する（実際の確保量を
+    /// 下回らない方向に丸める。totalへの過小評価は total 上限による DoS 防御の
+    /// 意味を失わせるため、安全側＝上振れに倒す）。
     pub(crate) fn approx_heap_bytes(&self) -> usize {
         let arena_bytes = self.arena.approx_heap_bytes();
-        let id_set_bytes = self
-            .visible_id_set
-            .len()
-            .saturating_mul(std::mem::size_of::<u64>());
+        let id_set_bytes = hash_set_conservative_bytes::<u64>(self.visible_id_set.capacity());
         arena_bytes.saturating_add(id_set_bytes)
     }
 }
@@ -2094,6 +2124,37 @@ mod tests {
 
         assert!(snapshot.approx_heap_bytes() > 0);
         assert_eq!(snapshot.built_ctx(), &ctx);
+    }
+
+    // 対象ビヘイビア: security.md「不安全な設計｜無制限リソース確保（DoS）」
+    // （codex-review P1 対応・PR #191）。`hash_set_conservative_bytes` は `len()`
+    // （要素数）ではなく `capacity()`（bucket/control-byte 込みの確保量）ベースで
+    // 見積もらなければならない。要素を全削除しても capacity は解放されない
+    // `HashSet` を作り、len ベースの旧計算（0）より大きい値が返ることを確認する
+    // （旧実装は len==0 のとき 0 を返し、実確保量を無視していた＝本テストは
+    // 退行防止）。
+    #[test]
+    fn hash_set_conservative_bytes_charges_unused_capacity_not_just_len() {
+        let mut set: HashSet<u64> = HashSet::with_capacity(1024);
+        for i in 0..1024u64 {
+            set.insert(i);
+        }
+        set.clear();
+        assert_eq!(set.len(), 0);
+        assert!(set.capacity() >= 1024);
+
+        let bytes = hash_set_conservative_bytes::<u64>(set.capacity());
+        assert!(
+            bytes > 0,
+            "capacity-based estimate must charge unused capacity even when len()==0"
+        );
+        // capacity 分の要素サイズ（8 byte/要素）は最低限含まれていること。
+        assert!(bytes >= set.capacity() * std::mem::size_of::<u64>());
+    }
+
+    #[test]
+    fn hash_set_conservative_bytes_is_zero_for_zero_capacity() {
+        assert_eq!(hash_set_conservative_bytes::<u64>(0), 0);
     }
 
     // TASK-137: フックは独自比較を持たず `PolicyContext::is_visible` へ
