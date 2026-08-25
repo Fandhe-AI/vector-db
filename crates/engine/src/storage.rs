@@ -122,26 +122,16 @@ pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// と同様、無制限 `Vec` 確保を避けるための契約。security.md「不安全な設計｜無制限リソース
 /// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
 /// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
-/// 不要）。超過時は [`StorageError::BatchLogLimitExceeded`] で fail-closed に拒否する。
+/// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する
+/// （PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT 対応: [`Storage::scan`] 用と variant を
+/// 分けない。理由は [`StorageError::ScanLimitExceeded`] のドキュメンテーションコメント参照）。
 const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
 /// （coding-rust.md: engine では `Result` を返し panic させない）。
-///
-/// `#[non_exhaustive]`: PR #193 codex レビュー PRRT_kwDOUAKASM6cB6is 対応。本 enum への
-/// variant 追加（例: [`StorageError::BatchLogLimitExceeded`] 新設）はクレート外の
-/// 網羅的 `match` を壊す破壊的変更になり得るため、以後の variant 追加をクレート境界の
-/// 外側からは非網羅として扱わせる（呼び出し元にワイルドカードアームを要求する）。
-/// 本クレート内（`catalog.rs` 等）は同一クレートのため従来どおり網羅的 `match` を書ける。
-/// wire_code 相当の観測可能な契約（AGENTS.md P1「公開 API・エラー契約の互換性」）は
-/// `catalog.rs::convert_storage_error` が `ScanLimitExceeded`・`BatchLogLimitExceeded` を
-/// いずれも `CatalogError::Invalid` へ一本化しているため今回の variant 分離では変化せず、
-/// 対になる spec 定義変更は不要と判断した（変わるのは内部 Rust variant の粒度とメッセージ
-/// 文字列のみ）。
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum StorageError {
     /// `redb` 側で発生したエラー（I/O・破損検出・トランザクション競合等）。
     Backend(redb::Error),
@@ -151,15 +141,23 @@ pub enum StorageError {
     /// 指定した行 ID が存在しない。
     NotFound(u64),
     /// [`Storage::scan`] の対象行数・バイト量が上限（[`MAX_SCAN_TOTAL_ROWS`]・
-    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過したため fail-closed に拒否した（対象ビヘイビア:
-    /// PERSIST-4）。呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと
-    /// （テーブルスコープ経由の呼び出しは `catalog.rs` の `scan_table_page` を使うこと）。
+    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過、または [`Storage::scan_batch_log`] のエントリ数が
+    /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した（対象ビヘイビア:
+    /// PERSIST-4・TABLE-10）。
+    ///
+    /// この 2 経路は同一 variant を共有する（PR #193 codex レビュー
+    /// PRRT_kwDOUAKASM6cCITT・PRRT_kwDOUAKASM6cB6is 対応。Issue #131 で
+    /// `Storage::scan_batch_log` 側にも行テーブル用の代替 API 案内が誤って出る問題が
+    /// 見つかったが、専用 variant を新設する初回修正案は公開 enum への破壊的変更に
+    /// あたるとして差し戻された）。そのため本 variant の [`fmt::Display`] は
+    /// どちらの経路にも常に正しい、代替手段を名指ししない中立な文言のみを持つ。
+    /// 経路別の正確な代替手段案内（`scan` → [`Storage::scan_page`]・テーブルスコープ →
+    /// `catalog.rs` の `scan_table_page`・`scan_batch_log` → 代替 API なし）は、
+    /// どの関数を呼んだかを把握している呼び出し元（= 内部コンテキスト）が生成する。
+    /// `catalog.rs::convert_storage_error` がテーブルスコープ経由の唯一の到達経路である
+    /// ことを踏まえて該当案内を組み立てている（`Storage::scan_batch_log` はカタログ層を
+    /// 経由しないため到達しない）。
     ScanLimitExceeded,
-    /// [`Storage::scan_batch_log`] のエントリ数が上限（[`MAX_BATCH_LOG_ROWS`]）を超過した
-    /// ため fail-closed に拒否した（対象ビヘイビア: TABLE-10）。バッチ台帳には
-    /// [`Storage::scan_page`] 相当のページング API が存在しないため、`ScanLimitExceeded`
-    /// と variant を分け、行テーブル用の代替 API を誤って案内しないようにする。
-    BatchLogLimitExceeded,
     /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
     /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
@@ -192,14 +190,12 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
-            StorageError::ScanLimitExceeded => write!(
-                f,
-                "scan limit exceeded (max {MAX_SCAN_TOTAL_ROWS} rows or {MAX_SCAN_TOTAL_BYTES} bytes): use scan_page"
-            ),
-            StorageError::BatchLogLimitExceeded => write!(
-                f,
-                "batch log scan limit exceeded (max {MAX_BATCH_LOG_ROWS} entries): batch log cannot be loaded at once"
-            ),
+            // 経路（scan / scan_batch_log）を問わず正しい中立な文言のみを持つ。経路別の
+            // 正確な代替手段案内は呼び出し元が組み立てる（本 variant のドキュメンテーション
+            // コメント参照。PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT 対応）。
+            StorageError::ScanLimitExceeded => {
+                write!(f, "scan limit exceeded: results were not returned")
+            }
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
             }
@@ -224,7 +220,6 @@ impl std::error::Error for StorageError {
             StorageError::Codec(_)
             | StorageError::NotFound(_)
             | StorageError::ScanLimitExceeded
-            | StorageError::BatchLogLimitExceeded
             | StorageError::DuplicateBatchSeq(_)
             | StorageError::PendingRowCountOverflow
             | StorageError::UnloggedRows(_)
@@ -525,11 +520,13 @@ impl Storage {
     /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
     ///
     /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
-    /// 部分的な結果を黙って切り詰めず [`StorageError::BatchLogLimitExceeded`] で
+    /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で
     /// fail-closed に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」
     /// 対応。バッチ台帳はコミットごとに増え続けるため、大きな DB では無制限確保が
-    /// メモリ枯渇につながり得る）。台帳にはページング API が無いため、`scan` 用の
-    /// `ScanLimitExceeded` とは別 variant で拒否し、存在しない代替 API を案内しない。
+    /// メモリ枯渇につながり得る）。台帳にはページング API が無いため、この経路の呼び出し元
+    /// は `ScanLimitExceeded` の `Display` が持つ中立文言をそのまま使う（`scan` 用の
+    /// `use scan_page` 案内を誤って流用しない。[`StorageError::ScanLimitExceeded`] の
+    /// ドキュメンテーションコメント参照）。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
@@ -559,11 +556,12 @@ fn check_scan_limits(rows: usize, bytes_used: usize, next_len: usize) -> Result<
 }
 
 /// [`Storage::scan_batch_log`] のエントリ数上限判定を切り出した純粋関数（テスト容易性の
-/// ため）。`entries` は走査済みエントリ数。超過時は [`StorageError::BatchLogLimitExceeded`]
-/// を返す。判定条件は既存の `scan_batch_log` 実装から変更しない。
+/// ため）。`entries` は走査済みエントリ数。超過時は [`StorageError::ScanLimitExceeded`]
+/// を返す（`scan` 用と同一 variant。理由は同 variant のドキュメンテーションコメント参照）。
+/// 判定条件は既存の `scan_batch_log` 実装から変更しない。
 fn check_batch_log_limit(entries: usize) -> Result<()> {
     if entries >= MAX_BATCH_LOG_ROWS {
-        return Err(StorageError::BatchLogLimitExceeded);
+        return Err(StorageError::ScanLimitExceeded);
     }
     Ok(())
 }
@@ -1179,26 +1177,22 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    // Issue #131: 上限超過時のエラー文言・variant が経路（scan / scan_batch_log）ごとに
-    // 正確な代替手段を案内することを固定する。台帳には scan_page 相当のページング API が
-    // 存在しないため、両者の文言が入れ替わらないことを検証する。
+    // Issue #131: `StorageError::ScanLimitExceeded` は scan / scan_batch_log の 2 経路で
+    // 共有される単一 variant のため、`Display` 自体はどちらの経路でも成立する中立文言のみを
+    // 持つことを固定する（`scan_page` のような一方の経路にしか存在しない代替手段を
+    // variant 自身の文言としては名指ししない。経路別の正確な案内は呼び出し元
+    // （`catalog.rs::convert_storage_error` 等）が生成する。PR #193 codex レビュー
+    // PRRT_kwDOUAKASM6cCITT 対応）。
 
     #[test]
-    fn scan_limit_error_message_points_to_scan_page() {
+    fn scan_limit_error_message_is_path_neutral() {
         let msg = StorageError::ScanLimitExceeded.to_string();
-        assert!(msg.contains("scan_page"), "message was: {msg}");
+        assert!(!msg.contains("scan_page"), "message was: {msg}");
         assert!(!msg.contains("batch log"), "message was: {msg}");
     }
 
     #[test]
-    fn batch_log_limit_error_message_does_not_point_to_scan_page() {
-        let msg = StorageError::BatchLogLimitExceeded.to_string();
-        assert!(msg.contains("batch log"), "message was: {msg}");
-        assert!(!msg.contains("scan_page"), "message was: {msg}");
-    }
-
-    #[test]
-    fn check_scan_limits_rejects_row_and_byte_overrun_with_scan_variant() {
+    fn check_scan_limits_rejects_row_and_byte_overrun() {
         // 行数境界: MAX_SCAN_TOTAL_ROWS 件目を追加しようとすると拒否される。
         assert!(matches!(
             check_scan_limits(MAX_SCAN_TOTAL_ROWS, 0, 1),
@@ -1215,10 +1209,10 @@ mod tests {
     }
 
     #[test]
-    fn check_batch_log_limit_rejects_overrun_with_batch_log_variant() {
+    fn check_batch_log_limit_rejects_overrun() {
         assert!(matches!(
             check_batch_log_limit(MAX_BATCH_LOG_ROWS),
-            Err(StorageError::BatchLogLimitExceeded)
+            Err(StorageError::ScanLimitExceeded)
         ));
         assert!(check_batch_log_limit(MAX_BATCH_LOG_ROWS - 1).is_ok());
     }
@@ -1227,7 +1221,6 @@ mod tests {
     fn scan_limit_errors_have_no_source() {
         use std::error::Error;
         assert!(StorageError::ScanLimitExceeded.source().is_none());
-        assert!(StorageError::BatchLogLimitExceeded.source().is_none());
     }
 
     /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:

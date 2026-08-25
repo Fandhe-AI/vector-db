@@ -501,19 +501,19 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::Backend(err) => CatalogError::Backend(err),
         StorageError::Codec(msg) => CatalogError::Invalid(msg),
         StorageError::NotFound(id) => CatalogError::RowNotFound(id),
-        // `scan_table_page` は `MAX_SCAN_PAGE_LIMIT` で事前にクランプしているため
-        // 通常この分岐には到達しない（`Storage::scan`（無制限走査）側でのみ発生しうる
-        // エラーの網羅性のためにここで扱う）。テーブルスコープの呼び出し元に対応する
-        // 正確な代替手段は `scan_table_page` なので、それを案内する。
+        // `StorageError::ScanLimitExceeded` は `Storage::scan`（無制限走査）と
+        // `Storage::scan_batch_log`（バッチ台帳）の 2 経路で共有される単一 variant
+        // （Issue #131・PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT 対応。バッチ台帳専用の
+        // variant を新設する案は公開 enum への破壊的変更にあたるとして差し戻された。詳細は
+        // `storage.rs::StorageError::ScanLimitExceeded` のドキュメンテーションコメント参照）。
+        // `convert_storage_error` はカタログ層（テーブルスコープの `scan_table_page`）
+        // からのみ呼ばれ `Storage::scan_batch_log` を経由しないため、ここでは
+        // 「呼び出し元が自分の経路を知っている（= 内部コンテキスト）」という前提の下、
+        // テーブルスコープの正確な代替手段 `scan_table_page` を案内してよい。
+        // なお `scan_table_page` は `MAX_SCAN_PAGE_LIMIT` で事前にクランプしているため
+        // 通常この分岐自体には到達しない（`StorageError` の網羅性のためにここで扱う）。
         StorageError::ScanLimitExceeded => {
             CatalogError::Invalid("scan limit exceeded: use scan_table_page".to_string())
-        }
-        // `Storage::scan_batch_log`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
-        // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない分岐だが
-        // `StorageError` の網羅性のためここでも扱う。台帳にはページング API が無いため
-        // 代替手段は案内しない。
-        StorageError::BatchLogLimitExceeded => {
-            CatalogError::Invalid("batch log scan limit exceeded".to_string())
         }
         // `log_batch`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
         // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない
@@ -1290,26 +1290,15 @@ mod tests {
         assert!(matches!(result, Err(CatalogError::Invalid(_))));
     }
 
-    // Issue #131: convert_storage_error の変換先文言が経路（テーブルスコープ /
-    // バッチ台帳）ごとに正確な代替手段を案内することを固定する。
+    // Issue #131: convert_storage_error はカタログ層（テーブルスコープ）専用の呼び出し元
+    // であるという内部コンテキストを前提に、`scan_table_page` への正確な代替手段案内を
+    // 生成することを固定する（`Storage::scan_batch_log` はこの経路を通らない）。
 
     #[test]
     fn convert_storage_error_maps_scan_limit_to_table_page_guidance() {
         let err = convert_storage_error(crate::storage::StorageError::ScanLimitExceeded);
         match err {
             CatalogError::Invalid(msg) => assert!(msg.contains("scan_table_page"), "{msg}"),
-            other => panic!("unexpected variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn convert_storage_error_maps_batch_log_limit_without_page_guidance() {
-        let err = convert_storage_error(crate::storage::StorageError::BatchLogLimitExceeded);
-        match err {
-            CatalogError::Invalid(msg) => {
-                assert!(msg.contains("batch log"), "{msg}");
-                assert!(!msg.contains("scan_page"), "{msg}");
-            }
             other => panic!("unexpected variant: {other:?}"),
         }
     }
