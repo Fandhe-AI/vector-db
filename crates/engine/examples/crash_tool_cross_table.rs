@@ -27,7 +27,7 @@
 
 use std::io::Write as _;
 
-use engine::storage::{RowInput, Storage, Visibility};
+use engine::storage::{RowInput, Storage, StorageError, Visibility};
 
 /// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が
 /// 目的で、RLS ポリシー評価そのものは対象外。TASK-142・PERSIST-1 のクラッシュ耐性
@@ -281,9 +281,22 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     }
 
     // バッチ台帳側: batch_seq の 0 起点連続性・row_count 合計。
-    let mut batch_log = storage
-        .scan_batch_log()
-        .map_err(|e| format!("scan_batch_log failed: {e}"))?;
+    //
+    // `StorageError::ScanLimitExceeded` の `Display` はそのまま使わない（Issue #131・
+    // PR #193 codex レビュー再指摘対応）: 固定文言 `"scan limit exceeded: use scan_page"`
+    // は `Storage::scan` 専用の代替 API 案内であり、台帳（`scan_batch_log`。ページング API
+    // を持たない）には当てはまらない。この呼び出し元は「`scan_batch_log` を呼んだ」という
+    // 経路を把握している内部コンテキストのため、台帳向けの正しい復旧策へ変換してから
+    // 提示する（`storage.rs::Storage::scan_batch_log` のドキュメンテーションコメント参照）。
+    let mut batch_log = storage.scan_batch_log().map_err(|e| match e {
+        StorageError::ScanLimitExceeded => {
+            "scan_batch_log failed: batch log entry count exceeds the in-memory scan limit; \
+             this tool has no paginated API for the batch log, reduce the log size (e.g. \
+             compact/rotate the database) before retrying"
+                .to_string()
+        }
+        other => format!("scan_batch_log failed: {other}"),
+    })?;
     batch_log.sort_by_key(|(seq, _)| *seq);
     let mut expected_seq: u64 = 0;
     let mut total_from_log: u64 = 0;

@@ -150,24 +150,26 @@ pub enum StorageError {
     /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した（対象ビヘイビア:
     /// PERSIST-4・TABLE-10）。
     ///
-    /// この 2 経路は同一 variant を共有する（Issue #131 で `Storage::scan_batch_log` 側にも
-    /// 行テーブル用の代替 API 案内（`scan_page`）が誤って出る問題が見つかったが、専用
-    /// variant を新設する案（PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT）・
-    /// `#[non_exhaustive]` を付与する案（同 PRRT_kwDOUAKASM6cB6is）はいずれも公開 enum・
-    /// 既存の網羅的 match への破壊的変更にあたるとして差し戻された）。
+    /// この 2 経路は同一 variant を共有する（専用 variant を新設する案（PR #193 codex
+    /// レビュー PRRT_kwDOUAKASM6cCITT）・`#[non_exhaustive]` を付与する案（同
+    /// PRRT_kwDOUAKASM6cB6is）はいずれも公開 enum・既存の網羅的 match への破壊的変更に
+    /// あたるとして差し戻された）。
     ///
-    /// **[`fmt::Display`] の互換性契約**: 本 variant の `Display` 文字列のうち、先頭の
-    /// `"scan limit exceeded: use scan_page"` は既存利用者がログ・診断で前方一致等で
-    /// 参照しうる観測可能な契約の一部とみなし、variant 追加・`non_exhaustive` 化と同様に
-    /// 告知なく削除・改変しない（PR #193 codex レビュー対応）。それ以降の括弧書きの補足は
-    /// 契約に含めず、経路の性質（行スキャン限定の案内であること等）を明示するために
-    /// 予告なく変わり得る。経路別の正確な代替手段案内（`scan` → [`Storage::scan_page`]・
-    /// テーブルスコープ → `catalog.rs` の `scan_table_page`）は、どの関数を呼んだかを
-    /// 把握している呼び出し元（= 内部コンテキスト）が本 variant を変換する際に別途
-    /// 組み立てる（`catalog.rs::convert_storage_error` 参照。プレフィックスに `scan_page`
-    /// を含むため `scan_batch_log` 経由でそのまま出すと誤案内になり得る点は変わらず、
-    /// この経路の呼び出し元は `Display` をそのまま使わずプレフィックスの互換性のみに
-    /// 依拠すること）。
+    /// **[`fmt::Display`] の互換性契約**: 本 variant の `Display` 文字列
+    /// `"scan limit exceeded: use scan_page"` は既存利用者がログ・診断で参照しうる
+    /// 観測可能な契約であり、variant 追加・`non_exhaustive` 化と同様、末尾への追記も
+    /// 含めて告知なく変更しない（PR #193 codex レビュー再指摘対応: 補足文言の追記で
+    /// あっても既存の完全一致・厳密な前方一致の参照を壊し得るため、旧文字列と完全に
+    /// 同一のまま維持する）。
+    ///
+    /// `scan_page` は [`Storage::scan`] 経路専用の代替 API であり、
+    /// [`Storage::scan_batch_log`]（台帳。ページング API を持たない）には当てはまらない。
+    /// `Display` 文字列自体を経路ごとに変えず固定するため、経路別の正確な代替手段案内
+    /// （`scan` → [`Storage::scan_page`]・テーブルスコープ → `catalog.rs` の
+    /// `scan_table_page`・台帳 → 上限緩和や運用対応）は、どの関数を呼んだかを把握している
+    /// 呼び出し元（= 内部コンテキスト）が本 variant を検出した際に `Display` をそのまま
+    /// 使わず別途組み立てる（`catalog.rs::convert_storage_error`・
+    /// `examples/crash_tool_cross_table.rs` の `scan_batch_log` 呼び出し箇所を参照）。
     ScanLimitExceeded,
     /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
@@ -201,19 +203,16 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
-            // 互換性契約として固定するのは先頭の "scan limit exceeded: use scan_page" の
-            // 部分のみ（本 variant のドキュメンテーションコメント「Display の互換性契約」
-            // 参照。PR #193 codex レビュー対応）。`scan_page` は `Storage::scan` 経路の
-            // 代替 API であり `scan_batch_log` 経路には本来当てはまらないが、旧文字列を
-            // 告知なく削除しない制約の下で両経路が同一 variant を共有するため、括弧内で
-            // 「行スキャン限定の案内である」ことを明示し、より正確な代替手段（テーブル
-            // スコープの `scan_table_page` 等）は呼び出し元（`catalog.rs::convert_storage_error`
-            // 等）が経路別に組み立てる前提を保つ。括弧内の補足文言は契約外で変わり得る。
+            // 互換性契約として文字列全体を旧文字列と完全に同一のまま固定する（本 variant の
+            // ドキュメンテーションコメント「Display の互換性契約」参照。PR #193 codex
+            // レビュー再指摘対応: 末尾への補足追記であっても既存利用者の完全一致・前方一致
+            // 参照を壊し得るため行わない）。`scan_page` は `Storage::scan` 経路専用の代替 API
+            // であり `scan_batch_log`（台帳）経路には当てはまらないが、`Display` 文字列は
+            // 経路によらず固定するため、経路別の正確な代替手段案内は呼び出し元
+            // （`catalog.rs::convert_storage_error`・`examples/crash_tool_cross_table.rs`）が
+            // `Display` を使わず別途組み立てる。
             StorageError::ScanLimitExceeded => {
-                write!(
-                    f,
-                    "scan limit exceeded: use scan_page (row scans; other routes should use their own paginated API)"
-                )
+                write!(f, "scan limit exceeded: use scan_page")
             }
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
@@ -580,11 +579,16 @@ impl Storage {
     /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で
     /// fail-closed に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」
     /// 対応。バッチ台帳はコミットごとに増え続けるため、大きな DB では無制限確保が
-    /// メモリ枯渇につながり得る）。台帳にはページング API が無いため、この経路の呼び出し元は
-    /// `ScanLimitExceeded` の `Display` をそのまま使わない。`Display` の先頭固定文言
-    /// （互換性契約の対象）が `scan` 専用の `scan_page` 案内を含むため、`scan_batch_log`
-    /// 経由でそのまま表示すると存在しない代替手段を誤案内する
-    /// （[`StorageError::ScanLimitExceeded`] のドキュメンテーションコメント参照）。
+    /// メモリ枯渇につながり得る）。
+    ///
+    /// **呼び出し元への注意（Issue #131）**: 台帳にはページング API が無いため、この
+    /// エラーをそのまま利用者へ露出する呼び出し元は `ScanLimitExceeded` の `Display`
+    /// （固定文言 `"scan limit exceeded: use scan_page"`。[`StorageError::ScanLimitExceeded`]
+    /// のドキュメンテーションコメント「Display の互換性契約」参照）をそのまま使わないこと。
+    /// `scan_page` は [`Storage::scan`] 専用の代替 API であり台帳には存在しないため、
+    /// そのまま表示すると存在しない代替手段を誤案内する。呼び出し元は本 variant を
+    /// 検出し、台帳向けの正しい復旧策（上限緩和・運用対応等）へ変換してから提示する
+    /// （変換例: `examples/crash_tool_cross_table.rs` の `scan_batch_log` 呼び出し箇所）。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
@@ -1342,21 +1346,18 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    // Issue #131 / PR #193 codex レビュー対応: `Display` の先頭固定文言
-    // "scan limit exceeded: use scan_page" は既存利用者が前方一致等で参照しうる
-    // 観測可能な互換性契約であり、告知なく削除・改変しない（本 variant のドキュメン
-    // テーションコメント参照）。括弧内の補足は契約対象外で、経路の性質（行スキャン
-    // 限定の案内であること）を明示する。経路別の正確な代替手段案内は呼び出し元
-    // （`catalog.rs::convert_storage_error` 等）が別途生成する。
+    // Issue #131 / PR #193 codex レビュー対応: `Display` の固定文言
+    // "scan limit exceeded: use scan_page" は既存利用者が完全一致・前方一致等で
+    // 参照しうる観測可能な互換性契約であり、告知なく削除・改変しない（末尾への
+    // 補足追記も含む。本 variant のドキュメンテーションコメント参照）。経路別の
+    // 正確な代替手段案内は呼び出し元（`catalog.rs::convert_storage_error`・
+    // `examples/crash_tool_cross_table.rs` 等）が `Display` を使わず別途生成する。
 
     #[test]
-    fn scan_limit_error_message_keeps_legacy_prefix_and_adds_route_qualifier() {
+    fn scan_limit_error_message_matches_legacy_string_exactly() {
         let message = StorageError::ScanLimitExceeded.to_string();
-        // 互換性契約: 旧文字列がそのままプレフィックスとして維持されていること。
-        assert!(message.starts_with("scan limit exceeded: use scan_page"));
-        // 契約外の補足: `scan_page` が行スキャン限定の案内であることを明示し、
-        // scan_batch_log 等の他経路がそのまま流用して誤案内しないよう促す。
-        assert!(message.contains("row scans"));
+        // 互換性契約: 旧文字列と完全に同一（バイト一致）であること。
+        assert_eq!(message, "scan limit exceeded: use scan_page");
     }
 
     #[test]
