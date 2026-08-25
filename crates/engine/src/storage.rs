@@ -147,18 +147,26 @@ pub enum StorageError {
     /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した（対象ビヘイビア:
     /// PERSIST-4・TABLE-10）。
     ///
-    /// この 2 経路は同一 variant を共有する（PR #193 codex レビュー
-    /// PRRT_kwDOUAKASM6cCITT・PRRT_kwDOUAKASM6cB6is 対応。Issue #131 で
-    /// `Storage::scan_batch_log` 側にも行テーブル用の代替 API 案内が誤って出る問題が
-    /// 見つかったが、専用 variant を新設する初回修正案は公開 enum への破壊的変更に
-    /// あたるとして差し戻された）。そのため本 variant の [`fmt::Display`] は
-    /// どちらの経路にも常に正しい、代替手段を名指ししない中立な文言のみを持つ。
-    /// 経路別の正確な代替手段案内（`scan` → [`Storage::scan_page`]・テーブルスコープ →
-    /// `catalog.rs` の `scan_table_page`・`scan_batch_log` → 代替 API なし）は、
-    /// どの関数を呼んだかを把握している呼び出し元（= 内部コンテキスト）が生成する。
-    /// `catalog.rs::convert_storage_error` がテーブルスコープ経由の唯一の到達経路である
-    /// ことを踏まえて該当案内を組み立てている（`Storage::scan_batch_log` はカタログ層を
-    /// 経由しないため到達しない）。
+    /// この 2 経路は同一 variant を共有する（Issue #131 で `Storage::scan_batch_log` 側にも
+    /// 行テーブル用の代替 API 案内（`scan_page`）が誤って出る問題が見つかったが、専用
+    /// variant を新設する案（PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT）・
+    /// `#[non_exhaustive]` を付与する案（同 PRRT_kwDOUAKASM6cB6is）はいずれも公開 enum・
+    /// 既存の網羅的 match への破壊的変更にあたるとして差し戻された）。
+    ///
+    /// **[`fmt::Display`] の互換性契約**: 本 variant の `Display` 文字列
+    /// （`"scan limit exceeded: use scan_page"`）は既存利用者がログ・診断で参照しうる
+    /// 観測可能な契約の一部とみなし、`scan_batch_log` 経由の誤案内を修正する目的でも
+    /// 告知なく変更しない（PR #193 codex レビュー PRRT_kwDOUAKASM6cCl80 対応。variant の
+    /// 追加・`non_exhaustive` 化と同様、Display 文字列の変更もここでは互換性を壊す観測可能な
+    /// 変更として扱う）。経路別の正確な代替手段案内（`scan` → [`Storage::scan_page`]・
+    /// テーブルスコープ → `catalog.rs` の `scan_table_page`）は、どの関数を呼んだかを
+    /// 把握している呼び出し元（= 内部コンテキスト）が本 variant を変換する際に生成する
+    /// （`catalog.rs::convert_storage_error` 参照）。`Storage::scan_batch_log` は現時点で
+    /// カタログ層を経由する製品コード上の呼び出し元を持たないため、この Display 文字列を
+    /// そのまま観測する経路は実質的に存在しない。将来 `scan_batch_log` に製品コード上の
+    /// 呼び出し元を追加する場合は、その呼び出し元がこの Display をそのまま利用者へ
+    /// 露出させず、`catalog.rs::convert_storage_error` と同様に経路を把握した層で
+    /// 正確な案内文言へ変換すること。
     ScanLimitExceeded,
     /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
@@ -192,12 +200,11 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
-            // 経路（scan / scan_batch_log）を問わず正しい中立な文言のみを持つ。経路別の
-            // 正確な代替手段案内は呼び出し元が組み立てる（本 variant のドキュメンテーション
-            // コメント参照。PR #193 codex レビュー PRRT_kwDOUAKASM6cCITT 対応）。
-            StorageError::ScanLimitExceeded => {
-                write!(f, "scan limit exceeded: results were not returned")
-            }
+            // 互換性のため既存の Display 文字列を変更しない（本 variant の
+            // ドキュメンテーションコメント「Display の互換性契約」参照。PR #193 codex
+            // レビュー PRRT_kwDOUAKASM6cCl80 対応）。経路別の正確な代替手段案内は、経路を
+            // 把握している呼び出し元（`catalog.rs::convert_storage_error` 等）が組み立てる。
+            StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
             }
@@ -1203,18 +1210,18 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    // Issue #131: `StorageError::ScanLimitExceeded` は scan / scan_batch_log の 2 経路で
-    // 共有される単一 variant のため、`Display` 自体はどちらの経路でも成立する中立文言のみを
-    // 持つことを固定する（`scan_page` のような一方の経路にしか存在しない代替手段を
-    // variant 自身の文言としては名指ししない。経路別の正確な案内は呼び出し元
-    // （`catalog.rs::convert_storage_error` 等）が生成する。PR #193 codex レビュー
-    // PRRT_kwDOUAKASM6cCITT 対応）。
+    // Issue #131 / PR #193 codex レビュー PRRT_kwDOUAKASM6cCl80 対応: `Display` 文字列は
+    // 既存利用者のログ・診断契約として互換性を維持し、告知なく変更しない（`scan` /
+    // `scan_batch_log` の 2 経路で単一 variant を共有する事情はこの互換性契約に優先しない。
+    // 経路別の正確な代替手段案内は呼び出し元（`catalog.rs::convert_storage_error` 等）が
+    // 別途生成する）。
 
     #[test]
-    fn scan_limit_error_message_is_path_neutral() {
-        let msg = StorageError::ScanLimitExceeded.to_string();
-        assert!(!msg.contains("scan_page"), "message was: {msg}");
-        assert!(!msg.contains("batch log"), "message was: {msg}");
+    fn scan_limit_error_message_is_backward_compatible() {
+        assert_eq!(
+            StorageError::ScanLimitExceeded.to_string(),
+            "scan limit exceeded: use scan_page"
+        );
     }
 
     #[test]
