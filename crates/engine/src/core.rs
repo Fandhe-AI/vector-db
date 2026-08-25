@@ -263,7 +263,23 @@ impl PrefilterCache {
     /// せず、呼び出し元は戻り値の `Arc` をその場限りで使う（型ドキュメント参照）。
     /// ロック毒化時は挿入せず `Arc` をそのまま返す（キャッシュ非搭載でも検索自体は続行
     /// できるよう fail-closed に「キャッシュを諦める」側へ倒す）。
-    fn insert(&self, table: &str, snapshot: PrefilterSnapshot) -> Arc<PrefilterSnapshot> {
+    ///
+    /// `storage` は (1) の世代不整合エントリの一括破棄で「現在の実世代」
+    /// （[`Storage::current_generation`]）を判定するためだけに使う。以前は
+    /// `snapshot.built_generation()`（= このスナップショット自身の構築時点の世代）を
+    /// 現在世代の代用にしていたが、これは挿入対象のスナップショットが並行書き込みで
+    /// 既に古くなっている場合、真に新しい（現在世代と一致する）既存エントリまで
+    /// 「不一致」として誤って全破棄してしまう不具合があった（Cursor Bugbot 指摘）。
+    /// `storage.current_generation()` の読み取りに失敗した場合は世代整合を判定できない
+    /// ため、(1) の一括破棄は行わずスキップする（fail-closed: 「破棄しすぎない」側へ倒す。
+    /// stale なエントリは [`Self::lookup`] が個別に検出して破棄する）。
+    fn insert(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+        snapshot: PrefilterSnapshot,
+    ) -> Arc<PrefilterSnapshot> {
         let snapshot = Arc::new(snapshot);
         self.misses.fetch_add(1, Ordering::Relaxed);
 
@@ -278,16 +294,32 @@ impl PrefilterCache {
             return snapshot;
         };
 
-        // (1) 現在世代と不整合なエントリを先に全破棄する（型ドキュメント参照）。
-        let current_generation = snapshot.built_generation();
-        let before = guard.entries.len();
-        guard
+        // 同一 (table, ctx) キーの既存エントリは挿入前に取り除く（Cursor Bugbot 指摘:
+        // 常に push するだけだと同一キーが重複登録され、[`Self::lookup`] は先頭一致
+        // しか参照しないため後続の重複が [`MAX_PREFILTER_CACHE_ENTRIES`] を無駄に
+        // 消費し続ける）。キーは `(table, ctx)` の完全一致（型ドキュメント参照）。
+        if let Some(pos) = guard
             .entries
-            .retain(|e| e.snapshot.built_generation() == current_generation);
-        let removed_stale = before.saturating_sub(guard.entries.len());
-        if removed_stale > 0 {
-            self.stale_evictions
-                .fetch_add(removed_stale as u64, Ordering::Relaxed);
+            .iter()
+            .position(|e| e.table == table && e.snapshot.built_ctx() == ctx)
+        {
+            guard.entries.remove(pos);
+        }
+
+        // (1) 現在世代と不整合なエントリを先に全破棄する（型ドキュメント参照）。
+        // 上記の理由により、現在世代は必ず `storage.current_generation()` から読む
+        // （挿入対象スナップショット自身の世代を代用しない）。読み取りに失敗した場合は
+        // この一括破棄をスキップする（fail-closed）。
+        if let Ok(current_generation) = storage.current_generation() {
+            let before = guard.entries.len();
+            guard
+                .entries
+                .retain(|e| e.snapshot.built_generation() == current_generation);
+            let removed_stale = before.saturating_sub(guard.entries.len());
+            if removed_stale > 0 {
+                self.stale_evictions
+                    .fetch_add(removed_stale as u64, Ordering::Relaxed);
+            }
         }
 
         // (2) それでも件数・総量が上限を超えるなら `last_used` 最小から追い出す。
@@ -777,7 +809,9 @@ impl VectorCore for EngineCore {
             Err(RlsError::NotFound) => return Err(CoreError::NotFound),
             Err(e) => return Err(map_rls_error(e)),
         };
-        let snapshot = self.prefilter_cache.insert(table, snapshot);
+        let snapshot = self
+            .prefilter_cache
+            .insert(&self.storage, table, ctx, snapshot);
         self.search_with_snapshot(table, ctx, query, k, snapshot)
     }
 
@@ -1128,6 +1162,125 @@ mod tests {
         let stats = core.prefilter_cache_stats();
         assert!(stats.entries <= MAX_PREFILTER_CACHE_ENTRIES);
         assert!(stats.capacity_evictions >= 1);
+    }
+
+    // 対象ビヘイビア: TASK-169（Cursor Bugbot 指摘の回帰テスト）。`PrefilterCache::insert`
+    // が挿入対象スナップショット自身の世代を「現在世代」の代用にすると、並行書き込みで
+    // 既に古くなったスナップショットを挿入した際、真に新しい既存エントリまで
+    // 世代不一致として誤って全破棄してしまう（キャッシュが不当に空になる）。
+    // `storage.current_generation()` を正として世代整合を判定していれば、後から書き込み
+    // 前提で構築された（結果的に古い）スナップショットを挿入しても、既存の新しい
+    // エントリは破棄されず残る。
+    #[test]
+    fn search_insert_does_not_evict_a_newer_entry_using_a_stale_snapshots_own_generation() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // 世代 G0 時点で 2 つの異なるテナント向けスナップショットを構築しておく
+        // （まだキャッシュへは挿入しない）。
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let stale_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx_a).expect("build snapshot a");
+
+        // tenant-b 側は通常の検索経路でキャッシュへ挿入し、世代 G0 のエントリとして
+        // 常駐させる。
+        core.search(&ctx_b, "docs", &[1.0, 0.0], 10)
+            .expect("search ok for tenant-b");
+        assert_eq!(core.prefilter_cache_stats().entries, 1);
+
+        // 書き込みで世代を G0 → G1 へ進める（`stale_snapshot` は G0 のまま古くなる）。
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // tenant-b のエントリは既に世代 G1 で再構築済み（`search` がキャッシュミスから
+        // 再挿入する）とみなし、まず現在の状態を G1 に揃える。
+        core.search(&ctx_b, "docs", &[1.0, 0.0], 10)
+            .expect("search ok for tenant-b after write");
+        assert_eq!(
+            core.prefilter_cache_stats().entries,
+            1,
+            "tenant-b の再構築後エントリが 1 件残っていること"
+        );
+
+        // 古い（G0 のままの）`stale_snapshot` を挿入しても、既存の G1 エントリ
+        // （tenant-b）が誤って破棄されないこと（Cursor Bugbot 指摘の再現条件）。
+        core.prefilter_cache
+            .insert(&core.storage, "docs", &ctx_a, stale_snapshot);
+        let stats = core.prefilter_cache_stats();
+        assert_eq!(
+            stats.entries, 2,
+            "古いスナップショットの挿入で新しい既存エントリが失われてはならない"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-169（Cursor Bugbot 指摘の回帰テスト）。`PrefilterCache::insert`
+    // は同一 `(table, ctx)` キーへの挿入で既存エントリを置換し、重複エントリを
+    // 積み上げない（[`PrefilterCache::lookup`] は先頭一致のみ参照するため、重複が
+    // 残ると無駄に `MAX_PREFILTER_CACHE_ENTRIES` を消費し続ける）。
+    #[test]
+    fn search_insert_replaces_an_existing_entry_for_the_same_key_instead_of_duplicating() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 同一 (table, ctx) キーへ複数回挿入する（同一スナップショットを使い回しても
+        // `insert` 自身は世代を見ないため重複判定の再現に十分）。
+        let snapshot_1 =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot 1");
+        let snapshot_2 =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot 2");
+
+        core.prefilter_cache
+            .insert(&core.storage, "docs", &ctx, snapshot_1);
+        core.prefilter_cache
+            .insert(&core.storage, "docs", &ctx, snapshot_2);
+
+        assert_eq!(
+            core.prefilter_cache_stats().entries,
+            1,
+            "同一キーへの再挿入は既存エントリを置換し、重複登録してはならない"
+        );
     }
 
     // 対象ビヘイビア: TASK-169（Issue #137 系の provider 検証をキャッシュ経路でも
