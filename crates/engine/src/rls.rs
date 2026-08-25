@@ -11,8 +11,10 @@
 //! tenant/visibility 再検証（構築時との不一致は [`RlsError::IndexStale`]）を fail-closed に
 //! 行う。契約の詳細は [`PrefilterIndex::search`] のドキュメント参照。
 //!
-//! `core.rs::EngineCore`（`VectorCore::search`）への prefilter インデックスのキャッシュ
-//! 統合・API 変更は本タスクのスコープ外（`VectorCore` trait のシグネチャは変更しない）。
+//! `core.rs::EngineCore`（`VectorCore::search`）は `core.rs::PrefilterCache`
+//! （TASK-169）経由で [`PrefilterSnapshot`] をキャッシュし、世代整合を保った上で
+//! 事前フィルタインデックスを再利用する（`VectorCore` trait のシグネチャは変更しない。
+//! 詳細は `core.rs` モジュールドキュメント・`PrefilterSnapshot` のドキュメント参照）。
 //!
 //! 本モジュールはさらに [`SearchTimeFilter`]（TASK-134・対象ビヘイビア: RLS-1, RLS-3）を
 //! 提供する。[`PrefilterIndex`] は構築時に `PolicyContext` を束縛するため、ポリシーが
@@ -131,27 +133,39 @@ impl From<crate::storage::StorageError> for RlsError {
 /// [`Self::len`]・[`Self::is_empty`] は可視行数・行の有無という存在情報を返すため、
 /// [`Self::built_ctx`] との完全一致を要求する（不一致は [`RlsError::ContextMismatch`]）。
 /// [`Self::dim`]・[`Self::table_name`] は非機微情報のため `ctx` を要求しない。
-pub struct PrefilterIndex<'s> {
+/// 事前フィルタ方式の再利用可能インデックスのうち、`&Storage` 参照を持たない
+/// 内部スナップショット部分（TASK-133・TASK-169・RLS-1〜4）。
+///
+/// [`PrefilterIndex`] は本来 `&'s Storage` を保持するが、`core.rs::EngineCore` は
+/// `Storage` を所有するため、`EngineCore` 内部のキャッシュ（`core.rs::PrefilterCache`）に
+/// `PrefilterIndex<'s>` をそのまま格納すると自己参照構造体になってしまう。
+/// `PrefilterSnapshot` は storage 参照を持たない構築結果だけを保持し、`search_with`・
+/// `built_generation` 等のメソッドへ `&Storage` をそのつど引数で受け取ることで、
+/// `Arc<PrefilterSnapshot>` を storage の生存期間から独立してキャッシュに保持できるように
+/// する。[`PrefilterIndex`] は本型への薄いラッパーとして、既存の公開 API・契約（`ctx`
+/// 完全一致・前後世代照合・provider 結果検証）をそのまま維持する。
+pub(crate) struct PrefilterSnapshot {
     arena: VectorArena,
-    /// [`Self::build`] に渡された `&Storage`（[`Self::search`] へは渡さず、この参照のみ
-    /// 使う）。
-    storage: &'s Storage,
     /// `arena.ids()` の `HashSet` キャッシュ（provider 結果の可視性検証に使う）。
     visible_id_set: HashSet<u64>,
-    /// [`Self::build`] に渡された `PolicyContext` の複製。`ctx` 照合ゲートに使う。
+    /// 構築時に束縛した `PolicyContext` の複製。`ctx` 照合ゲートに使う。
     built_ctx: PolicyContext,
-    /// [`Self::build`] 時に読んだストレージ世代（[`Storage::current_generation`]）。
-    /// [`Self::search`] の失効検出に使う。
+    /// 構築時に読んだストレージ世代（[`Storage::current_generation`]）。
+    /// [`Self::search_with`] の失効検出に使う。
     built_generation: u64,
 }
 
-impl<'s> PrefilterIndex<'s> {
+impl PrefilterSnapshot {
     /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する（RLS-1）。
     /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
     /// security.md P0）。容量超過・次元不整合は [`RlsError::Arena`] へ伝播する。
-    pub fn build(storage: &'s Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
+    pub(crate) fn build(
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> Result<Self, RlsError> {
         // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
-        // コミットされても、その変更を見落とさない方向の順序。`search` の doc 参照）。
+        // コミットされても、その変更を見落とさない方向の順序。`search_with` の doc 参照）。
         let built_generation = storage.current_generation()?;
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
@@ -165,7 +179,6 @@ impl<'s> PrefilterIndex<'s> {
         let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
         Ok(Self {
             arena,
-            storage,
             visible_id_set,
             built_ctx: ctx.clone(),
             built_generation,
@@ -174,12 +187,13 @@ impl<'s> PrefilterIndex<'s> {
 
     /// 保持済みインデックスに対して Top-k 検索を行う（over-fetch なし・RLS-3）。
     ///
-    /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
+    /// `ctx` は構築時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
     /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**と
-    /// provider から結果を受け取った**後**の 2 回、
-    /// [`crate::storage::Storage::current_generation`] を呼んで [`Self::build`] 時の値と
-    /// 比較する（いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体の
+    /// provider から結果を受け取った**後**の 2 回、`storage`（呼び出し元が渡す。
+    /// キャッシュ経由の再利用時も構築時と同一の `Storage` を渡す契約）の
+    /// [`crate::storage::Storage::current_generation`] を呼んで構築時の値と比較する
+    /// （いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体の
     /// 書き込みコミットのたびに単調増加する（`crate::storage::bump_generation_and_commit`）
     /// ため、両方で一致することは「事前確認から事後確認までの間、行集合・内容とも一切
     /// 変更されていない」ことを意味する（安全性はこの前後比較のみで担保しており、
@@ -187,9 +201,10 @@ impl<'s> PrefilterIndex<'s> {
     /// 場合のみ provider を呼び、戻り値を `provider_result_is_valid`（`core.rs`）で検証する
     /// （違反は [`RlsError::ProviderResultRejected`]）。事前・事後の確認自体は互いに独立した
     /// 読み取りであり、事後確認と `Ok(hits)` 返却の間に残るごく短いウィンドウは次回検索の
-    /// 世代照合で扱う。TASK-133・RLS-1〜4 参照。
-    pub fn search(
+    /// 世代照合で扱う。TASK-133・TASK-169・RLS-1〜4 参照。
+    pub(crate) fn search_with(
         &self,
+        storage: &Storage,
         ctx: &PolicyContext,
         provider: &dyn SearchProvider,
         query: &[f32],
@@ -212,8 +227,7 @@ impl<'s> PrefilterIndex<'s> {
 
         // 事前の失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
         // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
-        let pre_generation = self
-            .storage
+        let pre_generation = storage
             .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
         if pre_generation != self.built_generation {
@@ -235,8 +249,7 @@ impl<'s> PrefilterIndex<'s> {
 
         // 事後の失効再検証（上記ドキュメント参照）。事前確認〜ここまでの間に別の書き込みが
         // コミットされている可能性があるため、世代を読み直して不一致なら結果を破棄する。
-        let post_generation = self
-            .storage
+        let post_generation = storage
             .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
         if post_generation != self.built_generation {
@@ -248,7 +261,7 @@ impl<'s> PrefilterIndex<'s> {
 
     /// インデックスが保持する可視行数を返す。`ctx` は構築時 `PolicyContext` と完全一致
     /// していなければ [`RlsError::ContextMismatch`]（存在情報を漏らさない。security.md P0）。
-    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+    pub(crate) fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
         if ctx != &self.built_ctx {
             return Err(RlsError::ContextMismatch);
         }
@@ -256,7 +269,7 @@ impl<'s> PrefilterIndex<'s> {
     }
 
     /// 可視行が 0 件かを返す（`ctx` 照合は [`Self::len`] と同じ）。
-    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+    pub(crate) fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
         if ctx != &self.built_ctx {
             return Err(RlsError::ContextMismatch);
         }
@@ -264,13 +277,97 @@ impl<'s> PrefilterIndex<'s> {
     }
 
     /// 検索対象ベクトルの次元（`ctx` 不要。テーブル定義由来の非機微情報）。
-    pub fn dim(&self) -> u32 {
+    pub(crate) fn dim(&self) -> u32 {
         self.arena.dim()
     }
 
     /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
-    pub fn table_name(&self) -> &str {
+    pub(crate) fn table_name(&self) -> &str {
         self.arena.table_name()
+    }
+
+    /// 構築時に束縛した `PolicyContext`（`core.rs::PrefilterCache` のキー照合に使う）。
+    pub(crate) fn built_ctx(&self) -> &PolicyContext {
+        &self.built_ctx
+    }
+
+    /// 構築時に読んだストレージ世代（`core.rs::PrefilterCache` の世代整合判定に使う）。
+    pub(crate) fn built_generation(&self) -> u64 {
+        self.built_generation
+    }
+
+    /// このスナップショットが常駐時に占める概算ヒープ使用量
+    /// （`core.rs::PrefilterCache` の容量上限判定に使う。[`VectorArena::approx_heap_bytes`]
+    /// と `visible_id_set` の概算合計。詳細は同メソッドのドキュメント参照）。
+    pub(crate) fn approx_heap_bytes(&self) -> usize {
+        let arena_bytes = self.arena.approx_heap_bytes();
+        let id_set_bytes = self
+            .visible_id_set
+            .len()
+            .saturating_mul(std::mem::size_of::<u64>());
+        arena_bytes.saturating_add(id_set_bytes)
+    }
+}
+
+/// 事前フィルタ方式の再利用可能インデックス（TASK-133・RLS-1〜4）。
+///
+/// [`Self::build`] 構築時に束縛した [`PolicyContext`] の可視性述語で
+/// [`VectorArena::build_filtered`] を呼び、可視行のみのカラムナ表現を保持する。
+/// [`Self::search`] の契約は同メソッドのドキュメント参照。
+///
+/// [`Self::len`]・[`Self::is_empty`] は可視行数・行の有無という存在情報を返すため、
+/// 構築時 `PolicyContext` との完全一致を要求する（不一致は [`RlsError::ContextMismatch`]）。
+/// [`Self::dim`]・[`Self::table_name`] は非機微情報のため `ctx` を要求しない。
+///
+/// 本型は storage 非依存の [`PrefilterSnapshot`] を `&'s Storage` とともに保持するだけの
+/// 薄いラッパーで、実処理は `PrefilterSnapshot` 側のメソッドへ委譲する（TASK-169:
+/// `core.rs::EngineCore` がキャッシュに保持できるよう `PrefilterSnapshot` を切り出した
+/// 経緯は同型のドキュメント参照）。
+pub struct PrefilterIndex<'s> {
+    inner: PrefilterSnapshot,
+    storage: &'s Storage,
+}
+
+impl<'s> PrefilterIndex<'s> {
+    /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する（RLS-1）。
+    /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
+    /// security.md P0）。容量超過・次元不整合は [`RlsError::Arena`] へ伝播する。
+    pub fn build(storage: &'s Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
+        let inner = PrefilterSnapshot::build(storage, table, ctx)?;
+        Ok(Self { inner, storage })
+    }
+
+    /// 保持済みインデックスに対して Top-k 検索を行う（契約は
+    /// [`PrefilterSnapshot::search_with`] のドキュメント参照。TASK-133・RLS-1〜4）。
+    pub fn search(
+        &self,
+        ctx: &PolicyContext,
+        provider: &dyn SearchProvider,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>, RlsError> {
+        self.inner
+            .search_with(self.storage, ctx, provider, query, k)
+    }
+
+    /// インデックスが保持する可視行数を返す（契約は [`PrefilterSnapshot::len`] 参照）。
+    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+        self.inner.len(ctx)
+    }
+
+    /// 可視行が 0 件かを返す（契約は [`PrefilterSnapshot::is_empty`] 参照）。
+    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+        self.inner.is_empty(ctx)
+    }
+
+    /// 検索対象ベクトルの次元（`ctx` 不要。テーブル定義由来の非機微情報）。
+    pub fn dim(&self) -> u32 {
+        self.inner.dim()
+    }
+
+    /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
+    pub fn table_name(&self) -> &str {
+        self.inner.table_name()
     }
 }
 
@@ -1856,5 +1953,100 @@ mod tests {
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
         assert_eq!(filter.dim(), 3);
         assert_eq!(filter.table_name(), "docs");
+    }
+
+    // 対象ビヘイビア: RLS-1〜4（TASK-169）。`PrefilterSnapshot::search_with` は
+    // `PrefilterIndex::search` と同一契約（世代の前後照合による失効検出）を、
+    // 呼び出し元が渡す `&Storage` に対して満たす（`core.rs::PrefilterCache` が
+    // storage 参照を保持せずキャッシュできることの直接的な前提）。
+    #[test]
+    fn snapshot_search_with_rejects_after_a_write_bumps_the_generation() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx).expect("build snapshot");
+
+        // 構築直後は世代が一致するため成功する。
+        assert!(snapshot
+            .search_with(&storage, &ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .is_ok());
+
+        // 別の書き込みコミットで世代が進むと、以後の検索は stale として拒否される
+        // （fail-closed。古い可視行集合の結果を返す経路を作らない）。
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.0, 1.0],
+        );
+        assert!(matches!(
+            snapshot.search_with(&storage, &ctx, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::IndexStale)
+        ));
+    }
+
+    // 対象ビヘイビア: RLS-1（TASK-169）。構築時と異なる `PolicyContext` は
+    // fail-closed に拒否する（`core.rs::PrefilterCache` のキー照合が万一崩れても
+    // 本メソッド自身が防御する二重チェック）。
+    #[test]
+    fn snapshot_search_with_rejects_a_context_different_from_build_time() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx_a).expect("build snapshot");
+
+        assert!(matches!(
+            snapshot.search_with(&storage, &ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::ContextMismatch)
+        ));
+    }
+
+    // 対象ビヘイビア: TASK-169（`core.rs::PrefilterCache` の容量上限判定の前提）。
+    // 可視行を持つスナップショットの概算ヒープ使用量は 0 より大きい。
+    #[test]
+    fn snapshot_approx_heap_bytes_is_positive_when_index_holds_rows() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx).expect("build snapshot");
+
+        assert!(snapshot.approx_heap_bytes() > 0);
+        assert_eq!(snapshot.built_ctx(), &ctx);
     }
 }

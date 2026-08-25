@@ -772,6 +772,35 @@ impl VectorArena {
     pub fn visibility(&self, index: usize) -> Option<Visibility> {
         self.visibilities.get(index).copied()
     }
+
+    /// このアリーナが保持するバッファのヒープ使用量の概算バイト数（`vectors`・`ids`・
+    /// `tenant_ids`・`visibilities` の要素サイズ合計。`String` の内部確保分を含み、
+    /// 構造体自体のスタックサイズ・アロケータのオーバーヘッドは含まない大まかな目安）。
+    ///
+    /// 呼び出し文脈: `core.rs::PrefilterCache`（TASK-133 後続。RLS-1〜4）がキャッシュに
+    /// 常駐させる `PrefilterSnapshot`（内部に本アリーナを保持）の総量上限判定に使う。
+    /// オーバーフローで panic しないよう `checked_mul`/`saturating_add` のみで計算する
+    /// （.claude/rules/coding-rust.md: 整数演算は checked/saturating を使う）。
+    pub(crate) fn approx_heap_bytes(&self) -> usize {
+        let vectors_bytes = self
+            .vectors
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+        let ids_bytes = self.ids.len().saturating_mul(std::mem::size_of::<u64>());
+        let visibilities_bytes = self
+            .visibilities
+            .len()
+            .saturating_mul(std::mem::size_of::<Visibility>());
+        let tenant_ids_bytes = self
+            .tenant_ids
+            .iter()
+            .map(|s| s.capacity())
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        vectors_bytes
+            .saturating_add(ids_bytes)
+            .saturating_add(visibilities_bytes)
+            .saturating_add(tenant_ids_bytes)
+    }
 }
 
 #[cfg(test)]
