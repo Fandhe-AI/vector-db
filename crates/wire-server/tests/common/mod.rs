@@ -96,6 +96,13 @@ pub fn send_ssl_request_and_startup(stream: &mut TcpStream, username: &str, data
     stream.read_exact(&mut resp).expect("read SSL response");
     assert_eq!(&resp, b"N", "server must decline SSL");
 
+    send_startup_message(stream, username, database);
+}
+
+/// StartupMessage（protocol 3.0, user=.../database=...）のみを送る
+/// （SSLRequest フェーズを別途消費済みの接続向け。`connect_after_slot_available`
+/// が SSLRequest の 'N' 応答まで進めた接続の続きとして使う）。
+pub fn send_startup_message(stream: &mut TcpStream, username: &str, database: &str) {
     let mut params = Vec::new();
     params.extend_from_slice(b"user\0");
     params.extend_from_slice(username.as_bytes());
@@ -111,6 +118,54 @@ pub fn send_ssl_request_and_startup(stream: &mut TcpStream, username: &str, data
     startup.extend_from_slice(&0x0003_0000i32.to_be_bytes());
     startup.extend_from_slice(&params);
     stream.write_all(&startup).expect("send StartupMessage");
+}
+
+/// 接続スロットが解放されるまで短い間隔でリトライし、解放後の TCP 接続を
+/// 返す（SSLRequest の 'N' 応答まで到達した時点で解放済みと判定する）。
+///
+/// `server::accept_loop` は同時接続数の上限を超える接続を、ハンドシェイクへ
+/// 進ませず即座にクローズする（`accept_loop` 内 `try_acquire_slot` 失敗時。
+/// `apply_io_timeout` 前に `drop(stream)` する経路）。そのため SSLRequest の
+/// 応答が 1 バイトも来ず EOF/タイムアウトになることが「スロット未解放」の
+/// 確実な合図になる。逆に 'N' が読めれば `ConnectionSlot` を確保できたことの
+/// 証拠であり、拒否された接続の write-side shutdown（drain 開始時の EOF）を
+/// 誤ってスロット解放の証拠として扱う競合を避けられる
+/// （`wire8_rejection_releases_connection_slot` のレビュー是正）。
+pub fn connect_after_slot_available(
+    addr: std::net::SocketAddr,
+    total_timeout: Duration,
+) -> TcpStream {
+    let deadline = std::time::Instant::now() + total_timeout;
+    loop {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("set read timeout");
+
+        let mut ssl_req = Vec::new();
+        ssl_req.extend_from_slice(&8i32.to_be_bytes());
+        ssl_req.extend_from_slice(&80_877_103i32.to_be_bytes());
+        stream.write_all(&ssl_req).expect("send SSLRequest");
+
+        let mut resp = [0u8; 1];
+        match stream.read_exact(&mut resp) {
+            Ok(()) => {
+                assert_eq!(&resp, b"N", "server must decline SSL");
+                stream.set_read_timeout(None).expect("clear read timeout");
+                return stream;
+            }
+            Err(_) => {
+                // over-capacity による即時クローズ、またはまだ枠が空くのを
+                // 待っている途中のタイムアウト。どちらも「未解放」として
+                // リトライする。
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connection slot was not released within {total_timeout:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 pub fn read_auth_request_type(stream: &mut TcpStream) -> i32 {

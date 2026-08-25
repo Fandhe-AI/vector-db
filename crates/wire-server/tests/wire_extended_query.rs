@@ -154,16 +154,13 @@ fn wire8_rejection_releases_connection_slot() {
     expect_error_response_with_sqlstate(&mut rejected, "0A000");
     expect_connection_closed(&mut rejected);
 
-    // 枠(1)が解放されたはずなので、次の接続はすぐに閉じられない
-    // （即座に EOF ではなく、認証応答まで進められること）。
-    // `send_ssl_request_and_startup` は内部で SSLRequest の 'N' 応答を読み切って
-    // から StartupMessage を送るため、続けて AuthenticationCleartextPassword
-    // （'R', code=3）が読めることまで確認する。
-    let mut second = std::net::TcpStream::connect(addr).expect("connect second");
-    second
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .expect("set read timeout");
-    common::send_ssl_request_and_startup(&mut second, "alice", "db");
+    // 枠(1)の解放は「拒否された 1 本目の書き込み方向 shutdown による EOF」では
+    // 証明できない（drain 開始時の EOF は `ConnectionSlot` 解放より先に観測され
+    // うるレース）。`connect_after_slot_available` が SSLRequest の 'N' 応答まで
+    // 到達するのをポーリングで待つことで、over-capacity 即時クローズ経路を
+    // 実際に外れた（＝スロットが解放された）ことを決定的に確認する。
+    let mut second = common::connect_after_slot_available(addr, Duration::from_secs(5));
+    common::send_startup_message(&mut second, "alice", "db");
     let auth_code = common::read_auth_request_type(&mut second);
     assert_eq!(
         auth_code, 3,
