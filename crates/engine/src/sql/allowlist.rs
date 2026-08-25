@@ -202,31 +202,67 @@ pub enum Projection {
 /// 既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
 /// 変更となった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド
 /// 追加が同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応
-/// にする（フィールド自体は既存の直読み互換性を保つため `pub` のまま維持する）。
-/// 加えて個別のアクセサーメソッド（[`ValidatedStatement::table_name`] 等）も公開し、
-/// 将来的な内部表現変更の余地を残す。本構造体はクレート外から直接構築するものでは
-/// なく、[`validate_sql`] の戻り値としてのみ取得する。
+/// にする。フィールドはカプセル化のため `pub(crate)` とし（クレート外からの直読み・
+/// 直書きは不可。コード内では [`ValidatedStatement::table_name`] 等のアクセサー
+/// メソッドを経由する）、クレート外からの構築は [`ValidatedStatement::new`]（既存
+/// フィールド相当の引数を取る）と [`ValidatedStatement::with_search_mode`]（TASK-161
+/// で追加した `search_mode` を設定するビルダー的メソッド）を経由する。本構造体は
+/// 通常 [`validate_sql`] の戻り値として取得するが、上記 constructor 経由でも構築
+/// できる（PR #188 レビュー指摘対応: 破壊的変更の移行経路を用意しつつ、直接の
+/// フィールド読み書きは許可しない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
-    pub table_name: String,
-    pub projection: Projection,
-    pub order_by: OrderByForm,
+    pub(crate) table_name: String,
+    pub(crate) projection: Projection,
+    pub(crate) order_by: OrderByForm,
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
-    pub where_predicates: Vec<WherePredicate>,
-    pub limit: u32,
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    pub(crate) limit: u32,
     /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
     /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
     /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
     /// を経由する `sql::parser::bind_with_session` が検証する。
-    pub search_mode: Option<String>,
+    pub(crate) search_mode: Option<String>,
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。未指定時は
     /// [`EvaluationOrder::DEFAULT`]（既存 TASK-75 の固定順 RLS→SCALAR→DISTANCE）。
-    pub evaluation_order: EvaluationOrder,
+    pub(crate) evaluation_order: EvaluationOrder,
 }
 
 impl ValidatedStatement {
+    /// クレート外から構築するための constructor（TASK-161 で `search_mode`
+    /// フィールドを追加する以前の既存フィールド相当の引数を取る）。`search_mode`
+    /// は未指定（`None`）で構築され、必要なら [`Self::with_search_mode`] を続けて
+    /// 呼ぶ。フィールドが `pub(crate)` のため、クレート外から `ValidatedStatement`
+    /// を得るにはこの constructor か [`validate_sql`] の戻り値を経由するしかない。
+    pub fn new(
+        table_name: String,
+        projection: Projection,
+        order_by: OrderByForm,
+        where_predicates: Vec<WherePredicate>,
+        limit: u32,
+        evaluation_order: EvaluationOrder,
+    ) -> Self {
+        Self {
+            table_name,
+            projection,
+            order_by,
+            where_predicates,
+            limit,
+            search_mode: None,
+            evaluation_order,
+        }
+    }
+
+    /// `search_mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
+    /// [`Self::new`] と組み合わせて `search_mode` を含む値を外部から構築する。
+    #[must_use]
+    pub fn with_search_mode(mut self, search_mode: Option<String>) -> Self {
+        self.search_mode = search_mode;
+        self
+    }
+
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub fn table_name(&self) -> &str {
         &self.table_name

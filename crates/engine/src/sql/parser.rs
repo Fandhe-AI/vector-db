@@ -62,24 +62,28 @@ pub enum Ranking {
 /// `#[non_exhaustive]`: TASK-161（SQL-12）で `mode` フィールドを追加した際、既存の
 /// 構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的変更と
 /// なった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド追加が
-/// 同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応にする
-/// （フィールド自体は既存の直読み互換性を保つため `pub` のまま維持する）。加えて
-/// 個別のアクセサーメソッド（[`BoundStatement::table`] 等）も公開し、将来的な内部
-/// 表現変更の余地を残す。本構造体はクレート外から直接構築するものではなく、
-/// [`bind_with_session`] の戻り値としてのみ取得する。
+/// 同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応にする。
+/// フィールドはカプセル化のため `pub(crate)` とし（クレート外からの直読み・直書きは
+/// 不可。コード内では [`BoundStatement::table`] 等のアクセサーメソッドを経由する）、
+/// クレート外からの構築は [`BoundStatement::new`]（既存フィールド相当の引数を取り、
+/// `mode` は既定値 [`crate::sql::mode::resolve_mode`]`(None, None)` で構築する）と
+/// [`BoundStatement::with_mode`]（TASK-161 で追加した `mode` を設定するビルダー的
+/// メソッド）を経由する。本構造体は通常 [`bind_with_session`] の戻り値として取得
+/// するが、上記 constructor 経由でも構築できる（PR #188 レビュー指摘対応: 破壊的
+/// 変更の移行経路を用意しつつ、直接のフィールド読み書きは許可しない）。
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct BoundStatement {
-    pub table: String,
-    pub projection: Vec<ProjectedColumn>,
-    pub scalar_filters: Vec<ScalarEq>,
+    pub(crate) table: String,
+    pub(crate) projection: Vec<ProjectedColumn>,
+    pub(crate) scalar_filters: Vec<ScalarEq>,
     /// `WHERE` 句に `visible()` 呼び出し形が含まれていたか（SQL-3・RLS-7 参照）。
     /// **実行側の RLS 適用はこの値の有無に依存しない**（`exec.rs` は無条件に
     /// `PolicyContext::is_visible` を適用する）。本フィールドは束縛結果の可観測性
     /// （テスト・診断）のためだけに保持する。
-    pub rls_predicate_present: bool,
-    pub ranking: Ranking,
-    pub limit: usize,
+    pub(crate) rls_predicate_present: bool,
+    pub(crate) ranking: Ranking,
+    pub(crate) limit: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
     /// （[`ValidatedStatement::search_mode`](crate::sql::allowlist::ValidatedStatement)）
     /// とセッション変数（呼び出し元 `core.rs::EngineCore::execute_sql_in_session` が
@@ -87,14 +91,50 @@ pub struct BoundStatement {
     /// が決定する。カーネル選択（`dispatch.rs`）の入力には含めない（`precision` の
     /// 実行契約は TASK-162・SEARCH-9 の管轄。`sql::exec` が本フィールドを見て
     /// 実行可否を判定する）。
-    pub mode: crate::sql::mode::ResolvedMode,
+    pub(crate) mode: crate::sql::mode::ResolvedMode,
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。`allowlist` が
     /// 検証済みの [`EvaluationOrder`] をそのまま素通しする（意味論的な束縛の必要は
     /// ない。実行意味論の解釈は [`crate::sql::plan::ExecutionPlan`] の管轄）。
-    pub evaluation_order: EvaluationOrder,
+    pub(crate) evaluation_order: EvaluationOrder,
 }
 
 impl BoundStatement {
+    /// クレート外から構築するための constructor（TASK-161 で `mode` フィールドを
+    /// 追加する以前の既存フィールド相当の引数を取る）。`mode` は
+    /// `resolve_mode(None, None)`（クエリ句・セッション変数いずれも未指定時の既定値、
+    /// `recall`・[`crate::sql::mode::ModeSource::Default`]）で構築され、必要なら
+    /// [`Self::with_mode`] を続けて呼ぶ。フィールドが `pub(crate)` のため、
+    /// クレート外から `BoundStatement` を得るにはこの constructor か
+    /// [`bind_with_session`] の戻り値を経由するしかない。
+    pub fn new(
+        table: String,
+        projection: Vec<ProjectedColumn>,
+        scalar_filters: Vec<ScalarEq>,
+        rls_predicate_present: bool,
+        ranking: Ranking,
+        limit: usize,
+        evaluation_order: EvaluationOrder,
+    ) -> Self {
+        Self {
+            table,
+            projection,
+            scalar_filters,
+            rls_predicate_present,
+            ranking,
+            limit,
+            mode: crate::sql::mode::resolve_mode(None, None),
+            evaluation_order,
+        }
+    }
+
+    /// `mode`（TASK-161・SQL-12）を設定したコピーを返すビルダー的メソッド。
+    /// [`Self::new`] と組み合わせて `mode` を含む値を外部から構築する。
+    #[must_use]
+    pub fn with_mode(mut self, mode: crate::sql::mode::ResolvedMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// 束縛対象のテーブル名。
     pub fn table(&self) -> &str {
         &self.table
