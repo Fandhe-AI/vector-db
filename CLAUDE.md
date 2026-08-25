@@ -28,7 +28,7 @@ vector-db/
 │   ├── design/                    # 設計ドキュメント（ADR 形式・public）
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check の CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + core-api-check の CI
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 まで opt-in）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は Issue #178 まで opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）
 │   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
