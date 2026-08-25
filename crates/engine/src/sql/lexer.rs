@@ -34,6 +34,11 @@ pub enum Keyword {
     Order,
     By,
     Limit,
+    /// `HINT ORDER(...)`（TASK-76・SQL-7）の先頭語。予約語化することで、この位置
+    /// 以外に現れた `HINT` を構造的に拒否する（許可リスト外の位置での識別子利用は
+    /// `Token::Ident` に落ちず、文法が期待しない箇所で `Keyword` として扱われて拒否
+    /// される）。副作用として `hint` という列名・識別子は受理できなくなる。
+    Hint,
 }
 
 fn keyword_from_str(s: &str) -> Option<Keyword> {
@@ -46,6 +51,7 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
         "ORDER" => Some(Keyword::Order),
         "BY" => Some(Keyword::By),
         "LIMIT" => Some(Keyword::Limit),
+        "HINT" => Some(Keyword::Hint),
         _ => None,
     }
 }
@@ -296,6 +302,16 @@ mod tests {
         assert_eq!(tokens[0], Token::Keyword(Keyword::Select));
         assert_eq!(tokens[2], Token::Keyword(Keyword::From));
         assert_eq!(tokens[4], Token::Keyword(Keyword::Limit));
+    }
+
+    #[test]
+    fn tokenizes_hint_keyword_case_insensitively() {
+        let tokens = tokenize("HINT ORDER(RLS)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Keyword(Keyword::Hint));
+        assert_eq!(tokens[1], Token::Keyword(Keyword::Order));
+
+        let tokens = tokenize("hint order(rls)").expect("tokenize should succeed");
+        assert_eq!(tokens[0], Token::Keyword(Keyword::Hint));
     }
 
     #[test]

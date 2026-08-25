@@ -11,6 +11,7 @@
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
 use crate::sql::lexer::{self, Keyword, LexError, Token};
+use crate::sql::plan::{self, EvaluationOrder, Stage};
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。
@@ -205,6 +206,9 @@ pub struct ValidatedStatement {
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub where_predicates: Vec<WherePredicate>,
     pub limit: u32,
+    /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。未指定時は
+    /// [`EvaluationOrder::DEFAULT`]（既存 TASK-75 の固定順 RLS→SCALAR→DISTANCE）。
+    pub evaluation_order: EvaluationOrder,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -401,6 +405,41 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `LIMIT <n>` の直後・文末に 1 箇所だけ許可する `HINT ORDER(<段>, <段>, <段>)`
+    /// を解析する（TASK-76・SQL-7）。次のトークンが `HINT` でなければ何も消費せず
+    /// `None` を返す（`HINT ORDER` 自体が省略可能なため）。段名は
+    /// [`plan::parse_stage_name`] で識別子トークンを閉じた [`Stage`] へ写像し、未知の
+    /// 名前・個数不正・重複は許可リスト外として拒否する（`Stage`/`EvaluationOrder`
+    /// を経由するため、パーサーを迂回しても不完全な順序が下流へ渡らない）。
+    fn parse_hint_order(&mut self) -> Result<Option<EvaluationOrder>, SqlSurfaceError> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Hint))) {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect_keyword(Keyword::Order)?;
+        self.expect_punct('(')?;
+
+        let mut stages: Vec<Stage> = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            let stage = plan::parse_stage_name(&name).ok_or_else(|| {
+                SqlSurfaceError::unsupported(format!("unsupported HINT ORDER stage: {name}"))
+            })?;
+            stages.push(stage);
+            if matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_punct(')')?;
+
+        let order = EvaluationOrder::try_from_stages(&stages).map_err(|e| {
+            SqlSurfaceError::unsupported(format!("invalid HINT ORDER permutation: {e:?}"))
+        })?;
+        Ok(Some(order))
+    }
+
     /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
     /// みなして拒否する。
     fn expect_end_of_statement(&mut self) -> Result<(), SqlSurfaceError> {
@@ -423,6 +462,7 @@ struct ParsedShape {
     where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
+    evaluation_order: EvaluationOrder,
 }
 
 /// 許可した statement 形状を先頭から再帰下降で判定する。
@@ -451,6 +491,8 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
 
+    let evaluation_order = p.parse_hint_order()?.unwrap_or(EvaluationOrder::DEFAULT);
+
     p.expect_end_of_statement()?;
 
     Ok(ParsedShape {
@@ -459,6 +501,7 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
         where_predicates,
         order_by,
         limit,
+        evaluation_order,
     })
 }
 
@@ -487,6 +530,7 @@ pub fn validate_statement(
         order_by: shape.order_by,
         where_predicates: shape.where_predicates,
         limit: shape.limit,
+        evaluation_order: shape.evaluation_order,
     })
 }
 
@@ -865,6 +909,149 @@ mod tests {
     fn rejects_semicolon_inside_argument_list_injection_attempt() {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding; DROP) LIMIT 5",
+        );
+    }
+
+    // --- HINT ORDER（TASK-76・SQL-7） ----------------------------------------
+
+    #[test]
+    fn accepts_all_six_hint_order_permutations() {
+        let lookup = catalog_with(&["documents"]);
+        for perm in [
+            "RLS, SCALAR, DISTANCE",
+            "RLS, DISTANCE, SCALAR",
+            "SCALAR, RLS, DISTANCE",
+            "SCALAR, DISTANCE, RLS",
+            "DISTANCE, RLS, SCALAR",
+            "DISTANCE, SCALAR, RLS",
+        ] {
+            let sql = format!(
+                "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER({perm})"
+            );
+            validate_statement(&sql, &lookup)
+                .unwrap_or_else(|e| panic!("perm={perm:?} must be accepted, got {e:?}"));
+        }
+    }
+
+    #[test]
+    fn accepts_lowercase_hint_order_stage_names_and_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(rls, scalar, distance);",
+            &lookup,
+        )
+        .expect("lowercase stage names should be accepted");
+        assert_eq!(stmt.evaluation_order, EvaluationOrder::DEFAULT);
+    }
+
+    #[test]
+    fn no_hint_order_defaults_to_rls_scalar_distance() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("must be accepted");
+        assert_eq!(stmt.evaluation_order, EvaluationOrder::DEFAULT);
+    }
+
+    #[test]
+    fn hint_order_populates_evaluation_order_field() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(DISTANCE, SCALAR, RLS)",
+            &lookup,
+        )
+        .expect("must be accepted");
+        assert_eq!(
+            stmt.evaluation_order.stages(),
+            [Stage::Distance, Stage::Scalar, Stage::Rls]
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_with_two_stages() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, SCALAR)",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_with_four_stages() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, SCALAR, DISTANCE, RLS)",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_with_duplicate_stage() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, RLS, SCALAR)",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_with_unknown_stage_name() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, SCALAR, ATTACKER)",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_with_empty_parens() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER()",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_alone_without_order() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_without_parens() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER RLS, SCALAR, DISTANCE",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_before_limit() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' HINT ORDER(RLS, SCALAR, DISTANCE) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_hint_order_specified_twice() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, SCALAR, DISTANCE) HINT ORDER(RLS, SCALAR, DISTANCE)",
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_tokens_after_hint_order() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER(RLS, SCALAR, DISTANCE) extra",
+        );
+    }
+
+    #[test]
+    fn rejects_dollar_parameter_in_hint_order() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 HINT ORDER($1, SCALAR, DISTANCE)",
+        );
+    }
+
+    #[test]
+    fn hint_becomes_unusable_as_a_bare_identifier() {
+        // HINT を予約語化した副作用（allowlist.rs のモジュールドキュメント・
+        // TASK-76 設計判断参照）: 列名・テーブル名として `hint` は使えなくなる。
+        assert_rejected_as_syntax_error(
+            "SELECT hint FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
     }
 
