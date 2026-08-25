@@ -13,7 +13,9 @@
 //! （TASK-124）が既にカバーしているため、本ファイルでは重複させない。
 
 use engine::core::{CoreError, EngineCore, VectorCore};
-use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{
+    CandidateHit, CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider,
+};
 use engine::policy::PolicyContext;
 use engine::storage::Row;
 
@@ -31,16 +33,26 @@ const _SEARCH_SIGNATURE: fn(
     usize,
 ) -> Result<Vec<SearchHit>, CoreError> = <EngineCore as VectorCore>::search;
 
-// `VectorCore::get_row` のシグネチャをコンパイル時に固定する。
-const _GET_ROW_SIGNATURE: fn(&EngineCore, &PolicyContext, &str, u64) -> Result<Row, CoreError> =
-    <EngineCore as VectorCore>::get_row;
+// `VectorCore::get_row` のシグネチャをコンパイル時に固定する。行 `id` の一意性スコープが
+// テナント内（対象ビヘイビア: TABLE-12）のため、点取得のキーは `(tenant_id, id)`。
+#[allow(clippy::type_complexity)]
+const _GET_ROW_SIGNATURE: fn(
+    &EngineCore,
+    &PolicyContext,
+    &str,
+    &str,
+    u64,
+) -> Result<Row, CoreError> = <EngineCore as VectorCore>::get_row;
 
 // `SearchProvider::search` は `SearchInput<'_>` を借用するため、任意のライフタイムで
 // 成立すること（HRTB）まで含めてシグネチャを固定する。
+// provider が返すのは候補ヒット（`CandidateHit`。識別子は呼び出し元定義のスロット番号）で、
+// テナント修飾済みの `SearchHit` は `VectorCore::search` の戻り値としてコア側が構築する
+// （TABLE-12・RLS-9。`kernel.rs` の型ドキュメント参照）。
 const _PROVIDER_SEARCH_SIGNATURE: for<'a> fn(
     &CpuScalarProvider,
     SearchInput<'a>,
-) -> Result<Vec<SearchHit>, KernelError> = <CpuScalarProvider as SearchProvider>::search;
+) -> Result<Vec<CandidateHit>, KernelError> = <CpuScalarProvider as SearchProvider>::search;
 
 // object-safe 性の固定（CORE-1）: `VectorCore` / `SearchProvider` はいずれも
 // `Box<dyn _>` として構築できなければならない（ジェネリクスを持ち込むとコンパイル

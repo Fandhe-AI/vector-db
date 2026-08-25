@@ -62,6 +62,12 @@ impl Xorshift64 {
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
+
 const DIM: u32 = 12;
 const TABLE: &str = "docs";
 
@@ -138,9 +144,7 @@ fn seed_multi_tenant_corpus(
             },
         ));
     }
-    storage
-        .insert_rows_into_table(TABLE, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, TABLE, &rows);
     truth
 }
 
@@ -238,18 +242,15 @@ fn checker_negative_control_detects_fabricated_violations() {
 
     // 正常系: 全ヒットが許可集合内・重複なし・k 以内 → 違反 0 件。
     let clean_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit { id: 2, score: 0.5 },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 2, 0.5),
     ];
     assert_eq!(count_policy_violations(&clean_hits, &allowed, 5), 0);
 
     // 不許可 id の混入。
     let leaked_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit {
-            id: 999,
-            score: 0.9,
-        },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 999, 0.9),
     ];
     assert!(
         count_policy_violations(&leaked_hits, &allowed, 5) > 0,
@@ -258,8 +259,8 @@ fn checker_negative_control_detects_fabricated_violations() {
 
     // 重複 id。
     let duplicate_hits = vec![
-        SearchHit { id: 1, score: 1.0 },
-        SearchHit { id: 1, score: 1.0 },
+        SearchHit::new("tenant-a", 1, 1.0),
+        SearchHit::new("tenant-a", 1, 1.0),
     ];
     assert!(
         count_policy_violations(&duplicate_hits, &allowed, 5) > 0,

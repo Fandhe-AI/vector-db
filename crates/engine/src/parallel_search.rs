@@ -25,7 +25,7 @@
 //! スレッドを追加せず単一スレッド相当まで縮退させるのみで、行の選出対象からの除外は
 //! 一切発生しない（[`ParallelSearchProvider::search`] 参照）。
 
-use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider, TopKSelector};
+use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, TopKSelector};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// クエリ 1 件あたりのスレッド数上限（CORE-3 の並列度の趣旨に対応）。
@@ -85,7 +85,7 @@ const MIN_ROWS_PER_THREAD: usize = 1024;
 pub struct ParallelSearchProvider;
 
 impl SearchProvider for ParallelSearchProvider {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         let dim = input.dim as usize;
         if input.query.len() != dim {
             return Err(KernelError::DimMismatch {
@@ -268,7 +268,7 @@ fn search_range(
             // （`kernel.rs::CpuScalarProvider::search` と同じ理由）。
             continue;
         }
-        selector.push(SearchHit { id, score });
+        selector.push(CandidateHit { id, score });
     }
     selector
 }
@@ -293,8 +293,8 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                SearchHit { id: 4, score: 3.0 },
-                SearchHit { id: 2, score: 2.0 }
+                CandidateHit { id: 4, score: 3.0 },
+                CandidateHit { id: 2, score: 2.0 }
             ]
         );
     }
@@ -429,7 +429,7 @@ mod tests {
         // 落ちる）。
         assert_eq!(
             hits,
-            vec![SearchHit {
+            vec![CandidateHit {
                 id: 100,
                 score: 5.0
             }]

@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::rls::PrefilterIndex;
 use engine::storage::{RowInput, Storage, Visibility};
@@ -52,6 +52,12 @@ impl Xorshift64 {
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
+
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
 
 const DIM: u32 = 16;
 const TARGET_TENANT: &str = "tenant-target";
@@ -122,9 +128,7 @@ fn seed_corpus(
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(table, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, table, &rows);
     target_ids
 }
 
@@ -248,7 +252,7 @@ impl CountingProvider {
 }
 
 impl SearchProvider for CountingProvider {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requested_ks
             .lock()
@@ -341,7 +345,7 @@ fn rls4_top_k_matches_independently_computed_full_scan_ranking() {
             .iter()
             .map(|&id| {
                 let row = storage
-                    .get_row_from_table("docs", id)
+                    .get_row_from_table("docs", TARGET_TENANT, id)
                     .expect("row must exist");
                 (id, dot(&row.embedding, &query))
             })

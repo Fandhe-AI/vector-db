@@ -43,7 +43,7 @@
 //! `provider_result_is_valid`）はキャッシュ経路・非キャッシュ経路のいずれでも
 //! `PrefilterSnapshot::search_with`／[`EngineCore::search_uncached`] が同一に適用する。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -51,7 +51,7 @@ use std::sync::{Arc, RwLock};
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
-use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
 use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
@@ -80,38 +80,62 @@ pub(crate) fn validate_search_k(k: usize) -> Result<(), usize> {
 /// `rls.rs::PrefilterIndex::search` の両方が provider を「untrusted 実装でありうる」前提で
 /// 扱うため、単一走査の検証ロジックを本関数へ集約する（二重管理・契約の食い違いを防ぐ。
 /// fail-closed: 1 件でも違反すれば `false` を返し、呼び出し元は結果を一切返さず拒否する）。
+///
+/// 第 3 引数は「可視行の id → その id を持つ可視行の件数」の多重集合（[`visible_id_counts`]
+/// で構築する）。単なる `HashSet<u64>` ではないのは、行 `id` の一意性スコープが
+/// テナント内に閉じた（対象ビヘイビア: TABLE-12）ことで、1 つの `PolicyContext` から
+/// 可視な行に同一 `id` が複数現れうるため（自テナント行と、他テナントの `Public` 行が
+/// 同じ `id` を持つ場合）。件数を上限として重複を許すことで、(4) の防御力
+/// （「provider は実在する可視行の数を超えて同じ id を返せない」）を落とさずに
+/// TABLE-12 が正当化する構成を受理する。set へ戻す（＝重複を一律拒否する）と、
+/// 他テナントが同じ `id` の `Public` 行を作るだけで検索が失敗する
+/// テナント間の可用性干渉になるため戻してはならない。
 pub(crate) fn provider_result_is_valid(
-    hits: &[SearchHit],
+    hits: &[CandidateHit],
     k: usize,
-    visible_id_set: &HashSet<u64>,
+    visible_id_counts: &HashMap<u64, usize>,
 ) -> bool {
     // (1) 件数が要求 k を超えない。
     if hits.len() > k {
         return false;
     }
-    let mut seen_ids: HashSet<u64> = HashSet::with_capacity(hits.len());
-    let mut prev: Option<&SearchHit> = None;
+    let mut seen_ids: HashMap<u64, usize> = HashMap::with_capacity(hits.len());
+    let mut prev: Option<&CandidateHit> = None;
     for hit in hits {
         // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を持たず、後続の順序
         // 検証（`total_cmp`）が無意味になるため他の検証より先に弾く。
         if !hit.score.is_finite() {
             return false;
         }
-        // (3) 縮約ビュー（＝可視行）の id 集合に属する（他テナント id・捏造 id の拒否）。
-        if !visible_id_set.contains(&hit.id) {
+        // (3) 縮約ビュー（＝可視行）の id 集合に属する（不可視 id・捏造 id の拒否）。
+        let Some(available) = visible_id_counts.get(&hit.id) else {
+            return false;
+        };
+        // (4) 同じ id の出現回数が、その id を持つ可視行の実数を超えない
+        // （同じ行を複数回返す provider の拒否。TABLE-12 により id の重複自体は
+        // 起こりうるため、集合ではなく多重集合で判定する。上記ドキュメント参照）。
+        let seen = seen_ids.entry(hit.id).or_insert(0);
+        *seen = match seen.checked_add(1) {
+            Some(next) => next,
+            None => return false,
+        };
+        if *seen > *available {
             return false;
         }
-        // (4) id が重複しない（同じ行が複数回返らない）。
-        if !seen_ids.insert(hit.id) {
-            return false;
-        }
-        // (5) スコア降順・同点は id 昇順（`kernel.rs::CpuScalarProvider` が実際に返す順序と
-        // 同じ契約。`total_cmp` は (2) で有限性を確認済みのため NaN の順序上の扱いには
-        // 依存しない）。
+        // (5) スコア降順・同点は**候補識別子**の昇順（`kernel.rs::CpuScalarProvider` が
+        // 実際に返す順序と同じ契約。識別子は呼び出し元定義で、`core.rs`・`sql/exec.rs` は
+        // アリーナのスロット番号を渡すため実質 `(tenant_id, id)` 昇順になり、単一テナント
+        // 内では従来どおり行 `id` 昇順と一致する。`docs/design/rrf-tie-break-determinism.md`
+        // の順序契約〈安定ソート + 識別子昇順タイブレーク〉と整合）。`total_cmp` は (2) で
+        // 有限性を確認済みのため NaN の順序上の扱いには依存しない。
         if let Some(p) = prev {
+            // 同点時は識別子の昇順。TABLE-12 により同点・同 id の並びが正当に起こりうる
+            // （異なるテナントの同一 id 行が同じスコアになる場合）ため、狭義単調増加
+            // （`p.id >= hit.id` を違反とする）ではなく広義単調増加で判定する。
+            // 同一行の重複返却は (4) の多重集合上限が引き続き遮断する。
             let out_of_order = match p.score.total_cmp(&hit.score) {
                 std::cmp::Ordering::Less => true,
-                std::cmp::Ordering::Equal => p.id >= hit.id,
+                std::cmp::Ordering::Equal => p.id > hit.id,
                 std::cmp::Ordering::Greater => false,
             };
             if out_of_order {
@@ -121,6 +145,64 @@ pub(crate) fn provider_result_is_valid(
         prev = Some(hit);
     }
     true
+}
+
+/// 可視行の id 列（`arena.ids()` 等）から [`provider_result_is_valid`] の第 3 引数
+/// （id → 可視行件数の多重集合）を構築する共通ヘルパ。`core.rs`・`rls.rs`・
+/// `sql/exec.rs` の 3 経路が同一の構築方法を共有し、片側だけが集合へ退化するのを防ぐ
+/// （TABLE-12 の重複 id の扱いは 1 か所で決める）。
+/// 候補アリーナのスロット番号（0..n）を provider 入力用の `Vec<u64>` として作る
+/// （対象ビヘイビア: TABLE-12）。
+///
+/// provider へ渡す識別子に行 `id` を使えないのは、行 `id` の一意性スコープが
+/// テナント内に閉じており、1 つの可視集合に同じ `id` の行が複数含まれうるため
+/// （自テナント行と他テナントの `Public` 行）。スロット番号は可視集合内で一意かつ
+/// `(tenant_id, id)` の行と 1 対 1 に対応するので、provider 結果の重複検証・
+/// ヒットの行解決の双方が曖昧にならない（`sql/exec.rs` も同じ方式）。
+/// 確保はフォールブル（`try_reserve_exact`）で行う（coding-rust.md「無制限確保禁止」）。
+pub(crate) fn slot_ids_for(arena: &VectorArena) -> Result<Vec<u64>, ArenaError> {
+    let len = arena.ids().len();
+    let mut slot_ids: Vec<u64> = Vec::new();
+    slot_ids
+        .try_reserve_exact(len)
+        .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve slot ids: {e}")))?;
+    for slot in 0..len {
+        let slot_id = u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+        slot_ids.push(slot_id);
+    }
+    Ok(slot_ids)
+}
+
+/// provider が返した候補ヒット（識別子はスロット番号）を、テナント修飾済みの
+/// 公開ヒット [`CandidateHit`] → [`crate::kernel::SearchHit`] へ解決する
+/// （対象ビヘイビア: TABLE-12・RLS-9。codex-review P1 指摘・PR #194）。
+///
+/// スロットが範囲外（provider の契約違反・データ不整合）の場合は `None` を返し、
+/// 呼び出し元は結果を一切返さず fail-closed に拒否する（部分的な解決はしない）。
+/// `String` 確保はここ（高々 `k` 件）でのみ発生し、候補行ごとに走る
+/// `TopKSelector::push` のホットパスには入らない。
+pub(crate) fn resolve_slot_hits(
+    arena: &VectorArena,
+    candidates: &[CandidateHit],
+) -> Option<Vec<SearchHit>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(candidates.len()).ok()?;
+    for hit in candidates {
+        let slot = usize::try_from(hit.id).ok()?;
+        let tenant = arena.tenant_id(slot)?;
+        let id = *arena.ids().get(slot)?;
+        out.push(SearchHit::new(tenant, id, hit.score));
+    }
+    Some(out)
+}
+
+pub(crate) fn visible_id_counts(ids: &[u64]) -> HashMap<u64, usize> {
+    let mut counts: HashMap<u64, usize> = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let entry = counts.entry(*id).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+    counts
 }
 
 /// [`PrefilterCache`] のエントリ数上限（TASK-169・security.md「不安全な設計｜
@@ -453,7 +535,7 @@ pub enum CoreError {
     /// 指定行が存在しない、または呼び出し元のテナント・可視性から見えない
     /// （区別しない。fail-closed）。
     NotFound,
-    /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約
+    /// `SearchProvider` が返却した `Vec<`[`CandidateHit`]`>` が Top-k の契約
     /// （以下のいずれか）を満たさなかった（codex P0/P1・Issue #137 対応。fail-closed）:
     /// (1) 件数が要求 `k` を超える、(2) コア側で計算した可視行 id 集合に含まれない
     /// `id` を含む（他テナントの id 捏造・実装バグを含む）、(3) `id` が重複する、
@@ -544,6 +626,18 @@ impl From<PolicyError> for CoreError {
 pub trait VectorCore: Send + Sync {
     /// `table` に対して `query` の Top-k 検索を行う。`ctx` のテナント・可視性を満たさない
     /// 行は結果に含めない（CORE-2）。
+    ///
+    /// 返却される [`SearchHit`] は `(tenant_id, id)` で行を一意に指す（対象ビヘイビア:
+    /// TABLE-12・RLS-9。codex-review P1 指摘・PR #194 対応）。行 `id` の一意性スコープは
+    /// テナント内に閉じているため**同一 `id` の hit が複数返り得る**（自テナントの行と、
+    /// 他テナントの `Public` 行が同じ `id` を持つ場合。いずれも `ctx` から可視な行であり、
+    /// テナント境界の侵害ではない）が、`tenant_id` が付随するため呼び出し元は常に
+    /// 両者を判別でき、`get_row(ctx, table, &hit.tenant_id, hit.id)` でそのヒット自身の
+    /// 行を取得できる。
+    ///
+    /// 順序はスコア降順・同点は候補識別子（内部のスロット番号。実質 `(tenant_id, id)`
+    /// 昇順で、単一テナント内では行 `id` 昇順と一致）で決定的
+    /// （`docs/design/rrf-tie-break-determinism.md` の順序契約）。
     fn search(
         &self,
         ctx: &PolicyContext,
@@ -554,7 +648,20 @@ pub trait VectorCore: Send + Sync {
 
     /// `table` から `id` の行を 1 件取得する。不可視・不存在は区別せず
     /// [`CoreError::NotFound`] を返す。
-    fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError>;
+    /// `(tenant_id, id)` で行を 1 件取得する（対象ビヘイビア: TABLE-12・RLS-9）。
+    ///
+    /// 行 `id` の一意性スコープはテナント内に閉じているため、行を指すには所有テナントが
+    /// 必要（[`crate::kernel::SearchHit::tenant_id`] をそのまま渡せる契約。
+    /// codex-review P1 指摘・PR #194）。取得できるのは `ctx` から**可視な**行のみで、
+    /// 不存在と不可視は区別せず [`CoreError::NotFound`] に統一する（他テナント行の
+    /// 存在探査に使えないようにする fail-closed な扱い。security.md P0）。
+    fn get_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<Row, CoreError>;
 }
 
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
@@ -743,6 +850,45 @@ impl EngineCore {
         }
     }
 
+    /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// `crate::tenant::insert_row`（テナント境界付き書き込みガード）への薄い委譲のみで、
+    /// テナント比較・所有権判定のロジックは本メソッドに書かない。`VectorCore` trait
+    /// へは昇格しない固有メソッド（`execute_sql` と同じ理由。`core-api-check` の対象外。
+    /// wire 層が DML を行う際の入口はこのメソッド経由を想定し、SQL `INSERT` 表層
+    /// （TASK-80/81/120）はこの経路の上に載せる前提）。
+    pub fn insert_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+        row: &crate::storage::RowInput<'_>,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::insert_row(&self.storage, table, ctx, id, row)
+    }
+
+    /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲のみ。
+    pub fn update_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+        row: &crate::storage::RowInput<'_>,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::update_row(&self.storage, table, ctx, id, row)
+    }
+
+    /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
+    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲のみ。
+    pub fn delete_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        id: u64,
+    ) -> Result<(), crate::tenant::TenantWriteError> {
+        crate::tenant::delete_row(&self.storage, table, ctx, id)
+    }
+
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
     /// （TASK-169）。`snapshot.search_with` が `IndexStale`/`ContextMismatch` を返した
     /// 場合は [`PrefilterCache::evict`] で該当エントリを破棄し、非キャッシュ経路
@@ -799,8 +945,11 @@ impl EngineCore {
         // そのまま `SearchInput` として provider へ渡せる（不可視データはそもそも
         // provider のアドレス空間へ渡らない。`SearchInput` に `is_visible` フィールドは
         // 存在しない。`kernel.rs` のドキュメント参照）。
+        // provider へ渡す識別子はスロット番号（[`slot_ids_for`] のドキュメント参照。
+        // 行 `id` は 1 つの可視集合内で一意とは限らないため識別子に使えない。TABLE-12）。
+        let slot_ids = slot_ids_for(&arena)?;
         let input = SearchInput {
-            ids: arena.ids(),
+            ids: &slot_ids,
             vectors: arena.vectors(),
             dim: arena.dim(),
             query,
@@ -815,13 +964,13 @@ impl EngineCore {
         // search_with` と共通、TASK-133）で単一走査を確認し、1 件でも違反すれば結果を
         // 一切返さず fail-closed に拒否する（部分的なフィルタリング・並べ替えはしない）。
         //
-        // アリーナは構築時点で可視行だけへ絞り込み済みのため、`arena.ids()` がそのまま
-        // 可視行 id 集合になる。
-        let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
-        if !provider_result_is_valid(&hits, k, &visible_id_set) {
+        // 検証対象はスロット識別子の集合（スロットは重複しないため各件数は 1）。
+        let visible_id_counts = visible_id_counts(&slot_ids);
+        if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(CoreError::ProviderResultRejected);
         }
-        Ok(hits)
+        // 検証を通過した候補だけをテナント修飾済みヒットへ解決する（TABLE-12・RLS-9）。
+        resolve_slot_hits(&arena, &hits).ok_or(CoreError::ProviderResultRejected)
     }
 }
 
@@ -918,8 +1067,21 @@ impl VectorCore for EngineCore {
         self.search_with_snapshot(table, ctx, query, k, snapshot)
     }
 
-    fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError> {
-        let row = match self.storage.get_row_from_table(table, id) {
+    fn get_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<Row, CoreError> {
+        // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）のため、
+        // 点取得のキーは `(tenant_id, id)`。`tenant_id` は検索結果
+        // （[`crate::kernel::SearchHit::tenant_id`]）等から呼び出し元が渡す行の帰属で、
+        // 認可には一切使わない（認可・可視性判定は下の `is_visible` の単一照合パスのみ）。
+        // 存在しない行・`ctx` から不可視な行（他テナントの `Private` 行を含む）は
+        // 区別せず `NotFound` に統一するため、他テナント行の存在探査には使えない
+        // （fail-closed。RLS-9・security.md P0）。
+        let row = match self.storage.get_row_from_table(table, tenant_id, id) {
             Ok(row) => row,
             // テーブル不存在・行不存在はいずれも「不可視と不存在を区別しない」契約に
             // 合流させる。それ以外（デコード不正等のデータ破損・バックエンドエラー）は
@@ -1015,10 +1177,58 @@ mod tests {
             .expect("insert row");
 
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-        let not_found = core.get_row(&ctx, "docs", 999);
-        let invisible = core.get_row(&ctx, "docs", 1);
+        let not_found = core.get_row(&ctx, "docs", "tenant-a", 999);
+        let invisible = core.get_row(&ctx, "docs", "tenant-a", 1);
         assert!(matches!(not_found, Err(CoreError::NotFound)));
         assert!(matches!(invisible, Err(CoreError::NotFound)));
+    }
+
+    // 対象ビヘイビア: RECOVER-4。`EngineCore::update_row`/`delete_row` は
+    // `crate::tenant` の書き込みガードへ委譲するだけであることの結合確認
+    // （テナント境界の実質的な検証は `tests/tenant_breach.rs` 側。ここでは
+    // `EngineCore` からの委譲経路そのものが `NotFound` を返すことだけを確認する）。
+    #[test]
+    fn update_and_delete_row_reject_other_tenant_as_not_found() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        let attacker = PolicyContext::new("tenant-a").expect("valid tenant");
+        let update_input = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[0.0, 1.0],
+            metadata: &[],
+        };
+        assert!(matches!(
+            core.update_row(&attacker, "docs", 1, &update_input),
+            Err(crate::tenant::TenantWriteError::NotFound)
+        ));
+        assert!(matches!(
+            core.delete_row(&attacker, "docs", 1),
+            Err(crate::tenant::TenantWriteError::NotFound)
+        ));
+
+        // データが不変であることを確認する（拒否が実際に永続化を止めていること）。
+        let row = core
+            .storage
+            .get_row_from_table("docs", "tenant-b", 1)
+            .expect("row still present");
+        assert_eq!(row.tenant_id, "tenant-b");
     }
 
     // 対象ビヘイビア: RLS-1〜4（TASK-169）。同一 `(table, ctx)` での 2 回目の検索は
@@ -1470,9 +1680,9 @@ mod tests {
     fn search_rejects_a_rogue_provider_result_even_on_a_cache_hit() {
         struct RogueProvider;
         impl SearchProvider for RogueProvider {
-            fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+            fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
                 // アリーナ外の id を返す不正 provider。
-                Ok(vec![SearchHit {
+                Ok(vec![CandidateHit {
                     id: 999,
                     score: 1.0,
                 }])

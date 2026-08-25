@@ -32,12 +32,18 @@ pub trait VectorCore: Send + Sync {
         query: &[f32],
         k: usize,
     ) -> Result<Vec<SearchHit>, CoreError>;
-    fn get_row(&self, ctx: &PolicyContext, table: &str, id: u64) -> Result<Row, CoreError>;
+    fn get_row(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<Row, CoreError>;
 }
 
 # source: crates/engine/src/kernel.rs :: SearchProvider
 pub trait SearchProvider: Send + Sync {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError>;
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError>;
 }
 
 # source: crates/engine/src/core.rs :: CoreError
@@ -58,8 +64,9 @@ pub enum CoreError {
 }
 
 # source: crates/engine/src/kernel.rs :: SearchHit
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
+    pub tenant_id: String,
     pub id: u64,
     pub score: f32,
 }
@@ -118,6 +125,9 @@ impl PolicyContext {
         }
         row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
+    pub fn is_owner(&self, row_tenant: &str) -> bool {
+        row_tenant == self.tenant_id
+    }
 }
 
 # source: crates/engine/src/policy.rs :: PolicyError
@@ -168,6 +178,7 @@ pub enum CatalogError {
     TableAlreadyExists(String),
     ColumnAlreadyExists(String),
     RowNotFound(u64),
+    IncompatibleRowKeyFormat,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

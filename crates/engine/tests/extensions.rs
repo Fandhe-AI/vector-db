@@ -21,6 +21,7 @@ use engine::kernel::{CpuScalarProvider, KernelError};
 use engine::policy::PolicyContext;
 use engine::search_engine;
 use engine::storage::{RowInput, Storage, Visibility};
+use engine::tenant::TenantWriteError;
 
 // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
 // `crates/engine/src/test_util/temp_db.rs` へ一本化した。
@@ -112,25 +113,27 @@ fn ext1_insert_and_read_back_768_dim_rows() {
         .create_table(&vector_table_schema("docs", 768))
         .expect("create_table");
 
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
     let embeddings: Vec<Vec<f32>> = (0..20u32).map(|i| make_embedding(768, i + 1)).collect();
     for (i, embedding) in embeddings.iter().enumerate() {
-        storage
-            .insert_row_into_table(
-                "docs",
-                i as u64,
-                &RowInput {
-                    tenant_id: TENANT_ID,
-                    visibility: Visibility::Public,
-                    embedding,
-                    metadata: b"m",
-                },
-            )
-            .unwrap_or_else(|e| panic!("insert_row_into_table failed for id={i}: {e}"));
+        engine::tenant::insert_row(
+            &storage,
+            "docs",
+            &ctx,
+            i as u64,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: b"m",
+            },
+        )
+        .unwrap_or_else(|e| panic!("tenant::insert_row failed for id={i}: {e}"));
     }
 
     for (i, embedding) in embeddings.iter().enumerate() {
         let row = storage
-            .get_row_from_table("docs", i as u64)
+            .get_row_from_table("docs", TENANT_ID, i as u64)
             .unwrap_or_else(|e| panic!("get_row_from_table failed for id={i}: {e}"));
         assert_eq!(row.id, i as u64);
         assert_eq!(row.embedding.len(), 768);
@@ -177,9 +180,10 @@ fn ext1_brute_force_top_k_ranks_self_match_first() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("insert_rows_into_table");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("insert_rows");
 
     let (all_rows, _cursor) = storage
         .scan_table_page("docs", None, 100)
@@ -217,25 +221,27 @@ fn ext2_multiple_tables_with_distinct_dims_coexist() {
             .unwrap_or_else(|e| panic!("create_table({name}) failed: {e}"));
     }
 
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
     for (name, dim) in dims {
         let embedding = make_embedding(dim, 7);
-        storage
-            .insert_row_into_table(
-                name,
-                1,
-                &RowInput {
-                    tenant_id: TENANT_ID,
-                    visibility: Visibility::Public,
-                    embedding: &embedding,
-                    metadata: b"m",
-                },
-            )
-            .unwrap_or_else(|e| panic!("insert into {name} (dim {dim}) failed: {e}"));
+        engine::tenant::insert_row(
+            &storage,
+            name,
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &embedding,
+                metadata: b"m",
+            },
+        )
+        .unwrap_or_else(|e| panic!("insert into {name} (dim {dim}) failed: {e}"));
     }
 
     for (name, dim) in dims {
         let row = storage
-            .get_row_from_table(name, 1)
+            .get_row_from_table(name, TENANT_ID, 1)
             .unwrap_or_else(|e| panic!("get_row_from_table({name}) failed: {e}"));
         assert_eq!(row.embedding.len(), dim as usize);
     }
@@ -254,36 +260,46 @@ fn ext2_rejects_dimension_mismatch_per_table_fail_closed() {
         .create_table(&vector_table_schema("mid", 768))
         .expect("create_table(mid)");
 
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+
     // 他テーブルの次元（768）を small（384）へ挿入しようとすると拒否される。
     let wrong_dim_embedding = make_embedding(768, 1);
-    let err = storage
-        .insert_row_into_table(
-            "small",
-            1,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &wrong_dim_embedding,
-                metadata: b"m",
-            },
-        )
-        .expect_err("mismatched dim must be rejected");
-    assert!(matches!(err, CatalogError::Invalid(_)));
+    let err = engine::tenant::insert_row(
+        &storage,
+        "small",
+        &ctx,
+        1,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &wrong_dim_embedding,
+            metadata: b"m",
+        },
+    )
+    .expect_err("mismatched dim must be rejected");
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+    ));
 
     // 次元 0 の埋め込みも拒否される。
-    let err = storage
-        .insert_row_into_table(
-            "small",
-            2,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[],
-                metadata: b"m",
-            },
-        )
-        .expect_err("zero-length embedding must be rejected");
-    assert!(matches!(err, CatalogError::Invalid(_)));
+    let err = engine::tenant::insert_row(
+        &storage,
+        "small",
+        &ctx,
+        2,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: b"m",
+        },
+    )
+    .expect_err("zero-length embedding must be rejected");
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+    ));
 
     // small テーブルには何も挿入されていないはず（拒否されたので）。
     let (rows, _cursor) = storage
@@ -310,36 +326,39 @@ fn ext2_same_id_coexists_independently_across_tables() {
     let small_embedding = make_embedding(384, 11);
     let mid_embedding = make_embedding(768, 22);
 
-    storage
-        .insert_row_into_table(
-            "small",
-            42,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &small_embedding,
-                metadata: b"small-42",
-            },
-        )
-        .expect("insert into small id=42");
-    storage
-        .insert_row_into_table(
-            "mid",
-            42,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &mid_embedding,
-                metadata: b"mid-42",
-            },
-        )
-        .expect("insert into mid id=42");
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_row(
+        &storage,
+        "small",
+        &ctx,
+        42,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &small_embedding,
+            metadata: b"small-42",
+        },
+    )
+    .expect("insert into small id=42");
+    engine::tenant::insert_row(
+        &storage,
+        "mid",
+        &ctx,
+        42,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &mid_embedding,
+            metadata: b"mid-42",
+        },
+    )
+    .expect("insert into mid id=42");
 
     let small_row = storage
-        .get_row_from_table("small", 42)
+        .get_row_from_table("small", TENANT_ID, 42)
         .expect("get small id=42");
     let mid_row = storage
-        .get_row_from_table("mid", 42)
+        .get_row_from_table("mid", TENANT_ID, 42)
         .expect("get mid id=42");
 
     assert_eq!(small_row.embedding, small_embedding);
@@ -382,9 +401,10 @@ fn ext2_scan_table_page_returns_only_own_table_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("small", &small_rows)
-        .expect("seed small");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "small", &ctx, &small_rows).expect("seed small");
 
     let mid_embeddings: Vec<Vec<f32>> = (100..103u64)
         .map(|i| make_embedding(768, i as u32 + 1))
@@ -404,9 +424,7 @@ fn ext2_scan_table_page_returns_only_own_table_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("mid", &mid_rows)
-        .expect("seed mid");
+    engine::tenant::insert_rows(&storage, "mid", &ctx, &mid_rows).expect("seed mid");
 
     let (small_page, _) = storage
         .scan_table_page("small", None, 100)
@@ -437,40 +455,43 @@ fn ext2_state_survives_close_and_reopen() {
 
         let small_embedding = make_embedding(384, 3);
         let mid_embedding = make_embedding(768, 5);
-        storage
-            .insert_row_into_table(
-                "small",
-                1,
-                &RowInput {
-                    tenant_id: TENANT_ID,
-                    visibility: Visibility::Public,
-                    embedding: &small_embedding,
-                    metadata: b"s1",
-                },
-            )
-            .expect("insert small id=1");
-        storage
-            .insert_row_into_table(
-                "mid",
-                1,
-                &RowInput {
-                    tenant_id: TENANT_ID,
-                    visibility: Visibility::Public,
-                    embedding: &mid_embedding,
-                    metadata: b"m1",
-                },
-            )
-            .expect("insert mid id=1");
+        let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+        engine::tenant::insert_row(
+            &storage,
+            "small",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &small_embedding,
+                metadata: b"s1",
+            },
+        )
+        .expect("insert small id=1");
+        engine::tenant::insert_row(
+            &storage,
+            "mid",
+            &ctx,
+            1,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &mid_embedding,
+                metadata: b"m1",
+            },
+        )
+        .expect("insert mid id=1");
         // `storage` はここでスコープを抜けて drop される（close 相当）。
     }
 
     {
         let storage = Storage::open(&path).expect("open storage (second)");
         let small_row = storage
-            .get_row_from_table("small", 1)
+            .get_row_from_table("small", TENANT_ID, 1)
             .expect("get small id=1 after reopen");
         let mid_row = storage
-            .get_row_from_table("mid", 1)
+            .get_row_from_table("mid", TENANT_ID, 1)
             .expect("get mid id=1 after reopen");
         assert_eq!(small_row.embedding.len(), 384);
         assert_eq!(mid_row.embedding.len(), 768);
@@ -479,19 +500,24 @@ fn ext2_state_survives_close_and_reopen() {
 
         // 誤次元挿入の拒否・同一 id の独立共存も再 open 後に不変であることを確認する。
         let wrong_dim = make_embedding(768, 9);
-        let err = storage
-            .insert_row_into_table(
-                "small",
-                2,
-                &RowInput {
-                    tenant_id: TENANT_ID,
-                    visibility: Visibility::Public,
-                    embedding: &wrong_dim,
-                    metadata: b"s2",
-                },
-            )
-            .expect_err("mismatched dim must still be rejected after reopen");
-        assert!(matches!(err, CatalogError::Invalid(_)));
+        let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+        let err = engine::tenant::insert_row(
+            &storage,
+            "small",
+            &ctx,
+            2,
+            &RowInput {
+                tenant_id: TENANT_ID,
+                visibility: Visibility::Public,
+                embedding: &wrong_dim,
+                metadata: b"s2",
+            },
+        )
+        .expect_err("mismatched dim must still be rejected after reopen");
+        assert!(matches!(
+            err,
+            TenantWriteError::Catalog(CatalogError::Invalid(_))
+        ));
     }
 }
 
@@ -544,17 +570,20 @@ fn ext2_insert_rows_into_table_discards_whole_transaction_on_mid_batch_failure()
         ),
     ];
 
-    let err = storage
-        .insert_rows_into_table("small", &batch)
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    let err = engine::tenant::insert_rows(&storage, "small", &ctx, &batch)
         .expect_err("batch containing a dimension mismatch must fail");
-    assert!(matches!(err, CatalogError::Invalid(_)));
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+    ));
 
     // トランザクション全体が破棄され、先に検証を通過していた 1・2 件目も
     // 一切反映されていないこと（`RowNotFound` まで確認し、別の理由での
     // 読み取り失敗と区別する）。
     for id in [1u64, 2] {
         let err = storage
-            .get_row_from_table("small", id)
+            .get_row_from_table("small", TENANT_ID, id)
             .expect_err(&format!("row {id} must not be visible after discard"));
         assert!(matches!(err, CatalogError::RowNotFound(_)));
     }
@@ -598,9 +627,10 @@ fn ext2_scan_table_page_resumes_via_after_cursor_across_pages() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed 25 rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed 25 rows");
 
     let (page1, cursor1) = storage
         .scan_table_page("docs", None, 10)
@@ -608,18 +638,27 @@ fn ext2_scan_table_page_resumes_via_after_cursor_across_pages() {
     assert_eq!(page1.len(), 10);
     assert_eq!(page1.first().map(|r| r.id), Some(0));
     assert_eq!(page1.last().map(|r| r.id), Some(9));
-    assert_eq!(cursor1, Some(9));
+    // カーソルは行ストアの物理キーと同形の `(tenant_id, id)`（対象ビヘイビア: TABLE-12）。
+    assert_eq!(cursor1, Some((TENANT_ID.to_string(), 9)));
 
     let (page2, cursor2) = storage
-        .scan_table_page("docs", cursor1, 10)
+        .scan_table_page(
+            "docs",
+            cursor1.as_ref().map(|(t, id)| (t.as_str(), *id)),
+            10,
+        )
         .expect("second page");
     assert_eq!(page2.len(), 10);
     assert_eq!(page2.first().map(|r| r.id), Some(10));
     assert_eq!(page2.last().map(|r| r.id), Some(19));
-    assert_eq!(cursor2, Some(19));
+    assert_eq!(cursor2, Some((TENANT_ID.to_string(), 19)));
 
     let (page3, cursor3) = storage
-        .scan_table_page("docs", cursor2, 10)
+        .scan_table_page(
+            "docs",
+            cursor2.as_ref().map(|(t, id)| (t.as_str(), *id)),
+            10,
+        )
         .expect("third (partial) page");
     assert_eq!(page3.len(), 5);
     assert_eq!(page3.first().map(|r| r.id), Some(20));
@@ -659,9 +698,10 @@ fn ext2_scan_table_page_byte_budget_caps_page_and_resume_covers_all_rows_without
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed large rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed large rows");
 
     let (page1, cursor1) = storage
         .scan_table_page("docs", None, 100)
@@ -684,7 +724,11 @@ fn ext2_scan_table_page_byte_budget_caps_page_and_resume_covers_all_rows_without
     let mut cursor = cursor1;
     loop {
         let (page, next_cursor) = storage
-            .scan_table_page("docs", cursor, 100)
+            .scan_table_page(
+                "docs",
+                cursor.as_ref().map(|(t, id)| (t.as_str(), *id)),
+                100,
+            )
             .expect("subsequent page after byte-budget cap");
         all_ids.extend(page.iter().map(|r| r.id));
         if next_cursor.is_none() {
@@ -709,18 +753,20 @@ fn ext2_scan_table_page_limit_zero_returns_empty_page() {
     storage
         .create_table(&vector_table_schema("docs", 1))
         .expect("create_table(docs)");
-    storage
-        .insert_row_into_table(
-            "docs",
-            1,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[1.0],
-                metadata: b"m",
-            },
-        )
-        .expect("seed row");
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: b"m",
+        },
+    )
+    .expect("seed row");
 
     let (page, cursor) = storage
         .scan_table_page("docs", None, 0)
@@ -740,22 +786,24 @@ fn ext2_scan_table_page_after_u64_max_returns_empty_page() {
     storage
         .create_table(&vector_table_schema("docs", 1))
         .expect("create_table(docs)");
-    storage
-        .insert_row_into_table(
-            "docs",
-            u64::MAX,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[1.0],
-                metadata: b"m",
-            },
-        )
-        .expect("seed row at id=u64::MAX");
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        u64::MAX,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: b"m",
+        },
+    )
+    .expect("seed row at id=u64::MAX");
 
     let (page, cursor) = storage
-        .scan_table_page("docs", Some(u64::MAX), 10)
-        .expect("after=u64::MAX must not error");
+        .scan_table_page("docs", Some((TENANT_ID, u64::MAX)), 10)
+        .expect("after=(tenant, u64::MAX) must not error");
     assert!(page.is_empty());
     assert_eq!(cursor, None);
 }
@@ -770,10 +818,13 @@ fn ext2_insert_rows_into_table_rejects_empty_batch_against_nonexistent_table() {
     let _cleanup = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
 
-    let err = storage
-        .insert_rows_into_table("ghost", &[])
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    let err = engine::tenant::insert_rows(&storage, "ghost", &ctx, &[])
         .expect_err("empty batch against a nonexistent table must still be rejected");
-    assert!(matches!(err, CatalogError::TableNotFound(_)));
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::TableNotFound(_))
+    ));
 }
 
 #[test]
@@ -800,22 +851,27 @@ fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
 
     // 不存在テーブルへの挿入・取得・走査は TableNotFound。
     let embedding = make_embedding(8, 1);
-    let err = storage
-        .insert_row_into_table(
-            "ghost",
-            1,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &embedding,
-                metadata: b"m",
-            },
-        )
-        .expect_err("insert into nonexistent table must fail");
-    assert!(matches!(err, CatalogError::TableNotFound(_)));
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    let err = engine::tenant::insert_row(
+        &storage,
+        "ghost",
+        &ctx,
+        1,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &embedding,
+            metadata: b"m",
+        },
+    )
+    .expect_err("insert into nonexistent table must fail");
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::TableNotFound(_))
+    ));
 
     let err = storage
-        .get_row_from_table("ghost", 1)
+        .get_row_from_table("ghost", TENANT_ID, 1)
         .expect_err("get from nonexistent table must fail");
     assert!(matches!(err, CatalogError::TableNotFound(_)));
 
@@ -832,19 +888,23 @@ fn ext2_rejects_operations_on_nonexistent_or_vectorless_table() {
     storage
         .create_table(&text_only)
         .expect("create_table(notes)");
-    let err = storage
-        .insert_row_into_table(
-            "notes",
-            1,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &embedding,
-                metadata: b"m",
-            },
-        )
-        .expect_err("insert with embedding into VECTOR-less table must fail");
-    assert!(matches!(err, CatalogError::Invalid(_)));
+    let err = engine::tenant::insert_row(
+        &storage,
+        "notes",
+        &ctx,
+        1,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &embedding,
+            metadata: b"m",
+        },
+    )
+    .expect_err("insert with embedding into VECTOR-less table must fail");
+    assert!(matches!(
+        err,
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+    ));
 }
 
 // --- EXT-2: 2000 次元テーブルの共存・検索経路（TASK-151。対象ビヘイビア: EXT-2。
@@ -900,9 +960,9 @@ fn seed_high_dim_table(storage: &Storage, name: &str, dim: u32, id_offset: u64) 
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(name, &rows)
-        .unwrap_or_else(|e| panic!("insert_rows_into_table({name}) failed: {e}"));
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(storage, name, &ctx, &rows)
+        .unwrap_or_else(|e| panic!("tenant::insert_rows({name}) failed: {e}"));
 }
 
 /// `dim` 次元の embedding 群（`seed_high_dim_table` と同一の決定論的生成規則）を

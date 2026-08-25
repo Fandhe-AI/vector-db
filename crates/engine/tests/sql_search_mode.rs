@@ -57,15 +57,21 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
         (3, [0.0, 1.0, 0.0]),
     ];
     for (id, emb) in &corpus {
-        storage
-            .insert_typed_row(
-                "docs",
-                *id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            *id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec())],
+        )
+        .expect("insert row");
     }
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     (core, guard)

@@ -102,6 +102,13 @@ pub enum CatalogError {
     /// テーブルスコープ行 API（TASK-146）で、指定した行 ID がそのテーブル内に
     /// 存在しない。他テーブルの同一 ID は無関係（テーブル帰属した独立ストア）。
     RowNotFound(u64),
+    /// 既存 DB の行テーブルが旧フォーマット（物理キーが `id` のみ）で、現行の
+    /// `(tenant_id, id)` 複合キー（対象ビヘイビア: TABLE-12）と互換でない。
+    /// 旧データを別テナントの行として読み出す fail-open を避けるため、
+    /// マイグレーションは提供せず fail-closed に拒否する（`redb` の
+    /// `TableError::TableTypeMismatch` を本 variant へ写像する）。エラー文言には
+    /// テーブル名・テナント ID を含めない（存在情報を漏らさない。security.md P0）。
+    IncompatibleRowKeyFormat,
 }
 
 impl fmt::Display for CatalogError {
@@ -116,6 +123,9 @@ impl fmt::Display for CatalogError {
                 write!(f, "column already exists: {name}")
             }
             CatalogError::RowNotFound(id) => write!(f, "row not found: id={id}"),
+            CatalogError::IncompatibleRowKeyFormat => {
+                write!(f, "incompatible row store key format: rebuild required")
+            }
         }
     }
 }
@@ -129,7 +139,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::TableNotFound(_)
             | CatalogError::TableAlreadyExists(_)
             | CatalogError::ColumnAlreadyExists(_)
-            | CatalogError::RowNotFound(_) => None,
+            | CatalogError::RowNotFound(_)
+            | CatalogError::IncompatibleRowKeyFormat => None,
         }
     }
 }
@@ -223,7 +234,11 @@ impl TableSchema {
 /// 空文字列・非 ASCII・区切り文字混入・長さ上限超過を fail-closed に拒否する。
 /// encode 側・decode 側の両方から呼ばれ、永続データが手で書き換えられた場合も
 /// 同じ検証を通す。
-fn validate_identifier(s: &str) -> Result<()> {
+///
+/// `pub(crate)`: `tenant.rs`（TASK-95・対象ビヘイビア: RECOVER-4）が書き込みガード API
+/// （`insert_row`/`update_row`/`delete_row`）内の同一 write トランザクションから、
+/// テーブル名検証をここへ委譲する（重複実装を作らない。クレート外へは公開しない）。
+pub(crate) fn validate_identifier(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(CatalogError::Invalid("identifier is empty".to_string()));
     }
@@ -492,6 +507,48 @@ pub(crate) fn user_rows_table_name(table_name: &str) -> String {
     format!("user_rows/{table_name}")
 }
 
+/// 行ストア（`user_rows/{table_name}`）の物理キー型（対象ビヘイビア: TABLE-12・RLS-9。
+/// ポインタ: `docs/spec/04-behavior/data-model.md` TABLE-12・`rls.md` RLS-9）。
+///
+/// キーはサーバー側導出テナント（`policy.rs::PolicyContext::tenant_id`）と行 `id` の
+/// 複合キーで、行 `id` の一意性スコープをテナント内に閉じる。異なるテナントは同一の
+/// `id` を独立に保持でき、`crate::tenant::insert_row` の重複検出は自テナントの
+/// 名前空間内だけを見るため、他テナント行の存在有無が `23505` の有無として観測される
+/// 経路が構造的に消える（codex-review P0 指摘・PR #194）。`redb` のタプルキーは
+/// 要素順（tenant_id 昇順 → id 昇順）で全順序を持つため、全件走査は従来どおり
+/// 単一の range 走査で列挙できる。
+pub(crate) type UserRowsTableDef<'a> = TableDefinition<'a, (&'static str, u64), &'static [u8]>;
+
+/// [`Storage::scan_table_page`] のページングカーソル（行ストアの物理キーと同形の
+/// `(tenant_id, id)`。対象ビヘイビア: TABLE-12。`id` 単独では再開位置を表現できない）。
+/// 呼び出し元がカーソルを保持できるよう所有形（`String`）で返す。
+pub type RowCursor = (String, u64);
+
+/// [`Storage::scan_table_page`] の戻り値（1 ページ分の行と、続きがある場合の
+/// [`RowCursor`]）。
+pub type RowPage = (Vec<StorageRow>, Option<RowCursor>);
+
+/// 行テーブル定義を組み立てる（[`UserRowsTableDef`] の唯一の生成点）。
+/// 呼び出し元（`catalog.rs`・`tenant.rs`・`arena.rs`・`rls.rs`）がキー型を各所で
+/// 書き下すとドリフトするため、ここへ集約する。
+pub(crate) fn user_rows_table_def(row_table_name: &str) -> UserRowsTableDef<'_> {
+    TableDefinition::new(row_table_name)
+}
+
+/// 行テーブル `open_table` のエラー写像（[`UserRowsTableDef`] 専用）。
+///
+/// 旧フォーマット（物理キーが `id` のみ）の DB を開くと `redb` は
+/// `TableError::TableTypeMismatch` を返す。これを黙って握りつぶすと旧行を
+/// 別テナントの行として扱う fail-open になりうるため、
+/// [`CatalogError::IncompatibleRowKeyFormat`] へ明示的に写像して拒否する
+/// （マイグレーションは提供しない。TABLE-12 の物理キー変更に伴う恒久契約）。
+pub(crate) fn map_row_table_error(e: redb::TableError) -> CatalogError {
+    match e {
+        redb::TableError::TableTypeMismatch { .. } => CatalogError::IncompatibleRowKeyFormat,
+        other => CatalogError::from(other),
+    }
+}
+
 /// `storage.rs::StorageError` を `CatalogError` へ明示変換する。`CatalogError` は
 /// `redb::Error` への blanket `From` 実装を持つため（`storage.rs` の設計メモと同じ
 /// coherence 制約）、`redb::Error` そのものではない複合エラー型 `StorageError` からの
@@ -548,7 +605,11 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
 /// カタログテーブル自体が未作成の場合・該当エントリが存在しない場合のいずれも
 /// `CatalogError::TableNotFound` に一本化する（他テーブルの存在情報を漏らさない
 /// fail-closed な扱い。security.md「アクセス制御の不備」）。
-fn require_table_schema_write(
+///
+/// `pub(crate)`: `tenant.rs`（TASK-95・対象ビヘイビア: RECOVER-4）の書き込みガード API が、
+/// 同一 write トランザクション内で「スキーマ取得 → 所有権判定 → 書き込み」を行うために
+/// ここへ委譲する（クレート外へは公開しない）。
+pub(crate) fn require_table_schema_write(
     write_txn: &redb::WriteTransaction,
     table_name: &str,
 ) -> Result<TableSchema> {
@@ -662,7 +723,21 @@ impl Storage {
     /// 行うことで、並行する DDL（`alter_table_add_column` 等）との整合を確保する。
     /// テーブル不存在・`VECTOR` 列なし・次元不一致はすべて fail-closed に `Err` で拒否する
     /// （security.md「不安全な設計」）。
-    pub fn insert_row_into_table(
+    ///
+    /// `pub(crate)`: 本メソッドはテナント境界チェック（`PolicyContext::is_owner`）を
+    /// 一切行わない生の書き込み経路であり、クレート外（wire-server・結合テスト等）へ
+    /// 公開するとテナント境界を完全に迂回できてしまう（codex-review P0 指摘・PR #194。
+    /// security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+    /// クレート外・テストからの新規行投入は [`crate::tenant::insert_row`]（テナント境界付き
+    /// 書き込みガード。TASK-95・RECOVER-4）を経由すること。
+    ///
+    /// `#[cfg_attr(not(test), allow(dead_code))]`: 現状の呼び出し元はすべて各モジュールの
+    /// `#[cfg(test)]` ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの
+    /// `tenant.rs`）のみのため、`cfg(test)` を含まない通常ビルド（wire-server が依存する
+    /// ビルド単位）では本メソッドが到達不能になり `dead_code` lint が発火する。これは
+    /// 上記の意図的な `pub(crate)` 制限の帰結であり黙殺してよい。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_row_into_table(
         &self,
         table_name: &str,
         id: u64,
@@ -675,22 +750,34 @@ impl Storage {
             schema.validate_embedding_dim(row.embedding.len())?;
             let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
-            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-            let mut row_table = write_txn.open_table(row_table_def)?;
-            row_table.insert(id, encoded.as_slice())?;
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // 物理キーは `(tenant_id, id)`（TABLE-12）。テナント境界チェックを行わない
+            // 生の経路のため、キーの名前空間は入力 `row.tenant_id` に従う
+            // （認可済みの名前空間で書くのは `crate::tenant::insert_row` の責務）。
+            row_table.insert((row.tenant_id, id), encoded.as_slice())?;
         }
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブルスコープで複数行を単一トランザクションで挿入する（TASK-146、対象ビヘイビア:
-    /// EXT-1, EXT-2）。[`insert_row_into_table`](Self::insert_row_into_table) のバッチ版。
+    /// EXT-1, EXT-2）。`insert_row_into_table` のバッチ版。
     /// 1 行でもスキーマ取得・次元検証・エンコードに失敗した場合、write トランザクションは
     /// commit されずに破棄されるため（`redb::WriteTransaction` の drop 契約）、全体が
     /// 未反映のまま拒否される。空スライスの場合も write トランザクション内でカタログ上の
     /// テーブル存在を確認してから成功を返す（レビュー指摘対応: `rows.is_empty()` を
     /// 存在確認より先に判定すると、存在しないテーブルへの空バッチ挿入が `Ok(())` になり
     /// 「テーブル不存在は fail-closed に `Err`」という契約を空バッチで迂回できてしまう）。
-    pub fn insert_rows_into_table(
+    ///
+    /// `pub(crate)`（codex-review P0 指摘・PR #194 対応）: 本メソッドはテナント境界
+    /// チェックを一切行わない生の書き込み経路で、クレート外へ公開すると任意の
+    /// `tenant_id` 名義での書き込み・既存行の上書きが可能になる
+    /// （security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+    /// クレート外・テストからのバッチ投入は [`crate::tenant::insert_rows`]
+    /// （`PolicyContext` 必須のガード付きバッチ API）を経由すること。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_rows_into_table(
         &self,
         table_name: &str,
         rows: &[(u64, RowInput<'_>)],
@@ -710,12 +797,14 @@ impl Storage {
                 return Ok(());
             }
             let row_table_name = user_rows_table_name(table_name);
-            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-            let mut row_table = write_txn.open_table(row_table_def)?;
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
             for (id, row) in rows {
                 schema.validate_embedding_dim(row.embedding.len())?;
                 let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
-                row_table.insert(*id, encoded.as_slice())?;
+                // 物理キーは `(tenant_id, id)`（TABLE-12。`insert_row_into_table` と同じ）。
+                row_table.insert((row.tenant_id, *id), encoded.as_slice())?;
             }
         }
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
@@ -728,10 +817,16 @@ impl Storage {
     ///
     /// スキーマ取得・`VECTOR` 列の抽出・スカラーペイロード生成
     /// （[`row_codec::encode_scalar_columns`]）・行書き込みを単一の write トランザクション
-    /// 内で行う（[`Self::insert_row_into_table`] と同じ理由で並行 DDL との整合を確保する）。
+    /// 内で行う（`insert_row_into_table` と同じ理由で並行 DDL との整合を確保する）。
     /// `VECTOR` 列を持たない・`values` の対応する位置が `Value::Vector` でない場合は
     /// fail-closed に `Err`。
-    pub fn insert_typed_row(
+    ///
+    /// `pub(crate)`（codex-review P0 指摘・PR #194 対応）: [`Self::insert_rows_into_table`]
+    /// と同じ理由でクレート外へは公開しない（`tenant_id` を引数で受け取る生の経路）。
+    /// クレート外・テストからの型付き行投入は [`crate::tenant::insert_typed_row`]
+    /// （`PolicyContext` から `tenant_id` を導出するガード付き API）を経由すること。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_typed_row(
         &self,
         table_name: &str,
         id: u64,
@@ -767,46 +862,73 @@ impl Storage {
             };
             let encoded = crate::storage::encode_row(&row_input).map_err(convert_storage_error)?;
             let row_table_name = user_rows_table_name(table_name);
-            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-            let mut row_table = write_txn.open_table(row_table_def)?;
-            row_table.insert(id, encoded.as_slice())?;
+            let mut row_table = write_txn
+                .open_table(user_rows_table_def(&row_table_name))
+                .map_err(map_row_table_error)?;
+            // 物理キーは `(tenant_id, id)`（TABLE-12）。`tenant_id` は本 API の引数
+            // （呼び出し元がテナントを明示する契約）。
+            row_table.insert((tenant_id, id), encoded.as_slice())?;
         }
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
-    /// テーブルスコープで 1 行取得する（スナップショット読み取り。TASK-146、対象ビヘイビア:
-    /// EXT-1, EXT-2）。他テーブルの同一 ID は見えない（テーブル帰属した独立ストア）。
+    /// テーブルスコープで、指定テナントの名前空間から 1 行取得する（スナップショット
+    /// 読み取り。TASK-146、対象ビヘイビア: EXT-1, EXT-2。物理キーは TABLE-12 の
+    /// `(tenant_id, id)`）。他テーブル・他テナントの同一 `id` は見えない。
+    ///
+    /// `tenant_id` を引数で必須化しているのは TABLE-12 で行 `id` の一意性スコープが
+    /// テナント内に閉じたためで、`id` 単独ではもはや行を一意に指せない。本メソッド自体は
+    /// 認可を行わない生の取得経路であり（`tenant_id` は「どの名前空間を引くか」の指定に
+    /// すぎない）、可視性判定は呼び出し元（`core.rs::EngineCore::get_row` →
+    /// `PolicyContext::is_visible`）が行う。呼び出し元は不存在と不可視を区別せず
+    /// `NotFound` に統一する契約のため、本 API 経由で他テナント行の存在を観測できる
+    /// 公開経路は生まれない（fail-closed。RLS-9）。
     /// テーブル不存在・行不存在はいずれも fail-closed に `Err` を返す
-    /// （エラー内容に他テーブルの存在情報を含めない）。
-    pub fn get_row_from_table(&self, table_name: &str, id: u64) -> Result<StorageRow> {
+    /// （エラー内容に他テーブル・他テナントの存在情報を含めない）。
+    pub fn get_row_from_table(
+        &self,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+    ) -> Result<StorageRow> {
         validate_identifier(table_name)?;
         let read_txn = self.db().begin_read()?;
         require_table_exists_read(&read_txn, table_name)?;
         let row_table_name = user_rows_table_name(table_name);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-        let row_table = match read_txn.open_table(row_table_def) {
+        let row_table = match read_txn.open_table(user_rows_table_def(&row_table_name)) {
             Ok(t) => t,
             // テーブルは定義済みだが 1 行も挿入していない（行テーブル自体が未作成）。
             Err(redb::TableError::TableDoesNotExist(_)) => {
                 return Err(CatalogError::RowNotFound(id))
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_row_table_error(e)),
         };
-        let guard = row_table.get(id)?.ok_or(CatalogError::RowNotFound(id))?;
+        let guard = row_table
+            .get(&(tenant_id, id))?
+            .ok_or(CatalogError::RowNotFound(id))?;
         crate::storage::decode_row(id, guard.value()).map_err(convert_storage_error)
     }
 
-    /// テーブルスコープで行 ID 昇順に最大 `limit` 件を走査する上限付きページング API
-    /// （TASK-146、対象ビヘイビア: EXT-1, EXT-2）。`storage.rs::Storage::scan_page` と同じ
-    /// 行数上限（`MAX_SCAN_PAGE_LIMIT`）・バイト量上限（`MAX_SCAN_PAGE_BYTES`）を適用し、
-    /// 自テーブルの行のみを返す（他テーブルとの混線なし）。カーソル・打ち切り契約は
-    /// `scan_page` と同一。
+    /// テーブルスコープで物理キー昇順（`(tenant_id, id)`。TABLE-12）に最大 `limit` 件を
+    /// 走査する上限付きページング API（TASK-146、対象ビヘイビア: EXT-1, EXT-2）。
+    /// `storage.rs::Storage::scan_page` と同じ行数上限（`MAX_SCAN_PAGE_LIMIT`）・
+    /// バイト量上限（`MAX_SCAN_PAGE_BYTES`）を適用し、自テーブルの行のみを返す
+    /// （他テーブルとの混線なし）。
+    ///
+    /// **走査範囲はテーブル全行**（テナントで絞らない）: 可視性判定は呼び出し元
+    /// （`crate::tenant::visible_rows` → `PolicyContext::is_visible`）の単一照合パスに
+    /// 委譲する契約を維持するため、本 API はテナント境界を判断しない。他テナントの
+    /// `Public` 行も列挙対象に含まれる（`(tenant_id, id)` 順では連続範囲にならないため、
+    /// テナント絞り込みでは可視集合を構成できない）。
+    ///
+    /// カーソルは物理キーと同じ `(tenant_id, id)` 形（`id` 単独では再開位置を表現できず、
+    /// 行の取りこぼしになる）。打ち切り契約は `scan_page` と同一。
     pub fn scan_table_page(
         &self,
         table_name: &str,
-        after: Option<u64>,
+        after: Option<(&str, u64)>,
         limit: u32,
-    ) -> Result<(Vec<StorageRow>, Option<u64>)> {
+    ) -> Result<RowPage> {
         validate_identifier(table_name)?;
         let limit = limit.min(crate::storage::MAX_SCAN_PAGE_LIMIT) as usize;
 
@@ -819,33 +941,30 @@ impl Storage {
             return Ok((Vec::new(), None));
         }
         let row_table_name = user_rows_table_name(table_name);
-        let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
-        let row_table = match read_txn.open_table(row_table_def) {
+        let row_table = match read_txn.open_table(user_rows_table_def(&row_table_name)) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_row_table_error(e)),
         };
 
-        // カーソルの直後（`after + 1`）から走査を開始する。`storage.rs::scan_page` と同じ
-        // 契約: `after` が `u64::MAX` なら「これ以上続きがない」ため空ページを返す。
-        let start = match after {
-            Some(cursor) => match cursor.checked_add(1) {
-                Some(next) => next,
-                None => return Ok((Vec::new(), None)),
-            },
-            None => 0,
+        // カーソルの直後から走査を開始する（`Bound::Excluded`）。複合キーでは
+        // 「次のキー」を算術で導出できないため、除外境界付き range で表現する。
+        let range_start = match after {
+            Some(cursor) => std::ops::Bound::Excluded(cursor),
+            None => std::ops::Bound::Unbounded,
         };
 
         let mut out = Vec::new();
         let mut bytes_used: usize = 0;
         let mut capped = false;
-        for entry in row_table.range(start..)? {
+        let mut last_key: Option<(String, u64)> = None;
+        for entry in row_table.range::<(&str, u64)>((range_start, std::ops::Bound::Unbounded))? {
             if out.len() == limit {
                 capped = true;
                 break;
             }
             let (k, v) = entry?;
-            let id = k.value();
+            let (tenant_id, id) = k.value();
             let raw = v.value();
             if !out.is_empty()
                 && bytes_used.saturating_add(raw.len()) > crate::storage::MAX_SCAN_PAGE_BYTES
@@ -854,14 +973,11 @@ impl Storage {
                 break;
             }
             out.push(crate::storage::decode_row(id, raw).map_err(convert_storage_error)?);
+            last_key = Some((tenant_id.to_string(), id));
             bytes_used = bytes_used.saturating_add(raw.len());
         }
 
-        let cursor_for_next = if capped {
-            out.last().map(|r| r.id)
-        } else {
-            None
-        };
+        let cursor_for_next = if capped { last_key } else { None };
         Ok((out, cursor_for_next))
     }
 }
@@ -886,7 +1002,8 @@ impl TableLookup for Storage {
                 | CatalogError::CorruptSchema(_)
                 | CatalogError::TableAlreadyExists(_)
                 | CatalogError::ColumnAlreadyExists(_)
-                | CatalogError::RowNotFound(_),
+                | CatalogError::RowNotFound(_)
+                | CatalogError::IncompatibleRowKeyFormat,
             ) => Err(SqlSurfaceError::Internal {
                 detail: "catalog lookup failed".to_string(),
             }),
@@ -1219,7 +1336,9 @@ mod tests {
             )
             .expect("insert typed row");
 
-        let row = storage.get_row_from_table("docs", 1).expect("get row");
+        let row = storage
+            .get_row_from_table("docs", "tenant-a", 1)
+            .expect("get row");
         assert_eq!(row.embedding, vec![1.0, 2.0, 3.0]);
         let schema = storage.get_table_schema("docs").expect("get schema");
         let decoded =

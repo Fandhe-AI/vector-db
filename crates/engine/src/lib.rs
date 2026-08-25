@@ -78,6 +78,30 @@
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
 //!
+//! TASK-95（対象ビヘイビア: RECOVER-4）: `tenant.rs` にテナント境界付き書き込みガード
+//! （`insert_row`/`update_row`/`delete_row`）を追加し、`policy.rs::PolicyContext::is_owner`
+//! の単一照合パスで書き込み認可を判定する（読み取りの可視性判定 `is_visible` とは独立）。
+//! `core::EngineCore` は同名の薄い委譲メソッドのみを持ち、`VectorCore` trait へは
+//! 昇格しない。機械検証は `tests/tenant_breach.rs`（詳細は `tenant.rs` モジュール
+//! ドキュメント参照）。
+//!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9）: 行 `id` の一意性スコープは
+//! テナント内であり、行ストア（`catalog.rs` の `user_rows/{table}`）の物理キーを
+//! `(tenant_id, id)` で名前空間化する（`catalog.rs::user_rows_table_def`）。
+//! `tenant.rs::insert_row` の重複検出はサーバー側導出テナントの名前空間内だけを見るため、
+//! 他テナント行の存在有無が `23505` の有無として観測される経路を構造的に持たない
+//! （codex-review P0 指摘・PR #194 対応）。旧フォーマット（キーが `id` のみ）の DB は
+//! `catalog.rs::map_row_table_error` が fail-closed に拒否する。読み取り側で同一 `id` の
+//! 可視行が複数現れうる点の扱いは `core.rs::provider_result_is_valid` を参照。
+//!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9・codex-review P1 対応）: 公開の
+//! 検索結果型 `kernel.rs::SearchHit` は `(tenant_id, id)` で行を一意に解決できる
+//! テナント修飾済みヒットとし、`core::VectorCore::get_row` も `(tenant_id, id)` を
+//! キーに取る（行 `id` の一意性スコープがテナント内のため `id` 単独では行を指せない）。
+//! `SearchProvider` の戻り値は候補ヒット `kernel.rs::CandidateHit`（識別子は呼び出し元
+//! 定義。`core.rs`・`sql/exec.rs` は候補アリーナのスロット番号を渡す）で、テナントの
+//! 解決は provider の外側で行う（ホットパスへヒープ確保を持ち込まないため）。
+//!
 //! TASK-156（対象ビヘイビア: CORE-14）: `isa.rs` が CPU 命令セット（AVX2+FMA・
 //! AVX-512・NEON）の実行時検出を提供し、`dispatch.rs::detect_current_isa`
 //! （決定表の ISA 入力）・`kernel.rs::dot`（`CpuScalarProvider` 等が共有する内積

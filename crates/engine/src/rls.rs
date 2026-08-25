@@ -57,14 +57,14 @@
 //! 異なる段で連携する（両者とも `PolicyContext::is_visible` へ委譲するのみで、
 //! 独自のテナント比較を新設しない点は共通）。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
 use crate::core::{provider_result_is_valid, validate_search_k, MAX_SEARCH_K};
-use crate::kernel::{self, KernelError, SearchHit, SearchInput, SearchProvider};
+use crate::kernel::{self, CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
 use crate::storage::{Storage, Visibility};
 
@@ -132,7 +132,7 @@ pub enum RlsError {
     /// 一致しない行を検出した場合の fail-closed 拒否（`Display` は id・テナント ID を
     /// 含まない。呼び出し元は [`PrefilterIndex::build`] を呼び直すこと。security.md P0）。
     IndexStale,
-    /// `SearchProvider` が返却した `Vec<`[`SearchHit`]`>` が Top-k の契約に違反した
+    /// `SearchProvider` が返却した `Vec<`[`CandidateHit`]`>` が Top-k の契約に違反した
     /// （`core.rs::CoreError::ProviderResultRejected` と同一契約。判定は共有ヘルパ
     /// `provider_result_is_valid` で行う。fail-closed: 違反があれば結果を一切返さない）。
     ProviderResultRejected,
@@ -227,8 +227,15 @@ fn hash_set_conservative_bytes<T>(capacity: usize) -> usize {
 /// 完全一致・前後世代照合・provider 結果検証）をそのまま維持する。
 pub(crate) struct PrefilterSnapshot {
     arena: VectorArena,
-    /// `arena.ids()` の `HashSet` キャッシュ（provider 結果の可視性検証に使う）。
-    visible_id_set: HashSet<u64>,
+    /// provider へ渡す候補識別子（アリーナのスロット番号 0..n）。行 `id` は 1 つの
+    /// 可視集合内で一意とは限らないため識別子に使えない（対象ビヘイビア: TABLE-12。
+    /// `core::slot_ids_for` のドキュメント参照）。検索のたびに作り直さず構築時に保持する。
+    slot_ids: Vec<u64>,
+    /// `slot_ids` から作る「識別子 → 件数」の多重集合キャッシュ（provider 結果の
+    /// 検証に使う。`core::visible_id_counts` で構築。スロット番号は重複しないため
+    /// 各件数は 1 になるが、検証ヘルパを `core.rs`・`sql/exec.rs` と共有するため
+    /// 同じ形で保持する）。
+    visible_id_counts: HashMap<u64, usize>,
     /// 構築時に束縛した `PolicyContext` の複製。`ctx` 照合ゲートに使う。
     built_ctx: PolicyContext,
     /// 構築時に読んだストレージ世代（[`Storage::current_generation`]）。
@@ -257,10 +264,12 @@ impl PrefilterSnapshot {
             }
             Err(e) => return Err(e.into()),
         };
-        let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
+        let slot_ids = crate::core::slot_ids_for(&arena)?;
+        let visible_id_counts = crate::core::visible_id_counts(&slot_ids);
         Ok(Self {
             arena,
-            visible_id_set,
+            slot_ids,
+            visible_id_counts,
             built_ctx: ctx.clone(),
             built_generation,
         })
@@ -318,7 +327,7 @@ impl PrefilterSnapshot {
         }
 
         let input = SearchInput {
-            ids: self.arena.ids(),
+            ids: &self.slot_ids,
             vectors: self.arena.vectors(),
             dim: self.arena.dim(),
             query,
@@ -326,9 +335,14 @@ impl PrefilterSnapshot {
         };
         let hits = provider.search(input)?;
 
-        if !provider_result_is_valid(&hits, k, &self.visible_id_set) {
+        if !provider_result_is_valid(&hits, k, &self.visible_id_counts) {
             return Err(RlsError::ProviderResultRejected);
         }
+        // 検証済みの候補（識別子はスロット番号）をテナント修飾済みヒットへ解決する
+        // （対象ビヘイビア: TABLE-12・RLS-9。`(tenant_id, id)` で呼び出し元が行を
+        // 一意に解決できる公開契約。codex-review P1 指摘・PR #194）。
+        let hits = crate::core::resolve_slot_hits(&self.arena, &hits)
+            .ok_or(RlsError::ProviderResultRejected)?;
 
         // 事後の失効再検証（上記ドキュメント参照）。事前確認〜ここまでの間に別の書き込みが
         // コミットされている可能性があるため、世代を読み直して不一致なら結果を破棄する。
@@ -396,8 +410,18 @@ impl PrefilterSnapshot {
     /// 意味を失わせるため、安全側＝上振れに倒す）。
     pub(crate) fn approx_heap_bytes(&self) -> usize {
         let arena_bytes = self.arena.approx_heap_bytes();
-        let id_set_bytes = hash_set_conservative_bytes::<u64>(self.visible_id_set.capacity());
-        arena_bytes.saturating_add(id_set_bytes)
+        let id_set_bytes =
+            hash_set_conservative_bytes::<(u64, usize)>(self.visible_id_counts.capacity());
+        // provider 入力用スロット識別子（`slot_ids`）の実確保量も計上する
+        // （TABLE-12 対応で追加した保持データ。キャッシュ総量上限の見積もりから
+        // 漏らさない）。
+        let slot_ids_bytes = self
+            .slot_ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u64>());
+        arena_bytes
+            .saturating_add(id_set_bytes)
+            .saturating_add(slot_ids_bytes)
     }
 }
 
@@ -597,9 +621,19 @@ impl<'s> SearchTimeFilter<'s> {
 
         let mut selector = kernel::TopKSelector::new(k);
         let mut visible_row_count: usize = 0;
+        // 候補識別子は走査中に採番するスキャンローカルのスロット番号（0 起点）。
+        // 行 `id` は 1 つの可視集合内で一意とは限らない（対象ビヘイビア: TABLE-12）ため
+        // 識別子には使えない。`(tenant_id, id)` はスロット番号を添字とする本 `Vec` に
+        // 保持し、最後に選出された高々 `k` 件だけをテナント修飾済みヒットへ解決する
+        // （`String` 確保をホットパスである `TopKSelector::push` の外へ出す）。
+        let mut visible_rows: Vec<(String, u64)> = Vec::new();
+        // 候補識別子の「識別子 → 件数」多重集合（検証ヘルパを `core.rs` と共有するための
+        // 形。スロット番号は重複しないため各件数は 1 になる）。
+        let mut visible_id_counts: HashMap<u64, usize> = HashMap::new();
         for entry in table.iter().map_err(crate::storage::StorageError::from)? {
             let (key, value) = entry.map_err(crate::storage::StorageError::from)?;
-            let id = key.value();
+            // 複合キーの第 2 要素が行 `id`（TABLE-12）。
+            let (_key_tenant, id) = key.value();
             let buf = value.value();
 
             // 可視性判定を embedding decode より前に行う（上記型ドキュメント参照。
@@ -614,7 +648,7 @@ impl<'s> SearchTimeFilter<'s> {
             // ここに到達するのは呼び出し元 `ctx` から可視な行のみ。次元不一致はこの行
             // 自身の id を含めて fail-closed に伝播してよい（呼び出し元が既に到達できる
             // 情報。`PrefilterIndex::build` と同じ契約。上記型ドキュメント参照）。
-            let row = crate::storage::decode_row(id, buf).map_err(ArenaError::from)?;
+            let mut row = crate::storage::decode_row(id, buf).map_err(ArenaError::from)?;
             let found_dim =
                 u32::try_from(row.embedding.len()).map_err(|_| ArenaError::DimMismatch {
                     id,
@@ -645,23 +679,49 @@ impl<'s> SearchTimeFilter<'s> {
                 // （`kernel.rs::CpuScalarProvider` と同方針）。
                 continue;
             }
-            selector.push(SearchHit { id, score });
+
+            // スロット採番は「実際に選出候補へ入れる行」に限る（非有限スコアで
+            // スキップした行は採番しない）。確保はフォールブルにし、上限は直前の
+            // `check_capacity` が可視行数に対して既に検証している。
+            let slot = visible_rows.len();
+            let slot_id = u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+            visible_rows.try_reserve(1).map_err(|e| {
+                ArenaError::AllocationFailed(format!("failed to reserve row key: {e}"))
+            })?;
+            // `row` はこの行の走査でしか使わないため、`tenant_id` は clone せず所有権ごと
+            // 移す（可視行ごとに走る経路で短命な `String` を二重確保しない）。
+            visible_rows.push((std::mem::take(&mut row.tenant_id), id));
+            let counted = visible_id_counts.entry(slot_id).or_insert(0);
+            *counted = counted.saturating_add(1);
+
+            selector.push(CandidateHit { id: slot_id, score });
         }
         let hits = selector.into_sorted_vec();
 
-        // 返却直前の機械検証（件数上限・スコア有限性・重複なし・順序の 4 点。
+        // 返却直前の機械検証（件数上限・スコア有限性・重複上限・順序の 4 点）。
         // `PrefilterIndex::search` と異なり本型は `dyn SearchProvider` を経由せず、
         // `hits` は上記ループで `ctx.is_visible` を通過した行からのみ inline 生成される
-        // ため、id 集合が可視行に属するかの検証は自己ループの同語反復になり
-        // `dyn SearchProvider` 越しの防御という本来の意義を持たない。そのため
-        // `visible_id_set` は全行分ではなく `hits` 自身の id から構築し、他 4 項目の
-        // 検証にのみ使う（`hits` の id は元々可視行由来なので (3) は常に真になる）。
-        let hit_id_set: HashSet<u64> = hits.iter().map(|hit| hit.id).collect();
-        if !provider_result_is_valid(&hits, k, &hit_id_set) {
+        // ため (3) は常に真になるが、(4)（同じ行を複数回返していないこと）を実効的に
+        // 保つため、多重集合は `hits` 自身ではなく走査中に数えた可視行の実件数から
+        // 構築する（TABLE-12 の重複 id の扱いは `core::provider_result_is_valid` 参照）。
+        if !provider_result_is_valid(&hits, k, &visible_id_counts) {
             return Err(RlsError::ProviderResultRejected);
         }
 
-        Ok(hits)
+        // 選出された候補（スロット番号）を `(tenant_id, id)` のテナント修飾済みヒットへ
+        // 解決する（対象ビヘイビア: TABLE-12・RLS-9）。スロットが範囲外なら部分結果を
+        // 返さず fail-closed に拒否する。
+        let mut out = Vec::new();
+        out.try_reserve_exact(hits.len())
+            .map_err(|e| ArenaError::AllocationFailed(format!("failed to reserve hits: {e}")))?;
+        for hit in &hits {
+            let slot = usize::try_from(hit.id).map_err(|_| RlsError::ProviderResultRejected)?;
+            let (tenant_id, row_id) = visible_rows
+                .get(slot)
+                .ok_or(RlsError::ProviderResultRejected)?;
+            out.push(SearchHit::new(tenant_id.as_str(), *row_id, hit.score));
+        }
+        Ok(out)
     }
 
     /// `ctx` の可視性述語で数えた可視行数を返す（存在情報のため `ctx` 必須。
@@ -730,19 +790,26 @@ impl<'s> SearchTimeFilter<'s> {
     /// （[`VectorArena::build`] の空アリーナ相当）。`redb::ReadOnlyTable` は内部で
     /// トランザクションガードを `Arc` 保持するため、返り値は呼び出し元が `read_txn` を
     /// 生かし続けなくても単独で使える（`redb::ReadTransaction::open_table` の戻り値契約）。
-    fn open_row_table(&self) -> Result<Option<redb::ReadOnlyTable<u64, &'static [u8]>>, RlsError> {
+    #[allow(clippy::type_complexity)]
+    fn open_row_table(
+        &self,
+    ) -> Result<Option<redb::ReadOnlyTable<(&'static str, u64), &'static [u8]>>, RlsError> {
         let read_txn = self
             .storage
             .db()
             .begin_read()
             .map_err(crate::storage::StorageError::from)?;
         let row_table_name = crate::catalog::user_rows_table_name(&self.table_name);
-        let row_table_def: redb::TableDefinition<u64, &[u8]> =
-            redb::TableDefinition::new(&row_table_name);
-        match read_txn.open_table(row_table_def) {
+        // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12）。走査はテーブル全行を
+        // 対象とし（テナントで絞らない）、可視性判定は `ctx.is_visible` の単一照合パスへ
+        // 委譲する契約を変えない。旧フォーマット DB は
+        // `catalog::map_row_table_error` 経由で fail-closed に拒否する。
+        match read_txn.open_table(crate::catalog::user_rows_table_def(&row_table_name)) {
             Ok(t) => Ok(Some(t)),
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
-            Err(e) => Err(crate::storage::StorageError::from(e).into()),
+            Err(e) => Err(RlsError::Arena(ArenaError::Catalog(
+                crate::catalog::map_row_table_error(e),
+            ))),
         }
     }
 }
@@ -831,7 +898,7 @@ impl RlsVerifiedHits {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -1160,8 +1227,8 @@ mod tests {
     // （`core.rs::CoreError::ProviderResultRejected` と同一契約の再現）。
     struct RogueProvider;
     impl SearchProvider for RogueProvider {
-        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
-            Ok(vec![SearchHit {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+            Ok(vec![CandidateHit {
                 id: 9_999_999,
                 score: 1.0,
             }])
@@ -1494,7 +1561,7 @@ mod tests {
         }
     }
     impl SearchProvider for RecordingProvider {
-        fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             CpuScalarProvider.search(input)
         }
@@ -1601,7 +1668,7 @@ mod tests {
         storage: &'s Storage,
     }
     impl SearchProvider for WritingDuringSearchProvider<'_> {
-        fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
             self.storage
                 .insert_row_into_table(
                     "docs",
@@ -1939,9 +2006,9 @@ mod tests {
             let write_txn = storage.db().begin_write().expect("begin_write");
             {
                 let row_table_name = crate::catalog::user_rows_table_name("docs");
-                let row_table_def: redb::TableDefinition<u64, &[u8]> =
-                    redb::TableDefinition::new(&row_table_name);
-                let mut row_table = write_txn.open_table(row_table_def).expect("open row table");
+                let mut row_table = write_txn
+                    .open_table(crate::catalog::user_rows_table_def(&row_table_name))
+                    .expect("open row table");
                 let encoded = crate::storage::encode_row(&RowInput {
                     tenant_id: "tenant-b",
                     visibility: Visibility::Private,
@@ -1950,7 +2017,7 @@ mod tests {
                 })
                 .expect("encode mismatched-dim row for tenant-b");
                 row_table
-                    .insert(2u64, encoded.as_slice())
+                    .insert(("tenant-b", 2u64), encoded.as_slice())
                     .expect("insert mismatched-dim row bypassing dim validation");
             }
             write_txn.commit().expect("commit mismatched-dim row");
@@ -2120,7 +2187,7 @@ mod tests {
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
 
         let hits = filter.search(&ctx, &[1.0, 0.0], 1).expect("search ok");
-        assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
+        assert_eq!(hits, vec![SearchHit::new("tenant-a", 1, 1.0)]);
     }
 
     // `len`/`is_empty` は渡された ctx の可視性述語で都度判定する（`PrefilterIndex` と
@@ -2404,7 +2471,8 @@ mod tests {
     // 退行防止）。
     #[test]
     fn hash_set_conservative_bytes_charges_unused_capacity_not_just_len() {
-        let mut set: HashSet<u64> = HashSet::with_capacity(1024);
+        let mut set: std::collections::HashSet<u64> =
+            std::collections::HashSet::with_capacity(1024);
         for i in 0..1024u64 {
             set.insert(i);
         }

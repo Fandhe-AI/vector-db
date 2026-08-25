@@ -65,15 +65,21 @@ fn sql1_pure_topk_matches_independent_exact_oracle() {
         (6, [-1.0, 0.0, 0.0]),
     ];
     for (id, emb) in &corpus {
-        storage
-            .insert_typed_row(
-                "docs",
-                *id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), Value::Text("x".to_string())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            *id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Text("x".to_string())],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
@@ -152,15 +158,21 @@ fn sql2_where_equality_excludes_non_matching_rows_without_under_fetch() {
         (5, [0.0, 1.0], "ja"),
     ];
     for (id, emb, lang) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
@@ -191,15 +203,21 @@ fn setup_multi_tenant_table(storage: &Storage) {
         (4, "tenant-b", Visibility::Private),
     ];
     for (id, tenant, visibility) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                tenant,
-                visibility,
-                &[Value::Vector(vec![1.0, 0.0])],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            id,
+            visibility,
+            &[Value::Vector(vec![1.0, 0.0])],
+        )
+        .expect("insert row");
     }
 }
 
@@ -284,15 +302,21 @@ fn sql4_hybrid_rrf_and_hybrid_syntax_forms_return_identical_topk() {
             Some(b) => Value::Text(b.to_string()),
             None => Value::Null,
         };
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), value],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), value],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
@@ -348,15 +372,21 @@ fn sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text() {
         ))
         .expect("create table");
     for (id, emb) in [(1u64, [1.0f32, 0.0]), (2, [0.0, 1.0])] {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), Value::Null],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Null],
+        )
+        .expect("insert row");
     }
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -416,15 +446,21 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
             Some(b) => Value::Text(b.to_string()),
             None => Value::Null,
         };
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), value],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), value],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
@@ -508,18 +544,24 @@ fn select_star_projects_id_then_schema_column_order() {
             ],
         ))
         .expect("create table");
-    storage
-        .insert_typed_row(
-            "docs",
-            7,
-            "tenant-a",
-            Visibility::Public,
-            &[
-                Value::Vector(vec![1.0, 0.0]),
-                Value::Text("hello".to_string()),
-            ],
-        )
-        .expect("insert row");
+    // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+    // `PolicyContext` から導出される）。
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "docs",
+        &ctx,
+        7,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![1.0, 0.0]),
+            Value::Text("hello".to_string()),
+        ],
+    )
+    .expect("insert row");
     let core = new_core(storage);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     let result = core
@@ -576,19 +618,25 @@ fn sql2_select_id_ignores_unprojected_large_text_column() {
         (5, [0.0, 1.0], "ja"),
     ];
     for (id, emb, lang) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[
-                    Value::Vector(emb.to_vec()),
-                    Value::Text(lang.to_string()),
-                    Value::Text(large_bio.clone()),
-                ],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(emb.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(large_bio.clone()),
+            ],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);

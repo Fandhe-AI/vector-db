@@ -31,7 +31,7 @@
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
@@ -316,7 +316,17 @@ pub fn execute_statement(
     // 保持して投影に流用することで、SQL 実行全体を単一スナップショット
     // （`VectorArena::build_filtered_with_rows` が開く read トランザクション）に
     // 閉じ込め、再取得によるスナップショット不一致の窓をなくす）。
-    let mut candidate_columns: HashMap<u64, Vec<Value>> = HashMap::new();
+    //
+    // 対応づけのキーは行 `id` ではなく**アリーナのスロット番号**
+    // （`VectorArena::build_filtered_with_rows_in_txn` が `on_visible_row` の第 1 引数で
+    // 渡す値。`arena.ids()` 等の添字と一致する）。行 `id` の一意性スコープはテナント内に
+    // 閉じている（対象ビヘイビア: TABLE-12）ため、1 つの可視集合に同じ `id` の行が
+    // 複数含まれうる（自テナント行と他テナントの `Public` 行）。`id` をキーにすると
+    // embedding（アリーナ由来）とスカラー列（本表由来）が別テナントの行から混ざる
+    // （Bugbot High 指摘）。スロット番号は `(tenant_id, id)` の行と 1 対 1 に対応するため、
+    // 混線が構造的に起こらない。`Vec` の添字がスロット番号そのものであることは
+    // `on_visible_row` が `true` を返した行だけが順番に push される契約で担保する。
+    let mut candidate_columns: Vec<Vec<Value>> = Vec::new();
 
     // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
     // `scan_scalar_columns` が常に `None` を返すだけ（実体は `arena` から引く）ため
@@ -349,86 +359,100 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
-    let on_visible_row = |id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
-        // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
-        // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
-        // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
-        // 値を保持しないクエリでも 1 行分の巨大な一時確保が先に発生し得た
-        // （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
-        // `scan_scalar_columns` は構造検証のみを行い `Text` 値を `metadata` 借用の
-        // `&str` として返すため、ここではヒープ確保が一切発生しない。フィルタ条件
-        // の突合も借用のまま行い、投影・hybrid 本文として実際に必要な列だけを
-        // 下のループで選択的に複製する。
-        let scanned = row_codec::scan_scalar_columns(schema, metadata)
-            .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
-        // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
-        // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
-        // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
-        if plan.scalar_prefilter {
-            for filter in &bound.scalar_filters {
-                match scanned.get(filter.column_index) {
-                    Some(Some(t)) if *t == filter.value => {}
-                    _ => return Ok(false),
-                }
-            }
-        }
-        if is_hybrid {
-            if let Some(idx) = text_column_index {
-                if let Some(Some(t)) = scanned.get(idx) {
-                    if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
-                        return Err(ArenaError::CapacityExceeded);
+    let on_visible_row =
+        |slot: usize, id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
+            // `id` は投影の `ResultRow.id` としてのみ使い、行の同定には使わない
+            // （同定は `slot`。上記 `candidate_columns` のコメント参照）。
+            let _ = id;
+            // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
+            // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
+            // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
+            // 値を保持しないクエリでも 1 行分の巨大な一時確保が先に発生し得た
+            // （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
+            // `scan_scalar_columns` は構造検証のみを行い `Text` 値を `metadata` 借用の
+            // `&str` として返すため、ここではヒープ確保が一切発生しない。フィルタ条件
+            // の突合も借用のまま行い、投影・hybrid 本文として実際に必要な列だけを
+            // 下のループで選択的に複製する。
+            let scanned = row_codec::scan_scalar_columns(schema, metadata)
+                .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
+            // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
+            // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
+            // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
+            if plan.scalar_prefilter {
+                for filter in &bound.scalar_filters {
+                    match scanned.get(filter.column_index) {
+                        Some(Some(t)) if *t == filter.value => {}
+                        _ => return Ok(false),
                     }
-                    let owned = try_alloc_text_for_budget(
-                        t,
-                        &mut sparse_bytes,
-                        crate::sparse::MAX_CORPUS_BYTES,
-                    )?;
-                    sparse_docs.push((id, owned));
-                }
-                // NULL 本文は疎側に含めない（密のみへ寄与する）。
-            }
-        }
-        // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
-        // ただし投影で実際に参照される列（`needed_column_indices`）だけを複製し、
-        // それ以外は `Value::Null` として保持する（複製しない）。行を保持することで
-        // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は
-        // 複製する列ごとに）を、それぞれの確保の**前**に検証し、上限超過は
-        // fail-closed に `ArenaError::CapacityExceeded`（`map_arena_error` 経由で
-        // `PayloadTooLarge`）として拒否する（投影列を持たない `SELECT id ...` でも、
-        // 候補行数に比例する `Vec<Value>` 構造体分だけで無制限に積み上がらない
-        // ようにする）。行単位の上限は「投影された列と hybrid 本文 1 本のみが複製
-        // 対象になる」という構造そのものが担保する（必要な列だけを、必要な分だけ
-        // 確保前に検証してから複製するため、行あたりの複製量は投影列の実バイト数
-        // を超えない）。
-        candidate_scalar_bytes = try_accumulate_budget(
-            candidate_scalar_bytes,
-            row_struct_bytes,
-            MAX_CANDIDATE_SCALAR_BYTES,
-        )?;
-        let mut kept: Vec<Value> = Vec::new();
-        kept.try_reserve_exact(scanned.len()).map_err(|e| {
-            ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
-        })?;
-        for (idx, slot) in scanned.into_iter().enumerate() {
-            if !needed_column_indices.contains(&idx) {
-                kept.push(Value::Null);
-                continue;
-            }
-            match slot {
-                None => kept.push(Value::Null),
-                Some(t) => {
-                    let owned = try_alloc_text_for_budget(
-                        t,
-                        &mut candidate_scalar_bytes,
-                        MAX_CANDIDATE_SCALAR_BYTES,
-                    )?;
-                    kept.push(Value::Text(owned));
                 }
             }
-        }
-        candidate_columns.insert(id, kept);
-        Ok(true)
-    };
+            if is_hybrid {
+                if let Some(idx) = text_column_index {
+                    if let Some(Some(t)) = scanned.get(idx) {
+                        if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
+                            return Err(ArenaError::CapacityExceeded);
+                        }
+                        let owned = try_alloc_text_for_budget(
+                            t,
+                            &mut sparse_bytes,
+                            crate::sparse::MAX_CORPUS_BYTES,
+                        )?;
+                        // 疎コーパスの文書 id もスロット番号（`DocId = u64`）にする。
+                        // 行 `id` を使うと、同一 `id` の可視行が 2 テナント分あるときに
+                        // `SparseIndex::build` が `DuplicateDocId` で失敗し、ハイブリッド
+                        // SQL 全体が落ちる（Bugbot Medium 指摘。対象ビヘイビア: TABLE-12）。
+                        let doc_id =
+                            u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+                        sparse_docs.push((doc_id, owned));
+                    }
+                    // NULL 本文は疎側に含めない（密のみへ寄与する）。
+                }
+            }
+            // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
+            // ただし投影で実際に参照される列（`needed_column_indices`）だけを複製し、
+            // それ以外は `Value::Null` として保持する（複製しない）。行を保持することで
+            // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は
+            // 複製する列ごとに）を、それぞれの確保の**前**に検証し、上限超過は
+            // fail-closed に `ArenaError::CapacityExceeded`（`map_arena_error` 経由で
+            // `PayloadTooLarge`）として拒否する（投影列を持たない `SELECT id ...` でも、
+            // 候補行数に比例する `Vec<Value>` 構造体分だけで無制限に積み上がらない
+            // ようにする）。行単位の上限は「投影された列と hybrid 本文 1 本のみが複製
+            // 対象になる」という構造そのものが担保する（必要な列だけを、必要な分だけ
+            // 確保前に検証してから複製するため、行あたりの複製量は投影列の実バイト数
+            // を超えない）。
+            candidate_scalar_bytes = try_accumulate_budget(
+                candidate_scalar_bytes,
+                row_struct_bytes,
+                MAX_CANDIDATE_SCALAR_BYTES,
+            )?;
+            let mut kept: Vec<Value> = Vec::new();
+            kept.try_reserve_exact(scanned.len()).map_err(|e| {
+                ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
+            })?;
+            for (idx, slot) in scanned.into_iter().enumerate() {
+                if !needed_column_indices.contains(&idx) {
+                    kept.push(Value::Null);
+                    continue;
+                }
+                match slot {
+                    None => kept.push(Value::Null),
+                    Some(t) => {
+                        let owned = try_alloc_text_for_budget(
+                            t,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Text(owned));
+                    }
+                }
+            }
+            // `slot` は「これから push される行の添字」（アリーナ側の契約）。ここでの
+            // push により `candidate_columns[slot] == kept` が成立する。両者がずれた場合は
+            // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
+            debug_assert_eq!(candidate_columns.len(), slot);
+            candidate_columns.push(kept);
+            Ok(true)
+        };
 
     let rls_hook = ImplicitRlsHook::new(ctx);
     let arena = VectorArena::build_filtered_with_rows_in_txn(
@@ -439,29 +463,42 @@ pub fn execute_statement(
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;
 
-    let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
-    // `id -> arena 内インデックス` の対応表。投影段で embedding を
-    // `arena.vector(index)`（候補構築と同一スナップショットのバッファ）から
-    // 引くために使う（`storage` への再アクセスを行わない）。
-    let arena_index_by_id: HashMap<u64, usize> = arena
-        .ids()
-        .iter()
-        .enumerate()
-        .map(|(idx, id)| (*id, idx))
-        .collect();
+    // provider へ渡す id は行 `id` ではなく**アリーナのスロット番号**（0..n）にする。
+    // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、1 つの
+    // 可視集合に同じ `id` の行が複数含まれうるため、`id` のままでは
+    // (a) provider 結果の重複検証、(b) RRF 融合の結合キー、(c) 投影段の行同定 の
+    // いずれもが別テナントの行を取り違えうる（Bugbot High/Medium 指摘）。スロット番号は
+    // 可視集合内で一意かつ `(tenant_id, id)` の行と 1 対 1 に対応するため、これらの
+    // 契約が構造的に回復する。クライアントへ返す `ResultRow.id` は投影段で
+    // `arena.ids()[slot]`（本来の行 id）へ戻す。
+    let mut slot_ids: Vec<u64> = Vec::new();
+    slot_ids
+        .try_reserve_exact(arena.ids().len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve candidate slot ids: {e}"),
+        })?;
+    for slot in 0..arena.ids().len() {
+        let slot_id = u64::try_from(slot).map_err(|_| SqlSurfaceError::Internal {
+            detail: "candidate slot index does not fit in u64".to_string(),
+        })?;
+        slot_ids.push(slot_id);
+    }
+    // スロット番号は重複しないため、多重集合の各件数は必ず 1 になる
+    // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
+    let visible_id_counts = core::visible_id_counts(&slot_ids);
 
     // DISTANCE 段。
     let hits: Vec<(u64, f64)> = match &bound.ranking {
         Ranking::Distance { query } => {
             let input = SearchInput {
-                ids: arena.ids(),
+                ids: &slot_ids,
                 vectors: arena.vectors(),
                 dim: arena.dim(),
                 query,
                 k: bound.limit,
             };
             let raw = provider.search(input).map_err(map_kernel_error)?;
-            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_set) {
+            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_counts) {
                 return Err(SqlSurfaceError::Internal {
                     detail: "search provider returned a result violating the top-k contract"
                         .to_string(),
@@ -479,7 +516,7 @@ pub fn execute_statement(
                 }
             })?;
             let input = SearchInput {
-                ids: arena.ids(),
+                ids: &slot_ids,
                 vectors: arena.vectors(),
                 dim: arena.dim(),
                 query,
@@ -492,14 +529,20 @@ pub fn execute_statement(
                 // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
                 // `hybrid::hybrid_search` と同じ理由でここでも行う）。
                 let dense_input = SearchInput {
-                    ids: arena.ids(),
+                    ids: &slot_ids,
                     vectors: arena.vectors(),
                     dim: arena.dim(),
                     query,
                     k: cfg.pool_depth(),
                 };
                 let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                if dense_hits.iter().any(|h| !visible_id_set.contains(&h.id)) {
+                // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                // キー存在で判定する。TABLE-12 の重複 id については
+                // `core::provider_result_is_valid` のドキュメント参照）。
+                if dense_hits
+                    .iter()
+                    .any(|h| !visible_id_counts.contains_key(&h.id))
+                {
                     return Err(SqlSurfaceError::Internal {
                         detail: "search provider returned a hit outside the visible id set"
                             .to_string(),
@@ -541,13 +584,18 @@ pub fn execute_statement(
         hits
     } else {
         hits.into_iter()
-            .filter(|(id, _)| {
-                match candidate_columns.get(id) {
-                Some(columns) => bound.scalar_filters.iter().all(|f| {
-                    matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value)
-                }),
-                None => false,
-            }
+            .filter(|(slot_id, _)| {
+                // `slot_id` はアリーナのスロット番号（上記参照）。範囲外は
+                // データ不整合として fail-closed に除去する。
+                match usize::try_from(*slot_id)
+                    .ok()
+                    .and_then(|slot| candidate_columns.get(slot))
+                {
+                    Some(columns) => bound.scalar_filters.iter().all(|f| {
+                        matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value)
+                    }),
+                    None => false,
+                }
             })
             .collect()
     };
@@ -562,10 +610,13 @@ pub fn execute_statement(
     // ドキュメント参照）。戻り値の [`RlsVerifiedHits`]（witness 型）は
     // [`project_rows`] へのみ渡り、安全網を経由しない生の `hits` から投影へ
     // 到達する経路は型として存在しない（`rls.rs` の型ドキュメント参照）。
-    let verified: RlsVerifiedHits = RlsSafetyNet::new(ctx).apply(hits, |id| {
-        let index = *arena_index_by_id.get(&id)?;
-        let tenant = arena.tenant_id(index)?;
-        let visibility = arena.visibility(index)?;
+    // `hits` の第 1 要素はアリーナのスロット番号。範囲外のスロット（provider の契約
+    // 違反・データ不整合）は `None` を返し、`RlsSafetyNet::apply` が fail-closed に
+    // 除去する（従来の「id が索引に無い」case と同じ扱い）。
+    let verified: RlsVerifiedHits = RlsSafetyNet::new(ctx).apply(hits, |slot_id| {
+        let slot = usize::try_from(slot_id).ok()?;
+        let tenant = arena.tenant_id(slot)?;
+        let visibility = arena.visibility(slot)?;
         Some((tenant, visibility))
     });
 
@@ -574,7 +625,6 @@ pub fn execute_statement(
         &bound.projection,
         schema,
         &arena,
-        &arena_index_by_id,
         &candidate_columns,
     )?;
 
@@ -610,26 +660,34 @@ fn project_rows(
     projection: &[ProjectedColumn],
     schema: &TableSchema,
     arena: &VectorArena,
-    arena_index_by_id: &HashMap<u64, usize>,
-    candidate_columns: &HashMap<u64, Vec<Value>>,
+    candidate_columns: &[Vec<Value>],
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
     let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
-    for (id, score) in hits {
-        let index = *arena_index_by_id
-            .get(&id)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "search hit id missing from candidate arena".to_string(),
-            })?;
+    for (slot_id, score) in hits {
+        // ヒットの第 1 要素はアリーナのスロット番号（`execute_statement` の
+        // `slot_ids` 参照）。embedding・スカラー列・行 `id` の 3 者すべてを同じ
+        // スロットから引くため、同一 `id` の別テナント行が混ざる余地がない
+        // （対象ビヘイビア: TABLE-12。Bugbot High 指摘への対応）。
+        let slot = usize::try_from(slot_id).map_err(|_| SqlSurfaceError::Internal {
+            detail: "candidate slot index out of range".to_string(),
+        })?;
         let embedding = arena
-            .vector(index)
+            .vector(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "candidate arena index out of range".to_string(),
             })?;
         let decoded = candidate_columns
-            .get(&id)
+            .get(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "search hit id missing from candidate scalar columns".to_string(),
+                detail: "search hit is missing from candidate scalar columns".to_string(),
+            })?;
+        // クライアントへ返す id は本来の行 `id`（スロット番号ではない）。
+        let id = *arena
+            .ids()
+            .get(slot)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "candidate arena index out of range".to_string(),
             })?;
         let mut cells = Vec::with_capacity(projection.len());
         for col in projection {

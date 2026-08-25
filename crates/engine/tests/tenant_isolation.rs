@@ -52,6 +52,12 @@ impl Xorshift64 {
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
+
 const DIM: u32 = 8;
 const TABLE: &str = "docs";
 const TENANTS: [&str; 4] = ["tenant-0", "tenant-1", "tenant-2", "tenant-3"];
@@ -111,9 +117,7 @@ fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) -> Vec<RowMet
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(TABLE, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, TABLE, &rows);
     metas
 }
 
@@ -190,7 +194,9 @@ fn table11_zero_cross_tenant_leakage_across_200_trials_via_both_search_paths() {
             }
 
             // 独立検証 2: `tenant.rs::verify_hits`（本タスクの統合層自体の検証を兼ねる）。
-            tenant::verify_hits(&storage, TABLE, ctx, &hit_ids)
+            // 照合は `(tenant_id, id)` の完全な行キーで行う（TABLE-12・RLS-9。
+            // `hits` はテナント修飾済み）。
+            tenant::verify_hits(&storage, TABLE, ctx, &hits)
                 .expect("tenant::verify_hits must accept PrefilterIndex hits");
         }
         // `indices` はここで drop され、`storage` の借用が終わる（次フェーズで

@@ -249,9 +249,11 @@ fn seed_table(storage: &Storage, name: &str, dim: u32, row_count: u32) {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(name, &rows)
-        .unwrap_or_else(|e| panic!("insert_rows_into_table({name}) failed: {e}"));
+    // テナント境界付きバッチ API 経由で投入する（生の `Storage::insert_rows_into_table`
+    // は codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(storage, name, &ctx, &rows)
+        .unwrap_or_else(|e| panic!("tenant::insert_rows({name}) failed: {e}"));
 }
 
 /// DB ファイルのバイト長を取得する。この値は
