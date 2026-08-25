@@ -254,8 +254,12 @@ fn seed_table(storage: &Storage, name: &str, dim: u32, row_count: u32) {
         .unwrap_or_else(|e| panic!("insert_rows_into_table({name}) failed: {e}"));
 }
 
-fn file_size(path: &PathBuf) -> u64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+/// DB ファイルのバイト長を取得する。この値は
+/// `docs/design/high-dim-2000-reverification.md` の実測結果表へ転記する測定契約の
+/// 一部であるため、パス消失・権限・I/O エラーを 0 バイトとして握り潰さず
+/// `Err` として呼び出し側（`run_part_b`）へ伝播し、測定を打ち切る（fail-closed）。
+fn file_size(path: &PathBuf) -> std::io::Result<u64> {
+    std::fs::metadata(path).map(|m| m.len())
 }
 
 /// `core.search(ctx, "emb2000", query, ENGINE_TOP_K)` を `ENGINE_MEASURED_ITERS` 回
@@ -277,7 +281,7 @@ fn measure_engine_search(core: &EngineCore, ctx: &PolicyContext, query: &[f32]) 
     summarize_latencies(latencies)
 }
 
-fn run_part_b() {
+fn run_part_b() -> std::io::Result<()> {
     println!(
         "\n=== Part B: end-to-end coexistence (row_count/table={ENGINE_ROW_COUNT}, k={ENGINE_TOP_K}) ==="
     );
@@ -304,7 +308,7 @@ fn run_part_b() {
         drop(core);
         stats
     };
-    let size_solo = file_size(&path_solo);
+    let size_solo = file_size(&path_solo)?;
     print_engine_row("solo(2000 only)", &stats_solo, size_solo);
 
     // (b) 768 + 2000 次元テーブル共存 DB。
@@ -319,7 +323,7 @@ fn run_part_b() {
         drop(core);
         stats
     };
-    let size_coexist = file_size(&path_coexist);
+    let size_coexist = file_size(&path_coexist)?;
     print_engine_row("coexist(768+2000)", &stats_coexist, size_coexist);
 
     let delta_pct = |a: Duration, b: Duration| -> f64 {
@@ -333,9 +337,10 @@ fn run_part_b() {
         "coexistence overhead (p95, coexist vs solo): {:+.1}%",
         delta_pct(stats_coexist.p95, stats_solo.p95)
     );
+    Ok(())
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
     run_part_a();
-    run_part_b();
+    run_part_b()
 }
