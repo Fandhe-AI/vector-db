@@ -22,8 +22,9 @@
 //! RRF で融合するハイブリッド検索。対象ビヘイビア: SEARCH-1, SEARCH-3。
 //! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-133（`rls.rs`。
 //! `PolicyContext`（TASK-124）と接続する事前フィルタ方式のテナント境界コア実装。対象
-//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` へのキャッシュ統合は
-//! 後続タスクの管轄）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
+//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` は TASK-169
+//! （`core::PrefilterCache`）経由でこのインデックスをキャッシュし世代整合を保った上で
+//! 再利用する）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
 //! 検索時フィルタ方式によるテナント境界フォールバック。対象ビヘイビア: RLS-1, RLS-3。
 //! `PrefilterIndex`（TASK-133）との使い分けは呼び出し元の責務）・TASK-107
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
