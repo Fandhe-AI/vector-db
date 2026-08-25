@@ -12,7 +12,7 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::{
-    bump_generation_and_commit, decode_row, encode_row, Row, RowInput, Storage, StorageError,
+    commit_write_txn, decode_row, encode_row, Row, RowInput, Storage, StorageError,
     BATCH_LOG_TABLE, ROWS_TABLE,
 };
 
@@ -84,7 +84,10 @@ impl Storage {
     /// 制御を検討すること（[`Storage::begin_batch_write`] も同じ排他ロック契約）。
     pub fn begin_write(&self) -> crate::storage::Result<WriteTxn> {
         let txn = self.db().begin_write()?;
-        Ok(WriteTxn { txn })
+        Ok(WriteTxn {
+            txn,
+            has_writes: false,
+        })
     }
 
     /// バッチ台帳付き書き込みトランザクションを開始する（TASK-90、対象ビヘイビア:
@@ -100,6 +103,7 @@ impl Storage {
         Ok(BatchWriteTxn {
             txn,
             pending_row_count: 0,
+            has_writes: false,
         })
     }
 }
@@ -148,27 +152,36 @@ impl ReadSnapshot {
 /// [`BatchWriteTxn`] のドキュメントコメント参照）。
 pub struct WriteTxn {
     txn: redb::WriteTransaction,
+    /// このハンドルを通じて redb の [`ROWS_TABLE`] に触れる操作（[`Self::put`]）を
+    /// 1 回でも行ったか（Issue #175・TASK-133 P2 対応）。`commit` 時にこれが
+    /// `false` なら世代カウンタを進めない判断根拠になる。**redb テーブルに触れる
+    /// 操作を本型に追加する場合は、必ずその直前で本フラグを立てること**
+    /// （立て忘れは `crate::rls::PrefilterIndex` の失効検出を素通りさせる見逃し
+    /// 失効＝RLS 相当のテナント境界チェックの fail-open に直結する P0 事項）。
+    has_writes: bool,
 }
 
 impl WriteTxn {
     /// 単一行を書き込む（commit するまで確定しない。[`Storage::put`] と同じ
-    /// upsert セマンティクス・エンコーディング契約）。
+    /// upsert セマンティクス・エンコーディング契約）。新規挿入・既存 ID への
+    /// 上書きのどちらも [`Self::has_writes`] を立てる対象とする（上書きは
+    /// tenant_id・visibility・embedding を変え得るため、`PrefilterIndex` の可視集合・
+    /// 内容に影響するため、見逃すと fail-open になる）。
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
+        self.has_writes = true;
         let mut table = self.txn.open_table(ROWS_TABLE)?;
         table.insert(id, encoded.as_slice())?;
         Ok(())
     }
 
-    /// トランザクションをコミットし、書き込みを確定する（`bump_generation_and_commit`
-    /// 経由。TASK-133 P1 対応）。呼び出し元が 1 度も [`Self::put`] を呼ばずに commit した
-    /// 場合も世代を進める（TASK-133 P2 対応の判断: 「実際に書き込みがあったか」を
-    /// `WriteTxn` に持たせるには専用の追跡カウンタが要り、`BatchWriteTxn`
-    /// （`pending_row_count`）と同種の複雑さを持ち込む。`catalog.rs::insert_rows_into_table`
-    /// の空バッチ経路のような呼び出し元が明確に判定できるケースのみを対象に是正し、
-    /// 本型は fail-closed（過剰な失効はあっても見逃しはない）を優先して現状維持する）。
+    /// トランザクションをコミットし、書き込みを確定する（[`commit_write_txn`]
+    /// 経由。TASK-133 P1・Issue #175 対応）。[`Self::put`] を 1 度も呼ばずに
+    /// commit した場合は世代カウンタを進めない（実書き込みがなければ
+    /// `PrefilterIndex` を失効させる理由がない）。1 度でも呼んでいれば
+    /// （上書きのみの場合を含む）必ず世代を進める。
     pub fn commit(self) -> crate::storage::Result<()> {
-        bump_generation_and_commit(self.txn)
+        commit_write_txn(self.txn, self.has_writes)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
@@ -224,6 +237,16 @@ pub struct BatchWriteTxn {
     /// という契約を保証する（PR #129 codex レビュー PRRT_kwDOUAKASM6bbQ7l・
     /// PRRT_kwDOUAKASM6bbc_I 対応）。
     pending_row_count: u64,
+    /// このハンドルを通じて redb のテーブル（[`ROWS_TABLE`]・[`BATCH_LOG_TABLE`]）に
+    /// 触れる操作（[`Self::put`]・[`Self::log_batch`]）を 1 回でも行ったか（Issue #175・
+    /// TASK-133 P2 対応）。`pending_row_count` は「直近の `log_batch` 以降の未台帳
+    /// 新規挿入数」であり `log_batch` 後は 0 に戻る・上書きを数えないため、これを
+    /// 「一度も書き込んでいないか」の判定には使えない（`pending_row_count == 0` の
+    /// commit を no-op と誤認すると、上書きのみのバッチや `log_batch` 済みバッチの
+    /// 世代更新を見逃す fail-open になる）。本フラグを別途持つのはそのため。
+    /// **redb テーブルに触れる操作を本型に追加する場合は、必ずその直前で本フラグを
+    /// 立てること**（立て忘れは `WriteTxn` の同名フィールドと同じ理由で P0）。
+    has_writes: bool,
 }
 
 impl BatchWriteTxn {
@@ -237,6 +260,11 @@ impl BatchWriteTxn {
     /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
+        // 新規挿入・上書きのどちらも実書き込みとして扱う（Issue #175。
+        // `pending_row_count` の増分条件とは独立に立てる。上書きのみのバッチは
+        // `pending_row_count` が増えないため、これを根拠にすると commit で
+        // 世代を進め忘れる fail-open になる）。
+        self.has_writes = true;
         let mut table = self.txn.open_table(ROWS_TABLE)?;
         let previous = table.insert(id, encoded.as_slice())?;
         if previous.is_none() {
@@ -285,6 +313,9 @@ impl BatchWriteTxn {
         if self.pending_row_count == 0 {
             return Err(StorageError::EmptyBatch);
         }
+        // ここから先は redb の `BATCH_LOG_TABLE` に触れる（Issue #175）。
+        // 上の `EmptyBatch` 早期 return は redb に一切触れないため対象外。
+        self.has_writes = true;
         let mut table = self.txn.open_table(BATCH_LOG_TABLE)?;
         if table.get(batch_seq)?.is_some() {
             return Err(StorageError::DuplicateBatchSeq(batch_seq));
@@ -303,22 +334,266 @@ impl BatchWriteTxn {
     /// してよい（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm4・PRRT_kwDOUAKASM6bbyWf
     /// 対応）。
     ///
-    /// `put`/`log_batch` を 1 度も呼ばずに commit した場合（`pending_row_count == 0`）も
-    /// 世代を進める（TASK-133 P2 対応の判断: `pending_row_count` は直近の `log_batch`
-    /// 以降の未記録件数であり 0 は「未記録行がない」ことしか意味せず「一度も書き込んで
-    /// いない」こととは区別できないため、これを根拠に世代更新をスキップすると、実際に
-    /// 書き込み済みのバッチを誤って no-op 扱いする回帰を生みかねない。[`WriteTxn::commit`]
-    /// と同じ理由で fail-closed 優先の現状維持とする）。
+    /// 世代カウンタの制御は `has_writes`（[`Self::put`]・[`Self::log_batch`] のいずれかを
+    /// 1 回でも呼んだか）で判断し、[`commit_write_txn`] に委譲する（Issue #175・
+    /// TASK-133 P2 対応）。`pending_row_count == 0` を「一度も書き込んでいない」判定に
+    /// **使わない**: `log_batch` 成功後や上書きのみのバッチでも 0 になり得るため、これを
+    /// 根拠にすると実際に書き込み済みのバッチを誤って no-op 扱いし、世代更新を見逃す
+    /// fail-open になる（`has_writes` を導入した理由そのもの）。
     pub fn commit(self) -> crate::storage::Result<()> {
         if self.pending_row_count != 0 {
             return Err(StorageError::UnloggedRows(self.pending_row_count));
         }
-        bump_generation_and_commit(self.txn)
+        commit_write_txn(self.txn, self.has_writes)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
     pub fn abort(self) -> crate::storage::Result<()> {
         self.txn.abort()?;
         Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    //! `WriteTxn`/`BatchWriteTxn` の commit 経路が「実書き込みの有無」に基づいて
+    //! 世代カウンタを制御することを検証する（Issue #175・TASK-133 P2 対応）。
+    //! 見逃し失効（fail-open）方向の退行がないことを重点的に確認する
+    //! （上書きのみの commit・`log_batch` 済みで `pending_row_count == 0` の commit を
+    //! no-op と誤認しないケース）。
+
+    use super::*;
+    use crate::storage::{RowInput, Visibility};
+
+    /// テストごとに一意な DB ファイルパスを払い出す（storage.rs の同名ヘルパーと同じ方針）。
+    fn unique_db_path(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "vector-db-engine-txn-{label}-{}-{seq}.redb",
+            std::process::id()
+        ));
+        path
+    }
+
+    struct CleanupGuard(std::path::PathBuf);
+    impl Drop for CleanupGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_txn_commit_without_put_does_not_bump_generation() {
+        let path = unique_db_path("write-noop");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let txn = storage.begin_write().expect("begin_write");
+        txn.commit().expect("commit without put");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            0,
+            "put を 1 度も呼ばない commit は世代を進めないこと"
+        );
+    }
+
+    #[test]
+    fn write_txn_commit_with_new_row_bumps_generation() {
+        let path = unique_db_path("write-new-row");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            },
+        )
+        .expect("put");
+        txn.commit().expect("commit with put");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            1,
+            "新規行の put を伴う commit は世代を進めること"
+        );
+    }
+
+    #[test]
+    fn write_txn_commit_with_overwrite_of_existing_id_bumps_generation() {
+        let path = unique_db_path("write-overwrite");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("initial put");
+        let generation_after_setup = storage.current_generation().expect("current_generation");
+
+        // 既存 ID を tenant_id・embedding を変えて上書き。上書きは pending_row_count
+        // のような新規カウンタでは検出できないため、fail-open ガードとして重要
+        // （2.1 節「実書き込みの定義」参照）。
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-b",
+                visibility: Visibility::Private,
+                embedding: &[9.0],
+                metadata: &[],
+            },
+        )
+        .expect("overwrite put");
+        txn.commit().expect("commit with overwrite");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            generation_after_setup + 1,
+            "既存 ID への上書き put を伴う commit は世代を進めること（fail-open ガード）"
+        );
+    }
+
+    #[test]
+    fn write_txn_abort_after_put_does_not_bump_generation() {
+        let path = unique_db_path("write-abort");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            },
+        )
+        .expect("put");
+        txn.abort().expect("abort");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            0,
+            "put 後の abort は書き込みを破棄し世代を進めないこと（既存挙動の固定）"
+        );
+    }
+
+    #[test]
+    fn batch_write_txn_commit_without_put_or_log_batch_does_not_bump_generation() {
+        let path = unique_db_path("batch-noop");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.commit().expect("commit without put/log_batch");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            0,
+            "put/log_batch を 1 度も呼ばない commit は世代を進めないこと"
+        );
+    }
+
+    #[test]
+    fn batch_write_txn_commit_after_put_and_log_batch_bumps_generation() {
+        let path = unique_db_path("batch-put-log");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            },
+        )
+        .expect("put");
+        txn.log_batch(0).expect("log_batch");
+        txn.commit()
+            .expect("commit with pending_row_count == 0 after log_batch");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            1,
+            "log_batch 済みで pending_row_count == 0 の commit も世代を進めること"
+        );
+    }
+
+    #[test]
+    fn batch_write_txn_commit_with_overwrite_only_bumps_generation() {
+        let path = unique_db_path("batch-overwrite-only");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("initial put");
+        let generation_after_setup = storage.current_generation().expect("current_generation");
+
+        // 新規挿入が 0 件（既存 ID の上書きのみ）なので pending_row_count は 0 の
+        // ままであり、log_batch は不要（呼ぶと EmptyBatch で拒否される）。
+        // pending_row_count を根拠にすると commit で世代更新を見逃す核心ケース。
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(
+            1,
+            &RowInput {
+                tenant_id: "tenant-b",
+                visibility: Visibility::Private,
+                embedding: &[9.0],
+                metadata: &[],
+            },
+        )
+        .expect("overwrite put");
+        txn.commit().expect("commit with overwrite-only batch");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            generation_after_setup + 1,
+            "上書きのみ（新規挿入 0 件）の commit も世代を進めること（fail-open ガード）"
+        );
+    }
+
+    #[test]
+    fn batch_write_txn_rejected_empty_log_batch_then_commit_does_not_bump_generation() {
+        let path = unique_db_path("batch-empty-log-batch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        let result = txn.log_batch(0);
+        assert!(matches!(result, Err(StorageError::EmptyBatch)));
+        txn.commit().expect("commit after rejected log_batch");
+
+        assert_eq!(
+            storage.current_generation().expect("current_generation"),
+            0,
+            "EmptyBatch で拒否された log_batch は redb に触れないため、\
+             その後の commit は世代を進めないこと"
+        );
     }
 }
