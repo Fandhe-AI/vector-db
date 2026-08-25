@@ -279,6 +279,31 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// 現在位置のトークンが `Token::Ident` かつ大文字小文字を区別せず `word` と
+    /// 一致するかを消費せずに判定する。TASK-161（SQL-12）修正: `USING`・`SET` は
+    /// 字句解析段階では予約語化せず（[`lexer`] のモジュールコメント参照）、構文上
+    /// その語が必須の位置でのみ本メソッドで文脈的にキーワードとして判定する。
+    /// これにより、それ以外の識別子位置（`FROM`・投影・`ORDER BY` 等）では
+    /// `using`・`set` を従来どおり通常の識別子として扱える。
+    fn peek_ident_matches(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case(word))
+    }
+
+    /// 現在位置が `Token::Ident` かつ大文字小文字を区別せず `word` と一致する場合のみ
+    /// 消費して成功とする。TASK-161（SQL-12）修正: `SET` を statement 先頭という
+    /// 文脈でのみキーワードとして判定するために使う（[`Parser::peek_ident_matches`]
+    /// 参照）。
+    fn expect_ident_matching(&mut self, word: &str) -> Result<(), SqlSurfaceError> {
+        if !self.peek_ident_matches(word) {
+            let other = self.peek();
+            return Err(SqlSurfaceError::unsupported(format!(
+                "expected '{word}', got {other:?}"
+            )));
+        }
+        self.advance();
+        Ok(())
+    }
+
     fn expect_string_literal(&mut self) -> Result<String, SqlSurfaceError> {
         match self.advance() {
             Some(Token::StringLiteral(s)) => Ok(s.clone()),
@@ -422,14 +447,16 @@ impl<'a> Parser<'a> {
     }
 
     /// `LIMIT n` 直後の省略可能な文末専用句 `USING MODE '<literal>'`（TASK-161・
-    /// SQL-12）。`USING` キーワードが続かなければ句なし（`Ok(None)`）として扱う。
+    /// SQL-12）。`USING` は字句解析段階のキーワードではなく `Ident` のため、
+    /// [`Parser::peek_ident_matches`] で文脈的（この位置限定）に判定する。続かなければ
+    /// 句なし（`Ok(None)`）として扱う。
     /// `USING` の直後は `MODE`（大文字小文字非区別の文脈識別子）のみ許可し、それ以外
     /// （将来 TASK-77/80 が追加する `PLAN`・`OPERATION_ID` 等）は fail-closed に拒否
     /// する（未実装の拡張点を黙って受理しない）。句を高々 1 回だけ消費するため、
     /// 2 回目以降の `USING MODE ...` は本メソッドではなく後続の
     /// [`Parser::expect_end_of_statement`] が「余剰トークン」として拒否する。
     fn parse_using_clause(&mut self) -> Result<Option<String>, SqlSurfaceError> {
-        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Using))) {
+        if !self.peek_ident_matches("USING") {
             return Ok(None);
         }
         self.advance();
@@ -516,7 +543,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
 fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
-    p.expect_keyword(Keyword::Set)?;
+    p.expect_ident_matching("SET")?;
     let name = p.expect_ident()?;
     if !name.eq_ignore_ascii_case("search_mode") {
         return Err(SqlSurfaceError::unsupported(format!(
@@ -542,6 +569,10 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
+    // `SET` は字句解析段階のキーワードではなく `Ident` のため（TASK-161・SQL-12
+    // 修正）、statement 先頭という文脈でのみ大文字小文字を区別せず判定する。
+    let is_set_statement =
+        matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) => {
             let shape = parse_select_shape(&tokens)?;
@@ -558,7 +589,7 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                 search_mode: shape.search_mode,
             }))
         }
-        Some(Token::Keyword(Keyword::Set)) => {
+        _ if is_set_statement => {
             let value = parse_set_search_mode(&tokens)?;
             Ok(Statement::SetSearchMode { value })
         }
@@ -1252,5 +1283,37 @@ mod tests {
             .expect_err("unsupported variable should be rejected")
             .wire_code();
         assert_eq!(err_a, err_b);
+    }
+
+    #[test]
+    fn using_and_set_remain_usable_as_table_and_column_identifiers() {
+        // codex-review P1 の回帰テスト: `USING`／`SET` を字句解析段階で無条件に
+        // キーワード化すると、カタログ上有効な識別子（`[A-Za-z_][A-Za-z0-9_]*`）
+        // である `using`／`set` というテーブル名・列名が `FROM`・投影・`ORDER BY`
+        // などの識別子位置で使えなくなる未告知の破壊的変更になる。`USING`／`SET` が
+        // 構文上必須の位置（`LIMIT` 直後・statement 先頭）以外では、従来どおり
+        // `Ident` として通ることを確認する。
+        let lookup = catalog_with(&["using", "set"]);
+
+        // テーブル名としての `using`／`set`（FROM 句の識別子位置）。
+        let stmt = validate_statement(
+            "SELECT * FROM using ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("table named `using` should remain a valid identifier");
+        assert_eq!(stmt.table_name, "using");
+        let stmt = validate_statement(
+            "SELECT * FROM set ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("table named `set` should remain a valid identifier");
+        assert_eq!(stmt.table_name, "set");
+
+        // 投影リストの列名としての `using`／`set`。
+        validate_statement(
+            "SELECT using, set FROM using ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("columns named `using`/`set` should remain valid identifiers");
     }
 }
