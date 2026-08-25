@@ -55,12 +55,9 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
 /// [`crate::txn::BatchWriteTxn`] に一本化すること。
 ///
-/// この適用範囲は Issue #133 で解消要否を検討したうえで恒久化した契約である（書き込み経路の
-/// 統合は行わない判断。検討した代替案・将来の再評価条件は `docs/design/batch-ledger-scope.md`
-/// 参照。詳細な検出コストの評価は [`crate::txn::BatchWriteTxn`] のドキュメントコメント
-/// 「契約の適用範囲」も参照）。製品の行書き込み経路（`catalog.rs` の per-table 行テーブル）は
-/// [`ROWS_TABLE`]・本テーブルのどちらも経由しないため、本テーブルの保護対象は現状テスト・
-/// クラッシュ耐性ツール経路に限られる。
+/// この適用範囲は Issue #133 で解消要否を検討したうえで恒久化した契約である。判断・検討した
+/// 代替案の詳細は `docs/design/batch-ledger-scope.md`、対応する private spec 側の記述は
+/// `docs/spec/05-tasks.md`（TASK-90・TASK-93）参照。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
 /// ストレージ全体の書き込み世代カウンタ（TASK-133 P1・対象ビヘイビア: RLS-1〜4）。
