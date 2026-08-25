@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use wire_server::auth::{argon2id, UserStore};
 use wire_server::framing::MAX_STARTUP_LEN;
+use wire_server::limits::ConnectionLimiter;
 
 const TEST_PARAMS: argon2id::Params = argon2id::RECOMMENDED_PARAMS;
 
@@ -45,11 +46,7 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(
-                stream,
-                &store,
-                wire_server::server::POST_AUTH_IDLE_TIMEOUT,
-            );
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
@@ -67,11 +64,7 @@ fn spawn_server_accepting_one_joinable(
 
     let handle = std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(
-                stream,
-                &store,
-                wire_server::server::POST_AUTH_IDLE_TIMEOUT,
-            );
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
@@ -82,20 +75,14 @@ fn spawn_server_with_accept_loop(
     users_path: &std::path::Path,
     max_connections: usize,
     io_timeout: Duration,
-    post_auth_idle_timeout: Duration,
 ) -> std::net::SocketAddr {
     let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(max_connections);
 
     std::thread::spawn(move || {
-        wire_server::server::accept_loop(
-            listener,
-            store,
-            max_connections,
-            io_timeout,
-            post_auth_idle_timeout,
-        );
+        wire_server::server::accept_loop_with_limiter(listener, store, limiter, io_timeout);
     });
 
     addr
@@ -346,7 +333,7 @@ fn wire10_negative_startup_length_returns_08p01() {
 }
 
 /// WIRE-10: 宣言長より実送信が短い（途中切断）StartupMessage を受けても panic
-/// せず、応答なしで正常にクローズすること（`handle_connection` を包むスレッドの
+/// せず、応答なしで正常にクローズすること（`handle_connection_bounded` を包むスレッドの
 /// `join()` が `Ok` であることで確認する）。
 #[test]
 fn wire10_truncated_startup_closes_without_panic() {
@@ -393,12 +380,7 @@ fn wire10_truncated_query_after_auth_closes_without_panic() {
 #[test]
 fn wire10_malformed_connection_does_not_affect_other_connections() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let addr = spawn_server_with_accept_loop(
-        &users_path,
-        4,
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let addr = spawn_server_with_accept_loop(&users_path, 4, Duration::from_secs(5));
 
     // A: 不正な StartupMessage（負の長さ）。
     {

@@ -9,17 +9,17 @@
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
 //!
-//! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
-//! TASK-70（対象ビヘイビア WIRE-7）。
+//! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）・
+//! TASK-69（対象ビヘイビア WIRE-5, WIRE-6）・TASK-70（対象ビヘイビア WIRE-7）。
 //! `--bind` は [`wire_server::bind_guard::GuardedBindAddrs::resolve`] により、TLS 未構成
 //! （[`wire_server::bind_guard::TransportSecurity::Cleartext`]）の間は非ループバック
 //! アドレスを起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind
 //! する（TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
-//! 再解決による TOCTOU も作らない。TASK-67 review 是正・TASK-70 で移設）。接続数上限・
-//! 認証前 I/O タイムアウトは [`wire_server::server::accept_loop`] が課す。本格的な
-//! 接続管理は TASK-69 の管轄。TLS 導入（TASK-72・WIRE-9）時は
-//! [`wire_server::bind_guard::TransportSecurity`] に variant を追加し、ここで渡す値を
-//! 実行時の TLS 設定有無に応じて切り替える。
+//! 再解決による TOCTOU も作らない。TASK-67 review 是正・TASK-70 で移設）。同時接続数
+//! 上限・認証前後の読み取りタイムアウトは [`wire_server::limits`] の契約値を
+//! [`wire_server::server::accept_loop_with_limiter`] が適用する（TASK-69）。
+//! TLS 導入（TASK-72・WIRE-9）時は [`wire_server::bind_guard::TransportSecurity`]
+//! に variant を追加し、ここで渡す値を実行時の TLS 設定有無に応じて切り替える。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use wire_server::auth::{self, UserStore};
 use wire_server::bind_guard::{GuardedBindAddrs, TransportSecurity};
+use wire_server::limits;
 use wire_server::server;
 
 const DEFAULT_BIND: &str = "127.0.0.1:5432";
@@ -113,12 +114,11 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     eprintln!("wire-server: listening on {bind_addr}");
 
-    server::accept_loop(
+    server::accept_loop_with_limiter(
         listener,
         store,
-        server::MAX_CONCURRENT_CONNECTIONS,
-        server::CONNECTION_IO_TIMEOUT,
-        server::POST_AUTH_IDLE_TIMEOUT,
+        limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS),
+        limits::READ_TIMEOUT,
     );
     ExitCode::SUCCESS
 }

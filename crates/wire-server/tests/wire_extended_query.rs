@@ -141,12 +141,7 @@ fn wire8_unsupported_feature_message_type_gets_distinct_message_text() {
 #[test]
 fn wire8_rejection_releases_connection_slot() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let addr = spawn_server_with_accept_loop(
-        &users_path,
-        1,
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let addr = spawn_server_with_accept_loop(&users_path, 1, Duration::from_secs(5));
 
     let mut rejected = common::authenticate_to_ready_for_query(addr, "alice", "correct-horse");
     send_length_prefixed_message(&mut rejected, b'P', b"");

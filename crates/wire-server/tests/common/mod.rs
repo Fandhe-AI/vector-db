@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wire_server::auth::{argon2id, UserStore};
+use wire_server::limits::ConnectionLimiter;
 
 /// `UserStore::load_from_file` は Argon2id パラメータが
 /// `argon2id::RECOMMENDED_PARAMS` と完全一致するレコードのみを受理するため、
@@ -48,37 +49,27 @@ pub fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::Soc
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            let _ = wire_server::handshake::handle_connection(
-                stream,
-                &store,
-                wire_server::server::POST_AUTH_IDLE_TIMEOUT,
-            );
+            let _ = wire_server::handshake::handle_connection_bounded(stream, &store);
         }
     });
 
     addr
 }
 
-/// `wire_server::server::accept_loop` 経由でサーバースレッドを起動する
+/// `wire_server::server::accept_loop_with_limiter` 経由でサーバースレッドを起動する
 /// （接続スロット解放の確認に使う）。
 pub fn spawn_server_with_accept_loop(
     users_path: &std::path::Path,
     max_connections: usize,
     io_timeout: Duration,
-    post_auth_idle_timeout: Duration,
 ) -> std::net::SocketAddr {
     let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(max_connections);
 
     std::thread::spawn(move || {
-        wire_server::server::accept_loop(
-            listener,
-            store,
-            max_connections,
-            io_timeout,
-            post_auth_idle_timeout,
-        );
+        wire_server::server::accept_loop_with_limiter(listener, store, limiter, io_timeout);
     });
 
     addr
@@ -123,14 +114,15 @@ pub fn send_startup_message(stream: &mut TcpStream, username: &str, database: &s
 /// 接続スロットが解放されるまで短い間隔でリトライし、解放後の TCP 接続を
 /// 返す（SSLRequest の 'N' 応答まで到達した時点で解放済みと判定する）。
 ///
-/// `server::accept_loop` は同時接続数の上限を超える接続を、ハンドシェイクへ
-/// 進ませず即座にクローズする（`accept_loop` 内 `try_acquire_slot` 失敗時。
-/// `apply_io_timeout` 前に `drop(stream)` する経路）。そのため SSLRequest の
-/// 応答が 1 バイトも来ず EOF/タイムアウトになることが「スロット未解放」の
-/// 確実な合図になる。逆に 'N' が読めれば `ConnectionSlot` を確保できたことの
-/// 証拠であり、拒否された接続の write-side shutdown（drain 開始時の EOF）を
-/// 誤ってスロット解放の証拠として扱う競合を避けられる
-/// （`wire8_rejection_releases_connection_slot` のレビュー是正）。
+/// `server::accept_loop_with_limiter` は同時接続数の上限を超える接続を、ハンドシェイクへ
+/// 進ませず `limits::ConnectionLimiter::try_acquire` 失敗時に `53300` の
+/// ErrorResponse を返してから即座にクローズする（`limits::reject_too_many_connections`
+/// 経由）。そのため SSLRequest の応答が 1 バイトも来ず EOF/タイムアウトになる
+/// ことが「スロット未解放」の確実な合図になる。逆に 'N' が読めれば
+/// `ConnectionLimiter` の枠を確保できたことの証拠であり、拒否された接続の
+/// write-side shutdown（drain 開始時の EOF）を誤ってスロット解放の証拠として
+/// 扱う競合を避けられる（`wire8_rejection_releases_connection_slot` のレビュー
+/// 是正）。
 pub fn connect_after_slot_available(
     addr: std::net::SocketAddr,
     total_timeout: Duration,
@@ -149,15 +141,28 @@ pub fn connect_after_slot_available(
 
         let mut resp = [0u8; 1];
         match stream.read_exact(&mut resp) {
-            Ok(()) => {
-                assert_eq!(&resp, b"N", "server must decline SSL");
+            // 'N': ハンドシェイクへ進んだ = ConnectionLimiter の枠を確保できた。
+            Ok(()) if &resp == b"N" => {
                 stream.set_read_timeout(None).expect("clear read timeout");
                 return stream;
             }
+            // 'E': limits::reject_too_many_connections が 53300 の ErrorResponse
+            // を書いてから切断した = まだ枠が空いていない。リトライする。
+            Ok(()) => {
+                assert_eq!(
+                    &resp, b"E",
+                    "unexpected first response byte while polling for a free slot"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connection slot was not released within {total_timeout:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
             Err(_) => {
-                // over-capacity による即時クローズ、またはまだ枠が空くのを
-                // 待っている途中のタイムアウト。どちらも「未解放」として
-                // リトライする。
+                // 拒否ワーカー自体が枯渇した場合の応答なし即時クローズ、または
+                // まだ枠が空くのを待っている途中のタイムアウト。どちらも
+                // 「未解放」としてリトライする。
                 assert!(
                     std::time::Instant::now() < deadline,
                     "connection slot was not released within {total_timeout:?}"
