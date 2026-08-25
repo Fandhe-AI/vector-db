@@ -32,36 +32,11 @@ use engine::storage::{RowInput, Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
-/// テナント境界付きバッチ API（`engine::tenant::insert_rows`）はバッチ内のテナント混在を
-/// `Forbidden` で拒否するため、テナントごとに分割して投入するテスト用ヘルパ
-/// （codex-review P0 指摘・PR #194 対応で `Storage::insert_rows_into_table` は
-/// `pub(crate)` 化した）。
-fn seed_rows_grouped_by_tenant(storage: &Storage, table: &str, rows: &[(u64, RowInput<'_>)]) {
-    let mut tenants: Vec<&str> = rows.iter().map(|(_, r)| r.tenant_id).collect();
-    tenants.sort_unstable();
-    tenants.dedup();
-    for tenant in tenants {
-        let ctx =
-            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
-                .expect("valid tenant");
-        let batch: Vec<(u64, RowInput<'_>)> = rows
-            .iter()
-            .filter(|(_, r)| r.tenant_id == tenant)
-            .map(|(id, r)| {
-                (
-                    *id,
-                    RowInput {
-                        tenant_id: r.tenant_id,
-                        visibility: r.visibility,
-                        embedding: r.embedding,
-                        metadata: r.metadata,
-                    },
-                )
-            })
-            .collect();
-        engine::tenant::insert_rows(storage, table, &ctx, &batch).expect("seed rows");
-    }
-}
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
 
 // ---------- 決定的擬似乱数（xorshift64*。`tests/rls_security.rs` と同一実装） ----------
 

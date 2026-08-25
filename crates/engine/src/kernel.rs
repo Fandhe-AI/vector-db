@@ -71,6 +71,14 @@ impl std::error::Error for KernelError {}
 /// あった（他テナントのデータをそもそも provider のアドレス空間へ渡さない、という
 /// より強い境界に変更した）。
 pub struct SearchInput<'a> {
+    /// `vectors` の行と 1 対 1 に対応する識別子。**呼び出し元が定義する識別子**であり、
+    /// 行 `id` とは限らない（provider は値の意味を解釈せず、そのまま
+    /// [`SearchHit::id`] として返す）。行 `id` の一意性スコープはテナント内に閉じている
+    /// （対象ビヘイビア: TABLE-12）ため、同一 `id` の可視行が複数含まれうる文脈では
+    /// 呼び出し元が一意な識別子を渡す責務を負う: SQL 表層（`sql::exec`）は候補アリーナの
+    /// スロット番号を渡し（投影・RRF 融合・疎コーパスの結合キーを一意にするため）、
+    /// `core::EngineCore::search` は行 `id` をそのまま渡す（結果を id で返す契約のため。
+    /// 重複しうることは `VectorCore::search` のドキュメント参照）。
     pub ids: &'a [u64],
     /// `ids.len() * dim` 要素のフラット化済みベクトル（行 i の embedding は
     /// `vectors[i * dim .. (i + 1) * dim]`）。可視行のみを含む（上記構造体ドキュメント
