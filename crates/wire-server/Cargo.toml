@@ -1,12 +1,18 @@
-# wire-server: PostgreSQL wire プロトコル v3 互換の自作実装を持つバイナリクレート。
+# wire-server: PostgreSQL wire プロトコル v3 互換の自作実装を持つクレート。
 # engine（コアロジック）を呼び出す接続ハンドリング層（.claude/rules/delegation-impl.md 参照）。
 # 外部プロトコルライブラリには依存しない方針（.claude/rules/dependency-policy.md）。
+# lib+bin 構成（TASK-67）: 結合テスト（tests/）が内部モジュールを利用できるよう、
+# バイナリのロジックは lib.rs 側に置き、main.rs は薄い CLI 層に留める。
 [package]
 name = "wire-server"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[lib]
+name = "wire_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "wire-server"
