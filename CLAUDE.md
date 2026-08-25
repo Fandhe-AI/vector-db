@@ -9,7 +9,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - クレート構成: `engine`（コアロジック）＋ `wire-server`（lib+bin）の workspace（`crates/`）
 - 永続化: `redb` ベース / 安全性: RLS 相当のテナント境界・fail-closed のエラー契約（`wire_code`）
 - 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）
-- ステータス: workspace 雛形構築済み（TASK-66）。wire プロトコル層は実装済み（TASK-67・TASK-68・TASK-69・TASK-70・TASK-71）。他は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜154）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
+- ステータス: workspace 雛形構築済み（TASK-66）。wire プロトコル層は実装済み（TASK-67・TASK-68・TASK-69・TASK-70・TASK-71）。SQL 表層は許可リスト検証（TASK-74）・束縛と実行計画（TASK-75）・取得モード切替構文（TASK-161）まで実装済み。他は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜165）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
 
 ## Repository Structure
 
@@ -28,7 +28,7 @@ vector-db/
 │   ├── design/                    # 設計ドキュメント（ADR 形式・public）
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
-│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check + cross-check（aarch64 クロスコンパイル確認）の CI
+│   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check + sort-determinism-check + cross-check（aarch64 クロスコンパイル確認）の CI
 │   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 まで opt-in）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は Issue #178 まで opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）
 │   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
@@ -38,7 +38,7 @@ vector-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_cross_table.sh 等。make 経由で実行）
+├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_cross_table.sh・check_sort_determinism.sh 等。make 経由で実行）
 ├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
 └── crates/                        # engine（lib）/ wire-server（lib+bin）workspace
 ```

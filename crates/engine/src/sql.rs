@@ -18,9 +18,28 @@
 //!   [`crate::rls::RlsSafetyNet`]（TASK-136）による最終安全網の二重適用を維持し、
 //!   `HINT` で外せない。TASK-76・SQL-7・RLS-5）
 //! - [`exec`][]: 実行計画（既定 RLS→SCALAR→DISTANCE、`HINT ORDER` 指定時は [`plan`] に従う）
+//! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
+//!   （TASK-161・SQL-12）
+//!
+//! TASK-161（対象ビヘイビア: SQL-12）: クエリ単位の専用句 `USING MODE '<literal>'`
+//! （[`allowlist`]）とセッション変数 `SET search_mode = '<literal>'`（同）を追加し、
+//! 優先順位（クエリ句 > セッション変数 > 既定）の解決を [`mode::resolve_mode`] に
+//! 集約した。`core.rs::EngineCore::execute_sql_in_session` が接続単位の
+//! [`mode::SessionState`] を受け取って呼び出す新しい公開 API で、既存の
+//! `execute_sql`（セッションなし）は空のセッションでこれへ委譲する。
 
 pub mod allowlist;
 pub mod exec;
 pub mod lexer;
+pub mod mode;
 pub mod parser;
 pub mod plan;
+
+/// `EngineCore::execute_sql_in_session`（TASK-161）の成功応答。`SELECT` は
+/// [`exec::QueryResult`] を、`SET search_mode` は解決前の設定値
+/// （[`mode::SearchMode`]）そのものを返す。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SqlOutcome {
+    Query(exec::QueryResult),
+    SetSearchMode(mode::SearchMode),
+}

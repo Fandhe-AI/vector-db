@@ -623,6 +623,41 @@ mod tests {
         assert!((fused[0].score - fused[1].score).abs() < 1e-15);
     }
 
+    // TASK-84（対応 Issue #61）: PoC-10 が指摘した「同点タイブレーク欠如による
+    // 非決定性」の回帰テスト。密のみ・疎のみそれぞれの同一順位（rank）は
+    // `dense_weight == sparse_weight` の既定設定下で同一 RRF スコアになる
+    // （モジュールドキュメントの RRF 定義参照）。rank 0〜2 の 3 段で
+    // 密のみ／疎のみのペアを 1 組ずつ作り（計 6 id、3 段の同点グループ）、
+    // `rrf_fuse` が返す順序が「スコア降順・各同点グループ内は id 昇順」を
+    // 常に満たすことを検証する。 `hybrid_search` の `truncate(k)` はこの
+    // 順序をそのまま使うため（`hybrid_search` doc コメント参照）、本テストで
+    // 順序そのものの決定性を保証すればグループ途中の `k` 切断でも
+    // 非決定性は生じない。
+    #[test]
+    fn rrf_fuse_multiple_tie_groups_are_ordered_score_desc_id_asc() {
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        // 各 rank の密側 id は疎側 id より大きい値にして、
+        // 「挿入順（id 降順に並べても）と無関係に id 昇順が保たれる」ことを
+        // 別途確認できるようにする。
+        let dense = [hit(20, 3.0), hit(21, 2.0), hit(22, 1.0)];
+        let sparse = [doc(10, 3.0), doc(11, 2.0), doc(12, 1.0)];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        assert_eq!(fused.len(), 6);
+        // rank 0 ペア (20, 10) が最上位の同点グループ、rank 2 ペア (22, 12) が
+        // 最下位の同点グループになるはず。
+        assert_eq!(
+            fused.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![10, 20, 11, 21, 12, 22]
+        );
+        for window in fused.windows(2) {
+            let (a, b) = (&window[0], &window[1]);
+            assert!(
+                a.score > b.score || (a.score - b.score).abs() < 1e-15,
+                "fused must be sorted by score descending: {fused:?}"
+            );
+        }
+    }
+
     #[test]
     fn rrf_fuse_applies_weights() {
         let cfg = RrfConfig::new(60.0, 2.0, 1.0, 10).unwrap();

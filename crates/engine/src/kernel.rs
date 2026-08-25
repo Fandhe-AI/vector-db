@@ -362,6 +362,35 @@ mod tests {
         assert_eq!(hits, vec![SearchHit { id: 1, score: 1.0 }]);
     }
 
+    // TASK-84（対応 Issue #61）: PoC-10 が指摘した「同点タイブレーク欠如による
+    // 非決定性」の回帰テスト。`tied_scores_prefer_smaller_id_at_selection_boundary`
+    // は k=1（単一勝者）のみを検証するため、本テストは k>1 で複数件が採用される
+    // 場合の順序全体（id 昇順）を検証する。挿入順は id 降順（シャッフル相当）で
+    // 与え、`push` の走査順に依存せず結果が id 昇順になることを確認する。
+    #[test]
+    fn tied_scores_are_ordered_by_id_ascending_when_multiple_survive() {
+        let ids = [5u64, 4, 3, 2, 1];
+        // 5 行とも同スコア（内積はすべて 1.0）。
+        let vectors = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let query = [1.0, 0.0];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query,
+            k: 3,
+        };
+        let hits = CpuScalarProvider.search(input).expect("search ok");
+        assert_eq!(
+            hits,
+            vec![
+                SearchHit { id: 1, score: 1.0 },
+                SearchHit { id: 2, score: 1.0 },
+                SearchHit { id: 3, score: 1.0 },
+            ]
+        );
+    }
+
     #[test]
     fn dim_mismatch_query_is_rejected() {
         let ids = [1u64];

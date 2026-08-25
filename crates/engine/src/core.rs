@@ -689,28 +689,101 @@ impl EngineCore {
         ctx: &PolicyContext,
         sql: &str,
     ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
-        let stmt = crate::sql::allowlist::validate_statement(sql, &self.storage)?;
-        let read_txn = self.storage.db().begin_read().map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: format!(
-                    "failed to begin read transaction: {}",
-                    StorageError::from(e)
-                ),
+        // セッション変数を持たない後方互換 API（TASK-75 由来）。`SET search_mode` 等
+        // セッションを要する statement はこのエントリポイントでは受理しない
+        // （黙った no-op にしない）。
+        //
+        // statement 種別の判定を [`crate::sql::allowlist::validate_sql`] で先に行い、
+        // `SetSearchMode` はリテラル値の妥当性を検証する前に一律 `42601` で拒否する
+        // （codex-review P1 指摘対応: 以前は `execute_sql_in_session` へ委譲していたため、
+        // 内部で `SearchMode::parse_literal` が先に走り、無効なリテラル値（例:
+        // `SET search_mode = 'fuzzy'`）は `22000` を返す一方、有効な値は `42601` を
+        // 返すという、同じ「このエントリポイントでは非対応」の statement が値によって
+        // 異なるエラーコードを返す非決定的な契約になっていた。fail-closed の観点でも
+        // エラー契約は入力の意味論的妥当性に関わらず一貫させるべきであり、statement
+        // 種別のみで判定する）。
+        match crate::sql::allowlist::validate_sql(sql, &self.storage)? {
+            crate::sql::allowlist::Statement::SetSearchMode { .. } => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "SET search_mode requires a session-aware entry point",
+                ))
             }
-        })?;
-        let schema =
-            crate::catalog::get_table_schema_in_txn(&read_txn, &stmt.table_name).map_err(|e| {
-                match e {
-                    CatalogError::TableNotFound(name) => {
-                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+            crate::sql::allowlist::Statement::Select(_) => {
+                // `SELECT` と判定済みのため、[`Self::execute_sql_in_session`] が
+                // `SqlOutcome::SetSearchMode` を返すことはない（同一 `sql` を
+                // `validate_sql` で 2 度構文解析するが、副作用のない決定的なパースの
+                // ため安全側に倒した単純さを優先する）。
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_) => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected SetSearchMode outcome for a statement already classified as Select"
+                                .to_string(),
+                        })
                     }
-                    other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!("failed to load table schema: {other}"),
-                    },
                 }
-            })?;
-        let bound = crate::sql::parser::bind(&stmt, &schema)?;
-        crate::sql::exec::execute_statement(&read_txn, self.provider.as_ref(), ctx, &schema, &bound)
+            }
+        }
+    }
+
+    /// 接続（セッション）単位の [`crate::sql::mode::SessionState`] を受け取って SQL 文を
+    /// 実行する（TASK-161・SQL-12 の公開 API）。`wire-server` の接続ハンドラ
+    /// （TASK-73・TASK-165 の管轄）が 1 接続につき 1 個の `SessionState` を所有し、
+    /// クエリのたびに `&mut` で本メソッドへ渡す想定（`EngineCore` 自体は
+    /// セッション状態を保持しない。接続間でモードが混線しない構造を型で担保する
+    /// ため。`sql::mode` モジュールドキュメント参照）。
+    ///
+    /// `SET search_mode = '<literal>'` はリテラル値が `recall`／`precision` のいずれか
+    /// である場合にのみ `session` を更新する（検証→代入の順）。失敗した `SET` は
+    /// `session` を一切変更しない（部分更新＝黙った既定化と同種の fail-open を防ぐ）。
+    pub fn execute_sql_in_session(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        sql: &str,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
+        match stmt {
+            crate::sql::allowlist::Statement::SetSearchMode { value } => {
+                let mode = crate::sql::mode::SearchMode::parse_literal(&value)?;
+                session.set_search_mode(mode);
+                Ok(crate::sql::SqlOutcome::SetSearchMode(mode))
+            }
+            crate::sql::allowlist::Statement::Select(validated) => {
+                let read_txn = self.storage.db().begin_read().map_err(|e| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!(
+                            "failed to begin read transaction: {}",
+                            StorageError::from(e)
+                        ),
+                    }
+                })?;
+                let schema =
+                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to load table schema: {other}"),
+                            },
+                        })?;
+                let bound = crate::sql::parser::bind_with_session(
+                    &validated,
+                    &schema,
+                    session.search_mode(),
+                )?;
+                let result = crate::sql::exec::execute_statement(
+                    &read_txn,
+                    self.provider.as_ref(),
+                    ctx,
+                    &schema,
+                    &bound,
+                )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+        }
     }
 
     /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。

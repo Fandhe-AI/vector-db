@@ -69,6 +69,12 @@
 //! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
 //! （詳細は `sql.rs` モジュールドキュメント参照）。
 //!
+//! TASK-161（対象ビヘイビア: SQL-12）: `sql::mode` が取得モード（`recall`／
+//! `precision`）の構文（`USING MODE` 句・`SET search_mode`）・優先順位解決
+//! （クエリ句 > セッション変数 > 既定）・接続単位の `SessionState` を提供する。
+//! `core::EngineCore::execute_sql_in_session` がこれを束ねる新しい公開 API（詳細は
+//! `sql.rs`・`sql/mode.rs` モジュールドキュメント参照）。
+//!
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
 //!
