@@ -302,7 +302,7 @@ fn new_core(storage: Storage) -> EngineCore {
 /// ケースでの順序保持は検証しない（それは HINT ORDER 自体の実行結果が RLS 段の
 /// 位置に依存せず安定していることの検証）。安全網が drop を伴っても部分列として
 /// 順序を保つことは §1（`RlsSafetyNet::apply` を直接駆動する
-/// `safety_net_matches_independent_oracle_across_visibility_and_tenants` 等）の
+/// `safety_net_independently_removes_disallowed_hits_from_unfiltered_arena`）の
 /// subsequence 検証でカバー済み。
 #[test]
 fn execute_sql_hint_order_rls_last_matches_default_order() {
