@@ -16,7 +16,8 @@
 //! （Issue #34 レビュー指摘対応）。単一の加算順序を構造的に保証するため
 //! `dot` を共有する形へ変更し、並列化のみを本 provider の役割とする
 //! （`std::thread::scope`（stable）による行範囲分割。外部からのスレッド数・
-//! カーネル選択の上書き機構は設けない。CORE-12 の方針）。
+//! カーネル選択の上書き機構は設けない。CORE-12 の方針。実行経路自体の決定表は
+//! `dispatch.rs::select_execution_path`（TASK-155・CORE-11, 12）に集約する）。
 //!
 //! 同時実行クエリ間の合計ワーカースレッド数は [`GLOBAL_WORKER_BUDGET`]（プロセス全体で
 //! 共有する `AtomicUsize`）で調停する（Issue #34 レビュー指摘対応。security.md

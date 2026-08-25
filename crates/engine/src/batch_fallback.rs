@@ -13,6 +13,12 @@
 //! CPU-SIMD 経路（`kernel.rs::CpuScalarProvider` と同じ選出規約）と構成的に
 //! 一致する。
 //!
+//! 本モジュールが担うのは「選択後の実行時 fail-safe」（primary 失敗→CPU 縮退）であり、
+//! 「実行前の経路選択」自体は `dispatch.rs::select_execution_path`（TASK-155・
+//! CORE-11, 12）が担う想定である。両者は排他ではなく直列（決定表→実行→縮退）の
+//! 責務分担になる設計だが、`select_execution_path` から本モジュールを実際に呼び出す
+//! 配線は後続タスクの管轄（本タスク時点では未接続）。
+//!
 //! [`BatchBackend`] は将来の実 GPU/外部実装が差し込まれる公開差し替え点であり、
 //! `Ok` を返した場合でも [`FallbackBatchEngine`] はその内容を無条件に信頼しない
 //! （codex-review P0 指摘対応・PR #152）。primary が成功を返しても、
