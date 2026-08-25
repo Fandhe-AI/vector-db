@@ -22,6 +22,15 @@ use crate::sql::lexer::{self, Keyword, LexError, Token};
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。
 const MAX_ERROR_DETAIL_LEN: usize = 200;
 
+/// `parse_arg_list` が許容する丸括弧の最大ネスト深さ。字句解析側に入力長・ネスト
+/// 段数の上限がないため、`expect_value` を深さごとに保持するスタック（`Vec<bool>`）
+/// は攻撃者が選ぶ入れ子段数に比例してヒープを消費しうる。このモジュールは
+/// ネストした関数呼び出しの意味を一切解釈しない設計であり、正当な入力が
+/// この深さを超えることはないため、上限超過は無制限リソース確保を防ぐため
+/// fail-closed に拒否する（coding-rust.md「untrusted 入力の扱い」・security.md
+/// 「不安全な設計」対応）。
+const MAX_ARG_NESTING_DEPTH: usize = 32;
+
 fn truncate_for_error(s: &str) -> String {
     if s.len() <= MAX_ERROR_DETAIL_LEN {
         return s.to_string();
@@ -287,39 +296,57 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Token::Punct(')'))) {
             return Ok(());
         }
-        let mut depth: u32 = 0;
-        // `expect_value`: depth 0（呼び出し直下）で次に来るべきトークンが値
-        // （`Ident`/`StringLiteral`/`Number`/`(` で始まる入れ子）か、区切り `,` /
-        // 終端 `)` かを追跡する。旧実装は消費済みトークンの直後を無条件に
-        // `peek()` で覗いて `_ => continue` していたため、区切りカンマなしの
-        // 連続トークン（`embedding 'q'`）・カンマのみの空要素列（`,,,`）・
-        // 先頭/末尾カンマ（`embedding,`）が構造検証を素通りしていた
-        // （Issue #55 レビュー指摘）。値の直後は `,` か `)` のみ、`,` の直後は
-        // 値のみを要求することで、これらをすべて構造エラーとして拒否する。
-        let mut expect_value = true;
+        // `expect_value` を丸括弧の深さごとに独立したスタックで追跡する。
+        // 先頭要素（index 0）が呼び出し直下（depth 0）、以降 `(` を消費するたびに
+        // 新しいフレームを push し、値/区切りの期待状態をネストの深さごとに
+        // 独立させる。旧実装は `depth == 0` の場合しか検査していなかったため、
+        // 入れ子丸括弧の内側（`depth >= 1`）では区切り規律が無効化されており、
+        // `hybrid_rrf((foo('q')))` や `hybrid_rrf((a b c))` のように 1 段カッコで
+        // 包むだけで「識別子直後の `(` を拒否する」契約や区切りカンマ必須の構造
+        // 検証をバイパスできた（Issue #55 レビュー指摘）。各深さのフレームで同じ
+        // 規律（値の直後は `,` か `)` のみ、`,` の直後は値のみ）を適用することで
+        // ネストの深さに関係なく一貫して拒否側に倒す。
+        let mut expect_value: Vec<bool> = vec![true];
         loop {
+            // untrusted 入力由来のトークン列を解析するため、スタックの取得は
+            // 常に `last_mut()` の `Option` 経路で行い、空スタックによる panic を防ぐ
+            // （coding-rust.md: 受信データ経路での unwrap/expect/添字アクセス禁止）。
             match self.advance() {
                 Some(Token::Ident(_)) | Some(Token::StringLiteral(_)) | Some(Token::Number(_)) => {
-                    if depth == 0 {
-                        if !expect_value {
-                            return Err(SqlSurfaceError::unsupported(
-                                "expected ',' or ')' between argument list values",
-                            ));
-                        }
-                        expect_value = false;
-                    }
-                }
-                Some(Token::Punct('(')) => {
-                    if depth == 0 && !expect_value {
+                    let cur = expect_value.last_mut().ok_or_else(|| {
+                        SqlSurfaceError::unsupported("internal argument list depth underflow")
+                    })?;
+                    if !*cur {
                         return Err(SqlSurfaceError::unsupported(
                             "expected ',' or ')' between argument list values",
                         ));
                     }
-                    depth = depth.saturating_add(1);
+                    *cur = false;
+                }
+                Some(Token::Punct('(')) => {
+                    let cur = expect_value.last_mut().ok_or_else(|| {
+                        SqlSurfaceError::unsupported("internal argument list depth underflow")
+                    })?;
+                    if !*cur {
+                        // 識別子や値の直後に区切りカンマなしで `(` が続く形
+                        // （`foo(...)` 等）。関数呼び出しのネストは解釈しないため拒否。
+                        return Err(SqlSurfaceError::unsupported(
+                            "expected ',' or ')' between argument list values",
+                        ));
+                    }
+                    // 入れ子丸括弧グループ全体を現在の深さの 1 値として扱う。
+                    *cur = false;
+                    if expect_value.len() >= MAX_ARG_NESTING_DEPTH {
+                        return Err(SqlSurfaceError::unsupported(
+                            "argument list nesting depth exceeds the allowed maximum",
+                        ));
+                    }
+                    expect_value.push(true);
                 }
                 Some(Token::Punct(')')) => {
-                    if depth == 0 {
-                        if expect_value {
+                    if expect_value.len() <= 1 {
+                        let cur = expect_value.last().copied().unwrap_or(true);
+                        if cur {
                             return Err(SqlSurfaceError::unsupported(
                                 "unexpected ')' in argument list: missing value",
                             ));
@@ -330,21 +357,26 @@ impl<'a> Parser<'a> {
                         self.pos = self.pos.saturating_sub(1);
                         return Ok(());
                     }
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        // 入れ子丸括弧が閉じ、depth 0 の 1 値として完結した。
-                        expect_value = false;
+                    // 入れ子フレームを閉じる。空グループ（`()`）は値として認めず拒否する。
+                    let closed_frame_expects_value = expect_value.pop().ok_or_else(|| {
+                        SqlSurfaceError::unsupported("internal argument list depth underflow")
+                    })?;
+                    if closed_frame_expects_value {
+                        return Err(SqlSurfaceError::unsupported(
+                            "unexpected ')' in argument list: missing value",
+                        ));
                     }
                 }
                 Some(Token::Punct(',')) => {
-                    if depth == 0 {
-                        if expect_value {
-                            return Err(SqlSurfaceError::unsupported(
-                                "unexpected ',' in argument list: missing value",
-                            ));
-                        }
-                        expect_value = true;
+                    let cur = expect_value.last_mut().ok_or_else(|| {
+                        SqlSurfaceError::unsupported("internal argument list depth underflow")
+                    })?;
+                    if *cur {
+                        return Err(SqlSurfaceError::unsupported(
+                            "unexpected ',' in argument list: missing value",
+                        ));
                     }
+                    *cur = true;
                 }
                 other => {
                     return Err(SqlSurfaceError::unsupported(format!(
@@ -607,6 +639,43 @@ mod tests {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, foo('q')) LIMIT 5",
         );
+    }
+
+    #[test]
+    fn rejects_hybrid_args_identifier_followed_by_paren_wrapped_in_nested_group() {
+        // Issue #55 レビュー指摘の再現ケース: 識別子直後の `(` を拒否する契約は、
+        // 呼び出し直下（depth 0）だけでなく入れ子丸括弧の内側（depth >= 1）でも
+        // 同様に働かなければならない。1 段カッコで包むだけでバイパスできてはならない。
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf((foo('q'))) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_hybrid_args_without_comma_separator_inside_nested_group() {
+        // 同上: 区切りカンマなしの連続トークン（`a b c`）も入れ子丸括弧の内側で
+        // 拒否されなければならない（depth 0 の `hybrid_rrf(a b c)` と対称であること）。
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf((a b c)) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_hybrid_args_empty_nested_paren_group() {
+        // 入れ子丸括弧の空グループ（`()`）は値として認めない。
+        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY hybrid_rrf(()) LIMIT 5");
+    }
+
+    #[test]
+    fn rejects_hybrid_args_nesting_depth_beyond_maximum() {
+        // untrusted 入力による無制限の入れ子でスタックが際限なく伸びないよう、
+        // ネスト深さに上限を設けて fail-closed に拒否する。
+        let opens = "(".repeat(MAX_ARG_NESTING_DEPTH + 1);
+        let closes = ")".repeat(MAX_ARG_NESTING_DEPTH + 1);
+        let sql = format!(
+            "SELECT * FROM documents ORDER BY hybrid_rrf({opens}embedding{closes}) LIMIT 5"
+        );
+        assert_rejected_as_syntax_error(&sql);
     }
 
     #[test]
