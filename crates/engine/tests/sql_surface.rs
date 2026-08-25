@@ -446,15 +446,21 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
             Some(b) => Value::Text(b.to_string()),
             None => Value::Null,
         };
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), value],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), value],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
