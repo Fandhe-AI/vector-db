@@ -57,7 +57,14 @@ impl SearchMode {
 /// 拡張点（クエリ句 > セッション変数 > プランナー推定 > 既定 の優先順位に合わせ、
 /// `SessionVariable` と `Default` の間へ新しい variant を追加する想定。本タスク
 /// （TASK-161）では未実装）。
+///
+/// `#[non_exhaustive]`: 将来 TASK-164 で `PlannerEstimate` 等の variant を追加した際、
+/// クレート外の `match` 式が網羅性エラーでコンパイル不能になる破壊的変更を防ぐ
+/// （AGENTS.md「公開 API・エラー契約の互換性（P1）」。PR #188 レビュー指摘対応:
+/// `BoundStatement`／`ValidatedStatement` と同種の拡張点保護）。クレート外で本 enum を
+/// `match` する場合は `_ => ...` 等のワイルドカードアームが必須になる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModeSource {
     QueryClause,
     SessionVariable,
@@ -65,10 +72,36 @@ pub enum ModeSource {
 }
 
 /// 優先順位解決を終えた実効モードと、その指定元。
+///
+/// `#[non_exhaustive]`: 本構造体に将来フィールドを追加しても（例:
+/// `ModeSource::PlannerEstimate` 導入時の付随情報）、既存の構造体リテラル構築コードが
+/// 必須フィールド不足でコンパイル不能になる破壊的変更を防ぐ（PR #188 レビュー指摘
+/// 対応: `BoundStatement`／`ValidatedStatement` と同種の拡張点保護）。フィールドは
+/// カプセル化のため `pub(crate)` とし、クレート外からの構築は [`ResolvedMode::new`]、
+/// 読み取りは [`ResolvedMode::mode`]／[`ResolvedMode::source`] を経由する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ResolvedMode {
-    pub mode: SearchMode,
-    pub source: ModeSource,
+    pub(crate) mode: SearchMode,
+    pub(crate) source: ModeSource,
+}
+
+impl ResolvedMode {
+    /// クレート外から解決済みモードを構築する constructor（`resolve_mode` を経ない
+    /// テスト・拡張コード向け）。
+    pub fn new(mode: SearchMode, source: ModeSource) -> Self {
+        Self { mode, source }
+    }
+
+    /// 解決された実効モード。
+    pub fn mode(&self) -> SearchMode {
+        self.mode
+    }
+
+    /// 実効モードの指定元。
+    pub fn source(&self) -> ModeSource {
+        self.source
+    }
 }
 
 /// クエリ句・セッション変数それぞれの解決済み値から実効モードを決定する
