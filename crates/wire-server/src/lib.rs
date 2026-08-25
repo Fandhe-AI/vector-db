@@ -9,11 +9,14 @@
 //! モジュール構成:
 //! - [`auth`]: ユーザーストア・Argon2id 照合・`PolicyContext` へのテナント導出（WIRE-2, WIRE-3）
 //! - [`handshake`]: TCP 接続ごとのメッセージ読み書き・StartupMessage・認証フロー（WIRE-1）
-//! - [`server`]: bind アドレスの loopback 検証・接続受け付けループ・同時接続数の
-//!   有界化・I/O タイムアウト（review 是正。本格的な接続管理は TASK-69）
+//! - [`server`]: bind アドレスの loopback 検証・接続受け付けループ（WIRE-5, WIRE-6 の
+//!   契約適用は [`limits`] に委譲）
+//! - [`limits`]: 読み取りタイムアウト・共有接続数リミッター（TASK-69・WIRE-5, WIRE-6）
 //!
-//! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
+//! 対応: TASK-67（対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）・TASK-69
+//! （対象ビヘイビア WIRE-5, WIRE-6）（ポインタ: `docs/spec/05-tasks.md`）。
 
 pub mod auth;
 pub mod handshake;
+pub mod limits;
 pub mod server;

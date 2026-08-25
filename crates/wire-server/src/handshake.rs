@@ -15,7 +15,6 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
 
 use crate::auth::{self, UserStore};
 
@@ -401,21 +400,18 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
     }
 }
 
-/// 1 接続ぶんのハンドシェイク・認証・最小クエリループ全体。`main.rs` の
-/// 接続受け付けスレッドから呼ばれる。戻り値の `Err` はネットワーク I/O 異常
-/// （クライアント切断等）を表し、呼び出し元はログのみでスレッドを終了してよい
-/// （他接続には影響させない）。
+/// 1 接続ぶんのハンドシェイク・認証・最小クエリループ全体。`server::accept_loop`
+/// の接続受け付けスレッドから呼ばれる。戻り値の `Err` はネットワーク I/O 異常
+/// （クライアント切断・読み取りタイムアウト等）を表し、呼び出し元はログのみで
+/// スレッドを終了してよい（他接続には影響させない）。
 ///
-/// `post_auth_idle_timeout` は認証成功後に read/write タイムアウトとして設定する
-/// 値（`server::POST_AUTH_IDLE_TIMEOUT` 相当。呼び出し元の `server::accept_loop` が
-/// 決める）。認証前フェーズのタイムアウトは呼び出し元がソケットへ設定済みの前提
-/// （`server::CONNECTION_IO_TIMEOUT`）で、本関数はそれを認証成功時にこの値へ
-/// 切り替える。
-pub fn handle_connection(
-    mut stream: TcpStream,
-    store: &UserStore,
-    post_auth_idle_timeout: Duration,
-) -> io::Result<()> {
+/// 読み取りタイムアウト（`limits::READ_TIMEOUT`）は呼び出し元の `server::accept_loop`
+/// が受理直後に一度だけソケットへ設定済みであり、本関数はそれを認証前後で
+/// 変更しない（WIRE-5: 接続全体に同一の期限を適用する）。タイムアウト由来の
+/// `io::Error`（`TimedOut` / `WouldBlock`）はここで捕捉して ErrorResponse を書く
+/// ことはせず、そのまま `Err` として呼び出し元へ返す（応答なしでクローズする
+/// ことが WIRE-5 の契約）。
+pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
     let username = match negotiate_startup(&mut stream) {
         Ok(u) => u,
         Err(HandshakeError::Io(e)) => return Err(e),
@@ -458,16 +454,8 @@ pub fn handle_connection(
             Ok(())
         }
         Ok(ctx) => {
-            // `server::accept_loop` が認証前フェーズの Slowloris 対策として設定した
-            // I/O タイムアウトを、認証後専用の緩い `post_auth_idle_timeout` へ
-            // 切り替える。無期限（`None`）にすると、有効な資格情報を持つクライアント
-            // が接続を張ったまま何も送らないことで接続枠を永久占有できてしまう
-            // （review 指摘）。本タイムアウトはあくまで暫定防御であり、本格的な
-            // セッション生存期間管理（keepalive・利用パターンに応じた期限調整等）は
-            // TASK-69（WIRE-8）の管轄とする。
-            stream.set_read_timeout(Some(post_auth_idle_timeout))?;
-            stream.set_write_timeout(Some(post_auth_idle_timeout))?;
-
+            // 読み取りタイムアウトは `server::accept_loop` が接続全体に一度だけ
+            // 設定済み（WIRE-5）であり、ここで切り替えない。
             write_authentication_ok(&mut stream)?;
             // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、
             // 暗号学的な強さは要求しない。プロセス ID とプロセス内カウンタで十分。

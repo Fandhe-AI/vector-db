@@ -6,7 +6,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wire_server::auth::{argon2id, UserStore};
@@ -50,47 +49,16 @@ fn spawn_server_accepting_one(users_path: &std::path::Path) -> std::net::SocketA
 
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            // このヘルパーを使うテストは post-auth アイドルの挙動を検証しないため、
-            // 本番既定値をそのまま使う。
-            let _ = wire_server::handshake::handle_connection(
-                stream,
-                &store,
-                wire_server::server::POST_AUTH_IDLE_TIMEOUT,
-            );
+            let _ = wire_server::handshake::handle_connection(stream, &store);
         }
     });
 
     addr
 }
 
-/// `wire_server::server::accept_loop` 経由でサーバースレッドを起動し、接続先アドレス
-/// を返す。`spawn_server_accepting_one` と異なり、認証前フェーズ・認証後フェーズの
-/// Slowloris 対策（同時接続数上限・I/O タイムアウト）を実際に適用した状態で
-/// ハンドシェイクを検証するために使う（review 指摘: 認証前タイムアウトが認証後
-/// セッションへ引き継がれないこと・認証後にも別の緩いアイドル期限が働くことの
-/// 回帰確認）。
-fn spawn_server_with_accept_loop(
-    users_path: &std::path::Path,
-    max_connections: usize,
-    io_timeout: Duration,
-    post_auth_idle_timeout: Duration,
-) -> std::net::SocketAddr {
-    let store = Arc::new(UserStore::load_from_file(users_path).expect("valid user store"));
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-
-    std::thread::spawn(move || {
-        wire_server::server::accept_loop(
-            listener,
-            store,
-            max_connections,
-            io_timeout,
-            post_auth_idle_timeout,
-        );
-    });
-
-    addr
-}
+// `wire_server::server::accept_loop` 経由（同時接続数上限・読み取りタイムアウトを
+// 実際に適用した状態でのハンドシェイク検証）は WIRE-5/WIRE-6 固有の関心事のため
+// `tests/wire_limits.rs` へ集約した（D1: 本ファイルは認証フロー自体の検証に専念する）。
 
 /// SSLRequest → 'N' → StartupMessage(protocol 3.0, user=...) を送るクライアント側の
 /// 共通シーケンス。
@@ -317,176 +285,10 @@ fn wire2_database_param_does_not_affect_authentication_outcome() {
     }
 }
 
-/// レビュー指摘の再現ケース: `server::accept_loop` の認証前 I/O タイムアウトは
-/// StartupMessage を送らない接続には引き続き働くが、認証成功後のセッションには
-/// 適用され続けないこと（対話的クライアント・コネクションプールの正当なアイドルを
-/// 切断しない）。
-#[test]
-fn wire_pre_auth_timeout_still_applies_but_post_auth_session_survives_idle() {
-    // 認証ハンドシェイク自体がこの区間内（`short_timeout` 未満）で完了する前提の
-    // pre-auth タイムアウト。CI・高負荷環境でのスケジューリング遅延を吸収できる
-    // 余裕を持たせる（150ms は高負荷時に地の文の read/write が間に合わず
-    // 誤ってタイムアウトする flake の実例があったため 300ms に引き上げた）。
-    let short_timeout = Duration::from_millis(300);
-    // post-auth 用のタイムアウトは、このテストが使うアイドル区間（`short_timeout * 3`）
-    // より十分に長く取り、pre-auth タイムアウトが引き継がれていないことだけを検証する
-    // （post-auth タイムアウト自体の発火は別テストで検証する）。
-    let post_auth_idle_timeout = short_timeout * 10;
-    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let addr = spawn_server_with_accept_loop(&users_path, 4, short_timeout, post_auth_idle_timeout);
-
-    // 1) 認証前タイムアウトは引き続き働く: 何も送らない接続は
-    //    `short_timeout` 経過後にサーバー側から切断される。
-    {
-        let mut stalled = TcpStream::connect(addr).expect("connect stalled");
-        std::thread::sleep(short_timeout * 3);
-        let mut buf = [0u8; 1];
-        let n = stalled.read(&mut buf).unwrap_or(0);
-        assert_eq!(
-            n, 0,
-            "pre-auth idle connection must still be closed by the server-side timeout"
-        );
-    }
-
-    // 2) 認証成功後のセッションは、認証前タイムアウトの何倍もアイドルしても
-    //    切断されないこと。アイドル後に簡易クエリを送っても正常に応答が返る
-    //    （EOF にならない）ことで生存を確認する。
-    {
-        let mut stream = TcpStream::connect(addr).expect("connect for auth");
-        send_ssl_request_and_startup(&mut stream, "alice", "db");
-        let _ = read_auth_request_type(&mut stream);
-        send_password_message(&mut stream, "correct-horse");
-
-        let mut header = [0u8; 1];
-        stream.read_exact(&mut header).expect("read auth ok type");
-        if header[0] != b'R' {
-            // `wire2_...` と同様、失敗時は SQLSTATE・本文を含めて診断する
-            // （認証タイムアウトの誤発火なら `08P01`、認証そのものの不一致なら
-            // `28P01` になるはずで、原因の切り分けに使う）。
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).expect("read len");
-            let len = i32::from_be_bytes(len_buf) as usize;
-            let mut body = vec![0u8; len.saturating_sub(4)];
-            stream.read_exact(&mut body).expect("read body");
-            let body_str = String::from_utf8_lossy(&body);
-            panic!(
-                "expected AuthenticationOk ('R'); got message type {:?}, body: {body_str:?}",
-                header[0] as char
-            );
-        }
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).expect("read len");
-        let mut code_buf = [0u8; 4];
-        stream.read_exact(&mut code_buf).expect("read code");
-        assert_eq!(i32::from_be_bytes(code_buf), 0, "AuthenticationOk expected");
-
-        // ReadyForQuery まで読み飛ばす。
-        let mut msg_type = read_message_type_discarding_body(&mut stream);
-        let mut safety = 0;
-        while msg_type != b'Z' {
-            safety += 1;
-            assert!(safety < 20, "too many messages before ReadyForQuery");
-            msg_type = read_message_type_discarding_body(&mut stream);
-        }
-
-        // 認証前タイムアウトの何倍もアイドルする（クリアされていなければ、
-        // ここで接続が切断されているはず）。
-        std::thread::sleep(short_timeout * 3);
-
-        // アイドル後に簡易クエリを送り、EOF ではなく正常な応答
-        // （未実装 ErrorResponse）が返ることで接続が生きていることを確認する。
-        let mut query = Vec::new();
-        query.push(b'Q');
-        let body = b"SELECT 1\0";
-        let total_len = (4 + body.len()) as i32;
-        query.extend_from_slice(&total_len.to_be_bytes());
-        query.extend_from_slice(body);
-        stream
-            .write_all(&query)
-            .expect("send simple query after idling past the pre-auth timeout window");
-
-        let mut resp_header = [0u8; 1];
-        stream.read_exact(&mut resp_header).expect(
-            "post-auth session must still be open after idling past the pre-auth timeout window",
-        );
-        assert_eq!(
-            resp_header[0], b'E',
-            "expected ErrorResponse (simple query not yet implemented), not a closed connection"
-        );
-    }
-}
-
-/// レビュー指摘の再現ケース: 認証成功後のセッションにも `post_auth_idle_timeout`
-/// が働き、期限超過で正常にクローズされ接続枠が解放されること（有効な資格情報を
-/// 持つクライアントが接続を張ったまま何も送らないことで `max_connections` の枠を
-/// 永久占有できないことの回帰確認）。
-#[test]
-fn wire_post_auth_session_is_closed_and_slot_released_after_idle_timeout() {
-    let pre_auth_timeout = Duration::from_secs(5); // このテストでは発火させない
-    let post_auth_idle_timeout = Duration::from_millis(150);
-    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
-    let addr =
-        spawn_server_with_accept_loop(&users_path, 1, pre_auth_timeout, post_auth_idle_timeout);
-
-    // 認証を完了させ、枠(1)を占有する。
-    let mut authenticated = TcpStream::connect(addr).expect("connect for auth");
-    send_ssl_request_and_startup(&mut authenticated, "alice", "db");
-    let _ = read_auth_request_type(&mut authenticated);
-    send_password_message(&mut authenticated, "correct-horse");
-
-    let mut header = [0u8; 1];
-    authenticated
-        .read_exact(&mut header)
-        .expect("read auth ok type");
-    assert_eq!(header[0], b'R');
-    let mut len_buf = [0u8; 4];
-    authenticated.read_exact(&mut len_buf).expect("read len");
-    let mut code_buf = [0u8; 4];
-    authenticated.read_exact(&mut code_buf).expect("read code");
-    assert_eq!(i32::from_be_bytes(code_buf), 0, "AuthenticationOk expected");
-
-    let mut msg_type = read_message_type_discarding_body(&mut authenticated);
-    let mut safety = 0;
-    while msg_type != b'Z' {
-        safety += 1;
-        assert!(safety < 20, "too many messages before ReadyForQuery");
-        msg_type = read_message_type_discarding_body(&mut authenticated);
-    }
-
-    // 枠(1)を占有した状態で 2 本目を張ると、上限超過で即座にクローズされること
-    // （タイムアウト前の基準点。`accept_loop_closes_connection_immediately_when_over_capacity`
-    // と同じ確認）。
-    {
-        let mut second = TcpStream::connect(addr).expect("connect second before timeout");
-        let mut buf = [0u8; 1];
-        let n = second.read(&mut buf).unwrap_or(0);
-        assert_eq!(
-            n, 0,
-            "slot must still be held by the authenticated session before its idle timeout elapses"
-        );
-    }
-
-    // 認証済み接続を何も送らずに保持し、post-auth アイドルタイムアウトの経過を待つ。
-    std::thread::sleep(post_auth_idle_timeout * 3);
-    let mut buf = [0u8; 1];
-    let n = authenticated.read(&mut buf).unwrap_or(0);
-    assert_eq!(
-        n, 0,
-        "authenticated session must be closed after its idle timeout elapses"
-    );
-
-    // 枠が解放されているため、3 本目は即座には閉じられないこと（読み取りが
-    // 短いプローブ猶予以内に WouldBlock することで、「即座に EOF」ではなく
-    // 「接続を受理して待機している」ことを確認する）。
-    let mut third = TcpStream::connect(addr).expect("connect third after timeout");
-    third
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .expect("set client read timeout");
-    let mut buf3 = [0u8; 1];
-    let err = third.read(&mut buf3).expect_err("no data sent yet");
-    assert_eq!(
-        err.kind(),
-        std::io::ErrorKind::WouldBlock,
-        "connection after the post-auth idle timeout must not be closed immediately (slot must be freed)"
-    );
-}
+// D1（TASK-69）: 認証前後で二段のタイムアウトを持つ前提のテスト
+// （wire_pre_auth_timeout_still_applies_but_post_auth_session_survives_idle /
+// wire_post_auth_session_is_closed_and_slot_released_after_idle_timeout）は、
+// 読み取りタイムアウトを接続全体へ単一値で適用する契約（WIRE-5）への変更に伴い
+// 前提が消えたため撤去した。置換先は `tests/wire_limits.rs` の
+// `wire5_pre_auth_idle_is_closed_without_response` /
+// `wire5_post_auth_idle_is_closed_without_response_and_permit_released`。
