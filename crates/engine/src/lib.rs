@@ -61,6 +61,10 @@
 //! サイズクラス別・総量上限・グローバル LRU で管理するプールを提供し、
 //! `batch_search.rs::run_batch_search` の行デコード用スクラッチバッファがこれを
 //! 経由する（詳細は `buffer_pool.rs` モジュールドキュメント参照）。
+//!
+//! TASK-74（対象ビヘイビア: SQL-8）: `sql.rs` が SQL 表層の入口。受信 SQL テキストに
+//! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
+//! （詳細は `sql.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -78,6 +82,7 @@ pub mod rls;
 pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
+pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;

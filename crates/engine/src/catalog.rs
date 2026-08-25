@@ -20,11 +20,15 @@
 //! 挿入時に本モジュールの [`TableSchema::validate_embedding_dim`] で宣言次元との
 //! 完全一致を検証する。次元検証はここで完結し、RLS ポリシー評価（可視性判定）は
 //! 従来どおり呼び出し元（TASK-133 以降）の責務のまま変えない。
+//!
+//! `sql::allowlist` との関係（TASK-74、対象ビヘイビア: SQL-8）: `impl TableLookup for
+//! Storage`（本ファイル下部）が SQL 表層の FROM テーブル存在確認を橋渡しする。
 
 use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
 use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -77,9 +81,17 @@ const MAX_LIST_TABLES: usize = 10_000;
 pub enum CatalogError {
     /// `redb` 側で発生したエラー（I/O・トランザクション競合等）。
     Backend(redb::Error),
-    /// 識別子・型・次元数・カタログ値のフォーマットが不正（TABLE-6）。
-    /// 欠落フィールド・未知の型・不正次元・区切り文字混入等をすべてここに集約する。
+    /// 識別子・型・次元数のフォーマットが不正（TABLE-6）。呼び出し側（ユーザー入力の
+    /// 識別子・スキーマ定義）が渡した値そのものの検証失敗であり、`detail` は
+    /// 呼び出し元が把握済みの情報のみを含む。
     Invalid(String),
+    /// redb に格納済みのカタログ値（[`decode_schema`]）のデコードに失敗した。
+    /// ユーザーが今回渡した入力の構文エラーではなく、ストレージ側の破損・想定外の
+    /// 格納状態を示す。`detail` には格納済みバイト列由来の断片（`cols_line` 等）が
+    /// 含まれ得るため、`Invalid` と区別し、wire クライアントへは detail を渡さず
+    /// 汎用メッセージへ丸める（Issue #55 レビュー指摘。`.claude/rules/security.md`
+    /// 「不安全な設計」「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
+    CorruptSchema(String),
     /// 指定したテーブルがカタログに存在しない。
     TableNotFound(String),
     /// `CREATE TABLE` で同名テーブルが既に存在する（上書きしない。TABLE-4 前提）。
@@ -96,6 +108,7 @@ impl fmt::Display for CatalogError {
         match self {
             CatalogError::Backend(e) => write!(f, "catalog backend error: {e}"),
             CatalogError::Invalid(msg) => write!(f, "invalid catalog data: {msg}"),
+            CatalogError::CorruptSchema(msg) => write!(f, "corrupt catalog schema: {msg}"),
             CatalogError::TableNotFound(name) => write!(f, "table not found: {name}"),
             CatalogError::TableAlreadyExists(name) => write!(f, "table already exists: {name}"),
             CatalogError::ColumnAlreadyExists(name) => {
@@ -111,6 +124,7 @@ impl std::error::Error for CatalogError {
         match self {
             CatalogError::Backend(e) => Some(e),
             CatalogError::Invalid(_)
+            | CatalogError::CorruptSchema(_)
             | CatalogError::TableNotFound(_)
             | CatalogError::TableAlreadyExists(_)
             | CatalogError::ColumnAlreadyExists(_)
@@ -338,7 +352,21 @@ fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
 /// redb のキー（呼び出し元が既知）から渡され、値バイト列には含まれない。
 /// 欠落フィールド・余剰フィールド・未知バージョン・不正 UTF-8・不正次元・
 /// 切り詰め・識別子違反はすべて `Err`（黙殺フォールバックしない。TABLE-6）。
+///
+/// 返すエラーは常に [`CatalogError::CorruptSchema`]（[`decode_schema_body`] が
+/// 内部で使う `validate_identifier`・`validate_vector_dim`・`validate_schema` は
+/// 汎用の `CatalogError::Invalid` を返すため、ここで格納済みデータのデコード失敗
+/// として明示的に読み替える）。呼び出し元（[`TableLookup for Storage`](Storage)）は
+/// この変換を前提に `Invalid`（ユーザー入力の識別子形式不正）と区別して wire_code を
+/// 割り当てる（Issue #55 レビュー指摘）。
 fn decode_schema(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
+    decode_schema_body(table_name, bytes).map_err(|e| match e {
+        CatalogError::Invalid(msg) => CatalogError::CorruptSchema(msg),
+        other => other,
+    })
+}
+
+fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
     if bytes.len() > MAX_CATALOG_VALUE_LEN {
         return Err(CatalogError::Invalid(format!(
             "catalog value too large: {} bytes",
@@ -777,6 +805,34 @@ impl Storage {
     }
 }
 
+/// `sql::allowlist::validate_statement`（TASK-74・SQL-8 参照）から FROM テーブルの
+/// カタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す `CatalogError`
+/// を SQL 表層のエラー契約へ分類し直し、識別子形式不正のみ拒否側（構文エラー）へ
+/// 倒す。それ以外（カタログ照会自体の失敗を含む）は受理側へ倒さず fail-closed に
+/// エラー伝播する（`.claude/rules/security.md`「不安全な設計」対応）。格納済み
+/// スキーマのデコード失敗は識別子形式不正と区別し、内部データ断片がエラー
+/// メッセージ経由で漏れないよう汎用メッセージへ丸める（security.md「情報漏えい」対応）。
+impl TableLookup for Storage {
+    fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(_) => Ok(true),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(CatalogError::Invalid(detail)) => Err(SqlSurfaceError::unsupported(format!(
+                "malformed table reference: {detail}"
+            ))),
+            Err(
+                CatalogError::Backend(_)
+                | CatalogError::CorruptSchema(_)
+                | CatalogError::TableAlreadyExists(_)
+                | CatalogError::ColumnAlreadyExists(_)
+                | CatalogError::RowNotFound(_),
+            ) => Err(SqlSurfaceError::Internal {
+                detail: "catalog lookup failed".to_string(),
+            }),
+        }
+    }
+}
+
 /// [`Storage::get_table_schema`]・[`crate::arena::VectorArena::build`]（TASK-87、
 /// 対象ビヘイビア: TABLE-8）が共有するトランザクションスコープの実装本体。
 /// `pub(crate)` で公開し、`arena.rs` が単一の `read_txn` 上でスキーマ取得と
@@ -919,7 +975,7 @@ mod tests {
         let bytes = b"v99\ncols:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
     }
 
@@ -928,7 +984,7 @@ mod tests {
         let bytes = b"v1\ncols:2\nfoo:text:-:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
     }
 
@@ -937,7 +993,7 @@ mod tests {
         let bytes = b"v1\ncols:1\nfoo:blob:-:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
     }
 
@@ -946,12 +1002,12 @@ mod tests {
         let bytes = b"v1\ncols:1\nfoo:vector:0:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
         let bytes = b"v1\ncols:1\nfoo:vector:not-a-number:0\n".to_vec();
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
     }
 
@@ -960,7 +1016,7 @@ mod tests {
         let bytes = vec![0xff, 0xfe, 0xfd];
         assert!(matches!(
             decode_schema("t", &bytes),
-            Err(CatalogError::Invalid(_))
+            Err(CatalogError::CorruptSchema(_))
         ));
     }
 
