@@ -588,9 +588,10 @@ impl<'s> SearchTimeFilter<'s> {
 
             // 可視性判定を embedding decode より前に行う（上記型ドキュメント参照。
             // `VectorArena::build_filtered` と同じ順序）。
+            // `tenant_id` は `buf` を借用した `&str`（ヒープアロケーションなし。Issue #174）。
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
-            if !ctx.is_visible(&tenant_id, visibility) {
+            if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
@@ -671,7 +672,7 @@ impl<'s> SearchTimeFilter<'s> {
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(value.value())
                     .map_err(ArenaError::from)?;
-            if ctx.is_visible(&tenant_id, visibility) {
+            if ctx.is_visible(tenant_id, visibility) {
                 count = count.checked_add(1).ok_or(ArenaError::CapacityExceeded)?;
             }
         }
@@ -690,7 +691,7 @@ impl<'s> SearchTimeFilter<'s> {
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(value.value())
                     .map_err(ArenaError::from)?;
-            if ctx.is_visible(&tenant_id, visibility) {
+            if ctx.is_visible(tenant_id, visibility) {
                 return Ok(false);
             }
         }

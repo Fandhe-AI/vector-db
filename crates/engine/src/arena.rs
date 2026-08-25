@@ -652,6 +652,7 @@ impl VectorArena {
             // 「不可視だからスキップ」と判断できないため fail-closed に伝播する
             // （`decode_row_tenant_and_visibility` のドキュメント参照。codex P0 対応・
             // Issue #137）。
+            // `tenant_id` は `buf` を借用した `&str`（ヒープアロケーションなし。Issue #174）。
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
 
@@ -660,7 +661,7 @@ impl VectorArena {
             // 不可視行の embedding が破損していても、対象テナントの検索を失敗させない
             // （他テナントの状態による可用性干渉・エラー経由の存在情報漏えいを避ける）。
             // 不可視行の破損検出自体は本関数の責務外（別経路の責務。上記ドキュメント参照）。
-            if !predicate(&tenant_id, visibility) {
+            if !predicate(tenant_id, visibility) {
                 continue;
             }
 
