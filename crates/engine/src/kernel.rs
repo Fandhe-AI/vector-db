@@ -300,7 +300,8 @@ impl TopKSelector {
         }
     }
 
-    /// 選出結果をスコア降順（同点は id 昇順）で確定して返す。
+    /// 選出結果をスコア降順（同点は候補識別子 [`CandidateHit::id`] の昇順）で確定して返す
+    /// （`docs/design/rrf-tie-break-determinism.md` の順序契約）。
     pub(crate) fn into_sorted_vec(self) -> Vec<CandidateHit> {
         let mut out: Vec<CandidateHit> = self
             .heap

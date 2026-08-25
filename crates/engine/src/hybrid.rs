@@ -266,7 +266,9 @@ impl From<SparseError> for HybridError {
 /// （両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず順位のみを
 /// 使う（RRF の定義）。
 ///
-/// 出力は融合スコア降順・同点は id 昇順（`f64::total_cmp` ベース）で確定する。
+/// 出力は融合スコア降順・同点は**候補識別子**の昇順（`f64::total_cmp` ベース）で確定する
+/// （識別子は呼び出し元定義。`sql/exec.rs` はアリーナのスロット番号を渡すため実質
+/// `(tenant_id, id)` 昇順になる。`docs/design/rrf-tie-break-determinism.md` 参照）。
 /// 各リストの長さが `cfg.pool_depth()` を超える場合は、後続のアロケーションを伴う
 /// 検証（重複検査の `BTreeSet` 構築等）へ進む前に [`HybridError::TooManyCandidates`]
 /// を返す（coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
