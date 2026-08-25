@@ -476,25 +476,42 @@ pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<V
     Ok(buf)
 }
 
-/// [`encode_scalar_columns`] の逆変換。戻り値は `schema.columns` と同じ長さ・順序を
-/// 持ち、`VECTOR` 列の位置は常に `Value::Null`（本関数はその位置のバイトを一切
-/// 読み書きしないダミー値。呼び出し元は embedding を `storage.rs::Row::embedding` から
-/// 別途参照する）。`Text` 列は [`decode_row`] と同じ規則（バッファ末尾で打ち切られた
-/// nullable 列は `Value::Null`、non-nullable は `Err`。presence タグ不正・宣言長が
-/// 残りバッファを超える場合は `Err`）でデコードする。
-pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Value>> {
-    let mut values = Vec::with_capacity(schema.columns.len());
+/// [`encode_scalar_columns`] の構造検証のみを行う borrow 版パーサー（Issue #56
+/// レビュー指摘対応・codex P1: `sql::exec::execute_statement` の `on_visible_row` は
+/// RLS/SCALAR フィルタ列・投影に不要な列も含め毎行デコードするが、旧
+/// `decode_scalar_columns` は全 `Text` 列を無条件に `to_string()` で確保していたため、
+/// 最大長 `Text` 列を多数持つスキーマでは投影が不要とする列も含め 1 行分の巨大な
+/// 一時確保が発生し得た（`.claude/rules/security.md`「不安全な設計｜無制限リソース
+/// 確保（DoS）」）。本関数は presence タグ・宣言長（[`MAX_TEXT_FIELD_LEN`] 超過）・
+/// UTF-8 妥当性をすべて検証しつつ、`Text` 値は `buf` を借用した `&str` として返し、
+/// 一切ヒープ確保しない。戻り値は `schema.columns` と同じ長さ・順序を持ち、
+/// `VECTOR` 列・`NULL` 列の位置は常に `None`。エラー種別は [`decode_row`] と同じ規則
+/// （presence タグ不正・宣言長が残りバッファを超える・末尾に余剰バイトがある場合は
+/// `Err`。バッファ末尾で打ち切られた nullable 列は欠落として許容）。
+///
+/// 呼び出し元は、フィルタ条件の突合には借用のまま使い（確保不要）、実際に投影・
+/// hybrid 本文として必要な列だけを [`Value::Text`] へ選択的に複製する
+/// （`sql::exec.rs` の `on_visible_row` 参照。累計・行単位の確保量上限はそちらが
+/// アロケーション前に検証する）。
+pub fn scan_scalar_columns<'a>(
+    schema: &TableSchema,
+    buf: &'a [u8],
+) -> Result<Vec<Option<&'a str>>> {
+    let mut values: Vec<Option<&'a str>> = Vec::new();
+    values
+        .try_reserve_exact(schema.columns.len())
+        .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
     let mut offset = 0usize;
     for column in &schema.columns {
         if matches!(column.ty, ColumnType::Vector(_)) {
-            values.push(Value::Null);
+            values.push(None);
             continue;
         }
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
                 if column.nullable {
-                    values.push(Value::Null);
+                    values.push(None);
                     continue;
                 } else {
                     return Err(RowCodecError::Invalid(format!(
@@ -516,7 +533,7 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                         column.name
                     )));
                 }
-                values.push(Value::Null);
+                values.push(None);
             }
             PRESENCE_VALUE => {
                 let len_bytes = buf
@@ -550,13 +567,11 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
                 let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
                     RowCodecError::Invalid("scalar payload truncated at text field".to_string())
                 })?;
-                let text = std::str::from_utf8(text_bytes)
-                    .map_err(|_| {
-                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                    })?
-                    .to_string();
+                let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                })?;
                 offset = text_end;
-                values.push(Value::Text(text));
+                values.push(Some(text));
             }
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -572,6 +587,39 @@ pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Val
         ));
     }
 
+    Ok(values)
+}
+
+/// [`encode_scalar_columns`] の逆変換。戻り値は `schema.columns` と同じ長さ・順序を
+/// 持ち、`VECTOR` 列の位置は常に `Value::Null`（本関数はその位置のバイトを一切
+/// 読み書きしないダミー値。呼び出し元は embedding を `storage.rs::Row::embedding` から
+/// 別途参照する）。構造検証は [`scan_scalar_columns`] に委譲し、本関数はその借用
+/// 結果を `try_reserve_exact` + `push_str` で `Value::Text` へ複製するだけの薄い
+/// ラッパー（Issue #56 レビュー指摘対応・codex P1: 全列を無条件に確保する経路は
+/// テスト・小規模スキーマ向けの汎用 API としてのみ残し、可視行を多数走査する
+/// `sql::exec.rs` の本番経路は [`scan_scalar_columns`] を直接使い不要な列を
+/// 確保しない設計へ切り替えた）。`Text` 列は [`decode_row`] と同じ規則（バッファ
+/// 末尾で打ち切られた nullable 列は `Value::Null`、non-nullable は `Err`。presence
+/// タグ不正・宣言長が残りバッファを超える場合は `Err`）でデコードする。
+pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Value>> {
+    let scanned = scan_scalar_columns(schema, buf)?;
+    let mut values: Vec<Value> = Vec::new();
+    values.try_reserve_exact(scanned.len()).map_err(|_| {
+        RowCodecError::Invalid("failed to reserve decoded scalar columns".to_string())
+    })?;
+    for slot in scanned {
+        match slot {
+            None => values.push(Value::Null),
+            Some(text) => {
+                let mut owned = String::new();
+                owned.try_reserve_exact(text.len()).map_err(|_| {
+                    RowCodecError::Invalid("failed to reserve text field".to_string())
+                })?;
+                owned.push_str(text);
+                values.push(Value::Text(owned));
+            }
+        }
+    }
     Ok(values)
 }
 
@@ -908,5 +956,76 @@ mod tests {
         let values = vec![Value::Text(huge_text)];
         let result = encode_scalar_columns(&schema, &values);
         assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    // --- scan_scalar_columns（Issue #56 レビュー指摘対応・codex P1） ----------------
+
+    #[test]
+    fn scan_scalar_columns_borrows_text_without_copying() {
+        // `Text` 値のポインタが `buf` の範囲内に収まることを確認し、`to_string()` の
+        // ような複製が発生していないことを直接検証する（不要列を確保前にスキップ
+        // する設計の核心。呼び出し元 `sql::exec.rs::on_visible_row` はこの borrow を
+        // 使って投影に不要な列を確保せずに読み飛ばす）。
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("body-text".repeat(1000)),
+            Value::Text("tag-value".to_string()),
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan scalar");
+        assert_eq!(scanned.len(), 3);
+        assert_eq!(scanned[0], None); // VECTOR 列は常に None
+        let buf_range = buf.as_ptr() as usize..buf.as_ptr() as usize + buf.len();
+        for slot in scanned.iter().skip(1) {
+            let s = slot.expect("text column must be Some");
+            let ptr = s.as_ptr() as usize;
+            assert!(
+                buf_range.contains(&ptr),
+                "scanned &str must borrow from buf, not allocate a copy"
+            );
+        }
+        assert_eq!(scanned[1], Some("body-text".repeat(1000).as_str()));
+        assert_eq!(scanned[2], Some("tag-value"));
+    }
+
+    #[test]
+    fn scan_scalar_columns_rejects_declared_length_exceeding_max_before_reading_bytes() {
+        // 宣言長が MAX_TEXT_FIELD_LEN を超える場合、残りバッファの実サイズによらず
+        // 読み出し(スライス化)より前に Err になる(borrow 版でも上限検証がバイト
+        // アクセスに先立つことを確認する)。
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let mut buf = Vec::new();
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&(MAX_TEXT_FIELD_LEN + 1).to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let result = scan_scalar_columns(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn scan_scalar_columns_skips_vector_columns_and_matches_decode_scalar_columns() {
+        // `decode_scalar_columns`（複製あり）は `scan_scalar_columns`（借用のみ）の
+        // 薄いラッパーへ再実装されたため、両者の観測結果が一致することを確認する。
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Null,
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let scanned = scan_scalar_columns(&schema, &buf).expect("scan scalar");
+        let decoded = decode_scalar_columns(&schema, &buf).expect("decode scalar");
+        assert_eq!(decoded.len(), scanned.len());
+        for (slot, value) in scanned.iter().zip(decoded.iter()) {
+            match (slot, value) {
+                (None, Value::Null) => {}
+                (Some(s), Value::Text(t)) => assert_eq!(*s, t.as_str()),
+                other => panic!("scan/decode mismatch: {other:?}"),
+            }
+        }
     }
 }

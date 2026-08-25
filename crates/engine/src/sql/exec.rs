@@ -62,6 +62,29 @@ fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize
     Ok(next)
 }
 
+/// `on_visible_row`（RLS/SCALAR 段の行フック）専用の、借用 `&str` から `String` への
+/// 選択的複製ヘルパー（Issue #56 レビュー指摘対応・codex P1: `decode_scalar_columns`
+/// の全列無条件確保を廃し、`row_codec::scan_scalar_columns` の borrow 結果から実際に
+/// 必要な列だけを複製する設計へ切り替えた本対応の中心）。累計バイト量
+/// （`budget`）を `cap` 超過なら**確保前**に `ArenaError::CapacityExceeded` として拒否し
+/// （行単位の上限は `on_visible_row` 側で行構造体分を別途計上する）、確保自体も
+/// `String::try_reserve_exact` を使うことで、論理サイズが上限内でもホスト側メモリが
+/// 実際に不足した場合に abort ではなく `Err(ArenaError::AllocationFailed)` を返す
+/// （`try_clone_text`・`arena.rs::try_reserve_exact` と同方針）。
+fn try_alloc_text_for_budget(
+    text: &str,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<String, ArenaError> {
+    *budget = try_accumulate_budget(*budget, text.len(), cap)?;
+    let mut owned = String::new();
+    owned.try_reserve_exact(text.len()).map_err(|e| {
+        ArenaError::AllocationFailed(format!("failed to reserve scalar text field: {e}"))
+    })?;
+    owned.push_str(text);
+    Ok(owned)
+}
+
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
@@ -232,12 +255,11 @@ pub fn execute_statement(
     };
 
     // 疎コーパスへ蓄積する累計文書数・バイト量。`sparse::SparseIndex::build` の上限
-    // （`MAX_CORPUS_DOCS`・`MAX_CORPUS_BYTES`）はアロケーション（`String::clone`）の
-    // *後* にしか検証できないため、本文を `sparse_docs` へ push する前にここで
-    // 同じ上限を検証する（.claude/rules/coding-rust.md「長さフィールドは上限検証して
-    // からアロケーションに使う」・security.md「不安全な設計｜無制限リソース確保
-    // （DoS）」対応。可視行数の上限は `arena::MAX_ARENA_ROWS`（最大 100 万件）だが、
-    // 疎コーパス側の上限はそれよりずっと小さいため、蓄積前の検証がないと候補集合
+    // （`MAX_CORPUS_DOCS`・`MAX_CORPUS_BYTES`）は `try_alloc_text_for_budget` が
+    // `String` 確保の**前**に検証する（.claude/rules/coding-rust.md「長さフィールドは
+    // 上限検証してからアロケーションに使う」・security.md「不安全な設計｜無制限
+    // リソース確保（DoS）」対応。可視行数の上限は `arena::MAX_ARENA_ROWS`（最大 100 万件）
+    // だが、疎コーパス側の上限はそれよりずっと小さいため、蓄積前の検証がないと候補集合
     // 構築の途中で無制限に近いメモリを確保してから拒否することになる）。
     let mut sparse_bytes: usize = 0;
 
@@ -254,10 +276,10 @@ pub fn execute_statement(
     let mut candidate_columns: HashMap<u64, Vec<Value>> = HashMap::new();
 
     // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
-    // `decode_scalar_columns` が常に `Value::Null` を積むだけ（実体は `arena` から
-    // 引く）ため対象外。この集合に含まれない列は `on_visible_row` でデコード直後に
-    // 破棄し、`candidate_columns` へ複製・保持しない（[`MAX_CANDIDATE_SCALAR_BYTES`]
-    // のドキュメント参照。投影に不要な列まで全候補分保持する P1 指摘への対応）。
+    // `scan_scalar_columns` が常に `None` を返すだけ（実体は `arena` から引く）ため
+    // 対象外。この集合に含まれない列は `on_visible_row` で借用のまま素通りし、
+    // `String` として複製・保持しない（[`MAX_CANDIDATE_SCALAR_BYTES`] のドキュメント
+    // 参照。投影に不要な列まで全候補分複製・保持する P1 指摘への対応）。
     let needed_column_indices: HashSet<usize> = bound
         .projection
         .iter()
@@ -278,57 +300,76 @@ pub fn execute_statement(
         .saturating_mul(std::mem::size_of::<Value>());
 
     let on_visible_row = |id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
-        let decoded = row_codec::decode_scalar_columns(schema, metadata)
+        // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
+        // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
+        // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
+        // 値を保持しないクエリでも 1 行分の巨大な一時確保が先に発生し得た
+        // （security.md「不安全な設計｜無制限リソース確保（DoS）」）。
+        // `scan_scalar_columns` は構造検証のみを行い `Text` 値を `metadata` 借用の
+        // `&str` として返すため、ここではヒープ確保が一切発生しない。フィルタ条件
+        // の突合も借用のまま行い、投影・hybrid 本文として実際に必要な列だけを
+        // 下のループで選択的に複製する。
+        let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
         for filter in &bound.scalar_filters {
-            match decoded.get(filter.column_index) {
-                Some(Value::Text(t)) if *t == filter.value => {}
+            match scanned.get(filter.column_index) {
+                Some(Some(t)) if *t == filter.value => {}
                 _ => return Ok(false),
             }
         }
         if is_hybrid {
             if let Some(idx) = text_column_index {
-                if let Some(Value::Text(t)) = decoded.get(idx) {
+                if let Some(Some(t)) = scanned.get(idx) {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
                         return Err(ArenaError::CapacityExceeded);
                     }
-                    let next_bytes = sparse_bytes.saturating_add(t.len());
-                    if next_bytes > crate::sparse::MAX_CORPUS_BYTES {
-                        return Err(ArenaError::CapacityExceeded);
-                    }
-                    sparse_bytes = next_bytes;
-                    sparse_docs.push((id, t.clone()));
+                    let owned = try_alloc_text_for_budget(
+                        t,
+                        &mut sparse_bytes,
+                        crate::sparse::MAX_CORPUS_BYTES,
+                    )?;
+                    sparse_docs.push((id, owned));
                 }
                 // NULL 本文は疎側に含めない（密のみへ寄与する）。
             }
         }
         // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
-        // ただし投影で実際に参照される列（`needed_column_indices`）だけを残し、
-        // それ以外は `Value::Null` に落として複製を保持しない。この行を保持することで
-        // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は列ごとに）
-        // を、それぞれのアロケーションの前に検証し、上限超過は fail-closed に
-        // `ArenaError::CapacityExceeded`（`map_arena_error` 経由で `PayloadTooLarge`）
-        // として拒否する（投影列を持たない `SELECT id ...` でも、候補行数に比例する
-        // `Vec<Value>` 構造体分だけで無制限に積み上がらないようにする）。
+        // ただし投影で実際に参照される列（`needed_column_indices`）だけを複製し、
+        // それ以外は `Value::Null` として保持する（複製しない）。行を保持することで
+        // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は
+        // 複製する列ごとに）を、それぞれの確保の**前**に検証し、上限超過は
+        // fail-closed に `ArenaError::CapacityExceeded`（`map_arena_error` 経由で
+        // `PayloadTooLarge`）として拒否する（投影列を持たない `SELECT id ...` でも、
+        // 候補行数に比例する `Vec<Value>` 構造体分だけで無制限に積み上がらない
+        // ようにする）。行単位の上限は「投影された列と hybrid 本文 1 本のみが複製
+        // 対象になる」という構造そのものが担保する（必要な列だけを、必要な分だけ
+        // 確保前に検証してから複製するため、行あたりの複製量は投影列の実バイト数
+        // を超えない）。
         candidate_scalar_bytes = try_accumulate_budget(
             candidate_scalar_bytes,
             row_struct_bytes,
             MAX_CANDIDATE_SCALAR_BYTES,
         )?;
-        let mut kept: Vec<Value> = Vec::with_capacity(decoded.len());
-        for (idx, value) in decoded.into_iter().enumerate() {
+        let mut kept: Vec<Value> = Vec::new();
+        kept.try_reserve_exact(scanned.len()).map_err(|e| {
+            ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
+        })?;
+        for (idx, slot) in scanned.into_iter().enumerate() {
             if !needed_column_indices.contains(&idx) {
                 kept.push(Value::Null);
                 continue;
             }
-            if let Value::Text(t) = &value {
-                candidate_scalar_bytes = try_accumulate_budget(
-                    candidate_scalar_bytes,
-                    t.len(),
-                    MAX_CANDIDATE_SCALAR_BYTES,
-                )?;
+            match slot {
+                None => kept.push(Value::Null),
+                Some(t) => {
+                    let owned = try_alloc_text_for_budget(
+                        t,
+                        &mut candidate_scalar_bytes,
+                        MAX_CANDIDATE_SCALAR_BYTES,
+                    )?;
+                    kept.push(Value::Text(owned));
+                }
             }
-            kept.push(value);
         }
         candidate_columns.insert(id, kept);
         Ok(true)

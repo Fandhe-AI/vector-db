@@ -454,3 +454,69 @@ fn select_star_projects_id_then_schema_column_order() {
         ]
     );
 }
+
+// --- Issue #56 レビュー指摘対応・codex P1: `decode_scalar_columns` の全列無条件
+// 確保を廃し、投影・WHERE フィルタ・hybrid 本文として必要な列だけを選択的に
+// 複製する設計への切り替え。本結合テストは `row_codec::scan_scalar_columns` の
+// 単体テスト（ポインタが `buf` 借用であること）を補完し、投影に無関係な巨大
+// `Text` 列を持つ可視行に対して、実際の SQL 実行結果（`SELECT id ...` が値を返す・
+// WHERE フィルタが投影に含まれない列でも正しく効く）が正しいことを確認する。
+
+#[test]
+fn sql2_select_id_ignores_unprojected_large_text_column() {
+    let path = unique_db_path("sql2-select-id-large-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                // 投影にも WHERE 条件にも現れない大容量 Text 列。旧実装ではこの列も
+                // `on_visible_row` の走査ごとに無条件で `to_string()` 確保していた。
+                ColumnDef::new("bio", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+
+    // 距離上位に lang != 'ja' の行を意図的に置く（sql2_where_equality と同じ
+    // under-fetch 検証意図に、投影に不要な大容量列を追加した構成）。
+    let large_bio = "x".repeat(1_000_000);
+    let rows: [(u64, [f32; 2], &str); 5] = [
+        (1, [1.0, 0.0], "en"),
+        (2, [0.99, 0.0], "en"),
+        (3, [0.9, 0.0], "ja"),
+        (4, [0.8, 0.0], "ja"),
+        (5, [0.0, 1.0], "ja"),
+    ];
+    for (id, emb, lang) in rows {
+        storage
+            .insert_typed_row(
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    Value::Vector(emb.to_vec()),
+                    Value::Text(lang.to_string()),
+                    Value::Text(large_bio.clone()),
+                ],
+            )
+            .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 2",
+        )
+        .expect("SELECT id with unrelated large Text column should succeed");
+
+    assert_eq!(result_ids(&result), vec![3, 4]);
+    for row in &result.rows {
+        assert_eq!(row.cells, vec![Cell::Integer(row.id)]);
+    }
+}
