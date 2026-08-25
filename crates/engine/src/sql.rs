@@ -14,8 +14,9 @@
 //! - [`lexer`][]: untrusted な SQL テキストの自作トークナイザ
 //! - [`allowlist`][]: 許可リスト検証本体・`SqlSurfaceError`。`HINT ORDER(...)` の構造検証も含む（TASK-76）
 //! - [`parser`][]: 許可リスト通過後の束縛（列名・型照合、ベクトルリテラル解析。TASK-75）
-//! - [`plan`][]: `HINT ORDER(...)` の評価順序規則（RLS は暗黙事前フィルタ＋最終安全網の
-//!   二重適用を維持し、`HINT` で外せない。TASK-76・SQL-7・RLS-5）
+//! - [`plan`][]: `HINT ORDER(...)` の評価順序規則（RLS は暗黙事前フィルタ＋
+//!   [`crate::rls::RlsSafetyNet`]（TASK-136）による最終安全網の二重適用を維持し、
+//!   `HINT` で外せない。TASK-76・SQL-7・RLS-5）
 //! - [`exec`][]: 実行計画（既定 RLS→SCALAR→DISTANCE、`HINT ORDER` 指定時は [`plan`] に従う）
 
 pub mod allowlist;

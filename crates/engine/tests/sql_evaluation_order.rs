@@ -384,12 +384,13 @@ fn execute_sql_rejects_malformed_hint_order_as_syntax_error() {
 }
 
 // --- 事前フィルタが HINT ORDER を生き延びることの直接検証（パーサー迂回。
-// plan::apply_rls_safety_net の純粋関数テストは crates/engine/src/sql/plan.rs の
-// 単体テストで既にカバーしている。ここでは `execute_sql` 経由で、`HINT ORDER` が
-// 候補構築時の暗黙 RLS 事前フィルタ自体を外せないことを確認する。安全網
-// （`apply_rls_safety_net`）は現状この事前フィルタと同じ候補集合から再判定する
-// ため、本テストは事前フィルタの効果を検証しており、安全網が独立に不可視行を
-// 落としていることの証明ではない） ------------------------------------------------
+// rls::RlsSafetyNet（TASK-136）の純粋関数テストは crates/engine/src/rls.rs の
+// 単体テストで、安全網単体の独立検証（無フィルタ arena による事前フィルタ迂回の
+// 模擬）は tests/rls_safety_net.rs でそれぞれカバーしている。ここでは
+// `execute_sql` 経由で、`HINT ORDER` が候補構築時の暗黙 RLS 事前フィルタ自体を
+// 外せないことを確認する。安全網（`RlsSafetyNet`）は現状この事前フィルタと同じ
+// 候補集合から再判定するため、本テストは事前フィルタの効果を検証しており、安全網が
+// 独立に不可視行を落としていることの証明ではない） ------------------------------------------------
 
 #[test]
 fn distance_leading_hint_order_does_not_bypass_implicit_rls_prefilter() {

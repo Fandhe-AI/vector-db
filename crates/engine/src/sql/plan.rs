@@ -15,15 +15,19 @@
 //! 記述に過ぎず、RLS の適用そのものを外す・弱める手段にはならない
 //! （security.md「fail-open にする変更は P0」）。
 //!
-//! 加えて、最終結果に対して [`apply_rls_safety_net`] を無条件に適用する。現状は
-//! この事前フィルタと同じ `arena`（`ctx.is_visible` を通過済みの候補集合）由来の
-//! テナント・可視性ラベルで再判定するため、今この経路単体では不可視行を追加で
-//! 落とすことはない（事前フィルタが唯一の実効的な防御線）。それでも安全網を
-//! `Option` や条件分岐で無効化できない構造にしておくのは、候補集合の構築元が
-//! 将来広がった場合（例: 事前フィルタを経由しない別経路の追加）に、その時点の
-//! `exec.rs` 側の変更漏れだけで RLS 違反が起こらないようにする構造的な歯止め
+//! 加えて、`exec.rs` は最終結果に対して [`crate::rls::RlsSafetyNet`]（TASK-136・
+//! RLS-5）を無条件に適用する。現状はこの事前フィルタと同じ `arena`
+//! （`ctx.is_visible` を通過済みの候補集合）由来のテナント・可視性ラベルで
+//! 再判定するため、今この経路単体では不可視行を追加で落とすことはない
+//! （事前フィルタが唯一の実効的な防御線）。それでも安全網を `Option` や条件分岐で
+//! 無効化できない構造にしておくのは、候補集合の構築元が将来広がった場合
+//! （例: 事前フィルタを経由しない別経路の追加）に、その時点の `exec.rs` 側の
+//! 変更漏れだけで RLS 違反が起こらないようにする構造的な歯止め
 //! （defense-in-depth）としてであり、「今の実行経路で 2 つの独立した検査が
-//! 効いている」という主張ではない。
+//! 効いている」という主張ではない。安全網の実装・witness 型（通過済み hits
+//! だけを持ち出せる型）は `rls.rs` 側の管轄（TASK-136 で `sql::plan` から
+//! 再配置）で、本モジュールはそれを分岐させる真偽値を [`ExecutionPlan`] に
+//! 持たせない設計だけを担う。
 
 /// `HINT ORDER(...)` が受理する評価段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,10 +110,10 @@ pub enum PlanError {
 }
 
 /// [`crate::sql::parser::BoundStatement`] から導出する、`exec.rs` が直接参照する
-/// 実行方針。RLS 安全網（[`apply_rls_safety_net`]）は `HINT ORDER` の内容に関わらず
-/// `exec.rs` が無条件に呼び出す契約であり、その適用有無を分岐させる真偽値は
-/// この構造体に持たせない（boolean フィールドを経由させないことで「安全網を
-/// 無効化できる `ExecutionPlan` を作れない」ことを型で保証する）。
+/// 実行方針。RLS 安全網（[`crate::rls::RlsSafetyNet`]）は `HINT ORDER` の内容に
+/// 関わらず `exec.rs` が無条件に呼び出す契約であり、その適用有無を分岐させる
+/// 真偽値はこの構造体に持たせない（boolean フィールドを経由させないことで
+/// 「安全網を無効化できる `ExecutionPlan` を作れない」ことを型で保証する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutionPlan {
     /// SCALAR 条件を候補構築時（`on_visible_row`）に事前適用するか。
@@ -127,33 +131,9 @@ impl ExecutionPlan {
     }
 }
 
-/// RLS 実行時安全網（RLS-5）。`hits`（DISTANCE 段が返した `(id, score)` の順序付き列）
-/// から、`is_visible(tenant_id, visibility)` が `false` を返す行、および
-/// `tenant_id`/`visibility` を引けない行（データ不整合。fail-closed に除去）を除く。
-///
-/// `HINT ORDER` の内容・`rls_predicate_present` の有無に関係なく `exec.rs` から
-/// 無条件に呼ばれる契約（本モジュールの先頭ドキュメント参照）。`hits` の相対順序は
-/// 保つ（`filter` ベースで安定。要素の並べ替えは行わない）。
-pub fn apply_rls_safety_net<F>(
-    hits: Vec<(u64, f64)>,
-    tenant_and_visibility: impl Fn(u64) -> Option<(String, crate::storage::Visibility)>,
-    is_visible: F,
-) -> Vec<(u64, f64)>
-where
-    F: Fn(&str, crate::storage::Visibility) -> bool,
-{
-    hits.into_iter()
-        .filter(|(id, _)| match tenant_and_visibility(*id) {
-            Some((tenant, visibility)) => is_visible(&tenant, visibility),
-            None => false,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Visibility;
 
     // --- Stage / parse_stage_name ------------------------------------------------
 
@@ -273,43 +253,5 @@ mod tests {
         let order = EvaluationOrder::try_from_stages(&[Stage::Distance, Stage::Scalar, Stage::Rls])
             .unwrap();
         assert!(!ExecutionPlan::from_evaluation_order(order).scalar_prefilter);
-    }
-
-    // --- apply_rls_safety_net -----------------------------------------------------
-
-    #[test]
-    fn safety_net_removes_invisible_ids_and_keeps_order() {
-        let hits = vec![(1, 0.1), (2, 0.2), (3, 0.3)];
-        // id=2 は tenant-b（呼び出し側の is_visible が false を返す想定）。
-        let lookup = |id: u64| -> Option<(String, Visibility)> {
-            match id {
-                1 => Some(("tenant-a".to_string(), Visibility::Public)),
-                2 => Some(("tenant-b".to_string(), Visibility::Public)),
-                3 => Some(("tenant-a".to_string(), Visibility::Private)),
-                _ => None,
-            }
-        };
-        let filtered = apply_rls_safety_net(hits, lookup, |tenant, _| tenant == "tenant-a");
-        assert_eq!(filtered, vec![(1, 0.1), (3, 0.3)]);
-    }
-
-    #[test]
-    fn safety_net_fail_closed_drops_ids_with_missing_tenant_info() {
-        let hits = vec![(1, 0.1), (99, 0.9)];
-        let lookup = |id: u64| -> Option<(String, Visibility)> {
-            if id == 1 {
-                Some(("tenant-a".to_string(), Visibility::Public))
-            } else {
-                None
-            }
-        };
-        let filtered = apply_rls_safety_net(hits, lookup, |_, _| true);
-        assert_eq!(filtered, vec![(1, 0.1)]);
-    }
-
-    #[test]
-    fn safety_net_on_empty_hits_returns_empty() {
-        let filtered: Vec<(u64, f64)> = apply_rls_safety_net(Vec::new(), |_| None, |_, _| true);
-        assert!(filtered.is_empty());
     }
 }

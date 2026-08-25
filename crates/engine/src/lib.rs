@@ -39,7 +39,9 @@
 //! の既定 provider 構築経路）・TASK-89（`tenant.rs`。行単位テナント境界の行ストア
 //! 統合層と `policy.rs::PolicyContext::is_visible`（CORE-2）との統合。対象
 //! ビヘイビア: TABLE-9, TABLE-11。詳細は `tenant.rs`・`policy.rs` の
-//! モジュールドキュメント参照）。プロトコル層
+//! モジュールドキュメント参照）・TASK-136（`rls.rs::RlsSafetyNet`。SQL 表層の実行結果
+//! に対する RLS 実行時安全網を `sql::plan` から再配置・強化。対象ビヘイビア: RLS-5）。
+//! プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!
