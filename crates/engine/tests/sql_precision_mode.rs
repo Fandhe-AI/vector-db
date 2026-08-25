@@ -426,6 +426,59 @@ fn precision_gate_applies_after_distance_first_scalar_postfilter() {
     assert_eq!(result_ids(&result), vec![2]);
 }
 
+#[test]
+fn precision_gate_fail_closed_when_postfilter_survivors_exceed_limit_based_k_eff() {
+    // codex-review / Bugbot 指摘の回帰テスト: SCALAR 事後フィルタ（DISTANCE 先行）
+    // 経路で、WHERE を満たす Top-2 が `bound.limit`（ここでは `LIMIT 1`）由来の
+    // 狭い取得件数の外側に位置するケース。修正前は DISTANCE 段が
+    // `bound.limit.max(2) == 2` 件しか取得せず、WHERE 不一致の Top-1（id1）を
+    // 除去した後に残る候補が id2 の 1 件のみになり、「Top-2 が存在しない」＝
+    // マージン条件成立と誤判定して fail-open に id2 を返していた
+    // （id2・id3 の確信度差は既定マージン閾値 0.05 未満で本来は空集合が正しい）。
+    // 事後フィルタ経路の `k_eff` を可視集合全体まで広げた修正後は、WHERE を
+    // 満たす完全な順位列（id2, id3）に対してマージン判定が行われ、空集合になる。
+    let path = unique_db_path("precision-hint-order-beyond-k-eff");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    // id1: dense Top-1（内積 1.0）だが lang != 'ja' → SCALAR 事後フィルタで除去。
+    // id2: dense Top-2（内積 0.99）・lang = 'ja'。
+    // id3: dense Top-3（内積 0.97）・lang = 'ja'。id2 との cosine 類似度差が
+    // 既定マージン閾値（0.05）未満になるよう選んだベクトル。
+    let rows: [(u64, [f32; 3], &str); 3] = [
+        (1, [1.0, 0.0, 0.0], "en"),
+        (2, [0.99, 0.1, 0.0], "ja"),
+        (3, [0.97, 0.2, 0.0], "ja"),
+    ];
+    for (id, emb, lang) in rows {
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+        )
+        .expect("insert row");
+    }
+    let core = new_core(storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sql = "SELECT * FROM docs WHERE lang = 'ja' \
+               ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1 \
+               HINT ORDER(DISTANCE, SCALAR, RLS) USING MODE 'precision'";
+    let result = core.execute_sql(&ctx, sql).expect("precision must succeed");
+    assert!(result.rows.is_empty());
+}
+
 // --- 10: fail-open 経路の不在（外部入力） -------------------------------------------
 
 #[test]

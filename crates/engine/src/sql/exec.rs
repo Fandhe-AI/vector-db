@@ -118,11 +118,13 @@ const _: () = assert!(
     "sql::exec's hybrid pool_depth derivation assumes core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH"
 );
 
-// `precision` 時の `k_eff = bound.limit.max(2)`（`LIMIT 1` でも Top-2 を取得する
-// ための下限）が常に `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に
-// 固定する（`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を
-// 検証済みのため、`k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の
-// 場合のみ）。
+// `precision` 時の `k_eff`（SCALAR 事前フィルタ経路: `bound.limit.max(2)`。
+// SCALAR 事後フィルタ経路: `arena.ids().len().clamp(2, core::MAX_SEARCH_K)`。
+// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）が常に
+// `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に固定する
+// （`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を検証済み、
+// 事後フィルタ経路は `.min(core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
+// `k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の場合のみ）。
 const _: () = assert!(
     2 <= core::MAX_SEARCH_K,
     "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"
@@ -567,10 +569,26 @@ pub fn execute_statement(
     // `precision` 時は DISTANCE 段の取得件数を `bound.limit` より広く取る
     // （`LIMIT 1` でも Top-2 を取得し、`precision::apply_gate` のマージン判定を
     // 行えるようにする。`crate::precision` モジュールドキュメント参照）。`recall`
-    // 時は従来どおり `bound.limit`。`2 <= core::MAX_SEARCH_K` は下記 `const _` で
-    // 固定するため、`k_eff` は常に provider・RRF 設定の許容範囲に収まる。
+    // 時は従来どおり `bound.limit`。
+    //
+    // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ経路）では
+    // `bound.limit.max(2)` 件だけを取得すると、事後フィルタで候補が間引かれた
+    // 結果「Top-2 が最初から存在しなかった」のか「取得件数不足で Top-2 を
+    // 取りこぼしただけ」なのかを区別できない。後者を前者と誤認すると
+    // `precision::apply_gate` が「Top-2 不在＝マージン条件成立」と誤判定し、
+    // 本来は僅差で拒否すべき候補を通す fail-open 経路になる（codex-review・
+    // Bugbot 指摘。SEARCH-9 は確信度不足時の fail-closed を要求する）。この
+    // 経路のみ可視集合全体（`arena.ids().len()`。`ImplicitRlsHook` で RLS 済み）
+    // を取得し、事後フィルタ後の残存件数が「WHERE を満たす候補の完全な順位列」
+    // になるようにする。`core::MAX_SEARCH_K` でクランプする（下記 `const _` で
+    // `2 <= core::MAX_SEARCH_K` を固定済みのため `k_eff` は常に provider・RRF
+    // 設定の許容範囲に収まる）。
     let k_eff = if is_precision {
-        bound.limit.max(2)
+        if plan.scalar_prefilter {
+            bound.limit.max(2)
+        } else {
+            arena.ids().len().clamp(2, core::MAX_SEARCH_K)
+        }
     } else {
         bound.limit
     };
