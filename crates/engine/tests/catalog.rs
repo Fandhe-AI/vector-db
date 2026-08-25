@@ -525,9 +525,13 @@ fn table6_decode_rejects_hand_crafted_invalid_catalog_bytes() {
 
         let storage = Storage::open(&path).expect("reopen storage");
         let result = storage.get_table_schema("broken");
+        // 格納済みバイト列のデコード失敗は `CatalogError::CorruptSchema`（`Invalid`
+        // とは区別。Issue #55 レビュー指摘: 前者はユーザー入力の識別子形式不正、
+        // 後者はストレージ破損で detail に生データ断片を含み得るため wire_code の
+        // 割り当てを分ける）。
         assert!(
-            matches!(result, Err(CatalogError::Invalid(_))),
-            "case {label}: expected Err(Invalid), got {result:?}"
+            matches!(result, Err(CatalogError::CorruptSchema(_))),
+            "case {label}: expected Err(CorruptSchema), got {result:?}"
         );
     }
 }

@@ -277,20 +277,53 @@ impl<'a> Parser<'a> {
     /// 括弧の対応が取れた許可トークン（識別子・文字列・数値・カンマ・入れ子丸括弧）
     /// のみで構成されているかだけを構造的に検証する（キーワード・`;` の混入は拒否。
     /// インジェクション的な文の混入を防ぐ fail-closed な設計）。
-    /// 空引数（`f()`）も許可する。
+    /// 空引数（`f()`）も許可する。カンマ区切りの `値 (',' 値)*` 構造を厳密に要求し、
+    /// 区切りカンマなしの連続トークン・カンマのみの空要素列・先頭/末尾カンマは
+    /// すべて拒否する（Issue #55 レビュー指摘）。入れ子丸括弧は識別子に隣接しない
+    /// 独立したグループ（例: `(embedding)`）としてのみ 1 値扱いとし、識別子に
+    /// 直接後続する `(`（`foo(...)` の形）はネストした関数呼び出しの解釈を
+    /// 持たないため区切りカンマなしの連結として拒否側に倒す。
     fn parse_arg_list(&mut self) -> Result<(), SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct(')'))) {
             return Ok(());
         }
         let mut depth: u32 = 0;
+        // `expect_value`: depth 0（呼び出し直下）で次に来るべきトークンが値
+        // （`Ident`/`StringLiteral`/`Number`/`(` で始まる入れ子）か、区切り `,` /
+        // 終端 `)` かを追跡する。旧実装は消費済みトークンの直後を無条件に
+        // `peek()` で覗いて `_ => continue` していたため、区切りカンマなしの
+        // 連続トークン（`embedding 'q'`）・カンマのみの空要素列（`,,,`）・
+        // 先頭/末尾カンマ（`embedding,`）が構造検証を素通りしていた
+        // （Issue #55 レビュー指摘）。値の直後は `,` か `)` のみ、`,` の直後は
+        // 値のみを要求することで、これらをすべて構造エラーとして拒否する。
+        let mut expect_value = true;
         loop {
             match self.advance() {
-                Some(Token::Ident(_)) | Some(Token::StringLiteral(_)) | Some(Token::Number(_)) => {}
+                Some(Token::Ident(_)) | Some(Token::StringLiteral(_)) | Some(Token::Number(_)) => {
+                    if depth == 0 {
+                        if !expect_value {
+                            return Err(SqlSurfaceError::unsupported(
+                                "expected ',' or ')' between argument list values",
+                            ));
+                        }
+                        expect_value = false;
+                    }
+                }
                 Some(Token::Punct('(')) => {
+                    if depth == 0 && !expect_value {
+                        return Err(SqlSurfaceError::unsupported(
+                            "expected ',' or ')' between argument list values",
+                        ));
+                    }
                     depth = depth.saturating_add(1);
                 }
                 Some(Token::Punct(')')) => {
                     if depth == 0 {
+                        if expect_value {
+                            return Err(SqlSurfaceError::unsupported(
+                                "unexpected ')' in argument list: missing value",
+                            ));
+                        }
                         // 呼び出し元の `expect_punct(')')` が消費すべき閉じ括弧に達した。
                         // `advance()` 直後で `pos >= 1` が保証されるため `saturating_sub`
                         // は防御的措置（coding-rust.md「整数演算は checked/saturating を使う」）。
@@ -298,22 +331,25 @@ impl<'a> Parser<'a> {
                         return Ok(());
                     }
                     depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        // 入れ子丸括弧が閉じ、depth 0 の 1 値として完結した。
+                        expect_value = false;
+                    }
                 }
-                Some(Token::Punct(',')) => {}
+                Some(Token::Punct(',')) => {
+                    if depth == 0 {
+                        if expect_value {
+                            return Err(SqlSurfaceError::unsupported(
+                                "unexpected ',' in argument list: missing value",
+                            ));
+                        }
+                        expect_value = true;
+                    }
+                }
                 other => {
                     return Err(SqlSurfaceError::unsupported(format!(
                         "unsupported token in argument list: {other:?}"
                     )))
-                }
-            }
-            if depth == 0 {
-                match self.peek() {
-                    Some(Token::Punct(')')) => return Ok(()),
-                    Some(Token::Punct(',')) => {
-                        self.advance();
-                        continue;
-                    }
-                    _ => continue,
                 }
             }
         }
@@ -521,6 +557,55 @@ mod tests {
             OrderByForm::FunctionCall {
                 name: "HYBRID".to_string()
             }
+        );
+    }
+
+    // parse_arg_list の区切り構造回帰テスト（Issue #55 レビュー指摘）。
+    #[test]
+    fn rejects_hybrid_args_without_comma_separator() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding 'q') LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_hybrid_args_all_commas_no_values() {
+        assert_rejected_as_syntax_error("SELECT * FROM documents ORDER BY hybrid_rrf(,,,) LIMIT 5");
+    }
+
+    #[test]
+    fn rejects_hybrid_args_trailing_comma() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding,) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn rejects_hybrid_args_leading_comma() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(,embedding) LIMIT 5",
+        );
+    }
+
+    #[test]
+    fn accepts_hybrid_args_with_nested_paren_group() {
+        // 入れ子丸括弧そのもの（identifier に隣接しない、括弧単独のグループ）は
+        // depth 0 の 1 値として引き続き許可される。identifier 直後に区切りなしで
+        // `(` が続く形（`foo(...)`）は本来の対象（区切りカンマなしの連結）に
+        // 該当するため、区切り必須のまま拒否側に倒す（このモジュールは関数呼び出しの
+        // ネストを解釈しない設計、TASK-74 計画方針）。
+        let lookup = catalog_with(&["documents"]);
+        validate_statement(
+            "SELECT * FROM documents ORDER BY hybrid_rrf((embedding), 'q') LIMIT 5",
+            &lookup,
+        )
+        .expect("standalone nested paren group argument should still be accepted");
+    }
+
+    #[test]
+    fn rejects_hybrid_args_identifier_immediately_followed_by_paren() {
+        assert_rejected_as_syntax_error(
+            "SELECT * FROM documents ORDER BY hybrid_rrf(embedding, foo('q')) LIMIT 5",
         );
     }
 
