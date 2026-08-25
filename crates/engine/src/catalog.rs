@@ -503,10 +503,17 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::NotFound(id) => CatalogError::RowNotFound(id),
         // `scan_table_page` は `MAX_SCAN_PAGE_LIMIT` で事前にクランプしているため
         // 通常この分岐には到達しない（`Storage::scan`（無制限走査）側でのみ発生しうる
-        // エラーの網羅性のためにここで扱う）。到達時の文言は「scan_table_page を使え」と
-        // 自己言及的にならないよう、呼び出し元 API 名を挙げずに一般化して書く。
+        // エラーの網羅性のためにここで扱う）。テーブルスコープの呼び出し元に対応する
+        // 正確な代替手段は `scan_table_page` なので、それを案内する。
         StorageError::ScanLimitExceeded => {
-            CatalogError::Invalid("scan limit exceeded: use a bounded page scan".to_string())
+            CatalogError::Invalid("scan limit exceeded: use scan_table_page".to_string())
+        }
+        // `Storage::scan_batch_log`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
+        // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない分岐だが
+        // `StorageError` の網羅性のためここでも扱う。台帳にはページング API が無いため
+        // 代替手段は案内しない。
+        StorageError::BatchLogLimitExceeded => {
+            CatalogError::Invalid("batch log scan limit exceeded".to_string())
         }
         // `log_batch`（バッチ台帳）専用のエラーだが、カタログ層は行テーブル
         // （`user_rows_table_name`）しか扱わずバッチ台帳を経由しない。到達しない
@@ -1281,5 +1288,29 @@ mod tests {
             &[RowCodecValue::Null],
         );
         assert!(matches!(result, Err(CatalogError::Invalid(_))));
+    }
+
+    // Issue #131: convert_storage_error の変換先文言が経路（テーブルスコープ /
+    // バッチ台帳）ごとに正確な代替手段を案内することを固定する。
+
+    #[test]
+    fn convert_storage_error_maps_scan_limit_to_table_page_guidance() {
+        let err = convert_storage_error(crate::storage::StorageError::ScanLimitExceeded);
+        match err {
+            CatalogError::Invalid(msg) => assert!(msg.contains("scan_table_page"), "{msg}"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_storage_error_maps_batch_log_limit_without_page_guidance() {
+        let err = convert_storage_error(crate::storage::StorageError::BatchLogLimitExceeded);
+        match err {
+            CatalogError::Invalid(msg) => {
+                assert!(msg.contains("batch log"), "{msg}");
+                assert!(!msg.contains("scan_page"), "{msg}");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

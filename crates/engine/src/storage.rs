@@ -122,7 +122,7 @@ pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// と同様、無制限 `Vec` 確保を避けるための契約。security.md「不安全な設計｜無制限リソース
 /// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
 /// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
-/// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する。
+/// 不要）。超過時は [`StorageError::BatchLogLimitExceeded`] で fail-closed に拒否する。
 const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
@@ -139,10 +139,15 @@ pub enum StorageError {
     /// 指定した行 ID が存在しない。
     NotFound(u64),
     /// [`Storage::scan`] の対象行数・バイト量が上限（[`MAX_SCAN_TOTAL_ROWS`]・
-    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過、または [`Storage::scan_batch_log`] のエントリ数が
-    /// 上限（[`MAX_BATCH_LOG_ROWS`]）を超過したため fail-closed に拒否した。
-    /// `scan` の呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと。
+    /// [`MAX_SCAN_TOTAL_BYTES`]）を超過したため fail-closed に拒否した（対象ビヘイビア:
+    /// PERSIST-4）。呼び出し元は上限付きページング API [`Storage::scan_page`] を使うこと
+    /// （テーブルスコープ経由の呼び出しは `catalog.rs` の `scan_table_page` を使うこと）。
     ScanLimitExceeded,
+    /// [`Storage::scan_batch_log`] のエントリ数が上限（[`MAX_BATCH_LOG_ROWS`]）を超過した
+    /// ため fail-closed に拒否した（対象ビヘイビア: TABLE-10）。バッチ台帳には
+    /// [`Storage::scan_page`] 相当のページング API が存在しないため、`ScanLimitExceeded`
+    /// と variant を分け、行テーブル用の代替 API を誤って案内しないようにする。
+    BatchLogLimitExceeded,
     /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
     /// （`batch_seq` ごとに 1 エントリ）が壊れる。呼び出し元の採番バグを fail-closed
@@ -175,7 +180,14 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
-            StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
+            StorageError::ScanLimitExceeded => write!(
+                f,
+                "scan limit exceeded (max {MAX_SCAN_TOTAL_ROWS} rows or {MAX_SCAN_TOTAL_BYTES} bytes): use scan_page"
+            ),
+            StorageError::BatchLogLimitExceeded => write!(
+                f,
+                "batch log scan limit exceeded (max {MAX_BATCH_LOG_ROWS} entries): batch log cannot be loaded at once"
+            ),
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
             }
@@ -200,6 +212,7 @@ impl std::error::Error for StorageError {
             StorageError::Codec(_)
             | StorageError::NotFound(_)
             | StorageError::ScanLimitExceeded
+            | StorageError::BatchLogLimitExceeded
             | StorageError::DuplicateBatchSeq(_)
             | StorageError::PendingRowCountOverflow
             | StorageError::UnloggedRows(_)
@@ -424,11 +437,7 @@ impl Storage {
         for entry in table.iter()? {
             let (k, v) = entry?;
             let raw = v.value();
-            if out.len() >= MAX_SCAN_TOTAL_ROWS
-                || bytes_used.saturating_add(raw.len()) > MAX_SCAN_TOTAL_BYTES
-            {
-                return Err(StorageError::ScanLimitExceeded);
-            }
+            check_scan_limits(out.len(), bytes_used, raw.len())?;
             bytes_used = bytes_used.saturating_add(raw.len());
             out.push(decode_row(k.value(), raw)?);
         }
@@ -504,9 +513,11 @@ impl Storage {
     /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
     ///
     /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
-    /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で fail-closed
-    /// に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」対応。バッチ台帳は
-    /// コミットごとに増え続けるため、大きな DB では無制限確保がメモリ枯渇につながり得る）。
+    /// 部分的な結果を黙って切り詰めず [`StorageError::BatchLogLimitExceeded`] で
+    /// fail-closed に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」
+    /// 対応。バッチ台帳はコミットごとに増え続けるため、大きな DB では無制限確保が
+    /// メモリ枯渇につながり得る）。台帳にはページング API が無いため、`scan` 用の
+    /// `ScanLimitExceeded` とは別 variant で拒否し、存在しない代替 API を案内しない。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
@@ -516,14 +527,33 @@ impl Storage {
         };
         let mut out = Vec::new();
         for entry in table.iter()? {
-            if out.len() >= MAX_BATCH_LOG_ROWS {
-                return Err(StorageError::ScanLimitExceeded);
-            }
+            check_batch_log_limit(out.len())?;
             let (k, v) = entry?;
             out.push((k.value(), v.value()));
         }
         Ok(out)
     }
+}
+
+/// [`Storage::scan`] の行数・バイト量上限判定を切り出した純粋関数（テスト容易性のため）。
+/// `rows`・`bytes_used` は走査済み件数・バイト量、`next_len` はこれから加える 1 行の
+/// エンコード済みバイト長。超過時は [`StorageError::ScanLimitExceeded`] を返す。
+/// 判定条件（`>=` / `>` / `saturating_add`）は既存の `scan` 実装から変更しない。
+fn check_scan_limits(rows: usize, bytes_used: usize, next_len: usize) -> Result<()> {
+    if rows >= MAX_SCAN_TOTAL_ROWS || bytes_used.saturating_add(next_len) > MAX_SCAN_TOTAL_BYTES {
+        return Err(StorageError::ScanLimitExceeded);
+    }
+    Ok(())
+}
+
+/// [`Storage::scan_batch_log`] のエントリ数上限判定を切り出した純粋関数（テスト容易性の
+/// ため）。`entries` は走査済みエントリ数。超過時は [`StorageError::BatchLogLimitExceeded`]
+/// を返す。判定条件は既存の `scan_batch_log` 実装から変更しない。
+fn check_batch_log_limit(entries: usize) -> Result<()> {
+    if entries >= MAX_BATCH_LOG_ROWS {
+        return Err(StorageError::BatchLogLimitExceeded);
+    }
+    Ok(())
 }
 
 /// 行を固定レイアウトでエンコードする（serde 系依存を増やさない方針。dependency-policy.md）。
@@ -1135,6 +1165,57 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    // Issue #131: 上限超過時のエラー文言・variant が経路（scan / scan_batch_log）ごとに
+    // 正確な代替手段を案内することを固定する。台帳には scan_page 相当のページング API が
+    // 存在しないため、両者の文言が入れ替わらないことを検証する。
+
+    #[test]
+    fn scan_limit_error_message_points_to_scan_page() {
+        let msg = StorageError::ScanLimitExceeded.to_string();
+        assert!(msg.contains("scan_page"), "message was: {msg}");
+        assert!(!msg.contains("batch log"), "message was: {msg}");
+    }
+
+    #[test]
+    fn batch_log_limit_error_message_does_not_point_to_scan_page() {
+        let msg = StorageError::BatchLogLimitExceeded.to_string();
+        assert!(msg.contains("batch log"), "message was: {msg}");
+        assert!(!msg.contains("scan_page"), "message was: {msg}");
+    }
+
+    #[test]
+    fn check_scan_limits_rejects_row_and_byte_overrun_with_scan_variant() {
+        // 行数境界: MAX_SCAN_TOTAL_ROWS 件目を追加しようとすると拒否される。
+        assert!(matches!(
+            check_scan_limits(MAX_SCAN_TOTAL_ROWS, 0, 1),
+            Err(StorageError::ScanLimitExceeded)
+        ));
+        assert!(check_scan_limits(MAX_SCAN_TOTAL_ROWS - 1, 0, 1).is_ok());
+
+        // バイト境界: 追加後に MAX_SCAN_TOTAL_BYTES を超えると拒否される。
+        assert!(matches!(
+            check_scan_limits(0, MAX_SCAN_TOTAL_BYTES, 1),
+            Err(StorageError::ScanLimitExceeded)
+        ));
+        assert!(check_scan_limits(0, MAX_SCAN_TOTAL_BYTES, 0).is_ok());
+    }
+
+    #[test]
+    fn check_batch_log_limit_rejects_overrun_with_batch_log_variant() {
+        assert!(matches!(
+            check_batch_log_limit(MAX_BATCH_LOG_ROWS),
+            Err(StorageError::BatchLogLimitExceeded)
+        ));
+        assert!(check_batch_log_limit(MAX_BATCH_LOG_ROWS - 1).is_ok());
+    }
+
+    #[test]
+    fn scan_limit_errors_have_no_source() {
+        use std::error::Error;
+        assert!(StorageError::ScanLimitExceeded.source().is_none());
+        assert!(StorageError::BatchLogLimitExceeded.source().is_none());
     }
 
     /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:

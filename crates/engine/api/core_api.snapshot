@@ -150,6 +150,7 @@ pub enum StorageError {
     Codec(String),
     NotFound(u64),
     ScanLimitExceeded,
+    BatchLogLimitExceeded,
     DuplicateBatchSeq(u64),
     PendingRowCountOverflow,
     UnloggedRows(u64),
