@@ -145,13 +145,11 @@ pub enum Visibility {
 
 # source: crates/engine/src/storage.rs :: StorageError
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum StorageError {
     Backend(redb::Error),
     Codec(String),
     NotFound(u64),
     ScanLimitExceeded,
-    BatchLogLimitExceeded,
     DuplicateBatchSeq(u64),
     PendingRowCountOverflow,
     UnloggedRows(u64),
