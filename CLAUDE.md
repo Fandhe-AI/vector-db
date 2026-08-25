@@ -29,8 +29,8 @@ vector-db/
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-cross-table + core-api-check の CI
-│   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 未接続の間は schedule 停止中）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 未接続の間は opt-in）の回帰ベンチ（いずれも workflow_dispatch）
-│   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch のみ。schedule は strict モード疎通確認後に再追加予定。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
+│   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 まで opt-in）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は Issue #178 まで opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）
+│   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
 │   ├── agents/                    # カテゴリ別 subagent 定義

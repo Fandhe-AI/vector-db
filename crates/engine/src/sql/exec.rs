@@ -21,7 +21,8 @@
 //! defense-in-depth としてで、「独立した 2 つの検査が効いている」という意味では
 //! ない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で RLS 段を
 //! 後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
-//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。RLS の暗黙適用フック
+//! （[`crate::rls::ImplicitRlsHook`]）経由で述語を取得する（TASK-137・RLS-6, RLS-7）。
 //!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
@@ -35,6 +36,7 @@ use crate::core;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
+use crate::rls::ImplicitRlsHook;
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
@@ -425,10 +427,11 @@ pub fn execute_statement(
         Ok(true)
     };
 
+    let rls_hook = ImplicitRlsHook::new(ctx);
     let arena = VectorArena::build_filtered_with_rows_in_txn(
         read_txn,
         &bound.table,
-        |tenant, visibility| ctx.is_visible(tenant, visibility),
+        rls_hook.predicate(),
         on_visible_row,
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;

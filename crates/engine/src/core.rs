@@ -18,7 +18,8 @@
 //! 委ねると、provider 実装がそれを無視して不可視行（他テナント行を含む）のベクトル・id を
 //! 読み取る／外部送信することを防げない（AGENTS.md P0「テナント境界の弱体化」）。そのため
 //! `EngineCore::search` は二重の防御を持つ: (1) [`VectorArena::build_filtered`] へ
-//! [`crate::policy::PolicyContext::is_visible`] をそのまま述語として渡し、不可視行を
+//! [`crate::rls::ImplicitRlsHook::predicate`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7）を
+//! 渡し、不可視行を
 //! アリーナ構築時点で確保しない（`arena.rs` のドキュメント参照。以前はアリーナ全行を
 //! 構築してから可視行だけを別バッファへ再確保・全コピーしており、1 検索あたりの
 //! ピークメモリが最大で 2 倍になっていたが、構築時フィルタにより単一確保で完結する。
@@ -37,6 +38,7 @@ use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
+use crate::rls::ImplicitRlsHook;
 use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
 use redb::ReadableDatabase;
@@ -440,15 +442,14 @@ impl VectorCore for EngineCore {
         // 直前の照会成立後にテーブルが削除された場合の理論的な競合窓のみで発生しうる。
         // その場合も同様に存在情報を漏らさず `NotFound` へ丸め込む。
         //
-        // `VectorArena::build_filtered` へ `ctx.is_visible` をそのまま述語として渡し、
-        // 不可視行（他テナント行を含む）をアリーナ構築時点で確保しない
+        // `VectorArena::build_filtered` へ `rls::ImplicitRlsHook::predicate`（TASK-137・
+        // RLS-6/7）を渡し、不可視行（他テナント行を含む）をアリーナ構築時点で確保しない
         // （codex P0/P2・Issue #137 対応。以前はアリーナ全行を構築してから可視行だけを
         // 別バッファへ再確保・全コピーしており、1 検索あたりのピークメモリが最大で
         // 2 倍になっていた。構築時フィルタにより単一確保で完結する。`arena.rs` の
         // ドキュメント参照）。構築後のアリーナは `ctx` の下で可視な行だけを保持する。
-        let arena = match VectorArena::build_filtered(&self.storage, table, |tenant, visibility| {
-            ctx.is_visible(tenant, visibility)
-        }) {
+        let rls_hook = ImplicitRlsHook::new(ctx);
+        let arena = match VectorArena::build_filtered(&self.storage, table, rls_hook.predicate()) {
             Ok(arena) => arena,
             Err(ArenaError::Catalog(CatalogError::TableNotFound(_))) => {
                 return Err(CoreError::NotFound)
@@ -499,7 +500,7 @@ impl VectorCore for EngineCore {
             }
             Err(e) => return Err(CoreError::Catalog(e)),
         };
-        if !ctx.is_visible(&row.tenant_id, row.visibility) {
+        if !ImplicitRlsHook::new(ctx).is_visible(&row.tenant_id, row.visibility) {
             return Err(CoreError::NotFound);
         }
         Ok(row)
