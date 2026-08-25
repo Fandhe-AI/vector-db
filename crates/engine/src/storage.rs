@@ -129,7 +129,19 @@ const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 /// `redb::Error` へ変換可能なため、それを内部に保持して一本化する。
 /// ライブラリコードとして panic せず、すべての失敗を `Result` で返す
 /// （coding-rust.md: engine では `Result` を返し panic させない）。
+///
+/// `#[non_exhaustive]`: PR #193 codex レビュー PRRT_kwDOUAKASM6cB6is 対応。本 enum への
+/// variant 追加（例: [`StorageError::BatchLogLimitExceeded`] 新設）はクレート外の
+/// 網羅的 `match` を壊す破壊的変更になり得るため、以後の variant 追加をクレート境界の
+/// 外側からは非網羅として扱わせる（呼び出し元にワイルドカードアームを要求する）。
+/// 本クレート内（`catalog.rs` 等）は同一クレートのため従来どおり網羅的 `match` を書ける。
+/// wire_code 相当の観測可能な契約（AGENTS.md P1「公開 API・エラー契約の互換性」）は
+/// `catalog.rs::convert_storage_error` が `ScanLimitExceeded`・`BatchLogLimitExceeded` を
+/// いずれも `CatalogError::Invalid` へ一本化しているため今回の variant 分離では変化せず、
+/// 対になる spec 定義変更は不要と判断した（変わるのは内部 Rust variant の粒度とメッセージ
+/// 文字列のみ）。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StorageError {
     /// `redb` 側で発生したエラー（I/O・破損検出・トランザクション競合等）。
     Backend(redb::Error),
