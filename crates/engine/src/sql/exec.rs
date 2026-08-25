@@ -149,6 +149,14 @@ pub struct QueryResult {
     pub rows: Vec<ResultRow>,
 }
 
+/// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。単一行 INSERT の
+/// みを受理するため常に `1` になるが、`INSERT 0 1` 相当の wire 応答（TASK-73）へ
+/// 写像しやすいよう件数フィールドとして保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOutcome {
+    pub rows_affected: u64,
+}
+
 impl From<RowCodecError> for SqlSurfaceError {
     /// スカラーペイロードのデコード失敗は、格納済みデータの破損・実装バグの
     /// いずれかであり、SQL 入力自体の不正ではないため fail-closed に `XX000` へ
@@ -721,6 +729,81 @@ fn project_rows(
         rows.push(ResultRow { id, score, cells });
     }
     Ok(rows)
+}
+
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80 の公開 API）。
+/// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
+/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
+///
+/// 行の書き込みはガード付き API [`crate::tenant::insert_typed_row`] へ委譲する
+/// （TASK-95・TABLE-12・RLS-9）。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
+/// テナント名前空間の指定を呼び出し元任せにするため、SQL 表層からは使わない
+/// （ガードを迂回できる書き込み入口を増やさない。security.md P0）。テナントは
+/// `ctx.tenant_id()` からサーバー側で導出され（クライアントが列リストへテナント
+/// 相当の値を指定しても無視される）、可視性は常に `Visibility::Private` に固定する
+/// （`PolicyContext::is_visible` は `Public` 行を他テナントへも可視とするため、
+/// 既定 `Public` は越境露出になる。fail-closed に `Private` を採用する）。
+///
+/// 単一の write トランザクションで完結し、既存 `id` への黙った上書きは行わない。
+/// 重複検出のスコープは**呼び出し元テナントの名前空間内**に閉じる（行ストアの物理
+/// キーが `(tenant_id, id)` であるため。TABLE-12・RLS-9）。したがって:
+///
+/// - 同一テナント内の `id` 重複のみ [`SqlSurfaceError::IdConflict`]（`23505`）
+/// - 他テナントが同じ `id` を保持していても本経路は成功する（応答・実行経路のいずれも
+///   他テナントの行 id 存在で分岐しないため、存在オラクルにならない）
+///
+/// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
+/// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
+/// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
+/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の冪等契約
+/// （台帳への原子的記録・重複拒否・内容不一致検出）はまだ提供しない。`bound.operation_id`
+/// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
+/// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
+/// （ポインタ: docs/spec/05-tasks.md TASK-93）。
+pub fn execute_insert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::catalog::CatalogError;
+    use crate::storage::{StorageError, Visibility};
+    use crate::tenant::TenantWriteError;
+
+    crate::tenant::insert_typed_row(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        Visibility::Private,
+        &bound.values,
+    )
+    .map_err(|e| match e {
+        // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
+        // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
+        TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
+            SqlSurfaceError::UndefinedTable { name }
+        }
+        // 入力値に起因すると型で確認できるものだけを「受理構文だが値が不正」として
+        // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
+        // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
+        // 所有テナントは含めない（security.md「エラー・ログ経由で他テナントのデータ・
+        // 存在情報を漏らさない」）。
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+        | TenantWriteError::Storage(StorageError::Codec(_)) => {
+            SqlSurfaceError::invalid_input("insert rejected: invalid row")
+        }
+        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗等）は
+        // サーバー側の内部事象として `XX000` へ写像する（codex-review P0/P1 指摘・
+        // PR #189: バックエンド障害を入力不正として返すと再試行・障害判定を誤らせる。
+        // また `TenantWriteError` の `Display`/`Debug` は原因を秘匿する契約のため、
+        // detail には原因を一切展開せず固定文言に留める）。
+        _ => SqlSurfaceError::Internal {
+            detail: "insert failed".to_string(),
+        },
+    })?;
+
+    Ok(InsertOutcome { rows_affected: 1 })
 }
 
 #[cfg(test)]

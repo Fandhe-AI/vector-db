@@ -12,10 +12,16 @@
 
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
+use crate::sql::using_operation_id::OperationId;
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
 /// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。
 const MAX_ERROR_DETAIL_LEN: usize = 200;
+
+/// INSERT の列リスト・VALUES リストがそれぞれ持てる要素数の上限（SQL-10、TASK-80）。
+/// 無制限 `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限
+/// リソース確保（DoS）」対応）。`catalog::MAX_COLUMN_COUNT` と同値を採用する。
+const MAX_INSERT_COLUMNS: usize = 256;
 
 /// ORDER BY の関数呼び出し形で許可する関数名を照合する（大文字小文字を区別しない）。
 /// 未知の名前は fail-closed に拒否し、識別子であれば任意の名前を関数呼び出しとして
@@ -67,6 +73,19 @@ pub enum SqlSurfaceError {
     /// untrusted 入力のサイズがアロケーション前の上限を超過した（ベクトルリテラル
     /// 64 KiB 超過、候補集合の容量上限超過等。ERR-2: `54000`）。
     PayloadTooLarge { detail: String },
+    /// 書き込み系 SQL 文の文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の
+    /// 省略（空文字値を含む）。RECOVER-1 の必須化ガードの前段として、SQL 表層が
+    /// 書き込みトランザクションを開始する**前**に構造検証段階で fail-closed に
+    /// 拒否する（ERR-2: `23502`）。
+    MissingOperationId,
+    /// INSERT 先の行 `id` が**呼び出し元テナントの名前空間内で**既に使われている
+    /// （`tenant::insert_typed_row` の [`crate::tenant::TenantWriteError::IdConflict`]
+    /// を SQL 表層へ写像したもの。ERR-2: `23505`）。行ストアの物理キーは
+    /// `(tenant_id, id)` で名前空間化されているため（TABLE-12・RLS-9）、他テナントが
+    /// 同じ `id` を保持していても本 variant にはならない。`operation_id` 単位の
+    /// 冪等判定（台帳による重複拒否・内容不一致検出）は本 variant の管轄外で、
+    /// TASK-93・TASK-94・TASK-101 が後続で扱う。
+    IdConflict,
 }
 
 impl SqlSurfaceError {
@@ -78,7 +97,16 @@ impl SqlSurfaceError {
             SqlSurfaceError::Internal { .. } => "XX000",
             SqlSurfaceError::InvalidInput { .. } => "22000",
             SqlSurfaceError::PayloadTooLarge { .. } => "54000",
+            SqlSurfaceError::MissingOperationId => "23502",
+            SqlSurfaceError::IdConflict => "23505",
         }
+    }
+
+    /// `pub(crate)`: `sql::allowlist::Parser::parse_operation_id_clause`・
+    /// `sql::using_operation_id::OperationId::parse` が文末句の省略（空文字値を
+    /// 含む）を報告するために使う（SQL-10、TASK-80）。
+    pub(crate) fn missing_operation_id() -> Self {
+        SqlSurfaceError::MissingOperationId
     }
 
     /// `pub(crate)`: `catalog.rs::impl TableLookup for Storage` が `CatalogError::Invalid`
@@ -126,6 +154,15 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::InvalidInput { detail } => write!(f, "invalid input: {detail}"),
             SqlSurfaceError::PayloadTooLarge { detail } => {
                 write!(f, "payload too large: {detail}")
+            }
+            SqlSurfaceError::MissingOperationId => {
+                write!(f, "missing USING OPERATION_ID clause")
+            }
+            // 所有テナント・行内容・他テナントの存在有無を一切含めない固定文言
+            // （security.md P0）。同一テナント内の重複でのみ返るため、この応答自体が
+            // 他テナントの行 id 存在オラクルにならない。
+            SqlSurfaceError::IdConflict => {
+                write!(f, "row id already exists")
             }
         }
     }
@@ -321,6 +358,34 @@ pub enum Statement {
     },
 }
 
+/// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
+/// （文字列リテラル／数値）のみを構造として保持し、列型との照合・意味論的解釈は
+/// `sql::parser::bind_insert` の責務とする。
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertLiteral {
+    String(String),
+    Number(String),
+}
+
+/// 許可形状の構造判定を通過した INSERT 文（SQL-10、TASK-80）。`ValidatedStatement`
+/// と同様、本モジュールが保証するのはここまでの構造情報のみで、列名・値の
+/// 意味論的妥当性は検証しない（`sql::parser::bind_insert` の責務）。
+///
+/// 受理する形は `INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)
+/// USING OPERATION_ID '<id>' [;]` の単一行形のみ（複数行 VALUES・RETURNING・
+/// 可視性ラベル指定は許可リスト外）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedInsert {
+    /// INTO に指定され、カタログ存在確認を通過したテーブル名。
+    pub table_name: String,
+    /// 列リストの宣言順（`columns[i]` は `values[i]` に対応する。個数は
+    /// `parse_insert` が既に一致を確認済み）。
+    pub columns: Vec<String>,
+    pub values: Vec<InsertLiteral>,
+    /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。
+    pub operation_id: OperationId,
+}
+
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
 /// 再帰下降だが文法の深さは定数（statement → select_list/where/order_by の 1 階層）で、
 /// 深いネストによるスタック消費は発生しない。
@@ -353,6 +418,27 @@ impl<'a> Parser<'a> {
                 "expected keyword {kw:?}, got {other:?}"
             ))),
         }
+    }
+
+    /// パーサー位置に応じた文脈的キーワード照合（PR #189 レビュー指摘対応・P1）。
+    /// `INSERT`/`INTO`/`VALUES`/`USING`/`OPERATION_ID` は
+    /// [`lexer::Keyword`] へ含めない（`lexer.rs` の設計メモ参照）ため、
+    /// [`Token::Ident`] を大文字小文字を区別せず文字列比較して INSERT 許可形状の
+    /// 期待位置でのみキーワードとして扱う。同名の一般識別子（テーブル名・列名）は
+    /// `expect_ident` を通る位置に置かれる限り、本メソッドの対象外として素通しする。
+    fn expect_contextual_keyword(&mut self, word: &str) -> Result<(), SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word) => Ok(()),
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected keyword {word}, got {other:?}"
+            ))),
+        }
+    }
+
+    /// 次のトークンが文脈的キーワード `word` に一致するかを消費せずに判定する
+    /// （`parse_operation_id_clause` が `USING` 句の有無で分岐するために使う）。
+    fn peek_contextual_keyword(&self, word: &str) -> bool {
+        matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case(word))
     }
 
     fn expect_punct(&mut self, c: char) -> Result<(), SqlSurfaceError> {
@@ -623,6 +709,88 @@ impl<'a> Parser<'a> {
         }
         Ok(())
     }
+
+    /// VALUES リストの 1 要素（文字列リテラルまたは数値リテラルのみ。関数呼び出し・
+    /// 括弧・`NULL` キーワード等は許可リスト外）。
+    fn expect_literal(&mut self) -> Result<InsertLiteral, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::StringLiteral(s)) => Ok(InsertLiteral::String(s.clone())),
+            Some(Token::Number(n)) => Ok(InsertLiteral::Number(n.clone())),
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected literal value, got {other:?}"
+            ))),
+        }
+    }
+
+    /// `INSERT INTO <table> (<col>[, <col>]*) VALUES (<lit>[, <lit>]*)
+    /// USING OPERATION_ID '<id>' [;]` の単一行形のみを受理する（SQL-10、TASK-80）。
+    /// 複数行 VALUES・RETURNING・可視性ラベル指定は構造的に受理しない。
+    fn parse_insert(&mut self) -> Result<ParsedInsertShape, SqlSurfaceError> {
+        self.expect_contextual_keyword("INSERT")?;
+        self.expect_contextual_keyword("INTO")?;
+        let table_name = self.expect_ident()?;
+
+        self.expect_punct('(')?;
+        let mut columns = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if columns.len() >= MAX_INSERT_COLUMNS {
+                return Err(SqlSurfaceError::unsupported("too many INSERT columns"));
+            }
+            columns.push(self.expect_ident()?);
+        }
+        self.expect_punct(')')?;
+
+        self.expect_contextual_keyword("VALUES")?;
+        self.expect_punct('(')?;
+        let mut values = vec![self.expect_literal()?];
+        while matches!(self.peek(), Some(Token::Punct(','))) {
+            self.advance();
+            if values.len() >= MAX_INSERT_COLUMNS {
+                return Err(SqlSurfaceError::unsupported("too many INSERT values"));
+            }
+            values.push(self.expect_literal()?);
+        }
+        self.expect_punct(')')?;
+
+        if columns.len() != values.len() {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "INSERT column count {} does not match value count {}",
+                columns.len(),
+                values.len()
+            )));
+        }
+
+        // 文末専用句の省略（`23502`）は、この時点でまだ FROM/INTO テーブルの
+        // カタログ照会（`validate_insert` の呼び出し元）を一切行っていない
+        // ＝書き込みトランザクションは絶対に開始されていない段階で判定される
+        // （SQL-10 の要件: 省略は書き込みトランザクションを開始する前に拒否する）。
+        let operation_id = self.parse_operation_id_clause()?;
+
+        Ok(ParsedInsertShape {
+            table_name,
+            columns,
+            values,
+            operation_id,
+        })
+    }
+
+    /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）。省略は
+    /// [`SqlSurfaceError::MissingOperationId`]（`23502`）。`USING` の後に
+    /// `OPERATION_ID` キーワード・文字列リテラルが続かない形（`$n` プレースホルダ
+    /// 由来の字句解析拒否を含む）・`OPERATION_ID` に文字列リテラル以外が続く形
+    /// （数値・識別子等）は許可リスト外として `42601` へ落ちる
+    /// （`expect_keyword`/`expect_string_literal` が `UnsupportedSyntax` を返す）。
+    fn parse_operation_id_clause(&mut self) -> Result<OperationId, SqlSurfaceError> {
+        if self.peek_contextual_keyword("USING") {
+            self.advance();
+            self.expect_contextual_keyword("OPERATION_ID")?;
+            let raw = self.expect_string_literal()?;
+            OperationId::parse(&raw)
+        } else {
+            Err(SqlSurfaceError::missing_operation_id())
+        }
+    }
 }
 
 /// 構文木（[`ValidatedStatement`] の元）。カタログ存在確認前の中間結果。
@@ -759,6 +927,51 @@ pub fn validate_statement(
             "SET is not a query statement (use a session-aware entry point)",
         )),
     }
+}
+
+/// 構文木（[`ValidatedInsert`] の元）。カタログ存在確認前の中間結果（SQL-10、TASK-80）。
+struct ParsedInsertShape {
+    table_name: String,
+    columns: Vec<String>,
+    values: Vec<InsertLiteral>,
+    operation_id: OperationId,
+}
+
+/// INSERT 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
+/// INTO テーブルがカタログに実在するかを確認する（SQL-10、TASK-80 の公開 API）。
+/// `validate_statement`（SELECT 専用、TASK-74）とは独立したエントリポイントとする
+/// （SELECT 文に `USING OPERATION_ID` を付けた入力は `validate_statement` 側の
+/// `expect_end_of_statement` が余剰トークンとして `42601` で拒否するため、
+/// SELECT/INSERT を誤って混同受理する経路は構造的に存在しない）。
+///
+/// 検証順序（決定的。同一入力には常に同一の [`SqlSurfaceError`] を返す）:
+/// 1. 字句解析（[`SqlSurfaceError::UnsupportedSyntax`]）
+/// 2. 構造の許可リスト判定。文末専用句の省略はこの段階で
+///    [`SqlSurfaceError::MissingOperationId`]（`23502`）として判定され、
+///    カタログ照会（次段）は一切呼ばれない＝書き込みトランザクションは
+///    絶対に開始されていない（SQL-10 の要件）
+/// 3. INTO 単一テーブルのカタログ存在確認（不存在は [`SqlSurfaceError::UndefinedTable`]、
+///    `wire_code` は `42P01`）
+pub fn validate_insert(
+    sql: &str,
+    lookup: &impl TableLookup,
+) -> Result<ValidatedInsert, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    let mut p = Parser::new(&tokens);
+    let shape = p.parse_insert()?;
+    p.expect_end_of_statement()?;
+
+    let exists = lookup.table_exists(&shape.table_name)?;
+    if !exists {
+        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    }
+
+    Ok(ValidatedInsert {
+        table_name: shape.table_name,
+        columns: shape.columns,
+        values: shape.values,
+        operation_id: shape.operation_id,
+    })
 }
 
 #[cfg(test)]
@@ -1392,6 +1605,181 @@ mod tests {
             "x".repeat(2_000_000)
         );
         assert!(validate_statement(&huge, &lookup).is_err());
+    }
+
+    // --- validate_insert（SQL-10、TASK-80） -----------------------------------
+
+    #[test]
+    fn accepts_insert_with_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') USING OPERATION_ID 'op-0001'",
+            &lookup,
+        )
+        .expect("basic INSERT shape should be accepted");
+        assert_eq!(stmt.table_name, "documents");
+        assert_eq!(
+            stmt.columns,
+            vec!["id".to_string(), "embedding".to_string()]
+        );
+        assert_eq!(stmt.operation_id.as_str(), "op-0001");
+    }
+
+    #[test]
+    fn accepts_insert_with_trailing_semicolon() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'op-0001';",
+            &lookup,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_insert_missing_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert("INSERT INTO documents (id) VALUES (1)", &lookup)
+            .expect_err("missing clause must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_insert_with_empty_operation_id_value() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID ''",
+            &lookup,
+        )
+        .expect_err("empty value must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_insert_operation_id_dollar_placeholder() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID $1",
+            &lookup,
+        )
+        .expect_err("$n placeholder must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_operation_id_non_string_value() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 123",
+            &lookup,
+        )
+        .expect_err("non-string value must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_with_duplicate_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'a' USING OPERATION_ID 'b'",
+            &lookup,
+        )
+        .expect_err("duplicate clause must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_select_with_using_operation_id_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING OPERATION_ID 'op-0001'",
+            &lookup,
+        )
+        .expect_err("USING OPERATION_ID on a SELECT must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_column_value_count_mismatch() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id, embedding) VALUES (1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+        )
+        .expect_err("column/value count mismatch must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_insert_into_undefined_table() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO nope (id) VALUES (1) USING OPERATION_ID 'op-0001'",
+            &lookup,
+        )
+        .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn missing_operation_id_is_classified_before_undefined_table() {
+        // 構造違反（句省略）とテーブル不存在の両方に該当する入力は、検証順序
+        // （構造判定が先）により常に 23502 として決定的に分類される
+        // （SQL-10 の要件: 省略は書き込みトランザクション開始前に拒否）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert("INSERT INTO nope (id) VALUES (1)", &lookup)
+            .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn insert_structural_validation_never_queries_catalog_when_operation_id_is_missing() {
+        // 23502 が「行数不変」のような弱い代理指標ではなく、カタログ照会（＝write
+        // txn 開始の前段）そのものに到達していないことを直接確認する
+        // （advisor 指摘対応: catalog lookup が一度も呼ばれていないことをフラグで検証）。
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_insert("INSERT INTO nope (id) VALUES (1)", &lookup)
+            .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
+    }
+
+    #[test]
+    fn rejects_insert_exceeding_max_columns() {
+        let lookup = catalog_with(&["documents"]);
+        let cols: Vec<String> = (0..MAX_INSERT_COLUMNS + 1)
+            .map(|i| format!("c{i}"))
+            .collect();
+        let vals: Vec<String> = (0..MAX_INSERT_COLUMNS + 1).map(|i| i.to_string()).collect();
+        let sql = format!(
+            "INSERT INTO documents ({}) VALUES ({}) USING OPERATION_ID 'op-0001'",
+            cols.join(", "),
+            vals.join(", ")
+        );
+        let err = validate_insert(&sql, &lookup).expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn same_insert_input_yields_same_classification_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "INSERT INTO documents (id) VALUES (1)";
+        let first = validate_insert(sql, &lookup).unwrap_err().wire_code();
+        let second = validate_insert(sql, &lookup).unwrap_err().wire_code();
+        assert_eq!(first, second);
     }
 
     // --- TASK-161（SQL-12: `USING MODE`／`SET search_mode`）------------------------

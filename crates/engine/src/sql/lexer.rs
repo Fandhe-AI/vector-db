@@ -45,6 +45,15 @@ pub enum Keyword {
     Limit,
 }
 
+/// TASK-80・SQL-10 の `INSERT`/`INTO`/`VALUES`/`USING`/`OPERATION_ID` は
+/// [`Keyword`] へ含めない（PR #189 レビュー指摘対応・P1）。この 5 語を無条件で
+/// `Token::Keyword` 化すると、既存の SELECT 許可形状（`sql::allowlist`）が
+/// 受理してきた同名のテーブル名・列名（`catalog::validate_identifier` は
+/// これらを識別子として許可している）が `expect_ident` を通過できなくなり、
+/// 引用識別子の回避策もないまま公開クエリ構文を無告知に破壊してしまう。
+/// 代わりに常に [`Token::Ident`] として字句解析し、`sql::allowlist::Parser` が
+/// INSERT 許可形状のパーサー位置でのみ文脈的に大文字小文字を無視して照合する
+/// （`Parser::expect_contextual_keyword`）。
 fn keyword_from_str(s: &str) -> Option<Keyword> {
     // 大文字小文字を区別しない ASCII 大文字比較（SQL 予約語の慣習に合わせる）。
     match s.to_ascii_uppercase().as_str() {
@@ -300,6 +309,27 @@ mod tests {
     }
 
     #[test]
+    fn insert_operation_id_words_lex_as_plain_idents() {
+        // PR #189 レビュー指摘対応（P1）: INSERT 許可形状・USING OPERATION_ID
+        // 文末句が使う 5 語は Token::Keyword 化せず、常に Token::Ident として
+        // 字句解析されることを固定する（文脈的キーワード化は
+        // `sql::allowlist::Parser` 側の責務）。
+        let tokens =
+            tokenize("INSERT INTO t VALUES USING OPERATION_ID").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Ident("INSERT".to_string()),
+                Token::Ident("INTO".to_string()),
+                Token::Ident("t".to_string()),
+                Token::Ident("VALUES".to_string()),
+                Token::Ident("USING".to_string()),
+                Token::Ident("OPERATION_ID".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn tokenizes_using_and_set_as_plain_idents() {
         // TASK-161（SQL-12）: `USING`／`SET` は字句解析の時点ではキーワード化しない
         // （`allowlist` 側が LIMIT 直後／statement 先頭という文脈でのみキーワードとして
@@ -322,6 +352,24 @@ mod tests {
                 Token::Ident("search_mode".to_string()),
                 Token::Punct('='),
                 Token::StringLiteral("precision".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_operation_id_words_remain_usable_as_ordinary_identifiers() {
+        // PR #189 レビュー指摘対応（P1）: `catalog::validate_identifier` が許可する
+        // 同名のテーブル名・列名（例: `values`）が、SELECT 許可形状の
+        // `expect_ident` 位置で引き続き受理できることを固定する
+        // （`SELECT values FROM documents` が構文破壊しない回帰テスト）。
+        let tokens = tokenize("SELECT values FROM documents").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Select),
+                Token::Ident("values".to_string()),
+                Token::Keyword(Keyword::From),
+                Token::Ident("documents".to_string()),
             ]
         );
     }

@@ -972,6 +972,44 @@ impl EngineCore {
         // 検証を通過した候補だけをテナント修飾済みヒットへ解決する（TABLE-12・RLS-9）。
         resolve_slot_hits(&arena, &hits).ok_or(CoreError::ProviderResultRejected)
     }
+
+    /// SQL 表層の単一 INSERT 文実行エントリポイント（TASK-80、対象ビヘイビア:
+    /// SQL-10）。`execute_sql`（TASK-75、SELECT 専用）とは独立した固有メソッドと
+    /// する。`VectorCore` trait への昇格は行わない（`crates/engine/api/
+    /// core_api.snapshot` が対象とするのは `VectorCore` trait 本体のみのため、
+    /// 本メソッドの追加はコア API シグネチャ安定性チェックに影響しない。
+    /// `execute_sql` と同じ理由）。
+    ///
+    /// `sql::allowlist::validate_insert`（構造検証。文末専用句
+    /// `USING OPERATION_ID '<id>'` の省略はこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない）→ `Storage::get_table_schema`
+    /// （スキーマ取得）→ `sql::parser::bind_insert`（意味論検証・束縛）→
+    /// `sql::exec::execute_insert`（単一 write トランザクションでの実行）の順に呼ぶ。
+    pub fn execute_insert_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage)?;
+        let schema = self
+            .storage
+            .get_table_schema(&stmt.table_name)
+            .map_err(|e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                // `TableNotFound` 以外（`CorruptSchema` の格納済みカタログ断片・
+                // `Backend` の redb I/O 情報等）は detail へ一切展開しない固定文言に
+                // 丸める（codex-review P0 指摘・PR #189。`CatalogError::CorruptSchema`
+                // 自身の「wire クライアントへは detail を渡さない」契約と
+                // security.md P0「エラー経由で内部情報・存在情報を漏らさない」対応）。
+                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
+                },
+            })?;
+        let bound = crate::sql::parser::bind_insert(&stmt, &schema)?;
+        crate::sql::exec::execute_insert(&self.storage, ctx, &bound)
+    }
 }
 
 impl VectorCore for EngineCore {
