@@ -274,7 +274,29 @@ fn validate_closed_expr(
                     "too many call arguments",
                 ));
             }
-            if builtin_from_name(name).is_none() && registry.get(name).is_none() {
+            // 呼び出し先の存在だけでなく、引数個数（組み込みは `builtin_signature`、
+            // 登録済み UDF は `UdfDefinition::params.len()`）も定義時に照合する。
+            // ここを素通りすると `CREATE FUNCTION f() AS vec_norm()` のような
+            // 引数数不一致の関数本体が「定義時検証」という公開契約に反して登録
+            // されてしまう（呼び出し時の `bind_call` 側の検査だけでは間に合わない）。
+            if let Some(builtin) = builtin_from_name(name) {
+                let (param_types, _ret) = builtin_signature(builtin);
+                if args.len() != param_types.len() {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects {} argument(s), got {}",
+                        param_types.len(),
+                        args.len()
+                    )));
+                }
+            } else if let Some(def) = registry.get(name) {
+                if args.len() != def.params.len() {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects {} argument(s), got {}",
+                        def.params.len(),
+                        args.len()
+                    )));
+                }
+            } else {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "unknown function: {name}"
                 )));
@@ -519,11 +541,37 @@ fn bind_call(
 ///
 /// fail-closed: 0 除算・非有限値（NaN/∞）の生成は黙って 0 や NULL に丸めず、行単位で
 /// `Err`（`22000`）として伝播する。
+/// 行 `id`（`u64`）を `ExprValue::Scalar`（`f64`）へ変換する前に、`f64` の 52 bit
+/// 仮数部で正確に表現できる範囲（`2^53` 以下）かを確認する。これを超える `id` を
+/// 無条件に `as f64` で丸めると、`WHERE id = <literal>` のような等価述語が精度欠落
+/// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22000` で拒否する）。
+fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
+    const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
+    if id > MAX_EXACT_F64_INT {
+        return Err(SqlSurfaceError::invalid_input(
+            "row id exceeds the range that can be exactly represented for comparison",
+        ));
+    }
+    Ok(id as f64)
+}
+
 pub fn eval(expr: &BoundExpr, id: u64, embedding: &[f32]) -> Result<ExprValue, SqlSurfaceError> {
     match expr {
         BoundExpr::Number(v) => Ok(ExprValue::Scalar(*v)),
-        BoundExpr::IdRef => Ok(ExprValue::Scalar(id as f64)),
-        BoundExpr::VectorRef => Ok(ExprValue::Vector(embedding.to_vec())),
+        BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
+        BoundExpr::VectorRef => {
+            // untrusted SQL から到達しうる経路（`WHERE`・`SELECT` 式の `VECTOR` 列参照）
+            // のため、`Vec::to_vec()`（内部で infallible alloc を使い OOM 時にプロセスを
+            // abort しうる）ではなく `try_reserve_exact` で確保成否を確認してからコピー
+            // する。同一ファイル内の `vec_div`・`apply_vector_scalar_op` と同じ
+            // fail-closed 方針（確保失敗は `54000` へ写像し、abort させない）。
+            let mut out: Vec<f32> = Vec::new();
+            out.try_reserve_exact(embedding.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("vector value exceeds available memory")
+            })?;
+            out.extend_from_slice(embedding);
+            Ok(ExprValue::Vector(out))
+        }
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding),
         BoundExpr::Binary { op, lhs, rhs } => {
             let l = eval(lhs, id, embedding)?;
@@ -568,7 +616,16 @@ fn eval_builtin(
                         "vec_div: result is not finite",
                     ));
                 }
-                out.push(r as f32);
+                // f64 では有限でも `f32` へキャストした結果が `f32::MAX` を超えて
+                // Infinity 化しうる。「非有限値は 22000 で fail-closed」の契約を
+                // キャスト後の値にも適用し、結果へ Infinity を流出させない。
+                let r32 = r as f32;
+                if !r32.is_finite() {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "vec_div: result is not finite",
+                    ));
+                }
+                out.push(r32);
             }
             Ok(ExprValue::Vector(out))
         }
@@ -712,7 +769,16 @@ fn apply_vector_scalar_op(op: BinOp, v: &[f32], s: f64) -> Result<ExprValue, Sql
                 "arithmetic result is not finite",
             ));
         }
-        out.push(r as f32);
+        // f64 では有限でも `f32` へキャストした結果が `f32::MAX` を超えて Infinity
+        // 化しうる。キャスト後の値にも `is_finite()` を適用し fail-closed を保つ
+        // （`vec_div` 側の同種修正と同方針）。
+        let r32 = r as f32;
+        if !r32.is_finite() {
+            return Err(SqlSurfaceError::invalid_input(
+                "arithmetic result is not finite",
+            ));
+        }
+        out.push(r32);
     }
     Ok(ExprValue::Vector(out))
 }
@@ -908,5 +974,68 @@ mod tests {
         }
         let err = define_function(&mut registry, "one_too_many", &[], &num("1.0")).unwrap_err();
         assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn builtin_call_with_wrong_arity_is_rejected_at_definition_time() {
+        // `vec_norm` は 1 引数だが 0 引数で呼び出す本体を定義しようとする。
+        let mut registry = UdfRegistry::default();
+        let err = define_function(&mut registry, "f", &[], &call("vec_norm", vec![])).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn registered_udf_call_with_wrong_arity_is_rejected_at_definition_time() {
+        // `g(v)` は 1 引数だが、`h` の本体は `g(v, v)`（2 引数）で呼び出す。
+        let mut registry = UdfRegistry::default();
+        define_function(&mut registry, "g", &["v".to_string()], &ident("v")).unwrap();
+        let err = define_function(
+            &mut registry,
+            "h",
+            &["v".to_string()],
+            &call("g", vec![ident("v"), ident("v")]),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+        assert_eq!(registry.len(), 1, "h should not have been registered");
+    }
+
+    #[test]
+    fn id_beyond_f64_exact_range_is_rejected_not_silently_rounded() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = bin(BinOp::Eq, ident("id"), num("9007199254740993"));
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let err = eval(&bound, 9_007_199_254_740_993, &[0.0, 0.0, 0.0]).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn id_within_f64_exact_range_still_evaluates() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = bin(BinOp::Eq, ident("id"), num("42"));
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let value = eval(&bound, 42, &[0.0, 0.0, 0.0]).expect("eval should succeed");
+        assert_eq!(value, ExprValue::Bool(true));
+    }
+
+    #[test]
+    fn vec_div_result_that_overflows_f32_after_cast_is_rejected() {
+        // f64 中間値は有限だが `f32::MAX` を超えるため `r as f32` は Infinity になる。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = call("vec_div", vec![ident("embedding"), num("1e-300")]);
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let embedding = [1.0f32, 0.0, 0.0];
+        let err = eval(&bound, 1, &embedding).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 }
