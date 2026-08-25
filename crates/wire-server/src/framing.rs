@@ -180,11 +180,18 @@ pub fn read_startup_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, FrameError
 /// 型バイトの途中で切断されていれば `Truncated` を返す。
 pub fn read_typed_frame_header<R: Read>(reader: &mut R) -> Result<Option<u8>, FrameError> {
     let mut type_byte = [0u8; 1];
-    match reader.read(&mut type_byte) {
-        Ok(0) => Ok(None),
-        Ok(_) => Ok(Some(type_byte[0])),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
+    loop {
+        match reader.read(&mut type_byte) {
+            Ok(0) => return Ok(None),
+            Ok(_) => return Ok(Some(type_byte[0])),
+            // シグナル割り込み等による `Interrupted` は接続断ではないため、
+            // `read_exact` 系の他経路（`post_auth_loop` / `read_password_message`）
+            // と同様にリトライする（Bugbot 指摘: type byte 読み取りのみ再試行が
+            // 抜けていた）。
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 
@@ -297,6 +304,35 @@ mod tests {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         let result = read_typed_frame_header(&mut cursor).expect("clean EOF is not an error");
         assert_eq!(result, None);
+    }
+
+    /// Bugbot 指摘: `read_typed_frame_header` はシグナル割り込み相当の
+    /// `ErrorKind::Interrupted` を再試行し、接続を切断しないこと
+    /// （`post_auth_loop` / `read_password_message` の `read_exact` 経路と同様の
+    /// リトライ挙動を type byte 読み取りにも揃える）。
+    #[test]
+    fn typed_header_retries_on_interrupted() {
+        struct InterruptOnceThenByte {
+            interrupted: bool,
+        }
+
+        impl Read for InterruptOnceThenByte {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                if let Some(slot) = buf.first_mut() {
+                    *slot = b'Q';
+                }
+                Ok(1)
+            }
+        }
+
+        let mut reader = InterruptOnceThenByte { interrupted: false };
+        let result =
+            read_typed_frame_header(&mut reader).expect("interrupted read must be retried");
+        assert_eq!(result, Some(b'Q'));
     }
 
     /// `max_total` に `MAX_MESSAGE_LEN` を超える値を渡しても、全体上限で丸められる
