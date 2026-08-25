@@ -752,17 +752,21 @@ fn project_rows(
 /// - 他テナントが同じ `id` を保持していても本経路は成功する（応答・実行経路のいずれも
 ///   他テナントの行 id 存在で分岐しないため、存在オラクルにならない）
 ///
-/// SQL-10 の再送判定（同一 `operation_id` の再実行が `23505` を受けたら commit 済みと
-/// みなす）は、この同一テナント内スコープでのみ成立する。`bound.operation_id` は
-/// 現時点では永続化しない。台帳への追記は TASK-93（対象ビヘイビア: RECOVER-2）の
-/// 管轄で、本関数がその追記点になる（ポインタ: docs/spec/05-tasks.md TASK-93）。
+/// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
+/// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
+/// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
+/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の冪等契約
+/// （台帳への原子的記録・重複拒否・内容不一致検出）はまだ提供しない。`bound.operation_id`
+/// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
+/// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
+/// （ポインタ: docs/spec/05-tasks.md TASK-93）。
 pub fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundInsert,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::catalog::CatalogError;
-    use crate::storage::Visibility;
+    use crate::storage::{StorageError, Visibility};
     use crate::tenant::TenantWriteError;
 
     crate::tenant::insert_typed_row(
@@ -780,12 +784,20 @@ pub fn execute_insert(
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
-        // スキーマ不整合・値不正は「受理構文だが値が不正」として `22000` へ丸め込む。
-        // 行内容・所有テナントは含めない（security.md「エラー・ログ経由で他テナントの
-        // データ・存在情報を漏らさない」）。
-        TenantWriteError::Catalog(CatalogError::Invalid(_)) | TenantWriteError::Storage(_) => {
+        // 入力値に起因すると型で確認できるものだけを「受理構文だが値が不正」として
+        // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
+        // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
+        // 所有テナントは含めない（security.md「エラー・ログ経由で他テナントのデータ・
+        // 存在情報を漏らさない」）。
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+        | TenantWriteError::Storage(StorageError::Codec(_)) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
         }
+        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗等）は
+        // サーバー側の内部事象として `XX000` へ写像する（codex-review P0/P1 指摘・
+        // PR #189: バックエンド障害を入力不正として返すと再試行・障害判定を誤らせる。
+        // また `TenantWriteError` の `Display`/`Debug` は原因を秘匿する契約のため、
+        // detail には原因を一切展開せず固定文言に留める）。
         _ => SqlSurfaceError::Internal {
             detail: "insert failed".to_string(),
         },

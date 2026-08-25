@@ -998,8 +998,13 @@ impl EngineCore {
                 CatalogError::TableNotFound(name) => {
                     crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
                 }
-                other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                    detail: format!("failed to load table schema: {other}"),
+                // `TableNotFound` 以外（`CorruptSchema` の格納済みカタログ断片・
+                // `Backend` の redb I/O 情報等）は detail へ一切展開しない固定文言に
+                // 丸める（codex-review P0 指摘・PR #189。`CatalogError::CorruptSchema`
+                // 自身の「wire クライアントへは detail を渡さない」契約と
+                // security.md P0「エラー経由で内部情報・存在情報を漏らさない」対応）。
+                _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: "failed to load table schema".to_string(),
                 },
             })?;
         let bound = crate::sql::parser::bind_insert(&stmt, &schema)?;

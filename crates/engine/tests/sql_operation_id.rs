@@ -310,11 +310,12 @@ fn error_response_of_same_tenant_conflict_is_identical_regardless_of_other_tenan
 }
 
 #[test]
-fn resending_the_same_operation_id_statement_is_rejected_with_23505() {
-    // SQL-10 の再送判定: 同一 `operation_id` を持つ同一文を再送すると、行 `id` の
-    // 重複により `23505` が返る。呼び出し元（wire 層・クライアント）はこれを
-    // 「先行実行が commit 済み」と解釈できる。判定が成立するのは同一テナント内
-    // スコープに限られる（他テナントの同一 `id` は別キーのため衝突しない。TABLE-12）。
+fn resending_the_same_statement_is_rejected_with_23505_by_row_id_conflict() {
+    // 同一文（同一 `operation_id`・同一行 `id`）の再送は、行キー `(tenant_id, id)` の
+    // 重複として `23505` になる。判定はあくまで行キー由来であり、`operation_id` を
+    // キーにした冪等判定（台帳による重複拒否・内容不一致検出）は本タスクの管轄外
+    // （TASK-93・TASK-94・TASK-101）。衝突が成立するのは同一テナント内スコープに
+    // 限られる（他テナントの同一 `id` は別キーのため衝突しない。TABLE-12）。
     let path = unique_db_path("insert-resend");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);

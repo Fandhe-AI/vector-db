@@ -82,9 +82,9 @@ pub enum SqlSurfaceError {
     /// （`tenant::insert_typed_row` の [`crate::tenant::TenantWriteError::IdConflict`]
     /// を SQL 表層へ写像したもの。ERR-2: `23505`）。行ストアの物理キーは
     /// `(tenant_id, id)` で名前空間化されているため（TABLE-12・RLS-9）、他テナントが
-    /// 同じ `id` を保持していても本 variant にはならない。SQL-10 の再送判定
-    /// （同一 `operation_id` の再実行が `23505` を受けたら commit 済みとみなす）は、
-    /// この同一テナント内スコープでのみ成立する。
+    /// 同じ `id` を保持していても本 variant にはならない。`operation_id` 単位の
+    /// 冪等判定（台帳による重複拒否・内容不一致検出）は本 variant の管轄外で、
+    /// TASK-93・TASK-94・TASK-101 が後続で扱う。
     IdConflict,
 }
 
