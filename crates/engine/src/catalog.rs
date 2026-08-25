@@ -20,11 +20,15 @@
 //! 挿入時に本モジュールの [`TableSchema::validate_embedding_dim`] で宣言次元との
 //! 完全一致を検証する。次元検証はここで完結し、RLS ポリシー評価（可視性判定）は
 //! 従来どおり呼び出し元（TASK-133 以降）の責務のまま変えない。
+//!
+//! `sql::allowlist` との関係（TASK-74、対象ビヘイビア: SQL-8）: `impl TableLookup for
+//! Storage`（本ファイル下部）が SQL 表層の FROM テーブル存在確認を橋渡しする。
 
 use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
 use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
@@ -774,6 +778,33 @@ impl Storage {
             None
         };
         Ok((out, cursor_for_next))
+    }
+}
+
+/// `sql::allowlist::validate_statement`（TASK-74、対象ビヘイビア: SQL-8）から FROM
+/// テーブルのカタログ存在確認に使われる橋渡し実装。`get_table_schema` が返す
+/// `CatalogError` を SQL 表層の `wire_code` 契約へ分類し直す:
+/// `TableNotFound` は「存在しない」（`Ok(false)`）、識別子形式不正（`Invalid`）は
+/// テーブル参照として構文的に成立しないため `42601`、それ以外（`redb` I/O 由来の
+/// `Backend` を含む）はカタログ照会自体の失敗として `XX000` とし、受理側へは倒さない
+/// （fail-closed。`.claude/rules/security.md`「不安全な設計」対応）。
+impl TableLookup for Storage {
+    fn table_exists(&self, name: &str) -> std::result::Result<bool, SqlSurfaceError> {
+        match self.get_table_schema(name) {
+            Ok(_) => Ok(true),
+            Err(CatalogError::TableNotFound(_)) => Ok(false),
+            Err(CatalogError::Invalid(detail)) => Err(SqlSurfaceError::unsupported(format!(
+                "malformed table reference: {detail}"
+            ))),
+            Err(
+                CatalogError::Backend(_)
+                | CatalogError::TableAlreadyExists(_)
+                | CatalogError::ColumnAlreadyExists(_)
+                | CatalogError::RowNotFound(_),
+            ) => Err(SqlSurfaceError::Internal {
+                detail: "catalog lookup failed".to_string(),
+            }),
+        }
     }
 }
 

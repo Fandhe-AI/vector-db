@@ -17,6 +17,7 @@ pub mod rls;
 pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
+pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;

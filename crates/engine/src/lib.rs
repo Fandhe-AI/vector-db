@@ -61,6 +61,12 @@
 //! サイズクラス別・総量上限・グローバル LRU で管理するプールを提供し、
 //! `batch_search.rs::run_batch_search` の行デコード用スクラッチバッファがこれを
 //! 経由する（詳細は `buffer_pool.rs` モジュールドキュメント参照）。
+//!
+//! TASK-74（対象ビヘイビア: SQL-8）: `sql.rs` が SQL 表層の入口。受信 SQL テキストに
+//! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）で受理範囲外構文を
+//! `42601`、カタログ未存在テーブルを `42P01` として決定的に拒否する（`error-format.md`
+//! ERR-2 写像）。受理側の実行計画は TASK-75 以降の管轄（詳細は `sql.rs` モジュール
+//! ドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -78,6 +84,7 @@ pub mod rls;
 pub mod row_codec;
 pub mod search_engine;
 pub mod sparse;
+pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
