@@ -581,6 +581,7 @@ pub struct RlsSafetyNet<'c> {
 }
 
 impl<'c> RlsSafetyNet<'c> {
+    /// 束縛済み `PolicyContext` を保持する安全網を構築する。
     pub fn new(ctx: &'c PolicyContext) -> Self {
         RlsSafetyNet { ctx }
     }
@@ -620,18 +621,22 @@ pub struct RlsVerifiedHits {
 }
 
 impl RlsVerifiedHits {
+    /// 検証済み hits を借用で返す。
     pub fn hits(&self) -> &[(u64, f64)] {
         &self.hits
     }
 
+    /// 検証済み hits を所有権ごと取り出す。
     pub fn into_hits(self) -> Vec<(u64, f64)> {
         self.hits
     }
 
+    /// 検証済み hits の件数。
     pub fn len(&self) -> usize {
         self.hits.len()
     }
 
+    /// 検証済み hits が空か。
     pub fn is_empty(&self) -> bool {
         self.hits.is_empty()
     }
