@@ -179,6 +179,11 @@ core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差�
 	scripts/check_core_api.sh --self-test
 	scripts/check_core_api.sh
 
+.PHONY: sort-determinism-check
+sort-determinism-check: ## RRF 融合等のソート非決定性 API 再混入検知（TASK-84・Issue #61。cargo 不要のテキスト比較）
+	scripts/check_sort_determinism.sh --self-test
+	scripts/check_sort_determinism.sh
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
@@ -193,7 +198,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/parallel_bench.rs）

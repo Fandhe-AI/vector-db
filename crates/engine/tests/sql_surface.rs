@@ -385,6 +385,106 @@ fn sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text() {
     assert_eq!(result_ids(&result), vec![1, 2]);
 }
 
+// TASK-84（対応 Issue #61）: SQL-4（HYBRID/hybrid_rrf 経由の RRF 融合）end-to-end で、
+// 同点融合スコアを持つ行群が `LIMIT` 境界を跨ぐ場合でも決定的であることを検証する。
+// `hybrid.rs`・`crates/engine/tests/hybrid.rs` のユニット・統合レベルの検証を
+// SQL 表層（`EngineCore::execute_sql`）まで通しで確認する回帰テスト。
+#[test]
+fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
+    let path = unique_db_path("sql4-tie-boundary");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+
+    // `crates/engine/tests/hybrid.rs` の
+    // `hybrid_search_tie_group_across_limit_boundary_is_deterministic_and_matches_oracle`
+    // と同じコーパス構成: id 30〜32 は密ベクトルのみクエリに近く（疎側は
+    // 「anchor」を含まないため候補外）、id 10〜12 は「anchor」を含む（疎側で
+    // ヒット）が密ベクトルはクエリと直交（密側の内積は 0 で三者とも同値タイ）。
+    // SQL 表層は `pool_depth = LIMIT.max(既定値)` を密側 `k` に使うため
+    // （`sql/exec.rs` 参照）、可視 6 行すべてが密プールに入り、id 10〜12 は
+    // 密側で内積 0 の同点グループ（id 昇順でタイブレーク）を形成する。
+    let rows: [(u64, [f32; 2], Option<&str>); 6] = [
+        (30, [0.9, 0.1], Some("unrelated content alpha")),
+        (31, [0.8, 0.1], Some("unrelated content beta")),
+        (32, [0.7, 0.1], Some("unrelated content gamma")),
+        (10, [0.0, 1.0], Some("anchor anchor anchor")),
+        (11, [0.0, -1.0], Some("anchor anchor")),
+        (12, [0.0, 2.0], Some("anchor")),
+    ];
+    for (id, emb, body) in rows {
+        let value = match body {
+            Some(b) => Value::Text(b.to_string()),
+            None => Value::Null,
+        };
+        storage
+            .insert_typed_row(
+                "docs",
+                id,
+                "tenant-a",
+                Visibility::Public,
+                &[Value::Vector(emb.to_vec()), value],
+            )
+            .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    // LIMIT 4 は密側同点グループ（id 10, 11, 12。密内積 0 で三者同値）3 件のうち
+    // 全件を含み、さらに疎ヒットの寄与で二番目に高い id=30 が続く位置になる
+    // （疎ヒットの BM25 は文書長で差が付くため三者間の RRF 合計スコアには
+    // 差が出るが、密側の同点タイブレーク（id 昇順）自体が LIMIT 境界の
+    // 決定性に影響しないことは、この LIMIT 位置に依らず以下の反復実行で
+    // 確認する）。
+    let sql =
+        "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 4";
+
+    let baseline = core.execute_sql(&ctx, sql).expect("hybrid SQL-4 ok");
+    let baseline_ids = result_ids(&baseline);
+    for trial in 1..20 {
+        let result = core
+            .execute_sql(&ctx, sql)
+            .unwrap_or_else(|e| panic!("trial={trial}: hybrid SQL-4 ok, got {e}"));
+        assert_eq!(
+            result_ids(&result),
+            baseline_ids,
+            "trial={trial} diverged from baseline"
+        );
+    }
+    // id 10〜12 は密内積 0（同点）だが疎側 BM25 の寄与差により RRF 合計スコアは
+    // 文書長が短いほど高くなる（`sparse.rs` の BM25 長さ正規化の帰結）ため
+    // id 昇順とは限らない順位になりうる。ここでは値そのものではなく、密同点
+    // グループが全件 Top-4 に含まれ、かつ密ベクトルのみで一致する id 30〜32 の
+    // 中では最上位（id=30）だけが混ざることを確認する（同点タイブレークが
+    // LIMIT 境界を跨いでも壊れていないことの構造的な確認）。
+    assert_eq!(
+        baseline_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [10u64, 11, 12, 30]
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "baseline_ids={baseline_ids:?}"
+    );
+
+    // 2 構文形（`hybrid_rrf(...)` / `HYBRID(...)`）でも同一 Top-k であることを
+    // 同時に確認する（既存の
+    // `sql4_hybrid_rrf_and_hybrid_syntax_forms_return_identical_topk` と同種の
+    // 検証を、同点境界コーパスでも独立に確認する）。
+    let sql_kw =
+        "SELECT * FROM docs ORDER BY HYBRID(embedding, '[1.0,0.0]', body, 'anchor') LIMIT 4";
+    let result_kw = core.execute_sql(&ctx, sql_kw).expect("HYBRID form ok");
+    assert_eq!(result_ids(&result_kw), baseline_ids);
+}
+
 // --- 共通契約: 空テーブル・SELECT * の列順 -------------------------------------
 
 #[test]

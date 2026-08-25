@@ -266,6 +266,150 @@ fn hybrid_search_on_empty_corpus_returns_ok_empty() {
     assert!(hits.is_empty());
 }
 
+// TASK-84（対応 Issue #61）: RRF 融合結果の同点タイブレークが `hybrid_search` の
+// `LIMIT`（＝ `k`）境界を跨ぐ場合でも決定的であることの回帰テスト。PoC-10 が
+// 指摘した非決定性（`HashMap` 由来の走査順・`sort_unstable_by` のタイブレーク欠如）
+// は engine 本体には存在しない（`hybrid.rs` は `BTreeMap` 累積 + 安定ソート +
+// id 昇順タイブレークを使う。`docs/design/rrf-tie-break-determinism.md` 参照）。
+// 本テストは密側で複数 id が完全同点（同一内積）になるコーパスを構成し、
+// その同点グループが `k` 境界を跨いでも (1) `ParallelSearchProvider` で
+// 反復実行して常に同一結果になること、(2) 独立オラクル（密側は本体実装と
+// 別経路の内積再計算、疎側はタイブレーク検証が主目的のため
+// `SparseIndex::search_within` の結果をそのまま用いる。下記コメント参照）と
+// 一致することを確認する。
+#[test]
+fn hybrid_search_tie_group_across_limit_boundary_is_deterministic_and_matches_oracle() {
+    // 密側 provider は `pool_depth`（既定で候補数を上回る）を `k` として渡すため
+    // 可視 6 行すべてを走査する。id 10〜12 はクエリベクトルと直交（内積 0）で
+    // 完全同点の密ランキング下位グループを形成し（id 昇順でタイブレーク）、
+    // id 30〜32 は密側で相異なる内積を持つ上位グループを形成する。id 10〜12 は
+    // さらに「anchor」で疎側にもヒットする（文書長差により疎側の寄与は
+    // 三者で異なるため、RRF 合計スコアは同点にならない）。この構成により、
+    // 密側だけで発生する厳密な同点グループ（id 10, 11, 12）が `k` 境界を
+    // またぐ場合の決定性を検証できる。
+    struct TieDoc {
+        id: u64,
+        text: &'static str,
+        // 疎のみヒットさせるため密ベクトルはクエリと直交させる。
+        vector: [f32; 2],
+    }
+    let query_vector = [1.0f32, 0.0];
+    // 密のみ id（30台）: クエリに近い順に rank 0,1,2 を占め、テキストはノイズ。
+    // 疎のみ id（10台）: キーワード「anchor」に一致するがベクトルはクエリと直交。
+    let docs: Vec<TieDoc> = vec![
+        TieDoc {
+            id: 30,
+            text: "unrelated content alpha",
+            vector: [0.9, 0.1],
+        },
+        TieDoc {
+            id: 31,
+            text: "unrelated content beta",
+            vector: [0.8, 0.1],
+        },
+        TieDoc {
+            id: 32,
+            text: "unrelated content gamma",
+            vector: [0.7, 0.1],
+        },
+        TieDoc {
+            id: 10,
+            text: "anchor anchor anchor",
+            vector: [0.0, 1.0],
+        },
+        TieDoc {
+            id: 11,
+            text: "anchor anchor",
+            vector: [0.0, -1.0],
+        },
+        TieDoc {
+            id: 12,
+            text: "anchor",
+            vector: [0.0, 2.0],
+        },
+    ];
+    let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text)).collect();
+    let index = SparseIndex::build(&refs).expect("sparse index build ok");
+    let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
+    let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector).collect();
+    let cfg = RrfConfig::default();
+    // 候補 6 件のうち k=4 は密側同点グループ（id 10, 11, 12。3 件）の全件を含み、
+    // 疎側の寄与差により総合スコアが最も高くなる id=30 が加わる位置になる
+    // （実測値はオラクルとの一致で検証する。ハードコードした期待順序には
+    // 依存しない）。
+    let k = 4;
+
+    let run = |trial: u64| {
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query_vector,
+            k: 6,
+        };
+        hybrid_search(&ParallelSearchProvider, input, &index, "anchor", k, &cfg)
+            .unwrap_or_else(|e| panic!("trial={trial}: hybrid search ok, got {e}"))
+    };
+
+    let baseline = run(0);
+    for trial in 1..20u64 {
+        assert_eq!(run(trial), baseline, "trial={trial} diverged from baseline");
+    }
+
+    // 独立オラクル: 本体の `rrf_fuse`/`hybrid_search` を経由せず、RRF の定義
+    // （`weight / (k_const + rank + 1)` の id ごと加算）を BTreeMap で再計算する。
+    let k_const = 60.0f64;
+    let mut oracle_scores: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    // 密ランキング: クエリ [1,0] との内積降順。id 30,31,32 のみが有意な内積を持つ
+    // （id 10,11,12 は直交＝内積 0 だが 0 は非負のため密リストにも出現しうる。
+    // オラクルは密側 provider と同じ「Top-k 全件」を使うため、ここでは
+    // `CpuScalarProvider` 相当の全件内積降順・id 昇順タイブレークで並べる）。
+    let mut dense_ranked: Vec<(u64, f64)> = docs
+        .iter()
+        .map(|d| {
+            let dot = d.vector[0] as f64 * query_vector[0] as f64
+                + d.vector[1] as f64 * query_vector[1] as f64;
+            (d.id, dot)
+        })
+        .collect();
+    dense_ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (rank, (id, _)) in dense_ranked.iter().enumerate() {
+        *oracle_scores.entry(*id).or_insert(0.0) += 1.0 / (k_const + rank as f64 + 1.0);
+    }
+    // 疎ランキング: BM25 スコアは内部実装依存のため独立再計算はしないが、
+    // 「anchor」を含む id 10,11,12 のみが疎側で有意にヒットし、id 30〜32 は
+    // 疎側で 0 件（BM25 未ヒット）になる。相対順位は tf のみで決まる単純な
+    // コーパス（IDF は全ヒット文書で同一）のため、tf 降順・id 昇順を疎ランクの
+    // オラクルとして用いる。
+    // 疎ランキング: BM25 スコアの計算式自体は private spec 側の管轄のため独立再実装
+    // しない。本テストが独立検証するのは「タイブレーク規約（スコア降順・id 昇順）が
+    // `LIMIT` 境界を跨いでも保たれるか」であり、疎側の相対順位はテスト対象の
+    // `SparseIndex::search_within` から取得してそのままオラクルへ入力する（密側の
+    // ランキングのみを完全に別経路で再計算し、独立性を確保する）。
+    let sparse_hits = index
+        .search_within(
+            "anchor",
+            cfg.pool_depth(),
+            &ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u64>>(),
+        )
+        .expect("sparse search ok");
+    for (rank, doc) in sparse_hits.iter().enumerate() {
+        *oracle_scores.entry(doc.doc_id).or_insert(0.0) += 1.0 / (k_const + rank as f64 + 1.0);
+    }
+    let mut oracle_sorted: Vec<(u64, f64)> = oracle_scores.into_iter().collect();
+    oracle_sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let expected_ids: Vec<u64> = oracle_sorted
+        .into_iter()
+        .take(k)
+        .map(|(id, _)| id)
+        .collect();
+
+    let actual_ids: Vec<u64> = baseline.iter().map(|h| h.id).collect();
+    assert_eq!(actual_ids, expected_ids);
+}
+
 // provider 差し替え検証（CORE-3〜5 統合の確認）: CpuScalarProvider と
 // ParallelSearchProvider で融合結果が一致すること。
 #[test]
