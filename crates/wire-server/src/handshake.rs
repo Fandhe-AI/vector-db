@@ -169,6 +169,18 @@ fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
 
 /// ErrorResponse（'E'）。SQLSTATE と英語メッセージのみを含む最小フィールド構成
 /// （severity 'S'・code 'C'・message 'M' のみ。他テナント・存在情報は含めない）。
+/// `protocol_dispatch::reject_and_close` から呼ばれる `io::Result` 版のラッパー。
+/// `HandshakeError`／`handshake::Result` は本モジュール限定の型のため、モジュール
+/// 境界をまたいで直接公開せず、戻り値を `io::Result` へ写像したこの関数のみを
+/// `pub(crate)` にする（`HandshakeError` 自体は private のまま維持する）。
+pub(crate) fn write_error_response_io(
+    stream: &mut TcpStream,
+    sqlstate: &str,
+    message: &str,
+) -> io::Result<()> {
+    write_error_response(stream, sqlstate, message).map_err(io::Error::from)
+}
+
 fn write_error_response(stream: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -314,8 +326,8 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// 認証成功後の最小メッセージループ。簡易クエリ（'Q'）には未実装エラー
 /// （SQLSTATE `0A000`）を返してループを継続し、Terminate（'X'）で正常終了する。
-/// それ以外の型（拡張クエリプロトコル等、TASK-71 管轄）は fail-closed で
-/// エラー応答後に接続を切断する。
+/// それ以外の型（拡張クエリプロトコル等）は `protocol_dispatch` へ委譲し、
+/// fail-closed でエラー応答後に接続を切断する（TASK-71・WIRE-8 で正式化済み）。
 ///
 /// `Q`・`X` いずれも構造検証を行う（review 指摘: 構造を検証せず読み捨てるだけでは
 /// フレーミングの曖昧さが残る）。`Q` は単一の NUL 終端文字列（空 body・終端 NUL
@@ -325,8 +337,9 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `_ctx` は認証成功時に導出された `engine::policy::PolicyContext`（テナント境界・
 /// 可視性判定の唯一の入力経路）をセッション状態として保持し続けるために受け取る
 /// （review 指摘: 破棄すると将来のクエリ実行経路がテナントを再導出する際に
-/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリ実行は TASK-71 の
-/// 管轄で現状は未実装のため、本関数ではまだ参照しない。
+/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリの実処理は
+/// 後続タスク（engine SQL 表層との接続）の管轄で現状は未実装のため、本関数では
+/// まだ参照しない。
 fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) -> Result<()> {
     loop {
         let type_byte = match framing::read_typed_frame_header(stream)? {
@@ -367,19 +380,24 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
                 let _body = framing::read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
             }
-            _ => {
-                // 拡張クエリプロトコル等の未対応メッセージ。長さは検証のうえ読み捨て、
-                // fail-closed でエラー応答後に切断する（TASK-71 で正式化予定）。
-                let _body = framing::read_length_prefixed_body(
+            other => {
+                // 拡張クエリプロトコル等の未対応メッセージ。長さフィールド
+                // （最低 4 バイト、MIN_TYPED_MESSAGE_LEN..=MAX_MESSAGE_LEN）だけは
+                // 他の型付きメッセージと同じ基準で検証する。未検証のまま
+                // `0A000`（未対応機能）を返すと、長さフィールド欠落・範囲外の
+                // malformed frame まで正規の未対応機能扱いにしてしまい、既存の
+                // framing/protocol error 契約（`54000`/`08P01`）を迂回してしまう
+                // ため（レビュー指摘の回帰防止）。本文自体は読まない
+                // （`protocol_dispatch` 側が型バイトのみで分類し、ErrorResponse
+                // 送出後は有界 lingering close で未読データを読み捨てる。
+                // ポインタ: TASK-71・WIRE-8）。
+                framing::validate_typed_message_length_prefix(
                     stream,
                     framing::MIN_TYPED_MESSAGE_LEN,
                     framing::MAX_MESSAGE_LEN,
                 )?;
-                write_error_response(
-                    stream,
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "message type is not supported on this connection",
-                )?;
+                let kind = crate::protocol_dispatch::classify(other);
+                crate::protocol_dispatch::reject_and_close(stream, kind, write_error_response_io)?;
                 return Ok(());
             }
         }
@@ -722,6 +740,101 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).expect("connect");
         write_length_prefixed_message(&mut client, b'X', b"");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// レビュー指摘の再現ケース: 未対応メッセージ（例: Parse 'P'）であっても、
+    /// 宣言長が `MIN_TYPED_MESSAGE_LEN`（4）未満の malformed frame は
+    /// `0A000`（未対応機能）としてではなく、既存の `FrameError` 経路
+    /// （`08P01` 相当）で fail-closed に拒否されること（`post_auth_loop` は
+    /// `Err` を返し、呼び出し元の `respond_and_close` が応答を分岐する）。
+    #[test]
+    fn post_auth_loop_rejects_unsupported_message_with_length_below_minimum() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            match result {
+                Err(HandshakeError::Frame(_)) => {}
+                other => panic!(
+                    "malformed length prefix on an unsupported message must surface as a                      FrameError, got {other:?}"
+                ),
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        // 型バイト 'P'（Parse・未対応）の直後に、body を含めない宣言長 3
+        // （MIN_TYPED_MESSAGE_LEN=4 未満）だけを送る。
+        client.write_all(b"P").expect("send type byte");
+        client
+            .write_all(&3i32.to_be_bytes())
+            .expect("send malformed length");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// レビュー指摘の再現ケース: 未対応メッセージの宣言長が `MAX_MESSAGE_LEN` を
+    /// 超える場合も同様に `FrameError`（`TooLarge`・`54000` 相当）経路へ送られ、
+    /// `0A000` を返さないこと。
+    #[test]
+    fn post_auth_loop_rejects_unsupported_message_with_length_too_large() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            match result {
+                Err(HandshakeError::Frame(FrameError::TooLarge { .. })) => {}
+                other => panic!(
+                    "oversized length prefix on an unsupported message must surface as                      FrameError::TooLarge, got {other:?}"
+                ),
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let declared = (framing::MAX_MESSAGE_LEN + 1) as i32;
+        client.write_all(b"P").expect("send type byte");
+        client
+            .write_all(&declared.to_be_bytes())
+            .expect("send oversized length");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// 正常系の対照確認: 未対応メッセージでも宣言長が妥当な範囲内であれば、
+    /// 従来どおり `reject_and_close`（`0A000` 応答＋切断）へ到達し、
+    /// `post_auth_loop` は `Ok(())` を返すこと。
+    #[test]
+    fn post_auth_loop_accepts_well_formed_unsupported_message_length() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            assert!(
+                result.is_ok(),
+                "well-formed length prefix on an unsupported message must still be rejected                  via 0A000 and return Ok(())"
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        // 型バイト 'P'（Parse・未対応）+ 妥当な宣言長のみ（body は付けない。
+        // `reject_and_close` 側は body を読まず lingering close で読み捨てる）。
+        write_length_prefixed_message(&mut client, b'P', b"");
+
+        let mut resp_type = [0u8; 1];
+        client
+            .read_exact(&mut resp_type)
+            .expect("read response type");
+        assert_eq!(resp_type[0], b'E', "expected ErrorResponse ('E')");
 
         server.join().expect("server thread must not panic");
     }

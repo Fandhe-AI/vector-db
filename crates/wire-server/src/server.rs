@@ -11,7 +11,7 @@
 //! 接続数上限・I/O タイムアウトを課す（[`accept_loop`]）。認証後は緩い
 //! [`POST_AUTH_IDLE_TIMEOUT`] へ切り替え、有効資格情報を持つクライアントが
 //! 何も送らずに接続枠を永久占有するのを防ぐ（暫定防御）。本格的な接続ライフサイクル
-//! 管理（段階的タイムアウト・ヘルスチェック・keepalive 等）は TASK-69（WIRE-8）の
+//! 管理（段階的タイムアウト・ヘルスチェック・keepalive 等）は TASK-69（WIRE-5, WIRE-6）の
 //! 管轄であり、本モジュールは暫定の防御的デフォルトに留める。
 
 use std::io;
@@ -91,7 +91,7 @@ pub const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// `MAX_CONCURRENT_CONNECTIONS` の枠を永久に占有し続けるのを防ぐ（review 指摘）。
 /// 期限超過時は接続を正常にクローズし、接続枠を解放する（`server::accept_loop` の
 /// `ConnectionSlot` の Drop 経由）。あくまで暫定防御であり、本格的なセッション生存
-/// 期間管理（keepalive・利用パターンに応じた期限調整等）は TASK-69（WIRE-8）の管轄。
+/// 期間管理（keepalive・利用パターンに応じた期限調整等）は TASK-69（WIRE-5, WIRE-6）の管轄。
 pub const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// 同時接続数の枠 1 つぶんの所有権。`Drop` で確実に解放する（RAII。早期 return や
