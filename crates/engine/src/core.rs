@@ -227,10 +227,16 @@ impl PrefilterCache {
         table: &str,
         ctx: &PolicyContext,
     ) -> Option<Arc<PrefilterSnapshot>> {
-        let current_generation = storage.current_generation().ok()?;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
 
         let mut guard = self.state.write().ok()?;
+        // 世代はロック取得後に読み直す（github-actions/codex-review P1 指摘）。
+        // ロック取得を待っている間に他スレッドが新しい世代のエントリを挿入し得るため、
+        // ロック取得前に読んだ古い世代値のままだと、その新しい有効エントリを
+        // 「不一致」と誤判定して破棄してしまう（fail-closed の意図に反する誤破棄）。
+        // ロック保持中に読む値なら、この呼び出し内で以降エントリが変化しないことを
+        // 保証できる。
+        let current_generation = storage.current_generation().ok()?;
         let position = guard
             .entries
             .iter()
@@ -275,6 +281,13 @@ impl PrefilterCache {
     /// ため、(0)(1) いずれも実行せずキャッシュへの反映をスキップする（fail-closed:
     /// 「判定できないなら書き込まない」側へ倒す。stale なエントリは [`Self::lookup`]
     /// が個別に検出して破棄する）。
+    ///
+    /// 世代の読み取りは書き込みロック取得後に行う（github-actions/codex-review P1
+    /// 指摘）。ロック取得前に読むと、ロック待機中に他スレッドがより新しい世代の
+    /// エントリを挿入し得るため、その古い世代値のまま (1) の一括破棄を行うと、
+    /// 直後に挿入されたばかりの真に新しい有効エントリまで「不一致」として誤って
+    /// 削除してしまう。ロック保持中に読んだ値なら、この呼び出し内で以降エントリが
+    /// 変化しないことを保証できる。
     fn insert(
         &self,
         storage: &Storage,
@@ -292,22 +305,23 @@ impl PrefilterCache {
             return snapshot;
         }
 
+        let Ok(mut guard) = self.state.write() else {
+            return snapshot;
+        };
+
         // (0) 挿入対象自身が現在世代と一致するか確認する（対象外スレッド指摘の修正）。
         // 世代が読み取れない、または挿入対象が既に古い場合はキャッシュへ反映せず
         // その場限りの `Arc` を返す。ここでリターンすることで、後続の「同一キー破棄」
         // ステップに到達させない。すなわち並行書き込みで自身が stale になった挿入が、
         // 別スレッドが直前に挿入した現在世代の有効エントリを上書き・削除する経路を断つ
-        // （型ドキュメント参照）。
+        // （型ドキュメント参照）。ロック保持中に読むため、以降のこの関数内の判定と
+        // 齟齬が生じない。
         let Ok(current_generation) = storage.current_generation() else {
             return snapshot;
         };
         if snapshot.built_generation() != current_generation {
             return snapshot;
         }
-
-        let Ok(mut guard) = self.state.write() else {
-            return snapshot;
-        };
 
         // 同一 (table, ctx) キーの既存エントリは挿入前に取り除く（Cursor Bugbot 指摘:
         // 常に push するだけだと同一キーが重複登録され、[`Self::lookup`] は先頭一致
