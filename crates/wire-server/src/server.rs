@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::UserStore;
-use crate::limits::{self, ConnectionLimiter};
+use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
 
 /// `bind_addr` を解決し、すべてのアドレスが loopback であることを検証したうえで
 /// 解決済みの [`SocketAddr`] 列を返す。TLS（TASK-72・WIRE-9）が実装されるまで、
@@ -72,7 +72,10 @@ pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
 ///   拒否応答の書き込み（最大 `REJECT_WRITE_TIMEOUT` の同期 `write_all`）を
 ///   accept ループ本体でブロックさせないことで、受信ウィンドウを閉じた相手を
 ///   繰り返し接続させて待受自体を止める経路（資源枯渇防御自体が新たな DoS
-///   経路になる問題）を避ける
+///   経路になる問題）を避ける。この拒否スレッド自体も
+///   [`limits::RejectWorkerLimiter`]（`MAX_REJECT_WORKERS`）で別枠に有界化し、
+///   上限到達後は応答を書かずに即座にクローズする（review 是正: 拒否経路の
+///   無制限 `thread::spawn` によるスレッド／スタック枯渇 DoS を防ぐ）
 /// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ設定してから
 ///   ハンドシェイクへ渡す（認証前後を問わず同一値を維持する。WIRE-5）。超過時は
 ///   `handle_connection` が応答を書かずに `Err` を返し、スレッド終了で枠が解放される
@@ -85,6 +88,10 @@ pub fn accept_loop(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
+    // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
+    // review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）。
+    let reject_limiter = RejectWorkerLimiter::new(limits::MAX_REJECT_WORKERS);
+
     for conn in listener.incoming() {
         let stream = match conn {
             Ok(s) => s,
@@ -110,10 +117,37 @@ pub fn accept_loop(
             // を避けるため、拒否応答の書き込みは短命な使い捨てスレッドへ委譲し、
             // accept ループは即座に次の `accept` へ戻る。このスレッドは
             // `limiter` の枠を消費しない（枠管理対象は認証済み接続処理のみ）。
+            //
+            // ただしこの拒否スレッド自体を無制限に生成すると、攻撃者が上限到達後に
+            // 接続を連続作成することでスレッド／スタックなどの OS 資源を無制限に
+            // 消費できてしまう（review 是正）。`reject_limiter` で別枠に有界化し、
+            // 上限に達した場合は応答を書かずに即座にクローズする（fail-closed。
+            // 応答が返らない方を、資源枯渇を許す方より安全側とする）。
             let max = limiter.max();
-            std::thread::spawn(move || {
-                limits::reject_too_many_connections(stream, max);
-            });
+            match reject_limiter.try_acquire() {
+                Some(reject_permit) => {
+                    // `std::thread::spawn` はスレッド生成失敗時に panic し、
+                    // accept ループ自体を停止させうる（review 指摘）ため、
+                    // panic しない `Builder::spawn` を使い、失敗時はログのみで
+                    // 継続する。生成に失敗した場合、`stream`・`reject_permit` は
+                    // クロージャごと `Err` の一部としてこの場でドロップされ、
+                    // 接続は応答なしにクローズされる。
+                    if let Err(e) = std::thread::Builder::new().spawn(move || {
+                        // 拒否応答の書き込み中だけ `reject_permit` を保持し、
+                        // スレッド終了時（正常終了・panic いずれも）に Drop で
+                        // 確実に枠を解放する。
+                        let _reject_permit = reject_permit;
+                        limits::reject_too_many_connections(stream, max);
+                    }) {
+                        eprintln!("wire-server: failed to spawn reject worker thread: {e}");
+                    }
+                }
+                None => {
+                    // 拒否ワーカーも枯渇: 新たにスレッドを生成せず、応答を書かずに
+                    // 即座にクローズする（有界化を優先し fail-closed に倒す）。
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            }
             continue;
         };
 

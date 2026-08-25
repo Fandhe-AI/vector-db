@@ -27,6 +27,74 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// 上限超過接続への拒否応答（[`reject_too_many_connections`]）を書き込むために
+/// 同時に生成できるワーカースレッド数の上限（review 是正・WIRE-6）。
+///
+/// `server::accept_loop` は本体をブロックさせないため拒否応答の書き込みを
+/// 使い捨てスレッドへ委譲するが、`MAX_CONNECTIONS` の枠管理外で無制限に
+/// `std::thread::spawn` すると、攻撃者が上限到達後に接続を連続作成することで
+/// スレッド・スタックなどの OS 資源を無制限に消費できてしまう（DoS）。
+/// [`RejectWorkerLimiter`] でこのワーカー数自体を別枠の小さい上限に有界化し、
+/// 上限に達した場合は応答を書かずに即座に接続をクローズする（fail-closed。
+/// 応答が返らない方を、資源枯渇を許す方より安全側とする）。
+pub const MAX_REJECT_WORKERS: usize = 16;
+
+/// 拒否応答ワーカー 1 本ぶんの所有権。`Drop` で確実に解放する（`ConnectionPermit`
+/// と同じ RAII パターン）。
+pub struct RejectWorkerPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for RejectWorkerPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 拒否応答ワーカースレッド数を [`MAX_REJECT_WORKERS`] 以内に有界化する専用の
+/// 小さいセマフォ。`ConnectionLimiter`（認証済み接続の枠）とは別枠で管理し、
+/// 拒否経路が本来の接続枠を消費しないという既存の契約を変えない。
+#[derive(Clone)]
+pub struct RejectWorkerLimiter {
+    active: Arc<AtomicUsize>,
+    max: usize,
+}
+
+impl RejectWorkerLimiter {
+    /// ワーカー数上限を `max` として新しいリミッターを作る。
+    pub fn new(max: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            max,
+        }
+    }
+
+    /// `active` が `max` 未満なら枠を 1 つ確保して `Some` を返す。`ConnectionLimiter`
+    /// と同じ CAS ループで競合下でも `max` を超えて確保しない。
+    pub fn try_acquire(&self) -> Option<RejectWorkerPermit> {
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            let next = current.checked_add(1)?;
+            match self.active.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(RejectWorkerPermit {
+                        active: Arc::clone(&self.active),
+                    })
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
 /// `docs/spec/04-behavior/error-format.md`。
 pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
