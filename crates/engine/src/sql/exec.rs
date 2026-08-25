@@ -32,6 +32,36 @@ use crate::storage::{Storage, StorageError};
 /// 最大値を取る）。
 const DEFAULT_HYBRID_POOL_DEPTH: usize = 200;
 
+/// `candidate_columns`（RLS/SCALAR 段を通過した可視行のうち、投影で実際に使う
+/// スカラー列だけを保持するキャッシュ）が累計で保持してよいバイト数の上限
+/// （Issue #56 レビュー指摘対応・codex P1: 1 フィールド最大 4 MiB（`row_codec::MAX_TEXT_FIELD_LEN`）
+/// × 候補最大 `arena::MAX_ARENA_ROWS`（100 万行）の組み合わせでは、投影に不要な列まで
+/// 複製・保持すると巨大確保に至り得る。`on_visible_row` は投影で使う列のみを保持し、
+/// かつ保持前にこの累計上限をアロケーション前に検証する。上限判定の主体は
+/// テキスト実体（`Value::Text` の複製バイト数）であり、これが本対応の中心。
+/// 加えて、行ごとに必ず確保される `Vec<Value>` 自体の構造体サイズ
+/// （`schema.columns.len() * size_of::<Value>()`）も加算する。列数が少ない
+/// スキーマでは `MAX_ARENA_ROWS`（100 万行）分でも本上限には遠く及ばないため、
+/// この構造体分の加算は「投影列を一切持たない `SELECT id ...` かつ列数が多い
+/// スキーマ」の残余リスクを塞ぐ副次的な安全網であり、主たる歯止めではない。
+/// `arena::MAX_ARENA_TOTAL_BYTES`
+/// と同一の 1 GiB を採用する（256 MiB 等より小さい値にすると、候補行数が多いが
+/// 1 行あたりは小さいテーブルへの `LIMIT` 付き正当なクエリを不必要に拒否しうるため、
+/// 密ベクタ側の総量上限と同じ桁数に揃えて過度に厳しくしない）。
+const MAX_CANDIDATE_SCALAR_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// `current` に `add` を加えた累計が `cap` を超えないことを検証してから返す
+/// （超過時は [`ArenaError::CapacityExceeded`]。アロケーション前の累計バイト量
+/// 検証を 1 箇所に集約するための共通ヘルパー。`on_visible_row` の構造体バイト・
+/// テキストバイトの両方の検証で使う）。
+fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize, ArenaError> {
+    let next = current.saturating_add(add);
+    if next > cap {
+        return Err(ArenaError::CapacityExceeded);
+    }
+    Ok(next)
+}
+
 // `pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH)` が常に
 // `hybrid::RrfConfig::new` の検証（`1..=hybrid::MAX_POOL_DEPTH`）を通過するのは、
 // `bound.limit` の上限（`core::MAX_SEARCH_K`。`sql::parser::bind` が検証済み）が
@@ -116,6 +146,45 @@ fn map_kernel_error(_e: KernelError) -> SqlSurfaceError {
     }
 }
 
+/// 投影段（`VECTOR` 列を返す `SELECT *`・明示投影）で、候補選択と同一スナップショット
+/// の `embedding`（`arena` が保持するバッファのスライス）を応答行用に複製する
+/// （Issue #56 レビュー指摘対応・codex P1: `catalog::validate_schema` は 1 テーブルに
+/// つき `VECTOR` 列を高々 1 本しか許さず、`hits.len()` は候補集合（`arena`。既に
+/// `arena::MAX_ARENA_TOTAL_BYTES` で総量検査済み）の部分集合であるため、この複製の
+/// 論理上限は arena 自体の容量検査で既に閉じている。残る懸念は `Vec::to_vec`
+/// （内部で `Vec::with_capacity` を使い、確保失敗時に abort する）が、arena の
+/// 検査を通過した論理サイズであってもホスト側のメモリが実際に不足した場合に
+/// プロセスを OOM abort させてしまう点。`try_reserve_exact` を使うことで、その場合を
+/// abort ではなく `Err`（fail-closed に `PayloadTooLarge`）として呼び出し元へ伝える
+/// （`arena.rs::try_reserve_exact`・security.md「不安全な設計｜無制限リソース確保
+/// （DoS）」と同方針）。
+fn try_clone_embedding(embedding: &[f32]) -> Result<Vec<f32>, SqlSurfaceError> {
+    let mut out: Vec<f32> = Vec::new();
+    out.try_reserve_exact(embedding.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("projected vector payload exceeds available memory")
+    })?;
+    out.extend_from_slice(embedding);
+    Ok(out)
+}
+
+/// 投影段で `Text` 列を応答行用に複製する。`candidate_columns`（`on_visible_row`）
+/// 側は [`MAX_CANDIDATE_SCALAR_BYTES`] で累計バイト量を検証済みだが、`String::clone`
+/// （内部で `String::with_capacity` 相当を使い、確保失敗時に abort する）を素朴に
+/// 使うと、その論理上限内であってもホスト側のメモリが実際に不足した場合に
+/// プロセスを OOM abort させ得る（Issue #56 レビュー指摘対応・codex P1:
+/// `decode_scalar_columns`／`candidate_columns` の複製に関する指摘と同根の問題が
+/// 応答構築側にも残っていたための追加対応。[`try_clone_embedding`] と同方針で
+/// `try_reserve_exact` を使い、失敗を abort ではなく `Err`（fail-closed に
+/// `PayloadTooLarge`）へ変換する）。
+fn try_clone_text(text: &str) -> Result<String, SqlSurfaceError> {
+    let mut out = String::new();
+    out.try_reserve_exact(text.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large("projected text payload exceeds available memory")
+    })?;
+    out.push_str(text);
+    Ok(out)
+}
+
 fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
     match e {
         HybridError::Sparse(SparseError::QueryTooLong { .. })
@@ -177,6 +246,30 @@ pub fn execute_statement(
     // 閉じ込め、再取得によるスナップショット不一致の窓をなくす）。
     let mut candidate_columns: HashMap<u64, Vec<Value>> = HashMap::new();
 
+    // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
+    // `decode_scalar_columns` が常に `Value::Null` を積むだけ（実体は `arena` から
+    // 引く）ため対象外。この集合に含まれない列は `on_visible_row` でデコード直後に
+    // 破棄し、`candidate_columns` へ複製・保持しない（[`MAX_CANDIDATE_SCALAR_BYTES`]
+    // のドキュメント参照。投影に不要な列まで全候補分保持する P1 指摘への対応）。
+    let needed_column_indices: HashSet<usize> = bound
+        .projection
+        .iter()
+        .filter_map(|col| match col {
+            ProjectedColumn::Column { index, .. } => Some(*index),
+            ProjectedColumn::Id => None,
+        })
+        .collect();
+
+    // `candidate_columns` に保持する Text 値の実バイト数に加え、行ごとに必ず確保する
+    // `Vec<Value>` 自体の構造体サイズも累計する（[`MAX_CANDIDATE_SCALAR_BYTES`] の
+    // ドキュメント参照。投影列を持たない `SELECT id ...` でも候補行数に比例して
+    // 積み上がる構造体アロケーションを見逃さないため）。
+    let mut candidate_scalar_bytes: usize = 0;
+    let row_struct_bytes = schema
+        .columns
+        .len()
+        .saturating_mul(std::mem::size_of::<Value>());
+
     let on_visible_row = |id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
         let decoded = row_codec::decode_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
@@ -203,7 +296,34 @@ pub fn execute_statement(
             }
         }
         // スカラー条件（あれば）を通過した行のみを、投影段で再利用するために保持する。
-        candidate_columns.insert(id, decoded);
+        // ただし投影で実際に参照される列（`needed_column_indices`）だけを残し、
+        // それ以外は `Value::Null` に落として複製を保持しない。この行を保持することで
+        // 増える累計バイト量（行構造体分 `row_struct_bytes` を先に、Text 実体分は列ごとに）
+        // を、それぞれのアロケーションの前に検証し、上限超過は fail-closed に
+        // `ArenaError::CapacityExceeded`（`map_arena_error` 経由で `PayloadTooLarge`）
+        // として拒否する（投影列を持たない `SELECT id ...` でも、候補行数に比例する
+        // `Vec<Value>` 構造体分だけで無制限に積み上がらないようにする）。
+        candidate_scalar_bytes = try_accumulate_budget(
+            candidate_scalar_bytes,
+            row_struct_bytes,
+            MAX_CANDIDATE_SCALAR_BYTES,
+        )?;
+        let mut kept: Vec<Value> = Vec::with_capacity(decoded.len());
+        for (idx, value) in decoded.into_iter().enumerate() {
+            if !needed_column_indices.contains(&idx) {
+                kept.push(Value::Null);
+                continue;
+            }
+            if let Value::Text(t) = &value {
+                candidate_scalar_bytes = try_accumulate_budget(
+                    candidate_scalar_bytes,
+                    t.len(),
+                    MAX_CANDIDATE_SCALAR_BYTES,
+                )?;
+            }
+            kept.push(value);
+        }
+        candidate_columns.insert(id, kept);
         Ok(true)
     };
 
@@ -342,9 +462,11 @@ pub fn execute_statement(
                                 detail: "projected column index out of range".to_string(),
                             })?;
                     match column.ty {
-                        ColumnType::Vector(_) => cells.push(Cell::Vector(embedding.to_vec())),
+                        ColumnType::Vector(_) => {
+                            cells.push(Cell::Vector(try_clone_embedding(embedding)?))
+                        }
                         ColumnType::Text => match decoded.get(*index) {
-                            Some(Value::Text(t)) => cells.push(Cell::Text(t.clone())),
+                            Some(Value::Text(t)) => cells.push(Cell::Text(try_clone_text(t)?)),
                             Some(Value::Null) | None => cells.push(Cell::Null),
                             Some(Value::Vector(_)) => {
                                 return Err(SqlSurfaceError::Internal {
@@ -376,4 +498,65 @@ pub fn execute_statement(
         .collect();
 
     Ok(QueryResult { columns, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #56 レビュー指摘対応・codex P1 の 2 件（`decode_scalar_columns` の
+    // 無制限保持・`embedding.to_vec()` の abort し得る確保）に対する境界値テスト。
+    // 本体（`execute_statement`）を通した巨大データでの再現は非現実的なため、
+    // 上限判定を担う純粋関数を直接検証する（`arena.rs`・`sparse.rs` の
+    // 境界値テストと同方針）。
+
+    #[test]
+    fn try_accumulate_budget_accepts_up_to_cap_exactly() {
+        assert_eq!(try_accumulate_budget(90, 10, 100).unwrap(), 100);
+    }
+
+    #[test]
+    fn try_accumulate_budget_rejects_one_byte_over_cap() {
+        assert!(matches!(
+            try_accumulate_budget(90, 11, 100),
+            Err(ArenaError::CapacityExceeded)
+        ));
+    }
+
+    #[test]
+    fn try_accumulate_budget_saturates_instead_of_overflowing() {
+        // `saturating_add` により usize::MAX 近傍でもオーバーフローで未定義動作にならず、
+        // 必ず `CapacityExceeded` として拒否される（coding-rust.md「整数演算は
+        // checked_*／saturating_* を使う」対応）。
+        assert!(matches!(
+            try_accumulate_budget(usize::MAX - 1, 10, 100),
+            Err(ArenaError::CapacityExceeded)
+        ));
+    }
+
+    #[test]
+    fn try_clone_embedding_copies_values_without_aliasing_source() {
+        let source = vec![1.0f32, 2.0, 3.0];
+        let cloned = try_clone_embedding(&source).expect("small copy must succeed");
+        assert_eq!(cloned, source);
+    }
+
+    #[test]
+    fn try_clone_embedding_handles_empty_slice() {
+        let cloned = try_clone_embedding(&[]).expect("empty copy must succeed");
+        assert!(cloned.is_empty());
+    }
+
+    #[test]
+    fn try_clone_text_copies_without_aliasing_source() {
+        let source = "hello world".to_string();
+        let cloned = try_clone_text(&source).expect("small copy must succeed");
+        assert_eq!(cloned, source);
+    }
+
+    #[test]
+    fn try_clone_text_handles_empty_string() {
+        let cloned = try_clone_text("").expect("empty copy must succeed");
+        assert!(cloned.is_empty());
+    }
 }
