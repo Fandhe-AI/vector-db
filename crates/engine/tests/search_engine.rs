@@ -57,18 +57,23 @@ fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
 }
 
 fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[f32]) {
-    storage
-        .insert_row_into_table(
-            table,
-            id,
-            &RowInput {
-                tenant_id: tenant,
-                visibility: Visibility::Public,
-                embedding,
-                metadata: &[],
-            },
-        )
-        .expect("seed row");
+    // テナント境界付き書き込みガード（TASK-95・RECOVER-4）経由で投入する。生の
+    // `Storage::insert_row_into_table` は `pub(crate)` 化済みでクレート外から呼べない
+    // （codex-review P0 指摘対応）。
+    let ctx = PolicyContext::new(tenant).expect("valid tenant");
+    engine::tenant::insert_row(
+        storage,
+        table,
+        &ctx,
+        id,
+        &RowInput {
+            tenant_id: tenant,
+            visibility: Visibility::Public,
+            embedding,
+            metadata: &[],
+        },
+    )
+    .expect("seed row");
 }
 
 /// `docs` テーブル（dim=3）へ 6 行を投入した `Storage` を返す。同点スコアを含む

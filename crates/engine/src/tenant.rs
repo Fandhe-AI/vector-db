@@ -228,12 +228,9 @@ pub enum TenantWriteError {
 
 impl TenantWriteError {
     /// SQLSTATE 風 `wire_code`（coding-rust.md「エラー型は SQLSTATE 風 wire_code の設計に
-    /// 従う」）。`Forbidden` → `42501`（テナント帰属不一致）・`NotFound` → `P0002`
-    /// （行不在）は ERR-2 の分類表（`docs/spec/04-behavior/error-format.md`）が
-    /// 明示する写像（`Forbidden` は RECOVER-4 の記述と対応）。行 id 重複（INSERT
-    /// 上書き拒否）は ERR-2 の分類表に専用ラベルが無いため、`operation_id` 重複と同じ
-    /// unique_violation 系統として暫定で `23505` を割り当てる（正式な写像は未確定。
-    /// PR レビューでユーザーへ報告し、必要なら spec リポ側の課題として起票する）。
+    /// 従う」）。対象ビヘイビア: RECOVER-4・ERR-2（`docs/spec/04-behavior/error-format.md`
+    /// をポインタ参照。写像の具体値・採用理由は spec 側の管理事項であり、本コメントへは
+    /// 転記しない。spec-confidentiality.md 参照）。
     pub fn wire_code(&self) -> &'static str {
         match self {
             TenantWriteError::Forbidden => "42501",
@@ -556,5 +553,60 @@ mod tests {
             verify_hits(&storage, "docs", &ctx, &[1, 2]),
             Err(TenantError::HitOutsideVisibleSet)
         ));
+    }
+
+    // 対象ビヘイビア: RECOVER-4（負方向・生 API の到達範囲確認）。
+    // `crate::catalog::Storage::insert_row_into_table` は codex-review P0 指摘
+    // （PR #194）を受けて `pub(crate)` 化し、クレート外（`tests/` 配下の結合テスト・
+    // wire-server 等）からは到達不能にした。この生 API は本モジュール内では
+    // （例: 将来の移行ツール等で）引き続き参照しうるため、クレート内ユニットテストとして
+    // 「テナント境界チェックを経由しない書き込みは実際に行を書き換える」ことを確認する。
+    // 旧・結合テスト版（`tests/tenant_breach.rs::recover4_checker_detects_unguarded_mutation`）
+    // は `pub(crate)` 化に伴いクレート外から呼べなくなったため、このユニットテストへ
+    // 移設した。
+    #[test]
+    fn raw_insert_row_into_table_bypasses_tenant_guard() {
+        let path = unique_db_path("raw-insert-bypass");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+
+        // ガード付き経路（`insert_row`）で tenant-b 名義の行を正規に投入する。
+        let owner = PolicyContext::new("tenant-b").expect("valid tenant");
+        insert_row(
+            &storage,
+            "docs",
+            &owner,
+            1,
+            &RowInput {
+                tenant_id: "tenant-b",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: &[],
+            },
+        )
+        .expect("seed tenant-b row via guarded path");
+
+        // ガードを経由しない生の `Storage::insert_row_into_table`（`pub(crate)`）で
+        // 同じ id を tenant-a 名義へ上書きできてしまうことを確認する（クレート内から
+        // 到達可能である以上、この経路自体は塞がっていないことの記録。クレート外からの
+        // 到達不能性が本対応の主眼）。
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[9.0, 9.0],
+                    metadata: &[],
+                },
+            )
+            .expect("unguarded write succeeds by construction");
+
+        let after = storage
+            .get_row_from_table("docs", 1)
+            .expect("read back row");
+        assert_eq!(after.tenant_id, "tenant-a");
     }
 }

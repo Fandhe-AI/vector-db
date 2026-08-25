@@ -553,42 +553,9 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         .expect("EngineCore::delete_row ok");
 }
 
-// 対象ビヘイビア: RECOVER-4（負方向・検査器の実効性）。ガードを経由しない生の
-// `Storage::insert_row_into_table` で tenant-b 行を上書きした場合、`snapshot_table` の
-// 前後比較が差分を検出できることを確認する（実装と検査器の経路分離・fail しうることの
-// 確認）。
-#[test]
-fn recover4_checker_detects_unguarded_mutation() {
-    let path = unique_db_path("checker-detects");
-    let _cleanup = CleanupGuard(path.clone());
-    let storage = Storage::open(&path).expect("open storage");
-    seed_corpus(&storage, 5, 4000);
-
-    let before = snapshot_table(&storage);
-    let victim_id = *before
-        .iter()
-        .find(|(_, (t, ..))| t == TENANT_B)
-        .map(|(id, _)| id)
-        .expect("seed must contain a tenant-b row");
-
-    // ガードを迂回した生の書き込み（テナント境界を無視する）。
-    storage
-        .insert_row_into_table(
-            TABLE,
-            victim_id,
-            &RowInput {
-                tenant_id: TENANT_A,
-                visibility: Visibility::Public,
-                embedding: &[9.0; DIM as usize],
-                metadata: &[],
-            },
-        )
-        .expect("unguarded write succeeds by construction");
-
-    let after = snapshot_table(&storage);
-    assert_ne!(
-        before, after,
-        "checker must detect the unguarded mutation as a difference"
-    );
-    assert_eq!(after[&victim_id].0, TENANT_A);
-}
+// 対象ビヘイビア: RECOVER-4（負方向・検査器の実効性）。ガードを経由しない生の書き込み
+// （`Storage::insert_row_into_table`）で tenant-b 行を上書きした場合に `snapshot_table` の
+// 前後比較が差分を検出できることの確認は、当該 API を `pub(crate)` 化した
+// （codex-review P0 指摘・PR #194。クレート外部から到達不能にした）ことに伴い、
+// クレート内ユニットテスト（`crates/engine/src/tenant.rs` の
+// `raw_insert_row_into_table_bypasses_tenant_guard`）へ移設した。

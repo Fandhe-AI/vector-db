@@ -663,7 +663,21 @@ impl Storage {
     /// 行うことで、並行する DDL（`alter_table_add_column` 等）との整合を確保する。
     /// テーブル不存在・`VECTOR` 列なし・次元不一致はすべて fail-closed に `Err` で拒否する
     /// （security.md「不安全な設計」）。
-    pub fn insert_row_into_table(
+    ///
+    /// `pub(crate)`: 本メソッドはテナント境界チェック（`PolicyContext::is_owner`）を
+    /// 一切行わない生の書き込み経路であり、クレート外（wire-server・結合テスト等）へ
+    /// 公開するとテナント境界を完全に迂回できてしまう（codex-review P0 指摘・PR #194。
+    /// security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
+    /// クレート外・テストからの新規行投入は [`crate::tenant::insert_row`]（テナント境界付き
+    /// 書き込みガード。TASK-95・RECOVER-4）を経由すること。
+    ///
+    /// `#[cfg_attr(not(test), allow(dead_code))]`: 現状の呼び出し元はすべて各モジュールの
+    /// `#[cfg(test)]` ユニットテスト（`arena.rs`・`core.rs`・`rls.rs`・本ファイルの
+    /// `tenant.rs`）のみのため、`cfg(test)` を含まない通常ビルド（wire-server が依存する
+    /// ビルド単位）では本メソッドが到達不能になり `dead_code` lint が発火する。これは
+    /// 上記の意図的な `pub(crate)` 制限の帰結であり黙殺してよい。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn insert_row_into_table(
         &self,
         table_name: &str,
         id: u64,
@@ -684,13 +698,20 @@ impl Storage {
     }
 
     /// テーブルスコープで複数行を単一トランザクションで挿入する（TASK-146、対象ビヘイビア:
-    /// EXT-1, EXT-2）。[`insert_row_into_table`](Self::insert_row_into_table) のバッチ版。
+    /// EXT-1, EXT-2）。`insert_row_into_table` のバッチ版。
     /// 1 行でもスキーマ取得・次元検証・エンコードに失敗した場合、write トランザクションは
     /// commit されずに破棄されるため（`redb::WriteTransaction` の drop 契約）、全体が
     /// 未反映のまま拒否される。空スライスの場合も write トランザクション内でカタログ上の
     /// テーブル存在を確認してから成功を返す（レビュー指摘対応: `rows.is_empty()` を
     /// 存在確認より先に判定すると、存在しないテーブルへの空バッチ挿入が `Ok(())` になり
     /// 「テーブル不存在は fail-closed に `Err`」という契約を空バッチで迂回できてしまう）。
+    ///
+    /// 既知の課題（codex-review P0 指摘・PR #194。`insert_row_into_table` と同型）:
+    /// 本メソッドもテナント境界チェックを行わない生の書き込み経路のまま `pub` を維持して
+    /// いる（`crate::tenant` 側に対応するガード付きバッチ挿入 API がまだ無いため。生 API を
+    /// `pub(crate)` 化した場合の外部呼び出し元移行はテスト側の対応を要し、本 PR の
+    /// スコープ外として次 PR へ持ち越す）。新規のクレート外呼び出しをこの API に追加しない
+    /// こと。
     pub fn insert_rows_into_table(
         &self,
         table_name: &str,
@@ -729,9 +750,13 @@ impl Storage {
     ///
     /// スキーマ取得・`VECTOR` 列の抽出・スカラーペイロード生成
     /// （[`row_codec::encode_scalar_columns`]）・行書き込みを単一の write トランザクション
-    /// 内で行う（[`Self::insert_row_into_table`] と同じ理由で並行 DDL との整合を確保する）。
+    /// 内で行う（`insert_row_into_table` と同じ理由で並行 DDL との整合を確保する）。
     /// `VECTOR` 列を持たない・`values` の対応する位置が `Value::Vector` でない場合は
     /// fail-closed に `Err`。
+    ///
+    /// 既知の課題（codex-review P0 指摘・PR #194。`insert_row_into_table` と同型）:
+    /// 本メソッドもテナント境界チェックを行わない生の書き込み経路のまま `pub` を維持して
+    /// いる。理由・対応方針は [`Self::insert_rows_into_table`] の同種コメントを参照。
     pub fn insert_typed_row(
         &self,
         table_name: &str,

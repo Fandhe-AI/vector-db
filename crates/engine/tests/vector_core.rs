@@ -68,18 +68,20 @@ fn seed_row(
     visibility: Visibility,
     embedding: &[f32],
 ) {
-    storage
-        .insert_row_into_table(
-            table,
-            id,
-            &RowInput {
-                tenant_id: tenant,
-                visibility,
-                embedding,
-                metadata: &[],
-            },
-        )
-        .expect("seed row");
+    let ctx = PolicyContext::new(tenant).expect("valid tenant");
+    engine::tenant::insert_row(
+        storage,
+        table,
+        &ctx,
+        id,
+        &RowInput {
+            tenant_id: tenant,
+            visibility,
+            embedding,
+            metadata: &[],
+        },
+    )
+    .expect("seed row");
 }
 
 // 対象ビヘイビア: CORE-1。`&dyn VectorCore` のみを介する 2 種類の「模擬プロトコル
