@@ -44,8 +44,9 @@ fi
 
 # writer（crash_tool write）の PID を保持する。ループ内で起動するたびに更新され、
 # `wait` で reap 済みなら空文字へ戻す（不変条件は stop_writer のコメント参照）。
-# trap 設定より前に初期化しておかないと、ループ開始前（cargo build 中など）に
-# 中断された場合 set -u 下で cleanup が未定義変数エラーになり、
+# trap 設定（後述の trap cleanup EXIT / INT TERM）より前に初期化しておかないと、
+# trap 設置後・ループ内で writer_pid=$! に到達する前の窓で SIGTERM/SIGINT を受けた
+# 場合に set -u 下で cleanup が未定義変数エラーになり、
 # 本来の目的（writer 停止）を果たさず異常終了してしまう。
 writer_pid=""
 
