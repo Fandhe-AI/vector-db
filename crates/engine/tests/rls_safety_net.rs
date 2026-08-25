@@ -218,7 +218,7 @@ fn safety_net_independently_removes_disallowed_hits_from_unfiltered_arena() {
     let viewer_tenants = ["tenant-0", "tenant-2", "tenant-4"];
     let ks = [1usize, 10, 50, 200];
 
-    for &viewer in &viewer_tenants {
+    for (viewer_idx, &viewer) in viewer_tenants.iter().enumerate() {
         for allow_private in [false, true] {
             let ctx = if allow_private {
                 PolicyContext::with_visibilities(viewer, [Visibility::Public, Visibility::Private])
@@ -229,7 +229,10 @@ fn safety_net_independently_removes_disallowed_hits_from_unfiltered_arena() {
             let expected_allowed = allowed_ids(&truth, viewer, allow_private);
 
             for &k in &ks {
-                let query = random_query(k as u64 ^ (viewer.len() as u64) << 8);
+                // viewer 文字列長は tenant-0/tenant-2/tenant-4 で等しく（いずれも 8
+                // バイト）シードとして使えないため、ループ内の viewer_idx（0..2）を
+                // 使い viewer ごとに異なるクエリを生成する。
+                let query = random_query(k as u64 ^ (viewer_idx as u64) << 8);
                 let input = SearchInput {
                     ids: arena.ids(),
                     vectors: arena.vectors(),
@@ -293,11 +296,16 @@ fn new_core(storage: Storage) -> EngineCore {
 }
 
 /// `WHERE visible()` のみのクエリで、既定順序（`RLS, SCALAR, DISTANCE`）と
-/// `HINT ORDER(DISTANCE, SCALAR, RLS)`（RLS 段を最後尾＝安全網の並べ替え有無が
-/// 最も現れやすい位置）の結果 id 列が一致することを確認する（安全網は `filter`
-/// ベースで要素を並べ替えない契約。`rls.rs::RlsSafetyNet::apply` のドキュメント参照）。
+/// `HINT ORDER(DISTANCE, SCALAR, RLS)`（RLS 段を最後尾）の結果 id 列が一致すること
+/// を確認する。全行が単一テナント・`Public` で `WHERE visible()` の事前フィルタを
+/// 素通りするため、本テストは安全網（`RlsSafetyNet::apply`）が実際に行を drop する
+/// ケースでの順序保持は検証しない（それは HINT ORDER 自体の実行結果が RLS 段の
+/// 位置に依存せず安定していることの検証）。安全網が drop を伴っても部分列として
+/// 順序を保つことは §1（`RlsSafetyNet::apply` を直接駆動する
+/// `safety_net_matches_independent_oracle_across_visibility_and_tenants` 等）の
+/// subsequence 検証でカバー済み。
 #[test]
-fn execute_sql_result_order_is_unchanged_when_rls_stage_runs_last() {
+fn execute_sql_hint_order_rls_last_matches_default_order() {
     let path = unique_db_path("order-preserved-rls-last");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -343,6 +351,6 @@ fn execute_sql_result_order_is_unchanged_when_rls_stage_runs_last() {
     let rls_last_ids: Vec<u64> = rls_last_result.rows.iter().map(|r| r.id).collect();
     assert_eq!(
         default_ids, rls_last_ids,
-        "safety net must not reorder rows when RLS stage runs last"
+        "HINT ORDER with RLS stage last must match default stage order"
     );
 }
