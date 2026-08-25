@@ -32,14 +32,12 @@
 //! （両型とも他テナントのデータ量が対象テナントの検索可用性へ干渉しない契約で揃えている。
 //! 詳細は [`SearchTimeFilter`] のドキュメント参照）。
 //!
-//! 本モジュールはさらに [`ImplicitRlsHook`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7）を
-//! 提供する。認証済みセッションからサーバー側で導出された `PolicyContext`
-//! （`wire-server` の `handshake.rs::post_auth_loop` が保持し、SQL テキストは一切渡さない
-//! 契約。導出自体は `wire-server/src/auth.rs`・TASK-67 の管轄）だけを入力とし、
+//! 本モジュールはさらに [`ImplicitRlsHook`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7。
+//! ポインタ: `docs/spec/05-tasks.md` TASK-137・`docs/spec/04-behavior/rls.md`）を提供する。
+//! 認証済みセッションからサーバー側で導出された `PolicyContext`（導出自体は
+//! `wire-server/src/auth.rs`・TASK-67 の管轄）だけを入力とし、
 //! `core.rs::EngineCore::search`/`get_row`・`sql/exec.rs::execute_statement`
-//! の候補集合構築（C1〜C4 共通）を無条件に通す単一注入点である。述語の有無・SQL テキスト・
-//! 接続パラメータのいずれにも依存しないため、クライアントが述語を省略・改変しても
-//! 可視性フィルタを外せない。判定ロジック自体は新設せず
+//! の候補集合構築への単一注入点である。判定ロジック自体は新設せず
 //! [`crate::policy::PolicyContext::is_visible`] へ委譲するだけに留める
 //! （テナント比較の分岐を増やさない・security.md P0）。
 
@@ -56,13 +54,10 @@ use crate::storage::{Storage, Visibility};
 
 /// RLS-6 / RLS-7 の暗黙適用フック（TASK-137）。
 ///
-/// 認証済みセッションから導出済みの [`PolicyContext`] だけを束縛し、C1（純粋
-/// Top-k）・C2（スカラー条件付き Top-k）・C4（ハイブリッド）の候補集合構築時に
-/// 可視性フィルタを無条件適用するための単一注入点。呼び出し元は
-/// `core.rs::EngineCore::search`/`get_row` と `sql/exec.rs::execute_statement`
-/// （RLS 段は `bound.rls_predicate_present` を参照せず必ず本フック経由の述語を使う）。
-/// コンストラクタ・メソッドのいずれも SQL テキスト・テーブル名・接続パラメータを
-/// 受け取らない（RLS-6: テナントは `PolicyContext` のみが唯一の入力源）。
+/// 認証済みセッションから導出済みの [`PolicyContext`] だけを束縛し、候補集合構築時の
+/// 可視性フィルタ適用への単一注入点。呼び出し元は
+/// `core.rs::EngineCore::search`/`get_row` と `sql/exec.rs::execute_statement`。
+/// コンストラクタ・メソッドのいずれも `PolicyContext` 以外の入力を受け取らない。
 #[must_use]
 pub struct ImplicitRlsHook<'c> {
     ctx: &'c PolicyContext,
@@ -1909,8 +1904,8 @@ mod tests {
         assert_eq!(filter.table_name(), "docs");
     }
 
-    // TASK-137・RLS-6/7: フックは独自比較を持たず `PolicyContext::is_visible` へ
-    // 委譲するだけであることを、テナント × 可視性の全組で確認する。
+    // TASK-137: フックは独自比較を持たず `PolicyContext::is_visible` へ
+    // 委譲するだけであることを確認する。
     #[test]
     fn implicit_hook_delegates_to_policy_context_is_visible() {
         let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
@@ -1932,8 +1927,7 @@ mod tests {
         assert_eq!(hook.context() as *const PolicyContext, &ctx as *const _);
     }
 
-    // TASK-137・RLS-6/7: Public のみならず Private も許可した ctx でも、他テナントの
-    // Private 行は fail-closed のまま（許可漏れで全許可に倒れていないことの回帰）。
+    // TASK-137: fail-closed の回帰確認。
     #[test]
     fn implicit_hook_never_admits_other_tenant_private_rows() {
         let ctx =

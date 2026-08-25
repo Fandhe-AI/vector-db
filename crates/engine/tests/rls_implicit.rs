@@ -5,10 +5,8 @@
 //! `CleanupGuard`、決定的擬似乱数 xorshift64*、production の判定関数
 //! （[`engine::policy::PolicyContext::is_visible`]）を一切呼ばない独立オラクル、
 //! `Storage::open` → `EngineCore::from_storage`）で実 `Storage` 上に複数テナントの
-//! コーパスを構築し、`EngineCore::execute_sql`（SQL 経由・C1/C2/C4）と
-//! `VectorCore::search`（trait 経由・C1）の両経路で RLS-6（テナントはサーバー側で
-//! `PolicyContext` からのみ導出される）・RLS-7（`WHERE` 句の `visible()` 述語の
-//! 有無・改変では可視性フィルタを解除できない）を機械検証する。
+//! コーパスを構築し、`EngineCore::execute_sql`（SQL 経由）と `VectorCore::search`
+//! （trait 経由）の両経路で RLS-6・RLS-7 を機械検証する。
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -186,7 +184,7 @@ fn query_vec() -> String {
     )
 }
 
-// --- RLS-7: 述語の有無に依存しない無条件強制（C1/C2/C4） -------------------------
+// --- RLS-7（TASK-137） -----------------------------------------------------------
 
 #[test]
 fn rls7_c1_without_predicate_matches_with_predicate_and_leaks_nothing() {
@@ -355,7 +353,7 @@ fn rls7_predicate_alteration_cannot_widen_visibility() {
     }
 }
 
-// --- RLS-6: テナントはサーバー側で `PolicyContext` からのみ導出される -------------
+// --- RLS-6（TASK-137） -----------------------------------------------------------
 
 #[test]
 fn rls6_tenant_is_derived_only_from_policy_context() {
@@ -432,7 +430,7 @@ fn rls6_sql_cannot_reference_tenant_column_or_session_settings() {
     }
 }
 
-// --- RLS-6/7: `VectorCore::search`（trait 経由の C1）でも同じ契約 -----------------
+// --- RLS-6/7（TASK-137）: `VectorCore::search`（trait 経由）でも同じ契約 ----------
 
 #[test]
 fn rls_hook_is_the_only_path_for_vector_core_search() {
