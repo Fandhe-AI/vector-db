@@ -1,16 +1,18 @@
 //! TASK-72（WIRE-9）の受け入れ条件「対象ビヘイビア ID に対応するテストを追加する」に
 //! 対応するテスト。TASK-72 はランタイム実装を伴わない設計ドキュメント作成タスクである
-//! ため、成果物（`crates/wire-server/docs/tls-scram-design.md`）の存在と必須セクションの
-//! 完全性を検証することでビヘイビア対応とする。TLS・SCRAM の実装本体に対するテストは、
-//! 実装コードが追加される後続タスク側で追加する。
+//! ため、成果物（`docs/design/tls-scram-design.md`）の存在と必須セクションの完全性を
+//! 検証することでビヘイビア対応とする。TLS・SCRAM の実装本体に対するテストは、実装
+//! コードが追加される後続タスク側で追加する。
 
 use std::fs;
 use std::path::PathBuf;
 
 /// テスト対象ドキュメントの絶対パスを返す。
-/// `CARGO_MANIFEST_DIR` は `crates/wire-server` を指すため、直下の `docs/` を参照する。
+/// `CARGO_MANIFEST_DIR` は `crates/wire-server` を指すため、リポジトリ構造規約
+/// （CLAUDE.md の設計ドキュメント置き場）に従いリポジトリルート直下の
+/// `docs/design/` を参照する。
 fn design_doc_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/tls-scram-design.md")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/tls-scram-design.md")
 }
 
 #[test]

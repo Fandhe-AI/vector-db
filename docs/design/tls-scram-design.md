@@ -38,7 +38,7 @@ TCP 待ち受け・SSLRequest ハンドシェイク・認証フローは未実�
 
 ### TLS ライブラリ候補
 
-- 依存最小方針（[dependency-policy](../../../.claude/rules/dependency-policy.md)）
+- 依存最小方針（[dependency-policy](../../.claude/rules/dependency-policy.md)）
   との整合を最優先とする。TLS はプロトコル実装が複雑であり自作コストが高いため、
   外部クレートへの依存が現実的な候補となる（wire プロトコル本体の自作方針とは
   別軸の判断）。
