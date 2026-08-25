@@ -10,18 +10,23 @@
 //! ログ・引数に残さない）。
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
-//! `--bind` は [`wire_server::server::bind_loopback`] により非ループバックアドレスを
-//! 起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind する
-//! （TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
-//! 再解決による TOCTOU も作らない。review 是正）。接続数上限・認証前 I/O タイムアウトは
-//! [`wire_server::server::accept_loop`] が課す。本格的な接続管理・bind 方式の
-//! 拡張は TASK-69・TASK-70 の管轄。
+//! TASK-70（対象ビヘイビア WIRE-7）。
+//! `--bind` は [`wire_server::bind_guard::GuardedBindAddrs::resolve`] により、TLS 未構成
+//! （[`wire_server::bind_guard::TransportSecurity::Cleartext`]）の間は非ループバック
+//! アドレスを起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind
+//! する（TLS 未実装のうちは平文パスワードを非ループバックへ公開しない。ホスト名の
+//! 再解決による TOCTOU も作らない。TASK-67 review 是正・TASK-70 で移設）。接続数上限・
+//! 認証前 I/O タイムアウトは [`wire_server::server::accept_loop`] が課す。本格的な
+//! 接続管理は TASK-69 の管轄。TLS 導入（TASK-72・WIRE-9）時は
+//! [`wire_server::bind_guard::TransportSecurity`] に variant を追加し、ここで渡す値を
+//! 実行時の TLS 設定有無に応じて切り替える。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use wire_server::auth::{self, UserStore};
+use wire_server::bind_guard::{GuardedBindAddrs, TransportSecurity};
 use wire_server::server;
 
 const DEFAULT_BIND: &str = "127.0.0.1:5432";
@@ -72,6 +77,18 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // TLS（TASK-72・WIRE-9）は未実装のため常に `Cleartext` を渡す。bind の
+    // loopback 検証をユーザーストア読込より前に行うことで、ユーザーストアの
+    // 内容に関わらず bind 先が拒否対象であれば即座に終了できる（fail-closed を
+    // 早期に確定させる）。
+    let guarded = match GuardedBindAddrs::resolve(&bind_addr, TransportSecurity::Cleartext) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("wire-server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let store = match UserStore::load_from_file(&users_path) {
         Ok(s) => s,
         Err(e) => {
@@ -81,13 +98,16 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     let store = Arc::new(store);
 
-    // `server::bind_loopback` は loopback 検証と bind を単一の入口にまとめており、
-    // `bind_addr`（文字列）を別途 `TcpListener::bind` へ渡すことはしない
-    // （検証時と bind 時で DNS 再解決が起きる TOCTOU を作らないため。review 指摘）。
-    let listener = match server::bind_loopback(&bind_addr) {
+    // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
+    // （文字列）を別途 `TcpListener::bind` へ渡すことはしない（検証時と bind 時で
+    // DNS 再解決が起きる TOCTOU を作らないため。TASK-67 review 指摘）。
+    let listener = match guarded.bind() {
         Ok(l) => l,
-        Err(msg) => {
-            eprintln!("wire-server: {msg}");
+        Err(e) => {
+            eprintln!(
+                "wire-server: failed to bind {bind_addr} ({:?}): {e}",
+                guarded.addrs()
+            );
             return ExitCode::FAILURE;
         }
     };
