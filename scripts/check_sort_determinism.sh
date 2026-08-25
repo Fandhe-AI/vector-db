@@ -12,8 +12,12 @@
 #
 # 検知対象（コメント・文字列リテラル・char リテラルは除外し、実コードのみを
 # 走査する。詳細は scan_dir 内コメント参照）:
-#   - `sort_unstable_by(` / `sort_unstable_by_key(`
-#   - `select_nth_unstable_by(` / `select_nth_unstable_by_key(`
+#   - `sort_unstable_by` / `sort_unstable_by_key`
+#   - `select_nth_unstable_by` / `select_nth_unstable_by_key`
+# への**識別子としての参照そのもの**を検知対象とする（直後に `(` を伴う呼び出し
+# だけでなく、`let f = <[T]>::sort_unstable_by;` のような関数アイテムとしての
+# 参照経由の再混入も見逃さないため。codex-review P1 指摘対応。判断根拠は
+# `docs/design/rrf-tie-break-determinism.md` 参照）。
 #
 # `partial_cmp(...).unwrap()/.expect(...)` は当初検知対象に含める案もあったが、
 # 安定ソート（`sort_by`）と組み合わせた「非有限値が来たら panic で止める」テスト
@@ -22,9 +26,12 @@
 # `docs/design/rrf-tie-break-determinism.md` 参照）。
 #
 # 許可が必要な正当ケース（例: 整数 id 列など全順序を持つ値への `sort_unstable`
-# 相当）は、対象行末に `// sort-determinism: allow <理由>` マーカーを付けることで
-# 個別に除外できる（`check_core_api.sh` の `--update` のような自動更新機構は持たない。
-# 除外は都度コードレビューでマーカーごと承認する運用とする）。
+# 相当）は、検知位置と同じ行の**行コメント**（`//` 以降）に
+# `sort-determinism: allow <理由>` マーカーを付けることで個別に除外できる
+# （`check_core_api.sh` の `--update` のような自動更新機構は持たない。除外は
+# 都度コードレビューでマーカーごと承認する運用とする）。文字列リテラル中の
+# マーカーやコード部分に現れるマーカー文字列は許可として扱わない（codex-review
+# P1 指摘対応。詳細は scan_dir 内コメント参照）。
 #
 # `crates/engine/src` に現状 0 件であることの根拠・維持すべき不変条件は
 # `docs/design/rrf-tie-break-determinism.md` を参照。
@@ -50,40 +57,35 @@ elif [ "${1:-}" != "" ]; then
 fi
 
 # `dir` 配下（存在しなければスキップ）の `*.rs` を対象に、非決定的ソート API の
-# 呼び出しを検知する。マッチ行を stdout へ出力し、1 件も無ければ何も出力しない
+# 識別子参照を検知する。マッチ行を stdout へ出力し、1 件も無ければ何も出力しない
 # （呼び出し側が出力有無で成否判定する）。
 #
 # 完全な lexer/parser は持たない軽量チェックだが、単純な「行頭 `//` だけを除外
 # して正規表現を全体適用する」実装は、ブロックコメント (`/* ... */`) や文字列
-# リテラル中の `sort_unstable_by(` を実コードとして誤検知する一方、
-# `sort_unstable_by /* comment */ (` のようにコメントを挟んだ有効な呼び出しは
-# 検知漏れになる（codex-review P2 指摘）。そのため以下の 2 段階で処理する:
+# リテラル中の `sort_unstable_by` を実コードとして誤検知する。そのため以下の
+# 2 段階で処理する:
 #
 #   1. `mask_non_code` (perl): ファイル全体を走査し、行コメント (`//...`)・
 #      ブロックコメント（`/* ... */`、ネスト対応）・文字列リテラル
 #      （通常/バイト文字列と `r"..."`/`r#"...#"` 等の raw 文字列）・char
 #      リテラル (`'x'`, `'\n'` 等。ライフタイム `'a` とは非貪欲マッチで区別)
-#      の中身を、行・桁位置を保ったまま半角スペースへ置換する（改行はそのまま
-#      保持し、行番号の対応関係を崩さない）。これにより「コメント・文字列内の
-#      誤検知」と「コメントを挟んだ呼び出しの検知漏れ」の両方を同時に解消する
-#      （`\s*` はマスク後の空白へそのまま一致するため、ブロックコメントを挟んだ
-#      呼び出しも 1 つの正規表現でまたいで検知できる）。
-#   2. マスク後のテキストに対して API 呼び出しパターンを走査する（API 名と
-#      `(` の間の改行・空白を許容する `\s*`。2 回目の codex-review P1 指摘対応）に加え、
-#      turbofish 付き呼び出し（`sort_unstable_by::<_>(...)` 等）の API 名と `(` の
-#      間に挟まる `::<...>` も許容する（3 回目の codex-review P1 指摘対応）。turbofish
-#      の中身は Perl の名前付き再帰サブパターン
-#      `(?<angle><(?:->|[^<>]|(?&angle))*>)` で山括弧のネストを追跡して読み取る
-#      （`[^>]*` の単純実装では `sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) ->
-#      Ordering>(...)` のように型引数内に `>` を含む呼び出しで内側の `>` で
-#      早期にマッチが終了し検知漏れになっていた。4 回目の codex-review P1
-#      指摘対応）。関数ポインタの戻り値矢印 `->` はそれ自体に `>` を含むが
-#      閉じ括弧ではないため、`->` を 1 トークンとして先に許容し、素の `>` とは
-#      区別する（区別しないと `-> Ordering>` の `>`（矢印側）で山括弧の対応が
-#      崩れ、直後の実在する閉じ `>` の手前で誤ってマッチが終了する）。単一行・
-#      複数行いずれのネスト付き turbofish もマッチする。
-#      `// sort-determinism: allow ...` 許可マーカーの判定は、マーカー自体が
-#      コメント中にしか書けないため、マスク前の元テキスト（`@lines`）を参照する。
+#      の中身を、行・桁位置を保ったまま半角スペースへ置換した `masked` テキストと、
+#      各文字が「行コメント内 (`L`)」か「それ以外 (`O`)」かを同じ長さ・同じ
+#      行数で記録した `kind` 分類文字列を同時に構築する（改行はいずれも保持し、
+#      行番号・桁位置の対応関係を崩さない）。`kind` は文字列リテラル・
+#      ブロックコメント中に現れる `sort-determinism: allow` を実際の行コメント
+#      と区別するために使う（2 回目の codex-review P1 指摘対応。文字列中の
+#      マーカーで実コードを誤って許可してしまう問題の修正）。
+#   2. `masked` テキストに対して、API 名の**識別子としての参照そのもの**を単語
+#      境界 (`\b`) で走査する（呼び出し `(...)` の有無を問わない。関数アイテム
+#      経由の参照 `<[T]>::sort_unstable_by` のような直接呼び出しを伴わない
+#      再混入も見逃さないため。1 回目の codex-review P1 指摘対応）。
+#      各マッチについて、マッチと同じ行の `kind` 分類でマッチ終端より後ろに
+#      行コメント (`L`) が始まる位置があり、かつその行コメント部分（元テキスト
+#      から取得。文字列リテラル等でマスクされていない生のコメント文字列）に
+#      `sort-determinism: allow ` 形式のマーカーが含まれる場合のみ許可済みと
+#      判定する。文字列リテラル中や、行コメントより手前のコード部分に現れる
+#      同一文字列は許可として扱わない。
 #
 # fail-closed: `find`・`perl` の失敗（構文エラー・実行不能・読み取り失敗等）を
 # 握り潰さず scan_dir の非ゼロ終了として呼び出し元へ伝播する（従来は
@@ -113,38 +115,46 @@ scan_dir() {
     local out
     out="$(perl -0777 -ne '
       # 行コメント・ブロックコメント・文字列/char リテラルの中身を、行・桁位置を
-      # 保ったまま半角スペースへ置換する（改行は保持）。戻り値は元テキストと
-      # 同じ長さ・同じ行数の文字列。
+      # 保ったまま半角スペースへ置換した $out と、各文字が行コメント内
+      # (`"L"`) かそれ以外 (`"O"`) かを同じ長さ・同じ行数で記録した $kind を
+      # 返す。$out は API 識別子検知用、$kind は許可マーカーが実際の行コメント
+      # 内にあるかどうかの判定用（文字列/ブロックコメント中のマーカーとの
+      # 区別に使う）。
       sub mask_non_code {
         my ($s) = @_;
         my $out = "";
+        my $kind = "";
         pos($s) = 0;
         my $len = length($s);
         while (pos($s) < $len) {
           if ($s =~ /\G\/\/[^\n]*/gc) {
             $out .= (" " x length($&));
+            $kind .= ("L" x length($&));
           } elsif ($s =~ /\G\/\*/gc) {
             my $depth = 1;
             $out .= "  ";
+            $kind .= "OO";
             while ($depth > 0 && pos($s) < $len) {
-              if ($s =~ /\G\/\*/gc) { $depth++; $out .= "  "; }
-              elsif ($s =~ /\G\*\//gc) { $depth--; $out .= "  "; }
-              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
-              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              if ($s =~ /\G\/\*/gc) { $depth++; $out .= "  "; $kind .= "OO"; }
+              elsif ($s =~ /\G\*\//gc) { $depth--; $out .= "  "; $kind .= "OO"; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; $kind .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; $kind .= "O"; }
               else { last; }
             }
           } elsif ($s =~ /\Gb?r(#*)"/gc) {
             my $hashes = $1;
             $out .= (" " x length($&));
+            $kind .= ("O" x length($&));
             my $closing = "\"" . $hashes;
             while (pos($s) < $len) {
-              if ($s =~ /\G\Q$closing\E/gc) { $out .= (" " x length($closing)); last; }
-              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
-              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              if ($s =~ /\G\Q$closing\E/gc) { $out .= (" " x length($closing)); $kind .= ("O" x length($closing)); last; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; $kind .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; $kind .= "O"; }
               else { last; }
             }
           } elsif ($s =~ /\Gb?"/gc) {
             $out .= (" " x length($&));
+            $kind .= ("O" x length($&));
             while (pos($s) < $len) {
               if ($s =~ /\G\\(.)/gcs) {
                 # エスケープシーケンス（`\n` 等）を 2 文字消費する。第 2 文字が
@@ -152,52 +162,73 @@ scan_dir() {
                 # 半角スペースへ潰さず改行として保持しないと、マスク後テキストの
                 # 行数が元テキストとずれてしまう（`.` が `/s` 修飾子で改行にも
                 # マッチするための復元漏れ。self-test fixture では未再現の実
-                # ソースで顕在化したバグ）。
+                # ソースで顕在化したバグ）。$kind も同じ位置に実改行を入れて
+                # 行数を揃える。
                 $out .= " " . ($1 eq "\n" ? "\n" : " ");
+                $kind .= "O" . ($1 eq "\n" ? "\n" : "O");
               }
-              elsif ($s =~ /\G"/gc) { $out .= " "; last; }
-              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
-              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              elsif ($s =~ /\G"/gc) { $out .= " "; $kind .= "O"; last; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; $kind .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; $kind .= "O"; }
               else { last; }
             }
           } elsif ($s =~ /\G'"'"'(?:\\.|[^'"'"'\\\n])'"'"'/gc) {
             $out .= (" " x length($&));
+            $kind .= ("O" x length($&));
           } elsif ($s =~ /\G(\n)/gc) {
             $out .= "\n";
+            $kind .= "\n";
           } elsif ($s =~ /\G(.)/gcs) {
             $out .= $1;
+            $kind .= "O";
           } else {
             last;
           }
         }
-        return $out;
+        return ($out, $kind);
       }
 
       my $orig = $_;
-      my $masked = mask_non_code($orig);
+      my ($masked, $kind) = mask_non_code($orig);
       my @lines = split /\n/, $orig, -1;
       my @masked_lines = split /\n/, $masked, -1;
-      if (scalar(@lines) != scalar(@masked_lines)) {
+      my @kind_lines = split /\n/, $kind, -1;
+      if (scalar(@lines) != scalar(@masked_lines) || scalar(@lines) != scalar(@kind_lines)) {
         die "mask_non_code produced a different line count than the input (masking bug)\n";
       }
 
       my $joined = "";
       my @lineno_of_pos;
+      my @line_start;
+      my $cum = 0;
       for my $i (0 .. $#masked_lines) {
         my $ln = $i + 1;
+        push @line_start, $cum;
         my $text = $masked_lines[$i] . "\n";
         push @lineno_of_pos, ($ln) x length($text);
         $joined .= $text;
+        $cum += length($text);
       }
-      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*(?:::\s*(?<angle><(?:->|[^<>]|(?&angle))*>)\s*)?\(/gs) {
-        my $start_ln = $lineno_of_pos[$-[0]];
-        my $end_ln = $lineno_of_pos[$+[0] - 1] // $start_ln;
+
+      # API 名の識別子そのものを検知する（呼び出し `(...)` の有無を問わない。
+      # 関数アイテム経由の参照も検知対象に含めるため）。
+      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\b/gs) {
+        my $match_start = $-[0];
+        my $match_end = $+[0];
+        my $ln = $lineno_of_pos[$match_start];
+        my $col_end = $match_end - $line_start[$ln - 1];
+
         my $allowed = 0;
-        for my $l ($start_ln .. $end_ln) {
-          if ($lines[$l - 1] =~ /sort-determinism: allow /) { $allowed = 1; last; }
+        my $kind_line = $kind_lines[$ln - 1];
+        my $comment_idx = index($kind_line, "L");
+        if ($comment_idx != -1 && $comment_idx >= $col_end) {
+          my $comment_text = substr($lines[$ln - 1], $comment_idx);
+          if ($comment_text =~ /sort-determinism: allow /) {
+            $allowed = 1;
+          }
         }
         next if $allowed;
-        print "$start_ln:$lines[$start_ln - 1]\n";
+        print "$ln:$lines[$ln - 1]\n";
       }
     ' "${file}")"
     local perl_status=$?
@@ -264,10 +295,7 @@ fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by(|a, b| a.cmp(b));
 }
 EOF
-  # fixture 11: 検知すべきケース（turbofish 付き呼び出し・単一行。
-  # `sort_unstable_by::<_>(...)` のように API 名と `(` の間に `::<...>` が
-  # 挟まる形式は Rust として有効だが、`\s*\(` のみの旧パターンでは検知漏れに
-  # なっていたという 3 回目の codex-review P1 指摘の再現ケース）。
+  # fixture 11: 検知すべきケース（turbofish 付き呼び出し・単一行）。
   cat >"${tmp}/detect_turbofish.rs" <<'EOF'
 fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by::<_>(|a, b| a.cmp(b));
@@ -283,16 +311,34 @@ fn f(v: &mut [(i32, i32)]) {
     );
 }
 EOF
-  # fixture 13: 検知すべきケース（型引数内に `>` を含むネストした turbofish。
-  # `<[^>]*>` の単純パターンでは型引数中の内側 `>`（`Vec<i32>` の閉じ括弧）で
-  # マッチが終了し、その後に本来続くはずの `(` が見つからず検知漏れになって
-  # いたという 4 回目の codex-review P1 指摘の再現ケース）。
+  # fixture 13: 検知すべきケース（型引数内に `>` を含むネストした turbofish）。
   cat >"${tmp}/detect_turbofish_nested.rs" <<'EOF'
 use std::cmp::Ordering;
 
 fn f(v: &mut Vec<i32>, cmp: fn(&Vec<i32>, &Vec<i32>) -> Ordering) {
     let mut vv: Vec<Vec<i32>> = vec![v.clone()];
     vv.sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) -> Ordering>(cmp);
+}
+EOF
+  # fixture 14: 検知すべきケース（呼び出しを伴わない関数アイテムとしての
+  # 参照。`(` を要求する旧パターンでは検知漏れになっていたという 5 回目の
+  # codex-review P1 指摘の再現ケース）。
+  cat >"${tmp}/detect_function_item_reference.rs" <<'EOF'
+fn f() {
+    let sort = <[i32]>::sort_unstable_by;
+    let mut v = vec![3, 1, 2];
+    sort(&mut v, |a, b| a.cmp(b));
+}
+EOF
+  # fixture 15: 検知すべきケース（文字列リテラル中に許可マーカーと同じ文字列を
+  # 埋め込んで検知を回避しようとするケース。マスク前の行全体に対する素朴な
+  # 文字列一致では誤って許可扱いになっていたという 6 回目の codex-review P1
+  # 指摘の再現ケース。マーカーは行コメントではなく文字列リテラル中にあるため
+  # 許可されず、検知されなければならない）。
+  cat >"${tmp}/detect_string_marker_bypass.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by(|a, b| a.cmp(b));
+    let _s = "sort-determinism: allow fake marker inside a string literal";
 }
 EOF
   # fixture 3: 検知してはならないケース（コメント行・許可マーカー・整数の
@@ -304,12 +350,13 @@ fn f(ids: &mut Vec<u64>, v: &mut Vec<i32>) {
     v.sort_unstable_by(|a, b| a.cmp(b)); // sort-determinism: allow 全順序の整数比較のみ
 }
 EOF
-  # fixture 6: 検知してはならないケース（改行を挟んだ呼び出しの許可マーカーが
-  # 呼び出し終端側の行にある場合。マーカー検索がマッチ範囲全体を見ることの確認）。
+  # fixture 6: 検知してはならないケース（複数行にわたる呼び出しで、識別子が
+  # 現れる行自体の行コメントに許可マーカーがある場合。マーカー検索が
+  # マスク後の行コメント分類を正しく参照することの確認）。
   cat >"${tmp}/allowed_multiline.rs" <<'EOF'
 fn f(v: &mut Vec<i32>) {
-    v.sort_unstable_by
-        (|a, b| a.cmp(b)); // sort-determinism: allow 全順序の整数比較のみ
+    v.sort_unstable_by // sort-determinism: allow 全順序の整数比較のみ
+        (|a, b| a.cmp(b));
 }
 EOF
   # fixture 8: 検知してはならないケース（文字列リテラル中の言及。テキスト
@@ -373,6 +420,14 @@ EOF
   fi
   if ! printf '%s\n' "${local_detected}" | grep -q "detect_turbofish_nested.rs.*sort_unstable_by"; then
     echo "FAIL: self-test did not detect nested-turbofish-qualified sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) -> Ordering>(...) in detect_turbofish_nested.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_function_item_reference.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect a call-less function item reference to sort_unstable_by in detect_function_item_reference.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_string_marker_bypass.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by guarded by a fake allow marker inside a string literal in detect_string_marker_bypass.rs" >&2
     failed=1
   fi
   if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs"; then
