@@ -153,20 +153,15 @@ pub enum StorageError {
     /// `#[non_exhaustive]` を付与する案（同 PRRT_kwDOUAKASM6cB6is）はいずれも公開 enum・
     /// 既存の網羅的 match への破壊的変更にあたるとして差し戻された）。
     ///
-    /// **[`fmt::Display`] の互換性契約**: 本 variant の `Display` 文字列
-    /// （`"scan limit exceeded: use scan_page"`）は既存利用者がログ・診断で参照しうる
-    /// 観測可能な契約の一部とみなし、`scan_batch_log` 経由の誤案内を修正する目的でも
-    /// 告知なく変更しない（PR #193 codex レビュー PRRT_kwDOUAKASM6cCl80 対応。variant の
-    /// 追加・`non_exhaustive` 化と同様、Display 文字列の変更もここでは互換性を壊す観測可能な
-    /// 変更として扱う）。経路別の正確な代替手段案内（`scan` → [`Storage::scan_page`]・
-    /// テーブルスコープ → `catalog.rs` の `scan_table_page`）は、どの関数を呼んだかを
-    /// 把握している呼び出し元（= 内部コンテキスト）が本 variant を変換する際に生成する
-    /// （`catalog.rs::convert_storage_error` 参照）。`Storage::scan_batch_log` は現時点で
-    /// カタログ層を経由する製品コード上の呼び出し元を持たないため、この Display 文字列を
-    /// そのまま観測する経路は実質的に存在しない。将来 `scan_batch_log` に製品コード上の
-    /// 呼び出し元を追加する場合は、その呼び出し元がこの Display をそのまま利用者へ
-    /// 露出させず、`catalog.rs::convert_storage_error` と同様に経路を把握した層で
-    /// 正確な案内文言へ変換すること。
+    /// **[`fmt::Display`] の互換性契約**: 本 variant の `Display` 文字列は既存利用者が
+    /// ログ・診断で参照しうる観測可能な契約の一部とみなし、variant 追加・`non_exhaustive`
+    /// 化と同様に告知なく削除・改変しない。ただし文字列の**中身**が経路別の代替 API 名
+    /// （`scan_page`）を含んでいると `scan_batch_log` 経由でも誤案内になるため（PR #193
+    /// codex レビュー PRRT_kwDOUAKASM6cC0IQ 対応）、両経路で共通して成立する中立な文言
+    /// （どの API 名にも触れない）に固定する。経路別の正確な代替手段案内（`scan` →
+    /// [`Storage::scan_page`]・テーブルスコープ → `catalog.rs` の `scan_table_page`）は、
+    /// どの関数を呼んだかを把握している呼び出し元（= 内部コンテキスト）が本 variant を
+    /// 変換する際に付加する（`catalog.rs::convert_storage_error` 参照）。
     ScanLimitExceeded,
     /// [`crate::txn::BatchWriteTxn::log_batch`] に既存の `batch_seq` を渡した。`redb` の
     /// `insert` は無条件上書きのため、検出せず通すとバッチ台帳の不変条件
@@ -200,11 +195,17 @@ impl fmt::Display for StorageError {
             StorageError::Backend(e) => write!(f, "storage backend error: {e}"),
             StorageError::Codec(msg) => write!(f, "row codec error: {msg}"),
             StorageError::NotFound(id) => write!(f, "row not found: id={id}"),
-            // 互換性のため既存の Display 文字列を変更しない（本 variant の
+            // `scan`・`scan_batch_log` の 2 経路で共有する中立文言（本 variant の
             // ドキュメンテーションコメント「Display の互換性契約」参照。PR #193 codex
-            // レビュー PRRT_kwDOUAKASM6cCl80 対応）。経路別の正確な代替手段案内は、経路を
-            // 把握している呼び出し元（`catalog.rs::convert_storage_error` 等）が組み立てる。
-            StorageError::ScanLimitExceeded => write!(f, "scan limit exceeded: use scan_page"),
+            // レビュー PRRT_kwDOUAKASM6cC0IQ 対応）。経路別の正確な代替手段案内（`scan_page`
+            // 等の API 名）は、経路を把握している呼び出し元（`catalog.rs::convert_storage_error`
+            // 等）が組み立てる。
+            StorageError::ScanLimitExceeded => {
+                write!(
+                    f,
+                    "scan limit exceeded: result too large for a single unpaginated read"
+                )
+            }
             StorageError::DuplicateBatchSeq(seq) => {
                 write!(f, "duplicate batch seq: seq={seq}")
             }
@@ -535,9 +536,9 @@ impl Storage {
     /// fail-closed に拒否する（security.md「不安全な設計｜無制限リソース確保（DoS）」
     /// 対応。バッチ台帳はコミットごとに増え続けるため、大きな DB では無制限確保が
     /// メモリ枯渇につながり得る）。台帳にはページング API が無いため、この経路の呼び出し元
-    /// は `ScanLimitExceeded` の `Display` が持つ中立文言をそのまま使う（`scan` 用の
-    /// `use scan_page` 案内を誤って流用しない。[`StorageError::ScanLimitExceeded`] の
-    /// ドキュメンテーションコメント参照）。
+    /// は `ScanLimitExceeded` の `Display` が持つ中立文言（どの API 名にも触れない）を
+    /// そのまま使う（`scan` 用の `scan_page` 案内を誤って流用しない。
+    /// [`StorageError::ScanLimitExceeded`] のドキュメンテーションコメント参照）。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
@@ -1210,18 +1211,22 @@ mod tests {
         assert_eq!(cursor, None);
     }
 
-    // Issue #131 / PR #193 codex レビュー PRRT_kwDOUAKASM6cCl80 対応: `Display` 文字列は
-    // 既存利用者のログ・診断契約として互換性を維持し、告知なく変更しない（`scan` /
-    // `scan_batch_log` の 2 経路で単一 variant を共有する事情はこの互換性契約に優先しない。
-    // 経路別の正確な代替手段案内は呼び出し元（`catalog.rs::convert_storage_error` 等）が
-    // 別途生成する）。
+    // Issue #131 / PR #193 codex レビュー PRRT_kwDOUAKASM6cC0IQ 対応: `Display` 文字列は
+    // `scan` / `scan_batch_log` の 2 経路で単一 variant を共有するため、どちらの経路でも
+    // 誤案内にならない中立な文言（経路別 API 名を含まない）に固定する。経路別の正確な
+    // 代替手段案内は呼び出し元（`catalog.rs::convert_storage_error` 等）が別途生成する。
 
     #[test]
-    fn scan_limit_error_message_is_backward_compatible() {
+    fn scan_limit_error_message_is_neutral_across_scan_and_batch_log_routes() {
+        let message = StorageError::ScanLimitExceeded.to_string();
         assert_eq!(
-            StorageError::ScanLimitExceeded.to_string(),
-            "scan limit exceeded: use scan_page"
+            message,
+            "scan limit exceeded: result too large for a single unpaginated read"
         );
+        // scan 専用 API 名（scan_page 等）を含まないことを固定する。含めると
+        // scan_batch_log 経由の呼び出し元へ存在しない台帳用ページング手段を誤案内する
+        // （PR #193 codex レビュー PRRT_kwDOUAKASM6cC0IQ）。
+        assert!(!message.contains("scan_page"));
     }
 
     #[test]
