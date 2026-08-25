@@ -50,4 +50,11 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 - Docker 開発コンテナへの `psql`／`psycopg` 追加
 - SQL `INSERT` が書き込む行の可視性（`Visibility::Private` 固定）と wire 認証
   経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（挿入直後の行が
-  同一セッションからも見えない現状の是非）
+  同一セッションからも見えない現状の是非）。codex-review P1・PR #210 指摘の
+  検討過程で、`Private` 許可を wire 認証側へ広げる案は
+  `wire1_three_tenant_visibility_public_shared_private_hidden`
+  （自テナント自身の `Private` 行も含め wire 越しには不可視、という既存の
+  最小権限境界）を壊すため不採用と判断した。当面は wire の簡易クエリ経路
+  から `INSERT` 自体を公開しない（`simple_query.rs` のモジュールコメント
+  参照）ことで非対称を回避しており、本項目は「wire 経由の書き込み系 SQL」の
+  設計が定まるまで引き続きスコープ外

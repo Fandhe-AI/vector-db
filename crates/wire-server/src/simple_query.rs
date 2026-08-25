@@ -2,13 +2,25 @@
 //!
 //! 呼び出し文脈: `handshake::post_auth_loop` が UTF-8 検証済みの `'Q'` 本文を
 //! 受け取った直後にここへ委譲する。責務境界は
-//! (1) 文種別（`INSERT` かどうか）による `engine::core::EngineCore` 入口の振り分け、
+//! (1) `engine::core::EngineCore::execute_sql_in_session` 呼び出し、
 //! (2) 成功／失敗結果の wire メッセージへの整形（実バイト列生成は
 //! [`crate::result_encoder`] に委譲）、(3) 接続単位 `SessionState` の
 //! 受け渡しのみ。SQL の構文解釈・許可リスト判定・RLS 適用はすべて engine 側
-//! （`engine::sql::allowlist::validate_sql`/`validate_insert`）に委ね、ここでは
-//! 一切判定しない（誤判定しても engine が `42601` 等で拒否し fail-closed が
-//! 保たれる）。
+//! （`engine::sql::allowlist::validate_sql`）に委ねる。
+//!
+//! `INSERT` は wire 経由では受理しない。engine 側の `INSERT`
+//! （`sql::exec::execute_insert`）は行を常に `Visibility::Private` で書き込む
+//! 固定仕様（TASK-80・SQL-10）である一方、wire 認証経由の `PolicyContext`
+//! （`auth::verify` → `PolicyContext::new`）は `Public` のみを許可可視性とする
+//! 最小権限の既定を維持している（`wire1_three_tenant_visibility_public_shared_private_hidden`
+//! が、認証したテナント自身の `Private` 行も含めて wire 越しには不可視である
+//! ことを回帰確認済み。codex-review P1・PR #210 指摘の検討過程で確認）。
+//! `INSERT` を wire 側で受理してしまうと、書き込んだ本人にも二度と wire
+//! 経由では読めない行を生成することになるため、`engine::sql::allowlist::
+//! validate_sql` の許可リストに INSERT 文が含まれないことを利用し、他の
+//! 許可外構文と同じ `42601`（fail-closed）で拒否させる。wire 経由での書き込み
+//! 系 SQL 対応は、`Private` 行が wire 越しに読める経路の設計が定まってから
+//! 改めて着手する。
 
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -27,16 +39,6 @@ const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
 
 fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
     stream.write_all(msg)
-}
-
-/// `sql` の先頭トークン（空白・改行を読み飛ばした後、ASCII 大文字小文字非区別）が
-/// `INSERT` かどうかを判定する。振り分け専用の軽量判定であり、この判定自体が
-/// 誤っていても engine 側の許可リスト検証（fail-closed）が最終的に構文を拒否する
-/// ため、安全性はここに依存しない。
-fn is_insert_statement(sql: &str) -> bool {
-    let trimmed = sql.trim_start();
-    let head: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
-    head.eq_ignore_ascii_case("INSERT")
 }
 
 /// ErrorResponse を書いてから ReadyForQuery を書く（簡易クエリのエラーは接続を
@@ -68,26 +70,11 @@ pub(crate) fn execute_and_respond(
         return crate::handshake::write_ready_for_query_io(stream);
     }
 
-    if is_insert_statement(sql) {
-        return match engine.execute_insert_sql(ctx, sql) {
-            Ok(outcome) => match result_encoder::encode_command_complete(&format!(
-                "INSERT 0 {}",
-                outcome.rows_affected
-            )) {
-                Ok(msg) => {
-                    write_all(stream, &msg)?;
-                    crate::handshake::write_ready_for_query_io(stream)
-                }
-                Err(_) => respond_error_and_ready(
-                    stream,
-                    SQLSTATE_INTERNAL_ERROR,
-                    "failed to encode command complete response",
-                ),
-            },
-            Err(e) => respond_error_and_ready(stream, e.wire_code(), &e.to_string()),
-        };
-    }
-
+    // `INSERT` は engine の許可リスト（`sql::allowlist::validate_sql`）が
+    // 受理しない構文のため、他の許可外構文と同じ `execute_sql_in_session` へ
+    // そのまま渡す（`42601` で fail-closed に拒否される。モジュール冒頭コメント
+    // 参照）。wire 層でここを分岐して `execute_insert_sql` へ振り分けることは
+    // 意図的に行わない。
     match engine.execute_sql_in_session(ctx, session, sql) {
         Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result),
         Ok(SqlOutcome::SetSearchMode(_)) => match result_encoder::encode_command_complete("SET") {
@@ -114,7 +101,7 @@ pub(crate) fn execute_and_respond(
                 ),
             }
         }
-        Err(e) => respond_error_and_ready(stream, e.wire_code(), &e.to_string()),
+        Err(e) => respond_error_and_ready(stream, e.wire_code(), &e.client_message()),
     }
 }
 
@@ -159,22 +146,5 @@ fn respond_query_result(
             SQLSTATE_INTERNAL_ERROR,
             "failed to encode command complete response",
         ),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_insert_statement;
-
-    #[test]
-    fn detects_insert_case_insensitively_with_leading_whitespace() {
-        assert!(is_insert_statement("  insert into t values (1)"));
-        assert!(is_insert_statement("INSERT INTO t VALUES (1)"));
-    }
-
-    #[test]
-    fn does_not_detect_select_as_insert() {
-        assert!(!is_insert_statement("SELECT * FROM t"));
-        assert!(!is_insert_statement(""));
     }
 }

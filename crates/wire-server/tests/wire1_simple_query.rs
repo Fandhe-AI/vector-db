@@ -4,8 +4,10 @@
 //! `docs/spec/04-behavior/wire-protocol.md` WIRE-1）。
 //!
 //! 生バイトの wire クライアント（`tests/common`）で、in-process サーバー
-//! （`accept_loop_with_engine`）に対し C1 相当のクエリ・INSERT・SET・空クエリ・
-//! 不正 UTF-8・エラー後の接続維持・3 テナント RLS 分離を検証する。実 `psql` 等の
+//! （`accept_loop_with_engine`）に対し C1 相当のクエリ・INSERT 拒否・SET・
+//! 空クエリ・不正 UTF-8・エラー後の接続維持・3 テナント RLS 分離を検証する。
+//! `INSERT` は wire の簡易クエリプロトコル経由では現時点で公開しない
+//! （`simple_query.rs` のモジュールコメント参照）。実 `psql` 等の
 //! 外部クライアントを使う 3 クライアント統合検証は `tests/three_client_e2e.rs`
 //! （`#[ignore]`）が担い、本ファイルはその契約の中核（受信バイト列は同一）を
 //! 常時（`make ci`）回帰保護する。
@@ -98,19 +100,25 @@ fn wire1_c1_query_returns_row_description_and_data_rows() {
     read_ready_for_query(&mut stream);
 }
 
-/// `INSERT ... USING OPERATION_ID '<id>'` は `CommandComplete("INSERT 0 1")` を
-/// 返し、行が実際に永続化されること（同一 `id` の再 INSERT が `23505`
-/// `IdConflict` になることで確認する）。
+/// `INSERT` は wire の簡易クエリプロトコル経由では受理せず、他の許可外構文と
+/// 同様に `42601`（`SqlSurfaceError::UnsupportedSyntax`）で拒否し、接続は
+/// 維持されること（続くクエリが応答すること）。
 ///
 /// SQL `INSERT` が書き込む行は常に `Visibility::Private`（`sql::exec::
 /// execute_insert` の固定仕様。ポインタ: TASK-80・SQL-10）である一方、wire 認証
 /// 経由の `PolicyContext`（`auth::verify` → `PolicyContext::new`）は `Public` の
-/// みを許可可視性とするため、挿入直後の SELECT では自テナントの行であっても
-/// 見えない（`policy.rs::PolicyContext::is_visible` の許可可視性チェックが先に
-/// 弾く）。この非対称は本 Issue のスコープ外（wire 接続へ `Private` 可視性を
-/// 付与する経路の要否は別途判断が必要）とし、本テストは可視性へは踏み込まない。
+/// みを許可可視性とする（`wire1_three_tenant_visibility_public_shared_private_hidden`
+/// が回帰確認する既存の最小権限境界であり、自テナント自身の `Private` 行も
+/// 対象に含めて意図的に不可視。codex-review P1・PR #210 指摘の検討過程で確認
+/// 済み）。この最小権限境界を緩めずに両立させる唯一の道は、`INSERT` 直後の
+/// 同一セッション SELECT で絶対に読めない行を書き込ませないこと＝wire で
+/// `INSERT` 自体を公開しないことだったため、`simple_query::is_insert_statement`
+/// による INSERT 専用振り分けを撤去し、他の許可外構文と同じ fail-closed 経路
+/// （`engine::sql::allowlist::validate_sql`）へ合流させた。wire 経由での
+/// 書き込み系 SQL 対応は、Private 行が wire 越しに読める経路の設計が定まって
+/// から改めて着手する。
 #[test]
-fn wire1_insert_returns_command_complete_and_persists_row() {
+fn wire1_insert_is_rejected_as_unsupported_syntax_and_connection_survives() {
     let (core, _guard) = new_core_single_tenant();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
@@ -120,17 +128,21 @@ fn wire1_insert_returns_command_complete_and_persists_row() {
         &mut stream,
         "INSERT INTO docs (id, embedding, lang) VALUES (99, '[0.0,0.0,1.0]', 'fr') USING OPERATION_ID 'op-wire1-insert'",
     );
-    let tag = read_command_complete(&mut stream);
-    assert_eq!(tag, "INSERT 0 1");
+    expect_error_response_with_sqlstate(&mut stream, "42601");
     read_ready_for_query(&mut stream);
 
-    // 同一 id の再挿入は `23505`（テナント名前空間内の id 重複）で拒否される
-    // ことで、直前の INSERT が実際に永続化されたことを確認する。
+    // エラー後も接続は維持され、続く SELECT が正常応答すること。
     send_simple_query(
         &mut stream,
-        "INSERT INTO docs (id, embedding, lang) VALUES (99, '[0.0,0.0,1.0]', 'fr') USING OPERATION_ID 'op-wire1-insert-2'",
+        "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 3",
     );
-    expect_error_response_with_sqlstate(&mut stream, "23505");
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["id", "embedding", "lang"]);
+    for _ in 0..3 {
+        read_data_row(&mut stream);
+    }
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "SELECT 3");
     read_ready_for_query(&mut stream);
 }
 
