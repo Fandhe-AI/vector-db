@@ -166,9 +166,8 @@ fn read_message_type_discarding_body(stream: &mut TcpStream) -> u8 {
     header[0]
 }
 
-/// WIRE-1 系: SSLRequest → 'N' → StartupMessage → AuthenticationCleartextPassword →
-/// 正パスワード → AuthenticationOk → (BackendKeyData → ParameterStatus* →)
-/// ReadyForQuery の順序どおり到達すること。
+/// ポインタ: TASK-67・WIRE-1。正常系の認証シーケンスが `ReadyForQuery` まで
+/// 到達すること。
 #[test]
 fn wire1_successful_cleartext_auth_reaches_ready_for_query() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
@@ -220,8 +219,7 @@ fn wire1_successful_cleartext_auth_reaches_ready_for_query() {
     }
 }
 
-/// WIRE-3 系: 誤パスワードで `28P01` の ErrorResponse を受信し、ReadyForQuery が
-/// 送られず接続が切断されること。応答までの経過時間が固定遅延の下限以上であること
+/// ポインタ: TASK-67・WIRE-3。誤パスワードの応答・接続クローズ・下限遅延を確認する
 /// （上限はフレーク回避のため検証しない）。
 #[test]
 fn wire3_wrong_password_returns_28p01_without_ready_for_query() {
@@ -264,7 +262,8 @@ fn wire3_wrong_password_returns_28p01_without_ready_for_query() {
     );
 }
 
-/// 未知ユーザーでも同一の応答（`28P01`）・同一の固定遅延であること（列挙対策）。
+/// ポインタ: TASK-67・WIRE-3。未知ユーザーが既知ユーザーの誤パスワードと外形上
+/// 区別できないこと（列挙対策）。
 #[test]
 fn wire3_unknown_user_returns_same_error_and_delay() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
@@ -284,11 +283,9 @@ fn wire3_unknown_user_returns_same_error_and_delay() {
     assert!(elapsed >= Duration::from_millis(200));
 }
 
-/// WIRE-2 系: StartupMessage の `database` に他テナント名を自己申告しても、接続の
-/// 成否・応答シーケンスに影響しないこと（実際のテナント導出値そのものの検証は
-/// `auth::verify` の単体テストで行う。ここでは「クライアント自己申告値を使わない」
-/// ことの外形的帰結として、無関係な `database` 値でも正規ユーザーが認証成功する
-/// ことを確認する）。
+/// ポインタ: TASK-67・WIRE-2。クライアント自己申告値が認証結果に影響しないことを
+/// 外形的に確認する（テナント導出値そのものの検証は `auth::verify` の単体テストで
+/// 行う）。
 #[test]
 fn wire2_database_param_does_not_affect_authentication_outcome() {
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);

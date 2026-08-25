@@ -264,8 +264,8 @@ fn negotiate_startup(stream: &mut TcpStream) -> Result<String> {
 }
 
 /// StartupMessage のパラメータ列（null 終端キー・値ペアの繰り返し、空文字列で終端）
-/// から `user` を取り出す。`database`/`dbname` を含む他パラメータはテナント決定に
-/// 一切使わない（WIRE-2: テナントはユーザーストアからのみ導出する）。
+/// から `user` を取り出す。`user` 以外のパラメータはテナント決定に用いない
+/// （ポインタ: TASK-67・WIRE-2）。
 fn parse_startup_params(params_body: &[u8]) -> Result<String> {
     let mut pos = 0usize;
     let mut user: Option<String> = None;
@@ -278,8 +278,7 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
         if key == "user" {
             user = Some(value.to_string());
         }
-        // `database`/`dbname` 等その他のパラメータは意図的に読み捨てる
-        // （WIRE-2: クライアント自己申告値をテナント決定に使わない）。
+        // その他のパラメータは意図的に読み捨てる（ポインタ: WIRE-2）。
     }
     user.ok_or(HandshakeError::Protocol("missing required parameter: user"))
 }
@@ -393,7 +392,7 @@ pub fn handle_connection(
         }
     };
 
-    // WIRE-3。verify は 1 回のみ呼び、結果に関わらずここでループへ戻さない。
+    // ポインタ: TASK-67・WIRE-3。
     match auth::verify(store, &username, &password) {
         Err(_failure) => {
             write_error_response(

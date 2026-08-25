@@ -1,9 +1,9 @@
 //! ユーザーストア・Argon2id 照合・`engine::policy::PolicyContext` へのテナント導出を担う。
 //!
-//! `handshake.rs` の認証フロー（cleartext password 受理後）から [`verify`] が呼ばれ、
-//! 成功時は `engine` クレートの `PolicyContext`（テナント境界・可視性判定の唯一の入力
-//! 経路）を返す。テナントはこのユーザーストアの `tenant_id` フィールドからのみ導出し、
-//! StartupMessage の `database` 等クライアント自己申告値は一切参照しない（WIRE-2）。
+//! `handshake.rs` の認証フローから [`verify`] が呼ばれ、成功時は `engine` クレートの
+//! `PolicyContext`（テナント境界・可視性判定の唯一の入力経路）を返す。テナントは
+//! このユーザーストアのフィールドからのみ導出し、クライアント自己申告値は参照しない
+//! （fail-closed の設計判断）。
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-2, WIRE-3）。
 
 pub mod argon2id;
@@ -17,8 +17,7 @@ use std::time::{Duration, Instant};
 
 use argon2id::Params;
 
-/// 認証失敗時に課す固定遅延（WIRE-3）。
-/// ポインタ: `docs/spec/04-behavior/wire-protocol.md` WIRE-3。
+/// 認証失敗時に課す固定遅延。ポインタ: TASK-67・WIRE-3（`docs/spec/04-behavior/wire-protocol.md`）。
 const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(200);
 
 /// wire プロトコルの認証失敗応答が用いる SQLSTATE（invalid_password）。
@@ -199,8 +198,7 @@ impl UserStore {
     }
 }
 
-/// cleartext password 認証の失敗（WIRE-3: SQLSTATE `28P01`・接続切断のみで応答し、
-/// 存在有無やテナント情報は含めない）。
+/// cleartext password 認証の失敗を表す（ポインタ: TASK-67・WIRE-3）。
 #[derive(Debug)]
 pub struct AuthFailure;
 
@@ -210,18 +208,14 @@ impl AuthFailure {
     pub const MESSAGE: &'static str = "password authentication failed";
 }
 
-/// 未知ユーザーに対しても実ユーザーと同一コスト・同一応答時間で照合を走らせるための
-/// ダミー PHC レコード（列挙攻撃・タイミングオラクル対策。WIRE-2）。
-/// salt・hash は固定値でよい（値自体は秘密ではなく、真のユーザー kdf と同一
-/// パラメータで計算コストを揃えることだけが目的のため）。プロセス内で一度だけ
+/// 未知ユーザーに対しても実ユーザーと同一コストで照合を走らせるためのダミー PHC
+/// レコード（ポインタ: TASK-67・WIRE-2）。salt・hash は固定値でよい（値自体は
+/// 秘密ではなく、計算コストを揃えることだけが目的のため）。プロセス内で一度だけ
 /// 生成して再利用する。
 ///
 /// [`argon2id::synthesize_phc_without_hashing`] で組み立て、`encode_phc` は使わない
-/// （`encode_phc` は構築時に実際に Argon2id を計算するため、構築コスト 1 回 +
-/// `verify()` 側の `verify_phc` 呼び出し 1 回で計 2 回分のコストがかかる。
-/// `OnceLock` の初回呼び出し＝コールドスタート直後の未知ユーザー試行だけ約 2 倍の
-/// コストになり、実ユーザーの失敗経路（`verify_phc` 1 回分）とタイミングが揃わなく
-/// なる。review 指摘）。
+/// （`encode_phc` は構築時に実際に Argon2id を計算してしまい、`verify()` 側の
+/// `verify_phc` 呼び出しと合わせて計算コストが二重になるため。review 指摘）。
 fn dummy_phc() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
@@ -234,30 +228,23 @@ fn dummy_phc() -> &'static str {
 }
 
 /// cleartext password 認証を照合し、成功時は `engine::policy::PolicyContext` を返す。
-/// `handshake.rs` の接続ハンドラから 1 接続につき 1 回だけ呼ばれる契約（WIRE-3:
-/// 認証は 1 接続あたり 1 回のみ・失敗時に再試行させない）。
+/// `handshake.rs` の接続ハンドラから呼ばれる（ポインタ: TASK-67・WIRE-3）。
 ///
-/// 失敗時（未知ユーザー・誤パスワードのいずれも）は固定遅延 [`AUTH_FAILURE_DELAY`]
-/// を課してから `Err` を返す。未知ユーザーでも [`dummy_phc`] を用いて実ユーザーと
-/// 同一コストの Argon2id 計算を必ず実行し、早期 return によるタイミング差を作らない。
+/// 失敗時は未知ユーザー・誤パスワードのいずれも [`dummy_phc`] を用いて実ユーザーと
+/// 同一コストの Argon2id 計算を必ず実行してから固定遅延 [`AUTH_FAILURE_DELAY`] 込みで
+/// `Err` を返し、早期 return によるタイミング差を作らない（列挙攻撃対策。ポインタ:
+/// WIRE-2, WIRE-3）。
 ///
 /// `argon2id::MAX_CONCURRENT_ARGON2_KDF` による同時実行数の制限（review 指摘）は
-/// `hash_raw` 内部でブロッキング待機するため、高負荷時は `elapsed`（待機時間を含む）
-/// が `AUTH_FAILURE_DELAY` を上回ることがある。この場合、下記の追加 `sleep` は
-/// スキップされるが「失敗は最低 `AUTH_FAILURE_DELAY` はかかる」という下限保証
-/// 自体は崩れない（`elapsed` が既に下限を超えているだけ）。既知ユーザーの誤
-/// パスワード・未知ユーザーのいずれも同一の `verify_phc` 経路（＝同一のセマフォ）を
-/// 通るため、同時実行数に起因する遅延も両者に等しく作用し、列挙攻撃対策の
-/// タイミング対称性は維持される。
+/// `hash_raw` 内部でブロッキング待機するが、既知ユーザー・未知ユーザーいずれも同一の
+/// `verify_phc` 経路（＝同一のセマフォ）を通るため、待機時間もタイミング対称性を
+/// 崩さない。
 ///
-/// この対称性が成立する前提は、既知ユーザーの実レコードと未知ユーザー用
-/// [`dummy_phc`] とで Argon2id パラメータ（m/t/p）が常に一致していることであり、
-/// それは `UserStore::load_from_file` が `argon2id::RECOMMENDED_PARAMS` への完全
-/// 一致以外のレコードを起動時に拒否することで保証される（P0 review 指摘: レコード
-/// ごとにパラメータが異なると KDF コストが変わり、`AUTH_FAILURE_DELAY` の下限で
-/// 吸収しきれないタイミング差からユーザー存在が漏えいし得た）。加えて実測では
-/// release ビルドの `RECOMMENDED_PARAMS` での KDF 実行時間は `AUTH_FAILURE_DELAY`
-/// を十分下回るため、この下限 sleep が実運用でも変動を吸収する。
+/// この対称性は、既知ユーザーの実レコードと未知ユーザー用 [`dummy_phc`] とで
+/// Argon2id パラメータが常に一致していることに依存する。`UserStore::load_from_file`
+/// が `argon2id::RECOMMENDED_PARAMS` への完全一致以外のレコードを起動時に拒否する
+/// ことでこれを保証する（P0 review 指摘: レコードごとのパラメータ差がタイミング
+/// 側チャネルになり得た）。
 pub fn verify(
     store: &UserStore,
     username: &str,
