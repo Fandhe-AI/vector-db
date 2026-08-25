@@ -847,11 +847,8 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     })?;
     // 上限検証済みの dim に基づくため、無制限確保にはならない。
     let mut embedding = Vec::with_capacity(dim as usize);
-    for chunk in embedding_bytes.chunks_exact(4) {
-        let arr: [u8; 4] = chunk
-            .try_into()
-            .map_err(|_| StorageError::Codec("embedding chunk is not 4 bytes".to_string()))?;
-        embedding.push(f32::from_le_bytes(arr));
+    for chunk in embedding_bytes.as_chunks::<4>().0 {
+        embedding.push(f32::from_le_bytes(*chunk));
     }
     offset = embedding_end;
 
