@@ -320,10 +320,14 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
     );
 }
 
-/// 内積スコア（[`engine::kernel::CpuScalarProvider`] と同じ尺度・左から右への逐次和）。
-/// 本テストが独立に参照値を算出するための複製（production コードは変更しない）。
+/// 内積スコア。[`engine::kernel::CpuScalarProvider`] が使うカーネルと同一の
+/// `engine::isa::current().dot` へ委譲する（TASK-156・CORE-14 対応: SIMD 化で
+/// 加算順序が変わり得るため、本テストのように production の Top-K と float 完全一致
+/// で比較する箇所は、算術カーネル自体は本番経路と共有しつつ、順位ロジック
+/// （全行スキャン→許可集合フィルタ→ソート、という手順そのもの）は本テストが独立に
+/// 組み立てることで、`PrefilterIndex` の実装を経由しない検証という趣旨を保つ）。
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    engine::isa::current().dot(a, b)
 }
 
 // 対象ビヘイビア: RLS-4。テスト側で独立に「全行スキャン→許可集合でフィルタ→Top-K」を
