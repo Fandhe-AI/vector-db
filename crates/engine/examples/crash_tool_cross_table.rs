@@ -285,14 +285,17 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     // `StorageError::ScanLimitExceeded` の `Display` はそのまま使わない（Issue #131・
     // PR #193 codex レビュー再指摘対応）: 固定文言 `"scan limit exceeded: use scan_page"`
     // は `Storage::scan` 専用の代替 API 案内であり、台帳（`scan_batch_log`。ページング API
-    // を持たない）には当てはまらない。この呼び出し元は「`scan_batch_log` を呼んだ」という
-    // 経路を把握している内部コンテキストのため、台帳向けの正しい復旧策へ変換してから
-    // 提示する（`storage.rs::Storage::scan_batch_log` のドキュメンテーションコメント参照）。
+    // を持たない）には当てはまらない。加えて台帳エントリ数を削減する compact/rotate 相当の
+    // API・運用手順も本リポには存在しない（通常の compaction は論理エントリ数を減らさず、
+    // rotation で台帳を捨てれば検証対象そのものを失うため、いずれも実行可能な代替手段では
+    // ない: PR #193 codex レビュー再指摘対応）。実行不能な手段を示唆せず、「このツールでは
+    // 上限を超えた台帳を検証できない」という事実のみを明示する
+    // （`storage.rs::Storage::scan_batch_log` のドキュメンテーションコメント参照）。
     let mut batch_log = storage.scan_batch_log().map_err(|e| match e {
         StorageError::ScanLimitExceeded => {
-            "scan_batch_log failed: batch log entry count exceeds the in-memory scan limit; \
-             this tool has no paginated API for the batch log, reduce the log size (e.g. \
-             compact/rotate the database) before retrying"
+            "scan_batch_log failed: batch log exceeds the scan limit of this tool; \
+             cross-table verification cannot be performed on this ledger \
+             (no paginated ledger API is available yet)"
                 .to_string()
         }
         other => format!("scan_batch_log failed: {other}"),

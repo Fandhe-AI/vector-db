@@ -585,10 +585,14 @@ impl Storage {
     /// エラーをそのまま利用者へ露出する呼び出し元は `ScanLimitExceeded` の `Display`
     /// （固定文言 `"scan limit exceeded: use scan_page"`。[`StorageError::ScanLimitExceeded`]
     /// のドキュメンテーションコメント「Display の互換性契約」参照）をそのまま使わないこと。
-    /// `scan_page` は [`Storage::scan`] 専用の代替 API であり台帳には存在しないため、
-    /// そのまま表示すると存在しない代替手段を誤案内する。呼び出し元は本 variant を
-    /// 検出し、台帳向けの正しい復旧策（上限緩和・運用対応等）へ変換してから提示する
-    /// （変換例: `examples/crash_tool_cross_table.rs` の `scan_batch_log` 呼び出し箇所）。
+    /// `scan_page` は [`Storage::scan`] 専用の代替 API であり台帳には存在しない。また台帳
+    /// エントリ数を削減する compact/rotate 相当の API・運用手順も本クレートには存在しない
+    /// （通常の compaction は論理エントリ数を減らさず、rotation で台帳を捨てれば検証対象
+    /// そのものを失うため、いずれも実行可能な代替手段ではない: PR #193 codex レビュー
+    /// 再指摘対応）。呼び出し元は本 variant を検出した際、実行不能な手段を示唆せず
+    /// 「この呼び出し元では上限を超えた台帳を扱えない（検証不能）」という事実のみを
+    /// 明示すること（変換例: `examples/crash_tool_cross_table.rs` の `scan_batch_log`
+    /// 呼び出し箇所）。
     pub fn scan_batch_log(&self) -> Result<Vec<(u64, u64)>> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(BATCH_LOG_TABLE) {
