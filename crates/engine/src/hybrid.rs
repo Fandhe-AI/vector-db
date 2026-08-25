@@ -510,6 +510,12 @@ pub fn hybrid_search(
     // 復元できず、結果件数の差から不可視データの有無が外部へ漏れる（2 回目の
     // codex-review P0 指摘対応。モジュールドキュメント参照）。1 件でも可視集合外の
     // id が含まれていたら検索全体を拒否する（fail-closed）。
+    // 申し送り（TABLE-12）: 行 `id` の一意性スコープはテナント内のため、可視集合に
+    // 同一 `id` の行が複数現れうる（自テナント行と他テナントの `Public` 行）。下の
+    // 包含判定は所属のみを見るため影響を受けないが、RRF 融合は `id` をキーに順位を
+    // 統合するため、その場合 2 行が 1 エントリへ畳み込まれる。どちらの行も呼び出し元
+    // から可視でテナント境界の侵害にはならないが、読み取り経路の行識別をテナント修飾
+    // する設計は spec 側の未確定事項として据え置く（`sql/exec.rs` の投影段と同じ扱い）。
     if dense_hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
         return Err(HybridError::ProviderResultRejected);
     }

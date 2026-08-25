@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use engine::catalog::CatalogError;
 use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
@@ -273,12 +274,16 @@ fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
         let write_txn = db.begin_write().expect("begin write txn");
         {
             // `catalog.rs::user_rows_table_name` と同一の命名規則（`user_rows/<table>`）。
-            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+            // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12。`catalog.rs::
+            // user_rows_table_def` と同一のキー型。旧 `u64` 単独キーで書くと、
+            // engine 側が `IncompatibleRowKeyFormat` を返して本テストが検証したい
+            // 行デコード経路へ到達しなくなる＝テストが空振りする）。
+            let row_table_def: redb::TableDefinition<(&str, u64), &[u8]> =
                 redb::TableDefinition::new("user_rows/docs");
             let mut table = write_txn.open_table(row_table_def).expect("open row table");
             // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列。
             table
-                .insert(1u64, &[1u8][..])
+                .insert(("tenant-a", 1u64), &[1u8][..])
                 .expect("insert malformed row");
         }
         write_txn.commit().expect("commit malformed row");
@@ -289,9 +294,13 @@ fn get_row_surfaces_data_corruption_distinctly_from_not_found() {
     let err = core
         .get_row(&ctx, "docs", 1)
         .expect_err("corrupted row must not be silently reported as NotFound");
+    // 行データのデコード失敗（`CatalogError::Invalid`）であることまで確認する。
+    // 単に `Catalog(_)` で受けると、行テーブルのキー型不一致
+    // （`CatalogError::IncompatibleRowKeyFormat`。TABLE-12 の物理キー変更に伴う
+    // 旧フォーマット拒否）でも通過してしまい、本テストが空振りする。
     assert!(
-        matches!(err, CoreError::Catalog(_)),
-        "expected CoreError::Catalog (data corruption surfaced distinctly), got: {err}"
+        matches!(err, CoreError::Catalog(CatalogError::Invalid(_))),
+        "expected CoreError::Catalog(Invalid) (row decode failure surfaced distinctly), got: {err}"
     );
 }
 
@@ -758,13 +767,17 @@ fn dim_mismatch_is_rejected_before_scanning_table_rows() {
         let db = redb::Database::create(&path).expect("reopen raw database");
         let write_txn = db.begin_write().expect("begin write txn");
         {
-            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+            // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12。`catalog.rs::
+            // user_rows_table_def` と同一のキー型。旧 `u64` 単独キーで書くと、
+            // engine 側が `IncompatibleRowKeyFormat` を返して本テストが検証したい
+            // 行デコード経路へ到達しなくなる＝テストが空振りする）。
+            let row_table_def: redb::TableDefinition<(&str, u64), &[u8]> =
                 redb::TableDefinition::new("user_rows/docs");
             let mut table = write_txn.open_table(row_table_def).expect("open row table");
             // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列
             // （`get_row_surfaces_data_corruption_distinctly_from_not_found` と同手法）。
             table
-                .insert(1u64, &[1u8][..])
+                .insert(("tenant-a", 1u64), &[1u8][..])
                 .expect("insert malformed row");
         }
         write_txn.commit().expect("commit malformed row");
@@ -809,13 +822,17 @@ fn non_finite_query_is_rejected_before_scanning_table_rows() {
         let db = redb::Database::create(&path).expect("reopen raw database");
         let write_txn = db.begin_write().expect("begin write txn");
         {
-            let row_table_def: redb::TableDefinition<u64, &[u8]> =
+            // 物理キーは `(tenant_id, id)`（対象ビヘイビア: TABLE-12。`catalog.rs::
+            // user_rows_table_def` と同一のキー型。旧 `u64` 単独キーで書くと、
+            // engine 側が `IncompatibleRowKeyFormat` を返して本テストが検証したい
+            // 行デコード経路へ到達しなくなる＝テストが空振りする）。
+            let row_table_def: redb::TableDefinition<(&str, u64), &[u8]> =
                 redb::TableDefinition::new("user_rows/docs");
             let mut table = write_txn.open_table(row_table_def).expect("open row table");
             // version バイトのみで後続フィールドが一切ない、意図的な破損バイト列
             // （`get_row_surfaces_data_corruption_distinctly_from_not_found` と同手法）。
             table
-                .insert(1u64, &[1u8][..])
+                .insert(("tenant-a", 1u64), &[1u8][..])
                 .expect("insert malformed row");
         }
         write_txn.commit().expect("commit malformed row");

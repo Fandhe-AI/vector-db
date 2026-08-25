@@ -594,6 +594,15 @@ impl ResidentMatrix {
         // （codex レビュー指摘対応）。
         // `HashSet::with_capacity` は失敗時に abort するため使わず、
         // `try_reserve`（フォールブル）で確保する（Cursor Bugbot 指摘対応）。
+        //
+        // TABLE-12 との関係（申し送り）: 行 `id` の一意性スコープはテナント内に閉じた
+        // （`catalog.rs::user_rows_table_def`）ため、行ストア上の 1 テーブルには
+        // 異なるテナントの同一 `id` が正当に共存しうる。本メソッドは現状テストからのみ
+        // 呼ばれており（行ストアとは未接続）、そのような入力は `DuplicateRowId` で
+        // fail-closed に拒否される。バッチ経路を行ストアへ配線する際は、下記の
+        // 選出後再検証（`run_batch_search` の id → (tenant, visibility) 逆引き）を
+        // 行 index ベースへ作り替えたうえで本検証を緩めること（id ベースのまま緩めると
+        // 別テナントの行を取り違える経路が生まれる）。
         let mut seen_ids = std::collections::HashSet::new();
         seen_ids.try_reserve(ids.len()).map_err(|e| {
             BatchSearchError::AllocationFailed(format!("failed to reserve id set: {e}"))
