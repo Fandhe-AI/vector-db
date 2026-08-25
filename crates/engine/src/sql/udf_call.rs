@@ -80,8 +80,12 @@ pub enum BoundExpr {
     Number(f64),
     /// 疑似列 `id`（行 `id` を `f64` として扱う）。
     IdRef,
-    /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、`catalog::validate_schema`
-    /// が保証済みのため列インデックスを保持する必要はない）。
+    /// テーブルの `VECTOR` 列参照（1 テーブルにつき高々 1 本、TABLE-1。
+    /// `catalog::encode_schema` が内部で呼ぶ `validate_schema` により
+    /// `CREATE TABLE`・`ALTER TABLE ADD COLUMN` の双方で fail-closed に強制される
+    /// ため列インデックスを保持する必要はないが、束縛側（`bind_expr_in`）でも
+    /// 参照先がスキーマ中最初の VECTOR 列と一致することを重ねて検査し、
+    /// この不変条件が崩れた場合に誤った列の値で黙って評価しないようにする）。
     VectorRef,
     Builtin {
         f: BuiltinFn,
@@ -438,20 +442,54 @@ fn bind_expr_in(
                     "column reference is not allowed in a function body: {name}"
                 ))
             })?;
+            // カタログ上の実カラムを疑似列 `id` より優先して照合する（`parser.rs` の
+            // 投影束縛（`Projection::Columns`/`Items` の `SelectItem::Column`
+            // 分岐、Issue #56 レビュー指摘対応）と同じ優先順位に揃える。以前は
+            // `name == "id"` を先に判定していたため、テーブルが実カラム `id` を
+            // 宣言していても式内では常に行キー疑似列を参照してしまい、
+            // `SELECT id` と `SELECT id + 1` で参照対象が食い違っていた
+            // （codex-review PR #209 指摘）。
+            if let Some((index, column)) = schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == name)
+            {
+                return match column.ty {
+                    ColumnType::Vector(_) => {
+                        // `BoundExpr::VectorRef` は「1 テーブルにつき `VECTOR` 列は
+                        // 高々 1 本」（TABLE-1、`catalog::encode_schema` が
+                        // `validate_schema` 経由で CREATE TABLE・ALTER TABLE ADD
+                        // COLUMN の双方について fail-closed に強制する）という
+                        // 不変条件に依存し、実行時は常に検索対象 embedding スロット
+                        // （`arena.vector(slot)`）の値を返す。その不変条件が
+                        // 何らかの理由で崩れていた場合に誤った列の値で
+                        // 黙って評価するのを防ぐため、ここでも重ねて検査し、
+                        // スキーマ中の最初の VECTOR 列以外を参照する式は
+                        // fail-closed に拒否する（codex-review PR #209 指摘。
+                        // security.md「不安全な設計」対応）。
+                        let first_vector_index = schema
+                            .columns
+                            .iter()
+                            .position(|c| matches!(c.ty, ColumnType::Vector(_)));
+                        if first_vector_index != Some(index) {
+                            return Err(SqlSurfaceError::invalid_input(format!(
+                                "column {name:?} is not the table's VECTOR column"
+                            )));
+                        }
+                        Ok((BoundExpr::VectorRef, ExprType::Vector))
+                    }
+                    ColumnType::Text => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} cannot be used in an expression (TEXT columns are not supported)"
+                    ))),
+                };
+            }
             if name == "id" {
                 return Ok((BoundExpr::IdRef, ExprType::Scalar));
             }
-            let column = schema
-                .columns
-                .iter()
-                .find(|c| &c.name == name)
-                .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
-            match column.ty {
-                ColumnType::Vector(_) => Ok((BoundExpr::VectorRef, ExprType::Vector)),
-                ColumnType::Text => Err(SqlSurfaceError::invalid_input(format!(
-                    "column {name:?} cannot be used in an expression (TEXT columns are not supported)"
-                ))),
-            }
+            Err(SqlSurfaceError::invalid_input(format!(
+                "unknown column: {name}"
+            )))
         }
         Expr::Call { name, args } => bind_call(name, args, env, node_budget),
         Expr::Binary { op, lhs, rhs } => {
@@ -1118,6 +1156,66 @@ mod tests {
             bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
         let embedding = [1.0f32, 0.0, 0.0];
         let err = eval(&bound, 1, &embedding).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn real_id_column_takes_precedence_over_pseudo_column() {
+        // codex-review PR #209 指摘対応: 実カラム `id`（TEXT 型）を宣言したスキーマで
+        // `id` を参照すると、`parser.rs` の投影束縛と同じ優先順位で実カラムが
+        // 解決され、TEXT 列であるため「TEXT 列は式内で使えない」エラーになるべき
+        // （黙って行キー疑似列 `BoundExpr::IdRef` へフォールバックしてはならない）。
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("id", ColumnType::Text, false),
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+            ],
+        );
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&ident("id"), &schema, &registry, &mut budget).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn pseudo_id_column_still_resolves_when_no_real_id_column_exists() {
+        // 実カラム `id` が存在しないスキーマでは、従来どおり行キー疑似列
+        // `BoundExpr::IdRef` へ解決される（既存挙動の非回帰確認）。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) =
+            bind_expr(&ident("id"), &schema, &registry, &mut budget).expect("bind should succeed");
+        assert_eq!(ty, ExprType::Scalar);
+        assert_eq!(bound, BoundExpr::IdRef);
+    }
+
+    #[test]
+    fn non_first_vector_column_reference_is_rejected_fail_closed() {
+        // codex-review PR #209 指摘対応: `catalog::validate_schema`（TABLE-1）は
+        // 複数 VECTOR 列を持つスキーマの永続化を拒否するが、`bind_expr_in` 側でも
+        // 独立に検査し、その不変条件が何らかの理由で崩れていた場合に
+        // 2 本目以降の VECTOR 列参照が検索対象 embedding スロットの値で
+        // 誤って評価されるのを防ぐ（fail-closed。security.md「不安全な設計」）。
+        // `TableSchema::new` は `validate_schema` を経由しないため、ここでは
+        // カタログ層では作れないはずの 2 VECTOR 列スキーマを直接構築して検査する。
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("other", ColumnType::Vector(3), false),
+            ],
+        );
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        // 最初の VECTOR 列（embedding）は従来どおり解決できる。
+        let (_, ty) = bind_expr(&ident("embedding"), &schema, &registry, &mut budget)
+            .expect("bind should succeed");
+        assert_eq!(ty, ExprType::Vector);
+        // 2 本目の VECTOR 列（other）は fail-closed に拒否される。
+        let mut budget = MAX_EXPR_NODES;
+        let err = bind_expr(&ident("other"), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
     }
 }
