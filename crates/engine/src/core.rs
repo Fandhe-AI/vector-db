@@ -772,17 +772,26 @@ impl EngineCore {
                     "SET search_mode requires a session-aware entry point",
                 ))
             }
+            // TASK-79（SQL-9）: UDF 定義はセッションへ登録する statement のため、
+            // セッションを持たないこのエントリポイントでは受理しない（`SET` と同じ
+            // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
+            crate::sql::allowlist::Statement::CreateFunction { .. } => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "CREATE FUNCTION requires a session-aware entry point",
+                ))
+            }
             crate::sql::allowlist::Statement::Select(_) => {
                 // `SELECT` と判定済みのため、[`Self::execute_sql_in_session`] が
-                // `SqlOutcome::SetSearchMode` を返すことはない（同一 `sql` を
-                // `validate_sql` で 2 度構文解析するが、副作用のない決定的なパースの
-                // ため安全側に倒した単純さを優先する）。
+                // `SqlOutcome::SetSearchMode`／`SqlOutcome::CreateFunction` を返すことは
+                // ない（同一 `sql` を `validate_sql` で 2 度構文解析するが、副作用の
+                // ない決定的なパースのため安全側に倒した単純さを優先する）。
                 let mut session = crate::sql::mode::SessionState::default();
                 match self.execute_sql_in_session(ctx, &mut session, sql)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
-                    crate::sql::SqlOutcome::SetSearchMode(_) => {
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. } => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: "unexpected SetSearchMode outcome for a statement already classified as Select"
+                            detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
                         })
                     }
@@ -814,6 +823,14 @@ impl EngineCore {
                 session.set_search_mode(mode);
                 Ok(crate::sql::SqlOutcome::SetSearchMode(mode))
             }
+            // TASK-79（SQL-9）: `CREATE FUNCTION` の検証・登録は
+            // `sql::udf_call::define_function` に委譲する（検証→登録の順を守り、
+            // 失敗時は `session.udfs()` を一切変更しない。`SET search_mode` と同じ
+            // 「部分更新＝黙った既定化を防ぐ」方針）。
+            crate::sql::allowlist::Statement::CreateFunction { name, params, body } => {
+                crate::sql::udf_call::define_function(session.udfs_mut(), &name, &params, &body)?;
+                Ok(crate::sql::SqlOutcome::CreateFunction { name })
+            }
             crate::sql::allowlist::Statement::Select(validated) => {
                 let read_txn = self.storage.db().begin_read().map_err(|e| {
                     crate::sql::allowlist::SqlSurfaceError::Internal {
@@ -833,10 +850,11 @@ impl EngineCore {
                                 detail: format!("failed to load table schema: {other}"),
                             },
                         })?;
-                let bound = crate::sql::parser::bind_with_session(
+                let bound = crate::sql::parser::bind_in_session(
                     &validated,
                     &schema,
                     session.search_mode(),
+                    session.udfs(),
                 )?;
                 let result = crate::sql::exec::execute_statement(
                     &read_txn,

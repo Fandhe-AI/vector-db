@@ -12,6 +12,9 @@
 
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
+use crate::sql::udf_call::{
+    BinOp, Expr, MAX_CALL_ARGS, MAX_EXPR_DEPTH, MAX_EXPR_NODES, MAX_UDF_PARAMS,
+};
 use crate::sql::using_operation_id::OperationId;
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
@@ -216,19 +219,43 @@ pub enum OrderByForm {
 
 /// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前
 /// （[`is_allowed_where_predicate_name`]）のみを通過させる。
+///
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Expression`
+/// variant を追加した（宣言的 UDF・組み込み関数呼び出しを含む比較式
+/// `<expr> <cmp> <expr>`。式の意味論検証は `sql::parser::bind_in_session` の責務）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
     /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
     Equality { column: String, value: String },
     /// 許可された名前の述語呼び出し形（空引数）。
     PredicateCall { name: String },
+    /// 式の比較述語（TASK-79・SQL-9）。`Expr::Binary` の比較演算子（`> < >= <= =`）
+    /// を頂点に持つ木のみを許可する（`parse_where` が構造的に保証する）。
+    Expression(Expr),
 }
 
-/// SELECT リストの許可形状（TASK-75）。`*` か、単純な列名リストのみ。
+/// SELECT リストの 1 項目（TASK-79・SQL-9 で式項目を追加する際の共通表現）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectItem {
+    /// 既存の単純な列名項目（`*` 展開・裸の列名）。
+    Column(String),
+    /// 関数呼び出しを頂点に持つ式項目（TASK-79・SQL-9: 宣言的 UDF・組み込み関数の
+    /// 結果列位置での呼び出し）。`alias` 省略時の列名は `sql::parser` が関数名から
+    /// 導出する。
+    Expr { expr: Expr, alias: Option<String> },
+}
+
+/// SELECT リストの許可形状（TASK-75）。`*`・単純な列名リストに加え、TASK-79（SQL-9）
+/// で式項目（少なくとも 1 項目が関数呼び出しを含む形）を [`Items`] として追加した。
+/// 全項目が単純な列名の場合は従来どおり [`Columns`] のまま（後方互換）。
+///
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Items` variant を
+/// 追加した。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
     All,
     Columns(Vec<String>),
+    Items(Vec<SelectItem>),
 }
 
 /// 許可形状の構造判定を通過した SQL 文（後続タスクのパーサー・実行計画の土台）。
@@ -346,6 +373,8 @@ impl ValidatedStatement {
 /// [`validate_sql`]（TASK-161 の公開 API）が返す statement 種別。`SELECT` 以外の
 /// 文が増えても [`ValidatedStatement`] 自体は SELECT 専用の構造を保つため、
 /// 統一的な enum で包む。
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `CreateFunction`
+/// variant を追加した。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     Select(ValidatedStatement),
@@ -355,6 +384,17 @@ pub enum Statement {
     /// で行う（本モジュールは構造の受理までを担う）。
     SetSearchMode {
         value: String,
+    },
+    /// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr>`（TASK-79・SQL-9）。
+    /// カタログ照会を必要としない（セッションのみに影響するため FROM テーブルの
+    /// 存在確認は行わない）。パラメータ名重複・登録済み名との衝突・列参照の禁止
+    /// 等の意味論的妥当性検証は `sql::udf_call::define_function`（呼び出し元
+    /// `core.rs::EngineCore::execute_sql_in_session`）が行う（本モジュールは構造の
+    /// 受理までを担う）。
+    CreateFunction {
+        name: String,
+        params: Vec<String>,
+        body: Expr,
     },
 }
 
@@ -392,11 +432,33 @@ pub struct ValidatedInsert {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// 式ノード（`Expr::Number` / `Ident` / `Binary` / `Call`）の残り生成可能数。
+    /// `parse_add_expr` / `parse_mul_expr` の左結合ループは `depth` を増やさず
+    /// `lhs` に木を積み続けるため、`MAX_EXPR_DEPTH`（構文解析の再帰段数）だけでは
+    /// "1+1+...+1" のような同一深さの連鎖入力を制限できない。ノード生成のたびに
+    /// 本フィールドを課金し、AST 全体のノード数を UDF 本体と同じ [`MAX_EXPR_NODES`]
+    /// で頭打ちにすることで、ノード予算枯渇後の `Box<Expr>` 再帰的 drop による
+    /// スタック消費も定数に抑える（security.md「不安全な設計｜無制限リソース確保
+    /// （DoS）」対応。1 文（`Parser` 1 インスタンス）につき共有）。
+    expr_node_budget: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(tokens: &'a [Token]) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            expr_node_budget: MAX_EXPR_NODES,
+        }
+    }
+
+    /// 式ノードを 1 つ生成する直前に呼び、予算を消費する。予算枯渇時は
+    /// fail-closed に拒否する（[`Self::expr_node_budget`] 参照）。
+    fn consume_expr_node(&mut self) -> Result<(), SqlSurfaceError> {
+        self.expr_node_budget = self.expr_node_budget.checked_sub(1).ok_or_else(|| {
+            SqlSurfaceError::payload_too_large("expression exceeds the allowed node count")
+        })?;
+        Ok(())
     }
 
     fn peek(&self) -> Option<&Token> {
@@ -502,51 +564,103 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// SELECT リストの許可形状（`*` または単純な列名リストのみ）。
+    /// SELECT リストの許可形状（`*`・単純な列名リスト・TASK-79（SQL-9）で追加した
+    /// 式項目〔関数呼び出しを頂点に持つ式、任意で `AS <alias>`〕の混在リスト）。
+    /// 全項目が単純な列名の場合は従来どおり [`Projection::Columns`]（後方互換。
+    /// `AS` を列名として使う既存形を壊さないため、列名項目には `AS` を付けない）。
     fn parse_select_list(&mut self) -> Result<Projection, SqlSurfaceError> {
         if matches!(self.peek(), Some(Token::Punct('*'))) {
             self.advance();
             return Ok(Projection::All);
         }
-        let mut columns = vec![self.expect_ident()?];
+        let mut items = vec![self.parse_select_item()?];
         while matches!(self.peek(), Some(Token::Punct(','))) {
             self.advance();
-            columns.push(self.expect_ident()?);
+            items.push(self.parse_select_item()?);
         }
-        Ok(Projection::Columns(columns))
+        if items.iter().all(|it| matches!(it, SelectItem::Column(_))) {
+            let columns = items
+                .into_iter()
+                .map(|it| match it {
+                    SelectItem::Column(name) => name,
+                    SelectItem::Expr { .. } => unreachable!("filtered above"),
+                })
+                .collect();
+            return Ok(Projection::Columns(columns));
+        }
+        Ok(Projection::Items(items))
     }
 
-    /// WHERE 句の許可形状（等価条件・述語呼び出し形の 2 種のみ。`OR`・括弧による
-    /// ネスト・比較演算子の拡張は許可しない）。述語呼び出し形は許可された名前
+    /// SELECT リストの 1 項目。次のトークンが `ident '('` なら式項目（関数呼び出し。
+    /// 続けて `AS <alias>` を任意で受理する）、それ以外は従来どおり裸の列名として
+    /// 受理する。
+    fn parse_select_item(&mut self) -> Result<SelectItem, SqlSurfaceError> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            let name = name.clone();
+            if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('('))) {
+                self.advance();
+                let expr = self.parse_call_expr(name, 0)?;
+                let alias = if self.peek_ident_matches("AS") {
+                    self.advance();
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                return Ok(SelectItem::Expr { expr, alias });
+            }
+        }
+        Ok(SelectItem::Column(self.expect_ident()?))
+    }
+
+    /// WHERE 句の許可形状（等価条件・述語呼び出し形・TASK-79（SQL-9）で追加した
+    /// 式の比較述語 `<expr> <cmp> <expr>` の 3 種。`OR`・括弧によるネストは
+    /// 引き続き許可しない）。述語呼び出し形は許可された名前
     /// （[`is_allowed_where_predicate_name`]）のみを受理し、未知の名前は拒否する。
+    ///
+    /// 既存 2 形との曖昧さ回避: 先頭が `ident '=' <string literal>` なら等価条件、
+    /// `ident '(' ')'`（許可名のみ）なら述語呼び出し形として確定的に判定し、
+    /// いずれにも一致しない場合のみ式の比較述語として再解析する（`pos` を
+    /// 巻き戻してから解析し直す。式文法の `primary` は `ident '(' <args> ')'` も
+    /// 受理するため、`visible()` 以外の名前の呼び出し形はここで初めて式として
+    /// 解釈される）。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
-            let name = self.expect_ident()?;
-            match self.peek() {
-                Some(Token::Punct('=')) => {
+            let start = self.pos;
+            let mut matched_legacy = false;
+            if let Some(Token::Ident(name)) = self.peek().cloned() {
+                if matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('=')))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+                {
+                    self.advance();
                     self.advance();
                     let value = self.expect_string_literal()?;
                     predicates.push(WherePredicate::Equality {
                         column: name,
                         value,
                     });
-                }
-                Some(Token::Punct('(')) => {
-                    if !is_allowed_where_predicate_name(&name) {
-                        return Err(SqlSurfaceError::unsupported(format!(
-                            "unsupported WHERE predicate: {name}"
-                        )));
-                    }
+                    matched_legacy = true;
+                } else if is_allowed_where_predicate_name(&name)
+                    && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::Punct(')')))
+                {
                     self.advance();
-                    self.expect_punct(')')?;
+                    self.advance();
+                    self.advance();
                     predicates.push(WherePredicate::PredicateCall { name });
+                    matched_legacy = true;
                 }
-                other => {
-                    return Err(SqlSurfaceError::unsupported(format!(
-                        "unsupported WHERE predicate form near {other:?}"
-                    )))
-                }
+            }
+            if !matched_legacy {
+                self.pos = start;
+                let lhs = self.parse_value_expr(0)?;
+                let op = self.expect_cmp_op()?;
+                let rhs = self.parse_value_expr(0)?;
+                predicates.push(WherePredicate::Expression(Expr::Binary {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                }));
             }
             if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
                 self.advance();
@@ -555,6 +669,133 @@ impl<'a> Parser<'a> {
             break;
         }
         Ok(predicates)
+    }
+
+    /// 比較演算子トークン（`> < >= <= =`）を消費して [`BinOp`] へ写像する
+    /// （TASK-79・SQL-9）。
+    fn expect_cmp_op(&mut self) -> Result<BinOp, SqlSurfaceError> {
+        match self.advance() {
+            Some(Token::Punct('>')) => Ok(BinOp::Gt),
+            Some(Token::Punct('<')) => Ok(BinOp::Lt),
+            Some(Token::Ge) => Ok(BinOp::Ge),
+            Some(Token::Le) => Ok(BinOp::Le),
+            Some(Token::Punct('=')) => Ok(BinOp::Eq),
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "expected comparison operator, got {other:?}"
+            ))),
+        }
+    }
+
+    /// 再帰深さ上限（[`MAX_EXPR_DEPTH`]）を検査する。構文解析自体の再帰段数を
+    /// 制限することで、深いネスト入力によるスタック消費を定数に抑える
+    /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    fn check_expr_depth(&self, depth: usize) -> Result<(), SqlSurfaceError> {
+        if depth > MAX_EXPR_DEPTH {
+            return Err(SqlSurfaceError::payload_too_large(
+                "expression nesting exceeds the allowed depth",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 式文法（`add → mul → primary`）の入口。`CREATE FUNCTION` の本体・SELECT の
+    /// 式項目・WHERE 式述語の両辺・関数呼び出しの引数のいずれからも共通で使う
+    /// （TASK-79・SQL-9）。
+    fn parse_value_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        self.parse_add_expr(depth)
+    }
+
+    fn parse_add_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let mut lhs = self.parse_mul_expr(depth + 1)?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Punct('+')) => BinOp::Add,
+                Some(Token::Punct('-')) => BinOp::Sub,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_mul_expr(depth + 1)?;
+            self.consume_expr_node()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    fn parse_mul_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        let mut lhs = self.parse_primary_expr(depth + 1)?;
+        loop {
+            let op = match self.peek() {
+                Some(Token::Punct('*')) => BinOp::Mul,
+                Some(Token::Punct('/')) => BinOp::Div,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_primary_expr(depth + 1)?;
+            self.consume_expr_node()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `primary := number | ident | ident '(' [expr {',' expr}] ')' | '(' expr ')'`。
+    fn parse_primary_expr(&mut self, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.check_expr_depth(depth)?;
+        match self.peek().cloned() {
+            Some(Token::Number(n)) => {
+                self.advance();
+                self.consume_expr_node()?;
+                Ok(Expr::Number(n))
+            }
+            Some(Token::Punct('(')) => {
+                self.advance();
+                let inner = self.parse_value_expr(depth + 1)?;
+                self.expect_punct(')')?;
+                Ok(inner)
+            }
+            Some(Token::Ident(name)) => {
+                self.advance();
+                if matches!(self.peek(), Some(Token::Punct('('))) {
+                    self.parse_call_expr(name, depth)
+                } else {
+                    self.consume_expr_node()?;
+                    Ok(Expr::Ident(name))
+                }
+            }
+            other => Err(SqlSurfaceError::unsupported(format!(
+                "unsupported expression term near {other:?}"
+            ))),
+        }
+    }
+
+    /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
+    /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
+    fn parse_call_expr(&mut self, name: String, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        self.expect_punct('(')?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Some(Token::Punct(')'))) {
+            args.push(self.parse_value_expr(depth + 1)?);
+            while matches!(self.peek(), Some(Token::Punct(','))) {
+                self.advance();
+                if args.len() >= MAX_CALL_ARGS {
+                    return Err(SqlSurfaceError::payload_too_large(
+                        "too many call arguments",
+                    ));
+                }
+                args.push(self.parse_value_expr(depth + 1)?);
+            }
+        }
+        self.expect_punct(')')?;
+        self.consume_expr_node()?;
+        Ok(Expr::Call { name, args })
     }
 
     /// ORDER BY 式の許可形状（距離演算子形または関数呼び出し形）。関数呼び出し形は
@@ -868,10 +1109,45 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
     Ok(value)
 }
 
+/// `CREATE FUNCTION <name>(<param>[, <param>...]) AS <expr> [;]`（TASK-79・SQL-9）の
+/// 許可形状。`CREATE`／`FUNCTION`／`AS` は `SET`・`USING` と同方針で予約語化せず、
+/// statement 先頭・所定位置でのみ文脈的に照合する（既存の列名・テーブル名として
+/// これらの語を使う SQL を破壊しない）。パラメータ数は構造検証段階でも
+/// [`MAX_UDF_PARAMS`] を超えないことを確認する（意味論検証は
+/// `sql::udf_call::define_function` が担うが、アロケーション前の上限検証は
+/// `.claude/rules/security.md`「長さフィールドは上限検証してからアロケーションに
+/// 使う」に従い構造検証段階でも行う）。
+fn parse_create_function(tokens: &[Token]) -> Result<(String, Vec<String>, Expr), SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+    p.expect_ident_matching("CREATE")?;
+    p.expect_ident_matching("FUNCTION")?;
+    let name = p.expect_ident()?;
+    p.expect_punct('(')?;
+    let mut params = Vec::new();
+    if !matches!(p.peek(), Some(Token::Punct(')'))) {
+        params.push(p.expect_ident()?);
+        while matches!(p.peek(), Some(Token::Punct(','))) {
+            p.advance();
+            if params.len() >= MAX_UDF_PARAMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many function parameters",
+                ));
+            }
+            params.push(p.expect_ident()?);
+        }
+    }
+    p.expect_punct(')')?;
+    p.expect_ident_matching("AS")?;
+    let body = p.parse_value_expr(0)?;
+    p.expect_end_of_statement()?;
+    Ok((name, params, body))
+}
+
 /// SQL 文をトークン化し、許可リスト形式で構造検証する（TASK-161 の公開 API。
-/// TASK-74 の `validate_statement` を `SELECT`／`SET search_mode` の 2 statement 種別へ
-/// 拡張したもの）。先頭トークンで statement 種別を判定し、`SELECT` のみ `lookup` を
-/// 通じて FROM テーブルのカタログ存在確認まで行う（`SET` はカタログ照会を要しない）。
+/// TASK-74 の `validate_statement` を `SELECT`／`SET search_mode`／
+/// `CREATE FUNCTION`（TASK-79・SQL-9）の 3 statement 種別へ拡張したもの）。先頭
+/// トークンで statement 種別を判定し、`SELECT` のみ `lookup` を通じて FROM テーブルの
+/// カタログ存在確認まで行う（`SET`・`CREATE FUNCTION` はカタログ照会を要しない）。
 ///
 /// 検証順序（決定的。同一入力には常に同一の [`SqlSurfaceError`] を返す）:
 /// 1. 字句解析（入力長・トークン数上限を含む。失敗は [`SqlSurfaceError::UnsupportedSyntax`]）
@@ -880,10 +1156,13 @@ fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
 ///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
 pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
-    // `SET` は字句解析段階のキーワードではなく `Ident` のため（TASK-161・SQL-12
-    // 修正）、statement 先頭という文脈でのみ大文字小文字を区別せず判定する。
+    // `SET`・`CREATE` は字句解析段階のキーワードではなく `Ident` のため
+    // （TASK-161・SQL-12 修正と同方針）、statement 先頭という文脈でのみ大文字小文字を
+    // 区別せず判定する。
     let is_set_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
+    let is_create_function_statement =
+        matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"));
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) => {
             let shape = parse_select_shape(&tokens)?;
@@ -905,8 +1184,12 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
             let value = parse_set_search_mode(&tokens)?;
             Ok(Statement::SetSearchMode { value })
         }
+        _ if is_create_function_statement => {
+            let (name, params, body) = parse_create_function(&tokens)?;
+            Ok(Statement::CreateFunction { name, params, body })
+        }
         other => Err(SqlSurfaceError::unsupported(format!(
-            "expected SELECT or SET, got {other:?}"
+            "expected SELECT, SET, or CREATE FUNCTION, got {other:?}"
         ))),
     }
 }
@@ -925,6 +1208,9 @@ pub fn validate_statement(
         Statement::Select(stmt) => Ok(stmt),
         Statement::SetSearchMode { .. } => Err(SqlSurfaceError::unsupported(
             "SET is not a query statement (use a session-aware entry point)",
+        )),
+        Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
+            "CREATE FUNCTION is not a query statement (use a session-aware entry point)",
         )),
     }
 }
@@ -1317,6 +1603,23 @@ mod tests {
         assert_rejected_as_syntax_error(
             "SELECT * FROM documents WHERE lang != 'ja' ORDER BY embedding <=> '[0.1]' LIMIT 5",
         );
+    }
+
+    #[test]
+    fn rejects_long_left_associative_arithmetic_chain_by_node_budget() {
+        // `parse_add_expr`/`parse_mul_expr` の左結合ループは `depth` を増やさずに
+        // `lhs` へ木を積み続けるため、"1+1+...+1" のような同一深さの連鎖入力は
+        // `MAX_EXPR_DEPTH`（構文解析の再帰段数チェック）をすり抜けうる。ノード数
+        // 予算（`Parser::expr_node_budget`、[`MAX_EXPR_NODES`] 共有）がこの形の
+        // 入力も頭打ちにすることを確認する（`54000`。ノード予算エラー後の
+        // `Box<Expr>` 再帰的 drop によるスタック消費を定数に抑える対応）。
+        let chain: String = "1+".repeat(600) + "1";
+        let sql = format!(
+            "SELECT * FROM documents WHERE {chain} > 0 ORDER BY embedding <=> '[0.1]' LIMIT 5"
+        );
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(&sql, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000", "err={err:?}");
     }
 
     #[test]

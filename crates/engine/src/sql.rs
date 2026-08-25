@@ -46,13 +46,21 @@ pub mod lexer;
 pub mod mode;
 pub mod parser;
 pub mod plan;
+pub mod udf_call;
 pub mod using_operation_id;
 
 /// `EngineCore::execute_sql_in_session`（TASK-161）の成功応答。`SELECT` は
 /// [`exec::QueryResult`] を、`SET search_mode` は解決前の設定値
-/// （[`mode::SearchMode`]）そのものを返す。
+/// （[`mode::SearchMode`]）そのものを返す。TASK-79（SQL-9）で `CREATE FUNCTION` の
+/// 応答として `CreateFunction` を追加した（**BREAKING CHANGE**: 既存の網羅的
+/// `match` はワイルドカードアームの追加が必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
     Query(exec::QueryResult),
     SetSearchMode(mode::SearchMode),
+    /// `CREATE FUNCTION <name>(...) AS <expr>`（TASK-79・SQL-9）がセッションへの
+    /// 登録に成功したことを示す応答。登録された関数名を保持する。
+    CreateFunction {
+        name: String,
+    },
 }

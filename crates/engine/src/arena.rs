@@ -80,6 +80,13 @@ pub enum ArenaError {
     /// （security.md「不安全な設計｜無制限リソース確保（DoS）」対応。メッセージは
     /// プログラム出力文字列のため英語）。
     AllocationFailed(String),
+    /// 呼び出し元フック（`on_visible_row`）が、行データではなく**値**を理由に構築を
+    /// 拒否した（TASK-79・SQL-9: `WHERE` の式述語が 0 除算・非有限値等で fail-closed に
+    /// 拒否した場合）。データ破損・実装バグを表す [`ArenaError::Storage`] とは区別し、
+    /// 呼び出し元（`sql::exec::map_arena_error`）が `SqlSurfaceError::InvalidInput`
+    /// （`22000`）へ写像できるようにする。`arena.rs` は sql 表層の型に依存しないよう、
+    /// メッセージは呼び出し元がテナント・行内容を含めずに構築した固定文言に限る。
+    InvalidInput(String),
 }
 
 impl std::fmt::Display for ArenaError {
@@ -98,6 +105,7 @@ impl std::fmt::Display for ArenaError {
                 "embedding dim mismatch at row id={id}: expected={expected} found={found}"
             ),
             ArenaError::AllocationFailed(msg) => write!(f, "arena allocation failed: {msg}"),
+            ArenaError::InvalidInput(msg) => write!(f, "arena build rejected by hook: {msg}"),
         }
     }
 }
@@ -110,7 +118,8 @@ impl std::error::Error for ArenaError {
             ArenaError::InvalidDim
             | ArenaError::CapacityExceeded
             | ArenaError::DimMismatch { .. }
-            | ArenaError::AllocationFailed(_) => None,
+            | ArenaError::AllocationFailed(_)
+            | ArenaError::InvalidInput(_) => None,
         }
     }
 }
@@ -480,7 +489,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         Self::build_filtered_with_rows_and_limits(
             storage,
@@ -518,7 +527,7 @@ impl VectorArena {
             storage,
             table_name,
             predicate,
-            |_slot, _id, _metadata| Ok(true),
+            |_slot, _id, _embedding, _metadata| Ok(true),
             max_rows,
             max_bytes,
         )
@@ -540,7 +549,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         let read_txn = storage.db().begin_read().map_err(StorageError::from)?;
         Self::build_filtered_with_rows_and_limits_in_txn(
@@ -572,7 +581,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         Self::build_filtered_with_rows_and_limits_in_txn(
             read_txn,
@@ -609,7 +618,7 @@ impl VectorArena {
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
-        G: FnMut(usize, u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         let expected_dim = validated_vector_dim_in_txn(read_txn, table_name)?;
 
@@ -702,7 +711,11 @@ impl VectorArena {
             // 閉じたため、`id` は 1 つの可視集合内で行を一意に指せない。スロット番号は
             // `(tenant_id, id)` の行と 1 対 1 に対応する）。呼び出し元側で
             // 別カウンタを持たせない（本ループの push 条件とドリフトさせない）。
-            if !on_visible_row(visible_row_count, id, &row.metadata)? {
+            // TASK-79（SQL-9）: `row.embedding` はこの時点で既にデコード済み（直前の
+            // `decode_row` 呼び出し）のため、追加コピーなしでフックへ渡せる。呼び出し元
+            // （`sql::exec.rs` の `on_visible_row`）は `WHERE` の式述語（宣言的 UDF・
+            // 組み込み関数呼び出し）を SCALAR 段の一部として評価するために使う。
+            if !on_visible_row(visible_row_count, id, &row.embedding, &row.metadata)? {
                 continue;
             }
 
@@ -1133,7 +1146,7 @@ mod tests {
             &read_txn,
             "docs",
             |_tenant, _visibility| true,
-            |_slot, _id, metadata| {
+            |_slot, _id, _embedding, metadata| {
                 let decoded = row_codec::decode_scalar_columns(&bound_schema, metadata)
                     .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
                 decoded_bodies.push(match decoded.get(1) {

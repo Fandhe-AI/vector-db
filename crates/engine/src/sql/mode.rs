@@ -146,11 +146,28 @@ pub fn resolve_mode(query: Option<SearchMode>, session: Option<SearchMode>) -> R
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
     search_mode: Option<SearchMode>,
+    /// TASK-79（SQL-9）: `CREATE FUNCTION` で登録した宣言的 UDF のセッション単位
+    /// レジストリ。`SessionState` 自体が接続（＝認証済みテナント）単位の値型であるため、
+    /// UDF 定義が他接続・他テナントへ漏れる経路は構造上存在しない。永続化しない
+    /// （`crate::sql::udf_call` モジュールドキュメント参照）。
+    udfs: crate::sql::udf_call::UdfRegistry,
 }
 
 impl SessionState {
     pub fn search_mode(&self) -> Option<SearchMode> {
         self.search_mode
+    }
+
+    /// このセッションに登録済みの UDF レジストリ（読み取り専用）。
+    pub fn udfs(&self) -> &crate::sql::udf_call::UdfRegistry {
+        &self.udfs
+    }
+
+    /// `core.rs::EngineCore::execute_sql_in_session` の `CreateFunction` 分岐から
+    /// 呼ばれる。登録の検証自体は `udf_call::define_function` が担い、本メソッドは
+    /// セッションが保持する `&mut UdfRegistry` を貸し出すだけの薄いアクセサ。
+    pub fn udfs_mut(&mut self) -> &mut crate::sql::udf_call::UdfRegistry {
+        &mut self.udfs
     }
 
     /// 検証済みの値のみを受け取る契約（呼び出し元 `core.rs::EngineCore::execute_sql_in_session`
