@@ -71,8 +71,17 @@ fi
 #   2. マスク後のテキストに対して API 呼び出しパターンを走査する（API 名と
 #      `(` の間の改行・空白を許容する `\s*`。2 回目の codex-review P1 指摘対応）に加え、
 #      turbofish 付き呼び出し（`sort_unstable_by::<_>(...)` 等）の API 名と `(` の
-#      間に挟まる `::<...>` も許容する（3 回目の codex-review P1 指摘対応。中身は
-#      `[^>]*` で単一行・複数行いずれのネストなし turbofish もマッチする）。
+#      間に挟まる `::<...>` も許容する（3 回目の codex-review P1 指摘対応）。turbofish
+#      の中身は Perl の名前付き再帰サブパターン
+#      `(?<angle><(?:->|[^<>]|(?&angle))*>)` で山括弧のネストを追跡して読み取る
+#      （`[^>]*` の単純実装では `sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) ->
+#      Ordering>(...)` のように型引数内に `>` を含む呼び出しで内側の `>` で
+#      早期にマッチが終了し検知漏れになっていた。4 回目の codex-review P1
+#      指摘対応）。関数ポインタの戻り値矢印 `->` はそれ自体に `>` を含むが
+#      閉じ括弧ではないため、`->` を 1 トークンとして先に許容し、素の `>` とは
+#      区別する（区別しないと `-> Ordering>` の `>`（矢印側）で山括弧の対応が
+#      崩れ、直後の実在する閉じ `>` の手前で誤ってマッチが終了する）。単一行・
+#      複数行いずれのネスト付き turbofish もマッチする。
 #      `// sort-determinism: allow ...` 許可マーカーの判定は、マーカー自体が
 #      コメント中にしか書けないため、マスク前の元テキスト（`@lines`）を参照する。
 #
@@ -180,7 +189,7 @@ scan_dir() {
         push @lineno_of_pos, ($ln) x length($text);
         $joined .= $text;
       }
-      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*(?:::\s*<[^>]*>\s*)?\(/gs) {
+      while ($joined =~ /\b(sort_unstable_by(?:_key)?|select_nth_unstable_by(?:_key)?)\s*(?:::\s*(?<angle><(?:->|[^<>]|(?&angle))*>)\s*)?\(/gs) {
         my $start_ln = $lineno_of_pos[$-[0]];
         my $end_ln = $lineno_of_pos[$+[0] - 1] // $start_ln;
         my $allowed = 0;
@@ -274,6 +283,18 @@ fn f(v: &mut [(i32, i32)]) {
     );
 }
 EOF
+  # fixture 13: 検知すべきケース（型引数内に `>` を含むネストした turbofish。
+  # `<[^>]*>` の単純パターンでは型引数中の内側 `>`（`Vec<i32>` の閉じ括弧）で
+  # マッチが終了し、その後に本来続くはずの `(` が見つからず検知漏れになって
+  # いたという 4 回目の codex-review P1 指摘の再現ケース）。
+  cat >"${tmp}/detect_turbofish_nested.rs" <<'EOF'
+use std::cmp::Ordering;
+
+fn f(v: &mut Vec<i32>, cmp: fn(&Vec<i32>, &Vec<i32>) -> Ordering) {
+    let mut vv: Vec<Vec<i32>> = vec![v.clone()];
+    vv.sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) -> Ordering>(cmp);
+}
+EOF
   # fixture 3: 検知してはならないケース（コメント行・許可マーカー・整数の
   # sort_unstable（引数なし、パターン対象外）・文字列全体としての言及）。
   cat >"${tmp}/allowed.rs" <<'EOF'
@@ -348,6 +369,10 @@ EOF
   fi
   if ! printf '%s\n' "${local_detected}" | grep -q "detect_turbofish_multiline.rs.*select_nth_unstable_by_key"; then
     echo "FAIL: self-test did not detect multiline turbofish-qualified select_nth_unstable_by_key::<_, _>(...) in detect_turbofish_multiline.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_turbofish_nested.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect nested-turbofish-qualified sort_unstable_by::<fn(&Vec<i32>, &Vec<i32>) -> Ordering>(...) in detect_turbofish_nested.rs" >&2
     failed=1
   fi
   if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs"; then
