@@ -200,7 +200,7 @@ ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-che
 # --------------------------------------------------
 
 .PHONY: bench-parallel
-bench-parallel: ## TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から定期実行）
+bench-parallel: ## TASK-127 の性能・Recall 受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 ifdef HAS_CARGO
 	cargo bench --bench parallel_bench -p engine
 else
@@ -212,7 +212,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-batch
-bench-batch: ## TASK-130 のバッチ高速化受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から手動実行）
+bench-batch: ## TASK-130 のバッチ高速化受け入れ基準回帰ベンチを実行する（時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 ifdef HAS_CARGO
 	cargo bench --bench batch_bench -p engine
 else
