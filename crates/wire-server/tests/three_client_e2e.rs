@@ -1,6 +1,10 @@
 //! 無改造の実クライアント 3 種（`psql`／Python `psycopg`／Node.js `pg`）から
-//! `wire-server` バイナリへ実接続し、C1 クエリの実行・誤りパスワードの拒否を
-//! 検証する層 B の統合テスト（TASK-73、対象ビヘイビア: WIRE-1）。
+//! `wire-server` バイナリへ実接続し、C1〜C4（純粋 Top-k・スカラー条件付き・
+//! RLS・ハイブリッド。列定義は `crates/engine/src/sql/parser.rs` 参照）の実行・
+//! 誤りパスワードの拒否を検証する層 B の統合テスト（TASK-73、対象ビヘイビア:
+//! WIRE-1。codex-review P2 指摘・PR #210: C1 のみの検証では C2〜C4 固有の構文・
+//! 列構成・型変換が各ドライバで正常に扱われることを保証できないため、C2〜C4 も
+//! 独立オラクルと照合する）。
 //!
 //! 責務境界: 層 A（`tests/wire1_simple_query.rs`）が生バイトの wire クライアント
 //! で常時（`make ci`）回帰保護する契約と同じバイト列を、実クライアント経由で
@@ -118,6 +122,9 @@ fn spawn_wire_server(users_path: &Path, db_path: &Path) -> ServerGuard {
 /// テーブルを持つ一時 DB を用意する（層 A の
 /// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ seed
 /// 方針。可視性の非対称は同テストのドキュメンテーションコメント参照）。
+/// `lang`（C2 のスカラー条件付き Top-k 用）・`body`（C4 のハイブリッド用）を
+/// `embedding` に加えて持たせ、C1〜C4 すべてを同じ 3 行のコーパスで検証できる
+/// ようにする（codex-review P2 指摘・PR #210）。
 fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("three-client-e2e-docs");
     let guard = temp_db::CleanupGuard(path.clone());
@@ -125,15 +132,19 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
     storage
         .create_table(&TableSchema::new(
             "docs",
-            vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
         ))
         .expect("create table");
-    let tenants: [(&str, u64, [f32; 2]); 3] = [
-        ("tenant-a", 1, [1.0, 0.0]),
-        ("tenant-b", 2, [0.0, 1.0]),
-        ("tenant-c", 3, [-1.0, 0.0]),
+    let tenants: [(&str, u64, [f32; 2], &str, &str); 3] = [
+        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
+        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
+        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
     ];
-    for (tenant, id, dir) in tenants {
+    for (tenant, id, dir, lang, body) in tenants {
         let ctx = PolicyContext::new(tenant).expect("valid tenant");
         engine::tenant::insert_typed_row(
             &storage,
@@ -141,7 +152,11 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
             &ctx,
             id,
             Visibility::Public,
-            &[Value::Vector(dir.to_vec())],
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(body.to_string()),
+            ],
         )
         .expect("insert row");
     }
@@ -164,10 +179,30 @@ fn write_users_file(path: &Path) {
     std::fs::write(path, content).expect("write users file");
 }
 
-const SELECT_OWN_ROW: &str = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
+/// C1（純粋 Top-k。列は id のみ）。
+const C1_SQL: &str = "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
+/// C2（スカラー条件付き Top-k。`id, lang` の 2 列を返し、`lang`（Text 型）の
+/// 型変換が各ドライバで正しく行われることも合わせて検証する）。
+const C2_SQL: &str =
+    "SELECT id, lang FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
+/// C3（RLS。`visible()` の有無で結果が変わらないことを検証する。
+/// `crates/engine/tests/sql_surface.rs`
+/// `sql3_rls_is_enforced_regardless_of_visible_predicate_presence` と同じ契約）。
+const C3_SQL: &str =
+    "SELECT id FROM docs WHERE visible() ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
+/// C4（ハイブリッド）。全行の `body` に含まれない語をクエリ語に選び、疎側候補が
+/// 0 件となることで密のみのランキングへ縮退させる（`crates/engine/tests/sql_surface.rs`
+/// `sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text` と同じ契約）。
+/// この場合、疎側の寄与が全行で等しく（0 件）なるため RRF 融合後の順序は密側の
+/// 順位のみで決まり、C1 と同じ独立オラクルで期待値を照合できる。
+const C4_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0.0]', body, 'zzz-term-absent-from-any-seed-body') LIMIT 3";
 
-/// psql（無改造）で C1 を実行し、返却された id 集合を返す。
-fn run_psql(port: u16, user: &str, password: &str) -> Vec<String> {
+/// psql（無改造）で任意の SQL を実行し、返却された各行を `|` 区切りで結合した
+/// 文字列の集合として返す（単一列なら値そのもの）。`-F '|'` で区切り文字を
+/// 明示指定し（`-X` で `~/.psqlrc` 経由の `\pset fieldsep` 上書きも遮断する
+/// ため、環境差異で暗黙に変わらない）、`run_psycopg`／`run_pg` 側も同じ区切りで
+/// 出力を揃える。
+fn run_psql(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
     let psql = resolve_tool("PSQL_BIN", "psql");
     let output = Command::new(&psql)
         .env("PGPASSWORD", password)
@@ -183,10 +218,12 @@ fn run_psql(port: u16, user: &str, password: &str) -> Vec<String> {
             "-X",
             "-w",
             "-At",
+            "-F",
+            "|",
             "-v",
             "ON_ERROR_STOP=1",
             "-c",
-            SELECT_OWN_ROW,
+            sql,
         ])
         .output()
         .unwrap_or_else(|e| {
@@ -238,8 +275,10 @@ fn run_psql_wrong_password(port: u16, user: &str) {
     );
 }
 
-/// Python `psycopg`（無改造）で C1 を実行し、id 集合を返す。
-fn run_psycopg(port: u16, user: &str, password: &str) -> Vec<String> {
+/// Python `psycopg`（無改造）で任意の SQL を実行し、各行を `|` 区切りで
+/// 結合した文字列の集合を返す（`run_psql` と同じ区切り規約。複数列を返す
+/// C2 の型変換検証に対応する）。
+fn run_psycopg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
     let python = resolve_tool("PYTHON_BIN", "python3");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
     let output = Command::new(&python)
@@ -248,7 +287,7 @@ fn run_psycopg(port: u16, user: &str, password: &str) -> Vec<String> {
         .env("WIRE_PORT", port.to_string())
         .env("WIRE_USER", user)
         .env("WIRE_PASSWORD", password)
-        .env("WIRE_SQL", SELECT_OWN_ROW)
+        .env("WIRE_SQL", sql)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"));
     assert!(
@@ -264,8 +303,9 @@ fn run_psycopg(port: u16, user: &str, password: &str) -> Vec<String> {
         .collect()
 }
 
-/// Node.js `pg`（無改造）で C1 を実行し、id 集合を返す。
-fn run_pg(port: u16, user: &str, password: &str) -> Vec<String> {
+/// Node.js `pg`（無改造）で任意の SQL を実行し、各行を `|` 区切りで結合
+/// した文字列の集合を返す（`run_psql` と同じ区切り規約）。
+fn run_pg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
     let node = resolve_tool("NODE_BIN", "node");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
     let output = Command::new(&node)
@@ -274,7 +314,7 @@ fn run_pg(port: u16, user: &str, password: &str) -> Vec<String> {
         .env("WIRE_PORT", port.to_string())
         .env("WIRE_USER", user)
         .env("WIRE_PASSWORD", password)
-        .env("WIRE_SQL", SELECT_OWN_ROW)
+        .env("WIRE_SQL", sql)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"));
     assert!(
@@ -291,15 +331,17 @@ fn run_pg(port: u16, user: &str, password: &str) -> Vec<String> {
 }
 
 /// 3 クライアント（psql / psycopg / pg）それぞれで、3 テナントいずれの
-/// ユーザーで接続しても C1 の結果が独立オラクル（seed 表からの距離降順・
+/// ユーザーで接続しても C1〜C4 の結果が独立オラクル（seed 表からの距離降順。
 /// `Visibility::Public` はテナント跨ぎで可視。層 A の
 /// `wire1_three_tenant_visibility_public_shared_private_hidden` と同じ可視性
-/// 契約）と一致すること・誤りパスワードが拒否されることを検証する。
-/// ツール未導入・スクリプト失敗は silent skip せず `panic!` で失敗させる
-/// （本ファイル先頭のドキュメンテーションコメント参照）。
+/// 契約）と一致すること・誤りパスワードが拒否されることを検証する
+/// （codex-review P2 指摘・PR #210: C1 だけでは C2〜C4 固有の構文・列構成・
+/// 型変換の各ドライバでの正常動作を保証できないため、C2〜C4 も独立オラクルと
+/// 照合する）。ツール未導入・スクリプト失敗は silent skip せず `panic!` で
+/// 失敗させる（本ファイル先頭のドキュメンテーションコメント参照）。
 #[test]
 #[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
-fn three_clients_run_c1_and_reject_wrong_password() {
+fn three_clients_run_c1_through_c4_and_reject_wrong_password() {
     let (db_path, _db_guard) = seed_three_tenant_db();
     let users_dir = temp_db::TempDir::new("three-client-e2e-users");
     let users_path = users_dir.path().join("users.txt");
@@ -310,31 +352,46 @@ fn three_clients_run_c1_and_reject_wrong_password() {
 
     // クエリ `[1.0,0.0]` からの距離昇順オラクル（seed 表: tenant-a=(1,0)距離0・
     // tenant-b=(0,1)距離1・tenant-c=(-1,0)距離2）。`Public` 行は全テナントから
-    // 可視のため、どのユーザーで接続してもこの 3 件が返る。
-    let expected_ids = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+    // 可視のため、どのユーザーで接続してもこの 3 件が返る（C1・C3・C4）。
+    let expected_c1 = vec!["1".to_string(), "2".to_string(), "3".to_string()];
+    // C2: `lang = 'ja'` で tenant-b（id 2, lang=en）を除外した残り 2 件を、
+    // 同じ距離昇順で返す（`SELECT id, lang` の 2 列を `|` 区切りで検証）。
+    let expected_c2 = vec!["1|ja".to_string(), "3|ja".to_string()];
+    // C3: `visible()` の有無で結果は変わらない契約のため C1 と同じ期待値。
+    let expected_c3 = expected_c1.clone();
+    // C4: 全行の body に含まれない語をクエリ語に使い密のみへ縮退させるため、
+    // C1 と同じ期待値になる（`C4_SQL` のドキュメンテーションコメント参照）。
+    let expected_c4 = expected_c1.clone();
 
     for (user, pw) in [
         ("alice", "pw-alice"),
         ("bob", "pw-bob"),
         ("carol", "pw-carol"),
     ] {
-        let psql_ids = run_psql(port, user, pw);
-        assert_eq!(
-            psql_ids, expected_ids,
-            "psql: unexpected result for user {user}"
-        );
+        for (label, sql, expected) in [
+            ("C1", C1_SQL, &expected_c1),
+            ("C2", C2_SQL, &expected_c2),
+            ("C3", C3_SQL, &expected_c3),
+            ("C4", C4_SQL, &expected_c4),
+        ] {
+            let psql_rows = run_psql(port, user, pw, sql);
+            assert_eq!(
+                &psql_rows, expected,
+                "psql: unexpected {label} result for user {user}"
+            );
 
-        let psycopg_ids = run_psycopg(port, user, pw);
-        assert_eq!(
-            psycopg_ids, expected_ids,
-            "psycopg: unexpected result for user {user}"
-        );
+            let psycopg_rows = run_psycopg(port, user, pw, sql);
+            assert_eq!(
+                &psycopg_rows, expected,
+                "psycopg: unexpected {label} result for user {user}"
+            );
 
-        let pg_ids = run_pg(port, user, pw);
-        assert_eq!(
-            pg_ids, expected_ids,
-            "pg: unexpected result for user {user}"
-        );
+            let pg_rows = run_pg(port, user, pw, sql);
+            assert_eq!(
+                &pg_rows, expected,
+                "pg: unexpected {label} result for user {user}"
+            );
+        }
     }
 
     run_psql_wrong_password(port, "alice");

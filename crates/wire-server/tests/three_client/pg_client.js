@@ -8,7 +8,10 @@
 // 使う。
 //
 // 環境変数: WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD / WIRE_SQL。
-// 成功時は結果セットの 1 列目（id 列）を改行区切りで stdout へ出力し終了コード 0。
+// 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
+// 出力し終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう全列を
+// 出力する。`crates/wire-server/tests/three_client_e2e.rs` の `run_psql`／
+// `run_psycopg` と同じ区切り規約）。
 // 失敗時はエラーを stderr へ出力し終了コード 1（silent skip はしない）。
 
 const host = process.env.WIRE_HOST;
@@ -44,8 +47,7 @@ client
   .then(() => client.query(sql))
   .then((result) => {
     for (const row of result.rows) {
-      const firstKey = Object.keys(row)[0];
-      process.stdout.write(`${row[firstKey]}\n`);
+      process.stdout.write(`${Object.values(row).join("|")}\n`);
     }
     return client.end();
   })

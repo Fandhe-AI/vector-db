@@ -20,8 +20,11 @@ codex-review 指摘・PR #210）。
 - WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD: 接続情報。
 - WIRE_SQL: 実行する SQL 文。
 
-成功時は結果セットの 1 列目（id 列）を改行区切りで stdout へ出力し、終了コード 0。
-失敗時はエラーを stderr へ出力し、終了コード 1（silent skip はしない）。
+成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
+出力し、終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう
+全列を出力する。`crates/wire-server/tests/three_client_e2e.rs` の
+`run_psql`／`run_pg` と同じ区切り規約）。失敗時はエラーを stderr へ出力し、
+終了コード 1（silent skip はしない）。
 """
 
 import os
@@ -57,7 +60,7 @@ def main() -> int:
             with psycopg.ClientCursor(conn) as cur:
                 cur.execute(sql)
                 for row in cur.fetchall():
-                    print(row[0])
+                    print("|".join(str(value) for value in row))
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         print(f"psycopg_client: query failed: {e}", file=sys.stderr)
