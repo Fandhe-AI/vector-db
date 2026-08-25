@@ -67,7 +67,8 @@ fi
 #
 #   1. `mask_non_code` (perl): ファイル全体を走査し、行コメント (`//...`)・
 #      ブロックコメント（`/* ... */`、ネスト対応）・文字列リテラル
-#      （通常/バイト文字列と `r"..."`/`r#"...#"` 等の raw 文字列）・char
+#      （通常/バイト/C 文字列 `"..."`/`b"..."`/`c"..."` と `r"..."`/`br#"..."#`/
+#      `cr#"..."#` 等の raw 文字列）・char
 #      リテラル (`'x'`, `'\n'` 等。ライフタイム `'a` とは非貪欲マッチで区別)
 #      の中身を、行・桁位置を保ったまま半角スペースへ置換した `masked` テキストと、
 #      各文字が「行コメント内 (`L`)」か「それ以外 (`O`)」かを同じ長さ・同じ
@@ -141,7 +142,7 @@ scan_dir() {
               elsif ($s =~ /\G./gcs) { $out .= " "; $kind .= "O"; }
               else { last; }
             }
-          } elsif ($s =~ /\Gb?r(#*)"/gc) {
+          } elsif ($s =~ /\G(?:b|c)?r(#*)"/gc) {
             my $hashes = $1;
             $out .= (" " x length($&));
             $kind .= ("O" x length($&));
@@ -152,7 +153,7 @@ scan_dir() {
               elsif ($s =~ /\G./gcs) { $out .= " "; $kind .= "O"; }
               else { last; }
             }
-          } elsif ($s =~ /\Gb?"/gc) {
+          } elsif ($s =~ /\G(?:b|c)?"/gc) {
             $out .= (" " x length($&));
             $kind .= ("O" x length($&));
             while (pos($s) < $len) {
@@ -379,6 +380,24 @@ fn f(v: &mut Vec<i32>) {
 }
 EOF
 
+  # fixture 16: 検知してはならないケース（C 文字列リテラル `c"..."` 中の
+  # 言及。`b?"..."` のみを扱う旧実装では `c"..."` の接頭辞 `c` を認識できず、
+  # マスクされずに実コードとして誤検知していたという codex-review P1
+  # 指摘の再現ケース）。
+  cat >"${tmp}/allowed_c_string_literal.rs" <<'EOF'
+fn f() {
+    let _s = c"sort_unstable_by";
+}
+EOF
+  # fixture 17: 検知してはならないケース（raw C 文字列リテラル
+  # `cr#"..."#` 中の言及。ハッシュ付き raw 文字列の閉じタグ判定も含めて
+  # 正しくマスクされることを確認する）。
+  cat >"${tmp}/allowed_raw_c_string_literal.rs" <<'EOF'
+fn f() {
+    let _s = cr#"sort_unstable_by"#;
+}
+EOF
+
   local_detected="$(scan_dir "${tmp}")"
   scan_status=$?
   if [ "${scan_status}" -ne 0 ]; then
@@ -430,7 +449,7 @@ EOF
     echo "FAIL: self-test did not detect sort_unstable_by guarded by a fake allow marker inside a string literal in detect_string_marker_bypass.rs" >&2
     failed=1
   fi
-  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs"; then
+  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs\|allowed_c_string_literal.rs\|allowed_raw_c_string_literal.rs"; then
     echo "FAIL: self-test false-positive on allowed*.rs (comment / allow-marker / string literal / sort_unstable without comparator should not match)" >&2
     echo "--- detected ---" >&2
     printf '%s\n' "${local_detected}" >&2
