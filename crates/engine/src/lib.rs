@@ -68,12 +68,19 @@
 //!
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
+//!
+//! TASK-119（対象ビヘイビア: INDEX-3）: `chunking.rs` が `INSERT` 経由で届く
+//! ファイル内容（パス＋本文）を Markdown 見出し単位・非 Markdown 固定行数単位で
+//! チャンク列へ分割する純関数的な API を提供する（詳細は `chunking.rs`
+//! モジュールドキュメント参照）。増分インデックスへの結線（TASK-120）・
+//! 一括投入上限（TASK-122、対象ビヘイビア: INDEX-4）は後続タスクの管轄。
 
 pub mod arena;
 pub mod batch_fallback;
 pub mod batch_search;
 pub mod buffer_pool;
 pub mod catalog;
+pub mod chunking;
 pub mod core;
 pub mod dispatch;
 pub mod hybrid;

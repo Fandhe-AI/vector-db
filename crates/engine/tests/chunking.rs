@@ -1,0 +1,180 @@
+//! TASK-119（対象ビヘイビア: INDEX-3）のチャンク化モジュール公開 API に対する
+//! 結合テスト。ポインタ: `docs/spec/05-tasks.md` TASK-119・
+//! `docs/spec/04-behavior/indexing.md` INDEX-3。
+//!
+//! `engine::chunking` の公開 API のみを経由して検証する（内部ヘルパの単体テストは
+//! `crates/engine/src/chunking.rs` 側に置く）。
+
+use engine::chunking::{
+    chunk_file, chunk_generic, chunk_markdown, detect_file_kind, ChunkingConfig, ChunkingError,
+    FileKind, MAX_INPUT_BYTES,
+};
+
+fn lines_of(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn mixed_files_are_chunked_by_kind() {
+    let config = ChunkingConfig::default();
+
+    let markdown = "# heading one\nbody a\n\n## heading two\nbody b\n";
+    let md_chunks = chunk_file("notes/readme.md", markdown, &config).expect("markdown chunks");
+    assert_eq!(md_chunks.len(), 2);
+
+    let generic_120 = lines_of(120);
+    let rs_chunks = chunk_file("src/main.rs", &generic_120, &config).expect("generic chunks");
+    assert_eq!(rs_chunks.len(), 120usize.div_ceil(60));
+
+    let toml_130 = lines_of(130);
+    let toml_chunks = chunk_file("Cargo.toml", &toml_130, &config).expect("toml chunks");
+    assert_eq!(toml_chunks.len(), 130usize.div_ceil(60));
+
+    let no_ext = lines_of(1);
+    let no_ext_chunks = chunk_file("Makefile", &no_ext, &config).expect("no-ext chunks");
+    assert_eq!(no_ext_chunks.len(), 1);
+}
+
+#[test]
+fn generic_60_line_windows() {
+    let config = ChunkingConfig::default();
+
+    let chunks_150 = chunk_generic(&lines_of(150), &config).expect("150 lines");
+    assert_eq!(chunks_150.len(), 3);
+    assert_eq!((chunks_150[0].start_line, chunks_150[0].end_line), (1, 60));
+    assert_eq!(
+        (chunks_150[1].start_line, chunks_150[1].end_line),
+        (61, 120)
+    );
+    assert_eq!(
+        (chunks_150[2].start_line, chunks_150[2].end_line),
+        (121, 150)
+    );
+
+    let chunks_60 = chunk_generic(&lines_of(60), &config).expect("60 lines");
+    assert_eq!(chunks_60.len(), 1);
+
+    let chunks_61 = chunk_generic(&lines_of(61), &config).expect("61 lines");
+    assert_eq!(chunks_61.len(), 2);
+
+    let chunks_empty = chunk_generic("", &config).expect("empty input");
+    assert_eq!(chunks_empty.len(), 0);
+
+    let chunks_blank = chunk_generic("   \n\n   \n", &config).expect("blank-only input");
+    assert_eq!(chunks_blank.len(), 0);
+}
+
+#[test]
+fn markdown_heading_boundaries() {
+    let config = ChunkingConfig::default();
+    let text = "preamble text\n\n# h1\nbody one\n\n## h2\nbody two\n\n### h3\nbody three\n\n#### h4 not a boundary\nstill inside h3 section\n";
+    let chunks = chunk_markdown(text, &config).expect("markdown chunks");
+
+    // 前文 + h1 + h2 + h3（#### は境界にならないため h3 節へ吸収される）= 4 節。
+    assert_eq!(chunks.len(), 4);
+    assert_eq!(chunks[0].start_line, 1);
+    assert!(chunks[1].text.starts_with("# h1"));
+    assert!(chunks[2].text.starts_with("## h2"));
+    assert!(chunks[3].text.starts_with("### h3"));
+    assert!(chunks[3].text.contains("#### h4 not a boundary"));
+}
+
+#[test]
+fn markdown_fenced_code_not_heading() {
+    let config = ChunkingConfig::default();
+    let text = "# real heading\nintro\n\n```text\n# not a heading\nstill code\n```\n\nmore body\n";
+    let chunks = chunk_markdown(text, &config).expect("markdown chunks");
+
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].text.contains("# not a heading"));
+}
+
+#[test]
+fn markdown_oversized_section_split_by_paragraph() {
+    let long_paragraph_a = "a".repeat(400);
+    let long_paragraph_b = "b".repeat(400);
+    let text = format!("# heading\n{long_paragraph_a}\n\n{long_paragraph_b}\n");
+
+    let split_config = ChunkingConfig {
+        max_markdown_section_chars: Some(600),
+        ..ChunkingConfig::default()
+    };
+    let split_chunks = chunk_markdown(&text, &split_config).expect("split chunks");
+    assert!(
+        split_chunks.len() > 1,
+        "oversized section should split at paragraph boundary"
+    );
+
+    let unbounded_config = ChunkingConfig {
+        max_markdown_section_chars: None,
+        ..ChunkingConfig::default()
+    };
+    let unbounded_chunks = chunk_markdown(&text, &unbounded_config).expect("unbounded chunks");
+    assert_eq!(unbounded_chunks.len(), 1);
+}
+
+#[test]
+fn crlf_input_is_normalized() {
+    let config = ChunkingConfig::default();
+    let lf = "# heading\r\nbody one\r\nbody two\r\n";
+    let crlf = "# heading\nbody one\nbody two\n";
+
+    let lf_chunks = chunk_markdown(lf, &config).expect("crlf chunks");
+    let crlf_chunks = chunk_markdown(crlf, &config).expect("lf chunks");
+
+    assert_eq!(lf_chunks.len(), crlf_chunks.len());
+    for chunk in &lf_chunks {
+        assert!(!chunk.text.contains('\r'));
+    }
+    assert_eq!(lf_chunks[0].text, crlf_chunks[0].text);
+}
+
+#[test]
+fn file_kind_detection() {
+    assert_eq!(detect_file_kind("a/b/readme.md"), FileKind::Markdown);
+    assert_eq!(detect_file_kind("readme.MD"), FileKind::Markdown);
+    assert_eq!(detect_file_kind("notes.markdown"), FileKind::Markdown);
+    assert_eq!(detect_file_kind("main.rs"), FileKind::Generic);
+    assert_eq!(detect_file_kind("data.json"), FileKind::Generic);
+    assert_eq!(detect_file_kind("Makefile"), FileKind::Generic);
+    assert_eq!(detect_file_kind("trailing."), FileKind::Generic);
+}
+
+#[test]
+fn limits_fail_closed() {
+    let config = ChunkingConfig::default();
+
+    let oversized = "a".repeat(MAX_INPUT_BYTES + 1);
+    let result = chunk_generic(&oversized, &config);
+    assert!(matches!(result, Err(ChunkingError::InputTooLarge { .. })));
+
+    let zero_lines_per_chunk = ChunkingConfig {
+        lines_per_chunk: 0,
+        ..ChunkingConfig::default()
+    };
+    let result = chunk_generic("some text", &zero_lines_per_chunk);
+    assert!(matches!(result, Err(ChunkingError::InvalidConfig { .. })));
+
+    // チャンク総文字数が入力を超えないこと（有界化の健全性）。
+    let text = lines_of(90);
+    let chunks = chunk_generic(&text, &config).expect("90 lines");
+    let total_chars: usize = chunks.iter().map(|c| c.text.chars().count()).sum();
+    assert!(total_chars <= text.chars().count());
+}
+
+#[test]
+fn chunk_indices_are_dense_and_ordered() {
+    let config = ChunkingConfig::default();
+    let chunks = chunk_generic(&lines_of(200), &config).expect("200 lines");
+
+    let mut prev_end = 0usize;
+    for (expected_index, chunk) in chunks.iter().enumerate() {
+        assert_eq!(chunk.index, expected_index);
+        assert!(chunk.start_line <= chunk.end_line);
+        assert!(chunk.start_line > prev_end);
+        prev_end = chunk.end_line;
+    }
+}
