@@ -408,6 +408,173 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
     })
 }
 
+/// `sql::exec`（TASK-75、対象ビヘイビア: SQL-2）から呼ばれる、スキーマの非
+/// `VECTOR` 列（`Text` 列）のみを列順にエンコードするペイロード。`storage.rs::RowInput`
+/// は `embedding`（`VECTOR` 列 1 本）と不透明な `metadata` バイト列しか持たないため、
+/// `VECTOR` 列は `embedding` スロットへ、それ以外は本関数の出力を `metadata` へ格納する
+/// という規約を SQL 表層のローカルな契約として定義する（`encode_row`/`decode_row` の
+/// フルスキーマコーデックは `tenant_id`/`visibility` ヘッダごと持つため、`storage.rs` 側で
+/// 既に保持しているそれらと二重管理・二重保存になってしまい、本関数では使わない）。
+///
+/// `values` は [`TableSchema::columns`] の列順に対応させる（`VECTOR` 列の位置は
+/// 無条件にスキップされ、`values` に何を渡しても読まれない）。欠落・上限超過・
+/// 型不一致の規則は [`encode_row`] と同一（nullable 列の末尾欠落は `Value::Null`、
+/// non-nullable な欠落は `Err`）。
+pub fn encode_scalar_columns(schema: &TableSchema, values: &[Value]) -> Result<Vec<u8>> {
+    if values.len() > schema.columns.len() {
+        return Err(RowCodecError::Invalid(format!(
+            "too many values: schema has {} columns, got {}",
+            schema.columns.len(),
+            values.len()
+        )));
+    }
+
+    let mut buf = Vec::new();
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if matches!(column.ty, ColumnType::Vector(_)) {
+            // VECTOR 列は storage.rs 側の embedding スロットが担当するため、
+            // スカラーペイロードには一切含めない（値の有無・内容を問わずスキップ）。
+            continue;
+        }
+        let value = values.get(idx).unwrap_or(&Value::Null);
+        match value {
+            Value::Null => {
+                if !column.nullable {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} is not nullable but value is missing",
+                        column.name
+                    )));
+                }
+                buf.push(PRESENCE_NULL);
+            }
+            Value::Text(text) => {
+                let text_bytes = text.as_bytes();
+                let text_len = u32::try_from(text_bytes.len()).map_err(|_| {
+                    RowCodecError::Invalid(format!(
+                        "text field too long: {} bytes",
+                        text_bytes.len()
+                    ))
+                })?;
+                if text_len > MAX_TEXT_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                    )));
+                }
+                buf.push(PRESENCE_VALUE);
+                buf.extend_from_slice(&text_len.to_le_bytes());
+                buf.extend_from_slice(text_bytes);
+            }
+            Value::Vector(_) => {
+                return Err(RowCodecError::Invalid(format!(
+                    "column {:?} expects a non-Vector value, got Vector",
+                    column.name
+                )))
+            }
+        }
+    }
+
+    Ok(buf)
+}
+
+/// [`encode_scalar_columns`] の逆変換。戻り値は `schema.columns` と同じ長さ・順序を
+/// 持ち、`VECTOR` 列の位置は常に `Value::Null`（本関数はその位置のバイトを一切
+/// 読み書きしないダミー値。呼び出し元は embedding を `storage.rs::Row::embedding` から
+/// 別途参照する）。`Text` 列は [`decode_row`] と同じ規則（バッファ末尾で打ち切られた
+/// nullable 列は `Value::Null`、non-nullable は `Err`。presence タグ不正・宣言長が
+/// 残りバッファを超える場合は `Err`）でデコードする。
+pub fn decode_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(schema.columns.len());
+    let mut offset = 0usize;
+    for column in &schema.columns {
+        if matches!(column.ty, ColumnType::Vector(_)) {
+            values.push(Value::Null);
+            continue;
+        }
+        let presence = match buf.get(offset) {
+            Some(&b) => b,
+            None => {
+                if column.nullable {
+                    values.push(Value::Null);
+                    continue;
+                } else {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} is not nullable but scalar payload is truncated",
+                        column.name
+                    )));
+                }
+            }
+        };
+        offset = offset.checked_add(1).ok_or_else(|| {
+            RowCodecError::Invalid("offset overflow after presence field".to_string())
+        })?;
+
+        match presence {
+            PRESENCE_NULL => {
+                if !column.nullable {
+                    return Err(RowCodecError::Invalid(format!(
+                        "column {:?} is not nullable but value is NULL",
+                        column.name
+                    )));
+                }
+                values.push(Value::Null);
+            }
+            PRESENCE_VALUE => {
+                let len_bytes = buf
+                    .get(
+                        offset..offset.checked_add(4).ok_or_else(|| {
+                            RowCodecError::Invalid(
+                                "offset overflow before text length field".to_string(),
+                            )
+                        })?,
+                    )
+                    .ok_or_else(|| {
+                        RowCodecError::Invalid(
+                            "scalar payload truncated at text length field".to_string(),
+                        )
+                    })?;
+                let len_arr: [u8; 4] = len_bytes.try_into().map_err(|_| {
+                    RowCodecError::Invalid("text length field is not 4 bytes".to_string())
+                })?;
+                let text_len = u32::from_le_bytes(len_arr);
+                if text_len > MAX_TEXT_FIELD_LEN {
+                    return Err(RowCodecError::Invalid(format!(
+                        "text field length {text_len} exceeds limit {MAX_TEXT_FIELD_LEN}"
+                    )));
+                }
+                offset = offset.checked_add(4).ok_or_else(|| {
+                    RowCodecError::Invalid("offset overflow after text length field".to_string())
+                })?;
+                let text_end = offset.checked_add(text_len as usize).ok_or_else(|| {
+                    RowCodecError::Invalid("offset overflow after text field".to_string())
+                })?;
+                let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
+                    RowCodecError::Invalid("scalar payload truncated at text field".to_string())
+                })?;
+                let text = std::str::from_utf8(text_bytes)
+                    .map_err(|_| {
+                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                    })?
+                    .to_string();
+                offset = text_end;
+                values.push(Value::Text(text));
+            }
+            other => {
+                return Err(RowCodecError::Invalid(format!(
+                    "unknown presence byte: {other}"
+                )))
+            }
+        }
+    }
+
+    if offset != buf.len() {
+        return Err(RowCodecError::Invalid(
+            "scalar payload has trailing bytes beyond declared columns".to_string(),
+        ));
+    }
+
+    Ok(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +829,84 @@ mod tests {
         let encoded = encode_row(&schema, "tenant-a", Visibility::Public, &values).expect("encode");
         let decoded = decode_row(&schema, &encoded).expect("decode");
         assert_eq!(decoded.values[0], Value::Text(body));
+    }
+
+    // --- encode_scalar_columns / decode_scalar_columns（TASK-75、SQL-2） -----------
+
+    #[test]
+    fn scalar_columns_roundtrip_skips_vector_column() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello world".to_string()),
+            Value::Text("tag-a".to_string()),
+        ];
+        let encoded = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let decoded = decode_scalar_columns(&schema, &encoded).expect("decode scalar");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0], Value::Null); // VECTOR 列はダミー Null
+        assert_eq!(decoded[1], Value::Text("hello world".to_string()));
+        assert_eq!(decoded[2], Value::Text("tag-a".to_string()));
+    }
+
+    #[test]
+    fn scalar_columns_treats_missing_trailing_nullable_column_as_null() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            // tag（nullable, 末尾）を渡さない。
+        ];
+        let encoded = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let decoded = decode_scalar_columns(&schema, &encoded).expect("decode scalar");
+        assert_eq!(decoded[2], Value::Null);
+    }
+
+    #[test]
+    fn scalar_columns_rejects_missing_trailing_non_nullable_column() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        let values = vec![Value::Vector(vec![1.0, 2.0])];
+        let result = encode_scalar_columns(&schema, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn scalar_columns_decode_rejects_unknown_presence_byte() {
+        let schema = TableSchema::new("docs", vec![ColumnDef::new("body", ColumnType::Text, true)]);
+        let buf = vec![0xaa]; // 未知の presence バイト
+        let result = decode_scalar_columns(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn scalar_columns_decode_rejects_declared_length_exceeding_remaining_buffer() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let mut buf = Vec::new();
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        buf.extend_from_slice(b"short");
+        let result = decode_scalar_columns(&schema, &buf);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    #[test]
+    fn scalar_columns_encode_rejects_text_field_length_overflow() {
+        let schema = TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("body", ColumnType::Text, false)],
+        );
+        let huge_text = "x".repeat((MAX_TEXT_FIELD_LEN as usize) + 1);
+        let values = vec![Value::Text(huge_text)];
+        let result = encode_scalar_columns(&schema, &values);
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 }

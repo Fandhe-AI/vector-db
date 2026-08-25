@@ -28,8 +28,9 @@ use std::fmt;
 
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
+use crate::row_codec::{self, Value as RowCodecValue};
 use crate::sql::allowlist::{SqlSurfaceError, TableLookup};
-use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError};
+use crate::storage::{Row as StorageRow, RowInput, Storage, StorageError, Visibility};
 
 /// カタログ値を格納するテーブル。キーはテーブル名、値は [`encode_schema`] で
 /// エンコードしたバイト列。`ROWS_TABLE`（`storage.rs`）とは別テーブルとし、
@@ -713,6 +714,59 @@ impl Storage {
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
+    /// スキーマ列順の型付き値列（[`row_codec::Value`]）から 1 行挿入する（TASK-75、
+    /// 対象ビヘイビア: SQL-1〜4 の実行経路が `INSERT` 文を持たない本タスクで、
+    /// 結合テスト（`tests/sql_surface.rs`）が決定的なコーパスを投入するための共通入口）。
+    /// `values` は `schema.columns` の列順に対応させる。
+    ///
+    /// スキーマ取得・`VECTOR` 列の抽出・スカラーペイロード生成
+    /// （[`row_codec::encode_scalar_columns`]）・行書き込みを単一の write トランザクション
+    /// 内で行う（[`Self::insert_row_into_table`] と同じ理由で並行 DDL との整合を確保する）。
+    /// `VECTOR` 列を持たない・`values` の対応する位置が `Value::Vector` でない場合は
+    /// fail-closed に `Err`。
+    pub fn insert_typed_row(
+        &self,
+        table_name: &str,
+        id: u64,
+        tenant_id: &str,
+        visibility: Visibility,
+        values: &[RowCodecValue],
+    ) -> Result<()> {
+        validate_identifier(table_name)?;
+        let write_txn = self.db().begin_write()?;
+        {
+            let schema = require_table_schema_write(&write_txn, table_name)?;
+            let vector_idx = schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+                .ok_or_else(|| CatalogError::Invalid("table has no VECTOR column".to_string()))?;
+            let embedding = match values.get(vector_idx) {
+                Some(RowCodecValue::Vector(v)) => v.clone(),
+                _ => {
+                    return Err(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    ))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let metadata = row_codec::encode_scalar_columns(&schema, values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            let row_input = RowInput {
+                tenant_id,
+                visibility,
+                embedding: &embedding,
+                metadata: &metadata,
+            };
+            let encoded = crate::storage::encode_row(&row_input).map_err(convert_storage_error)?;
+            let row_table_name = user_rows_table_name(table_name);
+            let row_table_def: TableDefinition<u64, &[u8]> = TableDefinition::new(&row_table_name);
+            let mut row_table = write_txn.open_table(row_table_def)?;
+            row_table.insert(id, encoded.as_slice())?;
+        }
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+    }
+
     /// テーブルスコープで 1 行取得する（スナップショット読み取り。TASK-146、対象ビヘイビア:
     /// EXT-1, EXT-2）。他テーブルの同一 ID は見えない（テーブル帰属した独立ストア）。
     /// テーブル不存在・行不存在はいずれも fail-closed に `Err` を返す
@@ -1142,5 +1196,90 @@ mod tests {
             generation_before + 1,
             "a non-empty batch insert must still bump the storage generation counter"
         );
+    }
+
+    // --- insert_typed_row（TASK-75、SQL-1〜4 の結合テスト共通入口） -----------------
+
+    #[test]
+    fn insert_typed_row_round_trips_embedding_and_scalar_columns() {
+        let path = unique_db_path("insert-typed-row-roundtrip");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                    ColumnDef::new("lang", ColumnType::Text, true),
+                ],
+            ))
+            .expect("create table");
+
+        storage
+            .insert_typed_row(
+                "docs",
+                1,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![1.0, 2.0, 3.0]),
+                    RowCodecValue::Text("hello".to_string()),
+                    RowCodecValue::Text("ja".to_string()),
+                ],
+            )
+            .expect("insert typed row");
+
+        let row = storage.get_row_from_table("docs", 1).expect("get row");
+        assert_eq!(row.embedding, vec![1.0, 2.0, 3.0]);
+        let schema = storage.get_table_schema("docs").expect("get schema");
+        let decoded =
+            row_codec::decode_scalar_columns(&schema, &row.metadata).expect("decode scalar");
+        assert_eq!(decoded[1], RowCodecValue::Text("hello".to_string()));
+        assert_eq!(decoded[2], RowCodecValue::Text("ja".to_string()));
+    }
+
+    #[test]
+    fn insert_typed_row_rejects_embedding_dim_mismatch() {
+        let path = unique_db_path("insert-typed-row-dim-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+            ))
+            .expect("create table");
+
+        let result = storage.insert_typed_row(
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[RowCodecValue::Vector(vec![1.0, 2.0])],
+        );
+        assert!(matches!(result, Err(CatalogError::Invalid(_))));
+    }
+
+    #[test]
+    fn insert_typed_row_rejects_missing_vector_column_value() {
+        let path = unique_db_path("insert-typed-row-missing-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(3), false)],
+            ))
+            .expect("create table");
+
+        let result = storage.insert_typed_row(
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[RowCodecValue::Null],
+        );
+        assert!(matches!(result, Err(CatalogError::Invalid(_))));
     }
 }

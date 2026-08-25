@@ -455,6 +455,43 @@ impl VectorArena {
         )
     }
 
+    /// [`Self::build_filtered`] へ、可視行（RLS 述語 `predicate` を通過した行）ごとに
+    /// 呼ばれる第 2 段のフック `on_visible_row(id, metadata)` を追加した版（TASK-75、
+    /// 対象ビヘイビア: SQL-2）。
+    ///
+    /// 呼び出し文脈: `sql::exec`（TASK-75）が `WHERE <列> = '<literal>'`
+    /// （スカラー等価条件）の事前フィルタをここで適用する。`on_visible_row` が
+    /// `Ok(false)` を返した行は、`predicate`（RLS 段）を通過した行と同様に
+    /// embedding をデコード済みだが、アリーナへは格納しない（`vectors`/`ids`/
+    /// `tenant_ids`/`visibilities` のいずれにも追加せず、アリーナ容量の上限検証
+    /// （[`check_capacity`]）の対象からも除外する）。`predicate`（RLS 段）→
+    /// `on_visible_row`（SCALAR 段）の評価順序は固定であり、[`Self::build_filtered`]
+    /// と同じく可視行だけが `on_visible_row` に到達する（不可視行の metadata は一切
+    /// デコードしない。呼び出し元がこの順序を入れ替えることはできない）。
+    ///
+    /// `on_visible_row` が `Err` を返した場合（例: `row_codec::decode_scalar_columns`
+    /// のデコード失敗）は、当該行を黙ってスキップせず fail-closed にアリーナ構築全体を
+    /// 拒否する（部分的なアリーナを返さない。[`Self::build_filtered`] の既存契約と同方針）。
+    pub fn build_filtered_with_rows<F, G>(
+        storage: &Storage,
+        table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        Self::build_filtered_with_rows_and_limits(
+            storage,
+            table_name,
+            predicate,
+            on_visible_row,
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+        )
+    }
+
     /// [`Self::build_filtered`] の上限値パラメータ化版。実装は本関数に集約し、
     /// [`Self::build_filtered`] は本番用の定数（[`MAX_ARENA_ROWS`]・
     /// [`MAX_ARENA_TOTAL_BYTES`]）で呼び出すだけの薄いラッパーにする。
@@ -470,12 +507,38 @@ impl VectorArena {
     fn build_filtered_with_limits<F>(
         storage: &Storage,
         table_name: &str,
-        mut predicate: F,
+        predicate: F,
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
+    {
+        Self::build_filtered_with_rows_and_limits(
+            storage,
+            table_name,
+            predicate,
+            |_id, _metadata| Ok(true),
+            max_rows,
+            max_bytes,
+        )
+    }
+
+    /// [`Self::build_filtered_with_limits`] の行フック付き版。実装はここへ集約し、
+    /// [`Self::build_filtered_with_limits`]（RLS 段のみ）は `on_visible_row` に
+    /// 常に `Ok(true)` を返す no-op を渡すだけの薄いラッパーになる（[`Self::build_filtered`]
+    /// のドキュメント参照。RLS 段のみの既存呼び出し元の挙動・エラー契約は変えない）。
+    fn build_filtered_with_rows_and_limits<F, G>(
+        storage: &Storage,
+        table_name: &str,
+        mut predicate: F,
+        mut on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(u64, &[u8]) -> std::result::Result<bool, ArenaError>,
     {
         // スキーマ取得・対象テーブルの行走査を単一の `read_txn`（同一スナップショット）上で
         // 行う。別トランザクションに分かれていると、スキーマ取得後・走査前に対象テーブルへの
@@ -550,6 +613,14 @@ impl VectorArena {
                     expected: expected_dim,
                     found: found_dim,
                 });
+            }
+
+            // SCALAR 段（TASK-75）: RLS 段（`predicate`）を通過した行の metadata に対し
+            // 呼び出し元のスカラー等価条件を適用する。`false` はアリーナへ格納せず
+            // スキップし（容量検証の対象にも含めない）、`Err` は fail-closed に
+            // 全体を拒否する（[`Self::build_filtered_with_rows`] のドキュメント参照）。
+            if !on_visible_row(id, &row.metadata)? {
+                continue;
             }
 
             // アロケーション前の上限検証（.claude/rules/security.md「不安全な設計｜

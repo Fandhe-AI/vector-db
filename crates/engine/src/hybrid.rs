@@ -52,7 +52,7 @@ use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
 /// 検索プールの深さ・k の上限。`core.rs::MAX_SEARCH_K`（同じく 10_000）と同桁を採用し、
 /// 未検証の巨大な値がそのままアロケーションサイズへ伝播することを防ぐ
 /// （coding-rust.md「無制限確保禁止」）。
-const MAX_POOL_DEPTH: usize = 10_000;
+pub(crate) const MAX_POOL_DEPTH: usize = 10_000;
 
 /// RRF 融合の設定（本モジュールの既定値。関連: TASK-103）。
 ///

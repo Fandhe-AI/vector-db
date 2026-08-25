@@ -268,6 +268,44 @@ impl EngineCore {
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
         Self { storage, provider }
     }
+
+    /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
+    /// `VectorCore` trait への昇格は行わない固有メソッドとする（`crates/engine/api/
+    /// core_api.snapshot`・`make core-api-check` が対象とするのは `VectorCore`
+    /// trait 本体のみのため、本メソッドの追加はコア API シグネチャ安定性チェックに
+    /// 影響しない。trait への統合可否は wire 統合タスク（TASK-68〜73）が判断する）。
+    ///
+    /// `sql::allowlist::validate_statement`（構造検証）→
+    /// `sql::parser::bind`（意味論検証・束縛）→ `sql::exec::execute_statement`
+    /// （RLS→SCALAR→DISTANCE 固定順の実行）の順に呼ぶ。RLS 適用は `ctx` の下で
+    /// 無条件に行われ、SQL 文中の `visible()` 呼び出しの有無に依存しない（SQL-3・
+    /// RLS-7。`sql::exec` のモジュールドキュメント参照）。
+    pub fn execute_sql(
+        &self,
+        ctx: &PolicyContext,
+        sql: &str,
+    ) -> Result<crate::sql::exec::QueryResult, crate::sql::allowlist::SqlSurfaceError> {
+        let stmt = crate::sql::allowlist::validate_statement(sql, &self.storage)?;
+        let schema = self
+            .storage
+            .get_table_schema(&stmt.table_name)
+            .map_err(|e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to load table schema: {other}"),
+                },
+            })?;
+        let bound = crate::sql::parser::bind(&stmt, &schema)?;
+        crate::sql::exec::execute_statement(
+            &self.storage,
+            self.provider.as_ref(),
+            ctx,
+            &schema,
+            &bound,
+        )
+    }
 }
 
 impl VectorCore for EngineCore {
