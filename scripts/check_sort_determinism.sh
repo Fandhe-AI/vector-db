@@ -331,12 +331,23 @@ fn f() {
     sort(&mut v, |a, b| a.cmp(b));
 }
 EOF
-  # fixture 15: 検知すべきケース（文字列リテラル中に許可マーカーと同じ文字列を
-  # 埋め込んで検知を回避しようとするケース。マスク前の行全体に対する素朴な
-  # 文字列一致では誤って許可扱いになっていたという 6 回目の codex-review P1
+  # fixture 15: 検知すべきケース（呼び出しと**同一行**の文字列リテラル中に
+  # 許可マーカーと同じ文字列を埋め込んで検知を回避しようとするケース。
+  # マスク前の行全体に対する素朴な文字列一致では、同一行に文字列リテラルが
+  # あるだけで誤って許可扱いになっていたという 6 回目の codex-review P1
   # 指摘の再現ケース。マーカーは行コメントではなく文字列リテラル中にあるため
-  # 許可されず、検知されなければならない）。
+  # 許可されず、検知されなければならない。Bugbot 指摘対応: 当初のこの fixture
+  # は偽マーカーが呼び出しの次行にあり、同一行での回避を再現できていなかった
+  # ため同一行へ修正した）。
   cat >"${tmp}/detect_string_marker_bypass.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    let _s = "sort-determinism: allow fake marker inside a string literal"; v.sort_unstable_by(|a, b| a.cmp(b));
+}
+EOF
+  # fixture 18: 検知すべきケース（fixture 15 と同種の回避だが、偽マーカーが
+  # 呼び出しの次の行の文字列リテラル中にあるケース。マーカー探索が呼び出し
+  # 行以外の行の文字列内容まで許可判定に取り込まないことを確認する）。
+  cat >"${tmp}/detect_string_marker_bypass_next_line.rs" <<'EOF'
 fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by(|a, b| a.cmp(b));
     let _s = "sort-determinism: allow fake marker inside a string literal";
@@ -447,6 +458,10 @@ EOF
   fi
   if ! printf '%s\n' "${local_detected}" | grep -q "detect_string_marker_bypass.rs.*sort_unstable_by"; then
     echo "FAIL: self-test did not detect sort_unstable_by guarded by a fake allow marker inside a string literal in detect_string_marker_bypass.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_string_marker_bypass_next_line.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by guarded by a fake allow marker inside a string literal on the next line in detect_string_marker_bypass_next_line.rs" >&2
     failed=1
   fi
   if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs\|allowed_c_string_literal.rs\|allowed_raw_c_string_literal.rs"; then
