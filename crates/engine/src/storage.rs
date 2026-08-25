@@ -1005,6 +1005,10 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
     #[test]
     fn decode_row_tenant_and_visibility_matches_full_decode_header() {
         // ヘッダのみ decode（本 PR で借用 &str 化した経路）が、フル decode の
@@ -1094,26 +1098,6 @@ mod tests {
             let full_result = decode_row(1, &buf);
             assert!(header_result.is_err(), "header decode should fail-closed");
             assert!(full_result.is_err(), "full decode should fail-closed");
-        }
-    }
-
-    /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-storage-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
-    }
-
-    struct CleanupGuard(std::path::PathBuf);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
         }
     }
 

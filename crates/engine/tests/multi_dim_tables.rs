@@ -15,38 +15,16 @@
 //! （`docs/design/multi-dim-table-coexistence.md` の「制約」節も参照）。
 //! production コード（`src/`）の変更はスコープ外。
 //!
-//! ヘルパ（`unique_db_path` / `CleanupGuard` / 決定論的な埋め込み生成）は
-//! `tests/incremental_write_perf.rs` の既存方針（ヘルパ共通化はせず小さく複製する）
-//! に倣い、このファイル内に複製する。
-
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+//! ヘルパ（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+//! `crates/engine/src/test_util/temp_db.rs` へ一本化した。決定論的な埋め込み生成は
+//! このファイル固有のまま複製する（`tests/incremental_write_perf.rs` の既存方針を踏襲）。
 
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`cargo test` の並列実行でも
-/// 衝突しないよう、プロセス ID とプロセス内連番を組み合わせる）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-task91-multi-dim-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 /// 全行に付与するダミーのテナント識別子（本テストはテナント境界の判定経路に
 /// 踏み込まない。空文字列は `RowInput` 側で拒否されるため非空の固定値を使う）。
