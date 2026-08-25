@@ -177,6 +177,65 @@ pub fn accept_loop(
     }
 }
 
+/// 同時接続数の暫定上限だった旧定数。TASK-69（WIRE-6）で
+/// [`crate::limits::MAX_CONNECTIONS`] が正式な契約値として上限を管理するように
+/// なったため、`accept_loop` 本体は本定数を参照しない。すでに公開 API
+/// （`pub const MAX_CONCURRENT_CONNECTIONS`）として利用側に届いている可能性が
+/// あるため、AGENTS.md の「公開 API・エラー契約の互換性（P1）」に従い削除せず
+/// 残す（[`bind_loopback`] と同じ後方互換方針）。
+#[deprecated(since = "0.1.0", note = "use crate::limits::MAX_CONNECTIONS instead")]
+pub const MAX_CONCURRENT_CONNECTIONS: usize = limits::MAX_CONNECTIONS;
+
+/// 認証前フェーズにのみ課していた I/O 期限の旧定数。TASK-69（WIRE-5）で
+/// [`crate::limits::READ_TIMEOUT`] が接続全体（認証前後を問わず）へ適用する
+/// 単一の契約値になったため、`accept_loop` 本体は本定数を参照しない。
+#[deprecated(since = "0.1.0", note = "use crate::limits::READ_TIMEOUT instead")]
+pub const CONNECTION_IO_TIMEOUT: Duration = limits::READ_TIMEOUT;
+
+/// 認証後のセッションに課していた緩いアイドル期限の旧定数。WIRE-5 の契約が
+/// 「認証前後で同一の読み取りタイムアウトを適用する」単一値方式へ統一された
+/// ため、`accept_loop`／`handle_connection` のどちらもこの値で挙動を切り替える
+/// ことはない。[`accept_loop_legacy`] が受け取る同名引数もこの理由で無視する
+/// （doc 参照）。
+#[deprecated(
+    since = "0.1.0",
+    note = "post-auth idle timeout switching was removed by WIRE-5 (single read_timeout contract); this value is unused"
+)]
+pub const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// 旧 `(listener, store, max_connections, io_timeout, post_auth_idle_timeout)`
+/// 5 引数シグネチャの [`accept_loop`] との後方互換ラッパー。
+///
+/// TASK-69（WIRE-5, WIRE-6）で `accept_loop` 本体は
+/// `(listener, store, limiter: ConnectionLimiter, read_timeout)` の 4 引数へ
+/// 移行し、認証前後で読み取りタイムアウトを切り替える経路も廃止した（WIRE-5:
+/// 接続全体に同一の期限を適用する単一値方式）。本関数はすでに公開 API として
+/// 利用側に届いている可能性のある旧シグネチャを維持しつつ、内部では新実装
+/// （[`ConnectionLimiter::new`] と `io_timeout`）へ委譲する（[`bind_loopback`]
+/// と同じ後方互換方針）。
+///
+/// `post_auth_idle_timeout` は WIRE-5 の単一タイムアウト契約により**無視**する
+/// （認証前後で値を切り替える経路自体が存在しないため、渡された値を使う先が
+/// ない）。新規コードは `accept_loop` を `ConnectionLimiter` とともに直接呼ぶこと。
+#[deprecated(
+    since = "0.1.0",
+    note = "use accept_loop(listener, store, ConnectionLimiter::new(max_connections), read_timeout) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
+)]
+pub fn accept_loop_legacy(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    max_connections: usize,
+    io_timeout: Duration,
+    _post_auth_idle_timeout: Duration,
+) {
+    accept_loop(
+        listener,
+        store,
+        ConnectionLimiter::new(max_connections),
+        io_timeout,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +377,70 @@ mod tests {
 
         drop(stalled);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1 review 再指摘（codex-review PRRT_kwDOUAKASM6b_Fs-）の再現ケース: 旧
+    /// 5 引数シグネチャの [`accept_loop_legacy`] を経由しても、新実装
+    /// （`ConnectionLimiter` ベースの `accept_loop`）と同じ fail-closed 挙動
+    /// （上限超過接続への `53300` 応答）が得られること。`post_auth_idle_timeout`
+    /// 引数は無視される契約のため、呼び出し時の値そのものは検証しない。
+    #[test]
+    #[allow(deprecated)]
+    fn accept_loop_legacy_compat_wrapper_enforces_connection_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-server-test-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users.txt");
+        std::fs::write(&path, "").expect("write empty user store");
+        let store = Arc::new(UserStore::load_from_file(&path).expect("valid empty store"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+
+        std::thread::spawn(move || {
+            accept_loop_legacy(
+                listener,
+                store,
+                1,
+                Duration::from_secs(5),
+                POST_AUTH_IDLE_TIMEOUT,
+            );
+        });
+
+        let _held = TcpStream::connect(addr).expect("connect first");
+        std::thread::sleep(Duration::from_millis(100));
+
+        let mut second = TcpStream::connect(addr).expect("connect second");
+        let mut header = [0u8; 1];
+        second.read_exact(&mut header).expect("read message type");
+        assert_eq!(header[0], b'E', "expected ErrorResponse via legacy wrapper");
+        let mut len_buf = [0u8; 4];
+        second.read_exact(&mut len_buf).expect("read length");
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len - 4];
+        second.read_exact(&mut body).expect("read body");
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(
+            body_str.contains(limits::SQLSTATE_TOO_MANY_CONNECTIONS),
+            "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 旧定数 `MAX_CONCURRENT_CONNECTIONS` / `CONNECTION_IO_TIMEOUT` が
+    /// [`crate::limits`] の現行契約値と同値のまま参照できること（互換層が
+    /// 値のドリフトを起こしていないことの回帰確認）。
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_constants_stay_in_sync_with_limits_module() {
+        assert_eq!(MAX_CONCURRENT_CONNECTIONS, limits::MAX_CONNECTIONS);
+        assert_eq!(CONNECTION_IO_TIMEOUT, limits::READ_TIMEOUT);
     }
 }

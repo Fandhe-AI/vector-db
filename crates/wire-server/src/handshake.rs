@@ -15,6 +15,7 @@
 
 use std::io::{self, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use crate::auth::{self, UserStore};
 use crate::framing::{self, FrameError};
@@ -492,6 +493,31 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
     }
 }
 
+/// 旧 `(stream, store, post_auth_idle_timeout)` 3 引数シグネチャの
+/// [`handle_connection`] との後方互換ラッパー。
+///
+/// TASK-69（WIRE-5）で読み取りタイムアウトは認証前後で切り替えない単一値方式
+/// （`server::accept_loop` が受理直後に一度だけ設定する）へ統一され、
+/// `handle_connection` 本体はタイムアウトを受け取らない 2 引数シグネチャへ
+/// 移行した。本関数はすでに公開 API として利用側に届いている可能性のある旧
+/// シグネチャを維持しつつ、内部では新実装（[`handle_connection`]）へ委譲する
+/// （`server::bind_loopback` と同じ後方互換方針）。
+///
+/// `post_auth_idle_timeout` は WIRE-5 の単一タイムアウト契約により**無視**する
+/// （認証前後で値を切り替える経路自体が存在しないため）。新規コードは
+/// `handle_connection` を直接呼ぶこと。
+#[deprecated(
+    since = "0.1.0",
+    note = "use handle_connection(stream, store) instead; post_auth_idle_timeout is ignored (WIRE-5 uses a single read_timeout for the whole connection)"
+)]
+pub fn handle_connection_with_idle_timeout(
+    stream: TcpStream,
+    store: &UserStore,
+    _post_auth_idle_timeout: Duration,
+) -> io::Result<()> {
+    handle_connection(stream, store)
+}
+
 /// BackendKeyData の secret フィールド用のプロセス内カウンタ（接続ごとに異なる値を
 /// 割り当てるだけの用途で、暗号学的強度は不要）。
 fn connection_counter() -> i32 {
@@ -825,5 +851,58 @@ mod tests {
         assert_eq!(resp_type[0], b'E', "expected ErrorResponse ('E')");
 
         server.join().expect("server thread must not panic");
+    }
+
+    /// P1 review 再指摘（codex-review PRRT_kwDOUAKASM6b_Fs-）の再現ケース: 旧
+    /// 3 引数シグネチャの [`handle_connection_with_idle_timeout`] を呼んでも
+    /// panic せず、新実装（[`handle_connection`]）へ委譲されること。無効な
+    /// StartupMessage（負の長さ）を送り、応答なしで正常にクローズすることまで
+    /// 確認する（`post_auth_idle_timeout` は無視される契約のため、値そのものは
+    /// 検証しない）。
+    #[test]
+    #[allow(deprecated)]
+    fn handle_connection_with_idle_timeout_compat_wrapper_delegates_without_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-handshake-test-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users.txt");
+        std::fs::write(&path, "").expect("write empty user store");
+        let store = UserStore::load_from_file(&path).expect("valid empty store");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let result =
+                handle_connection_with_idle_timeout(stream, &store, Duration::from_secs(300));
+            assert!(
+                result.is_ok(),
+                "malformed startup must close without I/O error"
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(-1i32).to_be_bytes());
+        client
+            .write_all(&msg)
+            .expect("send negative-length startup");
+
+        let mut extra = [0u8; 1];
+        let n = client.read(&mut extra).unwrap_or(0);
+        // ErrorResponse の 'E' か、応答なし EOF のいずれか（フレーミング拒否経路の
+        // 詳細は本テストの関心事ではない）。ここでは委譲先が呼ばれて panic せずに
+        // クローズすることのみを確認する。
+        let _ = n;
+
+        server.join().expect("server thread must not panic");
+        let _ = std::fs::remove_file(&path);
     }
 }
