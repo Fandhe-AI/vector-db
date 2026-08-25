@@ -297,6 +297,97 @@ fn table10_mixing_plain_write_txn_with_batch_write_txn_is_a_documented_out_of_co
     assert_eq!(batch_log, vec![(0, 1)]);
 }
 
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`Storage::put`（バッチ台帳を経由
+// しない別経路）と `BatchWriteTxn` を同一 DB・同一 `ROWS_TABLE` に対して混在させると、
+// `WriteTxn` との混在（既存テスト参照）と同様に「台帳の row_count 合計 == 行総数」という
+// 不変条件が成立しなくなることを固定する。
+#[test]
+fn table10_mixing_storage_put_with_batch_write_txn_is_a_documented_out_of_contract_limitation() {
+    let path = unique_db_path("mixing-storage-put-and-batch-write-txn-is-out-of-contract");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // 台帳を経由しない Storage::put で行 0 を書き込む。
+    storage
+        .put(0, &row(&[1.0], &[1]))
+        .expect("storage put row 0");
+
+    // BatchWriteTxn で行 1 だけを台帳へ記録する。BatchWriteTxn 単体としては不変条件を
+    // すべて満たしており、この commit 自体は正しく成功する。
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    batch_txn.log_batch(0).expect("log_batch for row 1");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 1)]);
+}
+
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`Storage::put_batch` と
+// `BatchWriteTxn` の混在でも同様に不変条件が成立しなくなることを固定する。
+#[test]
+fn table10_mixing_storage_put_batch_with_batch_write_txn_is_a_documented_out_of_contract_limitation(
+) {
+    let path = unique_db_path("mixing-storage-put-batch-and-batch-write-txn-is-out-of-contract");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // 台帳を経由しない Storage::put_batch で行 0・1 を書き込む。
+    storage
+        .put_batch(&[(0, row(&[1.0], &[1])), (1, row(&[2.0], &[2]))])
+        .expect("storage put_batch rows 0,1");
+
+    // BatchWriteTxn で行 2 だけを台帳へ記録する。
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(2, &row(&[3.0], &[3])).expect("put row 2");
+    batch_txn.log_batch(0).expect("log_batch for row 2");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 3);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 1)]);
+}
+
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`BatchWriteTxn` で書き込んだ後に
+// 台帳非経由の `Storage::put` を upsert・新規挿入いずれで呼んでも、台帳の値は一切更新
+// されないことを固定する（`Storage::put` からは台帳の存在自体が見えないため）。
+#[test]
+fn table10_storage_put_after_batch_write_txn_leaves_ledger_unchanged() {
+    let path = unique_db_path("storage-put-after-batch-write-txn-leaves-ledger-unchanged");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    batch_txn.log_batch(0).expect("log_batch for row 0");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    // 既存 ID への upsert。
+    storage
+        .put(0, &row(&[9.0], &[9]))
+        .expect("storage put upsert row 0");
+    // 新規 ID への挿入。
+    storage
+        .put(1, &row(&[2.0], &[2]))
+        .expect("storage put row 1");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(storage.get(0).expect("get row 0").embedding, [9.0]);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(
+        batch_log,
+        vec![(0, 1)],
+        "storage put (upsert or new) must not update the batch ledger"
+    );
+}
+
 // 対象ビヘイビア: TABLE-10。直近の log_batch（または WriteTxn 生成）以降 1 件も put
 // していない状態で log_batch を呼ぶと EmptyBatch で拒否され、ゼロ件エントリを台帳へ
 // 残さないこと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm7 対応）。
