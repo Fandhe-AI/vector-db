@@ -42,17 +42,62 @@ if [ ! -d "${WORKDIR}" ]; then
   exit 1
 fi
 
+# writer（crash_tool write）の PID を保持する。ループ内で起動するたびに更新され、
+# `wait` で reap 済みなら空文字へ戻す（不変条件は stop_writer のコメント参照）。
+# trap 設定より前に初期化しておかないと、ループ開始前（cargo build 中など）に
+# 中断された場合 set -u 下で cleanup が未定義変数エラーになり、
+# 本来の目的（writer 停止）を果たさず異常終了してしまう。
+writer_pid=""
+
+# バックグラウンドの writer（crash_tool write）を確実に停止する。
+# 呼び出し元は cleanup（EXIT/INT/TERM 経路）とループ内の各停止経路。
+# - writer_pid が空なら何もしない（reap 済み PID は OS に再利用され得るため、
+#   空のまま kill すると無関係な別プロセスを誤って殺しかねない）
+# - SIGKILL を使うのは、writer 側にシグナルハンドラが無く WORKDIR ごと破棄される
+#   前提のプロセスであり、graceful 停止に意味が無い・ハングしない・本スクリプトの
+#   他の停止経路（成功パスの SIGKILL 判定）と手段を揃えられるため
+# - wait で確実に reap してから writer_pid をクリアする（クリア漏れがあると
+#   cleanup からの再呼び出しで別プロセスへの誤 kill につながる）
+stop_writer() {
+  if [ -n "${writer_pid}" ]; then
+    kill -9 "${writer_pid}" 2>/dev/null
+    wait "${writer_pid}" 2>/dev/null
+    writer_pid=""
+  fi
+}
+
 # INT/TERM は bash の trap ハンドラ実行後もスクリプトの次の文から実行を継続する
 # 仕様があるため、EXIT と INT/TERM を同一 trap にまとめると中断時に WORKDIR 削除後も
 # ループが続行し、以降の参照が不可解なエラーで異常終了する。cleanup（削除処理）は
 # EXIT 用に分離し、INT/TERM では明示的に exit 130 で打ち切ることでハンドラ実行後の
 # 継続を防ぐ（130 は SIGINT の慣例終了コードだが、本スクリプトでは TERM 受信時も
 # 同じ値で統一して打ち切る）。
+#
+# cleanup は「writer 停止 → WORKDIR 削除」の順序を守る（本質的な点）。逆順にすると
+# WORKDIR を unlink した後も writer が生存を続け、削除済み redb ファイルへ書き込みを
+# 続ける survivor が残る（プロセスグループではなくスクリプト単体へ SIGTERM/SIGINT が
+# 送られた場合、trap されるのは本スクリプトのみで子である writer には届かないため、
+# 明示的な停止が無いと writer は親を失ったまま MAX_ROWS まで自走しディスク・CPU を
+# 消費し続ける。Issue #134）。
+# `cleanup; exit 130` は EXIT trap も再度走らせる（exit で EXIT trap が発火する）が、
+# stop_writer は writer_pid 空なら no-op・`rm -rf` は対象が既に無ければ何もしないため
+# 2 回実行しても安全（冪等）。
 cleanup() {
+  stop_writer
   rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
+
+# 中断パスの検証手順（受け入れ基準: Issue #134）。自動化版は
+# scripts/crash_test_interrupt.sh（`make crash-test-interrupt`）。
+#   - スクリプト単体への SIGTERM（プロセスグループを介さない経路）:
+#     scripts/crash_test.sh 100 & pid=$!; sleep 5; kill -TERM "$pid"; wait "$pid"
+#     → 終了コード 130・`pgrep -f 'crash_tool write'` の出力が空（survivor 無し）
+#   - プロセスグループへの SIGTERM（`set -m` 下・端末の Ctrl+C 相当）:
+#     ( set -m; scripts/crash_test.sh 100 & pid=$!; sleep 5; kill -TERM -- "-$pid"; wait "$pid" )
+#     → 同様に survivor 無しであることを確認する
+echo "workdir: ${WORKDIR}"
 DB_PATH="${WORKDIR}/crash_test.redb"
 WRITE_LOG="${WORKDIR}/write.log"
 
@@ -89,8 +134,7 @@ for i in $(seq 1 "${ITERATIONS}"); do
   if [ "${started}" != "true" ]; then
     timeout_ms=$((WRITE_START_TIMEOUT_TENTHS * 100))
     echo "ERROR: writer did not report progress within ${timeout_ms}ms" >&2
-    kill -9 "${writer_pid}" 2>/dev/null
-    wait "${writer_pid}" 2>/dev/null
+    stop_writer
     exit 1
   fi
 

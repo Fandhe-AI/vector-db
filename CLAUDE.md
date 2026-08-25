@@ -38,7 +38,7 @@ vector-db/
 │   ├── skills/                    # npx skills add 導入スキル
 │   ├── workflows/                 # implement-issue-tree.js (相対 symlink)
 │   └── settings.json              # SessionStart / PostToolUse hooks
-├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_cross_table.sh 等。make 経由で実行）
+├── scripts/                       # 補助スクリプト（crash_test.sh・crash_test_interrupt.sh・crash_test_cross_table.sh 等。make 経由で実行）
 ├── Cargo.toml                     # workspace 定義（members: crates/engine, crates/wire-server）
 └── crates/                        # engine（lib）/ wire-server（lib+bin）workspace
 ```

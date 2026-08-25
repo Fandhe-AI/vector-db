@@ -166,6 +166,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため crash-test をスキップ"
 endif
 
+.PHONY: crash-test-interrupt
+crash-test-interrupt: ## crash_test.sh の中断パス（SIGTERM 単体・プロセスグループ）のセルフテスト（Issue #134・TASK-142。scripts/crash_test_interrupt.sh を実行）
+ifdef HAS_CARGO
+	scripts/crash_test_interrupt.sh
+else
+	@echo "skip: Cargo.toml 未追加のため crash-test-interrupt をスキップ"
+endif
+
 .PHONY: crash-test-cross-table
 crash-test-cross-table: ## 2 テーブル横断トランザクション・クラッシュ耐性回帰テスト（TASK-90・TABLE-10。scripts/crash_test_cross_table.sh を実行）
 ifdef HAS_CARGO
@@ -193,7 +201,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/parallel_bench.rs）
