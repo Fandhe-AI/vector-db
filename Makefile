@@ -184,6 +184,14 @@ sort-determinism-check: ## RRF 融合等のソート非決定性 API 再混入�
 	scripts/check_sort_determinism.sh --self-test
 	scripts/check_sort_determinism.sh
 
+.PHONY: check-cross
+check-cross: ## TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）
+ifdef HAS_CARGO
+	cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)

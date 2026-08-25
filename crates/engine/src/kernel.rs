@@ -91,7 +91,9 @@ pub trait SearchProvider: Send + Sync {
 }
 
 /// 既定の CPU-only 参照実装。内積スコアでの総当たり Top-k（`O(n log k)`、`BinaryHeap`
-/// による部分ソート）。単一スレッド・スカラー演算のみで、ベクトル化・並列化された
+/// による部分ソート）を単一スレッドで行う。内積カーネル自体は `isa.rs`
+/// （TASK-156・CORE-14）の実行時検出結果に従う（`dot` 参照。対応 CPU では SIMD、
+/// 非対応環境ではスカラー逐次和）。スレッド並列化された
 /// [`crate::parallel_search::ParallelSearchProvider`]（TASK-126）の正解値検証用の参照実装も兼ねる。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuScalarProvider;
@@ -142,14 +144,18 @@ impl SearchProvider for CpuScalarProvider {
     }
 }
 
-/// 内積（dot product）のスカラー参照実装（左から右への逐次和）。
+/// 内積（dot product）。実体は `isa.rs::current().dot`（TASK-156・CORE-14）へ
+/// 委譲し、実行時検出された ISA（AVX2+FMA・AVX-512・NEON。非対応環境では
+/// `isa::dot_scalar` と同じ左から右への逐次和）を使う。
 ///
-/// `parallel_search.rs::search_range` からも同一関数として呼ばれる（Issue #34 レビュー
-/// 指摘対応: 加算順序を分岐させると `ParallelSearchProvider` と本 provider の Top-k
-/// 集合・順序が丸め誤差で食い違い得るため、`pub(crate)` にして共有し、
-/// 単一の加算順序であることを構造的に保証する）。
+/// `parallel_search.rs::search_range`・`batch_search.rs`・`rls.rs` からも同一関数
+/// として呼ばれる（Issue #34 レビュー指摘対応: 加算順序を分岐させると
+/// `ParallelSearchProvider` 等と本 provider の Top-k 集合・順序が丸め誤差で
+/// 食い違い得るため、`pub(crate)` にして共有し、単一のカーネル・単一の加算順序で
+/// あることを構造的に保証する。ISA 検出はプロセス内で単調なため、実行中に加算順序が
+/// 変わることはない）。
 pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    crate::isa::current().dot(a, b)
 }
 
 /// ヒープ内の同点タイブレーク規約（Low 指摘対応）: スコアが同じ場合は id が小さい方を

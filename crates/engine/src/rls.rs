@@ -11,8 +11,10 @@
 //! tenant/visibility 再検証（構築時との不一致は [`RlsError::IndexStale`]）を fail-closed に
 //! 行う。契約の詳細は [`PrefilterIndex::search`] のドキュメント参照。
 //!
-//! `core.rs::EngineCore`（`VectorCore::search`）への prefilter インデックスのキャッシュ
-//! 統合・API 変更は本タスクのスコープ外（`VectorCore` trait のシグネチャは変更しない）。
+//! `core.rs::EngineCore`（`VectorCore::search`）は `core.rs::PrefilterCache`
+//! （TASK-169）経由で [`PrefilterSnapshot`] をキャッシュし、世代整合を保った上で
+//! 事前フィルタインデックスを再利用する（`VectorCore` trait のシグネチャは変更しない。
+//! 詳細は `core.rs` モジュールドキュメント・`PrefilterSnapshot` のドキュメント参照）。
 //!
 //! 本モジュールはさらに [`SearchTimeFilter`]（TASK-134・対象ビヘイビア: RLS-1, RLS-3）を
 //! 提供する。[`PrefilterIndex`] は構築時に `PolicyContext` を束縛するため、ポリシーが
@@ -177,27 +179,60 @@ impl From<crate::storage::StorageError> for RlsError {
 /// [`Self::len`]・[`Self::is_empty`] は可視行数・行の有無という存在情報を返すため、
 /// [`Self::built_ctx`] との完全一致を要求する（不一致は [`RlsError::ContextMismatch`]）。
 /// [`Self::dim`]・[`Self::table_name`] は非機微情報のため `ctx` を要求しない。
-pub struct PrefilterIndex<'s> {
+/// `HashSet<T>` の `capacity()`（保持要素数ではなく確保済み容量）から、実バケット数の
+/// 保守的な上限バイト数を見積もる（[`PrefilterSnapshot::approx_heap_bytes`] から呼ぶ。
+/// codex-review P1 対応・PR #191）。
+///
+/// `std::collections::HashSet` の実装基盤 `hashbrown` は最大負荷率 7/8 で 2 のべき乗
+/// サイズのテーブルを確保するため、実バケット数は `capacity() * 8 / 7` 以上になる。
+/// ここでは `capacity()` を `8/7` 倍してから次の 2 のべき乗へ切り上げることで、
+/// 実バケット数を下回らない（安全側＝上振れの）見積もりにする。1 バケットあたり
+/// 要素サイズ + control byte 1 byte を課金する。オーバーフロー時は `usize::MAX` に
+/// 飽和させる（総量上限判定を通過させない fail-closed 側に倒す。
+/// .claude/rules/coding-rust.md: 整数演算は checked/saturating を使う）。
+fn hash_set_conservative_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let scaled_up = capacity.saturating_mul(8) / 7;
+    let buckets = scaled_up.checked_next_power_of_two().unwrap_or(usize::MAX);
+    let per_bucket = std::mem::size_of::<T>().saturating_add(1);
+    buckets.saturating_mul(per_bucket)
+}
+
+/// 事前フィルタ方式の再利用可能インデックスのうち、`&Storage` 参照を持たない
+/// 内部スナップショット部分（TASK-133・TASK-169・RLS-1〜4）。
+///
+/// [`PrefilterIndex`] は本来 `&'s Storage` を保持するが、`core.rs::EngineCore` は
+/// `Storage` を所有するため、`EngineCore` 内部のキャッシュ（`core.rs::PrefilterCache`）に
+/// `PrefilterIndex<'s>` をそのまま格納すると自己参照構造体になってしまう。
+/// `PrefilterSnapshot` は storage 参照を持たない構築結果だけを保持し、`search_with`・
+/// `built_generation` 等のメソッドへ `&Storage` をそのつど引数で受け取ることで、
+/// `Arc<PrefilterSnapshot>` を storage の生存期間から独立してキャッシュに保持できるように
+/// する。[`PrefilterIndex`] は本型への薄いラッパーとして、既存の公開 API・契約（`ctx`
+/// 完全一致・前後世代照合・provider 結果検証）をそのまま維持する。
+pub(crate) struct PrefilterSnapshot {
     arena: VectorArena,
-    /// [`Self::build`] に渡された `&Storage`（[`Self::search`] へは渡さず、この参照のみ
-    /// 使う）。
-    storage: &'s Storage,
     /// `arena.ids()` の `HashSet` キャッシュ（provider 結果の可視性検証に使う）。
     visible_id_set: HashSet<u64>,
-    /// [`Self::build`] に渡された `PolicyContext` の複製。`ctx` 照合ゲートに使う。
+    /// 構築時に束縛した `PolicyContext` の複製。`ctx` 照合ゲートに使う。
     built_ctx: PolicyContext,
-    /// [`Self::build`] 時に読んだストレージ世代（[`Storage::current_generation`]）。
-    /// [`Self::search`] の失効検出に使う。
+    /// 構築時に読んだストレージ世代（[`Storage::current_generation`]）。
+    /// [`Self::search_with`] の失効検出に使う。
     built_generation: u64,
 }
 
-impl<'s> PrefilterIndex<'s> {
+impl PrefilterSnapshot {
     /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する（RLS-1）。
     /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
     /// security.md P0）。容量超過・次元不整合は [`RlsError::Arena`] へ伝播する。
-    pub fn build(storage: &'s Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
+    pub(crate) fn build(
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> Result<Self, RlsError> {
         // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
-        // コミットされても、その変更を見落とさない方向の順序。`search` の doc 参照）。
+        // コミットされても、その変更を見落とさない方向の順序。`search_with` の doc 参照）。
         let built_generation = storage.current_generation()?;
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
@@ -211,7 +246,6 @@ impl<'s> PrefilterIndex<'s> {
         let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
         Ok(Self {
             arena,
-            storage,
             visible_id_set,
             built_ctx: ctx.clone(),
             built_generation,
@@ -220,22 +254,26 @@ impl<'s> PrefilterIndex<'s> {
 
     /// 保持済みインデックスに対して Top-k 検索を行う（over-fetch なし・RLS-3）。
     ///
-    /// `ctx` は [`Self::build`] 時に束縛した `PolicyContext` と完全一致していなければ
+    /// `ctx` は構築時に束縛した `PolicyContext` と完全一致していなければ
     /// [`RlsError::ContextMismatch`] で fail-closed に拒否する。`k`・`query` の検証
     /// （`core.rs::EngineCore::search` と同一契約）の後、provider を呼ぶ**前**と
-    /// provider から結果を受け取った**後**の 2 回、
-    /// [`crate::storage::Storage::current_generation`] を呼んで [`Self::build`] 時の値と
-    /// 比較する（いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体の
-    /// 書き込みコミットのたびに単調増加する（`crate::storage::bump_generation_and_commit`）
+    /// provider から結果を受け取った**後**の 2 回、`storage`（呼び出し元が渡す。
+    /// キャッシュ経由の再利用時も構築時と同一の `Storage` を渡す契約）の
+    /// [`crate::storage::Storage::current_generation`] を呼んで構築時の値と比較する
+    /// （いずれかで不一致なら [`RlsError::IndexStale`]）。世代はストレージ全体で、
+    /// 実書き込みを伴うコミットのたびに単調増加する（`crate::storage::commit_write_txn`
+    /// が `has_writes == true` のときのみ `crate::storage::bump_generation_and_commit`
+    /// に委譲する契約。Issue #175。put を伴わない no-op commit では世代は進まない）
     /// ため、両方で一致することは「事前確認から事後確認までの間、行集合・内容とも一切
     /// 変更されていない」ことを意味する（安全性はこの前後比較のみで担保しており、
     /// `current_generation` 自体は世代値以外の一貫性を保証しない）。事前確認を通過した
     /// 場合のみ provider を呼び、戻り値を `provider_result_is_valid`（`core.rs`）で検証する
     /// （違反は [`RlsError::ProviderResultRejected`]）。事前・事後の確認自体は互いに独立した
     /// 読み取りであり、事後確認と `Ok(hits)` 返却の間に残るごく短いウィンドウは次回検索の
-    /// 世代照合で扱う。TASK-133・RLS-1〜4 参照。
-    pub fn search(
+    /// 世代照合で扱う。TASK-133・TASK-169・RLS-1〜4 参照。
+    pub(crate) fn search_with(
         &self,
+        storage: &Storage,
         ctx: &PolicyContext,
         provider: &dyn SearchProvider,
         query: &[f32],
@@ -258,8 +296,7 @@ impl<'s> PrefilterIndex<'s> {
 
         // 事前の失効検出（上記ドキュメント参照）。世代の読み取り自体に失敗した場合も
         // 「現在の状態を確認できない」ため fail-closed に `IndexStale` とする。
-        let pre_generation = self
-            .storage
+        let pre_generation = storage
             .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
         if pre_generation != self.built_generation {
@@ -281,8 +318,7 @@ impl<'s> PrefilterIndex<'s> {
 
         // 事後の失効再検証（上記ドキュメント参照）。事前確認〜ここまでの間に別の書き込みが
         // コミットされている可能性があるため、世代を読み直して不一致なら結果を破棄する。
-        let post_generation = self
-            .storage
+        let post_generation = storage
             .current_generation()
             .map_err(|_| RlsError::IndexStale)?;
         if post_generation != self.built_generation {
@@ -294,7 +330,7 @@ impl<'s> PrefilterIndex<'s> {
 
     /// インデックスが保持する可視行数を返す。`ctx` は構築時 `PolicyContext` と完全一致
     /// していなければ [`RlsError::ContextMismatch`]（存在情報を漏らさない。security.md P0）。
-    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+    pub(crate) fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
         if ctx != &self.built_ctx {
             return Err(RlsError::ContextMismatch);
         }
@@ -302,7 +338,7 @@ impl<'s> PrefilterIndex<'s> {
     }
 
     /// 可視行が 0 件かを返す（`ctx` 照合は [`Self::len`] と同じ）。
-    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+    pub(crate) fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
         if ctx != &self.built_ctx {
             return Err(RlsError::ContextMismatch);
         }
@@ -310,13 +346,106 @@ impl<'s> PrefilterIndex<'s> {
     }
 
     /// 検索対象ベクトルの次元（`ctx` 不要。テーブル定義由来の非機微情報）。
-    pub fn dim(&self) -> u32 {
+    pub(crate) fn dim(&self) -> u32 {
         self.arena.dim()
     }
 
     /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
-    pub fn table_name(&self) -> &str {
+    pub(crate) fn table_name(&self) -> &str {
         self.arena.table_name()
+    }
+
+    /// 構築時に束縛した `PolicyContext`（`core.rs::PrefilterCache` のキー照合に使う）。
+    pub(crate) fn built_ctx(&self) -> &PolicyContext {
+        &self.built_ctx
+    }
+
+    /// 構築時に読んだストレージ世代（`core.rs::PrefilterCache` の世代整合判定に使う）。
+    pub(crate) fn built_generation(&self) -> u64 {
+        self.built_generation
+    }
+
+    /// このスナップショットが常駐時に占める概算ヒープ使用量
+    /// （`core.rs::PrefilterCache` の容量上限判定に使う。[`VectorArena::approx_heap_bytes`]
+    /// と `visible_id_set` の概算合計。詳細は同メソッドのドキュメント参照）。
+    ///
+    /// `visible_id_set: HashSet<u64>` は `len()`（要素数）ではなく `capacity()`
+    /// （現在のテーブルサイズで確保済みの容量。未使用分含む）を基準に見積もる
+    /// （codex-review P1 対応・PR #191。`len()` ベースは amortized 成長で確保済みの
+    /// 未使用容量・swiss table の control byte オーバーヘッドを無視し、実確保量を
+    /// 過小評価するため）。`hashbrown`（`std::collections::HashSet` の実装基盤）は
+    /// 最大負荷率 7/8 でテーブルを 2 のべき乗サイズに確保するため、実バケット数は
+    /// `capacity() * 8 / 7` 以上になる。ここでは `capacity()` をそのまま `8/7` 倍し
+    /// 2 のべき乗へ切り上げて実バケット数の保守的な上限を見積もり、1 バケットあたり
+    /// 要素（`u64`）8 byte + control byte 1 byte で概算する（実際の確保量を
+    /// 下回らない方向に丸める。totalへの過小評価は total 上限による DoS 防御の
+    /// 意味を失わせるため、安全側＝上振れに倒す）。
+    pub(crate) fn approx_heap_bytes(&self) -> usize {
+        let arena_bytes = self.arena.approx_heap_bytes();
+        let id_set_bytes = hash_set_conservative_bytes::<u64>(self.visible_id_set.capacity());
+        arena_bytes.saturating_add(id_set_bytes)
+    }
+}
+
+/// 事前フィルタ方式の再利用可能インデックス（TASK-133・RLS-1〜4）。
+///
+/// [`Self::build`] 構築時に束縛した [`PolicyContext`] の可視性述語で
+/// [`VectorArena::build_filtered`] を呼び、可視行のみのカラムナ表現を保持する。
+/// [`Self::search`] の契約は同メソッドのドキュメント参照。
+///
+/// [`Self::len`]・[`Self::is_empty`] は可視行数・行の有無という存在情報を返すため、
+/// 構築時 `PolicyContext` との完全一致を要求する（不一致は [`RlsError::ContextMismatch`]）。
+/// [`Self::dim`]・[`Self::table_name`] は非機微情報のため `ctx` を要求しない。
+///
+/// 本型は storage 非依存の [`PrefilterSnapshot`] を `&'s Storage` とともに保持するだけの
+/// 薄いラッパーで、実処理は `PrefilterSnapshot` 側のメソッドへ委譲する（TASK-169:
+/// `core.rs::EngineCore` がキャッシュに保持できるよう `PrefilterSnapshot` を切り出した
+/// 経緯は同型のドキュメント参照）。
+pub struct PrefilterIndex<'s> {
+    inner: PrefilterSnapshot,
+    storage: &'s Storage,
+}
+
+impl<'s> PrefilterIndex<'s> {
+    /// `table` に対し `ctx` の可視性述語で可視行のみのインデックスを構築する（RLS-1）。
+    /// テーブル不存在は [`RlsError::NotFound`] へ丸め込む（存在情報を漏らさない。
+    /// security.md P0）。容量超過・次元不整合は [`RlsError::Arena`] へ伝播する。
+    pub fn build(storage: &'s Storage, table: &str, ctx: &PolicyContext) -> Result<Self, RlsError> {
+        let inner = PrefilterSnapshot::build(storage, table, ctx)?;
+        Ok(Self { inner, storage })
+    }
+
+    /// 保持済みインデックスに対して Top-k 検索を行う（契約は
+    /// [`PrefilterSnapshot::search_with`] のドキュメント参照。TASK-133・RLS-1〜4）。
+    pub fn search(
+        &self,
+        ctx: &PolicyContext,
+        provider: &dyn SearchProvider,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>, RlsError> {
+        self.inner
+            .search_with(self.storage, ctx, provider, query, k)
+    }
+
+    /// インデックスが保持する可視行数を返す（契約は [`PrefilterSnapshot::len`] 参照）。
+    pub fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {
+        self.inner.len(ctx)
+    }
+
+    /// 可視行が 0 件かを返す（契約は [`PrefilterSnapshot::is_empty`] 参照）。
+    pub fn is_empty(&self, ctx: &PolicyContext) -> Result<bool, RlsError> {
+        self.inner.is_empty(ctx)
+    }
+
+    /// 検索対象ベクトルの次元（`ctx` 不要。テーブル定義由来の非機微情報）。
+    pub fn dim(&self) -> u32 {
+        self.inner.dim()
+    }
+
+    /// 構築元のテーブル名（`ctx` 不要。呼び出し元が渡した引数の反映）。
+    pub fn table_name(&self) -> &str {
+        self.inner.table_name()
     }
 }
 
@@ -461,9 +590,10 @@ impl<'s> SearchTimeFilter<'s> {
 
             // 可視性判定を embedding decode より前に行う（上記型ドキュメント参照。
             // `VectorArena::build_filtered` と同じ順序）。
+            // `tenant_id` は `buf` を借用した `&str`（ヒープアロケーションなし。Issue #174）。
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(buf).map_err(ArenaError::from)?;
-            if !ctx.is_visible(&tenant_id, visibility) {
+            if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
@@ -544,7 +674,7 @@ impl<'s> SearchTimeFilter<'s> {
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(value.value())
                     .map_err(ArenaError::from)?;
-            if ctx.is_visible(&tenant_id, visibility) {
+            if ctx.is_visible(tenant_id, visibility) {
                 count = count.checked_add(1).ok_or(ArenaError::CapacityExceeded)?;
             }
         }
@@ -563,7 +693,7 @@ impl<'s> SearchTimeFilter<'s> {
             let (tenant_id, visibility) =
                 crate::storage::decode_row_tenant_and_visibility(value.value())
                     .map_err(ArenaError::from)?;
-            if ctx.is_visible(&tenant_id, visibility) {
+            if ctx.is_visible(tenant_id, visibility) {
                 return Ok(false);
             }
         }
@@ -617,41 +747,10 @@ mod tests {
         )
     }
 
-    // 簡易テンポラリディレクトリ（外部クレート非依存。dependency-policy 準拠。
-    // `core.rs::tests::TempDir` と同型の複製）。
-    struct TempDir(std::path::PathBuf);
-    impl TempDir {
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    // プロセス内グローバル通番。`SystemTime::now()` の実測分解能はプラットフォームにより
-    // ナノ秒より粗いため、同一 tick で並行実行された複数スレッドが `duration_since` の値だけで
-    // 一時ディレクトリ名を組み立てると衝突しうる（`storage.rs::tests::unique_db_path`・
-    // `arena.rs` の同種ヘルパーと同じ `SEQ.fetch_add` 対策。並列テスト実行時の
-    // `DatabaseAlreadyOpen` フレーク回避）。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    fn tempdir() -> TempDir {
-        let mut dir = std::env::temp_dir();
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let unique = format!(
-            "engine-rls-test-{}-{}-{seq}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
-    }
+    // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: `SEQ` 通番対策込みでこのモジュール内に
+    // 複製していたが、`DatabaseAlreadyOpen` フレーク対策が他の複製へ波及しなかったため）。
+    use crate::test_util::temp_db::tempdir;
 
     fn open_storage(dir: &std::path::Path) -> Storage {
         Storage::open(dir.join("db.redb")).expect("open storage")
@@ -1093,6 +1192,81 @@ mod tests {
 
         let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // 構築後に `crate::txn::WriteTxn` 経由で行を上書きした場合も、`ROWS_TABLE` 直接の
+    // `insert_row_into_table`（catalog.rs 経由）と同様に世代カウンタの不一致により
+    // `RlsError::IndexStale` で拒否する（Issue #175。「実書き込みの有無」判定の消費者側
+    // 退行検査。世代はストレージ全体で 1 つのため、対象テーブル外の書き込みでも失効する
+    // 現行契約自体は変えない）。
+    #[test]
+    fn search_rejects_after_write_txn_overwrite_commit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        // WriteTxn 経由で行 1 の embedding を上書きする（RowInput の tenant_id は
+        // catalog.rs 側テーブル名プレフィックスの都合上、insert 側と別経路の
+        // 生 put のため id は catalog 側と衝突しない別 id を使う）。
+        let mut txn = storage.begin_write().expect("begin_write");
+        txn.put(
+            1_000_000,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[0.0, 1.0],
+                metadata: &[],
+            },
+        )
+        .expect("put");
+        txn.commit().expect("commit with put");
+
+        let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // put を 1 度も呼ばない `WriteTxn` の commit（no-op commit）は世代を進めないため
+    // （Issue #175）、構築済みインデックスはそのまま `search` を継続できる。
+    // 本 Issue の効果（実書き込みなし commit で世代を不変にすることによる過剰失効の
+    // 削減）を消費者側で固定する。
+    #[test]
+    fn search_still_succeeds_after_noop_write_txn_commit() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        let txn = storage.begin_write().expect("begin_write");
+        txn.commit().expect("commit without put");
+
+        let result = index
+            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .expect("search should still succeed after no-op commit");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, 1);
     }
 
     // 構築後に新規可視行が挿入された場合も世代カウンタの不一致により
@@ -1902,6 +2076,132 @@ mod tests {
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
         assert_eq!(filter.dim(), 3);
         assert_eq!(filter.table_name(), "docs");
+    }
+
+    // 対象ビヘイビア: RLS-1〜4（TASK-169）。`PrefilterSnapshot::search_with` は
+    // `PrefilterIndex::search` と同一契約（世代の前後照合による失効検出）を、
+    // 呼び出し元が渡す `&Storage` に対して満たす（`core.rs::PrefilterCache` が
+    // storage 参照を保持せずキャッシュできることの直接的な前提）。
+    #[test]
+    fn snapshot_search_with_rejects_after_a_write_bumps_the_generation() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx).expect("build snapshot");
+
+        // 構築直後は世代が一致するため成功する。
+        assert!(snapshot
+            .search_with(&storage, &ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .is_ok());
+
+        // 別の書き込みコミットで世代が進むと、以後の検索は stale として拒否される
+        // （fail-closed。古い可視行集合の結果を返す経路を作らない）。
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[0.0, 1.0],
+        );
+        assert!(matches!(
+            snapshot.search_with(&storage, &ctx, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::IndexStale)
+        ));
+    }
+
+    // 対象ビヘイビア: RLS-1（TASK-169）。構築時と異なる `PolicyContext` は
+    // fail-closed に拒否する（`core.rs::PrefilterCache` のキー照合が万一崩れても
+    // 本メソッド自身が防御する二重チェック）。
+    #[test]
+    fn snapshot_search_with_rejects_a_context_different_from_build_time() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx_a).expect("build snapshot");
+
+        assert!(matches!(
+            snapshot.search_with(&storage, &ctx_b, &CpuScalarProvider, &[1.0, 0.0], 10),
+            Err(RlsError::ContextMismatch)
+        ));
+    }
+
+    // 対象ビヘイビア: TASK-169（`core.rs::PrefilterCache` の容量上限判定の前提）。
+    // 可視行を持つスナップショットの概算ヒープ使用量は 0 より大きい。
+    #[test]
+    fn snapshot_approx_heap_bytes_is_positive_when_index_holds_rows() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx).expect("build snapshot");
+
+        assert!(snapshot.approx_heap_bytes() > 0);
+        assert_eq!(snapshot.built_ctx(), &ctx);
+    }
+
+    // 対象ビヘイビア: security.md「不安全な設計｜無制限リソース確保（DoS）」
+    // （codex-review P1 対応・PR #191）。`hash_set_conservative_bytes` は `len()`
+    // （要素数）ではなく `capacity()`（bucket/control-byte 込みの確保量）ベースで
+    // 見積もらなければならない。要素を全削除しても capacity は解放されない
+    // `HashSet` を作り、len ベースの旧計算（0）より大きい値が返ることを確認する
+    // （旧実装は len==0 のとき 0 を返し、実確保量を無視していた＝本テストは
+    // 退行防止）。
+    #[test]
+    fn hash_set_conservative_bytes_charges_unused_capacity_not_just_len() {
+        let mut set: HashSet<u64> = HashSet::with_capacity(1024);
+        for i in 0..1024u64 {
+            set.insert(i);
+        }
+        set.clear();
+        assert_eq!(set.len(), 0);
+        assert!(set.capacity() >= 1024);
+
+        let bytes = hash_set_conservative_bytes::<u64>(set.capacity());
+        assert!(
+            bytes > 0,
+            "capacity-based estimate must charge unused capacity even when len()==0"
+        );
+        // capacity 分の要素サイズ（8 byte/要素）は最低限含まれていること。
+        assert!(bytes >= set.capacity() * std::mem::size_of::<u64>());
+    }
+
+    #[test]
+    fn hash_set_conservative_bytes_is_zero_for_zero_capacity() {
+        assert_eq!(hash_set_conservative_bytes::<u64>(0), 0);
     }
 
     // TASK-137: フックは独自比較を持たず `PolicyContext::is_visible` へ

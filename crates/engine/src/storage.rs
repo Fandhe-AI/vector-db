@@ -42,18 +42,21 @@ pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new(
 /// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
 /// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
 ///
-/// **契約の適用範囲（重要）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の行総数」という
-/// 不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ書き込んだ場合に
-/// のみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・`EmptyBatch`・
-/// `UnloggedRows`・上書き非カウントの各チェック）によって保証される。[`Storage::put`]・
-/// [`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を経由しない別経路）は
-/// 台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
+/// **契約の適用範囲（重要・恒久契約）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の
+/// 行総数」という不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ
+/// 書き込んだ場合にのみ [`crate::txn::BatchWriteTxn`] の公開 API（`DuplicateBatchSeq`・
+/// `EmptyBatch`・`UnloggedRows`・上書き非カウントの各チェック）によって保証される。
+/// [`Storage::put`]・[`Storage::put_batch`]・[`crate::txn::WriteTxn::put`]（バッチ台帳を
+/// 経由しない別経路）は台帳を一切更新せず [`ROWS_TABLE`] に直接書き込めるため、これらと
 /// [`crate::txn::BatchWriteTxn`] を同一 DB・同一テーブルに対して混在させると、上記の
 /// 不変条件は成立しなくなる。これは型システムでは検出できない呼び出し元の責務であり、
 /// 本モジュールは意図的にそれを強制しない（PR #129 codex レビュー PRRT_kwDOUAKASM6bbyWf
 /// 対応。「台帳合計 == 行総数」を保証する範囲を、実際に型で保証できる範囲まで明文化して
 /// 限定した）。TABLE-10 の不変条件が必要な呼び出し元は、対象テーブルへの書き込みを
 /// [`crate::txn::BatchWriteTxn`] に一本化すること。
+///
+/// 適用範囲の検討経緯（Issue #133）は `docs/design/batch-ledger-scope.md` にポインタを、
+/// 判断の詳細は private spec 側 `docs/spec/05-tasks.md`（TASK-90・TASK-93）に記載する。
 pub(crate) const BATCH_LOG_TABLE: TableDefinition<u64, u64> = TableDefinition::new("batch_log");
 
 /// ストレージ全体の書き込み世代カウンタ（TASK-133 P1・対象ビヘイビア: RLS-1〜4）。
@@ -123,6 +126,8 @@ pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
 /// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
 /// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する。
+/// 最大 `batch_seq` だけが必要な採番再開経路はこの上限に依存しない
+/// [`Storage::batch_log_max_seq`] を使う。
 const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
@@ -229,8 +234,9 @@ where
 pub type Result<T> = std::result::Result<T, StorageError>;
 
 /// 書き込みコミット直前に [`GENERATION_TABLE`] を +1 してからコミットする
-/// （TASK-133 P1 対応）。本クレート内の書き込みコミット（`Storage::put`/`put_batch`・
-/// `crate::catalog` の DDL/DML・`crate::txn::WriteTxn`/`BatchWriteTxn`）は
+/// （TASK-133 P1 対応）。本クレート内の実書き込みを伴う書き込みコミット
+/// （`Storage::put`/`put_batch`・`crate::catalog` の DDL/DML・
+/// [`commit_write_txn`] 経由の `crate::txn::WriteTxn`/`BatchWriteTxn`）は
 /// `write_txn.commit()` を直接呼ばずすべて本関数を経由する。将来の書き込み API 追加も
 /// 本関数を呼ぶだけで世代カウントの経路網羅が保たれる。
 ///
@@ -253,6 +259,32 @@ pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> R
     }
     write_txn.commit()?;
     Ok(())
+}
+
+/// `crate::txn::WriteTxn`/`BatchWriteTxn` の commit 経路を一本化する集約点
+/// （Issue #175・TASK-133 P2 対応）。`has_writes` は呼び出し元（`txn.rs`）が
+/// 自身のハンドルで redb のテーブルに触れる操作（`put`・`log_batch` 等）を
+/// 1 回でも行ったかを追跡した結果を渡す契約とする。
+///
+/// - `has_writes == true`: [`bump_generation_and_commit`] に委譲し、従来どおり
+///   世代を進めてからコミットする。
+/// - `has_writes == false`: 変更が何もないため durable write を発生させず、
+///   `write_txn.abort()` で閉じて世代を進めない（`crate::catalog` の空バッチ
+///   経路が commit せず drop（= abort）で閉じているのと同方針）。
+///
+/// fail-closed の判断: `has_writes` の真偽は本関数ではなく呼び出し元の追跡に
+/// 依存する。呼び出し元がテーブルに触れたかどうかの判定に迷う場合は `true`
+/// （世代を進める）側に倒すことが `txn.rs` 側の契約であり、本関数はそれを
+/// 前提に「過剰失効はあっても見逃し（fail-open）はない」設計とする
+/// （見逃しは `crate::rls::PrefilterIndex` の RLS 相当の失効検出を素通りさせ、
+/// 他テナント行の混入・削除済み可視性の残存に直結するため P0）。
+pub(crate) fn commit_write_txn(write_txn: redb::WriteTransaction, has_writes: bool) -> Result<()> {
+    if has_writes {
+        bump_generation_and_commit(write_txn)
+    } else {
+        write_txn.abort()?;
+        Ok(())
+    }
 }
 
 /// RLS 相当のテナント境界判定に使う可視性ラベル（対象ビヘイビア: PERSIST-3）。
@@ -350,6 +382,10 @@ impl Storage {
     }
 
     /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1）。
+    ///
+    /// バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路（恒久契約。
+    /// `docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が必要な場合は
+    /// [`Storage::begin_batch_write`] が返す [`crate::txn::BatchWriteTxn`] を使うこと。
     pub fn put(&self, id: u64, row: &RowInput<'_>) -> Result<()> {
         let encoded = encode_row(row)?;
         let write_txn = self.db.begin_write()?;
@@ -362,6 +398,11 @@ impl Storage {
 
     /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2）。
     /// 空スライスの場合はトランザクションを開かず即座に成功を返す。
+    ///
+    /// [`Storage::put`] と同様、バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路
+    /// （恒久契約。`docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が
+    /// 必要な場合は [`Storage::begin_batch_write`] が返す [`crate::txn::BatchWriteTxn`] を
+    /// 使うこと。
     pub fn put_batch(&self, rows: &[(u64, RowInput<'_>)]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -501,7 +542,9 @@ impl Storage {
     }
 
     /// [`BATCH_LOG_TABLE`] の全エントリを `batch_seq` 昇順で読み出す（対象ビヘイビア:
-    /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
+    /// TABLE-10）。再起動後の検証専用の読み取り（採番再開には
+    /// [`Storage::batch_log_max_seq`] を使う。全件走査を要する検証オラクル
+    /// （`crash_tool_cross_table.rs` の `verify_inner` 等）向け）。
     ///
     /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
     /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で fail-closed
@@ -523,6 +566,28 @@ impl Storage {
             out.push((k.value(), v.value()));
         }
         Ok(out)
+    }
+
+    /// [`BATCH_LOG_TABLE`] の最大 `batch_seq` を返す（対象ビヘイビア: TABLE-10）。
+    /// 台帳テーブル未作成・空の場合は `Ok(None)`。
+    ///
+    /// [`Storage::scan_batch_log`] と異なり全エントリを `Vec` へ確保せず、redb の
+    /// B-tree 実装が持つ最終キー取得（`ReadableTable::last`）だけを使う（O(log n)・
+    /// アロケーションなし）ため、[`MAX_BATCH_LOG_ROWS`] に依存しない。採番再開経路
+    /// （`crash_tool_cross_table.rs` の `find_resume_state`）が呼ぶ想定で、台帳件数が
+    /// 上限を超えた DB でも再開できるようにするための専用 API（Issue #132）。
+    pub fn batch_log_max_seq(&self) -> Result<Option<u64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(BATCH_LOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // `AccessGuard` は read txn（延いては `table`）を借用したままなので、
+        // `u64` へコピーしてから返す（`table`/`read_txn` のスコープを抜けた後に
+        // 借用が残る E0597 を避ける）。
+        let max_seq = table.last()?.map(|(k, _v)| k.value());
+        Ok(max_seq)
     }
 }
 
@@ -595,7 +660,13 @@ pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
 /// （ヘッダのみ）の両方がこの関数を呼ぶ。ロジックを 1 箇所に集約することで、
 /// 検証条件（`tenant_len` 上限・UTF-8・空文字列拒否等）が両者で食い違わないようにする。
 /// 成功時は `(tenant_id, visibility, visibility バイトの直後のオフセット)` を返す。
-fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
+///
+/// `tenant_id` は `buf` を借用した `&str`（所有化しない）。呼び出し元は `buf` の
+/// 生存期間中のみこの値を参照できる。ヘッダ比較（可視性判定）の経路を行ごとの
+/// ヒープアロケーションなしで処理するための設計（Issue #174。PR #151 の性能
+/// フォローアップ）。行を所有化して保持する必要がある場合（[`decode_row`] が
+/// `Row` を構築する場合）は、呼び出し元が明示的に `.to_string()` する。
+fn decode_row_header(buf: &[u8]) -> Result<(&str, Visibility, usize)> {
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
@@ -637,8 +708,7 @@ fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
         ));
     }
     let tenant_id = std::str::from_utf8(tenant_bytes)
-        .map_err(|_| StorageError::Codec("tenant_id is not valid UTF-8".to_string()))?
-        .to_string();
+        .map_err(|_| StorageError::Codec("tenant_id is not valid UTF-8".to_string()))?;
     offset = tenant_end;
 
     let visibility_byte = *buf.get(offset).ok_or_else(|| {
@@ -666,7 +736,11 @@ fn decode_row_header(buf: &[u8]) -> Result<(String, Visibility, usize)> {
 /// 可視性を判定できない場合は、`decode_row_header` と同じ理由で `Err` を返す
 /// （呼び出し元はこの行を「不可視だからスキップ」とは判断できないため fail-closed。
 /// `arena.rs` 側のドキュメント参照）。
-pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(String, Visibility)> {
+///
+/// `tenant_id` は `buf` を借用した `&str`（[`decode_row_header`] 参照）。ヘッダ比較
+/// のみを行う呼び出し元（`PolicyContext::is_visible` への受け渡し）は借用のまま
+/// 完結するため、この経路は行ごとのヒープアロケーションを伴わない（Issue #174）。
+pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visibility)> {
     let (tenant_id, visibility, _offset_after_header) = decode_row_header(buf)?;
     Ok((tenant_id, visibility))
 }
@@ -751,7 +825,7 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 
     Ok(Row {
         id,
-        tenant_id,
+        tenant_id: tenant_id.to_string(),
         visibility,
         embedding,
         metadata: metadata_bytes.to_vec(),
@@ -931,23 +1005,99 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// テストごとに一意な DB ファイルパスを払い出す（persistence.rs の同名ヘルパーと同じ方針）。
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-storage-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    #[test]
+    fn decode_row_tenant_and_visibility_matches_full_decode_header() {
+        // ヘッダのみ decode（本 PR で借用 &str 化した経路）が、フル decode の
+        // Row.tenant_id / Row.visibility と常に一致することを示す同等性テスト
+        // （Issue #174: 借用化で判定結果が変わっていないことの担保）。
+        let cases: &[(&str, Visibility)] = &[
+            ("tenant-a", Visibility::Public),
+            ("tenant-b", Visibility::Private),
+            ("テナント-あ", Visibility::Public), // マルチバイト UTF-8
+            (
+                "t".repeat(MAX_TENANT_ID_LEN as usize).leak(),
+                Visibility::Private,
+            ), // 上限ちょうど
+        ];
+        for &(tenant_id, visibility) in cases {
+            let buf = sample_row_with_rls(tenant_id, visibility, &[1.0, 2.0], b"meta");
+            let (header_tenant, header_visibility) =
+                decode_row_tenant_and_visibility(&buf).unwrap();
+            let row = decode_row(1, &buf).unwrap();
+            assert_eq!(header_tenant, row.tenant_id);
+            assert_eq!(header_visibility, row.visibility);
+        }
     }
 
-    struct CleanupGuard(std::path::PathBuf);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+    #[test]
+    fn decode_row_tenant_and_visibility_borrows_from_input_buffer() {
+        // 返却 &str が buf そのものを指すこと（コピーでなく借用であること）を
+        // ポインタ範囲と長さで確認する（Issue #174: ヘッダ比較経路の非アロケーション化の
+        // 決定的な証明。#[global_allocator] によるカウントは並列テスト下で非決定的になり
+        // やすく依存追加も避けたいため採用しない）。
+        let buf = sample_row_with_rls("tenant-a", Visibility::Public, &[1.0], b"m");
+        let (tenant_id, _visibility) = decode_row_tenant_and_visibility(&buf).unwrap();
+        let buf_range = buf.as_ptr_range();
+        assert!(buf_range.contains(&tenant_id.as_ptr()));
+        assert_eq!(tenant_id.len(), "tenant-a".len());
+    }
+
+    #[test]
+    fn decode_row_tenant_and_visibility_fails_closed_on_same_header_corruptions_as_decode_row() {
+        // ヘッダ破損時、ヘッダのみ decode とフル decode の両方が Err を返すこと
+        // （fail-closed の契約が借用化後も維持されていることの確認。Issue #174）。
+        let corrupt_cases: Vec<Vec<u8>> = vec![
+            Vec::new(), // 空バッファ
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                buf[0] = 0xFF; // 未知版数
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let oversized = MAX_TENANT_ID_LEN + 1;
+                buf[1..3].copy_from_slice(&oversized.to_le_bytes()); // tenant_len 上限超過
+                buf
+            },
+            {
+                // ヘッダ領域自体（visibility バイトの直前）で切り詰める。末尾（dim/metadata）
+                // のみの切り詰めはヘッダのみ decode の成否に影響しないため、ヘッダ decode も
+                // 失敗させるにはヘッダ領域内で切り詰める必要がある。
+                let buf = sample_row(&[1.0], b"m");
+                let visibility_offset = 1 + 2 + "tenant-a".len();
+                buf[..visibility_offset].to_vec()
+            },
+            {
+                let mut buf = Vec::new();
+                buf.push(ROW_FORMAT_VERSION);
+                buf.extend_from_slice(&0u16.to_le_bytes()); // tenant_len = 0（空 tenant_id）
+                buf.push(Visibility::Public.to_byte());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf.extend_from_slice(&0u32.to_le_bytes());
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let tenant_start = 1 + 2;
+                buf[tenant_start] = 0xFF; // 非 UTF-8
+                buf
+            },
+            {
+                let mut buf = sample_row(&[1.0], b"m");
+                let visibility_offset = 1 + 2 + "tenant-a".len();
+                buf[visibility_offset] = 0xFF; // 未知 visibility バイト
+                buf
+            },
+        ];
+        for buf in corrupt_cases {
+            let header_result = decode_row_tenant_and_visibility(&buf);
+            let full_result = decode_row(1, &buf);
+            assert!(header_result.is_err(), "header decode should fail-closed");
+            assert!(full_result.is_err(), "full decode should fail-closed");
         }
     }
 
@@ -1135,6 +1285,79 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    // 対象ビヘイビア: TABLE-10。台帳テーブル未作成（DB 作成直後で一度も log_batch
+    // していない）状態では `None` を返す（fail-closed だが「未作成 = 0 件」を過不足なく
+    // 表現する契約。scan_batch_log の空 Vec 返却と同じ扱い）。
+    #[test]
+    fn batch_log_max_seq_returns_none_when_table_does_not_exist() {
+        let path = unique_db_path("batch-log-max-seq-no-table");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            None
+        );
+    }
+
+    // 対象ビヘイビア: TABLE-10。挿入順ではなくキー最大値を返すこと（redb の B-tree
+    // 末尾キー取得であり、挿入順に依存する実装への退行を検知する）。
+    #[test]
+    fn batch_log_max_seq_returns_max_key_not_insertion_order() {
+        let path = unique_db_path("batch-log-max-seq-max-key");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // `Storage` の private フィールド（`db`）は同一モジュール内なので直接触れる。
+        // 公開 API は log_batch 経由（BatchWriteTxn）のみだが、ここでは
+        // batch_log_max_seq 単体の「キー最大値」契約だけを最小構成で検証したいため、
+        // 台帳テーブルへ非連続キーを直接書き込む。
+        {
+            let write_txn = storage.db.begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(BATCH_LOG_TABLE)
+                    .expect("open batch log table");
+                table.insert(3u64, 10u64).expect("insert seq 3");
+                table.insert(0u64, 10u64).expect("insert seq 0");
+                table.insert(7u64, 10u64).expect("insert seq 7");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            Some(7)
+        );
+    }
+
+    // 対象ビヘイビア: TABLE-10。境界値 `u64::MAX` を含む場合もそのまま返すこと
+    // （呼び出し元の `checked_add` による fail-closed 拒否は呼び出し元の責務であり、
+    // 本 API 自身は値の解釈をしない）。
+    #[test]
+    fn batch_log_max_seq_returns_u64_max_boundary() {
+        let path = unique_db_path("batch-log-max-seq-u64-max");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        {
+            let write_txn = storage.db.begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(BATCH_LOG_TABLE)
+                    .expect("open batch log table");
+                table.insert(1u64, 10u64).expect("insert seq 1");
+                table.insert(u64::MAX, 10u64).expect("insert seq u64::MAX");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            Some(u64::MAX)
+        );
     }
 
     /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:

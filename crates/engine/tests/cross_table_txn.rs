@@ -16,27 +16,11 @@
 
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す
-/// （`crates/engine/tests/txn_isolation.rs` の同名ヘルパーと同じ方針）。
-fn unique_db_path(label: &str) -> std::path::PathBuf {
-    use std::sync::atomic::Ordering;
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-cross-table-txn-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(std::path::PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     RowInput {
@@ -297,6 +281,97 @@ fn table10_mixing_plain_write_txn_with_batch_write_txn_is_a_documented_out_of_co
     assert_eq!(batch_log, vec![(0, 1)]);
 }
 
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`Storage::put`（バッチ台帳を経由
+// しない別経路）と `BatchWriteTxn` を同一 DB・同一 `ROWS_TABLE` に対して混在させると、
+// `WriteTxn` との混在（既存テスト参照）と同様に「台帳の row_count 合計 == 行総数」という
+// 不変条件が成立しなくなることを固定する。
+#[test]
+fn table10_mixing_storage_put_with_batch_write_txn_is_a_documented_out_of_contract_limitation() {
+    let path = unique_db_path("mixing-storage-put-and-batch-write-txn-is-out-of-contract");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // 台帳を経由しない Storage::put で行 0 を書き込む。
+    storage
+        .put(0, &row(&[1.0], &[1]))
+        .expect("storage put row 0");
+
+    // BatchWriteTxn で行 1 だけを台帳へ記録する。BatchWriteTxn 単体としては不変条件を
+    // すべて満たしており、この commit 自体は正しく成功する。
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(1, &row(&[2.0], &[2])).expect("put row 1");
+    batch_txn.log_batch(0).expect("log_batch for row 1");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 1)]);
+}
+
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`Storage::put_batch` と
+// `BatchWriteTxn` の混在でも同様に不変条件が成立しなくなることを固定する。
+#[test]
+fn table10_mixing_storage_put_batch_with_batch_write_txn_is_a_documented_out_of_contract_limitation(
+) {
+    let path = unique_db_path("mixing-storage-put-batch-and-batch-write-txn-is-out-of-contract");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    // 台帳を経由しない Storage::put_batch で行 0・1 を書き込む。
+    storage
+        .put_batch(&[(0, row(&[1.0], &[1])), (1, row(&[2.0], &[2]))])
+        .expect("storage put_batch rows 0,1");
+
+    // BatchWriteTxn で行 2 だけを台帳へ記録する。
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(2, &row(&[3.0], &[3])).expect("put row 2");
+    batch_txn.log_batch(0).expect("log_batch for row 2");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 3);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(batch_log, vec![(0, 1)]);
+}
+
+// 対象ビヘイビア: TABLE-10。契約の適用範囲外を記録するピン留めであり、正しさの主張ではない
+// （Issue #133・`docs/design/batch-ledger-scope.md` 参照）。`BatchWriteTxn` で書き込んだ後に
+// 台帳非経由の `Storage::put` を upsert・新規挿入いずれで呼んでも、台帳の値は一切更新
+// されないことを固定する（`Storage::put` からは台帳の存在自体が見えないため）。
+#[test]
+fn table10_storage_put_after_batch_write_txn_leaves_ledger_unchanged() {
+    let path = unique_db_path("storage-put-after-batch-write-txn-leaves-ledger-unchanged");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+    batch_txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+    batch_txn.log_batch(0).expect("log_batch for row 0");
+    batch_txn.commit().expect("commit via BatchWriteTxn");
+
+    // 既存 ID への upsert。
+    storage
+        .put(0, &row(&[9.0], &[9]))
+        .expect("storage put upsert row 0");
+    // 新規 ID への挿入。
+    storage
+        .put(1, &row(&[2.0], &[2]))
+        .expect("storage put row 1");
+
+    let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(storage.get(0).expect("get row 0").embedding, [9.0]);
+    let batch_log = storage.scan_batch_log().expect("scan_batch_log");
+    assert_eq!(
+        batch_log,
+        vec![(0, 1)],
+        "storage put (upsert or new) must not update the batch ledger"
+    );
+}
+
 // 対象ビヘイビア: TABLE-10。直近の log_batch（または WriteTxn 生成）以降 1 件も put
 // していない状態で log_batch を呼ぶと EmptyBatch で拒否され、ゼロ件エントリを台帳へ
 // 残さないこと（PR #129 codex レビュー PRRT_kwDOUAKASM6bbnm7 対応）。
@@ -388,5 +463,91 @@ fn table10_log_batch_does_not_double_count_overwritten_id_within_same_batch() {
         batch_log,
         vec![(0, 2)],
         "overwrite of an existing id must not inflate the logged row count"
+    );
+}
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。`Storage::batch_log_max_seq` は複数バッチ
+// コミット後、`scan_batch_log` の全件走査から求めた最大値と一致すること
+// （公開 API 経由での整合性確認。単体での「キー最大値」契約は storage.rs の
+// `mod tests` が直接検証する）。
+#[test]
+fn table10_batch_log_max_seq_matches_scan_batch_log_max_after_multiple_batches() {
+    let path = unique_db_path("batch-log-max-seq-multiple-batches");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        None,
+        "empty ledger must report None before any batch is committed"
+    );
+
+    for batch_seq in 0..3u64 {
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(batch_seq, &row(&[1.0], &[1]))
+            .expect("put row for batch");
+        txn.log_batch(batch_seq).expect("log_batch");
+        txn.commit().expect("commit");
+    }
+
+    let expected_max = storage
+        .scan_batch_log()
+        .expect("scan_batch_log")
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max();
+    assert_eq!(expected_max, Some(2));
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        expected_max
+    );
+}
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。DB を close してから再オープンしても
+// 最大通番が一致すること（採番再開経路は再起動後に呼ばれるため、永続化された値が
+// 正しく読めることを確認する）。
+#[test]
+fn table10_batch_log_max_seq_survives_reopen() {
+    let path = unique_db_path("batch-log-max-seq-reopen");
+    let _cleanup = CleanupGuard(path.clone());
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+        txn.log_batch(5).expect("log_batch seq=5");
+        txn.commit().expect("commit");
+    }
+
+    let reopened = Storage::open(&path).expect("reopen storage");
+    assert_eq!(
+        reopened
+            .batch_log_max_seq()
+            .expect("batch_log_max_seq after reopen"),
+        Some(5)
+    );
+}
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。commit 前に drop したバッチは台帳へ反映
+// されず、最大通番も `None` のままであること（原子性オラクルとの整合。
+// `table10_drop_without_commit_discards_both_tables` と同種の観点を
+// `batch_log_max_seq` 側でも確認する）。
+#[test]
+fn table10_batch_log_max_seq_ignores_dropped_uncommitted_batch() {
+    let path = unique_db_path("batch-log-max-seq-drop-uncommitted");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+        txn.log_batch(9).expect("log_batch seq=9");
+        // commit せずスコープを抜けて drop する。
+    }
+
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        None,
+        "an uncommitted (dropped) batch must not be visible to batch_log_max_seq"
     );
 }
