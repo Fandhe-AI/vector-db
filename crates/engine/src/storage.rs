@@ -123,6 +123,8 @@ pub(crate) const MAX_SCAN_PAGE_BYTES: usize = 16 * 1024 * 1024;
 /// 確保（DoS）」対応）。バッチ台帳の 1 エントリは固定 16 バイト（`u64` キー + `u64` 値）の
 /// ため、この上限だけで確保量が頭打ちになる（[`MAX_SCAN_TOTAL_BYTES`] 相当のバイト上限は
 /// 不要）。超過時は [`StorageError::ScanLimitExceeded`] で fail-closed に拒否する。
+/// 最大 `batch_seq` だけが必要な採番再開経路はこの上限に依存しない
+/// [`Storage::batch_log_max_seq`] を使う。
 const MAX_BATCH_LOG_ROWS: usize = 1_000_000;
 
 /// 永続化層の公開エラー型。`redb` の複数のエラー型（`DatabaseError` 等）はすべて
@@ -501,7 +503,9 @@ impl Storage {
     }
 
     /// [`BATCH_LOG_TABLE`] の全エントリを `batch_seq` 昇順で読み出す（対象ビヘイビア:
-    /// TABLE-10）。再起動後の検証・採番再開専用の読み取り。
+    /// TABLE-10）。再起動後の検証専用の読み取り（採番再開には
+    /// [`Storage::batch_log_max_seq`] を使う。全件走査を要する検証オラクル
+    /// （`crash_tool_cross_table.rs` の `verify_inner` 等）向け）。
     ///
     /// エントリ数が [`MAX_BATCH_LOG_ROWS`] を超える場合は、[`Storage::scan`] と同様に
     /// 部分的な結果を黙って切り詰めず [`StorageError::ScanLimitExceeded`] で fail-closed
@@ -523,6 +527,28 @@ impl Storage {
             out.push((k.value(), v.value()));
         }
         Ok(out)
+    }
+
+    /// [`BATCH_LOG_TABLE`] の最大 `batch_seq` を返す（対象ビヘイビア: TABLE-10）。
+    /// 台帳テーブル未作成・空の場合は `Ok(None)`。
+    ///
+    /// [`Storage::scan_batch_log`] と異なり全エントリを `Vec` へ確保せず、redb の
+    /// B-tree 実装が持つ最終キー取得（`ReadableTable::last`）だけを使う（O(log n)・
+    /// アロケーションなし）ため、[`MAX_BATCH_LOG_ROWS`] に依存しない。採番再開経路
+    /// （`crash_tool_cross_table.rs` の `find_resume_state`）が呼ぶ想定で、台帳件数が
+    /// 上限を超えた DB でも再開できるようにするための専用 API（Issue #132）。
+    pub fn batch_log_max_seq(&self) -> Result<Option<u64>> {
+        let read_txn = self.db.begin_read()?;
+        let table = match read_txn.open_table(BATCH_LOG_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // `AccessGuard` は read txn（延いては `table`）を借用したままなので、
+        // `u64` へコピーしてから返す（`table`/`read_txn` のスコープを抜けた後に
+        // 借用が残る E0597 を避ける）。
+        let max_seq = table.last()?.map(|(k, _v)| k.value());
+        Ok(max_seq)
     }
 }
 
@@ -1135,6 +1161,79 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    // 対象ビヘイビア: TABLE-10。台帳テーブル未作成（DB 作成直後で一度も log_batch
+    // していない）状態では `None` を返す（fail-closed だが「未作成 = 0 件」を過不足なく
+    // 表現する契約。scan_batch_log の空 Vec 返却と同じ扱い）。
+    #[test]
+    fn batch_log_max_seq_returns_none_when_table_does_not_exist() {
+        let path = unique_db_path("batch-log-max-seq-no-table");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            None
+        );
+    }
+
+    // 対象ビヘイビア: TABLE-10。挿入順ではなくキー最大値を返すこと（redb の B-tree
+    // 末尾キー取得であり、挿入順に依存する実装への退行を検知する）。
+    #[test]
+    fn batch_log_max_seq_returns_max_key_not_insertion_order() {
+        let path = unique_db_path("batch-log-max-seq-max-key");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // `Storage` の private フィールド（`db`）は同一モジュール内なので直接触れる。
+        // 公開 API は log_batch 経由（BatchWriteTxn）のみだが、ここでは
+        // batch_log_max_seq 単体の「キー最大値」契約だけを最小構成で検証したいため、
+        // 台帳テーブルへ非連続キーを直接書き込む。
+        {
+            let write_txn = storage.db.begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(BATCH_LOG_TABLE)
+                    .expect("open batch log table");
+                table.insert(3u64, 10u64).expect("insert seq 3");
+                table.insert(0u64, 10u64).expect("insert seq 0");
+                table.insert(7u64, 10u64).expect("insert seq 7");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            Some(7)
+        );
+    }
+
+    // 対象ビヘイビア: TABLE-10。境界値 `u64::MAX` を含む場合もそのまま返すこと
+    // （呼び出し元の `checked_add` による fail-closed 拒否は呼び出し元の責務であり、
+    // 本 API 自身は値の解釈をしない）。
+    #[test]
+    fn batch_log_max_seq_returns_u64_max_boundary() {
+        let path = unique_db_path("batch-log-max-seq-u64-max");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        {
+            let write_txn = storage.db.begin_write().expect("begin_write");
+            {
+                let mut table = write_txn
+                    .open_table(BATCH_LOG_TABLE)
+                    .expect("open batch log table");
+                table.insert(1u64, 10u64).expect("insert seq 1");
+                table.insert(u64::MAX, 10u64).expect("insert seq u64::MAX");
+            }
+            write_txn.commit().expect("commit");
+        }
+
+        assert_eq!(
+            storage.batch_log_max_seq().expect("batch_log_max_seq"),
+            Some(u64::MAX)
+        );
     }
 
     /// 電源断シミュレーションによるクラッシュ耐性の再検証（TASK-145、ポインタ:

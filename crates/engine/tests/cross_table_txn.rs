@@ -390,3 +390,89 @@ fn table10_log_batch_does_not_double_count_overwritten_id_within_same_batch() {
         "overwrite of an existing id must not inflate the logged row count"
     );
 }
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。`Storage::batch_log_max_seq` は複数バッチ
+// コミット後、`scan_batch_log` の全件走査から求めた最大値と一致すること
+// （公開 API 経由での整合性確認。単体での「キー最大値」契約は storage.rs の
+// `mod tests` が直接検証する）。
+#[test]
+fn table10_batch_log_max_seq_matches_scan_batch_log_max_after_multiple_batches() {
+    let path = unique_db_path("batch-log-max-seq-multiple-batches");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        None,
+        "empty ledger must report None before any batch is committed"
+    );
+
+    for batch_seq in 0..3u64 {
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(batch_seq, &row(&[1.0], &[1]))
+            .expect("put row for batch");
+        txn.log_batch(batch_seq).expect("log_batch");
+        txn.commit().expect("commit");
+    }
+
+    let expected_max = storage
+        .scan_batch_log()
+        .expect("scan_batch_log")
+        .iter()
+        .map(|(seq, _)| *seq)
+        .max();
+    assert_eq!(expected_max, Some(2));
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        expected_max
+    );
+}
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。DB を close してから再オープンしても
+// 最大通番が一致すること（採番再開経路は再起動後に呼ばれるため、永続化された値が
+// 正しく読めることを確認する）。
+#[test]
+fn table10_batch_log_max_seq_survives_reopen() {
+    let path = unique_db_path("batch-log-max-seq-reopen");
+    let _cleanup = CleanupGuard(path.clone());
+
+    {
+        let storage = Storage::open(&path).expect("open storage");
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+        txn.log_batch(5).expect("log_batch seq=5");
+        txn.commit().expect("commit");
+    }
+
+    let reopened = Storage::open(&path).expect("reopen storage");
+    assert_eq!(
+        reopened
+            .batch_log_max_seq()
+            .expect("batch_log_max_seq after reopen"),
+        Some(5)
+    );
+}
+
+// 対象ビヘイビア: TABLE-10（Issue #132）。commit 前に drop したバッチは台帳へ反映
+// されず、最大通番も `None` のままであること（原子性オラクルとの整合。
+// `table10_drop_without_commit_discards_both_tables` と同種の観点を
+// `batch_log_max_seq` 側でも確認する）。
+#[test]
+fn table10_batch_log_max_seq_ignores_dropped_uncommitted_batch() {
+    let path = unique_db_path("batch-log-max-seq-drop-uncommitted");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    {
+        let mut txn = storage.begin_batch_write().expect("begin_batch_write");
+        txn.put(0, &row(&[1.0], &[1])).expect("put row 0");
+        txn.log_batch(9).expect("log_batch seq=9");
+        // commit せずスコープを抜けて drop する。
+    }
+
+    assert_eq!(
+        storage.batch_log_max_seq().expect("batch_log_max_seq"),
+        None,
+        "an uncommitted (dropped) batch must not be visible to batch_log_max_seq"
+    );
+}
