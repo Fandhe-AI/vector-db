@@ -34,6 +34,16 @@
 //! （両型とも他テナントのデータ量が対象テナントの検索可用性へ干渉しない契約で揃えている。
 //! 詳細は [`SearchTimeFilter`] のドキュメント参照）。
 //!
+//! 本モジュールはさらに [`RlsSafetyNet`]（TASK-136・対象ビヘイビア: RLS-5。
+//! `docs/spec/04-behavior/sql-surface.md` SQL-7）を提供する。`sql::exec` の DISTANCE
+//! 段（および SCALAR 事後フィルタ）を通過した最終 `hits` を、束縛済み
+//! `PolicyContext::is_visible` で再判定する第 2 層の防御であり、`sql::plan` に
+//! あった同名の安全網（TASK-76）をこのモジュールへ再配置したもの。判定を独自実装
+//! せず [`PolicyContext::is_visible`] へ委譲する点は本モジュールの他 API と同じ
+//! 方針を踏襲する。安全網通過済みの `hits` は [`RlsVerifiedHits`]（witness 型）
+//! としてのみ持ち出せるため、投影段（`sql::exec`）は安全網を経由しない生の
+//! `Vec<(u64, f64)>` から投影へ到達する経路を型として作れない。
+//!
 //! 本モジュールはさらに [`ImplicitRlsHook`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7。
 //! ポインタ: `docs/spec/05-tasks.md` TASK-137・`docs/spec/04-behavior/rls.md`）を提供する。
 //! 認証済みセッションからサーバー側で導出された `PolicyContext`（導出自体は
@@ -41,7 +51,11 @@
 //! `core.rs::EngineCore::search`/`get_row`・`sql/exec.rs::execute_statement`
 //! の候補集合構築への単一注入点である。判定ロジック自体は新設せず
 //! [`crate::policy::PolicyContext::is_visible`] へ委譲するだけに留める
-//! （テナント比較の分岐を増やさない・security.md P0）。
+//! （テナント比較の分岐を増やさない・security.md P0）。RLS 安全網（[`RlsSafetyNet`]）
+//! とは独立した契約で、[`ImplicitRlsHook`] は候補構築時の暗黙事前フィルタへの
+//! 注入点、[`RlsSafetyNet`] はその後段（DISTANCE/SCALAR 通過後）の再判定という
+//! 異なる段で連携する（両者とも `PolicyContext::is_visible` へ委譲するのみで、
+//! 独自のテナント比較を新設しない点は共通）。
 
 use std::collections::HashMap;
 
@@ -751,8 +765,92 @@ impl<'s> SearchTimeFilter<'s> {
     }
 }
 
+/// RLS 実行時安全網（TASK-136・RLS-5）。`sql::exec` の DISTANCE 段（および SCALAR
+/// 事後フィルタ）を通過した最終 `hits`（`(id, score)` の順序付き列）を、束縛済み
+/// [`PolicyContext`] で再判定する第 2 層の防御。判定は必ず
+/// [`PolicyContext::is_visible`] へ委譲し、本モジュール独自のテナント比較を新設
+/// しない（[`PrefilterIndex`]・[`SearchTimeFilter`] と同方針。security.md P0）。
+///
+/// `HINT ORDER` の内容・`rls_predicate_present` の有無に関係なく `sql::exec` から
+/// 無条件に呼ばれる契約（呼び出し元がこの適用を分岐させる余地を API に持たせない）。
+#[must_use]
+pub struct RlsSafetyNet<'c> {
+    ctx: &'c PolicyContext,
+}
+
+impl<'c> RlsSafetyNet<'c> {
+    /// 束縛済み `PolicyContext` を保持する安全網を構築する。
+    pub fn new(ctx: &'c PolicyContext) -> Self {
+        RlsSafetyNet { ctx }
+    }
+
+    /// `hits` の相対順序を保ちつつ、`is_visible` が `false` の行、および
+    /// `label_of` がラベルを引けない行（データ不整合。fail-closed に除去）を除く。
+    /// `label_of` は候補構築時と同一スナップショット（`arena`）由来の借用
+    /// `&str` を返す想定で、ヒット単位の `String` 確保を発生させない。
+    pub fn apply<'a, F>(&self, hits: Vec<(u64, f64)>, label_of: F) -> RlsVerifiedHits
+    where
+        F: Fn(u64) -> Option<(&'a str, Visibility)>,
+    {
+        let original_len = hits.len();
+        let filtered: Vec<(u64, f64)> = hits
+            .into_iter()
+            .filter(|(id, _)| match label_of(*id) {
+                Some((tenant, visibility)) => self.ctx.is_visible(tenant, visibility),
+                None => false,
+            })
+            .collect();
+        let dropped = original_len.saturating_sub(filtered.len());
+        RlsVerifiedHits {
+            hits: filtered,
+            dropped,
+        }
+    }
+}
+
+/// [`RlsSafetyNet::apply`] を通過した hits だけが持てる witness 型。構築経路は
+/// [`RlsSafetyNet::apply`] のみに限定する（`Default`・`From<Vec<_>>` は実装しない）。
+/// `sql::exec` の投影段はこの型からしか hits を取り出せないため、安全網を経由
+/// しない生の `Vec<(u64, f64)>` から投影へ到達する経路を型として作れない。
+#[must_use]
+pub struct RlsVerifiedHits {
+    hits: Vec<(u64, f64)>,
+    dropped: usize,
+}
+
+impl RlsVerifiedHits {
+    /// 検証済み hits を借用で返す。
+    pub fn hits(&self) -> &[(u64, f64)] {
+        &self.hits
+    }
+
+    /// 検証済み hits を所有権ごと取り出す。
+    pub fn into_hits(self) -> Vec<(u64, f64)> {
+        self.hits
+    }
+
+    /// 検証済み hits の件数。
+    pub fn len(&self) -> usize {
+        self.hits.len()
+    }
+
+    /// 検証済み hits が空か。
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+
+    /// 安全網が除去した件数。0 でなければ事前フィルタの迂回を示す観測値だが、
+    /// エラー・応答へは載せない（他テナントの存在情報を漏らさない。
+    /// security.md P0）。テスト・将来の内部メトリクス用。
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::kernel::CpuScalarProvider;
@@ -2094,6 +2192,130 @@ mod tests {
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
         assert_eq!(filter.dim(), 3);
         assert_eq!(filter.table_name(), "docs");
+    }
+
+    // --- RlsSafetyNet（TASK-136・RLS-5。`sql::plan::apply_rls_safety_net` から移設） -----
+
+    #[test]
+    fn safety_net_removes_invisible_ids_and_keeps_order() {
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let hits = vec![(1, 0.1), (2, 0.2), (3, 0.3)];
+        // id=2 は tenant-b の Private（呼び出し側の ctx では不可視。Public は
+        // テナントを問わず可視のため、除去対象には Private を使う）。
+        let label_of = |id: u64| -> Option<(&str, Visibility)> {
+            match id {
+                1 => Some(("tenant-a", Visibility::Public)),
+                2 => Some(("tenant-b", Visibility::Private)),
+                3 => Some(("tenant-a", Visibility::Private)),
+                _ => None,
+            }
+        };
+        let verified = net.apply(hits, label_of);
+        assert_eq!(verified.hits(), &[(1, 0.1), (3, 0.3)]);
+        assert_eq!(verified.dropped(), 1);
+        assert_eq!(verified.len(), 2);
+        assert!(!verified.is_empty());
+    }
+
+    #[test]
+    fn safety_net_fail_closed_drops_ids_with_missing_label() {
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+            .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let hits = vec![(1, 0.1), (99, 0.9)];
+        let label_of = |id: u64| -> Option<(&str, Visibility)> {
+            if id == 1 {
+                Some(("tenant-a", Visibility::Public))
+            } else {
+                None
+            }
+        };
+        let verified = net.apply(hits, label_of);
+        assert_eq!(verified.into_hits(), vec![(1, 0.1)]);
+    }
+
+    #[test]
+    fn safety_net_on_empty_hits_returns_empty() {
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+            .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let verified = net.apply(Vec::new(), |_| None);
+        assert!(verified.is_empty());
+        assert_eq!(verified.dropped(), 0);
+    }
+
+    #[test]
+    fn safety_net_dropped_is_zero_when_all_visible() {
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let hits = vec![(1, 0.1), (2, 0.2)];
+        let label_of = |id: u64| -> Option<(&str, Visibility)> {
+            match id {
+                1 => Some(("tenant-a", Visibility::Public)),
+                2 => Some(("tenant-a", Visibility::Private)),
+                _ => None,
+            }
+        };
+        let verified = net.apply(hits, label_of);
+        assert_eq!(verified.dropped(), 0);
+        assert_eq!(verified.len(), 2);
+    }
+
+    #[test]
+    fn safety_net_still_removes_other_tenant_private_even_when_ctx_allows_private() {
+        // ctx が Private を許可していても、`is_visible` への委譲がテナント一致を
+        // 要求するため他テナントの Private 行は除去される（`policy.rs` の判定へ
+        // 委譲していることの回帰。本モジュール独自の緩い比較を持たない）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let hits = vec![(1, 0.1), (2, 0.2)];
+        let label_of = |id: u64| -> Option<(&str, Visibility)> {
+            match id {
+                1 => Some(("tenant-a", Visibility::Private)),
+                2 => Some(("tenant-b", Visibility::Private)),
+                _ => None,
+            }
+        };
+        let verified = net.apply(hits, label_of);
+        assert_eq!(verified.hits(), &[(1, 0.1)]);
+        assert_eq!(verified.dropped(), 1);
+    }
+
+    #[test]
+    fn safety_net_matches_is_visible_across_all_tenant_and_visibility_combinations() {
+        // 判定が `PolicyContext::is_visible` と全組（テナント × 可視性）で一致する
+        // ことの機械照合（安全網が独自ロジックへ乖離していないことの回帰）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let net = RlsSafetyNet::new(&ctx);
+        let tenants = ["tenant-a", "tenant-b"];
+        let visibilities = [Visibility::Public, Visibility::Private];
+        let mut hits = Vec::new();
+        let mut labels: HashMap<u64, (&str, Visibility)> = HashMap::new();
+        let mut expected_visible: HashSet<u64> = HashSet::new();
+        let mut next_id = 1u64;
+        for tenant in tenants {
+            for visibility in visibilities {
+                let id = next_id;
+                next_id += 1;
+                hits.push((id, id as f64));
+                labels.insert(id, (tenant, visibility));
+                if ctx.is_visible(tenant, visibility) {
+                    expected_visible.insert(id);
+                }
+            }
+        }
+        let verified = net.apply(hits, |id| labels.get(&id).copied());
+        let got_visible: HashSet<u64> = verified.hits().iter().map(|(id, _)| *id).collect();
+        assert_eq!(got_visible, expected_visible);
     }
 
     // 対象ビヘイビア: RLS-1〜4（TASK-169）。`PrefilterSnapshot::search_with` は

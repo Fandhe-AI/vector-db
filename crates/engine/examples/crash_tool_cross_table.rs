@@ -27,7 +27,7 @@
 
 use std::io::Write as _;
 
-use engine::storage::{RowInput, Storage, Visibility};
+use engine::storage::{RowInput, Storage, StorageError, Visibility};
 
 /// write/verify で固定して使うテナント識別子（単一テナントのクラッシュ耐性検証が
 /// 目的で、RLS ポリシー評価そのものは対象外。TASK-142・PERSIST-1 のクラッシュ耐性
@@ -281,9 +281,25 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     }
 
     // バッチ台帳側: batch_seq の 0 起点連続性・row_count 合計。
-    let mut batch_log = storage
-        .scan_batch_log()
-        .map_err(|e| format!("scan_batch_log failed: {e}"))?;
+    //
+    // `StorageError::ScanLimitExceeded` の `Display` はそのまま使わない（Issue #131・
+    // PR #193 codex レビュー再指摘対応）: 固定文言 `"scan limit exceeded: use scan_page"`
+    // は `Storage::scan` 専用の代替 API 案内であり、台帳（`scan_batch_log`。ページング API
+    // を持たない）には当てはまらない。加えて台帳エントリ数を削減する compact/rotate 相当の
+    // API・運用手順も本リポには存在しない（通常の compaction は論理エントリ数を減らさず、
+    // rotation で台帳を捨てれば検証対象そのものを失うため、いずれも実行可能な代替手段では
+    // ない: PR #193 codex レビュー再指摘対応）。実行不能な手段を示唆せず、「このツールでは
+    // 上限を超えた台帳を検証できない」という事実のみを明示する
+    // （`storage.rs::Storage::scan_batch_log` のドキュメンテーションコメント参照）。
+    let mut batch_log = storage.scan_batch_log().map_err(|e| match e {
+        StorageError::ScanLimitExceeded => {
+            "scan_batch_log failed: batch log exceeds the scan limit of this tool; \
+             cross-table verification cannot be performed on this ledger \
+             (no paginated ledger API is available yet)"
+                .to_string()
+        }
+        other => format!("scan_batch_log failed: {other}"),
+    })?;
     batch_log.sort_by_key(|(seq, _)| *seq);
     let mut expected_seq: u64 = 0;
     let mut total_from_log: u64 = 0;
