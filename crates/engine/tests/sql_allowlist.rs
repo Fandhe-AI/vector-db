@@ -57,7 +57,7 @@ fn accepts_basic_select_against_real_catalog() {
         &storage,
     )
     .expect("basic shape against a real table must be accepted");
-    assert_eq!(stmt.table_name, "documents");
+    assert_eq!(stmt.table_name(), "documents");
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn accepts_using_mode_clause_against_real_catalog() {
         &storage,
     )
     .expect("USING MODE clause against a real table must be accepted");
-    assert_eq!(stmt.search_mode.as_deref(), Some("precision"));
+    assert_eq!(stmt.search_mode(), Some("precision"));
 }
 
 #[test]

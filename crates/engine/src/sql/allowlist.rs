@@ -198,30 +198,69 @@ pub enum Projection {
 /// 本モジュールが保証するのはここまでの構造情報のみで、列名・リテラル値の意味論的な
 /// 妥当性は検証しない（`sql::parser::bind` の責務）。
 ///
-/// `#[non_exhaustive]`: TASK-161（SQL-12）で `search_mode` フィールドを追加した際、
-/// 既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
-/// 変更となった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド
-/// 追加が同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応
-/// にする。本構造体はクレート外から直接構築するものではなく、[`validate_sql`] の
-/// 戻り値としてのみ取得する。
+/// フィールドは `pub(crate)`（クレート内の `sql::parser` 等からは直接参照できるが、
+/// クレート外からは構造体リテラル構築・フィールド直読みのいずれも不可）とし、外部へは
+/// 個別のアクセサーメソッド（[`ValidatedStatement::table_name`] 等）でのみ値を公開する。
+/// TASK-161（SQL-12）で `search_mode` フィールドを追加した際、当時全フィールドが
+/// `pub` だったため既存の構造体リテラル構築コードが必須フィールド不足でコンパイル
+/// 不能になる破壊的変更を作ってしまった（AGENTS.md「公開 API・エラー契約の互換性
+/// （P1）」）。アクセサー経由の設計にすることで、今後フィールドを追加してもクレート
+/// 外の呼び出し元を壊さない。本構造体はクレート外から直接構築するものではなく、
+/// [`validate_sql`] の戻り値としてのみ取得する。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ValidatedStatement {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
-    pub table_name: String,
-    pub projection: Projection,
-    pub order_by: OrderByForm,
+    pub(crate) table_name: String,
+    pub(crate) projection: Projection,
+    pub(crate) order_by: OrderByForm,
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
-    pub where_predicates: Vec<WherePredicate>,
-    pub limit: u32,
+    pub(crate) where_predicates: Vec<WherePredicate>,
+    pub(crate) limit: u32,
     /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
     /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
     /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
     /// を経由する `sql::parser::bind_with_session` が検証する。
-    pub search_mode: Option<String>,
+    pub(crate) search_mode: Option<String>,
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。未指定時は
     /// [`EvaluationOrder::DEFAULT`]（既存 TASK-75 の固定順 RLS→SCALAR→DISTANCE）。
-    pub evaluation_order: EvaluationOrder,
+    pub(crate) evaluation_order: EvaluationOrder,
+}
+
+impl ValidatedStatement {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// SELECT リストの許可形状。
+    pub fn projection(&self) -> &Projection {
+        &self.projection
+    }
+
+    /// ORDER BY 句の許可形状。
+    pub fn order_by(&self) -> &OrderByForm {
+        &self.order_by
+    }
+
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
+
+    /// `LIMIT` 句の値。
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+
+    /// `USING MODE '<literal>'`（TASK-161・SQL-12）の生リテラル値。未指定時は `None`。
+    pub fn search_mode(&self) -> Option<&str> {
+        self.search_mode.as_deref()
+    }
+
+    /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。
+    pub fn evaluation_order(&self) -> EvaluationOrder {
+        self.evaluation_order
+    }
 }
 
 /// [`validate_sql`]（TASK-161 の公開 API）が返す statement 種別。`SELECT` 以外の

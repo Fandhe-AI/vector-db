@@ -59,25 +59,27 @@ pub enum Ranking {
 /// 束縛済みの SQL 文（[`exec::execute_statement`](crate::sql::exec::execute_statement)
 /// が直接実行する入力形）。
 ///
-/// `#[non_exhaustive]`: TASK-161（SQL-12）で `mode` フィールドを追加した際、既存の
-/// 構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的変更と
-/// なった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。今後のフィールド追加が
-/// 同様の破壊を再発させないよう、外部クレートからの構造体リテラル構築を非対応にする。
+/// フィールドは `pub(crate)`（クレート内の `sql::exec` 等からは直接参照できるが、
+/// クレート外からは構造体リテラル構築・フィールド直読みのいずれも不可）とし、外部へは
+/// 個別のアクセサーメソッド（[`BoundStatement::table`] 等）でのみ値を公開する。
+/// TASK-161（SQL-12）で `mode` フィールドを追加した際、当時全フィールドが `pub` だった
+/// ため既存の構造体リテラル構築コードが必須フィールド不足でコンパイル不能になる破壊的
+/// 変更を作ってしまった（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。アクセサー
+/// 経由の設計にすることで、今後フィールドを追加してもクレート外の呼び出し元を壊さない。
 /// 本構造体はクレート外から直接構築するものではなく、[`bind_with_session`] の戻り値
 /// としてのみ取得する。
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub struct BoundStatement {
-    pub table: String,
-    pub projection: Vec<ProjectedColumn>,
-    pub scalar_filters: Vec<ScalarEq>,
+    pub(crate) table: String,
+    pub(crate) projection: Vec<ProjectedColumn>,
+    pub(crate) scalar_filters: Vec<ScalarEq>,
     /// `WHERE` 句に `visible()` 呼び出し形が含まれていたか（SQL-3・RLS-7 参照）。
     /// **実行側の RLS 適用はこの値の有無に依存しない**（`exec.rs` は無条件に
     /// `PolicyContext::is_visible` を適用する）。本フィールドは束縛結果の可観測性
     /// （テスト・診断）のためだけに保持する。
-    pub rls_predicate_present: bool,
-    pub ranking: Ranking,
-    pub limit: usize,
+    pub(crate) rls_predicate_present: bool,
+    pub(crate) ranking: Ranking,
+    pub(crate) limit: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
     /// （[`ValidatedStatement::search_mode`](crate::sql::allowlist::ValidatedStatement)）
     /// とセッション変数（呼び出し元 `core.rs::EngineCore::execute_sql_in_session` が
@@ -85,11 +87,54 @@ pub struct BoundStatement {
     /// が決定する。カーネル選択（`dispatch.rs`）の入力には含めない（`precision` の
     /// 実行契約は TASK-162・SEARCH-9 の管轄。`sql::exec` が本フィールドを見て
     /// 実行可否を判定する）。
-    pub mode: crate::sql::mode::ResolvedMode,
+    pub(crate) mode: crate::sql::mode::ResolvedMode,
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。`allowlist` が
     /// 検証済みの [`EvaluationOrder`] をそのまま素通しする（意味論的な束縛の必要は
     /// ない。実行意味論の解釈は [`crate::sql::plan::ExecutionPlan`] の管轄）。
-    pub evaluation_order: EvaluationOrder,
+    pub(crate) evaluation_order: EvaluationOrder,
+}
+
+impl BoundStatement {
+    /// 束縛対象のテーブル名。
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// 投影対象の列一覧（`Row::id` 疑似列を含みうる）。
+    pub fn projection(&self) -> &[ProjectedColumn] {
+        &self.projection
+    }
+
+    /// SCALAR 段で適用する等価条件一覧。
+    pub fn scalar_filters(&self) -> &[ScalarEq] {
+        &self.scalar_filters
+    }
+
+    /// `WHERE` 句に `visible()` 呼び出し形が含まれていたか（SQL-3・RLS-7 参照）。
+    /// **実行側の RLS 適用はこの値の有無に依存しない**（可観測性のためだけの値）。
+    pub fn rls_predicate_present(&self) -> bool {
+        self.rls_predicate_present
+    }
+
+    /// DISTANCE 段のランキング方式。
+    pub fn ranking(&self) -> &Ranking {
+        &self.ranking
+    }
+
+    /// `LIMIT` 句の値。
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。
+    pub fn mode(&self) -> crate::sql::mode::ResolvedMode {
+        self.mode
+    }
+
+    /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。
+    pub fn evaluation_order(&self) -> EvaluationOrder {
+        self.evaluation_order
+    }
 }
 
 use crate::sql::allowlist::SqlSurfaceError;
