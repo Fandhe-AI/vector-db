@@ -273,6 +273,10 @@ fn run_part_b() {
     let query = make_embedding(2000, ENGINE_ROW_COUNT + 1);
 
     // (a) 2000 次元テーブル単独 DB。
+    // `file_size` はブロックを抜けて `core`（と内部の `Storage`）が drop された後に
+    // 呼ぶ（redb はプロセス生存中ファイルを成長させるため、`Storage` が生きたまま
+    // 読むと確定前のファイル長を拾い得る。close 後に読むことで両条件のファイル
+    // サイズを公平に比較する）。
     let path_solo = unique_db_path("solo-2000");
     let _guard_solo = CleanupGuard(path_solo.clone());
     let stats_solo = {
@@ -280,12 +284,11 @@ fn run_part_b() {
         seed_table(&storage, "emb2000", 2000, ENGINE_ROW_COUNT);
         let core = EngineCore::from_storage(storage, search_engine::default_engine());
         let stats = measure_engine_search(&core, &ctx, &query);
-        print_latency_row(
-            &format!("solo(2000 only) [{} bytes]", file_size(&path_solo)),
-            &stats,
-        );
+        drop(core);
         stats
     };
+    let size_solo = file_size(&path_solo);
+    print_latency_row(&format!("solo(2000 only) [{size_solo} bytes]"), &stats_solo);
 
     // (b) 768 + 2000 次元テーブル共存 DB。
     let path_coexist = unique_db_path("coexist-768-2000");
@@ -296,12 +299,14 @@ fn run_part_b() {
         seed_table(&storage, "emb2000", 2000, ENGINE_ROW_COUNT);
         let core = EngineCore::from_storage(storage, search_engine::default_engine());
         let stats = measure_engine_search(&core, &ctx, &query);
-        print_latency_row(
-            &format!("coexist(768+2000) [{} bytes]", file_size(&path_coexist)),
-            &stats,
-        );
+        drop(core);
         stats
     };
+    let size_coexist = file_size(&path_coexist);
+    print_latency_row(
+        &format!("coexist(768+2000) [{size_coexist} bytes]"),
+        &stats_coexist,
+    );
 
     let delta_pct = |a: Duration, b: Duration| -> f64 {
         if b.as_secs_f64() > 0.0 {
