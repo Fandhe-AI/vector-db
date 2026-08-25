@@ -84,6 +84,24 @@ fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize
     Ok(next)
 }
 
+/// `!scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision 経路で、
+/// `visible_len`（`arena.ids().len()`。`ImplicitRlsHook` で RLS 済みの可視集合件数）
+/// が `core::MAX_SEARCH_K` を超えるかどうかを純粋関数として切り出したもの
+/// （`sql::exec::execute_statement` の DISTANCE 段呼び出し直前で使う）。超える場合、
+/// DISTANCE 段の取得件数 `k_eff` は `MAX_SEARCH_K` へクランプされ、可視集合全体を
+/// 対象にした「WHERE を満たす候補の完全な順位列」を構築できなくなる（`MAX_SEARCH_K`
+/// 件目より後ろに僅差の Top-2 相当が存在しても取得できず、`precision::apply_gate`
+/// が「Top-2 不在＝マージン成立」と誤判定する fail-open 経路になる。codex-review
+/// 指摘・PRRT_kwDOUAKASM6cPLHE）。呼び出し元は `true` の場合、DISTANCE 検索自体を
+/// 実行せず空集合（fail-closed の通常応答）へ倒す。
+fn precision_completeness_unbounded(
+    is_precision: bool,
+    scalar_prefilter: bool,
+    visible_len: usize,
+) -> bool {
+    is_precision && !scalar_prefilter && visible_len > core::MAX_SEARCH_K
+}
+
 /// `on_visible_row`（RLS/SCALAR 段の行フック）専用の、借用 `&str` から `String` への
 /// 選択的複製ヘルパー（Issue #56 レビュー指摘対応・codex P1: `decode_scalar_columns`
 /// の全列無条件確保を廃し、`row_codec::scan_scalar_columns` の borrow 結果から実際に
@@ -593,83 +611,103 @@ pub fn execute_statement(
         bound.limit
     };
 
+    // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision
+    // 経路で `arena.ids().len()` が `core::MAX_SEARCH_K` を超える場合、直上の
+    // `k_eff` は `MAX_SEARCH_K` へクランプされ、DISTANCE 段は可視集合全体ではなく
+    // 先頭 `MAX_SEARCH_K` 件しか取得できない（provider の `k` 契約上限）。この場合
+    // `MAX_SEARCH_K` 件目より後ろに WHERE を満たす僅差の Top-2 相当が存在しても
+    // 取得できず、SCALAR 事後フィルタ後に「Top-2 を取りこぼしただけ」なのか
+    // 「Top-2 が最初から存在しない」のかを再び区別できなくなる（直上のコメントが
+    // 解消しようとした fail-open の再発。codex-review 指摘・PRRT_kwDOUAKASM6cPLHE）。
+    // 「WHERE を満たす候補の完全な順位列を取得できる」という本経路の前提が崩れる
+    // 以上、DISTANCE 検索自体を実行せず空集合へ倒す（`crate::precision` モジュール
+    // ドキュメントが定める「確信度が判定できない＝空集合の通常応答」という既存の
+    // fail-closed パターンに合わせる。完全性を保証できないこと自体は仕様上の
+    // fail-closed 応答であり `SqlSurfaceError` への昇格対象ではない）。
+    let completeness_unbounded =
+        precision_completeness_unbounded(is_precision, plan.scalar_prefilter, arena.ids().len());
+
     // DISTANCE 段。
-    let hits: Vec<(u64, f64)> = match &bound.ranking {
-        Ranking::Distance { query } => {
-            let input = SearchInput {
-                ids: &slot_ids,
-                vectors: arena.vectors(),
-                dim: arena.dim(),
-                query,
-                k: k_eff,
-            };
-            let raw = provider.search(input).map_err(map_kernel_error)?;
-            if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "search provider returned a result violating the top-k contract"
-                        .to_string(),
-                });
-            }
-            raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
-        }
-        Ranking::Hybrid {
-            query, query_text, ..
-        } => {
-            let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
-            let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
-                SqlSurfaceError::Internal {
-                    detail: "invalid hybrid RRF config".to_string(),
-                }
-            })?;
-            let input = SearchInput {
-                ids: &slot_ids,
-                vectors: arena.vectors(),
-                dim: arena.dim(),
-                query,
-                k: k_eff,
-            };
-            let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
-                // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
-                // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
-                // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
-                // `hybrid::hybrid_search` と同じ理由でここでも行う）。
-                let dense_input = SearchInput {
+    let hits: Vec<(u64, f64)> = if completeness_unbounded {
+        Vec::new()
+    } else {
+        match &bound.ranking {
+            Ranking::Distance { query } => {
+                let input = SearchInput {
                     ids: &slot_ids,
                     vectors: arena.vectors(),
                     dim: arena.dim(),
                     query,
-                    k: cfg.pool_depth(),
+                    k: k_eff,
                 };
-                let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
-                // キー存在で判定する。TABLE-12 の重複 id については
-                // `core::provider_result_is_valid` のドキュメント参照）。
-                if dense_hits
-                    .iter()
-                    .any(|h| !visible_id_counts.contains_key(&h.id))
-                {
+                let raw = provider.search(input).map_err(map_kernel_error)?;
+                if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
                     return Err(SqlSurfaceError::Internal {
-                        detail: "search provider returned a hit outside the visible id set"
+                        detail: "search provider returned a result violating the top-k contract"
                             .to_string(),
                     });
                 }
-                let mut fused =
-                    hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                fused.truncate(k_eff);
-                fused
-            } else {
-                let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                    .iter()
-                    .map(|(id, text)| (*id, text.as_str()))
-                    .collect();
-                let sparse_index = SparseIndex::build(&doc_refs)
-                    .map_err(HybridError::Sparse)
-                    .map_err(map_hybrid_error)?;
-                hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
-                    .map_err(map_hybrid_error)?
-            };
-            fused.into_iter().map(|h| (h.id, h.score)).collect()
+                raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
+            }
+            Ranking::Hybrid {
+                query, query_text, ..
+            } => {
+                let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
+                let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
+                    SqlSurfaceError::Internal {
+                        detail: "invalid hybrid RRF config".to_string(),
+                    }
+                })?;
+                let input = SearchInput {
+                    ids: &slot_ids,
+                    vectors: arena.vectors(),
+                    dim: arena.dim(),
+                    query,
+                    k: k_eff,
+                };
+                let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
+                    // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                    // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
+                    // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
+                    // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
+                    // `hybrid::hybrid_search` と同じ理由でここでも行う）。
+                    let dense_input = SearchInput {
+                        ids: &slot_ids,
+                        vectors: arena.vectors(),
+                        dim: arena.dim(),
+                        query,
+                        k: cfg.pool_depth(),
+                    };
+                    let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
+                    // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                    // キー存在で判定する。TABLE-12 の重複 id については
+                    // `core::provider_result_is_valid` のドキュメント参照）。
+                    if dense_hits
+                        .iter()
+                        .any(|h| !visible_id_counts.contains_key(&h.id))
+                    {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "search provider returned a hit outside the visible id set"
+                                .to_string(),
+                        });
+                    }
+                    let mut fused =
+                        hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
+                    fused.truncate(k_eff);
+                    fused
+                } else {
+                    let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                        .iter()
+                        .map(|(id, text)| (*id, text.as_str()))
+                        .collect();
+                    let sparse_index = SparseIndex::build(&doc_refs)
+                        .map_err(HybridError::Sparse)
+                        .map_err(map_hybrid_error)?;
+                    hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
+                        .map_err(map_hybrid_error)?
+                };
+                fused.into_iter().map(|h| (h.id, h.score)).collect()
+            }
         }
     };
 
@@ -1053,6 +1091,56 @@ mod tests {
         assert!(matches!(
             try_accumulate_budget(usize::MAX - 1, 10, 100),
             Err(ArenaError::CapacityExceeded)
+        ));
+    }
+
+    // codex-review 指摘（PRRT_kwDOUAKASM6cPLHE）の回帰テスト: `!scalar_prefilter`
+    // の precision 経路で可視集合が `core::MAX_SEARCH_K` を超えるかどうかの判定
+    // （`k_eff` クランプにより完全な順位列を構築できなくなる境界）。本体
+    // （`execute_statement`）を `MAX_SEARCH_K` 超の巨大データで再現するのは
+    // 非現実的なため、上限判定を担う純粋関数を直接検証する（`try_accumulate_budget`
+    // と同方針）。
+
+    #[test]
+    fn precision_completeness_unbounded_false_when_recall_mode() {
+        // `is_precision == false`（recall）は本経路自体を通らないため常に `false`。
+        assert!(!precision_completeness_unbounded(
+            false,
+            false,
+            core::MAX_SEARCH_K + 1
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_false_when_scalar_prefilter() {
+        // SCALAR 先行経路は `k_eff = bound.limit.max(2)` を使い、可視集合の広さに
+        // 依存しないため常に `false`。
+        assert!(!precision_completeness_unbounded(
+            true,
+            true,
+            core::MAX_SEARCH_K + 1
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_false_at_max_search_k_boundary() {
+        // 可視集合が `MAX_SEARCH_K` ちょうどなら `k_eff` はクランプされず完全な
+        // 順位列を取得できるため `false`。
+        assert!(!precision_completeness_unbounded(
+            true,
+            false,
+            core::MAX_SEARCH_K
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_true_one_over_max_search_k() {
+        // 1 件でも超過すれば `k_eff` がクランプされ完全性を保証できなくなるため
+        // `true`（呼び出し元は空集合へ倒す）。
+        assert!(precision_completeness_unbounded(
+            true,
+            false,
+            core::MAX_SEARCH_K + 1
         ));
     }
 
