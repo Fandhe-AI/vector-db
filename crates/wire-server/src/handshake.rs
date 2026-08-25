@@ -266,16 +266,29 @@ fn negotiate_startup(stream: &mut TcpStream) -> Result<String> {
 /// StartupMessage のパラメータ列（null 終端キー・値ペアの繰り返し、空文字列で終端）
 /// から `user` を取り出す。`user` 以外のパラメータはテナント決定に用いない
 /// （ポインタ: TASK-67・WIRE-2）。
+///
+/// 終端（空キー）を読んだ時点で `params_body` を使い切っていること（終端後の
+/// 残余バイトがないこと）・`user` キーが複数回出現しないことを検証する
+/// （review 指摘: 残余バイトの無視・重複キーの後勝ち上書きは、フレーミングの
+/// 曖昧さやテナント決定への不正な入力混入余地を生むため fail-closed で拒否する）。
 fn parse_startup_params(params_body: &[u8]) -> Result<String> {
     let mut pos = 0usize;
     let mut user: Option<String> = None;
     loop {
         let key = read_c_string(params_body, &mut pos)?;
         if key.is_empty() {
+            if pos != params_body.len() {
+                return Err(HandshakeError::Protocol(
+                    "trailing data after startup params",
+                ));
+            }
             break;
         }
         let value = read_c_string(params_body, &mut pos)?;
         if key == "user" {
+            if user.is_some() {
+                return Err(HandshakeError::Protocol("duplicate user parameter"));
+            }
             user = Some(value.to_string());
         }
         // その他のパラメータは意図的に読み捨てる（ポインタ: WIRE-2）。
@@ -284,6 +297,11 @@ fn parse_startup_params(params_body: &[u8]) -> Result<String> {
 }
 
 /// PasswordMessage（'p'）を読み、末尾 null を除いた生パスワードバイト列を返す。
+///
+/// body は null 終端 C 文字列 1 個であること（末尾以外に NUL を含む不正フレームは
+/// 拒否する。review 指摘: `password\0suffix\0` のような多重 NUL フレームを
+/// Argon2id 照合へそのまま渡すと、フレーミングの曖昧さがパスワード照合の意味論に
+/// 混入するため fail-closed で拒否する）。
 fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let mut type_byte = [0u8; 1];
     stream.read_exact(&mut type_byte)?;
@@ -291,7 +309,6 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
         return Err(HandshakeError::Protocol("expected PasswordMessage"));
     }
     let body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
-    // body は null 終端 C 文字列 1 個（末尾の 0 を除く）。
     let end = body
         .len()
         .checked_sub(1)
@@ -301,14 +318,33 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
             "password message not null-terminated",
         ));
     }
-    Ok(body[..end].to_vec())
+    let password = body
+        .get(..end)
+        .ok_or(HandshakeError::Protocol("truncated password body"))?;
+    if password.contains(&0) {
+        return Err(HandshakeError::Protocol(
+            "password message contains embedded NUL",
+        ));
+    }
+    Ok(password.to_vec())
 }
 
 /// 認証成功後の最小メッセージループ。簡易クエリ（'Q'）には未実装エラー
 /// （SQLSTATE `0A000`）を返してループを継続し、Terminate（'X'）で正常終了する。
 /// それ以外の型（拡張クエリプロトコル等、TASK-71 管轄）は fail-closed で
 /// エラー応答後に接続を切断する。
-fn post_auth_loop(stream: &mut TcpStream) -> Result<()> {
+///
+/// `Q`・`X` いずれも構造検証を行う（review 指摘: 構造を検証せず読み捨てるだけでは
+/// フレーミングの曖昧さが残る）。`Q` は単一の NUL 終端文字列（空 body・終端 NUL
+/// なし・末尾以外の埋め込み NUL はいずれも拒否）、`X` は length=4・body が厳密に
+/// 空であることを要求し、違反は protocol violation として fail-closed で扱う。
+///
+/// `_ctx` は認証成功時に導出された `engine::policy::PolicyContext`（テナント境界・
+/// 可視性判定の唯一の入力経路）をセッション状態として保持し続けるために受け取る
+/// （review 指摘: 破棄すると将来のクエリ実行経路がテナントを再導出する際に
+/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリ実行は TASK-71 の
+/// 管轄で現状は未実装のため、本関数ではまだ参照しない。
+fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) -> Result<()> {
     loop {
         let mut type_byte = [0u8; 1];
         match stream.read_exact(&mut type_byte) {
@@ -319,7 +355,25 @@ fn post_auth_loop(stream: &mut TcpStream) -> Result<()> {
 
         match type_byte[0] {
             b'Q' => {
-                let _body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
+                // 最小 5（length 4 バイト + 終端 NUL 1 バイト）。空 body は拒否する。
+                let body = read_length_prefixed_body(stream, 5, PROVISIONAL_MESSAGE_MAX_LEN)?;
+                let end = body
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(HandshakeError::Protocol("empty query body"))?;
+                if body.get(end) != Some(&0) {
+                    return Err(HandshakeError::Protocol(
+                        "query message not null-terminated",
+                    ));
+                }
+                let text = body
+                    .get(..end)
+                    .ok_or(HandshakeError::Protocol("truncated query body"))?;
+                if text.contains(&0) {
+                    return Err(HandshakeError::Protocol(
+                        "query message contains embedded NUL",
+                    ));
+                }
                 write_error_response(
                     stream,
                     SQLSTATE_FEATURE_NOT_SUPPORTED,
@@ -328,7 +382,8 @@ fn post_auth_loop(stream: &mut TcpStream) -> Result<()> {
                 write_ready_for_query(stream)?;
             }
             b'X' => {
-                let _body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
+                // Terminate は length=4（body 厳密に空）以外を fail-closed で拒否する。
+                let _body = read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
             }
             _ => {
@@ -402,7 +457,7 @@ pub fn handle_connection(
             )?;
             Ok(())
         }
-        Ok(_ctx) => {
+        Ok(ctx) => {
             // `server::accept_loop` が認証前フェーズの Slowloris 対策として設定した
             // I/O タイムアウトを、認証後専用の緩い `post_auth_idle_timeout` へ
             // 切り替える。無期限（`None`）にすると、有効な資格情報を持つクライアント
@@ -423,7 +478,7 @@ pub fn handle_connection(
             write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
             write_ready_for_query(&mut stream)?;
 
-            match post_auth_loop(&mut stream) {
+            match post_auth_loop(&mut stream, &ctx) {
                 Ok(()) => Ok(()),
                 Err(HandshakeError::Io(e)) => Err(e),
                 Err(HandshakeError::Protocol(_)) => {
@@ -485,6 +540,27 @@ mod tests {
         assert!(parse_startup_params(&body).is_err());
     }
 
+    /// review 指摘の再現ケース: 終端（空キー）後に残余バイトがあれば拒否すること。
+    #[test]
+    fn parse_startup_params_rejects_trailing_data_after_terminator() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"user\0alice\0");
+        body.push(0); // 終端
+        body.extend_from_slice(b"trailing garbage");
+        assert!(parse_startup_params(&body).is_err());
+    }
+
+    /// review 指摘の再現ケース: `user` キーが複数回出現する場合は後勝ちで上書きせず
+    /// 拒否すること（テナント決定の唯一の入力経路への曖昧な混入余地を作らない）。
+    #[test]
+    fn parse_startup_params_rejects_duplicate_user() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"user\0alice\0");
+        body.extend_from_slice(b"user\0mallory\0");
+        body.push(0);
+        assert!(parse_startup_params(&body).is_err());
+    }
+
     fn write_ssl_request(stream: &mut TcpStream) {
         let mut msg = Vec::new();
         msg.extend_from_slice(&8i32.to_be_bytes());
@@ -519,6 +595,140 @@ mod tests {
             n, 0,
             "server must close rather than answer a second SSLRequest"
         );
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// 長さプレフィックス付きメッセージ（type byte + length + body）をそのまま
+    /// クライアント側から送るテスト用ヘルパー。
+    fn write_length_prefixed_message(stream: &mut TcpStream, type_byte: u8, body: &[u8]) {
+        let total_len = (4 + body.len()) as i32;
+        let mut msg = Vec::with_capacity(1 + body.len() + 4);
+        msg.push(type_byte);
+        msg.extend_from_slice(&total_len.to_be_bytes());
+        msg.extend_from_slice(body);
+        stream.write_all(&msg).expect("send message");
+    }
+
+    /// review 指摘の再現ケース: 末尾以外に NUL を含む PasswordMessage
+    /// （`password\0suffix\0`）を fail-closed で拒否すること。
+    #[test]
+    fn read_password_message_rejects_embedded_nul() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = read_password_message(&mut stream);
+            assert!(result.is_err(), "embedded NUL must be rejected");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'p', b"password\0suffix\0");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// 正常系の対照確認: 内部 NUL を含まない PasswordMessage は受理されること。
+    #[test]
+    fn read_password_message_accepts_well_formed_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = read_password_message(&mut stream);
+            assert_eq!(result.expect("valid password"), b"correct-horse".to_vec());
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'p', b"correct-horse\0");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    fn dummy_policy_context() -> engine::policy::PolicyContext {
+        engine::policy::PolicyContext::new("tenant-a").expect("valid tenant id")
+    }
+
+    /// review 指摘の再現ケース: 簡易クエリ（'Q'）の body が空（終端 NUL すら
+    /// 無い）場合は fail-closed で拒否すること。
+    #[test]
+    fn post_auth_loop_rejects_empty_query_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            assert!(result.is_err(), "empty query body must be rejected");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'Q', b"");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// review 指摘の再現ケース: 簡易クエリの body に末尾以外の埋め込み NUL が
+    /// あれば fail-closed で拒否すること。
+    #[test]
+    fn post_auth_loop_rejects_query_with_embedded_nul() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            assert!(result.is_err(), "embedded NUL in query must be rejected");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'Q', b"select\0 1\0");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// review 指摘の再現ケース: Terminate（'X'）は length=4（body 厳密に空）以外を
+    /// fail-closed で拒否すること。
+    #[test]
+    fn post_auth_loop_rejects_terminate_with_nonempty_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            assert!(
+                result.is_err(),
+                "Terminate with a non-empty body must be rejected"
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'X', b"unexpected");
+
+        server.join().expect("server thread must not panic");
+    }
+
+    /// 正常系の対照確認: length=4・body 厳密に空の Terminate は正常終了すること。
+    #[test]
+    fn post_auth_loop_accepts_well_formed_terminate() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let ctx = dummy_policy_context();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let result = post_auth_loop(&mut stream, &ctx);
+            assert!(result.is_ok(), "well-formed Terminate must succeed");
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect");
+        write_length_prefixed_message(&mut client, b'X', b"");
 
         server.join().expect("server thread must not panic");
     }
