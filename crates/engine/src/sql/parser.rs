@@ -69,9 +69,18 @@ pub struct BoundStatement {
     pub rls_predicate_present: bool,
     pub ranking: Ranking,
     pub limit: usize,
+    /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
+    /// （[`ValidatedStatement::search_mode`](crate::sql::allowlist::ValidatedStatement)）
+    /// とセッション変数（呼び出し元 `core.rs::EngineCore::execute_sql_in_session` が
+    /// 渡す [`crate::sql::mode::SessionState`]）から [`crate::sql::mode::resolve_mode`]
+    /// が決定する。カーネル選択（`dispatch.rs`）の入力には含めない（`precision` の
+    /// 実行契約は TASK-162・SEARCH-9 の管轄。`sql::exec` が本フィールドを見て
+    /// 実行可否を判定する）。
+    pub mode: crate::sql::mode::ResolvedMode,
 }
 
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::sql::mode::{self, SearchMode};
 
 /// `[f1,f2,...]` 形式のベクトルリテラルを解析する（SQL-1）。
 ///
@@ -231,11 +240,35 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
 
 /// [`ValidatedStatement`] を `schema` と照合して [`BoundStatement`] へ束縛する
 /// （TASK-75 の公開 API）。`schema` は呼び出し元（`core.rs::EngineCore::execute_sql`）が
-/// `Storage::get_table_schema` で取得済みのものを渡す。
+/// `Storage::get_table_schema` で取得済みのものを渡す。セッション変数を持たない
+/// エントリポイント向けの後方互換 API で、[`bind_with_session`]（TASK-161）へ
+/// `session_mode: None` で委譲する。
 pub fn bind(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
 ) -> Result<BoundStatement, SqlSurfaceError> {
+    bind_with_session(stmt, schema, None)
+}
+
+/// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
+/// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
+/// 束縛する（TASK-161 の公開 API）。`stmt.search_mode`（クエリ句 `USING MODE` の生
+/// リテラル）を [`SearchMode::parse_literal`] で検証し、`session_mode` とあわせて
+/// [`mode::resolve_mode`] で優先順位解決する（クエリ句 > セッション変数 > 既定）。
+/// クエリ句のリテラルが `recall`／`precision` 以外の場合は
+/// [`SqlSurfaceError::InvalidInput`]（`22000`。構文上受理された値が不正）で
+/// fail-closed に拒否し、黙って既定モードへ落とさない。
+pub fn bind_with_session(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    session_mode: Option<SearchMode>,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    let query_mode = match &stmt.search_mode {
+        Some(literal) => Some(SearchMode::parse_literal(literal)?),
+        None => None,
+    };
+    let resolved_mode = mode::resolve_mode(query_mode, session_mode);
+
     let projection = match &stmt.projection {
         Projection::All => {
             let mut cols = Vec::with_capacity(schema.columns.len() + 1);
@@ -313,6 +346,7 @@ pub fn bind(
         rls_predicate_present,
         ranking,
         limit,
+        mode: resolved_mode,
     })
 }
 
@@ -617,5 +651,72 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_with_session: 取得モードの優先順位解決（TASK-161・SQL-12） -------------
+
+    fn bind_sql_with_session(
+        sql: &str,
+        session_mode: Option<SearchMode>,
+    ) -> Result<BoundStatement, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = validate_statement(sql, &lookup).expect("must pass allowlist");
+        bind_with_session(&stmt, &docs_schema(), session_mode)
+    }
+
+    const SELECT_NO_MODE: &str =
+        "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5";
+
+    #[test]
+    fn bind_defaults_to_recall_when_no_clause_and_no_session() {
+        let bound = bind_sql_with_session(SELECT_NO_MODE, None).expect("bind should succeed");
+        assert_eq!(bound.mode.mode, SearchMode::Recall);
+        assert_eq!(bound.mode.source, mode::ModeSource::Default);
+    }
+
+    #[test]
+    fn bind_uses_session_variable_when_no_query_clause() {
+        let bound = bind_sql_with_session(SELECT_NO_MODE, Some(SearchMode::Precision))
+            .expect("bind should succeed");
+        assert_eq!(bound.mode.mode, SearchMode::Precision);
+        assert_eq!(bound.mode.source, mode::ModeSource::SessionVariable);
+    }
+
+    #[test]
+    fn bind_query_clause_wins_over_session_variable() {
+        let sql =
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5 USING MODE 'recall'";
+        let bound =
+            bind_sql_with_session(sql, Some(SearchMode::Precision)).expect("bind should succeed");
+        assert_eq!(bound.mode.mode, SearchMode::Recall);
+        assert_eq!(bound.mode.source, mode::ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn bind_query_clause_alone_resolves_without_session() {
+        let sql =
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5 USING MODE 'precision'";
+        let bound = bind_sql_with_session(sql, None).expect("bind should succeed");
+        assert_eq!(bound.mode.mode, SearchMode::Precision);
+        assert_eq!(bound.mode.source, mode::ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn bind_rejects_unknown_query_clause_mode_value() {
+        let sql =
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5 USING MODE 'fuzzy'";
+        let err = bind_sql_with_session(sql, None).unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn plain_bind_resolves_default_mode_without_session_argument() {
+        // 既存 `bind`（後方互換 API）は `bind_with_session(.., None)` へ委譲するため、
+        // 句・セッションいずれも無指定なら既定 `recall` を解決する。
+        let bound = bind_sql(SELECT_NO_MODE).expect("bind should succeed");
+        assert_eq!(bound.mode.mode, SearchMode::Recall);
+        assert_eq!(bound.mode.source, mode::ModeSource::Default);
     }
 }

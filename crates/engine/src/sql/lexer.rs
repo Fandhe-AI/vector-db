@@ -34,6 +34,14 @@ pub enum Keyword {
     Order,
     By,
     Limit,
+    /// TASK-161（SQL-12）: 文末専用句 `USING MODE '<literal>'` の導入語。`MODE` 自体は
+    /// 予約語化せず文脈識別子（`Token::Ident`）のまま扱う（`USING PLAN`／
+    /// `USING OPERATION_ID` 等、後続タスク TASK-77/80 が同じ `USING` の下へ拡張する
+    /// 拡張点を `allowlist.rs::parse_using_clause` に集約するため）。
+    Using,
+    /// TASK-161（SQL-12）: セッション変数 `SET search_mode = '<literal>'` の導入語。
+    /// `search_mode` 自体は予約語化せず文脈識別子として照合する。
+    Set,
 }
 
 fn keyword_from_str(s: &str) -> Option<Keyword> {
@@ -46,6 +54,8 @@ fn keyword_from_str(s: &str) -> Option<Keyword> {
         "ORDER" => Some(Keyword::Order),
         "BY" => Some(Keyword::By),
         "LIMIT" => Some(Keyword::Limit),
+        "USING" => Some(Keyword::Using),
+        "SET" => Some(Keyword::Set),
         _ => None,
     }
 }
@@ -286,6 +296,30 @@ mod tests {
                 Token::Ident("docs".to_string()),
                 Token::Keyword(Keyword::Limit),
                 Token::Number("10".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_using_and_set_keywords_case_insensitively() {
+        // TASK-161（SQL-12）: `USING MODE '...'`／`SET search_mode = '...'` の導入語。
+        let tokens = tokenize("using MODE 'recall'").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Using),
+                Token::Ident("MODE".to_string()),
+                Token::StringLiteral("recall".to_string()),
+            ]
+        );
+        let tokens = tokenize("SET search_mode = 'precision'").expect("tokenize should succeed");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Keyword(Keyword::Set),
+                Token::Ident("search_mode".to_string()),
+                Token::Punct('='),
+                Token::StringLiteral("precision".to_string()),
             ]
         );
     }

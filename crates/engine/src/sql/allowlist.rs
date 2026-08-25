@@ -205,6 +205,26 @@ pub struct ValidatedStatement {
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub where_predicates: Vec<WherePredicate>,
     pub limit: u32,
+    /// `LIMIT` 直後の文末専用句 `USING MODE '<literal>'`（TASK-161・SQL-12）の生
+    /// リテラル値。省略時は `None`。値の意味論的妥当性（`recall`／`precision` の
+    /// 2 値のみ有効）は本モジュールの管轄外で、`sql::mode::SearchMode::parse_literal`
+    /// を経由する `sql::parser::bind_with_session` が検証する。
+    pub search_mode: Option<String>,
+}
+
+/// [`validate_sql`]（TASK-161 の公開 API）が返す statement 種別。`SELECT` 以外の
+/// 文が増えても [`ValidatedStatement`] 自体は SELECT 専用の構造を保つため、
+/// 統一的な enum で包む。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Statement {
+    Select(ValidatedStatement),
+    /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）。カタログ照会を必要と
+    /// しないためテーブル存在確認は行わない。リテラル値の意味論的妥当性検証は
+    /// `core.rs::EngineCore::execute_sql_in_session` が `SearchMode::parse_literal`
+    /// で行う（本モジュールは構造の受理までを担う）。
+    SetSearchMode {
+        value: String,
+    },
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -401,6 +421,28 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `LIMIT n` 直後の省略可能な文末専用句 `USING MODE '<literal>'`（TASK-161・
+    /// SQL-12）。`USING` キーワードが続かなければ句なし（`Ok(None)`）として扱う。
+    /// `USING` の直後は `MODE`（大文字小文字非区別の文脈識別子）のみ許可し、それ以外
+    /// （将来 TASK-77/80 が追加する `PLAN`・`OPERATION_ID` 等）は fail-closed に拒否
+    /// する（未実装の拡張点を黙って受理しない）。句を高々 1 回だけ消費するため、
+    /// 2 回目以降の `USING MODE ...` は本メソッドではなく後続の
+    /// [`Parser::expect_end_of_statement`] が「余剰トークン」として拒否する。
+    fn parse_using_clause(&mut self) -> Result<Option<String>, SqlSurfaceError> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Using))) {
+            return Ok(None);
+        }
+        self.advance();
+        let name = self.expect_ident()?;
+        if !name.eq_ignore_ascii_case("MODE") {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported USING clause: {name}"
+            )));
+        }
+        let value = self.expect_string_literal()?;
+        Ok(Some(value))
+    }
+
     /// 省略可能な単一末尾セミコロンの後に余剰トークンがあれば複数 statement と
     /// みなして拒否する。
     fn expect_end_of_statement(&mut self) -> Result<(), SqlSurfaceError> {
@@ -423,10 +465,12 @@ struct ParsedShape {
     where_predicates: Vec<WherePredicate>,
     order_by: OrderByForm,
     limit: u32,
+    search_mode: Option<String>,
 }
 
-/// 許可した statement 形状を先頭から再帰下降で判定する。
-fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
+/// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
+/// TASK-161 で `LIMIT` 直後の `USING MODE` 句判定を追加した）。
+fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
@@ -451,6 +495,8 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
         .parse()
         .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}")))?;
 
+    let search_mode = p.parse_using_clause()?;
+
     p.expect_end_of_statement()?;
 
     Ok(ParsedShape {
@@ -459,35 +505,85 @@ fn parse_statement(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
         where_predicates,
         order_by,
         limit,
+        search_mode,
     })
 }
 
-/// SQL 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
-/// FROM テーブルがカタログに実在するかを確認する（TASK-74 の公開 API）。
+/// `SET search_mode = '<literal>'`（TASK-161・SQL-12）の許可形状。規範形は
+/// `=` ＋ 文字列リテラルの完全一致のみ（`TO` 形・非引用値・`RESET`/`SHOW` 等の緩和は
+/// SQL-12 に規範がないため、本実装は最も厳格な形に倒す。緩和は spec 側の判断事項）。
+/// 変数名 `search_mode` は大文字小文字を区別せず照合する。
+fn parse_set_search_mode(tokens: &[Token]) -> Result<String, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+
+    p.expect_keyword(Keyword::Set)?;
+    let name = p.expect_ident()?;
+    if !name.eq_ignore_ascii_case("search_mode") {
+        return Err(SqlSurfaceError::unsupported(format!(
+            "unsupported SET variable: {name}"
+        )));
+    }
+    p.expect_punct('=')?;
+    let value = p.expect_string_literal()?;
+    p.expect_end_of_statement()?;
+
+    Ok(value)
+}
+
+/// SQL 文をトークン化し、許可リスト形式で構造検証する（TASK-161 の公開 API。
+/// TASK-74 の `validate_statement` を `SELECT`／`SET search_mode` の 2 statement 種別へ
+/// 拡張したもの）。先頭トークンで statement 種別を判定し、`SELECT` のみ `lookup` を
+/// 通じて FROM テーブルのカタログ存在確認まで行う（`SET` はカタログ照会を要しない）。
 ///
 /// 検証順序（決定的。同一入力には常に同一の [`SqlSurfaceError`] を返す）:
 /// 1. 字句解析（入力長・トークン数上限を含む。失敗は [`SqlSurfaceError::UnsupportedSyntax`]）
 /// 2. 構造の許可リスト判定（失敗は `UnsupportedSyntax`）
-/// 3. FROM 単一テーブルのカタログ存在確認（不存在は [`SqlSurfaceError::UndefinedTable`]）
+/// 3. `SELECT` の場合のみ、FROM 単一テーブルのカタログ存在確認
+///    （不存在は [`SqlSurfaceError::UndefinedTable`]）
+pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, SqlSurfaceError> {
+    let tokens = lexer::tokenize(sql)?;
+    match tokens.first() {
+        Some(Token::Keyword(Keyword::Select)) => {
+            let shape = parse_select_shape(&tokens)?;
+            let exists = lookup.table_exists(&shape.table_name)?;
+            if !exists {
+                return Err(SqlSurfaceError::undefined_table(shape.table_name));
+            }
+            Ok(Statement::Select(ValidatedStatement {
+                table_name: shape.table_name,
+                projection: shape.projection,
+                order_by: shape.order_by,
+                where_predicates: shape.where_predicates,
+                limit: shape.limit,
+                search_mode: shape.search_mode,
+            }))
+        }
+        Some(Token::Keyword(Keyword::Set)) => {
+            let value = parse_set_search_mode(&tokens)?;
+            Ok(Statement::SetSearchMode { value })
+        }
+        other => Err(SqlSurfaceError::unsupported(format!(
+            "expected SELECT or SET, got {other:?}"
+        ))),
+    }
+}
+
+/// `SELECT` 文のみを受理する後方互換 API（TASK-74・TASK-75 が既に依存している
+/// シグネチャを維持する）。[`validate_sql`]（TASK-161）へ委譲し、`SELECT` 以外
+/// （`SET search_mode` 等）は「このエントリポイントでは受理しない statement 形」
+/// として `42601` で拒否する（`SET` のリテラル値自体が妥当でも、それを保持する
+/// セッションを持たないこのエントリポイントでは意味を持たないため。黙った
+/// no-op にはしない）。
 pub fn validate_statement(
     sql: &str,
     lookup: &impl TableLookup,
 ) -> Result<ValidatedStatement, SqlSurfaceError> {
-    let tokens = lexer::tokenize(sql)?;
-    let shape = parse_statement(&tokens)?;
-
-    let exists = lookup.table_exists(&shape.table_name)?;
-    if !exists {
-        return Err(SqlSurfaceError::undefined_table(shape.table_name));
+    match validate_sql(sql, lookup)? {
+        Statement::Select(stmt) => Ok(stmt),
+        Statement::SetSearchMode { .. } => Err(SqlSurfaceError::unsupported(
+            "SET is not a query statement (use a session-aware entry point)",
+        )),
     }
-
-    Ok(ValidatedStatement {
-        table_name: shape.table_name,
-        projection: shape.projection,
-        order_by: shape.order_by,
-        where_predicates: shape.where_predicates,
-        limit: shape.limit,
-    })
 }
 
 #[cfg(test)]
@@ -954,5 +1050,207 @@ mod tests {
             "x".repeat(2_000_000)
         );
         assert!(validate_statement(&huge, &lookup).is_err());
+    }
+
+    // --- TASK-161（SQL-12: `USING MODE`／`SET search_mode`）------------------------
+
+    #[test]
+    fn accepts_using_mode_clause_after_limit() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE 'precision'",
+            &lookup,
+        )
+        .expect("USING MODE clause should be accepted");
+        assert_eq!(stmt.search_mode.as_deref(), Some("precision"));
+    }
+
+    #[test]
+    fn using_mode_clause_is_case_insensitive_on_mode_keyword_only() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 using mode 'recall'",
+            &lookup,
+        )
+        .expect("USING/mode keywords should be case-insensitive");
+        // リテラル値自体は完全一致判定（`sql::mode::SearchMode::parse_literal`）の管轄で、
+        // 本モジュールは構造のみを見る。ここでは構造受理のみ検査する。
+        assert_eq!(stmt.search_mode.as_deref(), Some("recall"));
+    }
+
+    #[test]
+    fn select_without_using_mode_has_no_search_mode() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5",
+            &lookup,
+        )
+        .expect("plain SELECT should still be accepted");
+        assert_eq!(stmt.search_mode, None);
+    }
+
+    #[test]
+    fn rejects_using_mode_with_identifier_instead_of_literal() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE recall",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_using_mode_with_number_literal() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE 123",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_using_mode_dollar_parameter_form() {
+        // SQL-12: `USING MODE $n` は MVP では構文エラーで拒否する（拡張クエリプロトコル
+        // 対応後の将来形式。`$` はレキサー側で既に許可リスト外として拒否される）。
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE $1",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_using_clause_with_unsupported_word() {
+        // `USING` 直後は `MODE` のみ許可する（`PLAN`・`OPERATION_ID` は TASK-77/80 の
+        // 拡張点であり本タスクでは未実装。fail-closed に拒否する）。
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING PLAN 'x'",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_using_mode_clause() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE 'recall' USING MODE 'precision'",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_using_mode_clause_before_limit() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' USING MODE 'recall' LIMIT 5",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_using_mode_on_statement_that_is_not_select() {
+        // 書き込み系文（`INSERT` 等）は本モジュールが `SELECT`／`SET` 以外を一切
+        // 構文として認識しないため、`USING MODE` の有無に関わらず先頭キーワードの
+        // 時点で拒否される（SQL-8 の許可リスト検証への統合。SQL-12 の R6）。
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement(
+            "INSERT INTO documents VALUES (1) USING MODE 'recall'",
+            &lookup
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_set_search_mode_statement() {
+        let lookup = catalog_with(&["documents"]);
+        match validate_sql("SET search_mode = 'precision'", &lookup)
+            .expect("SET search_mode should be accepted")
+        {
+            Statement::SetSearchMode { value } => assert_eq!(value, "precision"),
+            other => panic!("expected SetSearchMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_search_mode_variable_name_is_case_insensitive() {
+        let lookup = catalog_with(&["documents"]);
+        match validate_sql("SET SEARCH_MODE = 'recall'", &lookup)
+            .expect("variable name should be case-insensitive")
+        {
+            Statement::SetSearchMode { value } => assert_eq!(value, "recall"),
+            other => panic!("expected SetSearchMode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_set_of_unsupported_variable() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_sql("SET other_variable = 'x'", &lookup).is_err());
+    }
+
+    #[test]
+    fn rejects_set_search_mode_to_form() {
+        // 規範形は `=`。`TO` 形は SQL-12 に規範がないため受理しない。
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_sql("SET search_mode TO 'recall'", &lookup).is_err());
+    }
+
+    #[test]
+    fn rejects_set_search_mode_unquoted_value() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_sql("SET search_mode = recall", &lookup).is_err());
+    }
+
+    #[test]
+    fn rejects_reset_search_mode() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_sql("RESET search_mode", &lookup).is_err());
+    }
+
+    #[test]
+    fn rejects_show_search_mode() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_sql("SHOW search_mode", &lookup).is_err());
+    }
+
+    #[test]
+    fn rejects_set_with_trailing_using_mode_clause() {
+        let lookup = catalog_with(&["documents"]);
+        assert!(
+            validate_sql("SET search_mode = 'recall' USING MODE 'precision'", &lookup).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_statement_rejects_set_search_mode_as_query() {
+        // `validate_statement`（後方互換 API）はセッションを持たないため `SET` を
+        // 拒否する（R: 黙った no-op にしない）。
+        let lookup = catalog_with(&["documents"]);
+        assert!(validate_statement("SET search_mode = 'recall'", &lookup).is_err());
+    }
+
+    #[test]
+    fn using_mode_and_set_search_mode_are_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql =
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING MODE 'precision'";
+        let first = validate_statement(sql, &lookup).expect("should be accepted");
+        let second = validate_statement(sql, &lookup).expect("should be accepted");
+        assert_eq!(first, second);
+
+        // 失敗系（未知の SET 変数）も同一入力に対し同一 `wire_code` を返すことを確認する。
+        let err_a = validate_sql("SET other_variable = 'x'", &lookup)
+            .expect_err("unsupported variable should be rejected")
+            .wire_code();
+        let err_b = validate_sql("SET other_variable = 'x'", &lookup)
+            .expect_err("unsupported variable should be rejected")
+            .wire_code();
+        assert_eq!(err_a, err_b);
     }
 }
