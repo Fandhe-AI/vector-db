@@ -264,15 +264,17 @@ impl PrefilterCache {
     /// ロック毒化時は挿入せず `Arc` をそのまま返す（キャッシュ非搭載でも検索自体は続行
     /// できるよう fail-closed に「キャッシュを諦める」側へ倒す）。
     ///
-    /// `storage` は (1) の世代不整合エントリの一括破棄で「現在の実世代」
-    /// （[`Storage::current_generation`]）を判定するためだけに使う。以前は
-    /// `snapshot.built_generation()`（= このスナップショット自身の構築時点の世代）を
-    /// 現在世代の代用にしていたが、これは挿入対象のスナップショットが並行書き込みで
-    /// 既に古くなっている場合、真に新しい（現在世代と一致する）既存エントリまで
-    /// 「不一致」として誤って全破棄してしまう不具合があった（Cursor Bugbot 指摘）。
+    /// `storage` は (0) 挿入対象自身の世代整合チェックと (1) の世代不整合エントリの
+    /// 一括破棄で「現在の実世代」（[`Storage::current_generation`]）を判定するために
+    /// 使う。以前は `snapshot.built_generation()`（= このスナップショット自身の構築
+    /// 時点の世代）を現在世代の代用にしていたが、これは挿入対象のスナップショットが
+    /// 並行書き込みで既に古くなっている場合、真に新しい（現在世代と一致する）既存
+    /// エントリまで「不一致」として誤って全破棄してしまう不具合があった
+    /// （Cursor Bugbot 指摘）。
     /// `storage.current_generation()` の読み取りに失敗した場合は世代整合を判定できない
-    /// ため、(1) の一括破棄は行わずスキップする（fail-closed: 「破棄しすぎない」側へ倒す。
-    /// stale なエントリは [`Self::lookup`] が個別に検出して破棄する）。
+    /// ため、(0)(1) いずれも実行せずキャッシュへの反映をスキップする（fail-closed:
+    /// 「判定できないなら書き込まない」側へ倒す。stale なエントリは [`Self::lookup`]
+    /// が個別に検出して破棄する）。
     fn insert(
         &self,
         storage: &Storage,
@@ -290,6 +292,19 @@ impl PrefilterCache {
             return snapshot;
         }
 
+        // (0) 挿入対象自身が現在世代と一致するか確認する（対象外スレッド指摘の修正）。
+        // 世代が読み取れない、または挿入対象が既に古い場合はキャッシュへ反映せず
+        // その場限りの `Arc` を返す。ここでリターンすることで、後続の「同一キー破棄」
+        // ステップに到達させない。すなわち並行書き込みで自身が stale になった挿入が、
+        // 別スレッドが直前に挿入した現在世代の有効エントリを上書き・削除する経路を断つ
+        // （型ドキュメント参照）。
+        let Ok(current_generation) = storage.current_generation() else {
+            return snapshot;
+        };
+        if snapshot.built_generation() != current_generation {
+            return snapshot;
+        }
+
         let Ok(mut guard) = self.state.write() else {
             return snapshot;
         };
@@ -298,6 +313,8 @@ impl PrefilterCache {
         // 常に push するだけだと同一キーが重複登録され、[`Self::lookup`] は先頭一致
         // しか参照しないため後続の重複が [`MAX_PREFILTER_CACHE_ENTRIES`] を無駄に
         // 消費し続ける）。キーは `(table, ctx)` の完全一致（型ドキュメント参照）。
+        // 上記 (0) により、ここに到達する時点で `snapshot` 自身は現在世代と一致
+        // していることが保証されている（stale な挿入で既存の有効エントリを消さない）。
         if let Some(pos) = guard
             .entries
             .iter()
@@ -307,19 +324,18 @@ impl PrefilterCache {
         }
 
         // (1) 現在世代と不整合なエントリを先に全破棄する（型ドキュメント参照）。
-        // 上記の理由により、現在世代は必ず `storage.current_generation()` から読む
-        // （挿入対象スナップショット自身の世代を代用しない）。読み取りに失敗した場合は
-        // この一括破棄をスキップする（fail-closed）。
-        if let Ok(current_generation) = storage.current_generation() {
-            let before = guard.entries.len();
-            guard
-                .entries
-                .retain(|e| e.snapshot.built_generation() == current_generation);
-            let removed_stale = before.saturating_sub(guard.entries.len());
-            if removed_stale > 0 {
-                self.stale_evictions
-                    .fetch_add(removed_stale as u64, Ordering::Relaxed);
-            }
+        // 現在世代は (0) で読み取り済みの `current_generation`（挿入対象自身の世代と
+        // 一致することを確認済み）をそのまま使う（挿入対象スナップショット自身の世代を
+        // 代用しない、という以前の修正意図は変わらない。二重読み取りによるレースを
+        // 避けるため同一ロック内で 1 回だけ読んだ値を使い回す）。
+        let before = guard.entries.len();
+        guard
+            .entries
+            .retain(|e| e.snapshot.built_generation() == current_generation);
+        let removed_stale = before.saturating_sub(guard.entries.len());
+        if removed_stale > 0 {
+            self.stale_evictions
+                .fetch_add(removed_stale as u64, Ordering::Relaxed);
         }
 
         // (2) それでも件数・総量が上限を超えるなら `last_used` 最小から追い出す。
@@ -1170,7 +1186,11 @@ mod tests {
     // 世代不一致として誤って全破棄してしまう（キャッシュが不当に空になる）。
     // `storage.current_generation()` を正として世代整合を判定していれば、後から書き込み
     // 前提で構築された（結果的に古い）スナップショットを挿入しても、既存の新しい
-    // エントリは破棄されず残る。
+    // エントリは破棄されず残る。加えて（後続の Cursor Bugbot 指摘・PR #191）、
+    // 挿入対象自身が現在世代と不一致（= stale）の場合はそもそもキャッシュへ反映しない
+    // （型ドキュメント (0) 参照）。これにより、並行構築中の古いスナップショットの
+    // 挿入が「同一キーの既存エントリを一旦取り除いてから push する」経路を経由して
+    // 別スレッドが直前に挿入した現在世代の有効エントリを上書き・削除する不具合を防ぐ。
     #[test]
     fn search_insert_does_not_evict_a_newer_entry_using_a_stale_snapshots_own_generation() {
         let dir = tempdir();
@@ -1230,12 +1250,15 @@ mod tests {
 
         // 古い（G0 のままの）`stale_snapshot` を挿入しても、既存の G1 エントリ
         // （tenant-b）が誤って破棄されないこと（Cursor Bugbot 指摘の再現条件）。
+        // かつ、挿入対象自身が stale なため tenant-a のエントリとしても追加されない
+        // こと（後続の Cursor Bugbot 指摘の修正: stale な挿入はキャッシュへ一切
+        // 反映しない）。
         core.prefilter_cache
             .insert(&core.storage, "docs", &ctx_a, stale_snapshot);
         let stats = core.prefilter_cache_stats();
         assert_eq!(
-            stats.entries, 2,
-            "古いスナップショットの挿入で新しい既存エントリが失われてはならない"
+            stats.entries, 1,
+            "stale な挿入は既存の新しいエントリを失わせてはならず、自身も追加されない"
         );
     }
 
@@ -1280,6 +1303,76 @@ mod tests {
             core.prefilter_cache_stats().entries,
             1,
             "同一キーへの再挿入は既存エントリを置換し、重複登録してはならない"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-169（PR #191 codex-review 指摘の回帰テスト）。同一
+    // `(table, ctx)` キーに対する並行構築時、旧世代（stale）のスナップショットの
+    // 挿入が、既に挿入済みの新しい世代の有効エントリを「同一キーだから」という理由で
+    // 上書き・削除してはならない。`search_with` 側の世代検証で stale 結果が漏れる
+    // ことはないが、有効なキャッシュを失うと以降の検索が非キャッシュ経路へ縮退する
+    // （型ドキュメント (0) 参照）。
+    #[test]
+    fn search_insert_does_not_overwrite_a_fresher_entry_for_the_same_key_with_a_stale_one() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 世代 G0 でスナップショットを構築しておく（並行スレッドの遅延構築を模す。
+        // まだキャッシュへは挿入しない）。
+        let stale_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g0");
+
+        // 書き込みで世代を G0 → G1 へ進める。
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // 別スレッド（を模した経路）が同一キーで G1 のスナップショットを先に
+        // キャッシュへ挿入済みとする。
+        let fresh_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g1");
+        let fresh_arc = core
+            .prefilter_cache
+            .insert(&core.storage, "docs", &ctx, fresh_snapshot);
+        assert_eq!(core.prefilter_cache_stats().entries, 1);
+
+        // 遅れて到着した G0 の stale スナップショットを同一キーへ挿入しても、
+        // 既にキャッシュされている G1 の有効エントリが上書き・削除されないこと。
+        core.prefilter_cache
+            .insert(&core.storage, "docs", &ctx, stale_snapshot);
+
+        let cached = core
+            .prefilter_cache
+            .lookup(&core.storage, "docs", &ctx)
+            .expect("同一キーの G1 エントリがキャッシュに残っていること");
+        assert!(
+            Arc::ptr_eq(&cached, &fresh_arc),
+            "stale な挿入によって G1 の有効エントリが差し替えられてはならない"
         );
     }
 
