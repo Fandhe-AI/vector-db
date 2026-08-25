@@ -7,6 +7,9 @@
 //! 生の Argon2 計算過程（レーン・スライス・ブロック生成）は非公開に留める。
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`）。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+
 use super::blake2b;
 
 /// 1 ブロック = 1024 バイト = 128 個の 64bit ワード（RFC 9106 §3.2）。
@@ -72,6 +75,103 @@ pub const MAX_HASH_LEN: usize = 64;
 ///
 /// [`generate_salt`]: super::generate_salt
 pub const MAX_SALT_LEN: usize = 64;
+
+/// 同時に実行してよい Argon2id KDF（[`hash_raw`]）呼び出し数の上限。1 回の
+/// `hash_raw` は最大 [`MAX_M_COST_KIB`]（256 MiB）を確保しうるため、上限なしに
+/// 同時実行を許すと、最大同時接続数（`server::MAX_CONCURRENT_CONNECTIONS` = 256）
+/// に比例して理論上 256 接続 × 256 MiB ≈ 64 GiB の同時確保が起こりうる
+/// （review 指摘）。最悪ケースの累積メモリ = `MAX_CONCURRENT_ARGON2_KDF` ×
+/// `MAX_M_COST_KIB`（8 × 256 MiB = 2 GiB）に抑える。上限超過時は
+/// [`Argon2KdfSemaphore::acquire`] がブロッキング待機する（公平性は問わない
+/// 簡素な実装でよい。認証は 1 接続あたり 1 回のみで再試行させない契約
+/// （WIRE-3）のため、待機自体が新たな DoS 経路にはならない）。
+pub const MAX_CONCURRENT_ARGON2_KDF: usize = 8;
+
+/// [`MAX_CONCURRENT_ARGON2_KDF`] を上限とするブロッキング・カウンティング
+/// セマフォ。`hash_raw` が計算資源を確保する直前に 1 枠を取得し、関数を抜ける
+/// （成功・エラーいずれも）と `Argon2KdfPermit` の `Drop` で確実に解放する
+/// （RAII。解放漏れによる恒久的なデッドロックを防ぐ）。
+struct Argon2KdfSemaphore {
+    /// 残り枠数。`Mutex` の中身そのものをカウンタとして使う（`Condvar` と
+    /// 組み合わせるための一般的な構成）。
+    available: Mutex<usize>,
+    condvar: Condvar,
+}
+
+impl Argon2KdfSemaphore {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: Mutex::new(permits),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// 枠が空くまでブロックしたうえで 1 枠を取得する。`Mutex` の poison
+    /// （他スレッドが lock 保持中に panic した場合）は、このセマフォ自体の
+    /// カウンタ整合性には影響しないため `into_inner()` で回収し、デッドロックの
+    /// 温床にしない（fail-closed の趣旨はここでは「待機し続ける」方向であり、
+    /// poison を理由に無制限実行へフォールバックしない）。
+    fn acquire(&self) -> Argon2KdfPermit<'_> {
+        let mut guard = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *guard == 0 {
+            guard = self
+                .condvar
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *guard -= 1;
+        record_kdf_enter();
+        Argon2KdfPermit { sem: self }
+    }
+}
+
+/// [`Argon2KdfSemaphore::acquire`] が返す枠の所有権。`Drop` で枠を返却し、
+/// 待機中のスレッドを 1 つ起床させる。
+struct Argon2KdfPermit<'a> {
+    sem: &'a Argon2KdfSemaphore,
+}
+
+impl Drop for Argon2KdfPermit<'_> {
+    fn drop(&mut self) {
+        let mut guard = self
+            .sem
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard += 1;
+        self.sem.condvar.notify_one();
+        record_kdf_exit();
+    }
+}
+
+fn argon2_kdf_semaphore() -> &'static Argon2KdfSemaphore {
+    static SEM: OnceLock<Argon2KdfSemaphore> = OnceLock::new();
+    SEM.get_or_init(|| Argon2KdfSemaphore::new(MAX_CONCURRENT_ARGON2_KDF))
+}
+
+/// 同時実行数の計装（テストがカウンタで上限遵守を検証できるようにするための
+/// 軽量なオブザーバビリティ。本番経路への影響は原子的な加減算のみで無視できる）。
+static ARGON2_KDF_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+static ARGON2_KDF_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn record_kdf_enter() {
+    let n = ARGON2_KDF_IN_FLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
+    ARGON2_KDF_PEAK.fetch_max(n, Ordering::AcqRel);
+}
+
+fn record_kdf_exit() {
+    ARGON2_KDF_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// テスト専用: プロセス起動以降に観測された Argon2id KDF の最大同時実行数を返す
+/// （`MAX_CONCURRENT_ARGON2_KDF` を超えないことの回帰確認に使う）。
+#[cfg(test)]
+pub(crate) fn peak_concurrent_kdf_for_test() -> usize {
+    ARGON2_KDF_PEAK.load(Ordering::Acquire)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Argon2Error {
@@ -462,6 +562,12 @@ pub fn hash_raw(
     if out_len < 4 {
         return Err(Argon2Error::InvalidParam("out_len must be >= 4"));
     }
+
+    // パラメータ検証（上記）を終えた妥当な呼び出しのみが枠を待つ。ここで
+    // ブロックした場合、後続のメモリ確保・計算はすべて枠を保持したまま行い、
+    // 関数を抜けるときに `_permit` の Drop で解放する（[`MAX_CONCURRENT_ARGON2_KDF`]
+    // 参照）。
+    let _permit = argon2_kdf_semaphore().acquire();
 
     let m_prime = 4 * p * (m / (4 * p));
     let q = m_prime / p;
@@ -942,5 +1048,41 @@ mod tests {
             let encoded = b64_encode(&data);
             assert_eq!(b64_decode(&encoded).expect("valid base64"), data);
         }
+    }
+
+    /// レビュー指摘の再現ケース: `hash_raw` を要求上限（[`MAX_CONCURRENT_ARGON2_KDF`]）
+    /// より多いスレッドから同時に呼んでも、実際に計算資源を確保している同時実行数が
+    /// 上限を超えないこと。[`peak_concurrent_kdf_for_test`] のカウンタ計装で検証する
+    /// （タイミング依存を避けるため、上限を「超えない」ことのみを厳密にアサートし、
+    /// 「上限まで到達すること」は環境依存になるためアサートしない）。
+    #[test]
+    fn hash_raw_never_exceeds_max_concurrent_kdf() {
+        // 計算に数十ミリ秒程度かかる、テストとして許容できる範囲のパラメータ
+        // （本番既定の `RECOMMENDED_PARAMS` より軽量。並行性を観測できれば十分）。
+        let params = Params {
+            m_cost_kib: 4096,
+            t_cost: 2,
+            p_cost: 1,
+        };
+        let thread_count = MAX_CONCURRENT_ARGON2_KDF * 3;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let salt = format!("salt-thread-{i:02}-pad");
+                    let _ = hash_raw(b"password", salt.as_bytes(), &[], &[], &params, 32)
+                        .expect("valid params");
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("kdf thread must not panic");
+        }
+
+        let peak = peak_concurrent_kdf_for_test();
+        assert!(
+            peak <= MAX_CONCURRENT_ARGON2_KDF,
+            "observed peak concurrency {peak} must not exceed {MAX_CONCURRENT_ARGON2_KDF}"
+        );
     }
 }

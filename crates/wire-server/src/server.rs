@@ -7,9 +7,11 @@
 //!
 //! 対応: TASK-67 の review 是正。TLS（TASK-72・WIRE-9）が実装されるまで非ループバック
 //! bind を拒否し（[`bind_loopback`]）、Slowloris 対策として認証前フェーズに限り
-//! 接続数上限・I/O タイムアウトを課す（[`accept_loop`]）。本格的な接続ライフサイクル
-//! 管理（段階的タイムアウト・ヘルスチェック・認証後アイドル管理等）は TASK-69
-//! （WIRE-8）の管轄であり、本モジュールは暫定の防御的デフォルトに留める。
+//! 接続数上限・I/O タイムアウトを課す（[`accept_loop`]）。認証後は緩い
+//! [`POST_AUTH_IDLE_TIMEOUT`] へ切り替え、有効資格情報を持つクライアントが
+//! 何も送らずに接続枠を永久占有するのを防ぐ（暫定防御）。本格的な接続ライフサイクル
+//! 管理（段階的タイムアウト・ヘルスチェック・keepalive 等）は TASK-69（WIRE-8）の
+//! 管轄であり、本モジュールは暫定の防御的デフォルトに留める。
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -26,11 +28,18 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// **認証前**（StartupMessage 受信〜認証応答完了まで）にのみ課す読み取り・書き込みの
 /// I/O 期限（Slowloris 対策: StartupMessage 等を送らない/受け取らない接続がスレッドと
 /// 接続枠を無期限に占有するのを防ぐ）。認証成功後は
-/// [`crate::handshake::handle_connection`] がこのタイムアウトを解除する
-/// （対話的クライアント・コネクションプールの正当なアイドルを切断しないため。
-/// review 指摘）。認証後のセッション生存期間管理（keepalive・アイドルタイムアウト等）
-/// は TASK-69（WIRE-8）の管轄。
+/// [`crate::handshake::handle_connection`] が [`POST_AUTH_IDLE_TIMEOUT`] へ切り替える
+/// （review 指摘）。
 pub const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// **認証後**のセッションに課す緩いアイドル期限。対話的クライアント・コネクション
+/// プールの正当な長アイドル（数分〜十数分）を切断しない値を確保しつつ、有効な
+/// 資格情報を持つクライアントが接続を張ったまま何も送らないことで
+/// `MAX_CONCURRENT_CONNECTIONS` の枠を永久に占有し続けるのを防ぐ（review 指摘）。
+/// 期限超過時は接続を正常にクローズし、接続枠を解放する（`server::accept_loop` の
+/// `ConnectionSlot` の Drop 経由）。あくまで暫定防御であり、本格的なセッション生存
+/// 期間管理（keepalive・利用パターンに応じた期限調整等）は TASK-69（WIRE-8）の管轄。
+pub const POST_AUTH_IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// `bind_addr` を解決し、すべてのアドレスが loopback であることを検証したうえで
 /// 解決済みの [`SocketAddr`] 列を返す。TLS（TASK-72・WIRE-9）が実装されるまで、
@@ -128,9 +137,12 @@ fn apply_io_timeout(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
 /// - `max_connections` を超える接続は [`crate::handshake::handle_connection`] へ
 ///   進ませず、スレッドも生成せずに即座にクローズする（枠を使い切った状態で
 ///   スレッドを積み増さない）
-/// - 受理した接続には読み取り・書き込み双方に `io_timeout` を設定してから
-///   ハンドシェイクへ渡す（StartupMessage 等を送らない/受け取らない接続が
-///   無期限にスレッド・接続枠を占有するのを防ぐ）
+/// - 受理した接続には読み取り・書き込み双方に `io_timeout`（認証前フェーズ用）を
+///   設定してからハンドシェイクへ渡す（StartupMessage 等を送らない/受け取らない
+///   接続が無期限にスレッド・接続枠を占有するのを防ぐ）
+/// - 認証成功後は `post_auth_idle_timeout`（[`POST_AUTH_IDLE_TIMEOUT`] 相当。
+///   `handle_connection` が切り替える）へ緩和し、対話的クライアント・
+///   コネクションプールの正当なアイドルを妨げないようにする
 ///
 /// 各スレッドの panic は `std::thread::spawn` の join ハンドルを無視することで
 /// プロセス全体へは波及させない（他接続の継続稼働を優先する）。
@@ -139,6 +151,7 @@ pub fn accept_loop(
     store: Arc<UserStore>,
     max_connections: usize,
     io_timeout: Duration,
+    post_auth_idle_timeout: Duration,
 ) {
     let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
@@ -170,7 +183,9 @@ pub fn accept_loop(
             // 接続処理中は `slot` を保持し続け、スレッド終了時（正常終了・panic
             // いずれも）に Drop で確実に枠を解放する。
             let _slot = slot;
-            if let Err(e) = crate::handshake::handle_connection(stream, &store) {
+            if let Err(e) =
+                crate::handshake::handle_connection(stream, &store, post_auth_idle_timeout)
+            {
                 eprintln!("wire-server: connection error: {e}");
             }
         });
@@ -261,7 +276,15 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
 
         std::thread::spawn(move || {
-            accept_loop(listener, store, 1, Duration::from_secs(5));
+            // このテストは認証前フェーズのみを検証するため、post-auth タイムアウト
+            // の値そのものは無関係（本番既定値をそのまま使う）。
+            accept_loop(
+                listener,
+                store,
+                1,
+                Duration::from_secs(5),
+                POST_AUTH_IDLE_TIMEOUT,
+            );
         });
 
         // 1 本目: 上限(1)に達する接続。ハンドシェイクを進めず接続だけ保持する。
@@ -307,7 +330,9 @@ mod tests {
         );
 
         std::thread::spawn(move || {
-            accept_loop(listener, store, 1, short_timeout);
+            // このテストは認証前フェーズのみを検証するため、post-auth タイムアウト
+            // の値そのものは無関係（本番既定値をそのまま使う）。
+            accept_loop(listener, store, 1, short_timeout, POST_AUTH_IDLE_TIMEOUT);
         });
 
         // 1 本目: 何も送らず保持する（クライアント側では明示的に close しない。

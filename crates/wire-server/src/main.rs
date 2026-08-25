@@ -98,6 +98,7 @@ fn run_server(args: &[String]) -> ExitCode {
         store,
         server::MAX_CONCURRENT_CONNECTIONS,
         server::CONNECTION_IO_TIMEOUT,
+        server::POST_AUTH_IDLE_TIMEOUT,
     );
     ExitCode::SUCCESS
 }

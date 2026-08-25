@@ -15,6 +15,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use crate::auth::{self, UserStore};
 
@@ -350,7 +351,17 @@ fn post_auth_loop(stream: &mut TcpStream) -> Result<()> {
 /// 接続受け付けスレッドから呼ばれる。戻り値の `Err` はネットワーク I/O 異常
 /// （クライアント切断等）を表し、呼び出し元はログのみでスレッドを終了してよい
 /// （他接続には影響させない）。
-pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
+///
+/// `post_auth_idle_timeout` は認証成功後に read/write タイムアウトとして設定する
+/// 値（`server::POST_AUTH_IDLE_TIMEOUT` 相当。呼び出し元の `server::accept_loop` が
+/// 決める）。認証前フェーズのタイムアウトは呼び出し元がソケットへ設定済みの前提
+/// （`server::CONNECTION_IO_TIMEOUT`）で、本関数はそれを認証成功時にこの値へ
+/// 切り替える。
+pub fn handle_connection(
+    mut stream: TcpStream,
+    store: &UserStore,
+    post_auth_idle_timeout: Duration,
+) -> io::Result<()> {
     let username = match negotiate_startup(&mut stream) {
         Ok(u) => u,
         Err(HandshakeError::Io(e)) => return Err(e),
@@ -394,13 +405,14 @@ pub fn handle_connection(mut stream: TcpStream, store: &UserStore) -> io::Result
         }
         Ok(_ctx) => {
             // `server::accept_loop` が認証前フェーズの Slowloris 対策として設定した
-            // I/O タイムアウトを解除する。認証成功後もタイムアウトを残すと、対話的
-            // クライアント・コネクションプールの正当なアイドル（数十秒〜）が切断
-            // される（review 指摘）。認証前の接続数上限・タイムアウトによる防御は
-            // ここまでで役目を終えており、認証後のセッション生存期間管理
-            // （keepalive・アイドルタイムアウト等）は TASK-69（WIRE-8）の管轄とする。
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
+            // I/O タイムアウトを、認証後専用の緩い `post_auth_idle_timeout` へ
+            // 切り替える。無期限（`None`）にすると、有効な資格情報を持つクライアント
+            // が接続を張ったまま何も送らないことで接続枠を永久占有できてしまう
+            // （review 指摘）。本タイムアウトはあくまで暫定防御であり、本格的な
+            // セッション生存期間管理（keepalive・利用パターンに応じた期限調整等）は
+            // TASK-69（WIRE-8）の管轄とする。
+            stream.set_read_timeout(Some(post_auth_idle_timeout))?;
+            stream.set_write_timeout(Some(post_auth_idle_timeout))?;
 
             write_authentication_ok(&mut stream)?;
             // BackendKeyData の値そのものはキャンセル要求の照合以外に使わないため、

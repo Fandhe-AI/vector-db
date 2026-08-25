@@ -220,6 +220,15 @@ fn dummy_phc() -> &'static str {
 /// 失敗時（未知ユーザー・誤パスワードのいずれも）は固定遅延 [`AUTH_FAILURE_DELAY`]
 /// を課してから `Err` を返す。未知ユーザーでも [`dummy_phc`] を用いて実ユーザーと
 /// 同一コストの Argon2id 計算を必ず実行し、早期 return によるタイミング差を作らない。
+///
+/// `argon2id::MAX_CONCURRENT_ARGON2_KDF` による同時実行数の制限（review 指摘）は
+/// `hash_raw` 内部でブロッキング待機するため、高負荷時は `elapsed`（待機時間を含む）
+/// が `AUTH_FAILURE_DELAY` を上回ることがある。この場合、下記の追加 `sleep` は
+/// スキップされるが「失敗は最低 `AUTH_FAILURE_DELAY` はかかる」という下限保証
+/// 自体は崩れない（`elapsed` が既に下限を超えているだけ）。既知ユーザーの誤
+/// パスワード・未知ユーザーのいずれも同一の `verify_phc` 経路（＝同一のセマフォ）を
+/// 通るため、同時実行数に起因する遅延も両者に等しく作用し、列挙攻撃対策の
+/// タイミング対称性は維持される。
 pub fn verify(
     store: &UserStore,
     username: &str,
@@ -336,6 +345,42 @@ mod tests {
         let result = verify(&store, "bob", b"anything");
         assert!(result.is_err());
         assert!(start.elapsed() >= AUTH_FAILURE_DELAY);
+    }
+
+    /// レビュー指摘（Argon2id KDF の同時実行数上限）の再確認: `hash_raw` 内部の
+    /// セマフォで多数の `verify` 呼び出しが同時に待機しても、各呼び出しの
+    /// `elapsed` が `AUTH_FAILURE_DELAY` を下回ることはないこと（下限保証は
+    /// セマフォの待機時間が加算される方向にしか作用しないため、構造的に破れない
+    /// はずだが、実際の並行実行下で回帰確認する）。
+    #[test]
+    fn verify_min_delay_holds_under_concurrent_kdf_contention() {
+        use std::sync::Arc;
+
+        let store = Arc::new(store_with_user("alice", "tenant-a", b"correct-horse"));
+        // `argon2id::MAX_CONCURRENT_ARGON2_KDF`（8）を上回るスレッド数で
+        // セマフォを実際に競合させる。
+        let thread_count = 16;
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let result = verify(&store, "bob", b"anything");
+                    assert!(result.is_err());
+                    start.elapsed()
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let elapsed = h.join().expect("verify thread must not panic");
+            assert!(
+                elapsed >= AUTH_FAILURE_DELAY,
+                "elapsed {elapsed:?} must not fall below the fixed failure delay even under \
+                 KDF semaphore contention"
+            );
+        }
     }
 
     /// ユーザーストアロード時、重複 username を拒否すること。
