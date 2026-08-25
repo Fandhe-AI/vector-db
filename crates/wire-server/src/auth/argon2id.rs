@@ -33,25 +33,40 @@ pub const RECOMMENDED_PARAMS: Params = Params {
     p_cost: 1,
 };
 
-/// `m_cost_kib` の上限（2 GiB）。ユーザーストアの PHC 行は構文的に正しければ任意の
-/// 巨大値を持ちうる untrusted 入力であり、上限なしに `hash_raw` へ通すと
-/// `m_prime` ブロック数に比例した `Vec` 確保で OOM を招く（1 テナントの認証失敗では
-/// なくプロセス全体のクラッシュに波及するため、ロード時に fail-closed で拒否する）。
-pub const MAX_M_COST_KIB: u32 = 2 * 1024 * 1024;
+/// `m_cost_kib` の上限（256 MiB）。旧上限（2 GiB）は「範囲内の構文的に正しい PHC」
+/// でのログイン試行 1 回が数百 MiB 〜 2 GiB を一括確保しうる値で、確保失敗時は
+/// abort に至りうる／同時ログイン試行が重なるだけでプロセス全体を圧迫しうる
+/// （review 指摘）。[`RECOMMENDED_PARAMS`]（OWASP 推奨・約 19 MiB）の十数倍程度を
+/// 目安に引き下げ、1 回の確保を数百 MiB 級に抑える。
+pub const MAX_M_COST_KIB: u32 = 256 * 1024;
 /// `t_cost`（パス数）の上限。CPU 時間の異常な引き伸ばしを防ぐ。
 pub const MAX_T_COST: u32 = 64;
 /// `p_cost`（レーン数）の上限。レーンごとの作業領域確保・スレッド分の CPU 消費を防ぐ。
 pub const MAX_P_COST: u32 = 64;
+/// `m_cost_kib * t_cost`（総計算量の目安）の上限。`m` 単体の上限だけでは、上限
+/// ぎりぎりの `m` に大きな `t` を掛け合わせて計算時間を極端に引き延ばす PHC を
+/// 防げないため、積にも別途上限を設ける（目安: [`RECOMMENDED_PARAMS`] の総計算量の
+/// 20 倍）。この結果、`MAX_M_COST_KIB`・`MAX_T_COST` は同時には振り切れない
+/// （`m = MAX_M_COST_KIB` 付近では `t` は実質 2 程度までしか許容されず、
+/// `t = MAX_T_COST` 付近では `m` は数 MiB 級までしか許容されない）。意図的な
+/// トレードオフであり、高強度な単一パラメータより「両方を極端にした組み合わせ」を
+/// 優先的に排除する。
+pub const MAX_TOTAL_WORK_KIB: u64 =
+    (RECOMMENDED_PARAMS.m_cost_kib as u64) * (RECOMMENDED_PARAMS.t_cost as u64) * 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Argon2Error {
     /// メモリ量がレーン数に対して小さすぎる（RFC 9106: m は 8*p 以上必須）。
     MemoryTooSmall,
-    /// `m_cost_kib` / `t_cost` / `p_cost` が [`MAX_M_COST_KIB`] 等の運用上限を超える
-    /// （構文的には正しい PHC でも、計算資源の異常確保を防ぐため拒否する）。
+    /// `m_cost_kib` / `t_cost` / `p_cost` / それらの積が [`MAX_M_COST_KIB`] 等の
+    /// 運用上限を超える（構文的には正しい PHC でも、計算資源の異常確保を防ぐため
+    /// 拒否する）。
     ParamOutOfRange(&'static str),
     /// レーン数・パス数・出力長が 0（RFC 9106 の定義域外）。
     InvalidParam(&'static str),
+    /// パラメータは運用上限内だが、実行時のメモリ確保（`try_reserve_exact`）に
+    /// 失敗した（fail-closed。プロセスを abort させず認証エラーへ畳み込む）。
+    AllocationFailed,
     /// PHC 文字列がこの実装が生成する形式（`$argon2id$v=19$m=..,t=..,p=..$salt$hash`）と
     /// 一致しない（fail-closed。詳細な原因は攻撃者へ推測材料を与えないため区別しない）。
     MalformedPhc,
@@ -65,6 +80,9 @@ impl std::fmt::Display for Argon2Error {
                 write!(f, "argon2id: parameter exceeds resource ceiling: {name}")
             }
             Argon2Error::InvalidParam(name) => write!(f, "argon2id: invalid parameter: {name}"),
+            Argon2Error::AllocationFailed => {
+                write!(f, "argon2id: failed to allocate working memory")
+            }
             Argon2Error::MalformedPhc => write!(f, "argon2id: malformed PHC string"),
         }
     }
@@ -73,7 +91,8 @@ impl std::fmt::Display for Argon2Error {
 /// `hash_raw` が実際に計算資源を確保する前に課すパラメータ検証をロード時にも再利用
 /// できるよう切り出したもの（`auth.rs::UserStore::load_from_file` から呼ばれる）。
 /// 構文検証（[`parse_phc`]）とは独立に、値の範囲（下限は RFC 9106 の `m >= 8*p`、
-/// 上限は [`MAX_M_COST_KIB`] 等の運用上限）を検証する。
+/// 上限は [`MAX_M_COST_KIB`] 等の運用上限、および [`MAX_TOTAL_WORK_KIB`] による
+/// `m * t` の積の上限）を検証する。
 pub fn validate_params(params: &Params) -> Result<(), Argon2Error> {
     let p = params.p_cost;
     let m = params.m_cost_kib;
@@ -92,6 +111,10 @@ pub fn validate_params(params: &Params) -> Result<(), Argon2Error> {
     }
     if p > MAX_P_COST {
         return Err(Argon2Error::ParamOutOfRange("p_cost"));
+    }
+    let total_work_kib = (m as u64).saturating_mul(t as u64);
+    if total_work_kib > MAX_TOTAL_WORK_KIB {
+        return Err(Argon2Error::ParamOutOfRange("m_cost_kib * t_cost"));
     }
     Ok(())
 }
@@ -427,7 +450,15 @@ pub fn hash_raw(
 
     let h0 = compute_h0(password, salt, secret, ad, p, out_len as u32, m, t);
 
-    let mut blocks: Vec<Block> = vec![[0u64; BLOCK_QWORDS]; m_prime as usize];
+    // `validate_params` で上限は検証済みだが（[`MAX_M_COST_KIB`]・256 MiB 級）、
+    // 実行時のメモリ確保自体が失敗する可能性は残る。`try_reserve_exact` で
+    // fallible にし、失敗を abort ではなく `AllocationFailed`（認証エラーへ畳み込む
+    // fail-closed 経路）として扱う。
+    let mut blocks: Vec<Block> = Vec::new();
+    blocks
+        .try_reserve_exact(m_prime as usize)
+        .map_err(|_| Argon2Error::AllocationFailed)?;
+    blocks.resize(m_prime as usize, [0u64; BLOCK_QWORDS]);
     for lane in 0..p {
         let mut seed0 = Vec::with_capacity(72);
         seed0.extend_from_slice(&h0);
@@ -720,6 +751,58 @@ mod tests {
             hash_raw(b"pw", b"salt", &[], &[], &params, 32),
             Err(Argon2Error::MemoryTooSmall)
         );
+    }
+
+    /// レビュー指摘: `MAX_M_COST_KIB` を 2 GiB から 256 MiB へ引き下げた回帰確認。
+    /// 旧上限では許容されていた値が新上限で拒否されること。
+    #[test]
+    fn validate_params_rejects_m_cost_above_reduced_ceiling() {
+        let params = Params {
+            m_cost_kib: MAX_M_COST_KIB + 1,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        assert_eq!(
+            validate_params(&params),
+            Err(Argon2Error::ParamOutOfRange("m_cost_kib"))
+        );
+    }
+
+    /// レビュー指摘: `m_cost_kib` 単体は上限内でも、`t_cost` との積が
+    /// `MAX_TOTAL_WORK_KIB` を超える組み合わせを拒否すること。
+    #[test]
+    fn validate_params_rejects_total_work_above_ceiling() {
+        let params = Params {
+            m_cost_kib: MAX_M_COST_KIB,
+            t_cost: MAX_T_COST,
+            p_cost: 1,
+        };
+        assert_eq!(
+            validate_params(&params),
+            Err(Argon2Error::ParamOutOfRange("m_cost_kib * t_cost"))
+        );
+    }
+
+    /// `MAX_TOTAL_WORK_KIB` 導入後も [`RECOMMENDED_PARAMS`]（既定の新規ハッシュ生成
+    /// パラメータ）が拒否されないこと（総計算量の上限が実運用の既定値を壊さないこと
+    /// の回帰確認）。
+    #[test]
+    fn validate_params_accepts_recommended_params() {
+        assert_eq!(validate_params(&RECOMMENDED_PARAMS), Ok(()));
+    }
+
+    /// `m_cost_kib` が上限ちょうどでも、`t_cost` を小さく抑えれば
+    /// `MAX_TOTAL_WORK_KIB` 内に収まり受理されること（上限付近の許容境界を
+    /// 明示し、`MAX_M_COST_KIB` と `MAX_TOTAL_WORK_KIB` の相互作用を
+    /// リーダーが計算し直さずに確認できるようにする）。
+    #[test]
+    fn validate_params_accepts_max_m_cost_with_small_t_cost() {
+        let params = Params {
+            m_cost_kib: MAX_M_COST_KIB,
+            t_cost: 2,
+            p_cost: 1,
+        };
+        assert_eq!(validate_params(&params), Ok(()));
     }
 
     /// レビュー指摘: RFC 9106 KAT（m=32, p=4 → seg_len=2）は `fill_segment` の

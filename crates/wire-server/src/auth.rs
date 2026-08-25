@@ -394,6 +394,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// レビュー指摘: `MAX_M_COST_KIB` を 2 GiB から 256 MiB へ引き下げた回帰確認。
+    /// 新上限をわずかに超えるだけの PHC も起動時に拒否されること
+    /// （旧上限では通過していた範囲）。
+    #[test]
+    fn load_from_file_rejects_m_cost_above_reduced_ceiling() {
+        let dir = std::env::temp_dir().join(format!("wire-server-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_reduced_m_cost_ceiling.txt");
+        let over_ceiling = argon2id::MAX_M_COST_KIB as u64 + 1;
+        std::fs::write(
+            &path,
+            format!("alice:tenant-a:$argon2id$v=19$m={over_ceiling},t=1,p=1$c2FsdA$aGFzaA\n"),
+        )
+        .expect("write fixture");
+        let result = UserStore::load_from_file(&path);
+        assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 構文的には正しいが decode 後の hash フィールドが 4 バイト未満（`hash_raw` が
     /// 要求する `out_len >= 4` の下限を満たさない）の PHC を起動時に拒否すること
     /// （レビュー指摘: この検証がないと load は通過し、`verify()` が常に

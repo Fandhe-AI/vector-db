@@ -10,8 +10,11 @@
 //! ログ・引数に残さない）。
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）。
-//! 非ループバック bind の拒否ガードは TASK-70 の管轄であり、本タスクでは既定値
-//! （`127.0.0.1`）による運用限定でリスクを抑える。
+//! `--bind` は [`wire_server::server::validate_loopback_bind`] により非ループバック
+//! アドレスを起動時に fail-closed で拒否する（TLS 未実装のうちは平文パスワードを
+//! 非ループバックへ公開しない。review 是正）。接続数上限・I/O タイムアウトは
+//! [`wire_server::server::accept_loop`] が課す。本格的な接続管理・bind 方式の
+//! 拡張は TASK-69・TASK-70 の管轄。
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -19,6 +22,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use wire_server::auth::{self, UserStore};
+use wire_server::server;
 
 const DEFAULT_BIND: &str = "127.0.0.1:5432";
 
@@ -68,6 +72,11 @@ fn run_server(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    if let Err(msg) = server::validate_loopback_bind(&bind_addr) {
+        eprintln!("wire-server: {msg}");
+        return ExitCode::FAILURE;
+    }
+
     let store = match UserStore::load_from_file(&users_path) {
         Ok(s) => s,
         Err(e) => {
@@ -86,30 +95,13 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     eprintln!("wire-server: listening on {bind_addr}");
 
-    accept_loop(listener, store);
+    server::accept_loop(
+        listener,
+        store,
+        server::MAX_CONCURRENT_CONNECTIONS,
+        server::CONNECTION_IO_TIMEOUT,
+    );
     ExitCode::SUCCESS
-}
-
-/// 接続受け付けループ本体（`main` から分離し、結合テストが同じ挙動を再利用できる
-/// ようにする）。1 接続 1 スレッドで処理し、各スレッドの panic は
-/// `std::thread::spawn` の join ハンドルを無視することでプロセス全体へは波及させない
-/// （他接続の継続稼働を優先する。接続数制限は TASK-69 の管轄）。
-fn accept_loop(listener: TcpListener, store: Arc<UserStore>) {
-    for conn in listener.incoming() {
-        let stream = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("wire-server: accept error: {e}");
-                continue;
-            }
-        };
-        let store = Arc::clone(&store);
-        std::thread::spawn(move || {
-            if let Err(e) = wire_server::handshake::handle_connection(stream, &store) {
-                eprintln!("wire-server: connection error: {e}");
-            }
-        });
-    }
 }
 
 /// `hash-password` サブコマンド: stdin からパスワードを 1 行読み、新規 salt を
