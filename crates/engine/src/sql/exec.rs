@@ -1,12 +1,27 @@
-//! SQL 表層の実行計画層（TASK-75、対象ビヘイビア: SQL-1, SQL-2, SQL-3, SQL-4。
-//! ポインタ: `docs/spec/05-tasks.md` TASK-75・`docs/spec/04-behavior/sql-surface.md`）。
+//! SQL 表層の実行計画層（TASK-75・TASK-76、対象ビヘイビア: SQL-1, SQL-2, SQL-3, SQL-4,
+//! SQL-7。ポインタ: `docs/spec/05-tasks.md` TASK-75・TASK-76・
+//! `docs/spec/04-behavior/sql-surface.md`・`docs/spec/04-behavior/rls.md` RLS-5）。
 //!
 //! 責務境界: [`parser::bind`](crate::sql::parser::bind) が返す [`BoundStatement`] を、
-//! 固定順序 **RLS → SCALAR → DISTANCE** で実行する（`HINT ORDER` による順序上書きは
-//! TASK-76 の管轄でありここでは提供しない）。RLS 段は `WHERE` 句の `visible()` 呼び出し
-//! （[`BoundStatement::rls_predicate_present`]）の有無に**関係なく**無条件に適用する
-//! （SQL-3・RLS-7: RLS 強制は述語の有無に依存しない。security.md P0「テナント分離の
-//! 検査を外す/緩める/バイパス経路を作らない」）。
+//! 既定順序 **RLS → SCALAR → DISTANCE**、または `HINT ORDER(...)` が指定した順序
+//! （[`crate::sql::plan::EvaluationOrder`]）で実行する。順序が実効を持つのは
+//! SCALAR と DISTANCE の相対位置のみ（[`crate::sql::plan::ExecutionPlan`] 参照）:
+//! SCALAR が先なら候補構築時に等価条件を事前適用し（従来どおり正確に `limit` 件）、
+//! DISTANCE が先なら DISTANCE 段の後で等価条件を事後適用する（`limit` 未満になり
+//! 得る。under-fetch の救済（オーバーサンプル等）は本モジュールの管轄外）。
+//!
+//! RLS は **`HINT ORDER` の内容に関係なく**、唯一の実効的な防御である候補構築時の
+//! 暗黙事前フィルタ（`VectorArena::build_filtered_with_rows_in_txn` の `predicate`。
+//! `WHERE` 句の `visible()` 呼び出し（[`BoundStatement::rls_predicate_present`]）の
+//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。加えて
+//! [`crate::sql::plan::apply_rls_safety_net`] を最終結果へ無条件に適用するが、この
+//! 安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補集合）
+//! 由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とすことは
+//! ない。無効化できない構造にしてあるのは、候補集合の構築元が将来広がった場合の
+//! defense-in-depth としてで、「独立した 2 つの検査が効いている」という意味では
+//! ない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で RLS 段を
+//! 後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
+//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。
 //!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
@@ -24,6 +39,7 @@ use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
+use crate::sql::plan::{self, ExecutionPlan};
 use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
@@ -243,8 +259,16 @@ pub fn execute_statement(
     schema: &TableSchema,
     bound: &BoundStatement,
 ) -> Result<QueryResult, SqlSurfaceError> {
-    // RLS 段（無条件）+ SCALAR 段（同一走査の行フック）。可視行だけがフックへ到達する
-    // （`arena::VectorArena::build_filtered_with_rows` のドキュメント参照）。
+    // HINT ORDER（未指定なら既定の RLS→SCALAR→DISTANCE）から導出する実行方針。
+    // `scalar_prefilter` のみが分岐点（`ExecutionPlan::from_evaluation_order` の
+    // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
+    // フィールドを持たせず、下記で無条件に呼び出す。
+    let plan = ExecutionPlan::from_evaluation_order(bound.evaluation_order);
+
+    // RLS 段（無条件）+ SCALAR 段（同一走査の行フック。`plan.scalar_prefilter` が
+    // `false` の場合はここでは等価条件を判定せず、DISTANCE 段の後で事後適用する）。
+    // 可視行だけがフックへ到達する（`arena::VectorArena::build_filtered_with_rows`
+    // のドキュメント参照）。
     let mut sparse_docs: Vec<(u64, String)> = Vec::new();
     let is_hybrid = matches!(bound.ranking, Ranking::Hybrid { .. });
     let text_column_index = match &bound.ranking {
@@ -280,7 +304,11 @@ pub fn execute_statement(
     // 対象外。この集合に含まれない列は `on_visible_row` で借用のまま素通りし、
     // `String` として複製・保持しない（[`MAX_CANDIDATE_SCALAR_BYTES`] のドキュメント
     // 参照。投影に不要な列まで全候補分複製・保持する P1 指摘への対応）。
-    let needed_column_indices: HashSet<usize> = bound
+    // DISTANCE 先行時（`!plan.scalar_prefilter`）は SCALAR 条件を DISTANCE 段の後で
+    // 事後適用するため、`scalar_filters` が参照する列も候補構築時に保持しておく
+    // 必要がある（TASK-76・SQL-7）。SCALAR 先行時（既定）はここで等価条件を判定し
+    // 終えるため、値の保持自体は不要（従来どおり投影列のみ保持する）。
+    let mut needed_column_indices: HashSet<usize> = bound
         .projection
         .iter()
         .filter_map(|col| match col {
@@ -288,6 +316,9 @@ pub fn execute_statement(
             ProjectedColumn::Id => None,
         })
         .collect();
+    if !plan.scalar_prefilter {
+        needed_column_indices.extend(bound.scalar_filters.iter().map(|f| f.column_index));
+    }
 
     // `candidate_columns` に保持する Text 値の実バイト数に加え、行ごとに必ず確保する
     // `Vec<Value>` 自体の構造体サイズも累計する（[`MAX_CANDIDATE_SCALAR_BYTES`] の
@@ -311,10 +342,15 @@ pub fn execute_statement(
         // 下のループで選択的に複製する。
         let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
-        for filter in &bound.scalar_filters {
-            match scanned.get(filter.column_index) {
-                Some(Some(t)) if *t == filter.value => {}
-                _ => return Ok(false),
+        // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
+        // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
+        // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
+        if plan.scalar_prefilter {
+            for filter in &bound.scalar_filters {
+                match scanned.get(filter.column_index) {
+                    Some(Some(t)) if *t == filter.value => {}
+                    _ => return Ok(false),
+                }
             }
         }
         if is_hybrid {
@@ -474,6 +510,46 @@ pub fn execute_statement(
             fused.into_iter().map(|h| (h.id, h.score)).collect()
         }
     };
+
+    // SCALAR 事後フィルタ（DISTANCE 先行時のみ。TASK-76・SQL-7）。`on_visible_row` は
+    // `plan.scalar_prefilter == false` の間、等価条件を判定せず可視行を通過させて
+    // いるため、ここで `candidate_columns`（`needed_column_indices` により対象列を
+    // 保持済み）と突合する。不一致・値の取得不能（データ不整合。fail-closed）は
+    // 除去する。返却件数が `limit` 未満になり得る（under-fetch。オーバーサンプルに
+    // よる救済は行わない）。
+    let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
+        hits
+    } else {
+        hits.into_iter()
+            .filter(|(id, _)| {
+                match candidate_columns.get(id) {
+                Some(columns) => bound.scalar_filters.iter().all(|f| {
+                    matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value)
+                }),
+                None => false,
+            }
+            })
+            .collect()
+    };
+
+    // RLS 実行時安全網（RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
+    // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
+    // フィールドを持たせておらず（`plan.rs` のドキュメント参照）、呼び出しを
+    // 迂回する経路が型として存在しない。`arena` は候補構築と同一スナップショットの
+    // テナント・可視性ラベルを保持しているため、`storage` の再取得なしに安全網を
+    // 評価できる。現状は事前フィルタと同じ `arena` から再判定するため、この安全網
+    // 単体で不可視行を追加で落とすことはない（defense-in-depth。モジュール
+    // ドキュメント参照）。
+    let hits: Vec<(u64, f64)> = plan::apply_rls_safety_net(
+        hits,
+        |id| {
+            let index = *arena_index_by_id.get(&id)?;
+            let tenant = arena.tenant_id(index)?.to_string();
+            let visibility = arena.visibility(index)?;
+            Some((tenant, visibility))
+        },
+        |tenant, visibility| ctx.is_visible(tenant, visibility),
+    );
 
     // 投影: `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と
     // 同一スナップショットで保持しておいた embedding（`arena`）・デコード済み

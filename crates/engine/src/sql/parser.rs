@@ -18,6 +18,7 @@ use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::{
     FunctionArg, OrderByForm, Projection, ValidatedStatement, WherePredicate,
 };
+use crate::sql::plan::EvaluationOrder;
 
 /// ベクトルリテラルの生バイト長上限（SQL-1）。アロケーション（`Vec<f32>` の確保・
 /// カンマ分割）に入る前にこの長さで拒否する。
@@ -69,6 +70,10 @@ pub struct BoundStatement {
     pub rls_predicate_present: bool,
     pub ranking: Ranking,
     pub limit: usize,
+    /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。`allowlist` が
+    /// 検証済みの [`EvaluationOrder`] をそのまま素通しする（意味論的な束縛の必要は
+    /// ない。実行意味論の解釈は [`crate::sql::plan::ExecutionPlan`] の管轄）。
+    pub evaluation_order: EvaluationOrder,
 }
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -313,6 +318,7 @@ pub fn bind(
         rls_predicate_present,
         ranking,
         limit,
+        evaluation_order: stmt.evaluation_order,
     })
 }
 
@@ -608,6 +614,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind: evaluation_order 素通し（TASK-76・SQL-7） -------------------------
+
+    #[test]
+    fn binds_default_evaluation_order_when_hint_order_absent() {
+        let bound =
+            bind_sql("SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5")
+                .expect("bind should succeed");
+        assert_eq!(bound.evaluation_order, EvaluationOrder::DEFAULT);
+    }
+
+    #[test]
+    fn binds_explicit_evaluation_order_from_hint_order() {
+        let bound = bind_sql(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5 HINT ORDER(DISTANCE, SCALAR, RLS)",
+        )
+        .expect("bind should succeed");
+        assert_eq!(
+            bound.evaluation_order.stages(),
+            [
+                crate::sql::plan::Stage::Distance,
+                crate::sql::plan::Stage::Scalar,
+                crate::sql::plan::Stage::Rls,
+            ]
+        );
     }
 
     #[test]
