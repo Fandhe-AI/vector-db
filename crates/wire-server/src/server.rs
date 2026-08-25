@@ -66,9 +66,13 @@ pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
 /// （WIRE-5, WIRE-6。契約値・実装は [`crate::limits`] に集約）:
 ///
 /// - `limiter` の枠を確保できない接続は [`crate::handshake::handle_connection`] へ
-///   進ませず、スレッドも生成せずに [`limits::reject_too_many_connections`] で
-///   `53300`（too_many_connections）の ErrorResponse を返してから即座にクローズする
-///   （枠を使い切った状態でスレッドを積み増さない）
+///   進ませず、`limiter` の枠も消費しない短命な使い捨てスレッドへ
+///   [`limits::reject_too_many_connections`] を委譲し、`53300`
+///   （too_many_connections）の ErrorResponse を返してから即座にクローズする。
+///   拒否応答の書き込み（最大 `REJECT_WRITE_TIMEOUT` の同期 `write_all`）を
+///   accept ループ本体でブロックさせないことで、受信ウィンドウを閉じた相手を
+///   繰り返し接続させて待受自体を止める経路（資源枯渇防御自体が新たな DoS
+///   経路になる問題）を避ける
 /// - 受理した接続には読み取り・書き込み双方に `read_timeout` を一度だけ設定してから
 ///   ハンドシェイクへ渡す（認証前後を問わず同一値を維持する。WIRE-5）。超過時は
 ///   `handle_connection` が応答を書かずに `Err` を返し、スレッド終了で枠が解放される
@@ -99,7 +103,17 @@ pub fn accept_loop(
                 limiter.active(),
                 limiter.max()
             );
-            limits::reject_too_many_connections(stream, limiter.max());
+            // `reject_too_many_connections` は同期 `write_all`（最大
+            // `REJECT_WRITE_TIMEOUT`）を伴うため、accept ループ本体では呼ばない。
+            // 受信ウィンドウを閉じた相手を繰り返し接続させることで待受自体を
+            // 止められる経路（今回追加した資源枯渇防御が新たな DoS 経路になる問題）
+            // を避けるため、拒否応答の書き込みは短命な使い捨てスレッドへ委譲し、
+            // accept ループは即座に次の `accept` へ戻る。このスレッドは
+            // `limiter` の枠を消費しない（枠管理対象は認証済み接続処理のみ）。
+            let max = limiter.max();
+            std::thread::spawn(move || {
+                limits::reject_too_many_connections(stream, max);
+            });
             continue;
         };
 
