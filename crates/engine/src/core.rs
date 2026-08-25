@@ -675,7 +675,7 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: "unexpected SetSearchMode outcome for a statement                                      already classified as Select"
+                            detail: "unexpected SetSearchMode outcome for a statement already classified as Select"
                                 .to_string(),
                         })
                     }
