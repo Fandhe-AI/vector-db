@@ -685,8 +685,9 @@ impl ResidentMatrix {
 
 /// 集約するか否かの判定（副作用なしの純関数）。`pending_after_pop` はキューから
 /// 1 件取り出した直後に後続が存在するかどうか（呼び出し側のキュー実装に依存
-/// しない最小のインターフェース）。ディスパッチ決定表本体（TASK-155 ポインタ）
-/// はこの判定を呼び出す側であり、本関数自体は経路選択ロジックを持たない。
+/// しない最小のインターフェース）。ディスパッチ決定表本体（`dispatch.rs::select_execution_path`。
+/// TASK-155・CORE-11, 12）はこの判定を呼び出す側であり、本関数自体は経路選択ロジックを
+/// 持たない（二重管理を避けるための契約）。
 pub fn should_aggregate_into_batch(pending_after_pop: bool) -> bool {
     pending_after_pop
 }

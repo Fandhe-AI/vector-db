@@ -9,8 +9,10 @@
 //! 既定コンストラクタが実際にどちらの provider を注入するかは `search_engine.rs`
 //! （TASK-131・CORE-9 の差し替え点確定化レイヤ）経由で `core.rs::EngineCore::open` を参照。
 //!
-//! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12 の方針先取り。
-//! ディスパッチ決定表は TASK-155 の範囲）。
+//! 経路選択の外部上書き機構（環境変数・設定フラグ等）は設けない（CORE-12）。
+//! 実行経路（CPU-SIMD／GPU）自体の決定表は `dispatch.rs::select_execution_path`
+//! （TASK-155・CORE-11, 12）に集約されており、本モジュールはあくまで provider
+//! trait の窓口を提供する。
 
 use std::fmt;
 

@@ -46,12 +46,23 @@
 //! 性能系タスク（TASK-127・TASK-130・TASK-83 等）向けの計測プロトコル基盤は
 //! `benches/harness/`（TASK-158。lib 本体外・`cargo bench`／`tests/bench_harness.rs`
 //! から利用）を参照。
+//!
+//! TASK-155（対象ビヘイビア: CORE-11, CORE-12）: `kernel.rs`（CORE-13）・
+//! `search_engine.rs`（CORE-9）・`batch_search.rs`（CORE-6, CORE-7）・
+//! `batch_fallback.rs`（CORE-8）に分散しうる「入力 → 実行経路」の判断を、
+//! `dispatch.rs::select_execution_path` という副作用なしの決定表 1 箇所へ集約する。
+//! 経路を外部から上書きする機構は設けない（CORE-12。詳細は `dispatch.rs` の
+//! モジュールドキュメント参照）。`core.rs::EngineCore::search`（単発クエリ経路）・
+//! `batch_fallback.rs::FallbackBatchEngine::batch_search`（バッチ経路）が実際に
+//! `select_execution_path` の戻り値を見て実行を分岐する（配線済み。詳細は
+//! `dispatch.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
 pub mod batch_search;
 pub mod catalog;
 pub mod core;
+pub mod dispatch;
 pub mod hybrid;
 pub mod kernel;
 pub mod parallel_search;

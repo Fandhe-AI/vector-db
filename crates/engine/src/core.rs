@@ -34,6 +34,7 @@ use std::path::Path;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::CatalogError;
+use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
 use crate::search_engine;
@@ -130,6 +131,17 @@ pub enum CoreError {
     /// 呼び出し元へ漏れかねないため、区別せず本 variant に統一する（他テナントの
     /// 存在情報も含めない）。
     ProviderResultRejected,
+    /// `dispatch.rs::select_execution_path`（TASK-155・CORE-11）への入力構築が失敗した
+    /// （fail-closed。`dim`・`batch_size` の上限検証はここより前段（本モジュールの
+    /// スキーマ照合）で既に一致条件を満たしているはずのため、通常到達しない防御的分岐）。
+    Dispatch(DispatchError),
+    /// `dispatch.rs::select_execution_path` が `ExecutionPath::Gpu` を返した
+    /// （CORE-11/12）。単発クエリ経路（`core.rs::EngineCore::search`）は GPU
+    /// capability を構造的に持たない（`DispatchInput::for_single_query` は GPU
+    /// capability を引数に取らない）ため、決定表が正しく動作する限り到達しない
+    /// はずの防御的分岐。GPU 実行を提供する `SearchProvider` 実装が後続タスクで
+    /// 追加されるまで fail-closed に拒否する。
+    GpuPathUnavailable,
 }
 
 impl std::fmt::Display for CoreError {
@@ -146,11 +158,24 @@ impl std::fmt::Display for CoreError {
                 f,
                 "search provider returned a hit outside the policy-visible id set"
             ),
+            CoreError::Dispatch(e) => write!(f, "core dispatch error: {e}"),
+            CoreError::GpuPathUnavailable => {
+                write!(
+                    f,
+                    "dispatch selected a gpu execution path with no gpu-capable provider wired"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for CoreError {}
+
+impl From<DispatchError> for CoreError {
+    fn from(e: DispatchError) -> Self {
+        CoreError::Dispatch(e)
+    }
+}
 
 impl From<StorageError> for CoreError {
     fn from(e: StorageError) -> Self {
@@ -293,6 +318,19 @@ impl VectorCore for EngineCore {
         // `KernelError::NonFiniteQuery` を用いる。
         if query.iter().any(|v| !v.is_finite()) {
             return Err(CoreError::Kernel(KernelError::NonFiniteQuery));
+        }
+
+        // 実行経路の決定（TASK-155・対象ビヘイビア: CORE-11, CORE-12）。単発クエリ経路は
+        // 待機キューを持たない（`pending_after_pop` は常に `false`）ため決定表は常に
+        // `ExecutionPath::CpuSimd` を返す。`DispatchInput::for_single_query` は GPU
+        // capability を引数に取らない設計のため `ExecutionPath::Gpu` は構造的に
+        // 到達しないが、決定表が返しうる全 variant を網羅させることで、将来
+        // 単発クエリ経路へ GPU capability を持ち込む変更が発生した際にコンパイル
+        // エラーで検出できるようにする（`dispatch.rs` モジュールドキュメント参照）。
+        let dispatch_input = DispatchInput::for_single_query(expected_dim as usize, false)?;
+        match dispatch::select_execution_path(dispatch_input)? {
+            ExecutionPath::CpuSimd { .. } => {}
+            ExecutionPath::Gpu => return Err(CoreError::GpuPathUnavailable),
         }
 
         // 次元・有限性検証を通過した後にのみアリーナを構築する。ここでの `TableNotFound` は
