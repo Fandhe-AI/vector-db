@@ -539,6 +539,12 @@ fn connection_counter() -> i32 {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
+    /// プロセス内単調カウンタ（`tests/wire_auth.rs` と同一クラスの競合対策。
+    /// Issue #172）。
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parse_startup_params_extracts_user_and_ignores_database() {
@@ -872,15 +878,19 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn handle_connection_compat_wrapper_delegates_without_panic() {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-handshake-test-legacy-{}-{}",
+            "wire-server-handshake-test-legacy-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = UserStore::load_from_file(&path).expect("valid empty store");

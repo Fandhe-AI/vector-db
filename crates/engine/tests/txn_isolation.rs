@@ -14,27 +14,11 @@ use std::time::Duration;
 use engine::storage::{RowInput, Storage, StorageError, Visibility};
 use engine::txn::IsolationLevel;
 
-static UNIQUE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す
-/// （`crates/engine/tests/persistence.rs` の同名ヘルパーと同じ方針）。
-fn unique_db_path(label: &str) -> std::path::PathBuf {
-    use std::sync::atomic::Ordering;
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-txn-isolation-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(std::path::PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     RowInput {

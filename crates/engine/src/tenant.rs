@@ -196,23 +196,9 @@ mod tests {
     use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::storage::{RowInput, Visibility};
 
-    fn unique_db_path(label: &str) -> std::path::PathBuf {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "vector-db-engine-tenant-unit-{label}-{}-{seq}.redb",
-            std::process::id()
-        ));
-        path
-    }
-
-    struct CleanupGuard(std::path::PathBuf);
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
+    // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+    // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
     fn schema(table: &str) -> TableSchema {
         TableSchema::new(

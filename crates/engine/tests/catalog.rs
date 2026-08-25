@@ -1,12 +1,9 @@
 //! `engine::catalog` の統合テスト（TASK-85、対象ビヘイビア: TABLE-1, TABLE-4,
 //! TABLE-5, TABLE-6。ポインタ: `docs/spec/04-behavior/data-model.md`）。
 //!
-//! ヘルパ（`unique_db_path` / `CleanupGuard`）は `tests/persistence.rs` /
-//! `tests/incremental_write_perf.rs` と同じ流儀を小さく複製する
-//! （`tests/common/mod.rs` 化は本 Issue のスコープ外。既存ファイルの流儀を踏襲）。
+//! ヘルパ（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+//! `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use redb::{ReadableDatabase, ReadableTable};
@@ -19,25 +16,9 @@ use engine::storage::{RowInput, Storage, Visibility};
 /// 行データの生バイト列を検証するテスト（TABLE-4/TABLE-5）でのみ使う。
 const ROWS_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rows");
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-catalog-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn embedding_schema(name: &str, dim: u32) -> TableSchema {
     TableSchema::new(
