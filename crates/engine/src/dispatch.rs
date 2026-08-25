@@ -9,26 +9,33 @@
 //! バッチ実行経路）は、実行前にここへ入力を渡して経路を確定してから、
 //! 対応する provider・エンジンを構築・実行する想定である。
 //!
-//! # 実配線調査で判明した具体的な阻害要因（未接続のまま。TASK-155 レビュー起因）
+//! # 実配線（単発クエリ経路・バッチ経路）
 //!
-//! 単発クエリ経路（`core.rs::EngineCore::open`・`search_engine.rs`、CORE-9）への配線を
-//! 試みたが、以下 2 点により安全に接続できないことを確認した:
+//! `kernel.rs` が提供する provider は現状 `CpuScalarProvider`／`ParallelSearchProvider`
+//! （スレッド構成の違いのみで、ISA 別の SIMD 幅を持つ別実装ではない）に限られるため、
+//! [`ExecutionPath::CpuSimd { width }`] の `width` は「決定表が確定させた実行幅の
+//! ラベル」であり、`width` ごとに異なる provider を切り替える先はまだ存在しない
+//! （SIMD 幅別 provider の実装は TASK-156・CORE-14 の管轄）。それでも
+//! `core.rs::EngineCore::search` は毎回 `select_execution_path` を呼び、戻り値が
+//! `CpuSimd` の場合だけ既存 provider を実行し、`Gpu` の場合は
+//! `CoreError::GpuPathUnavailable` を返して fail-closed に拒否する
+//! （単発クエリ経路は [`GpuCapability`] を保持しないため `Gpu` は理論上到達しない
+//! 分岐だが、決定表が返しうる全 variant を網羅させることで、将来 GPU capability を
+//! 単発クエリ経路へ持ち込む変更が発生した際にコンパイルエラーで気付ける）。
 //!
-//! - `kernel.rs` が提供する provider は現状 `CpuScalarProvider`／
-//!   `ParallelSearchProvider`（スレッド構成の違いのみで、ISA 別の SIMD 幅・GPU 実装を
-//!   持たない）に限られ、本モジュールが返す `ExecutionPath::CpuSimd { width }`／
-//!   `ExecutionPath::Gpu` を実際に分岐させる先が存在しない。
-//! - `dim` の検証上限が不一致（[`DispatchInput::dim`] のドキュメント参照）。本モジュールは
-//!   `batch_search::MAX_BATCH_DIM`（8_192）を使うが、単発クエリ経路は独立してより大きい
-//!   `storage::MAX_EMBEDDING_DIM`（65_536）で検証しており、そのまま接続すると
-//!   現在成功している 8_193〜65_536 次元のクエリを誤って拒否する。
+//! `dim` の検証上限の不一致（旧: 本モジュールの `batch_search::MAX_BATCH_DIM` 固定 vs.
+//! 単発クエリ経路の `storage::MAX_EMBEDDING_DIM`）は、[`DispatchInput`] の
+//! コンストラクタ（[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]）を
+//! 呼び出し元の文脈で分け、それぞれ適切な上限を内部に持たせることで解消した
+//! （`DimLimit` 参照。単発クエリ用コンストラクタは常に `storage::MAX_EMBEDDING_DIM`、
+//! バッチ用は `batch_search::MAX_BATCH_DIM` を使う）。
 //!
-//! `batch_fallback.rs::FallbackBatchEngine::batch_search` への配線も試みたが、
-//! こちらも安全に接続できないことを確認した（詳細は `batch_fallback.rs` モジュール
-//! ドキュメントの「実配線調査で判明した阻害要因」参照）。
-//!
-//! いずれも SIMD 幅／GPU provider の実装・キュー層の追加・ISA 実行時検出
-//! （TASK-156・CORE-14）を要する後続タスクの管轄とする。
+//! `batch_fallback.rs::FallbackBatchEngine::batch_search` は `select_execution_path` の
+//! 戻り値で primary（GPU）／CPU 縮退のどちらを試みるかを決める（旧来の
+//! `match &self.primary { Available => .., Unavailable => .. }` という独自分岐を
+//! 置き換えた。詳細は `batch_fallback.rs` のモジュールドキュメント参照）。primary が
+//! 実際に構築成功した場合にのみ得られる [`GpuCapability`]（sealed トークン）を渡すため、
+//! 未検証の GPU capability を経路選択へ持ち込む余地がない（CORE-12）。
 //!
 //! `batch_search.rs::should_aggregate_into_batch`（動的窓集約の判定）は本モジュールが
 //! 呼び出す既存の純関数であり、二重に判定ロジックを持たない（同モジュールの
@@ -48,8 +55,11 @@
 //! wire/SQL 表層側で [`select_execution_path`] の戻り値を読み取り専用に
 //! 表示する形の後続タスクとして検討する。
 //!
-//! ISA の実行時検出（TASK-156・CORE-14）は本タスクの範囲外であり、[`DetectedIsa`] は
-//! 検出トークン導入前のデータ表現として、呼び出し元が指定する値をそのまま受け取る。
+//! ISA の完全な実行時検出（`is_x86_feature_detected!` 等による CPUID/HWCAP 照会、
+//! TASK-156・CORE-14）は本タスクの範囲外だが、[`detect_current_isa`] はコンパイル時
+//! ターゲット（`cfg(target_arch = ..)`）だけに基づく保守的な下限検出を提供する
+//! （fail-closed: 実際より広い ISA を報告することはない。x86_64 は常に `Scalar` を
+//! 返し、AVX2/AVX-512 の実行時検出は TASK-156 が担う）。
 
 use crate::batch_search::{should_aggregate_into_batch, MAX_BATCH_DIM, MAX_BATCH_QUERIES};
 
@@ -68,6 +78,42 @@ pub enum DetectedIsa {
     Avx2Fma,
     /// x86_64 AVX-512（512 bit）。
     Avx512,
+}
+
+/// コンパイル時ターゲットのみに基づく保守的な ISA 下限検出（モジュールドキュメント
+/// 「ISA の完全な実行時検出」の項参照）。呼び出し元（`core.rs::EngineCore::search`）が
+/// 任意の [`DetectedIsa`] を偽装できないよう、`DispatchInput` のコンストラクタは
+/// この関数の戻り値のみを受け取る想定である（`isa` フィールド自体は private のため、
+/// 呼び出し元が別の値を混入させる経路はない）。
+pub fn detect_current_isa() -> DetectedIsa {
+    if cfg!(target_arch = "aarch64") {
+        // aarch64 の baseline ISA は Neon（128 bit）を含むことがアーキテクチャ仕様上
+        // 保証されている（実行時検出なしでも安全に主張できる下限）。
+        DetectedIsa::Neon
+    } else {
+        // x86_64 等は AVX2/AVX-512 の実際の対応有無をコンパイル時には判定できないため、
+        // 最も保守的な `Scalar` を返す（fail-closed。実行時検出は TASK-156 の管轄）。
+        DetectedIsa::Scalar
+    }
+}
+
+/// GPU バックエンドが実際に利用可能であることを証明する sealed capability トークン
+/// （CORE-12: 未検証の GPU capability を外部から構築させない）。
+///
+/// `pub(crate)` のコンストラクタ [`GpuCapability::proven`] しか値を作れないため、
+/// `dispatch` モジュール外から任意に `GpuCapability` を偽装することはできない。
+/// 現状唯一の生成元は `batch_fallback.rs::FallbackBatchEngine::build` が primary
+/// backend（[`crate::batch_fallback::BatchBackend`]）の構築に成功した経路のみである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuCapability(());
+
+impl GpuCapability {
+    /// 呼び出し元が GPU backend の構築成功を確認した後にのみ呼ぶ（`pub(crate)`
+    /// のため crate 外からは呼べない。CORE-12 の「未検証の capability を経路選択へ
+    /// 持ち込めない」という要件を型で保証する）。
+    pub(crate) fn proven() -> Self {
+        GpuCapability(())
+    }
 }
 
 /// クエリベクトルの要素型。現状は `F32` のみを扱う。
@@ -100,38 +146,132 @@ pub enum ExecutionPath {
     Gpu,
 }
 
-/// [`select_execution_path`] への入力。すべて値渡しで、参照透過性（同一入力→同一出力）を
-/// 保つ（グローバル状態・環境変数・ファイル・時刻を一切参照しない。CORE-12）。
+/// [`DispatchInput`] の `dim` 検証に使う上限の文脈（単発クエリ経路とバッチ経路で
+/// 異なる。旧: 両経路とも `batch_search::MAX_BATCH_DIM` へ固定していたための不一致を
+/// コンストラクタ分離で解消した。モジュールドキュメント「実配線」の項参照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DispatchInput {
-    /// GPU バックエンドが利用可能かどうか（HW capability）。実 GPU 未接続の現時点では
-    /// 呼び出し元がバックエンド構築可否から与える（`batch_fallback.rs::BatchBackend`
-    /// の構築結果に対応）。
-    pub gpu_available: bool,
-    /// 実行時に検出された ISA（TASK-156 の検出トークン導入前は呼び出し元指定）。
-    pub isa: DetectedIsa,
-    /// クエリベクトルの次元。0、または `batch_search::MAX_BATCH_DIM` 超過は不正入力として
-    /// `Err` を返す（fail-closed）。単発クエリ（`batch_size == 1`）でも同じ上限で
-    /// 検証する。`core.rs::EngineCore::search` の単発クエリ経路は別途
-    /// `storage::MAX_EMBEDDING_DIM`（より大きい値）で次元を検証しており、本モジュールは
-    /// まだその経路へ接続していない（後続タスクの管轄）。接続時は「決定表の入力は常に
-    /// バッチ側の上限で検証する」という本方針を踏襲するか、単発クエリ用の別上限を
-    /// 設けるかを改めて検討する。
-    pub dim: usize,
-    /// バッチ内のクエリ件数。0、または `batch_search::MAX_BATCH_QUERIES` 超過は不正入力
-    /// として `Err` を返す（fail-closed）。単発クエリは 1 を渡す。
-    pub batch_size: usize,
-    /// クエリベクトルの要素型。
-    pub dtype: QueryDtype,
-    /// 動的窓判定用の入力。キューから 1 件取り出した直後に後続が存在するかどうか
-    /// （`batch_search.rs::should_aggregate_into_batch` へそのまま渡す）。
-    pub pending_after_pop: bool,
+enum DimLimit {
+    /// `core.rs::EngineCore::search`（単発クエリ経路）用。`storage::MAX_EMBEDDING_DIM`。
+    SingleQuery,
+    /// `batch_fallback.rs`／`batch_search.rs`（バッチ経路）用。`batch_search::MAX_BATCH_DIM`。
+    Batch,
 }
 
-/// [`select_execution_path`] が返すエラー。fail-closed（曖昧な入力は拒否側に倒す）。
+impl DimLimit {
+    fn max(self) -> usize {
+        match self {
+            DimLimit::SingleQuery => SINGLE_QUERY_MAX_DIM,
+            DimLimit::Batch => MAX_BATCH_DIM,
+        }
+    }
+}
+
+/// [`DispatchInput::for_single_query`] が用いる次元上限。`storage::MAX_EMBEDDING_DIM`
+/// （`pub(crate)`）をここで再公開し、crate 外（`tests/dispatch.rs` 等）が上限値を
+/// 二重管理せずに参照できるようにする。
+pub const SINGLE_QUERY_MAX_DIM: usize = crate::storage::MAX_EMBEDDING_DIM as usize;
+
+/// [`select_execution_path`] への入力。すべて値渡しで、参照透過性（同一入力→同一出力）を
+/// 保つ（グローバル状態・環境変数・ファイル・時刻を一切参照しない。CORE-12）。
+///
+/// フィールドはすべて private（codex-review P1 指摘対応: `gpu_available`／`isa` が
+/// public field だと任意の呼び出し元が未検証の ISA・GPU capability を直接構築できて
+/// しまい、CORE-12 の「未検証指定による経路上書きを構造的に排除する」契約と矛盾する
+/// ため）。構築は [`Self::for_single_query`]／[`Self::for_batch`] の 2 コンストラクタ
+/// のみを経由し、`gpu`（[`GpuCapability`]。`pub(crate)` コンストラクタのみが値を持てる
+/// sealed トークン）・`dim` の検証上限（[`DimLimit`]）は各コンストラクタが文脈に応じて
+/// 固定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchInput {
+    /// GPU バックエンドが実際に利用可能であることの証明（[`GpuCapability`]）。
+    /// `None` は「GPU 不能」（`batch_fallback.rs::PrimarySlot::Unavailable`、または
+    /// 単発クエリ経路のように構造的に GPU capability を持ちえない呼び出し元）を表す。
+    gpu: Option<GpuCapability>,
+    /// 実行時に検出された ISA（[`detect_current_isa`] の戻り値を渡す想定）。
+    isa: DetectedIsa,
+    /// クエリベクトルの次元。0、または `dim_limit` の上限超過は不正入力として `Err` を
+    /// 返す（fail-closed）。
+    dim: usize,
+    dim_limit: DimLimit,
+    /// バッチ内のクエリ件数。0、または `batch_search::MAX_BATCH_QUERIES` 超過は不正入力
+    /// として `Err` を返す（fail-closed）。単発クエリは常に 1。
+    batch_size: usize,
+    /// クエリベクトルの要素型。
+    dtype: QueryDtype,
+    /// 動的窓判定用の入力。キューから 1 件取り出した直後に後続が存在するかどうか
+    /// （`batch_search.rs::should_aggregate_into_batch` へそのまま渡す）。バッチ経路
+    /// （[`Self::for_batch`]）は待機キューを持たないため常に `false` を渡す。
+    pending_after_pop: bool,
+}
+
+impl DispatchInput {
+    /// `core.rs::EngineCore::search`（単発クエリ経路、CORE-9）用のコンストラクタ。
+    /// GPU capability を引数に取らない（構造的に `gpu: None` へ固定する）。単発クエリ
+    /// 経路は `batch_fallback.rs::FallbackBatchEngine` を経由しないため GPU backend の
+    /// 構築結果自体を持ちえず、これは実装漏れではなく設計上の制約である。
+    ///
+    /// `dim` は 0、または `storage::MAX_EMBEDDING_DIM` 超過で `Err`（fail-closed）。
+    pub fn for_single_query(
+        isa: DetectedIsa,
+        dim: usize,
+        pending_after_pop: bool,
+    ) -> Result<Self, DispatchError> {
+        Self::new(None, isa, dim, DimLimit::SingleQuery, 1, pending_after_pop)
+    }
+
+    /// `batch_fallback.rs::FallbackBatchEngine::batch_search`／`batch_search.rs` の
+    /// バッチ経路（CORE-6, 7, 8）用のコンストラクタ。`gpu` は primary backend の構築に
+    /// 成功した場合のみ [`GpuCapability`] を渡せる（呼び出し元が `Some`/`None` を自由に
+    /// 選べるが、値自体は `dispatch` モジュール外から偽装できない）。バッチ経路は
+    /// 待機キューを持たないため `pending_after_pop` は常に `false` として扱う。
+    ///
+    /// `dim` は 0、または `batch_search::MAX_BATCH_DIM` 超過で `Err`（fail-closed）。
+    pub fn for_batch(
+        gpu: Option<GpuCapability>,
+        isa: DetectedIsa,
+        dim: usize,
+        batch_size: usize,
+    ) -> Result<Self, DispatchError> {
+        Self::new(gpu, isa, dim, DimLimit::Batch, batch_size, false)
+    }
+
+    fn new(
+        gpu: Option<GpuCapability>,
+        isa: DetectedIsa,
+        dim: usize,
+        dim_limit: DimLimit,
+        batch_size: usize,
+        pending_after_pop: bool,
+    ) -> Result<Self, DispatchError> {
+        let max_dim = dim_limit.max();
+        if dim == 0 || dim > max_dim {
+            return Err(DispatchError::InvalidDim { dim, max: max_dim });
+        }
+        if batch_size == 0 || batch_size > MAX_BATCH_QUERIES {
+            return Err(DispatchError::InvalidBatchSize {
+                batch_size,
+                max: MAX_BATCH_QUERIES,
+            });
+        }
+        Ok(Self {
+            gpu,
+            isa,
+            dim,
+            dim_limit,
+            batch_size,
+            dtype: QueryDtype::F32,
+            pending_after_pop,
+        })
+    }
+}
+
+/// [`DispatchInput`] のコンストラクタが返すエラー。fail-closed（曖昧な入力は拒否側に
+/// 倒す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchError {
-    /// `dim` が 0、または `batch_search::MAX_BATCH_DIM` を超過した。
+    /// `dim` が 0、または呼び出し元の文脈（[`DispatchInput::for_single_query`] なら
+    /// `storage::MAX_EMBEDDING_DIM`、[`DispatchInput::for_batch`] なら
+    /// `batch_search::MAX_BATCH_DIM`）の上限を超過した。
     InvalidDim { dim: usize, max: usize },
     /// `batch_size` が 0、または `batch_search::MAX_BATCH_QUERIES` を超過した。
     InvalidBatchSize { batch_size: usize, max: usize },
@@ -168,17 +308,28 @@ fn simd_width_for(isa: DetectedIsa) -> SimdWidth {
 /// 実行経路選択の決定表本体（CORE-11）。副作用なしの純関数（同一 `input` に対し
 /// 常に同一の `Result` を返す）。
 ///
+/// `dim`・`batch_size` の 0・上限超過検証は [`DispatchInput`] のコンストラクタ
+/// （[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]）が構築時点で
+/// 行っており（fail-closed）、本関数へ渡る `input` は既にその不変条件を満たす。
+/// `select_execution_path` は `Result` を返すシグネチャを維持する（将来 `input` 以外の
+/// 検証条件が決定表へ加わった場合に呼び出し元のエラーハンドリングを壊さないため）。
+///
 /// 決定表の行（既存モジュールの判定を吸収する。実装は変更せず、経路選択だけを
 /// ここへ集約する）:
 ///
-/// 1. `dim`・`batch_size` の 0・上限超過 → `Err`（fail-closed。他の行より先に検証する）
-/// 2. `batch_size == 1` かつ動的窓判定（[`should_aggregate_into_batch`]）が `false`
-///    → 単発クエリとして GPU を使わず CPU-SIMD（CORE-7 の単発クエリ行）
-/// 3. `batch_size == 1` だが動的窓判定が `true`（後続クエリが控えている）
-///    → バッチ扱いへ昇格する（CORE-7 の動的窓例外行）
-/// 4. 上記以外（`batch_size >= 2`、またはバッチ昇格後）で `gpu_available == true`
-///    → GPU を優先する（CORE-6 の対応行）
-/// 5. `gpu_available == false` → 常に CPU-SIMD（CORE-8 の縮退対応行。
+/// 1. `for_batch` 経由（[`DispatchInput`] の内部 `dim_limit` が `DimLimit::Batch`）
+///    → 件数によらず常にバッチ扱い（`FallbackBatchEngine::batch_search` は呼び出し
+///    時点で既にバッチとして確定した集合を渡すため、2 行目以降の「動的窓」判定は
+///    単発クエリ経路専用であり、バッチ経路には適用しない。CORE-6, 7, 8 の対応行）
+/// 2. `for_single_query` 経由かつ動的窓判定（[`should_aggregate_into_batch`]）が
+///    `false` → 単発クエリとして GPU を使わず CPU-SIMD（CORE-7 の単発クエリ行）
+/// 3. `for_single_query` 経由だが動的窓判定が `true`（後続クエリが控えている）
+///    → バッチ扱いへ昇格する（CORE-7 の動的窓例外行。`for_single_query` は GPU
+///    capability を引数に取らないため、本行が実際に `ExecutionPath::Gpu` へ帰着する
+///    ことは現状ない。動的窓のキュー層を持つ後続タスクのための予約行）
+/// 4. 上記でバッチ扱いになり、かつ GPU capability を保持する → GPU を優先する
+///    （CORE-6 の対応行）
+/// 5. GPU capability を保持しない → 常に CPU-SIMD（CORE-8 の縮退対応行。
 ///    `batch_fallback.rs` の実行時縮退とは独立に、事前の経路選択としても
 ///    GPU 不能なら最初から CPU-SIMD を選ぶ）
 ///
@@ -186,30 +337,22 @@ fn simd_width_for(isa: DetectedIsa) -> SimdWidth {
 /// 網羅 match の対象に含め、将来 variant が増えた際に分岐漏れをコンパイルエラーで
 /// 検出できるようにする。
 pub fn select_execution_path(input: DispatchInput) -> Result<ExecutionPath, DispatchError> {
-    if input.dim == 0 || input.dim > MAX_BATCH_DIM {
-        return Err(DispatchError::InvalidDim {
-            dim: input.dim,
-            max: MAX_BATCH_DIM,
-        });
-    }
-    if input.batch_size == 0 || input.batch_size > MAX_BATCH_QUERIES {
-        return Err(DispatchError::InvalidBatchSize {
-            batch_size: input.batch_size,
-            max: MAX_BATCH_QUERIES,
-        });
-    }
-
     // dtype は現時点で分岐に寄与しないが、網羅 match で束縛して将来の variant 追加を
     // コンパイルエラーで検出可能にしておく（決定表更新漏れの構造的防止。CORE-11）。
     match input.dtype {
         QueryDtype::F32 => {}
     }
 
-    // バッチ扱いにするかどうか（単発クエリ + 動的窓判定の吸収。CORE-7）。
-    let treated_as_batch =
-        input.batch_size >= 2 || should_aggregate_into_batch(input.pending_after_pop);
+    // バッチ扱いにするかどうか。`for_batch` 経由は常にバッチ扱い（上記ルール 1）。
+    // `for_single_query` 経由は動的窓判定の吸収（CORE-7）で決まる。
+    let treated_as_batch = match input.dim_limit {
+        DimLimit::Batch => true,
+        DimLimit::SingleQuery => {
+            input.batch_size >= 2 || should_aggregate_into_batch(input.pending_after_pop)
+        }
+    };
 
-    if treated_as_batch && input.gpu_available {
+    if treated_as_batch && input.gpu.is_some() {
         return Ok(ExecutionPath::Gpu);
     }
 
@@ -225,25 +368,18 @@ pub fn select_execution_path(input: DispatchInput) -> Result<ExecutionPath, Disp
 mod tests {
     use super::*;
 
-    fn base_input() -> DispatchInput {
-        DispatchInput {
-            gpu_available: false,
-            isa: DetectedIsa::Scalar,
-            dim: 8,
-            batch_size: 1,
-            dtype: QueryDtype::F32,
-            pending_after_pop: false,
-        }
+    // `GpuCapability::proven()` は `pub(crate)` のため、本 unit テスト（同一クレート内）
+    // からは呼べるが `tests/dispatch.rs`（別クレート扱いの結合テスト）からは呼べない
+    // （CORE-12: 未検証の GPU capability を crate 外から構築できないことの回帰）。
+    // GPU capability を伴う決定表の全網羅走査は、そのため本 unit テスト側に置く。
+    fn gpu() -> GpuCapability {
+        GpuCapability::proven()
     }
 
     #[test]
-    fn single_query_without_pending_uses_cpu_simd_even_if_gpu_available() {
-        let input = DispatchInput {
-            gpu_available: true,
-            batch_size: 1,
-            pending_after_pop: false,
-            ..base_input()
-        };
+    fn single_query_without_pending_uses_cpu_simd() {
+        let input =
+            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, false).expect("valid input");
         assert_eq!(
             select_execution_path(input).expect("valid input"),
             ExecutionPath::CpuSimd {
@@ -252,52 +388,63 @@ mod tests {
         );
     }
 
+    /// `for_single_query` 経由は GPU capability を構造的に持てない（引数に取らない）ため、
+    /// 「単発クエリ + pending → GPU 昇格」（決定表ルール 3）が実際に `Gpu` へ帰着する
+    /// ことは現状の公開 API からは起こらない。ルール 3 自体の回帰は、crate 内だけに
+    /// 見える private フィールドの struct-update で「将来 GPU capability を伴う単発
+    /// クエリ経路が追加された場合」を模した入力を組み立てて確認する。
     #[test]
-    fn single_query_with_pending_promotes_to_batch_and_uses_gpu_when_available() {
-        let input = DispatchInput {
-            gpu_available: true,
-            batch_size: 1,
-            pending_after_pop: true,
-            ..base_input()
+    fn single_query_with_pending_promotes_to_batch_row_reaches_gpu_if_capability_were_present() {
+        let base =
+            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, true).expect("valid input");
+        assert_eq!(base.dim_limit, DimLimit::SingleQuery);
+        let hypothetical = DispatchInput {
+            gpu: Some(gpu()),
+            ..base
         };
         assert_eq!(
-            select_execution_path(input).expect("valid input"),
+            select_execution_path(hypothetical).expect("valid input"),
             ExecutionPath::Gpu
+        );
+        // 一方、現実の `for_single_query` の戻り値（GPU capability なし）は pending でも
+        // CpuSimd のままである。
+        assert_eq!(
+            select_execution_path(base).expect("valid input"),
+            ExecutionPath::CpuSimd {
+                width: SimdWidth::Scalar
+            }
         );
     }
 
+    /// バッチ経路（`for_batch`）は件数によらず常にバッチ扱いになる（決定表ルール 1）。
+    /// `FallbackBatchEngine::batch_search` は呼び出し時点で既にバッチとして確定した
+    /// 集合を渡すため、`batch_size == 1` でも「単発クエリの動的窓判定」は適用しない
+    /// （`batch_fallback.rs` の実配線と一致させる回帰）。
     #[test]
-    fn batch_prefers_gpu_when_available() {
-        let input = DispatchInput {
-            gpu_available: true,
-            batch_size: 2,
-            ..base_input()
-        };
-        assert_eq!(
-            select_execution_path(input).expect("valid input"),
-            ExecutionPath::Gpu
-        );
+    fn batch_prefers_gpu_when_available_even_for_single_item_batch() {
+        for batch_size in [1usize, 2, MAX_BATCH_QUERIES] {
+            let input = DispatchInput::for_batch(Some(gpu()), DetectedIsa::Scalar, 8, batch_size)
+                .expect("valid input");
+            assert_eq!(
+                select_execution_path(input).expect("valid input"),
+                ExecutionPath::Gpu,
+                "batch_size={batch_size}"
+            );
+        }
     }
 
     #[test]
     fn gpu_unavailable_always_falls_back_to_cpu_simd() {
         for batch_size in [1usize, 2, MAX_BATCH_QUERIES] {
-            for pending in [false, true] {
-                let input = DispatchInput {
-                    gpu_available: false,
-                    isa: DetectedIsa::Avx2Fma,
-                    batch_size,
-                    pending_after_pop: pending,
-                    ..base_input()
-                };
-                assert_eq!(
-                    select_execution_path(input).expect("valid input"),
-                    ExecutionPath::CpuSimd {
-                        width: SimdWidth::W256
-                    },
-                    "batch_size={batch_size} pending={pending}"
-                );
-            }
+            let input = DispatchInput::for_batch(None, DetectedIsa::Avx2Fma, 8, batch_size)
+                .expect("valid input");
+            assert_eq!(
+                select_execution_path(input).expect("valid input"),
+                ExecutionPath::CpuSimd {
+                    width: SimdWidth::W256
+                },
+                "batch_size={batch_size}"
+            );
         }
     }
 
@@ -310,10 +457,7 @@ mod tests {
             (DetectedIsa::Avx512, SimdWidth::W512),
         ];
         for (isa, expected_width) in cases {
-            let input = DispatchInput {
-                isa,
-                ..base_input()
-            };
+            let input = DispatchInput::for_single_query(isa, 8, false).expect("valid input");
             assert_eq!(
                 select_execution_path(input).expect("valid input"),
                 ExecutionPath::CpuSimd {
@@ -325,28 +469,18 @@ mod tests {
     }
 
     #[test]
-    fn zero_dim_is_rejected() {
-        let input = DispatchInput {
-            dim: 0,
-            ..base_input()
-        };
+    fn zero_dim_is_rejected_for_single_query() {
+        let max = crate::storage::MAX_EMBEDDING_DIM as usize;
         assert_eq!(
-            select_execution_path(input).unwrap_err(),
-            DispatchError::InvalidDim {
-                dim: 0,
-                max: MAX_BATCH_DIM
-            }
+            DispatchInput::for_single_query(DetectedIsa::Scalar, 0, false).unwrap_err(),
+            DispatchError::InvalidDim { dim: 0, max }
         );
     }
 
     #[test]
-    fn dim_over_limit_is_rejected() {
-        let input = DispatchInput {
-            dim: MAX_BATCH_DIM + 1,
-            ..base_input()
-        };
+    fn dim_over_limit_is_rejected_for_batch() {
         assert_eq!(
-            select_execution_path(input).unwrap_err(),
+            DispatchInput::for_batch(None, DetectedIsa::Scalar, MAX_BATCH_DIM + 1, 1).unwrap_err(),
             DispatchError::InvalidDim {
                 dim: MAX_BATCH_DIM + 1,
                 max: MAX_BATCH_DIM
@@ -354,14 +488,20 @@ mod tests {
         );
     }
 
+    /// 単発クエリ経路は `storage::MAX_EMBEDDING_DIM`（バッチ経路の `MAX_BATCH_DIM` より
+    /// 大きい）を上限に使うため、バッチ経路では拒否される次元でも単発クエリ経路では
+    /// 受理される（旧: 両経路とも `MAX_BATCH_DIM` に固定していたための不一致の回帰）。
+    #[test]
+    fn single_query_dim_limit_is_wider_than_batch_dim_limit() {
+        let dim = MAX_BATCH_DIM + 1;
+        assert!(DispatchInput::for_single_query(DetectedIsa::Scalar, dim, false).is_ok());
+        assert!(DispatchInput::for_batch(None, DetectedIsa::Scalar, dim, 1).is_err());
+    }
+
     #[test]
     fn zero_batch_size_is_rejected() {
-        let input = DispatchInput {
-            batch_size: 0,
-            ..base_input()
-        };
         assert_eq!(
-            select_execution_path(input).unwrap_err(),
+            DispatchInput::for_batch(None, DetectedIsa::Scalar, 8, 0).unwrap_err(),
             DispatchError::InvalidBatchSize {
                 batch_size: 0,
                 max: MAX_BATCH_QUERIES
@@ -371,12 +511,9 @@ mod tests {
 
     #[test]
     fn batch_size_over_limit_is_rejected() {
-        let input = DispatchInput {
-            batch_size: MAX_BATCH_QUERIES + 1,
-            ..base_input()
-        };
         assert_eq!(
-            select_execution_path(input).unwrap_err(),
+            DispatchInput::for_batch(None, DetectedIsa::Scalar, 8, MAX_BATCH_QUERIES + 1)
+                .unwrap_err(),
             DispatchError::InvalidBatchSize {
                 batch_size: MAX_BATCH_QUERIES + 1,
                 max: MAX_BATCH_QUERIES
@@ -387,18 +524,12 @@ mod tests {
     #[test]
     fn determinism_same_input_yields_same_output_across_repeated_calls() {
         let cases = [
-            base_input(),
+            DispatchInput::for_single_query(DetectedIsa::Scalar, 8, false).expect("valid input"),
+            DispatchInput::for_batch(Some(gpu()), DetectedIsa::Avx512, 8, 4).expect("valid input"),
             DispatchInput {
-                gpu_available: true,
-                batch_size: 4,
-                isa: DetectedIsa::Avx512,
-                ..base_input()
-            },
-            DispatchInput {
-                gpu_available: true,
-                batch_size: 1,
                 pending_after_pop: true,
-                ..base_input()
+                ..DispatchInput::for_batch(Some(gpu()), DetectedIsa::Scalar, 8, 1)
+                    .expect("valid input")
             },
         ];
         for input in cases {
@@ -408,16 +539,18 @@ mod tests {
         }
     }
 
-    // 動的窓行が batch_search::should_aggregate_into_batch と一致すること
-    // （二重管理を避けるための契約の回帰確認）。
+    /// 動的窓行（`for_single_query` 経由・pending 有無）が
+    /// `batch_search::should_aggregate_into_batch` と一致すること（二重管理を避ける
+    /// という契約の回帰確認）。GPU capability は crate 内 struct-update で仮に付与し、
+    /// 「昇格した場合に GPU へ帰着するか」を検証する（`single_query_with_pending_...`
+    /// テストと同じ理由）。
     #[test]
     fn dynamic_window_row_matches_should_aggregate_into_batch() {
         for pending in [false, true] {
             let input = DispatchInput {
-                gpu_available: true,
-                batch_size: 1,
-                pending_after_pop: pending,
-                ..base_input()
+                gpu: Some(gpu()),
+                ..DispatchInput::for_single_query(DetectedIsa::Scalar, 8, pending)
+                    .expect("valid input")
             };
             let expected = if should_aggregate_into_batch(pending) {
                 ExecutionPath::Gpu
@@ -427,6 +560,74 @@ mod tests {
                 }
             };
             assert_eq!(select_execution_path(input).expect("valid input"), expected);
+        }
+    }
+
+    /// 決定表の全網羅走査（コンテキスト（`for_single_query`／`for_batch`）× `gpu` 有無 ×
+    /// `isa` × `batch_size`（`for_batch` のみ 1・2・上限）× `pending_after_pop` の直積）。
+    /// 旧 `tests/dispatch.rs` に置いていた同等の走査を、`GpuCapability::proven()` が
+    /// `pub(crate)` のため crate 内 unit テストへ移設した（CORE-12 の回帰でもある:
+    /// 結合テスト側から GPU capability を偽装できないこと自体がテストの一部）。
+    #[test]
+    fn decision_table_covers_gpu_and_cpu_product() {
+        let isa_variants = [
+            DetectedIsa::Scalar,
+            DetectedIsa::Neon,
+            DetectedIsa::Avx2Fma,
+            DetectedIsa::Avx512,
+        ];
+
+        // `for_batch`: 件数によらず常にバッチ扱い（ルール 1）。
+        let batch_sizes = [1usize, 2, MAX_BATCH_QUERIES];
+        for gpu_present in [false, true] {
+            for isa in isa_variants {
+                for batch_size in batch_sizes {
+                    let gpu_opt = if gpu_present { Some(gpu()) } else { None };
+                    let input =
+                        DispatchInput::for_batch(gpu_opt, isa, 8, batch_size).expect("valid input");
+                    let expected = if gpu_present {
+                        ExecutionPath::Gpu
+                    } else {
+                        ExecutionPath::CpuSimd {
+                            width: simd_width_for(isa),
+                        }
+                    };
+                    assert_eq!(
+                        select_execution_path(input).expect("valid input"),
+                        expected,
+                        "context=batch gpu_present={gpu_present} isa={isa:?} batch_size={batch_size}"
+                    );
+                }
+            }
+        }
+
+        // `for_single_query`: 動的窓判定（`pending_after_pop`）で昇格するかどうかが
+        // 決まる。実際の呼び出し元は GPU capability を持たないが、決定表そのものの
+        // 網羅性は「GPU capability を仮に付与した場合」も含めて確認する。
+        for gpu_present in [false, true] {
+            for isa in isa_variants {
+                for pending_after_pop in [false, true] {
+                    let gpu_opt = if gpu_present { Some(gpu()) } else { None };
+                    let input = DispatchInput {
+                        gpu: gpu_opt,
+                        ..DispatchInput::for_single_query(isa, 8, pending_after_pop)
+                            .expect("valid input")
+                    };
+                    let treated_as_batch = should_aggregate_into_batch(pending_after_pop);
+                    let expected = if treated_as_batch && gpu_present {
+                        ExecutionPath::Gpu
+                    } else {
+                        ExecutionPath::CpuSimd {
+                            width: simd_width_for(isa),
+                        }
+                    };
+                    assert_eq!(
+                        select_execution_path(input).expect("valid input"),
+                        expected,
+                        "context=single gpu_present={gpu_present} isa={isa:?} pending={pending_after_pop}"
+                    );
+                }
+            }
         }
     }
 }

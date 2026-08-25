@@ -15,33 +15,31 @@
 //!
 //! 本モジュールが担うのは「選択後の実行時 fail-safe」（primary 失敗→CPU 縮退）であり、
 //! 「実行前の経路選択」自体は `dispatch.rs::select_execution_path`（TASK-155・
-//! CORE-11, 12）が担う想定である。両者は排他ではなく直列（決定表→実行→縮退）の
-//! 責務分担になる設計だが、`select_execution_path` から本モジュールを実際に呼び出す
-//! 配線は後続タスクの管轄（本タスク時点では未接続）。
+//! CORE-11, 12）が担う。両者は排他ではなく直列（決定表→実行→縮退）の責務分担に
+//! なる設計であり、[`FallbackBatchEngine::batch_search`] は冒頭で
+//! `select_execution_path` を呼んで primary（GPU）を試みるか CPU 縮退経路へ直行するか
+//! を決めてから実行する（配線済み）。
 //!
-//! # 実配線調査で判明した阻害要因（TASK-155 レビュー起因）
+//! # 実配線: `pending_after_pop`（動的窓判定）をバッチ経路の判断へ持ち込まない
 //!
-//! [`FallbackBatchEngine::batch_search`] の冒頭で `select_execution_path` を呼び、
-//! 単発クエリ（`batch_size == 1`）を CPU-SIMD 経路へ直行させる配線を試作したが、
-//! 以下の理由で安全に導入できないことを確認した:
+//! `select_execution_path` の `pending_after_pop` 入力（動的窓判定用）を供給する
+//! キュー層は存在しない（`batch_search.rs::should_aggregate_into_batch`／
+//! `DynamicWindowAggregator` は現状 `dispatch.rs` とテストからのみ呼ばれる）。当初
+//! `pending_after_pop: false` 固定で単発クエリ（`batch_size == 1`）を毎回 CPU-SIMD
+//! 直行にする配線を試作したが、`revalidate_primary_hits`・恒久故障ラッチ等の primary
+//! 実行経路を単発クエリのバッチで検証しているテスト群が primary 未呼び出しのため
+//! red になることを実測で確認した（本モジュールの呼び出しは既に集約済みのバッチ
+//! であり、`batch_size == 1` であっても「単発クエリの動的窓判定」を適用すべき対象
+//! ではない、という誤りが原因）。
 //!
-//! - `select_execution_path` の `pending_after_pop` 入力（動的窓判定用）を供給する
-//!   キュー層が存在しない。`batch_search.rs::should_aggregate_into_batch` は
-//!   `dispatch.rs` とテストからのみ呼ばれ、本番の呼び出し元を持たない
-//!   （`batch_search.rs::DynamicWindowAggregator` も同様に本番の呼び出し元なし）。
-//!   そのため本メソッドの呼び出しが実際には集約済みバッチの一部（単発 1 件に
-//!   見えても動的窓に入るはずだった呼び出し）であっても区別できない。
-//! - 上記の制約下で `pending_after_pop: false` 固定にして単発クエリを primary
-//!   未到達にすると、`revalidate_primary_hits`・恒久故障ラッチ等の primary 実行
-//!   経路を単発クエリのバッチで検証しているテスト群（`revalidation_rejects_*`・
-//!   `runtime_error_latches_after_first_failure_and_stops_retrying_primary`・
-//!   `input_errors_from_primary_are_not_treated_as_fallback_trigger` 等、
-//!   `cargo test -p engine --lib batch_fallback` で 26 件中 12 件）が primary
-//!   未呼び出しのため意図した障害注入を検証できなくなり red になることを実測で
-//!   確認した。
-//!
-//! キュー層（`pending_after_pop` を実データで供給する上位呼び出し元）の追加と、
-//! 上記テスト群の複数クエリバッチへの書き換えをセットで行う後続タスクの管轄とする。
+//! この誤りは `dispatch.rs::select_execution_path` 側で解消した:
+//! `DispatchInput::for_batch` 経由（本モジュールが使うコンストラクタ）の入力は
+//! 件数・`pending_after_pop` によらず常にバッチ扱いになる（決定表ルール 1。
+//! `for_single_query` 経由の入力だけが動的窓判定の対象になる）。これにより本
+//! メソッドは `pending_after_pop: false` を渡すだけでよく（実際、`for_batch` は
+//! この値を判断に使わない）、primary の呼び出し可否は「`self.primary` が
+//! `Available` かどうか」だけで決まるという従来の挙動を、決定表を経由しながら
+//! そのまま維持する。
 //!
 //! [`BatchBackend`] は将来の実 GPU/外部実装が差し込まれる公開差し替え点であり、
 //! `Ok` を返した場合でも [`FallbackBatchEngine`] はその内容を無条件に信頼しない
@@ -68,6 +66,7 @@ use crate::batch_search::{
     run_batch_search, BatchEngine, BatchHit, BatchQuery, BatchRowSource, BatchSearchError,
     ResidentMatrix, MAX_BATCH_TOTAL_BYTES,
 };
+use crate::dispatch::{self, DispatchInput, ExecutionPath, GpuCapability};
 use crate::kernel::SearchHit;
 use crate::storage::Visibility;
 
@@ -746,8 +745,33 @@ impl FallbackBatchEngine {
             return run_batch_search(&self.cpu, queries);
         }
 
-        match &self.primary {
-            PrimarySlot::Available(backend) => match backend.batch_search(queries) {
+        // 実行経路の決定（TASK-155・対象ビヘイビア: CORE-11, CORE-12）。primary が構築
+        // 成功している（[`PrimarySlot::Available`]）場合のみ [`GpuCapability::proven`]
+        // （`pub(crate)` の sealed トークン）を渡す。未検証の GPU capability を
+        // `dispatch` へ持ち込む経路はない（CORE-12）。バッチ経路は件数によらず常に
+        // バッチ扱いになる決定表のルール（`dispatch.rs` モジュールドキュメント参照）
+        // により、`self.primary` が `Available` なら常に primary を試みる・
+        // `Unavailable` なら常に CPU 縮退経路を使うという、以下の分岐が従来持っていた
+        // 挙動をそのまま維持する（旧: 本 `match` 自体が経路選択を担っていたが、
+        // 経路選択の判断自体は `select_execution_path` へ委譲した）。
+        let gpu = match &self.primary {
+            PrimarySlot::Available(_) => Some(GpuCapability::proven()),
+            PrimarySlot::Unavailable => None,
+        };
+        let dispatch_input = DispatchInput::for_batch(
+            gpu,
+            dispatch::detect_current_isa(),
+            self.cpu.dim,
+            queries.len(),
+        )
+        .map_err(to_batch_search_error)?;
+        let execution_path =
+            dispatch::select_execution_path(dispatch_input).map_err(to_batch_search_error)?;
+
+        let use_primary = matches!(execution_path, ExecutionPath::Gpu);
+
+        match (&self.primary, use_primary) {
+            (PrimarySlot::Available(backend), true) => match backend.batch_search(queries) {
                 Ok(hits) => {
                     // primary バックエンドは公開差し替え点（[`BatchBackend`]）であり、
                     // 将来の実 GPU/外部実装が任意の `Vec<BatchHit>` を返しうる
@@ -781,7 +805,33 @@ impl FallbackBatchEngine {
                     run_batch_search(&self.cpu, queries)
                 }
             },
-            PrimarySlot::Unavailable => run_batch_search(&self.cpu, queries),
+            // `select_execution_path` は GPU capability を渡した場合にのみ
+            // `ExecutionPath::Gpu` を返す（`dispatch.rs` の決定表参照）ため、
+            // `use_primary == true` かつ `self.primary` が `Unavailable` という
+            // 組み合わせは到達しない。到達した場合も CPU 縮退経路へ倒す
+            // fail-closed な catch-all として扱う（`self.primary` が `Available` でも
+            // `use_primary == false` になることはない前提だが、決定表側の将来変更で
+            // 前提が崩れても panic せず CPU 経路へ倒す）。
+            (_, _) => run_batch_search(&self.cpu, queries),
+        }
+    }
+}
+
+/// [`DispatchError`] を [`BatchSearchError`] へ写像する（`FallbackBatchEngine::
+/// batch_search` が `select_execution_path` 呼び出し前に `crate::batch_search::
+/// validate_batch_queries` で既に `dim`・`batch_size` を検証済みのため、通常到達
+/// しない防御的経路。CORE-11 の決定表が返す `DispatchError` variant と
+/// `BatchSearchError` の対応する variant を 1:1 で写す）。
+fn to_batch_search_error(e: dispatch::DispatchError) -> BatchSearchError {
+    match e {
+        dispatch::DispatchError::InvalidDim { dim, max } => {
+            BatchSearchError::InvalidDim { dim, max }
+        }
+        dispatch::DispatchError::InvalidBatchSize { batch_size, max } => {
+            BatchSearchError::TooManyQueries {
+                count: batch_size,
+                max,
+            }
         }
     }
 }

@@ -11,10 +11,14 @@
 //! エンジンの選択はコード上の明示指定（[`SearchEngineKind`] の値）のみで決まる。
 //! 環境変数・設定ファイルによる実行時の経路上書き機構は設けない（`kernel.rs` に明記の
 //! 方針を踏襲。CORE-12）。CPU-SIMD／GPU の実行経路自体を決める決定表は
-//! `dispatch.rs::select_execution_path`（TASK-155・CORE-11, 12）が担う。本モジュールは
-//! 現時点ではコード上の明示指定（[`SearchEngineKind`]）のみで provider を構築しており、
-//! `select_execution_path` の戻り値に基づいて構築先を切り替える配線は後続タスクの管轄
-//! （まだ接続していない）。
+//! `dispatch.rs::select_execution_path`（TASK-155・CORE-11, 12）が担う。本モジュールが
+//! 構築する provider（[`SearchEngineKind`]）はいずれも CPU 実装のため、
+//! `core.rs::EngineCore::search` は provider を実行する前に `select_execution_path` を
+//! 呼び、`ExecutionPath::CpuSimd` の場合だけ本モジュールの provider を実行する
+//! （`ExecutionPath::Gpu` は fail-closed に拒否する。詳細は `core.rs::EngineCore::search`
+//! の実装、`dispatch.rs` モジュールドキュメント参照）。SIMD 幅ごとに異なる provider を
+//! 構築する配線（[`SearchEngineKind`] への variant 追加を伴う）は TASK-156・CORE-14 の
+//! 管轄。
 
 use crate::kernel::{CpuScalarProvider, SearchProvider};
 use crate::parallel_search::ParallelSearchProvider;

@@ -50,6 +50,8 @@ pub enum CoreError {
     },
     NotFound,
     ProviderResultRejected,
+    Dispatch(DispatchError),
+    GpuPathUnavailable,
 }
 
 # source: crates/engine/src/kernel.rs :: SearchHit
