@@ -676,3 +676,43 @@ fn dollar_parameter_placeholder_in_where_remains_unsupported() {
         .expect_err("$n parameter placeholders remain unsupported");
     assert_eq!(err.wire_code(), "42601");
 }
+
+#[test]
+fn chained_udf_parameter_doubling_is_rejected_before_expansion_blows_up() {
+    // Review 指摘（High）の回帰テスト: `g0(v) = v + v` から
+    // `g{n}(v) = g{n-1}(v + v)` まで複数の `CREATE FUNCTION` 文にまたいで連鎖させると、
+    // 各定義の本体は構文的に小さい（`g{n-1}(v + v)` の数ノード）ため
+    // `validate_closed_expr` の構文ノード数チェックは連鎖長にほぼ線形にしか消費されない。
+    // 一方、呼び出し（束縛）時のパラメータ参照展開はクローンする既展開済み部分木の
+    // サイズを課金していなかったため、展開後の `BoundExpr` サイズは連鎖長に対して
+    // 指数的に膨張しうる（`v` の参照が 2 回あるたびに倍加）。修正後は
+    // `bind_expr_in` の `Expr::Ident` 分岐でクローンする展開後ノード数も
+    // `node_budget` へ課金するため、連鎖を伸ばして呼び出すと実際に膨張が進む前に
+    // `54000`（`payload_too_large`）で早期に拒否される
+    // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+
+    core.execute_sql_in_session(&ctx, &mut session, "CREATE FUNCTION g0(v) AS v + v")
+        .expect("g0 definition should succeed (small syntactic body)");
+    for n in 1..=20u32 {
+        let prev = n - 1;
+        let sql = format!("CREATE FUNCTION g{n}(v) AS g{prev}(v + v)");
+        core.execute_sql_in_session(&ctx, &mut session, &sql)
+            .unwrap_or_else(|e| {
+                panic!("g{n} definition should succeed (syntactic body stays small): {e:?}")
+            });
+    }
+
+    let err = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT g20(id) AS r FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
+        )
+        .expect_err(
+            "expansion of the chained UDF call must be rejected before it can blow up memory",
+        );
+    assert_eq!(err.wire_code(), "54000");
+}

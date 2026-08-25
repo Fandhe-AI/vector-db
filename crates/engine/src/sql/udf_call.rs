@@ -300,6 +300,18 @@ struct BindEnv<'a> {
     registry: &'a UdfRegistry,
 }
 
+/// 展開済み [`BoundExpr`] のノード数を数える。UDF 連鎖のパラメータ参照展開時に
+/// クローンする部分木のサイズを `node_budget` へ課金するために使う
+/// （`bind_expr_in` の `Expr::Ident` 分岐を参照）。木の深さは束縛段で既に
+/// `node_budget` により上限が掛かっているため、単純な再帰で数え上げてよい。
+fn count_bound_nodes(expr: &BoundExpr) -> usize {
+    match expr {
+        BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef => 1,
+        BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
+        BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
+    }
+}
+
 /// [`Expr`] を意味論的に束縛する（`sql::parser::bind_in_session` から呼ばれる公開 API）。
 /// 列参照は `schema` から、UDF 呼び出しは `registry` から解決し、UDF はインライン
 /// 展開して自己完結した [`BoundExpr`] を返す。`node_budget` は展開後のノード数上限
@@ -340,6 +352,17 @@ fn bind_expr_in(
         }
         Expr::Ident(name) => {
             if let Some((bound, ty)) = env.params.get(name) {
+                // パラメータ参照の展開は、構文上は 1 ノードでも実際には既に展開済みの
+                // `BoundExpr` 部分木をまるごとクローンする（UDF 連鎖・多重参照時に
+                // 展開結果が指数的に膨張しうる経路）。構文ノード数（直前の
+                // `checked_sub(1)`）だけでなく、クローンされる展開後ノード数も
+                // `node_budget` へ課金し、`MAX_EXPR_NODES` の「展開後の式ノード数上限」
+                // という契約をこの経路でも成立させる（security.md「不安全な設計｜
+                // 無制限リソース確保（DoS）」対応）。
+                let expanded_size = count_bound_nodes(bound);
+                *node_budget = node_budget
+                    .checked_sub(expanded_size)
+                    .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
                 return Ok((bound.clone(), *ty));
             }
             let schema = env.schema.ok_or_else(|| {
@@ -626,7 +649,11 @@ fn eval_binary(op: BinOp, l: ExprValue, r: ExprValue) -> Result<ExprValue, SqlSu
                     BinOp::Ge => a >= b,
                     BinOp::Le => a <= b,
                     BinOp::Eq => a == b,
-                    _ => unreachable!(),
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "non-comparison operator in comparison evaluation".to_string(),
+                        });
+                    }
                 };
                 Ok(ExprValue::Bool(result))
             }
@@ -648,7 +675,11 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
             }
             a / b
         }
-        _ => unreachable!(),
+        BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+            return Err(SqlSurfaceError::Internal {
+                detail: "comparison operator in scalar arithmetic evaluation".to_string(),
+            });
+        }
     };
     if !v.is_finite() {
         return Err(SqlSurfaceError::invalid_input(
@@ -670,7 +701,11 @@ fn apply_vector_scalar_op(op: BinOp, v: &[f32], s: f64) -> Result<ExprValue, Sql
         let r = match op {
             BinOp::Mul => (x as f64) * s,
             BinOp::Div => (x as f64) / s,
-            _ => unreachable!(),
+            BinOp::Add | BinOp::Sub | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le | BinOp::Eq => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "non-mul/div operator in vector-scalar evaluation".to_string(),
+                });
+            }
         };
         if !r.is_finite() {
             return Err(SqlSurfaceError::invalid_input(
