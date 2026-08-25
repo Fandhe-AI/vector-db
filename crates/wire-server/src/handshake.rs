@@ -192,6 +192,18 @@ fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
 
 /// ErrorResponse（'E'）。SQLSTATE と英語メッセージのみを含む最小フィールド構成
 /// （severity 'S'・code 'C'・message 'M' のみ。他テナント・存在情報は含めない）。
+/// `protocol_dispatch::reject_and_close` から呼ばれる `io::Result` 版のラッパー。
+/// `HandshakeError`／`handshake::Result` は本モジュール限定の型のため、モジュール
+/// 境界をまたいで直接公開せず、戻り値を `io::Result` へ写像したこの関数のみを
+/// `pub(crate)` にする（`HandshakeError` 自体は private のまま維持する）。
+pub(crate) fn write_error_response_io(
+    stream: &mut TcpStream,
+    sqlstate: &str,
+    message: &str,
+) -> io::Result<()> {
+    write_error_response(stream, sqlstate, message).map_err(io::Error::from)
+}
+
 fn write_error_response(stream: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -331,8 +343,8 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 
 /// 認証成功後の最小メッセージループ。簡易クエリ（'Q'）には未実装エラー
 /// （SQLSTATE `0A000`）を返してループを継続し、Terminate（'X'）で正常終了する。
-/// それ以外の型（拡張クエリプロトコル等、TASK-71 管轄）は fail-closed で
-/// エラー応答後に接続を切断する。
+/// それ以外の型（拡張クエリプロトコル等）は `protocol_dispatch` へ委譲し、
+/// fail-closed でエラー応答後に接続を切断する（TASK-71・WIRE-8 で正式化済み）。
 ///
 /// `Q`・`X` いずれも構造検証を行う（review 指摘: 構造を検証せず読み捨てるだけでは
 /// フレーミングの曖昧さが残る）。`Q` は単一の NUL 終端文字列（空 body・終端 NUL
@@ -342,8 +354,9 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
 /// `_ctx` は認証成功時に導出された `engine::policy::PolicyContext`（テナント境界・
 /// 可視性判定の唯一の入力経路）をセッション状態として保持し続けるために受け取る
 /// （review 指摘: 破棄すると将来のクエリ実行経路がテナントを再導出する際に
-/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリ実行は TASK-71 の
-/// 管轄で現状は未実装のため、本関数ではまだ参照しない。
+/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリの実処理は
+/// 後続タスク（engine SQL 表層との接続）の管轄で現状は未実装のため、本関数では
+/// まだ参照しない。
 fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) -> Result<()> {
     loop {
         let mut type_byte = [0u8; 1];
@@ -386,15 +399,13 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
                 let _body = read_length_prefixed_body(stream, 4, 4)?;
                 return Ok(());
             }
-            _ => {
-                // 拡張クエリプロトコル等の未対応メッセージ。長さは検証のうえ読み捨て、
-                // fail-closed でエラー応答後に切断する（TASK-71 で正式化予定）。
-                let _body = read_length_prefixed_body(stream, 4, PROVISIONAL_MESSAGE_MAX_LEN)?;
-                write_error_response(
-                    stream,
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "message type is not supported on this connection",
-                )?;
+            other => {
+                // 拡張クエリプロトコル等の未対応メッセージ。対象フレームの body・
+                // 後続のパイプラインは一切読まない（`protocol_dispatch` 側が
+                // 型バイトのみで分類し、ErrorResponse 送出後は有界 lingering close
+                // で未読データを読み捨てる。ポインタ: TASK-71・WIRE-8）。
+                let kind = crate::protocol_dispatch::classify(other);
+                crate::protocol_dispatch::reject_and_close(stream, kind, write_error_response_io)?;
                 return Ok(());
             }
         }
