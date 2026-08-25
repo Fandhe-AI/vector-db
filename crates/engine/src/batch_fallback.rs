@@ -34,7 +34,7 @@
 //!
 //! この誤りは `dispatch.rs::select_execution_path` 側で解消した:
 //! `DispatchInput::for_batch` 経由（本モジュールが使うコンストラクタ）の入力は
-//! 件数・`pending_after_pop` によらず常にバッチ扱いになる（決定表ルール 1。
+//! 件数・`pending_after_pop` によらず常にバッチ扱いになる（CORE-6, 7, 8。
 //! `for_single_query` 経由の入力だけが動的窓判定の対象になる）。これにより本
 //! メソッドは `pending_after_pop: false` を渡すだけでよく（実際、`for_batch` は
 //! この値を判断に使わない）、primary の呼び出し可否は「`self.primary` が
@@ -763,16 +763,17 @@ impl FallbackBatchEngine {
         }
 
         // 実行経路の決定（TASK-155・対象ビヘイビア: CORE-11, CORE-12）。primary が構築
-        // 成功している（[`PrimarySlot::Available`]）場合のみ [`GpuCapability::proven`]
-        // （`pub(crate)` の sealed トークン）を渡す。未検証の GPU capability を
-        // `dispatch` へ持ち込む経路はない（CORE-12）。バッチ経路は件数によらず常に
-        // バッチ扱いになる決定表のルール（`dispatch.rs` モジュールドキュメント参照）
-        // により、`self.primary` が `Available` なら常に primary を試みる・
-        // `Unavailable` なら常に CPU 縮退経路を使うという、以下の分岐が従来持っていた
-        // 挙動をそのまま維持する（旧: 本 `match` 自体が経路選択を担っていたが、
-        // 経路選択の判断自体は `select_execution_path` へ委譲した）。
+        // 成功している（[`PrimarySlot::Available`]）場合のみ、その backend への参照を
+        // witness として [`GpuCapability::proven`] へ渡す（codex-review P1 指摘対応・
+        // PR #158: `proven` は検証済み backend への参照を提示できない限り呼べないため、
+        // 未検証の GPU capability を `dispatch` へ持ち込む経路は構造的にない。CORE-12）。
+        // バッチ経路は件数によらず常にバッチ扱いになる決定表の性質（`dispatch.rs`
+        // モジュールドキュメント参照）により、`self.primary` が `Available` なら常に
+        // primary を試みる・`Unavailable` なら常に CPU 縮退経路を使うという、以下の
+        // 分岐が従来持っていた挙動をそのまま維持する（旧: 本 `match` 自体が経路選択を
+        // 担っていたが、経路選択の判断自体は `select_execution_path` へ委譲した）。
         let gpu = match &self.primary {
-            PrimarySlot::Available(_) => Some(GpuCapability::proven()),
+            PrimarySlot::Available(backend) => Some(GpuCapability::proven(backend.as_ref())),
             PrimarySlot::Unavailable => None,
         };
         let dispatch_input = DispatchInput::for_batch(gpu, self.cpu.dim, queries.len())

@@ -101,18 +101,29 @@ pub fn detect_current_isa() -> DetectedIsa {
 /// GPU バックエンドが実際に利用可能であることを証明する sealed capability トークン
 /// （CORE-12: 未検証の GPU capability を外部から構築させない）。
 ///
-/// `pub(crate)` のコンストラクタ [`GpuCapability::proven`] しか値を作れないため、
-/// `dispatch` モジュール外から任意に `GpuCapability` を偽装することはできない。
+/// コンストラクタ [`GpuCapability::proven`] は「検証済み GPU backend の参照
+/// （`&dyn` [`crate::batch_fallback::BatchBackend`]）を提示できること」を型で
+/// 要求する（codex-review P1 指摘対応・PR #158: 従来は単なる `pub(crate)` の
+/// 引数なし関数だったため、backend を構築していない crate 内の任意モジュールからも
+/// `GpuCapability::proven()` を呼べてしまい、CORE-12 の「未検証 capability を経路
+/// 選択へ持ち込めない」契約を型で保証できていなかった。witness 引数を要求する
+/// ことで、検証済み backend の所有・借用と capability の構築を分離不能にする。
+/// `dispatch` と `batch_fallback` はモジュール階層上の祖先関係にないため
+/// `pub(in ...)` によるモジュール限定は表現できず、この witness 引数方式で
+/// 同等以上の保証（「値を持っている」ことそのものが証明になる）を型で与える）。
 /// 現状唯一の生成元は `batch_fallback.rs::FallbackBatchEngine::build` が primary
-/// backend（[`crate::batch_fallback::BatchBackend`]）の構築に成功した経路のみである。
+/// backend の構築に成功した経路のみである。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GpuCapability(());
 
 impl GpuCapability {
-    /// 呼び出し元が GPU backend の構築成功を確認した後にのみ呼ぶ（`pub(crate)`
-    /// のため crate 外からは呼べない。CORE-12 の「未検証の capability を経路選択へ
-    /// 持ち込めない」という要件を型で保証する）。
-    pub(crate) fn proven() -> Self {
+    /// 呼び出し元が実際に構築成功した GPU backend（`&dyn` [`crate::batch_fallback::
+    /// BatchBackend`]）を提示した場合にのみ呼べる。`pub(crate)` だが、検証済み
+    /// backend への参照を渡せない限り値を作れないため、未検証の capability を経路
+    /// 選択へ持ち込む経路は構造的にない（CORE-12。codex-review P1 指摘対応・
+    /// PR #158）。`_verified_backend` は値そのものを使わない（存在の証明としてのみ
+    /// 使う witness 引数）。
+    pub(crate) fn proven(_verified_backend: &dyn crate::batch_fallback::BatchBackend) -> Self {
         GpuCapability(())
     }
 }
@@ -326,8 +337,8 @@ fn simd_width_for(isa: DetectedIsa) -> SimdWidth {
     }
 }
 
-/// 実行経路選択の決定表本体（CORE-11）。副作用なしの純関数（同一 `input` に対し
-/// 常に同一の `Result` を返す）。
+/// 実行経路選択の決定表本体（TASK-155・対象ビヘイビア: CORE-6, 7, 8, 11, 12）。
+/// 副作用なしの純関数（同一 `input` に対し常に同一の `Result` を返す）。
 ///
 /// `dim`・`batch_size` の 0・上限超過検証は [`DispatchInput`] のコンストラクタ
 /// （[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]）が構築時点で
@@ -335,24 +346,12 @@ fn simd_width_for(isa: DetectedIsa) -> SimdWidth {
 /// `select_execution_path` は `Result` を返すシグネチャを維持する（将来 `input` 以外の
 /// 検証条件が決定表へ加わった場合に呼び出し元のエラーハンドリングを壊さないため）。
 ///
-/// 決定表の行（既存モジュールの判定を吸収する。実装は変更せず、経路選択だけを
-/// ここへ集約する）:
-///
-/// 1. `for_batch` 経由（[`DispatchInput`] の内部 `dim_limit` が `DimLimit::Batch`）
-///    → 件数によらず常にバッチ扱い（`FallbackBatchEngine::batch_search` は呼び出し
-///    時点で既にバッチとして確定した集合を渡すため、2 行目以降の「動的窓」判定は
-///    単発クエリ経路専用であり、バッチ経路には適用しない。CORE-6, 7, 8 の対応行）
-/// 2. `for_single_query` 経由かつ動的窓判定（[`should_aggregate_into_batch`]）が
-///    `false` → 単発クエリとして GPU を使わず CPU-SIMD（CORE-7 の単発クエリ行）
-/// 3. `for_single_query` 経由だが動的窓判定が `true`（後続クエリが控えている）
-///    → バッチ扱いへ昇格する（CORE-7 の動的窓例外行。`for_single_query` は GPU
-///    capability を引数に取らないため、本行が実際に `ExecutionPath::Gpu` へ帰着する
-///    ことは現状ない。動的窓のキュー層を持つ後続タスクのための予約行）
-/// 4. 上記でバッチ扱いになり、かつ GPU capability を保持する → GPU を優先する
-///    （CORE-6 の対応行）
-/// 5. GPU capability を保持しない → 常に CPU-SIMD（CORE-8 の縮退対応行。
-///    `batch_fallback.rs` の実行時縮退とは独立に、事前の経路選択としても
-///    GPU 不能なら最初から CPU-SIMD を選ぶ）
+/// 具体的な判定条件（バッチ経由／単発クエリ経由の別・動的窓判定・GPU capability の
+/// 有無の組み合わせ）は `docs/spec` の対応ビヘイビア（CORE-6, CORE-7, CORE-8）を
+/// 正とする。実装は下記コードの網羅 match が唯一の表現であり、既存モジュール
+/// （`batch_search.rs`／`batch_fallback.rs`）が個別に持っていた判定をここへ集約
+/// しただけで、判定条件そのものは変更していない（CORE-11: 決定表を 1 箇所に保つ
+/// という設計意図）。
 ///
 /// `dtype` は現状 `F32` の 1 variant のみのため経路分岐には寄与しないが、
 /// 網羅 match の対象に含め、将来 variant が増えた際に分岐漏れをコンパイルエラーで
@@ -364,7 +363,7 @@ pub fn select_execution_path(input: DispatchInput) -> Result<ExecutionPath, Disp
         QueryDtype::F32 => {}
     }
 
-    // バッチ扱いにするかどうか。`for_batch` 経由は常にバッチ扱い（上記ルール 1）。
+    // バッチ扱いにするかどうか。`for_batch` 経由は常にバッチ扱い（CORE-6, 7, 8）。
     // `for_single_query` 経由は動的窓判定の吸収（CORE-7）で決まる。
     let treated_as_batch = match input.dim_limit {
         DimLimit::Batch => true,
@@ -393,8 +392,21 @@ mod tests {
     // からは呼べるが `tests/dispatch.rs`（別クレート扱いの結合テスト）からは呼べない
     // （CORE-12: 未検証の GPU capability を crate 外から構築できないことの回帰）。
     // GPU capability を伴う決定表の全網羅走査は、そのため本 unit テスト側に置く。
+    // `proven()` は検証済み backend への witness 参照を要求するため、テストでは
+    // 実際に呼び出されることのないスタブ実装（本体は unreachable）を渡して満たす。
+    struct WitnessOnlyBackend;
+    impl crate::batch_fallback::BatchBackend for WitnessOnlyBackend {
+        fn batch_search(
+            &self,
+            _queries: &[crate::batch_search::BatchQuery<'_>],
+        ) -> Result<Vec<crate::batch_search::BatchHit>, crate::batch_fallback::BatchExecError>
+        {
+            unreachable!("decision-table 網羅テスト用の witness スタブは実行されない")
+        }
+    }
+
     fn gpu() -> GpuCapability {
-        GpuCapability::proven()
+        GpuCapability::proven(&WitnessOnlyBackend)
     }
 
     /// `isa` を任意の [`DetectedIsa`] へ差し替えた [`DispatchInput`] を組み立てる
@@ -423,8 +435,8 @@ mod tests {
     }
 
     /// `for_single_query` 経由は GPU capability を構造的に持てない（引数に取らない）ため、
-    /// 「単発クエリ + pending → GPU 昇格」（決定表ルール 3）が実際に `Gpu` へ帰着する
-    /// ことは現状の公開 API からは起こらない。ルール 3 自体の回帰は、crate 内だけに
+    /// 単発クエリで動的窓判定により GPU 昇格する分岐（CORE-7）が実際に `Gpu` へ帰着する
+    /// ことは現状の公開 API からは起こらない。この分岐自体の回帰は、crate 内だけに
     /// 見える private フィールドの struct-update で「将来 GPU capability を伴う単発
     /// クエリ経路が追加された場合」を模した入力を組み立てて確認する。
     #[test]
@@ -452,7 +464,7 @@ mod tests {
         );
     }
 
-    /// バッチ経路（`for_batch`）は件数によらず常にバッチ扱いになる（決定表ルール 1）。
+    /// バッチ経路（`for_batch`）は件数によらず常にバッチ扱いになる（CORE-6, 7, 8）。
     /// `FallbackBatchEngine::batch_search` は呼び出し時点で既にバッチとして確定した
     /// 集合を渡すため、`batch_size == 1` でも「単発クエリの動的窓判定」は適用しない
     /// （`batch_fallback.rs` の実配線と一致させる回帰）。
@@ -629,7 +641,7 @@ mod tests {
             DetectedIsa::Avx512,
         ];
 
-        // `for_batch`: 件数によらず常にバッチ扱い（ルール 1）。
+        // `for_batch`: 件数によらず常にバッチ扱い（CORE-6, 7, 8）。
         let batch_sizes = [1usize, 2, MAX_BATCH_QUERIES];
         for gpu_present in [false, true] {
             for isa in isa_variants {
