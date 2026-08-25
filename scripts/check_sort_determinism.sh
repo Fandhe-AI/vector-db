@@ -10,7 +10,8 @@
 # へ再混入していないかを、`cargo` を使わない軽量な `grep` ベースで検知する
 # （`check_core_api.sh` と同様、rust-ci ジョブとは独立に実行できる）。
 #
-# 検知対象（行頭コメント `//`・`///`・`//!` は除外し、実コード行のみを走査）:
+# 検知対象（コメント・文字列リテラル・char リテラルは除外し、実コードのみを
+# 走査する。詳細は scan_dir 内コメント参照）:
 #   - `sort_unstable_by(` / `sort_unstable_by_key(`
 #   - `select_nth_unstable_by(` / `select_nth_unstable_by_key(`
 #
@@ -30,7 +31,7 @@
 #
 # `--self-test` は検知パターン自体の回帰テストモード。実ソースを使わずその場で
 # 用意した fixture に対して「検知すべきケースを見逃さない」「許可マーカー付きの行は
-# 誤検知しない」「コメント行・文字列中の一致は誤検知しない」ことを検証する
+# 誤検知しない」「コメント・文字列リテラル中の一致は誤検知しない」ことを検証する
 # （make sort-determinism-check・CI の sort-determinism-check ジョブから呼ばれる）。
 #
 # 使い方: scripts/check_sort_determinism.sh [--self-test]
@@ -48,25 +49,36 @@ elif [ "${1:-}" != "" ]; then
   exit 1
 fi
 
-# `dir` 配下（存在しなければスキップ）の `*.rs` を対象に、非決定的ソート API・
-# 危険な `partial_cmp` 使用を検知する。マッチ行を stdout へ出力し、1 件も
-# 無ければ何も出力しない（呼び出し側が出力有無で成否判定する）。
+# `dir` 配下（存在しなければスキップ）の `*.rs` を対象に、非決定的ソート API の
+# 呼び出しを検知する。マッチ行を stdout へ出力し、1 件も無ければ何も出力しない
+# （呼び出し側が出力有無で成否判定する）。
 #
-# API 名と `(` の間に改行・空白を挟んだ呼び出し（例:
-# `v.sort_unstable_by\n    (|a, b| ...)`）でも検知を回避できないよう、行単位の
-# `grep -E` ではなく `perl` でファイル全体を 1 つの文字列として走査する
-# （2 回目の codex-review P1 指摘対応）。以下を誤検知として除外する:
-#   - 行頭（先頭の空白を許容）が `//` で始まるコメント行
-#   - マッチ開始行〜終了行のいずれかに `// sort-determinism: allow ...`
-#     マーカーを持つ行（複数行にまたがる呼び出しでも終端側のマーカーを許容する）
+# 完全な lexer/parser は持たない軽量チェックだが、単純な「行頭 `//` だけを除外
+# して正規表現を全体適用する」実装は、ブロックコメント (`/* ... */`) や文字列
+# リテラル中の `sort_unstable_by(` を実コードとして誤検知する一方、
+# `sort_unstable_by /* comment */ (` のようにコメントを挟んだ有効な呼び出しは
+# 検知漏れになる（codex-review P2 指摘）。そのため以下の 2 段階で処理する:
+#
+#   1. `mask_non_code` (perl): ファイル全体を走査し、行コメント (`//...`)・
+#      ブロックコメント（`/* ... */`、ネスト対応）・文字列リテラル
+#      （通常/バイト文字列と `r"..."`/`r#"...#"` 等の raw 文字列）・char
+#      リテラル (`'x'`, `'\n'` 等。ライフタイム `'a` とは非貪欲マッチで区別)
+#      の中身を、行・桁位置を保ったまま半角スペースへ置換する（改行はそのまま
+#      保持し、行番号の対応関係を崩さない）。これにより「コメント・文字列内の
+#      誤検知」と「コメントを挟んだ呼び出しの検知漏れ」の両方を同時に解消する
+#      （`\s*` はマスク後の空白へそのまま一致するため、ブロックコメントを挟んだ
+#      呼び出しも 1 つの正規表現でまたいで検知できる）。
+#   2. マスク後のテキストに対して API 呼び出しパターンを走査する（API 名と
+#      `(` の間の改行・空白を許容する `\s*`。2 回目の codex-review P1 指摘対応）。
+#      `// sort-determinism: allow ...` 許可マーカーの判定は、マーカー自体が
+#      コメント中にしか書けないため、マスク前の元テキスト（`@lines`）を参照する。
 #
 # fail-closed: `find`・`perl` の失敗（構文エラー・実行不能・読み取り失敗等）を
-# 握り潰さず scan_dir の非ゼロ終了として呼び出し元へ伝播する（2回目の
-# codex-review P1 指摘対応。従来は `perl ... | sed ...` を素通しし、末尾の
-# `sed` が成功すれば `set -u` のみではパイプライン全体が成功扱いになっていた。
-# `pipefail`（ファイル先頭で有効化）に加え、本関数内では `find`/`perl` を
-# 個別にコマンド置換で実行し `$?` を明示チェックすることで、process
-# substitution 経由でも失敗を確実に検知する）。
+# 握り潰さず scan_dir の非ゼロ終了として呼び出し元へ伝播する（従来は
+# `perl ... | sed ...` を素通しし、末尾の `sed` が成功すれば `set -u` のみでは
+# パイプライン全体が成功扱いになっていた。`pipefail`（ファイル先頭で有効化）に
+# 加え、本関数内では `find`/`perl` を個別にコマンド置換で実行し `$?` を明示
+# チェックすることで、process substitution 経由でも失敗を確実に検知する）。
 scan_dir() {
   local dir="$1"
   if [ ! -d "${dir}" ]; then
@@ -88,18 +100,80 @@ scan_dir() {
   while IFS= read -r file; do
     local out
     out="$(perl -0777 -ne '
-      my @lines = split /\n/, $_, -1;
-      # 行頭コメント行（`//`・`///`・`//!`）を除いた「実コード」だけを 1 本の
-      # 文字列へ結合し、結合後の各文字位置が元のどの行番号に属するかを保持する。
-      # これにより `sort_unstable_by\n    (` のように API 名と `(` の間に改行や
-      # 空白を挟んだ呼び出しも 1 つの正規表現でまたいで検知できる。
+      # 行コメント・ブロックコメント・文字列/char リテラルの中身を、行・桁位置を
+      # 保ったまま半角スペースへ置換する（改行は保持）。戻り値は元テキストと
+      # 同じ長さ・同じ行数の文字列。
+      sub mask_non_code {
+        my ($s) = @_;
+        my $out = "";
+        pos($s) = 0;
+        my $len = length($s);
+        while (pos($s) < $len) {
+          if ($s =~ /\G\/\/[^\n]*/gc) {
+            $out .= (" " x length($&));
+          } elsif ($s =~ /\G\/\*/gc) {
+            my $depth = 1;
+            $out .= "  ";
+            while ($depth > 0 && pos($s) < $len) {
+              if ($s =~ /\G\/\*/gc) { $depth++; $out .= "  "; }
+              elsif ($s =~ /\G\*\//gc) { $depth--; $out .= "  "; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              else { last; }
+            }
+          } elsif ($s =~ /\Gb?r(#*)"/gc) {
+            my $hashes = $1;
+            $out .= (" " x length($&));
+            my $closing = "\"" . $hashes;
+            while (pos($s) < $len) {
+              if ($s =~ /\G\Q$closing\E/gc) { $out .= (" " x length($closing)); last; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              else { last; }
+            }
+          } elsif ($s =~ /\Gb?"/gc) {
+            $out .= (" " x length($&));
+            while (pos($s) < $len) {
+              if ($s =~ /\G\\(.)/gcs) {
+                # エスケープシーケンス（`\n` 等）を 2 文字消費する。第 2 文字が
+                # 改行そのもの（行末 `\` による Rust の行継続エスケープ）の場合は
+                # 半角スペースへ潰さず改行として保持しないと、マスク後テキストの
+                # 行数が元テキストとずれてしまう（`.` が `/s` 修飾子で改行にも
+                # マッチするための復元漏れ。self-test fixture では未再現の実
+                # ソースで顕在化したバグ）。
+                $out .= " " . ($1 eq "\n" ? "\n" : " ");
+              }
+              elsif ($s =~ /\G"/gc) { $out .= " "; last; }
+              elsif ($s =~ /\G(\n)/gc) { $out .= "\n"; }
+              elsif ($s =~ /\G./gcs) { $out .= " "; }
+              else { last; }
+            }
+          } elsif ($s =~ /\G'"'"'(?:\\.|[^'"'"'\\\n])'"'"'/gc) {
+            $out .= (" " x length($&));
+          } elsif ($s =~ /\G(\n)/gc) {
+            $out .= "\n";
+          } elsif ($s =~ /\G(.)/gcs) {
+            $out .= $1;
+          } else {
+            last;
+          }
+        }
+        return $out;
+      }
+
+      my $orig = $_;
+      my $masked = mask_non_code($orig);
+      my @lines = split /\n/, $orig, -1;
+      my @masked_lines = split /\n/, $masked, -1;
+      if (scalar(@lines) != scalar(@masked_lines)) {
+        die "mask_non_code produced a different line count than the input (masking bug)\n";
+      }
+
       my $joined = "";
       my @lineno_of_pos;
-      for my $i (0 .. $#lines) {
+      for my $i (0 .. $#masked_lines) {
         my $ln = $i + 1;
-        my $line = $lines[$i];
-        next if $line =~ m{^\s*//};
-        my $text = $line . "\n";
+        my $text = $masked_lines[$i] . "\n";
         push @lineno_of_pos, ($ln) x length($text);
         $joined .= $text;
       }
@@ -159,6 +233,25 @@ fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by   (|a, b| a.cmp(b));
 }
 EOF
+  # fixture 7: 検知すべきケース（API 名と `(` の間にブロックコメントを挟んだ
+  # 呼び出し。テキスト走査ではコメントを挟む呼び出しを検知漏れしうるという
+  # codex-review P2 指摘の再現ケース）。
+  cat >"${tmp}/detect_block_comment_split.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    v.sort_unstable_by /* score-order tie-break */ (|a, b| a.cmp(b));
+}
+EOF
+  # fixture 10: 検知すべきケース（行末 `\` による Rust の行継続エスケープを
+  # 含む文字列リテラルの直後に実コードがある場合。マスク処理が改行を正しく
+  # 保持できず行番号がずれるバグの再現ケース。この呼び出し自体は文字列の外の
+  # 実コードなので検知しなければならない）。
+  cat >"${tmp}/detect_after_string_continuation.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    let _msg = "foo \
+        bar";
+    v.sort_unstable_by(|a, b| a.cmp(b));
+}
+EOF
   # fixture 3: 検知してはならないケース（コメント行・許可マーカー・整数の
   # sort_unstable（引数なし、パターン対象外）・文字列全体としての言及）。
   cat >"${tmp}/allowed.rs" <<'EOF'
@@ -174,6 +267,25 @@ EOF
 fn f(v: &mut Vec<i32>) {
     v.sort_unstable_by
         (|a, b| a.cmp(b)); // sort-determinism: allow 全順序の整数比較のみ
+}
+EOF
+  # fixture 8: 検知してはならないケース（文字列リテラル中の言及。テキスト
+  # 走査ではコメント・文字列リテラルを実コードと区別できないという
+  # codex-review P2 指摘の再現ケース）。
+  cat >"${tmp}/allowed_string_literal.rs" <<'EOF'
+fn f() -> &'static str {
+    "call v.sort_unstable_by(|a, b| a.cmp(b)) is forbidden by lint"
+}
+EOF
+  # fixture 9: 検知してはならないケース（ブロックコメント中の言及。単一行・
+  # 複数行の両方を確認する）。
+  cat >"${tmp}/allowed_block_comment.rs" <<'EOF'
+fn f(v: &mut Vec<i32>) {
+    /* do not call v.sort_unstable_by(|a, b| a.cmp(b)) here */
+    /* multi-line block comment mentioning
+       v.sort_unstable_by(|a, b| a.cmp(b))
+       across several lines */
+    v.sort_by(|a, b| a.cmp(b));
 }
 EOF
 
@@ -200,8 +312,16 @@ EOF
     echo "FAIL: self-test did not detect sort_unstable_by with whitespace before '(' in detect_whitespace.rs" >&2
     failed=1
   fi
-  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs"; then
-    echo "FAIL: self-test false-positive on allowed*.rs (comment / allow-marker / sort_unstable without comparator should not match)" >&2
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_block_comment_split.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by split by a block comment in detect_block_comment_split.rs" >&2
+    failed=1
+  fi
+  if ! printf '%s\n' "${local_detected}" | grep -q "detect_after_string_continuation.rs.*sort_unstable_by"; then
+    echo "FAIL: self-test did not detect sort_unstable_by after a string literal with a line-continuation escape in detect_after_string_continuation.rs" >&2
+    failed=1
+  fi
+  if printf '%s\n' "${local_detected}" | grep -q "allowed.rs\|allowed_multiline.rs\|allowed_string_literal.rs\|allowed_block_comment.rs"; then
+    echo "FAIL: self-test false-positive on allowed*.rs (comment / allow-marker / string literal / sort_unstable without comparator should not match)" >&2
     echo "--- detected ---" >&2
     printf '%s\n' "${local_detected}" >&2
     failed=1
