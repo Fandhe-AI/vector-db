@@ -31,6 +31,15 @@
 //! [`PrefilterIndex`] と同じく「呼び出しテナントの可視行数・バイト量」基準で検査する
 //! （両型とも他テナントのデータ量が対象テナントの検索可用性へ干渉しない契約で揃えている。
 //! 詳細は [`SearchTimeFilter`] のドキュメント参照）。
+//!
+//! 本モジュールはさらに [`ImplicitRlsHook`]（TASK-137・対象ビヘイビア: RLS-6, RLS-7。
+//! ポインタ: `docs/spec/05-tasks.md` TASK-137・`docs/spec/04-behavior/rls.md`）を提供する。
+//! 認証済みセッションからサーバー側で導出された `PolicyContext`（導出自体は
+//! `wire-server/src/auth.rs`・TASK-67 の管轄）だけを入力とし、
+//! `core.rs::EngineCore::search`/`get_row`・`sql/exec.rs::execute_statement`
+//! の候補集合構築への単一注入点である。判定ロジック自体は新設せず
+//! [`crate::policy::PolicyContext::is_visible`] へ委譲するだけに留める
+//! （テナント比較の分岐を増やさない・security.md P0）。
 
 use std::collections::HashSet;
 
@@ -41,7 +50,44 @@ use crate::catalog::CatalogError;
 use crate::core::{provider_result_is_valid, validate_search_k, MAX_SEARCH_K};
 use crate::kernel::{self, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
-use crate::storage::Storage;
+use crate::storage::{Storage, Visibility};
+
+/// RLS-6 / RLS-7 の暗黙適用フック（TASK-137）。
+///
+/// 認証済みセッションから導出済みの [`PolicyContext`] だけを束縛し、候補集合構築時の
+/// 可視性フィルタ適用への単一注入点。呼び出し元は
+/// `core.rs::EngineCore::search`/`get_row` と `sql/exec.rs::execute_statement`。
+/// コンストラクタ・メソッドのいずれも `PolicyContext` 以外の入力を受け取らない。
+#[must_use]
+pub struct ImplicitRlsHook<'c> {
+    ctx: &'c PolicyContext,
+}
+
+impl<'c> ImplicitRlsHook<'c> {
+    /// 認証済みセッションから導出済みの `ctx` を束縛する。
+    pub fn new(ctx: &'c PolicyContext) -> Self {
+        Self { ctx }
+    }
+
+    /// 束縛済みの `PolicyContext`（読み取り専用）。
+    pub fn context(&self) -> &'c PolicyContext {
+        self.ctx
+    }
+
+    /// 単点判定（`core.rs::EngineCore::get_row` 等）。
+    /// [`PolicyContext::is_visible`] へ委譲するだけで独自比較を持たない。
+    pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
+        self.ctx.is_visible(row_tenant, row_visibility)
+    }
+
+    /// 候補集合構築（`VectorArena::build_filtered`・
+    /// `build_filtered_with_rows_in_txn` 系）へそのまま渡せる述語を返す。
+    /// 返す関数も `PolicyContext` 以外の入力を一切持たない。
+    pub fn predicate(&self) -> impl Fn(&str, Visibility) -> bool + 'c {
+        let ctx = self.ctx;
+        move |tenant, visibility| ctx.is_visible(tenant, visibility)
+    }
+}
 
 /// [`PrefilterIndex`] のエラー型。`core.rs::CoreError` とおおむね対称の設計だが、
 /// `Policy` は持たず（`PolicyContext` の構築時検証は呼び出し元の責務で本モジュールには
@@ -1856,5 +1902,41 @@ mod tests {
         let filter = SearchTimeFilter::build(&storage, "docs").expect("build filter");
         assert_eq!(filter.dim(), 3);
         assert_eq!(filter.table_name(), "docs");
+    }
+
+    // TASK-137: フックは独自比較を持たず `PolicyContext::is_visible` へ
+    // 委譲するだけであることを確認する。
+    #[test]
+    fn implicit_hook_delegates_to_policy_context_is_visible() {
+        let ctx = PolicyContext::with_visibilities("tenant-a", [Visibility::Public])
+            .expect("valid tenant");
+        let hook = ImplicitRlsHook::new(&ctx);
+
+        for tenant in ["tenant-a", "tenant-b"] {
+            for visibility in [Visibility::Public, Visibility::Private] {
+                assert_eq!(
+                    hook.is_visible(tenant, visibility),
+                    ctx.is_visible(tenant, visibility)
+                );
+                assert_eq!(
+                    (hook.predicate())(tenant, visibility),
+                    ctx.is_visible(tenant, visibility)
+                );
+            }
+        }
+        assert_eq!(hook.context() as *const PolicyContext, &ctx as *const _);
+    }
+
+    // TASK-137: fail-closed の回帰確認。
+    #[test]
+    fn implicit_hook_never_admits_other_tenant_private_rows() {
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let hook = ImplicitRlsHook::new(&ctx);
+
+        assert!(hook.is_visible("tenant-a", Visibility::Private));
+        assert!(!hook.is_visible("tenant-b", Visibility::Private));
+        assert!(hook.is_visible("tenant-b", Visibility::Public));
     }
 }
