@@ -17,6 +17,8 @@
 //! ハッシュ（`22023`）は TASK-101 の管轄。本モジュールは「既存エントリを上書きしない
 //! （keep-first）」ことだけを恒久契約として担保する。
 
+use std::ops::Bound;
+
 use redb::{ReadableTable, TableDefinition, TableHandle};
 
 use crate::recovery::required_op_id::OperationId;
@@ -175,12 +177,16 @@ pub(crate) fn record_in_txn(
 /// 破って空テーブルを commit してしまう（Issue #226 レビュー対応・Cursor Bugbot
 /// 指摘）。そのため `list_tables` で存在確認してから `open_table` する。
 ///
-/// キー先頭が `tenant_id` のため `table_name` 単独の range 走査はできない。全件
-/// 走査は避けられないが、1 回の走査・削除で保持するキー集合は
-/// [`DELETE_BATCH_SIZE`] 件までに有界化し、対象が尽きるまで走査を繰り返す
-/// （長期利用テーブルの `DROP TABLE` で台帳サイズに比例した無制限メモリを一度に
-/// 要求しないようにするため。Issue #226 レビュー対応・codex-review 指摘。行データ
-/// そのものへはアクセスしない）。
+/// キー先頭が `tenant_id` のため `table_name` 単独の range 走査はできず、台帳全体の
+/// 走査は避けられない。ただし 1 回の走査・削除で保持するキー集合は
+/// [`DELETE_BATCH_SIZE`] 件までに有界化する（長期利用テーブルの `DROP TABLE` で
+/// 台帳サイズに比例した無制限メモリを一度に要求しないようにするため。Issue #226
+/// レビュー対応・codex-review 指摘。行データそのものへはアクセスしない）。
+///
+/// 走査は毎回先頭からやり直すのではなく、直前に処理したキーの**次**から
+/// `range` を再開する（前方一方向）。再開点より手前のキーは「対象外（走査済みで
+/// 残す）」か「対象（削除済み）」のいずれかで再訪の必要がないため、台帳全体で
+/// 線形 1 パスに収まり、バッチ化による二次オーダー化を避けられる。
 pub(crate) fn delete_table_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
@@ -193,28 +199,46 @@ pub(crate) fn delete_table_in_txn(
         return Ok(());
     }
 
+    // 同一 write txn 内で同じテーブルを二重に `open_table` すると
+    // `TableAlreadyOpen` になるため、ハンドルはループ外で 1 度だけ取得する。
+    let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+    // 直前バッチで最後に処理したキー（次バッチの走査再開点。上記ドキュメント参照）。
+    let mut resume_after: Option<(String, String, String)> = None;
     loop {
-        let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
         let mut keys_to_remove: Vec<(String, String, String)> = Vec::new();
-        for entry in ledger_table.iter()? {
-            let (k, _v) = entry?;
-            let (tenant_id, table_name, op_id) = k.value();
-            if table_name == table {
-                keys_to_remove.push((
-                    tenant_id.to_string(),
-                    table_name.to_string(),
-                    op_id.to_string(),
-                ));
-                if keys_to_remove.len() >= DELETE_BATCH_SIZE {
-                    break;
+        let mut reached_batch_limit = false;
+        {
+            let lower = match resume_after.as_ref() {
+                Some((tenant_id, table_name, op_id)) => {
+                    Bound::Excluded((tenant_id.as_str(), table_name.as_str(), op_id.as_str()))
+                }
+                None => Bound::Unbounded,
+            };
+            let iter = ledger_table.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
+            for entry in iter {
+                let (k, _v) = entry?;
+                let (tenant_id, table_name, op_id) = k.value();
+                if table_name == table {
+                    keys_to_remove.push((
+                        tenant_id.to_string(),
+                        table_name.to_string(),
+                        op_id.to_string(),
+                    ));
+                    if keys_to_remove.len() >= DELETE_BATCH_SIZE {
+                        // 走査を打ち切る位置＝直前に push したキー。次バッチはこの
+                        // キーの次から再開する。
+                        reached_batch_limit = true;
+                        break;
+                    }
                 }
             }
         }
-        if keys_to_remove.is_empty() {
-            break;
-        }
+        resume_after = keys_to_remove.last().cloned();
         for (tenant_id, table_name, op_id) in &keys_to_remove {
             ledger_table.remove((tenant_id.as_str(), table_name.as_str(), op_id.as_str()))?;
+        }
+        if !reached_batch_limit {
+            break;
         }
     }
     Ok(())
@@ -496,5 +520,70 @@ mod tests {
                 .any(|name| name == OP_LEDGER_TABLE.name()),
             "delete_table_in_txn must not create op_ledger as a side effect: {table_names:?}"
         );
+    }
+
+    // (i) DELETE_BATCH_SIZE を超える件数の対象エントリでも、バッチ分割走査が
+    // 打ち切られずに全件削除され、他テーブル名のエントリは残る（Issue #226
+    // レビュー対応・codex-review 指摘のメモリ有界化に伴う複数バッチ経路の回帰
+    // テスト。テナントを跨いだ削除である契約も同時に確認する）。
+    #[test]
+    fn delete_table_in_txn_removes_entries_across_multiple_batches() {
+        let path = unique_db_path("ledger-i");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        // 対象テーブル分は 2 テナントに分散させ、合計で DELETE_BATCH_SIZE を超えさせる。
+        let per_tenant = DELETE_BATCH_SIZE + 7;
+        let write_txn = db.begin_write().expect("begin write");
+        for tenant in ["tenant-a", "tenant-b"] {
+            for i in 0..per_tenant {
+                record_in_txn(
+                    &write_txn,
+                    tenant,
+                    "documents",
+                    LedgerWrite::Record(&op(&format!("op-{i:06}"))),
+                )
+                .expect("record");
+            }
+        }
+        // 削除対象外（別テーブル名）。キー順で対象の前後どちらにも現れるようにする。
+        for table in ["alpha_table", "zeta_table"] {
+            for i in 0..3 {
+                record_in_txn(
+                    &write_txn,
+                    "tenant-a",
+                    table,
+                    LedgerWrite::Record(&op(&format!("op-{i:06}"))),
+                )
+                .expect("record");
+            }
+        }
+        write_txn.commit().expect("commit");
+
+        let write_txn = db.begin_write().expect("begin write");
+        delete_table_in_txn(&write_txn, "documents").expect("delete_table_in_txn");
+        write_txn.commit().expect("commit");
+
+        let read_txn = db.begin_read().expect("begin read");
+        for tenant in ["tenant-a", "tenant-b"] {
+            for i in 0..per_tenant {
+                let found = contains_in_read_txn(
+                    &read_txn,
+                    tenant,
+                    "documents",
+                    &op(&format!("op-{i:06}")),
+                )
+                .expect("contains");
+                assert!(!found, "target entry must be removed: {tenant} op-{i:06}");
+            }
+        }
+        for table in ["alpha_table", "zeta_table"] {
+            for i in 0..3 {
+                let found =
+                    contains_in_read_txn(&read_txn, "tenant-a", table, &op(&format!("op-{i:06}")))
+                        .expect("contains");
+                assert!(found, "other table entry must survive: {table} op-{i:06}");
+            }
+        }
     }
 }
