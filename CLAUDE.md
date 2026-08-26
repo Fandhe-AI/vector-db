@@ -9,7 +9,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - クレート構成: `engine`（コアロジック）＋ `wire-server`（lib+bin）の workspace（`crates/`）
 - 永続化: `redb` ベース / 安全性: RLS 相当のテナント境界・fail-closed のエラー契約（`wire_code`）
 - 依存は最小・`=x.y.z` 完全固定・ユーザー承認制（[dependency-policy](.claude/rules/dependency-policy.md)）
-- ステータス: workspace 雛形構築済み（TASK-66）。wire プロトコル層は実装済み（TASK-67・TASK-68・TASK-69・TASK-70・TASK-71）。SQL 表層は許可リスト検証（TASK-74）・束縛と実行計画（TASK-75）・取得モード切替構文（TASK-161）・`precision` モードの実行契約（TASK-162）・宣言的 UDF 呼び出し（TASK-79）・宣言的フィルタ API（TASK-147）まで実装済み。簡易クエリプロトコルを SQL 表層へ接続（TASK-73・WIRE-1）。`precision` モードの評価ハーネス実装済み（TASK-163。目標値の確定はユーザー判断待ち・`.github/workflows/recall.yml` 未接続）。モード切替・`precision` 契約の wire 経由 3 クライアント検証実装済み（TASK-165・SQL-12・SEARCH-9）。RLS 暗黙適用の全読み取り経路一般化検証を実施済み（TASK-138）。障害回復の `operation_id` 必須化ガード実装済み（TASK-92）。他は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜165）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
+- ステータス: workspace 雛形構築済み（TASK-66）。wire プロトコル層は実装済み（TASK-67・TASK-68・TASK-69・TASK-70・TASK-71）。SQL 表層は許可リスト検証（TASK-74）・束縛と実行計画（TASK-75）・取得モード切替構文（TASK-161）・`precision` モードの実行契約（TASK-162）・宣言的 UDF 呼び出し（TASK-79）・宣言的フィルタ API（TASK-147）まで実装済み。簡易クエリプロトコルを SQL 表層へ接続（TASK-73・WIRE-1）。`precision` モードの評価ハーネス実装済み（TASK-163。目標値の確定はユーザー判断待ち・`.github/workflows/recall.yml` 未接続）。モード切替・`precision` 契約の wire 経由 3 クライアント検証実装済み（TASK-165・SQL-12・SEARCH-9）。RLS 暗黙適用の全読み取り経路一般化検証を実施済み（TASK-138）。障害回復の `operation_id` 必須化ガード実装済み（TASK-92）。エラー契約 `wire_code` 写像の共通分類実装済み（TASK-152・ERR-2）。他は未実装（タスクは spec リポの `05-tasks.md`（TASK-66〜165）、マイルストーンは `06-roadmap.md`（MS-1〜6）参照）
 
 ## Repository Structure
 
