@@ -7,15 +7,15 @@ name: Bench
 #
 # schedule トリガ（毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
 # 独立した時間帯にする）は #168 で再追加済み。BENCH_MAX_P95_MS・BENCH_MIN_RECALL・
-# BENCH_BATCH_MAX_DEGRADATION_PCT の repo variables 未設定のまま schedule 実行された
-# 場合は `parallel_bench.rs` / `batch_bench.rs` 側の fail-closed により run が red に
-# なる（「一度も評価していない run」が green として埋もれることはない）。CORE-5
-# （対照エンジンとの中央値比較）は対照エンジンクレートの導入承認待ちで未接続のため
-# 引き続き Issue #176 で追跡し、`BENCH_CORE5` repo variable が未設定（既定）の間は
-# 「対象外」として合否判定から明示的に除外する opt-in 方式を維持する（`parallel_bench.rs`
-# 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）も
-# 実 GPU バックエンド未接続のため Issue #178 で追跡し、同様に opt-in のまま維持する
-# （`batch_bench.rs` 冒頭コメント参照）。
+# BENCH_BATCH_MAX_DEGRADATION_PCT・BENCH_MAX_CONTRAST_RATIO の repo variables 未設定の
+# まま schedule 実行された場合は `parallel_bench.rs` / `batch_bench.rs` /
+# `contrast_bench.rs` 側の fail-closed により run が red になる（「一度も評価していない
+# run」が green として埋もれることはない）。CORE-5（対照エンジンとの p95 レイテンシ比）は
+# usearch を対照エンジンとして接続済み（TASK-127・Issue #176）で、bench-contrast ジョブ
+# （下記）が既定ゲートとして実測する。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs
+# f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡し、`BENCH_CORE6`・
+# `BENCH_CORE16` repo variable による opt-in のまま維持する（`batch_bench.rs`
+# 冒頭コメント参照）。
 #
 # bench-c1（TASK-83・Conditional Go 条件7）は workflow_dispatch 限定とし、上記
 # schedule には含めない。GitHub ホステッド runner は共有 2 vCPU の非専有環境であり、
@@ -63,15 +63,39 @@ jobs:
         # 数値そのものは載せない——`crates/engine/benches/parallel_bench.rs` が
         # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
         # BENCH_MIN_RECALL が未設定の場合は `parallel_bench.rs` 側が fail-closed で
-        # 非ゼロ終了する。BENCH_CORE5 は repo variable が未設定（既定）なら CORE-5 を
-        # 対象外として扱う opt-in フラグで、CORE-5 接続後（Issue #176）にリポジトリ
-        # 管理者が `gh variable set BENCH_CORE5 1` で有効化する想定（`parallel_bench.rs`
-        # 冒頭コメント参照）。
+        # 非ゼロ終了する。CORE-5（対照エンジン比較）は `contrast_bench.rs`（下記
+        # bench-contrast ジョブ）が独立バイナリとして判定する（Issue #176）。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
-          BENCH_CORE5: ${{ vars.BENCH_CORE5 }}
         run: make bench-parallel
+
+  # --------------------------------------------------
+  # bench-contrast（TASK-127 CORE-5 対照エンジン接続。Issue #176）
+  # --------------------------------------------------
+  # `contrast_bench.rs` は `usearch`（`contrast-bench` feature 限定の optional 依存）を
+  # C++ FFI 経由でビルドするため、CORE-3/CORE-4（bench-parallel ジョブ）とは独立した
+  # ジョブに分離してある（対照エンジン側の障害・ビルド失敗が CORE-3/CORE-4 のゲートへ
+  # 波及しない failure domain 分離。`Cargo.toml` の `contrast-bench` feature コメント
+  # 参照）。既定ゲート化（BENCH_CORE5 opt-in の撤去）は本 Issue #176 の目的の一つ。
+  bench-contrast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-contrast
+        # 数値基準（p95 レイテンシ比の上限）は spec（TASK-127・CORE-5）が SSOT のため
+        # 本ワークフローにはハードコードしない。BENCH_MAX_CONTRAST_RATIO が未設定の場合は
+        # `contrast_bench.rs` 側が fail-closed で非ゼロ終了する（variable 未設定のまま
+        # schedule run が実行された場合も red になり、false green にはならない）。
+        env:
+          BENCH_MAX_CONTRAST_RATIO: ${{ vars.BENCH_MAX_CONTRAST_RATIO }}
+        run: make bench-contrast
 
   # --------------------------------------------------
   # bench-batch（TASK-130 回帰ベンチ実行）
