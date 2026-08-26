@@ -10,6 +10,7 @@ pub mod chunking;
 pub mod core;
 pub mod declarative_filter;
 pub mod dispatch;
+pub mod gpu_batch;
 pub mod hybrid;
 pub mod isa;
 pub mod kernel;

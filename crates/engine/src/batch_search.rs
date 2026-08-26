@@ -690,6 +690,15 @@ impl ResidentMatrix {
         self.dim
     }
 
+    /// パック済み行列（行優先・`row_count() * dim().div_ceil(2)` 要素）への
+    /// 読み取り専用参照。`gpu_batch.rs::GpuBatchBackend` が GPU の STORAGE
+    /// バッファへアップロードする実データとして使う（TASK-128〜130・Issue #178
+    /// ポインタ）。CPU 参照実装（[`Self::row_f32_into`]）と表現を共有するだけで、
+    /// 本メソッド自体はデコードを行わない。
+    pub(crate) fn packed(&self) -> &[u32] {
+        &self.packed
+    }
+
     /// 行 `idx` を f16 往復で復元し、呼び出し元が用意したバッファへ書き込む
     /// （積和計算専用。格納表現自体は f32 のまま別途保持する呼び出し元の責務で
     /// あり、本メソッドはバッチスコア計算のためだけに使う）。バッファを

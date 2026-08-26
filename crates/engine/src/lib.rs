@@ -69,6 +69,12 @@
 //! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
 //! （詳細は `sql.rs` モジュールドキュメント参照）。
 //!
+//! TASK-128〜130（対象ビヘイビア: CORE-6, CORE-8, CORE-16。ポインタ: Issue #178）:
+//! `gpu_batch.rs` が `wgpu`（=30.0.1。**依存追加はオーナー承認待ち**。
+//! `crates/engine/Cargo.toml` コメント参照）を用いた実 GPU バックエンドを提供し、
+//! `batch_fallback.rs::FallbackBatchEngine::build_with_gpu` から primary として
+//! 差し込める（詳細は `gpu_batch.rs` モジュールドキュメント参照）。
+//!
 //! TASK-161（対象ビヘイビア: SQL-12）: `sql::mode` が取得モード（`recall`／
 //! `precision`）の構文（`USING MODE` 句・`SET search_mode`）・優先順位解決
 //! （クエリ句 > セッション変数 > 既定）・接続単位の `SessionState` を提供する。
@@ -151,6 +157,7 @@ pub mod chunking;
 pub mod core;
 pub mod declarative_filter;
 pub mod dispatch;
+pub mod gpu_batch;
 pub mod hybrid;
 pub mod isa;
 pub mod kernel;

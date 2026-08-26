@@ -624,3 +624,29 @@ fn batch_search_and_fallback_both_include_other_tenant_public_rows() {
         "BatchEngine and FallbackBatchEngine（CPU 縮退経路）must agree on TABLE-9 visibility"
     );
 }
+
+// 実 GPU バックエンド（`gpu_batch.rs::GpuBatchBackend`。TASK-128〜130・Issue #178
+// ポインタ）を primary として構築する回帰テスト。GPU の有無を問わず
+// `build_with_gpu` 自体が panic せず成立すること（初期化失敗時は CPU 専用
+// モードへ fail-closed に縮退する契約。詳細な GPU 分岐の正しさ・テナント
+// 混入 0 件の検証は `tests/gpu_batch.rs` が担う）。
+#[test]
+fn build_with_gpu_constructs_successfully_regardless_of_gpu_availability() {
+    let (ids, tenant_ids, visibilities, dim, vectors) = fixture();
+    let observer = RecordingObserver::default();
+    let engine =
+        FallbackBatchEngine::build_with_gpu(&ids, &tenant_ids, &visibilities, dim, &vectors, Box::new(observer))
+            .expect("build_with_gpu should not fail regardless of gpu availability (CORE-8 fail-closed init contract)");
+
+    let ctx_a = ctx("tenant-a");
+    let query = [1.0f32, 0.0];
+    let queries = vec![BatchQuery {
+        vector: &query,
+        k: 4,
+        ctx: &ctx_a,
+    }];
+    let hits = engine
+        .batch_search(&queries)
+        .expect("batch_search should succeed via gpu primary or cpu fallback");
+    assert_eq!(hits.len(), 1);
+}
