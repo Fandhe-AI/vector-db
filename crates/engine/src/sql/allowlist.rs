@@ -436,8 +436,10 @@ impl ValidatedStatement {
 /// 文が増えても [`ValidatedStatement`] 自体は SELECT 専用の構造を保つため、
 /// 統一的な enum で包む。
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `CreateFunction`
-/// variant を追加した。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// variant を追加した。`Aggregate` variant が `GroupByClause`（TASK-167・SQL-14）
+/// 経由で `f64`（HAVING リテラル）を保持するため `Eq` は導出しない
+/// （`PartialEq` のみ。`Statement` の値比較はテストでのみ使う）。
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(ValidatedStatement),
     /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）。カタログ照会を必要と
@@ -516,20 +518,72 @@ pub struct AggregateItem {
     pub(crate) alias: Option<String>,
 }
 
-/// 許可形状の構造判定を通過した集計 `SELECT` 文（TASK-166・SQL-13）。
-/// [`ValidatedStatement`] と同様、本モジュールが保証するのはここまでの構造情報のみで、
-/// 列名・式の意味論的妥当性は検証しない（`sql::parser::bind_aggregate` の責務）。
+/// 集計 `SELECT` リストの 1 項目（TASK-167・SQL-14 で `AggregateItem` 単独から拡張）。
+/// `GroupKey` は `GROUP BY` 句がある場合にのみ現れ、`GROUP BY` 列と同名の裸の
+/// 識別子（任意で `AS <alias>`）だけを構造上受理する（`allowlist::Parser::parse_select_item`
+/// ではなく [`Parser::parse_aggregate_select_item`] が列名一致を検査する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateSelectItem {
+    Aggregate(AggregateItem),
+    /// `column` は SELECT リストに書かれた識別子そのもの（構文解析時点では
+    /// まだ `GROUP BY` 句を読んでいないため）。`GROUP BY` 句の列名と一致するかは
+    /// [`parse_aggregate_shape`] が全体を読み終えた後に検査する。
+    GroupKey {
+        column: String,
+        alias: Option<String>,
+    },
+}
+
+/// `HAVING` 述語 1 つ（TASK-167・SQL-14）。左辺は SELECT リストに現れる集計項目の
+/// 実効名（別名または既定名）への参照のみを許可し、右辺は数値リテラルに限定する
+/// （集計関数呼び出し形の直接記述・列同士の比較・文字列リテラルはいずれも許可
+/// リスト外）。意味論的な名前解決（存在確認・型検査）は
+/// `sql::parser::bind_aggregate` の責務。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HavingPredicate {
+    pub(crate) item_name: String,
+    pub(crate) op: BinOp,
+    pub(crate) literal: f64,
+}
+
+/// `GROUP BY` 集計の `ORDER BY` 対象（TASK-167・SQL-14）。`GROUP BY` 列名、または
+/// SELECT リストの集計項目の実効名のいずれかの識別子を指す（解決は
+/// `sql::parser::bind_aggregate`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateOrderBy {
+    pub(crate) target: String,
+    pub(crate) descending: bool,
+}
+
+/// `GROUP BY <column> [HAVING ...] [ORDER BY ...] [LIMIT ...]`（TASK-167・SQL-14）の
+/// 許可形状。`column` はカタログ照会前の識別子のまま保持し（`TEXT` 列限定等の
+/// 意味論的検査は束縛段）、`having`/`order_by`/`limit` はいずれも省略可能。
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupByClause {
+    pub(crate) column: String,
+    pub(crate) having: Vec<HavingPredicate>,
+    pub(crate) order_by: Option<AggregateOrderBy>,
+    pub(crate) limit: Option<u32>,
+}
+
+/// 許可形状の構造判定を通過した集計 `SELECT` 文（TASK-166・SQL-13。TASK-167・
+/// SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` を追加）。[`ValidatedStatement`]
+/// と同様、本モジュールが保証するのはここまでの構造情報のみで、列名・式の
+/// 意味論的妥当性は検証しない（`sql::parser::bind_aggregate` の責務）。
 /// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可。カプセル化の方針は
 /// [`ValidatedStatement`] と同じ）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedAggregate {
     /// FROM に指定され、カタログ存在確認を通過したテーブル名。
     pub(crate) table_name: String,
-    /// 集計項目リスト（`SELECT` リスト順。1..=[`MAX_AGGREGATE_ITEMS`]）。
-    pub(crate) items: Vec<AggregateItem>,
+    /// SELECT リスト項目（順序保持。1..=[`MAX_AGGREGATE_ITEMS`]）。
+    pub(crate) items: Vec<AggregateSelectItem>,
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。既存の
     /// [`ValidatedStatement::where_predicates`] と同一の許可形状を再利用する。
     pub(crate) where_predicates: Vec<WherePredicate>,
+    /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら TASK-166・SQL-13 の
+    /// 単一行集計（既存の受理形）のまま。
+    pub(crate) group_by: Option<GroupByClause>,
 }
 
 impl ValidatedAggregate {
@@ -538,14 +592,19 @@ impl ValidatedAggregate {
         &self.table_name
     }
 
-    /// 集計項目リスト（`SELECT` リスト順）。
-    pub fn items(&self) -> &[AggregateItem] {
+    /// SELECT リスト項目（順序保持）。
+    pub fn items(&self) -> &[AggregateSelectItem] {
         &self.items
     }
 
     /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
     pub fn where_predicates(&self) -> &[WherePredicate] {
         &self.where_predicates
+    }
+
+    /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら `GROUP BY` なしの単一行集計。
+    pub fn group_by(&self) -> Option<&GroupByClause> {
+        self.group_by.as_ref()
     }
 }
 
@@ -803,6 +862,111 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(AggregateItem { func, arg, alias })
+    }
+
+    /// 集計 SELECT リストの 1 項目（TASK-167・SQL-14 で拡張）。次のトークンが
+    /// 集計関数名 `'('` なら従来どおり集計項目（[`Parser::parse_aggregate_item`]）、
+    /// それ以外は `GROUP BY` 列と同名の裸の識別子（任意で `AS <alias>`）として
+    /// [`AggregateSelectItem::GroupKey`] へ構造上受理する（列名一致・`GROUP BY` 句
+    /// 自体の有無は [`parse_aggregate_shape`] が全体を読み終えてから検査する。
+    /// 許可リストとして「集計項目か裸の識別子か」の 2 形にのみ絞り込み、それ以外
+    /// （式・関数呼び出しの混在等）は `expect_ident` の失敗で `42601` に落ちる）。
+    fn parse_aggregate_select_item(&mut self) -> Result<AggregateSelectItem, SqlSurfaceError> {
+        if let Some(Token::Ident(name)) = self.peek() {
+            if is_aggregate_function_name(name)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Punct('(')))
+            {
+                return Ok(AggregateSelectItem::Aggregate(self.parse_aggregate_item()?));
+            }
+        }
+        let column = self.expect_ident()?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(AggregateSelectItem::GroupKey { column, alias })
+    }
+
+    /// `GROUP BY <column>`（TASK-167・SQL-14）。`GROUP BY` は単一の裸識別子のみ
+    /// 受理する（式・関数・複数列・位置番号はいずれも `expect_ident`／後続の
+    /// `expect_end_of_statement` 系の失敗で `42601`）。`GROUP` は予約語化せず
+    /// [`Parser::expect_contextual_keyword`] で文脈的に照合する（PR #189 の方針）。
+    fn parse_group_by_clause(&mut self) -> Result<String, SqlSurfaceError> {
+        self.expect_contextual_keyword("GROUP")?;
+        self.expect_keyword(Keyword::By)?;
+        self.expect_ident()
+    }
+
+    /// `HAVING <having_pred> [AND <having_pred>]*`（TASK-167・SQL-14）。
+    /// `<having_pred> := <ident> <cmp> ['-'] <number>`。左辺は SELECT リスト集計
+    /// 項目の実効名への参照のみを構造上許可し（存在確認・型検査は束縛段）、右辺は
+    /// 数値リテラル限定（文字列リテラル・両辺集計・括弧・`OR` はいずれも許可リスト
+    /// 外）。条件数は [`MAX_AGGREGATE_ITEMS`] で頭打ちにする（`54000`。無制限
+    /// `Vec` 確保を避ける方針を HAVING 条件にも適用）。
+    fn parse_having(&mut self) -> Result<Vec<HavingPredicate>, SqlSurfaceError> {
+        self.expect_contextual_keyword("HAVING")?;
+        let mut predicates = Vec::new();
+        loop {
+            if predicates.len() >= MAX_AGGREGATE_ITEMS {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "too many HAVING predicates",
+                ));
+            }
+            let item_name = self.expect_ident()?;
+            let op = self.expect_cmp_op()?;
+            let negative = matches!(self.peek(), Some(Token::Punct('-')));
+            if negative {
+                self.advance();
+            }
+            let raw = self.expect_number()?;
+            let mut literal = crate::sql::udf_call::parse_number_literal(&raw)?;
+            if negative {
+                literal = -literal;
+            }
+            predicates.push(HavingPredicate {
+                item_name,
+                op,
+                literal,
+            });
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(predicates)
+    }
+
+    /// 集計 `GROUP BY` の `ORDER BY <target> [ASC|DESC]`（TASK-167・SQL-14）。
+    /// `<target>` は `GROUP BY` 列名または SELECT リスト集計項目の実効名のいずれか
+    /// 1 つの識別子（意味論的な解決は束縛段）。`ASC`/`DESC` は予約語化せず文脈的に
+    /// 照合し、省略時は昇順として扱う。
+    fn parse_aggregate_order_by(&mut self) -> Result<AggregateOrderBy, SqlSurfaceError> {
+        self.expect_keyword(Keyword::Order)?;
+        self.expect_keyword(Keyword::By)?;
+        let target = self.expect_ident()?;
+        let descending = if self.peek_ident_matches("DESC") {
+            self.advance();
+            true
+        } else if self.peek_ident_matches("ASC") {
+            self.advance();
+            false
+        } else {
+            false
+        };
+        Ok(AggregateOrderBy { target, descending })
+    }
+
+    /// 集計 `GROUP BY` の `LIMIT <n>`（TASK-167・SQL-14）。構文段では `u32` として
+    /// 受理するのみで、範囲検査（`1..=MAX_GROUPS`）は束縛段
+    /// （`sql::parser::bind_aggregate`）が行う。
+    fn parse_aggregate_limit(&mut self) -> Result<u32, SqlSurfaceError> {
+        self.expect_keyword(Keyword::Limit)?;
+        let raw = self.expect_number()?;
+        raw.parse()
+            .map_err(|_| SqlSurfaceError::unsupported(format!("malformed LIMIT value: {raw}")))
     }
 
     /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
@@ -1319,23 +1483,25 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
 }
 
 /// 構文木（[`ValidatedAggregate`] の元）。カタログ存在確認前の中間結果
-/// （TASK-166・SQL-13）。
+/// （TASK-166・SQL-13。TASK-167・SQL-14 で `group_by` を追加）。
 struct ParsedAggregateShape {
     table_name: String,
-    items: Vec<AggregateItem>,
+    items: Vec<AggregateSelectItem>,
     where_predicates: Vec<WherePredicate>,
+    group_by: Option<GroupByClause>,
 }
 
 /// 許可した集計 `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-166・
-/// SQL-13）。`ORDER BY`／`LIMIT`／`HINT ORDER`／`USING MODE` はいずれも受理しない
-/// （集計結果は常に単一行のため、順位付け・取得モードの余地がない）。呼び出し元
-/// （[`validate_sql`]）は先頭 2 トークンが集計関数名 `'('` であることを確認済みの
+/// SQL-13。TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` を追加）。
+/// `HINT ORDER`／`USING MODE` はいずれの形でも受理しない（集計結果は取得モードの
+/// 余地を持たない）。呼び出し元（[`validate_sql`]）は先頭 2 トークンが集計関数名
+/// `'('` であるか、`SELECT ... GROUP BY` の並びを含むかのいずれかを確認済みの
 /// 前提で呼ぶ。
 fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
     p.expect_keyword(Keyword::Select)?;
-    let mut items = vec![p.parse_aggregate_item()?];
+    let mut items = vec![p.parse_aggregate_select_item()?];
     while matches!(p.peek(), Some(Token::Punct(','))) {
         if items.len() >= MAX_AGGREGATE_ITEMS {
             return Err(SqlSurfaceError::payload_too_large(
@@ -1343,7 +1509,18 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
             ));
         }
         p.advance();
-        items.push(p.parse_aggregate_item()?);
+        items.push(p.parse_aggregate_select_item()?);
+    }
+    // SELECT リストに集計項目が 1 つも無い（`GroupKey` のみ、いわゆる
+    // `SELECT DISTINCT` 相当）形は許可しない（TASK-167・SQL-14 の受理形は集計
+    // 結果を持つ行のみを対象とする）。
+    if !items
+        .iter()
+        .any(|i| matches!(i, AggregateSelectItem::Aggregate(_)))
+    {
+        return Err(SqlSurfaceError::unsupported(
+            "aggregate SELECT list requires at least one aggregate item",
+        ));
     }
     p.expect_keyword(Keyword::From)?;
     let table_name = p.expect_ident()?;
@@ -1355,12 +1532,65 @@ fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSu
         Vec::new()
     };
 
+    let has_group_by =
+        matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("GROUP"));
+    let group_by = if has_group_by {
+        let column = p.parse_group_by_clause()?;
+        // SELECT リストの `GroupKey` 項目は `GROUP BY` 列と同名でなければならない
+        // （§計画 3.1）。不一致・`GROUP BY` 句を持たない `GroupKey` 項目（下の
+        // `else` 分岐）はいずれも許可リスト外として `42601` に落とす。
+        for item in &items {
+            if let AggregateSelectItem::GroupKey { column: c, .. } = item {
+                if c != &column {
+                    return Err(SqlSurfaceError::unsupported(format!(
+                        "SELECT list bare identifier {c:?} does not match GROUP BY column {column:?}"
+                    )));
+                }
+            }
+        }
+        let having = if matches!(p.peek(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("HAVING"))
+        {
+            p.parse_having()?
+        } else {
+            Vec::new()
+        };
+        let order_by = if matches!(p.peek(), Some(Token::Keyword(Keyword::Order))) {
+            Some(p.parse_aggregate_order_by()?)
+        } else {
+            None
+        };
+        let limit = if matches!(p.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            Some(p.parse_aggregate_limit()?)
+        } else {
+            None
+        };
+        Some(GroupByClause {
+            column,
+            having,
+            order_by,
+            limit,
+        })
+    } else {
+        // `GROUP BY` 句が無いのに SELECT リストへ裸の識別子（`GroupKey` 候補）が
+        // 混在する形（例: `SELECT lang, COUNT(*) FROM t`）は許可しない。
+        if items
+            .iter()
+            .any(|i| matches!(i, AggregateSelectItem::GroupKey { .. }))
+        {
+            return Err(SqlSurfaceError::unsupported(
+                "bare column reference in aggregate SELECT list requires GROUP BY",
+            ));
+        }
+        None
+    };
+
     p.expect_end_of_statement()?;
 
     Ok(ParsedAggregateShape {
         table_name,
         items,
         where_predicates,
+        group_by,
     })
 }
 
@@ -1443,9 +1673,20 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
     // トラックせず先読みだけで確定させる（`Parser::pos` の巻き戻しに依存しない）。
+    // TASK-167（SQL-14）: トークン列中に文脈キーワード `GROUP` → `BY` の並びが
+    // あれば、集計項目が SELECT リストの先頭に来ない形（`SELECT <col>, <agg>(...)
+    // FROM t GROUP BY <col>`）も集計 SELECT 形状へ振り分ける。`GROUP`/`BY` は
+    // どちらも他の文脈で通常の識別子・既存の `ORDER BY` の一部として現れうるが、
+    // 「`Ident("GROUP")` の直後に `Keyword::By`」という並びは既存の許可形状には
+    // 存在しないため、フォールス・ポジティブなく集計形状の目印として使える。
+    let contains_group_by = tokens.windows(2).any(|w| {
+        matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+            && matches!(w[1], Token::Keyword(Keyword::By))
+    });
     let is_aggregate_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
-        && matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
-        && matches!(tokens.get(2), Some(Token::Punct('(')));
+        && ((matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+            && matches!(tokens.get(2), Some(Token::Punct('('))))
+            || contains_group_by);
     match tokens.first() {
         Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
             let shape = parse_aggregate_shape(&tokens)?;
@@ -1457,6 +1698,7 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                 table_name: shape.table_name,
                 items: shape.items,
                 where_predicates: shape.where_predicates,
+                group_by: shape.group_by,
             }))
         }
         Some(Token::Keyword(Keyword::Select)) => {
@@ -2776,22 +3018,35 @@ mod tests {
         }
     }
 
+    /// [`AggregateSelectItem::Aggregate`] であることを前提に中身を取り出す
+    /// （TASK-167・SQL-14 で `items()` の要素型が `AggregateSelectItem` へ変わった
+    /// ことに伴うテストヘルパ）。
+    fn expect_agg_item(item: &AggregateSelectItem) -> &AggregateItem {
+        match item {
+            AggregateSelectItem::Aggregate(item) => item,
+            AggregateSelectItem::GroupKey { .. } => {
+                panic!("expected an aggregate item, got a GroupKey item")
+            }
+        }
+    }
+
     #[test]
     fn accepts_count_star() {
         let lookup = catalog_with(&["documents"]);
         let agg = expect_aggregate("SELECT COUNT(*) FROM documents", &lookup);
         assert_eq!(agg.table_name(), "documents");
         assert_eq!(agg.items().len(), 1);
-        assert_eq!(agg.items()[0].func, AggregateFunc::Count);
-        assert_eq!(agg.items()[0].arg, AggregateArg::Star);
-        assert_eq!(agg.items()[0].alias, None);
+        let item = expect_agg_item(&agg.items()[0]);
+        assert_eq!(item.func, AggregateFunc::Count);
+        assert_eq!(item.arg, AggregateArg::Star);
+        assert_eq!(item.alias, None);
     }
 
     #[test]
     fn accepts_count_star_case_insensitive_function_name() {
         let lookup = catalog_with(&["documents"]);
         let agg = expect_aggregate("SELECT count(*) FROM documents", &lookup);
-        assert_eq!(agg.items()[0].func, AggregateFunc::Count);
+        assert_eq!(expect_agg_item(&agg.items()[0]).func, AggregateFunc::Count);
     }
 
     #[test]
@@ -2802,8 +3057,9 @@ mod tests {
             &lookup,
         );
         assert_eq!(agg.items().len(), 5);
-        assert_eq!(agg.items()[1].func, AggregateFunc::Sum);
-        assert_eq!(agg.items()[1].alias.as_deref(), Some("total"));
+        let second = expect_agg_item(&agg.items()[1]);
+        assert_eq!(second.func, AggregateFunc::Sum);
+        assert_eq!(second.alias.as_deref(), Some("total"));
         assert_eq!(agg.where_predicates().len(), 2);
     }
 
@@ -2814,11 +3070,102 @@ mod tests {
     }
 
     #[test]
-    fn rejects_group_by_on_aggregate_select() {
+    fn accepts_group_by_with_having_order_by_and_limit() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_sql("SELECT COUNT(*) FROM documents GROUP BY lang", &lookup)
-            .expect_err("GROUP BY must be rejected");
+        let agg = expect_aggregate(
+            "SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang HAVING n > 1 ORDER BY n DESC LIMIT 10",
+            &lookup,
+        );
+        let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
+        assert_eq!(group_by.column, "lang");
+        assert_eq!(group_by.having.len(), 1);
+        assert_eq!(group_by.having[0].item_name, "n");
+        assert_eq!(group_by.having[0].literal, 1.0);
+        let order_by = group_by.order_by.as_ref().expect("ORDER BY must be parsed");
+        assert_eq!(order_by.target, "n");
+        assert!(order_by.descending);
+        assert_eq!(group_by.limit, Some(10));
+    }
+
+    #[test]
+    fn rejects_group_key_not_in_select_list_alone() {
+        // 集計項目を 1 つも持たない SELECT リスト（`DISTINCT` 相当）は許可しない。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT lang FROM documents GROUP BY lang", &lookup)
+            .expect_err("aggregate-less GROUP BY must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_bare_column_in_select_list_without_group_by() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT lang, COUNT(*) FROM documents", &lookup)
+            .expect_err("bare column reference without GROUP BY must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_select_list_bare_identifier_mismatching_group_by_column() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT id, COUNT(*) FROM documents GROUP BY lang", &lookup)
+            .expect_err("mismatching bare identifier must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_multiple_group_by_columns() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) FROM documents GROUP BY lang, id",
+            &lookup,
+        )
+        .expect_err("multi-column GROUP BY must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_having_without_group_by() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT COUNT(*) FROM documents HAVING COUNT(*) > 1",
+            &lookup,
+        )
+        .expect_err("HAVING without GROUP BY must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_having_with_string_literal_rhs() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang HAVING n > 'x'",
+            &lookup,
+        )
+        .expect_err("HAVING right-hand side must be numeric");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn accepts_having_with_negative_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang HAVING n > -1",
+            &lookup,
+        );
+        let group_by = agg.group_by().expect("GROUP BY clause must be accepted");
+        assert_eq!(group_by.having[0].literal, -1.0);
+    }
+
+    #[test]
+    fn rejects_group_by_over_max_aggregate_items_worth_of_having_predicates() {
+        let lookup = catalog_with(&["documents"]);
+        let having: String = std::iter::repeat_n("n > 1", MAX_AGGREGATE_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql =
+            format!("SELECT lang, COUNT(*) AS n FROM documents GROUP BY lang HAVING {having}");
+        let err = validate_sql(&sql, &lookup).expect_err("HAVING predicate count must be bounded");
+        assert_eq!(err.wire_code(), "54000");
     }
 
     #[test]

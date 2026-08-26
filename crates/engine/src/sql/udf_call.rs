@@ -48,6 +48,41 @@ const WASM_CALL_ARITY: usize = 2;
 /// `Expr::Number` 束縛）の双方で同一の正確表現境界として共有する。
 const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
 
+/// 数値リテラルの生文字列（符号なし。`-` は呼び出し元が別トークンとして処理する）を
+/// `f64` へ束縛する（TASK-79・SQL-9 の `Expr::Number` 束縛から TASK-167・SQL-14
+/// （`sql::group_by` の HAVING/LIMIT リテラル束縛）が共有できるよう切り出した）。
+/// 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を生成する）は
+/// `f64::from_str` が黙って最近接値へ丸めうる（`raw.parse::<f64>()` はエラーに
+/// ならない）。`2^53` を超える整数は `f64` で正確に表現できないという境界を、丸め
+/// 変換の *前* に整数として検査することで、大きな整数リテラルが精度欠落によって
+/// 別の値と黙って同一視されるのを防ぐ（fail-closed。security.md「不安全な設計」対応）。
+pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    if is_integer_literal {
+        let as_int: u64 = raw.parse().map_err(|_| {
+            // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
+            // `f64` で正確に表現できないことに変わりはない。
+            SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            )
+        })?;
+        if as_int > MAX_EXACT_F64_INT {
+            return Err(SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            ));
+        }
+    }
+    let v: f64 = raw
+        .parse()
+        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
+    if !v.is_finite() {
+        return Err(SqlSurfaceError::invalid_input(
+            "numeric literal is not finite",
+        ));
+    }
+    Ok(v)
+}
+
 /// 式の二項演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
@@ -527,37 +562,7 @@ fn bind_expr_in(
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     match expr {
         Expr::Number(raw) => {
-            // 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を
-            // 生成する）は `f64::from_str` が黙って最近接値へ丸めうる
-            // （`raw.parse::<f64>()` はエラーにならない）。`id_as_finite_scalar` と
-            // 同じ「`2^53` を超える整数は `f64` で正確に表現できない」境界を、丸め
-            // 変換の *前* に整数として検査することで、`WHERE id = 9007199254740993`
-            // のような大きな整数リテラルが精度欠落によって別の値（例:
-            // `9007199254740992`）と黙って同一視されるのを防ぐ（fail-closed。
-            // security.md「不安全な設計」対応）。
-            let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
-            if is_integer_literal {
-                let as_int: u64 = raw.parse().map_err(|_| {
-                    // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
-                    // `f64` で正確に表現できないことに変わりはない。
-                    SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    )
-                })?;
-                if as_int > MAX_EXACT_F64_INT {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    ));
-                }
-            }
-            let v: f64 = raw
-                .parse()
-                .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
-            if !v.is_finite() {
-                return Err(SqlSurfaceError::invalid_input(
-                    "numeric literal is not finite",
-                ));
-            }
+            let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))
         }
         Expr::Ident(name) => {

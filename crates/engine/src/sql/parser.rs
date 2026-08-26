@@ -761,18 +761,69 @@ pub(crate) struct BoundAggregateItem {
     pub(crate) name: String,
 }
 
-/// 束縛済みの集計 SELECT 文（TASK-166・SQL-13）。[`crate::sql::aggregate::execute_aggregate`]
-/// が直接実行する入力形。`BoundStatement` と異なり検索固有のフィールド
-/// （`ranking`・`limit`・`mode`・`evaluation_order`）を持たない（集計は常に単一行・
-/// `HINT ORDER`／`USING MODE` を受理しないため。[`crate::sql::allowlist::ValidatedAggregate`]
-/// のドキュメント参照）。
+/// SELECT リストの出力列 1 つ（TASK-167・SQL-14）。`GROUP BY` なしの単一行集計
+/// （TASK-166・SQL-13）では `bind_aggregate` が `items` の宣言順で自動生成し、既存
+/// 挙動を変えない。`GROUP BY` ありの場合は `AggregateSelectItem::GroupKey`／
+/// `Aggregate` の並び順をそのまま反映する。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ProjectionColumn {
+    /// `GROUP BY` 列の値（`sql::group_by::GroupKey` から復元）。
+    GroupKey { name: String },
+    /// `items[item_index]` の集計結果。
+    Aggregate { item_index: usize, name: String },
+}
+
+/// HAVING 述語 1 つを束縛した形（TASK-167・SQL-14）。`item_index` は
+/// [`BoundAggregate::items`] の添字（HAVING は SELECT リストの集計項目のみを
+/// 参照できるため、常に既存の `items` を指す。新規アキュムレータを追加しない）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoundHaving {
+    pub(crate) item_index: usize,
+    pub(crate) op: crate::sql::udf_call::BinOp,
+    pub(crate) literal: f64,
+}
+
+/// `ORDER BY` 対象を束縛した形（TASK-167・SQL-14）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OrderTarget {
+    GroupKey,
+    Aggregate(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoundOrderBy {
+    pub(crate) target: OrderTarget,
+    pub(crate) descending: bool,
+}
+
+/// 束縛済みの `GROUP BY` 句（TASK-167・SQL-14）。`column_index` は `schema.columns`
+/// の添字（束縛段で `TEXT` 列であることを確認済み）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundGroupBy {
+    pub(crate) column_index: usize,
+    pub(crate) having: Vec<BoundHaving>,
+    pub(crate) order_by: Option<BoundOrderBy>,
+    pub(crate) limit: Option<usize>,
+}
+
+/// 束縛済みの集計 SELECT 文（TASK-166・SQL-13。TASK-167・SQL-14 で `group_by`・
+/// `projection` を追加）。[`crate::sql::aggregate::execute_aggregate`] が直接実行する
+/// 入力形。`BoundStatement` と異なり検索固有のフィールド（`ranking`・`limit`・
+/// `mode`・`evaluation_order`）を持たない（集計結果の順位付け・取得モードは
+/// `sql::group_by`（`GROUP BY` ありの場合のみ）が別途扱うため。
+/// [`crate::sql::allowlist::ValidatedAggregate`] のドキュメント参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundAggregate {
     pub(crate) table: String,
+    /// 集計項目（アキュムレータを持つ項目のみ。`GroupKey` 項目は含まない）。
     pub(crate) items: Vec<BoundAggregateItem>,
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
     pub(crate) rls_predicate_present: bool,
+    /// 出力列順（`items` とは独立。`GROUP BY` の有無によらず常に構築する）。
+    pub(crate) projection: Vec<ProjectionColumn>,
+    /// `GROUP BY` 句（TASK-167・SQL-14）。`None` なら TASK-166・SQL-13 の単一行集計。
+    pub(crate) group_by: Option<BoundGroupBy>,
 }
 
 /// 集計項目 1 つの引数（[`crate::sql::allowlist::AggregateArg`]）を `schema` と
@@ -851,7 +902,8 @@ fn resolve_aggregate_input(
 }
 
 /// [`crate::sql::allowlist::ValidatedAggregate`] を `schema`・UDF レジストリ `udfs`
-/// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API）。
+/// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API。
+/// TASK-167・SQL-14 で `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` の束縛を追加）。
 /// `WHERE` 句の意味論は [`bind_where_predicates`] を検索 SELECT
 /// （[`bind_in_session`]）と共有する。式ノード予算（[`crate::sql::udf_call::MAX_EXPR_NODES`]）
 /// は集計項目＋`WHERE` の全式項目で 1 文につき共有する（`bind_in_session` と同じ
@@ -861,24 +913,52 @@ pub(crate) fn bind_aggregate(
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
 ) -> Result<BoundAggregate, SqlSurfaceError> {
+    use crate::sql::allowlist::AggregateSelectItem;
+
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    let mut items = Vec::with_capacity(stmt.items().len());
+    // GROUP BY 列名（`SELECT` リストの `GroupKey` 項目の照合・`ORDER BY`/`LIMIT`
+    // 束縛より前に確定させる。`GROUP BY` なしなら `None`）。
+    let group_by_column = stmt.group_by().map(|g| g.column.as_str());
+
+    let mut items = Vec::new();
+    let mut projection = Vec::with_capacity(stmt.items().len());
     for item in stmt.items() {
-        let input = resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?;
-        let name = item
-            .alias
-            .clone()
-            .unwrap_or_else(|| item.func.default_alias().to_string());
-        items.push(BoundAggregateItem {
-            func: item.func,
-            input,
-            name,
-        });
+        match item {
+            AggregateSelectItem::Aggregate(item) => {
+                let input =
+                    resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?;
+                let name = item
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| item.func.default_alias().to_string());
+                let item_index = items.len();
+                items.push(BoundAggregateItem {
+                    func: item.func,
+                    input,
+                    name: name.clone(),
+                });
+                projection.push(ProjectionColumn::Aggregate { item_index, name });
+            }
+            // `allowlist::parse_aggregate_shape` が `GROUP BY` 句自体の有無・
+            // 列名一致を構造検証済みのため、ここへ到達する `GroupKey` 項目は常に
+            // `group_by_column` と同名（構造上の前提。念のため `unwrap_or` で
+            // フォールバックせず明示的に確認する）。
+            AggregateSelectItem::GroupKey { column, alias } => {
+                debug_assert_eq!(Some(column.as_str()), group_by_column);
+                let name = alias.clone().unwrap_or_else(|| column.clone());
+                projection.push(ProjectionColumn::GroupKey { name });
+            }
+        }
     }
 
     let (metadata_filters, expr_filters, rls_predicate_present) =
         bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+
+    let group_by = match stmt.group_by() {
+        None => None,
+        Some(clause) => Some(bind_group_by_clause(clause, schema, &items)?),
+    };
 
     Ok(BoundAggregate {
         table: stmt.table_name().to_string(),
@@ -886,6 +966,131 @@ pub(crate) fn bind_aggregate(
         metadata_filters,
         expr_filters,
         rls_predicate_present,
+        projection,
+        group_by,
+    })
+}
+
+/// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
+/// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14）。`HAVING`/
+/// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、または
+/// `GROUP BY` 列名そのものに解決する。
+fn bind_group_by_clause(
+    clause: &crate::sql::allowlist::GroupByClause,
+    schema: &TableSchema,
+    items: &[BoundAggregateItem],
+) -> Result<BoundGroupBy, SqlSurfaceError> {
+    // GROUP BY 列は TEXT 列のみ許可する（VECTOR・疑似列 `id`・未知列はいずれも
+    // 型不整合として拒否。§計画 3.2。`id` によるグルーピングは本タスクの対象外
+    // ＝将来拡張候補）。
+    let column_index = schema
+        .columns
+        .iter()
+        .position(|c| c.name == clause.column)
+        .filter(|&idx| {
+            matches!(
+                schema.columns.get(idx).map(|c| c.ty),
+                Some(ColumnType::Text)
+            )
+        })
+        .ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!(
+                "GROUP BY column {:?} must reference an existing TEXT column",
+                clause.column
+            ))
+        })?;
+
+    // HAVING/ORDER BY の対象名解決: `GROUP BY` 列名そのもの、または `items` の
+    // いずれか 1 つの実効名に一意に一致する識別子のみを受理する（曖昧・非存在は
+    // `22000`）。
+    let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
+        let matches_group_key = name == clause.column;
+        let item_matches: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.name == name)
+            .map(|(idx, _)| idx)
+            .collect();
+        match (matches_group_key, item_matches.as_slice()) {
+            (true, []) => Ok(OrderTarget::GroupKey),
+            (false, [idx]) => Ok(OrderTarget::Aggregate(*idx)),
+            (false, []) => Err(SqlSurfaceError::invalid_input(format!(
+                "unknown GROUP BY reference: {name}"
+            ))),
+            _ => Err(SqlSurfaceError::invalid_input(format!(
+                "ambiguous GROUP BY reference: {name}"
+            ))),
+        }
+    };
+
+    let mut having = Vec::with_capacity(clause.having.len());
+    for pred in &clause.having {
+        let target = resolve_target(&pred.item_name)?;
+        let item_index = match target {
+            OrderTarget::Aggregate(idx) => idx,
+            OrderTarget::GroupKey => {
+                // GROUP BY 列（TEXT）は数値比較の対象にならない（HAVING 右辺は
+                // 常に数値リテラル）。列名一致でも `GroupKey` を指した場合は
+                // 型不整合として拒否する。
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "HAVING cannot compare the GROUP BY key column {:?} to a numeric literal",
+                    pred.item_name
+                )));
+            }
+        };
+        // HAVING が数値比較できる集計結果のみを許可する。`COUNT(<TEXT 列>)` は
+        // `AggregateInput::TextColumn` を使うが結果は常に整数のため許可し、
+        // `MIN`/`MAX(<TEXT 列>)`（結果が `Cell::Text`）のみを型不整合として
+        // 拒否する（`AggregateFunc::Count` を除く `TextColumn` 入力）。
+        let bound_item = items
+            .get(item_index)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "HAVING item_index resolved out of bounds".to_string(),
+            })?;
+        let is_text_valued = matches!(bound_item.input, AggregateInput::TextColumn(_))
+            && !matches!(bound_item.func, crate::sql::allowlist::AggregateFunc::Count);
+        if is_text_valued {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "HAVING target {:?} is a TEXT-typed aggregate and cannot be compared numerically",
+                pred.item_name
+            )));
+        }
+        having.push(BoundHaving {
+            item_index,
+            op: pred.op,
+            literal: pred.literal,
+        });
+    }
+
+    let order_by = match &clause.order_by {
+        None => None,
+        Some(ob) => Some(BoundOrderBy {
+            target: resolve_target(&ob.target)?,
+            descending: ob.descending,
+        }),
+    };
+
+    let limit = match clause.limit {
+        None => None,
+        Some(raw) => {
+            let limit = usize::try_from(raw).map_err(|_| {
+                SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}"))
+            })?;
+            if limit == 0 || limit > crate::sql::group_by::MAX_GROUPS {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "LIMIT {limit} out of range (must be 1..={})",
+                    crate::sql::group_by::MAX_GROUPS
+                )));
+            }
+            Some(limit)
+        }
+    };
+
+    Ok(BoundGroupBy {
+        column_index,
+        having,
+        order_by,
+        limit,
     })
 }
 
@@ -1455,7 +1660,7 @@ mod tests {
         // 独立して機能することを確認するため、AST を直接組み立てて渡す
         // （防御的実装の単体検証。§計画 6-B）。
         use crate::sql::allowlist::{
-            AggregateArg, AggregateFunc, AggregateItem, ValidatedAggregate,
+            AggregateArg, AggregateFunc, AggregateItem, AggregateSelectItem, ValidatedAggregate,
         };
         use crate::sql::udf_call::BinOp;
 
@@ -1464,7 +1669,7 @@ mod tests {
         // （`allowlist.rs` のカプセル化はクレート外からの構築のみを禁じる）。
         let agg = ValidatedAggregate {
             table_name: "documents".to_string(),
-            items: vec![AggregateItem {
+            items: vec![AggregateSelectItem::Aggregate(AggregateItem {
                 func: AggregateFunc::Sum,
                 arg: AggregateArg::Expr(Expr::Binary {
                     op: BinOp::Gt,
@@ -1472,8 +1677,9 @@ mod tests {
                     rhs: Box::new(Expr::Number("1".to_string())),
                 }),
                 alias: None,
-            }],
+            })],
             where_predicates: Vec::new(),
+            group_by: None,
         };
         let err = bind_aggregate(
             &agg,
