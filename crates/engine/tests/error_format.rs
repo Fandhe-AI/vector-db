@@ -52,21 +52,19 @@ fn err2_all_classes_have_unique_wire_codes() {
 /// 拡張分類の増加（ビヘイビアファイル固有の `wire_code` 追加）を検知する。
 #[test]
 fn err2_table_is_fifteen_rows_and_extensions_are_explicit() {
-    assert_eq!(ErrorClass::ERR2_TABLE.len(), 15, "spec 表は計 15 行");
-    let table: HashSet<ErrorClass> = ErrorClass::ERR2_TABLE.into_iter().collect();
-    assert_eq!(table.len(), 15, "表の分類は重複しない");
-    for class in ErrorClass::ERR2_TABLE {
-        assert!(
-            ErrorClass::ALL.contains(&class),
-            "ERR2_TABLE は ALL の部分集合: {class:?}"
-        );
-    }
+    let table: Vec<ErrorClass> = ErrorClass::ALL
+        .into_iter()
+        .filter(|c| c.is_err2_table_row())
+        .collect();
+    assert_eq!(table.len(), 15, "spec 表は計 15 行");
+
+    // 表外の拡張は SQL-13（集計の数値範囲超過）の 1 分類のみ。
     let extensions: Vec<ErrorClass> = ErrorClass::ALL
         .into_iter()
-        .filter(|c| !table.contains(c))
+        .filter(|c| !c.is_err2_table_row())
         .collect();
-    // 表外の拡張は SQL-13（集計の数値範囲超過）の 1 分類のみ。
     assert_eq!(extensions, vec![ErrorClass::NumericOutOfRange]);
+    assert_eq!(ErrorClass::NumericOutOfRange.wire_code(), "22003");
 }
 
 #[test]
@@ -270,6 +268,46 @@ fn err2_internal_error_client_message_never_carries_detail() {
     let fixed = WireError::internal();
     assert_eq!(fixed.message(), "internal error");
     assert_eq!(fixed.wire_code(), "XX000");
+}
+
+/// マルチバイト文字が上限バイト位置を跨ぐ場合に、文字境界まで巻き戻して切り詰める
+/// （不正な UTF-8 断片・文字の途中での切断を作らない）。純 ASCII の
+/// [`err2_wire_error_message_is_truncated`] では通らない巻き戻し経路の回帰検知。
+#[test]
+fn err2_wire_error_message_truncation_respects_char_boundary() {
+    // "あ" は 3 バイト。上限 200 バイトは 3 の倍数ではない（200 = 3 * 66 + 2）ため、
+    // 200 バイト目は文字の途中に当たり、198 バイト（66 文字）まで巻き戻される。
+    let long = "あ".repeat(200);
+    let err = WireError::new(ErrorClass::InvalidInput, long);
+    let msg = err.message();
+
+    assert_eq!(
+        msg.len(),
+        198 + "...".len(),
+        "文字境界まで巻き戻して切り詰める"
+    );
+    assert!(msg.ends_with("..."), "切り詰め時は省略記号を付与する");
+    let body = msg.strip_suffix("...").expect("suffix");
+    assert_eq!(body.chars().count(), 66, "完全な文字のみを残す");
+    assert!(body.chars().all(|c| c == 'あ'), "文字の途中で切らない");
+    // `String` として保持できている時点で UTF-8 として妥当（不正断片を作っていない）。
+    assert_eq!(
+        std::str::from_utf8(msg.as_bytes()).expect("valid utf-8"),
+        msg
+    );
+}
+
+/// 1 文字が上限バイト長を跨ぐ極端な入力でも巻き戻しが停止し、パニックしない。
+#[test]
+fn err2_wire_error_message_truncation_handles_single_huge_char() {
+    // 4 バイト文字（絵文字）を並べ、上限 200 の直前が文字境界にならない場合を含めて
+    // 巻き戻しが常に停止することを確認する（200 = 4 * 50 でちょうど境界）。
+    let long = "\u{1F600}".repeat(100);
+    let err = WireError::new(ErrorClass::InvalidInput, long);
+    let msg = err.message();
+    assert_eq!(msg.len(), 200 + "...".len());
+    let body = msg.strip_suffix("...").expect("suffix");
+    assert_eq!(body.chars().count(), 50);
 }
 
 #[test]
