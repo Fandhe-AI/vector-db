@@ -39,14 +39,34 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
 // --- 一意性・決定性 -----------------------------------------------------------
 
 #[test]
-fn err2_all_fifteen_classes_have_unique_wire_codes() {
-    assert_eq!(ErrorClass::ALL.len(), 15, "spec 表は計 15 行（15 分類）");
+fn err2_all_classes_have_unique_wire_codes() {
     let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
     assert_eq!(
         codes.len(),
-        15,
+        ErrorClass::ALL.len(),
         "wire_code は分類ごとに一意でなければならない"
     );
+}
+
+/// ERR-2 分類表（15 行）と、表外の拡張分類の関係を固定する。表側の増減、および
+/// 拡張分類の増加（ビヘイビアファイル固有の `wire_code` 追加）を検知する。
+#[test]
+fn err2_table_is_fifteen_rows_and_extensions_are_explicit() {
+    assert_eq!(ErrorClass::ERR2_TABLE.len(), 15, "spec 表は計 15 行");
+    let table: HashSet<ErrorClass> = ErrorClass::ERR2_TABLE.into_iter().collect();
+    assert_eq!(table.len(), 15, "表の分類は重複しない");
+    for class in ErrorClass::ERR2_TABLE {
+        assert!(
+            ErrorClass::ALL.contains(&class),
+            "ERR2_TABLE は ALL の部分集合: {class:?}"
+        );
+    }
+    let extensions: Vec<ErrorClass> = ErrorClass::ALL
+        .into_iter()
+        .filter(|c| !table.contains(c))
+        .collect();
+    // 表外の拡張は SQL-13（集計の数値範囲超過）の 1 分類のみ。
+    assert_eq!(extensions, vec![ErrorClass::NumericOutOfRange]);
 }
 
 #[test]
@@ -106,7 +126,11 @@ fn err2_from_wire_code_rejects_unknown_codes() {
 #[test]
 fn err2_label_is_screaming_snake_case_and_unique() {
     let labels: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.label()).collect();
-    assert_eq!(labels.len(), 15, "label はクラスごとに一意");
+    assert_eq!(
+        labels.len(),
+        ErrorClass::ALL.len(),
+        "label はクラスごとに一意"
+    );
     for class in ErrorClass::ALL {
         let label = class.label();
         assert!(
@@ -160,6 +184,13 @@ fn err2_sql_surface_error_mapping_is_unchanged() {
         "54000"
     );
     assert_eq!(SqlSurfaceError::IdConflict.wire_code(), "23505");
+    assert_eq!(
+        SqlSurfaceError::NumericOutOfRange {
+            detail: "x".to_string()
+        }
+        .wire_code(),
+        "22003"
+    );
 }
 
 #[test]

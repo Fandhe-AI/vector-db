@@ -54,11 +54,39 @@ pub enum ErrorClass {
     /// 予期しない内部エラー（`XX000`）。クライアントへは詳細を運ばない
     /// （[`WireError::internal`] 参照）。
     InternalError,
+    /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）の数値演算が表現範囲を超過
+    /// （`22003`）。ERR-2 の分類表には未掲載で、SQL-13（`sql::aggregate`）が
+    /// ERR-2 の拡張規則（表外の発生条件はビヘイビアファイルが一意の `wire_code` を
+    /// 定義してよい）に基づき定義した分類。[`ErrorClass::ERR2_TABLE`] には含めない。
+    NumericOutOfRange,
 }
 
 impl ErrorClass {
-    /// 全 15 分類。テストでの網羅・一意性検証、`from_wire_code` の逆引きに使う。
-    pub const ALL: [ErrorClass; 15] = [
+    /// 全分類（ERR-2 分類表の 15 行 + 拡張 1 分類）。テストでの網羅・一意性検証、
+    /// `from_wire_code` の逆引きに使う。
+    pub const ALL: [ErrorClass; 16] = [
+        ErrorClass::InvalidInput,
+        ErrorClass::AuthRequired,
+        ErrorClass::AuthInvalid,
+        ErrorClass::ForbiddenTenantMismatch,
+        ErrorClass::TableNotFound,
+        ErrorClass::RowNotFound,
+        ErrorClass::DuplicateOperationId,
+        ErrorClass::MissingOperationId,
+        ErrorClass::PayloadTooLarge,
+        ErrorClass::ConnectionLimitExceeded,
+        ErrorClass::FeatureNotSupported,
+        ErrorClass::UnsupportedSqlSyntax,
+        ErrorClass::StartupMessageInvalid,
+        ErrorClass::OperationIdContentMismatch,
+        ErrorClass::InternalError,
+        ErrorClass::NumericOutOfRange,
+    ];
+
+    /// ERR-2 の分類表そのものに対応する 15 分類（表の掲載順）。[`ErrorClass::ALL`]
+    /// のうち、ビヘイビアファイル固有の拡張分類（[`ErrorClass::NumericOutOfRange`]）を
+    /// 除いた部分集合。spec 表との対応が将来ずれた場合にテストで検知するために持つ。
+    pub const ERR2_TABLE: [ErrorClass; 15] = [
         ErrorClass::InvalidInput,
         ErrorClass::AuthRequired,
         ErrorClass::AuthInvalid,
@@ -95,6 +123,7 @@ impl ErrorClass {
             ErrorClass::StartupMessageInvalid => "08P01",
             ErrorClass::OperationIdContentMismatch => "22023",
             ErrorClass::InternalError => "XX000",
+            ErrorClass::NumericOutOfRange => "22003",
         }
     }
 
@@ -117,6 +146,7 @@ impl ErrorClass {
             ErrorClass::StartupMessageInvalid => "STARTUP_MESSAGE_INVALID",
             ErrorClass::OperationIdContentMismatch => "OPERATION_ID_CONTENT_MISMATCH",
             ErrorClass::InternalError => "INTERNAL_ERROR",
+            ErrorClass::NumericOutOfRange => "NUMERIC_OUT_OF_RANGE",
         }
     }
 
@@ -245,15 +275,14 @@ mod tests {
     // `ALL` が enum の全 variant を漏れなく列挙していることの最小限の確認
     // （網羅性の主な検証は `tests/error_format.rs` の結合テスト側で行う）。
     #[test]
-    fn all_has_fifteen_distinct_classes() {
-        assert_eq!(ErrorClass::ALL.len(), 15);
+    fn all_classes_are_distinct() {
         let set: HashSet<ErrorClass> = ErrorClass::ALL.into_iter().collect();
-        assert_eq!(set.len(), 15);
+        assert_eq!(set.len(), ErrorClass::ALL.len());
     }
 
     #[test]
     fn wire_codes_are_pairwise_distinct() {
         let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
-        assert_eq!(codes.len(), 15);
+        assert_eq!(codes.len(), ErrorClass::ALL.len());
     }
 }

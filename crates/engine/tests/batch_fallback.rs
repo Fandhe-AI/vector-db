@@ -14,7 +14,7 @@ use engine::batch_fallback::{
     FallbackObserver, FallbackReason,
 };
 use engine::batch_search::{BatchEngine, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix};
-use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
+use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
@@ -102,25 +102,36 @@ fn oracle_search(
     ctx: &PolicyContext,
     query: &[f32],
     k: usize,
-) -> Vec<CandidateHit> {
-    let mut visible_ids = Vec::new();
+) -> Vec<SearchHit> {
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。候補識別子は行 `id` ではなく
+    // 元配列内のスロット index を使う（本体コードと同じ「候補識別子＝スロット
+    // 番号」方式）。行 `id` の一意性スコープはテナント内に閉じているため、
+    // `id` 値そのものを識別子にすると異なるテナントが同じ `id` を共有する
+    // フィクスチャで逆引きが曖昧になる。
+    let mut visible_slots: Vec<u64> = Vec::new();
     let mut visible_vectors = Vec::new();
-    for (row_idx, (id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {
+    for (row_idx, (_id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {
         if ctx.is_visible(tenant, Visibility::Public) {
-            visible_ids.push(*id);
+            visible_slots.push(row_idx as u64);
             let start = row_idx * dim;
             visible_vectors.extend_from_slice(&vectors[start..start + dim]);
         }
     }
-    CpuScalarProvider
+    let hits = CpuScalarProvider
         .search(SearchInput {
-            ids: &visible_ids,
+            ids: &visible_slots,
             vectors: &visible_vectors,
             dim: dim as u32,
             query,
             k,
         })
-        .expect("oracle search ok")
+        .expect("oracle search ok");
+    hits.into_iter()
+        .map(|hit| {
+            let idx = hit.id as usize;
+            SearchHit::new(tenant_ids[idx].clone(), ids[idx], hit.score)
+        })
+        .collect()
 }
 
 // CORE-8: 初期化失敗注入 → 構築 `Ok`（CPU 専用モード）・検索 `Ok`・イベント
