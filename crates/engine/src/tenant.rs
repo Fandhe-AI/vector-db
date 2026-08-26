@@ -593,6 +593,189 @@ pub fn delete_row(
     Ok(())
 }
 
+/// [`replace_typed_rows_by_text_key`] の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaceOutcome {
+    /// テキスト列 `key_column` が `key_value` に一致した既存行のうち削除した件数。
+    pub removed: usize,
+    /// 新規挿入した行数（`rows.len()` と一致する）。
+    pub inserted: usize,
+    /// 新規挿入した行のうち最小の `id`（`rows` が空なら `None`）。
+    pub first_id: Option<u64>,
+}
+
+/// テキスト列 `key_column` の値が `key_value` に一致するテナント内の既存行を
+/// すべて削除し、代わりに `rows` を新規挿入する（TASK-120・対象ビヘイビア:
+/// INDEX-1, INDEX-2。ファイル形 `INSERT` の同一パス再送時の置換セマンティクスの
+/// 決定を担う。ポインタ: `docs/design/resend-semantics.md`）。
+///
+/// `crate::incremental::index_file` から、チャンク化・埋め込み計算をすべて終えた
+/// 後にのみ呼ばれる（write トランザクションの外で外部 I/O・CPU 計算を終えてから
+/// 単一の write トランザクションへ入る設計。coding-rust.md「不安全な設計 / DoS」:
+/// 単一ライタの長時間占有を避ける）。
+///
+/// - 削除・採番・挿入・世代更新をすべて単一の write トランザクション内で行う
+///   （途中失敗は `redb::WriteTransaction` の drop 契約により abort。副作用ゼロ）
+/// - 走査範囲はテナント名前空間 `(ctx.tenant_id(), ..)` に限定する（TABLE-12・RLS-9。
+///   他テナントの同一 `key_value` 行は走査対象にも削除対象にも含まれない）
+/// - 新規行の `id` は同一テナント名前空間内の既存最大 `id`（削除対象・対象外を問わず、
+///   走査中に観測した全行）+ 1 から連番で採番する（[`insert_row`] の「既存行を
+///   上書きしない」契約と衝突しない。`checked_add` でオーバーフローを `Err` に倒す）
+/// - `rows` が空かつ削除対象も 0 件なら世代を進めずに成功する（[`insert_rows`] の
+///   空バッチと同じ扱い。無変更コミットで既存インデックスを不要に失効させない）
+///
+/// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
+/// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
+/// テーブルに VECTOR 列がない場合は [`TenantWriteError::Catalog`]（`CatalogError::Invalid`）。
+pub fn replace_typed_rows_by_text_key(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    key_column: &str,
+    key_value: &str,
+    visibility: crate::storage::Visibility,
+    rows: &[Vec<crate::row_codec::Value>],
+) -> Result<ReplaceOutcome, TenantWriteError> {
+    validate_identifier(table)?;
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
+    // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
+    // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
+    // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
+    let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table has no VECTOR column".to_string(),
+                ))
+            })?;
+        let key_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == key_column)
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                    "unknown key column: {key_column}"
+                )))
+            })?;
+
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+
+        let tenant = ctx.tenant_id();
+        // テナント名前空間内の既存行を走査し、削除対象 id・既存最大 id（削除対象・
+        // 対象外を問わない）を同時に収集する。`range` の借用は本ブロックで閉じ、
+        // 後続の `remove`/`insert`（`&mut` 借用）と衝突しないようにする
+        // （`update_row`/`delete_row` の `AccessGuard` スコープと同じ方針）。
+        let mut to_remove: Vec<u64> = Vec::new();
+        let mut max_id: Option<u64> = None;
+        {
+            let start = std::ops::Bound::Included((tenant, 0u64));
+            let end = std::ops::Bound::Included((tenant, u64::MAX));
+            let mut iter = row_table
+                .range::<(&str, u64)>((start, end))
+                .map_err(CatalogError::from)?;
+            for entry in &mut iter {
+                let (k, v) = entry.map_err(CatalogError::from)?;
+                let (_key_tenant, id) = k.value();
+                let raw = v.value();
+                let row = crate::storage::decode_row(id, raw).map_err(TenantWriteError::Storage)?;
+                max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, &row.metadata)
+                    .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
+                if scanned.get(key_idx).copied().flatten() == Some(key_value) {
+                    to_remove.push(id);
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        if removed == 0 && rows.is_empty() {
+            // 変更ゼロ。`insert_rows` の空バッチと同じく世代を進めずに成功する
+            // （呼び出し元が commit せず drop することを、戻り値の 0/0/None から判断する）。
+            return Ok(ReplaceOutcome {
+                removed: 0,
+                inserted: 0,
+                first_id: None,
+            });
+        }
+
+        for id in &to_remove {
+            row_table
+                .remove(&(tenant, *id))
+                .map_err(CatalogError::from)?;
+        }
+
+        let mut next_id = max_id.map_or(Ok(0u64), |m| {
+            m.checked_add(1).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "id namespace exhausted".to_string(),
+                ))
+            })
+        })?;
+        let mut first_id: Option<u64> = None;
+        let mut inserted = 0usize;
+        for values in rows {
+            let embedding = match values.get(vector_idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.clone(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            let row = RowInput {
+                tenant_id: ctx.tenant_id(),
+                visibility,
+                embedding: &embedding,
+                metadata: &metadata,
+            };
+            let id = next_id;
+            let key = (ctx.tenant_id(), id);
+            // 上の採番規則により既存行との衝突は起こらないはずだが、`insert_row` と
+            // 同じ防御（TOCTOU 対策の単一 write トランザクション内チェック）を残す。
+            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
+                return Err(TenantWriteError::IdConflict);
+            }
+            let encoded = encode_row(&row)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+            inserted += 1;
+            next_id = id.checked_add(1).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "id namespace exhausted".to_string(),
+                ))
+            })?;
+        }
+
+        Ok(ReplaceOutcome {
+            removed,
+            inserted,
+            first_id,
+        })
+    })();
+    let outcome = outcome?;
+    if outcome.removed == 0 && outcome.inserted == 0 {
+        drop(write_txn);
+        return Ok(outcome);
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,5 +943,198 @@ mod tests {
             .get_row_from_table("docs", "tenant-a", 1)
             .expect("read back row");
         assert_eq!(after.tenant_id, "tenant-a");
+    }
+
+    // --- replace_typed_rows_by_text_key（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2） --
+
+    fn file_schema(table: &str) -> TableSchema {
+        TableSchema::new(
+            table,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    fn row_values(embedding: [f32; 2], path: &str, body: &str) -> Vec<crate::row_codec::Value> {
+        vec![
+            crate::row_codec::Value::Vector(embedding.to_vec()),
+            crate::row_codec::Value::Text(path.to_string()),
+            crate::row_codec::Value::Text(body.to_string()),
+        ]
+    }
+
+    #[test]
+    fn replace_same_path_replaces_rows_and_leaves_other_paths_untouched() {
+        let path = unique_db_path("replace-same-path");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx,
+            "path",
+            "other.txt",
+            Visibility::Private,
+            &[row_values([9.0, 9.0], "other.txt", "unrelated")],
+        )
+        .expect("seed other path");
+
+        let first = replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx,
+            "path",
+            "note.txt",
+            Visibility::Private,
+            &[row_values([1.0, 0.0], "note.txt", "v1 chunk a")],
+        )
+        .expect("first replace should succeed");
+        assert_eq!(first.removed, 0);
+        assert_eq!(first.inserted, 1);
+        assert!(first.first_id.is_some());
+
+        let second = replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx,
+            "path",
+            "note.txt",
+            Visibility::Private,
+            &[
+                row_values([2.0, 0.0], "note.txt", "v2 chunk a"),
+                row_values([2.0, 1.0], "note.txt", "v2 chunk b"),
+            ],
+        )
+        .expect("second replace should succeed");
+        assert_eq!(second.removed, 1);
+        assert_eq!(second.inserted, 2);
+        // 採番は既存最大 id + 1 から連番であり、他パス・旧チャンクの id と衝突しない。
+        assert!(second.first_id.unwrap() > first.first_id.unwrap());
+
+        // 他パスは無変更。
+        let visible_ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let rows = visible_rows(&storage, "docs", &visible_ctx).expect("visible rows");
+        let bodies: Vec<&str> = rows
+            .iter()
+            .map(|r| {
+                let scanned =
+                    crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
+                        .expect("scan scalar columns");
+                scanned.get(2).copied().flatten().unwrap_or("")
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(bodies.contains(&"unrelated"));
+        assert!(bodies.contains(&"v2 chunk a"));
+        assert!(bodies.contains(&"v2 chunk b"));
+        assert!(!bodies.contains(&"v1 chunk a"));
+    }
+
+    #[test]
+    fn replace_does_not_touch_other_tenants_same_path_rows() {
+        let path = unique_db_path("replace-tenant-isolation");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx_b,
+            "path",
+            "shared.txt",
+            Visibility::Private,
+            &[row_values([1.0, 1.0], "shared.txt", "tenant-b content")],
+        )
+        .expect("tenant-b seed should succeed");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx_a,
+            "path",
+            "shared.txt",
+            Visibility::Private,
+            &[row_values([2.0, 2.0], "shared.txt", "tenant-a content")],
+        )
+        .expect("tenant-a replace should succeed");
+
+        let visible_ctx_b =
+            PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let rows_b = visible_rows(&storage, "docs", &visible_ctx_b).expect("visible rows");
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].tenant_id, "tenant-b");
+    }
+
+    #[test]
+    fn replace_empty_rows_and_no_match_does_not_bump_generation() {
+        let path = unique_db_path("replace-empty-noop");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let before = storage.current_generation().expect("read generation");
+        let outcome = replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx,
+            "path",
+            "absent.txt",
+            Visibility::Private,
+            &[],
+        )
+        .expect("no-op replace should succeed");
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.inserted, 0);
+        assert_eq!(outcome.first_id, None);
+        let after = storage.current_generation().expect("read generation");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn replace_rejects_table_without_vector_column() {
+        let path = unique_db_path("replace-no-vector-column");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("path", ColumnType::Text, false)],
+            ))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let err = replace_typed_rows_by_text_key(
+            &storage,
+            "docs",
+            &ctx,
+            "path",
+            "a.txt",
+            Visibility::Private,
+            &[vec![crate::row_codec::Value::Text("a.txt".to_string())]],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TenantWriteError::Catalog(CatalogError::Invalid(_))
+        ));
     }
 }

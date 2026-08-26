@@ -198,12 +198,15 @@ pub struct QueryResult {
     pub rows: Vec<ResultRow>,
 }
 
-/// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。単一行 INSERT の
-/// みを受理するため常に `1` になるが、`INSERT 0 1` 相当の wire 応答（TASK-73）へ
-/// 写像しやすいよう件数フィールドとして保持する。
+/// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。行形 `INSERT` は
+/// 単一行のみを受理するため `rows_affected` は常に `1` になるが、
+/// `INSERT 0 1` 相当の wire 応答（TASK-73）へ写像しやすいよう件数フィールドとして
+/// 保持する。ファイル形 `INSERT`（TASK-120・INDEX-1, INDEX-2）は複数チャンク行を
+/// 書き込むため `incremental` に計測・件数を保持し、行形では常に `None`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InsertOutcome {
     pub rows_affected: u64,
+    pub incremental: Option<crate::incremental::IndexOutcome>,
 }
 
 impl From<RowCodecError> for SqlSurfaceError {
@@ -1057,7 +1060,73 @@ pub fn execute_insert(
         },
     })?;
 
-    Ok(InsertOutcome { rows_affected: 1 })
+    Ok(InsertOutcome {
+        rows_affected: 1,
+        incremental: None,
+    })
+}
+
+/// ファイル形 `INSERT`（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）を実行する。
+/// `sql::parser::bind_insert_form` が判別した `BoundFileInsert` を受け取り、
+/// `incremental::index_file` へ委譲する。`embedder` が未設定（`None`）の場合は
+/// fail-closed に拒否する（意味のないベクトルが黙って索引化される fail-open を
+/// 防ぐ。`core.rs::EngineCore` モジュールドキュメント参照）。
+///
+/// `IncrementalError` → `SqlSurfaceError` の写像をここに集約する（他の SQL 表層
+/// エラー写像と同じ「呼び出し元の型で fail-closed に丸める」方針。security.md
+/// 「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
+pub fn execute_file_insert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    embedder: Option<&dyn crate::embedding::Embedder>,
+    config: &crate::incremental::IncrementalConfig,
+    bound: &crate::sql::parser::BoundFileInsert,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    let embedder = embedder.ok_or_else(|| SqlSurfaceError::Internal {
+        detail: "no embedder configured for file-form insert".to_string(),
+    })?;
+
+    let input = crate::incremental::BoundFileIndexInput {
+        table: &bound.table,
+        path: &bound.path,
+        body: &bound.body,
+        template_values: &bound.template_values,
+        path_column_index: bound.path_column_index,
+        body_column_index: bound.body_column_index,
+        vector_column_index: bound.vector_column_index,
+    };
+
+    let outcome = crate::incremental::index_file(storage, ctx, embedder, config, &input)
+        .map_err(map_incremental_error)?;
+
+    Ok(InsertOutcome {
+        rows_affected: outcome.rows_replaced as u64,
+        incremental: Some(outcome),
+    })
+}
+
+/// [`crate::incremental::IncrementalError`] を SQL 表層のエラー契約へ写像する
+/// （`execute_file_insert` の唯一の呼び出し元。detail はサーバー内部の固定文言・
+/// チャンク数等の非機密情報のみで、本文・応答本文は含めない）。
+fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceError {
+    use crate::incremental::IncrementalError;
+    use crate::tenant::TenantWriteError;
+
+    match e {
+        IncrementalError::ChunkingTooLarge(detail) => SqlSurfaceError::payload_too_large(detail),
+        IncrementalError::Embed(_) => SqlSurfaceError::Internal {
+            detail: "embedding failed".to_string(),
+        },
+        IncrementalError::Write(TenantWriteError::Catalog(CatalogError::TableNotFound(name))) => {
+            SqlSurfaceError::UndefinedTable { name }
+        }
+        IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
+            SqlSurfaceError::invalid_input("insert rejected: invalid row")
+        }
+        IncrementalError::Write(_) => SqlSurfaceError::Internal {
+            detail: "incremental index write failed".to_string(),
+        },
+    }
 }
 
 #[cfg(test)]

@@ -692,6 +692,195 @@ pub fn bind_insert(
     })
 }
 
+/// ファイル形 `INSERT` の束縛結果（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
+///
+/// `sql::exec::execute_file_insert` → `incremental::index_file` へ渡され、`path`/`body`
+/// はそのままチャンク化の入力になる（`incremental.rs` モジュールドキュメント参照）。
+/// `template_values` はスキーマ列順で、`path`/`body`/VECTOR 列の位置は
+/// プレースホルダ（各チャンク行の構築時に上書きされる）、それ以外の Text 列
+/// （例 `lang`）は全チャンク行へ複製される値を保持する。
+#[derive(Debug, Clone)]
+pub struct BoundFileInsert {
+    pub table: String,
+    pub path: String,
+    pub body: String,
+    pub path_column_index: usize,
+    pub body_column_index: usize,
+    pub vector_column_index: usize,
+    pub template_values: Vec<crate::row_codec::Value>,
+    pub operation_id: OperationId,
+}
+
+/// [`bind_insert_form`] の束縛結果。行形（既存の 1 行 1 ID `INSERT`）とファイル形
+/// （TASK-120。サーバー側チャンク化・ベクトル化を経由する `INSERT`）を区別する。
+#[derive(Debug, Clone)]
+pub enum BoundInsertForm {
+    Row(BoundInsert),
+    File(BoundFileInsert),
+}
+
+/// `ValidatedInsert` の列リストから行形・ファイル形いずれの `INSERT` かを束縛段階で
+/// 判別し、対応する束縛結果を返す（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2）。
+/// 許可リスト（`sql::allowlist`）・構文（`sql::lexer`）は行形・ファイル形で共通の
+/// ままであり、本関数だけが形を分岐させる（`sql/exec.rs`・`core.rs` の呼び出し元
+/// モジュールドキュメント参照）。
+///
+/// 判別規則（すべて満たす場合のみファイル形）:
+/// - 列リストに疑似列 `id` を含まない
+/// - 列リストに、スキーマ上 `VECTOR` 型である列を含まない
+/// - 列リストに Text 列 `path` と `body` を両方含む
+///
+/// いずれか 1 つでも欠ける場合（`id` または VECTOR 列を同時指定した場合を含む）は
+/// 行形として扱い、[`bind_insert`] の既存の検証（`22000`）にそのまま委ねる
+/// （黙って片方の形へ丸めない。行形の既存テスト・エラー契約は本関数導入後も無変更）。
+pub fn bind_insert_form(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+) -> Result<BoundInsertForm, SqlSurfaceError> {
+    let has_id = stmt.columns.iter().any(|c| c == "id");
+    let has_vector_column = stmt.columns.iter().any(|c| {
+        schema
+            .columns
+            .iter()
+            .any(|sc| &sc.name == c && matches!(sc.ty, ColumnType::Vector(_)))
+    });
+    let has_path = stmt.columns.iter().any(|c| c == "path");
+    let has_body = stmt.columns.iter().any(|c| c == "body");
+
+    if !has_id && !has_vector_column && has_path && has_body {
+        bind_file_insert(stmt, schema).map(BoundInsertForm::File)
+    } else {
+        bind_insert(stmt, schema).map(BoundInsertForm::Row)
+    }
+}
+
+/// [`bind_insert_form`] がファイル形と判定した場合の束縛本体。
+fn bind_file_insert(
+    stmt: &ValidatedInsert,
+    schema: &TableSchema,
+) -> Result<BoundFileInsert, SqlSurfaceError> {
+    if stmt.columns.len() != stmt.values.len() {
+        return Err(SqlSurfaceError::invalid_input(
+            "INSERT column count does not match value count",
+        ));
+    }
+
+    let mut seen_columns: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for name in &stmt.columns {
+        if !seen_columns.insert(name.as_str()) {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "duplicate column in INSERT column list: {name}"
+            )));
+        }
+    }
+
+    let vector_column_index = schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+        .ok_or_else(|| SqlSurfaceError::invalid_input("table has no VECTOR column"))?;
+    let path_column_index = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "path")
+        .ok_or_else(|| SqlSurfaceError::invalid_input("table has no path column"))?;
+    let body_column_index = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "body")
+        .ok_or_else(|| SqlSurfaceError::invalid_input("table has no body column"))?;
+    match schema.columns.get(path_column_index) {
+        Some(c) if matches!(c.ty, ColumnType::Text) => {}
+        _ => return Err(SqlSurfaceError::invalid_input("path column must be Text")),
+    }
+    match schema.columns.get(body_column_index) {
+        Some(c) if matches!(c.ty, ColumnType::Text) => {}
+        _ => return Err(SqlSurfaceError::invalid_input("body column must be Text")),
+    }
+
+    let mut template_values: Vec<crate::row_codec::Value> =
+        vec![crate::row_codec::Value::Null; schema.columns.len()];
+    let mut provided = vec![false; schema.columns.len()];
+    let mut path_value: Option<String> = None;
+    let mut body_value: Option<String> = None;
+
+    for (name, literal) in stmt.columns.iter().zip(stmt.values.iter()) {
+        let col_idx = schema
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let column = schema
+            .columns
+            .get(col_idx)
+            .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown column: {name}")))?;
+        let value = match (column.ty, literal) {
+            (ColumnType::Text, InsertLiteral::String(s)) => {
+                crate::row_codec::Value::Text(s.clone())
+            }
+            (ColumnType::Text, InsertLiteral::Number(_)) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?} expects a text literal, got a number"
+                )))
+            }
+            // `bind_insert_form` の判別規則により VECTOR 列名は列リストに含まれない
+            // 前提だが、防御的に拒否する（各チャンクのベクトルはサーバー側が
+            // `incremental.rs` で埋め込み結果から設定し、クライアント入力を使わない）。
+            (ColumnType::Vector(_), _) => {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "column {name:?}: VECTOR column must not be provided for file-form INSERT"
+                )))
+            }
+        };
+        if col_idx == path_column_index {
+            if let crate::row_codec::Value::Text(ref s) = value {
+                path_value = Some(s.clone());
+            }
+        }
+        if col_idx == body_column_index {
+            if let crate::row_codec::Value::Text(ref s) = value {
+                body_value = Some(s.clone());
+            }
+        }
+        if let Some(slot) = template_values.get_mut(col_idx) {
+            *slot = value;
+        }
+        if let Some(flag) = provided.get_mut(col_idx) {
+            *flag = true;
+        }
+    }
+
+    for (idx, column) in schema.columns.iter().enumerate() {
+        if matches!(column.ty, ColumnType::Vector(_)) {
+            // VECTOR 列はクライアントが指定しない（埋め込み結果で後から埋める）。
+            continue;
+        }
+        let is_provided = provided.get(idx).copied().unwrap_or(false);
+        if !is_provided && !column.nullable {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "column {:?} is not nullable but was not provided",
+                column.name
+            )));
+        }
+    }
+
+    let path = path_value
+        .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for path column"))?;
+    let body = body_value
+        .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for body column"))?;
+
+    Ok(BoundFileInsert {
+        table: stmt.table_name.clone(),
+        path,
+        body,
+        path_column_index,
+        body_column_index,
+        vector_column_index,
+        template_values,
+        operation_id: stmt.operation_id.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,6 +1314,145 @@ mod tests {
     fn rejects_insert_duplicate_column_in_list() {
         let err = bind_insert_sql(
             "INSERT INTO documents (id, id) VALUES (1, 2) USING OPERATION_ID 'op-0001'",
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- bind_insert_form: 形判別（TASK-120・INDEX-1, INDEX-2） -----------------
+
+    fn file_docs_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    fn bind_insert_form_sql_with_schema(
+        sql: &str,
+        schema: &TableSchema,
+    ) -> Result<BoundInsertForm, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt =
+            crate::sql::allowlist::validate_insert(sql, &lookup).expect("must pass allowlist");
+        bind_insert_form(&stmt, schema)
+    }
+
+    #[test]
+    fn bind_insert_form_detects_file_form_without_id_or_vector_column() {
+        let bound = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body) VALUES ('a.txt', 'hello world') USING OPERATION_ID 'op-file-1'",
+            &file_docs_schema(),
+        )
+        .expect("bind_insert_form should succeed");
+        match bound {
+            BoundInsertForm::File(f) => {
+                assert_eq!(f.table, "documents");
+                assert_eq!(f.path, "a.txt");
+                assert_eq!(f.body, "hello world");
+                assert_eq!(f.vector_column_index, 0);
+                assert_eq!(f.path_column_index, 1);
+                assert_eq!(f.body_column_index, 2);
+            }
+            BoundInsertForm::Row(_) => panic!("expected file form"),
+        }
+    }
+
+    #[test]
+    fn bind_insert_form_detects_row_form_with_id_and_vector_column() {
+        let bound = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (id, embedding, path, body) VALUES (1, '[0.1,0.2,0.3]', 'a.txt', 'hello') USING OPERATION_ID 'op-row-1'",
+            &file_docs_schema(),
+        )
+        .expect("bind_insert_form should succeed");
+        match bound {
+            BoundInsertForm::Row(r) => {
+                assert_eq!(r.id, 1);
+            }
+            BoundInsertForm::File(_) => panic!("expected row form"),
+        }
+    }
+
+    #[test]
+    fn bind_insert_form_treats_id_plus_path_body_as_row_form_and_fails_without_vector() {
+        // path/body を指定していても id を同時指定した場合は行形として扱われ、
+        // 行形の既存検証（embedding 未提供で 22000）にそのまま倒れる。
+        let err = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (id, path, body) VALUES (1, 'a.txt', 'hello') USING OPERATION_ID 'op-row-2'",
+            &file_docs_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_insert_form_treats_vector_plus_path_body_as_row_form_and_fails_without_id() {
+        // VECTOR 列を同時指定した場合も行形として扱われ、id 未提供で 22000 になる。
+        let err = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (embedding, path, body) VALUES ('[0.1,0.2,0.3]', 'a.txt', 'hello') USING OPERATION_ID 'op-row-3'",
+            &file_docs_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_insert_form_file_form_missing_body_falls_back_to_row_form_and_fails() {
+        // path のみ・body 欠落は行形へフォールバックし、id 未提供で 22000 になる
+        // （黙って file 形へ丸めない）。
+        let err = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path) VALUES ('a.txt') USING OPERATION_ID 'op-row-4'",
+            &file_docs_schema(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_insert_form_file_form_copies_other_text_column_into_template_values() {
+        let bound = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body, lang) VALUES ('a.txt', 'hello', 'ja') USING OPERATION_ID 'op-file-2'",
+            &file_docs_schema(),
+        )
+        .expect("bind_insert_form should succeed");
+        match bound {
+            BoundInsertForm::File(f) => {
+                assert_eq!(
+                    f.template_values.get(3),
+                    Some(&crate::row_codec::Value::Text("ja".to_string()))
+                );
+            }
+            BoundInsertForm::Row(_) => panic!("expected file form"),
+        }
+    }
+
+    #[test]
+    fn bind_insert_form_file_form_rejects_missing_non_nullable_text_column() {
+        let mut schema = file_docs_schema();
+        // `lang` を非 nullable 化して未指定時に 22000 になることを確認する。
+        if let Some(c) = schema.columns.get_mut(3) {
+            c.nullable = false;
+        }
+        let err = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body) VALUES ('a.txt', 'hello') USING OPERATION_ID 'op-file-3'",
+            &schema,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_insert_form_rejects_table_without_path_or_body_column() {
+        let err = bind_insert_form_sql_with_schema(
+            "INSERT INTO documents (path, body) VALUES ('a.txt', 'hello') USING OPERATION_ID 'op-file-4'",
+            &docs_schema(),
         )
         .unwrap_err();
         assert_eq!(err.wire_code(), "22000");

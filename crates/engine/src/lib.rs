@@ -120,8 +120,17 @@
 //! TASK-119（対象ビヘイビア: INDEX-3）: `chunking.rs` が `INSERT` 経由で届く
 //! ファイル内容（パス＋本文）をファイル種別ごとの方針でチャンク列へ分割する
 //! 純関数的な API を提供する（詳細は `chunking.rs` モジュールドキュメント参照）。
-//! 増分インデックスへの結線（TASK-120）・一括投入上限（TASK-122、対象ビヘイビア:
-//! INDEX-4）は後続タスクの管轄。
+//!
+//! TASK-120（対象ビヘイビア: INDEX-1, INDEX-2）: `embedding.rs` の `Embedder` trait・
+//! 決定的参照実装 `HashingEmbedder` と、`incremental.rs::index_file` がこれを
+//! 束ねてファイル形 `INSERT`（`chunking.rs` によるチャンク化 → 注入型 `Embedder` に
+//! よるベクトル化 → `tenant.rs::replace_typed_rows_by_text_key` による同一パス
+//! 置換書き込み）を実行する。行形 `INSERT`（`sql::parser::bind_insert`）とは
+//! `sql::parser::bind_insert_form` の束縛段階の形判別で分岐し、既存の許可リスト
+//! 構文（`sql::allowlist`）は変更しない。`core::EngineCore::execute_insert_sql` が
+//! 分岐の入口（詳細は `embedding.rs`・`incremental.rs`・`sql/parser.rs` モジュール
+//! ドキュメント参照）。一括投入上限（TASK-122、対象ビヘイビア: INDEX-4）・外部埋め込み
+//! サービス実クライアントの接続は後続タスクの管轄。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -131,7 +140,9 @@ pub mod catalog;
 pub mod chunking;
 pub mod core;
 pub mod dispatch;
+pub mod embedding;
 pub mod hybrid;
+pub mod incremental;
 pub mod isa;
 pub mod kernel;
 pub mod parallel_search;
