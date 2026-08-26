@@ -28,7 +28,7 @@ use engine::sql::exec::{Cell, QueryResult};
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 use engine::storage::{Storage, Visibility};
-use engine::wasm_udf::{WasmUdfBackend, WasmUdfError};
+use engine::wasm_udf::{TrapKind, WasmUdfBackend, WasmUdfError};
 
 static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -63,14 +63,14 @@ impl WasmUdfBackend for MockNormScaleBackend {
     fn call_vector_scalar(&self, v: &[f32], scalar: f64) -> Result<f64, WasmUdfError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         if self.force_err {
-            return Err(WasmUdfError::Trap("mock forced failure"));
+            return Err(WasmUdfError::Trap(TrapKind::Other));
         }
         let sum_sq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
         let norm = sum_sq.sqrt();
         if norm == 0.0 {
             // 実バックエンドの 0 除算相当の失敗を模す（`vec_div` の 0 除算 fail-closed
             // と同じ経路をエラー写像側〔`udf_call::eval`〕で確認するための仕込み）。
-            return Err(WasmUdfError::Trap("division by zero"));
+            return Err(WasmUdfError::Trap(TrapKind::Unreachable));
         }
         let sum: f64 = v.iter().map(|&x| x as f64 / norm).sum();
         Ok(scalar * sum)
@@ -570,17 +570,4 @@ fn wasm_call_with_wrong_argument_type_is_rejected() {
         .expect_err("argument type mismatch must be rejected at bind time");
     assert_eq!(err.wire_code(), "22000");
     assert_eq!(call_count.load(Ordering::SeqCst), 0);
-}
-
-// --- `compile()` の未実装時の契約（wasmtime 依存の承認待ち） -----------------------
-
-#[test]
-fn compile_returns_runtime_unavailable_without_backend() {
-    let err = engine::wasm_udf::compile(
-        b"\0asm\x01\x00\x00\x00",
-        "f",
-        engine::wasm_udf::SandboxLimits::default(),
-    )
-    .expect_err("compile must fail until the wasmtime backend is approved and implemented");
-    assert_eq!(err, WasmUdfError::RuntimeUnavailable);
 }

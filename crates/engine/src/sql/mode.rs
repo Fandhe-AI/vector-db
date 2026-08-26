@@ -170,13 +170,14 @@ impl SessionState {
         &mut self.udfs
     }
 
-    /// TASK-149（対象ビヘイビア: EXT-5, EXT-6）: コンパイル済み WASM UDF
-    /// （`crate::wasm_udf::compile` の戻り値）をこのセッションのレジストリへ登録
-    /// する。検証・名前空間の衝突検査は `udf_call::define_wasm_function` が担い、
-    /// 登録は宣言的 UDF と同じ「セッション（＝認証済みテナントの接続単位）に
-    /// 閉じる・永続化しない」構造に従う。SQL からの登録構文（`CREATE FUNCTION
-    /// ... AS WASM ...`）・wire 経由のモジュール搬送は本タスクのスコープ外で、
-    /// 呼び出し元がモジュールバイト列の取得・コンパイルを担う。
+    /// TASK-149（対象ビヘイビア: EXT-5, EXT-6）: 検証済みの `Arc<dyn WasmUdfBackend>`
+    /// をこのセッションのレジストリへ登録する。名前空間の衝突検査は
+    /// `udf_call::define_wasm_function` が担い、登録は宣言的 UDF と同じ
+    /// 「セッション（＝認証済みテナントの接続単位）に閉じる・永続化しない」構造に
+    /// 従う。SQL からの登録構文（`CREATE FUNCTION ... AS WASM ...`）・wire 経由の
+    /// モジュール搬送・モジュールバイト列からのバックエンド構築（wasmtime 依存の
+    /// ユーザー承認待ち。`crate::wasm_udf` モジュールドキュメント参照）は本タスクの
+    /// スコープ外で、呼び出し元が検証済みバックエンドの構築を担う。
     pub fn register_wasm_udf(
         &mut self,
         name: &str,

@@ -356,12 +356,13 @@ pub fn define_function(
     Ok(())
 }
 
-/// コンパイル済み WASM UDF（`crate::wasm_udf::compile` の戻り値）をセッションの
-/// レジストリへ登録する（TASK-149、対象ビヘイビア: EXT-5, EXT-6。
-/// `sql::mode::SessionState::register_wasm_udf` から呼ばれる）。名前空間・上限は
-/// 宣言的 UDF（[`define_function`]）と共有し、SQL からの `CREATE FUNCTION` 構文・
-/// wire 経由のモジュール搬送は本タスクのスコープ外（呼び出し元がモジュールバイト
-/// 列の取得・コンパイルを担う）。
+/// 検証済みの `Arc<dyn WasmUdfBackend>` をセッションのレジストリへ登録する
+/// （TASK-149、対象ビヘイビア: EXT-5, EXT-6。`sql::mode::SessionState::register_wasm_udf`
+/// から呼ばれる）。名前空間・上限は宣言的 UDF（[`define_function`]）と共有し、
+/// SQL からの `CREATE FUNCTION` 構文・wire 経由のモジュール搬送・モジュールバイト
+/// 列からのバックエンド構築（wasmtime 依存のユーザー承認待ち。`crate::wasm_udf`
+/// モジュールドキュメント参照）は本タスクのスコープ外（呼び出し元が検証済み
+/// バックエンドの構築を担う）。
 pub fn define_wasm_function(
     registry: &mut UdfRegistry,
     name: &str,
