@@ -42,8 +42,10 @@ fn is_allowed_where_predicate_name(name: &str) -> bool {
 
 /// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
 /// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
-/// と同方針）。
-fn is_aggregate_function_name(name: &str) -> bool {
+/// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
+/// ため参照される（CREATE FUNCTION での集計関数名との衝突を防ぐ。Cursor Bugbot
+/// 指摘対応・PR #229）。
+pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"

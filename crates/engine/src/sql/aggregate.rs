@@ -382,7 +382,7 @@ pub(crate) fn execute_aggregate(
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
             let (k, v) = entry.map_err(storage_internal)?;
-            let (_key_tenant, id) = k.value();
+            let (key_tenant, id) = k.value();
             let buf = v.value();
 
             // RLS 段（無条件・デコード前）: `arena.rs` の走査ループと同一の順序
@@ -397,8 +397,11 @@ pub(crate) fn execute_aggregate(
             }
 
             // ここに到達するのは可視行のみ。以降は完全デコードして SCALAR 段・
-            // 集計へ進む。
-            let row = storage::decode_row(id, buf).map_err(storage_internal)?;
+            // 集計へ進む。複合キー側の `key_tenant` とヘッダ側 `tenant_id` の
+            // 不一致（内部バグ・raw redb 書き込みによる異常）を fail-closed に
+            // 拒否するため、単純な `decode_row` ではなく `decode_row_for_key`
+            // （TABLE-12 の整合検査）を使う（codex P0 指摘対応。PR #229）。
+            let row = storage::decode_row_for_key(key_tenant, id, buf).map_err(storage_internal)?;
             if let Some(dim) = expected_dim {
                 let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
                 if found != dim {
