@@ -10,7 +10,7 @@
 //!
 //! [`contrast`]（`contrast-bench` feature 限定）は CORE-5（対照エンジン比較・
 //! Issue #176）の対照エンジンアダプタを提供する。`contrast_bench.rs` からのみ
-//! 呼ばれ、`parallel_bench.rs`（CORE-3/CORE-4）・`accept.rs` の他判定関数からは
+//! 呼ばれ、`simd_bench.rs`（CORE-3/CORE-4）・`accept.rs` の他判定関数からは
 //! 独立している（対照エンジン側の障害〔C++ FFI 含む〕が CORE-3/CORE-4 のゲートへ
 //! 波及しない failure domain 分離。`contrast.rs` 冒頭コメント参照）。
 //!
@@ -51,5 +51,6 @@ pub mod contrast;
 pub mod env_report;
 pub mod protocol;
 pub mod rng;
+pub mod scalar_reference;
 pub mod sql_c1;
 pub mod stats;

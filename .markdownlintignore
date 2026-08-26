@@ -1,8 +1,13 @@
 # markdownlint の除外パス。ルール設定本体は .markdownlint.jsonc を参照する。
 # .agents/skills/（upstream 配布のスキル実体。修正先は agent-cli-skills）と
 # docs/spec/（private submodule。lint 対象外）はリポジトリ管理外として除外する。
+# target/ は cargo のビルド生成物置き場で、TASK-127 CORE-5（Issue #176）で追加した
+# usearch の cxx bridge が upstream の README.md を展開するため、ローカルビルド後の
+# make lint-docs が第三者ドキュメントを検査してしまう（CI の lint-docs ジョブは
+# 素の checkout で走るため元々対象外）。git 管理外の生成物として除外する。
 _/
 .claude/
 .agents/skills/
 docs/spec/
 node_modules/
+target/

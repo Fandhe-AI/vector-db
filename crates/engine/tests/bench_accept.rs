@@ -1,7 +1,7 @@
 //! `benches/harness/accept.rs`（TASK-127 受け入れ判定ヘルパ）の回帰テスト。
 //!
 //! 対象ビヘイビア: CORE-3, CORE-4, CORE-5, SEARCH-4（ポインタ: `docs/spec/05-tasks.md`
-//! TASK-127）。`parallel_bench.rs`・`contrast_bench.rs` は時間依存のためこのテストからは
+//! TASK-127）。`simd_bench.rs`・`contrast_bench.rs` は時間依存のためこのテストからは
 //! 実行しない（`tests/bench_harness.rs` と同様、実測タイマーに依存しない判定ロジックのみを
 //! `#[path]` で取り込み `cargo test`（`make ci` 対象）で検証する）。CORE-5 は
 //! `contrast_bench.rs` で接続済み（Issue #176）。
@@ -177,13 +177,13 @@ fn check_recall_within_limit_rejects_out_of_range_min_recall() {
 #[test]
 fn check_recall_within_limit_rejects_zero_min_recall() {
     // 0.0 を許容すると「どんな recall 値でも pass」となり CORE-4 のゲートが
-    // 実質的に無効化されるため、`min_recall_from_env`（parallel_bench.rs）と同様に
+    // 実質的に無効化されるため、`min_recall_from_env`（simd_bench.rs）と同様に
     // 下限からも除外する（`(0.0, 1.0]`）。
     let err = check_recall_within_limit(0.0, 0.0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
-// check_contrast_ratio_within_limit（CORE-5。本 PR では parallel_bench.rs から未接続だが
+// check_contrast_ratio_within_limit（CORE-5。本 PR では simd_bench.rs から未接続だが
 // 判定ロジック自体は検証しておく）。
 
 #[test]

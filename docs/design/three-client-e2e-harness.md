@@ -1,9 +1,10 @@
 # ADR: 3 クライアント統合検証ハーネスの層 A/層 B 分割（WIRE-1）
 
 - ステータス: Accepted
-- 対応: TASK-73（WIRE-1）、TASK-165（SQL-12・SEARCH-9）
+- 対応: TASK-73（WIRE-1）、TASK-165（SQL-12・SEARCH-9）、TASK-168（SQL-13・SQL-14）
 - 関連: TASK-67・TASK-68・TASK-69・TASK-70・TASK-71（wire プロトコル層）、
-  TASK-74・TASK-75・TASK-80・TASK-161・TASK-162（SQL 表層）、TASK-137（RLS 暗黙適用）
+  TASK-74・TASK-75・TASK-80・TASK-161・TASK-162・TASK-166・TASK-167（SQL 表層）、
+  TASK-137（RLS 暗黙適用）
 
 ## 背景
 
@@ -60,6 +61,28 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
   未知モード値の拒否）のみを検証し、層 A で確定済みの全閾値パターンを層 B へ
   複製しない（層 B は無改造クライアント経由の受信確認が目的であり、閾値の
   網羅は層 A の責務）。
+
+### TASK-168: 集計クエリ（SQL-13／SQL-14）の検証範囲
+
+集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`。SQL-13）・`GROUP BY`/`HAVING`
+集計（SQL-14）の wire 経由検証も同じ層分割に従う。
+
+- **層 A**（`crates/wire-server/tests/wire_aggregate.rs`）: 主たる回帰保護。
+  単一行集計・`GROUP BY` の既定順（キー昇順）・`HAVING`・`ORDER BY`／`LIMIT`、
+  空集合契約（`COUNT`=0、他は NULL）、数値オーバーフロー（`22003`）・
+  型不整合／許可形状外（`22000`／`42601`）の拒否経路、テナント境界（他
+  テナントの `Private` 行を大量追加しても `COUNT`／`GROUP BY` の結果が
+  不変であること）を、生バイトの wire クライアントで常時（`make ci`）検証
+  する。
+- **層 B**（`crates/wire-server/tests/three_client_e2e.rs`）: `docs` テーブルに
+  Private 行（他テナントにのみ存在するグループ値を含む）を追加した専用 seed
+  （`seed_aggregate_three_tenant_db`）に対し、単一行集計・`GROUP BY`/`HAVING`・
+  RLS 不変（Private 専用グループが現れない）・拒否経路 2 種（型不整合・
+  許可形状外）の代表ケースのみを 3 クライアントで検証する。Node `pg` の
+  `Object.values(row)` 出力仕様（同名列の衝突）を避けるためすべての SELECT に
+  一意の `AS` 別名を付け、NULL 描画の描画差異（psql／psycopg／pg で表現が
+  異なる）を避けるため NULL を返す SQL は使わない（NULL 契約は層 A の
+  DataRow -1 長検証に閉じる）。
 
 ## 影響
 

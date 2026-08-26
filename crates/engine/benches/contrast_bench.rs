@@ -9,19 +9,19 @@
 //! （CORE-5 の判定統計量の詳細は `docs/spec/04-behavior/core-engine.md` CORE-5 が
 //! SSOT のため本コメントでは転記しない）。
 //!
-//! `parallel_bench.rs`（CORE-3/CORE-4）とは独立バイナリに分離してある
+//! `simd_bench.rs`（CORE-3/CORE-4）とは独立バイナリに分離してある
 //! （`Cargo.toml` の `[[bench]] contrast_bench` コメント参照）。対照エンジン側は
 //! C++ FFI（`usearch`）を経由するため、そちらの障害・ビルド失敗が CORE-3/CORE-4 の
 //! ゲートへ波及しない failure domain 分離が目的。`required-features =
 //! ["contrast-bench"]` により feature 無指定のビルド（`make check-cross` 等）では
 //! 本ターゲット自体がスキップされる。
 //!
-//! 測定条件（`ROW_COUNT`・`DIM`・`TOP_K`・シード）は `parallel_bench.rs` と同一値を
+//! 測定条件（`ROW_COUNT`・`DIM`・`TOP_K`・シード）は `simd_bench.rs` と同一値を
 //! 用いる（同一データでの比較が CORE-5 の前提のため）。
 //!
 //! 閾値は `BENCH_MAX_CONTRAST_RATIO` 環境変数（有限・正の浮動小数点）から注入する。
 //! 未設定・不正値は fail-closed で非ゼロ終了する（`harness::accept::
-//! parse_contrast_ratio_limit`。`parallel_bench.rs` の `max_p95_from_env` と同一方針）。
+//! parse_contrast_ratio_limit`。`simd_bench.rs` の `max_p95_from_env` と同一方針）。
 //! 閾値そのものは spec が SSOT のため標準出力へは出力しない
 //! （`.claude/rules/spec-confidentiality.md`）。
 //!
@@ -48,7 +48,7 @@ use harness::rng::DeterministicRng;
 use engine::kernel::{SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 
-/// 測定条件。`parallel_bench.rs` と同一値（CORE-5 は同一データでの比較が前提）。
+/// 測定条件。`simd_bench.rs` と同一値（CORE-5 は同一データでの比較が前提）。
 const ROW_COUNT: usize = 100_000;
 const DIM: usize = 768;
 const TOP_K: usize = 20;
@@ -180,7 +180,7 @@ fn main() {
 
     // `run_ab` が既に成功しているため `measurement.a/b.samples` は非空
     // （`stats::summarize` が空サンプルを `Err` で早期リターンする契約。
-    // `parallel_bench.rs` の p95 算出と同一の `expect` 方針）。
+    // `simd_bench.rs` の p95 算出と同一の `expect` 方針）。
     let candidate_p95 = harness::accept::p95_from_samples(&measurement.a.samples)
         .expect("non-empty samples must yield a p95");
     let contrast_p95 = harness::accept::p95_from_samples(&measurement.b.samples)

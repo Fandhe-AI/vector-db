@@ -67,7 +67,6 @@ use crate::batch_search::{
     ResidentMatrix, MAX_BATCH_TOTAL_BYTES,
 };
 use crate::dispatch::{self, DispatchInput, ExecutionPath, GpuCapability};
-use crate::kernel::CandidateHit;
 use crate::storage::Visibility;
 
 /// primary バックエンド実行時のエラー種別（CORE-8 ポインタ）。GPU デバイス
@@ -157,12 +156,23 @@ impl std::error::Error for BatchExecError {}
 /// 一切返さず `Err` を返す）:
 /// - `Vec<BatchHit>` の長さが `queries.len()` と一致する
 /// - 各クエリの `hits.len()` が対応する `BatchQuery::k` 以下
-/// - 各 `CandidateHit::id` はそのバックエンドが走査対象とした常駐行列に実在する
-///   行の id で、かつ対応するクエリの `BatchQuery::ctx.is_visible(..)` を満たす
-/// - 各 `CandidateHit::score` は有限値
-/// - 同一クエリ内で id が重複しない
-/// - スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::into_sorted_vec` と
-///   同じ規約）
+/// - 各 `SearchHit` の `(tenant_id, id)` はそのバックエンドが走査対象とした常駐
+///   行列に実在する行のものであり、かつ対応するクエリの
+///   `BatchQuery::ctx.is_visible(..)` を満たす（対象ビヘイビア: TABLE-12・
+///   RLS-9。行 `id` の一意性スコープはテナント内に閉じているため、`id` 単独
+///   ではなく `(tenant_id, id)` の組で実在性を判定する）
+/// - 各 `SearchHit::score` は有限値
+/// - 同一クエリ内で `(tenant_id, id)` が重複しない
+/// - スコア降順・同点は常駐行列の行順（`batch_search.rs::run_batch_search` が
+///   実際に返す順序と同じ契約。`kernel.rs::TopKSelector::into_sorted_vec` の
+///   識別子昇順タイブレークが常駐行列のスロット番号で行われるため）。ここで
+///   言う「行順」は [`FallbackBatchEngine::build`] に渡された `ids`/
+///   `tenant_ids`/`vectors` 配列の並び（＝本実装が独立再検証で使う
+///   `self.cpu` のスロット番号）であり、`BatchBackend` 実装が内部で保持する
+///   任意の順序ではない。実装が内部で行を並べ替える場合、その並べ替えを
+///   考慮せずスコア降順・元の行順で同点タイブレークした結果を返す必要がある
+///   （そうしないと (4) の順序検証で正当な結果が `PrimaryResultRejected` に
+///   なる）
 ///
 /// 逆に、[`FallbackBatchEngine`] 経由で呼ばれる実装は `queries` を自前で
 /// 再検証する必要はない: [`FallbackBatchEngine::batch_search`] は
@@ -607,9 +617,13 @@ impl FallbackBatchEngine {
             .iter()
             .any(|q| q.ctx.is_visible(q.ctx.tenant_id(), Visibility::Public));
 
-        // id → (tenant, visibility) の逆引き表。`self.cpu.ids` は
-        // `ResidentMatrix::build`（[`Self::build`] 内で先に呼ばれる）が
-        // 一意性を検証済みのため、id は (tenant, visibility) を一意に決める。
+        // (tenant_id, id) → (slot, visibility) の逆引き表（対象ビヘイビア:
+        // TABLE-12・RLS-9。PR #205）。`self.cpu`（信頼済み CPU 常駐行列）は
+        // `ResidentMatrix::build` と同じ一意性検証を経ている（[`Self::build`]）
+        // ため、`(tenant_id, id)` は常駐行列内のスロットを一意に決める。
+        // 行 `id` の一意性スコープはテナント内に閉じているため、`id` 単独では
+        // 逆引きに使えない（自テナント行と他テナントの `Public` 行が同じ `id`
+        // を持ちうる）。
         let matching_row_count = self
             .cpu
             .tenant_ids
@@ -620,23 +634,26 @@ impl FallbackBatchEngine {
                     || (public_grant_query_count_nonzero && **v == Visibility::Public)
             })
             .count();
-        let mut id_to_tenant: HashMap<u64, (&str, Visibility)> = HashMap::new();
-        id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
-            BatchSearchError::AllocationFailed(format!(
-                "failed to reserve id-tenant map for primary result revalidation: {e}"
-            ))
-        })?;
-        for ((id, tenant), visibility) in self
+        let mut row_key_to_slot: HashMap<(&str, u64), (usize, Visibility)> = HashMap::new();
+        row_key_to_slot
+            .try_reserve(matching_row_count)
+            .map_err(|e| {
+                BatchSearchError::AllocationFailed(format!(
+                    "failed to reserve row-key map for primary result revalidation: {e}"
+                ))
+            })?;
+        for (idx, ((id, tenant), visibility)) in self
             .cpu
             .ids
             .iter()
             .zip(self.cpu.tenant_ids.iter())
             .zip(self.cpu.visibilities.iter())
+            .enumerate()
         {
             let is_reachable_public =
                 public_grant_query_count_nonzero && *visibility == Visibility::Public;
             if batch_tenants.contains(tenant.as_str()) || is_reachable_public {
-                id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
+                row_key_to_slot.insert((tenant.as_str(), *id), (idx, *visibility));
             }
         }
 
@@ -646,13 +663,15 @@ impl FallbackBatchEngine {
                 return Err(BatchSearchError::PrimaryResultRejected);
             }
 
-            let mut seen_ids: HashSet<u64> = HashSet::new();
-            seen_ids.try_reserve(batch_hit.hits.len()).map_err(|e| {
-                BatchSearchError::AllocationFailed(format!(
-                    "failed to reserve seen-id set for primary result revalidation: {e}"
-                ))
-            })?;
-            let mut prev: Option<&CandidateHit> = None;
+            let mut seen_row_keys: HashSet<(&str, u64)> = HashSet::new();
+            seen_row_keys
+                .try_reserve(batch_hit.hits.len())
+                .map_err(|e| {
+                    BatchSearchError::AllocationFailed(format!(
+                        "failed to reserve seen row-key set for primary result revalidation: {e}"
+                    ))
+                })?;
+            let mut prev: Option<(f32, usize)> = None;
             for hit in &batch_hit.hits {
                 // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を
                 // 持たず、後続の順序検証（`total_cmp`）が無意味になるため
@@ -660,32 +679,45 @@ impl FallbackBatchEngine {
                 if !hit.score.is_finite() {
                     return Err(BatchSearchError::PrimaryResultRejected);
                 }
-                // (3) id が重複しない（同じ行が同一クエリ内で複数回返らない）。
-                if !seen_ids.insert(hit.id) {
+                // (3) `(tenant_id, id)` が重複しない（同じ行が同一クエリ内で
+                // 複数回返らない。バックエンドが自称するテナント名をそのまま
+                // 使うが、後続 (5) でその名が信頼済み行と一致することを
+                // 独立に検証するため、偽装テナント名による重複回避は
+                // (5) で別途拒否される）。
+                if !seen_row_keys.insert((hit.tenant_id.as_str(), hit.id)) {
                     return Err(BatchSearchError::PrimaryResultRejected);
                 }
-                // (4) スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::
-                // into_sorted_vec` が実際に返す順序と同じ契約）。
-                if let Some(p) = prev {
-                    let out_of_order = match p.score.total_cmp(&hit.score) {
+                // (5) `(tenant_id, id)` が信頼済み常駐行列に存在し、かつ
+                // そのクエリの `PolicyContext::is_visible` を満たす（他
+                // テナント id・捏造 id・可視性偽装・テナント名偽装（実在
+                // する id に別テナント名を付けたヒット）のいずれも
+                // マップ不在として拒否する。テナント混入固有の違反のため
+                // `TenantMaskViolation` を使う）。(4) の順序判定に使う
+                // スロットを得るため、(4) より先に行う。
+                let Some(&(slot, visibility)) =
+                    row_key_to_slot.get(&(hit.tenant_id.as_str(), hit.id))
+                else {
+                    return Err(BatchSearchError::TenantMaskViolation);
+                };
+                if !q.ctx.is_visible(hit.tenant_id.as_str(), visibility) {
+                    return Err(BatchSearchError::TenantMaskViolation);
+                }
+                // (4) スコア降順・同点は常駐行列のスロット昇順
+                // （`batch_search.rs::run_batch_search` が実際に返す順序と
+                // 同じ契約。`kernel.rs::TopKSelector::into_sorted_vec` の
+                // 識別子昇順タイブレークが選出段でスロット番号に対して
+                // 行われるため）。
+                if let Some((prev_score, prev_slot)) = prev {
+                    let out_of_order = match prev_score.total_cmp(&hit.score) {
                         std::cmp::Ordering::Less => true,
-                        std::cmp::Ordering::Equal => p.id >= hit.id,
+                        std::cmp::Ordering::Equal => prev_slot >= slot,
                         std::cmp::Ordering::Greater => false,
                     };
                     if out_of_order {
                         return Err(BatchSearchError::PrimaryResultRejected);
                     }
                 }
-                prev = Some(hit);
-
-                // (5) id が信頼済み常駐行列に存在し、かつそのクエリの
-                // `PolicyContext::is_visible` を満たす（他テナント id・
-                // 捏造 id・可視性偽装のいずれも拒否する。テナント混入固有の
-                // 違反のため `TenantMaskViolation` を使う）。
-                match id_to_tenant.get(&hit.id) {
-                    Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
-                    _ => return Err(BatchSearchError::TenantMaskViolation),
-                }
+                prev = Some((hit.score, slot));
             }
         }
 
@@ -1096,6 +1128,62 @@ mod tests {
         .expect("build ok")
     }
 
+    /// `tenant-a`・`tenant-b` が同じ `id`（`1`）を共有する `Public` フィクスチャ
+    /// （対象ビヘイビア: TABLE-12・RLS-9。PR #205）。行 `id` の一意性スコープが
+    /// テナント内に閉じたことで正当となる入力を、`revalidate_primary_hits` が
+    /// 誤って拒否しないことの検証に使う。
+    fn build_engine_with_backend_shared_id(
+        backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
+        observer: Box<dyn FallbackObserver>,
+    ) -> FallbackBatchEngine {
+        let ids = [1u64, 1];
+        let tenant_ids = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = [Visibility::Public, Visibility::Public];
+        #[rustfmt::skip]
+        let vectors = [
+            1.0, 0.0,
+            1.0, 0.0,
+        ];
+        FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &vectors,
+            backend_factory,
+            observer,
+        )
+        .expect("build ok")
+    }
+
+    /// [`build_engine_with_backend_shared_id`] と同じ id・テナント・ベクトル
+    /// 配置だが、全行 `Private` にした版（対象ビヘイビア: TABLE-12・RLS-9。
+    /// PR #205）。テナント分離そのもの（他テナントの同 `id` 行が混入しない
+    /// こと）を検証するテストは本フィクスチャを使う。
+    fn build_engine_with_backend_shared_id_private(
+        backend_factory: impl FnOnce(ResidentMatrix) -> Result<Box<dyn BatchBackend>, BatchBackendError>,
+        observer: Box<dyn FallbackObserver>,
+    ) -> FallbackBatchEngine {
+        let ids = [1u64, 1];
+        let tenant_ids = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = [Visibility::Private, Visibility::Private];
+        #[rustfmt::skip]
+        let vectors = [
+            1.0, 0.0,
+            1.0, 0.0,
+        ];
+        FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &vectors,
+            backend_factory,
+            observer,
+        )
+        .expect("build ok")
+    }
+
     /// primary バックエンドの実行時エラーを注入するモック（本体へテスト専用
     /// API を追加せず、`BatchBackend` trait をテストコード側で実装する
     /// エラー注入手段。Issue #137 対応の test-support feature 撤廃方針を踏襲）。
@@ -1166,6 +1254,12 @@ mod tests {
     // `PolicyContext::is_visible` の単一照合パスへ委ねるため、オラクルも
     // 同じ述語（`ctx.is_visible(tenant, Visibility::Public)`）だけで
     // 可視行を絞り込む（テナント一致の事前フィルタは行わない）。
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。候補識別子は行 `id` ではなく
+    // 元配列内のスロット index を使う（本体コードと同じ「候補識別子＝スロット
+    // 番号」方式）。行 `id` の一意性スコープはテナント内に閉じているため、
+    // `id` 値そのものを識別子にすると異なるテナントが同じ `id` を共有する
+    // フィクスチャで逆引きが曖昧になる（`CpuScalarProvider::search` が返す
+    // `CandidateHit::id` は入力 `ids` 配列の値をそのまま返すため）。
     fn oracle_search(
         ids: &[u64],
         tenant_ids: &[&str],
@@ -1173,25 +1267,33 @@ mod tests {
         ctx: &PolicyContext,
         query: &[f32],
         k: usize,
-    ) -> Vec<crate::kernel::CandidateHit> {
-        use crate::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
-        let mut visible_ids = Vec::new();
+    ) -> Vec<crate::kernel::SearchHit> {
+        use crate::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
+        let mut visible_slots: Vec<u64> = Vec::new();
         let mut visible_vectors = Vec::new();
-        for ((&id, &tenant), row) in ids.iter().zip(tenant_ids).zip(vectors_per_row) {
+        for (idx, ((_id, &tenant), row)) in
+            ids.iter().zip(tenant_ids).zip(vectors_per_row).enumerate()
+        {
             if ctx.is_visible(tenant, Visibility::Public) {
-                visible_ids.push(id);
+                visible_slots.push(idx as u64);
                 visible_vectors.extend_from_slice(row);
             }
         }
-        CpuScalarProvider
+        let hits = CpuScalarProvider
             .search(SearchInput {
-                ids: &visible_ids,
+                ids: &visible_slots,
                 vectors: &visible_vectors,
                 dim: 2,
                 query,
                 k,
             })
-            .expect("oracle search ok")
+            .expect("oracle search ok");
+        hits.into_iter()
+            .map(|hit| {
+                let idx = hit.id as usize;
+                SearchHit::new(tenant_ids[idx], ids[idx], hit.score)
+            })
+            .collect()
     }
 
     // CORE-8: 初期化失敗注入 → 構築は `Ok`（CPU 専用モード）・検索は `Ok`・
@@ -1436,6 +1538,100 @@ mod tests {
         }
     }
 
+    // 対象ビヘイビア: TABLE-12・RLS-9・TABLE-9（PR #205）。CPU 縮退経路
+    // （`run_batch_search` を `self.cpu` に対して直接通す経路）でも、異なる
+    // テナントが同じ `id` を持つ `Public` フィクスチャに対し、両テナントの
+    // 行がそれぞれ別ヒットとして返り（TABLE-9 の相互可視性）、各ヒットの
+    // `tenant_id` が正しく行の所属を示すことを確認する（primary 経路のみの
+    // 回帰にしない）。テナント分離そのもの（他テナントの同 `id` 行が
+    // 混入しないこと）は `Private` フィクスチャを使う
+    // `fallback_search_isolates_rows_when_tenants_share_id` で検証する。
+    #[test]
+    fn fallback_search_returns_both_tenants_public_rows_sharing_id_via_cpu_fallback() {
+        let observer = RecordingObserver::new();
+        let engine = build_engine_with_backend_shared_id(
+            |_matrix| {
+                Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
+                    "lost".to_string(),
+                ))) as Box<dyn BatchBackend>)
+            },
+            Box::new(observer),
+        );
+        let ctx_a = ctx("tenant-a");
+        let ctx_b = ctx("tenant-b");
+        let query = [1.0f32, 0.0];
+        let queries = vec![
+            BatchQuery {
+                vector: &query,
+                k: 4,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &query,
+                k: 4,
+                ctx: &ctx_b,
+            },
+        ];
+        let hits = engine.batch_search(&queries).expect("search ok");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].hits.len(), 2, "id=1 shared by both tenants (Public) must both return for tenant-a's is_visible-permissive ctx");
+        assert_eq!(hits[1].hits.len(), 2);
+        for hit in &hits[0].hits {
+            assert_eq!(hit.id, 1);
+        }
+        for hit in &hits[1].hits {
+            assert_eq!(hit.id, 1);
+        }
+        let tenants_a: std::collections::HashSet<&str> =
+            hits[0].hits.iter().map(|h| h.tenant_id.as_str()).collect();
+        let tenants_b: std::collections::HashSet<&str> =
+            hits[1].hits.iter().map(|h| h.tenant_id.as_str()).collect();
+        assert!(tenants_a.contains("tenant-a") && tenants_a.contains("tenant-b"));
+        assert!(tenants_b.contains("tenant-a") && tenants_b.contains("tenant-b"));
+    }
+
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205 §1 目的 3 のコア）。CPU 縮退
+    // 経路で、異なるテナントが同じ `id`（`1`）を持つ `Private` フィクスチャに
+    // 対し、各テナントのクエリが自テナントの行だけを受け取り、他テナントの
+    // 同 `id` 行が一切混入しないことを確認する（primary 経路の同種テストは
+    // `batch_search.rs::batch_search_returns_only_own_row_when_other_tenant_
+    // shares_id`）。
+    #[test]
+    fn fallback_search_isolates_rows_when_tenants_share_id() {
+        let observer = RecordingObserver::new();
+        let engine = build_engine_with_backend_shared_id_private(
+            |_matrix| {
+                Ok(Box::new(FailingBackend::new(BatchBackendError::DeviceLost(
+                    "lost".to_string(),
+                ))) as Box<dyn BatchBackend>)
+            },
+            Box::new(observer),
+        );
+        let ctx_a = private_ctx("tenant-a");
+        let ctx_b = private_ctx("tenant-b");
+        let query = [1.0f32, 0.0];
+        let queries = vec![
+            BatchQuery {
+                vector: &query,
+                k: 4,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &query,
+                k: 4,
+                ctx: &ctx_b,
+            },
+        ];
+        let hits = engine.batch_search(&queries).expect("search ok");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].hits.len(), 1);
+        assert_eq!(hits[0].hits[0].tenant_id, "tenant-a");
+        assert_eq!(hits[0].hits[0].id, 1);
+        assert_eq!(hits[1].hits.len(), 1);
+        assert_eq!(hits[1].hits[0].tenant_id, "tenant-b");
+        assert_eq!(hits[1].hits[0].id, 1);
+    }
+
     // 正常時（primary 成功）はイベント 0 件・縮退再実行なしであることを確認する。
     #[test]
     fn successful_primary_search_emits_no_fallback_event() {
@@ -1560,10 +1756,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::CandidateHit {
-                                id: 9_999,
-                                score: 1.0,
-                            }],
+                            hits: vec![crate::kernel::SearchHit::new("tenant-a", 9_999, 1.0)],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)
@@ -1592,7 +1785,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::CandidateHit { id: 3, score: 1.0 }],
+                            hits: vec![crate::kernel::SearchHit::new("tenant-b", 3, 1.0)],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)
@@ -1610,6 +1803,109 @@ mod tests {
         assert_eq!(err, BatchSearchError::TenantMaskViolation);
     }
 
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。実在する `id`（tenant-b の
+    // 行 id=3）に、実際には別テナントの `tenant_id`（tenant-a）を付けて
+    // 詐称する悪性バックエンドは拒否される。行 `id` の一意性スコープが
+    // テナント内に閉じたことで「id さえ実在すればよい」検証では防げない
+    // 新しい偽装経路であり、`(tenant_id, id)` の組で信頼済み常駐行列と
+    // 突き合わせることで拒否できることを確認する。
+    #[test]
+    fn revalidation_rejects_hit_with_mislabeled_tenant() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![crate::kernel::SearchHit::new("tenant-a", 3, 1.0)],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::TenantMaskViolation);
+    }
+
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。同一クエリ内で同じ
+    // `(tenant_id, id)` の組を複数回返す悪性バックエンドは拒否される
+    // （`revalidation_rejects_duplicate_id_within_one_query` の
+    // `(tenant_id, id)` 版。スコアを変えても重複判定はキーのみで行う）。
+    #[test]
+    fn revalidation_rejects_duplicate_row_key() {
+        let engine = build_engine_with_backend(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                crate::kernel::SearchHit::new("tenant-a", 1, 2.0),
+                                crate::kernel::SearchHit::new("tenant-a", 1, 1.0),
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let err = engine.batch_search(&queries).unwrap_err();
+        assert_eq!(err, BatchSearchError::PrimaryResultRejected);
+    }
+
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。異なるテナントが同じ `id`
+    // を持つ `Public` フィクスチャに対し、両テナントを正しくラベル付けした
+    // 結果を返すバックエンドは独立再検証を通過する（正当な入力を誤って
+    // `DuplicateRowId`/`TenantMaskViolation` 扱いしないことの回帰）。
+    #[test]
+    fn revalidation_accepts_same_id_across_tenants_when_both_visible() {
+        let engine = build_engine_with_backend_shared_id(
+            |_matrix| {
+                Ok(Box::new(MaliciousBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                crate::kernel::SearchHit::new("tenant-a", 1, 1.0),
+                                crate::kernel::SearchHit::new("tenant-b", 1, 1.0),
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(RecordingObserver::new()),
+        );
+        // `Public` 行を両方見るため、許可集合に `Public` を含むクエリで検索する
+        // （`PolicyContext::new` の既定は `Public` のみ許可）。
+        let ctx_a = ctx("tenant-a");
+        let query = [1.0f32, 0.0];
+        let queries = vec![BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &ctx_a,
+        }];
+        let hits = engine.batch_search(&queries).expect("search ok");
+        let returned: std::collections::HashSet<(&str, u64)> = hits[0]
+            .hits
+            .iter()
+            .map(|h| (h.tenant_id.as_str(), h.id))
+            .collect();
+        assert!(returned.contains(&("tenant-a", 1)));
+        assert!(returned.contains(&("tenant-b", 1)));
+    }
+
     // クエリの `k` を超える件数を返す悪性バックエンドは拒否される（id 自体は
     // 有効なテナント内 id でも件数上限違反として弾く）。
     #[test]
@@ -1620,8 +1916,8 @@ mod tests {
                     make_hits: || {
                         vec![BatchHit {
                             hits: vec![
-                                crate::kernel::CandidateHit { id: 1, score: 2.0 },
-                                crate::kernel::CandidateHit { id: 2, score: 1.0 },
+                                crate::kernel::SearchHit::new("tenant-a", 1, 2.0),
+                                crate::kernel::SearchHit::new("tenant-a", 2, 1.0),
                             ],
                         }]
                     },
@@ -1696,8 +1992,8 @@ mod tests {
                     make_hits: || {
                         vec![BatchHit {
                             hits: vec![
-                                crate::kernel::CandidateHit { id: 1, score: 2.0 },
-                                crate::kernel::CandidateHit { id: 1, score: 1.0 },
+                                crate::kernel::SearchHit::new("tenant-a", 1, 2.0),
+                                crate::kernel::SearchHit::new("tenant-a", 1, 1.0),
                             ],
                         }]
                     },
@@ -1724,10 +2020,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::CandidateHit {
-                                id: 1,
-                                score: f32::NAN,
-                            }],
+                            hits: vec![crate::kernel::SearchHit::new("tenant-a", 1, f32::NAN)],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)
@@ -1755,8 +2048,8 @@ mod tests {
                         vec![BatchHit {
                             hits: vec![
                                 // 昇順（本来は降順であるべき）で返す違反。
-                                crate::kernel::CandidateHit { id: 1, score: 1.0 },
-                                crate::kernel::CandidateHit { id: 2, score: 2.0 },
+                                crate::kernel::SearchHit::new("tenant-a", 1, 1.0),
+                                crate::kernel::SearchHit::new("tenant-a", 2, 2.0),
                             ],
                         }]
                     },
@@ -1865,7 +2158,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::CandidateHit { id: 3, score: 1.0 }],
+                            hits: vec![crate::kernel::SearchHit::new("tenant-b", 3, 1.0)],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)

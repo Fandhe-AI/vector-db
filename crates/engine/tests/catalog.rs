@@ -518,3 +518,106 @@ fn table6_decode_rejects_hand_crafted_invalid_catalog_bytes() {
         );
     }
 }
+
+// --- drop_table（Issue #179。PR #151 レビュー据え置き事項の公開 API 契約） -------
+
+#[test]
+fn drop_table_rejects_missing_table_name() {
+    let path = unique_db_path("drop-table-missing");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let result = storage.drop_table("does_not_exist");
+    assert!(
+        matches!(result, Err(CatalogError::TableNotFound(_))),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn drop_table_rejects_invalid_identifier() {
+    let path = unique_db_path("drop-table-invalid-identifier");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    assert!(matches!(
+        storage.drop_table("bad name"),
+        Err(CatalogError::Invalid(_))
+    ));
+    assert!(matches!(
+        storage.drop_table(""),
+        Err(CatalogError::Invalid(_))
+    ));
+}
+
+// テーブルを drop してから同名・別次元で再作成すると、旧行テーブル（`user_rows/{table}`）
+// が残留せず、新しい次元の行だけが挿入・走査できる（TABLE-4/TABLE-6・EXT-2 の
+// 次元固定の不変条件が drop・再作成をまたいでも守られることの確認）。
+#[test]
+fn drop_table_then_recreate_with_different_dim_has_no_leftover_rows() {
+    let path = unique_db_path("drop-table-recreate-different-dim");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = engine::recovery::required_op_id::OperationId::parse("drop-table-test")
+        .expect("valid operation_id");
+
+    storage
+        .create_table(&embedding_schema("docs", 4))
+        .expect("create_table");
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        &row(&[1.0, 0.0, 0.0, 0.0], b"old"),
+        &op_id,
+    )
+    .expect("insert row before drop");
+
+    storage.drop_table("docs").expect("drop_table");
+
+    // 再作成前はカタログにも存在しない。
+    assert!(matches!(
+        storage.get_table_schema("docs"),
+        Err(CatalogError::TableNotFound(_))
+    ));
+
+    let new_schema = embedding_schema("docs", 8);
+    storage
+        .create_table(&new_schema)
+        .expect("recreate with different dim");
+
+    // 旧次元（4）の埋め込みはもう受理されない（新スキーマが優先される）。
+    assert!(engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        2,
+        &row(&[1.0, 0.0, 0.0, 0.0], b"stale-dim"),
+        &op_id
+    )
+    .is_err());
+
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        3,
+        &row(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], b"new"),
+        &op_id,
+    )
+    .expect("insert row with new dim");
+
+    let (rows, cursor) = storage
+        .scan_table_page("docs", None, 100)
+        .expect("scan_table_page after recreate");
+    assert!(cursor.is_none());
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the row inserted after recreate must be present (no leftover from before drop)"
+    );
+    assert_eq!(rows[0].id, 3);
+}

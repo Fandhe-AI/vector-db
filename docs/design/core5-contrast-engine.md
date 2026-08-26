@@ -79,14 +79,14 @@ bans の監査対象に含めた（fail-closed）。
 
 ## ベンチの構成: 独立バイナリへの分離
 
-CORE-3/CORE-4（`parallel_bench.rs`）と CORE-5 を別バイナリ（`contrast_bench.rs`）に
+CORE-3/CORE-4（`simd_bench.rs`）と CORE-5 を別バイナリ（`contrast_bench.rs`）に
 分けた。対照エンジン側（C++ FFI を含む）の障害・ビルド失敗が CORE-3/CORE-4 の
 ゲートへ波及しないようにする failure domain 分離が目的で、`.github/workflows/
-bench.yml` でも `bench-parallel` と `bench-contrast` を別ジョブにしてある。
+bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてある。
 
 - 測定: `harness::ab::run_ab`（interleaved A/B）で A＝`ParallelSearchProvider::search`、
   B＝`ContrastIndex::search`（usearch `exact_search`）を同一データ・同一クエリで
-  交互実行する（測定条件は `parallel_bench.rs` と同一の `ROW_COUNT`/`DIM`/`TOP_K`/
+  交互実行する（測定条件は `simd_bench.rs` と同一の `ROW_COUNT`/`DIM`/`TOP_K`/
   シード）
 - 判定統計量: 実装は `harness::accept::p95_ratio` の結果で判定する
   （`AbMeasurement::median_ratio`〔`ab.rs` の既存契約〕は補助情報として標準出力に
@@ -108,7 +108,7 @@ bench.yml` でも `bench-parallel` と `bench-contrast` を別ジョブにして
 
 ## `BENCH_CORE5` opt-in の撤去
 
-`parallel_bench.rs` から `core5_requested_from_env` と CORE-5 分岐を削除し、
+`simd_bench.rs` から `core5_requested_from_env` と CORE-5 分岐を削除し、
 `.github/workflows/bench.yml` から `BENCH_CORE5` 注入を削除、`bench-contrast` ジョブ
 （schedule + workflow_dispatch）を追加した。`BENCH_MAX_CONTRAST_RATIO` repo variable
 未設定のまま schedule run が実行された場合は fail-closed で red になる（既存の

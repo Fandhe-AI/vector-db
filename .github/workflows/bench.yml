@@ -1,6 +1,6 @@
 name: Bench
 
-# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の実行。crates/engine/benches/parallel_bench.rs
+# TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の実行。crates/engine/benches/simd_bench.rs
 # は時間依存の測定値を含むため PR CI（ci.yml）のアサーションには混ぜず、本 workflow を
 # 独立実行する。private submodule（docs/spec）は取得しない（README「開発環境構築」:
 # ビルド・テストは spec 抜きで成立する方針）。
@@ -8,15 +8,15 @@ name: Bench
 # schedule トリガ（毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
 # 独立した時間帯にする）は #168 で再追加済み。BENCH_MAX_P95_MS・BENCH_MIN_RECALL・
 # BENCH_BATCH_MAX_DEGRADATION_PCT・BENCH_MAX_CONTRAST_RATIO の repo variables 未設定の
-# まま schedule 実行された場合は `parallel_bench.rs` / `batch_bench.rs` /
+# まま schedule 実行された場合は `simd_bench.rs` / `batch_bench.rs` /
 # `contrast_bench.rs` 側の fail-closed により run が red になる（「一度も評価していない
-# run」が green として埋もれることはない）。CORE-5（対照エンジン接続。判定統計量は
+# run」が green として埋もれることはない）。CORE-5（対照エンジン接続。判定基準は
 # docs/spec/04-behavior/core-engine.md CORE-5 が SSOT）は usearch を対照エンジンとして
-# 接続済み（TASK-127・Issue #176）で、bench-contrast ジョブ
-# （下記）が既定ゲートとして実測する。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs
-# f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡し、`BENCH_CORE6`・
-# `BENCH_CORE16` repo variable による opt-in のまま維持する（`batch_bench.rs`
-# 冒頭コメント参照）。
+# 接続済み（TASK-127・Issue #176）で、bench-contrast ジョブ（下記）が既定ゲートとして
+# 実測する（旧 opt-in repo variable は撤去済み）。CORE-6（GPU vs CPU-SIMD）・CORE-16
+# （f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡し、
+# `BENCH_CORE6`・`BENCH_CORE16` repo variable による opt-in のまま維持する
+# （`batch_bench.rs` 冒頭コメント参照）。
 #
 # bench-c1（TASK-83・Conditional Go 条件7）は workflow_dispatch 限定とし、上記
 # schedule には含めない。GitHub ホステッド runner は共有 2 vCPU の非専有環境であり、
@@ -42,12 +42,12 @@ concurrency:
 
 jobs:
   # --------------------------------------------------
-  # bench-parallel（TASK-127 回帰ベンチ実行）
+  # bench-simd（TASK-127 回帰ベンチ実行）
   # --------------------------------------------------
   # 生の steps を持つ独立ジョブとして定義するため、第三者 action（actions/checkout）は
   # ci.yml の crash-test 系ジョブと同一の SHA 固定で参照する（AGENTS.md「CI・ワークフロー
   # の改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
-  bench-parallel:
+  bench-simd:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -57,28 +57,28 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
-      - name: Run bench-parallel
+      - name: Run bench-simd
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
         # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
         # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値の
-        # 数値そのものは載せない——`crates/engine/benches/parallel_bench.rs` が
+        # 数値そのものは載せない——`crates/engine/benches/simd_bench.rs` が
         # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
-        # BENCH_MIN_RECALL が未設定の場合は `parallel_bench.rs` 側が fail-closed で
+        # BENCH_MIN_RECALL が未設定の場合は `simd_bench.rs` 側が fail-closed で
         # 非ゼロ終了する。CORE-5（対照エンジン比較）は `contrast_bench.rs`（下記
         # bench-contrast ジョブ）が独立バイナリとして判定する（Issue #176）。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
-        run: make bench-parallel
+        run: make bench-simd
 
   # --------------------------------------------------
   # bench-contrast（TASK-127 CORE-5 対照エンジン接続。Issue #176）
   # --------------------------------------------------
   # `contrast_bench.rs` は `usearch`（`contrast-bench` feature 限定の optional 依存）を
-  # C++ FFI 経由でビルドするため、CORE-3/CORE-4（bench-parallel ジョブ）とは独立した
+  # C++ FFI 経由でビルドするため、CORE-3/CORE-4（bench-simd ジョブ）とは独立した
   # ジョブに分離してある（対照エンジン側の障害・ビルド失敗が CORE-3/CORE-4 のゲートへ
   # 波及しない failure domain 分離。`Cargo.toml` の `contrast-bench` feature コメント
-  # 参照）。既定ゲート化（BENCH_CORE5 opt-in の撤去）は本 Issue #176 の目的の一つ。
+  # 参照）。既定ゲート化（旧 opt-in repo variable の撤去）は本 Issue #176 の目的の一つ。
   bench-contrast:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -104,7 +104,7 @@ jobs:
   # CORE-7（動的窓の劣化上限）はアクティブなゲートとして実測する。CORE-6（GPU vs
   # CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため
   # opt-in fail-closed で扱う（`batch_bench.rs` 冒頭コメント参照。Issue #178 で
-  # 追跡）。bench-parallel ジョブと同様、schedule / workflow_dispatch の両方で
+  # 追跡）。bench-simd ジョブと同様、schedule / workflow_dispatch の両方で
   # 実行する（#168）。
   bench-batch:
     runs-on: ubuntu-latest
@@ -152,7 +152,7 @@ jobs:
         run: rustup show
       - name: Run bench-c1
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-83・SQL-1）が SSOT のため
-        # 本ワークフローにはハードコードしない。bench-parallel の
+        # 本ワークフローにはハードコードしない。bench-simd の
         # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
         # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
         # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
