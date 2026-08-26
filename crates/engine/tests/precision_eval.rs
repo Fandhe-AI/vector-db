@@ -843,9 +843,9 @@ fn resolve_gate_threshold(var: &str, kind: ThresholdKind) -> Option<f64> {
 
 /// TASK-163（SEARCH-10）層 B: hybrid ランキングの 3 指標が `PRECISION_EVAL_MIN_TOP1_ACC`・
 /// `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN`（未確定。Actions
-/// variables 由来を想定）を満たすかを判定する閾値ゲート。未設定は既定（非 strict）
-/// では「対象外」として明示的に成功終了し、strict モードでは fail-closed でテスト
-/// 失敗とする。設定済みで非数値・範囲外は常に fail-closed（`hybrid_recall.rs::
+/// variables 由来を想定）を満たすかを判定する閾値ゲート。評価自体は閾値の設定状況に
+/// 関わらず実行し、未設定は既定（非 strict）では「判定のみスキップ＝対象外」として
+/// 明示的に成功終了し、strict モードでは fail-closed でテスト失敗とする。設定済みで非数値・範囲外は常に fail-closed（`hybrid_recall.rs::
 /// hybrid_recall_small_scale_threshold_gate` と同一契約）。ログには指標名と pass/fail
 /// のみを出力し、注入された閾値の数値も実測値も出力しない（`make precision-regression`
 /// は将来 public runner から実行されうるため）。3 指標はいずれも `precision` モードの
@@ -858,15 +858,19 @@ fn precision_eval_threshold_gate() {
     let max_false_return =
         resolve_gate_threshold("PRECISION_EVAL_MAX_FALSE_RETURN", ThresholdKind::Max);
 
+    // 閾値の設定状況に関わらず、まず評価を production の SQL 経路で通しで実行する。
+    // 「閾値未設定でも評価は実行し、判定だけをスキップする」契約（README・
+    // `docs/design/precision-eval-regression.md`）を満たし、fixture・SQL 経路の破損を
+    // 未設定状態の実行でも検出できるようにするため（PR #212 codex-review P1）。
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
+    let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
+
     if min_top1.is_none() && min_mrr10.is_none() && max_false_return.is_none() {
         println!(
-            "precision_eval_threshold_gate: PRECISION_EVAL_MIN_TOP1_ACC/PRECISION_EVAL_MIN_MRR10/PRECISION_EVAL_MAX_FALSE_RETURN not configured; gate not enabled (explicit no-op, not a failure)"
+            "precision_eval_threshold_gate: PRECISION_EVAL_MIN_TOP1_ACC/PRECISION_EVAL_MIN_MRR10/PRECISION_EVAL_MAX_FALSE_RETURN not configured; evaluation ran, comparison skipped (explicit no-op, not a failure)"
         );
         return;
     }
-
-    let (core, _guard, ctx, qa, no_answer) = build_fixture();
-    let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
 
     // 出力は指標名と pass/fail のみ。閾値の数値も実測値も出さない——本テストは
     // `make precision-regression` を通じて将来 public runner（`recall.yml`）から
