@@ -20,6 +20,15 @@
 //! 最小限確認する（3 クライアントの子プロセス実行は本環境未導入のため
 //! コンパイル通過とスクリプト構文確認のみで検証済み。詳細は PR 本文）。
 //!
+//! TASK-168（SQL-13／SQL-14）: 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）・
+//! `GROUP BY`/`HAVING` の拒否形状・NULL 契約の回帰保護は層 A
+//! （`tests/wire_aggregate.rs`、常時 `make ci`）が主として担う。本ファイルは
+//! `seed_aggregate_three_tenant_db` の同一コーパスに対する代表ケース（単一行
+//! 集計・`GROUP BY`/`HAVING`・RLS 不変・拒否経路 2 種）のみを 3 クライアント
+//! 経由で確認する（3 クライアントの子プロセス実行は本環境未導入のため層 A・
+//! 層 B いずれもコンパイル通過とスクリプト構文確認のみで検証済み。詳細は
+//! PR 本文）。
+//!
 //! ツール未検出・クライアントスクリプトの非 0 終了はいずれも `panic!` で
 //! 失敗させ、silent skip はしない（`.claude/rules/coding-rust.md`・実行規約
 //! 「テストの skip・ignore・アサーション弱体化で CI を通さない」の精神を、
@@ -165,6 +174,76 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
                 .expect("valid operation_id"),
         )
         .expect("insert row");
+    }
+    (path, guard)
+}
+
+/// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
+/// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
+/// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
+/// wire 認証経路の `PolicyContext` は Public のみ許可のため、Private 行は
+/// どのユーザーの接続からも不可視。既存 C1〜C4 テストの seed
+/// （`seed_three_tenant_db`）はこの関数の追加では変更しない。
+fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-aggregate-docs");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let public_rows: [(&str, u64, [f32; 2], &str, &str); 3] = [
+        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
+        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
+        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
+    ];
+    for (tenant, id, dir, lang, body) in public_rows {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(body.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("insert public row");
+    }
+    let private_rows: [(&str, u64, [f32; 2], &str); 2] = [
+        ("tenant-a", 11, [1.0, 0.0], "xx"),
+        ("tenant-b", 12, [0.0, 1.0], "ja"),
+    ];
+    for (tenant, id, dir, lang) in private_rows {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Private,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text("private body".to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("insert private row");
     }
     (path, guard)
 }
@@ -662,6 +741,89 @@ fn three_clients_verify_search_mode_switch_and_precision_contract() {
         run_psql_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
         run_psycopg_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
         run_pg_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
+    }
+
+    drop(server);
+    let _ = std::io::stdout().flush();
+}
+
+/// TASK-168（SQL-13／SQL-14）: 集計クエリ（単一行の `COUNT`/`SUM`/`AVG`/`MIN`/
+/// `MAX`・`GROUP BY`/`HAVING`）と RLS 不変性の代表ケースを無改造クライアント
+/// 経由で確認する。閾値・拒否形状そのものの回帰保護は層 A
+/// （`tests/wire_aggregate.rs`、常時 `make ci`）が担う。
+///
+/// すべての SELECT に一意の `AS` 別名を付け、NULL を返す SQL は使わない
+/// （Node `pg` は `Object.values(row)` で行を出力するため同名列が潰れ、NULL の
+/// 描画も psql（空文字）／pg（`Array.join` で空文字）／psycopg（`str(None)`=
+/// "None"）で異なる。NULL 契約の検証は層 A に閉じる）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_verify_aggregate_queries_and_rls_invariance() {
+    let (db_path, _db_guard) = seed_aggregate_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-aggregate-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+
+    // 独立オラクル（可視行は id=1/2/3 の Public 3 行のみ。Private 行
+    // （lang="xx"）は wire 認証経路では不可視。`seed_aggregate_three_tenant_db`
+    // のドキュメンテーションコメント参照）。
+    const AGG1_SQL: &str = "SELECT COUNT(*) AS n, SUM(id) AS s, AVG(id) AS a, MIN(lang) AS l_min, MAX(lang) AS l_max FROM docs";
+    let expected_agg1 = vec!["3|6|2|en|ja".to_string()];
+
+    const AGG2_SQL: &str = "SELECT COUNT(*) AS n FROM docs WHERE lang = 'ja'";
+    let expected_agg2 = vec!["2".to_string()];
+
+    const AGG3_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC";
+    let expected_agg3 = vec!["ja|2".to_string(), "en|1".to_string()];
+
+    const AGG4_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n >= 2";
+    let expected_agg4 = vec!["ja|2".to_string()];
+
+    for (user, pw) in [
+        ("alice", "pw-alice"),
+        ("bob", "pw-bob"),
+        ("carol", "pw-carol"),
+    ] {
+        for (label, sql, expected) in [
+            ("AGG1", AGG1_SQL, &expected_agg1),
+            ("AGG2", AGG2_SQL, &expected_agg2),
+            ("AGG3", AGG3_SQL, &expected_agg3),
+            ("AGG4", AGG4_SQL, &expected_agg4),
+        ] {
+            let psql_rows = run_psql(port, user, pw, sql);
+            assert_eq!(
+                &psql_rows, expected,
+                "psql: unexpected {label} result for user {user} (must not reveal the \
+                 Private-only \"xx\" group of another tenant)"
+            );
+
+            let psycopg_rows = run_psycopg(port, user, pw, sql);
+            assert_eq!(
+                &psycopg_rows, expected,
+                "psycopg: unexpected {label} result for user {user}"
+            );
+
+            let pg_rows = run_pg(port, user, pw, sql);
+            assert_eq!(
+                &pg_rows, expected,
+                "pg: unexpected {label} result for user {user}"
+            );
+        }
+
+        // 拒否経路: 型不整合（VECTOR 列への SUM）・許可形状外
+        // （集計と裸の列の混在）はいずれも接続を破棄せず拒否される。
+        const REJECT_TYPE_MISMATCH_SQL: &str = "SELECT SUM(embedding) FROM docs";
+        run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+        run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+        run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+
+        const REJECT_MIXED_SHAPE_SQL: &str = "SELECT COUNT(*), lang FROM docs";
+        run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+        run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+        run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
     }
 
     drop(server);
