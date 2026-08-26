@@ -137,8 +137,10 @@
 //! `sql::parser::bind_insert_form` の束縛段階の形判別で分岐し、既存の許可リスト
 //! 構文（`sql::allowlist`）は変更しない。`core::EngineCore::execute_insert_sql` が
 //! 分岐の入口（詳細は `embedding.rs`・`incremental.rs`・`sql/parser.rs` モジュール
-//! ドキュメント参照）。一括投入上限（TASK-122、対象ビヘイビア: INDEX-4）・外部埋め込み
-//! サービス実クライアントの接続は後続タスクの管轄。
+//! ドキュメント参照）。`operation_id` の台帳記録（TASK-93・RECOVER-2）は行形と同じ
+//! 契約で、置換書き込みと同一 write トランザクション内に結線済み。一括投入上限
+//! （TASK-122、対象ビヘイビア: INDEX-4）・外部埋め込みサービス実クライアントの接続は
+//! 後続タスクの管轄。
 //!
 //! TASK-147（対象ビヘイビア: EXT-3）: `declarative_filter.rs` が、メタデータ列
 //! （`TEXT` 列）に対する等価・前方一致フィルタを任意の列名へ宣言的に指定できる
@@ -150,6 +152,11 @@
 //! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
 //! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
 //! モジュールドキュメント参照）。
+//!
+//! TASK-93（対象ビヘイビア: RECOVER-2）: `recovery::ledger` が、検証済み
+//! `operation_id` をテナント内・テーブル単位で永続化する台帳を提供する。台帳への
+//! 追記は行の書き込み・更新・削除と同一の `redb::WriteTransaction` 内で原子的に
+//! 行う（詳細は `recovery::ledger` モジュールドキュメント参照）。
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `sql::aggregate` が集計関数（`COUNT`/`SUM`/
 //! `AVG`/`MIN`/`MAX`）のみを結果列とする `GROUP BY` なし単一行 SELECT を実行する。

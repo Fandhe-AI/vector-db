@@ -21,7 +21,12 @@ TASK-120・TASK-93 の実装はこの決定に従う。
   `crates/engine/src/incremental.rs::index_file`・
   `crates/engine/src/tenant.rs::replace_typed_rows_by_text_key`・
   `crates/engine/tests/incremental_index.rs` が本決定に対応するコード・テスト）
-- TASK-93（RECOVER-2）: リカバリ処理で本決定と整合する状態復元を行う（未着手）
+- TASK-93（RECOVER-2）: 行・型付き行の書き込み経路（`tenant::insert_row`/
+  `insert_rows`/`insert_typed_row`/`update_row`/`delete_row`、SQL `INSERT`）は
+  台帳結線済み（Issue #81）。ファイル形 `INSERT`（置換セマンティクス経路）も
+  TASK-120（PR #221）で同一の write トランザクション内へ結線済み
+- 上記 2 タスク側で本決定に対応するテストを追加する（本タスクは基盤・工程管理タスク
+  であり、対応ビヘイビア ID なしのため本 PR ではテスト追加を行わない）
 
 ## スコープ外
 

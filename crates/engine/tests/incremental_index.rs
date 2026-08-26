@@ -17,6 +17,8 @@ use engine::embedding::{EmbedError, Embedder, HashingEmbedder};
 use engine::incremental::IncrementalConfig;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::ledger::LedgerLookup;
+use engine::recovery::required_op_id::OperationId;
 use engine::sql::exec::Cell;
 use engine::storage::{Storage, Visibility};
 
@@ -677,6 +679,83 @@ fn embedder_dim_mismatch_with_table_schema_is_rejected_with_no_side_effects() {
 }
 
 // --- 行形の回帰（既存 `id` + ベクトルリテラル指定の INSERT は不変） ------------------
+
+/// ファイル形 `INSERT` も行形 `INSERT` と同じく `operation_id` を台帳へ記録し
+/// （TASK-93・RECOVER-2）、拒否された場合は行も台帳エントリも残さないことを固定する
+/// （置換書き込みと台帳記録が同一 write トランザクションで原子的であることの確認）。
+#[test]
+fn file_form_insert_records_operation_id_in_ledger_atomically() {
+    let path = unique_db_path("index-ledger");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |id: &str| OperationId::parse(id).expect("valid operation_id");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql(
+            "documents",
+            "docs/ledger.txt",
+            "line one\nline two",
+            "op-led-1",
+        ),
+    )
+    .expect("file-form insert should succeed");
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op("op-led-1"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::Recorded
+    );
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op("op-led-unused"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
+
+    // 他テナントからは同じ `operation_id` が観測されない（RLS-9 と同型のスコープ）。
+    let other = PolicyContext::new("tenant-b").expect("valid tenant");
+    assert_eq!(
+        core.operation_recorded(&other, "documents", &op("op-led-1"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
+}
+
+/// 拒否されたファイル形 `INSERT` は行も台帳エントリも残さない（置換書き込みと
+/// 台帳記録が同一 write トランザクションで abort される。TASK-93・RECOVER-2）。
+#[test]
+fn rejected_file_form_insert_leaves_no_ledger_entry() {
+    let path = unique_db_path("index-ledger-abort");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(NonFiniteEmbedder { dim: DIM }))
+        .with_incremental_config(small_chunk_config());
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |id: &str| OperationId::parse(id).expect("valid operation_id");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "docs/ledger2.txt", "line one", "op-led-2"),
+    )
+    .expect_err("non-finite embedding must be rejected");
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op("op-led-2"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
+}
 
 #[test]
 fn row_form_insert_still_writes_single_row_with_no_incremental_outcome() {

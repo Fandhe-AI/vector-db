@@ -152,12 +152,17 @@ pub struct BoundFileIndexInput<'a> {
 /// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
 /// 内部結線用 API のため `pub(crate)` に閉じる（`sql/exec.rs::execute_file_insert`
 /// が唯一の呼び出し元。codex-review P1 指摘・PR #221）。
+///
+/// `ledger_write` は行形 `INSERT` 経路（`tenant::insert_typed_row_unchecked`）と同じ
+/// 契約で、置換書き込みと同一の write トランザクション内で台帳へ記録される
+/// （TASK-93・RECOVER-2。`LedgerWrite::Disabled` なら台帳へ一切触れない）。
 pub(crate) fn index_file(
     storage: &Storage,
     ctx: &PolicyContext,
     embedder: &dyn Embedder,
     config: &IncrementalConfig,
     input: &BoundFileIndexInput<'_>,
+    ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
 ) -> Result<IndexOutcome, IncrementalError> {
     // `embedder.dim()` を対象テーブルの `VECTOR(N)` と突き合わせる（サーバー側の
     // Embedder 設定とスキーマの不整合。チャンク化・埋め込み呼び出しの前に検出し、
@@ -262,14 +267,17 @@ pub(crate) fn index_file(
         first_id: _,
     } = crate::tenant::replace_typed_rows_by_text_key(
         storage,
-        input.table,
         ctx,
-        // ファイル形 INSERT のチャンク置換キーは常に `path` 列（`sql/parser.rs`
-        // モジュールドキュメントの判別規則 §2.1 で固定されている）。
-        "path",
-        input.path,
-        Visibility::Private,
-        &rows,
+        crate::tenant::ReplaceByTextKey {
+            table: input.table,
+            // ファイル形 INSERT のチャンク置換キーは常に `path` 列（`sql/parser.rs`
+            // モジュールドキュメントの判別規則 §2.1 で固定されている）。
+            key_column: "path",
+            key_value: input.path,
+            visibility: Visibility::Private,
+            rows: &rows,
+            ledger_write,
+        },
     )?;
     let write_elapsed = write_start.elapsed();
 

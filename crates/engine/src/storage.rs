@@ -85,8 +85,10 @@ pub(crate) fn map_rows_table_error(e: redb::TableError) -> StorageError {
 /// 新規挿入した行数。[`ROWS_TABLE`] と同一の `redb::WriteTransaction` 内でのみ書き込む
 /// （`txn.rs` の [`crate::txn::BatchWriteTxn::log_batch`]）ことで、2 テーブル横断の
 /// トランザクション原子性（同時にコミットされる／同時に破棄される）を製品コード経路で
-/// 成立させる。TASK-93（`operation_id` 台帳。ポインタ: `docs/spec/05-tasks.md` TASK-93）と
-/// 同型のパターンであり、本テーブル自体はテスト専用の使い捨てではない。
+/// 成立させる。[`crate::recovery::ledger::OP_LEDGER_TABLE`]（`operation_id` 台帳。
+/// TASK-93、対象ビヘイビア: RECOVER-2。行の書き込み/更新/削除と同一トランザクション
+/// 内で原子的に追記する）と同型のパターンであり、本テーブル自体はテスト専用の
+/// 使い捨てではない。
 ///
 /// **契約の適用範囲（重要・恒久契約）**: 「台帳の row_count 合計 == [`ROWS_TABLE`] の
 /// 行総数」という不変条件は、[`crate::txn::BatchWriteTxn`] だけを使って [`ROWS_TABLE`] へ
