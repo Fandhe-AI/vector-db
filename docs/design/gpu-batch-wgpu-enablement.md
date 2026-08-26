@@ -64,7 +64,9 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - error scope の `pop()` は `device.poll` を駆動しながら待つ
   （`block_on_with_device_poll`）。自己ポーリングのみだとデバイスのポーリング待ちで
   無限スピンしうるため
-- GPU の待機はすべて有限 deadline（`GPU_POLL_DEADLINE`）を持つ。readback は
+- GPU の待機はすべて有限 deadline（`GPU_POLL_DEADLINE`）を持つ。初期化の
+  `request_adapter`/`request_device` も同じ deadline で打ち切り、超過は
+  `InitFailed`（＝CPU 縮退）へ写像する。readback は
   `PollType::wait_indefinitely()` ではなく有限タイムアウトの `Wait` を deadline まで
   繰り返し、`PollError::Timeout` は継続・deadline 超過は `DeviceLost` として返す
   （完了通知が停止しても CPU 縮退〔CORE-8〕へ移れるようにするため）。error scope の
@@ -72,9 +74,11 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - ステージング用のバイト列・readback の `f32` 列は `try_reserve_exact` で
   フォールブルに確保する（`Vec::with_capacity` の abort-on-OOM を避け、確保失敗も
   CPU 縮退可能な backend エラーとして返す）
-- dispatch 前の計算量ガードはクエリごとの実到達行数（`is_visible` を満たす行数）
-  × dim を合算して照合する。全行 × 全クエリの直積で課金すると、CPU 経路では
-  予算内の要求まで `Input` エラー（＝縮退対象外）で恒久的に拒否してしまうため
+- 計算量ガードはクエリごとの実到達行数（`is_visible` を満たす行数）× dim を
+  合算して照合する。dispatch 前の主防御線（`check_reachable_batch_work`）も、
+  `gather_reachable_rows` 内の後段二重チェックも同じ基準を使う。全行ベースで
+  課金すると、CPU 経路では予算内の要求まで `Input` エラー（＝縮退対象外）で
+  恒久的に拒否してしまうため
 - WGSL は `const` 文字列で埋め込み（外部ファイル読み込みなし）。
   `unpack2x16float`（コア機能。`shader-f16` 拡張不要）で
   `batch_search.rs::pack_f16x2` と同じビット解釈の f16 → f32 復元を行い、

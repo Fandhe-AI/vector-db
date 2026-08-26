@@ -185,6 +185,7 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         // 使うため無効のままでよい（実測 limits をそのまま使う）。
         apply_limit_buckets: false,
     }))
+    .map_err(|()| "adapter request timed out".to_string())?
     .map_err(|e| format!("adapter request failed: {e}"))?;
 
     let info = adapter.get_info();
@@ -215,6 +216,7 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))
+    .map_err(|()| "device request timed out".to_string())?
     .map_err(|e| format!("device request failed: {e}"))?;
 
     let device_lost = std::sync::Arc::new(AtomicBool::new(false));
@@ -325,18 +327,29 @@ fn storage_layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::Bind
 /// .claude/rules/dependency-policy.md「依存最小方針」）。`Waker::noop()` は
 /// std 安定 API（Rust 1.85+。本リポ toolchain は stable 1.96 想定）で、
 /// wgpu の `request_adapter`/`request_device` は native バックエンドでは
-/// 即座に完結するため、1 回の `poll` で `Ready` になる（`loop` は将来の
-/// 実装差分に対する保険）。
-fn pollster_free_block_on<F: std::future::Future>(fut: F) -> F::Output {
+/// 即座に完結するため通常 1 回の `poll` で `Ready` になるが、ドライバ無応答時に
+/// 永久停止しないよう [`GPU_POLL_DEADLINE`] で打ち切る（超過は `Err(())` を返し、
+/// 呼び出し元が `InitFailed` へ写像して CPU 縮退させる）。
+fn pollster_free_block_on<F: std::future::Future>(fut: F) -> Result<F::Output, ()> {
     use std::task::{Context, Poll, Waker};
 
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut boxed = Box::pin(fut);
+    let deadline = std::time::Instant::now() + GPU_POLL_DEADLINE;
     loop {
         match boxed.as_mut().poll(&mut cx) {
-            Poll::Ready(v) => return v,
-            Poll::Pending => std::thread::yield_now(),
+            Poll::Ready(v) => return Ok(v),
+            Poll::Pending => {
+                // deadline 超過は「adapter 列挙・デバイス要求が応答しない」異常と
+                // みなして打ち切る（codex P1 指摘対応: 終了条件のない自己ポーリングは
+                // ドライバ無応答環境で `try_new` を永久停止させ、`InitFailed` を返して
+                // CPU-SIMD へ縮退する CORE-8 の契約を満たせない）。
+                if std::time::Instant::now() >= deadline {
+                    return Err(());
+                }
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -793,24 +806,23 @@ fn check_batch_work_from_visible_counts(
 
 /// クエリ `ctx` から見て到達可能な行の index 列を求める（CORE-2 の単一照合
 /// パス `PolicyContext::is_visible` を使う。テナント文字列の独自比較はしない）。
+///
 /// 計算量ガードの主防御線は呼び出し元 [`GpuBatchBackend::batch_search`] 冒頭の
-/// [`check_reachable_batch_work`]（クエリごとの実到達行数を合算した総量）であり、
-/// 本関数内の `rows * 1 query * dim` チェックはその後段の防御的な二重チェックに
-/// 過ぎない（単独ではクエリ件数を考慮しないため総量ガードの代替にはならない）。
+/// [`check_reachable_batch_work`]（クエリごとの実到達行数を合算した総量）である。
+/// 本関数は収集後の**実到達行数**に対してのみ後段の二重チェックを行う
+/// （codex P1 指摘対応: 以前は常駐行列の全 `row_count × dim` を課金しており、
+/// 他テナント行を多く含む行列では当該クエリの可視行が少なくても
+/// `WorkBudgetExceeded` になり、しかも `BatchExecError::Input` のため CPU 縮退も
+/// せず有効な要求を恒久的に拒否していた）。
 fn gather_reachable_rows(
     matrix: &crate::batch_search::ResidentMatrix,
     ctx: &PolicyContext,
 ) -> Result<Vec<u32>, GpuInputError> {
-    let rows = matrix.row_count();
-    let work = rows
-        .checked_mul(matrix.dim())
-        .ok_or(GpuInputError::WorkBudgetExceeded)?;
-    if work > MAX_BATCH_WORK {
-        return Err(GpuInputError::WorkBudgetExceeded);
-    }
-
     let mut out: Vec<u32> = Vec::new();
-    out.try_reserve(rows)
+    // 確保量は全行数を上限とする（行数自体は `ResidentMatrix::build` が
+    // `MAX_BATCH_ROWS` 以下に制限済み。ここでの `try_reserve` は
+    // abort-on-OOM を避けるためのフォールブル確保）。
+    out.try_reserve(matrix.row_count())
         .map_err(|_| GpuInputError::CapacityExceeded)?;
     for (idx, (tenant, visibility)) in matrix
         .tenant_ids()
@@ -825,6 +837,17 @@ fn gather_reachable_rows(
                 out.push(idx_u32);
             }
         }
+    }
+
+    // 後段の二重チェック: 実際に走査する行数 × dim のみを課金する
+    // （主防御線の `check_reachable_batch_work` と同じ基準。単独ではクエリ件数を
+    // 考慮しないため総量ガードの代替にはならない）。
+    let work = out
+        .len()
+        .checked_mul(matrix.dim())
+        .ok_or(GpuInputError::WorkBudgetExceeded)?;
+    if work > MAX_BATCH_WORK {
+        return Err(GpuInputError::WorkBudgetExceeded);
     }
     Ok(out)
 }
@@ -1470,6 +1493,45 @@ mod tests {
             err,
             crate::batch_search::BatchSearchError::PrimaryResultRejected
         );
+    }
+
+    // 回帰テスト（codex P1 指摘対応）: `gather_reachable_rows` の後段ガードは
+    // 常駐行列の全行数ではなく「当該クエリが実際に走査する行数」で課金する。
+    // 他テナント行を多数含む行列でも、可視行が少なければ受理されること
+    // （旧実装は全行課金のため `WorkBudgetExceeded`＝`Input` エラーとなり、
+    // CPU 縮退もできず有効な要求を恒久的に拒否していた）を確認する。
+    #[test]
+    fn gather_reachable_rows_bills_only_the_rows_it_scans() {
+        // dim を大きめに取り、「全行 × dim」なら予算超過・「可視行 × dim」なら
+        // 予算内、という関係になる規模を作る。
+        let dim = 2_000usize;
+        let rows = 40usize; // 全行 40 行のうち可視は 1 行だけ
+        let ids: Vec<u64> = (0..rows as u64).collect();
+        let tenant_ids: Vec<String> = (0..rows)
+            .map(|i| {
+                if i == 0 {
+                    "a".to_string()
+                } else {
+                    format!("other-{i}")
+                }
+            })
+            .collect();
+        let visibilities = vec![Visibility::Private; rows];
+        let vectors = vec![0.5f32; rows * dim];
+        let matrix = crate::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let ctx = PolicyContext::with_visibilities("a", [Visibility::Private])
+            .expect("policy context with explicit visibilities should build");
+        let reachable = gather_reachable_rows(&matrix, &ctx)
+            .expect("a query that scans a single row must not exceed the work budget");
+        assert_eq!(reachable, vec![0], "only tenant a's private row is visible");
     }
 
     // GPU デバイスが利用可能な実行環境でのみ実走する end-to-end 正しさの検証。
