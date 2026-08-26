@@ -12,11 +12,12 @@
 
 ## 背景
 
-TASK-83 は spec 上「必須独立タスク・Conditional Go 条件7」であり、SQL-1（C1: 純粋
-Top-k）の p95 レイテンシを他プロセスと共有しない専有環境で再測定し、SQL-1 の p95
-基準を満たすことを確認する（ポインタ: `docs/spec/05-tasks.md` TASK-83）。数値基準・
-過去の PoC 実測値そのものは spec が SSOT であり、本ドキュメントへは転記しない
-（`.claude/rules/spec-confidentiality.md`）。
+本 PR は TASK-83（Conditional Go 条件7。ポインタ: `docs/spec/05-tasks.md`）に対する
+実装として、SQL 表層 C1（純粋 Top-k）の p95 再測定ハーネス・合否ゲート・専有環境での
+再実行手順を整備する。タスクの定義本文・数値基準・過去の PoC 実測値は spec が SSOT で
+あり、本ドキュメントへは転記しない（`.claude/rules/spec-confidentiality.md`。ポインタ
+表記に留める運用は `docs/design/concurrent-write-verification.md`〔TASK-144・条件6〕の
+前例に倣う）。
 
 TASK-158（性能計測プロトコル基盤 `crates/engine/benches/harness/`）の契約
 （warmup 20 回以上・計測 20 回以上・中央値＋Q1/Q3・決定的シード RNG・interleaved A/B）
@@ -43,7 +44,7 @@ end-to-end 再測定は TASK-165 の管轄とする。
 | ---- | ---- |
 | 測定入口 | `crates/engine/benches/sql_c1_bench.rs`（`cargo bench --bench sql_c1_bench -p engine` / `make bench-c1`） |
 | 測定対象 | `EngineCore::execute_sql(ctx, "SELECT id FROM documents ORDER BY embedding <=> '[...]' LIMIT 20")`（SQL-1 の規範形。`harness::sql_c1` が構造検証つきで組み立てる） |
-| データ | 100,000 行 × 768 次元・k=20（決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
+| データ | 100,000 行 × 768 次元・k=20（本ベンチが選んだ計測構成。既存 `parallel_bench.rs` の行数・次元に揃えて比較可能にしたもので、spec の計測条件の転記ではない。決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
 | プロトコル | `harness::protocol::run`（warmup 20・計測 50・決定的シード）→ `harness::accept::p95_from_samples` / `check_p95_within_limit`。Recall@20 は `CpuScalarProvider`（厳密最近傍の独立オラクル）との Top-20 一致率を 20 クエリの worst-query で判定 |
 | 診断 A/B | `harness::ab::run_ab` で SQL 表層 vs `EngineCore::search` を interleaved 計測し `median_ratio` を出力（**合否には含めない**。SQL 表層オーバーヘッドの切り分け材料。ただし `EngineCore::search` 側は `PrefilterCache`〔TASK-169〕を経由するため、テーブル内容が変わらない本ベンチでは初回以降キャッシュがウォームな状態で計測される——`median_ratio` は「SQL 表層のコールドな arena 再構築」と「キャッシュヒット時の `EngineCore::search`」の比であり、両経路の候補デコード実装そのものを対称条件で比較した値ではない点に注意） |
 | 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`parallel_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
