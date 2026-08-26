@@ -42,7 +42,7 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM)))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(small_chunk_config())
 }
 
@@ -161,7 +161,7 @@ fn index2_file_insert_chunks_are_searchable_by_hybrid_and_distance() {
     assert_eq!(incremental.chunks_written, 3);
     assert_eq!(incremental.rows_replaced, 3);
 
-    let embedder = HashingEmbedder::new(DIM);
+    let embedder = HashingEmbedder::new(DIM).expect("valid dim");
     let query_text = "unique marker zzzqq";
     let query_vec = embedder
         .embed_batch(&[query_text])
@@ -490,7 +490,7 @@ fn chunk_count_over_limit_is_rejected_with_no_side_effects() {
         ))
         .expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM)))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(IncrementalConfig {
             chunking: engine::chunking::ChunkingConfig {
                 lines_per_chunk: 1,
@@ -545,7 +545,7 @@ fn invalid_chunking_config_is_reported_as_internal_error_not_payload_limit() {
         ))
         .expect("create table");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM)))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(IncrementalConfig {
             chunking: engine::chunking::ChunkingConfig {
                 lines_per_chunk: 0,
@@ -577,6 +577,50 @@ fn invalid_chunking_config_is_reported_as_internal_error_not_payload_limit() {
         )
         .expect("select should succeed");
     assert_eq!(rows.rows.len(), 0);
+}
+
+/// チャンク数と次元の積（埋め込み結果の総バイト数）に上限があり、個別上限内でも
+/// 積が上限を超える入力は埋め込み呼び出し前に拒否されることを固定する
+/// （codex-review P1 指摘・PR #221。OOM を誘発できる経路を塞ぐ）。
+#[test]
+fn embedding_total_bytes_limit_rejects_chunk_count_times_dim_blowup() {
+    const BIG_DIM: u32 = 65_536;
+    let path = unique_db_path("index-total-bytes");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(BIG_DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(BIG_DIM).expect("valid dim")))
+        .with_incremental_config(IncrementalConfig {
+            chunking: engine::chunking::ChunkingConfig {
+                lines_per_chunk: 1,
+                max_markdown_section_chars: None,
+            },
+            ..IncrementalConfig::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 1 行 1 チャンク。チャンク数はファイル単位上限（既定 4,096）内だが、
+    // チャンク数 × 次元 × 4 byte が総バイト上限（64 MiB）を超える。
+    let lines: Vec<String> = (0..300).map(|i| format!("line {i}")).collect();
+    let body = lines.join("\n");
+    let err = core
+        .execute_insert_sql(
+            &write_ctx,
+            &insert_file_sql("documents", "docs/huge.txt", &body, "op-huge-1"),
+        )
+        .expect_err("embedding result size blowup must be rejected");
+    assert_eq!(err.wire_code(), "54000");
 }
 
 #[test]
@@ -647,7 +691,7 @@ fn embedder_dim_mismatch_with_table_schema_is_rejected_with_no_side_effects() {
     // （サーバー側設定の不整合。クライアント入力の不正ではないため XX000 になる
     // べきで、22000（クライアント起因の値不正）に丸め込まれてはならない）。
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM + 1)));
+        .with_embedder(Box::new(HashingEmbedder::new(DIM + 1).expect("valid dim")));
     let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
     let err = core

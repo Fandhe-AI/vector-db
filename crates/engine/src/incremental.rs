@@ -26,6 +26,14 @@ use crate::tenant::{ReplaceOutcome, TenantWriteError};
 /// あり、本上限はそれを代替しない）。
 pub const MAX_CHUNKS_PER_FILE: usize = 4_096;
 
+/// 1 ファイル分の埋め込み結果として確保してよい総バイト数の上限。
+///
+/// チャンク数（[`MAX_CHUNKS_PER_FILE`]）と次元（`embedding::MAX_EMBEDDER_DIM`）を
+/// 個別に検証するだけでは積が非常に大きくなり得るため、両者の積へ独立した上限を
+/// かける（codex-review P1 指摘・PR #221。coding-rust.md「不安全な設計 / DoS」・
+/// 「整数演算は checked_* を使う」）。
+pub const MAX_EMBEDDING_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 /// [`index_file`] の挙動を調整する設定。
 #[derive(Debug, Clone)]
 pub struct IncrementalConfig {
@@ -216,6 +224,25 @@ pub(crate) fn index_file(
             chunks.len(),
             config.max_chunks_per_file
         )));
+    }
+
+    // チャンク数 × 次元 × `f32` の積へ上限をかける（個別上限だけでは積が
+    // 有界にならない。埋め込み呼び出しの前に checked 演算で判定し、確保も
+    // 外部呼び出しも行わずに拒否する）。
+    let total_bytes = chunks
+        .len()
+        .checked_mul(table_dim as usize)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()));
+    match total_bytes {
+        Some(bytes) if bytes <= MAX_EMBEDDING_TOTAL_BYTES => {}
+        _ => {
+            return Err(IncrementalError::ChunkingTooLarge(format!(
+                "embedding result too large: {} chunks x dim {} exceeds {} bytes",
+                chunks.len(),
+                table_dim,
+                MAX_EMBEDDING_TOTAL_BYTES
+            )))
+        }
     }
 
     let embedding_start = Instant::now();

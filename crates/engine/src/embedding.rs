@@ -48,6 +48,13 @@ pub enum EmbedError {
     /// 1 回のバッチ呼び出しに対する入力件数が上限を超えた
     /// （coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」対応）。
     TooManyInputs { len: usize, max: usize },
+    /// 構築時に指定された次元が受理範囲（`1..=`[`MAX_EMBEDDER_DIM`]）外だった
+    /// （codex-review P1 指摘・PR #221。無検証の巨大次元で infallible な確保を
+    /// 行わないため、構築を `Result` にして境界で弾く）。
+    InvalidDim { dim: u32, max: u32 },
+    /// ベクトル確保に失敗した（メモリ逼迫）。`vec![]` の infallible 確保による
+    /// abort を避け、`try_reserve_exact` の失敗をエラーとして返す。
+    AllocationFailed,
 }
 
 impl std::fmt::Display for EmbedError {
@@ -61,6 +68,10 @@ impl std::fmt::Display for EmbedError {
             EmbedError::TooManyInputs { len, max } => {
                 write!(f, "embedding batch too large: {len} inputs (max {max})")
             }
+            EmbedError::InvalidDim { dim, max } => {
+                write!(f, "invalid embedding dim: {dim} (must be 1..={max})")
+            }
+            EmbedError::AllocationFailed => write!(f, "embedding allocation failed"),
         }
     }
 }
@@ -74,6 +85,11 @@ impl std::error::Error for EmbedError {}
 /// 有界に保つ）。
 pub const MAX_EMBED_BATCH: usize = 8_192;
 
+/// [`Embedder`] 実装が受理してよい最大次元。カタログの `VECTOR(N)` 上限
+/// （`storage::MAX_EMBEDDING_DIM`）と同値に固定する（この上限を超える次元は
+/// どのみちテーブルへ書けないため、埋め込み側で先に弾いて確保量を有界にする）。
+pub const MAX_EMBEDDER_DIM: u32 = crate::storage::MAX_EMBEDDING_DIM;
+
 /// 決定的・ネットワーク不要な参照実装（feature hashing → 固定次元 → L2 正規化）。
 ///
 /// **意味的埋め込みではない**（類似語・類義語を近づける学習済みモデルを一切
@@ -86,9 +102,20 @@ pub struct HashingEmbedder {
 }
 
 impl HashingEmbedder {
-    /// `dim`（0 は不正）で参照実装を構築する。
-    pub fn new(dim: u32) -> Self {
-        Self { dim }
+    /// `dim` で参照実装を構築する。受理範囲は `1..=`[`MAX_EMBEDDER_DIM`]。
+    ///
+    /// 範囲外を `Result` で拒否する（`embed_batch` が入力ごとに `dim` 要素を確保する
+    /// ため、未検証の巨大次元を受け付けると `Result` を返す API でありながら確保失敗が
+    /// abort になる。codex-review P1 指摘・PR #221。coding-rust.md「長さフィールドは
+    /// 上限検証してからアロケーションに使う」）。
+    pub fn new(dim: u32) -> Result<Self, EmbedError> {
+        if dim == 0 || dim > MAX_EMBEDDER_DIM {
+            return Err(EmbedError::InvalidDim {
+                dim,
+                max: MAX_EMBEDDER_DIM,
+            });
+        }
+        Ok(Self { dim })
     }
 
     /// 1 語（小文字化済み）を FNV-1a でハッシュし、`dim` 個の次元へ符号付きで
@@ -137,7 +164,11 @@ impl Embedder for HashingEmbedder {
                 max: MAX_EMBED_BATCH,
             })?;
         for text in texts {
-            let mut v = vec![0.0f32; dim];
+            // `vec![0.0; dim]` の infallible 確保を避け、失敗をエラーへ変換する。
+            let mut v: Vec<f32> = Vec::new();
+            v.try_reserve_exact(dim)
+                .map_err(|_| EmbedError::AllocationFailed)?;
+            v.resize(dim, 0.0f32);
             for token in text.split_whitespace() {
                 let lower = token.to_lowercase();
                 Self::hash_token_into(dim, &lower, &mut v);
@@ -160,7 +191,7 @@ mod tests {
 
     #[test]
     fn embed_batch_is_deterministic() {
-        let e = HashingEmbedder::new(16);
+        let e = HashingEmbedder::new(16).expect("valid dim");
         let a = e.embed_batch(&["hello world", "second text"]).unwrap();
         let b = e.embed_batch(&["hello world", "second text"]).unwrap();
         assert_eq!(a, b);
@@ -168,7 +199,7 @@ mod tests {
 
     #[test]
     fn embed_batch_output_matches_configured_dim() {
-        let e = HashingEmbedder::new(32);
+        let e = HashingEmbedder::new(32).expect("valid dim");
         let out = e.embed_batch(&["some text here"]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 32);
@@ -176,14 +207,14 @@ mod tests {
 
     #[test]
     fn embed_batch_empty_input_returns_empty_output() {
-        let e = HashingEmbedder::new(8);
+        let e = HashingEmbedder::new(8).expect("valid dim");
         let out = e.embed_batch(&[]).unwrap();
         assert!(out.is_empty());
     }
 
     #[test]
     fn embed_batch_output_is_l2_normalized() {
-        let e = HashingEmbedder::new(16);
+        let e = HashingEmbedder::new(16).expect("valid dim");
         let out = e
             .embed_batch(&["some non-empty text with several tokens"])
             .unwrap();
@@ -193,7 +224,7 @@ mod tests {
 
     #[test]
     fn embed_batch_rejects_over_max_batch() {
-        let e = HashingEmbedder::new(4);
+        let e = HashingEmbedder::new(4).expect("valid dim");
         let texts: Vec<&str> = std::iter::repeat_n("x", MAX_EMBED_BATCH + 1).collect();
         let err = e.embed_batch(&texts).unwrap_err();
         assert_eq!(
@@ -205,9 +236,29 @@ mod tests {
         );
     }
 
+    // codex-review P1 指摘・PR #221: 未検証の次元で infallible な巨大確保をしない。
+    #[test]
+    fn new_rejects_zero_and_over_max_dim() {
+        assert_eq!(
+            HashingEmbedder::new(0).unwrap_err(),
+            EmbedError::InvalidDim {
+                dim: 0,
+                max: MAX_EMBEDDER_DIM
+            }
+        );
+        assert_eq!(
+            HashingEmbedder::new(u32::MAX).unwrap_err(),
+            EmbedError::InvalidDim {
+                dim: u32::MAX,
+                max: MAX_EMBEDDER_DIM
+            }
+        );
+        assert!(HashingEmbedder::new(MAX_EMBEDDER_DIM).is_ok());
+    }
+
     #[test]
     fn embed_batch_different_texts_produce_different_vectors() {
-        let e = HashingEmbedder::new(64);
+        let e = HashingEmbedder::new(64).expect("valid dim");
         let out = e
             .embed_batch(&["alpha beta gamma", "completely different words"])
             .unwrap();
