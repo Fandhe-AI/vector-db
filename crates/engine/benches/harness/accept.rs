@@ -99,12 +99,10 @@ pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, B
 /// 対照エンジンとの比率（被検/対照）が上限（`max_ratio`）以下かを判定する
 /// （CORE-5。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）。
 ///
-/// 呼び出し元（`contrast_bench.rs`）は本実装が採用する統計量として
-/// [`p95_ratio`] の結果を渡す（`ab::AbMeasurement::median_ratio` は補助情報として
-/// 標準出力に併記するのみで、本判定には使わない）。CORE-5 の判定統計量の詳細は
-/// `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本コメントでは
-/// 転記しない。引数名を汎用の `ratio` ではなく統計量非依存の値として扱えるよう、
-/// 値そのものの妥当性検証（有限・非負）のみを本関数の責務とする（TASK-127・
+/// `ratio` の算出方法は本関数の関知するところではなく、呼び出し元
+/// （`contrast_bench.rs`）が算出済みの比率を渡す契約とする。本関数の責務は値の
+/// 妥当性検証（有限・非負）と上限との突き合わせのみで、比率の定義を含む CORE-5 の
+/// 判定内容は上記ポインタ先が SSOT のため本コメントには記載しない（TASK-127・
 /// Issue #176 で対照エンジン〔usearch〕へ接続済み）。
 pub fn check_contrast_ratio_within_limit(ratio: f64, max_ratio: f64) -> Result<bool, BenchError> {
     if !ratio.is_finite() || ratio < 0.0 {
@@ -120,7 +118,7 @@ pub fn check_contrast_ratio_within_limit(ratio: f64, max_ratio: f64) -> Result<b
     Ok(ratio <= max_ratio)
 }
 
-/// 2 つの所要時間サンプル列から p95 レイテンシの比率（a/b）を算出する（CORE-5）。
+/// 2 つの所要時間サンプル列の p95 の比（a/b）を算出する汎用ヘルパ。
 ///
 /// `contrast_bench.rs` が `a`＝被検（`ParallelSearchProvider`）・`b`＝対照
 /// （usearch `exact_search`）の順で渡す契約とする。`p95_from_samples` を経由するため

@@ -88,11 +88,10 @@ bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてあ�
   B＝`ContrastIndex::search`（usearch `exact_search`）を同一データ・同一クエリで
   交互実行する（測定条件は `simd_bench.rs` と同一の `ROW_COUNT`/`DIM`/`TOP_K`/
   シード）
-- 判定統計量: 実装は `harness::accept::p95_ratio` の結果で判定する
-  （`AbMeasurement::median_ratio`〔`ab.rs` の既存契約〕は補助情報として標準出力に
-  併記するのみで、判定には使わない）。CORE-5 の判定統計量の詳細は
-  `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本ドキュメントでは
-  転記しない
+- 判定: `harness::accept::check_contrast_ratio_within_limit`（被検/対照の比率が
+  `BENCH_MAX_CONTRAST_RATIO` 以下か）。比率の算出方法を含む CORE-5 の判定内容は
+  `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本ドキュメントには
+  記載しない
 - 閾値注入: `BENCH_MAX_CONTRAST_RATIO` 環境変数（有限・正の浮動小数点）。未設定・
   不正値は fail-closed（`harness::accept::parse_contrast_ratio_limit`）
 - 健全性チェック: 同一クエリでの Top-k 一致率（`recall_at_k`）を対照側と算出し標準
