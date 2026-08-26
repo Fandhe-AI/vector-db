@@ -44,8 +44,15 @@
 use redb::{Database, ReadableDatabase, TableDefinition};
 
 /// テスト対象のテーブル定義（`crates/engine/src/storage.rs` の `ROWS_TABLE` と同一の
-/// キー・値型。本ファイルは行の中身を解釈しないため、値のエンコード詳細に依存しない）。
-const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
+/// キー・値型 `(tenant_id, id)` 複合キー（対象ビヘイビア: TABLE-12）。本ファイルは
+/// 行の中身を解釈しないため、値のエンコード詳細に依存しない。物理キー形式を production
+/// と揃えておくことで、本ファイルの電源断像が実際の `Storage` の on-disk レイアウトを
+/// 正しく模していることを保つ（Issue #206）。
+const ROWS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("rows");
+
+/// 本ファイル全体で使う固定テナント識別子（RLS 相当のテナント境界判定経路には
+/// 踏み込まないため単一値で足りる。`crash_tool.rs::CRASH_TOOL_TENANT_ID` と同方針）。
+const POWER_LOSS_TENANT_ID: &str = "power-loss-tenant";
 
 // `BackendState`/`PowerLossBackend`（commit/sync 契約のモデル本体）は
 // `crates/engine/src/storage.rs` の `#[cfg(test)]` ユニットテストと共有するため、
@@ -150,7 +157,9 @@ fn insert_row(db: &Database, id: u64, value: &[u8]) {
     let write_txn = db.begin_write().expect("begin write txn");
     {
         let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
-        table.insert(id, value).expect("insert row");
+        table
+            .insert((POWER_LOSS_TENANT_ID, id), value)
+            .expect("insert row");
     }
     write_txn.commit().expect("commit write txn");
 }
@@ -163,7 +172,7 @@ fn get_row(db: &Database, id: u64) -> Option<Vec<u8>> {
         Err(e) => panic!("unexpected open_table error: {e}"),
     };
     table
-        .get(id)
+        .get((POWER_LOSS_TENANT_ID, id))
         .expect("get row")
         .map(|guard| guard.value().to_vec())
 }
@@ -210,11 +219,11 @@ fn power_loss_scenario2_mid_transaction_crash_discards_whole_transaction() {
         let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
         for i in 0..64u64 {
             table
-                .insert(1_000 + i, &[0u8; 512][..])
+                .insert((POWER_LOSS_TENANT_ID, 1_000 + i), &[0u8; 512][..])
                 .expect("insert uncommitted row");
         }
         table
-            .insert(2u64, &b"never-committed"[..])
+            .insert((POWER_LOSS_TENANT_ID, 2u64), &b"never-committed"[..])
             .expect("insert uncommitted row");
     }
 
@@ -331,7 +340,7 @@ fn run_partial_writeback_search(seed_count: u64, extra_writes: u64) {
             let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
             for i in 0..extra_writes {
                 table
-                    .insert(100 + i, &[0u8; 512][..])
+                    .insert((POWER_LOSS_TENANT_ID, 100 + i), &[0u8; 512][..])
                     .expect("insert uncommitted row");
             }
         }

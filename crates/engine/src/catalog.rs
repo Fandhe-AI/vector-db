@@ -517,12 +517,17 @@ pub(crate) fn user_rows_table_name(table_name: &str) -> String {
 /// 経路が構造的に消える（codex-review P0 指摘・PR #194）。`redb` のタプルキーは
 /// 要素順（tenant_id 昇順 → id 昇順）で全順序を持つため、全件走査は従来どおり
 /// 単一の range 走査で列挙できる。
-pub(crate) type UserRowsTableDef<'a> = TableDefinition<'a, (&'static str, u64), &'static [u8]>;
+///
+/// `storage.rs::RowStoreTableDef` へのエイリアス（Issue #206。旧 `rows` テーブル
+/// （`storage.rs::ROWS_TABLE`）とテーブル名だけが異なる同一契約のため、キー型定義を
+/// `storage.rs` 側へ一元化しドリフトを防ぐ）。
+pub(crate) type UserRowsTableDef<'a> = crate::storage::RowStoreTableDef<'a>;
 
 /// [`Storage::scan_table_page`] のページングカーソル（行ストアの物理キーと同形の
 /// `(tenant_id, id)`。対象ビヘイビア: TABLE-12。`id` 単独では再開位置を表現できない）。
-/// 呼び出し元がカーソルを保持できるよう所有形（`String`）で返す。
-pub type RowCursor = (String, u64);
+///
+/// `storage.rs::RowCursor` の re-export（生成点は `storage.rs` に一元化。Issue #206）。
+pub use crate::storage::RowCursor;
 
 /// [`Storage::scan_table_page`] の戻り値（1 ページ分の行と、続きがある場合の
 /// [`RowCursor`]）。
@@ -597,6 +602,12 @@ fn convert_storage_error(e: StorageError) -> CatalogError {
         StorageError::GenerationCounterOverflow => {
             CatalogError::Invalid("storage generation counter overflow".to_string())
         }
+        // カタログ層は `catalog.rs::ROWS_TABLE`（`user_rows/{table}`）を経由し
+        // `storage.rs::ROWS_TABLE`（旧 `rows` テーブル）は経由しないため通常到達
+        // しないが、`StorageError` の網羅性のためここでも扱う。両テーブルは
+        // `CatalogError::IncompatibleRowKeyFormat` と完全に同一の文言を持つため、
+        // 単純な写像で挙動が揃う（Issue #206）。
+        StorageError::IncompatibleRowKeyFormat => CatalogError::IncompatibleRowKeyFormat,
     }
 }
 

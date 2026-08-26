@@ -172,17 +172,18 @@ fn write_table(storage: &Storage, table_name: &str, dim: u32, id_base: u64) -> V
 fn scan_all(storage: &Storage) -> (Duration, usize) {
     let started = Instant::now();
     let mut total_rows = 0usize;
-    let mut cursor = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (page, next_cursor) = storage
-            .scan_page(cursor, 512)
+            .scan_page(cursor_ref, 512)
             .expect("scan_page should succeed");
         total_rows += page.len();
         match next_cursor {
             None => break,
             // 安全弁: cursor が前進しない場合の無限ループを防ぐガード
             // （`tests/multi_dim_tables.rs` の `assert_rows_match` と同じ方針）。
-            Some(next) if cursor.is_some_and(|prev| next <= prev) => break,
+            Some(ref next) if cursor.as_ref().is_some_and(|prev| next <= prev) => break,
             Some(next) => cursor = Some(next),
         }
     }
