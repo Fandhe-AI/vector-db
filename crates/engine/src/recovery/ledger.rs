@@ -17,7 +17,7 @@
 //! ハッシュ（`22023`）は TASK-101 の管轄。本モジュールは「既存エントリを上書きしない
 //! （keep-first）」ことだけを恒久契約として担保する。
 
-use redb::{ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition, TableHandle};
 
 use crate::recovery::required_op_id::OperationId;
 use crate::storage::StorageError;
@@ -49,6 +49,12 @@ const LEDGER_ENTRY_FORMAT_VERSION: u8 = 1;
 
 /// 台帳エントリの符号化値（現行フォーマット。バージョンバイトのみ）。
 const LEDGER_ENTRY_V1: [u8; 1] = [LEDGER_ENTRY_FORMAT_VERSION];
+
+/// [`delete_table_in_txn`] が 1 回の走査・削除で `keys_to_remove` に保持するキー数の
+/// 上限（Issue #226 レビュー対応・codex-review 指摘）。長期利用テーブルの
+/// `DROP TABLE` でも台帳サイズに比例した無制限メモリを一度に要求しないよう、
+/// 対象キーが尽きるまでこの件数単位で繰り返し走査・削除する。
+const DELETE_BATCH_SIZE: usize = 1024;
 
 /// 未知の台帳値フォーマットを検出したときのエラー（fail-closed）。テナント・テーブル・
 /// `operation_id` を含まない固定文言のみを返す（security.md P0）。
@@ -158,34 +164,58 @@ pub(crate) fn record_in_txn(
 /// 削除する際、既にテナント横断で不可逆削除する設計（本ファイル冒頭コメント参照）
 /// のため、台帳エントリもテナントを問わず同名分をまとめて削除して整合させる。
 ///
-/// 台帳テーブル自体が未作成（一度も `Record` されていない DB）の場合は no-op で
-/// `Ok(())` を返す（`contains_in_read_txn` と同じ「テーブル不在をエラーにしない」
-/// 方針）。キー先頭が `tenant_id` のため `table_name` 単独の range 走査はできず、
-/// 全件走査してから対象キーのみ削除する（DDL 経路のみで呼ばれ、頻度が低いための
-/// 許容。行データそのものへはアクセスしない）。
+/// 台帳テーブル自体が未作成（一度も `Record` されていない DB、または
+/// [`LedgerWrite::Disabled`] のみで運用してきた構成）の場合は no-op で `Ok(())` を
+/// 返す（`contains_in_read_txn` と同じ「テーブル不在をエラーにしない」方針）。
+///
+/// `redb::WriteTransaction::open_table` はテーブル不在時に**自動作成**してしまう
+/// （`ReadTransaction::open_table` と異なり `TableError::TableDoesNotExist` を返さ
+/// ない）ため、直接 `open_table` を呼んで結果を分岐する実装では no-op 分岐が到達
+/// 不能になり、`LedgerWrite::Disabled` が前提とする「台帳テーブルを作らない」契約を
+/// 破って空テーブルを commit してしまう（Issue #226 レビュー対応・Cursor Bugbot
+/// 指摘）。そのため `list_tables` で存在確認してから `open_table` する。
+///
+/// キー先頭が `tenant_id` のため `table_name` 単独の range 走査はできない。全件
+/// 走査は避けられないが、1 回の走査・削除で保持するキー集合は
+/// [`DELETE_BATCH_SIZE`] 件までに有界化し、対象が尽きるまで走査を繰り返す
+/// （長期利用テーブルの `DROP TABLE` で台帳サイズに比例した無制限メモリを一度に
+/// 要求しないようにするため。Issue #226 レビュー対応・codex-review 指摘。行データ
+/// そのものへはアクセスしない）。
 pub(crate) fn delete_table_in_txn(
     write_txn: &redb::WriteTransaction,
     table: &str,
 ) -> Result<(), StorageError> {
-    let mut ledger_table = match write_txn.open_table(OP_LEDGER_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
-        Err(e) => return Err(StorageError::from(e)),
-    };
-    let mut keys_to_remove: Vec<(String, String, String)> = Vec::new();
-    for entry in ledger_table.iter()? {
-        let (k, _v) = entry?;
-        let (tenant_id, table_name, op_id) = k.value();
-        if table_name == table {
-            keys_to_remove.push((
-                tenant_id.to_string(),
-                table_name.to_string(),
-                op_id.to_string(),
-            ));
-        }
+    let ledger_table_exists = write_txn
+        .list_tables()
+        .map_err(StorageError::from)?
+        .any(|handle| handle.name() == OP_LEDGER_TABLE.name());
+    if !ledger_table_exists {
+        return Ok(());
     }
-    for (tenant_id, table_name, op_id) in &keys_to_remove {
-        ledger_table.remove((tenant_id.as_str(), table_name.as_str(), op_id.as_str()))?;
+
+    loop {
+        let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
+        let mut keys_to_remove: Vec<(String, String, String)> = Vec::new();
+        for entry in ledger_table.iter()? {
+            let (k, _v) = entry?;
+            let (tenant_id, table_name, op_id) = k.value();
+            if table_name == table {
+                keys_to_remove.push((
+                    tenant_id.to_string(),
+                    table_name.to_string(),
+                    op_id.to_string(),
+                ));
+                if keys_to_remove.len() >= DELETE_BATCH_SIZE {
+                    break;
+                }
+            }
+        }
+        if keys_to_remove.is_empty() {
+            break;
+        }
+        for (tenant_id, table_name, op_id) in &keys_to_remove {
+            ledger_table.remove((tenant_id.as_str(), table_name.as_str(), op_id.as_str()))?;
+        }
     }
     Ok(())
 }
@@ -439,5 +469,32 @@ mod tests {
         delete_table_in_txn(&write_txn, "documents")
             .expect("no-op when ledger table has never been created");
         write_txn.commit().expect("commit");
+    }
+
+    // (h) delete_table_in_txn は台帳テーブル未作成の DB に対して呼んでも op_ledger
+    // テーブル自体を作成しない（LedgerWrite::Disabled が前提とする「台帳を作らない」
+    // 契約を守る。Issue #226 レビュー対応・Cursor Bugbot 指摘の回帰テスト）。
+    #[test]
+    fn delete_table_in_txn_does_not_create_ledger_table_as_side_effect() {
+        let path = unique_db_path("ledger-h");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        delete_table_in_txn(&write_txn, "documents").expect("no-op");
+        write_txn.commit().expect("commit");
+
+        let read_txn = db.begin_read().expect("begin read");
+        let table_names: Vec<String> = read_txn
+            .list_tables()
+            .expect("list_tables")
+            .map(|handle| handle.name().to_string())
+            .collect();
+        assert!(
+            !table_names
+                .iter()
+                .any(|name| name == OP_LEDGER_TABLE.name()),
+            "delete_table_in_txn must not create op_ledger as a side effect: {table_names:?}"
+        );
     }
 }
