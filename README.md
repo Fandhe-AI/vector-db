@@ -44,7 +44,8 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make lint-docs` | ドキュメント／設定ファイル系 lint（markdownlint・yamllint・editorconfig-checker・commitlint） |
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
-| `make bench-parallel` / `make bench-c1` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
+| `make bench-parallel` / `make bench-c1` / `make recall-regression` / `make precision-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行。`precision-regression` は目標値未確定のため `recall.yml` へ未接続。詳細は下記「`precision` 評価ハーネス」参照） |
+| `make precision-report` | TASK-163 の判断材料レポート・パラメータ感度スイープ（実測値を標準出力へ出すため**ローカル専用**。CI・GitHub Actions からは実行しない） |
 | `make e2e-three-client` | TASK-73（WIRE-1）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
 
 ターゲット一覧は `make help` で確認できます。
@@ -142,6 +143,35 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 ```
 
 挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo variables」と同一です。ローカルの `make rerank-regression`（`RERANK_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`RERANK_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。
+
+### `precision` 評価ハーネス（TASK-163）
+
+`crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の
+SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエリを含む）上で実測する
+評価ハーネスです。設計判断の記録は `docs/design/precision-eval-regression.md`
+を参照してください（指標の定義・実測値・パラメータ感度は spec 側で管理します）。
+
+- 層 A（`cargo test -p engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
+  上で評価を通しで実行し、構造不変条件と測定の決定性のみを検査します（指標の実測値は
+  アサートも出力もしません。品質の回帰判定は層 B が担います）。
+- 層 B（`make precision-regression`）: 閾値ゲートのみを実行し、指標名と pass/fail
+  だけを出力します（閾値の数値も実測値も出力しません）。`PRECISION_EVAL_MIN_TOP1_ACC`・
+  `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
+  と比較して判定します。未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝
+  明示的に対象外」として成功終了、`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`（strict
+  モード）では未設定も fail-closed でテスト失敗とします。非数値・範囲外は常に
+  fail-closed です。
+- 判断材料レポート・感度スイープ（`make precision-report`。**ローカル専用**）:
+  hybrid・dense 双方の指標（`precision_eval_report`）と `PrecisionPolicy` の閾値を
+  差し替えたパラメータ感度スイープ（`precision_eval_policy_sweep`。hybrid 系列・
+  dense 系列）を出力します。実測値を標準出力へ出すため、public runner で動く CI・
+  `recall.yml` からは実行しません（`.claude/rules/spec-confidentiality.md`）。
+- **`.github/workflows/recall.yml` への接続は行っていません**: TASK-163 のスコープは
+  実測・判断材料の提示までであり目標値の確定は含まないため、上記の
+  `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。
+  目標値が確定したのち、`RERANK_RECALL_MIN_*` 等と同様に `recall-gate` の Actions
+  variables として設定し、`recall.yml` の `recall-regression` job に
+  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` 付きの step を追加してください。
 
 ## ライセンス
 
