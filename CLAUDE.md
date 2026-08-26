@@ -29,7 +29,7 @@ vector-db/
 │   └── spec/                      # vector-db-spec submodule（private・要アクセス権）
 ├── .github/workflows/
 │   ├── ci.yml                     # lint-docs + rust-ci（fmt/clippy/test/cargo-deny）+ crash-test + crash-test-interrupt + crash-test-cross-table + core-api-check + sort-determinism-check + cross-check（aarch64 クロスコンパイル確認）の CI
-│   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 まで opt-in）+ TASK-130 バッチ高速化受け入れ基準（CORE-6 は GPU 搭載環境向けの opt-in・CORE-16 は測定不能）の回帰ベンチ（workflow_dispatch + 週次 schedule）+ TASK-83 SQL 表層 C1 p95 専有環境再測定（Conditional Go 条件7・workflow_dispatch 限定）
+│   ├── bench.yml                  # TASK-127 性能・Recall 受け入れ基準（CORE-5 は Issue #176 で usearch 接続済み・既定ゲート）+ TASK-130 バッチ高速化受け入れ基準（CORE-6/16 は GPU 搭載環境向けの Issue #178 opt-in）の回帰ベンチ（workflow_dispatch + 週次 schedule）+ TASK-83 SQL 表層 C1 p95 専有環境再測定（Conditional Go 条件7・workflow_dispatch 限定）
 │   ├── recall.yml                 # TASK-104 ハイブリッド検索 Recall 回帰の層 B 閾値ゲート（workflow_dispatch + 週次 schedule。environment recall-gate + strict モードで閾値未評価runの誤green化を防止。pull_request 非対応＝spec 閾値の非公開ログ漏えい防止。PR ゲートは層 A が担う）
 │   └── codex-review.yml           # PR 自動レビュー wrapper
 ├── .claude/
@@ -105,7 +105,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 
 ## Conventions
 
-- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み
+- **環境構築・検証**: `make setup`（submodule → rustup → lefthook）で構築し、push 前に `make ci`（CI と同等のチェック）をローカル実行する。cargo 系ターゲットは workspace 追加（TASK-66）により有効化済み。`make lint`／`make test`（lefthook pre-push 含む）は `--all-features` で実行するため `contrast-bench` feature 経由で usearch（optional 依存）の C++ ビルドが走る。**C++17 コンパイラが必須**（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに無い場合 `make lint`／`make test`／`make ci` が失敗する。詳細は README「回帰ベンチの repo variables」節）
 - **日本語**: やりとり・報告・コミット説明文・コード内コメントは日本語（プログラム出力文字列は英語）
 - **Conventional Commits**: commitlint で検証。`--no-verify` 禁止
 - **セキュリティレビュー**: PR 作成前に OWASP Top 10＋AGENTS.md P0 観点（spec 漏えい・テナント境界・wire 入力検証）を確認

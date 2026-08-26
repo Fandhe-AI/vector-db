@@ -19,6 +19,12 @@ pub enum BenchError {
     /// （`ab::run_ab` の `median_ratio` 算出。回帰ゲートが NaN で暗黙に false 評価される
     /// 事態を防ぐため、算出不能を明示的な `Err` として呼び出し側に伝える）。
     DegenerateRatio(&'static str),
+    /// 対照エンジン（`contrast.rs`。TASK-127 CORE-5・Issue #176）の FFI 呼び出しが
+    /// エラーを返した。呼び出し元（`contrast_bench.rs`）が `unwrap`/`expect` で panic
+    /// させず `Result` 伝播できるよう、エラー内容（`cxx::Exception::what()` 等）を
+    /// 文字列化して保持する（動的な理由文字列を要するため他の variant の `&'static str`
+    /// では表現できない）。
+    ExternalEngine(String),
 }
 
 impl std::fmt::Display for BenchError {
@@ -30,6 +36,9 @@ impl std::fmt::Display for BenchError {
             }
             BenchError::DegenerateRatio(reason) => {
                 write!(f, "degenerate ratio: {reason}")
+            }
+            BenchError::ExternalEngine(reason) => {
+                write!(f, "external engine error: {reason}")
             }
         }
     }

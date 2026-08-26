@@ -64,12 +64,13 @@ psycopg・node pg から無改造で cleartext password 認証つき接続でき
 
 ### 回帰ベンチの repo variables（TASK-127）
 
-`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）・`BENCH_MAX_CONTRAST_RATIO`（対照エンジンに対する p95 レイテンシ比率〔被検/対照〕の上限・TASK-127 CORE-5）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
 gh variable set BENCH_MAX_P95_MS
 gh variable set BENCH_MIN_RECALL
 gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
+gh variable set BENCH_MAX_CONTRAST_RATIO
 ```
 
 形式は以下のとおりです（値は上記のとおり本リポジトリには記載しません）。
@@ -79,13 +80,11 @@ gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
 | `BENCH_MAX_P95_MS` | 正の整数（単位: ms） |
 | `BENCH_MIN_RECALL` | `(0.0, 1.0]` の浮動小数点 |
 | `BENCH_BATCH_MAX_DEGRADATION_PCT` | 0 以上の有限浮動小数点 |
+| `BENCH_MAX_CONTRAST_RATIO` | 0 より大きい有限浮動小数点 |
 
-未設定のまま実行すると `crates/engine/benches/simd_bench.rs`／`batch_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+未設定のまま実行すると `crates/engine/benches/simd_bench.rs`／`batch_bench.rs`／`contrast_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続です（TASK-127。`.claude/rules/dependency-policy.md`。Issue #176 で追跡中）。CORE-5 の判定は `BENCH_CORE5` repo variable による opt-in 方式です。
-
-- 未設定（既定）: CORE-5 は「対象外」として標準出力へ明示され、合否判定には含まれません。CORE-3（p95 レイテンシ）・CORE-4（Recall@k）のみで合否を返します
-- `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
+CORE-5（対照エンジンとの p95 レイテンシ比較。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）は usearch の総当たり `exact_search`（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176。クレート採用と公開境界はオーナー承認済み〔2026-08-26〕）。`contrast_bench.rs` が被検（`ParallelSearchProvider`）と対照エンジンを同一データ・同一クエリで interleaved A/B 実行し、両者の p95 レイテンシ比率（被検/対照）が `BENCH_MAX_CONTRAST_RATIO` 以下であることを判定します。CORE-3/CORE-4（`simd_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。閾値の具体値は spec が SSOT のため本リポジトリには記載せず、bench の標準出力にも出しません。`contrast-bench` feature は `make lint`／`make test`（lefthook pre-push 含む）が `--all-features` で実行するため、`make bench-contrast` に限らずこれらのローカル実行・CI でも usearch の C++ ビルドが走ります。C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに C++17 コンパイラがない環境では `make lint`／`make test`／`make ci` が失敗します）。
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は Issue #178 で追跡中です。実 GPU バックエンド（`gpu_batch.rs`）に加え、CORE-6 は `benches/batch_bench.rs` の A/B 実測ゲート（GPU 経路 vs CPU-SIMD 経路）へ配線済みです。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限 `BENCH_CORE6_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。CORE-16 は GPU 側の f32 常駐対照経路が未実装のため引き続き測定不能で（Issue #234 で追跡）、`BENCH_CORE16` を opt-in するとその理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
 

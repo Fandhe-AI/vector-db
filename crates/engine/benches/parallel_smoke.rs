@@ -1,7 +1,7 @@
 //! マルチスレッド並列検索カーネル（TASK-126）の p95 手動計測スモーク。対象ビヘイビア:
-//! CORE-3・CORE-5・SEARCH-4（数値基準は spec 参照。本ベンチは手動実行専用の計測入口を
-//! 提供するのみで、数値基準の回帰テスト化・CI 定期実行・対照エンジン比較は
-//! TASK-127 の範囲）。
+//! CORE-3・SEARCH-4（数値基準は spec 参照。本ベンチは手動実行専用の計測入口を
+//! 提供するのみで、数値基準の回帰テスト化・CI 定期実行は TASK-127 の範囲）。
+//! CORE-5（対照エンジン比較）は `contrast_bench.rs`（TASK-127・Issue #176）で判定する。
 //!
 //! `cargo bench --bench parallel_smoke -p engine` で手動実行する（`make ci` の対象外。
 //! `Cargo.toml` 側 `harness = false` / `test = false` は `benches/measurement.rs` と

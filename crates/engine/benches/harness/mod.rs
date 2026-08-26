@@ -8,6 +8,12 @@
 //! 判定ヘルパを提供する（TASK-127）。計測そのもの（`protocol`・`ab`）とは責務を分け、
 //! `tests/bench_accept.rs` から実測タイマーに依存せず単体検証できるようにしている。
 //!
+//! [`contrast`]（`contrast-bench` feature 限定）は CORE-5（対照エンジン比較・
+//! Issue #176）の対照エンジンアダプタを提供する。`contrast_bench.rs` からのみ
+//! 呼ばれ、`simd_bench.rs`（CORE-3/CORE-4）・`accept.rs` の他判定関数からは
+//! 独立している（対照エンジン側の障害〔C++ FFI 含む〕が CORE-3/CORE-4 のゲートへ
+//! 波及しない failure domain 分離。`contrast.rs` 冒頭コメント参照）。
+//!
 //! 対象ビヘイビア ID なし（基盤タスク。CORE-3〜6・SEARCH-4・SQL-1 等の測定条件を
 //! 担保する下支え）。
 //!
@@ -40,6 +46,8 @@
 // 個別に import する。
 pub mod ab;
 pub mod accept;
+#[cfg(feature = "contrast-bench")]
+pub mod contrast;
 pub mod env_report;
 pub mod protocol;
 pub mod rng;

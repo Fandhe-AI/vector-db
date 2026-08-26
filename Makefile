@@ -193,7 +193,7 @@ sort-determinism-check: ## RRF 融合等のソート非決定性 API 再混入�
 	scripts/check_sort_determinism.sh
 
 .PHONY: check-cross
-check-cross: ## TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）
+check-cross: ## TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）。`contrast-bench` feature を付けないため usearch（TASK-127 CORE-5・Issue #176。C++ ビルドを伴う）は本コマンドの対象に含まれない
 ifdef HAS_CARGO
 	cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu
 else
@@ -234,6 +234,18 @@ ifdef HAS_CARGO
 	cargo bench --bench simd_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-simd をスキップ"
+endif
+
+# --------------------------------------------------
+# CORE-5 対照エンジン接続の回帰ベンチ（TASK-127・Issue #176。crates/engine/benches/contrast_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-contrast
+bench-contrast: ## TASK-127 CORE-5（対照エンジンに対する p95 レイテンシ比率）の回帰ベンチを実行する（`contrast-bench` feature 限定・C++17 コンパイラが必要。時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
+ifdef HAS_CARGO
+	cargo bench --bench contrast_bench -p engine --features contrast-bench
+else
+	@echo "skip: Cargo.toml 未追加のため bench-contrast をスキップ"
 endif
 
 # --------------------------------------------------

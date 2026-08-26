@@ -1,5 +1,7 @@
 //! 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。ポインタ: `docs/spec/05-tasks.md`
-//! TASK-127・対象ビヘイビア CORE-3, CORE-4, CORE-5, SEARCH-4）。
+//! TASK-127・対象ビヘイビア CORE-3, CORE-4, SEARCH-4）。CORE-5（対照エンジン比較）は
+//! `contrast_bench.rs`（同じく TASK-127・Issue #176）が独立バイナリとして判定する
+//! （failure domain 分離。同ファイル冒頭コメント参照）。
 //!
 //! 実測対象は `ParallelSearchProvider`（TASK-126・スレッド並列）が `kernel::dot` 経由で
 //! 呼び出す TASK-156（CORE-14・Issue #109・PR #202）の実行時検出 SIMD カーネル
@@ -14,10 +16,9 @@
 //! `parallel_smoke.rs`（TASK-126 の手動計測スモーク）と異なり、本ベンチは数値基準との
 //! 突き合わせまで行い、基準未達なら非ゼロ終了する回帰ゲートとして機能する
 //! （`harness/accept.rs` の判定ヘルパを利用）。`.github/workflows/bench.yml`
-//! （週次 schedule + workflow_dispatch による実行。CORE-5 は Issue #176 まで
-//! opt-in のまま。同ファイル冒頭コメント参照）から実行される想定で、`make ci` の対象にはしない
-//! （時間依存の測定値を CI アサーションへ混ぜない既存方針。`parallel_smoke.rs`
-//! と同一）。
+//! （週次 schedule + workflow_dispatch による実行）から実行される想定で、`make ci` の
+//! 対象にはしない（時間依存の測定値を CI アサーションへ混ぜない既存方針。
+//! `parallel_smoke.rs` と同一）。
 //!
 //! - 冒頭で検出 ISA を [`EnvReport`] へ記録する（`sql_c1_bench.rs` と同一パターン）。
 //!   `isa::current().isa()` が [`engine::isa::DetectedIsa::Scalar`] を返す環境
@@ -36,17 +37,10 @@
 //!   側で別途担保済み）にしかならず、SIMD 演算順序（レーン分割・FMA）による丸め差を
 //!   含む「SIMD 経路 vs 真のスカラー逐次和」という CORE-4 本来の判定になっていな
 //!   かった（`harness::scalar_reference` モジュール冒頭コメント参照）。
-//! - CORE-5: 対照エンジンとの中央値比較。対照エンジンクレートの導入がユーザー承認必須
-//!   （`.claude/rules/dependency-policy.md`）のため本 PR では未接続。CORE-5 の判定は
-//!   `BENCH_CORE5=1` が設定された場合のみ opt-in で有効化する（[`core5_requested_from_env`]）。
-//!   既定（未設定）では CORE-3/CORE-4 のみで合否を返し、CORE-5 は「対象外（未接続・
-//!   Issue #176 で追跡中）」であることを標準出力へ明示する（silent skip にしない）。
-//!   `BENCH_CORE5=1` を指定した場合は、未接続＝判定不能を fail-closed として扱う
-//!   （判定関数 [`harness::accept::check_contrast_ratio_within_limit`] のみ先行実装済み。
-//!   実測接続後は同フラグの下で自動的に実測ベースの判定へ切り替わる）。
-//!   opt-in にしたのは、フラグ無指定時まで恒常的に fail させると CORE-3/CORE-4 の
-//!   合否判定ゲートとして機能しなくなるため（codex-review 継続指摘）。
-//!   `Cargo.toml`・PR 本文の「対象外・承認事項」参照）
+//! - CORE-5（対照エンジン接続）は本ファイルでは判定しない。`contrast_bench.rs` が
+//!   `contrast-bench` feature 限定の独立バイナリとして実測・判定する（Issue #176。
+//!   対照エンジン側の C++ FFI ビルド障害を CORE-3/CORE-4 のゲートへ波及させない
+//!   failure domain 分離。同ファイル冒頭コメント参照）。
 //! - 診断 A/B（[`harness::ab::run_ab`]）: `ParallelSearchProvider`（SIMD+並列）と
 //!   単一スレッドの真のスカラー参照（総当たり）を比較する。**この比較は SIMD 単独の
 //!   効果を分離したものではない**（codex-review 指摘対応）。A 側はスレッド並列化・
@@ -189,22 +183,6 @@ fn min_recall_from_env() -> Result<f64, String> {
     Ok(value)
 }
 
-/// `BENCH_CORE5` 環境変数を読み取り、CORE-5（対照エンジン比較）判定を opt-in で
-/// 有効化するかを返す。`"1"` のときのみ有効（未設定・それ以外の値はすべて無効）。
-///
-/// CORE-5 は対照エンジンクレートの導入がユーザー承認必須のため未接続であり
-/// （`.claude/rules/dependency-policy.md`）、フラグ無指定の既定状態では CORE-5 を
-/// 判定対象から明示的に除外する（`main` 側で「対象外」を出力する。silent skip には
-/// しない）。フラグを常時 fail-closed にすると CORE-3/CORE-4 が基準を満たしても
-/// 本ベンチが成功ケースを持たなくなり、合否ゲートとして機能しなくなるため
-/// （codex-review 継続指摘）、既定では対象外・`BENCH_CORE5=1` 指定時のみ
-/// fail-closed という opt-in 方式にする。
-fn core5_requested_from_env() -> bool {
-    std::env::var("BENCH_CORE5")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
-}
-
 fn main() {
     let max_p95 = match max_p95_from_env() {
         Ok(v) => v,
@@ -317,24 +295,8 @@ fn main() {
         "topk_consistency(simd_parallel_vs_scalar_reference): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
     );
 
-    // --- CORE-5: 対照エンジン比較（本 PR では未接続。BENCH_CORE5=1 で opt-in） ---
-    // 対照エンジンクレートの導入がユーザー承認必須のため実測できない
-    // （`.claude/rules/dependency-policy.md`）。`core5_requested_from_env` のドキュメント
-    // 参照。フラグ未指定（既定）では CORE-5 を判定対象から明示的に除外し、その旨を
-    // 標準出力へ書く（silent skip にしない。Issue #176 で追跡中）。フラグ指定時のみ
-    // 「未測定＝判定不能」を fail-closed として受理判定に反映する。
-    let core5_requested = core5_requested_from_env();
-    if core5_requested {
-        let core5_ok = false;
-        passed &= core5_ok;
-        println!(
-            "contrast_ratio: not measured in this run (contrast engine dependency pending user approval; see harness::accept::check_contrast_ratio_within_limit) requested=true pass={core5_ok}"
-        );
-    } else {
-        println!(
-            "contrast_ratio: out of scope for this run (contrast engine dependency pending user approval; not counted toward pass/fail; set BENCH_CORE5=1 to opt in once connected; see harness::accept::check_contrast_ratio_within_limit and issue #35) requested=false"
-        );
-    }
+    // CORE-5（対照エンジン比較）は `contrast_bench.rs` が独立バイナリとして判定する
+    // （モジュール冒頭コメント参照）。
 
     // --- 診断 A/B: ParallelSearchProvider（SIMD+並列） vs 単一スレッド真のスカラー参照 ---
     // 合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。**SIMD 単独効果の
@@ -413,10 +375,7 @@ fn main() {
     }
 
     if !passed {
-        let core5_suffix = if core5_requested { "CORE-5/" } else { "" };
-        eprintln!(
-            "simd_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/{core5_suffix}SEARCH-4)"
-        );
+        eprintln!("simd_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/SEARCH-4)");
         std::process::exit(1);
     }
 }

@@ -16,6 +16,16 @@ path = "src/lib.rs"
 # TASK-140（永続化層）: オーナー承認済み（Issue #16）の唯一の依存。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 redb = "=4.2.0"
+# TASK-127 CORE-5（対照エンジン接続。Issue #176）: クレート・バージョンともに
+# オーナー承認済み（2026-08-26。承認記録は Issue #176 のコメント、および
+# `docs/spec/04-behavior/core-engine.md` CORE-5 の追記）。ライセンスは Apache-2.0
+# （`deny.toml` の allow list 既存）。目的は
+# `contrast_bench.rs` から対照エンジン（総当たり厳密最近傍）として呼び出すことのみで、
+# `src/` 配下（ライブラリ公開面）は本依存に一切依存しない。`optional = true` ＋
+# 下記 `contrast-bench` feature 限定とし、`wire-server` バイナリはリンクしない
+# （`cargo tree -p wire-server` に出現しないことを CI 外の手元確認で担保）。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+usearch = { version = "=2.26.1", optional = true }
 
 # TASK-128〜130（Issue #178）: GPU バッチ経路（`gpu_batch.rs`）用の依存。
 # .claude/rules/dependency-policy.md の承認事項をここに記録する
@@ -37,6 +47,13 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
     "dx12",
     "wgsl",
 ] }
+
+[features]
+# CORE-5 の対照エンジン（usearch の総当たり `exact_search`）を bench 専用に有効化する
+# feature。`test-support` feature 廃止時（本ファイル上部の redb dev-dependency コメント
+# 参照）と異なり、テナント境界・RLS 迂回 API は一切露出しない
+# （bench 専用の依存有効化のみで安全境界に触れない）。
+contrast-bench = ["dep:usearch"]
 
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
@@ -76,12 +93,24 @@ test = false
 # fail-closed で拒否する。harness = false / test = false は上記 2 ベンチと同一方針
 # （時間依存の測定値を make ci のアサーションへ混ぜない）。
 # `make bench-simd`（Makefile）・`.github/workflows/bench.yml`
-# （workflow_dispatch による手動実行。CORE-5 未接続の間は schedule 停止中）から
+# （週次 schedule + workflow_dispatch）から
 # 実行する。判定ロジック自体（時間非依存）は harness/accept.rs にあり
 # tests/bench_accept.rs で make ci 側から回帰検証する。
 name = "simd_bench"
 harness = false
 test = false
+
+[[bench]]
+# TASK-127（CORE-5）の対照エンジン接続入口（Issue #176）。CORE-3/CORE-4
+# （`simd_bench.rs`）とは別バイナリに分離し、対照エンジン（C++ FFI を含む
+# `contrast-bench` feature）側の障害が CORE-3/CORE-4 ゲートを巻き込まないようにする
+# （failure domain 分離。`harness/contrast.rs` 冒頭コメント参照）。
+# `required-features` により `contrast-bench` feature 無指定のビルド（`make check-cross`
+# 等）では本ベンチターゲット自体がスキップされ、usearch の C++ ビルドは走らない。
+name = "contrast_bench"
+harness = false
+test = false
+required-features = ["contrast-bench"]
 
 [[bench]]
 # TASK-130（バッチ高速化の受け入れ基準検証）の回帰ゲート入口。CORE-7（動的窓の

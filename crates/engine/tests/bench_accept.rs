@@ -1,9 +1,10 @@
 //! `benches/harness/accept.rs`（TASK-127 受け入れ判定ヘルパ）の回帰テスト。
 //!
 //! 対象ビヘイビア: CORE-3, CORE-4, CORE-5, SEARCH-4（ポインタ: `docs/spec/05-tasks.md`
-//! TASK-127）。`simd_bench.rs` は時間依存のためこのテストからは実行しない
-//! （`tests/bench_harness.rs` と同様、実測タイマーに依存しない判定ロジックのみを
-//! `#[path]` で取り込み `cargo test`（`make ci` 対象）で検証する）。
+//! TASK-127）。`simd_bench.rs`・`contrast_bench.rs` は時間依存のためこのテストからは
+//! 実行しない（`tests/bench_harness.rs` と同様、実測タイマーに依存しない判定ロジックのみを
+//! `#[path]` で取り込み `cargo test`（`make ci` 対象）で検証する）。CORE-5 は
+//! `contrast_bench.rs` で接続済み（Issue #176）。
 
 // 本テストは `accept`（受け入れ判定ヘルパ）と、そのエラー型 `stats::BenchError` のみを
 // 検証対象とし `ab`/`protocol`/`rng`（harness 自体の契約は `tests/bench_harness.rs` が
@@ -16,7 +17,7 @@ mod harness;
 
 use harness::accept::{
     check_contrast_ratio_within_limit, check_p95_within_limit, check_recall_within_limit,
-    p95_from_samples, recall_at_k, worst_recall,
+    p95_from_samples, p95_ratio, parse_contrast_ratio_limit, recall_at_k, worst_recall,
 };
 use harness::stats::BenchError;
 use std::time::Duration;
@@ -214,5 +215,77 @@ fn check_contrast_ratio_within_limit_rejects_non_positive_max_ratio() {
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 
     let err = check_contrast_ratio_within_limit(1.0, -1.0).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+// p95_ratio（CORE-5・Issue #176）。
+
+#[test]
+fn p95_ratio_computes_ratio_of_p95_values() {
+    let a: Vec<Duration> = (1..=20).map(Duration::from_millis).collect(); // p95=19ms
+    let b: Vec<Duration> = (1..=20).map(|i| Duration::from_millis(i * 2)).collect(); // p95=38ms
+    let ratio = p95_ratio(&a, &b).unwrap();
+    assert!((ratio - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn p95_ratio_rejects_empty_samples() {
+    let a: Vec<Duration> = vec![];
+    let b: Vec<Duration> = vec![Duration::from_millis(1)];
+    let err = p95_ratio(&a, &b).unwrap_err();
+    assert_eq!(err, BenchError::EmptySamples);
+
+    let a: Vec<Duration> = vec![Duration::from_millis(1)];
+    let b: Vec<Duration> = vec![];
+    let err = p95_ratio(&a, &b).unwrap_err();
+    assert_eq!(err, BenchError::EmptySamples);
+}
+
+#[test]
+fn p95_ratio_rejects_zero_baseline() {
+    let a: Vec<Duration> = vec![Duration::from_millis(1)];
+    let b: Vec<Duration> = vec![Duration::ZERO];
+    let err = p95_ratio(&a, &b).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+// parse_contrast_ratio_limit（CORE-5・Issue #176）。
+
+#[test]
+fn parse_contrast_ratio_limit_accepts_positive_finite_value() {
+    assert!((parse_contrast_ratio_limit("1.5").unwrap() - 1.5).abs() < f64::EPSILON);
+    // 前後の空白は trim される（GitHub Actions の repo variable 経由でも安全に扱える）。
+    assert!((parse_contrast_ratio_limit(" 2.0 \n").unwrap() - 2.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn parse_contrast_ratio_limit_rejects_empty_string() {
+    // 未設定の repo variable は GitHub Actions 上で空文字列に解決されるため
+    // （`.github/workflows/bench.yml` 参照）、空文字列を明示的に拒否できることを検証する。
+    let err = parse_contrast_ratio_limit("").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = parse_contrast_ratio_limit("   ").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn parse_contrast_ratio_limit_rejects_non_numeric_string() {
+    let err = parse_contrast_ratio_limit("abc").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn parse_contrast_ratio_limit_rejects_non_positive_or_non_finite_value() {
+    let err = parse_contrast_ratio_limit("0").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = parse_contrast_ratio_limit("-1.0").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = parse_contrast_ratio_limit("NaN").unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = parse_contrast_ratio_limit("inf").unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
