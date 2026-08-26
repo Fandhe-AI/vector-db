@@ -1,14 +1,15 @@
 //! 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。ポインタ: `docs/spec/05-tasks.md`
 //! TASK-127・対象ビヘイビア CORE-3, CORE-4, CORE-5, SEARCH-4）。
 //!
-//! 実測対象は `ParallelSearchProvider`（TASK-126）であり、`kernel::dot` の
-//! スレッド並列化を行う。`kernel::dot` の実体は TASK-156（CORE-14）で
-//! `isa::current().dot` へ委譲され、実行時検出された CPU 命令セット
-//! （AVX2+FMA・AVX-512・NEON。非対応環境ではスカラー逐次和）を使うため、本ベンチは
-//! スレッド並列化と SIMD 化の双方が乗った実測になる（`parallel_search.rs`・
-//! `isa.rs` モジュール冒頭のコメント参照）。x86_64 実機での数値実測（p95 等）と
-//! CORE-14 の Must 化判断は TASK-156 の範囲外であり、本ベンチの回帰基準値自体は
-//! 未接続のまま（ファイル名は導入当時のものを維持）。
+//! 実測対象は `ParallelSearchProvider`（TASK-126・スレッド並列）が `kernel::dot` 経由で
+//! 呼び出す TASK-156（CORE-14・Issue #109・PR #202）の実行時検出 SIMD カーネル
+//! （AVX2+FMA・AVX-512・NEON。`isa::current().dot` へ委譲）であり、スレッド並列化と
+//! SIMD 化の双方が乗った実測になる（`parallel_search.rs`・`isa.rs` モジュール冒頭の
+//! コメント参照）。ファイル名は当初 `simd_bench.rs` だったが、PR #143（TASK-127）
+//! 導入時点では SIMD カーネルが未実装だったため実態に合わせて `parallel_bench.rs` へ
+//! 改名していた。TASK-156 で SIMD カーネルが入ったことを受け、本 Issue（#177）で
+//! `simd_bench.rs` へ戻し、検出 ISA の記録・CORE-4 参照の真のスカラー逐次和への
+//! 差し替えを行う（詳細は各セクション参照）。
 //!
 //! `parallel_smoke.rs`（TASK-126 の手動計測スモーク）と異なり、本ベンチは数値基準との
 //! 突き合わせまで行い、基準未達なら非ゼロ終了する回帰ゲートとして機能する
@@ -18,11 +19,23 @@
 //! （時間依存の測定値を CI アサーションへ混ぜない既存方針。`parallel_smoke.rs`
 //! と同一）。
 //!
-//! - CORE-3・SEARCH-4: p95 レイテンシが上限以下であること（[`max_p95_from_env`]）
-//! - CORE-4: `ParallelSearchProvider`（TASK-126・実測対象）と `CpuScalarProvider`
-//!   （厳密最近傍の参照実装。`kernel.rs` 既存）の Top-k 一致率が下限以上であること
-//!   （[`min_recall_from_env`]。両 provider とも厳密最近傍のため、本質的には
-//!   並列実装の Top-k 一致を確認する回帰チェック。詳細は本文の CORE-4 セクション参照）
+//! - 冒頭で検出 ISA を [`EnvReport`] へ記録する（`sql_c1_bench.rs` と同一パターン）。
+//!   `isa::current().isa()` が [`engine::isa::DetectedIsa::Scalar`] を返す環境
+//!   （SIMD 拡張なし）では SIMD 経路が測定不能＝判定不能として fail-closed で
+//!   非ゼロ終了する（GitHub ホステッド x86_64 runner は AVX2+FMA 以上・aarch64 は
+//!   常に NEON を検出するため実運用で恒常 red にはならない。ISA を上書きする
+//!   環境変数・フラグは意図的に設けない——`isa.rs`「CORE-12 との整合」節参照）。
+//! - CORE-3・SEARCH-4: p95 レイテンシが上限以下であること（[`max_p95_from_env`]）。
+//!   出力行に検出 ISA を併記する。
+//! - CORE-4: `ParallelSearchProvider`（SIMD+並列・実測対象）と
+//!   `harness::scalar_reference::top_k_ids_scalar`（`engine::isa::dot_scalar` による
+//!   真のスカラー逐次和の総当たり参照）の Top-k 一致率が下限以上であること
+//!   （[`min_recall_from_env`]）。旧実装は参照に `CpuScalarProvider` を使っていたが、
+//!   同 provider も TASK-156 以降 `kernel::dot` 経由で SIMD カーネルを使うため
+//!   「SIMD+並列 vs SIMD+逐次」（スレッド分割の整合確認。`tests/parallel_search.rs`
+//!   側で別途担保済み）にしかならず、SIMD 演算順序（レーン分割・FMA）による丸め差を
+//!   含む「SIMD 経路 vs 真のスカラー逐次和」という CORE-4 本来の判定になっていな
+//!   かった（`harness::scalar_reference` モジュール冒頭コメント参照）。
 //! - CORE-5: 対照エンジンとの中央値比較。対照エンジンクレートの導入がユーザー承認必須
 //!   （`.claude/rules/dependency-policy.md`）のため本 PR では未接続。CORE-5 の判定は
 //!   `BENCH_CORE5=1` が設定された場合のみ opt-in で有効化する（[`core5_requested_from_env`]）。
@@ -34,6 +47,9 @@
 //!   opt-in にしたのは、フラグ無指定時まで恒常的に fail させると CORE-3/CORE-4 の
 //!   合否判定ゲートとして機能しなくなるため（codex-review 継続指摘）。
 //!   `Cargo.toml`・PR 本文の「対象外・承認事項」参照）
+//! - 診断 A/B（[`harness::ab::run_ab`]）: `ParallelSearchProvider`（SIMD+並列）と
+//!   単一スレッドの真のスカラー参照（総当たり）を比較し、SIMD 効果を実測ログで
+//!   可視化する。合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。
 //!
 //! 数値基準（p95 上限・Recall 下限）・測定条件は spec（TASK-127）が SSOT。本ファイルには
 //! 数値そのものをハードコードせず、実行時に環境変数（`BENCH_MAX_P95_MS`・
@@ -55,13 +71,17 @@
 #[allow(dead_code)]
 mod harness;
 
+use harness::ab::run_ab;
 use harness::accept::{
     check_p95_within_limit, check_recall_within_limit, p95_from_samples, recall_at_k, worst_recall,
 };
+use harness::env_report::EnvReport;
 use harness::protocol::{run, MeasurementConfig};
 use harness::rng::DeterministicRng;
+use harness::scalar_reference::top_k_ids_scalar;
 
-use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+use engine::isa::DetectedIsa;
+use engine::kernel::{SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use std::time::Duration;
 
@@ -145,17 +165,32 @@ fn main() {
     let max_p95 = match max_p95_from_env() {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("parallel_bench: {msg}");
+            eprintln!("simd_bench: {msg}");
             std::process::exit(1);
         }
     };
     let min_recall = match min_recall_from_env() {
         Ok(v) => v,
         Err(msg) => {
-            eprintln!("parallel_bench: {msg}");
+            eprintln!("simd_bench: {msg}");
             std::process::exit(1);
         }
     };
+
+    // 検出 ISA を記録する（`sql_c1_bench.rs` と同一パターン）。標準出力の env 行から
+    // 「SIMD 経路を実際に測ったか」を後から確認できるようにする。
+    let isa = engine::isa::current().isa();
+    println!("{}", EnvReport::capture(format!("{isa:?}")));
+
+    // Scalar 検出時は SIMD 経路が測定不能＝判定不能として fail-closed（モジュール
+    // 冒頭コメント参照）。ISA を上書きする入口は意図的に設けない
+    // （`isa.rs`「CORE-12 との整合」節と同じ方針）。
+    if isa == DetectedIsa::Scalar {
+        eprintln!(
+            "simd_bench: no SIMD instruction set detected at runtime (isa=Scalar); SIMD path is not measurable on this host"
+        );
+        std::process::exit(1);
+    }
 
     let mut rng = DeterministicRng::new(1);
     let ids: Vec<u64> = (0..ROW_COUNT as u64).collect();
@@ -191,38 +226,27 @@ fn main() {
     // SSOT であり、public リポの Actions ログへ能動的に書き出さない
     // （モジュール冒頭コメント参照）。
     println!(
-        "p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} pass={p95_ok}",
+        "p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} isa={isa:?} median={:?} p95={p95:?} pass={p95_ok}",
         measurement.summary.median,
     );
 
-    // --- CORE-4: ParallelSearchProvider vs CpuScalarProvider の Top-k 一致率 ---
-    // 両 provider はいずれも総当たり（厳密最近傍）実装であり（`parallel_search.rs:79`
-    // のドキュメント参照）、`TopKSelector` の選出規約・同点順序を共有する
-    // （`kernel.rs:146` 参照）。したがって本測定は近似 ANN の Recall 品質ゲートでは
-    // なく、並列実装が参照実装と Top-k 集合で食い違わないことを bench 規模（本ファイル
-    // の ROW_COUNT・DIM）で確認する回帰チェックである（同種の集合一致は
-    // `parallel_search.rs` の単体テストでも小規模に検証済み）。近似 provider が
-    // 導入された時点で本チェックが実質的な Recall 受け入れゲートとして機能する
-    // （spec ポインタ: TASK-127 CORE-4）。
+    // --- CORE-4: ParallelSearchProvider（SIMD+並列） vs 真のスカラー逐次和の Top-k 一致率 ---
+    // 参照実装は `harness::scalar_reference::top_k_ids_scalar`（`engine::isa::dot_scalar`
+    // による総当たり）を使う。旧実装は `CpuScalarProvider` を参照にしていたが、同
+    // provider も TASK-156（CORE-14）以降 `kernel::dot` 経由で SIMD カーネルを使うため
+    // 「SIMD+並列 vs SIMD+逐次」（スレッド分割の整合確認）にしかならなかった
+    // （`tests/parallel_search.rs::multi_thread_path_matches_scalar_reference_at_scale`
+    // 等が別途 `make ci` で担保）。本判定は SIMD レーン分割・FMA による丸め差を含む
+    // 「SIMD 経路 vs 真のスカラー逐次和」の比較であり、近似 ANN provider 導入前でも
+    // SIMD 経路の正しさゲートとして機能する（spec ポインタ: TASK-127 CORE-4）。
     // クエリ間の平均ではなく worst-query（最小値）で判定する
     // （`harness::accept::worst_recall` のドキュメント参照）。
-    let reference = CpuScalarProvider;
     let mut recalls = Vec::with_capacity(RECALL_QUERY_COUNT);
     for _ in 0..RECALL_QUERY_COUNT {
         let query = rng.next_vector(DIM);
 
-        let expected: Vec<u64> = reference
-            .search(SearchInput {
-                ids: &ids,
-                vectors: &vectors,
-                dim: DIM as u32,
-                query: &query,
-                k: TOP_K,
-            })
-            .expect("reference search must succeed for well-formed synthetic input")
-            .into_iter()
-            .map(|hit| hit.id)
-            .collect();
+        let expected = top_k_ids_scalar(&ids, &vectors, DIM, &query, TOP_K)
+            .expect("well-formed synthetic input yields a scalar reference top-k");
         let actual: Vec<u64> = provider
             .search(SearchInput {
                 ids: &ids,
@@ -246,7 +270,7 @@ fn main() {
     // limit（BENCH_MIN_RECALL の実測値）は意図的にログへ出力しない（p95_latency と
     // 同一方針。モジュール冒頭コメント参照）。
     println!(
-        "topk_consistency(parallel_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
+        "topk_consistency(simd_parallel_vs_scalar_reference): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
     );
 
     // --- CORE-5: 対照エンジン比較（本 PR では未接続。BENCH_CORE5=1 で opt-in） ---
@@ -268,10 +292,50 @@ fn main() {
         );
     }
 
+    // --- 診断 A/B: ParallelSearchProvider（SIMD+並列） vs 単一スレッド真のスカラー参照 ---
+    // 合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。SIMD 効果を実測ログで
+    // 可視化する目的のみ。
+    let ab_query = rng.next_vector(DIM);
+    match run_ab(
+        &config,
+        || -> Vec<u64> {
+            provider
+                .search(SearchInput {
+                    ids: &ids,
+                    vectors: &vectors,
+                    dim: DIM as u32,
+                    query: &ab_query,
+                    k: TOP_K,
+                })
+                .expect("candidate search must succeed for well-formed synthetic input")
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect()
+        },
+        || -> Vec<u64> {
+            top_k_ids_scalar(&ids, &vectors, DIM, &ab_query, TOP_K)
+                .expect("well-formed synthetic input yields a scalar reference top-k")
+        },
+    ) {
+        Ok(ab) => {
+            println!(
+                "diagnostic_ab(simd_parallel_vs_scalar_reference): a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail)",
+                ab.a.summary.median, ab.b.summary.median, ab.median_ratio
+            );
+        }
+        Err(e) => {
+            // A/B は診断情報であり合否に含めないため、算出不能（分母 0 等）でも
+            // 本体の pass/fail には影響させない。ただし silent にはせず記録する。
+            println!(
+                "diagnostic_ab(simd_parallel_vs_scalar_reference): unavailable ({e}) (not counted toward pass/fail)"
+            );
+        }
+    }
+
     if !passed {
         let core5_suffix = if core5_requested { "CORE-5/" } else { "" };
         eprintln!(
-            "parallel_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/{core5_suffix}SEARCH-4)"
+            "simd_bench: acceptance criteria not met (TASK-127 CORE-3/CORE-4/{core5_suffix}SEARCH-4)"
         );
         std::process::exit(1);
     }

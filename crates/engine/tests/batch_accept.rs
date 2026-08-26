@@ -170,7 +170,7 @@ fn check_improvement_at_least_rejects_non_finite_or_non_positive_min_pct() {
 // ---------------------------------------------------------------------
 // CORE-16: f16 パック常駐経路（BatchEngine）vs f32 厳密経路（CpuScalarProvider）の
 // Recall@k 非劣化。決定的シードで生成した単一テナントのコーパスに対し、両経路の
-// Top-k を比較する（`parallel_bench.rs` の CORE-4 検証と同型のアプローチ）。
+// Top-k を比較する（`simd_bench.rs` の CORE-4 検証と同型のアプローチ）。
 // ---------------------------------------------------------------------
 
 const RECALL_ROW_COUNT: usize = 500;
