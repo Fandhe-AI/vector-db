@@ -13,9 +13,10 @@ name: Bench
 # （対照エンジンとの中央値比較）は対照エンジンクレートの導入承認待ちで未接続のため
 # 引き続き Issue #176 で追跡し、`BENCH_CORE5` repo variable が未設定（既定）の間は
 # 「対象外」として合否判定から明示的に除外する opt-in 方式を維持する（`simd_bench.rs`
-# 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）も
-# 実 GPU バックエンド未接続のため Issue #178 で追跡し、同様に opt-in のまま維持する
-# （`batch_bench.rs` 冒頭コメント参照）。
+# 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は
+# Issue #178 で実 GPU バックエンド（`engine::gpu_batch`）へ接続済みだが、GitHub
+# ホステッド runner に GPU がない・閾値が spec SSOT であることから opt-in のまま
+# 維持する（`batch_bench.rs` 冒頭コメント参照）。
 #
 # bench-c1（TASK-83・Conditional Go 条件7）は workflow_dispatch 限定とし、上記
 # schedule には含めない。GitHub ホステッド runner は共有 2 vCPU の非専有環境であり、
@@ -96,13 +97,21 @@ jobs:
         # ハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する。
         # BENCH_BATCH_MAX_DEGRADATION_PCT が未設定の場合は `batch_bench.rs` 側が
         # fail-closed で非ゼロ終了する。BENCH_CORE6/BENCH_CORE16 は repo variable が
-        # 未設定（既定）なら対象外として扱う opt-in フラグで、実 GPU 接続後（Issue
-        # #178）にリポジトリ管理者が `gh variable set BENCH_CORE6 1` 等で有効化する
-        # 想定（`batch_bench.rs` 冒頭コメント参照）。
+        # 未設定（既定）なら対象外として扱う opt-in フラグで、リポジトリ管理者が
+        # `gh variable set BENCH_CORE6 1` 等で有効化する想定（Issue #178 で実 GPU
+        # バックエンドへ接続済み。`batch_bench.rs` 冒頭コメント参照）。opt-in 時は
+        # CORE-6 は短縮率の下限（BENCH_CORE6_MIN_IMPROVEMENT_PCT。値は spec が
+        # SSOT）も必要で、未設定なら判定不能として fail-closed に非ゼロ終了する。
+        # なお GitHub ホステッド runner には GPU がないため、BENCH_CORE6 を有効化
+        # すると CORE-6 は「測定不能（pass=false）」になる（GPU 搭載 self-hosted
+        # runner 前提のフラグ。CPU 同士の比較値を GPU 実測の代替として計上しない）。
+        # CORE-16（GPU 常駐 f16 パック vs f32 常駐）は GPU 側の f32 常駐対照経路が
+        # 未実装のため、opt-in しても「測定不能（pass=false）」を報告する。
         env:
           BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ vars.BENCH_BATCH_MAX_DEGRADATION_PCT }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
           BENCH_CORE16: ${{ vars.BENCH_CORE16 }}
+          BENCH_CORE6_MIN_IMPROVEMENT_PCT: ${{ vars.BENCH_CORE6_MIN_IMPROVEMENT_PCT }}
         run: make bench-batch
 
   # --------------------------------------------------

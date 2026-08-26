@@ -402,7 +402,11 @@ pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
 /// なく `try_reserve_exact`（要求量ちょうど）を使うのは、呼び出し元が
 /// アロケーション前に検証済みの論理必要量どおりに実確保量を抑えるため
 /// （`arena.rs::try_reserve_exact` と同じ理由）。
-fn try_reserve_exact<T>(
+///
+/// `pub(crate)`: `gpu_batch.rs` の選出後解決ループも同じフォールブル確保方針を
+/// 共有する（Issue #178。GPU 経路だけ abort-on-OOM な `Vec::with_capacity` に
+/// 分岐しないよう単一の真実源にする）。
+pub(crate) fn try_reserve_exact<T>(
     buf: &mut Vec<T>,
     additional: usize,
     what: &str,
@@ -415,7 +419,9 @@ fn try_reserve_exact<T>(
 /// `tenant_ids` の複製に使うのと同じ理由: `String::from`/`.into()`（`SearchHit::
 /// new` が内部で使う）は失敗時に abort するため、選出後の解決ループのように
 /// バッチ全体で最大 [`MAX_BATCH_TOTAL_K`] 回呼ばれうる経路では使わない）。
-fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
+/// `pub(crate)`: `gpu_batch.rs` の選出後解決ループも `SearchHit::tenant_id` の
+/// 複製に本ヘルパーを使う（Issue #178）。
+pub(crate) fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
     let mut owned = String::new();
     owned.try_reserve_exact(s.len()).map_err(|e| {
         BatchSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
@@ -427,7 +433,16 @@ fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
 /// 1 テナント分の積和演算数（`rows × queries × dim`）を checked 演算で計算する。
 /// 積のオーバーフローは [`MAX_BATCH_WORK`] 超過とみなす（[`compute_batch_work`]
 /// 専用のヘルパー。境界値を直接検証できるよう独立関数へ切り出す）。
-fn compute_tenant_work(rows: usize, queries: usize, dim: usize) -> Result<usize, BatchSearchError> {
+///
+/// `pub(crate)`: `gpu_batch.rs` の GPU 経路も dispatch 前の総量ガードに同じ
+/// 計算式を再利用する（CPU 経路と GPU 経路で計算量 DoS ガードの基準式が
+/// 分岐しないよう、この関数を単一の真実源とする。Issue #178 レビュー
+/// 指摘対応）。
+pub(crate) fn compute_tenant_work(
+    rows: usize,
+    queries: usize,
+    dim: usize,
+) -> Result<usize, BatchSearchError> {
     rows.checked_mul(queries)
         .and_then(|v| v.checked_mul(dim))
         .ok_or(BatchSearchError::WorkBudgetExceeded {
@@ -508,6 +523,24 @@ impl ResidentMatrix {
     /// `visibilities[i]` は `tenant_ids[i]` と対応する行 `i` の可視性ラベルで、
     /// `BatchEngine::batch_search` が `PolicyContext::is_visible` の単一
     /// 照合パスへ渡す（codex P0 指摘対応）。
+    ///
+    /// # 事前条件: 行の並び順（結果の同点タイブレークに直結する）
+    ///
+    /// 本メソッドは渡された行を**並べ替えず**、順序の検証も行わない。行 `i` は
+    /// そのままスロット `i` になる。[`BatchHit`] の同点タイブレークは選出段の
+    /// 候補識別子（＝スロット番号）昇順であるため、結果順序は呼び出し元が渡す
+    /// 行の並びで決まる。
+    ///
+    /// 公開ドキュメント（README「検索結果順序」・`docs/design/
+    /// rrf-tie-break-determinism.md`）が述べる `(tenant_id, id)` 昇順
+    /// （単一テナント内では id 昇順）を満たすには、呼び出し元が
+    /// `(tenant_id, id)` キーの昇順で行を渡す必要がある。これは `Storage` の
+    /// 行キー順（`(tenant_id, id)`。TABLE-12）でスキャンした結果をそのまま
+    /// 渡せば自然に満たされる事前条件であり、本メソッドで再ソートすると
+    /// 一括インデクシング経路のコストが増えるため呼び出し元の責務としている
+    /// （codex-review P1 指摘対応で明文化）。事前条件を満たさない並びを渡した
+    /// 場合も結果は決定的（スロット昇順）だが、`(tenant_id, id)` 昇順には
+    /// ならない。
     ///
     /// # 信頼境界（P0 レビュー対応で明文化）
     ///
@@ -705,6 +738,15 @@ impl ResidentMatrix {
 
     pub fn dim(&self) -> usize {
         self.dim
+    }
+
+    /// パック済み行列（行優先・`row_count() * dim().div_ceil(2)` 要素）への
+    /// 読み取り専用参照。`gpu_batch.rs::GpuBatchBackend` が GPU の STORAGE
+    /// バッファへアップロードする実データとして使う（TASK-128〜130・Issue #178
+    /// ポインタ）。CPU 参照実装（[`Self::row_f32_into`]）と表現を共有するだけで、
+    /// 本メソッド自体はデコードを行わない。
+    pub(crate) fn packed(&self) -> &[u32] {
+        &self.packed
     }
 
     /// 行 `idx` を f16 往復で復元し、呼び出し元が用意したバッファへ書き込む

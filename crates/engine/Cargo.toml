@@ -17,6 +17,27 @@ path = "src/lib.rs"
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 redb = "=4.2.0"
 
+# TASK-128〜130（Issue #178）: GPU バッチ経路（`gpu_batch.rs`）用の依存。
+# .claude/rules/dependency-policy.md の承認事項をここに記録する
+# （**オーナー承認済み: 2026-08-26。Issue #178 のコメントに承認記録あり**）。
+#   - クレート: wgpu = "=30.0.1"（default-features = false）
+#   - 目的: Vulkan/Metal/DX12 を単一 API で扱うクロスプラットフォーム GPU
+#     compute。各 GPU API を自作 FFI で叩くと依存最小方針に反して肥大化する
+#   - ライセンス: MIT OR Apache-2.0（本リポと同一）
+#   - メンテ状況: gfx-rs/wgpu。2026-08-26 時点で crates.io 最新版
+#   - 推移的依存: `Cargo.lock` diff で新規 100 パッケージ（`cargo tree -p
+#     engine` で実測。`parking_lot`/`parking_lot_core` を含む——wgpu-core が
+#     間接的に要求するため features 指定では除外できない）
+#   - feature はゲート化しない（CORE-12: 経路上書き機構を作らない方針。
+#     GPU の可否は実行時の初期化結果のみで決まる）
+wgpu = { version = "=30.0.1", default-features = false, features = [
+    "std",
+    "vulkan",
+    "metal",
+    "dx12",
+    "wgsl",
+] }
+
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
 # dev-dependency で `EngineCore::storage`/`from_storage`（テナント境界の単一照合パス

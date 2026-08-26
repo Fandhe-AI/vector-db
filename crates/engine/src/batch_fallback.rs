@@ -190,10 +190,12 @@ pub trait BatchBackend: Send + Sync {
 }
 
 /// 既存 `BatchEngine`（f16 パック常駐行列を走査する GPU 経路の CPU 参照実装。
-/// TASK-128 ポインタ）を primary バックエンドとして適合させるラッパー。実 GPU
-/// （`wgpu` 等）への接続は依存追加のユーザー承認が前提のため未実装であり
-/// （dependency-policy.md）、本実装からランタイムエラー（[`BatchExecError::Backend`]）
-/// が自発的に発生することはない。実 GPU 接続時はこの型を差し替える想定。
+/// TASK-128 ポインタ）を primary バックエンドとして適合させるラッパー。本実装
+/// からランタイムエラー（[`BatchExecError::Backend`]）が自発的に発生することは
+/// ない（CPU 上で決定的に計算するため）。実 GPU への接続は
+/// `gpu_batch.rs::GpuBatchBackend`（TASK-128〜130・Issue #178 ポインタ。
+/// `Self::build_with_gpu` 経由）が担い、テスト・ベンチの配線疎通用に本型は
+/// 残す（`Self::build_with_gpu_reference`）。
 pub struct GpuReferenceBackend {
     engine: BatchEngine,
 }
@@ -535,6 +537,34 @@ impl FallbackBatchEngine {
             dim,
             vectors,
             |matrix| Ok(Box::new(GpuReferenceBackend::new(matrix)) as Box<dyn BatchBackend>),
+            observer,
+        )
+    }
+
+    /// 実 GPU（`gpu_batch.rs::GpuBatchBackend`。`wgpu`。TASK-128〜130・Issue #178
+    /// ポインタ）を primary として使うコンストラクタ。GPU デバイスの初期化に
+    /// 失敗した場合（GPU 非搭載・ドライバ不整合等）は panic せず縮退イベントを
+    /// 1 件通知して CPU 専用モードで構築が成立する（[`Self::build`] の契約と
+    /// 同じ。CORE-8: 初期化失敗からの縮退）。`wgpu` 依存はオーナー承認済み
+    /// （2026-08-26。`crates/engine/Cargo.toml` コメント参照）。
+    pub fn build_with_gpu(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[Visibility],
+        dim: usize,
+        vectors: &[f32],
+        observer: Box<dyn FallbackObserver>,
+    ) -> Result<Self, BatchSearchError> {
+        Self::build(
+            ids,
+            tenant_ids,
+            visibilities,
+            dim,
+            vectors,
+            |matrix| {
+                crate::gpu_batch::GpuBatchBackend::try_new(matrix)
+                    .map(|backend| Box::new(backend) as Box<dyn BatchBackend>)
+            },
             observer,
         )
     }
