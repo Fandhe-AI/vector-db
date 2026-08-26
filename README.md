@@ -83,7 +83,7 @@ gh variable set BENCH_MAX_CONTRAST_RATIO
 
 未設定のまま実行すると `crates/engine/benches/parallel_bench.rs`／`batch_bench.rs`／`contrast_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-CORE-5（対照エンジンとの p95 レイテンシ比較）は usearch（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176）。`contrast_bench.rs` が CORE-3/CORE-4（`parallel_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。ローカルで `make bench-contrast` を実行するには C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み）。
+CORE-5（対照エンジンとの p95 レイテンシ比較）は usearch（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176）。`contrast_bench.rs` が CORE-3/CORE-4（`parallel_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。`contrast-bench` feature は `make lint`／`make test`（lefthook pre-push 含む）が `--all-features` で実行するため、`make bench-contrast` に限らずこれらのローカル実行・CI でも usearch の C++ ビルドが走ります。C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに C++17 コンパイラがない環境では `make lint`／`make test`／`make ci` が失敗します）。
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡中で、`BENCH_CORE6`／`BENCH_CORE16` repo variable による opt-in 方式のまま維持します（未設定＝既定で対象外）。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。
 
