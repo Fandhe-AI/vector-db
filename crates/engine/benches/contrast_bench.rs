@@ -25,12 +25,15 @@
 //! （`.claude/rules/spec-confidentiality.md`）。
 //!
 //! 健全性チェックとして同一クエリの Top-k 一致率（`recall_at_k`）を対照側と算出し
-//! 標準出力へ併記する。ガードは `(0.0, 1.0]` の範囲チェックのみであり、配線が完全に
-//! 壊れている（一致率 0 になる）ケースの検出が主眼である。metric 取り違え・key 対応ずれの
-//! ように一致率が 0 より大きい値のまま歪むケースまでは検出できない（検出力は限定的）。
-//! この値は合否判定には含めないが、範囲外・空結果は fail-closed とする
-//! （測定が成立していないことの検出。`harness::accept::recall_at_k`・`worst_recall` を
-//! 再利用する）。
+//! 標準出力へ併記し、[`MIN_TOPK_OVERLAP`] 未満なら CORE-5 の合否判定自体を fail-closed で
+//! 拒否する（codex-review 指摘・PR #224 対応。被検・対照エンジンはいずれも同一データ・
+//! 同一メトリック（内積）に対する厳密最近傍探索であり（`ContrastIndex::search`・
+//! `ParallelSearchProvider` のドキュメンテーションコメント参照）、連続分布の合成ベクトル
+//! では Top-k 境界での完全な同点はほぼ発生しないため、ほぼ全件一致するのが正しい配線の
+//! 契約である。metric 取り違え・key 対応ずれのように一致率が 0 より大きい値のまま歪む
+//! ケースも本チェックで検出できるようにし、単なる配線断線（一致率 0）検出に留めない。
+//! 浮動小数点の加算順序差（被検側 `kernel.rs::dot` と対照側 usearch C++ 実装）による
+//! 境界付近のごく少数の順序入れ替わりのみは許容するため、しきい値は 1.0 未満に設定する。
 
 #[allow(dead_code)]
 mod harness;
@@ -48,6 +51,13 @@ use engine::parallel_search::ParallelSearchProvider;
 const ROW_COUNT: usize = 100_000;
 const DIM: usize = 768;
 const TOP_K: usize = 20;
+
+/// Top-k 一致率（[`harness::accept::recall_at_k`]）の合否判定用下限。被検・対照とも
+/// 同一データ・同一メトリックの厳密最近傍探索であるため、正しい配線では 1.0 に極めて
+/// 近い値になる契約（モジュールドキュメント参照）。1.0 ちょうどを要求しないのは、被検・
+/// 対照エンジン間の浮動小数点加算順序差による境界付近のごく少数の順序入れ替わりを
+/// 誤検知しないため。
+const MIN_TOPK_OVERLAP: f64 = 0.95;
 
 fn max_contrast_ratio_from_env() -> Result<f64, String> {
     let raw = std::env::var("BENCH_MAX_CONTRAST_RATIO").unwrap_or_default();
@@ -127,9 +137,10 @@ fn main() {
         }
     };
 
-    // 健全性チェック: 対照エンジンとの Top-k 一致率（合否判定には含めない）。
-    // 検出できるのは配線が完全に壊れている場合（一致率 0）に限られ、metric 取り違え・
-    // key 対応ずれのように一致率が 0 より大きい値のまま歪むケースは検出できない。
+    // 健全性チェック: 対照エンジンとの Top-k 一致率。[`MIN_TOPK_OVERLAP`] 未満は
+    // 単なる配線断線（一致率 0）だけでなく metric 取り違え・key 対応ずれのような
+    // 歪みも検出対象に含め、CORE-5 の最終合否（`overall_ok`）へ反映する
+    // （codex-review 指摘・PR #224 対応）。
     let candidate_topk: Vec<u64> = candidate
         .search(SearchInput {
             ids: &ids,
@@ -162,6 +173,9 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // `(0.0, 1.0]` の範囲チェック（上）は測定不成立の検出、`MIN_TOPK_OVERLAP` との比較（下）は
+    // 厳密最近傍同士の一致率そのものの合否判定であり、役割が異なるため両方を維持する。
+    let topk_overlap_ok = topk_overlap >= MIN_TOPK_OVERLAP;
 
     // `run_ab` が既に成功しているため `measurement.a/b.samples` は非空
     // （`stats::summarize` が空サンプルを `Err` で早期リターンする契約。
@@ -170,12 +184,16 @@ fn main() {
         .expect("non-empty samples must yield a p95");
     let contrast_p95 = harness::accept::p95_from_samples(&measurement.b.samples)
         .expect("non-empty samples must yield a p95");
+    // CORE-5 の最終合否は p95 比率（`ratio_ok`）と Top-k 一致率（`topk_overlap_ok`）の
+    // 両方を満たすことを要求する（codex-review 指摘・PR #224 対応。片方のみでは metric
+    // 取り違え・key 対応ずれのように処理が速いだけの無効な計測を合格させてしまう）。
+    let overall_ok = ratio_ok && topk_overlap_ok;
     println!(
-        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} candidate_p95={candidate_p95:?} contrast_p95={contrast_p95:?} p95_ratio={ratio:.6} median_ratio={:.6} topk_overlap_min={topk_overlap:.6} pass={ratio_ok}",
+        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} candidate_p95={candidate_p95:?} contrast_p95={contrast_p95:?} p95_ratio={ratio:.6} median_ratio={:.6} topk_overlap_min={topk_overlap:.6} ratio_ok={ratio_ok} topk_overlap_ok={topk_overlap_ok} pass={overall_ok}",
         measurement.median_ratio,
     );
 
-    if !ratio_ok {
+    if !overall_ok {
         eprintln!("contrast_bench: acceptance criteria not met (TASK-127 CORE-5)");
         std::process::exit(1);
     }
