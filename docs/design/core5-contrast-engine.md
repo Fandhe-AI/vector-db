@@ -111,8 +111,12 @@ bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてあ�
 - 閾値注入: `BENCH_MAX_CONTRAST_RATIO` 環境変数（有限・正の浮動小数点）。未設定・
   不正値は fail-closed（`harness::accept::parse_contrast_ratio_limit`）
 - 健全性チェック: 同一クエリでの Top-k 一致率（`recall_at_k`）を対照側と算出し標準
-  出力へ併記する（配線ミス〔metric 取り違え・key 対応ずれ〕検出用）。合否判定には
-  含めないが `(0.0, 1.0]` の範囲外は fail-closed とする
+  出力へ併記する（配線ミス〔metric 取り違え・key 対応ずれ〕検出用）。**この一致率は
+  合否判定に含める**——`contrast_bench.rs` の `MIN_TOPK_OVERLAP` 未満なら比率判定の
+  結果によらず不合格とし（`overall_ok = ratio_ok && topk_overlap_ok`）、
+  `(0.0, 1.0]` の範囲外も測定不成立として fail-closed とする。比率だけを見ると、
+  metric 取り違え等で「速いが誤った結果を返している」計測を合格させてしまうため
+  （下限値は本リポジトリ側で定めた実装定数で、spec 由来の数値基準ではない）
 
 ### スレッド条件の非対称性（既知の限界）
 
