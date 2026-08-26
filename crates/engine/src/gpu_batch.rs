@@ -525,15 +525,19 @@ fn try_reserve_f32(buf: &mut Vec<f32>, additional: usize) -> Result<(), BatchBac
 /// バッファサイズを 4 の倍数で確保しているため通常到達しないが、fail-closed
 /// に空扱いで打ち切る）。
 fn f32_vec_from_ne_bytes(bytes: &[u8]) -> Result<Vec<f32>, BatchBackendError> {
+    // `as_chunks::<4>()` は「ちょうど 4 バイトの配列列」と「端数」に分ける
+    // （`chunks_exact` + `try_into` と違い添字・変換失敗の分岐が生じない）。
+    let (quads, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        // 呼び出し元はバッファサイズを 4 の倍数で確保しているため通常到達しない。
+        // 端数がある＝readback が破損しているとみなし、部分結果を返さず空で打ち切る
+        // （呼び出し元の件数一致チェックが `TransferFailed` として拒否する）。
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
-    try_reserve_f32(&mut out, bytes.len() / 4)?;
-    let mut chunks = bytes.chunks_exact(4);
-    for chunk in &mut chunks {
-        let arr: [u8; 4] = match chunk.try_into() {
-            Ok(a) => a,
-            Err(_) => return Ok(Vec::new()),
-        };
-        out.push(f32::from_ne_bytes(arr));
+    try_reserve_f32(&mut out, quads.len())?;
+    for quad in quads {
+        out.push(f32::from_ne_bytes(*quad));
     }
     Ok(out)
 }
@@ -1025,9 +1029,10 @@ mod tests {
         let bytes = bytes_of_u32_slice(&values).expect("small staging buffer must allocate");
         assert_eq!(bytes.len(), 16);
         let mut restored = Vec::new();
-        for chunk in bytes.chunks_exact(4) {
-            let arr: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-            restored.push(u32::from_ne_bytes(arr));
+        let (quads, remainder) = bytes.as_chunks::<4>();
+        assert!(remainder.is_empty(), "u32 encoding must be a multiple of 4");
+        for quad in quads {
+            restored.push(u32::from_ne_bytes(*quad));
         }
         assert_eq!(restored, values);
     }
