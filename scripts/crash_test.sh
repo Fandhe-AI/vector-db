@@ -149,7 +149,14 @@ for i in $(seq 1 "${ITERATIONS}"); do
   sleep "0.$(printf '%03d' "${wait_ms}")"
 
   if ! kill -9 "${writer_pid}" 2>/dev/null; then
-    echo "ERROR: kill -9 failed for writer pid ${writer_pid} at iteration ${i} (writer may have already exited on its own, e.g. a put error or safety limit); this iteration cannot verify SIGKILL crash resilience" >&2
+    # kill が失敗する＝対象 PID が既に存在しない（ESRCH）。writer は自発終了し
+    # bash に reap 済みで、その PID は OS に再利用され得る。ここで writer_pid を
+    # 保持したまま exit 1 すると EXIT trap（cleanup → stop_writer）が同じ PID へ
+    # 再度 kill -9 を送り、無関係なプロセスを巻き込む。未 reap の子だけを指す
+    # という writer_pid の不変条件を保つため、退避してから即クリアする。
+    reaped_writer_pid="${writer_pid}"
+    writer_pid=""
+    echo "ERROR: kill -9 failed for writer pid ${reaped_writer_pid} at iteration ${i} (writer may have already exited on its own, e.g. a put error or safety limit); this iteration cannot verify SIGKILL crash resilience" >&2
     cat "${WRITE_LOG}" >&2
     exit 1
   fi
