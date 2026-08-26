@@ -107,6 +107,39 @@ fn markdown_heading_boundaries() {
 }
 
 #[test]
+fn markdown_fence_close_requires_commonmark_conditions() {
+    // 閉じフェンスは「開始と同じ文字種・開始以上の長さ・後続が空白のみ」を
+    // 満たす行に限る（Review 指摘）。満たさない行で閉じたと誤認すると、
+    // コードブロック内の `#` 行が見出し境界になりチャンクが誤分割される。
+    let config = ChunkingConfig::default();
+
+    // 短い ``` は ```` で開いたフェンスを閉じない。
+    let chunks = chunk_markdown("# a\n````\n```\n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 1);
+
+    // info string 付きの行は閉じフェンスにならない。
+    let chunks = chunk_markdown("# a\n```\n```text\n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 1);
+
+    // 逆に条件を満たす行（開始以上の長さ・後続空白のみ）は閉じる。
+    let chunks = chunk_markdown("# a\n```\n````  \n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 2);
+}
+
+#[test]
+fn markdown_fence_open_rejects_backtick_info_string() {
+    // backtick 開始フェンスの info string にバッククォートは置けないため、
+    // 該当行は fence 開始にならず後続の見出しは通常どおり境界になる。
+    let config = ChunkingConfig::default();
+    let chunks = chunk_markdown("# a\n```a`b\n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 2);
+
+    // tilde 開始フェンスにはこの制約がない。
+    let chunks = chunk_markdown("# a\n~~~a`b\n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 1);
+}
+
+#[test]
 fn markdown_indented_fence_is_not_a_fence() {
     // 4 スペース以上インデントされた ``` 行はインデントコードブロックの内容で
     // あり fence 開始ではない（is_atx_heading と同じ CommonMark のインデント

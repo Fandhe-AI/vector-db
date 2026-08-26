@@ -13,19 +13,14 @@
 //! バイト列のデコードを行わない）。パスはファイル種別判定のみに使い、
 //! ファイルシステムへはアクセスしない。
 //!
-//! 分割方針は spec（private）が定める詳細の正であり、ここでは README 公開範囲の
-//! 1 行要約に留める: Markdown は見出し単位、非 Markdown は固定行数単位（既定
-//! 60 行）。移植元は `docs/spec/03-poc/eval-base/scripts/build_chunks.py`
-//! （PoC-0）だが、文面は転記せず本モジュール独自の実装として以下の点を変更した。
+//! 分割方針の詳細は spec（private）が正であり、本コメントには転記しない
+//! （TASK-119・INDEX-3 のポインタのみ）。公開 API の契約として説明が必要な
+//! 実装上の性質は以下に限る。
 //!
 //! - 行分割は `str::lines()` を使い CRLF (`\r\n`) を LF 相当として正規化する
-//!   （PoC は `\n` 固定分割だったため CRLF 入力で `\r` が本文に残っていた点の改善）
 //! - fenced code block（```` ``` ```` / `~~~` の対）の内側にある `#` 始まりの行は
-//!   見出しと見なさない（Markdown 仕様上見出しではなく、コードを多く含む
-//!   コーパスでの誤分割を防ぐための安全側の改善）
-//! - 20 文字未満のチャンクを間引くフィルタは採用しない（評価データ生成用の
-//!   間引きであり、DB では内容を無音で失う結果になるため）
-//! - 言語判定（`lang` 相当の分類）は対象外（INDEX-3 のスコープ外）
+//!   Markdown 仕様上見出しではないため、節の境界にしない
+//! - 短いチャンクを間引くフィルタは持たない（DB では内容を無音で失うため）
 //!
 //! untrusted 入力に対する有界化（fail-closed。.claude/rules/coding-rust.md）:
 //! 走査に入る前に入力全体のバイト長・行数を検証し、上限超過時は副作用なく
@@ -47,7 +42,7 @@ pub const DEFAULT_LINES_PER_CHUNK: usize = 60;
 
 /// Markdown の 1 節あたりの既定上限文字数（`chars().count()` で計測）。
 ///
-/// PoC-0 の実績値を移植した既定値。`None` を渡すと上限なし（節を分割しない）。
+/// `ChunkingConfig` に `None` を渡すと上限なし（節を分割しない）。
 pub const DEFAULT_MAX_MARKDOWN_SECTION_CHARS: Option<usize> = Some(600);
 
 /// ファイルパスから判定したファイル種別。
@@ -183,7 +178,7 @@ fn validate_input(text: &str, config: &ChunkingConfig) -> Result<(), ChunkingErr
     Ok(())
 }
 
-/// 行頭の半角スペース数を数える（`is_atx_heading` と `fence_delimiter_kind` が
+/// 行頭の半角スペース数を数える（`is_atx_heading` と `fence_marker` が
 /// 共有するインデント判定の単一実装）。
 ///
 /// CommonMark ではインデント 4 個以上の行はインデントコードブロックの内容と
@@ -196,7 +191,7 @@ fn leading_indent_spaces(line: &str) -> usize {
 }
 
 /// ATX 見出し行かどうかを判定する（`#` 1〜3 個＋空白で始まる行。4 段以上は
-/// 境界にしない。PoC 同等の判定範囲）。
+/// 節の境界にしない）。
 ///
 /// 行頭の空白は [`leading_indent_spaces`] の基準（0〜3 個まで）に従う。
 fn is_atx_heading(line: &str) -> bool {
@@ -218,29 +213,74 @@ fn is_atx_heading(line: &str) -> bool {
     )
 }
 
-/// fenced code block のデリミタ文字種（```` ``` ```` か `~~~` か）を判定する。
-/// デリミタ行でなければ `None`。
+/// fenced code block のデリミタ行（```` ``` ```` / `~~~` の 3 個以上の連続）の
+/// 情報。デリミタ行でなければ [`fence_marker`] が `None` を返す。
 ///
-/// CommonMark 仕様上、閉じフェンスは開始フェンスと同じ文字種でなければ
-/// ならない（異なる文字種の行はフェンス内部の通常テキストとして扱う）。
-/// `chunk_markdown` がこの戻り値を使ってフェンスの開始・終了を対応付ける。
+/// CommonMark の開閉条件を判定するために必要な最小限の情報のみを保持する。
+/// `chunk_markdown` が開始フェンスの `kind`・`len` を状態として持ち、後続行の
+/// マーカーと突き合わせて閉じフェンスの成立を判定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FenceMarker {
+    /// デリミタ文字種（`` ` `` か `~`）。
+    kind: char,
+    /// デリミタ文字の連続数（3 以上）。
+    len: usize,
+    /// デリミタの後ろ（info string 相当）が空白のみか。
+    info_is_blank: bool,
+    /// デリミタの後ろにバッククォートを含むか（backtick 開始フェンスの可否判定用）。
+    info_has_backtick: bool,
+}
+
+/// 行が fenced code block のデリミタ行かを判定し、開閉判定に必要な情報を返す。
 ///
 /// 行頭インデントは [`leading_indent_spaces`] の基準（0〜3 個まで）に従い、
 /// 4 個以上インデントされた行は fence と見なさない（`is_atx_heading` と同じ
 /// 基準。非対称だとインデントコードブロック内の ``` 行で fence が開きっぱなしに
 /// なり、以降の見出し境界がすべて失われる）。
-fn fence_delimiter_kind(line: &str) -> Option<char> {
-    let leading_spaces = leading_indent_spaces(line);
-    if leading_spaces >= 4 {
+fn fence_marker(line: &str) -> Option<FenceMarker> {
+    let indent = leading_indent_spaces(line);
+    if indent >= 4 {
         return None;
     }
-    let trimmed = line.get(leading_spaces..)?;
-    if trimmed.starts_with("```") {
-        Some('`')
-    } else if trimmed.starts_with("~~~") {
-        Some('~')
-    } else {
-        None
+    // インデントは半角スペース（1 バイト）のみを数えているため、この境界は
+    // 常に char 境界（添字ではなく get で取り、失敗時は None）。
+    let rest = line.get(indent..)?;
+    let kind = match rest.chars().next()? {
+        '`' => '`',
+        '~' => '~',
+        _ => return None,
+    };
+    let len = rest.chars().take_while(|&c| c == kind).count();
+    if len < 3 {
+        return None;
+    }
+    // kind は ASCII 1 バイト文字なので len はそのままバイト長でもある。
+    let info = rest.get(len..)?;
+    Some(FenceMarker {
+        kind,
+        len,
+        info_is_blank: info.trim().is_empty(),
+        info_has_backtick: info.contains('`'),
+    })
+}
+
+impl FenceMarker {
+    /// 開始フェンスとして成立するか。
+    ///
+    /// CommonMark では backtick 開始フェンスの info string にバッククォートを
+    /// 含められない（`` ```a`b `` は fence 開始ではない）。tilde 開始フェンスには
+    /// この制約がない。
+    fn can_open(&self) -> bool {
+        self.kind != '`' || !self.info_has_backtick
+    }
+
+    /// `open` で開いたフェンスを閉じられるか。
+    ///
+    /// CommonMark の閉じ条件は「開始と同じ文字種・開始以上の長さ・後続が空白のみ」。
+    /// 短い ``` や info string 付きの行で閉じたと誤認すると、コードブロック内の
+    /// `#` 行が見出し境界と判定されチャンクが誤分割される。
+    fn can_close(&self, open: &FenceMarker) -> bool {
+        self.kind == open.kind && self.len >= open.len && self.info_is_blank
     }
 }
 
@@ -297,7 +337,7 @@ pub fn chunk_generic(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>, 
 /// 段落（空行区切り）単位で、上限文字数に収まるよう詰め直す。
 ///
 /// 1 段落単体が上限を超える場合は分割せずそのまま 1 チャンクとする
-/// （段落内部をさらに割ると文脈が失われるため、PoC の方針を踏襲）。
+/// （段落内部をさらに割ると文脈が失われるため）。
 ///
 /// 段落は `lines` 内の連続範囲 `[start, end)` として保持し、チャンク化の際も
 /// 「最初の段落の先頭行から最後の段落の末尾行まで」の連続スライスを
@@ -377,8 +417,8 @@ fn split_oversized_section(
 /// Markdown ファイルを見出し単位でチャンク化する。
 ///
 /// ATX 見出し（[`is_atx_heading`]）の行を節の開始境界とし、最初の見出しより
-/// 前の前文は独立した 1 節として扱う。fenced code block（[`fence_delimiter_kind`]）
-/// 内の `#` 行は見出しと見なさない。`config.max_markdown_section_chars` を
+/// 前の前文は独立した 1 節として扱う。fenced code block（[`fence_marker`] の
+/// 開閉判定）内の `#` 行は見出しと見なさない。`config.max_markdown_section_chars` を
 /// 超える節は [`split_oversized_section`] で段落単位に詰め直す。
 pub fn chunk_markdown(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>, ChunkingError> {
     validate_input(text, config)?;
@@ -390,24 +430,28 @@ pub fn chunk_markdown(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>,
         .collect();
 
     // 見出し境界で節へ分割する（fence 内の見出しらしき行は境界にしない）。
-    // 閉じフェンスは開始フェンスと同じ文字種の行でのみ成立させる
-    // （fence_delimiter_kind のドキュメント参照）。異なる文字種の行は
-    // フェンス内部の通常行として扱い、開閉状態を変化させない。
+    // 閉じフェンスは FenceMarker::can_close が定める CommonMark の条件
+    // （同じ文字種・開始以上の長さ・後続が空白のみ）を満たす行でのみ成立させる。
+    // 満たさない行はフェンス内部の通常行として扱い、開閉状態を変化させない。
     let mut sections: Vec<Vec<(usize, &str)>> = Vec::new();
     let mut current: Vec<(usize, &str)> = Vec::new();
-    let mut fence_kind: Option<char> = None;
+    let mut open_fence: Option<FenceMarker> = None;
     for &(ln, l) in &numbered_lines {
-        if let Some(kind) = fence_delimiter_kind(l) {
-            match fence_kind {
-                None => fence_kind = Some(kind),
-                Some(open) if open == kind => fence_kind = None,
-                Some(_) => {}
+        match (open_fence, fence_marker(l)) {
+            // 開いているフェンスを閉じられる行だけを閉じ扱いにする。
+            (Some(open), Some(marker)) if marker.can_close(&open) => {
+                open_fence = None;
             }
-            current.push((ln, l));
-            continue;
-        }
-        if fence_kind.is_none() && is_atx_heading(l) && !current.is_empty() {
-            sections.push(std::mem::take(&mut current));
+            // 閉じ条件を満たさないデリミタ行はフェンス内部の通常行のまま。
+            (Some(_), _) => {}
+            (None, Some(marker)) if marker.can_open() => {
+                open_fence = Some(marker);
+            }
+            (None, _) => {
+                if is_atx_heading(l) && !current.is_empty() {
+                    sections.push(std::mem::take(&mut current));
+                }
+            }
         }
         current.push((ln, l));
     }
@@ -478,15 +522,37 @@ mod tests {
     }
 
     #[test]
-    fn fence_delimiter_detection() {
-        assert_eq!(fence_delimiter_kind("```"), Some('`'));
-        assert_eq!(fence_delimiter_kind("```rust"), Some('`'));
-        assert_eq!(fence_delimiter_kind("~~~"), Some('~'));
-        assert_eq!(fence_delimiter_kind("plain text"), None);
+    fn fence_marker_detection() {
+        assert_eq!(fence_marker("```").map(|m| (m.kind, m.len)), Some(('`', 3)));
+        assert_eq!(
+            fence_marker("````rust").map(|m| (m.kind, m.len)),
+            Some(('`', 4))
+        );
+        assert_eq!(fence_marker("~~~").map(|m| (m.kind, m.len)), Some(('~', 3)));
+        assert_eq!(fence_marker("plain text"), None);
+        assert_eq!(fence_marker("``"), None);
         // インデント基準は is_atx_heading と対称（0〜3 個まで）。
-        assert_eq!(fence_delimiter_kind("   ```"), Some('`'));
-        assert_eq!(fence_delimiter_kind("    ```"), None);
-        assert_eq!(fence_delimiter_kind("    ~~~"), None);
+        assert_eq!(fence_marker("   ```").map(|m| m.kind), Some('`'));
+        assert_eq!(fence_marker("    ```"), None);
+        assert_eq!(fence_marker("    ~~~"), None);
+    }
+
+    #[test]
+    fn fence_open_close_conditions() {
+        let open3 = fence_marker("```").expect("fence marker");
+        let open4 = fence_marker("````").expect("fence marker");
+
+        // backtick 開始フェンスの info string にバッククォートは置けない。
+        assert!(fence_marker("```rust").expect("marker").can_open());
+        assert!(!fence_marker("```a`b").expect("marker").can_open());
+        assert!(fence_marker("~~~a`b").expect("marker").can_open());
+
+        // 閉じは同じ文字種・開始以上の長さ・後続が空白のみ。
+        assert!(fence_marker("```").expect("marker").can_close(&open3));
+        assert!(fence_marker("````").expect("marker").can_close(&open3));
+        assert!(!fence_marker("```").expect("marker").can_close(&open4));
+        assert!(!fence_marker("```text").expect("marker").can_close(&open3));
+        assert!(!fence_marker("~~~").expect("marker").can_close(&open3));
     }
 
     #[test]
@@ -497,7 +563,7 @@ mod tests {
         assert_eq!(leading_indent_spaces("\tタブは対象外"), 0);
         // 同じ行に対して見出し・fence の判定基準が一致すること。
         assert!(!is_atx_heading("    # indented code"));
-        assert_eq!(fence_delimiter_kind("    ```"), None);
+        assert_eq!(fence_marker("    ```"), None);
     }
 
     #[test]
