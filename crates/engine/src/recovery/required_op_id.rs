@@ -59,6 +59,29 @@ impl LedgerMode {
             LedgerMode::CompareOnlyWithoutLedger => Ok(op_id),
         }
     }
+
+    /// [`Self::require`] の判定結果を「台帳へ書くか」を表す
+    /// [`crate::recovery::ledger::LedgerWrite`] へ変換する（TASK-93、対象ビヘイビア:
+    /// RECOVER-2）。`require` が先に `operation_id` の必須化を判定するため、
+    /// `LedgerMode::Ledgered` かつ `op_id` が `None` の場合はここへ到達する前に
+    /// `MissingOperationId` で拒否される。`resolve` はその判定を再利用しつつ、
+    /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）を
+    /// [`crate::recovery::ledger::LedgerWrite::Disabled`] へ写像する（台帳テーブルへ
+    /// 一切触れない側を型で明示し、`Option::None` を黙って skip 扱いにしない）。
+    pub(crate) fn resolve<'a>(
+        self,
+        op_id: Option<&'a OperationId>,
+    ) -> Result<crate::recovery::ledger::LedgerWrite<'a>, MissingOperationId> {
+        match self {
+            LedgerMode::Ledgered => match op_id {
+                Some(id) => Ok(crate::recovery::ledger::LedgerWrite::Record(id)),
+                None => Err(MissingOperationId),
+            },
+            LedgerMode::CompareOnlyWithoutLedger => {
+                Ok(crate::recovery::ledger::LedgerWrite::Disabled)
+            }
+        }
+    }
 }
 
 /// [`crate::sql::allowlist::validate_insert`] が `?` 演算子で本ガードの結果を
@@ -124,5 +147,34 @@ mod tests {
     #[test]
     fn missing_operation_id_display_has_no_sensitive_detail() {
         assert_eq!(MissingOperationId.to_string(), "missing operation_id");
+    }
+
+    // TASK-93（対象ビヘイビア: RECOVER-2）: `resolve` が `LedgerMode` を
+    // `LedgerWrite` へ正しく写像することをピン留めする。
+    #[test]
+    fn resolve_ledgered_with_some_yields_record() {
+        let id = OperationId::parse("op-0003").expect("valid operation_id");
+        let write = LedgerMode::Ledgered
+            .resolve(Some(&id))
+            .expect("must accept");
+        match write {
+            crate::recovery::ledger::LedgerWrite::Record(recorded) => {
+                assert_eq!(recorded, &id);
+            }
+            crate::recovery::ledger::LedgerWrite::Disabled => {
+                panic!("Ledgered must resolve to Record")
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_compare_only_yields_disabled() {
+        let write = LedgerMode::CompareOnlyWithoutLedger
+            .resolve(None)
+            .expect("compare-only mode must not require operation_id");
+        assert!(matches!(
+            write,
+            crate::recovery::ledger::LedgerWrite::Disabled
+        ));
     }
 }
