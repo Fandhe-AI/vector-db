@@ -70,9 +70,10 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
   `PRECISION_EVAL_MIN_MRR10`（`(0.0, 1.0]`）・`PRECISION_EVAL_MAX_FALSE_RETURN`
   （`[0.0, 1.0)`。`1.0` は常時 pass＝fail-open のため拒否）を環境変数から解決する。
   未設定は非 strict では「評価は実行するが判定はスキップ（対象外）」として成功終了、
-  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で fail-closed。非数値・範囲外は常に fail-closed。ログには実測値と pass/fail の
-  みを出力し、閾値の数値は出力しない（`hybrid_recall.rs::resolve_gate_threshold`
-  と同型）。
+  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で fail-closed。非数値・範囲外は常に
+  fail-closed。ログには指標名と pass/fail のみを出力し、閾値の数値も実測値も出力
+  しない（解決規則は `hybrid_recall.rs::resolve_gate_threshold` と同型。将来 public
+  runner の `recall.yml` から実行されても非公開値が Actions ログへ出ないようにする）。
 - **`.github/workflows/recall.yml` への接続は本 PR では行わない**: TASK-163 の
   スコープは実測・判断材料の提示までであり目標値の確定は含まない。未確定の閾値変数を
   strict モードの週次 job へ追加すると、管理者に未確定値の設定を強いるか schedule

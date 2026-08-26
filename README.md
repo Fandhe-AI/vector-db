@@ -157,9 +157,10 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 - 層 B（`make precision-regression`）: 閾値ゲートのみを実行し、指標名と pass/fail
   だけを出力します（閾値の数値も実測値も出力しません）。`PRECISION_EVAL_MIN_TOP1_ACC`・
   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
-  （未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝明示的に対象外」として成功終了。
-  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）による閾値ゲートと、
-  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）で判定します。
+  と比較して判定します。未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝
+  明示的に対象外」として成功終了、`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`（strict
+  モード）では未設定も fail-closed でテスト失敗とします。非数値・範囲外は常に
+  fail-closed です。
 - 判断材料レポート・感度スイープ（`make precision-report`。**ローカル専用**）:
   hybrid・dense 双方の指標（`precision_eval_report`）と `PrecisionPolicy` の閾値を
   差し替えたパラメータ感度スイープ（`precision_eval_policy_sweep`。hybrid 系列・

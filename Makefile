@@ -288,7 +288,7 @@ endif
 .PHONY: precision-regression
 precision-regression: ## TASK-163 の precision モード評価基準（Top-1 Accuracy・MRR@10・誤返却率）閾値ゲートのみを実行する（pass/fail のみ出力・実測値は出さない。目標値未確定のため .github/workflows/recall.yml には未接続。ci には含めない）
 ifdef HAS_CARGO
-	cargo test --release -p engine --test precision_eval -- --ignored --nocapture precision_eval_threshold_gate
+	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_threshold_gate
 else
 	@echo "skip: Cargo.toml 未追加のため precision-regression をスキップ"
 endif
@@ -296,7 +296,8 @@ endif
 .PHONY: precision-report
 precision-report: ## TASK-163 の判断材料レポート（hybrid/dense の指標）とパラメータ感度スイープを実行する（実測値を標準出力へ出すためローカル専用。CI・GitHub Actions からは実行しない）
 ifdef HAS_CARGO
-	cargo test --release -p engine --test precision_eval -- --ignored --nocapture precision_eval_report precision_eval_policy_sweep
+	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_report
+	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_policy_sweep
 else
 	@echo "skip: Cargo.toml 未追加のため precision-report をスキップ"
 endif
