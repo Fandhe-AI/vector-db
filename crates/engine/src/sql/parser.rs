@@ -15,6 +15,7 @@
 //! リテラル文字列を解析する（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
 
 use crate::catalog::{ColumnType, TableSchema};
+use crate::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
 use crate::sql::allowlist::{
     FunctionArg, InsertLiteral, OrderByForm, Projection, ValidatedInsert, ValidatedStatement,
     WherePredicate,
@@ -46,13 +47,6 @@ pub enum ProjectedColumn {
         name: String,
         expr: crate::sql::udf_call::BoundExpr,
     },
-}
-
-/// SCALAR 段（`WHERE <列> = '<literal>'`）で適用する等価条件 1 件。
-#[derive(Debug, Clone, PartialEq)]
-pub struct ScalarEq {
-    pub column_index: usize,
-    pub value: String,
 }
 
 /// DISTANCE 段のランキング方式。C1/C2/C3（純粋・スカラー条件付き・RLS 適用 Top-k）は
@@ -96,16 +90,22 @@ pub enum Ranking {
 pub struct BoundStatement {
     pub(crate) table: String,
     pub(crate) projection: Vec<ProjectedColumn>,
-    pub(crate) scalar_filters: Vec<ScalarEq>,
+    /// SCALAR 段で適用するメタデータフィルタ（等価・前方一致、TASK-147・EXT-3）。
+    /// **TASK-147 で追加した破壊的変更（BREAKING CHANGE）**: 旧 `scalar_filters:
+    /// Vec<ScalarEq>`（等価専用）を `declarative_filter::MetadataFilter`
+    /// （汎用 API。等価・前方一致の両方を表す）へ置換し、フィールド名も
+    /// `metadata_filters` へ改名した。
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
     /// `WHERE` 句に `visible()` 呼び出し形が含まれていたか（SQL-3・RLS-7 参照）。
     /// **実行側の RLS 適用はこの値の有無に依存しない**（`exec.rs` は無条件に
     /// `PolicyContext::is_visible` を適用する）。本フィールドは束縛結果の可観測性
     /// （テスト・診断）のためだけに保持する。
     pub(crate) rls_predicate_present: bool,
     /// `WHERE` の式述語（TASK-79・SQL-9）。UDF インライン展開済みで、レジストリを
-    /// 参照せず単独で評価できる。既存の `scalar_filters` と同じ SCALAR 段の一部として
-    /// 扱う（`sql::exec` のモジュールドキュメント参照。既定順では候補構築時の行フックで
-    /// 事前適用し、`HINT ORDER` で DISTANCE 先行時は DISTANCE 段の後で事後適用する）。
+    /// 参照せず単独で評価できる。既存の `metadata_filters` と同じ SCALAR 段の一部
+    /// として扱う（`sql::exec` のモジュールドキュメント参照。既定順では候補構築時の
+    /// 行フックで事前適用し、`HINT ORDER` で DISTANCE 先行時は DISTANCE 段の後で
+    /// 事後適用する）。
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
     pub(crate) ranking: Ranking,
     pub(crate) limit: usize,
@@ -134,7 +134,7 @@ impl BoundStatement {
     pub fn new(
         table: String,
         projection: Vec<ProjectedColumn>,
-        scalar_filters: Vec<ScalarEq>,
+        metadata_filters: Vec<MetadataFilter>,
         rls_predicate_present: bool,
         ranking: Ranking,
         limit: usize,
@@ -143,7 +143,7 @@ impl BoundStatement {
         Self {
             table,
             projection,
-            scalar_filters,
+            metadata_filters,
             rls_predicate_present,
             expr_filters: Vec::new(),
             ranking,
@@ -171,9 +171,9 @@ impl BoundStatement {
         &self.projection
     }
 
-    /// SCALAR 段で適用する等価条件一覧。
-    pub fn scalar_filters(&self) -> &[ScalarEq] {
-        &self.scalar_filters
+    /// SCALAR 段で適用するメタデータフィルタ一覧（等価・前方一致、TASK-147・EXT-3）。
+    pub fn metadata_filters(&self) -> &[MetadataFilter] {
+        &self.metadata_filters
     }
 
     /// `WHERE` 句に `visible()` 呼び出し形が含まれていたか（SQL-3・RLS-7 参照）。
@@ -519,17 +519,20 @@ pub fn bind_in_session(
         }
     };
 
-    let mut scalar_filters = Vec::with_capacity(stmt.where_predicates.len());
+    // TASK-147（EXT-3）: 等価・前方一致条件は未束縛の宣言（`DeclarativeFilter`）へ
+    // いったん集約し、`declarative_filter::bind_all` で一括束縛する（列名解決・
+    // `TEXT` 列限定・リテラル長上限・件数上限を汎用 API 側の 1 箇所に集約する）。
+    let mut declarative_filters = Vec::with_capacity(stmt.where_predicates.len());
     let mut expr_filters = Vec::new();
     let mut rls_predicate_present = false;
     for predicate in &stmt.where_predicates {
         match predicate {
             WherePredicate::Equality { column, value } => {
-                let index = text_column_index(schema, column)?;
-                scalar_filters.push(ScalarEq {
-                    column_index: index,
-                    value: value.clone(),
-                });
+                declarative_filters.push(DeclarativeFilter::equals(column.clone(), value.clone()));
+            }
+            WherePredicate::Prefix { column, pattern } => {
+                let prefix = declarative_filter::parse_prefix_pattern(pattern)?;
+                declarative_filters.push(DeclarativeFilter::starts_with(column.clone(), prefix));
             }
             WherePredicate::PredicateCall { .. } => {
                 // allowlist が許可する述語呼び出し形は `visible()` のみ
@@ -549,6 +552,7 @@ pub fn bind_in_session(
             }
         }
     }
+    let metadata_filters = declarative_filter::bind_all(&declarative_filters, schema)?;
 
     let ranking = bind_ranking(&stmt.order_by, schema)?;
 
@@ -565,7 +569,7 @@ pub fn bind_in_session(
     Ok(BoundStatement {
         table: stmt.table_name.clone(),
         projection,
-        scalar_filters,
+        metadata_filters,
         rls_predicate_present,
         expr_filters,
         ranking,
@@ -793,7 +797,7 @@ mod tests {
         assert_eq!(bound.table, "documents");
         assert_eq!(bound.limit, 5);
         assert!(matches!(bound.ranking, Ranking::Distance { .. }));
-        assert!(bound.scalar_filters.is_empty());
+        assert!(bound.metadata_filters.is_empty());
         assert!(!bound.rls_predicate_present);
     }
 
@@ -907,12 +911,12 @@ mod tests {
             "SELECT * FROM documents WHERE lang = 'ja' ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
         )
         .expect("bind should succeed");
+        assert_eq!(bound.metadata_filters.len(), 1);
+        let filter = &bound.metadata_filters[0];
+        assert_eq!(filter.column_index(), 2);
         assert_eq!(
-            bound.scalar_filters,
-            vec![ScalarEq {
-                column_index: 2,
-                value: "ja".to_string(),
-            }]
+            filter.op(),
+            &crate::declarative_filter::FilterOp::Equals("ja".to_string())
         );
     }
 
@@ -943,7 +947,7 @@ mod tests {
         )
         .expect("bind should succeed");
         assert!(bound.rls_predicate_present);
-        assert!(bound.scalar_filters.is_empty());
+        assert!(bound.metadata_filters.is_empty());
     }
 
     // --- bind: C4（ハイブリッド） --------------------------------------------------

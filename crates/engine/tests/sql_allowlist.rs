@@ -138,6 +138,36 @@ fn accepts_using_mode_clause_against_real_catalog() {
     assert_eq!(stmt.search_mode(), Some("precision"));
 }
 
+// --- TASK-147（EXT-3: `WHERE <col> LIKE '<prefix>%'`）実カタログ結合 --------------
+
+#[test]
+fn accepts_where_like_prefix_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("like-accept");
+    validate_statement(
+        "SELECT * FROM documents WHERE lang LIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        &storage,
+    )
+    .expect("LIKE prefix shape against a real table must be accepted");
+}
+
+#[test]
+fn rejects_not_like_and_ilike_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("like-reject");
+    let not_like = validate_statement(
+        "SELECT * FROM documents WHERE lang NOT LIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        &storage,
+    )
+    .expect_err("NOT LIKE must be rejected");
+    assert_eq!(not_like.wire_code(), "42601");
+
+    let ilike = validate_statement(
+        "SELECT * FROM documents WHERE lang ILIKE 'j%' ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10",
+        &storage,
+    )
+    .expect_err("ILIKE must be rejected");
+    assert_eq!(ilike.wire_code(), "42601");
+}
+
 #[test]
 fn rejects_using_mode_on_insert_statement_against_real_catalog() {
     // 書き込み系文への `USING MODE` 付与は SQL-8 の許可リスト検証で構文エラーとして

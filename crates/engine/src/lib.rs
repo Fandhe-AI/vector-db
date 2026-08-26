@@ -130,6 +130,13 @@
 //! 純関数的な API を提供する（詳細は `chunking.rs` モジュールドキュメント参照）。
 //! 増分インデックスへの結線（TASK-120）・一括投入上限（TASK-122、対象ビヘイビア:
 //! INDEX-4）は後続タスクの管轄。
+//!
+//! TASK-147（対象ビヘイビア: EXT-3）: `declarative_filter.rs` が、メタデータ列
+//! （`TEXT` 列）に対する等価・前方一致フィルタを任意の列名へ宣言的に指定できる
+//! 汎用 API（`DeclarativeFilter`／`MetadataFilter`）を提供する。`sql::parser` の
+//! 旧 `ScalarEq`（等価専用・SQL-2 の実装例）はこの汎用 API へ統合済み
+//! （BREAKING CHANGE。詳細は `declarative_filter.rs`・`sql/parser.rs` モジュール
+//! ドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -138,6 +145,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod chunking;
 pub mod core;
+pub mod declarative_filter;
 pub mod dispatch;
 pub mod hybrid;
 pub mod isa;
