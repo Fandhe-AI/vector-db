@@ -75,9 +75,9 @@ name = "contrast_bench"
 required-features = ["contrast-bench"]
 ```
 
-とし、`contrast_bench.rs`（新設）にのみ `required-features` を付けた。`src/` 配下は
-本 feature で一切 `cfg` 分岐せず、`wire-server` バイナリは usearch をリンクしない
-（`cargo tree -p wire-server` に出現しないことを確認済み）。以前 `test-support`
+とし、`contrast_bench.rs`（新設）にのみ `required-features` を付ける。`src/` 配下は
+本 feature で一切 `cfg` 分岐させず、`wire-server` バイナリは usearch をリンクしない
+（PR #224 にて `cargo tree -p wire-server` に出現しないことを確認済み）。以前 `test-support`
 feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）はテナント境界
 迂回 API の露出が理由だったが、本 feature は bench 専用の依存有効化のみで安全境界に
 触れない。
@@ -86,16 +86,15 @@ feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）
 実行するため、`contrast-bench` feature は PR ごとの `make ci`・CI で常時有効化され
 usearch の C++ ビルドが走る（GitHub ホステッド `ubuntu-latest` には g++ が同梱済み。
 初回 1〜3 分、以降はビルドキャッシュ次第）。ローカル実行にも C++17 コンパイラが必要
-になる（README「回帰ベンチの repo variables」に明記）。`deny.toml` は
-`[graph] all-features = true` を追加し、optional 依存も advisories/licenses/sources/
-bans の監査対象に含めた（fail-closed）。
+になる。`deny.toml` へは `[graph] all-features = true` を追加し、optional 依存も
+advisories/licenses/sources/bans の監査対象に含める（fail-closed）。
 
 ## ベンチの構成: 独立バイナリへの分離
 
 CORE-3/CORE-4（`simd_bench.rs`）と CORE-5 を別バイナリ（`contrast_bench.rs`）に
-分けた。対照エンジン側（C++ FFI を含む）の障害・ビルド失敗が CORE-3/CORE-4 の
+分ける。対照エンジン側（C++ FFI を含む）の障害・ビルド失敗が CORE-3/CORE-4 の
 ゲートへ波及しないようにする failure domain 分離が目的で、`.github/workflows/
-bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてある。
+bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにする。
 
 - 測定: `harness::ab::run_ab`（interleaved A/B）で A＝`ParallelSearchProvider::search`、
   B＝`ContrastIndex::search`（usearch `exact_search`）を同一データ・同一クエリで
@@ -129,7 +128,7 @@ bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてあ�
 
 `simd_bench.rs` から `core5_requested_from_env` と CORE-5 分岐を削除し、
 `.github/workflows/bench.yml` から `BENCH_CORE5` 注入を削除、`bench-contrast` ジョブ
-（schedule + workflow_dispatch）を追加した。`BENCH_MAX_CONTRAST_RATIO` repo variable
+（schedule + workflow_dispatch）を追加する。`BENCH_MAX_CONTRAST_RATIO` repo variable
 未設定のまま schedule run が実行された場合は fail-closed で red になる（既存の
 CORE-3/CORE-4・CORE-6/CORE-16 と同一の「未評価 run が green として埋もれない」方針を
 踏襲）。
@@ -141,6 +140,6 @@ CORE-3/CORE-4・CORE-6/CORE-16 と同一の「未評価 run が green として�
 - `BENCH_CORE5` repo variable の削除は管理者作業（残っていても参照されなくなるため
   無害）
 - usearch を不採用とする判断があった場合は `harness/contrast.rs` のアダプタ差し替え
-  で別クレートへ移行できる構造にしてある
+  で別クレートへ移行できる構造とする
 - `BENCH_MAX_CONTRAST_RATIO` の値設定はマージ後の管理者作業（未設定のまま週次 run が
   走ると設計どおり fail-closed で red になる）
