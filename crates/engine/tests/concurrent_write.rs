@@ -30,10 +30,11 @@ use temp_db::{unique_db_path, CleanupGuard};
 /// 同じ読み切りループ）。
 fn read_all_ids(storage: &Storage) -> Vec<u64> {
     let mut ids = Vec::new();
-    let mut cursor = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (page, next_cursor) = storage
-            .scan_page(cursor, 1_000)
+            .scan_page(cursor_ref, 1_000)
             .expect("scan_page should not fail against a healthy database");
         ids.extend(page.iter().map(|r| r.id));
         match next_cursor {
@@ -98,8 +99,12 @@ fn concurrent_put_from_multiple_threads_persists_every_row_without_loss_or_dupli
     );
 
     // 内容の一致も抜き取りで確認する（embedding が id 由来の期待値と一致すること）。
+    // 物理キーは (tenant_id, id) の複合キー（TABLE-12）のため、id からその行を
+    // 書き込んだスレッド（= tenant_id）を逆算する。
     for id in [0u64, THREAD_COUNT * ROWS_PER_THREAD - 1] {
-        let row = storage.get(id).expect("row must exist");
+        let thread_idx = id / ROWS_PER_THREAD;
+        let tenant_id = format!("tenant-{thread_idx}");
+        let row = storage.get(&tenant_id, id).expect("row must exist");
         let expected_embedding: Vec<f32> =
             (0..EMBEDDING_DIM).map(|i| (id + i as u64) as f32).collect();
         assert_eq!(row.embedding, expected_embedding);

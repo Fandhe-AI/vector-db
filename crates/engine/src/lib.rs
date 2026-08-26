@@ -78,6 +78,14 @@
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
 //!
+//! TASK-138（対象ビヘイビア: RLS-8）: TASK-137 の暗黙適用契約が MVP クエリカタログ
+//! （C1〜C4）以外の全読み取り経路（複数の任意スキーマテーブル・任意形状 SELECT・
+//! 宣言的 UDF・`VectorCore::search`／`get_row`・`tenant::visible_rows`）へも
+//! 一般化されて働くことを `tests/rls_generalized.rs` で機械検証する（経路インベントリ
+//! ・検証マトリクスは `docs/design/rls-generalized-read-paths.md` 参照）。
+//! `USING PLAN` 展開後クエリは TASK-77 未実装のため fail-closed な拒否のみを固定し、
+//! 展開後クエリの暗黙適用検証は TASK-77/TASK-117 の管轄とする。
+//!
 //! TASK-95（対象ビヘイビア: RECOVER-4）: `tenant.rs` にテナント境界付き書き込みガード
 //! （`insert_row`/`update_row`/`delete_row`）を追加し、`policy.rs::PolicyContext::is_owner`
 //! の単一照合パスで書き込み認可を判定する（読み取りの可視性判定 `is_visible` とは独立）。

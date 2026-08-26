@@ -268,17 +268,18 @@ fn mixed_dim_rows_roundtrip_intact() {
         // ページサイズは総行数（PER_TABLE_ROWS * テーブル数）未満に固定し、cursor が
         // 複数ページへ跨って進行する経路を実際に通す。
         let mut all_rows = Vec::new();
-        let mut cursor = None;
+        let mut cursor: Option<engine::storage::RowCursor> = None;
         loop {
+            let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
             let (page, next_cursor) = storage
-                .scan_page(cursor, 16)
+                .scan_page(cursor_ref, 16)
                 .expect("scan_page should succeed");
             all_rows.extend(page);
             match next_cursor {
                 None => break,
                 // 安全弁: cursor が前進しない（実装上は発生しないはずだが、将来の実装変更で
                 // 壊れた場合に無限ループへ陥らないための防御）場合は打ち切る。
-                Some(next) if cursor.is_some_and(|prev| next <= prev) => break,
+                Some(ref next) if cursor.as_ref().is_some_and(|prev| next <= prev) => break,
                 Some(next) => cursor = Some(next),
             }
         }
@@ -381,7 +382,9 @@ fn alter_table_does_not_disturb_other_dims() {
 
     // 既存行はすべて不変であることを確認する。
     for (id, embedding, metadata) in &existing_rows {
-        let row = storage.get(*id).expect("get existing row after alter");
+        let row = storage
+            .get(TENANT_ID, *id)
+            .expect("get existing row after alter");
         assert_eq!(&row.embedding, embedding, "id={id}");
         assert_eq!(&row.metadata, metadata, "id={id}");
     }

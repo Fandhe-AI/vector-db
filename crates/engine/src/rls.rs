@@ -74,6 +74,10 @@ use crate::storage::{Storage, Visibility};
 /// 可視性フィルタ適用への単一注入点。呼び出し元は
 /// `core.rs::EngineCore::search`/`get_row` と `sql/exec.rs::execute_statement`。
 /// コンストラクタ・メソッドのいずれも `PolicyContext` 以外の入力を受け取らない。
+///
+/// この単一注入点の契約が MVP クエリカタログ（C1〜C4）以外の全読み取り経路へも
+/// 一般化されて働くことは TASK-138（対象ビヘイビア: RLS-8）・`tests/rls_generalized.rs`
+/// で機械検証する。
 #[must_use]
 pub struct ImplicitRlsHook<'c> {
     ctx: &'c PolicyContext,
