@@ -925,7 +925,7 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
         self.ledger_mode.require(operation_id)?;
-        crate::tenant::insert_row(&self.storage, table, ctx, id, row)
+        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -940,7 +940,7 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
         self.ledger_mode.require(operation_id)?;
-        crate::tenant::update_row(&self.storage, table, ctx, id, row)
+        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -954,7 +954,7 @@ impl EngineCore {
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
         self.ledger_mode.require(operation_id)?;
-        crate::tenant::delete_row(&self.storage, table, ctx, id)
+        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id)
     }
 
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する

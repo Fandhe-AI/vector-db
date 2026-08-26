@@ -989,8 +989,11 @@ fn project_rows(
 /// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
 /// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
 ///
-/// 行の書き込みはガード付き API [`crate::tenant::insert_typed_row`] へ委譲する
-/// （TASK-95・TABLE-12・RLS-9）。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
+/// 行の書き込みはガードなし実体 [`crate::tenant::insert_typed_row_unchecked`]（`pub(crate)`）
+/// へ委譲する（TASK-95・TABLE-12・RLS-9。`operation_id` 必須化ガードは本関数の
+/// 呼び出し前に `sql::allowlist::validate_insert` が適用済みのため、ガード付き公開版
+/// `crate::tenant::insert_typed_row` は経由しない。TASK-92・RECOVER-1・
+/// codex-review P1 指摘・PR #217）。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
 /// テナント名前空間の指定を呼び出し元任せにするため、SQL 表層からは使わない
 /// （ガードを迂回できる書き込み入口を増やさない。security.md P0）。テナントは
 /// `ctx.tenant_id()` からサーバー側で導出され（クライアントが列リストへテナント
@@ -1029,7 +1032,7 @@ pub fn execute_insert(
     use crate::storage::{StorageError, Visibility};
     use crate::tenant::TenantWriteError;
 
-    crate::tenant::insert_typed_row(
+    crate::tenant::insert_typed_row_unchecked(
         storage,
         &bound.table,
         ctx,
@@ -1041,7 +1044,7 @@ pub fn execute_insert(
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // `tenant::insert_typed_row` 自体は `operation_id` 必須化ガード
+        // `tenant::insert_typed_row_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
         // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
         // `sql::allowlist::validate_insert` が書き込みトランザクション開始前に

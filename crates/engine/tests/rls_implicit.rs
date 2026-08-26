@@ -128,6 +128,8 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
                     Value::Text(lang.to_string()),
                     Value::Text(body),
                 ],
+                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                    .expect("valid operation_id"),
             )
             .expect("insert row");
             truths.push(RowTruth {
