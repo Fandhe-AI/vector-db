@@ -18,7 +18,7 @@
 | 目的 | Vulkan/Metal/DX12 の compute を単一 API で扱うため。各 GPU API を自作 FFI で叩くと依存最小方針に反して肥大化する |
 | ライセンス | MIT OR Apache-2.0（本リポと同一） |
 | メンテ状況 | gfx-rs/wgpu。crates.io の 30.0.1 系。`rust-version = 1.87.0`（本リポ toolchain は stable。充足） |
-| 推移的依存 | 上記 feature 構成で 102 crate（`Cargo.lock` 反映済み）。主要: `wgpu-core`/`wgpu-hal`/`wgpu-types`/`naga`/`ash`/`gpu-allocator`/`libloading`/`bitflags`/`thiserror`/`hashbrown`/`indexmap`/`smallvec`/`log`/`bytemuck`（`gpu-allocator` 経由の推移的依存。本体は `bytemuck` を使わず `to_ne_bytes`/`from_ne_bytes` でバイト変換する） |
+| 推移的依存 | 上記 feature 構成で新規 100 crate（`Cargo.lock` diff の `name = ` 追加行数で実測。`git diff <merge-base>..<この PR> -- Cargo.lock` で再現可能）。主要: `wgpu-core`/`wgpu-hal`/`wgpu-types`/`naga`/`ash`/`gpu-allocator`/`libloading`/`bitflags`/`thiserror`/`hashbrown`/`indexmap`/`smallvec`/`log`/`bytemuck`（`gpu-allocator` 経由の推移的依存。本体は `bytemuck` を使わず `to_ne_bytes`/`from_ne_bytes` でバイト変換する）/`parking_lot`・`parking_lot_core`（`wgpu-core` が間接的に要求し、features 指定では除外できない） |
 | cargo-deny | `make deny` で `advisories ok, bans ok, licenses ok, sources ok`（warn: `hashbrown`/`syn` の重複バージョンのみ。`multiple-versions = "warn"` 方針どおり） |
 | ビルド | `cargo check`／`cargo clippy --all-targets -- -D warnings` green。Vulkan ローダは `libloading` による実行時動的ロードのため、リンク時要件・CI runner への追加パッケージは不要 |
 
