@@ -116,12 +116,19 @@
 //! ドキュメント参照）。設定値は `core::EngineCore` が保持する `PrecisionPolicy`
 //! で、クエリ・セッション変数から到達できないサーバー側専有の値とする。TASK-161
 //! （`sql::mode`）が解決する `SearchMode` はこの契約の実行可否のみを分岐する。
+//!
+//! TASK-119（対象ビヘイビア: INDEX-3）: `chunking.rs` が `INSERT` 経由で届く
+//! ファイル内容（パス＋本文）をファイル種別ごとの方針でチャンク列へ分割する
+//! 純関数的な API を提供する（詳細は `chunking.rs` モジュールドキュメント参照）。
+//! 増分インデックスへの結線（TASK-120）・一括投入上限（TASK-122、対象ビヘイビア:
+//! INDEX-4）は後続タスクの管轄。
 
 pub mod arena;
 pub mod batch_fallback;
 pub mod batch_search;
 pub mod buffer_pool;
 pub mod catalog;
+pub mod chunking;
 pub mod core;
 pub mod dispatch;
 pub mod hybrid;
