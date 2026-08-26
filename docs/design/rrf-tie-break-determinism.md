@@ -73,6 +73,13 @@ id 昇順」で事前ソート済みであることを検証し（`is_sorted_des
 - スコア順に並べる箇所は必ず**安定ソート**（`sort_by`/`sort_by_key`。`sort_unstable_by`
   系は使わない）を使う。
 - 同点（スコアが等しい）要素のタイブレークは常に **id 昇順**とする。
+  複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`・`gpu_batch.rs`）
+  では行の一意キーが `(tenant_id, id)` であるため（PR #205/#228）、タイブレーク基準も
+  `(tenant_id, id)` 昇順へ拡張される。実装上は選出段の候補識別子（常駐行列の行スロット
+  番号）昇順であり、行を `(tenant_id, id)` キー順で常駐行列へ渡す前提のもとで両者は
+  一致する。単一テナント内では従来どおり id 昇順に退化し、CPU 経路・GPU 経路の間で
+  順序が食い違わないことが `FallbackBatchEngine::revalidate_primary_hits` の順序検証で
+  機械的に担保される。
 - スコアの比較には（NaN を含む非全順序を扱う場合）`total_cmp` を使い、非有限値は
   比較前に事前拒否する（`hybrid.rs`・`kernel.rs`・`sparse.rs` の既存契約と同じ）。
 - RRF 等の融合スコアを id ごとに累積する構造は `HashMap` ではなく `BTreeMap`（または
