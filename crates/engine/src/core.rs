@@ -922,8 +922,8 @@ impl EngineCore {
         row: &crate::storage::RowInput<'_>,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -937,8 +937,8 @@ impl EngineCore {
         row: &crate::storage::RowInput<'_>,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -951,8 +951,34 @@ impl EngineCore {
         id: u64,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id, ledger_write)
+    }
+
+    /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア:
+    /// RECOVER-2）。`crate::tenant::operation_recorded` への薄い委譲のみ。
+    ///
+    /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）では台帳テーブルへ
+    /// 一切触れず [`LedgerLookup::NoLedger`] を返す（「未記録」と誤認させない
+    /// fail-closed な区別。`recovery::ledger` モジュールドキュメント参照）。
+    /// `VectorCore` trait へは昇格しない（`execute_insert_sql` と同じ理由。
+    /// `core-api-check` の対象外）。
+    pub fn operation_recorded(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        op_id: &OperationId,
+    ) -> Result<crate::recovery::ledger::LedgerLookup, crate::tenant::TenantWriteError> {
+        use crate::recovery::ledger::LedgerLookup;
+        if matches!(self.ledger_mode, LedgerMode::CompareOnlyWithoutLedger) {
+            return Ok(LedgerLookup::NoLedger);
+        }
+        let recorded = crate::tenant::operation_recorded(&self.storage, table, ctx, op_id)?;
+        Ok(if recorded {
+            LedgerLookup::Recorded
+        } else {
+            LedgerLookup::NotRecorded
+        })
     }
 
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
@@ -1076,7 +1102,7 @@ impl EngineCore {
                 },
             })?;
         let bound = crate::sql::parser::bind_insert(&stmt, &schema)?;
-        crate::sql::exec::execute_insert(&self.storage, ctx, &bound)
+        crate::sql::exec::execute_insert(&self.storage, ctx, &bound, self.ledger_mode)
     }
 }
 

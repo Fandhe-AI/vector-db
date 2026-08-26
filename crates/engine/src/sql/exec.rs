@@ -1017,25 +1017,35 @@ fn project_rows(
 /// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
 /// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
 /// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
-/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の冪等契約
-/// （台帳への原子的記録・重複拒否・内容不一致検出）はまだ提供しない。`bound.operation_id`
-/// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
-/// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
-/// （ポインタ: docs/spec/05-tasks.md TASK-93）。
+/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の重複拒否・
+/// 内容不一致検出はまだ提供しない（TASK-94・TASK-101、対象ビヘイビア:
+/// RECOVER-3・RECOVER-10 の管轄）。
 ///
-/// `bound.operation_id` の必須化（TASK-92・RECOVER-1）は呼び出し元
-/// `sql::allowlist::validate_insert` が `LedgerMode::require` 経由で本関数の
-/// 呼び出し前に適用済みのため、`LedgerMode::Ledgered`（既定）では常に `Some`。
-/// `LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、本関数は
-/// いずれの場合も値の有無で分岐しない（台帳を持たないため未使用）。
+/// `ledger_mode` は `core.rs::EngineCore` が保持する構成をそのまま受け取り、
+/// `ledger_mode.resolve(bound.operation_id.as_ref())` で
+/// [`crate::recovery::ledger::LedgerWrite`] へ変換したうえで
+/// [`crate::tenant::insert_typed_row_unchecked`] へ渡す（TASK-93、対象ビヘイビア:
+/// RECOVER-2。台帳への追記が行書き込みと同一 write トランザクションで行われる点は
+/// `tenant.rs` モジュールドキュメント参照）。`bound.operation_id` の必須化
+/// （TASK-92・RECOVER-1）は呼び出し元 `sql::allowlist::validate_insert` が
+/// `LedgerMode::require` 経由で本関数の呼び出し前に適用済みのため、
+/// `LedgerMode::Ledgered`（既定）では常に `Some`。`resolve` はその判定を再利用する
+/// ため、ここで改めて `MissingOperationId` を返す経路は実質到達しない
+/// （`LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、その場合
+/// `resolve` は `LedgerWrite::Disabled` を返し、台帳へは触れない）。
 pub fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::catalog::CatalogError;
     use crate::storage::{StorageError, Visibility};
     use crate::tenant::TenantWriteError;
+
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     crate::tenant::insert_typed_row_unchecked(
         storage,
@@ -1044,6 +1054,7 @@ pub fn execute_insert(
         bound.id,
         Visibility::Private,
         &bound.values,
+        ledger_write,
     )
     .map_err(|e| match e {
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
