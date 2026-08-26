@@ -252,6 +252,20 @@ fn file_kind_detection() {
     assert_eq!(detect_file_kind("data.json"), FileKind::Generic);
     assert_eq!(detect_file_kind("Makefile"), FileKind::Generic);
     assert_eq!(detect_file_kind("trailing."), FileKind::Generic);
+
+    // 拡張子判定は最終パス要素だけを見る（ディレクトリ名のドットを拾わない）。
+    assert_eq!(detect_file_kind("docs.md/README"), FileKind::Generic);
+    assert_eq!(
+        detect_file_kind("archive.markdown/file.txt"),
+        FileKind::Generic
+    );
+    assert_eq!(detect_file_kind("docs.md/"), FileKind::Generic);
+    assert_eq!(detect_file_kind("v1.md/notes.md"), FileKind::Markdown);
+    assert_eq!(detect_file_kind("dir\\notes.md"), FileKind::Markdown);
+    assert_eq!(detect_file_kind("dir.md\\README"), FileKind::Generic);
+    // ドットファイル（拡張子ではなく名前の一部）は Generic 扱い。
+    assert_eq!(detect_file_kind(".md"), FileKind::Generic);
+    assert_eq!(detect_file_kind(""), FileKind::Generic);
 }
 
 #[test]

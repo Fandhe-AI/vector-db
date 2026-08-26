@@ -62,8 +62,12 @@ pub enum FileKind {
 /// ファイルシステムへはアクセスせず、文字列としてのパスのみを見る
 /// （untrusted なパス文字列に対しても安全に呼べる）。
 pub fn detect_file_kind(path: &str) -> FileKind {
-    let ext = match path.rsplit_once('.') {
-        Some((_, ext)) if !ext.is_empty() => ext,
+    // 判定対象は最終パス要素（ファイル名）の拡張子のみ。パス全体から最後の `.`
+    // を探すと `docs.md/README` のようにディレクトリ側のドットを拾いうるため、
+    // 先に区切り（`/`・Windows 形式の `\`）で末尾要素を切り出す。
+    let file_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let ext = match file_name.rsplit_once('.') {
+        Some((stem, ext)) if !ext.is_empty() && !stem.is_empty() => ext,
         _ => return FileKind::Generic,
     };
     if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") {
