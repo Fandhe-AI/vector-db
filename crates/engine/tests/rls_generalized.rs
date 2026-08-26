@@ -158,6 +158,11 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                 } else {
                     (0..t.dim).map(|_| rng.next_f32_signed()).collect()
                 };
+                // lang は visibility（i % 2）と独立な乱数で決める。両者を同じ i % 2 から
+                // 導出すると lang='ja' 述語が Public 行と完全一致してしまい、RLS を
+                // バイパスして述語だけで絞り込む実装バグを lang 述語つき shape では
+                // 検出できなくなる（codex-review 指摘）。
+                let lang_is_ja = rng.next_u64().is_multiple_of(2);
                 let ctx = PolicyContext::with_visibilities(
                     tenant,
                     [Visibility::Public, Visibility::Private],
@@ -166,7 +171,7 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                 let mut values = vec![Value::Vector(emb)];
                 for (idx, &col) in t.text_cols.iter().enumerate() {
                     let cell = if col == "lang" {
-                        if i % 2 == 0 {
+                        if lang_is_ja {
                             "ja".to_string()
                         } else {
                             "en".to_string()
@@ -428,92 +433,119 @@ fn udf_reads_only_reach_visible_rows_across_tables_and_sessions() {
 
     for t in TABLES.iter() {
         for &tenant in TENANTS.iter() {
-            let ctx = ctx_for(tenant, true);
-            let mut session = SessionState::default();
-            core.execute_sql_in_session(
-                &ctx,
-                &mut session,
-                "CREATE FUNCTION unit_sum(v) AS vec_sum(vec_div(v, vec_norm(v)))",
-            )
-            .expect("CREATE FUNCTION should succeed");
+            // allow_private=false（Public-only 利用者）でも UDF 経路が自テナントの
+            // Private 行を誤って評価・返却しないことを固定する（codex-review 指摘。
+            // 従来は allow_private=true 固定だったため Public-only 時の回帰を
+            // 検出できなかった）。
+            for allow_private in [false, true] {
+                let ctx = ctx_for(tenant, allow_private);
+                let mut session = SessionState::default();
+                core.execute_sql_in_session(
+                    &ctx,
+                    &mut session,
+                    "CREATE FUNCTION unit_sum(v) AS vec_sum(vec_div(v, vec_norm(v)))",
+                )
+                .expect("CREATE FUNCTION should succeed");
 
-            let q = query_vec(t.dim);
-            let allowed = allowed_set(&truths, t.name, tenant, true);
+                let q = query_vec(t.dim);
+                let allowed = allowed_set(&truths, t.name, tenant, allow_private);
 
-            // 結果列位置: 他テナントの不可視ゼロベクトル（カナリア）があっても
-            // 0 除算に落ちず成功する（不可視行では UDF が一切評価されない）。自テナントの
-            // 可視カナリア（ゼロベクトル）は意図的に 0 除算を起こすため、
-            // `vec_norm(v) > 0.0` の式述語（許可リスト SQL-9 の式述語形。`=` 以外の
-            // 比較演算子は列の直接比較には使えないため関数式で表す）で除外する
-            // （可視カナリア自身の 0 除算検証は本関数末尾で別途行う）。
-            let sql_result_col = format!(
+                // 結果列位置: 他テナントの不可視ゼロベクトル（カナリア）があっても
+                // 0 除算に落ちず成功する（不可視行では UDF が一切評価されない）。自テナントの
+                // 可視カナリア（ゼロベクトル）は意図的に 0 除算を起こすため、
+                // `vec_norm(v) > 0.0` の式述語（許可リスト SQL-9 の式述語形。`=` 以外の
+                // 比較演算子は列の直接比較には使えないため関数式で表す）で除外する
+                // （可視カナリア自身の 0 除算検証は本関数末尾で別途行う）。
+                let sql_result_col = format!(
                 "SELECT id, unit_sum({}) AS s FROM {} WHERE vec_norm({}) > 0.0 ORDER BY {} <=> '{q}' LIMIT 20",
                 t.vector_col, t.name, t.vector_col, t.vector_col
             );
-            let outcome = core
-                .execute_sql_in_session(&ctx, &mut session, &sql_result_col)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "table={} tenant={tenant} sql={sql_result_col:?} err={e:?}",
-                        t.name
-                    )
-                });
-            let result = expect_query(outcome);
-            for row in &result.rows {
-                assert!(
+                let outcome = core
+                    .execute_sql_in_session(&ctx, &mut session, &sql_result_col)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "table={} tenant={tenant} sql={sql_result_col:?} err={e:?}",
+                            t.name
+                        )
+                    });
+                let result = expect_query(outcome);
+                for row in &result.rows {
+                    assert!(
                     allowed.contains(&row.id),
                     "disallowed row leaked via UDF result column: table={} tenant={tenant} id={}",
                     t.name,
                     row.id
                 );
-            }
+                }
 
-            // WHERE 位置でも同じ契約（同じ理由で自テナントの可視カナリアを除外する）。
-            let sql_where = format!(
+                // WHERE 位置でも同じ契約（同じ理由で自テナントの可視カナリアを除外する）。
+                let sql_where = format!(
                 "SELECT id FROM {} WHERE vec_norm({}) > 0.0 AND unit_sum({}) < 1000.0 ORDER BY {} <=> '{q}' LIMIT 20",
                 t.name, t.vector_col, t.vector_col, t.vector_col
             );
-            let outcome = core
-                .execute_sql_in_session(&ctx, &mut session, &sql_where)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "table={} tenant={tenant} sql={sql_where:?} err={e:?}",
-                        t.name
-                    )
-                });
-            let result = expect_query(outcome);
-            for row in &result.rows {
-                assert!(
-                    allowed.contains(&row.id),
-                    "disallowed row leaked via UDF WHERE: table={} tenant={tenant} id={}",
-                    t.name,
-                    row.id
-                );
-            }
+                let outcome = core
+                    .execute_sql_in_session(&ctx, &mut session, &sql_where)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "table={} tenant={tenant} sql={sql_where:?} err={e:?}",
+                            t.name
+                        )
+                    });
+                let result = expect_query(outcome);
+                for row in &result.rows {
+                    assert!(
+                        allowed.contains(&row.id),
+                        "disallowed row leaked via UDF WHERE: table={} tenant={tenant} id={}",
+                        t.name,
+                        row.id
+                    );
+                }
 
-            // 可視側のカナリア（自テナントの Private ゼロベクトル行）に対しては
-            // 0 除算で 22000 になることを固定し、「不可視行で評価されていない」ことを
-            // 両側から裏付ける（見えているものは評価される・見えていないものは
-            // 評価されない、の両方を検証しないと「常に評価されない」実装でも
-            // 通ってしまう）。
-            let canary = truths
-                .iter()
-                .find(|r| r.table == t.name && r.tenant == tenant && r.is_zero_canary)
-                .expect("fixture has a per-tenant zero canary");
-            let sql_canary_only = format!(
+                // カナリア（自テナントの Private ゼロベクトル行）に対する挙動は
+                // allow_private で分岐する。可視（allow_private=true）なら 0 除算で
+                // 22000 になることを固定し、「不可視行で評価されていない」ことを両側から
+                // 裏付ける（見えているものは評価される・見えていないものは評価されない、
+                // の両方を検証しないと「常に評価されない」実装でも通ってしまう）。
+                // 不可視（allow_private=false・Public-only）なら RLS が行自体を除外して
+                // UDF まで到達しないため、0 除算エラーにならず空結果になることを固定する
+                // （codex-review 指摘: Public-only 経路の UDF 未評価を検証）。
+                let canary = truths
+                    .iter()
+                    .find(|r| r.table == t.name && r.tenant == tenant && r.is_zero_canary)
+                    .expect("fixture has a per-tenant zero canary");
+                let sql_canary_only = format!(
                 "SELECT id, unit_sum({}) AS s FROM {} WHERE id = {} ORDER BY {} <=> '{q}' LIMIT 1",
                 t.vector_col, t.name, canary.id, t.vector_col
             );
-            let err = core
-                .execute_sql_in_session(&ctx, &mut session, &sql_canary_only)
-                .expect_err("visible zero-vector row must trigger division by zero");
-            assert_eq!(
-                err.wire_code(),
-                "22000",
-                "table={} tenant={tenant} id={}",
-                t.name,
-                canary.id
-            );
+                if allow_private {
+                    let err = core
+                        .execute_sql_in_session(&ctx, &mut session, &sql_canary_only)
+                        .expect_err("visible zero-vector row must trigger division by zero");
+                    assert_eq!(
+                        err.wire_code(),
+                        "22000",
+                        "table={} tenant={tenant} id={}",
+                        t.name,
+                        canary.id
+                    );
+                } else {
+                    let outcome = core
+                    .execute_sql_in_session(&ctx, &mut session, &sql_canary_only)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Public-only viewer must not error on invisible canary: table={} tenant={tenant} id={} err={e:?}",
+                            t.name, canary.id
+                        )
+                    });
+                    let result = expect_query(outcome);
+                    assert!(
+                    result.rows.is_empty(),
+                    "Public-only viewer must not see own-tenant Private canary via UDF: table={} tenant={tenant} id={}",
+                    t.name,
+                    canary.id
+                );
+                }
+            }
         }
     }
 }
@@ -617,24 +649,30 @@ fn get_row_is_not_found_for_every_disallowed_row_and_ok_for_every_allowed_row() 
 
     for t in TABLES.iter() {
         for &viewer in TENANTS.iter() {
-            let ctx = ctx_for(viewer, true);
-            for truth in truths.iter().filter(|r| r.table == t.name) {
-                let got = core.get_row(&ctx, t.name, truth.tenant, truth.id);
-                if is_allowed(truth, viewer, true) {
-                    let row = got.unwrap_or_else(|e| {
-                        panic!(
-                            "expected Ok for allowed row: table={} viewer={viewer} owner={} id={} err={e:?}",
+            // allow_private=false（既定の Public-only 権限）でも自テナントの Private
+            // 行が NotFound になることを固定する（codex-review 指摘。従来は
+            // allow_private=true 固定だったため、既定権限下での get_row 経由の
+            // 自テナント Private 行漏えい回帰を検出できなかった）。
+            for allow_private in [false, true] {
+                let ctx = ctx_for(viewer, allow_private);
+                for truth in truths.iter().filter(|r| r.table == t.name) {
+                    let got = core.get_row(&ctx, t.name, truth.tenant, truth.id);
+                    if is_allowed(truth, viewer, allow_private) {
+                        let row = got.unwrap_or_else(|e| {
+                            panic!(
+                                "expected Ok for allowed row: table={} viewer={viewer} allow_private={allow_private} owner={} id={} err={e:?}",
+                                t.name, truth.tenant, truth.id
+                            )
+                        });
+                        assert_eq!(row.tenant_id, truth.tenant);
+                        assert_eq!(row.visibility, truth.visibility);
+                    } else {
+                        assert!(
+                            matches!(got, Err(CoreError::NotFound)),
+                            "expected NotFound for disallowed row: table={} viewer={viewer} allow_private={allow_private} owner={} id={}",
                             t.name, truth.tenant, truth.id
-                        )
-                    });
-                    assert_eq!(row.tenant_id, truth.tenant);
-                    assert_eq!(row.visibility, truth.visibility);
-                } else {
-                    assert!(
-                        matches!(got, Err(CoreError::NotFound)),
-                        "expected NotFound for disallowed row: table={} viewer={viewer} owner={} id={}",
-                        t.name, truth.tenant, truth.id
-                    );
+                        );
+                    }
                 }
             }
         }
