@@ -99,12 +99,13 @@ pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, B
 /// 対照エンジンとの比率（被検/対照）が上限（`max_ratio`）以下かを判定する
 /// （CORE-5。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）。
 ///
-/// CORE-5 の判定統計量は p95 レイテンシの比率であり、呼び出し元
-/// （`contrast_bench.rs`）は [`p95_ratio`] の結果を渡す（`ab::AbMeasurement::median_ratio`
-/// は補助情報として標準出力に併記するのみで、本判定には使わない）。引数名を汎用の
-/// `ratio` ではなく統計量非依存の値として扱えるよう、値そのものの妥当性検証
-/// （有限・非負）のみを本関数の責務とする（TASK-127・Issue #176 で対照エンジン
-/// 〔usearch〕へ接続済み）。
+/// 呼び出し元（`contrast_bench.rs`）は本実装が採用する統計量として
+/// [`p95_ratio`] の結果を渡す（`ab::AbMeasurement::median_ratio` は補助情報として
+/// 標準出力に併記するのみで、本判定には使わない）。CORE-5 の判定統計量の詳細は
+/// `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本コメントでは
+/// 転記しない。引数名を汎用の `ratio` ではなく統計量非依存の値として扱えるよう、
+/// 値そのものの妥当性検証（有限・非負）のみを本関数の責務とする（TASK-127・
+/// Issue #176 で対照エンジン〔usearch〕へ接続済み）。
 pub fn check_contrast_ratio_within_limit(ratio: f64, max_ratio: f64) -> Result<bool, BenchError> {
     if !ratio.is_finite() || ratio < 0.0 {
         return Err(BenchError::DegenerateRatio(

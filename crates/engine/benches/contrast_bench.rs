@@ -4,9 +4,10 @@
 //!
 //! 被検（`ParallelSearchProvider`。TASK-126）と対照エンジン（usearch の総当たり
 //! `exact_search`。`harness::contrast::ContrastIndex`）を同一データ・同一クエリで
-//! `harness::ab::run_ab`（interleaved A/B）により比較し、p95 レイテンシの比率
-//! （被検/対照）が上限以下であることを判定する（`harness::accept::p95_ratio` /
-//! `check_contrast_ratio_within_limit`）。
+//! `harness::ab::run_ab`（interleaved A/B）により比較し、`harness::accept::p95_ratio` /
+//! `check_contrast_ratio_within_limit` の結果が上限以下であることを判定する
+//! （CORE-5 の判定統計量の詳細は `docs/spec/04-behavior/core-engine.md` CORE-5 が
+//! SSOT のため本コメントでは転記しない）。
 //!
 //! `parallel_bench.rs`（CORE-3/CORE-4）とは独立バイナリに分離してある
 //! （`Cargo.toml` の `[[bench]] contrast_bench` コメント参照）。対照エンジン側は

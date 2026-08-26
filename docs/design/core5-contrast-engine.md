@@ -11,8 +11,8 @@
 
 ## 背景
 
-CORE-5 は「対照エンジンと同一データ・同一クエリで p95 レイテンシの比率を比較する」
-ビヘイビアだが、対照エンジンクレートの導入が依存追加のユーザー承認を要するため
+CORE-5 のビヘイビア詳細（`docs/spec/04-behavior/core-engine.md` CORE-5）が SSOT
+だが、対照エンジンクレートの導入が依存追加のユーザー承認を要するため
 （`.claude/rules/dependency-policy.md`）、TASK-127 の初回実装（PR #143）では
 判定ロジック（`harness/accept.rs::check_contrast_ratio_within_limit`）のみ先行実装し、
 実測は `BENCH_CORE5=1` の opt-in でのみ「未接続＝判定不能」を fail-closed とする
@@ -88,9 +88,11 @@ bench.yml` でも `bench-parallel` と `bench-contrast` を別ジョブにして
   B＝`ContrastIndex::search`（usearch `exact_search`）を同一データ・同一クエリで
   交互実行する（測定条件は `parallel_bench.rs` と同一の `ROW_COUNT`/`DIM`/`TOP_K`/
   シード）
-- 判定統計量: CORE-5 は p95 レイテンシ比で判定する（`harness::accept::p95_ratio`）。
-  `AbMeasurement::median_ratio`（`ab.rs` の既存契約）は補助情報として標準出力に
-  併記するのみで、判定には使わない
+- 判定統計量: 実装は `harness::accept::p95_ratio` の結果で判定する
+  （`AbMeasurement::median_ratio`〔`ab.rs` の既存契約〕は補助情報として標準出力に
+  併記するのみで、判定には使わない）。CORE-5 の判定統計量の詳細は
+  `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本ドキュメントでは
+  転記しない
 - 閾値注入: `BENCH_MAX_CONTRAST_RATIO` 環境変数（有限・正の浮動小数点）。未設定・
   不正値は fail-closed（`harness::accept::parse_contrast_ratio_limit`）
 - 健全性チェック: 同一クエリでの Top-k 一致率（`recall_at_k`）を対照側と算出し標準
