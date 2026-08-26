@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::auth::UserStore;
 use crate::bind_guard::{GuardedBindAddrs, TransportSecurity};
 use crate::limits::{self, ConnectionLimiter, RejectWorkerLimiter};
+use engine::core::EngineCore;
 
 /// 旧 TASK-67 review 是正時点の公開 API との後方互換ラッパー。
 ///
@@ -101,6 +102,31 @@ pub fn accept_loop_with_limiter(
     limiter: ConnectionLimiter,
     read_timeout: Duration,
 ) {
+    accept_loop_inner(listener, store, None, limiter, read_timeout)
+}
+
+/// engine（SQL 表層）を接続した接続受け付けループ（TASK-73・WIRE-1）。
+/// `main.rs::run_server` が `--db` 指定時にこちらを呼ぶ。受理・拒否・タイムアウト・
+/// 有界化の契約は [`accept_loop_with_limiter`] と同一で、各接続ハンドラに
+/// `engine::core::EngineCore`（`Arc` で複数接続スレッド間共有。`EngineCore` は
+/// `Send + Sync`）を渡す点のみが異なる。
+pub fn accept_loop_with_engine(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    engine: Arc<EngineCore>,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) {
+    accept_loop_inner(listener, store, Some(engine), limiter, read_timeout)
+}
+
+fn accept_loop_inner(
+    listener: TcpListener,
+    store: Arc<UserStore>,
+    engine: Option<Arc<EngineCore>>,
+    limiter: ConnectionLimiter,
+    read_timeout: Duration,
+) {
     // 拒否応答ワーカースレッドの有界化専用リミッター（`limiter` とは別枠。
     // review 是正: 拒否経路の無制限 `thread::spawn` による DoS 対策）。
     let reject_limiter = RejectWorkerLimiter::new(limits::MAX_REJECT_WORKERS);
@@ -171,11 +197,18 @@ pub fn accept_loop_with_limiter(
         }
 
         let store = Arc::clone(&store);
+        let engine = engine.clone();
         std::thread::spawn(move || {
             // 接続処理中は `permit` を保持し続け、スレッド終了時（正常終了・panic
             // いずれも）に Drop で確実に枠を解放する。
             let _permit = permit;
-            if let Err(e) = crate::handshake::handle_connection_bounded(stream, &store) {
+            let result = match &engine {
+                Some(engine) => {
+                    crate::handshake::handle_connection_with_engine(stream, &store, engine)
+                }
+                None => crate::handshake::handle_connection_bounded(stream, &store),
+            };
+            if let Err(e) = result {
                 eprintln!("wire-server: connection error: {e}");
             }
         });

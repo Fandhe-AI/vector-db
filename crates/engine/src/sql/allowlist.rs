@@ -105,6 +105,20 @@ impl SqlSurfaceError {
         }
     }
 
+    /// クライアント（wire 層 `ErrorResponse`）へそのまま返してよい文言を返す。
+    /// `Internal`（`wire_code() == "XX000"`）は redb I/O エラー等の内部ストレージ
+    /// 詳細を保持しているため固定の一般化メッセージへ丸め、それ以外の variant は
+    /// 通常の `Display` 文言（テナント越境の存在情報を含まないよう各コンストラクタ
+    /// 側で既に切り詰め・一般化済み）をそのまま返す（security.md P0「private
+    /// 情報の漏えい」対応。`wire-server::simple_query` はエラー応答の整形時に
+    /// `to_string()` ではなく必ずこちらを使うこと）。
+    pub fn client_message(&self) -> String {
+        match self {
+            SqlSurfaceError::Internal { .. } => "internal error".to_string(),
+            other => other.to_string(),
+        }
+    }
+
     /// `pub(crate)`: `sql::allowlist::Parser::parse_operation_id_clause`・
     /// `sql::using_operation_id::OperationId::parse` が文末句の省略（空文字値を
     /// 含む）を報告するために使う（SQL-10、TASK-80）。
@@ -1283,6 +1297,34 @@ mod tests {
                 detail: "simulated backend failure".to_string(),
             })
         }
+    }
+
+    // codex-review P0・PR #210 指摘の再発防止: `Internal`（`wire_code() ==
+    // "XX000"`）の `client_message()` は redb I/O エラー等の内部詳細
+    // （`detail`）を一切含まない固定文言へ丸めること。`wire-server::simple_query`
+    // は `to_string()` ではなく必ずこちらを使う契約（security.md P0）。
+    #[test]
+    fn internal_error_client_message_does_not_leak_detail() {
+        let err = SqlSurfaceError::Internal {
+            detail: "redb I/O error: disk quota exceeded at /var/lib/vector-db/data.redb"
+                .to_string(),
+        };
+        assert_eq!(err.wire_code(), "XX000");
+        assert_eq!(err.client_message(), "internal error");
+        assert!(!err.client_message().contains("redb"));
+        assert!(!err.client_message().contains("disk quota"));
+    }
+
+    // 対照確認: `Internal` 以外の variant は通常の `Display` 文言をそのまま
+    // `client_message()` として返す（各コンストラクタで既に切り詰め・一般化
+    // 済みのため、丸め不要）。
+    #[test]
+    fn non_internal_error_client_message_matches_display() {
+        let err = SqlSurfaceError::UndefinedTable {
+            name: "ghost_table".to_string(),
+        };
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(err.client_message().contains("ghost_table"));
     }
 
     fn catalog_with(tables: &[&'static str]) -> FakeCatalog {

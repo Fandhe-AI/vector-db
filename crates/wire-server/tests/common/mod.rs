@@ -318,4 +318,146 @@ pub fn expect_connection_closed(stream: &mut TcpStream) {
     let mut extra = [0u8; 1];
     let n = stream.read(&mut extra).unwrap_or(0);
     assert_eq!(n, 0, "connection must be closed after rejection");
+    let _ = extra;
+}
+
+// ---------------------------------------------------------------------------
+// engine 接続経路のヘルパー（TASK-73・WIRE-1。`tests/wire1_simple_query.rs` と
+// `tests/three_client_e2e.rs` が共有する）。
+// ---------------------------------------------------------------------------
+
+/// サーバースレッドを `wire_server::server::accept_loop_with_engine` 経由で起動する
+/// （簡易クエリが `engine::core::EngineCore` へ到達する経路。TASK-73）。
+pub fn spawn_server_with_engine(
+    users_path: &std::path::Path,
+    engine: std::sync::Arc<engine::core::EngineCore>,
+) -> std::net::SocketAddr {
+    let store = UserStore::load_from_file(users_path).expect("valid user store");
+    let store = Arc::new(store);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let limiter = ConnectionLimiter::new(16);
+
+    std::thread::spawn(move || {
+        wire_server::server::accept_loop_with_engine(
+            listener,
+            store,
+            engine,
+            limiter,
+            Duration::from_secs(5),
+        );
+    });
+
+    addr
+}
+
+/// 簡易クエリ（'Q'）1 文を送る（UTF-8 テキストのみを想定。`sql` は呼び出し側の
+/// リテラル文字列を渡す前提で、NUL 混入検証は wire-server 側のテストが別途担う）。
+pub fn send_simple_query(stream: &mut TcpStream, sql: &str) {
+    let mut body = Vec::new();
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    send_length_prefixed_message(stream, b'Q', &body);
+}
+
+/// `RowDescription`（'T'）を読み、列名のリストを返す。
+pub fn read_row_description(stream: &mut TcpStream) -> Vec<String> {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'T', "expected RowDescription");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+
+    let field_count = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2usize;
+    let mut names = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let nul = body[pos..]
+            .iter()
+            .position(|&b| b == 0)
+            .expect("nul-terminated column name");
+        let name = std::str::from_utf8(&body[pos..pos + nul])
+            .expect("utf8 column name")
+            .to_string();
+        pos += nul + 1;
+        pos += 4 + 2 + 4 + 2 + 4 + 2; // table oid, attnum, type oid, typlen, typmod, format
+        names.push(name);
+    }
+    names
+}
+
+/// `DataRow`（'D'）を 1 行読み、各セルを `Option<String>`（`NULL` は `None`）として
+/// 返す。
+pub fn read_data_row(stream: &mut TcpStream) -> Vec<Option<String>> {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'D', "expected DataRow");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+
+    let field_count = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut pos = 2usize;
+    let mut cells = Vec::with_capacity(field_count);
+    for _ in 0..field_count {
+        let cell_len = i32::from_be_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+        pos += 4;
+        if cell_len < 0 {
+            cells.push(None);
+            continue;
+        }
+        let cell_len = cell_len as usize;
+        let text = std::str::from_utf8(&body[pos..pos + cell_len])
+            .expect("utf8 cell")
+            .to_string();
+        pos += cell_len;
+        cells.push(Some(text));
+    }
+    cells
+}
+
+/// `CommandComplete`（'C'）のタグ文字列を読む。
+pub fn read_command_complete(stream: &mut TcpStream) -> String {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'C', "expected CommandComplete");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
+    let end = body.len().saturating_sub(1);
+    String::from_utf8_lossy(&body[..end]).to_string()
+}
+
+/// `EmptyQueryResponse`（'I'）を読み、body が存在しないこと（length=4）を確認する。
+pub fn expect_empty_query_response(stream: &mut TcpStream) {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'I', "expected EmptyQueryResponse");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    assert_eq!(
+        i32::from_be_bytes(len_buf),
+        4,
+        "EmptyQueryResponse has no body"
+    );
+}
+
+/// `ReadyForQuery`（'Z'）を読み切る（`status` バイトの中身は検証しない呼び出し側
+/// 向けの簡便ヘルパー）。
+pub fn read_ready_for_query(stream: &mut TcpStream) {
+    let mut header = [0u8; 1];
+    stream.read_exact(&mut header).expect("read type");
+    assert_eq!(header[0], b'Z', "expected ReadyForQuery");
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).expect("read len");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    stream.read_exact(&mut body).expect("read body");
 }

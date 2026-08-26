@@ -108,6 +108,14 @@
 //! カーネル）双方の実体がこれへ委譲する。SIMD カーネル（`unsafe` を含む）は検出
 //! 成功時のみ構築される sealed トークン経由でしか呼び出せない（詳細は `isa.rs`
 //! モジュールドキュメント参照）。
+//!
+//! TASK-162（対象ビヘイビア: SEARCH-9）: `precision.rs` が `precision` モードの
+//! 実行契約（確信度判定・空集合 fail-closed 応答）を提供する。適用位置は
+//! `sql::exec::execute_statement` の DISTANCE 段（＋事後 SCALAR フィルタ）の後・
+//! `RlsSafetyNet::apply` の前（詳細は `precision.rs`・`sql/exec.rs` モジュール
+//! ドキュメント参照）。設定値は `core::EngineCore` が保持する `PrecisionPolicy`
+//! で、クエリ・セッション変数から到達できないサーバー側専有の値とする。TASK-161
+//! （`sql::mode`）が解決する `SearchMode` はこの契約の実行可否のみを分岐する。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -121,6 +129,7 @@ pub mod isa;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
+pub mod precision;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
