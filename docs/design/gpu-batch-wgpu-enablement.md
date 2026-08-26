@@ -1,8 +1,8 @@
 # wgpu 導入と GPU バッチ経路の有効化
 
 - ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
-- **依存追加はオーナーの明示承認を得ていない。マージ前に承認が必要**
-  （`.claude/rules/dependency-policy.md`。承認事項は
+- 依存追加はオーナー承認済み（2026-08-26。承認記録は Issue #178 のコメント。
+  `.claude/rules/dependency-policy.md`。承認事項は
   `crates/engine/Cargo.toml` のコメント・本文 §1 参照）
 - 対応: TASK-128〜130（Issue #178。ポインタ: `docs/spec/05-tasks.md`）
 - 関連ビヘイビア: CORE-6, CORE-8, CORE-16, EXT-2（ポインタ:
@@ -137,7 +137,8 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   `FallbackBatchEngine::build_with_gpu`。GPU が初期化できない環境・計測中に
   CPU 縮退（CORE-8）が発生した場合は「測定不能（`pass=false`）」とし、CPU 同士の
   比較値を GPU 実測の代替として計上しない
-- CORE-16: GPU 常駐コピーの f16 パックと f32 常駐の比較（ポインタ:
+- CORE-16: 本 PR のスコープ外として **Issue #234 へ切り出し済み**（Issue #178 は
+  CORE-6 の充足で close する）。GPU 常駐コピーの f16 パックと f32 常駐の比較（ポインタ:
   `docs/spec/04-behavior/core-engine.md` CORE-16）であり、現状の GPU バックエンドは
   f16 パック常駐のみを実装していて GPU 側の f32 常駐対照経路が無いため実測不能。
   opt-in 時は理由を明示して `pass=false` とする（CPU 経路同士の f16/f32 比較は
@@ -182,5 +183,5 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
 | fail-closed / panic 禁止 | `unwrap`/`expect`/添字アクセスは使わない。wgpu のエラー・デバイスロスト・ポーリング失敗はすべて `Result` で伝播する |
 | 情報漏えい | エラー/イベント文字列にテナント ID・クエリ・adapter 製品名を含めない |
 | A05 設定ミス / CORE-12 | GPU 経路を強制・無効化する環境変数・feature flag を `src/` に設けない（`InstanceDescriptor::new_without_display_handle()`） |
-| A06/A08 依存・サプライチェーン | `=30.0.1` 完全固定、`Cargo.lock` コミット、`cargo deny` green。**オーナー承認は未取得。マージ条件とする** |
+| A06/A08 依存・サプライチェーン | `=30.0.1` 完全固定、`Cargo.lock` コミット、`cargo deny` green。オーナー承認済み（2026-08-26。承認記録は Issue #178 のコメント） |
 | `unsafe`（P1） | 追加しない。`tests/isa.rs` の走査テストで機械的に担保（`unsafe` トークンが `gpu_batch.rs` に存在しないことを含む） |

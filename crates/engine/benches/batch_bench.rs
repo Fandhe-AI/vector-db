@@ -280,6 +280,7 @@ fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, St
 
 /// CORE-16 ゲート（GPU 常駐コピーの f16 パック vs f32 常駐の p95 短縮率）。
 ///
+/// 本 ID は Issue #234 へ切り出し済み（Issue #178 は CORE-6 の充足で close）。
 /// 本 ID の A/B は **GPU バッチ経路上**の常駐形式比較であり（ポインタ:
 /// `docs/spec/04-behavior/core-engine.md` CORE-16。CPU-SIMD 経路への f16 適用は
 /// 本 ID の対象外）、現状の `gpu_batch.rs` は f16 パック常駐のみを実装していて

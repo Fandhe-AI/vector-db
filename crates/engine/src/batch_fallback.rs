@@ -545,8 +545,8 @@ impl FallbackBatchEngine {
     /// ポインタ）を primary として使うコンストラクタ。GPU デバイスの初期化に
     /// 失敗した場合（GPU 非搭載・ドライバ不整合等）は panic せず縮退イベントを
     /// 1 件通知して CPU 専用モードで構築が成立する（[`Self::build`] の契約と
-    /// 同じ。CORE-8: 初期化失敗からの縮退）。**依存追加はオーナー承認待ち**
-    /// （`crates/engine/Cargo.toml` コメント参照。マージ前に承認が必要）。
+    /// 同じ。CORE-8: 初期化失敗からの縮退）。`wgpu` 依存はオーナー承認済み
+    /// （2026-08-26。`crates/engine/Cargo.toml` コメント参照）。
     pub fn build_with_gpu(
         ids: &[u64],
         tenant_ids: &[String],

@@ -19,7 +19,7 @@ redb = "=4.2.0"
 
 # TASK-128〜130（Issue #178）: GPU バッチ経路（`gpu_batch.rs`）用の依存。
 # .claude/rules/dependency-policy.md の承認事項をここに記録する
-# （**この依存はまだオーナーの明示承認を得ていない。マージ前に承認が必要**）。
+# （**オーナー承認済み: 2026-08-26。Issue #178 のコメントに承認記録あり**）。
 #   - クレート: wgpu = "=30.0.1"（default-features = false）
 #   - 目的: Vulkan/Metal/DX12 を単一 API で扱うクロスプラットフォーム GPU
 #     compute。各 GPU API を自作 FFI で叩くと依存最小方針に反して肥大化する

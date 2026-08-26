@@ -2,7 +2,7 @@
 //! 16。ポインタ: Issue #178）。
 //!
 //! `batch_fallback.rs::BatchBackend` の公開差し替え点へ差し込む実装で、
-//! `wgpu`（=30.0.1・依存追加はオーナー承認待ち。`crates/engine/Cargo.toml`
+//! `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕。`crates/engine/Cargo.toml`
 //! コメント参照）を通じて Vulkan/Metal/DX12 の compute パイプラインを扱う。
 //! `batch_search.rs::ResidentMatrix`（f16 2 要素/u32 パック常駐行列）が保持する
 //! `packed()` バッファを GPU の STORAGE バッファへアップロードし、行 × クエリの
