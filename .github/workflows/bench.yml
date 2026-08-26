@@ -127,10 +127,12 @@ jobs:
         run: rustup show
       - name: Run bench-c1
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-83・SQL-1）が SSOT のため
-        # 本ワークフローにはハードコードしない。bench-parallel と同じ repo variables
-        # （BENCH_MAX_P95_MS・BENCH_MIN_RECALL）を再利用する。未設定の場合は
-        # `sql_c1_bench.rs` 側が fail-closed で非ゼロ終了する。
+        # 本ワークフローにはハードコードしない。bench-parallel の
+        # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
+        # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
+        # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
+        # 非ゼロ終了する。
         env:
-          BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
-          BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
+          BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
+          BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1

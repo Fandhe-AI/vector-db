@@ -25,9 +25,13 @@
 //! p95・Recall の pass/fail 自体は常に出力しつつ、条件7 の判定対象からは明示的に
 //! 除外する（silent skip にしない。`parallel_bench.rs` の CORE-5 opt-in と同一方針）。
 //!
-//! 数値基準（p95 上限・Recall 下限）は `parallel_bench.rs` と同じ環境変数
-//! （`BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL`）から注入する。spec が SSOT のため
-//! 本ファイルにはハードコードしない（`.claude/rules/spec-confidentiality.md`）。
+//! 数値基準（p95 上限・Recall 下限）は SQL-1 専用の環境変数
+//! （`BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`）から注入する。
+//! `parallel_bench.rs` の `BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL` は CORE-3・SEARCH-4・
+//! CORE-4（`SearchProvider` 単体）の基準であり、SQL 表層全体を対象とする SQL-1 の
+//! 基準とは spec 上の出所が異なるため、流用せず別 variable として分離する
+//! （流用すると緩い側で false green・厳しい側で false red になる）。spec が SSOT の
+//! ため本ファイルにはハードコードしない（`.claude/rules/spec-confidentiality.md`）。
 //! 標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しない
 //! （`parallel_bench.rs` と同一方針）。
 //!
@@ -81,32 +85,34 @@ const TABLE: &str = "documents";
 const COLUMN: &str = "embedding";
 const TENANT_ID: &str = "bench-tenant";
 
-/// `BENCH_MAX_P95_MS` 環境変数を読み取る（`parallel_bench.rs::max_p95_from_env` と
-/// 同一仕様。数値基準は spec が SSOT のためここにはデフォルト値を持たない）。
+/// `BENCH_SQL_C1_MAX_P95_MS` 環境変数を読み取る（検証仕様は
+/// `parallel_bench.rs::max_p95_from_env` と同一だが、SQL-1 の基準は provider 単体の
+/// CORE-3・SEARCH-4 とは別物のため variable 名を分ける。数値基準は spec が SSOT の
+///ためここにはデフォルト値を持たない）。
 fn max_p95_from_env() -> Result<Duration, String> {
-    let raw = std::env::var("BENCH_MAX_P95_MS")
-        .map_err(|_| "BENCH_MAX_P95_MS is not set (see .github/workflows/bench.yml vars)")?;
-    let millis: u64 = raw
-        .trim()
-        .parse()
-        .map_err(|_| "BENCH_MAX_P95_MS must be a positive integer (milliseconds)".to_string())?;
+    let raw = std::env::var("BENCH_SQL_C1_MAX_P95_MS")
+        .map_err(|_| "BENCH_SQL_C1_MAX_P95_MS is not set (see .github/workflows/bench.yml vars)")?;
+    let millis: u64 = raw.trim().parse().map_err(|_| {
+        "BENCH_SQL_C1_MAX_P95_MS must be a positive integer (milliseconds)".to_string()
+    })?;
     if millis == 0 {
-        return Err("BENCH_MAX_P95_MS must be greater than 0".to_string());
+        return Err("BENCH_SQL_C1_MAX_P95_MS must be greater than 0".to_string());
     }
     Ok(Duration::from_millis(millis))
 }
 
-/// `BENCH_MIN_RECALL` 環境変数を読み取る（`parallel_bench.rs::min_recall_from_env` と
-/// 同一仕様）。
+/// `BENCH_SQL_C1_MIN_RECALL` 環境変数を読み取る（検証仕様は
+/// `parallel_bench.rs::min_recall_from_env` と同一。CORE-4 の Recall 基準と混同しない
+/// よう SQL-1 専用の variable 名にする）。
 fn min_recall_from_env() -> Result<f64, String> {
-    let raw = std::env::var("BENCH_MIN_RECALL")
-        .map_err(|_| "BENCH_MIN_RECALL is not set (see .github/workflows/bench.yml vars)")?;
+    let raw = std::env::var("BENCH_SQL_C1_MIN_RECALL")
+        .map_err(|_| "BENCH_SQL_C1_MIN_RECALL is not set (see .github/workflows/bench.yml vars)")?;
     let value: f64 = raw
         .trim()
         .parse()
-        .map_err(|_| "BENCH_MIN_RECALL must be a floating-point number".to_string())?;
+        .map_err(|_| "BENCH_SQL_C1_MIN_RECALL must be a floating-point number".to_string())?;
     if !(value > 0.0 && value <= 1.0) {
-        return Err("BENCH_MIN_RECALL must be within (0.0, 1.0]".to_string());
+        return Err("BENCH_SQL_C1_MIN_RECALL must be within (0.0, 1.0]".to_string());
     }
     Ok(value)
 }
@@ -221,7 +227,7 @@ fn main() {
     let p95 = p95_from_samples(&measurement.samples).expect("non-empty samples must yield a p95");
     let p95_ok = check_p95_within_limit(p95, max_p95);
     passed &= p95_ok;
-    // limit（BENCH_MAX_P95_MS の実測値）は意図的にログへ出力しない（`parallel_bench.rs`
+    // limit（BENCH_SQL_C1_MAX_P95_MS の実測値）は意図的にログへ出力しない（`parallel_bench.rs`
     // と同一方針。モジュール冒頭コメント参照）。
     println!(
         "p95_latency(sql_c1): rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} pass={p95_ok}",

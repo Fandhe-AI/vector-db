@@ -46,7 +46,7 @@ end-to-end 再測定は TASK-165 の管轄とする。
 | データ | 100,000 行 × 768 次元・k=20（決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
 | プロトコル | `harness::protocol::run`（warmup 20・計測 50・決定的シード）→ `harness::accept::p95_from_samples` / `check_p95_within_limit`。Recall@20 は `CpuScalarProvider`（厳密最近傍の独立オラクル）との Top-20 一致率を 20 クエリの worst-query で判定 |
 | 診断 A/B | `harness::ab::run_ab` で SQL 表層 vs `EngineCore::search` を interleaved 計測し `median_ratio` を出力（**合否には含めない**。SQL 表層オーバーヘッドの切り分け材料。ただし `EngineCore::search` 側は `PrefilterCache`〔TASK-169〕を経由するため、テーブル内容が変わらない本ベンチでは初回以降キャッシュがウォームな状態で計測される——`median_ratio` は「SQL 表層のコールドな arena 再構築」と「キャッシュヒット時の `EngineCore::search`」の比であり、両経路の候補デコード実装そのものを対称条件で比較した値ではない点に注意） |
-| 閾値注入 | `BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL`（`parallel_bench.rs` と共通の repo variables）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
+| 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`parallel_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
 | 専有環境の宣言 | `BENCH_DEDICATED_ENV=1` の opt-in フラグ。未設定（既定）では「専有環境として宣言されていない」ことを明示し、条件7 の判定対象から除外する（p95/Recall 自体の pass/fail は常に出力） |
 | CI 対象 | `tests/c1_bench_accept.rs`（`make ci` 対象）が SQL 文字列生成・識別子検証・往復性・環境記録の非 panic のみを時間非依存に検証する。時間依存の実測（`bench-c1`）は `.github/workflows/bench.yml` の `workflow_dispatch` 限定ジョブから実行し、schedule には含めない |
 
@@ -76,9 +76,9 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
 
 代わりに、以下 2 点を本 PR 内で検証した:
 
-1. **fail-closed の動作確認**: `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` 未設定・
-   `BENCH_MAX_P95_MS=0`・`BENCH_MIN_RECALL=1.5` のいずれでも、データ投入前に
-   非ゼロ終了することを確認した。
+1. **fail-closed の動作確認**: `BENCH_SQL_C1_MAX_P95_MS`／`BENCH_SQL_C1_MIN_RECALL`
+   未設定・`BENCH_SQL_C1_MAX_P95_MS=0`・`BENCH_SQL_C1_MIN_RECALL=1.5` のいずれでも、
+   データ投入前に非ゼロ終了することを確認した。
 2. **計測経路の疎通確認**: 行数・次元・k を大幅に縮小した構成（200 行・8 次元・k=5）
    で `make bench-c1` 相当のバイナリを実行し、以下が正しく動作することを確認した
    （検証後、本コミットの内容は元の本番定数（100,000 行・768 次元・k=20）へ戻して
@@ -120,8 +120,8 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
    ドキュメントに書かない）:
 
    ```bash
-   BENCH_MAX_P95_MS=<spec 値> \
-   BENCH_MIN_RECALL=<spec 値> \
+   BENCH_SQL_C1_MAX_P95_MS=<spec 値> \
+   BENCH_SQL_C1_MIN_RECALL=<spec 値> \
    BENCH_DEDICATED_ENV=1 \
    make bench-c1
    ```
