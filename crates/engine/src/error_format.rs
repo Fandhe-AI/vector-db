@@ -135,20 +135,25 @@ impl ErrorClass {
 /// 同じ規約を適用する。2 箇所が独立の値を持って乖離することを構造的に防ぐ）。
 pub(crate) const MAX_MESSAGE_LEN: usize = 200;
 
+/// 切り詰めたことを示す省略記号。長さは [`MAX_MESSAGE_LEN`] の内数として確保する。
+const ELLIPSIS: &str = "...";
+
 /// 文字境界で安全に切り詰める（マルチバイト文字の途中で切らない）。添字直接アクセス
 /// をせず `get()` で明示的に処理する（`.claude/rules/coding-rust.md`「untrusted 入力の
-/// 扱い」）。
+/// 扱い」）。省略記号を含めた返値全体が [`MAX_MESSAGE_LEN`] バイトを超えないよう、
+/// prefix の上限から省略記号分を差し引く（上限が「メッセージ全体の長さ」を意味する
+/// 契約を実装側でも守る。codex-review P1 指摘対応）。
 fn truncate_message(s: &str) -> String {
     if s.len() <= MAX_MESSAGE_LEN {
         return s.to_string();
     }
-    let mut end = MAX_MESSAGE_LEN;
+    let mut end = MAX_MESSAGE_LEN.saturating_sub(ELLIPSIS.len());
     while end > 0 && !s.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
     match s.get(..end) {
-        Some(prefix) => format!("{prefix}..."),
-        None => "...".to_string(),
+        Some(prefix) => format!("{prefix}{ELLIPSIS}"),
+        None => ELLIPSIS.to_string(),
     }
 }
 
