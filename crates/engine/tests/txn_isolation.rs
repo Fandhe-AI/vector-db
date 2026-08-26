@@ -57,8 +57,20 @@ fn table3_write_txn_commits_multiple_rows_atomically_via_single_open_table() {
     txn.put(2, &row(&[2.0], b"b")).expect("second put in txn");
     txn.commit().expect("commit multi-row write txn");
 
-    assert_eq!(storage.get(1).expect("row 1 committed").metadata, b"a");
-    assert_eq!(storage.get(2).expect("row 2 committed").metadata, b"b");
+    assert_eq!(
+        storage
+            .get("tenant-a", 1)
+            .expect("row 1 committed")
+            .metadata,
+        b"a"
+    );
+    assert_eq!(
+        storage
+            .get("tenant-a", 2)
+            .expect("row 2 committed")
+            .metadata,
+        b"b"
+    );
 }
 
 // 対象ビヘイビア: TABLE-3（詳細は関数名・ポインタ: docs/spec/04-behavior/data-model.md）。
@@ -74,7 +86,7 @@ fn table3_write_txn_abort_discards_uncommitted_writes() {
     txn.abort().expect("abort write txn");
 
     let err = storage
-        .get(1)
+        .get("tenant-a", 1)
         .expect_err("aborted write must not be visible");
     assert!(
         matches!(err, StorageError::NotFound(_)),
@@ -100,7 +112,7 @@ fn table3_write_txn_drop_without_commit_or_abort_auto_aborts() {
     }
 
     let err = storage
-        .get(1)
+        .get("tenant-a", 1)
         .expect_err("dropped-without-commit write must not be visible");
     assert!(
         matches!(err, StorageError::NotFound(_)),
@@ -116,7 +128,10 @@ fn table3_write_txn_drop_without_commit_or_abort_auto_aborts() {
         .expect("put after drop");
     next_txn.commit().expect("commit after drop");
     assert_eq!(
-        storage.get(2).expect("row 2 committed").metadata,
+        storage
+            .get("tenant-a", 2)
+            .expect("row 2 committed")
+            .metadata,
         b"after-drop"
     );
 }
@@ -208,8 +223,20 @@ fn table3_begin_write_serializes_concurrent_writers_via_public_txn_api() {
     );
 
     // 両方のコミットが反映されていること。
-    assert_eq!(storage.get(1).expect("row 1 committed").metadata, b"first");
-    assert_eq!(storage.get(2).expect("row 2 committed").metadata, b"second");
+    assert_eq!(
+        storage
+            .get("tenant-a", 1)
+            .expect("row 1 committed")
+            .metadata,
+        b"first"
+    );
+    assert_eq!(
+        storage
+            .get("tenant-a", 2)
+            .expect("row 2 committed")
+            .metadata,
+        b"second"
+    );
 }
 
 // 対象ビヘイビア: TABLE-3（詳細は関数名・ポインタ: docs/spec/04-behavior/data-model.md）。
@@ -240,14 +267,14 @@ fn table3_read_snapshot_does_not_see_later_commits_or_uncommitted_writes() {
 
     // 事前に存在した行はスナップショットから見える。
     let seen = snapshot
-        .get(1)
+        .get("tenant-a", 1)
         .expect("pre-existing row visible in snapshot");
     assert_eq!(seen.metadata, b"pre-existing");
 
     // スナップショット開始後にコミットされた行は、このスナップショットからは見えない
     // （スナップショットが開始時点の状態に固定されていることの確認）。
     let err = snapshot
-        .get(2)
+        .get("tenant-a", 2)
         .expect_err("row committed after snapshot start must not be visible to it");
     assert!(
         matches!(err, StorageError::NotFound(_)),
@@ -258,7 +285,7 @@ fn table3_read_snapshot_does_not_see_later_commits_or_uncommitted_writes() {
     // （後続の読み取りはコミット済み最新状態を見る）。
     let fresh_snapshot = storage.begin_read().expect("begin fresh read snapshot");
     let fresh = fresh_snapshot
-        .get(2)
+        .get("tenant-a", 2)
         .expect("row 2 must be visible to a snapshot opened after commit");
     assert_eq!(fresh.metadata, b"committed-after-snapshot");
 }
@@ -299,7 +326,7 @@ fn table3_read_snapshot_does_not_see_uncommitted_write_from_open_write_txn() {
         .begin_read()
         .expect("begin read snapshot while write is pending");
     let err = snapshot
-        .get(2)
+        .get("tenant-a", 2)
         .expect_err("uncommitted row must not be visible to a snapshot reader");
     assert!(
         matches!(err, StorageError::NotFound(_)),

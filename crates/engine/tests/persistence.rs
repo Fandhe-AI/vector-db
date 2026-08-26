@@ -16,9 +16,10 @@ use std::time::Duration;
 use engine::storage::{RowInput, Storage, StorageError, Visibility};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 
-/// `Storage` 内部の行テーブルと同一の名前・型（キー: 行 ID、値: エンコード済みバイト列）。
-/// テスト側は行の中身を解釈しないため、値のエンコード詳細に依存しない。
-const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
+/// `Storage` 内部の行テーブルと同一の名前・型（キー: `(tenant_id, id)` 複合キー
+/// （対象ビヘイビア: TABLE-12）、値: エンコード済みバイト列）。テスト側は行の中身を
+/// 解釈しないため、値のエンコード詳細に依存しない。
+const ROWS_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("rows");
 
 // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
 // `crates/engine/src/test_util/temp_db.rs` へ一本化した。
@@ -69,11 +70,14 @@ fn persist1_uncommitted_write_is_discarded_and_committed_data_survives_reopen() 
             // （テーブル名が食い違うと、以降の「abort 後に行 2 が消えている」検証が
             // 別テーブルを見ているだけの偽陽性になり得るため）。
             assert!(
-                table.get(1u64).expect("get row 1 via raw handle").is_some(),
+                table
+                    .get(("tenant-a", 1u64))
+                    .expect("get row 1 via raw handle")
+                    .is_some(),
                 "raw Database handle must see the row committed via Storage"
             );
             table
-                .insert(2u64, &b""[..])
+                .insert(("tenant-a", 2u64), &b""[..])
                 .expect("insert into uncommitted txn");
         }
         write_txn.abort().expect("abort uncommitted txn");
@@ -82,7 +86,9 @@ fn persist1_uncommitted_write_is_discarded_and_committed_data_survives_reopen() 
     // 3. Storage で再オープンし、コミット済みの行 1 は無傷、中断した行 2 は存在しないこと
     //    を確認する。
     let storage = Storage::open(&path).expect("reopen storage");
-    let committed = storage.get(1).expect("row 1 must survive reopen");
+    let committed = storage
+        .get("tenant-a", 1)
+        .expect("row 1 must survive reopen");
     assert_eq!(committed.embedding, vec![1.0, 2.0, 3.0]);
     assert_eq!(committed.metadata, b"committed");
 
@@ -90,7 +96,7 @@ fn persist1_uncommitted_write_is_discarded_and_committed_data_survives_reopen() 
     // ケースが Codec エラー等の別理由の失敗と混同されて誤って pass するのを防ぐ
     // （`is_err()` だけでは区別できない）。
     let err = storage
-        .get(2)
+        .get("tenant-a", 2)
         .expect_err("aborted write must not be visible after reopen");
     assert!(
         matches!(err, StorageError::NotFound(_)),
@@ -135,12 +141,14 @@ fn persist2_incremental_write_preserves_existing_rows() {
 
     // 既存データが増分書き込みの影響を受けていないこと（再構築されていないこと）を
     // スポットチェックする。
-    let preserved = storage.get(10).expect("original row must remain readable");
+    let preserved = storage
+        .get("tenant-a", 10)
+        .expect("original row must remain readable");
     assert_eq!(preserved.embedding, vec![10.0]);
     assert_eq!(preserved.metadata, b"initial");
 
     let appended = storage
-        .get(65)
+        .get("tenant-a", 65)
         .expect("incrementally written row must be readable");
     assert_eq!(appended.embedding, vec![65.0]);
     assert_eq!(appended.metadata, b"incremental");
@@ -175,7 +183,7 @@ fn persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure() {
     // `NotFound` まで確認することで、「読み取り自体が別の理由で失敗した」ケースと
     // 区別する（`is_err()` だけでは Backend エラー等も誤って合格し得るため）。
     for id in [1u64, 2, 4] {
-        let err = storage.get(id).expect_err(&format!(
+        let err = storage.get("tenant-a", id).expect_err(&format!(
             "row {id} must not be visible after the batch transaction was discarded"
         ));
         assert!(
@@ -214,7 +222,9 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
         let write_txn = writer_db.begin_write().expect("begin write txn");
         {
             let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
-            table.insert(2u64, &b""[..]).expect("insert row 2");
+            table
+                .insert(("tenant-a", 2u64), &b""[..])
+                .expect("insert row 2");
         }
         // 挿入済みだが未コミットである旨をメインスレッドへ通知し、コミット許可を待つ。
         writer_ready_tx.send(()).expect("signal writer ready");
@@ -238,11 +248,11 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
             .open_table(ROWS_TABLE)
             .expect("open table for read");
         assert!(
-            table.get(1u64).expect("get row 1").is_some(),
+            table.get(("tenant-a", 1u64)).expect("get row 1").is_some(),
             "pre-existing committed row must be visible"
         );
         assert!(
-            table.get(2u64).expect("get row 2").is_none(),
+            table.get(("tenant-a", 2u64)).expect("get row 2").is_none(),
             "uncommitted row must not be visible to a snapshot reader"
         );
     }
@@ -313,7 +323,10 @@ fn persist4_writes_are_serialized_and_reads_see_snapshot() {
         .open_table(ROWS_TABLE)
         .expect("open table for read");
     assert!(
-        table.get(2u64).expect("get row 2 after commit").is_some(),
+        table
+            .get(("tenant-a", 2u64))
+            .expect("get row 2 after commit")
+            .is_some(),
         "row committed by the first writer must be visible after commit"
     );
 }
@@ -333,7 +346,7 @@ fn storage_get_rejects_corrupted_row_bytes() {
             let mut table = write_txn.open_table(ROWS_TABLE).expect("open table");
             // version バイトのみで、後続のフィールドが一切ないバイト列（意図的な破損）。
             table
-                .insert(1u64, &[1u8][..])
+                .insert(("tenant-a", 1u64), &[1u8][..])
                 .expect("insert malformed row");
         }
         write_txn.commit().expect("commit malformed row");
@@ -341,7 +354,7 @@ fn storage_get_rejects_corrupted_row_bytes() {
 
     let storage = Storage::open(&path).expect("reopen storage");
     let err = storage
-        .get(1)
+        .get("tenant-a", 1)
         .expect_err("malformed row must be rejected, not decoded with defaults");
     // `NotFound` ではなく、デコードそのものが拒否されたことを確認する
     // （テーブル名の取り違え等で行が別テーブルへ書かれてしまった場合、
@@ -386,17 +399,23 @@ fn persist3_reopen_roundtrip_via_get_and_scan() {
 
     let storage = Storage::open(&path).expect("reopen storage");
 
-    let row1 = storage.get(1).expect("row 1 must survive reopen");
+    let row1 = storage
+        .get("tenant-a", 1)
+        .expect("row 1 must survive reopen");
     assert_eq!(row1.tenant_id, "tenant-a");
     assert_eq!(row1.visibility, Visibility::Public);
     assert_eq!(row1.metadata, b"a-public");
 
-    let row2 = storage.get(2).expect("row 2 must survive reopen");
+    let row2 = storage
+        .get("tenant-a", 2)
+        .expect("row 2 must survive reopen");
     assert_eq!(row2.tenant_id, "tenant-a");
     assert_eq!(row2.visibility, Visibility::Private);
     assert_eq!(row2.metadata, b"a-private");
 
-    let row3 = storage.get(3).expect("row 3 must survive reopen");
+    let row3 = storage
+        .get("tenant-b", 3)
+        .expect("row 3 must survive reopen");
     assert_eq!(row3.tenant_id, "tenant-b");
     assert_eq!(row3.visibility, Visibility::Public);
     assert_eq!(row3.metadata, b"b-public");
@@ -458,7 +477,10 @@ fn persist3_on_disk_row_entry_layout_via_raw_redb() {
     );
 
     let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
-    let guard = table.get(1u64).expect("get row 1").expect("row 1 exists");
+    let guard = table
+        .get(("tenant-x", 1u64))
+        .expect("get row 1")
+        .expect("row 1 exists");
     let raw = guard.value();
 
     // レイアウト: [version(1)][tenant_len(2) le]["tenant-x"(8)][visibility(1)]...
