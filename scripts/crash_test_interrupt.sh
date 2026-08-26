@@ -93,17 +93,25 @@ assert_no_survivor() {
     waited=$((waited + 1))
   done
   if kill -0 "${writer_pid}" 2>/dev/null; then
-    # /proc 経由（Linux）で確実に crash_tool であることを確認してから後始末する
-    # （PID 再利用により無関係なプロセスへ誤って kill しないための最終確認）。
+    # PID が生存していても、それが本当に writer（crash_tool write）とは限らない。
+    # writer が SIGKILL で停止・reap された直後の SURVIVOR_GRACE_TENTHS
+    # （約 2 秒）のうちに OS が同じ PID を無関係なプロセスへ再利用しうるため、
+    # /proc 経由（Linux。無ければ ps）で cmdline を照合して同一性を確かめる。
     local cmdline=""
     if [ -r "/proc/${writer_pid}/cmdline" ]; then
       cmdline="$(tr '\0' ' ' < "/proc/${writer_pid}/cmdline" 2>/dev/null)"
     else
       cmdline="$(ps -o command= -p "${writer_pid}" 2>/dev/null)"
     fi
-    if [[ "${cmdline}" == *crash_tool* ]]; then
-      kill -9 "${writer_pid}" 2>/dev/null
+    if [[ "${cmdline}" != *crash_tool* ]]; then
+      # PID 再利用で別プロセスを掴んだ場合。writer 自体は停止済みであり
+      # survivor は無いので成功扱いとする（無関係なプロセスを kill せず、
+      # かつ Issue #134 の regression と誤判定して赤 CI にもしない）。
+      return 0
     fi
+    # cmdline が crash_tool を含む＝writer が実際に生き残っている。後始末に
+    # SIGKILL してから regression として失敗させる（kill と判定を同一条件に揃える）。
+    kill -9 "${writer_pid}" 2>/dev/null
     return 1
   fi
   return 0

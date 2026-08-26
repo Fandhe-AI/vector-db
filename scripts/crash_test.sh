@@ -98,6 +98,11 @@ trap 'cleanup; exit 130' INT TERM
 #   - プロセスグループへの SIGTERM（`set -m` 下・端末の Ctrl+C 相当）:
 #     ( set -m; scripts/crash_test.sh 100 & pid=$!; sleep 5; kill -TERM -- "-$pid"; wait "$pid" )
 #     → 同様に survivor 無しであることを確認する
+
+# 以下の 1 行は単なる進捗表示ではなく、scripts/crash_test_interrupt.sh が
+# `sed -n 's/^workdir: //p'` で WORKDIR を取り出し「中断後に削除されたか」を
+# 判定するための契約（load-bearing）。書式（行頭 `workdir: ` + パス）を変更する
+# 場合は crash_test_interrupt.sh のパースも併せて更新すること。
 echo "workdir: ${WORKDIR}"
 DB_PATH="${WORKDIR}/crash_test.redb"
 WRITE_LOG="${WORKDIR}/write.log"
