@@ -10,6 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
+use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
@@ -94,16 +95,11 @@ pub enum SqlSurfaceError {
 
 impl SqlSurfaceError {
     /// ERR-2（docs/spec/04-behavior/error-format.md）の wire_code 写像。
+    /// TASK-152 で単一真実源化した [`ClassifiedError::wire_code`] へ委譲する
+    /// （既存の返値は 1 つも変えない。委譲先は `error_class()` の `match` のみを
+    /// 単一の判定点として持つ）。
     pub fn wire_code(&self) -> &'static str {
-        match self {
-            SqlSurfaceError::UnsupportedSyntax { .. } => "42601",
-            SqlSurfaceError::UndefinedTable { .. } => "42P01",
-            SqlSurfaceError::Internal { .. } => "XX000",
-            SqlSurfaceError::InvalidInput { .. } => "22000",
-            SqlSurfaceError::PayloadTooLarge { .. } => "54000",
-            SqlSurfaceError::MissingOperationId => "23502",
-            SqlSurfaceError::IdConflict => "23505",
-        }
+        ClassifiedError::wire_code(self)
     }
 
     /// クライアント（wire 層 `ErrorResponse`）へそのまま返してよい文言を返す。
@@ -112,12 +108,10 @@ impl SqlSurfaceError {
     /// 通常の `Display` 文言（テナント越境の存在情報を含まないよう各コンストラクタ
     /// 側で既に切り詰め・一般化済み）をそのまま返す（security.md P0「private
     /// 情報の漏えい」対応。`wire-server::simple_query` はエラー応答の整形時に
-    /// `to_string()` ではなく必ずこちらを使うこと）。
+    /// `to_string()` ではなく必ずこちらを使うこと）。TASK-152 で
+    /// [`ClassifiedError::client_message`] へ委譲する（返値は不変）。
     pub fn client_message(&self) -> String {
-        match self {
-            SqlSurfaceError::Internal { .. } => "internal error".to_string(),
-            other => other.to_string(),
-        }
+        ClassifiedError::client_message(self)
     }
 
     /// `pub(crate)`: `sql::allowlist::Parser::parse_operation_id_clause`・
@@ -157,6 +151,33 @@ impl SqlSurfaceError {
     pub(crate) fn payload_too_large(detail: impl Into<String>) -> Self {
         SqlSurfaceError::PayloadTooLarge {
             detail: truncate_for_error(&detail.into()),
+        }
+    }
+}
+
+/// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
+/// variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で一致させ、
+/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり
+/// `operation_id` 重複ではないが、既存契約が同一 `wire_code`（`23505`）を
+/// 返すため `DuplicateOperationId` へ写像する。分類名の整合は別途スコープ外
+/// として追跡する）。
+impl ClassifiedError for SqlSurfaceError {
+    fn error_class(&self) -> ErrorClass {
+        match self {
+            SqlSurfaceError::UnsupportedSyntax { .. } => ErrorClass::UnsupportedSqlSyntax,
+            SqlSurfaceError::UndefinedTable { .. } => ErrorClass::TableNotFound,
+            SqlSurfaceError::Internal { .. } => ErrorClass::InternalError,
+            SqlSurfaceError::InvalidInput { .. } => ErrorClass::InvalidInput,
+            SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
+            SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
+            SqlSurfaceError::IdConflict => ErrorClass::DuplicateOperationId,
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            SqlSurfaceError::Internal { .. } => "internal error".to_string(),
+            other => other.to_string(),
         }
     }
 }

@@ -31,6 +31,11 @@
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
 //!
+//! TASK-152（対象ビヘイビア: ERR-2）: `allowlist::SqlSurfaceError` の `wire_code` 写像は
+//! [`crate::error_format`]（`ErrorClass`・`ClassifiedError` trait）へ委譲する。本モジュール
+//! の公開シグネチャ・返値は変更しない（詳細は `error_format.rs` モジュールドキュメント
+//! 参照）。
+//!
 //! TASK-161（対象ビヘイビア: SQL-12）: クエリ単位の専用句 `USING MODE '<literal>'`
 //! （[`allowlist`]）とセッション変数 `SET search_mode = '<literal>'`（同）を追加し、
 //! 優先順位（クエリ句 > セッション変数 > 既定）の解決を [`mode::resolve_mode`] に

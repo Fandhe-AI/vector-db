@@ -141,6 +141,12 @@
 //! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
 //! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
 //! モジュールドキュメント参照）。
+//!
+//! TASK-152（対象ビヘイビア: ERR-2）: `error_format.rs` が `wire_code` 写像の
+//! 単一真実源（`ErrorClass`・`ClassifiedError` trait・`WireError`）を提供する。
+//! `sql::allowlist::SqlSurfaceError`・`tenant::TenantWriteError` はこれへ委譲し、
+//! 既存の `wire_code()` 返値は変更しない（詳細は `error_format.rs` モジュール
+//! ドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -151,6 +157,7 @@ pub mod chunking;
 pub mod core;
 pub mod declarative_filter;
 pub mod dispatch;
+pub mod error_format;
 pub mod hybrid;
 pub mod isa;
 pub mod kernel;

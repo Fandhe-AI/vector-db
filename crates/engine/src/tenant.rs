@@ -267,15 +267,34 @@ impl TenantWriteError {
     /// SQLSTATE 風 `wire_code`（coding-rust.md「エラー型は SQLSTATE 風 wire_code の設計に
     /// 従う」）。対象ビヘイビア: RECOVER-4・ERR-2（`docs/spec/04-behavior/error-format.md`
     /// をポインタ参照。写像の具体値・採用理由は spec 側の管理事項であり、本コメントへは
-    /// 転記しない。spec-confidentiality.md 参照）。
+    /// 転記しない。spec-confidentiality.md 参照）。TASK-152 で単一真実源化した
+    /// [`crate::error_format::ErrorClass`] へ委譲する（既存の返値は 1 つも変えない）。
     pub fn wire_code(&self) -> &'static str {
+        crate::error_format::ClassifiedError::wire_code(self)
+    }
+}
+
+/// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`crate::error_format::ErrorClass`]
+/// へ委譲する。variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で
+/// 一致させ、委譲化で応答コードを変えない。
+impl crate::error_format::ClassifiedError for TenantWriteError {
+    fn error_class(&self) -> crate::error_format::ErrorClass {
+        use crate::error_format::ErrorClass;
         match self {
-            TenantWriteError::Forbidden => "42501",
-            TenantWriteError::NotFound => "P0002",
-            TenantWriteError::IdConflict => "23505",
-            TenantWriteError::MissingOperationId => "23502",
-            TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
+            TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
+            TenantWriteError::NotFound => ErrorClass::RowNotFound,
+            TenantWriteError::IdConflict => ErrorClass::DuplicateOperationId,
+            TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
+            TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => {
+                ErrorClass::InternalError
+            }
         }
+    }
+
+    /// `Display` は既にテナント境界の秘匿契約（テナント ID・行 id・テーブル名を
+    /// 含めない。上記 struct doc 参照）を満たしているため、そのまま返す。
+    fn client_message(&self) -> String {
+        self.to_string()
     }
 }
 
