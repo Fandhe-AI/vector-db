@@ -238,10 +238,20 @@ pub enum OrderByForm {
 /// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Expression`
 /// variant を追加した（宣言的 UDF・組み込み関数呼び出しを含む比較式
 /// `<expr> <cmp> <expr>`。式の意味論検証は `sql::parser::bind_in_session` の責務）。
+///
+/// **TASK-147（EXT-3）で追加した破壊的変更（BREAKING CHANGE）**: `Prefix` variant
+/// を追加した（`<col> LIKE '<prefix>%'` の前方一致条件。網羅的 `match` を持つ
+/// 外部コードは要対応）。パターン文字列は無加工で保持し、意味論的な検証
+/// （末尾 `%` のみ許可・空 prefix 拒否等）は `declarative_filter::parse_prefix_pattern`
+/// （`sql::parser::bind_in_session` から呼ばれる）の責務とする。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WherePredicate {
     /// 列と文字列リテラルの等価条件（TASK-75: リテラル値を保持する）。
     Equality { column: String, value: String },
+    /// 前方一致条件（TASK-147・EXT-3）。`LIKE` は [`Keyword`] へ追加せず、TASK-80 と
+    /// 同じ「`Token::Ident` をパーサー位置でのみ文脈照合」方式にして `like` という
+    /// 列名を壊さない（[`Parser::parse_where`] 参照）。
+    Prefix { column: String, pattern: String },
     /// 許可された名前の述語呼び出し形（空引数）。
     PredicateCall { name: String },
     /// 式の比較述語（TASK-79・SQL-9）。`Expr::Binary` の比較演算子（`> < >= <= =`）
@@ -631,17 +641,21 @@ impl<'a> Parser<'a> {
         Ok(SelectItem::Column(self.expect_ident()?))
     }
 
-    /// WHERE 句の許可形状（等価条件・述語呼び出し形・TASK-79（SQL-9）で追加した
-    /// 式の比較述語 `<expr> <cmp> <expr>` の 3 種。`OR`・括弧によるネストは
-    /// 引き続き許可しない）。述語呼び出し形は許可された名前
+    /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
+    /// TASK-79（SQL-9）で追加した式の比較述語 `<expr> <cmp> <expr>` の 4 種。
+    /// `OR`・括弧によるネストは引き続き許可しない）。述語呼び出し形は許可された名前
     /// （[`is_allowed_where_predicate_name`]）のみを受理し、未知の名前は拒否する。
     ///
-    /// 既存 2 形との曖昧さ回避: 先頭が `ident '=' <string literal>` なら等価条件、
-    /// `ident '(' ')'`（許可名のみ）なら述語呼び出し形として確定的に判定し、
-    /// いずれにも一致しない場合のみ式の比較述語として再解析する（`pos` を
-    /// 巻き戻してから解析し直す。式文法の `primary` は `ident '(' <args> ')'` も
-    /// 受理するため、`visible()` 以外の名前の呼び出し形はここで初めて式として
-    /// 解釈される）。
+    /// 既存形との曖昧さ回避: 先頭が `ident '=' <string literal>` なら等価条件、
+    /// `ident <文脈的 'LIKE'> <string literal>` なら前方一致条件、`ident '(' ')'`
+    /// （許可名のみ）なら述語呼び出し形として確定的に判定し、いずれにも一致しない
+    /// 場合のみ式の比較述語として再解析する（`pos` を巻き戻してから解析し直す。
+    /// 式文法の `primary` は `ident '(' <args> ')'` も受理するため、`visible()`
+    /// 以外の名前の呼び出し形はここで初めて式として解釈される）。`LIKE` は
+    /// [`Keyword`] へ追加せず `Token::Ident` を本メソッド内でのみ文脈的に照合する
+    /// （TASK-80 と同じ方式。`like` という列名の等価条件を壊さない）。`NOT LIKE`・
+    /// `ILIKE`・`LIKE` の右辺が非リテラルの各形は、この確定判定に一致しないため
+    /// 式述語フォールバックへ流れ、通常は `42601` で拒否される。
     fn parse_where(&mut self) -> Result<Vec<WherePredicate>, SqlSurfaceError> {
         let mut predicates = Vec::new();
         loop {
@@ -657,6 +671,17 @@ impl<'a> Parser<'a> {
                     predicates.push(WherePredicate::Equality {
                         column: name,
                         value,
+                    });
+                    matched_legacy = true;
+                } else if matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("LIKE"))
+                    && matches!(self.tokens.get(self.pos + 2), Some(Token::StringLiteral(_)))
+                {
+                    self.advance();
+                    self.advance();
+                    let pattern = self.expect_string_literal()?;
+                    predicates.push(WherePredicate::Prefix {
+                        column: name,
+                        pattern,
                     });
                     matched_legacy = true;
                 } else if is_allowed_where_predicate_name(&name)
