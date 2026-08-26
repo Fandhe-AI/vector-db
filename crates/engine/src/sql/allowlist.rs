@@ -193,10 +193,8 @@ impl SqlSurfaceError {
 
 /// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
 /// variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で一致させ、
-/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり
-/// `operation_id` 重複ではないが、既存契約が同一 `wire_code`（`23505`）を
-/// 返すため `DuplicateOperationId` へ写像する。分類名の整合は別途スコープ外
-/// として追跡する）。
+/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり、原因を問わない
+/// 一意制約違反の分類 [`ErrorClass::UniqueViolation`]（`23505`）へ写像する）。
 impl ClassifiedError for SqlSurfaceError {
     fn error_class(&self) -> ErrorClass {
         match self {
@@ -206,7 +204,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::InvalidInput { .. } => ErrorClass::InvalidInput,
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
-            SqlSurfaceError::IdConflict => ErrorClass::DuplicateOperationId,
+            SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
         }
     }

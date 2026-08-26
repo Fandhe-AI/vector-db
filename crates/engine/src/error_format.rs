@@ -85,9 +85,12 @@ define_error_classes! {
     /// 指定した行が存在しない（`P0002`）。[`crate::tenant::TenantWriteError::NotFound`]
     /// の写像。
     RowNotFound => ("P0002", "ROW_NOT_FOUND"),
-    /// 一意制約の衝突（`23505`）。[`crate::tenant::TenantWriteError::IdConflict`]・
-    /// [`crate::sql::allowlist::SqlSurfaceError::IdConflict`] の写像。
-    DuplicateOperationId => ("23505", "DUPLICATE_OPERATION_ID"),
+    /// 一意制約の衝突（`23505`）。行キー `(tenant_id, id)` の衝突
+    /// （[`crate::tenant::TenantWriteError::IdConflict`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::IdConflict`]）と、`operation_id` の
+    /// 重複（TASK-93 の台帳）が共通で属する分類。原因を限定した命名にすると
+    /// 別原因の衝突を誤った意味論で運ぶため、`23505` の意味そのもので命名する。
+    UniqueViolation => ("23505", "UNIQUE_VIOLATION"),
     /// `USING OPERATION_ID` 句の省略（`23502`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::MissingOperationId`]・
     /// [`crate::tenant::TenantWriteError::MissingOperationId`] の写像。

@@ -294,7 +294,7 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
         match self {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
-            TenantWriteError::IdConflict => ErrorClass::DuplicateOperationId,
+            TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
             TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
             TenantWriteError::Catalog(_)
             | TenantWriteError::Storage(_)
