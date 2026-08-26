@@ -181,6 +181,13 @@ pub(crate) fn write_error_response_io(
     write_error_response(stream, sqlstate, message).map_err(io::Error::from)
 }
 
+/// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
+/// 本モジュール限定の `handshake::Result` を扱えないため、`ReadyForQuery` を
+/// 送出する唯一の経路としてこの関数を `pub(crate)` にする。
+pub(crate) fn write_ready_for_query_io(stream: &mut TcpStream) -> io::Result<()> {
+    write_ready_for_query(stream).map_err(io::Error::from)
+}
+
 fn write_error_response(stream: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {
     let mut body = Vec::new();
     body.push(b'S');
@@ -324,23 +331,34 @@ fn read_password_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Ok(password.to_vec())
 }
 
-/// 認証成功後の最小メッセージループ。簡易クエリ（'Q'）には未実装エラー
-/// （SQLSTATE `0A000`）を返してループを継続し、Terminate（'X'）で正常終了する。
-/// それ以外の型（拡張クエリプロトコル等）は `protocol_dispatch` へ委譲し、
-/// fail-closed でエラー応答後に接続を切断する（TASK-71・WIRE-8 で正式化済み）。
+/// 認証成功後の最小メッセージループ。`engine` が `Some` の場合、簡易クエリ
+/// （'Q'）は UTF-8 検証後 [`crate::simple_query::execute_and_respond`] へ委譲し、
+/// engine の SQL 表層で実行した結果（または SQL エラー）を wire メッセージへ
+/// 整形して返す（TASK-73・WIRE-1）。`engine` が `None`（`handle_connection_bounded`
+/// 経由の後方互換パス）の場合は従来どおり未実装エラー（SQLSTATE `0A000`）を返す。
+/// いずれの経路も Terminate（'X'）で正常終了する。それ以外の型（拡張クエリ
+/// プロトコル等）は `protocol_dispatch` へ委譲し、fail-closed でエラー応答後に
+/// 接続を切断する（TASK-71・WIRE-8 で正式化済み）。
 ///
 /// `Q`・`X` いずれも構造検証を行う（review 指摘: 構造を検証せず読み捨てるだけでは
 /// フレーミングの曖昧さが残る）。`Q` は単一の NUL 終端文字列（空 body・終端 NUL
-/// なし・末尾以外の埋め込み NUL はいずれも拒否）、`X` は length=4・body が厳密に
-/// 空であることを要求し、違反は protocol violation として fail-closed で扱う。
+/// なし・末尾以外の埋め込み NUL はいずれも拒否）に加え、本文が UTF-8 として
+/// 妥当であることを要求する（`simple_query`／engine の SQL 表層はいずれも `&str`
+/// のみを受け取る契約のため、境界はここで確定させる。不正 UTF-8 は `08P01` で
+/// fail-closed に拒否する）。`X` は length=4・body が厳密に空であることを要求し、
+/// 違反は protocol violation として fail-closed で扱う。
 ///
-/// `_ctx` は認証成功時に導出された `engine::policy::PolicyContext`（テナント境界・
-/// 可視性判定の唯一の入力経路）をセッション状態として保持し続けるために受け取る
-/// （review 指摘: 破棄すると将来のクエリ実行経路がテナントを再導出する際に
-/// クライアント自己申告値の混入余地を作りかねない）。簡易クエリの実処理は
-/// 後続タスク（engine SQL 表層との接続）の管轄で現状は未実装のため、本関数では
-/// まだ参照しない。
-fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) -> Result<()> {
+/// `ctx` は認証成功時に導出された `engine::policy::PolicyContext`（テナント境界・
+/// 可視性判定の唯一の入力経路）、`session` は接続単位の
+/// `engine::sql::mode::SessionState`（取得モード・宣言的 UDF レジストリ）で、
+/// いずれも本ループの全クエリを通じて 1 個の値を使い回す（`EngineCore` 自体は
+/// セッション状態を保持しない設計。`sql::mode` モジュールドキュメント参照）。
+fn post_auth_loop(
+    stream: &mut TcpStream,
+    ctx: &engine::policy::PolicyContext,
+    engine: Option<&engine::core::EngineCore>,
+    session: &mut engine::sql::mode::SessionState,
+) -> Result<()> {
     loop {
         let type_byte = match framing::read_typed_frame_header(stream)? {
             Some(b) => b,
@@ -368,12 +386,24 @@ fn post_auth_loop(stream: &mut TcpStream, _ctx: &engine::policy::PolicyContext) 
                         "query message contains embedded NUL",
                     ));
                 }
-                write_error_response(
-                    stream,
-                    SQLSTATE_FEATURE_NOT_SUPPORTED,
-                    "simple query execution is not yet implemented",
-                )?;
-                write_ready_for_query(stream)?;
+                let text = std::str::from_utf8(text)
+                    .map_err(|_| HandshakeError::Protocol("query text is not valid UTF-8"))?;
+
+                match engine {
+                    Some(engine) => {
+                        crate::simple_query::execute_and_respond(
+                            stream, engine, ctx, session, text,
+                        )?;
+                    }
+                    None => {
+                        write_error_response(
+                            stream,
+                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            "simple query execution is not yet implemented",
+                        )?;
+                        write_ready_for_query(stream)?;
+                    }
+                }
             }
             b'X' => {
                 // Terminate は length=4（body 厳密に空）以外を fail-closed で拒否する。
@@ -455,7 +485,31 @@ fn respond_and_close(
 /// 直接受け取る形）は [`handle_connection`]（deprecated 互換ラッパー）として
 /// 維持する（codex-review / Cursor Bugbot 再指摘: 別名ラッパーでは後方互換に
 /// ならず、旧名・旧シグネチャをそのまま残す必要がある）。
-pub fn handle_connection_bounded(mut stream: TcpStream, store: &UserStore) -> io::Result<()> {
+///
+/// `engine` が `None` の場合、簡易クエリには従来どおり `0A000`（未実装）を返す
+/// （本関数の既存呼び出し元・既存テストの契約を変えない）。`Some` を渡す新規
+/// エントリポイントは [`handle_connection_with_engine`]（TASK-73・WIRE-1）。
+pub fn handle_connection_bounded(stream: TcpStream, store: &UserStore) -> io::Result<()> {
+    handle_connection_inner(stream, store, None)
+}
+
+/// engine（SQL 表層）を接続した簡易クエリ実行経路（TASK-73・WIRE-1）。
+/// `server::accept_loop_with_engine` の接続受け付けスレッドから呼ばれる。
+/// 認証・ハンドシェイクの契約は [`handle_connection_bounded`] と同一で、簡易
+/// クエリ（'Q'）の実処理だけが `engine::core::EngineCore` へ委譲される点が異なる。
+pub fn handle_connection_with_engine(
+    stream: TcpStream,
+    store: &UserStore,
+    engine: &engine::core::EngineCore,
+) -> io::Result<()> {
+    handle_connection_inner(stream, store, Some(engine))
+}
+
+fn handle_connection_inner(
+    mut stream: TcpStream,
+    store: &UserStore,
+    engine: Option<&engine::core::EngineCore>,
+) -> io::Result<()> {
     let username = match negotiate_startup(&mut stream) {
         Ok(u) => u,
         Err(e) => return respond_and_close(&mut stream, e, "invalid startup packet"),
@@ -491,7 +545,11 @@ pub fn handle_connection_bounded(mut stream: TcpStream, store: &UserStore) -> io
             write_parameter_status(&mut stream, "client_encoding", "UTF8")?;
             write_ready_for_query(&mut stream)?;
 
-            match post_auth_loop(&mut stream, &ctx) {
+            // 接続単位のセッション状態（取得モード・宣言的 UDF レジストリ）。
+            // `EngineCore` 自体は保持しない（`sql::mode` モジュールドキュメント参照）。
+            let mut session = engine::sql::mode::SessionState::default();
+
+            match post_auth_loop(&mut stream, &ctx, engine, &mut session) {
                 Ok(()) => Ok(()),
                 Err(e) => respond_and_close(&mut stream, e, "invalid message frame"),
             }
@@ -539,6 +597,12 @@ fn connection_counter() -> i32 {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
+    /// プロセス内単調カウンタ（`tests/wire_auth.rs` と同一クラスの競合対策。
+    /// Issue #172）。
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parse_startup_params_extracts_user_and_ignores_database() {
@@ -695,7 +759,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             assert!(result.is_err(), "empty query body must be rejected");
         });
 
@@ -715,7 +784,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             assert!(result.is_err(), "embedded NUL in query must be rejected");
         });
 
@@ -735,7 +809,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             assert!(
                 result.is_err(),
                 "Terminate with a non-empty body must be rejected"
@@ -757,7 +836,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             assert!(result.is_ok(), "well-formed Terminate must succeed");
         });
 
@@ -780,7 +864,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             match result {
                 Err(HandshakeError::Frame(_)) => {}
                 other => panic!(
@@ -811,7 +900,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             match result {
                 Err(HandshakeError::Frame(FrameError::TooLarge { .. })) => {}
                 other => panic!(
@@ -841,7 +935,12 @@ mod tests {
 
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept");
-            let result = post_auth_loop(&mut stream, &ctx);
+            let result = post_auth_loop(
+                &mut stream,
+                &ctx,
+                None,
+                &mut engine::sql::mode::SessionState::default(),
+            );
             assert!(
                 result.is_ok(),
                 "well-formed length prefix on an unsupported message must still be rejected                  via 0A000 and return Ok(())"
@@ -872,15 +971,19 @@ mod tests {
     #[test]
     #[allow(deprecated)]
     fn handle_connection_compat_wrapper_delegates_without_panic() {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-handshake-test-legacy-{}-{}",
+            "wire-server-handshake-test-legacy-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         let store = UserStore::load_from_file(&path).expect("valid empty store");

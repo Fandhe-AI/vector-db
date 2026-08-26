@@ -13,34 +13,16 @@
 //! `cargo test` の対象外）を参照。結果は `docs/design/concurrent-write-verification.md`
 //! に記載する。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`crates/engine/tests/persistence.rs` の
-/// 同名ヘルパーと同じ方針。`cargo test` のデフォルト並列実行でも衝突しない）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-concurrent-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 /// 全行を `scan_page` のページングで読み切る（`scan()` は 1 回の呼び出しで確保する
 /// 総バイト量に上限があり、本テストの行サイズ・件数次第では超過し得るため使わない。

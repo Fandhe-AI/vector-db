@@ -67,7 +67,7 @@ use crate::batch_search::{
     ResidentMatrix, MAX_BATCH_TOTAL_BYTES,
 };
 use crate::dispatch::{self, DispatchInput, ExecutionPath, GpuCapability};
-use crate::kernel::SearchHit;
+use crate::kernel::CandidateHit;
 use crate::storage::Visibility;
 
 /// primary バックエンド実行時のエラー種別（CORE-8 ポインタ）。GPU デバイス
@@ -157,9 +157,9 @@ impl std::error::Error for BatchExecError {}
 /// 一切返さず `Err` を返す）:
 /// - `Vec<BatchHit>` の長さが `queries.len()` と一致する
 /// - 各クエリの `hits.len()` が対応する `BatchQuery::k` 以下
-/// - 各 `SearchHit::id` はそのバックエンドが走査対象とした常駐行列に実在する
+/// - 各 `CandidateHit::id` はそのバックエンドが走査対象とした常駐行列に実在する
 ///   行の id で、かつ対応するクエリの `BatchQuery::ctx.is_visible(..)` を満たす
-/// - 各 `SearchHit::score` は有限値
+/// - 各 `CandidateHit::score` は有限値
 /// - 同一クエリ内で id が重複しない
 /// - スコア降順・同点は id 昇順（`kernel.rs::TopKSelector::into_sorted_vec` と
 ///   同じ規約）
@@ -652,7 +652,7 @@ impl FallbackBatchEngine {
                     "failed to reserve seen-id set for primary result revalidation: {e}"
                 ))
             })?;
-            let mut prev: Option<&SearchHit> = None;
+            let mut prev: Option<&CandidateHit> = None;
             for hit in &batch_hit.hits {
                 // (2) スコアが有限（NaN/Inf でない）。非有限スコアは全順序を
                 // 持たず、後続の順序検証（`total_cmp`）が無意味になるため
@@ -1173,7 +1173,7 @@ mod tests {
         ctx: &PolicyContext,
         query: &[f32],
         k: usize,
-    ) -> Vec<crate::kernel::SearchHit> {
+    ) -> Vec<crate::kernel::CandidateHit> {
         use crate::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
         let mut visible_ids = Vec::new();
         let mut visible_vectors = Vec::new();
@@ -1536,7 +1536,7 @@ mod tests {
     // 無条件で信頼せず拒否されることを確認する。
 
     /// 任意の `Vec<BatchHit>` を返す悪性バックエンドのモック（クエリ内容を
-    /// 無視し、クロージャで用意した結果をそのまま返す。`BatchHit`/`SearchHit`
+    /// 無視し、クロージャで用意した結果をそのまま返す。`BatchHit`/`CandidateHit`
     /// は `Clone` ではないため、呼び出しごとに結果を構築するクロージャとして
     /// 保持する）。
     struct MaliciousBackend<F: Fn() -> Vec<BatchHit> + Send + Sync> {
@@ -1560,7 +1560,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::SearchHit {
+                            hits: vec![crate::kernel::CandidateHit {
                                 id: 9_999,
                                 score: 1.0,
                             }],
@@ -1592,7 +1592,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::SearchHit { id: 3, score: 1.0 }],
+                            hits: vec![crate::kernel::CandidateHit { id: 3, score: 1.0 }],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)
@@ -1620,8 +1620,8 @@ mod tests {
                     make_hits: || {
                         vec![BatchHit {
                             hits: vec![
-                                crate::kernel::SearchHit { id: 1, score: 2.0 },
-                                crate::kernel::SearchHit { id: 2, score: 1.0 },
+                                crate::kernel::CandidateHit { id: 1, score: 2.0 },
+                                crate::kernel::CandidateHit { id: 2, score: 1.0 },
                             ],
                         }]
                     },
@@ -1696,8 +1696,8 @@ mod tests {
                     make_hits: || {
                         vec![BatchHit {
                             hits: vec![
-                                crate::kernel::SearchHit { id: 1, score: 2.0 },
-                                crate::kernel::SearchHit { id: 1, score: 1.0 },
+                                crate::kernel::CandidateHit { id: 1, score: 2.0 },
+                                crate::kernel::CandidateHit { id: 1, score: 1.0 },
                             ],
                         }]
                     },
@@ -1724,7 +1724,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::SearchHit {
+                            hits: vec![crate::kernel::CandidateHit {
                                 id: 1,
                                 score: f32::NAN,
                             }],
@@ -1755,8 +1755,8 @@ mod tests {
                         vec![BatchHit {
                             hits: vec![
                                 // 昇順（本来は降順であるべき）で返す違反。
-                                crate::kernel::SearchHit { id: 1, score: 1.0 },
-                                crate::kernel::SearchHit { id: 2, score: 2.0 },
+                                crate::kernel::CandidateHit { id: 1, score: 1.0 },
+                                crate::kernel::CandidateHit { id: 2, score: 2.0 },
                             ],
                         }]
                     },
@@ -1865,7 +1865,7 @@ mod tests {
                 Ok(Box::new(MaliciousBackend {
                     make_hits: || {
                         vec![BatchHit {
-                            hits: vec![crate::kernel::SearchHit { id: 3, score: 1.0 }],
+                            hits: vec![crate::kernel::CandidateHit { id: 3, score: 1.0 }],
                         }]
                     },
                 }) as Box<dyn BatchBackend>)

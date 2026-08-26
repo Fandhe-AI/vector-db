@@ -18,34 +18,17 @@
 //! 依存するため、引き続き `src/arena.rs` 内のユニットテストの責務とする
 //! （クレート外からは呼べないため）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::arena::{ArenaError, VectorArena};
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::policy::PolicyContext;
 use engine::storage::{RowInput, Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// テストごとに一意な DB ファイルパスを払い出す（`tests/extensions.rs` と同じ方針）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-task87-arena-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-/// テスト終了時（panic 時含む）に DB ファイルを確実に削除するガード。
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した（旧: 結合テストごとの複製。
+// `tests/power_loss.rs`・`tests/bench_accept.rs` と同じ `#[path]` 取り込み方式）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 const TENANT_ID: &str = "tenant-a";
 
@@ -95,9 +78,10 @@ fn table8_build_produces_arena_matching_inserted_rows() {
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table("docs", &rows)
-        .expect("seed rows");
+    // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
+    // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed rows");
 
     let arena = VectorArena::build(&storage, "docs").expect("build arena via public API");
     assert_eq!(arena.table_name(), "docs");
@@ -109,7 +93,7 @@ fn table8_build_produces_arena_matching_inserted_rows() {
 
     for i in 0..10usize {
         let expected_row = storage
-            .get_row_from_table("docs", i as u64)
+            .get_row_from_table("docs", TENANT_ID, i as u64)
             .expect("read row back via storage");
         assert_eq!(arena.vector(i), Some(expected_row.embedding.as_slice()));
         assert_eq!(arena.tenant_id(i), Some(expected_row.tenant_id.as_str()));
@@ -136,30 +120,33 @@ fn table8_build_scopes_arena_to_the_requested_table_only() {
         .create_table(&schema_for("docs_b", 4))
         .expect("create_table docs_b");
 
-    storage
-        .insert_row_into_table(
-            "docs_a",
-            0,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[1.0, 2.0, 3.0, 4.0],
-                metadata: b"table=docs_a",
-            },
-        )
-        .expect("seed docs_a row");
-    storage
-        .insert_row_into_table(
-            "docs_b",
-            0,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[9.0, 9.0, 9.0, 9.0],
-                metadata: b"table=docs_b",
-            },
-        )
-        .expect("seed docs_b row");
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_row(
+        &storage,
+        "docs_a",
+        &ctx,
+        0,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0, 4.0],
+            metadata: b"table=docs_a",
+        },
+    )
+    .expect("seed docs_a row");
+    engine::tenant::insert_row(
+        &storage,
+        "docs_b",
+        &ctx,
+        0,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[9.0, 9.0, 9.0, 9.0],
+            metadata: b"table=docs_b",
+        },
+    )
+    .expect("seed docs_b row");
 
     let arena_a = VectorArena::build(&storage, "docs_a").expect("build arena for docs_a");
     assert_eq!(arena_a.len(), 1);
@@ -186,37 +173,43 @@ fn table8_insert_rejects_dimension_mismatch_and_build_only_sees_valid_rows() {
         .create_table(&schema_for("docs", 4))
         .expect("create_table");
 
-    storage
-        .insert_row_into_table(
-            "docs",
-            0,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[1.0, 2.0, 3.0, 4.0],
-                metadata: b"m",
-            },
-        )
-        .expect("seed matching-dim row");
+    let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        0,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0, 4.0],
+            metadata: b"m",
+        },
+    )
+    .expect("seed matching-dim row");
 
     // 別次元のテーブルを作成し検索対象から外す（`insert_row_into_table` は次元検証する
     // ため、公開 API だけでは同一テーブル内に次元不一致行を作れない。ここでは
     // `Storage` 単体としての次元検証が有効であることの確認に留め、`build` 側の
     // `Err(DimMismatch)` 分岐は `src/arena.rs` の内部テストで手書きバイト列を使って
     // 再現している）。
-    let err = storage
-        .insert_row_into_table(
-            "docs",
-            1,
-            &RowInput {
-                tenant_id: TENANT_ID,
-                visibility: Visibility::Public,
-                embedding: &[1.0, 2.0],
-                metadata: b"m",
-            },
-        )
-        .expect_err("dimension-mismatched insert must be rejected by the public API");
-    assert!(matches!(err, engine::catalog::CatalogError::Invalid(_)));
+    let err = engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        &RowInput {
+            tenant_id: TENANT_ID,
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0],
+            metadata: b"m",
+        },
+    )
+    .expect_err("dimension-mismatched insert must be rejected by the public API");
+    assert!(matches!(
+        err,
+        engine::tenant::TenantWriteError::Catalog(engine::catalog::CatalogError::Invalid(_))
+    ));
 
     // 次元検証を通過した行のみが残っており、公開 API から見た `build` は成功する。
     let arena = VectorArena::build(&storage, "docs").expect("build arena");

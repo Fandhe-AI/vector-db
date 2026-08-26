@@ -7,9 +7,6 @@
 //! 小規模コーパス、厳密な `CpuScalarProvider`）で実 `Storage` 上にテーブルを構築し、
 //! 評価順序（既定・`HINT ORDER` 指定）ごとの実行結果を検証する。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::kernel::CpuScalarProvider;
@@ -18,24 +15,11 @@ use engine::row_codec::Value;
 use engine::sql::exec::QueryResult;
 use engine::storage::{Storage, Visibility};
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-sql-evaluation-order-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn open_storage(path: &std::path::Path) -> Storage {
     Storage::open(path).expect("open storage")
@@ -68,15 +52,21 @@ fn setup_lang_corpus(storage: &Storage) {
         (5, [0.0, 1.0], "ja"),
     ];
     for (id, emb, lang) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                "tenant-a",
-                Visibility::Public,
-                &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+        )
+        .expect("insert row");
     }
 }
 
@@ -195,15 +185,21 @@ fn setup_multi_tenant_table(storage: &Storage) {
         (4, "tenant-b", Visibility::Private),
     ];
     for (id, tenant, visibility) in rows {
-        storage
-            .insert_typed_row(
-                "docs",
-                id,
-                tenant,
-                visibility,
-                &[Value::Vector(vec![1.0, 0.0])],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            id,
+            visibility,
+            &[Value::Vector(vec![1.0, 0.0])],
+        )
+        .expect("insert row");
     }
 }
 
@@ -316,15 +312,21 @@ fn hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders() {
             Some(b) => Value::Text(b.to_string()),
             None => Value::Null,
         };
-        storage
-            .insert_typed_row(
-                "docs",
-                row.id,
-                row.tenant,
-                row.visibility,
-                &[Value::Vector(row.embedding.to_vec()), value],
-            )
-            .expect("insert row");
+        // テナント境界付き API 経由で投入する（生の `Storage::insert_typed_row` は
+        // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した。`tenant_id` は
+        // `PolicyContext` から導出される）。
+        let ctx =
+            PolicyContext::with_visibilities(row.tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            row.id,
+            row.visibility,
+            &[Value::Vector(row.embedding.to_vec()), value],
+        )
+        .expect("insert row");
     }
 
     let core = new_core(storage);
@@ -384,12 +386,13 @@ fn execute_sql_rejects_malformed_hint_order_as_syntax_error() {
 }
 
 // --- 事前フィルタが HINT ORDER を生き延びることの直接検証（パーサー迂回。
-// plan::apply_rls_safety_net の純粋関数テストは crates/engine/src/sql/plan.rs の
-// 単体テストで既にカバーしている。ここでは `execute_sql` 経由で、`HINT ORDER` が
-// 候補構築時の暗黙 RLS 事前フィルタ自体を外せないことを確認する。安全網
-// （`apply_rls_safety_net`）は現状この事前フィルタと同じ候補集合から再判定する
-// ため、本テストは事前フィルタの効果を検証しており、安全網が独立に不可視行を
-// 落としていることの証明ではない） ------------------------------------------------
+// rls::RlsSafetyNet（TASK-136）の純粋関数テストは crates/engine/src/rls.rs の
+// 単体テストで、安全網単体の独立検証（無フィルタ arena による事前フィルタ迂回の
+// 模擬）は tests/rls_safety_net.rs でそれぞれカバーしている。ここでは
+// `execute_sql` 経由で、`HINT ORDER` が候補構築時の暗黙 RLS 事前フィルタ自体を
+// 外せないことを確認する。安全網（`RlsSafetyNet`）は現状この事前フィルタと同じ
+// 候補集合から再判定するため、本テストは事前フィルタの効果を検証しており、安全網が
+// 独立に不可視行を落としていることの証明ではない） ------------------------------------------------
 
 #[test]
 fn distance_leading_hint_order_does_not_bypass_implicit_rls_prefilter() {

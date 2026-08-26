@@ -67,7 +67,7 @@ pub struct RerankCandidate<'a> {
 }
 
 /// 再順位付け後の検索結果 1 件。[`crate::hybrid::HybridHit`] とスコア尺度が異なるため
-/// 型を分ける（`hybrid.rs` が `kernel::SearchHit`/`sparse::ScoredDoc` と型を分けた方針と
+/// 型を分ける（`hybrid.rs` が `kernel::CandidateHit`/`sparse::ScoredDoc` と型を分けた方針と
 /// 同じ）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RerankedHit {

@@ -20,6 +20,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
+- **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
@@ -44,8 +45,20 @@ make setup   # サブモジュール → rustup → lefthook（git hooks）を�
 | `make fmt` / `make fmt-check` / `make lint` / `make test` / `make deny` | Rust 系チェック（workspace 追加により有効化済み） |
 | `make docker-build` / `make docker-shell` / `make docker-ci` | Docker による環境非依存の開発・検証（`compose.yaml` 参照） |
 | `make bench-parallel` / `make recall-regression` | 時間依存・spec 閾値依存の回帰チェック（`ci` には含めない。`.github/workflows/bench.yml`・`recall.yml` から実行） |
+| `make e2e-three-client` | TASK-73（WIRE-1）実 `psql`／`psycopg`／`pg` クライアント統合テスト（`ci` には含めない opt-in。要 `psql`・`python3`+`psycopg`・`node`+`pg`。`PSQL_BIN`/`PYTHON_BIN`/`NODE_BIN` で上書き可） |
 
 ターゲット一覧は `make help` で確認できます。
+
+### wire-server の起動（TASK-73）
+
+```bash
+cargo run -p wire-server -- --users <ユーザーストアのパス> --db <redb ファイルのパス> [--bind 127.0.0.1:5432]
+```
+
+`--users`・`--db` はいずれも必須です（省略時は匿名ログイン・匿名 DB を暗黙生成せず
+fail-closed で起動を拒否します）。`--bind` 省略時は `127.0.0.1:5432`。psql・
+psycopg・node pg から無改造で cleartext password 認証つき接続できます
+（詳細: `docs/design/three-client-e2e-harness.md`）。
 
 ### 回帰ベンチの repo variables（TASK-127）
 

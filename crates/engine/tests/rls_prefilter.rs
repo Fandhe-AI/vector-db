@@ -5,13 +5,12 @@
 //! `crates/engine/tests/hybrid_recall.rs`（TASK-104）の決定的合成コーパス生成
 //! （自前 xorshift64*・外部クレート不使用）を踏襲する。
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::kernel::{CpuScalarProvider, KernelError, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::rls::PrefilterIndex;
 use engine::storage::{RowInput, Storage, Visibility};
@@ -48,26 +47,17 @@ impl Xorshift64 {
 
 // ---------- テスト共通のセットアップ ----------
 
-static UNIQUE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
-/// テストごとに一意な DB ファイルパスを払い出す（`tests/incremental_write_perf.rs` と
-/// 同方式。デフォルトの並列 `cargo test` 実行でも衝突しない）。
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-rls-prefilter-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// テナント単位へ分割してシード投入する共通ヘルパ（複数テストへの複製を避けるため
+// `src/test_util/seed_rows.rs` へ一本化した。`temp_db.rs` と同じ取り込み方式）。
+#[path = "../src/test_util/seed_rows.rs"]
+mod seed_rows;
+use seed_rows::seed_rows_grouped_by_tenant;
 
 const DIM: u32 = 16;
 const TARGET_TENANT: &str = "tenant-target";
@@ -138,9 +128,7 @@ fn seed_corpus(
             )
         })
         .collect();
-    storage
-        .insert_rows_into_table(table, &rows)
-        .expect("seed corpus batch insert");
+    seed_rows_grouped_by_tenant(storage, table, &rows);
     target_ids
 }
 
@@ -264,7 +252,7 @@ impl CountingProvider {
 }
 
 impl SearchProvider for CountingProvider {
-    fn search(&self, input: SearchInput<'_>) -> Result<Vec<SearchHit>, KernelError> {
+    fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.requested_ks
             .lock()
@@ -320,10 +308,14 @@ fn rls3_search_calls_provider_exactly_once_with_requested_k() {
     );
 }
 
-/// 内積スコア（[`engine::kernel::CpuScalarProvider`] と同じ尺度・左から右への逐次和）。
-/// 本テストが独立に参照値を算出するための複製（production コードは変更しない）。
+/// 内積スコア。[`engine::kernel::CpuScalarProvider`] が使うカーネルと同一の
+/// `engine::isa::current().dot` へ委譲する（TASK-156・CORE-14 対応: SIMD 化で
+/// 加算順序が変わり得るため、本テストのように production の Top-K と float 完全一致
+/// で比較する箇所は、算術カーネル自体は本番経路と共有しつつ、順位ロジック
+/// （全行スキャン→許可集合フィルタ→ソート、という手順そのもの）は本テストが独立に
+/// 組み立てることで、`PrefilterIndex` の実装を経由しない検証という趣旨を保つ）。
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    engine::isa::current().dot(a, b)
 }
 
 // 対象ビヘイビア: RLS-4。テスト側で独立に「全行スキャン→許可集合でフィルタ→Top-K」を
@@ -353,7 +345,7 @@ fn rls4_top_k_matches_independently_computed_full_scan_ranking() {
             .iter()
             .map(|&id| {
                 let row = storage
-                    .get_row_from_table("docs", id)
+                    .get_row_from_table("docs", TARGET_TENANT, id)
                     .expect("row must exist");
                 (id, dot(&row.embedding, &query))
             })

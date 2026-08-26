@@ -22,8 +22,9 @@
 //! RRF で融合するハイブリッド検索。対象ビヘイビア: SEARCH-1, SEARCH-3。
 //! `VectorCore` trait への統合・SQL 表層統合は後続タスクの管轄）・TASK-133（`rls.rs`。
 //! `PolicyContext`（TASK-124）と接続する事前フィルタ方式のテナント境界コア実装。対象
-//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` へのキャッシュ統合は
-//! 後続タスクの管轄）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
+//! ビヘイビア: RLS-1, RLS-2, RLS-3, RLS-4。`core::EngineCore` は TASK-169
+//! （`core::PrefilterCache`）経由でこのインデックスをキャッシュし世代整合を保った上で
+//! 再利用する）・TASK-134（`rls.rs::SearchTimeFilter`。動的ポリシー用の
 //! 検索時フィルタ方式によるテナント境界フォールバック。対象ビヘイビア: RLS-1, RLS-3。
 //! `PrefilterIndex`（TASK-133）との使い分けは呼び出し元の責務）・TASK-107
 //! （`hybrid.rs` の候補プールを再順位付けするリランキング層。`Reranker` trait による
@@ -39,7 +40,9 @@
 //! の既定 provider 構築経路）・TASK-89（`tenant.rs`。行単位テナント境界の行ストア
 //! 統合層と `policy.rs::PolicyContext::is_visible`（CORE-2）との統合。対象
 //! ビヘイビア: TABLE-9, TABLE-11。詳細は `tenant.rs`・`policy.rs` の
-//! モジュールドキュメント参照）。プロトコル層
+//! モジュールドキュメント参照）・TASK-136（`rls.rs::RlsSafetyNet`。SQL 表層の実行結果
+//! に対する RLS 実行時安全網を `sql::plan` から再配置・強化。対象ビヘイビア: RLS-5）。
+//! プロトコル層
 //! （`wire-server`）は `core::VectorCore` のみに依存し、認証・SQL 表層・実行バックエンド
 //! 差し替え等は後続タスクで拡張する。
 //!
@@ -66,8 +69,53 @@
 //! 対する AST 許可リスト検証（`sql::allowlist::validate_statement`）を提供する
 //! （詳細は `sql.rs` モジュールドキュメント参照）。
 //!
+//! TASK-161（対象ビヘイビア: SQL-12）: `sql::mode` が取得モード（`recall`／
+//! `precision`）の構文（`USING MODE` 句・`SET search_mode`）・優先順位解決
+//! （クエリ句 > セッション変数 > 既定）・接続単位の `SessionState` を提供する。
+//! `core::EngineCore::execute_sql_in_session` がこれを束ねる新しい公開 API（詳細は
+//! `sql.rs`・`sql/mode.rs` モジュールドキュメント参照）。
+//!
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
+//!
+//! TASK-95（対象ビヘイビア: RECOVER-4）: `tenant.rs` にテナント境界付き書き込みガード
+//! （`insert_row`/`update_row`/`delete_row`）を追加し、`policy.rs::PolicyContext::is_owner`
+//! の単一照合パスで書き込み認可を判定する（読み取りの可視性判定 `is_visible` とは独立）。
+//! `core::EngineCore` は同名の薄い委譲メソッドのみを持ち、`VectorCore` trait へは
+//! 昇格しない。機械検証は `tests/tenant_breach.rs`（詳細は `tenant.rs` モジュール
+//! ドキュメント参照）。
+//!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9）: 行 `id` の一意性スコープは
+//! テナント内であり、行ストア（`catalog.rs` の `user_rows/{table}`）の物理キーを
+//! `(tenant_id, id)` で名前空間化する（`catalog.rs::user_rows_table_def`）。
+//! `tenant.rs::insert_row` の重複検出はサーバー側導出テナントの名前空間内だけを見るため、
+//! 他テナント行の存在有無が `23505` の有無として観測される経路を構造的に持たない
+//! （codex-review P0 指摘・PR #194 対応）。旧フォーマット（キーが `id` のみ）の DB は
+//! `catalog.rs::map_row_table_error` が fail-closed に拒否する。読み取り側で同一 `id` の
+//! 可視行が複数現れうる点の扱いは `core.rs::provider_result_is_valid` を参照。
+//!
+//! TASK-89/TASK-95（対象ビヘイビア: TABLE-12, RLS-9・codex-review P1 対応）: 公開の
+//! 検索結果型 `kernel.rs::SearchHit` は `(tenant_id, id)` で行を一意に解決できる
+//! テナント修飾済みヒットとし、`core::VectorCore::get_row` も `(tenant_id, id)` を
+//! キーに取る（行 `id` の一意性スコープがテナント内のため `id` 単独では行を指せない）。
+//! `SearchProvider` の戻り値は候補ヒット `kernel.rs::CandidateHit`（識別子は呼び出し元
+//! 定義。`core.rs`・`sql/exec.rs` は候補アリーナのスロット番号を渡す）で、テナントの
+//! 解決は provider の外側で行う（ホットパスへヒープ確保を持ち込まないため）。
+//!
+//! TASK-156（対象ビヘイビア: CORE-14）: `isa.rs` が CPU 命令セット（AVX2+FMA・
+//! AVX-512・NEON）の実行時検出を提供し、`dispatch.rs::detect_current_isa`
+//! （決定表の ISA 入力）・`kernel.rs::dot`（`CpuScalarProvider` 等が共有する内積
+//! カーネル）双方の実体がこれへ委譲する。SIMD カーネル（`unsafe` を含む）は検出
+//! 成功時のみ構築される sealed トークン経由でしか呼び出せない（詳細は `isa.rs`
+//! モジュールドキュメント参照）。
+//!
+//! TASK-162（対象ビヘイビア: SEARCH-9）: `precision.rs` が `precision` モードの
+//! 実行契約（確信度判定・空集合 fail-closed 応答）を提供する。適用位置は
+//! `sql::exec::execute_statement` の DISTANCE 段（＋事後 SCALAR フィルタ）の後・
+//! `RlsSafetyNet::apply` の前（詳細は `precision.rs`・`sql/exec.rs` モジュール
+//! ドキュメント参照）。設定値は `core::EngineCore` が保持する `PrecisionPolicy`
+//! で、クエリ・セッション変数から到達できないサーバー側専有の値とする。TASK-161
+//! （`sql::mode`）が解決する `SearchMode` はこの契約の実行可否のみを分岐する。
 //!
 //! TASK-119（対象ビヘイビア: INDEX-3）: `chunking.rs` が `INSERT` 経由で届く
 //! ファイル内容（パス＋本文）を Markdown 見出し単位・非 Markdown 固定行数単位で
@@ -84,9 +132,11 @@ pub mod chunking;
 pub mod core;
 pub mod dispatch;
 pub mod hybrid;
+pub mod isa;
 pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
+pub mod precision;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
@@ -96,6 +146,19 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+
+/// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
+/// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
+///
+/// `temp_db` 自身の自己テスト（`temp_db_tests`）は本モジュール配下でのみ
+/// コンパイル・実行される（Issue #201 レビュー対応）。`tests/*.rs` 側は
+/// `#[path = "../src/test_util/temp_db.rs"] mod temp_db;` で `temp_db.rs` 単体のみを
+/// 取り込むため、結合テストバイナリごとの重複実行は発生しない。
+#[cfg(test)]
+mod test_util {
+    pub mod temp_db;
+    mod temp_db_tests;
+}
 
 /// engine クレートの識別子。
 ///
