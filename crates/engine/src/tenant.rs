@@ -1,6 +1,15 @@
 //! 行単位テナント境界の行ストア統合層（TASK-89・対象ビヘイビア: TABLE-9, TABLE-11。
 //! TASK-95・対象ビヘイビア: RECOVER-4 の書き込みガード API を追加）。
 //!
+//! [`TenantWriteError::MissingOperationId`]（TASK-92・対象ビヘイビア: RECOVER-1）は
+//! 本モジュール自身の書き込み関数（[`insert_row`]・[`insert_rows`]・
+//! [`insert_typed_row`]・[`update_row`]・[`delete_row`]）が生成する variant では
+//! ない。`operation_id` 必須化ガードは `crate::recovery::required_op_id::LedgerMode`
+//! （呼び出し元 `crate::core::EngineCore::{insert_row, update_row, delete_row}`）が
+//! 本モジュールへ委譲する**前**に適用するため、本モジュールは `operation_id` の
+//! 存在検証を持たない（責務を上位へ委譲したままとし、本層の関数シグネチャ・
+//! 呼び出し元（テストのシード・engine 内部）を変更しない）。
+//!
 //! `policy.rs::PolicyContext::is_visible` の単一照合パス（CORE-2）へすべての可視性
 //! 判定を委譲し、本モジュール独自のテナント比較は持たない（security.md P0）。
 //! 提供する API は大きく 2 系統:
@@ -238,6 +247,13 @@ pub enum TenantWriteError {
     /// INSERT 先 id に既存行がある（所有者を問わず同一 variant。上書きによる他テナント
     /// 行の破壊を遮断しつつ、所有テナントの存在情報を漏らさない）。
     IdConflict,
+    /// `operation_id` の省略（句の欠落・明示 `NULL` を含む）。台帳あり構成
+    /// （`recovery::required_op_id::LedgerMode::Ledgered`、既定）では書き込み系操作に
+    /// `operation_id` の指定を必須とする（TASK-92・対象ビヘイビア: RECOVER-1）。
+    /// `crate::core::EngineCore::{insert_row, update_row, delete_row}` が
+    /// `crate::tenant::*` へ委譲する**前**にガードを適用するため、本 variant が
+    /// 実際に返る時点で書き込みトランザクションは未開始（ERR-2: `23502`）。
+    MissingOperationId,
     /// [`crate::catalog`] 側のエラー（テーブル不存在・行破損・redb バックエンドエラー等）。
     Catalog(CatalogError),
     /// [`crate::storage`] 側のエンコード/デコードエラー（`RowInput` の入力検証失敗等）。
@@ -254,6 +270,7 @@ impl TenantWriteError {
             TenantWriteError::Forbidden => "42501",
             TenantWriteError::NotFound => "P0002",
             TenantWriteError::IdConflict => "23505",
+            TenantWriteError::MissingOperationId => "23502",
             TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
         }
     }
@@ -267,6 +284,7 @@ impl std::fmt::Display for TenantWriteError {
             }
             TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
             TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
+            TenantWriteError::MissingOperationId => write!(f, "missing operation_id"),
             // `CatalogError`/`StorageError` の `Display` をそのまま展開しない（`TenantError`
             // と同じ理由。security.md テナント境界 P0）。
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
@@ -284,6 +302,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
+            TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
         }

@@ -15,6 +15,7 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
 use engine::rls::{PrefilterIndex, SearchTimeFilter};
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::{self, TenantWriteError};
@@ -552,7 +553,8 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.25; DIM as usize],
         metadata: &[],
     };
-    core.insert_row(&owner, TABLE, another_new_id, &insert_row2)
+    let op_id = OperationId::parse("op-engine-core-delegation").expect("valid operation_id");
+    core.insert_row(&owner, TABLE, another_new_id, &insert_row2, Some(&op_id))
         .expect("EngineCore::insert_row ok");
     let update_row2 = RowInput {
         tenant_id: TENANT_A,
@@ -560,9 +562,9 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.1; DIM as usize],
         metadata: &[],
     };
-    core.update_row(&owner, TABLE, another_new_id, &update_row2)
+    core.update_row(&owner, TABLE, another_new_id, &update_row2, Some(&op_id))
         .expect("EngineCore::update_row ok");
-    core.delete_row(&owner, TABLE, another_new_id)
+    core.delete_row(&owner, TABLE, another_new_id, Some(&op_id))
         .expect("EngineCore::delete_row ok");
 }
 

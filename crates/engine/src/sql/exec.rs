@@ -1014,6 +1014,12 @@ fn project_rows(
 /// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
 /// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
 /// （ポインタ: docs/spec/05-tasks.md TASK-93）。
+///
+/// `bound.operation_id` の必須化（TASK-92・RECOVER-1）は呼び出し元
+/// `sql::allowlist::validate_insert` が `LedgerMode::require` 経由で本関数の
+/// 呼び出し前に適用済みのため、`LedgerMode::Ledgered`（既定）では常に `Some`。
+/// `LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、本関数は
+/// いずれの場合も値の有無で分岐しない（台帳を持たないため未使用）。
 pub fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
@@ -1035,6 +1041,14 @@ pub fn execute_insert(
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        // `tenant::insert_typed_row` 自体は `operation_id` 必須化ガード
+        // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
+        // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
+        // `sql::allowlist::validate_insert` が書き込みトランザクション開始前に
+        // 既に適用済みのため、この写像アームは実際には到達しない。ただし
+        // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示しておく
+        // （TASK-92・対象ビヘイビア: RECOVER-1）。
+        TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }

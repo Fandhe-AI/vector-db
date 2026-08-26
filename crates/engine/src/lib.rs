@@ -122,6 +122,13 @@
 //! 純関数的な API を提供する（詳細は `chunking.rs` モジュールドキュメント参照）。
 //! 増分インデックスへの結線（TASK-120）・一括投入上限（TASK-122、対象ビヘイビア:
 //! INDEX-4）は後続タスクの管轄。
+//!
+//! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
+//! 「書き込み系操作は `operation_id` の指定を必須とする」ガードをサーバー構成のみで
+//! 決定する 1 箇所へ集約する。`sql::allowlist::validate_insert`（`INSERT` の構造検証
+//! 段階）と `core::EngineCore::{insert_row, update_row, delete_row}`（TASK-95）の
+//! 両経路が同一ガードを通り、いずれも書き込みトランザクション開始前に `23502` で
+//! fail-closed に拒否する（詳細は `recovery` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -137,6 +144,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
