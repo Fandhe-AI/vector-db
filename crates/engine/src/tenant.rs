@@ -332,6 +332,43 @@ impl From<StorageError> for TenantWriteError {
     }
 }
 
+/// 行ストア（`user_rows/{table_name}`）への一意挿入ヘルパ（TABLE-12・TASK-130・
+/// PR #194 の申し送り対応）。[`insert_row_unchecked`]・[`insert_rows_unchecked`]・
+/// [`insert_typed_row_unchecked`] が共有する唯一の実装。
+///
+/// 旧来は `get` で存在確認してから `insert` する 2 回の B-tree 探索だったが、
+/// `redb::Table::insert` が上書き前の旧値を `Option<AccessGuard>` として返す性質を
+/// 使い、`insert` 一回の走査結果だけで存在判定する（`get` を省略）。返る旧値は
+/// 中身を読まず即座に破棄する（存在の有無だけが関心事）。
+///
+/// # 呼び出し元が守るべき前提（Err 時は commit しない）
+///
+/// `Some` を返した時点で該当キーには **新しい値がすでに書き込まれている**（redb の
+/// `insert` は探索と書き込みを同一パスで行うため、後から取り消す API はない）。
+/// この上書きを外部から観測させないのは、本関数の `Err` を受け取った呼び出し元が
+/// 属する write トランザクションを **commit せずに drop（abort）する**という契約に
+/// よる（`redb::WriteTransaction` の drop 契約。[`insert_row_unchecked`] 等はいずれも
+/// 自身が `begin_write` した txn をこの関数の外側でだけ commit するため、この契約を
+/// 満たす）。将来の呼び出し元を追加する場合もこの前提を破らないこと。
+///
+/// キーは呼び出し元がサーバー側導出テナント（`ctx.tenant_id()`）で組み立てる
+/// （本関数はキー生成に関与しない）。他テナントの行キーへ触れる経路を持たないため、
+/// 他テナント行の有無で分岐する処理は本関数にも存在しない（RLS-9・fail-closed）。
+fn insert_unique_row(
+    row_table: &mut redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    key: (&str, u64),
+    encoded: &[u8],
+) -> Result<(), TenantWriteError> {
+    if row_table
+        .insert(key, encoded)
+        .map_err(CatalogError::from)?
+        .is_some()
+    {
+        return Err(TenantWriteError::IdConflict);
+    }
+    Ok(())
+}
+
 /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// `row.tenant_id` が `ctx` のテナントと不一致なら
@@ -396,13 +433,8 @@ pub(crate) fn insert_row_unchecked(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
-        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-            return Err(TenantWriteError::IdConflict);
-        }
         let encoded = encode_row(row)?;
-        row_table
-            .insert(key, encoded.as_slice())
-            .map_err(CatalogError::from)?;
+        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
@@ -414,6 +446,10 @@ pub(crate) fn insert_row_unchecked(
 /// 認可・重複検出の契約は [`insert_row`] と同一で、バッチ全体を単一の write
 /// トランザクションで処理する（1 件でも拒否されれば commit せず全体が未反映になる。
 /// `redb::WriteTransaction` の drop 契約）。
+///
+/// 存在確認は行ごとに `get` → `insert` の 2 回 B-tree 探索する旧実装ではなく、
+/// [`insert_unique_row`]（`insert` の戻り値で既存行の有無を判定）を使い 1 回に
+/// 削減している（TASK-130・PR #194 の申し送り対応）。
 ///
 /// - `row.tenant_id` が `ctx` と不一致な行が 1 件でもあれば [`TenantWriteError::Forbidden`]
 ///   （ストレージへ触れる前に全件を検査する）
@@ -485,13 +521,8 @@ pub(crate) fn insert_rows_unchecked(
         for (id, row) in rows {
             schema.validate_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
-            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-                return Err(TenantWriteError::IdConflict);
-            }
             let encoded = encode_row(row)?;
-            row_table
-                .insert(key, encoded.as_slice())
-                .map_err(CatalogError::from)?;
+            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
     }
     bump_generation_and_commit(write_txn)?;
@@ -570,13 +601,8 @@ pub(crate) fn insert_typed_row_unchecked(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         let key = (ctx.tenant_id(), id);
-        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-            return Err(TenantWriteError::IdConflict);
-        }
         let encoded = encode_row(&row)?;
-        row_table
-            .insert(key, encoded.as_slice())
-            .map_err(CatalogError::from)?;
+        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
@@ -884,5 +910,86 @@ mod tests {
             .get_row_from_table("docs", "tenant-a", 1)
             .expect("read back row");
         assert_eq!(after.tenant_id, "tenant-a");
+    }
+
+    // 対象ビヘイビア: TABLE-12・TASK-130。[`insert_unique_row`] 導入（`get` を省き
+    // `insert` の戻り値で衝突判定）により、衝突行より前に処理される行が実際に write
+    // txn 内へ書き込まれても、txn が commit されなければ何も永続化されないことを固定
+    // する（PR #194 の「既存行と衝突するバッチは IdConflict・既存行は不変」契約の
+    // 単体テスト版。バッチ末尾で衝突するケースを対象に、先行行が残らないことを確認）。
+    #[test]
+    fn insert_rows_with_trailing_conflict_persists_nothing() {
+        let path = unique_db_path("trailing-conflict");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("test-op").expect("valid operation_id");
+
+        // id=3 を事前に投入しておき、バッチ末尾でこの id と衝突させる。
+        insert_row(
+            &storage,
+            "docs",
+            &a,
+            3,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[9.0, 9.0],
+                metadata: b"original",
+            },
+            &op_id,
+        )
+        .expect("seed id=3");
+
+        let batch = [
+            (
+                1u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: b"one",
+                },
+            ),
+            (
+                2u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: b"two",
+                },
+            ),
+            (
+                3u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 1.0],
+                    metadata: b"overwrite-attempt",
+                },
+            ),
+        ];
+        let err = insert_rows(&storage, "docs", &a, &batch, &op_id)
+            .expect_err("trailing id=3 conflicts with the seeded row");
+        assert!(matches!(err, TenantWriteError::IdConflict));
+
+        // id=1・2 は「衝突より前に処理された行」だが、txn が commit されていない
+        // ため一切書き込まれていない（all-or-nothing）。
+        assert!(
+            storage.get_row_from_table("docs", "tenant-a", 1).is_err(),
+            "id=1 must not have been persisted"
+        );
+        assert!(
+            storage.get_row_from_table("docs", "tenant-a", 2).is_err(),
+            "id=2 must not have been persisted"
+        );
+        // id=3 は元の内容のまま（insert-then-abort でも上書きは永続化されない）。
+        let row3 = storage
+            .get_row_from_table("docs", "tenant-a", 3)
+            .expect("id=3 must still exist with its original content");
+        assert_eq!(row3.metadata, b"original".to_vec());
     }
 }
