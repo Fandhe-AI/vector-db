@@ -48,8 +48,15 @@
 //!   合否判定ゲートとして機能しなくなるため（codex-review 継続指摘）。
 //!   `Cargo.toml`・PR 本文の「対象外・承認事項」参照）
 //! - 診断 A/B（[`harness::ab::run_ab`]）: `ParallelSearchProvider`（SIMD+並列）と
-//!   単一スレッドの真のスカラー参照（総当たり）を比較し、SIMD 効果を実測ログで
-//!   可視化する。合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。
+//!   単一スレッドの真のスカラー参照（総当たり）を比較する。**この比較は SIMD 単独の
+//!   効果を分離したものではない**（codex-review 指摘対応）。A 側はスレッド並列化・
+//!   `TopKSelector`（`kernel.rs`）を経由し、B 側は単一スレッド・独立実装の
+//!   Top-k 選出（`harness::scalar_reference`）を経由するため、`median_ratio` には
+//!   SIMD カーネル差に加えて並列化効果・Top-k 選出アルゴリズム差・割り当て/ソート量の
+//!   差も乗る。ここで可視化しているのは「エンドツーエンドの SIMD 並列経路 vs
+//!   スカラー参照経路」の実測比であり、内積カーネルのみを差し替えた SIMD 単独効果の
+//!   測定ではない点に注意する。合否には数えない（`sql_c1_bench.rs::diagnostic_ab`
+//!   と同型）。
 //!
 //! 数値基準（p95 上限・Recall 下限）・測定条件は spec（TASK-127）が SSOT。本ファイルには
 //! 数値そのものをハードコードせず、実行時に環境変数（`BENCH_MAX_P95_MS`・
@@ -293,8 +300,12 @@ fn main() {
     }
 
     // --- 診断 A/B: ParallelSearchProvider（SIMD+並列） vs 単一スレッド真のスカラー参照 ---
-    // 合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。SIMD 効果を実測ログで
-    // 可視化する目的のみ。
+    // 合否には数えない（`sql_c1_bench.rs::diagnostic_ab` と同型）。**SIMD 単独効果の
+    // 測定ではない**（モジュール冒頭コメント参照。codex-review 指摘対応）: A 側は
+    // 並列化・`TopKSelector` を経由し、B 側は単一スレッド・独立実装の Top-k 選出を
+    // 経由するため、`median_ratio` には並列化効果・Top-k 選出アルゴリズム差・
+    // 割り当て/ソート量の差も乗る。ここで可視化するのは「エンドツーエンドの SIMD
+    // 並列経路 vs スカラー参照経路」の実測比である。
     let ab_query = rng.next_vector(DIM);
     match run_ab(
         &config,
@@ -319,7 +330,7 @@ fn main() {
     ) {
         Ok(ab) => {
             println!(
-                "diagnostic_ab(simd_parallel_vs_scalar_reference): a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail)",
+                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail)",
                 ab.a.summary.median, ab.b.summary.median, ab.median_ratio
             );
         }
@@ -327,7 +338,7 @@ fn main() {
             // A/B は診断情報であり合否に含めないため、算出不能（分母 0 等）でも
             // 本体の pass/fail には影響させない。ただし silent にはせず記録する。
             println!(
-                "diagnostic_ab(simd_parallel_vs_scalar_reference): unavailable ({e}) (not counted toward pass/fail)"
+                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): unavailable ({e}) (not counted toward pass/fail)"
             );
         }
     }
