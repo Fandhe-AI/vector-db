@@ -8,7 +8,7 @@
   いずれもマージ済み（PR #138・#142・#144）
 - 関連: TASK-106（`docs/design/cjk-tokenizer-impact-ja-corpus.md`。決定的合成コーパス
   生成・固定値回帰トラッキング方式の先行実装）・TASK-127（`crates/engine/benches/
-  parallel_bench.rs`。spec 閾値の Actions variables 注入パターンの先行実装）
+  simd_bench.rs`。spec 閾値の Actions variables 注入パターンの先行実装）
 
 ## 背景
 
@@ -36,7 +36,7 @@
   ローカルの `make recall-regression`（`HYBRID_RECALL_REQUIRE_THRESHOLDS` を
   注入しない）では未設定（GitHub Actions では空文字列に解決される variable も
   含む）は「ゲート未設定＝明示的に対象外」を出力して成功終了し
-  （`crates/engine/benches/parallel_bench.rs::core5_requested_from_env` と同じ
+  （`crates/engine/benches/simd_bench.rs::core5_requested_from_env` と同じ
   opt-in パターン）、設定済みで非数値・範囲外は fail-closed でテスト失敗とする。
   `recall.yml` からの実行は strict モード（下記「strict モードによる誤 green
   防止」参照）が既定で有効なため、未設定も fail-closed になる。ログには実測値と

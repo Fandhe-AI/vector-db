@@ -71,15 +71,15 @@ test = false
 
 [[bench]]
 # TASK-127（性能・Recall 受け入れ基準の回帰テスト化）の回帰ゲート入口。実測対象は
-# `ParallelSearchProvider`（スレッド並列＋ TASK-156 の実行時 SIMD 検出カーネル。
-# ファイル名は元々のスカラー並列実装当時のものを維持している。`parallel_bench.rs`
-# 冒頭コメント参照）。harness = false / test = false
-# は上記 2 ベンチと同一方針（時間依存の測定値を make ci のアサーションへ混ぜない）。
-# `make bench-parallel`（Makefile）・`.github/workflows/bench.yml`
+# `ParallelSearchProvider`（スレッド並列＋ TASK-156 の実行時検出 SIMD カーネル。
+# `simd_bench.rs` 冒頭コメント参照）。Scalar 検出時は SIMD 経路が測定不能として
+# fail-closed で拒否する。harness = false / test = false は上記 2 ベンチと同一方針
+# （時間依存の測定値を make ci のアサーションへ混ぜない）。
+# `make bench-simd`（Makefile）・`.github/workflows/bench.yml`
 # （workflow_dispatch による手動実行。CORE-5 未接続の間は schedule 停止中）から
 # 実行する。判定ロジック自体（時間非依存）は harness/accept.rs にあり
 # tests/bench_accept.rs で make ci 側から回帰検証する。
-name = "parallel_bench"
+name = "simd_bench"
 harness = false
 test = false
 
@@ -98,7 +98,7 @@ test = false
 [[bench]]
 # TASK-83（Conditional Go 条件7: C1 p95 専有環境再測定）の実測入口。実測対象は
 # `EngineCore::execute_sql`（SQL 表層。`sql::exec::execute_statement`）経由の C1
-# （純粋 Top-k）で、`parallel_bench.rs`（provider 単体）とは異なりテーブル走査・
+# （純粋 Top-k）で、`simd_bench.rs`（provider 単体）とは異なりテーブル走査・
 # 候補デコードを含む SQL 実行計画全体の p95 を測る。harness = false / test = false
 # は上記ベンチと同一方針。`make bench-c1`（Makefile）・
 # `.github/workflows/bench.yml`（workflow_dispatch 限定）から実行する。判定ロジック

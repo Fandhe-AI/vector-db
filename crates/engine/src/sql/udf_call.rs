@@ -48,6 +48,41 @@ const WASM_CALL_ARITY: usize = 2;
 /// `Expr::Number` 束縛）の双方で同一の正確表現境界として共有する。
 const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
 
+/// 数値リテラルの生文字列（符号なし。`-` は呼び出し元が別トークンとして処理する）を
+/// `f64` へ束縛する（TASK-79・SQL-9 の `Expr::Number` 束縛から TASK-167・SQL-14
+/// （`sql::group_by` の HAVING/LIMIT リテラル束縛）が共有できるよう切り出した）。
+/// 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を生成する）は
+/// `f64::from_str` が黙って最近接値へ丸めうる（`raw.parse::<f64>()` はエラーに
+/// ならない）。`2^53` を超える整数は `f64` で正確に表現できないという境界を、丸め
+/// 変換の *前* に整数として検査することで、大きな整数リテラルが精度欠落によって
+/// 別の値と黙って同一視されるのを防ぐ（fail-closed。security.md「不安全な設計」対応）。
+pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    if is_integer_literal {
+        let as_int: u64 = raw.parse().map_err(|_| {
+            // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
+            // `f64` で正確に表現できないことに変わりはない。
+            SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            )
+        })?;
+        if as_int > MAX_EXACT_F64_INT {
+            return Err(SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            ));
+        }
+    }
+    let v: f64 = raw
+        .parse()
+        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
+    if !v.is_finite() {
+        return Err(SqlSurfaceError::invalid_input(
+            "numeric literal is not finite",
+        ));
+    }
+    Ok(v)
+}
+
 /// 式の二項演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOp {
@@ -202,12 +237,17 @@ fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
 }
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
-/// 等）・組み込み関数名と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
-/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する。
+/// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
+/// TASK-166・SQL-13）と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
+/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する
+/// （集計関数名を含めない版では `CREATE FUNCTION min(...)` が成功したまま
+/// `SELECT min(id)` が集計として実行され、当該 UDF が呼び出し不能になる不整合が
+/// あった。Cursor Bugbot 指摘対応・PR #229）。
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(upper.as_str(), "VISIBLE" | "HYBRID_RRF" | "HYBRID")
         || builtin_from_name(name).is_some()
+        || crate::sql::allowlist::is_aggregate_function_name(name)
 }
 
 /// セッション内で登録された宣言的 UDF 1 件。本体は構文段の [`Expr`]（パラメータ参照は
@@ -522,37 +562,7 @@ fn bind_expr_in(
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     match expr {
         Expr::Number(raw) => {
-            // 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を
-            // 生成する）は `f64::from_str` が黙って最近接値へ丸めうる
-            // （`raw.parse::<f64>()` はエラーにならない）。`id_as_finite_scalar` と
-            // 同じ「`2^53` を超える整数は `f64` で正確に表現できない」境界を、丸め
-            // 変換の *前* に整数として検査することで、`WHERE id = 9007199254740993`
-            // のような大きな整数リテラルが精度欠落によって別の値（例:
-            // `9007199254740992`）と黙って同一視されるのを防ぐ（fail-closed。
-            // security.md「不安全な設計」対応）。
-            let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
-            if is_integer_literal {
-                let as_int: u64 = raw.parse().map_err(|_| {
-                    // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
-                    // `f64` で正確に表現できないことに変わりはない。
-                    SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    )
-                })?;
-                if as_int > MAX_EXACT_F64_INT {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    ));
-                }
-            }
-            let v: f64 = raw
-                .parse()
-                .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
-            if !v.is_finite() {
-                return Err(SqlSurfaceError::invalid_input(
-                    "numeric literal is not finite",
-                ));
-            }
+            let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))
         }
         Expr::Ident(name) => {

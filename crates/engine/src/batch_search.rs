@@ -10,13 +10,16 @@
 //! マスク・動的窓集約）のみを依存クレートなしで実装する。GPU 実行への置き換えは
 //! 承認後のフォローアップとする（TASK-128 ポインタ）。
 //!
-//! `TopKSelector`（`kernel.rs`）を選出段で共用し、選出規約（スコア降順・同点 id
+//! `TopKSelector`（`kernel.rs`）を選出段で共用し、選出規約（スコア降順・同点識別子
 //! 昇順・非有限値除外）の二重管理を防ぐ。`core.rs::EngineCore` と同じ「(1) 選出前に
-//! 候補をマスクで絞る、(2) 選出後の結果 id を独立に再検証する」二重防御を踏襲する。
+//! 候補をマスクで絞る、(2) 選出後にスロットを `(tenant_id, id)` へ解決して独立に
+//! 再検証する」二重防御を踏襲する（対象ビヘイビア: TABLE-12・RLS-9。行 `id` の
+//! 一意性スコープがテナント内に閉じたため、`core.rs::resolve_slot_hits` と同じ
+//! 「候補識別子＝常駐行列のスロット番号」方式を採る。詳細は [`BatchHit`] 参照）。
 
 use std::fmt;
 
-use crate::kernel::{CandidateHit, TopKSelector};
+use crate::kernel::{CandidateHit, SearchHit, TopKSelector};
 use crate::policy::PolicyContext;
 use crate::storage::Visibility;
 
@@ -125,10 +128,12 @@ pub enum BatchSearchError {
     NonFiniteQuery { query_index: usize },
     /// 常駐行列構築時、`ids`/`vectors`/可視性マスクの長さ不整合。
     ArenaLengthMismatch,
-    /// 常駐行列構築時、`ids` に重複があった。id → tenant を一意に定められないと
-    /// 選出後の独立再検証（id ベース）が成立しないため fail-closed で拒否する
-    /// （codex レビュー指摘対応。重複行そのものの id は他テナントの存在情報を
-    /// 漏らしうるためエラーには含めない）。
+    /// 常駐行列構築時、**同一テナント内**で `id` に重複があった（対象ビヘイビア:
+    /// TABLE-12・RLS-9）。行 `id` の一意性スコープはテナント内に閉じているため、
+    /// 異なるテナントが同じ `id` を持つことは正当な入力であり拒否しない
+    /// （codex レビュー指摘対応の当初実装は `id` 単独の重複を拒否していたが、
+    /// PR #205 で `(tenant_id, id)` 複合キーの重複判定へ改めた）。重複行そのものの
+    /// id は他テナントの存在情報を漏らしうるためエラーには含めない。
     DuplicateRowId,
     /// 常駐行列構築時、`tenant_ids` の要素が [`crate::storage::MAX_TENANT_ID_LEN`]
     /// を超過した（Cursor Bugbot 指摘対応: 容量チェックが `MAX_TENANT_ID_LEN` で
@@ -406,6 +411,19 @@ fn try_reserve_exact<T>(
         .map_err(|e| BatchSearchError::AllocationFailed(format!("failed to reserve {what}: {e}")))
 }
 
+/// `&str` を `String` へフォールブルに複製する（`ResidentMatrix::build` が
+/// `tenant_ids` の複製に使うのと同じ理由: `String::from`/`.into()`（`SearchHit::
+/// new` が内部で使う）は失敗時に abort するため、選出後の解決ループのように
+/// バッチ全体で最大 [`MAX_BATCH_TOTAL_K`] 回呼ばれうる経路では使わない）。
+fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
+    let mut owned = String::new();
+    owned.try_reserve_exact(s.len()).map_err(|e| {
+        BatchSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
+    })?;
+    owned.push_str(s);
+    Ok(owned)
+}
+
 /// 1 テナント分の積和演算数（`rows × queries × dim`）を checked 演算で計算する。
 /// 積のオーバーフローは [`MAX_BATCH_WORK`] 超過とみなす（[`compute_batch_work`]
 /// 専用のヘルパー。境界値を直接検証できるよう独立関数へ切り出す）。
@@ -595,29 +613,28 @@ impl ResidentMatrix {
             return Err(BatchSearchError::ArenaLengthMismatch);
         }
 
-        // id の一意性を検証する（容量・長さチェックより後に置き、cheap な拒否経路
+        // (tenant_id, id) 複合キーの一意性を検証する（対象ビヘイビア: TABLE-12・
+        // RLS-9。容量・長さチェックより後に置き、cheap な拒否経路
         // （`CapacityExceeded`・`ArenaLengthMismatch`）を先に済ませてから、
-        // 検証コスト・確保量が `ids.len()` に比例する本チェックへ進む）。重複を
-        // 許すと id → tenant が一意に定まらず、`BatchEngine::batch_search` の
-        // 選出後独立再検証（id ベース）が異なるテナントの行を取り違えうる
-        // （codex レビュー指摘対応）。
+        // 検証コスト・確保量が `ids.len()` に比例する本チェックへ進む）。行 `id`
+        // の一意性スコープはテナント内に閉じている（`catalog.rs::
+        // user_rows_table_def`）ため、異なるテナントが同じ `id` を持つ入力は
+        // 正当であり拒否しない。`run_batch_search` の選出後独立再検証は
+        // 常駐行列のスロット番号を候補識別子にして `(tenant_id, id)` へ解決する
+        // 方式（`resolve_batch_slot` 参照）へ改めたため、id 単独の重複を拒否する
+        // 必要はなく、同一テナント内の重複だけを拒否すれば選出後再検証の一意性
+        // 前提（スロット → 行が 1 対 1）は保たれる（PR #205: 旧実装は id 単独の
+        // 重複を拒否しており、他テナントが同じ id を持つだけで正当な入力を誤って
+        // 拒否していた）。
         // `HashSet::with_capacity` は失敗時に abort するため使わず、
         // `try_reserve`（フォールブル）で確保する（Cursor Bugbot 指摘対応）。
-        //
-        // TABLE-12 との関係（申し送り）: 行 `id` の一意性スコープはテナント内に閉じた
-        // （`catalog.rs::user_rows_table_def`）ため、行ストア上の 1 テーブルには
-        // 異なるテナントの同一 `id` が正当に共存しうる。本メソッドは現状テストからのみ
-        // 呼ばれており（行ストアとは未接続）、そのような入力は `DuplicateRowId` で
-        // fail-closed に拒否される。バッチ経路を行ストアへ配線する際は、下記の
-        // 選出後再検証（`run_batch_search` の id → (tenant, visibility) 逆引き）を
-        // 行 index ベースへ作り替えたうえで本検証を緩めること（id ベースのまま緩めると
-        // 別テナントの行を取り違える経路が生まれる）。
-        let mut seen_ids = std::collections::HashSet::new();
-        seen_ids.try_reserve(ids.len()).map_err(|e| {
-            BatchSearchError::AllocationFailed(format!("failed to reserve id set: {e}"))
+        let mut seen_row_keys: std::collections::HashSet<(&str, u64)> =
+            std::collections::HashSet::new();
+        seen_row_keys.try_reserve(ids.len()).map_err(|e| {
+            BatchSearchError::AllocationFailed(format!("failed to reserve row key set: {e}"))
         })?;
-        for &id in ids {
-            if !seen_ids.insert(id) {
+        for (&id, tenant) in ids.iter().zip(tenant_ids) {
+            if !seen_row_keys.insert((tenant.as_str(), id)) {
                 return Err(BatchSearchError::DuplicateRowId);
             }
         }
@@ -895,9 +912,18 @@ pub struct BatchQuery<'a> {
 }
 
 /// `BatchEngine::batch_search` の 1 クエリ分の結果。
+///
+/// 対象ビヘイビア: TABLE-12・RLS-9。要素はテナント修飾済みの [`SearchHit`]
+/// であり、`(tenant_id, id)` で行を一意に解決できる契約（`core.rs::
+/// VectorCore::search` の戻り値と同一契約。PR #205 で `CandidateHit` から
+/// 変更した破壊的変更）。同点タイブレークは選出段の候補識別子（常駐行列の
+/// 行スロット番号）の昇順であり、行ストアから構築する場合（#178）は
+/// `(tenant_id, id)` キー順で行を渡す前提のため実質 `(tenant_id, id)` 昇順、
+/// 単一テナント内では従来どおり `id` 昇順になる（`docs/design/
+/// rrf-tie-break-determinism.md` の順序契約と整合）。
 #[derive(Debug)]
 pub struct BatchHit {
-    pub hits: Vec<CandidateHit>,
+    pub hits: Vec<SearchHit>,
 }
 
 /// バッチ走査パイプラインの行ソース抽象（TASK-129・CORE-8 ポインタ）。
@@ -948,6 +974,26 @@ impl BatchRowSource for ResidentMatrix {
         // `self.row_f32_into(...)` は無限再帰にならない）。
         ResidentMatrix::row_f32_into(self, idx, out)
     }
+}
+
+/// 候補識別子（常駐行列のスロット番号）を `(tenant_id, id, visibility)` へ解決する
+/// （対象ビヘイビア: TABLE-12・RLS-9。`core.rs::resolve_slot_hits` と同じ考え方。
+/// PR #205）。`run_batch_search`（選出後の独立再検証）と `batch_fallback.rs::
+/// revalidate_primary_hits`（untrusted primary backend 出力の再検証用マップ構築）
+/// の両方から共用し、解決ロジックの二重管理を防ぐ。
+///
+/// スロットが範囲外（provider・backend の契約違反）の場合は `None` を返し、
+/// 呼び出し元は結果を一切返さず fail-closed に拒否する。添字アクセス（`[]`）は
+/// 使わず `get()` のみで解決する（coding-rust.md「untrusted 入力の扱い」対応）。
+pub(crate) fn resolve_batch_slot<S: BatchRowSource>(
+    source: &S,
+    slot: u64,
+) -> Option<(&str, u64, Visibility)> {
+    let idx = usize::try_from(slot).ok()?;
+    let tenant = source.tenant_ids().get(idx)?.as_str();
+    let id = *source.ids().get(idx)?;
+    let visibility = *source.visibilities().get(idx)?;
+    Some((tenant, id, visibility))
 }
 
 /// バッチクエリ・一括インデクシング専用のエンジン（CORE-6/7 ポインタ）。
@@ -1198,21 +1244,6 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         }
     }
 
-    // `Public` 許可クエリが 1 件も無ければ、バッチ外テナントの行はどのみち
-    // 到達不能（下記の行外側ループの `row_is_reachable` 判定と対応）。その
-    // 場合に `extra_public_row_count` を課金・確保対象へ含めると、
-    // 「無関係なテナントの `Public` 行が大量に存在するデータセット」を
-    // 理由に、実際には 1 行も走査しない安価なバッチまで高コスト扱いに
-    // してしまう（可用性の後退）。到達しうる場合のみ計上する。
-    let public_grant_query_count_nonzero = public_grant_query_count > 0;
-    let matching_row_count: usize = tenant_row_counts.values().sum::<usize>().saturating_add(
-        if public_grant_query_count_nonzero {
-            extra_public_row_count
-        } else {
-            0
-        },
-    );
-
     // 走査開始前の計算量ガード（codex P1 指摘対応・Cursor Medium 指摘対応・
     // codex P1 追加指摘対応・TASK-89 追加指摘対応）。個別クエリの入力エラー
     // （次元不一致・非有限値・k 範囲外）を上の 1 巡目で先に確定させた上で、
@@ -1357,38 +1388,6 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         }
     }
 
-    // id → (tenant, visibility) の逆引き表（選出後の独立再検証用）。
-    // `ResidentMatrix::build` が id の重複を拒否しているため、id は
-    // (tenant, visibility) を一意に決める（[`BatchSearchError::DuplicateRowId`]
-    // 参照）。選出段のマスク実装（行 index からの `PolicyContext::is_visible`
-    // 呼び出し）とは別経路でこの表を組むことで、二重防御を維持する。
-    // 登録対象は「バッチのテナントに属する行」に加え、TASK-89（TABLE-9）
-    // 対応で「`Public` 許可クエリが 1 件以上ある場合の、データセット全体の
-    // `Public` 行」（`matching_row_count` の計上と対応。上記の計算量ガードが
-    // この拡張分のコストも `cross_tenant_public_work` として覆う）。それ以外
-    // の行は登録しない（バッチ外テナントの id が万一 hit に混入した場合を
-    // 確実にマップ不在 → `TenantMaskViolation` にする fail-closed 側の効果を
-    // 維持する）。`HashMap::with_capacity` ではなく `try_reserve`
-    // （フォールブル）で確保する（codex P1 指摘対応）。予約量は上で数えた
-    // `matching_row_count` をそのまま再利用する。
-    let mut id_to_tenant: std::collections::HashMap<u64, (&str, Visibility)> =
-        std::collections::HashMap::new();
-    id_to_tenant.try_reserve(matching_row_count).map_err(|e| {
-        BatchSearchError::AllocationFailed(format!("failed to reserve id-tenant map: {e}"))
-    })?;
-    for ((id, tenant), visibility) in source
-        .ids()
-        .iter()
-        .zip(source.tenant_ids().iter())
-        .zip(source.visibilities().iter())
-    {
-        let is_reachable_public =
-            public_grant_query_count_nonzero && *visibility == Visibility::Public;
-        if batch_tenants.contains(tenant.as_str()) || is_reachable_public {
-            id_to_tenant.insert(*id, (tenant.as_str(), *visibility));
-        }
-    }
-
     // 行外側ループ: 行 1 件につき 1 回だけデコードし、その行に到達しうる
     // クエリ集合だけを走査する（Cursor Medium 指摘対応: 以前はクエリ側を
     // バッチ全体で舐める O(matching_rows * queries.len()) のネストループに
@@ -1434,7 +1433,13 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
         if !row_is_reachable {
             continue;
         }
-        let Some(id) = source.ids().get(row_idx).copied() else {
+        // 候補識別子は行 `id` ではなく常駐行列のスロット番号（対象ビヘイビア:
+        // TABLE-12・RLS-9。`core.rs::slot_ids_for`/`resolve_slot_hits` と同じ
+        // 方式）。行 `id` の一意性スコープはテナント内に閉じているため、id を
+        // 直接候補識別子にすると異なるテナントの同一 `id` 行を選出後に区別
+        // できない。`u64::try_from` の checked 変換で拒否できない行は
+        // 候補にしない（`MAX_BATCH_ROWS` 上限により通常到達しない防御的分岐）。
+        let Ok(slot) = u64::try_from(row_idx) else {
             continue;
         };
         if source.row_f32_into(row_idx, &mut row_buf.buf).is_none() {
@@ -1482,7 +1487,7 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
             if !score.is_finite() {
                 continue;
             }
-            selector.push(CandidateHit { id, score });
+            selector.push(CandidateHit { id: slot, score });
         }
     }
 
@@ -1500,16 +1505,46 @@ pub(crate) fn run_batch_search<S: BatchRowSource>(
     let mut out: Vec<BatchHit> = Vec::new();
     try_reserve_exact(&mut out, queries.len(), "batch results")?;
     for (q, selector) in queries.iter().zip(selectors) {
-        let hits = selector.into_sorted_vec();
+        let candidates = selector.into_sorted_vec();
 
-        // (2) 選出後の独立再検証: 返す id が全て `PolicyContext::is_visible`
-        // を満たす行由来であることを、マスク実装（行 index からの判定）
-        // から独立に id → (tenant, visibility) の逆引き表で確認する。
-        for hit in &hits {
-            match id_to_tenant.get(&hit.id) {
-                Some(&(t, v)) if q.ctx.is_visible(t, v) => {}
-                _ => return Err(BatchSearchError::TenantMaskViolation),
+        // (2) 選出後の独立再検証: 各ヒットのスロットをマスク実装（行 index
+        // からの判定）とは独立に `(tenant_id, id, visibility)` へ解決し
+        // （`resolve_batch_slot`）、`PolicyContext::is_visible` を満たすことを
+        // 確認する（対象ビヘイビア: TABLE-12・RLS-9。`core.rs::resolve_slot_hits`
+        // と同じ考え方）。解決不能・不可視のいずれも結果を一切返さず拒否する
+        // （fail-closed）。`String` 確保はここ（高々 `k` 件）でのみ発生し、
+        // 行外側ループのホットパスには入らない。
+        //
+        // 旧実装は `id_to_tenant` の登録対象を「バッチのテナントに属する行」
+        // または「`Public` 許可クエリがある場合の `Public` 行」に絞っていたが
+        // （バッチ外テナントの id が hit に混入した場合を確実にマップ不在に
+        // する追加のフィルタ）、本実装は `resolve_batch_slot` で常駐行列の
+        // 任意の行を解決したうえで `is_visible` のみを判定する。この単純化が
+        // fail-closed 性を弱めないのは、`is_visible(t, v)` が真になるのは
+        // (a) `t == q.ctx.tenant_id()`（＝バッチのテナント集合に属する）か、
+        // (b) `v == Visibility::Public` かつ `q.ctx` が `Public` を許可
+        // （＝「`Public` 許可クエリがある場合の `Public` 行」）のいずれか
+        // だけであり、旧フィルタの受理条件を `is_visible` の判定が構造的に
+        // 包含するため（旧フィルタが弾いていた行は `is_visible` も必ず偽になる）。
+        let mut hits: Vec<SearchHit> = Vec::new();
+        try_reserve_exact(&mut hits, candidates.len(), "batch resolved hits")?;
+        for hit in &candidates {
+            let Some((tenant, id, visibility)) = resolve_batch_slot(source, hit.id) else {
+                return Err(BatchSearchError::TenantMaskViolation);
+            };
+            if !q.ctx.is_visible(tenant, visibility) {
+                return Err(BatchSearchError::TenantMaskViolation);
             }
+            // `SearchHit::new`（`impl Into<String>` 経由の `String::from`）では
+            // なくフォールブルな `try_owned_str` で `tenant_id` を複製する
+            // （`sum(k)` は最大 [`MAX_BATCH_TOTAL_K`]（100 万）まで達しうるため、
+            // `ResidentMatrix::build` の `tenant_ids` 複製と同じ理由で
+            // abort-on-OOM を避ける）。
+            hits.push(SearchHit {
+                tenant_id: try_owned_str(tenant)?,
+                id,
+                score: hit.score,
+            });
         }
 
         out.push(BatchHit { hits });
@@ -1800,17 +1835,30 @@ mod tests {
         assert_eq!(err, BatchSearchError::ArenaLengthMismatch);
     }
 
-    // codex レビュー指摘対応: id 重複は fail-closed で拒否する（重複を許すと
-    // id → tenant が一意に定まらず、`batch_search` の選出後独立再検証（id ベース）
-    // が別テナントの行を取り違えうるため）。
+    // 対象ビヘイビア: TABLE-12・RLS-9。同一テナント内の id 重複は fail-closed で
+    // 拒否する（`(tenant_id, id)` 複合キーが行を一意に定めなくなり、選出後再検証
+    // が同一テナント内の別行を取り違えうるため）。
     #[test]
     fn resident_matrix_rejects_duplicate_ids() {
         let ids = [1u64, 1];
-        let tenants = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let tenants = ["tenant-a".to_string(), "tenant-a".to_string()];
         let visibilities = [Visibility::Public, Visibility::Public];
         let vectors = [1.0f32, 0.0, 0.0, 1.0];
         let err = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap_err();
         assert_eq!(err, BatchSearchError::DuplicateRowId);
+    }
+
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。行 `id` の一意性スコープは
+    // テナント内に閉じているため、異なるテナントが同じ `id` を持つ入力は正当で
+    // あり `DuplicateRowId` にならない。
+    #[test]
+    fn resident_matrix_accepts_same_id_across_tenants() {
+        let ids = [1u64, 1];
+        let tenants = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = [Visibility::Public, Visibility::Public];
+        let vectors = [1.0f32, 0.0, 0.0, 1.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors).unwrap();
+        assert_eq!(matrix.row_count(), 2);
     }
 
     // Cursor Bugbot 指摘対応: 容量チェックは `MAX_TENANT_ID_LEN` で予算計上する
@@ -2023,6 +2071,65 @@ mod tests {
         }
     }
 
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。行 `id` の一意性スコープは
+    // テナント内に閉じているため、異なるテナントが同じ `id`（ここでは `1`）を
+    // 持つ `Private` フィクスチャで、`tenant-a` のクエリが自テナントの行
+    // `(tenant-a, 1)` だけを返し、`tenant-b` の同 `id` 行が混入しないことを
+    // 確認する（選出後の独立再検証が `(tenant_id, id)` 基準であることの
+    // 直接的な回帰）。
+    #[test]
+    fn batch_search_returns_only_own_row_when_other_tenant_shares_id() {
+        let ids = [1u64, 1];
+        let tenants = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = [Visibility::Private, Visibility::Private];
+        let vectors = [1.0f32, 0.0, 1.0, 0.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors)
+            .expect("valid matrix");
+        let engine = BatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let ctx_a = private_ctx("tenant-a");
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 10,
+            ctx: &ctx_a,
+        }];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        assert_eq!(results[0].hits.len(), 1);
+        assert_eq!(results[0].hits[0].tenant_id, "tenant-a");
+        assert_eq!(results[0].hits[0].id, 1);
+    }
+
+    // 対象ビヘイビア: TABLE-12・RLS-9（PR #205）。`Public` 行で `tenant-a`・
+    // `tenant-b` が同じ `id`（`1`）を共有する場合、`PolicyContext::new`
+    // （`Public` のみ許可）のクエリからは両テナントの行が別ヒットとして返り、
+    // 各ヒットの `tenant_id` が正しく行の所属を示すことを確認する。
+    #[test]
+    fn batch_search_returns_both_tenants_public_rows_sharing_id() {
+        let ids = [1u64, 1];
+        let tenants = ["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = [Visibility::Public, Visibility::Public];
+        let vectors = [1.0f32, 0.0, 1.0, 0.0];
+        let matrix = ResidentMatrix::build(&ids, &tenants, &visibilities, 2, &vectors)
+            .expect("valid matrix");
+        let engine = BatchEngine::new(matrix);
+        let query_vec = [1.0f32, 0.0];
+        let ctx_a = ctx("tenant-a");
+        let queries = vec![BatchQuery {
+            vector: &query_vec,
+            k: 10,
+            ctx: &ctx_a,
+        }];
+        let results = engine.batch_search(&queries).expect("batch search ok");
+        let returned: std::collections::HashSet<(&str, u64)> = results[0]
+            .hits
+            .iter()
+            .map(|h| (h.tenant_id.as_str(), h.id))
+            .collect();
+        assert_eq!(results[0].hits.len(), 2, "both shared-id rows must return");
+        assert!(returned.contains(&("tenant-a", 1)));
+        assert!(returned.contains(&("tenant-b", 1)));
+    }
+
     // codex P0 指摘対応: `Visibility::Private` の行は、`PolicyContext::new`
     // （既定・最小権限で `Public` のみ許可）では不可視のままであることを
     // 確認する（`policy.rs::private_requires_explicit_grant` と同じ CORE-2 ポインタの
@@ -2145,15 +2252,24 @@ mod tests {
         let matrix = build_two_tenant_matrix();
         // マスクを経由せず「全行を無条件に候補にする」経路を直接模した結果集合
         // （実装コードのマスク段を使わず、テストがここで意図的に違反を作る）。
+        // 候補識別子は本体コードと同じくスロット番号（対象ビヘイビア:
+        // TABLE-12・RLS-9。PR #205）。
         let simulated_unmasked_hits = [
-            CandidateHit { id: 1, score: 1.0 }, // tenant-a: 正当
-            CandidateHit { id: 3, score: 1.0 }, // tenant-b: 混入（検出されるべき）
+            CandidateHit { id: 0, score: 1.0 }, // slot 0 = (tenant-a, 1): 正当
+            CandidateHit { id: 2, score: 1.0 }, // slot 2 = (tenant-b, 3): 混入（検出されるべき）
         ];
-        let tenant_a_ids: std::collections::HashSet<u64> =
-            [matrix.ids[0], matrix.ids[1]].into_iter().collect();
-        let violation = simulated_unmasked_hits
-            .iter()
-            .any(|hit| !tenant_a_ids.contains(&hit.id));
+        // 期待集合は `(tenant_id, id)` キー（`resolve_batch_slot` と同じ解決結果）。
+        let tenant_a_keys: std::collections::HashSet<(&str, u64)> =
+            [("tenant-a", matrix.ids[0]), ("tenant-a", matrix.ids[1])]
+                .into_iter()
+                .collect();
+        let violation =
+            simulated_unmasked_hits
+                .iter()
+                .any(|hit| match resolve_batch_slot(&matrix, hit.id) {
+                    Some((tenant, id, _visibility)) => !tenant_a_keys.contains(&(tenant, id)),
+                    None => true,
+                });
         assert!(
             violation,
             "independent checker failed to detect a tenant mask violation"
@@ -2577,10 +2693,10 @@ mod tests {
     // `Public` を許可しないクエリ（`Private` のみ許可）だけのバッチでは、
     // `public_grant_query_count` が 0 になり、バッチに登場しない tenant-c の
     // `Public` 行はそもそも到達不能（TABLE-9 は `Public` 許可クエリにしか
-    // 効かない）。この場合は同じ常駐行列（tenant-c 側の行数は上のテストと
-    // 同じ 400 件）でもコストを一切払わず成功し、tenant-c の id も一切
-    // 返らないことを確認する（`public_grant_query_count_nonzero` ゲートの
-    // 回帰）。
+    // 効かない）。`cross_tenant_public_work` は `public_grant_query_count` を
+    // 乗じる積で計算されるため、この場合は同じ常駐行列（tenant-c 側の行数は
+    // 上のテストと同じ 400 件）でもコストを一切払わず成功し、tenant-c の id も
+    // 一切返らないことを確認する。
     #[test]
     fn batch_search_does_not_charge_foreign_public_rows_when_no_query_grants_public() {
         let matrix = build_tenant_a_and_foreign_public_matrix(400);

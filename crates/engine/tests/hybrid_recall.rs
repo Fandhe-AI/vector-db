@@ -29,14 +29,14 @@
 //!   environment `recall-gate` の Actions variables から注入）と実測値を比較する
 //!   閾値ゲート。既定（非 strict）では未設定・空文字列を「ゲート未設定＝明示的に
 //!   対象外」として成功終了する（silent skip にはしない。
-//!   `parallel_bench.rs::core5_requested_from_env` と同じ opt-in 方式）。
+//!   `simd_bench.rs::core5_requested_from_env` と同じ opt-in 方式）。
 //!   `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（`recall.yml` からの実行（dispatch /
 //!   schedule）時のみ注入される strict モードフラグ）が立っている場合は、未設定も
 //!   非数値・範囲外と同様に fail-closed でテスト失敗とする——environment 作成漏れ・
 //!   variable 名の誤り・variable の誤削除により「一度も評価していない run」が
 //!   基準を満たした run と同じ green になる事故を防ぐ（PR #147 codex-review P1
 //!   継続指摘対応。[`GateThreshold`]・[`resolve_gate_threshold`] 参照）。ログには
-//!   実測値と pass/fail のみを出力する（`crates/engine/benches/parallel_bench.rs`
+//!   実測値と pass/fail のみを出力する（`crates/engine/benches/simd_bench.rs`
 //!   と同方針）。実測値（Recall@k）は
 //!   [`RecallResult::recall20`]/[`RecallResult::recall100`] が定義するとおり
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
@@ -567,7 +567,7 @@ fn hybrid_recall_large_scale_regression() {
 enum GateThreshold {
     /// 環境変数が未設定、または GitHub Actions の未設定 repo/environment variable が
     /// 解決する空文字列（`.github/workflows/bench.yml` の `BENCH_MAX_P95_MS` 等と
-    /// 同じ経路。`crates/engine/benches/parallel_bench.rs::min_recall_from_env`
+    /// 同じ経路。`crates/engine/benches/simd_bench.rs::min_recall_from_env`
     /// 冒頭コメント参照）。
     NotConfigured,
     /// 設定済みで `(0.0, 1.0]` の範囲内。この場合のみ実測値と比較する。
@@ -607,7 +607,7 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
 /// strict モードが無効（ローカル `make recall-regression`・仮に PR 経由で
 /// `--ignored` を明示指定して実行した場合）は、閾値未設定を「対象外」として
 /// 明示的に成功終了する opt-in 挙動を維持する
-/// （`parallel_bench.rs::core5_requested_from_env` と同型）。
+/// （`simd_bench.rs::core5_requested_from_env` と同型）。
 ///
 /// strict モードが有効な場合は未設定を「一度も評価していない run」とみなし、
 /// 非数値・範囲外と同様に fail-closed でテスト失敗とする。これにより

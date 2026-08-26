@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
-use engine::rls::PrefilterIndex;
+use engine::rls::{PrefilterIndex, RlsError};
 use engine::storage::{RowInput, Storage, Visibility};
 
 // ---------- 決定的擬似乱数（xorshift64*。`tests/hybrid_recall.rs` と同一実装。外部クレート不使用） ----------
@@ -362,6 +362,74 @@ fn rls4_top_k_matches_independently_computed_full_scan_ranking() {
             actual, scored,
             "PrefilterIndex top-{K} must match the independently computed full-scan \
              ranking (query={query_idx})"
+        );
+    }
+}
+
+// Issue #179（PR #151 レビュー据え置き事項）の受け入れ条件: `drop_table` → 再作成をまたぐと、
+// drop 前に構築した `PrefilterIndex` は世代不一致で `RlsError::IndexStale` になり、削除済み
+// 行・旧スキーマの行に基づく結果を返す経路がないことを公開 API のみで検証する。
+#[test]
+fn rls_prefilter_index_is_invalidated_across_drop_table_and_recreate() {
+    const NUM_ROWS: u64 = 200;
+
+    let path = unique_db_path("rls-drop-table");
+    let _cleanup = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    let old_ids = seed_corpus(&storage, "docs", NUM_ROWS, 0.5, 9000);
+
+    let ctx = PolicyContext::new(TARGET_TENANT).expect("valid tenant");
+    let stale_index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build prefilter index");
+
+    storage.drop_table("docs").expect("drop table");
+
+    // 同名・同次元で再作成し、旧 id 範囲とは重ならない新規行だけを投入する。
+    storage
+        .create_table(&schema_for("docs", DIM))
+        .expect("recreate table");
+    let new_ids: Vec<u64> = (NUM_ROWS + 1..=NUM_ROWS + 50).collect();
+    let mut rng = Xorshift64::new(9500);
+    let embeddings: Vec<Vec<f32>> = new_ids
+        .iter()
+        .map(|_| (0..DIM).map(|_| rng.next_f32_signed()).collect())
+        .collect();
+    let rows: Vec<(u64, RowInput<'_>)> = new_ids
+        .iter()
+        .zip(embeddings.iter())
+        .map(|(&id, embedding)| {
+            (
+                id,
+                RowInput {
+                    tenant_id: TARGET_TENANT,
+                    visibility: Visibility::Public,
+                    embedding,
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    seed_rows_grouped_by_tenant(&storage, "docs", &rows);
+
+    // drop 前に構築したインデックスへの検索は、旧行を一切返さず fail-closed に拒否される。
+    let stale_result = stale_index.search(&ctx, &CpuScalarProvider, &random_query(9600), 20);
+    assert!(matches!(stale_result, Err(RlsError::IndexStale)));
+
+    // 再作成後に新規構築したインデックスは、新規 id 範囲のみを返し旧 id を一切含まない。
+    let fresh_index = PrefilterIndex::build(&storage, "docs", &ctx).expect("rebuild index");
+    let hits = fresh_index
+        .search(&ctx, &CpuScalarProvider, &random_query(9600), 20)
+        .expect("search on fresh index");
+    assert!(!hits.is_empty(), "fresh index should return the new rows");
+    for hit in &hits {
+        assert!(
+            new_ids.contains(&hit.id),
+            "hit id={} must be within the newly inserted id range",
+            hit.id
+        );
+        assert!(
+            !old_ids.contains(&hit.id),
+            "hit id={} must not be a stale id from before drop_table",
+            hit.id
         );
     }
 }

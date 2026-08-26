@@ -298,6 +298,12 @@ impl PrefilterSnapshot {
     /// （違反は [`RlsError::ProviderResultRejected`]）。事前・事後の確認自体は互いに独立した
     /// 読み取りであり、事後確認と `Ok(hits)` 返却の間に残るごく短いウィンドウは次回検索の
     /// 世代照合で扱う。TASK-133・TASK-169・RLS-1〜4 参照。
+    ///
+    /// DDL（`catalog.rs` の `create_table`／`alter_table_add_column`／`drop_table`）も
+    /// すべて `bump_generation_and_commit` 経由で commit するため世代を進める。
+    /// テーブルを drop して再作成した場合も同じ世代照合で検出され、drop 前に構築した
+    /// スナップショットは drop 後・再作成後のいずれでも `IndexStale` になる
+    /// （Issue #179。削除済み行・旧スキーマの行に基づく結果を返す経路を作らない）。
     pub(crate) fn search_with(
         &self,
         storage: &Storage,
@@ -1293,6 +1299,76 @@ mod tests {
 
         let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
         assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // テーブルを drop すると、drop 前に構築したインデックスへの検索は世代不一致により
+    // `RlsError::IndexStale` で拒否される（Issue #179。旧行を返す経路がないことの確認）。
+    #[test]
+    fn search_rejects_after_table_is_dropped() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        storage.drop_table("docs").expect("drop table");
+
+        let result = index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(RlsError::IndexStale)));
+    }
+
+    // drop → 同名・同次元での再作成をまたいでも、旧インデックスは stale のまま。
+    // 新規に構築したインデックスは再作成後の新規行のみを返す（旧行を含まない）。
+    #[test]
+    fn search_rejects_after_table_is_dropped_and_recreated_with_new_rows() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        insert(
+            &storage,
+            "docs",
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let stale_index = PrefilterIndex::build(&storage, "docs", &ctx).expect("build index");
+
+        storage.drop_table("docs").expect("drop table");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("recreate table");
+        insert(
+            &storage,
+            "docs",
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 0.0],
+        );
+
+        let stale_result = stale_index.search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10);
+        assert!(matches!(stale_result, Err(RlsError::IndexStale)));
+
+        let fresh_index = PrefilterIndex::build(&storage, "docs", &ctx).expect("rebuild index");
+        let hits = fresh_index
+            .search(&ctx, &CpuScalarProvider, &[1.0, 0.0], 10)
+            .expect("search succeeds on fresh index");
+        let ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![2]);
     }
 
     // tenant_id は変わらず visibility だけが構築時 ctx の許可範囲外へ書き換わった場合も

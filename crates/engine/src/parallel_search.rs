@@ -233,6 +233,21 @@ fn thread_count_for(row_count: usize) -> usize {
     available.min(by_rows).max(1)
 }
 
+/// [`ParallelSearchProvider::search`] が `row_count` 件のテーブルに対して実際に
+/// 起動しようとするワーカースレッド数（[`GLOBAL_WORKER_BUDGET`] による同時実行
+/// クエリ間の縮退は考慮しない上限値）を呼び出し元へ公開する。`thread_count_for` は
+/// 非 `pub` のため、ベンチ・スモークテストなど本クレート外から「この行数・この
+/// 実行環境で実際に複数スレッドへ分割されるか」を事前に判定したい呼び出し元
+/// （`benches/simd_bench.rs` の診断 A/B 等。Cursor Bugbot 指摘・PR #222）向けの
+/// 薄いラッパーとして用意する。
+///
+/// 返り値が 2 未満の場合、その `row_count` での `search` は
+/// `std::thread::available_parallelism()`（CI runner・ローカル環境のコア数に依存）
+/// 由来の縮退も含めて単一スレッド経路（並列化なし）を通ることを意味する。
+pub fn expected_thread_count(row_count: usize) -> usize {
+    thread_count_for(row_count)
+}
+
 /// `ids`（担当範囲だけに絞り込み済み）と `vectors`（絞り込まず全行分。`row_offset` を
 /// 起点とする絶対行インデックスで参照する）に対して総当たり Top-k を選出する。
 /// 単一スレッド経路・並列ワーカーの両方から呼ばれる共通処理。
