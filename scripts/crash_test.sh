@@ -42,17 +42,68 @@ if [ ! -d "${WORKDIR}" ]; then
   exit 1
 fi
 
+# writer（crash_tool write）の PID を保持する。ループ内で起動するたびに更新され、
+# `wait` で reap 済みなら空文字へ戻す（不変条件は stop_writer のコメント参照）。
+# trap 設定（後述の trap cleanup EXIT / INT TERM）より前に初期化しておかないと、
+# trap 設置後・ループ内で writer_pid=$! に到達する前の窓で SIGTERM/SIGINT を受けた
+# 場合に set -u 下で cleanup が未定義変数エラーになり、
+# 本来の目的（writer 停止）を果たさず異常終了してしまう。
+writer_pid=""
+
+# バックグラウンドの writer（crash_tool write）を確実に停止する。
+# 呼び出し元は cleanup（EXIT/INT/TERM 経路）とループ内の各停止経路。
+# - writer_pid が空なら何もしない（reap 済み PID は OS に再利用され得るため、
+#   空のまま kill すると無関係な別プロセスを誤って殺しかねない）
+# - SIGKILL を使うのは、writer 側にシグナルハンドラが無く WORKDIR ごと破棄される
+#   前提のプロセスであり、graceful 停止に意味が無い・ハングしない・本スクリプトの
+#   他の停止経路（成功パスの SIGKILL 判定）と手段を揃えられるため
+# - wait で確実に reap してから writer_pid をクリアする（クリア漏れがあると
+#   cleanup からの再呼び出しで別プロセスへの誤 kill につながる）
+stop_writer() {
+  if [ -n "${writer_pid}" ]; then
+    kill -9 "${writer_pid}" 2>/dev/null
+    wait "${writer_pid}" 2>/dev/null
+    writer_pid=""
+  fi
+}
+
 # INT/TERM は bash の trap ハンドラ実行後もスクリプトの次の文から実行を継続する
 # 仕様があるため、EXIT と INT/TERM を同一 trap にまとめると中断時に WORKDIR 削除後も
 # ループが続行し、以降の参照が不可解なエラーで異常終了する。cleanup（削除処理）は
 # EXIT 用に分離し、INT/TERM では明示的に exit 130 で打ち切ることでハンドラ実行後の
 # 継続を防ぐ（130 は SIGINT の慣例終了コードだが、本スクリプトでは TERM 受信時も
 # 同じ値で統一して打ち切る）。
+#
+# cleanup は「writer 停止 → WORKDIR 削除」の順序を守る（本質的な点）。逆順にすると
+# WORKDIR を unlink した後も writer が生存を続け、削除済み redb ファイルへ書き込みを
+# 続ける survivor が残る（プロセスグループではなくスクリプト単体へ SIGTERM/SIGINT が
+# 送られた場合、trap されるのは本スクリプトのみで子である writer には届かないため、
+# 明示的な停止が無いと writer は親を失ったまま MAX_ROWS まで自走しディスク・CPU を
+# 消費し続ける。Issue #134）。
+# `cleanup; exit 130` は EXIT trap も再度走らせる（exit で EXIT trap が発火する）が、
+# stop_writer は writer_pid 空なら no-op・`rm -rf` は対象が既に無ければ何もしないため
+# 2 回実行しても安全（冪等）。
 cleanup() {
+  stop_writer
   rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
 trap 'cleanup; exit 130' INT TERM
+
+# 中断パスの検証手順（受け入れ基準: Issue #134）。自動化版は
+# scripts/crash_test_interrupt.sh（`make crash-test-interrupt`）。
+#   - スクリプト単体への SIGTERM（プロセスグループを介さない経路）:
+#     scripts/crash_test.sh 100 & pid=$!; sleep 5; kill -TERM "$pid"; wait "$pid"
+#     → 終了コード 130・`pgrep -f 'crash_tool write'` の出力が空（survivor 無し）
+#   - プロセスグループへの SIGTERM（`set -m` 下・端末の Ctrl+C 相当）:
+#     ( set -m; scripts/crash_test.sh 100 & pid=$!; sleep 5; kill -TERM -- "-$pid"; wait "$pid" )
+#     → 同様に survivor 無しであることを確認する
+
+# 以下の 1 行は単なる進捗表示ではなく、scripts/crash_test_interrupt.sh が
+# `sed -n 's/^workdir: //p'` で WORKDIR を取り出し「中断後に削除されたか」を
+# 判定するための契約（load-bearing）。書式（行頭 `workdir: ` + パス）を変更する
+# 場合は crash_test_interrupt.sh のパースも併せて更新すること。
+echo "workdir: ${WORKDIR}"
 DB_PATH="${WORKDIR}/crash_test.redb"
 WRITE_LOG="${WORKDIR}/write.log"
 
@@ -80,6 +131,12 @@ for i in $(seq 1 "${ITERATIONS}"); do
     fi
     if ! kill -0 "${writer_pid}" 2>/dev/null; then
       # writer が同期点に到達する前に終了した（起動失敗など）。
+      # kill -0 は zombie に対しては成功するため、失敗＝ESRCH＝bash が既に reap
+      # 済みで PID が OS に再利用され得る状態。writer_pid の「未 reap の子だけを
+      # 指す」不変条件を保つためクリアし、下の stop_writer が再利用済み PID へ
+      # kill -9 を送らないようにする（タイムアウトで抜ける経路では writer は生存中
+      # なので writer_pid は保持され、stop_writer が正しく停止する）。
+      writer_pid=""
       break
     fi
     sleep 0.1
@@ -89,8 +146,7 @@ for i in $(seq 1 "${ITERATIONS}"); do
   if [ "${started}" != "true" ]; then
     timeout_ms=$((WRITE_START_TIMEOUT_TENTHS * 100))
     echo "ERROR: writer did not report progress within ${timeout_ms}ms" >&2
-    kill -9 "${writer_pid}" 2>/dev/null
-    wait "${writer_pid}" 2>/dev/null
+    stop_writer
     exit 1
   fi
 
@@ -99,26 +155,38 @@ for i in $(seq 1 "${ITERATIONS}"); do
   sleep "0.$(printf '%03d' "${wait_ms}")"
 
   if ! kill -9 "${writer_pid}" 2>/dev/null; then
-    echo "ERROR: kill -9 failed for writer pid ${writer_pid} at iteration ${i} (writer may have already exited on its own, e.g. a put error or safety limit); this iteration cannot verify SIGKILL crash resilience" >&2
+    # kill が失敗する＝対象 PID が既に存在しない（ESRCH）。writer は自発終了し
+    # bash に reap 済みで、その PID は OS に再利用され得る。ここで writer_pid を
+    # 保持したまま exit 1 すると EXIT trap（cleanup → stop_writer）が同じ PID へ
+    # 再度 kill -9 を送り、無関係なプロセスを巻き込む。未 reap の子だけを指す
+    # という writer_pid の不変条件を保つため、退避してから即クリアする。
+    reaped_writer_pid="${writer_pid}"
+    writer_pid=""
+    echo "ERROR: kill -9 failed for writer pid ${reaped_writer_pid} at iteration ${i} (writer may have already exited on its own, e.g. a put error or safety limit); this iteration cannot verify SIGKILL crash resilience" >&2
     cat "${WRITE_LOG}" >&2
     exit 1
   fi
 
   wait "${writer_pid}" 2>/dev/null
   writer_status=$?
+  # reap 済みの PID は OS に回収され別プロセスへ再利用され得る。共有変数
+  # writer_pid は「未 reap の子だけを指す」不変条件（stop_writer のコメント参照）
+  # を保つため、終了状態の判定より前にクリアする。判定を挟んでからクリアすると、
+  # 下の fail-closed な `exit 1` 経路が writer_pid を保持したまま EXIT trap
+  # （cleanup → stop_writer）へ入り、reap 済み PID へ kill -9 を送って同一 runner 上の
+  # 無関係なプロセスを巻き込みかねない。メッセージ用には退避した値を使う。
+  reaped_writer_pid="${writer_pid}"
+  writer_pid=""
+
   # `wait` は SIGKILL で終了したプロセスに対して 128+9=137 を返す。
   # それ以外（writer が kill 到達前に自発終了した等）は SIGKILL を検証できて
   # いない反復であり、テストの目的（強制終了下での整合性検証）を満たさない
   # ため fail-closed で拒否する。
   if [ "${writer_status}" -ne 137 ]; then
-    echo "ERROR: writer pid ${writer_pid} did not terminate via SIGKILL at iteration ${i} (wait exit status=${writer_status}, expected 137); this iteration did not exercise a real SIGKILL crash" >&2
+    echo "ERROR: writer pid ${reaped_writer_pid} did not terminate via SIGKILL at iteration ${i} (wait exit status=${writer_status}, expected 137); this iteration did not exercise a real SIGKILL crash" >&2
     cat "${WRITE_LOG}" >&2
     exit 1
   fi
-
-  # wait で reap 済みの PID は OS に回収され再利用され得るため、以降のエラーパスで
-  # 誤って無関係な別プロセスへ kill してしまわないようクリアしておく。
-  writer_pid=""
 
   verify_output="$("${BIN}" verify "${DB_PATH}")"
   echo "${verify_output}"
