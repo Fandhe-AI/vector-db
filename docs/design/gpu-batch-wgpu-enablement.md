@@ -18,7 +18,7 @@
 | 目的 | Vulkan/Metal/DX12 の compute を単一 API で扱うため。各 GPU API を自作 FFI で叩くと依存最小方針に反して肥大化する |
 | ライセンス | MIT OR Apache-2.0（本リポと同一） |
 | メンテ状況 | gfx-rs/wgpu。crates.io の 30.0.1 系。`rust-version = 1.87.0`（本リポ toolchain は stable。充足） |
-| 推移的依存 | 上記 feature 構成で新規 100 crate（`Cargo.lock` diff の `name = ` 追加行数で実測。`git diff <merge-base>..<この PR> -- Cargo.lock` で再現可能）。主要: `wgpu-core`/`wgpu-hal`/`wgpu-types`/`naga`/`ash`/`gpu-allocator`/`libloading`/`bitflags`/`thiserror`/`hashbrown`/`indexmap`/`smallvec`/`log`/`bytemuck`（`gpu-allocator` 経由の推移的依存。本体は `bytemuck` を使わず `to_ne_bytes`/`from_ne_bytes` でバイト変換する）/`parking_lot`・`parking_lot_core`（`wgpu-core` が間接的に要求し、features 指定では除外できない） |
+| 推移的依存 | 上記 feature 構成で新規 100 crate（`Cargo.lock` diff の `name =` 追加行で実測。`git diff <merge-base>..<この PR> -- Cargo.lock` で再現可能）。主要: `wgpu-core`/`wgpu-hal`/`wgpu-types`/`naga`/`ash`/`gpu-allocator`/`libloading`/`bitflags`/`thiserror`/`hashbrown`/`indexmap`/`smallvec`/`log`/`bytemuck`（`gpu-allocator` 経由の推移的依存。本体は `bytemuck` を使わず `to_ne_bytes`/`from_ne_bytes` でバイト変換する）/`parking_lot`・`parking_lot_core`（`wgpu-core` が間接的に要求し、features 指定では除外できない） |
 | cargo-deny | `make deny` で `advisories ok, bans ok, licenses ok, sources ok`（warn: `hashbrown`/`syn` の重複バージョンのみ。`multiple-versions = "warn"` 方針どおり） |
 | ビルド | `cargo check`／`cargo clippy --all-targets -- -D warnings` green。Vulkan ローダは `libloading` による実行時動的ロードのため、リンク時要件・CI runner への追加パッケージは不要 |
 
@@ -98,6 +98,27 @@ dispatch・チャンク分割・ベンチ A/B 実測配線）から縮小した�
   未実装。結合テスト（`tests/gpu_batch.rs`）は GPU の有無を実行時に判定し、
   利用不能な環境では該当分岐を `eprintln!` で報告して早期 return する
 
+### 2.4 選出結果の解決（`(tenant_id, id)` 契約への追随）
+
+`BatchHit.hits` は PR #205/#228 で `CandidateHit`（行 id 単独）から `SearchHit`
+（`(tenant_id, id)` で行を一意に解決できる型）へ変更されている。GPU 経路も
+CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検証」）と同じ
+`resolve_batch_slot` + `PolicyContext::is_visible` を通し、`finalize_gpu_hits`
+（`gpu_batch.rs`）で解決する。
+
+重要な帰結として、`TopKSelector` へ push する候補識別子は**行 id ではなく常駐
+行列のスロット番号**でなければならない。`TopKSelector` の同点タイブレークは
+候補識別子の昇順であり、`FallbackBatchEngine::revalidate_primary_hits` の順序
+検証は「スコア降順・同点はスロット昇順」を契約とするため、行 id を使うと
+`(tenant_id, id)` 順に並んだ通常のマルチテナント常駐行列で同点時に順序契約違反
+となり、正当な結果まで `PrimaryResultRejected` で拒否される（再検証違反は CPU
+縮退させず `Err` を返す設計のため、GPU 搭載環境で恒久的に失敗する）。
+
+`finalize_gpu_hits` は GPU デバイスに触れないため、GPU 非搭載環境（CI）でも
+順序・解決・fail-closed 挙動を単体テストできる（スロット昇順の確認・解決不能
+スロットの拒否・不可視行の拒否・テナント跨ぎ同一 `id` の区別、および出力が
+`revalidate_primary_hits` を通ること／行 id 順の出力が拒否されることの回帰）。
+
 ## 3. ローカル実測（開発環境）
 
 開発コンテナ内で GPU（NVIDIA、Vulkan backend）が実際に利用可能であることを
@@ -126,7 +147,7 @@ dispatch・チャンク分割・ベンチ A/B 実測配線）から縮小した�
 | ---- | ---- |
 | A03 インジェクション | WGSL は `const` 埋め込み。外部文字列からシェーダ・パラメータを組み立てない |
 | A01 アクセス制御（テナント境界 P0） | GPU は積和のみ。可視性判定は CPU 側の `PolicyContext::is_visible` 単一照合パス。`FallbackBatchEngine::revalidate_primary_hits` が GPU 出力を独立再検証する（既存 P0 防御を維持） |
-| A04 不安全な設計 / DoS | バッファサイズは `checked_*`・定数予算（`GPU_SCORE_BUFFER_BYTES`）で制限。計算量は `MAX_BATCH_WORK` を dispatch 前に適用 |
+| A04 不安全な設計 / DoS | バッファサイズは `checked_*`・定数予算（`GPU_SCORE_BUFFER_BUDGET_BYTES`）で制限。計算量は `MAX_BATCH_WORK` を dispatch 前に適用 |
 | fail-closed / panic 禁止 | `unwrap`/`expect`/添字アクセスは使わない。wgpu のエラー・デバイスロスト・ポーリング失敗はすべて `Result` で伝播する |
 | 情報漏えい | エラー/イベント文字列にテナント ID・クエリ・adapter 製品名を含めない |
 | A05 設定ミス / CORE-12 | GPU 経路を強制・無効化する環境変数・feature flag を `src/` に設けない（`InstanceDescriptor::new_without_display_handle()`） |

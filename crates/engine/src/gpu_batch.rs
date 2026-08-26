@@ -38,12 +38,12 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
-    compute_tenant_work, validate_batch_queries, BatchHit, BatchQuery, BatchRowSource,
-    MAX_BATCH_WORK,
+    compute_tenant_work, resolve_batch_slot, try_owned_str, try_reserve_exact,
+    validate_batch_queries, BatchHit, BatchQuery, BatchRowSource, BatchSearchError, MAX_BATCH_WORK,
 };
+use crate::kernel::SearchHit;
 use crate::kernel::{CandidateHit, TopKSelector};
 use crate::policy::PolicyContext;
-use crate::storage::Visibility;
 
 /// 1 回の GPU dispatch で読み戻すスコアバッファの予算（バイト）。adapter の
 /// `max_storage_buffer_binding_size` に依らず、compute の 1 次元 dispatch が
@@ -462,7 +462,11 @@ impl BatchBackend for GpuBatchBackend {
         let dim_half = dim.div_ceil(2);
         let query_stride = dim_half.saturating_mul(2);
 
-        let mut hits: Vec<BatchHit> = Vec::with_capacity(queries.len());
+        // `Vec::with_capacity`（abort-on-OOM）ではなくフォールブル確保にする
+        // （CPU 経路 `run_batch_search` の `out` と同じ方針。Issue #178 レビュー指摘）。
+        let mut hits: Vec<BatchHit> = Vec::new();
+        try_reserve_exact(&mut hits, queries.len(), "gpu batch results")
+            .map_err(BatchExecError::Input)?;
         for q in queries {
             let reachable = gather_reachable_rows(&self.matrix, q.ctx)
                 .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
@@ -494,21 +498,66 @@ impl BatchBackend for GpuBatchBackend {
                     if !score.is_finite() {
                         continue;
                     }
-                    let id = match self.matrix.ids().get(row_idx as usize) {
-                        Some(id) => *id,
-                        None => continue,
-                    };
-                    selector.push(CandidateHit { id, score });
+                    // 候補識別子は「行 id」ではなく常駐行列のスロット番号
+                    // （`gather_reachable_rows` が返す行 index）を使う。
+                    // `TopKSelector` の同点タイブレークは候補識別子の昇順で
+                    // あり、CPU 経路（`batch_search.rs::run_batch_search`）は
+                    // スロット昇順を契約としているため（`batch_fallback.rs::
+                    // revalidate_primary_hits` の順序検証 (4) が同じ基準で
+                    // 判定する）、ここで行 id を使うと同点時に順序契約違反と
+                    // なり正当な結果まで `PrimaryResultRejected` で拒否される
+                    // （PR #205/#228 の `(tenant_id, id)` 統一に追随。Issue #178）。
+                    selector.push(CandidateHit {
+                        id: u64::from(row_idx),
+                        score,
+                    });
                 }
             }
 
             hits.push(BatchHit {
-                hits: selector.into_sorted_vec(),
+                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
+                    .map_err(BatchExecError::Input)?,
             });
         }
 
         Ok(hits)
     }
+}
+
+/// GPU 側で選出した候補（常駐行列のスロット番号 + スコア）を、テナント修飾済みの
+/// [`SearchHit`]（`(tenant_id, id)` で行を一意に解決できる契約。対象ビヘイビア:
+/// TABLE-12・RLS-9。PR #205/#228）へ解決する。
+///
+/// [`GpuBatchBackend::batch_search`] の最終段だが、GPU デバイスに触れないため
+/// GPU 非搭載環境（CI）でも単体テストできるよう独立関数として切り出している
+/// （`tests` モジュール参照。Issue #178 レビュー指摘対応）。
+///
+/// 解決は CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検証」）
+/// と同一の `resolve_batch_slot` + `PolicyContext::is_visible`（CORE-2 の単一照合
+/// パス）を通す。スロットが解決不能（GPU 側の readback 破損・実装バグ）、または
+/// 解決した行が当該クエリから不可視の場合は、部分結果を返さず
+/// [`BatchSearchError::TenantMaskViolation`] で全体を拒否する（fail-closed）。
+fn finalize_gpu_hits(
+    matrix: &crate::batch_search::ResidentMatrix,
+    ctx: &PolicyContext,
+    candidates: &[CandidateHit],
+) -> Result<Vec<SearchHit>, BatchSearchError> {
+    let mut out: Vec<SearchHit> = Vec::new();
+    try_reserve_exact(&mut out, candidates.len(), "gpu resolved hits")?;
+    for hit in candidates {
+        let Some((tenant, id, visibility)) = resolve_batch_slot(matrix, hit.id) else {
+            return Err(BatchSearchError::TenantMaskViolation);
+        };
+        if !ctx.is_visible(tenant, visibility) {
+            return Err(BatchSearchError::TenantMaskViolation);
+        }
+        out.push(SearchHit {
+            tenant_id: try_owned_str(tenant)?,
+            id,
+            score: hit.score,
+        });
+    }
+    Ok(out)
 }
 
 impl GpuBatchBackend {
@@ -596,7 +645,6 @@ fn gather_reachable_rows(
             }
         }
     }
-    let _ = Visibility::Public; // import 用途の明示（マスク判定は is_visible 経由のみ）
     Ok(out)
 }
 
@@ -797,6 +845,9 @@ fn dispatch_dot_products(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 本体側はマスク判定を `PolicyContext::is_visible` の単一照合パスへ委ねており
+    // `Visibility` を直接参照しない。フィクスチャ構築のためテスト側でのみ取り込む。
+    use crate::storage::Visibility;
 
     // GPU デバイスに依存しない純粋関数のみをここで検証する。デバイス初期化を
     // 要するテスト（初期化失敗→縮退・実 GPU 分岐）は `tests/gpu_batch.rs`
@@ -918,6 +969,234 @@ mod tests {
             .expect("reachable row gather should succeed within work budget");
         reachable_priv.sort_unstable();
         assert_eq!(reachable_priv, vec![0, 1, 2]);
+    }
+
+    /// 同一 `(tenant_id, id)` 契約の検証用フィクスチャ（Issue #178 レビュー指摘対応）。
+    /// スロット 0 = `("tenant-a", 99, Public)`・スロット 1 = `("tenant-b", 1, Public)` と、
+    /// 「スロット昇順」と「行 id 昇順」が逆順になる配置にする。行は本番経路では
+    /// `(tenant_id, id)` 順で常駐行列へ渡される（`batch_search.rs::BatchHit` の
+    /// 順序契約）ため、この配置は特殊ケースではなく通常のマルチテナント配置である。
+    fn tie_fixture() -> (Vec<u64>, Vec<String>, Vec<Visibility>, usize, Vec<f32>) {
+        (
+            vec![99u64, 1],
+            vec!["tenant-a".to_string(), "tenant-b".to_string()],
+            vec![Visibility::Public, Visibility::Public],
+            2,
+            // 2 行とも同一ベクトル = 同点スコアになりタイブレークが顕在化する。
+            vec![1.0, 0.0, 1.0, 0.0],
+        )
+    }
+
+    fn tie_matrix() -> crate::batch_search::ResidentMatrix {
+        let (ids, tenant_ids, visibilities, dim, vectors) = tie_fixture();
+        crate::batch_search::ResidentMatrix::build(&ids, &tenant_ids, &visibilities, dim, &vectors)
+            .expect("resident matrix build should succeed for well-formed fixture")
+    }
+
+    /// `finalize_gpu_hits` は候補識別子をスロット番号として解決し、
+    /// `(tenant_id, id)` 付きの `SearchHit` を選出順のまま返す。
+    #[test]
+    fn finalize_gpu_hits_resolves_slots_to_tenant_qualified_hits() {
+        let matrix = tie_matrix();
+        let ctx = PolicyContext::new("tenant-a").expect("policy context should build");
+        let mut selector = TopKSelector::new(2);
+        selector.push(CandidateHit { id: 0, score: 1.0 });
+        selector.push(CandidateHit { id: 1, score: 1.0 });
+        let hits = finalize_gpu_hits(&matrix, &ctx, &selector.into_sorted_vec())
+            .expect("visible slots should resolve");
+        // 同点のタイブレークはスロット昇順（行 id 昇順ではない）。
+        let resolved: Vec<(&str, u64)> =
+            hits.iter().map(|h| (h.tenant_id.as_str(), h.id)).collect();
+        assert_eq!(resolved, vec![("tenant-a", 99), ("tenant-b", 1)]);
+    }
+
+    /// 解決不能なスロット（GPU 側 readback 破損・実装バグを模す）は部分結果を
+    /// 返さず全体を拒否する（fail-closed）。
+    #[test]
+    fn finalize_gpu_hits_rejects_out_of_range_slot() {
+        let matrix = tie_matrix();
+        let ctx = PolicyContext::new("tenant-a").expect("policy context should build");
+        let err = finalize_gpu_hits(
+            &matrix,
+            &ctx,
+            &[
+                CandidateHit { id: 0, score: 1.0 },
+                CandidateHit {
+                    id: 9_999,
+                    score: 0.5,
+                },
+            ],
+        )
+        .expect_err("out-of-range slot must be rejected");
+        assert_eq!(
+            err,
+            crate::batch_search::BatchSearchError::TenantMaskViolation
+        );
+    }
+
+    /// 当該クエリから不可視の行（他テナントの `Private` 行）を指すスロットも
+    /// `PolicyContext::is_visible` の単一照合パスで拒否する。
+    #[test]
+    fn finalize_gpu_hits_rejects_slot_invisible_to_query_context() {
+        let ids = vec![1u64, 2];
+        let tenant_ids = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = vec![Visibility::Public, Visibility::Private];
+        let matrix = crate::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &[1.0, 0.0, 1.0, 0.0],
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+        let ctx = PolicyContext::new("tenant-a").expect("policy context should build");
+        let err = finalize_gpu_hits(&matrix, &ctx, &[CandidateHit { id: 1, score: 1.0 }])
+            .expect_err("invisible row must be rejected");
+        assert_eq!(
+            err,
+            crate::batch_search::BatchSearchError::TenantMaskViolation
+        );
+    }
+
+    /// テナント跨ぎで同じ `id` を持つ行（`id` 単独では一意でない）も、
+    /// `(tenant_id, id)` として区別して返る（対象ビヘイビア: TABLE-12・RLS-9）。
+    #[test]
+    fn finalize_gpu_hits_distinguishes_same_id_across_tenants() {
+        let ids = vec![7u64, 7];
+        let tenant_ids = vec!["tenant-a".to_string(), "tenant-b".to_string()];
+        let visibilities = vec![Visibility::Public, Visibility::Public];
+        let matrix = crate::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &[1.0, 0.0, 1.0, 0.0],
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+        let ctx = PolicyContext::new("tenant-a").expect("policy context should build");
+        let hits = finalize_gpu_hits(
+            &matrix,
+            &ctx,
+            &[
+                CandidateHit { id: 0, score: 1.0 },
+                CandidateHit { id: 1, score: 1.0 },
+            ],
+        )
+        .expect("both public rows are visible to tenant-a");
+        let resolved: Vec<(&str, u64)> =
+            hits.iter().map(|h| (h.tenant_id.as_str(), h.id)).collect();
+        assert_eq!(resolved, vec![("tenant-a", 7), ("tenant-b", 7)]);
+    }
+
+    /// GPU 経路の最終出力が `FallbackBatchEngine::revalidate_primary_hits`
+    /// （PR #205/#228 で `(tenant_id, id)` 基準へ統一された順序・存在・可視性の
+    /// 独立再検証）を通ることを、GPU デバイスなしで確認する回帰テスト。
+    /// 選出時の候補識別子に行 id を使う旧実装では、同点時に「行 id 昇順」で
+    /// 並ぶため再検証の順序契約（スロット昇順）に違反し、正当な結果まで
+    /// `PrimaryResultRejected` として拒否されていた（Issue #178 レビュー指摘）。
+    #[test]
+    fn gpu_finalized_hits_pass_primary_revalidation_while_row_id_order_is_rejected() {
+        use crate::batch_fallback::{
+            BatchBackend, BatchExecError, FallbackBatchEngine, FallbackObserver,
+        };
+
+        /// 与えられたクロージャの結果をそのまま返す差し替え用バックエンド
+        /// （`batch_fallback.rs` のテストにある `MaliciousBackend` と同じ形。
+        /// 本体へテスト専用の公開 API は追加しない）。
+        struct StubBackend<F: Fn() -> Vec<BatchHit> + Send + Sync> {
+            make_hits: F,
+        }
+        impl<F: Fn() -> Vec<BatchHit> + Send + Sync> BatchBackend for StubBackend<F> {
+            fn batch_search(
+                &self,
+                _queries: &[BatchQuery<'_>],
+            ) -> Result<Vec<BatchHit>, BatchExecError> {
+                Ok((self.make_hits)())
+            }
+        }
+
+        struct SilentObserver;
+        impl FallbackObserver for SilentObserver {
+            fn on_fallback(&self, _event: crate::batch_fallback::FallbackEvent) {}
+        }
+
+        let (ids, tenant_ids, visibilities, dim, vectors) = tie_fixture();
+        let ctx = PolicyContext::new("tenant-a").expect("policy context should build");
+        let query_vec = vec![1.0f32, 0.0];
+
+        // 現行実装（スロット順）の出力を返すバックエンド: 再検証を通る。
+        let engine = FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            |matrix| {
+                Ok(Box::new(StubBackend {
+                    make_hits: move || {
+                        let ctx = PolicyContext::new("tenant-a")
+                            .expect("policy context should build in stub");
+                        let mut selector = TopKSelector::new(2);
+                        selector.push(CandidateHit { id: 0, score: 1.0 });
+                        selector.push(CandidateHit { id: 1, score: 1.0 });
+                        let hits = finalize_gpu_hits(&matrix, &ctx, &selector.into_sorted_vec())
+                            .expect("slots are visible to tenant-a");
+                        vec![BatchHit { hits }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(SilentObserver),
+        )
+        .expect("fallback engine build should succeed for well-formed fixture");
+        let queries = [BatchQuery {
+            vector: &query_vec,
+            k: 2,
+            ctx: &ctx,
+        }];
+        let hits = engine
+            .batch_search(&queries)
+            .expect("slot-ordered gpu output must pass primary revalidation");
+        let resolved: Vec<(&str, u64)> = hits
+            .first()
+            .map(|b| {
+                b.hits
+                    .iter()
+                    .map(|h| (h.tenant_id.as_str(), h.id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(resolved, vec![("tenant-a", 99), ("tenant-b", 1)]);
+
+        // 旧実装（行 id 順）の出力を模したバックエンド: 再検証で拒否される
+        // ことを確認し、上のテストが順序契約を実際に守っていることを裏付ける。
+        let engine_row_id_order = FallbackBatchEngine::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+            |_matrix| {
+                Ok(Box::new(StubBackend {
+                    make_hits: || {
+                        vec![BatchHit {
+                            hits: vec![
+                                SearchHit::new("tenant-b", 1, 1.0),
+                                SearchHit::new("tenant-a", 99, 1.0),
+                            ],
+                        }]
+                    },
+                }) as Box<dyn BatchBackend>)
+            },
+            Box::new(SilentObserver),
+        )
+        .expect("fallback engine build should succeed for well-formed fixture");
+        let err = engine_row_id_order
+            .batch_search(&queries)
+            .expect_err("row-id-ordered output violates the slot-ascending contract");
+        assert_eq!(
+            err,
+            crate::batch_search::BatchSearchError::PrimaryResultRejected
+        );
     }
 
     // GPU デバイスが利用可能な実行環境でのみ実走する end-to-end 正しさの検証。

@@ -402,7 +402,11 @@ pub fn unpack_f16x2(packed: u32) -> (f32, f32) {
 /// なく `try_reserve_exact`（要求量ちょうど）を使うのは、呼び出し元が
 /// アロケーション前に検証済みの論理必要量どおりに実確保量を抑えるため
 /// （`arena.rs::try_reserve_exact` と同じ理由）。
-fn try_reserve_exact<T>(
+///
+/// `pub(crate)`: `gpu_batch.rs` の選出後解決ループも同じフォールブル確保方針を
+/// 共有する（Issue #178。GPU 経路だけ abort-on-OOM な `Vec::with_capacity` に
+/// 分岐しないよう単一の真実源にする）。
+pub(crate) fn try_reserve_exact<T>(
     buf: &mut Vec<T>,
     additional: usize,
     what: &str,
@@ -415,7 +419,9 @@ fn try_reserve_exact<T>(
 /// `tenant_ids` の複製に使うのと同じ理由: `String::from`/`.into()`（`SearchHit::
 /// new` が内部で使う）は失敗時に abort するため、選出後の解決ループのように
 /// バッチ全体で最大 [`MAX_BATCH_TOTAL_K`] 回呼ばれうる経路では使わない）。
-fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
+/// `pub(crate)`: `gpu_batch.rs` の選出後解決ループも `SearchHit::tenant_id` の
+/// 複製に本ヘルパーを使う（Issue #178）。
+pub(crate) fn try_owned_str(s: &str) -> Result<String, BatchSearchError> {
     let mut owned = String::new();
     owned.try_reserve_exact(s.len()).map_err(|e| {
         BatchSearchError::AllocationFailed(format!("failed to reserve tenant_id: {e}"))
