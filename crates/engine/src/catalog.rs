@@ -2,9 +2,13 @@
 //! ポインタ: `docs/spec/05-tasks.md` TASK-85・`docs/spec/04-behavior/data-model.md`）。
 //!
 //! 責務境界: `VECTOR(N)` 列型を含むテーブル定義（[`TableSchema`]）の DDL
-//! （`CREATE TABLE`・`ALTER TABLE ADD COLUMN`）と、その永続化（`storage.rs` の
-//! `redb::Database` を共有する専用テーブル）を担う。行データそのもの
-//! （`ROWS_TABLE`）には一切アクセスしない設計上の境界とする（TABLE-4/TABLE-5）。
+//! （`CREATE TABLE`・`ALTER TABLE ADD COLUMN`・`DROP TABLE` 相当の
+//! [`Storage::drop_table`]）と、その永続化（`storage.rs` の `redb::Database` を
+//! 共有する専用テーブル）を担う。行データそのもの（`ROWS_TABLE`）には一切
+//! アクセスしない設計上の境界とする（TABLE-4/TABLE-5）。[`Storage::drop_table`] は
+//! 例外的にテーブルスコープ行ストア（`user_rows/{table}`）をカタログエントリと
+//! 同一トランザクションで削除するが、これは DDL のライフサイクル管理としての
+//! 削除であり、行の中身（値）を読み書きするものではない。
 //! 行エンコーダーの列対応・NULL 解決（TASK-86）・
 //! アリーナデコード（TASK-87）・テナント境界統合（TASK-89）・SQL surface からの
 //! DDL 受理は本モジュールの責務外で、後続タスクが本モジュールの API に依存する。
@@ -493,12 +497,12 @@ fn decode_schema_body(table_name: &str, bytes: &[u8]) -> Result<TableSchema> {
 /// 呼び出し元は必ず先に `validate_identifier(table_name)` を通してから呼ぶこと
 /// （本関数自身は検証を行わない）。
 ///
-/// 将来 `drop_table` 相当の API を追加する実装者向けの申し送り: この動的テーブルは
-/// [`CATALOG_TABLE`] のエントリとは別ライフサイクルで管理されている（`create_table` は
-/// `CATALOG_TABLE` のみ書き込み、本関数が指す行テーブルは初回挿入まで未作成のまま）。
-/// `drop_table` を実装する際は `CATALOG_TABLE` のエントリ削除と同一 write トランザクション内で
-/// 本関数が返す行テーブルも削除しないと、テーブル再作成時に旧次元の行データが残留し
-/// EXT-2 の次元固定の不変条件を静かに破る恐れがある。
+/// この動的テーブルは [`CATALOG_TABLE`] のエントリとは別ライフサイクルで管理されている
+/// （`create_table` は `CATALOG_TABLE` のみ書き込み、本関数が指す行テーブルは初回挿入まで
+/// 未作成のまま）。[`Storage::drop_table`] が `CATALOG_TABLE` のエントリ削除と同一 write
+/// トランザクション内で本関数が返す行テーブルも削除する。残留を許すとテーブル再作成時に
+/// 旧次元の行データが残り、EXT-2 の次元固定の不変条件を静かに破るため（Issue #179・
+/// PR #151 レビュー据え置き事項）。
 ///
 /// `pub(crate)` で公開する: `arena.rs`（TASK-87、対象ビヘイビア: TABLE-8）が
 /// コールドスタート・アリーナ構築時に、対象テーブルの行テーブルだけを単一の
@@ -673,6 +677,49 @@ impl Storage {
             }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
+        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+    }
+
+    /// テーブル定義（`CATALOG_TABLE` エントリ）と、対応する行ストア
+    /// （`user_rows/{table_name}`）を同一 write txn で削除する `DROP TABLE` 相当の DDL
+    /// （Issue #179。PR #151 レビューで据え置かれた stale `PrefilterIndex` 対策）。
+    ///
+    /// 失効契約: `bump_generation_and_commit` 経由で commit するため、drop 前に構築された
+    /// [`crate::rls::PrefilterSnapshot`]／[`crate::core`] の `PrefilterCache` エントリは
+    /// 以後の世代照合でいずれも stale（`RlsError::IndexStale`／キャッシュ破棄）になり、
+    /// 削除済み行・旧スキーマの行に基づく結果を返す経路がない。drop 専用の新たな失効機構は
+    /// 追加しない（世代カウンタへの一本化）。
+    ///
+    /// 安全性: `create_table`／`alter_table_add_column` と同じく
+    /// [`crate::policy::PolicyContext`] を取らない生の DDL であり、全テナントの行を
+    /// 不可逆に削除する。DDL 認可の設計を経ないまま untrusted 経路（SQL 表層・
+    /// wire-server）へ配線しない（`DROP TABLE` 文は引き続き許可リスト外で `42601`）。
+    ///
+    /// 存在しないテーブル名は `Err(CatalogError::TableNotFound)`、識別子として不正な
+    /// 名前は `Err(CatalogError::Invalid)`（fail-closed。冪等に `Ok` へ丸めない）。
+    /// 行ストア（`user_rows/{table_name}`）は初回挿入まで物理的に未作成のことがあり、
+    /// その場合の `delete_table` は「元々存在しなかった」ことを表す `Ok(false)` を返すため
+    /// エラーにしない。`ROWS_TABLE`（旧・非テーブルスコープ API）・バッチ台帳・
+    /// 世代テーブルには一切触れない。
+    pub fn drop_table(&self, table_name: &str) -> Result<()> {
+        validate_identifier(table_name)?;
+        let write_txn = self.db().begin_write()?;
+        {
+            let mut table = match write_txn.open_table(CATALOG_TABLE) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(CatalogError::TableNotFound(table_name.to_string()));
+                }
+                Err(e) => return Err(CatalogError::from(e)),
+            };
+            if table.remove(table_name)?.is_none() {
+                return Err(CatalogError::TableNotFound(table_name.to_string()));
+            }
+        }
+        // `CATALOG_TABLE` のハンドルは上のブロックを抜けた時点で解放済み。ここで
+        // 行ストアを同一 txn 内で `open_table` すると `TableAlreadyOpen` になるため、
+        // `delete_table` は既存ハンドルを介さず直接呼ぶ。
+        write_txn.delete_table(user_rows_table_def(&user_rows_table_name(table_name)))?;
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -1205,6 +1252,178 @@ mod tests {
             vec![ColumnDef::new("body", ColumnType::Text, false)],
         );
         assert!(no_vector.validate_embedding_dim(384).is_err());
+    }
+
+    // --- Storage::drop_table -----------------------------------------------
+    // `drop_table` の内部不変条件（世代 +1・`ROWS_TABLE` 非接触）をこの unit test
+    // モジュールに置き、公開契約（未存在・識別子不正・再作成別次元）の固定は
+    // `tests/catalog.rs`（クレート外の統合テスト）側に委譲する（Issue #179）。
+
+    #[test]
+    fn drop_table_removes_catalog_entry() {
+        let path = unique_db_path("drop-table-removes-entry");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+
+        storage.drop_table("docs").expect("drop table");
+
+        assert!(matches!(
+            storage.get_table_schema("docs"),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(!storage
+            .list_tables()
+            .expect("list tables")
+            .iter()
+            .any(|t| t == "docs"));
+    }
+
+    #[test]
+    fn drop_table_rejects_missing_table_and_invalid_identifier() {
+        let path = unique_db_path("drop-table-rejects-missing");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // カタログテーブル自体が未作成（1 テーブルも定義していない DB）でも
+        // `TableNotFound` に丸め込む（`Backend` 等の内部エラー種別を露出しない）。
+        assert!(matches!(
+            storage.drop_table("docs"),
+            Err(CatalogError::TableNotFound(_))
+        ));
+
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+
+        assert!(matches!(
+            storage.drop_table("missing"),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(matches!(
+            storage.drop_table("bad/name"),
+            Err(CatalogError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn drop_table_then_recreate_with_different_dim_starts_empty() {
+        let path = unique_db_path("drop-table-recreate-dim");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        storage.drop_table("docs").expect("drop table");
+
+        // drop 直後（再作成前）はカタログ・行の双方が不存在扱いになる。
+        assert!(matches!(
+            storage.get_row_from_table("docs", "tenant-a", 1),
+            Err(CatalogError::TableNotFound(_))
+        ));
+        assert!(matches!(
+            storage.scan_table_page("docs", None, 10),
+            Err(CatalogError::TableNotFound(_))
+        ));
+
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(4), false)],
+            ))
+            .expect("recreate table with different dim");
+        storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0, 0.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row with new dim");
+
+        let (rows, _cursor) = storage
+            .scan_table_page("docs", None, 10)
+            .expect("scan after recreate");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 2);
+    }
+
+    #[test]
+    fn drop_table_bumps_generation_exactly_once() {
+        let path = unique_db_path("drop-table-generation");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+
+        let before = storage.current_generation().expect("read generation");
+        storage.drop_table("docs").expect("drop table");
+        let after = storage.current_generation().expect("read generation");
+
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn drop_table_does_not_touch_legacy_rows_table() {
+        let path = unique_db_path("drop-table-legacy-rows");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("put legacy row");
+
+        storage.drop_table("docs").expect("drop table");
+
+        let row = storage
+            .get("tenant-a", 1)
+            .expect("legacy row still readable");
+        assert_eq!(row.embedding, vec![1.0, 0.0]);
     }
 
     // --- Storage::list_tables ---------------------------------------------
