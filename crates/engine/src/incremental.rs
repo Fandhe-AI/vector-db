@@ -149,7 +149,10 @@ pub struct BoundFileIndexInput<'a> {
 /// 返した場合の防御的検証は埋め込み呼び出し直後で別途行う。次元検証自体は
 /// `tenant.rs` 側の `validate_embedding_dim` が書き込みトランザクション内でも
 /// 行うため、いずれも二重防御になる。
-pub fn index_file(
+/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
+/// 内部結線用 API のため `pub(crate)` に閉じる（`sql/exec.rs::execute_file_insert`
+/// が唯一の呼び出し元。codex-review P1 指摘・PR #221）。
+pub(crate) fn index_file(
     storage: &Storage,
     ctx: &PolicyContext,
     embedder: &dyn Embedder,

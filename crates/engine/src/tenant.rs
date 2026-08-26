@@ -780,7 +780,13 @@ pub struct ReplaceOutcome {
 /// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
 /// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
 /// テーブルに VECTOR 列がない場合は [`TenantWriteError::Catalog`]（`CatalogError::Invalid`）。
-pub fn replace_typed_rows_by_text_key(
+///
+/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
+/// 内部結線用 API のため `pub(crate)` に閉じる（ガードは唯一の到達経路である
+/// `core::EngineCore::execute_insert_sql` が `sql::allowlist::validate_insert` 経由で
+/// 書き込み前に適用済み）。クレート外へ公開するとガードを迂回する書き込み入口に
+/// なる（codex-review P1 指摘・PR #221。security.md P0）。
+pub(crate) fn replace_typed_rows_by_text_key(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,

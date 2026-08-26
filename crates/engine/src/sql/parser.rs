@@ -725,8 +725,9 @@ pub fn bind_insert(
 ///
 /// `sql::exec::execute_file_insert` → `incremental::index_file` へ渡され、`path`/`body`
 /// はそのままチャンク化の入力になる（`incremental.rs` モジュールドキュメント参照）。
-/// `template_values` はスキーマ列順で、`path`/`body`/VECTOR 列の位置は
-/// プレースホルダ（各チャンク行の構築時に上書きされる）、それ以外の Text 列
+/// `template_values` はスキーマ列順で、`path`/`body`/VECTOR 列の位置は必ず
+/// `Value::Null`（各チャンク行の構築時に上書きされるプレースホルダ。本文全文を
+/// 残さないことでチャンク数分の複製増幅を避ける）、それ以外の Text 列
 /// （例 `lang`）は全チャンク行へ複製される値を保持する。
 #[derive(Debug, Clone)]
 pub struct BoundFileInsert {
@@ -901,6 +902,17 @@ fn bind_file_insert(
         .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for path column"))?;
     let body = body_value
         .ok_or_else(|| SqlSurfaceError::invalid_input("missing value for body column"))?;
+
+    // `path`/`body`/VECTOR 列の位置はチャンク行ごとに必ず上書きされるため、テンプレート
+    // 側では `Value::Null` に戻して保持する。ここに本文全文を残すと
+    // `incremental::index_file` のチャンクループが行ごとに本文全体を複製 → 直後に破棄
+    // することになり、単一の untrusted 入力で「本文サイズ × チャンク数」の確保・コピーを
+    // 誘発できる（codex-review P1 指摘・PR #221。security.md「不安全な設計 / DoS」）。
+    for idx in [path_column_index, body_column_index, vector_column_index] {
+        if let Some(slot) = template_values.get_mut(idx) {
+            *slot = crate::row_codec::Value::Null;
+        }
+    }
 
     Ok(BoundFileInsert {
         table: stmt.table_name.clone(),
@@ -1802,6 +1814,20 @@ mod tests {
                 assert_eq!(f.vector_column_index, 0);
                 assert_eq!(f.path_column_index, 1);
                 assert_eq!(f.body_column_index, 2);
+                // `path`/`body`/VECTOR 列の位置は本文全文を保持しない
+                // （チャンク数分の複製増幅の防止。codex-review P1 指摘・PR #221）。
+                assert_eq!(
+                    f.template_values.get(f.vector_column_index),
+                    Some(&crate::row_codec::Value::Null)
+                );
+                assert_eq!(
+                    f.template_values.get(f.path_column_index),
+                    Some(&crate::row_codec::Value::Null)
+                );
+                assert_eq!(
+                    f.template_values.get(f.body_column_index),
+                    Some(&crate::row_codec::Value::Null)
+                );
             }
             BoundInsertForm::Row(_) => panic!("expected file form"),
         }

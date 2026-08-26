@@ -1097,7 +1097,12 @@ pub fn execute_insert(
 /// `IncrementalError` → `SqlSurfaceError` の写像をここに集約する（他の SQL 表層
 /// エラー写像と同じ「呼び出し元の型で fail-closed に丸める」方針。security.md
 /// 「エラー・ログ経由で他テナントのデータ・存在情報を漏らさない」対応）。
-pub fn execute_file_insert(
+/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）は呼び出し元
+/// `core::EngineCore::execute_insert_sql` が `sql::allowlist::validate_insert` 経由で
+/// 適用済みであり、本関数自体はガードを持たない。クレート外へ公開すると
+/// `BoundFileInsert` を直接構築してガードを迂回できるため `pub(crate)` に閉じる
+/// （codex-review P1 指摘・PR #221。security.md P0）。
+pub(crate) fn execute_file_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     embedder: Option<&dyn crate::embedding::Embedder>,
