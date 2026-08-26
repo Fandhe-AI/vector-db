@@ -123,14 +123,22 @@ const RECALL_QUERY_COUNT: usize = 20;
 /// されず、ログの `end_to_end_simd_parallel_path` ラベルと実態（シングルスレッド
 /// SIMD パス）が食い違う（Cursor Bugbot 指摘・PR #222）。`parallel_search.rs`
 /// `thread_count_for` はスレッド数を `row_count / MIN_ROWS_PER_THREAD`
-/// （`parallel_search.rs` 内 `MIN_ROWS_PER_THREAD = 1024`。非 `pub` のためこの
-/// ファイルからは参照できず値のみポインタ表記する）でクランプするため、
+/// （`parallel_search.rs` 内 `MIN_ROWS_PER_THREAD = 1024`）でクランプするため、
 /// 少なくとも 2 スレッドに分割されるには行数が `MIN_ROWS_PER_THREAD` の 2 倍
 /// （2,048）以上必要。旧値 2,000 はこれを下回っており（`MIN_ROWS_PER_THREAD`
 /// × 1 未満）常にシングルスレッド経路だった。`MIN_ROWS_PER_THREAD` の 4 倍
 /// （実分割後も 1 スレッドあたり `MIN_ROWS_PER_THREAD` を十分上回る）を確保
-/// しつつ、タイムアウト回避の目的（行数を小さく保つ）は維持する値として
-/// 選定した。
+/// しつつ、タイムアウト回避の目的（行数を小さく保つ）は維持する値として選定した。
+///
+/// ただし `thread_count_for` は行数だけでなく実行時の
+/// `std::thread::available_parallelism()` にもスレッド数を制限される
+/// （`parallel_search.rs` 参照）。並列度 1 の runner・コンテナ（CPU 制限環境）や
+/// ローカル環境では、この行数条件を満たしていても A 側が単一スレッドのままに
+/// なり得る（codex-review 指摘・Issue #177／PR #222）。行数だけで「2 スレッド
+/// 以上に分割される」と決め打たず、`engine::parallel_search::expected_thread_count`
+/// で実行時に見込みスレッド数を取得し、2 未満ならログラベルを
+/// `end_to_end_simd_single_thread_path_vs_scalar_reference_path` へ切り替えて
+/// 実態と食い違わせない（`main` 関数内 `diag_label` 参照）。
 const DIAG_AB_ROW_COUNT: usize = 4_096;
 
 /// `BENCH_MAX_P95_MS` 環境変数（ミリ秒・整数）を読み取り、CORE-3・SEARCH-4 の
@@ -352,6 +360,22 @@ fn main() {
     }
     let diag_config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
     let ab_query = rng.next_vector(DIM);
+
+    // A 側が実際に複数スレッドへ分割されるかは `DIAG_AB_ROW_COUNT` だけでなく
+    // 実行環境の `std::thread::available_parallelism()` にも依存する
+    // （`parallel_search.rs::thread_count_for`）。並列度 1 の runner・コンテナ
+    // （CPU 制限環境）では `DIAG_AB_ROW_COUNT` をいくら増やしても A 側は単一
+    // スレッドのままになり、常に "parallel_path" とラベル付けすると診断値の
+    // 意味を誤認させる（codex-review 指摘・Issue #177／PR #222）。
+    // `engine::parallel_search::expected_thread_count` で実際に使われる見込みの
+    // スレッド数を事前取得し、ラベル・出力へ実測反映する（2 未満なら
+    // 「並列」を名乗らない）。
+    let diag_expected_threads = engine::parallel_search::expected_thread_count(DIAG_AB_ROW_COUNT);
+    let diag_label = if diag_expected_threads >= 2 {
+        "end_to_end_simd_parallel_path_vs_scalar_reference_path"
+    } else {
+        "end_to_end_simd_single_thread_path_vs_scalar_reference_path"
+    };
     match run_ab(
         &diag_config,
         || -> Vec<u64> {
@@ -375,7 +399,7 @@ fn main() {
     ) {
         Ok(ab) => {
             println!(
-                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): rows={DIAG_AB_ROW_COUNT} dim={DIM} k={TOP_K} a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail; small dedicated dataset, not comparable to p95_latency's rows={ROW_COUNT} figure)",
+                "diagnostic_ab({diag_label}, not isolated to SIMD kernel alone): rows={DIAG_AB_ROW_COUNT} dim={DIM} k={TOP_K} expected_threads={diag_expected_threads} a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail; small dedicated dataset, not comparable to p95_latency's rows={ROW_COUNT} figure)",
                 ab.a.summary.median, ab.b.summary.median, ab.median_ratio
             );
         }
@@ -383,7 +407,7 @@ fn main() {
             // A/B は診断情報であり合否に含めないため、算出不能（分母 0 等）でも
             // 本体の pass/fail には影響させない。ただし silent にはせず記録する。
             println!(
-                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): unavailable ({e}) (not counted toward pass/fail)"
+                "diagnostic_ab({diag_label}, not isolated to SIMD kernel alone): expected_threads={diag_expected_threads} unavailable ({e}) (not counted toward pass/fail)"
             );
         }
     }
