@@ -181,8 +181,17 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                     };
                     values.push(Value::Text(cell));
                 }
-                engine::tenant::insert_typed_row(storage, t.name, &ctx, id, visibility, &values)
-                    .expect("insert row");
+                engine::tenant::insert_typed_row(
+                    storage,
+                    t.name,
+                    &ctx,
+                    id,
+                    visibility,
+                    &values,
+                    &engine::recovery::required_op_id::OperationId::parse("test-op")
+                        .expect("valid operation_id"),
+                )
+                .expect("insert row");
                 truths.push(RowTruth {
                     table: t.name,
                     id,

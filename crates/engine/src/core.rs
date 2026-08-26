@@ -53,6 +53,7 @@ use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
+use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
@@ -683,6 +684,11 @@ pub struct EngineCore {
     /// [`Self::with_precision_policy`] のみ。`crate::precision` モジュール
     /// ドキュメントの fail-open 不在の設計制約を参照）。
     precision_policy: crate::precision::PrecisionPolicy,
+    /// `operation_id` 必須化ガード（TASK-92・対象ビヘイビア: RECOVER-1）を制御する
+    /// サーバー側構成。クエリ・セッション変数から到達できる経路を持たない（差し替えは
+    /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
+    /// ドキュメント参照）。
+    ledger_mode: LedgerMode,
 }
 
 impl EngineCore {
@@ -703,6 +709,7 @@ impl EngineCore {
             provider,
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
+            ledger_mode: LedgerMode::default(),
         })
     }
 
@@ -723,6 +730,7 @@ impl EngineCore {
             provider,
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
+            ledger_mode: LedgerMode::default(),
         }
     }
 
@@ -740,6 +748,16 @@ impl EngineCore {
     /// 到達できない（`crate::precision` モジュールドキュメント参照）。
     pub fn with_precision_policy(mut self, policy: crate::precision::PrecisionPolicy) -> Self {
         self.precision_policy = policy;
+        self
+    }
+
+    /// `operation_id` 必須化ガード（TASK-92・対象ビヘイビア: RECOVER-1）を制御する
+    /// [`LedgerMode`] を差し替えたビルダーを返す（[`Self::with_precision_policy`] と
+    /// 同型: 所有権を消費するビルダーメソッドとし、`&mut self` セッターは公開しない）。
+    /// `SessionState`・SQL 構文からはこの値へ到達できない（`crate::recovery::
+    /// required_op_id` モジュールドキュメント参照）。
+    pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
+        self.ledger_mode = mode;
         self
     }
 
@@ -892,37 +910,49 @@ impl EngineCore {
     /// へは昇格しない固有メソッド（`execute_sql` と同じ理由。`core-api-check` の対象外。
     /// wire 層が DML を行う際の入口はこのメソッド経由を想定し、SQL `INSERT` 表層
     /// （TASK-80/81/120）はこの経路の上に載せる前提）。
+    ///
+    /// TASK-92（対象ビヘイビア: RECOVER-1）: `crate::tenant::insert_row` へ委譲する前に
+    /// `self.ledger_mode.require(operation_id)` を通す（詳細は
+    /// `recovery::required_op_id` モジュールドキュメント参照）。
     pub fn insert_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
         row: &crate::storage::RowInput<'_>,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::insert_row(&self.storage, table, ctx, id, row)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
-    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲のみ。
+    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲だが、
+    /// 委譲前に同じ `operation_id` 必須化ガードを通す（TASK-92・RECOVER-1）。
     pub fn update_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
         row: &crate::storage::RowInput<'_>,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::update_row(&self.storage, table, ctx, id, row)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
-    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲のみ。
+    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲だが、
+    /// 委譲前に同じ `operation_id` 必須化ガードを通す（TASK-92・RECOVER-1）。
     pub fn delete_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::delete_row(&self.storage, table, ctx, id)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id)
     }
 
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
@@ -1017,16 +1047,18 @@ impl EngineCore {
     /// `execute_sql` と同じ理由）。
     ///
     /// `sql::allowlist::validate_insert`（構造検証。文末専用句
-    /// `USING OPERATION_ID '<id>'` の省略はこの段階で `23502` として拒否され、
-    /// 書き込みトランザクションは一切開始されない）→ `Storage::get_table_schema`
-    /// （スキーマ取得）→ `sql::parser::bind_insert`（意味論検証・束縛）→
-    /// `sql::exec::execute_insert`（単一 write トランザクションでの実行）の順に呼ぶ。
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ `Storage::get_table_schema`（スキーマ取得）→
+    /// `sql::parser::bind_insert`（意味論検証・束縛）→ `sql::exec::execute_insert`
+    /// （単一 write トランザクションでの実行）の順に呼ぶ。
     pub fn execute_insert_sql(
         &self,
         ctx: &PolicyContext,
         sql: &str,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage)?;
+        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
         let schema = self
             .storage
             .get_table_schema(&stmt.table_name)
@@ -1288,12 +1320,13 @@ mod tests {
             embedding: &[0.0, 1.0],
             metadata: &[],
         };
+        let op_id = OperationId::parse("op-update-delete-not-found").expect("valid operation_id");
         assert!(matches!(
-            core.update_row(&attacker, "docs", 1, &update_input),
+            core.update_row(&attacker, "docs", 1, &update_input, Some(&op_id)),
             Err(crate::tenant::TenantWriteError::NotFound)
         ));
         assert!(matches!(
-            core.delete_row(&attacker, "docs", 1),
+            core.delete_row(&attacker, "docs", 1, Some(&op_id)),
             Err(crate::tenant::TenantWriteError::NotFound)
         ));
 

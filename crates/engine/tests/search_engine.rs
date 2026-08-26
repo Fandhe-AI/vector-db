@@ -45,6 +45,8 @@ fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[
             embedding,
             metadata: &[],
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed row");
 }

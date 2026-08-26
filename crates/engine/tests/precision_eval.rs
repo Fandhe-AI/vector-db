@@ -432,6 +432,8 @@ fn setup_core(docs: &[Doc], vocab_size: usize) -> (EngineCore, CleanupGuard) {
                 Value::Vector(doc.vector.clone()),
                 Value::Text(doc.text.clone()),
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }

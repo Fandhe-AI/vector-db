@@ -15,6 +15,7 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
 use engine::rls::{PrefilterIndex, SearchTimeFilter};
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::{self, TenantWriteError};
@@ -169,7 +170,15 @@ fn seed_corpus(storage: &Storage, rows_per_tenant: u64, seed: u64) {
                 )
             })
             .collect();
-        tenant::insert_rows(storage, TABLE, &ctx, &inputs).expect("seed corpus batch insert");
+        tenant::insert_rows(
+            storage,
+            TABLE,
+            &ctx,
+            &inputs,
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("seed corpus batch insert");
     }
 }
 
@@ -226,7 +235,15 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
             embedding: &[1.0; DIM as usize],
             metadata: &[],
         };
-        let r = tenant::insert_row(&storage, TABLE, &attacker, target, &row);
+        let r = tenant::insert_row(
+            &storage,
+            TABLE,
+            &attacker,
+            target,
+            &row,
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        );
         assert!(matches!(r, Err(TenantWriteError::Forbidden)));
         results.push(r);
     }
@@ -252,7 +269,15 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 embedding: &[2.0; DIM as usize],
                 metadata: &[],
             };
-            let r = tenant::update_row(&storage, TABLE, &attacker, target, &row);
+            let r = tenant::update_row(
+                &storage,
+                TABLE,
+                &attacker,
+                target,
+                &row,
+                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                    .expect("valid operation_id"),
+            );
             assert!(matches!(r, Err(TenantWriteError::NotFound)));
             results.push(r);
         } else {
@@ -263,7 +288,15 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 embedding: &[2.0; DIM as usize],
                 metadata: &[],
             };
-            let r = tenant::update_row(&storage, TABLE, &attacker, own_id, &row);
+            let r = tenant::update_row(
+                &storage,
+                TABLE,
+                &attacker,
+                own_id,
+                &row,
+                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                    .expect("valid operation_id"),
+            );
             assert!(matches!(r, Err(TenantWriteError::Forbidden)));
             results.push(r);
         }
@@ -277,7 +310,14 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
         } else {
             victim_ids[(i as usize) % victim_ids.len()]
         };
-        let r = tenant::delete_row(&storage, TABLE, &attacker, target);
+        let r = tenant::delete_row(
+            &storage,
+            TABLE,
+            &attacker,
+            target,
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        );
         assert!(matches!(r, Err(TenantWriteError::NotFound)));
         results.push(r);
     }
@@ -498,7 +538,16 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.5; DIM as usize],
         metadata: &[],
     };
-    tenant::insert_row(&storage, TABLE, &owner, new_id, &insert_row).expect("owner insert ok");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &owner,
+        new_id,
+        &insert_row,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("owner insert ok");
 
     let own_id = before
         .keys()
@@ -511,8 +560,16 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.75; DIM as usize],
         metadata: &[],
     };
-    tenant::update_row(&storage, TABLE, &owner, own_id, &update_row_input)
-        .expect("owner update ok");
+    tenant::update_row(
+        &storage,
+        TABLE,
+        &owner,
+        own_id,
+        &update_row_input,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("owner update ok");
 
     let delete_target = before
         .keys()
@@ -520,7 +577,15 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         .map(|(_, id)| *id)
         .next()
         .expect("seed must contain another tenant-a row");
-    tenant::delete_row(&storage, TABLE, &owner, delete_target).expect("owner delete ok");
+    tenant::delete_row(
+        &storage,
+        TABLE,
+        &owner,
+        delete_target,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("owner delete ok");
 
     // スナップショットのキーは `(tenant_id, id)`（TABLE-12）。
     let key = |id: u64| (TENANT_A.to_string(), id);
@@ -552,7 +617,8 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.25; DIM as usize],
         metadata: &[],
     };
-    core.insert_row(&owner, TABLE, another_new_id, &insert_row2)
+    let op_id = OperationId::parse("op-engine-core-delegation").expect("valid operation_id");
+    core.insert_row(&owner, TABLE, another_new_id, &insert_row2, Some(&op_id))
         .expect("EngineCore::insert_row ok");
     let update_row2 = RowInput {
         tenant_id: TENANT_A,
@@ -560,9 +626,9 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.1; DIM as usize],
         metadata: &[],
     };
-    core.update_row(&owner, TABLE, another_new_id, &update_row2)
+    core.update_row(&owner, TABLE, another_new_id, &update_row2, Some(&op_id))
         .expect("EngineCore::update_row ok");
-    core.delete_row(&owner, TABLE, another_new_id)
+    core.delete_row(&owner, TABLE, another_new_id, Some(&op_id))
         .expect("EngineCore::delete_row ok");
 }
 

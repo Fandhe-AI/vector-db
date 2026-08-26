@@ -161,6 +161,8 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
                 Value::Text(lang.to_string()),
                 Value::Text(body.to_string()),
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }

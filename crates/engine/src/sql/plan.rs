@@ -89,7 +89,8 @@ impl EvaluationOrder {
     }
 
     /// SCALAR 段が DISTANCE 段より先に評価されるか。`exec.rs` が事前適用
-    /// （`on_visible_row` での等価条件突合）と事後適用（DISTANCE 段後のフィルタ）の
+    /// （`on_visible_row` でのメタデータフィルタ突合。TASK-147・EXT-3）と事後適用
+    /// （DISTANCE 段後のフィルタ）の
     /// どちらを使うかを決める唯一の分岐点。
     pub fn scalar_before_distance(&self) -> bool {
         let scalar_pos = self.0.iter().position(|s| matches!(s, Stage::Scalar));

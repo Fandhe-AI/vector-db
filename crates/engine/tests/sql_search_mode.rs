@@ -70,6 +70,8 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
