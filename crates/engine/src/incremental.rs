@@ -26,13 +26,15 @@ use crate::tenant::{ReplaceOutcome, TenantWriteError};
 /// あり、本上限はそれを代替しない）。
 pub const MAX_CHUNKS_PER_FILE: usize = 4_096;
 
-/// 1 ファイル分の埋め込み結果として確保してよい総バイト数の上限。
+/// 1 ファイル分のチャンク行として確保してよい総バイト数の上限。
 ///
-/// チャンク数（[`MAX_CHUNKS_PER_FILE`]）と次元（`embedding::MAX_EMBEDDER_DIM`）を
-/// 個別に検証するだけでは積が非常に大きくなり得るため、両者の積へ独立した上限を
+/// 対象は「埋め込みベクトル」だけでなく、チャンク数分だけ複製される Text 値
+/// （`path`・`lang` 等のテンプレート列）とチャンク本文も含めた合計。チャンク数
+/// （[`MAX_CHUNKS_PER_FILE`]）・次元（`embedding::MAX_EMBEDDER_DIM`）・個々の Text 値
+/// 長を個別に検証するだけでは積が非常に大きくなり得るため、合計へ独立した上限を
 /// かける（codex-review P1 指摘・PR #221。coding-rust.md「不安全な設計 / DoS」・
 /// 「整数演算は checked_* を使う」）。
-pub const MAX_EMBEDDING_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_INDEX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
 /// [`index_file`] の挙動を調整する設定。
 #[derive(Debug, Clone)]
@@ -157,6 +159,35 @@ pub struct BoundFileIndexInput<'a> {
 /// 返した場合の防御的検証は埋め込み呼び出し直後で別途行う。次元検証自体は
 /// `tenant.rs` 側の `validate_embedding_dim` が書き込みトランザクション内でも
 /// 行うため、いずれも二重防御になる。
+/// チャンク行を実際に構築した場合に確保される総バイト数の見積り（[`index_file`] が
+/// [`MAX_INDEX_TOTAL_BYTES`] と突き合わせる。オーバーフローは `None` を返して
+/// 呼び出し元が拒否側へ倒す）。
+///
+/// 内訳はチャンク数 ×（ベクトル本体 + `path` + テンプレートの Text 値合計）に
+/// 全チャンク本文の合計を加えたもの。テンプレートの `path`/`body`/VECTOR 位置は
+/// `sql::parser::bind_file_insert` が `Value::Null` に戻しているため二重計上しない。
+fn estimate_total_row_bytes(
+    chunks: &[crate::chunking::Chunk],
+    input: &BoundFileIndexInput<'_>,
+    table_dim: u32,
+) -> Option<usize> {
+    let mut template_text_bytes: usize = 0;
+    for v in input.template_values {
+        if let Value::Text(s) = v {
+            template_text_bytes = template_text_bytes.checked_add(s.len())?;
+        }
+    }
+    let vector_bytes = (table_dim as usize).checked_mul(std::mem::size_of::<f32>())?;
+    let per_row = vector_bytes
+        .checked_add(input.path.len())?
+        .checked_add(template_text_bytes)?;
+    let mut total = chunks.len().checked_mul(per_row)?;
+    for c in chunks {
+        total = total.checked_add(c.text.len())?;
+    }
+    Some(total)
+}
+
 /// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
 /// 内部結線用 API のため `pub(crate)` に閉じる（`sql/exec.rs::execute_file_insert`
 /// が唯一の呼び出し元。codex-review P1 指摘・PR #221）。
@@ -226,21 +257,19 @@ pub(crate) fn index_file(
         )));
     }
 
-    // チャンク数 × 次元 × `f32` の積へ上限をかける（個別上限だけでは積が
-    // 有界にならない。埋め込み呼び出しの前に checked 演算で判定し、確保も
-    // 外部呼び出しも行わずに拒否する）。
-    let total_bytes = chunks
-        .len()
-        .checked_mul(table_dim as usize)
-        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()));
+    // 生成予定のチャンク行の総バイト数へ上限をかける。ベクトル（次元 × `f32`）に
+    // 加え、チャンク数分だけ複製される Text 値（`path` とテンプレート列。例 `lang`）・
+    // チャンク本文も数える（個別上限だけでは積・総和が有界にならない）。埋め込み
+    // 呼び出しの前に checked 演算で判定し、確保も外部呼び出しも行わずに拒否する。
+    let total_bytes = estimate_total_row_bytes(&chunks, input, table_dim);
     match total_bytes {
-        Some(bytes) if bytes <= MAX_EMBEDDING_TOTAL_BYTES => {}
+        Some(bytes) if bytes <= MAX_INDEX_TOTAL_BYTES => {}
         _ => {
             return Err(IncrementalError::ChunkingTooLarge(format!(
-                "embedding result too large: {} chunks x dim {} exceeds {} bytes",
+                "index payload too large: {} chunks x dim {} exceeds {} bytes",
                 chunks.len(),
                 table_dim,
-                MAX_EMBEDDING_TOTAL_BYTES
+                MAX_INDEX_TOTAL_BYTES
             )))
         }
     }

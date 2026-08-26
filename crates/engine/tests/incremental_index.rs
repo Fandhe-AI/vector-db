@@ -623,6 +623,34 @@ fn embedding_total_bytes_limit_rejects_chunk_count_times_dim_blowup() {
     assert_eq!(err.wire_code(), "54000");
 }
 
+/// ベクトル分が上限内でも、チャンク数分だけ複製される Text 値（`lang` 等）の総量が
+/// 上限を超える入力は拒否されることを固定する（codex-review P1 指摘・PR #221）。
+#[test]
+fn embedding_total_bytes_limit_counts_replicated_text_values() {
+    let path = unique_db_path("index-total-bytes-text");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 1 チャンク = 2 行（`small_chunk_config`）。8,192 行 → 4,096 チャンク
+    // （ファイル単位のチャンク数上限ちょうど）。`lang` に 32 KiB を指定すると
+    // 複製総量は約 128 MiB になり、ベクトル分（4,096 × 128 × 4 byte = 2 MiB）が
+    // 上限内でも合計で上限（64 MiB）を超える。SQL 本文自体は 1 MiB 未満に収まる。
+    let lines: Vec<String> = (0..8_192).map(|_| "x".to_string()).collect();
+    let body = lines.join("\n");
+    let big_lang = "a".repeat(32 * 1024);
+    let sql = format!(
+        "INSERT INTO documents (path, body, lang) VALUES ('{}', '{}', '{}') USING OPERATION_ID 'op-bigtext-1'",
+        "docs/bigtext.txt",
+        sql_escape(&body),
+        big_lang
+    );
+    let err = core
+        .execute_insert_sql(&write_ctx, &sql)
+        .expect_err("replicated text blowup must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+}
+
 #[test]
 fn missing_embedder_is_rejected_fail_closed_with_no_side_effects() {
     let path = unique_db_path("index-no-embedder");
