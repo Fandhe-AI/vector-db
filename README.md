@@ -63,12 +63,13 @@ psycopg・node pg から無改造で cleartext password 認証つき接続でき
 
 ### 回帰ベンチの repo variables（TASK-127）
 
-`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）・`BENCH_MAX_CONTRAST_RATIO`（対照エンジンとの p95 レイテンシ比の上限・TASK-127 CORE-5）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
 gh variable set BENCH_MAX_P95_MS
 gh variable set BENCH_MIN_RECALL
 gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
+gh variable set BENCH_MAX_CONTRAST_RATIO
 ```
 
 形式は以下のとおりです（値は上記のとおり本リポジトリには記載しません）。
@@ -78,13 +79,11 @@ gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
 | `BENCH_MAX_P95_MS` | 正の整数（単位: ms） |
 | `BENCH_MIN_RECALL` | `(0.0, 1.0]` の浮動小数点 |
 | `BENCH_BATCH_MAX_DEGRADATION_PCT` | 0 以上の有限浮動小数点 |
+| `BENCH_MAX_CONTRAST_RATIO` | 0 より大きい有限浮動小数点 |
 
-未設定のまま実行すると `crates/engine/benches/parallel_bench.rs`／`batch_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
+未設定のまま実行すると `crates/engine/benches/parallel_bench.rs`／`batch_bench.rs`／`contrast_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続です（TASK-127。`.claude/rules/dependency-policy.md`。Issue #176 で追跡中）。CORE-5 の判定は `BENCH_CORE5` repo variable による opt-in 方式です。
-
-- 未設定（既定）: CORE-5 は「対象外」として標準出力へ明示され、合否判定には含まれません。CORE-3（p95 レイテンシ）・CORE-4（Recall@k）のみで合否を返します
-- `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
+CORE-5（対照エンジンとの p95 レイテンシ比較）は usearch（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176）。`contrast_bench.rs` が CORE-3/CORE-4（`parallel_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。ローカルで `make bench-contrast` を実行するには C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み）。
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡中で、`BENCH_CORE6`／`BENCH_CORE16` repo variable による opt-in 方式のまま維持します（未設定＝既定で対象外）。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。
 
