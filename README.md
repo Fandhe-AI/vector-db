@@ -157,8 +157,9 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
   （未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝明示的に対象外」として成功終了。
   `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）による閾値ゲートと、
+  hybrid・dense 双方の指標を出力する判断材料レポート（`precision_eval_report`）、
   `PrecisionPolicy` の閾値を差し替えるパラメータ感度スイープ
-  （`precision_eval_policy_sweep`）を実行します。
+  （`precision_eval_policy_sweep`。hybrid 系列・dense 系列）を実行します。
 - **`.github/workflows/recall.yml` への接続は行っていません**: TASK-163 のスコープは
   実測・判断材料の提示までであり目標値の確定は含まないため、上記の
   `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。

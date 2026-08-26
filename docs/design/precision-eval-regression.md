@@ -78,9 +78,13 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
   strict モードの週次 job へ追加すると、管理者に未確定値の設定を強いるか schedule
   を恒常的に red にする。層 B ＋ Makefile ターゲットは用意済みで、`recall.yml` への
   step 追加は**ユーザーの目標値確定後のフォローアップ**とする。
+- **判断材料レポート**（`#[ignore]`。アサートなし）: 既定ポリシーでの hybrid・dense
+  双方の指標を出力する。`PrecisionPolicy` は dense/hybrid で別々の既定閾値を持つため、
+  両方の妥当性判断には両系列の実測が要る。出力は層 B 側（`make precision-regression`）
+  に限り、層 A（PR CI）では値を出さない。
 - **パラメータ感度スイープ**（`#[ignore]`。アサートなし）: `with_precision_policy`
-  で hybrid の閾値パラメータを差し替え、指標の変化を表形式で出力する（判断材料の
-  提示専用。production の既定値は変更しない）。
+  で hybrid 閾値・dense 閾値をそれぞれ差し替え、対応するランキングの指標の変化を
+  表形式で出力する（判断材料の提示専用。production の既定値は変更しない）。
 
 ## 実測結果・パラメータ感度・目標値確定の判断材料
 

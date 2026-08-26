@@ -36,9 +36,13 @@
 //!   未設定時は「評価は実行するが判定はスキップ」（`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`
 //!   の strict モードでは fail-closed）。`.github/workflows/recall.yml` への接続は
 //!   本タスクでは行わない（README 参照）。
+//! - 判断材料レポート（`#[ignore]`・アサートなし）: 既定ポリシーでの hybrid・dense
+//!   双方の指標を出力する（`make precision-regression` 経由。値は public な CI ログに
+//!   出ない）。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
-//!   小さな格子で差し替え、指標の変化を `println!` で表示する（目標値確定の判断
-//!   材料。production の既定値は変更しない。結果の記録先は spec 側）。
+//!   小さな格子で差し替え、hybrid 系列・dense 系列それぞれの指標の変化を `println!`
+//!   で表示する（目標値確定の判断材料。production の既定値は変更しない。結果の
+//!   記録先は spec 側）。
 //!
 //! # TASK-158（性能計測プロトコル基盤）準拠
 //!
@@ -898,10 +902,36 @@ fn precision_eval_threshold_gate() {
     );
 }
 
+// ---------- 判断材料レポート（`#[ignore]`。層 B 側の出力専用。アサートなし） ----------
+
+/// 既定ポリシー（`precision::DEFAULT_*`）での hybrid・dense 双方の指標を同一
+/// コーパス上で出力する（`PrecisionPolicy` が dense/hybrid 別々の既定閾値を持つため、
+/// 両方の妥当性判断には両系列の実測が要る）。
+///
+/// 実測値の出力は層 B 側（`make precision-regression`。`.github/workflows/ci.yml` の
+/// 対象外）に限定し、層 A（PR CI）では値を出さない
+/// （`.claude/rules/spec-confidentiality.md`。値の記録先は spec 側〔ポインタ:
+/// `docs/spec/05-tasks.md` TASK-163・`docs/spec/04-behavior/search.md` SEARCH-10〕）。
+#[test]
+#[ignore = "判断材料の提示専用（実測値の出力）。make precision-regression または cargo test -- --ignored precision_eval_report --nocapture で実行する"]
+fn precision_eval_report() {
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
+    print_eval_result(
+        "hybrid",
+        &measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer),
+    );
+    print_eval_result(
+        "dense",
+        &measure(&core, &ctx, Ranking::Dense, &qa, &no_answer),
+    );
+}
+
 // ---------- 感度スイープ（`#[ignore]`。判断材料の提示専用。アサートなし） ----------
 
-/// `PrecisionPolicy::new` の dense/hybrid 閾値を小さな格子で差し替え、hybrid
-/// ランキングの 3 指標の変化を表形式で出力する（目標値確定のための判断材料。
+/// `PrecisionPolicy::new` の hybrid 閾値・dense 閾値をそれぞれ小さな格子で差し替え、
+/// 対応するランキング（hybrid 系列・dense 系列）の 3 指標の変化を表形式で出力する
+/// （dense/hybrid の既定閾値は独立に評価する必要があるため両系列を出す。
+/// 目標値確定のための判断材料。
 /// production の既定値〔`precision::DEFAULT_*`〕は変更しない。`with_precision_policy`
 /// によるテスト内差し替えのみ）。
 #[test]
@@ -945,6 +975,35 @@ fn precision_eval_policy_sweep() {
                 let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
                 println!(
                     "{hybrid_min_top1:.3}  {hybrid_min_margin:.3}  {max_results}  {:.4}  {:.4}  {:.4}  {:.4}",
+                    r.top1_accuracy(),
+                    r.mrr10(),
+                    r.false_return_rate(),
+                    r.avg_result_rows(),
+                );
+            }
+        }
+    }
+
+    println!("=== TASK-163 precision パラメータ感度スイープ（dense。判断材料専用） ===");
+    println!(
+        "dense_min_top1  dense_min_margin  max_results  top1_acc  mrr10  false_return_rate  avg_result_rows"
+    );
+    for &dense_min_top1 in &[0.60, 0.80, 0.90] {
+        for &dense_min_margin in &[0.01, 0.05, 0.10] {
+            for &max_results in &[1usize, 3] {
+                let policy = PrecisionPolicy::new(
+                    dense_min_top1,
+                    dense_min_margin,
+                    engine::precision::DEFAULT_HYBRID_MIN_TOP1,
+                    engine::precision::DEFAULT_HYBRID_MIN_MARGIN,
+                    max_results,
+                )
+                .expect("swept policy must construct");
+                let (core, _guard) = setup_core(&docs, VOCAB_SIZE);
+                let core = core.with_precision_policy(policy);
+                let r = measure(&core, &ctx, Ranking::Dense, &qa, &no_answer);
+                println!(
+                    "{dense_min_top1:.3}  {dense_min_margin:.3}  {max_results}  {:.4}  {:.4}  {:.4}  {:.4}",
                     r.top1_accuracy(),
                     r.mrr10(),
                     r.false_return_rate(),
