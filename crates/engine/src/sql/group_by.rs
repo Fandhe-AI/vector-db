@@ -99,51 +99,124 @@ fn check_new_group_budget(
     Ok(())
 }
 
-/// `HAVING`/`WHERE` 相当ではなく、完了済みグループの集計結果 [`Cell`] と数値
-/// リテラルを比較する（TASK-167・SQL-14）。`Cell::Null`（空グループはあり得ないが
-/// `SUM`/`MIN`/`MAX` 等の空集合契約由来で `NULL` になりうる）との比較は常に偽
-/// （PostgreSQL の `NULL` 比較契約と同じ）。`Cell::Integer` は `u64`（束縛段で
-/// `2^53` 以下に制限済みのリテラルとの比較のため `f64` へ変換しても精度は失われ
-/// ない）、`Cell::Float` は `total_cmp` 相当の通常比較（非有限値は
-/// [`Accumulator`] 側が既に拒否済みのため到達しない）。
-fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
-    let value = match cell {
-        Cell::Integer(n) => *n as f64,
-        Cell::Float(f) => *f,
-        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT 型の集計結果を
-        // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
-        // として扱う。
-        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) => return false,
-    };
-    match op {
-        BinOp::Gt => value > literal,
-        BinOp::Lt => value < literal,
-        BinOp::Ge => value >= literal,
-        BinOp::Le => value <= literal,
-        BinOp::Eq => value == literal,
-        // 構文段（`allowlist::Parser::expect_cmp_op`）が算術演算子を HAVING の
-        // 比較演算子として構造上生成しないため到達しない。
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+/// `Cell::Integer`（`u64`。`COUNT`/`SUM` 等の集計結果で `2^53` を超えうる）と
+/// HAVING リテラル（`f64`。構文段 `parse_number_literal` が非有限値を拒否済み）
+/// を精度損失なく比較し、両者の大小関係を返す（PR #230 codex-review 指摘対応:
+/// 以前は `Cell::Integer` を無条件に `f64` へキャストしていたため、`2^53` 超の
+/// 集計値が丸められ `HAVING` の等号・不等号比較が誤判定しうた）。
+fn cmp_integer_to_literal(n: u64, literal: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if literal.is_nan() {
+        // 到達しない想定（構文段が非有限値を拒否済み）。fail-closed に「常に
+        // 不一致」となるよう Equal 以外を返す（呼び出し元の Eq 判定が false
+        // になれば十分なため、方向は問わない）。
+        return Ordering::Greater;
+    }
+    if literal < 0.0 {
+        // `u64` は常に 0 以上のため、負のリテラルより常に大きい。
+        return Ordering::Greater;
+    }
+    if literal >= 18_446_744_073_709_551_616.0 {
+        // 2^64（`u64` の表現域の上限超）。`n` は常にこれより小さい。
+        return Ordering::Less;
+    }
+    // 上の範囲チェックにより `literal.floor()` は [0, 2^64) に収まるため、
+    // `as u64` は精度・範囲の両面で安全（Rust の float→int キャストは
+    // 飽和変換であり未定義動作にならない）。
+    let floor_u64 = literal.floor() as u64;
+    match n.cmp(&floor_u64) {
+        Ordering::Equal if literal.fract() != 0.0 => {
+            // n == floor(literal) だが literal 自体は非整数 → 実際には n < literal。
+            Ordering::Less
+        }
+        other => other,
     }
 }
 
-/// `ORDER BY` 対象 1 つの並び替えキー。`GroupKey`（`Option<String>`）と
-/// `Cell`（集計結果）を共通の [`Ordering`](std::cmp::Ordering) へ写像する。
-/// `Cell::Null` は常に末尾（[`GroupKey`] の `None` と同じ既定順序規約）。
-fn cmp_order_value(a: &Cell, b: &Cell) -> std::cmp::Ordering {
+/// `HAVING`/`WHERE` 相当ではなく、完了済みグループの集計結果 [`Cell`] と数値
+/// リテラルを比較する（TASK-167・SQL-14）。`Cell::Null`（空グループはあり得ないが
+/// `SUM`/`MIN`/`MAX` 等の空集合契約由来で `NULL` になりうる）との比較は常に偽
+/// （PostgreSQL の `NULL` 比較契約と同じ）。`Cell::Integer` は
+/// [`cmp_integer_to_literal`] で精度損失なく比較する（`SUM(id)` 等 `2^53` を
+/// 超えうる値を無条件に `f64` へキャストしない）。`Cell::Float` は `total_cmp`
+/// 相当の通常比較（非有限値は [`Accumulator`] 側が既に拒否済みのため到達しない）。
+fn having_matches(cell: &Cell, op: BinOp, literal: f64) -> bool {
+    match cell {
+        Cell::Integer(n) => {
+            use std::cmp::Ordering;
+            let ord = cmp_integer_to_literal(*n, literal);
+            match op {
+                BinOp::Gt => ord == Ordering::Greater,
+                BinOp::Lt => ord == Ordering::Less,
+                BinOp::Ge => ord != Ordering::Less,
+                BinOp::Le => ord != Ordering::Greater,
+                BinOp::Eq => ord == Ordering::Equal,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+            }
+        }
+        Cell::Float(f) => match op {
+            BinOp::Gt => *f > literal,
+            BinOp::Lt => *f < literal,
+            BinOp::Ge => *f >= literal,
+            BinOp::Le => *f <= literal,
+            BinOp::Eq => *f == literal,
+            // 構文段（`allowlist::Parser::expect_cmp_op`）が算術演算子を HAVING の
+            // 比較演算子として構造上生成しないため到達しない。
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => false,
+        },
+        // 束縛段（`sql::parser::bind_group_by_clause`）が TEXT 型の集計結果を
+        // HAVING の対象として拒否済みのため到達しない。fail-closed に「不一致」
+        // として扱う。
+        Cell::Null | Cell::Text(_) | Cell::Vector(_) | Cell::Bool(_) => false,
+    }
+}
+
+/// `ORDER BY` 対象 1 つの並び替えキーのうち、非 `NULL` 値どうしの比較のみを行う
+/// （`Cell`（集計結果）を共通の [`Ordering`](std::cmp::Ordering) へ写像する）。
+/// `NULL` 配置（常に末尾）の判定は呼び出し元 [`order_with_nulls_last`] が方向反転
+/// より外側で行うため、ここでは非 `NULL` 値どうしの大小関係のみを返す（PR #230
+/// codex-review 指摘: 以前は `Cell::Null` の末尾配置を含めた `Ordering` 全体を
+/// `ORDER BY ... DESC` で `.reverse()` していたため、`NULL` が先頭に来て `LIMIT`
+/// が非 `NULL` グループを取りこぼしていた）。
+fn cmp_cell_values(a: &Cell, b: &Cell) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (a, b) {
-        (Cell::Null, Cell::Null) => Ordering::Equal,
-        (Cell::Null, _) => Ordering::Greater,
-        (_, Cell::Null) => Ordering::Less,
         (Cell::Integer(x), Cell::Integer(y)) => x.cmp(y),
         (Cell::Integer(x), Cell::Float(y)) => (*x as f64).total_cmp(y),
         (Cell::Float(x), Cell::Integer(y)) => x.total_cmp(&(*y as f64)),
         (Cell::Float(x), Cell::Float(y)) => x.total_cmp(y),
         (Cell::Text(x), Cell::Text(y)) => x.cmp(y),
-        // 型不一致は束縛段で発生しないため到達しない。決定的な安定順序として
+        // `Cell::Null` は呼び出し元が別途処理するため、ここへ渡ってきても
+        // （防御的フォールバックとして）到達しない想定。型不一致も同様に
         // Equal を返す（並び替え全体が破綻しないようにする防御的フォールバック）。
         _ => Ordering::Equal,
+    }
+}
+
+/// `ORDER BY` の並び順を、`NULL` 配置（常に末尾）を [`BoundOrderBy::descending`]
+/// による方向反転の外側で確定させたうえで返す（PR #230 codex-review 指摘対応）。
+/// `a_is_null`/`b_is_null` は比較対象（`GroupKey` の `None` または
+/// `Cell::Null`）が `NULL` かどうか、`value_cmp` は両者が非 `NULL` の場合の
+/// 大小関係（[`cmp_cell_values`] 等）。`DESC` 指定時も `NULL` は常に末尾に残る
+/// （`GroupKey`/[`cmp_order_value`] 系がこれまで守ってきた既定順序規約と同じ）。
+fn order_with_nulls_last(
+    a_is_null: bool,
+    b_is_null: bool,
+    value_cmp: std::cmp::Ordering,
+    descending: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a_is_null, b_is_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            if descending {
+                value_cmp.reverse()
+            } else {
+                value_cmp
+            }
+        }
     }
 }
 
@@ -319,18 +392,29 @@ pub(crate) fn execute_grouped_aggregate(
         Some(order_by) => {
             finished.sort_by(|(ka, ca), (kb, cb)| {
                 let primary = match order_by.target {
-                    OrderTarget::GroupKey => ka.cmp(kb),
-                    OrderTarget::Aggregate(idx) => cmp_order_value(
-                        ca.get(idx).unwrap_or(&Cell::Null),
-                        cb.get(idx).unwrap_or(&Cell::Null),
+                    OrderTarget::GroupKey => order_with_nulls_last(
+                        ka.0.is_none(),
+                        kb.0.is_none(),
+                        match (&ka.0, &kb.0) {
+                            (Some(a), Some(b)) => a.cmp(b),
+                            _ => std::cmp::Ordering::Equal,
+                        },
+                        order_by.descending,
                     ),
+                    OrderTarget::Aggregate(idx) => {
+                        let ca_cell = ca.get(idx).unwrap_or(&Cell::Null);
+                        let cb_cell = cb.get(idx).unwrap_or(&Cell::Null);
+                        order_with_nulls_last(
+                            matches!(ca_cell, Cell::Null),
+                            matches!(cb_cell, Cell::Null),
+                            cmp_cell_values(ca_cell, cb_cell),
+                            order_by.descending,
+                        )
+                    }
                 };
-                let primary = if order_by.descending {
-                    primary.reverse()
-                } else {
-                    primary
-                };
-                // 安定した決定性のため、同値はグループキー順で tie-break する。
+                // 安定した決定性のため、同値はグループキー順で tie-break する
+                // （`DESC` でも `NULL` は末尾のまま。`GroupKey::Ord` を使う昇順の
+                // tie-break はそもそも方向反転の対象外）。
                 primary.then_with(|| ka.cmp(kb))
             });
         }

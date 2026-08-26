@@ -650,3 +650,133 @@ fn text_min_max_accumulator_total_size_over_budget_is_rejected() {
         .expect_err("exceeding the TEXT accumulator total byte budget must be rejected");
     assert_eq!(err.wire_code(), "54000");
 }
+
+// `ORDER BY <GROUP BY 列> DESC` でも `NULL` グループは常に末尾（PR #230
+// codex-review P1 指摘対応: 以前は非 `NULL` 側との大小関係を含む `Ordering`
+// 全体を `.reverse()` していたため、`DESC` 指定時に `NULL` グループが先頭へ来て
+// `LIMIT` が本来先頭に来るべき非 `NULL` グループ（この場合 "cc"）を取りこぼして
+// いた）。
+#[test]
+fn group_by_desc_order_still_places_null_group_last_for_limit() {
+    let path = unique_db_path("group-by-desc-null-last");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |n: &str| {
+        engine::recovery::required_op_id::OperationId::parse(n).expect("valid operation_id")
+    };
+
+    storage
+        .alter_table_add_column(TABLE, ColumnDef::new("note", ColumnType::Text, true))
+        .expect("alter table");
+
+    for (id, note) in [
+        (1u64, Some("bb")),
+        (2, None),
+        (3, Some("aa")),
+        (4, None),
+        (5, Some("cc")),
+    ] {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                Value::Text("ja".to_string()),
+                note.map(|n| Value::Text(n.to_string()))
+                    .unwrap_or(Value::Null),
+            ],
+            &op(&format!("op-{id}")),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT note, COUNT(*) AS n FROM docs GROUP BY note ORDER BY note DESC LIMIT 1",
+        )
+        .expect("GROUP BY with DESC order and LIMIT should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        as_text(&result.rows[0].cells[0]),
+        Some("cc".to_string()),
+        "the largest non-NULL group must sort before the NULL group even under DESC"
+    );
+}
+
+// `HAVING` は `SUM(id)` のように `2^53` を超えうる整数集計値を精度損失なく比較
+// する（PR #230 codex-review P1 指摘対応: 以前は `Cell::Integer(u64)` を無条件に
+// `f64` へキャストしていたため、`2^53` 超の集計値が丸められ等号・不等号比較が
+// 誤判定しうた）。HAVING リテラル自体は束縛段で `2^53` 以下に制限されるため、
+// ここでは集計値側（`SUM(id)`）を `2^53` 超にして検証する。
+#[test]
+fn having_compares_large_integer_sum_without_precision_loss() {
+    let path = unique_db_path("group-by-having-large-integer");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |n: &str| {
+        engine::recovery::required_op_id::OperationId::parse(n).expect("valid operation_id")
+    };
+
+    // 2^53 + 1（`f64` で正確に表現できない最小の整数）。この行 1 件だけで
+    // グループを構成するため、SUM(id) はそのままこの id の値になる。
+    const HUGE_ID: u64 = (1u64 << 53) + 1;
+    // 束縛段（`sql::udf_call::parse_number_literal`）が受理する上限（2^53 ちょうど）。
+    const MAX_LITERAL: u64 = 1u64 << 53;
+
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx,
+        HUGE_ID,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![0.0f32; DIM]),
+            Value::Text("huge".to_string()),
+        ],
+        &op("op-huge"),
+    )
+    .expect("insert row");
+
+    let core = new_core(storage);
+
+    // 丸めると HUGE_ID は MAX_LITERAL（2^53）に一致してしまうが、実際の SUM は
+    // HUGE_ID（2^53 + 1）であり MAX_LITERAL とは等しくない。
+    let eq_result = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT lang, SUM(id) AS s FROM docs WHERE lang = 'huge' GROUP BY lang HAVING s = {MAX_LITERAL}"
+            ),
+        )
+        .expect("HAVING with large SUM should succeed");
+    assert!(
+        eq_result.rows.is_empty(),
+        "SUM(id) = {HUGE_ID} must not equal the rounded literal {MAX_LITERAL}"
+    );
+
+    // 丸めると HUGE_ID と MAX_LITERAL が等しくなってしまうため、丸め誤差込みの
+    // 比較では `>` が偽になる。実際には HUGE_ID > MAX_LITERAL のため真である
+    // べき。
+    let gt_result = core
+        .execute_sql(
+            &ctx,
+            &format!(
+                "SELECT lang, SUM(id) AS s FROM docs WHERE lang = 'huge' GROUP BY lang HAVING s > {MAX_LITERAL}"
+            ),
+        )
+        .expect("HAVING with large SUM should succeed");
+    assert_eq!(
+        gt_result.rows.len(),
+        1,
+        "SUM(id) = {HUGE_ID} must compare greater than the literal {MAX_LITERAL}"
+    );
+}
