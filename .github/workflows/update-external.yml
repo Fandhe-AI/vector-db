@@ -5,19 +5,17 @@
 # 設定だけを持つ薄い wrapper であり、fail-closed ガード・`persist-credentials`・
 # `source-token`・外部 action の pin・Node / skills CLI の版数は共通側で集中管理される。
 #
-# 移行前は本リポジトリでテンプレートを手管理していた。`.github/workflows/**` は
-# skills-update の配布対象外で上流の強化が届かないため、乖離が固定化していた
-# （Fandhe-AI/agent-cli-skills イシュー #261）。
+# 参照方式（@latest・組織方針）:
+# `Fandhe-AI/actions`（組織内の上流リポジトリ）への `uses:` 参照は可変タグ `@latest` を使う
+# （2026-08-18 オーナー判断。fandhe-backend の AGENTS.md「Fandhe-AI/actions の参照方式
+# （@latest）」節に記録）。`latest` は上流の `.github/workflows/move-latest-tag.yml` が
+# main への push ごとに付け替えるため、実行される revision は常に上流 main の tip に追従
+# する。SHA 固定の観点は第三者 action にのみ適用する。
 #
-# 参照 SHA の検証記録（2026-08-17 実測）:
-# - 到達性: `gh api repos/Fandhe-AI/actions/compare/main...0655187f7c71aafbe94098f7613d2cea1876e29f`
-#   → `{"status":"identical","ahead_by":0,"behind_by":0}`。upstream main の祖先であることを
-#   確認した（実測時点では main の tip そのもの）。以後 main が進めば status は behind へ
-#   変わるが、`ahead_by: 0` が保たれる限り祖先である事実は変わらない
-# - コミット: feat(update-external): 定期更新 workflow を reusable 化して配布経路を確立 (#79)
-#   （2026-08-17T02:14:46Z）
-# - 入力契約: 同 SHA の `.github/workflows/update-external.yml` を contents API で取得し
-#   `on.workflow_call` を確認。inputs 9 件（target / runner-json / base-branch /
+# 入力契約・権限・timeout の検証記録（2026-08-17 実測。@latest 追従のため、以下は実測時点の
+# 上流 revision に対する参考情報であり、現在実行される revision の保証ではない。契約が
+# 変わった場合は上流側の validate-inputs / actionlint が検出する前提の運用）:
+# - 入力契約: `on.workflow_call` は inputs 9 件（target / runner-json / base-branch /
 #   enable-submodule / enable-skills / submodule-auto-merge{,-allowlist} /
 #   skills-auto-merge{,-allowlist}）・secrets 2 件（SUBMODULE_PAT / SKILLS_PAT）で、いずれも
 #   required: false。本ファイルの with / secrets がこの契約の範囲内であることを機械照合した
@@ -25,10 +23,8 @@
 #   `contents: read`。reusable workflow の権限は呼び出し側以下である必要があり、本ファイルの
 #   `permissions: contents: read` で充足する
 # - 実行時間上限: 呼び出し先ジョブは validate-inputs 5 分・submodule 10 分・skills 15 分の
-#   `timeout-minutes` を持つ（移行前の各ジョブと同値）。reusable workflow を呼ぶジョブ自身には
-#   `timeout-minutes` を設定できないため、上限は上流のこの契約で担保される
-# - タグ未公開（0 tags / 0 releases）のため SHA 固定が必須で、Dependabot による自動更新は
-#   効かない。上流更新時は本記録ごと手で差し替える
+#   `timeout-minutes` を持つ。reusable workflow を呼ぶジョブ自身には `timeout-minutes` を
+#   設定できないため、上限は上流のこの契約で担保される
 #
 # runner 選択の根拠（移行前ファイルから引き継ぎ）:
 # 「public 化に伴う組織 runner 方針（Fandhe-AI/actions リポジトリの docs/runner-policy.md）により GitHub
@@ -63,7 +59,7 @@ concurrency:
 
 jobs:
   update-external:
-    # Fandhe-AI/actions はタグ未公開のため main 追従の最新コミット SHA に固定する
+    # 組織方針（冒頭コメント参照）により、上流 main 追従の可変タグ @latest を参照する
     uses: Fandhe-AI/actions/.github/workflows/update-external.yml@latest
     permissions:
       contents: read
