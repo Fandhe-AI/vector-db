@@ -67,6 +67,8 @@ fn setup_single_tenant_table(storage: &Storage, rows: &[(u64, [f32; 2], &str, &s
                 Value::Text((*lang).to_string()),
                 Value::Null,
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation id"),
         )
         .expect("insert row");
     }
@@ -323,6 +325,8 @@ fn ext3_rls_is_enforced_before_metadata_filter() {
                 Value::Vector(vec![1.0, 0.0]),
                 Value::Text(path_val.to_string()),
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation id"),
         )
         .expect("insert row");
     }
