@@ -40,7 +40,7 @@ fn new_core_with_documents_table(path: &std::path::Path) -> EngineCore {
 
 #[test]
 fn err2_all_fifteen_classes_have_unique_wire_codes() {
-    assert_eq!(ErrorClass::ALL.len(), 15, "spec 表は計 15 行（14 分類）");
+    assert_eq!(ErrorClass::ALL.len(), 15, "spec 表は計 15 行（15 分類）");
     let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
     assert_eq!(
         codes.len(),
@@ -243,7 +243,18 @@ fn err2_internal_error_client_message_never_carries_detail() {
 
 #[test]
 fn err2_wire_error_message_is_truncated() {
+    // `error_format::MAX_MESSAGE_LEN`（200、非 pub）+ 省略記号 "..." の 3 文字で
+    // 固定長 203 バイトへ切り詰められることを検証する（回帰検知のため固定値で確認）。
+    const EXPECTED_TRUNCATED_LEN: usize = 203;
     let long = "a".repeat(10_000);
     let err = WireError::new(ErrorClass::InvalidInput, long.clone());
-    assert!(err.message().len() < long.len(), "上限長で切り詰める");
+    assert_eq!(
+        err.message().len(),
+        EXPECTED_TRUNCATED_LEN,
+        "上限長ちょうどへ切り詰める"
+    );
+    assert!(
+        err.message().ends_with("..."),
+        "切り詰め時は省略記号を付与する"
+    );
 }

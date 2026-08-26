@@ -15,7 +15,7 @@
 //! RECOVER-10 の内容照合）は TASK-154 の管轄であり本モジュールでは実装しない。
 
 /// エラー分類の共通表現。`docs/spec/04-behavior/error-format.md` の分類表
-/// （計 15 行・14 分類）に 1 対 1 対応する。表の掲載順と揃える。
+/// （計 15 行・15 分類）に 1 対 1 対応する。表の掲載順と揃える。
 ///
 /// `#[non_exhaustive]` は付けない。網羅 `match` によって、新しい分類を追加した際
 /// `wire_code`／`label`／`ALL` のすべてを更新し忘れるとコンパイルが失敗する構造に
@@ -181,7 +181,13 @@ impl WireError {
     /// 新規構築。`message` は [`MAX_MESSAGE_LEN`] で切り詰める（DoS・情報漏えい対応）。
     /// `class == InternalError` の詳細文言を運びたい場合はこの API を使わず、必ず
     /// [`WireError::internal`] を使うこと（内部ストレージ詳細等の漏えい経路を型で塞ぐ）。
+    /// `InternalError` を渡された場合、渡された `message` は使わず
+    /// [`WireError::internal`] へ差し替える（コメントの主張を実装でも強制し、
+    /// 呼び出し側の実装漏れによる詳細漏えいを構造的に防ぐ）。
     pub fn new(class: ErrorClass, message: impl Into<String>) -> Self {
+        if matches!(class, ErrorClass::InternalError) {
+            return WireError::internal();
+        }
         WireError {
             class,
             message: truncate_message(&message.into()),
