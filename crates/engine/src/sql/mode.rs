@@ -170,6 +170,21 @@ impl SessionState {
         &mut self.udfs
     }
 
+    /// TASK-149（対象ビヘイビア: EXT-5, EXT-6）: コンパイル済み WASM UDF
+    /// （`crate::wasm_udf::compile` の戻り値）をこのセッションのレジストリへ登録
+    /// する。検証・名前空間の衝突検査は `udf_call::define_wasm_function` が担い、
+    /// 登録は宣言的 UDF と同じ「セッション（＝認証済みテナントの接続単位）に
+    /// 閉じる・永続化しない」構造に従う。SQL からの登録構文（`CREATE FUNCTION
+    /// ... AS WASM ...`）・wire 経由のモジュール搬送は本タスクのスコープ外で、
+    /// 呼び出し元がモジュールバイト列の取得・コンパイルを担う。
+    pub fn register_wasm_udf(
+        &mut self,
+        name: &str,
+        backend: std::sync::Arc<dyn crate::wasm_udf::WasmUdfBackend>,
+    ) -> Result<(), crate::sql::allowlist::SqlSurfaceError> {
+        crate::sql::udf_call::define_wasm_function(&mut self.udfs, name, backend)
+    }
+
     /// 検証済みの値のみを受け取る契約（呼び出し元 `core.rs::EngineCore::execute_sql_in_session`
     /// が `SearchMode::parse_literal` の検証成功後にのみ呼ぶ）。失敗した `SET` が
     /// セッションを変更しないことは、この「検証→代入」の呼び出し順序で保証する
