@@ -131,6 +131,12 @@ for i in $(seq 1 "${ITERATIONS}"); do
     fi
     if ! kill -0 "${writer_pid}" 2>/dev/null; then
       # writer が同期点に到達する前に終了した（起動失敗など）。
+      # kill -0 は zombie に対しては成功するため、失敗＝ESRCH＝bash が既に reap
+      # 済みで PID が OS に再利用され得る状態。writer_pid の「未 reap の子だけを
+      # 指す」不変条件を保つためクリアし、下の stop_writer が再利用済み PID へ
+      # kill -9 を送らないようにする（タイムアウトで抜ける経路では writer は生存中
+      # なので writer_pid は保持され、stop_writer が正しく停止する）。
+      writer_pid=""
       break
     fi
     sleep 0.1
