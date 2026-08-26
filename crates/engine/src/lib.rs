@@ -142,6 +142,11 @@
 //! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
 //! モジュールドキュメント参照）。
 //!
+//! TASK-93（対象ビヘイビア: RECOVER-2）: `recovery::ledger` が、検証済み
+//! `operation_id` をテナント内・テーブル単位で永続化する台帳を提供する。台帳への
+//! 追記は行の書き込み・更新・削除と同一の `redb::WriteTransaction` 内で原子的に
+//! 行う（詳細は `recovery::ledger` モジュールドキュメント参照）。
+//!
 //! TASK-166（対象ビヘイビア: SQL-13）: `sql::aggregate` が集計関数（`COUNT`/`SUM`/
 //! `AVG`/`MIN`/`MAX`）のみを結果列とする `GROUP BY` なし単一行 SELECT を実行する。
 //! RLS 適用順序は既存の検索 SELECT 実行経路（`arena.rs`）と同一の規約（デコード前の

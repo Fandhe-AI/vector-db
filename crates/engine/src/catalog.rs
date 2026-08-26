@@ -699,8 +699,11 @@ impl Storage {
     /// 名前は `Err(CatalogError::Invalid)`（fail-closed。冪等に `Ok` へ丸めない）。
     /// 行ストア（`user_rows/{table_name}`）は初回挿入まで物理的に未作成のことがあり、
     /// その場合の `delete_table` は「元々存在しなかった」ことを表す `Ok(false)` を返すため
-    /// エラーにしない。`ROWS_TABLE`（旧・非テーブルスコープ API）・バッチ台帳・
-    /// 世代テーブルには一切触れない。
+    /// エラーにしない。`ROWS_TABLE`（旧・非テーブルスコープ API）・世代テーブルには
+    /// 一切触れない。`operation_id` 台帳（`op_ledger`）は同一トランザクション内で
+    /// [`crate::recovery::ledger::delete_table_in_txn`] により当該テーブル名分を
+    /// 削除する（Issue #226 レビュー対応: drop 後の同名テーブル再作成で旧台帳
+    /// エントリが引き継がれ、正当な書き込みを誤って重複拒否する事故を防ぐ）。
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         validate_identifier(table_name)?;
         let write_txn = self.db().begin_write()?;
@@ -720,6 +723,11 @@ impl Storage {
         // 行ストアを同一 txn 内で `open_table` すると `TableAlreadyOpen` になるため、
         // `delete_table` は既存ハンドルを介さず直接呼ぶ。
         write_txn.delete_table(user_rows_table_def(&user_rows_table_name(table_name)))?;
+        // op_ledger も同一 txn・同一 commit で整合させる（上記ドキュメンテーション
+        // コメント参照）。行ストア削除と異なりテーブル自体は残す（他テーブル分の
+        // エントリが同居するため）。
+        crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
+            .map_err(convert_storage_error)?;
         crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -1393,6 +1401,46 @@ mod tests {
         let after = storage.current_generation().expect("read generation");
 
         assert_eq!(after, before + 1);
+    }
+
+    // drop 後の同名テーブル再作成で旧 `op_ledger` エントリが引き継がれ、正当な
+    // 書き込みを誤って重複拒否させない（Issue #226 レビュー対応: TASK-93/RECOVER-2）。
+    #[test]
+    fn drop_table_removes_op_ledger_entries_for_that_table() {
+        use crate::recovery::ledger::{contains_in_read_txn, record_in_txn, LedgerWrite};
+        use crate::recovery::required_op_id::OperationId;
+
+        let path = unique_db_path("drop-table-op-ledger");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create table");
+
+        let op_id = OperationId::parse("op-drop-1").expect("valid operation_id");
+        let write_txn = storage.db().begin_write().expect("begin write");
+        record_in_txn(&write_txn, "tenant-a", "docs", LedgerWrite::Record(&op_id))
+            .expect("record op ledger entry");
+        write_txn.commit().expect("commit ledger record");
+
+        storage.drop_table("docs").expect("drop table");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("recreate table with same name");
+
+        let read_txn = storage.db().begin_read().expect("begin read");
+        let found = contains_in_read_txn(&read_txn, "tenant-a", "docs", &op_id)
+            .expect("contains after recreate");
+        assert!(
+            !found,
+            "op_ledger entry from the dropped table must not survive into the recreated table"
+        );
     }
 
     #[test]
