@@ -146,6 +146,50 @@ pub(crate) fn record_in_txn(
     Ok(RecordOutcome::Recorded)
 }
 
+/// `DROP TABLE` 相当の DDL（[`crate::catalog::Storage::drop_table`]）と**同一の
+/// `redb::WriteTransaction`** 内で呼び出し、指定テーブル名に属する台帳エントリを
+/// 全テナント分まとめて削除する（Issue #226 レビュー対応・PR #226）。
+///
+/// 背景: 台帳キーは `(tenant_id, table_name, operation_id)` のみでテーブルの世代を
+/// 持たない。`drop_table` が台帳へ触れないまま同名テーブルを再作成すると、
+/// 新しい（空の）テーブルに対して旧テーブルの `operation_id` が
+/// [`contains_in_read_txn`] 経由で「記録済み」と誤判定され、正当な書き込みが
+/// 拒否される事故につながる。`drop_table` は物理行ストア（`user_rows/{table}`）を
+/// 削除する際、既にテナント横断で不可逆削除する設計（本ファイル冒頭コメント参照）
+/// のため、台帳エントリもテナントを問わず同名分をまとめて削除して整合させる。
+///
+/// 台帳テーブル自体が未作成（一度も `Record` されていない DB）の場合は no-op で
+/// `Ok(())` を返す（`contains_in_read_txn` と同じ「テーブル不在をエラーにしない」
+/// 方針）。キー先頭が `tenant_id` のため `table_name` 単独の range 走査はできず、
+/// 全件走査してから対象キーのみ削除する（DDL 経路のみで呼ばれ、頻度が低いための
+/// 許容。行データそのものへはアクセスしない）。
+pub(crate) fn delete_table_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table: &str,
+) -> Result<(), StorageError> {
+    let mut ledger_table = match write_txn.open_table(OP_LEDGER_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(e) => return Err(StorageError::from(e)),
+    };
+    let mut keys_to_remove: Vec<(String, String, String)> = Vec::new();
+    for entry in ledger_table.iter()? {
+        let (k, _v) = entry?;
+        let (tenant_id, table_name, op_id) = k.value();
+        if table_name == table {
+            keys_to_remove.push((
+                tenant_id.to_string(),
+                table_name.to_string(),
+                op_id.to_string(),
+            ));
+        }
+    }
+    for (tenant_id, table_name, op_id) in &keys_to_remove {
+        ledger_table.remove((tenant_id.as_str(), table_name.as_str(), op_id.as_str()))?;
+    }
+    Ok(())
+}
+
 /// `read_txn` 内で `(tenant_id, table, op_id)` が台帳に記録済みかを照会する（TASK-93、
 /// 対象ビヘイビア: RECOVER-2）。台帳テーブルが未作成（台帳を一度も使っていない DB、
 /// または [`LedgerWrite::Disabled`] のみで運用してきた構成）の場合は `false` を返す
@@ -317,5 +361,83 @@ mod tests {
         )
         .expect_err("unknown format version must be rejected on record too");
         assert!(matches!(err2, StorageError::Codec(_)));
+    }
+
+    // (f) delete_table_in_txn は指定テーブル名分を全テナントから削除し、他テーブル名の
+    // エントリには触れない（Issue #226 レビュー対応: drop→同名再作成での旧台帳
+    // エントリ引き継ぎ防止）。
+    #[test]
+    fn delete_table_in_txn_removes_all_tenants_for_table_only() {
+        let path = unique_db_path("ledger-f");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Record(&op("op-f1")),
+        )
+        .expect("record tenant-a/documents");
+        record_in_txn(
+            &write_txn,
+            "tenant-b",
+            "documents",
+            LedgerWrite::Record(&op("op-f2")),
+        )
+        .expect("record tenant-b/documents");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "other_table",
+            LedgerWrite::Record(&op("op-f3")),
+        )
+        .expect("record tenant-a/other_table");
+        write_txn.commit().expect("commit initial records");
+
+        let write_txn = db.begin_write().expect("begin write");
+        delete_table_in_txn(&write_txn, "documents").expect("delete_table_in_txn");
+        write_txn.commit().expect("commit delete");
+
+        let read_txn = db.begin_read().expect("begin read");
+        assert!(
+            !contains_in_read_txn(&read_txn, "tenant-a", "documents", &op("op-f1"))
+                .expect("contains a/documents")
+        );
+        assert!(
+            !contains_in_read_txn(&read_txn, "tenant-b", "documents", &op("op-f2"))
+                .expect("contains b/documents")
+        );
+        assert!(
+            contains_in_read_txn(&read_txn, "tenant-a", "other_table", &op("op-f3"))
+                .expect("contains a/other_table must survive")
+        );
+
+        // drop 後に同名テーブルへ同じ operation_id で再記録できる（旧エントリが
+        // 引き継がれ NotRecorded ではなく誤って Recorded 扱いになる事故が起きない）。
+        let write_txn = db.begin_write().expect("begin write");
+        let outcome = record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Record(&op("op-f1")),
+        )
+        .expect("re-record after drop");
+        assert_eq!(outcome, RecordOutcome::Recorded);
+        write_txn.commit().expect("commit re-record");
+    }
+
+    // (g) 台帳テーブル未作成のまま delete_table_in_txn を呼んでもエラーにならない。
+    #[test]
+    fn delete_table_in_txn_is_noop_when_ledger_table_missing() {
+        let path = unique_db_path("ledger-g");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        delete_table_in_txn(&write_txn, "documents")
+            .expect("no-op when ledger table has never been created");
+        write_txn.commit().expect("commit");
     }
 }
