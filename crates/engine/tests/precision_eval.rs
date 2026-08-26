@@ -30,15 +30,15 @@
 //!   構造不変条件（カウンタの上下関係・`PrecisionPolicy::max_results` の遵守・
 //!   指標が `[0.0, 1.0]` に収まること）と測定の決定性のみを検査する。指標の実測値は
 //!   アサートも出力もしない（値が public な Actions ログ・テストコードに残らない）。
-//! - 層 B（`#[ignore]`・`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
+//! - 層 B（`#[ignore]`・`make precision-regression`。pass/fail のみ出力）: `PRECISION_EVAL_MIN_TOP1_ACC`・
 //!   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
 //!   （`hybrid_recall.rs::resolve_gate_threshold` と同型の解決規則）による閾値ゲート。
 //!   未設定時は「評価は実行するが判定はスキップ」（`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`
 //!   の strict モードでは fail-closed）。`.github/workflows/recall.yml` への接続は
 //!   本タスクでは行わない（README 参照）。
 //! - 判断材料レポート（`#[ignore]`・アサートなし）: 既定ポリシーでの hybrid・dense
-//!   双方の指標を出力する（`make precision-regression` 経由。値は public な CI ログに
-//!   出ない）。
+//!   双方の指標を出力する。実測値を標準出力へ出すため**ローカル専用**の
+//!   `make precision-report` からのみ実行し、CI・GitHub Actions からは実行しない。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
 //!   小さな格子で差し替え、hybrid 系列・dense 系列それぞれの指標の変化を `println!`
 //!   で表示する（目標値確定の判断材料。production の既定値は変更しない。結果の
@@ -846,9 +846,10 @@ fn resolve_gate_threshold(var: &str, kind: ThresholdKind) -> Option<f64> {
 /// variables 由来を想定）を満たすかを判定する閾値ゲート。未設定は既定（非 strict）
 /// では「対象外」として明示的に成功終了し、strict モードでは fail-closed でテスト
 /// 失敗とする。設定済みで非数値・範囲外は常に fail-closed（`hybrid_recall.rs::
-/// hybrid_recall_small_scale_threshold_gate` と同一契約）。ログには実測値と
-/// pass/fail のみを出力し、注入された閾値の数値は出力しない。3 指標はいずれも
-/// `precision` モードの返却列から算出する（[`measure`] 参照）。
+/// hybrid_recall_small_scale_threshold_gate` と同一契約）。ログには指標名と pass/fail
+/// のみを出力し、注入された閾値の数値も実測値も出力しない（`make precision-regression`
+/// は将来 public runner から実行されうるため）。3 指標はいずれも `precision` モードの
+/// 返却列から算出する（[`measure`] 参照）。
 #[test]
 #[ignore = "spec 閾値（目標値。Actions variables 由来を想定）が必要なため既定では実行しない。make precision-regression で実行する"]
 fn precision_eval_threshold_gate() {
@@ -866,34 +867,28 @@ fn precision_eval_threshold_gate() {
 
     let (core, _guard, ctx, qa, no_answer) = build_fixture();
     let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
-    // 実測値の出力は層 B（`make precision-regression`。`.github/workflows/ci.yml` の
-    // 対象外）に限る。層 A は public な Actions ログへ実測値を出さない。
-    print_eval_result("hybrid", &r);
 
+    // 出力は指標名と pass/fail のみ。閾値の数値も実測値も出さない——本テストは
+    // `make precision-regression` を通じて将来 public runner（`recall.yml`）から
+    // 実行されうるため、Actions ログに非公開値を残さない
+    // （`.claude/rules/spec-confidentiality.md`。PR #212 codex-review P0）。
+    // 実測値の出力は ローカル専用の `make precision-report`
+    // （[`precision_eval_report`]・[`precision_eval_policy_sweep`]）が担う。
     let mut pass = true;
     if let Some(min) = min_top1 {
         let p = r.top1_accuracy() >= min;
         pass &= p;
-        println!(
-            "precision_eval_threshold_gate: top1_accuracy={:.4} pass={p}",
-            r.top1_accuracy()
-        );
+        println!("precision_eval_threshold_gate: top1_accuracy pass={p}");
     }
     if let Some(min) = min_mrr10 {
         let p = r.mrr10() >= min;
         pass &= p;
-        println!(
-            "precision_eval_threshold_gate: mrr10={:.4} pass={p}",
-            r.mrr10()
-        );
+        println!("precision_eval_threshold_gate: mrr10 pass={p}");
     }
     if let Some(max) = max_false_return {
         let p = r.false_return_rate() <= max;
         pass &= p;
-        println!(
-            "precision_eval_threshold_gate: false_return_rate={:.4} pass={p}",
-            r.false_return_rate()
-        );
+        println!("precision_eval_threshold_gate: false_return_rate pass={p}");
     }
 
     assert!(
@@ -908,12 +903,13 @@ fn precision_eval_threshold_gate() {
 /// コーパス上で出力する（`PrecisionPolicy` が dense/hybrid 別々の既定閾値を持つため、
 /// 両方の妥当性判断には両系列の実測が要る）。
 ///
-/// 実測値の出力は層 B 側（`make precision-regression`。`.github/workflows/ci.yml` の
-/// 対象外）に限定し、層 A（PR CI）では値を出さない
+/// 実測値の出力はローカル専用の `make precision-report` に限定する（`make
+/// precision-regression`＝閾値ゲートは pass/fail しか出さないため、将来 public runner
+/// から実行されても値が漏れない）
 /// （`.claude/rules/spec-confidentiality.md`。値の記録先は spec 側〔ポインタ:
 /// `docs/spec/05-tasks.md` TASK-163・`docs/spec/04-behavior/search.md` SEARCH-10〕）。
 #[test]
-#[ignore = "判断材料の提示専用（実測値の出力）。make precision-regression または cargo test -- --ignored precision_eval_report --nocapture で実行する"]
+#[ignore = "判断材料の提示専用（実測値の出力）。ローカル専用の make precision-report または cargo test -- --ignored precision_eval_report --nocapture で実行する"]
 fn precision_eval_report() {
     let (core, _guard, ctx, qa, no_answer) = build_fixture();
     print_eval_result(
@@ -935,7 +931,7 @@ fn precision_eval_report() {
 /// production の既定値〔`precision::DEFAULT_*`〕は変更しない。`with_precision_policy`
 /// によるテスト内差し替えのみ）。
 #[test]
-#[ignore = "判断材料の提示専用（表出力）。make precision-regression または cargo test -- --ignored precision_eval_policy_sweep --nocapture で実行する"]
+#[ignore = "判断材料の提示専用（表出力）。ローカル専用の make precision-report または cargo test -- --ignored precision_eval_policy_sweep --nocapture で実行する"]
 fn precision_eval_policy_sweep() {
     let (docs, inverted) = generate_corpus(CORPUS_SEED, NUM_DOCS, VOCAB_SIZE);
     let mut qa_rng = DeterministicRng::new(CORPUS_SEED.wrapping_add(QA_SEED_OFFSET));
