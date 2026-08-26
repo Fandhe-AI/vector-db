@@ -118,7 +118,20 @@ const RECALL_QUERY_COUNT: usize = 20;
 /// 診断が示したいのは「SIMD 並列経路 vs スカラー参照経路」の比率であり、比率の
 /// 意味は行数に依存しないため、CORE-3/CORE-4 用データセットとは別に小さい専用
 /// データセットを生成して用いる。
-const DIAG_AB_ROW_COUNT: usize = 2_000;
+///
+/// ただし縮小しすぎると A 側（`ParallelSearchProvider`）が実際にはスレッド分割
+/// されず、ログの `end_to_end_simd_parallel_path` ラベルと実態（シングルスレッド
+/// SIMD パス）が食い違う（Cursor Bugbot 指摘・PR #222）。`parallel_search.rs`
+/// `thread_count_for` はスレッド数を `row_count / MIN_ROWS_PER_THREAD`
+/// （`parallel_search.rs` 内 `MIN_ROWS_PER_THREAD = 1024`。非 `pub` のためこの
+/// ファイルからは参照できず値のみポインタ表記する）でクランプするため、
+/// 少なくとも 2 スレッドに分割されるには行数が `MIN_ROWS_PER_THREAD` の 2 倍
+/// （2,048）以上必要。旧値 2,000 はこれを下回っており（`MIN_ROWS_PER_THREAD`
+/// × 1 未満）常にシングルスレッド経路だった。`MIN_ROWS_PER_THREAD` の 4 倍
+/// （実分割後も 1 スレッドあたり `MIN_ROWS_PER_THREAD` を十分上回る）を確保
+/// しつつ、タイムアウト回避の目的（行数を小さく保つ）は維持する値として
+/// 選定した。
+const DIAG_AB_ROW_COUNT: usize = 4_096;
 
 /// `BENCH_MAX_P95_MS` 環境変数（ミリ秒・整数）を読み取り、CORE-3・SEARCH-4 の
 /// p95 上限として使う `Duration` を得る。未設定・非数値・0 以下は fail-closed で
