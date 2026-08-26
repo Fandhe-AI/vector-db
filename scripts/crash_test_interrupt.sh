@@ -182,6 +182,10 @@ run_variant() {
   wait "${script_pid}" 2>/dev/null
   script_status=$?
   if [ "${script_status}" -ne 130 ]; then
+    # 期待外の終了コード（trap 未設置による 143 など）でも、writer が生き残って
+    # いれば MAX_ROWS まで自走し続ける。タイムアウト経路と同様に後始末してから
+    # 失敗させる（テスト自身が survivor をリークしない）。
+    assert_no_survivor "${writer_pid}" || true
     fail "[${name}] crash_test.sh exit status=${script_status}, expected 130"
   fi
 
