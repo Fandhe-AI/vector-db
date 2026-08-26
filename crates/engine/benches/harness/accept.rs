@@ -96,19 +96,19 @@ pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, B
     Ok(recall >= min_recall)
 }
 
-/// 対照エンジンとの中央値比（`ab::AbMeasurement::median_ratio`。被検/対照）が
-/// 上限（`max_ratio`）以下かを判定する（CORE-5）。
+/// 対照エンジンとの比率（被検/対照）が上限（`max_ratio`）以下かを判定する
+/// （CORE-5。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）。
 ///
-/// 呼び出し元は本 PR の時点では未接続（対照エンジンクレートの導入がユーザー承認必須
-/// のため。`.claude/rules/dependency-policy.md`）。判定ロジックのみ先行実装し、
-/// `tests/bench_accept.rs` で単体検証する。
-pub fn check_contrast_ratio_within_limit(
-    median_ratio: f64,
-    max_ratio: f64,
-) -> Result<bool, BenchError> {
-    if !median_ratio.is_finite() || median_ratio < 0.0 {
+/// CORE-5 の判定統計量は p95 レイテンシの比率であり、呼び出し元
+/// （`contrast_bench.rs`）は [`p95_ratio`] の結果を渡す（`ab::AbMeasurement::median_ratio`
+/// は補助情報として標準出力に併記するのみで、本判定には使わない）。引数名を汎用の
+/// `ratio` ではなく統計量非依存の値として扱えるよう、値そのものの妥当性検証
+/// （有限・非負）のみを本関数の責務とする（TASK-127・Issue #176 で対照エンジン
+/// 〔usearch〕へ接続済み）。
+pub fn check_contrast_ratio_within_limit(ratio: f64, max_ratio: f64) -> Result<bool, BenchError> {
+    if !ratio.is_finite() || ratio < 0.0 {
         return Err(BenchError::DegenerateRatio(
-            "median_ratio must be a finite, non-negative value",
+            "ratio must be a finite, non-negative value",
         ));
     }
     if !max_ratio.is_finite() || max_ratio <= 0.0 {
@@ -116,7 +116,50 @@ pub fn check_contrast_ratio_within_limit(
             "max_ratio must be a finite, positive value",
         ));
     }
-    Ok(median_ratio <= max_ratio)
+    Ok(ratio <= max_ratio)
+}
+
+/// 2 つの所要時間サンプル列から p95 レイテンシの比率（a/b）を算出する（CORE-5）。
+///
+/// `contrast_bench.rs` が `a`＝被検（`ParallelSearchProvider`）・`b`＝対照
+/// （usearch `exact_search`）の順で渡す契約とする。`p95_from_samples` を経由するため
+/// 空サンプルは `Err(BenchError::EmptySamples)`。対照側の p95 が `Duration::ZERO`
+/// （極めて軽量なワークロード・粗い clock 分解能等）だと a/b が NaN/+inf 化し
+/// 暗黙の fail-open を招くため、`ab::median_ratio` と同一方針で `Err` とする。
+pub fn p95_ratio(a_samples: &[Duration], b_samples: &[Duration]) -> Result<f64, BenchError> {
+    let p95_a = p95_from_samples(a_samples)?;
+    let p95_b = p95_from_samples(b_samples)?;
+    if p95_b.is_zero() {
+        return Err(BenchError::DegenerateRatio(
+            "cannot compute p95_ratio: baseline (b) p95 is zero",
+        ));
+    }
+    Ok(p95_a.as_secs_f64() / p95_b.as_secs_f64())
+}
+
+/// `BENCH_MAX_CONTRAST_RATIO` 環境変数の生文字列を CORE-5 の上限比として解析する
+/// 純関数（`contrast_bench.rs` の env 読み取りから分離し、`tests/bench_accept.rs` で
+/// 実測タイマー・env に依存せず検証できるようにする）。
+///
+/// 未設定の repo variable は GitHub Actions 上では空文字列に解決される
+/// （`.github/workflows/bench.yml` 参照）ため、空文字列も明示的に拒否する
+/// （`max_p95_from_env`〔`parallel_bench.rs`〕と同一の fail-closed 方針）。
+pub fn parse_contrast_ratio_limit(raw: &str) -> Result<f64, BenchError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BenchError::ProtocolViolation(
+            "BENCH_MAX_CONTRAST_RATIO must not be empty",
+        ));
+    }
+    let value: f64 = trimmed.parse().map_err(|_| {
+        BenchError::ProtocolViolation("BENCH_MAX_CONTRAST_RATIO must be a floating-point number")
+    })?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(BenchError::ProtocolViolation(
+            "BENCH_MAX_CONTRAST_RATIO must be a finite, positive value",
+        ));
+    }
+    Ok(value)
 }
 
 /// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
