@@ -487,6 +487,9 @@ impl GpuBatchBackend {
         let _guard = gpu_dispatch_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // ステージング確保は scope の外で先に済ませる（`dispatch_dot_products`
+        // と同じ理由。codex P1 指摘対応）。
+        let packed_staging = bytes_of_u32_slice(matrix.packed())?;
         let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let row_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -495,7 +498,6 @@ impl GpuBatchBackend {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let packed_staging = bytes_of_u32_slice(matrix.packed())?;
         ctx.queue.write_buffer(&row_buffer, 0, &packed_staging);
         let poll_failed = || {
             BatchBackendError::InitFailed(
@@ -892,6 +894,16 @@ fn dispatch_dot_products(
         _pad1: 0,
     };
 
+    // ステージング用バイト列（ホスト側の確保）は error scope を push する**前**に
+    // すべて用意する（codex P1 指摘対応: scope の内側で `?` により早期 return すると
+    // pop が明示的に実行されない。`ErrorScopeGuard::drop` が自動 pop するため
+    // スタックが壊れることはないが、「push した scope はこの関数内で必ず明示的に
+    // pop する」という読み手に分かりやすい不変条件を保つ。GPU に触れない確保処理を
+    // scope の内側へ入れる必要はそもそもない）。
+    let params_bytes = params.to_ne_bytes_vec()?;
+    let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
+    let query_bytes = bytes_of_f32_slice(&padded_query)?;
+
     // バッファ・bind group の生成もすべて error scope の内側で行う
     // （codex/Bugbot P1 指摘対応: 以前は encoder 直前で push していたため、
     // 生成失敗が scope 外の uncaptured error になり panic しえた）。
@@ -904,10 +916,8 @@ fn dispatch_dot_products(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    ctx.queue
-        .write_buffer(&params_buffer, 0, &params.to_ne_bytes_vec()?);
+    ctx.queue.write_buffer(&params_buffer, 0, &params_bytes);
 
-    let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
     let row_ids_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product row ids"),
         size: row_ids_bytes.len() as u64,
@@ -916,7 +926,6 @@ fn dispatch_dot_products(
     });
     ctx.queue.write_buffer(&row_ids_buffer, 0, &row_ids_bytes);
 
-    let query_bytes = bytes_of_f32_slice(&padded_query)?;
     let query_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product query"),
         size: query_bytes.len() as u64,
