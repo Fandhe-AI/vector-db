@@ -1136,6 +1136,11 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
 
     match e {
         IncrementalError::ChunkingTooLarge(detail) => SqlSurfaceError::payload_too_large(detail),
+        // サーバー構成の誤り・メモリ逼迫はクライアント入力起因の `54000` ではなく
+        // 内部失敗 `XX000` として返す（Cursor Bugbot 指摘・PR #221）。
+        IncrementalError::Internal(detail) => SqlSurfaceError::Internal {
+            detail: detail.to_string(),
+        },
         IncrementalError::Embed(crate::embedding::EmbedError::TooManyInputs { len, max }) => {
             SqlSurfaceError::payload_too_large(format!(
                 "embedding batch too large: {len} inputs (max {max})"

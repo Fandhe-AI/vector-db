@@ -452,6 +452,60 @@ fn chunk_count_over_limit_is_rejected_with_no_side_effects() {
     assert_eq!(rows.rows.len(), 0);
 }
 
+/// サーバー側のチャンク化設定が不正（`lines_per_chunk == 0`）な場合、クライアント
+/// 入力起因の `54000`（payload too large）ではなくサーバー内部失敗 `XX000` を返す
+/// ことを固定する（Cursor Bugbot 指摘・PR #221。再試行・障害判定の誤導を防ぐ）。
+#[test]
+fn invalid_chunking_config_is_reported_as_internal_error_not_payload_limit() {
+    let path = unique_db_path("index-invalid-config");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM)))
+        .with_incremental_config(IncrementalConfig {
+            chunking: engine::chunking::ChunkingConfig {
+                lines_per_chunk: 0,
+                max_markdown_section_chars: None,
+            },
+            ..IncrementalConfig::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let err = core
+        .execute_insert_sql(
+            &write_ctx,
+            &insert_file_sql("documents", "docs/cfg.txt", "l1\nl2\nl3", "op-cfg-1"),
+        )
+        .expect_err("invalid server-side chunking config must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+
+    // 副作用ゼロ（write トランザクションを開始しない）。
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
+    let rows = core
+        .execute_sql(
+            &read_ctx,
+            &format!(
+                "SELECT body FROM documents WHERE path = 'docs/cfg.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
+            ),
+        )
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 0);
+}
+
 #[test]
 fn missing_embedder_is_rejected_fail_closed_with_no_side_effects() {
     let path = unique_db_path("index-no-embedder");

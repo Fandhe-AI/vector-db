@@ -63,8 +63,15 @@ pub struct IndexOutcome {
 /// 写像先を示す（実際の写像は `sql/exec.rs::execute_file_insert` が集約する）。
 #[derive(Debug)]
 pub enum IncrementalError {
-    /// チャンク化入力・出力チャンク数の上限超過（`54000` 相当）。
+    /// チャンク化入力・出力チャンク数の上限超過（`54000` 相当）。クライアントが
+    /// 送った本文サイズ・チャンク数に起因するものだけをこの variant にする。
     ChunkingTooLarge(String),
+    /// サーバー側の事象に起因する失敗（`XX000` 相当）。チャンク化設定の不正
+    /// （`chunking::ChunkingError::InvalidConfig`。例: `lines_per_chunk == 0`）や
+    /// 行バッファ確保失敗（メモリ逼迫）が該当する。これらをクライアント入力起因の
+    /// `54000` として返すと、再試行・障害判定を誤らせるため分離する
+    /// （Cursor Bugbot 指摘・PR #221）。`detail` は原因を展開しない固定文言のみ。
+    Internal(&'static str),
     /// 埋め込みサービスの失敗・次元不一致（`XX000` 相当。応答本文・入力本文を
     /// 含めない）。
     Embed(EmbedError),
@@ -84,6 +91,7 @@ impl std::fmt::Display for IncrementalError {
             IncrementalError::ChunkingTooLarge(detail) => {
                 write!(f, "chunking limit exceeded: {detail}")
             }
+            IncrementalError::Internal(detail) => write!(f, "{detail}"),
             IncrementalError::Embed(e) => write!(f, "embedding failed: {e}"),
             IncrementalError::Write(_) => write!(f, "incremental index write failed"),
             IncrementalError::EmptyChunks => {
@@ -169,8 +177,20 @@ pub fn index_file(
     }
 
     let chunking_start = Instant::now();
-    let chunks = crate::chunking::chunk_file(input.path, input.body, &config.chunking)
-        .map_err(|e| IncrementalError::ChunkingTooLarge(e.to_string()))?;
+    // `chunk_file` の失敗を原因別に写像する。入力本文サイズ超過のみクライアント起因
+    // （`54000`）とし、チャンク化設定の不正はサーバー構成の誤りとして `XX000` へ倒す
+    // （Cursor Bugbot 指摘・PR #221。`detail` に設定値・本文を載せない）。
+    let chunks = crate::chunking::chunk_file(input.path, input.body, &config.chunking).map_err(
+        |e| match e {
+            crate::chunking::ChunkingError::InputTooLarge { .. }
+            | crate::chunking::ChunkingError::TooManyLines { .. } => {
+                IncrementalError::ChunkingTooLarge(e.to_string())
+            }
+            crate::chunking::ChunkingError::InvalidConfig { .. } => {
+                IncrementalError::Internal("invalid chunking configuration")
+            }
+        },
+    )?;
     let chunking_elapsed = chunking_start.elapsed();
 
     // 空・空白のみの本文（`chunk_file` が 0 チャンクを返す入力）は、ここで
@@ -208,9 +228,8 @@ pub fn index_file(
     let embedding_elapsed = embedding_start.elapsed();
 
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    rows.try_reserve_exact(chunks.len()).map_err(|_| {
-        IncrementalError::ChunkingTooLarge("failed to reserve chunk rows".to_string())
-    })?;
+    rows.try_reserve_exact(chunks.len())
+        .map_err(|_| IncrementalError::Internal("failed to reserve chunk rows"))?;
     for (chunk, vector) in chunks.iter().zip(vectors) {
         let mut values = input.template_values.to_vec();
         if let Some(slot) = values.get_mut(input.path_column_index) {
