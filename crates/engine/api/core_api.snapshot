@@ -26,6 +26,7 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+pub mod wasm_udf;
 
 # source: crates/engine/src/core.rs :: VectorCore
 pub trait VectorCore: Send + Sync {

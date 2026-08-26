@@ -167,6 +167,7 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+pub mod wasm_udf;
 
 /// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
 /// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。
