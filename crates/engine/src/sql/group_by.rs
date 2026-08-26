@@ -335,8 +335,9 @@ pub(crate) fn execute_grouped_aggregate(
             for (accumulator, item) in accs.iter_mut().zip(&bound.items) {
                 // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
                 // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
-                // クエリ全体の累計バイト数を予算管理する（before/after 比較で
-                // 差分のみ加算。縮小方向〔より短い極値への更新〕は加算しない）。
+                // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
+                // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
+                // 実際の保持量を正確に反映する）。
                 let before = accumulator.text_len();
                 accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
                 let after = accumulator.text_len();
@@ -354,6 +355,19 @@ pub(crate) fn execute_grouped_aggregate(
                             "GROUP BY TEXT aggregate state exceeds the allowed total size",
                         ));
                     }
+                } else if after < before {
+                    // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
+                    // 実際の保持量を正確に反映するため減算する（`checked_sub` の
+                    // 失敗＝内部不整合は `XX000` の accumulator_bug へ落とし、
+                    // fail-open にはしない）。減算しないと過去の増加量が
+                    // 累積し続け、実保持量が予算内でも正常なクエリを
+                    // 誤って 54000 で拒否してしまう。
+                    let delta = before - after;
+                    total_text_accumulator_bytes = total_text_accumulator_bytes
+                        .checked_sub(delta)
+                        .ok_or_else(|| {
+                            accumulator_bug("GROUP BY TEXT aggregate size accounting underflowed")
+                        })?;
                 }
             }
         }

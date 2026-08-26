@@ -651,6 +651,81 @@ fn text_min_max_accumulator_total_size_over_budget_is_rejected() {
     assert_eq!(err.wire_code(), "54000");
 }
 
+// `MIN`/`MAX(<TEXT 列>)` の累計バイト数予算は「増加のみ加算」ではなく
+// 「増加/縮小の両方向」を反映しなければならない（PR #230 codex-review P1
+// 指摘対応）。より短い極値へ更新された場合に減算しないと、実際の保持量が
+// 予算内でも過去の増加量が累積し続け、正常なクエリを誤って `54000` で
+// 拒否してしまう。同一グループ内で「大きい文字列→より小さい文字列」の
+// 更新（MIN の縮小）を複数グループに渡って繰り返し、縮小を差し引けば
+// 予算内に収まるが、差し引かなければ予算超過になる規模で検証する。
+#[test]
+fn text_min_max_accumulator_shrink_direction_is_subtracted_from_budget() {
+    let path = unique_db_path("group-by-text-accumulator-shrink");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let schema = TableSchema::new(
+        "textshrink",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(1), false),
+            ColumnDef::new("k", ColumnType::Text, false),
+            ColumnDef::new("v", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 各グループにつき、まず大きな文字列（辞書順で大きい "z..." 始まり、
+    // 3 MiB）を投入して MIN 候補にし、続けて短い文字列（辞書順で小さい
+    // "a"）を投入して MIN を縮小させる。縮小を正しく減算しなければ、
+    // 増加分だけの累積（6 グループ × 3 MiB = 18 MiB）が 16 MiB の予算を
+    // 超過して誤って拒否される。
+    const GROUPS: u64 = 6;
+    const VALUE_LEN: usize = 3 * 1024 * 1024;
+    let mut op_seq: u64 = 0;
+    for i in 0..GROUPS {
+        let large = format!("z{}", "y".repeat(VALUE_LEN));
+        engine::tenant::insert_typed_row(
+            &storage,
+            "textshrink",
+            &ctx,
+            op_seq,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32]),
+                Value::Text(format!("k{i}")),
+                Value::Text(large),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{op_seq}"))
+                .expect("valid op"),
+        )
+        .expect("insert row");
+        op_seq += 1;
+
+        engine::tenant::insert_typed_row(
+            &storage,
+            "textshrink",
+            &ctx,
+            op_seq,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32]),
+                Value::Text(format!("k{i}")),
+                Value::Text("a".to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{op_seq}"))
+                .expect("valid op"),
+        )
+        .expect("insert row");
+        op_seq += 1;
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(&ctx, "SELECT k, MIN(v) FROM textshrink GROUP BY k")
+        .expect("shrinking MIN updates must not cause a false positive over-budget rejection");
+    assert_eq!(result.rows.len(), GROUPS as usize);
+}
+
 // `ORDER BY <GROUP BY 列> DESC` でも `NULL` グループは常に末尾（PR #230
 // codex-review P1 指摘対応: 以前は非 `NULL` 側との大小関係を含む `Ordering`
 // 全体を `.reverse()` していたため、`DESC` 指定時に `NULL` グループが先頭へ来て
