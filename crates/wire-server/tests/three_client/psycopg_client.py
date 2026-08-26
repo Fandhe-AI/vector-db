@@ -19,14 +19,21 @@ codex-review 指摘・PR #210）。
 環境変数:
 - WIRE_HOST / WIRE_PORT / WIRE_USER / WIRE_PASSWORD: 接続情報。
 - WIRE_SQL: 実行する SQL 文。
+- WIRE_SQL_PRELUDE（任意・TASK-165）: 同一接続で `WIRE_SQL` より先に順次実行する
+  SQL 文の配列を表す JSON 文字列（例 `["SET search_mode = 'precision'"]`）。
+  `SET search_mode` を先行実行してから本体の `SELECT` を送る、セッション複数文の
+  検証（SQL-12）に使う。配列でない・要素が文字列でない場合は fail-closed で
+  エラー終了する（stdin／argv を使わない現行方針を維持。security.md P0）。
 
 成功時は結果セットの各行を `|` 区切りで結合した文字列を改行区切りで stdout へ
 出力し、終了コード 0（複数列を返す SQL でも列構成・型変換を検証できるよう
 全列を出力する。`crates/wire-server/tests/three_client_e2e.rs` の
 `run_psql`／`run_pg` と同じ区切り規約）。失敗時はエラーを stderr へ出力し、
-終了コード 1（silent skip はしない）。
+終了コード 1（silent skip はしない）。SQLSTATE を伴う失敗（拒否経路の検証。
+TASK-165）は `[SQLSTATE=<code>]` を stderr メッセージに含める。
 """
 
+import json
 import os
 import sys
 
@@ -40,6 +47,22 @@ def main() -> int:
     if not all([host, port, user, password is not None, sql]):
         print("psycopg_client: missing required WIRE_* environment variables", file=sys.stderr)
         return 1
+
+    prelude_raw = os.environ.get("WIRE_SQL_PRELUDE")
+    prelude: list[str] = []
+    if prelude_raw:
+        try:
+            parsed = json.loads(prelude_raw)
+        except json.JSONDecodeError as e:
+            print(f"psycopg_client: WIRE_SQL_PRELUDE is not valid JSON: {e}", file=sys.stderr)
+            return 1
+        if not isinstance(parsed, list) or not all(isinstance(s, str) for s in parsed):
+            print(
+                "psycopg_client: WIRE_SQL_PRELUDE must be a JSON array of strings",
+                file=sys.stderr,
+            )
+            return 1
+        prelude = parsed
 
     try:
         import psycopg
@@ -58,12 +81,16 @@ def main() -> int:
             connect_timeout=5,
         ) as conn:
             with psycopg.ClientCursor(conn) as cur:
+                for stmt in prelude:
+                    cur.execute(stmt)
                 cur.execute(sql)
                 for row in cur.fetchall():
                     print("|".join(str(value) for value in row))
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
-        print(f"psycopg_client: query failed: {e}", file=sys.stderr)
+        sqlstate = getattr(e, "sqlstate", None)
+        suffix = f" [SQLSTATE={sqlstate}]" if sqlstate else ""
+        print(f"psycopg_client: query failed{suffix}: {e}", file=sys.stderr)
         return 1
 
 
