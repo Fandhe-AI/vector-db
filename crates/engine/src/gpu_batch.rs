@@ -55,6 +55,20 @@ use crate::policy::PolicyContext;
 /// クエリごとに独立して縮小するため、分割自体はスコア計算の正しさに影響しない）。
 const GPU_SCORE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 const GPU_WORKGROUP_SIZE: u32 = 256;
+
+/// GPU の submit 完了・readback・error scope 完了を待つ上限時間
+/// （codex/Bugbot 指摘対応: `PollType::wait_indefinitely()` と終了条件のない
+/// ループは、Metal 等でコマンド完了通知が停止した場合に永久に戻らず、
+/// 「GPU 実行時エラーは `BatchBackendError` を返して CPU 縮退（CORE-8）へ倒す」
+/// という設計契約を破る）。期限超過は `DeviceLost` として返し、
+/// `FallbackBatchEngine` が CPU-SIMD 経路へ縮退できるようにする。値は
+/// spec 由来の閾値ではなく、正常な dispatch が十分収まる範囲で「実質ハング」を
+/// 打ち切るための防御的上限。
+const GPU_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 1 回の `device.poll` でブロックしてよい最大時間。`GPU_POLL_DEADLINE` に
+/// 達するまで複数回に分けて待つことで、deadline 判定の粒度を確保する。
+const GPU_POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
 /// adapter の `max_compute_workgroups_per_dimension` に対する安全側の固定上限
 /// （実機実測値は 65535）。取得できた実際の limits がこれを下回る場合はその値を使う。
 const MAX_WORKGROUPS_PER_DIMENSION_FALLBACK: u32 = 65535;
@@ -262,13 +276,13 @@ fn init_gpu_context() -> Result<GpuContext, String> {
     // 待機中も `device.poll` を駆動する（`block_on_with_device_poll`）ため、
     // デバイスのポーリング待ちで無限スピンしない。
     if block_on_with_device_poll(&device, init_oom_scope.pop())
-        .map_err(|_| "device poll failed during pipeline creation".to_string())?
+        .map_err(|_| "device poll failed or timed out during pipeline creation".to_string())?
         .is_some()
     {
         return Err("gpu out of memory during pipeline creation".to_string());
     }
     if block_on_with_device_poll(&device, init_validation_scope.pop())
-        .map_err(|_| "device poll failed during pipeline creation".to_string())?
+        .map_err(|_| "device poll failed or timed out during pipeline creation".to_string())?
         .is_some()
     {
         return Err("gpu validation error during pipeline creation".to_string());
@@ -342,6 +356,7 @@ fn block_on_with_device_poll<F: std::future::Future>(
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     let mut boxed = Box::pin(fut);
+    let deadline = std::time::Instant::now() + GPU_POLL_DEADLINE;
     loop {
         if let Poll::Ready(v) = boxed.as_mut().poll(&mut cx) {
             return Ok(v);
@@ -349,6 +364,11 @@ fn block_on_with_device_poll<F: std::future::Future>(
         // 送信済みコマンド・コールバックを進める。`PollType::Poll`（非ブロッキング）
         // を使い、完了していなければ次のループで future を再ポーリングする。
         if device.poll(wgpu::PollType::Poll).is_err() {
+            return Err(());
+        }
+        // deadline 超過は「完了通知が来ない」異常として打ち切る
+        // （codex/Bugbot 指摘対応: 終了条件のないループはハングになる）。
+        if std::time::Instant::now() >= deadline {
             return Err(());
         }
         std::thread::yield_now();
@@ -453,8 +473,11 @@ impl GpuBatchBackend {
         });
         let packed_staging = bytes_of_u32_slice(matrix.packed())?;
         ctx.queue.write_buffer(&row_buffer, 0, &packed_staging);
-        let poll_failed =
-            || BatchBackendError::InitFailed("device poll failed during buffer upload".to_string());
+        let poll_failed = || {
+            BatchBackendError::InitFailed(
+                "device poll failed or timed out during buffer upload".to_string(),
+            )
+        };
         if block_on_with_device_poll(&ctx.device, oom_scope.pop())
             .map_err(|_| poll_failed())?
             .is_some()
@@ -930,7 +953,8 @@ fn dispatch_dot_products(
     // `pop()` の future はデバイスがポーリングされるまで `Pending` のままに
     // なりうるため、待機中も `device.poll` を駆動する（codex/Bugbot P1 指摘対応:
     // 自己ポーリングのみだと後続の readback ポーリングへ到達できずハングする）。
-    let poll_failed = || BatchBackendError::DeviceLost("device poll failed".to_string());
+    let poll_failed =
+        || BatchBackendError::DeviceLost("device poll failed or timed out".to_string());
     let oom_err =
         block_on_with_device_poll(&ctx.device, oom_scope.pop()).map_err(|_| poll_failed())?;
     let validation_err = block_on_with_device_poll(&ctx.device, validation_scope.pop())
@@ -956,12 +980,24 @@ fn dispatch_dot_products(
         }
     });
 
+    // 無期限待機（`PollType::wait_indefinitely()`）は使わず、有限タイムアウトの
+    // `Wait` を deadline まで繰り返す（codex/Bugbot 指摘対応: Metal 等で完了通知が
+    // 止まると無期限待機はそのまま戻らず、CPU 縮退〔CORE-8〕へ移れない）。
+    // `PollError::Timeout` は「まだ完了していない」だけなのでループを継続し、
+    // deadline 超過時に `DeviceLost` として返す。
+    let deadline = std::time::Instant::now() + GPU_POLL_DEADLINE;
     loop {
-        let poll_result = ctx.device.poll(wgpu::PollType::wait_indefinitely());
-        if poll_result.is_err() {
-            return Err(BatchBackendError::DeviceLost(
-                "device poll failed".to_string(),
-            ));
+        let poll_result = ctx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(GPU_POLL_SLICE),
+        });
+        if let Err(e) = poll_result {
+            // タイムアウト以外のポーリング失敗はデバイス異常として即座に返す。
+            if !matches!(e, wgpu::PollError::Timeout) {
+                return Err(BatchBackendError::DeviceLost(
+                    "device poll failed".to_string(),
+                ));
+            }
         }
         let ready = match map_result.lock() {
             Ok(guard) => guard.is_some(),
@@ -973,6 +1009,11 @@ fn dispatch_dot_products(
         };
         if ready {
             break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(BatchBackendError::DeviceLost(
+                "device poll timed out while waiting for readback".to_string(),
+            ));
         }
         std::thread::yield_now();
     }

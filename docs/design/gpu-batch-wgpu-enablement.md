@@ -64,6 +64,11 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - error scope の `pop()` は `device.poll` を駆動しながら待つ
   （`block_on_with_device_poll`）。自己ポーリングのみだとデバイスのポーリング待ちで
   無限スピンしうるため
+- GPU の待機はすべて有限 deadline（`GPU_POLL_DEADLINE`）を持つ。readback は
+  `PollType::wait_indefinitely()` ではなく有限タイムアウトの `Wait` を deadline まで
+  繰り返し、`PollError::Timeout` は継続・deadline 超過は `DeviceLost` として返す
+  （完了通知が停止しても CPU 縮退〔CORE-8〕へ移れるようにするため）。error scope の
+  待機ループにも同じ deadline を共有する
 - ステージング用のバイト列・readback の `f32` 列は `try_reserve_exact` で
   フォールブルに確保する（`Vec::with_capacity` の abort-on-OOM を避け、確保失敗も
   CPU 縮退可能な backend エラーとして返す）
