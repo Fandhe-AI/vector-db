@@ -12,8 +12,8 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::storage::{
-    commit_write_txn, decode_row, encode_row, Row, RowInput, Storage, StorageError,
-    BATCH_LOG_TABLE, ROWS_TABLE,
+    commit_write_txn, decode_row_for_key, encode_row, map_rows_table_error, Row, RowInput, Storage,
+    StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
 };
 
 /// engine が宣言する分離レベル（対象ビヘイビア: TABLE-3）。
@@ -118,20 +118,23 @@ pub struct ReadSnapshot {
 }
 
 impl ReadSnapshot {
-    /// 行 ID を指定して 1 行取得する（[`Storage::get`] と同じデコード契約）。
+    /// テナント ID・行 ID を指定して 1 行取得する（[`Storage::get`] と同じデコード契約・
+    /// 物理キー契約。対象ビヘイビア: TABLE-12）。
     ///
     /// このスナップショットの開始後にコミットされた変更（他ライタによる書き込みを
     /// 含む）は反映されない。
-    pub fn get(&self, id: u64) -> crate::storage::Result<Row> {
+    pub fn get(&self, tenant_id: &str, id: u64) -> crate::storage::Result<Row> {
         let table = match self.txn.open_table(ROWS_TABLE) {
             Ok(t) => t,
             // テーブル未作成（1 行も書き込んでいない）は「存在しない」として扱う
             // （storage.rs の Storage::get と同方針）。
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(StorageError::NotFound(id)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_rows_table_error(e)),
         };
-        let guard = table.get(id)?.ok_or(StorageError::NotFound(id))?;
-        decode_row(id, guard.value())
+        let guard = table
+            .get((tenant_id, id))?
+            .ok_or(StorageError::NotFound(id))?;
+        decode_row_for_key(tenant_id, id, guard.value())
     }
 }
 
@@ -170,8 +173,11 @@ impl WriteTxn {
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
         self.has_writes = true;
-        let mut table = self.txn.open_table(ROWS_TABLE)?;
-        table.insert(id, encoded.as_slice())?;
+        let mut table = self
+            .txn
+            .open_table(ROWS_TABLE)
+            .map_err(map_rows_table_error)?;
+        table.insert((row.tenant_id, id), encoded.as_slice())?;
         Ok(())
     }
 
@@ -258,6 +264,10 @@ impl BatchWriteTxn {
     /// だけで実在行数より多い値を台帳へ記録でき、「台帳の row_count 合計 == 行総数」
     /// という TABLE-10 の契約を公開 API だけで破れてしまうため
     /// （PR #129 codex レビュー PRRT_kwDOUAKASM6bbc_I 対応）。
+    ///
+    /// 物理キーは `(row.tenant_id, id)`（対象ビヘイビア: TABLE-12）。同一 `id` でも
+    /// テナントが異なれば別キー＝新規挿入として数える（別テナントの行が「台帳の
+    /// row_count 合計 == 行総数」契約と整合する）。
     pub fn put(&mut self, id: u64, row: &RowInput<'_>) -> crate::storage::Result<()> {
         let encoded = encode_row(row)?;
         // 新規挿入・上書きのどちらも実書き込みとして扱う（Issue #175。
@@ -265,8 +275,11 @@ impl BatchWriteTxn {
         // `pending_row_count` が増えないため、これを根拠にすると commit で
         // 世代を進め忘れる fail-open になる）。
         self.has_writes = true;
-        let mut table = self.txn.open_table(ROWS_TABLE)?;
-        let previous = table.insert(id, encoded.as_slice())?;
+        let mut table = self
+            .txn
+            .open_table(ROWS_TABLE)
+            .map_err(map_rows_table_error)?;
+        let previous = table.insert((row.tenant_id, id), encoded.as_slice())?;
         if previous.is_none() {
             // 呼び出し元にはトランザクション内で扱える行数の上限（TASK-90 の想定用途
             // ではバッチ 1 本あたり高々数千件）を課しており u64 を溢れさせることは
@@ -444,14 +457,16 @@ mod tests {
             .expect("initial put");
         let generation_after_setup = storage.current_generation().expect("current_generation");
 
-        // 既存 ID を tenant_id・embedding を変えて上書き。上書きは pending_row_count
-        // のような新規カウンタでは検出できないため、fail-open ガードとして重要
-        // （2.1 節「実書き込みの定義」参照）。
+        // 同一 tenant_id・同一 id（= 同一物理キー）で visibility・embedding を変えて
+        // 上書き。tenant_id を変えると物理キーが (tenant_id, id) の複合キーのため
+        // 別行への新規挿入になってしまい「上書き」の検証にならない（TABLE-12）。
+        // 上書きは pending_row_count のような新規カウンタでは検出できないため、
+        // fail-open ガードとして重要（2.1 節「実書き込みの定義」参照）。
         let mut txn = storage.begin_write().expect("begin_write");
         txn.put(
             1,
             &RowInput {
-                tenant_id: "tenant-b",
+                tenant_id: "tenant-a",
                 visibility: Visibility::Private,
                 embedding: &[9.0],
                 metadata: &[],
@@ -555,6 +570,10 @@ mod tests {
             .expect("initial put");
         let generation_after_setup = storage.current_generation().expect("current_generation");
 
+        // 同一 tenant_id・同一 id（= 同一物理キー）で上書き。tenant_id を変えると
+        // 物理キーが (tenant_id, id) の複合キーのため別行への新規挿入になり
+        // （previous.is_none() == true）、本テストが検証したい「新規挿入 0 件」の
+        // 前提が崩れて log_batch 必須（UnloggedRows）になってしまう（TABLE-12）。
         // 新規挿入が 0 件（既存 ID の上書きのみ）なので pending_row_count は 0 の
         // ままであり、log_batch は不要（呼ぶと EmptyBatch で拒否される）。
         // pending_row_count を根拠にすると commit で世代更新を見逃す核心ケース。
@@ -562,7 +581,7 @@ mod tests {
         txn.put(
             1,
             &RowInput {
-                tenant_id: "tenant-b",
+                tenant_id: "tenant-a",
                 visibility: Visibility::Private,
                 embedding: &[9.0],
                 metadata: &[],

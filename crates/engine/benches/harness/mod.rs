@@ -43,5 +43,6 @@ pub mod accept;
 pub mod env_report;
 pub mod protocol;
 pub mod rng;
+pub mod scalar_reference;
 pub mod sql_c1;
 pub mod stats;

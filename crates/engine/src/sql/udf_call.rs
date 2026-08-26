@@ -20,9 +20,12 @@
 //! （`.claude/rules/coding-rust.md`）。0 除算・非有限値（NaN/∞）の生成は行単位で
 //! fail-closed に拒否し、黙って 0 や NULL へ丸めない（security.md「不安全な設計」）。
 
+use std::sync::Arc;
+
 use crate::catalog;
 use crate::catalog::{ColumnType, TableSchema};
 use crate::sql::allowlist::SqlSurfaceError;
+use crate::wasm_udf::WasmUdfBackend;
 
 /// UDF 定義が持てるパラメータ数の上限（`54000` で拒否）。
 pub const MAX_UDF_PARAMS: usize = 32;
@@ -35,12 +38,50 @@ pub const MAX_EXPR_DEPTH: usize = 32;
 /// （`Parser::expr_node_budget`）としても共有し、左結合ループが `MAX_EXPR_DEPTH`
 /// をすり抜けて木を積み続ける入力（"1+1+...+1" 等）を頭打ちにする（`54000`）。
 pub const MAX_EXPR_NODES: usize = 1024;
-/// セッションが保持できる UDF 定義数上限（`54000`）。
+/// セッションが保持できる UDF 定義数上限（宣言的・WASM 合算。`54000`）。
 pub const MAX_SESSION_UDFS: usize = 64;
+/// WASM UDF 呼び出しの引数数（TASK-149。ABI 固定シグネチャ
+/// `(Vector, Scalar) -> Scalar` のため常に 2）。
+const WASM_CALL_ARITY: usize = 2;
 /// `f64` の 52 bit 仮数部で整数値を正確に表現できる上限（`2^53`）。行 `id`
 /// （[`id_as_finite_scalar`]）・整数の数値リテラル（[`bind_expr_in`] の
 /// `Expr::Number` 束縛）の双方で同一の正確表現境界として共有する。
 const MAX_EXACT_F64_INT: u64 = 1u64 << 53;
+
+/// 数値リテラルの生文字列（符号なし。`-` は呼び出し元が別トークンとして処理する）を
+/// `f64` へ束縛する（TASK-79・SQL-9 の `Expr::Number` 束縛から TASK-167・SQL-14
+/// （`sql::group_by` の HAVING/LIMIT リテラル束縛）が共有できるよう切り出した）。
+/// 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を生成する）は
+/// `f64::from_str` が黙って最近接値へ丸めうる（`raw.parse::<f64>()` はエラーに
+/// ならない）。`2^53` を超える整数は `f64` で正確に表現できないという境界を、丸め
+/// 変換の *前* に整数として検査することで、大きな整数リテラルが精度欠落によって
+/// 別の値と黙って同一視されるのを防ぐ（fail-closed。security.md「不安全な設計」対応）。
+pub(crate) fn parse_number_literal(raw: &str) -> Result<f64, SqlSurfaceError> {
+    let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    if is_integer_literal {
+        let as_int: u64 = raw.parse().map_err(|_| {
+            // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
+            // `f64` で正確に表現できないことに変わりはない。
+            SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            )
+        })?;
+        if as_int > MAX_EXACT_F64_INT {
+            return Err(SqlSurfaceError::invalid_input(
+                "integer literal exceeds the range that can be exactly represented",
+            ));
+        }
+    }
+    let v: f64 = raw
+        .parse()
+        .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
+    if !v.is_finite() {
+        return Err(SqlSurfaceError::invalid_input(
+            "numeric literal is not finite",
+        ));
+    }
+    Ok(v)
+}
 
 /// 式の二項演算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -75,7 +116,11 @@ pub enum Expr {
 
 /// 束縛済み（列参照・関数呼び出しの解決、UDF 本体のインライン展開が完了した）式。
 /// レジストリを参照せずに単独で評価できる（`eval` の入力）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq` は手動実装する（[`WasmCall`](BoundExpr::WasmCall) が保持する
+/// `Arc<dyn WasmUdfBackend>` は `dyn` 型のため構造的な `derive(PartialEq)` を
+/// 導出できない。バックエンドの同一性は `Arc::ptr_eq` で判定する）。
+#[derive(Debug, Clone)]
 pub enum BoundExpr {
     Number(f64),
     /// 疑似列 `id`（行 `id` を `f64` として扱う）。
@@ -96,6 +141,53 @@ pub enum BoundExpr {
         lhs: Box<BoundExpr>,
         rhs: Box<BoundExpr>,
     },
+    /// WASM UDF 呼び出し（TASK-149、対象ビヘイビア: EXT-5）。ABI は
+    /// `crate::wasm_udf` が固定する `(Vector, Scalar) -> Scalar` の 1 種類のみ
+    /// （`args` は常に長さ 2）。`registry` を実行時に参照しないという `BoundExpr`
+    /// の設計を維持するため、束縛済みバックエンドを `Arc` で直接保持する。
+    WasmCall {
+        name: String,
+        backend: Arc<dyn WasmUdfBackend>,
+        args: Vec<BoundExpr>,
+    },
+}
+
+impl PartialEq for BoundExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (BoundExpr::Number(a), BoundExpr::Number(b)) => a == b,
+            (BoundExpr::IdRef, BoundExpr::IdRef) => true,
+            (BoundExpr::VectorRef, BoundExpr::VectorRef) => true,
+            (BoundExpr::Builtin { f: fa, args: aa }, BoundExpr::Builtin { f: fb, args: ab }) => {
+                fa == fb && aa == ab
+            }
+            (
+                BoundExpr::Binary {
+                    op: opa,
+                    lhs: la,
+                    rhs: ra,
+                },
+                BoundExpr::Binary {
+                    op: opb,
+                    lhs: lb,
+                    rhs: rb,
+                },
+            ) => opa == opb && la == lb && ra == rb,
+            (
+                BoundExpr::WasmCall {
+                    name: na,
+                    backend: ba,
+                    args: aa,
+                },
+                BoundExpr::WasmCall {
+                    name: nb,
+                    backend: bb,
+                    args: ab,
+                },
+            ) => na == nb && Arc::ptr_eq(ba, bb) && aa == ab,
+            _ => false,
+        }
+    }
 }
 
 /// 束縛済み式の静的型。
@@ -145,12 +237,17 @@ fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
 }
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
-/// 等）・組み込み関数名と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
-/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する。
+/// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
+/// TASK-166・SQL-13）と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
+/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する
+/// （集計関数名を含めない版では `CREATE FUNCTION min(...)` が成功したまま
+/// `SELECT min(id)` が集計として実行され、当該 UDF が呼び出し不能になる不整合が
+/// あった。Cursor Bugbot 指摘対応・PR #229）。
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(upper.as_str(), "VISIBLE" | "HYBRID_RRF" | "HYBRID")
         || builtin_from_name(name).is_some()
+        || crate::sql::allowlist::is_aggregate_function_name(name)
 }
 
 /// セッション内で登録された宣言的 UDF 1 件。本体は構文段の [`Expr`]（パラメータ参照は
@@ -164,9 +261,32 @@ pub struct UdfDefinition {
 /// セッション単位の UDF レジストリ（`sql::mode::SessionState` が保持する）。
 /// 追記専用（再定義・`DROP` は許可しない。RLS-8 と同じ「認証済みテナントの接続単位」
 /// の外へ漏れない構造にするため、他セッション・永続化とは無関係に保つ）。
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// `PartialEq` は手動実装する（`wasm` マップの値 `Arc<dyn WasmUdfBackend>` が
+/// `dyn` 型のため構造的な `derive` を導出できない。宣言的 UDF 定義は構造等価、
+/// WASM UDF は名前一致かつ `Arc::ptr_eq` で判定する）。
+#[derive(Debug, Clone, Default)]
 pub struct UdfRegistry {
     defs: std::collections::BTreeMap<String, UdfDefinition>,
+    /// TASK-149（EXT-5, EXT-6）: WASM UDF のセッション単位レジストリ。宣言的 UDF
+    /// （`defs`）とは別の名前空間ではなく同一の名前空間を共有する（衝突検査は
+    /// [`define_wasm_function`]・[`define_function`] の双方が
+    /// [`is_name_taken`] を通して行う）。
+    wasm: std::collections::BTreeMap<String, Arc<dyn WasmUdfBackend>>,
+}
+
+impl PartialEq for UdfRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        if self.defs != other.defs || self.wasm.len() != other.wasm.len() {
+            return false;
+        }
+        self.wasm.iter().all(|(name, backend)| {
+            other
+                .wasm
+                .get(name)
+                .is_some_and(|other_backend| Arc::ptr_eq(backend, other_backend))
+        })
+    }
 }
 
 impl UdfRegistry {
@@ -174,12 +294,25 @@ impl UdfRegistry {
         self.defs.get(&name.to_ascii_lowercase())
     }
 
+    /// 登録済みの WASM UDF バックエンドを名前で引く（`bind_call` の解決経路から
+    /// 呼ばれる。存在しない場合は `None`）。
+    pub fn get_wasm(&self, name: &str) -> Option<&Arc<dyn WasmUdfBackend>> {
+        self.wasm.get(&name.to_ascii_lowercase())
+    }
+
     pub fn len(&self) -> usize {
-        self.defs.len()
+        self.defs.len() + self.wasm.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.defs.is_empty()
+        self.defs.is_empty() && self.wasm.is_empty()
+    }
+
+    /// 名前空間（組み込み・宣言的 UDF・WASM UDF を横断した名前）が既に使われて
+    /// いるかを判定する（[`define_function`]・[`define_wasm_function`] が共有する
+    /// 衝突検査）。
+    fn is_name_taken(&self, lower: &str) -> bool {
+        self.defs.contains_key(lower) || self.wasm.contains_key(lower)
     }
 }
 
@@ -209,12 +342,12 @@ pub fn define_function(
             "function name {name} collides with a built-in or reserved name"
         )));
     }
-    if registry.defs.contains_key(&lower) {
+    if registry.is_name_taken(&lower) {
         return Err(SqlSurfaceError::invalid_input(format!(
             "function {name} is already defined in this session"
         )));
     }
-    if registry.defs.len() >= MAX_SESSION_UDFS {
+    if registry.len() >= MAX_SESSION_UDFS {
         return Err(SqlSurfaceError::payload_too_large(
             "too many functions defined in this session",
         ));
@@ -260,6 +393,40 @@ pub fn define_function(
             body: body.clone(),
         },
     );
+    Ok(())
+}
+
+/// 検証済みの `Arc<dyn WasmUdfBackend>` をセッションのレジストリへ登録する
+/// （TASK-149、対象ビヘイビア: EXT-5, EXT-6。`sql::mode::SessionState::register_wasm_udf`
+/// から呼ばれる）。名前空間・上限は宣言的 UDF（[`define_function`]）と共有し、
+/// SQL からの `CREATE FUNCTION` 構文・wire 経由のモジュール搬送・モジュールバイト
+/// 列からのバックエンド構築（wasmtime 依存のユーザー承認待ち。`crate::wasm_udf`
+/// モジュールドキュメント参照）は本タスクのスコープ外（呼び出し元が検証済み
+/// バックエンドの構築を担う）。
+pub fn define_wasm_function(
+    registry: &mut UdfRegistry,
+    name: &str,
+    backend: Arc<dyn WasmUdfBackend>,
+) -> Result<(), SqlSurfaceError> {
+    catalog::validate_identifier(name)
+        .map_err(|_| SqlSurfaceError::invalid_input(format!("invalid function name: {name}")))?;
+    let lower = name.to_ascii_lowercase();
+    if is_reserved_function_name(name) {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "function name {name} collides with a built-in or reserved name"
+        )));
+    }
+    if registry.is_name_taken(&lower) {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "function {name} is already defined in this session"
+        )));
+    }
+    if registry.len() >= MAX_SESSION_UDFS {
+        return Err(SqlSurfaceError::payload_too_large(
+            "too many functions defined in this session",
+        ));
+    }
+    registry.wasm.insert(lower, backend);
     Ok(())
 }
 
@@ -319,6 +486,15 @@ fn validate_closed_expr(
                         args.len()
                     )));
                 }
+            } else if registry.get_wasm(name).is_some() {
+                // WASM UDF（TASK-149）は ABI 固定シグネチャ
+                // `(Vector, Scalar) -> Scalar` のみのため、常に 2 引数固定。
+                if args.len() != WASM_CALL_ARITY {
+                    return Err(SqlSurfaceError::invalid_input(format!(
+                        "function {name} expects {WASM_CALL_ARITY} argument(s), got {}",
+                        args.len()
+                    )));
+                }
             } else {
                 return Err(SqlSurfaceError::invalid_input(format!(
                     "unknown function: {name}"
@@ -354,6 +530,7 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
         BoundExpr::Number(_) | BoundExpr::IdRef | BoundExpr::VectorRef => 1,
         BoundExpr::Builtin { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
         BoundExpr::Binary { lhs, rhs, .. } => 1 + count_bound_nodes(lhs) + count_bound_nodes(rhs),
+        BoundExpr::WasmCall { args, .. } => 1 + args.iter().map(count_bound_nodes).sum::<usize>(),
     }
 }
 
@@ -385,37 +562,7 @@ fn bind_expr_in(
         .ok_or_else(|| SqlSurfaceError::payload_too_large("expression is too large"))?;
     match expr {
         Expr::Number(raw) => {
-            // 整数リテラル（`.` を含まない。字句層はここでのみ整数/小数の 2 形を
-            // 生成する）は `f64::from_str` が黙って最近接値へ丸めうる
-            // （`raw.parse::<f64>()` はエラーにならない）。`id_as_finite_scalar` と
-            // 同じ「`2^53` を超える整数は `f64` で正確に表現できない」境界を、丸め
-            // 変換の *前* に整数として検査することで、`WHERE id = 9007199254740993`
-            // のような大きな整数リテラルが精度欠落によって別の値（例:
-            // `9007199254740992`）と黙って同一視されるのを防ぐ（fail-closed。
-            // security.md「不安全な設計」対応）。
-            let is_integer_literal = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
-            if is_integer_literal {
-                let as_int: u64 = raw.parse().map_err(|_| {
-                    // 桁数が多すぎて `u64` にも収まらない（`u64::MAX` 超）場合も、
-                    // `f64` で正確に表現できないことに変わりはない。
-                    SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    )
-                })?;
-                if as_int > MAX_EXACT_F64_INT {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "integer literal exceeds the range that can be exactly represented",
-                    ));
-                }
-            }
-            let v: f64 = raw
-                .parse()
-                .map_err(|_| SqlSurfaceError::unsupported(format!("malformed number: {raw}")))?;
-            if !v.is_finite() {
-                return Err(SqlSurfaceError::invalid_input(
-                    "numeric literal is not finite",
-                ));
-            }
+            let v = parse_number_literal(raw)?;
             Ok((BoundExpr::Number(v), ExprType::Scalar))
         }
         Expr::Ident(name) => {
@@ -583,39 +730,73 @@ fn bind_call(
         ));
     }
 
-    // 登録済み UDF 呼び出し: 実引数を呼び出し元の文脈（`env.schema`・現在の
-    // `env.params`）で先に束縛してから、UDF 本体をパラメータ名 → 束縛済み実引数の
-    // 対応表で束縛し直す（インライン展開。呼び出し元は展開後の `BoundExpr` のみを
-    // 受け取り、`registry` を実行時に参照しない）。
-    let def = env
-        .registry
-        .get(name)
-        .ok_or_else(|| SqlSurfaceError::invalid_input(format!("unknown function: {name}")))?
-        .clone();
-    if args.len() != def.params.len() {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "function {name} expects {} argument(s), got {}",
-            def.params.len(),
-            args.len()
-        )));
+    // 解決順（組み込み → 宣言的 UDF → WASM UDF）。組み込みは上で既に処理済みなので
+    // ここでは宣言的 UDF を先に試し、次に WASM UDF を試す。
+    if let Some(def) = env.registry.get(name).cloned() {
+        // 登録済み宣言的 UDF 呼び出し: 実引数を呼び出し元の文脈（`env.schema`・
+        // 現在の `env.params`）で先に束縛してから、UDF 本体をパラメータ名 →
+        // 束縛済み実引数の対応表で束縛し直す（インライン展開。呼び出し元は
+        // 展開後の `BoundExpr` のみを受け取り、`registry` を実行時に参照しない）。
+        if args.len() != def.params.len() {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {name} expects {} argument(s), got {}",
+                def.params.len(),
+                args.len()
+            )));
+        }
+        let mut bound_args = Vec::with_capacity(args.len());
+        for a in args {
+            bound_args.push(bind_expr_in(a, env, node_budget)?);
+        }
+        let mut inner_params = std::collections::HashMap::new();
+        for (pname, bound) in def.params.iter().zip(bound_args) {
+            inner_params.insert(pname.clone(), bound);
+        }
+        let mut inner_env = BindEnv {
+            // UDF 本体は列参照を持たない閉じた関数であるべき契約（`define_function`
+            // が定義時に検査済み）だが、束縛段でも `schema: None` にして構造的に
+            // 強制する（定義時検査のバイパス・実装バグの双方に対する fail-closed
+            // な多重防御）。
+            schema: None,
+            params: inner_params,
+            registry: env.registry,
+        };
+        return bind_expr_in(&def.body, &mut inner_env, node_budget);
     }
-    let mut bound_args = Vec::with_capacity(args.len());
-    for a in args {
-        bound_args.push(bind_expr_in(a, env, node_budget)?);
+
+    if let Some(backend) = env.registry.get_wasm(name).cloned() {
+        // WASM UDF（TASK-149）: ABI 固定シグネチャ `(Vector, Scalar) -> Scalar`
+        // のため引数個数・型は常にこの形で検査する（組み込み `vec_div` と同じ
+        // 引数検査の流儀）。
+        if args.len() != WASM_CALL_ARITY {
+            return Err(SqlSurfaceError::invalid_input(format!(
+                "function {name} expects {WASM_CALL_ARITY} argument(s), got {}",
+                args.len()
+            )));
+        }
+        let mut bound_args = Vec::with_capacity(args.len());
+        for (a, expected) in args.iter().zip([ExprType::Vector, ExprType::Scalar].iter()) {
+            let (b, ty) = bind_expr_in(a, env, node_budget)?;
+            if ty != *expected {
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "function {name} argument type mismatch"
+                )));
+            }
+            bound_args.push(b);
+        }
+        return Ok((
+            BoundExpr::WasmCall {
+                name: name.to_string(),
+                backend,
+                args: bound_args,
+            },
+            ExprType::Scalar,
+        ));
     }
-    let mut inner_params = std::collections::HashMap::new();
-    for (pname, bound) in def.params.iter().zip(bound_args) {
-        inner_params.insert(pname.clone(), bound);
-    }
-    let mut inner_env = BindEnv {
-        // UDF 本体は列参照を持たない閉じた関数であるべき契約（`define_function` が
-        // 定義時に検査済み）だが、束縛段でも `schema: None` にして構造的に強制する
-        // （定義時検査のバイパス・実装バグの双方に対する fail-closed な多重防御）。
-        schema: None,
-        params: inner_params,
-        registry: env.registry,
-    };
-    bind_expr_in(&def.body, &mut inner_env, node_budget)
+
+    Err(SqlSurfaceError::invalid_input(format!(
+        "unknown function: {name}"
+    )))
 }
 
 /// 行コンテキスト（行 `id`・その行の `VECTOR` 列の embedding）で束縛済み式を評価する。
@@ -660,6 +841,20 @@ pub fn eval(expr: &BoundExpr, id: u64, embedding: &[f32]) -> Result<ExprValue, S
             let l = eval(lhs, id, embedding)?;
             let r = eval(rhs, id, embedding)?;
             eval_binary(*op, l, r)
+        }
+        BoundExpr::WasmCall { backend, args, .. } => {
+            // ABI 固定シグネチャ（bind_call が保証）: args[0] = Vector, args[1] = Scalar。
+            let v = eval_vector_arg(args, 0, id, embedding)?;
+            let s = eval_scalar_arg(args, 1, id, embedding)?;
+            // バックエンドの失敗（deadline 超過・トラップ・メモリ確保失敗・
+            // `Mutex` poison 等）は種別を問わずすべて `22000` に写像する（行値・
+            // テナント情報を含まない固定文言。`crate::wasm_udf::WasmUdfError` の
+            // `Display` を利用。EXT-6 の拒否・強制中断はここで行単位のエラーへ
+            // 収束し、プロセスは生存する）。
+            let result = backend
+                .call_vector_scalar(&v, s)
+                .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
+            finite_scalar(result, "wasm udf")
         }
     }
 }

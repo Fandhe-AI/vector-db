@@ -2,6 +2,12 @@
 //! PERSIST-3, PERSIST-4。ポインタ: `docs/spec/05-tasks.md` TASK-140・TASK-141・
 //! `docs/spec/04-behavior/persistence.md`）。
 //!
+//! 行ストア（[`ROWS_TABLE`]）の物理キーは `(tenant_id, id)` の複合キー（対象ビヘイビア:
+//! TABLE-12。ポインタ: `docs/spec/04-behavior/data-model.md` TABLE-12・
+//! `docs/spec/05-tasks.md` TASK-89・TASK-95）。旧フォーマット（`id` 単独キー）の DB は
+//! [`StorageError::IncompatibleRowKeyFormat`] で fail-closed に拒否し、マイグレーションは
+//! 提供しない（Issue #206。`catalog.rs::UserRowsTableDef` と同一契約）。
+//!
 //! 責務境界: ベクトル行（id・テナント ID・可視性ラベル・埋め込み・メタデータ）の永続化 API を
 //! 提供する。後続の検索カーネル・カタログ層（TASK-124〜、TASK-85〜）から呼び出される想定で、
 //! 本モジュールは `tenant_id`・`visibility` をスキーマとして同居保持するが、
@@ -25,13 +31,53 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 #[cfg(test)]
 mod power_loss_model;
 
-/// 行データを格納するテーブル。キーは行 ID（`u64`）、値は [`encode_row`] でエンコードした
-/// バイト列。テーブル名は `docs/spec` 側の成果物指定に依存しないローカルな識別子。
+/// 行ストアの物理キー型（対象ビヘイビア: TABLE-12。ポインタ:
+/// `docs/spec/04-behavior/data-model.md` TABLE-12）。キーはテナント ID・行 `id` の
+/// 複合キーで、行 `id` の一意性スコープをテナント内に閉じる。異なるテナントは同一の
+/// `id` を独立に保持できる（`crate::catalog::UserRowsTableDef` と同一契約。テーブル名
+/// だけが異なる）。`redb` のタプルキーは要素順（tenant_id 昇順 → id 昇順）で全順序を
+/// 持つため、全件走査は従来どおり単一の range 走査で列挙できる。
+///
+/// `pub(crate)`: `catalog.rs`（TASK-89・TASK-95）の `UserRowsTableDef` は本型への
+/// エイリアスであり、行ストアのキー型定義を本モジュールへ一元化する（PR #194 で
+/// `catalog.rs` 側にも同型を個別定義していたキー型の二重化を Issue #206 で解消）。
+pub(crate) type RowStoreTableDef<'a> = TableDefinition<'a, (&'static str, u64), &'static [u8]>;
+
+/// 行データを格納するテーブル。物理キーは [`RowStoreTableDef`]（`(tenant_id, id)`
+/// 複合キー）、値は [`encode_row`] でエンコードしたバイト列。テーブル名は `docs/spec`
+/// 側の成果物指定に依存しないローカルな識別子。
+///
+/// 旧フォーマット（物理キーが `id` 単独）の DB を開くと `redb` は
+/// `TableError::TableTypeMismatch` を返す。これを黙って握りつぶすと旧行を
+/// 別テナントの行として扱う fail-open になりうるため、[`map_rows_table_error`] で
+/// [`StorageError::IncompatibleRowKeyFormat`] へ明示的に写像して拒否する
+/// （マイグレーションは提供しない。TABLE-12 の物理キー変更に伴う恒久契約。
+/// `catalog.rs::map_row_table_error` と同型）。
 ///
 /// `pub(crate)`: `txn.rs`（TASK-88・TABLE-3）が `Storage` の公開 API を経由せず、
 /// 同一テーブルに対する読み取りスナップショット・書き込みトランザクションハンドルを
 /// 直接構築するために参照する。
-pub(crate) const ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
+pub(crate) const ROWS_TABLE: RowStoreTableDef<'static> = TableDefinition::new("rows");
+
+/// [`Storage::scan_page`] のページングカーソル（行ストアの物理キーと同形の
+/// `(tenant_id, id)`。対象ビヘイビア: TABLE-12。`id` 単独では再開位置を表現できない）。
+/// 呼び出し元がカーソルを保持できるよう所有形（`String`）で返す。
+///
+/// `catalog.rs::RowCursor` は本型の re-export（生成点を本モジュールへ一元化する）。
+pub type RowCursor = (String, u64);
+
+/// [`ROWS_TABLE`]（[`RowStoreTableDef`]）専用の `open_table` エラー写像。
+///
+/// `TableError::TableTypeMismatch`（旧 `id` 単独キー形式の DB）を
+/// [`StorageError::IncompatibleRowKeyFormat`] へ写像し fail-closed に拒否する。
+/// `catalog.rs::map_row_table_error`（[`crate::catalog::UserRowsTableDef`] 専用）と
+/// 同型のパターン。
+pub(crate) fn map_rows_table_error(e: redb::TableError) -> StorageError {
+    match e {
+        redb::TableError::TableTypeMismatch { .. } => StorageError::IncompatibleRowKeyFormat,
+        other => StorageError::from(other),
+    }
+}
 
 /// バッチ台帳テーブル（TASK-90、対象ビヘイビア: TABLE-10。ポインタ:
 /// `docs/spec/05-tasks.md` TASK-90・`docs/spec/04-behavior/data-model.md` TABLE-10）。
@@ -195,6 +241,13 @@ pub enum StorageError {
     /// [`GENERATION_TABLE`] のカウンタが `u64` を溢れた（到達し得ない防御的分岐。
     /// coding-rust.md「整数演算は checked_*/saturating_* を使う」対応）。
     GenerationCounterOverflow,
+    /// [`ROWS_TABLE`] を旧フォーマット（物理キーが `id` 単独）の DB に対して開こうと
+    /// した（対象ビヘイビア: TABLE-12）。旧行を新キー形式で読み解くと別テナントの行
+    /// として扱う fail-open になりうるため拒否する（マイグレーションは提供しない。
+    /// [`map_rows_table_error`] のドキュメンテーションコメント参照）。`Display` には
+    /// テナント ID・テーブル名を含めない（security.md「情報漏えい（エラー経由の
+    /// 存在情報）」対応。`CatalogError::IncompatibleRowKeyFormat` と同一文言）。
+    IncompatibleRowKeyFormat,
 }
 
 impl fmt::Display for StorageError {
@@ -227,6 +280,12 @@ impl fmt::Display for StorageError {
             StorageError::GenerationCounterOverflow => {
                 write!(f, "storage generation counter overflow")
             }
+            // `CatalogError::IncompatibleRowKeyFormat` と完全に同一の文言に揃える
+            // （`catalog.rs::convert_storage_error` が本 variant をそのまま写像するため、
+            // 呼び出し元から見て文言が食い違わないようにする）。
+            StorageError::IncompatibleRowKeyFormat => {
+                write!(f, "incompatible row store key format: rebuild required")
+            }
         }
     }
 }
@@ -242,7 +301,8 @@ impl std::error::Error for StorageError {
             | StorageError::PendingRowCountOverflow
             | StorageError::UnloggedRows(_)
             | StorageError::EmptyBatch
-            | StorageError::GenerationCounterOverflow => None,
+            | StorageError::GenerationCounterOverflow
+            | StorageError::IncompatibleRowKeyFormat => None,
         }
     }
 }
@@ -414,7 +474,9 @@ impl Storage {
         &self.db
     }
 
-    /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1）。
+    /// 単一行を書き込み、コミットする（対象ビヘイビア: PERSIST-1・TABLE-12）。
+    /// 物理キーは `(row.tenant_id, id)`（[`RowStoreTableDef`]）。`tenant_id` は
+    /// [`encode_row`] の検証（空拒否・[`MAX_TENANT_ID_LEN`]）を通った値のみキーへ使う。
     ///
     /// バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路（恒久契約。
     /// `docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が必要な場合は
@@ -423,14 +485,17 @@ impl Storage {
         let encoded = encode_row(row)?;
         let write_txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(ROWS_TABLE)?;
-            table.insert(id, encoded.as_slice())?;
+            let mut table = write_txn
+                .open_table(ROWS_TABLE)
+                .map_err(map_rows_table_error)?;
+            table.insert((row.tenant_id, id), encoded.as_slice())?;
         }
         bump_generation_and_commit(write_txn)
     }
 
-    /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2）。
-    /// 空スライスの場合はトランザクションを開かず即座に成功を返す。
+    /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2・TABLE-12）。
+    /// 空スライスの場合はトランザクションを開かず即座に成功を返す。物理キーは
+    /// [`Storage::put`] と同じ `(row.tenant_id, id)`。
     ///
     /// [`Storage::put`] と同様、バッチ台帳（[`BATCH_LOG_TABLE`]）を経由しない経路
     /// （恒久契約。`docs/design/batch-ledger-scope.md` 参照）。TABLE-10 の不変条件が
@@ -442,10 +507,12 @@ impl Storage {
         }
         let write_txn = self.db.begin_write()?;
         {
-            let mut table = write_txn.open_table(ROWS_TABLE)?;
+            let mut table = write_txn
+                .open_table(ROWS_TABLE)
+                .map_err(map_rows_table_error)?;
             for (id, row) in rows {
                 let encoded = encode_row(row)?;
-                table.insert(*id, encoded.as_slice())?;
+                table.insert((row.tenant_id, *id), encoded.as_slice())?;
             }
         }
         bump_generation_and_commit(write_txn)
@@ -465,20 +532,27 @@ impl Storage {
         }
     }
 
-    /// 行 ID を指定して 1 行取得する（スナップショット読み取り）。
-    pub fn get(&self, id: u64) -> Result<Row> {
+    /// テナント ID・行 ID を指定して 1 行取得する（スナップショット読み取り。対象
+    /// ビヘイビア: TABLE-12）。物理キーは `(tenant_id, id)` の複合キーのため、`id`
+    /// 単独では行を一意に指せない（`catalog.rs` の `get_row_from_table` と同じ理由）。
+    pub fn get(&self, tenant_id: &str, id: u64) -> Result<Row> {
         let read_txn = self.db.begin_read()?;
         let table = match read_txn.open_table(ROWS_TABLE) {
             Ok(t) => t,
             // テーブル未作成（1 行も書き込んでいない）は「存在しない」として扱う。
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(StorageError::NotFound(id)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_rows_table_error(e)),
         };
-        let guard = table.get(id)?.ok_or(StorageError::NotFound(id))?;
-        decode_row(id, guard.value())
+        let guard = table
+            .get((tenant_id, id))?
+            .ok_or(StorageError::NotFound(id))?;
+        decode_row_for_key(tenant_id, id, guard.value())
     }
 
-    /// 全行をスナップショット読み取りで走査する（対象ビヘイビア: PERSIST-4）。
+    /// 全行をスナップショット読み取りで走査する（対象ビヘイビア: PERSIST-4・TABLE-12）。
+    /// 列挙順は物理キー順（`tenant_id` 昇順 → `id` 昇順）で、テナントをまたぐと
+    /// 単純な `id` 昇順にはならない（呼び出し元が `id` 順を仮定する場合は明示的に
+    /// ソートすること）。
     ///
     /// 総行数が [`MAX_SCAN_TOTAL_ROWS`]、総バイト量（エンコード済みバイト列長で近似）が
     /// [`MAX_SCAN_TOTAL_BYTES`] のいずれかを超える場合は、部分的な結果を黙って切り詰めず
@@ -491,26 +565,30 @@ impl Storage {
         let table = match read_txn.open_table(ROWS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_rows_table_error(e)),
         };
         let mut out = Vec::new();
         let mut bytes_used: usize = 0;
         for entry in table.iter()? {
             let (k, v) = entry?;
+            let (tenant_id, id) = k.value();
             let raw = v.value();
             check_scan_limits(out.len(), bytes_used, raw.len())?;
             bytes_used = bytes_used.saturating_add(raw.len());
-            out.push(decode_row(k.value(), raw)?);
+            out.push(decode_row_for_key(tenant_id, id, raw)?);
         }
         Ok(out)
     }
 
-    /// 行 ID 昇順で最大 `limit` 件を走査する上限付きページング API（[`scan`](Self::scan) の
-    /// 無制限確保を避けるための代替。対象ビヘイビア: PERSIST-4）。
+    /// 物理キー昇順（`(tenant_id, id)`。TABLE-12）で最大 `limit` 件を走査する
+    /// 上限付きページング API（[`scan`](Self::scan) の無制限確保を避けるための代替。
+    /// 対象ビヘイビア: PERSIST-4）。
     ///
-    /// `after` に前回呼び出しで返した [`Row::id`] の最大値（カーソル）を渡すと、
-    /// その ID より大きい行から再開する。初回は `None` を渡す。
-    /// 戻り値の第 2 要素は次回呼び出しに渡すべきカーソル（続きがなければ `None`）。
+    /// `after` に前回呼び出しで返したカーソル（[`RowCursor`]）を渡すと、その直後の
+    /// キーから再開する。初回は `None` を渡す。戻り値の第 2 要素は次回呼び出しに
+    /// 渡すべきカーソル（続きがなければ `None`）。複合キーでは「次のキー」を算術で
+    /// 導出できないため `Bound::Excluded` の range で表現する
+    /// （`catalog.rs::scan_table_page` と同型のページング契約）。
     ///
     /// `limit` は [`MAX_SCAN_PAGE_LIMIT`] で切り詰める（呼び出し元が誤って大きな値を
     /// 渡しても一度の確保が上限を超えないようにする）。`limit == 0` は空ページを返す。
@@ -518,7 +596,11 @@ impl Storage {
     /// 相当。エンコード済みバイト列長で近似）が [`MAX_SCAN_PAGE_BYTES`] を超える場合は
     /// その時点でページを打ち切る（最大サイズの行が並んだ場合の巨大確保を避けるため。
     /// 1 行のみで超過する場合はその 1 行を含めて返し、無限ループを避ける）。
-    pub fn scan_page(&self, after: Option<u64>, limit: u32) -> Result<(Vec<Row>, Option<u64>)> {
+    pub fn scan_page(
+        &self,
+        after: Option<(&str, u64)>,
+        limit: u32,
+    ) -> Result<(Vec<Row>, Option<RowCursor>)> {
         let limit = limit.min(MAX_SCAN_PAGE_LIMIT) as usize;
         if limit == 0 {
             return Ok((Vec::new(), None));
@@ -528,17 +610,14 @@ impl Storage {
         let table = match read_txn.open_table(ROWS_TABLE) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok((Vec::new(), None)),
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(map_rows_table_error(e)),
         };
 
-        // カーソルの直後（`after + 1`）から走査を開始する。`after` が `u64::MAX` の場合は
-        // 「これ以上続きがない」ことを意味するため、範囲を作らず空ページを返す。
-        let start = match after {
-            Some(cursor) => match cursor.checked_add(1) {
-                Some(next) => next,
-                None => return Ok((Vec::new(), None)),
-            },
-            None => 0,
+        // カーソルの直後から走査を開始する（`Bound::Excluded`）。複合キーでは
+        // 「次のキー」を算術で導出できないため、除外境界付き range で表現する。
+        let range_start = match after {
+            Some(cursor) => std::ops::Bound::Excluded(cursor),
+            None => std::ops::Bound::Unbounded,
         };
 
         let mut out = Vec::new();
@@ -546,27 +625,25 @@ impl Storage {
         // 行数上限・バイト上限のいずれかで打ち切った場合のみ「続きがあるかもしれない」。
         // イテレータが自然に尽きた（テーブル末尾に到達した）場合は打ち切りではない。
         let mut capped = false;
-        for entry in table.range(start..)? {
+        let mut last_key: Option<RowCursor> = None;
+        for entry in table.range::<(&str, u64)>((range_start, std::ops::Bound::Unbounded))? {
             if out.len() == limit {
                 capped = true;
                 break;
             }
             let (k, v) = entry?;
-            let id = k.value();
+            let (tenant_id, id) = k.value();
             let raw = v.value();
             if !out.is_empty() && bytes_used.saturating_add(raw.len()) > MAX_SCAN_PAGE_BYTES {
                 capped = true;
                 break;
             }
-            out.push(decode_row(id, raw)?);
+            out.push(decode_row_for_key(tenant_id, id, raw)?);
+            last_key = Some((tenant_id.to_string(), id));
             bytes_used = bytes_used.saturating_add(raw.len());
         }
 
-        let cursor_for_next = if capped {
-            out.last().map(|r| r.id)
-        } else {
-            None
-        };
+        let cursor_for_next = if capped { last_key } else { None };
         Ok((out, cursor_for_next))
     }
 
@@ -972,6 +1049,25 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
     })
 }
 
+/// [`ROWS_TABLE`] の読み取り経路（[`Storage::get`]・[`Storage::scan`]・
+/// [`Storage::scan_page`]・[`crate::txn::ReadSnapshot::get`]）専用の [`decode_row`] 包み。
+/// 物理キー側の `tenant_id`（`key_tenant`）とエンコード済み行内の `tenant_id` が
+/// 一致することを確認してから返す（対象ビヘイビア: TABLE-12）。
+///
+/// raw `redb` 書き込みや将来のバグでキーのテナントと行内容のテナントがずれた行を
+/// 黙って返さない fail-closed な整合検査であり、`decode_row` 単体では検出できない
+/// （`decode_row` はキー側 `tenant_id` を知らない）。不一致は
+/// [`StorageError::Codec`] で拒否する（テナント境界の異常検知であり、
+/// `IncompatibleRowKeyFormat` のような DB 全体のフォーマット不整合とは性質が異なる
+/// ため既存 variant を再利用する）。
+pub(crate) fn decode_row_for_key(key_tenant: &str, id: u64, raw: &[u8]) -> Result<Row> {
+    let row = decode_row(id, raw)?;
+    if row.tenant_id != key_tenant {
+        return Err(StorageError::Codec("row key tenant mismatch".to_string()));
+    }
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,7 +1377,7 @@ mod tests {
         );
 
         // 読み取りのみの操作は世代を進めない。
-        let _ = storage.get(1).expect("get row 1");
+        let _ = storage.get("tenant-a", 1).expect("get row 1");
         let _ = storage.scan().expect("scan");
         assert_eq!(
             storage.current_generation().expect("gen after reads"),
@@ -1316,16 +1412,18 @@ mod tests {
         assert_eq!(page1.len(), 10);
         assert_eq!(page1.first().map(|r| r.id), Some(0));
         assert_eq!(page1.last().map(|r| r.id), Some(9));
-        assert_eq!(cursor1, Some(9));
+        assert_eq!(cursor1, Some(("tenant-a".to_string(), 9)));
 
-        let (page2, cursor2) = storage.scan_page(cursor1, 10).expect("second page");
+        let cursor1_ref = cursor1.as_ref().map(|(t, id)| (t.as_str(), *id));
+        let (page2, cursor2) = storage.scan_page(cursor1_ref, 10).expect("second page");
         assert_eq!(page2.len(), 10);
         assert_eq!(page2.first().map(|r| r.id), Some(10));
         assert_eq!(page2.last().map(|r| r.id), Some(19));
-        assert_eq!(cursor2, Some(19));
+        assert_eq!(cursor2, Some(("tenant-a".to_string(), 19)));
 
+        let cursor2_ref = cursor2.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (page3, cursor3) = storage
-            .scan_page(cursor2, 10)
+            .scan_page(cursor2_ref, 10)
             .expect("third (partial) page");
         assert_eq!(page3.len(), 5);
         assert_eq!(page3.first().map(|r| r.id), Some(20));
@@ -1404,8 +1502,9 @@ mod tests {
         let mut all_ids: Vec<u64> = page1.iter().map(|r| r.id).collect();
         let mut cursor = cursor1;
         loop {
+            let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
             let (page, next_cursor) = storage
-                .scan_page(cursor, 100)
+                .scan_page(cursor_ref, 100)
                 .expect("subsequent page after byte-budget cap");
             all_ids.extend(page.iter().map(|r| r.id));
             if next_cursor.is_none() {
@@ -1425,6 +1524,241 @@ mod tests {
         let (page, cursor) = storage.scan_page(None, 0).expect("scan with zero limit");
         assert!(page.is_empty());
         assert_eq!(cursor, None);
+    }
+
+    // 対象ビヘイビア: TABLE-12（ポインタ: `docs/spec/04-behavior/data-model.md`
+    // TABLE-12）。旧フォーマット（物理キーが `id` 単独）の DB を [`ROWS_TABLE`]
+    // （複合キー `(tenant_id, id)`）で開こうとする全経路が `IncompatibleRowKeyFormat`
+    // で fail-closed に拒否し、DB 内容を一切変更しないことを固定する（Issue #206）。
+    #[test]
+    fn rows_table_rejects_legacy_id_only_key_format() {
+        let path = unique_db_path("legacy-key-format");
+        let _cleanup = CleanupGuard(path.clone());
+
+        // raw redb で旧フォーマット（`id` 単独キー）の `rows` テーブルを作り、
+        // 1 行だけ書き込んでおく（内容が不変であることの検証対象）。
+        const LEGACY_ROWS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rows");
+        {
+            let db = redb::Database::create(&path).expect("create legacy database");
+            let write_txn = db.begin_write().expect("begin write txn");
+            {
+                let mut table = write_txn
+                    .open_table(LEGACY_ROWS_TABLE)
+                    .expect("open legacy table");
+                table.insert(1u64, &b"legacy-row"[..]).expect("insert row");
+            }
+            write_txn.commit().expect("commit legacy row");
+        }
+
+        let storage = Storage::open(&path).expect("open storage over legacy db");
+
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: &[],
+        };
+
+        // 読み取り経路。
+        assert!(matches!(
+            storage.get("tenant-a", 1),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+        assert!(matches!(
+            storage.scan(),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+        assert!(matches!(
+            storage.scan_page(None, 10),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+
+        // 書き込み経路（`Storage::put`/`put_batch`）。
+        assert!(matches!(
+            storage.put(2, &row),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+        assert!(matches!(
+            storage.put_batch(&[(2, row)]),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+
+        // `txn` 経由（`ReadSnapshot::get`・`WriteTxn::put`・`BatchWriteTxn::put`）。
+        let snapshot = storage.begin_read().expect("begin_read");
+        assert!(matches!(
+            snapshot.get("tenant-a", 1),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+
+        let row_for_write_txn = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: &[],
+        };
+        let mut write_txn = storage.begin_write().expect("begin_write");
+        assert!(matches!(
+            write_txn.put(2, &row_for_write_txn),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+        // `redb::Database::begin_write` の排他ロックは 1 本のみ同時に持てるため、
+        // 次の `begin_batch_write` の前に必ず手放す（保持したままだと後続の
+        // `begin_write` 呼び出しがデッドロックする）。
+        write_txn.abort().expect("abort write_txn");
+
+        let row_for_batch_txn = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: &[],
+        };
+        let mut batch_txn = storage.begin_batch_write().expect("begin_batch_write");
+        assert!(matches!(
+            batch_txn.put(2, &row_for_batch_txn),
+            Err(StorageError::IncompatibleRowKeyFormat)
+        ));
+        batch_txn.abort().expect("abort batch_txn");
+
+        // `Storage` を drop してファイルロックを解放してから raw redb で再オープンする
+        // （`tests/persistence.rs` と同じ制約）。
+        drop(storage);
+
+        // `Display` にテナント ID・テーブル名を含めない（security.md「情報漏えい」対応）。
+        let message = StorageError::IncompatibleRowKeyFormat.to_string();
+        assert_eq!(
+            message,
+            "incompatible row store key format: rebuild required"
+        );
+        assert!(!message.contains("tenant-a"));
+        assert!(!message.contains("rows"));
+
+        // 旧行の内容が変更されていないことを raw redb で確認する。
+        let db = redb::Database::open(&path).expect("reopen legacy database raw");
+        let read_txn = db.begin_read().expect("begin_read raw");
+        let table = read_txn
+            .open_table(LEGACY_ROWS_TABLE)
+            .expect("open legacy table after failed writes");
+        let guard = table
+            .get(1u64)
+            .expect("get legacy row")
+            .expect("row exists");
+        assert_eq!(guard.value(), b"legacy-row");
+    }
+
+    // 対象ビヘイビア: TABLE-12。異なるテナントは同一 `id` を独立に保持できる
+    // （物理キーが `(tenant_id, id)` の複合キーのため）。
+    #[test]
+    fn same_id_across_tenants_are_independent_rows() {
+        let path = unique_db_path("same-id-cross-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: b"a",
+                },
+            )
+            .expect("put tenant-a row 1");
+        storage
+            .put(
+                1,
+                &RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: &[2.0],
+                    metadata: b"b",
+                },
+            )
+            .expect("put tenant-b row 1");
+
+        let row_a = storage.get("tenant-a", 1).expect("get tenant-a row 1");
+        assert_eq!(row_a.metadata, b"a");
+        let row_b = storage.get("tenant-b", 1).expect("get tenant-b row 1");
+        assert_eq!(row_b.metadata, b"b");
+
+        let mut scanned = storage.scan().expect("scan");
+        scanned.sort_by(|x, y| x.tenant_id.cmp(&y.tenant_id));
+        assert_eq!(scanned.len(), 2);
+        assert_eq!(
+            scanned
+                .iter()
+                .map(|r| (r.tenant_id.as_str(), r.id))
+                .collect::<Vec<_>>(),
+            vec![("tenant-a", 1), ("tenant-b", 1)]
+        );
+
+        let (page, cursor) = storage.scan_page(None, 100).expect("scan_page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(cursor, None);
+    }
+
+    // 対象ビヘイビア: TABLE-12。`(tenant_id, id)` 順のページングがテナント境界を
+    // 跨いでも取りこぼし・重複なく全件列挙できることを固定する。
+    #[test]
+    fn scan_page_cursor_resumes_across_tenant_boundary() {
+        let path = unique_db_path("scan-page-cross-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let rows: Vec<(u64, RowInput<'_>)> = vec![
+            (
+                1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0],
+                    metadata: &[],
+                },
+            ),
+            (
+                2,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[2.0],
+                    metadata: &[],
+                },
+            ),
+            (
+                1,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Public,
+                    embedding: &[3.0],
+                    metadata: &[],
+                },
+            ),
+        ];
+        storage.put_batch(&rows).expect("seed rows");
+
+        let mut all: Vec<(String, u64)> = Vec::new();
+        let mut cursor: Option<RowCursor> = None;
+        loop {
+            let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
+            let (page, next_cursor) = storage
+                .scan_page(cursor_ref, 1)
+                .expect("scan_page with limit=1");
+            all.extend(page.iter().map(|r| (r.tenant_id.clone(), r.id)));
+            match next_cursor {
+                None => break,
+                Some(next) => cursor = Some(next),
+            }
+        }
+
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                ("tenant-a".to_string(), 1),
+                ("tenant-a".to_string(), 2),
+                ("tenant-b".to_string(), 1),
+            ]
+        );
     }
 
     // Issue #131 / PR #193 codex レビュー対応: `Display` の固定文言
@@ -1640,10 +1974,10 @@ mod tests {
             );
 
             let row1_before = storage
-                .get(1)
+                .get("tenant-a", 1)
                 .expect("decode row 1 via production Storage API before crash");
             let row2_before = storage
-                .get(2)
+                .get("tenant-b", 2)
                 .expect("decode row 2 via production Storage API before crash");
 
             let crash_image = backend.durable_snapshot();
@@ -1656,7 +1990,7 @@ mod tests {
             };
 
             let row1_after = recovered_storage
-                .get(1)
+                .get("tenant-a", 1)
                 .expect("decode row 1 via production Storage API after crash");
             assert_eq!(
                 row1_after, row1_before,
@@ -1674,7 +2008,7 @@ mod tests {
             );
 
             let row2_after = recovered_storage
-                .get(2)
+                .get("tenant-b", 2)
                 .expect("decode row 2 via production Storage API after crash");
             assert_eq!(
                 row2_after, row2_before,

@@ -71,6 +71,8 @@ fn dense_clear_winner_returns_top1_only_while_recall_returns_all() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -114,6 +116,8 @@ fn dense_ambiguous_top1_and_top2_returns_empty_result() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -152,6 +156,8 @@ fn dense_low_similarity_returns_empty_result() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -187,6 +193,8 @@ fn dense_clear_winner_result_never_exceeds_max_results_regardless_of_limit() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -226,6 +234,8 @@ fn set_search_mode_and_using_mode_yield_identical_precision_results() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -287,6 +297,8 @@ fn hybrid_dense_and_sparse_agree_on_rank1_returns_top1_only() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(body.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -330,6 +342,8 @@ fn hybrid_dense_and_sparse_disagree_returns_empty_result() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(body.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -368,6 +382,8 @@ fn hybrid_dense_only_degradation_returns_empty_result() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Null],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -414,6 +430,8 @@ fn precision_gate_applies_after_distance_first_scalar_postfilter() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -467,6 +485,8 @@ fn precision_gate_fail_closed_when_postfilter_survivors_exceed_limit_based_k_eff
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -500,6 +520,8 @@ fn no_external_input_can_disable_or_relax_the_confidence_gate() {
         1,
         Visibility::Public,
         &[Value::Vector(vec![1.0, 0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert row");
     let core = new_core(storage);
@@ -574,6 +596,8 @@ fn precision_result_depends_only_on_server_side_policy_not_query_input() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -619,6 +643,8 @@ fn tenant_a_precision_result_is_unaffected_by_tenant_b_private_row_existence() {
             1,
             Visibility::Public,
             &[Value::Vector(vec![0.5, 0.5, 0.0])],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert tenant-a row");
         if insert_tenant_b_exact_match {
@@ -630,6 +656,8 @@ fn tenant_a_precision_result_is_unaffected_by_tenant_b_private_row_existence() {
                 2,
                 Visibility::Private,
                 &[Value::Vector(vec![1.0, 0.0, 0.0])],
+                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                    .expect("valid operation_id"),
             )
             .expect("insert tenant-b row");
         }

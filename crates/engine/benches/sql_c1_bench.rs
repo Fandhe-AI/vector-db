@@ -1,7 +1,7 @@
 //! SQL 表層 C1（純粋 Top-k）の p95 再測定ベンチ（TASK-83。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-83・Conditional Go 条件7）。
 //!
-//! `parallel_bench.rs`（TASK-127）は `SearchProvider` を直接叩く provider 単体の
+//! `simd_bench.rs`（TASK-127）は `SearchProvider` を直接叩く provider 単体の
 //! p95 であり、`EngineCore::execute_sql`（`sql::exec::execute_statement`。SQL-1〜4、
 //! TASK-75）経由の C1 p95 は本ベンチが初めて計測する。SQL 表層は毎クエリ
 //! `VectorArena::build_filtered_with_rows_in_txn` で候補行を redb から再デコードし
@@ -23,17 +23,17 @@
 //! `BENCH_DEDICATED_ENV=1` を明示的に設定した run でのみ「専有環境として宣言された」
 //! ことを記録する（[`dedicated_env_attested_from_env`]）。未設定（既定）の run では
 //! p95・Recall の pass/fail 自体は常に出力しつつ、条件7 の判定対象からは明示的に
-//! 除外する（silent skip にしない。`parallel_bench.rs` の CORE-5 opt-in と同一方針）。
+//! 除外する（silent skip にしない。`simd_bench.rs` の CORE-5 opt-in と同一方針）。
 //!
 //! 数値基準（p95 上限・Recall 下限）は SQL-1 専用の環境変数
 //! （`BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`）から注入する。
-//! `parallel_bench.rs` の `BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL` は CORE-3・SEARCH-4・
+//! `simd_bench.rs` の `BENCH_MAX_P95_MS`・`BENCH_MIN_RECALL` は CORE-3・SEARCH-4・
 //! CORE-4（`SearchProvider` 単体）の基準であり、SQL 表層全体を対象とする SQL-1 の
 //! 基準とは spec 上の出所が異なるため、流用せず別 variable として分離する
 //! （流用すると緩い側で false green・厳しい側で false red になる）。spec が SSOT の
 //! ため本ファイルにはハードコードしない（`.claude/rules/spec-confidentiality.md`）。
 //! 標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しない
-//! （`parallel_bench.rs` と同一方針）。
+//! （`simd_bench.rs` と同一方針）。
 //!
 //! `make bench-c1`（Makefile）・`.github/workflows/bench.yml`
 //! （`workflow_dispatch` 限定。GitHub ホステッド runner は共有 2 vCPU のため恒常的な
@@ -43,7 +43,7 @@
 
 // `harness` は独立したコンパイル単位（cargo bench バイナリ）から取り込まれる共有
 // ソース。本ファイルが実際に使う項目のみで、未到達の `pub` 項目は `dead_code`
-// 警告になりうるためモジュール全体を対象に許容する（`parallel_bench.rs` と同一方針）。
+// 警告になりうるためモジュール全体を対象に許容する（`simd_bench.rs` と同一方針）。
 #[allow(dead_code)]
 mod harness;
 
@@ -69,13 +69,13 @@ use std::time::Duration;
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
-/// 測定条件（`parallel_bench.rs` の TASK-127 と同一値。既存ベンチがすでに公開コード
+/// 測定条件（`simd_bench.rs` の TASK-127 と同一値。既存ベンチがすでに公開コード
 /// へ含んでいるため新規の漏えいではない）。
 const ROW_COUNT: usize = 100_000;
 const DIM: usize = 768;
 const TOP_K: usize = 20;
 
-/// Recall@k 判定に使うクエリ本数（`parallel_bench.rs` と同一方針。worst-query 判定）。
+/// Recall@k 判定に使うクエリ本数（`simd_bench.rs` と同一方針。worst-query 判定）。
 const RECALL_QUERY_COUNT: usize = 20;
 
 /// 単一 write トランザクションの確保量を有界化するための投入チャンクサイズ。
@@ -86,7 +86,7 @@ const COLUMN: &str = "embedding";
 const TENANT_ID: &str = "bench-tenant";
 
 /// `BENCH_SQL_C1_MAX_P95_MS` 環境変数を読み取る（検証仕様は
-/// `parallel_bench.rs::max_p95_from_env` と同一だが、SQL-1 の基準は provider 単体の
+/// `simd_bench.rs::max_p95_from_env` と同一だが、SQL-1 の基準は provider 単体の
 /// CORE-3・SEARCH-4 とは別物のため variable 名を分ける。数値基準は spec が SSOT の
 ///ためここにはデフォルト値を持たない）。
 fn max_p95_from_env() -> Result<Duration, String> {
@@ -102,7 +102,7 @@ fn max_p95_from_env() -> Result<Duration, String> {
 }
 
 /// `BENCH_SQL_C1_MIN_RECALL` 環境変数を読み取る（検証仕様は
-/// `parallel_bench.rs::min_recall_from_env` と同一。CORE-4 の Recall 基準と混同しない
+/// `simd_bench.rs::min_recall_from_env` と同一。CORE-4 の Recall 基準と混同しない
 /// よう SQL-1 専用の variable 名にする）。
 fn min_recall_from_env() -> Result<f64, String> {
     let raw = std::env::var("BENCH_SQL_C1_MIN_RECALL")
@@ -200,7 +200,15 @@ fn main() {
                 )
             })
             .collect();
-        engine::tenant::insert_rows(&storage, TABLE, &ctx, &rows).expect("seed batch insert");
+        engine::tenant::insert_rows(
+            &storage,
+            TABLE,
+            &ctx,
+            &rows,
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("seed batch insert");
         for (i, v) in batch_vectors.iter().enumerate() {
             ids.push(next_id + i as u64);
             flat_vectors.extend_from_slice(v);
@@ -227,7 +235,7 @@ fn main() {
     let p95 = p95_from_samples(&measurement.samples).expect("non-empty samples must yield a p95");
     let p95_ok = check_p95_within_limit(p95, max_p95);
     passed &= p95_ok;
-    // limit（BENCH_SQL_C1_MAX_P95_MS の実測値）は意図的にログへ出力しない（`parallel_bench.rs`
+    // limit（BENCH_SQL_C1_MAX_P95_MS の実測値）は意図的にログへ出力しない（`simd_bench.rs`
     // と同一方針。モジュール冒頭コメント参照）。
     println!(
         "p95_latency(sql_c1): rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} pass={p95_ok}",

@@ -111,21 +111,26 @@ fn derive_row(id: u64) -> (Vec<f32>, Vec<u8>) {
 /// 現在の最大行 ID を求める（クラッシュ → 再起動 → 再クラッシュを反復するために必要。
 /// `write` はプロセス起動のたびにこの関数から採番を引き継ぐ）。
 fn find_next_id(storage: &Storage) -> Result<u64, String> {
-    let mut cursor: Option<u64> = None;
-    let mut last_id: Option<u64> = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
+    // 本ツールは単一テナント（`CRASH_TOOL_TENANT_ID`）のみを書き込むため、物理キー
+    // `(tenant_id, id)`（TABLE-12）の走査順はそのまま `id` 昇順になる。複数テナントを
+    // 書き込む場合は「最後の行」ではなく走査した全行の `id` の `max()` を取る必要がある
+    // （`crash_tool_cross_table.rs::find_resume_state` 参照）。
+    let mut max_id: Option<u64> = None;
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (rows, next_cursor) = storage
-            .scan_page(cursor, PAGE_LIMIT)
+            .scan_page(cursor_ref, PAGE_LIMIT)
             .map_err(|e| format!("scan_page failed: {e}"))?;
-        if let Some(last) = rows.last() {
-            last_id = Some(last.id);
+        for row in &rows {
+            max_id = Some(max_id.map_or(row.id, |m| m.max(row.id)));
         }
         match next_cursor {
             Some(c) => cursor = Some(c),
             None => break,
         }
     }
-    match last_id {
+    match max_id {
         Some(id) => id
             .checked_add(1)
             .ok_or_else(|| "row id overflow while resuming".to_string()),
@@ -194,13 +199,14 @@ fn run_verify(path: &str) -> i32 {
 
 fn verify_inner(path: &str) -> Result<u64, String> {
     let storage = Storage::open(path).map_err(|e| format!("open failed: {e}"))?;
-    let mut cursor: Option<u64> = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
     let mut expected_id: u64 = 0;
     let mut total_rows: u64 = 0;
 
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (rows, next_cursor) = storage
-            .scan_page(cursor, PAGE_LIMIT)
+            .scan_page(cursor_ref, PAGE_LIMIT)
             .map_err(|e| format!("scan_page failed: {e}"))?;
         for row in &rows {
             if row.id != expected_id {

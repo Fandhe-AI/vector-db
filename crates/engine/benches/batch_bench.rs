@@ -2,7 +2,7 @@
 //! TASK-130・対象ビヘイビア CORE-6, CORE-7〔動的窓〕, CORE-16〔f16 常駐〕。
 //! `docs/spec/04-behavior/core-engine.md` ポインタ参照）。
 //!
-//! `parallel_bench.rs`（TASK-127）と同じ設計方針を踏襲する: `make ci` には含めず
+//! `simd_bench.rs`（TASK-127）と同じ設計方針を踏襲する: `make ci` には含めず
 //! `.github/workflows/bench.yml`（workflow_dispatch）から実行する時間依存ベンチであり、
 //! 閾値は環境変数（Actions variables）から注入・未設定は fail-closed で非ゼロ終了する。
 //! 標準出力には実測値と pass/fail のみを書き、注入された閾値そのものは出力しない
@@ -30,14 +30,14 @@
 //!   B の p95 が A に対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを
 //!   判定する。`BatchEngine::batch_search` 自体（f16 デコード・テナントマスク・
 //!   visibility フィルタ・全走査）は本ゲートの測定対象外とする（CORE-3/CORE-5 側の
-//!   ゲート〔`parallel_bench.rs`〕が別途担う関心事であり、本ゲートに混ぜると
+//!   ゲート〔`simd_bench.rs`〕が別途担う関心事であり、本ゲートに混ぜると
 //!   再び判別力を失う）。
 //! - CORE-6（GPU 経路 vs CPU-SIMD の p95 短縮率）・CORE-16（f16 常駐 vs f32 常駐の
 //!   p95 短縮率）: 実 GPU バックエンド未接続のため実測不能
 //!   （`crates/engine/src/batch_search.rs` モジュール冒頭コメント参照。CPU 上の
 //!   参照実装を GPU の代替として計測することはアサーション弱体化にあたるため行わない）。
 //!   `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in）が未設定（空文字含む）の既定では
-//!   「対象外」を標準出力へ明示するのみで合否には数えない（`parallel_bench.rs` の
+//!   「対象外」を標準出力へ明示するのみで合否には数えない（`simd_bench.rs` の
 //!   CORE-5 opt-in の骨格を踏襲するが、opt-in 判定は非空値ならすべて要求とみなす
 //!   よう本ファイル側で強化している。レビュー指摘対応: `"1"` 完全一致のみを
 //!   有効とみなす方式だと `"true"`/`"yes"` 等の non-"1" な truthy 値がサイレントに
@@ -53,7 +53,7 @@
 //!   ——同一 CPU 経路同士なので改善率は意味を持たない——が、配線そのものが
 //!   `panic`/`Err` せず最後まで動くことだけを確認する。
 
-// `harness` の取り込み方針は `parallel_bench.rs` と同一（本ファイルが実際に使う項目
+// `harness` の取り込み方針は `simd_bench.rs` と同一（本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
 #[allow(dead_code)]
 mod harness;

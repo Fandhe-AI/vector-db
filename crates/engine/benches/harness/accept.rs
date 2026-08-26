@@ -1,13 +1,13 @@
 //! 性能・Recall 受け入れ基準の判定ヘルパ（TASK-127。ポインタ: `docs/spec/05-tasks.md`
 //! TASK-127・対象ビヘイビア CORE-3, CORE-4, CORE-5, SEARCH-4）。
 //!
-//! `parallel_bench.rs` から呼ばれる時間非依存の判定ロジックを本モジュールへ分離する。
+//! `simd_bench.rs` から呼ばれる時間非依存の判定ロジックを本モジュールへ分離する。
 //! `tests/bench_accept.rs` が `#[path]` で本モジュールを取り込み、実測タイマーに
 //! 依存せず `cargo test`（`make ci` 対象）で回帰検証する（`harness/mod.rs`・
 //! `harness/ab.rs` と同一パターン）。
 //!
 //! 数値基準そのもの（p95 上限・Recall 下限・対照エンジン比の上限）は spec が SSOT
-//! であり、本ファイルにはハードコードしない。判定関数は呼び出し元（`parallel_bench.rs`）
+//! であり、本ファイルにはハードコードしない。判定関数は呼び出し元（`simd_bench.rs`）
 //! から閾値を引数で受け取るのみとする（`.claude/rules/spec-confidentiality.md`:
 //! spec 本文・数値基準を public 資産へ転記しない）。
 //!
@@ -86,7 +86,7 @@ pub fn worst_recall(recalls: &[f64]) -> Result<f64, BenchError> {
 /// `min_recall` は `(0.0, 1.0]` の範囲外だと判定基準として意味を持たないため
 /// `Err`（fail-closed）とする。`0.0` を許容すると「どんな recall 値でも pass」
 /// となり CORE-4 のゲートが実質的に無効化されるため下限からも除外する
-/// （`parallel_bench.rs` の `min_recall_from_env` と同一の不変条件）。
+/// （`simd_bench.rs` の `min_recall_from_env` と同一の不変条件）。
 pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, BenchError> {
     if !(min_recall > 0.0 && min_recall <= 1.0) {
         return Err(BenchError::ProtocolViolation(

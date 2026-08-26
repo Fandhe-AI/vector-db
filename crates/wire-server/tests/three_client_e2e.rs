@@ -13,6 +13,22 @@
 //! 導入をローカル環境へ強制すると `make ci` 自体が壊れるため。ADR:
 //! `docs/design/three-client-e2e-harness.md`）。
 //!
+//! TASK-165（SQL-12／SEARCH-9）: `USING MODE`／`SET search_mode` の優先順位・
+//! 確信度ゲートは層 A（`tests/wire_search_mode.rs`、常時 `make ci`）が主たる
+//! 回帰保護を担う。本ファイルは `run_*_session` 系ヘルパー（`WIRE_SQL_PRELUDE`
+//! で同一接続に複数文を送る）を使い、無改造クライアント経由でも同じ契約を
+//! 最小限確認する（3 クライアントの子プロセス実行は本環境未導入のため
+//! コンパイル通過とスクリプト構文確認のみで検証済み。詳細は PR 本文）。
+//!
+//! TASK-168（SQL-13／SQL-14）: 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）・
+//! `GROUP BY`/`HAVING` の拒否形状・NULL 契約の回帰保護は層 A
+//! （`tests/wire_aggregate.rs`、常時 `make ci`）が主として担う。本ファイルは
+//! `seed_aggregate_three_tenant_db` の同一コーパスに対する代表ケース（単一行
+//! 集計・`GROUP BY`/`HAVING`・RLS 不変・拒否経路 2 種）のみを 3 クライアント
+//! 経由で確認する（3 クライアントの子プロセス実行は本環境未導入のため層 A・
+//! 層 B いずれもコンパイル通過とスクリプト構文確認のみで検証済み。詳細は
+//! PR 本文）。
+//!
 //! ツール未検出・クライアントスクリプトの非 0 終了はいずれも `panic!` で
 //! 失敗させ、silent skip はしない（`.claude/rules/coding-rust.md`・実行規約
 //! 「テストの skip・ignore・アサーション弱体化で CI を通さない」の精神を、
@@ -154,8 +170,80 @@ fn seed_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
                 Value::Text(lang.to_string()),
                 Value::Text(body.to_string()),
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
+    }
+    (path, guard)
+}
+
+/// `seed_three_tenant_db` と同じ Public 3 行（`embedding`/`lang`/`body`）に加え、
+/// tenant-a の Private 行（id=11, lang="xx"）・tenant-b の Private 行
+/// （id=12, lang="ja"）を投入した一時 DB を用意する（TASK-168・SQL-13/14）。
+/// wire 認証経路の `PolicyContext` は Public のみ許可のため、Private 行は
+/// どのユーザーの接続からも不可視。既存 C1〜C4 テストの seed
+/// （`seed_three_tenant_db`）はこの関数の追加では変更しない。
+fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("three-client-e2e-aggregate-docs");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("lang", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let public_rows: [(&str, u64, [f32; 2], &str, &str); 3] = [
+        ("tenant-a", 1, [1.0, 0.0], "ja", "vector database intro"),
+        ("tenant-b", 2, [0.0, 1.0], "en", "query planning notes"),
+        ("tenant-c", 3, [-1.0, 0.0], "ja", "unrelated topic"),
+    ];
+    for (tenant, id, dir, lang, body) in public_rows {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text(body.to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("insert public row");
+    }
+    let private_rows: [(&str, u64, [f32; 2], &str); 2] = [
+        ("tenant-a", 11, [1.0, 0.0], "xx"),
+        ("tenant-b", 12, [0.0, 1.0], "ja"),
+    ];
+    for (tenant, id, dir, lang) in private_rows {
+        let ctx =
+            PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        engine::tenant::insert_typed_row(
+            &storage,
+            "docs",
+            &ctx,
+            id,
+            Visibility::Private,
+            &[
+                Value::Vector(dir.to_vec()),
+                Value::Text(lang.to_string()),
+                Value::Text("private body".to_string()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("insert private row");
     }
     (path, guard)
 }
@@ -195,28 +283,51 @@ const C4_SQL: &str = "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '[1.0,0
 /// ため、環境差異で暗黙に変わらない）、`run_psycopg`／`run_pg` 側も同じ区切りで
 /// 出力を揃える。
 fn run_psql(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
+    run_psql_session(port, user, password, &[], sql)
+}
+
+/// psql（無改造）で `prelude` の各文を先に実行してから `sql` を実行し、`sql` の
+/// 結果行を `run_psql` と同じ `|` 区切りの集合として返す（TASK-165・SQL-12。
+/// 同一接続で `SET search_mode = ...` を先行実行してから `SELECT` を送る、
+/// セッション複数文の検証に使う）。`-q`（quiet）で prelude の `SET` タグが
+/// stdout の結果集合へ混入するのを防ぎ、複数の `-c` は psql が同一セッションで
+/// 順次送信する（`run_psql` は本関数の prelude 無しの薄いラッパー）。
+fn run_psql_session(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+) -> Vec<String> {
     let psql = resolve_tool("PSQL_BIN", "psql");
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        "127.0.0.1".into(),
+        "-p".into(),
+        port.to_string(),
+        "-U".into(),
+        user.into(),
+        "-d".into(),
+        "irrelevant-db-name".into(),
+        "-X".into(),
+        "-w".into(),
+        "-q".into(),
+        "-At".into(),
+        "-F".into(),
+        "|".into(),
+        "-v".into(),
+        "ON_ERROR_STOP=1".into(),
+    ];
+    for stmt in prelude {
+        args.push("-c".into());
+        args.push((*stmt).into());
+    }
+    args.push("-c".into());
+    args.push(sql.into());
+
     let output = Command::new(&psql)
         .env("PGPASSWORD", password)
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            user,
-            "-d",
-            "irrelevant-db-name",
-            "-X",
-            "-w",
-            "-At",
-            "-F",
-            "|",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            sql,
-        ])
+        .args(&args)
         .output()
         .unwrap_or_else(|e| {
             panic!("failed to spawn {psql} (install libpq-client tools or set PSQL_BIN): {e}")
@@ -231,6 +342,59 @@ fn run_psql(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// psql で `prelude` を先行実行後、最終文が非 0 終了かつ stderr に期待
+/// SQLSTATE を含めて拒否されることを確認する（TASK-165 の拒否経路検証。
+/// `-v VERBOSITY=verbose` で SQLSTATE を stderr へ出させる）。
+fn run_psql_session_expect_sqlstate(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+    expected_sqlstate: &str,
+) {
+    let psql = resolve_tool("PSQL_BIN", "psql");
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        "127.0.0.1".into(),
+        "-p".into(),
+        port.to_string(),
+        "-U".into(),
+        user.into(),
+        "-d".into(),
+        "irrelevant-db-name".into(),
+        "-X".into(),
+        "-w".into(),
+        "-q".into(),
+        "-At".into(),
+        "-v".into(),
+        "ON_ERROR_STOP=1".into(),
+        "-v".into(),
+        "VERBOSITY=verbose".into(),
+    ];
+    for stmt in prelude {
+        args.push("-c".into());
+        args.push((*stmt).into());
+    }
+    args.push("-c".into());
+    args.push(sql.into());
+
+    let output = Command::new(&psql)
+        .env("PGPASSWORD", password)
+        .args(&args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
+    assert!(
+        !output.status.success(),
+        "psql must exit non-zero for a rejected statement (user {user})"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_sqlstate),
+        "expected SQLSTATE {expected_sqlstate} in psql stderr, got: {stderr}"
+    );
 }
 
 /// psql で誤りパスワードを送り、非 0 終了・`28P01`／認証失敗の文言が出ることを
@@ -271,17 +435,20 @@ fn run_psql_wrong_password(port: u16, user: &str) {
 /// 結合した文字列の集合を返す（`run_psql` と同じ区切り規約。複数列を返す
 /// C2 の型変換検証に対応する）。
 fn run_psycopg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
-    let python = resolve_tool("PYTHON_BIN", "python3");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
-    let output = Command::new(&python)
-        .arg(&script)
-        .env("WIRE_HOST", "127.0.0.1")
-        .env("WIRE_PORT", port.to_string())
-        .env("WIRE_USER", user)
-        .env("WIRE_PASSWORD", password)
-        .env("WIRE_SQL", sql)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"));
+    run_psycopg_session(port, user, password, &[], sql)
+}
+
+/// `psycopg_client.py` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の
+/// 各文を同一接続で先行実行してから `sql` を実行する（TASK-165・SQL-12。
+/// `run_psycopg` は本関数の prelude 無しの薄いラッパー）。
+fn run_psycopg_session(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+) -> Vec<String> {
+    let output = spawn_psycopg_client(port, user, password, prelude, sql);
     assert!(
         output.status.success(),
         "psycopg_client.py failed for user {user} (install psycopg via \
@@ -295,20 +462,92 @@ fn run_psycopg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> 
         .collect()
 }
 
-/// Node.js `pg`（無改造）で任意の SQL を実行し、各行を `|` 区切りで結合
-/// した文字列の集合を返す（`run_psql` と同じ区切り規約）。
-fn run_pg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
-    let node = resolve_tool("NODE_BIN", "node");
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
-    let output = Command::new(&node)
-        .arg(&script)
+/// psycopg で `prelude` を先行実行後、最終文が非 0 終了かつ stderr に期待
+/// SQLSTATE（`psycopg_client.py` の `[SQLSTATE=<code>]` 表記）を含めて拒否
+/// されることを確認する（TASK-165 の拒否経路検証）。
+fn run_psycopg_session_expect_sqlstate(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+    expected_sqlstate: &str,
+) {
+    let output = spawn_psycopg_client(port, user, password, prelude, sql);
+    assert!(
+        !output.status.success(),
+        "psycopg_client.py must exit non-zero for a rejected statement (user {user})"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_sqlstate),
+        "expected SQLSTATE {expected_sqlstate} in psycopg_client.py stderr, got: {stderr}"
+    );
+}
+
+fn spawn_psycopg_client(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+) -> std::process::Output {
+    let python = resolve_tool("PYTHON_BIN", "python3");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
         .env("WIRE_HOST", "127.0.0.1")
         .env("WIRE_PORT", port.to_string())
         .env("WIRE_USER", user)
         .env("WIRE_PASSWORD", password)
-        .env("WIRE_SQL", sql)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"));
+        .env("WIRE_SQL", sql);
+    if !prelude.is_empty() {
+        let prelude_json =
+            serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
+        cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"))
+}
+
+/// `["a","b"]` 形式の最小 JSON エンコーダ（依存追加なしで `WIRE_SQL_PRELUDE` を
+/// 組み立てる。`prelude` は本ファイル内の定数リテラルのみを渡す前提で、
+/// 制御文字・バックスラッシュを含まない SQL 文だけを扱う。`\`・制御文字を
+/// 含む文字列を渡した場合は panic して不正なエンコードを未然に防ぐ）。
+fn serde_json_prelude(statements: &[&str]) -> Option<String> {
+    let mut out = String::from("[");
+    for (i, stmt) in statements.iter().enumerate() {
+        if stmt.contains('\\') || stmt.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&stmt.replace('"', "\\\""));
+        out.push('"');
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// Node.js `pg`（無改造）で任意の SQL を実行し、各行を `|` 区切りで結合
+/// した文字列の集合を返す（`run_psql` と同じ区切り規約）。
+fn run_pg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
+    run_pg_session(port, user, password, &[], sql)
+}
+
+/// `pg_client.js` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の各文を
+/// 同一接続で先行実行してから `sql` を実行する（TASK-165・SQL-12。`run_pg` は
+/// 本関数の prelude 無しの薄いラッパー）。
+fn run_pg_session(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+) -> Vec<String> {
+    let output = spawn_pg_client(port, user, password, prelude, sql);
     assert!(
         output.status.success(),
         "pg_client.js failed for user {user} (install pg via \
@@ -320,6 +559,54 @@ fn run_pg(port: u16, user: &str, password: &str, sql: &str) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// pg で `prelude` を先行実行後、最終文が非 0 終了かつ stderr に期待
+/// SQLSTATE（`pg_client.js` の `[SQLSTATE=<code>]` 表記）を含めて拒否される
+/// ことを確認する（TASK-165 の拒否経路検証）。
+fn run_pg_session_expect_sqlstate(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+    expected_sqlstate: &str,
+) {
+    let output = spawn_pg_client(port, user, password, prelude, sql);
+    assert!(
+        !output.status.success(),
+        "pg_client.js must exit non-zero for a rejected statement (user {user})"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_sqlstate),
+        "expected SQLSTATE {expected_sqlstate} in pg_client.js stderr, got: {stderr}"
+    );
+}
+
+fn spawn_pg_client(
+    port: u16,
+    user: &str,
+    password: &str,
+    prelude: &[&str],
+    sql: &str,
+) -> std::process::Output {
+    let node = resolve_tool("NODE_BIN", "node");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
+    let mut cmd = Command::new(&node);
+    cmd.arg(&script)
+        .env("WIRE_HOST", "127.0.0.1")
+        .env("WIRE_PORT", port.to_string())
+        .env("WIRE_USER", user)
+        .env("WIRE_PASSWORD", password)
+        .env("WIRE_SQL", sql);
+    if !prelude.is_empty() {
+        let prelude_json =
+            serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
+        cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    cmd.output()
+        .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"))
 }
 
 /// 3 クライアント（psql / psycopg / pg）それぞれで、3 テナントいずれの
@@ -379,6 +666,165 @@ fn three_clients_run_c1_through_c4_and_reject_wrong_password() {
     }
 
     run_psql_wrong_password(port, "alice");
+
+    drop(server);
+    let _ = std::io::stdout().flush();
+}
+
+/// TASK-165（SQL-12／SEARCH-9）: `USING MODE` 句・`SET search_mode` セッション
+/// 変数・未知モード値の拒否を無改造クライアント経由で最小限確認する。閾値
+/// そのものの回帰保護は層 A（`tests/wire_search_mode.rs`、常時 `make ci`）が
+/// 担うため、ここでは同じオラクル（`seed_three_tenant_db` の
+/// `[1,0]`／`[0,1]`／`[-1,0]` コーパス）に対する代表ケースのみを 3 クライアントで
+/// 確認する（M2: クエリ句 precision が Top-1 のみを返す／M5: `SET
+/// search_mode='precision'` が後続の句なし SELECT に適用される／R1: クエリ句の
+/// 未知モード値が拒否される）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_verify_search_mode_switch_and_precision_contract() {
+    let (db_path, _db_guard) = seed_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-search-mode-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+
+    const PRECISION_CLAUSE_SQL: &str =
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3 USING MODE 'precision'";
+    const UNKNOWN_MODE_SQL: &str =
+        "SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3 USING MODE 'fuzzy'";
+    let expected_top1_only = vec!["1".to_string()];
+
+    for (user, pw) in [
+        ("alice", "pw-alice"),
+        ("bob", "pw-bob"),
+        ("carol", "pw-carol"),
+    ] {
+        // M2: クエリ句 precision（明確な勝者 → Top-1 のみ）。
+        assert_eq!(
+            run_psql_session(port, user, pw, &[], PRECISION_CLAUSE_SQL),
+            expected_top1_only,
+            "psql: USING MODE 'precision' must return only id=1 for user {user}"
+        );
+        assert_eq!(
+            run_psycopg_session(port, user, pw, &[], PRECISION_CLAUSE_SQL),
+            expected_top1_only,
+            "psycopg: USING MODE 'precision' must return only id=1 for user {user}"
+        );
+        assert_eq!(
+            run_pg_session(port, user, pw, &[], PRECISION_CLAUSE_SQL),
+            expected_top1_only,
+            "pg: USING MODE 'precision' must return only id=1 for user {user}"
+        );
+
+        // M5: SET search_mode='precision' → 句なし SELECT が Top-1 のみ返る
+        // （セッション複数文の同一接続内適用。`WIRE_SQL_PRELUDE`／複数 `-c` 経由）。
+        let prelude = ["SET search_mode = 'precision'"];
+        assert_eq!(
+            run_psql_session(port, user, pw, &prelude, C1_SQL),
+            expected_top1_only,
+            "psql: SET search_mode='precision' must apply to the subsequent SELECT for user {user}"
+        );
+        assert_eq!(
+            run_psycopg_session(port, user, pw, &prelude, C1_SQL),
+            expected_top1_only,
+            "psycopg: SET search_mode='precision' must apply to the subsequent SELECT for user {user}"
+        );
+        assert_eq!(
+            run_pg_session(port, user, pw, &prelude, C1_SQL),
+            expected_top1_only,
+            "pg: SET search_mode='precision' must apply to the subsequent SELECT for user {user}"
+        );
+
+        // R1: クエリ句の未知モード値は 22000 で拒否される。
+        run_psql_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
+        run_psycopg_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
+        run_pg_session_expect_sqlstate(port, user, pw, &[], UNKNOWN_MODE_SQL, "22000");
+    }
+
+    drop(server);
+    let _ = std::io::stdout().flush();
+}
+
+/// TASK-168（SQL-13／SQL-14）: 集計クエリ（単一行の `COUNT`/`SUM`/`AVG`/`MIN`/
+/// `MAX`・`GROUP BY`/`HAVING`）と RLS 不変性の代表ケースを無改造クライアント
+/// 経由で確認する。閾値・拒否形状そのものの回帰保護は層 A
+/// （`tests/wire_aggregate.rs`、常時 `make ci`）が担う。
+///
+/// すべての SELECT に一意の `AS` 別名を付け、NULL を返す SQL は使わない
+/// （Node `pg` は `Object.values(row)` で行を出力するため同名列が潰れ、NULL の
+/// 描画も psql（空文字）／pg（`Array.join` で空文字）／psycopg（`str(None)`=
+/// "None"）で異なる。NULL 契約の検証は層 A に閉じる）。
+#[test]
+#[ignore = "requires psql, python3+psycopg, node+pg; run via `make e2e-three-client`"]
+fn three_clients_verify_aggregate_queries_and_rls_invariance() {
+    let (db_path, _db_guard) = seed_aggregate_three_tenant_db();
+    let users_dir = temp_db::TempDir::new("three-client-e2e-aggregate-users");
+    let users_path = users_dir.path().join("users.txt");
+    write_users_file(&users_path);
+
+    let server = spawn_wire_server(&users_path, &db_path);
+    let port = server.port;
+
+    // 独立オラクル（可視行は id=1/2/3 の Public 3 行のみ。Private 行
+    // （lang="xx"）は wire 認証経路では不可視。`seed_aggregate_three_tenant_db`
+    // のドキュメンテーションコメント参照）。
+    const AGG1_SQL: &str = "SELECT COUNT(*) AS n, SUM(id) AS s, AVG(id) AS a, MIN(lang) AS l_min, MAX(lang) AS l_max FROM docs";
+    let expected_agg1 = vec!["3|6|2|en|ja".to_string()];
+
+    const AGG2_SQL: &str = "SELECT COUNT(*) AS n FROM docs WHERE lang = 'ja'";
+    let expected_agg2 = vec!["2".to_string()];
+
+    const AGG3_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY n DESC";
+    let expected_agg3 = vec!["ja|2".to_string(), "en|1".to_string()];
+
+    const AGG4_SQL: &str = "SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n >= 2";
+    let expected_agg4 = vec!["ja|2".to_string()];
+
+    for (user, pw) in [
+        ("alice", "pw-alice"),
+        ("bob", "pw-bob"),
+        ("carol", "pw-carol"),
+    ] {
+        for (label, sql, expected) in [
+            ("AGG1", AGG1_SQL, &expected_agg1),
+            ("AGG2", AGG2_SQL, &expected_agg2),
+            ("AGG3", AGG3_SQL, &expected_agg3),
+            ("AGG4", AGG4_SQL, &expected_agg4),
+        ] {
+            let psql_rows = run_psql(port, user, pw, sql);
+            assert_eq!(
+                &psql_rows, expected,
+                "psql: unexpected {label} result for user {user} (must not reveal the \
+                 Private-only \"xx\" group of another tenant)"
+            );
+
+            let psycopg_rows = run_psycopg(port, user, pw, sql);
+            assert_eq!(
+                &psycopg_rows, expected,
+                "psycopg: unexpected {label} result for user {user}"
+            );
+
+            let pg_rows = run_pg(port, user, pw, sql);
+            assert_eq!(
+                &pg_rows, expected,
+                "pg: unexpected {label} result for user {user}"
+            );
+        }
+
+        // 拒否経路: 型不整合（VECTOR 列への SUM）・許可形状外
+        // （集計と裸の列の混在）はいずれも接続を破棄せず拒否される。
+        const REJECT_TYPE_MISMATCH_SQL: &str = "SELECT SUM(embedding) FROM docs";
+        run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+        run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+        run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_TYPE_MISMATCH_SQL, "22000");
+
+        const REJECT_MIXED_SHAPE_SQL: &str = "SELECT COUNT(*), lang FROM docs";
+        run_psql_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+        run_psycopg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+        run_pg_session_expect_sqlstate(port, user, pw, &[], REJECT_MIXED_SHAPE_SQL, "42601");
+    }
 
     drop(server);
     let _ = std::io::stdout().flush();

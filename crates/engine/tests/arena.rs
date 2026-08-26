@@ -81,7 +81,15 @@ fn table8_build_produces_arena_matching_inserted_rows() {
     // テナント境界付きバッチ API 経由（生の `Storage::insert_rows_into_table` は
     // codex-review P0 指摘・PR #194 対応で `pub(crate)` 化した）。
     let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
-    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows).expect("seed rows");
+    engine::tenant::insert_rows(
+        &storage,
+        "docs",
+        &ctx,
+        &rows,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("seed rows");
 
     let arena = VectorArena::build(&storage, "docs").expect("build arena via public API");
     assert_eq!(arena.table_name(), "docs");
@@ -132,6 +140,8 @@ fn table8_build_scopes_arena_to_the_requested_table_only() {
             embedding: &[1.0, 2.0, 3.0, 4.0],
             metadata: b"table=docs_a",
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed docs_a row");
     engine::tenant::insert_row(
@@ -145,6 +155,8 @@ fn table8_build_scopes_arena_to_the_requested_table_only() {
             embedding: &[9.0, 9.0, 9.0, 9.0],
             metadata: b"table=docs_b",
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed docs_b row");
 
@@ -185,6 +197,8 @@ fn table8_insert_rejects_dimension_mismatch_and_build_only_sees_valid_rows() {
             embedding: &[1.0, 2.0, 3.0, 4.0],
             metadata: b"m",
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed matching-dim row");
 
@@ -204,6 +218,8 @@ fn table8_insert_rejects_dimension_mismatch_and_build_only_sees_valid_rows() {
             embedding: &[1.0, 2.0],
             metadata: b"m",
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect_err("dimension-mismatched insert must be rejected by the public API");
     assert!(matches!(

@@ -9,9 +9,12 @@
 //!
 //! 書き込み系 SQL 文（`INSERT`）は `EngineCore::execute_insert_sql`（TASK-80、
 //! 対象ビヘイビア: SQL-10）が別エントリポイントとして扱う。文末専用句
-//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）の省略は、書き込み
-//! トランザクションを開始する前に構造検証段階で fail-closed に拒否する
-//! （RECOVER-1 の必須化ガードの前段）。
+//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）は本モジュールが構造
+//! パース（省略・明示 `NULL` はいずれも `None`）のみを行い、必須化の判断
+//! （省略を書き込みトランザクション開始前に `23502` で拒否するか否か）は
+//! サーバー構成 [`crate::recovery::required_op_id::LedgerMode`] へ移した
+//! （TASK-92・RECOVER-1。`allowlist::validate_insert` が `LedgerMode::require` へ
+//! 委譲する）。
 //!
 //! 本モジュール配下は wire プロトコル入力と同じ untrusted 入力の扱い
 //! （`.claude/rules/coding-rust.md`）に従う。
@@ -27,6 +30,21 @@
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
+//! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
+//!   実行（TASK-166・SQL-13）。`GROUP BY` ありの複数行実行は [`group_by`] へ委譲する
+//! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
+//!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
+//!   `ORDER BY`・`LIMIT` を担う
+//!
+//! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
+//! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
+//! 意味論束縛は [`parser::bind_aggregate`]、実行は [`aggregate::execute_aggregate`]
+//! が担う。RLS 適用順序（デコード前のヘッダ判定 → 可視行のみ完全デコード）は
+//! 既存の検索 SELECT 実行経路（[`crate::arena`]）と同一の規約に揃え、`COUNT` 等の
+//! 集計値から他テナント行の存在・件数を推測できないことを維持する（RLS-7・
+//! RLS-8）。オーバーフロー（`u64`/`f64`）は `SqlSurfaceError::NumericOutOfRange`
+//! （ERR-2 が新設する `22003`）で fail-closed に拒否する。`GROUP BY`／`HAVING` は
+//! 引き続き許可リスト外（`42601`）。
 //!
 //! TASK-161（対象ビヘイビア: SQL-12）: クエリ単位の専用句 `USING MODE '<literal>'`
 //! （[`allowlist`]）とセッション変数 `SET search_mode = '<literal>'`（同）を追加し、
@@ -39,9 +57,21 @@
 //! 許可形状を追加した。実行は [`exec::execute_insert`] が担い、行の書き込みは
 //! `tenant.rs` のガード付き API（`tenant::insert_typed_row`）経由に統一する
 //! （TABLE-12・RLS-9）。
+//!
+//! TASK-147（対象ビヘイビア: EXT-3）: `WHERE` 句に前方一致条件
+//! `<col> LIKE '<prefix>%'` を追加した（[`allowlist`] が構造を、
+//! `crate::declarative_filter` が意味論を検証する。`LIKE` は末尾ちょうど 1 つの
+//! `%` のみを許可し、`NOT LIKE`・`ILIKE`・中間 `%`・`_`・エスケープは拒否する）。
+//! 既存の等価条件 `<col> = '<literal>'`（SQL-2）と合わせ、両者は
+//! `crate::declarative_filter::MetadataFilter`（汎用 API。任意の `TEXT` 列に
+//! 対する宣言的フィルタ）として一本化した（**BREAKING CHANGE**: 旧
+//! `sql::parser::ScalarEq`・`BoundStatement::scalar_filters` を置換。詳細は
+//! `declarative_filter.rs`・`sql/parser.rs` モジュールドキュメント参照）。
 
+pub mod aggregate;
 pub mod allowlist;
 pub mod exec;
+pub mod group_by;
 pub mod lexer;
 pub mod mode;
 pub mod parser;

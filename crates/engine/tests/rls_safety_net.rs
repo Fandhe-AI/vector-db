@@ -325,6 +325,8 @@ fn execute_sql_hint_order_rls_last_matches_default_order() {
             id,
             Visibility::Public,
             &[engine::row_codec::Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }

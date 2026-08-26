@@ -53,6 +53,7 @@ use crate::catalog::CatalogError;
 use crate::dispatch::{self, DispatchError, DispatchInput, ExecutionPath};
 use crate::kernel::{CandidateHit, KernelError, SearchHit, SearchInput, SearchProvider};
 use crate::policy::{PolicyContext, PolicyError};
+use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::rls::{ImplicitRlsHook, PrefilterSnapshot, RlsError};
 use crate::search_engine;
 use crate::storage::{Row, Storage, StorageError};
@@ -691,6 +692,11 @@ pub struct EngineCore {
     /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定（TASK-120）。
     /// 差し替えは [`Self::with_incremental_config`] のみ。
     incremental_config: crate::incremental::IncrementalConfig,
+    /// `operation_id` 必須化ガード（TASK-92・対象ビヘイビア: RECOVER-1）を制御する
+    /// サーバー側構成。クエリ・セッション変数から到達できる経路を持たない（差し替えは
+    /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
+    /// ドキュメント参照）。
+    ledger_mode: LedgerMode,
 }
 
 impl EngineCore {
@@ -713,6 +719,7 @@ impl EngineCore {
             precision_policy: crate::precision::PrecisionPolicy::default(),
             embedder: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
+            ledger_mode: LedgerMode::default(),
         })
     }
 
@@ -735,6 +742,7 @@ impl EngineCore {
             precision_policy: crate::precision::PrecisionPolicy::default(),
             embedder: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
+            ledger_mode: LedgerMode::default(),
         }
     }
 
@@ -772,6 +780,16 @@ impl EngineCore {
         config: crate::incremental::IncrementalConfig,
     ) -> Self {
         self.incremental_config = config;
+        self
+    }
+
+    /// `operation_id` 必須化ガード（TASK-92・対象ビヘイビア: RECOVER-1）を制御する
+    /// [`LedgerMode`] を差し替えたビルダーを返す（[`Self::with_precision_policy`] と
+    /// 同型: 所有権を消費するビルダーメソッドとし、`&mut self` セッターは公開しない）。
+    /// `SessionState`・SQL 構文からはこの値へ到達できない（`crate::recovery::
+    /// required_op_id` モジュールドキュメント参照）。
+    pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
+        self.ledger_mode = mode;
         self
     }
 
@@ -846,6 +864,25 @@ impl EngineCore {
                     }
                 }
             }
+            // TASK-166（SQL-13）: 集計 SELECT は UDF 呼び出しをその引数に含みうる
+            // ため（セッション UDF レジストリ参照）、`Select` と同じくセッションを
+            // 要する実行本体（`execute_sql_in_session`）へ委譲する。UDF を持たない
+            // 空セッションで束縛するため、セッションに定義済みの UDF を参照する
+            // 集計は（`Select` と同様）このセッションなしエントリポイントでは
+            // 使えない（`22000`。「未知の関数」として拒否される）。
+            crate::sql::allowlist::Statement::Aggregate(_) => {
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. } => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -915,6 +952,36 @@ impl EngineCore {
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
+            // TASK-166（SQL-13）: 集計 SELECT はスキーマ取得（`bind_aggregate` 用）・
+            // 行走査（`sql::aggregate::execute_aggregate`）を、既存の検索 SELECT
+            // （`Statement::Select` アーム）と同じく単一の `read_txn`（同一
+            // スナップショット）上で行う（Issue #56 レビュー指摘対応の踏襲。上記
+            // `Statement::Select` アームのドキュメント参照）。
+            crate::sql::allowlist::Statement::Aggregate(validated) => {
+                let read_txn = self.storage.db().begin_read().map_err(|e| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!(
+                            "failed to begin read transaction: {}",
+                            StorageError::from(e)
+                        ),
+                    }
+                })?;
+                let schema =
+                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to load table schema: {other}"),
+                            },
+                        })?;
+                let bound =
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                let result =
+                    crate::sql::aggregate::execute_aggregate(&read_txn, ctx, &schema, &bound)?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
         }
     }
 
@@ -924,37 +991,49 @@ impl EngineCore {
     /// へは昇格しない固有メソッド（`execute_sql` と同じ理由。`core-api-check` の対象外。
     /// wire 層が DML を行う際の入口はこのメソッド経由を想定し、SQL `INSERT` 表層
     /// （TASK-80/81/120）はこの経路の上に載せる前提）。
+    ///
+    /// TASK-92（対象ビヘイビア: RECOVER-1）: `crate::tenant::insert_row` へ委譲する前に
+    /// `self.ledger_mode.require(operation_id)` を通す（詳細は
+    /// `recovery::required_op_id` モジュールドキュメント参照）。
     pub fn insert_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
         row: &crate::storage::RowInput<'_>,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::insert_row(&self.storage, table, ctx, id, row)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
-    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲のみ。
+    /// [`Self::insert_row`] と同じく `crate::tenant::update_row` への薄い委譲だが、
+    /// 委譲前に同じ `operation_id` 必須化ガードを通す（TASK-92・RECOVER-1）。
     pub fn update_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
         row: &crate::storage::RowInput<'_>,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::update_row(&self.storage, table, ctx, id, row)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row)
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
-    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲のみ。
+    /// [`Self::insert_row`] と同じく `crate::tenant::delete_row` への薄い委譲だが、
+    /// 委譲前に同じ `operation_id` 必須化ガードを通す（TASK-92・RECOVER-1）。
     pub fn delete_row(
         &self,
         ctx: &PolicyContext,
         table: &str,
         id: u64,
+        operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        crate::tenant::delete_row(&self.storage, table, ctx, id)
+        self.ledger_mode.require(operation_id)?;
+        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id)
     }
 
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
@@ -1049,16 +1128,18 @@ impl EngineCore {
     /// `execute_sql` と同じ理由）。
     ///
     /// `sql::allowlist::validate_insert`（構造検証。文末専用句
-    /// `USING OPERATION_ID '<id>'` の省略はこの段階で `23502` として拒否され、
-    /// 書き込みトランザクションは一切開始されない）→ `Storage::get_table_schema`
-    /// （スキーマ取得）→ `sql::parser::bind_insert`（意味論検証・束縛）→
-    /// `sql::exec::execute_insert`（単一 write トランザクションでの実行）の順に呼ぶ。
+    /// `USING OPERATION_ID '<id>'` の省略（明示 `NULL` を含む）は、`self.ledger_mode`
+    /// が `LedgerMode::Ledgered`（既定）である限りこの段階で `23502` として拒否され、
+    /// 書き込みトランザクションは一切開始されない。TASK-92・対象ビヘイビア:
+    /// RECOVER-1）→ `Storage::get_table_schema`（スキーマ取得）→
+    /// `sql::parser::bind_insert`（意味論検証・束縛）→ `sql::exec::execute_insert`
+    /// （単一 write トランザクションでの実行）の順に呼ぶ。
     pub fn execute_insert_sql(
         &self,
         ctx: &PolicyContext,
         sql: &str,
     ) -> Result<crate::sql::exec::InsertOutcome, crate::sql::allowlist::SqlSurfaceError> {
-        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage)?;
+        let stmt = crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
         let schema = self
             .storage
             .get_table_schema(&stmt.table_name)
@@ -1333,12 +1414,13 @@ mod tests {
             embedding: &[0.0, 1.0],
             metadata: &[],
         };
+        let op_id = OperationId::parse("op-update-delete-not-found").expect("valid operation_id");
         assert!(matches!(
-            core.update_row(&attacker, "docs", 1, &update_input),
+            core.update_row(&attacker, "docs", 1, &update_input, Some(&op_id)),
             Err(crate::tenant::TenantWriteError::NotFound)
         ));
         assert!(matches!(
-            core.delete_row(&attacker, "docs", 1),
+            core.delete_row(&attacker, "docs", 1, Some(&op_id)),
             Err(crate::tenant::TenantWriteError::NotFound)
         ));
 
@@ -1487,6 +1569,92 @@ mod tests {
         let stats = core.prefilter_cache_stats();
         assert!(stats.stale_evictions >= 1);
         assert_eq!(stats.misses, 2);
+    }
+
+    // Issue #179: `drop_table` → 同名・同次元での再作成をまたぐと、drop 前に充填した
+    // `PrefilterCache` エントリは世代不一致で破棄され、再作成後は新規行のみを返す
+    // （旧行が混入する経路がないことの確認）。
+    #[test]
+    fn search_cache_is_invalidated_by_drop_table_and_recreate() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let first = core
+            .search(&ctx, "docs", &[1.0, 0.0], 10)
+            .expect("first search ok");
+        assert_eq!(first.len(), 1);
+
+        core.storage.drop_table("docs").expect("drop table");
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("recreate table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row after recreate");
+
+        let second = core
+            .search(&ctx, "docs", &[1.0, 0.0], 10)
+            .expect("second search ok after drop and recreate");
+        let ids: Vec<u64> = second.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![2]);
+
+        let stats = core.prefilter_cache_stats();
+        assert!(stats.stale_evictions >= 1);
+        assert_eq!(stats.misses, 2);
+    }
+
+    // Issue #179: drop 後に再作成しないテーブルへの検索は、既存の
+    // 「存在情報を漏らさない」契約どおり `CoreError::NotFound` に丸め込まれる。
+    #[test]
+    fn search_returns_not_found_after_drop_without_recreate() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        core.storage.drop_table("docs").expect("drop table");
+
+        let result = core.search(&ctx, "docs", &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(CoreError::NotFound)));
     }
 
     // 対象ビヘイビア: RLS-1（TASK-169）。異なる `PolicyContext`（別テナント）は別の

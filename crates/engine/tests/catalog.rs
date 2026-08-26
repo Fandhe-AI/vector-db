@@ -13,8 +13,9 @@ use engine::storage::{RowInput, Storage, Visibility};
 
 /// `storage.rs::ROWS_TABLE` と同一のテーブル定義（`pub(crate)` のため本クレート外の
 /// ここでは参照できず、`tests/persistence.rs` と同じ流儀でローカルに再宣言する）。
+/// 物理キーは `(tenant_id, id)` の複合キー（対象ビヘイビア: TABLE-12）。
 /// 行データの生バイト列を検証するテスト（TABLE-4/TABLE-5）でのみ使う。
-const ROWS_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rows");
+const ROWS_TABLE: redb::TableDefinition<(&str, u64), &[u8]> = redb::TableDefinition::new("rows");
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -139,7 +140,7 @@ fn seed_rows(storage: &Storage, count: u64) {
 /// `Storage::scan()` はエンコード後の値をデコードして返すため、デコード→再エンコードが
 /// 恒等写像でない将来の変更を見逃し得る。TABLE-4/TABLE-5 の検証は、この生バイト列
 /// 比較でのみ厳密に行える。
-fn read_raw_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>)> {
+fn read_raw_rows(path: &std::path::Path) -> Vec<((String, u64), Vec<u8>)> {
     let db = redb::Database::open(path).expect("reopen raw database for row inspection");
     let read_txn = db.begin_read().expect("begin_read");
     let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
@@ -148,7 +149,8 @@ fn read_raw_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>)> {
         .expect("iterate rows table")
         .map(|entry| {
             let (k, v) = entry.expect("row entry");
-            (k.value(), v.value().to_vec())
+            let (tenant_id, id) = k.value();
+            ((tenant_id.to_string(), id), v.value().to_vec())
         })
         .collect()
 }
@@ -515,4 +517,107 @@ fn table6_decode_rejects_hand_crafted_invalid_catalog_bytes() {
             "case {label}: expected Err(CorruptSchema), got {result:?}"
         );
     }
+}
+
+// --- drop_table（Issue #179。PR #151 レビュー据え置き事項の公開 API 契約） -------
+
+#[test]
+fn drop_table_rejects_missing_table_name() {
+    let path = unique_db_path("drop-table-missing");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let result = storage.drop_table("does_not_exist");
+    assert!(
+        matches!(result, Err(CatalogError::TableNotFound(_))),
+        "got {result:?}"
+    );
+}
+
+#[test]
+fn drop_table_rejects_invalid_identifier() {
+    let path = unique_db_path("drop-table-invalid-identifier");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    assert!(matches!(
+        storage.drop_table("bad name"),
+        Err(CatalogError::Invalid(_))
+    ));
+    assert!(matches!(
+        storage.drop_table(""),
+        Err(CatalogError::Invalid(_))
+    ));
+}
+
+// テーブルを drop してから同名・別次元で再作成すると、旧行テーブル（`user_rows/{table}`）
+// が残留せず、新しい次元の行だけが挿入・走査できる（TABLE-4/TABLE-6・EXT-2 の
+// 次元固定の不変条件が drop・再作成をまたいでも守られることの確認）。
+#[test]
+fn drop_table_then_recreate_with_different_dim_has_no_leftover_rows() {
+    let path = unique_db_path("drop-table-recreate-different-dim");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+
+    let ctx = engine::policy::PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = engine::recovery::required_op_id::OperationId::parse("drop-table-test")
+        .expect("valid operation_id");
+
+    storage
+        .create_table(&embedding_schema("docs", 4))
+        .expect("create_table");
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        &row(&[1.0, 0.0, 0.0, 0.0], b"old"),
+        &op_id,
+    )
+    .expect("insert row before drop");
+
+    storage.drop_table("docs").expect("drop_table");
+
+    // 再作成前はカタログにも存在しない。
+    assert!(matches!(
+        storage.get_table_schema("docs"),
+        Err(CatalogError::TableNotFound(_))
+    ));
+
+    let new_schema = embedding_schema("docs", 8);
+    storage
+        .create_table(&new_schema)
+        .expect("recreate with different dim");
+
+    // 旧次元（4）の埋め込みはもう受理されない（新スキーマが優先される）。
+    assert!(engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        2,
+        &row(&[1.0, 0.0, 0.0, 0.0], b"stale-dim"),
+        &op_id
+    )
+    .is_err());
+
+    engine::tenant::insert_row(
+        &storage,
+        "docs",
+        &ctx,
+        3,
+        &row(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], b"new"),
+        &op_id,
+    )
+    .expect("insert row with new dim");
+
+    let (rows, cursor) = storage
+        .scan_table_page("docs", None, 100)
+        .expect("scan_table_page after recreate");
+    assert!(cursor.is_none());
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the row inserted after recreate must be present (no leftover from before drop)"
+    );
+    assert_eq!(rows[0].id, 3);
 }

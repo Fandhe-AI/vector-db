@@ -78,6 +78,14 @@
 //! TASK-137（対象ビヘイビア: RLS-6, RLS-7）: `rls.rs::ImplicitRlsHook` が候補集合構築へ
 //! 可視性フィルタを適用する単一注入点（詳細は `rls.rs` モジュールドキュメント参照）。
 //!
+//! TASK-138（対象ビヘイビア: RLS-8）: TASK-137 の暗黙適用契約が MVP クエリカタログ
+//! （C1〜C4）以外の全読み取り経路（複数の任意スキーマテーブル・任意形状 SELECT・
+//! 宣言的 UDF・`VectorCore::search`／`get_row`・`tenant::visible_rows`）へも
+//! 一般化されて働くことを `tests/rls_generalized.rs` で機械検証する（経路インベントリ
+//! ・検証マトリクスは `docs/design/rls-generalized-read-paths.md` 参照）。
+//! `USING PLAN` 展開後クエリは TASK-77 未実装のため fail-closed な拒否のみを固定し、
+//! 展開後クエリの暗黙適用検証は TASK-77/TASK-117 の管轄とする。
+//!
 //! TASK-95（対象ビヘイビア: RECOVER-4）: `tenant.rs` にテナント境界付き書き込みガード
 //! （`insert_row`/`update_row`/`delete_row`）を追加し、`policy.rs::PolicyContext::is_owner`
 //! の単一照合パスで書き込み認可を判定する（読み取りの可視性判定 `is_visible` とは独立）。
@@ -131,6 +139,31 @@
 //! 分岐の入口（詳細は `embedding.rs`・`incremental.rs`・`sql/parser.rs` モジュール
 //! ドキュメント参照）。一括投入上限（TASK-122、対象ビヘイビア: INDEX-4）・外部埋め込み
 //! サービス実クライアントの接続は後続タスクの管轄。
+//!
+//! TASK-147（対象ビヘイビア: EXT-3）: `declarative_filter.rs` が、メタデータ列
+//! （`TEXT` 列）に対する等価・前方一致フィルタを任意の列名へ宣言的に指定できる
+//! 汎用 API（`DeclarativeFilter`／`MetadataFilter`）を提供する。`sql::parser` の
+//! 旧 `ScalarEq`（等価専用・SQL-2 の実装例）はこの汎用 API へ統合済み
+//! （BREAKING CHANGE。詳細は `declarative_filter.rs`・`sql/parser.rs` モジュール
+//! ドキュメント参照）。
+//!
+//! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
+//! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
+//! モジュールドキュメント参照）。
+//!
+//! TASK-166（対象ビヘイビア: SQL-13）: `sql::aggregate` が集計関数（`COUNT`/`SUM`/
+//! `AVG`/`MIN`/`MAX`）のみを結果列とする `GROUP BY` なし単一行 SELECT を実行する。
+//! RLS 適用順序は既存の検索 SELECT 実行経路（`arena.rs`）と同一の規約（デコード前の
+//! ヘッダ判定 → 可視行のみ完全デコード）に揃え、集計値から他テナント行の存在・件数を
+//! 推測できないことを維持する（詳細は `sql.rs`・`sql/aggregate.rs` モジュール
+//! ドキュメント参照）。
+//!
+//! TASK-167（対象ビヘイビア: SQL-14）: `sql::group_by` が `GROUP BY <TEXT 列>` を
+//! 追加し、複数行の集計結果を返す（任意で `HAVING`・`ORDER BY`・`LIMIT` を伴う）。
+//! グループ数・グループキーの累計バイト数は上限で有界化し、超過は fail-closed に
+//! 拒否する。RLS 適用順序は TASK-166 の単一行経路と同一の規約を独立して踏襲し、
+//! 他テナントにしか存在しないグループ値が結果に現れないことを維持する（詳細は
+//! `sql/group_by.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -139,6 +172,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod chunking;
 pub mod core;
+pub mod declarative_filter;
 pub mod dispatch;
 pub mod embedding;
 pub mod hybrid;
@@ -148,6 +182,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
@@ -157,6 +192,7 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+pub mod wasm_udf;
 
 /// テスト専用の共通ヘルパ群（Issue #173）。`#[cfg(test)]` 限定・非公開のため
 /// `pub mod` を含まず `scripts/check_core_api.sh` の到達性スナップショットに影響しない。

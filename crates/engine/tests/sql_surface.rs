@@ -78,6 +78,8 @@ fn sql1_pure_topk_matches_independent_exact_oracle() {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text("x".to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -171,6 +173,8 @@ fn sql2_where_equality_excludes_non_matching_rows_without_under_fetch() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -216,6 +220,8 @@ fn setup_multi_tenant_table(storage: &Storage) {
             id,
             visibility,
             &[Value::Vector(vec![1.0, 0.0])],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -315,6 +321,8 @@ fn sql4_hybrid_rrf_and_hybrid_syntax_forms_return_identical_topk() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), value],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -385,6 +393,8 @@ fn sql4_hybrid_degrades_to_dense_only_when_no_visible_body_text() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Null],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -459,6 +469,8 @@ fn sql4_hybrid_tie_group_across_limit_boundary_is_deterministic() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), value],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -560,6 +572,8 @@ fn select_star_projects_id_then_schema_column_order() {
             Value::Vector(vec![1.0, 0.0]),
             Value::Text("hello".to_string()),
         ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert row");
     let core = new_core(storage);
@@ -635,6 +649,8 @@ fn sql2_select_id_ignores_unprojected_large_text_column() {
                 Value::Text(lang.to_string()),
                 Value::Text(large_bio.clone()),
             ],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }

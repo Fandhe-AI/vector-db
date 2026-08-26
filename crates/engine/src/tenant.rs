@@ -1,6 +1,14 @@
 //! 行単位テナント境界の行ストア統合層（TASK-89・対象ビヘイビア: TABLE-9, TABLE-11。
 //! TASK-95・対象ビヘイビア: RECOVER-4 の書き込みガード API を追加）。
 //!
+//! ## `operation_id` 必須化ガードと公開 API の構造（TASK-92・対象ビヘイビア: RECOVER-1）
+//!
+//! `pub fn` の [`insert_row`]・[`insert_rows`]・[`insert_typed_row`]・[`update_row`]・
+//! [`delete_row`] は `operation_id: &OperationId` を必須引数として要求する
+//! （codex-review P1 指摘・PR #217 対応。詳細は `recovery::required_op_id`
+//! モジュールドキュメント参照）。ガード検証を持たない `pub(crate)` の
+//! `*_unchecked` 版はクレート外へ公開しない。
+//!
 //! `policy.rs::PolicyContext::is_visible` の単一照合パス（CORE-2）へすべての可視性
 //! 判定を委譲し、本モジュール独自のテナント比較は持たない（security.md P0）。
 //! 提供する API は大きく 2 系統:
@@ -31,6 +39,7 @@ use crate::catalog::{
 };
 use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
+use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::storage::{
     bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
     Storage, StorageError,
@@ -238,6 +247,16 @@ pub enum TenantWriteError {
     /// INSERT 先 id に既存行がある（所有者を問わず同一 variant。上書きによる他テナント
     /// 行の破壊を遮断しつつ、所有テナントの存在情報を漏らさない）。
     IdConflict,
+    /// `operation_id` の省略（句の欠落・明示 `NULL` を含む）。台帳あり構成
+    /// （`recovery::required_op_id::LedgerMode::Ledgered`、既定）では書き込み系操作に
+    /// `operation_id` の指定を必須とする（TASK-92・対象ビヘイビア: RECOVER-1）。
+    /// `crate::core::EngineCore::{insert_row, update_row, delete_row}` が
+    /// `crate::tenant::*_unchecked` へ委譲する**前**に `self.ledger_mode` でガードを
+    /// 適用し、本モジュールの `pub fn insert_row`/`insert_rows`/`insert_typed_row`/
+    /// `update_row`/`delete_row` は `operation_id` を必須引数として要求したうえで
+    /// `LedgerMode::Ledgered` で内部ガードするため、いずれの経路でも本 variant が
+    /// 実際に返る時点で書き込みトランザクションは未開始（ERR-2: `23502`）。
+    MissingOperationId,
     /// [`crate::catalog`] 側のエラー（テーブル不存在・行破損・redb バックエンドエラー等）。
     Catalog(CatalogError),
     /// [`crate::storage`] 側のエンコード/デコードエラー（`RowInput` の入力検証失敗等）。
@@ -254,6 +273,7 @@ impl TenantWriteError {
             TenantWriteError::Forbidden => "42501",
             TenantWriteError::NotFound => "P0002",
             TenantWriteError::IdConflict => "23505",
+            TenantWriteError::MissingOperationId => "23502",
             TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
         }
     }
@@ -267,6 +287,7 @@ impl std::fmt::Display for TenantWriteError {
             }
             TenantWriteError::NotFound => write!(f, "tenant write target row not found"),
             TenantWriteError::IdConflict => write!(f, "tenant write id conflict"),
+            TenantWriteError::MissingOperationId => write!(f, "missing operation_id"),
             // `CatalogError`/`StorageError` の `Display` をそのまま展開しない（`TenantError`
             // と同じ理由。security.md テナント境界 P0）。
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
@@ -284,6 +305,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
+            TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
         }
@@ -310,6 +332,43 @@ impl From<StorageError> for TenantWriteError {
     }
 }
 
+/// 行ストア（`user_rows/{table_name}`）への一意挿入ヘルパ（TABLE-12・TASK-130・
+/// PR #194 の申し送り対応）。[`insert_row_unchecked`]・[`insert_rows_unchecked`]・
+/// [`insert_typed_row_unchecked`] が共有する唯一の実装。
+///
+/// 旧来は `get` で存在確認してから `insert` する 2 回の B-tree 探索だったが、
+/// `redb::Table::insert` が上書き前の旧値を `Option<AccessGuard>` として返す性質を
+/// 使い、`insert` 一回の走査結果だけで存在判定する（`get` を省略）。返る旧値は
+/// 中身を読まず即座に破棄する（存在の有無だけが関心事）。
+///
+/// # 呼び出し元が守るべき前提（Err 時は commit しない）
+///
+/// `Some` を返した時点で該当キーには **新しい値がすでに書き込まれている**（redb の
+/// `insert` は探索と書き込みを同一パスで行うため、後から取り消す API はない）。
+/// この上書きを外部から観測させないのは、本関数の `Err` を受け取った呼び出し元が
+/// 属する write トランザクションを **commit せずに drop（abort）する**という契約に
+/// よる（`redb::WriteTransaction` の drop 契約。[`insert_row_unchecked`] 等はいずれも
+/// 自身が `begin_write` した txn をこの関数の外側でだけ commit するため、この契約を
+/// 満たす）。将来の呼び出し元を追加する場合もこの前提を破らないこと。
+///
+/// キーは呼び出し元がサーバー側導出テナント（`ctx.tenant_id()`）で組み立てる
+/// （本関数はキー生成に関与しない）。他テナントの行キーへ触れる経路を持たないため、
+/// 他テナント行の有無で分岐する処理は本関数にも存在しない（RLS-9・fail-closed）。
+fn insert_unique_row(
+    row_table: &mut redb::Table<'_, (&'static str, u64), &'static [u8]>,
+    key: (&str, u64),
+    encoded: &[u8],
+) -> Result<(), TenantWriteError> {
+    if row_table
+        .insert(key, encoded)
+        .map_err(CatalogError::from)?
+        .is_some()
+    {
+        return Err(TenantWriteError::IdConflict);
+    }
+    Ok(())
+}
+
 /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
 ///
 /// `row.tenant_id` が `ctx` のテナントと不一致なら
@@ -329,7 +388,29 @@ impl From<StorageError> for TenantWriteError {
 /// 行い、失敗時は commit せずトランザクションを破棄する（`redb::WriteTransaction` の
 /// drop 契約により abort。判定と書き込みの間に TOCTOU を作らない。redb は単一
 /// ライタで書き込みを直列化する）。
+///
+/// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
+/// から [`insert_row_unchecked`] へ委譲する（TASK-92・対象ビヘイビア: RECOVER-1・
+/// codex-review P1 指摘・PR #217）。本関数はモジュール冒頭ドキュメントの「公開 API」
+/// 層であり、`operation_id` を省略できる経路を型で塞ぐ。
 pub fn insert_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    row: &RowInput<'_>,
+    operation_id: &OperationId,
+) -> Result<(), TenantWriteError> {
+    LedgerMode::Ledgered.require(Some(operation_id))?;
+    insert_row_unchecked(storage, table, ctx, id, row)
+}
+
+/// [`insert_row`] のガードなし実体（`pub(crate)`。TASK-92・RECOVER-1）。
+/// `operation_id` 必須化ガードを持たないため、クレート外から直接呼べない
+/// （`pub(crate)` によりガードを迂回できる経路を閉じる）。呼び出し元は
+/// [`insert_row`]（本モジュール内でガード済み）と
+/// `crate::core::EngineCore::insert_row`（`self.ledger_mode` でガード済み）の 2 か所。
+pub(crate) fn insert_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -352,13 +433,8 @@ pub fn insert_row(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
-        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-            return Err(TenantWriteError::IdConflict);
-        }
         let encoded = encode_row(row)?;
-        row_table
-            .insert(key, encoded.as_slice())
-            .map_err(CatalogError::from)?;
+        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
@@ -371,6 +447,10 @@ pub fn insert_row(
 /// トランザクションで処理する（1 件でも拒否されれば commit せず全体が未反映になる。
 /// `redb::WriteTransaction` の drop 契約）。
 ///
+/// 存在確認は行ごとに `get` → `insert` の 2 回 B-tree 探索する旧実装ではなく、
+/// [`insert_unique_row`]（`insert` の戻り値で既存行の有無を判定）を使い 1 回に
+/// 削減している（TASK-130・PR #194 の申し送り対応）。
+///
 /// - `row.tenant_id` が `ctx` と不一致な行が 1 件でもあれば [`TenantWriteError::Forbidden`]
 ///   （ストレージへ触れる前に全件を検査する）
 /// - 物理キーは `(ctx.tenant_id(), id)`（TABLE-12）。既存行との衝突、および
@@ -382,7 +462,25 @@ pub fn insert_row(
 /// 空バッチはテーブル存在確認のみを行い、世代を進めずに成功する
 /// （`catalog.rs::Storage::insert_rows_into_table` と同じ扱い。無変更コミットで
 /// 既存インデックスを不要に失効させない）。
+///
+/// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
+/// から [`insert_rows_unchecked`] へ委譲する（[`insert_row`] と同じ設計。TASK-92・
+/// RECOVER-1・codex-review P1 指摘・PR #217。バッチ経路にガード付き公開入口が
+/// 存在しなかった点も本対応で塞ぐ）。
 pub fn insert_rows(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    rows: &[(u64, RowInput<'_>)],
+    operation_id: &OperationId,
+) -> Result<(), TenantWriteError> {
+    LedgerMode::Ledgered.require(Some(operation_id))?;
+    insert_rows_unchecked(storage, table, ctx, rows)
+}
+
+/// [`insert_rows`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
+/// 設計。呼び出し元は本モジュール内の [`insert_rows`] のみ）。
+pub(crate) fn insert_rows_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -423,13 +521,8 @@ pub fn insert_rows(
         for (id, row) in rows {
             schema.validate_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
-            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-                return Err(TenantWriteError::IdConflict);
-            }
             let encoded = encode_row(row)?;
-            row_table
-                .insert(key, encoded.as_slice())
-                .map_err(CatalogError::from)?;
+            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
     }
     bump_generation_and_commit(write_txn)?;
@@ -442,7 +535,30 @@ pub fn insert_rows(
 /// 行の `tenant_id` は**引数で受け取らず** `ctx`（サーバー側導出テナント。WIRE-2・
 /// RLS-6）から導出する（クライアント自己申告のテナントを書き込みへ持ち込む経路を
 /// 作らない。security.md P0）。重複検出・物理キーの扱いは [`insert_row`] と同一。
+///
+/// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
+/// から [`insert_typed_row_unchecked`] へ委譲する（[`insert_row`] と同じ設計。
+/// TASK-92・RECOVER-1・codex-review P1 指摘・PR #217）。`crate::sql::exec::execute_insert`
+/// は `sql::allowlist::validate_insert` が既にガード済みであることを前提に
+/// [`insert_typed_row_unchecked`] を直接呼ぶため、本関数を経由しない
+/// （`sql/exec.rs` のドキュメント参照）。
 pub fn insert_typed_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    visibility: crate::storage::Visibility,
+    values: &[crate::row_codec::Value],
+    operation_id: &OperationId,
+) -> Result<(), TenantWriteError> {
+    LedgerMode::Ledgered.require(Some(operation_id))?;
+    insert_typed_row_unchecked(storage, table, ctx, id, visibility, values)
+}
+
+/// [`insert_typed_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と
+/// 同じ設計）。呼び出し元は本モジュール内の [`insert_typed_row`] と
+/// `crate::sql::exec::execute_insert`（`allowlist::validate_insert` でガード済み）。
+pub(crate) fn insert_typed_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -485,13 +601,8 @@ pub fn insert_typed_row(
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
         let key = (ctx.tenant_id(), id);
-        if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
-            return Err(TenantWriteError::IdConflict);
-        }
         let encoded = encode_row(&row)?;
-        row_table
-            .insert(key, encoded.as_slice())
-            .map_err(CatalogError::from)?;
+        insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
@@ -507,7 +618,26 @@ pub fn insert_typed_row(
 ///
 /// スキーマ取得・次元検証・既存行の所有権判定・書き込みを単一の write トランザクション
 /// 内で行う（[`insert_row`] と同じ TOCTOU 対策）。
+///
+/// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
+/// から [`update_row_unchecked`] へ委譲する（[`insert_row`] と同じ設計。TASK-92・
+/// RECOVER-1・codex-review P1 指摘・PR #217）。
 pub fn update_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    row: &RowInput<'_>,
+    operation_id: &OperationId,
+) -> Result<(), TenantWriteError> {
+    LedgerMode::Ledgered.require(Some(operation_id))?;
+    update_row_unchecked(storage, table, ctx, id, row)
+}
+
+/// [`update_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
+/// 設計）。呼び出し元は本モジュール内の [`update_row`] と
+/// `crate::core::EngineCore::update_row`（`self.ledger_mode` でガード済み）。
+pub(crate) fn update_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -558,7 +688,25 @@ pub fn update_row(
 /// 対象行が不存在、または既存行の所有者が `ctx` と一致しない場合は
 /// **区別せず** [`TenantWriteError::NotFound`]（[`update_row`] と同じ契約。
 /// security.md P0）。
+///
+/// `operation_id` を必須引数として要求し、[`LedgerMode::Ledgered`] で内部ガードして
+/// から [`delete_row_unchecked`] へ委譲する（[`insert_row`] と同じ設計。TASK-92・
+/// RECOVER-1・codex-review P1 指摘・PR #217）。
 pub fn delete_row(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    id: u64,
+    operation_id: &OperationId,
+) -> Result<(), TenantWriteError> {
+    LedgerMode::Ledgered.require(Some(operation_id))?;
+    delete_row_unchecked(storage, table, ctx, id)
+}
+
+/// [`delete_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
+/// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
+/// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
+pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -929,9 +1077,11 @@ mod tests {
         let storage = Storage::open(&path).expect("open storage");
         storage.create_table(&schema("docs")).expect("create table");
 
-        // ガード付き経路（`insert_row`）で tenant-b 名義の行を正規に投入する。
+        // ガード付き経路（`insert_row_unchecked`。`operation_id` 必須化ガードは本テストの
+        // 対象外なので、ガードを内包する `pub fn insert_row` ではなくガードなし実体を
+        // 直接使う）で tenant-b 名義の行を正規に投入する。
         let owner = PolicyContext::new("tenant-b").expect("valid tenant");
-        insert_row(
+        insert_row_unchecked(
             &storage,
             "docs",
             &owner,
@@ -1159,5 +1309,86 @@ mod tests {
             err,
             TenantWriteError::Catalog(CatalogError::Invalid(_))
         ));
+    }
+
+    // 対象ビヘイビア: TABLE-12・TASK-130。[`insert_unique_row`] 導入（`get` を省き
+    // `insert` の戻り値で衝突判定）により、衝突行より前に処理される行が実際に write
+    // txn 内へ書き込まれても、txn が commit されなければ何も永続化されないことを固定
+    // する（PR #194 の「既存行と衝突するバッチは IdConflict・既存行は不変」契約の
+    // 単体テスト版。バッチ末尾で衝突するケースを対象に、先行行が残らないことを確認）。
+    #[test]
+    fn insert_rows_with_trailing_conflict_persists_nothing() {
+        let path = unique_db_path("trailing-conflict");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("test-op").expect("valid operation_id");
+
+        // id=3 を事前に投入しておき、バッチ末尾でこの id と衝突させる。
+        insert_row(
+            &storage,
+            "docs",
+            &a,
+            3,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[9.0, 9.0],
+                metadata: b"original",
+            },
+            &op_id,
+        )
+        .expect("seed id=3");
+
+        let batch = [
+            (
+                1u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: b"one",
+                },
+            ),
+            (
+                2u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: b"two",
+                },
+            ),
+            (
+                3u64,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 1.0],
+                    metadata: b"overwrite-attempt",
+                },
+            ),
+        ];
+        let err = insert_rows(&storage, "docs", &a, &batch, &op_id)
+            .expect_err("trailing id=3 conflicts with the seeded row");
+        assert!(matches!(err, TenantWriteError::IdConflict));
+
+        // id=1・2 は「衝突より前に処理された行」だが、txn が commit されていない
+        // ため一切書き込まれていない（all-or-nothing）。
+        assert!(
+            storage.get_row_from_table("docs", "tenant-a", 1).is_err(),
+            "id=1 must not have been persisted"
+        );
+        assert!(
+            storage.get_row_from_table("docs", "tenant-a", 2).is_err(),
+            "id=2 must not have been persisted"
+        );
+        // id=3 は元の内容のまま（insert-then-abort でも上書きは永続化されない）。
+        let row3 = storage
+            .get_row_from_table("docs", "tenant-a", 3)
+            .expect("id=3 must still exist with its original content");
+        assert_eq!(row3.metadata, b"original".to_vec());
     }
 }
