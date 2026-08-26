@@ -96,6 +96,24 @@ impl Embedder for FailingEmbedder {
     }
 }
 
+/// 非有限値（`NaN`）を含むベクトルを返すフェイク埋め込み実装（外部実装が壊れた応答を
+/// 返す場合に、永続化前へ fail-closed に倒れることの検証用）。
+struct NonFiniteEmbedder {
+    dim: u32,
+}
+impl Embedder for NonFiniteEmbedder {
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut v = vec![0.0f32; self.dim as usize];
+        if let Some(slot) = v.get_mut(0) {
+            *slot = f32::NAN;
+        }
+        Ok(vec![v; texts.len()])
+    }
+}
+
 // --- INDEX-2: 結果整合性（チャンク化・埋め込み・書き込みが検索へ反映される） --------
 
 #[test]
@@ -394,6 +412,59 @@ fn embedder_failure_leaves_no_side_effects_and_returns_internal_error() {
             &read_ctx,
             &format!(
                 "SELECT body FROM documents WHERE path = 'docs/fail.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
+            ),
+        )
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 0);
+}
+
+/// `Embedder` 応答に非有限値（`NaN`/`±Inf`）が含まれる場合、書き込み前に
+/// fail-closed に拒否されることを固定する（codex-review P1 指摘・PR #221。
+/// SQL のベクトルリテラル経路と同じ防御をこの新経路にも適用する）。
+#[test]
+fn non_finite_embedding_values_are_rejected_before_write() {
+    let path = unique_db_path("index-non-finite");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(NonFiniteEmbedder { dim: DIM }))
+        .with_incremental_config(small_chunk_config());
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let err = core
+        .execute_insert_sql(
+            &write_ctx,
+            &insert_file_sql(
+                "documents",
+                "docs/nonfinite.txt",
+                "line one\nline two",
+                "op-nonfinite-1",
+            ),
+        )
+        .expect_err("non-finite embedding values must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+
+    // 副作用ゼロ（write トランザクションへ入らない）。
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
+    let rows = core
+        .execute_sql(
+            &read_ctx,
+            &format!(
+                "SELECT body FROM documents WHERE path = 'docs/nonfinite.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
             ),
         )
         .expect("select should succeed");

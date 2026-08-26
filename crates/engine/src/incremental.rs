@@ -227,6 +227,14 @@ pub(crate) fn index_file(
                 got: v.len(),
             }));
         }
+        // 非有限値（`NaN`/`±Inf`）を永続化前に拒否する。SQL のベクトルリテラルは
+        // `sql::parser::parse_vector_literal` が同じ検証を行っており、外部実装も
+        // 許容する `Embedder` の応答経路がこの防御を迂回すると、距離計算・順位付けが
+        // 不定になった行が索引に残り検索が継続的に壊れる（codex-review P1 指摘・
+        // PR #221。coding-rust.md「エラー契約は fail-closed とする」）。
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err(IncrementalError::Embed(EmbedError::InvalidResponse));
+        }
     }
     let embedding_elapsed = embedding_start.elapsed();
 
