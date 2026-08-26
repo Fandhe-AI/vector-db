@@ -218,7 +218,7 @@ fn check_contrast_ratio_within_limit_rejects_non_positive_max_ratio() {
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 
-// p95_ratio（Issue #176 で追加した比率算出ヘルパ）。
+// p95_ratio（CORE-5・Issue #176）。
 
 #[test]
 fn p95_ratio_computes_ratio_of_p95_values() {

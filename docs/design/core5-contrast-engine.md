@@ -1,6 +1,8 @@
 # ADR: CORE-5 対照エンジン接続（TASK-127・Issue #176）
 
-- ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
+- ステータス: Accepted（2026-08-26 オーナー承認。クレート採用〔`usearch =2.26.1`〕と
+  CORE-5 の公開境界の双方を承認済み。spec 側の記録は
+  `docs/spec/04-behavior/core-engine.md` CORE-5 の 2026-08-26 追記）
 - 対応: TASK-127（`docs/spec/05-tasks.md`）・Issue #176
 - 対象ビヘイビア: CORE-5（`docs/spec/04-behavior/core-engine.md`）
 - 前提: TASK-127（性能・Recall 受け入れ基準の回帰テスト化。PR #143）で CORE-3/CORE-4
@@ -33,6 +35,10 @@ CORE-5 のビヘイビア詳細（`docs/spec/04-behavior/core-engine.md` CORE-5�
 | arroy | なし（Annoy 近似）＋ LMDB C ビルド | MIT | 中 | 不可 |
 | lancedb | あり | Apache-2.0 | 数百（arrow/datafusion/tokio 等） | 不可（依存最小方針に反する） |
 | faiss | あり | MIT/Apache-2.0 | システム libfaiss 必須 | 不可（ホステッド runner で不成立） |
+
+オーナー承認: 2026-08-26 に `usearch = "=2.26.1"`（Apache-2.0・bench 専用 optional
+feature）の採用が承認された（`.claude/rules/dependency-policy.md`。承認記録は
+Issue #176 のコメント）。
 
 `usearch` を採用した理由:
 
@@ -88,10 +94,13 @@ bench.yml` でも `bench-simd` と `bench-contrast` を別ジョブにしてあ�
   B＝`ContrastIndex::search`（usearch `exact_search`）を同一データ・同一クエリで
   交互実行する（測定条件は `simd_bench.rs` と同一の `ROW_COUNT`/`DIM`/`TOP_K`/
   シード）
-- 判定: `harness::accept::check_contrast_ratio_within_limit`（被検/対照の比率が
-  `BENCH_MAX_CONTRAST_RATIO` 以下か）。比率の算出方法を含む CORE-5 の判定内容は
-  `docs/spec/04-behavior/core-engine.md` CORE-5 が SSOT のため本ドキュメントには
-  記載しない
+- 判定: `harness::accept::p95_ratio`（被検/対照の p95 レイテンシ比率）を
+  `harness::accept::check_contrast_ratio_within_limit` で `BENCH_MAX_CONTRAST_RATIO`
+  と突き合わせる（`AbMeasurement::median_ratio`〔`ab.rs` の既存契約〕は補助情報として
+  標準出力へ併記するのみで判定には使わない）。この算出・判定ヘルパを public 実装として
+  置くことはオーナー承認済み（2026-08-26。`docs/spec/04-behavior/core-engine.md`
+  CORE-5 の「公開境界」追記が SSOT）。閾値の具体値は public 資産へ書かず Actions
+  variable で注入し、bench の標準出力にも出さない
 - 閾値注入: `BENCH_MAX_CONTRAST_RATIO` 環境変数（有限・正の浮動小数点）。未設定・
   不正値は fail-closed（`harness::accept::parse_contrast_ratio_limit`）
 - 健全性チェック: 同一クエリでの Top-k 一致率（`recall_at_k`）を対照側と算出し標準
@@ -122,3 +131,5 @@ CORE-3/CORE-4・CORE-6/CORE-16 と同一の「未評価 run が green として�
   無害）
 - usearch を不採用とする判断があった場合は `harness/contrast.rs` のアダプタ差し替え
   で別クレートへ移行できる構造にしてある
+- `BENCH_MAX_CONTRAST_RATIO` の値設定はマージ後の管理者作業（未設定のまま週次 run が
+  走ると設計どおり fail-closed で red になる）

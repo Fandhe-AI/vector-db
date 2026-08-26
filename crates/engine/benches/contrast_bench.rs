@@ -4,10 +4,10 @@
 //!
 //! 被検（`ParallelSearchProvider`。TASK-126）と対照エンジン（usearch の総当たり
 //! `exact_search`。`harness::contrast::ContrastIndex`）を同一データ・同一クエリで
-//! `harness::ab::run_ab`（interleaved A/B）により比較し、被検/対照の比率が
-//! `BENCH_MAX_CONTRAST_RATIO` 以下であることを `harness::accept::
-//! check_contrast_ratio_within_limit` で判定する（比率の算出方法を含む CORE-5 の
-//! 判定内容は上記ポインタ先が SSOT のため本コメントには記載しない）。
+//! `harness::ab::run_ab`（interleaved A/B）により比較し、p95 レイテンシの比率
+//! （被検/対照）が上限以下であることを判定する（`harness::accept::p95_ratio` /
+//! `check_contrast_ratio_within_limit`）。閾値の具体値は spec が SSOT のため
+//! 本リポジトリには持たず、`BENCH_MAX_CONTRAST_RATIO` から注入する。
 //!
 //! `simd_bench.rs`（CORE-3/CORE-4）とは独立バイナリに分離してある
 //! （`Cargo.toml` の `[[bench]] contrast_bench` コメント参照）。対照エンジン側は
@@ -185,12 +185,12 @@ fn main() {
         .expect("non-empty samples must yield a p95");
     let contrast_p95 = harness::accept::p95_from_samples(&measurement.b.samples)
         .expect("non-empty samples must yield a p95");
-    // CORE-5 の最終合否は比率判定（`ratio_ok`）と Top-k 一致率（`topk_overlap_ok`）の
+    // CORE-5 の最終合否は p95 比率（`ratio_ok`）と Top-k 一致率（`topk_overlap_ok`）の
     // 両方を満たすことを要求する（codex-review 指摘・PR #224 対応。片方のみでは metric
     // 取り違え・key 対応ずれのように処理が速いだけの無効な計測を合格させてしまう）。
     let overall_ok = ratio_ok && topk_overlap_ok;
     println!(
-        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} candidate_p95={candidate_p95:?} contrast_p95={contrast_p95:?} gate_ratio={ratio:.6} median_ratio={:.6} topk_overlap_min={topk_overlap:.6} ratio_ok={ratio_ok} topk_overlap_ok={topk_overlap_ok} pass={overall_ok}",
+        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} candidate_p95={candidate_p95:?} contrast_p95={contrast_p95:?} p95_ratio={ratio:.6} median_ratio={:.6} topk_overlap_min={topk_overlap:.6} ratio_ok={ratio_ok} topk_overlap_ok={topk_overlap_ok} pass={overall_ok}",
         measurement.median_ratio,
     );
 

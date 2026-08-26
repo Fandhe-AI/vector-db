@@ -241,7 +241,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-contrast
-bench-contrast: ## TASK-127 CORE-5（対照エンジンとの比較。判定統計量は docs/spec/04-behavior/core-engine.md CORE-5 が SSOT）の回帰ベンチを実行する（`contrast-bench` feature 限定・C++17 コンパイラが必要。時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
+bench-contrast: ## TASK-127 CORE-5（対照エンジンに対する p95 レイテンシ比率）の回帰ベンチを実行する（`contrast-bench` feature 限定・C++17 コンパイラが必要。時間依存のため ci には含めない。.github/workflows/bench.yml から週次 schedule / workflow_dispatch で実行）
 ifdef HAS_CARGO
 	cargo bench --bench contrast_bench -p engine --features contrast-bench
 else

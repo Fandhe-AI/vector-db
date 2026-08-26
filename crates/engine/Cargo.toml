@@ -16,8 +16,10 @@ path = "src/lib.rs"
 # TASK-140（永続化層）: オーナー承認済み（Issue #16）の唯一の依存。
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 redb = "=4.2.0"
-# TASK-127 CORE-5（対照エンジン接続。Issue #176）: オーナー承認済み（依存追加自体は
-# Issue 起票時に承認済み。具体クレート・バージョンは本 PR で提示）。目的は
+# TASK-127 CORE-5（対照エンジン接続。Issue #176）: クレート・バージョンともに
+# オーナー承認済み（2026-08-26。承認記録は Issue #176 のコメント、および
+# `docs/spec/04-behavior/core-engine.md` CORE-5 の追記）。ライセンスは Apache-2.0
+# （`deny.toml` の allow list 既存）。目的は
 # `contrast_bench.rs` から対照エンジン（総当たり厳密最近傍）として呼び出すことのみで、
 # `src/` 配下（ライブラリ公開面）は本依存に一切依存しない。`optional = true` ＋
 # 下記 `contrast-bench` feature 限定とし、`wire-server` バイナリはリンクしない

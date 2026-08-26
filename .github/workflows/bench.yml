@@ -90,7 +90,7 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-contrast
-        # 数値基準・判定統計量は spec（TASK-127・CORE-5）が SSOT のため
+        # 数値基準（p95 レイテンシ比率の上限）は spec（TASK-127・CORE-5）が SSOT のため
         # 本ワークフローにはハードコードしない。BENCH_MAX_CONTRAST_RATIO が未設定の場合は
         # `contrast_bench.rs` 側が fail-closed で非ゼロ終了する（variable 未設定のまま
         # schedule run が実行された場合も red になり、false green にはならない）。
