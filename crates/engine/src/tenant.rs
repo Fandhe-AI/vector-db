@@ -623,6 +623,11 @@ pub struct ReplaceOutcome {
 ///   上書きしない」契約と衝突しない。`checked_add` でオーバーフローを `Err` に倒す）
 /// - `rows` が空かつ削除対象も 0 件なら世代を進めずに成功する（[`insert_rows`] の
 ///   空バッチと同じ扱い。無変更コミットで既存インデックスを不要に失効させない）
+/// - テナント名前空間内の走査は `visible_rows` と同じ上限（[`MAX_SCANNED_ROWS`]・
+///   [`MAX_VISIBLE_ROWS`]）を適用し、超過時は副作用ゼロで `Err`。各行は
+///   `crate::storage::decode_row_metadata_borrowed` で `metadata`（スカラー列
+///   ペイロード）のみを借用取得し、比較に不要な embedding は確保しない
+///   （coding-rust.md「不安全な設計 / DoS」対応）
 ///
 /// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
 /// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
@@ -675,6 +680,7 @@ pub fn replace_typed_rows_by_text_key(
         // （`update_row`/`delete_row` の `AccessGuard` スコープと同じ方針）。
         let mut to_remove: Vec<u64> = Vec::new();
         let mut max_id: Option<u64> = None;
+        let mut scanned_count: usize = 0;
         {
             let start = std::ops::Bound::Included((tenant, 0u64));
             let end = std::ops::Bound::Included((tenant, u64::MAX));
@@ -685,12 +691,29 @@ pub fn replace_typed_rows_by_text_key(
                 let (k, v) = entry.map_err(CatalogError::from)?;
                 let (_key_tenant, id) = k.value();
                 let raw = v.value();
-                let row = crate::storage::decode_row(id, raw).map_err(TenantWriteError::Storage)?;
+                scanned_count = scanned_count.saturating_add(1);
+                if scanned_count > MAX_SCANNED_ROWS {
+                    return Err(TenantWriteError::Storage(StorageError::Codec(format!(
+                        "too many rows scanned for replace: max {MAX_SCANNED_ROWS}"
+                    ))));
+                }
+                // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
+                // 借用で取り出す（`decode_row` は行ごとに `Vec<f32>` を確保するため、
+                // テナント全行走査のホットパスでは使わない。`storage.rs`
+                // `decode_row_metadata_borrowed` モジュールドキュメント参照。
+                // coding-rust.md「不安全な設計 / DoS」対応）。
+                let metadata = crate::storage::decode_row_metadata_borrowed(raw)
+                    .map_err(TenantWriteError::Storage)?;
                 max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
-                let scanned = crate::row_codec::scan_scalar_columns(&schema, &row.metadata)
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
                     .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
                 if scanned.get(key_idx).copied().flatten() == Some(key_value) {
                     to_remove.push(id);
+                    if to_remove.len() > MAX_VISIBLE_ROWS {
+                        return Err(TenantWriteError::Storage(StorageError::Codec(format!(
+                            "too many matching rows for replace: max {MAX_VISIBLE_ROWS}"
+                        ))));
+                    }
                 }
             }
         }

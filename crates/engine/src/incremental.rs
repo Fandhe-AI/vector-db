@@ -127,9 +127,11 @@ pub struct BoundFileIndexInput<'a> {
 /// 4. `tenant::replace_typed_rows_by_text_key` で単一 write トランザクション内の
 ///    「同一パスの既存行を全削除 → 新チャンク行を挿入 → 世代 bump」
 ///
-/// 埋め込み結果の次元不一致は書き込みへ進む前に検出する（`Embedder::dim()` と
-/// スキーマの `VECTOR(N)` を突き合わせる。次元検証自体は `tenant.rs` 側の
-/// `validate_embedding_dim` が書き込みトランザクション内でも行うため二重防御）。
+/// `Embedder::dim()` とスキーマの `VECTOR(N)` の不一致はチャンク化・埋め込み呼び出し
+/// より前（手順の最初）に検出する。埋め込み実装が自己申告と異なる次元のベクトルを
+/// 返した場合の防御的検証は埋め込み呼び出し直後で別途行う。次元検証自体は
+/// `tenant.rs` 側の `validate_embedding_dim` が書き込みトランザクション内でも
+/// 行うため、いずれも二重防御になる。
 pub fn index_file(
     storage: &Storage,
     ctx: &PolicyContext,
@@ -137,6 +139,26 @@ pub fn index_file(
     config: &IncrementalConfig,
     input: &BoundFileIndexInput<'_>,
 ) -> Result<IndexOutcome, IncrementalError> {
+    // `embedder.dim()` を対象テーブルの `VECTOR(N)` と突き合わせる（サーバー側の
+    // Embedder 設定とスキーマの不整合。チャンク化・埋め込み呼び出しの前に検出し、
+    // 誤設定時の無駄な計算・外部 I/O を避ける。`tenant.rs` 側の
+    // `validate_embedding_dim` が書き込みトランザクション内でも同じ検証を行うため
+    // 二重防御になる）。
+    let schema = storage
+        .get_table_schema(input.table)
+        .map_err(TenantWriteError::Catalog)?;
+    let table_dim = schema.vector_dim().ok_or_else(|| {
+        TenantWriteError::Catalog(crate::catalog::CatalogError::Invalid(
+            "table has no VECTOR column".to_string(),
+        ))
+    })?;
+    if embedder.dim() != table_dim {
+        return Err(IncrementalError::Embed(EmbedError::DimMismatch {
+            expected: table_dim,
+            got: embedder.dim() as usize,
+        }));
+    }
+
     let chunking_start = Instant::now();
     let chunks = crate::chunking::chunk_file(input.path, input.body, &config.chunking)
         .map_err(|e| IncrementalError::ChunkingTooLarge(e.to_string()))?;

@@ -117,23 +117,15 @@ fn index2_file_insert_chunks_are_searchable_by_hybrid_and_distance() {
     let read_ctx =
         PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
     let before = core
         .execute_sql(
-            &read_ctx,
-            "SELECT body FROM documents WHERE path = 'docs/note.txt' ORDER BY embedding <=> '[0.0]' LIMIT 100",
-        );
-    // ベクトルリテラルの次元は問わない事前確認のため、失敗しても本題ではない。
-    // (次元検証は execute_sql 側で早期に走るため、別クエリで 0 件確認する)
-    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
-    let before = before.unwrap_or_else(|_| {
-        core.execute_sql(
             &read_ctx,
             &format!(
                 "SELECT body FROM documents WHERE path = 'docs/note.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
             ),
         )
-        .expect("pre-insert select should succeed")
-    });
+        .expect("pre-insert select should succeed");
     assert_eq!(before.rows.len(), 0);
 
     let outcome = core
@@ -226,21 +218,15 @@ fn resend_same_path_replaces_chunks_and_old_content_disappears() {
         .expect("file-form insert sets incremental");
     assert_eq!(incremental.rows_replaced, 2);
 
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
     let rows_for_note = core
         .execute_sql(
-            &read_ctx,
-            "SELECT body FROM documents WHERE path = 'docs/note.txt' ORDER BY embedding <=> '[0.0]' LIMIT 100",
-        );
-    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
-    let rows_for_note = rows_for_note.unwrap_or_else(|_| {
-        core.execute_sql(
             &read_ctx,
             &format!(
                 "SELECT body FROM documents WHERE path = 'docs/note.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
             ),
         )
-        .expect("select by path should succeed")
-    });
+        .expect("select by path should succeed");
     assert_eq!(rows_for_note.rows.len(), 2);
     let bodies = body_text_cells(&rows_for_note);
     assert!(bodies.iter().all(|b| b.contains("second version")));
@@ -463,6 +449,57 @@ fn missing_embedder_is_rejected_fail_closed_with_no_side_effects() {
             &read_ctx,
             &format!(
                 "SELECT body FROM documents WHERE path = 'docs/noembedder.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
+            ),
+        )
+        .expect("select should succeed");
+    assert_eq!(rows.rows.len(), 0);
+}
+
+#[test]
+fn embedder_dim_mismatch_with_table_schema_is_rejected_with_no_side_effects() {
+    let path = unique_db_path("index-embedder-dim-mismatch");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    // テーブルは VECTOR(DIM) だが、注入した Embedder は異なる次元を返す
+    // （サーバー側設定の不整合。クライアント入力の不正ではないため XX000 になる
+    // べきで、22000（クライアント起因の値不正）に丸め込まれてはならない）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM + 1)));
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let err = core
+        .execute_insert_sql(
+            &write_ctx,
+            &insert_file_sql(
+                "documents",
+                "docs/dimmismatch.txt",
+                "line one\nline two",
+                "op-dimmismatch-1",
+            ),
+        )
+        .expect_err("embedder/table dim mismatch should be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
+    let rows = core
+        .execute_sql(
+            &read_ctx,
+            &format!(
+                "SELECT body FROM documents WHERE path = 'docs/dimmismatch.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
             ),
         )
         .expect("select should succeed");

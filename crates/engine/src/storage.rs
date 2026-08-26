@@ -808,6 +808,86 @@ pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visi
     Ok((tenant_id, visibility))
 }
 
+/// 行バイト列から `metadata`（スカラー列ペイロード）だけを取り出す（[`decode_row`] と
+/// 同じヘッダ・embedding フィールド検証を経るが、embedding は `Vec<f32>` へ確保せず
+/// 長さ検証のみでオフセットを進める）。`metadata` は `buf` を借用した `&[u8]`。
+///
+/// 呼び出し文脈: `tenant.rs::replace_typed_rows_by_text_key` が、テナント名前空間内の
+/// 全行を走査してテキスト列（例: `path`）の一致判定を行う際に使う。当該経路は行ごとに
+/// embedding をヒープ確保する必要がないため、[`decode_row`] を使うと
+/// `MAX_SCANNED_ROWS` 級の走査で無視できない一時確保が発生し得る
+/// （coding-rust.md「不安全な設計 / DoS」対応。`decode_row_tenant_and_visibility` が
+/// 可視性判定のためにヘッダのみを借用で返す設計と同じ方針）。
+pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
+    let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
+
+    let dim_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at dim field".to_string()))?;
+    let dim_bytes = buf
+        .get(offset..dim_field_end)
+        .ok_or_else(|| StorageError::Codec("row buffer truncated at dim field".to_string()))?;
+    let dim_arr: [u8; 4] = dim_bytes
+        .try_into()
+        .map_err(|_| StorageError::Codec("dim field is not 4 bytes".to_string()))?;
+    let dim = u32::from_le_bytes(dim_arr);
+    if dim > MAX_EMBEDDING_DIM {
+        return Err(StorageError::Codec(format!(
+            "embedding dim {dim} exceeds limit {MAX_EMBEDDING_DIM}"
+        )));
+    }
+    offset = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow after dim field".to_string()))?;
+
+    let embedding_bytes_len = (dim as usize)
+        .checked_mul(4)
+        .ok_or_else(|| StorageError::Codec("embedding byte length overflow".to_string()))?;
+    let embedding_end = offset
+        .checked_add(embedding_bytes_len)
+        .ok_or_else(|| StorageError::Codec("offset overflow after embedding field".to_string()))?;
+    // embedding バイト列は境界検証のみ行い、`f32` へは変換・確保しない。
+    if buf.get(offset..embedding_end).is_none() {
+        return Err(StorageError::Codec(
+            "row buffer truncated at embedding field".to_string(),
+        ));
+    }
+    offset = embedding_end;
+
+    let metadata_len_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at metadata_len field".to_string()))?;
+    let metadata_len_bytes = buf.get(offset..metadata_len_field_end).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at metadata_len field".to_string())
+    })?;
+    let metadata_len_arr: [u8; 4] = metadata_len_bytes
+        .try_into()
+        .map_err(|_| StorageError::Codec("metadata_len field is not 4 bytes".to_string()))?;
+    let metadata_len = u32::from_le_bytes(metadata_len_arr);
+    if metadata_len > MAX_METADATA_LEN {
+        return Err(StorageError::Codec(format!(
+            "metadata length {metadata_len} exceeds limit {MAX_METADATA_LEN}"
+        )));
+    }
+    offset = offset.checked_add(4).ok_or_else(|| {
+        StorageError::Codec("offset overflow after metadata_len field".to_string())
+    })?;
+
+    let metadata_end = offset
+        .checked_add(metadata_len as usize)
+        .ok_or_else(|| StorageError::Codec("offset overflow after metadata field".to_string()))?;
+    let metadata_bytes = buf
+        .get(offset..metadata_end)
+        .ok_or_else(|| StorageError::Codec("row buffer truncated at metadata field".to_string()))?;
+    if metadata_end != buf.len() {
+        return Err(StorageError::Codec(
+            "row buffer has trailing bytes beyond declared metadata length".to_string(),
+        ));
+    }
+
+    Ok(metadata_bytes)
+}
+
 /// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
 /// 黙殺フォールバックで既知の型・デフォルト値へ落とさない）。添字アクセス `[]` ではなく
 /// `get()` を使い、境界外アクセスを未定義動作にしない。
