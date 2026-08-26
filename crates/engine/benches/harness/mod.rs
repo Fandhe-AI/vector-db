@@ -40,6 +40,8 @@
 // 個別に import する。
 pub mod ab;
 pub mod accept;
+pub mod env_report;
 pub mod protocol;
 pub mod rng;
+pub mod sql_c1;
 pub mod stats;

@@ -16,6 +16,13 @@ name: Bench
 # 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）も
 # 実 GPU バックエンド未接続のため Issue #178 で追跡し、同様に opt-in のまま維持する
 # （`batch_bench.rs` 冒頭コメント参照）。
+#
+# bench-c1（TASK-83・Conditional Go 条件7）は workflow_dispatch 限定とし、上記
+# schedule には含めない。GitHub ホステッド runner は共有 2 vCPU の非専有環境であり、
+# `crates/engine/benches/sql_c1_bench.rs` が測る SQL 表層（毎クエリ約 300MB の候補
+# デコードを伴う）の p95 を恒常的な回帰ゲートとして schedule 実行すると、専有環境
+# 前提の基準に対して恒常的に red になりかねない（`sql_c1_bench.rs` 冒頭コメント参照。
+# `BENCH_DEDICATED_ENV` は GitHub ホステッド runner が専有環境でないため注入しない）。
 on:
   workflow_dispatch: {}
   schedule:
@@ -97,3 +104,35 @@ jobs:
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
           BENCH_CORE16: ${{ vars.BENCH_CORE16 }}
         run: make bench-batch
+
+  # --------------------------------------------------
+  # bench-c1（TASK-83 Conditional Go 条件7 の参考実測。workflow_dispatch 限定）
+  # --------------------------------------------------
+  # SQL 表層（`EngineCore::execute_sql`）経由の C1（純粋 Top-k）p95 を再測定する。
+  # 上記 2 ジョブと異なり schedule には含めない（ワークフロー冒頭コメント参照）。
+  # GitHub ホステッド runner は専有環境ではないため `BENCH_DEDICATED_ENV` は注入せず、
+  # `sql_c1_bench.rs` 側が「専有環境未宣言」として条件7 の判定対象から明示的に除外する
+  # （参考値としての p95/Recall 実測とゲートの土台整備が本ジョブの目的で、条件7 の
+  # 最終判定はオーナーが専有環境で `make bench-c1` を実行して行う）。
+  bench-c1:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-c1
+        # 数値基準（p95 上限・Recall 下限）は spec（TASK-83・SQL-1）が SSOT のため
+        # 本ワークフローにはハードコードしない。bench-parallel の
+        # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
+        # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
+        # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
+        # 非ゼロ終了する。
+        env:
+          BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
+          BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
+        run: make bench-c1
