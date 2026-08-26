@@ -31,7 +31,7 @@
 //! テーブル単位分離を検討する場合は、本モジュールの可視性フィルタと独立した設計判断
 //! として扱うこと。
 
-use redb::ReadableTable;
+use redb::{ReadableDatabase, ReadableTable};
 
 use crate::catalog::{
     map_row_table_error, require_table_schema_write, user_rows_table_def, user_rows_table_name,
@@ -39,6 +39,7 @@ use crate::catalog::{
 };
 use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
+use crate::recovery::ledger::{self, LedgerWrite};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::storage::{
     bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
@@ -261,21 +262,50 @@ pub enum TenantWriteError {
     Catalog(CatalogError),
     /// [`crate::storage`] 側のエンコード/デコードエラー（`RowInput` の入力検証失敗等）。
     Storage(StorageError),
+    /// `operation_id` 台帳（`crate::recovery::ledger`）テーブルの読み書きで検出した
+    /// 内部エラー（未知フォーマットバージョンの混入・redb バックエンド障害）。
+    /// `Storage(StorageError::Codec)` と型を分ける（Cursor Bugbot 指摘・PR #226）:
+    /// 台帳の破損はクライアントが送った行データとは無関係のサーバー内部事象であり、
+    /// `sql::exec::execute_insert` の呼び出し元マッピングが `StorageError::Codec` を
+    /// 「行データ不正（`22000`）」として丸めてしまうと、台帳破損を「送った行が不正」
+    /// という誤ったクライアント向けエラーへ変換してしまう。台帳エラーは常に
+    /// `wire_code` `XX000`（内部事象）に固定し、クライアントへ再試行を促す誤情報を
+    /// 出さない（fail-closed）。
+    LedgerCorrupted(StorageError),
 }
 
 impl TenantWriteError {
     /// SQLSTATE 風 `wire_code`（coding-rust.md「エラー型は SQLSTATE 風 wire_code の設計に
     /// 従う」）。対象ビヘイビア: RECOVER-4・ERR-2（`docs/spec/04-behavior/error-format.md`
     /// をポインタ参照。写像の具体値・採用理由は spec 側の管理事項であり、本コメントへは
-    /// 転記しない。spec-confidentiality.md 参照）。
+    /// 転記しない。spec-confidentiality.md 参照）。TASK-152 で単一真実源化した
+    /// [`crate::error_format::ErrorClass`] へ委譲する（既存の返値は 1 つも変えない）。
     pub fn wire_code(&self) -> &'static str {
+        crate::error_format::ClassifiedError::wire_code(self)
+    }
+}
+
+/// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`crate::error_format::ErrorClass`]
+/// へ委譲する。variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で
+/// 一致させ、委譲化で応答コードを変えない。
+impl crate::error_format::ClassifiedError for TenantWriteError {
+    fn error_class(&self) -> crate::error_format::ErrorClass {
+        use crate::error_format::ErrorClass;
         match self {
-            TenantWriteError::Forbidden => "42501",
-            TenantWriteError::NotFound => "P0002",
-            TenantWriteError::IdConflict => "23505",
-            TenantWriteError::MissingOperationId => "23502",
-            TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
+            TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
+            TenantWriteError::NotFound => ErrorClass::RowNotFound,
+            TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
+            TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
+            TenantWriteError::Catalog(_)
+            | TenantWriteError::Storage(_)
+            | TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
         }
+    }
+
+    /// `Display` は既にテナント境界の秘匿契約（テナント ID・行 id・テーブル名を
+    /// 含めない。上記 struct doc 参照）を満たしているため、そのまま返す。
+    fn client_message(&self) -> String {
+        self.to_string()
     }
 }
 
@@ -292,6 +322,7 @@ impl std::fmt::Display for TenantWriteError {
             // と同じ理由。security.md テナント境界 P0）。
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
             TenantWriteError::Storage(_) => write!(f, "tenant write storage error"),
+            TenantWriteError::LedgerCorrupted(_) => write!(f, "tenant write ledger error"),
         }
     }
 }
@@ -308,6 +339,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
+            TenantWriteError::LedgerCorrupted(_) => f.write_str("LedgerCorrupted(<redacted>)"),
         }
     }
 }
@@ -401,8 +433,8 @@ pub fn insert_row(
     row: &RowInput<'_>,
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
-    LedgerMode::Ledgered.require(Some(operation_id))?;
-    insert_row_unchecked(storage, table, ctx, id, row)
+    let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
+    insert_row_unchecked(storage, table, ctx, id, row, ledger_write)
 }
 
 /// [`insert_row`] のガードなし実体（`pub(crate)`。TASK-92・RECOVER-1）。
@@ -410,12 +442,19 @@ pub fn insert_row(
 /// （`pub(crate)` によりガードを迂回できる経路を閉じる）。呼び出し元は
 /// [`insert_row`]（本モジュール内でガード済み）と
 /// `crate::core::EngineCore::insert_row`（`self.ledger_mode` でガード済み）の 2 か所。
+///
+/// `ledger`（TASK-93・対象ビヘイビア: RECOVER-2）: 行書き込みと**同一の write
+/// トランザクション**内で台帳へ追記する（順序: スキーマ取得 → 台帳追記 → 行書き込み →
+/// commit）。台帳を先に触っておくことで、行側の `IdConflict` によりトランザクションが
+/// drop された場合に台帳も一緒に破棄される（原子性）ことを結合テストで直接検証できる
+/// （`recovery::ledger` モジュールドキュメント参照）。
 pub(crate) fn insert_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     row: &RowInput<'_>,
+    ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を ctx と照合する
@@ -427,6 +466,8 @@ pub(crate) fn insert_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -474,17 +515,22 @@ pub fn insert_rows(
     rows: &[(u64, RowInput<'_>)],
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
-    LedgerMode::Ledgered.require(Some(operation_id))?;
-    insert_rows_unchecked(storage, table, ctx, rows)
+    let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
+    insert_rows_unchecked(storage, table, ctx, rows, ledger_write)
 }
 
 /// [`insert_rows`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
 /// 設計。呼び出し元は本モジュール内の [`insert_rows`] のみ）。
+///
+/// `ledger`（TASK-93・RECOVER-2）: 空バッチは台帳も書かず世代も進めない現行方針を
+/// 維持する（[`insert_row_unchecked`] のドキュメント参照。順序はスキーマ取得 →
+/// 空バッチ早期 return → 台帳追記 → 行書き込み → commit）。
 pub(crate) fn insert_rows_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
     rows: &[(u64, RowInput<'_>)],
+    ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     // ストレージへ触れる前に、クライアント自己申告の `tenant_id` を全件検査する
@@ -514,6 +560,8 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -551,13 +599,14 @@ pub fn insert_typed_row(
     values: &[crate::row_codec::Value],
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
-    LedgerMode::Ledgered.require(Some(operation_id))?;
-    insert_typed_row_unchecked(storage, table, ctx, id, visibility, values)
+    let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
+    insert_typed_row_unchecked(storage, table, ctx, id, visibility, values, ledger_write)
 }
 
 /// [`insert_typed_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と
 /// 同じ設計）。呼び出し元は本モジュール内の [`insert_typed_row`] と
-/// `crate::sql::exec::execute_insert`（`allowlist::validate_insert` でガード済み）。
+/// `crate::sql::exec::execute_insert`（`allowlist::validate_insert` でガード済み。
+/// `LedgerMode::resolve` の結果をそのまま渡す。TASK-93・RECOVER-2）。
 pub(crate) fn insert_typed_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -565,6 +614,7 @@ pub(crate) fn insert_typed_row_unchecked(
     id: u64,
     visibility: crate::storage::Visibility,
     values: &[crate::row_codec::Value],
+    ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
@@ -596,6 +646,8 @@ pub(crate) fn insert_typed_row_unchecked(
             embedding: &embedding,
             metadata: &metadata,
         };
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -630,19 +682,24 @@ pub fn update_row(
     row: &RowInput<'_>,
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
-    LedgerMode::Ledgered.require(Some(operation_id))?;
-    update_row_unchecked(storage, table, ctx, id, row)
+    let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
+    update_row_unchecked(storage, table, ctx, id, row, ledger_write)
 }
 
 /// [`update_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
 /// 設計）。呼び出し元は本モジュール内の [`update_row`] と
 /// `crate::core::EngineCore::update_row`（`self.ledger_mode` でガード済み）。
+///
+/// `ledger`（TASK-93・RECOVER-2）: 対象行が不存在（`NotFound`）の場合は台帳へ触れない
+/// （後続 §T2 相当の結合テストが「未記録」であることを検証する）。所有権判定
+/// （`owns_existing`）の**後**に台帳追記する順序を取る。
 pub(crate) fn update_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
     row: &RowInput<'_>,
+    ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     if !ctx.is_owner(row.tenant_id) {
@@ -674,6 +731,8 @@ pub(crate) fn update_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let encoded = encode_row(row)?;
         row_table
             .insert(key, encoded.as_slice())
@@ -699,18 +758,23 @@ pub fn delete_row(
     id: u64,
     operation_id: &OperationId,
 ) -> Result<(), TenantWriteError> {
-    LedgerMode::Ledgered.require(Some(operation_id))?;
-    delete_row_unchecked(storage, table, ctx, id)
+    let ledger_write = LedgerMode::Ledgered.resolve(Some(operation_id))?;
+    delete_row_unchecked(storage, table, ctx, id, ledger_write)
 }
 
 /// [`delete_row`] のガードなし実体（`pub(crate)`。[`insert_row_unchecked`] と同じ
 /// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
 /// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
+///
+/// `ledger`（TASK-93・RECOVER-2）: [`update_row_unchecked`] と同じく、対象行が
+/// 不存在（`NotFound`）の場合は台帳へ触れない。所有権判定（`owns_existing`）の
+/// **後**に台帳追記する。
 pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
     id: u64,
+    ledger_write: LedgerWrite<'_>,
 ) -> Result<(), TenantWriteError> {
     validate_identifier(table)?;
     let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
@@ -735,10 +799,277 @@ pub(crate) fn delete_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
     Ok(())
+}
+
+/// [`replace_typed_rows_by_text_key`] の成功応答。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplaceOutcome {
+    /// テキスト列 `key_column` が `key_value` に一致した既存行のうち削除した件数。
+    pub removed: usize,
+    /// 新規挿入した行数（`rows.len()` と一致する）。
+    pub inserted: usize,
+    /// 新規挿入した行のうち最小の `id`（`rows` が空なら `None`）。
+    pub first_id: Option<u64>,
+}
+
+/// テキスト列 `key_column` の値が `key_value` に一致するテナント内の既存行を
+/// すべて削除し、代わりに `rows` を新規挿入する（TASK-120・対象ビヘイビア:
+/// INDEX-1, INDEX-2。ファイル形 `INSERT` の同一パス再送時の置換セマンティクスの
+/// 決定を担う。ポインタ: `docs/design/resend-semantics.md`）。
+///
+/// `crate::incremental::index_file` から、チャンク化・埋め込み計算をすべて終えた
+/// 後にのみ呼ばれる（write トランザクションの外で外部 I/O・CPU 計算を終えてから
+/// 単一の write トランザクションへ入る設計。coding-rust.md「不安全な設計 / DoS」:
+/// 単一ライタの長時間占有を避ける）。
+///
+/// - 削除・採番・挿入・世代更新をすべて単一の write トランザクション内で行う
+///   （途中失敗は `redb::WriteTransaction` の drop 契約により abort。副作用ゼロ）
+/// - 走査範囲はテナント名前空間 `(ctx.tenant_id(), ..)` に限定する（TABLE-12・RLS-9。
+///   他テナントの同一 `key_value` 行は走査対象にも削除対象にも含まれない）
+/// - 新規行の `id` は同一テナント名前空間内の既存最大 `id`（削除対象・対象外を問わず、
+///   走査中に観測した全行）+ 1 から連番で採番する（[`insert_row`] の「既存行を
+///   上書きしない」契約と衝突しない。`checked_add` でオーバーフローを `Err` に倒す）
+/// - `rows` が空かつ削除対象も 0 件なら世代を進めずに成功する（[`insert_rows`] の
+///   空バッチと同じ扱い。無変更コミットで既存インデックスを不要に失効させない）
+/// - テナント名前空間内の走査は `visible_rows` と同じ上限（[`MAX_SCANNED_ROWS`]・
+///   [`MAX_VISIBLE_ROWS`]）を適用し、超過時は副作用ゼロで `Err`。各行は
+///   `crate::storage::decode_row_metadata_borrowed` で `metadata`（スカラー列
+///   ペイロード）のみを借用取得し、比較に不要な embedding は確保しない
+///   （coding-rust.md「不安全な設計 / DoS」対応）
+///
+/// エラー契約は [`insert_row`]/[`delete_row`] と同一（`TenantWriteError`。他テナントの
+/// 存在情報を漏らさない fail-closed）。`key_column` がスキーマに存在しない・
+/// テーブルに VECTOR 列がない場合は [`TenantWriteError::Catalog`]（`CatalogError::Invalid`）。
+///
+/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
+/// 内部結線用 API のため `pub(crate)` に閉じる（ガードは唯一の到達経路である
+/// `core::EngineCore::execute_insert_sql` が `sql::allowlist::validate_insert` 経由で
+/// 書き込み前に適用済み）。クレート外へ公開するとガードを迂回する書き込み入口に
+/// なる（codex-review P1 指摘・PR #221。security.md P0）。
+/// [`replace_typed_rows_by_text_key`] の入力一式（引数の取り違えを型で防ぎ、
+/// 引数個数を抑えるためのまとまり。`incremental::index_file` が構築する）。
+pub(crate) struct ReplaceByTextKey<'a> {
+    pub table: &'a str,
+    /// 置換キーにするテキスト列名（ファイル形 `INSERT` では常に `path`）。
+    pub key_column: &'a str,
+    pub key_value: &'a str,
+    pub visibility: crate::storage::Visibility,
+    pub rows: &'a [Vec<crate::row_codec::Value>],
+    /// 台帳への記録指示（TASK-93・RECOVER-2）。行の削除・挿入と同一 write
+    /// トランザクション内で適用される。
+    pub ledger_write: LedgerWrite<'a>,
+}
+
+pub(crate) fn replace_typed_rows_by_text_key(
+    storage: &Storage,
+    ctx: &PolicyContext,
+    req: ReplaceByTextKey<'_>,
+) -> Result<ReplaceOutcome, TenantWriteError> {
+    let ReplaceByTextKey {
+        table,
+        key_column,
+        key_value,
+        visibility,
+        rows,
+        ledger_write,
+    } = req;
+    validate_identifier(table)?;
+    let write_txn = storage.db().begin_write().map_err(CatalogError::from)?;
+    // `row_table` の借用（`write_txn.open_table(..)`）をこのブロック内に閉じ込め、
+    // ブロックを抜けた後に `write_txn` を（成功なら commit、無変更なら drop で
+    // abort）自由に扱えるようにする（`insert_rows` の空バッチ早期 return と異なり、
+    // 「削除対象 0 件」は行を走査するまで判定できないため、走査後に判定する）。
+    let outcome: Result<ReplaceOutcome, TenantWriteError> = (|| {
+        let schema = require_table_schema_write(&write_txn, table)?;
+        let vector_idx = schema
+            .columns
+            .iter()
+            .position(|c| matches!(c.ty, crate::catalog::ColumnType::Vector(_)))
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "table has no VECTOR column".to_string(),
+                ))
+            })?;
+        let key_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == key_column)
+            .ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(format!(
+                    "unknown key column: {key_column}"
+                )))
+            })?;
+
+        let row_table_name = user_rows_table_name(table);
+        let mut row_table = write_txn
+            .open_table(user_rows_table_def(&row_table_name))
+            .map_err(map_row_table_error)?;
+
+        let tenant = ctx.tenant_id();
+        // テナント名前空間内の既存行を走査し、削除対象 id・既存最大 id（削除対象・
+        // 対象外を問わない）を同時に収集する。`range` の借用は本ブロックで閉じ、
+        // 後続の `remove`/`insert`（`&mut` 借用）と衝突しないようにする
+        // （`update_row`/`delete_row` の `AccessGuard` スコープと同じ方針）。
+        let mut to_remove: Vec<u64> = Vec::new();
+        let mut max_id: Option<u64> = None;
+        let mut scanned_count: usize = 0;
+        {
+            let start = std::ops::Bound::Included((tenant, 0u64));
+            let end = std::ops::Bound::Included((tenant, u64::MAX));
+            let mut iter = row_table
+                .range::<(&str, u64)>((start, end))
+                .map_err(CatalogError::from)?;
+            for entry in &mut iter {
+                let (k, v) = entry.map_err(CatalogError::from)?;
+                let (_key_tenant, id) = k.value();
+                let raw = v.value();
+                scanned_count = scanned_count.saturating_add(1);
+                if scanned_count > MAX_SCANNED_ROWS {
+                    return Err(TenantWriteError::Storage(StorageError::Codec(format!(
+                        "too many rows scanned for replace: max {MAX_SCANNED_ROWS}"
+                    ))));
+                }
+                // embedding は比較に不要なため、metadata（スカラー列ペイロード）のみを
+                // 借用で取り出す（`decode_row` は行ごとに `Vec<f32>` を確保するため、
+                // テナント全行走査のホットパスでは使わない。`storage.rs`
+                // `decode_row_metadata_borrowed` モジュールドキュメント参照。
+                // coding-rust.md「不安全な設計 / DoS」対応）。
+                let metadata = crate::storage::decode_row_metadata_borrowed(raw)
+                    .map_err(TenantWriteError::Storage)?;
+                max_id = Some(max_id.map_or(id, |m: u64| m.max(id)));
+                let scanned = crate::row_codec::scan_scalar_columns(&schema, metadata)
+                    .map_err(|e| TenantWriteError::Storage(StorageError::Codec(e.to_string())))?;
+                if scanned.get(key_idx).copied().flatten() == Some(key_value) {
+                    to_remove.push(id);
+                    if to_remove.len() > MAX_VISIBLE_ROWS {
+                        return Err(TenantWriteError::Storage(StorageError::Codec(format!(
+                            "too many matching rows for replace: max {MAX_VISIBLE_ROWS}"
+                        ))));
+                    }
+                }
+            }
+        }
+
+        let removed = to_remove.len();
+        if removed == 0 && rows.is_empty() {
+            // 変更ゼロ。`insert_rows` の空バッチと同じく世代を進めずに成功する
+            // （呼び出し元が commit せず drop することを、戻り値の 0/0/None から判断する）。
+            return Ok(ReplaceOutcome {
+                removed: 0,
+                inserted: 0,
+                first_id: None,
+            });
+        }
+
+        // 台帳記録は行の削除・挿入と同一の write トランザクション内で行う
+        // （TASK-93・RECOVER-2。`insert_typed_row_unchecked` と同型。失敗すれば
+        // トランザクションごと abort し、行変更も台帳も残さない）。重複時の
+        // `RecordOutcome::AlreadyPresent` はここでは拒否理由にしない（重複拒否は
+        // TASK-94 の管轄で、行形 `INSERT` 経路と同じ扱いに揃える）。
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
+
+        for id in &to_remove {
+            row_table
+                .remove(&(tenant, *id))
+                .map_err(CatalogError::from)?;
+        }
+
+        let mut next_id = max_id.map_or(Ok(0u64), |m| {
+            m.checked_add(1).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "id namespace exhausted".to_string(),
+                ))
+            })
+        })?;
+        let mut first_id: Option<u64> = None;
+        let mut inserted = 0usize;
+        for values in rows {
+            let embedding = match values.get(vector_idx) {
+                Some(crate::row_codec::Value::Vector(v)) => v.clone(),
+                _ => {
+                    return Err(TenantWriteError::Catalog(CatalogError::Invalid(
+                        "VECTOR column value missing or not a Vector".to_string(),
+                    )))
+                }
+            };
+            schema.validate_embedding_dim(embedding.len())?;
+            let metadata = crate::row_codec::encode_scalar_columns(&schema, values)
+                .map_err(|e| CatalogError::Invalid(e.to_string()))?;
+            let row = RowInput {
+                tenant_id: ctx.tenant_id(),
+                visibility,
+                embedding: &embedding,
+                metadata: &metadata,
+            };
+            let id = next_id;
+            let key = (ctx.tenant_id(), id);
+            // 上の採番規則により既存行との衝突は起こらないはずだが、`insert_row` と
+            // 同じ防御（TOCTOU 対策の単一 write トランザクション内チェック）を残す。
+            if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
+                return Err(TenantWriteError::IdConflict);
+            }
+            let encoded = encode_row(&row)?;
+            row_table
+                .insert(key, encoded.as_slice())
+                .map_err(CatalogError::from)?;
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+            inserted += 1;
+            next_id = id.checked_add(1).ok_or_else(|| {
+                TenantWriteError::Catalog(CatalogError::Invalid(
+                    "id namespace exhausted".to_string(),
+                ))
+            })?;
+        }
+
+        Ok(ReplaceOutcome {
+            removed,
+            inserted,
+            first_id,
+        })
+    })();
+    let outcome = outcome?;
+    if outcome.removed == 0 && outcome.inserted == 0 {
+        drop(write_txn);
+        return Ok(outcome);
+    }
+    bump_generation_and_commit(write_txn)?;
+    Ok(outcome)
+}
+
+/// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア: RECOVER-2）。
+/// `crate::core::EngineCore::operation_recorded` からの薄い委譲先。`pub(crate)` に
+/// 限定する（codex-review P1 指摘・PR #226）: `EngineCore::operation_recorded` は
+/// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）で台帳へ一切触れず
+/// `LedgerLookup::NoLedger` を返す契約だが、本関数は `Storage` を直接受け取り
+/// `ledger_mode` の状態を知らないため、DB に過去（`Ledgered` 構成時）の記録が
+/// 残っていればそれをそのまま観測してしまう。これを公開したままだと
+/// `EngineCore` の「台帳を持たない構成では照会しない」という fail-closed な
+/// 区別を呼び出し元が迂回できてしまう。`EngineCore::operation_recorded` 経由の
+/// 委譲（`LedgerLookup` 判定込み）に一本化し、モード非依存の生の照会結果を
+/// クレート外へ公開しない。
+///
+/// 照会範囲は呼び出し元テナント（`ctx.tenant_id()`）の名前空間に閉じる。他テナントの
+/// `operation_id` 存在を成否・文言・経路差で観測できる経路にはならない（TABLE-12・
+/// RLS-9 と同型。security.md P0）。
+pub(crate) fn operation_recorded(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+    op_id: &OperationId,
+) -> Result<bool, TenantWriteError> {
+    validate_identifier(table)?;
+    let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
+    ledger::contains_in_read_txn(&read_txn, ctx.tenant_id(), table, op_id)
+        .map_err(TenantWriteError::LedgerCorrupted)
 }
 
 #[cfg(test)]
@@ -886,6 +1217,9 @@ mod tests {
                 embedding: &[1.0, 0.0],
                 metadata: &[],
             },
+            // 本テストの主眼は台帳ではなくテナント境界の到達範囲確認のため、台帳は
+            // 使わない（`LedgerWrite::Disabled`）。
+            LedgerWrite::Disabled,
         )
         .expect("seed tenant-b row via guarded path");
 
@@ -910,6 +1244,227 @@ mod tests {
             .get_row_from_table("docs", "tenant-a", 1)
             .expect("read back row");
         assert_eq!(after.tenant_id, "tenant-a");
+    }
+
+    // --- replace_typed_rows_by_text_key（TASK-120・対象ビヘイビア: INDEX-1, INDEX-2） --
+
+    fn file_schema(table: &str) -> TableSchema {
+        TableSchema::new(
+            table,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    fn row_values(embedding: [f32; 2], path: &str, body: &str) -> Vec<crate::row_codec::Value> {
+        vec![
+            crate::row_codec::Value::Vector(embedding.to_vec()),
+            crate::row_codec::Value::Text(path.to_string()),
+            crate::row_codec::Value::Text(body.to_string()),
+        ]
+    }
+
+    #[test]
+    fn replace_same_path_replaces_rows_and_leaves_other_paths_untouched() {
+        let path = unique_db_path("replace-same-path");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "other.txt",
+                visibility: Visibility::Private,
+                rows: &[row_values([9.0, 9.0], "other.txt", "unrelated")],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("seed other path");
+
+        let first = replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "note.txt",
+                visibility: Visibility::Private,
+                rows: &[row_values([1.0, 0.0], "note.txt", "v1 chunk a")],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("first replace should succeed");
+        assert_eq!(first.removed, 0);
+        assert_eq!(first.inserted, 1);
+        assert!(first.first_id.is_some());
+
+        let second = replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "note.txt",
+                visibility: Visibility::Private,
+                rows: &[
+                    row_values([2.0, 0.0], "note.txt", "v2 chunk a"),
+                    row_values([2.0, 1.0], "note.txt", "v2 chunk b"),
+                ],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("second replace should succeed");
+        assert_eq!(second.removed, 1);
+        assert_eq!(second.inserted, 2);
+        // 採番は既存最大 id + 1 から連番であり、他パス・旧チャンクの id と衝突しない。
+        assert!(second.first_id.unwrap() > first.first_id.unwrap());
+
+        // 他パスは無変更。
+        let visible_ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let rows = visible_rows(&storage, "docs", &visible_ctx).expect("visible rows");
+        let bodies: Vec<&str> = rows
+            .iter()
+            .map(|r| {
+                let scanned =
+                    crate::row_codec::scan_scalar_columns(&file_schema("docs"), &r.metadata)
+                        .expect("scan scalar columns");
+                scanned.get(2).copied().flatten().unwrap_or("")
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(bodies.contains(&"unrelated"));
+        assert!(bodies.contains(&"v2 chunk a"));
+        assert!(bodies.contains(&"v2 chunk b"));
+        assert!(!bodies.contains(&"v1 chunk a"));
+    }
+
+    #[test]
+    fn replace_does_not_touch_other_tenants_same_path_rows() {
+        let path = unique_db_path("replace-tenant-isolation");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            &ctx_b,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "shared.txt",
+                visibility: Visibility::Private,
+                rows: &[row_values([1.0, 1.0], "shared.txt", "tenant-b content")],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("tenant-b seed should succeed");
+
+        replace_typed_rows_by_text_key(
+            &storage,
+            &ctx_a,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "shared.txt",
+                visibility: Visibility::Private,
+                rows: &[row_values([2.0, 2.0], "shared.txt", "tenant-a content")],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("tenant-a replace should succeed");
+
+        let visible_ctx_b =
+            PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let rows_b = visible_rows(&storage, "docs", &visible_ctx_b).expect("visible rows");
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_b[0].tenant_id, "tenant-b");
+    }
+
+    #[test]
+    fn replace_empty_rows_and_no_match_does_not_bump_generation() {
+        let path = unique_db_path("replace-empty-noop");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&file_schema("docs"))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let before = storage.current_generation().expect("read generation");
+        let outcome = replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "absent.txt",
+                visibility: Visibility::Private,
+                rows: &[],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("no-op replace should succeed");
+        assert_eq!(outcome.removed, 0);
+        assert_eq!(outcome.inserted, 0);
+        assert_eq!(outcome.first_id, None);
+        let after = storage.current_generation().expect("read generation");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn replace_rejects_table_without_vector_column() {
+        let path = unique_db_path("replace-no-vector-column");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("path", ColumnType::Text, false)],
+            ))
+            .expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let err = replace_typed_rows_by_text_key(
+            &storage,
+            &ctx,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "a.txt",
+                visibility: Visibility::Private,
+                rows: &[vec![crate::row_codec::Value::Text("a.txt".to_string())]],
+                // 本テストは台帳の記録有無を検証対象にしないため無効化する。
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            TenantWriteError::Catalog(CatalogError::Invalid(_))
+        ));
     }
 
     // 対象ビヘイビア: TABLE-12・TASK-130。[`insert_unique_row`] 導入（`get` を省き

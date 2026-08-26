@@ -684,6 +684,14 @@ pub struct EngineCore {
     /// [`Self::with_precision_policy`] のみ。`crate::precision` モジュール
     /// ドキュメントの fail-open 不在の設計制約を参照）。
     precision_policy: crate::precision::PrecisionPolicy,
+    /// ファイル形 `INSERT`（TASK-120・INDEX-1, INDEX-2）のチャンク本文をベクトルへ
+    /// 変換する注入点。未設定（`None`）はファイル形 `INSERT` を fail-closed に
+    /// 拒否する契約（既定で参照実装を暗黙採用しない。`embedding.rs` モジュール
+    /// ドキュメント参照）。差し替えは [`Self::with_embedder`] のみ。
+    embedder: Option<Box<dyn crate::embedding::Embedder>>,
+    /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定（TASK-120）。
+    /// 差し替えは [`Self::with_incremental_config`] のみ。
+    incremental_config: crate::incremental::IncrementalConfig,
     /// `operation_id` 必須化ガード（TASK-92・対象ビヘイビア: RECOVER-1）を制御する
     /// サーバー側構成。クエリ・セッション変数から到達できる経路を持たない（差し替えは
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
@@ -709,6 +717,8 @@ impl EngineCore {
             provider,
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
+            embedder: None,
+            incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
         })
     }
@@ -730,6 +740,8 @@ impl EngineCore {
             provider,
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
+            embedder: None,
+            incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
         }
     }
@@ -748,6 +760,26 @@ impl EngineCore {
     /// 到達できない（`crate::precision` モジュールドキュメント参照）。
     pub fn with_precision_policy(mut self, policy: crate::precision::PrecisionPolicy) -> Self {
         self.precision_policy = policy;
+        self
+    }
+
+    /// ファイル形 `INSERT`（TASK-120・INDEX-1, INDEX-2）のベクトル化に使う
+    /// [`crate::embedding::Embedder`] を注入したビルダーを返す（所有権を消費する
+    /// ビルダーメソッドとし、[`Self::with_precision_policy`] と同じ流儀。未呼び出し
+    /// なら `None` のままで、ファイル形 `INSERT` は fail-closed に拒否される）。
+    pub fn with_embedder(mut self, embedder: Box<dyn crate::embedding::Embedder>) -> Self {
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定
+    /// （[`crate::incremental::IncrementalConfig`]）を差し替えたビルダーを返す
+    /// （TASK-120）。未呼び出しなら `IncrementalConfig::default()`。
+    pub fn with_incremental_config(
+        mut self,
+        config: crate::incremental::IncrementalConfig,
+    ) -> Self {
+        self.incremental_config = config;
         self
     }
 
@@ -971,8 +1003,8 @@ impl EngineCore {
         row: &crate::storage::RowInput<'_>,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::insert_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
     }
 
     /// `table` の既存行を 1 件更新する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -986,8 +1018,8 @@ impl EngineCore {
         row: &crate::storage::RowInput<'_>,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::update_row_unchecked(&self.storage, table, ctx, id, row, ledger_write)
     }
 
     /// `table` の既存行を 1 件削除する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -1000,8 +1032,34 @@ impl EngineCore {
         id: u64,
         operation_id: Option<&OperationId>,
     ) -> Result<(), crate::tenant::TenantWriteError> {
-        self.ledger_mode.require(operation_id)?;
-        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id)
+        let ledger_write = self.ledger_mode.resolve(operation_id)?;
+        crate::tenant::delete_row_unchecked(&self.storage, table, ctx, id, ledger_write)
+    }
+
+    /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア:
+    /// RECOVER-2）。`crate::tenant::operation_recorded` への薄い委譲のみ。
+    ///
+    /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）では台帳テーブルへ
+    /// 一切触れず [`LedgerLookup::NoLedger`] を返す（「未記録」と誤認させない
+    /// fail-closed な区別。`recovery::ledger` モジュールドキュメント参照）。
+    /// `VectorCore` trait へは昇格しない（`execute_insert_sql` と同じ理由。
+    /// `core-api-check` の対象外）。
+    pub fn operation_recorded(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        op_id: &OperationId,
+    ) -> Result<crate::recovery::ledger::LedgerLookup, crate::tenant::TenantWriteError> {
+        use crate::recovery::ledger::LedgerLookup;
+        if matches!(self.ledger_mode, LedgerMode::CompareOnlyWithoutLedger) {
+            return Ok(LedgerLookup::NoLedger);
+        }
+        let recorded = crate::tenant::operation_recorded(&self.storage, table, ctx, op_id)?;
+        Ok(if recorded {
+            LedgerLookup::Recorded
+        } else {
+            LedgerLookup::NotRecorded
+        })
     }
 
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
@@ -1124,8 +1182,22 @@ impl EngineCore {
                     detail: "failed to load table schema".to_string(),
                 },
             })?;
-        let bound = crate::sql::parser::bind_insert(&stmt, &schema)?;
-        crate::sql::exec::execute_insert(&self.storage, ctx, &bound)
+        let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
+        match bound {
+            crate::sql::parser::BoundInsertForm::Row(bound) => {
+                crate::sql::exec::execute_insert(&self.storage, ctx, &bound, self.ledger_mode)
+            }
+            crate::sql::parser::BoundInsertForm::File(bound) => {
+                crate::sql::exec::execute_file_insert(
+                    &self.storage,
+                    ctx,
+                    self.embedder.as_deref(),
+                    &self.incremental_config,
+                    &bound,
+                    self.ledger_mode,
+                )
+            }
+        }
     }
 }
 

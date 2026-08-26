@@ -10,6 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
+use crate::error_format::{ClassifiedError, ErrorClass};
 use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
@@ -19,8 +20,11 @@ use crate::sql::udf_call::{
 use crate::sql::using_operation_id::OperationId;
 
 /// エラーメッセージへ含める入力断片の長さ上限。untrusted 入力をそのまま無加工で
-/// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。
-const MAX_ERROR_DETAIL_LEN: usize = 200;
+/// 長大にエラーへ埋め込まない（security.md「情報漏えい」対応）。値は
+/// [`crate::error_format`] の単一真実源を参照し、wire 応答直前の最終切り詰め
+/// （`WireError::new`）と本モジュールの構築時切り詰めが別々の上限を持たないようにする
+/// （TASK-152・ERR-2）。
+const MAX_ERROR_DETAIL_LEN: usize = crate::error_format::MAX_MESSAGE_LEN;
 
 /// INSERT の列リスト・VALUES リストがそれぞれ持てる要素数の上限（SQL-10、TASK-80）。
 /// 無制限 `Vec` 確保を避ける（`.claude/rules/security.md`「不安全な設計｜無制限
@@ -119,17 +123,11 @@ pub enum SqlSurfaceError {
 
 impl SqlSurfaceError {
     /// ERR-2（docs/spec/04-behavior/error-format.md）の wire_code 写像。
+    /// TASK-152 で単一真実源化した [`ClassifiedError::wire_code`] へ委譲する
+    /// （既存の返値は 1 つも変えない。委譲先は `error_class()` の `match` のみを
+    /// 単一の判定点として持つ）。
     pub fn wire_code(&self) -> &'static str {
-        match self {
-            SqlSurfaceError::UnsupportedSyntax { .. } => "42601",
-            SqlSurfaceError::UndefinedTable { .. } => "42P01",
-            SqlSurfaceError::Internal { .. } => "XX000",
-            SqlSurfaceError::InvalidInput { .. } => "22000",
-            SqlSurfaceError::PayloadTooLarge { .. } => "54000",
-            SqlSurfaceError::MissingOperationId => "23502",
-            SqlSurfaceError::IdConflict => "23505",
-            SqlSurfaceError::NumericOutOfRange { .. } => "22003",
-        }
+        ClassifiedError::wire_code(self)
     }
 
     /// クライアント（wire 層 `ErrorResponse`）へそのまま返してよい文言を返す。
@@ -138,12 +136,10 @@ impl SqlSurfaceError {
     /// 通常の `Display` 文言（テナント越境の存在情報を含まないよう各コンストラクタ
     /// 側で既に切り詰め・一般化済み）をそのまま返す（security.md P0「private
     /// 情報の漏えい」対応。`wire-server::simple_query` はエラー応答の整形時に
-    /// `to_string()` ではなく必ずこちらを使うこと）。
+    /// `to_string()` ではなく必ずこちらを使うこと）。TASK-152 で
+    /// [`ClassifiedError::client_message`] へ委譲する（返値は不変）。
     pub fn client_message(&self) -> String {
-        match self {
-            SqlSurfaceError::Internal { .. } => "internal error".to_string(),
-            other => other.to_string(),
-        }
+        ClassifiedError::client_message(self)
     }
 
     /// `pub(crate)`: `sql::allowlist::Parser::parse_operation_id_clause`・
@@ -191,6 +187,32 @@ impl SqlSurfaceError {
     pub(crate) fn numeric_out_of_range(detail: impl Into<String>) -> Self {
         SqlSurfaceError::NumericOutOfRange {
             detail: truncate_for_error(&detail.into()),
+        }
+    }
+}
+
+/// TASK-152（ERR-2）: `wire_code` 写像の単一真実源 [`ErrorClass`] へ委譲する。
+/// variant → `ErrorClass` の対応は既存 `wire_code()` の返値と 1:1 で一致させ、
+/// 委譲化で応答コードを変えない（`IdConflict` は行 `id` 衝突であり、原因を問わない
+/// 一意制約違反の分類 [`ErrorClass::UniqueViolation`]（`23505`）へ写像する）。
+impl ClassifiedError for SqlSurfaceError {
+    fn error_class(&self) -> ErrorClass {
+        match self {
+            SqlSurfaceError::UnsupportedSyntax { .. } => ErrorClass::UnsupportedSqlSyntax,
+            SqlSurfaceError::UndefinedTable { .. } => ErrorClass::TableNotFound,
+            SqlSurfaceError::Internal { .. } => ErrorClass::InternalError,
+            SqlSurfaceError::InvalidInput { .. } => ErrorClass::InvalidInput,
+            SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
+            SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
+            SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
+            SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
+        }
+    }
+
+    fn client_message(&self) -> String {
+        match self {
+            SqlSurfaceError::Internal { .. } => "internal error".to_string(),
+            other => other.to_string(),
         }
     }
 }

@@ -46,6 +46,11 @@
 //! （ERR-2 が新設する `22003`）で fail-closed に拒否する。`GROUP BY`／`HAVING` は
 //! 引き続き許可リスト外（`42601`）。
 //!
+//! TASK-152（対象ビヘイビア: ERR-2）: `allowlist::SqlSurfaceError` の `wire_code` 写像は
+//! [`crate::error_format`]（`ErrorClass`・`ClassifiedError` trait）へ委譲する。本モジュール
+//! の公開シグネチャ・返値は変更しない（詳細は `error_format.rs` モジュールドキュメント
+//! 参照）。
+//!
 //! TASK-161（対象ビヘイビア: SQL-12）: クエリ単位の専用句 `USING MODE '<literal>'`
 //! （[`allowlist`]）とセッション変数 `SET search_mode = '<literal>'`（同）を追加し、
 //! 優先順位（クエリ句 > セッション変数 > 既定）の解決を [`mode::resolve_mode`] に
