@@ -196,9 +196,9 @@ pub fn check_degradation_within_limit(
 /// （`min_improvement_pct`）以上かを判定する（TASK-130・CORE-6/CORE-16 ポインタ:
 /// GPU 経路・f16 常駐経路の性能受け入れ）。
 ///
-/// 本 PR の時点では呼び出し元（`batch_bench.rs`）から未接続（実 GPU バックエンド
-/// 未接続のため。opt-in fail-closed で「判定不能」を扱う。判定ロジックのみ
-/// 先行実装し `tests/batch_accept.rs` で単体検証する）。
+/// 呼び出し元は `batch_bench.rs` の CORE-6/CORE-16 opt-in ゲート（Issue #178 で
+/// 実 GPU バックエンドへ接続済み）。判定ロジック自体は時間非依存のため
+/// `tests/batch_accept.rs` が `make ci` 側から単体検証する。
 ///
 /// 短縮率は `(baseline - candidate) / baseline * 100`（%）。`baseline` が
 /// `Duration::ZERO` だと除算不能なため `Err`（`check_degradation_within_limit` と

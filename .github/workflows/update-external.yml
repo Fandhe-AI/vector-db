@@ -1,0 +1,82 @@
+# 外部ソース（submodule 参照・エージェントスキル）の自動追従ワークフロー。
+#
+# 実装本体は Fandhe-AI/actions の reusable workflow `.github/workflows/update-external.yml`
+# （Fandhe-AI/agent-cli-skills イシュー #259 で reusable 化）。本ファイルはリポジトリ固有の
+# 設定だけを持つ薄い wrapper であり、fail-closed ガード・`persist-credentials`・
+# `source-token`・外部 action の pin・Node / skills CLI の版数は共通側で集中管理される。
+#
+# 参照方式（@latest・組織方針）:
+# `Fandhe-AI/actions`（組織内の上流リポジトリ）への `uses:` 参照は可変タグ `@latest` を使う
+# （2026-08-18 オーナー判断。fandhe-backend の AGENTS.md「Fandhe-AI/actions の参照方式
+# （@latest）」節に記録）。`latest` は上流の `.github/workflows/move-latest-tag.yml` が
+# main への push ごとに付け替えるため、実行される revision は常に上流 main の tip に追従
+# する。SHA 固定の観点は第三者 action にのみ適用する。
+#
+# 入力契約・権限・timeout の検証記録（2026-08-17 実測。@latest 追従のため、以下は実測時点の
+# 上流 revision に対する参考情報であり、現在実行される revision の保証ではない。契約が
+# 変わった場合は上流側の validate-inputs / actionlint が検出する前提の運用）:
+# - 入力契約: `on.workflow_call` は inputs 9 件（target / runner-json / base-branch /
+#   enable-submodule / enable-skills / submodule-auto-merge{,-allowlist} /
+#   skills-auto-merge{,-allowlist}）・secrets 2 件（SUBMODULE_PAT / SKILLS_PAT）で、いずれも
+#   required: false。本ファイルの with / secrets がこの契約の範囲内であることを機械照合した
+# - 権限: 呼び出し先ジョブの permissions は validate-inputs `{}`・submodule / skills が
+#   `contents: read`。reusable workflow の権限は呼び出し側以下である必要があり、本ファイルの
+#   `permissions: contents: read` で充足する
+# - 実行時間上限: 呼び出し先ジョブは validate-inputs 5 分・submodule 10 分・skills 15 分の
+#   `timeout-minutes` を持つ。reusable workflow を呼ぶジョブ自身には `timeout-minutes` を
+#   設定できないため、上限は上流のこの契約で担保される
+#
+# runner 選択の根拠（移行前ファイルから引き継ぎ）:
+# 「public 化に伴う組織 runner 方針（Fandhe-AI/actions リポジトリの docs/runner-policy.md）により GitHub
+# ホステッドランナーへ移行（イシュー #554）。」— 両ジョブの runs-on 直上に記載
+# 「ハングしたジョブの無期限実行を防ぐため、多層防御として timeout を必ず設定する（NFR-10・.claude/rules/ci.md・#182。runner
+# 種別に依らず維持する運用ルール）。」— 両ジョブの timeout-minutes 直上に記載
+
+name: Update external sources
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 00:00 UTC = 09:00 JST
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '更新対象（手動実行時のみ有効。schedule は常に all）'
+        type: choice
+        required: false
+        default: all
+        options:
+          - all
+          - submodule
+          - skill
+
+permissions:
+  contents: read
+
+# reusable workflow のトップレベル concurrency は機能しないため呼び出し側で設定する
+concurrency:
+  group: update-external
+  cancel-in-progress: false
+
+jobs:
+  update-external:
+    # 組織方針（冒頭コメント参照）により、上流 main 追従の可変タグ @latest を参照する
+    uses: Fandhe-AI/actions/.github/workflows/update-external.yml@latest
+    permissions:
+      contents: read
+    with:
+      # schedule 起動では inputs が null になるため all へフォールバックする
+      target: ${{ inputs.target || 'all' }}
+      # runs-on へ渡す JSON リテラル（素の self-hosted は fromJSON が失敗する）
+      runner-json: '"ubuntu-latest"'
+      # auto-merge はマージ可否を左右する設定のため、組織変数を呼び出し側で解決して渡す。
+      # 未設定（null/空）を有効と解釈する composite action の非対称設計に合わせ、
+      # 明示的に 'false' へフォールバックしオプトイン運用とする。
+      submodule-auto-merge: ${{ vars.SUBMODULE_AUTO_MERGE || 'false' }}
+      submodule-auto-merge-allowlist: ${{ vars.SUBMODULE_AUTO_MERGE_ALLOWLIST }}
+      skills-auto-merge: ${{ vars.SKILLS_AUTO_MERGE || 'false' }}
+      skills-auto-merge-allowlist: ${{ vars.SKILLS_AUTO_MERGE_ALLOWLIST }}
+    secrets:
+      # 未登録の secret は空文字となり、共通側のガードが checkout 前に fail-closed で止める。
+      # SKILLS_PAT 未登録時は共通側が SUBMODULE_PAT へフォールバックする。
+      SUBMODULE_PAT: ${{ secrets.SUBMODULE_PAT }}
+      SKILLS_PAT: ${{ secrets.SKILLS_PAT }}

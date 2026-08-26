@@ -20,8 +20,9 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
-- **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）
+- **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
+- **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -85,7 +86,7 @@ gh variable set BENCH_MAX_CONTRAST_RATIO
 
 CORE-5（対照エンジンとの p95 レイテンシ比較。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）は usearch の総当たり `exact_search`（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176。クレート採用と公開境界はオーナー承認済み〔2026-08-26〕）。`contrast_bench.rs` が被検（`ParallelSearchProvider`）と対照エンジンを同一データ・同一クエリで interleaved A/B 実行し、両者の p95 レイテンシ比率（被検/対照）が `BENCH_MAX_CONTRAST_RATIO` 以下であることを判定します。CORE-3/CORE-4（`simd_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。閾値の具体値は spec が SSOT のため本リポジトリには記載せず、bench の標準出力にも出しません。`contrast-bench` feature は `make lint`／`make test`（lefthook pre-push 含む）が `--all-features` で実行するため、`make bench-contrast` に限らずこれらのローカル実行・CI でも usearch の C++ ビルドが走ります。C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに C++17 コンパイラがない環境では `make lint`／`make test`／`make ci` が失敗します）。
 
-同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡中で、`BENCH_CORE6`／`BENCH_CORE16` repo variable による opt-in 方式のまま維持します（未設定＝既定で対象外）。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。
+同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は Issue #178 で追跡中です。実 GPU バックエンド（`gpu_batch.rs`）に加え、CORE-6 は `benches/batch_bench.rs` の A/B 実測ゲート（GPU 経路 vs CPU-SIMD 経路）へ配線済みです。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限 `BENCH_CORE6_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。CORE-16 は GPU 側の f32 常駐対照経路が未実装のため引き続き測定不能で（Issue #234 で追跡）、`BENCH_CORE16` を opt-in するとその理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
 
 ### C1 p95 専有環境再測定（TASK-83）
 

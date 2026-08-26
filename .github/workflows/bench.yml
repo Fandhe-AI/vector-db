@@ -14,7 +14,8 @@ name: Bench
 # docs/spec/04-behavior/core-engine.md CORE-5 が SSOT）は usearch を対照エンジンとして
 # 接続済み（TASK-127・Issue #176）で、bench-contrast ジョブ（下記）が既定ゲートとして
 # 実測する（旧 opt-in repo variable は撤去済み）。CORE-6（GPU vs CPU-SIMD）・CORE-16
-# （f16 常駐 vs f32 常駐）は実 GPU バックエンド未接続のため Issue #178 で追跡し、
+# （f16 常駐 vs f32 常駐）は Issue #178 で実 GPU バックエンド（`engine::gpu_batch`）へ
+# 接続済みだが、GitHub ホステッド runner に GPU がない・閾値が spec SSOT であることから
 # `BENCH_CORE6`・`BENCH_CORE16` repo variable による opt-in のまま維持する
 # （`batch_bench.rs` 冒頭コメント参照）。
 #
@@ -121,13 +122,21 @@ jobs:
         # ハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する。
         # BENCH_BATCH_MAX_DEGRADATION_PCT が未設定の場合は `batch_bench.rs` 側が
         # fail-closed で非ゼロ終了する。BENCH_CORE6/BENCH_CORE16 は repo variable が
-        # 未設定（既定）なら対象外として扱う opt-in フラグで、実 GPU 接続後（Issue
-        # #178）にリポジトリ管理者が `gh variable set BENCH_CORE6 1` 等で有効化する
-        # 想定（`batch_bench.rs` 冒頭コメント参照）。
+        # 未設定（既定）なら対象外として扱う opt-in フラグで、リポジトリ管理者が
+        # `gh variable set BENCH_CORE6 1` 等で有効化する想定（Issue #178 で実 GPU
+        # バックエンドへ接続済み。`batch_bench.rs` 冒頭コメント参照）。opt-in 時は
+        # CORE-6 は短縮率の下限（BENCH_CORE6_MIN_IMPROVEMENT_PCT。値は spec が
+        # SSOT）も必要で、未設定なら判定不能として fail-closed に非ゼロ終了する。
+        # なお GitHub ホステッド runner には GPU がないため、BENCH_CORE6 を有効化
+        # すると CORE-6 は「測定不能（pass=false）」になる（GPU 搭載 self-hosted
+        # runner 前提のフラグ。CPU 同士の比較値を GPU 実測の代替として計上しない）。
+        # CORE-16（GPU 常駐 f16 パック vs f32 常駐）は GPU 側の f32 常駐対照経路が
+        # 未実装のため、opt-in しても「測定不能（pass=false）」を報告する。
         env:
           BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ vars.BENCH_BATCH_MAX_DEGRADATION_PCT }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
           BENCH_CORE16: ${{ vars.BENCH_CORE16 }}
+          BENCH_CORE6_MIN_IMPROVEMENT_PCT: ${{ vars.BENCH_CORE6_MIN_IMPROVEMENT_PCT }}
         run: make bench-batch
 
   # --------------------------------------------------
