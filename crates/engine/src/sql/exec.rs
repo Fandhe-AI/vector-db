@@ -990,9 +990,11 @@ fn project_rows(
     Ok(rows)
 }
 
-/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80 の公開 API）。
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80）。
 /// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
-/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
+/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。クレート外へ公開する
+/// 契約は持たず、可視性は `pub(crate)` に留める（TASK-93・codex-review P1 指摘・PR #226:
+/// `ledger_mode` 引数の追加をソース互換性の破壊的変更として扱う必要をなくすため）。
 ///
 /// 行の書き込みはガードなし実体 [`crate::tenant::insert_typed_row_unchecked`]（`pub(crate)`）
 /// へ委譲する（TASK-95・TABLE-12・RLS-9。`operation_id` 必須化ガードは本関数の
@@ -1033,7 +1035,7 @@ fn project_rows(
 /// ため、ここで改めて `MissingOperationId` を返す経路は実質到達しない
 /// （`LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、その場合
 /// `resolve` は `LedgerWrite::Disabled` を返し、台帳へは触れない）。
-pub fn execute_insert(
+pub(crate) fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundInsert,
