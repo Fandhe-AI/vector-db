@@ -119,6 +119,34 @@ fn insert_empty_operation_id_value_is_rejected_as_missing() {
     assert_eq!(err.wire_code(), "23502");
 }
 
+// 対象ビヘイビア: RECOVER-1（TASK-92）。明示 `NULL` は句の欠落と同様に拒否する。
+#[test]
+fn insert_explicit_null_operation_id_is_rejected_as_missing_before_any_write() {
+    let path = unique_db_path("insert-explicit-null");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let err = core
+        .execute_insert_sql(
+            &ctx,
+            "INSERT INTO documents (id, embedding, body) VALUES (1, '[0.1,0.2,0.3]', 'hello') USING OPERATION_ID NULL",
+        )
+        .expect_err("explicit NULL must be rejected as missing");
+    assert_eq!(err.wire_code(), "23502");
+
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let result = core
+        .execute_sql(
+            &read_ctx,
+            "SELECT id FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3]' LIMIT 5",
+        )
+        .expect("select should succeed");
+    assert!(result.rows.is_empty());
+}
+
 // --- 拡張クエリプロトコル形式（$n）は 42601 --------------------------------------
 
 #[test]

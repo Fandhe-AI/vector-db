@@ -9,9 +9,12 @@
 //!
 //! 書き込み系 SQL 文（`INSERT`）は `EngineCore::execute_insert_sql`（TASK-80、
 //! 対象ビヘイビア: SQL-10）が別エントリポイントとして扱う。文末専用句
-//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）の省略は、書き込み
-//! トランザクションを開始する前に構造検証段階で fail-closed に拒否する
-//! （RECOVER-1 の必須化ガードの前段）。
+//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）は本モジュールが構造
+//! パース（省略・明示 `NULL` はいずれも `None`）のみを行い、必須化の判断
+//! （省略を書き込みトランザクション開始前に `23502` で拒否するか否か）は
+//! サーバー構成 [`crate::recovery::required_op_id::LedgerMode`] へ移した
+//! （TASK-92・RECOVER-1。`allowlist::validate_insert` が `LedgerMode::require` へ
+//! 委譲する）。
 //!
 //! 本モジュール配下は wire プロトコル入力と同じ untrusted 入力の扱い
 //! （`.claude/rules/coding-rust.md`）に従う。

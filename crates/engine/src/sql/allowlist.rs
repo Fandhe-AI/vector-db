@@ -10,6 +10,7 @@
 //! 後続タスクが [`ValidatedStatement`] を土台に実装する。本モジュールは
 //! 「許可形状の構造判定を通過させる」ところまでに責務を留める。
 
+use crate::recovery::required_op_id::LedgerMode;
 use crate::sql::lexer::{self, Keyword, LexError, Token};
 use crate::sql::plan::{self, EvaluationOrder, Stage};
 use crate::sql::udf_call::{
@@ -446,8 +447,12 @@ pub struct ValidatedInsert {
     /// `parse_insert` が既に一致を確認済み）。
     pub columns: Vec<String>,
     pub values: Vec<InsertLiteral>,
-    /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。
-    pub operation_id: OperationId,
+    /// 文末専用句で搬送された、検証済みの `operation_id`（SQL-10）。句の欠落・明示
+    /// `NULL` はいずれも `None`（TASK-92・RECOVER-1）。`validate_insert` は
+    /// `LedgerMode::Ledgered`（既定）では `None` を書き込みトランザクション開始前に
+    /// `23502` で拒否するため、この構成では常に `Some` になる。
+    /// `LedgerMode::CompareOnlyWithoutLedger` では `None` を許す。
+    pub operation_id: Option<OperationId>,
 }
 
 /// 1 文の最大トークン数を超えない前提の下で使うパーサーカーソル。
@@ -1041,10 +1046,11 @@ impl<'a> Parser<'a> {
             )));
         }
 
-        // 文末専用句の省略（`23502`）は、この時点でまだ FROM/INTO テーブルの
-        // カタログ照会（`validate_insert` の呼び出し元）を一切行っていない
-        // ＝書き込みトランザクションは絶対に開始されていない段階で判定される
-        // （SQL-10 の要件: 省略は書き込みトランザクションを開始する前に拒否する）。
+        // 文末専用句の構造パースのみをここで行う（省略・明示 `NULL` はいずれも
+        // `None`）。必須化の判定（`23502`）は `validate_insert` が
+        // `LedgerMode::require` へ委譲し、この時点でまだ FROM/INTO テーブルの
+        // カタログ照会を一切行っていない＝書き込みトランザクションは絶対に
+        // 開始されていない段階で行われる（TASK-92・RECOVER-1）。
         let operation_id = self.parse_operation_id_clause()?;
 
         Ok(ParsedInsertShape {
@@ -1055,20 +1061,29 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）。省略は
-    /// [`SqlSurfaceError::MissingOperationId`]（`23502`）。`USING` の後に
-    /// `OPERATION_ID` キーワード・文字列リテラルが続かない形（`$n` プレースホルダ
-    /// 由来の字句解析拒否を含む）・`OPERATION_ID` に文字列リテラル以外が続く形
-    /// （数値・識別子等）は許可リスト外として `42601` へ落ちる
-    /// （`expect_keyword`/`expect_string_literal` が `UnsupportedSyntax` を返す）。
-    fn parse_operation_id_clause(&mut self) -> Result<OperationId, SqlSurfaceError> {
+    /// 文末専用句 `USING OPERATION_ID '<id>'`（SQL-10、TASK-80）の構造パースのみを
+    /// 行う（値の意味論的検証は [`OperationId::parse`]）。句の省略・明示
+    /// `USING OPERATION_ID NULL`（大小無視。字句解析上は `Token::Ident("NULL")`）は
+    /// いずれも `Ok(None)` として返し、`23502` への判定はここでは行わない
+    /// （TASK-92・RECOVER-1: 必須化の可否はサーバー構成 `LedgerMode` が決める。
+    /// 呼び出し元 [`validate_insert`] が `LedgerMode::require` へ委譲する）。`USING` の
+    /// 後に `OPERATION_ID` キーワードが続かない形（`$n` プレースホルダ由来の字句解析
+    /// 拒否を含む）・`OPERATION_ID` に文字列リテラルでも `NULL` でもない形
+    /// （数値・他の識別子等）は許可リスト外として `42601` へ落ちる
+    /// （`expect_contextual_keyword`/`expect_string_literal` が `UnsupportedSyntax` を
+    /// 返す）。
+    fn parse_operation_id_clause(&mut self) -> Result<Option<OperationId>, SqlSurfaceError> {
         if self.peek_contextual_keyword("USING") {
             self.advance();
             self.expect_contextual_keyword("OPERATION_ID")?;
+            if self.peek_contextual_keyword("NULL") {
+                self.advance();
+                return Ok(None);
+            }
             let raw = self.expect_string_literal()?;
-            OperationId::parse(&raw)
+            OperationId::parse(&raw).map(Some)
         } else {
-            Err(SqlSurfaceError::missing_operation_id())
+            Ok(None)
         }
     }
 }
@@ -1259,7 +1274,7 @@ struct ParsedInsertShape {
     table_name: String,
     columns: Vec<String>,
     values: Vec<InsertLiteral>,
-    operation_id: OperationId,
+    operation_id: Option<OperationId>,
 }
 
 /// INSERT 文をトークン化し、許可リスト形式で構造検証してから、`lookup` を通じて
@@ -1269,22 +1284,20 @@ struct ParsedInsertShape {
 /// `expect_end_of_statement` が余剰トークンとして `42601` で拒否するため、
 /// SELECT/INSERT を誤って混同受理する経路は構造的に存在しない）。
 ///
-/// 検証順序（決定的。同一入力には常に同一の [`SqlSurfaceError`] を返す）:
-/// 1. 字句解析（[`SqlSurfaceError::UnsupportedSyntax`]）
-/// 2. 構造の許可リスト判定。文末専用句の省略はこの段階で
-///    [`SqlSurfaceError::MissingOperationId`]（`23502`）として判定され、
-///    カタログ照会（次段）は一切呼ばれない＝書き込みトランザクションは
-///    絶対に開始されていない（SQL-10 の要件）
-/// 3. INTO 単一テーブルのカタログ存在確認（不存在は [`SqlSurfaceError::UndefinedTable`]、
-///    `wire_code` は `42P01`）
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
+/// 詳細は `recovery::required_op_id` モジュールドキュメント参照。
 pub fn validate_insert(
     sql: &str,
     lookup: &impl TableLookup,
+    mode: LedgerMode,
 ) -> Result<ValidatedInsert, SqlSurfaceError> {
     let tokens = lexer::tokenize(sql)?;
     let mut p = Parser::new(&tokens);
     let shape = p.parse_insert()?;
     p.expect_end_of_statement()?;
+
+    mode.require(shape.operation_id.as_ref())?;
 
     let exists = lookup.table_exists(&shape.table_name)?;
     if !exists {
@@ -1985,6 +1998,7 @@ mod tests {
         let stmt = validate_insert(
             "INSERT INTO documents (id, embedding) VALUES (1, '[0.1,0.2]') USING OPERATION_ID 'op-0001'",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect("basic INSERT shape should be accepted");
         assert_eq!(stmt.table_name, "documents");
@@ -1992,7 +2006,10 @@ mod tests {
             stmt.columns,
             vec!["id".to_string(), "embedding".to_string()]
         );
-        assert_eq!(stmt.operation_id.as_str(), "op-0001");
+        assert_eq!(
+            stmt.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
     }
 
     #[test]
@@ -2001,6 +2018,7 @@ mod tests {
         assert!(validate_insert(
             "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'op-0001';",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .is_ok());
     }
@@ -2008,9 +2026,65 @@ mod tests {
     #[test]
     fn rejects_insert_missing_operation_id_clause() {
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert("INSERT INTO documents (id) VALUES (1)", &lookup)
-            .expect_err("missing clause must be rejected");
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1)",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("missing clause must be rejected");
         assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_insert_with_explicit_null_operation_id() {
+        // 明示 `NULL` は句の欠落と同様に扱う（TASK-92・RECOVER-1）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("explicit NULL must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn rejects_insert_with_explicit_null_operation_id_case_insensitive() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID null",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("lowercase null must be rejected as missing");
+        assert_eq!(err.wire_code(), "23502");
+    }
+
+    #[test]
+    fn explicit_null_operation_id_does_not_reach_catalog_lookup() {
+        struct FlaggingCatalog {
+            called: std::cell::Cell<bool>,
+        }
+        impl TableLookup for FlaggingCatalog {
+            fn table_exists(&self, _name: &str) -> Result<bool, SqlSurfaceError> {
+                self.called.set(true);
+                Ok(true)
+            }
+        }
+        let lookup = FlaggingCatalog {
+            called: std::cell::Cell::new(false),
+        };
+        let err = validate_insert(
+            "INSERT INTO nope (id) VALUES (1) USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
+        assert_eq!(err.wire_code(), "23502");
+        assert!(
+            !lookup.called.get(),
+            "catalog lookup must not be reached before the operation_id clause is validated"
+        );
     }
 
     #[test]
@@ -2019,6 +2093,7 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID ''",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("empty value must be rejected as missing");
         assert_eq!(err.wire_code(), "23502");
@@ -2030,6 +2105,7 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID $1",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("$n placeholder must be rejected");
         assert_eq!(err.wire_code(), "42601");
@@ -2041,6 +2117,7 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 123",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("non-string value must be rejected");
         assert_eq!(err.wire_code(), "42601");
@@ -2052,9 +2129,51 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'a' USING OPERATION_ID 'b'",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("duplicate clause must be rejected");
         assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_missing_operation_id_clause() {
+        // サーバー構成のみが必須化の可否を決める（TASK-92・RECOVER-1）:
+        // `CompareOnlyWithoutLedger` では句の省略を許す。
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id) VALUES (1)",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        assert_eq!(stmt.operation_id, None);
+    }
+
+    #[test]
+    fn compare_only_without_ledger_accepts_explicit_null() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID NULL",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect("compare-only mode must not require operation_id");
+        assert_eq!(stmt.operation_id, None);
+    }
+
+    #[test]
+    fn compare_only_without_ledger_still_validates_control_characters() {
+        // 値検証（制御文字混入は `22000`）はサーバー構成に依存しない
+        // （`LedgerMode` は必須化の可否のみを制御し、値の意味論的妥当性検証
+        // 〔`OperationId::parse`〕を迂回させない）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_insert(
+            "INSERT INTO documents (id) VALUES (1) USING OPERATION_ID 'op-\u{0007}'",
+            &lookup,
+            LedgerMode::CompareOnlyWithoutLedger,
+        )
+        .expect_err("control character must still be rejected");
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
@@ -2074,6 +2193,7 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO documents (id, embedding) VALUES (1) USING OPERATION_ID 'op-0001'",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("column/value count mismatch must be rejected");
         assert_eq!(err.wire_code(), "42601");
@@ -2085,6 +2205,7 @@ mod tests {
         let err = validate_insert(
             "INSERT INTO nope (id) VALUES (1) USING OPERATION_ID 'op-0001'",
             &lookup,
+            LedgerMode::Ledgered,
         )
         .expect_err("undefined table must be rejected");
         assert_eq!(err.wire_code(), "42P01");
@@ -2096,8 +2217,12 @@ mod tests {
         // （構造判定が先）により常に 23502 として決定的に分類される
         // （SQL-10 の要件: 省略は書き込みトランザクション開始前に拒否）。
         let lookup = catalog_with(&["documents"]);
-        let err = validate_insert("INSERT INTO nope (id) VALUES (1)", &lookup)
-            .expect_err("must be rejected");
+        let err = validate_insert(
+            "INSERT INTO nope (id) VALUES (1)",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
         assert_eq!(err.wire_code(), "23502");
     }
 
@@ -2118,8 +2243,12 @@ mod tests {
         let lookup = FlaggingCatalog {
             called: std::cell::Cell::new(false),
         };
-        let err = validate_insert("INSERT INTO nope (id) VALUES (1)", &lookup)
-            .expect_err("must be rejected");
+        let err = validate_insert(
+            "INSERT INTO nope (id) VALUES (1)",
+            &lookup,
+            LedgerMode::Ledgered,
+        )
+        .expect_err("must be rejected");
         assert_eq!(err.wire_code(), "23502");
         assert!(
             !lookup.called.get(),
@@ -2139,7 +2268,8 @@ mod tests {
             cols.join(", "),
             vals.join(", ")
         );
-        let err = validate_insert(&sql, &lookup).expect_err("must be rejected");
+        let err =
+            validate_insert(&sql, &lookup, LedgerMode::Ledgered).expect_err("must be rejected");
         assert_eq!(err.wire_code(), "42601");
     }
 
@@ -2147,8 +2277,12 @@ mod tests {
     fn same_insert_input_yields_same_classification_across_repeated_calls() {
         let lookup = catalog_with(&["documents"]);
         let sql = "INSERT INTO documents (id) VALUES (1)";
-        let first = validate_insert(sql, &lookup).unwrap_err().wire_code();
-        let second = validate_insert(sql, &lookup).unwrap_err().wire_code();
+        let first = validate_insert(sql, &lookup, LedgerMode::Ledgered)
+            .unwrap_err()
+            .wire_code();
+        let second = validate_insert(sql, &lookup, LedgerMode::Ledgered)
+            .unwrap_err()
+            .wire_code();
         assert_eq!(first, second);
     }
 

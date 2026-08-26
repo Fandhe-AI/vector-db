@@ -69,6 +69,8 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -267,6 +269,8 @@ fn dividing_by_a_zero_norm_vector_is_fail_closed_when_distance_runs_first() {
         1,
         Visibility::Private,
         &[Value::Vector(vec![0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert zero vector");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
@@ -353,6 +357,8 @@ fn equality_predicate_and_expr_predicate_combine_in_the_same_where_clause() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -398,6 +404,8 @@ fn udf_expression_never_evaluates_on_invisible_rows() {
         1,
         Visibility::Public,
         &[Value::Vector(vec![1.0, 0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert tenant-a row");
 
@@ -414,6 +422,8 @@ fn udf_expression_never_evaluates_on_invisible_rows() {
         2,
         Visibility::Private,
         &[Value::Vector(vec![0.0, 0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert tenant-b row");
 
@@ -576,6 +586,8 @@ fn dividing_by_a_zero_norm_vector_is_fail_closed_with_22000() {
         1,
         Visibility::Private,
         &[Value::Vector(vec![0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert zero vector");
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));

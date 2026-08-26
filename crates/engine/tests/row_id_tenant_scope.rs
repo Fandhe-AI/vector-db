@@ -67,10 +67,26 @@ fn table12_insert_with_an_id_held_by_another_tenant_succeeds_without_touching_th
     let a = ctx(TENANT_A);
     let b = ctx(TENANT_B);
 
-    tenant::insert_row(&storage, TABLE, &a, 1, &row(TENANT_A, &[1.0, 0.0], b"a1"))
-        .expect("tenant-a insert id=1");
-    tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[0.0, 1.0], b"b1"))
-        .expect("tenant-b must be able to use the same id in its own namespace");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &a,
+        1,
+        &row(TENANT_A, &[1.0, 0.0], b"a1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-a insert id=1");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &b,
+        1,
+        &row(TENANT_B, &[0.0, 1.0], b"b1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-b must be able to use the same id in its own namespace");
 
     // 双方の行が独立に残っていること（テスト側で期待値をベタ書きし、本体の
     // 可視性判定 API には依存しない）。
@@ -101,6 +117,8 @@ fn table12_duplicate_id_within_the_same_tenant_is_rejected_with_23505() {
         &a,
         7,
         &row(TENANT_A, &[1.0, 0.0], b"first"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("first insert ok");
     let err = tenant::insert_row(
@@ -109,6 +127,8 @@ fn table12_duplicate_id_within_the_same_tenant_is_rejected_with_23505() {
         &a,
         7,
         &row(TENANT_A, &[0.0, 1.0], b"second"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect_err("duplicate id within the same tenant must be rejected");
     assert!(matches!(err, TenantWriteError::IdConflict));
@@ -140,6 +160,8 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &b,
         42,
         &row(TENANT_B, &[0.0, 1.0], b"foreign"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed tenant-b row id=42");
     let with_foreign = tenant::insert_row(
@@ -148,6 +170,8 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"mine"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     );
 
     // ケース 2: どのテナントも id=42 を保持していない状態で同じ INSERT。
@@ -158,6 +182,8 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"mine"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     );
 
     assert!(
@@ -177,6 +203,8 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"dup"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect_err("duplicate within tenant-a must be rejected");
     let dup_without_foreign = tenant::insert_row(
@@ -185,6 +213,8 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"dup"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect_err("duplicate within tenant-a must be rejected");
     assert_eq!(
@@ -212,19 +242,55 @@ fn recover4_cross_tenant_update_and_delete_are_uniformly_not_found() {
     let (storage, _cleanup) = open_seeded("cross-update-delete");
     let a = ctx(TENANT_A);
     let b = ctx(TENANT_B);
-    tenant::insert_row(&storage, TABLE, &b, 5, &row(TENANT_B, &[0.0, 1.0], b"b5"))
-        .expect("seed tenant-b row id=5");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &b,
+        5,
+        &row(TENANT_B, &[0.0, 1.0], b"b5"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("seed tenant-b row id=5");
 
-    let update_existing =
-        tenant::update_row(&storage, TABLE, &a, 5, &row(TENANT_A, &[1.0, 0.0], b"x"))
-            .expect_err("cross-tenant update must fail");
-    let update_missing =
-        tenant::update_row(&storage, TABLE, &a, 6, &row(TENANT_A, &[1.0, 0.0], b"x"))
-            .expect_err("update of a nonexistent id must fail");
-    let delete_existing =
-        tenant::delete_row(&storage, TABLE, &a, 5).expect_err("cross-tenant delete must fail");
-    let delete_missing = tenant::delete_row(&storage, TABLE, &a, 6)
-        .expect_err("delete of a nonexistent id must fail");
+    let update_existing = tenant::update_row(
+        &storage,
+        TABLE,
+        &a,
+        5,
+        &row(TENANT_A, &[1.0, 0.0], b"x"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("cross-tenant update must fail");
+    let update_missing = tenant::update_row(
+        &storage,
+        TABLE,
+        &a,
+        6,
+        &row(TENANT_A, &[1.0, 0.0], b"x"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("update of a nonexistent id must fail");
+    let delete_existing = tenant::delete_row(
+        &storage,
+        TABLE,
+        &a,
+        5,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("cross-tenant delete must fail");
+    let delete_missing = tenant::delete_row(
+        &storage,
+        TABLE,
+        &a,
+        6,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("delete of a nonexistent id must fail");
 
     for e in [
         &update_existing,
@@ -258,10 +324,26 @@ fn table12_search_tolerates_the_same_id_held_by_two_tenants_as_public_rows() {
     let (storage, _cleanup) = open_seeded("search-dup-id");
     let a = ctx(TENANT_A);
     let b = ctx(TENANT_B);
-    tenant::insert_row(&storage, TABLE, &a, 1, &row(TENANT_A, &[1.0, 0.0], b"a1"))
-        .expect("tenant-a public row id=1");
-    tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[1.0, 0.0], b"b1"))
-        .expect("tenant-b public row id=1");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &a,
+        1,
+        &row(TENANT_A, &[1.0, 0.0], b"a1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-a public row id=1");
+    tenant::insert_row(
+        &storage,
+        TABLE,
+        &b,
+        1,
+        &row(TENANT_B, &[1.0, 0.0], b"b1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-b public row id=1");
 
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let hits = core
@@ -309,6 +391,8 @@ fn table12_sql_projection_never_mixes_embedding_and_scalars_across_tenants() {
             RowCodecValue::Vector(vec![1.0, 0.0]),
             RowCodecValue::Text("body-a".to_string()),
         ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("tenant-a row id=100");
     engine::tenant::insert_typed_row(
@@ -321,6 +405,8 @@ fn table12_sql_projection_never_mixes_embedding_and_scalars_across_tenants() {
             RowCodecValue::Vector(vec![0.0, 1.0]),
             RowCodecValue::Text("body-b".to_string()),
         ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("tenant-b row id=100");
 
@@ -386,6 +472,8 @@ fn table12_hybrid_sql_tolerates_the_same_id_held_by_two_tenants() {
             RowCodecValue::Vector(vec![1.0, 0.0]),
             RowCodecValue::Text("vector database tenant a".to_string()),
         ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("tenant-a row id=100");
     engine::tenant::insert_typed_row(
@@ -398,6 +486,8 @@ fn table12_hybrid_sql_tolerates_the_same_id_held_by_two_tenants() {
             RowCodecValue::Vector(vec![0.0, 1.0]),
             RowCodecValue::Text("vector database tenant b".to_string()),
         ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("tenant-b row id=100");
 
@@ -438,8 +528,15 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         (1u64, row(TENANT_A, &[1.0, 0.0], b"a1")),
         (2u64, row(TENANT_B, &[0.0, 1.0], b"b2")),
     ];
-    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &mixed)
-        .expect_err("a batch containing another tenant's row must be rejected");
+    let err = engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &a,
+        &mixed,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("a batch containing another tenant's row must be rejected");
     assert!(matches!(err, TenantWriteError::Forbidden));
     assert_eq!(err.wire_code(), "42501");
     assert!(storage.get_row_from_table(TABLE, TENANT_A, 1).is_err());
@@ -449,8 +546,15 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         (5u64, row(TENANT_A, &[1.0, 0.0], b"first")),
         (5u64, row(TENANT_A, &[0.0, 1.0], b"second")),
     ];
-    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &dup)
-        .expect_err("duplicate ids within one batch must be rejected");
+    let err = engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &a,
+        &dup,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("duplicate ids within one batch must be rejected");
     assert!(matches!(err, TenantWriteError::IdConflict));
     assert!(storage.get_row_from_table(TABLE, TENANT_A, 5).is_err());
 
@@ -459,10 +563,25 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         (1u64, row(TENANT_A, &[1.0, 0.0], b"a1")),
         (2u64, row(TENANT_A, &[0.5, 0.5], b"a2")),
     ];
-    engine::tenant::insert_rows(&storage, TABLE, &a, &batch_a).expect("own-tenant batch ok");
+    engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &a,
+        &batch_a,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("own-tenant batch ok");
     let batch_b = vec![(1u64, row(TENANT_B, &[0.0, 1.0], b"b1"))];
-    engine::tenant::insert_rows(&storage, TABLE, &b, &batch_b)
-        .expect("another tenant may reuse the same id");
+    engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &b,
+        &batch_b,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("another tenant may reuse the same id");
     assert_eq!(
         storage
             .get_row_from_table(TABLE, TENANT_A, 1)
@@ -480,8 +599,15 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
 
     // 既存行と衝突するバッチは IdConflict（既存行は不変）。
     let conflict = vec![(2u64, row(TENANT_A, &[0.0, 0.0], b"overwrite"))];
-    let err = engine::tenant::insert_rows(&storage, TABLE, &a, &conflict)
-        .expect_err("existing id within the same tenant must conflict");
+    let err = engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &a,
+        &conflict,
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect_err("existing id within the same tenant must conflict");
     assert!(matches!(err, TenantWriteError::IdConflict));
     assert_eq!(
         storage
@@ -505,8 +631,16 @@ fn rls9_verify_hits_detects_an_invisible_row_sharing_an_id_with_a_visible_row() 
     let c = ctx(TENANT_C);
     // tenant-b の Public 行（tenant-a から可視）と、同じ id を持つ tenant-c の
     // Private 行（tenant-a から不可視）。
-    engine::tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[1.0, 0.0], b"b1"))
-        .expect("tenant-b public row id=1");
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &b,
+        1,
+        &row(TENANT_B, &[1.0, 0.0], b"b1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-b public row id=1");
     engine::tenant::insert_row(
         &storage,
         TABLE,
@@ -518,6 +652,8 @@ fn rls9_verify_hits_detects_an_invisible_row_sharing_an_id_with_a_visible_row() 
             embedding: &[0.0, 1.0],
             metadata: b"c1",
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("tenant-c private row id=1");
 
@@ -551,10 +687,26 @@ fn table12_search_hits_resolve_to_the_exact_row_via_tenant_and_id() {
     let (storage, _cleanup) = open_seeded("hit-resolution");
     let a = ctx(TENANT_A);
     let b = ctx(TENANT_B);
-    engine::tenant::insert_row(&storage, TABLE, &a, 1, &row(TENANT_A, &[1.0, 0.0], b"a1"))
-        .expect("tenant-a row id=1");
-    engine::tenant::insert_row(&storage, TABLE, &b, 1, &row(TENANT_B, &[0.9, 0.1], b"b1"))
-        .expect("tenant-b public row id=1");
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &a,
+        1,
+        &row(TENANT_A, &[1.0, 0.0], b"a1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-a row id=1");
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &b,
+        1,
+        &row(TENANT_B, &[0.9, 0.1], b"b1"),
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("tenant-b public row id=1");
 
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
     let viewer = PolicyContext::new(TENANT_A).expect("valid tenant");

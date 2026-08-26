@@ -137,6 +137,10 @@
 //! 旧 `ScalarEq`（等価専用・SQL-2 の実装例）はこの汎用 API へ統合済み
 //! （BREAKING CHANGE。詳細は `declarative_filter.rs`・`sql/parser.rs` モジュール
 //! ドキュメント参照）。
+//!
+//! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
+//! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
+//! モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -153,6 +157,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;

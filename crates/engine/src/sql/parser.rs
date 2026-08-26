@@ -221,7 +221,11 @@ pub struct BoundInsert {
     /// `schema.columns` の列順に対応する値列（`catalog::insert_typed_row`/
     /// `tenant::insert_typed_row` の `values` 契約と同一。`id` 疑似列は含まない）。
     pub values: Vec<crate::row_codec::Value>,
-    pub operation_id: OperationId,
+    /// TASK-92（RECOVER-1）: `ValidatedInsert.operation_id` をそのまま素通しする。
+    /// `LedgerMode::Ledgered`（既定）では `sql::allowlist::validate_insert` が既に
+    /// `None` を `23502` で拒否済みのため常に `Some`。`CompareOnlyWithoutLedger`
+    /// でのみ `None` になり得る。
+    pub operation_id: Option<OperationId>,
 }
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -1031,8 +1035,12 @@ mod tests {
         let lookup = FakeCatalog {
             tables: ["documents"].into_iter().collect(),
         };
-        let stmt =
-            crate::sql::allowlist::validate_insert(sql, &lookup).expect("must pass allowlist");
+        let stmt = crate::sql::allowlist::validate_insert(
+            sql,
+            &lookup,
+            crate::recovery::required_op_id::LedgerMode::Ledgered,
+        )
+        .expect("must pass allowlist");
         bind_insert(&stmt, &docs_schema())
     }
 
@@ -1044,7 +1052,10 @@ mod tests {
         .expect("bind_insert should succeed");
         assert_eq!(bound.table, "documents");
         assert_eq!(bound.id, 1);
-        assert_eq!(bound.operation_id.as_str(), "op-0001");
+        assert_eq!(
+            bound.operation_id.as_ref().map(OperationId::as_str),
+            Some("op-0001")
+        );
         assert_eq!(
             bound.values,
             vec![

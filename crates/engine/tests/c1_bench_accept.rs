@@ -166,6 +166,8 @@ mod e2e {
                 *id,
                 Visibility::Public,
                 &[Value::Vector(emb.to_vec())],
+                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                    .expect("valid operation_id"),
             )
             .expect("insert row");
         }

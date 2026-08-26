@@ -200,7 +200,15 @@ fn main() {
                 )
             })
             .collect();
-        engine::tenant::insert_rows(&storage, TABLE, &ctx, &rows).expect("seed batch insert");
+        engine::tenant::insert_rows(
+            &storage,
+            TABLE,
+            &ctx,
+            &rows,
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
+        )
+        .expect("seed batch insert");
         for (i, v) in batch_vectors.iter().enumerate() {
             ids.push(next_id + i as u64);
             flat_vectors.extend_from_slice(v);

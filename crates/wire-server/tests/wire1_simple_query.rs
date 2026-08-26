@@ -61,6 +61,8 @@ fn new_core_single_tenant() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -237,6 +239,8 @@ fn wire1_vector_and_null_cells_are_text_encoded() {
         1,
         Visibility::Public,
         &[Value::Vector(vec![1.0, 2.0]), Value::Null],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert row");
     let core = Arc::new(EngineCore::from_storage(
@@ -303,6 +307,8 @@ fn wire1_three_tenant_visibility_public_shared_private_hidden() {
             public_id,
             Visibility::Public,
             &[Value::Vector(dir.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert public row");
         engine::tenant::insert_typed_row(
@@ -312,6 +318,8 @@ fn wire1_three_tenant_visibility_public_shared_private_hidden() {
             private_id,
             Visibility::Private,
             &[Value::Vector(dir.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert private row");
     }

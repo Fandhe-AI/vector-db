@@ -68,6 +68,8 @@ fn new_core_three_tenant_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -369,6 +371,8 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert public row");
     }
@@ -383,6 +387,8 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
         12,
         Visibility::Private,
         &[Value::Vector(vec![1.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert private row");
 

@@ -65,6 +65,8 @@ fn setup_lang_corpus(storage: &Storage) {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -198,6 +200,8 @@ fn setup_multi_tenant_table(storage: &Storage) {
             id,
             visibility,
             &[Value::Vector(vec![1.0, 0.0])],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -325,6 +329,8 @@ fn hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders() {
             row.id,
             row.visibility,
             &[Value::Vector(row.embedding.to_vec()), value],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }

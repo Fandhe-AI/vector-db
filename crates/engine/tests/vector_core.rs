@@ -58,6 +58,8 @@ fn seed_row(
             embedding,
             metadata: &[],
         },
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("seed row");
 }
