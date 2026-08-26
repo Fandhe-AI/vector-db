@@ -183,17 +183,31 @@ fn validate_input(text: &str, config: &ChunkingConfig) -> Result<(), ChunkingErr
     Ok(())
 }
 
+/// 行頭の半角スペース数を数える（`is_atx_heading` と `fence_delimiter_kind` が
+/// 共有するインデント判定の単一実装）。
+///
+/// CommonMark ではインデント 4 個以上の行はインデントコードブロックの内容と
+/// なり、見出しにも fence にもならない。両判定が別々にインデントを数えると
+/// 基準が非対称になり、片方だけがコードブロック内の行を構文として誤認する
+/// （Review 指摘の根本原因）ため、数え方をここに一本化する。
+/// 戻り値は行頭スペースのバイトオフセットでもある（スペースは 1 バイト文字）。
+fn leading_indent_spaces(line: &str) -> usize {
+    line.chars().take_while(|&c| c == ' ').count()
+}
+
 /// ATX 見出し行かどうかを判定する（`#` 1〜3 個＋空白で始まる行。4 段以上は
 /// 境界にしない。PoC 同等の判定範囲）。
 ///
-/// 行頭の空白は CommonMark 仕様に合わせて 0〜3 個までのみ見出し扱いとする
-/// （4 個以上のインデントはインデントコードブロックとなり見出しにはならない）。
+/// 行頭の空白は [`leading_indent_spaces`] の基準（0〜3 個まで）に従う。
 fn is_atx_heading(line: &str) -> bool {
-    let leading_spaces = line.chars().take_while(|&c| c == ' ').count();
+    let leading_spaces = leading_indent_spaces(line);
     if leading_spaces >= 4 {
         return false;
     }
-    let trimmed_start = &line[leading_spaces..];
+    let trimmed_start = match line.get(leading_spaces..) {
+        Some(rest) => rest,
+        None => return false,
+    };
     let hashes = trimmed_start.chars().take_while(|&c| c == '#').count();
     if hashes == 0 || hashes > 3 {
         return false;
@@ -210,8 +224,17 @@ fn is_atx_heading(line: &str) -> bool {
 /// CommonMark 仕様上、閉じフェンスは開始フェンスと同じ文字種でなければ
 /// ならない（異なる文字種の行はフェンス内部の通常テキストとして扱う）。
 /// `chunk_markdown` がこの戻り値を使ってフェンスの開始・終了を対応付ける。
+///
+/// 行頭インデントは [`leading_indent_spaces`] の基準（0〜3 個まで）に従い、
+/// 4 個以上インデントされた行は fence と見なさない（`is_atx_heading` と同じ
+/// 基準。非対称だとインデントコードブロック内の ``` 行で fence が開きっぱなしに
+/// なり、以降の見出し境界がすべて失われる）。
 fn fence_delimiter_kind(line: &str) -> Option<char> {
-    let trimmed = line.trim_start_matches(' ');
+    let leading_spaces = leading_indent_spaces(line);
+    if leading_spaces >= 4 {
+        return None;
+    }
+    let trimmed = line.get(leading_spaces..)?;
     if trimmed.starts_with("```") {
         Some('`')
     } else if trimmed.starts_with("~~~") {
@@ -275,53 +298,75 @@ pub fn chunk_generic(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>, 
 ///
 /// 1 段落単体が上限を超える場合は分割せずそのまま 1 チャンクとする
 /// （段落内部をさらに割ると文脈が失われるため、PoC の方針を踏襲）。
+///
+/// 段落は `lines` 内の連続範囲 `[start, end)` として保持し、チャンク化の際も
+/// 「最初の段落の先頭行から最後の段落の末尾行まで」の連続スライスを
+/// [`trim_block`] へ渡す。段落そのものを詰め替えると段落間の空行が本文から
+/// 落ち、非オーバーサイズ経路（`chunk_markdown` が `trim_block` を直接呼ぶ分岐）
+/// と整形が食い違ううえ、`start_line`/`end_line` の行スパンと本文の行数が
+/// 対応しなくなる（TASK-120 の増分インデックス結線が行スパンを使う前提を壊す）。
 fn split_oversized_section(
     start_index: usize,
     lines: &[(usize, &str)],
     max_chars: usize,
 ) -> Vec<Chunk> {
-    // 空行を境界に段落へ分割する。
-    let mut paragraphs: Vec<Vec<(usize, &str)>> = Vec::new();
-    let mut current: Vec<(usize, &str)> = Vec::new();
-    for &(ln, l) in lines {
+    // 空行を境界に段落の範囲（lines 内の [start, end)）を求める。空行自体は
+    // どの段落にも属さないが、範囲の間に残るためチャンク本文には保持される。
+    let mut paragraphs: Vec<(usize, usize)> = Vec::new();
+    let mut paragraph_start: Option<usize> = None;
+    for (offset, &(_, l)) in lines.iter().enumerate() {
         if l.trim().is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(std::mem::take(&mut current));
+            if let Some(start) = paragraph_start.take() {
+                paragraphs.push((start, offset));
             }
-        } else {
-            current.push((ln, l));
+        } else if paragraph_start.is_none() {
+            paragraph_start = Some(offset);
         }
     }
-    if !current.is_empty() {
-        paragraphs.push(current);
+    if let Some(start) = paragraph_start {
+        paragraphs.push((start, lines.len()));
     }
 
     let mut chunks = Vec::new();
     let mut index = start_index;
-    let mut acc: Vec<(usize, &str)> = Vec::new();
+    // 累積中のチャンクが覆う lines 内の範囲（[start, end)）と文字数。
+    let mut acc: Option<(usize, usize)> = None;
     let mut acc_chars: usize = 0;
 
-    for paragraph in paragraphs {
-        let paragraph_chars: usize = paragraph
+    for (start, end) in paragraphs {
+        let paragraph_chars: usize = lines
+            .get(start..end)
+            .unwrap_or(&[])
             .iter()
             .map(|(_, l)| l.chars().count())
             .fold(0usize, |a, b| a.saturating_add(b));
 
-        if !acc.is_empty() && acc_chars.saturating_add(paragraph_chars) > max_chars {
-            if let Some(chunk) = trim_block(index, &acc) {
-                index = index.saturating_add(1);
-                chunks.push(chunk);
+        if let Some((acc_start, acc_end)) = acc {
+            if acc_chars.saturating_add(paragraph_chars) > max_chars {
+                if let Some(chunk) = lines
+                    .get(acc_start..acc_end)
+                    .and_then(|block| trim_block(index, block))
+                {
+                    index = index.saturating_add(1);
+                    chunks.push(chunk);
+                }
+                acc = None;
+                acc_chars = 0;
             }
-            acc = Vec::new();
-            acc_chars = 0;
         }
 
-        acc.extend(paragraph.iter().copied());
+        acc = match acc {
+            Some((acc_start, _)) => Some((acc_start, end)),
+            None => Some((start, end)),
+        };
         acc_chars = acc_chars.saturating_add(paragraph_chars);
     }
 
-    if !acc.is_empty() {
-        if let Some(chunk) = trim_block(index, &acc) {
+    if let Some((acc_start, acc_end)) = acc {
+        if let Some(chunk) = lines
+            .get(acc_start..acc_end)
+            .and_then(|block| trim_block(index, block))
+        {
             chunks.push(chunk);
         }
     }
@@ -438,6 +483,21 @@ mod tests {
         assert_eq!(fence_delimiter_kind("```rust"), Some('`'));
         assert_eq!(fence_delimiter_kind("~~~"), Some('~'));
         assert_eq!(fence_delimiter_kind("plain text"), None);
+        // インデント基準は is_atx_heading と対称（0〜3 個まで）。
+        assert_eq!(fence_delimiter_kind("   ```"), Some('`'));
+        assert_eq!(fence_delimiter_kind("    ```"), None);
+        assert_eq!(fence_delimiter_kind("    ~~~"), None);
+    }
+
+    #[test]
+    fn leading_indent_is_counted_consistently() {
+        assert_eq!(leading_indent_spaces("no indent"), 0);
+        assert_eq!(leading_indent_spaces("   three"), 3);
+        assert_eq!(leading_indent_spaces("    four"), 4);
+        assert_eq!(leading_indent_spaces("\tタブは対象外"), 0);
+        // 同じ行に対して見出し・fence の判定基準が一致すること。
+        assert!(!is_atx_heading("    # indented code"));
+        assert_eq!(fence_delimiter_kind("    ```"), None);
     }
 
     #[test]

@@ -6,8 +6,8 @@
 //! `crates/engine/src/chunking.rs` 側に置く）。
 
 use engine::chunking::{
-    chunk_file, chunk_generic, chunk_markdown, detect_file_kind, ChunkingConfig, ChunkingError,
-    FileKind, MAX_INPUT_BYTES,
+    chunk_file, chunk_generic, chunk_markdown, detect_file_kind, Chunk, ChunkingConfig,
+    ChunkingError, FileKind, MAX_INPUT_BYTES, MAX_INPUT_LINES,
 };
 
 fn lines_of(n: usize) -> String {
@@ -15,6 +15,27 @@ fn lines_of(n: usize) -> String {
         .map(|i| format!("line {i}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 各チャンクの本文行数が `end_line - start_line + 1` に一致することを検証する
+/// 共通アサーション（全経路で「チャンク本文は元テキストの連続する行スライス」
+/// であるという不変条件。TASK-120 の増分インデックス結線が行スパンを使う前提）。
+fn assert_line_span_matches_text(chunks: &[Chunk]) {
+    for chunk in chunks {
+        let span = chunk
+            .end_line
+            .checked_sub(chunk.start_line)
+            .and_then(|d| d.checked_add(1))
+            .expect("end_line >= start_line");
+        assert_eq!(
+            chunk.text.lines().count(),
+            span,
+            "chunk {} text lines must match its line span ({}..={})",
+            chunk.index,
+            chunk.start_line,
+            chunk.end_line
+        );
+    }
 }
 
 #[test]
@@ -65,6 +86,8 @@ fn generic_60_line_windows() {
 
     let chunks_blank = chunk_generic("   \n\n   \n", &config).expect("blank-only input");
     assert_eq!(chunks_blank.len(), 0);
+
+    assert_line_span_matches_text(&chunks_150);
 }
 
 #[test]
@@ -80,6 +103,20 @@ fn markdown_heading_boundaries() {
     assert!(chunks[2].text.starts_with("## h2"));
     assert!(chunks[3].text.starts_with("### h3"));
     assert!(chunks[3].text.contains("#### h4 not a boundary"));
+    assert_line_span_matches_text(&chunks);
+}
+
+#[test]
+fn markdown_indented_fence_is_not_a_fence() {
+    // 4 スペース以上インデントされた ``` 行はインデントコードブロックの内容で
+    // あり fence 開始ではない（is_atx_heading と同じ CommonMark のインデント
+    // 基準に揃える。Review 指摘）。誤って fence 開始と見なすと以降の見出しが
+    // すべて 1 節へ溶ける。
+    let config = ChunkingConfig::default();
+    let chunks = chunk_markdown("# a\n    ```\n# b\n", &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks[0].text.starts_with("# a"));
+    assert!(chunks[1].text.starts_with("# b"));
 }
 
 #[test]
@@ -125,8 +162,36 @@ fn markdown_oversized_section_split_by_paragraph() {
         max_markdown_section_chars: None,
         ..ChunkingConfig::default()
     };
+    assert_line_span_matches_text(&split_chunks);
+
     let unbounded_chunks = chunk_markdown(&text, &unbounded_config).expect("unbounded chunks");
     assert_eq!(unbounded_chunks.len(), 1);
+    assert_line_span_matches_text(&unbounded_chunks);
+}
+
+#[test]
+fn markdown_oversized_section_preserves_paragraph_blank_lines() {
+    // 同一チャンクへ合流した複数段落の間の空行（段落境界）が本文から
+    // 落ちないこと。非オーバーサイズ経路（trim_block 直呼び）と整形が
+    // 一致していることの回帰保護（Review 指摘）。
+    let config = ChunkingConfig {
+        max_markdown_section_chars: Some(600),
+        ..ChunkingConfig::default()
+    };
+    let a = "a".repeat(200);
+    let b = "b".repeat(200);
+    let c = "c".repeat(400);
+    let text = format!("# h\n{a}\n\n{b}\n\n{c}\n");
+
+    let chunks = chunk_markdown(&text, &config).expect("markdown chunks");
+    assert_eq!(chunks.len(), 2);
+
+    assert_eq!((chunks[0].start_line, chunks[0].end_line), (1, 4));
+    assert_eq!(chunks[0].text, format!("# h\n{a}\n\n{b}"));
+    assert!(chunks[0].text.contains("\n\n"));
+    assert_eq!((chunks[1].start_line, chunks[1].end_line), (6, 6));
+    assert_eq!(chunks[1].text, c);
+    assert_line_span_matches_text(&chunks);
 }
 
 #[test]
@@ -170,6 +235,12 @@ fn limits_fail_closed() {
     };
     let result = chunk_generic("some text", &zero_lines_per_chunk);
     assert!(matches!(result, Err(ChunkingError::InvalidConfig { .. })));
+
+    // 行数上限は単独で発火すること（バイト長上限に隠れないことの回帰保護）。
+    let too_many_lines = "\n".repeat(MAX_INPUT_LINES + 1);
+    assert!(too_many_lines.len() <= MAX_INPUT_BYTES);
+    let result = chunk_generic(&too_many_lines, &config);
+    assert!(matches!(result, Err(ChunkingError::TooManyLines { .. })));
 
     // チャンク総文字数が入力を超えないこと（有界化の健全性）。
     let text = lines_of(90);
