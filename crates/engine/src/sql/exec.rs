@@ -36,6 +36,7 @@ use std::collections::HashSet;
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
 use crate::core;
+use crate::declarative_filter;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
@@ -409,9 +410,10 @@ pub fn execute_statement(
     // `String` として複製・保持しない（[`MAX_CANDIDATE_SCALAR_BYTES`] のドキュメント
     // 参照。投影に不要な列まで全候補分複製・保持する P1 指摘への対応）。
     // DISTANCE 先行時（`!plan.scalar_prefilter`）は SCALAR 条件を DISTANCE 段の後で
-    // 事後適用するため、`scalar_filters` が参照する列も候補構築時に保持しておく
-    // 必要がある（TASK-76・SQL-7）。SCALAR 先行時（既定）はここで等価条件を判定し
-    // 終えるため、値の保持自体は不要（従来どおり投影列のみ保持する）。
+    // 事後適用するため、`metadata_filters`（TASK-147・EXT-3。等価・前方一致）が
+    // 参照する列も候補構築時に保持しておく必要がある（TASK-76・SQL-7）。SCALAR
+    // 先行時（既定）はここで条件を判定し終えるため、値の保持自体は不要（従来どおり
+    // 投影列のみ保持する）。
     let mut needed_column_indices: HashSet<usize> = bound
         .projection
         .iter()
@@ -425,7 +427,7 @@ pub fn execute_statement(
         })
         .collect();
     if !plan.scalar_prefilter {
-        needed_column_indices.extend(bound.scalar_filters.iter().map(|f| f.column_index));
+        needed_column_indices.extend(bound.metadata_filters.iter().map(|f| f.column_index()));
     }
 
     // `candidate_columns` に保持する Text 値の実バイト数に加え、行ごとに必ず確保する
@@ -454,18 +456,16 @@ pub fn execute_statement(
         // 下のループで選択的に複製する。
         let scanned = row_codec::scan_scalar_columns(schema, metadata)
             .map_err(|e| ArenaError::Storage(StorageError::Codec(e.to_string())))?;
-        // SCALAR 先行（既定）の場合のみここで等価条件を事前適用する。DISTANCE 先行
-        // （`HINT ORDER`）の場合は可視行を無条件に通過させ、DISTANCE 段の後で
-        // `apply_scalar_postfilter` が事後適用する（§モジュールドキュメント参照）。
+        // SCALAR 先行（既定）の場合のみここでメタデータフィルタ（TASK-147・EXT-3。
+        // 等価・前方一致）を事前適用する。DISTANCE 先行（`HINT ORDER`）の場合は
+        // 可視行を無条件に通過させ、DISTANCE 段の後で `apply_scalar_postfilter` が
+        // 事後適用する（§モジュールドキュメント参照）。
         if plan.scalar_prefilter {
-            for filter in &bound.scalar_filters {
-                match scanned.get(filter.column_index) {
-                    Some(Some(t)) if *t == filter.value => {}
-                    _ => return Ok(false),
-                }
+            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
+                return Ok(false);
             }
             // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
-            // 既存の等価条件と同じ SCALAR 段の一部として事前適用する。可視行
+            // 既存のメタデータフィルタと同じ SCALAR 段の一部として事前適用する。可視行
             // （RLS-8 の暗黙適用を通過した行）にのみ到達するため、不可視行では
             // 式が一切評価されない。評価エラー（0 除算・非有限値等）は当該行を
             // 黙ってスキップせず、クエリ全体の失敗として fail-closed に伝播する
@@ -720,12 +720,13 @@ pub fn execute_statement(
     let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
         hits
     } else {
-        // TASK-79（SQL-9）: `WHERE` の式述語も既存の等価条件と同じ SCALAR 事後
-        // フィルタの一部として扱う（DISTANCE 先行時。§モジュールドキュメント参照）。
-        // 評価に使う embedding は候補選択と同一スナップショットの `arena` から
-        // （投影段と同じ経路。再取得なし）。評価エラーはこの場で fail-closed に
-        // クエリ全体の失敗として伝播する（当該行だけを黙ってスキップしない。
-        // `on_visible_row` の事前フィルタ経路と同じ方針）。
+        // TASK-79（SQL-9）: `WHERE` の式述語も既存のメタデータフィルタ（TASK-147・
+        // EXT-3）と同じ SCALAR 事後フィルタの一部として扱う（DISTANCE 先行時。
+        // §モジュールドキュメント参照）。評価に使う embedding は候補選択と同一
+        // スナップショットの `arena` から（投影段と同じ経路。再取得なし）。
+        // 評価エラーはこの場で fail-closed にクエリ全体の失敗として伝播する
+        // （当該行だけを黙ってスキップしない。`on_visible_row` の事前フィルタ経路と
+        // 同じ方針）。
         let mut filtered = Vec::with_capacity(hits.len());
         for (slot_id, score) in hits {
             // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
@@ -736,10 +737,14 @@ pub fn execute_statement(
             let Some(columns) = candidate_columns.get(slot) else {
                 continue;
             };
-            let scalar_ok = bound.scalar_filters.iter().all(
-                |f| matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value),
-            );
-            if !scalar_ok {
+            let scanned: Vec<Option<&str>> = columns
+                .iter()
+                .map(|v| match v {
+                    Value::Text(t) => Some(t.as_str()),
+                    Value::Null | Value::Vector(_) => None,
+                })
+                .collect();
+            if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
             if !bound.expr_filters.is_empty() {

@@ -39,6 +39,16 @@
 //! 許可形状を追加した。実行は [`exec::execute_insert`] が担い、行の書き込みは
 //! `tenant.rs` のガード付き API（`tenant::insert_typed_row`）経由に統一する
 //! （TABLE-12・RLS-9）。
+//!
+//! TASK-147（対象ビヘイビア: EXT-3）: `WHERE` 句に前方一致条件
+//! `<col> LIKE '<prefix>%'` を追加した（[`allowlist`] が構造を、
+//! `crate::declarative_filter` が意味論を検証する。`LIKE` は末尾ちょうど 1 つの
+//! `%` のみを許可し、`NOT LIKE`・`ILIKE`・中間 `%`・`_`・エスケープは拒否する）。
+//! 既存の等価条件 `<col> = '<literal>'`（SQL-2）と合わせ、両者は
+//! `crate::declarative_filter::MetadataFilter`（汎用 API。任意の `TEXT` 列に
+//! 対する宣言的フィルタ）として一本化した（**BREAKING CHANGE**: 旧
+//! `sql::parser::ScalarEq`・`BoundStatement::scalar_filters` を置換。詳細は
+//! `declarative_filter.rs`・`sql/parser.rs` モジュールドキュメント参照）。
 
 pub mod allowlist;
 pub mod exec;

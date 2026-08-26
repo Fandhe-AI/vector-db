@@ -36,7 +36,9 @@ const MAX_TENANT_ID_LEN: u8 = u8::MAX;
 /// `Text` 列 1 つあたりのバイト長上限。`storage.rs::MAX_METADATA_LEN` と同値方針
 /// （data-model.md 2026-08-22 追記・CORE-15 方針のポインタ準拠）。検証通過後の
 /// 長さのみをアロケーションに使う。
-const MAX_TEXT_FIELD_LEN: u32 = 4 * 1024 * 1024;
+/// TASK-147（EXT-3）: `declarative_filter::DeclarativeFilter::bind` がメタデータ
+/// フィルタのリテラル長上限検査（`54000`）にこの値を再利用するため `pub(crate)`。
+pub(crate) const MAX_TEXT_FIELD_LEN: u32 = 4 * 1024 * 1024;
 
 /// `Vector` 列の次元数上限。`storage.rs::MAX_EMBEDDING_DIM`（永続化層が扱える上限）と
 /// 同値を維持する。片方だけの変更を防ぐため下部の const assert でコンパイル時に強制する。
