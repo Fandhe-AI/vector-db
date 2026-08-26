@@ -403,6 +403,59 @@ fn default_expr_alias(expr: &Expr) -> String {
     }
 }
 
+/// `WHERE` 句の許可述語列（[`WherePredicate`]）を束縛する共通ヘルパー
+/// （TASK-166・SQL-13 で `bind_in_session` から切り出した。検索 SELECT
+/// （[`bind_in_session`]）・集計 SELECT（[`bind_aggregate`]）の両方が同一の
+/// 意味論（等価・前方一致条件は `declarative_filter::bind_all` に集約、`visible()`
+/// はフラグのみ、式述語は `Bool` 型を要求）で WHERE を解釈する必要があるため、
+/// 挙動を複製せずこの 1 箇所に集約する。戻り値は
+/// `(metadata_filters, expr_filters, rls_predicate_present)` の組。
+fn bind_where_predicates(
+    where_predicates: &[WherePredicate],
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<
+    (
+        Vec<MetadataFilter>,
+        Vec<crate::sql::udf_call::BoundExpr>,
+        bool,
+    ),
+    SqlSurfaceError,
+> {
+    let mut declarative_filters = Vec::with_capacity(where_predicates.len());
+    let mut expr_filters = Vec::new();
+    let mut rls_predicate_present = false;
+    for predicate in where_predicates {
+        match predicate {
+            WherePredicate::Equality { column, value } => {
+                declarative_filters.push(DeclarativeFilter::equals(column.clone(), value.clone()));
+            }
+            WherePredicate::Prefix { column, pattern } => {
+                let prefix = declarative_filter::parse_prefix_pattern(pattern)?;
+                declarative_filters.push(DeclarativeFilter::starts_with(column.clone(), prefix));
+            }
+            WherePredicate::PredicateCall { .. } => {
+                // allowlist が許可する述語呼び出し形は `visible()` のみ
+                // （`is_allowed_where_predicate_name`）。名前の再検証はしない
+                // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
+                rls_predicate_present = true;
+            }
+            WherePredicate::Expression(expr) => {
+                let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                if ty != crate::sql::udf_call::ExprType::Bool {
+                    return Err(SqlSurfaceError::invalid_input(
+                        "WHERE expression must evaluate to a boolean (use a comparison)",
+                    ));
+                }
+                expr_filters.push(bound);
+            }
+        }
+    }
+    let metadata_filters = declarative_filter::bind_all(&declarative_filters, schema)?;
+    Ok((metadata_filters, expr_filters, rls_predicate_present))
+}
+
 pub fn bind(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
@@ -523,40 +576,8 @@ pub fn bind_in_session(
         }
     };
 
-    // TASK-147（EXT-3）: 等価・前方一致条件は未束縛の宣言（`DeclarativeFilter`）へ
-    // いったん集約し、`declarative_filter::bind_all` で一括束縛する（列名解決・
-    // `TEXT` 列限定・リテラル長上限・件数上限を汎用 API 側の 1 箇所に集約する）。
-    let mut declarative_filters = Vec::with_capacity(stmt.where_predicates.len());
-    let mut expr_filters = Vec::new();
-    let mut rls_predicate_present = false;
-    for predicate in &stmt.where_predicates {
-        match predicate {
-            WherePredicate::Equality { column, value } => {
-                declarative_filters.push(DeclarativeFilter::equals(column.clone(), value.clone()));
-            }
-            WherePredicate::Prefix { column, pattern } => {
-                let prefix = declarative_filter::parse_prefix_pattern(pattern)?;
-                declarative_filters.push(DeclarativeFilter::starts_with(column.clone(), prefix));
-            }
-            WherePredicate::PredicateCall { .. } => {
-                // allowlist が許可する述語呼び出し形は `visible()` のみ
-                // （`is_allowed_where_predicate_name`）。名前の再検証はしない
-                // （許可リスト層の責務。ここでは可観測性のためのフラグのみ立てる）。
-                rls_predicate_present = true;
-            }
-            WherePredicate::Expression(expr) => {
-                let (bound, ty) =
-                    crate::sql::udf_call::bind_expr(expr, schema, udfs, &mut node_budget)?;
-                if ty != crate::sql::udf_call::ExprType::Bool {
-                    return Err(SqlSurfaceError::invalid_input(
-                        "WHERE expression must evaluate to a boolean (use a comparison)",
-                    ));
-                }
-                expr_filters.push(bound);
-            }
-        }
-    }
-    let metadata_filters = declarative_filter::bind_all(&declarative_filters, schema)?;
+    let (metadata_filters, expr_filters, rls_predicate_present) =
+        bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
 
     let ranking = bind_ranking(&stmt.order_by, schema)?;
 
@@ -697,6 +718,174 @@ pub fn bind_insert(
         id,
         values,
         operation_id: stmt.operation_id.clone(),
+    })
+}
+
+/// 集計項目 1 つの引数を意味論的に解決した結果（TASK-166・SQL-13）。
+/// `sql::aggregate::execute_aggregate` はこの enum だけを見て走査中の 1 行から
+/// 集計対象値を取り出す（`schema`・`udfs` を再度参照しない自己完結な形）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AggregateInput {
+    /// `COUNT(*)`・`COUNT(id)`・`COUNT(<Scalar 型の式>)` のいずれか。可視行はすべて
+    /// 対象（NULL・非存在の概念がない）。`COUNT` 以外の関数からこの variant を得る
+    /// ことはない（[`resolve_aggregate_input`] 参照）。`VECTOR` 列の裸の列参照は
+    /// nullable 属性を持つため対象外（[`AggregateInput::VectorColumnPresence`]）。
+    AllVisible,
+    /// 疑似列 `id`（`SUM`/`AVG`/`MIN`/`MAX`）。`f64` へ変換せず `u64` の
+    /// `checked_add` で正確に演算する（`docs/spec/04-behavior/error-format.md`
+    /// ERR-2 が新設する `22003` で桁あふれを fail-closed に拒否するため）。
+    IdU64,
+    /// `TEXT` 列の裸の列参照（`schema.columns` の添字）。`COUNT`（非 NULL 行数）・
+    /// `MIN`/`MAX`（バイト順・NULL 無視）でのみ使う（`SUM`/`AVG` は
+    /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
+    TextColumn(usize),
+    /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
+    /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`sql::udf_call::eval` で
+    /// `id`・embedding から評価する。
+    ScalarExpr(crate::sql::udf_call::BoundExpr),
+    /// `VECTOR` 列の裸の列参照（`COUNT` 限定。[`resolve_aggregate_input`] 参照）。
+    /// 列は `ALTER TABLE ADD COLUMN`（TABLE-5）で追加された nullable な `VECTOR`
+    /// 列の可能性があり、値が未設定の可視行は NULL として `COUNT` から除外する
+    /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
+    /// 従う。PR #229 codex-review 指摘対応）。
+    VectorColumnPresence,
+}
+
+/// 束縛済みの集計項目 1 つ（TASK-166・SQL-13）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundAggregateItem {
+    pub(crate) func: crate::sql::allowlist::AggregateFunc,
+    pub(crate) input: AggregateInput,
+    /// `AS <alias>` の指定値、省略時は関数名小文字
+    /// （[`crate::sql::allowlist::AggregateFunc::default_alias`]）。
+    pub(crate) name: String,
+}
+
+/// 束縛済みの集計 SELECT 文（TASK-166・SQL-13）。[`crate::sql::aggregate::execute_aggregate`]
+/// が直接実行する入力形。`BoundStatement` と異なり検索固有のフィールド
+/// （`ranking`・`limit`・`mode`・`evaluation_order`）を持たない（集計は常に単一行・
+/// `HINT ORDER`／`USING MODE` を受理しないため。[`crate::sql::allowlist::ValidatedAggregate`]
+/// のドキュメント参照）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BoundAggregate {
+    pub(crate) table: String,
+    pub(crate) items: Vec<BoundAggregateItem>,
+    pub(crate) metadata_filters: Vec<MetadataFilter>,
+    pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    pub(crate) rls_predicate_present: bool,
+}
+
+/// 集計項目 1 つの引数（[`crate::sql::allowlist::AggregateArg`]）を `schema` と
+/// 照合し、[`AggregateInput`] へ解決する（TASK-166・SQL-13）。列名解決の優先順位
+/// （実カラム＞疑似列 `id`）は [`bind_in_session`] の投影束縛・
+/// `sql::udf_call::bind_expr_in` と揃える（Issue #56 レビュー指摘で確立した既存
+/// 規約）。
+///
+/// 型ごとの受理・拒否は以下（対象ビヘイビア: SQL-13）:
+/// - `*`（`COUNT` 限定。構文層が既に強制済み）→ [`AggregateInput::AllVisible`]
+/// - `id` → `COUNT` は [`AggregateInput::AllVisible`]、それ以外は
+///   [`AggregateInput::IdU64`]
+/// - `TEXT` 列 → `SUM`/`AVG` は型不整合（`22000`）、それ以外は
+///   [`AggregateInput::TextColumn`]
+/// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
+///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
+/// - 上記以外の識別子 → 未知の列（`22000`）
+/// - 複合式（`Expr::Call`・`Expr::Binary`・`Expr::Number`）→
+///   `sql::udf_call::bind_expr` に委譲し、`Scalar` 型のみ
+///   [`AggregateInput::ScalarExpr`] として受理、`Vector`/`Bool` 型は型不整合
+///   （`22000`）
+fn resolve_aggregate_input(
+    func: crate::sql::allowlist::AggregateFunc,
+    arg: &crate::sql::allowlist::AggregateArg,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<AggregateInput, SqlSurfaceError> {
+    use crate::sql::allowlist::{AggregateArg, AggregateFunc};
+    use crate::sql::udf_call::ExprType;
+
+    match arg {
+        AggregateArg::Star => Ok(AggregateInput::AllVisible),
+        AggregateArg::Expr(Expr::Ident(name)) => {
+            if let Some((index, column)) = schema
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| &c.name == name)
+            {
+                return match (column.ty, func) {
+                    (ColumnType::Text, AggregateFunc::Sum | AggregateFunc::Avg) => {
+                        Err(SqlSurfaceError::invalid_input(format!(
+                            "column {name:?} is TEXT and cannot be used with SUM/AVG"
+                        )))
+                    }
+                    (ColumnType::Text, _) => Ok(AggregateInput::TextColumn(index)),
+                    (ColumnType::Vector(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::VectorColumnPresence)
+                    }
+                    (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
+                        "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
+                    ))),
+                };
+            }
+            if name == "id" {
+                return match func {
+                    AggregateFunc::Count => Ok(AggregateInput::AllVisible),
+                    _ => Ok(AggregateInput::IdU64),
+                };
+            }
+            Err(SqlSurfaceError::invalid_input(format!(
+                "unknown column: {name}"
+            )))
+        }
+        AggregateArg::Expr(expr) => {
+            let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+            match ty {
+                ExprType::Scalar => Ok(AggregateInput::ScalarExpr(bound)),
+                ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
+                    "aggregate argument must evaluate to a scalar",
+                )),
+            }
+        }
+    }
+}
+
+/// [`crate::sql::allowlist::ValidatedAggregate`] を `schema`・UDF レジストリ `udfs`
+/// と照合して [`BoundAggregate`] へ束縛する（TASK-166・SQL-13 の公開 API）。
+/// `WHERE` 句の意味論は [`bind_where_predicates`] を検索 SELECT
+/// （[`bind_in_session`]）と共有する。式ノード予算（[`crate::sql::udf_call::MAX_EXPR_NODES`]）
+/// は集計項目＋`WHERE` の全式項目で 1 文につき共有する（`bind_in_session` と同じ
+/// 歯止め）。
+pub(crate) fn bind_aggregate(
+    stmt: &crate::sql::allowlist::ValidatedAggregate,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<BoundAggregate, SqlSurfaceError> {
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+
+    let mut items = Vec::with_capacity(stmt.items().len());
+    for item in stmt.items() {
+        let input = resolve_aggregate_input(item.func, &item.arg, schema, udfs, &mut node_budget)?;
+        let name = item
+            .alias
+            .clone()
+            .unwrap_or_else(|| item.func.default_alias().to_string());
+        items.push(BoundAggregateItem {
+            func: item.func,
+            input,
+            name,
+        });
+    }
+
+    let (metadata_filters, expr_filters, rls_predicate_present) =
+        bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+
+    Ok(BoundAggregate {
+        table: stmt.table_name().to_string(),
+        items,
+        metadata_filters,
+        expr_filters,
+        rls_predicate_present,
     })
 }
 
@@ -1210,5 +1399,160 @@ mod tests {
         let bound = bind_sql(SELECT_NO_MODE).expect("bind should succeed");
         assert_eq!(bound.mode.mode, SearchMode::Recall);
         assert_eq!(bound.mode.source, mode::ModeSource::Default);
+    }
+
+    // --- bind_aggregate（TASK-166・SQL-13） -------------------------------------
+
+    fn bind_aggregate_sql(sql: &str) -> Result<BoundAggregate, SqlSurfaceError> {
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_sql(sql, &lookup).expect("must pass allowlist");
+        let agg = match stmt {
+            crate::sql::allowlist::Statement::Aggregate(agg) => agg,
+            other => panic!("expected Statement::Aggregate, got {other:?}"),
+        };
+        bind_aggregate(
+            &agg,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+    }
+
+    #[test]
+    fn binds_sum_avg_min_max_on_vector_column_as_type_mismatch() {
+        for func in ["SUM", "AVG", "MIN", "MAX"] {
+            let sql = format!("SELECT {func}(embedding) FROM documents");
+            let err = bind_aggregate_sql(&sql).unwrap_err();
+            assert_eq!(
+                err.wire_code(),
+                "22000",
+                "{func}(embedding) should be 22000"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_sum_avg_on_text_column_as_type_mismatch() {
+        for func in ["SUM", "AVG"] {
+            let sql = format!("SELECT {func}(lang) FROM documents");
+            let err = bind_aggregate_sql(&sql).unwrap_err();
+            assert_eq!(err.wire_code(), "22000", "{func}(lang) should be 22000");
+        }
+    }
+
+    #[test]
+    fn binds_unknown_column_as_invalid_input() {
+        let err = bind_aggregate_sql("SELECT SUM(ghost) FROM documents").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn binds_sum_on_bool_typed_expression_as_type_mismatch() {
+        // 実際の SQL 文法では比較演算子（`>` 等）は集計引数の式文法
+        // （`parse_value_expr`）に現れないため、この組み合わせは構文上到達しない。
+        // `bind_aggregate` 自体の型検査（`ExprType::Bool` を拒否する分岐）が
+        // 独立して機能することを確認するため、AST を直接組み立てて渡す
+        // （防御的実装の単体検証。§計画 6-B）。
+        use crate::sql::allowlist::{
+            AggregateArg, AggregateFunc, AggregateItem, ValidatedAggregate,
+        };
+        use crate::sql::udf_call::BinOp;
+
+        // `ValidatedAggregate`/`AggregateItem` のフィールドは `pub(crate)` のため、
+        // 同一クレート内であるこのテストからは構造体リテラルで直接組み立てられる
+        // （`allowlist.rs` のカプセル化はクレート外からの構築のみを禁じる）。
+        let agg = ValidatedAggregate {
+            table_name: "documents".to_string(),
+            items: vec![AggregateItem {
+                func: AggregateFunc::Sum,
+                arg: AggregateArg::Expr(Expr::Binary {
+                    op: BinOp::Gt,
+                    lhs: Box::new(Expr::Ident("id".to_string())),
+                    rhs: Box::new(Expr::Number("1".to_string())),
+                }),
+                alias: None,
+            }],
+            where_predicates: Vec::new(),
+        };
+        let err = bind_aggregate(
+            &agg,
+            &docs_schema(),
+            &crate::sql::udf_call::UdfRegistry::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn binds_sum_on_vector_typed_expression_as_type_mismatch() {
+        let err =
+            bind_aggregate_sql("SELECT SUM(vec_div(embedding, 2)) FROM documents").unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn binds_count_sum_avg_min_max_on_id_and_udf_call() {
+        let bound = bind_aggregate_sql(
+            "SELECT COUNT(embedding), COUNT(lang), SUM(id), AVG(vec_norm(embedding)), MIN(lang) FROM documents",
+        )
+        .expect("bind should succeed");
+        assert_eq!(bound.items.len(), 5);
+        assert_eq!(bound.items[0].input, AggregateInput::VectorColumnPresence);
+        assert!(matches!(
+            bound.items[1].input,
+            AggregateInput::TextColumn(_)
+        ));
+        assert_eq!(bound.items[2].input, AggregateInput::IdU64);
+        assert!(matches!(
+            bound.items[3].input,
+            AggregateInput::ScalarExpr(_)
+        ));
+        assert!(matches!(
+            bound.items[4].input,
+            AggregateInput::TextColumn(_)
+        ));
+    }
+
+    #[test]
+    fn binds_default_alias_to_lowercase_function_name() {
+        let bound =
+            bind_aggregate_sql("SELECT COUNT(*) FROM documents").expect("bind should succeed");
+        assert_eq!(bound.items[0].name, "count");
+    }
+
+    #[test]
+    fn binds_explicit_alias_over_default() {
+        let bound = bind_aggregate_sql("SELECT COUNT(*) AS total FROM documents")
+            .expect("bind should succeed");
+        assert_eq!(bound.items[0].name, "total");
+    }
+
+    #[test]
+    fn aggregate_binds_real_id_column_over_pseudo_column_when_schema_declares_it() {
+        let schema = TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("id", ColumnType::Text, false),
+            ],
+        );
+        let lookup = FakeCatalog {
+            tables: ["documents"].into_iter().collect(),
+        };
+        let stmt = crate::sql::allowlist::validate_sql("SELECT MIN(id) FROM documents", &lookup)
+            .expect("must pass allowlist");
+        let agg = match stmt {
+            crate::sql::allowlist::Statement::Aggregate(agg) => agg,
+            other => panic!("expected Statement::Aggregate, got {other:?}"),
+        };
+        let bound = bind_aggregate(&agg, &schema, &crate::sql::udf_call::UdfRegistry::default())
+            .expect("bind should succeed");
+        // スキーマが実カラム `id`（TEXT）を宣言しているため、疑似列ではなく実カラムへ
+        // 束縛される（`resolve_aggregate_input` の優先順位。Issue #56 と同じ規約）。
+        assert!(matches!(
+            bound.items[0].input,
+            AggregateInput::TextColumn(_)
+        ));
     }
 }

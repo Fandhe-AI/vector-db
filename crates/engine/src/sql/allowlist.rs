@@ -40,6 +40,23 @@ fn is_allowed_where_predicate_name(name: &str) -> bool {
     matches!(name.to_ascii_uppercase().as_str(), "VISIBLE")
 }
 
+/// 集計関数（TASK-166・SQL-13）で許可する関数名を照合する（大文字小文字を区別
+/// しない）。未知の名前は fail-closed に拒否する（[`is_allowed_where_predicate_name`]
+/// と同方針）。`sql::udf_call::is_reserved_function_name` から名前空間一本化の
+/// ため参照される（CREATE FUNCTION での集計関数名との衝突を防ぐ。Cursor Bugbot
+/// 指摘対応・PR #229）。
+pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+    )
+}
+
+/// 1 文の集計項目リストが持てる要素数の上限（TASK-166・SQL-13）。無制限 `Vec` 確保を
+/// 避ける（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」
+/// 対応）。
+const MAX_AGGREGATE_ITEMS: usize = 32;
+
 fn truncate_for_error(s: &str) -> String {
     if s.len() <= MAX_ERROR_DETAIL_LEN {
         return s.to_string();
@@ -90,6 +107,14 @@ pub enum SqlSurfaceError {
     /// 冪等判定（台帳による重複拒否・内容不一致検出）は本 variant の管轄外で、
     /// TASK-93・TASK-94・TASK-101 が後続で扱う。
     IdConflict,
+    /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
+    /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
+    /// ERR-2 表に未掲載の新設コード（SQL-13 が定義。ポインタ:
+    /// `docs/spec/04-behavior/error-format.md` ERR-2 の
+    /// 「ビヘイビアファイルが一意の wire_code を定義してよい」規則に基づく）。黙って
+    /// wrap・非有限値化せず fail-closed に拒否する（`.claude/rules/coding-rust.md`
+    /// 「整数演算は checked_*/saturating_* を使う」対応）。
+    NumericOutOfRange { detail: String },
 }
 
 impl SqlSurfaceError {
@@ -103,6 +128,7 @@ impl SqlSurfaceError {
             SqlSurfaceError::PayloadTooLarge { .. } => "54000",
             SqlSurfaceError::MissingOperationId => "23502",
             SqlSurfaceError::IdConflict => "23505",
+            SqlSurfaceError::NumericOutOfRange { .. } => "22003",
         }
     }
 
@@ -159,6 +185,14 @@ impl SqlSurfaceError {
             detail: truncate_for_error(&detail.into()),
         }
     }
+
+    /// `pub(crate)`: `sql::aggregate`（TASK-166・SQL-13）が集計の数値演算オーバー
+    /// フロー（`u64` の `checked_add` 失敗・`f64` の非有限値化）を報告するために使う。
+    pub(crate) fn numeric_out_of_range(detail: impl Into<String>) -> Self {
+        SqlSurfaceError::NumericOutOfRange {
+            detail: truncate_for_error(&detail.into()),
+        }
+    }
 }
 
 impl std::fmt::Display for SqlSurfaceError {
@@ -181,6 +215,9 @@ impl std::fmt::Display for SqlSurfaceError {
             // 他テナントの行 id 存在オラクルにならない。
             SqlSurfaceError::IdConflict => {
                 write!(f, "row id already exists")
+            }
+            SqlSurfaceError::NumericOutOfRange { detail } => {
+                write!(f, "numeric value out of range: {detail}")
             }
         }
     }
@@ -421,6 +458,95 @@ pub enum Statement {
         params: Vec<String>,
         body: Expr,
     },
+    /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
+    /// （TASK-166・SQL-13。C6a）。`FROM` 単一テーブルのカタログ存在確認を通過済み。
+    Aggregate(ValidatedAggregate),
+}
+
+/// 集計関数の種別（TASK-166・SQL-13）。関数名は [`is_aggregate_function_name`] で
+/// 大文字小文字を区別せず照合済み。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggregateFunc {
+    /// `name` が [`is_aggregate_function_name`] を通過済みの前提で呼ぶ。
+    fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(AggregateFunc::Count),
+            "SUM" => Some(AggregateFunc::Sum),
+            "AVG" => Some(AggregateFunc::Avg),
+            "MIN" => Some(AggregateFunc::Min),
+            "MAX" => Some(AggregateFunc::Max),
+            _ => None,
+        }
+    }
+
+    /// `AS <alias>` を省略した場合の既定結果列名（関数名の小文字）。
+    pub(crate) fn default_alias(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "count",
+            AggregateFunc::Sum => "sum",
+            AggregateFunc::Avg => "avg",
+            AggregateFunc::Min => "min",
+            AggregateFunc::Max => "max",
+        }
+    }
+}
+
+/// 集計関数の引数（TASK-166・SQL-13）。`Star` は `COUNT(*)` 専用（[`Parser::parse_aggregate_item`]
+/// が `COUNT` 以外での出現を構造的に拒否する）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateArg {
+    Star,
+    Expr(Expr),
+}
+
+/// SELECT リストの集計項目 1 つ（TASK-166・SQL-13）。`alias` 省略時の列名は
+/// [`AggregateFunc::default_alias`] を使う（`sql::parser::bind_aggregate` の責務）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateItem {
+    pub(crate) func: AggregateFunc,
+    pub(crate) arg: AggregateArg,
+    pub(crate) alias: Option<String>,
+}
+
+/// 許可形状の構造判定を通過した集計 `SELECT` 文（TASK-166・SQL-13）。
+/// [`ValidatedStatement`] と同様、本モジュールが保証するのはここまでの構造情報のみで、
+/// 列名・式の意味論的妥当性は検証しない（`sql::parser::bind_aggregate` の責務）。
+/// フィールドは `pub(crate)`（クレート外からの直読み・直書き不可。カプセル化の方針は
+/// [`ValidatedStatement`] と同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedAggregate {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub(crate) table_name: String,
+    /// 集計項目リスト（`SELECT` リスト順。1..=[`MAX_AGGREGATE_ITEMS`]）。
+    pub(crate) items: Vec<AggregateItem>,
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。既存の
+    /// [`ValidatedStatement::where_predicates`] と同一の許可形状を再利用する。
+    pub(crate) where_predicates: Vec<WherePredicate>,
+}
+
+impl ValidatedAggregate {
+    /// FROM に指定され、カタログ存在確認を通過したテーブル名。
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    /// 集計項目リスト（`SELECT` リスト順）。
+    pub fn items(&self) -> &[AggregateItem] {
+        &self.items
+    }
+
+    /// WHERE 句に含まれる述語（AND 結合順）。空なら WHERE 句なし。
+    pub fn where_predicates(&self) -> &[WherePredicate] {
+        &self.where_predicates
+    }
 }
 
 /// INSERT の VALUES リストの 1 リテラル（SQL-10、TASK-80）。トークン種別
@@ -641,6 +767,44 @@ impl<'a> Parser<'a> {
         Ok(SelectItem::Column(self.expect_ident()?))
     }
 
+    /// 集計 SELECT リストの 1 項目（TASK-166・SQL-13）:
+    /// `<agg_name> '(' ('*' | <expr>) ')' [AS <alias>]`。`*` は `COUNT` 専用
+    /// （それ以外の関数での出現は `42601`）。空引数（`COUNT()`）・複数引数・
+    /// `DISTINCT` 修飾はいずれも構造的に受理しない（`)` を期待する位置で不一致となり
+    /// `42601` へ落ちる）。
+    fn parse_aggregate_item(&mut self) -> Result<AggregateItem, SqlSurfaceError> {
+        let name = self.expect_ident()?;
+        let func = AggregateFunc::from_name(&name).ok_or_else(|| {
+            SqlSurfaceError::unsupported(format!("unsupported aggregate function: {name}"))
+        })?;
+        self.expect_punct('(')?;
+        let arg = if matches!(self.peek(), Some(Token::Punct('*'))) {
+            if func != AggregateFunc::Count {
+                return Err(SqlSurfaceError::unsupported(
+                    "'*' is only allowed inside COUNT(*)",
+                ));
+            }
+            self.advance();
+            AggregateArg::Star
+        } else {
+            if matches!(self.peek(), Some(Token::Punct(')'))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "aggregate function requires exactly one argument",
+                ));
+            }
+            let expr = self.parse_value_expr(0)?;
+            AggregateArg::Expr(expr)
+        };
+        self.expect_punct(')')?;
+        let alias = if self.peek_ident_matches("AS") {
+            self.advance();
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(AggregateItem { func, arg, alias })
+    }
+
     /// WHERE 句の許可形状（等価条件・前方一致条件（TASK-147・EXT-3）・述語呼び出し形・
     /// TASK-79（SQL-9）で追加した式の比較述語 `<expr> <cmp> <expr>` の 4 種。
     /// `OR`・括弧によるネストは引き続き許可しない）。述語呼び出し形は許可された名前
@@ -822,7 +986,19 @@ impl<'a> Parser<'a> {
 
     /// 関数呼び出し式 `<name> '(' [expr {',' expr}] ')'` を解析する。呼び出し元は
     /// 直前に `name` を消費済みで、次のトークンが `'('` である前提（`peek` 済み）。
+    ///
+    /// TASK-166（SQL-13）: 集計関数名（[`is_aggregate_function_name`]）はここでは
+    /// 常に拒否する（`42601`）。集計関数の頂点呼び出しは
+    /// [`Parser::parse_aggregate_item`] が本メソッドを経由せず直接消費するため、
+    /// この経路に到達する集計名はすべて「集計項目の頂点以外」（SELECT の非集計項目・
+    /// WHERE 式述語・`CREATE FUNCTION` 本体・集計引数のネスト呼び出し）での出現であり、
+    /// いずれも許可形状外（`GROUP BY` を持たない集計のみを SQL-13 の受理形とする）。
     fn parse_call_expr(&mut self, name: String, depth: usize) -> Result<Expr, SqlSurfaceError> {
+        if is_aggregate_function_name(&name) {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "aggregate function {name} is only allowed as a top-level SELECT item"
+            )));
+        }
         self.expect_punct('(')?;
         let mut args = Vec::new();
         if !matches!(self.peek(), Some(Token::Punct(')'))) {
@@ -1142,6 +1318,52 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
     })
 }
 
+/// 構文木（[`ValidatedAggregate`] の元）。カタログ存在確認前の中間結果
+/// （TASK-166・SQL-13）。
+struct ParsedAggregateShape {
+    table_name: String,
+    items: Vec<AggregateItem>,
+    where_predicates: Vec<WherePredicate>,
+}
+
+/// 許可した集計 `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-166・
+/// SQL-13）。`ORDER BY`／`LIMIT`／`HINT ORDER`／`USING MODE` はいずれも受理しない
+/// （集計結果は常に単一行のため、順位付け・取得モードの余地がない）。呼び出し元
+/// （[`validate_sql`]）は先頭 2 トークンが集計関数名 `'('` であることを確認済みの
+/// 前提で呼ぶ。
+fn parse_aggregate_shape(tokens: &[Token]) -> Result<ParsedAggregateShape, SqlSurfaceError> {
+    let mut p = Parser::new(tokens);
+
+    p.expect_keyword(Keyword::Select)?;
+    let mut items = vec![p.parse_aggregate_item()?];
+    while matches!(p.peek(), Some(Token::Punct(','))) {
+        if items.len() >= MAX_AGGREGATE_ITEMS {
+            return Err(SqlSurfaceError::payload_too_large(
+                "too many aggregate items",
+            ));
+        }
+        p.advance();
+        items.push(p.parse_aggregate_item()?);
+    }
+    p.expect_keyword(Keyword::From)?;
+    let table_name = p.expect_ident()?;
+
+    let where_predicates = if matches!(p.peek(), Some(Token::Keyword(Keyword::Where))) {
+        p.advance();
+        p.parse_where()?
+    } else {
+        Vec::new()
+    };
+
+    p.expect_end_of_statement()?;
+
+    Ok(ParsedAggregateShape {
+        table_name,
+        items,
+        where_predicates,
+    })
+}
+
 /// `SET search_mode = '<literal>'`（TASK-161・SQL-12）の許可形状。規範形は
 /// `=` ＋ 文字列リテラルの完全一致のみ（`TO` 形・非引用値・`RESET`/`SHOW` 等の緩和は
 /// SQL-12 に規範がないため、本実装は最も厳格な形に倒す。緩和は spec 側の判断事項）。
@@ -1217,7 +1439,26 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
     let is_create_function_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"));
+    // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
+    // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
+    // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
+    // トラックせず先読みだけで確定させる（`Parser::pos` の巻き戻しに依存しない）。
+    let is_aggregate_select = matches!(tokens.first(), Some(Token::Keyword(Keyword::Select)))
+        && matches!(tokens.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+        && matches!(tokens.get(2), Some(Token::Punct('(')));
     match tokens.first() {
+        Some(Token::Keyword(Keyword::Select)) if is_aggregate_select => {
+            let shape = parse_aggregate_shape(&tokens)?;
+            let exists = lookup.table_exists(&shape.table_name)?;
+            if !exists {
+                return Err(SqlSurfaceError::undefined_table(shape.table_name));
+            }
+            Ok(Statement::Aggregate(ValidatedAggregate {
+                table_name: shape.table_name,
+                items: shape.items,
+                where_predicates: shape.where_predicates,
+            }))
+        }
         Some(Token::Keyword(Keyword::Select)) => {
             let shape = parse_select_shape(&tokens)?;
             let exists = lookup.table_exists(&shape.table_name)?;
@@ -1265,6 +1506,12 @@ pub fn validate_statement(
         )),
         Statement::CreateFunction { .. } => Err(SqlSurfaceError::unsupported(
             "CREATE FUNCTION is not a query statement (use a session-aware entry point)",
+        )),
+        // TASK-166（SQL-13）: 集計 SELECT は `ValidatedStatement`（検索 SELECT 専用の
+        // 形）を持たないため、このエントリポイントでは受理しない（`SET`・
+        // `CREATE FUNCTION` と同じ「このエントリポイントでは非対応」の一律 `42601`）。
+        Statement::Aggregate(_) => Err(SqlSurfaceError::unsupported(
+            "aggregate SELECT is not a search query statement (use a session-aware entry point)",
         )),
     }
 }
@@ -2518,5 +2765,217 @@ mod tests {
             &lookup,
         )
         .expect("columns named `using`/`set` should remain valid identifiers");
+    }
+
+    // --- 集計 SELECT（TASK-166・SQL-13） ------------------------------------
+
+    fn expect_aggregate(sql: &str, lookup: &impl TableLookup) -> ValidatedAggregate {
+        match validate_sql(sql, lookup).expect("expected the aggregate shape to be accepted") {
+            Statement::Aggregate(agg) => agg,
+            other => panic!("expected Statement::Aggregate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_count_star() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate("SELECT COUNT(*) FROM documents", &lookup);
+        assert_eq!(agg.table_name(), "documents");
+        assert_eq!(agg.items().len(), 1);
+        assert_eq!(agg.items()[0].func, AggregateFunc::Count);
+        assert_eq!(agg.items()[0].arg, AggregateArg::Star);
+        assert_eq!(agg.items()[0].alias, None);
+    }
+
+    #[test]
+    fn accepts_count_star_case_insensitive_function_name() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate("SELECT count(*) FROM documents", &lookup);
+        assert_eq!(agg.items()[0].func, AggregateFunc::Count);
+    }
+
+    #[test]
+    fn accepts_multiple_aggregate_items_with_alias_and_where() {
+        let lookup = catalog_with(&["documents"]);
+        let agg = expect_aggregate(
+            "SELECT COUNT(lang), SUM(id) AS total, MIN(lang), MAX(id), AVG(id) FROM documents WHERE visible() AND lang = 'en'",
+            &lookup,
+        );
+        assert_eq!(agg.items().len(), 5);
+        assert_eq!(agg.items()[1].func, AggregateFunc::Sum);
+        assert_eq!(agg.items()[1].alias.as_deref(), Some("total"));
+        assert_eq!(agg.where_predicates().len(), 2);
+    }
+
+    #[test]
+    fn accepts_trailing_semicolon_on_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        expect_aggregate("SELECT COUNT(*) FROM documents;", &lookup);
+    }
+
+    #[test]
+    fn rejects_group_by_on_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(*) FROM documents GROUP BY lang", &lookup)
+            .expect_err("GROUP BY must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_order_by_and_limit_on_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT COUNT(*) FROM documents ORDER BY id LIMIT 10",
+            &lookup,
+        )
+        .expect_err("ORDER BY/LIMIT must be rejected on an aggregate SELECT");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_hint_order_and_using_mode_on_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT COUNT(*) FROM documents HINT ORDER(rls, scalar, distance)",
+            &lookup,
+        )
+        .expect_err("HINT ORDER must be rejected on an aggregate SELECT");
+        assert_eq!(err.wire_code(), "42601");
+        let err = validate_sql(
+            "SELECT COUNT(*) FROM documents USING MODE 'recall'",
+            &lookup,
+        )
+        .expect_err("USING MODE must be rejected on an aggregate SELECT");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_mixed_aggregate_and_non_aggregate_items_either_order() {
+        let lookup = catalog_with(&["documents"]);
+        assert_eq!(
+            validate_sql("SELECT id, COUNT(*) FROM documents", &lookup)
+                .expect_err("mixing non-aggregate then aggregate must be rejected")
+                .wire_code(),
+            "42601"
+        );
+        assert_eq!(
+            validate_sql("SELECT COUNT(*), id FROM documents", &lookup)
+                .expect_err("mixing aggregate then non-aggregate must be rejected")
+                .wire_code(),
+            "42601"
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_call_inside_where_expression() {
+        let lookup = catalog_with(&["documents"]);
+        // `WHERE COUNT(id) > 1` は先頭トークンが集計形の判定に一致しない
+        // （`SELECT` の直後は `WHERE` ではない）ため通常 SELECT として構文解析
+        // され、`parse_call_expr` が集計名を拒否して `42601` になる。
+        let err = validate_sql(
+            "SELECT id FROM documents WHERE COUNT(id) > 1 ORDER BY id <=> '[0.1]' LIMIT 1",
+            &lookup,
+        )
+        .expect_err("aggregate call in WHERE must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_nested_aggregate_call() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(SUM(id)) FROM documents", &lookup)
+            .expect_err("nested aggregate call must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_star_outside_count() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT SUM(*) FROM documents", &lookup)
+            .expect_err("'*' outside COUNT must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_empty_argument_list() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT() FROM documents", &lookup)
+            .expect_err("COUNT() must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_distinct_modifier() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(DISTINCT lang) FROM documents", &lookup)
+            .expect_err("COUNT(DISTINCT ...) must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_aggregate_call_in_create_function_body() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("CREATE FUNCTION f(x) AS COUNT(x)", &lookup)
+            .expect_err("aggregate call in CREATE FUNCTION body must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_multiple_aggregate_statements() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql(
+            "SELECT COUNT(*) FROM documents; SELECT COUNT(*) FROM documents",
+            &lookup,
+        )
+        .expect_err("multiple statements must be rejected");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_undefined_table_on_aggregate_select() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_sql("SELECT COUNT(*) FROM ghost", &lookup)
+            .expect_err("undefined table must be rejected");
+        assert_eq!(err.wire_code(), "42P01");
+    }
+
+    #[test]
+    fn rejects_too_many_aggregate_items() {
+        let lookup = catalog_with(&["documents"]);
+        let items = std::iter::repeat_n("COUNT(*)", MAX_AGGREGATE_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {items} FROM documents");
+        let err = validate_sql(&sql, &lookup)
+            .expect_err("exceeding MAX_AGGREGATE_ITEMS must be rejected");
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn accepts_exactly_max_aggregate_items() {
+        let lookup = catalog_with(&["documents"]);
+        let items = std::iter::repeat_n("COUNT(*)", MAX_AGGREGATE_ITEMS)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {items} FROM documents");
+        let agg = expect_aggregate(&sql, &lookup);
+        assert_eq!(agg.items().len(), MAX_AGGREGATE_ITEMS);
+    }
+
+    #[test]
+    fn validate_statement_rejects_aggregate_select_as_search_query() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT COUNT(*) FROM documents", &lookup)
+            .expect_err("aggregate SELECT must be rejected by the SELECT-only entry point");
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn aggregate_classification_is_deterministic_across_repeated_calls() {
+        let lookup = catalog_with(&["documents"]);
+        let sql = "SELECT COUNT(*) FROM documents WHERE lang = 'en'";
+        let first = validate_sql(sql, &lookup).expect("first call should succeed");
+        let second = validate_sql(sql, &lookup).expect("second call should succeed");
+        assert_eq!(first, second);
     }
 }

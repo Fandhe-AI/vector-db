@@ -202,12 +202,17 @@ fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
 }
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
-/// 等）・組み込み関数名と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
-/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する。
+/// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
+/// TASK-166・SQL-13）と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
+/// ことで「同じ字面が場所により異なる意味を持つ」曖昧さを構造的に排除する
+/// （集計関数名を含めない版では `CREATE FUNCTION min(...)` が成功したまま
+/// `SELECT min(id)` が集計として実行され、当該 UDF が呼び出し不能になる不整合が
+/// あった。Cursor Bugbot 指摘対応・PR #229）。
 fn is_reserved_function_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     matches!(upper.as_str(), "VISIBLE" | "HYBRID_RRF" | "HYBRID")
         || builtin_from_name(name).is_some()
+        || crate::sql::allowlist::is_aggregate_function_name(name)
 }
 
 /// セッション内で登録された宣言的 UDF 1 件。本体は構文段の [`Expr`]（パラメータ参照は

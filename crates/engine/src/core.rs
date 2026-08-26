@@ -832,6 +832,25 @@ impl EngineCore {
                     }
                 }
             }
+            // TASK-166（SQL-13）: 集計 SELECT は UDF 呼び出しをその引数に含みうる
+            // ため（セッション UDF レジストリ参照）、`Select` と同じくセッションを
+            // 要する実行本体（`execute_sql_in_session`）へ委譲する。UDF を持たない
+            // 空セッションで束縛するため、セッションに定義済みの UDF を参照する
+            // 集計は（`Select` と同様）このセッションなしエントリポイントでは
+            // 使えない（`22000`。「未知の関数」として拒否される）。
+            crate::sql::allowlist::Statement::Aggregate(_) => {
+                let mut session = crate::sql::mode::SessionState::default();
+                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                    crate::sql::SqlOutcome::Query(result) => Ok(result),
+                    crate::sql::SqlOutcome::SetSearchMode(_)
+                    | crate::sql::SqlOutcome::CreateFunction { .. } => {
+                        Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
+                                .to_string(),
+                        })
+                    }
+                }
+            }
         }
     }
 
@@ -899,6 +918,36 @@ impl EngineCore {
                     &bound,
                     &self.precision_policy,
                 )?;
+                Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // TASK-166（SQL-13）: 集計 SELECT はスキーマ取得（`bind_aggregate` 用）・
+            // 行走査（`sql::aggregate::execute_aggregate`）を、既存の検索 SELECT
+            // （`Statement::Select` アーム）と同じく単一の `read_txn`（同一
+            // スナップショット）上で行う（Issue #56 レビュー指摘対応の踏襲。上記
+            // `Statement::Select` アームのドキュメント参照）。
+            crate::sql::allowlist::Statement::Aggregate(validated) => {
+                let read_txn = self.storage.db().begin_read().map_err(|e| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!(
+                            "failed to begin read transaction: {}",
+                            StorageError::from(e)
+                        ),
+                    }
+                })?;
+                let schema =
+                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
+                        .map_err(|e| match e {
+                            CatalogError::TableNotFound(name) => {
+                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                            }
+                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to load table schema: {other}"),
+                            },
+                        })?;
+                let bound =
+                    crate::sql::parser::bind_aggregate(&validated, &schema, session.udfs())?;
+                let result =
+                    crate::sql::aggregate::execute_aggregate(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
         }
