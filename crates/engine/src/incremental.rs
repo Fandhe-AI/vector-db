@@ -70,6 +70,12 @@ pub enum IncrementalError {
     Embed(EmbedError),
     /// テナント境界付き書き込みの失敗（[`TenantWriteError`] をそのまま保持）。
     Write(TenantWriteError),
+    /// チャンク化の結果、書き込み対象のチャンクが 0 件になった（`22000` 相当）。
+    /// 空・空白のみの本文を送った場合に、既存チャンクを全削除したまま
+    /// 挿入 0 件で世代だけ bump するのを防ぐ（`replace_typed_rows_by_text_key`
+    /// の「同一パスの既存行を全削除 → 新チャンク行を挿入」契約が、意図しない
+    /// 全削除（実質的な索引破壊）に化けるのを fail-closed に拒否する）。
+    EmptyChunks,
 }
 
 impl std::fmt::Display for IncrementalError {
@@ -80,6 +86,9 @@ impl std::fmt::Display for IncrementalError {
             }
             IncrementalError::Embed(e) => write!(f, "embedding failed: {e}"),
             IncrementalError::Write(_) => write!(f, "incremental index write failed"),
+            IncrementalError::EmptyChunks => {
+                write!(f, "file body produced no chunks to index")
+            }
         }
     }
 }
@@ -163,6 +172,15 @@ pub fn index_file(
     let chunks = crate::chunking::chunk_file(input.path, input.body, &config.chunking)
         .map_err(|e| IncrementalError::ChunkingTooLarge(e.to_string()))?;
     let chunking_elapsed = chunking_start.elapsed();
+
+    // 空・空白のみの本文（`chunk_file` が 0 チャンクを返す入力）は、ここで
+    // fail-closed に拒否する。ガードなしで `replace_typed_rows_by_text_key`
+    // まで進むと、同一パスの既存チャンクを全削除したうえで挿入 0 件のまま
+    // 世代だけ bump してコミットし、実質的な索引破壊が「成功」応答になる
+    // （Issue #68 レビュー指摘）。
+    if chunks.is_empty() {
+        return Err(IncrementalError::EmptyChunks);
+    }
 
     if chunks.len() > config.max_chunks_per_file {
         return Err(IncrementalError::ChunkingTooLarge(format!(

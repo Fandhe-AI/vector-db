@@ -245,6 +245,51 @@ fn resend_same_path_replaces_chunks_and_old_content_disappears() {
     assert!(body_text_cells(&rows_for_other)[0].contains("qqzzz"));
 }
 
+#[test]
+fn empty_body_file_insert_is_rejected_and_does_not_wipe_existing_chunks() {
+    // Issue #68 レビュー指摘: 本文が空（または空白のみで `chunk_file` が
+    // 0 チャンクを返す）ファイル形 INSERT を送ると、ガードなしでは既存チャンクを
+    // 全削除したうえで挿入 0 件のまま世代だけ bump してコミットしてしまう
+    // （実質的な索引破壊が「成功」応答になる）。fail-closed に拒否し、
+    // 既存チャンクが無傷で残ることを確認する。
+    let path = unique_db_path("index-empty-body-rejected");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(&path);
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+
+    let first_body = "first version line one alpha\nfirst version line two alpha";
+    core.execute_insert_sql(
+        &write_ctx,
+        &insert_file_sql("documents", "docs/note.txt", first_body, "op-empty-1"),
+    )
+    .expect("first insert should succeed");
+
+    // 空白のみの本文 → `chunk_file` は 0 チャンクを返す。
+    let err = core
+        .execute_insert_sql(
+            &write_ctx,
+            &insert_file_sql("documents", "docs/note.txt", "   \n\n  ", "op-empty-2"),
+        )
+        .expect_err("empty-chunk file insert should be rejected");
+    assert_eq!(err.wire_code(), "22000");
+
+    let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
+    let rows_for_note = core
+        .execute_sql(
+            &read_ctx,
+            &format!(
+                "SELECT body FROM documents WHERE path = 'docs/note.txt' ORDER BY embedding <=> {zero_vec} LIMIT 100"
+            ),
+        )
+        .expect("select by path should succeed");
+    // 既存チャンクが無傷で残る（全削除されていない）。
+    assert_eq!(rows_for_note.rows.len(), 1);
+    assert!(body_text_cells(&rows_for_note)[0].contains("first version"));
+}
+
 // --- テナント境界 ---------------------------------------------------------------
 
 #[test]

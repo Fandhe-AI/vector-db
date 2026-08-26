@@ -1114,6 +1114,11 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
 
     match e {
         IncrementalError::ChunkingTooLarge(detail) => SqlSurfaceError::payload_too_large(detail),
+        IncrementalError::Embed(crate::embedding::EmbedError::TooManyInputs { len, max }) => {
+            SqlSurfaceError::payload_too_large(format!(
+                "embedding batch too large: {len} inputs (max {max})"
+            ))
+        }
         IncrementalError::Embed(_) => SqlSurfaceError::Internal {
             detail: "embedding failed".to_string(),
         },
@@ -1126,6 +1131,9 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),
         },
+        IncrementalError::EmptyChunks => {
+            SqlSurfaceError::invalid_input("insert rejected: file body produced no chunks to index")
+        }
     }
 }
 
