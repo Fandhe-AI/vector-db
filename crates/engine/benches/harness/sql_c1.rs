@@ -53,6 +53,31 @@ impl std::fmt::Display for SqlC1Error {
     }
 }
 
+/// [`vector_literal`] の検証（非有限値の拒否・[`MAX_VECTOR_LITERAL_BYTES`] 上限）を
+/// 通過したベクトルリテラルであることを型で表す newtype。
+///
+/// 内部の `String` は非公開で、本モジュール外からは [`vector_literal`] 経由でしか
+/// 構築できない。これにより [`c1_statement`] が SQL へ単一引用符つきで連結する
+/// 文字列は「検証済みである」ことがコード上で保証され、運用規約に依存しない
+/// （`.claude/rules/coding-rust.md`「SQL / プラン文字列の組み立てに未検証入力を
+/// 連結しない」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorLiteral(String);
+
+impl VectorLiteral {
+    /// 検証済みリテラルの本体を借用する（`sql::parser::parse_vector_literal` への
+    /// 受け渡し・テストでの突き合わせに使う）。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for VectorLiteral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// `[A-Za-z_][A-Za-z0-9_]*` に一致するかを検証する（SQL 表層の識別子受理規則と
 /// 同じ形状。定数からのみ呼ばれる想定だが、定数だからといって検証を省かない
 /// ——「未検証の外部文字列連結経路を作らない」という設計方針そのものを
@@ -77,7 +102,7 @@ fn is_valid_identifier(name: &str) -> bool {
 /// 検証は各成分を `write!` で追記するたびに行い、上限超過を検知した時点で成長を
 /// 打ち切る（一括アロケーション前の事前検証ではないが、無制限に成長し続けさせない
 /// 意味で有界性は保つ。coding-rust.md「untrusted 入力の扱い」）。
-pub fn vector_literal(values: &[f32]) -> Result<String, SqlC1Error> {
+pub fn vector_literal(values: &[f32]) -> Result<VectorLiteral, SqlC1Error> {
     if values.iter().any(|v| !v.is_finite()) {
         return Err(SqlC1Error::NonFiniteComponent);
     }
@@ -98,21 +123,21 @@ pub fn vector_literal(values: &[f32]) -> Result<String, SqlC1Error> {
     if out.len() > MAX_VECTOR_LITERAL_BYTES {
         return Err(SqlC1Error::LiteralTooLarge);
     }
-    Ok(out)
+    Ok(VectorLiteral(out))
 }
 
 /// SQL-1（純粋 Top-k）の規範形クエリ文字列を組み立てる: `SELECT id FROM <table>
 /// ORDER BY <column> <=> '<literal>' LIMIT <k>`。
 ///
 /// `table`・`column` は識別子検証を経てから埋め込む（呼び出し元がすべて定数を
-/// 渡す構成であっても、未検証文字列連結の経路をコード上に残さないため。
-/// `literal` は [`vector_literal`] が返した文字列のみを受け付ける契約——本関数は
-/// `literal` の中身を再検証しない代わりに、生成元を型ではなく運用規約として
-/// [`vector_literal`] に限定する）。
+/// 渡す構成であっても、未検証文字列連結の経路をコード上に残さないため）。
+/// `literal` は [`VectorLiteral`]（[`vector_literal`] でしか構築できない検証済み型）
+/// のみを受け付けるため、単一引用符内へ連結される文字列が未検証になる経路は
+/// 型レベルで存在しない。
 pub fn c1_statement(
     table: &str,
     column: &str,
-    literal: &str,
+    literal: &VectorLiteral,
     k: usize,
 ) -> Result<String, SqlC1Error> {
     if !is_valid_identifier(table) {

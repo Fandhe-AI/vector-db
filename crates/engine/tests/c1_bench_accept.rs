@@ -26,12 +26,12 @@ use engine::sql::parser::parse_vector_literal;
 fn vector_literal_round_trips_through_parse_vector_literal() {
     let values: Vec<f32> = (0..768).map(|i| (i as f32) * 0.01 - 3.84).collect();
     let literal = vector_literal(&values).expect("finite values must produce a literal");
-    assert!(literal.len() < 64 * 1024);
+    assert!(literal.as_str().len() < 64 * 1024);
 
     // `vector_literal` は「`str::parse::<f32>` で元の値へ往復できる」ことを契約として
     // 宣言しているため、許容誤差なしのビット等価比較で検証する（誤差付き比較は契約より
     // 緩く、往復性の劣化を見逃す）。
-    let parsed = parse_vector_literal(&literal, 768).expect("literal must parse back");
+    let parsed = parse_vector_literal(literal.as_str(), 768).expect("literal must parse back");
     assert_eq!(parsed, values, "vector_literal must round-trip exactly");
 }
 
@@ -50,8 +50,8 @@ fn vector_literal_rejects_infinity() {
 #[test]
 fn vector_literal_empty_dimension_round_trips() {
     let literal = vector_literal(&[]).expect("empty vector must produce a literal");
-    assert_eq!(literal, "[]");
-    let parsed = parse_vector_literal(&literal, 0).expect("literal must parse back");
+    assert_eq!(literal.as_str(), "[]");
+    let parsed = parse_vector_literal(literal.as_str(), 0).expect("literal must parse back");
     assert!(parsed.is_empty());
 }
 
