@@ -141,6 +141,13 @@
 //! TASK-92（対象ビヘイビア: RECOVER-1）: `recovery::required_op_id::LedgerMode` が
 //! `operation_id` 必須化ガードをサーバー構成のみで決定する（詳細は `recovery`
 //! モジュールドキュメント参照）。
+//!
+//! TASK-166（対象ビヘイビア: SQL-13）: `sql::aggregate` が集計関数（`COUNT`/`SUM`/
+//! `AVG`/`MIN`/`MAX`）のみを結果列とする `GROUP BY` なし単一行 SELECT を実行する。
+//! RLS 適用順序は既存の検索 SELECT 実行経路（`arena.rs`）と同一の規約（デコード前の
+//! ヘッダ判定 → 可視行のみ完全デコード）に揃え、集計値から他テナント行の存在・件数を
+//! 推測できないことを維持する（詳細は `sql.rs`・`sql/aggregate.rs` モジュール
+//! ドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;
