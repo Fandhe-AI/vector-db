@@ -55,47 +55,32 @@
 //! wire/SQL 表層側で [`select_execution_path`] の戻り値を読み取り専用に
 //! 表示する形の後続タスクとして検討する。
 //!
-//! ISA の完全な実行時検出（`is_x86_feature_detected!` 等による CPUID/HWCAP 照会、
-//! TASK-156・CORE-14）は本タスクの範囲外だが、[`detect_current_isa`] はコンパイル時
-//! ターゲット（`cfg(target_arch = ..)`）だけに基づく保守的な下限検出を提供する
-//! （fail-closed: 実際より広い ISA を報告することはない。x86_64 は常に `Scalar` を
-//! 返し、AVX2/AVX-512 の実行時検出は TASK-156 が担う）。
+//! ISA の完全な実行時検出（`is_x86_feature_detected!` 等による CPUID/HWCAP 照会）は
+//! TASK-156（対象ビヘイビア: CORE-14）が `isa.rs` に実装した。[`detect_current_isa`]
+//! はその検出結果（`isa::current().isa()`）へ委譲する薄いラッパーであり、
+//! 本モジュール自身は CPU 機能照会のロジックを持たない（fail-closed: 検出失敗時は
+//! `isa.rs` 側が `Scalar` へ倒す。詳細は `isa.rs` モジュールドキュメント参照）。
 
 use crate::batch_search::{should_aggregate_into_batch, MAX_BATCH_DIM, MAX_BATCH_QUERIES};
 
-/// 実行時に検出された ISA（TASK-156 の検出トークン導入前のデータ表現）。
+/// 実行時に検出された ISA。定義の実体は `isa.rs`（TASK-156）に移設し、既存の公開パス
+/// （`engine::dispatch::DetectedIsa`。`tests/dispatch.rs` 等が参照）を維持するため
+/// ここで re-export する。
 ///
 /// `#[non_exhaustive]` にはしない。variant 追加時に [`select_execution_path`] の
 /// 網羅 match がコンパイルエラーになり、決定表の更新漏れを構造的に防ぐため
 /// （CORE-11: 決定表を 1 箇所に保つという設計意図と表裏一体）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DetectedIsa {
-    /// SIMD 拡張なし（スカラー演算のみ）。
-    Scalar,
-    /// Arm Neon（128 bit）。
-    Neon,
-    /// x86_64 AVX2 + FMA（256 bit）。
-    Avx2Fma,
-    /// x86_64 AVX-512（512 bit）。
-    Avx512,
-}
+pub use crate::isa::DetectedIsa;
 
-/// コンパイル時ターゲットのみに基づく保守的な ISA 下限検出（モジュールドキュメント
-/// 「ISA の完全な実行時検出」の項参照）。呼び出し元が任意の [`DetectedIsa`] を
-/// 偽装できないよう、[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]
+/// 実行時に検出された ISA を返す（TASK-156・CORE-14）。`isa::current()`（プロセス内
+/// 1 回だけ検出しキャッシュする）の写像を返すだけの薄いラッパーで、本モジュール
+/// 自身は検出ロジックを持たない。呼び出し元が任意の [`DetectedIsa`] を偽装
+/// できないよう、[`DispatchInput::for_single_query`]／[`DispatchInput::for_batch`]
 /// は `isa` を引数に取らず、内部でこの関数の戻り値のみを使う（codex-review P1
 /// 指摘対応・PR #158。`isa` フィールド自体も private のため、呼び出し元が別の値を
 /// 混入させる経路は構造的に存在しない）。
 pub fn detect_current_isa() -> DetectedIsa {
-    if cfg!(target_arch = "aarch64") {
-        // aarch64 の baseline ISA は Neon（128 bit）を含むことがアーキテクチャ仕様上
-        // 保証されている（実行時検出なしでも安全に主張できる下限）。
-        DetectedIsa::Neon
-    } else {
-        // x86_64 等は AVX2/AVX-512 の実際の対応有無をコンパイル時には判定できないため、
-        // 最も保守的な `Scalar` を返す（fail-closed。実行時検出は TASK-156 の管轄）。
-        DetectedIsa::Scalar
-    }
+    crate::isa::current().isa()
 }
 
 /// GPU バックエンドが実際に利用可能であることを証明する sealed capability トークン

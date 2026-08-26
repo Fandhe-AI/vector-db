@@ -377,11 +377,8 @@ pub fn decode_row(schema: &TableSchema, buf: &[u8]) -> Result<DecodedRow> {
                     })?;
                     // 上限検証済みの dim に基づくため、無制限確保にはならない。
                     let mut vector = Vec::with_capacity(dim as usize);
-                    for chunk in vector_bytes.chunks_exact(4) {
-                        let arr: [u8; 4] = chunk.try_into().map_err(|_| {
-                            RowCodecError::Invalid("vector chunk is not 4 bytes".to_string())
-                        })?;
-                        vector.push(f32::from_le_bytes(arr));
+                    for chunk in vector_bytes.as_chunks::<4>().0 {
+                        vector.push(f32::from_le_bytes(*chunk));
                     }
                     offset = vector_end;
                     values.push(Value::Vector(vector));

@@ -1,10 +1,12 @@
 //! wire-server: PostgreSQL wire プロトコル v3 互換の自作実装を持つバイナリ層。
 //!
 //! 責務境界: クライアント接続の受け付け・wire プロトコルのパース/応答整形を担い、
-//! クエリの実処理は `engine` クレート（コアロジック層）へ委譲する（本タスク時点では
-//! 未実装であり、簡易クエリには「未実装」の ErrorResponse を返す。TASK-73 以降で接続）。
+//! クエリの実処理は `engine` クレート（コアロジック層）へ委譲する（TASK-73 で
+//! 簡易クエリプロトコルを `engine::core::EngineCore` へ接続した）。
 //!
-//! CLI: `wire-server --users <path> [--bind <addr:port>]`（既定 bind: `127.0.0.1:5432`）。
+//! CLI: `wire-server --users <path> --db <path> [--bind <addr:port>]`
+//! （既定 bind: `127.0.0.1:5432`）。`--db` は必須（省略時は fail-closed で
+//! 非 0 終了。匿名・揮発 DB の暗黙生成はしない。TASK-73・WIRE-1）。
 //! `wire-server hash-password` サブコマンドはユーザーストア（`username:tenant_id:phc`）
 //! に登録する 1 行を生成する補助コマンド（stdin からパスワードを読み、平文を
 //! ログ・引数に残さない）。
@@ -42,9 +44,10 @@ fn main() -> ExitCode {
     run_server(&args)
 }
 
-/// `wire-server --users <path> [--bind <addr:port>]`。
+/// `wire-server --users <path> --db <path> [--bind <addr:port>]`。
 fn run_server(args: &[String]) -> ExitCode {
     let mut users_path: Option<PathBuf> = None;
+    let mut db_path: Option<PathBuf> = None;
     let mut bind_addr = DEFAULT_BIND.to_string();
 
     let mut i = 1;
@@ -56,6 +59,14 @@ fn run_server(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 users_path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            "--db" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("wire-server: --db requires a path argument");
+                    return ExitCode::FAILURE;
+                };
+                db_path = Some(PathBuf::from(v));
                 i += 2;
             }
             "--bind" => {
@@ -75,6 +86,12 @@ fn run_server(args: &[String]) -> ExitCode {
 
     let Some(users_path) = users_path else {
         eprintln!("wire-server: --users <path> is required (fail-closed: no anonymous login)");
+        return ExitCode::FAILURE;
+    };
+    let Some(db_path) = db_path else {
+        eprintln!(
+            "wire-server: --db <path> is required (fail-closed: no implicit anonymous/volatile database)"
+        );
         return ExitCode::FAILURE;
     };
 
@@ -99,6 +116,18 @@ fn run_server(args: &[String]) -> ExitCode {
     };
     let store = Arc::new(store);
 
+    // engine（永続化 + SQL 表層）を起動する。ユーザーストア読込に続けて bind 前に
+    // 開くことで、DB を開けない状態のまま listen してしまう経路を避ける
+    // （fail-closed。TASK-73・WIRE-1）。
+    let core = match engine::core::EngineCore::open(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("wire-server: failed to open database at {db_path:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let core = Arc::new(core);
+
     // `guarded.bind()` は検証済みの数値アドレスへ直接 bind し、`bind_addr`
     // （文字列）を別途 `TcpListener::bind` へ渡すことはしない（検証時と bind 時で
     // DNS 再解決が起きる TOCTOU を作らないため。TASK-67 review 指摘）。
@@ -112,11 +141,17 @@ fn run_server(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("wire-server: listening on {bind_addr}");
+    // 実際に bind されたアドレスを出す（`--bind 127.0.0.1:0` の ephemeral port
+    // 割り当て結果を E2E テストハーネスがこの行から取得する前提。TASK-73）。
+    match listener.local_addr() {
+        Ok(addr) => eprintln!("wire-server: listening on {addr}"),
+        Err(_) => eprintln!("wire-server: listening on {bind_addr}"),
+    }
 
-    server::accept_loop_with_limiter(
+    server::accept_loop_with_engine(
         listener,
         store,
+        core,
         limits::ConnectionLimiter::new(limits::MAX_CONNECTIONS),
         limits::READ_TIMEOUT,
     );

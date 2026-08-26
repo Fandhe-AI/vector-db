@@ -148,6 +148,18 @@ impl PolicyContext {
         }
         row_visibility == Visibility::Public || row_tenant == self.tenant_id
     }
+
+    /// 書き込み認可の単一照合パス（TASK-95・対象ビヘイビア: RECOVER-4）。
+    ///
+    /// [`Self::is_visible`] とは独立の判定で、可視性ラベル（`Public`/`Private`）は
+    /// 一切考慮しない。テナント一致のみで判定するため、他テナントの `Public` 行は
+    /// 読めても書けない（読み取り可視性の拡張が書き込み権限の拡張を意味しない）。
+    /// 呼び出し元（[`crate::tenant`]・[`crate::core`]）はこのメソッド以外で書き込み用の
+    /// テナント比較を行わない（security.md P0「テナント分離の検査を外す/緩める/
+    /// バイパス経路を作らない」）。
+    pub fn is_owner(&self, row_tenant: &str) -> bool {
+        row_tenant == self.tenant_id
+    }
 }
 
 #[cfg(test)]
@@ -207,6 +219,32 @@ mod tests {
         let tenant_id = "t".repeat(max_len);
         let ctx = PolicyContext::new(&tenant_id).expect("tenant_id at the limit must be accepted");
         assert_eq!(ctx.tenant_id(), tenant_id);
+    }
+
+    // 対象ビヘイビア: RECOVER-4。同一テナントの行は所有者とみなす。
+    #[test]
+    fn is_owner_true_for_same_tenant() {
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        assert!(ctx.is_owner("tenant-a"));
+    }
+
+    // 対象ビヘイビア: RECOVER-4（fail-closed）。他テナントの行は所有者とみなさない。
+    #[test]
+    fn is_owner_false_for_other_tenant() {
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        assert!(!ctx.is_owner("tenant-b"));
+    }
+
+    // 対象ビヘイビア: RECOVER-4。`is_owner` は可視性ラベルを一切考慮しない。他テナントの
+    // `Public` 行が読めても（`is_visible`）、書き込み認可（`is_owner`）は別判定であることを
+    // 確認する（読み取り可視性の拡張が書き込み権限の拡張を意味しないことの回帰検証）。
+    #[test]
+    fn is_owner_ignores_visibility_even_when_public_is_visible() {
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        assert!(ctx.is_visible("tenant-b", Visibility::Public));
+        assert!(!ctx.is_owner("tenant-b"));
     }
 
     // レビュー指摘対応（codex P1・Issue #137）: `storage.rs::MAX_TENANT_ID_LEN` を 1 バイト

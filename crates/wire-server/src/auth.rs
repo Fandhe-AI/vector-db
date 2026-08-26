@@ -182,6 +182,17 @@ impl UserStore {
         Ok(Self { users })
     }
 
+    /// ロード済みレコード数。ユーザー名・テナント ID 等の存在情報は含まない
+    /// （wire 経路からは呼ばない。テストのフィクスチャ診断専用。Issue #172）。
+    pub fn len(&self) -> usize {
+        self.users.len()
+    }
+
+    /// レコードが 1 件も無いか（`len() == 0`）。`clippy::len_without_is_empty` 対応。
+    pub fn is_empty(&self) -> bool {
+        self.users.is_empty()
+    }
+
     #[cfg(test)]
     fn from_records(records: Vec<(&str, &str, &str)>) -> Self {
         let mut users = HashMap::new();
@@ -257,9 +268,20 @@ pub fn verify(
         Some(r) => &r.phc,
         None => dummy_phc(),
     };
-    // `verify_phc` の失敗（構文エラー）は起動時検証済みの PHC では原理上起きないが、
-    // 万一に備えて fail-closed（不一致扱い）にする。
-    let password_matches = argon2id::verify_phc(phc_to_check, password).unwrap_or(false);
+    // `verify_phc` の失敗（KDF 実行エラー・構文エラー）は起動時検証済みの PHC では
+    // 原理上起きないが、万一に備えて fail-closed（不一致扱い）にする。応答・遅延
+    // 契約（`AUTH_FAILURE_DELAY` 起点は `start` のまま）は変えず、原因追跡のために
+    // stderr へのみ記録する（username・password・PHC は出力しない。Issue #172:
+    // 高負荷時に稀発する非再現フレークの原因切り分け用診断）。
+    let password_matches = match argon2id::verify_phc(phc_to_check, password) {
+        Ok(matches) => matches,
+        Err(e) => {
+            eprintln!(
+                "wire-server: password verification could not run the KDF ({e:?}); treating as authentication failure"
+            );
+            false
+        }
+    };
 
     let outcome = match (record, password_matches) {
         (Some(r), true) => Ok(r.tenant_id.clone()),
@@ -275,6 +297,16 @@ pub fn verify(
         Ok(tenant_id) => {
             // tenant_id はロード時に `PolicyContext::new` で検証済みだが、契約変更に
             // 備えて再検証する（fail-closed。ここでの失敗も認証失敗として扱う）。
+            //
+            // `Public` のみ許可し `Private` は含めない（既定・最小権限）。
+            // `wire1_three_tenant_visibility_public_shared_private_hidden`
+            // （`crates/wire-server/tests/wire1_simple_query.rs`）が、認証した
+            // テナント自身の `Private` 行であっても wire 経由の SELECT では
+            // 不可視であることを回帰確認しており、ここを `Private` 許可へ
+            // 広げるとその境界を壊す（codex-review P1・PR #210 指摘の検討過程で
+            // 確認。テナント越境ではなく自テナント自身の可視性でも意図的に
+            // 最小権限のまま。対応は `simple_query.rs` 側で wire の INSERT 自体を
+            // 公開しない方針とした）。
             engine::policy::PolicyContext::new(&tenant_id).map_err(|_| AuthFailure)
         }
         Err(()) => Err(AuthFailure),
@@ -520,6 +552,30 @@ mod tests {
         .expect("write fixture");
         let result = UserStore::load_from_file(&path);
         assert!(matches!(result, Err(LoadError::InvalidPhc { line: 1 })));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 空ファイルは「レコード 0 件のストア」として受理される現行挙動を明示する
+    /// 回帰テスト（Issue #172）。この挙動自体の是非は本 Issue のスコープ外だが、
+    /// 結合テスト側フィクスチャが誤って空ファイルを読んだ場合に「既知ユーザー
+    /// なし → 常に `28P01`」という非再現フレークの原因になり得るため、前提を
+    /// 固定して診断（`UserStore::is_empty`）の土台にする。
+    #[test]
+    fn load_from_file_accepts_empty_file_as_empty_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "wire-server-test-empty-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must not be before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("users_empty.txt");
+        std::fs::write(&path, "").expect("write empty fixture");
+        let store = UserStore::load_from_file(&path).expect("empty file must load as empty store");
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
         let _ = std::fs::remove_file(&path);
     }
 

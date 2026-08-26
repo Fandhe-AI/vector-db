@@ -6,32 +6,15 @@
 //! `validate_statement` を検証する（`sql::allowlist` モジュール内の単体テストは
 //! storage 非依存のフェイクを使うため、本ファイルは実カタログとの結合を確認する）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::sql::allowlist::validate_statement;
 use engine::storage::Storage;
 
-static UNIQUE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn unique_db_path(label: &str) -> PathBuf {
-    let seq = UNIQUE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut path = std::env::temp_dir();
-    path.push(format!(
-        "vector-db-engine-sql-allowlist-{label}-{}-{seq}.redb",
-        std::process::id()
-    ));
-    path
-}
-
-struct CleanupGuard(PathBuf);
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+// 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で
+// `crates/engine/src/test_util/temp_db.rs` へ一本化した。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 fn open_storage_with_documents_table(label: &str) -> (Storage, CleanupGuard) {
     let path = unique_db_path(label);
@@ -57,7 +40,7 @@ fn accepts_basic_select_against_real_catalog() {
         &storage,
     )
     .expect("basic shape against a real table must be accepted");
-    assert_eq!(stmt.table_name, "documents");
+    assert_eq!(stmt.table_name(), "documents");
 }
 
 #[test]
@@ -119,9 +102,14 @@ fn rejects_unsupported_syntax_before_touching_the_catalog() {
 #[test]
 fn never_silently_executes_an_unrecognized_where_condition_as_unfiltered_top_k() {
     // 未対応 WHERE 条件が黙殺されず明示的に拒否されることを固定する（SQL-8）。
+    // TASK-79（SQL-9）で `<expr> <cmp> <expr>` 形の式述語（`1 = 1` 等の数値比較を
+    // 含む）を正式に受理するようになったため、旧 `1 = 1` はもはや「未対応構文」の
+    // 例として不適切になった（意図した仕様拡張であり、非回帰ではない）。本テストの
+    // 意図（`OR` によるバイパスを黙って許可しない）を保つため、依然として拒否される
+    // `OR` 結合へ置き換える。
     let (storage, _guard) = open_storage_with_documents_table("no-silent-fallback");
     let err = validate_statement(
-        "SELECT * FROM documents WHERE lang = 'ja' AND 1 = 1 ORDER BY embedding <=> '[0.1]' LIMIT 10",
+        "SELECT * FROM documents WHERE lang = 'ja' OR lang = 'en' ORDER BY embedding <=> '[0.1]' LIMIT 10",
         &storage,
     )
     .expect_err("unrecognized WHERE condition must be rejected, never silently dropped");
@@ -135,4 +123,31 @@ fn same_input_yields_same_wire_code_across_repeated_calls_against_real_catalog()
     let first = validate_statement(sql, &storage).unwrap_err().wire_code();
     let second = validate_statement(sql, &storage).unwrap_err().wire_code();
     assert_eq!(first, second);
+}
+
+// --- TASK-161（SQL-12: `USING MODE`）実カタログ結合 ------------------------------
+
+#[test]
+fn accepts_using_mode_clause_against_real_catalog() {
+    let (storage, _guard) = open_storage_with_documents_table("using-mode-accept");
+    let stmt = validate_statement(
+        "SELECT * FROM documents ORDER BY embedding <=> '[0.1,0.2,0.3,0.4]' LIMIT 10 USING MODE 'precision'",
+        &storage,
+    )
+    .expect("USING MODE clause against a real table must be accepted");
+    assert_eq!(stmt.search_mode(), Some("precision"));
+}
+
+#[test]
+fn rejects_using_mode_on_insert_statement_against_real_catalog() {
+    // 書き込み系文への `USING MODE` 付与は SQL-8 の許可リスト検証で構文エラーとして
+    // 拒否する（SQL-12 の R6）。`INSERT` 自体が本モジュールの許可形状に存在しないため、
+    // `USING MODE` の有無に関わらず先頭キーワードの時点で拒否される。
+    let (storage, _guard) = open_storage_with_documents_table("using-mode-insert-rejected");
+    let err = validate_statement(
+        "INSERT INTO documents (embedding) VALUES ('[0.1,0.2,0.3,0.4]') USING MODE 'recall'",
+        &storage,
+    )
+    .expect_err("USING MODE on a write statement must be rejected");
+    assert_eq!(err.wire_code(), "42601");
 }

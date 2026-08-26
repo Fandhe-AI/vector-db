@@ -187,6 +187,27 @@ core-api-check: ## コア API（VectorCore/SearchProvider）シグネチャ差�
 	scripts/check_core_api.sh --self-test
 	scripts/check_core_api.sh
 
+.PHONY: sort-determinism-check
+sort-determinism-check: ## RRF 融合等のソート非決定性 API 再混入検知（TASK-84・Issue #61。cargo 不要のテキスト比較）
+	scripts/check_sort_determinism.sh --self-test
+	scripts/check_sort_determinism.sh
+
+.PHONY: check-cross
+check-cross: ## TASK-156（CORE-14）aarch64 クロスコンパイル確認。cargo check のみ（リンクしないためクロスリンカ不要）。手元に target 未導入でも make ci を壊さないよう独立ターゲットとする（bench-* と同方針）
+ifdef HAS_CARGO
+	cargo check -p engine --all-targets --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
+endif
+
+.PHONY: e2e-three-client
+e2e-three-client: ## TASK-73（WIRE-1）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
+ifdef HAS_CARGO
+	cargo test -p wire-server --test three_client_e2e -- --ignored
+else
+	@echo "skip: Cargo.toml 未追加のため e2e-three-client をスキップ"
+endif
+
 .PHONY: deny
 deny: ## cargo deny check advisories bans licenses sources（依存監査。cargo-deny 未導入なら自動導入）
 ifneq ($(and $(HAS_CARGO),$(HAS_DENY)),)
@@ -201,7 +222,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/parallel_bench.rs）

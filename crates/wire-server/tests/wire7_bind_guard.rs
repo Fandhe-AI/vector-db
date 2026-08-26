@@ -9,8 +9,13 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// フィクスチャ一時ディレクトリ名の一意性を pid・時刻だけに委ねないための
+/// プロセス内単調カウンタ（`wire_auth.rs` と同一クラスの競合対策。Issue #172）。
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// テストごとに衝突しない一時ユーザーストアディレクトリ／ファイルを保持し、
 /// `Drop` でディレクトリごと確実に削除するガード（対応: TASK-70 review 指摘。
@@ -25,15 +30,19 @@ struct TempUserStore {
 
 impl TempUserStore {
     fn new() -> Self {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "wire-server-wire7-test-{}-{}",
+            "wire-server-wire7-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("system clock")
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // `create_dir`（既存なら `Err`）で衝突を黙って吸収せず顕在化させる
+        // （Issue #172）。
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let path = dir.join("users.txt");
         std::fs::write(&path, "").expect("write empty user store");
         Self { dir, path }
@@ -41,6 +50,17 @@ impl TempUserStore {
 
     fn path_str(&self) -> &str {
         self.path.to_str().expect("utf-8 path")
+    }
+
+    /// `--db` に渡す一時 DB ファイルパス（本テストは bind ガードの外形挙動のみを
+    /// 検証するため、ファイル自体は作成せず `EngineCore::open` に新規作成させる。
+    /// TASK-73 で `--db` が必須化されたため追加）。
+    fn db_path_str(&self) -> String {
+        self.dir
+            .join("db.redb")
+            .to_str()
+            .expect("utf-8 path")
+            .to_string()
     }
 }
 
@@ -56,9 +76,17 @@ impl Drop for TempUserStore {
 fn non_loopback_bind_exits_non_zero() {
     let users_store = TempUserStore::new();
 
+    let db_path = users_store.db_path_str();
     for bind_addr in ["0.0.0.0:0", "[::]:0"] {
         let output = Command::new(env!("CARGO_BIN_EXE_wire-server"))
-            .args(["--users", users_store.path_str(), "--bind", bind_addr])
+            .args([
+                "--users",
+                users_store.path_str(),
+                "--db",
+                &db_path,
+                "--bind",
+                bind_addr,
+            ])
             .output()
             .expect("spawn wire-server");
 
@@ -80,8 +108,16 @@ fn non_loopback_bind_exits_non_zero() {
 fn loopback_bind_starts_listening() {
     let users_store = TempUserStore::new();
 
+    let db_path = users_store.db_path_str();
     let mut child = Command::new(env!("CARGO_BIN_EXE_wire-server"))
-        .args(["--users", users_store.path_str(), "--bind", "127.0.0.1:0"])
+        .args([
+            "--users",
+            users_store.path_str(),
+            "--db",
+            &db_path,
+            "--bind",
+            "127.0.0.1:0",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

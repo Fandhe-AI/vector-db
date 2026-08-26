@@ -153,3 +153,49 @@ jobs:
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Run core-api-check
         run: make core-api-check
+
+  # --------------------------------------------------
+  # sort-determinism-check（ソート非決定性 API 再混入検知。TASK-84・対応 Issue #61）
+  # --------------------------------------------------
+  # RRF 融合結果等のスコア順 Top-k で同点タイブレークを省略する非決定的ソート API
+  # （`sort_unstable_by`/`sort_unstable_by_key`/`select_nth_unstable_by(_key)`）の
+  # 再混入を scripts/check_sort_determinism.sh（cargo 不要のテキスト比較）で機械
+  # チェックする。core-api-check と同様の理由で独立ジョブとし、第三者 action は
+  # 同一 SHA 固定を使う。判断の根拠は docs/design/rrf-tie-break-determinism.md 参照。
+  sort-determinism-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Run sort-determinism-check
+        run: make sort-determinism-check
+
+  # --------------------------------------------------
+  # cross-check（aarch64 クロスコンパイル確認。TASK-156・対象ビヘイビア CORE-14）
+  # --------------------------------------------------
+  # `isa.rs` の NEON カーネル（`#[cfg(target_arch = "aarch64")]`）が x86_64 の
+  # rust-ci ジョブではコンパイル対象に入らないため、`cargo check --target
+  # aarch64-unknown-linux-gnu`（リンクしないためクロスリンカ不要）で構文・型検査
+  # だけ別途確認する。rust-ci（reusable workflow）とは異なり生の steps を持つ独立
+  # ジョブとして定義するため、第三者 action（actions/checkout）は SHA 固定で参照する
+  # （AGENTS.md「CI・ワークフローの改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions
+  # のみ）。private submodule（docs/spec）は取得しない（spec 抜きでビルドが成立する方針を
+  # 維持）。branch protection の必須チェックへ追加する運用は他ジョブと同様ユーザー作業
+  # （PR 本文参照）。
+  cross-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Add aarch64-unknown-linux-gnu target
+        run: rustup target add aarch64-unknown-linux-gnu
+      - name: Run check-cross
+        run: make check-cross

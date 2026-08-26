@@ -14,7 +14,7 @@ use engine::batch_fallback::{
     FallbackObserver, FallbackReason,
 };
 use engine::batch_search::{BatchEngine, BatchHit, BatchQuery, BatchSearchError, ResidentMatrix};
-use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
@@ -102,7 +102,7 @@ fn oracle_search(
     ctx: &PolicyContext,
     query: &[f32],
     k: usize,
-) -> Vec<SearchHit> {
+) -> Vec<CandidateHit> {
     let mut visible_ids = Vec::new();
     let mut visible_vectors = Vec::new();
     for (row_idx, (id, tenant)) in ids.iter().zip(tenant_ids).enumerate() {

@@ -266,6 +266,147 @@ fn hybrid_search_on_empty_corpus_returns_ok_empty() {
     assert!(hits.is_empty());
 }
 
+// TASK-84（対応 Issue #61）: RRF 融合結果の同点タイブレークが `hybrid_search` の
+// `LIMIT`（＝ `k`）境界を跨ぐ場合でも決定的であることの回帰テスト。PoC-10 が
+// 指摘した非決定性の懸念（詳細は非公開 PoC 側の管轄のため本文へ転記しない。
+// ポインタ: `docs/design/rrf-tie-break-determinism.md`）が engine 本体には
+// 存在しないことを、実際に融合後スコアが完全一致する候補群を構成した上で
+// 検証する（`hybrid.rs` は `BTreeMap` 累積 + 安定ソート + id 昇順タイブレークを
+// 使う。同ドキュメント参照）。
+//
+// タイの構成方法: `RrfConfig::new` で `pool_depth` を候補総数より小さい値に
+// 絞ると、密側 Top-k 圏外の行は密側の融合スコアに一切寄与しない（ゼロ寄与）。
+// これを利用して「密側のみで得点する行」と「疎側のみで得点する行」を作り、
+// 両者が同じ順位（0 始まりの rank）を占めるよう構成すると、RRF の 1 項
+// `weight / (k_const + rank + 1)` が数値として完全一致し、他方の寄与が
+// 存在しないため融合後の合計スコアも完全一致する（丸め誤差の入る余地がない）。
+// 本テストは rank 0 の組（id 1 密のみ / id 3 疎のみ）と rank 1 の組
+// （id 2 密のみ / id 4 疎のみ）の 2 組のタイを作り、`k=3` で 2 組目のタイ
+// （id 2, id 4）の途中を `LIMIT` が横切る配置にする。
+#[test]
+fn hybrid_search_tie_group_across_limit_boundary_is_deterministic_and_matches_oracle() {
+    struct TieDoc {
+        id: u64,
+        text: &'static str,
+        vector: [f32; 2],
+    }
+    let query_vector = [1.0f32, 0.0];
+    let docs: Vec<TieDoc> = vec![
+        // 密側のみで得点する行（`anchor` を含まないため疎側は不一致）。
+        // 内積降順で id=1 が rank0、id=2 が rank1、id=5 が rank2 を占める。
+        TieDoc {
+            id: 1,
+            text: "filler filler filler filler",
+            vector: [1.0, 0.0],
+        },
+        TieDoc {
+            id: 2,
+            text: "filler filler filler filler",
+            vector: [0.5, 0.0],
+        },
+        TieDoc {
+            id: 5,
+            text: "filler filler filler filler",
+            vector: [0.4, 0.0],
+        },
+        // 疎側のみで得点する行。内積を負にして密側 Top-3（`pool_depth=3`）圏外に
+        // 追い出し、密側の寄与をゼロにする。文書長は 4 語で揃え、`anchor` の
+        // 出現数（tf）だけで疎側の順位が一意に決まるようにする
+        // （id=3: tf=4 → rank0、id=4: tf=1 → rank1）。
+        TieDoc {
+            id: 3,
+            text: "anchor anchor anchor anchor",
+            vector: [-1.0, 0.0],
+        },
+        TieDoc {
+            id: 4,
+            text: "anchor filler filler filler",
+            vector: [-2.0, 0.0],
+        },
+    ];
+    let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text)).collect();
+    let index = SparseIndex::build(&refs).expect("sparse index build ok");
+    let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
+    let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector).collect();
+    // `pool_depth=3`: 密側 Top-3 に id 1, 2, 5 のみが入り、id 3, 4（内積が負で
+    // 最下位）は密側から完全に除外される（＝密側寄与ゼロ）。
+    let cfg = RrfConfig::new(60.0, 1.0, 1.0, 3).expect("valid rrf config");
+    // `k=3`（`pool_depth` の上限まで）: id 1（rank0 タイ組の先頭）・id 3（同点）・
+    // id 2（rank1 タイ組の先頭）までを含み、id 4（rank1 タイ組の 2 番目）を
+    // 境界の直後で切り捨てる位置になる。
+    let k = 3;
+
+    let run = |trial: u64| {
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &query_vector,
+            k: ids.len(),
+        };
+        hybrid_search(&ParallelSearchProvider, input, &index, "anchor", k, &cfg)
+            .unwrap_or_else(|e| panic!("trial={trial}: hybrid search ok, got {e}"))
+    };
+
+    let baseline = run(0);
+    for trial in 1..20u64 {
+        assert_eq!(run(trial), baseline, "trial={trial} diverged from baseline");
+    }
+
+    let actual_ids: Vec<u64> = baseline.iter().map(|h| h.id).collect();
+    // id 1 と id 3 は融合後スコアが完全一致（1/(60+0+1)）し、id 昇順タイブレークで
+    // id 1 が先に来る。id 2 と id 4 も完全一致（1/(60+1+1)）だが、`k=3` の境界が
+    // このタイ組の途中を横切るため id 2 のみが残り id 4 は落ちる。
+    assert_eq!(actual_ids, vec![1u64, 3, 2]);
+
+    // 独立オラクル: 本体の `rrf_fuse`/`hybrid_search` を経由せず、RRF の定義
+    // （`weight / (k_const + rank + 1)` の id ごと加算）を再計算する。密側の
+    // ランキングは本体実装と別経路の内積再計算＋`pool_depth` 圏外の除外を行い、
+    // 疎側は `SparseIndex::search_within` の結果をそのまま用いる（BM25 の計算式
+    // 自体は非公開 spec 側の管轄のため独立再実装しない。本テストが検証したいのは
+    // 「タイブレーク規約（スコア降順・id 昇順）が `LIMIT` 境界を跨いでも保たれるか」
+    // であり、疎側の相対順位は実装から取得すれば十分）。
+    let k_const = 60.0f64;
+    let pool_depth = cfg.pool_depth();
+    let mut dense_ranked: Vec<(u64, f64)> = docs
+        .iter()
+        .map(|d| {
+            let dot = d.vector[0] as f64 * query_vector[0] as f64
+                + d.vector[1] as f64 * query_vector[1] as f64;
+            (d.id, dot)
+        })
+        .collect();
+    dense_ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    dense_ranked.truncate(pool_depth);
+
+    let sparse_hits = index
+        .search_within(
+            "anchor",
+            pool_depth,
+            &ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<u64>>(),
+        )
+        .expect("sparse search ok");
+
+    let mut oracle_scores: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    for (rank, (id, _)) in dense_ranked.iter().enumerate() {
+        *oracle_scores.entry(*id).or_insert(0.0) += 1.0 / (k_const + rank as f64 + 1.0);
+    }
+    for (rank, doc) in sparse_hits.iter().enumerate() {
+        *oracle_scores.entry(doc.doc_id).or_insert(0.0) += 1.0 / (k_const + rank as f64 + 1.0);
+    }
+    let mut oracle_sorted: Vec<(u64, f64)> = oracle_scores.into_iter().collect();
+    oracle_sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let expected_ids: Vec<u64> = oracle_sorted
+        .into_iter()
+        .take(k)
+        .map(|(id, _)| id)
+        .collect();
+
+    assert_eq!(actual_ids, expected_ids);
+}
+
 // provider 差し替え検証（CORE-3〜5 統合の確認）: CpuScalarProvider と
 // ParallelSearchProvider で融合結果が一致すること。
 #[test]

@@ -6,44 +6,17 @@
 //! `tests/vector_core.rs` と同じ手法（`EngineCore` がテナント境界を迂回する生ハンドルを
 //! 公開しないため）。
 
-use std::path::PathBuf;
-
 use engine::core::{EngineCore, VectorCore};
-use engine::kernel::{CpuScalarProvider, SearchHit, SearchInput, SearchProvider};
+use engine::kernel::{CandidateHit, CpuScalarProvider, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::search_engine::{self, SearchEngineKind};
 use engine::storage::{RowInput, Storage, Visibility};
 
-/// 自動削除される一時ディレクトリ（`redb` ファイルの置き場）。外部クレートに
-/// 依存しない最小実装（dependency-policy 準拠。`tests/vector_core.rs` と同型）。
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(label: &str) -> Self {
-        let mut dir = std::env::temp_dir();
-        let unique = format!(
-            "engine-search-engine-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        dir.push(unique);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        Self(dir)
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.0.join("db.redb")
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+// 一時ディレクトリ（`TempDir`）は Issue #173 で `crates/engine/src/test_util/temp_db.rs`
+// へ一本化した（旧: `tests/vector_core.rs` と同型のローカル複製）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::TempDir;
 
 fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
     engine::catalog::TableSchema::new(
@@ -57,18 +30,23 @@ fn schema_for(table_name: &str, dim: u32) -> engine::catalog::TableSchema {
 }
 
 fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[f32]) {
-    storage
-        .insert_row_into_table(
-            table,
-            id,
-            &RowInput {
-                tenant_id: tenant,
-                visibility: Visibility::Public,
-                embedding,
-                metadata: &[],
-            },
-        )
-        .expect("seed row");
+    // テナント境界付き書き込みガード（TASK-95・RECOVER-4）経由で投入する。生の
+    // `Storage::insert_row_into_table` は `pub(crate)` 化済みでクレート外から呼べない
+    // （codex-review P0 指摘対応）。
+    let ctx = PolicyContext::new(tenant).expect("valid tenant");
+    engine::tenant::insert_row(
+        storage,
+        table,
+        &ctx,
+        id,
+        &RowInput {
+            tenant_id: tenant,
+            visibility: Visibility::Public,
+            embedding,
+            metadata: &[],
+        },
+    )
+    .expect("seed row");
 }
 
 /// `docs` テーブル（dim=3）へ 6 行を投入した `Storage` を返す。同点スコアを含む
@@ -159,7 +137,7 @@ impl SearchProvider for MockAnnProvider {
     fn search(
         &self,
         input: SearchInput<'_>,
-    ) -> Result<Vec<SearchHit>, engine::kernel::KernelError> {
+    ) -> Result<Vec<CandidateHit>, engine::kernel::KernelError> {
         self.called.store(true, std::sync::atomic::Ordering::SeqCst);
         CpuScalarProvider.search(input)
     }

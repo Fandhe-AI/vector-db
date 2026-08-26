@@ -13,22 +13,25 @@
 //! RLS は **`HINT ORDER` の内容に関係なく**、唯一の実効的な防御である候補構築時の
 //! 暗黙事前フィルタ（`VectorArena::build_filtered_with_rows_in_txn` の `predicate`。
 //! `WHERE` 句の `visible()` 呼び出し（[`BoundStatement::rls_predicate_present`]）の
-//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。加えて
-//! [`crate::sql::plan::apply_rls_safety_net`] を最終結果へ無条件に適用するが、この
-//! 安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補集合）
-//! 由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とすことは
-//! ない。無効化できない構造にしてあるのは、候補集合の構築元が将来広がった場合の
-//! defense-in-depth としてで、「独立した 2 つの検査が効いている」という意味では
-//! ない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で RLS 段を
-//! 後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
-//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。RLS の暗黙適用フック
-//! （[`crate::rls::ImplicitRlsHook`]）経由で述語を取得する（TASK-137・RLS-6, RLS-7）。
+//! 有無に**関係なく**無条件に適用する。SQL-3・RLS-7・RLS-8）を必ず経由する。この
+//! 事前フィルタの述語は RLS の暗黙適用フック（[`crate::rls::ImplicitRlsHook`]）
+//! 経由で取得する（TASK-137・RLS-6, RLS-7）。加えて
+//! [`crate::rls::RlsSafetyNet`]（TASK-136・RLS-5）を最終結果へ無条件に適用するが、
+//! この安全網は事前フィルタと同じ `arena`（既に `ctx.is_visible` を通過済みの候補
+//! 集合）由来のラベルで再判定するため、現状の実行経路では不可視行を追加で落とす
+//! ことはない。無効化できない構造にしてあるのは、候補集合の構築元が将来広がった
+//! 場合の defense-in-depth としてで、「独立した 2 つの検査が効いている」という
+//! 意味ではない（詳細は `plan.rs` のモジュールドキュメント参照）。`HINT ORDER` で
+//! RLS 段を後段に置いても、事前フィルタの適用そのものは外れない（security.md P0
+//! 「テナント分離の検査を外す/緩める/バイパス経路を作らない」）。安全網通過済みの
+//! `hits` は [`crate::rls::RlsVerifiedHits`]（witness 型）としてのみ投影段へ渡り、
+//! 生の `Vec<(u64, f64)>` から投影へ到達する経路は型として存在しない。
 //!
 //! `core.rs::EngineCore::execute_sql`（TASK-75 で追加する固有メソッド。`VectorCore`
 //! trait は不変）からのみ呼ばれる想定で、`Storage`・`SearchProvider`・`PolicyContext`
 //! を束ねる。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
@@ -36,12 +39,13 @@ use crate::core;
 use crate::hybrid::{self, HybridError, HybridHit, RrfConfig};
 use crate::kernel::{KernelError, SearchInput, SearchProvider};
 use crate::policy::PolicyContext;
-use crate::rls::ImplicitRlsHook;
+use crate::rls::{ImplicitRlsHook, RlsSafetyNet, RlsVerifiedHits};
 use crate::row_codec::{self, RowCodecError, Value};
 use crate::sparse::{DocId, SparseError, SparseIndex};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::parser::{BoundStatement, ProjectedColumn, Ranking};
-use crate::sql::plan::{self, ExecutionPlan};
+use crate::sql::plan::ExecutionPlan;
+use crate::sql::udf_call;
 use crate::storage::StorageError;
 
 /// 疎コーパス側へ集約する候補プールの既定深さ。`hybrid::hybrid_search` の
@@ -80,6 +84,24 @@ fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize
     Ok(next)
 }
 
+/// `!scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision 経路で、
+/// `visible_len`（`arena.ids().len()`。`ImplicitRlsHook` で RLS 済みの可視集合件数）
+/// が `core::MAX_SEARCH_K` を超えるかどうかを純粋関数として切り出したもの
+/// （`sql::exec::execute_statement` の DISTANCE 段呼び出し直前で使う）。超える場合、
+/// DISTANCE 段の取得件数 `k_eff` は `MAX_SEARCH_K` へクランプされ、可視集合全体を
+/// 対象にした「WHERE を満たす候補の完全な順位列」を構築できなくなる（`MAX_SEARCH_K`
+/// 件目より後ろに僅差の Top-2 相当が存在しても取得できず、`precision::apply_gate`
+/// が「Top-2 不在＝マージン成立」と誤判定する fail-open 経路になる。codex-review
+/// 指摘・PRRT_kwDOUAKASM6cPLHE）。呼び出し元は `true` の場合、DISTANCE 検索自体を
+/// 実行せず空集合（fail-closed の通常応答）へ倒す。
+fn precision_completeness_unbounded(
+    is_precision: bool,
+    scalar_prefilter: bool,
+    visible_len: usize,
+) -> bool {
+    is_precision && !scalar_prefilter && visible_len > core::MAX_SEARCH_K
+}
+
 /// `on_visible_row`（RLS/SCALAR 段の行フック）専用の、借用 `&str` から `String` への
 /// 選択的複製ヘルパー（Issue #56 レビュー指摘対応・codex P1: `decode_scalar_columns`
 /// の全列無条件確保を廃し、`row_codec::scan_scalar_columns` の borrow 結果から実際に
@@ -114,21 +136,51 @@ const _: () = assert!(
     "sql::exec's hybrid pool_depth derivation assumes core::MAX_SEARCH_K <= hybrid::MAX_POOL_DEPTH"
 );
 
+// `precision` 時の `k_eff`（SCALAR 事前フィルタ経路: `bound.limit.max(2)`。
+// SCALAR 事後フィルタ経路: `arena.ids().len().clamp(2, core::MAX_SEARCH_K)`。
+// いずれも「`LIMIT 1` でも Top-2 を取得する」ための下限が `2`）が常に
+// `core::MAX_SEARCH_K` の範囲内に収まることをコンパイル時に固定する
+// （`bound.limit` は `sql::parser::bind` が `1..=core::MAX_SEARCH_K` を検証済み、
+// 事後フィルタ経路は `.min(core::MAX_SEARCH_K)` で明示的にクランプ済みのため、
+// `k_eff` が `MAX_SEARCH_K` を超えるのは `MAX_SEARCH_K < 2` の場合のみ）。
+const _: () = assert!(
+    2 <= core::MAX_SEARCH_K,
+    "sql::exec's precision k_eff derivation assumes core::MAX_SEARCH_K >= 2"
+);
+
 /// 投影結果 1 セル。`row_codec::Value` の公開 enum は変更せず、`id` 疑似列
 /// （`u64`）を表現するため独自の enum を持つ。
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Float`・`Bool`
+/// variant を追加した（宣言的 UDF・組み込み関数呼び出しの結果列。`row_codec::Value`
+/// は変更しない方針を踏襲する）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Null,
     Integer(u64),
     Text(String),
     Vector(Vec<f32>),
+    /// 式項目（TASK-79・SQL-9）の `Scalar` 型評価結果。
+    Float(f64),
+    /// 式項目（TASK-79・SQL-9）の `Bool` 型評価結果。
+    Bool(bool),
 }
 
 /// 投影結果の列メタデータ。`Id` は疑似列（`ColumnType` を持たない）。
+///
+/// **TASK-79（SQL-9）で追加した破壊的変更（BREAKING CHANGE）**: `Computed` variant を
+/// 追加した。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnMeta {
     Id,
-    Scalar { name: String, ty: ColumnType },
+    Scalar {
+        name: String,
+        ty: ColumnType,
+    },
+    /// 式項目（TASK-79・SQL-9）。`ColumnType` を持たない（`Cell::Float`/`Cell::Bool`/
+    /// `Cell::Vector` のいずれになるかは実行時の評価結果の型による）。
+    Computed {
+        name: String,
+    },
 }
 
 /// 投影結果 1 行。
@@ -144,6 +196,14 @@ pub struct ResultRow {
 pub struct QueryResult {
     pub columns: Vec<ColumnMeta>,
     pub rows: Vec<ResultRow>,
+}
+
+/// `EngineCore::execute_insert_sql` の成功応答（SQL-10、TASK-80）。単一行 INSERT の
+/// みを受理するため常に `1` になるが、`INSERT 0 1` 相当の wire 応答（TASK-73）へ
+/// 写像しやすいよう件数フィールドとして保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOutcome {
+    pub rows_affected: u64,
 }
 
 impl From<RowCodecError> for SqlSurfaceError {
@@ -168,6 +228,13 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         ArenaError::CapacityExceeded => {
             SqlSurfaceError::payload_too_large("candidate set exceeds arena capacity")
         }
+        // TASK-79（SQL-9）: `WHERE` 式述語の評価（`sql::udf_call::eval`）が 0 除算・
+        // 非有限値等で fail-closed に拒否した場合（`expr_eval_error_to_arena` 参照）。
+        // データ破損・実装バグ（`Storage`/`Catalog`/`InvalidDim`/`DimMismatch`/
+        // `AllocationFailed`）とは異なり、入力値に起因する「受理構文だが値が不正」
+        // として `22000` へ写像する（`sql::parser::bind_in_session` の他の
+        // `InvalidInput` と同じ分類）。
+        ArenaError::InvalidInput(detail) => SqlSurfaceError::invalid_input(detail),
         ArenaError::Storage(_)
         | ArenaError::Catalog(_)
         | ArenaError::InvalidDim
@@ -175,6 +242,22 @@ fn map_arena_error(table: &str, e: ArenaError) -> SqlSurfaceError {
         | ArenaError::AllocationFailed(_) => SqlSurfaceError::Internal {
             detail: "arena build failed".to_string(),
         },
+    }
+}
+
+/// `sql::udf_call::eval` が返す [`SqlSurfaceError`] を、`on_visible_row`（行フック。
+/// 戻り値が [`ArenaError`] に固定されている）から返せる形へ写像する（TASK-79・
+/// SQL-9）。`map_arena_error` がこの逆写像（`ArenaError` → `SqlSurfaceError`）を
+/// 呼び出し元で行い、`22000`／`54000` の wire_code を保つ（`arena.rs` は sql 表層の
+/// 型に依存しないため、両関数の対で往復させる）。
+fn expr_eval_error_to_arena(e: SqlSurfaceError) -> ArenaError {
+    match e {
+        SqlSurfaceError::PayloadTooLarge { detail } => {
+            let _ = detail;
+            ArenaError::CapacityExceeded
+        }
+        SqlSurfaceError::InvalidInput { detail } => ArenaError::InvalidInput(detail),
+        other => ArenaError::Storage(StorageError::Codec(other.to_string())),
     }
 }
 
@@ -260,7 +343,16 @@ pub fn execute_statement(
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundStatement,
+    precision_policy: &crate::precision::PrecisionPolicy,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
+    // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
+    // 切り出してあり、本関数は適用位置（DISTANCE 段＋事後 SCALAR フィルタの後・
+    // `RlsSafetyNet::apply` の前）を決めるだけの薄い配線を担う（詳細は
+    // `crate::precision` モジュールドキュメント「PRECISION ゲート段」参照）。
+    // `recall`（既定）の実行経路はこの分岐に触れないため一切変わらない。
+    let is_precision = bound.mode.mode == crate::sql::mode::SearchMode::Precision;
+
     // HINT ORDER（未指定なら既定の RLS→SCALAR→DISTANCE）から導出する実行方針。
     // `scalar_prefilter` のみが分岐点（`ExecutionPlan::from_evaluation_order` の
     // ドキュメント参照。TASK-76・SQL-7）。RLS 安全網はこの構造体に分岐用の
@@ -299,7 +391,17 @@ pub fn execute_statement(
     // 保持して投影に流用することで、SQL 実行全体を単一スナップショット
     // （`VectorArena::build_filtered_with_rows` が開く read トランザクション）に
     // 閉じ込め、再取得によるスナップショット不一致の窓をなくす）。
-    let mut candidate_columns: HashMap<u64, Vec<Value>> = HashMap::new();
+    //
+    // 対応づけのキーは行 `id` ではなく**アリーナのスロット番号**
+    // （`VectorArena::build_filtered_with_rows_in_txn` が `on_visible_row` の第 1 引数で
+    // 渡す値。`arena.ids()` 等の添字と一致する）。行 `id` の一意性スコープはテナント内に
+    // 閉じている（対象ビヘイビア: TABLE-12）ため、1 つの可視集合に同じ `id` の行が
+    // 複数含まれうる（自テナント行と他テナントの `Public` 行）。`id` をキーにすると
+    // embedding（アリーナ由来）とスカラー列（本表由来）が別テナントの行から混ざる
+    // （Bugbot High 指摘）。スロット番号は `(tenant_id, id)` の行と 1 対 1 に対応するため、
+    // 混線が構造的に起こらない。`Vec` の添字がスロット番号そのものであることは
+    // `on_visible_row` が `true` を返した行だけが順番に push される契約で担保する。
+    let mut candidate_columns: Vec<Vec<Value>> = Vec::new();
 
     // 投影段（下記ループ）が実際に参照する Text 列インデックスの集合。`VECTOR` 列は
     // `scan_scalar_columns` が常に `None` を返すだけ（実体は `arena` から引く）ため
@@ -315,7 +417,11 @@ pub fn execute_statement(
         .iter()
         .filter_map(|col| match col {
             ProjectedColumn::Column { index, .. } => Some(*index),
-            ProjectedColumn::Id => None,
+            // `Computed`（TASK-79・SQL-9）は候補構築時に保持した `candidate_columns`
+            // （`Text` 列のデコード結果）を参照しない。評価に使うのは `arena` 由来の
+            // `id`／embedding のみ（`sql::udf_call::eval` 参照。`TEXT` 列参照は
+            // 束縛段で拒否済み）。
+            ProjectedColumn::Id | ProjectedColumn::Computed { .. } => None,
         })
         .collect();
     if !plan.scalar_prefilter {
@@ -332,7 +438,11 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
-    let on_visible_row = |id: u64, metadata: &[u8]| -> std::result::Result<bool, ArenaError> {
+    let on_visible_row = |slot: usize,
+                          id: u64,
+                          embedding: &[f32],
+                          metadata: &[u8]|
+     -> std::result::Result<bool, ArenaError> {
         // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
         // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
         // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
@@ -354,6 +464,25 @@ pub fn execute_statement(
                     _ => return Ok(false),
                 }
             }
+            // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
+            // 既存の等価条件と同じ SCALAR 段の一部として事前適用する。可視行
+            // （RLS-8 の暗黙適用を通過した行）にのみ到達するため、不可視行では
+            // 式が一切評価されない。評価エラー（0 除算・非有限値等）は当該行を
+            // 黙ってスキップせず、クエリ全体の失敗として fail-closed に伝播する
+            // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
+            for expr in &bound.expr_filters {
+                match udf_call::eval(expr, id, embedding).map_err(expr_eval_error_to_arena)? {
+                    udf_call::ExprValue::Bool(true) => {}
+                    udf_call::ExprValue::Bool(false) => return Ok(false),
+                    // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
+                    // `Bool` に限定済みのため到達しない（`ExprType::Bool` 検査参照）。
+                    _ => {
+                        return Err(ArenaError::InvalidInput(
+                            "WHERE expression did not evaluate to a boolean".to_string(),
+                        ))
+                    }
+                }
+            }
         }
         if is_hybrid {
             if let Some(idx) = text_column_index {
@@ -366,7 +495,12 @@ pub fn execute_statement(
                         &mut sparse_bytes,
                         crate::sparse::MAX_CORPUS_BYTES,
                     )?;
-                    sparse_docs.push((id, owned));
+                    // 疎コーパスの文書 id もスロット番号（`DocId = u64`）にする。
+                    // 行 `id` を使うと、同一 `id` の可視行が 2 テナント分あるときに
+                    // `SparseIndex::build` が `DuplicateDocId` で失敗し、ハイブリッド
+                    // SQL 全体が落ちる（Bugbot Medium 指摘。対象ビヘイビア: TABLE-12）。
+                    let doc_id = u64::try_from(slot).map_err(|_| ArenaError::CapacityExceeded)?;
+                    sparse_docs.push((doc_id, owned));
                 }
                 // NULL 本文は疎側に含めない（密のみへ寄与する）。
             }
@@ -409,7 +543,11 @@ pub fn execute_statement(
                 }
             }
         }
-        candidate_columns.insert(id, kept);
+        // `slot` は「これから push される行の添字」（アリーナ側の契約）。ここでの
+        // push により `candidate_columns[slot] == kept` が成立する。両者がずれた場合は
+        // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
+        debug_assert_eq!(candidate_columns.len(), slot);
+        candidate_columns.push(kept);
         Ok(true)
     };
 
@@ -422,95 +560,154 @@ pub fn execute_statement(
     )
     .map_err(|e| map_arena_error(&bound.table, e))?;
 
-    let visible_id_set: HashSet<u64> = arena.ids().iter().copied().collect();
-    // `id -> arena 内インデックス` の対応表。投影段で embedding を
-    // `arena.vector(index)`（候補構築と同一スナップショットのバッファ）から
-    // 引くために使う（`storage` への再アクセスを行わない）。
-    let arena_index_by_id: HashMap<u64, usize> = arena
-        .ids()
-        .iter()
-        .enumerate()
-        .map(|(idx, id)| (*id, idx))
-        .collect();
+    // provider へ渡す id は行 `id` ではなく**アリーナのスロット番号**（0..n）にする。
+    // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、1 つの
+    // 可視集合に同じ `id` の行が複数含まれうるため、`id` のままでは
+    // (a) provider 結果の重複検証、(b) RRF 融合の結合キー、(c) 投影段の行同定 の
+    // いずれもが別テナントの行を取り違えうる（Bugbot High/Medium 指摘）。スロット番号は
+    // 可視集合内で一意かつ `(tenant_id, id)` の行と 1 対 1 に対応するため、これらの
+    // 契約が構造的に回復する。クライアントへ返す `ResultRow.id` は投影段で
+    // `arena.ids()[slot]`（本来の行 id）へ戻す。
+    let mut slot_ids: Vec<u64> = Vec::new();
+    slot_ids
+        .try_reserve_exact(arena.ids().len())
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("failed to reserve candidate slot ids: {e}"),
+        })?;
+    for slot in 0..arena.ids().len() {
+        let slot_id = u64::try_from(slot).map_err(|_| SqlSurfaceError::Internal {
+            detail: "candidate slot index does not fit in u64".to_string(),
+        })?;
+        slot_ids.push(slot_id);
+    }
+    // スロット番号は重複しないため、多重集合の各件数は必ず 1 になる
+    // （`core::provider_result_is_valid` の (3)(4) 検証はそのまま使える）。
+    let visible_id_counts = core::visible_id_counts(&slot_ids);
+
+    // `precision` 時は DISTANCE 段の取得件数を `bound.limit` より広く取る
+    // （`LIMIT 1` でも Top-2 を取得し、`precision::apply_gate` のマージン判定を
+    // 行えるようにする。`crate::precision` モジュールドキュメント参照）。`recall`
+    // 時は従来どおり `bound.limit`。
+    //
+    // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ経路）では
+    // `bound.limit.max(2)` 件だけを取得すると、事後フィルタで候補が間引かれた
+    // 結果「Top-2 が最初から存在しなかった」のか「取得件数不足で Top-2 を
+    // 取りこぼしただけ」なのかを区別できない。後者を前者と誤認すると
+    // `precision::apply_gate` が「Top-2 不在＝マージン条件成立」と誤判定し、
+    // 本来は僅差で拒否すべき候補を通す fail-open 経路になる（codex-review・
+    // Bugbot 指摘。SEARCH-9 は確信度不足時の fail-closed を要求する）。この
+    // 経路のみ可視集合全体（`arena.ids().len()`。`ImplicitRlsHook` で RLS 済み）
+    // を取得し、事後フィルタ後の残存件数が「WHERE を満たす候補の完全な順位列」
+    // になるようにする。`core::MAX_SEARCH_K` でクランプする（下記 `const _` で
+    // `2 <= core::MAX_SEARCH_K` を固定済みのため `k_eff` は常に provider・RRF
+    // 設定の許容範囲に収まる）。
+    let k_eff = if is_precision {
+        if plan.scalar_prefilter {
+            bound.limit.max(2)
+        } else {
+            arena.ids().len().clamp(2, core::MAX_SEARCH_K)
+        }
+    } else {
+        bound.limit
+    };
+
+    // `!plan.scalar_prefilter`（DISTANCE 先行・SCALAR 事後フィルタ）の precision
+    // 経路で `arena.ids().len()` が `core::MAX_SEARCH_K` を超える場合、直上の
+    // `k_eff` は `MAX_SEARCH_K` へクランプされ、DISTANCE 段は可視集合全体ではなく
+    // 先頭 `MAX_SEARCH_K` 件しか取得できない（provider の `k` 契約上限）。この場合
+    // `MAX_SEARCH_K` 件目より後ろに WHERE を満たす僅差の Top-2 相当が存在しても
+    // 取得できず、SCALAR 事後フィルタ後に「Top-2 を取りこぼしただけ」なのか
+    // 「Top-2 が最初から存在しない」のかを再び区別できなくなる（直上のコメントが
+    // 解消しようとした fail-open の再発。codex-review 指摘・PRRT_kwDOUAKASM6cPLHE）。
+    // 「WHERE を満たす候補の完全な順位列を取得できる」という本経路の前提が崩れる
+    // 以上、DISTANCE 検索自体を実行せず空集合へ倒す（`crate::precision` モジュール
+    // ドキュメントが定める「確信度が判定できない＝空集合の通常応答」という既存の
+    // fail-closed パターンに合わせる。完全性を保証できないこと自体は仕様上の
+    // fail-closed 応答であり `SqlSurfaceError` への昇格対象ではない）。
+    let completeness_unbounded =
+        precision_completeness_unbounded(is_precision, plan.scalar_prefilter, arena.ids().len());
 
     // DISTANCE 段。
-    let hits: Vec<(u64, f64)> = match &bound.ranking {
-        Ranking::Distance { query } => {
-            let input = SearchInput {
-                ids: arena.ids(),
-                vectors: arena.vectors(),
-                dim: arena.dim(),
-                query,
-                k: bound.limit,
-            };
-            let raw = provider.search(input).map_err(map_kernel_error)?;
-            if !core::provider_result_is_valid(&raw, bound.limit, &visible_id_set) {
-                return Err(SqlSurfaceError::Internal {
-                    detail: "search provider returned a result violating the top-k contract"
-                        .to_string(),
-                });
-            }
-            raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
-        }
-        Ranking::Hybrid {
-            query, query_text, ..
-        } => {
-            let pool_depth = bound.limit.max(DEFAULT_HYBRID_POOL_DEPTH);
-            let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
-                SqlSurfaceError::Internal {
-                    detail: "invalid hybrid RRF config".to_string(),
-                }
-            })?;
-            let input = SearchInput {
-                ids: arena.ids(),
-                vectors: arena.vectors(),
-                dim: arena.dim(),
-                query,
-                k: bound.limit,
-            };
-            let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
-                // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
-                // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
-                // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
-                // `hybrid::hybrid_search` と同じ理由でここでも行う）。
-                let dense_input = SearchInput {
-                    ids: arena.ids(),
+    let hits: Vec<(u64, f64)> = if completeness_unbounded {
+        Vec::new()
+    } else {
+        match &bound.ranking {
+            Ranking::Distance { query } => {
+                let input = SearchInput {
+                    ids: &slot_ids,
                     vectors: arena.vectors(),
                     dim: arena.dim(),
                     query,
-                    k: cfg.pool_depth(),
+                    k: k_eff,
                 };
-                let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                if dense_hits.iter().any(|h| !visible_id_set.contains(&h.id)) {
+                let raw = provider.search(input).map_err(map_kernel_error)?;
+                if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
                     return Err(SqlSurfaceError::Internal {
-                        detail: "search provider returned a hit outside the visible id set"
+                        detail: "search provider returned a result violating the top-k contract"
                             .to_string(),
                     });
                 }
-                let mut fused =
-                    hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                fused.truncate(bound.limit);
-                fused
-            } else {
-                let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                    .iter()
-                    .map(|(id, text)| (*id, text.as_str()))
-                    .collect();
-                let sparse_index = SparseIndex::build(&doc_refs)
-                    .map_err(HybridError::Sparse)
-                    .map_err(map_hybrid_error)?;
-                hybrid::hybrid_search(
-                    provider,
-                    input,
-                    &sparse_index,
-                    query_text,
-                    bound.limit,
-                    &cfg,
-                )
-                .map_err(map_hybrid_error)?
-            };
-            fused.into_iter().map(|h| (h.id, h.score)).collect()
+                raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
+            }
+            Ranking::Hybrid {
+                query, query_text, ..
+            } => {
+                let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
+                let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
+                    SqlSurfaceError::Internal {
+                        detail: "invalid hybrid RRF config".to_string(),
+                    }
+                })?;
+                let input = SearchInput {
+                    ids: &slot_ids,
+                    vectors: arena.vectors(),
+                    dim: arena.dim(),
+                    query,
+                    k: k_eff,
+                };
+                let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
+                    // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                    // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
+                    // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
+                    // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
+                    // `hybrid::hybrid_search` と同じ理由でここでも行う）。
+                    let dense_input = SearchInput {
+                        ids: &slot_ids,
+                        vectors: arena.vectors(),
+                        dim: arena.dim(),
+                        query,
+                        k: cfg.pool_depth(),
+                    };
+                    let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
+                    // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                    // キー存在で判定する。TABLE-12 の重複 id については
+                    // `core::provider_result_is_valid` のドキュメント参照）。
+                    if dense_hits
+                        .iter()
+                        .any(|h| !visible_id_counts.contains_key(&h.id))
+                    {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "search provider returned a hit outside the visible id set"
+                                .to_string(),
+                        });
+                    }
+                    let mut fused =
+                        hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
+                    fused.truncate(k_eff);
+                    fused
+                } else {
+                    let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                        .iter()
+                        .map(|(id, text)| (*id, text.as_str()))
+                        .collect();
+                    let sparse_index = SparseIndex::build(&doc_refs)
+                        .map_err(HybridError::Sparse)
+                        .map_err(map_hybrid_error)?;
+                    hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
+                        .map_err(map_hybrid_error)?
+                };
+                fused.into_iter().map(|h| (h.id, h.score)).collect()
+            }
         }
     };
 
@@ -523,61 +720,228 @@ pub fn execute_statement(
     let hits: Vec<(u64, f64)> = if plan.scalar_prefilter {
         hits
     } else {
-        hits.into_iter()
-            .filter(|(id, _)| {
-                match candidate_columns.get(id) {
-                Some(columns) => bound.scalar_filters.iter().all(|f| {
-                    matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value)
-                }),
-                None => false,
+        // TASK-79（SQL-9）: `WHERE` の式述語も既存の等価条件と同じ SCALAR 事後
+        // フィルタの一部として扱う（DISTANCE 先行時。§モジュールドキュメント参照）。
+        // 評価に使う embedding は候補選択と同一スナップショットの `arena` から
+        // （投影段と同じ経路。再取得なし）。評価エラーはこの場で fail-closed に
+        // クエリ全体の失敗として伝播する（当該行だけを黙ってスキップしない。
+        // `on_visible_row` の事前フィルタ経路と同じ方針）。
+        let mut filtered = Vec::with_capacity(hits.len());
+        for (slot_id, score) in hits {
+            // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
+            // として fail-closed に除去する。
+            let Some(slot) = usize::try_from(slot_id).ok() else {
+                continue;
+            };
+            let Some(columns) = candidate_columns.get(slot) else {
+                continue;
+            };
+            let scalar_ok = bound.scalar_filters.iter().all(
+                |f| matches!(columns.get(f.column_index), Some(Value::Text(t)) if *t == f.value),
+            );
+            if !scalar_ok {
+                continue;
             }
-            })
-            .collect()
+            if !bound.expr_filters.is_empty() {
+                let Some(embedding) = arena.vector(slot) else {
+                    continue;
+                };
+                let Some(row_id) = arena.ids().get(slot).copied() else {
+                    continue;
+                };
+                let mut expr_ok = true;
+                for expr in &bound.expr_filters {
+                    match udf_call::eval(expr, row_id, embedding)? {
+                        udf_call::ExprValue::Bool(true) => {}
+                        udf_call::ExprValue::Bool(false) => {
+                            expr_ok = false;
+                            break;
+                        }
+                        // 束縛段が型を `Bool` に限定済みのため到達しない。
+                        _ => {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "WHERE expression did not evaluate to a boolean"
+                                    .to_string(),
+                            })
+                        }
+                    }
+                }
+                if !expr_ok {
+                    continue;
+                }
+            }
+            filtered.push((slot_id, score));
+        }
+        filtered
     };
 
-    // RLS 実行時安全網（RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
+    // PRECISION ゲート段（TASK-162・SEARCH-9）。SCALAR 事後フィルタの**後**・
+    // `RlsSafetyNet::apply` の**前**に置く（`crate::precision` モジュール
+    // ドキュメント参照）。`WHERE` を満たす行だけを対象に Top-1／Top-2 の確信度を
+    // 見るため SCALAR 段より後、`RlsSafetyNet` は行を「減らす」ことしかしないため
+    // ゲート通過後に安全網が行を落としても確信のない行が増える方向にはならず、
+    // この位置より前に置く必要がある。候補集合自体は `ImplicitRlsHook` により
+    // 事前フィルタ済み（`arena` 構築時）のため、他テナント不可視行が Top-1／Top-2
+    // の比較対象に混入することはない。`HINT ORDER` の内容に関係なく無条件に適用
+    // する（`is_precision` は `bound.mode` のみに依存し、`plan.scalar_prefilter`
+    // の分岐に触れない）。`recall`（既定）はこのブロックを一切通らないため、
+    // 挙動は変わらない（SEARCH-1〜8 不変）。
+    let hits: Vec<(u64, f64)> = if is_precision {
+        // 確信度指標はランキング方式ごとに正規化する（`crate::precision` モジュール
+        // ドキュメント参照）: dense はクエリ・候補 embedding の cosine 類似度、
+        // hybrid は融合スコアを理論最大値で割った正規化 RRF スコア。確信度は
+        // 先頭 `min(limit, max_results) + 1` 件分だけ計算する（有界・小規模。
+        // DoS 対策）。
+        let thresholds = match &bound.ranking {
+            Ranking::Distance { .. } => precision_policy.dense(),
+            Ranking::Hybrid { .. } => precision_policy.hybrid(),
+        };
+        let want = bound
+            .limit
+            .min(precision_policy.max_results())
+            .saturating_add(1);
+        let take_n = want.min(hits.len());
+        let mut conf: Vec<f64> = Vec::with_capacity(take_n);
+        match &bound.ranking {
+            Ranking::Distance { query } => {
+                for (slot_id, _score) in hits.iter().take(take_n) {
+                    let slot =
+                        usize::try_from(*slot_id).map_err(|_| SqlSurfaceError::Internal {
+                            detail: "candidate slot index out of range".to_string(),
+                        })?;
+                    let embedding =
+                        arena
+                            .vector(slot)
+                            .ok_or_else(|| SqlSurfaceError::Internal {
+                                detail: "candidate arena index out of range".to_string(),
+                            })?;
+                    // ノルム 0・次元不一致・非有限値は「確信なし」（`0.0`）として
+                    // 扱う。`ConfidenceThresholds::new` が閾値を厳密に正へ限定して
+                    // いるため、`0.0` は常に `min_top1` 未満となり空集合へ倒れる
+                    // （fail-closed。`crate::precision::cosine_similarity` の
+                    // ドキュメント参照）。
+                    conf.push(crate::precision::cosine_similarity(query, embedding).unwrap_or(0.0));
+                }
+            }
+            Ranking::Hybrid { .. } => {
+                // 正規化に使う重み・ランク減衰定数は DISTANCE 段で使ったものと
+                // 同一の固定値（`60.0, 1.0, 1.0`）で、`pool_depth` は正規化の
+                // 計算式に現れないため既定値で構わない
+                // （`crate::precision::rrf_normalized` のドキュメント参照）。
+                let cfg = RrfConfig::default();
+                for (_slot_id, score) in hits.iter().take(take_n) {
+                    conf.push(crate::precision::rrf_normalized(*score, &cfg).unwrap_or(0.0));
+                }
+            }
+        }
+        let n = crate::precision::apply_gate(
+            &conf,
+            &thresholds,
+            bound.limit,
+            precision_policy.max_results(),
+        )
+        .map_err(|e| SqlSurfaceError::Internal {
+            detail: format!("precision gate contract violation: {e}"),
+        })?;
+        let mut truncated = hits;
+        truncated.truncate(n);
+        truncated
+    } else {
+        hits
+    };
+
+    // RLS 実行時安全網（TASK-136・RLS-5）。`HINT ORDER` の内容に関係なく常に適用する
     // （モジュールドキュメント参照）。`ExecutionPlan` にはこの適用を分岐させる
     // フィールドを持たせておらず（`plan.rs` のドキュメント参照）、呼び出しを
     // 迂回する経路が型として存在しない。`arena` は候補構築と同一スナップショットの
     // テナント・可視性ラベルを保持しているため、`storage` の再取得なしに安全網を
     // 評価できる。現状は事前フィルタと同じ `arena` から再判定するため、この安全網
     // 単体で不可視行を追加で落とすことはない（defense-in-depth。モジュール
-    // ドキュメント参照）。
-    let hits: Vec<(u64, f64)> = plan::apply_rls_safety_net(
-        hits,
-        |id| {
-            let index = *arena_index_by_id.get(&id)?;
-            let tenant = arena.tenant_id(index)?.to_string();
-            let visibility = arena.visibility(index)?;
-            Some((tenant, visibility))
-        },
-        |tenant, visibility| ctx.is_visible(tenant, visibility),
-    );
+    // ドキュメント参照）。戻り値の [`RlsVerifiedHits`]（witness 型）は
+    // [`project_rows`] へのみ渡り、安全網を経由しない生の `hits` から投影へ
+    // 到達する経路は型として存在しない（`rls.rs` の型ドキュメント参照）。
+    // `hits` の第 1 要素はアリーナのスロット番号。範囲外のスロット（provider の契約
+    // 違反・データ不整合）は `None` を返し、`RlsSafetyNet::apply` が fail-closed に
+    // 除去する（従来の「id が索引に無い」case と同じ扱い）。
+    let verified: RlsVerifiedHits = RlsSafetyNet::new(ctx).apply(hits, |slot_id| {
+        let slot = usize::try_from(slot_id).ok()?;
+        let tenant = arena.tenant_id(slot)?;
+        let visibility = arena.visibility(slot)?;
+        Some((tenant, visibility))
+    });
 
-    // 投影: `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と
-    // 同一スナップショットで保持しておいた embedding（`arena`）・デコード済み
-    // スカラー列（`candidate_columns`）から返却行を構築する（上記コメント参照。
-    // 候補選択後に対象行が更新・削除されても、投影は候補選択時点の値を返す
-    // ため、RLS・スカラー WHERE・embedding が候補選択と投影とで食い違うことはない）。
+    let rows = project_rows(
+        verified,
+        &bound.projection,
+        schema,
+        &arena,
+        &candidate_columns,
+    )?;
+
+    let columns = bound
+        .projection
+        .iter()
+        .map(|col| match col {
+            ProjectedColumn::Id => ColumnMeta::Id,
+            ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
+                name: name.clone(),
+                ty: schema
+                    .columns
+                    .get(*index)
+                    .map(|c| c.ty)
+                    .unwrap_or(ColumnType::Text),
+            },
+            ProjectedColumn::Computed { name, .. } => ColumnMeta::Computed { name: name.clone() },
+        })
+        .collect();
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// 投影段（TASK-136・RLS-5）。引数を [`RlsVerifiedHits`]（witness 型）に固定する
+/// ことで、[`RlsSafetyNet::apply`] を経由しない生の `Vec<(u64, f64)>` から本関数へ
+/// 到達する経路を型として作れなくする（`execute_statement` からのみ呼ばれる）。
+/// `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と同一
+/// スナップショットで保持しておいた embedding（`arena`）・デコード済みスカラー列
+/// （`candidate_columns`）から返却行を構築する（候補選択後に対象行が更新・削除
+/// されても、投影は候補選択時点の値を返すため、RLS・スカラー WHERE・embedding が
+/// 候補選択と投影とで食い違うことはない）。
+fn project_rows(
+    verified: RlsVerifiedHits,
+    projection: &[ProjectedColumn],
+    schema: &TableSchema,
+    arena: &VectorArena,
+    candidate_columns: &[Vec<Value>],
+) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+    let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
-    for (id, score) in hits {
-        let index = *arena_index_by_id
-            .get(&id)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "search hit id missing from candidate arena".to_string(),
-            })?;
+    for (slot_id, score) in hits {
+        // ヒットの第 1 要素はアリーナのスロット番号（`execute_statement` の
+        // `slot_ids` 参照）。embedding・スカラー列・行 `id` の 3 者すべてを同じ
+        // スロットから引くため、同一 `id` の別テナント行が混ざる余地がない
+        // （対象ビヘイビア: TABLE-12。Bugbot High 指摘への対応）。
+        let slot = usize::try_from(slot_id).map_err(|_| SqlSurfaceError::Internal {
+            detail: "candidate slot index out of range".to_string(),
+        })?;
         let embedding = arena
-            .vector(index)
+            .vector(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "candidate arena index out of range".to_string(),
             })?;
         let decoded = candidate_columns
-            .get(&id)
+            .get(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "search hit id missing from candidate scalar columns".to_string(),
+                detail: "search hit is missing from candidate scalar columns".to_string(),
             })?;
-        let mut cells = Vec::with_capacity(bound.projection.len());
-        for col in &bound.projection {
+        // クライアントへ返す id は本来の行 `id`（スロット番号ではない）。
+        let id = *arena
+            .ids()
+            .get(slot)
+            .ok_or_else(|| SqlSurfaceError::Internal {
+                detail: "candidate arena index out of range".to_string(),
+            })?;
+        let mut cells = Vec::with_capacity(projection.len());
+        for col in projection {
             match col {
                 ProjectedColumn::Id => cells.push(Cell::Integer(id)),
                 ProjectedColumn::Column { index, .. } => {
@@ -603,28 +967,97 @@ pub fn execute_statement(
                         },
                     }
                 }
+                ProjectedColumn::Computed { expr, .. } => {
+                    // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
+                    // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
+                    // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
+                    // （行値・テナントを含まない固定文言。`sql::udf_call::eval` 参照）。
+                    match udf_call::eval(expr, id, embedding)? {
+                        udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                        udf_call::ExprValue::Vector(v) => cells.push(Cell::Vector(v)),
+                        udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
+                    }
+                }
             }
         }
         rows.push(ResultRow { id, score, cells });
     }
+    Ok(rows)
+}
 
-    let columns = bound
-        .projection
-        .iter()
-        .map(|col| match col {
-            ProjectedColumn::Id => ColumnMeta::Id,
-            ProjectedColumn::Column { index, name } => ColumnMeta::Scalar {
-                name: name.clone(),
-                ty: schema
-                    .columns
-                    .get(*index)
-                    .map(|c| c.ty)
-                    .unwrap_or(ColumnType::Text),
-            },
-        })
-        .collect();
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80 の公開 API）。
+/// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
+/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
+///
+/// 行の書き込みはガード付き API [`crate::tenant::insert_typed_row`] へ委譲する
+/// （TASK-95・TABLE-12・RLS-9）。`catalog.rs` の生の挿入 API は `pub(crate)` かつ
+/// テナント名前空間の指定を呼び出し元任せにするため、SQL 表層からは使わない
+/// （ガードを迂回できる書き込み入口を増やさない。security.md P0）。テナントは
+/// `ctx.tenant_id()` からサーバー側で導出され（クライアントが列リストへテナント
+/// 相当の値を指定しても無視される）、可視性は常に `Visibility::Private` に固定する
+/// （`PolicyContext::is_visible` は `Public` 行を他テナントへも可視とするため、
+/// 既定 `Public` は越境露出になる。fail-closed に `Private` を採用する）。
+///
+/// 単一の write トランザクションで完結し、既存 `id` への黙った上書きは行わない。
+/// 重複検出のスコープは**呼び出し元テナントの名前空間内**に閉じる（行ストアの物理
+/// キーが `(tenant_id, id)` であるため。TABLE-12・RLS-9）。したがって:
+///
+/// - 同一テナント内の `id` 重複のみ [`SqlSurfaceError::IdConflict`]（`23505`）
+/// - 他テナントが同じ `id` を保持していても本経路は成功する（応答・実行経路のいずれも
+///   他テナントの行 id 存在で分岐しないため、存在オラクルにならない）
+///
+/// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
+/// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
+/// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
+/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の冪等契約
+/// （台帳への原子的記録・重複拒否・内容不一致検出）はまだ提供しない。`bound.operation_id`
+/// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
+/// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
+/// （ポインタ: docs/spec/05-tasks.md TASK-93）。
+pub fn execute_insert(
+    storage: &crate::storage::Storage,
+    ctx: &PolicyContext,
+    bound: &crate::sql::parser::BoundInsert,
+) -> Result<InsertOutcome, SqlSurfaceError> {
+    use crate::catalog::CatalogError;
+    use crate::storage::{StorageError, Visibility};
+    use crate::tenant::TenantWriteError;
 
-    Ok(QueryResult { columns, rows })
+    crate::tenant::insert_typed_row(
+        storage,
+        &bound.table,
+        ctx,
+        bound.id,
+        Visibility::Private,
+        &bound.values,
+    )
+    .map_err(|e| match e {
+        // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
+        // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
+        TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
+            SqlSurfaceError::UndefinedTable { name }
+        }
+        // 入力値に起因すると型で確認できるものだけを「受理構文だが値が不正」として
+        // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
+        // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
+        // 所有テナントは含めない（security.md「エラー・ログ経由で他テナントのデータ・
+        // 存在情報を漏らさない」）。
+        TenantWriteError::Catalog(CatalogError::Invalid(_))
+        | TenantWriteError::Storage(StorageError::Codec(_)) => {
+            SqlSurfaceError::invalid_input("insert rejected: invalid row")
+        }
+        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗等）は
+        // サーバー側の内部事象として `XX000` へ写像する（codex-review P0/P1 指摘・
+        // PR #189: バックエンド障害を入力不正として返すと再試行・障害判定を誤らせる。
+        // また `TenantWriteError` の `Display`/`Debug` は原因を秘匿する契約のため、
+        // detail には原因を一切展開せず固定文言に留める）。
+        _ => SqlSurfaceError::Internal {
+            detail: "insert failed".to_string(),
+        },
+    })?;
+
+    Ok(InsertOutcome { rows_affected: 1 })
 }
 
 #[cfg(test)]
@@ -658,6 +1091,56 @@ mod tests {
         assert!(matches!(
             try_accumulate_budget(usize::MAX - 1, 10, 100),
             Err(ArenaError::CapacityExceeded)
+        ));
+    }
+
+    // codex-review 指摘（PRRT_kwDOUAKASM6cPLHE）の回帰テスト: `!scalar_prefilter`
+    // の precision 経路で可視集合が `core::MAX_SEARCH_K` を超えるかどうかの判定
+    // （`k_eff` クランプにより完全な順位列を構築できなくなる境界）。本体
+    // （`execute_statement`）を `MAX_SEARCH_K` 超の巨大データで再現するのは
+    // 非現実的なため、上限判定を担う純粋関数を直接検証する（`try_accumulate_budget`
+    // と同方針）。
+
+    #[test]
+    fn precision_completeness_unbounded_false_when_recall_mode() {
+        // `is_precision == false`（recall）は本経路自体を通らないため常に `false`。
+        assert!(!precision_completeness_unbounded(
+            false,
+            false,
+            core::MAX_SEARCH_K + 1
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_false_when_scalar_prefilter() {
+        // SCALAR 先行経路は `k_eff = bound.limit.max(2)` を使い、可視集合の広さに
+        // 依存しないため常に `false`。
+        assert!(!precision_completeness_unbounded(
+            true,
+            true,
+            core::MAX_SEARCH_K + 1
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_false_at_max_search_k_boundary() {
+        // 可視集合が `MAX_SEARCH_K` ちょうどなら `k_eff` はクランプされず完全な
+        // 順位列を取得できるため `false`。
+        assert!(!precision_completeness_unbounded(
+            true,
+            false,
+            core::MAX_SEARCH_K
+        ));
+    }
+
+    #[test]
+    fn precision_completeness_unbounded_true_one_over_max_search_k() {
+        // 1 件でも超過すれば `k_eff` がクランプされ完全性を保証できなくなるため
+        // `true`（呼び出し元は空集合へ倒す）。
+        assert!(precision_completeness_unbounded(
+            true,
+            false,
+            core::MAX_SEARCH_K + 1
         ));
     }
 
