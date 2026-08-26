@@ -262,6 +262,16 @@ pub enum TenantWriteError {
     Catalog(CatalogError),
     /// [`crate::storage`] 側のエンコード/デコードエラー（`RowInput` の入力検証失敗等）。
     Storage(StorageError),
+    /// `operation_id` 台帳（`crate::recovery::ledger`）テーブルの読み書きで検出した
+    /// 内部エラー（未知フォーマットバージョンの混入・redb バックエンド障害）。
+    /// `Storage(StorageError::Codec)` と型を分ける（Cursor Bugbot 指摘・PR #226）:
+    /// 台帳の破損はクライアントが送った行データとは無関係のサーバー内部事象であり、
+    /// `sql::exec::execute_insert` の呼び出し元マッピングが `StorageError::Codec` を
+    /// 「行データ不正（`22000`）」として丸めてしまうと、台帳破損を「送った行が不正」
+    /// という誤ったクライアント向けエラーへ変換してしまう。台帳エラーは常に
+    /// `wire_code` `XX000`（内部事象）に固定し、クライアントへ再試行を促す誤情報を
+    /// 出さない（fail-closed）。
+    LedgerCorrupted(StorageError),
 }
 
 impl TenantWriteError {
@@ -276,6 +286,7 @@ impl TenantWriteError {
             TenantWriteError::IdConflict => "23505",
             TenantWriteError::MissingOperationId => "23502",
             TenantWriteError::Catalog(_) | TenantWriteError::Storage(_) => "XX000",
+            TenantWriteError::LedgerCorrupted(_) => "XX000",
         }
     }
 }
@@ -293,6 +304,7 @@ impl std::fmt::Display for TenantWriteError {
             // と同じ理由。security.md テナント境界 P0）。
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
             TenantWriteError::Storage(_) => write!(f, "tenant write storage error"),
+            TenantWriteError::LedgerCorrupted(_) => write!(f, "tenant write ledger error"),
         }
     }
 }
@@ -309,6 +321,7 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
+            TenantWriteError::LedgerCorrupted(_) => f.write_str("LedgerCorrupted(<redacted>)"),
         }
     }
 }
@@ -398,7 +411,8 @@ pub(crate) fn insert_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -492,7 +506,8 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -582,7 +597,8 @@ pub(crate) fn insert_typed_row_unchecked(
             embedding: &embedding,
             metadata: &metadata,
         };
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -671,7 +687,8 @@ pub(crate) fn update_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         let encoded = encode_row(row)?;
         row_table
             .insert(key, encoded.as_slice())
@@ -738,7 +755,8 @@ pub(crate) fn delete_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)?;
+        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+            .map_err(TenantWriteError::LedgerCorrupted)?;
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
@@ -746,13 +764,21 @@ pub(crate) fn delete_row_unchecked(
 }
 
 /// `table` に `op_id` が台帳記録済みかを照会する（TASK-93、対象ビヘイビア: RECOVER-2）。
-/// `crate::core::EngineCore::operation_recorded` からの薄い委譲先で、テスト・後続
-/// タスク（TASK-94・TASK-98）用の最小公開面として `pub` にする。
+/// `crate::core::EngineCore::operation_recorded` からの薄い委譲先。`pub(crate)` に
+/// 限定する（codex-review P1 指摘・PR #226）: `EngineCore::operation_recorded` は
+/// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）で台帳へ一切触れず
+/// `LedgerLookup::NoLedger` を返す契約だが、本関数は `Storage` を直接受け取り
+/// `ledger_mode` の状態を知らないため、DB に過去（`Ledgered` 構成時）の記録が
+/// 残っていればそれをそのまま観測してしまう。これを公開したままだと
+/// `EngineCore` の「台帳を持たない構成では照会しない」という fail-closed な
+/// 区別を呼び出し元が迂回できてしまう。`EngineCore::operation_recorded` 経由の
+/// 委譲（`LedgerLookup` 判定込み）に一本化し、モード非依存の生の照会結果を
+/// クレート外へ公開しない。
 ///
 /// 照会範囲は呼び出し元テナント（`ctx.tenant_id()`）の名前空間に閉じる。他テナントの
 /// `operation_id` 存在を成否・文言・経路差で観測できる経路にはならない（TABLE-12・
 /// RLS-9 と同型。security.md P0）。
-pub fn operation_recorded(
+pub(crate) fn operation_recorded(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
@@ -760,12 +786,8 @@ pub fn operation_recorded(
 ) -> Result<bool, TenantWriteError> {
     validate_identifier(table)?;
     let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
-    Ok(ledger::contains_in_read_txn(
-        &read_txn,
-        ctx.tenant_id(),
-        table,
-        op_id,
-    )?)
+    ledger::contains_in_read_txn(&read_txn, ctx.tenant_id(), table, op_id)
+        .map_err(TenantWriteError::LedgerCorrupted)
 }
 
 #[cfg(test)]

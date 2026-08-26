@@ -1075,16 +1075,20 @@ pub fn execute_insert(
         // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
         // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
         // 所有テナントは含めない（security.md「エラー・ログ経由で他テナントのデータ・
-        // 存在情報を漏らさない」）。
+        // 存在情報を漏らさない」）。`TenantWriteError::LedgerCorrupted`（`op_ledger` の
+        // 未知フォーマット・バックエンド障害）はここに含めない: 台帳破損は送信された
+        // 行データとは無関係のサーバー内部事象であり、クライアントの行を「不正」と
+        // 誤認させると誤った再試行を誘発する（Cursor Bugbot 指摘・PR #226）。下の
+        // `_` 節（`XX000`）へ委ねる。
         TenantWriteError::Catalog(CatalogError::Invalid(_))
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
         }
-        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗等）は
-        // サーバー側の内部事象として `XX000` へ写像する（codex-review P0/P1 指摘・
-        // PR #189: バックエンド障害を入力不正として返すと再試行・障害判定を誤らせる。
-        // また `TenantWriteError` の `Display`/`Debug` は原因を秘匿する契約のため、
-        // detail には原因を一切展開せず固定文言に留める）。
+        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗・
+        // 台帳破損等）はサーバー側の内部事象として `XX000` へ写像する
+        // （codex-review P0/P1 指摘・PR #189: バックエンド障害を入力不正として返すと
+        // 再試行・障害判定を誤らせる。また `TenantWriteError` の `Display`/`Debug` は
+        // 原因を秘匿する契約のため、detail には原因を一切展開せず固定文言に留める）。
         _ => SqlSurfaceError::Internal {
             detail: "insert failed".to_string(),
         },
