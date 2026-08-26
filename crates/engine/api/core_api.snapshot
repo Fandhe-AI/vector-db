@@ -8,6 +8,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod chunking;
 pub mod core;
+pub mod declarative_filter;
 pub mod dispatch;
 pub mod hybrid;
 pub mod isa;
