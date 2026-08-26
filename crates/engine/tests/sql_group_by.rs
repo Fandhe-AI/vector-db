@@ -509,3 +509,144 @@ fn rejects_limit_out_of_range_on_group_by() {
         .expect_err("LIMIT 0 must be rejected");
     assert_eq!(err.wire_code(), "22000");
 }
+
+// --- PR #230 codex-review/Bugbot 指摘の回帰テスト ----------------------------------
+
+// NULL グループは既定の昇順（`ORDER BY` 未指定）で常に末尾に来る（`GroupKey` の
+// `Ord` が `Option<String>` の派生 `Ord`（`None` が先頭）のままだと、この
+// `LIMIT 1` が非 NULL の先頭グループではなく NULL グループを返してしまう）。
+#[test]
+fn group_by_default_order_places_null_group_last_for_limit() {
+    let path = unique_db_path("group-by-null-sorts-last");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    storage.create_table(&schema()).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op = |n: &str| {
+        engine::recovery::required_op_id::OperationId::parse(n).expect("valid operation_id")
+    };
+
+    storage
+        .alter_table_add_column(TABLE, ColumnDef::new("note", ColumnType::Text, true))
+        .expect("alter table");
+
+    for (id, note) in [
+        (1u64, Some("bb")),
+        (2, None),
+        (3, Some("aa")),
+        (4, None),
+        (5, Some("cc")),
+    ] {
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            id,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32; DIM]),
+                Value::Text("ja".to_string()),
+                note.map(|n| Value::Text(n.to_string()))
+                    .unwrap_or(Value::Null),
+            ],
+            &op(&format!("op-{id}")),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT note, COUNT(*) AS n FROM docs GROUP BY note LIMIT 1",
+        )
+        .expect("GROUP BY with default order and LIMIT should succeed");
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        as_text(&result.rows[0].cells[0]),
+        Some("aa".to_string()),
+        "the smallest non-NULL group must sort before the NULL group"
+    );
+}
+
+// `ORDER BY` は SELECT リストで `GROUP BY` 列に付けたエイリアスも参照できる
+// （`resolve_target` が生の列名にしか一致しないと `unknown GROUP BY reference`
+// として `22000` を返してしまう）。
+#[test]
+fn order_by_accepts_group_key_alias() {
+    let path = unique_db_path("group-by-order-by-alias");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+    let visible = visible_rows(&truths, "tenant-a", true);
+    let expected = oracle_groups(&visible);
+
+    let mut expected_langs: Vec<String> = expected.keys().cloned().collect();
+    expected_langs.sort();
+
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT lang AS language, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY language",
+        )
+        .expect("ORDER BY referencing the GROUP BY key alias should succeed");
+    let actual_langs: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| as_text(&row.cells[0]).expect("group key must be present"))
+        .collect();
+    assert_eq!(actual_langs, expected_langs);
+}
+
+// クエリ全体での `MIN`/`MAX(<TEXT 列>)` 集計状態の累計バイト数は
+// `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES` で頭打ちにされ、超過は `54000`
+// （codex-review P1 指摘対応: グループ数×項目数分の `TextMin`/`TextMax` が
+// 無制限にメモリを確保しないことを確認する）。
+#[test]
+fn text_min_max_accumulator_total_size_over_budget_is_rejected() {
+    let path = unique_db_path("group-by-text-accumulator-budget");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let schema = TableSchema::new(
+        "textbudget",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(1), false),
+            ColumnDef::new("k", ColumnType::Text, false),
+            ColumnDef::new("v", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 各グループの MIN(v) 対象文字列を 3 MiB（行のメタデータ総量上限 4 MiB を
+    // 下回る値）にし、6 グループ分（18 MiB）投入して 16 MiB のクエリ全体予算を
+    // 超過させる。
+    const GROUPS: u64 = 6;
+    const VALUE_LEN: usize = 3 * 1024 * 1024;
+    for i in 0..GROUPS {
+        let value = "x".repeat(VALUE_LEN);
+        engine::tenant::insert_typed_row(
+            &storage,
+            "textbudget",
+            &ctx,
+            i,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0f32]),
+                Value::Text(format!("k{i}")),
+                Value::Text(value),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!("op-{i}"))
+                .expect("valid op"),
+        )
+        .expect("insert row");
+    }
+
+    let core = new_core(storage);
+    let err = core
+        .execute_sql(&ctx, "SELECT k, MIN(v) FROM textbudget GROUP BY k")
+        .expect_err("exceeding the TEXT accumulator total byte budget must be rejected");
+    assert_eq!(err.wire_code(), "54000");
+}

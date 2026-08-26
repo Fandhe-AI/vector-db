@@ -923,6 +923,12 @@ pub(crate) fn bind_aggregate(
 
     let mut items = Vec::new();
     let mut projection = Vec::with_capacity(stmt.items().len());
+    // `GROUP BY` 列に SELECT リストで `AS` エイリアスが付いた場合の実効名
+    // （`ORDER BY` がこのエイリアスを参照できるよう `bind_group_by_clause` へ渡す。
+    // PR #230 Bugbot 指摘対応: `resolve_target` が生の列名にしか一致しないと、
+    // SELECT リストの実効名であるはずのエイリアスが `ORDER BY` から unknown 扱い
+    // される）。
+    let mut group_key_alias: Option<String> = None;
     for item in stmt.items() {
         match item {
             AggregateSelectItem::Aggregate(item) => {
@@ -947,6 +953,7 @@ pub(crate) fn bind_aggregate(
             AggregateSelectItem::GroupKey { column, alias } => {
                 debug_assert_eq!(Some(column.as_str()), group_by_column);
                 let name = alias.clone().unwrap_or_else(|| column.clone());
+                group_key_alias = alias.clone();
                 projection.push(ProjectionColumn::GroupKey { name });
             }
         }
@@ -957,7 +964,12 @@ pub(crate) fn bind_aggregate(
 
     let group_by = match stmt.group_by() {
         None => None,
-        Some(clause) => Some(bind_group_by_clause(clause, schema, &items)?),
+        Some(clause) => Some(bind_group_by_clause(
+            clause,
+            schema,
+            &items,
+            group_key_alias.as_deref(),
+        )?),
     };
 
     Ok(BoundAggregate {
@@ -973,12 +985,16 @@ pub(crate) fn bind_aggregate(
 
 /// [`crate::sql::allowlist::GroupByClause`] を `schema`・束縛済み `items`（アキュムレータ
 /// 一覧）と照合して [`BoundGroupBy`] へ束縛する（TASK-167・SQL-14）。`HAVING`/
-/// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、または
-/// `GROUP BY` 列名そのものに解決する。
+/// `ORDER BY` の対象名は SELECT リストの集計項目の実効名（`item.name`）、
+/// `GROUP BY` 列名そのもの、または SELECT リストで `GROUP BY` 列に付けた
+/// `group_key_alias`（`Some` の場合のみ）に解決する（`group_key_alias` は
+/// SELECT リストの実効名であり `ORDER BY` から参照できて然るべきため。PR #230
+/// Bugbot 指摘対応）。
 fn bind_group_by_clause(
     clause: &crate::sql::allowlist::GroupByClause,
     schema: &TableSchema,
     items: &[BoundAggregateItem],
+    group_key_alias: Option<&str>,
 ) -> Result<BoundGroupBy, SqlSurfaceError> {
     // GROUP BY 列は TEXT 列のみ許可する（VECTOR・疑似列 `id`・未知列はいずれも
     // 型不整合として拒否。§計画 3.2。`id` によるグルーピングは本タスクの対象外
@@ -1000,11 +1016,12 @@ fn bind_group_by_clause(
             ))
         })?;
 
-    // HAVING/ORDER BY の対象名解決: `GROUP BY` 列名そのもの、または `items` の
-    // いずれか 1 つの実効名に一意に一致する識別子のみを受理する（曖昧・非存在は
-    // `22000`）。
+    // HAVING/ORDER BY の対象名解決: `GROUP BY` 列名そのもの、`GROUP BY` 列の
+    // SELECT リストでの実効名（`group_key_alias`）、または `items` のいずれか
+    // 1 つの実効名に一意に一致する識別子のみを受理する（曖昧・非存在は `22000`）。
     let resolve_target = |name: &str| -> Result<OrderTarget, SqlSurfaceError> {
-        let matches_group_key = name == clause.column;
+        let matches_group_key =
+            name == clause.column || group_key_alias.is_some_and(|alias| alias == name);
         let item_matches: Vec<usize> = items
             .iter()
             .enumerate()

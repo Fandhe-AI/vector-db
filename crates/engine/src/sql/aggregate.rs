@@ -313,6 +313,22 @@ impl Accumulator {
         }
     }
 
+    /// `TextMin`/`TextMax` が現在保持している文字列のバイト数（未保持なら 0、
+    /// それ以外の集計種別は常に 0）。呼び出し元（`sql::group_by`）が `observe`
+    /// 前後でこの値を比較し、`GROUP BY` 全体での TEXT アキュムレータ累計バイト数を
+    /// 予算管理するために公開する（PR #230 codex-review 指摘対応: `GROUP BY` は
+    /// グループ数に比例して `TextMin`/`TextMax` インスタンスが増えるため、
+    /// 単一行集計〔TASK-166・SQL-13〕の「項目ごとに高々 1 本」という有界性だけでは
+    /// 不十分）。
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            Accumulator::TextMin(m) | Accumulator::TextMax(m) => {
+                m.as_ref().map(String::len).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
     /// 空集合契約: `COUNT` は `0`、それ以外は `NULL`（PostgreSQL 互換。TASK-166・
     /// SQL-13）。`AVG` は合計を保持したまま `finish` の時点で除算する。
     pub(crate) fn finish(self) -> Cell {

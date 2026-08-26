@@ -8,11 +8,15 @@
 //! **不可視行のグループキーは結果に一切現れない**（他テナントにしか存在しない
 //! グループ値からの存在推測を防ぐ。RLS-7・RLS-8 の `GROUP BY` 版）。
 //!
-//! グループ数・グループキー文字列の累計バイト数はいずれも [`MAX_GROUPS`]・
-//! [`MAX_GROUP_KEY_TOTAL_BYTES`] で頭打ちにし、超過は
-//! [`SqlSurfaceError::payload_too_large`]（`54000`）で fail-closed に拒否する
-//! （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応。
-//! `TEXT` 値は 1 件あたり最大 4 MiB 許容されるため、件数上限だけでは有界にならない）。
+//! グループ数・グループキー文字列の累計バイト数・`MIN`/`MAX(<TEXT 列>)` 集計状態
+//! （`Accumulator::TextMin`/`TextMax`）の累計バイト数は、それぞれ [`MAX_GROUPS`]・
+//! [`MAX_GROUP_KEY_TOTAL_BYTES`]・[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`] で頭打ちに
+//! し、超過は [`SqlSurfaceError::payload_too_large`]（`54000`）で fail-closed に
+//! 拒否する（`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」
+//! 対応。`TEXT` 値は 1 件あたり最大 4 MiB 許容されるため、件数上限だけでは有界に
+//! ならない。単一行集計〔`aggregate.rs`〕は `TextMin`/`TextMax` インスタンスが
+//! 項目数分（高々 SELECT リスト長）で頭打ちだが、`GROUP BY` はグループ数倍に
+//! なるため別途累計管理が必要。PR #230 codex-review 指摘対応）。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -34,12 +38,39 @@ pub(crate) const MAX_GROUPS: usize = 10_000;
 /// 1 件あたり最大 4 MiB を許容するため、[`MAX_GROUPS`] 件数だけでは有界にならない。
 const MAX_GROUP_KEY_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 
+/// クエリ全体で `MIN`/`MAX(<TEXT 列>)` 集計項目（`Accumulator::TextMin`/`TextMax`）が
+/// 保持してよい文字列の累計バイト数の上限。`TEXT` 列は 1 件あたり最大 4 MiB を
+/// 許容し、`GROUP BY` は最大 [`MAX_GROUPS`] グループ×集計項目数だけ独立した
+/// アキュムレータを保持しうるため、件数上限だけでは有界にならない
+/// （[`MAX_GROUP_KEY_TOTAL_BYTES`] と同じ予算規模を採用）。
+const MAX_TEXT_ACCUMULATOR_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
 /// グループキー（`GROUP BY` 対象列の値）。`None` は NULL 値のグループ（`TEXT` 列の
 /// NULL は 1 つのグループへまとめる。PostgreSQL 互換）。`Ord` はバイト順、`None` は
 /// 常に末尾（既定の昇順ソート・[`crate::sql::exec::ColumnMeta`] へ渡す前の表示順を
-/// 決定的にする）。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// 決定的にする）。`Option<String>` の派生 `Ord`（`None` が先頭）とは逆順になるため
+/// 手動実装する（PR #230 codex-review/Bugbot 指摘: 派生 `Ord` のままだと既定順序・
+/// `ORDER BY` 未指定時に `NULL` グループが先頭に来て `LIMIT` が意図した先頭の
+/// 非 `NULL` グループを取りこぼす）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct GroupKey(Option<String>);
+
+impl PartialOrd for GroupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GroupKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+}
 
 /// グループ表への新規グループキー追加前に有界性を検査する（[`MAX_GROUPS`]・
 /// [`MAX_GROUP_KEY_TOTAL_BYTES`]）。呼び出し元が「このキーは表に存在しない」ことを
@@ -151,6 +182,7 @@ pub(crate) fn execute_grouped_aggregate(
 
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let mut total_key_bytes: usize = 0;
+    let mut total_text_accumulator_bytes: usize = 0;
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -228,7 +260,28 @@ pub(crate) fn execute_grouped_aggregate(
                 .ok_or_else(|| accumulator_bug("group entry disappeared after insertion"))?;
 
             for (accumulator, item) in accs.iter_mut().zip(&bound.items) {
+                // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
+                // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
+                // クエリ全体の累計バイト数を予算管理する（before/after 比較で
+                // 差分のみ加算。縮小方向〔より短い極値への更新〕は加算しない）。
+                let before = accumulator.text_len();
                 accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
+                let after = accumulator.text_len();
+                if after > before {
+                    let delta = after - before;
+                    total_text_accumulator_bytes = total_text_accumulator_bytes
+                        .checked_add(delta)
+                        .ok_or_else(|| {
+                            SqlSurfaceError::payload_too_large(
+                                "GROUP BY TEXT aggregate size accounting overflowed",
+                            )
+                        })?;
+                    if total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
+                        return Err(SqlSurfaceError::payload_too_large(
+                            "GROUP BY TEXT aggregate state exceeds the allowed total size",
+                        ));
+                    }
+                }
             }
         }
     }
