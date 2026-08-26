@@ -100,8 +100,9 @@ pub fn check_recall_within_limit(recall: f64, min_recall: f64) -> Result<bool, B
 /// （CORE-5。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）。
 ///
 /// 呼び出し元（`contrast_bench.rs`）は [`p95_ratio`] の結果を渡す（`ab::
-/// AbMeasurement::median_ratio` は補助情報として標準出力へ併記するのみで本判定には
-/// 使わない）。本関数の責務は値の妥当性検証（有限・非負）と上限との突き合わせのみ
+/// AbMeasurement::median_ratio` は補助情報として算出されるのみで本判定には使わず、
+/// 実測値であるため標準出力へも出さない。AGENTS.md P0: 実測値の公開禁止）。
+/// 本関数の責務は値の妥当性検証（有限・非負）と上限との突き合わせのみ
 /// とし、比率の算出は呼び出し元へ委ねる（TASK-127・Issue #176 で対照エンジン
 /// 〔usearch〕へ接続済み。判定ヘルパを public 実装として置くことはオーナー承認済み
 /// ——2026-08-26。閾値の具体値は本リポジトリに持たず env 経由で注入する）。

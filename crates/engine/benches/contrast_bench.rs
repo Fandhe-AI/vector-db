@@ -25,8 +25,8 @@
 //! 閾値そのものは spec が SSOT のため標準出力へは出力しない
 //! （`.claude/rules/spec-confidentiality.md`）。
 //!
-//! 健全性チェックとして同一クエリの Top-k 一致率（`recall_at_k`）を対照側と算出し
-//! 標準出力へ併記し、[`MIN_TOPK_OVERLAP`] 未満なら CORE-5 の合否判定自体を fail-closed で
+//! 健全性チェックとして同一クエリの Top-k 一致率（`recall_at_k`）を対照側と算出し、
+//! [`MIN_TOPK_OVERLAP`] 未満なら CORE-5 の合否判定自体を fail-closed で
 //! 拒否する（codex-review 指摘・PR #224 対応。被検・対照エンジンはいずれも同一データ・
 //! 同一メトリック（内積）に対する厳密最近傍探索であり（`ContrastIndex::search`・
 //! `ParallelSearchProvider` のドキュメンテーションコメント参照）、連続分布の合成ベクトル
@@ -169,8 +169,10 @@ fn main() {
         }
     };
     if !(topk_overlap > 0.0 && topk_overlap <= 1.0) {
+        // AGENTS.md P0（実測値の公開禁止）: 範囲逸脱の実測値そのものは出さず、
+        // どの健全性チェックが破れたかのみを報告する。
         eprintln!(
-            "contrast_bench: topk_overlap_min out of range ({topk_overlap}); wiring likely broken"
+            "contrast_bench: topk_overlap_min out of range (not in (0.0, 1.0]); wiring likely broken"
         );
         std::process::exit(1);
     }
@@ -178,24 +180,28 @@ fn main() {
     // 厳密最近傍同士の一致率そのものの合否判定であり、役割が異なるため両方を維持する。
     let topk_overlap_ok = topk_overlap >= MIN_TOPK_OVERLAP;
 
-    // `run_ab` が既に成功しているため `measurement.a/b.samples` は非空
-    // （`stats::summarize` が空サンプルを `Err` で早期リターンする契約。
-    // `simd_bench.rs` の p95 算出と同一の `expect` 方針）。
-    let candidate_p95 = harness::accept::p95_from_samples(&measurement.a.samples)
-        .expect("non-empty samples must yield a p95");
-    let contrast_p95 = harness::accept::p95_from_samples(&measurement.b.samples)
-        .expect("non-empty samples must yield a p95");
     // CORE-5 の最終合否は p95 比率（`ratio_ok`）と Top-k 一致率（`topk_overlap_ok`）の
     // 両方を満たすことを要求する（codex-review 指摘・PR #224 対応。片方のみでは metric
     // 取り違え・key 対応ずれのように処理が速いだけの無効な計測を合格させてしまう）。
     let overall_ok = ratio_ok && topk_overlap_ok;
+    // AGENTS.md P0（実測値の公開禁止）: p95・比率・一致率等の実測値は public な
+    // Actions ログへ出力せず、各判定の pass/fail のみを記録する
+    // （codex-review 指摘・PR #224 対応）。
     println!(
-        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} candidate_p95={candidate_p95:?} contrast_p95={contrast_p95:?} p95_ratio={ratio:.6} median_ratio={:.6} topk_overlap_min={topk_overlap:.6} ratio_ok={ratio_ok} topk_overlap_ok={topk_overlap_ok} pass={overall_ok}",
-        measurement.median_ratio,
+        "contrast_ratio(parallel_vs_usearch_exact): rows={ROW_COUNT} dim={DIM} k={TOP_K} ratio_ok={ratio_ok} topk_overlap_ok={topk_overlap_ok} pass={overall_ok}"
     );
 
     if !overall_ok {
-        eprintln!("contrast_bench: acceptance criteria not met (TASK-127 CORE-5)");
+        if !ratio_ok {
+            eprintln!(
+                "contrast_bench: p95 ratio (candidate vs contrast engine) exceeds the configured limit (TASK-127 CORE-5)"
+            );
+        }
+        if !topk_overlap_ok {
+            eprintln!(
+                "contrast_bench: top-k overlap with the contrast engine is below the configured minimum; candidate/contrast wiring or metric may be mismatched (TASK-127 CORE-5)"
+            );
+        }
         std::process::exit(1);
     }
 }
