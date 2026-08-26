@@ -10,7 +10,8 @@ name: Bench
 # BENCH_BATCH_MAX_DEGRADATION_PCT の repo variables 未設定のまま schedule 実行された
 # 場合は `simd_bench.rs` / `batch_bench.rs` 側の fail-closed により run が red に
 # なる（「一度も評価していない run」が green として埋もれることはない）。CORE-5
-# （対照エンジンとの中央値比較）は対照エンジンクレートの導入承認待ちで未接続のため
+# （対照エンジンに対する p95 レイテンシ比率の判定。ポインタ:
+# docs/spec/04-behavior/core-engine.md CORE-5）は対照エンジンの接続が未完了のため
 # 引き続き Issue #176 で追跡し、`BENCH_CORE5` repo variable が未設定（既定）の間は
 # 「対象外」として合否判定から明示的に除外する opt-in 方式を維持する（`simd_bench.rs`
 # 冒頭コメント参照）。CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）も

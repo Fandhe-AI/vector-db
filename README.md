@@ -81,7 +81,11 @@ gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
 
 未設定のまま実行すると `crates/engine/benches/simd_bench.rs`／`batch_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。
 
-CORE-5（対照エンジンとの中央値比較）は対照エンジンクレートの導入がユーザー承認待ちのため未接続です（TASK-127。`.claude/rules/dependency-policy.md`。Issue #176 で追跡中）。CORE-5 の判定は `BENCH_CORE5` repo variable による opt-in 方式です。
+CORE-5 は、対照エンジン（既存のインプロセスベクトル DB）と同一データ・同一クエリで比較し、被検／対照の **p95 レイテンシ比率**が上限以下であることを判定する受け入れ基準です（TASK-127。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）。この判定方法と、比率の算出・閾値比較を行う bench 用ヘルパを public 実装として本リポジトリへ置くことは、オーナー判断（2026-08-26）により公開範囲として確定しています。**比率の上限値そのもの（spec 由来の数値基準）は本リポジトリには記載せず**、Actions variable（`BENCH_MAX_CONTRAST_RATIO`）から注入し、bench の標準出力にも出しません。
+
+対照エンジンには usearch の総当たり `exact_search`（Apache-2.0）を採用します。bench 専用の optional feature 限定で有効化し、製品バイナリ（`wire-server`）にはリンクしません（同じくオーナー承認済み・2026-08-26）。
+
+実装（対照エンジンの接続・bench ジョブの追加・`BENCH_CORE5` opt-in の撤去）は Issue #176 / PR #224 で進行中です。本リポジトリの現状（本ドキュメント時点）では CORE-5 は未接続で、判定は `BENCH_CORE5` repo variable による opt-in 方式です。
 
 - 未設定（既定）: CORE-5 は「対象外」として標準出力へ明示され、合否判定には含まれません。CORE-3（p95 レイテンシ）・CORE-4（Recall@k）のみで合否を返します
 - `gh variable set BENCH_CORE5 1` を設定: CORE-5 を判定対象に含め、未接続＝判定不能を fail-closed として扱います（非ゼロ終了）
