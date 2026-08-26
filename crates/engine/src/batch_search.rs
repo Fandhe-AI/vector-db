@@ -409,7 +409,16 @@ fn try_reserve_exact<T>(
 /// 1 テナント分の積和演算数（`rows × queries × dim`）を checked 演算で計算する。
 /// 積のオーバーフローは [`MAX_BATCH_WORK`] 超過とみなす（[`compute_batch_work`]
 /// 専用のヘルパー。境界値を直接検証できるよう独立関数へ切り出す）。
-fn compute_tenant_work(rows: usize, queries: usize, dim: usize) -> Result<usize, BatchSearchError> {
+///
+/// `pub(crate)`: `gpu_batch.rs` の GPU 経路も dispatch 前の総量ガードに同じ
+/// 計算式を再利用する（CPU 経路と GPU 経路で計算量 DoS ガードの基準式が
+/// 分岐しないよう、この関数を単一の真実源とする。Issue #178 レビュー
+/// 指摘対応）。
+pub(crate) fn compute_tenant_work(
+    rows: usize,
+    queries: usize,
+    dim: usize,
+) -> Result<usize, BatchSearchError> {
     rows.checked_mul(queries)
         .and_then(|v| v.checked_mul(dim))
         .ok_or(BatchSearchError::WorkBudgetExceeded {

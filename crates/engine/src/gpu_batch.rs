@@ -17,10 +17,14 @@
 //!   契約（doc 参照）を満たすことを目指すが、`FallbackBatchEngine::
 //!   revalidate_primary_hits` が独立に再検証するため、本モジュールが唯一の
 //!   防御線ではない（codex-review P0 指摘対応の設計を踏襲）
-//! - 計算量 DoS 対策は `batch_search.rs::MAX_BATCH_WORK` と同じ定数を用いて
-//!   dispatch 前に適用する（`run_batch_search` のテナント別精緻化までは
-//!   行わず、より粗いが安全側の見積もりで代替する。Issue #178 の
-//!   スコープ縮小事項。詳細は out-of-scope 記録を参照）
+//! - 計算量 DoS 対策は `batch_search.rs::compute_tenant_work`（`rows × queries
+//!   × dim` の checked 演算）を CPU 経路と共有し、`batch_search` 冒頭で
+//!   dispatch 前に `queries.len()` を乗じた総量を [`MAX_BATCH_WORK`] と照合
+//!   する。GPU 経路はテナント別に走査を分けないため「常駐行列の全行数」を
+//!   単一テナント分の行数として扱い、`run_batch_search` のテナント別合算と
+//!   同じかより厳しい側に倒れる保守的な上界にする（クエリごとの
+//!   `gather_reachable_rows` 内の単発チェックはこの総量ガードの後段に
+//!   残す防御的な二重チェックであり、唯一の防御線ではない）
 //!
 //! # panic を作らない設計
 //!
@@ -34,7 +38,8 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::batch_fallback::{BatchBackend, BatchBackendError, BatchExecError};
 use crate::batch_search::{
-    validate_batch_queries, BatchHit, BatchQuery, BatchRowSource, MAX_BATCH_WORK,
+    compute_tenant_work, validate_batch_queries, BatchHit, BatchQuery, BatchRowSource,
+    MAX_BATCH_WORK,
 };
 use crate::kernel::{CandidateHit, TopKSelector};
 use crate::policy::PolicyContext;
@@ -433,6 +438,29 @@ impl BatchBackend for GpuBatchBackend {
         // 再検証する（TASK-128 設計方針 §3.2 ポインタ）。
         validate_batch_queries(self.matrix.dim(), queries).map_err(BatchExecError::Input)?;
 
+        // dispatch 前の総量ガード（codex/Issue #178 レビュー指摘対応: GPU 経路が
+        // `queries.len()` を乗じていなかった DoS 増幅の修正）。CPU 経路
+        // （`run_batch_search`）と同じ `compute_tenant_work` を使い、
+        // `常駐行列の全行数 × クエリ件数 × dim` を [`MAX_BATCH_WORK`] と照合する。
+        // GPU 経路はテナント別に走査を分けないため「全行数」を単一テナント分の
+        // 行数として扱う。これは実際に走査しうる最大の行集合（テナント絞り込み
+        // 後の集合の superset）であり、CPU 経路のテナント別合算と同じか
+        // それより厳しい側に倒れる保守的な上界になる。
+        // `compute_tenant_work` はオーバーフローのみ `Err` にする（`compute_batch_work`
+        // が合算後に上限照合する設計のため）。GPU 経路にはテナント別の合算対象が
+        // ないため、ここで直接 [`MAX_BATCH_WORK`] とも照合する。
+        let total_work =
+            compute_tenant_work(self.matrix.row_count(), queries.len(), self.matrix.dim())
+                .map_err(BatchExecError::Input)?;
+        if total_work > MAX_BATCH_WORK {
+            return Err(BatchExecError::Input(
+                crate::batch_search::BatchSearchError::WorkBudgetExceeded {
+                    work: total_work,
+                    max: MAX_BATCH_WORK,
+                },
+            ));
+        }
+
         let ctx = match global_context() {
             Ok(ctx) => ctx,
             Err(msg) => {
@@ -522,9 +550,11 @@ fn gpu_chunk_row_capacity(ctx: &GpuContext) -> usize {
 
 /// クエリ `ctx` から見て到達可能な行の index 列を求める（CORE-2 の単一照合
 /// パス `PolicyContext::is_visible` を使う。テナント文字列の独自比較はしない）。
-/// 計算量ガード: 収集前に `rows * 1 query * dim` を [`MAX_BATCH_WORK`] と
-/// 照合する（`run_batch_search` のテナント別精緻化より粗いが安全側。
-/// Issue #178 スコープ縮小事項）。
+/// 計算量ガードの主防御線は呼び出し元 [`GpuBatchBackend::batch_search`] 冒頭の
+/// `compute_tenant_work(rows, queries.len(), dim)` 総量チェック（`queries.len()`
+/// を乗じた上界）であり、本関数内の `rows * 1 query * dim` チェックはその後段の
+/// 防御的な二重チェックに過ぎない（単独では `queries.len()` を考慮しないため
+/// 総量ガードの代替にはならない）。
 fn gather_reachable_rows(
     matrix: &crate::batch_search::ResidentMatrix,
     ctx: &PolicyContext,
@@ -787,6 +817,39 @@ mod tests {
     fn f32_vec_from_ne_bytes_rejects_truncated_input() {
         let bytes = vec![0u8, 1, 2];
         assert!(f32_vec_from_ne_bytes(&bytes).is_empty());
+    }
+
+    // 回帰テスト（Issue #178 レビュー指摘対応）: GPU 経路は以前
+    // `gather_reachable_rows` 内で `rows * dim`（1 クエリ分）しか
+    // 見積もらず `queries.len()` を乗じていなかったため、単発クエリでは
+    // 予算内でもクエリ件数が多いバッチで総計算量が
+    // `MAX_BATCH_WORK` を大幅に超過しうる DoS 増幅の穴があった。
+    // `GpuBatchBackend::batch_search` はいまや dispatch 前に
+    // `compute_tenant_work(rows, queries.len(), dim)` で `rows × queries ×
+    // dim` を求め、[`MAX_BATCH_WORK`] と直接照合してから dispatch する
+    // （CPU 経路と同じ計算式。`compute_tenant_work` 自体はオーバーフロー
+    // のみを `Err` にする関数のため、超過判定は呼び出し側の責務——
+    // `batch_search` 本体と同じ手順をここで直接再現して検証する）。
+    // ここでは GPU デバイスなしで検証できるよう、1 クエリ分
+    // （`rows * dim`）は `MAX_BATCH_WORK` 未満だが、`queries.len()` 倍
+    // すると超過するケースで超過判定が働くことを確認する。
+    #[test]
+    fn compute_tenant_work_total_exceeds_budget_when_query_count_multiplied_in() {
+        let rows = 2_000_000usize;
+        let dim = 2_000usize;
+        let single_query_work = rows.checked_mul(dim).expect("fixture should not overflow");
+        assert!(
+            single_query_work <= MAX_BATCH_WORK,
+            "fixture must stay within budget for a single query: {single_query_work}"
+        );
+
+        let queries = 4_096usize; // MAX_BATCH_QUERIES
+        let total_work =
+            compute_tenant_work(rows, queries, dim).expect("fixture total must not overflow usize");
+        assert!(
+            total_work > MAX_BATCH_WORK,
+            "fixture must exceed budget once query count is multiplied in: {total_work}"
+        );
     }
 
     #[test]
