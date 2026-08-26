@@ -56,7 +56,11 @@
 //!   差も乗る。ここで可視化しているのは「エンドツーエンドの SIMD 並列経路 vs
 //!   スカラー参照経路」の実測比であり、内積カーネルのみを差し替えた SIMD 単独効果の
 //!   測定ではない点に注意する。合否には数えない（`sql_c1_bench.rs::diagnostic_ab`
-//!   と同型）。
+//!   と同型）。CORE-3/CORE-4 とは別に `DIAG_AB_ROW_COUNT`（小さい専用件数）・
+//!   プロトコル下限ちょうどの反復回数（warmup 20 回・計測 20 回）を使う
+//!   （Issue #177 codex-review 指摘: `ROW_COUNT` 全件・warmup 20 回＋計測 50 回を
+//!   合否に数えない診断でも流用すると、B 側の逐次内積＋全件 `sort_by` が
+//!   `.github/workflows/bench.yml` の `timeout-minutes: 30` を圧迫し得たため）。
 //!
 //! 数値基準（p95 上限・Recall 下限）・測定条件は spec（TASK-127）が SSOT。本ファイルには
 //! 数値そのものをハードコードせず、実行時に環境変数（`BENCH_MAX_P95_MS`・
@@ -103,6 +107,18 @@ const TOP_K: usize = 20;
 /// 単一クエリでの偶然の完全一致に判定全体が引きずられないようにする。
 /// 本数自体は本ベンチ独自の実装選択で spec 由来の値ではない）。
 const RECALL_QUERY_COUNT: usize = 20;
+
+/// 診断 A/B（合否に数えない `run_ab` 計測）専用の行数（Issue #177 codex-review
+/// 指摘対応）。CORE-3/CORE-4 は `ROW_COUNT`（100,000 件）の全件を判定根拠として
+/// 使う必要があるため変更しないが、診断 A/B は合否に数えない参考値であり、B 側
+/// （`top_k_ids_scalar`）が `ROW_COUNT` 全件の逐次内積＋`sort_by` を warmup 20 回＋
+/// 計測 50 回（`DIAG_AB_CONFIG` 参照）実行すると、GitHub ホステッド runner・
+/// `.github/workflows/bench.yml` の `timeout-minutes: 30` 制約下で恒常的な
+/// タイムアウト要因になり得た（約 54 億要素分の逐次演算＋70 回の O(n log n) ソート）。
+/// 診断が示したいのは「SIMD 並列経路 vs スカラー参照経路」の比率であり、比率の
+/// 意味は行数に依存しないため、CORE-3/CORE-4 用データセットとは別に小さい専用
+/// データセットを生成して用いる。
+const DIAG_AB_ROW_COUNT: usize = 2_000;
 
 /// `BENCH_MAX_P95_MS` 環境変数（ミリ秒・整数）を読み取り、CORE-3・SEARCH-4 の
 /// p95 上限として使う `Duration` を得る。未設定・非数値・0 以下は fail-closed で
@@ -306,14 +322,30 @@ fn main() {
     // 経由するため、`median_ratio` には並列化効果・Top-k 選出アルゴリズム差・
     // 割り当て/ソート量の差も乗る。ここで可視化するのは「エンドツーエンドの SIMD
     // 並列経路 vs スカラー参照経路」の実測比である。
+    //
+    // CORE-3/CORE-4 と同じ `ids`/`vectors`（`ROW_COUNT` 件）・`config`（warmup 20 回・
+    // 計測 50 回）を流用すると、B 側の `top_k_ids_scalar` が呼び出しのたびに
+    // `ROW_COUNT × DIM` 要素の逐次内積と `ROW_COUNT` 件全体の `sort_by` を行うため、
+    // 合否に数えない診断のためだけに大きな計算コストが warmup+計測の 70 回分
+    // 乗ってしまう（`.github/workflows/bench.yml` の `timeout-minutes: 30` を
+    // 圧迫し得る。Issue #177 codex-review 指摘）。診断が示したいのは比率であって
+    // 絶対値ではないため、専用の小さいデータセット（`DIAG_AB_ROW_COUNT` 件）と
+    // プロトコル下限ちょうどの反復回数（warmup 20 回・計測 20 回）で行う。
+    let mut diag_ids: Vec<u64> = Vec::with_capacity(DIAG_AB_ROW_COUNT);
+    let mut diag_vectors = Vec::with_capacity(DIAG_AB_ROW_COUNT * DIM);
+    for i in 0..DIAG_AB_ROW_COUNT {
+        diag_ids.push(i as u64);
+        diag_vectors.extend(rng.next_vector(DIM));
+    }
+    let diag_config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
     let ab_query = rng.next_vector(DIM);
     match run_ab(
-        &config,
+        &diag_config,
         || -> Vec<u64> {
             provider
                 .search(SearchInput {
-                    ids: &ids,
-                    vectors: &vectors,
+                    ids: &diag_ids,
+                    vectors: &diag_vectors,
                     dim: DIM as u32,
                     query: &ab_query,
                     k: TOP_K,
@@ -324,13 +356,13 @@ fn main() {
                 .collect()
         },
         || -> Vec<u64> {
-            top_k_ids_scalar(&ids, &vectors, DIM, &ab_query, TOP_K)
+            top_k_ids_scalar(&diag_ids, &diag_vectors, DIM, &ab_query, TOP_K)
                 .expect("well-formed synthetic input yields a scalar reference top-k")
         },
     ) {
         Ok(ab) => {
             println!(
-                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail)",
+                "diagnostic_ab(end_to_end_simd_parallel_path_vs_scalar_reference_path, not isolated to SIMD kernel alone): rows={DIAG_AB_ROW_COUNT} dim={DIM} k={TOP_K} a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail; small dedicated dataset, not comparable to p95_latency's rows={ROW_COUNT} figure)",
                 ab.a.summary.median, ab.b.summary.median, ab.median_ratio
             );
         }
