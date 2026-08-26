@@ -14,9 +14,9 @@
 TASK-162 で `precision` モードの実行契約（確信度ゲート・空集合 fail-closed）が
 実装されたが、その既定閾値（`precision.rs` の `DEFAULT_*` 定数）と SEARCH-10 の
 評価基準はいずれも実測未了だった。本タスクは `tests/hybrid_recall.rs`
-（TASK-104）・`tests/rerank_recall.rs`（TASK-108）と同じ「決定的合成コーパス＋
-2 層構成（層 A 固定値回帰／層 B spec 閾値ゲート）」方式で `precision` 専用の評価
-ハーネスを追加し、目標値確定の判断材料を提示することが目的。
+（TASK-104）・`tests/rerank_recall.rs`（TASK-108）と同じ決定的合成コーパス方式で
+`precision` 専用の評価ハーネスを追加し、目標値確定の判断材料を提示することが目的。
+2 層構成は「層 A 構造不変条件・決定性／層 B 環境変数閾値ゲート」とする。
 
 **目標値の確定そのもの・SEARCH-10 期待欄の更新は本タスクのスコープ外**
 （下記「申し送り」参照）。指標の正式な定義・実測値・パラメータ感度は spec 側
@@ -29,6 +29,14 @@ TASK-162 で `precision` モードの実行契約（確信度ゲート・空集�
 sql_precision_mode.rs` と同じ流儀）のみで測定する。直接呼ぶと `sql/exec.rs` の配線
 （`k_eff` の拡張・正規化 RRF の適用等）をテスト側で再実装することになり production
 と乖離しうるため。
+
+3 指標（Top-1 Accuracy・MRR@10・誤返却率）はいずれも `USING MODE 'precision'` の
+クエリが返した行から算出する。MRR@10 を `recall` モードの結果で測ると確信度ゲート・
+`PrecisionPolicy` が指標に反映されず `PRECISION_EVAL_MIN_MRR10` が別モードの品質を
+判定してしまうため（PR #212 codex-review P1）。ゲートが空集合へ倒したクエリは
+寄与 0 として Q+ 件数の分母に算入する。返却行数は `PrecisionPolicy::max_results`
+で上限が決まるため、順位の広がりは感度スイープで `max_results` を広げたときにのみ
+現れ、既定値（1 件）では MRR@10 は Top-1 Accuracy と構造的に一致する。
 
 ランキングは **hybrid**（`hybrid_rrf(embedding, ..., body, ...)`）を主、**dense**
 （`embedding <=> ...`）を副として同一コーパスで併測する（`PrecisionPolicy` が
@@ -53,13 +61,16 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
 
 ## 2 層構成と spec 閾値の扱い
 
-- **層 A**（`#[test]`。`make ci` 対象）: 決定的コーパスの実測値を固定値アサーション
-  で回帰トラッキングする。spec の数値基準は使わない。
+- **層 A**（`#[test]`。`make ci` 対象）: production の SQL 経路で評価を通しで実行し、
+  構造不変条件（カウンタの上下関係・`PrecisionPolicy::max_results` の遵守・指標が
+  `[0.0, 1.0]` に収まること）と測定の決定性のみを検査する。指標の実測値はアサート
+  も出力もしない——public リポジトリ・public な Actions ログに実測値を残さないため
+  （`.claude/rules/spec-confidentiality.md`）。品質の回帰判定は層 B だけが行う。
 - **層 B**（`#[ignore]`。`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
   `PRECISION_EVAL_MIN_MRR10`（`(0.0, 1.0]`）・`PRECISION_EVAL_MAX_FALSE_RETURN`
   （`[0.0, 1.0)`。`1.0` は常時 pass＝fail-open のため拒否）を環境変数から解決する。
-  未設定は非 strict では「対象外」で成功終了、`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`
-  で fail-closed。非数値・範囲外は常に fail-closed。ログには実測値と pass/fail の
+  未設定は非 strict では「評価は実行するが判定はスキップ（対象外）」として成功終了、
+  `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で fail-closed。非数値・範囲外は常に fail-closed。ログには実測値と pass/fail の
   みを出力し、閾値の数値は出力しない（`hybrid_recall.rs::resolve_gate_threshold`
   と同型）。
 - **`.github/workflows/recall.yml` への接続は本 PR では行わない**: TASK-163 の
@@ -74,7 +85,8 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
 ## 実測結果・パラメータ感度・目標値確定の判断材料
 
 指標の実測値・感度スイープの結果・目標値確定のためのユーザー確認事項は
-public リポジトリへは転記しない（`.claude/rules/spec-confidentiality.md`）。
+public リポジトリ（本ドキュメント・テストコード・PR 本文）へは一切転記しない
+（`.claude/rules/spec-confidentiality.md`）。
 実測は `cargo test -p engine --test precision_eval -- --nocapture`、感度スイープ
 は `make precision-regression` の `precision_eval_policy_sweep`（`--ignored`）
 でローカル再現できる。結果の記録・判断は spec 側（上記ポインタ）で管理する。

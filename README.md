@@ -134,10 +134,11 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
 を参照してください（指標の定義・実測値・パラメータ感度は spec 側で管理します）。
 
 - 層 A（`cargo test -p engine --test precision_eval`。`make ci` 対象）: 決定的コーパス
-  での実測値を固定値で回帰トラッキングします。spec の数値基準は使いません。
+  上で評価を通しで実行し、構造不変条件と測定の決定性のみを検査します（指標の実測値は
+  アサートも出力もしません。品質の回帰判定は層 B が担います）。
 - 層 B（`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
-  （未設定ならローカルでは「ゲート未設定＝明示的に対象外」として成功終了。
+  （未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝明示的に対象外」として成功終了。
   `PRECISION_EVAL_REQUIRE_THRESHOLDS=1` で strict モード）による閾値ゲートと、
   `PrecisionPolicy` の閾値を差し替えるパラメータ感度スイープ
   （`precision_eval_policy_sweep`）を実行します。

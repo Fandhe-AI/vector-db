@@ -3,11 +3,15 @@
 //!
 //! `precision` モード（TASK-162。`crates/engine/src/precision.rs`）の評価基準を
 //! 実測する評価ハーネス。`tests/hybrid_recall.rs`（TASK-104）・
-//! `tests/rerank_recall.rs`（TASK-108）と同じ「決定的合成コーパス＋2 層構成
-//! （層 A 固定値回帰／層 B spec 閾値ゲート）」方式を踏襲する。SEARCH-10 の評価指標
-//! 定義・実測値・目標値確定の判断材料は spec 側（上記ポインタ）と
-//! `docs/design/precision-eval-regression.md` に記録し、本ファイルには転記しない
-//! （`.claude/rules/spec-confidentiality.md`）。
+//! `tests/rerank_recall.rs`（TASK-108）の決定的合成コーパス方式を踏襲しつつ、
+//! 2 層構成は「層 A 構造不変条件／層 B 閾値ゲート」とする。
+//!
+//! **SEARCH-10 の評価指標の実測値は public な本リポジトリに一切記録しない**
+//! （`.claude/rules/spec-confidentiality.md`。PR #212 codex-review P0）。実測値・
+//! パラメータ感度・目標値確定の判断材料の記録先は spec 側（上記ポインタ）であり、
+//! 本ファイル・`docs/design/precision-eval-regression.md` には具体値を書かない。
+//! 品質の回帰判定は層 B の `PRECISION_EVAL_*` 環境変数で注入された閾値との比較
+//! だけが行う。
 //!
 //! # 測定経路
 //!
@@ -22,26 +26,28 @@
 //!
 //! # 2 層構成
 //!
-//! - 層 A（`#[test]`・`make ci` 対象）: 決定的コーパスでの実測値を固定値アサーション
-//!   で回帰トラッキングする。spec の数値基準は使わない
-//!   （`.claude/rules/spec-confidentiality.md`）。
+//! - 層 A（`#[test]`・`make ci` 対象）: 評価を production の SQL 経路で通しで実行し、
+//!   構造不変条件（カウンタの上下関係・`PrecisionPolicy::max_results` の遵守・
+//!   指標が `[0.0, 1.0]` に収まること）と測定の決定性のみを検査する。指標の実測値は
+//!   アサートも出力もしない（値が public な Actions ログ・テストコードに残らない）。
 //! - 層 B（`#[ignore]`・`make precision-regression`）: `PRECISION_EVAL_MIN_TOP1_ACC`・
 //!   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
 //!   （`hybrid_recall.rs::resolve_gate_threshold` と同型の解決規則）による閾値ゲート。
-//!   `.github/workflows/recall.yml` への接続は本タスクでは行わない（README 参照）。
+//!   未設定時は「評価は実行するが判定はスキップ」（`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`
+//!   の strict モードでは fail-closed）。`.github/workflows/recall.yml` への接続は
+//!   本タスクでは行わない（README 参照）。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
 //!   小さな格子で差し替え、指標の変化を `println!` で表示する（目標値確定の判断
-//!   材料。production の既定値は変更しない。実測結果は
-//!   `docs/design/precision-eval-regression.md` 参照）。
+//!   材料。production の既定値は変更しない。結果の記録先は spec 側）。
 //!
 //! # TASK-158（性能計測プロトコル基盤）準拠
 //!
 //! 合成コーパスの疑似乱数は `harness::rng::DeterministicRng`（`#[path]` で
 //! `benches/harness/mod.rs` を取り込む。`tests/bench_harness.rs`・`tests/
 //! bench_accept.rs` と同一方式）を使う。決定的コーパス上の指標は入力の決定的関数
-//! であり、同一シードから常に同一値が再現される（層 A の固定値アサーションがその
-//! 保証を兼ねる）ため、warmup／計測回数・中央値等の時間計測プロトコルはレイテンシ
-//! 基準を持たない本タスクでは適用対象外とする。
+//! であり、同一シードから常に同一値が再現される（層 A の決定性検査がその保証を
+//! 兼ねる）ため、warmup／計測回数・中央値等の時間計測プロトコルはレイテンシ基準を
+//! 持たない本タスクでは適用対象外とする。
 
 #[allow(dead_code)]
 #[path = "../benches/harness/mod.rs"]
@@ -459,18 +465,6 @@ impl Ranking {
             ),
         }
     }
-
-    fn recall_top10_sql(self, query_text: &str, query_vector: &[f32]) -> String {
-        let vec_lit = vector_literal(query_vector);
-        match self {
-            Ranking::Hybrid => format!(
-                "SELECT * FROM docs ORDER BY hybrid_rrf(embedding, '{vec_lit}', body, '{query_text}') LIMIT 10 USING MODE 'recall'"
-            ),
-            Ranking::Dense => format!(
-                "SELECT * FROM docs ORDER BY embedding <=> '{vec_lit}' LIMIT 10 USING MODE 'recall'"
-            ),
-        }
-    }
 }
 
 /// SEARCH-10 の 3 指標＋診断値の実測結果（1 ランキング方式分）。
@@ -482,6 +476,9 @@ struct EvalResult {
     coverage_row_count: usize,
     mrr_hits_by_rank: BTreeMap<usize, usize>,
     false_returns: usize,
+    /// 1 クエリあたり返却行数の最大値（`PrecisionPolicy::max_results` の遵守を
+    /// 検査する構造不変条件用。[`precision_eval_hybrid_invariants`] 参照）。
+    max_result_rows: usize,
 }
 
 impl EvalResult {
@@ -491,7 +488,13 @@ impl EvalResult {
     }
 
     /// MRR@10 = Σ(1/rank) / n_qplus（`mrr_hits_by_rank` は `rank -> 件数` の集計。
-    /// 整数集計を保つことで層 A の固定値アサーションが浮動小数点丸めに依存しない）。
+    /// 順位は `precision` モードの返却列における最初の正解行の位置で、正解を含まない
+    /// クエリ・空集合クエリは寄与 0 として分母 `n_qplus` に算入する）。
+    ///
+    /// `PrecisionPolicy::max_results` が返却行数の上限であるため、順位の取りうる
+    /// 範囲は `1..=max_results` に限られる。既定ポリシー（`max_results == 1`）の下では
+    /// 本値は Top-1 Accuracy と構造的に一致し、順位の広がりは
+    /// [`precision_eval_policy_sweep`] で `max_results` を差し替えたときにのみ現れる。
     fn mrr10(&self) -> f64 {
         let sum: f64 = self
             .mrr_hits_by_rank
@@ -519,13 +522,11 @@ impl EvalResult {
         self.top1_hits as f64 / self.coverage_hits as f64
     }
 
-    /// 診断値: 非空クエリ 1 件あたりの平均返却行数。SEARCH-10 の 3 指標
-    /// （Top-1 Accuracy・MRR@10・誤返却率）はいずれもゲート通過の有無・先頭行のみに
-    /// 依存し `PrecisionPolicy::max_results` の値そのものには反応しない構造のため、
-    /// `precision_eval_policy_sweep` で `max_results` を差し替えても 3 指標が
-    /// 変化しない（`docs/design/precision-eval-regression.md` 記載の既知の観察）。
-    /// 本値は `max_results` の効果を直接反映する唯一の測定値として、感度スイープの
-    /// 判断材料に加える（層 A のアサート対象外）。
+    /// 診断値: 非空クエリ 1 件あたりの平均返却行数。Top-1 Accuracy・誤返却率は
+    /// ゲート通過の有無と先頭行のみに依存し `PrecisionPolicy::max_results` には
+    /// 反応しないため、`precision_eval_policy_sweep` で `max_results` の効果を
+    /// 読み取れるよう MRR@10（順位の広がりに反応する）と併せて表に出す
+    /// （閾値ゲートの判定対象外の診断値）。
     fn avg_result_rows(&self) -> f64 {
         if self.coverage_hits == 0 {
             return 0.0;
@@ -548,10 +549,12 @@ fn measure(
     let mut coverage_hits = 0usize;
     let mut coverage_row_count = 0usize;
     let mut mrr_hits_by_rank: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut max_result_rows = 0usize;
 
     for case in qa {
         let precision_sql = ranking.precision_sql(&case.query_text, &case.query_vector);
         let precision_ids = result_ids(core, ctx, &precision_sql);
+        max_result_rows = max_result_rows.max(precision_ids.len());
         if let Some(&top1) = precision_ids.first() {
             coverage_hits += 1;
             coverage_row_count += precision_ids.len();
@@ -560,9 +563,12 @@ fn measure(
             }
         }
 
-        let recall_sql = ranking.recall_top10_sql(&case.query_text, &case.query_vector);
-        let recall_ids = result_ids(core, ctx, &recall_sql);
-        if let Some(rank) = recall_ids
+        // MRR@10 も `precision` モードの返却列（`precision_sql`）から算出する。
+        // `recall` モードの結果で測ると確信度ゲート・`PrecisionPolicy` が指標に
+        // 反映されず、`PRECISION_EVAL_MIN_MRR10` が別モードの品質を判定してしまう
+        // （PR #212 codex-review P1）。ゲートが空集合へ倒したクエリ・正解を含まない
+        // クエリは順位を記録せず、寄与 0 として分母 `n_qplus` に算入する。
+        if let Some(rank) = precision_ids
             .iter()
             .position(|id| case.correct.contains(id))
             .map(|idx| idx + 1)
@@ -575,6 +581,7 @@ fn measure(
     for case in no_answer {
         let precision_sql = ranking.precision_sql(&case.query_text, &case.query_vector);
         let precision_ids = result_ids(core, ctx, &precision_sql);
+        max_result_rows = max_result_rows.max(precision_ids.len());
         if !precision_ids.is_empty() {
             false_returns += 1;
         }
@@ -588,6 +595,7 @@ fn measure(
         coverage_row_count,
         mrr_hits_by_rank,
         false_returns,
+        max_result_rows,
     }
 }
 
@@ -617,7 +625,7 @@ fn print_eval_result(label: &str, r: &EvalResult) {
     );
 }
 
-// ---------- 層 A: 固定値回帰トラッキング（`#[test]`。`make ci` 対象） ----------
+// ---------- 層 A: 構造不変条件・決定性の検査（`#[test]`。`make ci` 対象。実測値は扱わない） ----------
 
 const NUM_DOCS: usize = 850;
 const VOCAB_SIZE: usize = 100;
@@ -662,56 +670,101 @@ fn build_fixture() -> (
     (core, guard, ctx, qa, no_answer)
 }
 
-/// TASK-163（SEARCH-10）層 A: hybrid ランキング（主）での 3 指標を実測し、固定値で
-/// 回帰トラッキングする。決定的コーパス・QA/Q0 セットのため実測値は再現可能であり、
-/// `precision`／`recall` 検索カーネルへの変更で数値が変化した場合はこのテストが
-/// 失敗する。
-#[test]
-fn precision_eval_hybrid_regression() {
-    let (core, _guard, ctx, qa, no_answer) = build_fixture();
-    assert_eq!(qa.len(), 100, "重複除外後の Q+ 件数が変化した");
-    assert_eq!(no_answer.len(), 55, "Q0 件数が変化した");
-
-    let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
-    print_eval_result("hybrid", &r);
-
-    // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
-    // （[`generate_corpus`] のドロップアウト／デコイ）であるため、precision の
-    // 各指標は 1.0 に張り付かない。実測値を固定値で回帰トラッキングする
-    // （検索カーネル・ゲート・フィクスチャの変更で数値が変化した場合はこのテストが
-    // 失敗する）。
-    assert_eq!(r.top1_hits, 60, "hybrid Top-1 命中数が変化した");
-    assert_eq!(r.coverage_hits, 65, "hybrid coverage 件数が変化した");
-    // `rank -> 件数` の分布そのものを固定値アサートする（`.values().sum()` のみだと
-    // 総ヒット件数は不変のまま順位が入れ替わる劣化（例: 1 位ヒットが 5 位へ後退）を
-    // 検知できないため。BTreeMap の `Debug` 出力はキー昇順で決定的）。
-    assert_eq!(
-        format!("{:?}", r.mrr_hits_by_rank),
-        "{1: 76, 2: 4, 3: 2, 4: 3, 5: 1, 6: 1, 7: 1, 8: 2, 9: 1, 10: 1}",
-        "hybrid MRR@10 の順位別命中分布が変化した"
+/// [`measure`] の結果が満たすべき構造不変条件を検査する（実測値そのものは
+/// 検査しない）。`EvalResult` の各カウンタは定義上の上下関係と `PrecisionPolicy`
+/// の返却行数上限に従うはずであり、これを破るのはハーネス・ゲート配線のバグ。
+/// 品質の良し悪しの判定は層 B（`PRECISION_EVAL_*` 閾値ゲート）だけが行う
+/// （SEARCH-10 の実測値・目標値は spec 側で管理する。PR #212 codex-review P0）。
+fn assert_structural_invariants(r: &EvalResult, max_results: usize) {
+    assert!(r.n_qplus > 0 && r.n_qzero > 0, "評価セットが空");
+    assert!(
+        r.top1_hits <= r.coverage_hits && r.coverage_hits <= r.n_qplus,
+        "Top-1 命中数・coverage 件数の上下関係が破れた"
     );
-    assert_eq!(r.false_returns, 7, "hybrid 誤返却件数が変化した");
+    assert!(r.false_returns <= r.n_qzero, "誤返却件数が Q0 件数を超えた");
+    assert!(
+        r.max_result_rows <= max_results,
+        "precision モードが PrecisionPolicy::max_results を超える行を返した"
+    );
+    for (&rank, &count) in &r.mrr_hits_by_rank {
+        assert!(
+            rank >= 1 && rank <= max_results,
+            "MRR の順位が返却行数上限の範囲外"
+        );
+        assert!(count <= r.n_qplus, "順位別命中数が Q+ 件数を超えた");
+    }
+    assert!(
+        r.mrr_hits_by_rank.values().sum::<usize>() <= r.n_qplus,
+        "順位別命中数の総和が Q+ 件数を超えた"
+    );
+    for metric in [
+        r.top1_accuracy(),
+        r.mrr10(),
+        r.false_return_rate(),
+        r.coverage(),
+        r.conditional_top1_accuracy(),
+    ] {
+        assert!((0.0..=1.0).contains(&metric), "指標が [0.0, 1.0] の外");
+    }
 }
 
-/// TASK-163（SEARCH-10）層 A: dense ランキング（副）での 3 指標を実測し、固定値で
-/// 回帰トラッキングする（[`precision_eval_hybrid_regression`] と同一フィクスチャ・
-/// 同一契約）。
+/// 2 回の [`measure`] が完全に一致することを検査する（決定的コーパス上の指標は
+/// 入力の決定的関数であるという前提の検査。失敗時も実測値は出力しない）。
+fn assert_same_measurement(a: &EvalResult, b: &EvalResult) {
+    assert!(
+        a.n_qplus == b.n_qplus
+            && a.n_qzero == b.n_qzero
+            && a.top1_hits == b.top1_hits
+            && a.coverage_hits == b.coverage_hits
+            && a.coverage_row_count == b.coverage_row_count
+            && a.false_returns == b.false_returns
+            && a.max_result_rows == b.max_result_rows
+            && a.mrr_hits_by_rank == b.mrr_hits_by_rank,
+        "同一フィクスチャに対する測定が再現しなかった（非決定性）"
+    );
+}
+
+/// TASK-163（SEARCH-10）層 A: hybrid ランキング（主）の評価を production の SQL 経路
+/// で通しで実行し、構造不変条件と決定性のみを検査する。
+///
+/// 指標の実測値は public リポジトリに記録せず（`.claude/rules/spec-confidentiality.md`。
+/// 記録先は spec 側〔ポインタ: `docs/spec/05-tasks.md` TASK-163・
+/// `docs/spec/04-behavior/search.md` SEARCH-10〕）、品質の回帰判定は層 B の
+/// `PRECISION_EVAL_*` 閾値ゲート（[`precision_eval_threshold_gate`]）だけが行う。
+/// 本テストが守るのは「ハーネスが production 経路で完走し、結果が決定的で、
+/// `PrecisionPolicy` の契約を破らない」ことまで。
 #[test]
-fn precision_eval_dense_regression() {
+fn precision_eval_hybrid_invariants() {
+    let (core, _guard, ctx, qa, no_answer) = build_fixture();
+    // フィクスチャ規模の drift 検知（生成側の重複除外・生成規則が変わると崩れる）。
+    // 期待値はテスト内定数（`NUM_*`）から導かれるもので、実測値ではない。
+    assert_eq!(
+        qa.len(),
+        NUM_QPLUS_QUERIES,
+        "重複除外後の Q+ 件数がフィクスチャ定数と一致しない"
+    );
+    assert_eq!(
+        no_answer.len(),
+        NUM_QZERO_HARD_NEGATIVE + NUM_QZERO_OOV,
+        "Q0 件数がフィクスチャ定数と一致しない"
+    );
+
+    let max_results = PrecisionPolicy::default().max_results();
+    let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
+    assert_structural_invariants(&r, max_results);
+    assert_same_measurement(&r, &measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer));
+}
+
+/// TASK-163（SEARCH-10）層 A: dense ランキング（副）版
+/// （[`precision_eval_hybrid_invariants`] と同一フィクスチャ・同一契約）。
+#[test]
+fn precision_eval_dense_invariants() {
     let (core, _guard, ctx, qa, no_answer) = build_fixture();
 
+    let max_results = PrecisionPolicy::default().max_results();
     let r = measure(&core, &ctx, Ranking::Dense, &qa, &no_answer);
-    print_eval_result("dense", &r);
-
-    assert_eq!(r.top1_hits, 10, "dense Top-1 命中数が変化した");
-    assert_eq!(r.coverage_hits, 10, "dense coverage 件数が変化した");
-    // 理由は [`precision_eval_hybrid_regression`] のコメント参照（順位分布そのものを固定値アサートする）。
-    assert_eq!(
-        format!("{:?}", r.mrr_hits_by_rank),
-        "{1: 75, 2: 3, 3: 3, 5: 1, 8: 2, 10: 1}",
-        "dense MRR@10 の順位別命中分布が変化した"
-    );
-    assert_eq!(r.false_returns, 0, "dense 誤返却件数が変化した");
+    assert_structural_invariants(&r, max_results);
+    assert_same_measurement(&r, &measure(&core, &ctx, Ranking::Dense, &qa, &no_answer));
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make precision-regression` 専用） ----------
@@ -790,7 +843,8 @@ fn resolve_gate_threshold(var: &str, kind: ThresholdKind) -> Option<f64> {
 /// では「対象外」として明示的に成功終了し、strict モードでは fail-closed でテスト
 /// 失敗とする。設定済みで非数値・範囲外は常に fail-closed（`hybrid_recall.rs::
 /// hybrid_recall_small_scale_threshold_gate` と同一契約）。ログには実測値と
-/// pass/fail のみを出力し、注入された閾値の数値は出力しない。
+/// pass/fail のみを出力し、注入された閾値の数値は出力しない。3 指標はいずれも
+/// `precision` モードの返却列から算出する（[`measure`] 参照）。
 #[test]
 #[ignore = "spec 閾値（目標値。Actions variables 由来を想定）が必要なため既定では実行しない。make precision-regression で実行する"]
 fn precision_eval_threshold_gate() {
@@ -808,6 +862,9 @@ fn precision_eval_threshold_gate() {
 
     let (core, _guard, ctx, qa, no_answer) = build_fixture();
     let r = measure(&core, &ctx, Ranking::Hybrid, &qa, &no_answer);
+    // 実測値の出力は層 B（`make precision-regression`。`.github/workflows/ci.yml` の
+    // 対象外）に限る。層 A は public な Actions ログへ実測値を出さない。
+    print_eval_result("hybrid", &r);
 
     let mut pass = true;
     if let Some(min) = min_top1 {
@@ -865,11 +922,10 @@ fn precision_eval_policy_sweep() {
     let ctx = PolicyContext::new("precision-eval-tenant").expect("valid tenant");
 
     println!("=== TASK-163 precision パラメータ感度スイープ（hybrid。判断材料専用） ===");
-    // Top-1 Accuracy・MRR@10・誤返却率はゲート通過の有無・先頭行のみに依存し
-    // `max_results` そのものには反応しない（構造上の理由は [`EvalResult::
-    // avg_result_rows`] 参照）。`avg_result_rows`（非空クエリ 1 件あたりの平均返却
-    // 行数）を併記し、`max_results` を差し替えたことの効果が表から読み取れるように
-    // する。
+    // Top-1 Accuracy・誤返却率はゲート通過の有無と先頭行のみに依存し `max_results`
+    // には反応しない。MRR@10 は `max_results` を広げたときに 2 位以下の正解を拾い、
+    // `avg_result_rows`（非空クエリ 1 件あたりの平均返却行数）は返却量そのものを
+    // 表すため、この 2 つで `max_results` の効果が表から読み取れる。
     println!(
         "hybrid_min_top1  hybrid_min_margin  max_results  top1_acc  mrr10  false_return_rate  avg_result_rows"
     );
