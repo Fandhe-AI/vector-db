@@ -114,13 +114,14 @@ impl GpuParams {
     /// `to_ne_bytes` の連結だけでバイト列化する。フィールド順は WGSL の
     /// `Params` と一致させ、host/device 双方をネイティブエンディアンに揃える
     /// （native GPU バックエンドはホストと同一エンディアンで動作する前提）。
-    fn to_ne_bytes_vec(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(16);
+    fn to_ne_bytes_vec(self) -> Result<Vec<u8>, BatchBackendError> {
+        let mut out = Vec::new();
+        try_reserve_bytes(&mut out, 16)?;
         out.extend_from_slice(&self.dim_half.to_ne_bytes());
         out.extend_from_slice(&self.row_count.to_ne_bytes());
         out.extend_from_slice(&self._pad0.to_ne_bytes());
         out.extend_from_slice(&self._pad1.to_ne_bytes());
-        out
+        Ok(out)
     }
 }
 
@@ -137,6 +138,10 @@ struct GpuContext {
     /// デバイスロスト検知用ラッチ。`Device::set_device_lost_callback` から
     /// 更新される（コールバックは別スレッドから呼ばれうるため `AtomicBool`）。
     device_lost: std::sync::Arc<AtomicBool>,
+    /// error scope 外で発生した wgpu エラーのラッチ（`Device::on_uncaptured_error`
+    /// から更新）。既定ハンドラの panic を避けつつ、異常を握り潰さないための記録で、
+    /// `GpuBatchBackend::batch_search` が検知すると backend エラーを返して CPU 縮退へ倒す。
+    uncaptured_error: std::sync::Arc<AtomicBool>,
 }
 
 fn global_context() -> &'static Result<GpuContext, String> {
@@ -204,6 +209,24 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         device_lost_flag.store(true, Ordering::SeqCst);
     });
 
+    // error scope で捕捉しきれなかったエラーの既定ハンドラは panic しうる
+    // （wgpu の既定動作）。engine はライブラリクレートであり panic させない
+    // 契約（coding-rust.md）のため、独自ハンドラで `uncaptured_error` ラッチへ
+    // 記録するだけに置き換える。ラッチは次回以降の `batch_search` 冒頭で
+    // 参照され、GPU 経路を使わず CPU 縮退（CORE-8）へ倒すための入力になる
+    // （codex/Bugbot P1 指摘対応: scope 外の wgpu 操作が panic しうる問題）。
+    let uncaptured_error = std::sync::Arc::new(AtomicBool::new(false));
+    let uncaptured_error_flag = uncaptured_error.clone();
+    device.on_uncaptured_error(std::sync::Arc::new(move |_e: wgpu::Error| {
+        uncaptured_error_flag.store(true, Ordering::SeqCst);
+    }));
+
+    // シェーダ・レイアウト・パイプライン生成も error scope の内側で行う
+    // （codex P1 指摘対応: scope 外の生成失敗は uncaptured error 扱いになり、
+    // 上記ハンドラ導入前は panic しえた。ここで捕捉して `Err` へ写像する）。
+    let init_validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let init_oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("batch dot product"),
         source: wgpu::ShaderSource::Wgsl(DOT_SHADER_WGSL.into()),
@@ -235,6 +258,22 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         cache: None,
     });
 
+    // LIFO で pop する（後に push した OutOfMemory スコープを先に pop する）。
+    // 待機中も `device.poll` を駆動する（`block_on_with_device_poll`）ため、
+    // デバイスのポーリング待ちで無限スピンしない。
+    if block_on_with_device_poll(&device, init_oom_scope.pop())
+        .map_err(|_| "device poll failed during pipeline creation".to_string())?
+        .is_some()
+    {
+        return Err("gpu out of memory during pipeline creation".to_string());
+    }
+    if block_on_with_device_poll(&device, init_validation_scope.pop())
+        .map_err(|_| "device poll failed during pipeline creation".to_string())?
+        .is_some()
+    {
+        return Err("gpu validation error during pipeline creation".to_string());
+    }
+
     let max_workgroups_per_dimension = if adapter_limits.max_compute_workgroups_per_dimension > 0 {
         adapter_limits
             .max_compute_workgroups_per_dimension
@@ -251,6 +290,7 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
         max_workgroups_per_dimension,
         device_lost,
+        uncaptured_error,
     })
 }
 
@@ -284,6 +324,34 @@ fn pollster_free_block_on<F: std::future::Future>(fut: F) -> F::Output {
             Poll::Ready(v) => return v,
             Poll::Pending => std::thread::yield_now(),
         }
+    }
+}
+
+/// `device.poll` を駆動しながら future を完了させる同期化ヘルパー
+/// （codex/Bugbot P1 指摘対応: `push_error_scope`/`pop` の future は
+/// デバイスをポーリングするまで `Pending` のままになりうるため、
+/// [`pollster_free_block_on`] の自己ポーリングだけでは進行せずハングする）。
+/// ポーリング自体が失敗した場合はデバイス異常として `Err(())` を返し、
+/// 呼び出し元がデバイスロスト・初期化失敗として写像する。
+fn block_on_with_device_poll<F: std::future::Future>(
+    device: &wgpu::Device,
+    fut: F,
+) -> Result<F::Output, ()> {
+    use std::task::{Context, Poll, Waker};
+
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    let mut boxed = Box::pin(fut);
+    loop {
+        if let Poll::Ready(v) = boxed.as_mut().poll(&mut cx) {
+            return Ok(v);
+        }
+        // 送信済みコマンド・コールバックを進める。`PollType::Poll`（非ブロッキング）
+        // を使い、完了していなければ次のループで future を再ポーリングする。
+        if device.poll(wgpu::PollType::Poll).is_err() {
+            return Err(());
+        }
+        std::thread::yield_now();
     }
 }
 
@@ -325,6 +393,10 @@ pub struct GpuBatchBackend {
     /// デバイスが失われたか」を見るだけで、縮退の可否判断自体は
     /// `batch_fallback.rs` が担う）。
     device_lost: std::sync::Arc<AtomicBool>,
+    /// `GpuContext::uncaptured_error` と同一のラッチ（error scope 外で発生した
+    /// wgpu エラーの記録）。`batch_search` 冒頭で参照し、記録があれば GPU 経路を
+    /// 使わず backend エラーを返して CPU 縮退（CORE-8）へ倒す。
+    uncaptured_error: std::sync::Arc<AtomicBool>,
     /// バッファ生成・dispatch は `&self` から呼ばれる（`BatchBackend` が
     /// `&self` メソッドのみを要求する object-safe trait のため）。wgpu の
     /// `Queue::submit`/`Buffer` 操作自体は内部で同期を取るが、複数スレッドが
@@ -369,19 +441,42 @@ impl GpuBatchBackend {
             ));
         }
 
+        // 常駐行列バッファの確保・アップロードも error scope の内側で行い、
+        // 失敗を `InitFailed`（＝CPU 縮退）へ写像する（codex P1 指摘対応）。
+        let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let row_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("resident matrix packed rows"),
             size: packed_bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        ctx.queue
-            .write_buffer(&row_buffer, 0, &bytes_of_u32_slice(matrix.packed()));
+        let packed_staging = bytes_of_u32_slice(matrix.packed())?;
+        ctx.queue.write_buffer(&row_buffer, 0, &packed_staging);
+        let poll_failed =
+            || BatchBackendError::InitFailed("device poll failed during buffer upload".to_string());
+        if block_on_with_device_poll(&ctx.device, oom_scope.pop())
+            .map_err(|_| poll_failed())?
+            .is_some()
+        {
+            return Err(BatchBackendError::InitFailed(
+                "gpu out of memory while uploading the resident matrix".to_string(),
+            ));
+        }
+        if block_on_with_device_poll(&ctx.device, validation_scope.pop())
+            .map_err(|_| poll_failed())?
+            .is_some()
+        {
+            return Err(BatchBackendError::InitFailed(
+                "gpu validation error while uploading the resident matrix".to_string(),
+            ));
+        }
 
         Ok(Self {
             matrix,
             row_buffer,
             device_lost: ctx.device_lost.clone(),
+            uncaptured_error: ctx.uncaptured_error.clone(),
             dispatch_lock: Mutex::new(()),
         })
     }
@@ -390,37 +485,57 @@ impl GpuBatchBackend {
 /// `&[u32]` を `to_ne_bytes` で `&[u8]` 相当のバイト列へ変換する
 /// （`bytemuck` 不採用。依存最小方針）。返す `Vec<u8>` は呼び出し元が
 /// `Queue::write_buffer` へそのまま渡す想定の一時バッファ。
-fn bytes_of_u32_slice(values: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len().saturating_mul(4));
+fn bytes_of_u32_slice(values: &[u32]) -> Result<Vec<u8>, BatchBackendError> {
+    let mut out = Vec::new();
+    try_reserve_bytes(&mut out, values.len().saturating_mul(4))?;
     for v in values {
         out.extend_from_slice(&v.to_ne_bytes());
     }
-    out
+    Ok(out)
 }
 
-fn bytes_of_f32_slice(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len().saturating_mul(4));
+fn bytes_of_f32_slice(values: &[f32]) -> Result<Vec<u8>, BatchBackendError> {
+    let mut out = Vec::new();
+    try_reserve_bytes(&mut out, values.len().saturating_mul(4))?;
     for v in values {
         out.extend_from_slice(&v.to_ne_bytes());
     }
-    out
+    Ok(out)
+}
+
+/// ステージング用バイト列・`f32` 列のフォールブル確保ヘルパー
+/// （Cursor Bugbot / codex P1 指摘対応: `Vec::with_capacity` は確保失敗時に
+/// プロセスを abort するため、常駐行列・チャンク単位の数 MiB 級コピーでは使わない。
+/// 失敗は [`BatchBackendError::KernelLaunchFailed`] として返し、`FallbackBatchEngine`
+/// の CPU 縮退（CORE-8）が働く経路に載せる）。
+fn try_reserve_bytes(buf: &mut Vec<u8>, additional: usize) -> Result<(), BatchBackendError> {
+    buf.try_reserve_exact(additional).map_err(|_| {
+        BatchBackendError::KernelLaunchFailed("staging buffer allocation failed".to_string())
+    })
+}
+
+fn try_reserve_f32(buf: &mut Vec<f32>, additional: usize) -> Result<(), BatchBackendError> {
+    buf.try_reserve_exact(additional).map_err(|_| {
+        BatchBackendError::TransferFailed("readback buffer allocation failed".to_string())
+    })
 }
 
 /// GPU の readback バッファから `f32` 列を復元する（`from_ne_bytes`。
 /// `bytemuck` 不採用）。長さが 4 の倍数でない場合は空を返す（呼び出し元が
 /// バッファサイズを 4 の倍数で確保しているため通常到達しないが、fail-closed
 /// に空扱いで打ち切る）。
-fn f32_vec_from_ne_bytes(bytes: &[u8]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(bytes.len() / 4);
+fn f32_vec_from_ne_bytes(bytes: &[u8]) -> Result<Vec<f32>, BatchBackendError> {
+    let mut out = Vec::new();
+    try_reserve_f32(&mut out, bytes.len() / 4)?;
     let mut chunks = bytes.chunks_exact(4);
     for chunk in &mut chunks {
         let arr: [u8; 4] = match chunk.try_into() {
             Ok(a) => a,
-            Err(_) => return Vec::new(),
+            Err(_) => return Ok(Vec::new()),
         };
         out.push(f32::from_ne_bytes(arr));
     }
-    out
+    Ok(out)
 }
 
 impl BatchBackend for GpuBatchBackend {
@@ -430,6 +545,16 @@ impl BatchBackend for GpuBatchBackend {
                 "gpu device lost".to_string(),
             )));
         }
+        // error scope 外で発生した wgpu エラーが記録されていれば、GPU 経路を
+        // 信頼せず backend エラーとして返す（`FallbackBatchEngine` が CPU 縮退へ
+        // 倒す。codex/Bugbot P1 指摘対応の一部）。
+        if self.uncaptured_error.load(Ordering::SeqCst) {
+            return Err(BatchExecError::Backend(
+                BatchBackendError::KernelLaunchFailed(
+                    "gpu reported an uncaptured error".to_string(),
+                ),
+            ));
+        }
 
         // `FallbackBatchEngine::batch_search` が本メソッド呼び出し前に
         // `validate_batch_queries` を適用する契約だが（`batch_fallback.rs`
@@ -438,10 +563,12 @@ impl BatchBackend for GpuBatchBackend {
         // 再検証する（TASK-128 設計方針 §3.2 ポインタ）。
         validate_batch_queries(self.matrix.dim(), queries).map_err(BatchExecError::Input)?;
 
-        // dispatch 前の総量ガード（codex/Issue #178 レビュー指摘対応: GPU 経路が
-        // `queries.len()` を乗じていなかった DoS 増幅の修正）。
-        check_total_batch_work(self.matrix.row_count(), queries.len(), self.matrix.dim())
-            .map_err(BatchExecError::Input)?;
+        // dispatch 前の総量ガード（Issue #178 レビュー指摘対応: GPU 経路が
+        // `queries.len()` を乗じていなかった DoS 増幅の修正と、その後の
+        // codex/Bugbot P1 指摘対応: 全行 × 全クエリの直積で課金すると CPU 経路の
+        // テナント別合算では予算内の要求まで `Input` エラー〔＝CPU 縮退しない〕で
+        // 恒久的に拒否してしまうため、クエリごとの実到達行数で課金する）。
+        check_reachable_batch_work(&self.matrix, queries).map_err(BatchExecError::Input)?;
 
         let ctx = match global_context() {
             Ok(ctx) => ctx,
@@ -579,31 +706,58 @@ fn gpu_chunk_row_capacity(ctx: &GpuContext) -> usize {
     by_budget.min(by_workgroups).max(1)
 }
 
-/// [`GpuBatchBackend::batch_search`] の dispatch 前総量ガード本体
-/// （codex/Issue #178 レビュー指摘対応: GPU 経路が `gather_reachable_rows`
-/// 内で `rows × dim`（1 クエリ分）しか見積もらず `queries.len()` を
-/// 乗じていなかった DoS 増幅の修正）。CPU 経路（`run_batch_search`）と
-/// 同じ `compute_tenant_work` を使い、`常駐行列の全行数 × クエリ件数 ×
-/// dim` を [`MAX_BATCH_WORK`] と照合する。GPU 経路はテナント別に走査を
-/// 分けないため「全行数」を単一テナント分の行数として扱う。これは実際に
-/// 走査しうる最大の行集合（テナント絞り込み後の集合の superset）であり、
-/// CPU 経路のテナント別合算と同じかそれより厳しい側に倒れる保守的な
-/// 上界になる。
+/// [`GpuBatchBackend::batch_search`] の dispatch 前総量ガード本体。
 ///
-/// `compute_tenant_work` はオーバーフローのみ `Err` にする
-/// （`compute_batch_work` が合算後に上限照合する設計のため）。GPU 経路には
-/// テナント別の合算対象がないため、ここで直接 [`MAX_BATCH_WORK`] とも
-/// 照合する。名前付き関数として切り出すことで、この総量ガード自体を
-/// ハードウェア非依存にテストできるようにする（`tests` モジュール参照）。
-fn check_total_batch_work(
-    rows: usize,
-    queries: usize,
+/// CPU 経路（`batch_search.rs::run_batch_search`）は「テナントごとの行数 ×
+/// そのテナントのクエリ数 × dim」を合算して [`MAX_BATCH_WORK`] と照合する。
+/// GPU 経路も同じ基準に揃えるため、クエリごとに実際に走査する行
+/// （`PolicyContext::is_visible` を満たす行）の数だけを課金する
+/// （codex/Bugbot P1 指摘対応: 以前は「常駐行列の全行数 × 全クエリ数 × dim」の
+/// 直積で課金していたため、複数テナントが混在すると CPU 経路では予算内の要求まで
+/// 超過扱いになり、しかも超過は `BatchExecError::Input` として
+/// `FallbackBatchEngine` の CPU 縮退対象外＝恒久的な失敗になっていた）。
+///
+/// 事前走査のコストは `rows × queries` 回の可視性判定のみ（dim を乗じない）で、
+/// CPU 経路が本走査で行う判定回数と同じオーダーに収まる。
+fn check_reachable_batch_work(
+    matrix: &crate::batch_search::ResidentMatrix,
+    queries: &[BatchQuery<'_>],
+) -> Result<(), crate::batch_search::BatchSearchError> {
+    let mut counts: Vec<usize> = Vec::new();
+    try_reserve_exact(&mut counts, queries.len(), "gpu reachable row counts")?;
+    for q in queries {
+        let visible = matrix
+            .tenant_ids()
+            .iter()
+            .zip(matrix.visibilities().iter())
+            .filter(|(tenant, visibility)| q.ctx.is_visible(tenant, **visibility))
+            .count();
+        counts.push(visible);
+    }
+    check_batch_work_from_visible_counts(&counts, matrix.dim())
+}
+
+/// [`check_reachable_batch_work`] の判定本体（GPU デバイス非依存。
+/// 境界値をハードウェアなしでテストできるよう独立関数として切り出す）。
+/// 各要素は 1 クエリが実際に走査する行数で、`Σ(rows_q × dim)` を
+/// [`MAX_BATCH_WORK`] と照合する。オーバーフローは超過として扱う。
+fn check_batch_work_from_visible_counts(
+    visible_rows_per_query: &[usize],
     dim: usize,
 ) -> Result<(), crate::batch_search::BatchSearchError> {
-    let total_work = compute_tenant_work(rows, queries, dim)?;
-    if total_work > MAX_BATCH_WORK {
+    let mut total: usize = 0;
+    for rows in visible_rows_per_query {
+        let work = compute_tenant_work(*rows, 1, dim)?;
+        total = total.checked_add(work).ok_or(
+            crate::batch_search::BatchSearchError::WorkBudgetExceeded {
+                work: usize::MAX,
+                max: MAX_BATCH_WORK,
+            },
+        )?;
+    }
+    if total > MAX_BATCH_WORK {
         return Err(crate::batch_search::BatchSearchError::WorkBudgetExceeded {
-            work: total_work,
+            work: total,
             max: MAX_BATCH_WORK,
         });
     }
@@ -613,9 +767,9 @@ fn check_total_batch_work(
 /// クエリ `ctx` から見て到達可能な行の index 列を求める（CORE-2 の単一照合
 /// パス `PolicyContext::is_visible` を使う。テナント文字列の独自比較はしない）。
 /// 計算量ガードの主防御線は呼び出し元 [`GpuBatchBackend::batch_search`] 冒頭の
-/// [`check_total_batch_work`]（`queries.len()` を乗じた上界）であり、本関数内の
-/// `rows * 1 query * dim` チェックはその後段の防御的な二重チェックに過ぎない
-/// （単独では `queries.len()` を考慮しないため総量ガードの代替にはならない）。
+/// [`check_reachable_batch_work`]（クエリごとの実到達行数を合算した総量）であり、
+/// 本関数内の `rows * 1 query * dim` チェックはその後段の防御的な二重チェックに
+/// 過ぎない（単独ではクエリ件数を考慮しないため総量ガードの代替にはならない）。
 fn gather_reachable_rows(
     matrix: &crate::batch_search::ResidentMatrix,
     ctx: &PolicyContext,
@@ -663,7 +817,8 @@ fn dispatch_dot_products(
     }
     let row_count = row_indices.len() as u32;
 
-    let mut padded_query: Vec<f32> = Vec::with_capacity(query_stride);
+    let mut padded_query: Vec<f32> = Vec::new();
+    try_reserve_f32(&mut padded_query, query_stride)?;
     padded_query.extend_from_slice(query);
     padded_query.resize(query_stride, 0.0);
 
@@ -674,6 +829,12 @@ fn dispatch_dot_products(
         _pad1: 0,
     };
 
+    // バッファ・bind group の生成もすべて error scope の内側で行う
+    // （codex/Bugbot P1 指摘対応: 以前は encoder 直前で push していたため、
+    // 生成失敗が scope 外の uncaptured error になり panic しえた）。
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
     let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product params"),
         size: 16,
@@ -681,9 +842,9 @@ fn dispatch_dot_products(
         mapped_at_creation: false,
     });
     ctx.queue
-        .write_buffer(&params_buffer, 0, &params.to_ne_bytes_vec());
+        .write_buffer(&params_buffer, 0, &params.to_ne_bytes_vec()?);
 
-    let row_ids_bytes = bytes_of_u32_slice(row_indices);
+    let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
     let row_ids_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product row ids"),
         size: row_ids_bytes.len() as u64,
@@ -692,7 +853,7 @@ fn dispatch_dot_products(
     });
     ctx.queue.write_buffer(&row_ids_buffer, 0, &row_ids_bytes);
 
-    let query_bytes = bytes_of_f32_slice(&padded_query);
+    let query_bytes = bytes_of_f32_slice(&padded_query)?;
     let query_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product query"),
         size: query_bytes.len() as u64,
@@ -742,9 +903,6 @@ fn dispatch_dot_products(
         ],
     });
 
-    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -765,8 +923,14 @@ fn dispatch_dot_products(
     ctx.queue.submit(std::iter::once(encoder.finish()));
 
     // LIFO で pop する（後に push した OutOfMemory スコープを先に pop する）。
-    let oom_err = pollster_free_block_on(oom_scope.pop());
-    let validation_err = pollster_free_block_on(validation_scope.pop());
+    // `pop()` の future はデバイスがポーリングされるまで `Pending` のままに
+    // なりうるため、待機中も `device.poll` を駆動する（codex/Bugbot P1 指摘対応:
+    // 自己ポーリングのみだと後続の readback ポーリングへ到達できずハングする）。
+    let poll_failed = || BatchBackendError::DeviceLost("device poll failed".to_string());
+    let oom_err =
+        block_on_with_device_poll(&ctx.device, oom_scope.pop()).map_err(|_| poll_failed())?;
+    let validation_err = block_on_with_device_poll(&ctx.device, validation_scope.pop())
+        .map_err(|_| poll_failed())?;
     if let Some(e) = oom_err {
         return Err(BatchBackendError::KernelLaunchFailed(format!(
             "gpu out of memory: {e}"
@@ -835,7 +999,7 @@ fn dispatch_dot_products(
         let view = slice.get_mapped_range().map_err(|e| {
             BatchBackendError::TransferFailed(format!("get_mapped_range failed: {e}"))
         })?;
-        f32_vec_from_ne_bytes(&view)
+        f32_vec_from_ne_bytes(&view)?
     };
     readback_buffer.unmap();
 
@@ -858,7 +1022,7 @@ mod tests {
         // u32 バイト列と f32 バイト列は別関数だが、ラウンドトリップ可能な
         // エンコード（native endian の 4 byte 固定）であることだけを確認する。
         let values = [0u32, 1, u32::MAX, 42];
-        let bytes = bytes_of_u32_slice(&values);
+        let bytes = bytes_of_u32_slice(&values).expect("small staging buffer must allocate");
         assert_eq!(bytes.len(), 16);
         let mut restored = Vec::new();
         for chunk in bytes.chunks_exact(4) {
@@ -871,33 +1035,26 @@ mod tests {
     #[test]
     fn f32_vec_from_ne_bytes_round_trips() {
         let values = [0.0f32, 1.5, -3.25, f32::MIN, f32::MAX];
-        let bytes = bytes_of_f32_slice(&values);
-        let restored = f32_vec_from_ne_bytes(&bytes);
+        let bytes = bytes_of_f32_slice(&values).expect("small staging buffer must allocate");
+        let restored = f32_vec_from_ne_bytes(&bytes).expect("small readback buffer must allocate");
         assert_eq!(restored, values);
     }
 
     #[test]
     fn f32_vec_from_ne_bytes_rejects_truncated_input() {
         let bytes = vec![0u8, 1, 2];
-        assert!(f32_vec_from_ne_bytes(&bytes).is_empty());
+        assert!(f32_vec_from_ne_bytes(&bytes)
+            .expect("small readback buffer must allocate")
+            .is_empty());
     }
 
     // 回帰テスト（Issue #178 レビュー指摘対応）: GPU 経路は以前
-    // `gather_reachable_rows` 内で `rows * dim`（1 クエリ分）しか
-    // 見積もらず `queries.len()` を乗じていなかったため、単発クエリでは
-    // 予算内でもクエリ件数が多いバッチで総計算量が
-    // `MAX_BATCH_WORK` を大幅に超過しうる DoS 増幅の穴があった。
-    // `GpuBatchBackend::batch_search` はいまや dispatch 前に
-    // [`check_total_batch_work`] を呼び、`rows × queries × dim` を
-    // [`MAX_BATCH_WORK`] と直接照合してから dispatch する（CPU 経路と
-    // 同じ計算式）。GPU デバイスなしで検証できるよう、`batch_search` が
-    // 呼ぶのと同じ named function を直接呼ぶ（ガードを削除・弱体化すると
-    // このテストが直接落ちる。関数呼び出し経由で `batch_search` 本体の
-    // 挙動をここで再現しているだけの assert ではない）。
-    // 1 クエリ分（`rows * dim`）は `MAX_BATCH_WORK` 未満で許可され、
-    // `queries.len()` 倍すると超過して拒否されることの両方を確認する。
+    // `gather_reachable_rows` 内で `rows * dim`（1 クエリ分）しか見積もらず
+    // クエリ件数を乗じていなかったため、単発クエリでは予算内でもクエリ件数が
+    // 多いバッチで総計算量が `MAX_BATCH_WORK` を大幅に超過しうる DoS 増幅の
+    // 穴があった。判定本体（GPU デバイス非依存）を直接呼んで検証する。
     #[test]
-    fn check_total_batch_work_multiplies_query_count_into_the_budget() {
+    fn batch_work_budget_accumulates_across_queries() {
         let rows = 2_000_000usize;
         let dim = 2_000usize;
         let single_query_work = rows.checked_mul(dim).expect("fixture should not overflow");
@@ -906,17 +1063,87 @@ mod tests {
             "fixture must stay within budget for a single query: {single_query_work}"
         );
         assert!(
-            check_total_batch_work(rows, 1, dim).is_ok(),
+            check_batch_work_from_visible_counts(&[rows], dim).is_ok(),
             "a single query within budget must be accepted"
         );
 
-        let queries = 4_096usize; // MAX_BATCH_QUERIES
-        match check_total_batch_work(rows, queries, dim) {
+        let counts = vec![rows; 4_096]; // MAX_BATCH_QUERIES
+        match check_batch_work_from_visible_counts(&counts, dim) {
             Err(crate::batch_search::BatchSearchError::WorkBudgetExceeded { .. }) => {}
-            other => panic!(
-                "expected WorkBudgetExceeded once query count is multiplied in, got {other:?}"
-            ),
+            other => {
+                panic!("expected WorkBudgetExceeded once query count is accumulated, got {other:?}")
+            }
         }
+    }
+
+    // 回帰テスト（codex/Bugbot P1 指摘対応）: 課金対象はクエリごとの実到達行数で
+    // あり「常駐行列の全行数 × 全クエリ数」の直積ではない。テナント分離により
+    // 各クエリが常駐行列の一部しか走査しない構成では、直積課金だと超過扱いに
+    // なる要求が受理されることを確認する（超過は `Input` エラーとして CPU 縮退の
+    // 対象外になるため、過大課金は成功可能な検索の恒久的失敗を招く）。
+    #[test]
+    fn batch_work_budget_bills_reachable_rows_not_the_cartesian_product() {
+        // 100 テナント × 各 10,000 行 = 全 1,000,000 行の常駐行列に、
+        // テナントごとに 1 本ずつ（計 100 本）のクエリが来る構成を模す。
+        let total_rows = 1_000_000usize;
+        let queries = 100usize;
+        let reachable_per_query = total_rows / queries;
+        let dim = 768usize;
+
+        // 直積課金（旧実装）: 全行 × 全クエリ × dim は予算を大きく超える。
+        let cartesian = total_rows.saturating_mul(queries).saturating_mul(dim);
+        assert!(
+            cartesian > MAX_BATCH_WORK,
+            "fixture must exceed the budget under the old cartesian billing"
+        );
+
+        // 実到達行数課金（本実装）: Σ(到達行数 × dim) は予算内であり受理される。
+        let counts = vec![reachable_per_query; queries];
+        assert!(
+            check_batch_work_from_visible_counts(&counts, dim).is_ok(),
+            "a batch that the cpu path would accept must not be rejected by the gpu guard"
+        );
+
+        // 予算を実際に超える構成は引き続き拒否される（ガードの弱体化防止）。
+        let over_budget = vec![total_rows; queries];
+        match check_batch_work_from_visible_counts(&over_budget, dim) {
+            Err(crate::batch_search::BatchSearchError::WorkBudgetExceeded { .. }) => {}
+            other => {
+                panic!("expected WorkBudgetExceeded for a genuinely oversized batch, got {other:?}")
+            }
+        }
+    }
+
+    // `check_reachable_batch_work` が常駐行列の可視性判定（`PolicyContext::is_visible`）
+    // を通して行数を数えること（他テナントの Private 行を課金対象にしないこと）を、
+    // GPU デバイスなしで確認する。
+    #[test]
+    fn reachable_batch_work_counts_only_visible_rows() {
+        let ids = vec![1u64, 2, 3];
+        let tenant_ids = vec!["a".to_string(), "b".to_string(), "a".to_string()];
+        let visibilities = vec![
+            Visibility::Private,
+            Visibility::Private,
+            Visibility::Private,
+        ];
+        let matrix = crate::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            2,
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+        let ctx = PolicyContext::with_visibilities("a", [Visibility::Private])
+            .expect("policy context with explicit visibilities should build");
+        let query = [1.0f32, 0.0];
+        let queries = [BatchQuery {
+            vector: &query,
+            k: 2,
+            ctx: &ctx,
+        }];
+        // テナント a の 2 行のみが課金対象（テナント b の Private 行は不可視）。
+        assert!(check_reachable_batch_work(&matrix, &queries).is_ok());
     }
 
     #[test]

@@ -55,9 +55,21 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - `request_device` の `required_limits` は adapter の実測 limits をそのまま
   要求する。常駐行列（`packed()`）のバイト数が
   `max_storage_buffer_binding_size` を超える場合は `InitFailed`（CPU 縮退へ）
-- `device.on_uncaptured_error` 相当の防御として `push_error_scope`/
-  `pop_error_scope`（LIFO）で Validation/OutOfMemory を捕捉し、
-  `set_device_lost_callback` でデバイスロストをラッチする
+- `push_error_scope`/`pop`（LIFO）で Validation/OutOfMemory を捕捉する。scope は
+  バッファ・bind group の生成前（dispatch）／シェーダ・パイプライン生成前
+  （初期化）から張り、生成失敗も scope 内へ収める。加えて
+  `device.on_uncaptured_error` で scope 外エラーをラッチし（既定ハンドラの panic を
+  回避）、検知後の `batch_search` は backend エラーを返して CPU 縮退へ倒す。
+  `set_device_lost_callback` でデバイスロストもラッチする
+- error scope の `pop()` は `device.poll` を駆動しながら待つ
+  （`block_on_with_device_poll`）。自己ポーリングのみだとデバイスのポーリング待ちで
+  無限スピンしうるため
+- ステージング用のバイト列・readback の `f32` 列は `try_reserve_exact` で
+  フォールブルに確保する（`Vec::with_capacity` の abort-on-OOM を避け、確保失敗も
+  CPU 縮退可能な backend エラーとして返す）
+- dispatch 前の計算量ガードはクエリごとの実到達行数（`is_visible` を満たす行数）
+  × dim を合算して照合する。全行 × 全クエリの直積で課金すると、CPU 経路では
+  予算内の要求まで `Input` エラー（＝縮退対象外）で恒久的に拒否してしまうため
 - WGSL は `const` 文字列で埋め込み（外部ファイル読み込みなし）。
   `unpack2x16float`（コア機能。`shader-f16` 拡張不要）で
   `batch_search.rs::pack_f16x2` と同じビット解釈の f16 → f32 復元を行い、
