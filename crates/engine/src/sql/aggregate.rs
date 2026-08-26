@@ -1,4 +1,7 @@
 //! 集計 SELECT（`GROUP BY` なし・単一行結果、TASK-166・SQL-13）の実行本体。
+//! `GROUP BY` ありの複数行実行は [`crate::sql::group_by::execute_grouped_aggregate`]
+//! （TASK-167・SQL-14）が担い、[`execute_aggregate`] は `BoundAggregate::group_by`
+//! の有無で振り分けるだけの薄い分岐を持つ。
 //!
 //! 責務境界: [`crate::sql::parser::bind_aggregate`] が返す
 //! [`crate::sql::parser::BoundAggregate`] を受け取り、対象テーブルの行テーブル
@@ -39,7 +42,7 @@ use redb::ReadableTable;
 /// 通過したはずの `(AggregateFunc, AggregateInput)` の組み合わせが
 /// [`Accumulator::new`] の網羅から漏れていた場合に返す（実装バグの検出用。
 /// untrusted 入力起因ではないため `wire_code` は `XX000`）。
-fn accumulator_bug(detail: &str) -> SqlSurfaceError {
+pub(crate) fn accumulator_bug(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: format!("aggregate accumulator/input type mismatch: {detail}"),
     }
@@ -49,7 +52,7 @@ fn accumulator_bug(detail: &str) -> SqlSurfaceError {
 /// （`TextMin`/`TextMax` のみ、新しい極値を更新するたびに高々 1 本の `String` を
 /// 保持し直す。`.claude/rules/security.md`「不安全な設計｜無制限リソース確保
 /// （DoS）」対応）。
-enum Accumulator {
+pub(crate) enum Accumulator {
     /// `COUNT(*)`・`COUNT(id)`・`COUNT(<VECTOR 列>)`・`COUNT(<Scalar 式>)`。
     Count(u64),
     /// `SUM(id)`。`checked_add` で正確に演算し、超過は [`SqlSurfaceError::numeric_out_of_range`]。
@@ -80,7 +83,10 @@ impl Accumulator {
     /// 済みの `(func, input)` から初期状態を作る。ここで到達しない組み合わせが
     /// あれば `bind_aggregate` 側のバグであり、[`accumulator_bug`] で fail-closed に
     /// 拒否する（黙って `Count(0)` 等へ縮退しない）。
-    fn new(func: AggregateFunc, input: &AggregateInput) -> Result<Self, SqlSurfaceError> {
+    pub(crate) fn new(
+        func: AggregateFunc,
+        input: &AggregateInput,
+    ) -> Result<Self, SqlSurfaceError> {
         use AggregateFunc::{Avg, Count, Max, Min, Sum};
         Ok(match (func, input) {
             (Count, _) => Accumulator::Count(0),
@@ -106,7 +112,7 @@ impl Accumulator {
 
     /// 可視行 1 件を観測して状態を更新する。`scanned` は同じ行の
     /// `row_codec::scan_scalar_columns` 結果（借用のまま）。
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
         id: u64,
@@ -307,9 +313,25 @@ impl Accumulator {
         }
     }
 
+    /// `TextMin`/`TextMax` が現在保持している文字列のバイト数（未保持なら 0、
+    /// それ以外の集計種別は常に 0）。呼び出し元（`sql::group_by`）が `observe`
+    /// 前後でこの値を比較し、`GROUP BY` 全体での TEXT アキュムレータ累計バイト数を
+    /// 予算管理するために公開する（PR #230 codex-review 指摘対応: `GROUP BY` は
+    /// グループ数に比例して `TextMin`/`TextMax` インスタンスが増えるため、
+    /// 単一行集計〔TASK-166・SQL-13〕の「項目ごとに高々 1 本」という有界性だけでは
+    /// 不十分）。
+    pub(crate) fn text_len(&self) -> usize {
+        match self {
+            Accumulator::TextMin(m) | Accumulator::TextMax(m) => {
+                m.as_ref().map(String::len).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
     /// 空集合契約: `COUNT` は `0`、それ以外は `NULL`（PostgreSQL 互換。TASK-166・
     /// SQL-13）。`AVG` は合計を保持したまま `finish` の時点で除算する。
-    fn finish(self) -> Cell {
+    pub(crate) fn finish(self) -> Cell {
         match self {
             Accumulator::Count(n) => Cell::Integer(n),
             Accumulator::IdSum(s) => s.map(Cell::Integer).unwrap_or(Cell::Null),
@@ -335,7 +357,7 @@ impl Accumulator {
 /// `TextMin`/`TextMax` が新しい極値を保持し直す際にのみ呼ぶ（1 項目あたり高々
 /// 1 本。`.claude/rules/security.md`「不安全な設計」対応で `try_reserve_exact` を
 /// 使い、確保失敗を abort ではなく `54000` として返す）。
-fn try_clone_str(value: &str) -> Result<String, SqlSurfaceError> {
+pub(crate) fn try_clone_str(value: &str) -> Result<String, SqlSurfaceError> {
     let mut owned = String::new();
     owned.try_reserve_exact(value.len()).map_err(|_| {
         SqlSurfaceError::payload_too_large("aggregate text value exceeds available memory")
@@ -344,7 +366,7 @@ fn try_clone_str(value: &str) -> Result<String, SqlSurfaceError> {
     Ok(owned)
 }
 
-fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
+pub(crate) fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: format!("aggregate row scan failed: {}", e.into()),
     }
@@ -361,6 +383,14 @@ pub(crate) fn execute_aggregate(
     schema: &TableSchema,
     bound: &BoundAggregate,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    // TASK-167（SQL-14）: `GROUP BY` ありは複数行結果を返すため
+    // `sql::group_by::execute_grouped_aggregate` へ分岐する（グループ表の有界化・
+    // `HAVING`/`ORDER BY`/`LIMIT` はそちらの責務）。`GROUP BY` なしは以下の
+    // TASK-166・SQL-13 の単一行経路を維持する（既存挙動は変更しない）。
+    if bound.group_by.is_some() {
+        return crate::sql::group_by::execute_grouped_aggregate(read_txn, ctx, schema, bound);
+    }
+
     let mut accumulators = Vec::with_capacity(bound.items.len());
     for item in &bound.items {
         accumulators.push(Accumulator::new(item.func, &item.input)?);
@@ -550,6 +580,11 @@ mod tests {
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
             rls_predicate_present: false,
+            projection: vec![crate::sql::parser::ProjectionColumn::Aggregate {
+                item_index: 0,
+                name: "result".to_string(),
+            }],
+            group_by: None,
         }
     }
 

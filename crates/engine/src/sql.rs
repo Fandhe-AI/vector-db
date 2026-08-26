@@ -31,7 +31,10 @@
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
-//!   実行（TASK-166・SQL-13）
+//!   実行（TASK-166・SQL-13）。`GROUP BY` ありの複数行実行は [`group_by`] へ委譲する
+//! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
+//!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
+//!   `ORDER BY`・`LIMIT` を担う
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -68,6 +71,7 @@
 pub mod aggregate;
 pub mod allowlist;
 pub mod exec;
+pub mod group_by;
 pub mod lexer;
 pub mod mode;
 pub mod parser;
