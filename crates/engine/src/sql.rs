@@ -9,9 +9,12 @@
 //!
 //! 書き込み系 SQL 文（`INSERT`）は `EngineCore::execute_insert_sql`（TASK-80、
 //! 対象ビヘイビア: SQL-10）が別エントリポイントとして扱う。文末専用句
-//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）の省略は、書き込み
-//! トランザクションを開始する前に構造検証段階で fail-closed に拒否する
-//! （RECOVER-1 の必須化ガードの前段）。
+//! `USING OPERATION_ID '<id>'`（[`using_operation_id`]）は本モジュールが構造
+//! パース（省略・明示 `NULL` はいずれも `None`）のみを行い、必須化の判断
+//! （省略を書き込みトランザクション開始前に `23502` で拒否するか否か）は
+//! サーバー構成 [`crate::recovery::required_op_id::LedgerMode`] へ移した
+//! （TASK-92・RECOVER-1。`allowlist::validate_insert` が `LedgerMode::require` へ
+//! 委譲する）。
 //!
 //! 本モジュール配下は wire プロトコル入力と同じ untrusted 入力の扱い
 //! （`.claude/rules/coding-rust.md`）に従う。
@@ -39,6 +42,16 @@
 //! 許可形状を追加した。実行は [`exec::execute_insert`] が担い、行の書き込みは
 //! `tenant.rs` のガード付き API（`tenant::insert_typed_row`）経由に統一する
 //! （TABLE-12・RLS-9）。
+//!
+//! TASK-147（対象ビヘイビア: EXT-3）: `WHERE` 句に前方一致条件
+//! `<col> LIKE '<prefix>%'` を追加した（[`allowlist`] が構造を、
+//! `crate::declarative_filter` が意味論を検証する。`LIKE` は末尾ちょうど 1 つの
+//! `%` のみを許可し、`NOT LIKE`・`ILIKE`・中間 `%`・`_`・エスケープは拒否する）。
+//! 既存の等価条件 `<col> = '<literal>'`（SQL-2）と合わせ、両者は
+//! `crate::declarative_filter::MetadataFilter`（汎用 API。任意の `TEXT` 列に
+//! 対する宣言的フィルタ）として一本化した（**BREAKING CHANGE**: 旧
+//! `sql::parser::ScalarEq`・`BoundStatement::scalar_filters` を置換。詳細は
+//! `declarative_filter.rs`・`sql/parser.rs` モジュールドキュメント参照）。
 
 pub mod allowlist;
 pub mod exec;

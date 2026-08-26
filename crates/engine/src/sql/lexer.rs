@@ -21,7 +21,10 @@
 /// `USING MODE ...`、statement 先頭の `SET search_mode = ...`）でのみ、
 /// `allowlist` 側が `Ident` の文字列を大文字小文字を区別せず照合して
 /// 文脈的にキーワードとして扱う（`allowlist.rs::parse_using_clause`・
-/// `allowlist.rs::validate_sql` 参照）。
+/// `allowlist.rs::validate_sql` 参照）。`LIKE`（TASK-147・EXT-3）も同じ理由・同じ
+/// 方式で `Keyword` へ含めない（`like` という列名の等価条件 `WHERE like = 'x'` を
+/// 壊さないため。`allowlist.rs::Parser::parse_where` が `WHERE` 句内・`ident` の
+/// 直後という位置でのみ文脈的に照合する）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
     Keyword(Keyword),

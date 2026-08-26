@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use engine::policy::PolicyContext;
+use engine::recovery::required_op_id::OperationId;
 use engine::storage::{RowInput, Storage, Visibility};
 
 /// `rows` をテナントごとのバッチへ分割し、テナント境界付き API
@@ -50,6 +51,7 @@ pub fn seed_rows_grouped_by_tenant(storage: &Storage, table: &str, rows: &[(u64,
                 )
             })
             .collect();
-        engine::tenant::insert_rows(storage, table, &ctx, &batch).expect("seed rows");
+        let op_id = OperationId::parse("seed-rows-grouped-by-tenant").expect("valid operation_id");
+        engine::tenant::insert_rows(storage, table, &ctx, &batch, &op_id).expect("seed rows");
     }
 }

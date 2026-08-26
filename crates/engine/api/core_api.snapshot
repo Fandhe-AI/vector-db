@@ -8,6 +8,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub mod chunking;
 pub mod core;
+pub mod declarative_filter;
 pub mod dispatch;
 pub mod hybrid;
 pub mod isa;
@@ -15,6 +16,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
@@ -24,6 +26,7 @@ pub mod sql;
 pub mod storage;
 pub mod tenant;
 pub mod txn;
+pub mod wasm_udf;
 
 # source: crates/engine/src/core.rs :: VectorCore
 pub trait VectorCore: Send + Sync {
