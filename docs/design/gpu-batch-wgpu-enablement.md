@@ -74,11 +74,12 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - ステージング用のバイト列・readback の `f32` 列は `try_reserve_exact` で
   フォールブルに確保する（`Vec::with_capacity` の abort-on-OOM を避け、確保失敗も
   CPU 縮退可能な backend エラーとして返す）
-- 計算量ガードはクエリごとの実到達行数（`is_visible` を満たす行数）× dim を
-  合算して照合する。dispatch 前の主防御線（`check_reachable_batch_work`）も、
-  `gather_reachable_rows` 内の後段二重チェックも同じ基準を使う。全行ベースで
-  課金すると、CPU 経路では予算内の要求まで `Input` エラー（＝縮退対象外）で
-  恒久的に拒否してしまうため
+- 計算量ガードは dispatch 前の `check_reachable_batch_work` が単独で担い、
+  クエリごとの実到達行数（`is_visible` を満たす行数）× dim を合算して照合する。
+  `gather_reachable_rows` 内には後段チェックを置かない: 全行ベースで課金すると
+  CPU 経路では予算内の要求まで `Input` エラー（＝縮退対象外）で恒久的に拒否して
+  しまううえ、`MAX_BATCH_ROWS × MAX_BATCH_DIM` < `MAX_BATCH_WORK` のため 1 クエリ分の
+  課金がこの上限を超えることは構造的にありえず到達不能だったため
 - WGSL は `const` 文字列で埋め込み（外部ファイル読み込みなし）。
   `unpack2x16float`（コア機能。`shader-f16` 拡張不要）で
   `batch_search.rs::pack_f16x2` と同じビット解釈の f16 → f32 復元を行い、
