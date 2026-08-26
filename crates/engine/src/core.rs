@@ -1503,6 +1503,92 @@ mod tests {
         assert_eq!(stats.misses, 2);
     }
 
+    // Issue #179: `drop_table` → 同名・同次元での再作成をまたぐと、drop 前に充填した
+    // `PrefilterCache` エントリは世代不一致で破棄され、再作成後は新規行のみを返す
+    // （旧行が混入する経路がないことの確認）。
+    #[test]
+    fn search_cache_is_invalidated_by_drop_table_and_recreate() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let first = core
+            .search(&ctx, "docs", &[1.0, 0.0], 10)
+            .expect("first search ok");
+        assert_eq!(first.len(), 1);
+
+        core.storage.drop_table("docs").expect("drop table");
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("recreate table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row after recreate");
+
+        let second = core
+            .search(&ctx, "docs", &[1.0, 0.0], 10)
+            .expect("second search ok after drop and recreate");
+        let ids: Vec<u64> = second.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![2]);
+
+        let stats = core.prefilter_cache_stats();
+        assert!(stats.stale_evictions >= 1);
+        assert_eq!(stats.misses, 2);
+    }
+
+    // Issue #179: drop 後に再作成しないテーブルへの検索は、既存の
+    // 「存在情報を漏らさない」契約どおり `CoreError::NotFound` に丸め込まれる。
+    #[test]
+    fn search_returns_not_found_after_drop_without_recreate() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        core.storage.drop_table("docs").expect("drop table");
+
+        let result = core.search(&ctx, "docs", &[1.0, 0.0], 10);
+        assert!(matches!(result, Err(CoreError::NotFound)));
+    }
+
     // 対象ビヘイビア: RLS-1（TASK-169）。異なる `PolicyContext`（別テナント）は別の
     // キャッシュエントリになり、互いの検索結果に混入しない。
     #[test]

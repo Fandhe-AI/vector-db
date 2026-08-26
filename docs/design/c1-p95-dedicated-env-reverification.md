@@ -5,7 +5,7 @@
 - 対応: TASK-83（Issue #60。ポインタ: `docs/spec/05-tasks.md`・Conditional Go 条件7）
 - 前提: TASK-75（SQL 表層 SELECT の束縛・実行。Issue #56 / PR #184 でマージ済み）・
   TASK-158（性能計測プロトコル基盤。Issue #106 でマージ済み）
-- 関連: TASK-127（provider 単体の性能・Recall 受け入れ基準回帰。`parallel_bench.rs`）・
+- 関連: TASK-127（provider 単体の性能・Recall 受け入れ基準回帰。`simd_bench.rs`）・
   TASK-144（Issue #121。条件6 の前例となる再測定 ADR）・TASK-165（wire 経由での
   end-to-end 再測定。本タスクの範囲外）
 - 対象ビヘイビア: なし（基盤タスク。成果物は専有環境再測定レポートとゲート整備）
@@ -23,7 +23,7 @@ TASK-158（性能計測プロトコル基盤 `crates/engine/benches/harness/`）
 （warmup 20 回以上・計測 20 回以上・中央値＋Q1/Q3・決定的シード RNG・interleaved A/B）
 に従って計測する。
 
-既存 `benches/parallel_bench.rs`（TASK-127）は `SearchProvider` を直接叩く provider
+既存 `benches/simd_bench.rs`（TASK-127）は `SearchProvider` を直接叩く provider
 単体の p95 であり、`EngineCore::execute_sql`（SQL 表層。`sql::exec::execute_statement`）
 経由の C1 p95 は本タスクまで未計測だった。SQL 表層は毎クエリ
 `VectorArena::build_filtered_with_rows_in_txn` により候補行を redb から再デコードする
@@ -44,10 +44,10 @@ end-to-end 再測定は TASK-165 の管轄とする。
 | ---- | ---- |
 | 測定入口 | `crates/engine/benches/sql_c1_bench.rs`（`cargo bench --bench sql_c1_bench -p engine` / `make bench-c1`） |
 | 測定対象 | `EngineCore::execute_sql(ctx, "SELECT id FROM documents ORDER BY embedding <=> '[...]' LIMIT 20")`（SQL-1 の規範形。`harness::sql_c1` が構造検証つきで組み立てる） |
-| データ | 100,000 行 × 768 次元・k=20（本ベンチが選んだ計測構成。既存 `parallel_bench.rs` の行数・次元に揃えて比較可能にしたもので、spec の計測条件の転記ではない。決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
+| データ | 100,000 行 × 768 次元・k=20（本ベンチが選んだ計測構成。既存 `simd_bench.rs` の行数・次元に揃えて比較可能にしたもので、spec の計測条件の転記ではない。決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
 | プロトコル | `harness::protocol::run`（warmup 20・計測 50・決定的シード）→ `harness::accept::p95_from_samples` / `check_p95_within_limit`。Recall@20 は `CpuScalarProvider`（厳密最近傍の独立オラクル）との Top-20 一致率を 20 クエリの worst-query で判定 |
 | 診断 A/B | `harness::ab::run_ab` で SQL 表層 vs `EngineCore::search` を interleaved 計測し `median_ratio` を出力（**合否には含めない**。SQL 表層オーバーヘッドの切り分け材料。ただし `EngineCore::search` 側は `PrefilterCache`〔TASK-169〕を経由するため、テーブル内容が変わらない本ベンチでは初回以降キャッシュがウォームな状態で計測される——`median_ratio` は「SQL 表層のコールドな arena 再構築」と「キャッシュヒット時の `EngineCore::search`」の比であり、両経路の候補デコード実装そのものを対称条件で比較した値ではない点に注意） |
-| 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`parallel_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
+| 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`simd_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
 | 専有環境の宣言 | `BENCH_DEDICATED_ENV=1` の opt-in フラグ。未設定（既定）では「専有環境として宣言されていない」ことを明示し、条件7 の判定対象から除外する（p95/Recall 自体の pass/fail は常に出力） |
 | CI 対象 | `tests/c1_bench_accept.rs`（`make ci` 対象）が SQL 文字列生成・識別子検証・往復性・環境記録の非 panic のみを時間非依存に検証する。時間依存の実測（`bench-c1`）は `.github/workflows/bench.yml` の `workflow_dispatch` 限定ジョブから実行し、schedule には含めない |
 
