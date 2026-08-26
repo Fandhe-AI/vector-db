@@ -28,11 +28,11 @@ fn vector_literal_round_trips_through_parse_vector_literal() {
     let literal = vector_literal(&values).expect("finite values must produce a literal");
     assert!(literal.len() < 64 * 1024);
 
+    // `vector_literal` は「`str::parse::<f32>` で元の値へ往復できる」ことを契約として
+    // 宣言しているため、許容誤差なしのビット等価比較で検証する（誤差付き比較は契約より
+    // 緩く、往復性の劣化を見逃す）。
     let parsed = parse_vector_literal(&literal, 768).expect("literal must parse back");
-    assert_eq!(parsed.len(), values.len());
-    for (a, b) in values.iter().zip(parsed.iter()) {
-        assert!((a - b).abs() < 1e-6, "expected {a}, got {b}");
-    }
+    assert_eq!(parsed, values, "vector_literal must round-trip exactly");
 }
 
 #[test]
@@ -196,11 +196,13 @@ mod e2e {
             .map(|hit| hit.id)
             .collect();
 
-        let actual_set: std::collections::HashSet<u64> = actual.into_iter().collect();
-        let expected_set: std::collections::HashSet<u64> = expected.into_iter().collect();
+        // 集合ではなく順序込みで比較する。C1 テンプレートは `ORDER BY <=> ... LIMIT k` の
+        // 距離昇順を契約しており、集合比較では順序の退行を検知できないため。上記 corpus は
+        // query `[1,0,0]` に対する上位 3 件（id=1・2・5）の距離が互いに異なり同点タイが
+        // 発生しないので、SQL 表層経路と参照オラクル経路の順序は一意に定まる。
         assert_eq!(
-            actual_set, expected_set,
-            "C1 template result must match the independent exact oracle's top-k id set"
+            actual, expected,
+            "C1 template result must match the independent exact oracle's ordered top-k"
         );
     }
 }

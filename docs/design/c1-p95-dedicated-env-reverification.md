@@ -6,8 +6,8 @@
 - 前提: TASK-75（SQL 表層 SELECT の束縛・実行。Issue #56 / PR #184 でマージ済み）・
   TASK-158（性能計測プロトコル基盤。Issue #106 でマージ済み）
 - 関連: TASK-127（provider 単体の性能・Recall 受け入れ基準回帰。`parallel_bench.rs`）・
-  TASK-144（Issue #121。条件6 の前例となる再測定 ADR）・TASK-73/TASK-165（wire 経由での
-  SQL 実行。本タスクの範囲外）
+  TASK-144（Issue #121。条件6 の前例となる再測定 ADR）・TASK-165（wire 経由での
+  end-to-end 再測定。本タスクの範囲外）
 - 対象ビヘイビア: なし（基盤タスク。成果物は専有環境再測定レポートとゲート整備）
 
 ## 背景
@@ -32,9 +32,10 @@ TASK-158（性能計測プロトコル基盤 `crates/engine/benches/harness/`）
 `EngineCore::search`（`VectorCore` trait 経由）の interleaved A/B を診断情報として
 同時に取得する。
 
-wire-server は本 PR 時点でまだ `execute_sql` を呼んでいない（TASK-73 未着手）ため、
-本タスクの測定対象は spec の PoC-10 と同じ内部実行器（engine の SQL 表層）とする。
-wire 経由の再測定は TASK-73/TASK-165 の管轄。
+本タスクの測定対象は engine の内部実行器（SQL 表層 `EngineCore::execute_sql`）とし、
+wire プロトコル経路（TASK-73・WIRE-1 の簡易クエリで `execute_sql` へ接続済み）の
+往復コストは含めない。条件7 が対象とするのは SQL 表層自体の p95 であり、wire 経由の
+end-to-end 再測定は TASK-165 の管轄とする。
 
 ## 検証設計
 
@@ -62,7 +63,7 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
 | 検出 ISA | AVX2+FMA（`engine::isa::current().isa()`。AVX-512 非対応） |
 | 論理コア数 | 12（`std::thread::available_parallelism()`。他 Issue の worktree と共有） |
 | 仮想化 | QEMU 仮想 CPU・KVM |
-| spec の計測環境前提 | 本ホストとは非同一（Apple M4 Max ベアメタル等を想定した専有環境） |
+| spec の計測環境前提 | 本ホストとは非同一（他プロセスと CPU/IO を共有しない専有環境） |
 
 ## 実測結果
 
@@ -137,7 +138,7 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
 ## 制約・スコープ外
 
 - 専有環境での本実測はオーナー作業（本 PR には含まれない）
-- wire 経由の再測定は TASK-73/TASK-165 の管轄
+- wire 経由の end-to-end 再測定は TASK-165 の管轄
 - SQL 経路への `PrefilterCache`（TASK-169）適用等の性能改善は本 PR のスコープ外
 - `bench.yml` の `bench-c1` を週次 schedule へ含めるかの判断は、専有環境での実測後に
   オーナーが行う
