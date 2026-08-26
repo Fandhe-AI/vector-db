@@ -156,19 +156,24 @@ for i in $(seq 1 "${ITERATIONS}"); do
 
   wait "${writer_pid}" 2>/dev/null
   writer_status=$?
+  # reap 済みの PID は OS に回収され別プロセスへ再利用され得る。共有変数
+  # writer_pid は「未 reap の子だけを指す」不変条件（stop_writer のコメント参照）
+  # を保つため、終了状態の判定より前にクリアする。判定を挟んでからクリアすると、
+  # 下の fail-closed な `exit 1` 経路が writer_pid を保持したまま EXIT trap
+  # （cleanup → stop_writer）へ入り、reap 済み PID へ kill -9 を送って同一 runner 上の
+  # 無関係なプロセスを巻き込みかねない。メッセージ用には退避した値を使う。
+  reaped_writer_pid="${writer_pid}"
+  writer_pid=""
+
   # `wait` は SIGKILL で終了したプロセスに対して 128+9=137 を返す。
   # それ以外（writer が kill 到達前に自発終了した等）は SIGKILL を検証できて
   # いない反復であり、テストの目的（強制終了下での整合性検証）を満たさない
   # ため fail-closed で拒否する。
   if [ "${writer_status}" -ne 137 ]; then
-    echo "ERROR: writer pid ${writer_pid} did not terminate via SIGKILL at iteration ${i} (wait exit status=${writer_status}, expected 137); this iteration did not exercise a real SIGKILL crash" >&2
+    echo "ERROR: writer pid ${reaped_writer_pid} did not terminate via SIGKILL at iteration ${i} (wait exit status=${writer_status}, expected 137); this iteration did not exercise a real SIGKILL crash" >&2
     cat "${WRITE_LOG}" >&2
     exit 1
   fi
-
-  # wait で reap 済みの PID は OS に回収され再利用され得るため、以降のエラーパスで
-  # 誤って無関係な別プロセスへ kill してしまわないようクリアしておく。
-  writer_pid=""
 
   verify_output="$("${BIN}" verify "${DB_PATH}")"
   echo "${verify_output}"
