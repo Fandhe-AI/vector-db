@@ -6,8 +6,8 @@
 //! 実 `EngineCore` を用いた分類境界（構文・値・テーブル不在）の決定的分類、
 //! `InternalError` がクライアント文言へ内部詳細を運ばないことを検証する。
 //!
-//! 台帳系（`operation_id` 内容不一致・`22023`）は ERR-3 管轄で本タスクの対象外
-//! （TASK-154 が発生経路を実装する。ここでは写像の一意性検証にのみ含める）。
+//! 収録範囲は engine・wire-server が現に返す `wire_code` に限る（未実装分類の追加は
+//! TASK-153・TASK-154 の管轄）。
 
 use std::collections::HashSet;
 
@@ -46,25 +46,6 @@ fn err2_all_classes_have_unique_wire_codes() {
         ErrorClass::ALL.len(),
         "wire_code は分類ごとに一意でなければならない"
     );
-}
-
-/// ERR-2 分類表（15 行）と、表外の拡張分類の関係を固定する。表側の増減、および
-/// 拡張分類の増加（ビヘイビアファイル固有の `wire_code` 追加）を検知する。
-#[test]
-fn err2_table_is_fifteen_rows_and_extensions_are_explicit() {
-    let table: Vec<ErrorClass> = ErrorClass::ALL
-        .into_iter()
-        .filter(|c| c.is_err2_table_row())
-        .collect();
-    assert_eq!(table.len(), 15, "spec 表は計 15 行");
-
-    // 表外の拡張は SQL-13（集計の数値範囲超過）の 1 分類のみ。
-    let extensions: Vec<ErrorClass> = ErrorClass::ALL
-        .into_iter()
-        .filter(|c| !c.is_err2_table_row())
-        .collect();
-    assert_eq!(extensions, vec![ErrorClass::NumericOutOfRange]);
-    assert_eq!(ErrorClass::NumericOutOfRange.wire_code(), "22003");
 }
 
 #[test]

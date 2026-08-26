@@ -1,45 +1,45 @@
 //! エラー分類共通形式（TASK-152。対象ビヘイビア: ERR-2。ポインタ:
-//! `docs/spec/04-behavior/error-format.md`）。
+//! `docs/spec/05-tasks.md` TASK-152・`docs/spec/04-behavior/error-format.md`）。
 //!
 //! 責務境界: engine 各所（`sql::allowlist::SqlSurfaceError`・`tenant::TenantWriteError`
 //! 等）が独立に持つ `wire_code()` 実装を、本モジュールの [`ErrorClass`] へ委譲させる
 //! ための単一真実源（SSOT）を提供する。`wire_code` 写像が複数箇所へ文字列リテラルで
 //! 分散し、決定的分類（同一入力に常に同一 `wire_code`）・一意対応（分類⇔`wire_code`）が
-//! 構造的に保証されない状態を防ぐことが目的（ERR-2 が確定として保証する契約は
-//! `wire_code` 列のみ）。
+//! 構造的に保証されない状態を防ぐことが目的。
+//!
+//! 収録範囲は「engine・wire-server が現に返している `wire_code`」に限る。未実装の分類は
+//! 実装タスク（wire 応答への写像は TASK-153、`operation_id` 内容照合は TASK-154）が
+//! 追加する。分類の定義そのものは spec 側の管理事項であり、本コメント・本モジュールへ
+//! 転記しない（`.claude/rules/spec-confidentiality.md`）。
 //!
 //! 分類リストは [`define_error_classes`] マクロの 1 箇所のみで宣言し、`ErrorClass` の
-//! 定義・`ALL`・`wire_code`・`label`・`is_err2_table_row` をそこから生成する。分類を
-//! 追加・削除すると `ALL` の固定長（`count`）が合わなくなりコンパイルが失敗するため、
-//! 「分類は増えたが `ALL` の更新を忘れる」乖離は構造的に発生しない。
+//! 定義・`ALL`・`wire_code`・`label` をそこから生成する。分類を追加・削除すると `ALL` の
+//! 固定長（`count`）が合わなくなりコンパイルが失敗するため、「分類は増えたが `ALL` の
+//! 更新を忘れる」乖離は構造的に発生しない。
 //!
 //! wire-server 側（`SQLSTATE_*` 定数・`ErrorResponse` 整形）は TASK-153 の管轄で、
 //! 本モジュールはそれらを直接呼び出さない（workspace 責務境界: `.claude/rules/
-//! coding-rust.md`）。`OperationIdContentMismatch`（ERR-3 管轄）は写像の一意性を
-//! 保つために本 enum へ含めるが、これを実際に発生させる経路（`recovery.md`
-//! RECOVER-10 の内容照合）は TASK-154 の管轄であり本モジュールでは実装しない。
+//! coding-rust.md`）。
 
-/// [`ErrorClass`] の宣言と写像（`ALL`・`wire_code`・`label`・`is_err2_table_row`）を
-/// **単一の分類リスト**から生成するマクロ。分類・`wire_code`・ラベル・ERR-2 分類表への
-/// 掲載有無を 1 箇所に集約し、リスト間の乖離（分類を追加したのに `ALL` へ足し忘れる等）を
-/// 構造的に起こせなくする（ERR-2 の一意対応・決定的分類を型で担保するのが本モジュールの
-/// 責務）。`count` は `ALL` の固定長配列長であり、分類を増減させたのに更新しなければ
+/// [`ErrorClass`] の宣言と写像（`ALL`・`wire_code`・`label`）を**単一の分類リスト**から
+/// 生成するマクロ。分類・`wire_code`・ラベルを 1 箇所に集約し、リスト間の乖離（分類を
+/// 追加したのに `ALL` へ足し忘れる等）を構造的に起こせなくする（ERR-2 の一意対応・
+/// 決定的分類を型で担保するのが本モジュールの責務）。`count` は `ALL` の固定長配列長であり、分類を増減させたのに更新しなければ
 /// 配列長不一致でコンパイルが失敗する。
 macro_rules! define_error_classes {
     (
         count = $count:literal;
         $(
             $(#[$variant_doc:meta])*
-            $variant:ident => ($wire_code:literal, $label:literal, err2_table = $in_table:literal),
+            $variant:ident => ($wire_code:literal, $label:literal),
         )+
     ) => {
-        /// エラー分類の共通表現。`docs/spec/04-behavior/error-format.md` の分類表
-        /// （計 15 行）と、表外の発生条件に対しビヘイビアファイルが定義した拡張分類から成る
-        /// （表と拡張の区別は [`ErrorClass::is_err2_table_row`]）。並びは表の掲載順に揃える。
+        /// エラー分類の共通表現。engine・wire-server が現に返す `wire_code` に 1 対 1 で
+        /// 対応する（ERR-2。ポインタ: `docs/spec/04-behavior/error-format.md`）。
         ///
         /// `#[non_exhaustive]` は付けない。分類の追加は
         /// [`define_error_classes`] のリストへの 1 行追加としてのみ行い、
-        /// `wire_code`／`label`／`ALL`／`is_err2_table_row` は同リストから生成されるため
+        /// `wire_code`／`label`／`ALL` は同リストから生成されるため
         /// 更新漏れが起こり得ない（`StorageError` と同じ「網羅 `match` を強制する」既定方針）。
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum ErrorClass {
@@ -47,7 +47,7 @@ macro_rules! define_error_classes {
         }
 
         impl ErrorClass {
-            /// 全分類（ERR-2 分類表の行 + 拡張分類）。テストでの網羅・一意性検証、
+            /// 全分類。テストでの網羅・一意性検証、
             /// [`ErrorClass::from_wire_code`] の逆引きに使う。
             pub const ALL: [ErrorClass; $count] = [ $( ErrorClass::$variant, )+ ];
 
@@ -63,57 +63,61 @@ macro_rules! define_error_classes {
                 match self { $( ErrorClass::$variant => $label, )+ }
             }
 
-            /// ERR-2 の分類表そのものに掲載された分類なら `true`。表外の発生条件に対して
-            /// ビヘイビアファイルが独自に定義した拡張分類（例: SQL-13 の
-            /// [`ErrorClass::NumericOutOfRange`]）は `false` を返す。spec 表との対応が
-            /// 将来ずれた場合にテストで検知するために持つ。
-            pub const fn is_err2_table_row(self) -> bool {
-                match self { $( ErrorClass::$variant => $in_table, )+ }
-            }
         }
     };
 }
 
 define_error_classes! {
-    count = 16;
+    count = 14;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
-    InvalidInput => ("22000", "INVALID_INPUT", err2_table = true),
-    /// 認証資格情報なし（未認証セッションでのクエリ受信等。`28000`）。
-    AuthRequired => ("28000", "AUTH_REQUIRED", err2_table = true),
-    /// 認証資格情報が無効（誤りパスワード等。`28P01`）。
-    AuthInvalid => ("28P01", "AUTH_INVALID", err2_table = true),
-    /// テナント帰属不一致（`42501`）。
-    ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH", err2_table = true),
-    /// FROM に指定したテーブルがカタログ未存在（`42P01`）。
-    TableNotFound => ("42P01", "TABLE_NOT_FOUND", err2_table = true),
-    /// 指定した行が存在しない（`P0002`）。
-    RowNotFound => ("P0002", "ROW_NOT_FOUND", err2_table = true),
-    /// `operation_id` 重複（`23505`）。
-    DuplicateOperationId => ("23505", "DUPLICATE_OPERATION_ID", err2_table = true),
-    /// `operation_id` 省略（`23502`）。
-    MissingOperationId => ("23502", "MISSING_OPERATION_ID", err2_table = true),
+    /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
+    InvalidInput => ("22000", "INVALID_INPUT"),
+    /// 認証資格情報が無効（`28P01`）。wire-server の `auth::SQLSTATE_INVALID_PASSWORD`
+    /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
+    AuthInvalid => ("28P01", "AUTH_INVALID"),
+    /// テナント帰属不一致（`42501`）。[`crate::tenant::TenantWriteError::Forbidden`]
+    /// の写像。
+    ForbiddenTenantMismatch => ("42501", "FORBIDDEN_TENANT_MISMATCH"),
+    /// 参照したテーブルがカタログ未存在（`42P01`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] の写像。
+    TableNotFound => ("42P01", "TABLE_NOT_FOUND"),
+    /// 指定した行が存在しない（`P0002`）。[`crate::tenant::TenantWriteError::NotFound`]
+    /// の写像。
+    RowNotFound => ("P0002", "ROW_NOT_FOUND"),
+    /// 一意制約の衝突（`23505`）。[`crate::tenant::TenantWriteError::IdConflict`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::IdConflict`] の写像。
+    DuplicateOperationId => ("23505", "DUPLICATE_OPERATION_ID"),
+    /// `USING OPERATION_ID` 句の省略（`23502`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::MissingOperationId`]・
+    /// [`crate::tenant::TenantWriteError::MissingOperationId`] の写像。
+    MissingOperationId => ("23502", "MISSING_OPERATION_ID"),
     /// untrusted 入力のサイズがアロケーション前の上限を超過（`54000`）。
-    PayloadTooLarge => ("54000", "PAYLOAD_TOO_LARGE", err2_table = true),
-    /// 接続数上限超過（`53300`）。
-    ConnectionLimitExceeded => ("53300", "CONNECTION_LIMIT_EXCEEDED", err2_table = true),
-    /// 拡張クエリプロトコル未対応（`0A000`）。
-    FeatureNotSupported => ("0A000", "FEATURE_NOT_SUPPORTED", err2_table = true),
+    /// [`crate::sql::allowlist::SqlSurfaceError::PayloadTooLarge`]・wire-server の
+    /// `framing::SQLSTATE_PROGRAM_LIMIT_EXCEEDED` に対応する。
+    PayloadTooLarge => ("54000", "PAYLOAD_TOO_LARGE"),
+    /// 接続数上限超過（`53300`）。wire-server の `limits::SQLSTATE_TOO_MANY_CONNECTIONS`
+    /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
+    ConnectionLimitExceeded => ("53300", "CONNECTION_LIMIT_EXCEEDED"),
+    /// 未対応のプロトコル機能（`0A000`）。wire-server の
+    /// `handshake::SQLSTATE_FEATURE_NOT_SUPPORTED`・`protocol_dispatch` に対応する分類
+    /// （engine 側に発生経路はなく、写像の集約のみ）。
+    FeatureNotSupported => ("0A000", "FEATURE_NOT_SUPPORTED"),
     /// 受理範囲外の SQL 構文（構文解析失敗・AST 許可リスト外。`42601`）。
-    UnsupportedSqlSyntax => ("42601", "UNSUPPORTED_SQL_SYNTAX", err2_table = true),
-    /// 起動メッセージ不正（`08P01`）。
-    StartupMessageInvalid => ("08P01", "STARTUP_MESSAGE_INVALID", err2_table = true),
-    /// commit 済み `operation_id` が内容の異なる書き込みへ再利用された（`22023`）。
-    /// ERR-3 管轄。写像のみ本 enum で定義し、発生させる経路は TASK-154 が実装する。
-    OperationIdContentMismatch => ("22023", "OPERATION_ID_CONTENT_MISMATCH", err2_table = true),
+    /// [`crate::sql::allowlist::SqlSurfaceError::UnsupportedSyntax`] の写像。
+    UnsupportedSqlSyntax => ("42601", "UNSUPPORTED_SQL_SYNTAX"),
+    /// プロトコル違反（`08P01`）。wire-server の `framing::SQLSTATE_PROTOCOL_VIOLATION`
+    /// に対応する分類（engine 側に発生経路はなく、写像の集約のみ）。
+    ProtocolViolation => ("08P01", "PROTOCOL_VIOLATION"),
     /// 予期しない内部エラー（`XX000`）。クライアントへは詳細を運ばない
     /// （[`WireError::internal`] 参照）。
-    InternalError => ("XX000", "INTERNAL_ERROR", err2_table = true),
-    /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`）の数値演算が表現範囲を超過
-    /// （`22003`）。ERR-2 の分類表には未掲載で、SQL-13（`sql::aggregate`）が
-    /// ERR-2 の拡張規則（表外の発生条件はビヘイビアファイルが一意の `wire_code` を
-    /// 定義してよい）に基づき定義した分類。
-    NumericOutOfRange => ("22003", "NUMERIC_OUT_OF_RANGE", err2_table = false),
+    /// [`crate::sql::allowlist::SqlSurfaceError::Internal`]・
+    /// [`crate::tenant::TenantWriteError::Catalog`]／`Storage` の写像。
+    InternalError => ("XX000", "INTERNAL_ERROR"),
+    /// 数値演算が表現範囲を超過（`22003`）。
+    /// [`crate::sql::allowlist::SqlSurfaceError::NumericOutOfRange`]（SQL-13 の集計関数）
+    /// の写像。
+    NumericOutOfRange => ("22003", "NUMERIC_OUT_OF_RANGE"),
 }
 
 impl ErrorClass {
