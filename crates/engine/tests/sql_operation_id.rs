@@ -11,8 +11,10 @@
 //! 有無で応答が変化しないことを、本体の判定 API に依存しないテスト側オラクル
 //! （期待値のベタ書き）で確認する。
 //!
-//! 台帳系（同一 `operation_id` の内容不一致 `22023`・台帳への永続化）は本タスクの
-//! 管轄外（TASK-93・TASK-94・TASK-101 が後続で扱う）。
+//! 台帳への永続化は TASK-93（対象ビヘイビア: RECOVER-2）が
+//! `crate::recovery::ledger` として実装済み（結合テストは
+//! `tests/recovery_ledger.rs`）。同一 `operation_id` の重複拒否（`23505`）・内容
+//! 不一致検出（`22023`）は本タスクの管轄外（TASK-94・TASK-101 が後続で扱う）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -341,9 +343,10 @@ fn error_response_of_same_tenant_conflict_is_identical_regardless_of_other_tenan
 fn resending_the_same_statement_is_rejected_with_23505_by_row_id_conflict() {
     // 同一文（同一 `operation_id`・同一行 `id`）の再送は、行キー `(tenant_id, id)` の
     // 重複として `23505` になる。判定はあくまで行キー由来であり、`operation_id` を
-    // キーにした冪等判定（台帳による重複拒否・内容不一致検出）は本タスクの管轄外
-    // （TASK-93・TASK-94・TASK-101）。衝突が成立するのは同一テナント内スコープに
-    // 限られる（他テナントの同一 `id` は別キーのため衝突しない。TABLE-12）。
+    // キーにした重複拒否・内容不一致検出（TASK-94・TASK-101）は本タスクの管轄外
+    // （台帳への永続化自体は TASK-93 実装済み。`tests/recovery_ledger.rs` 参照）。
+    // 衝突が成立するのは同一テナント内スコープに限られる（他テナントの同一 `id` は
+    // 別キーのため衝突しない。TABLE-12）。
     let path = unique_db_path("insert-resend");
     let _guard = CleanupGuard(path.clone());
     let core = new_core_with_documents_table(&path);

@@ -990,9 +990,11 @@ fn project_rows(
     Ok(rows)
 }
 
-/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80 の公開 API）。
+/// [`crate::sql::parser::BoundInsert`] を実行する（SQL-10、TASK-80）。
 /// `core.rs::EngineCore::execute_insert_sql` からのみ呼ばれる想定で、`Storage`・
-/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。
+/// `PolicyContext` を束ねる（`execute_statement` と対称の役割）。クレート外へ公開する
+/// 契約は持たず、可視性は `pub(crate)` に留める（TASK-93・codex-review P1 指摘・PR #226:
+/// `ledger_mode` 引数の追加をソース互換性の破壊的変更として扱う必要をなくすため）。
 ///
 /// 行の書き込みはガードなし実体 [`crate::tenant::insert_typed_row_unchecked`]（`pub(crate)`）
 /// へ委譲する（TASK-95・TABLE-12・RLS-9。`operation_id` 必須化ガードは本関数の
@@ -1017,25 +1019,35 @@ fn project_rows(
 /// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
 /// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
 /// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
-/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の冪等契約
-/// （台帳への原子的記録・重複拒否・内容不一致検出）はまだ提供しない。`bound.operation_id`
-/// は現時点では永続化せず、台帳への追記は TASK-93・TASK-94・TASK-101（対象ビヘイビア:
-/// RECOVER-2・RECOVER-3・RECOVER-10）の管轄で、本関数がその追記点になる
-/// （ポインタ: docs/spec/05-tasks.md TASK-93）。
+/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の重複拒否・
+/// 内容不一致検出はまだ提供しない（TASK-94・TASK-101、対象ビヘイビア:
+/// RECOVER-3・RECOVER-10 の管轄）。
 ///
-/// `bound.operation_id` の必須化（TASK-92・RECOVER-1）は呼び出し元
-/// `sql::allowlist::validate_insert` が `LedgerMode::require` 経由で本関数の
-/// 呼び出し前に適用済みのため、`LedgerMode::Ledgered`（既定）では常に `Some`。
-/// `LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、本関数は
-/// いずれの場合も値の有無で分岐しない（台帳を持たないため未使用）。
-pub fn execute_insert(
+/// `ledger_mode` は `core.rs::EngineCore` が保持する構成をそのまま受け取り、
+/// `ledger_mode.resolve(bound.operation_id.as_ref())` で
+/// [`crate::recovery::ledger::LedgerWrite`] へ変換したうえで
+/// [`crate::tenant::insert_typed_row_unchecked`] へ渡す（TASK-93、対象ビヘイビア:
+/// RECOVER-2。台帳への追記が行書き込みと同一 write トランザクションで行われる点は
+/// `tenant.rs` モジュールドキュメント参照）。`bound.operation_id` の必須化
+/// （TASK-92・RECOVER-1）は呼び出し元 `sql::allowlist::validate_insert` が
+/// `LedgerMode::require` 経由で本関数の呼び出し前に適用済みのため、
+/// `LedgerMode::Ledgered`（既定）では常に `Some`。`resolve` はその判定を再利用する
+/// ため、ここで改めて `MissingOperationId` を返す経路は実質到達しない
+/// （`LedgerMode::CompareOnlyWithoutLedger` でのみ `None` になり得るが、その場合
+/// `resolve` は `LedgerWrite::Disabled` を返し、台帳へは触れない）。
+pub(crate) fn execute_insert(
     storage: &crate::storage::Storage,
     ctx: &PolicyContext,
     bound: &crate::sql::parser::BoundInsert,
+    ledger_mode: crate::recovery::required_op_id::LedgerMode,
 ) -> Result<InsertOutcome, SqlSurfaceError> {
     use crate::catalog::CatalogError;
     use crate::storage::{StorageError, Visibility};
     use crate::tenant::TenantWriteError;
+
+    let ledger_write = ledger_mode
+        .resolve(bound.operation_id.as_ref())
+        .map_err(|_| SqlSurfaceError::MissingOperationId)?;
 
     crate::tenant::insert_typed_row_unchecked(
         storage,
@@ -1044,6 +1056,7 @@ pub fn execute_insert(
         bound.id,
         Visibility::Private,
         &bound.values,
+        ledger_write,
     )
     .map_err(|e| match e {
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
@@ -1064,16 +1077,20 @@ pub fn execute_insert(
         // `22000` へ丸め込む（`CatalogError::Invalid` は識別子・次元・スキーマ検証の
         // 失敗、`StorageError::Codec` は行エンコード時の不正値）。エラー文言に行内容・
         // 所有テナントは含めない（security.md「エラー・ログ経由で他テナントのデータ・
-        // 存在情報を漏らさない」）。
+        // 存在情報を漏らさない」）。`TenantWriteError::LedgerCorrupted`（`op_ledger` の
+        // 未知フォーマット・バックエンド障害）はここに含めない: 台帳破損は送信された
+        // 行データとは無関係のサーバー内部事象であり、クライアントの行を「不正」と
+        // 誤認させると誤った再試行を誘発する（Cursor Bugbot 指摘・PR #226）。下の
+        // `_` 節（`XX000`）へ委ねる。
         TenantWriteError::Catalog(CatalogError::Invalid(_))
         | TenantWriteError::Storage(StorageError::Codec(_)) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
         }
-        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗等）は
-        // サーバー側の内部事象として `XX000` へ写像する（codex-review P0/P1 指摘・
-        // PR #189: バックエンド障害を入力不正として返すと再試行・障害判定を誤らせる。
-        // また `TenantWriteError` の `Display`/`Debug` は原因を秘匿する契約のため、
-        // detail には原因を一切展開せず固定文言に留める）。
+        // それ以外（redb バックエンド障害・commit 失敗・カタログ破損・認可失敗・
+        // 台帳破損等）はサーバー側の内部事象として `XX000` へ写像する
+        // （codex-review P0/P1 指摘・PR #189: バックエンド障害を入力不正として返すと
+        // 再試行・障害判定を誤らせる。また `TenantWriteError` の `Display`/`Debug` は
+        // 原因を秘匿する契約のため、detail には原因を一切展開せず固定文言に留める）。
         _ => SqlSurfaceError::Internal {
             detail: "insert failed".to_string(),
         },
