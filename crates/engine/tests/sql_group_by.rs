@@ -600,6 +600,54 @@ fn order_by_accepts_group_key_alias() {
     assert_eq!(actual_langs, expected_langs);
 }
 
+// `GROUP BY` 列を SELECT リストで複数回・別名で射影した場合、いずれのエイリアス
+// も `ORDER BY` から参照できる（PR #230 codex-review P1 指摘対応: `group_key_alias`
+// が単一 `Option<String>` で実装されていると `GroupKey` 項目を処理するたびに
+// 上書きされ、先に指定したエイリアス（この例では `a`）が `unknown GROUP BY
+// reference` として不当に `22000` 拒否されていた）。
+#[test]
+fn order_by_accepts_any_of_multiple_group_key_aliases() {
+    let path = unique_db_path("group-by-order-by-multi-alias");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_multi_tenant_corpus(&storage);
+    let core = new_core(storage);
+    let ctx = ctx_for("tenant-a", true);
+    let visible = visible_rows(&truths, "tenant-a", true);
+    let expected = oracle_groups(&visible);
+
+    let mut expected_langs: Vec<String> = expected.keys().cloned().collect();
+    expected_langs.sort();
+
+    // 先に指定したエイリアス `a` を ORDER BY が参照するケース。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT lang AS a, lang AS b, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY a",
+        )
+        .expect("ORDER BY referencing the first GROUP BY key alias should succeed");
+    let actual_langs: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| as_text(&row.cells[0]).expect("group key must be present"))
+        .collect();
+    assert_eq!(actual_langs, expected_langs);
+
+    // 後に指定したエイリアス `b` を ORDER BY が参照するケースも引き続き成功する。
+    let result = core
+        .execute_sql(
+            &ctx,
+            "SELECT lang AS a, lang AS b, COUNT(*) AS n FROM docs GROUP BY lang ORDER BY b",
+        )
+        .expect("ORDER BY referencing the second GROUP BY key alias should succeed");
+    let actual_langs: Vec<String> = result
+        .rows
+        .iter()
+        .map(|row| as_text(&row.cells[0]).expect("group key must be present"))
+        .collect();
+    assert_eq!(actual_langs, expected_langs);
+}
+
 // クエリ全体での `MIN`/`MAX(<TEXT 列>)` 集計状態の累計バイト数は
 // `MAX_TEXT_ACCUMULATOR_TOTAL_BYTES` で頭打ちにされ、超過は `54000`
 // （codex-review P1 指摘対応: グループ数×項目数分の `TextMin`/`TextMax` が
