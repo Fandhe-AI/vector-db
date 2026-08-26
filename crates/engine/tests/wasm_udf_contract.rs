@@ -120,6 +120,8 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
+            &engine::recovery::required_op_id::OperationId::parse("test-op")
+                .expect("valid operation_id"),
         )
         .expect("insert row");
     }
@@ -316,6 +318,8 @@ fn wasm_call_never_evaluates_on_invisible_rows() {
         1,
         Visibility::Public,
         &[Value::Vector(vec![1.0, 0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert tenant-a row");
 
@@ -332,6 +336,8 @@ fn wasm_call_never_evaluates_on_invisible_rows() {
         2,
         Visibility::Private,
         &[Value::Vector(vec![0.0, 0.0, 0.0])],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
     )
     .expect("insert tenant-b row");
 
