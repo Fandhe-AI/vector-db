@@ -911,11 +911,9 @@ impl EngineCore {
     /// wire 層が DML を行う際の入口はこのメソッド経由を想定し、SQL `INSERT` 表層
     /// （TASK-80/81/120）はこの経路の上に載せる前提）。
     ///
-    /// TASK-92（対象ビヘイビア: RECOVER-1）: `crate::tenant::insert_row` へ委譲する
-    /// **前**に `self.ledger_mode.require(operation_id)` を通す。`operation_id` が
-    /// 必須化ガードを満たさない（`LedgerMode::Ledgered` かつ `None`）場合は
-    /// [`crate::tenant::TenantWriteError::MissingOperationId`]（`23502`）を返し、
-    /// 書き込みトランザクションは一切開始しない。
+    /// TASK-92（対象ビヘイビア: RECOVER-1）: `crate::tenant::insert_row` へ委譲する前に
+    /// `self.ledger_mode.require(operation_id)` を通す（詳細は
+    /// `recovery::required_op_id` モジュールドキュメント参照）。
     pub fn insert_row(
         &self,
         ctx: &PolicyContext,

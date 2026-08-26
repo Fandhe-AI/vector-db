@@ -16,15 +16,6 @@ engine 横断（SQL 表層・`EngineCore` の行書き込み API の両方）へ
 ポインタである。本リポジトリで公開している設計方針の範囲は README.md
 「実装方針（要点）」の通りであり、それを超える内容はここに記載しない。
 
-## 設計判断（公開範囲のみ）
-
-- 必須化の可否は `crates/engine/src/recovery/required_op_id.rs::LedgerMode` という
-  **サーバー側構成専用**の値 1 箇所に集約する。クエリ句・セッション変数からは
-  到達できない（`crate::precision::PrecisionPolicy` と同型の fail-open 非経路設計）。
-- SQL 表層（`sql::allowlist::validate_insert`）と `EngineCore::{insert_row, update_row,
-  delete_row}`（TASK-95）の 2 経路が同一ガードを通ることで、SQL に閉じない
-  engine 横断の必須化にする。
-
 ## 影響を受けるコード
 
 - `crates/engine/src/recovery.rs`・`crates/engine/src/recovery/required_op_id.rs`（新規:

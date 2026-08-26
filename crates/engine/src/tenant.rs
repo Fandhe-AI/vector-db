@@ -3,25 +3,11 @@
 //!
 //! ## `operation_id` 必須化ガードと公開 API の構造（TASK-92・対象ビヘイビア: RECOVER-1）
 //!
-//! 書き込み系関数は 2 層に分かれる:
-//!
-//! - `pub fn` の [`insert_row`]・[`insert_rows`]・[`insert_typed_row`]・[`update_row`]・
-//!   [`delete_row`] は `operation_id: &OperationId` を**必須引数**として要求し、内部で
-//!   `LedgerMode::Ledgered.require(Some(operation_id))` を通してから
-//!   `pub(crate)` の `*_unchecked` 版へ委譲する。型で必須化するため、本モジュールを
-//!   直接呼ぶクレート利用者（wire-server・テスト）が `operation_id` を省略できる経路は
-//!   構造的に存在しない（codex-review P1 指摘・PR #217 対応。以前は本モジュールの
-//!   関数が `pub` かつ `operation_id` 引数を持たず、`crate::core::EngineCore` の
-//!   ガード付き入口を経由しない直接呼び出しでガードを迂回できた）。
-//! - `pub(crate) fn` の `insert_row_unchecked`・`insert_rows_unchecked`・
-//!   `insert_typed_row_unchecked`・`update_row_unchecked`・`delete_row_unchecked` は
-//!   ガード検証を持たず、`operation_id` 必須化ガードを**呼び出し元が別の場所で
-//!   既に通した**ことを前提にする（`crate::core::EngineCore::{insert_row, update_row,
-//!   delete_row}` は `self.ledger_mode`（`CompareOnlyWithoutLedger` を含む実構成）で
-//!   ガードした後にこちらへ委譲し、`crate::sql::exec::execute_insert` は
-//!   `crate::sql::allowlist::validate_insert` がガード済みであることを前提にこちらへ
-//!   委譲する）。クレート外へは公開されない（`pub(crate)`）ため、上記 2 経路以外から
-//!   ガードを迂回して呼べない。
+//! `pub fn` の [`insert_row`]・[`insert_rows`]・[`insert_typed_row`]・[`update_row`]・
+//! [`delete_row`] は `operation_id: &OperationId` を必須引数として要求する
+//! （codex-review P1 指摘・PR #217 対応。詳細は `recovery::required_op_id`
+//! モジュールドキュメント参照）。ガード検証を持たない `pub(crate)` の
+//! `*_unchecked` 版はクレート外へ公開しない。
 //!
 //! `policy.rs::PolicyContext::is_visible` の単一照合パス（CORE-2）へすべての可視性
 //! 判定を委譲し、本モジュール独自のテナント比較は持たない（security.md P0）。

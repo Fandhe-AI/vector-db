@@ -1259,18 +1259,9 @@ struct ParsedInsertShape {
 /// `expect_end_of_statement` が余剰トークンとして `42601` で拒否するため、
 /// SELECT/INSERT を誤って混同受理する経路は構造的に存在しない）。
 ///
-/// 検証順序（決定的。同一入力には常に同一の [`SqlSurfaceError`] を返す）:
-/// 1. 字句解析（[`SqlSurfaceError::UnsupportedSyntax`]）
-/// 2. 構造の許可リスト判定
-/// 3. `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）。
-///    `mode` が [`LedgerMode::Ledgered`]（既定）かつ `operation_id` が省略
-///    （句の欠落・明示 `NULL` を含む）の場合、この段階で
-///    [`SqlSurfaceError::MissingOperationId`]（`23502`）として拒否され、
-///    カタログ照会（次段）は一切呼ばれない＝書き込みトランザクションは
-///    絶対に開始されていない（SQL-10 の要件）。保護の適用可否は `mode`
-///    （サーバー構成）のみで決まり、クライアント入力では変えられない。
-/// 4. INTO 単一テーブルのカタログ存在確認（不存在は [`SqlSurfaceError::UndefinedTable`]、
-///    `wire_code` は `42P01`）
+/// 検証順序は決定的（同一入力には常に同一の [`SqlSurfaceError`] を返す）。
+/// `operation_id` 必須化ガード（`mode.require`。TASK-92・RECOVER-1）を含む段階構成の
+/// 詳細は `recovery::required_op_id` モジュールドキュメント参照。
 pub fn validate_insert(
     sql: &str,
     lookup: &impl TableLookup,
