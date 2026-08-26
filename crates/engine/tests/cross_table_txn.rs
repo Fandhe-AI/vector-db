@@ -47,8 +47,14 @@ fn table10_commit_reflects_both_tables_atomically() {
     txn.log_batch(0).expect("log_batch");
     txn.commit().expect("commit");
 
-    assert_eq!(storage.get(0).expect("get row 0").embedding, embedding);
-    assert_eq!(storage.get(1).expect("get row 1").embedding, embedding);
+    assert_eq!(
+        storage.get("tenant-a", 0).expect("get row 0").embedding,
+        embedding
+    );
+    assert_eq!(
+        storage.get("tenant-a", 1).expect("get row 1").embedding,
+        embedding
+    );
     assert_eq!(
         storage.scan_batch_log().expect("scan_batch_log"),
         vec![(0, 2)]
@@ -70,7 +76,9 @@ fn table10_drop_without_commit_discards_both_tables() {
         // commit も abort も呼ばずスコープを抜ける。
     }
 
-    let get_err = storage.get(0).expect_err("row must not exist after drop");
+    let get_err = storage
+        .get("tenant-a", 0)
+        .expect_err("row must not exist after drop");
     assert!(matches!(
         get_err,
         engine::storage::StorageError::NotFound(0)
@@ -93,7 +101,9 @@ fn table10_abort_discards_both_tables() {
     txn.log_batch(0).expect("log_batch");
     txn.abort().expect("abort");
 
-    let get_err = storage.get(0).expect_err("row must not exist after abort");
+    let get_err = storage
+        .get("tenant-a", 0)
+        .expect_err("row must not exist after abort");
     assert!(matches!(
         get_err,
         engine::storage::StorageError::NotFound(0)
@@ -173,7 +183,7 @@ fn table10_log_batch_rejects_duplicate_seq_and_preserves_existing_entry() {
         "existing batch_log entry must remain unchanged"
     );
     let get_err = storage
-        .get(1)
+        .get("tenant-a", 1)
         .expect_err("row from aborted duplicate txn must not exist");
     assert!(matches!(
         get_err,
@@ -233,7 +243,7 @@ fn table10_batch_write_txn_rejects_commit_of_unlogged_put_even_without_any_log_b
     ));
 
     let get_err = storage
-        .get(0)
+        .get("tenant-a", 0)
         .expect_err("row from rejected commit must not exist");
     assert!(matches!(
         get_err,
@@ -363,7 +373,10 @@ fn table10_storage_put_after_batch_write_txn_leaves_ledger_unchanged() {
 
     let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
     assert_eq!(rows.len(), 2);
-    assert_eq!(storage.get(0).expect("get row 0").embedding, [9.0]);
+    assert_eq!(
+        storage.get("tenant-a", 0).expect("get row 0").embedding,
+        [9.0]
+    );
     let batch_log = storage.scan_batch_log().expect("scan_batch_log");
     assert_eq!(
         batch_log,
@@ -420,7 +433,7 @@ fn table10_commit_rejects_rows_put_after_last_log_batch() {
     // commit 自体が失敗しているため、行 0（log_batch 済み）を含めトランザクション
     // 全体が未確定のまま。再オープンしても何も残っていないことを確認する。
     let get_err = storage
-        .get(0)
+        .get("tenant-a", 0)
         .expect_err("row from rejected commit must not exist");
     assert!(matches!(
         get_err,
@@ -456,7 +469,10 @@ fn table10_log_batch_does_not_double_count_overwritten_id_within_same_batch() {
     // 実在行は id=0（上書き後の値）・id=1 の 2 行のみ。
     let (rows, _) = storage.scan_page(None, 100).expect("scan_page");
     assert_eq!(rows.len(), 2);
-    assert_eq!(storage.get(0).expect("get row 0").embedding, [9.0]);
+    assert_eq!(
+        storage.get("tenant-a", 0).expect("get row 0").embedding,
+        [9.0]
+    );
 
     let batch_log = storage.scan_batch_log().expect("scan_batch_log");
     assert_eq!(

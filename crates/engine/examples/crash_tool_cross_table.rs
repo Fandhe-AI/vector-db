@@ -119,21 +119,25 @@ struct ResumeState {
 /// 取得のみ・O(log n)）を使うため、台帳件数が `MAX_BATCH_LOG_ROWS` を超えても
 /// 再開経路自体は上限に依存しない（Issue #132）。
 fn find_resume_state(storage: &Storage) -> Result<ResumeState, String> {
-    let mut cursor: Option<u64> = None;
-    let mut last_row_id: Option<u64> = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
+    // 本ツールは単一テナント（`CRASH_TOOL_TENANT_ID`）のみを書き込むため、物理キー
+    // `(tenant_id, id)`（TABLE-12）の走査順はそのまま `id` 昇順になる。複数テナントを
+    // 書き込む場合は「最後の行」ではなく走査した全行の `id` の `max()` を取る必要がある。
+    let mut max_row_id: Option<u64> = None;
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (rows, next_cursor) = storage
-            .scan_page(cursor, PAGE_LIMIT)
+            .scan_page(cursor_ref, PAGE_LIMIT)
             .map_err(|e| format!("scan_page failed: {e}"))?;
-        if let Some(last) = rows.last() {
-            last_row_id = Some(last.id);
+        for row in &rows {
+            max_row_id = Some(max_row_id.map_or(row.id, |m| m.max(row.id)));
         }
         match next_cursor {
             Some(c) => cursor = Some(c),
             None => break,
         }
     }
-    let next_row_id = match last_row_id {
+    let next_row_id = match max_row_id {
         Some(id) => id
             .checked_add(1)
             .ok_or_else(|| "row id overflow while resuming".to_string())?,
@@ -234,12 +238,13 @@ fn verify_inner(path: &str) -> Result<(u64, u64), String> {
     let storage = Storage::open(path).map_err(|e| format!("open failed: {e}"))?;
 
     // 行テーブル側: ID の 0 起点連続性・内容一致（PERSIST-1 のオラクルと同方針）。
-    let mut cursor: Option<u64> = None;
+    let mut cursor: Option<engine::storage::RowCursor> = None;
     let mut expected_id: u64 = 0;
     let mut total_rows: u64 = 0;
     loop {
+        let cursor_ref = cursor.as_ref().map(|(t, id)| (t.as_str(), *id));
         let (rows, next_cursor) = storage
-            .scan_page(cursor, PAGE_LIMIT)
+            .scan_page(cursor_ref, PAGE_LIMIT)
             .map_err(|e| format!("scan_page failed: {e}"))?;
         for row in &rows {
             if row.id != expected_id {

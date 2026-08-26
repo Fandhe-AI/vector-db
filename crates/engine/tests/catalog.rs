@@ -13,8 +13,9 @@ use engine::storage::{RowInput, Storage, Visibility};
 
 /// `storage.rs::ROWS_TABLE` と同一のテーブル定義（`pub(crate)` のため本クレート外の
 /// ここでは参照できず、`tests/persistence.rs` と同じ流儀でローカルに再宣言する）。
+/// 物理キーは `(tenant_id, id)` の複合キー（対象ビヘイビア: TABLE-12）。
 /// 行データの生バイト列を検証するテスト（TABLE-4/TABLE-5）でのみ使う。
-const ROWS_TABLE: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("rows");
+const ROWS_TABLE: redb::TableDefinition<(&str, u64), &[u8]> = redb::TableDefinition::new("rows");
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -139,7 +140,7 @@ fn seed_rows(storage: &Storage, count: u64) {
 /// `Storage::scan()` はエンコード後の値をデコードして返すため、デコード→再エンコードが
 /// 恒等写像でない将来の変更を見逃し得る。TABLE-4/TABLE-5 の検証は、この生バイト列
 /// 比較でのみ厳密に行える。
-fn read_raw_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>)> {
+fn read_raw_rows(path: &std::path::Path) -> Vec<((String, u64), Vec<u8>)> {
     let db = redb::Database::open(path).expect("reopen raw database for row inspection");
     let read_txn = db.begin_read().expect("begin_read");
     let table = read_txn.open_table(ROWS_TABLE).expect("open rows table");
@@ -148,7 +149,8 @@ fn read_raw_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>)> {
         .expect("iterate rows table")
         .map(|entry| {
             let (k, v) = entry.expect("row entry");
-            (k.value(), v.value().to_vec())
+            let (tenant_id, id) = k.value();
+            ((tenant_id.to_string(), id), v.value().to_vec())
         })
         .collect()
 }

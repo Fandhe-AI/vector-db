@@ -168,6 +168,7 @@ pub enum StorageError {
     UnloggedRows(u64),
     EmptyBatch,
     GenerationCounterOverflow,
+    IncompatibleRowKeyFormat,
 }
 
 # source: crates/engine/src/catalog.rs :: CatalogError
