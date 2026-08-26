@@ -33,25 +33,26 @@
 //!   ゲート〔`simd_bench.rs`〕が別途担う関心事であり、本ゲートに混ぜると
 //!   再び判別力を失う）。
 //! - CORE-6（GPU 経路 vs CPU-SIMD の p95 短縮率）・CORE-16（f16 常駐 vs f32 常駐の
-//!   p95 短縮率）: 実 GPU バックエンド未接続のため実測不能
-//!   （`crates/engine/src/batch_search.rs` モジュール冒頭コメント参照。CPU 上の
-//!   参照実装を GPU の代替として計測することはアサーション弱体化にあたるため行わない）。
-//!   `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in）が未設定（空文字含む）の既定では
-//!   「対象外」を標準出力へ明示するのみで合否には数えない（`simd_bench.rs` の
-//!   CORE-5 opt-in の骨格を踏襲するが、opt-in 判定は非空値ならすべて要求とみなす
-//!   よう本ファイル側で強化している。レビュー指摘対応: `"1"` 完全一致のみを
-//!   有効とみなす方式だと `"true"`/`"yes"` 等の non-"1" な truthy 値がサイレントに
-//!   「未設定」と同じ fail-open 側へ落ちるため）。フラグ指定時は「実 GPU 経路が
-//!   未実装のため本フラグはまだ使用不可（GPU 実行への置き換え後に有効化される。
-//!   `batch_search.rs` モジュール冒頭コメント参照）」ことを明示し、無条件で
-//!   `pass=false` とする（レビュー指摘対応: 以前は「opt-in する」という運用上の
-//!   誘導文言だけがあり、`check_improvement_at_least`〔判定ロジック本体〕を呼ぶ
-//!   実測経路が存在しない不一致があった）。あわせて、判定ロジック自体の配線
-//!   （env フラグ読み取り → 実測 → `check_improvement_at_least` 呼び出し →
-//!   標準出力）が壊れていないかを CPU 経路同士の疎通測定で確認する
-//!   （[`run_wiring_smoke`]）。これは GPU 実測の代替ではなく合否にも数えない
-//!   ——同一 CPU 経路同士なので改善率は意味を持たない——が、配線そのものが
-//!   `panic`/`Err` せず最後まで動くことだけを確認する。
+//!   p95 短縮率）: `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in。未設定・空文字のみ
+//!   「対象外」とし、非空値はすべて opt-in 要求とみなす）で有効化する実測ゲート
+//!   （Issue #178 で実 GPU バックエンド〔`engine::gpu_batch`〕が接続されたため、
+//!   従来の「未実装のため常に pass=false」を実測経路へ置き換えた）。
+//!   - CORE-6: 対照 A = CPU-SIMD バッチ経路（`BatchEngine::batch_search`。f16 常駐
+//!     行列を CPU の実行時 SIMD 検出カーネルで全走査）、被検 B = GPU バックエンド
+//!     （`FallbackBatchEngine::build_with_gpu`）。閾値は
+//!     `BENCH_CORE6_MIN_IMPROVEMENT_PCT` から注入し未設定は fail-closed。
+//!     GPU が初期化できない環境（CI の GitHub ホステッド runner 等）で opt-in された
+//!     場合は「判定不能」を `pass=false` として報告する（CPU 経路同士の比較値を
+//!     GPU 実測の代替として計上しない＝アサーション弱体化を避ける）。計測中に
+//!     CPU 縮退（CORE-8）が起きた場合も同様に `pass=false`（縮退後の値は GPU 経路の
+//!     実測ではないため）。
+//!   - CORE-16: **GPU 常駐コピーの f16 パック vs f32 常駐**の比較であり、現状の
+//!     GPU バックエンドは f16 パック常駐のみを実装していて GPU 側の f32 常駐対照
+//!     経路が無いため実測不能。opt-in 時はその理由を明示して `pass=false` とする
+//!     （CPU 経路同士の f16/f32 比較は本 ID の対象外のため代替に使わない）。
+//!
+//!
+//!   いずれも実測値と pass/fail のみを標準出力へ書き、注入した閾値は出力しない。
 
 // `harness` の取り込み方針は `simd_bench.rs` と同一（本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
@@ -68,7 +69,6 @@ use harness::rng::DeterministicRng;
 use engine::batch_search::{BatchEngine, BatchQuery, DynamicWindowAggregator, ResidentMatrix};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
-use std::time::Instant;
 
 /// CORE-7 ゲートで 1 反復あたり集約器へ通すクエリ本数。1 本単位では `push`/`drain`
 /// が数百ナノ秒程度で終わり `Instant` の分解能・関数呼び出しオーバーヘッドへ
@@ -79,13 +79,16 @@ const AGG_BATCH_SIZE: usize = 256;
 /// CORE-7 ゲートで集約するクエリの次元数。
 const AGG_QUERY_DIM: usize = 768;
 
-/// CORE-6/CORE-16 の配線疎通測定（[`run_wiring_smoke`]）専用の合成データセット規模。
-/// GPU 実測の代替ではなく「関数呼び出しが最後まで動くこと」の確認が目的のため、
-/// `BatchEngine::batch_search` が現実的な時間で完走する程度の小規模で十分とし、
-/// `AGG_BATCH_SIZE` 系のミリ秒級 CORE-7 計測と混同しないよう独立した定数にする。
-const SMOKE_ROW_COUNT: usize = 2_000;
-const SMOKE_DIM: usize = 64;
-const SMOKE_TOP_K: usize = 5;
+/// CORE-6/CORE-16 ゲートの実測に使う合成データセット規模（本ベンチ固有の測定条件で
+/// あり spec の閾値ではない）。GPU 転送・dispatch の固定コストを償却できる程度の
+/// 行数・次元にしつつ、GPU 非搭載環境でも CORE-16 側（CPU 上の f16/f32 比較）が
+/// 現実的な時間で完走する規模に留める。
+const GPU_GATE_ROW_COUNT: usize = 20_000;
+const GPU_GATE_DIM: usize = 256;
+const GPU_GATE_TOP_K: usize = 10;
+/// 1 反復あたりのバッチ本数（GPU 経路はクエリ単位に dispatch するため、1 本だと
+/// 転送・同期の固定コストが支配的になり経路差が現れない）。
+const GPU_GATE_BATCH_SIZE: usize = 8;
 
 /// CORE-7 ゲートの計測に使うテナント ID（本ベンチ専用の合成データ。実データではない）。
 const BENCH_TENANT: &str = "task-130-bench-tenant";
@@ -123,90 +126,182 @@ fn opt_in_requested_from_env(var: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// CORE-6/CORE-16 opt-in フラグの「配線」だけを CPU 経路同士で疎通確認する
-/// （[`check_improvement_at_least`] を実際に呼ぶ実測経路が存在しない、という
-/// レビュー指摘への対応）。`baseline`/`candidate` はどちらも同一の
-/// `BatchEngine::batch_search`（CPU 参照実装）を同一入力で 1 回ずつ呼んで得た
-/// 実測時間であり、同一経路同士のため改善率に意味はない（GPU 実測の代替では
-/// ない）。ここで確認したいのは「env 読み取り → 実測 → `check_improvement_at_least`
-/// 呼び出し → 標準出力」という配線が `panic`/`Err` せず最後まで通ること自体であり、
-/// 戻り値の pass/fail は疎通確認の対象外として全体の合否（`passed`）には反映しない。
-/// 関数呼び出し自体が `Err` を返した場合（= 配線が壊れている）は疎通確認の失敗として
-/// 呼び出し元へ伝える。
-fn run_wiring_smoke(
-    label: &str,
-    batch_engine: &BatchEngine,
-    ctx: &PolicyContext,
-) -> Result<(), String> {
-    let query = vec![0.1_f32; SMOKE_DIM];
-    let batch_queries = [BatchQuery {
-        vector: &query,
-        k: SMOKE_TOP_K,
-        ctx,
-    }];
+/// `BENCH_CORE6_MIN_IMPROVEMENT_PCT` を読み取り、
+/// p95 短縮率の下限として使う値を得る。opt-in されているのに閾値が未設定・非数値・
+/// 非正値の場合は「判定不能」として fail-closed に `Err` を返す
+/// （[`max_degradation_pct_from_env`] と同一方針。数値そのものは spec が SSOT であり
+/// 本ファイルにデフォルト値を持たない——`.claude/rules/spec-confidentiality.md`）。
+fn min_improvement_pct_from_env(var: &str) -> Result<f64, String> {
+    let raw = std::env::var(var)
+        .map_err(|_| format!("{var} is not set (see .github/workflows/bench.yml vars)"))?;
+    let value: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("{var} must be a floating-point number"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("{var} must be a finite, positive value"));
+    }
+    Ok(value)
+}
 
-    let start_baseline = Instant::now();
-    batch_engine
-        .batch_search(&batch_queries)
-        .map_err(|err| format!("{label} wiring smoke: baseline batch_search failed: {err}"))?;
-    let baseline = start_baseline.elapsed();
+/// CORE-6/CORE-16 ゲート用の合成データセット（本ベンチ専用。実データではない）。
+/// 単一テナント・全 `Public` の素直な配置にし、テナントマスクの分岐差が経路間の
+/// 比較へ混ざらないようにする。
+struct GateDataset {
+    ids: Vec<u64>,
+    tenant_ids: Vec<String>,
+    visibilities: Vec<Visibility>,
+    vectors: Vec<f32>,
+    queries: Vec<Vec<f32>>,
+}
 
-    let start_candidate = Instant::now();
-    batch_engine
-        .batch_search(&batch_queries)
-        .map_err(|err| format!("{label} wiring smoke: candidate batch_search failed: {err}"))?;
-    let candidate = start_candidate.elapsed();
-
-    // 疎通確認専用の暫定しきい値（spec の受け入れ基準値ではない。CPU 経路同士の
-    // 比較で `check_improvement_at_least` の入力検証（有限・正値）を満たすためだけの
-    // 値で、判定結果自体は合否に使わない）。
-    const WIRING_SENTINEL_PCT: f64 = 0.001;
-    match check_improvement_at_least(baseline, candidate, WIRING_SENTINEL_PCT) {
-        Ok(result) => {
-            println!(
-                "{label}_wiring_smoke: baseline={baseline:?} candidate={candidate:?} \
-                 result={result} (CPU-vs-CPU plumbing check only; not a GPU measurement; \
-                 not counted toward pass/fail)"
-            );
-            Ok(())
-        }
-        Err(err) => Err(format!(
-            "{label} wiring smoke: check_improvement_at_least failed: {err}"
-        )),
+fn build_gate_dataset(rng: &mut DeterministicRng) -> GateDataset {
+    let ids: Vec<u64> = (0..GPU_GATE_ROW_COUNT as u64).collect();
+    let tenant_ids: Vec<String> =
+        std::iter::repeat_n(BENCH_TENANT.to_string(), GPU_GATE_ROW_COUNT).collect();
+    let visibilities: Vec<Visibility> =
+        std::iter::repeat_n(Visibility::Public, GPU_GATE_ROW_COUNT).collect();
+    let mut vectors = Vec::with_capacity(GPU_GATE_ROW_COUNT * GPU_GATE_DIM);
+    for _ in 0..GPU_GATE_ROW_COUNT {
+        vectors.extend(rng.next_vector(GPU_GATE_DIM));
+    }
+    let queries: Vec<Vec<f32>> = (0..GPU_GATE_BATCH_SIZE)
+        .map(|_| rng.next_vector(GPU_GATE_DIM))
+        .collect();
+    GateDataset {
+        ids,
+        tenant_ids,
+        visibilities,
+        vectors,
+        queries,
     }
 }
 
-/// GPU 未接続の opt-in ゲート 1 本分の標準出力・合否寄与を処理する（CORE-6/CORE-16 共通）。
-/// 既定（未設定）では「対象外」を明示するのみで合否に数えない（silent skip にしない）。
-/// フラグ指定時は「実 GPU 経路が未実装のため本フラグはまだ使用不可」であることを明示し
-/// `pass=false` とする（レビュー指摘対応: `check_improvement_at_least` を呼ぶ実測経路が
-/// 存在しないまま「opt-in する」とだけ案内していた不一致を解消する）。あわせて配線疎通
-/// （[`run_wiring_smoke`]）を実行し、疎通自体が壊れていれば `Err` として報告する。
-fn report_gpu_unconnected_gate(
-    label: &str,
-    var: &str,
-    batch_engine: &BatchEngine,
-    ctx: &PolicyContext,
-) -> Result<bool, String> {
-    let requested = opt_in_requested_from_env(var);
-    if requested {
-        println!(
-            "{label}: not usable yet (real GPU backend not implemented; this flag will be \
-             enabled once the GPU execution path replaces the CPU reference implementation; \
-             see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) \
-             requested=true pass=false"
-        );
-        run_wiring_smoke(label, batch_engine, ctx)?;
-        Ok(false)
-    } else {
-        println!(
-            "{label}: out of scope for this run (real GPU backend not implemented; not counted \
-             toward pass/fail; set {var}=1 to see the not-usable-yet message once opted in; \
-             see crates/engine/src/batch_search.rs module doc, TASK-130 CORE-6/CORE-16 pointer) \
-             requested=false"
-        );
-        Ok(true)
+/// CORE-8 の縮退イベント件数だけを数える observer（GPU ゲートの測定妥当性判定用）。
+/// 構築時・計測中に 1 件でも縮退が起きていれば、その測定値は GPU 経路のものでは
+/// ないため「判定不能（`pass=false`）」に倒す。
+struct CountingObserver(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl engine::batch_fallback::FallbackObserver for CountingObserver {
+    fn on_fallback(&self, event: engine::batch_fallback::FallbackEvent) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("batch_bench: fallback observed during gpu gate: {event}");
     }
+}
+
+/// `run_ab` の 1 反復分として与えるバッチクエリ列を組み立てる（測定区間外での
+/// 参照の組み立てはできないため、各ワークロード内で `BatchQuery` を作る。
+/// クエリベクトル本体は事前生成済みで確保・コピーは発生しない）。
+fn gate_batch_queries<'a>(queries: &'a [Vec<f32>], ctx: &'a PolicyContext) -> Vec<BatchQuery<'a>> {
+    queries
+        .iter()
+        .map(|q| BatchQuery {
+            vector: q.as_slice(),
+            k: GPU_GATE_TOP_K,
+            ctx,
+        })
+        .collect()
+}
+
+/// CORE-6 ゲート（GPU 経路 vs CPU-SIMD 経路の p95 短縮率）。
+/// opt-in されていなければ「対象外」を出力して合否に数えない（silent skip にしない）。
+/// opt-in 時に GPU が初期化できない・計測中に CPU 縮退した場合は `pass=false`
+/// （fail-closed。CPU 同士の比較値を GPU 実測の代替として計上しない）。
+fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, String> {
+    const LABEL: &str = "gpu_vs_cpu_simd_p95";
+    if !opt_in_requested_from_env("BENCH_CORE6") {
+        println!(
+            "{LABEL}: out of scope for this run (not counted toward pass/fail; \
+             set BENCH_CORE6=1 with BENCH_CORE6_MIN_IMPROVEMENT_PCT to enable) requested=false"
+        );
+        return Ok(true);
+    }
+    let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE6_MIN_IMPROVEMENT_PCT")?;
+
+    let fallback_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let gpu_engine = engine::batch_fallback::FallbackBatchEngine::build_with_gpu(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        GPU_GATE_DIM,
+        &dataset.vectors,
+        Box::new(CountingObserver(std::sync::Arc::clone(&fallback_count))),
+    )
+    .map_err(|err| format!("{LABEL}: gpu-backed engine build failed: {err}"))?;
+    if fallback_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        println!(
+            "{LABEL}: not measurable in this environment (gpu backend unavailable; \
+             cpu fallback engaged) requested=true pass=false"
+        );
+        return Ok(false);
+    }
+
+    let cpu_matrix = ResidentMatrix::build(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        GPU_GATE_DIM,
+        &dataset.vectors,
+    )
+    .map_err(|err| format!("{LABEL}: resident matrix build failed: {err}"))?;
+    let cpu_engine = BatchEngine::new(cpu_matrix);
+
+    let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
+    let workload_a = || {
+        let queries = gate_batch_queries(&dataset.queries, ctx);
+        cpu_engine.batch_search(&queries).map(|hits| hits.len())
+    };
+    let workload_b = || {
+        let queries = gate_batch_queries(&dataset.queries, ctx);
+        gpu_engine.batch_search(&queries).map(|hits| hits.len())
+    };
+    let ab = run_ab(&config, workload_a, workload_b)
+        .map_err(|err| format!("{LABEL}: A/B measurement failed: {err}"))?;
+    if fallback_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        println!(
+            "{LABEL}: not measurable in this environment (cpu fallback engaged during \
+             measurement) requested=true pass=false"
+        );
+        return Ok(false);
+    }
+
+    let p95_a = p95_from_samples(&ab.a.samples)
+        .map_err(|err| format!("{LABEL}: p95 of A samples unavailable: {err}"))?;
+    let p95_b = p95_from_samples(&ab.b.samples)
+        .map_err(|err| format!("{LABEL}: p95 of B samples unavailable: {err}"))?;
+    let pass = check_improvement_at_least(p95_a, p95_b, min_improvement_pct)
+        .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
+    println!(
+        "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
+         cpu_simd_p95={p95_a:?} gpu_p95={p95_b:?} requested=true pass={pass}"
+    );
+    Ok(pass)
+}
+
+/// CORE-16 ゲート（GPU 常駐コピーの f16 パック vs f32 常駐の p95 短縮率）。
+///
+/// 本 ID の A/B は **GPU バッチ経路上**の常駐形式比較であり（ポインタ:
+/// `docs/spec/04-behavior/core-engine.md` CORE-16。CPU-SIMD 経路への f16 適用は
+/// 本 ID の対象外）、現状の `gpu_batch.rs` は f16 パック常駐のみを実装していて
+/// GPU 側の f32 常駐対照経路が存在しないため実測不能である。opt-in された場合は
+/// その理由を明示して `pass=false` とする（CPU 経路同士の f16/f32 比較を代替として
+/// 計上しない。CORE-6 側と同じ方針＝アサーション弱体化を避ける）。
+fn run_core16_gate() -> bool {
+    const LABEL: &str = "f16_resident_vs_f32_resident_p95";
+    if !opt_in_requested_from_env("BENCH_CORE16") {
+        println!(
+            "{LABEL}: out of scope for this run (not counted toward pass/fail; \
+             set BENCH_CORE16=1 to see the not-measurable report) requested=false"
+        );
+        return true;
+    }
+    println!(
+        "{LABEL}: not measurable yet (the gpu backend keeps the resident copy in f16 \
+         packed form only; no f32-resident gpu baseline path exists to compare against, \
+         and a cpu-only f16/f32 comparison is out of scope for this behavior) \
+         requested=true pass=false"
+    );
+    false
 }
 
 /// CORE-7 A/B 計測の測定区間からクエリ確保・コピーを追い出すための事前生成
@@ -299,52 +394,19 @@ fn main() {
         ab.a.summary.median, ab.b.summary.median,
     );
 
-    // --- CORE-6 / CORE-16: 実 GPU 未接続の opt-in fail-closed ゲート＋配線疎通確認 ---
-    // 配線疎通用の合成データ（実データではない・GPU 実測の代替ではない）。
-    let smoke_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
-    let smoke_ids: Vec<u64> = (0..SMOKE_ROW_COUNT as u64).collect();
-    let smoke_tenant_ids: Vec<String> =
-        std::iter::repeat_n(BENCH_TENANT.to_string(), SMOKE_ROW_COUNT).collect();
-    let smoke_visibilities: Vec<Visibility> =
-        std::iter::repeat_n(Visibility::Public, SMOKE_ROW_COUNT).collect();
-    let mut smoke_vectors = Vec::with_capacity(SMOKE_ROW_COUNT * SMOKE_DIM);
-    for _ in 0..SMOKE_ROW_COUNT {
-        smoke_vectors.extend(rng.next_vector(SMOKE_DIM));
-    }
-    let smoke_matrix = ResidentMatrix::build(
-        &smoke_ids,
-        &smoke_tenant_ids,
-        &smoke_visibilities,
-        SMOKE_DIM,
-        &smoke_vectors,
-    )
-    .expect("resident matrix must build for well-formed synthetic smoke input");
-    let smoke_batch_engine = BatchEngine::new(smoke_matrix);
+    // --- CORE-6 / CORE-16: opt-in の実測ゲート（Issue #178 で実 GPU バックエンドへ
+    // 接続済み。未 opt-in なら「対象外」を出力するだけで合否に数えない）---
+    let gate_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
+    let gate_dataset = build_gate_dataset(&mut rng);
 
-    let core6_ok = match report_gpu_unconnected_gate(
-        "gpu_vs_cpu_simd_p95",
-        "BENCH_CORE6",
-        &smoke_batch_engine,
-        &smoke_ctx,
-    ) {
+    let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx) {
         Ok(ok) => ok,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
     };
-    let core16_ok = match report_gpu_unconnected_gate(
-        "f16_resident_vs_f32_resident_p95",
-        "BENCH_CORE16",
-        &smoke_batch_engine,
-        &smoke_ctx,
-    ) {
-        Ok(ok) => ok,
-        Err(msg) => {
-            eprintln!("batch_bench: {msg}");
-            std::process::exit(1);
-        }
-    };
+    let core16_ok = run_core16_gate();
     passed &= core6_ok;
     passed &= core16_ok;
 

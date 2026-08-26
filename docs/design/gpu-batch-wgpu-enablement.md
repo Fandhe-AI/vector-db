@@ -77,7 +77,7 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 ### 2.3 スコープ縮小事項（当初計画からの差分）
 
 実装時間の制約により、以下は当初計画（`BatchPlan` によるテナント別グループ
-dispatch・チャンク分割・ベンチ A/B 実測配線）から縮小した。挙動の正しさ・
+dispatch・チャンク分割）から縮小した。挙動の正しさ・
 安全性には影響しないが、性能特性・網羅性が計画より狭い:
 
 - `batch_search.rs::run_batch_search` の内部（テナント別精緻化された work
@@ -88,9 +88,6 @@ dispatch・チャンク分割・ベンチ A/B 実測配線）から縮小した�
 - dispatch はクエリ単位（バッチ内の複数クエリを 1 回の dispatch にまとめる
   最適化は行わない）。行数が `GPU_SCORE_BUFFER_BUDGET_BYTES`
   （32 MiB）を超える場合はクエリ内で行チャンクへ分割する
-- `benches/batch_bench.rs`（TASK-130 の CORE-6/16 opt-in ゲート）は実 GPU
-  経路への実測配線を行っていない。バックエンド自体は接続済みのため、後続の
-  作業で `FallbackBatchEngine::build_with_gpu` を使った A/B 計測へ配線できる
 - GPU バッファ（スコア/リードバック/クエリ）の呼び出し間再利用（CORE-15 の
   プール方針を GPU ステージングへ拡張）は行っておらず、呼び出しごとに
   確保・解放する
@@ -119,6 +116,24 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
 スロットの拒否・不可視行の拒否・テナント跨ぎ同一 `id` の区別、および出力が
 `revalidate_primary_hits` を通ること／行 id 順の出力が拒否されることの回帰）。
 
+### 2.5 ベンチ A/B 実測配線（CORE-6/CORE-16 opt-in ゲート）
+
+`benches/batch_bench.rs` の `BENCH_CORE6`/`BENCH_CORE16` opt-in フラグは、
+「実 GPU 未実装のため常に `pass=false`」という案内から実測経路へ置き換えた:
+
+- CORE-6: 対照 = `BatchEngine::batch_search`（CPU-SIMD・f16 常駐）、被検 =
+  `FallbackBatchEngine::build_with_gpu`。GPU が初期化できない環境・計測中に
+  CPU 縮退（CORE-8）が発生した場合は「測定不能（`pass=false`）」とし、CPU 同士の
+  比較値を GPU 実測の代替として計上しない
+- CORE-16: GPU 常駐コピーの f16 パックと f32 常駐の比較（ポインタ:
+  `docs/spec/04-behavior/core-engine.md` CORE-16）であり、現状の GPU バックエンドは
+  f16 パック常駐のみを実装していて GPU 側の f32 常駐対照経路が無いため実測不能。
+  opt-in 時は理由を明示して `pass=false` とする（CPU 経路同士の f16/f32 比較は
+  本 ID の対象外のため代替に使わない）
+- CORE-6 の短縮率下限は `BENCH_CORE6_MIN_IMPROVEMENT_PCT`（Actions variables）から
+  注入し、未設定・非正値は fail-closed（値は spec が SSOT のため本リポに
+  デフォルトを持たない）
+
 ## 3. ローカル実測（開発環境）
 
 開発コンテナ内で GPU（NVIDIA、Vulkan backend）が実際に利用可能であることを
@@ -133,6 +148,10 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   正しさ・CPU オラクル（`kernel.rs::CpuScalarProvider`）とのスコア一致
   （相対誤差 1e-3 以内）を確認
   （`crates/engine/tests/gpu_batch.rs`）
+- `make bench-batch` の CORE-6 ゲート（`BENCH_CORE6` opt-in）が GPU 経路で
+  完走し、CPU-SIMD 経路との A/B p95 を実測できることを確認した（縮退イベント
+  0 件。閾値・判定値そのものは Actions variables 経由で注入されるため本文には
+  記録しない）
 - GitHub ホステッド runner（CI）には GPU が無いため、CI では常に
   「初期化失敗 → CPU-SIMD 縮退」分岐のみが実走する。開発環境（GPU あり）で
   両分岐（成功・初期化失敗）を実際に確認する仕組みは持たない
