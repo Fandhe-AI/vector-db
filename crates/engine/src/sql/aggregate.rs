@@ -115,6 +115,17 @@ impl Accumulator {
     ) -> Result<(), SqlSurfaceError> {
         match input {
             AggregateInput::AllVisible => self.observe_present(),
+            // nullable な `VECTOR` 列（TABLE-5 の `ALTER TABLE ADD COLUMN` で追加
+            // された列を含む）の裸の列参照。`row.embedding` が空 = 未設定（NULL）
+            // という `storage::Row` の既存契約に従い、NULL 行は数えない
+            // （PR #229 codex-review 指摘対応）。
+            AggregateInput::VectorColumnPresence => {
+                if embedding.is_empty() {
+                    Ok(())
+                } else {
+                    self.observe_present()
+                }
+            }
             AggregateInput::IdU64 => self.observe_id(id),
             AggregateInput::TextColumn(index) => {
                 let value = scanned.get(*index).copied().flatten();
@@ -132,9 +143,10 @@ impl Accumulator {
         }
     }
 
-    /// NULL・非存在の概念を持たない入力（`*`・`id`・`VECTOR` 列・`Scalar` 式）を
-    /// 数えるだけの経路。`COUNT` 以外がこの経路に来ることはない
-    /// （[`Accumulator::new`] の型検査）。
+    /// NULL・非存在の概念を持たない入力（`*`・`id`・`Scalar` 式）を数えるだけの
+    /// 経路。`VECTOR` 列は nullable のため別経路
+    /// （[`AggregateInput::VectorColumnPresence`]）を使う。`COUNT` 以外がこの
+    /// 経路に来ることはない（[`Accumulator::new`] の型検査）。
     fn observe_present(&mut self) -> Result<(), SqlSurfaceError> {
         match self {
             Accumulator::Count(n) => {
@@ -402,13 +414,21 @@ pub(crate) fn execute_aggregate(
             // 拒否するため、単純な `decode_row` ではなく `decode_row_for_key`
             // （TABLE-12 の整合検査）を使う（codex P0 指摘対応。PR #229）。
             let row = storage::decode_row_for_key(key_tenant, id, buf).map_err(storage_internal)?;
+            // `row.embedding` が空 = `VECTOR` 列が未設定（NULL、TABLE-5 の
+            // `ALTER TABLE ADD COLUMN` で追加された nullable 列を含む）という
+            // `storage::Row` の既存契約に従い、次元検証は値が実際に存在する行に
+            // だけ行う。空を無条件に次元不一致として拒否すると、`COUNT(*)` 等
+            // `VECTOR` 値を参照しない集計まで nullable 列の NULL 行で `XX000`
+            // 失敗する（PR #229 codex-review 指摘対応）。
             if let Some(dim) = expected_dim {
-                let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
-                if found != dim {
-                    return Err(SqlSurfaceError::Internal {
-                        detail: "aggregate row scan failed: embedding dimension mismatch"
-                            .to_string(),
-                    });
+                if !row.embedding.is_empty() {
+                    let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
+                    if found != dim {
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "aggregate row scan failed: embedding dimension mismatch"
+                                .to_string(),
+                        });
+                    }
                 }
             }
 
@@ -470,7 +490,98 @@ pub(crate) fn execute_aggregate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
     use crate::sql::allowlist::AggregateFunc;
+    use crate::sql::parser::{BoundAggregate, BoundAggregateItem};
+    use crate::storage::{RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// nullable な `VECTOR` 列を宣言するテーブルへ、`storage::encode_row`
+    /// （低レベル API）で直接行を書き込む。TABLE-5 が想定する「既存行が対象列を
+    /// 未設定のまま持つ」状態（`row.embedding` が空）を、現行の公開 INSERT 経路
+    /// （`tenant::insert_row` 系。`TableSchema::validate_embedding_dim` を介し常に
+    /// 次元一致を要求する）を経由せず直接再現するための検証専用ヘルパ（PR #229
+    /// codex-review 指摘対応）。
+    fn write_row_direct(
+        storage: &Storage,
+        table_name: &str,
+        tenant_id: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((tenant_id, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// nullable な `VECTOR` 列（TABLE-5 想定）を単一列として持つテーブルの
+    /// スキーマ・空 `BoundAggregate` を組み立てる共通部。
+    fn nullable_vector_schema() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(3), true)],
+        )
+    }
+
+    fn bound_single(func: AggregateFunc, input: AggregateInput) -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![BoundAggregateItem {
+                func,
+                input,
+                name: "result".to_string(),
+            }],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            rls_predicate_present: false,
+        }
+    }
+
+    #[test]
+    fn count_vector_column_skips_null_rows_but_count_star_does_not() {
+        let path = unique_db_path("agg-nullable-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        // id=1: VECTOR 値あり、id=2: nullable 列が未設定（embedding 空 = NULL）。
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        // COUNT(embedding) は NULL 行（id=2）を数えない。
+        let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
+        let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_vec)
+            .expect("COUNT(embedding) should succeed even with a NULL row present");
+        assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+
+        // COUNT(*) は VECTOR 値を参照しないため、nullable 列の NULL 行があっても
+        // 次元不一致（旧 XX000）を返さず両方の可視行を数える（本 PR の中心的指摘）。
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+            .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
+        assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+    }
 
     fn count_acc() -> Accumulator {
         Accumulator::new(AggregateFunc::Count, &AggregateInput::AllVisible).unwrap()

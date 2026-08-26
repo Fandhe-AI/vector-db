@@ -726,9 +726,10 @@ pub fn bind_insert(
 /// 集計対象値を取り出す（`schema`・`udfs` を再度参照しない自己完結な形）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AggregateInput {
-    /// `COUNT(*)`・`COUNT(id)`・`COUNT(<VECTOR 列>)`・`COUNT(<Scalar 型の式>)` の
-    /// いずれか。可視行はすべて対象（NULL・非存在の概念がない）。`COUNT` 以外の
-    /// 関数からこの variant を得ることはない（[`resolve_aggregate_input`] 参照）。
+    /// `COUNT(*)`・`COUNT(id)`・`COUNT(<Scalar 型の式>)` のいずれか。可視行はすべて
+    /// 対象（NULL・非存在の概念がない）。`COUNT` 以外の関数からこの variant を得る
+    /// ことはない（[`resolve_aggregate_input`] 参照）。`VECTOR` 列の裸の列参照は
+    /// nullable 属性を持つため対象外（[`AggregateInput::VectorColumnPresence`]）。
     AllVisible,
     /// 疑似列 `id`（`SUM`/`AVG`/`MIN`/`MAX`）。`f64` へ変換せず `u64` の
     /// `checked_add` で正確に演算する（`docs/spec/04-behavior/error-format.md`
@@ -742,6 +743,12 @@ pub(crate) enum AggregateInput {
     /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`sql::udf_call::eval` で
     /// `id`・embedding から評価する。
     ScalarExpr(crate::sql::udf_call::BoundExpr),
+    /// `VECTOR` 列の裸の列参照（`COUNT` 限定。[`resolve_aggregate_input`] 参照）。
+    /// 列は `ALTER TABLE ADD COLUMN`（TABLE-5）で追加された nullable な `VECTOR`
+    /// 列の可能性があり、値が未設定の可視行は NULL として `COUNT` から除外する
+    /// （`row.embedding` が空 = 未設定という [`crate::storage::Row`] の既存契約に
+    /// 従う。PR #229 codex-review 指摘対応）。
+    VectorColumnPresence,
 }
 
 /// 束縛済みの集計項目 1 つ（TASK-166・SQL-13）。
@@ -780,8 +787,8 @@ pub(crate) struct BoundAggregate {
 ///   [`AggregateInput::IdU64`]
 /// - `TEXT` 列 → `SUM`/`AVG` は型不整合（`22000`）、それ以外は
 ///   [`AggregateInput::TextColumn`]
-/// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::AllVisible`]、
-///   それ以外は型不整合（`22000`）
+/// - `VECTOR` 列（裸の列参照）→ `COUNT` は [`AggregateInput::VectorColumnPresence`]
+///   （非 NULL 行のみ数える）、それ以外は型不整合（`22000`）
 /// - 上記以外の識別子 → 未知の列（`22000`）
 /// - 複合式（`Expr::Call`・`Expr::Binary`・`Expr::Number`）→
 ///   `sql::udf_call::bind_expr` に委譲し、`Scalar` 型のみ
@@ -813,7 +820,9 @@ fn resolve_aggregate_input(
                         )))
                     }
                     (ColumnType::Text, _) => Ok(AggregateInput::TextColumn(index)),
-                    (ColumnType::Vector(_), AggregateFunc::Count) => Ok(AggregateInput::AllVisible),
+                    (ColumnType::Vector(_), AggregateFunc::Count) => {
+                        Ok(AggregateInput::VectorColumnPresence)
+                    }
                     (ColumnType::Vector(_), _) => Err(SqlSurfaceError::invalid_input(format!(
                         "column {name:?} is VECTOR and cannot be used with SUM/AVG/MIN/MAX"
                     ))),
@@ -1489,7 +1498,7 @@ mod tests {
         )
         .expect("bind should succeed");
         assert_eq!(bound.items.len(), 5);
-        assert_eq!(bound.items[0].input, AggregateInput::AllVisible);
+        assert_eq!(bound.items[0].input, AggregateInput::VectorColumnPresence);
         assert!(matches!(
             bound.items[1].input,
             AggregateInput::TextColumn(_)
