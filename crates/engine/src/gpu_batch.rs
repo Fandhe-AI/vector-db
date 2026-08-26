@@ -163,6 +163,19 @@ fn global_context() -> &'static Result<GpuContext, String> {
     CONTEXT.get_or_init(init_gpu_context)
 }
 
+/// プロセス共有 `wgpu::Device` への dispatch・バッファアップロードを直列化する
+/// グローバルロック（[`global_context`] と同じ生存範囲）。
+///
+/// [`GpuContext`] がプロセス単位で 1 つなのに対し [`GpuBatchBackend`] は
+/// 複数インスタンス存在しうるため、直列化はインスタンス単位ではなくプロセス単位で
+/// 行う（codex P1 指摘対応）。poisoning は無視する（保護対象は `()` のみで、
+/// panic により壊れる不変条件を持たないため。`batch_search.rs::row_buffer_pool`
+/// と同じ方針）。
+fn gpu_dispatch_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 /// GPU デバイスの初期化本体。失敗はすべて `Err(String)`（英語・adapter 名や
 /// テナント情報を含まない）として返し、panic 経路（`Instance::new` の一部条件
 /// 等）を事前ガードで避ける（TASK-128 設計ドキュメント §3.2 ポインタ）。
@@ -430,13 +443,6 @@ pub struct GpuBatchBackend {
     /// wgpu エラーの記録）。`batch_search` 冒頭で参照し、記録があれば GPU 経路を
     /// 使わず backend エラーを返して CPU 縮退（CORE-8）へ倒す。
     uncaptured_error: std::sync::Arc<AtomicBool>,
-    /// バッファ生成・dispatch は `&self` から呼ばれる（`BatchBackend` が
-    /// `&self` メソッドのみを要求する object-safe trait のため）。wgpu の
-    /// `Queue::submit`/`Buffer` 操作自体は内部で同期を取るが、複数スレッドが
-    /// 同時に同一 backend へ dispatch した場合の待ち合わせを明示するために
-    /// `Mutex<()>` で直列化する（正当性のためではなく、readback の
-    /// map_async コールバックが呼び出し順に混線しないようにするため）。
-    dispatch_lock: Mutex<()>,
 }
 
 impl GpuBatchBackend {
@@ -476,6 +482,11 @@ impl GpuBatchBackend {
 
         // 常駐行列バッファの確保・アップロードも error scope の内側で行い、
         // 失敗を `InitFailed`（＝CPU 縮退）へ写像する（codex P1 指摘対応）。
+        // `batch_search` の dispatch と同じグローバルロックで保護し、共有 Device
+        // への操作が並行しないようにする（codex P1 指摘対応）。
+        let _guard = gpu_dispatch_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let row_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -513,7 +524,6 @@ impl GpuBatchBackend {
             row_buffer,
             device_lost: ctx.device_lost.clone(),
             uncaptured_error: ctx.uncaptured_error.clone(),
-            dispatch_lock: Mutex::new(()),
         })
     }
 }
@@ -619,11 +629,19 @@ impl BatchBackend for GpuBatchBackend {
             }
         };
 
-        let _guard = self.dispatch_lock.lock().map_err(|_| {
-            BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
-                "dispatch lock poisoned".to_string(),
-            ))
-        })?;
+        // `GpuContext`（`wgpu::Device`）はプロセス共有の `OnceLock` であり、
+        // `GpuBatchBackend` インスタンスは複数存在しうる。したがって直列化は
+        // インスタンス単位ではなくプロセス単位で行う必要がある
+        // （codex P1 指摘対応: インスタンス単位の Mutex では、別インスタンスが
+        // 同じ Device へ並行に `push_error_scope`/`pop` を発行しうる。wgpu 30 の
+        // error scope スタックは `std` feature 有効時 thread-local であるため
+        // 本実装でスタックが交錯することは無いが、`device.poll` の駆動と
+        // `map_async` コールバックの完了待ちが相互に影響しうるため、
+        // 「共有 Device への dispatch は 1 つずつ」という不変条件を
+        // プロセス単位の lock で明示する）。
+        let _guard = gpu_dispatch_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dim = self.matrix.dim();
         let dim_half = dim.div_ceil(2);

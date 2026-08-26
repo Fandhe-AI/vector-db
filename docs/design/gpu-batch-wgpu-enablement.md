@@ -61,6 +61,10 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
   `device.on_uncaptured_error` で scope 外エラーをラッチし（既定ハンドラの panic を
   回避）、検知後の `batch_search` は backend エラーを返して CPU 縮退へ倒す。
   `set_device_lost_callback` でデバイスロストもラッチする
+- `GpuContext`（`wgpu::Device`）はプロセス共有だが `GpuBatchBackend` は複数
+  インスタンス存在しうるため、共有 Device への dispatch・バッファアップロードは
+  **プロセス単位**のグローバルロックで直列化する（インスタンス単位の Mutex では
+  別インスタンスからの並行操作を防げない）
 - error scope の `pop()` は `device.poll` を駆動しながら待つ
   （`block_on_with_device_poll`）。自己ポーリングのみだとデバイスのポーリング待ちで
   無限スピンしうるため
