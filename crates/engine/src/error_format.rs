@@ -9,9 +9,10 @@
 //!
 //! 収録範囲は「engine・wire-server が現に返している `wire_code`」に限る。未実装の分類は
 //! 実装タスク（wire 応答への写像は TASK-153）が追加する。分類の追加自体は TASK-101
-//! （`operation_id` 内容照合。RECOVER-10）で行い、「他分類へ写像しない」ことの正式検証は
-//! TASK-154 が担う。分類の定義そのものは spec 側の管理事項であり、本コメント・本モジュール
-//! へ転記しない（`.claude/rules/spec-confidentiality.md`）。
+//! （`operation_id` 内容照合。RECOVER-10）で行った。「他分類（特に `23505`）へ写像しない」
+//! ことの正式検証は TASK-154（対象ビヘイビア ERR-3）が担い、`tests/error_format_err3.rs`
+//! の結合テストで検証済み。分類の定義そのものは spec 側の管理事項であり、本コメント・
+//! 本モジュールへ転記しない（`.claude/rules/spec-confidentiality.md`）。
 //!
 //! 分類リストは [`define_error_classes`] マクロの 1 箇所のみで宣言し、`ErrorClass` の
 //! 定義・`ALL`・`wire_code`・`label` をそこから生成する。分類を追加・削除すると `ALL` の
@@ -124,7 +125,9 @@ define_error_classes! {
     NumericOutOfRange => ("22003", "NUMERIC_OUT_OF_RANGE"),
     /// 台帳（TASK-93）に記録済みの `operation_id` へ、内容が異なる書き込みが再送された
     /// （`22023`）。TASK-101（RECOVER-10）が追加。ハッシュ一致の証明が取れない場合は
-    /// 常にこちら側へ倒す（fail-closed。commit 済み確定の根拠にしない）。
+    /// 常にこちら側へ倒す（fail-closed。commit 済み確定の根拠にしない）。他のいかなる
+    /// 分類（特に `23505`）にも写像しないことは対象ビヘイビア ERR-3（TASK-154）が
+    /// 確定契約とし、`tests/error_format_err3.rs` で検証する。
     /// [`crate::tenant::TenantWriteError::OperationIdContentMismatch`]・
     /// [`crate::sql::allowlist::SqlSurfaceError::OperationIdContentMismatch`] の写像。
     OperationIdContentMismatch => ("22023", "OPERATION_ID_CONTENT_MISMATCH"),
