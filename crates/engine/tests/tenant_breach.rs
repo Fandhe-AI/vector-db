@@ -241,7 +241,13 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
             &attacker,
             target,
             &row,
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            // `seed_corpus` が tenant-a 名義の正当な投入で "test-op" を既に使用済み
+            // （TASK-94・RECOVER-3 は operation_id をテナント×テーブル単位で一意化する）
+            // ため、越境試行の検証には別の未使用 operation_id を使う（PR #247
+            // codex-review 指摘対応。越境試行はいずれも所有権判定より先に拒否・abort
+            // されるため台帳へは残らないが、"test-op" を再利用すると seed 時点の
+            // 正当な記録と衝突し `DuplicateOperationId` を誤って観測してしまう）。
+            &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::Forbidden)));
@@ -300,7 +306,8 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 &attacker,
                 own_id,
                 &row,
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                // "test-op-breach"（同上）。
+                &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::Forbidden)));
@@ -558,7 +565,7 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         &owner,
         new_id,
         &insert_row,
-        &engine::recovery::required_op_id::OperationId::parse("test-op-insert")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-owner-insert")
             .expect("valid operation_id"),
     )
     .expect("owner insert ok");
@@ -580,7 +587,7 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         &owner,
         own_id,
         &update_row_input,
-        &engine::recovery::required_op_id::OperationId::parse("test-op-update")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-owner-update")
             .expect("valid operation_id"),
     )
     .expect("owner update ok");
@@ -596,7 +603,7 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         TABLE,
         &owner,
         delete_target,
-        &engine::recovery::required_op_id::OperationId::parse("test-op-delete")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-owner-delete")
             .expect("valid operation_id"),
     )
     .expect("owner delete ok");
@@ -635,6 +642,10 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
     // （上記と同じ理由）。
     let insert_op_id =
         OperationId::parse("op-engine-core-delegation-insert").expect("valid operation_id");
+    let update_op_id =
+        OperationId::parse("op-engine-core-delegation-update").expect("valid operation_id");
+    let delete_op_id =
+        OperationId::parse("op-engine-core-delegation-delete").expect("valid operation_id");
     core.insert_row(
         &owner,
         TABLE,
@@ -649,8 +660,6 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.1; DIM as usize],
         metadata: &[],
     };
-    let update_op_id =
-        OperationId::parse("op-engine-core-delegation-update").expect("valid operation_id");
     core.update_row(
         &owner,
         TABLE,
@@ -659,8 +668,6 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         Some(&update_op_id),
     )
     .expect("EngineCore::update_row ok");
-    let delete_op_id =
-        OperationId::parse("op-engine-core-delegation-delete").expect("valid operation_id");
     core.delete_row(&owner, TABLE, another_new_id, Some(&delete_op_id))
         .expect("EngineCore::delete_row ok");
 }

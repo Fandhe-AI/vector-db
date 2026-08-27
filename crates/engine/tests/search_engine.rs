@@ -38,7 +38,10 @@ fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[
     // 持つため、同一テナント・同一テーブル内で内容の異なる複数行へ同一 operation_id を
     // 使い回すと 2 件目以降が OperationIdContentMismatch で拒否される。行ごとに一意の
     // operation_id を使う。
-    let op_id = format!("test-op-{tenant}-{table}-{id}");
+    let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+        "test-op-{tenant}-{table}-{id}"
+    ))
+    .expect("valid operation_id");
     engine::tenant::insert_row(
         storage,
         table,
@@ -50,7 +53,7 @@ fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[
             embedding,
             metadata: &[],
         },
-        &engine::recovery::required_op_id::OperationId::parse(&op_id).expect("valid operation_id"),
+        &op_id,
     )
     .expect("seed row");
 }

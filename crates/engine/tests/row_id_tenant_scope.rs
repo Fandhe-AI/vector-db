@@ -117,7 +117,7 @@ fn table12_duplicate_id_within_the_same_tenant_is_rejected_with_23505() {
         &a,
         7,
         &row(TENANT_A, &[1.0, 0.0], b"first"),
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-1")
             .expect("valid operation_id"),
     )
     .expect("first insert ok");
@@ -201,13 +201,17 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
     );
 
     // 逆方向（同一テナント内重複）でも、他テナント行の有無で応答が変わらないこと。
+    // TASK-94・RECOVER-3: `with_foreign`/`without_foreign` が既に tenant-a/TABLE で
+    // `"test-op"` を使っているため、ここで同じ値を再利用すると台帳の重複拒否
+    // （`DuplicateOperationId`）に化けてしまい、本テストが検証したい行キー衝突
+    // （`IdConflict`）を通らなくなる。未使用の別 `operation_id` を使う。
     let dup_with_foreign = tenant::insert_row(
         &storage_with,
         TABLE,
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"dup"),
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-dup")
             .expect("valid operation_id"),
     )
     .expect_err("duplicate within tenant-a must be rejected");
@@ -217,10 +221,12 @@ fn rls9_insert_response_is_identical_whether_or_not_another_tenant_holds_the_id(
         &a,
         42,
         &row(TENANT_A, &[1.0, 0.0], b"dup"),
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-dup")
             .expect("valid operation_id"),
     )
     .expect_err("duplicate within tenant-a must be rejected");
+    assert!(matches!(dup_with_foreign, TenantWriteError::IdConflict));
+    assert!(matches!(dup_without_foreign, TenantWriteError::IdConflict));
     assert_eq!(
         dup_with_foreign.wire_code(),
         dup_without_foreign.wire_code()
@@ -537,7 +543,7 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         TABLE,
         &a,
         &mixed,
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-mixed")
             .expect("valid operation_id"),
     )
     .expect_err("a batch containing another tenant's row must be rejected");
@@ -555,7 +561,7 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         TABLE,
         &a,
         &dup,
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-dup")
             .expect("valid operation_id"),
     )
     .expect_err("duplicate ids within one batch must be rejected");
@@ -563,6 +569,9 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
     assert!(storage.get_row_from_table(TABLE, TENANT_A, 5).is_err());
 
     // 正常系: 自テナント名義のバッチは成功し、他テナントは同じ id を独立に使える。
+    // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、各バッチ呼び出しに別の
+    // `operation_id` を使う（固定文言の使い回しは同一テナント内の 2 回目以降が
+    // `23505` になる）。
     let batch_a = vec![
         (1u64, row(TENANT_A, &[1.0, 0.0], b"a1")),
         (2u64, row(TENANT_A, &[0.5, 0.5], b"a2")),
@@ -572,7 +581,7 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         TABLE,
         &a,
         &batch_a,
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-batch-a")
             .expect("valid operation_id"),
     )
     .expect("own-tenant batch ok");
@@ -582,7 +591,7 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         TABLE,
         &b,
         &batch_b,
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-batch-b")
             .expect("valid operation_id"),
     )
     .expect("another tenant may reuse the same id");

@@ -367,3 +367,69 @@ fn file_form_insert_resend_same_body_is_23505_and_different_body_is_22023() {
         .expect_err("different body resend must be rejected");
     assert_eq!(mismatch_err.wire_code(), "22023");
 }
+
+// --- 並行性: 2 スレッドが同一 operation_id・同一内容で同時 INSERT すると、成功 1・
+//     23505 拒否 1 になり、当該テーブルの行数は試行ごとに +1 のまま
+//     （TASK-94・RECOVER-3 の原子性契約を TASK-101・RECOVER-10 の内容照合ハッシュが
+//     引き継ぐことの実測。redb 単一ライタ直列化 + 同一 write トランザクション内の
+//     判定により、2 セッションのうち一方のみ commit する。両スレッドとも同一 id・
+//     同一内容で INSERT するため、負けたセッションは行 id 衝突ではなく
+//     `DuplicateOperationId`（内容一致の再送）として観測されるはず）。
+//     `Storage`/`PolicyContext`/`OperationId` はいずれも `Sync` のため、
+//     `crate::tenant::insert_row` を直接 2 スレッドから共有参照で呼べる。
+
+#[test]
+fn concurrent_same_operation_id_same_content_inserts_yield_exactly_one_success() {
+    for attempt in 0..10u64 {
+        let path = unique_db_path(&format!("content-hash-concurrent-{attempt}"));
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema(TABLE)).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = op("op-concurrent");
+
+        let (successes, row_count) = std::thread::scope(|s| {
+            let storage_ref = &storage;
+            let ctx_ref = &ctx;
+            let op_ref = &op_id;
+            let insert = move || {
+                engine::tenant::insert_row(
+                    storage_ref,
+                    TABLE,
+                    ctx_ref,
+                    1,
+                    &row(&[0.1, 0.2, 0.3], b"same"),
+                    op_ref,
+                )
+            };
+            let h1 = s.spawn(insert);
+            let h2 = s.spawn(insert);
+            let r1 = h1.join().expect("thread 1 must not panic");
+            let r2 = h2.join().expect("thread 2 must not panic");
+
+            let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+            for r in [&r1, &r2] {
+                if let Err(e) = r {
+                    assert!(
+                        matches!(e, TenantWriteError::DuplicateOperationId),
+                        "the losing session must fail with DuplicateOperationId \
+                         (same content resend), got {e:?}"
+                    );
+                }
+            }
+
+            let visible = engine::tenant::visible_rows(storage_ref, TABLE, ctx_ref)
+                .expect("visible_rows must succeed");
+            (successes, visible.len())
+        });
+
+        assert_eq!(
+            successes, 1,
+            "attempt {attempt}: exactly one of the two concurrent sessions must succeed"
+        );
+        assert_eq!(
+            row_count, 1,
+            "attempt {attempt}: exactly one row must have been committed"
+        );
+    }
+}

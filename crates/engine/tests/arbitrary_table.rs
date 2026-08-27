@@ -19,7 +19,7 @@
 //! production 判定関数に依存しない独立オラクル）に従う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::core::EngineCore;
+use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::ledger::LedgerLookup;
@@ -103,6 +103,11 @@ fn seed_corpus(storage: &Storage, table: &str, tenant: &str) {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        // TASK-94・RECOVER-3 の重複拒否（`23505`）はテーブル単位で `operation_id` を
+        // 一意に要求するため、同一テーブル・同一テナントへの複数行 seed は行ごとに
+        // 別の `operation_id` を使う（PR #247 codex-review 指摘対応。1 つの
+        // `operation_id` を複数行の insert で使い回す既存の記述は TASK-93（keep-first
+        // のみ）時点のものでもはや成立しない）。
         engine::tenant::insert_typed_row(
             storage,
             table,
@@ -116,9 +121,9 @@ fn seed_corpus(storage: &Storage, table: &str, tenant: &str) {
             ],
             // 台帳の内容照合（TASK-101・RECOVER-10）は operation_id 単位でハッシュを
             // 持つため、コーパス内の各行（内容が異なる）へ同一 operation_id を使い回すと
-            // 2 行目以降が `OperationIdContentMismatch` になる。行ごとに一意な
-            // operation_id を割り当てる。
-            &op(&format!("seed-op-{}", row.id)),
+            // 2 行目以降が `OperationIdContentMismatch` になる。行ごと・テーブルごとに
+            // 一意な operation_id を割り当てる。
+            &op(&format!("seed-op-{table}-{}", row.id)),
         )
         .expect("insert row");
     }
@@ -476,7 +481,7 @@ fn setup_multi_tenant_table(storage: &Storage, table: &str) {
             // 台帳の内容照合（TASK-101・RECOVER-10）は (tenant, table, operation_id)
             // 単位でハッシュを持つため、テナントをまたいで内容が異なる本ループでは
             // 一意な operation_id を使う。
-            &op(&format!("rls-seed-{}", row.id)),
+            &op(&format!("rls-seed-{table}-{}", row.id)),
         )
         .expect("insert row");
     }
@@ -657,12 +662,13 @@ fn arbitrary_table_ledger_scope_is_per_table_and_per_tenant() {
 
     // 同一テーブル・同一テナントへの operation_id 自体の再送（op-shared を新規行
     // id=2・異なる内容へ再利用）。TASK-93（本台帳）は「既存エントリを上書きしない
-    // （keep-first）」ことのみを契約とし、重複行 id 拒否（23505）は TASK-94 の管轄で
-    // 本 PR のスコープ外だが、内容照合（TASK-101・RECOVER-10。本 PR で実装）は
-    // operation_id 単位で記録済みハッシュと比較するため、id・内容のいずれかが
-    // 異なれば `OperationIdContentMismatch`（`22023`）として拒否される
-    // （`recovery/ledger.rs` モジュール冒頭ドキュメント参照。行 id 衝突とは独立した
-    // 判定軸であることの確認）。
+    // （keep-first）」ことのみを契約とし、重複行 id 拒否（23505）は TASK-94・
+    // RECOVER-3 の管轄だが、内容照合（TASK-101・RECOVER-10）は operation_id 単位で
+    // 記録済みハッシュと比較するため、id・内容のいずれかが異なれば
+    // `OperationIdContentMismatch`（`22023`）として拒否される（`recovery/ledger.rs`
+    // モジュール冒頭ドキュメント参照。行 id 衝突とは独立した判定軸であることの確認。
+    // 同一内容の再送が `23505` になることは `tests/recovery_content_hash.rs` が
+    // 別途検証する）。
     let err_content_mismatch = core
         .execute_insert_sql(
             &ctx_a,
@@ -677,6 +683,13 @@ fn arbitrary_table_ledger_scope_is_per_table_and_per_tenant() {
             .expect("lookup ok"),
         LedgerLookup::Recorded,
         "keep-first: the ledger entry recorded by the first op-shared write must remain"
+    );
+    assert!(
+        matches!(
+            core.get_row(&ctx_a, "kb_articles", "tenant-a", 2),
+            Err(CoreError::NotFound)
+        ),
+        "the rejected resend must not have written row id=2"
     );
 
     // tenant-b が同一テーブルへ同一 operation_id を使っても成功する（テナント単位

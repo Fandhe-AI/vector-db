@@ -109,11 +109,14 @@ pub enum SqlSurfaceError {
     /// `(tenant_id, id)` で名前空間化されているため（TABLE-12・RLS-9）、他テナントが
     /// 同じ `id` を保持していても本 variant にはならない。`operation_id` 単位の
     /// 冪等判定（台帳による重複拒否・内容不一致検出）は [`SqlSurfaceError::DuplicateOperationId`]・
-    /// [`SqlSurfaceError::OperationIdContentMismatch`] が担う（TASK-101・RECOVER-10）。
+    /// [`SqlSurfaceError::OperationIdContentMismatch`] が担う（TASK-101・RECOVER-10。
+    /// TASK-94・RECOVER-3 の重複拒否契約を包含する）。
     IdConflict,
     /// `operation_id` 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**
     /// 書き込みが再送された（TASK-101・対象ビヘイビア: RECOVER-10。
     /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] の写像。ERR-2: `23505`）。
+    /// 行キー衝突（[`SqlSurfaceError::IdConflict`]）とは別の固定文言を返し、クライアント
+    /// が両者を取り違えないようにする。
     DuplicateOperationId,
     /// 台帳に記録済みの `operation_id` へ、**内容が異なる**書き込みが再送された、
     /// または内容一致を証明できない旧フォーマットの台帳エントリへ再送された
@@ -214,8 +217,8 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
-            SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
+            SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
             SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
         }
     }
@@ -249,14 +252,15 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::IdConflict => {
                 write!(f, "row id already exists")
             }
-            SqlSurfaceError::NumericOutOfRange { detail } => {
-                write!(f, "numeric value out of range: {detail}")
-            }
             // operation_id・行内容・テナントを含めない固定文言（security.md P0。
-            // TenantWriteError::DuplicateOperationId/OperationIdContentMismatch と同じ
-            // 契約）。
+            // `crate::tenant::TenantWriteError::DuplicateOperationId`/
+            // `OperationIdContentMismatch` と同じ契約。`IdConflict` の文言と区別できる
+            // ことが目的）。
             SqlSurfaceError::DuplicateOperationId => {
                 write!(f, "operation_id already recorded with the same content")
+            }
+            SqlSurfaceError::NumericOutOfRange { detail } => {
+                write!(f, "numeric value out of range: {detail}")
             }
             SqlSurfaceError::OperationIdContentMismatch => {
                 write!(f, "operation_id already recorded with different content")

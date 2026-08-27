@@ -58,7 +58,8 @@ fn new_core_single_tenant() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
         // ハッシュを持つため、内容の異なる複数行へ同一 operation_id を使い回すと
         // 2 件目以降が OperationIdContentMismatch で拒否される。行ごとに一意の
         // operation_id を使う。
-        let op_id = format!("test-op-{id}");
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
+            .expect("valid operation_id");
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -66,8 +67,7 @@ fn new_core_single_tenant() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            &engine::recovery::required_op_id::OperationId::parse(&op_id)
-                .expect("valid operation_id"),
+            &op_id,
         )
         .expect("insert row");
     }

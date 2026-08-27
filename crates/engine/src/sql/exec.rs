@@ -1015,16 +1015,19 @@ fn project_rows(
 /// 重複検出のスコープは**呼び出し元テナントの名前空間内**に閉じる（行ストアの物理
 /// キーが `(tenant_id, id)` であるため。TABLE-12・RLS-9）。したがって:
 ///
-/// - 同一テナント内の `id` 重複のみ [`SqlSurfaceError::IdConflict`]（`23505`）
-/// - 他テナントが同じ `id` を保持していても本経路は成功する（応答・実行経路のいずれも
-///   他テナントの行 id 存在で分岐しないため、存在オラクルにならない）
+/// - 同一テナント内の `id` 重複は [`SqlSurfaceError::IdConflict`]（`23505`）
+/// - 同一 `(tenant_id, table, operation_id)` への 2 回目以降の書き込みは
+///   [`SqlSurfaceError::DuplicateOperationId`]（`23505`。TASK-94・対象ビヘイビア:
+///   RECOVER-3）。台帳追記が行書き込みより先に同一 write トランザクション内で行われる
+///   ため（`tenant.rs` モジュールドキュメント参照）、同一文の再送はこちらが先に検出する
+/// - 他テナントが同じ `id`／`operation_id` を保持していても本経路は成功する
+///   （応答・実行経路のいずれも他テナントの存在で分岐しないため、存在オラクルに
+///   ならない）
 ///
-/// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
-/// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
-/// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
-/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の重複拒否・
-/// 内容不一致検出はまだ提供しない（TASK-94・TASK-101、対象ビヘイビア:
-/// RECOVER-3・RECOVER-10 の管轄）。
+/// `23505` は行キー `(tenant_id, id)` の衝突と `operation_id` の重複という 2 つの
+/// 別原因を共有する（`error_format.rs::ErrorClass::UniqueViolation` 参照）。
+/// 内容不一致検出（同一 `operation_id`・異なる内容）は TASK-101、対象ビヘイビア:
+/// RECOVER-10 の管轄で未提供。
 ///
 /// `ledger_mode` は `core.rs::EngineCore` が保持する構成をそのまま受け取り、
 /// `ledger_mode.resolve(bound.operation_id.as_ref())` で
@@ -1193,9 +1196,9 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
         }
-        // 台帳照合（TASK-101・RECOVER-10）: ファイル形 INSERT（`replace_typed_rows_by_text_key`
-        // 経由）でも行形 INSERT（[`execute_insert`]）と同じ写像を適用する。`_` 節
-        // （`XX000`）へ丸めない。
+        // 台帳照合（TASK-101・RECOVER-10。TASK-94・RECOVER-3 の重複拒否契約を包含する）:
+        // ファイル形 INSERT（`replace_typed_rows_by_text_key` 経由）でも行形 INSERT
+        // （[`execute_insert`]）と同じ写像を適用する。`_` 節（`XX000`）へ丸めない。
         IncrementalError::Write(TenantWriteError::DuplicateOperationId) => {
             SqlSurfaceError::DuplicateOperationId
         }

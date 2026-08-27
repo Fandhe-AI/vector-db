@@ -274,9 +274,12 @@ pub enum TenantWriteError {
     /// 出さない（fail-closed）。
     LedgerCorrupted(StorageError),
     /// 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**書き込みが
-    /// 再送された（TASK-101・対象ビヘイビア: RECOVER-10）。commit 済み確定の根拠として
-    /// 扱ってよく、`23505`（`UniqueViolation` と同じ分類。error_format.rs のコメント
-    /// 参照）へ写像する。
+    /// 再送された（TASK-101・対象ビヘイビア: RECOVER-10。TASK-94・RECOVER-3 の
+    /// 重複拒否契約を包含する）。commit 済み確定の根拠として扱ってよく、`23505`
+    /// （`UniqueViolation` と同じ分類。error_format.rs のコメント参照）へ写像する。
+    /// 行キー衝突（[`TenantWriteError::IdConflict`]）とは別 variant にすることで、
+    /// クライアントが「先行実行が commit 済み」（RECOVER-7 が使う判定）を行キー衝突と
+    /// 取り違えない固定文言を返せるようにする。
     DuplicateOperationId,
     /// 台帳に記録済みの `operation_id` へ、**内容が異なる**書き込みが再送された、
     /// または内容一致を証明できない旧フォーマット（v1）エントリへ再送された
@@ -306,11 +309,11 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
+            TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
             TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
             TenantWriteError::Catalog(_)
             | TenantWriteError::Storage(_)
             | TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
-            TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
             TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
         }
     }
@@ -336,6 +339,10 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
             TenantWriteError::Storage(_) => write!(f, "tenant write storage error"),
             TenantWriteError::LedgerCorrupted(_) => write!(f, "tenant write ledger error"),
+            // 行キー衝突（`IdConflict`）とは別の固定文言にすることで、クライアントが
+            // 「`operation_id` の重複拒否＝先行実行が commit 済み」（RECOVER-7 が使う
+            // 判定）を行キー衝突と取り違えないようにする（TASK-94・RECOVER-3・
+            // TASK-101・RECOVER-10）。
             TenantWriteError::DuplicateOperationId => {
                 write!(f, "operation_id already recorded with the same content")
             }
@@ -355,11 +362,11 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
+            TenantWriteError::DuplicateOperationId => f.write_str("DuplicateOperationId"),
             TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
             TenantWriteError::LedgerCorrupted(_) => f.write_str("LedgerCorrupted(<redacted>)"),
-            TenantWriteError::DuplicateOperationId => f.write_str("DuplicateOperationId"),
             TenantWriteError::OperationIdContentMismatch => {
                 f.write_str("OperationIdContentMismatch")
             }
@@ -506,7 +513,12 @@ pub(crate) fn insert_row_unchecked(
         schema.validate_embedding_dim(row.embedding.len())?;
         // 台帳照合用ハッシュ（TASK-101・RECOVER-10）はクライアント要求由来の内容
         // （id・行データ）のみから計算する（DB 状態に依存しない決定性の担保。
-        // `content_hash` モジュールドキュメント参照）。
+        // `content_hash` モジュールドキュメント参照）。同一 write トランザクション内で
+        // 即座に判定する（TOCTOU なし。redb 単一ライタ直列化により、この
+        // get→insert→判定がそのまま「トランザクション内再確認」になる）。`Err` の場合は
+        // 行の書き込みへ進まず、この後 `write_txn` が commit されない（呼び出し元の `?`
+        // で早期 return → drop）ため台帳追記も破棄され、部分書き込みが残らない
+        // （fail-closed。TASK-94・RECOVER-3 の原子性契約を包含する）。
         let content_hash = content_hash::for_insert(id, row)?;
         ledger::record_in_txn(
             &write_txn,
@@ -608,7 +620,10 @@ pub(crate) fn insert_rows_unchecked(
             return Ok(());
         }
         // バッチ全体で 1 ハッシュ（TASK-101・RECOVER-10。`content_hash` モジュール
-        // ドキュメント参照。要求記載順を含めて連結する）。
+        // ドキュメント参照。要求記載順を含めて連結する）。`Err` の場合は行の書き込みへ
+        // 進まず、この後 `write_txn` が commit されない（呼び出し元の `?` で早期
+        // return → drop）ため台帳追記も破棄され、部分書き込みが残らない（fail-closed。
+        // TASK-94・RECOVER-3 の原子性契約を包含する）。
         let content_hash = content_hash::for_insert_batch(rows)?;
         ledger::record_in_txn(
             &write_txn,
@@ -703,6 +718,9 @@ pub(crate) fn insert_typed_row_unchecked(
         };
         // 型付き挿入も行形 INSERT と同じ「新規挿入」操作としてハッシュ化する
         // （TASK-101・RECOVER-10。`content_hash::for_typed_insert` ドキュメント参照）。
+        // `Err` の場合は行の書き込みへ進まず、`write_txn` が commit されない（早期
+        // return → drop）ため台帳追記も破棄される（fail-closed。TASK-94・RECOVER-3
+        // の原子性契約を包含する）。
         let content_hash = content_hash::for_typed_insert(id, &row)?;
         ledger::record_in_txn(
             &write_txn,
@@ -842,10 +860,20 @@ pub fn delete_row(
 /// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
 /// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
 ///
-/// `ledger`（TASK-93・RECOVER-2、TASK-101・RECOVER-10）: [`update_row_unchecked`] と
-/// 同じく、台帳照合・追記を所有権判定（`owns_existing`）より**前**に行う（同関数の
-/// ドキュメント参照。再送された削除が「既に削除済み」で `NotFound` になる場合でも、
-/// 台帳照合が先行するためハッシュ一致による再送検知（`23505`）が機能する）。
+/// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
+/// [`update_row_unchecked`] と同じく、台帳照合・追記を所有権判定（`owns_existing`）
+/// より**前**に行う。DELETE は「対象行を消す」副作用が 1 回目の commit で完了する
+/// ため、同一 `operation_id` の 2 回目以降の再送は対象行が既に不存在
+/// （`owns_existing == false`）になっている。所有権判定を先に見て `NotFound` を
+/// 返すと、この正当な重複再送がハッシュ一致による再送検知（`DuplicateOperationId`・
+/// `23505`）ではなく `NotFound` として観測され、RECOVER-3 の「同一 `operation_id` の
+/// 2 回目以降は重複として拒否する」契約を壊す（codex-review P1 指摘・PR #247）。
+/// 台帳照合を先に行うことで、「未使用の `operation_id` で対象行が不存在」の通常
+/// ケースは `NotFound` のまま維持しつつ（台帳への tentative 追記はこの後の早期
+/// `return` で `write_txn` が commit されず破棄されるため、副作用として残らない）、
+/// 「使用済みの `operation_id` を対象行削除後に再送」のケースを
+/// `DuplicateOperationId`（内容一致）・`OperationIdContentMismatch`（内容不一致）
+/// として区別する。
 pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -1072,7 +1100,8 @@ pub(crate) fn replace_typed_rows_by_text_key(
         // チャンク化・埋め込み後の派生行データ（`rows`）も含めない。
         // `content_hash::for_replace_by_text_key` ドキュメント参照）。同一内容の再送は
         // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
-        // 契約に従う。行形 `INSERT` 経路と同じ扱い）。
+        // 契約に従う。行形 `INSERT` 経路と同じ扱い。TASK-94・RECOVER-3 の重複拒否契約を
+        // 包含する）。
         let content_hash = content_hash::for_replace_by_text_key(
             key_column,
             key_value,
