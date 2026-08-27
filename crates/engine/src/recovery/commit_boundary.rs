@@ -301,7 +301,14 @@ mod tests {
             .arg("--test-threads=1")
             .env(CHILD_DB_ENV, &path)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+            // stderr は破棄する（`Stdio::null()`）。テストは stdout の固定マーカーと
+            // 終了コード・シグナルのみを検証し stderr の内容を読まないため、pipe のまま
+            // 放置すると panic hook の出力（backtrace 等。`RUST_BACKTRACE` 有効時に
+            // 顕著）で OS のパイプバッファが埋まり、子が `abort()` 前に write でブロック
+            // して親が下記 30 秒タイムアウトで誤って失敗しうる（flaky の温床。
+            // cursor[bot] レビュー指摘対応・PR #246）。親側は try_wait のみをポーリング
+            // し pipe を能動的に読まない設計のため、そもそも pipe せず捨てるのが最小修正。
+            .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn child process");
 
