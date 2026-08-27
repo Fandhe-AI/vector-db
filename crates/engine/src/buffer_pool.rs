@@ -36,8 +36,10 @@
 //! (c) 一括投入経路が正当に生成しうる次元（`storage::MAX_EMBEDDING_DIM` まで）のうち
 //! `MAX_BATCH_DIM` 超のものは、本プールの [`BufferPool::acquire`] がアロケーション前に
 //! 拒否すること（`MAX_BATCH_DIM < MAX_EMBEDDING_DIM` の大小関係を前提とする）。
-//! GPU 転送ステージング用途は実際の GPU（`wgpu`）実行を追加していない現段階では
-//! 対象を持たない（`batch_search.rs` モジュール冒頭コメント参照）。
+//! GPU 転送ステージング用途は `gpu_batch.rs`（TASK-128〜130）が実 GPU（`wgpu`）実行を
+//! 接続済みだが、同モジュールは本プールを利用しない（本プールの利用箇所は前段落の通り
+//! `batch_search.rs::run_batch_search` のみ）ため、依然として対象を持たない
+//! （`batch_search.rs` モジュール冒頭コメント参照）。
 
 use std::collections::VecDeque;
 
