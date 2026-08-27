@@ -194,6 +194,7 @@ pub mod catalog;
 pub mod chunking;
 pub mod core;
 pub mod declarative_filter;
+pub mod dictionary;
 pub mod dispatch;
 pub mod embedding;
 pub mod error_format;

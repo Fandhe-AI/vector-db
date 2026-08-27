@@ -499,6 +499,175 @@ impl PrefilterCache {
     }
 }
 
+/// [`DictionaryCache`] のエントリ数上限（TASK-109・PLAN-5。[`PrefilterCache`]
+/// （TASK-169）と同じ DoS 対策方針を踏襲する）。
+const MAX_DICTIONARY_CACHE_ENTRIES: usize = 16;
+
+/// [`DictionaryCache`] が保持する [`crate::dictionary::Dictionary`] 群の概算バイト量の
+/// 合計上限（[`MAX_PREFILTER_CACHE_TOTAL_BYTES`] と同じ桁に揃える）。
+const MAX_DICTIONARY_CACHE_TOTAL_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// [`DictionaryCache`] の 1 エントリ。`table`・`ctx` の組がキャッシュキー
+/// （[`PrefilterCache`] の `CacheEntry` と同じ理由で `HashMap` ではなく `Vec` 線形走査）。
+struct DictCacheEntry {
+    table: String,
+    ctx: PolicyContext,
+    dictionary: Arc<crate::dictionary::Dictionary>,
+    built_generation: u64,
+    approx_bytes: usize,
+    /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
+    last_used: u64,
+}
+
+/// ロックが保護する可変状態（[`RwLock`] 内側）。
+#[derive(Default)]
+struct DictCacheState {
+    entries: Vec<DictCacheEntry>,
+}
+
+/// `EngineCore::dictionary_snapshot` が再利用する辞書的情報源（TASK-109・PLAN-5。
+/// ポインタ: `docs/spec/04-behavior/query-planning.md` PLAN-5）の世代整合キャッシュ。
+/// [`PrefilterCache`]（TASK-169）と同一の失効規約（fail-closed・世代不一致で破棄・
+/// ロック取得後に世代を読み直す・容量超過は LRU 追い出し）を踏襲する。
+///
+/// **失効の粒度**: `storage.current_generation()` はテーブル・書き込み種別を問わず
+/// 任意の write commit で単調増加する（[`Storage::current_generation`] ドキュメント
+/// 参照）。そのため本キャッシュはこのテーブル自身への書き込みだけでなく、無関係な
+/// 他テーブルへの書き込みでも保守的に失効する（テーブル単位の精密な失効は持たない）。
+/// これは意図的な単純化であり、誤って古い辞書を返す経路（fail-open）よりも安全側
+/// （過剰な再構築）に倒す設計判断である（security.md「fail-closed を維持する」）。
+///
+/// **再構築のトリガー**: ファイル形 `INSERT`（単発・バッチとも）は
+/// `tenant::replace_typed_rows_by_text_key` が世代を bump するため、次回
+/// `dictionary_snapshot` 呼び出し時に自動的に再構築され増分インデックスの結果が
+/// 反映される（TASK-120 との連動）。本キャッシュは post-commit フックを持たず、
+/// 参照時に世代を突き合わせるだけの構成のため、バッチ途中失敗時の不整合や
+/// プロセス再起動時の消失を気にする必要がない（`redb` からの再構築で自己回復する）。
+pub(crate) struct DictionaryCache {
+    state: RwLock<DictCacheState>,
+    seq: AtomicU64,
+}
+
+impl DictionaryCache {
+    fn new() -> Self {
+        Self {
+            state: RwLock::new(DictCacheState::default()),
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    /// `(table, ctx)` に一致し、現在世代と整合するエントリを探す。世代不一致・
+    /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う
+    /// （fail-closed。[`PrefilterCache::lookup`] と同じ方針）。
+    fn lookup(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.state.write().ok()?;
+        // 世代はロック取得後に読み直す（`PrefilterCache::lookup` と同じ理由。
+        // ロック取得前に読むとロック待機中の他スレッドの挿入を誤って「不一致」と
+        // 判定しうる）。
+        let current_generation = storage.current_generation().ok()?;
+        let position = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && &e.ctx == ctx)?;
+        let stale = guard
+            .entries
+            .get(position)
+            .map(|e| e.built_generation != current_generation)
+            .unwrap_or(true);
+        if stale {
+            guard.entries.remove(position);
+            return None;
+        }
+        let dictionary = {
+            let entry = guard.entries.get_mut(position)?;
+            entry.last_used = seq;
+            Arc::clone(&entry.dictionary)
+        };
+        Some(dictionary)
+    }
+
+    /// 新規構築した辞書を挿入する。単体で総量上限を超える場合・世代が既に古い場合は
+    /// キャッシュせず、呼び出し元の `Arc` をその場限りで使う
+    /// （[`PrefilterCache::insert`] と同じ方針）。
+    fn insert(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+        dictionary: crate::dictionary::Dictionary,
+        built_generation: u64,
+        approx_bytes: usize,
+    ) -> Arc<crate::dictionary::Dictionary> {
+        let dictionary = Arc::new(dictionary);
+        if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
+            return dictionary;
+        }
+
+        let Ok(mut guard) = self.state.write() else {
+            return dictionary;
+        };
+
+        let Ok(current_generation) = storage.current_generation() else {
+            return dictionary;
+        };
+        if built_generation != current_generation {
+            // 挿入対象自身が既に古い（並行書き込みで世代が進んだ）場合はキャッシュへ
+            // 反映しない。既存の有効エントリを誤って破棄しないための防御
+            // （`PrefilterCache::insert` の同種修正と同じ理由）。
+            return dictionary;
+        }
+
+        if let Some(pos) = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && &e.ctx == ctx)
+        {
+            guard.entries.remove(pos);
+        }
+        guard
+            .entries
+            .retain(|e| e.built_generation == current_generation);
+
+        let mut total_bytes: usize = guard
+            .entries
+            .iter()
+            .map(|e| e.approx_bytes)
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        while guard.entries.len() >= MAX_DICTIONARY_CACHE_ENTRIES
+            || total_bytes.saturating_add(approx_bytes) > MAX_DICTIONARY_CACHE_TOTAL_BYTES
+        {
+            let victim = guard
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(idx, _)| idx);
+            let Some(idx) = victim else {
+                return dictionary;
+            };
+            let removed = guard.entries.remove(idx);
+            total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
+        }
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        guard.entries.push(DictCacheEntry {
+            table: table.to_string(),
+            ctx: ctx.clone(),
+            dictionary: Arc::clone(&dictionary),
+            built_generation,
+            approx_bytes,
+            last_used: seq,
+        });
+        dictionary
+    }
+}
+
 /// `rls.rs::RlsError` を `CoreError` へ写像する（TASK-169）。呼び出し元
 /// （[`EngineCore::search`]）は `IndexStale`/`ContextMismatch` をキャッシュ縮退の
 /// トリガーとして先に `match` で処理するため、本関数へはそれ以外の 6 variant のみが
@@ -701,6 +870,14 @@ pub struct EngineCore {
     /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
     /// `crate::batch_limits` モジュールドキュメント参照。
     batch_limits: crate::batch_limits::BatchLimits,
+    /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
+    /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
+    /// [`DictionaryCache`] のドキュメント参照）。
+    dictionary_cache: DictionaryCache,
+    /// 辞書的情報源抽出の設定（TASK-109・PLAN-5）。差し替えは
+    /// [`Self::with_dictionary_config`] のみ。クエリ・セッション変数から到達できる
+    /// 経路は持たない（[`Self::with_precision_policy`] と同じ流儀）。
+    dictionary_config: crate::dictionary::DictionaryConfig,
 }
 
 impl EngineCore {
@@ -725,6 +902,8 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
+            dictionary_cache: DictionaryCache::new(),
+            dictionary_config: crate::dictionary::DictionaryConfig::default(),
         })
     }
 
@@ -749,6 +928,8 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
+            dictionary_cache: DictionaryCache::new(),
+            dictionary_config: crate::dictionary::DictionaryConfig::default(),
         }
     }
 
@@ -806,6 +987,111 @@ impl EngineCore {
     pub fn with_batch_limits(mut self, limits: crate::batch_limits::BatchLimits) -> Self {
         self.batch_limits = limits;
         self
+    }
+
+    /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
+    /// （[`crate::dictionary::DictionaryConfig`]）を差し替えたビルダーを返す
+    /// （[`Self::with_precision_policy`] と同じ流儀。未呼び出しなら
+    /// `DictionaryConfig::default()`）。
+    pub fn with_dictionary_config(mut self, config: crate::dictionary::DictionaryConfig) -> Self {
+        self.dictionary_config = config;
+        self
+    }
+
+    /// `table` の辞書的情報源スナップショットを返す（TASK-109・PLAN-5。TASK-110 の
+    /// LLM クエリプランニングが固定接頭辞コンテキストとして消費する入口）。
+    /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
+    /// `Self::with_incremental_config` 等と同じ理由）。
+    ///
+    /// [`DictionaryCache`] を経由し、世代整合が取れていれば再構築せず再利用する
+    /// （[`DictionaryCache`] のドキュメント参照）。キャッシュミス時は
+    /// `tenant::visible_rows`（`ctx` の可視性判定込み。テナント境界は完全にこの
+    /// 経路が担う）でテーブル全行を取得し、スキーマから `path`/`body` 列を解決して
+    /// `crate::dictionary::DictionaryBuilder` へ供給する。`path`/`body` 列を持たない
+    /// テーブルは `CatalogError::Invalid` の固定英語メッセージで拒否する
+    /// （既存 `execute_file_insert` 系と同じ「存在情報を漏らさない」写像方針）。
+    pub fn dictionary_snapshot(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<Arc<crate::dictionary::Dictionary>, CoreError> {
+        if let Some(dictionary) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
+            return Ok(dictionary);
+        }
+
+        let schema = self.storage.get_table_schema(table)?;
+        let path_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == "path")
+            .ok_or_else(|| {
+                CoreError::from(CatalogError::Invalid(
+                    "table has no path column required for dictionary extraction".to_string(),
+                ))
+            })?;
+        let body_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name == "body")
+            .ok_or_else(|| {
+                CoreError::from(CatalogError::Invalid(
+                    "table has no body column required for dictionary extraction".to_string(),
+                ))
+            })?;
+
+        // 挿入時の世代整合チェック用に現在世代をここで読み取る。走査中に他スレッドの
+        // 書き込みが競合しても、`DictionaryCache::insert` が挿入直前に世代を再確認し
+        // fail-closed にキャッシュへ反映しない（二重読み取りは不要）。
+        let built_generation = self.storage.current_generation()?;
+
+        let rows = crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
+            crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
+            // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ丸める
+            // （`TenantError` 自体が既にその契約を満たすが、`CoreError` 側の型に
+            // 昇格し直す。security.md「エラー・ログ経由で他テナントのデータ・
+            // 存在情報を漏らさない」）。
+            crate::tenant::TenantError::TooManyVisibleRows { .. }
+            | crate::tenant::TenantError::TooManyRowsScanned { .. } => CoreError::from(
+                CatalogError::Invalid("too many rows to build dictionary snapshot".to_string()),
+            ),
+            // `verify_hits` 専用の variant で `visible_rows` からは返らない防御的分岐。
+            crate::tenant::TenantError::HitOutsideVisibleSet => {
+                CoreError::from(CatalogError::Invalid(
+                    "unexpected tenant boundary error while building dictionary snapshot"
+                        .to_string(),
+                ))
+            }
+        })?;
+
+        let config = self.dictionary_config.clone();
+        let mut builder = crate::dictionary::DictionaryBuilder::new();
+        for row in &rows {
+            let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata) else {
+                // 破損行は辞書構築をこの 1 行分だけ黙ってスキップする（recall 側の
+                // 安全劣化。テナント境界・可視性判定には関与しないため fail-open で
+                // はない。モジュールドキュメント参照）。
+                continue;
+            };
+            let path = match values.get(path_idx) {
+                Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                _ => continue,
+            };
+            let body = match values.get(body_idx) {
+                Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                _ => continue,
+            };
+            builder.ingest(&config, path, body);
+        }
+        let dictionary = builder.finish(&config);
+        let approx_bytes = dictionary.approx_heap_bytes();
+        Ok(self.dictionary_cache.insert(
+            &self.storage,
+            table,
+            ctx,
+            dictionary,
+            built_generation,
+            approx_bytes,
+        ))
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
