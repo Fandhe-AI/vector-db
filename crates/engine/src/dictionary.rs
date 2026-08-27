@@ -287,7 +287,10 @@ fn accumulate_file_tree(tree: &mut FileTree, path: &str) {
     let counter = tree.by_extension.entry(ext_key).or_insert(0);
     *counter = counter.saturating_add(1);
 
-    let top_dir = match path.split_once('/') {
+    // 区切り文字は上の `file_name` 抽出（`rsplit(['/', '\\'])`）と同じ集合を使う
+    // （TASK-109・PLAN-5 レビュー対応: `/` のみだと Windows 形式パスの
+    // トップディレクトリが誤って "(root)" に集計される不一致があった）。
+    let top_dir = match path.split_once(['/', '\\']) {
         Some((dir, _)) if !dir.is_empty() => dir.to_string(),
         _ => "(root)".to_string(),
     };
@@ -775,6 +778,18 @@ mod tests {
         assert_eq!(tree.by_extension.get("md"), Some(&1));
         assert_eq!(tree.by_top_dir.get("src"), Some(&2));
         assert_eq!(tree.by_top_dir.get("(root)"), Some(&1));
+    }
+
+    #[test]
+    fn file_tree_top_dir_uses_the_same_separator_set_as_file_name_extraction() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト: `by_top_dir` の区切り文字判定が
+        // `file_name` 抽出（`rsplit(['/', '\\'])`）と食い違っていたため、Windows 形式
+        // パス（`\` 区切り）が誤って "(root)" に集計されるバグがあった。
+        let mut tree = FileTree::default();
+        accumulate_file_tree(&mut tree, "src\\engine\\core.rs");
+        assert_eq!(tree.by_extension.get("rs"), Some(&1));
+        assert_eq!(tree.by_top_dir.get("src"), Some(&1));
+        assert_eq!(tree.by_top_dir.get("(root)"), None);
     }
 
     #[test]

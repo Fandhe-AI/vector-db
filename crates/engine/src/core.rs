@@ -2587,14 +2587,32 @@ mod tests {
                 .expect("dictionary snapshot ok");
         }
 
-        let entries = core
+        let guard = core
             .dictionary_cache
             .state
             .read()
-            .expect("cache lock not poisoned")
-            .entries
-            .len();
-        assert!(entries <= MAX_DICTIONARY_CACHE_ENTRIES);
+            .expect("cache lock not poisoned");
+        // 上限ちょうどまで縮退していること（`<=` では「1 件も追い出されない」実装への
+        // 退行を検知できないため `==` で固定する）。
+        assert_eq!(guard.entries.len(), MAX_DICTIONARY_CACHE_ENTRIES);
+        // 挿入順が `last_used` 昇順と一致するため、最古（tenant-0）が LRU 追い出しの
+        // 対象になり、最新（tenant-{MAX}）は生存しているはずである
+        // （どのエントリが追い出されたかまで検証し、件数一致だけの弱い保証を補う）。
+        assert!(
+            !guard
+                .entries
+                .iter()
+                .any(|e| e.ctx.tenant_id() == "tenant-0"),
+            "oldest entry (tenant-0) must be evicted by LRU"
+        );
+        let newest_tenant = format!("tenant-{MAX_DICTIONARY_CACHE_ENTRIES}");
+        assert!(
+            guard
+                .entries
+                .iter()
+                .any(|e| e.ctx.tenant_id() == newest_tenant),
+            "newest entry must survive LRU eviction"
+        );
     }
 
     // 対象ビヘイビア: TASK-109・PLAN-5（`PrefilterCache::insert` の同種修正・
