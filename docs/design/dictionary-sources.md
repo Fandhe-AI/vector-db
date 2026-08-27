@@ -1,87 +1,45 @@
-# ADR: 辞書的情報源抽出と世代整合キャッシュによる連動
+# ADR: 辞書的情報源抽出パイプライン
 
 - ステータス: Accepted（TASK-109 で実装済み）
-- 対応: TASK-109（MS-4・対象ビヘイビア: PLAN-5。詳細は private spec 側）
-- 反映先（実装・テスト）: `crates/engine/src/dictionary.rs`・
-  `crates/engine/src/core.rs::DictionaryCache`・
-  `crates/engine/tests/dictionary.rs`
-- 関連: TASK-120（増分インデックス反映）・TASK-169（`PrefilterCache` の世代整合
-  キャッシュパターン）・TASK-110（後続。LLM クエリプランニング本体・本 ADR の対象外）
-
-## 背景
-
-LLM クエリプランニング（TASK-110 以降）が固定接頭辞コンテキストとして使う
-「辞書的情報源」を、DB に索引化済みのコーパスから機械抽出するモジュールを実装する。
-情報源の区分・抽出範囲の詳細は private spec 側（TASK-109・PLAN-5）の対象であり、
-本 ADR では実装（`crates/engine/src/dictionary.rs` 等）に閉じた設計判断のみを記す。
+- 対応: TASK-109（MS-4・対象ビヘイビア: PLAN-5）
+- 実装: `crates/engine/src/dictionary.rs`・`crates/engine/src/core.rs::DictionaryCache`
+- テスト: `crates/engine/tests/dictionary.rs`
+- 関連: TASK-120（増分インデックス反映）・TASK-169（`PrefilterCache` の世代整合キャッシュ
+  パターン）・TASK-110（後続タスク。本 ADR の対象外）
 
 ## 決定事項
 
-### 1. 依存を追加せず手書きの行パーサ・軽量トークナイザで実装する
+### 1. 依存を追加せず手書きの抽出処理で実装する
 
-dependency-policy（依存最小・ユーザー承認制）に従い、regex 等の新規クレートを
-追加しない。シンボル抽出は行頭定義（`fn`/`struct`/`enum`/`trait`/`impl`/`mod`/
-`const`/`type`）を空白区切りトークン走査で検出する手書きパーサとし、用語索引の
-トークナイザは `sparse.rs`（BM25 用・CJK バイグラム込み）とは責務が異なるため
-共有せず `dictionary.rs` 内に閉じる。
+dependency-policy（依存最小・ユーザー承認制）に従い、regex 等の新規クレートを追加せず、
+`dictionary.rs` に閉じた手書きの抽出処理として実装した。
 
-この設計はコメント・文字列リテラル内の同形テキストを特別扱いしない（例:
-`// fn foo()` は行頭トークンが `//` のため誤検出しないが、ブロックコメント・
-文字列リテラル内に単独で定義行と同形のテキストが現れる稀なケースは誤検出しうる）。
-辞書は LLM への補助コンテキストであり、過検出は recall 側の安全な劣化に留まり
-認可・可視性判定には関与しない。
+### 2. 増分インデックスとの連動は世代整合キャッシュで行う
 
-### 2. 増分インデックスとの連動は世代整合キャッシュ（post-commit フック不使用）
+`core::DictionaryCache` は `core::PrefilterCache`（TASK-169）と同一の失効パターンを
+踏襲する。post-commit フックのような追加の結線は持たず、次回参照時に
+`storage.current_generation()` との整合を判定して自己回復する構成とした。採用理由は
+`PrefilterCache` と共通（レビュー・保守コストの低減、部分更新による不整合経路の排除）。
 
-`core::DictionaryCache` は `core::PrefilterCache`（TASK-169）と同一の失効規約
-（`(table, ctx)` キー・`storage.current_generation()` との不一致で破棄・
-容量超過は LRU 追い出し・ロック毒化時はキャッシュを諦め非キャッシュ経路へ縮退）
-を踏襲する。ファイル形 `INSERT`（単発・バッチとも）は
-`tenant::replace_typed_rows_by_text_key` が世代を bump するため、次回
-`EngineCore::dictionary_snapshot` 呼び出し時に自動的に再構築され、増分インデックス
-の結果が反映される。
-
-post-commit フックを持たない構成にしたのは以下の理由による。
-
-- バッチ投入の途中失敗時に辞書側だけ不整合な部分更新が残る経路を構造的に排除できる
-- プロセス再起動時に辞書キャッシュが消失しても、次回参照時に `redb` から自己回復し、
-  永続化すべき追加状態を持たない
-- `PrefilterCache` と同一パターンのため、レビュー・保守コストが小さい
-
-トレードオフとして、`storage.current_generation()` はテーブル・書き込み種別を
-問わず任意の write commit で単調増加するため、本キャッシュはこのテーブル自身への
-書き込みだけでなく無関係な他テーブルへの書き込みでも保守的に失効する。テーブル
-単位の精密な失効は持たない。これは意図的な単純化であり、誤って古い辞書を返す
-経路（fail-open）よりも安全側（過剰な再構築）に倒す設計判断である。
-
-### 3. `path`/`body` 列を持たないテーブルは固定英語メッセージで拒否する
+### 3. `path`/`body` 列を持たないテーブルへの適用は拒否する
 
 新規 `CoreError` variant は追加せず、既存の `CatalogError::Invalid` を用いる
-（`wire_code` 写像・`wire-server` 側の網羅的 match への影響を避ける）。エラー
-メッセージは固定の英語文言とし、他テナントのデータ・存在情報を含めない。
+（`wire_code` 写像・`wire-server` 側の網羅的 match への影響を避ける）。エラーメッセージ
+は固定の英語文言とし、他テナントのデータ・存在情報を含めない。
 
 ## 影響
 
-- `crates/engine/src/dictionary.rs`（新規）: 抽出層（純関数 API・storage 非結線）
+- `crates/engine/src/dictionary.rs`（新規）
 - `crates/engine/src/core.rs`: `DictionaryCache`・`EngineCore::dictionary_snapshot`・
-  `EngineCore::with_dictionary_config` を追加（`VectorCore` trait へは昇格しない
-  固有 API のため `core-api-check` の対象外。`lib.rs` の `pub mod dictionary;`
-  追加のみが `core_api.snapshot` の差分になる）
-- `crates/engine/tests/dictionary.rs`（新規）: ファイル形 `INSERT`（単発・バッチ）
-  からの反映・同一パス再送での世代失効・テナント境界非漏えい・再起動後の再構築・
-  キャッシュヒットを検証
+  `EngineCore::with_dictionary_config` を追加（固有 API のため `core-api-check` の対象外）
+- `crates/engine/tests/dictionary.rs`（新規）
 
 ## スコープ外
 
-- Ollama 常駐プロセス連携・クエリ展開（TASK-110）、ソフトブースト（TASK-111）、
-  Recall 受け入れ検証（TASK-112〜113）は後続タスク
-- 辞書のパス単位差分更新（再構築の最適化）・LLM プロンプトへの整形（レンダリング
-  形式）は TASK-110 側で必要になった時点で拡張する
-- 行走査で得たチャンク本文をパスの原本本文へ結合せずチャンク単位のまま抽出する
-  ため、シンボルの行番号はチャンク相対値になる（チャンク化は行分割ベース・
-  非オーバーラップのためシンボル自体の欠落は生じない）。Markdown の文字数分割で
-  節が跨る場合の用語頻度の微差も同様に許容する（いずれも `dictionary.rs` モジュール
-  ドキュメント参照）
+- Ollama 連携・クエリ展開（TASK-110）、ソフトブースト（TASK-111）、Recall 受け入れ検証
+  （TASK-112〜113）は後続タスク
+- 辞書のパス単位差分更新（再構築の最適化）・LLM プロンプトへの整形は TASK-110 側で
+  必要になった時点で拡張する
 
 ## 参照
 
