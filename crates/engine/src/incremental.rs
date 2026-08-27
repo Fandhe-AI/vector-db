@@ -475,16 +475,18 @@ pub(crate) struct BatchFileIndexItem<'a> {
 /// 1. `items` の `(path.len(), body.len())` から `batch_limits::validate_batch_shape`
 ///    で①（ファイル数）②（ファイル単体本文サイズ）③（バッチ合計サイズ）を判定する
 ///    （チャンク化・埋め込み・write トランザクションのいずれよりも前）。
-/// 2. 全ファイルに対し [`chunk_phase`] を実行し（副作用ゼロ）、生成チャンク数を
-///    `checked_add` で累算する。オーバーフローは `54000` へ倒す。
-/// 3. 累算値を `batch_limits::validate_chunk_total` で判定し④を確定する（埋め込み・
-///    write トランザクションのいずれよりも開始前）。
-/// 4. 1〜3 をすべて通過した場合のみ、ファイルごとに [`embed_and_write_phase`] を実行
+/// 2. ファイルを 1 件ずつ [`chunk_phase`] にかけ（副作用ゼロ）、生成チャンク数を
+///    `checked_add` で累算するたびに `batch_limits::validate_chunk_total` を都度
+///    呼んで④を判定する（オーバーフローは `54000` へ倒す）。超過を検出した時点で
+///    残りファイルの `chunk_phase` を実行せず即座に拒否する（早期リターン）。これに
+///    より上限超過時に保持する `ChunkedFile` を上限判定通過分だけに抑え、超過検出
+///    前の無制限なチャンク生成・保持を防ぐ。
+/// 3. 2 をすべて通過した場合のみ、ファイルごとに [`embed_and_write_phase`] を実行
 ///    する（write トランザクションはファイル単位。TASK-120 の既存契約を維持）。
 ///
-/// 1〜3 のいずれかで拒否された場合、`chunk_phase` は redb への読み取り（スキーマ
+/// 1〜2 のいずれかで拒否された場合、`chunk_phase` は redb への読み取り（スキーマ
 /// 参照）のみで書き込み・埋め込みサービス呼び出しを行わないため副作用はゼロ
-/// （redb・インメモリ索引・`operation_id` 台帳とも変更なし。4 の write トランザク
+/// （redb・インメモリ索引・`operation_id` 台帳とも変更なし。3 の write トランザク
 /// ション自体が開始されていないため台帳記録も発生しない）。
 ///
 /// 4 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
@@ -508,7 +510,9 @@ pub(crate) fn index_file_batch(
     crate::batch_limits::validate_batch_shape(&shapes, limits)
         .map_err(BatchIncrementalError::Limits)?;
 
-    // 全ファイルの chunk_phase を先に完走させる（副作用ゼロ区間のみ）。
+    // 全ファイルの chunk_phase を先に完走させる（副作用ゼロ区間のみ）。④の上限判定は
+    // checked_add の直後・毎ファイルで都度行い、超過を検出した時点で残りファイルの
+    // chunk_phase を実行せず早期に拒否する（大量チャンクの生成・保持による DoS を防ぐ）。
     let mut chunked_files: Vec<ChunkedFile> = Vec::new();
     chunked_files
         .try_reserve_exact(items.len())
@@ -526,12 +530,12 @@ pub(crate) fn index_file_batch(
                         max: limits.max_batch_chunks,
                     },
                 ))?;
+        // ④: チャンク分割後・埋め込み処理の開始前。checked_add 直後に都度判定し、
+        // 超過時は chunked_files への保持・残りファイルの chunk_phase を行わない。
+        crate::batch_limits::validate_chunk_total(total_chunks, limits)
+            .map_err(BatchIncrementalError::Limits)?;
         chunked_files.push(chunked);
     }
-
-    // ④: チャンク分割後・埋め込み処理の開始前。
-    crate::batch_limits::validate_chunk_total(total_chunks, limits)
-        .map_err(BatchIncrementalError::Limits)?;
 
     // 1〜3 をすべて通過した場合のみ、ファイルごとに埋め込み・write トランザクション
     // を実行する（文単位セマンティクス。上記ドキュメント参照）。
