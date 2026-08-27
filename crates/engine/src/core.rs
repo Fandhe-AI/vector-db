@@ -1047,22 +1047,30 @@ impl EngineCore {
             let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
             drop(schema_read_txn);
 
+            // `path`/`body` は列名の存在だけでなく `ColumnType::Text` であることも
+            // 検証する（PR #249 codex-review P1 指摘: 同名の非 Text 列を持つ
+            // テーブルを受理すると、後段の `Value::Text` match で全行が黙って
+            // スキップされ、成功応答の空/不完全な辞書を返してしまう。型不一致は
+            // fail-closed で固定メッセージの `CatalogError::Invalid` として拒否し、
+            // 他テナントのデータ・存在情報は含めない）。
             let path_idx = schema
                 .columns
                 .iter()
-                .position(|c| c.name == "path")
+                .position(|c| c.name == "path" && c.ty == crate::catalog::ColumnType::Text)
                 .ok_or_else(|| {
                     CoreError::from(CatalogError::Invalid(
-                        "table has no path column required for dictionary extraction".to_string(),
+                        "table has no text path column required for dictionary extraction"
+                            .to_string(),
                     ))
                 })?;
             let body_idx = schema
                 .columns
                 .iter()
-                .position(|c| c.name == "body")
+                .position(|c| c.name == "body" && c.ty == crate::catalog::ColumnType::Text)
                 .ok_or_else(|| {
                     CoreError::from(CatalogError::Invalid(
-                        "table has no body column required for dictionary extraction".to_string(),
+                        "table has no text body column required for dictionary extraction"
+                            .to_string(),
                     ))
                 })?;
 

@@ -379,3 +379,54 @@ fn dictionary_snapshot_rejects_table_without_body_column() {
     // body 列欠落側の分岐（`core.rs` の 2 つ目の `ok_or_else`）を単独で検証する。
     assert!(format!("{err}").contains("body column"));
 }
+
+/// `path`/`body` という列名が存在しても `ColumnType::Text` でなければ拒否する
+/// （PR #249 codex-review P1 指摘の回帰テスト）。列名一致だけで受理すると、
+/// 後段の `Value::Text` match が全行を黙ってスキップし、成功応答の空/不完全な
+/// 辞書を返してしまう。ここでは `path` 列を `Vector` 型にして型不一致を再現する。
+#[test]
+fn dictionary_snapshot_rejects_non_text_path_column() {
+    let path = unique_db_path("dict-non-text-path-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "wrong_path_type",
+            vec![
+                ColumnDef::new("path", ColumnType::Vector(DIM), false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .dictionary_snapshot(&ctx, "wrong_path_type")
+        .expect_err("table with non-text path column must be rejected");
+    assert!(format!("{err}").contains("path column"));
+}
+
+/// `body` 列が非 Text 型の場合も同様に拒否する（上記テストの body 側）。
+#[test]
+fn dictionary_snapshot_rejects_non_text_body_column() {
+    let path = unique_db_path("dict-non-text-body-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "wrong_body_type",
+            vec![
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Vector(DIM), false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .dictionary_snapshot(&ctx, "wrong_body_type")
+        .expect_err("table with non-text body column must be rejected");
+    assert!(format!("{err}").contains("body column"));
+}
