@@ -141,11 +141,17 @@ pub struct Symbol {
 }
 
 /// `s` を `max_chars` 文字（文字境界。バイト境界ではない）で決定的に切り詰める。
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+/// 戻り値の `bool` は実際に切り詰めが発生したか（`s` の文字数が `max_chars` を
+/// 超えていたか）を示す。呼び出し元はこれを集約して
+/// [`DictionaryBuilder::truncated`] / [`Dictionary::truncated`] へ伝播させる
+/// 契約（モジュールドキュメント「有界化契約」参照。TASK-109・PLAN-5 レビュー
+/// 対応: 従来は切り詰めの有無を呼び出し元へ返さず、シンボル名・パス・用語の
+/// 個別切り詰めが `truncated` に反映されないまま黙殺されていた）。
+fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
     if s.chars().count() <= max_chars {
-        return s.to_string();
+        return (s.to_string(), false);
     }
-    s.chars().take(max_chars).collect()
+    (s.chars().take(max_chars).collect(), true)
 }
 
 /// 行頭の可視性修飾子（`pub` / `pub(...)`）・`async` / `unsafe` /
@@ -244,8 +250,10 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
 }
 
 /// 1 抽出単位（`path` の 1 チャンク本文 `body`）から Rust シンボルを抽出する。
-/// 戻り値の `bool` は [`MAX_SYMBOLS_PER_UNIT`] 超過による決定的切り詰めが
-/// 発生したかを示す。
+/// 戻り値の `bool` は [`MAX_SYMBOLS_PER_UNIT`] 超過による決定的切り詰め、
+/// および `path`・シンボル名が [`MAX_PATH_LEN`]・[`MAX_SYMBOL_NAME_LEN`] を
+/// 超えて切り詰められたかのいずれかが発生したことを示す（TASK-109・PLAN-5
+/// レビュー対応: 個別の文字列切り詰めも `truncated` へ確実に反映する）。
 ///
 /// 行番号はこの抽出単位内でのローカルな 1 起点行番号であり、チャンク化
 /// （`chunking.rs`）により本文が複数チャンクへ分割されている場合、元ファイル全体での
@@ -258,9 +266,8 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
 /// ドキュメンテーションコメント参照。チャンク相対行番号だけでは別チャンクの
 /// 同名・同種シンボルが衝突しうるための埋め合わせ）。
 pub fn extract_rust_symbols(path: &str, body: &str, unit_seq: u64) -> (Vec<Symbol>, bool) {
-    let path = truncate_chars(path, MAX_PATH_LEN);
+    let (path, mut truncated) = truncate_chars(path, MAX_PATH_LEN);
     let mut out = Vec::new();
-    let mut truncated = false;
     for (idx, line) in body.lines().enumerate() {
         if out.len() >= MAX_SYMBOLS_PER_UNIT {
             truncated = true;
@@ -273,10 +280,14 @@ pub fn extract_rust_symbols(path: &str, body: &str, unit_seq: u64) -> (Vec<Symbo
         // （untrusted 入力の行数は `chunking.rs::MAX_INPUT_LINES` で既に上限検証済み
         // だが、本モジュール単体でも `unwrap` を避け飽和変換で処理する）。
         let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
+        let (name, name_truncated) = truncate_chars(&name, MAX_SYMBOL_NAME_LEN);
+        if name_truncated {
+            truncated = true;
+        }
         out.push(Symbol {
             path: path.clone(),
             line: line_no,
-            name: truncate_chars(&name, MAX_SYMBOL_NAME_LEN),
+            name,
             kind,
             unit_seq,
         });
@@ -300,12 +311,16 @@ pub struct FileTree {
 /// うる。`by_extension`/`by_top_dir` は**ファイル単位**の集計（1 ファイル＝1 カウ
 /// ント）であるべきなので、`paths.insert` が真（＝パス初出）の場合のみ加算する
 /// （TASK-109・PLAN-5 レビュー対応: チャンク単位の重複加算バグ修正）。
-fn accumulate_file_tree(tree: &mut FileTree, path: &str) {
-    let path = truncate_chars(path, MAX_PATH_LEN);
+///
+/// 戻り値の `bool` は `path` が [`MAX_PATH_LEN`] を超えて切り詰められたかを示す
+/// （TASK-109・PLAN-5 レビュー対応: 呼び出し元 `DictionaryBuilder::ingest` が
+/// これを `truncated` へ伝播する）。
+fn accumulate_file_tree(tree: &mut FileTree, path: &str) -> bool {
+    let (path, truncated) = truncate_chars(path, MAX_PATH_LEN);
     if !tree.paths.insert(path.clone()) {
         // 既知パスの再訪（同一ファイルの別チャンク）。パス集合には既に含まれて
         // おり拡張子・トップディレクトリの二重加算を防ぐため、ここで打ち切る。
-        return;
+        return truncated;
     }
 
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(&path);
@@ -326,6 +341,7 @@ fn accumulate_file_tree(tree: &mut FileTree, path: &str) {
     };
     let counter = tree.by_top_dir.entry(top_dir).or_insert(0);
     *counter = counter.saturating_add(1);
+    truncated
 }
 
 const STOPWORDS: &[&str] = &[
@@ -345,28 +361,40 @@ fn is_stopword(word: &str) -> bool {
 /// ASCII 単語を小文字化・3 文字以上・ストップワード除外の条件で切り出す軽量
 /// トークナイザ（`sparse.rs` の BM25 用トークナイザとは責務が異なるため独立実装。
 /// モジュールドキュメント参照）。
-fn tokenize_ascii_words(text: &str) -> Vec<String> {
+/// 戻り値の `bool` はいずれかの語が [`MAX_TERM_LEN`] を超えて切り詰められたかを
+/// 示す（TASK-109・PLAN-5 レビュー対応: 呼び出し元の用語抽出関数がこれを
+/// `DictionaryBuilder::truncated` へ伝播する）。
+fn tokenize_ascii_words(text: &str) -> (Vec<String>, bool) {
     let mut words = Vec::new();
+    let mut truncated = false;
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_ascii_alphabetic() {
             current.push(ch.to_ascii_lowercase());
         } else if !current.is_empty() {
             if current.chars().count() >= 3 && !is_stopword(&current) {
-                words.push(truncate_chars(&current, MAX_TERM_LEN));
+                let (word, word_truncated) = truncate_chars(&current, MAX_TERM_LEN);
+                truncated = truncated || word_truncated;
+                words.push(word);
             }
             current.clear();
         }
     }
     if !current.is_empty() && current.chars().count() >= 3 && !is_stopword(&current) {
-        words.push(truncate_chars(&current, MAX_TERM_LEN));
+        let (word, word_truncated) = truncate_chars(&current, MAX_TERM_LEN);
+        truncated = truncated || word_truncated;
+        words.push(word);
     }
-    words
+    (words, truncated)
 }
 
 /// Rust ソースのドキュメンテーションコメント（`///` / `//!`）から用語頻度を抽出する。
-fn extract_rust_doc_terms(body: &str) -> BTreeMap<String, u64> {
+/// 戻り値の `bool` はいずれかの語が [`MAX_TERM_LEN`] 超で切り詰められたかを示す
+/// （TASK-109・PLAN-5 レビュー対応。呼び出し元 `DictionaryBuilder::merge_terms`
+/// がこれを `truncated` へ伝播する）。
+fn extract_rust_doc_terms(body: &str) -> (BTreeMap<String, u64>, bool) {
     let mut freq = BTreeMap::new();
+    let mut truncated = false;
     for line in body.lines() {
         let trimmed = line.trim_start();
         let content = if let Some(rest) = trimmed.strip_prefix("///") {
@@ -376,22 +404,26 @@ fn extract_rust_doc_terms(body: &str) -> BTreeMap<String, u64> {
         } else {
             continue;
         };
-        for word in tokenize_ascii_words(content) {
+        let (words, words_truncated) = tokenize_ascii_words(content);
+        truncated = truncated || words_truncated;
+        for word in words {
             let counter = freq.entry(word).or_insert(0u64);
             *counter = counter.saturating_add(1);
         }
     }
-    freq
+    (freq, truncated)
 }
 
-/// Markdown 本文（見出し・地の文いずれも含む）から用語頻度を抽出する。
-fn extract_markdown_terms(body: &str) -> BTreeMap<String, u64> {
+/// Markdown 本文（見出し・地の文いずれも含む）から用語頻度を抽出する。戻り値の
+/// `bool` の意味は [`extract_rust_doc_terms`] と同じ。
+fn extract_markdown_terms(body: &str) -> (BTreeMap<String, u64>, bool) {
     let mut freq = BTreeMap::new();
-    for word in tokenize_ascii_words(body) {
+    let (words, truncated) = tokenize_ascii_words(body);
+    for word in words {
         let counter = freq.entry(word).or_insert(0u64);
         *counter = counter.saturating_add(1);
     }
-    freq
+    (freq, truncated)
 }
 
 /// 抽出パイプラインの設定。シンボル辞書には無効化スイッチを持たせない
@@ -558,12 +590,20 @@ impl DictionaryBuilder {
                     self.symbols.insert(symbol);
                 }
                 if self.config.enable_term_index {
-                    self.merge_terms(extract_rust_doc_terms(body));
+                    let (terms, terms_truncated) = extract_rust_doc_terms(body);
+                    if terms_truncated {
+                        self.truncated = true;
+                    }
+                    self.merge_terms(terms);
                 }
             }
             SourceFileKind::Markdown => {
                 if self.config.enable_term_index {
-                    self.merge_terms(extract_markdown_terms(body));
+                    let (terms, terms_truncated) = extract_markdown_terms(body);
+                    if terms_truncated {
+                        self.truncated = true;
+                    }
+                    self.merge_terms(terms);
                 }
             }
             SourceFileKind::Other => {}
@@ -576,13 +616,18 @@ impl DictionaryBuilder {
             // 上限到達後に再 ingest された際、切り詰め後は既知パスであっても
             // 生の文字列比較では不一致となり新規パスと誤判定して `truncated` を
             // 不要に立ててしまう（TASK-109・PLAN-5 レビュー対応）。
-            let truncated_path = truncate_chars(path, MAX_PATH_LEN);
-            if self.file_tree.paths.len() >= MAX_DICTIONARY_PATHS
-                && !self.file_tree.paths.contains(&truncated_path)
-            {
+            let (truncated_path, path_truncated) = truncate_chars(path, MAX_PATH_LEN);
+            let safety_valve_hit = self.file_tree.paths.len() >= MAX_DICTIONARY_PATHS
+                && !self.file_tree.paths.contains(&truncated_path);
+            if !safety_valve_hit {
+                // `accumulate_file_tree` 内部でも同じ `truncate_chars(path,
+                // MAX_PATH_LEN)` を行うため、その戻り値は上の `path_truncated` と
+                // 常に一致する（呼び出し側で二重に `truncated` を立てないよう
+                // 戻り値自体は捨てるが、`path_truncated` で既に伝播済み）。
+                let _ = accumulate_file_tree(&mut self.file_tree, path);
+            }
+            if path_truncated || safety_valve_hit {
                 self.truncated = true;
-            } else {
-                accumulate_file_tree(&mut self.file_tree, path);
             }
         }
     }
@@ -800,7 +845,8 @@ mod tests {
     #[test]
     fn extracts_terms_from_rust_doc_comments_only() {
         let body = "//! module about caching and eviction\nfn helper() {}\n/// short\n";
-        let freq = extract_rust_doc_terms(body);
+        let (freq, truncated) = extract_rust_doc_terms(body);
+        assert!(!truncated);
         assert!(freq.contains_key("caching"));
         assert!(freq.contains_key("eviction"));
         assert!(freq.contains_key("module"));
@@ -811,7 +857,8 @@ mod tests {
     #[test]
     fn extracts_terms_from_markdown_body_and_headings() {
         let body = "# Query Planning\n\nThe dictionary contains symbols and terms.\n";
-        let freq = extract_markdown_terms(body);
+        let (freq, truncated) = extract_markdown_terms(body);
+        assert!(!truncated);
         assert!(freq.contains_key("query"));
         assert!(freq.contains_key("planning"));
         assert!(freq.contains_key("dictionary"));
@@ -823,13 +870,22 @@ mod tests {
 
     #[test]
     fn tokenizer_lowercases_and_drops_short_words() {
-        let words = tokenize_ascii_words("Rust DB is Fast and Reliable");
+        let (words, truncated) = tokenize_ascii_words("Rust DB is Fast and Reliable");
+        assert!(!truncated);
         assert!(words.contains(&"rust".to_string()));
         assert!(words.contains(&"fast".to_string()));
         assert!(words.contains(&"reliable".to_string()));
         assert!(!words.contains(&"db".to_string())); // 2 文字
         assert!(!words.contains(&"is".to_string())); // 2 文字
         assert!(!words.contains(&"and".to_string())); // ストップワード
+    }
+
+    #[test]
+    fn tokenizer_reports_truncation_for_overlong_word() {
+        let long_word = "a".repeat(MAX_TERM_LEN + 10);
+        let (words, truncated) = tokenize_ascii_words(&long_word);
+        assert!(truncated);
+        assert_eq!(words[0].chars().count(), MAX_TERM_LEN);
     }
 
     // --- ファイルツリー ---
@@ -902,27 +958,84 @@ mod tests {
         // TASK-109・PLAN-5 レビュー対応の回帰テスト（Low 指摘 2）:
         // `MAX_DICTIONARY_PATHS` へ到達した状態で、`MAX_PATH_LEN` を超える同一パス
         // （チャンク違いで再 ingest される）が「未知の新規パス」と誤判定され
-        // `truncated` が不要に立たないことを確認する。判定は挿入される切り詰め後の
+        // `paths` へ二重加算されないことを確認する。判定は挿入される切り詰め後の
         // 値で行う必要がある（生の未切り詰め `path` との比較は常に不一致になる）。
+        //
+        // `truncated` は `long_path` が `MAX_PATH_LEN` を超える時点で（安全弁とは
+        // 独立に）常に立つ（P1 レビュー対応: `truncate_chars` の切り詰め発生を
+        // 呼び出し元へ返し `truncated` へ伝播するようにしたため）。本テストが見る
+        // べき安全弁固有の regression シグナルは `truncated` の値ではなく
+        // `paths.len()` が再 ingest 後も増えないことである。
         let config = DictionaryConfig::default();
         let mut builder = DictionaryBuilder::new(config);
 
         // ちょうど MAX_DICTIONARY_PATHS - 1 件のユニークな穴埋めパスを積み、最後の
-        // 1 枠を長尺パスの初回 ingest で使い切る（この時点ではまだ安全弁は発火せず、
-        // `truncated` は立たない）。
+        // 1 枠を長尺パスの初回 ingest で使い切る。
         let long_path = "a".repeat(MAX_PATH_LEN + 50);
         for i in 0..(MAX_DICTIONARY_PATHS - 1) {
             builder.ingest(&format!("filler/{i}.txt"), "");
         }
         builder.ingest(&long_path, "");
         assert_eq!(builder.file_tree.paths.len(), MAX_DICTIONARY_PATHS);
-        assert!(!builder.truncated);
+        // `long_path` 自体の切り詰めにより、この時点で既に `truncated` は真。
+        assert!(builder.truncated);
 
         // 同一の長尺パス（別チャンク）を再 ingest。既知パス（切り詰め後）である
-        // ため、安全弁は発火せず `truncated` は立たないままであるべき。
+        // ため安全弁は発火せず、`paths.len()` は変わらないままであるべき
+        // （安全弁が誤発火し新規パス扱いされていれば、切り詰め後の重複が
+        // 事実上のカウント違反として現れずとも `paths` の実体は増えない
+        // ため `paths.len()` の不変が回帰の直接シグナルになる）。
         builder.ingest(&long_path, "");
         assert_eq!(builder.file_tree.paths.len(), MAX_DICTIONARY_PATHS);
-        assert!(!builder.truncated);
+        assert!(builder.truncated);
+    }
+
+    #[test]
+    fn builder_truncated_flag_reflects_symbol_path_and_name_truncation() {
+        // codex-review P1 対応の回帰テスト: `extract_rust_symbols` が返す
+        // シンボルの `path`/`name` が個別に切り詰められても、`truncate_chars` の
+        // 戻り値がこれまで呼び出し元へ伝わらず `DictionaryBuilder::truncated` /
+        // `Dictionary::truncated` が false のままになり得た（`crates/engine/src/
+        // dictionary.rs:538` 付近）。
+        let long_path = format!("src/{}.rs", "p".repeat(MAX_PATH_LEN + 10));
+        let long_name = "n".repeat(MAX_SYMBOL_NAME_LEN + 10);
+        let body = format!("fn {long_name}() {{}}\n");
+
+        let mut builder = DictionaryBuilder::new(DictionaryConfig::default());
+        builder.ingest(&long_path, &body);
+        assert!(builder.truncated);
+        let dict = builder.finish();
+        assert!(dict.truncated);
+    }
+
+    #[test]
+    fn builder_truncated_flag_reflects_file_tree_path_truncation() {
+        // codex-review P1 対応の回帰テスト: `accumulate_file_tree` 内の
+        // `truncate_chars` によるパス切り詰めが `truncated` へ伝播しない経路が
+        // あった（`crates/engine/src/dictionary.rs:579` 付近）。シンボル抽出対象
+        // 外の拡張子（Rust 以外）を使い、ファイルツリー経路単体の伝播を確認する。
+        let long_path = format!("docs/{}.md", "p".repeat(MAX_PATH_LEN + 10));
+
+        let mut builder = DictionaryBuilder::new(DictionaryConfig::default());
+        builder.ingest(&long_path, "");
+        assert!(builder.truncated);
+        let dict = builder.finish();
+        assert!(dict.truncated);
+    }
+
+    #[test]
+    fn builder_truncated_flag_reflects_term_truncation() {
+        // codex-review P1 対応の回帰テスト: `tokenize_ascii_words` による用語の
+        // `MAX_TERM_LEN` 超切り詰めが `truncated` へ伝播しない経路があった
+        // （`crates/engine/src/dictionary.rs:590` 付近から呼ばれる term 抽出）。
+        let long_word = "w".repeat(MAX_TERM_LEN + 10);
+        let body = format!("# heading\n\n{long_word} appears in body text.\n");
+
+        let mut builder = DictionaryBuilder::new(DictionaryConfig::default());
+        builder.ingest("docs/long-term.md", &body);
+        assert!(builder.truncated);
+        let dict = builder.finish();
+        assert!(dict.truncated);
     }
 
     // --- 上限系 ---
