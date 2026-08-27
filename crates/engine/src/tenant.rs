@@ -1256,8 +1256,9 @@ pub(crate) fn operation_recorded(
 /// [`operation_recorded`] と同じ理由で `pub(crate)` に限定する: `ledger_mode` の
 /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）判定は
 /// `EngineCore::last_operation_id` 側が担い、本関数はモード非依存の生の照会結果
-/// （`Option<OperationId>`）のみを返す。この区別をクレート外から迂回できないよう
-/// `pub(crate)` に留める。
+/// （[`ledger::LastOperationRaw`]。`last_op` 未記録時に `op_ledger` 由来の移行状態
+/// 〔`last_op` テーブル導入前の DB〕まで区別する。codex-review P1 指摘対応）のみを
+/// 返す。この区別をクレート外から迂回できないよう `pub(crate)` に留める。
 ///
 /// 照会範囲は呼び出し元テナント（`ctx.tenant_id()`）の名前空間に閉じる（TABLE-12・
 /// RLS-9 と同型。security.md P0）。
@@ -1265,7 +1266,7 @@ pub(crate) fn last_operation(
     storage: &Storage,
     table: &str,
     ctx: &PolicyContext,
-) -> Result<Option<OperationId>, TenantWriteError> {
+) -> Result<ledger::LastOperationRaw, TenantWriteError> {
     validate_identifier(table)?;
     let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
     ledger::last_operation_in_read_txn(&read_txn, ctx.tenant_id(), table)

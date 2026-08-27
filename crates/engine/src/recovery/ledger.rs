@@ -478,17 +478,79 @@ pub(crate) fn contains_in_read_txn(
 pub enum LastOperationLookup {
     /// テーブルあたり最後に commit 記録された `operation_id`。
     Committed(OperationId),
-    /// 台帳あり構成だが、当該テーブルへの記録がまだ 1 件もない。
+    /// 台帳あり構成だが、当該テーブルへの記録がまだ 1 件もない（`op_ledger`・
+    /// `last_op` いずれにも当該 `(tenant_id, table)` の記録が存在しない、真の
+    /// 未記録）。
     NotFound,
     /// 台帳を持たない構成（[`LedgerWrite::Disabled`]）のため照会できない。
     NoLedger,
+    /// `last_op`（二層目、TASK-98 で追加）テーブル導入前に書かれた `op_ledger`
+    /// （一層目）記録が当該 `(tenant_id, table)` に存在するが、`last_op` には
+    /// まだ記録がなく、正確な最終 `operation_id` を復元できない
+    /// （codex-review P1 指摘対応。`op_ledger` は commit 順序を保持しないため、
+    /// `last_op` 導入前の DB をアップグレード直後に照会した場合や、それ以降
+    /// 当該テーブルへの commit が一度も発生していない場合に生じうる）。
+    /// `NotFound`（真の未記録）へ丸めない fail-closed な区別: 呼び出し元は
+    /// 「未記録」の根拠として扱わず、同一内容の再送（本モジュールの重複判定）
+    /// を確定手段として使う。
+    Unavailable,
+}
+
+/// [`last_operation_in_read_txn`] の生の照会結果。`last_op`（二層目）テーブルの
+/// 状態に加え、`op_ledger`（一層目）由来の移行状態判定（[`LastOperationLookup::Unavailable`]
+/// 参照）を含む。呼び出し元（[`crate::tenant::last_operation`] 経由で
+/// [`crate::core::EngineCore::last_operation_id`]）が `LastOperationLookup` へ写像する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LastOperationRaw {
+    /// `last_op` に記録済み。
+    Found(OperationId),
+    /// `last_op`・`op_ledger` いずれにも当該 `(tenant_id, table)` の記録がない
+    /// （真の未記録）。
+    NotFound,
+    /// `last_op` には記録がないが `op_ledger` には記録がある（[`LastOperationLookup::Unavailable`]
+    /// 参照）。
+    LegacyLedgerWithoutLastOp,
+}
+
+/// `op_ledger`（一層目）に `(tenant_id, table)` の記録が 1 件でも存在するかを確認する
+/// （TASK-98、対象ビヘイビア: RECOVER-7・codex-review P1 指摘対応）。
+/// [`last_operation_in_read_txn`] が `last_op`（二層目）に記録なしと判定した際、それが
+/// 「本当に未記録」か「`last_op` テーブル導入〔TASK-98〕前の DB に旧 `op_ledger` 記録
+/// だけが残っている（アップグレード直後等）」かを区別するために使う。
+///
+/// `op_ledger` のキーは `(tenant_id, table_name, operation_id)` の辞書順のため、
+/// `(tenant_id, table, "")` を下限とする range の先頭 1 件を見るだけで判定でき、
+/// テーブル全体の走査は不要（`operation_id` は空文字列を許さない検証済み値のため、
+/// 空文字列は常に下限として機能する）。
+fn op_ledger_has_entry_for(
+    read_txn: &redb::ReadTransaction,
+    tenant_id: &str,
+    table: &str,
+) -> Result<bool, StorageError> {
+    let ledger_table = match read_txn.open_table(OP_LEDGER_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+        Err(e) => return Err(StorageError::from(e)),
+    };
+    let lower = Bound::Included((tenant_id, table, ""));
+    let mut iter = ledger_table.range::<(&str, &str, &str)>((lower, Bound::Unbounded))?;
+    match iter.next() {
+        Some(entry) => {
+            let (k, _v) = entry?;
+            let (found_tenant, found_table, _op_id) = k.value();
+            Ok(found_tenant == tenant_id && found_table == table)
+        }
+        None => Ok(false),
+    }
 }
 
 /// `read_txn` 内で `(tenant_id, table)` の最終 commit 済み `operation_id` を照会する
-/// （TASK-98、対象ビヘイビア: RECOVER-7）。テーブル不在（[`LAST_OP_TABLE`] を一度も
-/// 使っていない DB、または [`LedgerWrite::Disabled`] のみで運用してきた構成）は
-/// `Ok(None)` を返す（[`contains_in_read_txn`] と同じ「テーブル不在をエラーにしない」
-/// 方針）。未知フォーマットバージョン・不正 UTF-8・不正な `operation_id` はいずれも
+/// （TASK-98、対象ビヘイビア: RECOVER-7）。`last_op`（二層目）にテーブル不在・記録
+/// なしのいずれでも、[`op_ledger_has_entry_for`] で `op_ledger`（一層目）に当該
+/// `(tenant_id, table)` の記録が残っていないかを確認してから `NotFound` を確定する
+/// （`last_op` 導入前の DB をアップグレード直後に照会したケースを「未記録」と誤判定
+/// しない・codex-review P1 指摘対応。[`LastOperationRaw::LegacyLedgerWithoutLastOp`]
+/// 参照）。未知フォーマットバージョン・不正 UTF-8・不正な `operation_id` はいずれも
 /// fail-closed に拒否する（[`decode_last_op`]）。
 ///
 /// 呼び出し元（[`crate::tenant::last_operation`]）が `tenant_id` をサーバー側導出値に
@@ -497,25 +559,39 @@ pub(crate) fn last_operation_in_read_txn(
     read_txn: &redb::ReadTransaction,
     tenant_id: &str,
     table: &str,
-) -> Result<Option<OperationId>, StorageError> {
+) -> Result<LastOperationRaw, StorageError> {
     let last_op_table = match read_txn.open_table(LAST_OP_TABLE) {
-        Ok(t) => t,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
         Err(e) => return Err(StorageError::from(e)),
     };
-    match last_op_table.get((tenant_id, table))? {
-        Some(guard) => decode_last_op(guard.value()).map(Some).map_err(|e| {
-            // 診断メッセージのみを理由ごとに分ける（テナント・テーブル名・値の内容は
-            // 含めない・security.md P0）。fail-closed の判定自体はどの理由でも同じ。
-            let msg = match e {
-                LastOpDecodeError::UnknownVersion => "last_op entry has unknown format version",
-                LastOpDecodeError::InvalidUtf8 => "last_op entry has invalid utf-8 payload",
-                LastOpDecodeError::InvalidOperationId => "last_op entry has invalid operation_id",
-            };
-            StorageError::Codec(msg.to_string())
-        }),
-        None => Ok(None),
+
+    if let Some(t) = last_op_table.as_ref() {
+        if let Some(guard) = t.get((tenant_id, table))? {
+            return decode_last_op(guard.value())
+                .map(LastOperationRaw::Found)
+                .map_err(|e| {
+                    // 診断メッセージのみを理由ごとに分ける（テナント・テーブル名・値の
+                    // 内容は含めない・security.md P0）。fail-closed の判定自体はどの
+                    // 理由でも同じ。
+                    let msg = match e {
+                        LastOpDecodeError::UnknownVersion => {
+                            "last_op entry has unknown format version"
+                        }
+                        LastOpDecodeError::InvalidUtf8 => "last_op entry has invalid utf-8 payload",
+                        LastOpDecodeError::InvalidOperationId => {
+                            "last_op entry has invalid operation_id"
+                        }
+                    };
+                    StorageError::Codec(msg.to_string())
+                });
+        }
     }
+
+    if op_ledger_has_entry_for(read_txn, tenant_id, table)? {
+        return Ok(LastOperationRaw::LegacyLedgerWithoutLastOp);
+    }
+    Ok(LastOperationRaw::NotFound)
 }
 
 #[cfg(test)]
@@ -942,7 +1018,7 @@ mod tests {
         let read_txn = db.begin_read().expect("begin read");
         let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect("last_operation_in_read_txn");
-        assert_eq!(found, Some(op("op-a1")));
+        assert_eq!(found, LastOperationRaw::Found(op("op-a1")));
     }
 
     // (A2) 同一テーブルへの後続 commit で last_op が置き換わる（単一値）。一方、一層目
@@ -978,7 +1054,7 @@ mod tests {
         let read_txn = db.begin_read().expect("begin read");
         let last = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect("last_operation_in_read_txn");
-        assert_eq!(last, Some(op("op-a2-second")));
+        assert_eq!(last, LastOperationRaw::Found(op("op-a2-second")));
         // 一層目は両方とも記録済みのまま（keep-first で先着エントリも消えない）。
         assert!(
             contains_in_read_txn(&read_txn, "tenant-a", "documents", &op("op-a2-first"))
@@ -1013,7 +1089,7 @@ mod tests {
         let read_txn = db.begin_read().expect("begin read");
         let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect("last_operation_in_read_txn");
-        assert_eq!(found, None);
+        assert_eq!(found, LastOperationRaw::NotFound);
     }
 
     // (A4) Duplicate（内容一致再送）・ContentMismatch の拒否経路では last_op が
@@ -1059,7 +1135,7 @@ mod tests {
         let read_txn = db.begin_read().expect("begin read");
         let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect("last_operation_in_read_txn");
-        assert_eq!(found, Some(op("op-a4")));
+        assert_eq!(found, LastOperationRaw::Found(op("op-a4")));
     }
 
     // (A5) LedgerWrite::Disabled は last_op テーブルを作らない・照会はテーブル不在で
@@ -1083,8 +1159,8 @@ mod tests {
 
         let read_txn = db.begin_read().expect("begin read");
         let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
-            .expect("last_operation_in_read_txn on missing table must be None, not an error");
-        assert_eq!(found, None);
+            .expect("last_operation_in_read_txn on missing table must be NotFound, not an error");
+        assert_eq!(found, LastOperationRaw::NotFound);
         let table_names: Vec<String> = read_txn
             .list_tables()
             .expect("list_tables")
@@ -1219,17 +1295,17 @@ mod tests {
         assert_eq!(
             last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
                 .expect("last_operation tenant-a/documents"),
-            None
+            LastOperationRaw::NotFound
         );
         assert_eq!(
             last_operation_in_read_txn(&read_txn, "tenant-b", "documents")
                 .expect("last_operation tenant-b/documents"),
-            None
+            LastOperationRaw::NotFound
         );
         assert_eq!(
             last_operation_in_read_txn(&read_txn, "tenant-a", "other_table")
                 .expect("last_operation tenant-a/other_table must survive"),
-            Some(op("op-a7-3"))
+            LastOperationRaw::Found(op("op-a7-3"))
         );
     }
 
@@ -1252,5 +1328,125 @@ mod tests {
             .map(|handle| handle.name().to_string())
             .collect();
         assert!(!table_names.iter().any(|name| name == LAST_OP_TABLE.name()));
+    }
+
+    // --- codex-review P1 指摘対応: `last_op` 導入前 DB のアップグレード直後照会 -----
+
+    // (A8) `last_op` テーブルが未作成のまま `op_ledger`（一層目）にのみ記録がある
+    // （`last_op` 導入〔TASK-98〕前に書かれた DB を模す）場合、`NotFound`
+    // （未記録）へ丸めず `LegacyLedgerWithoutLastOp` を返す。
+    #[test]
+    fn last_operation_returns_legacy_when_only_op_ledger_has_entry_and_last_op_table_missing() {
+        let path = unique_db_path("last-op-a8");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        // `record_in_txn` は一層目・二層目を同一トランザクションで書くため、旧 DB を
+        // 模すには一層目 `op_ledger` のみへ直接書き込む（`last_op` には触れない）。
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE).expect("open table");
+            ledger_table
+                .insert(
+                    ("tenant-a", "documents", "op-a8"),
+                    encode_entry_v2(&hash("content-a8")).as_slice(),
+                )
+                .expect("insert legacy entry");
+        }
+        write_txn.commit().expect("commit");
+
+        let read_txn = db.begin_read().expect("begin read");
+        // `last_op` テーブル自体が未作成であることの前提確認。
+        let table_names: Vec<String> = read_txn
+            .list_tables()
+            .expect("list_tables")
+            .map(|handle| handle.name().to_string())
+            .collect();
+        assert!(!table_names.iter().any(|name| name == LAST_OP_TABLE.name()));
+
+        let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
+            .expect("last_operation_in_read_txn");
+        assert_eq!(found, LastOperationRaw::LegacyLedgerWithoutLastOp);
+    }
+
+    // (A9) `last_op` テーブル自体は存在する（他テーブルへの post-upgrade commit で
+    // 作成済み）が、照会対象の `(tenant_id, table)` にはまだ記録がなく、`op_ledger`
+    // 側にのみ記録が残っている場合も `LegacyLedgerWithoutLastOp` を返す。
+    #[test]
+    fn last_operation_returns_legacy_when_last_op_table_exists_but_lacks_entry_for_table() {
+        let path = unique_db_path("last-op-a9");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        // 旧 `op_ledger` 記録（`documents` テーブル分。`last_op` には書かない）。
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE).expect("open table");
+            ledger_table
+                .insert(
+                    ("tenant-a", "documents", "op-a9-legacy"),
+                    encode_entry_v2(&hash("content-a9-legacy")).as_slice(),
+                )
+                .expect("insert legacy entry");
+        }
+        write_txn.commit().expect("commit legacy entry");
+
+        // アップグレード後、別テーブル（`other_table`）への正規経路の書き込みで
+        // `last_op` テーブルが作成される。
+        let write_txn = db.begin_write().expect("begin write");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "other_table",
+            LedgerWrite::Record(&op("op-a9-other")),
+            &hash("content-a9-other"),
+        )
+        .expect("record other_table");
+        write_txn.commit().expect("commit other_table");
+
+        let read_txn = db.begin_read().expect("begin read");
+        // `last_op` テーブルは存在するが、`documents`/`tenant-a` の記録は持たない前提。
+        let table_names: Vec<String> = read_txn
+            .list_tables()
+            .expect("list_tables")
+            .map(|handle| handle.name().to_string())
+            .collect();
+        assert!(table_names.iter().any(|name| name == LAST_OP_TABLE.name()));
+
+        let found = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
+            .expect("last_operation_in_read_txn");
+        assert_eq!(found, LastOperationRaw::LegacyLedgerWithoutLastOp);
+
+        // 一方、正規経路で書かれた other_table は通常どおり Found を返す。
+        let found_other = last_operation_in_read_txn(&read_txn, "tenant-a", "other_table")
+            .expect("last_operation_in_read_txn other_table");
+        assert_eq!(found_other, LastOperationRaw::Found(op("op-a9-other")));
+    }
+
+    // (A10) `last_op` テーブルが存在していても、`op_ledger` 側にも当該
+    // `(tenant_id, table)` の記録が一切ない場合は真の `NotFound` のまま
+    // （`LegacyLedgerWithoutLastOp` へ誤判定しない）。
+    #[test]
+    fn last_operation_returns_not_found_when_neither_table_has_entry_even_if_last_op_table_exists()
+    {
+        let path = unique_db_path("last-op-a10");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "other_table",
+            LedgerWrite::Record(&op("op-a10-other")),
+            &hash("content-a10-other"),
+        )
+        .expect("record other_table");
+        write_txn.commit().expect("commit other_table");
+
+        let read_txn = db.begin_read().expect("begin read");
+        let found = last_operation_in_read_txn(&read_txn, "tenant-a", "never-written")
+            .expect("last_operation_in_read_txn");
+        assert_eq!(found, LastOperationRaw::NotFound);
     }
 }

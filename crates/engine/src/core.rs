@@ -1090,6 +1090,9 @@ impl EngineCore {
     /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）では
     /// [`Self::operation_recorded`] と同じく台帳テーブルへ一切触れず
     /// [`LastOperationLookup::NoLedger`] を返す（`NotFound` へ丸めない）。
+    /// `last_op`（二層目）テーブル導入〔TASK-98〕前の DB に旧 `op_ledger`（一層目）
+    /// 記録だけが残っている場合も同様に `NotFound` へ丸めず
+    /// [`LastOperationLookup::Unavailable`] を返す（codex-review P1 指摘対応）。
     /// `VectorCore` trait へは昇格しない（`operation_recorded` と同じ理由。
     /// `core-api-check` の対象外）。
     pub fn last_operation_id(
@@ -1097,14 +1100,19 @@ impl EngineCore {
         ctx: &PolicyContext,
         table: &str,
     ) -> Result<crate::recovery::ledger::LastOperationLookup, crate::tenant::TenantWriteError> {
-        use crate::recovery::ledger::LastOperationLookup;
+        use crate::recovery::ledger::{LastOperationLookup, LastOperationRaw};
         if matches!(self.ledger_mode, LedgerMode::CompareOnlyWithoutLedger) {
             return Ok(LastOperationLookup::NoLedger);
         }
         let found = crate::tenant::last_operation(&self.storage, table, ctx)?;
         Ok(match found {
-            Some(op_id) => LastOperationLookup::Committed(op_id),
-            None => LastOperationLookup::NotFound,
+            LastOperationRaw::Found(op_id) => LastOperationLookup::Committed(op_id),
+            LastOperationRaw::NotFound => LastOperationLookup::NotFound,
+            // `last_op` テーブル導入（TASK-98）前の DB に旧 `op_ledger` 記録だけが
+            // 残っているケース。正確な最終 `operation_id` を復元できないため
+            // `NotFound` へ丸めず fail-closed に区別する（codex-review P1 指摘対応。
+            // `LastOperationLookup::Unavailable` のドキュメント参照）。
+            LastOperationRaw::LegacyLedgerWithoutLastOp => LastOperationLookup::Unavailable,
         })
     }
 
