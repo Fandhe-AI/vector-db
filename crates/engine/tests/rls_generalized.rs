@@ -181,15 +181,18 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                     };
                     values.push(Value::Text(cell));
                 }
+                // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で
+                // 内容ハッシュを持つため、同一テナント・同一テーブル内で内容の異なる
+                // 複数行へ同一 operation_id を使い回すと 2 件目以降が
+                // OperationIdContentMismatch で拒否される。行・テーブルごとに一意の
+                // operation_id を使う。
+                let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+                    "test-op-{}-{id}",
+                    t.name
+                ))
+                .expect("valid operation_id");
                 engine::tenant::insert_typed_row(
-                    storage,
-                    t.name,
-                    &ctx,
-                    id,
-                    visibility,
-                    &values,
-                    &engine::recovery::required_op_id::OperationId::parse("test-op")
-                        .expect("valid operation_id"),
+                    storage, t.name, &ctx, id, visibility, &values, &op_id,
                 )
                 .expect("insert row");
                 truths.push(RowTruth {

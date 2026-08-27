@@ -422,6 +422,12 @@ fn setup_core(docs: &[Doc], vocab_size: usize) -> (EngineCore, CleanupGuard) {
 
     let ctx = PolicyContext::new("precision-eval-tenant").expect("valid tenant");
     for doc in docs {
+        // TASK-101（RECOVER-10）: 台帳は operation_id ごとに内容ハッシュを持つため、
+        // 内容の異なる複数行へ同一 operation_id を使い回すと 2 件目以降が
+        // OperationIdContentMismatch で拒否される。行ごとに一意の operation_id を使う。
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{}", doc.id))
+                .expect("valid operation_id");
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -432,8 +438,7 @@ fn setup_core(docs: &[Doc], vocab_size: usize) -> (EngineCore, CleanupGuard) {
                 Value::Vector(doc.vector.clone()),
                 Value::Text(doc.text.clone()),
             ],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
-                .expect("valid operation_id"),
+            &op_id,
         )
         .expect("insert row");
     }

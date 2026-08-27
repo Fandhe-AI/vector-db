@@ -142,7 +142,7 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
 スロットの拒否・不可視行の拒否・テナント跨ぎ同一 `id` の区別、および出力が
 `revalidate_primary_hits` を通ること／行 id 順の出力が拒否されることの回帰）。
 
-### 2.5 ベンチ A/B 実測配線（CORE-6/CORE-16 opt-in ゲート）
+### 2.5 ベンチ A/B 実測配線（CORE-6/CORE-16 opt-in ゲート。Issue #178・#234）
 
 `benches/batch_bench.rs` の `BENCH_CORE6`/`BENCH_CORE16` opt-in フラグは、
 「実 GPU 未実装のため常に `pass=false`」という案内から実測経路へ置き換えた:
@@ -151,14 +151,19 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   `FallbackBatchEngine::build_with_gpu`。GPU が初期化できない環境・計測中に
   CPU 縮退（CORE-8）が発生した場合は「測定不能（`pass=false`）」とし、CPU 同士の
   比較値を GPU 実測の代替として計上しない
-- CORE-16: 本 PR のスコープ外として **Issue #234 へ切り出し済み**（Issue #178 は
-  CORE-6 の充足で close する）。GPU 常駐コピーの f16 パックと f32 常駐の比較（ポインタ:
-  `docs/spec/04-behavior/core-engine.md` CORE-16）であり、現状の GPU バックエンドは
-  f16 パック常駐のみを実装していて GPU 側の f32 常駐対照経路が無いため実測不能。
-  opt-in 時は理由を明示して `pass=false` とする（CPU 経路同士の f16/f32 比較は
-  本 ID の対象外のため代替に使わない）
-- CORE-6 の短縮率下限は `BENCH_CORE6_MIN_IMPROVEMENT_PCT`（Actions variables）から
-  注入し、未設定・非正値は fail-closed（値は spec が SSOT のため本リポに
+- CORE-16（**Issue #234 で対照経路追加済み**。Issue #178 は CORE-6 の充足で
+  close 済み）: GPU 常駐コピーの f16 パックと f32 常駐の比較（ポインタ:
+  `docs/spec/04-behavior/core-engine.md` CORE-16）。対照 A = `gpu_batch.rs::
+  GpuF32ContrastBackend`（bench/テスト専用の対照経路。GPU 側に元の f32
+  ベクトル列をそのまま常駐させ `unpack2x16float` を経由しない内積を計算する）、
+  被検 B = 本番の f16 パック常駐 `GpuBatchBackend`。dispatch 本体
+  （`dispatch_dot_products`）は両常駐形式で共通化し、行データの読み方
+  （u32 パック解凍 vs f32 直接読み）だけが異なる WGSL シェーダを差し替える。
+  どちらかの GPU 初期化が失敗した環境では「測定不能（`pass=false`）」とし、
+  CPU 経路同士の比較値を GPU 実測の代替として計上しない（CORE-6 と同方針）
+- CORE-6/CORE-16 の短縮率下限はそれぞれ `BENCH_CORE6_MIN_IMPROVEMENT_PCT` /
+  `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（Actions variables）から注入し、
+  未設定・非正値は fail-closed（値は spec が SSOT のため本リポに
   デフォルトを持たない）
 
 ## 3. ローカル実測（開発環境）

@@ -364,6 +364,9 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
+        // `operation_id` を使う（固定文言の使い回しは同一テナント内の 2 回目以降が
+        // `23505` になる）。
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -371,7 +374,7 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
                 .expect("valid operation_id"),
         )
         .expect("insert public row");
@@ -380,6 +383,9 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
     let ctx_b =
         PolicyContext::with_visibilities("tenant-b", [Visibility::Public, Visibility::Private])
             .expect("valid tenant");
+    // TASK-101（RECOVER-10）: tenant-b は上のループで既に "test-op" を使用している
+    // ため（id=2, Public）、同じ operation_id を別内容で再利用すると
+    // OperationIdContentMismatch になる。別の operation_id を使う。
     engine::tenant::insert_typed_row(
         &storage,
         "docs",
@@ -387,7 +393,7 @@ fn search9_precision_gate_does_not_surface_private_rows_of_other_tenants() {
         12,
         Visibility::Private,
         &[Value::Vector(vec![1.0, 0.0])],
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
+        &engine::recovery::required_op_id::OperationId::parse("test-op-private-b")
             .expect("valid operation_id"),
     )
     .expect("insert private row");

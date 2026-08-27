@@ -9,8 +9,9 @@
 //! `sql::allowlist::Parser::parse_operation_id_clause`（呼び出し元）が行い、本モジュールは
 //! パース済み文字列値の意味論的検証（[`OperationId::parse`]）のみを担う。
 //!
-//! 台帳への永続化・重複拒否（`23505`）・内容不一致（`22023`）は本モジュールの
-//! 管轄外（TASK-93・TASK-94・TASK-101 が [`OperationId`] を土台にする）。
+//! 台帳への永続化（TASK-93）・重複拒否（`23505`、TASK-94）・内容不一致（`22023`、
+//! TASK-101）は本モジュールの管轄外で、いずれも本モジュールが提供する検証済み
+//! [`OperationId`] を土台にする。
 
 use crate::sql::allowlist::SqlSurfaceError;
 

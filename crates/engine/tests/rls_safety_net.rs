@@ -318,6 +318,11 @@ fn execute_sql_hint_order_rls_last_matches_default_order() {
         let ctx =
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        // TASK-101（RECOVER-10）: 台帳は operation_id ごとに内容ハッシュを持つため、
+        // 内容の異なる複数行へ同一 operation_id を使い回すと 2 件目以降が
+        // OperationIdContentMismatch で拒否される。行ごとに一意の operation_id を使う。
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
+            .expect("valid operation_id");
         engine::tenant::insert_typed_row(
             &storage,
             TABLE,
@@ -325,8 +330,7 @@ fn execute_sql_hint_order_rls_last_matches_default_order() {
             id,
             Visibility::Public,
             &[engine::row_codec::Value::Vector(emb.to_vec())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
-                .expect("valid operation_id"),
+            &op_id,
         )
         .expect("insert row");
     }

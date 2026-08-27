@@ -115,13 +115,19 @@ fn t2_engine_core_write_guard_rejects_none_before_reaching_storage() {
     assert_eq!(err.wire_code(), "23502");
 
     // `Some` を渡した場合は従来どおりの契約（ここでは実在テーブルへの成功・
-    // 未存在行への NotFound）が保たれる。
-    let op_id = OperationId::parse("op-t2").expect("valid operation_id");
-    core.insert_row(&ctx, TABLE, 100, &row, Some(&op_id))
+    // 未存在行への NotFound）が保たれる。TASK-101（RECOVER-10）: 台帳は
+    // `(tenant, table, operation_id)` 単位で内容ハッシュを持ち、insert/update/delete は
+    // それぞれ別の正規化入力（`content_hash` モジュール参照）を持つため、同一
+    // operation_id を insert→update→delete の 3 操作に使い回すと 2 回目以降が
+    // OperationIdContentMismatch になる。各操作へ別々の operation_id を使う。
+    let insert_op_id = OperationId::parse("op-t2-insert").expect("valid operation_id");
+    let update_op_id = OperationId::parse("op-t2-update").expect("valid operation_id");
+    let delete_op_id = OperationId::parse("op-t2-delete").expect("valid operation_id");
+    core.insert_row(&ctx, TABLE, 100, &row, Some(&insert_op_id))
         .expect("insert with operation_id should succeed");
-    core.update_row(&ctx, TABLE, 100, &row, Some(&op_id))
+    core.update_row(&ctx, TABLE, 100, &row, Some(&update_op_id))
         .expect("update with operation_id should succeed");
-    core.delete_row(&ctx, TABLE, 100, Some(&op_id))
+    core.delete_row(&ctx, TABLE, 100, Some(&delete_op_id))
         .expect("delete with operation_id should succeed");
 }
 

@@ -39,7 +39,8 @@ use crate::catalog::{
 };
 use crate::kernel::SearchHit;
 use crate::policy::PolicyContext;
-use crate::recovery::ledger::{self, LedgerWrite};
+use crate::recovery::content_hash;
+use crate::recovery::ledger::{self, LedgerRecordError, LedgerWrite};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::storage::{
     bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
@@ -272,6 +273,19 @@ pub enum TenantWriteError {
     /// `wire_code` `XX000`（内部事象）に固定し、クライアントへ再試行を促す誤情報を
     /// 出さない（fail-closed）。
     LedgerCorrupted(StorageError),
+    /// 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**書き込みが
+    /// 再送された（TASK-101・対象ビヘイビア: RECOVER-10。TASK-94・RECOVER-3 の
+    /// 重複拒否契約を包含する）。commit 済み確定の根拠として扱ってよく、`23505`
+    /// （`UniqueViolation` と同じ分類。error_format.rs のコメント参照）へ写像する。
+    /// 行キー衝突（[`TenantWriteError::IdConflict`]）とは別 variant にすることで、
+    /// クライアントが「先行実行が commit 済み」（RECOVER-7 が使う判定）を行キー衝突と
+    /// 取り違えない固定文言を返せるようにする。
+    DuplicateOperationId,
+    /// 台帳に記録済みの `operation_id` へ、**内容が異なる**書き込みが再送された、
+    /// または内容一致を証明できない旧フォーマット（v1）エントリへ再送された
+    /// （TASK-101・RECOVER-10）。commit 済み確定の根拠にしない fail-closed 判定
+    /// （`22023`）。行内容・テナント・他テナントの存在情報は含まない。
+    OperationIdContentMismatch,
 }
 
 impl TenantWriteError {
@@ -295,10 +309,12 @@ impl crate::error_format::ClassifiedError for TenantWriteError {
             TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
             TenantWriteError::NotFound => ErrorClass::RowNotFound,
             TenantWriteError::IdConflict => ErrorClass::UniqueViolation,
+            TenantWriteError::DuplicateOperationId => ErrorClass::UniqueViolation,
             TenantWriteError::MissingOperationId => ErrorClass::MissingOperationId,
             TenantWriteError::Catalog(_)
             | TenantWriteError::Storage(_)
             | TenantWriteError::LedgerCorrupted(_) => ErrorClass::InternalError,
+            TenantWriteError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
         }
     }
 
@@ -323,6 +339,16 @@ impl std::fmt::Display for TenantWriteError {
             TenantWriteError::Catalog(_) => write!(f, "tenant write catalog error"),
             TenantWriteError::Storage(_) => write!(f, "tenant write storage error"),
             TenantWriteError::LedgerCorrupted(_) => write!(f, "tenant write ledger error"),
+            // 行キー衝突（`IdConflict`）とは別の固定文言にすることで、クライアントが
+            // 「`operation_id` の重複拒否＝先行実行が commit 済み」（RECOVER-7 が使う
+            // 判定）を行キー衝突と取り違えないようにする（TASK-94・RECOVER-3・
+            // TASK-101・RECOVER-10）。
+            TenantWriteError::DuplicateOperationId => {
+                write!(f, "operation_id already recorded with the same content")
+            }
+            TenantWriteError::OperationIdContentMismatch => {
+                write!(f, "operation_id already recorded with different content")
+            }
         }
     }
 }
@@ -336,10 +362,14 @@ impl std::fmt::Debug for TenantWriteError {
             TenantWriteError::Forbidden => f.write_str("Forbidden"),
             TenantWriteError::NotFound => f.write_str("NotFound"),
             TenantWriteError::IdConflict => f.write_str("IdConflict"),
+            TenantWriteError::DuplicateOperationId => f.write_str("DuplicateOperationId"),
             TenantWriteError::MissingOperationId => f.write_str("MissingOperationId"),
             TenantWriteError::Catalog(_) => f.write_str("Catalog(<redacted>)"),
             TenantWriteError::Storage(_) => f.write_str("Storage(<redacted>)"),
             TenantWriteError::LedgerCorrupted(_) => f.write_str("LedgerCorrupted(<redacted>)"),
+            TenantWriteError::OperationIdContentMismatch => {
+                f.write_str("OperationIdContentMismatch")
+            }
         }
     }
 }
@@ -361,6 +391,21 @@ impl From<CatalogError> for TenantWriteError {
 impl From<StorageError> for TenantWriteError {
     fn from(e: StorageError) -> Self {
         TenantWriteError::Storage(e)
+    }
+}
+
+/// `ledger::record_in_txn`（TASK-101・RECOVER-10）の結果を `TenantWriteError` へ写像
+/// する。呼び出し元 6 箇所（本ファイル `*_unchecked`）が `?` で自然に変換できるように
+/// する。
+impl From<LedgerRecordError> for TenantWriteError {
+    fn from(e: LedgerRecordError) -> Self {
+        match e {
+            LedgerRecordError::Corrupted(storage_err) => {
+                TenantWriteError::LedgerCorrupted(storage_err)
+            }
+            LedgerRecordError::Duplicate => TenantWriteError::DuplicateOperationId,
+            LedgerRecordError::ContentMismatch => TenantWriteError::OperationIdContentMismatch,
+        }
     }
 }
 
@@ -466,8 +511,22 @@ pub(crate) fn insert_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
+        // 台帳照合用ハッシュ（TASK-101・RECOVER-10）はクライアント要求由来の内容
+        // （id・行データ）のみから計算する（DB 状態に依存しない決定性の担保。
+        // `content_hash` モジュールドキュメント参照）。同一 write トランザクション内で
+        // 即座に判定する（TOCTOU なし。redb 単一ライタ直列化により、この
+        // get→insert→判定がそのまま「トランザクション内再確認」になる）。`Err` の場合は
+        // 行の書き込みへ進まず、この後 `write_txn` が commit されない（呼び出し元の `?`
+        // で早期 return → drop）ため台帳追記も破棄され、部分書き込みが残らない
+        // （fail-closed。TASK-94・RECOVER-3 の原子性契約を包含する）。
+        let content_hash = content_hash::for_insert(id, row)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -560,8 +619,19 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
+        // バッチ全体で 1 ハッシュ（TASK-101・RECOVER-10。`content_hash` モジュール
+        // ドキュメント参照。要求記載順を含めて連結する）。`Err` の場合は行の書き込みへ
+        // 進まず、この後 `write_txn` が commit されない（呼び出し元の `?` で早期
+        // return → drop）ため台帳追記も破棄され、部分書き込みが残らない（fail-closed。
+        // TASK-94・RECOVER-3 の原子性契約を包含する）。
+        let content_hash = content_hash::for_insert_batch(rows)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -646,8 +716,36 @@ pub(crate) fn insert_typed_row_unchecked(
             embedding: &embedding,
             metadata: &metadata,
         };
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
+        // 型付き挿入も行形 INSERT と同じ「新規挿入」操作としてハッシュ化する
+        // （TASK-101・RECOVER-10。`content_hash::for_typed_insert` ドキュメント参照）。
+        // `Err` の場合は行の書き込みへ進まず、`write_txn` が commit されない（早期
+        // return → drop）ため台帳追記も破棄される（fail-closed。TASK-94・RECOVER-3
+        // の原子性契約を包含する）。
+        //
+        // ハッシュ入力には `values`（`schema.columns.len()` 幅・位置インデックス
+        // 基準の配列。`sql::parser::bind_insert` が構築）をそのまま渡さず、非
+        // VECTOR 列を列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
+        // `content_hash::push_named_scalar_columns` ドキュメント参照。位置基準の
+        // ままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で配列幅がずれ、内容一致の
+        // 再送が `22023` に誤判定される）。
+        let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(idx, column)| {
+                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+            })
+            .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
+            .collect();
+        let content_hash =
+            content_hash::for_typed_insert(id, visibility, &embedding, &named_columns)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -690,9 +788,15 @@ pub fn update_row(
 /// 設計）。呼び出し元は本モジュール内の [`update_row`] と
 /// `crate::core::EngineCore::update_row`（`self.ledger_mode` でガード済み）。
 ///
-/// `ledger`（TASK-93・RECOVER-2）: 対象行が不存在（`NotFound`）の場合は台帳へ触れない
-/// （後続 §T2 相当の結合テストが「未記録」であることを検証する）。所有権判定
-/// （`owns_existing`）の**後**に台帳追記する順序を取る。
+/// `ledger`（TASK-93・RECOVER-2、TASK-101・RECOVER-10）: 台帳照合・追記を所有権判定
+/// （`owns_existing`。`NotFound` 判定）より**前**に行う（TASK-93 時点の元設計から
+/// TASK-101 で反転）。commit 済み操作の再送は行状態が既に変化済み（削除済み行の
+/// 再更新等）のことがあり、所有権判定を先に行うと `NotFound`（`P0002`）が返って
+/// しまい、ハッシュ一致による再送検知（`23505`）に到達できない。台帳照合を先行
+/// させることで、再送検知が行状態の変化に左右されなくなる。「失敗した書き込みは
+/// 台帳へ残らない」不変条件は、エラー時に write トランザクションが commit されず
+/// drop（abort）される既存契約でそのまま保たれる（台帳照合が先でも、後続で
+/// `NotFound` を返せば同じ txn 内の台帳挿入も一緒に破棄される）。
 pub(crate) fn update_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -709,6 +813,15 @@ pub(crate) fn update_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
+        let content_hash = content_hash::for_update(id, row)?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
+
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -731,8 +844,6 @@ pub(crate) fn update_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
         let encoded = encode_row(row)?;
         row_table
             .insert(key, encoded.as_slice())
@@ -766,9 +877,20 @@ pub fn delete_row(
 /// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
 /// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
 ///
-/// `ledger`（TASK-93・RECOVER-2）: [`update_row_unchecked`] と同じく、対象行が
-/// 不存在（`NotFound`）の場合は台帳へ触れない。所有権判定（`owns_existing`）の
-/// **後**に台帳追記する。
+/// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3、TASK-101・RECOVER-10）:
+/// [`update_row_unchecked`] と同じく、台帳照合・追記を所有権判定（`owns_existing`）
+/// より**前**に行う。DELETE は「対象行を消す」副作用が 1 回目の commit で完了する
+/// ため、同一 `operation_id` の 2 回目以降の再送は対象行が既に不存在
+/// （`owns_existing == false`）になっている。所有権判定を先に見て `NotFound` を
+/// 返すと、この正当な重複再送がハッシュ一致による再送検知（`DuplicateOperationId`・
+/// `23505`）ではなく `NotFound` として観測され、RECOVER-3 の「同一 `operation_id` の
+/// 2 回目以降は重複として拒否する」契約を壊す（codex-review P1 指摘・PR #247）。
+/// 台帳照合を先に行うことで、「未使用の `operation_id` で対象行が不存在」の通常
+/// ケースは `NotFound` のまま維持しつつ（台帳への tentative 追記はこの後の早期
+/// `return` で `write_txn` が commit されず破棄されるため、副作用として残らない）、
+/// 「使用済みの `operation_id` を対象行削除後に再送」のケースを
+/// `DuplicateOperationId`（内容一致）・`OperationIdContentMismatch`（内容不一致）
+/// として区別する。
 pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -782,6 +904,17 @@ pub(crate) fn delete_row_unchecked(
         // 次元検証は不要だが、テーブル不存在の判定・並行 DDL との整合のため
         // `insert_row`/`update_row` と同じ前段を通す。
         require_table_schema_write(&write_txn, table)?;
+        // 削除要求のクライアント由来の内容は id のみ（`content_hash::for_delete`
+        // ドキュメント参照）。
+        let content_hash = content_hash::for_delete(id);
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
+
         let row_table_name = user_rows_table_name(table);
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
@@ -799,8 +932,6 @@ pub(crate) fn delete_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
@@ -861,6 +992,13 @@ pub(crate) struct ReplaceByTextKey<'a> {
     pub key_value: &'a str,
     pub visibility: crate::storage::Visibility,
     pub rows: &'a [Vec<crate::row_codec::Value>],
+    /// 内容照合ハッシュ（TASK-101・RECOVER-10）専用の raw クライアント要求。
+    /// `rows`（チャンク化・埋め込み後の派生行データ）とは意図的に分離する
+    /// （codex-review P1 指摘・PR #248。`content_hash::for_replace_by_text_key`
+    /// ドキュメント参照）。
+    pub content_hash_path: &'a str,
+    pub content_hash_body: &'a str,
+    pub content_hash_template_values: &'a [crate::row_codec::Value],
     /// 台帳への記録指示（TASK-93・RECOVER-2）。行の削除・挿入と同一 write
     /// トランザクション内で適用される。
     pub ledger_write: LedgerWrite<'a>,
@@ -877,6 +1015,9 @@ pub(crate) fn replace_typed_rows_by_text_key(
         key_value,
         visibility,
         rows,
+        content_hash_path,
+        content_hash_body,
+        content_hash_template_values,
         ledger_write,
     } = req;
     validate_identifier(table)?;
@@ -969,11 +1110,50 @@ pub(crate) fn replace_typed_rows_by_text_key(
 
         // 台帳記録は行の削除・挿入と同一の write トランザクション内で行う
         // （TASK-93・RECOVER-2。`insert_typed_row_unchecked` と同型。失敗すれば
-        // トランザクションごと abort し、行変更も台帳も残さない）。重複時の
-        // `RecordOutcome::AlreadyPresent` はここでは拒否理由にしない（重複拒否は
-        // TASK-94 の管轄で、行形 `INSERT` 経路と同じ扱いに揃える）。
-        ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-            .map_err(TenantWriteError::LedgerCorrupted)?;
+        // トランザクションごと abort し、行変更も台帳も残さない）。ハッシュ入力は
+        // 要求由来フィールド（`key_column`・`key_value`・`visibility`・
+        // `content_hash_path`・`content_hash_body`・`content_hash_template_values`）
+        // のみ（TASK-101・RECOVER-10。削除対象集合・採番 id 等の DB 状態由来の値に加え、
+        // チャンク化・埋め込み後の派生行データ（`rows`）も含めない。
+        // `content_hash::for_replace_by_text_key` ドキュメント参照）。同一内容の再送は
+        // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
+        // 契約に従う。行形 `INSERT` 経路と同じ扱い。TASK-94・RECOVER-3 の重複拒否契約を
+        // 包含する）。
+        //
+        // `content_hash_template_values`（`schema.columns.len()` 幅・位置インデックス
+        // 基準の配列。`sql::parser::bind_file_insert` が構築）をそのまま渡さず、
+        // 列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
+        // `content_hash::push_named_scalar_columns` ドキュメント参照。`insert_typed_row_unchecked`
+        // と同じ理由: 位置基準のままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で
+        // 配列幅がずれ、内容一致の再送が `22023` に誤判定される）。
+        let named_template_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(idx, column)| {
+                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+            })
+            .filter_map(|(idx, column)| {
+                content_hash_template_values
+                    .get(idx)
+                    .map(|value| (column.name.as_str(), value))
+            })
+            .collect();
+        let content_hash = content_hash::for_replace_by_text_key(
+            key_column,
+            key_value,
+            visibility,
+            content_hash_path,
+            content_hash_body,
+            &named_template_columns,
+        )?;
+        ledger::record_in_txn(
+            &write_txn,
+            ctx.tenant_id(),
+            table,
+            ledger_write,
+            &content_hash,
+        )?;
 
         for id in &to_remove {
             row_table
@@ -1286,6 +1466,9 @@ mod tests {
                 key_value: "other.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([9.0, 9.0], "other.txt", "unrelated")],
+                content_hash_path: "other.txt",
+                content_hash_body: "unrelated",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1301,6 +1484,9 @@ mod tests {
                 key_value: "note.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([1.0, 0.0], "note.txt", "v1 chunk a")],
+                content_hash_path: "note.txt",
+                content_hash_body: "v1 body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1322,6 +1508,9 @@ mod tests {
                     row_values([2.0, 0.0], "note.txt", "v2 chunk a"),
                     row_values([2.0, 1.0], "note.txt", "v2 chunk b"),
                 ],
+                content_hash_path: "note.txt",
+                content_hash_body: "v2 body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1373,6 +1562,9 @@ mod tests {
                 key_value: "shared.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([1.0, 1.0], "shared.txt", "tenant-b content")],
+                content_hash_path: "shared.txt",
+                content_hash_body: "tenant-b content",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1388,6 +1580,9 @@ mod tests {
                 key_value: "shared.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([2.0, 2.0], "shared.txt", "tenant-a content")],
+                content_hash_path: "shared.txt",
+                content_hash_body: "tenant-a content",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1422,6 +1617,9 @@ mod tests {
                 key_value: "absent.txt",
                 visibility: Visibility::Private,
                 rows: &[],
+                content_hash_path: "absent.txt",
+                content_hash_body: "",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1456,6 +1654,9 @@ mod tests {
                 key_value: "a.txt",
                 visibility: Visibility::Private,
                 rows: &[vec![crate::row_codec::Value::Text("a.txt".to_string())]],
+                content_hash_path: "a.txt",
+                content_hash_body: "body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1480,7 +1681,12 @@ mod tests {
         storage.create_table(&schema("docs")).expect("create table");
 
         let a = PolicyContext::new("tenant-a").expect("valid tenant");
-        let op_id = OperationId::parse("test-op").expect("valid operation_id");
+        // TASK-101（RECOVER-10）: 台帳照合は operation_id 単位でハッシュを持つため、
+        // 同一 operation_id を別内容の書き込みへ使い回すと本テストの意図（行 id 衝突の
+        // 検証）より先に `OperationIdContentMismatch` を検出してしまう。行 id 衝突を
+        // 単独で検証するため、シード投入とバッチ投入で別々の operation_id を使う。
+        let seed_op_id = OperationId::parse("test-op-seed").expect("valid operation_id");
+        let batch_op_id = OperationId::parse("test-op-batch").expect("valid operation_id");
 
         // id=3 を事前に投入しておき、バッチ末尾でこの id と衝突させる。
         insert_row(
@@ -1494,7 +1700,7 @@ mod tests {
                 embedding: &[9.0, 9.0],
                 metadata: b"original",
             },
-            &op_id,
+            &seed_op_id,
         )
         .expect("seed id=3");
 
@@ -1527,7 +1733,7 @@ mod tests {
                 },
             ),
         ];
-        let err = insert_rows(&storage, "docs", &a, &batch, &op_id)
+        let err = insert_rows(&storage, "docs", &a, &batch, &batch_op_id)
             .expect_err("trailing id=3 conflicts with the seeded row");
         assert!(matches!(err, TenantWriteError::IdConflict));
 

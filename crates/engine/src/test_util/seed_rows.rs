@@ -21,6 +21,13 @@ use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::storage::{RowInput, Storage, Visibility};
 
+/// プロセス内で `seed_rows_grouped_by_tenant` を呼ぶたびに一意な `operation_id`
+/// suffix を払い出すためのカウンタ（TASK-94・RECOVER-3 対応。台帳の重複拒否が入った
+/// ため、固定文字列の `operation_id` を同一テナント・同一テーブルへ複数回使うと
+/// 2 回目以降が `23505` で失敗しうる。1 テスト 1 回呼び出しの現状では衝突しないが、
+/// 将来の二重シードでも壊れないよう呼び出しごとに一意化しておく安全側の対応）。
+static SEED_OP_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `rows` をテナントごとのバッチへ分割し、テナント境界付き API
 /// （`engine::tenant::insert_rows`）で投入する。
 ///
@@ -51,7 +58,9 @@ pub fn seed_rows_grouped_by_tenant(storage: &Storage, table: &str, rows: &[(u64,
                 )
             })
             .collect();
-        let op_id = OperationId::parse("seed-rows-grouped-by-tenant").expect("valid operation_id");
+        let suffix = SEED_OP_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let op_id = OperationId::parse(&format!("seed-rows-grouped-by-tenant-{suffix}"))
+            .expect("valid operation_id");
         engine::tenant::insert_rows(storage, table, &ctx, &batch, &op_id).expect("seed rows");
     }
 }

@@ -47,6 +47,14 @@ fn seed_row(
     embedding: &[f32],
 ) {
     let ctx = PolicyContext::new(tenant).expect("valid tenant");
+    // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で内容ハッシュを
+    // 持つため、同一テナント・同一テーブル内で内容の異なる複数行へ同一
+    // operation_id を使い回すと 2 件目以降が OperationIdContentMismatch で拒否される。
+    // 行ごとに一意の operation_id を使う。
+    let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+        "test-op-{tenant}-{table}-{id}"
+    ))
+    .expect("valid operation_id");
     engine::tenant::insert_row(
         storage,
         table,
@@ -58,8 +66,7 @@ fn seed_row(
             embedding,
             metadata: &[],
         },
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
-            .expect("valid operation_id"),
+        &op_id,
     )
     .expect("seed row");
 }

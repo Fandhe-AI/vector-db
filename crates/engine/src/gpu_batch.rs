@@ -77,9 +77,16 @@ const MAX_WORKGROUPS_PER_DIMENSION_FALLBACK: u32 = 65535;
 /// と同一表現）と 1 クエリベクトルの内積を計算する。`unpack2x16float` は WGSL
 /// コア機能（`shader-f16` 拡張は不要）で、`batch_search.rs::unpack_f16x2` と
 /// 同じビット解釈をとる（同モジュールのドキュメンテーションコメント参照）。
+///
+/// `params.row_stride` は「1 行あたりの `packed_rows` 要素数」（= `dim.div_ceil(2)`）
+/// を表す。[`DOT_SHADER_F32_WGSL`]（Issue #234・CORE-16 対照経路）と bind group
+/// layout（バインディング構成・各エントリの型）を共用するため `Params` の形は
+/// 揃えてあるが、`row_stride` の意味はシェーダごとに異なる（本シェーダでは
+/// 「u32 パック要素数」、f32 版では「f32 要素数 = dim」。[`dispatch_dot_products`]
+/// のドキュメンテーションコメント参照）。
 const DOT_SHADER_WGSL: &str = r#"
 struct Params {
-    dim_half: u32,
+    row_stride: u32,
     row_count: u32,
     _pad0: u32,
     _pad1: u32,
@@ -98,11 +105,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let row = row_ids[i];
-    let row_base = row * params.dim_half;
+    let row_base = row * params.row_stride;
     var acc: f32 = 0.0;
     var j: u32 = 0u;
     loop {
-        if (j >= params.dim_half) {
+        if (j >= params.row_stride) {
             break;
         }
         let packed = packed_rows[row_base + j];
@@ -114,10 +121,53 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// WGSL: CORE-16（GPU 常駐コピーの f16 パック vs f32 常駐の A/B 対照経路。
+/// Issue #234・ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-16）用の
+/// **対照（bench/テスト専用）** シェーダ。[`DOT_SHADER_WGSL`] と異なり行データを
+/// `array<f32>` としてそのまま読み、`unpack2x16float` を経由しない f32 精度の
+/// 内積を計算する。バインディング構成（型・数）は [`DOT_SHADER_WGSL`] と同一の
+/// ため bind group layout を共用できる（WGSL の要素型 `array<u32>` vs
+/// `array<f32>` は wgpu のバインドグループレイアウト検証に現れない）。
+/// `params.row_stride` はここでは「1 行あたりの f32 要素数」= `dim` を表す。
+const DOT_SHADER_F32_WGSL: &str = r#"
+struct Params {
+    row_stride: u32,
+    row_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> rows: array<f32>;
+@group(0) @binding(2) var<storage, read> row_ids: array<u32>;
+@group(0) @binding(3) var<storage, read> query: array<f32>;
+@group(0) @binding(4) var<storage, read_write> scores: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.row_count) {
+        return;
+    }
+    let row = row_ids[i];
+    let row_base = row * params.row_stride;
+    var acc: f32 = 0.0;
+    var j: u32 = 0u;
+    loop {
+        if (j >= params.row_stride) {
+            break;
+        }
+        acc = acc + rows[row_base + j] * query[j];
+        j = j + 1u;
+    }
+    scores[i] = acc;
+}
+"#;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct GpuParams {
-    dim_half: u32,
+    row_stride: u32,
     row_count: u32,
     _pad0: u32,
     _pad1: u32,
@@ -131,7 +181,7 @@ impl GpuParams {
     fn to_ne_bytes_vec(self) -> Result<Vec<u8>, BatchBackendError> {
         let mut out = Vec::new();
         try_reserve_bytes(&mut out, 16)?;
-        out.extend_from_slice(&self.dim_half.to_ne_bytes());
+        out.extend_from_slice(&self.row_stride.to_ne_bytes());
         out.extend_from_slice(&self.row_count.to_ne_bytes());
         out.extend_from_slice(&self._pad0.to_ne_bytes());
         out.extend_from_slice(&self._pad1.to_ne_bytes());
@@ -321,6 +371,81 @@ fn init_gpu_context() -> Result<GpuContext, String> {
         device_lost,
         uncaptured_error,
     })
+}
+
+/// CORE-16 対照経路（[`GpuF32ContrastBackend`]）専用の compute pipeline を
+/// プロセス内で 1 回だけ遅延初期化する（Issue #234）。本番 dispatch 経路
+/// （[`GpuBatchBackend`]）の初期化コストへ影響させないため [`GpuContext`] には
+/// 足さず、独立の [`OnceLock`] として持つ。生成に失敗した場合もその結果を
+/// キャッシュし、以降の呼び出しは再試行しない（[`global_context`] と同方針）。
+///
+/// bind group layout は本番経路と共用する（[`DOT_SHADER_F32_WGSL`] のドキュメント
+/// コメント参照。バインディング構成が同一のため wgpu のレイアウト検証上は
+/// 区別されない）。
+fn f32_contrast_pipeline() -> Result<&'static wgpu::ComputePipeline, String> {
+    static PIPELINE: OnceLock<Result<wgpu::ComputePipeline, String>> = OnceLock::new();
+    let ctx = global_context().as_ref().map_err(String::clone)?;
+    let result = PIPELINE.get_or_init(|| {
+        // 生成は本番 dispatch と同じプロセス単位ロックの下で行う（codex P1
+        // 指摘対応と同方針: 共有 `wgpu::Device` への操作を並行させない）。
+        let _guard = gpu_dispatch_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        init_f32_contrast_pipeline(ctx)
+    });
+    result.as_ref().map_err(String::clone)
+}
+
+/// [`f32_contrast_pipeline`] の初期化本体。`init_gpu_context` のパイプライン
+/// 生成部と同じ手順（error scope で生成失敗を捕捉 → `Err` へ写像）を踏むが、
+/// device/queue/bind_group_layout は共有の [`GpuContext`] から借用するだけで
+/// 新規作成しない。
+fn init_f32_contrast_pipeline(ctx: &GpuContext) -> Result<wgpu::ComputePipeline, String> {
+    let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+
+    let shader = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("batch dot product f32 contrast"),
+            source: wgpu::ShaderSource::Wgsl(DOT_SHADER_F32_WGSL.into()),
+        });
+    let pipeline_layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("batch dot product f32 contrast pipeline layout"),
+            bind_group_layouts: &[Some(&ctx.bind_group_layout)],
+            immediate_size: 0,
+        });
+    let pipeline = ctx
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("batch dot product f32 contrast pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+    if block_on_with_device_poll(&ctx.device, oom_scope.pop())
+        .map_err(|_| {
+            "device poll failed or timed out during f32 contrast pipeline creation".to_string()
+        })?
+        .is_some()
+    {
+        return Err("gpu out of memory during f32 contrast pipeline creation".to_string());
+    }
+    if block_on_with_device_poll(&ctx.device, validation_scope.pop())
+        .map_err(|_| {
+            "device poll failed or timed out during f32 contrast pipeline creation".to_string()
+        })?
+        .is_some()
+    {
+        return Err("gpu validation error during f32 contrast pipeline creation".to_string());
+    }
+
+    Ok(pipeline)
 }
 
 fn storage_layout_entry(binding: u32, ty: wgpu::BufferBindingType) -> wgpu::BindGroupLayoutEntry {
@@ -664,17 +789,15 @@ impl BatchBackend for GpuBatchBackend {
             // （GPU_SCORE_BUFFER_BUDGET_BYTES ポインタ）。各チャンクは独立に
             // 実行し、選出器へ逐次 push するため正しさに影響しない。
             let chunk_rows = gpu_chunk_row_capacity(ctx);
+            let target = DotDispatchTarget {
+                pipeline: &ctx.pipeline,
+                row_buffer: &self.row_buffer,
+                bind_group_layout: self.bind_group_layout_ref(ctx),
+                row_stride: dim_half as u32,
+            };
             for chunk in reachable.chunks(chunk_rows.max(1)) {
-                let scores = dispatch_dot_products(
-                    ctx,
-                    &self.row_buffer,
-                    self.bind_group_layout_ref(ctx),
-                    chunk,
-                    q.vector,
-                    dim_half as u32,
-                    query_stride,
-                )
-                .map_err(BatchExecError::Backend)?;
+                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
+                    .map_err(BatchExecError::Backend)?;
 
                 if scores.len() != chunk.len() {
                     return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
@@ -753,6 +876,205 @@ impl GpuBatchBackend {
     /// 揃えるために存在する）。
     fn bind_group_layout_ref<'a>(&self, ctx: &'a GpuContext) -> &'a wgpu::BindGroupLayout {
         &ctx.bind_group_layout
+    }
+}
+
+/// CORE-16（GPU 常駐コピーの f16 パック vs f32 常駐の A/B 対照経路と受け入れ判定。
+/// Issue #234・ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-16）の
+/// **対照（bench/テスト専用）** バックエンド。[`GpuBatchBackend`] が保持する
+/// f16 2 要素/u32 パック常駐に対し、本バックエンドは元の f32 ベクトル列を
+/// そのまま GPU の STORAGE バッファへ常駐させ、`unpack2x16float` を経由しない
+/// f32 精度の内積を計算する。
+///
+/// `crate::batch_fallback::FallbackBatchEngine::build_with_gpu` の primary
+/// backend 選択には接続しない（CORE-12「経路を外部から上書きする機構を
+/// 設けない」と整合。本番の dispatch 経路選択は変えず、`benches/batch_bench.rs`
+/// の CORE-16 ゲートおよび `tests/gpu_batch.rs` の結合テストからのみ構築される。
+/// `crate::batch_fallback::GpuReferenceBackend` を pub で残している既存前例に倣う）。
+pub struct GpuF32ContrastBackend {
+    matrix: crate::batch_search::ResidentMatrix,
+    row_buffer: wgpu::Buffer,
+    /// [`GpuBatchBackend::device_lost`] と同じ役割（`GpuContext::device_lost`
+    /// への参照）。
+    device_lost: std::sync::Arc<AtomicBool>,
+    /// [`GpuBatchBackend::uncaptured_error`] と同じ役割。
+    uncaptured_error: std::sync::Arc<AtomicBool>,
+}
+
+impl GpuF32ContrastBackend {
+    /// 元データ（`ResidentMatrix::build` と同じ引数形）から f32 常駐対照
+    /// バックエンドを構築する。`ResidentMatrix` はテナント境界判定・スロット
+    /// 解決（`gather_reachable_rows`/`finalize_gpu_hits`/
+    /// `check_reachable_batch_work` の入力）のために内部でも構築するが、GPU
+    /// バッファへは常駐行列の f16 パック（`packed()`）ではなく、引数で渡された
+    /// **元の f32 ベクトル列**をそのままアップロードする。
+    pub fn try_new(
+        ids: &[u64],
+        tenant_ids: &[String],
+        visibilities: &[crate::storage::Visibility],
+        dim: usize,
+        vectors: &[f32],
+    ) -> Result<Self, BatchBackendError> {
+        let matrix =
+            crate::batch_search::ResidentMatrix::build(ids, tenant_ids, visibilities, dim, vectors)
+                .map_err(|e| {
+                    BatchBackendError::InitFailed(format!("resident matrix build failed: {e}"))
+                })?;
+
+        let ctx = match global_context() {
+            Ok(ctx) => ctx,
+            Err(msg) => return Err(BatchBackendError::InitFailed(msg.clone())),
+        };
+        // f32 対照経路専用パイプラインもここで先に確保できることを確認する
+        // （`try_new` 時点で `InitFailed` にできる失敗は早期に返す。
+        // `GpuBatchBackend::try_new` が本番パイプラインを `init_gpu_context` で
+        // 前もって確認しているのと同じ方針）。
+        f32_contrast_pipeline().map_err(BatchBackendError::InitFailed)?;
+
+        let vectors_bytes = vectors
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                BatchBackendError::InitFailed("f32 vector byte size overflow".to_string())
+            })?;
+        if vectors_bytes as u64 > ctx.max_storage_buffer_binding_size {
+            return Err(BatchBackendError::InitFailed(
+                "f32-resident vectors exceed adapter storage buffer limit".to_string(),
+            ));
+        }
+        if vectors_bytes == 0 {
+            return Err(BatchBackendError::InitFailed(
+                "f32-resident vectors are empty".to_string(),
+            ));
+        }
+
+        let _guard = gpu_dispatch_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vectors_staging = bytes_of_f32_slice(vectors)?;
+        let validation_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let oom_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let row_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("f32 contrast resident vectors"),
+            size: vectors_bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&row_buffer, 0, &vectors_staging);
+        let poll_failed = || {
+            BatchBackendError::InitFailed(
+                "device poll failed or timed out during f32-resident buffer upload".to_string(),
+            )
+        };
+        if block_on_with_device_poll(&ctx.device, oom_scope.pop())
+            .map_err(|_| poll_failed())?
+            .is_some()
+        {
+            return Err(BatchBackendError::InitFailed(
+                "gpu out of memory while uploading the f32-resident vectors".to_string(),
+            ));
+        }
+        if block_on_with_device_poll(&ctx.device, validation_scope.pop())
+            .map_err(|_| poll_failed())?
+            .is_some()
+        {
+            return Err(BatchBackendError::InitFailed(
+                "gpu validation error while uploading the f32-resident vectors".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            matrix,
+            row_buffer,
+            device_lost: ctx.device_lost.clone(),
+            uncaptured_error: ctx.uncaptured_error.clone(),
+        })
+    }
+}
+
+impl BatchBackend for GpuF32ContrastBackend {
+    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        if self.device_lost.load(Ordering::SeqCst) {
+            return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
+                "gpu device lost".to_string(),
+            )));
+        }
+        if self.uncaptured_error.load(Ordering::SeqCst) {
+            return Err(BatchExecError::Backend(
+                BatchBackendError::KernelLaunchFailed(
+                    "gpu reported an uncaptured error".to_string(),
+                ),
+            ));
+        }
+
+        validate_batch_queries(self.matrix.dim(), queries).map_err(BatchExecError::Input)?;
+        check_reachable_batch_work(&self.matrix, queries).map_err(BatchExecError::Input)?;
+
+        let ctx = match global_context() {
+            Ok(ctx) => ctx,
+            Err(msg) => {
+                return Err(BatchExecError::Backend(BatchBackendError::InitFailed(
+                    msg.clone(),
+                )))
+            }
+        };
+        let pipeline = f32_contrast_pipeline()
+            .map_err(|msg| BatchExecError::Backend(BatchBackendError::InitFailed(msg)))?;
+
+        let _guard = gpu_dispatch_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let dim = self.matrix.dim();
+        // f32 常駐は行データを `array<f32>` としてそのまま持つため、パディング
+        // 無しで `row_stride == dim`・`query_stride == dim`（f16 経路のような
+        // 偶数丸めは不要）。
+        let row_stride = dim as u32;
+        let query_stride = dim;
+
+        let mut hits: Vec<BatchHit> = Vec::new();
+        try_reserve_exact(&mut hits, queries.len(), "gpu f32 contrast results")
+            .map_err(BatchExecError::Input)?;
+        for q in queries {
+            let reachable = gather_reachable_rows(&self.matrix, q.ctx)
+                .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+
+            let mut selector = TopKSelector::new(q.k);
+
+            let chunk_rows = gpu_chunk_row_capacity(ctx);
+            let target = DotDispatchTarget {
+                pipeline,
+                row_buffer: &self.row_buffer,
+                bind_group_layout: &ctx.bind_group_layout,
+                row_stride,
+            };
+            for chunk in reachable.chunks(chunk_rows.max(1)) {
+                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
+                    .map_err(BatchExecError::Backend)?;
+
+                if scores.len() != chunk.len() {
+                    return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
+                        "readback length mismatch".to_string(),
+                    )));
+                }
+                for (&row_idx, &score) in chunk.iter().zip(scores.iter()) {
+                    if !score.is_finite() {
+                        continue;
+                    }
+                    selector.push(CandidateHit {
+                        id: u64::from(row_idx),
+                        score,
+                    });
+                }
+            }
+
+            hits.push(BatchHit {
+                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
+                    .map_err(BatchExecError::Input)?,
+            });
+        }
+
+        Ok(hits)
     }
 }
 
@@ -867,14 +1189,35 @@ fn gather_reachable_rows(
     Ok(out)
 }
 
+/// [`dispatch_dot_products`] へ渡す「呼び出し元の常駐形式ごとに固定の値」を
+/// 束ねる（clippy `too_many_arguments` を避けつつ、f16 パック常駐 /
+/// f32 常駐（Issue #234・[`GpuF32ContrastBackend`]）で異なるパイプライン・
+/// 行バッファ・行ストライドを 1 つの呼び出しで渡せるようにする）。
+/// `bind_group_layout` は両常駐形式で共用（[`DOT_SHADER_F32_WGSL`] のドキュメン
+/// テーションコメント参照）だが、`pipeline`・`row_buffer`・`row_stride` は
+/// 異なる。
+struct DotDispatchTarget<'a> {
+    pipeline: &'a wgpu::ComputePipeline,
+    row_buffer: &'a wgpu::Buffer,
+    bind_group_layout: &'a wgpu::BindGroupLayout,
+    /// `row_buffer` の 1 行あたりの要素数（f16: `dim.div_ceil(2)` 個の u32
+    /// パック要素、f32: `dim` 個の f32 要素）。
+    row_stride: u32,
+}
+
 /// 1 クエリ × `row_indices` 分の内積を GPU で計算し、readback した `f32` 列を返す。
+///
+/// `target` は呼び出し元の常駐形式（f16 パック / f32 常駐）ごとに異なる値を
+/// 渡す共通実装（Issue #234。CORE-16 対照経路 [`GpuF32ContrastBackend`] を
+/// 追加するにあたり、本番経路 [`GpuBatchBackend::batch_search`] と dispatch
+/// 本体をここへ共通化した。error scope・deadline 付きポーリング・readback
+/// 検証の防御を単一実装に保つ）。`query_stride` は `query` バッファのパディング後
+/// の要素数（f16 経路は偶数丸め、f32 経路はパディング不要のため `dim` そのもの）。
 fn dispatch_dot_products(
     ctx: &GpuContext,
-    row_buffer: &wgpu::Buffer,
-    bind_group_layout: &wgpu::BindGroupLayout,
+    target: &DotDispatchTarget<'_>,
     row_indices: &[u32],
     query: &[f32],
-    dim_half: u32,
     query_stride: usize,
 ) -> Result<Vec<f32>, BatchBackendError> {
     if row_indices.is_empty() {
@@ -888,7 +1231,7 @@ fn dispatch_dot_products(
     padded_query.resize(query_stride, 0.0);
 
     let params = GpuParams {
-        dim_half,
+        row_stride: target.row_stride,
         row_count,
         _pad0: 0,
         _pad1: 0,
@@ -950,7 +1293,7 @@ fn dispatch_dot_products(
 
     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("batch dot product bind group"),
-        layout: bind_group_layout,
+        layout: target.bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -958,7 +1301,7 @@ fn dispatch_dot_products(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: row_buffer.as_entire_binding(),
+                resource: target.row_buffer.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -985,7 +1328,7 @@ fn dispatch_dot_products(
             label: Some("batch dot product pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&ctx.pipeline);
+        pass.set_pipeline(target.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         let workgroups = (row_count as u64).div_ceil(GPU_WORKGROUP_SIZE as u64);
         let workgroups_x = u32::try_from(workgroups).unwrap_or(u32::MAX);
