@@ -19,7 +19,7 @@
 //! production 判定関数に依存しない独立オラクル）に従う。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::core::EngineCore;
+use engine::core::{CoreError, EngineCore, VectorCore};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::ledger::LedgerLookup;
@@ -103,6 +103,11 @@ fn seed_corpus(storage: &Storage, table: &str, tenant: &str) {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        // TASK-94・RECOVER-3 の重複拒否（`23505`）はテーブル単位で `operation_id` を
+        // 一意に要求するため、同一テーブル・同一テナントへの複数行 seed は行ごとに
+        // 別の `operation_id` を使う（PR #247 codex-review 指摘対応。1 つの
+        // `operation_id` を複数行の insert で使い回す既存の記述は TASK-93（keep-first
+        // のみ）時点のものでもはや成立しない）。
         engine::tenant::insert_typed_row(
             storage,
             table,
@@ -114,7 +119,7 @@ fn seed_corpus(storage: &Storage, table: &str, tenant: &str) {
                 Value::Text(format!("body-{}", row.id)),
                 Value::Text(row.lang.to_string()),
             ],
-            &op("seed-op"),
+            &op(&format!("seed-op-{table}-{}", row.id)),
         )
         .expect("insert row");
     }
@@ -281,7 +286,9 @@ fn arbitrary_table_c4_hybrid_rrf_and_hybrid_syntax_forms_match_documents() {
                     Value::Text(body.to_string()),
                     Value::Text("en".to_string()),
                 ],
-                &op("hybrid-seed"),
+                // seed_corpus と同じ理由（TASK-94・RECOVER-3）で行ごとに一意な
+                // `operation_id` を使う。
+                &op(&format!("hybrid-seed-{table}-{id}")),
             )
             .expect("insert row");
         }
@@ -466,7 +473,9 @@ fn setup_multi_tenant_table(storage: &Storage, table: &str) {
             row.id,
             row.visibility,
             &[Value::Vector(vec![1.0, 0.0])],
-            &op("rls-seed"),
+            // seed_corpus と同じ理由（TASK-94・RECOVER-3）で行ごとに一意な
+            // `operation_id` を使う。
+            &op(&format!("rls-seed-{table}-{}", row.id)),
         )
         .expect("insert row");
     }
@@ -646,21 +655,31 @@ fn arbitrary_table_ledger_scope_is_per_table_and_per_tenant() {
     assert_eq!(err.wire_code(), "23505");
 
     // 同一テーブル・同一テナントへの operation_id 自体の再送（op-shared を新規行
-    // id=2 へ再利用）。TASK-93（本台帳）は「既存エントリを上書きしない
-    // （keep-first）」ことのみを契約とし、重複拒否（23505）は TASK-94 の管轄で
-    // 本 PR のスコープ外（`recovery/ledger.rs` モジュール冒頭ドキュメント参照）
-    // のため、行 id が衝突しなければ成功し、台帳エントリも記録済みのまま
-    // 変化しないことを検証する（vacuous pass 防止・codex-review 指摘対応）。
-    core.execute_insert_sql(
-        &ctx_a,
-        "INSERT INTO kb_articles (id, embedding, body) VALUES (2, '[0.3,0.3,0.3]', 'resend') USING OPERATION_ID 'op-shared'",
-    )
-    .expect("resending an already-recorded operation_id onto a new row id must succeed (TASK-94 out of scope)");
+    // id=2 へ再利用）。TASK-94・RECOVER-3（本 PR）が「同一 (tenant_id, table,
+    // operation_id) への 2 回目以降の書き込みを拒否する」契約を実装したため、
+    // 行 id が衝突しない場合でも 23505（重複 operation_id）で拒否される
+    // （以前は TASK-93 の keep-first のみで成功していたが、本 PR でその挙動が
+    // 変わった。PR #247 codex-review 指摘対応）。行が書き込まれていないこと・
+    // 台帳エントリが最初の op-shared 書き込みのまま変化しないことも確認する。
+    let resend_err = core
+        .execute_insert_sql(
+            &ctx_a,
+            "INSERT INTO kb_articles (id, embedding, body) VALUES (2, '[0.3,0.3,0.3]', 'resend') USING OPERATION_ID 'op-shared'",
+        )
+        .expect_err("resending an already-recorded operation_id must now be rejected (TASK-94・RECOVER-3)");
+    assert_eq!(resend_err.wire_code(), "23505");
     assert_eq!(
         core.operation_recorded(&ctx_a, "kb_articles", &op("op-shared"))
             .expect("lookup ok"),
         LedgerLookup::Recorded,
         "keep-first: the ledger entry recorded by the first op-shared write must remain"
+    );
+    assert!(
+        matches!(
+            core.get_row(&ctx_a, "kb_articles", "tenant-a", 2),
+            Err(CoreError::NotFound)
+        ),
+        "the rejected resend must not have written row id=2"
     );
 
     // tenant-b が同一テーブルへ同一 operation_id を使っても成功する（テナント単位

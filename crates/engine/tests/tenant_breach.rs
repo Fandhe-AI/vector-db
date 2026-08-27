@@ -241,7 +241,13 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
             &attacker,
             target,
             &row,
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            // `seed_corpus` が tenant-a 名義の正当な投入で "test-op" を既に使用済み
+            // （TASK-94・RECOVER-3 は operation_id をテナント×テーブル単位で一意化する）
+            // ため、越境試行の検証には別の未使用 operation_id を使う（PR #247
+            // codex-review 指摘対応。越境試行はいずれも所有権判定より先に拒否・abort
+            // されるため台帳へは残らないが、"test-op" を再利用すると seed 時点の
+            // 正当な記録と衝突し `DuplicateOperationId` を誤って観測してしまう）。
+            &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::Forbidden)));
@@ -275,7 +281,9 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 &attacker,
                 target,
                 &row,
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                // "test-op-breach"（seed_corpus の "test-op" とは別 id。上記 INSERT
+                // ループのコメント参照）。
+                &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::NotFound)));
@@ -294,7 +302,8 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 &attacker,
                 own_id,
                 &row,
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                // "test-op-breach"（同上）。
+                &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::Forbidden)));
@@ -315,7 +324,8 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
             TABLE,
             &attacker,
             target,
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            // "test-op-breach"（同上）。
+            &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::NotFound)));

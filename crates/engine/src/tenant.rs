@@ -818,9 +818,20 @@ pub fn delete_row(
 /// 設計）。呼び出し元は本モジュール内の [`delete_row`] と
 /// `crate::core::EngineCore::delete_row`（`self.ledger_mode` でガード済み）。
 ///
-/// `ledger`（TASK-93・RECOVER-2）: [`update_row_unchecked`] と同じく、対象行が
-/// 不存在（`NotFound`）の場合は台帳へ触れない。所有権判定（`owns_existing`）の
-/// **後**に台帳追記する。
+/// `ledger`（TASK-93・RECOVER-2、TASK-94・RECOVER-3）: 台帳の重複判定
+/// （`ledger::record_in_txn` + `dedup::ensure_first_use`）を**所有権判定
+/// （`owns_existing`）より先**に行う。DELETE は「対象行を消す」副作用が
+/// 1 回目の commit で完了するため、同一 `operation_id` の 2 回目以降の再送は
+/// 対象行が既に不存在（`owns_existing == false`）になっている。所有権判定を
+/// 先に見て `NotFound` を返すと、この正当な重複再送が `DuplicateOperationId`
+/// （`23505`）ではなく `NotFound` として観測され、RECOVER-3 の「同一
+/// `operation_id` の 2 回目以降は重複として拒否する」契約を壊す
+/// （codex-review P1 指摘・PR #247）。台帳照合を先に行うことで、
+/// 「未使用の `operation_id` で対象行が不存在」の通常ケースは `NotFound` の
+/// まま維持しつつ（台帳への tentative 追記はこの後の早期 `return` で
+/// `write_txn` が commit されず破棄されるため、副作用として残らない）、
+/// 「使用済みの `operation_id` を対象行削除後に再送」のケースを
+/// `DuplicateOperationId` として区別する。
 pub(crate) fn delete_row_unchecked(
     storage: &Storage,
     table: &str,
@@ -838,6 +849,17 @@ pub(crate) fn delete_row_unchecked(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
+        // TASK-94・RECOVER-3: 台帳追記の結果を同一 write トランザクション内で即座に
+        // 判定する（TOCTOU なし。redb 単一ライタ直列化により、この get→insert→判定が
+        // そのまま「トランザクション内再確認」になる。`recovery::dedup` モジュール
+        // ドキュメント参照）。`AlreadyPresent` の場合はこの後の所有権判定・行削除へ
+        // 進まず、`write_txn` が commit されない（早期 `return` → drop）ため台帳の
+        // tentative 追記も破棄され、部分書き込みが残らない（fail-closed）。
+        let ledger_outcome =
+            ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
+                .map_err(TenantWriteError::LedgerCorrupted)?;
+        dedup::ensure_first_use(ledger_outcome)
+            .map_err(|_| TenantWriteError::DuplicateOperationId)?;
         // `update_row` と同じく `(tenant_id, id)` キー（TABLE-12）＋ `is_owner` の二重防御。
         let key = (ctx.tenant_id(), id);
         let owns_existing = match row_table.get(&key).map_err(CatalogError::from)? {
@@ -851,17 +873,6 @@ pub(crate) fn delete_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        // TASK-94・RECOVER-3: 台帳追記の結果を同一 write トランザクション内で即座に
-        // 判定する（TOCTOU なし。redb 単一ライタ直列化により、この get→insert→判定が
-        // そのまま「トランザクション内再確認」になる。`recovery::dedup` モジュール
-        // ドキュメント参照）。`AlreadyPresent` の場合は行の書き込みへ進まず、この後
-        // `write_txn` が commit されない（呼び出し元の `?` で早期 return → drop）ため
-        // 台帳追記も破棄され、部分書き込みが残らない（fail-closed）。
-        let ledger_outcome =
-            ledger::record_in_txn(&write_txn, ctx.tenant_id(), table, ledger_write)
-                .map_err(TenantWriteError::LedgerCorrupted)?;
-        dedup::ensure_first_use(ledger_outcome)
-            .map_err(|_| TenantWriteError::DuplicateOperationId)?;
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
     bump_generation_and_commit(write_txn)?;
