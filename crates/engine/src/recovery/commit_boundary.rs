@@ -13,64 +13,9 @@
 //! bump_generation_and_commit` を直接呼ばない）。これらはいずれも wire 層の
 //! DML 入口（`crate::core::EngineCore`）が最終的に通る経路。
 //!
-//! 失敗タイミングの三分類（RECOVER-5）と本モジュールの役割:
-//!
-//! - **(1) commit 前の失敗**: 呼び出し元が `write_txn` を commit へ渡す前に
-//!   `Err` を返し、`redb::WriteTransaction` を drop（＝ abort）する契約は
-//!   `crate::tenant`・`crate::catalog` 側に既存で成立している（本モジュールが
-//!   新設するのは (2)(3) の保護のみ）。
-//! - **(2) commit 成功後・派生状態反映の失敗**: [`PostCommitResult`] が
-//!   成功応答と独立に失敗を保持し、応答は commit 成功のまま一意に確定する
-//!   （反映失敗からの回復契約自体は後続タスク〔RECOVER-9 系〕のスコープで、
-//!   本モジュールは「応答の一意性を壊さない」構造の提供のみを担う）。
-//! - **(3) commit 成功後の panic**: [`PostCommitPanicGuard`] が commit 成功から
-//!   `post_commit`（派生状態反映）完了までの区間を覆う Drop ガードで、区間内で
-//!   panic が発生した場合は `std::process::abort()` してプロセスを終了させる。
-//!   さらに [`ResponseBoundaryGuard`] が、commit 成功から wire 層が実際に成功
-//!   応答をソケットへ書き終える（`ReadyForQuery` 送出含む）までのより広い区間を
-//!   カバーする（codex-review P1・PR #246 指摘対応。`commit_and_finish` 内で
-//!   disarm した後、呼び出し元スタックを戻って wire 層が応答を組み立て・送信する
-//!   区間は元々未保護だった）。unwind を継続させると呼び出し元スタック上の
-//!   `catch_unwind` 等で成功応答が構築されうるため、fail-closed（成功応答を
-//!   返しうる経路を構造的に遮断する）でプロセスごと止める（abort 前の ERR-1
-//!   応答送信は観測可能性側であり TASK-97・RECOVER-6 のスコープ。本モジュールは
-//!   安全性側のみを担う）。
-//!
-//!   [`ResponseBoundaryGuard`] はスレッドローカルの「現在アクティブなガードの
-//!   世代（generation）」を保持し、[`commit_and_finish`] は commit 成功時点で
-//!   そのスレッドにアクティブなガードが存在する場合のみ、その世代番号を pending
-//!   フラグへ記録する（codex-review P1 再指摘・PR #246 #discussion_r3870845012
-//!   対応。旧実装は commit 成功のたびに無条件でフラグを立てていたため、
-//!   `ResponseBoundaryGuard` の外側で公開 API（`Storage::put`/`WriteTxn::commit`
-//!   等）を直接呼んだ場合でも stale なフラグが残り、次のクエリのガードが
-//!   コミットなしに panic しただけで誤って abort しうる契約違反があった）。
-//!   ガードは drop 時、記録されている世代が自分自身の世代と一致する場合のみ
-//!   abort 判定を行う。ガードが存在しない状態での commit は
-//!   [`PostCommitPanicGuard`]（(2) の狭い区間）のみが保護し、
-//!   [`ResponseBoundaryGuard`] 側の保護は「何もしない」（＝この経路では wire
-//!   応答が構築されえないため、狭い区間の保護で十分というのが本モジュールの
-//!   前提）。
-//!
-//!   [`ResponseBoundaryGuard`] はスレッドローカル状態に依存するため、
-//!   `wire-server::server` の thread-per-connection 同期モデル（1 コネクション
-//!   1 スレッドが直列にクエリを処理する）を前提とする。呼び出し元
-//!   （`wire-server::simple_query::execute_and_respond`）が 1 クエリの処理開始時に
-//!   1 つ生成し、応答をすべて書き終えた自然な関数末尾（正常 return / unwind の
-//!   いずれでも drop される）まで所有する契約。非同期実行系（タスクがスレッドを
-//!   跨ぐ）へ移行する場合はこの設計が前提を失うため見直しが必要。
-//!
-//!   **ネスト時の契約**（codex-review P1 再指摘・PR #246
-//!   #discussion_r3873683862 対応）: 現在の唯一の呼び出し元は 1 クエリにつき
-//!   1 個のみ生成しネストしないが、本型は `pub` であり将来の呼び出し元がこの
-//!   契約を破ってネストして生成する可能性を型システムだけでは排除できない。
-//!   そのため [`ResponseBoundaryGuard`] は「ネストされても安全」な非所有設計と
-//!   している ―― 生成時に既にアクティブなガードが存在する場合、内側のガードは
-//!   スレッドローカル状態（[`ACTIVE_RESPONSE_BOUNDARY_GENERATION`]・
-//!   [`COMMIT_PENDING_RESPONSE`]）を一切書き換えず、drop 時も何もしない。外側の
-//!   世代・pending フラグは内側の生成・commit・正常 drop のいずれによっても
-//!   消去・上書きされないため、外側が commit 成功後に panic すれば内側の有無に
-//!   関わらず abort する。逆に内側の区間中に発生した commit は「外側の世代」の
-//!   commit として扱われる（内側は境界を所有しないため独自の世代を持たない）。
+//! 本モジュールが提供する型: [`PostCommitResult`]・[`PostCommitPanicGuard`]・
+//! [`ResponseBoundaryGuard`]。各型が担う保護区間・契約の詳細はそれぞれの
+//! ドキュメンテーションコメントを参照（対象ビヘイビア: RECOVER-5）。
 
 use std::cell::Cell;
 
@@ -78,7 +23,7 @@ use crate::storage::{self, Result as StorageResult};
 
 thread_local! {
     /// このスレッドで現在アクティブな [`ResponseBoundaryGuard`] の世代番号
-    /// （RECOVER-5 (3)。0 は「アクティブなガードなし」を表す予約値）。
+    /// （RECOVER-5。0 は「アクティブなガードなし」を表す予約値）。
     /// [`ResponseBoundaryGuard::new`] が生成時に採番・記録し、drop 時に
     /// 自分の世代と一致していればクリアする。[`commit_and_finish`] は commit
     /// 成功時点でここに記録されている世代（0 でなければ）だけを
@@ -91,20 +36,20 @@ thread_local! {
     static NEXT_RESPONSE_BOUNDARY_GENERATION: Cell<u64> = const { Cell::new(1) };
 
     /// commit 成功後、wire 層の応答確定（[`ResponseBoundaryGuard`] の drop）が
-    /// まだ済んでいない区間かどうかを表すスレッドローカルフラグ（RECOVER-5 (3)）。
+    /// まだ済んでいない区間かどうかを表すスレッドローカルフラグ（RECOVER-5）。
     /// [`commit_and_finish`] が commit 成功時にアクティブなガードが存在する場合、
     /// そのガードの世代番号を記録する（アクティブなガードがなければ何もしない
-    /// ―― stale フラグによる誤 abort を防ぐための契約。モジュール冒頭ドキュメント
-    /// 参照）。[`ResponseBoundaryGuard`] の drop 時に読み取ってクリアする。
+    /// ―― stale フラグによる誤 abort を防ぐための契約。[`ResponseBoundaryGuard`]
+    /// のドキュメント参照）。[`ResponseBoundaryGuard`] の drop 時に読み取ってクリアする。
     static COMMIT_PENDING_RESPONSE: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// commit 成功から wire 層の応答確定までの区間全体を覆う RAII ガード
-/// （RECOVER-5 (3)。[`PostCommitPanicGuard`] より広い区間を守る）。
+/// （RECOVER-5。[`PostCommitPanicGuard`] より広い区間を守る）。
 ///
 /// `wire-server::simple_query::execute_and_respond` が 1 クエリの処理開始時に
-/// 生成し、応答をすべて書き終えるまで所有する契約（モジュール冒頭ドキュメント
-/// 参照）。現在の唯一の呼び出し元はネストせず 1 クエリにつき 1 個のみ生成するが、
+/// 生成し、応答をすべて書き終えるまで所有する契約。現在の唯一の呼び出し元は
+/// ネストせず 1 クエリにつき 1 個のみ生成するが、
 /// 本型は `pub`（wire-server から呼ばれる）で将来の呼び出し元がこの契約を破って
 /// ネストして生成する可能性を構造的に排除できない。そのため、ネストしても
 /// 外側の保護区間が壊れない「非所有」設計にしている（codex-review P1 再指摘・
@@ -211,8 +156,8 @@ impl Drop for ResponseBoundaryGuard {
 }
 
 /// commit 成功後の派生状態（索引等）反映の結果。反映が失敗しても、確定済みの
-/// 成功応答（commit 自体は成功している）を `Err` へ転化させない
-/// （RECOVER-5 (2)）。現状 `crate::tenant`・`crate::txn` の書き込み経路には
+/// 成功応答（commit 自体は成功している）を `Err` へ転化させない（RECOVER-5）。
+/// 現状 `crate::tenant`・`crate::txn` の書き込み経路には
 /// commit 後の同期的な索引反映が存在しないため、既存呼び出し元はすべて
 /// [`PostCommitResult::Ok`] のみを渡す。将来 commit 後の派生状態反映を追加する
 /// 際の受け皿として型を用意しておく。
@@ -221,7 +166,7 @@ pub(crate) enum PostCommitResult {
     Ok,
     // `#[cfg_attr(not(test), allow(dead_code))]`: 現状 `crate::tenant`・`crate::txn` の
     // 書き込み経路は commit 後の同期的な索引反映を持たず、production 側は常に `Ok` のみを
-    // 構築する。本バリアントは (2) の応答一意性（反映失敗を成功応答へ転化させない）を
+    // 構築する。本バリアントは応答一意性（反映失敗を成功応答へ転化させない）を
     // 検証するユニットテスト（本モジュール末尾）専用の到達点であり、通常ビルドでは
     // `dead_code` lint が発火するため黙殺する（`catalog.rs::insert_row_into_table` と
     // 同じ理由・同じパターン）。
@@ -230,7 +175,7 @@ pub(crate) enum PostCommitResult {
 }
 
 /// commit 成功直後から呼び出し元への応答確定までの区間を覆う Drop ガード
-/// （RECOVER-5 (3)）。
+/// （RECOVER-5）。
 ///
 /// - [`Self::armed`] で commit 直後にガードを有効化する。
 /// - 応答を確定できる状態（成功で return できる状態）に達したら
@@ -285,10 +230,10 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
     armed && panicking
 }
 
-/// commit 成功境界の公開 choke point。`write_txn` は呼び出し元が pre-commit の
-/// 検証・書き込みを終え、commit 直前まで組み立て済みのトランザクションを渡す契約
-/// （呼び出し元が `Err` を返す場合はこの関数を呼ばず `write_txn` を drop する。
-/// drop による abort が RECOVER-5 (1) の「commit 前失敗は副作用ゼロ」契約を担う）。
+/// commit 成功境界の公開 choke point（RECOVER-5）。`write_txn` は呼び出し元が
+/// pre-commit の検証・書き込みを終え、commit 直前まで組み立て済みのトランザクション
+/// を渡す契約（呼び出し元が `Err` を返す場合はこの関数を呼ばず `write_txn` を drop
+/// する）。
 ///
 /// 内部で [`crate::storage::bump_generation_and_commit`] を呼んで commit する
 /// （世代カウントの経路網羅契約はそのまま維持する）。commit が失敗すればここで
@@ -299,7 +244,7 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 /// まで所有する）。アクティブなガードが存在しない場合（本モジュールのユニット
 /// テストや、将来の wire 経由以外の呼び出し元等）は記録しない ――
 /// その経路では wire 応答が構築されえないため、[`PostCommitPanicGuard`] による
-/// 狭い区間の保護のみで契約は満たされる（モジュール冒頭ドキュメント参照）。
+/// 狭い区間の保護のみで契約は満たされる。
 /// 続けて [`PostCommitPanicGuard`] を arm した状態で `post_commit` を実行し、
 /// 正常に完了できたら disarm してから `(value, post_commit の結果)` を返す
 /// （`post_commit` 内で panic した場合は `PostCommitPanicGuard` の Drop が abort
@@ -353,7 +298,7 @@ mod tests {
     use crate::storage::{RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
 
-    // --- should_abort の全分岐（RECOVER-5 (3) の判定純関数）---
+    // --- should_abort の全分岐（RECOVER-5 の判定純関数）---
 
     #[test]
     fn should_abort_true_only_when_armed_and_panicking() {
@@ -374,7 +319,7 @@ mod tests {
         // drop はスコープ終端で暗黙的に走る。abort されないことをテスト完走で示す。
     }
 
-    // --- commit_and_finish: RECOVER-5 (2) 応答一意性 ---
+    // --- commit_and_finish: RECOVER-5 応答一意性 ---
     // 派生状態反映が失敗しても、commit 済みの成功応答は Err へ転化しない。
 
     #[test]
@@ -415,7 +360,7 @@ mod tests {
             .expect("committed row must remain visible after reopen");
     }
 
-    // --- RECOVER-5 (3) 再指摘（PR #246 #discussion_r3870845012）の回帰テスト ---
+    // --- RECOVER-5 再指摘（PR #246 #discussion_r3870845012）の回帰テスト ---
     // `ResponseBoundaryGuard` の外側（＝ アクティブなガードなし）で commit した
     // stale なフラグを、後続クエリのガードが誤って自分の commit と関連付けて
     // abort しないこと。世代番号の紐付けにより、このケースは in-process で
@@ -567,7 +512,7 @@ mod tests {
         );
     }
 
-    // --- RECOVER-5 (3): commit 成功後 panic のプロセス終了保証（サブプロセス検証）---
+    // --- RECOVER-5: commit 成功後 panic のプロセス終了保証（サブプロセス検証）---
     //
     // `PostCommitPanicGuard` の abort 実行はプロセスを道連れにするため in-process では
     // 検証できない。`std::env::current_exe()`（cargo test が生成する本クレートの
@@ -600,7 +545,7 @@ mod tests {
                     .expect("child: insert");
             }
             let _ = commit_and_finish(write_txn, (), |()| {
-                panic!("injected post-commit panic for RECOVER-5 (3) verification")
+                panic!("injected post-commit panic for RECOVER-5 verification")
             });
             // ここへ到達したのはガードが abort しなかった不具合。親側が判定できる
             // 固定マーカーを出してから異常終了する。
@@ -681,7 +626,7 @@ mod tests {
         }
 
         // commit 自体は成功しているため、再オープン後も行が可視であること
-        // （(3) は commit 後の panic であり、副作用〔commit〕自体は残る ――
+        // （commit 後の panic であり、副作用〔commit〕自体は残る ――
         // 保証対象は「commit しないこと」ではなく「成功応答を返さないこと」）。
         let reopened = Storage::open(&path).expect("reopen storage");
         reopened
@@ -689,7 +634,7 @@ mod tests {
             .expect("committed row must remain visible after subprocess abort");
     }
 
-    // --- RECOVER-5 (3) 拡張区間: commit_and_finish が正常 return（disarm 済み）した
+    // --- RECOVER-5 拡張区間: commit_and_finish が正常 return（disarm 済み）した
     // 後、`ResponseBoundaryGuard` がまだ生存している区間（＝ wire 層が応答を組み立て・
     // 送信する区間の模擬）で panic しても abort すること。
     // codex-review P1・PR #246 指摘（`commit_and_finish` の disarm 直後から応答確定
