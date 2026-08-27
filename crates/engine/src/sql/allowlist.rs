@@ -108,9 +108,15 @@ pub enum SqlSurfaceError {
     /// を SQL 表層へ写像したもの。ERR-2: `23505`）。行ストアの物理キーは
     /// `(tenant_id, id)` で名前空間化されているため（TABLE-12・RLS-9）、他テナントが
     /// 同じ `id` を保持していても本 variant にはならない。`operation_id` 単位の
-    /// 冪等判定（台帳による重複拒否・内容不一致検出）は本 variant の管轄外で、
-    /// TASK-93・TASK-94・TASK-101 が後続で扱う。
+    /// 冪等判定（台帳による重複拒否）は [`SqlSurfaceError::DuplicateOperationId`]
+    /// （TASK-94）が別 variant で扱う。内容不一致検出は TASK-101 が後続で扱う。
     IdConflict,
+    /// 同一 `(tenant_id, table, operation_id)` への書き込みが既に commit 済み
+    /// （TASK-94・対象ビヘイビア: RECOVER-3。
+    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] を SQL 表層へ写像した
+    /// もの。ERR-2: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]）とは別の
+    /// 固定文言を返し、クライアントが両者を取り違えないようにする。
+    DuplicateOperationId,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// ERR-2 表に未掲載の新設コード（SQL-13 が定義。ポインタ:
@@ -205,6 +211,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::PayloadTooLarge { .. } => ErrorClass::PayloadTooLarge,
             SqlSurfaceError::MissingOperationId => ErrorClass::MissingOperationId,
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
+            SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
         }
     }
@@ -237,6 +244,12 @@ impl std::fmt::Display for SqlSurfaceError {
             // 他テナントの行 id 存在オラクルにならない。
             SqlSurfaceError::IdConflict => {
                 write!(f, "row id already exists")
+            }
+            // `crate::tenant::TenantWriteError::DuplicateOperationId` と同じ固定文言
+            // （`IdConflict` の文言と区別できることが目的。上記 variant doc・
+            // security.md P0 参照）。
+            SqlSurfaceError::DuplicateOperationId => {
+                write!(f, "operation_id already committed for this table")
             }
             SqlSurfaceError::NumericOutOfRange { detail } => {
                 write!(f, "numeric value out of range: {detail}")

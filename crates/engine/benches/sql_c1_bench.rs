@@ -200,15 +200,13 @@ fn main() {
                 )
             })
             .collect();
-        engine::tenant::insert_rows(
-            &storage,
-            TABLE,
-            &ctx,
-            &rows,
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
-                .expect("valid operation_id"),
-        )
-        .expect("seed batch insert");
+        // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、バッチごとに一意な
+        // `operation_id` を使う（固定文言の使い回しは 2 バッチ目以降が `23505` になる）。
+        let op_id =
+            engine::recovery::required_op_id::OperationId::parse(&format!("seed-batch-{next_id}"))
+                .expect("valid operation_id");
+        engine::tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id)
+            .expect("seed batch insert");
         for (i, v) in batch_vectors.iter().enumerate() {
             ids.push(next_id + i as u64);
             flat_vectors.extend_from_slice(v);

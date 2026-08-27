@@ -69,7 +69,7 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
                 .expect("valid operation_id"),
         )
         .expect("insert row");
@@ -357,7 +357,7 @@ fn equality_predicate_and_expr_predicate_combine_in_the_same_where_clause() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
                 .expect("valid operation_id"),
         )
         .expect("insert row");

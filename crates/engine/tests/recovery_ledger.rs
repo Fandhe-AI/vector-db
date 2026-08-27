@@ -315,7 +315,9 @@ fn t7_compare_only_without_ledger_never_records() {
 }
 
 // --- T8: keep-first。同一 op-a で 2 回目の書き込み（別 id）後も Recorded のまま
-//         （拒否は TASK-94 の管轄。ここでは 1 回目の記録が保持されることのみ検証）。
+//         （2 回目自体は TASK-94・RECOVER-3 実装後は `23505` で拒否される。
+//         `tests/recovery_dedup.rs` 参照。ここでは拒否後も 1 回目の記録が
+//         保持されることのみ検証する）。
 
 #[test]
 fn t8_keep_first_entry_remains_recorded_after_second_use() {
@@ -336,8 +338,11 @@ fn t8_keep_first_entry_remains_recorded_after_second_use() {
         LedgerLookup::Recorded
     );
 
-    // 2 回目の書き込み（別 id）。成否そのものは TASK-94 の管轄（本タスクでは重複拒否を
-    // 実装しない）のため断定しない。台帳が引き続き Recorded のままであることのみ検証する。
+    // 2 回目の書き込み（別 id）。TASK-94・RECOVER-3 実装後は台帳の
+    // `RecordOutcome::AlreadyPresent` により `23505` で拒否される
+    // （`tests/recovery_dedup.rs` が拒否そのものを検証する）。本テストは keep-first
+    // 契約（拒否後も 1 回目の記録が保持されること）のみを検証するため、成否は
+    // 断定せず結果を握り潰す。
     let _ = core.execute_insert_sql(
         &ctx,
         "INSERT INTO documents (id, embedding, body) VALUES (2, '[0.4,0.5,0.6]', 'c') USING OPERATION_ID 'op-a'",

@@ -47,6 +47,12 @@ fn seed_row(
     embedding: &[f32],
 ) {
     let ctx = PolicyContext::new(tenant).expect("valid tenant");
+    // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、呼び出しごとに一意な
+    // `operation_id` を使う（固定文言の使い回しは同一テナント内の 2 回目以降が
+    // `23505` になる）。
+    let op_id =
+        engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{tenant}-{id}"))
+            .expect("valid operation_id");
     engine::tenant::insert_row(
         storage,
         table,
@@ -58,8 +64,7 @@ fn seed_row(
             embedding,
             metadata: &[],
         },
-        &engine::recovery::required_op_id::OperationId::parse("test-op")
-            .expect("valid operation_id"),
+        &op_id,
     )
     .expect("seed row");
 }
