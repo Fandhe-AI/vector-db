@@ -28,13 +28,28 @@
 //!   panic が発生した場合は `std::process::abort()` してプロセスを終了させる。
 //!   さらに [`ResponseBoundaryGuard`] が、commit 成功から wire 層が実際に成功
 //!   応答をソケットへ書き終える（`ReadyForQuery` 送出含む）までのより広い区間を
-//!   スレッドローカルフラグ経由で覆う（codex-review P1・PR #246 指摘対応。
-//!   `commit_and_finish` 内で disarm した後、呼び出し元スタックを戻って wire 層が
-//!   応答を組み立て・送信する区間は元々未保護だった）。unwind を継続させると
-//!   呼び出し元スタック上の `catch_unwind` 等で成功応答が構築されうるため、
-//!   fail-closed（成功応答を返しうる経路を構造的に遮断する）でプロセスごと
-//!   止める（abort 前の ERR-1 応答送信は観測可能性側であり TASK-97・RECOVER-6
-//!   のスコープ。本モジュールは安全性側のみを担う）。
+//!   カバーする（codex-review P1・PR #246 指摘対応。`commit_and_finish` 内で
+//!   disarm した後、呼び出し元スタックを戻って wire 層が応答を組み立て・送信する
+//!   区間は元々未保護だった）。unwind を継続させると呼び出し元スタック上の
+//!   `catch_unwind` 等で成功応答が構築されうるため、fail-closed（成功応答を
+//!   返しうる経路を構造的に遮断する）でプロセスごと止める（abort 前の ERR-1
+//!   応答送信は観測可能性側であり TASK-97・RECOVER-6 のスコープ。本モジュールは
+//!   安全性側のみを担う）。
+//!
+//!   [`ResponseBoundaryGuard`] はスレッドローカルの「現在アクティブなガードの
+//!   世代（generation）」を保持し、[`commit_and_finish`] は commit 成功時点で
+//!   そのスレッドにアクティブなガードが存在する場合のみ、その世代番号を pending
+//!   フラグへ記録する（codex-review P1 再指摘・PR #246 #discussion_r3870845012
+//!   対応。旧実装は commit 成功のたびに無条件でフラグを立てていたため、
+//!   `ResponseBoundaryGuard` の外側で公開 API（`Storage::put`/`WriteTxn::commit`
+//!   等）を直接呼んだ場合でも stale なフラグが残り、次のクエリのガードが
+//!   コミットなしに panic しただけで誤って abort しうる契約違反があった）。
+//!   ガードは drop 時、記録されている世代が自分自身の世代と一致する場合のみ
+//!   abort 判定を行う。ガードが存在しない状態での commit は
+//!   [`PostCommitPanicGuard`]（(2) の狭い区間）のみが保護し、
+//!   [`ResponseBoundaryGuard`] 側の保護は「何もしない」（＝この経路では wire
+//!   応答が構築されえないため、狭い区間の保護で十分というのが本モジュールの
+//!   前提）。
 //!
 //!   [`ResponseBoundaryGuard`] はスレッドローカル状態に依存するため、
 //!   `wire-server::server` の thread-per-connection 同期モデル（1 コネクション
@@ -49,11 +64,26 @@ use std::cell::Cell;
 use crate::storage::{self, Result as StorageResult};
 
 thread_local! {
+    /// このスレッドで現在アクティブな [`ResponseBoundaryGuard`] の世代番号
+    /// （RECOVER-5 (3)。0 は「アクティブなガードなし」を表す予約値）。
+    /// [`ResponseBoundaryGuard::new`] が生成時に採番・記録し、drop 時に
+    /// 自分の世代と一致していればクリアする。[`commit_and_finish`] は commit
+    /// 成功時点でここに記録されている世代（0 でなければ）だけを
+    /// [`COMMIT_PENDING_RESPONSE`] へ引き渡す対象とする。
+    static ACTIVE_RESPONSE_BOUNDARY_GENERATION: Cell<u64> = const { Cell::new(0) };
+
+    /// 次に払い出す [`ResponseBoundaryGuard`] の世代番号。`saturating_add` で
+    /// 増分するため u64 を使い切らない限りオーバーフローしない
+    /// （coding-rust.md「整数演算は checked_*/saturating_* を使う」）。
+    static NEXT_RESPONSE_BOUNDARY_GENERATION: Cell<u64> = const { Cell::new(1) };
+
     /// commit 成功後、wire 層の応答確定（[`ResponseBoundaryGuard`] の drop）が
     /// まだ済んでいない区間かどうかを表すスレッドローカルフラグ（RECOVER-5 (3)）。
-    /// [`commit_and_finish`] が commit 成功のたびに `true` へ立て、
-    /// [`ResponseBoundaryGuard`] の drop 時に読み取ってリセットする。
-    static COMMIT_PENDING_RESPONSE: Cell<bool> = const { Cell::new(false) };
+    /// [`commit_and_finish`] が commit 成功時にアクティブなガードが存在する場合、
+    /// そのガードの世代番号を記録する（アクティブなガードがなければ何もしない
+    /// ―― stale フラグによる誤 abort を防ぐための契約。モジュール冒頭ドキュメント
+    /// 参照）。[`ResponseBoundaryGuard`] の drop 時に読み取ってクリアする。
+    static COMMIT_PENDING_RESPONSE: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// commit 成功から wire 層の応答確定までの区間全体を覆う RAII ガード
@@ -61,19 +91,18 @@ thread_local! {
 ///
 /// `wire-server::simple_query::execute_and_respond` が 1 クエリの処理開始時に
 /// 生成し、応答をすべて書き終えるまで所有する契約（モジュール冒頭ドキュメント
-/// 参照）。区間内で [`commit_and_finish`] が commit に成功すると
-/// [`COMMIT_PENDING_RESPONSE`] が立つ。drop 時にこのフラグを読み取ってリセットし、
-/// フラグが立った状態で unwind 中（panic 伝播中）であれば
-/// `std::process::abort()` する。フラグが立っていない、または unwind 中でなければ
+/// 参照）。生成時に一意な世代番号を採番してスレッドローカルへ記録し、区間内で
+/// [`commit_and_finish`] が commit に成功すると、その世代番号が
+/// [`COMMIT_PENDING_RESPONSE`] へ記録される。drop 時に記録されている世代が
+/// 自分自身の世代と一致する場合のみ「commit 成功後まだ応答未確定」と判定し、
+/// unwind 中（panic 伝播中）であれば `std::process::abort()` する。一致しない
+/// （commit していない、または他の世代のもの）、または unwind 中でなければ
 /// （正常終了 = 応答を書き終えた、または commit 前に失敗した）何もしない。
 ///
-/// 注意（フラグはガード区間外でも立ちうる）: [`COMMIT_PENDING_RESPONSE`] は
-/// [`commit_and_finish`] が commit に成功するたびに無条件で立てるため、本ガードを
-/// スタックに持たないスレッド上の commit（本モジュールのユニットテスト・将来の
-/// wire 経由以外の呼び出し元等）でも立つ。その場合は次にそのスレッド上で生成された
-/// 本ガードの drop で（panic していなければ）静かにリセットされるのみで実害はない
-/// （fail-closed 側に倒れる誤 abort はあり得るが、保護すべき区間の取りこぼしは
-/// 発生しない）。
+/// 世代番号による紐付けは、本ガードのスタック外（区間外）で commit された
+/// stale なフラグを、後続のクエリのガードが誤って自分の commit と誤認しない
+/// ようにするための構造（codex-review P1 再指摘・PR #246
+/// #discussion_r3870845012 対応）。
 ///
 /// `must_use` 属性は束縛忘れ（`let _ = ResponseBoundaryGuard::new();` 等で即座に
 /// drop され保護区間が消える）をコンパイル時の warning として検出するための注記。
@@ -81,7 +110,7 @@ thread_local! {
 /// まで保持すること。
 #[must_use]
 pub struct ResponseBoundaryGuard {
-    _private: (),
+    generation: u64,
 }
 
 impl ResponseBoundaryGuard {
@@ -89,7 +118,13 @@ impl ResponseBoundaryGuard {
     /// 名前付き変数へ束縛して生存させること（`let _ = ...` は即座に drop され
     /// 保護区間が失われるため使わない）。
     pub fn new() -> Self {
-        Self { _private: () }
+        let generation = NEXT_RESPONSE_BOUNDARY_GENERATION.with(|c| {
+            let current = c.get();
+            c.set(current.saturating_add(1));
+            current
+        });
+        ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| c.set(generation));
+        Self { generation }
     }
 }
 
@@ -101,7 +136,23 @@ impl Default for ResponseBoundaryGuard {
 
 impl Drop for ResponseBoundaryGuard {
     fn drop(&mut self) {
-        let armed = COMMIT_PENDING_RESPONSE.with(|f| f.replace(false));
+        // 記録されている pending 世代が自分自身のものと一致する場合のみ abort
+        // 対象とみなす。無条件でクリアするのは、一致しない値（他世代・stale な
+        // 値）を残したままにすると次のガードの誤 abort につながりうるため
+        // （一致しない値をここでクリアしても false abort にはならない ――
+        // should_abort は armed（＝一致）かつ panicking の場合のみ true）。
+        let pending = COMMIT_PENDING_RESPONSE.with(|f| f.replace(None));
+        let armed = pending == Some(self.generation);
+
+        // アクティブ世代の記録も自分自身のものであればクリアする（ネストして
+        // 生成されることは想定していないが、他ガードの記録を誤って消さないため
+        // 一致チェックを行う）。
+        ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| {
+            if c.get() == self.generation {
+                c.set(0);
+            }
+        });
+
         if should_abort(armed, std::thread::panicking()) {
             // 固定の英語文言のみを stderr へ出す。テナント ID・テーブル名・行データ・
             // operation_id を一切含めない（security.md P0「エラー・ログ経由で他テナントの
@@ -198,9 +249,14 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 /// 内部で [`crate::storage::bump_generation_and_commit`] を呼んで commit する
 /// （世代カウントの経路網羅契約はそのまま維持する）。commit が失敗すればここで
 /// `Err` を返して終わる（まだ point of no return に達していない）。commit が
-/// 成功したら [`COMMIT_PENDING_RESPONSE`]（[`ResponseBoundaryGuard`] 経由の
-/// より広い区間の保護。呼び出し元が wire 層まで所有する）を立てたうえで、
-/// さらに [`PostCommitPanicGuard`] を arm した状態で `post_commit` を実行し、
+/// 成功したら、その時点でこのスレッドにアクティブな [`ResponseBoundaryGuard`]
+/// が存在する場合のみ、その世代番号を [`COMMIT_PENDING_RESPONSE`] へ記録する
+/// （[`ResponseBoundaryGuard`] 経由のより広い区間の保護。呼び出し元が wire 層
+/// まで所有する）。アクティブなガードが存在しない場合（本モジュールのユニット
+/// テストや、将来の wire 経由以外の呼び出し元等）は記録しない ――
+/// その経路では wire 応答が構築されえないため、[`PostCommitPanicGuard`] による
+/// 狭い区間の保護のみで契約は満たされる（モジュール冒頭ドキュメント参照）。
+/// 続けて [`PostCommitPanicGuard`] を arm した状態で `post_commit` を実行し、
 /// 正常に完了できたら disarm してから `(value, post_commit の結果)` を返す
 /// （`post_commit` 内で panic した場合は `PostCommitPanicGuard` の Drop が abort
 /// する。`post_commit` 完了後・呼び出し元が応答を確定するまでの区間は
@@ -212,7 +268,10 @@ pub(crate) fn commit_and_finish<T>(
     post_commit: impl FnOnce(&T) -> PostCommitResult,
 ) -> StorageResult<(T, PostCommitResult)> {
     storage::bump_generation_and_commit(write_txn)?;
-    COMMIT_PENDING_RESPONSE.with(|f| f.set(true));
+    let active_guard_generation = ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| c.get());
+    if active_guard_generation != 0 {
+        COMMIT_PENDING_RESPONSE.with(|f| f.set(Some(active_guard_generation)));
+    }
     let guard = PostCommitPanicGuard::armed();
     let post_commit_result = post_commit(&value);
     guard.disarm();
@@ -309,6 +368,63 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen storage");
         reopened
             .get("tenant-a", 1u64)
+            .expect("committed row must remain visible after reopen");
+    }
+
+    // --- RECOVER-5 (3) 再指摘（PR #246 #discussion_r3870845012）の回帰テスト ---
+    // `ResponseBoundaryGuard` の外側（＝ アクティブなガードなし）で commit した
+    // stale なフラグを、後続クエリのガードが誤って自分の commit と関連付けて
+    // abort しないこと。世代番号の紐付けにより、このケースは in-process で
+    // 「abort しない」ことを検証できる（`catch_unwind` 内でガードが drop され、
+    // `std::thread::panicking()` は true になるが、pending 世代がこのガードの
+    // 世代と一致しないため abort 判定は false のまま）。旧実装（無条件フラグ）
+    // では stale フラグが誤ってこのガードの commit と誤認され、テストプロセス
+    // ごと SIGABRT していた。
+
+    #[test]
+    fn commit_outside_any_guard_does_not_arm_a_later_unrelated_guard_panic() {
+        let path = unique_db_path("commit-boundary-stale-flag-no-guard");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        // アクティブな ResponseBoundaryGuard が存在しないスレッド上で commit する
+        // （wire 層を経由しない公開 API 呼び出しの模擬。例: `Storage::put` を
+        // ガード外から直接呼ぶ経路）。
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: &[],
+        };
+        {
+            let mut table = write_txn
+                .open_table(crate::storage::ROWS_TABLE)
+                .expect("open rows table");
+            let encoded = crate::storage::encode_row(&row).expect("encode row");
+            table
+                .insert(("tenant-a", 42u64), encoded.as_slice())
+                .expect("insert");
+        }
+        commit(write_txn).expect("commit outside any guard must succeed");
+
+        // 後続の（無関係な）クエリを模した区間: ガードを生成し、commit を伴わずに
+        // panic する。stale フラグが誤って紐付いていなければ abort しないはず。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _response_boundary = ResponseBoundaryGuard::new();
+            panic!("later unrelated request panics before any commit of its own");
+        }));
+
+        assert!(
+            result.is_err(),
+            "the injected panic must still propagate as a normal unwind (not abort)"
+        );
+
+        // commit 自体は成功しているため、再オープン後も行が可視であること。
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen storage");
+        reopened
+            .get("tenant-a", 42u64)
             .expect("committed row must remain visible after reopen");
     }
 
