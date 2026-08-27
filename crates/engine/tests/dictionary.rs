@@ -351,6 +351,31 @@ fn dictionary_snapshot_rejects_table_without_path_or_body_columns() {
     let err = core
         .dictionary_snapshot(&ctx, "vectors_only")
         .expect_err("table without path/body columns must be rejected");
-    // 固定の英語メッセージであること（他テナントの存在情報を含まない）。
-    assert!(format!("{err}").contains("path column") || format!("{err}").contains("body column"));
+    // path 列の欠落が先に判定されるため、固定の英語メッセージは path 側のみを指す
+    // （body 側の分岐は `dictionary_snapshot_rejects_table_without_body_column` で検証）。
+    assert!(format!("{err}").contains("path column"));
+}
+
+#[test]
+fn dictionary_snapshot_rejects_table_without_body_column() {
+    let path = unique_db_path("dict-missing-body-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "path_only",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .dictionary_snapshot(&ctx, "path_only")
+        .expect_err("table without body column must be rejected");
+    // body 列欠落側の分岐（`core.rs` の 2 つ目の `ok_or_else`）を単独で検証する。
+    assert!(format!("{err}").contains("body column"));
 }

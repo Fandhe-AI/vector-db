@@ -2555,6 +2555,123 @@ mod tests {
         ));
     }
 
+    fn documents_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（security.md「不安全な設計｜無制限リソース
+    // 確保（DoS）」対応。`search_cache_entries_stay_within_the_configured_capacity`
+    // 〔TASK-169〕と同じ意図・手法）。異なる `(table, ctx)` の組を上限超過分だけ
+    // 構築しても、`DictionaryCache` のエントリ数は `MAX_DICTIONARY_CACHE_ENTRIES` を
+    // 超えず、超過分は `last_used` 最小の LRU エントリから追い出される
+    // （`DictionaryCache::insert` の追い出し分岐の回帰テスト）。
+    #[test]
+    fn dictionary_cache_entries_stay_within_the_configured_capacity() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+
+        for i in 0..(MAX_DICTIONARY_CACHE_ENTRIES + 1) {
+            let tenant = format!("tenant-{i}");
+            let ctx = PolicyContext::new(&tenant).expect("valid tenant");
+            core.dictionary_snapshot(&ctx, "documents")
+                .expect("dictionary snapshot ok");
+        }
+
+        let entries = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned")
+            .entries
+            .len();
+        assert!(entries <= MAX_DICTIONARY_CACHE_ENTRIES);
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（`PrefilterCache::insert` の同種修正・
+    // `search_insert_does_not_evict_a_newer_entry_using_a_stale_snapshots_own_generation`
+    // 〔TASK-169〕と同じ意図・手法）。`DictionaryCache::insert` は挿入対象自身の
+    // `built_generation` が `storage.current_generation()` と不一致（＝並行書き込みで
+    // 既に古くなった）場合、既存の新しいエントリを破棄せず・自身も追加しない
+    // （`DictionaryCache::insert` の世代不一致分岐の回帰テスト）。
+    #[test]
+    fn dictionary_cache_insert_does_not_evict_a_newer_entry_using_a_stale_generation() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+
+        // 世代 G0 時点の辞書を構築しておく（まだキャッシュへは挿入しない）。
+        let stale_generation = core.storage.current_generation().expect("read generation");
+        let stale_dictionary =
+            crate::dictionary::DictionaryBuilder::new().finish(&core.dictionary_config);
+        let stale_bytes = stale_dictionary.approx_heap_bytes();
+
+        // tenant-b 側は通常経路でキャッシュへ挿入し、世代 G0 のエントリとして常駐させる。
+        core.dictionary_snapshot(&ctx_b, "documents")
+            .expect("dictionary snapshot ok for tenant-b");
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            1
+        );
+
+        // 書き込みで世代を G0 → G1 へ進める（`stale_dictionary`/`stale_generation` は
+        // G0 のまま古くなる）。
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // 古い（G0 のままの）辞書を挿入しても、既存の G0 エントリ（tenant-b）が
+        // 誤って破棄されないこと。かつ、挿入対象自身が stale なため tenant-a の
+        // エントリとしても追加されないこと。
+        core.dictionary_cache.insert(
+            &core.storage,
+            "documents",
+            &ctx_a,
+            stale_dictionary,
+            stale_generation,
+            stale_bytes,
+        );
+        let entries = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned");
+        assert_eq!(
+            entries.entries.len(),
+            1,
+            "stale な挿入は既存の新しいエントリを失わせてはならず、自身も追加されない"
+        );
+        assert_eq!(entries.entries[0].ctx, ctx_b);
+    }
+
     // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::tempdir;
