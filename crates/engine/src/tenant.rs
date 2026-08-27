@@ -947,6 +947,13 @@ pub(crate) struct ReplaceByTextKey<'a> {
     pub key_value: &'a str,
     pub visibility: crate::storage::Visibility,
     pub rows: &'a [Vec<crate::row_codec::Value>],
+    /// 内容照合ハッシュ（TASK-101・RECOVER-10）専用の raw クライアント要求。
+    /// `rows`（チャンク化・埋め込み後の派生行データ）とは意図的に分離する
+    /// （codex-review P1 指摘・PR #248。`content_hash::for_replace_by_text_key`
+    /// ドキュメント参照）。
+    pub content_hash_path: &'a str,
+    pub content_hash_body: &'a str,
+    pub content_hash_template_values: &'a [crate::row_codec::Value],
     /// 台帳への記録指示（TASK-93・RECOVER-2）。行の削除・挿入と同一 write
     /// トランザクション内で適用される。
     pub ledger_write: LedgerWrite<'a>,
@@ -963,6 +970,9 @@ pub(crate) fn replace_typed_rows_by_text_key(
         key_value,
         visibility,
         rows,
+        content_hash_path,
+        content_hash_body,
+        content_hash_template_values,
         ledger_write,
     } = req;
     validate_identifier(table)?;
@@ -1056,13 +1066,21 @@ pub(crate) fn replace_typed_rows_by_text_key(
         // 台帳記録は行の削除・挿入と同一の write トランザクション内で行う
         // （TASK-93・RECOVER-2。`insert_typed_row_unchecked` と同型。失敗すれば
         // トランザクションごと abort し、行変更も台帳も残さない）。ハッシュ入力は
-        // 要求由来フィールド（`key_column`・`key_value`・`visibility`・`rows`）のみ
-        // （TASK-101・RECOVER-10。削除対象集合・採番 id 等の DB 状態由来の値は含めない。
+        // 要求由来フィールド（`key_column`・`key_value`・`visibility`・
+        // `content_hash_path`・`content_hash_body`・`content_hash_template_values`）
+        // のみ（TASK-101・RECOVER-10。削除対象集合・採番 id 等の DB 状態由来の値に加え、
+        // チャンク化・埋め込み後の派生行データ（`rows`）も含めない。
         // `content_hash::for_replace_by_text_key` ドキュメント参照）。同一内容の再送は
         // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
         // 契約に従う。行形 `INSERT` 経路と同じ扱い）。
-        let content_hash =
-            content_hash::for_replace_by_text_key(key_column, key_value, visibility, rows)?;
+        let content_hash = content_hash::for_replace_by_text_key(
+            key_column,
+            key_value,
+            visibility,
+            content_hash_path,
+            content_hash_body,
+            content_hash_template_values,
+        )?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -1382,6 +1400,9 @@ mod tests {
                 key_value: "other.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([9.0, 9.0], "other.txt", "unrelated")],
+                content_hash_path: "other.txt",
+                content_hash_body: "unrelated",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1397,6 +1418,9 @@ mod tests {
                 key_value: "note.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([1.0, 0.0], "note.txt", "v1 chunk a")],
+                content_hash_path: "note.txt",
+                content_hash_body: "v1 body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1418,6 +1442,9 @@ mod tests {
                     row_values([2.0, 0.0], "note.txt", "v2 chunk a"),
                     row_values([2.0, 1.0], "note.txt", "v2 chunk b"),
                 ],
+                content_hash_path: "note.txt",
+                content_hash_body: "v2 body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1469,6 +1496,9 @@ mod tests {
                 key_value: "shared.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([1.0, 1.0], "shared.txt", "tenant-b content")],
+                content_hash_path: "shared.txt",
+                content_hash_body: "tenant-b content",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1484,6 +1514,9 @@ mod tests {
                 key_value: "shared.txt",
                 visibility: Visibility::Private,
                 rows: &[row_values([2.0, 2.0], "shared.txt", "tenant-a content")],
+                content_hash_path: "shared.txt",
+                content_hash_body: "tenant-a content",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1518,6 +1551,9 @@ mod tests {
                 key_value: "absent.txt",
                 visibility: Visibility::Private,
                 rows: &[],
+                content_hash_path: "absent.txt",
+                content_hash_body: "",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },
@@ -1552,6 +1588,9 @@ mod tests {
                 key_value: "a.txt",
                 visibility: Visibility::Private,
                 rows: &[vec![crate::row_codec::Value::Text("a.txt".to_string())]],
+                content_hash_path: "a.txt",
+                content_hash_body: "body",
+                content_hash_template_values: &[],
                 // 本テストは台帳の記録有無を検証対象にしないため無効化する。
                 ledger_write: LedgerWrite::Disabled,
             },

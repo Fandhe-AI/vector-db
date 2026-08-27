@@ -191,30 +191,37 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 }
 
 /// `replace_typed_rows_by_text_key`（ファイル形 `INSERT` の置換経路）用（TASK-101
-/// 対象経路 6）。入力: `(key_column, key_value, visibility, rows)`。削除対象集合・
-/// 採番される id 等の DB 状態由来の値は含めない（本モジュールドキュメント
-/// 「正規化の方針」参照。同一ファイルの再チャンク化結果が変わらない限り、
-/// 同一パス・同一本文の再送は同一ハッシュになる）。
+/// 対象経路 6）。入力: `(key_column, key_value, visibility, path, body,
+/// template_values)`。削除対象集合・採番される id 等の DB 状態由来の値に加え、
+/// **チャンク化・埋め込み結果（`replace_typed_rows_by_text_key` へ渡る
+/// 派生済み行データ）も含めない**（codex-review P1 指摘・PR #248。`chunking`
+/// 設定や `Embedder` の応答は同一のクライアント要求に対しても実行時に変わり得る
+/// ため、これらをハッシュへ含めると再送の内容一致判定が偽陰性
+/// （`OperationIdContentMismatch` の誤検出）を起こす。ハッシュ入力は
+/// クライアントが `INSERT` 文で実際に送った値
+/// （`path`・`body`・その他の Text 列値＝`template_values`。`path`/`body`/VECTOR
+/// 列は `sql::parser::bind_file_insert` により `template_values` 中で常に
+/// `Value::Null` に正規化済みのため、`path`/`body` は別引数として明示的に渡す）
+/// のみから決定的に構成する。本モジュールドキュメント「正規化の方針」参照。
 pub(crate) fn for_replace_by_text_key(
     key_column: &str,
     key_value: &str,
     visibility: Visibility,
-    rows: &[Vec<Value>],
+    path: &str,
+    body: &str,
+    template_values: &[Value],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::ReplaceByTextKey);
     b.push_bytes(key_column.as_bytes())?;
     b.push_bytes(key_value.as_bytes())?;
     b.push_u8(visibility.to_byte());
-    let row_count = u32::try_from(rows.len())
-        .map_err(|_| StorageError::Codec("content hash row count too large".to_string()))?;
-    b.0.extend_from_slice(&row_count.to_le_bytes());
-    for row in rows {
-        let col_count = u32::try_from(row.len())
-            .map_err(|_| StorageError::Codec("content hash column count too large".to_string()))?;
-        b.0.extend_from_slice(&col_count.to_le_bytes());
-        for v in row {
-            push_value(&mut b, v)?;
-        }
+    b.push_bytes(path.as_bytes())?;
+    b.push_bytes(body.as_bytes())?;
+    let col_count = u32::try_from(template_values.len())
+        .map_err(|_| StorageError::Codec("content hash column count too large".to_string()))?;
+    b.0.extend_from_slice(&col_count.to_le_bytes());
+    for v in template_values {
+        push_value(&mut b, v)?;
     }
     Ok(b.finish())
 }
@@ -262,16 +269,14 @@ fn sha256(input: &[u8]) -> [u8; 32] {
     let padded = pad(input);
     let mut h = H0;
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (i, word) in chunk.chunks_exact(4).enumerate() {
-            // `chunks_exact(4)` は必ず 4 バイトのスライスを生成するため、
-            // `try_into` は失敗しない。添字直接アクセスの代わりに `get`/`try_into`
-            // で明示的に処理する（coding-rust.md「untrusted 入力の扱い」と同じ規律を
-            // 内部処理にも適用する）。
-            let bytes: [u8; 4] = word.try_into().unwrap_or([0; 4]);
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            // `as_chunks::<4>()` は固定長 4 バイト配列を返すため `from_be_bytes` は
+            // 失敗しない。添字直接アクセスの代わりに `get_mut` で明示的に処理する
+            // （coding-rust.md「untrusted 入力の扱い」と同じ規律を内部処理にも適用する）。
             if let Some(slot) = w.get_mut(i) {
-                *slot = u32::from_be_bytes(bytes);
+                *slot = u32::from_be_bytes(*word);
             }
         }
         for i in 16..64 {
@@ -437,15 +442,57 @@ mod tests {
         assert_ne!(for_delete(1), for_delete(2));
     }
 
-    // for_replace_by_text_key は行内容の違いを区別する。
+    // for_replace_by_text_key はクライアント要求由来の body/template_values の
+    // 違いを区別する。
     #[test]
-    fn for_replace_by_text_key_differs_by_rows() {
-        let rows_a = vec![vec![Value::Text("a".to_string())]];
-        let rows_b = vec![vec![Value::Text("b".to_string())]];
-        let h1 = for_replace_by_text_key("path", "docs/a.md", Visibility::Private, &rows_a)
-            .expect("hash");
-        let h2 = for_replace_by_text_key("path", "docs/a.md", Visibility::Private, &rows_b)
-            .expect("hash");
+    fn for_replace_by_text_key_differs_by_body() {
+        let template = vec![Value::Text("en".to_string())];
+        let h1 = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "body a",
+            &template,
+        )
+        .expect("hash");
+        let h2 = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "body b",
+            &template,
+        )
+        .expect("hash");
         assert_ne!(h1, h2);
+    }
+
+    // チャンク化・埋め込みの結果（行データそのもの）が変わっても、クライアント
+    // 要求（path/body/template_values）が同一なら同一ハッシュ（P1 修正のピン留め:
+    // codex-review 指摘・PR #248。`chunking` 設定や `Embedder` の応答差でハッシュが
+    // 変わると、同一要求の再送が `OperationIdContentMismatch` に誤判定される）。
+    #[test]
+    fn for_replace_by_text_key_is_independent_of_chunking_and_embedding_output() {
+        let template = vec![Value::Text("en".to_string())];
+        let h1 = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "same body",
+            &template,
+        )
+        .expect("hash");
+        let h2 = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "same body",
+            &template,
+        )
+        .expect("hash");
+        assert_eq!(h1, h2);
     }
 }
