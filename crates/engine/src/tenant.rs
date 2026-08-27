@@ -721,7 +721,23 @@ pub(crate) fn insert_typed_row_unchecked(
         // `Err` の場合は行の書き込みへ進まず、`write_txn` が commit されない（早期
         // return → drop）ため台帳追記も破棄される（fail-closed。TASK-94・RECOVER-3
         // の原子性契約を包含する）。
-        let content_hash = content_hash::for_typed_insert(id, &row)?;
+        //
+        // ハッシュ入力には `values`（`schema.columns.len()` 幅・位置インデックス
+        // 基準の配列。`sql::parser::bind_insert` が構築）をそのまま渡さず、非
+        // VECTOR 列を列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
+        // `content_hash::push_named_scalar_columns` ドキュメント参照。位置基準の
+        // ままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で配列幅がずれ、内容一致の
+        // 再送が `22023` に誤判定される）。
+        let named_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(idx, column)| {
+                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+            })
+            .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
+            .collect();
+        let content_hash = content_hash::for_typed_insert(id, &embedding, &named_columns)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -1102,13 +1118,33 @@ pub(crate) fn replace_typed_rows_by_text_key(
         // `23505`、内容不一致は `22023` へ写像される（呼び出し元の共通 `TenantWriteError`
         // 契約に従う。行形 `INSERT` 経路と同じ扱い。TASK-94・RECOVER-3 の重複拒否契約を
         // 包含する）。
+        //
+        // `content_hash_template_values`（`schema.columns.len()` 幅・位置インデックス
+        // 基準の配列。`sql::parser::bind_file_insert` が構築）をそのまま渡さず、
+        // 列名付きペアへ変換してから渡す（cursor bugbot 指摘・PR #248。
+        // `content_hash::push_named_scalar_columns` ドキュメント参照。`insert_typed_row_unchecked`
+        // と同じ理由: 位置基準のままだと `ALTER TABLE ADD COLUMN` を挟んだ再送で
+        // 配列幅がずれ、内容一致の再送が `22023` に誤判定される）。
+        let named_template_columns: Vec<(&str, &crate::row_codec::Value)> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(idx, column)| {
+                *idx != vector_idx && !matches!(column.ty, crate::catalog::ColumnType::Vector(_))
+            })
+            .filter_map(|(idx, column)| {
+                content_hash_template_values
+                    .get(idx)
+                    .map(|value| (column.name.as_str(), value))
+            })
+            .collect();
         let content_hash = content_hash::for_replace_by_text_key(
             key_column,
             key_value,
             visibility,
             content_hash_path,
             content_hash_body,
-            content_hash_template_values,
+            &named_template_columns,
         )?;
         ledger::record_in_txn(
             &write_txn,

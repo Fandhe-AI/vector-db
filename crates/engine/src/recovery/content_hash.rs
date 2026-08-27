@@ -126,13 +126,51 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
         }
         Value::Vector(vector) => {
             b.push_u8(2);
-            let len = u32::try_from(vector.len())
-                .map_err(|_| StorageError::Codec("content hash vector too large".to_string()))?;
-            b.0.extend_from_slice(&len.to_le_bytes());
-            for f in vector {
-                b.0.extend_from_slice(&f.to_le_bytes());
-            }
+            push_vector(b, vector)?;
         }
+    }
+    Ok(())
+}
+
+/// `f32` ベクトル 1 個を長さプレフィクス付きで連結する（[`push_value`] の
+/// `Value::Vector` 分岐と、埋め込みだけを単独で受け取る [`for_typed_insert`] の
+/// 双方から使う共通実装）。
+fn push_vector(b: &mut HashInputBuilder, vector: &[f32]) -> Result<(), StorageError> {
+    let len = u32::try_from(vector.len())
+        .map_err(|_| StorageError::Codec("content hash vector too large".to_string()))?;
+    b.0.extend_from_slice(&len.to_le_bytes());
+    for f in vector {
+        b.0.extend_from_slice(&f.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// スキーマの非 `VECTOR` 列（列名, 値）ペア列から、`Value::Null` の列を除外して
+/// 列名＋値の順に連結する（TASK-101・RECOVER-10 追加修正。cursor bugbot 指摘・
+/// PR #248: `sql::parser::bind_insert`/`bind_file_insert` は列値配列を
+/// `schema.columns.len()` 幅・位置インデックス基準で構築するため、間に
+/// `ALTER TABLE ADD COLUMN`（常に nullable。`catalog::alter_table_add_column`
+/// 参照）が挟まると同一クライアント要求の再送でも配列幅・各列の位置がずれ、
+/// 位置ベースでハッシュ化すると内容一致のはずの再送が不一致
+/// （`OperationIdContentMismatch`・`22023`）に誤判定されてしまう）。
+///
+/// 列の**位置ではなく名前**で連結することで、新規追加列（クライアントの元の
+/// 文には現れない → 束縛時は常に `Value::Null` で埋まる）を素通しで除外し、
+/// 既存列だけの並びをスキーマ変更前後で不変に保つ。クライアントが既存の
+/// nullable 列へ明示的に `NULL` を送った場合と、その列がまだスキーマに存在
+/// しなかった場合とで同一ハッシュになるが、いずれも永続化される行の内容
+/// （`row_codec::encode_scalar_columns` が書く当該列のプレゼンスバイト）は
+/// 同一であり、内容一致判定の観点で区別する必要はない。
+fn push_named_scalar_columns(
+    b: &mut HashInputBuilder,
+    columns: &[(&str, &Value)],
+) -> Result<(), StorageError> {
+    for (name, value) in columns {
+        if matches!(value, Value::Null) {
+            continue;
+        }
+        b.push_bytes(name.as_bytes())?;
+        push_value(b, value)?;
     }
     Ok(())
 }
@@ -165,12 +203,28 @@ pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHa
     Ok(b.finish())
 }
 
-/// `insert_typed_row_unchecked` 用（TASK-101 対象経路 3）。型付き列値から構築した
-/// [`RowInput`] を [`for_insert`] と同じレイアウトでハッシュする（操作種別タグは
-/// [`OpTag::Insert`] を共有する: 行形 `INSERT` と宣言的 `INSERT` は同じ「新規挿入」
-/// 操作であり、経路の違いでハッシュ空間を分ける必要がない）。
-pub(crate) fn for_typed_insert(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
-    for_insert(id, row)
+/// `insert_typed_row_unchecked` 用（TASK-101 対象経路 3）。入力: `id`・`VECTOR` 列の
+/// 埋め込み・非 `VECTOR` 列の（列名, 値）ペア列（`Value::Null` は
+/// [`push_named_scalar_columns`] が除外する）。操作種別タグは [`OpTag::Insert`] を
+/// 共有する（行形 `INSERT` と宣言的 `INSERT` は同じ「新規挿入」操作であり、経路の
+/// 違いでハッシュ空間を分ける必要がない）。
+///
+/// [`for_insert`] と異なり `storage::encode_row`（`schema.columns.len()` 幅の
+/// `row_codec::encode_scalar_columns` 出力を `metadata` に含む正準表現）を経由
+/// **しない**（cursor bugbot 指摘・PR #248。[`push_named_scalar_columns`]
+/// ドキュメント参照）。呼び出し元 `tenant::insert_typed_row_unchecked` は
+/// `values`（`sql::parser::bind_insert` が現在のスキーマ幅で構築した配列）から
+/// 列名付きペアを組み立てて渡す。
+pub(crate) fn for_typed_insert(
+    id: u64,
+    embedding: &[f32],
+    columns: &[(&str, &Value)],
+) -> Result<ContentHash, StorageError> {
+    let mut b = HashInputBuilder::new(OpTag::Insert);
+    b.push_u64(id);
+    push_vector(&mut b, embedding)?;
+    push_named_scalar_columns(&mut b, columns)?;
+    Ok(b.finish())
 }
 
 /// `update_row_unchecked` 用（TASK-101 対象経路 4）。入力: `(id, encoded_row)`。
@@ -192,24 +246,31 @@ pub(crate) fn for_delete(id: u64) -> ContentHash {
 
 /// `replace_typed_rows_by_text_key`（ファイル形 `INSERT` の置換経路）用（TASK-101
 /// 対象経路 6）。入力: `(key_column, key_value, visibility, path, body,
-/// template_values)`。削除対象集合・採番される id 等の DB 状態由来の値に加え、
+/// template_columns)`。削除対象集合・採番される id 等の DB 状態由来の値に加え、
 /// **チャンク化・埋め込み結果（`replace_typed_rows_by_text_key` へ渡る
 /// 派生済み行データ）も含めない**（codex-review P1 指摘・PR #248。`chunking`
 /// 設定や `Embedder` の応答は同一のクライアント要求に対しても実行時に変わり得る
 /// ため、これらをハッシュへ含めると再送の内容一致判定が偽陰性
 /// （`OperationIdContentMismatch` の誤検出）を起こす。ハッシュ入力は
 /// クライアントが `INSERT` 文で実際に送った値
-/// （`path`・`body`・その他の Text 列値＝`template_values`。`path`/`body`/VECTOR
-/// 列は `sql::parser::bind_file_insert` により `template_values` 中で常に
-/// `Value::Null` に正規化済みのため、`path`/`body` は別引数として明示的に渡す）
-/// のみから決定的に構成する。本モジュールドキュメント「正規化の方針」参照。
+/// （`path`・`body`・その他の Text 列値＝`template_columns`。`path`/`body`/VECTOR
+/// 列は `sql::parser::bind_file_insert` により `template_columns` 由来の
+/// `template_values` 中で常に `Value::Null` に正規化済みのため、`path`/`body` は
+/// 別引数として明示的に渡す）のみから決定的に構成する。本モジュールドキュメント
+/// 「正規化の方針」参照。
+///
+/// `template_values`（`schema.columns.len()` 幅・位置インデックス基準の配列）を
+/// 直接ハッシュしない（cursor bugbot 指摘・PR #248。[`push_named_scalar_columns`]
+/// ドキュメント参照: `ALTER TABLE ADD COLUMN` を挟むと同一クライアント要求の
+/// 再送でも配列幅・位置がずれる）。呼び出し元 `tenant::replace_typed_rows_by_text_key`
+/// が現在のスキーマから（列名, 値）ペアへ変換して渡す。
 pub(crate) fn for_replace_by_text_key(
     key_column: &str,
     key_value: &str,
     visibility: Visibility,
     path: &str,
     body: &str,
-    template_values: &[Value],
+    template_columns: &[(&str, &Value)],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::ReplaceByTextKey);
     b.push_bytes(key_column.as_bytes())?;
@@ -217,12 +278,7 @@ pub(crate) fn for_replace_by_text_key(
     b.push_u8(visibility.to_byte());
     b.push_bytes(path.as_bytes())?;
     b.push_bytes(body.as_bytes())?;
-    let col_count = u32::try_from(template_values.len())
-        .map_err(|_| StorageError::Codec("content hash column count too large".to_string()))?;
-    b.0.extend_from_slice(&col_count.to_le_bytes());
-    for v in template_values {
-        push_value(&mut b, v)?;
-    }
+    push_named_scalar_columns(&mut b, template_columns)?;
     Ok(b.finish())
 }
 
@@ -446,7 +502,8 @@ mod tests {
     // 違いを区別する。
     #[test]
     fn for_replace_by_text_key_differs_by_body() {
-        let template = vec![Value::Text("en".to_string())];
+        let lang = Value::Text("en".to_string());
+        let template: [(&str, &Value); 1] = [("lang", &lang)];
         let h1 = for_replace_by_text_key(
             "path",
             "docs/a.md",
@@ -474,7 +531,8 @@ mod tests {
     // 変わると、同一要求の再送が `OperationIdContentMismatch` に誤判定される）。
     #[test]
     fn for_replace_by_text_key_is_independent_of_chunking_and_embedding_output() {
-        let template = vec![Value::Text("en".to_string())];
+        let lang = Value::Text("en".to_string());
+        let template: [(&str, &Value); 1] = [("lang", &lang)];
         let h1 = for_replace_by_text_key(
             "path",
             "docs/a.md",
@@ -494,5 +552,71 @@ mod tests {
         )
         .expect("hash");
         assert_eq!(h1, h2);
+    }
+
+    // cursor bugbot 指摘・PR #248 のピン留め: `ALTER TABLE ADD COLUMN`（常に
+    // nullable）で新規列が追加されても、それに触れていないクライアント要求の
+    // 再送ハッシュは不変（新規列は Value::Null として渡り、
+    // push_named_scalar_columns が素通しで除外するため）。
+    #[test]
+    fn for_replace_by_text_key_is_stable_across_added_nullable_column() {
+        let lang = Value::Text("en".to_string());
+        // スキーマ変更前: `lang` 列のみ。
+        let before: [(&str, &Value); 1] = [("lang", &lang)];
+        let h_before = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "same body",
+            &before,
+        )
+        .expect("hash");
+
+        // スキーマ変更後（`ALTER TABLE ADD COLUMN note TEXT` 相当）: 同一クライアント
+        // 要求の再送では `note` 列は未提供のため Value::Null で束縛される。
+        let null_note = Value::Null;
+        let after: [(&str, &Value); 2] = [("lang", &lang), ("note", &null_note)];
+        let h_after = for_replace_by_text_key(
+            "path",
+            "docs/a.md",
+            Visibility::Private,
+            "docs/a.md",
+            "same body",
+            &after,
+        )
+        .expect("hash");
+
+        assert_eq!(h_before, h_after);
+    }
+
+    // for_typed_insert も同じ理由で、追加された nullable 列（未提供 → Value::Null）
+    // の有無にハッシュが影響されない。
+    #[test]
+    fn for_typed_insert_is_stable_across_added_nullable_column() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let before: [(&str, &Value); 1] = [("title", &title)];
+        let h_before = for_typed_insert(7, &embedding, &before).expect("hash");
+
+        let null_note = Value::Null;
+        let after: [(&str, &Value); 2] = [("title", &title), ("note", &null_note)];
+        let h_after = for_typed_insert(7, &embedding, &after).expect("hash");
+
+        assert_eq!(h_before, h_after);
+    }
+
+    // 一方、実際に異なる値が入れば当然ハッシュも変わる（区別できないほど鈍化
+    // していないことの確認）。
+    #[test]
+    fn for_typed_insert_differs_by_column_value() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title_a = Value::Text("hello".to_string());
+        let title_b = Value::Text("world".to_string());
+        let cols_a: [(&str, &Value); 1] = [("title", &title_a)];
+        let cols_b: [(&str, &Value); 1] = [("title", &title_b)];
+        let h1 = for_typed_insert(7, &embedding, &cols_a).expect("hash");
+        let h2 = for_typed_insert(7, &embedding, &cols_b).expect("hash");
+        assert_ne!(h1, h2);
     }
 }
