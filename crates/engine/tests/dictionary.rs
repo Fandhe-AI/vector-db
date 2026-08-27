@@ -430,3 +430,54 @@ fn dictionary_snapshot_rejects_non_text_body_column() {
         .expect_err("table with non-text body column must be rejected");
     assert!(format!("{err}").contains("body column"));
 }
+
+/// `path` 列が nullable な Text 型の場合も拒否する（PR #249 codex-review P1
+/// 指摘の回帰テスト）。nullable を許すと、NULL の `path` を持つ行が
+/// `Value::Null` に一致して黙ってスキップされ、成功応答の空/不完全な辞書を
+/// 返してしまう。スキーマ検証の時点で non-nullable を必須化する。
+#[test]
+fn dictionary_snapshot_rejects_nullable_path_column() {
+    let path = unique_db_path("dict-nullable-path-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "nullable_path",
+            vec![
+                ColumnDef::new("path", ColumnType::Text, true),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .dictionary_snapshot(&ctx, "nullable_path")
+        .expect_err("table with nullable path column must be rejected");
+    assert!(format!("{err}").contains("path column"));
+}
+
+/// `body` 列が nullable な Text 型の場合も同様に拒否する（上記テストの body 側）。
+#[test]
+fn dictionary_snapshot_rejects_nullable_body_column() {
+    let path = unique_db_path("dict-nullable-body-column");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "nullable_body",
+            vec![
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, true),
+            ],
+        ))
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .dictionary_snapshot(&ctx, "nullable_body")
+        .expect_err("table with nullable body column must be rejected");
+    assert!(format!("{err}").contains("body column"));
+}

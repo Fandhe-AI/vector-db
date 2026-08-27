@@ -1047,29 +1047,37 @@ impl EngineCore {
             let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
             drop(schema_read_txn);
 
-            // `path`/`body` は列名の存在だけでなく `ColumnType::Text` であることも
-            // 検証する（PR #249 codex-review P1 指摘: 同名の非 Text 列を持つ
-            // テーブルを受理すると、後段の `Value::Text` match で全行が黙って
-            // スキップされ、成功応答の空/不完全な辞書を返してしまう。型不一致は
-            // fail-closed で固定メッセージの `CatalogError::Invalid` として拒否し、
-            // 他テナントのデータ・存在情報は含めない）。
+            // `path`/`body` は列名の存在・`ColumnType::Text` に加え non-nullable
+            // であることまで検証する（PR #249 codex-review P1 指摘: 同名の非 Text
+            // 列や nullable な列を持つテーブルを受理すると、後段で `Value::Text`
+            // 以外（型不一致）または `Value::Null`（nullable 列に NULL が入った行）
+            // に一致した行が黙ってスキップされ、成功応答の空/不完全な辞書を
+            // 返してしまう。スキーマ不整合は fail-closed で固定メッセージの
+            // `CatalogError::Invalid` として拒否し、他テナントのデータ・存在情報は
+            // 含めない）。
             let path_idx = schema
                 .columns
                 .iter()
-                .position(|c| c.name == "path" && c.ty == crate::catalog::ColumnType::Text)
+                .position(|c| {
+                    c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
+                })
                 .ok_or_else(|| {
                     CoreError::from(CatalogError::Invalid(
-                        "table has no text path column required for dictionary extraction"
+                        "table has no non-nullable text path column required for dictionary \
+                         extraction"
                             .to_string(),
                     ))
                 })?;
             let body_idx = schema
                 .columns
                 .iter()
-                .position(|c| c.name == "body" && c.ty == crate::catalog::ColumnType::Text)
+                .position(|c| {
+                    c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
+                })
                 .ok_or_else(|| {
                     CoreError::from(CatalogError::Invalid(
-                        "table has no text body column required for dictionary extraction"
+                        "table has no non-nullable text body column required for dictionary \
+                         extraction"
                             .to_string(),
                     ))
                 })?;
@@ -1126,13 +1134,32 @@ impl EngineCore {
                             .to_string(),
                     )));
                 };
+                // 上記のスキーマ検証で path_idx/body_idx は non-nullable な
+                // `ColumnType::Text` 列を指すことを保証しているため、ここで
+                // `Value::Text` 以外（`Value::Null`・型不一致）に一致することは
+                // 想定しない。想定外のズレを黙って読み飛ばすと不完全な辞書が
+                // 正常なキャッシュエントリとして保存されうる（PR #249
+                // codex-review P1 指摘と同種の懸念）ため、防御的に fail-closed で
+                // 拒否する（他テナントのデータ・存在情報を含めない固定メッセージ）。
                 let path = match values.get(path_idx) {
                     Some(crate::row_codec::Value::Text(s)) => s.as_str(),
-                    _ => continue,
+                    _ => {
+                        return Err(CoreError::from(CatalogError::Invalid(
+                            "path column value was unexpectedly not text while building \
+                             dictionary snapshot"
+                                .to_string(),
+                        )));
+                    }
                 };
                 let body = match values.get(body_idx) {
                     Some(crate::row_codec::Value::Text(s)) => s.as_str(),
-                    _ => continue,
+                    _ => {
+                        return Err(CoreError::from(CatalogError::Invalid(
+                            "body column value was unexpectedly not text while building \
+                             dictionary snapshot"
+                                .to_string(),
+                        )));
+                    }
                 };
                 builder.ingest(path, body);
             }
