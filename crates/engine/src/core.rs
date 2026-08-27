@@ -592,9 +592,19 @@ impl DictionaryCache {
         Some(dictionary)
     }
 
-    /// 新規構築した辞書を挿入する。単体で総量上限を超える場合・世代が既に古い場合は
-    /// キャッシュせず、呼び出し元の `Arc` をその場限りで使う
-    /// （[`PrefilterCache::insert`] と同じ方針）。
+    /// 新規構築した辞書を挿入する。単体で総量上限を超える場合はキャッシュしないが
+    /// 呼び出し元へは返す（[`PrefilterCache::insert`] と同じ方針）。挿入対象自身が
+    /// 既に古い（並行書き込みで世代が進んだ）場合・世代を確認できない場合は
+    /// `None` を返し、呼び出し元へは一切渡さない（PR #249 codex-review P1
+    /// 指摘対応: 従来はこの場合もキャッシュへの反映だけを諦め、構築済みの
+    /// `Arc` はそのまま呼び出し元へ返していた。`dictionary_snapshot` 側は
+    /// 行走査完了後に一度 `observed_generation` を確認しているが、その確認と
+    /// 本関数の書き込みロック取得の間に別の書き込みがコミットされる競合が
+    /// あり、その場合でも「正常に構築できたスナップショット」として書き込み
+    /// 未反映の辞書を返してしまっていた。世代確認・キャッシュ反映可否の決定を
+    /// この関数内の単一のロック区間へ統合し、呼び出し元
+    /// `EngineCore::dictionary_snapshot` は `None` を「再試行のシグナル」として
+    /// 扱う）。
     fn insert(
         &self,
         storage: &Storage,
@@ -603,24 +613,28 @@ impl DictionaryCache {
         dictionary: crate::dictionary::Dictionary,
         built_generation: u64,
         approx_bytes: usize,
-    ) -> Arc<crate::dictionary::Dictionary> {
+    ) -> Option<Arc<crate::dictionary::Dictionary>> {
         let dictionary = Arc::new(dictionary);
-        if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
-            return dictionary;
-        }
 
         let Ok(mut guard) = self.state.write() else {
-            return dictionary;
+            // ロック毒化時は世代整合を検証できないため fail-closed 側へ倒し、
+            // 呼び出し元へは何も返さない（`PrefilterCache::insert` はロック毒化時も
+            // `Arc` を返す方針だが、本関数は世代確認自体をこのロック区間に統合した
+            // ため、ロックが取れない時点で世代確認もできていない）。
+            return None;
         };
 
         let Ok(current_generation) = storage.current_generation() else {
-            return dictionary;
+            return None;
         };
         if built_generation != current_generation {
-            // 挿入対象自身が既に古い（並行書き込みで世代が進んだ）場合はキャッシュへ
-            // 反映しない。既存の有効エントリを誤って破棄しないための防御
-            // （`PrefilterCache::insert` の同種修正と同じ理由）。
-            return dictionary;
+            // 挿入対象自身が既に古い（並行書き込みで世代が進んだ）。キャッシュへ
+            // 反映しないだけでなく、呼び出し元へも渡さない（上記ドキュメント参照）。
+            return None;
+        }
+
+        if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
+            return Some(dictionary);
         }
 
         if let Some(pos) = guard
@@ -649,7 +663,7 @@ impl DictionaryCache {
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(idx, _)| idx);
             let Some(idx) = victim else {
-                return dictionary;
+                return Some(dictionary);
             };
             let removed = guard.entries.remove(idx);
             total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
@@ -664,7 +678,7 @@ impl DictionaryCache {
             approx_bytes,
             last_used: seq,
         });
-        dictionary
+        Some(dictionary)
     }
 }
 
@@ -1177,14 +1191,24 @@ impl EngineCore {
             }
             let dictionary = builder.finish();
             let approx_bytes = dictionary.approx_heap_bytes();
-            return Ok(self.dictionary_cache.insert(
+            // `DictionaryCache::insert` は自身のロック区間内で世代を再確認し、
+            // 挿入対象（このスナップショット）が既に古くなっていれば `None` を
+            // 返す（PR #249 codex-review P1 指摘対応: 上の `observed_generation`
+            // チェックとこの呼び出しの間に別の書き込みがコミットされる競合を
+            // 検出する最後の砦）。`None` は書き込み未反映のスナップショットを
+            // 呼び出し元へ渡さないためのシグナルであり、ループ先頭へ戻って
+            // 最新スナップショットで再試行する（不完全な辞書を正規の結果として
+            // 返さない）。
+            if let Some(dictionary) = self.dictionary_cache.insert(
                 &self.storage,
                 table,
                 ctx,
                 dictionary,
                 built_generation,
                 approx_bytes,
-            ));
+            ) {
+                return Ok(dictionary);
+            }
         }
 
         // 継続的な並行書き込みで整合したスナップショットを得られなかった。
@@ -2800,14 +2824,21 @@ mod tests {
 
         // 古い（G0 のままの）辞書を挿入しても、既存の G0 エントリ（tenant-b）が
         // 誤って破棄されないこと。かつ、挿入対象自身が stale なため tenant-a の
-        // エントリとしても追加されないこと。
-        core.dictionary_cache.insert(
+        // エントリとしても追加されないこと。戻り値も `None`（PR #249
+        // codex-review P1 指摘対応: 呼び出し元へ書き込み未反映のスナップショットを
+        // 渡さないための契約。従来は `Arc` をそのまま返しており、
+        // `EngineCore::dictionary_snapshot` がこれを正常結果として扱っていた）。
+        let result = core.dictionary_cache.insert(
             &core.storage,
             "documents",
             &ctx_a,
             stale_dictionary,
             stale_generation,
             stale_bytes,
+        );
+        assert!(
+            result.is_none(),
+            "insert of an already-stale dictionary must return None, not the stale Arc"
         );
         let entries = core
             .dictionary_cache
