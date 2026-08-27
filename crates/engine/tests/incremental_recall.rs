@@ -141,9 +141,11 @@ const LINES_PER_FILE: usize = 4;
 const MEASUREMENT_ROUNDS: usize = 3;
 
 /// 判定閾値の分母（増分側は全体再構築側の `1 / RATIO_THRESHOLD_DENOM` 以下の時間で
-/// 完了すること）。`tests/incremental_write_perf.rs`（TASK-143・PERSIST-2）と同じ形の
-/// 判定閾値として採用する（対象ビヘイビアは TASK-121／INDEX-1／
-/// `docs/spec/04-behavior/indexing.md` を参照）。
+/// 完了すること）。本テスト固有の回帰検知パラメータであり、`tests/incremental_write_perf.rs`
+/// （TASK-143・PERSIST-2）と数値・判定式の形が一致するのは実装が同じ書き込み経路を
+/// 共有するためで、private spec 側の INDEX-1 数値基準との対応を示すものではない
+/// （INDEX-1 自体の数値基準・判定式はポインタ: `docs/spec/04-behavior/indexing.md`
+/// INDEX-1。本文はここに転記せず、対応関係も含め非公開のまま扱う）。
 const RATIO_THRESHOLD_DENOM: u32 = 10;
 
 fn generic_body(index: usize) -> String {
@@ -267,8 +269,10 @@ fn measure_full_rebuild() -> Duration {
 // 判定は「増分 1 ファイルの処理時間」対「全体再構築（`BASELINE_FILES + 1` 件を
 // 空 DB から構築）の総処理時間」の比を、`tests/incremental_write_perf.rs`
 // （PERSIST-2）と同じ形（`t_inc * RATIO_THRESHOLD_DENOM <= t_full`）で判定する。
-// 本テストは「増分コストが既存コーパス規模に依存しないこと」までは固定しない
-// （モジュールドキュメント参照）。
+// この閾値・判定式は本テスト固有の回帰検知パラメータであり、private spec 側の
+// INDEX-1 数値基準そのもの・その対応関係を示すものではない（`RATIO_THRESHOLD_DENOM`
+// のドキュメンテーションコメント参照）。本テストは「増分コストが既存コーパス規模に
+// 依存しないこと」までは固定しない（モジュールドキュメント参照）。
 #[test]
 fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild() {
     let t_inc = measure_single_file_incremental_insert();
