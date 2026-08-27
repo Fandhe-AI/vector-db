@@ -154,6 +154,25 @@ fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
     (s.chars().take(max_chars).collect(), true)
 }
 
+/// `chars` を先頭から走査しながら `max_chars` 文字までのみ確保する（untrusted 入力に
+/// 対する有界化。PR #249 codex-review P1 指摘対応）。[`truncate_chars`] は入力全体を
+/// 一旦保持してから切り詰めるため、非常に長い 1 語（区切り文字を含まない識別子・
+/// 単語）を含む入力では確保量が入力長に比例してしまう。本関数は走査中に保持文字数
+/// 自体を上限で止めるため、確保量は常に `max_chars` 相当で頭打ちになる。戻り値の
+/// `bool` は上限を超える文字が存在したか（切り詰めが発生したか）を示す。
+fn take_chars_bounded(chars: impl Iterator<Item = char>, max_chars: usize) -> (String, bool) {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (i, ch) in chars.enumerate() {
+        if i < max_chars {
+            out.push(ch);
+        } else {
+            truncated = true;
+        }
+    }
+    (out, truncated)
+}
+
 /// 行頭の可視性修飾子（`pub` / `pub(...)`）・`async` / `unsafe` /
 /// `extern "..."` を許容しつつ、行頭定義（`fn` / `struct` / `enum` / `trait` /
 /// `impl` / `mod` / `const` / `type`）を検出する手書きの行パーサ（TASK-109・PLAN-5）。
@@ -163,7 +182,12 @@ fn truncate_chars(s: &str, max_chars: usize) -> (String, bool) {
 /// 誤検出しない。ブロックコメント内・文字列リテラル内に単独で `fn foo() {` の形が
 /// 現れる稀なケースは誤検出し得るが、辞書は LLM への補助コンテキストであり
 /// 過検出は安全側（recall 側）の劣化に留まる。モジュールドキュメント参照）。
-fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
+///
+/// 戻り値の `bool` はシンボル名が [`MAX_SYMBOL_NAME_LEN`] を超えて切り詰められたか
+/// を示す（PR #249 codex-review P1 指摘対応: `impl` 名・識別子はいずれも
+/// [`take_chars_bounded`] で走査中に保持文字数を上限で止めるため、行内に極端に
+/// 長い名前があっても一時バッファがその長さに比例して確保されない）。
+fn parse_definition_line(line: &str) -> Option<(SymbolKind, String, bool)> {
     let mut tokens = line.split_whitespace();
     let mut tok = tokens.next()?;
 
@@ -224,7 +248,7 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
         }
     };
 
-    let name = if kind == SymbolKind::Impl {
+    let (name, name_truncated) = if kind == SymbolKind::Impl {
         // `impl` は単純な識別子を持たない（`impl<T> Foo<T>` / `impl<T> Trait for
         // Type<T>` 等）。行頭 `impl` 以降・`{` 手前までを名前として採る。
         let idx = line.find("impl")?;
@@ -233,20 +257,21 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
         if after.is_empty() {
             return None;
         }
-        after.to_string()
+        take_chars_bounded(after.chars(), MAX_SYMBOL_NAME_LEN)
     } else {
         let next = tokens.next()?;
-        let ident: String = next
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
+        let (ident, truncated) = take_chars_bounded(
+            next.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_'),
+            MAX_SYMBOL_NAME_LEN,
+        );
         if ident.is_empty() {
             return None;
         }
-        ident
+        (ident, truncated)
     };
 
-    Some((kind, name))
+    Some((kind, name, name_truncated))
 }
 
 /// 1 抽出単位（`path` の 1 チャンク本文 `body`）から Rust シンボルを抽出する。
@@ -273,14 +298,18 @@ pub fn extract_rust_symbols(path: &str, body: &str, unit_seq: u64) -> (Vec<Symbo
             truncated = true;
             break;
         }
-        let Some((kind, name)) = parse_definition_line(line) else {
+        let Some((kind, name, name_truncated)) = parse_definition_line(line) else {
             continue;
         };
         // `enumerate` は 0 起点。行番号は 1 起点かつ `u32` へ飽和変換する
         // （untrusted 入力の行数は `chunking.rs::MAX_INPUT_LINES` で既に上限検証済み
         // だが、本モジュール単体でも `unwrap` を避け飽和変換で処理する）。
         let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
-        let (name, name_truncated) = truncate_chars(&name, MAX_SYMBOL_NAME_LEN);
+        // `name` は `parse_definition_line` 内の `take_chars_bounded` により既に
+        // [`MAX_SYMBOL_NAME_LEN`] 以下へ有界化済み（PR #249 codex-review P1 指摘
+        // 対応）。ここで再度 `truncate_chars` を呼ぶと切り詰め済み文字列を複製する
+        // だけの無駄な確保になるため、`parse_definition_line` が返す切り詰め有無を
+        // そのまま使う。
         if name_truncated {
             truncated = true;
         }
@@ -361,6 +390,17 @@ fn is_stopword(word: &str) -> bool {
 /// ASCII 単語を小文字化・3 文字以上・ストップワード除外の条件で切り出す軽量
 /// トークナイザ（`sparse.rs` の BM25 用トークナイザとは責務が異なるため独立実装。
 /// モジュールドキュメント参照）。
+///
+/// 区切り文字（非 ASCII アルファベット）が現れるまで 1 語分の文字を `current` へ
+/// 蓄積するが、`current_len` が [`MAX_TERM_LEN`] に達した時点で以降の文字は破棄し
+/// `current_word_truncated` だけを立てる（PR #249 codex-review P1 指摘対応:
+/// 従来は区切りまで全文字を `current` へ無条件に追加してから最後に
+/// [`truncate_chars`] で切り詰めていたため、区切りを含まない非常に長い1語を含む
+/// untrusted 入力では入力長相当の一時バッファを確保できた）。
+/// ストップワード判定（`STOPWORDS` はいずれも [`MAX_TERM_LEN`] 未満の語のみ）は
+/// この有界化後の `current` に対して行っても、切り詰めより前に真の語長が
+/// 判明している時点（`current_len >= 3`）でのみ判定するため結果は変わらない。
+///
 /// 戻り値の `bool` はいずれかの語が [`MAX_TERM_LEN`] を超えて切り詰められたかを
 /// 示す（TASK-109・PLAN-5 レビュー対応: 呼び出し元の用語抽出関数がこれを
 /// `DictionaryBuilder::truncated` へ伝播する）。
@@ -368,22 +408,30 @@ fn tokenize_ascii_words(text: &str) -> (Vec<String>, bool) {
     let mut words = Vec::new();
     let mut truncated = false;
     let mut current = String::new();
+    let mut current_len = 0usize;
+    let mut current_word_truncated = false;
     for ch in text.chars() {
         if ch.is_ascii_alphabetic() {
-            current.push(ch.to_ascii_lowercase());
-        } else if !current.is_empty() {
-            if current.chars().count() >= 3 && !is_stopword(&current) {
-                let (word, word_truncated) = truncate_chars(&current, MAX_TERM_LEN);
-                truncated = truncated || word_truncated;
-                words.push(word);
+            if current_len < MAX_TERM_LEN {
+                current.push(ch.to_ascii_lowercase());
+                current_len += 1;
+            } else {
+                current_word_truncated = true;
             }
-            current.clear();
+        } else if current_len > 0 {
+            if current_len >= 3 && !is_stopword(&current) {
+                truncated = truncated || current_word_truncated;
+                words.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+            current_len = 0;
+            current_word_truncated = false;
         }
     }
-    if !current.is_empty() && current.chars().count() >= 3 && !is_stopword(&current) {
-        let (word, word_truncated) = truncate_chars(&current, MAX_TERM_LEN);
-        truncated = truncated || word_truncated;
-        words.push(word);
+    if current_len >= 3 && !is_stopword(&current) {
+        truncated = truncated || current_word_truncated;
+        words.push(current);
     }
     (words, truncated)
 }
@@ -706,7 +754,7 @@ mod tests {
 
     #[test]
     fn parses_pub_crate_async_fn() {
-        let (kind, name) = parse_definition_line("pub(crate) async fn run_batch() {").unwrap();
+        let (kind, name, _) = parse_definition_line("pub(crate) async fn run_batch() {").unwrap();
         assert_eq!(kind, SymbolKind::Fn);
         assert_eq!(name, "run_batch");
     }
@@ -720,7 +768,7 @@ mod tests {
         // キーワード＋空白の連続バイト列を残さない。
         let modifier = "unsafe";
         let input = format!("{modifier} fn raw_get(idx: usize) -> u8 {{");
-        let (kind, name) = parse_definition_line(&input).unwrap();
+        let (kind, name, _) = parse_definition_line(&input).unwrap();
         assert_eq!(kind, SymbolKind::Fn);
         assert_eq!(name, "raw_get");
     }
@@ -731,7 +779,7 @@ mod tests {
         // "Const fn parsed as const"）: `const` を `fn` の修飾子として先読みせず
         // 独立した定義キーワードとして早期一致させると、`pub const fn helper()` が
         // `Const("fn")` という無意味な結果になっていた。
-        let (kind, name) = parse_definition_line("pub const fn helper() -> u8 {").unwrap();
+        let (kind, name, _) = parse_definition_line("pub const fn helper() -> u8 {").unwrap();
         assert_eq!(kind, SymbolKind::Fn);
         assert_eq!(name, "helper");
     }
@@ -739,42 +787,42 @@ mod tests {
     #[test]
     fn parses_const_item_without_fn() {
         // `const fn` 以外の通常の `const` 定義は従来どおり `Const` として扱う。
-        let (kind, name) = parse_definition_line("pub const MAX: u8 = 10;").unwrap();
+        let (kind, name, _) = parse_definition_line("pub const MAX: u8 = 10;").unwrap();
         assert_eq!(kind, SymbolKind::Const);
         assert_eq!(name, "MAX");
     }
 
     #[test]
     fn parses_extern_c_fn() {
-        let (kind, name) = parse_definition_line("pub extern \"C\" fn ffi_entry() {").unwrap();
+        let (kind, name, _) = parse_definition_line("pub extern \"C\" fn ffi_entry() {").unwrap();
         assert_eq!(kind, SymbolKind::Fn);
         assert_eq!(name, "ffi_entry");
     }
 
     #[test]
     fn parses_generic_struct() {
-        let (kind, name) = parse_definition_line("pub struct Wrapper<T: Clone> {").unwrap();
+        let (kind, name, _) = parse_definition_line("pub struct Wrapper<T: Clone> {").unwrap();
         assert_eq!(kind, SymbolKind::Struct);
         assert_eq!(name, "Wrapper");
     }
 
     #[test]
     fn parses_impl_for() {
-        let (kind, name) = parse_definition_line("impl<T> MyTrait for MyType<T> {").unwrap();
+        let (kind, name, _) = parse_definition_line("impl<T> MyTrait for MyType<T> {").unwrap();
         assert_eq!(kind, SymbolKind::Impl);
         assert_eq!(name, "<T> MyTrait for MyType<T>");
     }
 
     #[test]
     fn parses_const_with_type() {
-        let (kind, name) = parse_definition_line("pub const MAX_LEN: usize = 10;").unwrap();
+        let (kind, name, _) = parse_definition_line("pub const MAX_LEN: usize = 10;").unwrap();
         assert_eq!(kind, SymbolKind::Const);
         assert_eq!(name, "MAX_LEN");
     }
 
     #[test]
     fn parses_type_alias() {
-        let (kind, name) =
+        let (kind, name, _) =
             parse_definition_line("pub(crate) type Result<T> = std::result::Result<T, Error>;")
                 .unwrap();
         assert_eq!(kind, SymbolKind::Type);
@@ -783,7 +831,7 @@ mod tests {
 
     #[test]
     fn parses_mod() {
-        let (kind, name) = parse_definition_line("pub mod dictionary;").unwrap();
+        let (kind, name, _) = parse_definition_line("pub mod dictionary;").unwrap();
         assert_eq!(kind, SymbolKind::Mod);
         assert_eq!(name, "dictionary");
     }
@@ -792,11 +840,11 @@ mod tests {
     fn parses_enum_and_trait() {
         assert_eq!(
             parse_definition_line("enum Kind {").unwrap(),
-            (SymbolKind::Enum, "Kind".to_string())
+            (SymbolKind::Enum, "Kind".to_string(), false)
         );
         assert_eq!(
             parse_definition_line("trait Reranker {").unwrap(),
-            (SymbolKind::Trait, "Reranker".to_string())
+            (SymbolKind::Trait, "Reranker".to_string(), false)
         );
     }
 
@@ -886,6 +934,55 @@ mod tests {
         let (words, truncated) = tokenize_ascii_words(&long_word);
         assert!(truncated);
         assert_eq!(words[0].chars().count(), MAX_TERM_LEN);
+    }
+
+    // 対象: PR #249 codex-review P1 指摘の回帰テスト（一時バッファの無界確保）。
+    // `take_chars_bounded` は走査中に保持文字数を [`MAX_TERM_LEN`]/
+    // [`MAX_SYMBOL_NAME_LEN`] で頭打ちにするため、区切り文字を含まない
+    // 非常に長い（MB オーダーの）1 語を含む untrusted 入力でも、確保される
+    // `String` の容量は上限相当に留まり、入力長には比例しない。
+    #[test]
+    fn take_chars_bounded_caps_allocation_regardless_of_input_length() {
+        const HUGE_LEN: usize = 5_000_000;
+        let huge_word = "a".repeat(HUGE_LEN);
+        let (bounded, truncated) = take_chars_bounded(huge_word.chars(), MAX_TERM_LEN);
+        assert!(truncated);
+        assert_eq!(bounded.chars().count(), MAX_TERM_LEN);
+        // 確保量が上限のごく小さい定数倍に収まっていること（`String` の
+        // amortized 成長分の余裕は許容するが、入力長 `HUGE_LEN` には遠く及ばない）。
+        assert!(
+            bounded.capacity() < MAX_TERM_LEN * 4,
+            "capacity {} must stay bounded near MAX_TERM_LEN, not grow toward input length {}",
+            bounded.capacity(),
+            HUGE_LEN
+        );
+    }
+
+    // `tokenize_ascii_words` 自体（`take_chars_bounded` の呼び出し元）でも、
+    // 区切りを含まない 1 語が非常に長い untrusted 入力に対して同じ有界性が
+    // 保たれることを end-to-end で確認する。
+    #[test]
+    fn tokenize_ascii_words_caps_buffer_for_pathologically_long_word() {
+        const HUGE_LEN: usize = 5_000_000;
+        let huge_word = "b".repeat(HUGE_LEN);
+        let (words, truncated) = tokenize_ascii_words(&huge_word);
+        assert!(truncated);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].chars().count(), MAX_TERM_LEN);
+        assert!(words[0].capacity() < MAX_TERM_LEN * 4);
+    }
+
+    // `parse_definition_line` の `impl` 名収集（行末までを走査する経路）でも
+    // 同じ有界性が保たれることを確認する。
+    #[test]
+    fn parse_definition_line_caps_impl_name_for_pathologically_long_line() {
+        const HUGE_LEN: usize = 5_000_000;
+        let line = format!("impl {}", "c".repeat(HUGE_LEN));
+        let (kind, name, truncated) = parse_definition_line(&line).unwrap();
+        assert_eq!(kind, SymbolKind::Impl);
+        assert!(truncated);
+        assert_eq!(name.chars().count(), MAX_SYMBOL_NAME_LEN);
+        assert!(name.capacity() < MAX_SYMBOL_NAME_LEN * 4);
     }
 
     // --- ファイルツリー ---
