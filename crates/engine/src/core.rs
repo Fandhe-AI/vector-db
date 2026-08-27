@@ -1251,6 +1251,24 @@ impl EngineCore {
             ));
         }
 
+        // ①（バッチあたり最大ファイル数）はここで先に判定できる（`sqls.len()` は
+        // 束縛前から既知）。②③（本文サイズ）は束縛結果の `path`/`body` 長が必要
+        // なため `incremental::index_file_batch` 側の `validate_batch_shape` に
+        // 委ねるが、①だけは束縛（`bind_insert_form` の `path`/`body` 文字列複製を
+        // 伴う）より前に切ることで、ファイル数超過時の無駄な確保・解析を避ける
+        // （coding-rust.md「不安全な設計 / DoS」対応。`batch_limits.rs` 側の判定と
+        // 重複するが、同じ上限値（`self.batch_limits.max_files_per_batch`）に対する
+        // 早期リジェクトであり結果は変わらない）。
+        if sqls.len() > self.batch_limits.max_files_per_batch {
+            return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                crate::batch_limits::BatchLimitsError::TooManyFiles {
+                    count: sqls.len(),
+                    max: self.batch_limits.max_files_per_batch,
+                }
+                .to_string(),
+            ));
+        }
+
         let embedder = self.embedder.as_deref().ok_or_else(|| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "no embedder configured for file-form insert".to_string(),

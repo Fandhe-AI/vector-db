@@ -97,6 +97,36 @@ impl Embedder for CountingEmbedder {
     }
 }
 
+/// 2 回目以降の `embed_batch` 呼び出しで失敗するフェイク埋め込み実装
+/// （文単位セマンティクスの検証用: バッチ内 2 ファイル目以降の非上限系失敗が
+/// 1 ファイル目の commit 済み書き込みを巻き戻さないことを確認する）。
+struct FailSecondEmbedder {
+    inner: HashingEmbedder,
+    calls: AtomicUsize,
+}
+
+impl FailSecondEmbedder {
+    fn new(dim: u32) -> Self {
+        Self {
+            inner: HashingEmbedder::new(dim).expect("valid dim"),
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Embedder for FailSecondEmbedder {
+    fn dim(&self) -> u32 {
+        self.inner.dim()
+    }
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.inner.embed_batch(texts)
+        } else {
+            Err(EmbedError::Unavailable)
+        }
+    }
+}
+
 fn row_count_for_path(core: &EngineCore, read_ctx: &PolicyContext, path: &str) -> usize {
     let zero_vec = vector_literal(&vec![0.0f32; DIM as usize]);
     core.execute_sql(
@@ -387,6 +417,57 @@ fn chunk_total_exactly_at_limit_succeeds() {
             1
         );
     }
+}
+
+// --- 上限非起因の途中失敗（文単位セマンティクス）------------------------------------
+
+/// 上限を超えていないバッチの 2 ファイル目で非上限系の失敗（埋め込みサービス障害）が
+/// 起きた場合、1 ファイル目は個別の write トランザクションで commit 済みのまま残り、
+/// 2 ファイル目だけが未索引のまま失敗する（`incremental::index_file_batch`・
+/// `core::EngineCore::execute_insert_sql_batch` ドキュメントの「文単位セマンティクス」
+/// 契約。INDEX-4 が Must とする「上限超過時の副作用ゼロ」とは別の契約であり、
+/// バッチ全体のロールバックはしない）。台帳記録もファイル単位の write トランザクション
+/// に追従することを `operation_recorded` で確認する。
+#[test]
+fn non_limit_failure_mid_batch_leaves_earlier_files_committed_and_is_file_scoped() {
+    let path = unique_db_path("batch-limits-mid-batch-failure");
+    let _guard = CleanupGuard(path.clone());
+    let storage = new_documents_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(FailSecondEmbedder::new(DIM)))
+        .with_incremental_config(small_chunk_config());
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let read_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let op = |id: &str| OperationId::parse(id).expect("valid operation_id");
+
+    let sqls = [
+        insert_file_sql("documents", "docs/m0.txt", "one line", "op-mid-0"),
+        insert_file_sql("documents", "docs/m1.txt", "one line", "op-mid-1"),
+    ];
+    let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+
+    let err = core
+        .execute_insert_sql_batch(&ctx, &sql_refs)
+        .expect_err("second file's embedder failure should fail the batch call");
+    assert_eq!(err.wire_code(), "XX000");
+
+    // 1 ファイル目は個別 write トランザクションで commit 済みのまま残る。
+    assert_eq!(row_count_for_path(&core, &read_ctx, "docs/m0.txt"), 1);
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op("op-mid-0"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::Recorded
+    );
+
+    // 2 ファイル目は埋め込み失敗のため未索引・台帳未記録のまま。
+    assert_eq!(row_count_for_path(&core, &read_ctx, "docs/m1.txt"), 0);
+    assert_eq!(
+        core.operation_recorded(&ctx, "documents", &op("op-mid-1"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::NotRecorded
+    );
 }
 
 // --- 行形混在・空バッチ -------------------------------------------------------------
