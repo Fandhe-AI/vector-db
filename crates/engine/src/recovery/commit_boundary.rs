@@ -235,10 +235,11 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 /// を渡す契約（呼び出し元が `Err` を返す場合はこの関数を呼ばず `write_txn` を drop
 /// する）。
 ///
-/// 内部で [`crate::storage::bump_generation_and_commit`] を呼んで commit する
+/// 内部で [`crate::storage::prepare_generation_bump`]・
+/// [`crate::storage::commit_prepared_write_txn`] の 2 段階で commit する
 /// （世代カウントの経路網羅契約はそのまま維持する。実際の呼び出しは
-/// [`commit_and_finish_with`] 経由）。commit 呼び出しの詳細な保護契約は
-/// [`commit_and_finish_with`] のドキュメント参照。
+/// [`commit_and_finish_with`] 経由）。この 2 段階に分けている理由・保護契約の
+/// 詳細は [`commit_and_finish_with`] のドキュメント参照。
 pub(crate) fn commit_and_finish<T>(
     write_txn: redb::WriteTransaction,
     value: T,
@@ -248,46 +249,55 @@ pub(crate) fn commit_and_finish<T>(
         write_txn,
         value,
         post_commit,
-        storage::bump_generation_and_commit,
+        storage::prepare_generation_bump,
+        storage::commit_prepared_write_txn,
     )
 }
 
-/// [`commit_and_finish`] の実装本体。`commit_fn` を差し替え可能にしているのは
-/// テストで「commit 呼び出しの内部で panic する」状況（redb が durable write を
-/// 終えたかどうか呼び出し元から判別できない曖昧な区間）を注入するためのみ
-/// （production は常に [`crate::storage::bump_generation_and_commit`] を渡す）。
+/// [`commit_and_finish`] の実装本体。`prepare_fn`・`commit_fn` を差し替え可能に
+/// しているのはテスト専用（production は常に [`crate::storage::
+/// prepare_generation_bump`]・[`crate::storage::commit_prepared_write_txn`] を
+/// 渡す）。この 2 引数への分割自体が、`write_txn.commit()` という 1 回の呼び出しを
+/// 境に durable 判定の可否が変わるという事実に対応している。
 ///
-/// [`PostCommitPanicGuard`] を `commit_fn` 呼び出しの**前**に arm する
-/// （codex-review P1 再指摘・PR #246 対応。`bump_generation_and_commit` を呼んで
-/// から戻るまでの間に panic した場合、redb が内部で durable write を終えている
-/// か否かは呼び出し元からは判別できない。fail-closed の方針に従い、この曖昧な
-/// 区間も commit 成功後と同じ扱いで保護区間に含める）。同様に、そのスレッドに
-/// アクティブな [`ResponseBoundaryGuard`] が存在する場合はその世代番号を
-/// `commit_fn` 呼び出し前に楽観的に [`COMMIT_PENDING_RESPONSE`] へ記録する。
-///
-/// `commit_fn` が `Err` を返した場合（redb の write transaction はアトミックの
-/// ため、`Err` は durable write が確定的に発生しなかったことを意味する）は、
-/// 楽観的に記録した pending フラグを撤回し、ガードを disarm してから `Err` を
-/// 返す（まだ point of no return に達していない。この撤回により commit しなかった
-/// 呼び出しが後続の無関係な panic を誤って abort させることを防ぐ ――
-/// stale フラグ対策と同じ理由）。
-///
-/// `commit_fn` が `Ok` を返した場合はガードを armed のまま `post_commit` を実行し、
-/// 正常に完了できたら disarm してから `(value, post_commit の結果)` を返す
-/// （`post_commit` 内で panic した場合は `PostCommitPanicGuard` の Drop が abort
-/// する。`post_commit` 完了後・呼び出し元が応答を確定するまでの区間は
-/// `COMMIT_PENDING_RESPONSE` を経由して [`ResponseBoundaryGuard`] が引き続き
-/// 保護する）。
+/// - `prepare_fn` は `write_txn.commit()` を呼ぶ**前**の準備段階を表す。まだ
+///   commit していないため、`Err` を返しても durable write は確定的に発生して
+///   いない ―― 通常のエラー応答として呼び出し元へ返してよい（ガードの arm も
+///   pending の記録も行わない）。
+/// - `commit_fn` は `write_txn.commit()` そのものを表す。ここから先は
+///   [`PostCommitPanicGuard`] を arm し、そのスレッドにアクティブな
+///   [`ResponseBoundaryGuard`] が存在する場合はその世代番号を
+///   [`COMMIT_PENDING_RESPONSE`] へ記録してから呼び出す（codex-review P1
+///   再指摘・PR #246 対応。`write_txn.commit()` を呼んでから戻るまでの間に
+///   panic した場合、redb が内部で durable write を終えているか否かは呼び出し
+///   元からは判別できない。fail-closed の方針に従い、この曖昧な区間も commit
+///   成功後と同じ扱いで保護区間に含める）。
+///   - `commit_fn` が `Err` を返した場合も、redb バックエンドの commit 呼び出し
+///     自体が返す `Err` は「durable write が発生しなかった」ことを意味しない
+///     （I/O・同期エラーでは新旧どちらの状態が永続化されたか呼び出し元からは
+///     判別できない。codex-review P1 再指摘・PR #246 対応）。そのため通常の
+///     エラー応答は返さず、`std::process::abort()` して結果不確定のまま
+///     成功・失敗いずれの応答も送出させない（panic 時の
+///     [`PostCommitPanicGuard`]・[`ResponseBoundaryGuard`] と同じ fail-closed
+///     方針。`abort()` はプロセスを直ちに終了させ Drop を走らせないため、
+///     この分岐でガード・pending フラグの後始末は行わない＝行っても無意味）。
+///   - `commit_fn` が `Ok` を返した場合はガードを armed のまま `post_commit` を
+///     実行し、正常に完了できたら disarm してから `(value, post_commit の結果)`
+///     を返す（`post_commit` 内で panic した場合は `PostCommitPanicGuard` の
+///     Drop が abort する。`post_commit` 完了後・呼び出し元が応答を確定するまで
+///     の区間は `COMMIT_PENDING_RESPONSE` を経由して [`ResponseBoundaryGuard`]
+///     が引き続き保護する）。
 fn commit_and_finish_with<T>(
     write_txn: redb::WriteTransaction,
     value: T,
     post_commit: impl FnOnce(&T) -> PostCommitResult,
+    prepare_fn: impl FnOnce(&redb::WriteTransaction) -> StorageResult<()>,
     commit_fn: impl FnOnce(redb::WriteTransaction) -> StorageResult<()>,
 ) -> StorageResult<(T, PostCommitResult)> {
+    prepare_fn(&write_txn)?;
+
     let active_guard_generation = ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| c.get());
     if active_guard_generation != 0 {
-        // 楽観的に pending を立てる。commit_fn が Err で確定的に返れば
-        // （下の Err 分岐で）撤回する。
         COMMIT_PENDING_RESPONSE.with(|f| f.set(Some(active_guard_generation)));
     }
     let guard = PostCommitPanicGuard::armed();
@@ -298,16 +308,17 @@ fn commit_and_finish_with<T>(
             guard.disarm();
             Ok((value, post_commit_result))
         }
-        Err(e) => {
-            if active_guard_generation != 0 {
-                COMMIT_PENDING_RESPONSE.with(|f| {
-                    if f.get() == Some(active_guard_generation) {
-                        f.set(None);
-                    }
-                });
-            }
-            guard.disarm();
-            Err(e)
+        Err(_backend_commit_error) => {
+            // 固定の英語文言のみを stderr へ出す。テナント ID・テーブル名・行データ・
+            // operation_id を一切含めない（security.md P0）。バックエンドのエラー詳細も
+            // 出さない ―― durable かどうか不明な状態でエラー内容から情報が漏れることを
+            // 避ける。
+            eprintln!(
+                "fatal: the storage backend's commit call returned an error, but whether the \
+                 write became durable before the error is indeterminate; aborting the process \
+                 to avoid returning a possibly-incorrect success or failure response"
+            );
+            std::process::abort();
         }
     }
 }
@@ -680,17 +691,13 @@ mod tests {
     }
 
     // --- codex-review P1 再指摘（PR #246）の回帰テスト ---
-    // commit_fn 呼び出しの Err 分岐で、楽観的に立てた pending フラグが撤回される
-    // こと（commit_fn 呼び出し前にアクティブな ResponseBoundaryGuard の世代を
-    // 楽観的に COMMIT_PENDING_RESPONSE へ記録するようになったため、commit_fn が
-    // 確定的に Err を返した場合〔redb の write transaction はアトミックであり
-    // durable write は発生していない〕はその記録を撤回しないと、後続の無関係な
-    // panic を誤って abort させてしまう ―― 既存の stale フラグ対策と同型の
-    // 回帰）。
+    // prepare_fn（write_txn.commit() より前の準備段階）の Err は、まだ commit を
+    // 呼んでいないため durable write が確定的に発生していない。ガードの arm も
+    // pending の記録も一切行わずに通常の Err として伝播すること。
 
     #[test]
-    fn commit_fn_returning_err_reverts_the_optimistically_set_pending_flag() {
-        let path = unique_db_path("commit-boundary-precommit-err-reverts-pending");
+    fn prepare_fn_err_propagates_normally_without_arming_the_boundary() {
+        let path = unique_db_path("commit-boundary-prepare-fn-err-no-arm");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
 
@@ -702,22 +709,23 @@ mod tests {
             (),
             |()| PostCommitResult::Ok,
             |_txn| Err(crate::storage::StorageError::GenerationCounterOverflow),
+            |_txn| panic!("commit_fn must not be called when prepare_fn already returned Err"),
         );
 
         assert!(
             result.is_err(),
-            "commit_fn returning Err must propagate as Err"
+            "prepare_fn returning Err must propagate as Err"
         );
         assert_eq!(
             COMMIT_PENDING_RESPONSE.with(|f| f.get()),
             None,
-            "a commit_fn Err must revert the optimistically recorded pending flag"
+            "a prepare_fn Err must never arm the pending flag (commit_fn was never reached)"
         );
 
-        // 撤回済みのため、この後 outer の区間内で panic しても abort しないはず
-        // （commit_fn が実際には何も commit していないため）。
+        // pending が一切立っていないため、この後 outer の区間内で panic しても
+        // abort しないはず（commit_fn へ到達していないため）。
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            panic!("panic after a failed commit_fn call must not be treated as post-commit");
+            panic!("panic after a prepare_fn Err must not be treated as post-commit");
         }));
         assert!(
             panicked.is_err(),
@@ -728,7 +736,7 @@ mod tests {
     }
 
     // --- codex-review P1 再指摘（PR #246）の end-to-end 回帰テスト ---
-    // `bump_generation_and_commit` 呼び出しから戻るまでの間（redb が durable write
+    // `write_txn.commit()` 呼び出しから戻るまでの間（redb が durable write
     // を終えたかどうか呼び出し元から判別できない曖昧な区間）に panic した場合も、
     // 「commit 成功後の panic」と同じ扱いで abort すること。実際の redb 呼び出し内部
     // に panic を注入することはできないため、`commit_and_finish_with` の `commit_fn`
@@ -754,6 +762,7 @@ mod tests {
                 write_txn,
                 (),
                 |()| PostCommitResult::Ok,
+                |_txn| Ok(()),
                 |_txn| panic!("injected panic inside the commit call itself"),
             );
             println!("CHILD_REACHED_AFTER_MID_COMMIT_PANIC_GUARD");
@@ -817,6 +826,105 @@ mod tests {
                 Some(6),
                 "child must be terminated by SIGABRT (std::process::abort) for a panic \
                  inside the commit call itself; status={status:?} stdout={stdout_buf}"
+            );
+        }
+    }
+
+    // --- codex-review P1 再指摘（PR #246・結果不明な backend commit エラー）の
+    // end-to-end 回帰テスト ---
+    // `commit_fn`（= `write_txn.commit()` 呼び出しそのもの）が `Err` を返した場合、
+    // その `Err` は「durable write が発生しなかった」ことを保証しない（I/O・同期
+    // エラーでは新旧どちらの状態が永続化されたか判別できない）。そのため通常の
+    // エラー応答は返さず `std::process::abort()` すること（panic ではなく通常の
+    // `Err` 戻り値であっても、この分岐だけは fail-closed に abort する）。
+    // ここでの合成 `Err`（`prepare_fn` は成功させ `commit_fn` だけが `Err` を返す）
+    // は「commit 呼び出しが実際に叩かれてから失敗した」ことを模擬しており、
+    // `prepare_fn_err_propagates_normally_without_arming_the_boundary`（commit を
+    // 一度も呼ばずに失敗する経路）とは別の分岐を検証する。
+    const CHILD_DB_ENV_COMMIT_FN_ERR: &str = "ENGINE_COMMIT_BOUNDARY_COMMIT_FN_ERR_CHILD_DB";
+
+    #[test]
+    fn subprocess_commit_fn_returning_err_aborts_instead_of_a_normal_error_response() {
+        if let Ok(db_path) = std::env::var(CHILD_DB_ENV_COMMIT_FN_ERR) {
+            // 子プロセス側: `prepare_fn` は成功させ、`commit_fn`（= 実際の commit
+            // 呼び出しに相当する箇所）だけが合成エラーを返す。production の
+            // `commit_and_finish` はこの `Err` を通常の `Err` として伝播せず、
+            // `commit_and_finish_with` 内で直接 `std::process::abort()` する。
+            let storage = Storage::open(&db_path).expect("child: open storage");
+            let write_txn = storage.db().begin_write().expect("child: begin_write");
+
+            let _response_boundary = ResponseBoundaryGuard::new();
+            let _ = commit_and_finish_with(
+                write_txn,
+                (),
+                |()| PostCommitResult::Ok,
+                |_txn| Ok(()),
+                |_txn| Err(crate::storage::StorageError::GenerationCounterOverflow),
+            );
+            // ここへ到達したのは fail-closed 化されていない不具合。親側が判定できる
+            // 固定マーカーを出してから異常終了する。
+            println!("CHILD_REACHED_AFTER_COMMIT_FN_ERR_WITHOUT_ABORT");
+            std::process::exit(1);
+        }
+
+        // 親プロセス側。
+        let path = unique_db_path("commit-boundary-subprocess-commit-fn-err");
+        let _cleanup = CleanupGuard(path.clone());
+        drop(Storage::open(&path).expect("parent: create storage"));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg(
+                "recovery::commit_boundary::tests::\
+                 subprocess_commit_fn_returning_err_aborts_instead_of_a_normal_error_response",
+            )
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_DB_ENV_COMMIT_FN_ERR, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if start.elapsed() > timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subprocess did not terminate within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        use std::io::Read as _;
+        let mut stdout_buf = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout_buf);
+        }
+
+        assert!(
+            !stdout_buf.contains("CHILD_REACHED_AFTER_COMMIT_FN_ERR_WITHOUT_ABORT"),
+            "a commit_fn Err must abort instead of returning a normal error response: \
+             stdout={stdout_buf}"
+        );
+        assert!(
+            !status.success(),
+            "child process must not exit successfully; status={status:?} stdout={stdout_buf}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "child must be terminated by SIGABRT (std::process::abort) for a commit_fn \
+                 Err (indeterminate durability); status={status:?} stdout={stdout_buf}"
             );
         }
     }
