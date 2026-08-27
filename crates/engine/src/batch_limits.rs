@@ -34,6 +34,15 @@
 //! （coding-rust.md「整数演算は checked_*／saturating_* を使う」）。
 
 /// 一括投入 4 上限の設定値。既定値は [`Default`] 実装を参照。
+///
+/// **既定値の出典に関する注記**（spec-confidentiality.md 準拠）: ①③④の具体的な
+/// 上限数値は private spec（INDEX-4）の判断事項であり、本ソース（public リポ）に
+/// 数値そのものとして固定しない。[`Default`] は環境変数（下記）による注入を優先し、
+/// 未設定時は spec の決定値ではない、本リポ独自の保守的なプレースホルダー値
+/// （②は既存公開定数 [`crate::chunking::MAX_INPUT_BYTES`]・③④は同じく既存公開定数
+/// [`crate::incremental::MAX_INDEX_TOTAL_BYTES`]／[`crate::incremental::MAX_CHUNKS_PER_FILE`]
+/// を再利用するのみで、新たな private 由来の乗数・定数は導入しない）へ fail-closed で
+/// フォールバックする。実運用値は運用環境側で環境変数として注入する。
 #[derive(Debug, Clone, Copy)]
 pub struct BatchLimits {
     /// ① バッチあたり最大ファイル数。
@@ -48,13 +57,34 @@ pub struct BatchLimits {
     pub max_batch_chunks: usize,
 }
 
+/// 環境変数からの上限値注入。未設定・空文字・parse 失敗・0 はいずれも
+/// フォールバックへ倒す（fail-closed。untrusted な環境変数値で `0` 等の
+/// 意図しない全遮断上限を成立させない）。
+fn env_usize_or(var_name: &str, fallback: usize) -> usize {
+    match std::env::var(var_name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|v| *v > 0)
+            .unwrap_or(fallback),
+        Err(_) => fallback,
+    }
+}
+
 impl Default for BatchLimits {
     fn default() -> Self {
         Self {
-            max_files_per_batch: 128,
+            max_files_per_batch: env_usize_or("VECTOR_DB_BATCH_MAX_FILES", 64),
             max_file_body_bytes: crate::chunking::MAX_INPUT_BYTES,
-            max_batch_total_bytes: 64 * 1024 * 1024,
-            max_batch_chunks: crate::incremental::MAX_CHUNKS_PER_FILE * 4,
+            max_batch_total_bytes: env_usize_or(
+                "VECTOR_DB_BATCH_MAX_TOTAL_BYTES",
+                crate::incremental::MAX_INDEX_TOTAL_BYTES,
+            ),
+            max_batch_chunks: env_usize_or(
+                "VECTOR_DB_BATCH_MAX_CHUNKS",
+                crate::incremental::MAX_CHUNKS_PER_FILE,
+            ),
         }
     }
 }

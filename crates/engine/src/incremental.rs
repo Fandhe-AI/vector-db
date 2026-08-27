@@ -492,8 +492,10 @@ pub(crate) struct BatchFileIndexItem<'a> {
 /// 4 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
 /// 文単位セマンティクスとする（すでに `embed_and_write_phase` を完走したファイルは
 /// 個別の write トランザクションで commit 済みのまま残り、ロールバックしない）。
-/// INDEX-4 が Must とするのは「上限超過時の副作用ゼロ」であり、これは 1〜4 の順序
-/// （全上限判定が埋め込み・write トランザクションより前に完了する構造）で保証する。
+/// 本関数が満たす契約は INDEX-4（ポインタ: `docs/spec/04-behavior/indexing.md`
+/// INDEX-4）の要件に対応する。1〜4 の順序（全上限判定が埋め込み・write
+/// トランザクションより前に完了する構造）がその実装根拠であり、詳細な要件文言は
+/// spec 側を参照する（spec-confidentiality.md 準拠。本文の転記は行わない）。
 pub(crate) fn index_file_batch(
     storage: &Storage,
     ctx: &PolicyContext,
