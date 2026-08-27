@@ -58,6 +58,11 @@ impl Default for IncrementalConfig {
 pub struct IndexTiming {
     pub chunking: Duration,
     pub embedding: Duration,
+    /// 行バッファ構築（`template_values`/`path`/`body`/ベクトルの複製・上書き）と
+    /// `tenant::replace_typed_rows_by_text_key` による redb 書き込みの合計。
+    /// 行バッファ構築はチャンク数・本文サイズ・ベクトル次元に比例し得るため、
+    /// パイプライン全体を計測対象とする INDEX-1 の契約上ここへ含める
+    /// （codex-review P1 指摘・PR #241）。
     pub write: Duration,
 }
 
@@ -299,6 +304,13 @@ pub(crate) fn index_file(
     }
     let embedding_elapsed = embedding_start.elapsed();
 
+    // `write_start` は行バッファ構築（テンプレート値の複製・`path`/`body`/ベクトルの
+    // 上書き）の直前に起点を置く。この構築処理はチャンク数・本文サイズ・ベクトル
+    // 次元に比例し得るため、`IndexTiming.write` を「redb 書き込みのみ」に狭めると
+    // ファイル形 `INSERT` パイプライン全体（本モジュールドキュメントの手順 4 相当）の
+    // うちここだけが計測から漏れ、区間の性能退行を検出できなくなる
+    // （codex-review P1 指摘・PR #241）。
+    let write_start = Instant::now();
     let mut rows: Vec<Vec<Value>> = Vec::new();
     rows.try_reserve_exact(chunks.len())
         .map_err(|_| IncrementalError::Internal("failed to reserve chunk rows"))?;
@@ -316,7 +328,6 @@ pub(crate) fn index_file(
         rows.push(values);
     }
 
-    let write_start = Instant::now();
     let ReplaceOutcome {
         removed: _,
         inserted,
