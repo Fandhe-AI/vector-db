@@ -499,6 +499,189 @@ impl PrefilterCache {
     }
 }
 
+/// [`DictionaryCache`] のエントリ数上限（TASK-109・PLAN-5。[`PrefilterCache`]
+/// （TASK-169）と同じ DoS 対策方針を踏襲する）。
+const MAX_DICTIONARY_CACHE_ENTRIES: usize = 16;
+
+/// [`DictionaryCache`] が保持する [`crate::dictionary::Dictionary`] 群の概算バイト量の
+/// 合計上限（[`MAX_PREFILTER_CACHE_TOTAL_BYTES`] と同じ桁に揃える）。
+const MAX_DICTIONARY_CACHE_TOTAL_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// [`DictionaryCache`] の 1 エントリ。`table`・`ctx` の組がキャッシュキー
+/// （[`PrefilterCache`] の `CacheEntry` と同じ理由で `HashMap` ではなく `Vec` 線形走査）。
+struct DictCacheEntry {
+    table: String,
+    ctx: PolicyContext,
+    dictionary: Arc<crate::dictionary::Dictionary>,
+    built_generation: u64,
+    approx_bytes: usize,
+    /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
+    last_used: u64,
+}
+
+/// ロックが保護する可変状態（[`RwLock`] 内側）。
+#[derive(Default)]
+struct DictCacheState {
+    entries: Vec<DictCacheEntry>,
+}
+
+/// `EngineCore::dictionary_snapshot` が再利用する辞書的情報源（TASK-109・PLAN-5。
+/// ポインタ: `docs/spec/04-behavior/query-planning.md` PLAN-5）の世代整合キャッシュ。
+/// [`PrefilterCache`]（TASK-169）と同一の失効規約（fail-closed・世代不一致で破棄・
+/// ロック取得後に世代を読み直す・容量超過は LRU 追い出し）を踏襲する。
+///
+/// **失効の粒度**: `storage.current_generation()` はテーブル・書き込み種別を問わず
+/// 任意の write commit で単調増加する（[`Storage::current_generation`] ドキュメント
+/// 参照）。そのため本キャッシュはこのテーブル自身への書き込みだけでなく、無関係な
+/// 他テーブルへの書き込みでも保守的に失効する（テーブル単位の精密な失効は持たない）。
+/// これは意図的な単純化であり、誤って古い辞書を返す経路（fail-open）よりも安全側
+/// （過剰な再構築）に倒す設計判断である（security.md「fail-closed を維持する」）。
+///
+/// **再構築のトリガー**: ファイル形 `INSERT`（単発・バッチとも）は
+/// `tenant::replace_typed_rows_by_text_key` が世代を bump するため、次回
+/// `dictionary_snapshot` 呼び出し時に自動的に再構築され増分インデックスの結果が
+/// 反映される（TASK-120 との連動）。本キャッシュは post-commit フックを持たず、
+/// 参照時に世代を突き合わせるだけの構成のため、バッチ途中失敗時の不整合や
+/// プロセス再起動時の消失を気にする必要がない（`redb` からの再構築で自己回復する）。
+pub(crate) struct DictionaryCache {
+    state: RwLock<DictCacheState>,
+    seq: AtomicU64,
+}
+
+impl DictionaryCache {
+    fn new() -> Self {
+        Self {
+            state: RwLock::new(DictCacheState::default()),
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    /// `(table, ctx)` に一致し、現在世代と整合するエントリを探す。世代不一致・
+    /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う
+    /// （fail-closed。[`PrefilterCache::lookup`] と同じ方針）。
+    fn lookup(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.state.write().ok()?;
+        // 世代はロック取得後に読み直す（`PrefilterCache::lookup` と同じ理由。
+        // ロック取得前に読むとロック待機中の他スレッドの挿入を誤って「不一致」と
+        // 判定しうる）。
+        let current_generation = storage.current_generation().ok()?;
+        let position = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && &e.ctx == ctx)?;
+        let stale = guard
+            .entries
+            .get(position)
+            .map(|e| e.built_generation != current_generation)
+            .unwrap_or(true);
+        if stale {
+            guard.entries.remove(position);
+            return None;
+        }
+        let dictionary = {
+            let entry = guard.entries.get_mut(position)?;
+            entry.last_used = seq;
+            Arc::clone(&entry.dictionary)
+        };
+        Some(dictionary)
+    }
+
+    /// 新規構築した辞書を挿入する。単体で総量上限を超える場合はキャッシュしないが
+    /// 呼び出し元へは返す（[`PrefilterCache::insert`] と同じ方針）。挿入対象自身が
+    /// 既に古い（並行書き込みで世代が進んだ）場合・世代を確認できない場合は
+    /// `None` を返し、呼び出し元へは一切渡さない（PR #249 codex-review P1
+    /// 指摘対応: 従来はこの場合もキャッシュへの反映だけを諦め、構築済みの
+    /// `Arc` はそのまま呼び出し元へ返していた。`dictionary_snapshot` 側は
+    /// 行走査完了後に一度 `observed_generation` を確認しているが、その確認と
+    /// 本関数の書き込みロック取得の間に別の書き込みがコミットされる競合が
+    /// あり、その場合でも「正常に構築できたスナップショット」として書き込み
+    /// 未反映の辞書を返してしまっていた。世代確認・キャッシュ反映可否の決定を
+    /// この関数内の単一のロック区間へ統合し、呼び出し元
+    /// `EngineCore::dictionary_snapshot` は `None` を「再試行のシグナル」として
+    /// 扱う）。
+    fn insert(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+        dictionary: crate::dictionary::Dictionary,
+        built_generation: u64,
+        approx_bytes: usize,
+    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+        let dictionary = Arc::new(dictionary);
+
+        let Ok(mut guard) = self.state.write() else {
+            // ロック毒化時は世代整合を検証できないため fail-closed 側へ倒し、
+            // 呼び出し元へは何も返さない（`PrefilterCache::insert` はロック毒化時も
+            // `Arc` を返す方針だが、本関数は世代確認自体をこのロック区間に統合した
+            // ため、ロックが取れない時点で世代確認もできていない）。
+            return None;
+        };
+
+        let Ok(current_generation) = storage.current_generation() else {
+            return None;
+        };
+        if built_generation != current_generation {
+            // 挿入対象自身が既に古い（並行書き込みで世代が進んだ）。キャッシュへ
+            // 反映しないだけでなく、呼び出し元へも渡さない（上記ドキュメント参照）。
+            return None;
+        }
+
+        if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
+            return Some(dictionary);
+        }
+
+        if let Some(pos) = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && &e.ctx == ctx)
+        {
+            guard.entries.remove(pos);
+        }
+        guard
+            .entries
+            .retain(|e| e.built_generation == current_generation);
+
+        let mut total_bytes: usize = guard
+            .entries
+            .iter()
+            .map(|e| e.approx_bytes)
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        while guard.entries.len() >= MAX_DICTIONARY_CACHE_ENTRIES
+            || total_bytes.saturating_add(approx_bytes) > MAX_DICTIONARY_CACHE_TOTAL_BYTES
+        {
+            let victim = guard
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(idx, _)| idx);
+            let Some(idx) = victim else {
+                return Some(dictionary);
+            };
+            let removed = guard.entries.remove(idx);
+            total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
+        }
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        guard.entries.push(DictCacheEntry {
+            table: table.to_string(),
+            ctx: ctx.clone(),
+            dictionary: Arc::clone(&dictionary),
+            built_generation,
+            approx_bytes,
+            last_used: seq,
+        });
+        Some(dictionary)
+    }
+}
+
 /// `rls.rs::RlsError` を `CoreError` へ写像する（TASK-169）。呼び出し元
 /// （[`EngineCore::search`]）は `IndexStale`/`ContextMismatch` をキャッシュ縮退の
 /// トリガーとして先に `match` で処理するため、本関数へはそれ以外の 6 variant のみが
@@ -701,6 +884,14 @@ pub struct EngineCore {
     /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
     /// `crate::batch_limits` モジュールドキュメント参照。
     batch_limits: crate::batch_limits::BatchLimits,
+    /// `dictionary.rs` の辞書的情報源（TASK-109・PLAN-5）の世代整合キャッシュ。
+    /// [`Self::dictionary_snapshot`] がこれを経由して再構築を再利用する（詳細は
+    /// [`DictionaryCache`] のドキュメント参照）。
+    dictionary_cache: DictionaryCache,
+    /// 辞書的情報源抽出の設定（TASK-109・PLAN-5）。差し替えは
+    /// [`Self::with_dictionary_config`] のみ。クエリ・セッション変数から到達できる
+    /// 経路は持たない（[`Self::with_precision_policy`] と同じ流儀）。
+    dictionary_config: crate::dictionary::DictionaryConfig,
 }
 
 impl EngineCore {
@@ -725,6 +916,8 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
+            dictionary_cache: DictionaryCache::new(),
+            dictionary_config: crate::dictionary::DictionaryConfig::default(),
         })
     }
 
@@ -749,6 +942,8 @@ impl EngineCore {
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
+            dictionary_cache: DictionaryCache::new(),
+            dictionary_config: crate::dictionary::DictionaryConfig::default(),
         }
     }
 
@@ -806,6 +1001,221 @@ impl EngineCore {
     pub fn with_batch_limits(mut self, limits: crate::batch_limits::BatchLimits) -> Self {
         self.batch_limits = limits;
         self
+    }
+
+    /// 辞書的情報源抽出（TASK-109・PLAN-5）の設定
+    /// （[`crate::dictionary::DictionaryConfig`]）を差し替えたビルダーを返す
+    /// （[`Self::with_precision_policy`] と同じ流儀。未呼び出しなら
+    /// `DictionaryConfig::default()`）。
+    ///
+    /// `dictionary_cache`（[`DictionaryCache`]）も同時に再初期化する（PR #249
+    /// codex-review P1 指摘対応）。`DictionaryCache` のキャッシュキーは
+    /// `(table, ctx)` と `storage.current_generation()` のみで、設定値
+    /// （`enable_file_tree`・`enable_term_index`・`top_terms` 等）を含まない。
+    /// 設定だけを差し替えて既存キャッシュを温存すると、`dictionary_snapshot` を
+    /// 一度でも呼んだ後に本メソッドで設定変更しても、書き込みで世代が進むまでは
+    /// 旧設定で構築した `Arc<Dictionary>` を返し続けてしまう。設定変更は稀な操作
+    /// のため、キャッシュ全体を破棄して次回参照時に新設定で再構築させる単純な
+    /// 方針を採る（fail-closed。古い設定の結果を新設定のものとして黙って返す
+    /// 経路を残さない）。
+    pub fn with_dictionary_config(mut self, config: crate::dictionary::DictionaryConfig) -> Self {
+        self.dictionary_config = config;
+        self.dictionary_cache = DictionaryCache::new();
+        self
+    }
+
+    /// `table` の辞書的情報源スナップショットを返す（TASK-109・PLAN-5。TASK-110 の
+    /// LLM クエリプランニングが固定接頭辞コンテキストとして消費する入口）。
+    /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
+    /// `Self::with_incremental_config` 等と同じ理由）。
+    ///
+    /// [`DictionaryCache`] を経由し、世代整合が取れていれば再構築せず再利用する
+    /// （[`DictionaryCache`] のドキュメント参照）。キャッシュミス時は
+    /// `tenant::visible_rows`（`ctx` の可視性判定込み。テナント境界は完全にこの
+    /// 経路が担う）でテーブル全行を取得し、スキーマから `path`/`body` 列を解決して
+    /// `crate::dictionary::DictionaryBuilder` へ供給する。`path`/`body` 列を持たない
+    /// テーブルは `CatalogError::Invalid` の固定英語メッセージで拒否する
+    /// （既存 `execute_file_insert` 系と同じ「存在情報を漏らさない」写像方針）。
+    ///
+    /// スキーマ・世代の取得（`schema_read_txn`）と行走査（`tenant::visible_rows`）は
+    /// 別スナップショットになりうる（`visible_rows` はページング走査中に複数回
+    /// `read_txn` を開くため、単一 `read_txn` へ統合できない）。そのため行走査後に
+    /// `Storage::current_generation` を再確認し、スキーマ取得時点の世代
+    /// （`built_generation`）と食い違っていれば「新スキーマ前提の行を旧スキーマで
+    /// デコードして破損行として黙ってスキップし、不完全な辞書をあたかも正規の
+    /// ものとして返す」（PR #249 codex-review P1 指摘）事態を防ぐため、その回の
+    /// 結果を破棄して最新スナップショットで再試行する（[`MAX_SNAPSHOT_RETRIES`]
+    /// 回まで。以降も食い違い続ける場合は書き込みが止まらないとみなしエラーで
+    /// 拒否する。fail-closed。security.md「不安全な設計」対応）。
+    pub fn dictionary_snapshot(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<Arc<crate::dictionary::Dictionary>, CoreError> {
+        if let Some(dictionary) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
+            return Ok(dictionary);
+        }
+
+        const MAX_SNAPSHOT_RETRIES: u32 = 5;
+        for _ in 0..MAX_SNAPSHOT_RETRIES {
+            // スキーマと「構築時の世代」を単一の `read_txn`（同一スナップショット）
+            // から読む（TASK-109・PLAN-5 レビュー対応: Cursor Bugbot Medium
+            // "Snapshot mixes schema and rows"）。以前はスキーマ取得
+            // （`Storage::get_table_schema`）と世代取得（`Storage::current_generation`）
+            // が別々の `read_txn` だったため、両呼び出しの間に並行
+            // `ALTER TABLE ADD COLUMN` がコミットされると、`built_generation` は
+            // 新世代を指すのに `schema` は旧世代のまま、という食い違ったペアを
+            // 観測しうった。スキーマと世代を同一スナップショットで揃えることで、
+            // `built_generation` が常に `schema` を取得した時点の世代と一致する
+            // ことを保証する。
+            let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+            let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
+            let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
+            drop(schema_read_txn);
+
+            // `path`/`body` は列名の存在・`ColumnType::Text` に加え non-nullable
+            // であることまで検証する（PR #249 codex-review P1 指摘: 同名の非 Text
+            // 列や nullable な列を持つテーブルを受理すると、後段で `Value::Text`
+            // 以外（型不一致）または `Value::Null`（nullable 列に NULL が入った行）
+            // に一致した行が黙ってスキップされ、成功応答の空/不完全な辞書を
+            // 返してしまう。スキーマ不整合は fail-closed で固定メッセージの
+            // `CatalogError::Invalid` として拒否し、他テナントのデータ・存在情報は
+            // 含めない）。
+            let path_idx = schema
+                .columns
+                .iter()
+                .position(|c| {
+                    c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
+                })
+                .ok_or_else(|| {
+                    CoreError::from(CatalogError::Invalid(
+                        "table has no non-nullable text path column required for dictionary \
+                         extraction"
+                            .to_string(),
+                    ))
+                })?;
+            let body_idx = schema
+                .columns
+                .iter()
+                .position(|c| {
+                    c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
+                })
+                .ok_or_else(|| {
+                    CoreError::from(CatalogError::Invalid(
+                        "table has no non-nullable text body column required for dictionary \
+                         extraction"
+                            .to_string(),
+                    ))
+                })?;
+
+            let rows =
+                crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
+                    crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
+                    // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ
+                    // 丸める（`TenantError` 自体が既にその契約を満たすが、
+                    // `CoreError` 側の型に昇格し直す。security.md「エラー・ログ
+                    // 経由で他テナントのデータ・存在情報を漏らさない」）。
+                    crate::tenant::TenantError::TooManyVisibleRows { .. }
+                    | crate::tenant::TenantError::TooManyRowsScanned { .. } => {
+                        CoreError::from(CatalogError::Invalid(
+                            "too many rows to build dictionary snapshot".to_string(),
+                        ))
+                    }
+                    // `verify_hits` 専用の variant で `visible_rows` からは返らない
+                    // 防御的分岐。
+                    crate::tenant::TenantError::HitOutsideVisibleSet => {
+                        CoreError::from(CatalogError::Invalid(
+                            "unexpected tenant boundary error while building dictionary snapshot"
+                                .to_string(),
+                        ))
+                    }
+                })?;
+
+            // 行走査完了後の実世代を確認する。`schema`/`built_generation` 取得後
+            // かつ `visible_rows` の走査完了前に書き込みがコミットされていると、
+            // 走査結果に旧スキーマでは正しくデコードできない新世代の行が混じり
+            // うる。ここで不一致を検出したら、その回の `rows`/`schema` を丸ごと
+            // 破棄し、最新スナップショットを取り直して再試行する（不完全な辞書を
+            // 正規の結果として返さない）。
+            let observed_generation = self.storage.current_generation()?;
+            if observed_generation != built_generation {
+                continue;
+            }
+
+            let config = self.dictionary_config.clone();
+            let mut builder = crate::dictionary::DictionaryBuilder::new(config);
+            for row in &rows {
+                let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                else {
+                    // デコード失敗行を黙ってスキップすると、内容を欠いた
+                    // `Dictionary` が `truncated: false` のまま正常なキャッシュ
+                    // エントリとして保存され、後続の LLM プランニングから完全な
+                    // スナップショットと区別できなくなる（PR #249 codex-review P1
+                    // 指摘）。データ破損は recall 側の安全劣化（切り詰め）とは
+                    // 性質が異なるため、fail-closed に構築全体を中止しキャッシュへ
+                    // 保存しない。他テナントのデータ・存在情報は含めない固定
+                    // メッセージで拒否する。
+                    return Err(CoreError::from(CatalogError::Invalid(
+                        "failed to decode a visible row while building dictionary snapshot"
+                            .to_string(),
+                    )));
+                };
+                // 上記のスキーマ検証で path_idx/body_idx は non-nullable な
+                // `ColumnType::Text` 列を指すことを保証しているため、ここで
+                // `Value::Text` 以外（`Value::Null`・型不一致）に一致することは
+                // 想定しない。想定外のズレを黙って読み飛ばすと不完全な辞書が
+                // 正常なキャッシュエントリとして保存されうる（PR #249
+                // codex-review P1 指摘と同種の懸念）ため、防御的に fail-closed で
+                // 拒否する（他テナントのデータ・存在情報を含めない固定メッセージ）。
+                let path = match values.get(path_idx) {
+                    Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                    _ => {
+                        return Err(CoreError::from(CatalogError::Invalid(
+                            "path column value was unexpectedly not text while building \
+                             dictionary snapshot"
+                                .to_string(),
+                        )));
+                    }
+                };
+                let body = match values.get(body_idx) {
+                    Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                    _ => {
+                        return Err(CoreError::from(CatalogError::Invalid(
+                            "body column value was unexpectedly not text while building \
+                             dictionary snapshot"
+                                .to_string(),
+                        )));
+                    }
+                };
+                builder.ingest(path, body);
+            }
+            let dictionary = builder.finish();
+            let approx_bytes = dictionary.approx_heap_bytes();
+            // `DictionaryCache::insert` は自身のロック区間内で世代を再確認し、
+            // 挿入対象（このスナップショット）が既に古くなっていれば `None` を
+            // 返す（PR #249 codex-review P1 指摘対応: 上の `observed_generation`
+            // チェックとこの呼び出しの間に別の書き込みがコミットされる競合を
+            // 検出する最後の砦）。`None` は書き込み未反映のスナップショットを
+            // 呼び出し元へ渡さないためのシグナルであり、ループ先頭へ戻って
+            // 最新スナップショットで再試行する（不完全な辞書を正規の結果として
+            // 返さない）。
+            if let Some(dictionary) = self.dictionary_cache.insert(
+                &self.storage,
+                table,
+                ctx,
+                dictionary,
+                built_generation,
+                approx_bytes,
+            ) {
+                return Ok(dictionary);
+            }
+        }
+
+        // 継続的な並行書き込みで整合したスナップショットを得られなかった。
+        // 不完全な辞書を黙って返さず fail-closed に拒否する。
+        Err(CoreError::from(CatalogError::Invalid(
+            "dictionary snapshot generation kept changing during row scan; retry later".to_string(),
+        )))
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
@@ -2299,6 +2709,271 @@ mod tests {
             core.search(&ctx, "docs", &[1.0, 0.0], 10),
             Err(CoreError::ProviderResultRejected)
         ));
+    }
+
+    fn documents_schema() -> TableSchema {
+        TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（security.md「不安全な設計｜無制限リソース
+    // 確保（DoS）」対応。`search_cache_entries_stay_within_the_configured_capacity`
+    // 〔TASK-169〕と同じ意図・手法）。異なる `(table, ctx)` の組を上限超過分だけ
+    // 構築しても、`DictionaryCache` のエントリ数は `MAX_DICTIONARY_CACHE_ENTRIES` を
+    // 超えず、超過分は `last_used` 最小の LRU エントリから追い出される
+    // （`DictionaryCache::insert` の追い出し分岐の回帰テスト）。
+    #[test]
+    fn dictionary_cache_entries_stay_within_the_configured_capacity() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+
+        for i in 0..(MAX_DICTIONARY_CACHE_ENTRIES + 1) {
+            let tenant = format!("tenant-{i}");
+            let ctx = PolicyContext::new(&tenant).expect("valid tenant");
+            core.dictionary_snapshot(&ctx, "documents")
+                .expect("dictionary snapshot ok");
+        }
+
+        let guard = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned");
+        // 上限ちょうどまで縮退していること（`<=` では「1 件も追い出されない」実装への
+        // 退行を検知できないため `==` で固定する）。
+        assert_eq!(guard.entries.len(), MAX_DICTIONARY_CACHE_ENTRIES);
+        // 挿入順が `last_used` 昇順と一致するため、最古（tenant-0）が LRU 追い出しの
+        // 対象になり、最新（tenant-{MAX}）は生存しているはずである
+        // （どのエントリが追い出されたかまで検証し、件数一致だけの弱い保証を補う）。
+        assert!(
+            !guard
+                .entries
+                .iter()
+                .any(|e| e.ctx.tenant_id() == "tenant-0"),
+            "oldest entry (tenant-0) must be evicted by LRU"
+        );
+        let newest_tenant = format!("tenant-{MAX_DICTIONARY_CACHE_ENTRIES}");
+        assert!(
+            guard
+                .entries
+                .iter()
+                .any(|e| e.ctx.tenant_id() == newest_tenant),
+            "newest entry must survive LRU eviction"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（`PrefilterCache::insert` の同種修正・
+    // `search_insert_does_not_evict_a_newer_entry_using_a_stale_snapshots_own_generation`
+    // 〔TASK-169〕と同じ意図・手法）。`DictionaryCache::insert` は挿入対象自身の
+    // `built_generation` が `storage.current_generation()` と不一致（＝並行書き込みで
+    // 既に古くなった）場合、既存の新しいエントリを破棄せず・自身も追加しない
+    // （`DictionaryCache::insert` の世代不一致分岐の回帰テスト）。
+    #[test]
+    fn dictionary_cache_insert_does_not_evict_a_newer_entry_using_a_stale_generation() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+
+        let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let ctx_b = PolicyContext::new("tenant-b").expect("valid tenant");
+
+        // 世代 G0 時点の辞書を構築しておく（まだキャッシュへは挿入しない）。
+        let stale_generation = core.storage.current_generation().expect("read generation");
+        let stale_dictionary =
+            crate::dictionary::DictionaryBuilder::new(core.dictionary_config.clone()).finish();
+        let stale_bytes = stale_dictionary.approx_heap_bytes();
+
+        // tenant-b 側は通常経路でキャッシュへ挿入し、世代 G0 のエントリとして常駐させる。
+        core.dictionary_snapshot(&ctx_b, "documents")
+            .expect("dictionary snapshot ok for tenant-b");
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            1
+        );
+
+        // 書き込みで世代を G0 → G1 へ進める（`stale_dictionary`/`stale_generation` は
+        // G0 のまま古くなる）。
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // 古い（G0 のままの）辞書を挿入しても、既存の G0 エントリ（tenant-b）が
+        // 誤って破棄されないこと。かつ、挿入対象自身が stale なため tenant-a の
+        // エントリとしても追加されないこと。戻り値も `None`（PR #249
+        // codex-review P1 指摘対応: 呼び出し元へ書き込み未反映のスナップショットを
+        // 渡さないための契約。従来は `Arc` をそのまま返しており、
+        // `EngineCore::dictionary_snapshot` がこれを正常結果として扱っていた）。
+        let result = core.dictionary_cache.insert(
+            &core.storage,
+            "documents",
+            &ctx_a,
+            stale_dictionary,
+            stale_generation,
+            stale_bytes,
+        );
+        assert!(
+            result.is_none(),
+            "insert of an already-stale dictionary must return None, not the stale Arc"
+        );
+        let entries = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned");
+        assert_eq!(
+            entries.entries.len(),
+            1,
+            "stale な挿入は既存の新しいエントリを失わせてはならず、自身も追加されない"
+        );
+        assert_eq!(entries.entries[0].ctx, ctx_b);
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（PR #249 codex-review P1 指摘の回帰テスト）。
+    // 可視行の `metadata`（スカラー列ペイロード）が `path`/`body`（非 nullable Text）
+    // をデコードできないほど破損している場合、その行を黙ってスキップして内容を
+    // 欠いた `Dictionary` を `truncated: false` のまま正常なキャッシュエントリと
+    // して保存してはならない。`dictionary_snapshot` がエラーを返し、かつ
+    // `DictionaryCache` にエントリが残らないことを確認する。
+    #[test]
+    fn dictionary_snapshot_fails_closed_on_corrupted_row_and_does_not_cache_it() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+        // `path`/`body` の presence タグすら読めない空のスカラーペイロード
+        // （`row_codec::scan_scalar_columns` は非 nullable 列の途中で打ち切られた
+        // バッファを `RowCodecError::Invalid` として拒否する）。
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert corrupted row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let err = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect_err("corrupted visible row must fail dictionary snapshot construction");
+        assert!(matches!(err, CoreError::Catalog(CatalogError::Invalid(_))));
+
+        let guard = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned");
+        assert_eq!(
+            guard.entries.len(),
+            0,
+            "a failed build must not leave a cache entry behind"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（PR #249 codex-review P1 指摘の回帰テスト）。
+    // `with_dictionary_config` は `dictionary_config` を差し替えるだけでは足りず、
+    // 既構築の `dictionary_cache` も再初期化しなければならない。`(table, ctx)` と
+    // `storage.current_generation()` のみをキーにするキャッシュは設定値を含まない
+    // ため、世代が変わらない限り旧設定で構築した `Arc<Dictionary>` を返し続けて
+    // しまう（設定変更が効かない見えないバグ）。
+    #[test]
+    fn with_dictionary_config_invalidates_stale_cache_entries() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        let schema = documents_schema();
+        core.storage.create_table(&schema).expect("create table");
+        let values = vec![
+            crate::row_codec::Value::Null,
+            crate::row_codec::Value::Text("src/example.rs".to_string()),
+            crate::row_codec::Value::Text("fn one() {}\nfn two() {}\n".to_string()),
+        ];
+        let metadata =
+            crate::row_codec::encode_scalar_columns(&schema, &values).expect("encode metadata");
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &metadata,
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 既定設定（ファイルツリーを有効）で一度構築し、キャッシュへ載せておく。
+        let dict_before = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect("dictionary snapshot ok before config change");
+        assert!(!dict_before.file_tree.paths.is_empty());
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            1
+        );
+
+        // ファイルツリーを無効化する設定へ差し替える。世代は変わっていないため、
+        // キャッシュを再初期化していなければ次の呼び出しが旧設定の
+        // `Arc<Dictionary>` をそのまま返してしまう。
+        let core = core.with_dictionary_config(crate::dictionary::DictionaryConfig {
+            enable_file_tree: false,
+            enable_term_index: false,
+            ..crate::dictionary::DictionaryConfig::default()
+        });
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            0,
+            "with_dictionary_config must invalidate the existing dictionary cache"
+        );
+
+        let dict_after = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect("dictionary snapshot ok after config change");
+        assert!(
+            dict_after.file_tree.paths.is_empty(),
+            "the new config (file tree disabled) must take effect, not a stale cached dictionary"
+        );
     }
 
     // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
