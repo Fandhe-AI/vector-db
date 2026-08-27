@@ -120,15 +120,24 @@ pub enum SymbolKind {
     Type,
 }
 
-/// 抽出された 1 シンボル。`Ord` はソート順（`path` → `line` → `name` → `kind`）を
-/// 決定的にするために導出し、[`Dictionary::symbols`]（`BTreeSet`）の反復順序が
-/// 挿入順に依存しないようにする。
+/// 抽出された 1 シンボル。`Ord` はソート順（`path` → `line` → `name` → `kind` →
+/// `unit_seq`）を決定的にするために導出し、[`Dictionary::symbols`]（`BTreeSet`）の
+/// 反復順序が挿入順に依存しないようにする。
+///
+/// `unit_seq` は [`extract_rust_symbols`] を呼んだ抽出単位（チャンク）の呼び出し順
+/// 連番（[`DictionaryBuilder`] が付与）であり、`line` がチャンク相対値であることの
+/// 埋め合わせとして同一性に含める（TASK-109・PLAN-5 レビュー対応: `line` のみを
+/// 同一性に使うと、別チャンクの同名・同種シンボルがたまたま同じチャンク相対行番号に
+/// 来た場合に `BTreeSet` 上で衝突し、後から挿入した側が黙って欠落していた。ADR の
+/// 「チャンク化でシンボル欠落しない」契約に反するため、チャンク単位で一意な値を
+/// 同一性へ組み込むことで衝突自体をなくす）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Symbol {
     pub path: String,
     pub line: u32,
     pub name: String,
     pub kind: SymbolKind,
+    pub unit_seq: u64,
 }
 
 /// `s` を `max_chars` 文字（文字境界。バイト境界ではない）で決定的に切り詰める。
@@ -157,7 +166,13 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
         tok = tokens.next()?;
     }
 
-    // `async` / `unsafe` / `extern "..."` は任意個・任意順で先行し得る。
+    // `async` / `unsafe` / `extern "..."` は任意個・任意順で先行し得る。`const` は
+    // `const fn foo()`（`fn` の修飾子）と `const NAME: T = ...`（独立した定義）の
+    // 2 通りで意味が異なるため、次のトークンが `fn` の場合のみ修飾子として読み飛ばす
+    // （1 トークン先読みしても `fn` でなければ `const` 自体を定義キーワードとして扱う
+    // 通常経路へフォールスルーする。TASK-109・PLAN-5 レビュー対応: 従来は `const` を
+    // 常に修飾子扱いせず定義キーワードとして早期一致させていたため
+    // `pub const fn helper()` が `Const("fn")` という無意味な結果になっていた）。
     loop {
         match tok {
             "async" | "unsafe" => {
@@ -170,6 +185,15 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
                 } else {
                     next
                 };
+            }
+            "const" => {
+                let mut lookahead = tokens.clone();
+                if lookahead.next() == Some("fn") {
+                    tokens = lookahead;
+                    tok = "fn";
+                } else {
+                    break;
+                }
             }
             _ => break,
         }
@@ -228,7 +252,12 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
 /// 行番号とは一致しない（チャンク化は行分割ベース・非オーバーラップのため
 /// シンボル自体の欠落は生じないが、行番号はチャンク相対値になる。呼び出し元
 /// `core.rs::DictionaryCache` のドキュメント参照）。
-pub fn extract_rust_symbols(path: &str, body: &str) -> (Vec<Symbol>, bool) {
+///
+/// `unit_seq` は呼び出し元（[`DictionaryBuilder::ingest`]）がこの抽出単位に
+/// 付与した一意な連番で、[`Symbol`] の同一性へそのまま伝播する（[`Symbol`] の
+/// ドキュメンテーションコメント参照。チャンク相対行番号だけでは別チャンクの
+/// 同名・同種シンボルが衝突しうるための埋め合わせ）。
+pub fn extract_rust_symbols(path: &str, body: &str, unit_seq: u64) -> (Vec<Symbol>, bool) {
     let path = truncate_chars(path, MAX_PATH_LEN);
     let mut out = Vec::new();
     let mut truncated = false;
@@ -249,6 +278,7 @@ pub fn extract_rust_symbols(path: &str, body: &str) -> (Vec<Symbol>, bool) {
             line: line_no,
             name: truncate_chars(&name, MAX_SYMBOL_NAME_LEN),
             kind,
+            unit_seq,
         });
     }
     (out, truncated)
@@ -474,6 +504,9 @@ pub struct DictionaryBuilder {
     file_tree: FileTree,
     term_freq: BTreeMap<String, u64>,
     truncated: bool,
+    /// 次回 `ingest` 呼び出しに付与する抽出単位（チャンク）連番。
+    /// [`Symbol::unit_seq`] のドキュメンテーションコメント参照。
+    next_unit_seq: u64,
 }
 
 impl DictionaryBuilder {
@@ -486,16 +519,23 @@ impl DictionaryBuilder {
             file_tree: FileTree::default(),
             term_freq: BTreeMap::new(),
             truncated: false,
+            next_unit_seq: 0,
         }
     }
 
     /// `path`・`body` の 1 抽出単位（1 行 = 1 チャンク相当）を取り込む。
     pub fn ingest(&mut self, path: &str, body: &str) {
+        // この呼び出し（＝ 1 抽出単位）に一意な連番を割り当てる（`u64` の枯渇は
+        // `tenant::MAX_VISIBLE_ROWS`・`MAX_SCANNED_ROWS` の実用上限から到達し得ない
+        // 防御的な飽和演算。coding-rust.md「整数演算は checked_*/saturating_* を使う」）。
+        let unit_seq = self.next_unit_seq;
+        self.next_unit_seq = self.next_unit_seq.saturating_add(1);
+
         // シンボル辞書は必須実装（PLAN-5）。ソース種別に関わらず常に試みる
         // （Rust 以外は行頭が予約語と一致しない限り検出されず実質空になる）。
         match detect_source_kind(path) {
             SourceFileKind::Rust => {
-                let (symbols, truncated) = extract_rust_symbols(path, body);
+                let (symbols, truncated) = extract_rust_symbols(path, body, unit_seq);
                 if truncated {
                     self.truncated = true;
                 }
@@ -504,6 +544,14 @@ impl DictionaryBuilder {
                     // モジュールドキュメント「決定性」参照）。最終的な決定的切り詰めは
                     // `finish` 内の `cap_btreeset` が担う。
                     if self.symbols.len() >= MAX_DICTIONARY_SYMBOLS {
+                        // 上限到達後でも、`symbol` が既存エントリと同一（同一性は
+                        // `Symbol` 全フィールド一致）であれば `insert` は何も変えない
+                        // ため実際には切り詰めていない。ここを確認せず一律
+                        // `truncated = true` にすると誤った切り詰め通知になる
+                        // （TASK-109・PLAN-5 レビュー対応）。
+                        if self.symbols.contains(&symbol) {
+                            continue;
+                        }
                         self.truncated = true;
                         break;
                     }
@@ -633,6 +681,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_const_fn() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト（Cursor Bugbot Medium
+        // "Const fn parsed as const"）: `const` を `fn` の修飾子として先読みせず
+        // 独立した定義キーワードとして早期一致させると、`pub const fn helper()` が
+        // `Const("fn")` という無意味な結果になっていた。
+        let (kind, name) = parse_definition_line("pub const fn helper() -> u8 {").unwrap();
+        assert_eq!(kind, SymbolKind::Fn);
+        assert_eq!(name, "helper");
+    }
+
+    #[test]
+    fn parses_const_item_without_fn() {
+        // `const fn` 以外の通常の `const` 定義は従来どおり `Const` として扱う。
+        let (kind, name) = parse_definition_line("pub const MAX: u8 = 10;").unwrap();
+        assert_eq!(kind, SymbolKind::Const);
+        assert_eq!(name, "MAX");
+    }
+
+    #[test]
     fn parses_extern_c_fn() {
         let (kind, name) = parse_definition_line("pub extern \"C\" fn ffi_entry() {").unwrap();
         assert_eq!(kind, SymbolKind::Fn);
@@ -700,7 +767,7 @@ mod tests {
     #[test]
     fn extract_rust_symbols_reports_line_numbers() {
         let body = "// header\nfn one() {}\n\npub struct Two {\n    field: u8,\n}\n";
-        let (symbols, truncated) = extract_rust_symbols("src/x.rs", body);
+        let (symbols, truncated) = extract_rust_symbols("src/x.rs", body, 0);
         assert!(!truncated);
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0].name, "one");
@@ -715,7 +782,7 @@ mod tests {
         for i in 0..(MAX_SYMBOLS_PER_UNIT + 10) {
             body.push_str(&format!("fn f{i}() {{}}\n"));
         }
-        let (symbols, truncated) = extract_rust_symbols("src/many.rs", &body);
+        let (symbols, truncated) = extract_rust_symbols("src/many.rs", &body, 0);
         assert!(truncated);
         assert_eq!(symbols.len(), MAX_SYMBOLS_PER_UNIT);
     }
@@ -724,7 +791,7 @@ mod tests {
     fn symbol_name_is_truncated_to_max_len() {
         let long_name = "a".repeat(MAX_SYMBOL_NAME_LEN + 50);
         let body = format!("fn {long_name}() {{}}\n");
-        let (symbols, _) = extract_rust_symbols("src/x.rs", &body);
+        let (symbols, _) = extract_rust_symbols("src/x.rs", &body, 0);
         assert_eq!(symbols[0].name.chars().count(), MAX_SYMBOL_NAME_LEN);
     }
 
@@ -913,13 +980,44 @@ mod tests {
     }
 
     #[test]
-    fn builder_deduplicates_symbols_across_units_for_same_path() {
+    fn builder_keeps_symbols_from_distinct_chunks_with_colliding_relative_line() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト（codex-review P2・Cursor Bugbot
+        // High "Chunk lines collide symbol identity"）: 2 つの `ingest` 呼び出し
+        // （＝別チャンク）が、たまたま同じチャンク相対行番号・同名・同種の
+        // シンボルを生成しても、`Symbol::unit_seq` によりチャンク単位で一意な
+        // 同一性を持つため誤って重複排除されず、両方のシンボルが保持される
+        // （ADR の「チャンク化でシンボル欠落しない」契約）。以前は `unit_seq` を
+        // 持たず、この 2 件が `BTreeSet` 上で衝突し 1 件に欠落していた。
         let config = DictionaryConfig::default();
         let mut builder = DictionaryBuilder::new(config);
         builder.ingest("src/x.rs", "fn foo() {}\n");
         builder.ingest("src/x.rs", "fn foo() {}\n");
         let dict = builder.finish();
-        assert_eq!(dict.symbols.len(), 1);
+        assert_eq!(dict.symbols.len(), 2);
+    }
+
+    #[test]
+    fn builder_truncated_flag_still_set_for_genuinely_new_symbol_at_cap() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト（Cursor Bugbot Medium
+        // "symbols.len()==MAX 到達時に…誤って truncated 扱いになる" の対照ケース）:
+        // `DictionaryBuilder::ingest` に追加した「上限到達時は既存エントリとの
+        // 完全一致を確認してから truncated を立てる」ガード（`Symbol::unit_seq`
+        // 導入によりチャンク間衝突自体が起きなくなったため、この分岐は主に
+        // 将来の同一性拡張に対する防御）が、実際に新規シンボルを切り詰める
+        // 通常経路の `truncated` 検知を壊していないことを確認する。
+        let config = DictionaryConfig::default();
+        let mut builder = DictionaryBuilder::new(config);
+        for i in 0..MAX_DICTIONARY_SYMBOLS {
+            builder.ingest(&format!("src/filler_{i}.rs"), &format!("fn f{i}() {{}}\n"));
+        }
+        assert_eq!(builder.symbols.len(), MAX_DICTIONARY_SYMBOLS);
+        assert!(!builder.truncated);
+
+        // 上限到達後に真に新規（未知）のシンボルを追加すると、これまでどおり
+        // `truncated` が正しく立つ。
+        builder.ingest("src/overflow.rs", "fn overflow() {}\n");
+        assert_eq!(builder.symbols.len(), MAX_DICTIONARY_SYMBOLS);
+        assert!(builder.truncated);
     }
 
     #[test]
@@ -927,7 +1025,7 @@ mod tests {
         // untrusted 入力に対する `checked_*`/`saturating_*` 方針の確認
         // （coding-rust.md）。極端な行数でもパニックしない。
         let body = "fn f() {}\n".repeat(3);
-        let (symbols, _) = extract_rust_symbols("src/x.rs", &body);
+        let (symbols, _) = extract_rust_symbols("src/x.rs", &body, 0);
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[2].line, 3);
     }

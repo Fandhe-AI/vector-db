@@ -1019,7 +1019,26 @@ impl EngineCore {
             return Ok(dictionary);
         }
 
-        let schema = self.storage.get_table_schema(table)?;
+        // スキーマと「構築時の世代」を単一の `read_txn`（同一スナップショット）から
+        // 読む（TASK-109・PLAN-5 レビュー対応: Cursor Bugbot Medium "Snapshot mixes
+        // schema and rows"）。以前はスキーマ取得（`Storage::get_table_schema`）と
+        // 世代取得（`Storage::current_generation`）が別々の `read_txn` だったため、
+        // 両呼び出しの間に並行 `ALTER TABLE ADD COLUMN` がコミットされると、
+        // `built_generation` は新世代を指すのに `schema` は旧世代のまま、という
+        // 食い違ったペアを観測しうる。その状態で後続の行走査（`tenant::visible_rows`）
+        // が新世代の行を返すと、旧スキーマでの `row_codec::decode_scalar_columns` が
+        // 新設列を含む行のデコードに失敗し、破損行として黙ってスキップされる
+        // （直下のループ内コメント参照）。その結果生じる不完全な辞書は
+        // `built_generation`（新世代）と `DictionaryCache::insert` 側の再確認時の
+        // 世代が一致してしまうため、そのまま新世代の正規の辞書としてキャッシュされ
+        // 得た。スキーマと世代を同一スナップショットで揃えることで、`built_generation`
+        // が常に `schema` を取得した時点の世代と一致することを保証し、以降の
+        // 世代不一致検出（`DictionaryCache::insert`）が確実に機能するようにする。
+        let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+        let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
+        let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
+        drop(schema_read_txn);
+
         let path_idx = schema
             .columns
             .iter()
@@ -1038,11 +1057,6 @@ impl EngineCore {
                     "table has no body column required for dictionary extraction".to_string(),
                 ))
             })?;
-
-        // 挿入時の世代整合チェック用に現在世代をここで読み取る。走査中に他スレッドの
-        // 書き込みが競合しても、`DictionaryCache::insert` が挿入直前に世代を再確認し
-        // fail-closed にキャッシュへ反映しない（二重読み取りは不要）。
-        let built_generation = self.storage.current_generation()?;
 
         let rows = crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
             crate::tenant::TenantError::Catalog(e) => CoreError::from(e),

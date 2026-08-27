@@ -368,6 +368,22 @@ pub(crate) fn commit_prepared_write_txn(write_txn: redb::WriteTransaction) -> Re
     Ok(())
 }
 
+/// [`Storage::current_generation`] が共有するトランザクションスコープの実装本体
+/// （TASK-109・PLAN-5 レビュー対応）。`crate::core::EngineCore::dictionary_snapshot`
+/// が `catalog::get_table_schema_in_txn` と同一の `read_txn` 上で本関数を呼ぶことで、
+/// スキーマ取得と世代取得を単一スナップショットへ閉じ込める（TOCTOU 対策。
+/// `catalog::get_table_schema_in_txn` のドキュメンテーションコメント・
+/// `EngineCore::execute_sql` の Issue #56 レビュー対応と同じ理由）。別々の `read_txn`
+/// で読むと、両呼び出しの間に `alter_table_add_column` がコミットされた場合、
+/// 「新スキーマの世代」と「旧スキーマ」の組み合わせという不整合なペアを観測しうる。
+pub(crate) fn current_generation_in_txn(read_txn: &redb::ReadTransaction) -> Result<u64> {
+    match read_txn.open_table(GENERATION_TABLE) {
+        Ok(t) => Ok(t.get(GENERATION_KEY)?.map(|v| v.value()).unwrap_or(0)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// [`prepare_generation_bump`] と [`commit_prepared_write_txn`] を連続実行する
 /// 薄いラッパ（TASK-133 P1 対応）。本クレート内の実書き込みを伴う書き込みコミットは
 /// `write_txn.commit()` を直接呼ばずすべて本関数、または
@@ -568,11 +584,7 @@ impl Storage {
     /// 世代値以外の一貫性を何も保証しない）。
     pub(crate) fn current_generation(&self) -> Result<u64> {
         let read_txn = self.db.begin_read()?;
-        match read_txn.open_table(GENERATION_TABLE) {
-            Ok(t) => Ok(t.get(GENERATION_KEY)?.map(|v| v.value()).unwrap_or(0)),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
-            Err(e) => Err(e.into()),
-        }
+        current_generation_in_txn(&read_txn)
     }
 
     /// テナント ID・行 ID を指定して 1 行取得する（スナップショット読み取り。対象
