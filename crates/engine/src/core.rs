@@ -1282,6 +1282,18 @@ impl EngineCore {
             }
         })?;
 
+        // ⓪（束縛前の生 SQL テキスト長に対する粗い早期リジェクト。
+        // `batch_limits::validate_raw_sql_len`）を各文の束縛（`validate_insert` の
+        // `lexer::tokenize`・`bind_insert_form` の `path`/`body` 文字列複製）より
+        // 前に判定する（codex-review P1 指摘・PR #242 対応。②③の逐次判定は
+        // decode 済みの `bound.path`/`bound.body` 長にしか作用せず、束縛処理自体
+        // （構文木の構築・文字列複製）は判定前に必ず入力サイズへ比例して走って
+        // しまうため、単一の巨大 SQL 文だけでファイル数上限（①）を経ずに
+        // メモリ・CPU を消費させる DoS 経路が残っていた。⓪は生テキスト長のみを
+        // 見る保守的な予算判定であり、正確な上限は引き続き②③（束縛後）が担う
+        // ため置き換えではない。`batch_limits.rs` の `validate_raw_sql_len` ドキュ
+        // メント参照）。
+        //
         // ②③（1 ファイルあたり最大本文サイズ・バッチ合計最大サイズ）を束縛直後
         // ここで逐次判定する（`batch_limits.rs` の `validate_batch_shape` は
         // `index_file_batch` 側で全ファイルの束縛完了後に改めて呼ばれる最終防衛線
@@ -1292,7 +1304,18 @@ impl EngineCore {
         // 見て、違反を検出した時点のファイルで打ち切ることで、複製の増幅を
         // 「違反ファイルまで」に抑える）。
         let mut running_total_bytes: usize = 0;
-        for sql in sqls {
+        let mut running_raw_sql_bytes: usize = 0;
+        for (index, sql) in sqls.iter().enumerate() {
+            running_raw_sql_bytes = crate::batch_limits::validate_raw_sql_len(
+                index,
+                sql.len(),
+                running_raw_sql_bytes,
+                &self.batch_limits,
+            )
+            .map_err(|e| {
+                crate::sql::allowlist::SqlSurfaceError::payload_too_large(e.to_string())
+            })?;
+
             let stmt =
                 crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
             let schema = self

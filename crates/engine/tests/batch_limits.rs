@@ -297,6 +297,84 @@ fn single_file_body_over_limit_rejected_with_54000_and_no_side_effects() {
     assert_eq!(row_count_for_path(&core, &read_ctx, "docs/big.txt"), 0);
 }
 
+/// codex-review P1 指摘の回帰テスト（PR #242・`batch_limits::validate_raw_sql_len`）:
+/// 束縛（`validate_insert` の `lexer::tokenize`・`bind_insert_form` の文字列複製）
+/// より前に、生 SQL テキスト長だけで極端に巨大な単一文を拒否できることを、存在
+/// しないテーブル名を使って確認する（テーブル存在検証は `validate_insert` 内部
+/// （束縛前）で行われるため、もし本ガードが束縛より前に効いていなければ
+/// `UndefinedTable`（`42P01`）が先に返るはずだが、本ガードにより `54000` が
+/// 先に返ることを確認する）。
+#[test]
+fn oversized_single_statement_rejected_before_parsing_with_54000_even_for_undefined_table() {
+    let path = unique_db_path("batch-limits-raw-sql-too-large");
+    let _guard = CleanupGuard(path.clone());
+    let storage = new_documents_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_file_body_bytes: 10,
+            max_batch_total_bytes: 10_000,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 予算 = 2 * 10 + 4096 = 4116。これを大きく超える本文を持つ、存在しない
+    // テーブルへの INSERT 文を渡す。
+    let huge_body = "a".repeat(5_000);
+    let sql = insert_file_sql(
+        "does_not_exist",
+        "docs/huge.txt",
+        &huge_body,
+        "op-raw-sql-too-large",
+    );
+    let sql_refs: Vec<&str> = vec![sql.as_str()];
+
+    let err = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect_err("oversized raw SQL text should be rejected before parsing");
+    assert_eq!(
+        err.wire_code(),
+        "54000",
+        "raw SQL 予算超過は UndefinedTable ではなく PAYLOAD_TOO_LARGE として返るはず"
+    );
+}
+
+/// 生 SQL テキスト長ガードのバッチ累計側（codex-review P1 指摘の回帰テスト・
+/// PR #242）: 個々の文は②（1 ファイルあたり最大本文サイズ）の予算内でも、複数文
+/// の生テキスト長合計が③由来の予算を超えれば、全文の束縛を終える前に拒否される
+/// ことを確認する（存在しないテーブル名で、束縛より前に効いていることを検証）。
+#[test]
+fn raw_sql_batch_total_over_budget_rejected_before_parsing_later_statements() {
+    let path = unique_db_path("batch-limits-raw-sql-batch-total-too-large");
+    let _guard = CleanupGuard(path.clone());
+    let storage = new_documents_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_files_per_batch: 10,
+            max_file_body_bytes: 10_000,
+            max_batch_total_bytes: 10,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // バッチ合計予算 = 2 * 10 + 4096 = 4116。各文は② 予算内でも、3 文合計の生
+    // テキスト長がこれを超えるようにする。3 文目は存在しないテーブルにして、
+    // 束縛（テーブル存在検証を含む）まで到達していないことを示す。
+    let body = "a".repeat(1_500);
+    let sql0 = insert_file_sql("documents", "docs/rb0.txt", &body, "op-raw-batch-0");
+    let sql1 = insert_file_sql("documents", "docs/rb1.txt", &body, "op-raw-batch-1");
+    let sql2 = insert_file_sql("does_not_exist", "docs/rb2.txt", &body, "op-raw-batch-2");
+    let sql_refs: Vec<&str> = vec![sql0.as_str(), sql1.as_str(), sql2.as_str()];
+
+    let err = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect_err("raw SQL batch total over budget should be rejected");
+    assert_eq!(err.wire_code(), "54000");
+}
+
 // --- ③: バッチ合計最大サイズ ---------------------------------------------------------
 
 #[test]

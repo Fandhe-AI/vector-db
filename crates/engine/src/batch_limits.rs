@@ -89,11 +89,11 @@ impl Default for BatchLimits {
     }
 }
 
-/// [`validate_batch_shape`]・[`validate_chunk_total`] の失敗理由。全 variant が
-/// `wire_code() == "54000"`（`PAYLOAD_TOO_LARGE`）へ写像される（ERR-2・TASK-152）。
-/// `detail`／`Display` には件数・上限値のみを含め、本文・パス・テナント情報は
-/// 一切含めない（security.md「エラー・ログ経由で他テナントのデータ・存在情報を
-/// 漏らさない」）。
+/// [`validate_batch_shape`]・[`validate_chunk_total`]・[`validate_raw_sql_len`] の
+/// 失敗理由。全 variant が `wire_code() == "54000"`（`PAYLOAD_TOO_LARGE`）へ写像
+/// される（ERR-2・TASK-152）。`detail`／`Display` には件数・上限値のみを含め、
+/// 本文・パス・テナント情報は一切含めない（security.md「エラー・ログ経由で
+/// 他テナントのデータ・存在情報を漏らさない」）。
 #[derive(Debug)]
 pub enum BatchLimitsError {
     /// ①超過。
@@ -109,6 +109,21 @@ pub enum BatchLimitsError {
     BatchTotalTooLarge { total: usize, max: usize },
     /// ④超過（累算オーバーフローも本 variant へ倒す）。
     TooManyChunks { total: usize, max: usize },
+    /// 解析前ガード（[`validate_raw_sql_len`]）: 1 文の生 SQL テキスト長が
+    /// [`raw_sql_len_budget`] を超過。`index` はバッチ内の 0 起点インデックス。
+    /// codex-review 指摘・PR #242 対応（②の判定は束縛後の decode 済み本文長にしか
+    /// 効かず、束縛（`lexer::tokenize`・`bind_insert_form` の文字列複製）自体が
+    /// 入力サイズに比例した処理を先に行ってしまうための、束縛より前の粗い早期
+    /// リジェクト）。
+    SqlTextTooLarge {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
+    /// 解析前ガード: バッチ内の生 SQL テキスト長の累計が
+    /// [`raw_sql_len_budget`] ベースの合計予算を超過（累算オーバーフローも本
+    /// variant へ倒す。`total` はオーバーフロー時 `usize::MAX` を用いる）。
+    BatchSqlTextTooLarge { total: usize, max: usize },
 }
 
 impl BatchLimitsError {
@@ -136,6 +151,18 @@ impl std::fmt::Display for BatchLimitsError {
             }
             BatchLimitsError::TooManyChunks { total, max } => {
                 write!(f, "batch chunk count {total} exceeds limit {max}")
+            }
+            BatchLimitsError::SqlTextTooLarge { index, len, max } => {
+                write!(
+                    f,
+                    "raw SQL text at batch index {index} length {len} exceeds pre-parse budget {max}"
+                )
+            }
+            BatchLimitsError::BatchSqlTextTooLarge { total, max } => {
+                write!(
+                    f,
+                    "batch raw SQL text total length {total} exceeds pre-parse budget {max}"
+                )
             }
         }
     }
@@ -207,6 +234,76 @@ pub(crate) fn validate_chunk_total(
         });
     }
     Ok(())
+}
+
+/// 生 SQL テキスト長（`str::len()`。デコード前）に対する保守的な予算。
+///
+/// `sql::lexer::lex_string_literal` の文字列リテラルエスケープは `''` → `'`
+/// （2 生バイト → 1 デコード後バイト）のみであり、デコード後の内容が生テキストより
+/// 長くなることはない（最悪でも生テキストの半分）。したがって
+/// `2 * decoded_max + overhead` は「デコード後に `decoded_max` 以内へ収まり得る
+/// 生テキストの上限」の安全側の見積りとなる（`overhead` は `INSERT INTO`・
+/// テーブル名・列リスト・`USING OPERATION_ID '<id>'` 句等、本文・パス以外の
+/// 構文分の余裕）。
+const RAW_SQL_OVERHEAD_BYTES: usize = 4096;
+
+/// [`RAW_SQL_OVERHEAD_BYTES`] のドキュメント参照。
+fn raw_sql_len_budget(decoded_max: usize) -> usize {
+    decoded_max
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(RAW_SQL_OVERHEAD_BYTES))
+        .unwrap_or(usize::MAX)
+}
+
+/// 束縛（`sql::allowlist::validate_insert` の `lexer::tokenize`・
+/// `sql::parser::bind_insert_form` の `path`/`body` 文字列複製）より前に、1 文の
+/// 生 SQL テキスト長とバッチ内の累計テキスト長を判定する（解析前の粗い早期
+/// リジェクト。codex-review 指摘・PR #242 対応）。
+///
+/// ②③（[`validate_batch_shape`]）はデコード後の `path`/`body` 長にしか作用せず、
+/// 束縛処理自体（構文木の構築・文字列複製）は入力サイズに比例した処理を
+/// 判定より前に必ず行ってしまう。本関数は束縛前に呼ぶことで、極端に巨大な単一
+/// SQL 文（②③の実効上限からは通常あり得ない生テキスト長）に対する束縛処理
+/// そのものを回避する。デコード後の実際の長さに対する正確な判定は
+/// [`validate_batch_shape`]（束縛後、`incremental::index_file_batch` 呼び出し前の
+/// 最終防衛線）が引き続き担い、本関数の予算判定に代わるものではない
+/// （[`raw_sql_len_budget`] が示す通り本関数の予算は 2 倍 + 余裕を持たせた
+/// 保守的な上限であり、正確な上限判定ではない）。
+///
+/// `running_raw_total` は呼び出し元がこれまでの生テキスト長を `checked_add` で
+/// 累算した値。戻り値は今回の `sql_len` を加算した新しい累計（呼び出し元は次回
+/// 呼び出しへそのまま渡す）。本文・パス自体は受け取らず、長さ情報のみで判定する
+/// （複製・追加確保を行わない。`validate_batch_shape` と同じ設計）。
+pub(crate) fn validate_raw_sql_len(
+    index: usize,
+    sql_len: usize,
+    running_raw_total: usize,
+    limits: &BatchLimits,
+) -> Result<usize, BatchLimitsError> {
+    let per_file_budget = raw_sql_len_budget(limits.max_file_body_bytes);
+    if sql_len > per_file_budget {
+        return Err(BatchLimitsError::SqlTextTooLarge {
+            index,
+            len: sql_len,
+            max: per_file_budget,
+        });
+    }
+
+    let batch_budget = raw_sql_len_budget(limits.max_batch_total_bytes);
+    let new_total =
+        running_raw_total
+            .checked_add(sql_len)
+            .ok_or(BatchLimitsError::BatchSqlTextTooLarge {
+                total: usize::MAX,
+                max: batch_budget,
+            })?;
+    if new_total > batch_budget {
+        return Err(BatchLimitsError::BatchSqlTextTooLarge {
+            total: new_total,
+            max: batch_budget,
+        });
+    }
+    Ok(new_total)
 }
 
 #[cfg(test)]
@@ -331,5 +428,69 @@ mod tests {
             BatchLimitsError::TooManyChunks { total: 1, max: 0 }.wire_code(),
             "54000"
         );
+        assert_eq!(
+            BatchLimitsError::SqlTextTooLarge {
+                index: 0,
+                len: 1,
+                max: 0
+            }
+            .wire_code(),
+            "54000"
+        );
+        assert_eq!(
+            BatchLimitsError::BatchSqlTextTooLarge { total: 1, max: 0 }.wire_code(),
+            "54000"
+        );
+    }
+
+    #[test]
+    fn raw_sql_len_accepts_within_per_file_budget() {
+        // max_file_body_bytes=10 → 予算 = 2*10 + 4096 = 4116。
+        let result = validate_raw_sql_len(0, 100, 0, &limits());
+        assert_eq!(result.unwrap(), 100);
+    }
+
+    #[test]
+    fn raw_sql_len_rejects_single_statement_over_per_file_budget() {
+        let budget = raw_sql_len_budget(limits().max_file_body_bytes);
+        assert!(matches!(
+            validate_raw_sql_len(2, budget + 1, 0, &limits()),
+            Err(BatchLimitsError::SqlTextTooLarge {
+                index: 2,
+                len,
+                max
+            }) if len == budget + 1 && max == budget
+        ));
+    }
+
+    #[test]
+    fn raw_sql_len_accepts_exactly_at_per_file_budget() {
+        let budget = raw_sql_len_budget(limits().max_file_body_bytes);
+        assert!(validate_raw_sql_len(0, budget, 0, &limits()).is_ok());
+    }
+
+    #[test]
+    fn raw_sql_len_rejects_when_running_total_exceeds_batch_budget() {
+        let batch_budget = raw_sql_len_budget(limits().max_batch_total_bytes);
+        // 1 文単独では per-file 予算内でも、累計が batch 予算を超えれば拒否する。
+        let per_file_ok = raw_sql_len_budget(limits().max_file_body_bytes).min(batch_budget);
+        assert!(matches!(
+            validate_raw_sql_len(1, per_file_ok, batch_budget, &limits()),
+            Err(BatchLimitsError::BatchSqlTextTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_sql_len_accumulates_running_total_across_calls() {
+        let l = limits();
+        let first = validate_raw_sql_len(0, 5, 0, &l).unwrap();
+        assert_eq!(first, 5);
+        let second = validate_raw_sql_len(1, 7, first, &l).unwrap();
+        assert_eq!(second, 12);
+    }
+
+    #[test]
+    fn raw_sql_len_budget_saturates_instead_of_overflowing() {
+        assert_eq!(raw_sql_len_budget(usize::MAX), usize::MAX);
     }
 }
