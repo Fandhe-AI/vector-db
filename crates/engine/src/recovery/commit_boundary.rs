@@ -58,6 +58,19 @@
 //!   1 つ生成し、応答をすべて書き終えた自然な関数末尾（正常 return / unwind の
 //!   いずれでも drop される）まで所有する契約。非同期実行系（タスクがスレッドを
 //!   跨ぐ）へ移行する場合はこの設計が前提を失うため見直しが必要。
+//!
+//!   **ネスト時の契約**（codex-review P1 再指摘・PR #246
+//!   #discussion_r3873683862 対応）: 現在の唯一の呼び出し元は 1 クエリにつき
+//!   1 個のみ生成しネストしないが、本型は `pub` であり将来の呼び出し元がこの
+//!   契約を破ってネストして生成する可能性を型システムだけでは排除できない。
+//!   そのため [`ResponseBoundaryGuard`] は「ネストされても安全」な非所有設計と
+//!   している ―― 生成時に既にアクティブなガードが存在する場合、内側のガードは
+//!   スレッドローカル状態（[`ACTIVE_RESPONSE_BOUNDARY_GENERATION`]・
+//!   [`COMMIT_PENDING_RESPONSE`]）を一切書き換えず、drop 時も何もしない。外側の
+//!   世代・pending フラグは内側の生成・commit・正常 drop のいずれによっても
+//!   消去・上書きされないため、外側が commit 成功後に panic すれば内側の有無に
+//!   関わらず abort する。逆に内側の区間中に発生した commit は「外側の世代」の
+//!   commit として扱われる（内側は境界を所有しないため独自の世代を持たない）。
 
 use std::cell::Cell;
 
@@ -91,18 +104,29 @@ thread_local! {
 ///
 /// `wire-server::simple_query::execute_and_respond` が 1 クエリの処理開始時に
 /// 生成し、応答をすべて書き終えるまで所有する契約（モジュール冒頭ドキュメント
-/// 参照）。生成時に一意な世代番号を採番してスレッドローカルへ記録し、区間内で
-/// [`commit_and_finish`] が commit に成功すると、その世代番号が
-/// [`COMMIT_PENDING_RESPONSE`] へ記録される。drop 時に記録されている世代が
-/// 自分自身の世代と一致する場合のみ「commit 成功後まだ応答未確定」と判定し、
-/// unwind 中（panic 伝播中）であれば `std::process::abort()` する。一致しない
-/// （commit していない、または他の世代のもの）、または unwind 中でなければ
-/// （正常終了 = 応答を書き終えた、または commit 前に失敗した）何もしない。
+/// 参照）。現在の唯一の呼び出し元はネストせず 1 クエリにつき 1 個のみ生成するが、
+/// 本型は `pub`（wire-server から呼ばれる）で将来の呼び出し元がこの契約を破って
+/// ネストして生成する可能性を構造的に排除できない。そのため、ネストしても
+/// 外側の保護区間が壊れない「非所有」設計にしている（codex-review P1 再指摘・
+/// PR #246 #discussion_r3873683862 対応。「想定していない」だけでは構造的保証に
+/// ならないという指摘に対し、ネストされても安全な構造そのもので応える）。
 ///
-/// 世代番号による紐付けは、本ガードのスタック外（区間外）で commit された
-/// stale なフラグを、後続のクエリのガードが誤って自分の commit と誤認しない
-/// ようにするための構造（codex-review P1 再指摘・PR #246
-/// #discussion_r3870845012 対応）。
+/// - 生成時、スレッドに既にアクティブなガード（[`ACTIVE_RESPONSE_BOUNDARY_GENERATION`]
+///   が非 0）が存在しなければ、新しい世代番号を採番して「境界を所有する」ガードと
+///   なる（`owned_generation = Some(generation)`）。既にアクティブなガードが存在
+///   する場合（＝ネストして生成された内側のガード）は境界を所有せず
+///   （`owned_generation = None`）、[`ACTIVE_RESPONSE_BOUNDARY_GENERATION`] を
+///   一切書き換えない。これにより外側ガードの世代がスレッドローカルへ残り続け、
+///   [`commit_and_finish`] が内側の区間内で commit してもその世代（＝外側の世代）
+///   が [`COMMIT_PENDING_RESPONSE`] へ記録される。
+/// - `owned_generation == None`（非所有＝内側ガード）の drop は何もしない
+///   （abort 判定もスレッドローカルの書き換えも行わない）。外側ガードの保護
+///   区間・pending フラグを一切触らないため、内側ガードの生成・commit・
+///   正常 drop のいずれの組み合わせでも外側の保護は失われない。
+/// - `owned_generation == Some(generation)`（所有＝外側 or 単独ガード）の drop
+///   は、記録されている pending 世代が自分自身の世代と一致する場合のみクリアし
+///   「commit 成功後まだ応答未確定」と判定する。一致しない場合は pending を
+///   一切変更しない（他ガードの記録を誤って消さない）。
 ///
 /// `must_use` 属性は束縛忘れ（`let _ = ResponseBoundaryGuard::new();` 等で即座に
 /// drop され保護区間が消える）をコンパイル時の warning として検出するための注記。
@@ -110,7 +134,9 @@ thread_local! {
 /// まで保持すること。
 #[must_use]
 pub struct ResponseBoundaryGuard {
-    generation: u64,
+    /// 境界を所有する場合のみ `Some(自世代)`。ネストして生成された内側の
+    /// ガードは `None`（＝ drop 時に何もしない）。
+    owned_generation: Option<u64>,
 }
 
 impl ResponseBoundaryGuard {
@@ -118,13 +144,22 @@ impl ResponseBoundaryGuard {
     /// 名前付き変数へ束縛して生存させること（`let _ = ...` は即座に drop され
     /// 保護区間が失われるため使わない）。
     pub fn new() -> Self {
-        let generation = NEXT_RESPONSE_BOUNDARY_GENERATION.with(|c| {
-            let current = c.get();
-            c.set(current.saturating_add(1));
-            current
+        let owned_generation = ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| {
+            if c.get() != 0 {
+                // 既にアクティブなガードが存在する＝ネストして生成された。
+                // 境界の所有権は外側ガードに残す（構造体ドキュメント参照）。
+                None
+            } else {
+                let generation = NEXT_RESPONSE_BOUNDARY_GENERATION.with(|n| {
+                    let current = n.get();
+                    n.set(current.saturating_add(1));
+                    current
+                });
+                c.set(generation);
+                Some(generation)
+            }
         });
-        ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| c.set(generation));
-        Self { generation }
+        Self { owned_generation }
     }
 }
 
@@ -136,19 +171,28 @@ impl Default for ResponseBoundaryGuard {
 
 impl Drop for ResponseBoundaryGuard {
     fn drop(&mut self) {
-        // 記録されている pending 世代が自分自身のものと一致する場合のみ abort
-        // 対象とみなす。無条件でクリアするのは、一致しない値（他世代・stale な
-        // 値）を残したままにすると次のガードの誤 abort につながりうるため
-        // （一致しない値をここでクリアしても false abort にはならない ――
-        // should_abort は armed（＝一致）かつ panicking の場合のみ true）。
-        let pending = COMMIT_PENDING_RESPONSE.with(|f| f.replace(None));
-        let armed = pending == Some(self.generation);
+        // 境界を所有していない（＝ネストして生成された内側の）ガードは、
+        // 外側の保護区間・pending フラグに一切触れずに何もしない
+        // （構造体ドキュメント参照）。
+        let Some(generation) = self.owned_generation else {
+            return;
+        };
 
-        // アクティブ世代の記録も自分自身のものであればクリアする（ネストして
-        // 生成されることは想定していないが、他ガードの記録を誤って消さないため
-        // 一致チェックを行う）。
+        // 記録されている pending 世代が自分自身のものと一致する場合のみ abort
+        // 対象とみなし、その場合のみクリアする。一致しない場合は pending を
+        // 変更しない（他ガードの記録を誤って消さないため）。
+        let armed = COMMIT_PENDING_RESPONSE.with(|f| {
+            if f.get() == Some(generation) {
+                f.set(None);
+                true
+            } else {
+                false
+            }
+        });
+
+        // アクティブ世代の記録も自分自身のものであればクリアする。
         ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| {
-            if c.get() == self.generation {
+            if c.get() == generation {
                 c.set(0);
             }
         });
@@ -428,6 +472,82 @@ mod tests {
             .expect("committed row must remain visible after reopen");
     }
 
+    // --- codex-review P1 再指摘（PR #246 #discussion_r3873683862）の回帰テスト ---
+    // 外側ガード配下で commit した後にネストして内側ガードを生成・正常 drop しても、
+    // 外側の pending フラグ（COMMIT_PENDING_RESPONSE）が消去されないこと
+    // （非所有設計により内側の drop はスレッドローカル状態に一切触れない）。
+    // 旧実装（drop 時に世代を問わず無条件で `replace(None)`）では、この内側の
+    // 正常 drop だけで外側の保護区間が消去されてしまっていた。
+
+    #[test]
+    fn nested_guard_normal_drop_does_not_clear_outer_pending_flag() {
+        let path = unique_db_path("commit-boundary-nested-guard-state");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let outer = ResponseBoundaryGuard::new();
+
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0],
+            metadata: &[],
+        };
+        {
+            let mut table = write_txn
+                .open_table(crate::storage::ROWS_TABLE)
+                .expect("open rows table");
+            let encoded = crate::storage::encode_row(&row).expect("encode row");
+            table
+                .insert(("tenant-a", 100u64), encoded.as_slice())
+                .expect("insert");
+        }
+        commit(write_txn).expect("outer commit must succeed");
+
+        let outer_generation = outer
+            .owned_generation
+            .expect("outer guard must own the boundary");
+        assert_eq!(
+            COMMIT_PENDING_RESPONSE.with(|f| f.get()),
+            Some(outer_generation),
+            "outer commit must record its own generation as pending"
+        );
+
+        // 内側ガードを生成・commit を伴わずに正常 drop する（ネストケース）。
+        {
+            let inner = ResponseBoundaryGuard::new();
+            assert_eq!(
+                inner.owned_generation, None,
+                "nested inner guard must not own the boundary"
+            );
+            // drop はスコープ終端で暗黙的に走る。
+        }
+
+        // 内側の正常 drop 後も、外側の pending フラグは消去されていないこと。
+        assert_eq!(
+            COMMIT_PENDING_RESPONSE.with(|f| f.get()),
+            Some(outer_generation),
+            "nested inner guard's normal drop must not clear the outer's pending flag"
+        );
+
+        // 外側ガードを drop してテスト自身が pending 状態を残さないようにする
+        // （テストプロセスが `--test-threads=1` 等で共有スレッドを使う場合、
+        // 残留した pending 世代が後続の無関係なガードの誤 abort を招きうるため）。
+        drop(outer);
+        assert_eq!(
+            COMMIT_PENDING_RESPONSE.with(|f| f.get()),
+            None,
+            "outer guard's own drop must clear the pending flag it owns"
+        );
+
+        drop(storage);
+        let reopened = Storage::open(&path).expect("reopen storage");
+        reopened
+            .get("tenant-a", 100u64)
+            .expect("committed row must remain visible after reopen");
+    }
+
     // --- commit_write_txn_guarded: has_writes == false は commit させず abort する ---
 
     #[test]
@@ -677,6 +797,123 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen storage");
         reopened
             .get("tenant-a", 9u64)
+            .expect("committed row must remain visible after subprocess abort");
+    }
+
+    // --- codex-review P1 再指摘（PR #246 #discussion_r3873683862）の end-to-end
+    // 回帰テスト ---
+    // 外側ガード配下で commit した後、ネストして内側ガードを生成・commit を伴わず
+    // 正常 drop してから、外側ガードの保護区間内で panic した場合に abort する
+    // こと（内側ガードの生成・正常 drop が外側の保護を消し去らないことの
+    // end-to-end 検証。上の `nested_guard_normal_drop_does_not_clear_outer_pending_flag`
+    // が in-process の状態検証、本テストが abort 契約そのものの検証を担う）。
+    const CHILD_DB_ENV_NESTED_GUARD: &str = "ENGINE_COMMIT_BOUNDARY_NESTED_GUARD_CHILD_DB";
+
+    #[test]
+    fn subprocess_outer_guard_still_aborts_after_nested_inner_guard_normal_drop() {
+        if let Ok(db_path) = std::env::var(CHILD_DB_ENV_NESTED_GUARD) {
+            // 子プロセス側: 外側ガード配下で commit した後、ネストして内側ガードを
+            // 生成し（commit を伴わず）正常 drop する。その後、外側ガードがまだ
+            // 生存している区間で panic する。
+            let storage = Storage::open(&db_path).expect("child: open storage");
+            let outer = ResponseBoundaryGuard::new();
+
+            let write_txn = storage.db().begin_write().expect("child: begin_write");
+            let row = RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            };
+            {
+                let mut table = write_txn
+                    .open_table(crate::storage::ROWS_TABLE)
+                    .expect("child: open rows table");
+                let encoded = crate::storage::encode_row(&row).expect("child: encode row");
+                table
+                    .insert(("tenant-a", 11u64), encoded.as_slice())
+                    .expect("child: insert");
+            }
+            commit(write_txn).expect("child: outer commit must succeed");
+
+            {
+                // ネストして生成された内側ガード。commit を伴わず正常 drop する
+                // （旧実装ではこの drop だけで外側の pending フラグが消えていた）。
+                let _inner = ResponseBoundaryGuard::new();
+            }
+
+            // `outer` を明示的に drop せず、ここで panic して unwind に乗せる。
+            // 内側ガードの生成・正常 drop を経ても外側 `outer` の pending
+            // フラグが残っていれば、この unwind による `outer` の drop で
+            // abort するはずである。
+            let _ = &outer;
+            panic!(
+                "injected panic within outer guard's boundary, after a nested inner \
+                 guard was created and dropped normally"
+            );
+        }
+
+        // 親プロセス側。
+        let path = unique_db_path("commit-boundary-subprocess-nested-guard");
+        let _cleanup = CleanupGuard(path.clone());
+        drop(Storage::open(&path).expect("parent: create storage"));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg(
+                "recovery::commit_boundary::tests::\
+                 subprocess_outer_guard_still_aborts_after_nested_inner_guard_normal_drop",
+            )
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_DB_ENV_NESTED_GUARD, &path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if start.elapsed() > timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subprocess did not terminate within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        use std::io::Read as _;
+        let mut stdout_buf = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout_buf);
+        }
+
+        assert!(
+            !status.success(),
+            "child process must not exit successfully; status={status:?} stdout={stdout_buf}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "child must be terminated by SIGABRT (std::process::abort) even though a \
+                 nested inner guard was created and dropped normally in between; \
+                 status={status:?} stdout={stdout_buf}"
+            );
+        }
+
+        // commit 自体は成功しているため、再オープン後も行が可視であること。
+        let reopened = Storage::open(&path).expect("reopen storage");
+        reopened
+            .get("tenant-a", 11u64)
             .expect("committed row must remain visible after subprocess abort");
     }
 }
