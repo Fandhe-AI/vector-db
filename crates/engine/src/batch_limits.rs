@@ -12,8 +12,13 @@
 //! 3. バッチ合計最大サイズ（`path` + 本文の合計。[`BatchLimits::max_batch_total_bytes`]）
 //! 4. バッチあたり最大生成チャンク数（サーバー側算定。[`BatchLimits::max_batch_chunks`]）
 //!
-//! 判定タイミングの契約: 1〜3 は [`validate_batch_shape`] でバッチの解析段階
-//! （チャンク化・埋め込み・write トランザクションのいずれよりも前）に、4 は
+//! 判定タイミングの契約: 1 は `core::EngineCore::execute_insert_sql_batch` が
+//! 束縛（`sql::parser::bind_insert_form`）より前に判定する。2〜3 は同メソッドの
+//! 束縛ループ内で、各文の束縛直後に逐次判定する（束縛済みの `path`/`body` 長を
+//! 使うため束縛自体は避けられないが、違反を検出した時点で残りの文の束縛を
+//! 打ち切ることで複製の増幅を抑える。TASK-122 レビュー対応）。[`validate_batch_shape`]
+//! はその最終防衛線として、バッチの解析段階（チャンク化・埋め込み・write
+//! トランザクションのいずれよりも前）に 1〜3 をまとめて再検証する。4 は
 //! [`validate_chunk_total`] でチャンク分割後・埋め込み処理の開始前に行う
 //! （呼び出し元 `incremental::index_file_batch` のドキュメント参照）。いずれの
 //! 超過も副作用ゼロ（redb・インメモリ索引・`operation_id` 台帳とも変更なし）で

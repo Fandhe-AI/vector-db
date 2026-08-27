@@ -1252,13 +1252,15 @@ impl EngineCore {
         }
 
         // ①（バッチあたり最大ファイル数）はここで先に判定できる（`sqls.len()` は
-        // 束縛前から既知）。②③（本文サイズ）は束縛結果の `path`/`body` 長が必要
-        // なため `incremental::index_file_batch` 側の `validate_batch_shape` に
-        // 委ねるが、①だけは束縛（`bind_insert_form` の `path`/`body` 文字列複製を
-        // 伴う）より前に切ることで、ファイル数超過時の無駄な確保・解析を避ける
-        // （coding-rust.md「不安全な設計 / DoS」対応。`batch_limits.rs` 側の判定と
-        // 重複するが、同じ上限値（`self.batch_limits.max_files_per_batch`）に対する
-        // 早期リジェクトであり結果は変わらない）。
+        // 束縛前から既知）。①だけは束縛（`bind_insert_form` の `path`/`body`
+        // 文字列複製を伴う）より前に切ることで、ファイル数超過時の無駄な確保・
+        // 解析を避ける（coding-rust.md「不安全な設計 / DoS」対応。`batch_limits.rs`
+        // 側の判定と重複するが、同じ上限値（`self.batch_limits.max_files_per_batch`）
+        // に対する早期リジェクトであり結果は変わらない）。②③（本文サイズ・バッチ
+        // 合計サイズ）は各文の束縛（`path`/`body` の `String` 複製を伴う）を経ない
+        // と判定できないため、以下の束縛ループ内で束縛直後に逐次判定する
+        // （`incremental::index_file_batch` 側の `validate_batch_shape` はその
+        // 最終防衛線であり、ここでの早期判定が主防御となる）。
         if sqls.len() > self.batch_limits.max_files_per_batch {
             return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
                 crate::batch_limits::BatchLimitsError::TooManyFiles {
@@ -1286,6 +1288,16 @@ impl EngineCore {
             }
         })?;
 
+        // ②③（1 ファイルあたり最大本文サイズ・バッチ合計最大サイズ）を束縛直後
+        // ここで逐次判定する（`batch_limits.rs` の `validate_batch_shape` は
+        // `index_file_batch` 側で全ファイルの束縛完了後に改めて呼ばれる最終防衛線
+        // だが、束縛（`bind_insert_form` による `path`/`body` の `String` 複製）を
+        // 全文について終えてからでは判定が遅く、`batch_limits.rs` モジュール
+        // ドキュメントが掲げる「本文・パスの複製や追加確保を行わない」DoS 対策の
+        // 意図に反する。ここでは束縛済みの `bound.path`/`bound.body` の長さのみを
+        // 見て、違反を検出した時点のファイルで打ち切ることで、複製の増幅を
+        // 「違反ファイルまで」に抑える）。
+        let mut running_total_bytes: usize = 0;
         for sql in sqls {
             let stmt =
                 crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
@@ -1303,6 +1315,40 @@ impl EngineCore {
             let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
             match bound {
                 crate::sql::parser::BoundInsertForm::File(file_bound) => {
+                    if file_bound.body.len() > self.batch_limits.max_file_body_bytes {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                            crate::batch_limits::BatchLimitsError::FileBodyTooLarge {
+                                index: file_binds.len(),
+                                len: file_bound.body.len(),
+                                max: self.batch_limits.max_file_body_bytes,
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    let next_total_bytes = file_bound
+                        .path
+                        .len()
+                        .checked_add(file_bound.body.len())
+                        .and_then(|t| running_total_bytes.checked_add(t))
+                        .ok_or_else(|| {
+                            crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                                crate::batch_limits::BatchLimitsError::BatchTotalTooLarge {
+                                    total: usize::MAX,
+                                    max: self.batch_limits.max_batch_total_bytes,
+                                }
+                                .to_string(),
+                            )
+                        })?;
+                    if next_total_bytes > self.batch_limits.max_batch_total_bytes {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::payload_too_large(
+                            crate::batch_limits::BatchLimitsError::BatchTotalTooLarge {
+                                total: next_total_bytes,
+                                max: self.batch_limits.max_batch_total_bytes,
+                            }
+                            .to_string(),
+                        ));
+                    }
+                    running_total_bytes = next_total_bytes;
                     file_binds.push(file_bound);
                 }
                 // 行形が 1 件でも混在した場合は黙って行形として処理せず拒否する
