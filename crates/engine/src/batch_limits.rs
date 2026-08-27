@@ -114,7 +114,7 @@ pub enum BatchLimitsError {
         max: usize,
     },
     /// 解析前ガード: バッチ内の生 SQL テキスト長の累計が
-    /// [`raw_sql_len_budget`] ベースの合計予算を超過（累算オーバーフローも本
+    /// [`batch_raw_sql_len_budget`] ベースの合計予算を超過（累算オーバーフローも本
     /// variant へ倒す。`total` はオーバーフロー時 `usize::MAX` を用いる）。
     BatchSqlTextTooLarge { total: usize, max: usize },
 }
@@ -249,11 +249,37 @@ pub(crate) fn validate_chunk_total(
 /// （PR #242 レビュー対応）。
 const RAW_SQL_OVERHEAD_BYTES: usize = 4096;
 
-/// [`RAW_SQL_OVERHEAD_BYTES`] のドキュメント参照。
+/// [`RAW_SQL_OVERHEAD_BYTES`] のドキュメント参照。1 文単位の予算算出に使う
+/// （構文オーバーヘッドを 1 文分のみ加算する）。
 fn raw_sql_len_budget(decoded_max: usize) -> usize {
     decoded_max
         .checked_mul(2)
         .and_then(|doubled| doubled.checked_add(RAW_SQL_OVERHEAD_BYTES))
+        .unwrap_or(usize::MAX)
+}
+
+/// バッチ累計側の予算算出（codex-review P1 指摘・PR #242 対応）。
+///
+/// `running_raw_total` はバッチ内の複数文の生 SQL テキスト長を合算した値であり、
+/// 各文にはそれぞれ独立した `INSERT INTO`・テーブル名・列リスト・
+/// `USING OPERATION_ID '<id>'` 等の構文オーバーヘッド（[`RAW_SQL_OVERHEAD_BYTES`]）
+/// が存在する。[`raw_sql_len_budget`] のように構文オーバーヘッドを 1 回しか
+/// 加算しないと、デコード後の `path + body` 合計が③以内・各本文が②以内という
+/// 後段契約を満たす正当な多文バッチでも、文数分のオーバーヘッドの分だけ解析前に
+/// 誤って `54000` へ拒否されうる。呼び出し元がバッチ内で許容する最大文数
+/// （`max_files_per_batch`。①の上限であり、本関数呼び出し時点では束縛ループの
+/// 前段で既に `sqls.len() <= max_files_per_batch` を検証済み）を渡し、
+/// オーバーヘッドをその文数分だけ含める。乗算・加算はいずれも `saturating_*`／
+/// `checked_*` を用い、オーバーフロー時は `usize::MAX`（＝実質無制限）へ倒す
+/// （拒否側ではなく緩める方向への飽和だが、`max_files_per_batch` はサーバー側
+/// 構成値であり untrusted な単一リクエスト入力からは到達しない。加えて
+/// `decoded_max` 自体の 2 倍加算により実運用上限では発生しない想定。
+/// [`raw_sql_len_budget`] と同じ設計方針）。
+fn batch_raw_sql_len_budget(decoded_max: usize, max_files_per_batch: usize) -> usize {
+    let overhead = max_files_per_batch.saturating_mul(RAW_SQL_OVERHEAD_BYTES);
+    decoded_max
+        .checked_mul(2)
+        .and_then(|doubled| doubled.checked_add(overhead))
         .unwrap_or(usize::MAX)
 }
 
@@ -295,7 +321,12 @@ pub(crate) fn validate_raw_sql_len(
         });
     }
 
-    let batch_budget = raw_sql_len_budget(limits.max_batch_total_bytes);
+    // バッチ累計側の予算は文数分の構文オーバーヘッドを含める
+    // （batch_raw_sql_len_budget ドキュメント参照。codex-review P1 指摘・PR #242
+    // 対応）。`limits.max_files_per_batch` は呼び出し元 `execute_insert_sql_batch`
+    // が本関数呼び出しループの前段で `sqls.len()` に対してすでに検証済みの上限。
+    let batch_budget =
+        batch_raw_sql_len_budget(limits.max_batch_total_bytes, limits.max_files_per_batch);
     let new_total =
         running_raw_total
             .checked_add(sql_len)
@@ -477,13 +508,43 @@ mod tests {
 
     #[test]
     fn raw_sql_len_rejects_when_running_total_exceeds_batch_budget() {
-        let batch_budget = raw_sql_len_budget(limits().max_batch_total_bytes);
+        let l = limits();
+        let batch_budget = batch_raw_sql_len_budget(l.max_batch_total_bytes, l.max_files_per_batch);
+        let per_file_budget = raw_sql_len_budget(l.max_batch_total_bytes);
         // 1 文単独では per-file 予算内でも、累計が batch 予算を超えれば拒否する。
-        let per_file_ok = raw_sql_len_budget(limits().max_batch_total_bytes).min(batch_budget);
+        let per_file_ok = per_file_budget.min(batch_budget);
         assert!(matches!(
-            validate_raw_sql_len(1, per_file_ok, batch_budget, &limits()),
+            validate_raw_sql_len(1, per_file_ok, batch_budget, &l),
             Err(BatchLimitsError::BatchSqlTextTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn raw_sql_len_batch_budget_includes_per_statement_overhead() {
+        // codex P1 追加指摘の回帰テスト（PR #242）: バッチ累計予算に文数分の
+        // 構文オーバーヘッドを含めない旧実装なら、後段契約（②③）を満たす
+        // 正当な多文バッチでも framing 分だけ解析前に拒否されうる。
+        // limits() は max_files_per_batch=4・max_batch_total_bytes=30。
+        // 旧実装の batch_budget = 2*30 + 4096 = 4156（文数分のオーバーヘッドを
+        // 見込んでいないため、2 文分弱の長さしか積めない）。
+        let l = limits();
+        let old_wrong_batch_budget = raw_sql_len_budget(l.max_batch_total_bytes);
+        // 各文は per-file 予算内（十分小さい）だが、4 文合計では旧実装の
+        // batch_budget を超え、4 文分の framing を見込んだ新しい batch_budget
+        // でなければ受理できない生テキスト長を積む。
+        let per_statement_len = old_wrong_batch_budget / 2;
+        let mut running = 0usize;
+        for index in 0..l.max_files_per_batch {
+            running = validate_raw_sql_len(index, per_statement_len, running, &l)
+                .expect("statement within per-file and per-statement-overhead-aware batch budget should be accepted");
+        }
+        assert_eq!(running, per_statement_len * l.max_files_per_batch);
+    }
+
+    #[test]
+    fn batch_raw_sql_len_budget_saturates_instead_of_overflowing() {
+        assert_eq!(batch_raw_sql_len_budget(usize::MAX, usize::MAX), usize::MAX);
+        assert_eq!(batch_raw_sql_len_budget(0, usize::MAX), usize::MAX);
     }
 
     #[test]

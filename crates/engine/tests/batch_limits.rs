@@ -355,17 +355,22 @@ fn raw_sql_batch_total_over_budget_rejected_before_parsing_later_statements() {
         .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(small_chunk_config())
         .with_batch_limits(BatchLimits {
-            max_files_per_batch: 10,
-            max_file_body_bytes: 10_000,
-            max_batch_total_bytes: 10,
+            max_files_per_batch: 3,
+            max_file_body_bytes: 10_000_000,
+            max_batch_total_bytes: 5_000,
             ..BatchLimits::default()
         });
     let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-    // バッチ合計予算 = 2 * 10 + 4096 = 4116。各文は② 予算内でも、3 文合計の生
-    // テキスト長がこれを超えるようにする。3 文目は存在しないテーブルにして、
-    // 束縛（テーブル存在検証を含む）まで到達していないことを示す。
-    let body = "a".repeat(1_500);
+    // 文単位予算（per_file_budget） = 2 * 5_000 + 4_096 = 14_096。
+    // バッチ累計予算（batch_raw_sql_len_budget、codex P1 追加指摘・PR #242 対応で
+    // 文数分の構文オーバーヘッドを含めるよう修正）
+    // = 2 * 5_000 + max_files_per_batch(3) * 4_096 = 22_288。
+    // 各文は本文 7_800 バイト（生 SQL 長は framing 込みで概ね 7_900 前後）で
+    // per_file_budget を大きく下回るが、3 文合計は概ね 23_700〜23_850 前後となり
+    // batch 予算 22_288 を超える。3 文目は存在しないテーブルにして、束縛
+    // （テーブル存在検証を含む）まで到達していないことを示す。
+    let body = "a".repeat(7_800);
     let sql0 = insert_file_sql("documents", "docs/rb0.txt", &body, "op-raw-batch-0");
     let sql1 = insert_file_sql("documents", "docs/rb1.txt", &body, "op-raw-batch-1");
     let sql2 = insert_file_sql("does_not_exist", "docs/rb2.txt", &body, "op-raw-batch-2");
