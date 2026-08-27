@@ -185,6 +185,41 @@ fn too_many_files_rejected_with_54000_and_no_side_effects() {
     }
 }
 
+/// codex-review 指摘（PR #242）の回帰テスト: embedder 未構成の `EngineCore` に
+/// ②（1 ファイルあたり最大本文サイズ）超過のバッチを渡した場合でも、embedder
+/// 未構成由来の `Internal`（`XX000` 相当）ではなく上限超過の `54000` が返ることを
+/// 確認する（②③ の判定は各文の束縛後に逐次行われるため、embedder 取得を
+/// ①②③ 完了より前に置くと ② 違反より先に embedder 未構成が検出されてしまう。
+/// 「上限超過は常に `54000`」というエラー契約を embedder 構成の有無に関わらず
+/// 維持する）。
+#[test]
+fn single_file_body_over_limit_rejected_with_54000_even_without_embedder_configured() {
+    let path = unique_db_path("batch-limits-file-body-too-large-no-embedder");
+    let _guard = CleanupGuard(path.clone());
+    let storage = new_documents_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_file_body_bytes: 10,
+            max_batch_total_bytes: 10_000,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    let sqls = [insert_file_sql(
+        "documents",
+        "docs/big-no-embedder.txt",
+        "this body is far longer than ten bytes",
+        "op-body-too-large-no-embedder",
+    )];
+    let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+
+    let err = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect_err("file body over ② should be rejected even without an embedder");
+    assert_eq!(err.wire_code(), "54000");
+}
+
 #[test]
 fn file_count_exactly_at_limit_succeeds() {
     let path = unique_db_path("batch-limits-file-count-boundary");

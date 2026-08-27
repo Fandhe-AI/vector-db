@@ -1271,12 +1271,6 @@ impl EngineCore {
             ));
         }
 
-        let embedder = self.embedder.as_deref().ok_or_else(|| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
-                detail: "no embedder configured for file-form insert".to_string(),
-            }
-        })?;
-
         // 束縛結果（`BoundFileInsert`）の所有権をここで保持する。後段で構築する
         // `BoundFileIndexInput`／`LedgerWrite` はこの `Vec` の要素を借用するため、
         // 束縛と `items` 構築を 2 パスへ分ける（`sql::parser::BoundFileInsert` の
@@ -1360,6 +1354,18 @@ impl EngineCore {
                 }
             }
         }
+
+        // embedder 未構成エラーは①②③（ファイル数・本文サイズ・バッチ合計サイズ）の
+        // 上限判定をすべて終えた後に返す（codex-review 指摘 P1 対応）。ここより前で
+        // 返すと、上限超過バッチを embedder 未構成の EngineCore に渡した際に
+        // `54000`（payload too large）ではなく embedder 未構成由来の `Internal`
+        // （`XX000` 相当）が先に返ってしまい、「上限超過は常に `54000`」という
+        // エラー契約（本メソッドドキュメント参照）に反する。
+        let embedder = self.embedder.as_deref().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "no embedder configured for file-form insert".to_string(),
+            }
+        })?;
 
         let mut items: Vec<crate::incremental::BatchFileIndexItem<'_>> = Vec::new();
         items.try_reserve_exact(file_binds.len()).map_err(|_| {
