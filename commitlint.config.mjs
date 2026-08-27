@@ -10,4 +10,15 @@ export default {
     // （sentence-case 等の禁止）と構造的に衝突するため大文字小文字の検査は無効化する
     'subject-case': [0],
   },
+  // `git merge --no-edit`（origin/main 取り込み）が生成する既定のマージコミット
+  // メッセージ（「Merge branch '...' into ...」等）は commitlint の
+  // `defaultIgnores` により既に対象外だが、過去に本リポで使われていた
+  // `merge: origin/main を取り込み` 形式（type-enum に無い `merge` を type として
+  // 使う）はこのデフォルトパターンに一致せず type-enum で fail していた
+  // （PR #249 CI 指摘）。履歴の書き換え（reword）は共有済みブランチの force-push を
+  // 要し安全側でないため行わず、代わりにこの既存パターンの merge コミットのみを
+  // commitlint の検証対象から明示的に除外する。以降の base 取り込みコミットは
+  // 通常の Conventional Commits 形式（例: `chore(engine): base ブランチの変更を
+  // 取り込む`）を使うため、本 ignore は過去コミットの後方互換のためだけに残す。
+  ignores: [(commit) => /^merge:\s/i.test(commit)],
 };
