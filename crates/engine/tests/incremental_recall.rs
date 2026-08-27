@@ -11,17 +11,16 @@
 //! が返す `IndexTiming`）を対象に、既存コーパスが積まれた状態での
 //! 「1 ファイル追加の性能」（INDEX-1）と「検索への反映」（INDEX-2）を固定する。
 //!
-//! **INDEX-1 が固定する契約は「増分 1 ファイル追加の所要時間が、同じ総ファイル数を
-//! 空 DB から構築する全体再構築の所要時間の 1/10 以下であること」（ポインタ:
-//! `docs/spec/04-behavior/indexing.md` INDEX-1）のみである。「増分コストが既存
-//! コーパス規模 N に依存しない」ことは INDEX-1 の契約ではなく、本テストが検証する
-//! 性質でもない。実装上、`tenant::replace_typed_rows_by_text_key`（同一パスの既存行を
-//! 特定するための置換キー探索）はテナント名前空間内の既存行を線形走査するため、
-//! 増分 1 ファイルの所要時間は既存コーパス規模に対して線形に増加する（実測: 既存
-//! ファイル数 8 で約 42µs、512 で約 146µs、8000 で約 1.55ms。codex-review 指摘・
-//! PR #241）。この線形走査コストの解消（キー探索の索引化）は redb スキーマ・
-//! 障害回復台帳の不変条件に関わる engine 側の設計変更であり、本テストの回帰検知
-//! パラメータ調整では解消できない別 Issue の対象とする。
+//! INDEX-1 が固定する数値基準・判定式は private spec 側の定義に従う（ポインタ:
+//! `docs/spec/04-behavior/indexing.md` INDEX-1。本文はここに転記しない）。「増分
+//! コストが既存コーパス規模 N に依存しない」ことは INDEX-1 の契約ではなく、本
+//! テストが検証する性質でもない。実装上、`tenant::replace_typed_rows_by_text_key`
+//! （同一パスの既存行を特定するための置換キー探索）はテナント名前空間内の既存行を
+//! 線形走査するため、増分 1 ファイルの所要時間は既存コーパス規模に対して線形に
+//! 増加する（具体的な実測値は spec-confidentiality 上ここに記載しない）。この線形
+//! 走査コストの解消（キー探索の索引化）は redb スキーマ・障害回復台帳の不変条件に
+//! 関わる engine 側の設計変更であり、本テストの回帰検知パラメータ調整では解消
+//! できない別 Issue の対象とする。
 
 use std::time::Duration;
 
@@ -142,8 +141,9 @@ const LINES_PER_FILE: usize = 4;
 const MEASUREMENT_ROUNDS: usize = 3;
 
 /// 判定閾値の分母（増分側は全体再構築側の `1 / RATIO_THRESHOLD_DENOM` 以下の時間で
-/// 完了すること）。`tests/incremental_write_perf.rs`（TASK-143・PERSIST-2）と同じ
-/// 分母を採用する（ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-1）。
+/// 完了すること）。`tests/incremental_write_perf.rs`（TASK-143・PERSIST-2）と同じ形の
+/// 判定閾値として採用する（対象ビヘイビアは TASK-121／INDEX-1／
+/// `docs/spec/04-behavior/indexing.md` を参照）。
 const RATIO_THRESHOLD_DENOM: u32 = 10;
 
 fn generic_body(index: usize) -> String {
@@ -224,8 +224,9 @@ fn measure_single_file_incremental_insert() -> Duration {
 /// `BASELINE_FILES + 1` 件を空 DB から順次挿入する「全体再構築」の総所要時間を
 /// `MEASUREMENT_ROUNDS` 回計測し、中央値を返す（増分側と同じ総ファイル数を毎ラウンド
 /// 書き込むことで比較条件を揃える）。一括投入構文（INDEX-4）は本移行時点で未実装
-/// （spec 側「検討中」。ポインタ: `docs/spec/04-behavior/indexing.md`）のため、SQL 表層
-/// で実現可能な「空 DB への逐次 `INSERT`」を全体再構築の代替として用いる。
+/// （ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-4。spec 側の検討状況はここに
+/// 転記しない）のため、SQL 表層で実現可能な「空 DB への逐次 `INSERT`」を全体再構築の
+/// 代替として用いる。
 fn measure_full_rebuild() -> Duration {
     let mut durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
     for round in 0..MEASUREMENT_ROUNDS {
