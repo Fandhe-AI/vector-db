@@ -34,12 +34,14 @@ fn seed_row(storage: &Storage, table: &str, id: u64, tenant: &str, embedding: &[
     // `Storage::insert_row_into_table` は `pub(crate)` 化済みでクレート外から呼べない
     // （codex-review P0 指摘対応）。
     let ctx = PolicyContext::new(tenant).expect("valid tenant");
-    // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
-    // `operation_id` を使う（固定文言の使い回しは同一テナント内の 2 回目以降が
-    // `23505` になる）。
-    let op_id =
-        engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{tenant}-{id}"))
-            .expect("valid operation_id");
+    // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で内容ハッシュを
+    // 持つため、同一テナント・同一テーブル内で内容の異なる複数行へ同一 operation_id を
+    // 使い回すと 2 件目以降が OperationIdContentMismatch で拒否される。行ごとに一意の
+    // operation_id を使う。
+    let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+        "test-op-{tenant}-{table}-{id}"
+    ))
+    .expect("valid operation_id");
     engine::tenant::insert_row(
         storage,
         table,

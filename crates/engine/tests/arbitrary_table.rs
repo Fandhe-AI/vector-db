@@ -119,6 +119,10 @@ fn seed_corpus(storage: &Storage, table: &str, tenant: &str) {
                 Value::Text(format!("body-{}", row.id)),
                 Value::Text(row.lang.to_string()),
             ],
+            // 台帳の内容照合（TASK-101・RECOVER-10）は operation_id 単位でハッシュを
+            // 持つため、コーパス内の各行（内容が異なる）へ同一 operation_id を使い回すと
+            // 2 行目以降が `OperationIdContentMismatch` になる。行ごと・テーブルごとに
+            // 一意な operation_id を割り当てる。
             &op(&format!("seed-op-{table}-{}", row.id)),
         )
         .expect("insert row");
@@ -286,8 +290,9 @@ fn arbitrary_table_c4_hybrid_rrf_and_hybrid_syntax_forms_match_documents() {
                     Value::Text(body.to_string()),
                     Value::Text("en".to_string()),
                 ],
-                // seed_corpus と同じ理由（TASK-94・RECOVER-3）で行ごとに一意な
-                // `operation_id` を使う。
+                // 台帳の内容照合（TASK-101・RECOVER-10）は operation_id 単位でハッシュを
+                // 持つため、行ごとに内容が異なる本ループでは一意な operation_id を使う
+                // （table・id ごとに衝突しない値）。
                 &op(&format!("hybrid-seed-{table}-{id}")),
             )
             .expect("insert row");
@@ -473,8 +478,9 @@ fn setup_multi_tenant_table(storage: &Storage, table: &str) {
             row.id,
             row.visibility,
             &[Value::Vector(vec![1.0, 0.0])],
-            // seed_corpus と同じ理由（TASK-94・RECOVER-3）で行ごとに一意な
-            // `operation_id` を使う。
+            // 台帳の内容照合（TASK-101・RECOVER-10）は (tenant, table, operation_id)
+            // 単位でハッシュを持つため、テナントをまたいで内容が異なる本ループでは
+            // 一意な operation_id を使う。
             &op(&format!("rls-seed-{table}-{}", row.id)),
         )
         .expect("insert row");
@@ -655,19 +661,23 @@ fn arbitrary_table_ledger_scope_is_per_table_and_per_tenant() {
     assert_eq!(err.wire_code(), "23505");
 
     // 同一テーブル・同一テナントへの operation_id 自体の再送（op-shared を新規行
-    // id=2 へ再利用）。TASK-94・RECOVER-3（本 PR）が「同一 (tenant_id, table,
-    // operation_id) への 2 回目以降の書き込みを拒否する」契約を実装したため、
-    // 行 id が衝突しない場合でも 23505（重複 operation_id）で拒否される
-    // （以前は TASK-93 の keep-first のみで成功していたが、本 PR でその挙動が
-    // 変わった。PR #247 codex-review 指摘対応）。行が書き込まれていないこと・
-    // 台帳エントリが最初の op-shared 書き込みのまま変化しないことも確認する。
-    let resend_err = core
+    // id=2・異なる内容へ再利用）。TASK-93（本台帳）は「既存エントリを上書きしない
+    // （keep-first）」ことのみを契約とし、重複行 id 拒否（23505）は TASK-94・
+    // RECOVER-3 の管轄だが、内容照合（TASK-101・RECOVER-10）は operation_id 単位で
+    // 記録済みハッシュと比較するため、id・内容のいずれかが異なれば
+    // `OperationIdContentMismatch`（`22023`）として拒否される（`recovery/ledger.rs`
+    // モジュール冒頭ドキュメント参照。行 id 衝突とは独立した判定軸であることの確認。
+    // 同一内容の再送が `23505` になることは `tests/recovery_content_hash.rs` が
+    // 別途検証する）。
+    let err_content_mismatch = core
         .execute_insert_sql(
             &ctx_a,
             "INSERT INTO kb_articles (id, embedding, body) VALUES (2, '[0.3,0.3,0.3]', 'resend') USING OPERATION_ID 'op-shared'",
         )
-        .expect_err("resending an already-recorded operation_id must now be rejected (TASK-94・RECOVER-3)");
-    assert_eq!(resend_err.wire_code(), "23505");
+        .expect_err(
+            "resending an already-recorded operation_id with different content must be rejected",
+        );
+    assert_eq!(err_content_mismatch.wire_code(), "22023");
     assert_eq!(
         core.operation_recorded(&ctx_a, "kb_articles", &op("op-shared"))
             .expect("lookup ok"),

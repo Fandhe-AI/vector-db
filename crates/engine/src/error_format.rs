@@ -8,9 +8,10 @@
 //! 構造的に保証されない状態を防ぐことが目的。
 //!
 //! 収録範囲は「engine・wire-server が現に返している `wire_code`」に限る。未実装の分類は
-//! 実装タスク（wire 応答への写像は TASK-153、`operation_id` 内容照合は TASK-154）が
-//! 追加する。分類の定義そのものは spec 側の管理事項であり、本コメント・本モジュールへ
-//! 転記しない（`.claude/rules/spec-confidentiality.md`）。
+//! 実装タスク（wire 応答への写像は TASK-153）が追加する。分類の追加自体は TASK-101
+//! （`operation_id` 内容照合。RECOVER-10）で行い、「他分類へ写像しない」ことの正式検証は
+//! TASK-154 が担う。分類の定義そのものは spec 側の管理事項であり、本コメント・本モジュール
+//! へ転記しない（`.claude/rules/spec-confidentiality.md`）。
 //!
 //! 分類リストは [`define_error_classes`] マクロの 1 箇所のみで宣言し、`ErrorClass` の
 //! 定義・`ALL`・`wire_code`・`label` をそこから生成する。分類を追加・削除すると `ALL` の
@@ -68,7 +69,7 @@ macro_rules! define_error_classes {
 }
 
 define_error_classes! {
-    count = 14;
+    count = 15;
 
     /// 構文上受理された SQL の値・引数が不正（`22000`）。
     /// [`crate::sql::allowlist::SqlSurfaceError::InvalidInput`] の写像。
@@ -121,6 +122,12 @@ define_error_classes! {
     /// [`crate::sql::allowlist::SqlSurfaceError::NumericOutOfRange`]（SQL-13 の集計関数）
     /// の写像。
     NumericOutOfRange => ("22003", "NUMERIC_OUT_OF_RANGE"),
+    /// 台帳（TASK-93）に記録済みの `operation_id` へ、内容が異なる書き込みが再送された
+    /// （`22023`）。TASK-101（RECOVER-10）が追加。ハッシュ一致の証明が取れない場合は
+    /// 常にこちら側へ倒す（fail-closed。commit 済み確定の根拠にしない）。
+    /// [`crate::tenant::TenantWriteError::OperationIdContentMismatch`]・
+    /// [`crate::sql::allowlist::SqlSurfaceError::OperationIdContentMismatch`] の写像。
+    OperationIdContentMismatch => ("22023", "OPERATION_ID_CONTENT_MISMATCH"),
 }
 
 impl ErrorClass {

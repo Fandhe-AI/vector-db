@@ -1068,10 +1068,6 @@ pub(crate) fn execute_insert(
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
-        // 同一 `operation_id` の重複拒否（TASK-94・対象ビヘイビア: RECOVER-3）。
-        // `tenant::insert_typed_row_unchecked` が台帳の `RecordOutcome::AlreadyPresent`
-        // を写像した結果で、行キー衝突（`IdConflict`）とは別の固定文言を維持する。
-        TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
         // `tenant::insert_typed_row_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
         // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
@@ -1080,6 +1076,12 @@ pub(crate) fn execute_insert(
         // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示しておく
         // （TASK-92・対象ビヘイビア: RECOVER-1）。
         TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
+        // 台帳照合（TASK-101・RECOVER-10）: 同一 operation_id・同一内容の再送は
+        // `23505`、内容不一致（v1 レガシーエントリへの再送を含む）は `22023` へ
+        // 写像する。`_` 節（`XX000`）へ丸めると、再送検知の応答をクライアントが
+        // 判別できなくなる。
+        TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
+        TenantWriteError::OperationIdContentMismatch => SqlSurfaceError::OperationIdContentMismatch,
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
@@ -1194,11 +1196,14 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
         }
-        // ファイル形 `INSERT`（`replace_typed_rows_by_text_key` 経由）の同一
-        // `operation_id` 重複拒否（TASK-94・RECOVER-3）。行形 `INSERT`
-        // （`execute_insert`）と同じ写像に揃える。
+        // 台帳照合（TASK-101・RECOVER-10。TASK-94・RECOVER-3 の重複拒否契約を包含する）:
+        // ファイル形 INSERT（`replace_typed_rows_by_text_key` 経由）でも行形 INSERT
+        // （[`execute_insert`]）と同じ写像を適用する。`_` 節（`XX000`）へ丸めない。
         IncrementalError::Write(TenantWriteError::DuplicateOperationId) => {
             SqlSurfaceError::DuplicateOperationId
+        }
+        IncrementalError::Write(TenantWriteError::OperationIdContentMismatch) => {
+            SqlSurfaceError::OperationIdContentMismatch
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

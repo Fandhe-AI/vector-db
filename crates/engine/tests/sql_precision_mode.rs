@@ -643,7 +643,7 @@ fn tenant_a_precision_result_is_unaffected_by_tenant_b_private_row_existence() {
             1,
             Visibility::Public,
             &[Value::Vector(vec![0.5, 0.5, 0.0])],
-            &engine::recovery::required_op_id::OperationId::parse("test-op-1")
+            &engine::recovery::required_op_id::OperationId::parse("test-op-tenant-a")
                 .expect("valid operation_id"),
         )
         .expect("insert tenant-a row");

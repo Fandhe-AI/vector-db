@@ -275,15 +275,19 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
                 embedding: &[2.0; DIM as usize],
                 metadata: &[],
             };
+            // TASK-101（RECOVER-10）: この分岐は `row.tenant_id == ctx` の所有権検査を
+            // 通過するため台帳照合まで到達する。`target` ごとに内容ハッシュが変わる
+            // ため、同一 operation_id を使い回すと 2 回目以降が
+            // OperationIdContentMismatch になり、本テストが検証したい NotFound を
+            // 独立に確認できなくなる。イテレーションごとに一意の operation_id を使う。
+            let op_id = format!("test-op-update-{i}");
             let r = tenant::update_row(
                 &storage,
                 TABLE,
                 &attacker,
                 target,
                 &row,
-                // "test-op-breach"（seed_corpus の "test-op" とは別 id。上記 INSERT
-                // ループのコメント参照）。
-                &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
+                &engine::recovery::required_op_id::OperationId::parse(&op_id)
                     .expect("valid operation_id"),
             );
             assert!(matches!(r, Err(TenantWriteError::NotFound)));
@@ -319,13 +323,16 @@ fn recover4_write_breach_attempts_are_all_rejected_and_data_is_unchanged() {
         } else {
             victim_ids[(i as usize) % victim_ids.len()]
         };
+        // TASK-101（RECOVER-10）: delete は所有権検査を持たず台帳照合まで必ず到達する。
+        // `target` ごとに内容ハッシュ（id のみ）が変わるため、同一 operation_id を
+        // 使い回すと 2 回目以降が OperationIdContentMismatch になってしまう。
+        let op_id = format!("test-op-delete-{i}");
         let r = tenant::delete_row(
             &storage,
             TABLE,
             &attacker,
             target,
-            // "test-op-breach"（同上）。
-            &engine::recovery::required_op_id::OperationId::parse("test-op-breach")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         );
         assert!(matches!(r, Err(TenantWriteError::NotFound)));
@@ -548,9 +555,10 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.5; DIM as usize],
         metadata: &[],
     };
-    // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、`seed_corpus` が既に
-    // tenant-a/TABLE で使った "test-op" とは別の `operation_id` を、さらに
-    // insert/update/delete それぞれで別の値を使う。
+    // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で内容ハッシュを
+    // 持ち、insert/update/delete はそれぞれ異なる正規化入力を持つため、以下の
+    // insert/update/delete へ同一 operation_id を使い回すと 2 回目以降が
+    // OperationIdContentMismatch になる。操作ごとに別々の operation_id を使う。
     tenant::insert_row(
         &storage,
         TABLE,
@@ -630,8 +638,8 @@ fn recover4_owner_writes_succeed_so_the_guard_is_not_vacuous() {
         embedding: &[0.25; DIM as usize],
         metadata: &[],
     };
-    // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、insert/update/delete で
-    // それぞれ別の `operation_id` を使う。
+    // TASK-101（RECOVER-10）: insert/update/delete それぞれ別の operation_id を使う
+    // （上記と同じ理由）。
     let insert_op_id =
         OperationId::parse("op-engine-core-delegation-insert").expect("valid operation_id");
     let update_op_id =
