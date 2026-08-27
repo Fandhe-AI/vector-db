@@ -1,19 +1,29 @@
 //! 増分インデックス（ファイル形 `INSERT` → チャンク化 → `Embedder` によるベクトル化 →
-//! 置換書き込み）の**受け入れ基準**回帰テスト（TASK-121、対象ビヘイビア: INDEX-1, INDEX-2。
-//! ポインタ: `docs/spec/05-tasks.md` TASK-121・`docs/spec/04-behavior/indexing.md`
-//! INDEX-1, INDEX-2）。
+//! 置換書き込み）の回帰テスト（TASK-121、対象ビヘイビア: INDEX-1, INDEX-2。ポインタ:
+//! `docs/spec/05-tasks.md` TASK-121・`docs/spec/04-behavior/indexing.md` INDEX-1,
+//! INDEX-2）。
+//!
+//! **位置づけ（codex-review P1 指摘・PR #241 対応）**: INDEX-2（検索への反映）は
+//! private spec の受け入れ基準をそのまま固定する回帰テストである。一方 INDEX-1
+//! （性能）側は、private spec が定める数値基準・判定式を本テストへ転記しておらず
+//! （spec-confidentiality）、`RATIO_THRESHOLD_DENOM` はそれとは無関係な本テスト
+//! 固有の代替閾値でしかない。したがって `index1_*` は **INDEX-1 の受け入れ基準
+//! 充足を証明しない**プレースホルダ回帰テストであり、CLAUDE.md 等の対外的な
+//! ステータス表記でも「INDEX-1 受け入れ基準実装済み」と扱わないこと。private
+//! spec 側の数値基準を実際に反映するには、公開境界拡張手順（作成者以外のオーナー
+//! 承認、または作成者=管理者本人の場合の承認記録手段。ポインタ:
+//! `docs/design/`）を経る必要があり、本 PR のスコープでは行わない。
 //!
 //! `tests/incremental_index.rs`（TASK-120）は検索反映・置換セマンティクス・
 //! fail-closed 経路を単発挿入で検証し、`tests/incremental_write_perf.rs`（TASK-143・
 //! PERSIST-2）は `Storage::put_batch` **単体**（ストレージ層のみ）の増分/全体再構築比を
 //! 検証する。本ファイルはその間を埋め、`execute_insert_sql` のファイル形挿入
-//! **パイプライン全体**（チャンク化＋埋め込み＋書き込み。`InsertOutcome.incremental`
-//! が返す `IndexTiming`）を対象に、既存コーパスが積まれた状態での
-//! 「1 ファイル追加の性能」（INDEX-1）と「検索への反映」（INDEX-2）を固定する。
+//! **パイプライン全体**（チャンク化＋埋め込み＋行バッファ構築＋書き込み。
+//! `InsertOutcome.incremental` が返す `IndexTiming`）を対象に、既存コーパスが積まれた
+//! 状態での「1 ファイル追加の性能」の代替回帰指標（`index1_*`）と「検索への反映」
+//! （INDEX-2）を固定する。
 //!
-//! INDEX-1 が固定する数値基準・判定式は private spec 側の定義に従う（ポインタ:
-//! `docs/spec/04-behavior/indexing.md` INDEX-1。本文はここに転記しない）。「増分
-//! コストが既存コーパス規模 N に依存しない」ことは INDEX-1 の契約ではなく、本
+//! 「増分コストが既存コーパス規模 N に依存しない」ことは INDEX-1 の契約ではなく、本
 //! テストが検証する性質でもない。実装上、`tenant::replace_typed_rows_by_text_key`
 //! （同一パスの既存行を特定するための置換キー探索）はテナント名前空間内の既存行を
 //! 線形走査するため、増分 1 ファイルの所要時間は既存コーパス規模に対して線形に
@@ -260,11 +270,17 @@ fn measure_full_rebuild() -> Duration {
     median(durations)
 }
 
-// --- INDEX-1: 増分性能（既存コーパスへの 1 ファイル追加 vs 全体再構築） -----------
+// --- INDEX-1 代替指標: 増分性能プレースホルダ回帰（既存コーパスへの 1 ファイル
+// 追加 vs 全体再構築） ---------------------------------------------------------
 //
-// 対象時間はサーバー内部処理（チャンク化・埋め込み・redb 書き込み）のみで、
-// wire プロトコル転送時間は含めない（`InsertOutcome.incremental.timing` を直接使う
-// ため SQL 解析・束縛の時間もほぼ含まれない）。
+// このテストは INDEX-1 の受け入れ基準充足を証明しない（モジュールドキュメントの
+// 「位置づけ」節参照）。private spec の数値基準未反映のまま完了扱いにしないための
+// 位置づけ表記であり、実装・判定式自体はここでは変更しない。
+//
+// 対象時間はサーバー内部処理（チャンク化・埋め込み・行バッファ構築・redb 書き込み。
+// `IndexTiming.write` のドキュメンテーションコメント参照）のみで、wire プロトコル
+// 転送時間は含めない（`InsertOutcome.incremental.timing` を直接使うため SQL 解析・
+// 束縛の時間もほぼ含まれない）。
 //
 // 判定は「増分 1 ファイルの処理時間」対「全体再構築（`BASELINE_FILES + 1` 件を
 // 空 DB から構築）の総処理時間」の比を、`tests/incremental_write_perf.rs`
