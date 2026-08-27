@@ -1113,12 +1113,18 @@ impl EngineCore {
             for row in &rows {
                 let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
                 else {
-                    // 破損行は辞書構築をこの 1 行分だけ黙ってスキップする（recall
-                    // 側の安全劣化。テナント境界・可視性判定には関与しないため
-                    // fail-open ではない。モジュールドキュメント参照）。上記の
-                    // 世代再確認により、この分岐が並行スキーマ変更由来の食い違い
-                    // を隠す経路にはならない。
-                    continue;
+                    // デコード失敗行を黙ってスキップすると、内容を欠いた
+                    // `Dictionary` が `truncated: false` のまま正常なキャッシュ
+                    // エントリとして保存され、後続の LLM プランニングから完全な
+                    // スナップショットと区別できなくなる（PR #249 codex-review P1
+                    // 指摘）。データ破損は recall 側の安全劣化（切り詰め）とは
+                    // 性質が異なるため、fail-closed に構築全体を中止しキャッシュへ
+                    // 保存しない。他テナントのデータ・存在情報は含めない固定
+                    // メッセージで拒否する。
+                    return Err(CoreError::from(CatalogError::Invalid(
+                        "failed to decode a visible row while building dictionary snapshot"
+                            .to_string(),
+                    )));
                 };
                 let path = match values.get(path_idx) {
                     Some(crate::row_codec::Value::Text(s)) => s.as_str(),
@@ -2775,6 +2781,53 @@ mod tests {
             "stale な挿入は既存の新しいエントリを失わせてはならず、自身も追加されない"
         );
         assert_eq!(entries.entries[0].ctx, ctx_b);
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（PR #249 codex-review P1 指摘の回帰テスト）。
+    // 可視行の `metadata`（スカラー列ペイロード）が `path`/`body`（非 nullable Text）
+    // をデコードできないほど破損している場合、その行を黙ってスキップして内容を
+    // 欠いた `Dictionary` を `truncated: false` のまま正常なキャッシュエントリと
+    // して保存してはならない。`dictionary_snapshot` がエラーを返し、かつ
+    // `DictionaryCache` にエントリが残らないことを確認する。
+    #[test]
+    fn dictionary_snapshot_fails_closed_on_corrupted_row_and_does_not_cache_it() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&documents_schema())
+            .expect("create table");
+        // `path`/`body` の presence タグすら読めない空のスカラーペイロード
+        // （`row_codec::scan_scalar_columns` は非 nullable 列の途中で打ち切られた
+        // バッファを `RowCodecError::Invalid` として拒否する）。
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert corrupted row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let err = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect_err("corrupted visible row must fail dictionary snapshot construction");
+        assert!(matches!(err, CoreError::Catalog(CatalogError::Invalid(_))));
+
+        let guard = core
+            .dictionary_cache
+            .state
+            .read()
+            .expect("cache lock not poisoned");
+        assert_eq!(
+            guard.entries.len(),
+            0,
+            "a failed build must not leave a cache entry behind"
+        );
     }
 
     // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
