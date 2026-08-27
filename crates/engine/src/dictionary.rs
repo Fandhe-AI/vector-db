@@ -453,8 +453,11 @@ fn cap_btreeset<T: Ord>(mut set: BTreeSet<T>, max: usize) -> (BTreeSet<T>, bool)
 }
 
 /// 単一ファイル（`path`）分の抽出単位（1 つ以上のチャンク本文）を積み上げる
-/// 増分ビルダー（TASK-109）。`core.rs::DictionaryCache` はテーブル走査で得た行を
-/// パス単位にグルーピングしたうえで、各行本文をこのビルダーへ渡す。
+/// 増分ビルダー（TASK-109）。`core.rs::EngineCore::dictionary_snapshot` はテーブル
+/// 走査で得た行を `path` 単位に事前グルーピングはせず、可視行を走査順に 1 行ずつ
+/// `(path, body)` として本ビルダーへ渡す（同一 `path` の行が複数あれば `ingest` が
+/// その都度呼ばれる。`ingest` 自体が呼び出し側の分割粒度に依存しない設計のため、
+/// グルーピングの有無は抽出結果に影響しない）。
 ///
 /// `config` は構築時（[`DictionaryBuilder::new`]）に固定して保持する。`ingest`・
 /// `finish` を別々の `&DictionaryConfig` で呼び分けられる構造だと、蓄積済みの
