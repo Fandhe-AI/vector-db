@@ -737,7 +737,8 @@ pub(crate) fn insert_typed_row_unchecked(
             })
             .filter_map(|(idx, column)| values.get(idx).map(|value| (column.name.as_str(), value)))
             .collect();
-        let content_hash = content_hash::for_typed_insert(id, &embedding, &named_columns)?;
+        let content_hash =
+            content_hash::for_typed_insert(id, visibility, &embedding, &named_columns)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),

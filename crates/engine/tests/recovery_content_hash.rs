@@ -120,6 +120,66 @@ fn insert_resend_same_content_is_23505_and_different_content_is_22023() {
     );
 }
 
+// --- 型付き INSERT（公開 API `engine::tenant::insert_typed_row` 経由）: 同一
+//     operation_id・同一内容だが visibility のみ異なる再送は、内容一致の
+//     23505 ではなく内容不一致の 22023 として区別できなければならない
+//     （codex-review P1・cursor bugbot 指摘・PR #248 の回帰固定。SQL 表層の
+//     `INSERT` 文は visibility を常に `Private` に固定するため公開 API を直接
+//     呼んで検証する。`sql::exec` のドキュメント参照）。
+#[test]
+fn typed_insert_resend_with_different_visibility_is_22023_not_23505() {
+    let path = unique_db_path("content-hash-typed-insert-visibility");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+
+    let values = vec![
+        engine::row_codec::Value::Vector(vec![0.1, 0.2, 0.3]),
+        engine::row_codec::Value::Text("a".to_string()),
+    ];
+
+    engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        Visibility::Public,
+        &values,
+        &op("op-vis"),
+    )
+    .expect("first insert must succeed");
+
+    // 同一 operation_id・同一内容・visibility のみ Public→Private → 22023
+    // （23505 = 内容一致の重複、と誤判定してはならない）。
+    let mismatch_err = engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        Visibility::Private,
+        &values,
+        &op("op-vis"),
+    )
+    .expect_err("visibility-only resend must be rejected as content mismatch");
+    assert_eq!(mismatch_err.wire_code(), "22023");
+
+    // 副作用ゼロ: 行は Public のまま（Private への昇格が誤って成立していない）。
+    let mismatch_err2 = engine::tenant::insert_typed_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        Visibility::Private,
+        &values,
+        &op("op-vis"),
+    )
+    .expect_err("resend must still be rejected on repeat");
+    assert_eq!(mismatch_err2.wire_code(), "22023");
+}
+
 // --- UPDATE: 対象行が既に削除済み（NotFound になりうる状態）でも、台帳照合が
 //     先行するため再送検知（23505/22023）が機能する（TASK-101 の順序反転の核心）。
 

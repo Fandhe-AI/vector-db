@@ -203,8 +203,8 @@ pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHa
     Ok(b.finish())
 }
 
-/// `insert_typed_row_unchecked` 用（TASK-101 対象経路 3）。入力: `id`・`VECTOR` 列の
-/// 埋め込み・非 `VECTOR` 列の（列名, 値）ペア列（`Value::Null` は
+/// `insert_typed_row_unchecked` 用（TASK-101 対象経路 3）。入力: `id`・`visibility`・
+/// `VECTOR` 列の埋め込み・非 `VECTOR` 列の（列名, 値）ペア列（`Value::Null` は
 /// [`push_named_scalar_columns`] が除外する）。操作種別タグは [`OpTag::Insert`] を
 /// 共有する（行形 `INSERT` と宣言的 `INSERT` は同じ「新規挿入」操作であり、経路の
 /// 違いでハッシュ空間を分ける必要がない）。
@@ -215,13 +215,23 @@ pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHa
 /// ドキュメント参照）。呼び出し元 `tenant::insert_typed_row_unchecked` は
 /// `values`（`sql::parser::bind_insert` が現在のスキーマ幅で構築した配列）から
 /// 列名付きペアを組み立てて渡す。
+///
+/// `visibility` はハッシュ入力に明示的に含める（codex-review P1・cursor bugbot
+/// 指摘・PR #248: `insert_typed_row_unchecked` が実際に永続化する行には
+/// `visibility` が含まれるが、旧実装では `id`・embedding・非 `VECTOR` 列しか
+/// ハッシュへ渡していなかった。そのため同一 `(tenant, table, operation_id)` で
+/// 内容は同一のまま `visibility` だけを変えた再送が、内容不一致の `22023` では
+/// なく内容一致の `23505` と誤判定されてしまう。`for_replace_by_text_key` と
+/// 同様に [`crate::storage::Visibility::to_byte`] で 1 バイトへ写像して連結する）。
 pub(crate) fn for_typed_insert(
     id: u64,
+    visibility: Visibility,
     embedding: &[f32],
     columns: &[(&str, &Value)],
 ) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::Insert);
     b.push_u64(id);
+    b.push_u8(visibility.to_byte());
     push_vector(&mut b, embedding)?;
     push_named_scalar_columns(&mut b, columns)?;
     Ok(b.finish())
@@ -597,11 +607,11 @@ mod tests {
         let embedding = [1.0_f32, 2.0, 3.0];
         let title = Value::Text("hello".to_string());
         let before: [(&str, &Value); 1] = [("title", &title)];
-        let h_before = for_typed_insert(7, &embedding, &before).expect("hash");
+        let h_before = for_typed_insert(7, Visibility::Public, &embedding, &before).expect("hash");
 
         let null_note = Value::Null;
         let after: [(&str, &Value); 2] = [("title", &title), ("note", &null_note)];
-        let h_after = for_typed_insert(7, &embedding, &after).expect("hash");
+        let h_after = for_typed_insert(7, Visibility::Public, &embedding, &after).expect("hash");
 
         assert_eq!(h_before, h_after);
     }
@@ -615,8 +625,21 @@ mod tests {
         let title_b = Value::Text("world".to_string());
         let cols_a: [(&str, &Value); 1] = [("title", &title_a)];
         let cols_b: [(&str, &Value); 1] = [("title", &title_b)];
-        let h1 = for_typed_insert(7, &embedding, &cols_a).expect("hash");
-        let h2 = for_typed_insert(7, &embedding, &cols_b).expect("hash");
+        let h1 = for_typed_insert(7, Visibility::Public, &embedding, &cols_a).expect("hash");
+        let h2 = for_typed_insert(7, Visibility::Public, &embedding, &cols_b).expect("hash");
         assert_ne!(h1, h2);
+    }
+
+    // codex-review P1・cursor bugbot 指摘（PR #248）の回帰固定: visibility のみが
+    // 異なる再送は、内容一致（23505）ではなく内容不一致（22023）として区別できな
+    // ければならない（RECOVER-10 の内容照合契約）。
+    #[test]
+    fn for_typed_insert_differs_by_visibility() {
+        let embedding = [1.0_f32, 2.0, 3.0];
+        let title = Value::Text("hello".to_string());
+        let cols: [(&str, &Value); 1] = [("title", &title)];
+        let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
+        let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
+        assert_ne!(h_public, h_private);
     }
 }
