@@ -993,8 +993,20 @@ impl EngineCore {
     /// （[`crate::dictionary::DictionaryConfig`]）を差し替えたビルダーを返す
     /// （[`Self::with_precision_policy`] と同じ流儀。未呼び出しなら
     /// `DictionaryConfig::default()`）。
+    ///
+    /// `dictionary_cache`（[`DictionaryCache`]）も同時に再初期化する（PR #249
+    /// codex-review P1 指摘対応）。`DictionaryCache` のキャッシュキーは
+    /// `(table, ctx)` と `storage.current_generation()` のみで、設定値
+    /// （`enable_file_tree`・`enable_term_index`・`top_terms` 等）を含まない。
+    /// 設定だけを差し替えて既存キャッシュを温存すると、`dictionary_snapshot` を
+    /// 一度でも呼んだ後に本メソッドで設定変更しても、書き込みで世代が進むまでは
+    /// 旧設定で構築した `Arc<Dictionary>` を返し続けてしまう。設定変更は稀な操作
+    /// のため、キャッシュ全体を破棄して次回参照時に新設定で再構築させる単純な
+    /// 方針を採る（fail-closed。古い設定の結果を新設定のものとして黙って返す
+    /// 経路を残さない）。
     pub fn with_dictionary_config(mut self, config: crate::dictionary::DictionaryConfig) -> Self {
         self.dictionary_config = config;
+        self.dictionary_cache = DictionaryCache::new();
         self
     }
 
@@ -2854,6 +2866,82 @@ mod tests {
             guard.entries.len(),
             0,
             "a failed build must not leave a cache entry behind"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-109・PLAN-5（PR #249 codex-review P1 指摘の回帰テスト）。
+    // `with_dictionary_config` は `dictionary_config` を差し替えるだけでは足りず、
+    // 既構築の `dictionary_cache` も再初期化しなければならない。`(table, ctx)` と
+    // `storage.current_generation()` のみをキーにするキャッシュは設定値を含まない
+    // ため、世代が変わらない限り旧設定で構築した `Arc<Dictionary>` を返し続けて
+    // しまう（設定変更が効かない見えないバグ）。
+    #[test]
+    fn with_dictionary_config_invalidates_stale_cache_entries() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        let schema = documents_schema();
+        core.storage.create_table(&schema).expect("create table");
+        let values = vec![
+            crate::row_codec::Value::Null,
+            crate::row_codec::Value::Text("src/example.rs".to_string()),
+            crate::row_codec::Value::Text("fn one() {}\nfn two() {}\n".to_string()),
+        ];
+        let metadata =
+            crate::row_codec::encode_scalar_columns(&schema, &values).expect("encode metadata");
+        core.storage
+            .insert_row_into_table(
+                "documents",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &metadata,
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 既定設定（ファイルツリーを有効）で一度構築し、キャッシュへ載せておく。
+        let dict_before = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect("dictionary snapshot ok before config change");
+        assert!(!dict_before.file_tree.paths.is_empty());
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            1
+        );
+
+        // ファイルツリーを無効化する設定へ差し替える。世代は変わっていないため、
+        // キャッシュを再初期化していなければ次の呼び出しが旧設定の
+        // `Arc<Dictionary>` をそのまま返してしまう。
+        let core = core.with_dictionary_config(crate::dictionary::DictionaryConfig {
+            enable_file_tree: false,
+            enable_term_index: false,
+            ..crate::dictionary::DictionaryConfig::default()
+        });
+        assert_eq!(
+            core.dictionary_cache
+                .state
+                .read()
+                .expect("cache lock not poisoned")
+                .entries
+                .len(),
+            0,
+            "with_dictionary_config must invalidate the existing dictionary cache"
+        );
+
+        let dict_after = core
+            .dictionary_snapshot(&ctx, "documents")
+            .expect("dictionary snapshot ok after config change");
+        assert!(
+            dict_after.file_tree.paths.is_empty(),
+            "the new config (file tree disabled) must take effect, not a stale cached dictionary"
         );
     }
 
