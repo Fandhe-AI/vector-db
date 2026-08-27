@@ -285,7 +285,7 @@ fn dictionary_snapshot_cache_hit_returns_same_arc_without_rescanning() {
     );
 }
 
-// --- 補助情報源の無効化: PLAN-5 対応（シンボル辞書は必須実装） --------------------
+// --- config フラグによる情報源の無効化（シンボル辞書には無効化スイッチが無い） ----
 
 #[test]
 fn dictionary_config_disables_only_auxiliary_sources() {

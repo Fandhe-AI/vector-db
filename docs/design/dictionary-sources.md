@@ -1,7 +1,7 @@
-# ADR: 辞書的情報源の必須／補助区分と世代整合キャッシュによる連動
+# ADR: 辞書的情報源抽出と世代整合キャッシュによる連動
 
 - ステータス: Accepted（TASK-109 で実装済み）
-- 対応: TASK-109（MS-4・対象ビヘイビア: PLAN-5）
+- 対応: TASK-109（MS-4・対象ビヘイビア: PLAN-5。詳細は private spec 側）
 - 反映先（実装・テスト）: `crates/engine/src/dictionary.rs`・
   `crates/engine/src/core.rs::DictionaryCache`・
   `crates/engine/tests/dictionary.rs`
@@ -12,19 +12,12 @@
 
 LLM クエリプランニング（TASK-110 以降）が固定接頭辞コンテキストとして使う
 「辞書的情報源」を、DB に索引化済みのコーパスから機械抽出するモジュールを実装する。
-必須・補助の情報源区分は README.md「実装方針（要点）」・PLAN-5（対応ビヘイビア。
-詳細は private spec 側）で公開済みの範囲に従う。
+情報源の区分・抽出範囲の詳細は private spec 側（TASK-109・PLAN-5）の対象であり、
+本 ADR では実装（`crates/engine/src/dictionary.rs` 等）に閉じた設計判断のみを記す。
 
 ## 決定事項
 
-### 1. シンボル辞書は必須実装、ファイルツリー・用語索引は補助情報源
-
-`DictionaryConfig` にはファイルツリー（`enable_file_tree`）・用語索引
-（`enable_term_index`）の無効化フラグのみを持たせ、シンボル辞書には無効化
-スイッチを設けない。新しい情報源の追加は `DictionarySourceKind` へのバリアント
-追加＋対応する抽出関数 1 つの追加で完結する構造とする（段階的追加可能な設計）。
-
-### 2. 依存を追加せず手書きの行パーサ・軽量トークナイザで実装する
+### 1. 依存を追加せず手書きの行パーサ・軽量トークナイザで実装する
 
 dependency-policy（依存最小・ユーザー承認制）に従い、regex 等の新規クレートを
 追加しない。シンボル抽出は行頭定義（`fn`/`struct`/`enum`/`trait`/`impl`/`mod`/
@@ -38,7 +31,7 @@ dependency-policy（依存最小・ユーザー承認制）に従い、regex 等
 辞書は LLM への補助コンテキストであり、過検出は recall 側の安全な劣化に留まり
 認可・可視性判定には関与しない。
 
-### 3. 増分インデックスとの連動は世代整合キャッシュ（post-commit フック不使用）
+### 2. 増分インデックスとの連動は世代整合キャッシュ（post-commit フック不使用）
 
 `core::DictionaryCache` は `core::PrefilterCache`（TASK-169）と同一の失効規約
 （`(table, ctx)` キー・`storage.current_generation()` との不一致で破棄・
@@ -61,7 +54,7 @@ post-commit フックを持たない構成にしたのは以下の理由によ�
 単位の精密な失効は持たない。これは意図的な単純化であり、誤って古い辞書を返す
 経路（fail-open）よりも安全側（過剰な再構築）に倒す設計判断である。
 
-### 4. `path`/`body` 列を持たないテーブルは固定英語メッセージで拒否する
+### 3. `path`/`body` 列を持たないテーブルは固定英語メッセージで拒否する
 
 新規 `CoreError` variant は追加せず、既存の `CatalogError::Invalid` を用いる
 （`wire_code` 写像・`wire-server` 側の網羅的 match への影響を避ける）。エラー

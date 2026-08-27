@@ -7,10 +7,10 @@
 //! `sparse.rs` と同じ流儀で storage / catalog / policy へは結線しない（行データの
 //! 取得・世代整合キャッシュとの結線は `core.rs::DictionaryCache` の責務）。
 //!
-//! PLAN-5 の設計要件により、シンボル辞書は**必須実装**（無効化スイッチを持たない）、
-//! ファイルツリー・用語索引は [`DictionaryConfig`] のフラグで無効化できる**補助情報源**
-//! として区別する。新しい情報源の追加は [`DictionarySourceKind`] へのバリアント追加＋
-//! 抽出関数 1 つの追加で完結する構造にする（段階的追加可能な設計）。
+//! シンボル辞書は [`DictionaryConfig`] に無効化スイッチを持たず常に抽出する。
+//! ファイルツリー・用語索引は同 config のフラグで無効化できる。新しい情報源の
+//! 追加は [`DictionarySourceKind`] へのバリアント追加＋抽出関数 1 つの追加で
+//! 完結する構造にする（段階的追加可能な設計）。
 //!
 //! 依存は追加しない（dependency-policy: regex 等の新規クレートは不可）ため、シンボル
 //! 抽出・トークナイズはいずれも手書きの行パーサ／文字走査で実装する。`sparse.rs`
@@ -95,15 +95,15 @@ pub fn detect_source_kind(path: &str) -> SourceFileKind {
     }
 }
 
-/// 段階的に追加可能な辞書的情報源の種別（PLAN-5 の設計要件）。新規情報源の追加は
+/// 段階的に追加可能な辞書的情報源の種別。新規情報源の追加は
 /// このバリアント追加＋対応する抽出関数の追加で完結する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DictionarySourceKind {
-    /// シンボル辞書（必須実装。[`DictionaryConfig`] に無効化スイッチを持たない）。
+    /// シンボル辞書（[`DictionaryConfig`] に無効化スイッチを持たない）。
     SymbolDict,
-    /// ファイルツリー（補助情報源。[`DictionaryConfig::enable_file_tree`]）。
+    /// ファイルツリー（[`DictionaryConfig::enable_file_tree`] で無効化可能）。
     FileTree,
-    /// 用語索引（補助情報源。[`DictionaryConfig::enable_term_index`]）。
+    /// 用語索引（[`DictionaryConfig::enable_term_index`] で無効化可能）。
     TermIndex,
 }
 
@@ -243,9 +243,9 @@ fn parse_definition_line(line: &str) -> Option<(SymbolKind, String)> {
     Some((kind, name))
 }
 
-/// 1 抽出単位（`path` の 1 チャンク本文 `body`）から Rust シンボルを抽出する
-/// （必須実装。PLAN-5）。戻り値の `bool` は [`MAX_SYMBOLS_PER_UNIT`] 超過による
-/// 決定的切り詰めが発生したかを示す。
+/// 1 抽出単位（`path` の 1 チャンク本文 `body`）から Rust シンボルを抽出する。
+/// 戻り値の `bool` は [`MAX_SYMBOLS_PER_UNIT`] 超過による決定的切り詰めが
+/// 発生したかを示す。
 ///
 /// 行番号はこの抽出単位内でのローカルな 1 起点行番号であり、チャンク化
 /// （`chunking.rs`）により本文が複数チャンクへ分割されている場合、元ファイル全体での
@@ -394,13 +394,13 @@ fn extract_markdown_terms(body: &str) -> BTreeMap<String, u64> {
     freq
 }
 
-/// 抽出パイプラインの設定（PLAN-5）。シンボル辞書には無効化スイッチを持たせない
-/// （必須実装であることを型・設定面で保証する）。
+/// 抽出パイプラインの設定。シンボル辞書には無効化スイッチを持たせない
+/// （常に構築されることを型・設定面で保証する）。
 #[derive(Debug, Clone)]
 pub struct DictionaryConfig {
-    /// ファイルツリー情報源を有効化するか（補助情報源）。
+    /// ファイルツリー情報源を有効化するか。
     pub enable_file_tree: bool,
-    /// 用語索引情報源を有効化するか（補助情報源）。
+    /// 用語索引情報源を有効化するか。
     pub enable_term_index: bool,
     /// 用語索引が保持する上位語数。
     pub top_terms: usize,
@@ -531,7 +531,7 @@ impl DictionaryBuilder {
         let unit_seq = self.next_unit_seq;
         self.next_unit_seq = self.next_unit_seq.saturating_add(1);
 
-        // シンボル辞書は必須実装（PLAN-5）。ソース種別に関わらず常に試みる
+        // シンボル辞書には無効化スイッチが無いため、ソース種別に関わらず常に試みる
         // （Rust 以外は行頭が予約語と一致しない限り検出されず実質空になる）。
         match detect_source_kind(path) {
             SourceFileKind::Rust => {
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn builder_symbol_dict_is_always_populated_even_when_auxiliary_sources_disabled() {
-        // PLAN-5 対応テスト: シンボル辞書は必須実装であり、補助情報源
+        // シンボル辞書には無効化スイッチが無いため、他の情報源
         // （ファイルツリー・用語索引）を無効化してもシンボル辞書だけは構築される。
         let config = DictionaryConfig {
             enable_file_tree: false,
