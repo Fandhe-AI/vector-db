@@ -238,7 +238,12 @@ fn arbitrary_table_c3_visible_predicate_does_not_change_result() {
             "SELECT * FROM kb_articles WHERE visible() ORDER BY embedding <=> '[1.0,0.0]' LIMIT 5",
         )
         .expect("with visible() should succeed");
-    assert_eq!(result_ids(&no_visible), result_ids(&with_visible));
+    // 独立オラクル: SEED_ROWS の embedding は問い合わせベクトル [1.0,0.0] からの
+    // 距離が id の昇順（1 が最近傍・5 が最遠）になるよう構成済みのため、期待順は
+    // 固定順 [1,2,3,4,5] に確定する（空集合同士の一致で通過する検証にしない）。
+    let expected = vec![1u64, 2, 3, 4, 5];
+    assert_eq!(result_ids(&no_visible), expected);
+    assert_eq!(result_ids(&with_visible), expected);
 }
 
 #[test]
@@ -315,6 +320,21 @@ fn arbitrary_table_c4_hybrid_rrf_and_hybrid_syntax_forms_match_documents() {
         result_ids(&documents_fn),
         "arbitrary table hybrid result must match documents"
     );
+    // 独立オラクル: id=1 は問い合わせベクトル [1.0,0.0] に対する厳密最近傍（距離 0）
+    // であり、かつ問い合わせキーワード「vector database」を本文にそのまま含む
+    // ため、ベクトル順位・テキスト順位のいずれでも最上位（rank=1）を占め、RRF 融合
+    // 後も先頭に来ることが確定する。相互比較のみで空集合同士も一致してしまう
+    // vacuous pass を防ぐため、絶対件数・先頭要素を明示検証する。
+    assert!(
+        !result_ids(&documents_fn).is_empty(),
+        "hybrid_rrf must return at least one row for this corpus"
+    );
+    assert_eq!(
+        result_ids(&documents_fn).first(),
+        Some(&1u64),
+        "id=1 is the closest vector match and contains the exact keyword phrase, \
+         so it must rank first after RRF fusion"
+    );
 }
 
 // --- 2. 評価順序（SQL-7 契約の任意テーブル適用） -----------------------------------
@@ -375,6 +395,17 @@ fn arbitrary_table_distance_leading_may_under_fetch_but_never_returns_mismatched
             .execute_sql(&ctx, &sql_with_hint(base, Some(hint)))
             .unwrap_or_else(|e| panic!("hint={hint:?} execution should succeed: {e}"));
         assert!(result.rows.len() <= 2, "hint={hint:?} exceeded limit");
+        // 独立オラクル: 問い合わせベクトル [1.0,0.0] に対する距離上位 2 件（id=1,2）は
+        // 共に lang='en'（WHERE lang='ja' に不一致）であるようコーパスを構成済み。
+        // DISTANCE 段が先に limit=2 件を確定させると事後スカラーフィルタで 0 件まで
+        // 減ることが確定するため、0 行を明示検証する（`sql_evaluation_order.rs` の
+        // 同型テストと同じ方式）。これにより空集合が無条件で通過する vacuous pass を
+        // 防ぐ。
+        assert_eq!(
+            result_ids(&result),
+            Vec::<u64>::new(),
+            "hint={hint:?}: distance-leading order must expose under-fetch for this corpus"
+        );
         for row in &result.rows {
             let lang_cell = row.cells.last().expect("lang cell present");
             assert_eq!(
@@ -481,6 +512,15 @@ fn arbitrary_table_rls_no_disallowed_row_leaks_across_all_six_orders() {
                 );
                 assert_ne!(id, 4, "tenant-b Private row must never leak: sql={sql:?}");
             }
+            // 下限アサーション: LIMIT 10 に対しコーパスは 4 行のみ・スカラー述語も
+            // 距離順によるオーバーサンプルの余地もないため、許可される 3 件
+            // （id=1,2,3）は必ず全件返る。空集合が無条件で通過する vacuous pass を
+            // 防ぐため、否定的チェックだけでなく実際の返却集合を厳密一致で検証する。
+            let actual: std::collections::HashSet<u64> = result_ids(&result).into_iter().collect();
+            assert_eq!(
+                actual, allowed,
+                "expected exactly the allowed set to be returned: sql={sql:?}"
+            );
         }
     }
 }
