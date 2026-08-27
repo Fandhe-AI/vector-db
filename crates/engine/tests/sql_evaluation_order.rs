@@ -58,6 +58,7 @@ fn setup_lang_corpus(storage: &Storage) {
         let ctx =
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        let op_id = format!("test-op-{id}");
         engine::tenant::insert_typed_row(
             storage,
             "docs",
@@ -65,7 +66,7 @@ fn setup_lang_corpus(storage: &Storage) {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .expect("insert row");
@@ -193,6 +194,7 @@ fn setup_multi_tenant_table(storage: &Storage) {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        let op_id = format!("test-op-{id}");
         engine::tenant::insert_typed_row(
             storage,
             "docs",
@@ -200,7 +202,7 @@ fn setup_multi_tenant_table(storage: &Storage) {
             id,
             visibility,
             &[Value::Vector(vec![1.0, 0.0])],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .expect("insert row");
@@ -322,6 +324,7 @@ fn hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders() {
         let ctx =
             PolicyContext::with_visibilities(row.tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        let op_id = format!("test-op-{}", row.id);
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -329,7 +332,7 @@ fn hybrid_search_succeeds_and_stays_rls_clean_across_all_six_orders() {
             row.id,
             row.visibility,
             &[Value::Vector(row.embedding.to_vec()), value],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .expect("insert row");

@@ -116,6 +116,10 @@ fn ext1_insert_and_read_back_768_dim_rows() {
     let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant");
     let embeddings: Vec<Vec<f32>> = (0..20u32).map(|i| make_embedding(768, i + 1)).collect();
     for (i, embedding) in embeddings.iter().enumerate() {
+        // TASK-101（RECOVER-10）: 台帳は operation_id ごとに内容ハッシュを持つため、
+        // 内容の異なる複数行へ同一 operation_id を使い回すと 2 件目以降が
+        // OperationIdContentMismatch で拒否される。行ごとに一意の operation_id を使う。
+        let op_id = format!("test-op-{i}");
         engine::tenant::insert_row(
             &storage,
             "docs",
@@ -127,7 +131,7 @@ fn ext1_insert_and_read_back_768_dim_rows() {
                 embedding,
                 metadata: b"m",
             },
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .unwrap_or_else(|e| panic!("tenant::insert_row failed for id={i}: {e}"));

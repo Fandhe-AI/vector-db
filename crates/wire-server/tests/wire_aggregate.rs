@@ -75,7 +75,7 @@ fn new_core_aggregate_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse("test-op-public")
                 .expect("valid operation_id"),
         )
         .expect("insert public row");
@@ -96,7 +96,7 @@ fn new_core_aggregate_docs() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
             id,
             Visibility::Private,
             &[Value::Vector(emb.to_vec()), Value::Text("xx".to_string())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse("test-op-private")
                 .expect("valid operation_id"),
         )
         .expect("insert private row");

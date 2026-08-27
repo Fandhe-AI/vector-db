@@ -229,6 +229,9 @@ fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
         let ctx =
             PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        // TASK-101（RECOVER-10）: 上の public_rows ループで同一テナントが既に
+        // "test-op" を使用しているため、別内容の再利用は OperationIdContentMismatch
+        // になる。別の operation_id を使う。
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -240,7 +243,7 @@ fn seed_aggregate_three_tenant_db() -> (PathBuf, temp_db::CleanupGuard) {
                 Value::Text(lang.to_string()),
                 Value::Text("private body".to_string()),
             ],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse("test-op-private")
                 .expect("valid operation_id"),
         )
         .expect("insert private row");

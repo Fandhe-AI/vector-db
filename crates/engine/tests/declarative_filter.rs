@@ -54,6 +54,10 @@ fn setup_single_tenant_table(storage: &Storage, rows: &[(u64, [f32; 2], &str, &s
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     for (id, emb, path, kind, lang) in rows {
+        // TASK-101（RECOVER-10）: 台帳は operation_id ごとに内容ハッシュを持つため、
+        // 内容の異なる複数行へ同一 operation_id を使い回すと 2 件目以降が
+        // OperationIdContentMismatch で拒否される。行ごとに一意の operation_id を使う。
+        let op_id = format!("test-op-{id}");
         engine::tenant::insert_typed_row(
             storage,
             "docs",
@@ -67,7 +71,7 @@ fn setup_single_tenant_table(storage: &Storage, rows: &[(u64, [f32; 2], &str, &s
                 Value::Text((*lang).to_string()),
                 Value::Null,
             ],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation id"),
         )
         .expect("insert row");

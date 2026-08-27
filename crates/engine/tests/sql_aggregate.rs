@@ -98,6 +98,11 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
             let ctx =
                 PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                     .expect("valid tenant");
+            // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で内容
+            // ハッシュを持つため、同一テナント・同一テーブル内で内容の異なる複数行へ
+            // 同一 operation_id を使い回すと 2 件目以降が OperationIdContentMismatch
+            // で拒否される。行ごとに一意の operation_id を使う。
+            let op_id = format!("test-op-{id}");
             engine::tenant::insert_typed_row(
                 storage,
                 TABLE,
@@ -105,7 +110,7 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
                 id,
                 visibility,
                 &[Value::Vector(emb.clone()), Value::Text(lang.to_string())],
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
+                &engine::recovery::required_op_id::OperationId::parse(&op_id)
                     .expect("valid operation_id"),
             )
             .expect("insert row");

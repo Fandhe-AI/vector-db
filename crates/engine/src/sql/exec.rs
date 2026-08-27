@@ -1073,6 +1073,12 @@ pub(crate) fn execute_insert(
         // `TenantWriteError` の網羅性を保ち、`23502` を返す正しい写像を明示しておく
         // （TASK-92・対象ビヘイビア: RECOVER-1）。
         TenantWriteError::MissingOperationId => SqlSurfaceError::MissingOperationId,
+        // 台帳照合（TASK-101・RECOVER-10）: 同一 operation_id・同一内容の再送は
+        // `23505`、内容不一致（v1 レガシーエントリへの再送を含む）は `22023` へ
+        // 写像する。`_` 節（`XX000`）へ丸めると、再送検知の応答をクライアントが
+        // 判別できなくなる。
+        TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
+        TenantWriteError::OperationIdContentMismatch => SqlSurfaceError::OperationIdContentMismatch,
         TenantWriteError::Catalog(CatalogError::TableNotFound(name)) => {
             SqlSurfaceError::UndefinedTable { name }
         }
@@ -1186,6 +1192,15 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         }
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
+        }
+        // 台帳照合（TASK-101・RECOVER-10）: ファイル形 INSERT（`replace_typed_rows_by_text_key`
+        // 経由）でも行形 INSERT（[`execute_insert`]）と同じ写像を適用する。`_` 節
+        // （`XX000`）へ丸めない。
+        IncrementalError::Write(TenantWriteError::DuplicateOperationId) => {
+            SqlSurfaceError::DuplicateOperationId
+        }
+        IncrementalError::Write(TenantWriteError::OperationIdContentMismatch) => {
+            SqlSurfaceError::OperationIdContentMismatch
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

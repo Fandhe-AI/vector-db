@@ -62,6 +62,7 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
         let ctx =
             PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
                 .expect("valid tenant");
+        let op_id = format!("test-op-{id}");
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -69,7 +70,7 @@ fn new_core_with_docs() -> (EngineCore, CleanupGuard) {
             *id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .expect("insert row");
@@ -350,6 +351,7 @@ fn equality_predicate_and_expr_predicate_combine_in_the_same_where_clause() {
         (3, [0.0, 0.0, 1.0], "ja"), // lang=ja だが norm=1 → 除外
     ];
     for (id, emb, lang) in corpus {
+        let op_id = format!("test-op-{id}");
         engine::tenant::insert_typed_row(
             &storage,
             "docs",
@@ -357,7 +359,7 @@ fn equality_predicate_and_expr_predicate_combine_in_the_same_where_clause() {
             id,
             Visibility::Public,
             &[Value::Vector(emb.to_vec()), Value::Text(lang.to_string())],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
+            &engine::recovery::required_op_id::OperationId::parse(&op_id)
                 .expect("valid operation_id"),
         )
         .expect("insert row");
