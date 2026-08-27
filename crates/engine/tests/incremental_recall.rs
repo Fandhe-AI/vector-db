@@ -3,16 +3,12 @@
 //! `docs/spec/05-tasks.md` TASK-121・`docs/spec/04-behavior/indexing.md` INDEX-1,
 //! INDEX-2）。
 //!
-//! **位置づけ（codex-review P1 指摘・PR #241 対応）**: INDEX-2（検索への反映）は
-//! private spec の受け入れ基準をそのまま固定する回帰テストである。一方 INDEX-1
-//! （性能）側は、private spec が定める数値基準・判定式を本テストへ転記しておらず
-//! （spec-confidentiality）、`RATIO_THRESHOLD_DENOM` はそれとは無関係な本テスト
-//! 固有の代替閾値でしかない。したがって `index1_*` は **INDEX-1 の受け入れ基準
-//! 充足を証明しない**プレースホルダ回帰テストであり、CLAUDE.md 等の対外的な
-//! ステータス表記でも「INDEX-1 受け入れ基準実装済み」と扱わないこと。private
-//! spec 側の数値基準を実際に反映するには、公開境界拡張手順（作成者以外のオーナー
-//! 承認、または作成者=管理者本人の場合の承認記録手段。ポインタ:
-//! `docs/design/`）を経る必要があり、本 PR のスコープでは行わない。
+//! **位置づけ**: 本テストは TASK-121（対象ビヘイビア: INDEX-1, INDEX-2。上記は
+//! ポインタ参照のみ）に関連する、本リポ独自の回帰テストである。README で公開済みの
+//! 要点（ファイル形 INSERT → チャンク化 → ベクトル化 → 同一パス置換書き込み、および
+//! 追加ファイルが検索で取得可能になること）に基づいて、本テストが独自に設定した
+//! 基準（測定方法・閾値・アサーション）を検証するものであり、private spec の受け入れ
+//! 基準の転記・具体化ではない。
 //!
 //! `tests/incremental_index.rs`（TASK-120）は検索反映・置換セマンティクス・
 //! fail-closed 経路を単発挿入で検証し、`tests/incremental_write_perf.rs`（TASK-143・
@@ -23,14 +19,13 @@
 //! 状態での「1 ファイル追加の性能」の代替回帰指標（`index1_*`）と「検索への反映」
 //! （INDEX-2）を固定する。
 //!
-//! 「増分コストが既存コーパス規模 N に依存しない」ことは INDEX-1 の契約ではなく、本
-//! テストが検証する性質でもない。実装上、`tenant::replace_typed_rows_by_text_key`
-//! （同一パスの既存行を特定するための置換キー探索）はテナント名前空間内の既存行を
-//! 線形走査するため、増分 1 ファイルの所要時間は既存コーパス規模に対して線形に
-//! 増加する（具体的な実測値は spec-confidentiality 上ここに記載しない）。この線形
-//! 走査コストの解消（キー探索の索引化）は redb スキーマ・障害回復台帳の不変条件に
-//! 関わる engine 側の設計変更であり、本テストの回帰検知パラメータ調整では解消
-//! できない別 Issue の対象とする。
+//! 「増分コストが既存コーパス規模 N に依存しない」ことは本テストが検証する性質では
+//! ない。実装上、`tenant::replace_typed_rows_by_text_key`（同一パスの既存行を特定
+//! するための置換キー探索）はテナント名前空間内の既存行を線形走査するため、増分
+//! 1 ファイルの所要時間は既存コーパス規模に対して線形に増加する。この線形走査
+//! コストの解消（キー探索の索引化）は redb スキーマ・障害回復台帳の不変条件に関わる
+//! engine 側の設計変更であり、本テストの回帰検知パラメータ調整では解消できない
+//! 別 Issue の対象とする。
 
 use std::time::Duration;
 
@@ -153,9 +148,7 @@ const MEASUREMENT_ROUNDS: usize = 3;
 /// 判定閾値の分母（増分側は全体再構築側の `1 / RATIO_THRESHOLD_DENOM` 以下の時間で
 /// 完了すること）。本テスト固有の回帰検知パラメータであり、`tests/incremental_write_perf.rs`
 /// （TASK-143・PERSIST-2）と数値・判定式の形が一致するのは実装が同じ書き込み経路を
-/// 共有するためで、private spec 側の INDEX-1 数値基準との対応を示すものではない
-/// （INDEX-1 自体の数値基準・判定式はポインタ: `docs/spec/04-behavior/indexing.md`
-/// INDEX-1。本文はここに転記せず、対応関係も含め非公開のまま扱う）。
+/// 共有するためである。
 const RATIO_THRESHOLD_DENOM: u32 = 10;
 
 fn generic_body(index: usize) -> String {
@@ -270,12 +263,8 @@ fn measure_full_rebuild() -> Duration {
     median(durations)
 }
 
-// --- INDEX-1 代替指標: 増分性能プレースホルダ回帰（既存コーパスへの 1 ファイル
+// --- INDEX-1 関連: 増分性能の本テスト固有の回帰基準（既存コーパスへの 1 ファイル
 // 追加 vs 全体再構築） ---------------------------------------------------------
-//
-// このテストは INDEX-1 の受け入れ基準充足を証明しない（モジュールドキュメントの
-// 「位置づけ」節参照）。private spec の数値基準未反映のまま完了扱いにしないための
-// 位置づけ表記であり、実装・判定式自体はここでは変更しない。
 //
 // 対象時間はサーバー内部処理（チャンク化・埋め込み・行バッファ構築・redb 書き込み。
 // `IndexTiming.write` のドキュメンテーションコメント参照）のみで、wire プロトコル
@@ -284,11 +273,10 @@ fn measure_full_rebuild() -> Duration {
 //
 // 判定は「増分 1 ファイルの処理時間」対「全体再構築（`BASELINE_FILES + 1` 件を
 // 空 DB から構築）の総処理時間」の比を、`tests/incremental_write_perf.rs`
-// （PERSIST-2）と同じ形（`t_inc * RATIO_THRESHOLD_DENOM <= t_full`）で判定する。
-// この閾値・判定式は本テスト固有の回帰検知パラメータであり、private spec 側の
-// INDEX-1 数値基準そのもの・その対応関係を示すものではない（`RATIO_THRESHOLD_DENOM`
-// のドキュメンテーションコメント参照）。本テストは「増分コストが既存コーパス規模に
-// 依存しないこと」までは固定しない（モジュールドキュメント参照）。
+// （PERSIST-2）と同じ形（`t_inc * RATIO_THRESHOLD_DENOM <= t_full`）で判定する
+// （`RATIO_THRESHOLD_DENOM` のドキュメンテーションコメント参照）。本テストは
+// 「増分コストが既存コーパス規模に依存しないこと」までは固定しない
+// （モジュールドキュメント参照）。
 #[test]
 fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild() {
     let t_inc = measure_single_file_incremental_insert();
