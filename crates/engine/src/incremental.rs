@@ -211,10 +211,11 @@ struct ChunkedFile {
 
 /// [`index_file`]・[`index_file_batch`] 共通の副作用ゼロ区間（TASK-122 分割前の
 /// [`index_file`] 手順 1〜2 相当）。次元検証 → `chunk_file` → 空チャンク拒否 →
-/// ファイル単位チャンク数上限 → 総バイト数上限までを行い、redb・埋め込みサービス
-/// いずれにも触れない（呼び出し元がバッチの①〜③・④判定を埋め込み・write
-/// トランザクションより前に完了できるようにするための分割。`incremental.rs`
-/// モジュールドキュメント参照）。
+/// ファイル単位チャンク数上限 → 総バイト数上限までを行う。`storage.get_table_schema`
+/// によるスキーマ読み取りは発生するが、書き込み・埋め込みサービス呼び出しは一切
+/// 行わない（呼び出し元がバッチの①〜③・④判定を埋め込み・write トランザクション
+/// より前に完了できるようにするための分割。`incremental.rs` モジュールドキュメント
+/// 参照）。
 fn chunk_phase(
     storage: &Storage,
     embedder_dim: u32,
@@ -436,6 +437,10 @@ pub(crate) enum BatchIncrementalError {
         index: usize,
         source: IncrementalError,
     },
+    /// 特定ファイルに起因しない、バッチ全体に対する内部エラー（一括バッファの
+    /// `try_reserve_exact` 失敗＝ DoS 対策の確保拒否等）。`Item` と型で分離し、
+    /// 「バッチ内のどのファイルが原因か」という誤解を招く表現を避ける。
+    Internal(&'static str),
 }
 
 impl std::fmt::Display for BatchIncrementalError {
@@ -445,6 +450,7 @@ impl std::fmt::Display for BatchIncrementalError {
             BatchIncrementalError::Item { index, source } => {
                 write!(f, "file at batch index {index}: {source}")
             }
+            BatchIncrementalError::Internal(detail) => write!(f, "{detail}"),
         }
     }
 }
@@ -476,10 +482,10 @@ pub(crate) struct BatchFileIndexItem<'a> {
 /// 4. 1〜3 をすべて通過した場合のみ、ファイルごとに [`embed_and_write_phase`] を実行
 ///    する（write トランザクションはファイル単位。TASK-120 の既存契約を維持）。
 ///
-/// 1〜3 のいずれかで拒否された場合、`chunk_phase` が redb・埋め込みサービスに一切
-/// 触れていないため副作用はゼロ（redb・インメモリ索引・`operation_id` 台帳とも
-/// 変更なし。4 の write トランザクション自体が開始されていないため台帳記録も
-/// 発生しない）。
+/// 1〜3 のいずれかで拒否された場合、`chunk_phase` は redb への読み取り（スキーマ
+/// 参照）のみで書き込み・埋め込みサービス呼び出しを行わないため副作用はゼロ
+/// （redb・インメモリ索引・`operation_id` 台帳とも変更なし。4 の write トランザク
+/// ション自体が開始されていないため台帳記録も発生しない）。
 ///
 /// 4 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
 /// 文単位セマンティクスとする（すでに `embed_and_write_phase` を完走したファイルは
@@ -506,10 +512,7 @@ pub(crate) fn index_file_batch(
     let mut chunked_files: Vec<ChunkedFile> = Vec::new();
     chunked_files
         .try_reserve_exact(items.len())
-        .map_err(|_| BatchIncrementalError::Item {
-            index: 0,
-            source: IncrementalError::Internal("failed to reserve batch chunk buffer"),
-        })?;
+        .map_err(|_| BatchIncrementalError::Internal("failed to reserve batch chunk buffer"))?;
     let mut total_chunks: usize = 0;
     for (index, item) in items.iter().enumerate() {
         let chunked = chunk_phase(storage, embedder.dim(), config, &item.input)
@@ -535,10 +538,7 @@ pub(crate) fn index_file_batch(
     let mut outcomes: Vec<IndexOutcome> = Vec::new();
     outcomes
         .try_reserve_exact(items.len())
-        .map_err(|_| BatchIncrementalError::Item {
-            index: 0,
-            source: IncrementalError::Internal("failed to reserve batch outcome buffer"),
-        })?;
+        .map_err(|_| BatchIncrementalError::Internal("failed to reserve batch outcome buffer"))?;
     for (index, (item, chunked)) in items.into_iter().zip(chunked_files).enumerate() {
         let outcome = embed_and_write_phase(
             storage,
