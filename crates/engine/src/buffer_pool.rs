@@ -31,8 +31,12 @@
 //! （`batch_search.rs::ROW_BUFFER_POOL_QUOTA_BYTES`）以下で、プールが「格納せず
 //! 即破棄」に縮退しないこと。
 //! (b) プールのピーク理論上限（総量上限＋最大クラス 1 個分）が一括投入経路の合計予算の
-//! fail-closed 既定値（`incremental::MAX_INDEX_TOTAL_BYTES`）以下で、プールが一括投入
-//! 経路のメモリ予算と競合しないこと。
+//! fail-closed 既定値（`incremental::MAX_INDEX_TOTAL_BYTES`）以下という、独立上限として
+//! 同程度の桁に収まること。両経路は同一プロセス内で同時に確保され得るため、これは
+//! プロセス全体の実ピーク使用量（概ね `incremental_usage + pool_peak`）を共通予算内に
+//! 収める保証ではない（両経路の合計を上限と比較する共有予算制御は存在しない。詳細は
+//! `batch_search.rs::ROW_BUFFER_POOL_QUOTA_BYTES` のコメントと
+//! `tests::pool_quota_stays_within_batch_limits_budget` を参照）。
 //! (c) 一括投入経路が正当に生成しうる次元（`storage::MAX_EMBEDDING_DIM` まで）のうち
 //! `MAX_BATCH_DIM` 超のものは、本プールの [`BufferPool::acquire`] がアロケーション前に
 //! 拒否すること（`MAX_BATCH_DIM < MAX_EMBEDDING_DIM` の大小関係を前提とする）。

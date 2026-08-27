@@ -90,9 +90,14 @@ pub const MAX_BATCH_WORK: usize = 10_000_000_000;
 /// 十分小さい値に抑える（プールは性能最適化であり、常駐行列本体の予算を圧迫しない）。
 ///
 /// Issue #170（INDEX-4・TASK-122 実装後の再整合）: 一括投入経路（`incremental.rs`）は
-/// 本プールを直接使わないが、プールのピーク理論上限（本定数＋最大サイズクラス 1 個分）は
+/// 本プールを直接使わない。本プールのピーク理論上限（本定数＋最大サイズクラス 1 個分）は
 /// 一括投入経路の合計予算の fail-closed 既定値 `incremental::MAX_INDEX_TOTAL_BYTES`
-/// （64 MiB）以下に収まり、一括投入経路のメモリ予算と競合しない。この大小関係は
+/// （64 MiB）以下という桁感を保つよう独立に設定してあるが、これは**プール単体の上限**が
+/// 一括投入経路の上限と同程度の桁に収まることの documentation-level な整合であり、
+/// 両経路が同一プロセス内で同時に確保し得るプロセス全体のピーク使用量
+/// （概ね `incremental_usage + pool_peak`）を共通予算内に収める保証ではない
+/// （両経路の合計を上限と比較する実行時の共有予算制御・一方の確保中に他方を縮小する
+/// 仕組みは本モジュールに存在しない）。この「独立上限としての桁感」の大小関係のみを
 /// `tests::pool_quota_stays_within_batch_limits_budget` で固定する（`buffer_pool.rs`
 /// モジュールコメントの (b) に対応）。
 const ROW_BUFFER_POOL_QUOTA_BYTES: usize = 16 * 1024 * 1024;
@@ -2843,9 +2848,18 @@ mod tests {
 
     // 不変条件 (b): プールのピーク理論上限（総量上限＋最大クラス 1 個分。CORE-15 の
     // ピーク有界性テストと同じ計算式）が一括投入経路の合計予算の fail-closed 既定値
-    // （`incremental::MAX_INDEX_TOTAL_BYTES`）以下であること。プールは一括投入経路を
-    // 直接使わないが（モジュール冒頭コメント参照）、同一プロセス内で同時に確保されうる
-    // メモリ予算として競合しないことを固定する。
+    // （`incremental::MAX_INDEX_TOTAL_BYTES`）以下であること。
+    //
+    // 注意（Issue #170 codex-review 指摘対応）: このテストが固定するのはプール単体の
+    // ピーク上限が一括投入経路の予算と同程度の桁に収まる、という **独立上限としての
+    // 桁感**のみである。プールは一括投入経路を直接使わないが（モジュール冒頭コメント
+    // 参照）、両経路は同一プロセス内で同時に確保され得るため、プロセス全体の実ピーク
+    // 使用量は概ね `incremental_usage + pool_peak` であり、本テストの
+    // `pool_peak <= MAX_INDEX_TOTAL_BYTES` という比較だけでは「両経路が同一プロセスの
+    // 共有メモリ予算内に収まる」ことは何も保証しない。両経路の合計を共通上限と比較する
+    // 実行時の共有予算制御や、一方の確保中に他方を縮小・解放する仕組みは本モジュールに
+    // 存在せず、本テストもそれを代替しない（各経路が自身の上限内に収まることのみを
+    // 独立に固定する）。
     #[test]
     fn pool_quota_stays_within_batch_limits_budget() {
         let max_class = match crate::buffer_pool::size_class_for(MAX_BATCH_DIM) {
@@ -2858,7 +2872,10 @@ mod tests {
             peak_theoretical_upper_bound <= crate::incremental::MAX_INDEX_TOTAL_BYTES,
             "pool peak theoretical upper bound ({peak_theoretical_upper_bound} bytes) must not \
              exceed the bulk-ingest fallback budget (incremental::MAX_INDEX_TOTAL_BYTES = {} \
-             bytes), otherwise the pool could compete with the bulk-ingest memory budget",
+             bytes); this is an independent-quota sanity bound only — it does NOT establish a \
+             combined per-process budget across the pool and bulk-ingest paths (the process-wide \
+             peak when both are live concurrently is roughly incremental_usage + pool_peak, which \
+             this assertion does not bound)",
             crate::incremental::MAX_INDEX_TOTAL_BYTES
         );
     }
