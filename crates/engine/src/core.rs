@@ -1064,7 +1064,7 @@ impl EngineCore {
         })?;
 
         let config = self.dictionary_config.clone();
-        let mut builder = crate::dictionary::DictionaryBuilder::new();
+        let mut builder = crate::dictionary::DictionaryBuilder::new(config);
         for row in &rows {
             let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata) else {
                 // 破損行は辞書構築をこの 1 行分だけ黙ってスキップする（recall 側の
@@ -1080,9 +1080,9 @@ impl EngineCore {
                 Some(crate::row_codec::Value::Text(s)) => s.as_str(),
                 _ => continue,
             };
-            builder.ingest(&config, path, body);
+            builder.ingest(path, body);
         }
-        let dictionary = builder.finish(&config);
+        let dictionary = builder.finish();
         let approx_bytes = dictionary.approx_heap_bytes();
         Ok(self.dictionary_cache.insert(
             &self.storage,
@@ -2617,7 +2617,7 @@ mod tests {
         // 世代 G0 時点の辞書を構築しておく（まだキャッシュへは挿入しない）。
         let stale_generation = core.storage.current_generation().expect("read generation");
         let stale_dictionary =
-            crate::dictionary::DictionaryBuilder::new().finish(&core.dictionary_config);
+            crate::dictionary::DictionaryBuilder::new(core.dictionary_config.clone()).finish();
         let stale_bytes = stale_dictionary.approx_heap_bytes();
 
         // tenant-b 側は通常経路でキャッシュへ挿入し、世代 G0 のエントリとして常駐させる。

@@ -264,9 +264,19 @@ pub struct FileTree {
 
 /// `path` をファイルツリー集計へ反映する。拡張子が取れない場合は "(none)"、
 /// トップディレクトリが取れない場合は "(root)" に集計する。
+///
+/// 呼び出し元（`core.rs::dictionary_snapshot`）は同一パスの複数チャンク本文を
+/// 別々の抽出単位として順次 `ingest` するため、本関数もパスごとに複数回呼ばれ
+/// うる。`by_extension`/`by_top_dir` は**ファイル単位**の集計（1 ファイル＝1 カウ
+/// ント）であるべきなので、`paths.insert` が真（＝パス初出）の場合のみ加算する
+/// （TASK-109・PLAN-5 レビュー対応: チャンク単位の重複加算バグ修正）。
 fn accumulate_file_tree(tree: &mut FileTree, path: &str) {
     let path = truncate_chars(path, MAX_PATH_LEN);
-    tree.paths.insert(path.clone());
+    if !tree.paths.insert(path.clone()) {
+        // 既知パスの再訪（同一ファイルの別チャンク）。パス集合には既に含まれて
+        // おり拡張子・トップディレクトリの二重加算を防ぐため、ここで打ち切る。
+        return;
+    }
 
     let file_name = path.rsplit(['/', '\\']).next().unwrap_or(&path);
     let ext_key = file_name
@@ -445,8 +455,15 @@ fn cap_btreeset<T: Ord>(mut set: BTreeSet<T>, max: usize) -> (BTreeSet<T>, bool)
 /// 単一ファイル（`path`）分の抽出単位（1 つ以上のチャンク本文）を積み上げる
 /// 増分ビルダー（TASK-109）。`core.rs::DictionaryCache` はテーブル走査で得た行を
 /// パス単位にグルーピングしたうえで、各行本文をこのビルダーへ渡す。
-#[derive(Debug, Default)]
+///
+/// `config` は構築時（[`DictionaryBuilder::new`]）に固定して保持する。`ingest`・
+/// `finish` を別々の `&DictionaryConfig` で呼び分けられる構造だと、蓄積済みの
+/// `term_freq`（`enable_term_index` を前提に集計している）が `finish` 時の異なる
+/// 設定で黙って捨てられる／解釈が食い違う不整合を起こしうるため（TASK-109・PLAN-5
+/// レビュー対応）、単一の設定に固定して不整合の余地自体を排除する。
+#[derive(Debug)]
 pub struct DictionaryBuilder {
+    config: DictionaryConfig,
     symbols: BTreeSet<Symbol>,
     file_tree: FileTree,
     term_freq: BTreeMap<String, u64>,
@@ -454,12 +471,20 @@ pub struct DictionaryBuilder {
 }
 
 impl DictionaryBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    /// `config` に固定したビルダーを新規作成する。以降の `ingest`・`finish` は
+    /// すべてこの `config` を用いる。
+    pub fn new(config: DictionaryConfig) -> Self {
+        Self {
+            config,
+            symbols: BTreeSet::new(),
+            file_tree: FileTree::default(),
+            term_freq: BTreeMap::new(),
+            truncated: false,
+        }
     }
 
     /// `path`・`body` の 1 抽出単位（1 行 = 1 チャンク相当）を取り込む。
-    pub fn ingest(&mut self, config: &DictionaryConfig, path: &str, body: &str) {
+    pub fn ingest(&mut self, path: &str, body: &str) {
         // シンボル辞書は必須実装（PLAN-5）。ソース種別に関わらず常に試みる
         // （Rust 以外は行頭が予約語と一致しない限り検出されず実質空になる）。
         match detect_source_kind(path) {
@@ -478,23 +503,28 @@ impl DictionaryBuilder {
                     }
                     self.symbols.insert(symbol);
                 }
-                if config.enable_term_index {
+                if self.config.enable_term_index {
                     self.merge_terms(extract_rust_doc_terms(body));
                 }
             }
             SourceFileKind::Markdown => {
-                if config.enable_term_index {
+                if self.config.enable_term_index {
                     self.merge_terms(extract_markdown_terms(body));
                 }
             }
             SourceFileKind::Other => {}
         }
 
-        if config.enable_file_tree {
-            // 生の安全弁（早期打ち切り。上記シンボルの安全弁と同じ理由で挿入順に
-            // 依存する。モジュールドキュメント「決定性」参照）。
+        if self.config.enable_file_tree {
+            // 安全弁の到達判定は実際に `paths` へ挿入される切り詰め後の値
+            // （`accumulate_file_tree` 内部の `truncate_chars` と同じ変換）で行う。
+            // 生の未切り詰め `path` で判定すると、`MAX_PATH_LEN` 超のパスが
+            // 上限到達後に再 ingest された際、切り詰め後は既知パスであっても
+            // 生の文字列比較では不一致となり新規パスと誤判定して `truncated` を
+            // 不要に立ててしまう（TASK-109・PLAN-5 レビュー対応）。
+            let truncated_path = truncate_chars(path, MAX_PATH_LEN);
             if self.file_tree.paths.len() >= MAX_DICTIONARY_PATHS
-                && !self.file_tree.paths.contains(path)
+                && !self.file_tree.paths.contains(&truncated_path)
             {
                 self.truncated = true;
             } else {
@@ -519,8 +549,11 @@ impl DictionaryBuilder {
     }
 
     /// 積み上げた内容を [`Dictionary`] へ確定する。用語索引は頻度降順・同点は
-    /// 辞書順昇順で上位 `config.top_terms` 件に決定的に切り詰める。
-    pub fn finish(self, config: &DictionaryConfig) -> Dictionary {
+    /// 辞書順昇順で上位 `config.top_terms` 件に決定的に切り詰める。設定は
+    /// [`DictionaryBuilder::new`] で固定したものを用いる（`ingest` と異なる設定を
+    /// 渡して不整合を起こす余地をなくすため、引数では受け取らない）。
+    pub fn finish(self) -> Dictionary {
+        let config = &self.config;
         let (symbols, symbols_truncated) = cap_btreeset(self.symbols, MAX_DICTIONARY_SYMBOLS);
         let (paths, paths_truncated) = cap_btreeset(self.file_tree.paths, MAX_DICTIONARY_PATHS);
 
@@ -741,6 +774,72 @@ mod tests {
         assert_eq!(tree.by_top_dir.get("(root)"), Some(&1));
     }
 
+    #[test]
+    fn accumulate_file_tree_counts_same_path_once_across_repeated_calls() {
+        // `accumulate_file_tree` 単体でのチャンク再訪回帰確認（バグ再現条件:
+        // 同一パスへの複数回呼び出しで by_extension/by_top_dir が加算され続けない）。
+        let mut tree = FileTree::default();
+        for _ in 0..5 {
+            accumulate_file_tree(&mut tree, "src/engine/core.rs");
+        }
+        assert_eq!(tree.paths.len(), 1);
+        assert_eq!(tree.by_extension.get("rs"), Some(&1));
+        assert_eq!(tree.by_top_dir.get("src"), Some(&1));
+    }
+
+    #[test]
+    fn builder_counts_by_extension_once_per_file_across_multiple_chunks() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト:
+        // `core.rs::dictionary_snapshot` はチャンク化済みの本文を行単位（＝チャンク
+        // 単位）で `DictionaryBuilder::ingest` へ渡すため、同一パスが複数回 ingest
+        // される。再現例（レビュー指摘どおり）: 20 行ファイルを lines_per_chunk 4 で
+        // 5 チャンクへ分割し、各チャンクを同一パスで ingest すると
+        // `by_extension["rs"]` はファイル単位の期待値 1 ではなく 5 になっていた。
+        let config = DictionaryConfig::default();
+        let mut builder = DictionaryBuilder::new(config);
+        let path = "src/many_chunks.rs";
+        for chunk in 0..5 {
+            let body = format!("fn chunk_{chunk}() {{}}\n");
+            builder.ingest(path, &body);
+        }
+        let dict = builder.finish();
+        assert_eq!(dict.file_tree.paths.len(), 1);
+        assert_eq!(dict.file_tree.by_extension.get("rs"), Some(&1));
+        assert_eq!(dict.file_tree.by_top_dir.get("src"), Some(&1));
+        // シンボル自体は各チャンクから別々に検出されるべき（チャンク単位の
+        // シンボル欠落を防ぐのが本来の意図であり、file_tree の重複加算修正で
+        // シンボル抽出まで壊さないことを併せて確認する）。
+        assert_eq!(dict.symbols.len(), 5);
+    }
+
+    #[test]
+    fn builder_file_tree_safety_valve_matches_on_truncated_path() {
+        // TASK-109・PLAN-5 レビュー対応の回帰テスト（Low 指摘 2）:
+        // `MAX_DICTIONARY_PATHS` へ到達した状態で、`MAX_PATH_LEN` を超える同一パス
+        // （チャンク違いで再 ingest される）が「未知の新規パス」と誤判定され
+        // `truncated` が不要に立たないことを確認する。判定は挿入される切り詰め後の
+        // 値で行う必要がある（生の未切り詰め `path` との比較は常に不一致になる）。
+        let config = DictionaryConfig::default();
+        let mut builder = DictionaryBuilder::new(config);
+
+        // ちょうど MAX_DICTIONARY_PATHS - 1 件のユニークな穴埋めパスを積み、最後の
+        // 1 枠を長尺パスの初回 ingest で使い切る（この時点ではまだ安全弁は発火せず、
+        // `truncated` は立たない）。
+        let long_path = "a".repeat(MAX_PATH_LEN + 50);
+        for i in 0..(MAX_DICTIONARY_PATHS - 1) {
+            builder.ingest(&format!("filler/{i}.txt"), "");
+        }
+        builder.ingest(&long_path, "");
+        assert_eq!(builder.file_tree.paths.len(), MAX_DICTIONARY_PATHS);
+        assert!(!builder.truncated);
+
+        // 同一の長尺パス（別チャンク）を再 ingest。既知パス（切り詰め後）である
+        // ため、安全弁は発火せず `truncated` は立たないままであるべき。
+        builder.ingest(&long_path, "");
+        assert_eq!(builder.file_tree.paths.len(), MAX_DICTIONARY_PATHS);
+        assert!(!builder.truncated);
+    }
+
     // --- 上限系 ---
 
     #[test]
@@ -769,9 +868,9 @@ mod tests {
             enable_term_index: false,
             top_terms: DEFAULT_TOP_TERMS,
         };
-        let mut builder = DictionaryBuilder::new();
-        builder.ingest(&config, "src/x.rs", "fn only_one() {}\n");
-        let dict = builder.finish(&config);
+        let mut builder = DictionaryBuilder::new(config);
+        builder.ingest("src/x.rs", "fn only_one() {}\n");
+        let dict = builder.finish();
         assert_eq!(dict.symbols.len(), 1);
         assert!(dict.file_tree.paths.is_empty());
         assert!(dict.term_index.is_empty());
@@ -784,14 +883,10 @@ mod tests {
             enable_term_index: true,
             top_terms: 2,
         };
-        let mut builder = DictionaryBuilder::new();
+        let mut builder = DictionaryBuilder::new(config);
         // "alpha" が最頻出、次いで "bravo"、"charlie" は最下位になるよう調整。
-        builder.ingest(
-            &config,
-            "docs/a.md",
-            "alpha alpha alpha bravo bravo charlie\n",
-        );
-        let dict = builder.finish(&config);
+        builder.ingest("docs/a.md", "alpha alpha alpha bravo bravo charlie\n");
+        let dict = builder.finish();
         assert_eq!(dict.term_index.len(), 2);
         assert!(dict.term_index.contains_key("alpha"));
         assert!(dict.term_index.contains_key("bravo"));
@@ -802,10 +897,10 @@ mod tests {
     #[test]
     fn builder_deduplicates_symbols_across_units_for_same_path() {
         let config = DictionaryConfig::default();
-        let mut builder = DictionaryBuilder::new();
-        builder.ingest(&config, "src/x.rs", "fn foo() {}\n");
-        builder.ingest(&config, "src/x.rs", "fn foo() {}\n");
-        let dict = builder.finish(&config);
+        let mut builder = DictionaryBuilder::new(config);
+        builder.ingest("src/x.rs", "fn foo() {}\n");
+        builder.ingest("src/x.rs", "fn foo() {}\n");
+        let dict = builder.finish();
         assert_eq!(dict.symbols.len(), 1);
     }
 
