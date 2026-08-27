@@ -1410,6 +1410,38 @@ impl EngineCore {
         })
     }
 
+    /// `table` の最終 commit 済み `operation_id` を照会する（TASK-98、対象ビヘイビア:
+    /// RECOVER-7。契約の詳細は spec 参照）。`crate::tenant::last_operation` への
+    /// 薄い委譲のみ。
+    ///
+    /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）では
+    /// [`Self::operation_recorded`] と同じく台帳テーブルへ一切触れず
+    /// [`LastOperationLookup::NoLedger`] を返す（`NotFound` へ丸めない）。
+    /// `LastOperationLookup::Unavailable` を返すべきケースについては
+    /// `recovery::ledger` モジュールドキュメント参照（codex-review P1 指摘対応）。
+    /// `VectorCore` trait へは昇格しない（`operation_recorded` と同じ理由。
+    /// `core-api-check` の対象外）。
+    pub fn last_operation_id(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<crate::recovery::ledger::LastOperationLookup, crate::tenant::TenantWriteError> {
+        use crate::recovery::ledger::{LastOperationLookup, LastOperationRaw};
+        if matches!(self.ledger_mode, LedgerMode::CompareOnlyWithoutLedger) {
+            return Ok(LastOperationLookup::NoLedger);
+        }
+        let found = crate::tenant::last_operation(&self.storage, table, ctx)?;
+        Ok(match found {
+            LastOperationRaw::Found(op_id) => LastOperationLookup::Committed(op_id),
+            LastOperationRaw::NotFound => LastOperationLookup::NotFound,
+            // `last_op` テーブル導入（TASK-98）前の DB に旧 `op_ledger` 記録だけが
+            // 残っているケース。正確な最終 `operation_id` を復元できないため
+            // `NotFound` へ丸めず fail-closed に区別する（codex-review P1 指摘対応。
+            // `LastOperationLookup::Unavailable` のドキュメント参照）。
+            LastOperationRaw::LegacyLedgerWithoutLastOp => LastOperationLookup::Unavailable,
+        })
+    }
+
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
     /// （TASK-169）。`snapshot.search_with` が `IndexStale`/`ContextMismatch` を返した
     /// 場合は [`PrefilterCache::evict`] で該当エントリを破棄し、非キャッシュ経路

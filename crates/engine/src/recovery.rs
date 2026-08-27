@@ -1,7 +1,7 @@
 //! TASK-92（対象ビヘイビア: RECOVER-1）の入口モジュール。障害回復系のガード・台帳の
 //! 実装をここへ集約する（ポインタ: docs/spec/05-tasks.md TASK-92〜94・TASK-96・
-//! TASK-101・docs/spec/04-behavior/recovery.md RECOVER-1〜3・RECOVER-5・
-//! RECOVER-10）。
+//! TASK-98・TASK-101・docs/spec/04-behavior/recovery.md RECOVER-1〜3・RECOVER-5・
+//! RECOVER-7・RECOVER-10）。
 //!
 //! [`required_op_id`] が `operation_id` 必須化ガード（RECOVER-1）を提供する
 //! （詳細は `required_op_id` モジュールドキュメント参照）。[`ledger`] がテーブル単位
@@ -14,6 +14,9 @@
 //! [`commit_boundary`] が commit 成功境界と応答一意性の保証（TASK-96、対象
 //! ビヘイビア: RECOVER-5）を提供する（詳細は `commit_boundary` モジュール
 //! ドキュメント参照）。
+//!
+//! [`ledger`] は TASK-98（対象ビヘイビア: RECOVER-7）の対応も含む（詳細は
+//! `ledger` モジュールドキュメント参照）。
 
 pub mod commit_boundary;
 pub(crate) mod content_hash;

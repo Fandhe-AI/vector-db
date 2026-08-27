@@ -1251,6 +1251,28 @@ pub(crate) fn operation_recorded(
         .map_err(TenantWriteError::LedgerCorrupted)
 }
 
+/// `table` の最終 commit 済み `operation_id` を照会する（TASK-98、対象ビヘイビア:
+/// RECOVER-7。契約の詳細は spec 参照）。`crate::core::EngineCore::last_operation_id`
+/// からの薄い委譲先。[`operation_recorded`] と同じ理由で `pub(crate)` に限定する:
+/// `ledger_mode` の `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）判定は
+/// `EngineCore::last_operation_id` 側が担い、本関数はモード非依存の生の照会結果
+/// （[`ledger::LastOperationRaw`]。詳細は `recovery::ledger` モジュールドキュメント
+/// 参照。codex-review P1 指摘対応）のみを返す。この区別をクレート外から迂回できない
+/// よう `pub(crate)` に留める。
+///
+/// 照会範囲は呼び出し元テナント（`ctx.tenant_id()`）の名前空間に閉じる（TABLE-12・
+/// RLS-9 と同型。security.md P0）。
+pub(crate) fn last_operation(
+    storage: &Storage,
+    table: &str,
+    ctx: &PolicyContext,
+) -> Result<ledger::LastOperationRaw, TenantWriteError> {
+    validate_identifier(table)?;
+    let read_txn = storage.db().begin_read().map_err(CatalogError::from)?;
+    ledger::last_operation_in_read_txn(&read_txn, ctx.tenant_id(), table)
+        .map_err(TenantWriteError::LedgerCorrupted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
