@@ -294,13 +294,18 @@ pub fn extract_rust_symbols(path: &str, body: &str, unit_seq: u64) -> (Vec<Symbo
     let (path, mut truncated) = truncate_chars(path, MAX_PATH_LEN);
     let mut out = Vec::new();
     for (idx, line) in body.lines().enumerate() {
+        let Some((kind, name, name_truncated)) = parse_definition_line(line) else {
+            continue;
+        };
+        // 上限判定は「追加対象のシンボルが見つかった後」に行う（PR #249
+        // codex-review P2 指摘対応）。行の解析前に判定すると、ちょうど
+        // `MAX_SYMBOLS_PER_UNIT` 個のシンボルを抽出し終えた後に空行・コメント・
+        // 通常文（非シンボル行）が 1 行でも残っているだけで、実際にはシンボルを
+        // 一切省略していないのに `truncated = true` になってしまう。
         if out.len() >= MAX_SYMBOLS_PER_UNIT {
             truncated = true;
             break;
         }
-        let Some((kind, name, name_truncated)) = parse_definition_line(line) else {
-            continue;
-        };
         // `enumerate` は 0 起点。行番号は 1 起点かつ `u32` へ飽和変換する
         // （untrusted 入力の行数は `chunking.rs::MAX_INPUT_LINES` で既に上限検証済み
         // だが、本モジュール単体でも `unwrap` を避け飽和変換で処理する）。
@@ -886,6 +891,44 @@ mod tests {
         let body = format!("fn {long_name}() {{}}\n");
         let (symbols, _) = extract_rust_symbols("src/x.rs", &body, 0);
         assert_eq!(symbols[0].name.chars().count(), MAX_SYMBOL_NAME_LEN);
+    }
+
+    // PR #249 codex-review P2 指摘の回帰テスト: ちょうど `MAX_SYMBOLS_PER_UNIT`
+    // 個のシンボルを抽出し終えた後に、非シンボル行（空行・コメント・通常文）が
+    // 続くだけでは実際にはシンボルを一切省略していないため `truncated` は
+    // 立たない（上限判定を「行の解析後・追加対象が見つかった場合のみ」へ
+    // 入れ替えたことの対照ケース）。
+    #[test]
+    fn extract_rust_symbols_does_not_truncate_when_trailing_lines_are_non_symbols() {
+        let mut body = String::new();
+        for i in 0..MAX_SYMBOLS_PER_UNIT {
+            body.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        // 上限ちょうどのシンボル数の後に、非シンボル行を複数追加する。
+        body.push_str("\n// just a comment\nlet result = compute();\n");
+        let (symbols, truncated) = extract_rust_symbols("src/exact_cap.rs", &body, 0);
+        assert_eq!(symbols.len(), MAX_SYMBOLS_PER_UNIT);
+        assert!(
+            !truncated,
+            "trailing non-symbol lines after reaching the cap must not set truncated"
+        );
+    }
+
+    // 上記の対照ケース: 上限到達後にさらにシンボル行が続く場合は、これまで
+    // どおり `truncated` が正しく立つ（本当に省略が発生したケース）。
+    #[test]
+    fn extract_rust_symbols_truncates_when_a_symbol_line_follows_the_cap() {
+        let mut body = String::new();
+        for i in 0..MAX_SYMBOLS_PER_UNIT {
+            body.push_str(&format!("fn f{i}() {{}}\n"));
+        }
+        body.push_str("fn overflow() {}\n");
+        let (symbols, truncated) = extract_rust_symbols("src/exact_cap_plus_one.rs", &body, 0);
+        assert_eq!(symbols.len(), MAX_SYMBOLS_PER_UNIT);
+        assert!(
+            truncated,
+            "a genuine extra symbol line beyond the cap must set truncated"
+        );
     }
 
     // --- 用語索引 ---
