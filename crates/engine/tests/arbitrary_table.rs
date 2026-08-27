@@ -633,22 +633,58 @@ fn arbitrary_table_ledger_scope_is_per_table_and_per_tenant() {
         LedgerLookup::Recorded
     );
 
-    // 同一テーブル・同一テナントへの再送は 23505（行キー衝突）。
+    // 既存行 id=1 への再送は 23505（行キー衝突）。これは operation_id とは無関係な
+    // 行ストア側の重複検出であることを明示するため、あえて未使用の operation_id
+    // （op-resend）を使う（重複行 id 検出は operation_id の有無に分岐しない。
+    // `tenant.rs::insert_row` ドキュメント参照）。
     let err = core
         .execute_insert_sql(
             &ctx_a,
             "INSERT INTO kb_articles (id, embedding, body) VALUES (1, '[0.9,0.9,0.9]', 'overwrite') USING OPERATION_ID 'op-resend'",
         )
-        .expect_err("resend into the same row id must be rejected");
+        .expect_err("row id conflict must be rejected regardless of operation_id");
     assert_eq!(err.wire_code(), "23505");
 
+    // 同一テーブル・同一テナントへの operation_id 自体の再送（op-shared を新規行
+    // id=2 へ再利用）。TASK-93（本台帳）は「既存エントリを上書きしない
+    // （keep-first）」ことのみを契約とし、重複拒否（23505）は TASK-94 の管轄で
+    // 本 PR のスコープ外（`recovery/ledger.rs` モジュール冒頭ドキュメント参照）
+    // のため、行 id が衝突しなければ成功し、台帳エントリも記録済みのまま
+    // 変化しないことを検証する（vacuous pass 防止・codex-review 指摘対応）。
+    core.execute_insert_sql(
+        &ctx_a,
+        "INSERT INTO kb_articles (id, embedding, body) VALUES (2, '[0.3,0.3,0.3]', 'resend') USING OPERATION_ID 'op-shared'",
+    )
+    .expect("resending an already-recorded operation_id onto a new row id must succeed (TASK-94 out of scope)");
+    assert_eq!(
+        core.operation_recorded(&ctx_a, "kb_articles", &op("op-shared"))
+            .expect("lookup ok"),
+        LedgerLookup::Recorded,
+        "keep-first: the ledger entry recorded by the first op-shared write must remain"
+    );
+
     // tenant-b が同一テーブルへ同一 operation_id を使っても成功する（テナント単位
-    // スコープが独立している）。tenant-b 視点では op-shared は未使用として扱われる。
+    // スコープが独立している）。行キー (tenant_id, id) もテナント単位で名前空間化
+    // されているため、insert の成否だけでは台帳のテナントスコープを検証できない
+    // （Bugbot 指摘対応）。tenant-b 視点で op-shared が未使用であることを事前に、
+    // 使用済みであることを事後に `operation_recorded` で直接確認する。
+    assert_eq!(
+        core.operation_recorded(&ctx_b, "kb_articles", &op("op-shared"))
+            .expect("lookup ok"),
+        LedgerLookup::NotRecorded,
+        "tenant-b must not observe tenant-a's op-shared ledger entry before its own write"
+    );
     core.execute_insert_sql(
         &ctx_b,
         "INSERT INTO kb_articles (id, embedding, body) VALUES (1, '[0.7,0.7,0.7]', 'b-owned') USING OPERATION_ID 'op-shared'",
     )
     .expect("tenant-b reusing the same operation_id must succeed (different tenant namespace)");
+    assert_eq!(
+        core.operation_recorded(&ctx_b, "kb_articles", &op("op-shared"))
+            .expect("lookup ok"),
+        LedgerLookup::Recorded,
+        "tenant-b's own op-shared write must now be observable in tenant-b's own namespace"
+    );
 
     // 他テナントの同一 operation_id の存在は、自テナントの 23505 判定に影響しない
     // （台帳照合が存在オラクルにならないことの確認）。
