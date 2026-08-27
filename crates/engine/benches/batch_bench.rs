@@ -344,17 +344,58 @@ fn run_core16_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, S
         }
     };
 
+    // レビュー指摘対応（PR #245）: `gate_batch_queries` の `Vec<BatchQuery>` 確保・
+    // 構築は測定区間の外（`run_ab` 呼び出し前）で 1 回だけ行い、両ワークロードから
+    // 同じ参照を再利用する。`BatchQuery` はクエリ本体・ctx への借用のみを保持し
+    // `batch_search` も `&[BatchQuery]` を読み取るだけで消費しないため、反復間で
+    // 使い回しても計測対象（f16/f32 常駐形式の差）を歪めない。以前は各反復の
+    // 測定区間内で構築しており、その共通コストが f16/f32 間の短縮率を薄めていた
+    // （CORE-7 と同じ「入力生成・確保は測定区間外」契約に反していた）。
+    let queries = gate_batch_queries(&dataset.queries, ctx);
+
+    // レビュー指摘対応（PR #245・cursor[bot]）: `batch_search` の `Result` を
+    // 検査せず捨てていたため、`try_new` 成功後にランタイムで GPU 失敗が起きても
+    // エラー経路（通常大幅に軽量）がそのまま計測サンプルへ計上され、
+    // `check_improvement_at_least` が誤って `pass=true` を返しうる状態だった
+    // （CORE-6 の縮退カウントに相当する fail-closed チェックが本ゲートに無かった）。
+    // 両ワークロードのエラー発生を計測中も観測し、1 件でもあれば「判定不能」として
+    // `pass=false` に倒す。
+    let error_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let error_count_a = std::sync::Arc::clone(&error_count);
+    let error_count_b = std::sync::Arc::clone(&error_count);
+
     let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
-    let workload_a = || {
-        let queries = gate_batch_queries(&dataset.queries, ctx);
-        f32_backend.batch_search(&queries).map(|hits| hits.len())
+    let workload_a = || match f32_backend.batch_search(&queries) {
+        Ok(hits) => hits.len(),
+        Err(err) => {
+            error_count_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "batch_bench: {LABEL}: f32-resident batch_search returned an error \
+                 during measurement: {err}"
+            );
+            0
+        }
     };
-    let workload_b = || {
-        let queries = gate_batch_queries(&dataset.queries, ctx);
-        f16_backend.batch_search(&queries).map(|hits| hits.len())
+    let workload_b = || match f16_backend.batch_search(&queries) {
+        Ok(hits) => hits.len(),
+        Err(err) => {
+            error_count_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            eprintln!(
+                "batch_bench: {LABEL}: f16-resident batch_search returned an error \
+                 during measurement: {err}"
+            );
+            0
+        }
     };
     let ab = run_ab(&config, workload_a, workload_b)
         .map_err(|err| format!("{LABEL}: A/B measurement failed: {err}"))?;
+    if error_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        println!(
+            "{LABEL}: not measurable in this environment (batch_search returned an \
+             error during measurement; see stderr) requested=true pass=false"
+        );
+        return Ok(false);
+    }
 
     let p95_a = p95_from_samples(&ab.a.samples)
         .map_err(|err| format!("{LABEL}: p95 of A samples unavailable: {err}"))?;
