@@ -328,32 +328,61 @@ where
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-/// 書き込みコミット直前に [`GENERATION_TABLE`] を +1 してからコミットする
-/// （TASK-133 P1 対応）。本クレート内の実書き込みを伴う書き込みコミット
-/// （`Storage::put`/`put_batch`・`crate::catalog` の DDL/DML・
-/// [`commit_write_txn`] 経由の `crate::txn::WriteTxn`/`BatchWriteTxn`）は
-/// `write_txn.commit()` を直接呼ばずすべて本関数を経由する。将来の書き込み API 追加も
-/// 本関数を呼ぶだけで世代カウントの経路網羅が保たれる。
+/// [`GENERATION_TABLE`] を +1 する（TASK-133 P1 対応）。`write_txn.commit()` を
+/// 呼ぶ前の準備段階のみを担い、この関数自体は commit を行わない。
+///
+/// commit 成功境界（TASK-96・RECOVER-5）: 本関数の `Err` は `write_txn.commit()` へ
+/// 到達する前に確定するため、durable write は発生していない
+/// （[`crate::recovery::commit_boundary::commit_and_finish`] はこの区別を使って、
+/// 本関数の `Err` を通常のエラー応答として扱ってよいと判断する。一方
+/// [`commit_prepared_write_txn`] の `Err` は durable かどうか呼び出し元から
+/// 判別できないため同列に扱わない。詳細は `commit_boundary` モジュールの
+/// ドキュメントを参照）。
 ///
 /// テーブル単位ではなくストレージ全体で 1 カウンタにした: `Storage::put`/`put_batch`
 /// は対象テーブル名を持たない旧 API のため、テーブル単位にすると経路によって
 /// カウンタ更新対象を誤る余地が生まれる（誤りは fail-open に直結する）。単一カウンタは
 /// 無関係なテーブルへの書き込みでも既存インデックスを失効させる（過剰拒否）が、
 /// fail-closed 方向のため許容する。
-pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> Result<()> {
-    {
-        let mut gen_table = write_txn.open_table(GENERATION_TABLE)?;
-        let current = gen_table
-            .get(GENERATION_KEY)?
-            .map(|v| v.value())
-            .unwrap_or(0);
-        let next = current
-            .checked_add(1)
-            .ok_or(StorageError::GenerationCounterOverflow)?;
-        gen_table.insert(GENERATION_KEY, next)?;
-    }
+pub(crate) fn prepare_generation_bump(write_txn: &redb::WriteTransaction) -> Result<()> {
+    let mut gen_table = write_txn.open_table(GENERATION_TABLE)?;
+    let current = gen_table
+        .get(GENERATION_KEY)?
+        .map(|v| v.value())
+        .unwrap_or(0);
+    let next = current
+        .checked_add(1)
+        .ok_or(StorageError::GenerationCounterOverflow)?;
+    gen_table.insert(GENERATION_KEY, next)?;
+    Ok(())
+}
+
+/// [`prepare_generation_bump`] 済みの `write_txn` を実際に commit する。この呼び出し
+/// 自体（`write_txn.commit()`）が本クレートにおける唯一の「point of no return」
+/// （TASK-96・RECOVER-5）であり、`Err` を返した場合でも durable write が実際には
+/// 発生していたかどうかを呼び出し元から判別できない
+/// （[`crate::recovery::commit_boundary::commit_and_finish`] はこの `Err` を
+/// 「結果不明」として扱い、通常のエラー応答を返さず fail-closed に処理する）。
+pub(crate) fn commit_prepared_write_txn(write_txn: redb::WriteTransaction) -> Result<()> {
     write_txn.commit()?;
     Ok(())
+}
+
+/// [`prepare_generation_bump`] と [`commit_prepared_write_txn`] を連続実行する
+/// 薄いラッパ（TASK-133 P1 対応）。本クレート内の実書き込みを伴う書き込みコミットは
+/// `write_txn.commit()` を直接呼ばずすべて本関数、または
+/// [`crate::recovery::commit_boundary::commit_and_finish`]（この 2 関数を個別に
+/// 呼び分けて point of no return の前後を区別する経路）のいずれかを経由する。
+///
+/// `Storage::put`/`put_batch`・`crate::catalog` の DDL/DML・[`commit_write_txn`]
+/// 経由の `crate::txn::WriteTxn`/`BatchWriteTxn` はいずれも本関数を直接呼ばず
+/// [`crate::recovery::commit_boundary::commit`] 経由で世代カウントへ到達する
+/// （choke point の一本化。詳細は `commit_boundary` モジュールのドキュメントを参照）。
+/// 本関数自体は本クレート内のテスト fixture 等、commit 成功境界の保護区間を
+/// 必要としない直接呼び出し元向けに残している。
+pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> Result<()> {
+    prepare_generation_bump(&write_txn)?;
+    commit_prepared_write_txn(write_txn)
 }
 
 /// `crate::txn::WriteTxn`/`BatchWriteTxn` の commit 経路を一本化する集約点
@@ -362,7 +391,14 @@ pub(crate) fn bump_generation_and_commit(write_txn: redb::WriteTransaction) -> R
 /// 1 回でも行ったかを追跡した結果を渡す契約とする。
 ///
 /// - `has_writes == true`: [`bump_generation_and_commit`] に委譲し、従来どおり
-///   世代を進めてからコミットする。
+///   世代を進めてからコミットする。ただし本関数の唯一の呼び出し元
+///   [`crate::recovery::commit_boundary::commit_write_txn_guarded`] は
+///   `has_writes == false` の場合にのみ本関数へ委譲する契約のため、この分岐は
+///   現状の呼び出し経路網羅では到達しない（`has_writes == true` は
+///   [`commit_write_txn_guarded`] 側で commit 成功境界（RECOVER-5）を張った
+///   [`crate::recovery::commit_boundary::commit`] へ回される）。将来
+///   `has_writes == true` を直接この関数へ渡す呼び出し元を追加する場合は
+///   [`commit_write_txn_guarded`] 経由に倣うこと。
 /// - `has_writes == false`: 変更が何もないため durable write を発生させず、
 ///   `write_txn.abort()` で閉じて世代を進めない（`crate::catalog` の空バッチ
 ///   経路が commit せず drop（= abort）で閉じているのと同方針）。
@@ -492,7 +528,10 @@ impl Storage {
                 .map_err(map_rows_table_error)?;
             table.insert((row.tenant_id, id), encoded.as_slice())?;
         }
-        bump_generation_and_commit(write_txn)
+        // commit 成功境界（TASK-96・RECOVER-5）の choke point 経由でコミットする
+        // （`crate::recovery::commit_boundary` 参照。commit 成功後の応答一意性を
+        // 構造的に保証する）。
+        crate::recovery::commit_boundary::commit(write_txn)
     }
 
     /// 複数行を単一トランザクションで書き込む（対象ビヘイビア: PERSIST-2・TABLE-12）。
@@ -517,7 +556,9 @@ impl Storage {
                 table.insert((row.tenant_id, *id), encoded.as_slice())?;
             }
         }
-        bump_generation_and_commit(write_txn)
+        // commit 成功境界（TASK-96・RECOVER-5）の choke point 経由でコミットする
+        // （[`Storage::put`] と同じ理由）。
+        crate::recovery::commit_boundary::commit(write_txn)
     }
 
     /// 現在の書き込み世代を返す（TASK-133 P1 対応。読み取り専用。1 回の `read_txn` を
