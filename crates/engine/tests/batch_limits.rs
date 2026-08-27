@@ -314,12 +314,14 @@ fn oversized_single_statement_rejected_before_parsing_with_54000_even_for_undefi
         .with_incremental_config(small_chunk_config())
         .with_batch_limits(BatchLimits {
             max_file_body_bytes: 10,
-            max_batch_total_bytes: 10_000,
+            max_batch_total_bytes: 100,
             ..BatchLimits::default()
         });
     let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-    // 予算 = 2 * 10 + 4096 = 4116。これを大きく超える本文を持つ、存在しない
+    // 予算は path に個別上限がない後段契約（③）を基礎に算出する
+    // （`batch_limits.rs` の `raw_sql_len_budget` ドキュメント参照）:
+    // 2 * 100 + 4096 = 4296。これを大きく超える本文を持つ、存在しない
     // テーブルへの INSERT 文を渡す。
     let huge_body = "a".repeat(5_000);
     let sql = insert_file_sql(

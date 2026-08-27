@@ -245,6 +245,15 @@ pub(crate) fn validate_chunk_total(
 /// 生テキストの上限」の安全側の見積りとなる（`overhead` は `INSERT INTO`・
 /// テーブル名・列リスト・`USING OPERATION_ID '<id>'` 句等、本文・パス以外の
 /// 構文分の余裕）。
+///
+/// 呼び出し元は 1 文単位の予算算出に `decoded_max` として
+/// [`BatchLimits::max_batch_total_bytes`] を渡す（[`BatchLimits::max_file_body_bytes`]
+/// ではない）。後段の正式な形状判定（[`validate_batch_shape`]）は `body` に②の
+/// 個別上限を課す一方、`path` には個別上限を課さず `path.len() + body.len()` が
+/// ③（バッチ合計上限）以内であれば 1 文として受理する。したがって 1 文が正当に
+/// 取り得るデコード後の最大長（`path.len() + body.len()` の理論上限）は③であり、
+/// ②を基礎にすると path が大きく body が小さい正当な入力を束縛前に誤って拒否する
+/// （PR #242 レビュー対応）。
 const RAW_SQL_OVERHEAD_BYTES: usize = 4096;
 
 /// [`RAW_SQL_OVERHEAD_BYTES`] のドキュメント参照。
@@ -263,12 +272,14 @@ fn raw_sql_len_budget(decoded_max: usize) -> usize {
 /// ②③（[`validate_batch_shape`]）はデコード後の `path`/`body` 長にしか作用せず、
 /// 束縛処理自体（構文木の構築・文字列複製）は入力サイズに比例した処理を
 /// 判定より前に必ず行ってしまう。本関数は束縛前に呼ぶことで、極端に巨大な単一
-/// SQL 文（②③の実効上限からは通常あり得ない生テキスト長）に対する束縛処理
+/// SQL 文（③の実効上限からは通常あり得ない生テキスト長）に対する束縛処理
 /// そのものを回避する。デコード後の実際の長さに対する正確な判定は
 /// [`validate_batch_shape`]（束縛後、`incremental::index_file_batch` 呼び出し前の
 /// 最終防衛線）が引き続き担い、本関数の予算判定に代わるものではない
 /// （[`raw_sql_len_budget`] が示す通り本関数の予算は 2 倍 + 余裕を持たせた
-/// 保守的な上限であり、正確な上限判定ではない）。
+/// 保守的な上限であり、正確な上限判定ではない）。1 文単位の予算は
+/// [`BatchLimits::max_batch_total_bytes`] を基礎に算出する（`path` に個別上限が
+/// ないため。[`RAW_SQL_OVERHEAD_BYTES`] のドキュメント参照）。
 ///
 /// `running_raw_total` は呼び出し元がこれまでの生テキスト長を `checked_add` で
 /// 累算した値。戻り値は今回の `sql_len` を加算した新しい累計（呼び出し元は次回
@@ -280,7 +291,9 @@ pub(crate) fn validate_raw_sql_len(
     running_raw_total: usize,
     limits: &BatchLimits,
 ) -> Result<usize, BatchLimitsError> {
-    let per_file_budget = raw_sql_len_budget(limits.max_file_body_bytes);
+    // 1 文が正当に取り得るデコード後最大長は body の②ではなく、path に個別上限が
+    // ない後段契約（③）である（RAW_SQL_OVERHEAD_BYTES ドキュメント参照）。
+    let per_file_budget = raw_sql_len_budget(limits.max_batch_total_bytes);
     if sql_len > per_file_budget {
         return Err(BatchLimitsError::SqlTextTooLarge {
             index,
@@ -445,14 +458,14 @@ mod tests {
 
     #[test]
     fn raw_sql_len_accepts_within_per_file_budget() {
-        // max_file_body_bytes=10 → 予算 = 2*10 + 4096 = 4116。
+        // max_batch_total_bytes=30 → 予算 = 2*30 + 4096 = 4156。
         let result = validate_raw_sql_len(0, 100, 0, &limits());
         assert_eq!(result.unwrap(), 100);
     }
 
     #[test]
     fn raw_sql_len_rejects_single_statement_over_per_file_budget() {
-        let budget = raw_sql_len_budget(limits().max_file_body_bytes);
+        let budget = raw_sql_len_budget(limits().max_batch_total_bytes);
         assert!(matches!(
             validate_raw_sql_len(2, budget + 1, 0, &limits()),
             Err(BatchLimitsError::SqlTextTooLarge {
@@ -465,7 +478,7 @@ mod tests {
 
     #[test]
     fn raw_sql_len_accepts_exactly_at_per_file_budget() {
-        let budget = raw_sql_len_budget(limits().max_file_body_bytes);
+        let budget = raw_sql_len_budget(limits().max_batch_total_bytes);
         assert!(validate_raw_sql_len(0, budget, 0, &limits()).is_ok());
     }
 
@@ -473,11 +486,31 @@ mod tests {
     fn raw_sql_len_rejects_when_running_total_exceeds_batch_budget() {
         let batch_budget = raw_sql_len_budget(limits().max_batch_total_bytes);
         // 1 文単独では per-file 予算内でも、累計が batch 予算を超えれば拒否する。
-        let per_file_ok = raw_sql_len_budget(limits().max_file_body_bytes).min(batch_budget);
+        let per_file_ok = raw_sql_len_budget(limits().max_batch_total_bytes).min(batch_budget);
         assert!(matches!(
             validate_raw_sql_len(1, per_file_ok, batch_budget, &limits()),
             Err(BatchLimitsError::BatchSqlTextTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn raw_sql_len_accepts_large_path_small_body_within_batch_total() {
+        // codex P1・Cursor Bugbot 対応の回帰テスト: path が本文上限よりはるかに
+        // 大きく body が小さい正当な入力（後段の正式契約では path に個別上限が
+        // なく、path.len() + body.len() <= max_batch_total_bytes であれば
+        // validate_batch_shape を通過する）が、max_file_body_bytes だけを基礎に
+        // した事前予算では誤って拒否されていたことの回帰テスト（PR #242 対応）。
+        let l = BatchLimits {
+            max_files_per_batch: 4,
+            max_file_body_bytes: 100,
+            max_batch_total_bytes: 1_000_000,
+            max_batch_chunks: 5,
+        };
+        let old_wrong_budget = raw_sql_len_budget(l.max_file_body_bytes);
+        // path 分の余裕を含む生 SQL 長。旧実装（body 基礎の予算）なら拒否される
+        // 大きさだが、path + body は合計上限（③）を満たす正当な入力である。
+        let sql_len = old_wrong_budget + 1;
+        assert!(validate_raw_sql_len(0, sql_len, 0, &l).is_ok());
     }
 
     #[test]
