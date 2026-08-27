@@ -163,6 +163,7 @@ fn err2_sql_surface_error_mapping_is_unchanged() {
         "54000"
     );
     assert_eq!(SqlSurfaceError::IdConflict.wire_code(), "23505");
+    assert_eq!(SqlSurfaceError::DuplicateOperationId.wire_code(), "23505");
     assert_eq!(
         SqlSurfaceError::NumericOutOfRange {
             detail: "x".to_string()
@@ -177,7 +178,33 @@ fn err2_tenant_write_error_mapping_is_unchanged() {
     assert_eq!(TenantWriteError::Forbidden.wire_code(), "42501");
     assert_eq!(TenantWriteError::NotFound.wire_code(), "P0002");
     assert_eq!(TenantWriteError::IdConflict.wire_code(), "23505");
+    assert_eq!(TenantWriteError::DuplicateOperationId.wire_code(), "23505");
     assert_eq!(TenantWriteError::MissingOperationId.wire_code(), "23502");
+}
+
+// --- TASK-94・RECOVER-3: 重複拒否と行 id 衝突は同じ wire_code だが別文言 --------
+
+#[test]
+fn err2_duplicate_operation_id_and_id_conflict_share_wire_code_but_not_message() {
+    // 両者は同一分類（`UniqueViolation`・`23505`）に属するが、クライアントが
+    // 「先行実行が commit 済み」（RECOVER-7 が使う判定）を行キー衝突と取り違えない
+    // よう、固定文言は異なる（tenant.rs・sql/allowlist.rs の doc 参照）。
+    assert_eq!(
+        SqlSurfaceError::IdConflict.wire_code(),
+        SqlSurfaceError::DuplicateOperationId.wire_code()
+    );
+    assert_ne!(
+        SqlSurfaceError::IdConflict.client_message(),
+        SqlSurfaceError::DuplicateOperationId.client_message()
+    );
+    assert_eq!(
+        TenantWriteError::IdConflict.wire_code(),
+        TenantWriteError::DuplicateOperationId.wire_code()
+    );
+    assert_ne!(
+        TenantWriteError::IdConflict.client_message(),
+        TenantWriteError::DuplicateOperationId.client_message()
+    );
 }
 
 // --- 分類境界（構文 vs 値 vs テーブル不在。決定的分類の確認） -------------------

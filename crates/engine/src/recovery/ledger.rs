@@ -13,9 +13,10 @@
 //! 呼ぶ（`tenant.rs` モジュールドキュメント参照）。
 //!
 //! **本タスクのスコープ外**（`tenant.rs` 冒頭ドキュメントおよび PR 本文の申し送り参照）:
-//! 同一 `operation_id` の重複拒否（`23505`）・事前チェックは TASK-94 の管轄。内容照合
-//! ハッシュ（`22023`）は TASK-101 の管轄。本モジュールは「既存エントリを上書きしない
-//! （keep-first）」ことだけを恒久契約として担保する。
+//! 同一 `operation_id` の重複拒否（`23505`）は [`crate::recovery::dedup`]（TASK-94、
+//! 対象ビヘイビア: RECOVER-3）が本モジュールの [`RecordOutcome`] を土台に実装する。
+//! 内容照合ハッシュ（`22023`）は TASK-101 の管轄。本モジュールは「既存エントリを
+//! 上書きしない（keep-first）」ことだけを恒久契約として担保する。
 
 use std::ops::Bound;
 
@@ -91,8 +92,8 @@ pub(crate) enum LedgerWrite<'a> {
     Disabled,
 }
 
-/// [`record_in_txn`] の記録結果。呼び出し元（本タスク時点）は結果を無視してよいが、
-/// 型として残すことで TASK-94 が `AlreadyPresent` を `23505` へ写像する際の土台にする。
+/// [`record_in_txn`] の記録結果。[`crate::recovery::dedup::ensure_first_use`]
+/// （TASK-94・RECOVER-3）が `AlreadyPresent` を `23505` へ写像する際の土台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordOutcome {
     /// 新規記録した。

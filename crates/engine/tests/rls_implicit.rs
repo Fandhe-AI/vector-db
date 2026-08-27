@@ -117,6 +117,12 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
             let ctx =
                 PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
                     .expect("valid tenant");
+            // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
+            // `operation_id` を使う（固定文言の使い回しは同一テナント内の 2 行目以降が
+            // `23505` になる）。
+            let op_id =
+                engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
+                    .expect("valid operation_id");
             engine::tenant::insert_typed_row(
                 storage,
                 TABLE,
@@ -128,8 +134,7 @@ fn seed_multi_tenant_corpus(storage: &Storage) -> Vec<RowTruth> {
                     Value::Text(lang.to_string()),
                     Value::Text(body),
                 ],
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
-                    .expect("valid operation_id"),
+                &op_id,
             )
             .expect("insert row");
             truths.push(RowTruth {

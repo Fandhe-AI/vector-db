@@ -54,6 +54,10 @@ fn setup_single_tenant_table(storage: &Storage, rows: &[(u64, [f32; 2], &str, &s
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
     for (id, emb, path, kind, lang) in rows {
+        // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
+        // `operation_id` を使う（固定文言の使い回しは 2 回目以降が `23505` になる）。
+        let op_id = engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
+            .expect("valid operation id");
         engine::tenant::insert_typed_row(
             storage,
             "docs",
@@ -67,8 +71,7 @@ fn setup_single_tenant_table(storage: &Storage, rows: &[(u64, [f32; 2], &str, &s
                 Value::Text((*lang).to_string()),
                 Value::Null,
             ],
-            &engine::recovery::required_op_id::OperationId::parse("test-op")
-                .expect("valid operation id"),
+            &op_id,
         )
         .expect("insert row");
     }
