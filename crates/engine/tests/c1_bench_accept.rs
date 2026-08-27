@@ -159,6 +159,11 @@ mod e2e {
         ];
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
         for (id, emb) in &corpus {
+            // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
+            // `operation_id` を使う（固定文言の使い回しは 2 回目以降が `23505` になる）。
+            let op_id =
+                engine::recovery::required_op_id::OperationId::parse(&format!("test-op-{id}"))
+                    .expect("valid operation_id");
             engine::tenant::insert_typed_row(
                 &storage,
                 "docs",
@@ -166,8 +171,7 @@ mod e2e {
                 *id,
                 Visibility::Public,
                 &[Value::Vector(emb.to_vec())],
-                &engine::recovery::required_op_id::OperationId::parse("test-op")
-                    .expect("valid operation_id"),
+                &op_id,
             )
             .expect("insert row");
         }

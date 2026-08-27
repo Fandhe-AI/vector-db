@@ -1015,16 +1015,19 @@ fn project_rows(
 /// 重複検出のスコープは**呼び出し元テナントの名前空間内**に閉じる（行ストアの物理
 /// キーが `(tenant_id, id)` であるため。TABLE-12・RLS-9）。したがって:
 ///
-/// - 同一テナント内の `id` 重複のみ [`SqlSurfaceError::IdConflict`]（`23505`）
-/// - 他テナントが同じ `id` を保持していても本経路は成功する（応答・実行経路のいずれも
-///   他テナントの行 id 存在で分岐しないため、存在オラクルにならない）
+/// - 同一テナント内の `id` 重複は [`SqlSurfaceError::IdConflict`]（`23505`）
+/// - 同一 `(tenant_id, table, operation_id)` への 2 回目以降の書き込みは
+///   [`SqlSurfaceError::DuplicateOperationId`]（`23505`。TASK-94・対象ビヘイビア:
+///   RECOVER-3）。台帳追記が行書き込みより先に同一 write トランザクション内で行われる
+///   ため（`tenant.rs` モジュールドキュメント参照）、同一文の再送はこちらが先に検出する
+/// - 他テナントが同じ `id`／`operation_id` を保持していても本経路は成功する
+///   （応答・実行経路のいずれも他テナントの存在で分岐しないため、存在オラクルに
+///   ならない）
 ///
-/// `23505` はあくまで**行キー `(tenant_id, id)` の衝突**であり、`operation_id` を
-/// キーにした同一性照合ではない（codex-review P1 指摘・PR #189）。同一文をそのまま
-/// 再送した場合は同じ行 id への再 INSERT となるため `23505` になるが、これは
-/// 「先行実行が commit 済み」の必要条件にすぎず、`operation_id` 単位の重複拒否・
-/// 内容不一致検出はまだ提供しない（TASK-94・TASK-101、対象ビヘイビア:
-/// RECOVER-3・RECOVER-10 の管轄）。
+/// `23505` は行キー `(tenant_id, id)` の衝突と `operation_id` の重複という 2 つの
+/// 別原因を共有する（`error_format.rs::ErrorClass::UniqueViolation` 参照）。
+/// 内容不一致検出（同一 `operation_id`・異なる内容）は TASK-101、対象ビヘイビア:
+/// RECOVER-10 の管轄で未提供。
 ///
 /// `ledger_mode` は `core.rs::EngineCore` が保持する構成をそのまま受け取り、
 /// `ledger_mode.resolve(bound.operation_id.as_ref())` で
@@ -1065,6 +1068,10 @@ pub(crate) fn execute_insert(
         // 同一テナント内の id 重複（`23505`）。SQL-10 の再送判定が識別できるよう、
         // 値不正（`22000`）へ丸めずに専用の wire_code を維持する。
         TenantWriteError::IdConflict => SqlSurfaceError::IdConflict,
+        // 同一 `operation_id` の重複拒否（TASK-94・対象ビヘイビア: RECOVER-3）。
+        // `tenant::insert_typed_row_unchecked` が台帳の `RecordOutcome::AlreadyPresent`
+        // を写像した結果で、行キー衝突（`IdConflict`）とは別の固定文言を維持する。
+        TenantWriteError::DuplicateOperationId => SqlSurfaceError::DuplicateOperationId,
         // `tenant::insert_typed_row_unchecked` 自体は `operation_id` 必須化ガード
         // （`recovery::required_op_id::LedgerMode`）を持たない（`tenant.rs` モジュール
         // ドキュメント参照）。本経路（SQL `INSERT`）ではガードを
@@ -1186,6 +1193,12 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
         }
         IncrementalError::Write(TenantWriteError::Catalog(CatalogError::Invalid(_))) => {
             SqlSurfaceError::invalid_input("insert rejected: invalid row")
+        }
+        // ファイル形 `INSERT`（`replace_typed_rows_by_text_key` 経由）の同一
+        // `operation_id` 重複拒否（TASK-94・RECOVER-3）。行形 `INSERT`
+        // （`execute_insert`）と同じ写像に揃える。
+        IncrementalError::Write(TenantWriteError::DuplicateOperationId) => {
+            SqlSurfaceError::DuplicateOperationId
         }
         IncrementalError::Write(_) => SqlSurfaceError::Internal {
             detail: "incremental index write failed".to_string(),

@@ -181,15 +181,16 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                     };
                     values.push(Value::Text(cell));
                 }
+                // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
+                // `operation_id` を使う（固定文言の使い回しは 2 回目以降が `23505`
+                // になる）。テーブル・テナントをまたいで一意な `id` を suffix にする。
+                let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
+                    "test-op-{}-{id}",
+                    t.name
+                ))
+                .expect("valid operation_id");
                 engine::tenant::insert_typed_row(
-                    storage,
-                    t.name,
-                    &ctx,
-                    id,
-                    visibility,
-                    &values,
-                    &engine::recovery::required_op_id::OperationId::parse("test-op")
-                        .expect("valid operation_id"),
+                    storage, t.name, &ctx, id, visibility, &values, &op_id,
                 )
                 .expect("insert row");
                 truths.push(RowTruth {
