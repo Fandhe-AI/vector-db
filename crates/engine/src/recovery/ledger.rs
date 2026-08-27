@@ -106,16 +106,30 @@ fn encode_last_op(op_id: &OperationId) -> Vec<u8> {
     buf
 }
 
+/// [`decode_last_op`] の拒否理由（fail-closed の判定結果を運用者向け診断に残すための
+/// 区分。テナント・テーブル名・値の内容は一切保持しない・Low・codex-review 指摘対応）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastOpDecodeError {
+    /// バージョンバイトが未知（空値・[`LAST_OP_FORMAT_VERSION_V1`] 以外）。
+    UnknownVersion,
+    /// バージョンバイト以降が不正 UTF-8。
+    InvalidUtf8,
+    /// UTF-8 としては妥当だが [`OperationId::parse`] が拒否する値。
+    InvalidOperationId,
+}
+
 /// [`LAST_OP_TABLE`] 値のデコード。空値・未知バージョン・不正 UTF-8・
 /// [`OperationId::parse`] が拒否する値はいずれも fail-closed に拒否する
-/// （[`OP_LEDGER_TABLE`] 側の [`decode_entry`] と同方針）。
-fn decode_last_op(value: &[u8]) -> Result<OperationId, UnknownLedgerEntryFormat> {
+/// （[`OP_LEDGER_TABLE`] 側の [`decode_entry`] と同方針）。拒否理由は
+/// [`LastOpDecodeError`] で区別し、呼び出し元（[`last_operation_in_read_txn`]）が
+/// 診断メッセージへ反映する。
+fn decode_last_op(value: &[u8]) -> Result<OperationId, LastOpDecodeError> {
     match value.split_first() {
         Some((&LAST_OP_FORMAT_VERSION_V1, rest)) => {
-            let raw = std::str::from_utf8(rest).map_err(|_| UnknownLedgerEntryFormat)?;
-            OperationId::parse(raw).map_err(|_| UnknownLedgerEntryFormat)
+            let raw = std::str::from_utf8(rest).map_err(|_| LastOpDecodeError::InvalidUtf8)?;
+            OperationId::parse(raw).map_err(|_| LastOpDecodeError::InvalidOperationId)
         }
-        _ => Err(UnknownLedgerEntryFormat),
+        _ => Err(LastOpDecodeError::UnknownVersion),
     }
 }
 
@@ -490,8 +504,15 @@ pub(crate) fn last_operation_in_read_txn(
         Err(e) => return Err(StorageError::from(e)),
     };
     match last_op_table.get((tenant_id, table))? {
-        Some(guard) => decode_last_op(guard.value()).map(Some).map_err(|_| {
-            StorageError::Codec("last_op entry has unknown format version".to_string())
+        Some(guard) => decode_last_op(guard.value()).map(Some).map_err(|e| {
+            // 診断メッセージのみを理由ごとに分ける（テナント・テーブル名・値の内容は
+            // 含めない・security.md P0）。fail-closed の判定自体はどの理由でも同じ。
+            let msg = match e {
+                LastOpDecodeError::UnknownVersion => "last_op entry has unknown format version",
+                LastOpDecodeError::InvalidUtf8 => "last_op entry has invalid utf-8 payload",
+                LastOpDecodeError::InvalidOperationId => "last_op entry has invalid operation_id",
+            };
+            StorageError::Codec(msg.to_string())
         }),
         None => Ok(None),
     }
@@ -1117,6 +1138,41 @@ mod tests {
         let err = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect_err("invalid utf8 must be rejected");
         assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    // (A6-c) UTF-8 としては妥当だが OperationId::parse が拒否する値（ここでは空文字列）
+    // も fail-closed。A6/A6-b とは異なる診断メッセージになることを確認する
+    // （codex-review 指摘対応・3 つの拒否理由を単一メッセージへ丸めない）。
+    #[test]
+    fn last_operation_invalid_operation_id_is_rejected_fail_closed() {
+        let path = unique_db_path("last-op-a6c");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(LAST_OP_TABLE).expect("open table");
+            table
+                .insert(
+                    ("tenant-a", "documents"),
+                    [LAST_OP_FORMAT_VERSION_V1].as_slice(),
+                )
+                .expect("insert raw entry with empty operation_id payload");
+        }
+        write_txn.commit().expect("commit");
+
+        let read_txn = db.begin_read().expect("begin read");
+        let err = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
+            .expect_err("invalid operation_id must be rejected");
+        match &err {
+            StorageError::Codec(msg) => {
+                assert!(
+                    msg.contains("invalid operation_id"),
+                    "expected an operation_id-specific diagnostic, got: {msg}"
+                );
+            }
+            other => panic!("expected StorageError::Codec, got: {other:?}"),
+        }
     }
 
     // (A7) delete_table_in_txn が対象テーブルの last_op を全テナント分削除し、他
