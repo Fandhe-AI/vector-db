@@ -1010,6 +1010,17 @@ impl EngineCore {
     /// `crate::dictionary::DictionaryBuilder` へ供給する。`path`/`body` 列を持たない
     /// テーブルは `CatalogError::Invalid` の固定英語メッセージで拒否する
     /// （既存 `execute_file_insert` 系と同じ「存在情報を漏らさない」写像方針）。
+    ///
+    /// スキーマ・世代の取得（`schema_read_txn`）と行走査（`tenant::visible_rows`）は
+    /// 別スナップショットになりうる（`visible_rows` はページング走査中に複数回
+    /// `read_txn` を開くため、単一 `read_txn` へ統合できない）。そのため行走査後に
+    /// `Storage::current_generation` を再確認し、スキーマ取得時点の世代
+    /// （`built_generation`）と食い違っていれば「新スキーマ前提の行を旧スキーマで
+    /// デコードして破損行として黙ってスキップし、不完全な辞書をあたかも正規の
+    /// ものとして返す」（PR #249 codex-review P1 指摘）事態を防ぐため、その回の
+    /// 結果を破棄して最新スナップショットで再試行する（[`MAX_SNAPSHOT_RETRIES`]
+    /// 回まで。以降も食い違い続ける場合は書き込みが止まらないとみなしエラーで
+    /// 拒否する。fail-closed。security.md「不安全な設計」対応）。
     pub fn dictionary_snapshot(
         &self,
         ctx: &PolicyContext,
@@ -1019,93 +1030,115 @@ impl EngineCore {
             return Ok(dictionary);
         }
 
-        // スキーマと「構築時の世代」を単一の `read_txn`（同一スナップショット）から
-        // 読む（TASK-109・PLAN-5 レビュー対応: Cursor Bugbot Medium "Snapshot mixes
-        // schema and rows"）。以前はスキーマ取得（`Storage::get_table_schema`）と
-        // 世代取得（`Storage::current_generation`）が別々の `read_txn` だったため、
-        // 両呼び出しの間に並行 `ALTER TABLE ADD COLUMN` がコミットされると、
-        // `built_generation` は新世代を指すのに `schema` は旧世代のまま、という
-        // 食い違ったペアを観測しうる。その状態で後続の行走査（`tenant::visible_rows`）
-        // が新世代の行を返すと、旧スキーマでの `row_codec::decode_scalar_columns` が
-        // 新設列を含む行のデコードに失敗し、破損行として黙ってスキップされる
-        // （直下のループ内コメント参照）。その結果生じる不完全な辞書は
-        // `built_generation`（新世代）と `DictionaryCache::insert` 側の再確認時の
-        // 世代が一致してしまうため、そのまま新世代の正規の辞書としてキャッシュされ
-        // 得た。スキーマと世代を同一スナップショットで揃えることで、`built_generation`
-        // が常に `schema` を取得した時点の世代と一致することを保証し、以降の
-        // 世代不一致検出（`DictionaryCache::insert`）が確実に機能するようにする。
-        let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
-        let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
-        let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
-        drop(schema_read_txn);
+        const MAX_SNAPSHOT_RETRIES: u32 = 5;
+        for _ in 0..MAX_SNAPSHOT_RETRIES {
+            // スキーマと「構築時の世代」を単一の `read_txn`（同一スナップショット）
+            // から読む（TASK-109・PLAN-5 レビュー対応: Cursor Bugbot Medium
+            // "Snapshot mixes schema and rows"）。以前はスキーマ取得
+            // （`Storage::get_table_schema`）と世代取得（`Storage::current_generation`）
+            // が別々の `read_txn` だったため、両呼び出しの間に並行
+            // `ALTER TABLE ADD COLUMN` がコミットされると、`built_generation` は
+            // 新世代を指すのに `schema` は旧世代のまま、という食い違ったペアを
+            // 観測しうった。スキーマと世代を同一スナップショットで揃えることで、
+            // `built_generation` が常に `schema` を取得した時点の世代と一致する
+            // ことを保証する。
+            let schema_read_txn = self.storage.db().begin_read().map_err(StorageError::from)?;
+            let schema = crate::catalog::get_table_schema_in_txn(&schema_read_txn, table)?;
+            let built_generation = crate::storage::current_generation_in_txn(&schema_read_txn)?;
+            drop(schema_read_txn);
 
-        let path_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == "path")
-            .ok_or_else(|| {
-                CoreError::from(CatalogError::Invalid(
-                    "table has no path column required for dictionary extraction".to_string(),
-                ))
-            })?;
-        let body_idx = schema
-            .columns
-            .iter()
-            .position(|c| c.name == "body")
-            .ok_or_else(|| {
-                CoreError::from(CatalogError::Invalid(
-                    "table has no body column required for dictionary extraction".to_string(),
-                ))
-            })?;
+            let path_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == "path")
+                .ok_or_else(|| {
+                    CoreError::from(CatalogError::Invalid(
+                        "table has no path column required for dictionary extraction".to_string(),
+                    ))
+                })?;
+            let body_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name == "body")
+                .ok_or_else(|| {
+                    CoreError::from(CatalogError::Invalid(
+                        "table has no body column required for dictionary extraction".to_string(),
+                    ))
+                })?;
 
-        let rows = crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
-            crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
-            // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ丸める
-            // （`TenantError` 自体が既にその契約を満たすが、`CoreError` 側の型に
-            // 昇格し直す。security.md「エラー・ログ経由で他テナントのデータ・
-            // 存在情報を漏らさない」）。
-            crate::tenant::TenantError::TooManyVisibleRows { .. }
-            | crate::tenant::TenantError::TooManyRowsScanned { .. } => CoreError::from(
-                CatalogError::Invalid("too many rows to build dictionary snapshot".to_string()),
-            ),
-            // `verify_hits` 専用の variant で `visible_rows` からは返らない防御的分岐。
-            crate::tenant::TenantError::HitOutsideVisibleSet => {
-                CoreError::from(CatalogError::Invalid(
-                    "unexpected tenant boundary error while building dictionary snapshot"
-                        .to_string(),
-                ))
-            }
-        })?;
+            let rows =
+                crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
+                    crate::tenant::TenantError::Catalog(e) => CoreError::from(e),
+                    // 走査量上限超過は他テナントの存在情報を含まない固定メッセージへ
+                    // 丸める（`TenantError` 自体が既にその契約を満たすが、
+                    // `CoreError` 側の型に昇格し直す。security.md「エラー・ログ
+                    // 経由で他テナントのデータ・存在情報を漏らさない」）。
+                    crate::tenant::TenantError::TooManyVisibleRows { .. }
+                    | crate::tenant::TenantError::TooManyRowsScanned { .. } => {
+                        CoreError::from(CatalogError::Invalid(
+                            "too many rows to build dictionary snapshot".to_string(),
+                        ))
+                    }
+                    // `verify_hits` 専用の variant で `visible_rows` からは返らない
+                    // 防御的分岐。
+                    crate::tenant::TenantError::HitOutsideVisibleSet => {
+                        CoreError::from(CatalogError::Invalid(
+                            "unexpected tenant boundary error while building dictionary snapshot"
+                                .to_string(),
+                        ))
+                    }
+                })?;
 
-        let config = self.dictionary_config.clone();
-        let mut builder = crate::dictionary::DictionaryBuilder::new(config);
-        for row in &rows {
-            let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata) else {
-                // 破損行は辞書構築をこの 1 行分だけ黙ってスキップする（recall 側の
-                // 安全劣化。テナント境界・可視性判定には関与しないため fail-open で
-                // はない。モジュールドキュメント参照）。
+            // 行走査完了後の実世代を確認する。`schema`/`built_generation` 取得後
+            // かつ `visible_rows` の走査完了前に書き込みがコミットされていると、
+            // 走査結果に旧スキーマでは正しくデコードできない新世代の行が混じり
+            // うる。ここで不一致を検出したら、その回の `rows`/`schema` を丸ごと
+            // 破棄し、最新スナップショットを取り直して再試行する（不完全な辞書を
+            // 正規の結果として返さない）。
+            let observed_generation = self.storage.current_generation()?;
+            if observed_generation != built_generation {
                 continue;
-            };
-            let path = match values.get(path_idx) {
-                Some(crate::row_codec::Value::Text(s)) => s.as_str(),
-                _ => continue,
-            };
-            let body = match values.get(body_idx) {
-                Some(crate::row_codec::Value::Text(s)) => s.as_str(),
-                _ => continue,
-            };
-            builder.ingest(path, body);
+            }
+
+            let config = self.dictionary_config.clone();
+            let mut builder = crate::dictionary::DictionaryBuilder::new(config);
+            for row in &rows {
+                let Ok(values) = crate::row_codec::decode_scalar_columns(&schema, &row.metadata)
+                else {
+                    // 破損行は辞書構築をこの 1 行分だけ黙ってスキップする（recall
+                    // 側の安全劣化。テナント境界・可視性判定には関与しないため
+                    // fail-open ではない。モジュールドキュメント参照）。上記の
+                    // 世代再確認により、この分岐が並行スキーマ変更由来の食い違い
+                    // を隠す経路にはならない。
+                    continue;
+                };
+                let path = match values.get(path_idx) {
+                    Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                    _ => continue,
+                };
+                let body = match values.get(body_idx) {
+                    Some(crate::row_codec::Value::Text(s)) => s.as_str(),
+                    _ => continue,
+                };
+                builder.ingest(path, body);
+            }
+            let dictionary = builder.finish();
+            let approx_bytes = dictionary.approx_heap_bytes();
+            return Ok(self.dictionary_cache.insert(
+                &self.storage,
+                table,
+                ctx,
+                dictionary,
+                built_generation,
+                approx_bytes,
+            ));
         }
-        let dictionary = builder.finish();
-        let approx_bytes = dictionary.approx_heap_bytes();
-        Ok(self.dictionary_cache.insert(
-            &self.storage,
-            table,
-            ctx,
-            dictionary,
-            built_generation,
-            approx_bytes,
-        ))
+
+        // 継続的な並行書き込みで整合したスナップショットを得られなかった。
+        // 不完全な辞書を黙って返さず fail-closed に拒否する。
+        Err(CoreError::from(CatalogError::Invalid(
+            "dictionary snapshot generation kept changing during row scan; retry later".to_string(),
+        )))
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。

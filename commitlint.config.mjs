@@ -20,5 +20,13 @@ export default {
   // commitlint の検証対象から明示的に除外する。以降の base 取り込みコミットは
   // 通常の Conventional Commits 形式（例: `chore(engine): base ブランチの変更を
   // 取り込む`）を使うため、本 ignore は過去コミットの後方互換のためだけに残す。
-  ignores: [(commit) => /^merge:\s/i.test(commit)],
+  // 正規表現を subject 接頭辞（`/^merge:\s/i`）にすると、今後 subject 内容を
+  // 問わず追加される任意の `merge: ...` コミットまで恒久的に検証対象外にして
+  // しまう（PR #249 codex-review P1 指摘）ため、実在する既知の履歴コミットの
+  // subject 行（1 行目）への完全一致に限定する。`ignores` の各関数には commit
+  // の生メッセージ全体（本文・フッターを含む）が渡されるため、本文側の内容は
+  // 問わず 1 行目だけを比較する。
+  ignores: [
+    (commit) => commit.split('\n', 1)[0] === 'merge: origin/main を取り込み',
+  ],
 };
