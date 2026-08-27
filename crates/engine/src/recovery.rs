@@ -15,12 +15,8 @@
 //! ビヘイビア: RECOVER-5）を提供する（詳細は `commit_boundary` モジュール
 //! ドキュメント参照）。
 //!
-//! [`ledger`] は TASK-98（対象ビヘイビア: RECOVER-7）で二層構造へ拡張済み:
-//! 一層目（重複判定用・全 `operation_id` を keep-first 保持）に加え、二層目
-//! （照会用・テーブルあたり最終 commit 済み `operation_id` の単一値）を持つ。
-//! commit 直後にクライアントが応答を受領できなかった場合の回復は、同一内容の
-//! 再送（第一の確定手段）を照会（補助手段）より優先する契約を `ledger` モジュール
-//! ドキュメントに明記している。
+//! [`ledger`] は TASK-98（対象ビヘイビア: RECOVER-7）の対応も含む（詳細は
+//! `ledger` モジュールドキュメント参照）。
 
 pub mod commit_boundary;
 pub(crate) mod content_hash;

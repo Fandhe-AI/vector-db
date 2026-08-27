@@ -1,15 +1,11 @@
 //! 障害回復の 2 経路回復の結合テスト（TASK-98、対象ビヘイビア: RECOVER-7。ポインタ:
-//! `docs/spec/05-tasks.md` TASK-98・`docs/spec/04-behavior/recovery.md` RECOVER-7）。
+//! `docs/spec/05-tasks.md` TASK-98・`docs/spec/04-behavior/recovery.md` RECOVER-7。
+//! 契約の詳細は spec 参照）。
 //!
 //! `tests/recovery_ledger.rs`（TASK-93）・`tests/recovery_content_hash.rs`（TASK-101）
 //! と同じ流儀（実 `Storage` + `CpuScalarProvider`、`EngineCore::from_storage`）で、
-//! commit 直後にクライアントが応答を受領できなかった場合の 2 つの回復経路を検証する:
-//!
-//! - **第一の確定手段（再送）**: 同一内容の `operation_id` 再送が `23505` を返せば
-//!   commit 済みと確定できる（一層目 `op_ledger`。後続 commit の有無によらず有効）。
-//! - **補助手段（照会）**: [`EngineCore::last_operation_id`] は「当該呼び出し以降に
-//!   同一テーブルへの後続 commit が発生していない場合にのみ」有効という設計制約付き
-//!   （二層目 `last_op`。後続 commit で値が置き換わる）。
+//! 同一内容の `operation_id` 再送（`23505`）と [`EngineCore::last_operation_id`]
+//! による照会の 2 経路を検証する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -55,9 +51,8 @@ fn row<'a>(embedding: &'a [f32], metadata: &'a [u8]) -> RowInput<'a> {
     }
 }
 
-// --- B1: 再送経路（第一の確定手段）。成功 commit 後、別セッション相当の後続 commit
-//         （別 operation_id）を挟んでも、同一内容の再送は 23505 のまま検出できる
-//         （一層目に基づくため後続 commit の有無によらず有効）。 -----------------
+// --- B1: 再送経路。成功 commit 後、別セッション相当の後続 commit（別 operation_id）
+//         を挟んでも、同一内容の再送は 23505 のまま検出できる。 -----------------
 
 #[test]
 fn b1_resend_detection_is_unaffected_by_subsequent_commits() {
@@ -126,9 +121,8 @@ fn b2_unused_operation_id_executes_normally_confirming_not_committed() {
     );
 }
 
-// --- B3: 照会経路（補助手段）。成功 commit 直後は last_operation_id が当該 ID を
-//         返す。同一テーブルへの後続 commit 後は新しい ID に置き換わる（＝古い ID の
-//         成否確定には使えないという設計制約が観測できる）。 ---------------------
+// --- B3: 照会経路。成功 commit 直後は last_operation_id が当該 ID を返す。同一
+//         テーブルへの後続 commit 後は新しい ID に置き換わる。 -------------------
 
 #[test]
 fn b3_last_operation_id_is_advisory_and_replaced_by_later_commit() {
@@ -161,8 +155,7 @@ fn b3_last_operation_id_is_advisory_and_replaced_by_later_commit() {
     )
     .expect("second insert must succeed");
 
-    // 設計制約: 照会結果は最新値に置き換わり、op-b3-first の成否確定にはもう使えない
-    // （このため再送＝第一の確定手段が必要という契約が成立する）。
+    // 照会結果は最新値に置き換わり、op-b3-first の成否確定にはもう使えない。
     assert_eq!(
         core.last_operation_id(&ctx, TABLE).expect("lookup ok"),
         LastOperationLookup::Committed(op("op-b3-second")),

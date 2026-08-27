@@ -21,15 +21,9 @@
 //! （本モジュールは「既存エントリを上書きしない（keep-first）」ことを引き続き
 //! 恒久契約として担保する）。
 //!
-//! TASK-98（対象ビヘイビア: RECOVER-7）で二層目 [`LAST_OP_TABLE`] を追加した。
-//! 一層目 [`OP_LEDGER_TABLE`]（全 `operation_id` を keep-first で保持・重複判定用）と
-//! 異なり、二層目はテーブルあたり最新の commit 済み `operation_id` 1 件のみを保持する
-//! 照会用の補助テーブルである。commit 直後にクライアントが応答を受領できなかった
-//! 場合の回復手段としては、**同一内容の再送**（本モジュールの重複判定。`23505` 受領＝
-//! commit 済み確定）を第一の確定手段とし、[`last_operation_in_read_txn`] による照会は
-//! 「当該呼び出し以降に同一テーブルへの後続 commit が発生していない場合にのみ有効」な
-//! 補助手段に留める（後続 commit で値が置き換わるため、古い `operation_id` の成否を
-//! 確定する根拠にはならない）。
+//! TASK-98（対象ビヘイビア: RECOVER-7）で [`LAST_OP_TABLE`] を追加した（ポインタ:
+//! `docs/spec/05-tasks.md` TASK-98・`docs/spec/04-behavior/recovery.md` RECOVER-7。
+//! 契約の詳細は spec 参照）。
 
 use std::ops::Bound;
 
@@ -55,7 +49,7 @@ use crate::storage::StorageError;
 /// 値は v1（バージョンバイトのみ）・v2（バージョンバイト＋32 バイト内容ハッシュ。
 /// TASK-101・RECOVER-10）のいずれか。未知バージョンの値は fail-closed に拒否する
 /// （[`decode_entry`]）。TASK-98（RECOVER-7）は本テーブルの意味・フォーマットを
-/// 変えず、二層目として別テーブル [`LAST_OP_TABLE`] を追加する形で拡張した。
+/// 変えず、別テーブル [`LAST_OP_TABLE`] を追加する形で拡張した。
 ///
 /// カタログ（`Storage::list_tables` 等）はユーザーテーブルのみを列挙する既存設計のため、
 /// 本テーブル名 `op_ledger` はユーザーから見えるテーブル一覧に混入しない。
@@ -79,11 +73,10 @@ fn encode_entry_v2(hash: &ContentHash) -> Vec<u8> {
     buf
 }
 
-/// 二層目「最終 commit 済み `operation_id`」照会テーブル（TASK-98、対象ビヘイビア:
+/// 最終 commit 済み `operation_id` 照会テーブル（TASK-98、対象ビヘイビア:
 /// RECOVER-7）。
 ///
-/// キーは `(tenant_id, table_name)`。[`OP_LEDGER_TABLE`] と異なり `operation_id` を
-/// キーに含めない（テーブルあたり最新 1 件のみを保持する単一値ストアのため）。
+/// キーは `(tenant_id, table_name)`。
 ///
 /// - `tenant_id` は [`OP_LEDGER_TABLE`] と同じくサーバー側導出のみを使う
 ///   （security.md P0・TABLE-12・RLS-9）。
@@ -251,8 +244,8 @@ pub enum LedgerLookup {
 /// を渡すこと。台帳追記は行の書き込み/削除と同一トランザクションになるため、
 /// 呼び出し元が後続で commit しなければ台帳エントリも一緒に破棄される（原子性）。
 ///
-/// 既存キーがあれば**上書きしない**（keep-first。台帳の恒久契約。TASK-98 が二層目
-/// `last_op` を追加する際もこの一層目の意味は変えない）。
+/// 既存キーがあれば**上書きしない**（keep-first。台帳の恒久契約。TASK-98 の
+/// `last_op` 追加でもこの意味は変えない）。
 ///
 /// `content_hash`（TASK-101・RECOVER-10）: 既存エントリが検出された場合、
 /// v2（内容ハッシュ保持）なら渡された `content_hash` と照合し、一致すれば
@@ -292,12 +285,9 @@ pub(crate) fn record_in_txn(
         };
     }
     ledger_table.insert(key, encode_entry_v2(content_hash).as_slice())?;
-    // 二層目 `last_op`（TASK-98・RECOVER-7）: 一層目への新規記録が確定した場合のみ
-    // 同一 write トランザクション内で upsert する（`Duplicate`/`ContentMismatch`
-    // 経路は上の match で早期 return 済みのためここへ到達しない＝書き込みが拒否された
-    // 再送では更新しない）。単一値のため既存有無を問わず上書きしてよい
-    // （`op_ledger` の keep-first 契約とは独立。commit しなければ一層目と共に
-    // 破棄される＝原子性は `write_txn` の commit/drop に委ねる）。
+    // `last_op`（TASK-98・RECOVER-7）: 同一 write トランザクション内で upsert する
+    // （`op_ledger` の keep-first 契約とは独立。原子性は `write_txn` の commit/drop
+    // に委ねる）。
     let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
     last_op_table.insert((tenant_id, table), encode_last_op(op_id).as_slice())?;
     Ok(RecordOutcome::Recorded)
@@ -391,11 +381,9 @@ pub(crate) fn delete_table_in_txn(
         }
     }
 
-    // 二層目 `last_op`（TASK-98・RECOVER-7）: 一層目と同じ理由で対象テーブル名分を
-    // 全テナントから削除する（drop → 同名再作成での旧 `last_op` 引き継ぎ防止。
-    // キー先頭が `tenant_id` のため一層目と同じ有界バッチ走査パターンを踏襲する。
-    // テーブルあたり最大 1 エントリ×テナント数のため一層目より件数は少ないが、
-    // 実装・レビュー観点を揃えるため同じ形にする）。
+    // `last_op`（TASK-98・RECOVER-7）: 対象テーブル名分を全テナントから削除する
+    // （drop → 同名再作成での旧 `last_op` 引き継ぎ防止。有界バッチ走査パターンは
+    // 上の `OP_LEDGER_TABLE` 側と揃える）。
     if existing_table_names.contains(LAST_OP_TABLE.name()) {
         let mut last_op_table = write_txn.open_table(LAST_OP_TABLE)?;
         let mut resume_after: Option<(String, String)> = None;
@@ -465,41 +453,25 @@ pub(crate) fn contains_in_read_txn(
 }
 
 /// [`crate::core::EngineCore::last_operation_id`] の照会結果（TASK-98、対象ビヘイビア:
-/// RECOVER-7）。[`LedgerLookup`] と同じ設計原則で `NoLedger` を `NotFound` へ丸めない
-/// （`LedgerMode::CompareOnlyWithoutLedger` では台帳を一切持たないため「未記録」と
-/// 「そもそも台帳を持たない」を型で区別する）。
-///
-/// `Committed` は補助手段としての契約付き: 当該テーブルへの後続 commit が発生して
-/// いなければ「返された `operation_id` の書き込みは commit 済み」の根拠として使える
-/// が、後続 commit があれば新しい値へ置き換わっている（本モジュール冒頭ドキュメント
-/// 参照）。commit 済み確定の第一の手段は、常に同一内容の再送（本モジュールの重複
-/// 判定）である。
+/// RECOVER-7。契約の詳細は spec 参照）。[`LedgerLookup`] と同じ設計原則で `NoLedger`
+/// を `NotFound` へ丸めない（`LedgerMode::CompareOnlyWithoutLedger` では台帳を一切
+/// 持たないため「未記録」と「そもそも台帳を持たない」を型で区別する）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LastOperationLookup {
     /// テーブルあたり最後に commit 記録された `operation_id`。
     Committed(OperationId),
-    /// 台帳あり構成だが、当該テーブルへの記録がまだ 1 件もない（`op_ledger`・
-    /// `last_op` いずれにも当該 `(tenant_id, table)` の記録が存在しない、真の
-    /// 未記録）。
+    /// 台帳あり構成だが、当該テーブルへの記録がまだ 1 件もない（真の未記録）。
     NotFound,
     /// 台帳を持たない構成（[`LedgerWrite::Disabled`]）のため照会できない。
     NoLedger,
-    /// `last_op`（二層目、TASK-98 で追加）テーブル導入前に書かれた `op_ledger`
-    /// （一層目）記録が当該 `(tenant_id, table)` に存在するが、`last_op` には
-    /// まだ記録がなく、正確な最終 `operation_id` を復元できない
-    /// （codex-review P1 指摘対応。`op_ledger` は commit 順序を保持しないため、
-    /// `last_op` 導入前の DB をアップグレード直後に照会した場合や、それ以降
-    /// 当該テーブルへの commit が一度も発生していない場合に生じうる）。
-    /// `NotFound`（真の未記録）へ丸めない fail-closed な区別: 呼び出し元は
-    /// 「未記録」の根拠として扱わず、同一内容の再送（本モジュールの重複判定）
-    /// を確定手段として使う。
+    /// 正確な最終 `operation_id` を復元できないため `NotFound`（真の未記録）へ
+    /// 丸めず fail-closed に区別する区分（TASK-98・RECOVER-7、codex-review P1
+    /// 指摘対応）。
     Unavailable,
 }
 
-/// [`last_operation_in_read_txn`] の生の照会結果。`last_op`（二層目）テーブルの
-/// 状態に加え、`op_ledger`（一層目）由来の移行状態判定（[`LastOperationLookup::Unavailable`]
-/// 参照）を含む。呼び出し元（[`crate::tenant::last_operation`] 経由で
-/// [`crate::core::EngineCore::last_operation_id`]）が `LastOperationLookup` へ写像する。
+/// [`last_operation_in_read_txn`] の生の照会結果。呼び出し元（[`crate::tenant::last_operation`]
+/// 経由で [`crate::core::EngineCore::last_operation_id`]）が `LastOperationLookup` へ写像する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LastOperationRaw {
     /// `last_op` に記録済み。
@@ -507,16 +479,14 @@ pub(crate) enum LastOperationRaw {
     /// `last_op`・`op_ledger` いずれにも当該 `(tenant_id, table)` の記録がない
     /// （真の未記録）。
     NotFound,
-    /// `last_op` には記録がないが `op_ledger` には記録がある（[`LastOperationLookup::Unavailable`]
-    /// 参照）。
+    /// [`LastOperationLookup::Unavailable`] に対応する状態（詳細は同 variant 参照）。
     LegacyLedgerWithoutLastOp,
 }
 
-/// `op_ledger`（一層目）に `(tenant_id, table)` の記録が 1 件でも存在するかを確認する
-/// （TASK-98、対象ビヘイビア: RECOVER-7・codex-review P1 指摘対応）。
-/// [`last_operation_in_read_txn`] が `last_op`（二層目）に記録なしと判定した際、それが
-/// 「本当に未記録」か「`last_op` テーブル導入〔TASK-98〕前の DB に旧 `op_ledger` 記録
-/// だけが残っている（アップグレード直後等）」かを区別するために使う。
+/// `op_ledger` に `(tenant_id, table)` の記録が 1 件でも存在するかを確認する
+/// （TASK-98、対象ビヘイビア: RECOVER-7・codex-review P1 指摘対応。契約の詳細は
+/// spec 参照）。[`last_operation_in_read_txn`] が [`LastOperationRaw::LegacyLedgerWithoutLastOp`]
+/// を判定するために使う。
 ///
 /// `op_ledger` のキーは `(tenant_id, table_name, operation_id)` の辞書順のため、
 /// `(tenant_id, table, "")` を下限とする range の先頭 1 件を見るだけで判定でき、
@@ -545,13 +515,11 @@ fn op_ledger_has_entry_for(
 }
 
 /// `read_txn` 内で `(tenant_id, table)` の最終 commit 済み `operation_id` を照会する
-/// （TASK-98、対象ビヘイビア: RECOVER-7）。`last_op`（二層目）にテーブル不在・記録
-/// なしのいずれでも、[`op_ledger_has_entry_for`] で `op_ledger`（一層目）に当該
-/// `(tenant_id, table)` の記録が残っていないかを確認してから `NotFound` を確定する
-/// （`last_op` 導入前の DB をアップグレード直後に照会したケースを「未記録」と誤判定
-/// しない・codex-review P1 指摘対応。[`LastOperationRaw::LegacyLedgerWithoutLastOp`]
-/// 参照）。未知フォーマットバージョン・不正 UTF-8・不正な `operation_id` はいずれも
-/// fail-closed に拒否する（[`decode_last_op`]）。
+/// （TASK-98、対象ビヘイビア: RECOVER-7。契約の詳細は spec 参照）。`last_op` に
+/// テーブル不在・記録なしのいずれでも、[`op_ledger_has_entry_for`] を用いて
+/// `NotFound` を確定する前に [`LastOperationRaw::LegacyLedgerWithoutLastOp`] 判定を
+/// 経る（codex-review P1 指摘対応）。未知フォーマットバージョン・不正 UTF-8・不正な
+/// `operation_id` はいずれも fail-closed に拒否する（[`decode_last_op`]）。
 ///
 /// 呼び出し元（[`crate::tenant::last_operation`]）が `tenant_id` をサーバー側導出値に
 /// 限定する（security.md P0・TABLE-12・RLS-9）。
@@ -995,7 +963,7 @@ mod tests {
         }
     }
 
-    // --- TASK-98・RECOVER-7: 二層目 `last_op` の照会 API ------------------------
+    // --- TASK-98・RECOVER-7: `last_op` の照会 API ------------------------------
 
     // (A1) 成功 commit 後、last_operation_in_read_txn が当該 operation_id を返す。
     #[test]
@@ -1021,7 +989,7 @@ mod tests {
         assert_eq!(found, LastOperationRaw::Found(op("op-a1")));
     }
 
-    // (A2) 同一テーブルへの後続 commit で last_op が置き換わる（単一値）。一方、一層目
+    // (A2) 同一テーブルへの後続 commit で last_op が置き換わる。一方、op_ledger
     // op_ledger の既存エントリは削除・置換されない（keep-first 併存確認）。
     #[test]
     fn last_operation_is_replaced_by_subsequent_commit_while_op_ledger_keeps_first() {
@@ -1055,7 +1023,7 @@ mod tests {
         let last = last_operation_in_read_txn(&read_txn, "tenant-a", "documents")
             .expect("last_operation_in_read_txn");
         assert_eq!(last, LastOperationRaw::Found(op("op-a2-second")));
-        // 一層目は両方とも記録済みのまま（keep-first で先着エントリも消えない）。
+        // op_ledger は両方とも記録済みのまま（keep-first で先着エントリも消えない）。
         assert!(
             contains_in_read_txn(&read_txn, "tenant-a", "documents", &op("op-a2-first"))
                 .expect("contains first")
@@ -1330,9 +1298,9 @@ mod tests {
         assert!(!table_names.iter().any(|name| name == LAST_OP_TABLE.name()));
     }
 
-    // --- codex-review P1 指摘対応: `last_op` 導入前 DB のアップグレード直後照会 -----
+    // --- codex-review P1 指摘対応: `last_op` 導入前 DB の照会 --------------------
 
-    // (A8) `last_op` テーブルが未作成のまま `op_ledger`（一層目）にのみ記録がある
+    // (A8) `last_op` テーブルが未作成のまま `op_ledger` にのみ記録がある
     // （`last_op` 導入〔TASK-98〕前に書かれた DB を模す）場合、`NotFound`
     // （未記録）へ丸めず `LegacyLedgerWithoutLastOp` を返す。
     #[test]
@@ -1341,8 +1309,8 @@ mod tests {
         let _guard = CleanupGuard(path.clone());
         let db = redb::Database::create(&path).expect("create db");
 
-        // `record_in_txn` は一層目・二層目を同一トランザクションで書くため、旧 DB を
-        // 模すには一層目 `op_ledger` のみへ直接書き込む（`last_op` には触れない）。
+        // `record_in_txn` は両テーブルを同一トランザクションで書くため、旧 DB を
+        // 模すには `op_ledger` のみへ直接書き込む（`last_op` には触れない）。
         let write_txn = db.begin_write().expect("begin write");
         {
             let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE).expect("open table");
