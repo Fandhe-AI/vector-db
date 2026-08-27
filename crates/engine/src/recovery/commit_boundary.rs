@@ -4,9 +4,14 @@
 //! （point of no return）と定め、書き込み実行中の失敗タイミングを問わず
 //! 1 回の呼び出しに対する応答が常に一意（二重応答なし）であることを構造的に
 //! 保証する choke point を提供する。呼び出し元は `crate::tenant`（各
-//! `*_unchecked` 関数）と `crate::txn`（`WriteTxn`/`BatchWriteTxn` の commit
-//! 一本化点）で、いずれも wire 層の DML 入口（`crate::core::EngineCore`）が
-//! 最終的に通る経路。
+//! `*_unchecked` 関数）・`crate::txn`（`WriteTxn`/`BatchWriteTxn` の commit
+//! 一本化点、[`commit_write_txn_guarded`] 経由）に加え、`crate::storage`
+//! （`Storage::put`/`put_batch`）・`crate::catalog`（テーブル DDL・
+//! `insert_row_into_table` 系の DML）が [`commit`] を直接呼ぶ経路も含む
+//! （本クレート内で実書き込みを伴う commit（`write_txn.commit()` を到達させる
+//! 経路）はすべて本モジュールの choke point を経由し、`crate::storage::
+//! bump_generation_and_commit` を直接呼ばない）。これらはいずれも wire 層の
+//! DML 入口（`crate::core::EngineCore`）が最終的に通る経路。
 //!
 //! 失敗タイミングの三分類（RECOVER-5）と本モジュールの役割:
 //!

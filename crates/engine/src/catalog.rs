@@ -677,7 +677,7 @@ impl Storage {
             }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブル定義（`CATALOG_TABLE` エントリ）と、対応する行ストア
@@ -728,7 +728,7 @@ impl Storage {
         // エントリが同居するため）。
         crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
             .map_err(convert_storage_error)?;
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// 既存テーブルへ列を末尾追記する（TABLE-5）。追加列は暗黙 nullable として
@@ -766,7 +766,7 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブル定義を読み出す（スナップショット読み取り）。存在しない場合は
@@ -824,7 +824,7 @@ impl Storage {
             // （認可済みの名前空間で書くのは `crate::tenant::insert_row` の責務）。
             row_table.insert((row.tenant_id, id), encoded.as_slice())?;
         }
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブルスコープで複数行を単一トランザクションで挿入する（TASK-146、対象ビヘイビア:
@@ -873,7 +873,7 @@ impl Storage {
                 row_table.insert((row.tenant_id, *id), encoded.as_slice())?;
             }
         }
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// スキーマ列順の型付き値列（[`row_codec::Value`]）から 1 行挿入する（TASK-75、
@@ -935,7 +935,7 @@ impl Storage {
             // （呼び出し元がテナントを明示する契約）。
             row_table.insert((tenant_id, id), encoded.as_slice())?;
         }
-        crate::storage::bump_generation_and_commit(write_txn).map_err(convert_storage_error)
+        crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
     /// テーブルスコープで、指定テナントの名前空間から 1 行取得する（スナップショット
