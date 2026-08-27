@@ -88,6 +88,18 @@ pub const MAX_BATCH_WORK: usize = 10_000_000_000;
 /// （最大 [`MAX_BATCH_DIM`] 要素 = 32KiB）を複数サイズクラス分アイドル保持できる
 /// 程度の桁とし、[`MAX_BATCH_TOTAL_BYTES`]（常駐行列本体の上限。1 GiB）と比べて
 /// 十分小さい値に抑える（プールは性能最適化であり、常駐行列本体の予算を圧迫しない）。
+///
+/// Issue #170（INDEX-4・TASK-122 実装後の再整合）: 一括投入経路（`incremental.rs`）は
+/// 本プールを直接使わない。本プールのピーク理論上限（本定数＋最大サイズクラス 1 個分）は
+/// 一括投入経路の合計予算の fail-closed 既定値 `incremental::MAX_INDEX_TOTAL_BYTES`
+/// （64 MiB）以下という桁感を保つよう独立に設定してあるが、これは**プール単体の上限**が
+/// 一括投入経路の上限と同程度の桁に収まることの documentation-level な整合であり、
+/// 両経路が同一プロセス内で同時に確保し得るプロセス全体のピーク使用量
+/// （概ね `incremental_usage + pool_peak`）を共通予算内に収める保証ではない
+/// （両経路の合計を上限と比較する実行時の共有予算制御・一方の確保中に他方を縮小する
+/// 仕組みは本モジュールに存在しない）。この「独立上限としての桁感」の大小関係のみを
+/// `tests::pool_quota_stays_within_batch_limits_budget` で固定する（`buffer_pool.rs`
+/// モジュールコメントの (b) に対応）。
 const ROW_BUFFER_POOL_QUOTA_BYTES: usize = 16 * 1024 * 1024;
 
 /// バッチ経路の行デコード用スクラッチバッファのプロセス共有プール（TASK-157・
@@ -2797,4 +2809,114 @@ mod tests {
     // BatchEngine が SearchProvider を実装しないこと（単発経路へ構造的に
     // 接続できないことのコンパイル時の裏付け）は型シグネチャそのものが保証する
     // ため実行時テストは不要（`kernel.rs::SearchProvider` を implement していない）。
+
+    // Issue #170（INDEX-4・TASK-122 実装後のバッチ経路バッファプール上限再整合）:
+    // `buffer_pool.rs`（TASK-157・CORE-15）導入時に申し送りとして残った、プール上限と
+    // 一括投入経路（`batch_limits.rs`・TASK-122）の上限との再整合を、以下の 3 テストで
+    // 固定する。いずれも環境変数で注入可能な `batch_limits.rs` の実行時値ではなく、
+    // fail-closed 既定のフォールバック定数（本リポの公開定数）に対して検証する
+    // （実行環境やテスト実行順に依存しない整合検証とするため）。
+
+    // 不変条件 (a): バッチ経路で到達しうる最大サイズクラス 1 個分が本プールの総量上限
+    // 以下であり、プールが「格納せず即破棄」に縮退しないこと（`buffer_pool.rs` モジュール
+    // コメントの (a) に対応）。静的な大小関係に加え、実際に最大クラスのバッファが
+    // `release` 後にアイドル保持されることも動的に確認する。
+    #[test]
+    fn pool_max_size_class_stays_retainable_within_quota() {
+        let max_class = match crate::buffer_pool::size_class_for(MAX_BATCH_DIM) {
+            Some(class) => class,
+            None => panic!("MAX_BATCH_DIM must map to a valid size class"),
+        };
+        assert!(
+            crate::buffer_pool::class_bytes(max_class) <= ROW_BUFFER_POOL_QUOTA_BYTES,
+            "max size class ({} bytes) must fit within the pool quota ({} bytes), \
+             otherwise the pool degrades to allocate-and-discard for every batch call",
+            crate::buffer_pool::class_bytes(max_class),
+            ROW_BUFFER_POOL_QUOTA_BYTES
+        );
+
+        let mut pool = crate::buffer_pool::BufferPool::new(ROW_BUFFER_POOL_QUOTA_BYTES);
+        let pooled = pool
+            .acquire(MAX_BATCH_DIM, MAX_BATCH_DIM)
+            .expect("MAX_BATCH_DIM must be acceptable at max_elems == MAX_BATCH_DIM");
+        pool.release(pooled);
+        assert!(
+            pool.retained_bytes() > 0,
+            "the max-class buffer must be retained idle after release, not discarded"
+        );
+    }
+
+    // 不変条件 (b): プールのピーク理論上限（総量上限＋最大クラス 1 個分。CORE-15 の
+    // ピーク有界性テストと同じ計算式）が一括投入経路の合計予算の fail-closed 既定値
+    // （`incremental::MAX_INDEX_TOTAL_BYTES`）以下であること。
+    //
+    // 注意（Issue #170 codex-review 指摘対応）: このテストが固定するのはプール単体の
+    // ピーク上限が一括投入経路の予算と同程度の桁に収まる、という **独立上限としての
+    // 桁感**のみである。プールは一括投入経路を直接使わないが（モジュール冒頭コメント
+    // 参照）、両経路は同一プロセス内で同時に確保され得るため、プロセス全体の実ピーク
+    // 使用量は概ね `incremental_usage + pool_peak` であり、本テストの
+    // `pool_peak <= MAX_INDEX_TOTAL_BYTES` という比較だけでは「両経路が同一プロセスの
+    // 共有メモリ予算内に収まる」ことは何も保証しない。両経路の合計を共通上限と比較する
+    // 実行時の共有予算制御や、一方の確保中に他方を縮小・解放する仕組みは本モジュールに
+    // 存在せず、本テストもそれを代替しない（各経路が自身の上限内に収まることのみを
+    // 独立に固定する）。
+    #[test]
+    fn pool_quota_stays_within_batch_limits_budget() {
+        let max_class = match crate::buffer_pool::size_class_for(MAX_BATCH_DIM) {
+            Some(class) => class,
+            None => panic!("MAX_BATCH_DIM must map to a valid size class"),
+        };
+        let peak_theoretical_upper_bound =
+            ROW_BUFFER_POOL_QUOTA_BYTES.saturating_add(crate::buffer_pool::class_bytes(max_class));
+        assert!(
+            peak_theoretical_upper_bound <= crate::incremental::MAX_INDEX_TOTAL_BYTES,
+            "pool peak theoretical upper bound ({peak_theoretical_upper_bound} bytes) must not \
+             exceed the bulk-ingest fallback budget (incremental::MAX_INDEX_TOTAL_BYTES = {} \
+             bytes); this is an independent-quota sanity bound only — it does NOT establish a \
+             combined per-process budget across the pool and bulk-ingest paths (the process-wide \
+             peak when both are live concurrently is roughly incremental_usage + pool_peak, which \
+             this assertion does not bound)",
+            crate::incremental::MAX_INDEX_TOTAL_BYTES
+        );
+    }
+
+    // 不変条件 (c): 一括投入経路が正当に生成しうる次元（`storage::MAX_EMBEDDING_DIM` まで）
+    // のうち `MAX_BATCH_DIM` 超のものは、本プールの `acquire` がアロケーション前に
+    // 拒否すること。`MAX_BATCH_DIM < MAX_EMBEDDING_DIM`（一括投入経路はバッチ経路より
+    // 高次元を受理しうる）という前提を明文化したうえで、境界（`MAX_BATCH_DIM` ちょうどは
+    // 受理・`MAX_BATCH_DIM + 1` は拒否）を固定する。
+    #[test]
+    fn pool_rejects_dims_beyond_max_batch_dim_before_allocation() {
+        assert!(
+            (MAX_BATCH_DIM as u64) < (crate::storage::MAX_EMBEDDING_DIM as u64),
+            "bulk-ingest path (storage::MAX_EMBEDDING_DIM) must be able to accept dims beyond \
+             what the batch path (MAX_BATCH_DIM) accepts, otherwise invariant (c) is vacuous"
+        );
+
+        let mut pool = crate::buffer_pool::BufferPool::new(ROW_BUFFER_POOL_QUOTA_BYTES);
+
+        // 境界: MAX_BATCH_DIM ちょうどは受理される。
+        let accepted = pool
+            .acquire(MAX_BATCH_DIM, MAX_BATCH_DIM)
+            .expect("MAX_BATCH_DIM must be accepted at the boundary");
+        pool.release(accepted);
+        let retained_before_rejection = pool.retained_bytes();
+
+        // 境界: MAX_BATCH_DIM + 1 はアロケーション前に拒否される。
+        let err = pool
+            .acquire(MAX_BATCH_DIM + 1, MAX_BATCH_DIM)
+            .expect_err("MAX_BATCH_DIM + 1 must be rejected before allocation");
+        assert_eq!(
+            err,
+            crate::buffer_pool::BufferPoolError::RequestTooLarge {
+                len: MAX_BATCH_DIM + 1,
+                max: MAX_BATCH_DIM,
+            }
+        );
+        assert_eq!(
+            pool.retained_bytes(),
+            retained_before_rejection,
+            "a rejected request must not allocate or retain any additional buffer"
+        );
+    }
 }

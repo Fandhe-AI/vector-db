@@ -19,13 +19,31 @@
 //! で拒否する（本モジュール自身は独自の絶対上限を新設しない）。
 //!
 //! `indexing.md` INDEX-4（一括投入の処理量上限）は `batch_limits.rs`（TASK-122）が
-//! ファイル形 `INSERT` の一括投入経路に対して実装済みだが、本モジュール（`batch_search.rs`
-//! 側のバッチクエリ・一括インデクシングのスクラッチバッファ管理）とは経路が異なるため、
-//! 本モジュールはその具体的な上限値には依存せず、既に実装・検証済みの `batch_search.rs` の
-//! 上限とのみ整合させる（`buffer_pool.rs` のピークメモリ有界性と `batch_limits.rs` の
-//! 上限との再整合は TASK-157 の宿題として残る）。GPU 転送ステージング用途は
-//! 実際の GPU（`wgpu`）実行を追加していない現段階では対象を持たない（`batch_search.rs`
-//! モジュール冒頭コメント参照）。
+//! ファイル形 `INSERT` の一括投入経路に対して実装済み。一括投入経路自体は本プールを
+//! 直接使わず（プールの利用箇所は `batch_search.rs::run_batch_search` のみ）、経路も
+//! 異なるため、本モジュールは `batch_limits.rs` の上限値へ依存しない設計を維持する。
+//! Issue #170（TASK-157 の宿題事項）でこの前提を次の 3 点として整合検証済み
+//! （検証は `batch_search.rs` の `#[cfg(test)]` に配置。環境変数で注入可能な
+//! `batch_limits.rs` の実行時値ではなく、fail-closed 既定のフォールバック定数に対して
+//! 行う）:
+//! (a) バッチ経路で到達しうる最大サイズクラス 1 個分（[`class_bytes`]・[`size_class_for`]
+//! を `batch_search.rs::MAX_BATCH_DIM` へ適用した値）が本プールの総量上限
+//! （`batch_search.rs::ROW_BUFFER_POOL_QUOTA_BYTES`）以下で、プールが「格納せず
+//! 即破棄」に縮退しないこと。
+//! (b) プールのピーク理論上限（総量上限＋最大クラス 1 個分）が一括投入経路の合計予算の
+//! fail-closed 既定値（`incremental::MAX_INDEX_TOTAL_BYTES`）以下という、独立上限として
+//! 同程度の桁に収まること。両経路は同一プロセス内で同時に確保され得るため、これは
+//! プロセス全体の実ピーク使用量（概ね `incremental_usage + pool_peak`）を共通予算内に
+//! 収める保証ではない（両経路の合計を上限と比較する共有予算制御は存在しない。詳細は
+//! `batch_search.rs::ROW_BUFFER_POOL_QUOTA_BYTES` のコメントと
+//! `tests::pool_quota_stays_within_batch_limits_budget` を参照）。
+//! (c) 一括投入経路が正当に生成しうる次元（`storage::MAX_EMBEDDING_DIM` まで）のうち
+//! `MAX_BATCH_DIM` 超のものは、本プールの [`BufferPool::acquire`] がアロケーション前に
+//! 拒否すること（`MAX_BATCH_DIM < MAX_EMBEDDING_DIM` の大小関係を前提とする）。
+//! GPU 転送ステージング用途は `gpu_batch.rs`（TASK-128〜130）が実 GPU（`wgpu`）実行を
+//! 接続済みだが、同モジュールは本プールを利用しない（本プールの利用箇所は前段落の通り
+//! `batch_search.rs::run_batch_search` のみ）ため、依然として対象を持たない
+//! （`batch_search.rs` モジュール冒頭コメント参照）。
 
 use std::collections::VecDeque;
 
@@ -34,12 +52,19 @@ const MIN_CLASS_ELEMS: usize = 64;
 
 /// アイドルバッファ 1 個（要素数×4 バイトに加えベクタ自体のオーバーヘッドを無視した
 /// 概算）が占めるバイト量を計算する（要素型は f32 固定）。
-fn class_bytes(class_elems: usize) -> usize {
+///
+/// `pub(crate)`: Issue #170（INDEX-4・TASK-157 整合）で `batch_search.rs` の
+/// 上限整合テスト（`#[cfg(test)]`）からも参照するため、モジュール外（同一クレート内）へ
+/// 公開する。
+pub(crate) fn class_bytes(class_elems: usize) -> usize {
     class_elems.saturating_mul(std::mem::size_of::<f32>())
 }
 
 /// `len` 以上の最小の 2 のべき乗（[`MIN_CLASS_ELEMS`] 未満には丸め上げる）を返す。
-fn size_class_for(len: usize) -> Option<usize> {
+///
+/// `pub(crate)`: [`class_bytes`] と同じ理由（Issue #170 整合テストからの参照）で
+/// `pub(crate)` とする。
+pub(crate) fn size_class_for(len: usize) -> Option<usize> {
     let base = len.max(MIN_CLASS_ELEMS);
     if base.is_power_of_two() {
         Some(base)
