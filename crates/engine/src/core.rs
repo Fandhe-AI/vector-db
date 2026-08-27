@@ -1077,6 +1077,37 @@ impl EngineCore {
         })
     }
 
+    /// `table` の最終 commit 済み `operation_id` を照会する（TASK-98、対象ビヘイビア:
+    /// RECOVER-7）。`crate::tenant::last_operation` への薄い委譲のみ。
+    ///
+    /// **契約（補助手段に限定）**: 本メソッドの結果は「当該呼び出し以降に同一
+    /// テーブルへの後続 commit が発生していない場合にのみ」書き込みの commit 済み
+    /// 確定の根拠として使える（後続 commit で値が置き換わるため）。commit 済み確定の
+    /// **第一の手段は常に同一内容の再送**（[`Self::insert_row`] 等が返す重複拒否。
+    /// `wire_code` `23505` の受領＝commit 済み確定）であり、本メソッドはそれが使えない
+    /// 場合の補助にとどめる（`recovery::ledger` モジュールドキュメント参照）。
+    ///
+    /// `LedgerMode::CompareOnlyWithoutLedger`（台帳を持たない構成）では
+    /// [`Self::operation_recorded`] と同じく台帳テーブルへ一切触れず
+    /// [`LastOperationLookup::NoLedger`] を返す（`NotFound` へ丸めない）。
+    /// `VectorCore` trait へは昇格しない（`operation_recorded` と同じ理由。
+    /// `core-api-check` の対象外）。
+    pub fn last_operation_id(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<crate::recovery::ledger::LastOperationLookup, crate::tenant::TenantWriteError> {
+        use crate::recovery::ledger::LastOperationLookup;
+        if matches!(self.ledger_mode, LedgerMode::CompareOnlyWithoutLedger) {
+            return Ok(LastOperationLookup::NoLedger);
+        }
+        let found = crate::tenant::last_operation(&self.storage, table, ctx)?;
+        Ok(match found {
+            Some(op_id) => LastOperationLookup::Committed(op_id),
+            None => LastOperationLookup::NotFound,
+        })
+    }
+
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
     /// （TASK-169）。`snapshot.search_with` が `IndexStale`/`ContextMismatch` を返した
     /// 場合は [`PrefilterCache::evict`] で該当エントリを破棄し、非キャッシュ経路
