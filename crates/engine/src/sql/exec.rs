@@ -1196,6 +1196,31 @@ fn map_incremental_error(e: crate::incremental::IncrementalError) -> SqlSurfaceE
     }
 }
 
+/// [`crate::incremental::BatchIncrementalError`] を SQL 表層のエラー契約へ写像する
+/// （TASK-122・対象ビヘイビア: INDEX-4。`core::EngineCore::execute_insert_sql_batch`
+/// の唯一の呼び出し元）。一括投入 4 上限（`crate::batch_limits::BatchLimitsError`）は
+/// 全 variant が `54000`（`payload_too_large`。ERR-2・TASK-152）へ写像する。個々の
+/// ファイルに起因する非上限系の失敗（`Item`）は単一ファイル経路と同じ写像
+/// （[`map_incremental_error`]）を再利用し、バッチ内のどのファイルかは detail に
+/// 含めない（本文・パス・テナント情報を含めない契約は単一ファイル経路と同一）。
+/// 特定ファイルに起因しないバッチ全体の内部エラー（`Internal`。一括バッファの
+/// 確保拒否等）は `Internal` 系へ写像する。
+pub(crate) fn map_batch_incremental_error(
+    e: crate::incremental::BatchIncrementalError,
+) -> SqlSurfaceError {
+    use crate::incremental::BatchIncrementalError;
+
+    match e {
+        BatchIncrementalError::Limits(limits_err) => {
+            SqlSurfaceError::payload_too_large(limits_err.to_string())
+        }
+        BatchIncrementalError::Item { source, .. } => map_incremental_error(source),
+        BatchIncrementalError::Internal(detail) => SqlSurfaceError::Internal {
+            detail: detail.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

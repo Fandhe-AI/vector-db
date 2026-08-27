@@ -228,10 +228,12 @@ fn measure_single_file_incremental_insert() -> Duration {
 
 /// `BASELINE_FILES + 1` 件を空 DB から順次挿入する「全体再構築」の総所要時間を
 /// `MEASUREMENT_ROUNDS` 回計測し、中央値を返す（増分側と同じ総ファイル数を毎ラウンド
-/// 書き込むことで比較条件を揃える）。一括投入構文（INDEX-4）は本移行時点で未実装
-/// （ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-4。spec 側の検討状況はここに
-/// 転記しない）のため、SQL 表層で実現可能な「空 DB への逐次 `INSERT`」を全体再構築の
-/// 代替として用いる。
+/// 書き込むことで比較条件を揃える）。一括投入の処理量上限（INDEX-4）は
+/// `engine::batch_limits`（TASK-122）・`engine::incremental::index_file_batch` として
+/// 実装済みだが、複数ファイルを 1 文で送る SQL 構文（複数文・複数行 VALUES）の表層拡張は
+/// 本移行時点で未実装（ポインタ: `docs/spec/04-behavior/indexing.md` INDEX-4。spec 側の
+/// 検討状況はここに転記しない）のため、SQL 表層で実現可能な「空 DB への逐次 `INSERT`」を
+/// 全体再構築の代替として用いる。
 fn measure_full_rebuild() -> Duration {
     let mut durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
     for round in 0..MEASUREMENT_ROUNDS {
