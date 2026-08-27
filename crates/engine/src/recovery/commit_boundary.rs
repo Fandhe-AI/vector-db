@@ -24,14 +24,96 @@
 //!   （反映失敗からの回復契約自体は後続タスク〔RECOVER-9 系〕のスコープで、
 //!   本モジュールは「応答の一意性を壊さない」構造の提供のみを担う）。
 //! - **(3) commit 成功後の panic**: [`PostCommitPanicGuard`] が commit 成功から
-//!   応答確定までの区間を覆う Drop ガードで、区間内で panic が発生した場合は
-//!   `std::process::abort()` してプロセスを終了させる。unwind を継続させると
+//!   `post_commit`（派生状態反映）完了までの区間を覆う Drop ガードで、区間内で
+//!   panic が発生した場合は `std::process::abort()` してプロセスを終了させる。
+//!   さらに [`ResponseBoundaryGuard`] が、commit 成功から wire 層が実際に成功
+//!   応答をソケットへ書き終える（`ReadyForQuery` 送出含む）までのより広い区間を
+//!   スレッドローカルフラグ経由で覆う（codex-review P1・PR #246 指摘対応。
+//!   `commit_and_finish` 内で disarm した後、呼び出し元スタックを戻って wire 層が
+//!   応答を組み立て・送信する区間は元々未保護だった）。unwind を継続させると
 //!   呼び出し元スタック上の `catch_unwind` 等で成功応答が構築されうるため、
 //!   fail-closed（成功応答を返しうる経路を構造的に遮断する）でプロセスごと
 //!   止める（abort 前の ERR-1 応答送信は観測可能性側であり TASK-97・RECOVER-6
 //!   のスコープ。本モジュールは安全性側のみを担う）。
+//!
+//!   [`ResponseBoundaryGuard`] はスレッドローカル状態に依存するため、
+//!   `wire-server::server` の thread-per-connection 同期モデル（1 コネクション
+//!   1 スレッドが直列にクエリを処理する）を前提とする。呼び出し元
+//!   （`wire-server::simple_query::execute_and_respond`）が 1 クエリの処理開始時に
+//!   1 つ生成し、応答をすべて書き終えた自然な関数末尾（正常 return / unwind の
+//!   いずれでも drop される）まで所有する契約。非同期実行系（タスクがスレッドを
+//!   跨ぐ）へ移行する場合はこの設計が前提を失うため見直しが必要。
+
+use std::cell::Cell;
 
 use crate::storage::{self, Result as StorageResult};
+
+thread_local! {
+    /// commit 成功後、wire 層の応答確定（[`ResponseBoundaryGuard`] の drop）が
+    /// まだ済んでいない区間かどうかを表すスレッドローカルフラグ（RECOVER-5 (3)）。
+    /// [`commit_and_finish`] が commit 成功のたびに `true` へ立て、
+    /// [`ResponseBoundaryGuard`] の drop 時に読み取ってリセットする。
+    static COMMIT_PENDING_RESPONSE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// commit 成功から wire 層の応答確定までの区間全体を覆う RAII ガード
+/// （RECOVER-5 (3)。[`PostCommitPanicGuard`] より広い区間を守る）。
+///
+/// `wire-server::simple_query::execute_and_respond` が 1 クエリの処理開始時に
+/// 生成し、応答をすべて書き終えるまで所有する契約（モジュール冒頭ドキュメント
+/// 参照）。区間内で [`commit_and_finish`] が commit に成功すると
+/// [`COMMIT_PENDING_RESPONSE`] が立つ。drop 時にこのフラグを読み取ってリセットし、
+/// フラグが立った状態で unwind 中（panic 伝播中）であれば
+/// `std::process::abort()` する。フラグが立っていない、または unwind 中でなければ
+/// （正常終了 = 応答を書き終えた、または commit 前に失敗した）何もしない。
+///
+/// 注意（フラグはガード区間外でも立ちうる）: [`COMMIT_PENDING_RESPONSE`] は
+/// [`commit_and_finish`] が commit に成功するたびに無条件で立てるため、本ガードを
+/// スタックに持たないスレッド上の commit（本モジュールのユニットテスト・将来の
+/// wire 経由以外の呼び出し元等）でも立つ。その場合は次にそのスレッド上で生成された
+/// 本ガードの drop で（panic していなければ）静かにリセットされるのみで実害はない
+/// （fail-closed 側に倒れる誤 abort はあり得るが、保護すべき区間の取りこぼしは
+/// 発生しない）。
+///
+/// `must_use` 属性は束縛忘れ（`let _ = ResponseBoundaryGuard::new();` 等で即座に
+/// drop され保護区間が消える）をコンパイル時の warning として検出するための注記。
+/// 実際に使う際は名前付きの変数（例: `let _response_boundary = ...;`）で応答確定
+/// まで保持すること。
+#[must_use]
+pub struct ResponseBoundaryGuard {
+    _private: (),
+}
+
+impl ResponseBoundaryGuard {
+    /// クエリ処理の入口で呼ぶ。応答をすべて書き終えるまでこの戻り値を
+    /// 名前付き変数へ束縛して生存させること（`let _ = ...` は即座に drop され
+    /// 保護区間が失われるため使わない）。
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Default for ResponseBoundaryGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ResponseBoundaryGuard {
+    fn drop(&mut self) {
+        let armed = COMMIT_PENDING_RESPONSE.with(|f| f.replace(false));
+        if should_abort(armed, std::thread::panicking()) {
+            // 固定の英語文言のみを stderr へ出す。テナント ID・テーブル名・行データ・
+            // operation_id を一切含めない（security.md P0「エラー・ログ経由で他テナントの
+            // データ・存在情報を漏らさない」）。
+            eprintln!(
+                "fatal: panic occurred after a write transaction committed successfully; \
+                 aborting the process to avoid returning a false success response"
+            );
+            std::process::abort();
+        }
+    }
+}
 
 /// commit 成功後の派生状態（索引等）反映の結果。反映が失敗しても、確定済みの
 /// 成功応答（commit 自体は成功している）を `Err` へ転化させない
@@ -116,15 +198,21 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 /// 内部で [`crate::storage::bump_generation_and_commit`] を呼んで commit する
 /// （世代カウントの経路網羅契約はそのまま維持する）。commit が失敗すればここで
 /// `Err` を返して終わる（まだ point of no return に達していない）。commit が
-/// 成功したら [`PostCommitPanicGuard`] を arm した状態で `post_commit` を実行し、
+/// 成功したら [`COMMIT_PENDING_RESPONSE`]（[`ResponseBoundaryGuard`] 経由の
+/// より広い区間の保護。呼び出し元が wire 層まで所有する）を立てたうえで、
+/// さらに [`PostCommitPanicGuard`] を arm した状態で `post_commit` を実行し、
 /// 正常に完了できたら disarm してから `(value, post_commit の結果)` を返す
-/// （`post_commit` 内で panic した場合はガードの Drop が abort する）。
+/// （`post_commit` 内で panic した場合は `PostCommitPanicGuard` の Drop が abort
+/// する。`post_commit` 完了後・呼び出し元が応答を確定するまでの区間は
+/// `COMMIT_PENDING_RESPONSE` を経由して [`ResponseBoundaryGuard`] が引き続き
+/// 保護する）。
 pub(crate) fn commit_and_finish<T>(
     write_txn: redb::WriteTransaction,
     value: T,
     post_commit: impl FnOnce(&T) -> PostCommitResult,
 ) -> StorageResult<(T, PostCommitResult)> {
     storage::bump_generation_and_commit(write_txn)?;
+    COMMIT_PENDING_RESPONSE.with(|f| f.set(true));
     let guard = PostCommitPanicGuard::armed();
     let post_commit_result = post_commit(&value);
     guard.disarm();
@@ -362,6 +450,117 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen storage");
         reopened
             .get("tenant-a", 7u64)
+            .expect("committed row must remain visible after subprocess abort");
+    }
+
+    // --- RECOVER-5 (3) 拡張区間: commit_and_finish が正常 return（disarm 済み）した
+    // 後、`ResponseBoundaryGuard` がまだ生存している区間（＝ wire 層が応答を組み立て・
+    // 送信する区間の模擬）で panic しても abort すること。
+    // codex-review P1・PR #246 指摘（`commit_and_finish` の disarm 直後から応答確定
+    // までが未保護だった点）の回帰テスト。
+    const CHILD_DB_ENV_RESPONSE_BOUNDARY: &str =
+        "ENGINE_COMMIT_BOUNDARY_RESPONSE_BOUNDARY_PANIC_CHILD_DB";
+
+    #[test]
+    fn subprocess_panic_after_commit_and_finish_returns_still_aborts_within_response_boundary() {
+        if let Ok(db_path) = std::env::var(CHILD_DB_ENV_RESPONSE_BOUNDARY) {
+            // 子プロセス側: wire 層（`simple_query::execute_and_respond`）が
+            // クエリ処理の入口で `ResponseBoundaryGuard` を生成してから
+            // `commit_and_finish` を呼び、正常 return を受け取った後（＝ 応答の
+            // 組み立て・送信中を模擬する区間）で panic する、という呼び出し順を
+            // 直接再現する。
+            let storage = Storage::open(&db_path).expect("child: open storage");
+            let write_txn = storage.db().begin_write().expect("child: begin_write");
+            let row = RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            };
+            {
+                let mut table = write_txn
+                    .open_table(crate::storage::ROWS_TABLE)
+                    .expect("child: open rows table");
+                let encoded = crate::storage::encode_row(&row).expect("child: encode row");
+                table
+                    .insert(("tenant-a", 9u64), encoded.as_slice())
+                    .expect("child: insert");
+            }
+
+            let _response_boundary = ResponseBoundaryGuard::new();
+            let (_, post_commit_result) =
+                commit_and_finish(write_txn, (), |()| PostCommitResult::Ok)
+                    .expect("child: commit_and_finish must succeed");
+            assert_eq!(post_commit_result, PostCommitResult::Ok);
+
+            // `commit_and_finish` は既に disarm 済みで正常 return している
+            // （旧実装ならここから先は無保護）。`_response_boundary` はまだ
+            // 生存中のため、ここで panic しても abort するはずである。
+            panic!("injected panic in the wire-layer response-assembly window (post commit_and_finish)");
+        }
+
+        // 親プロセス側。
+        let path = unique_db_path("commit-boundary-subprocess-response-boundary-panic");
+        let _cleanup = CleanupGuard(path.clone());
+        drop(Storage::open(&path).expect("parent: create storage"));
+
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg(
+                "recovery::commit_boundary::tests::\
+                 subprocess_panic_after_commit_and_finish_returns_still_aborts_within_response_boundary",
+            )
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_DB_ENV_RESPONSE_BOUNDARY, &path)
+            .stdout(std::process::Stdio::piped())
+            // 上のテスト同様、stderr は pipe せず破棄する（パイプバッファ詰まり回避）。
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child process");
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if start.elapsed() > timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subprocess did not terminate within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+
+        use std::io::Read as _;
+        let mut stdout_buf = String::new();
+        if let Some(mut out) = child.stdout.take() {
+            let _ = out.read_to_string(&mut stdout_buf);
+        }
+
+        assert!(
+            !status.success(),
+            "child process must not exit successfully; status={status:?} stdout={stdout_buf}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "child must be terminated by SIGABRT (std::process::abort) even though the \
+                 panic occurred after commit_and_finish already returned; \
+                 status={status:?} stdout={stdout_buf}"
+            );
+        }
+
+        // commit 自体は成功しているため、再オープン後も行が可視であること。
+        let reopened = Storage::open(&path).expect("reopen storage");
+        reopened
+            .get("tenant-a", 9u64)
             .expect("committed row must remain visible after subprocess abort");
     }
 }

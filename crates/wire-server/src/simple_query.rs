@@ -65,6 +65,20 @@ pub(crate) fn execute_and_respond(
     session: &mut SessionState,
     sql: &str,
 ) -> io::Result<()> {
+    // commit 成功から本関数が応答を書き終える（`ReadyForQuery` 送出含む）までの
+    // 区間全体を覆う RAII ガード（RECOVER-5 (3)・codex-review P1・PR #246 指摘対応）。
+    // 区間内で engine 側の書き込み系 commit が成功すると
+    // `engine::recovery::commit_boundary` 内部のスレッドローカルフラグが立ち、
+    // 本関数の全 return 経路（正常 return・panic 伝播いずれも）でこのガードが
+    // drop される際に、フラグが立ったまま unwind 中であればプロセスを abort する
+    // （wire-server は接続 1 本につきスレッド 1 つが直列にクエリを処理する
+    // thread-per-connection モデルのため、スレッドローカルでの受け渡しが成立する。
+    // `engine::recovery::commit_boundary` モジュールドキュメント参照）。
+    // 注意: `_response_boundary` を `let _ = ...`（無名束縛）に書き換えると即座に
+    // drop され、この保護区間全体が無効化される（`ResponseBoundaryGuard` は
+    // `#[must_use]`。関数末尾まで生存させるため必ずこの名前付き束縛のまま保つ）。
+    let _response_boundary = engine::recovery::commit_boundary::ResponseBoundaryGuard::new();
+
     if sql.trim().is_empty() {
         write_all(stream, &result_encoder::encode_empty_query_response())?;
         return crate::handshake::write_ready_for_query_io(stream);
