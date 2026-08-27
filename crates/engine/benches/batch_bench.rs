@@ -46,10 +46,16 @@
 //!     GPU 実測の代替として計上しない＝アサーション弱体化を避ける）。計測中に
 //!     CPU 縮退（CORE-8）が起きた場合も同様に `pass=false`（縮退後の値は GPU 経路の
 //!     実測ではないため）。
-//!   - CORE-16: **GPU 常駐コピーの f16 パック vs f32 常駐**の比較であり、現状の
-//!     GPU バックエンドは f16 パック常駐のみを実装していて GPU 側の f32 常駐対照
-//!     経路が無いため実測不能。opt-in 時はその理由を明示して `pass=false` とする
-//!     （CPU 経路同士の f16/f32 比較は本 ID の対象外のため代替に使わない）。
+//!   - CORE-16（Issue #234）: **GPU 常駐コピーの f16 パック vs f32 常駐**の p95
+//!     短縮率。対照 A = f32 常駐対照経路（`engine::gpu_batch::
+//!     GpuF32ContrastBackend`。GPU 側で元の f32 ベクトル列をそのまま常駐させ
+//!     `unpack2x16float` を経由しない内積を計算する bench/テスト専用経路）、
+//!     被検 B = 本番の f16 パック常駐 GPU 経路（`engine::gpu_batch::
+//!     GpuBatchBackend`）。閾値は `BENCH_CORE16_MIN_IMPROVEMENT_PCT` から注入し
+//!     未設定は fail-closed。どちらかの GPU 初期化が失敗した環境（CI の
+//!     GitHub ホステッド runner 等）で opt-in された場合は「判定不能」を
+//!     `pass=false` として報告する（CPU 経路同士の f16/f32 比較を代替として
+//!     計上しない＝アサーション弱体化を避ける。CORE-6 と同方針）。
 //!
 //!
 //!   いずれも実測値と pass/fail のみを標準出力へ書き、注入した閾値は出力しない。
@@ -66,6 +72,7 @@ use harness::accept::{
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
 
+use engine::batch_fallback::BatchBackend;
 use engine::batch_search::{BatchEngine, BatchQuery, DynamicWindowAggregator, ResidentMatrix};
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
@@ -278,31 +285,88 @@ fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, St
     Ok(pass)
 }
 
-/// CORE-16 ゲート（GPU 常駐コピーの f16 パック vs f32 常駐の p95 短縮率）。
+/// CORE-16 ゲート（GPU 常駐コピーの f16 パック vs f32 常駐の p95 短縮率。
+/// Issue #234）。
 ///
-/// 本 ID は Issue #234 へ切り出し済み（Issue #178 は CORE-6 の充足で close）。
 /// 本 ID の A/B は **GPU バッチ経路上**の常駐形式比較であり（ポインタ:
 /// `docs/spec/04-behavior/core-engine.md` CORE-16。CPU-SIMD 経路への f16 適用は
-/// 本 ID の対象外）、現状の `gpu_batch.rs` は f16 パック常駐のみを実装していて
-/// GPU 側の f32 常駐対照経路が存在しないため実測不能である。opt-in された場合は
-/// その理由を明示して `pass=false` とする（CPU 経路同士の f16/f32 比較を代替として
-/// 計上しない。CORE-6 側と同じ方針＝アサーション弱体化を避ける）。
-fn run_core16_gate() -> bool {
+/// 本 ID の対象外）、対照 A = `engine::gpu_batch::GpuF32ContrastBackend`
+/// （f32 常駐。bench/テスト専用の対照経路）、被検 B = 本番の f16 パック常駐
+/// `engine::gpu_batch::GpuBatchBackend` を**どちらも GPU 経路で直接構築**して
+/// 比較する（`FallbackBatchEngine` は経由しない。CPU 縮退が発生すると GPU 経路
+/// 同士の比較にならないため）。opt-in されていなければ「対象外」を出力して
+/// 合否に数えない（silent skip にしない）。opt-in 時にどちらかの GPU 初期化が
+/// 失敗した場合は `pass=false`（fail-closed。CPU 比較を GPU 実測の代替として
+/// 計上しない＝アサーション弱体化を避ける。CORE-6 と同方針）。
+fn run_core16_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, String> {
     const LABEL: &str = "f16_resident_vs_f32_resident_p95";
     if !opt_in_requested_from_env("BENCH_CORE16") {
         println!(
             "{LABEL}: out of scope for this run (not counted toward pass/fail; \
-             set BENCH_CORE16=1 to see the not-measurable report) requested=false"
+             set BENCH_CORE16=1 with BENCH_CORE16_MIN_IMPROVEMENT_PCT to enable) requested=false"
         );
-        return true;
+        return Ok(true);
     }
+    let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE16_MIN_IMPROVEMENT_PCT")?;
+
+    let f32_backend = match engine::gpu_batch::GpuF32ContrastBackend::try_new(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        GPU_GATE_DIM,
+        &dataset.vectors,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "{LABEL}: not measurable in this environment (f32-resident gpu contrast \
+                 backend unavailable: {e}) requested=true pass=false"
+            );
+            return Ok(false);
+        }
+    };
+    let f16_matrix = ResidentMatrix::build(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        GPU_GATE_DIM,
+        &dataset.vectors,
+    )
+    .map_err(|err| format!("{LABEL}: resident matrix build failed: {err}"))?;
+    let f16_backend = match engine::gpu_batch::GpuBatchBackend::try_new(f16_matrix) {
+        Ok(b) => b,
+        Err(e) => {
+            println!(
+                "{LABEL}: not measurable in this environment (f16-resident gpu backend \
+                 unavailable: {e}) requested=true pass=false"
+            );
+            return Ok(false);
+        }
+    };
+
+    let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
+    let workload_a = || {
+        let queries = gate_batch_queries(&dataset.queries, ctx);
+        f32_backend.batch_search(&queries).map(|hits| hits.len())
+    };
+    let workload_b = || {
+        let queries = gate_batch_queries(&dataset.queries, ctx);
+        f16_backend.batch_search(&queries).map(|hits| hits.len())
+    };
+    let ab = run_ab(&config, workload_a, workload_b)
+        .map_err(|err| format!("{LABEL}: A/B measurement failed: {err}"))?;
+
+    let p95_a = p95_from_samples(&ab.a.samples)
+        .map_err(|err| format!("{LABEL}: p95 of A samples unavailable: {err}"))?;
+    let p95_b = p95_from_samples(&ab.b.samples)
+        .map_err(|err| format!("{LABEL}: p95 of B samples unavailable: {err}"))?;
+    let pass = check_improvement_at_least(p95_a, p95_b, min_improvement_pct)
+        .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
     println!(
-        "{LABEL}: not measurable yet (the gpu backend keeps the resident copy in f16 \
-         packed form only; no f32-resident gpu baseline path exists to compare against, \
-         and a cpu-only f16/f32 comparison is out of scope for this behavior) \
-         requested=true pass=false"
+        "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
+         f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?} requested=true pass={pass}"
     );
-    false
+    Ok(pass)
 }
 
 /// CORE-7 A/B 計測の測定区間からクエリ確保・コピーを追い出すための事前生成
@@ -407,7 +471,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let core16_ok = run_core16_gate();
+    let core16_ok = match run_core16_gate(&gate_dataset, &gate_ctx) {
+        Ok(ok) => ok,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
     passed &= core6_ok;
     passed &= core16_ok;
 
