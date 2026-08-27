@@ -1,28 +1,21 @@
-//! 一括投入（複数ファイルをまとめたバッチ）に対する処理量ガード（TASK-122、
-//! 対象ビヘイビア: INDEX-4。ポインタ: `docs/spec/05-tasks.md` TASK-122・
-//! `docs/spec/04-behavior/indexing.md` INDEX-4）。
+//! 一括投入（複数ファイルをまとめたバッチ）に対する処理量ガード。
+//! ポインタ: `docs/spec/05-tasks.md` TASK-122・`docs/spec/04-behavior/indexing.md`
+//! INDEX-4。本モジュールが定義する上限の分類・数値・判定順序は本リポ独自の
+//! 実装上の上限であり、spec 側契約の構造をそのまま転記したものではない
+//! （spec-confidentiality.md 準拠。数値の出典は下記 [`BatchLimits`] のドキュメント
+//! 参照）。
 //!
 //! `chunking::MAX_INPUT_BYTES`・`incremental::MAX_CHUNKS_PER_FILE`・
 //! `incremental::MAX_INDEX_TOTAL_BYTES` はいずれもファイル 1 件分（TASK-120）の
-//! 上限であり、複数ファイル合計に対する上限を持たない。本モジュールはその欠落を
-//! 埋める、バッチ全体に対する 4 種の上限を扱う:
+//! 上限であり、複数ファイル合計に対する上限を持たない。本モジュールは
+//! [`BatchLimits`] の各フィールドとして、バッチ全体に対する処理量ガードを追加する。
 //!
-//! 1. バッチあたり最大ファイル数（[`BatchLimits::max_files_per_batch`]）
-//! 2. 1 ファイルあたり最大本文サイズ（[`BatchLimits::max_file_body_bytes`]）
-//! 3. バッチ合計最大サイズ（`path` + 本文の合計。[`BatchLimits::max_batch_total_bytes`]）
-//! 4. バッチあたり最大生成チャンク数（サーバー側算定。[`BatchLimits::max_batch_chunks`]）
-//!
-//! 判定タイミングの契約: 1 は `core::EngineCore::execute_insert_sql_batch` が
-//! 束縛（`sql::parser::bind_insert_form`）より前に判定する。2〜3 は同メソッドの
-//! 束縛ループ内で、各文の束縛直後に逐次判定する（束縛済みの `path`/`body` 長を
-//! 使うため束縛自体は避けられないが、違反を検出した時点で残りの文の束縛を
-//! 打ち切ることで複製の増幅を抑える。TASK-122 レビュー対応）。[`validate_batch_shape`]
-//! はその最終防衛線として、バッチの解析段階（チャンク化・埋め込み・write
-//! トランザクションのいずれよりも前）に 1〜3 をまとめて再検証する。4 は
-//! [`validate_chunk_total`] でチャンク分割後・埋め込み処理の開始前に行う
-//! （呼び出し元 `incremental::index_file_batch` のドキュメント参照）。いずれの
-//! 超過も副作用ゼロ（redb・インメモリ索引・`operation_id` 台帳とも変更なし）で
-//! `54000`（`PAYLOAD_TOO_LARGE`。ERR-2・TASK-152）として拒否する。
+//! 各上限の判定タイミングは [`validate_batch_shape`]・[`validate_chunk_total`]・
+//! [`validate_raw_sql_len`] の各関数ドキュメント、および呼び出し元
+//! `core::EngineCore::execute_insert_sql_batch`・`incremental::index_file_batch` の
+//! コメントを参照。いずれの超過も副作用ゼロ（redb・インメモリ索引・
+//! `operation_id` 台帳とも変更なし）で `54000`（`PAYLOAD_TOO_LARGE`。ERR-2・
+//! TASK-152）として拒否する。
 //!
 //! wire 層の 1 メッセージ 1 MiB 上限（WIRE-4、`wire-server/src/limits.rs`）は
 //! transport 層の別防御であり、本モジュールの代替にはならない（engine 側の

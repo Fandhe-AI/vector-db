@@ -466,18 +466,19 @@ pub(crate) struct BatchFileIndexItem<'a> {
     pub ledger_write: crate::recovery::ledger::LedgerWrite<'a>,
 }
 
-/// 複数ファイル（`items`）を 1 バッチとして索引化する（TASK-122・対象ビヘイビア:
-/// INDEX-4）。`core::EngineCore::execute_insert_sql_batch` からのみ呼ばれる想定で、
-/// [`index_file`] と同じく `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では
-/// 適用しないため `pub(crate)` に閉じる。
+/// 複数ファイル（`items`）を 1 バッチとして索引化する（ポインタ: TASK-122・
+/// `docs/spec/04-behavior/indexing.md` INDEX-4。上限の分類・判定順序は本リポ独自の
+/// 実装上の設計であり、spec 側契約の構造をそのまま転記したものではない
+/// （spec-confidentiality.md 準拠））。`core::EngineCore::execute_insert_sql_batch`
+/// からのみ呼ばれる想定で、[`index_file`] と同じく `operation_id` 必須化ガード
+/// （TASK-92・RECOVER-1）を自身では適用しないため `pub(crate)` に閉じる。
 ///
-/// 手順（`batch_limits.rs` モジュールドキュメントの判定タイミング契約と対応）:
+/// 本実装での手順:
 /// 1. `items` の `(path.len(), body.len())` から `batch_limits::validate_batch_shape`
-///    で①（ファイル数）②（ファイル単体本文サイズ）③（バッチ合計サイズ）を判定する
-///    （チャンク化・埋め込み・write トランザクションのいずれよりも前）。
+///    を呼ぶ（チャンク化・埋め込み・write トランザクションのいずれよりも前）。
 /// 2. ファイルを 1 件ずつ [`chunk_phase`] にかけ（副作用ゼロ）、生成チャンク数を
 ///    `checked_add` で累算するたびに `batch_limits::validate_chunk_total` を都度
-///    呼んで④を判定する（オーバーフローは `54000` へ倒す）。超過を検出した時点で
+///    呼ぶ（オーバーフローは `54000` へ倒す）。超過を検出した時点で
 ///    残りファイルの `chunk_phase` を実行せず即座に拒否する（早期リターン）。これに
 ///    より上限超過時に保持する `ChunkedFile` を上限判定通過分だけに抑え、超過検出
 ///    前の無制限なチャンク生成・保持を防ぐ。
@@ -489,13 +490,9 @@ pub(crate) struct BatchFileIndexItem<'a> {
 /// （redb・インメモリ索引・`operation_id` 台帳とも変更なし。3 の write トランザク
 /// ション自体が開始されていないため台帳記録も発生しない）。
 ///
-/// 4 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
+/// 3 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
 /// 文単位セマンティクスとする（すでに `embed_and_write_phase` を完走したファイルは
 /// 個別の write トランザクションで commit 済みのまま残り、ロールバックしない）。
-/// 本関数が満たす契約は INDEX-4（ポインタ: `docs/spec/04-behavior/indexing.md`
-/// INDEX-4）の要件に対応する。1〜4 の順序（全上限判定が埋め込み・write
-/// トランザクションより前に完了する構造）がその実装根拠であり、詳細な要件文言は
-/// spec 側を参照する（spec-confidentiality.md 準拠。本文の転記は行わない）。
 pub(crate) fn index_file_batch(
     storage: &Storage,
     ctx: &PolicyContext,

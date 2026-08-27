@@ -540,9 +540,9 @@ fn chunk_total_exactly_at_limit_succeeds() {
 /// 起きた場合、1 ファイル目は個別の write トランザクションで commit 済みのまま残り、
 /// 2 ファイル目だけが未索引のまま失敗する（`incremental::index_file_batch`・
 /// `core::EngineCore::execute_insert_sql_batch` ドキュメントの「文単位セマンティクス」
-/// 契約。INDEX-4 が Must とする「上限超過時の副作用ゼロ」とは別の契約であり、
-/// バッチ全体のロールバックはしない）。台帳記録もファイル単位の write トランザクション
-/// に追従することを `operation_recorded` で確認する。
+/// 契約。本リポ独自の実装上の挙動であり、バッチ全体のロールバックはしない。上限
+/// 超過時の副作用ゼロは別の契約〔TASK-122・INDEX-4〕）。台帳記録もファイル単位の
+/// write トランザクションに追従することを `operation_recorded` で確認する。
 #[test]
 fn non_limit_failure_mid_batch_leaves_earlier_files_committed_and_is_file_scoped() {
     let path = unique_db_path("batch-limits-mid-batch-failure");
