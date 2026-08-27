@@ -12,6 +12,14 @@
 //! 途中で失敗した場合は write トランザクションを一切開始しない、または開始済み
 //! トランザクションを commit せず abort する（副作用ゼロ。coding-rust.md
 //! 「エラー契約は fail-closed とする」）。
+//!
+//! [`index_file`] は内部的に副作用ゼロ区間の [`chunk_phase`]（チャンク化〜総バイト数
+//! 上限判定まで）と、外部 I/O・write トランザクションを含む [`embed_and_write_phase`]
+//! （埋め込み〜置換書き込み）の 2 フェーズへ分割されている（TASK-122・INDEX-4。挙動は
+//! 分割前と同一）。[`index_file_batch`] はこの分割を利用し、バッチ内の全ファイルの
+//! `chunk_phase` を先に完走させてから（副作用ゼロのまま①〜④の 4 上限を判定できる）、
+//! 全判定を通過した場合のみファイルごとに `embed_and_write_phase` を実行する
+//! （`batch_limits.rs` モジュールドキュメント参照）。
 
 use std::time::{Duration, Instant};
 
@@ -193,21 +201,26 @@ fn estimate_total_row_bytes(
     Some(total)
 }
 
-/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
-/// 内部結線用 API のため `pub(crate)` に閉じる（`sql/exec.rs::execute_file_insert`
-/// が唯一の呼び出し元。codex-review P1 指摘・PR #221）。
-///
-/// `ledger_write` は行形 `INSERT` 経路（`tenant::insert_typed_row_unchecked`）と同じ
-/// 契約で、置換書き込みと同一の write トランザクション内で台帳へ記録される
-/// （TASK-93・RECOVER-2。`LedgerWrite::Disabled` なら台帳へ一切触れない）。
-pub(crate) fn index_file(
+/// [`chunk_phase`] の成功応答。バッチ経路（[`index_file_batch`]）が全ファイル分を
+/// 一時保持してから ④（総チャンク数）判定・[`embed_and_write_phase`] へ渡すための
+/// 中間データ。
+struct ChunkedFile {
+    chunks: Vec<crate::chunking::Chunk>,
+    chunking_elapsed: Duration,
+}
+
+/// [`index_file`]・[`index_file_batch`] 共通の副作用ゼロ区間（TASK-122 分割前の
+/// [`index_file`] 手順 1〜2 相当）。次元検証 → `chunk_file` → 空チャンク拒否 →
+/// ファイル単位チャンク数上限 → 総バイト数上限までを行い、redb・埋め込みサービス
+/// いずれにも触れない（呼び出し元がバッチの①〜③・④判定を埋め込み・write
+/// トランザクションより前に完了できるようにするための分割。`incremental.rs`
+/// モジュールドキュメント参照）。
+fn chunk_phase(
     storage: &Storage,
-    ctx: &PolicyContext,
-    embedder: &dyn Embedder,
+    embedder_dim: u32,
     config: &IncrementalConfig,
     input: &BoundFileIndexInput<'_>,
-    ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
-) -> Result<IndexOutcome, IncrementalError> {
+) -> Result<ChunkedFile, IncrementalError> {
     // `embedder.dim()` を対象テーブルの `VECTOR(N)` と突き合わせる（サーバー側の
     // Embedder 設定とスキーマの不整合。チャンク化・埋め込み呼び出しの前に検出し、
     // 誤設定時の無駄な計算・外部 I/O を避ける。`tenant.rs` 側の
@@ -221,10 +234,10 @@ pub(crate) fn index_file(
             "table has no VECTOR column".to_string(),
         ))
     })?;
-    if embedder.dim() != table_dim {
+    if embedder_dim != table_dim {
         return Err(IncrementalError::Embed(EmbedError::DimMismatch {
             expected: table_dim,
-            got: embedder.dim() as usize,
+            got: embedder_dim as usize,
         }));
     }
 
@@ -278,6 +291,30 @@ pub(crate) fn index_file(
             )))
         }
     }
+
+    Ok(ChunkedFile {
+        chunks,
+        chunking_elapsed,
+    })
+}
+
+/// [`index_file`]・[`index_file_batch`] 共通の埋め込み〜置換書き込み区間
+/// （TASK-122 分割前の [`index_file`] 手順 3〜4 相当）。[`chunk_phase`] の成功応答を
+/// 受け取り、埋め込み（write トランザクションの外）→ 単一 write トランザクション内の
+/// 置換書き込みの順に実行する。バッチ経路では①〜④のすべての限度判定を通過した
+/// ファイルに対してのみ呼ばれる契約（`index_file_batch` ドキュメント参照）。
+fn embed_and_write_phase(
+    storage: &Storage,
+    ctx: &PolicyContext,
+    embedder: &dyn Embedder,
+    input: &BoundFileIndexInput<'_>,
+    chunked: ChunkedFile,
+    ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
+) -> Result<IndexOutcome, IncrementalError> {
+    let ChunkedFile {
+        chunks,
+        chunking_elapsed,
+    } = chunked;
 
     let embedding_start = Instant::now();
     let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
@@ -357,4 +394,163 @@ pub(crate) fn index_file(
             write: write_elapsed,
         },
     })
+}
+
+/// 可視性: `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では適用しない
+/// 内部結線用 API のため `pub(crate)` に閉じる（`sql/exec.rs::execute_file_insert`
+/// が唯一の呼び出し元。codex-review P1 指摘・PR #221）。
+///
+/// `ledger_write` は行形 `INSERT` 経路（`tenant::insert_typed_row_unchecked`）と同じ
+/// 契約で、置換書き込みと同一の write トランザクション内で台帳へ記録される
+/// （TASK-93・RECOVER-2。`LedgerWrite::Disabled` なら台帳へ一切触れない）。
+///
+/// 実体は [`chunk_phase`] → [`embed_and_write_phase`] を直列に呼ぶだけ（TASK-122 で
+/// バッチ経路 [`index_file_batch`] と共通化するために分割。挙動は分割前と同一）。
+pub(crate) fn index_file(
+    storage: &Storage,
+    ctx: &PolicyContext,
+    embedder: &dyn Embedder,
+    config: &IncrementalConfig,
+    input: &BoundFileIndexInput<'_>,
+    ledger_write: crate::recovery::ledger::LedgerWrite<'_>,
+) -> Result<IndexOutcome, IncrementalError> {
+    let chunked = chunk_phase(storage, embedder.dim(), config, input)?;
+    embed_and_write_phase(storage, ctx, embedder, input, chunked, ledger_write)
+}
+
+/// [`index_file_batch`] の失敗理由。バッチ全体に対する上限超過（[`batch_limits`]・
+/// TASK-122・INDEX-4）と、個々のファイルに起因する非上限系の失敗（[`IncrementalError`]。
+/// 単一ファイル経路 [`index_file`] と同じ写像先）を型で区別する（`sql/exec.rs` が
+/// `wire_code` の写像先を変えるための区別。上限超過は常に `54000`、`Item` は
+/// `IncrementalError` 自身の分類にそのまま従う）。
+#[derive(Debug)]
+pub(crate) enum BatchIncrementalError {
+    /// ①〜④いずれかの上限超過（副作用ゼロ。`crate::batch_limits::BatchLimitsError`
+    /// を参照）。
+    Limits(crate::batch_limits::BatchLimitsError),
+    /// バッチ内 `index` 番目のファイルに起因する非上限系の失敗。全上限判定を通過した
+    /// 後の埋め込み・書き込み段階でのみ発生し得る（すでに処理済みの先行ファイルは
+    /// 個別の write トランザクションで commit 済みのまま残る。文単位セマンティクス。
+    /// `index_file_batch` ドキュメント参照）。
+    Item {
+        index: usize,
+        source: IncrementalError,
+    },
+}
+
+impl std::fmt::Display for BatchIncrementalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchIncrementalError::Limits(e) => write!(f, "{e}"),
+            BatchIncrementalError::Item { index, source } => {
+                write!(f, "file at batch index {index}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BatchIncrementalError {}
+
+/// バッチ 1 件分の入力（束縛済みファイル形 `INSERT` の入力と、その `operation_id` から
+/// 解決済みの台帳書き込み指示の組）。`core::EngineCore::execute_insert_sql_batch` が
+/// バッチ内の各文を `sql::allowlist::validate_insert` → `sql::parser::bind_insert_form`
+/// で束縛したうえで構築する。
+pub(crate) struct BatchFileIndexItem<'a> {
+    pub input: BoundFileIndexInput<'a>,
+    pub ledger_write: crate::recovery::ledger::LedgerWrite<'a>,
+}
+
+/// 複数ファイル（`items`）を 1 バッチとして索引化する（TASK-122・対象ビヘイビア:
+/// INDEX-4）。`core::EngineCore::execute_insert_sql_batch` からのみ呼ばれる想定で、
+/// [`index_file`] と同じく `operation_id` 必須化ガード（TASK-92・RECOVER-1）を自身では
+/// 適用しないため `pub(crate)` に閉じる。
+///
+/// 手順（`batch_limits.rs` モジュールドキュメントの判定タイミング契約と対応）:
+/// 1. `items` の `(path.len(), body.len())` から `batch_limits::validate_batch_shape`
+///    で①（ファイル数）②（ファイル単体本文サイズ）③（バッチ合計サイズ）を判定する
+///    （チャンク化・埋め込み・write トランザクションのいずれよりも前）。
+/// 2. 全ファイルに対し [`chunk_phase`] を実行し（副作用ゼロ）、生成チャンク数を
+///    `checked_add` で累算する。オーバーフローは `54000` へ倒す。
+/// 3. 累算値を `batch_limits::validate_chunk_total` で判定し④を確定する（埋め込み・
+///    write トランザクションのいずれよりも開始前）。
+/// 4. 1〜3 をすべて通過した場合のみ、ファイルごとに [`embed_and_write_phase`] を実行
+///    する（write トランザクションはファイル単位。TASK-120 の既存契約を維持）。
+///
+/// 1〜3 のいずれかで拒否された場合、`chunk_phase` が redb・埋め込みサービスに一切
+/// 触れていないため副作用はゼロ（redb・インメモリ索引・`operation_id` 台帳とも
+/// 変更なし。4 の write トランザクション自体が開始されていないため台帳記録も
+/// 発生しない）。
+///
+/// 4 の途中（例: 2 ファイル目の埋め込み失敗）で非上限起因の失敗が起きた場合は
+/// 文単位セマンティクスとする（すでに `embed_and_write_phase` を完走したファイルは
+/// 個別の write トランザクションで commit 済みのまま残り、ロールバックしない）。
+/// INDEX-4 が Must とするのは「上限超過時の副作用ゼロ」であり、これは 1〜4 の順序
+/// （全上限判定が埋め込み・write トランザクションより前に完了する構造）で保証する。
+pub(crate) fn index_file_batch(
+    storage: &Storage,
+    ctx: &PolicyContext,
+    embedder: &dyn Embedder,
+    config: &IncrementalConfig,
+    limits: &crate::batch_limits::BatchLimits,
+    items: Vec<BatchFileIndexItem<'_>>,
+) -> Result<Vec<IndexOutcome>, BatchIncrementalError> {
+    // ①②③: バッチの解析段階（チャンク化・埋め込み・write トランザクションより前）。
+    let shapes: Vec<(usize, usize)> = items
+        .iter()
+        .map(|item| (item.input.path.len(), item.input.body.len()))
+        .collect();
+    crate::batch_limits::validate_batch_shape(&shapes, limits)
+        .map_err(BatchIncrementalError::Limits)?;
+
+    // 全ファイルの chunk_phase を先に完走させる（副作用ゼロ区間のみ）。
+    let mut chunked_files: Vec<ChunkedFile> = Vec::new();
+    chunked_files
+        .try_reserve_exact(items.len())
+        .map_err(|_| BatchIncrementalError::Item {
+            index: 0,
+            source: IncrementalError::Internal("failed to reserve batch chunk buffer"),
+        })?;
+    let mut total_chunks: usize = 0;
+    for (index, item) in items.iter().enumerate() {
+        let chunked = chunk_phase(storage, embedder.dim(), config, &item.input)
+            .map_err(|e| BatchIncrementalError::Item { index, source: e })?;
+        total_chunks =
+            total_chunks
+                .checked_add(chunked.chunks.len())
+                .ok_or(BatchIncrementalError::Limits(
+                    crate::batch_limits::BatchLimitsError::TooManyChunks {
+                        total: usize::MAX,
+                        max: limits.max_batch_chunks,
+                    },
+                ))?;
+        chunked_files.push(chunked);
+    }
+
+    // ④: チャンク分割後・埋め込み処理の開始前。
+    crate::batch_limits::validate_chunk_total(total_chunks, limits)
+        .map_err(BatchIncrementalError::Limits)?;
+
+    // 1〜3 をすべて通過した場合のみ、ファイルごとに埋め込み・write トランザクション
+    // を実行する（文単位セマンティクス。上記ドキュメント参照）。
+    let mut outcomes: Vec<IndexOutcome> = Vec::new();
+    outcomes
+        .try_reserve_exact(items.len())
+        .map_err(|_| BatchIncrementalError::Item {
+            index: 0,
+            source: IncrementalError::Internal("failed to reserve batch outcome buffer"),
+        })?;
+    for (index, (item, chunked)) in items.into_iter().zip(chunked_files).enumerate() {
+        let outcome = embed_and_write_phase(
+            storage,
+            ctx,
+            embedder,
+            &item.input,
+            chunked,
+            item.ledger_write,
+        )
+        .map_err(|e| BatchIncrementalError::Item { index, source: e })?;
+        outcomes.push(outcome);
+    }
+
+    Ok(outcomes)
 }

@@ -697,6 +697,10 @@ pub struct EngineCore {
     /// [`Self::with_ledger_mode`] のみ。`crate::recovery::required_op_id` モジュール
     /// ドキュメント参照）。
     ledger_mode: LedgerMode,
+    /// 一括投入（複数ファイルのバッチ投入）に対する 4 種の処理量上限（TASK-122・
+    /// 対象ビヘイビア: INDEX-4）。差し替えは [`Self::with_batch_limits`] のみ。
+    /// `crate::batch_limits` モジュールドキュメント参照。
+    batch_limits: crate::batch_limits::BatchLimits,
 }
 
 impl EngineCore {
@@ -720,6 +724,7 @@ impl EngineCore {
             embedder: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            batch_limits: crate::batch_limits::BatchLimits::default(),
         })
     }
 
@@ -743,6 +748,7 @@ impl EngineCore {
             embedder: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
+            batch_limits: crate::batch_limits::BatchLimits::default(),
         }
     }
 
@@ -790,6 +796,15 @@ impl EngineCore {
     /// required_op_id` モジュールドキュメント参照）。
     pub fn with_ledger_mode(mut self, mode: LedgerMode) -> Self {
         self.ledger_mode = mode;
+        self
+    }
+
+    /// 一括投入（複数ファイルのバッチ投入）に対する 4 種の処理量上限
+    /// （[`crate::batch_limits::BatchLimits`]）を差し替えたビルダーを返す
+    /// （TASK-122・対象ビヘイビア: INDEX-4。[`Self::with_incremental_config`] と同じ
+    /// 流儀。未呼び出しなら `BatchLimits::default()`）。
+    pub fn with_batch_limits(mut self, limits: crate::batch_limits::BatchLimits) -> Self {
+        self.batch_limits = limits;
         self
     }
 
@@ -1198,6 +1213,133 @@ impl EngineCore {
                 )
             }
         }
+    }
+
+    /// SQL 表層のバッチ INSERT 実行エントリポイント（TASK-122、対象ビヘイビア:
+    /// INDEX-4）。[`Self::execute_insert_sql`] の複数ファイル版で、複数ファイルを
+    /// 1 バッチとして受け取る engine ローカル API の入口（SQL 表層に複数文・複数行
+    /// VALUES の構文拡張は導入しない。1 文 = 1 ファイルの検証済み `INSERT` 文の列
+    /// （`sqls`）を 1 バッチとして受け取る）。`VectorCore` trait への昇格は行わない
+    /// （`execute_insert_sql` と同じ理由）。
+    ///
+    /// 手順:
+    /// 1. `sqls` が空なら `22000`（invalid input）で拒否する。
+    /// 2. 各文を `sql::allowlist::validate_insert`（`operation_id` 必須化ガード
+    ///    （TASK-92・RECOVER-1）を含む）→ `sql::parser::bind_insert_form` で束縛する。
+    ///    **全文がファイル形であることを要求**し、行形が 1 件でも混在したら `22000`
+    ///    で拒否する（黙って別セマンティクスへ丸めない）。
+    /// 3. 束縛結果から `operation_id` を `self.ledger_mode.resolve` で台帳書き込み
+    ///    指示へ解決し（TASK-93・RECOVER-2。行形・単一ファイル形と同じ契約）、
+    ///    `incremental::index_file_batch` へまとめて委譲する。一括投入 4 上限
+    ///    （`self.batch_limits`。TASK-122）の判定自体は `index_file_batch` が
+    ///    埋め込み・write トランザクションのいずれよりも前に行う契約
+    ///    （`batch_limits.rs`・`incremental.rs` モジュールドキュメント参照）。
+    ///
+    /// 上限超過時は redb・インメモリ索引・`operation_id` 台帳のいずれも変更されない
+    /// （`incremental::index_file_batch` の副作用ゼロ契約）。上限非起因の途中失敗
+    /// （例: 2 ファイル目の埋め込み失敗）は文単位セマンティクスとなり、既に処理済みの
+    /// 先行ファイルはそのまま索引化された状態で残る（`incremental::index_file_batch`
+    /// ドキュメント参照）。
+    pub fn execute_insert_sql_batch(
+        &self,
+        ctx: &PolicyContext,
+        sqls: &[&str],
+    ) -> Result<Vec<crate::sql::exec::InsertOutcome>, crate::sql::allowlist::SqlSurfaceError> {
+        if sqls.is_empty() {
+            return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "INSERT batch must contain at least one statement",
+            ));
+        }
+
+        let embedder = self.embedder.as_deref().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "no embedder configured for file-form insert".to_string(),
+            }
+        })?;
+
+        // 束縛結果（`BoundFileInsert`）の所有権をここで保持する。後段で構築する
+        // `BoundFileIndexInput`／`LedgerWrite` はこの `Vec` の要素を借用するため、
+        // 束縛と `items` 構築を 2 パスへ分ける（`sql::parser::BoundFileInsert` の
+        // 生存期間を `index_file_batch` 呼び出しまで維持するため）。
+        let mut file_binds: Vec<crate::sql::parser::BoundFileInsert> = Vec::new();
+        file_binds.try_reserve_exact(sqls.len()).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "failed to reserve batch bind buffer".to_string(),
+            }
+        })?;
+
+        for sql in sqls {
+            let stmt =
+                crate::sql::allowlist::validate_insert(sql, &self.storage, self.ledger_mode)?;
+            let schema = self
+                .storage
+                .get_table_schema(&stmt.table_name)
+                .map_err(|e| match e {
+                    CatalogError::TableNotFound(name) => {
+                        crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                    }
+                    _ => crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "failed to load table schema".to_string(),
+                    },
+                })?;
+            let bound = crate::sql::parser::bind_insert_form(&stmt, &schema)?;
+            match bound {
+                crate::sql::parser::BoundInsertForm::File(file_bound) => {
+                    file_binds.push(file_bound);
+                }
+                // 行形が 1 件でも混在した場合は黙って行形として処理せず拒否する
+                // （「複数ファイルのバッチ投入」という本メソッドの契約を維持する）。
+                crate::sql::parser::BoundInsertForm::Row(_) => {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                        "INSERT batch requires every statement to be file-form (path/body columns)",
+                    ));
+                }
+            }
+        }
+
+        let mut items: Vec<crate::incremental::BatchFileIndexItem<'_>> = Vec::new();
+        items.try_reserve_exact(file_binds.len()).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "failed to reserve batch item buffer".to_string(),
+            }
+        })?;
+        for bound in &file_binds {
+            let ledger_write = self
+                .ledger_mode
+                .resolve(bound.operation_id.as_ref())
+                .map_err(|_| crate::sql::allowlist::SqlSurfaceError::MissingOperationId)?;
+            let input = crate::incremental::BoundFileIndexInput {
+                table: &bound.table,
+                path: &bound.path,
+                body: &bound.body,
+                template_values: &bound.template_values,
+                path_column_index: bound.path_column_index,
+                body_column_index: bound.body_column_index,
+                vector_column_index: bound.vector_column_index,
+            };
+            items.push(crate::incremental::BatchFileIndexItem {
+                input,
+                ledger_write,
+            });
+        }
+
+        let outcomes = crate::incremental::index_file_batch(
+            &self.storage,
+            ctx,
+            embedder,
+            &self.incremental_config,
+            &self.batch_limits,
+            items,
+        )
+        .map_err(crate::sql::exec::map_batch_incremental_error)?;
+
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| crate::sql::exec::InsertOutcome {
+                rows_affected: outcome.rows_replaced as u64,
+                incremental: Some(outcome),
+            })
+            .collect())
     }
 }
 

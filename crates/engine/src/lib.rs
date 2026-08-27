@@ -144,9 +144,10 @@
 //! 構文（`sql::allowlist`）は変更しない。`core::EngineCore::execute_insert_sql` が
 //! 分岐の入口（詳細は `embedding.rs`・`incremental.rs`・`sql/parser.rs` モジュール
 //! ドキュメント参照）。`operation_id` の台帳記録（TASK-93・RECOVER-2）は行形と同じ
-//! 契約で、置換書き込みと同一 write トランザクション内に結線済み。一括投入上限
-//! （TASK-122、対象ビヘイビア: INDEX-4）・外部埋め込みサービス実クライアントの接続は
-//! 後続タスクの管轄。
+//! 契約で、置換書き込みと同一 write トランザクション内に結線済み。一括投入 4 上限
+//! （`batch_limits.rs`・TASK-122、対象ビヘイビア: INDEX-4。`incremental::index_file_batch`・
+//! `core::EngineCore::execute_insert_sql_batch` が結線）は実装済み。外部埋め込み
+//! サービス実クライアントの接続は後続タスクの管轄。
 //!
 //! TASK-147（対象ビヘイビア: EXT-3）: `declarative_filter.rs` が、メタデータ列
 //! （`TEXT` 列）に対する等価・前方一致フィルタを任意の列名へ宣言的に指定できる
@@ -186,6 +187,7 @@
 
 pub mod arena;
 pub mod batch_fallback;
+pub mod batch_limits;
 pub mod batch_search;
 pub mod buffer_pool;
 pub mod catalog;

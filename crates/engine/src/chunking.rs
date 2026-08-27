@@ -4,10 +4,11 @@
 //! 責務境界: `INSERT` 経由で受け取ったファイル内容（パス＋ UTF-8 本文）を、
 //! ファイル種別に応じた方針でチャンク列へ分割する純関数的な API を提供し、
 //! storage / catalog / sql / policy とは結線しない（`sparse.rs` と同じ
-//! 「純関数的 API・結線しない」方針）。呼び出し元は将来の増分インデックス結線
-//! （TASK-120）と一括投入上限（TASK-122、対象ビヘイビア: INDEX-4）を想定する。
-//! 本モジュール自身は単一入力（1 ファイル）に対する走査量の有界化のみを担い、
-//! 複数ファイルにまたがる合計サイズ・ファイル数上限は TASK-122 の管轄である。
+//! 「純関数的 API・結線しない」方針）。呼び出し元は増分インデックス結線
+//! （TASK-120・`incremental.rs`）と一括投入 4 上限（TASK-122・対象ビヘイビア: INDEX-4・
+//! `batch_limits.rs`）。本モジュール自身は単一入力（1 ファイル）に対する走査量の
+//! 有界化のみを担い、複数ファイルにまたがる合計サイズ・ファイル数上限は
+//! `batch_limits.rs`（TASK-122）の管轄である。
 //!
 //! 入力は SQL 表層で既に UTF-8 検証済みの `&str` を前提とする（本モジュールは
 //! バイト列のデコードを行わない）。パスはファイル種別判定のみに使い、
@@ -31,7 +32,8 @@
 ///
 /// wire → SQL `INSERT` 経由で届く untrusted 入力を前提とした DoS 対策
 /// （`sparse.rs::MAX_DOC_BYTES` と同じ流儀）。複数ファイル合計の上限は
-/// TASK-122（INDEX-4）が別途担う。
+/// `batch_limits.rs`（TASK-122・INDEX-4）が別途担う（`BatchLimits::
+/// max_file_body_bytes` の既定値は本定数と一致させている）。
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// 単一入力本文の上限行数（この上限を超える入力は走査前に拒否する）。
@@ -498,7 +500,7 @@ pub fn chunk_markdown(text: &str, config: &ChunkingConfig) -> Result<Vec<Chunk>,
 /// パスからファイル種別を判定し、[`chunk_markdown`] / [`chunk_generic`] へ委譲する。
 ///
 /// `INSERT` 経由で届く未検証のパス・本文を受け取る想定の公開入口
-/// （呼び出し元は将来の TASK-120 増分インデックス結線・TASK-122 一括投入上限）。
+/// （呼び出し元は TASK-120 増分インデックス結線・TASK-122 一括投入 4 上限）。
 pub fn chunk_file(
     path: &str,
     text: &str,
