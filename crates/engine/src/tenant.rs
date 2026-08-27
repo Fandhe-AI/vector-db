@@ -42,8 +42,7 @@ use crate::policy::PolicyContext;
 use crate::recovery::ledger::{self, LedgerWrite};
 use crate::recovery::required_op_id::{LedgerMode, OperationId};
 use crate::storage::{
-    bump_generation_and_commit, decode_row_tenant_and_visibility, encode_row, Row, RowInput,
-    Storage, StorageError,
+    decode_row_tenant_and_visibility, encode_row, Row, RowInput, Storage, StorageError,
 };
 
 /// 1 ページあたりの走査件数（`catalog.rs::Storage::scan_table_page` の内部上限
@@ -477,7 +476,7 @@ pub(crate) fn insert_row_unchecked(
         let encoded = encode_row(row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
 
@@ -573,7 +572,7 @@ pub(crate) fn insert_rows_unchecked(
             insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
 
@@ -656,7 +655,7 @@ pub(crate) fn insert_typed_row_unchecked(
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
 
@@ -738,7 +737,7 @@ pub(crate) fn update_row_unchecked(
             .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
 
@@ -803,7 +802,7 @@ pub(crate) fn delete_row_unchecked(
             .map_err(TenantWriteError::LedgerCorrupted)?;
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
 
@@ -1041,7 +1040,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         drop(write_txn);
         return Ok(outcome);
     }
-    bump_generation_and_commit(write_txn)?;
+    crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(outcome)
 }
 

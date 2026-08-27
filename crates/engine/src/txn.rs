@@ -11,9 +11,10 @@
 
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::recovery::commit_boundary::commit_write_txn_guarded;
 use crate::storage::{
-    commit_write_txn, decode_row_for_key, encode_row, map_rows_table_error, Row, RowInput, Storage,
-    StorageError, BATCH_LOG_TABLE, ROWS_TABLE,
+    decode_row_for_key, encode_row, map_rows_table_error, Row, RowInput, Storage, StorageError,
+    BATCH_LOG_TABLE, ROWS_TABLE,
 };
 
 /// engine が宣言する分離レベル（対象ビヘイビア: TABLE-3）。
@@ -181,13 +182,13 @@ impl WriteTxn {
         Ok(())
     }
 
-    /// トランザクションをコミットし、書き込みを確定する（[`commit_write_txn`]
-    /// 経由。TASK-133 P1・Issue #175 対応）。[`Self::put`] を 1 度も呼ばずに
-    /// commit した場合は世代カウンタを進めない（実書き込みがなければ
-    /// `PrefilterIndex` を失効させる理由がない）。1 度でも呼んでいれば
-    /// （上書きのみの場合を含む）必ず世代を進める。
+    /// トランザクションをコミットし、書き込みを確定する（[`commit_write_txn_guarded`]
+    /// 経由。TASK-133 P1・Issue #175、および TASK-96・対象ビヘイビア: RECOVER-5 の
+    /// commit 成功境界対応）。[`Self::put`] を 1 度も呼ばずに commit した場合は
+    /// 世代カウンタを進めない（実書き込みがなければ `PrefilterIndex` を失効させる
+    /// 理由がない）。1 度でも呼んでいれば（上書きのみの場合を含む）必ず世代を進める。
     pub fn commit(self) -> crate::storage::Result<()> {
-        commit_write_txn(self.txn, self.has_writes)
+        commit_write_txn_guarded(self.txn, self.has_writes)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
@@ -348,8 +349,9 @@ impl BatchWriteTxn {
     /// 対応）。
     ///
     /// 世代カウンタの制御は `has_writes`（[`Self::put`]・[`Self::log_batch`] のいずれかを
-    /// 1 回でも呼んだか）で判断し、[`commit_write_txn`] に委譲する（Issue #175・
-    /// TASK-133 P2 対応）。`pending_row_count == 0` を「一度も書き込んでいない」判定に
+    /// 1 回でも呼んだか）で判断し、[`commit_write_txn_guarded`] に委譲する（Issue #175・
+    /// TASK-133 P2、TASK-96・RECOVER-5 対応）。`pending_row_count == 0` を
+    /// 「一度も書き込んでいない」判定に
     /// **使わない**: `log_batch` 成功後や上書きのみのバッチでも 0 になり得るため、これを
     /// 根拠にすると実際に書き込み済みのバッチを誤って no-op 扱いし、世代更新を見逃す
     /// fail-open になる（`has_writes` を導入した理由そのもの）。
@@ -357,7 +359,7 @@ impl BatchWriteTxn {
         if self.pending_row_count != 0 {
             return Err(StorageError::UnloggedRows(self.pending_row_count));
         }
-        commit_write_txn(self.txn, self.has_writes)
+        commit_write_txn_guarded(self.txn, self.has_writes)
     }
 
     /// トランザクションを明示的に中断し、書き込みを破棄する。
