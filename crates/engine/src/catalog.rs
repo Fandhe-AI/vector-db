@@ -1407,6 +1407,7 @@ mod tests {
     // 書き込みを誤って重複拒否させない（Issue #226 レビュー対応: TASK-93/RECOVER-2）。
     #[test]
     fn drop_table_removes_op_ledger_entries_for_that_table() {
+        use crate::recovery::content_hash::ContentHash;
         use crate::recovery::ledger::{contains_in_read_txn, record_in_txn, LedgerWrite};
         use crate::recovery::required_op_id::OperationId;
 
@@ -1422,8 +1423,14 @@ mod tests {
 
         let op_id = OperationId::parse("op-drop-1").expect("valid operation_id");
         let write_txn = storage.db().begin_write().expect("begin write");
-        record_in_txn(&write_txn, "tenant-a", "docs", LedgerWrite::Record(&op_id))
-            .expect("record op ledger entry");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "docs",
+            LedgerWrite::Record(&op_id),
+            &ContentHash::for_test(b"content"),
+        )
+        .expect("record op ledger entry");
         write_txn.commit().expect("commit ledger record");
 
         storage.drop_table("docs").expect("drop table");

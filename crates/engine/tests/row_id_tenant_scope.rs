@@ -121,8 +121,10 @@ fn table12_duplicate_id_within_the_same_tenant_is_rejected_with_23505() {
             .expect("valid operation_id"),
     )
     .expect("first insert ok");
-    // 2 回目は別の `operation_id` を使う。台帳の重複拒否（TASK-94・RECOVER-3）ではなく、
-    // 本テストが検証したい行キー衝突（`IdConflict`）を発生させるため。
+    // 別の operation_id を使う（TASK-101・RECOVER-10）: 台帳照合は行書き込みより
+    // 前に行われるため、ここで同一 operation_id を再利用すると
+    // OperationIdContentMismatch（内容不一致）が先に検出されてしまい、本テストが
+    // 検証したい「行 id レベルの衝突検出」を独立に確認できなくなる。
     let err = tenant::insert_row(
         &storage,
         TABLE,
@@ -608,7 +610,10 @@ fn recover4_guarded_batch_insert_enforces_tenant_and_id_contracts() {
         b"b1".to_vec()
     );
 
-    // 既存行と衝突するバッチは IdConflict（既存行は不変）。
+    // 既存行と衝突するバッチは IdConflict（既存行は不変）。TASK-101（RECOVER-10）:
+    // 台帳照合が行書き込みより前に行われるため、`batch_a` と同じ operation_id を
+    // 別内容のバッチへ再利用すると OperationIdContentMismatch が先に検出されて
+    // しまう。行 id レベルの衝突検出を独立に確認するため別の operation_id を使う。
     let conflict = vec![(2u64, row(TENANT_A, &[0.0, 0.0], b"overwrite"))];
     let err = engine::tenant::insert_rows(
         &storage,

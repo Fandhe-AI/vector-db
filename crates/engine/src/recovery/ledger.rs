@@ -12,16 +12,20 @@
 //! `record_in_txn` を「スキーマ取得 → 台帳追記 → 行書き込み/削除 → commit」の順に
 //! 呼ぶ（`tenant.rs` モジュールドキュメント参照）。
 //!
-//! **本タスクのスコープ外**（`tenant.rs` 冒頭ドキュメントおよび PR 本文の申し送り参照）:
-//! 同一 `operation_id` の重複拒否（`23505`）は [`crate::recovery::dedup`]（TASK-94、
-//! 対象ビヘイビア: RECOVER-3）が本モジュールの [`RecordOutcome`] を土台に実装する。
-//! 内容照合ハッシュ（`22023`）は TASK-101 の管轄。本モジュールは「既存エントリを
-//! 上書きしない（keep-first）」ことだけを恒久契約として担保する。
+//! 内容照合ハッシュ（TASK-101、対象ビヘイビア: RECOVER-10。[`crate::recovery::content_hash`]
+//! 参照）を台帳値フォーマット v2 として追加済み。同一 `operation_id`・同一テーブルへの
+//! 再送時に、ハッシュが一致すれば「同一内容の再送」（呼び出し元が `23505` へ写像。
+//! TASK-94・RECOVER-3 の重複拒否契約を包含する）、不一致であれば「内容の異なる誤用」
+//! （呼び出し元が `22023` へ写像）を [`LedgerRecordError`] で返す。並行書き込みの
+//! 原子性は呼び出し元が同一 `redb::WriteTransaction` 内で本関数を呼ぶことで担保する
+//! （本モジュールは「既存エントリを上書きしない（keep-first）」ことを引き続き
+//! 恒久契約として担保する）。
 
 use std::ops::Bound;
 
 use redb::{ReadableTable, TableDefinition, TableHandle};
 
+use crate::recovery::content_hash::ContentHash;
 use crate::recovery::required_op_id::OperationId;
 use crate::storage::StorageError;
 
@@ -38,20 +42,40 @@ use crate::storage::StorageError;
 ///   （`user_rows/` プレフィックスなし）。
 /// - `operation_id` は検証済み [`OperationId`]（TASK-80。長さ上限 256・制御文字排除済み）。
 ///
-/// 値は先頭 1 バイトのフォーマットバージョンのみ（[`LEDGER_ENTRY_FORMAT_VERSION`]）。
-/// TASK-98（二層目 `last_op`）・TASK-101（内容ハッシュ）の拡張はバージョン繰り上げで
-/// 対応する想定で、未知バージョンの値は fail-closed に拒否する（[`decode_entry`]）。
+/// 値は v1（バージョンバイトのみ）・v2（バージョンバイト＋32 バイト内容ハッシュ。
+/// TASK-101・RECOVER-10）のいずれか。TASK-98（二層目 `last_op`）の拡張はさらなる
+/// バージョン繰り上げで対応する想定で、未知バージョンの値は fail-closed に拒否する
+/// （[`decode_entry`]）。
 ///
 /// カタログ（`Storage::list_tables` 等）はユーザーテーブルのみを列挙する既存設計のため、
 /// 本テーブル名 `op_ledger` はユーザーから見えるテーブル一覧に混入しない。
 pub(crate) const OP_LEDGER_TABLE: TableDefinition<(&str, &str, &str), &[u8]> =
     TableDefinition::new("op_ledger");
 
-/// [`OP_LEDGER_TABLE`] の値フォーマットバージョン（現行: 1 バイトのみ）。
-const LEDGER_ENTRY_FORMAT_VERSION: u8 = 1;
+/// [`OP_LEDGER_TABLE`] の値フォーマットバージョン v1（バージョンバイトのみ。内容ハッシュ
+/// なし）。TASK-101 以前に書かれた既存エントリ、または `decode_entry` が
+/// `StoredEntry::V1` を返す形式。
+const LEDGER_ENTRY_FORMAT_VERSION_V1: u8 = 1;
 
-/// 台帳エントリの符号化値（現行フォーマット。バージョンバイトのみ）。
-const LEDGER_ENTRY_V1: [u8; 1] = [LEDGER_ENTRY_FORMAT_VERSION];
+/// [`OP_LEDGER_TABLE`] の値フォーマットバージョン v2（バージョンバイト＋32 バイト
+/// 内容ハッシュ。TASK-101・RECOVER-10）。
+const LEDGER_ENTRY_FORMAT_VERSION_V2: u8 = 2;
+
+/// v2 台帳エントリの符号化。バージョンバイト＋[`ContentHash`] の生バイト列。
+fn encode_entry_v2(hash: &ContentHash) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32);
+    buf.push(LEDGER_ENTRY_FORMAT_VERSION_V2);
+    buf.extend_from_slice(hash.as_bytes());
+    buf
+}
+
+/// [`decode_entry`] の返値。`ledger.rs`（本ファイル）内でのみ使う中間表現。
+enum StoredEntry {
+    /// v1（内容ハッシュを保持しない旧フォーマット）。
+    V1,
+    /// v2（内容ハッシュを保持する現行フォーマット）。
+    V2 { hash: [u8; 32] },
+}
 
 /// [`delete_table_in_txn`] が 1 回の走査・削除で `keys_to_remove` に保持するキー数の
 /// 上限（Issue #226 レビュー対応・codex-review 指摘）。長期利用テーブルの
@@ -72,11 +96,15 @@ impl std::fmt::Display for UnknownLedgerEntryFormat {
 
 impl std::error::Error for UnknownLedgerEntryFormat {}
 
-/// 台帳値のデコード。空値・未知バージョンはいずれも fail-closed に拒否する
-/// （`storage.rs` の行フォーマット検証と同方針）。
-fn decode_entry(value: &[u8]) -> Result<(), UnknownLedgerEntryFormat> {
-    match value {
-        [LEDGER_ENTRY_FORMAT_VERSION] => Ok(()),
+/// 台帳値のデコード。空値・未知バージョン・v2 のハッシュ長不一致はいずれも
+/// fail-closed に拒否する（`storage.rs` の行フォーマット検証と同方針）。
+fn decode_entry(value: &[u8]) -> Result<StoredEntry, UnknownLedgerEntryFormat> {
+    match value.split_first() {
+        Some((&LEDGER_ENTRY_FORMAT_VERSION_V1, [])) => Ok(StoredEntry::V1),
+        Some((&LEDGER_ENTRY_FORMAT_VERSION_V2, rest)) => {
+            let hash: [u8; 32] = rest.try_into().map_err(|_| UnknownLedgerEntryFormat)?;
+            Ok(StoredEntry::V2 { hash })
+        }
         _ => Err(UnknownLedgerEntryFormat),
     }
 }
@@ -92,16 +120,46 @@ pub(crate) enum LedgerWrite<'a> {
     Disabled,
 }
 
-/// [`record_in_txn`] の記録結果。[`crate::recovery::dedup::ensure_first_use`]
-/// （TASK-94・RECOVER-3）が `AlreadyPresent` を `23505` へ写像する際の土台。
+/// [`record_in_txn`] の成功時の記録結果。既存キーの検出（重複・内容不一致）は
+/// [`LedgerRecordError`] 側の variant として返す（TASK-101・RECOVER-10 対応で
+/// `AlreadyPresent` を廃止し、呼び出し元が `?` で自然に `TenantWriteError` へ
+/// 写像できる形へ整理した）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordOutcome {
     /// 新規記録した。
     Recorded,
-    /// 同一キーが既に存在した（記録済みだったため上書きしていない。keep-first）。
-    AlreadyPresent,
     /// [`LedgerWrite::Disabled`] のため台帳へ触れなかった。
     Skipped,
+}
+
+/// [`record_in_txn`] のエラー型（TASK-101、対象ビヘイビア: RECOVER-10）。
+/// `crate::tenant::*_unchecked` が `?`／`match` で `TenantWriteError` へ写像する
+/// （`Duplicate` → `23505`・`ContentMismatch` → `22023`・`Corrupted` → `XX000`。
+/// `tenant.rs` の `TenantWriteError` 定義参照）。
+#[derive(Debug)]
+pub(crate) enum LedgerRecordError {
+    /// 未知の台帳値フォーマットを検出した（内部事象。テナント・行内容を含まない）。
+    Corrupted(StorageError),
+    /// 同一 `operation_id`・同一テーブルへ、**内容が一致する**書き込みが再送された
+    /// （commit 済み確定の根拠として扱ってよい。呼び出し元は `23505` へ写像する）。
+    Duplicate,
+    /// 同一 `operation_id`・同一テーブルへ、**内容が異なる**書き込みが再送された、
+    /// または内容一致を証明できない v1 レガシーエントリへ再送された（いずれも
+    /// fail-closed に「commit 済み確定の根拠にしない」側へ倒す。呼び出し元は
+    /// `22023` へ写像する）。
+    ContentMismatch,
+}
+
+/// `redb` の各操作は複数のエラー型を返すが、いずれも `redb::Error` へ変換可能
+/// （`storage.rs` の `StorageError` 側 blanket impl と同じ理由）。ここでは対象型が
+/// 異なる（`LedgerRecordError`）ため coherence 上の衝突なく独立に定義できる。
+impl<E> From<E> for LedgerRecordError
+where
+    E: Into<redb::Error>,
+{
+    fn from(e: E) -> Self {
+        LedgerRecordError::Corrupted(StorageError::from(e))
+    }
 }
 
 /// [`crate::core::EngineCore::operation_recorded`] の照会結果（TASK-93、対象ビヘイビア:
@@ -131,12 +189,21 @@ pub enum LedgerLookup {
 ///
 /// 既存キーがあれば**上書きしない**（keep-first。台帳の恒久契約。TASK-98 が二層目
 /// `last_op` を追加する際もこの一層目の意味は変えない）。
+///
+/// `content_hash`（TASK-101・RECOVER-10）: 既存エントリが検出された場合、
+/// v2（内容ハッシュ保持）なら渡された `content_hash` と照合し、一致すれば
+/// [`LedgerRecordError::Duplicate`]・不一致なら [`LedgerRecordError::ContentMismatch`]
+/// を返す。v1（内容ハッシュ非保持のレガシーエントリ）は内容一致を証明できないため、
+/// 常に `ContentMismatch` 側へ倒す（fail-closed。commit 済み確定の根拠として誤用
+/// されるのを防ぐ。本番データが存在しない前提のため移行処理は導入しない）。
+/// 新規記録時は v2 フォーマットで書き込む。
 pub(crate) fn record_in_txn(
     write_txn: &redb::WriteTransaction,
     tenant_id: &str,
     table: &str,
     ledger: LedgerWrite<'_>,
-) -> Result<RecordOutcome, StorageError> {
+    content_hash: &ContentHash,
+) -> Result<RecordOutcome, LedgerRecordError> {
     let op_id = match ledger {
         LedgerWrite::Record(op_id) => op_id,
         LedgerWrite::Disabled => return Ok(RecordOutcome::Skipped),
@@ -144,14 +211,23 @@ pub(crate) fn record_in_txn(
     let mut ledger_table = write_txn.open_table(OP_LEDGER_TABLE)?;
     let key = (tenant_id, table, op_id.as_str());
     if let Some(guard) = ledger_table.get(key)? {
-        // 値の中身は判定に使わない（存在すれば keep-first で終了）。ただし未知
-        // フォーマットが混入していないかは fail-closed に確認しておく。
-        decode_entry(guard.value()).map_err(|_| {
-            StorageError::Codec("op_ledger entry has unknown format version".to_string())
+        let stored = decode_entry(guard.value()).map_err(|_| {
+            LedgerRecordError::Corrupted(StorageError::Codec(
+                "op_ledger entry has unknown format version".to_string(),
+            ))
         })?;
-        return Ok(RecordOutcome::AlreadyPresent);
+        return match stored {
+            StoredEntry::V1 => Err(LedgerRecordError::ContentMismatch),
+            StoredEntry::V2 { hash } => {
+                if content_hash.matches(&hash) {
+                    Err(LedgerRecordError::Duplicate)
+                } else {
+                    Err(LedgerRecordError::ContentMismatch)
+                }
+            }
+        };
     }
-    ledger_table.insert(key, LEDGER_ENTRY_V1.as_slice())?;
+    ledger_table.insert(key, encode_entry_v2(content_hash).as_slice())?;
     Ok(RecordOutcome::Recorded)
 }
 
@@ -263,6 +339,8 @@ pub(crate) fn contains_in_read_txn(
     let key = (tenant_id, table, op_id.as_str());
     match ledger_table.get(key)? {
         Some(guard) => {
+            // v1・v2 のいずれも「記録済み」と判定する（[`decode_entry`] が未知
+            // フォーマットのみ拒否する。中身のハッシュ値は照会用途では不要）。
             decode_entry(guard.value()).map_err(|_| {
                 StorageError::Codec("op_ledger entry has unknown format version".to_string())
             })?;
@@ -283,6 +361,10 @@ mod tests {
         OperationId::parse(id).expect("valid operation_id")
     }
 
+    fn hash(seed: &str) -> ContentHash {
+        ContentHash::for_test(seed.as_bytes())
+    }
+
     // (a) 記録 → 同一 txn commit 後に contains が true になる。
     #[test]
     fn record_then_commit_is_observable_in_read_txn() {
@@ -296,6 +378,7 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-a")),
+            &hash("content-a"),
         )
         .expect("record");
         assert_eq!(outcome, RecordOutcome::Recorded);
@@ -321,6 +404,7 @@ mod tests {
                 "tenant-a",
                 "documents",
                 LedgerWrite::Record(&op("op-b")),
+                &hash("content-b"),
             )
             .expect("record");
             assert_eq!(outcome, RecordOutcome::Recorded);
@@ -333,10 +417,11 @@ mod tests {
         assert!(!found);
     }
 
-    // (c) 同一キー 2 回目は AlreadyPresent で値が変わらない（keep-first）。
+    // (c-1) 同一キー・同一内容の 2 回目は Duplicate（TASK-101・RECOVER-10。呼び出し元が
+    // `23505` へ写像する）で、値（台帳エントリ）は変わらない（keep-first）。
     #[test]
-    fn second_record_of_same_key_is_already_present_and_keeps_first_value() {
-        let path = unique_db_path("ledger-c");
+    fn second_record_of_same_key_and_content_is_duplicate_and_keeps_first_value() {
+        let path = unique_db_path("ledger-c1");
         let _guard = CleanupGuard(path.clone());
         let db = redb::Database::create(&path).expect("create db");
 
@@ -346,6 +431,7 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-c")),
+            &hash("content-c"),
         )
         .expect("record first");
         assert_eq!(first, RecordOutcome::Recorded);
@@ -354,15 +440,44 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-c")),
+            &hash("content-c"),
         )
-        .expect("record second");
-        assert_eq!(second, RecordOutcome::AlreadyPresent);
+        .expect_err("same content resend must be rejected as Duplicate");
+        assert!(matches!(second, LedgerRecordError::Duplicate));
         write_txn.commit().expect("commit");
 
         let read_txn = db.begin_read().expect("begin read");
         let found = contains_in_read_txn(&read_txn, "tenant-a", "documents", &op("op-c"))
             .expect("contains");
         assert!(found);
+    }
+
+    // (c-2) 同一キー・内容が異なる 2 回目は ContentMismatch（呼び出し元が `22023` へ
+    // 写像する。fail-closed: commit 済み確定の根拠にしない）。
+    #[test]
+    fn second_record_of_same_key_with_different_content_is_content_mismatch() {
+        let path = unique_db_path("ledger-c2");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Record(&op("op-c2")),
+            &hash("content-original"),
+        )
+        .expect("record first");
+        let second = record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Record(&op("op-c2")),
+            &hash("content-different"),
+        )
+        .expect_err("different content resend must be rejected as ContentMismatch");
+        assert!(matches!(second, LedgerRecordError::ContentMismatch));
     }
 
     // (d) Disabled は台帳テーブルを作らない。
@@ -373,8 +488,14 @@ mod tests {
         let db = redb::Database::create(&path).expect("create db");
 
         let write_txn = db.begin_write().expect("begin write");
-        let outcome = record_in_txn(&write_txn, "tenant-a", "documents", LedgerWrite::Disabled)
-            .expect("record");
+        let outcome = record_in_txn(
+            &write_txn,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Disabled,
+            &hash("unused"),
+        )
+        .expect("record");
         assert_eq!(outcome, RecordOutcome::Skipped);
         write_txn.commit().expect("commit");
 
@@ -382,6 +503,41 @@ mod tests {
         let found = contains_in_read_txn(&read_txn, "tenant-a", "documents", &op("op-d"))
             .expect("contains on missing table must be false, not an error");
         assert!(!found);
+    }
+
+    // (e-legacy) v1（内容ハッシュ非保持）の既存エントリへの再送は、内容一致を証明
+    // できないため常に ContentMismatch へ倒す（TASK-101・RECOVER-10 の fail-closed
+    // 設計判断。commit 済み確定の根拠として誤って `23505` を返さない）。
+    #[test]
+    fn resend_to_legacy_v1_entry_is_rejected_as_content_mismatch() {
+        let path = unique_db_path("ledger-e-legacy");
+        let _guard = CleanupGuard(path.clone());
+        let db = redb::Database::create(&path).expect("create db");
+
+        let write_txn = db.begin_write().expect("begin write");
+        {
+            let mut table = write_txn.open_table(OP_LEDGER_TABLE).expect("open table");
+            // v1 フォーマット（バージョンバイトのみ）を直接挿入して、TASK-101 以前の
+            // 台帳エントリを再現する。
+            table
+                .insert(
+                    ("tenant-a", "documents", "op-legacy"),
+                    [LEDGER_ENTRY_FORMAT_VERSION_V1].as_slice(),
+                )
+                .expect("insert raw v1 entry");
+        }
+        write_txn.commit().expect("commit");
+
+        let write_txn2 = db.begin_write().expect("begin write");
+        let err = record_in_txn(
+            &write_txn2,
+            "tenant-a",
+            "documents",
+            LedgerWrite::Record(&op("op-legacy")),
+            &hash("any-content"),
+        )
+        .expect_err("legacy v1 entry must be rejected as ContentMismatch");
+        assert!(matches!(err, LedgerRecordError::ContentMismatch));
     }
 
     // (e) 未知フォーマットバージョンの値は fail-closed（デコードエラー）。
@@ -413,9 +569,10 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-e")),
+            &hash("content-e"),
         )
         .expect_err("unknown format version must be rejected on record too");
-        assert!(matches!(err2, StorageError::Codec(_)));
+        assert!(matches!(err2, LedgerRecordError::Corrupted(_)));
     }
 
     // (f) delete_table_in_txn は指定テーブル名分を全テナントから削除し、他テーブル名の
@@ -433,6 +590,7 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-f1")),
+            &hash("content-f1"),
         )
         .expect("record tenant-a/documents");
         record_in_txn(
@@ -440,6 +598,7 @@ mod tests {
             "tenant-b",
             "documents",
             LedgerWrite::Record(&op("op-f2")),
+            &hash("content-f2"),
         )
         .expect("record tenant-b/documents");
         record_in_txn(
@@ -447,6 +606,7 @@ mod tests {
             "tenant-a",
             "other_table",
             LedgerWrite::Record(&op("op-f3")),
+            &hash("content-f3"),
         )
         .expect("record tenant-a/other_table");
         write_txn.commit().expect("commit initial records");
@@ -477,6 +637,7 @@ mod tests {
             "tenant-a",
             "documents",
             LedgerWrite::Record(&op("op-f1")),
+            &hash("content-f1-v2"),
         )
         .expect("re-record after drop");
         assert_eq!(outcome, RecordOutcome::Recorded);
@@ -543,6 +704,7 @@ mod tests {
                     tenant,
                     "documents",
                     LedgerWrite::Record(&op(&format!("op-{i:06}"))),
+                    &hash(&format!("content-{tenant}-{i:06}")),
                 )
                 .expect("record");
             }
@@ -555,6 +717,7 @@ mod tests {
                     "tenant-a",
                     table,
                     LedgerWrite::Record(&op(&format!("op-{i:06}"))),
+                    &hash(&format!("content-{table}-{i:06}")),
                 )
                 .expect("record");
             }

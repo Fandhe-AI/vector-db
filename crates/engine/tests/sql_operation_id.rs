@@ -13,10 +13,10 @@
 //!
 //! 台帳への永続化は TASK-93（対象ビヘイビア: RECOVER-2）が
 //! `crate::recovery::ledger` として実装済み（結合テストは
-//! `tests/recovery_ledger.rs`）。同一 `operation_id` の重複拒否（`23505`）は
-//! TASK-94（対象ビヘイビア: RECOVER-3）が `crate::recovery::dedup` として実装済み
-//! （結合テストは `tests/recovery_dedup.rs`）。内容不一致検出（`22023`）は本タスクの
-//! 管轄外（TASK-101 が後続で扱う）。
+//! `tests/recovery_ledger.rs`）。同一 `operation_id` の重複拒否（`23505`）・内容
+//! 不一致検出（`22023`）は `crate::recovery::ledger::record_in_txn` の内容照合ハッシュ
+//! （TASK-94・RECOVER-3 の重複拒否契約を包含する TASK-101・RECOVER-10）が担う
+//! （結合テストは `tests/recovery_content_hash.rs`）。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;

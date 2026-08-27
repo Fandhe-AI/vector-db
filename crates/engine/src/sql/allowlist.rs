@@ -108,15 +108,21 @@ pub enum SqlSurfaceError {
     /// を SQL 表層へ写像したもの。ERR-2: `23505`）。行ストアの物理キーは
     /// `(tenant_id, id)` で名前空間化されているため（TABLE-12・RLS-9）、他テナントが
     /// 同じ `id` を保持していても本 variant にはならない。`operation_id` 単位の
-    /// 冪等判定（台帳による重複拒否）は [`SqlSurfaceError::DuplicateOperationId`]
-    /// （TASK-94）が別 variant で扱う。内容不一致検出は TASK-101 が後続で扱う。
+    /// 冪等判定（台帳による重複拒否・内容不一致検出）は [`SqlSurfaceError::DuplicateOperationId`]・
+    /// [`SqlSurfaceError::OperationIdContentMismatch`] が担う（TASK-101・RECOVER-10。
+    /// TASK-94・RECOVER-3 の重複拒否契約を包含する）。
     IdConflict,
-    /// 同一 `(tenant_id, table, operation_id)` への書き込みが既に commit 済み
-    /// （TASK-94・対象ビヘイビア: RECOVER-3。
-    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] を SQL 表層へ写像した
-    /// もの。ERR-2: `23505`）。行キー衝突（[`SqlSurfaceError::IdConflict`]）とは別の
-    /// 固定文言を返し、クライアントが両者を取り違えないようにする。
+    /// `operation_id` 台帳（TASK-93）に記録済みの `operation_id` へ、**内容が一致する**
+    /// 書き込みが再送された（TASK-101・対象ビヘイビア: RECOVER-10。
+    /// [`crate::tenant::TenantWriteError::DuplicateOperationId`] の写像。ERR-2: `23505`）。
+    /// 行キー衝突（[`SqlSurfaceError::IdConflict`]）とは別の固定文言を返し、クライアント
+    /// が両者を取り違えないようにする。
     DuplicateOperationId,
+    /// 台帳に記録済みの `operation_id` へ、**内容が異なる**書き込みが再送された、
+    /// または内容一致を証明できない旧フォーマットの台帳エントリへ再送された
+    /// （TASK-101・RECOVER-10。[`crate::tenant::TenantWriteError::OperationIdContentMismatch`]
+    /// の写像。ERR-2: `22023`。fail-closed: commit 済み確定の根拠にしない）。
+    OperationIdContentMismatch,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// ERR-2 表に未掲載の新設コード（SQL-13 が定義。ポインタ:
@@ -213,6 +219,7 @@ impl ClassifiedError for SqlSurfaceError {
             SqlSurfaceError::IdConflict => ErrorClass::UniqueViolation,
             SqlSurfaceError::DuplicateOperationId => ErrorClass::UniqueViolation,
             SqlSurfaceError::NumericOutOfRange { .. } => ErrorClass::NumericOutOfRange,
+            SqlSurfaceError::OperationIdContentMismatch => ErrorClass::OperationIdContentMismatch,
         }
     }
 
@@ -245,14 +252,18 @@ impl std::fmt::Display for SqlSurfaceError {
             SqlSurfaceError::IdConflict => {
                 write!(f, "row id already exists")
             }
-            // `crate::tenant::TenantWriteError::DuplicateOperationId` と同じ固定文言
-            // （`IdConflict` の文言と区別できることが目的。上記 variant doc・
-            // security.md P0 参照）。
+            // operation_id・行内容・テナントを含めない固定文言（security.md P0。
+            // `crate::tenant::TenantWriteError::DuplicateOperationId`/
+            // `OperationIdContentMismatch` と同じ契約。`IdConflict` の文言と区別できる
+            // ことが目的）。
             SqlSurfaceError::DuplicateOperationId => {
-                write!(f, "operation_id already committed for this table")
+                write!(f, "operation_id already recorded with the same content")
             }
             SqlSurfaceError::NumericOutOfRange { detail } => {
                 write!(f, "numeric value out of range: {detail}")
+            }
+            SqlSurfaceError::OperationIdContentMismatch => {
+                write!(f, "operation_id already recorded with different content")
             }
         }
     }

@@ -181,9 +181,11 @@ fn seed_corpus(storage: &Storage) -> Vec<RowTruth> {
                     };
                     values.push(Value::Text(cell));
                 }
-                // TASK-94・RECOVER-3: 台帳の重複拒否が入ったため、行ごとに一意な
-                // `operation_id` を使う（固定文言の使い回しは 2 回目以降が `23505`
-                // になる）。テーブル・テナントをまたいで一意な `id` を suffix にする。
+                // TASK-101（RECOVER-10）: 台帳は (tenant, table, operation_id) 単位で
+                // 内容ハッシュを持つため、同一テナント・同一テーブル内で内容の異なる
+                // 複数行へ同一 operation_id を使い回すと 2 件目以降が
+                // OperationIdContentMismatch で拒否される。行・テーブルごとに一意の
+                // operation_id を使う。
                 let op_id = engine::recovery::required_op_id::OperationId::parse(&format!(
                     "test-op-{}-{id}",
                     t.name

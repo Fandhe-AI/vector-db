@@ -381,6 +381,12 @@ fn embed_and_write_phase(
             key_value: input.path,
             visibility: Visibility::Private,
             rows: &rows,
+            // 内容照合ハッシュ（TASK-101・RECOVER-10）はチャンク化・埋め込み前の
+            // raw クライアント要求から構成する（codex-review P1 指摘・PR #248。
+            // `tenant::ReplaceByTextKey` ドキュメント参照）。
+            content_hash_path: input.path,
+            content_hash_body: input.body,
+            content_hash_template_values: input.template_values,
             ledger_write,
         },
     )?;
