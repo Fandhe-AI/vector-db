@@ -29,6 +29,7 @@
 //! （(2-a) のプロセス再起動相当）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::chunking::{chunk_file, ChunkingConfig};
@@ -171,14 +172,21 @@ impl Embedder for FailingEmbedder {
 /// 最初の読み取り試行が失敗するケースの注入用）。`AtomicBool` は
 /// `SearchProvider: Send + Sync`（object-safe・`&self` メソッドのみ）の制約下で
 /// 呼び出し回数を数える唯一の内部可変性手段。
+///
+/// `failed_once` は `Arc` でテストコード側にも共有する。`sql::exec::map_kernel_error`
+/// が `KernelError` の variant 情報を破棄し固定文言の `SqlSurfaceError::Internal` へ
+/// 丸め込む契約（`map_kernel_error` ドキュメント参照）のため、公開エラー型からは
+/// 注入した `KernelError::WorkerPanicked` に由来する失敗であることを判別できない。
+/// 代わりにこの共有フラグを独立オラクルとして使い、初回検索が実際にこの provider の
+/// 注入経路を通って失敗したことを検証する（codex-review Low 指摘対応）。
 struct FailFirstSearchProvider {
-    failed_once: AtomicBool,
+    failed_once: Arc<AtomicBool>,
     inner: CpuScalarProvider,
 }
 impl FailFirstSearchProvider {
-    fn new() -> Self {
+    fn new(failed_once: Arc<AtomicBool>) -> Self {
         Self {
-            failed_once: AtomicBool::new(false),
+            failed_once,
             inner: CpuScalarProvider,
         }
     }
@@ -419,9 +427,13 @@ fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage_with_table(&path);
     let config = small_chunk_config();
-    let core = EngineCore::from_storage(storage, Box::new(FailFirstSearchProvider::new()))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
-        .with_incremental_config(config.clone());
+    let failed_once = Arc::new(AtomicBool::new(false));
+    let core = EngineCore::from_storage(
+        storage,
+        Box::new(FailFirstSearchProvider::new(Arc::clone(&failed_once))),
+    )
+    .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+    .with_incremental_config(config.clone());
 
     let body = "m1\nm2\nm3\nm4";
     core.execute_insert_sql(
@@ -430,6 +442,11 @@ fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
     )
     .expect("file-form insert should succeed");
     let expected = expected_chunk_bodies("docs/retry.txt", body, &config.chunking);
+
+    assert!(
+        !failed_once.load(Ordering::SeqCst),
+        "injected provider must not have been exercised before the first reflection read"
+    );
 
     // 初回検索（索引反映の最初の読み取り試行）は注入した provider により失敗する。
     let zero_vec = zero_vec_literal();
@@ -440,6 +457,15 @@ fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
         ),
     )
     .expect_err("first reflection read must fail as injected");
+    // 独立オラクル: `sql::exec::map_kernel_error` は `KernelError` の variant 情報を
+    // 破棄するため（`FailFirstSearchProvider` ドキュメント参照）、公開エラー型では
+    // 失敗が注入経路由来か判別できない。共有フラグの遷移で、実際に注入した
+    // provider の `search` が呼ばれて `KernelError::WorkerPanicked` を返したことを
+    // 直接確認する。
+    assert!(
+        failed_once.load(Ordering::SeqCst),
+        "the injected provider's failing branch must have been exercised"
+    );
 
     // 同一プロセス内の再試行は成功し、完全一致集合を返す（反映失敗が索引そのものを
     // 破損させたわけではなく、1 回の読み取り試行だけが失敗したことの確認）。
@@ -464,41 +490,63 @@ fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
         .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
         .with_incremental_config(config.clone());
 
-    let old_body = "old line one stale-marker-aaaa\nold line two\nold line three\nold line four";
+    // codex-review Medium 指摘対応: 末尾のマーカー否定アサーションが「辞書が常に空」
+    // という理由だけで自明に成立し、本文が実際に反映されているかを検知できていなかった
+    // （実験的に確認済み）。原因は 3 つ複合していたため、いずれも修正する:
+    // (a) ファイル形 INSERT は `incremental.rs` により行を `Visibility::Private` で
+    //     書き込むが、旧コードは `dictionary_snapshot` を `write_ctx()`
+    //     （`Visibility::Public` のみ）で呼んでいたため `tenant::visible_rows` が
+    //     常に 0 行しか見えず、テーブル走査自体が空だった（`read_ctx()` へ変更）。
+    // (b) `.txt` 拡張子だと `dictionary.rs::detect_source_kind` が
+    //     `SourceFileKind::Other` と判定し、用語索引抽出（`extract_markdown_terms`）
+    //     自体が走らない（`.md` へ変更）。
+    // (c) マーカーがハイフン区切りだと `dictionary.rs::tokenize_ascii_words` が
+    //     英字以外を区切り文字として扱うため `stale`/`marker`/`aaaa` に分割され、
+    //     デバッグ表現の単純な部分文字列一致では本文と無関係にほぼ常に不一致になる
+    //     （ハイフンなしの単一トークンへ変更）。
+    // 修正が効いていることを下の正コントロール（マーカーが実際に現れること）で
+    // 検証し、否定アサーションが自明に成立する経路ではないことを保証する。
+    let old_body = "old line one stalemarkeraaaa\nold line two\nold line three\nold line four";
     core.execute_insert_sql(
         &write_ctx(),
-        &insert_file_sql("docs/replace.txt", old_body, "op-replace-old"),
+        &insert_file_sql("docs/replace.md", old_body, "op-replace-old"),
     )
     .expect("first insert should succeed");
 
     // 検索・dictionary_snapshot でキャッシュ・導出索引を温める（世代 G で反映済み）。
-    let warmed = select_by_path(&core, "docs/replace.txt");
-    let expected_old = expected_chunk_bodies("docs/replace.txt", old_body, &config.chunking);
+    let warmed = select_by_path(&core, "docs/replace.md");
+    let expected_old = expected_chunk_bodies("docs/replace.md", old_body, &config.chunking);
     assert_eq!(warmed, expected_old);
-    core.dictionary_snapshot(&write_ctx(), TABLE)
+    let warm_dict = core
+        .dictionary_snapshot(&read_ctx(), TABLE)
         .expect("dictionary snapshot should succeed while warming the cache");
+    // 正コントロール: 世代 G の辞書には旧本文の固有語が実際に現れていることを
+    // 確認する。これが無いと、末尾の否定アサーションが「辞書抽出自体が機能していない」
+    // ことで自明に成立するのを見逃す（実験的に確認済み。上記コメント参照）。
+    assert!(
+        format!("{warm_dict:?}").contains("stalemarkeraaaa"),
+        "positive control: dictionary must contain the old-content marker while warmed"
+    );
 
     // 新本文・新 operation_id で同一 path を再送 commit（世代 G+1）。
-    let new_body = "new line one fresh-marker-bbbb\nnew line two\nnew line three\nnew line four\nnew line five\nnew line six";
+    let new_body = "new line one freshmarkerbbbb\nnew line two\nnew line three\nnew line four\nnew line five\nnew line six";
     core.execute_insert_sql(
         &write_ctx(),
-        &insert_file_sql("docs/replace.txt", new_body, "op-replace-new"),
+        &insert_file_sql("docs/replace.md", new_body, "op-replace-new"),
     )
     .expect("resend insert should succeed");
-    let expected_new = expected_chunk_bodies("docs/replace.txt", new_body, &config.chunking);
+    let expected_new = expected_chunk_bodies("docs/replace.md", new_body, &config.chunking);
 
     // 読み取らずに drop・再オープン。
     let core = drop_and_reopen(core, &path);
 
-    let after_bodies = select_by_path(&core, "docs/replace.txt");
+    let after_bodies = select_by_path(&core, "docs/replace.md");
     assert_eq!(
         after_bodies, expected_new,
         "only the newly resent chunks must remain after restart"
     );
     assert!(
-        after_bodies
-            .iter()
-            .all(|b| !b.contains("stale-marker-aaaa")),
+        after_bodies.iter().all(|b| !b.contains("stalemarkeraaaa")),
         "no stale chunk from the old content must remain, got: {after_bodies:?}"
     );
     assert_eq!(
@@ -511,14 +559,21 @@ fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
     );
 
     let dict = core
-        .dictionary_snapshot(&write_ctx(), TABLE)
+        .dictionary_snapshot(&read_ctx(), TABLE)
         .expect("dictionary snapshot after restart should succeed");
-    // 辞書スナップショットが旧本文の固有語を保持していないことを独立オラクルとして
-    // 確認する（デバッグ表現の文字列一致。`Dictionary` は辞書構築 API のトークン
-    // 集合を直接公開しないため）。
     let dict_debug = format!("{dict:?}");
+    // 正コントロール: 再構築後の辞書には新本文の固有語が現れる
+    // （辞書抽出パイプラインが再オープン後も実際に動作していることの確認）。
     assert!(
-        !dict_debug.contains("stale-marker-aaaa"),
+        dict_debug.contains("freshmarkerbbbb"),
+        "positive control: dictionary snapshot after restart must contain the new-content marker"
+    );
+    // 辞書スナップショットが旧本文の固有語を保持していないことを確認する
+    // （デバッグ表現の文字列一致。`Dictionary` は辞書構築 API のトークン集合を
+    // 直接公開しないため）。上記の正コントロールにより、この否定アサーションが
+    // 「辞書抽出が働いていないから自明に成立する」経路ではないことが保証される。
+    assert!(
+        !dict_debug.contains("stalemarkeraaaa"),
         "dictionary snapshot must not retain the stale token after restart"
     );
 }
