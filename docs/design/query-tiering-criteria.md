@@ -27,7 +27,13 @@ Issue #77（TASK-115）は、LLM クエリプランニング（TASK-110・`query
   （品質を優先する側を安全側とする）。
 - 判定基準の具体値（手掛かり語・拡張子リスト等）は `crate::tiering::TieringCriteria`
   として構成可能にし、ハードコードしていない。既定値は
-  `crate::tiering::TieringCriteria::default` を参照。
+  `crate::tiering::TieringCriteria::default` を参照。フィールドは公開で呼び出し元が
+  差し替え可能だが、値の大小文字は問わない（比較のたびに `crate::tiering::classify`
+  側で ASCII 小文字化してから照合する。codex 指摘対応・PR #261）。
+- 質問側トークンは空白区切りの後、境界句読点除去に加え英語短縮形接尾辞
+  （`'s`・`n't` 等）の除去も行い基底語へ正規化する（`crate::tiering::
+  strip_contraction_suffix`。Bugbot 指摘対応・PR #261。`what's` が手掛かり語
+  `what` と一致せずシンボル一致へフォールスルーする問題への対応）。
 
 ## 影響を受けるコード
 

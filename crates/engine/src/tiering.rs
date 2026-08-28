@@ -33,7 +33,10 @@
 //! のではなく [`ClassificationSignal::Degenerate`] の fail-safe 側へ倒す（超過を検出
 //! できない切り捨てのまま `classify` へ渡さない）。トークンの前後に付く句読点
 //! （`?`・`,`・全角句読点等）は比較前に除去し、自然文中のシンボル名・パス様トークンの
-//! 認識を妨げないようにする。
+//! 認識を妨げないようにする。トークン内部の英語短縮形接尾辞（`'s`・`n't` 等）も
+//! 末尾から除去し基底語へ正規化する（[`strip_contraction_suffix`] 参照。Bugbot
+//! 指摘対応・PR #261。`what's` が手掛かり語 `what` と一致しないままシンボル一致へ
+//! フォールスルーし対話ティアへ誤ルーティングされる問題への対応）。
 
 use std::collections::BTreeSet;
 
@@ -110,9 +113,16 @@ pub fn tier_for_class(class: QuestionClass) -> Tier {
 pub struct TieringCriteria {
     /// 概念・説明要求の言い回しとみなす手掛かり語（小文字化して比較。ASCII
     /// 小文字化のみ行い、マルチバイト文字はそのまま比較する。モジュール
-    /// ドキュメント「untrusted 入力対応」参照）。
+    /// ドキュメント「untrusted 入力対応」参照）。公開フィールドで呼び出し元が
+    /// 差し替え可能な契約のため、値そのものは大文字混じりでも構わない。
+    /// `classify` 側が比較のたびに ASCII 小文字化してから照合する
+    /// （codex P2 指摘対応・PR #261。`"Explain"` のような未正規化の差し替え値も
+    /// 質問側の小文字化トークンと一致する）。
     pub abstraction_cues: BTreeSet<String>,
-    /// パス様トークンとみなす拡張子（先頭のドットなし。小文字比較）。
+    /// パス様トークンとみなす拡張子（先頭のドットなし。小文字比較。
+    /// `abstraction_cues` と同じく `classify` 側で比較時に ASCII 小文字化する
+    /// ため `"RS"` のような大文字混じりの差し替え値も一致する。codex P2 指摘
+    /// 対応・PR #261）。
     pub path_like_extensions: BTreeSet<String>,
 }
 
@@ -194,6 +204,32 @@ fn strip_boundary_punctuation(token: &str) -> &str {
         })
 }
 
+/// 英語の短縮形（アポストロフィ付き接尾辞）。トークン末尾からこれらを除去して
+/// 基底語へ正規化する（[`strip_contraction_suffix`] 参照。長い接尾辞から先に
+/// 判定順を並べる必要はない。互いに接尾辞関係を持たないため判定順は結果に
+/// 影響しない）。
+const CONTRACTION_SUFFIXES: &[&str] = &["n't", "'re", "'ve", "'ll", "'s", "'d", "'m"];
+
+/// `strip_boundary_punctuation` 適用後・ASCII 小文字化後のトークン末尾から、
+/// 英語の短縮形接尾辞（`'s`・`n't` 等）を除去し基底語を返す（Cursor Bugbot 指摘
+/// 対応・PR #261）。`strip_boundary_punctuation` は先頭・末尾の境界句読点のみを
+/// 対象とし、`what's` のようにトークン内部にアポストロフィを持つ短縮形は対象外の
+/// ため除去されず、抽象手掛かり語（[`TieringCriteria::abstraction_cues`]）との
+/// 完全一致に失敗してシンボル一致へフォールスルーし、対話ティアへ誤ルーティング
+/// されうる問題への対応。除去後に空文字列になる場合（トークンが短縮形接尾辞
+/// そのものだった場合）は元のトークンをそのまま返し、判定材料を失わない
+/// （fail-safe の方向を変えない）。
+fn strip_contraction_suffix(token: &str) -> &str {
+    for suffix in CONTRACTION_SUFFIXES {
+        if let Some(stripped) = token.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                return stripped;
+            }
+        }
+    }
+    token
+}
+
 /// `question` を空白でトークナイズし、[`MAX_TOKENS`] 件までを返す（untrusted 入力の
 /// 有界化。制御文字を含むトークンは判定材料として使わずスキップし、境界句読点は
 /// 除去する）。戻り値の `bool` は [`MAX_TOKENS`] を超過して切り捨てが発生したかを示す
@@ -207,7 +243,10 @@ fn tokenize(question: &str) -> (Vec<String>, bool) {
         .into_iter()
         .take(MAX_TOKENS)
         .filter(|t| !t.chars().any(|c| c.is_control()))
-        .map(|t| ascii_lower(strip_boundary_punctuation(t)))
+        .map(|t| {
+            let lowered = ascii_lower(strip_boundary_punctuation(t));
+            strip_contraction_suffix(&lowered).to_string()
+        })
         .filter(|t| !t.is_empty())
         .collect();
     (tokens, truncated)
@@ -357,10 +396,19 @@ pub fn classify(
     // （`classify` ドキュメンテーションコメント「優先順」参照）。`index` は辞書
     // スナップショット構築時に 1 度だけ正規化済みのため、ここでは借用による
     // 照会のみで完結する（[`NormalizedDictionaryIndex`] ドキュメント参照）。
+    // `criteria` は呼び出し元が差し替え可能な公開フィールドであり、値の大小文字は
+    // 保証されない。質問側トークンは `tokenize` で既に ASCII 小文字化済みのため、
+    // 基準値側も比較のたびに ASCII 小文字化してから照合する（codex P2 指摘対応・
+    // PR #261。`TieringCriteria` ドキュメンテーションコメント参照）。
+    let normalized_path_extensions: BTreeSet<String> = criteria
+        .path_like_extensions
+        .iter()
+        .map(|ext| ascii_lower(ext))
+        .collect();
     let has_path_match = tokens.iter().any(|t| {
         index.path_tokens.contains(t)
             || extension_of(t)
-                .map(|ext| criteria.path_like_extensions.contains(ext))
+                .map(|ext| normalized_path_extensions.contains(ext))
                 .unwrap_or(false)
     });
     if has_path_match {
@@ -377,10 +425,13 @@ pub fn classify(
     // 変えず、判定漏れ（見逃し）を減らす側の変更にとどめる。
     let normalized_question = ascii_lower(question);
     let has_abstraction_cue = criteria.abstraction_cues.iter().any(|cue| {
-        if cue.is_ascii() {
-            tokens.iter().any(|t| t == cue)
+        // 基準値側も比較のたびに ASCII 小文字化する（`normalized_path_extensions`
+        // と同じ理由。codex P2 指摘対応・PR #261）。
+        let normalized_cue = ascii_lower(cue);
+        if normalized_cue.is_ascii() {
+            tokens.iter().any(|t| t == &normalized_cue)
         } else {
-            normalized_question.contains(cue.as_str())
+            normalized_question.contains(normalized_cue.as_str())
         }
     });
     if has_abstraction_cue {
@@ -752,6 +803,72 @@ mod tests {
         let result = classify("please frobnicate the thing", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
+    }
+
+    #[test]
+    fn mixed_case_abstraction_cue_in_criteria_still_matches_lowercase_question() {
+        // codex P2 指摘（PR #261）: `TieringCriteria` は公開フィールドで呼び出し元が
+        // 差し替え可能だが、質問側トークンのみ `ascii_lower` し基準値
+        // （`abstraction_cues`）を正規化しないまま比較すると、"Explain" のような
+        // 大文字混じりの差し替え値が小文字化済み質問トークンと一致しなくなる。
+        // 基準値も比較時に ASCII 小文字化することを確認する回帰テスト。
+        let dict = empty_dictionary();
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let mut criteria = TieringCriteria::default();
+        criteria.abstraction_cues.insert("Frobnicate".to_string());
+        let result = classify("please frobnicate the widget", &index, &criteria);
+        assert_eq!(result.class, QuestionClass::Abstraction);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
+    }
+
+    #[test]
+    fn mixed_case_path_extension_in_criteria_still_matches_lowercase_token() {
+        // codex P2 指摘（PR #261）: `path_like_extensions` も同様に基準値側が
+        // 正規化されないと "RS" のような大文字混じりの差し替え値が、小文字化済み
+        // トークンの拡張子（"rs"）と一致しなくなる。
+        let dict = empty_dictionary();
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let mut criteria = TieringCriteria::default();
+        criteria.path_like_extensions.clear();
+        criteria.path_like_extensions.insert("RS".to_string());
+        let result = classify("open core.rs and check it", &index, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::PathMatch);
+    }
+
+    #[test]
+    fn apostrophe_contraction_yields_abstraction_via_cue_stem() {
+        // Cursor Bugbot 指摘（PR #261）: 境界句読点除去は先頭・末尾のみを対象と
+        // するため、`what's` のような内部にアポストロフィを持つ短縮形は cue
+        // "what" と完全一致せず、シンボル一致へフォールスルーして誤って対話
+        // ティアへルーティングされうる。短縮形接尾辞（`'s` 等）を落として cue と
+        // 一致することを確認する。
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("what's happening in the loader", &index, &criteria);
+        assert_eq!(result.class, QuestionClass::Abstraction);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
+    }
+
+    #[test]
+    fn negation_contraction_strips_to_base_token() {
+        // `don't` のような否定短縮形が `n't` を落として基底トークン `do` へ
+        // 正規化されることを確認する（`strip_contraction_suffix` の `n't` 分岐）。
+        // 辞書シンボル一致ではなく手掛かり語一致で検証し、一般英語とシンボル名の
+        // 衝突（`classify` ドキュメンテーションコメント「優先順」参照）を経由せず
+        // `n't` 分岐そのものを孤立させて確認する。
+        let dict = empty_dictionary();
+        let mut criteria = TieringCriteria::default();
+        criteria.abstraction_cues.insert("do".to_string());
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("don't panic here", &index, &criteria);
+        assert_eq!(result.class, QuestionClass::Abstraction);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
     }
 
     /// 呼び出し記録付きスタブ `LlmClient`（`core.rs` 側テストとも共通の目的だが、
