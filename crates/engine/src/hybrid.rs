@@ -613,11 +613,15 @@ fn soft_boost_loose_upper_bound(cfg: &RrfConfig) -> f64 {
 /// 拒否すべき加点を通してしまう危険がある。
 ///
 /// [`apply_soft_boost`] はこの値を単独では使わず、候補ごとに `この値 -
-/// hit.score` を残余の許容加点として使う（PR #257 codex-review 指摘対応: 本値
-/// 単独を加点合計の上限にすると、候補の加点前スコア（`hit.score`。正の値）を
-/// 無視するため、プール最下位級（`hit.score` が本値未満）の候補でも
-/// `hit.score + candidate_boost` が本値〔＝真の 1 位の保証下限〕を上回りうる
-/// 「安全性コメントと実装の乖離」が生じていた）。
+/// hit.score`（`hit.score` が本値以上なら本値そのもの）を許容加点量として使う
+/// （PR #257 codex-review 指摘対応: 本値単独を加点合計の上限にすると、候補の
+/// 加点前スコア（`hit.score`。正の値）を無視するため、プール最下位級
+/// （`hit.score` が本値未満）の候補でも `hit.score + candidate_boost` が本値
+/// 〔＝真の 1 位の保証下限〕を上回りうる「安全性コメントと実装の乖離」が
+/// 生じていた。また `hit.score` が本値以上の近接順位級候補を許容加点量の
+/// 上限判定から一律除外すると、加点量そのものが本値を大幅に超える大幅加点を
+/// 許してしまい「小さな加点のみ」という契約に反するため、その場合も本値自体を
+/// 上限として適用する）。
 fn soft_boost_confirm_cap(cfg: &RrfConfig) -> f64 {
     cfg.dense_weight().min(cfg.sparse_weight()) / (cfg.k_const() + 1.0)
 }
@@ -712,8 +716,13 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// [`soft_boost_confirm_cap`] 単独とだけ比較しており、候補の元スコアを無視して
 /// いたため、プール最下位級（元スコアが上限未満）の候補でも「元スコア＋加点」が
 /// 上限〔＝真の 1 位の保証下限〕を上回りえた）。`hit.score` が上限以上の候補
-/// （元スコア単独で既に保証下限相当の近接順位級）はこの確定判定の対象外とする。
-/// 過去の実装（2 回目の codex-review P1 指摘対応）は候補ごとに「実スコアから
+/// （元スコア単独で既に保証下限相当の近接順位級）も、加点合計そのものが上限
+/// （`cap`）以上なら同じエラーで拒否する（4 回目の codex-review P1 指摘対応:
+/// 近接順位の逆転自体は許すべきだが、複数ルールを同一候補へ積んで
+/// `soft_boost_confirm_cap` を大幅に超える加点量を与えることまでは許容しない。
+/// 「小さな加点のみ」という PLAN-1 の契約は、真の 1 位との相対差ではなく加点量
+/// 自体の絶対上限として全候補に一貫して課す）。過去の実装（2 回目の
+/// codex-review P1 指摘対応）は候補ごとに「実スコアから
 /// `hits` の実際の最高スコア（真の 1 位）までの差」と比較しており、真の 1 位を
 /// 追い越す加点を一律拒否していた。これは近接順位を入れ替えるというソフトブースト
 /// 本来の用途（PLAN-1 の意図）そのものを検索エラーにする過剰拒否だった: 既定 RRF
@@ -722,8 +731,9 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// 上回り失敗していた。真の 1 位を追い越して新たな 1 位になること自体は正常な
 /// 結果であり拒否すべきではないため、実データの `hits` の最高スコアを都度計算する
 /// 方式には戻さず、`cfg` から導出する絶対上限（[`soft_boost_confirm_cap`]）から
-/// 候補自身の元スコアを差し引いた値とだけ比較する（元スコアが上限以上の候補は
-/// この判定を通過し続けるため、近接順位の正当な逆転は従来どおり妨げない。詳細は
+/// 候補自身の元スコアを差し引いた値（元スコアが上限以上の候補は上限そのもの）と
+/// だけ比較する。近接順位の正当な逆転は従来どおり妨げないが、加点量自体は
+/// 上限を超えないことを全候補に一貫して要求する（詳細は
 /// [`HybridError::BoostSoftBoundExceeded`]・[`soft_boost_confirm_cap`] のドキュメント
 /// 参照）。この判定は長さ検証・有限性検証の後、スコア加算より先に
 /// 行う（[`TooManyCandidates`] (HybridError::TooManyCandidates) と同じ順序）。
@@ -769,21 +779,27 @@ pub fn apply_soft_boost(
         // `candidate_boost >= cap` のみで判定しており、候補の元スコアを無視して
         // いたため、`hit.score` が正で `cap` 未満の「プール最下位級」候補でも
         // `hit.score + candidate_boost` が `cap`（＝真の 1 位の保証下限）を上回り
-        // 得た。`hit.score` が `cap` 以上の候補は元スコア単独で既に保証下限相当
-        // 以上であり「プール最下位級」ではないため、この確定判定の対象外とする
-        // （残余を負にせず素通しする）。これにより、真の 1 位の実際のスコアが
-        // 保証下限を上回る通常のケースで、近接順位（元スコアが `cap` 以上）の
-        // 候補が真の 1 位を追い越す正当な加点まで拒否してしまう過剰拒否
-        // （2 回目の codex-review P1 指摘の再発）を避ける。詳細は
-        // [`soft_boost_confirm_cap`]・[`HybridError::BoostSoftBoundExceeded`] の
-        // ドキュメント参照。`apply_soft_boost_rejects_total_exceeding_soft_bound`
+        // 得た。`hit.score` が `cap` 以上の候補（元スコア単独で既に保証下限相当
+        // 以上の近接順位級）は残余を負にせず `cap` 自体を上限として素通しする
+        // （4 回目の codex-review P1 指摘対応: 以前はここを確定判定から無条件に
+        // `continue` していたため、複数ルールを同一 id へ積んで `cap` を大幅に
+        // 超える加点量を近接順位候補へ与えられ、「小さな加点のみ」という契約に
+        // 反していた）。これにより、真の 1 位の実際のスコアが保証下限を上回る
+        // 通常のケースで、近接順位（元スコアが `cap` 以上）の候補が真の 1 位を
+        // 追い越す正当な**小さい**加点は妨げず（2 回目の codex-review P1 指摘の
+        // 再発防止）、かつ加点量自体が `cap` 以上になる非正当な大幅加点は拒否する。
+        // 詳細は [`soft_boost_confirm_cap`]・[`HybridError::BoostSoftBoundExceeded`]
+        // のドキュメント参照。`apply_soft_boost_rejects_total_exceeding_soft_bound`
         // （`hit.score == 0.0` のケース。`cap - 0.0 == cap` で従来どおりの挙動に
         // 一致）・`apply_soft_boost_allows_near_top_candidate_to_overtake_true_top`
-        // （`hit.score` が `cap` を大きく超える近接順位候補のケース）・
-        // `apply_soft_boost_rejects_boost_that_would_cross_guaranteed_floor`
-        // （本指摘の直接回帰: `hit.score` が `cap` 未満かつ正のプール最下位級
-        // 候補で、`candidate_boost` 単独では `cap` 未満でも `hit.score` を加えると
-        // `cap` を超えるケース）で固定する。
+        // （`hit.score` が `cap` を大きく超える近接順位候補への**小さい**加点は
+        // 通過するケース）・
+        // `apply_soft_boost_rejects_boost_that_would_cross_guaranteed_floor_with_candidate_score`
+        // （`hit.score` が `cap` 未満かつ正のプール最下位級候補で、`candidate_boost`
+        // 単独では `cap` 未満でも `hit.score` を加えると `cap` を超えるケース）・
+        // `apply_soft_boost_rejects_boost_exceeding_cap_for_near_top_candidate`
+        // （本指摘の直接回帰: `hit.score` が `cap` 以上の近接順位候補へ、加点量
+        // 自体が `cap` を超える大幅な加点を与えるケース）で固定する。
         let cap = soft_boost_confirm_cap(cfg);
         for hit in hits.iter() {
             let candidate_boost: f64 = rules
@@ -794,12 +810,21 @@ pub fn apply_soft_boost(
             if candidate_boost <= 0.0 {
                 continue;
             }
-            if hit.score >= cap {
-                // 元スコア単独で既に保証下限以上（近接順位級）の候補。追い越しは
-                // 正当なソフトブーストの用途のため、この確定判定では拒否しない。
-                continue;
-            }
-            let allowed = cap - hit.score;
+            // `allowed` は「この候補が受け取れる加点量そのものの上限」。元スコアが
+            // `cap` 未満の候補は残余（`cap - hit.score`）を上限とし（近接順位でない
+            // 候補が加点だけで保証下限を飛び越えるのを防ぐ、従来どおりの判定）、
+            // 元スコアが `cap` 以上の候補（近接順位級。追い越し自体は PLAN-1 の
+            // 正当な用途のため拒否しない）でも `cap` 自体を上限にする（4 回目の
+            // codex-review P1 指摘対応: 以前は `hit.score >= cap` の候補を確定判定
+            // から無条件に除外していたため、`BoostRule::new` の範囲内で複数ルールを
+            // 同一 id に積むと `soft_boost_confirm_cap` を大幅に超える加点量
+            // （早期検査 `soft_boost_loose_upper_bound` は通過する程度の合計）を
+            // 適用でき、「小さな加点のみ」という契約〔PLAN-1〕に反していた）。
+            let allowed = if hit.score >= cap {
+                cap
+            } else {
+                cap - hit.score
+            };
             if candidate_boost >= allowed {
                 return Err(HybridError::BoostSoftBoundExceeded {
                     total: candidate_boost,
@@ -1863,6 +1888,46 @@ mod tests {
             HybridError::BoostSoftBoundExceeded { total, max } => {
                 assert!((total - boost_amount).abs() < 1e-15);
                 assert!((max - 0.005).abs() < 1e-12, "max={max}");
+            }
+            other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_boost_exceeding_cap_for_near_top_candidate() {
+        // PR #257 codex-review P1 指摘（4 回目）の直接回帰: `hit.score >= cap` の
+        // 候補（元スコア単独で既に保証下限相当の近接順位級）を確定判定から
+        // 無条件に `continue` していたため、`BoostRule::new` が許す範囲内で
+        // `soft_boost_confirm_cap` を大幅に超える加点を同一 id へ積み上げられて
+        // いた。本テストは指摘のとおり合計 0.03 の加点（`soft_boost_confirm_cap`
+        // ≈ 0.01639 を超えるが `soft_boost_loose_upper_bound` ≈ 0.03279 未満）を
+        // 元スコアが `cap` 以上の候補へ与える。修正後は近接順位の逆転自体は
+        // 許しつつ、加点量自体（`candidate_boost`）が `cap` 未満であることを
+        // 全候補に要求するため拒否される。
+        let cfg = RrfConfig::default();
+        let cap = soft_boost_confirm_cap(&cfg);
+        let mut hits = vec![
+            HybridHit { id: 1, score: cap },
+            HybridHit { id: 2, score: 0.0 },
+        ];
+        let ids: BTreeSet<u64> = [1].into_iter().collect();
+        let boost_amount_each = 0.015;
+        let total = boost_amount_each * 2.0;
+        assert!(total > cap, "test premise: total boost must exceed cap");
+        assert!(
+            total < soft_boost_loose_upper_bound(&cfg),
+            "test premise: total boost must pass the early loose check"
+        );
+        let rule_a = BoostRule::new(&ids, boost_amount_each).expect("rule ok");
+        let rule_b = BoostRule::new(&ids, boost_amount_each).expect("rule ok");
+        let err = apply_soft_boost(&mut hits, &[rule_a, rule_b], &cfg).unwrap_err();
+        match err {
+            HybridError::BoostSoftBoundExceeded {
+                total: got_total,
+                max,
+            } => {
+                assert!((got_total - total).abs() < 1e-15);
+                assert!((max - cap).abs() < 1e-12, "max={max}");
             }
             other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
         }
