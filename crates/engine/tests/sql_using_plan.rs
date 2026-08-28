@@ -598,3 +598,91 @@ fn using_plan_rejects_out_of_range_limit_before_invoking_query_planner() {
         "invalid LIMIT must be rejected before the high-cost query planner call"
     );
 }
+
+#[test]
+fn using_plan_rejects_invalid_using_mode_before_invoking_query_planner() {
+    // codex-review P1（PR #266）指摘の判別テスト: `USING MODE` リテラルの解析
+    // （`SearchMode::parse_literal`、`22000`）は構文上受理されるが必ず拒否される
+    // 値（`recall`／`precision` 以外）であり、`plan_using_plan_expansion`（辞書
+    // スナップショット構築＋LLM クエリ展開＋再埋め込み）より前に完結すべき
+    // （`core.rs::EngineCore::execute_sql_in_session` の `USING PLAN` 分岐が
+    // `sql::using_plan::pre_check_schema` を I/O 前に呼ぶ契約）。修正前は
+    // `plan_using_plan_expansion` 内でのみモードリテラルを解析していたため、
+    // 無効な `USING MODE` でも LLM 呼び出し・再埋め込みが先に実行されていた。
+    let path = unique_db_path("sql-using-plan-invalid-mode");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'invalid'",
+        )
+        .expect_err("unknown USING MODE literal must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "invalid USING MODE must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
+fn using_plan_rejects_unknown_projection_column_before_invoking_query_planner() {
+    // codex-review P1（PR #266）指摘の判別テスト: 投影列（`SELECT` リスト）の
+    // 束縛（`sql::parser::bind_projection`、`22000`）も、`USING MODE` と同じく
+    // I/O 前の `pre_check_schema` で検証されるべき。未知列は構文上は受理される
+    // が束縛不能で必ず拒否される。
+    let path = unique_db_path("sql-using-plan-unknown-projection");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT no_such_column FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("unknown projected column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "unknown projection column must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
+fn using_plan_rejects_unknown_where_column_before_invoking_query_planner() {
+    // 上のテストの対（`WHERE` 述語側）。`sql::parser::bind_where_predicates` の
+    // 未知列拒否（`22000`）も同じく I/O 前の `pre_check_schema` で検証される
+    // べき。
+    let path = unique_db_path("sql-using-plan-unknown-where");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs WHERE no_such_column = 'x' USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("unknown WHERE column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "unknown WHERE column must be rejected before the high-cost query planner call"
+    );
+}
+

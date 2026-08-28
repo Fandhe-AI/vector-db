@@ -81,6 +81,44 @@ fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
     }
 }
 
+/// `plan_using_plan_expansion`（辞書スナップショット構築・LLM クエリ展開・
+/// 再埋め込みという高コスト I/O）より**前**に、`stmt` がスキーマ `schema` 上で
+/// 構造的に束縛可能であることを検証する（codex-review P1 指摘対応、PR #266）。
+///
+/// 従来 `USING MODE` リテラルの解析・`VECTOR` 列の存在・投影列（`SELECT`
+/// リスト）／`WHERE` 述語の束縛は、いずれも I/O 完了後の [`bind_expansion`]
+/// 内でのみ行われていた。`USING MODE 'invalid'` や未知列参照のように構文上は
+/// 受理されるが必ず拒否される入力でも、拒否より先に LLM 呼び出し・再埋め込みが
+/// 実行されてしまい、untrusted クエリによるリソース増幅になっていた
+/// （`LIMIT` 範囲検証・辞書用 `path`/`body` 列検証を I/O 前へ前倒しした既存対応
+/// と同種の指摘）。
+///
+/// 束縛結果自体は破棄する（呼び出し元 `core.rs::EngineCore::
+/// execute_sql_in_session` は I/O 完了後に最新スナップショットを取得し直し、
+/// [`bind_expansion`] で改めて束縛する。I/O 中の DDL によるスキーマ食い違いを
+/// 避ける既存方針を維持するため、ここでの結果を実行に使い回さない）。
+///
+/// fail-closed: 各検証はいずれも既存の関数（[`crate::sql::mode::SearchMode::
+/// parse_literal`]・[`parser::vector_column`]・[`parser::bind_projection`]・
+/// [`parser::bind_where_predicates`]）をそのまま呼ぶだけで、エラーの
+/// `wire_code`・メッセージは変えない（多層防御: I/O 後の [`bind_expansion`] も
+/// 同一スキーマ上で再度同じ検証を行う）。
+pub(crate) fn pre_check_bindable(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+) -> Result<(), SqlSurfaceError> {
+    if let Some(literal) = stmt.search_mode() {
+        crate::sql::mode::SearchMode::parse_literal(literal)?;
+    }
+    parser::vector_column(schema)?;
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
+    parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    Ok(())
+}
+
 /// `stmt`（`using_plan()` が `Some` である前提）・展開結果 `expansion`・埋め込み
 /// 済みの再埋め込みクエリベクトル `query_vector` を `schema` へ束縛し、既存 C4
 /// ハイブリッド実行形（[`Ranking::Hybrid`]）を持つ [`BoundStatement`] を構成する

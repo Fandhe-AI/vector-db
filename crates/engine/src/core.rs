@@ -1691,6 +1691,18 @@ impl EngineCore {
                         crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
                     })?;
 
+                    // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
+                    // 事前束縛検証（codex-review P1 指摘対応、PR #266）: 上記の辞書用
+                    // `path`/`body` 列検証・`LIMIT` 範囲検証と同じ理由で、これらも
+                    // I/O（`plan_using_plan_expansion`）より前に完結させる（多層防御
+                    // として I/O 後の再束縛でも同じ検証を通す。詳細は
+                    // [`crate::sql::using_plan::pre_check_bindable`] のドキュメント参照）。
+                    crate::sql::using_plan::pre_check_bindable(
+                        &validated,
+                        &pre_check_schema,
+                        session.udfs(),
+                    )?;
+
                     let planned =
                         self.plan_using_plan_expansion(ctx, session, &validated, question)?;
                     let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
