@@ -214,12 +214,9 @@ pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, E
     Ok(msg)
 }
 
-// NOTE（TASK-153・対象ビヘイビア ERR-1 で確定化。旧 NOTE は codex-review P1・
-// PR #253 指摘対応で「D フィールドは spec 側確定待ちのため送出しない」としていた
-// が、TASK-153 のタスク定義自体が `RECOVER-5` (3) 該当時の `state=may_be_committed`
-// 条件付き付与の実装を完了条件に含むため、`crate::error_response::
-// encode_may_be_committed` として D（detail）フィールド付き encoder を正式実装
-// した。`simple_query::build_emergency_response_bytes` は本関数
+// NOTE（TASK-153・対象ビヘイビア ERR-1 ポインタ）: D（detail）フィールド付き
+// encoder は `crate::error_response::encode_may_be_committed` として別途実装
+// している。`simple_query::build_emergency_response_bytes` は本関数
 // （`encode_error_response`）ではなくそちらを呼ぶ。本関数は 3 フィールド
 // （`S`/`C`/`M`）のみの通常エラー応答用として引き続き使う。
 

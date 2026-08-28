@@ -34,11 +34,7 @@ use engine::error_format::ErrorClass;
 
 use crate::result_encoder::{frame_len, push_s_c_m_fields, EncodeError};
 
-/// `D`（detail）フィールドに載せる固定文言。`RECOVER-5` (3) 該当時に限り、commit が
-/// 成功していたかもしれない（応答未達のまま該当操作が確定した可能性がある）ことを
-/// クライアントへ伝える。値の形式（`key=value` の単純テキスト）は TASK-153 が
-/// spec の「検討中確定化」として決定したワイヤ形式であり、spec 本文の逐語引用ではない
-/// （`.claude/rules/spec-confidentiality.md`）。
+/// `D`（detail）フィールドに載せる固定文言（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）。
 const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
 
 /// `message` に NUL バイトが含まれないか検証する（fail-closed）。フィールドは

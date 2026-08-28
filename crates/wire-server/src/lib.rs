@@ -22,8 +22,7 @@
 //! - [`result_encoder`][]: `RowDescription`/`DataRow`/`CommandComplete`/
 //!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）
 //! - [`error_response`][]: `engine::error_format::ErrorClass` → `ErrorResponse`
-//!   （'E'）バイト列への横断写像。`RECOVER-5` (3) 該当時限定の detail 付与を含む
-//!   （TASK-153・ERR-1）
+//!   （'E'）バイト列への横断写像（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、

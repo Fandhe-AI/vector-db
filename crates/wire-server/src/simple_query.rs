@@ -178,14 +178,11 @@ pub(crate) fn execute_and_respond(
 /// 緊急応答（TASK-97・RECOVER-6、対象ビヘイビア ERR-1）の事前エンコード済み
 /// バイト列を組み立てる。
 ///
-/// TASK-153 が ERR-1 のワイヤ形式（`RECOVER-5` (3) 該当時限定の `state=
-/// may_be_committed` 付与）を確定化したため、`crate::error_response::
-/// encode_may_be_committed` で `D`（detail）フィールド付きの ErrorResponse を
-/// 組み立てる（旧実装は spec 側の形式未確定を理由に 3 フィールドのみへ暫定的に
-/// 留めていた。`result_encoder.rs` の該当 NOTE 参照）。クライアントは
-/// 「commit は成功しているかもしれない」という状態情報を同期的に観測できる
-/// （RECOVER-6 が防ぐ「サイレントな接続断」の回避に加え、ERR-1 の条件付き
-/// 必須情報も運ぶ）。
+/// `crate::error_response::encode_may_be_committed`（TASK-153・ERR-1・`RECOVER-5`
+/// (3) ポインタ）で `D`（detail）フィールド付きの ErrorResponse を組み立てる。
+/// クライアントは「commit は成功しているかもしれない」という状態情報を同期的に
+/// 観測できる（RECOVER-6 が防ぐ「サイレントな接続断」の回避に加え、ERR-1 の
+/// 条件付き必須情報も運ぶ）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
 /// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
