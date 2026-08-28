@@ -66,6 +66,18 @@ impl From<FrameError> for HandshakeError {
     }
 }
 
+/// [`write_error_response`] が [`crate::result_encoder::encode_error_response`]
+/// （ErrorResponse バイト列組み立ての唯一の実体。codex-review Low 指摘対応・
+/// PR #101 で重複実装を解消）に委譲する際のエラー写像。フレーム長超過等の
+/// エンコード失敗は fail-closed に倒し `Protocol` 分類として扱う（本モジュールの
+/// `sqlstate`/`message` 引数は固定英語文言のみを渡す契約のため実運用では
+/// 発生しない想定）。
+impl From<crate::result_encoder::EncodeError> for HandshakeError {
+    fn from(_: crate::result_encoder::EncodeError) -> Self {
+        HandshakeError::Protocol("failed to encode error response")
+    }
+}
+
 /// `handle_connection_bounded` の戻り値型（`io::Result<()>`）へ `?` で直接畳み込めるようにする
 /// 変換。`Protocol`/`Frame` 側は `io::ErrorKind::InvalidData` に写像し、呼び出し元
 /// （`main.rs`）にはログ用途の文字列のみを残す（詳細な違反理由をクライアントへ
@@ -190,23 +202,12 @@ pub(crate) fn write_ready_for_query_io(stream: &mut TcpStream) -> io::Result<()>
     write_ready_for_query(stream).map_err(io::Error::from)
 }
 
+/// バイト列組み立ては [`crate::result_encoder::encode_error_response`] に委譲する
+/// （`S`/`C`/`M` 3 フィールドの ErrorResponse エンコードは本関数と
+/// `result_encoder::encode_error_response` で重複実装していたが、こちらを
+/// 唯一の実体として統合する。codex-review Low 指摘対応・PR #101）。
 fn write_error_response(stream: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {
-    let mut body = Vec::new();
-    body.push(b'S');
-    body.extend_from_slice(b"ERROR");
-    body.push(0);
-    body.push(b'C');
-    body.extend_from_slice(sqlstate.as_bytes());
-    body.push(0);
-    body.push(b'M');
-    body.extend_from_slice(message.as_bytes());
-    body.push(0);
-    body.push(0); // フィールド終端
-    let total_len = (4 + body.len()) as i32;
-    let mut msg = Vec::with_capacity(1 + body.len() + 4);
-    msg.push(b'E');
-    msg.extend_from_slice(&total_len.to_be_bytes());
-    msg.extend_from_slice(&body);
+    let msg = crate::result_encoder::encode_error_response(sqlstate, message)?;
     write_all(stream, &msg)
 }
 

@@ -8,7 +8,10 @@
 //! 唯一の責務。ソケットへの書き込みは行わず、`Vec<u8>` を返す純関数のみで構成する
 //! （`crate::result_encoder` と同じ方針。呼び出し元が I/O を担う）。
 //!
-//! [`encode`] は通常エラー応答（`S`/`C`/`M` の 3 フィールド）を組み立てる。
+//! [`encode`] は通常エラー応答（`S`/`C`/`M` の 3 フィールド）を組み立てる
+//! （バイト列組み立ての実体は [`crate::result_encoder::encode_error_response`]
+//! に委譲し、`handshake.rs::write_error_response` と同じ唯一の実装を共有する。
+//! codex-review Low 指摘対応・PR #101）。
 //! [`encode_may_be_committed`] は `RECOVER-5` (3)（commit 後 panic）該当時**限定**で
 //! `D`（detail）フィールドに `state=may_be_committed` 相当の情報を追加で運ぶ版であり、
 //! 呼び出し元は `crate::simple_query` の緊急応答チャネル（`engine::recovery::
@@ -50,8 +53,10 @@ fn reject_embedded_nul(message: &str) -> Result<(), EncodeError> {
 }
 
 /// `ErrorResponse`（'E'）本体のうち `S`/`C`/`M` の 3 フィールドを書き込む。
-/// [`encode`]・[`encode_may_be_committed`] の共通部分（末尾のフィールド終端・
-/// メッセージ長算出は呼び出し元がそれぞれ行う）。
+/// [`encode_may_be_committed`] が `D`（detail）フィールドを追加する前段として使う
+/// （[`encode`] は本関数を経由せず [`crate::result_encoder::encode_error_response`]
+/// へ委譲するため、こちらの利用は `encode_may_be_committed` 限定）。末尾のフィールド
+/// 終端・メッセージ長算出は呼び出し元が行う。
 fn push_s_c_m_fields(body: &mut Vec<u8>, class: ErrorClass, message: &str) {
     body.push(b'S');
     body.extend_from_slice(SEVERITY_ERROR.as_bytes());
@@ -77,13 +82,13 @@ fn wrap_frame(body: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
 
 /// 通常エラー応答。`S`=`ERROR`・`C`=`class.wire_code()`・`M`=`message` の 3
 /// フィールドのみを含む（他テナント・存在情報は含めない契約。`.claude/rules/
-/// security.md` P0）。
+/// security.md` P0）。バイト列組み立ての実体は
+/// [`crate::result_encoder::encode_error_response`] に委譲する薄いラッパーで、
+/// `ErrorClass` 起点で呼びたい箇所からの入口として存在する（NUL 混入検証は
+/// こちらの層で fail-closed に行う）。
 pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> {
     reject_embedded_nul(message)?;
-    let mut body = Vec::new();
-    push_s_c_m_fields(&mut body, class, message);
-    body.push(0); // フィールド終端
-    wrap_frame(body)
+    crate::result_encoder::encode_error_response(class.wire_code(), message)
 }
 
 /// `RECOVER-5` (3)（commit 後 panic）該当時**限定**の緊急応答。[`encode`] の 3

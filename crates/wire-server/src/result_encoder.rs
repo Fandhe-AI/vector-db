@@ -160,14 +160,20 @@ pub fn encode_empty_query_response() -> Vec<u8> {
 /// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみで組み立てる
 /// （`severity`/`code`/`message`。他テナント・存在情報は含めない）。
 ///
-/// 呼び出し文脈: `crate::simple_query::execute_and_respond` が「outcome を
-/// 決定する区間」の緊急応答チャネル（`engine::recovery::panic_hook::
-/// EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
-/// （panic フックの外）で事前に組み立てるために使う（panic フック内での
-/// エンコードによるアロケーション・整形失敗を避けるため。`panic_hook`
-/// モジュールドキュメント参照）。`handshake.rs` の `write_error_response`
-/// （ソケットへ直接書き込む版）とはフィールド構成は同じだが、こちらはバイト列を
-/// 返すだけで書き込みを行わない別実装（呼び出し文脈が異なるため統合しない）。
+/// 通常エラー応答のバイト列組み立ての唯一の実体（codex-review Low 指摘対応・
+/// PR #101 で重複実装を統合）。呼び出し元は 2 系統ある:
+/// - `handshake.rs::write_error_response`（ソケットへ直接書き込む経路。本関数の
+///   戻り値をそのまま `write_all` へ渡す）
+/// - `crate::simple_query::execute_and_respond` が「outcome を決定する区間」の
+///   緊急応答チャネル（`engine::recovery::panic_hook::
+///   EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
+///   （panic フックの外）で事前に組み立てるために使う（panic フック内での
+///   エンコードによるアロケーション・整形失敗を避けるため。`panic_hook`
+///   モジュールドキュメント参照）
+///
+/// `crate::error_response::encode`（`ErrorClass` を入力に取る版。TASK-153・
+/// ERR-1）も本関数へ委譲する（`ErrorClass::wire_code()` を `sqlstate` として渡す
+/// だけの薄いラッパー）。
 ///
 /// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
 /// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
