@@ -634,6 +634,13 @@ pub fn parse_expansion(response: &str) -> Result<QueryExpansion, PlanError> {
                 if s.chars().count() > MAX_TERM_LEN {
                     return Err(PlanError::InvalidResponse);
                 }
+                // path_hint/kind_hint と同じく、untrusted な LLM 出力を fail-closed に
+                // 検証する（codex-review PR #252 P2 指摘対応）。改行・NUL 等の制御文字を
+                // 含む検索語は、後続で SQL/プラン文字列へ連結される経路（coding-rust.md
+                // 「untrusted 入力の扱い」）に持ち込ませない。
+                if s.chars().any(|c| c.is_control()) {
+                    return Err(PlanError::InvalidResponse);
+                }
                 out.push(s.clone());
             }
             out
@@ -1024,8 +1031,37 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
         pos = size_line_end + 2;
 
         if size == 0 {
-            // トレーラ・終端 `\r\n` はデコード結果に影響しないため読み捨てて終了する。
-            return Ok(out);
+            // トレーラセクション（0 件以上のトレーラ行 + 終端の空行）を読み進める。
+            // トレーラ行自体の内容はデコード結果に影響しないため読み捨てるが、
+            // 空行（終端）に到達するまでの形式検証はスキップしない
+            // （codex-review PR #252 P1 指摘対応: zero chunk を即成功として
+            // 受理すると、終端形式が壊れた不正な HTTP 応答も無検証で受理してしまう）。
+            loop {
+                let line_end = loop {
+                    if let Some(rel) = find_subslice(&buf[pos..], b"\r\n") {
+                        break pos + rel;
+                    }
+                    if buf.len().saturating_sub(pos) > MAX_HTTP_HEADER_BYTES {
+                        return Err(PlanError::InvalidResponse);
+                    }
+                    let n = stream.read(&mut read_buf).map_err(classify_io_error)?;
+                    if n == 0 {
+                        return Err(PlanError::InvalidResponse);
+                    }
+                    total_received = total_received
+                        .checked_add(n)
+                        .ok_or(PlanError::ResponseTooLarge)?;
+                    if total_received > MAX_CHUNKED_TOTAL_BYTES {
+                        return Err(PlanError::ResponseTooLarge);
+                    }
+                    buf.extend_from_slice(&read_buf[..n]);
+                };
+                let is_terminator = line_end == pos;
+                pos = line_end + 2;
+                if is_terminator {
+                    return Ok(out);
+                }
+            }
         }
 
         let new_out_len = out
@@ -1055,6 +1091,13 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
         }
         // 直前の `while buf.len() < data_end + 2` ループが抜けた時点で
         // `buf.len() >= data_end + 2` が成立している（境界はループの不変条件で保証済み）。
+        // チャンクデータ直後の 2 バイトは仕様上 CRLF でなければならない。ここを
+        // 検証せずに読み飛ばすと、境界がずれた不正な chunked 応答（例: 宣言した
+        // `size` とデータ実体が食い違う応答）を無検証で受理してしまう
+        // （codex-review PR #252 P1 指摘対応。fail-closed 契約）。
+        if buf.get(data_end..data_end + 2) != Some(b"\r\n") {
+            return Err(PlanError::InvalidResponse);
+        }
         out.extend_from_slice(&buf[pos..data_end]);
         pos = data_end + 2;
     }
@@ -1180,6 +1223,18 @@ mod tests {
     #[test]
     fn parse_expansion_rejects_missing_required_field() {
         let response = r#"{"search_terms": ["a"], "path_hint": null}"#;
+        assert_eq!(
+            parse_expansion(response).unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn parse_expansion_rejects_control_char_in_search_term() {
+        // 回帰テスト（codex-review PR #252 P2 指摘対応）: path_hint/kind_hint と同様に
+        // search_terms も untrusted な LLM 出力であり、改行等の制御文字を含む検索語を
+        // 無検証で受理してはならない。
+        let response = r#"{"search_terms": ["a\nb"], "path_hint": null, "kind_hint": null}"#;
         assert_eq!(
             parse_expansion(response).unwrap_err(),
             PlanError::InvalidResponse
@@ -1576,6 +1631,43 @@ mod tests {
         assert_eq!(
             client.complete("q").unwrap_err(),
             PlanError::ResponseTooLarge
+        );
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: チャンクデータ直後の 2 バイトが
+    // 実際には CRLF でない不正な chunked 応答を、境界がずれたまま無検証で受理しない
+    // ことを確認する。
+    #[test]
+    fn ollama_client_rejects_chunk_without_trailing_crlf() {
+        let addr = spawn_stub_server(|_req| {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            // 宣言サイズどおりの 1 バイトデータの直後が `\r\n` ではなく `XX` になっている。
+            out.extend_from_slice(b"1\r\nAXX0\r\n\r\n");
+            out
+        });
+        let client = OllamaClient::new(config_for(addr));
+        assert_eq!(
+            client.complete("q").unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: size 0 のチャンク（終端）の後が
+    // 空行（トレーラなし終端）ではなく不正な内容の場合に無検証で成功しないことを確認する。
+    #[test]
+    fn ollama_client_rejects_malformed_zero_chunk_terminator() {
+        let addr = spawn_stub_server(|_req| {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            // 終端チャンク行の後、空行の代わりに接続を閉じてしまう不正な応答。
+            out.extend_from_slice(b"0\r\n");
+            out
+        });
+        let client = OllamaClient::new(config_for(addr));
+        assert_eq!(
+            client.complete("q").unwrap_err(),
+            PlanError::InvalidResponse
         );
     }
 
