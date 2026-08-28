@@ -199,6 +199,11 @@
 //! 追加する。ヒント一致は候補の除外・絞り込みには使わず、`truncate(k)` 前のプールへ
 //! 小さな加点（既定 `SOFT_BOOST_PER_MATCH`）を行い再順位付けするのみで、ハードフィルタ
 //! 化しない（詳細は `hybrid.rs` モジュールドキュメント参照）。
+//!
+//! TASK-148（対象ビヘイビア: EXT-4。ポインタ: `docs/spec/05-tasks.md` TASK-148・
+//! `docs/spec/04-behavior/extensions.md` EXT-4）: `scoring_boost.rs` が TASK-111 の
+//! ソフトブースト機構を一般化する（詳細は `scoring_boost.rs` モジュールドキュメント
+//! 参照）。SQL 表層への構文露出は対象外。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -226,6 +231,7 @@ pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
+pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;
 pub mod sql;
