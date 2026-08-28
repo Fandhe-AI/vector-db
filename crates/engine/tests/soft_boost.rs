@@ -19,6 +19,23 @@ use engine::hybrid::{
 use engine::kernel::{CpuScalarProvider, SearchInput};
 use engine::sparse::SparseIndex;
 
+/// `build_corpus` の 5 件（密ランク 1〜5、`k_const=60.0`）で id=3 を対象に使う
+/// テストが使う加点量（codex-review P1 2 回目指摘の回帰対応）。
+///
+/// この合成コーパスは真の 1 位（id=1・密ランク 1）と対象ドキュメント（id=3・
+/// 密ランク 3）のスコア差が `1/61 - 1/63 ≈ 0.00052` しかなく、`hybrid.rs` の
+/// モジュールドキュメントが `SOFT_BOOST_PER_MATCH`（`0.0007`）について述べる
+/// 「既定 `RrfConfig` 下で真の 1 位を上回れない」保証は、対象がプール最下位級
+/// （`pool_depth` 由来の大きなスコア差）にいる最悪ケースを前提にしたものであり、
+/// 本コーパスのように対象が真の 1 位のすぐ近く（密ランク 3）にいる場合には
+/// 成立しない（`SOFT_BOOST_PER_MATCH` 自体が `0.00052` を上回るため、これを
+/// そのまま使うと id=3 が id=1 を追い越してしまう）。本テストは「Top-k 圏内への
+/// 浮上」だけを検証したいので、密ランク 2（id=2）とのスコア差
+/// （`1/62 - 1/63 ≈ 0.000256`）は上回るが、密ランク 1（id=1）とのスコア差
+/// （`≈0.00052`）は下回る値を使い、真の 1 位を上回らないまま Top-k 入りだけを
+/// 起こす。
+const RANK3_TOP_K_ENTRY_BOOST: f64 = 0.0004;
+
 /// 合成コーパス 1 件分（文書 ID・検索用テキスト・低次元密ベクトル・メタデータ）。
 /// `path`/`kind` はヒント一致判定の対象となるメタデータで、`sql/exec.rs` が可視行
 /// から構築する想定の情報を模する。
@@ -131,7 +148,7 @@ fn hybrid_search_boosted_lifts_hint_matching_doc_into_top_k() {
 
     let path_ids = ids_matching_path_hint(&docs, "src/hybrid");
     assert_eq!(path_ids, [3].into_iter().collect::<BTreeSet<u64>>());
-    let rule = BoostRule::new(&path_ids, SOFT_BOOST_PER_MATCH).expect("rule ok");
+    let rule = BoostRule::new(&path_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
 
     let input2 = SearchInput {
         ids: &ids,
@@ -223,7 +240,7 @@ fn hybrid_search_boosted_does_not_change_candidate_set() {
     plain_ids.sort_unstable();
 
     let path_ids = ids_matching_path_hint(&docs, "src/hybrid");
-    let rule = BoostRule::new(&path_ids, SOFT_BOOST_PER_MATCH).expect("rule ok");
+    let rule = BoostRule::new(&path_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
 
     let input2 = SearchInput {
         ids: &ids,
@@ -265,7 +282,7 @@ fn hybrid_search_boosted_supports_kind_hint_matching() {
 
     let kind_ids = ids_matching_kind_hint(&docs, "doc");
     assert_eq!(kind_ids, [3].into_iter().collect::<BTreeSet<u64>>());
-    let rule = BoostRule::new(&kind_ids, SOFT_BOOST_PER_MATCH).expect("rule ok");
+    let rule = BoostRule::new(&kind_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
 
     let input = SearchInput {
         ids: &ids,
