@@ -31,16 +31,27 @@ use crate::query_planner::QueryExpansion;
 use crate::sql::allowlist::{SqlSurfaceError, ValidatedStatement};
 use crate::sql::parser::{self, BoundStatement, Ranking};
 
-/// `USING PLAN` の展開後クエリが密側・疎側のいずれの検索にも使う本文列の規約名。
-/// 増分インデックス（TASK-120）のファイル形 `INSERT`（`path`/`body` 列指定）と
-/// 揃える。
+/// `USING PLAN` の展開後クエリが疎側（`hybrid_search` の全文検索側入力。
+/// [`Ranking::Hybrid::text_column_index`]）の一致判定に使う本文列の規約名。
+/// 密側（再埋め込みベクトル）は `VECTOR` 列と比較するためこの列を参照しない
+/// （[`expanded_query_text`] のドキュメント参照）。増分インデックス（TASK-120）の
+/// ファイル形 `INSERT`（`path`/`body` 列指定）と揃える。
 pub(crate) const BODY_COLUMN_NAME: &str = "body";
 
-/// `question`（クエリ句のリテラル値）と `expansion`（LLM 展開結果）から、密側の
-/// 再埋め込み対象・疎側の検索テキストの両方に使う単一のテキストを決定的に構成する
-/// （PLAN-10 ポインタ: 原質問の埋め込み使い回しをしない再埋め込み規則。
-/// `search_terms` の結合順は `QueryExpansion` の順序をそのまま保つため、同一入力に
-/// 対して常に同一の結果を返す）。
+/// `question`（クエリ句のリテラル値）と `expansion`（LLM 展開結果）から、
+/// `Ranking::Hybrid::query_text`（`hybrid_search` の疎側〔全文検索側〕入力。
+/// `sql::exec` が `sparse::SparseIndex::search`/`search_within` へそのまま渡す）
+/// に使う単一のテキストを決定的に構成する。
+///
+/// 密側（再埋め込みベクトル）には本関数の戻り値を使わない
+/// （codex-review P1 指摘対応、PR #266）。密側は
+/// [`crate::query_planner::render_reembedding_text`] が課す既存の再埋め込み規則
+/// （固定接頭辞・検索語の防御的上限）に従う必要があり、`expanded_query_text` の
+/// 単純結合（接頭辞なし・検索語件数の上限なし）とは意図的に異なる文字列になる。
+/// 疎側は全文検索の一致判定に使うだけであり、同じ防御的上限を課す必要はないため、
+/// 単純結合のままでよい（呼び出し元 `core.rs::EngineCore::
+/// plan_using_plan_expansion` は疎側テキストにも `sparse::validate_query_bounds`
+/// による長さ上限検証を別途課している）。
 ///
 /// `question` は [`crate::query_planner::sanitize_question`] で `plan_query` が
 /// LLM プロンプトへ組み込んだのと**同一の切り詰め結果**へ正規化してから使う

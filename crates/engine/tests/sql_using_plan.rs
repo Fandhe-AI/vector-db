@@ -227,9 +227,12 @@ fn using_plan_dispatch_reaches_hybrid_execution_and_returns_seeded_rows() {
 
 #[test]
 fn using_plan_reembeds_expanded_text_not_the_raw_question() {
-    // PLAN-10 ポインタ: 密側の再埋め込み対象は「質問＋展開検索語」の決定的結合で
-    // あり、原質問だけの埋め込みを使い回さない。`RecordingEmbedder` が実際に渡された
-    // テキストを記録するため、原質問そのものとは異なることを直接確認する。
+    // PLAN-10 ポインタ: 密側の再埋め込み対象は `query_planner::
+    // render_reembedding_text`（固定接頭辞 `search_query: ` ＋質問＋展開検索語の
+    // 決定的結合）であり、原質問だけの埋め込みを使い回さない（codex-review P1
+    // 指摘対応、PR #266。密側と疎側〔`sql::using_plan::expanded_query_text`〕は
+    // 別テキスト）。`RecordingEmbedder` が実際に渡されたテキストを記録するため、
+    // 原質問そのものとは異なることを直接確認する。
     let path = unique_db_path("sql-using-plan-reembed");
     let _guard = CleanupGuard(path.clone());
     let storage = seeded_storage(&path);
@@ -268,7 +271,7 @@ fn using_plan_reembeds_expanded_text_not_the_raw_question() {
         seen[0], question,
         "USING PLAN must not re-embed the raw question verbatim (PLAN-10)"
     );
-    assert_eq!(seen[0], "find content alpha beta");
+    assert_eq!(seen[0], "search_query: find content alpha beta");
 }
 
 #[test]
@@ -689,13 +692,13 @@ fn using_plan_rejects_unknown_where_column_before_invoking_query_planner() {
 #[test]
 fn using_plan_rejects_expanded_query_text_exceeding_sparse_limits_before_reembedding() {
     // codex-review P1（PR #266）指摘の判別テスト: `sql::using_plan::
-    // expanded_query_text`（原質問＋展開検索語の決定的結合）は密側の再埋め込み
-    // （`Embedder::embed_batch`）と疎側の `hybrid_search` の両方へ渡る単一の文字列
-    // だが、疎側（`sparse::SparseIndex::search`/`search_within`）が課す
-    // `MAX_QUERY_BYTES`（16 KiB）を考慮せずに構成すると、CJK のような多バイト文字を
-    // 多用する展開結果では受理されたクエリが再埋め込み後の `hybrid_search` でのみ
-    // 失敗しうる（拒否自体は既存の `22000` 契約〔`map_hybrid_error`〕で fail-closed
-    // だが、再埋め込みという高コスト I/O を消費した後段でしか検出できていなかった）。
+    // expanded_query_text`（原質問＋展開検索語の決定的結合）は疎側
+    // （`hybrid_search` の全文検索側入力）専用の文字列だが、疎側
+    // （`sparse::SparseIndex::search`/`search_within`）が課す `MAX_QUERY_BYTES`
+    // （16 KiB）を考慮せずに構成すると、CJK のような多バイト文字を多用する展開結果
+    // では受理されたクエリが再埋め込み後の `hybrid_search` でのみ失敗しうる
+    // （拒否自体は既存の `22000` 契約〔`map_hybrid_error`〕で fail-closed だが、
+    // 再埋め込みという高コスト I/O を消費した後段でしか検出できていなかった）。
     //
     // 原質問（[`engine::query_planner::MAX_QUESTION_CHARS`] ちょうどの CJK）と
     // 展開検索語（[`engine::query_planner::MAX_SEARCH_TERMS`] 件 ×

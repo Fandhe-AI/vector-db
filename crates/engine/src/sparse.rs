@@ -111,9 +111,10 @@ const MAX_QUERY_BYTES: usize = 16 * 1024;
 
 /// [`SparseIndex::search`]／[`SparseIndex::search_within`] が課すクエリ入力検証
 /// （バイト長 [`MAX_QUERY_BYTES`]・一意語数 [`MAX_QUERY_TERMS`]）を、疎検索本体を
-/// 呼ぶ前に単独で行う（`sql::using_plan::expanded_query_text` が密側・疎側へ渡す
-/// 単一のクエリ文字列を、密側の再埋め込み（`Embedder::embed_batch`）前に検証する
-/// ための呼び出し口。codex-review P1 指摘対応、PR #266）。
+/// 呼ぶ前に単独で行う（`sql::using_plan::expanded_query_text` が組み立てる疎側
+/// クエリ文字列〔`hybrid_search` の全文検索側入力〕を、密側の再埋め込み
+/// （`Embedder::embed_batch`）前に検証するための呼び出し口。codex-review P1 指摘
+/// 対応、PR #266）。
 ///
 /// 上限値・判定順序（バイト長 → `tokenize()` → 一意語数）は [`SparseIndex::
 /// search`]／[`SparseIndex::search_within`] 内の入力検証と同一の値・同一の

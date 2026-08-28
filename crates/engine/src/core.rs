@@ -1808,35 +1808,50 @@ impl EngineCore {
                 detail: format!("USING PLAN query expansion failed: {e}"),
             })?;
 
-        // PLAN-10 ポインタ: 密側の再埋め込み対象は展開後テキスト（原質問＋展開検索語の
-        // 決定的結合）であり、原質問の埋め込みを使い回さない。疎側の検索テキストも
-        // 同じ結合結果を使う（`sql::using_plan::bind_expansion` が疎側へ渡す）。
-        let query_text = crate::sql::using_plan::expanded_query_text(question, &expansion);
+        // PLAN-10 ポインタ: 密側（再埋め込み）と疎側（`hybrid_search` の全文検索側）は
+        // 別々のテキストを使う（codex-review P1 指摘対応、PR #266）。密側は
+        // `query_planner::render_reembedding_text` が課す既存の再埋め込み規則
+        // （固定接頭辞 `search_query: `・`MAX_SEARCH_TERMS`/`MAX_TERM_LEN` による
+        // 検索語の防御的上限）に必ず従わせる。`sql::using_plan::expanded_query_text`
+        // （接頭辞なし・上限なしの単純結合）をそのまま `embed_batch` へ渡すと、既存の
+        // 増分索引・クエリ展開受け入れ検証（TASK-114・PLAN-10）が前提とする再埋め込み
+        // 入力と異なるベクトルになり、両経路の Recall 特性が食い違う。疎側の検索
+        // テキストは従来どおり `expanded_query_text`（`sql::using_plan::bind_expansion`
+        // が疎側へ渡す）を使う。
+        let sparse_query_text = crate::sql::using_plan::expanded_query_text(question, &expansion);
 
         // 疎側 `hybrid_search`（`sparse::SparseIndex::search`/`search_within`）が
         // 課すクエリ入力検証（`MAX_QUERY_BYTES`・`MAX_QUERY_TERMS`）を、密側の
         // 再埋め込み（`embedder.embed_batch`、高コスト I/O）より前に行う
-        // （codex-review P1 指摘対応、PR #266）。`expanded_query_text` は密側・
-        // 疎側の両方へ渡る単一の文字列だが、原質問（最大 `MAX_QUESTION_CHARS` 文字）
-        // ＋展開検索語（最大 `MAX_SEARCH_TERMS` 件 × `MAX_TERM_LEN` 文字）を無条件に
-        // 連結するため、CJK のような多バイト文字を多用する展開結果では文字数上限内
-        // でも結合後のバイト長が `MAX_QUERY_BYTES` を超えうる。検証を後段の
-        // `hybrid_search` 呼び出し時（`sql::exec::map_hybrid_error`）にのみ委ねると、
-        // 再埋め込みという高コスト I/O を消費してから拒否することになり、untrusted
-        // 入力によるリソース増幅になる。fail-closed（`22000`。`map_hybrid_error` が
-        // `hybrid_search` 経由で課す既存のエラー契約と同一の `wire_code`・文言）で
-        // ここで前倒し拒否する（`map_hybrid_error` 側の検証は多層防御として残る）。
-        crate::sparse::validate_query_bounds(&query_text).map_err(|_| {
+        // （codex-review P1 指摘対応、PR #266）。`expanded_query_text` は原質問
+        // （最大 `MAX_QUESTION_CHARS` 文字）＋展開検索語（最大 `MAX_SEARCH_TERMS` 件 ×
+        // `MAX_TERM_LEN` 文字）を無条件に連結するため、CJK のような多バイト文字を
+        // 多用する展開結果では文字数上限内でも結合後のバイト長が `MAX_QUERY_BYTES` を
+        // 超えうる。検証を後段の `hybrid_search` 呼び出し時
+        // （`sql::exec::map_hybrid_error`）にのみ委ねると、再埋め込みという高コスト
+        // I/O を消費してから拒否することになり、untrusted 入力によるリソース増幅に
+        // なる。fail-closed（`22000`。`map_hybrid_error` が `hybrid_search` 経由で
+        // 課す既存のエラー契約と同一の `wire_code`・文言）でここで前倒し拒否する
+        // （`map_hybrid_error` 側の検証は多層防御として残る）。
+        crate::sparse::validate_query_bounds(&sparse_query_text).map_err(|_| {
             crate::sql::allowlist::SqlSurfaceError::invalid_input(
                 "hybrid query text exceeds allowed length",
             )
         })?;
 
-        let embedded = embedder.embed_batch(&[query_text.as_str()]).map_err(|e| {
-            crate::sql::allowlist::SqlSurfaceError::Internal {
+        // 密側の再埋め込み対象は `query_planner::render_reembedding_text`
+        // （TASK-114・PLAN-10）が課す既存の再埋め込み規則（固定接頭辞・検索語の
+        // 防御的上限）に従わせる。次元検証・非有限値検証は本メソッドでは行わず、
+        // 呼び出し元 `execute_sql_in_session` が I/O 完了後に呼ぶ
+        // `sql::using_plan::bind_expansion` に一本化する（TASK-77 が当初から採る
+        // 既存の役割分担。両検証の実装は `bind_expansion` 内、`vector_column` に
+        // よる次元突き合わせ・非有限値拒否の箇所を参照）。
+        let dense_query_text = crate::query_planner::render_reembedding_text(question, &expansion);
+        let embedded = embedder
+            .embed_batch(&[dense_query_text.as_str()])
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("USING PLAN re-embedding failed: {e}"),
-            }
-        })?;
+            })?;
         let query_vector = embedded.into_iter().next().ok_or_else(|| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "embedder returned no vector for USING PLAN query".to_string(),
@@ -3594,6 +3609,118 @@ mod tests {
             row.cells,
             vec![crate::sql::exec::Cell::Text("new-path".to_string())],
             "projected `path` must resolve against the post-I/O schema, not stale pre-I/O indices"
+        );
+    }
+
+    // codex-review P1 回帰（PR #266）: `plan_using_plan_expansion` が
+    // `Embedder::embed_batch` へ渡すテキストは、`query_planner::
+    // render_reembedding_text`（固定接頭辞 `search_query: `・検索語の防御的上限
+    // つき）の出力と一致しなければならない。以前は `sql::using_plan::
+    // expanded_query_text`（接頭辞なし・上限なしの単純結合）をそのまま渡していた
+    // ため、`USING PLAN` 経路の再埋め込みベクトルが既存の増分索引・クエリ展開
+    // 受け入れ検証（TASK-114・PLAN-10）が前提とするベクトルと食い違っていた。
+    #[test]
+    fn plan_using_plan_expansion_embeds_render_reembedding_text_not_expanded_query_text() {
+        struct StubLlmClient;
+        impl crate::query_planner::LlmClient for StubLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                Ok(
+                    r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        // 呼び出し元が `embed_batch` へ渡した入力テキストをそのまま記録するスパイ
+        // 実装（`Mutex` で束ねて `Sync` を満たす。`Embedder` は `&self` のみで
+        // 呼ばれるため内部可変性が必要）。
+        struct SpyEmbedder {
+            dim: u32,
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl crate::embedding::Embedder for SpyEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                self.seen
+                    .lock()
+                    .expect("spy lock not poisoned")
+                    .extend(texts.iter().map(|t| t.to_string()));
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let spy = std::sync::Arc::new(SpyEmbedder {
+            dim: 2,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // `EngineCore::with_embedder` は `Box<dyn Embedder>` を要求するため、
+        // テスト側から観測を続けられるよう `Arc` を経由する薄いラッパーで包む
+        // （スパイ本体の所有権は `spy` 側にも残す）。
+        struct ArcEmbedder(std::sync::Arc<SpyEmbedder>);
+        impl crate::embedding::Embedder for ArcEmbedder {
+            fn dim(&self) -> u32 {
+                self.0.dim()
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                self.0.embed_batch(texts)
+            }
+        }
+
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(ArcEmbedder(spy.clone())))
+            .with_query_planner(Box::new(StubLlmClient));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT body FROM docs USING PLAN('find auth') LIMIT 5";
+        let stmt = crate::sql::allowlist::validate_sql(sql, &core.storage).expect("valid sql");
+        let validated = match stmt {
+            crate::sql::allowlist::Statement::Select(v) => v,
+            other => panic!("expected Select statement, got {other:?}"),
+        };
+        let question = validated.using_plan().expect("USING PLAN present");
+
+        let planned = core
+            .plan_using_plan_expansion(&ctx, &session, &validated, question)
+            .expect("plan_using_plan_expansion should succeed");
+
+        let seen = spy.seen.lock().expect("spy lock not poisoned");
+        assert_eq!(
+            seen.len(),
+            1,
+            "embed_batch must be called exactly once for USING PLAN re-embedding"
+        );
+        let expected = crate::query_planner::render_reembedding_text(question, &planned.expansion);
+        assert_eq!(
+            seen[0], expected,
+            "embed_batch input must match query_planner::render_reembedding_text output \
+             (fixed prefix + bounded search terms), not the unprefixed sparse query_text"
+        );
+        assert!(
+            seen[0].starts_with(crate::query_planner::SEARCH_QUERY_PREFIX),
+            "embed_batch input must carry the fixed re-embedding prefix"
         );
     }
 
