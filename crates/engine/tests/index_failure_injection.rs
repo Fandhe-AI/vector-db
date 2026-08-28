@@ -257,12 +257,15 @@ fn precommit_failure_on_fresh_path_leaves_rows_and_ledger_untouched() {
     // 独立オラクル: 同一 operation_id・同一 path での正常 INSERT が成功する
     // （台帳・行のどちらにも残渣がないことの証明）。
     let core = core.with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")));
+    let retry_body = "line one\nline two";
     core.execute_insert_sql(
         &write_ctx(),
-        &insert_file_sql("docs/fresh.txt", "line one\nline two", "op-fresh-1"),
+        &insert_file_sql("docs/fresh.txt", retry_body, "op-fresh-1"),
     )
     .expect("retry with the same operation_id must succeed after zero-side-effect failure");
-    assert_eq!(select_by_path(&core, "docs/fresh.txt").len(), 1);
+    let expected_retry =
+        expected_chunk_bodies("docs/fresh.txt", retry_body, &small_chunk_config().chunking);
+    assert_eq!(select_by_path(&core, "docs/fresh.txt"), expected_retry);
 }
 
 /// (1)-b: 正常 `INSERT` で baseline チャンクを commit した後、同一 `path` へ
@@ -375,14 +378,6 @@ fn postcommit_interruption_then_restart_rebuilds_index_exactly() {
     assert_eq!(
         select_bodies, expected,
         "SELECT must match independently computed chunks exactly"
-    );
-    assert_eq!(
-        select_bodies.len(),
-        select_bodies
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        "no duplicate chunk bodies must remain"
     );
 
     let embedder = HashingEmbedder::new(DIM).expect("valid dim");
@@ -537,6 +532,39 @@ fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
     .expect("resend insert should succeed");
     let expected_new = expected_chunk_bodies("docs/replace.md", new_body, &config.chunking);
 
+    // codex-review Medium 指摘対応: drop_and_reopen 前に同一プロセス内での再読み取りを
+    // 挟み、「世代不一致による fail-closed 破棄」の in-process 経路
+    // （`DictionaryCache` が世代 G の温めたキャッシュを世代 G+1 と不一致で破棄・
+    // 再構築する経路）を再オープンとは独立に検証する。
+    let in_process_bodies = select_by_path(&core, "docs/replace.md");
+    assert_eq!(
+        in_process_bodies, expected_new,
+        "in-process re-read after resend commit must reflect only the new chunks"
+    );
+    let in_process_dict = core
+        .dictionary_snapshot(&read_ctx(), TABLE)
+        .expect("dictionary snapshot after in-process resend read should succeed");
+    let in_process_dict_debug = format!("{in_process_dict:?}");
+    assert!(
+        in_process_dict_debug.contains("freshmarkerbbbb"),
+        "in-process dictionary snapshot must contain the new-content marker"
+    );
+    assert!(
+        !in_process_dict_debug.contains("stalemarkeraaaa"),
+        "in-process dictionary snapshot must not retain the stale token from the old generation"
+    );
+    let op = |id: &str| OperationId::parse(id).expect("valid operation_id");
+    assert_eq!(
+        core.operation_recorded(&write_ctx(), TABLE, &op("op-replace-new"))
+            .expect("ledger lookup should succeed"),
+        LedgerLookup::Recorded
+    );
+    assert_eq!(
+        core.last_operation_id(&write_ctx(), TABLE)
+            .expect("last operation lookup should succeed"),
+        engine::recovery::ledger::LastOperationLookup::Committed(op("op-replace-new"))
+    );
+
     // 読み取らずに drop・再オープン。
     let core = drop_and_reopen(core, &path);
 
@@ -548,14 +576,6 @@ fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
     assert!(
         after_bodies.iter().all(|b| !b.contains("stalemarkeraaaa")),
         "no stale chunk from the old content must remain, got: {after_bodies:?}"
-    );
-    assert_eq!(
-        after_bodies.len(),
-        after_bodies
-            .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len(),
-        "no duplicate chunk bodies must remain"
     );
 
     let dict = core
