@@ -841,3 +841,63 @@ fn using_plan_accepts_cjk_question_within_sparse_limits() {
         "a CJK question within limits must still reach the re-embedding call"
     );
 }
+
+#[test]
+fn using_plan_rejects_raw_question_exceeding_sparse_query_terms_before_invoking_query_planner() {
+    // codex-review P1 + Cursor Bugbot Medium（PR #266）指摘の判別テスト:
+    // `plan_using_plan_expansion` は `plan_query`（辞書スナップショット構築＋LLM
+    // 呼び出し、高コスト I/O）を実行した後にしか疎側の入力上限
+    // （`sparse::validate_query_bounds`）を検証していなかった。展開は検索語を
+    // 追加するだけで既存の語を減らさないため、展開前の原質問
+    // （`query_planner::sanitize_question` 通過後）の時点で既に `MAX_QUERY_TERMS`
+    // を超える場合、`plan_query` を呼んでも絶対に成功しえない。
+    //
+    // `MAX_QUESTION_CHARS` 以内（切り詰めなし）の CJK 質問で、`sparse::tokenize`
+    // が CJK 文字ごとに生成する unigram のみで一意語数が `MAX_QUERY_TERMS`
+    // （1024）を超えるケースを固定する（相異なる CJK 文字を `MAX_QUERY_TERMS + 1`
+    // 個並べる。バイト長は `MAX_QUERY_BYTES`〔16 KiB〕を十分下回るため、この
+    // ケースはバイト長超過ではなく一意語数超過のみで拒否されることも確認する）。
+    // `CountingLlmClient` の呼び出し回数が 0 のままであることを直接確認することで、
+    // 拒否が `plan_query`（辞書スナップショット構築・LLM 呼び出し）より前で
+    // 完結することを固定する。
+    let path = unique_db_path("sql-using-plan-raw-question-too-many-terms");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+
+    // U+4E00 (一) から連番で相異なる CJK 文字を並べる。区切り文字を挟まないため
+    // 隣接文字同士の bigram も生成されるが、unigram だけで既に上限を超える。
+    // `sparse::MAX_QUERY_TERMS`（1024・`crates/engine/src/sparse.rs`）は
+    // クレート内部定数で本テスト（統合テストクレート）からは参照できないため、
+    // 上限超過を確実にする件数として `MAX_QUESTION_CHARS`（2000）以下かつ
+    // `MAX_QUERY_TERMS + 1` 以上である 1025 文字を直接指定する。
+    const RAW_QUESTION_TERM_COUNT: usize = 1025;
+    let question: String = (0..RAW_QUESTION_TERM_COUNT)
+        .map(|i| char::from_u32(0x4E00 + i as u32).expect("valid CJK code point"))
+        .collect();
+    assert!(
+        question.chars().count() <= engine::query_planner::MAX_QUESTION_CHARS,
+        "fixture question must stay within MAX_QUESTION_CHARS so sanitize_question does not truncate it"
+    );
+    assert!(
+        question.len() <= 16 * 1024,
+        "fixture question must stay within MAX_QUERY_BYTES so the rejection is term-count-driven"
+    );
+
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            &format!("SELECT id FROM docs USING PLAN('{question}') LIMIT 10"),
+        )
+        .expect_err("raw question exceeding sparse query term limits must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "raw question exceeding sparse bounds must be rejected before the high-cost query planner call"
+    );
+}

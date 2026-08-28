@@ -1802,6 +1802,25 @@ impl EngineCore {
             }
         })?;
 
+        // `plan_query`（辞書スナップショット構築＋ LLM 呼び出し、高コスト I/O）より
+        // 前に、展開前の原質問（`query_planner::sanitize_question` を通した後）だけで
+        // 疎側の入力上限（`sparse::validate_query_bounds`）を満たせるか検証する
+        // （codex-review P1 + Cursor Bugbot Medium 指摘対応、PR #266）。展開は検索語を
+        // 追加するだけで既存の語を減らさないため、原質問の時点で `MAX_QUERY_BYTES`・
+        // `MAX_QUERY_TERMS` を超える場合、展開後の検証（本メソッド末尾。多層防御として
+        // 残す）まで待っても絶対に成功しえない。特に `MAX_QUESTION_CHARS` 文字以内の
+        // CJK 質問は、`sparse::tokenize` が CJK 文字ごとに unigram／隣接文字との
+        // bigram を生成するため、バイト長は上限内でも一意語数だけが
+        // `MAX_QUERY_TERMS` を超えうる。ここで前倒し拒否しないと、成功不能な入力の
+        // ためだけに辞書スナップショット構築・LLM 呼び出しという I/O を消費してから
+        // 22000 で拒否することになり、untrusted 入力によるリソース増幅になる。
+        let sanitized_question = crate::query_planner::sanitize_question(question);
+        crate::sparse::validate_query_bounds(&sanitized_question).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "hybrid query text exceeds allowed length",
+            )
+        })?;
+
         let expansion = self
             .plan_query(ctx, validated.table_name(), question)
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
