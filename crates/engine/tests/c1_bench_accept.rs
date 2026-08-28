@@ -15,7 +15,10 @@
 mod harness;
 
 use harness::env_report::EnvReport;
-use harness::sql_c1::{c1_statement, vector_literal, SqlC1Error, MAX_VECTOR_LITERAL_BYTES};
+use harness::sql_c1::{
+    c1_statement, render_ab_line, render_p95_line, render_recall_line, resolve_verbose,
+    vector_literal, SqlC1Error, MAX_VECTOR_LITERAL_BYTES,
+};
 
 use engine::sql::allowlist::SqlSurfaceError;
 use engine::sql::parser::parse_vector_literal;
@@ -211,6 +214,121 @@ mod e2e {
             actual, expected,
             "C1 template result must match the independent exact oracle's ordered top-k"
         );
+    }
+}
+
+// --- resolve_verbose・render_* (Issue #278: 実測値 public ログ出力の抑止) ---
+
+mod verbose_opt_in {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        // `BENCH_DEDICATED_ENV` の `.trim() == "1"` より厳格な厳密一致（Issue #278の
+        // 設計方針）。空白付き・別表記は verbose 側へ寛容にしない。
+        for raw in ["true", "0", " 1 ", "yes", ""] {
+            assert_eq!(
+                resolve_verbose(Some(raw), false),
+                Ok(false),
+                "raw={raw:?} must not be treated as verbose"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert_eq!(
+            resolve_verbose(Some("1"), true),
+            Err(SqlC1Error::VerboseRefusedUnderGitHubActions)
+        );
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
+
+    #[test]
+    fn render_p95_line_non_verbose_excludes_measured_values() {
+        let line = render_p95_line(
+            100_000,
+            768,
+            20,
+            Duration::from_millis(12),
+            Duration::from_millis(34),
+            true,
+            false,
+        );
+        assert!(line.contains("rows=100000"));
+        assert!(line.contains("dim=768"));
+        assert!(line.contains("k=20"));
+        assert!(line.contains("pass=true"));
+        assert!(!line.contains(&format!("{:?}", Duration::from_millis(12))));
+        assert!(!line.contains(&format!("{:?}", Duration::from_millis(34))));
+        assert!(!line.contains("median"));
+        assert!(!line.contains("p95="));
+    }
+
+    #[test]
+    fn render_p95_line_verbose_includes_measured_values() {
+        let median = Duration::from_millis(12);
+        let p95 = Duration::from_millis(34);
+        let line = render_p95_line(100_000, 768, 20, median, p95, true, true);
+        assert!(line.contains(&format!("{median:?}")));
+        assert!(line.contains(&format!("{p95:?}")));
+    }
+
+    #[test]
+    fn render_recall_line_non_verbose_excludes_measured_values() {
+        let recall_min = 0.987_654;
+        let line = render_recall_line(20, 20, recall_min, true, false);
+        assert!(line.contains("k=20"));
+        assert!(line.contains("queries=20"));
+        assert!(line.contains("pass=true"));
+        assert!(!line.contains(&format!("{recall_min:.6}")));
+        assert!(!line.contains("recall_min"));
+    }
+
+    #[test]
+    fn render_recall_line_verbose_includes_measured_values() {
+        let recall_min = 0.987_654;
+        let line = render_recall_line(20, 20, recall_min, true, true);
+        assert!(line.contains(&format!("{recall_min:.6}")));
+    }
+
+    #[test]
+    fn render_ab_line_non_verbose_excludes_measured_values() {
+        let a_median = Duration::from_millis(5);
+        let b_median = Duration::from_millis(6);
+        let median_ratio = 0.8333;
+        let line = render_ab_line(a_median, b_median, median_ratio, false);
+        assert!(!line.contains(&format!("{a_median:?}")));
+        assert!(!line.contains(&format!("{b_median:?}")));
+        assert!(!line.contains(&format!("{median_ratio:.4}")));
+        assert!(line.contains("available=true"));
+        assert!(line.contains("not counted toward pass/fail"));
+    }
+
+    #[test]
+    fn render_ab_line_verbose_includes_measured_values() {
+        let a_median = Duration::from_millis(5);
+        let b_median = Duration::from_millis(6);
+        let median_ratio = 0.8333;
+        let line = render_ab_line(a_median, b_median, median_ratio, true);
+        assert!(line.contains(&format!("{a_median:?}")));
+        assert!(line.contains(&format!("{b_median:?}")));
+        assert!(line.contains(&format!("{median_ratio:.4}")));
     }
 }
 

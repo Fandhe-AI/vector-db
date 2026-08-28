@@ -47,7 +47,7 @@ end-to-end 再測定は TASK-165 の管轄とする。
 | データ | 100,000 行 × 768 次元・k=20（本ベンチが選んだ計測構成。既存 `simd_bench.rs` の行数・次元に揃えて比較可能にしたもので、spec の計測条件の転記ではない。決定的シード RNG で生成し、`tenant::insert_rows` で 10,000 行単位のチャンク投入） |
 | プロトコル | `harness::protocol::run`（warmup 20・計測 50・決定的シード）→ `harness::accept::p95_from_samples` / `check_p95_within_limit`。Recall@20 は `CpuScalarProvider`（厳密最近傍の独立オラクル）との Top-20 一致率を 20 クエリの worst-query で判定 |
 | 診断 A/B | `harness::ab::run_ab` で SQL 表層 vs `EngineCore::search` を interleaved 計測し `median_ratio` を出力（**合否には含めない**。SQL 表層オーバーヘッドの切り分け材料。ただし `EngineCore::search` 側は `PrefilterCache`〔TASK-169〕を経由するため、テーブル内容が変わらない本ベンチでは初回以降キャッシュがウォームな状態で計測される——`median_ratio` は「SQL 表層のコールドな arena 再構築」と「キャッシュヒット時の `EngineCore::search`」の比であり、両経路の候補デコード実装そのものを対称条件で比較した値ではない点に注意） |
-| 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`simd_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了し、標準出力へは実測値と pass/fail のみを記録する（閾値の数値そのものは出力しない） |
+| 閾値注入 | `BENCH_SQL_C1_MAX_P95_MS`・`BENCH_SQL_C1_MIN_RECALL`（SQL-1 専用の repo variables。`simd_bench.rs` の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は provider 単体 CORE-3・SEARCH-4・CORE-4 の基準であり出所が異なるため流用しない）。未設定・不正値は fail-closed で非ゼロ終了する。標準出力は既定では pass/fail・非数値状態のみを記録する（閾値・実測値そのものは出力しない）。実測値は `BENCH_SQL_C1_VERBOSE=1`（GitHub Actions 外の opt-in）に限り出力する（Issue #278。`contrast_bench.rs`・CORE-5 対応〔PR #224〕と同一方針） |
 | 専有環境の宣言 | `BENCH_DEDICATED_ENV=1` の opt-in フラグ。未設定（既定）では「専有環境として宣言されていない」ことを明示し、条件7 の判定対象から除外する（p95/Recall 自体の pass/fail は常に出力） |
 | CI 対象 | `tests/c1_bench_accept.rs`（`make ci` 対象）が SQL 文字列生成・識別子検証・往復性・環境記録の非 panic のみを時間非依存に検証する。時間依存の実測（`bench-c1`）は `.github/workflows/bench.yml` の `workflow_dispatch` 限定ジョブから実行し、schedule には含めない |
 
@@ -95,11 +95,18 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
 確認済みである。フル規模での実測値そのものは未取得のため、下表は専有環境での
 再実行時に埋めるテンプレートとして扱う。
 
-| 指標 | 値 |
-| ---- | -- |
-| p95（SQL 表層 C1、rows=100,000 dim=768 k=20） | 未実測（専有環境での再実行時に記録） |
-| Recall@20（vs `CpuScalarProvider`） | 未実測（専有環境での再実行時に記録） |
-| A/B `median_ratio`（SQL 表層 / `EngineCore::search`） | 未実測（専有環境での再実行時に記録） |
+> [!NOTE]
+> `sql_c1_bench.rs` は既定で実測値を public ログへ出力しない（Issue #278。
+> 「専有環境での再実行手順」参照）。下表は「実施済み/未実施」「pass/fail」の
+> **非数値状態**のみを記録する運用へ改めた。実測値の数値そのもの（p95・
+> `recall_min`・`median_ratio`）は非公開記録先へ保存し、本ドキュメント（public
+> 資産）へは転記しない（`docs/design/tier-latency-acceptance.md` と同運用）。
+
+| 指標 | 実施状態 | pass/fail |
+| ---- | -------- | --------- |
+| p95（SQL 表層 C1、rows=100,000 dim=768 k=20） | 未実施 | — |
+| Recall@20（vs `CpuScalarProvider`） | 未実施 | — |
+| A/B `median_ratio`（SQL 表層 / `EngineCore::search`。診断情報・合否対象外） | 未実施 | 対象外 |
 
 ## Conditional Go 条件7 の判定: 未充足（判定保留）
 
@@ -124,14 +131,21 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
    BENCH_SQL_C1_MAX_P95_MS=<spec 値> \
    BENCH_SQL_C1_MIN_RECALL=<spec 値> \
    BENCH_DEDICATED_ENV=1 \
+   BENCH_SQL_C1_VERBOSE=1 \
    make bench-c1
    ```
 
+   `BENCH_SQL_C1_VERBOSE=1` は実測値を標準出力へ含める opt-in（Issue #278）。
+   **GitHub Actions 外の環境でのみ**設定すること。GitHub Actions 下（`GITHUB_ACTIONS`
+   環境変数設定時）では verbose 要求を fail-closed で拒否し、データ投入前に非ゼロ
+   終了する。
 3. 実行前後に `cat /proc/loadavg`・`nproc`・`lscpu | grep 'Model name'` を控え、
    run-to-run 変動を確認するため 2 回以上実行する。
 4. 標準出力の `p95_latency(sql_c1)`・`topk_consistency(sql_c1_vs_scalar_exhaustive)`・
-   `diagnostic_ab(sql_surface_vs_core_search)`・`conditional_go_7` の各行を上表へ
-   転記する（閾値の数値そのものは記録しない）。
+   `diagnostic_ab(sql_surface_vs_core_search)`・`conditional_go_7` の各行の
+   「実施済み」「pass/fail」を上表へ転記する（p95・`recall_min`・`median_ratio`・
+   閾値の数値そのものは本ドキュメント〔public 資産〕へは転記せず、非公開記録先へ
+   保存する。Issue #278）。
 5. `pass=true` かつ `dedicated_env=attested` であれば、本ドキュメントのステータスを
    Accepted に更新し、条件7 を「充足」へ書き換える。基準未達の場合は「未充足
    （実測・専有環境）」として観察（A/B 比から読める切り分け所見）を追記する。
@@ -150,6 +164,7 @@ CPU・KVM）上で行った。`sql_c1_bench.rs` が出力する `EnvReport`（OS
 
 - `docs/spec/05-tasks.md` TASK-83（ポインタ）
 - `docs/spec/04-behavior/sql-surface.md` SQL-1（ポインタ）
+- Issue #278（実測値 public ログ出力の抑止）
 - `crates/engine/benches/sql_c1_bench.rs`・`crates/engine/benches/harness/sql_c1.rs`・
   `crates/engine/benches/harness/env_report.rs`
 - `crates/engine/tests/c1_bench_accept.rs`

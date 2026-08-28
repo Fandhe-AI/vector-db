@@ -32,8 +32,15 @@
 //! 基準とは spec 上の出所が異なるため、流用せず別 variable として分離する
 //! （流用すると緩い側で false green・厳しい側で false red になる）。spec が SSOT の
 //! ため本ファイルにはハードコードしない（`.claude/rules/spec-confidentiality.md`）。
-//! 標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しない
-//! （`simd_bench.rs` と同一方針）。
+//! 標準出力には既定では公開済み定数（rows/dim/k/queries）と各判定の pass/fail・
+//! 非数値状態（A/B 診断の可否・条件7 の評価有無）のみを記録し、注入された閾値・
+//! p95/中央値/Recall/A-B 比率の実測数値は出力しない（`contrast_bench.rs`・
+//! PR #224・CORE-5 対応と同一方針。pass/fail と実測値を並べて公開すると spec 由来
+//! 閾値が逆算されうるため。AGENTS.md「private spec 内容の漏えい（P0）」）。実測数値は
+//! `BENCH_SQL_C1_VERBOSE=1`（[`harness::sql_c1::resolve_verbose`]）の opt-in に限り
+//! 出力する。GitHub Actions 下（`GITHUB_ACTIONS` 環境変数設定時）では repo variable
+//! 誤設定による public ログ流出を防ぐため、verbose 要求をデータ投入前に fail-closed
+//! で拒否する（Issue #278）。
 //!
 //! `make bench-c1`（Makefile）・`.github/workflows/bench.yml`
 //! （`workflow_dispatch` 限定。GitHub ホステッド runner は共有 2 vCPU のため恒常的な
@@ -54,7 +61,10 @@ use harness::accept::{
 use harness::env_report::EnvReport;
 use harness::protocol::{run, MeasurementConfig};
 use harness::rng::DeterministicRng;
-use harness::sql_c1::{c1_statement, vector_literal};
+use harness::sql_c1::{
+    c1_statement, render_ab_line, render_p95_line, render_recall_line, resolve_verbose,
+    vector_literal,
+};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
@@ -143,6 +153,20 @@ fn main() {
         }
     };
     let dedicated_env_attested = dedicated_env_attested_from_env();
+    // Issue #278: `BENCH_SQL_C1_VERBOSE=1` かつ GitHub Actions 下では、データ投入前に
+    // fail-closed で打ち切る（defense-in-depth。repo variable の誤設定で verbose が
+    // 注入された場合でも実測値が public ログへ出ないようにする。モジュール冒頭
+    // コメント参照）。
+    let verbose = match resolve_verbose(
+        std::env::var("BENCH_SQL_C1_VERBOSE").ok().as_deref(),
+        std::env::var_os("GITHUB_ACTIONS").is_some(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("sql_c1_bench: {err}");
+            std::process::exit(1);
+        }
+    };
 
     println!(
         "{}",
@@ -233,11 +257,19 @@ fn main() {
     let p95 = p95_from_samples(&measurement.samples).expect("non-empty samples must yield a p95");
     let p95_ok = check_p95_within_limit(p95, max_p95);
     passed &= p95_ok;
-    // limit（BENCH_SQL_C1_MAX_P95_MS の実測値）は意図的にログへ出力しない（`simd_bench.rs`
-    // と同一方針。モジュール冒頭コメント参照）。
+    // limit（BENCH_SQL_C1_MAX_P95_MS）・median・p95 は既定では意図的にログへ出力しない
+    // （モジュール冒頭コメント参照）。
     println!(
-        "p95_latency(sql_c1): rows={ROW_COUNT} dim={DIM} k={TOP_K} median={:?} p95={p95:?} pass={p95_ok}",
-        measurement.summary.median,
+        "{}",
+        render_p95_line(
+            ROW_COUNT,
+            DIM,
+            TOP_K,
+            measurement.summary.median,
+            p95,
+            p95_ok,
+            verbose,
+        )
     );
 
     // --- Recall@20: SQL 表層 C1 vs CpuScalarProvider 参照実装 ---
@@ -277,7 +309,8 @@ fn main() {
         .expect("min_recall validated by min_recall_from_env");
     passed &= recall_ok;
     println!(
-        "topk_consistency(sql_c1_vs_scalar_exhaustive): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
+        "{}",
+        render_recall_line(TOP_K, RECALL_QUERY_COUNT, recall_min, recall_ok, verbose)
     );
 
     // --- 診断 A/B: SQL 表層 vs EngineCore::search（VectorCore trait 経由。合否には含めない） ---
@@ -305,8 +338,13 @@ fn main() {
     ) {
         Ok(ab) => {
             println!(
-                "diagnostic_ab(sql_surface_vs_core_search): a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail)",
-                ab.a.summary.median, ab.b.summary.median, ab.median_ratio
+                "{}",
+                render_ab_line(
+                    ab.a.summary.median,
+                    ab.b.summary.median,
+                    ab.median_ratio,
+                    verbose
+                )
             );
         }
         Err(e) => {
@@ -328,6 +366,16 @@ fn main() {
     }
 
     if !passed {
+        // 判定ごとに未達を分けて報告する（`contrast_bench.rs` と同一方針）。数値は
+        // 含めず、どちらの基準が未達かのみを非数値で示す。
+        if !p95_ok {
+            eprintln!(
+                "sql_c1_bench: p95 latency (SQL-1 C1) exceeds the configured limit (TASK-83 SQL-1)"
+            );
+        }
+        if !recall_ok {
+            eprintln!("sql_c1_bench: recall@k (SQL-1 C1 vs scalar exhaustive oracle) is below the configured minimum (TASK-83 SQL-1)");
+        }
         eprintln!("sql_c1_bench: acceptance criteria not met (TASK-83 SQL-1 p95/Recall)");
         std::process::exit(1);
     }

@@ -107,6 +107,16 @@ gh variable set BENCH_SQL_C1_MIN_RECALL
 BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDICATED_ENV=1 make bench-c1
 ```
 
+`sql_c1_bench.rs` の既定の標準出力は、公開済み定数（`rows`/`dim`/`k`/`queries`）と各判定の pass/fail・非数値状態（A/B 診断の可否・条件7 の評価有無）のみです。p95・中央値・Recall・A/B 比率の実測値は出力しません（`contrast_bench.rs`・CORE-5 対応（PR #224）と同一方針。pass/fail と実測値を並べて公開すると spec 由来閾値が逆算可能になるため）。
+
+実測値が必要な場合（ADR の再実行・切り分け）は `BENCH_SQL_C1_VERBOSE=1` を付けて **GitHub Actions 外の環境で** 実行してください。GitHub Actions 下（`GITHUB_ACTIONS` 環境変数が設定されている場合）では verbose 要求を fail-closed で拒否し、データ投入前に非ゼロ終了します。
+
+```bash
+BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDICATED_ENV=1 BENCH_SQL_C1_VERBOSE=1 make bench-c1
+```
+
+出力された実測値は非公開記録先へ保存し、public な資産（ADR・PR・Issue・コミットメッセージ）へは転記しないでください。
+
 ### ティア別レイテンシ受け入れ基準の実測手順（TASK-116）
 
 `make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-116（対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4・PLAN-6・PLAN-7。判定内容・測定段階・数値基準は spec 側が SSOT であり本リポジトリには記載しません）の受け入れ基準を実測します。常駐 Ollama への実接続が前提です。

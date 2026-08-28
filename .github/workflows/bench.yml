@@ -170,7 +170,10 @@ jobs:
         # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
         # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
         # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
-        # 非ゼロ終了する。
+        # 非ゼロ終了する。`sql_c1_bench.rs` は既定で pass/fail・非数値状態のみを
+        # 出力し実測値を public ログへ出さない（Issue #278・AGENTS.md P0）。
+        # `BENCH_SQL_C1_VERBOSE` は本ワークフローから注入しない（注入しても
+        # `GITHUB_ACTIONS` 検出で fail-closed に非ゼロ終了する）。
         env:
           BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
           BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
