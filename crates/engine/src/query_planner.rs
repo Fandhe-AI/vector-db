@@ -861,12 +861,28 @@ fn read_http_response_body(stream: &mut TcpStream) -> Result<Vec<u8>, PlanError>
 
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-            break pos + 4;
+            let end = pos + 4;
+            // 区切り（`\r\n\r\n`）は 1 回の `read` が一括で大きなバイト列を
+            // 運んできた場合、`buf.len()` が `MAX_HTTP_HEADER_BYTES` 未満のまま
+            // 見つかることがある（下方の読み取り量制限だけでは、区切り発見時点の
+            // 総量チェックを兼ねられない）。区切り発見のたびに実ヘッダ長
+            // （`end`）そのものを上限と照合し、超過分は fail-closed に拒否する
+            // （codex-review PR #252 P1 指摘）。
+            if end > MAX_HTTP_HEADER_BYTES {
+                return Err(PlanError::InvalidResponse);
+            }
+            break end;
         }
         if buf.len() >= MAX_HTTP_HEADER_BYTES {
             return Err(PlanError::InvalidResponse);
         }
-        let n = stream.read(&mut read_buf).map_err(classify_io_error)?;
+        // 1 回の read で受理できる残り許容量までに読み取り量を制限し、
+        // 上限超過分を一度でも `buf` へ取り込まないようにする。
+        let remaining = MAX_HTTP_HEADER_BYTES - buf.len();
+        let read_len = remaining.min(read_buf.len());
+        let n = stream
+            .read(&mut read_buf[..read_len])
+            .map_err(classify_io_error)?;
         if n == 0 {
             return Err(PlanError::InvalidResponse);
         }
@@ -875,7 +891,8 @@ fn read_http_response_body(stream: &mut TcpStream) -> Result<Vec<u8>, PlanError>
 
     // `header_end` は直前のループが `find_subslice(&buf, ...)` の一致位置から
     // 導いた値で、一致条件成立時点で常に `buf.len()` 以内（境界はループの不変条件で
-    // 保証済み。`[]` は panic しない）。
+    // 保証済み。`[]` は panic しない）。加えて上のループで
+    // `header_end <= MAX_HTTP_HEADER_BYTES` も確認済み。
     let head = std::str::from_utf8(&buf[..header_end]).map_err(|_| PlanError::InvalidResponse)?;
     let mut lines = head.split("\r\n");
     let status_line = lines.next().ok_or(PlanError::InvalidResponse)?;
@@ -1360,6 +1377,83 @@ mod tests {
             client.complete("q").unwrap_err(),
             PlanError::ResponseTooLarge
         );
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: ヘッダ区切り（`\r\n\r\n`）が
+    // 1 回の `read` で `MAX_HTTP_HEADER_BYTES` の閾値をまたいで見つかった場合、
+    // 区切り発見を理由にサイズ検査より先に受理してしまわないことを確認する。
+    // サーバー側で書き込みを 2 回に分け、間に短いスリープを挟むことで、
+    // クライアント側の 1 回目の `read` 群がヘッダ本体（区切り未満）だけを受信し、
+    // 区切りが後続の別 `read` にまたがって出現する状況を決定的に再現する。
+    #[test]
+    fn ollama_client_rejects_header_exceeding_limit_found_in_single_read() {
+        // `spawn_stub_server` は 1 回の書き込みで応答を返すクロージャ形状のため、
+        // 意図的な分割書き込みを行うにはここで専用のサーバースレッドを立てる。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        // 1 回目の書き込み: `MAX_HTTP_HEADER_BYTES`（8 KiB）未満のヘッダ本体
+        // （区切りは含まない）。ステータス行 + パディングヘッダ行。
+        let status_line = "HTTP/1.1 200 OK\r\n";
+        let mut first_chunk = status_line.as_bytes().to_vec();
+        // `MAX_HTTP_HEADER_BYTES` から十分な余裕（200 バイト）を残して止める。
+        // 1 回目の受信だけでは上限に達しないことを保証する。
+        let pad_target = MAX_HTTP_HEADER_BYTES - 200;
+        while first_chunk.len() < pad_target {
+            first_chunk.extend_from_slice(b"X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        assert!(first_chunk.len() < MAX_HTTP_HEADER_BYTES);
+
+        // 2 回目の書き込み: 区切り（`\r\n\r\n`）を含む残りのヘッダ行。単独では
+        // 数百バイトで小さく、TCP の 1 回の `read` で丸ごと受信されうる大きさに
+        // 収めつつ、`first_chunk` と合算するとヘッダ総量が `MAX_HTTP_HEADER_BYTES`
+        // を明確に超えるよう十分なパディングを積む。
+        let mut second_chunk = Vec::new();
+        while second_chunk.len() < 400 {
+            second_chunk.extend_from_slice(b"X-Tail: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+        // 本文は他テストと同じ、正当な Ollama `/api/generate` 応答形状にする。
+        // ヘッダ上限違反を見逃す旧実装では、この本文が正常にパースされ
+        // `client.complete` が `Ok` を返してしまう（本テストが検出したい誤り）。
+        // 上限を正しく検査する実装は、本文の妥当性に関わらずヘッダ段階で
+        // `InvalidResponse` を返す。
+        let body = br#"{"model":"test-model","response":"{\"search_terms\":[\"a\"],\"path_hint\":null,\"kind_hint\":null}","done":true}"#;
+        second_chunk
+            .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
+        second_chunk.extend_from_slice(body);
+        assert!(first_chunk.len() + second_chunk.len() > MAX_HTTP_HEADER_BYTES);
+
+        let first_chunk_for_server = first_chunk.clone();
+        let second_chunk_for_server = second_chunk.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept stub connection");
+            let mut reader = BufReader::new(socket.try_clone().expect("clone socket"));
+            let mut request_line = String::new();
+            let _ = reader.read_line(&mut request_line);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            socket
+                .write_all(&first_chunk_for_server)
+                .expect("write first chunk");
+            socket.flush().expect("flush first chunk");
+            // クライアント側の読み取りが 1 回目の書き込み分を使い切ってから
+            // 2 回目の書き込みが独立した `read` として届くよう間隔を空ける。
+            thread::sleep(Duration::from_millis(50));
+            socket
+                .write_all(&second_chunk_for_server)
+                .expect("write second chunk");
+        });
+
+        let client = OllamaClient::new(config_for(addr));
+        assert_eq!(
+            client.complete("q").unwrap_err(),
+            PlanError::InvalidResponse
+        );
+        server.join().expect("stub server thread should not panic");
     }
 
     // 回帰テスト（advisor 指摘対応）: 実際の Ollama `/api/generate` 非ストリーミング
