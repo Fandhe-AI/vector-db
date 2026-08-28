@@ -247,12 +247,9 @@ pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanEr
 // 再埋め込み規則（TASK-114・PLAN-10）
 // ---------------------------------------------------------------------------
 
-/// 密ベクトル検索へ投入する再埋め込みテキストの先頭に付す固定接頭辞。
-///
-/// 既定埋め込みモデル `nomic-embed-text` が公開しているタスクプレフィックス規約
-/// （クエリ側は `search_query: `、ドキュメント側は `search_document: `）のうち
-/// クエリ側と一致させる（ポインタ: `docs/spec/05-tasks.md` TASK-114・
-/// `docs/spec/04-behavior/query-planning.md` PLAN-10）。
+/// 密ベクトル検索へ投入する再埋め込みテキストの先頭に付す固定接頭辞（ポインタ:
+/// `docs/spec/05-tasks.md` TASK-114・`docs/spec/04-behavior/query-planning.md`
+/// PLAN-10）。
 pub const SEARCH_QUERY_PREFIX: &str = "search_query: ";
 
 /// LLM クエリ展開（[`QueryExpansion`]）の結果から、再埋め込み対象テキストを
@@ -293,8 +290,8 @@ pub fn render_reembedding_text(question: &str, expansion: &QueryExpansion) -> St
 ///
 /// 呼び出し元は `core.rs::EngineCore::plan_and_embed_query`（TASK-114・PLAN-10）。
 /// **原質問を埋め込んだ既存ベクトルを引数に取らない**シグネチャとし、「LLM 展開前の
-/// 埋め込みをそのまま使い回す」経路を型レベルで構造的に排除する（再埋め込みの省略を
-/// 禁止する実装規則。`docs/spec/04-behavior/query-planning.md` PLAN-10）。
+/// 埋め込みをそのまま使い回す」経路を型レベルで構造的に排除する（規則の詳細は
+/// `docs/spec/04-behavior/query-planning.md` PLAN-10 参照）。
 ///
 /// 埋め込みサービスからの戻り値は untrusted 応答として扱い、件数が 1 件でない・
 /// 次元が `embedder.dim()` と異なる場合は [`crate::embedding::EmbedError::InvalidResponse`]・

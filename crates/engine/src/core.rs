@@ -1326,10 +1326,10 @@ impl EngineCore {
     ///    エラーが伝播し、以降の埋め込み呼び出しは実行しない）
     /// 4. [`crate::query_planner::reembed_expansion`] で再埋め込み
     ///
-    /// **原質問の埋め込みをそのまま使い回すことはしない**（再埋め込みの省略は Recall
-    /// 劣化の実測根拠がある実装規則。`reembed_expansion` は既存ベクトルを引数に取らない
-    /// シグネチャのため、使い回し経路は構造的に存在しない。`query_planner.rs`
-    /// モジュールドキュメント参照）。テーブルスキーマ参照は `execute_insert_sql`
+    /// **原質問の埋め込みをそのまま使い回すことはしない**（`reembed_expansion` は既存
+    /// ベクトルを引数に取らないシグネチャのため、使い回し経路は構造的に存在しない。
+    /// 規則の詳細は `docs/spec/04-behavior/query-planning.md` PLAN-10・
+    /// `query_planner.rs` モジュールドキュメント参照）。テーブルスキーマ参照は `execute_insert_sql`
     /// 等の既存経路（`self.storage.get_table_schema`）と同じ流儀を用い、新規の
     /// RLS バイパス経路は作らない（対象はテーブル構造メタデータでありテナント行
     /// データではないため、`ctx` によるフィルタ対象外。`(table, ctx)` に対する
