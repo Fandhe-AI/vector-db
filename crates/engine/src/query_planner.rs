@@ -1114,6 +1114,23 @@ fn read_until_eof_bounded(stream: &mut TcpStream, mut body: Vec<u8>) -> Result<V
     let mut read_buf = [0u8; 4096];
     loop {
         if body.len() >= MAX_RESPONSE_BYTES {
+            // 本文がちょうど MAX_RESPONSE_BYTES に達した状態。ここで直ちに
+            // ResponseTooLarge とすると、同じちょうど MAX_RESPONSE_BYTES の
+            // 応答が Content-Length 経由（read_fixed_length_body。`len >
+            // MAX_RESPONSE_BYTES` のみを拒否＝ちょうどは受理）では受理される
+            // のに対し、転送形式によって境界契約が食い違う（codex-review PR
+            // #252 P1 指摘）。追加 1 バイトだけ固定長バッファへ probe し、
+            // 相手が既に接続を閉じていれば（`n == 0`）「ちょうど上限」の
+            // 正当な応答として受理し、まだデータがあれば（`n > 0`）「超過」
+            // として拒否する。この分岐に到達する時点で `body.len() <
+            // MAX_RESPONSE_BYTES` は必ず成立しない（`>=` 条件のため）ため、
+            // 下の `remaining` クランプが 0 長 `read`（`Ok(0)` が EOF と
+            // 区別できず誤って本文を打ち切りうる）を発行することはない。
+            let mut probe = [0u8; 1];
+            let n = stream.read(&mut probe).map_err(classify_io_error)?;
+            if n == 0 {
+                break;
+            }
             return Err(PlanError::ResponseTooLarge);
         }
         let remaining = MAX_RESPONSE_BYTES - body.len();
@@ -1618,6 +1635,37 @@ mod tests {
             client.complete("q").unwrap_err(),
             PlanError::ResponseTooLarge
         );
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: EOF 読み取り経路
+    // （`Content-Length` も `chunked` も無い応答）で、本文がちょうど
+    // `MAX_RESPONSE_BYTES` の場合は受理されることを確認する。`Content-Length`
+    // 経由（`read_fixed_length_body`）はちょうど `MAX_RESPONSE_BYTES` を既に
+    // 受理する契約（`ollama_client_rejects_oversized_response` は `+1` のみを
+    // 拒否）のため、転送形式間で境界契約を揃える。
+    #[test]
+    fn ollama_client_accepts_response_at_exact_size_limit_on_eof_path() {
+        const PREFIX: &[u8] = br#"{"response":""#;
+        const SUFFIX: &[u8] = br#""}"#;
+        let pad_len = MAX_RESPONSE_BYTES - PREFIX.len() - SUFFIX.len();
+
+        let addr = spawn_stub_server(move |_req| {
+            let mut body = Vec::with_capacity(MAX_RESPONSE_BYTES);
+            body.extend_from_slice(PREFIX);
+            body.extend(std::iter::repeat_n(b'a', pad_len));
+            body.extend_from_slice(SUFFIX);
+            assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+
+            let mut response =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+            response.extend_from_slice(&body);
+            response
+        });
+        let client = OllamaClient::new(config_for(addr));
+        let text = client
+            .complete("q")
+            .expect("exact-limit EOF-path response should be accepted");
+        assert_eq!(text.len(), pad_len);
     }
 
     // 回帰テスト（codex-review PR #252 P1 指摘対応）: ヘッダ区切り（`\r\n\r\n`）が
