@@ -233,6 +233,16 @@ pub enum HybridError {
     /// （TASK-111）。[`rrf_fuse`] の [`TooManyCandidates`](HybridError::TooManyCandidates)
     /// と同じ「アロケーション・走査前に長さを検証する」順序を踏襲する。
     TooManyBoostRules { len: usize, max: usize },
+    /// [`apply_soft_boost`] に渡された `rules` の加点合計（1 件の候補が全ルールに
+    /// 一致した場合の最悪ケース）が、渡された `cfg`（[`RrfConfig`]）から動的に
+    /// 導出したソフトブースト上限（[`soft_boost_ceiling`]）以上だった（codex-review
+    /// P1 指摘・cursor bot 指摘対応。TASK-111）。`MAX_BOOST_AMOUNT` は
+    /// [`BoostRule::new`] 単体では「有限かつ極端でない」ことしか保証できず、実際に
+    /// どこまで安全かは呼び出し元が使う `cfg`（`k_const`・重み・`pool_depth`）に
+    /// 依存するため、加点の適用時点（[`apply_soft_boost`]）で `cfg` に対して動的に
+    /// 検証する。固定の `cfg` を前提にしたコンパイル時 assertion（既定値のみを対象と
+    /// する）では、[`RrfConfig::new`] が受理する非既定の `cfg` を守れない。
+    BoostSoftBoundExceeded { total: f64, max: f64 },
 }
 
 impl fmt::Display for HybridError {
@@ -264,6 +274,12 @@ impl fmt::Display for HybridError {
             HybridError::InvalidBoost => write!(f, "invalid soft boost rule amount"),
             HybridError::TooManyBoostRules { len, max } => {
                 write!(f, "too many soft boost rules: {len} rules (max {max})")
+            }
+            HybridError::BoostSoftBoundExceeded { total, max } => {
+                write!(
+                    f,
+                    "soft boost total {total} at or above the cfg-derived soft bound {max}"
+                )
             }
         }
     }
@@ -466,40 +482,73 @@ fn accumulate_ranked(
 /// ソフトブースト（TASK-111・PLAN-1）でヒント種別 1 件一致あたりに加点する既定値。
 /// 受け入れ基準の数値そのものは非公開（ポインタ: TASK-111・PLAN-1。spec 本文は
 /// 転記しない）で、本値は spec 由来の数値ではなく [`RrfConfig::default`]
-/// （`k_const=60.0`・`dense_weight=sparse_weight=1.0`、いずれも本ファイル内で
-/// 既に公開済みの定数）から純粋に導出した安全側の値である。
+/// （`k_const=60.0`・`dense_weight=sparse_weight=1.0`・`pool_depth=200`、いずれも
+/// 本ファイル内で既に公開済みの定数）から純粋に導出した安全側の値である。
 ///
-/// 保証している性質は次の 1 点のみ（codex-review 指摘対応）: [`RrfConfig::default`]
-/// では、融合プールが空でない限り真の 1 位の融合スコアは必ず `weight / (k_const + 1)`
-/// = `1.0 / 61.0` ≈ `0.016393` 以上になる（密・疎いずれかのチャネルで 1 位の候補が
-/// 必ずプールに含まれるため）。一方、[`MAX_BOOST_RULES`] 件（最大 16 件）のルールが
-/// 同一候補へ同時に一致しても加点合計は `16 * 0.001 = 0.016 < 0.016393` に収まる。
-/// したがって、ヒント一致だけでプール最下位級の候補を新たな 1 位へ押し上げる
-/// ことはできない。一方、Top-k 圏外の近接順位候補が圏内へ浮上する程度の入れ替え
-/// （`tests/soft_boost.rs` で検証）は PLAN-1 の意図どおり引き続き起こる。
-///
-/// この境界は [`RrfConfig::default`] の `k_const`／重みに対してのみ成立する。より
-/// 大きい `k_const` やより小さい重みを渡す呼び出し元は、本定数をそのまま使わず
-/// [`BoostRule::new`] の `amount` 側でスケールすること（[`MAX_BOOST_AMOUNT`] は
-/// そうした EXT-4 の他用途向けに意図的に大きく許容してある）。
-pub const SOFT_BOOST_PER_MATCH: f64 = 0.001;
-
-// 上記の安全マージンをコンパイル時に固定する（`MAX_BOOST_RULES` や
-// `SOFT_BOOST_PER_MATCH` の将来変更で無言のうちに破られないようにするガード）。
-const _: () = assert!(
-    (MAX_BOOST_RULES as f64) * SOFT_BOOST_PER_MATCH < 1.0 / 61.0,
-    "SOFT_BOOST_PER_MATCH * MAX_BOOST_RULES must stay below the RrfConfig::default \
-     single-channel top-1 contribution (1/61)"
-);
+/// 保証している性質は次の 1 点のみ（codex-review P1・cursor bot 指摘対応。2 回目の
+/// 見直し）: [`RrfConfig::default`] 下で、[`MAX_BOOST_RULES`] 件（最大 16 件）の
+/// ルールが同一候補へ同時に一致しても、その候補が**プール最下位級**（融合プール中で
+/// 唯一の出現が片方のチャネルの最下位順位のみ、という最悪ケース。RRF はヒットしない
+/// チャネルに `0.0` を割り当てるのではなく、そもそも `hits` に現れない ── 「0.0 と
+/// 比較すれば安全」という誤った前提を置かない）の加点後スコアで、真の 1 位が
+/// 取りうる保証下限（`max(dense_weight, sparse_weight) / (k_const + 1)` =
+/// `1.0 / 61.0` ≈ `0.016393`）を上回ることはできない。この不変条件は
+/// [`soft_boost_ceiling`] が `cfg` から動的に導出し、[`apply_soft_boost`] が
+/// 呼び出しのたびに検証する（[`HybridError::BoostSoftBoundExceeded`]）ため、
+/// 本定数はあくまで [`RrfConfig::default`] 向けの一例に過ぎず、この定数自体が
+/// 安全性を保証するわけではない。Top-k 圏外の近接順位候補が圏内へ浮上する程度の
+/// 入れ替え（`tests/soft_boost.rs` で検証）は PLAN-1 の意図どおり引き続き起こる。
+pub const SOFT_BOOST_PER_MATCH: f64 = 0.0007;
 
 /// [`apply_soft_boost`] が 1 回の呼び出しで受け付けるブーストルール数の上限
 /// （無制限入力の拒否。coding-rust.md「長さフィールドは上限検証してから」）。
 pub const MAX_BOOST_RULES: usize = 16;
 
-/// [`BoostRule::new`] が受け付ける加点値 `amount` の上限。[`RrfConfig::default`] の
-/// スコアスケール（`weight / k_const` ≈ 0.0167）に対し十分大きいが有界にし、単一
-/// ルールの加点が RRF 融合スコアの意味を完全に覆い隠さないようにする。
+/// [`BoostRule::new`] が受け付ける加点値 `amount` の単体上限。あくまで「非有限・
+/// 極端に巨大な値を弾く」ためのラフな安全弁であり、実際にどこまで「ソフト」で
+/// あり続けられるかは呼び出し元が使う `cfg`（[`RrfConfig`]）に依存するため、
+/// この定数だけでは softness を保証しない（保証は [`apply_soft_boost`] が `cfg` に
+/// 対して動的に行う。codex-review P1 指摘対応: 以前は本定数のみに頼っており、
+/// [`RrfConfig::default`] を使う呼び出し元でも `BoostRule::new(ids, 1.0)` を渡すだけで
+/// [`SOFT_BOOST_PER_MATCH`] の想定を大きく超える加点が可能だった）。
 const MAX_BOOST_AMOUNT: f64 = 1.0;
+
+/// `cfg`（[`RrfConfig`]）から、ソフトブーストの加点合計が下回るべき上限を動的に
+/// 導出する（[`apply_soft_boost`] の検証本体。codex-review P1・cursor bot 指摘対応）。
+///
+/// 導出根拠: 融合プールが空でない限り、真の 1 位の融合スコアは必ず
+/// `max(dense_weight, sparse_weight) / (k_const + 1)` 以上になる（密・疎いずれか、
+/// 重みが大きい方のチャネルで 1 位を取った候補が必ずプールに含まれ、その寄与だけで
+/// この値に達するため）。一方、プールに含まれる候補の最悪ケースの最低スコアは
+/// `min(dense_weight, sparse_weight) / (k_const + pool_depth)`（重みが小さい方の
+/// チャネルの最下位順位でのみ 1 回出現した場合。RRF はヒットしないチャネルに `0.0`
+/// を割り当てるのではなく、そもそも `hits` へ現れないため、`0.0` を下限に使うのは
+/// 誤り ── cursor bot 指摘の核心）。したがって加点合計がこの 2 値の差未満であれば、
+/// プール最下位級の候補がヒント一致だけで真の 1 位を上回ることはできない。
+///
+/// `pool_depth` が小さい `cfg` ではこの上限が小さく（`pool_depth` が 1 かつ等重みで
+/// `0.0` に）縮退しうる。これは意図した fail-closed な挙動である: プールが浅いほど
+/// 「プール最下位」と「真の 1 位」の距離自体が縮まり、そもそもソフトブーストを
+/// 安全に適用できる余地が小さいため（[`MAX_BOOST_RULES`] 件すべてが一致しても
+/// [`RrfConfig::default`] 相当の余裕を保つには、おおよそ `pool_depth` が数百桁必要）。
+fn soft_boost_ceiling(cfg: &RrfConfig) -> f64 {
+    let max_weight = cfg.dense_weight().max(cfg.sparse_weight());
+    let min_weight = cfg.dense_weight().min(cfg.sparse_weight());
+    let guaranteed_top1_floor = max_weight / (cfg.k_const() + 1.0);
+    let worst_case_pool_bottom = min_weight / (cfg.k_const() + cfg.pool_depth() as f64);
+    guaranteed_top1_floor - worst_case_pool_bottom
+}
+
+// `RrfConfig::default` に対する上記の安全マージンをコンパイル時にも固定する
+// （`MAX_BOOST_RULES` や `SOFT_BOOST_PER_MATCH` の将来変更で、実行時検証
+// （[`apply_soft_boost`]・[`soft_boost_ceiling`]）を経ない限り無言のうちに破られない
+// ようにする回帰ガード。実行時検証自体は任意の `cfg` に対して行われるため、本
+// assertion は「デフォルト設定でも安全マージンを持つ」ことの早期発見用に過ぎない）。
+const _: () = assert!(
+    (MAX_BOOST_RULES as f64) * SOFT_BOOST_PER_MATCH < 1.0 / 61.0 - 1.0 / 260.0,
+    "SOFT_BOOST_PER_MATCH * MAX_BOOST_RULES must stay below the RrfConfig::default \
+     soft_boost_ceiling (top-1 floor 1/61 minus worst-case pool-bottom 1/260)"
+);
 
 /// ソフトブーストの 1 ルール（TASK-111・PLAN-1。EXT-4 の汎用メタデータ一致ブーストの
 /// 共通基盤として、ヒント種別（path/kind）に依存しない形にしてある）。
@@ -548,19 +597,48 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// 候補の追加・削除は構造的に不可能（既存 `Vec` の `score` 更新のみ）で、EXT-4 の
 /// 「完全除外しない」性質を型レベルで担保する。`rules.len() > MAX_BOOST_RULES` は
 /// アロケーション・走査前に [`HybridError::TooManyBoostRules`] で拒否する（[`rrf_fuse`]
-/// の長さ検証と同じ順序）。加算後の非有限化（Inf オーバーフロー）は
-/// [`HybridError::NonFiniteScore`] で拒否する（`rrf_fuse` の融合後検証と同じ方向）。
-/// 最後に既存と同一の比較器（スコア降順・同点 id 昇順、`f64::total_cmp` ベース）で
-/// 再ソートし、決定性を維持する（`sort_by` を使い `sort_unstable_*` は使わない。
-/// `scripts/check_sort_determinism.sh` の対象）。
+/// の長さ検証と同じ順序）。加点合計（1 件の候補が全ルールに一致した場合の最悪ケース）
+/// が `cfg` から動的に導出した [`soft_boost_ceiling`] 以上の場合は
+/// [`HybridError::BoostSoftBoundExceeded`] で拒否する（codex-review P1・cursor bot
+/// 指摘対応。`BoostRule::new` 単体の `MAX_BOOST_AMOUNT` 検証だけでは、実際にどこまで
+/// 「ソフト」であり続けられるかが `cfg` に依存するため守れない）。この 2 つの長さ・
+/// 加点上限検証はいずれもスコア走査より先に行う（[`TooManyCandidates`]
+/// (HybridError::TooManyCandidates) と同じ順序）。加算後の非有限化（Inf
+/// オーバーフロー）は [`HybridError::NonFiniteScore`] で拒否する（`rrf_fuse` の融合後
+/// 検証と同じ方向）。最後に既存と同一の比較器（スコア降順・同点 id 昇順、
+/// `f64::total_cmp` ベース）で再ソートし、決定性を維持する（`sort_by` を使い
+/// `sort_unstable_*` は使わない。`scripts/check_sort_determinism.sh` の対象）。
+///
+/// 契約: [`soft_boost_ceiling`] による安全性の議論は、`hits` が**この `cfg` を使って**
+/// [`rrf_fuse`] した結果であることを前提にする。`hits` の生成に使った `cfg` と異なる
+/// `cfg` を渡すと（例えば `rrf_fuse` には大きい `pool_depth` を使い、ここには小さい
+/// `pool_depth` の `cfg` を渡す等）、導出した上限が実際のプールの分布と対応しなくなり
+/// 保証が無意味化する。[`hybrid_search_boosted`] は常に同一の `cfg` を両方へ渡すこと
+/// でこの前提を保つ。
 pub fn apply_soft_boost(
     hits: &mut [HybridHit],
     rules: &[BoostRule<'_>],
+    cfg: &RrfConfig,
 ) -> Result<(), HybridError> {
     if rules.len() > MAX_BOOST_RULES {
         return Err(HybridError::TooManyBoostRules {
             len: rules.len(),
             max: MAX_BOOST_RULES,
+        });
+    }
+
+    // `rules` が空なら加点合計は必ず `0.0` で、`apply_soft_boost` は no-op のまま
+    // 安全（`BoostRule::new` は `amount > 0.0` を要求するため、非空の `rules` なら
+    // `total_boost` は必ず正になる）。`soft_boost_ceiling` は `pool_depth == 1` かつ
+    // 等重みの `cfg` では `0.0` に退化しうる（真の 1 位保証下限とプール最下位級の
+    // 最悪スコアが同じ順位 `k_const + 1` に一致するため）ため、`total_boost > 0.0`
+    // を先に確認しないと空ルール（no-op）まで拒否してしまう。
+    let total_boost: f64 = rules.iter().map(|rule| rule.amount).sum();
+    let ceiling = soft_boost_ceiling(cfg);
+    if total_boost > 0.0 && total_boost >= ceiling {
+        return Err(HybridError::BoostSoftBoundExceeded {
+            total: total_boost,
+            max: ceiling,
         });
     }
 
@@ -645,6 +723,28 @@ pub fn hybrid_search_boosted(
     if k == 0 || k > cfg.pool_depth() {
         return Err(HybridError::InvalidK);
     }
+    // ルール件数・加点上限の検証は [`apply_soft_boost`] 内でも行われるが、ここでは
+    // それより先（`provider.search`・可視性走査・`SparseIndex::search_within`・
+    // `rrf_fuse` より前）に同じ検証を行う（codex-review P2 指摘対応）。`k` の検証と
+    // 同じ「安価な入力検証を高コストな処理より先に行う」順序を踏襲し、契約違反の
+    // 呼び出し元が無駄な検索コストを消費させられないようにする。
+    if rules.len() > MAX_BOOST_RULES {
+        return Err(HybridError::TooManyBoostRules {
+            len: rules.len(),
+            max: MAX_BOOST_RULES,
+        });
+    }
+    // `total_boost > 0.0` を先に確認する理由は [`apply_soft_boost`] 側の同じ検証の
+    // コメント参照（`pool_depth == 1` 等の degenerate な `cfg` で `soft_boost_ceiling`
+    // が `0.0` に退化しても空ルールを誤って拒否しないため）。
+    let total_boost: f64 = rules.iter().map(|rule| rule.amount).sum();
+    let boost_ceiling = soft_boost_ceiling(cfg);
+    if total_boost > 0.0 && total_boost >= boost_ceiling {
+        return Err(HybridError::BoostSoftBoundExceeded {
+            total: total_boost,
+            max: boost_ceiling,
+        });
+    }
 
     let visible_ids: std::collections::BTreeSet<u64> = input.ids.iter().copied().collect();
 
@@ -699,7 +799,7 @@ pub fn hybrid_search_boosted(
     let mut fused = rrf_fuse(&dense_hits, &sparse_hits, cfg)?;
     // `truncate(k)` の前にブーストを適用する（本関数ドキュメント参照。切り詰め後だと
     // 圏外候補が浮上できず EXT-4/PLAN-1 の効果が失われる）。
-    apply_soft_boost(&mut fused, rules)?;
+    apply_soft_boost(&mut fused, rules, cfg)?;
     fused.truncate(k);
     Ok(fused)
 }
@@ -1355,13 +1455,14 @@ mod tests {
 
     #[test]
     fn apply_soft_boost_adds_amount_for_single_match() {
+        let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
             HybridHit { id: 2, score: 0.4 },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
-        apply_soft_boost(&mut hits, &[rule]).expect("ok");
+        apply_soft_boost(&mut hits, &[rule], &cfg).expect("ok");
         let h1 = hits.iter().find(|h| h.id == 1).unwrap();
         let h2 = hits.iter().find(|h| h.id == 2).unwrap();
         assert!((h1.score - 0.5).abs() < 1e-15);
@@ -1370,48 +1471,64 @@ mod tests {
 
     #[test]
     fn apply_soft_boost_sums_multiple_rule_matches() {
+        let cfg = RrfConfig::default();
         let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
         let path_ids: BTreeSet<u64> = [1].into_iter().collect();
         let kind_ids: BTreeSet<u64> = [1].into_iter().collect();
         let rule_a = BoostRule::new(&path_ids, SOFT_BOOST_PER_MATCH).unwrap();
         let rule_b = BoostRule::new(&kind_ids, SOFT_BOOST_PER_MATCH).unwrap();
-        apply_soft_boost(&mut hits, &[rule_a, rule_b]).expect("ok");
+        apply_soft_boost(&mut hits, &[rule_a, rule_b], &cfg).expect("ok");
         assert!((hits[0].score - (0.1 + 2.0 * SOFT_BOOST_PER_MATCH)).abs() < 1e-15);
     }
 
     #[test]
     fn apply_soft_boost_changes_rank_order() {
+        // codex-review P1 対応後は加点合計を `soft_boost_ceiling` 未満にしか許さない
+        // ため、スコア差自体をその範囲内（既定 cfg で ≈ 0.01255）に収めた近接候補で
+        // 順位逆転を確認する（Top-k 圏外の近接順位候補が浮上する PLAN-1 の想定用途）。
+        let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
-            HybridHit { id: 2, score: 0.4 },
+            HybridHit {
+                id: 2,
+                score: 0.4995,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
-        // id=2 に十分大きい加点をして順位を逆転させる。
-        let rule = BoostRule::new(&ids, 0.2).unwrap();
-        apply_soft_boost(&mut hits, &[rule]).expect("ok");
+        // id=2 に十分大きい加点（ただしソフト上限未満）をして順位を逆転させる。
+        let rule = BoostRule::new(&ids, 0.001).unwrap();
+        apply_soft_boost(&mut hits, &[rule], &cfg).expect("ok");
         assert_eq!(hits[0].id, 2);
         assert_eq!(hits[1].id, 1);
     }
 
     #[test]
     fn apply_soft_boost_default_amount_cannot_overtake_default_cfg_top_rank() {
-        // codex-review P1 対応の回帰: `SOFT_BOOST_PER_MATCH`（既定値）で
-        // `MAX_BOOST_RULES` 件全てが同一候補へ一致しても、[`RrfConfig::default`]
-        // 下で真の 1 位が取りうる最小スコア（`weight / (k_const + 1)` = 1/61。
-        // モジュールドキュメント参照）を上回れないことを確認する。id=2 はプール
-        // 最下位級の低スコア（0.0）から出発させ、最悪ケースの加点合計を与える。
-        let top1_min_score = 1.0 / 61.0;
+        // codex-review P1・cursor bot 指摘対応の回帰: `SOFT_BOOST_PER_MATCH`
+        // （既定値）で `MAX_BOOST_RULES` 件全てが同一候補へ一致しても、
+        // [`RrfConfig::default`] 下で真の 1 位が取りうる保証下限（`weight /
+        // (k_const + 1)` = 1/61）を上回れないことを確認する。id=2 は「0.0」ではなく
+        // cursor bot 指摘どおりの真のプール最下位級スコア（弱い方のチャネル
+        // （既定は等重みのため dense=sparse）の最下位順位 `pool_depth` でのみ
+        // 出現した場合の `weight / (k_const + pool_depth)` = 1/260）から出発させ、
+        // [`soft_boost_ceiling`] と同じ最悪ケースの加点合計を与える。
+        let cfg = RrfConfig::default();
+        let top1_guaranteed_floor = 1.0 / 61.0;
+        let pool_bottom_worst_case = 1.0 / 260.0;
         let mut hits = vec![
             HybridHit {
                 id: 1,
-                score: top1_min_score,
+                score: top1_guaranteed_floor,
             },
-            HybridHit { id: 2, score: 0.0 },
+            HybridHit {
+                id: 2,
+                score: pool_bottom_worst_case,
+            },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
         let rules: Vec<BoostRule<'_>> = (0..MAX_BOOST_RULES).map(|_| rule).collect();
-        apply_soft_boost(&mut hits, &rules).expect("ok");
+        apply_soft_boost(&mut hits, &rules, &cfg).expect("ok");
 
         let h1 = hits.iter().find(|h| h.id == 1).unwrap();
         let h2 = hits.iter().find(|h| h.id == 2).unwrap();
@@ -1421,34 +1538,77 @@ mod tests {
     }
 
     #[test]
+    fn soft_boost_ceiling_matches_default_cfg_compile_time_assert_literals() {
+        // `SOFT_BOOST_PER_MATCH` 直後の compile-time assertion（`const _: () =
+        // assert!(...)`）は `1.0 / 61.0 - 1.0 / 260.0` を [`RrfConfig::default`] の
+        // `k_const`/`pool_depth` から手計算したリテラルとして埋め込んでいる。
+        // `RrfConfig::default` の値を変更しても、このリテラル自体は自動更新
+        // されないため、両者が一致することをテストで固定する（不一致になれば
+        // compile-time assertion が [`soft_boost_ceiling`] の実際の計算とは無関係な
+        // 値を検証するだけの張り子になり、次の `RrfConfig::default` 変更時に無言で
+        // 安全マージンを破りうる）。
+        let expected = 1.0 / 61.0 - 1.0 / 260.0;
+        let actual = soft_boost_ceiling(&RrfConfig::default());
+        assert!(
+            (actual - expected).abs() < 1e-15,
+            "soft_boost_ceiling(default)={actual} must match the const assert literal {expected}"
+        );
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_total_exceeding_soft_bound() {
+        // codex-review P1・cursor bot 指摘の回帰: `BoostRule::new` 単体は
+        // `MAX_BOOST_AMOUNT`（1.0）まで受理するが、[`RrfConfig::default`] を使う
+        // `apply_soft_boost` は加点合計が `soft_boost_ceiling` 以上なら構築成功済みの
+        // ルールでも実行時に拒否する（1 ルールだけで再現できることを確認: 以前の
+        // 実装は `BoostRule::new(ids, 1.0)` を渡すだけで最下位候補を新 1 位へ
+        // 押し上げられた）。
+        let cfg = RrfConfig::default();
+        let mut hits = vec![HybridHit { id: 1, score: 0.0 }];
+        let ids: BTreeSet<u64> = [1].into_iter().collect();
+        let rule = BoostRule::new(&ids, MAX_BOOST_AMOUNT).unwrap();
+        let err = apply_soft_boost(&mut hits, &[rule], &cfg).unwrap_err();
+        match err {
+            HybridError::BoostSoftBoundExceeded { total, max } => {
+                assert!((total - MAX_BOOST_AMOUNT).abs() < 1e-15);
+                assert!((max - soft_boost_ceiling(&cfg)).abs() < 1e-15);
+            }
+            other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn apply_soft_boost_tie_breaks_by_id_ascending() {
+        let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 5, score: 0.1 },
             HybridHit { id: 3, score: 0.1 },
         ];
-        apply_soft_boost(&mut hits, &[]).expect("ok");
+        apply_soft_boost(&mut hits, &[], &cfg).expect("ok");
         assert_eq!(hits[0].id, 3);
         assert_eq!(hits[1].id, 5);
     }
 
     #[test]
     fn apply_soft_boost_empty_rules_is_no_op() {
+        let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 2, score: 0.5 },
             HybridHit { id: 1, score: 0.4 },
         ];
         let before = hits.clone();
-        apply_soft_boost(&mut hits, &[]).expect("ok");
+        apply_soft_boost(&mut hits, &[], &cfg).expect("ok");
         assert_eq!(hits, before);
     }
 
     #[test]
     fn apply_soft_boost_rejects_too_many_rules() {
+        let cfg = RrfConfig::default();
         let ids: BTreeSet<u64> = BTreeSet::new();
         let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
         let rules: Vec<BoostRule<'_>> = (0..(MAX_BOOST_RULES + 1)).map(|_| rule).collect();
         let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
-        let err = apply_soft_boost(&mut hits, &rules).unwrap_err();
+        let err = apply_soft_boost(&mut hits, &rules, &cfg).unwrap_err();
         assert_eq!(
             err,
             HybridError::TooManyBoostRules {
@@ -1461,15 +1621,16 @@ mod tests {
     #[test]
     fn apply_soft_boost_rejects_non_finite_result() {
         // `apply_soft_boost` は `hits`（`rrf_fuse` の出力に限らず任意の呼び出し元が
-        // 渡しうる）を加点前提とせず全件の有限性を検証する。`MAX_BOOST_AMOUNT`
-        // （既定 1.0）は `f64::MAX` 級の値を加算しても浮動小数点丸めでオーバーフロー
-        // しない微小量のため、非有限化の検知経路は「入力自体が既に非有限（NaN/Inf）」
-        // なケースで確認する（ルール一致の有無に関わらず検証される契約の確認）。
+        // 渡しうる）を加点前提とせず全件の有限性を検証する。空ルールは加点合計が
+        // `0.0` で `soft_boost_ceiling` を必ず下回るため、非有限化の検知経路は
+        // 「入力自体が既に非有限（NaN/Inf）」なケースで確認する（ルール一致の有無に
+        // 関わらず検証される契約の確認）。
+        let cfg = RrfConfig::default();
         let mut hits = vec![HybridHit {
             id: 1,
             score: f64::INFINITY,
         }];
-        let err = apply_soft_boost(&mut hits, &[]).unwrap_err();
+        let err = apply_soft_boost(&mut hits, &[], &cfg).unwrap_err();
         assert_eq!(err, HybridError::NonFiniteScore);
     }
 
