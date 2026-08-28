@@ -531,10 +531,17 @@ fn measure_full_rebuild_batch() -> Duration {
 /// 使わないため、負荷変動によるフレークの余地もない。
 ///
 /// 柱 1 と異なり `CountingEmbedder` を挟まない（`execute_insert_sql_batch` の
-/// 戻り値だけで判定できるため）。埋め込み呼び出し回数ではなく実際に書き込まれた
-/// 行数（`rows_replaced`）も独立に照合することで、埋め込み層だけでなく
-/// `tenant::replace_typed_rows_by_text_key` への書き込み層の退行（例:
-/// 既存行を巻き込んで再書き込みする）も検出対象に含める。
+/// 戻り値だけで判定できるため）。`rows_replaced`（`tenant::replace_typed_rows_by_text_key`
+/// が返す `ReplaceOutcome.inserted`）は、`embed_and_write_phase` が渡す
+/// `rows`（＝ `chunks.len()`）の要素数をそのまま数え上げる実装であるため
+/// （`tenant.rs` の挿入ループ参照）、`chunks_written` と常に等しくなるトートロジー
+/// であり、`chunk_phase`／`embed_and_write_phase` の外側（`replace_typed_rows_by_text_key`
+/// 内の既存行巻き込み型の書き込み退行）を独立に検出する力は持たない。ここで
+/// `rows_replaced` も突き合わせるのは、`chunks_written` と食い違わないこと自体を
+/// 固定する冗長な整合性チェックであり、検出力の上乗せを主張するものではない
+/// （既存行を巻き込んだ再書き込みは `tenant::replace_typed_rows_by_text_key` の
+/// 線形走査コストとして現れ、柱 2（[`index1_single_file_insert_time_does_not_scale_with_corpus_size`]。
+/// 単一ファイル挿入の壁時計時間を小規模／大規模コーパスで比較）が担当する）。
 fn full_rebuild_batch_write_quantity(n_files: usize) -> (usize, usize) {
     let full_path = unique_db_path("recall-full-rebuild-batch-quantity");
     let _full_cleanup = CleanupGuard(full_path.clone());
@@ -734,6 +741,8 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
 
 #[test]
 fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
+    let _timing_guard = acquire_timing_lock();
+
     let (total_chunks_written, total_rows_replaced) =
         full_rebuild_batch_write_quantity(BASELINE_FILES);
 
@@ -741,17 +750,26 @@ fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
     let expected_total = (BASELINE_FILES + 1) * expected_chunks_per_file;
 
     println!(
-        "index1 full-rebuild-batch write-quantity judgement:          total_chunks_written={total_chunks_written} total_rows_replaced={total_rows_replaced}          expected_total={expected_total} (baseline_files={BASELINE_FILES})"
+        "index1 full-rebuild-batch write-quantity judgement: \
+         total_chunks_written={total_chunks_written} total_rows_replaced={total_rows_replaced} \
+         expected_total={expected_total} (baseline_files={BASELINE_FILES})"
     );
 
     assert_eq!(
-        total_chunks_written, expected_total,
-        "full-rebuild batch (execute_insert_sql_batch, {} files) must write exactly          {expected_chunks_per_file} chunks per file regardless of accumulated corpus size          within the batch; a reprocessing-type O(N) regression in index_file_batch would          inflate this total",
+        total_chunks_written,
+        expected_total,
+        "full-rebuild batch (execute_insert_sql_batch, {} files) must write exactly \
+         {expected_chunks_per_file} chunks per file regardless of accumulated corpus size \
+         within the batch; a reprocessing-type O(N) regression in index_file_batch would \
+         inflate this total",
         BASELINE_FILES + 1
     );
     assert_eq!(
         total_rows_replaced, total_chunks_written,
-        "rows actually written via tenant::replace_typed_rows_by_text_key must match the          chunk count produced for each file (no extra existing rows rewritten)"
+        "rows actually written via tenant::replace_typed_rows_by_text_key must match the \
+         chunk count produced for each file (redundant consistency check; see \
+         full_rebuild_batch_write_quantity doc for why this alone does not add detection \
+         power beyond chunks_written)"
     );
 }
 
