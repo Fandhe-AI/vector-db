@@ -167,3 +167,24 @@ jobs:
           RERANK_RECALL_MIN_R20_LARGE: ${{ vars.RERANK_RECALL_MIN_R20_LARGE }}
           RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ vars.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
         run: make rerank-regression
+      - name: Run query-planning-regression
+        # TASK-112（PLAN-1, PLAN-2）の層 B（`crates/engine/tests/query_planning_recall.rs`）。
+        # 数値基準（intent カテゴリの改善幅下限・direct カテゴリの after Recall@20
+        # 絶対下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
+        # step と同じ environment `recall-gate`（job の `environment:` 参照）の
+        # Actions variables から注入する。
+        #
+        # `QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント
+        # 参照）を常に注入する: `QUERY_PLANNING_RECALL_MIN_*` が未設定の場合、この
+        # workflow からの実行では fail-closed でテスト失敗とし、「一度も評価して
+        # いない run」を green にしない。ローカルの `make query-planning-regression`
+        # にはこのフラグを注入しないため、そちらは未設定を「対象外」として成功終了
+        # する opt-in 挙動を維持する（`crates/engine/tests/query_planning_recall.rs::
+        # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は strict
+        # モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログには実測値
+        # と pass/fail のみが出力され、注入された閾値の数値そのものは出力しない。
+        env:
+          QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS: "1"
+          QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT: ${{ vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT }}
+          QUERY_PLANNING_RECALL_MIN_R20_DIRECT: ${{ vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT }}
+        run: make query-planning-regression
