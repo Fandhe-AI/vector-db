@@ -3,10 +3,13 @@
 //!
 //! 責務境界: クエリ単位の `USING MODE` 句・セッション変数 `SET search_mode`
 //! （いずれも [`allowlist`](crate::sql::allowlist) が構文として受理し、生のリテラル
-//! 文字列を返す）から得られる値を、優先順位（クエリ句 > セッション変数 > 既定）に
-//! 従って決定的に解決する。解決結果（[`ResolvedMode`]）は
+//! 文字列を返す）から得られる値を、優先順位（クエリ句 > セッション変数 >
+//! プランナー推定 > 既定）に従って決定的に解決する（[`resolve_mode_with_planner`]。
+//! プランナー推定は `query_planner.rs::QueryExpansion::mode_hint` 由来。TASK-164・
+//! PLAN-11）。解決結果（[`ResolvedMode`]）は
 //! [`parser::BoundStatement`](crate::sql::parser::BoundStatement)
-//! （`bind_with_session`）が保持する。
+//! （`bind_with_session`）が保持する。SQL 表層はプランナー推定の結線を持たない
+//! （TASK-77/78 の管轄）ため、そちらは引き続き [`resolve_mode`]（2 引数版）を呼ぶ。
 //!
 //! `precision` の**実行契約**（確信度判定・空集合 fail-closed 応答）は本モジュールの
 //! 管轄外（TASK-162・対象ビヘイビア SEARCH-9）。本モジュールは構文・優先順位の解決
@@ -53,18 +56,17 @@ impl SearchMode {
     }
 }
 
-/// 実効モードの指定元。TASK-164（PLAN-11）が `USING PLAN` のモード推定を追加する際の
-/// 拡張点（クエリ句 > セッション変数 > プランナー推定 > 既定 の優先順位に合わせ、
-/// `SessionVariable` と `Default` の間へ新しい variant を追加する想定。本タスク
-/// （TASK-161）では未実装）。
+/// 実効モードの指定元。優先順位は **クエリ句 > セッション変数 > プランナー推定 >
+/// 既定** の 4 段（TASK-164・PLAN-11 で `PlannerEstimate` を追加し確定。
+/// `#[non_exhaustive]` により TASK-161 時点で確保していた拡張点を実際に使用した）。
 ///
 /// **TASK-161 で意図的に付与した破壊的変更（BREAKING CHANGE）**: `#[non_exhaustive]` を
 /// 付与したため、クレート外で本 enum を網羅的に `match` していたコードは
 /// `_ => ...` 等のワイルドカードアーム追加が必須になる（詳細は PR #188 の
 /// Breaking Changes 節を参照）。
 ///
-/// `#[non_exhaustive]`: 将来 TASK-164 で `PlannerEstimate` 等の variant を追加した際、
-/// クレート外の `match` 式が網羅性エラーでコンパイル不能になる破壊的変更を防ぐ
+/// `#[non_exhaustive]`: TASK-164 で `PlannerEstimate` variant を追加した際、
+/// クレート外の `match` 式が網羅性エラーでコンパイル不能になる破壊的変更を防いだ
 /// （AGENTS.md「公開 API・エラー契約の互換性（P1）」。PR #188 レビュー指摘対応:
 /// `BoundStatement`／`ValidatedStatement` と同種の拡張点保護）。クレート外で本 enum を
 /// `match` する場合は `_ => ...` 等のワイルドカードアームが必須になる。
@@ -73,7 +75,27 @@ impl SearchMode {
 pub enum ModeSource {
     QueryClause,
     SessionVariable,
+    /// LLM クエリプランナー（`query_planner.rs`。TASK-110・PLAN-1）の展開結果に
+    /// 含まれる `mode_hint` を採用した場合の指定元（TASK-164・PLAN-11）。
+    /// クエリ句・セッション変数のいずれも未指定のときにのみ採用される
+    /// （[`resolve_mode_with_planner`] の短絡順序。明示指定をプランナー推定が
+    /// 上書きする経路は構造上存在しない）。
+    PlannerEstimate,
     Default,
+}
+
+impl ModeSource {
+    /// `EXPLAIN` 等での可視化用の識別子（プログラム出力文字列は英語。
+    /// TASK-78・SQL-6 が wire 応答へ載せる際の値として使う想定の安定した公開契約
+    /// のため、一度出した値は今後変更しない）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ModeSource::QueryClause => "query_clause",
+            ModeSource::SessionVariable => "session_variable",
+            ModeSource::PlannerEstimate => "planner_estimate",
+            ModeSource::Default => "default",
+        }
+    }
 }
 
 /// 優先順位解決を終えた実効モードと、その指定元。
@@ -118,7 +140,34 @@ impl ResolvedMode {
 /// クエリ句・セッション変数それぞれの解決済み値から実効モードを決定する
 /// （副作用なし・決定的。同一入力には常に同一の結果を返す）。優先順位は
 /// **クエリ句 > セッション変数 > 既定（`recall`）**（SQL-12）。
+///
+/// SQL 表層（`sql/parser.rs::bind_with_session` 等。TASK-77/78 が管轄する
+/// `USING PLAN`／`EXPLAIN` 結線までは未実装）はプランナー推定を持たないため、
+/// 引き続きこの 2 引数版を呼ぶ（[`resolve_mode_with_planner`] へ `planner: None`
+/// を渡す後方互換の薄い委譲。TASK-164・PLAN-11）。
 pub fn resolve_mode(query: Option<SearchMode>, session: Option<SearchMode>) -> ResolvedMode {
+    resolve_mode_with_planner(query, session, None)
+}
+
+/// クエリ句・セッション変数・プランナー推定の 3 系統から実効モードを決定する
+/// （TASK-164・PLAN-11）。優先順位は **クエリ句 > セッション変数 > プランナー推定 >
+/// 既定（`recall`）**。
+///
+/// 短絡順序で判定するため、クエリ句またはセッション変数が `Some` の時点で
+/// `planner` を一切読まない構造になっている（明示指定をプランナー推定が上書きする
+/// 経路が構造上存在しないことの担保。security.md「不安全な設計」の裏返し:
+/// 推定はユーザーの明示指定より強い扱いにしない）。
+///
+/// `planner`（`query_planner.rs::QueryExpansion::mode_hint` 由来）が `None`
+/// （推定不確実・応答パース段での fail-safe 化を含む）の場合は次の優先順位
+/// （既定）へフォールスルーする。プランナー推定の不正値を `recall` へ丸める
+/// fail-safe の判断は `query_planner::parse_expansion` 側が担い、本関数は既に
+/// 検証済みの `Option<SearchMode>` を受け取るだけの契約とする。
+pub fn resolve_mode_with_planner(
+    query: Option<SearchMode>,
+    session: Option<SearchMode>,
+    planner: Option<SearchMode>,
+) -> ResolvedMode {
     if let Some(mode) = query {
         return ResolvedMode {
             mode,
@@ -129,6 +178,12 @@ pub fn resolve_mode(query: Option<SearchMode>, session: Option<SearchMode>) -> R
         return ResolvedMode {
             mode,
             source: ModeSource::SessionVariable,
+        };
+    }
+    if let Some(mode) = planner {
+        return ResolvedMode {
+            mode,
+            source: ModeSource::PlannerEstimate,
         };
     }
     ResolvedMode {
@@ -257,6 +312,90 @@ mod tests {
         assert_eq!(session.search_mode(), Some(SearchMode::Precision));
         session.set_search_mode(SearchMode::Recall);
         assert_eq!(session.search_mode(), Some(SearchMode::Recall));
+    }
+
+    #[test]
+    fn mode_source_as_str_is_stable() {
+        // EXPLAIN 出力（TASK-78）が読む公開契約のため、4 値を明示的に固定する
+        // （TASK-164・PLAN-11）。
+        assert_eq!(ModeSource::QueryClause.as_str(), "query_clause");
+        assert_eq!(ModeSource::SessionVariable.as_str(), "session_variable");
+        assert_eq!(ModeSource::PlannerEstimate.as_str(), "planner_estimate");
+        assert_eq!(ModeSource::Default.as_str(), "default");
+    }
+
+    // TASK-164・PLAN-11: query × session × planner の全 8 組合せで優先順位
+    // （クエリ句 > セッション変数 > プランナー推定 > 既定）と `source` を検査する。
+    #[test]
+    fn resolve_mode_with_planner_query_session_planner_all_set_query_wins() {
+        let resolved = resolve_mode_with_planner(
+            Some(SearchMode::Recall),
+            Some(SearchMode::Precision),
+            Some(SearchMode::Precision),
+        );
+        assert_eq!(resolved.mode, SearchMode::Recall);
+        assert_eq!(resolved.source, ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_query_and_session_set_planner_unset_query_wins() {
+        let resolved =
+            resolve_mode_with_planner(Some(SearchMode::Recall), Some(SearchMode::Precision), None);
+        assert_eq!(resolved.mode, SearchMode::Recall);
+        assert_eq!(resolved.source, ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_query_and_planner_set_session_unset_query_wins() {
+        let resolved =
+            resolve_mode_with_planner(Some(SearchMode::Recall), None, Some(SearchMode::Precision));
+        assert_eq!(resolved.mode, SearchMode::Recall);
+        assert_eq!(resolved.source, ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_query_alone_wins() {
+        let resolved = resolve_mode_with_planner(Some(SearchMode::Precision), None, None);
+        assert_eq!(resolved.mode, SearchMode::Precision);
+        assert_eq!(resolved.source, ModeSource::QueryClause);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_session_and_planner_set_query_unset_session_wins() {
+        let resolved =
+            resolve_mode_with_planner(None, Some(SearchMode::Recall), Some(SearchMode::Precision));
+        assert_eq!(resolved.mode, SearchMode::Recall);
+        assert_eq!(resolved.source, ModeSource::SessionVariable);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_session_alone_wins() {
+        let resolved = resolve_mode_with_planner(None, Some(SearchMode::Precision), None);
+        assert_eq!(resolved.mode, SearchMode::Precision);
+        assert_eq!(resolved.source, ModeSource::SessionVariable);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_planner_alone_wins_over_default() {
+        let resolved = resolve_mode_with_planner(None, None, Some(SearchMode::Precision));
+        assert_eq!(resolved.mode, SearchMode::Precision);
+        assert_eq!(resolved.source, ModeSource::PlannerEstimate);
+    }
+
+    #[test]
+    fn resolve_mode_with_planner_all_unset_defaults_to_recall() {
+        let resolved = resolve_mode_with_planner(None, None, None);
+        assert_eq!(resolved.mode, SearchMode::Recall);
+        assert_eq!(resolved.source, ModeSource::Default);
+    }
+
+    #[test]
+    fn resolve_mode_delegates_to_resolve_mode_with_planner_none() {
+        // 後方互換の委譲そのものを検査する（TASK-164 で `resolve_mode` の外部
+        // シグネチャは変えていないことの回帰テスト）。
+        let resolved = resolve_mode(None, Some(SearchMode::Precision));
+        assert_eq!(resolved.mode, SearchMode::Precision);
+        assert_eq!(resolved.source, ModeSource::SessionVariable);
     }
 
     #[test]
