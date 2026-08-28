@@ -1221,7 +1221,22 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
         }
 
         let data_end = pos.checked_add(size).ok_or(PlanError::ResponseTooLarge)?;
-        while buf.len() < data_end + 2 {
+        // チャンクデータ末尾に続く終端 CRLF（2 バイト）込みの境界。直前の
+        // `new_out_len > MAX_RESPONSE_BYTES` チェックが `size` を実質
+        // `MAX_RESPONSE_BYTES` 以下に制限し、かつ `pos` は本ループの直前で
+        // 常に 0 リセットされる（`buf.drain(0..pos)` 参照）ため、現状の呼び出し
+        // 経路では `data_end` が `usize::MAX` 近傍に到達することはなく、続く
+        // `+ 2` が実際にオーバーフローすることはない。ただし `size` は
+        // untrusted な chunk-size 行由来の値であり（`coding-rust.md`:
+        // 整数演算は checked_*/saturating_* を使う）、上記 2 チェックの順序・
+        // 存在に依存せず境界計算自体を安全にしておくため、`checked_add` で
+        // 検証済みの `chunk_end` を一度だけ計算し、以降の全使用箇所
+        // （while 条件・`buf.get` 範囲・次反復の `pos` 更新）でこの値のみを
+        // 用いる（codex-review PR #252 P0 指摘対応。到達不能である旨は確認済み
+        // だが、将来のリファクタで前段チェックの順序が変わっても安全なように
+        // 独立した防御として維持する）。
+        let chunk_end = data_end.checked_add(2).ok_or(PlanError::ResponseTooLarge)?;
+        while buf.len() < chunk_end {
             if buf.len().saturating_sub(pos) > MAX_RESPONSE_BYTES + MAX_HTTP_HEADER_BYTES {
                 return Err(PlanError::ResponseTooLarge);
             }
@@ -1237,17 +1252,17 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
             }
             buf.extend_from_slice(&read_buf[..n]);
         }
-        // 直前の `while buf.len() < data_end + 2` ループが抜けた時点で
-        // `buf.len() >= data_end + 2` が成立している（境界はループの不変条件で保証済み）。
+        // 直前の `while buf.len() < chunk_end` ループが抜けた時点で
+        // `buf.len() >= chunk_end` が成立している（境界はループの不変条件で保証済み）。
         // チャンクデータ直後の 2 バイトは仕様上 CRLF でなければならない。ここを
         // 検証せずに読み飛ばすと、境界がずれた不正な chunked 応答（例: 宣言した
         // `size` とデータ実体が食い違う応答）を無検証で受理してしまう
         // （codex-review PR #252 P1 指摘対応。fail-closed 契約）。
-        if buf.get(data_end..data_end + 2) != Some(b"\r\n") {
+        if buf.get(data_end..chunk_end) != Some(b"\r\n") {
             return Err(PlanError::InvalidResponse);
         }
         out.extend_from_slice(&buf[pos..data_end]);
-        pos = data_end + 2;
+        pos = chunk_end;
     }
 }
 
