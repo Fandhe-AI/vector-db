@@ -121,7 +121,9 @@ pub enum SqlSurfaceError {
     /// 台帳に記録済みの `operation_id` へ、**内容が異なる**書き込みが再送された、
     /// または内容一致を証明できない旧フォーマットの台帳エントリへ再送された
     /// （TASK-101・RECOVER-10。[`crate::tenant::TenantWriteError::OperationIdContentMismatch`]
-    /// の写像。ERR-2: `22023`。fail-closed: commit 済み確定の根拠にしない）。
+    /// の写像。ERR-3（TASK-154）: `22023`。他のいかなる分類（特に `23505`）にも写像しない
+    /// ことは `tests/error_format_err3.rs` で検証する。fail-closed:
+    /// commit 済み確定の根拠にしない）。
     OperationIdContentMismatch,
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
