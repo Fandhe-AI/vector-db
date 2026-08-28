@@ -198,6 +198,7 @@ pub enum CatalogError {
     ColumnAlreadyExists(String),
     RowNotFound(u64),
     IncompatibleRowKeyFormat,
+    TableGenerationCounterOverflow,
 }
 
 # source: crates/engine/src/arena.rs :: ArenaError

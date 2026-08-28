@@ -1819,7 +1819,8 @@ impl EngineCore {
                     // （デコード不整合・世代競合の再試行枯渇・走査量上限超過等）は
                     // 真にサーバー側の内部/一時的障害であり、引き続き `Internal`
                     // として扱う。
-                    // 計画開始時の世代を記録する（codex-review P1 指摘対応、PR #266）:
+                    // 計画開始時の世代を記録する（codex-review P1 指摘対応、PR #266。
+                    // 対象テーブル限定化: codex-review P1 再指摘、PR #266）:
                     // `plan_using_plan_expansion` は `dictionary_snapshot`（LLM プロンプト
                     // 用の固定接頭辞）を、下記の I/O 前スキーマ検証に使う
                     // `pre_check_txn` とは別スナップショットの内部 `read_txn` から構築する
@@ -1828,21 +1829,41 @@ impl EngineCore {
                     // またはデータ・スキーマが更新されると、計画時の辞書語彙（旧テーブル
                     // 由来）による展開・再埋め込みベクトルが、I/O 完了後に新規取得する
                     // 最新スキーマ・行データ（新テーブル）へ適用され、テーブルの同一性を
-                    // 跨いだ不整合な結果になりうる。`storage.current_generation()` は
-                    // テーブル単位ではなくストレージ全体で任意の write commit ごとに
-                    // 単調増加する（[`Storage::current_generation`] ドキュメント参照。
-                    // `DictionaryCache` と同じ精度）。テーブル単位の精密な世代を持たない
-                    // ため、I/O 中に無関係な他テーブルへ書き込みがあった場合も保守的に
-                    // 拒否する（fail-open で見逃すよりも安全側に倒す設計判断。
-                    // security.md「fail-closed を維持する」）。再計画（辞書再構築・
-                    // 再展開）は行わず、単純に拒否する。
+                    // 跨いだ不整合な結果になりうる。当初 `storage.current_generation()`
+                    // （ストレージ全体で任意の write commit ごとに単調増加する世代）で
+                    // 照合していたが、書き込みが継続する運用では無関係な他テーブル・
+                    // 他テナントへの通常の書き込みが 1 回でも I/O 中に完了しただけで
+                    // `USING PLAN` が恒常的に `XX000` 拒否される可用性問題を生む
+                    // （codex-review P1 再指摘）。対象テーブル（`validated.table_name`）
+                    // 固有の世代 [`crate::catalog::table_generation_in_txn`] へ切り替え、
+                    // 当該テーブルの DDL（`CREATE`/`DROP`/`ALTER TABLE`）・行書き込みが
+                    // あった場合にのみ拒否する（`crate::catalog::
+                    // bump_table_generation_in_txn` のドキュメント参照。書き込み経路
+                    // すべてで commit 前に呼ばれる契約）。無関係な他テーブルへの書き込みは
+                    // 本世代へ影響しない。`user_rows/{table_name}` は複数テナントの行を
+                    // 同居させる単一の物理テーブルのため、同一テーブルへの他テナントの
+                    // 書き込みは本世代の対象に含める（拒否側に倒す）: `dictionary_snapshot`
+                    // が読む行集合は `tenant::visible_rows`（`ctx` に基づく RLS 可視性
+                    // 判定。TASK-137・RLS-6, RLS-7）を経由するため、他テナントが
+                    // `Visibility::Public`/`Shared` で書き込んだ行は要求元テナントの
+                    // 辞書内容にも影響しうる。行ごとの可視性を見ずにテーブル単位で
+                    // 一括して拒否側へ倒すのは過剰検知（他テナントの `Private` 専用の
+                    // 書き込みまで拒否対象に含む）を許容する設計判断であり、テナント
+                    // 単位の精密な世代を持たないことの限界だが、fail-open で見逃す
+                    // よりも安全側に倒す（security.md「fail-closed を維持する」）。
+                    // 再計画（辞書再構築・再展開）は行わず、単純に拒否する。
                     let (pre_check_schema, planning_generation) = {
                         let (pre_check_txn, schema) =
                             self.read_txn_with_schema(&validated.table_name)?;
-                        let generation = crate::storage::current_generation_in_txn(&pre_check_txn)
-                            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to read storage generation: {e}"),
-                            })?;
+                        let generation = crate::catalog::table_generation_in_txn(
+                            &pre_check_txn,
+                            &validated.table_name,
+                        )
+                        .map_err(|e| {
+                            crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to read table generation: {e}"),
+                            }
+                        })?;
                         drop(pre_check_txn);
                         (schema, generation)
                     };
@@ -1866,8 +1887,9 @@ impl EngineCore {
                         self.plan_using_plan_expansion(ctx, session, &validated, question)?;
                     let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
 
-                    // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #266）:
-                    // 上記コメントのとおり、`planning_generation` と現在の世代が
+                    // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #266。対象
+                    // テーブル限定化: codex-review P1 再指摘、PR #266）: 上記コメントの
+                    // とおり、`planning_generation` と現在の**対象テーブル**世代が
                     // 一致しなければ、計画時に使った辞書スナップショット・展開結果・
                     // 再埋め込みベクトルが現在のテーブル世代に対して有効である保証が
                     // ないため、fail-closed に拒否する（`SqlSurfaceError::Internal`。
@@ -1875,16 +1897,18 @@ impl EngineCore {
                     // 〔本メソッドのドキュメント参照〕と同じ `XX000` 分類を使い、新規
                     // 分類は追加しない。クライアントへは `Internal::client_message()`
                     // による固定の一般化メッセージのみを返し、他テナント・他クエリの
-                    // 書き込み有無という存在情報を漏らさない）。
-                    let current_generation = crate::storage::current_generation_in_txn(&read_txn)
-                        .map_err(|e| {
-                        crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: format!("failed to read storage generation: {e}"),
-                        }
-                    })?;
+                    // 書き込み有無という存在情報を漏らさない）。無関係な他テーブルへの
+                    // 書き込みでは変化しない世代（[`crate::catalog::table_generation_in_txn`]。
+                    // 上記の計画開始時取得箇所のコメント参照）を使うため、書き込みが
+                    // 継続する運用でも対象テーブル・辞書が無変化であれば拒否されない。
+                    let current_generation =
+                        crate::catalog::table_generation_in_txn(&read_txn, &validated.table_name)
+                            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: format!("failed to read table generation: {e}"),
+                        })?;
                     if current_generation != planning_generation {
                         return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
-                            detail: "storage generation changed during USING PLAN query \
+                            detail: "table generation changed during USING PLAN query \
                                      expansion; rejecting stale plan"
                                 .to_string(),
                         });
@@ -3978,6 +4002,142 @@ mod tests {
             other => panic!(
                 "expected SqlSurfaceError::Internal (generation mismatch) rejection, got: \
                  {other:?}"
+            ),
+        }
+    }
+
+    // codex-review P1 再指摘（PR #266）: 上記
+    // `execute_sql_in_session_rejects_using_plan_when_table_generation_changes_during_io`
+    // が固定した世代照合は、当初ストレージ全体の単調増加世代
+    // （`crate::storage::current_generation_in_txn`）と比較していたため、対象テーブル
+    // （`docs`）自身は無変化でも、I/O（LLM 呼び出し）の間に**無関係な別テーブル**へ
+    // 通常の書き込みが 1 回でも完了すると `USING PLAN` が `XX000` で拒否されていた
+    // （書き込みが継続する運用では恒常的に失敗し、書き込み可能な利用者が無関係
+    // テナントの `USING PLAN` 検索を事実上妨害できる可用性問題）。対象テーブル固有の
+    // 世代（`crate::catalog::table_generation_in_txn`）へ切り替えた後は、無関係な
+    // 他テーブルへの書き込みが `docs` の世代に影響しないため、本テストは
+    // `Ok` を期待する（修正前は本テストが `fail` していたことを確認済み）。
+    #[test]
+    fn execute_sql_in_session_using_plan_succeeds_when_an_unrelated_table_is_written_during_io() {
+        // `GenerationBumpingLlmClient` と同じ二段階初期化パターン（上記テストの
+        // ドキュメントコメント参照）。ここでは `docs`（対象テーブル）ではなく
+        // `other_tenant_docs`（無関係な別テーブル・別テナント名義）を
+        // `LlmClient::complete` から書き込む。
+        struct UnrelatedTableWritingLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for UnrelatedTableWritingLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                // 対象テーブル（`docs`）とは別名の、無関係なテーブルへの通常の書き込み
+                // （別テナント名義。TenantWriteError 経由の RLS 境界付き書き込み API を
+                // 使い、テスト対象の書き込み経路〔tenant.rs〕を実際に通す）。
+                core.storage
+                    .create_table(&TableSchema::new(
+                        "other_docs",
+                        vec![
+                            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                            ColumnDef::new("path", ColumnType::Text, false),
+                            ColumnDef::new("body", ColumnType::Text, false),
+                        ],
+                    ))
+                    .expect("create unrelated table mid-io");
+                let other_ctx =
+                    PolicyContext::new("tenant-b").expect("valid tenant for unrelated table");
+                let other_op_id =
+                    OperationId::parse("unrelated-write-mid-io").expect("valid operation_id");
+                crate::tenant::insert_typed_row(
+                    &core.storage,
+                    "other_docs",
+                    &other_ctx,
+                    1,
+                    Visibility::Public,
+                    &[
+                        crate::row_codec::Value::Vector(vec![0.5, 0.5]),
+                        crate::row_codec::Value::Text("other-path".to_string()),
+                        crate::row_codec::Value::Text("other-body".to_string()),
+                    ],
+                    &other_op_id,
+                )
+                .expect("insert row into unrelated table mid-io");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table docs");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("using-plan-unrelated-write").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("doc-path".to_string()),
+                crate::row_codec::Value::Text("doc-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row into docs");
+
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(UnrelatedTableWritingLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Ok(crate::sql::SqlOutcome::Query(_)) => {}
+            other => panic!(
+                "expected USING PLAN to succeed despite an unrelated table being written \
+                 during I/O, got: {other:?}"
             ),
         }
     }
