@@ -33,19 +33,23 @@
 //! Recall@20 は `hybrid_recall.rs::RecallResult` と同じ理由で、分母に正解集合の
 //! 総数ではなく理論上限 `ceil20`（Σmin(20,\|correct_q\|)）を使う。
 //!
-//! 2 層構成（`rerank_recall.rs` と同方針）:
-//! - 層 A（`#[test]`・PR CI 常時実行）: baseline/after の hits・改善量を固定値
-//!   アサーションで回帰トラッキングする（spec 数値は使わない）。あわせて「intent は
-//!   after が baseline を上回る」「direct は after が baseline 比で固定許容値を
-//!   下回らない（展開が既存の強みを破壊しない）」ことを独立にアサートする
+//! 2 層構成（`rerank_recall.rs` と同方針。ただし本ファイルは合成コーパスの実測値
+//! （Recall・hit 数等）をコード・CI ログのいずれにも数値として残さない
+//! （`.claude/rules/spec-confidentiality.md`／AGENTS.md「数値基準・実測値・spec
+//! 本文の転記は引き続き P0」）:
+//! - 層 A（`#[test]`・PR CI 常時実行）: baseline/after の hits をカテゴリ間・
+//!   before/after 間の相対関係（不等号・等号）のみで回帰トラッキングする（絶対数値の
+//!   固定値アサーション・数値の標準出力は行わない）。「intent は after が baseline を
+//!   上回る」「direct は after が baseline を下回らない（展開が既存の強みを破壊
+//!   しない）」ことを独立にアサートする
 //! - 層 B（`#[ignore]`・`make query-planning-regression` 経由）: spec 由来の下限
 //!   （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`＝intent の改善幅下限・
 //!   `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`＝direct の絶対下限。`.github/workflows/
 //!   recall.yml` が environment `recall-gate` の Actions variables から注入）と
 //!   実測値を比較する閾値ゲート。`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
 //!   （`recall.yml` の Run step からのみ注入）で未設定を fail-closed にする strict
-//!   モードを持つ（`rerank_recall.rs::resolve_gate_threshold` と同型。ログには実測値と
-//!   pass/fail のみを出力し、注入された閾値の数値は出力しない）
+//!   モードを持つ（`rerank_recall.rs::resolve_gate_threshold` と同型。ログには
+//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 実 Ollama 接続での実測は対象外（TASK-110 時点からの継続制約。本テストは
@@ -539,7 +543,7 @@ fn measure_category_recall(
     }
 }
 
-// ---------- 層 A: 固定値回帰トラッキング（PR CI 常時実行） ----------
+// ---------- 層 A: 相対関係による回帰トラッキング（PR CI 常時実行） ----------
 
 const NUM_DOCS: usize = 4_000;
 const NUM_PAIRS: usize = 80;
@@ -550,10 +554,12 @@ const SEED: u64 = 0x5EED_0112_5150_4C41;
 const DENSE_CANDIDATE_DEPTH: usize = 100;
 
 /// TASK-112（PLAN-1, PLAN-2）層 A: intent/direct 両カテゴリの baseline（展開なし）・
-/// after（展開あり）Recall@20 を実測し、固定値アサーションで回帰トラッキングする。
-/// あわせて「intent は after が baseline を上回る」（PLAN-1）「direct は after が
-/// baseline と一致する」（PLAN-2。本テストの `MockLlmClient` は direct 語彙を無変換で
-/// 通すため理論上完全一致になる）ことを独立にアサートする（spec の数値基準は使わない）。
+/// after（展開あり）Recall@20 を実測し、カテゴリ間・before/after 間の相対関係
+/// （不等号・等号）のみで回帰トラッキングする（絶対数値はコード・標準出力のいずれにも
+/// 残さない。AGENTS.md「数値基準・実測値・spec 本文の転記は引き続き P0」）。あわせて
+/// 「intent は after が baseline を上回る」（PLAN-1）「direct は after が baseline と
+/// 一致する」（PLAN-2。本テストの `MockLlmClient` は direct 語彙を無変換で通すため
+/// 理論上完全一致になる）ことを独立にアサートする（spec の数値基準は使わない）。
 #[test]
 fn query_planning_recall_regression() {
     let (docs, pairs) = generate_corpus(SEED, NUM_DOCS, NUM_PAIRS, VOCAB_SIZE);
@@ -567,30 +573,13 @@ fn query_planning_recall_regression() {
     let direct = measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline);
     let intent = measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline);
 
+    // 実測の Recall・hit 数は標準出力（public な CI ログ）へ出さない。固定構成
+    // （docs/pairs/vocab は本ファイルのフィクスチャ定数であり実測値ではない）のみ出力する。
     println!(
         "=== TASK-112 Recall（docs={} pairs={} vocab={}） ===",
         docs.len(),
         pairs.len(),
         VOCAB_SIZE
-    );
-    println!(
-        "direct: baseline Recall@20={:.4} ({}/{})  after Recall@20={:.4} ({}/{})",
-        direct.baseline_recall20(),
-        direct.baseline_hits20,
-        direct.ceil20,
-        direct.after_recall20(),
-        direct.after_hits20,
-        direct.ceil20,
-    );
-    println!(
-        "intent: baseline Recall@20={:.4} ({}/{})  after Recall@20={:.4} ({}/{})  improvement={:.4}",
-        intent.baseline_recall20(),
-        intent.baseline_hits20,
-        intent.ceil20,
-        intent.after_recall20(),
-        intent.after_hits20,
-        intent.ceil20,
-        intent.after_recall20() - intent.baseline_recall20(),
     );
 
     // PLAN-1: intent は展開ありが展開なしを上回ることの独立したアサーション
@@ -606,33 +595,40 @@ fn query_planning_recall_regression() {
         "direct カテゴリで展開ありの Recall@20 が展開なしを下回った"
     );
 
-    // `hits`/`ceil`/`total_correct` を固定値で回帰トラッキングする（検索カーネル・
-    // クエリ展開パーサ・フィクスチャの変更で数値が変化した場合はこのテストが失敗する）。
-    // direct/intent は同一 `pairs`（同一 `correct`）から生成するため `total_correct`/
-    // `ceil20` は両カテゴリで一致する。
+    // `hits`/`ceil`/`total_correct` をカテゴリ間・before/after 間の相対関係
+    // （不等号・等号）のみで回帰トラッキングする（検索カーネル・クエリ展開パーサ・
+    // フィクスチャの変更でこれらの関係が崩れた場合にこのテストが失敗する。絶対数値の
+    // 固定値アサーションは行わない）。direct/intent は同一 `pairs`（同一 `correct`）
+    // から生成するため `total_correct`/`ceil20` は両カテゴリで一致する。
     assert_eq!(
         direct.total_correct,
         pairs.iter().map(|p| p.correct.len()).sum::<usize>()
     );
     assert_eq!(intent.total_correct, direct.total_correct);
+    assert_eq!(
+        direct.ceil20,
+        pairs.iter().map(|p| p.correct.len().min(20)).sum::<usize>()
+    );
     assert_eq!(direct.ceil20, intent.ceil20);
-    assert_eq!(direct.total_correct, 441, "正解集合の総数が変化した");
-    assert_eq!(direct.ceil20, 265, "Recall@20 の理論上限が変化した");
+    // direct カテゴリは `MockLlmClient` が語彙を無変換で通すため、展開の有無で
+    // Recall@20 hit 数が理論上完全一致する（PLAN-2 の `>=` より強い性質）。
     assert_eq!(
-        direct.baseline_hits20, 215,
-        "direct カテゴリ baseline（展開なし）の Recall@20 hit 数が変化した"
+        direct.after_hits20, direct.baseline_hits20,
+        "direct カテゴリで展開ありが展開なしと一致しなかった（MockLlmClient の無変換パススルー性質が崩れた）"
     );
+    // 展開後の intent クエリは direct クエリと語彙的に等価になるため、after の
+    // hit 数はカテゴリを跨いで一致する（`syn_XXXX` → `kw_XXXX` の同義語対応表が
+    // 全射であることの回帰検知）。
     assert_eq!(
-        direct.after_hits20, 215,
-        "direct カテゴリ after（展開あり）の Recall@20 hit 数が変化した"
+        intent.after_hits20, direct.after_hits20,
+        "intent カテゴリの after hit 数が direct カテゴリの after hit 数と一致しなかった"
     );
-    assert_eq!(
-        intent.baseline_hits20, 2,
-        "intent カテゴリ baseline（展開なし）の Recall@20 hit 数が変化した"
-    );
-    assert_eq!(
-        intent.after_hits20, 215,
-        "intent カテゴリ after（展開あり）の Recall@20 hit 数が変化した"
+    // 展開なしの intent は「初見の言い換えに対応できない」構成のため、direct の
+    // baseline を厳密に下回る（コーパス語彙と無関係な `syn_XXXX` のみで構成される
+    // ため、疎チャネル・密チャネルいずれからも手がかりを得られない）。
+    assert!(
+        intent.baseline_hits20 < direct.baseline_hits20,
+        "intent カテゴリ baseline（展開なし）が direct カテゴリ baseline を下回らなかった"
     );
 }
 
@@ -743,7 +739,7 @@ fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
 /// 片方のみ設定済みの場合は設定済みの側だけを判定する。両方未設定かつ非 strict の
 /// 場合のみコーパス生成前に早期 return して成功終了する。strict モードでは
 /// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。ログには
-/// 実測値と pass/fail のみを出力し、注入された閾値の数値は出力しない。
+/// pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
 fn query_planning_recall_threshold_gate() {
@@ -769,9 +765,7 @@ fn query_planning_recall_threshold_gate() {
         Some(min) => {
             let pass_intent = intent_improvement >= min;
             pass &= pass_intent;
-            println!(
-                "query_planning_recall_threshold_gate: intent_improvement@20={intent_improvement:.4} pass_intent={pass_intent}"
-            );
+            println!("query_planning_recall_threshold_gate: pass_intent={pass_intent}");
         }
         None => {
             println!(
@@ -783,9 +777,7 @@ fn query_planning_recall_threshold_gate() {
         Some(min) => {
             let pass_direct = direct_after_recall20 >= min;
             pass &= pass_direct;
-            println!(
-                "query_planning_recall_threshold_gate: direct_after_recall@20={direct_after_recall20:.4} pass_direct={pass_direct}"
-            );
+            println!("query_planning_recall_threshold_gate: pass_direct={pass_direct}");
         }
         None => {
             println!(
