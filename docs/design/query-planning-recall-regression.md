@@ -1,8 +1,8 @@
-# ADR: クエリ展開の受け入れ基準回帰ハーネス（TASK-112）
+# ADR: クエリ展開の受け入れ基準回帰ハーネス（TASK-112・TASK-113）
 
 - ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
-- 対応: TASK-112（`docs/spec/05-tasks.md`・`docs/spec/06-roadmap.md` 参照）
-- 対象ビヘイビア: PLAN-1, PLAN-2（`docs/spec/04-behavior/query-planning.md`）
+- 対応: TASK-112・TASK-113（`docs/spec/05-tasks.md`・`docs/spec/06-roadmap.md` 参照）
+- 対象ビヘイビア: PLAN-1, PLAN-2, PLAN-3（`docs/spec/04-behavior/query-planning.md`）
 - 前提: TASK-110（クエリ展開クライアント `crates/engine/src/query_planner.rs`。
   常駐 LLM プロセス〔Ollama〕への注入型 `LlmClient`、`render_full_prompt` →
   `LlmClient::complete` → `parse_expansion` の一連）・TASK-111（ソフトブースト
@@ -81,13 +81,43 @@
 実行境界）はそのまま踏襲する（`docs/design/hybrid-recall-regression.md`「2 層構成」
 参照）。
 
+### 大規模段（TASK-113・PLAN-3。数万チャンク規模）
+
+小規模段と同じ生成・測定ロジック（`generate_corpus`/`measure_category_recall`/
+`MockLlmClient`）をそのまま再利用し、規模だけを変えたフィクスチャ定数
+（`LARGE_NUM_DOCS`/`LARGE_NUM_PAIRS`/`LARGE_VOCAB_SIZE`/`LARGE_SEED`。本ファイル
+固有の値。spec の実測コーパス件数は転記しない）で `direct` カテゴリのみを追加
+測定する。**対象を `direct` に限定する理由**: PLAN-3 が要求するスケール条件付き
+基準は `direct` カテゴリのものであり、`intent` の大規模測定は本タスクのスコープ外
+（「既知の制約・スコープ外」参照）。加えて密チャネルは総当たり
+（`LARGE_NUM_DOCS × LARGE_VOCAB_SIZE` オーダの積和）のため、測定対象を 1 カテゴリ
+に絞ることで `rerank_recall.rs::rerank_recall_large_scale_regression`（TASK-108）と
+同オーダの実行時間に収めている。
+
+- **層 A**（`query_planning_recall_large_scale_regression`。PR CI 常時実行）:
+  小規模段と同じ理由で絶対数値はコード・標準出力に残さず、相対関係のみを
+  アサートする。「展開が数万規模でも direct の既存の強みを破壊しない」
+  （`after_hits20 >= baseline_hits20`。PLAN-2 と同じ性質の大規模段確認）と、
+  `MockLlmClient` の無変換パススルー性質から導かれる `after_hits20 ==
+  baseline_hits20`（小規模段の `query_planning_recall_regression` と同じ完全一致
+  性質）を独立にアサートする
+- **層 B**（`query_planning_recall_large_scale_threshold_gate`。`#[ignore]`。
+  `make query-planning-regression` 経由）: 新規の spec 由来下限
+  `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`（`docs/spec/04-behavior/search.md`
+  SEARCH-2 のスケール条件付き基準に対応する絶対下限。`.github/workflows/
+  recall.yml` の同一 job・同一 environment `recall-gate` から注入）と大規模段
+  `direct` の after Recall@20 を比較する閾値ゲート。既存の
+  `resolve_gate_threshold`（`(0.0, 1.0]` 検証・strict モード fail-closed）を
+  そのまま再利用し、実装・運用契約を小規模段の層 B とドリフトさせない
+
 ## 既知の制約・スコープ外
 
 - 実 Ollama 接続での実測は対象外（TASK-110 時点からの継続制約）。本ハーネスの
   スタブ `LlmClient` は「LLM 出力の受理契約（`parse_expansion` の fail-closed
   検証）を通した上でクエリ展開の効果を測定する」という設計目的のみを満たす
 - 数万チャンク規模ケース（`docs/spec/04-behavior/search.md` のスケール条件付き
-  基準）の追加は TASK-113 が本ファイルへ後続で追加する
+  基準）は TASK-113 で `direct` カテゴリ限定として追加済み（上記「大規模段」参照）。
+  `intent` カテゴリの大規模測定は本タスクのスコープ外として継続する
 - `search_query:` プレフィックス再埋め込み（TASK-114）は未実装のため、本テストの
   再構成クエリは埋め込みの使い回しではなく合成 one-hot ベクトルの再合成で代替する
 - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了（TASK-104/TASK-108

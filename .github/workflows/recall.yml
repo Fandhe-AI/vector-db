@@ -183,6 +183,13 @@ jobs:
         # `docs/design/query-planning-recall-regression.md` 参照）ため、劣化展開
         # シナリオ専用の下限として独立に追加した変数。
         #
+        # `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE` は TASK-113（PLAN-3）の
+        # 大規模段（`crates/engine/tests/query_planning_recall.rs::
+        # query_planning_recall_large_scale_threshold_gate`）専用の direct
+        # カテゴリ絶対下限（`docs/spec/04-behavior/search.md` SEARCH-2 のスケール
+        # 条件付き基準に対応）。小規模段の `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`
+        # とは別コーパス規模・別変数として独立に解決する。
+        #
         # `QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント
         # 参照）を常に注入する: `QUERY_PLANNING_RECALL_MIN_*` が未設定の場合、この
         # workflow からの実行では fail-closed でテスト失敗とし、「一度も評価して
@@ -199,4 +206,6 @@ jobs:
           QUERY_PLANNING_RECALL_MIN_R20_DIRECT: ${{ vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT }}
           QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED: ${{
             vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED }}
+          QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE: ${{
+            vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
         run: make query-planning-regression

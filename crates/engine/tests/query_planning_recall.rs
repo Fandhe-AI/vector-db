@@ -1,5 +1,6 @@
-//! TASK-112（対象ビヘイビア: PLAN-1, PLAN-2。ポインタ: `docs/spec/05-tasks.md`
-//! TASK-112・`docs/spec/04-behavior/query-planning.md` PLAN-1, PLAN-2）。
+//! TASK-112・TASK-113（対象ビヘイビア: PLAN-1, PLAN-2, PLAN-3。ポインタ: `docs/spec/
+//! 05-tasks.md` TASK-112・TASK-113・`docs/spec/04-behavior/query-planning.md`
+//! PLAN-1, PLAN-2, PLAN-3）。
 //!
 //! TASK-110（クエリ展開クライアント `crates/engine/src/query_planner.rs`）が返す
 //! [`QueryExpansion`] が、実際に検索 Recall@20 を改善するかどうかを実測する受け入れ
@@ -59,10 +60,16 @@
 //!   `docs/design/query-planning-recall-regression.md` 参照。値そのものは
 //!   引き続き spec・オーナー側の判断事項）
 //!
+//! **大規模段**（TASK-113・PLAN-3。数万チャンク規模の合成コーパスに対する `direct`
+//! カテゴリ限定の Recall 回帰。intent の大規模測定はスコープ外）も同じ 2 層構成を
+//! 踏襲する: 層 A（[`query_planning_recall_large_scale_regression`]）は相対関係
+//! のみをアサートし、層 B（[`query_planning_recall_large_scale_threshold_gate`]）は
+//! `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`（`docs/spec/04-behavior/search.md`
+//! SEARCH-2 のスケール条件付き基準に対応する絶対下限）と比較する。
+//!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 実 Ollama 接続での実測は対象外（TASK-110 時点からの継続制約。本テストは
 //!   決定的スタブ `LlmClient` で LLM 出力の受理契約のみを固定する）
-//! - 数万チャンク規模ケースの追加は TASK-113 が本ファイルへ後続で追加する
 //! - `search_query:` プレフィックス再埋め込み（TASK-114）は未実装のため、本テストの
 //!   再構成クエリは埋め込みの使い回しではなく合成 one-hot ベクトルの再合成で代替する
 //! - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了（`hybrid_recall.rs`
@@ -758,6 +765,79 @@ fn query_planning_recall_detects_degraded_expansion_quality() {
     );
 }
 
+// ---------- 層 A/B 大規模段（数万件オーダ。TASK-113・PLAN-3。direct カテゴリのみ対象） ----------
+
+/// 大規模段専用のコーパス規模（`hybrid_recall.rs`/`rerank_recall.rs` の `LARGE_*` と
+/// 同じ役割の本ファイル固有フィクスチャ定数。spec の実測コーパス件数の転記はしない）。
+/// PLAN-3 の対象は `direct` カテゴリのみ（intent の大規模測定はスコープ外。
+/// ファイル冒頭「既知の制約」参照）のため、密チャネルの総当たり演算量
+/// （`LARGE_NUM_DOCS × LARGE_VOCAB_SIZE` オーダ）を `rerank_recall.rs::
+/// rerank_recall_large_scale_regression` と同オーダに収めつつペア数を絞る。
+const LARGE_NUM_DOCS: usize = 40_000;
+const LARGE_NUM_PAIRS: usize = 50;
+const LARGE_VOCAB_SIZE: usize = 1_000;
+// `hybrid_recall.rs::LARGE_SEED`/`rerank_recall.rs::LARGE_SEED` とは異なる本ファイル
+// 固有の専用シード（`SEED` 定数とも別値。他ファイル・本ファイル内の他コーパスと
+// 値が重複しないようにする）。
+const LARGE_SEED: u64 = 0x5EED_0113_504C_414E;
+
+/// TASK-113（PLAN-3）層 A: 大規模コーパス（数万件オーダ）で `direct` カテゴリの
+/// baseline（展開なし）・after（展開あり）Recall@20 を実測する。本ファイルの既存
+/// 方針（ファイル冒頭コメント参照）を踏襲し、絶対数値の固定値アサーション・実測値の
+/// 標準出力は行わず、相対関係のみをアサートする: 「展開が数万規模でも direct の
+/// 既存の強みを破壊しない」（PLAN-2 と同じ性質を大規模段でも独立に確認する。
+/// `MockLlmClient` は direct 語彙を無変換で通すため理論上完全一致になる）。
+#[test]
+fn query_planning_recall_large_scale_regression() {
+    let (docs, pairs) = generate_corpus(
+        LARGE_SEED,
+        LARGE_NUM_DOCS,
+        LARGE_NUM_PAIRS,
+        LARGE_VOCAB_SIZE,
+    );
+    assert_corpus_within_limits(&docs);
+    assert!(!pairs.is_empty());
+    for pair in &pairs {
+        assert!(!pair.correct.is_empty());
+    }
+
+    let direct = measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline);
+
+    // 実測の Recall・hit 数は標準出力（public な CI ログ）へ出さない。固定構成
+    // （docs/pairs/vocab は本ファイルのフィクスチャ定数であり実測値ではない）のみ出力する。
+    println!(
+        "=== TASK-113 大規模段 Recall（docs={} pairs={} vocab={}） ===",
+        docs.len(),
+        pairs.len(),
+        LARGE_VOCAB_SIZE
+    );
+
+    assert_eq!(
+        direct.total_correct,
+        pairs.iter().map(|p| p.correct.len()).sum::<usize>()
+    );
+    assert_eq!(
+        direct.ceil20,
+        pairs.iter().map(|p| p.correct.len().min(20)).sum::<usize>()
+    );
+    assert!(
+        direct.baseline_hits20 > 0,
+        "大規模段 direct baseline の Recall@20 hit 数が 0 だった"
+    );
+    // PLAN-2 と同じ性質（展開が既存の強みを破壊しない）を大規模段でも独立に確認する。
+    assert!(
+        direct.after_hits20 >= direct.baseline_hits20,
+        "大規模段 direct カテゴリで展開ありの Recall@20 が展開なしを下回った"
+    );
+    // direct カテゴリは `MockLlmClient` が語彙を無変換で通すため、展開の有無で
+    // Recall@20 hit 数が理論上完全一致する（小規模段の
+    // `query_planning_recall_regression` と同じ性質を大規模段でも確認する）。
+    assert_eq!(
+        direct.after_hits20, direct.baseline_hits20,
+        "大規模段 direct カテゴリで展開ありが展開なしと一致しなかった（MockLlmClient の無変換パススルー性質が崩れた）"
+    );
+}
+
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make query-planning-regression` 専用） ----------
 
 /// `QUERY_PLANNING_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` または `[0.0, 1.0]` の
@@ -967,5 +1047,42 @@ fn query_planning_recall_threshold_gate() {
     assert!(
         pass,
         "intent recall improvement, direct after-expansion recall@20, or degraded-expansion intent recall improvement is below the configured QUERY_PLANNING_RECALL_MIN_* threshold"
+    );
+}
+
+/// TASK-113（PLAN-3）層 B: 大規模段（数万件オーダ）の `direct` カテゴリ after
+/// Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`（絶対下限。
+/// `docs/spec/04-behavior/search.md` SEARCH-2 のスケール条件付き基準に対応）以上で
+/// あることを確認する閾値ゲート。契約は [`query_planning_recall_threshold_gate`]・
+/// `rerank_recall.rs::rerank_recall_large_scale_threshold_gate` と同型（未設定かつ
+/// 非 strict の場合はコーパス生成前に早期 return して成功終了する。strict モードでは
+/// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。ログには
+/// pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない
+/// （本ファイルの既存方針。ファイル冒頭コメント参照）。
+#[test]
+#[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
+fn query_planning_recall_large_scale_threshold_gate() {
+    let min_r20_direct_large = resolve_gate_threshold("QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE");
+
+    let Some(min) = min_r20_direct_large else {
+        println!(
+            "query_planning_recall_large_scale_threshold_gate: QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE not configured; gate not enabled (explicit no-op, not a failure)"
+        );
+        return;
+    };
+
+    let (docs, pairs) = generate_corpus(
+        LARGE_SEED,
+        LARGE_NUM_DOCS,
+        LARGE_NUM_PAIRS,
+        LARGE_VOCAB_SIZE,
+    );
+    let direct = measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline);
+    let pass = direct.after_recall20() >= min;
+    println!("query_planning_recall_large_scale_threshold_gate: pass={pass}");
+
+    assert!(
+        pass,
+        "large-scale direct after-expansion recall@20 is below the configured QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE threshold"
     );
 }
