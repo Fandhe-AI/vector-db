@@ -797,6 +797,18 @@ impl From<crate::query_planner::PlanError> for CoreError {
     }
 }
 
+/// [`EngineCore::query_planner`] が保持する注入形態（TASK-115・PLAN-8）。単一クライアント
+/// （TASK-110 の既存契約。[`EngineCore::with_query_planner`]）と、質問類型（`crate::tiering`）
+/// に応じてティア別クライアントを振り分ける構成（[`EngineCore::with_tiered_query_planner`]）の
+/// 二択を型で表し、両方同時設定という不整合状態を作れなくする。
+enum PlannerBinding {
+    /// TASK-110 時点の単一クライアント注入（既存の [`EngineCore::with_query_planner`]・
+    /// [`EngineCore::plan_query`] の挙動・契約を変えない）。
+    Single(Box<dyn crate::query_planner::LlmClient>),
+    /// TASK-115・PLAN-8 のティア別クライアント注入（`crate::tiering::TieredPlanner`）。
+    Tiered(crate::tiering::TieredPlanner),
+}
+
 impl From<StorageError> for CoreError {
     fn from(e: StorageError) -> Self {
         CoreError::Storage(e)
@@ -895,11 +907,15 @@ pub struct EngineCore {
     /// 拒否する契約（既定で参照実装を暗黙採用しない。`embedding.rs` モジュール
     /// ドキュメント参照）。差し替えは [`Self::with_embedder`] のみ。
     embedder: Option<Box<dyn crate::embedding::Embedder>>,
-    /// LLM クエリプランニング（TASK-110・PLAN-1）のクエリ展開クライアント注入点。
-    /// 未設定（`None`）は [`Self::plan_query`] を fail-closed に拒否する契約
-    /// （`embedder` と同じ流儀。既定で参照実装を暗黙採用しない）。差し替えは
-    /// [`Self::with_query_planner`] のみ。
-    query_planner: Option<Box<dyn crate::query_planner::LlmClient>>,
+    /// LLM クエリプランニング（TASK-110・PLAN-1／TASK-115・PLAN-8）のクエリ展開
+    /// クライアント注入点。未設定（`None`）は [`Self::plan_query`] を fail-closed に
+    /// 拒否する契約（`embedder` と同じ流儀。既定で参照実装を暗黙採用しない）。
+    /// 単一クライアント注入（[`Self::with_query_planner`]）とティア別クライアント注入
+    /// （[`Self::with_tiered_query_planner`]・TASK-115・`crate::tiering`）のどちらか
+    /// 一方のみを保持する契約を [`PlannerBinding`] の型で表す（両方同時設定という
+    /// 不整合状態を型で作れなくする。`Option<PlannerBinding>` の内側に 2 つ目の
+    /// `Option` を並べる設計だと両方 `Some` の状態を許してしまうため採らない）。
+    query_planner: Option<PlannerBinding>,
     /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定（TASK-120）。
     /// 差し替えは [`Self::with_incremental_config`] のみ。
     incremental_config: crate::incremental::IncrementalConfig,
@@ -1008,7 +1024,27 @@ impl EngineCore {
     /// ビルダーメソッドとし、[`Self::with_embedder`] と同じ流儀。未呼び出しなら
     /// `None` のままで、[`Self::plan_query`] は fail-closed に拒否される）。
     pub fn with_query_planner(mut self, client: Box<dyn crate::query_planner::LlmClient>) -> Self {
-        self.query_planner = Some(client);
+        self.query_planner = Some(PlannerBinding::Single(client));
+        self
+    }
+
+    /// 質問類型推定・ティアリング（TASK-115・PLAN-8）に基づき、対話ティア／高精度
+    /// ティアそれぞれの [`crate::query_planner::LlmClient`] を注入したビルダーを返す
+    /// （所有権を消費するビルダーメソッドとし、[`Self::with_query_planner`] と同じ流儀。
+    /// [`Self::with_query_planner`] と排他: 後に呼んだ側が [`Self::query_planner`] を
+    /// 上書きする。判定基準 [`crate::tiering::TieringCriteria`] は差し替え可能な既定値
+    /// （最終確定はオーナー判断待ち。`docs/design/query-tiering-criteria.md` 参照）。
+    pub fn with_tiered_query_planner(
+        mut self,
+        dialogue: Box<dyn crate::query_planner::LlmClient>,
+        high_precision: Box<dyn crate::query_planner::LlmClient>,
+        criteria: crate::tiering::TieringCriteria,
+    ) -> Self {
+        self.query_planner = Some(PlannerBinding::Tiered(crate::tiering::TieredPlanner::new(
+            dialogue,
+            high_precision,
+            criteria,
+        )));
         self
     }
 
@@ -1280,16 +1316,52 @@ impl EngineCore {
         table: &str,
         question: &str,
     ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
-        let client = self
+        let (expansion, _classification) =
+            self.plan_query_with_classification(ctx, table, question)?;
+        Ok(expansion)
+    }
+
+    /// [`Self::plan_query`] と同じ契約に加え、[`Self::query_planner`] が
+    /// [`PlannerBinding::Tiered`] 構成の場合に採用した質問類型・ティア
+    /// （[`crate::tiering::Classification`]）も `Some` で返す（TASK-115・PLAN-8。
+    /// TASK-116 のティア別レイテンシ検証、将来の EXPLAIN 露出〔SQL-6・PLAN-11／
+    /// TASK-164〕の足場）。[`PlannerBinding::Single`] 構成の場合は分類自体を行わず
+    /// `None` を返す（単一クライアントへそのまま委譲する `Self::plan_query` の既存
+    /// 挙動を変えないため）。
+    ///
+    /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
+    /// `Self::plan_query`・`Self::dictionary_snapshot` と同じ理由）。
+    pub fn plan_query_with_classification(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+    ) -> Result<
+        (
+            crate::query_planner::QueryExpansion,
+            Option<crate::tiering::Classification>,
+        ),
+        CoreError,
+    > {
+        let binding = self
             .query_planner
-            .as_deref()
+            .as_ref()
             .ok_or(CoreError::QueryPlannerUnavailable)?;
         let dictionary = self.dictionary_snapshot(ctx, table)?;
+
+        let (client, classification): (&dyn crate::query_planner::LlmClient, _) = match binding {
+            PlannerBinding::Single(client) => (client.as_ref(), None),
+            PlannerBinding::Tiered(tiered) => {
+                let (client, classification) = tiered.select(question, &dictionary);
+                (client, Some(classification))
+            }
+        };
+
         let prefix = crate::query_planner::render_prompt_prefix(&dictionary);
         let prompt = crate::query_planner::render_full_prompt(&prefix, question)?;
         let response = client.complete(&prompt)?;
         let expansion = crate::query_planner::parse_expansion(&response)?;
-        Ok(expansion)
+        Ok((expansion, classification))
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
