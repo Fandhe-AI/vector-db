@@ -298,29 +298,42 @@ fn write_users_file(path: &Path) {
 // --- クライアント実行ヘルパー（`tests/three_client_e2e.rs` と同型） -----------------
 
 fn run_psql(port: u16, sql: &str) -> Vec<String> {
+    run_psql_session(port, &[], sql)
+}
+
+/// psql（無改造）で `prelude` の各文を先に実行してから `sql` を実行し、`sql` の
+/// 結果行を `run_psql` と同じ `|` 区切りの集合として返す（同一接続でのセッション
+/// 複数文検証。`tests/three_client_e2e.rs::run_psql_session` と同型）。
+fn run_psql_session(port: u16, prelude: &[&str], sql: &str) -> Vec<String> {
     let psql = resolve_tool("PSQL_BIN", "psql");
+    let mut args: Vec<String> = vec![
+        "-h".into(),
+        "127.0.0.1".into(),
+        "-p".into(),
+        port.to_string(),
+        "-U".into(),
+        "alice".into(),
+        "-d".into(),
+        "irrelevant-db-name".into(),
+        "-X".into(),
+        "-w".into(),
+        "-q".into(),
+        "-At".into(),
+        "-F".into(),
+        "|".into(),
+        "-v".into(),
+        "ON_ERROR_STOP=1".into(),
+    ];
+    for stmt in prelude {
+        args.push("-c".into());
+        args.push((*stmt).into());
+    }
+    args.push("-c".into());
+    args.push(sql.into());
+
     let output = Command::new(&psql)
         .env("PGPASSWORD", "pw-alice")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "alice",
-            "-d",
-            "irrelevant-db-name",
-            "-X",
-            "-w",
-            "-q",
-            "-At",
-            "-F",
-            "|",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            sql,
-        ])
+        .args(&args)
         .output()
         .unwrap_or_else(|e| {
             panic!("failed to spawn {psql} (install libpq-client tools or set PSQL_BIN): {e}")
@@ -338,21 +351,37 @@ fn run_psql(port: u16, sql: &str) -> Vec<String> {
 }
 
 fn spawn_psycopg_client(port: u16, sql: &str) -> std::process::Output {
+    spawn_psycopg_client_session(port, &[], sql)
+}
+
+/// `psycopg_client.py` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の
+/// 各文を同一接続で先行実行してから `sql` を実行する（`spawn_psycopg_client` は
+/// 本関数の prelude 無しの薄いラッパー。`tests/three_client_e2e.rs` と同型）。
+fn spawn_psycopg_client_session(port: u16, prelude: &[&str], sql: &str) -> std::process::Output {
     let python = resolve_tool("PYTHON_BIN", "python3");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/psycopg_client.py");
-    Command::new(&python)
-        .arg(&script)
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
         .env("WIRE_HOST", "127.0.0.1")
         .env("WIRE_PORT", port.to_string())
         .env("WIRE_USER", "alice")
         .env("WIRE_PASSWORD", "pw-alice")
-        .env("WIRE_SQL", sql)
-        .output()
+        .env("WIRE_SQL", sql);
+    if !prelude.is_empty() {
+        let prelude_json =
+            serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
+        cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn {python}: {e}"))
 }
 
 fn run_psycopg(port: u16, sql: &str) -> Vec<String> {
-    let output = spawn_psycopg_client(port, sql);
+    run_psycopg_session(port, &[], sql)
+}
+
+fn run_psycopg_session(port: u16, prelude: &[&str], sql: &str) -> Vec<String> {
+    let output = spawn_psycopg_client_session(port, prelude, sql);
     assert!(
         output.status.success(),
         "psycopg_client.py failed (install psycopg via `pip install psycopg[binary]` or set \
@@ -367,21 +396,37 @@ fn run_psycopg(port: u16, sql: &str) -> Vec<String> {
 }
 
 fn spawn_pg_client(port: u16, sql: &str) -> std::process::Output {
+    spawn_pg_client_session(port, &[], sql)
+}
+
+/// `pg_client.js` に `WIRE_SQL_PRELUDE`（JSON 配列）を渡し、`prelude` の各文を
+/// 同一接続で先行実行してから `sql` を実行する（`spawn_pg_client` は本関数の
+/// prelude 無しの薄いラッパー。`tests/three_client_e2e.rs` と同型）。
+fn spawn_pg_client_session(port: u16, prelude: &[&str], sql: &str) -> std::process::Output {
     let node = resolve_tool("NODE_BIN", "node");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/three_client/pg_client.js");
-    Command::new(&node)
-        .arg(&script)
+    let mut cmd = Command::new(&node);
+    cmd.arg(&script)
         .env("WIRE_HOST", "127.0.0.1")
         .env("WIRE_PORT", port.to_string())
         .env("WIRE_USER", "alice")
         .env("WIRE_PASSWORD", "pw-alice")
-        .env("WIRE_SQL", sql)
-        .output()
+        .env("WIRE_SQL", sql);
+    if !prelude.is_empty() {
+        let prelude_json =
+            serde_json_prelude(prelude).expect("prelude statements must encode as a JSON array");
+        cmd.env("WIRE_SQL_PRELUDE", prelude_json);
+    }
+    cmd.output()
         .unwrap_or_else(|e| panic!("failed to spawn {node}: {e}"))
 }
 
 fn run_pg(port: u16, sql: &str) -> Vec<String> {
-    let output = spawn_pg_client(port, sql);
+    run_pg_session(port, &[], sql)
+}
+
+fn run_pg_session(port: u16, prelude: &[&str], sql: &str) -> Vec<String> {
+    let output = spawn_pg_client_session(port, prelude, sql);
     assert!(
         output.status.success(),
         "pg_client.js failed (install pg via `npm install pg` or set NODE_BIN): stderr={}",
@@ -392,6 +437,27 @@ fn run_pg(port: u16, sql: &str) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect()
+}
+
+/// `["a","b"]` 形式の最小 JSON エンコーダ（依存追加なしで `WIRE_SQL_PRELUDE` を
+/// 組み立てる。`prelude` は本ファイル内の定数リテラルのみを渡す前提で、
+/// 制御文字・バックスラッシュを含まない SQL 文だけを扱う。`tests/three_client_e2e.rs`
+/// の同名関数と同型）。
+fn serde_json_prelude(statements: &[&str]) -> Option<String> {
+    let mut out = String::from("[");
+    for (i, stmt) in statements.iter().enumerate() {
+        if stmt.contains('\\') || stmt.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&stmt.replace('"', "\\\""));
+        out.push('"');
+    }
+    out.push(']');
+    Some(out)
 }
 
 /// 3 クライアントすべてで `sql` を実行し、結果集合が `expected` と一致することを
@@ -537,51 +603,32 @@ fn three_clients_run_create_function_then_call() {
     let call_sql = "SELECT id FROM docs WHERE udf_norm(embedding) < 1.5 \
                     ORDER BY embedding <=> '[1.0,0.0]' LIMIT 3";
     // 単一接続セッション内で複数文を送る（`run_*_session` 系の prelude 経由。
-    // `three_client_e2e.rs` と同じ複数文セッション方式）。
+    // `three_client_e2e.rs` と同じ複数文セッション方式）。3 クライアントいずれも
+    // `CREATE FUNCTION` を先行実行してから同一接続で本体クエリを送ることを
+    // 検証する（psql のみを検証しているとの指摘・PR #271 Bugbot コメントを
+    // 踏まえ psycopg・pg も同一セッション経路で確認する）。
     // `[1, 3, 2]`: 3 行とも `vec_norm(embedding) < 1.5` を満たす
     // （id=1≈0.906・id=2=1.0・id=3≈0.906）ため件数では判別できないが、順序
     // （`ORDER BY embedding <=> '[1.0,0.0]'`）は in-process engine オラクルで
     // 事前確認済み（`three_clients_run_hint_order` と同一コーパス・同一順序）。
     let expected: Vec<String> = vec!["1".to_string(), "3".to_string(), "2".to_string()];
+    let prelude = [create_sql];
 
-    let psql = resolve_tool("PSQL_BIN", "psql");
-    let output = Command::new(&psql)
-        .env("PGPASSWORD", "pw-alice")
-        .args([
-            "-h",
-            "127.0.0.1",
-            "-p",
-            &port.to_string(),
-            "-U",
-            "alice",
-            "-d",
-            "irrelevant-db-name",
-            "-X",
-            "-w",
-            "-q",
-            "-At",
-            "-F",
-            "|",
-            "-v",
-            "ON_ERROR_STOP=1",
-            "-c",
-            create_sql,
-            "-c",
-            call_sql,
-        ])
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {psql}: {e}"));
-    assert!(
-        output.status.success(),
-        "psql: CREATE FUNCTION + call session failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        run_psql_session(port, &prelude, call_sql),
+        expected,
+        "psql: unexpected UDF call result"
     );
-    let rows: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    assert_eq!(rows, expected, "psql: unexpected UDF call result");
+    assert_eq!(
+        run_psycopg_session(port, &prelude, call_sql),
+        expected,
+        "psycopg: unexpected UDF call result"
+    );
+    assert_eq!(
+        run_pg_session(port, &prelude, call_sql),
+        expected,
+        "pg: unexpected UDF call result"
+    );
 }
 
 /// SQL-10: `INSERT ... USING OPERATION_ID '<id>'` が 3 クライアントいずれからも
