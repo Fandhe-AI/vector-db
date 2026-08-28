@@ -157,18 +157,26 @@ pub fn encode_empty_query_response() -> Vec<u8> {
     msg
 }
 
-/// `ErrorResponse`（'E'）body の `S`（severity=`ERROR` 固定）/`C`（sqlstate）/`M`
-/// （message）の 3 フィールドを `body` へ書き込む。フィールド終端（末尾の NUL）・
-/// フレーム化（`E` タグ・長さ）は呼び出し元が行う。
+/// `ErrorResponse`（'E'）body の `S`（severity）/`C`（sqlstate）/`M`（message）の
+/// 3 フィールドを `body` へ書き込む。フィールド終端（末尾の NUL）・フレーム化
+/// （`E` タグ・長さ）は呼び出し元が行う。
+///
+/// `severity` は呼び出し元が明示的に決定した値をそのまま書き込む（本関数自身は
+/// `ErrorClass` 等から severity を判定しない）。接続を閉じる契約の分類
+/// （`ErrorClass::ConnectionLimitExceeded`＝`53300`）は `FATAL`、それ以外は
+/// `ERROR` を渡す契約（codex-review P1 指摘対応・PR #258。`crate::error_response`
+/// の呼び出し元が `severity_for` で決定し本関数へ渡す。写像を本関数側で持たせると
+/// `limits.rs::reject_too_many_connections` の独自実装〔`FATAL` 固定〕と分類の
+/// 判定基準が 2 箇所に分散するため、判定は呼び出し元に閉じる）。
 ///
 /// [`encode_error_response`] と `crate::error_response::encode_may_be_committed`
 /// （TASK-153・ERR-1。`D`（detail）フィールドを追加で運ぶ版）が共有する唯一の
 /// レイアウト実体（codex-review Low 指摘対応・PR #101。以前は両者が同じ
 /// S/C/M 書き込みをそれぞれ自前で複製しており、フィールドレイアウト変更時に
 /// 乖離しうる状態だった）。crate 内に限り公開する。
-pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, sqlstate: &str, message: &str) {
+pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, severity: &str, sqlstate: &str, message: &str) {
     body.push(b'S');
-    body.extend_from_slice(b"ERROR");
+    body.extend_from_slice(severity.as_bytes());
     body.push(0);
     body.push(b'C');
     body.extend_from_slice(sqlstate.as_bytes());
@@ -204,7 +212,7 @@ pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, sqlstate: &str, message: &st
 /// 本関数の入力自体は untrusted ではないが、同じ規律を踏襲する）。
 pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, EncodeError> {
     let mut body = Vec::new();
-    push_s_c_m_fields(&mut body, sqlstate, message);
+    push_s_c_m_fields(&mut body, "ERROR", sqlstate, message);
     body.push(0); // フィールド終端
     let total_len = frame_len(body.len())?;
     let mut msg = Vec::with_capacity(1 + body.len() + 4);
