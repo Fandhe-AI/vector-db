@@ -12,11 +12,11 @@
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CoreError, EngineCore};
-use engine::embedding::HashingEmbedder;
+use engine::embedding::{EmbedError, Embedder, HashingEmbedder};
 use engine::incremental::IncrementalConfig;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
-use engine::query_planner::{LlmClient, PlanError, QueryExpansion};
+use engine::query_planner::{render_reembedding_text, LlmClient, PlanError, QueryExpansion};
 use engine::storage::Storage;
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +56,21 @@ fn new_core_with_documents_table(
     path: &std::path::Path,
     planner: Box<dyn LlmClient>,
 ) -> EngineCore {
+    new_core_with_documents_table_and_embedder(
+        path,
+        planner,
+        Box::new(HashingEmbedder::new(DIM).expect("valid dim")),
+    )
+}
+
+/// [`new_core_with_documents_table`] の embedder 差し替え版（TASK-114・PLAN-10 の
+/// 再埋め込み検証用。スパイ `Embedder`・次元不一致検証など embedder 自体を
+/// 差し替えたいテストから使う）。
+fn new_core_with_documents_table_and_embedder(
+    path: &std::path::Path,
+    planner: Box<dyn LlmClient>,
+    embedder: Box<dyn Embedder>,
+) -> EngineCore {
     let storage = Storage::open(path).expect("open storage");
     storage
         .create_table(&TableSchema::new(
@@ -68,7 +83,7 @@ fn new_core_with_documents_table(
         ))
         .expect("create table");
     EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_embedder(embedder)
         .with_incremental_config(small_chunk_config())
         .with_query_planner(planner)
 }
@@ -325,4 +340,246 @@ fn plan_query_prefix_is_isolated_per_tenant() {
     assert!(!prompt_a.contains("only_in_tenant_b"));
     assert!(prompt_b.contains("only_in_tenant_b"));
     assert!(!prompt_b.contains("only_in_tenant_a"));
+}
+
+// =====================================================================================
+// TASK-114・PLAN-10: 再埋め込み規則（`EngineCore::plan_and_embed_query`）
+// =====================================================================================
+
+/// 埋め込み呼び出しを記録しつつ、実ベクトルは決定的な [`HashingEmbedder`] へ委譲する
+/// スパイ `Embedder`。TASK-114・PLAN-10 の「再埋め込みテキストが構造的に
+/// `render_reembedding_text` の出力と一致すること」「使い回し禁止」の検証に使う。
+struct SpyEmbedder {
+    inner: HashingEmbedder,
+    seen_texts: Arc<Mutex<Vec<String>>>,
+}
+
+impl Embedder for SpyEmbedder {
+    fn dim(&self) -> u32 {
+        self.inner.dim()
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        for t in texts {
+            self.seen_texts
+                .lock()
+                .expect("spy lock poisoned")
+                .push((*t).to_string());
+        }
+        self.inner.embed_batch(texts)
+    }
+}
+
+#[test]
+fn plan_and_embed_query_reembeds_expanded_text_with_search_query_prefix() {
+    let path = unique_db_path("plan-embed-basic");
+    let _guard = CleanupGuard(path.clone());
+    let seen_texts = Arc::new(Mutex::new(Vec::new()));
+    let core = new_core_with_documents_table_and_embedder(
+        &path,
+        Box::new(MockLlmClient {
+            response: FIXED_EXPANSION_JSON.to_string(),
+            seen_prompts: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Box::new(SpyEmbedder {
+            inner: HashingEmbedder::new(DIM).expect("valid dim"),
+            seen_texts: Arc::clone(&seen_texts),
+        }),
+    );
+    let ctx = tenant_ctx("tenant-a");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "src/x.rs", "pub fn run_batch() {}\n", "op-1"),
+    )
+    .expect("file insert should succeed");
+
+    let question = "how does batching work?";
+    let planned = core
+        .plan_and_embed_query(&ctx, "documents", question)
+        .expect("plan_and_embed_query should succeed");
+
+    // LLM 展開結果（TASK-110）が引き続き返ること。
+    assert_eq!(planned.expansion.search_terms, vec!["batch", "cache"]);
+
+    // 再埋め込みへ渡された最後のテキストが `render_reembedding_text` の出力と
+    // バイト一致し、`search_query: ` で始まり、モック LLM が返した展開語を含むこと。
+    let seen = seen_texts.lock().expect("spy lock poisoned");
+    let last = seen.last().expect("embed_batch should have been called");
+    assert_eq!(*last, render_reembedding_text(question, &planned.expansion));
+    assert!(last.starts_with("search_query: "));
+    assert!(last.contains("batch"));
+    assert!(last.contains("cache"));
+}
+
+#[test]
+fn plan_and_embed_query_does_not_reuse_raw_question_embedding() {
+    let path = unique_db_path("plan-embed-no-reuse");
+    let _guard = CleanupGuard(path.clone());
+    let core = new_core_with_documents_table(
+        &path,
+        Box::new(MockLlmClient {
+            response: FIXED_EXPANSION_JSON.to_string(),
+            seen_prompts: Arc::new(Mutex::new(Vec::new())),
+        }),
+    );
+    let ctx = tenant_ctx("tenant-a");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "src/x.rs", "pub fn run_batch() {}\n", "op-1"),
+    )
+    .expect("file insert should succeed");
+
+    let question = "how does batching work?";
+    let planned = core
+        .plan_and_embed_query(&ctx, "documents", question)
+        .expect("plan_and_embed_query should succeed");
+
+    let reference = HashingEmbedder::new(DIM).expect("valid dim");
+    let raw_question_vec = reference
+        .embed_batch(&[question])
+        .expect("embed_batch should succeed")
+        .pop()
+        .expect("one vector");
+    let expected_vec = reference
+        .embed_batch(&[render_reembedding_text(question, &planned.expansion).as_str()])
+        .expect("embed_batch should succeed")
+        .pop()
+        .expect("one vector");
+
+    assert_ne!(
+        planned.embedding, raw_question_vec,
+        "plan_and_embed_query must not reuse the raw question's embedding"
+    );
+    assert_eq!(
+        planned.embedding, expected_vec,
+        "plan_and_embed_query must embed the search_query:-prefixed expanded text"
+    );
+}
+
+#[test]
+fn plan_and_embed_query_rejects_when_no_embedder_configured() {
+    let path = unique_db_path("plan-embed-no-embedder");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    let seen_prompts = Arc::new(Mutex::new(Vec::new()));
+    // `with_embedder` を呼ばない EngineCore（未注入）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_query_planner(
+        Box::new(MockLlmClient {
+            response: FIXED_EXPANSION_JSON.to_string(),
+            seen_prompts: Arc::clone(&seen_prompts),
+        }),
+    );
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .plan_and_embed_query(&ctx, "documents", "anything")
+        .expect_err("plan_and_embed_query without a configured embedder must fail-closed");
+    assert!(matches!(err, CoreError::EmbedderUnavailable));
+    // embedder 未構成は LLM 呼び出しより前に検出され、LLM は一度も呼ばれない
+    // （`incremental.rs::chunk_phase` と同じ「高コスト I/O の前に構成不備を検出する」流儀）。
+    assert!(seen_prompts.lock().expect("mock lock poisoned").is_empty());
+}
+
+#[test]
+fn plan_and_embed_query_rejects_when_no_planner_configured() {
+    let path = unique_db_path("plan-embed-no-planner");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "documents",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+    // `with_query_planner` を呼ばない EngineCore（未注入）。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")));
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .plan_and_embed_query(&ctx, "documents", "anything")
+        .expect_err("plan_and_embed_query without a configured planner must fail-closed");
+    assert!(matches!(err, CoreError::QueryPlannerUnavailable));
+}
+
+#[test]
+fn plan_and_embed_query_rejects_embedder_table_dim_mismatch() {
+    let path = unique_db_path("plan-embed-dim-mismatch");
+    let _guard = CleanupGuard(path.clone());
+    // テーブル宣言次元 (DIM=32) と embedder 次元 (16) を意図的にずらす。
+    let mismatched_dim: u32 = 16;
+    let core = new_core_with_documents_table_and_embedder(
+        &path,
+        Box::new(MockLlmClient {
+            response: FIXED_EXPANSION_JSON.to_string(),
+            seen_prompts: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Box::new(HashingEmbedder::new(mismatched_dim).expect("valid dim")),
+    );
+    let ctx = tenant_ctx("tenant-a");
+
+    let err = core
+        .plan_and_embed_query(&ctx, "documents", "anything")
+        .expect_err("plan_and_embed_query must reject an embedder/table dim mismatch");
+    assert!(matches!(
+        err,
+        CoreError::QueryEmbedding(EmbedError::DimMismatch {
+            expected: DIM,
+            got: 16,
+        })
+    ));
+}
+
+#[test]
+fn plan_and_embed_query_does_not_embed_when_llm_expansion_fails() {
+    let path = unique_db_path("plan-embed-llm-fails");
+    let _guard = CleanupGuard(path.clone());
+    let seen_texts = Arc::new(Mutex::new(Vec::new()));
+    let core = new_core_with_documents_table_and_embedder(
+        &path,
+        Box::new(FailingLlmClient(PlanError::Unavailable)),
+        Box::new(SpyEmbedder {
+            inner: HashingEmbedder::new(DIM).expect("valid dim"),
+            seen_texts: Arc::clone(&seen_texts),
+        }),
+    );
+    let ctx = tenant_ctx("tenant-a");
+
+    core.execute_insert_sql(
+        &ctx,
+        &insert_file_sql("documents", "src/x.rs", "pub fn hello() {}\n", "op-1"),
+    )
+    .expect("file insert should succeed");
+    let calls_after_insert = seen_texts.lock().expect("spy lock poisoned").len();
+
+    let err = core
+        .plan_and_embed_query(&ctx, "documents", "anything")
+        .expect_err("plan_and_embed_query must propagate llm expansion failures");
+    assert!(matches!(
+        err,
+        CoreError::QueryPlanning(PlanError::Unavailable)
+    ));
+
+    // LLM 展開失敗時は再埋め込み（`embed_batch` の追加呼び出し）を一切行わない。
+    let calls_after_plan = seen_texts.lock().expect("spy lock poisoned").len();
+    assert_eq!(
+        calls_after_insert, calls_after_plan,
+        "embedder must not be called again after llm expansion fails"
+    );
 }

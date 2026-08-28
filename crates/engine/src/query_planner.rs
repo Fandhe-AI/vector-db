@@ -213,16 +213,23 @@ pub fn render_prompt_prefix(dictionary: &crate::dictionary::Dictionary) -> Strin
     out
 }
 
-/// `prefix`（[`render_prompt_prefix`] の出力）と untrusted な `question` から完全な
-/// プロンプトを組み立てる。`question` は制御文字（改行・タブを除く）を除去し
+/// untrusted な `question` から制御文字（改行・タブを除く）を除去し
 /// [`MAX_QUESTION_CHARS`] 文字で決定的に切り詰める（untrusted 入力の有界化。
-/// coding-rust.md）。
-pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanError> {
-    let sanitized: String = question
+/// coding-rust.md）。[`render_full_prompt`]・[`render_reembedding_text`]
+/// （TASK-114・PLAN-10）の両方が同じ切り詰め規則で質問文を扱うことを、コメントの
+/// 重複ではなく本関数の共有によって保証する。
+fn sanitize_question(question: &str) -> String {
+    question
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
         .take(MAX_QUESTION_CHARS)
-        .collect();
+        .collect()
+}
+
+/// `prefix`（[`render_prompt_prefix`] の出力）と untrusted な `question` から完全な
+/// プロンプトを組み立てる。`question` は [`sanitize_question`] で有界化する。
+pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanError> {
+    let sanitized = sanitize_question(question);
 
     let mut out = String::new();
     out.push_str(prefix);
@@ -234,6 +241,98 @@ pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanEr
         return Err(PlanError::PromptTooLarge);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 再埋め込み規則（TASK-114・PLAN-10）
+// ---------------------------------------------------------------------------
+
+/// 密ベクトル検索へ投入する再埋め込みテキストの先頭に付す固定接頭辞。
+///
+/// 既定埋め込みモデル `nomic-embed-text` が公開しているタスクプレフィックス規約
+/// （クエリ側は `search_query: `、ドキュメント側は `search_document: `）のうち
+/// クエリ側と一致させる（ポインタ: `docs/spec/05-tasks.md` TASK-114・
+/// `docs/spec/04-behavior/query-planning.md` PLAN-10）。
+pub const SEARCH_QUERY_PREFIX: &str = "search_query: ";
+
+/// LLM クエリ展開（[`QueryExpansion`]）の結果から、再埋め込み対象テキストを
+/// 決定的に合成する。
+///
+/// 合成規則: [`SEARCH_QUERY_PREFIX`] ＋ [`sanitize_question`] で有界化した質問文 ＋
+/// `expansion.search_terms` を半角スペース区切りで連結（`search_terms` が空なら
+/// 「プレフィックス＋質問」のみで成立するフォールバック）。`path_hint`・
+/// `kind_hint` はソフトヒント（RRF 融合後スコアへの加点等、TASK-111 の管轄）であり
+/// 埋め込み対象には含めない。
+///
+/// `expansion` はパース済み（[`parse_expansion`] 経由）であれば `search_terms` の
+/// 件数・各語長は [`MAX_SEARCH_TERMS`]・[`MAX_TERM_LEN`] 以内だが、本関数は
+/// `QueryExpansion` を直接構築する呼び出し元（テスト等）にも同じ上限を強制する
+/// （coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」。
+/// パース経路だけが守る前提に依存しない）。
+pub fn render_reembedding_text(question: &str, expansion: &QueryExpansion) -> String {
+    let sanitized_question = sanitize_question(question);
+
+    let mut out = String::with_capacity(SEARCH_QUERY_PREFIX.len() + sanitized_question.len());
+    out.push_str(SEARCH_QUERY_PREFIX);
+    out.push_str(&sanitized_question);
+
+    for term in expansion.search_terms.iter().take(MAX_SEARCH_TERMS) {
+        let bounded_term: String = term.chars().take(MAX_TERM_LEN).collect();
+        if bounded_term.is_empty() {
+            continue;
+        }
+        out.push(' ');
+        out.push_str(&bounded_term);
+    }
+
+    out
+}
+
+/// [`render_reembedding_text`] で合成したテキストを 1 件だけ [`Embedder::embed_batch`]
+/// （TASK-120）へ渡し、次元・件数を検証したベクトルを返す。
+///
+/// 呼び出し元は `core.rs::EngineCore::plan_and_embed_query`（TASK-114・PLAN-10）。
+/// **原質問を埋め込んだ既存ベクトルを引数に取らない**シグネチャとし、「LLM 展開前の
+/// 埋め込みをそのまま使い回す」経路を型レベルで構造的に排除する（再埋め込みの省略を
+/// 禁止する実装規則。`docs/spec/04-behavior/query-planning.md` PLAN-10）。
+///
+/// 埋め込みサービスからの戻り値は untrusted 応答として扱い、件数が 1 件でない・
+/// 次元が `embedder.dim()` と異なる場合は [`crate::embedding::EmbedError::InvalidResponse`]・
+/// [`crate::embedding::EmbedError::DimMismatch`] で fail-closed に拒否する
+/// （`embedding.rs` の「入力本文をエラーへ含めない」方針を踏襲し、質問文・展開語を
+/// エラーへ含めない）。
+pub fn reembed_expansion(
+    embedder: &dyn crate::embedding::Embedder,
+    question: &str,
+    expansion: &QueryExpansion,
+) -> Result<Vec<f32>, crate::embedding::EmbedError> {
+    let text = render_reembedding_text(question, expansion);
+    let mut vectors = embedder.embed_batch(&[text.as_str()])?;
+    if vectors.len() != 1 {
+        return Err(crate::embedding::EmbedError::InvalidResponse);
+    }
+    // `vectors.len() == 1` を確認済みのため `pop` は必ず `Some` を返すが、
+    // untrusted な `Embedder` 実装の契約違反を panic ではなく `Result` で扱う方針
+    // （coding-rust.md）を貫き、添字アクセスは使わない。
+    let vector = vectors
+        .pop()
+        .ok_or(crate::embedding::EmbedError::InvalidResponse)?;
+    let expected = embedder.dim();
+    if vector.len() != expected as usize {
+        return Err(crate::embedding::EmbedError::DimMismatch {
+            expected,
+            got: vector.len(),
+        });
+    }
+    Ok(vector)
+}
+
+/// [`crate::core::EngineCore::plan_and_embed_query`] の戻り値。LLM 展開結果と、
+/// [`reembed_expansion`] による再埋め込みベクトルの組。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedQuery {
+    pub expansion: QueryExpansion,
+    pub embedding: Vec<f32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1534,151 @@ mod tests {
         let prompt = render_full_prompt(prefix, &question).unwrap();
         let question_section = prompt.split("# Question\n").nth(1).unwrap();
         assert!(question_section.trim_end().chars().count() <= MAX_QUESTION_CHARS);
+    }
+
+    // --- 再埋め込み規則（TASK-114・PLAN-10） ---
+
+    fn sample_expansion() -> QueryExpansion {
+        QueryExpansion {
+            search_terms: vec!["batch".to_string(), "cache".to_string()],
+            path_hint: Some("src/".to_string()),
+            kind_hint: Some("fn".to_string()),
+        }
+    }
+
+    #[test]
+    fn render_reembedding_text_starts_with_search_query_prefix() {
+        let text = render_reembedding_text("how does batching work?", &sample_expansion());
+        assert!(text.starts_with(SEARCH_QUERY_PREFIX));
+    }
+
+    #[test]
+    fn render_reembedding_text_orders_question_then_terms() {
+        let text = render_reembedding_text("how does batching work?", &sample_expansion());
+        assert_eq!(text, "search_query: how does batching work? batch cache");
+    }
+
+    #[test]
+    fn render_reembedding_text_is_deterministic() {
+        let expansion = sample_expansion();
+        let a = render_reembedding_text("question", &expansion);
+        let b = render_reembedding_text("question", &expansion);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_reembedding_text_falls_back_to_prefix_and_question_when_no_terms() {
+        let expansion = QueryExpansion {
+            search_terms: vec![],
+            path_hint: None,
+            kind_hint: None,
+        };
+        let text = render_reembedding_text("bare question", &expansion);
+        assert_eq!(text, "search_query: bare question");
+    }
+
+    #[test]
+    fn render_reembedding_text_truncates_overlong_question() {
+        let expansion = sample_expansion();
+        // `x` は検索語（"batch"・"cache"）に出現しない文字のため、質問部分と
+        // 検索語部分の境界を空白分割で一意に切り出せる。
+        let question = "x".repeat(MAX_QUESTION_CHARS + 500);
+        let text = render_reembedding_text(&question, &expansion);
+        let question_part = text
+            .strip_prefix(SEARCH_QUERY_PREFIX)
+            .expect("must start with prefix");
+        // 質問部分（検索語より前の最初の空白区切りトークン）の文字数が
+        // ちょうど MAX_QUESTION_CHARS まで切り詰められていること
+        // （`take(MAX_QUESTION_CHARS)` による自明な再導出ではなく、実際の出力を
+        // 検証する）。
+        let question_segment = question_part.split(' ').next().expect("question segment");
+        assert_eq!(question_segment.chars().count(), MAX_QUESTION_CHARS);
+        assert!(question_segment.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn render_reembedding_text_ignores_path_and_kind_hints() {
+        let expansion = QueryExpansion {
+            search_terms: vec!["term".to_string()],
+            path_hint: Some("should/not/appear.rs".to_string()),
+            kind_hint: Some("struct".to_string()),
+        };
+        let text = render_reembedding_text("q", &expansion);
+        assert!(!text.contains("should/not/appear.rs"));
+        assert!(!text.contains("struct"));
+    }
+
+    #[test]
+    fn render_reembedding_text_bounds_hand_built_expansion_beyond_parse_limits() {
+        // `QueryExpansion` はパースを経由せずテストコードから直接構築できるため、
+        // `parse_expansion` の上限（`MAX_SEARCH_TERMS`・`MAX_TERM_LEN`）を超える値を
+        // 手で作っても本関数側で有界化されることを確認する。
+        let expansion = QueryExpansion {
+            search_terms: vec!["t".repeat(MAX_TERM_LEN + 50); MAX_SEARCH_TERMS + 10],
+            path_hint: None,
+            kind_hint: None,
+        };
+        let text = render_reembedding_text("q", &expansion);
+        let term_count = text
+            .split_whitespace()
+            .skip(2) // "search_query:" は空白込みでプレフィックス定数のため 1 語、"q" が質問。
+            .count();
+        assert!(term_count <= MAX_SEARCH_TERMS);
+        for term in text.split_whitespace().skip(2) {
+            assert!(term.chars().count() <= MAX_TERM_LEN);
+        }
+    }
+
+    struct StubEmbedder {
+        dim: u32,
+        response: Vec<Vec<f32>>,
+    }
+
+    impl crate::embedding::Embedder for StubEmbedder {
+        fn dim(&self) -> u32 {
+            self.dim
+        }
+
+        fn embed_batch(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+            Ok(self.response.clone())
+        }
+    }
+
+    #[test]
+    fn reembed_expansion_returns_vector_matching_embedder_dim() {
+        let embedder = crate::embedding::HashingEmbedder::new(16).expect("valid dim");
+        let vector =
+            reembed_expansion(&embedder, "how does batching work?", &sample_expansion()).unwrap();
+        assert_eq!(vector.len(), 16);
+    }
+
+    #[test]
+    fn reembed_expansion_rejects_wrong_output_count() {
+        let embedder = StubEmbedder {
+            dim: 8,
+            response: vec![vec![0.0; 8], vec![0.0; 8]],
+        };
+        let err = reembed_expansion(&embedder, "q", &sample_expansion()).unwrap_err();
+        assert_eq!(err, crate::embedding::EmbedError::InvalidResponse);
+    }
+
+    #[test]
+    fn reembed_expansion_rejects_dim_mismatch() {
+        let embedder = StubEmbedder {
+            dim: 8,
+            response: vec![vec![0.0; 4]],
+        };
+        let err = reembed_expansion(&embedder, "q", &sample_expansion()).unwrap_err();
+        assert_eq!(
+            err,
+            crate::embedding::EmbedError::DimMismatch {
+                expected: 8,
+                got: 4,
+            }
+        );
     }
 
     // --- 展開結果パース ---
