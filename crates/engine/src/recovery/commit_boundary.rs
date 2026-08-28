@@ -230,6 +230,22 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
     armed && panicking
 }
 
+/// このスレッドが現在「commit 成功後・応答未確定」の区間にあるかを読み取り専用で
+/// 照会する（TASK-97、対象ビヘイビア: RECOVER-6）。[`panic_hook`](crate::recovery::
+/// panic_hook) が panic フック内から呼び、緊急応答（`may_be_committed` を運ぶ
+/// ErrorResponse）を送出してよい状況かどうかの判定材料の一つに使う。
+///
+/// [`COMMIT_PENDING_RESPONSE`] をクリアしない・書き換えない（既存の
+/// [`ResponseBoundaryGuard`] の世代管理・abort 判定ロジックには一切影響しない）。
+/// 返り値は世代番号そのもの（`Some` なら pending 中）であり、呼び出し元
+/// （panic フック）は世代の一致判定をしない契約 ―― フックは panic が発生した
+/// スレッド上で実行されるため、そのスレッドに pending が立っていれば、それは
+/// 常にこの接続スレッド自身の commit に対応する（他スレッド・他接続の世代が
+/// 混入する余地がない。thread-local である本フラグの前提そのもの）。
+pub(crate) fn active_commit_pending_generation() -> Option<u64> {
+    COMMIT_PENDING_RESPONSE.with(|f| f.get())
+}
+
 /// commit 成功境界の公開 choke point（RECOVER-5）。`write_txn` は呼び出し元が
 /// pre-commit の検証・書き込みを終え、commit 直前まで組み立て済みのトランザクション
 /// を渡す契約（呼び出し元が `Err` を返す場合はこの関数を呼ばず `write_txn` を drop
