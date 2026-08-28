@@ -198,7 +198,9 @@ fn wire1_non_utf8_query_is_rejected_and_connection_closes() {
 
 /// 許可リスト外の構文（`42601`）はエラー応答後も接続を維持し、続くクエリが
 /// 成功すること（簡易クエリのエラーは切断しない。拡張クエリプロトコルの
-/// WIRE-8 切断契約とは独立）。
+/// WIRE-8 切断契約とは独立）。TASK-99（RECOVER-8）の「回復可能エラー
+/// （`Result::Err`）は ERR-1 応答後も処理継続」側の対応テスト（panic 側の
+/// fail-fast は `engine::recovery::fail_fast` を参照）。
 #[test]
 fn wire1_sql_error_keeps_connection_and_next_query_succeeds() {
     let (core, _guard) = new_core_single_tenant();
