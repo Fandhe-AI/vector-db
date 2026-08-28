@@ -54,3 +54,4 @@ pub mod rng;
 pub mod scalar_reference;
 pub mod sql_c1;
 pub mod stats;
+pub mod tier;

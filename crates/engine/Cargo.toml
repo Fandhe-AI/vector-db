@@ -136,3 +136,16 @@ test = false
 name = "sql_c1_bench"
 harness = false
 test = false
+
+[[bench]]
+# TASK-116（ティア別レイテンシ受け入れ基準の検証。対象ビヘイビア PLAN-4, PLAN-6,
+# PLAN-7）の実測入口。TASK-115（PLAN-8）の `EngineCore::with_tiered_query_planner`
+# 経由で対話ティア／高精度ティアそれぞれのクエリ展開追加処理時間 p95・展開込み
+# e2e p95 を実 Ollama 接続で測る。harness = false / test = false は上記ベンチと
+# 同一方針。`make bench-tier`（Makefile）・`.github/workflows/bench.yml`
+# （workflow_dispatch 限定・`BENCH_TIER` opt-in。常駐 Ollama 前提のため schedule
+# には載せない）から実行する。判定ロジック自体（時間非依存）は harness/tier.rs
+# にあり tests/tier_latency_accept.rs で make ci 側から回帰検証する。
+name = "tier_latency_bench"
+harness = false
+test = false

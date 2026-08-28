@@ -172,3 +172,44 @@ jobs:
           BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
           BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1
+
+  # --------------------------------------------------
+  # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準。
+  # workflow_dispatch 限定・BENCH_TIER opt-in）
+  # --------------------------------------------------
+  # 対話ティア／高精度ティアそれぞれのクエリ展開追加処理時間 p95・展開込み e2e
+  # p95 を、常駐 Ollama へ実接続して測定する。GitHub ホステッド runner には
+  # 常駐 Ollama が無いため、既定では `vars.BENCH_TIER` が未設定（空文字）のままで
+  # `tier_latency_bench.rs` 側が「測定不能」を明示ログ出力して判定対象外とする
+  # （silent skip にしない。`bench-batch` ジョブの BENCH_CORE6/BENCH_CORE16 opt-in
+  # と同一方針）。実測を行う場合は運用者が `gh variable set BENCH_TIER 1` に加え
+  # 下記の接続・閾値 repo variables を設定したうえで、常駐 Ollama を用意した
+  # セルフホスト環境等から本ワークフローを workflow_dispatch する。
+  bench-tier:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run bench-tier
+        # 数値基準（p95 上限）は spec（TASK-116・PLAN-4/6/7）が SSOT のため本
+        # ワークフローにはハードコードしない。接続先（host/port/model）も含め
+        # すべて repo variables から注入する。BENCH_TIER が未設定（空文字）の
+        # 既定では tier_latency_bench.rs 側が opt-in 未充足として明示ログを出し
+        # 判定対象外のまま正常終了する。
+        env:
+          BENCH_TIER: ${{ vars.BENCH_TIER }}
+          BENCH_TIER_OLLAMA_HOST: ${{ vars.BENCH_TIER_OLLAMA_HOST }}
+          BENCH_TIER_OLLAMA_PORT: ${{ vars.BENCH_TIER_OLLAMA_PORT }}
+          BENCH_TIER_DIALOGUE_MODEL: ${{ vars.BENCH_TIER_DIALOGUE_MODEL }}
+          BENCH_TIER_PRECISION_MODEL: ${{ vars.BENCH_TIER_PRECISION_MODEL }}
+          BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS: ${{ vars.BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS }}
+          BENCH_TIER_DIALOGUE_MAX_P95_MS: ${{ vars.BENCH_TIER_DIALOGUE_MAX_P95_MS }}
+          BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS: ${{ vars.BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS }}
+          BENCH_TIER_PRECISION_MAX_P95_MS: ${{ vars.BENCH_TIER_PRECISION_MAX_P95_MS }}
+        run: make bench-tier

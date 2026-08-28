@@ -105,6 +105,34 @@ gh variable set BENCH_SQL_C1_MIN_RECALL
 BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDICATED_ENV=1 make bench-c1
 ```
 
+### ティア別レイテンシ受け入れ基準の repo variables（TASK-116）
+
+`make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-115（PLAN-8）のティアリング機構が振り分ける対話ティア／高精度ティアそれぞれについて、クエリ展開の追加処理時間 p95（PLAN-4）と展開込みエンドツーエンド p95（PLAN-6/7。`USING PLAN('<query>')` 経由）を実測します。常駐 Ollama への実接続が前提のため、GitHub ホステッド runner 既定では `BENCH_TIER` repo variable が未設定（空文字）のままとし、`tier_latency_bench.rs` が「測定不能」を明示ログ出力して判定対象外のまま正常終了します（`BENCH_CORE6`/`BENCH_CORE16` と同じ opt-in 方式）。
+
+```bash
+gh variable set BENCH_TIER
+gh variable set BENCH_TIER_OLLAMA_HOST
+gh variable set BENCH_TIER_OLLAMA_PORT
+gh variable set BENCH_TIER_DIALOGUE_MODEL
+gh variable set BENCH_TIER_PRECISION_MODEL
+gh variable set BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS
+gh variable set BENCH_TIER_DIALOGUE_MAX_P95_MS
+gh variable set BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS
+gh variable set BENCH_TIER_PRECISION_MAX_P95_MS
+```
+
+形式は以下のとおりです（p95 上限の値そのものは spec 由来のため本リポジトリには記載しません）。
+
+| variable | 形式 |
+| -------- | ---- |
+| `BENCH_TIER` | 非空文字なら opt-in（例: `1`）。未設定・空文字は既定の「対象外」 |
+| `BENCH_TIER_OLLAMA_HOST` | ループバックアドレスまたはホスト名（`OllamaConfig::with_host` が非ループバック IP リテラルを拒否） |
+| `BENCH_TIER_OLLAMA_PORT` | `0`〜`65535` のポート番号 |
+| `BENCH_TIER_DIALOGUE_MODEL` / `BENCH_TIER_PRECISION_MODEL` | 空でないモデル名 |
+| `BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS` / `BENCH_TIER_DIALOGUE_MAX_P95_MS` / `BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS` / `BENCH_TIER_PRECISION_MAX_P95_MS` | 正の整数（単位: ms） |
+
+`BENCH_TIER` が opt-in された状態で上記接続・閾値 variables のいずれかが未設定・不正値だと、`tier_latency_bench.rs` は fail-closed で非ゼロ終了します。標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しません。加えて計測用質問（`DIALOGUE_QUESTION`/`PRECISION_QUESTION`）の実測ティアが意図したティアと一致するか（routing 実証）も判定に含め、不一致は閾値を満たしていても fail とします。`.github/workflows/bench.yml` の `bench-tier` ジョブは `workflow_dispatch` 限定で、常駐 Ollama 前提のため週次 `schedule` には含めません。設計判断の記録は `docs/design/tier-latency-acceptance.md` を参照してください。
+
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
 `.github/workflows/recall.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 04:00 UTC。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）を GitHub Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください（`gh api` または Settings > Environments）。
