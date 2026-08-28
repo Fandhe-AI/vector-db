@@ -796,7 +796,14 @@ fn query_planning_recall_large_scale_regression() {
         LARGE_VOCAB_SIZE,
     );
     assert_corpus_within_limits(&docs);
-    assert!(!pairs.is_empty());
+    // `pairs` が空でないことだけでは、生成ロジックやフィクスチャ分布の変更で
+    // QA セットが例えば 1 件まで縮小しても検出できない（PR #268 レビュー指摘）。
+    // 要求件数 `LARGE_NUM_PAIRS` と突き合わせ、大規模段の回帰カバレッジ縮小を検出する。
+    assert_eq!(
+        pairs.len(),
+        LARGE_NUM_PAIRS,
+        "生成された QA ペア数が LARGE_NUM_PAIRS と一致しない（フィクスチャ縮小の疑い）"
+    );
     for pair in &pairs {
         assert!(!pair.correct.is_empty());
     }
