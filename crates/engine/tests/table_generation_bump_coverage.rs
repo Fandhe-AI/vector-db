@@ -33,6 +33,12 @@
 //! 修飾を要求しない自己参照であり、上記の「import 漏れ検出」の対象外のため
 //! 裸名走査からは除外する（モジュール修飾つき呼び出しの走査は他ファイルと同様に
 //! 及ぶ）。
+//!
+//! `assert_no_commit_boundary_module_alias_import` はモジュール自体の alias
+//! import（`use ...commit_boundary as cb;`）のみを禁止しており、関数単位の alias
+//! import（`use ...commit_boundary::commit as finish;` → `finish(write_txn)`）は
+//! 対象外だった（codex-review P1 再指摘・PR #266）。`assert_no_commit_boundary_fn_alias_import`
+//! がこの経路も禁止し、alias import 全般を fail-closed に倒す。
 
 use std::path::{Path, PathBuf};
 
@@ -191,6 +197,75 @@ fn assert_no_commit_boundary_module_alias_import(rs_files: &[PathBuf], src_dir: 
     }
 }
 
+/// `use` 文の生文字列を、識別子（英数字・`_`）の並びだけを抜き出したトークン列へ
+/// 変換する。空白・改行・`::`・`{`/`}`/`,` はすべて区切りとして落ちるため、
+/// 複数行 `use` や `{commit as x, commit_and_finish}` のようなネスト braces を含む
+/// import リストでも、識別子の並びだけを見れば alias 記法（`<name> as <alias>`）を
+/// 一様に検出できる（[`assert_no_commit_boundary_fn_alias_import`] の下請け）。
+fn use_stmt_tokens(stmt: &str) -> Vec<&str> {
+    stmt.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 走査対象の全ファイル中に、`commit_boundary` の commit 系公開関数を「関数 alias
+/// import」（例: `use crate::recovery::commit_boundary::commit as finish;`）で
+/// 取り込む箇所が存在しないことを確認する。`line_has_bare_call` は import 元の
+/// 関数名（`name`）でしか呼び出し箇所を探索しないため、alias 経由の呼び出し
+/// （`finish(write_txn)`）は裸名走査からもモジュール修飾走査からも漏れる
+/// fail-open だった（codex-review P1 再指摘・PR #266）。ここでは `use` 文単位で
+/// 生文字列を `;` まで切り出し（`use` 文の中に `;` を含む式は現れないため単純な
+/// 文字列探索で安全に文の境界を取れる）、[`use_stmt_tokens`] でトークン化した上で
+/// `<commit 系関数名>` の直後トークンが `as` であるものを検出する。
+/// [`assert_no_commit_boundary_module_alias_import`]（モジュール自体の alias
+/// import 禁止）と対になり、alias 経路を包括的に禁止することで fail-closed に
+/// 倒す（alias が必要になった場合は本テストの走査ロジックへ対応を追加した上で
+/// 許可すること）。
+fn assert_no_commit_boundary_fn_alias_import(
+    rs_files: &[PathBuf],
+    src_dir: &Path,
+    commit_names: &[String],
+) {
+    for path in rs_files {
+        let rel_name = path
+            .strip_prefix(src_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel_name == COMMIT_BOUNDARY_MODULE_FILE {
+            continue;
+        }
+        let content = std::fs::read_to_string(path).expect("read source file");
+
+        let mut search_from = 0usize;
+        while let Some(rel) = content[search_from..].find("use ") {
+            let start = search_from + rel;
+            let after = &content[start..];
+            let Some(semi_rel) = after.find(';') else {
+                break;
+            };
+            let stmt = &after[..=semi_rel];
+            search_from = start + semi_rel + 1;
+
+            if !stmt.contains("commit_boundary") {
+                continue;
+            }
+            let tokens = use_stmt_tokens(stmt);
+            for window in tokens.windows(2) {
+                let [tok, next] = window else { continue };
+                if *next == "as" && commit_names.iter().any(|n| n == tok) {
+                    panic!(
+                        "{rel_name} imports commit_boundary::{tok} under an alias (`{tok} as \
+                         ...`), which escapes this test's \"commit_boundary::\"-prefixed and \
+                         bare-name call site scan; extend the scan logic before introducing an \
+                         alias import"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `line` 中の `name(` が、`use` で import した裸名の関数呼び出しであるかを判定する
 /// （モジュール修飾つき呼び出し `commit_boundary::name(` や、`.name(` のような
 /// メソッド呼び出し、`fn name(` のような定義行は対象外）。
@@ -240,6 +315,7 @@ fn every_commit_boundary_commit_call_bumps_table_generation_or_is_allowlisted() 
     );
     assert_commit_names_cover_by_value_write_txn_params(&src_dir, &commit_names);
     assert_no_commit_boundary_module_alias_import(&rs_files, &src_dir);
+    assert_no_commit_boundary_fn_alias_import(&rs_files, &src_dir, &commit_names);
     let prefixed_needles: Vec<String> = commit_names
         .iter()
         .map(|n| format!("commit_boundary::{n}("))
