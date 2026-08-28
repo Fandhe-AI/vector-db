@@ -184,6 +184,14 @@
 //! 拒否する。RLS 適用順序は TASK-166 の単一行経路と同一の規約を独立して踏襲し、
 //! 他テナントにしか存在しないグループ値が結果に現れないことを維持する（詳細は
 //! `sql/group_by.rs` モジュールドキュメント参照）。
+//!
+//! TASK-110（対象ビヘイビア: PLAN-1）: `query_planner.rs` が常駐 LLM プロセス
+//! （Ollama 等）に対するクエリ展開クライアント（`LlmClient` trait・実装
+//! `OllamaClient`・プロンプト組み立て・応答 JSON の厳格パース）を、依存追加なしの
+//! 自作 HTTP/1.1／JSON で提供する。`dictionary.rs`（TASK-109）の辞書スナップショットを
+//! 固定接頭辞コンテキストとして束ねる注入点は `core::EngineCore::with_query_planner` /
+//! `core::EngineCore::plan_query`（詳細は `query_planner.rs` モジュールドキュメント
+//! 参照）。展開結果はソフトヒントに限り、SQL・プラン文字列への未検証連結は行わない。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -206,6 +214,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod query_planner;
 pub mod recovery;
 pub mod rerank;
 pub mod rls;
