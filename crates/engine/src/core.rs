@@ -39,8 +39,12 @@
 //! `ContextMismatch`/`IndexStale` はいずれも「キャッシュを使わない」側へ縮退し
 //! （[`EngineCore::search_uncached`] を都度 1 回だけ呼ぶ）、stale なインデックスの
 //! 結果を返す経路を作らない（fail-closed。詳細は [`PrefilterCache`] のドキュメント
-//! 参照）。可視性判定・provider 結果の二重防御（構築時フィルタ＋
-//! `provider_result_is_valid`）はキャッシュ経路・非キャッシュ経路のいずれでも
+//! 参照）。構築完了から挿入までの間に世代が進んだ（挿入対象自身が stale になった）場合も
+//! 同様に [`PrefilterCache::insert`] が `None` を返し、呼び出し元は
+//! `search_uncached` へ 1 回だけ縮退する（TASK-169・Issue #280。stale な
+//! スナップショットを呼び出し元へ露出させない）。可視性判定・provider 結果の
+//! 二重防御（構築時フィルタ＋`provider_result_is_valid`）はキャッシュ経路・
+//! 非キャッシュ経路のいずれでも
 //! `PrefilterSnapshot::search_with`／[`EngineCore::search_uncached`] が同一に適用する。
 
 use std::collections::HashMap;
@@ -348,10 +352,16 @@ impl PrefilterCache {
         Some(snapshot)
     }
 
-    /// 新規構築したスナップショットを挿入する。単体で総量上限を超える場合はキャッシュ
-    /// せず、呼び出し元は戻り値の `Arc` をその場限りで使う（型ドキュメント参照）。
-    /// ロック毒化時は挿入せず `Arc` をそのまま返す（キャッシュ非搭載でも検索自体は続行
-    /// できるよう fail-closed に「キャッシュを諦める」側へ倒す）。
+    /// 新規構築したスナップショットを挿入する。挿入対象自身が既に古い（並行書き込みで
+    /// 世代が進んだ）場合・世代を確認できない場合は `None` を返し、キャッシュへ
+    /// 反映しないだけでなく呼び出し元へも一切渡さない（Issue #280。
+    /// [`DictionaryCache::insert`] と同じ契約に統一。以前は判定不能・stale のいずれも
+    /// 構築済みの `Arc` をそのまま返しており、呼び出し元は世代不一致を承知の上で
+    /// stale なスナップショットを一時的に検索へ使う経路が残っていた。`search_with`
+    /// 側の前後世代照合で結果自体が漏れることはなかったが〔`core.rs` モジュール
+    /// ドキュメント参照〕、契約としては [`DictionaryCache::insert`] と食い違って
+    /// いた）。単体で総量上限を超える場合はキャッシュしないが、現在世代と整合済み
+    /// なので呼び出し元へは `Some` で返し、その場限りで使う（型ドキュメント参照）。
     ///
     /// `storage` は (0) 挿入対象自身の世代整合チェックと (1) の世代不整合エントリの
     /// 一括破棄で「現在の実世代」（[`Storage::current_generation`]）を判定するために
@@ -360,10 +370,9 @@ impl PrefilterCache {
     /// 並行書き込みで既に古くなっている場合、真に新しい（現在世代と一致する）既存
     /// エントリまで「不一致」として誤って全破棄してしまう不具合があった
     /// （Cursor Bugbot 指摘）。
-    /// `storage.current_generation()` の読み取りに失敗した場合は世代整合を判定できない
-    /// ため、(0)(1) いずれも実行せずキャッシュへの反映をスキップする（fail-closed:
-    /// 「判定できないなら書き込まない」側へ倒す。stale なエントリは [`Self::lookup`]
-    /// が個別に検出して破棄する）。
+    /// `storage.current_generation()` の読み取りに失敗した場合、およびロックが
+    /// 毒化している場合は世代整合を判定できないため `None` を返す（fail-closed:
+    /// 「判定できないなら使わせない」側へ倒す。[`DictionaryCache::insert`] と同じ方針）。
     ///
     /// 世代の読み取りは書き込みロック取得後に行う（github-actions/codex-review P1
     /// 指摘）。ロック取得前に読むと、ロック待機中に他スレッドがより新しい世代の
@@ -377,33 +386,38 @@ impl PrefilterCache {
         table: &str,
         ctx: &PolicyContext,
         snapshot: PrefilterSnapshot,
-    ) -> Arc<PrefilterSnapshot> {
+    ) -> Option<Arc<PrefilterSnapshot>> {
         let snapshot = Arc::new(snapshot);
         self.misses.fetch_add(1, Ordering::Relaxed);
 
+        // ロック毒化時は世代整合を判定できないため `None`（fail-closed。
+        // [`DictionaryCache::insert`] と同じ契約に統一。Issue #280）。
+        let Ok(mut guard) = self.state.write() else {
+            return None;
+        };
+
+        // (0) 挿入対象自身が現在世代と一致するか確認する（対象外スレッド指摘の修正）。
+        // 世代が読み取れない、または挿入対象が既に古い場合はキャッシュへ反映せず、
+        // 呼び出し元へも一切渡さない（`None`。Issue #280）。ここでリターンすることで、
+        // 後続の「同一キー破棄」ステップに到達させない。すなわち並行書き込みで自身が
+        // stale になった挿入が、別スレッドが直前に挿入した現在世代の有効エントリを
+        // 上書き・削除する経路を断つ（型ドキュメント参照）。ロック保持中に読むため、
+        // 以降のこの関数内の判定と齟齬が生じない。
+        let Ok(current_generation) = storage.current_generation() else {
+            return None;
+        };
+        if snapshot.built_generation() != current_generation {
+            return None;
+        }
+
+        // ここまで到達した時点で `snapshot` 自身は現在世代と一致していることが
+        // 保証されている。以降の容量判定・LRU 追い出しはキャッシュへの常駐可否のみを
+        // 左右し、呼び出し元へ `Some` で返すことは変えない。
         let own_bytes = snapshot.approx_heap_bytes();
         if own_bytes > MAX_PREFILTER_CACHE_TOTAL_BYTES {
             // 単体で総量上限を超えるスナップショットは常駐させない（DoS 対策。
             // 型ドキュメント参照）。呼び出し元へはそのまま返し、1 回の検索限りで使う。
-            return snapshot;
-        }
-
-        let Ok(mut guard) = self.state.write() else {
-            return snapshot;
-        };
-
-        // (0) 挿入対象自身が現在世代と一致するか確認する（対象外スレッド指摘の修正）。
-        // 世代が読み取れない、または挿入対象が既に古い場合はキャッシュへ反映せず
-        // その場限りの `Arc` を返す。ここでリターンすることで、後続の「同一キー破棄」
-        // ステップに到達させない。すなわち並行書き込みで自身が stale になった挿入が、
-        // 別スレッドが直前に挿入した現在世代の有効エントリを上書き・削除する経路を断つ
-        // （型ドキュメント参照）。ロック保持中に読むため、以降のこの関数内の判定と
-        // 齟齬が生じない。
-        let Ok(current_generation) = storage.current_generation() else {
-            return snapshot;
-        };
-        if snapshot.built_generation() != current_generation {
-            return snapshot;
+            return Some(snapshot);
         }
 
         // 同一 (table, ctx) キーの既存エントリは挿入前に取り除く（Cursor Bugbot 指摘:
@@ -453,7 +467,8 @@ impl PrefilterCache {
             let Some(idx) = victim else {
                 // これ以上追い出せるエントリがない（空）のに超過している場合は、
                 // 挿入自体を諦めてキャッシュを汚さない（type ドキュメント参照）。
-                return snapshot;
+                // 挿入対象自身は現在世代と整合済みなので `Some` で返す。
+                return Some(snapshot);
             };
             let removed = guard.entries.remove(idx);
             total_bytes = total_bytes.saturating_sub(removed.snapshot.approx_heap_bytes());
@@ -466,7 +481,7 @@ impl PrefilterCache {
             snapshot: Arc::clone(&snapshot),
             last_used: seq,
         });
-        snapshot
+        Some(snapshot)
     }
 
     /// `search_with` が返した `IndexStale`/`ContextMismatch` を受けて、該当エントリを
@@ -648,9 +663,9 @@ impl DictionaryCache {
 
         let Ok(mut guard) = self.state.write() else {
             // ロック毒化時は世代整合を検証できないため fail-closed 側へ倒し、
-            // 呼び出し元へは何も返さない（`PrefilterCache::insert` はロック毒化時も
-            // `Arc` を返す方針だが、本関数は世代確認自体をこのロック区間に統合した
-            // ため、ロックが取れない時点で世代確認もできていない）。
+            // 呼び出し元へは何も返さない（Issue #280 で `PrefilterCache::insert` も
+            // 同契約に統一済み。本関数は世代確認自体をこのロック区間に統合したため、
+            // ロックが取れない時点で世代確認もできていない）。
             return None;
         };
 
@@ -2416,6 +2431,36 @@ impl EngineCore {
         })
     }
 
+    /// 新規構築した `PrefilterSnapshot` を [`PrefilterCache::insert`] へ渡し、その
+    /// 結果に応じて検索経路を分岐する（`VectorCore::search` のキャッシュミス経路
+    /// からのみ呼ぶ。テスト（[`Self::search_with_built_snapshot`] を直接呼ぶ判別
+    /// テスト）から呼びやすいよう `VectorCore::search` 本体から切り出した。
+    /// Issue #280）。`insert` が `Some` を返せば挿入対象は現在世代と整合済みなので
+    /// そのまま [`Self::search_with_snapshot`] で検索する。`None`（挿入対象自身が
+    /// 構築完了から挿入までの間に stale になった、またはロック毒化・世代読み取り
+    /// 失敗で判定不能）の場合はキャッシュへ一切触れず [`Self::search_uncached`] へ
+    /// 1 回だけ縮退する。この縮退は「`search_with` が事後に `IndexStale` を検出して
+    /// `search_uncached` へ縮退する」既存経路と観測可能な結果が同値である（世代は
+    /// 単調増加のため、stale なスナップショットの `search_with` は必ず
+    /// `IndexStale` を返す。無駄な `search_with` 試行を 1 回省くだけで、結果側の
+    /// fail-closed 契約自体は変えない）。
+    fn search_with_built_snapshot(
+        &self,
+        table: &str,
+        ctx: &PolicyContext,
+        query: &[f32],
+        k: usize,
+        snapshot: PrefilterSnapshot,
+    ) -> Result<Vec<SearchHit>, CoreError> {
+        match self
+            .prefilter_cache
+            .insert(&self.storage, table, ctx, snapshot)
+        {
+            Some(snapshot) => self.search_with_snapshot(table, ctx, query, k, snapshot),
+            None => self.search_uncached(ctx, table, query, k),
+        }
+    }
+
     /// キャッシュ済み（または挿入直後の）`PrefilterSnapshot` に対して検索する
     /// （TASK-169）。`snapshot.search_with` が `IndexStale`/`ContextMismatch` を返した
     /// 場合は [`PrefilterCache::evict`] で該当エントリを破棄し、非キャッシュ経路
@@ -2862,10 +2907,7 @@ impl VectorCore for EngineCore {
             Err(RlsError::NotFound) => return Err(CoreError::NotFound),
             Err(e) => return Err(map_rls_error(e)),
         };
-        let snapshot = self
-            .prefilter_cache
-            .insert(&self.storage, table, ctx, snapshot);
-        self.search_with_snapshot(table, ctx, query, k, snapshot)
+        self.search_with_built_snapshot(table, ctx, query, k, snapshot)
     }
 
     fn get_row(
@@ -3438,8 +3480,13 @@ mod tests {
         // かつ、挿入対象自身が stale なため tenant-a のエントリとしても追加されない
         // こと（後続の Cursor Bugbot 指摘の修正: stale な挿入はキャッシュへ一切
         // 反映しない）。
-        core.prefilter_cache
+        let inserted = core
+            .prefilter_cache
             .insert(&core.storage, "docs", &ctx_a, stale_snapshot);
+        assert!(
+            inserted.is_none(),
+            "挿入対象自身が stale な場合は呼び出し元へも渡さない（Issue #280）"
+        );
         let stats = core.prefilter_cache_stats();
         assert_eq!(
             stats.entries, 1,
@@ -3472,17 +3519,19 @@ mod tests {
             .expect("insert row");
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
-        // 同一 (table, ctx) キーへ複数回挿入する（同一スナップショットを使い回しても
-        // `insert` 自身は世代を見ないため重複判定の再現に十分）。
+        // 同一 (table, ctx) キーへ複数回挿入する（両者とも現在世代 G0 と一致するため
+        // `insert` に受理される。重複判定の再現には世代不一致は不要）。
         let snapshot_1 =
             PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot 1");
         let snapshot_2 =
             PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot 2");
 
         core.prefilter_cache
-            .insert(&core.storage, "docs", &ctx, snapshot_1);
+            .insert(&core.storage, "docs", &ctx, snapshot_1)
+            .expect("current generation の snapshot は受理される");
         core.prefilter_cache
-            .insert(&core.storage, "docs", &ctx, snapshot_2);
+            .insert(&core.storage, "docs", &ctx, snapshot_2)
+            .expect("current generation の snapshot は受理される");
 
         assert_eq!(
             core.prefilter_cache_stats().entries,
@@ -3543,13 +3592,20 @@ mod tests {
             PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g1");
         let fresh_arc = core
             .prefilter_cache
-            .insert(&core.storage, "docs", &ctx, fresh_snapshot);
+            .insert(&core.storage, "docs", &ctx, fresh_snapshot)
+            .expect("current generation の snapshot は受理される");
         assert_eq!(core.prefilter_cache_stats().entries, 1);
 
         // 遅れて到着した G0 の stale スナップショットを同一キーへ挿入しても、
         // 既にキャッシュされている G1 の有効エントリが上書き・削除されないこと。
-        core.prefilter_cache
-            .insert(&core.storage, "docs", &ctx, stale_snapshot);
+        // 挿入対象自身は stale なので呼び出し元へも渡されない（Issue #280）。
+        let stale_inserted =
+            core.prefilter_cache
+                .insert(&core.storage, "docs", &ctx, stale_snapshot);
+        assert!(
+            stale_inserted.is_none(),
+            "stale な挿入は呼び出し元へも渡さない"
+        );
 
         let cached = core
             .prefilter_cache
@@ -3558,6 +3614,148 @@ mod tests {
         assert!(
             Arc::ptr_eq(&cached, &fresh_arc),
             "stale な挿入によって G1 の有効エントリが差し替えられてはならない"
+        );
+    }
+
+    // 対象ビヘイビア: TASK-169・RLS-1〜4・Issue #280（判別テスト。`DictionaryCache::insert`
+    //〔TASK-109・PR #249〕と同じ「スキャン中に世代が進んだ場合は stale な挿入を `None` で
+    // 拒否する」契約を `PrefilterCache::insert` にも適用したことの確認）。世代 G0 で構築した
+    // スナップショットを、書き込みで G0 → G1 へ進めた後に挿入すると `None` が返り、
+    // キャッシュへも反映されないこと。対照として、G1 で構築し直したスナップショットの
+    // 挿入は `Some` を返し、`lookup` で同一 `Arc` が引けること（拒否が過剰でないことの
+    // 確認）。
+    #[test]
+    fn prefilter_cache_insert_rejects_a_stale_snapshot_when_generation_advances_during_build() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 世代 G0 でスナップショットを構築する（読み取り中に並行書き込みが割り込む
+        // 状況を模す。まだキャッシュへは挿入しない）。
+        let stale_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g0");
+
+        // 書き込みで世代を G0 → G1 へ進める（構築完了〜挿入の間に世代が進む競合）。
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // G0 のまま stale になったスナップショットの挿入は拒否される（`None`）。
+        let rejected = core
+            .prefilter_cache
+            .insert(&core.storage, "docs", &ctx, stale_snapshot);
+        assert!(
+            rejected.is_none(),
+            "世代不一致の挿入対象は呼び出し元へも渡さない（DictionaryCache::insert と同契約）"
+        );
+        assert_eq!(
+            core.prefilter_cache_stats().entries,
+            0,
+            "stale な挿入はキャッシュへ反映されない"
+        );
+
+        // 対照: G1 で構築し直したスナップショットは受理され、`lookup` で同一 `Arc`
+        // が引けること（拒否が過剰でないことの確認）。
+        let fresh_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g1");
+        let fresh_arc = core
+            .prefilter_cache
+            .insert(&core.storage, "docs", &ctx, fresh_snapshot)
+            .expect("current generation の snapshot は受理される");
+        assert_eq!(core.prefilter_cache_stats().entries, 1);
+        let cached = core
+            .prefilter_cache
+            .lookup(&core.storage, "docs", &ctx)
+            .expect("G1 のエントリがキャッシュに残っていること");
+        assert!(Arc::ptr_eq(&cached, &fresh_arc));
+    }
+
+    // 対象ビヘイビア: TASK-169・RLS-1〜4・Issue #280（受け入れ条件3: 結果側の
+    // fail-closed が変わらないことの確認）。`PrefilterSnapshot::build` 完了後、
+    // `PrefilterCache::insert` へ渡すまでの間に別の書き込みが世代を進め、挿入対象の
+    // スナップショットが stale になったケースを、`EngineCore::search_with_built_snapshot`
+    // を直接呼ぶことで決定的に再現する。`insert` が `None` を返し、`search_uncached`
+    // へ 1 回だけ縮退することで、stale なスナップショットではなく最新状態で検索
+    // される（クエリに最も近い、書き込み後に追加された行が結果へ含まれる）ことを
+    // 確認する。
+    #[test]
+    fn search_falls_back_to_uncached_when_a_freshly_built_snapshot_turns_stale_before_insert() {
+        let dir = tempdir();
+        let core = new_core(dir.path());
+        core.storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create table");
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[1.0, 0.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        // 世代 G0（行 id=1 のみ）でスナップショットを構築する（まだ挿入しない）。
+        let stale_snapshot =
+            PrefilterSnapshot::build(&core.storage, "docs", &ctx).expect("build snapshot g0");
+
+        // クエリに最も近いベクトルを持つ行 id=2 を書き込み、世代を G0 → G1 へ進める。
+        // `stale_snapshot` は行 id=2 を含まないアリーナのまま古くなる。
+        core.storage
+            .insert_row_into_table(
+                "docs",
+                2,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: &[],
+                },
+            )
+            .expect("insert row");
+
+        // 構築済みの G0 スナップショットをそのまま渡す（`VectorCore::search` の
+        // キャッシュミス経路が「構築 → 挿入」の間で競合に遭った状況を模す）。
+        let hits = core
+            .search_with_built_snapshot("docs", &ctx, &[0.0, 1.0], 10, stale_snapshot)
+            .expect("search ok");
+
+        assert!(
+            hits.iter().any(|h| h.id == 2),
+            "stale スナップショットではなく最新状態（行 id=2 を含む）で検索されること"
+        );
+        assert_eq!(
+            core.prefilter_cache_stats().entries,
+            0,
+            "stale なスナップショットはキャッシュへ常駐しない"
         );
     }
 

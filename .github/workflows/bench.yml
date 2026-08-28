@@ -136,6 +136,11 @@ jobs:
         # （pass=false）」になる（GPU 搭載 self-hosted runner 前提のフラグ。CPU 同士の
         # 比較値を GPU 実測の代替として計上しない）。CORE-16 の対照経路
         # （`engine::gpu_batch::GpuF32ContrastBackend`）は Issue #234 で接続済み。
+        # `batch_bench.rs` は pass/fail・非数値状態のみを標準出力へ書く（Issue #279）。
+        # `BENCH_VERBOSE` は実測値を public な Actions ログへ出す opt-in のため本
+        # ワークフローの env へは意図的に追加しない（bench 側も `GITHUB_ACTIONS` 下
+        # では拒否する二重化。実測値が必要な場合は承認済み計測環境で
+        # `BENCH_VERBOSE=1 make bench-batch` を直接実行する）。
         env:
           BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ vars.BENCH_BATCH_MAX_DEGRADATION_PCT }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
