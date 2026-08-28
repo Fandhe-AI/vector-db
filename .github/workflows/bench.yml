@@ -61,12 +61,15 @@ jobs:
       - name: Run bench-simd
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
         # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
-        # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値の
-        # 数値そのものは載せない——`crates/engine/benches/simd_bench.rs` が
-        # 標準出力へ実測値と pass/fail のみを書き出す設計になっている）。BENCH_MAX_P95_MS・
-        # BENCH_MIN_RECALL が未設定の場合は `simd_bench.rs` 側が fail-closed で
-        # 非ゼロ終了する。CORE-5（対照エンジン比較）は `contrast_bench.rs`（下記
-        # bench-contrast ジョブ）が独立バイナリとして判定する（Issue #176）。
+        # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値・
+        # 実測値の数値そのものは載せない——`crates/engine/benches/simd_bench.rs` が
+        # 標準出力へ pass/fail のみを書き出す設計になっている。実測値は `--verbose`
+        # opt-in 限定で、GitHub Actions 下では fail-closed で拒否される。Issue #277。
+        # `contrast_bench.rs`〔CORE-5・Issue #224〕と同方針）。`--verbose` は付けない。
+        # BENCH_MAX_P95_MS・BENCH_MIN_RECALL が未設定の場合は `simd_bench.rs` 側が
+        # fail-closed で非ゼロ終了する。CORE-5（対照エンジン比較）は
+        # `contrast_bench.rs`（下記 bench-contrast ジョブ）が独立バイナリとして
+        # 判定する（Issue #176）。
         env:
           BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
           BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
@@ -167,7 +170,10 @@ jobs:
         # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
         # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
         # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
-        # 非ゼロ終了する。
+        # 非ゼロ終了する。`sql_c1_bench.rs` は既定で pass/fail・非数値状態のみを
+        # 出力し実測値を public ログへ出さない（Issue #278・AGENTS.md P0）。
+        # `BENCH_SQL_C1_VERBOSE` は本ワークフローから注入しない（注入しても
+        # `GITHUB_ACTIONS` 検出で fail-closed に非ゼロ終了する）。
         env:
           BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
           BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}

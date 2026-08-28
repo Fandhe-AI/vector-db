@@ -95,7 +95,8 @@ test = false
 # `make bench-simd`（Makefile）・`.github/workflows/bench.yml`
 # （週次 schedule + workflow_dispatch）から
 # 実行する。判定ロジック自体（時間非依存）は harness/accept.rs にあり
-# tests/bench_accept.rs で make ci 側から回帰検証する。
+# tests/bench_accept.rs で make ci 側から回帰検証する。標準出力は pass/fail のみ
+# （実測値は `--verbose` opt-in 限定・GitHub Actions 下では拒否。Issue #277）。
 name = "simd_bench"
 harness = false
 test = false

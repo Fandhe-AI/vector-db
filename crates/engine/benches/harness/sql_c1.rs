@@ -13,6 +13,7 @@
 //! 取り込まれる共有ソースのため、`crate::` を参照しない）。
 
 use std::fmt::Write as _;
+use std::time::Duration;
 
 /// ベクトルリテラルの生バイト長上限（`sql::parser::MAX_VECTOR_LITERAL_BYTES` と
 /// 同一値のつもりで手動複製した定数。当該定数は private のため独自に定義する。
@@ -35,6 +36,10 @@ pub enum SqlC1Error {
     LiteralTooLarge,
     /// テーブル名・列名が識別子として不正だった。
     InvalidIdentifier(&'static str),
+    /// `BENCH_SQL_C1_VERBOSE=1` が GitHub Actions 実行環境下で要求された（Issue #278）。
+    /// public な Actions ログへ実測値を出さないための fail-closed 拒否であり、
+    /// `sql_c1_bench.rs::main` はデータ投入前にこの Err で打ち切る。
+    VerboseRefusedUnderGitHubActions,
 }
 
 impl std::fmt::Display for SqlC1Error {
@@ -48,6 +53,12 @@ impl std::fmt::Display for SqlC1Error {
             }
             SqlC1Error::InvalidIdentifier(field) => {
                 write!(f, "{field} is not a valid identifier")
+            }
+            SqlC1Error::VerboseRefusedUnderGitHubActions => {
+                write!(
+                    f,
+                    "BENCH_SQL_C1_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values"
+                )
             }
         }
     }
@@ -149,4 +160,96 @@ pub fn c1_statement(
     Ok(format!(
         "SELECT id FROM {table} ORDER BY {column} <=> '{literal}' LIMIT {k}"
     ))
+}
+
+/// `BENCH_SQL_C1_VERBOSE` の opt-in 判定（TASK-83・Issue #278）。
+///
+/// 既定（`raw` が `Some("1")` 以外）は非 verbose（`Ok(false)`）で、
+/// [`render_p95_line`]・[`render_recall_line`]・[`render_ab_line`] は実測数値を
+/// 出力しない。`raw == Some("1")` の厳密一致のみ verbose 要求とみなす
+/// （`dedicated_env_attested_from_env` の `.trim() == "1"` より厳格にしているのは、
+/// こちらは public ログへの実測値露出を左右する opt-in であり、空白付き値の
+/// 誤入力を verbose 側へ寛容に倒すと事故につながるため）。
+///
+/// `under_github_actions`（`GITHUB_ACTIONS` 環境変数の有無）が真の場合、verbose 要求は
+/// defense-in-depth として `Err(SqlC1Error::VerboseRefusedUnderGitHubActions)` で
+/// fail-closed に拒否する。GitHub ホステッド runner の repo variable 誤設定で
+/// `BENCH_SQL_C1_VERBOSE=1` が注入された場合でも、実測値が public な Actions ログへ
+/// 出る前に打ち切るため（AGENTS.md「private spec 内容の漏えい（P0）」。数値基準・
+/// 実測値の転記は承認有無に関わらず P0）。`under_github_actions=false` かつ
+/// `raw=None` は通常のゲート実行に影響しない（`Ok(false)`）。
+pub fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, SqlC1Error> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(SqlC1Error::VerboseRefusedUnderGitHubActions);
+    }
+    Ok(requested)
+}
+
+/// `p95_latency(sql_c1)` 判定行の描画（TASK-83・Issue #278）。
+///
+/// `verbose=false`（既定）では公開済み定数（`rows`/`dim`/`k`）と `pass` のみを含み、
+/// `median`・`p95` の実測値は一切含めない（PR #224・CORE-5 対応と同一方針。
+/// pass/fail と実測値を並べて公開すると spec 由来の閾値が逆算されうるため）。
+/// `verbose=true` では ADR（`docs/design/c1-p95-dedicated-env-reverification.md`）の
+/// 「実測結果」表への転記用に、従来どおり `median`/`p95` を含める。
+pub fn render_p95_line(
+    rows: usize,
+    dim: usize,
+    k: usize,
+    median: Duration,
+    p95: Duration,
+    pass: bool,
+    verbose: bool,
+) -> String {
+    if verbose {
+        format!(
+            "p95_latency(sql_c1): rows={rows} dim={dim} k={k} median={median:?} p95={p95:?} pass={pass} (verbose)"
+        )
+    } else {
+        format!("p95_latency(sql_c1): rows={rows} dim={dim} k={k} pass={pass}")
+    }
+}
+
+/// `topk_consistency(sql_c1_vs_scalar_exhaustive)` 判定行の描画（TASK-83・Issue #278）。
+///
+/// `verbose=false`（既定）では `k`/`queries`/`pass` のみを含み、`recall_min` の実測値
+/// は含めない（[`render_p95_line`] と同一方針）。
+pub fn render_recall_line(
+    k: usize,
+    queries: usize,
+    recall_min: f64,
+    pass: bool,
+    verbose: bool,
+) -> String {
+    if verbose {
+        format!(
+            "topk_consistency(sql_c1_vs_scalar_exhaustive): k={k} queries={queries} recall_min={recall_min:.6} pass={pass} (verbose)"
+        )
+    } else {
+        format!(
+            "topk_consistency(sql_c1_vs_scalar_exhaustive): k={k} queries={queries} pass={pass}"
+        )
+    }
+}
+
+/// `diagnostic_ab(sql_surface_vs_core_search)` 診断行の描画（TASK-83・Issue #278）。
+///
+/// A/B 診断は合否に含めない参考情報だが、`a_median`/`b_median`/`median_ratio` は
+/// 実測値であるため既定では出力しない。`verbose=false` では算出可能である旨
+/// （`available=true`）と、実測値を見るための再実行方法のみを示す
+/// （[`render_p95_line`] と同一方針）。
+pub fn render_ab_line(
+    a_median: Duration,
+    b_median: Duration,
+    median_ratio: f64,
+    verbose: bool,
+) -> String {
+    if verbose {
+        format!(
+            "diagnostic_ab(sql_surface_vs_core_search): a_median={a_median:?} b_median={b_median:?} median_ratio={median_ratio:.4} (verbose; not counted toward pass/fail)"
+        )
+    } else {
+        "diagnostic_ab(sql_surface_vs_core_search): available=true (not counted toward pass/fail; values suppressed, set BENCH_SQL_C1_VERBOSE=1 outside GitHub Actions to print)".to_string()
+    }
 }
