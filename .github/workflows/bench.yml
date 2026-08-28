@@ -172,3 +172,15 @@ jobs:
           BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
           BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1
+
+  # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本
+  # workflow に置かない。GitHub ホステッド runner には常駐 Ollama がなく、
+  # self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み
+  # 例外の範囲外（過去の同種指摘により self-hosted 経路は撤去済み。AGENTS.md
+  # 「CI・ワークフローの改変（P1）」）であるため、`BENCH_TIER` を opt-in しても
+  # 常に Ollama 接続に失敗し、どの設定でも受け入れ基準を実測して成功させる CI
+  # 経路が存在しない設計になってしまう（PR #269 Codex 指摘）。実測は GitHub
+  # Actions 外の承認済み計測手順（README「ティア別レイテンシ受け入れ基準の
+  # 実測手順」・`docs/design/tier-latency-acceptance.md`）のみを正式な入口とし、
+  # 判定ロジック層（`crates/engine/tests/tier_latency_accept.rs`）のみ
+  # `make ci` 対象として維持する。

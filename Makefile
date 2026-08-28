@@ -273,6 +273,18 @@ else
 endif
 
 # --------------------------------------------------
+# ティア別レイテンシ受け入れ基準の検証（TASK-116。crates/engine/benches/tier_latency_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-tier
+bench-tier: ## TASK-116（PLAN-4/6/7）のティア別レイテンシ受け入れ基準ベンチを実行する（時間依存・常駐 Ollama 前提のため ci には含めない。CI 経路は存在せず README「ティア別レイテンシ受け入れ基準の実測手順」記載の Actions 外の承認済み計測環境で運用者が直接実行する）
+ifdef HAS_CARGO
+	cargo bench --bench tier_latency_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-tier をスキップ"
+endif
+
+# --------------------------------------------------
 # ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
 # --------------------------------------------------
 

@@ -105,6 +105,17 @@ gh variable set BENCH_SQL_C1_MIN_RECALL
 BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDICATED_ENV=1 make bench-c1
 ```
 
+### ティア別レイテンシ受け入れ基準の実測手順（TASK-116）
+
+`make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-116（対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4・PLAN-6・PLAN-7。判定内容・測定段階・数値基準は spec 側が SSOT であり本リポジトリには記載しません）の受け入れ基準を実測します。常駐 Ollama への実接続が前提です。
+
+> [!IMPORTANT]
+> `.github/workflows/bench.yml` に `bench-tier` ジョブは**置きません**。GitHub ホステッド runner には常駐 Ollama が無く、self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み例外の範囲外（AGENTS.md「CI・ワークフローの改変（P1）」。self-hosted 経路は過去の指摘により撤去済み）のため、CI 上のどの設定（opt-in の有無）でも実測を成功させる経路が存在しません（PR #269 Codex 指摘）。実測は本節の手順により GitHub Actions 外の承認済み計測環境で運用者が直接実行してください。これが TASK-116 受け入れ基準実測の正式な入口です。
+
+常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧（変数名と用途のみ。値は含みません）は `cargo bench --bench tier_latency_bench -p engine -- --help` で表示されます。未設定・不正値のまま opt-in（`BENCH_TIER` 設定）した場合は fail-closed で不足している env 名を含む明示エラーとして表示されます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
+
+実測値（p95 の数値）そのものは public な `docs/design/tier-latency-acceptance.md` へ転記せず、非公開記録先へ保存してください。同ドキュメントの「実測状態」節には各判定の「実施済み/未実施」「pass/fail」「routing 一致/不一致」という非数値の状態のみを更新してください。判定ロジック層（時間非依存の純関数）のみ `crates/engine/tests/tier_latency_accept.rs` として `make ci` 対象です。設計判断の記録は `docs/design/tier-latency-acceptance.md` を参照してください。
+
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
 `.github/workflows/recall.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 04:00 UTC。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）を GitHub Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください（`gh api` または Settings > Environments）。
