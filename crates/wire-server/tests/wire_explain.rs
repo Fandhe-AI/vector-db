@@ -1,0 +1,165 @@
+//! `EXPLAIN SELECT ... USING PLAN('<query>')` の簡易クエリプロトコル経由（生バイト
+//! クライアント）検証（TASK-78、対象ビヘイビア: SQL-6。ポインタ:
+//! `docs/spec/05-tasks.md` TASK-78・`docs/spec/04-behavior/sql-surface.md` SQL-6）。
+//!
+//! LLM 展開・モード解決の規則そのものは `crates/engine/tests/sql_explain.rs`
+//! （in-process）が確定オラクルとして検証済みのため、本ファイルは同じ規則が
+//! **wire フレーミング** 越しに `RowDescription`（`QUERY PLAN` 単一列）・
+//! `DataRow`（決定的な行）・`CommandComplete`（`EXPLAIN` タグ・行数無し）として
+//! 観測できることの確認に徹する（`wire_search_mode.rs` と同じ流儀。
+//! `common/mod.rs` は `tests/wire_extended_query.rs` 用のヘルパーを共有する）。
+
+#[path = "common/mod.rs"]
+mod common;
+
+#[path = "../../engine/src/test_util/temp_db.rs"]
+mod temp_db;
+
+use std::sync::Arc;
+
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
+use engine::kernel::CpuScalarProvider;
+use engine::policy::PolicyContext;
+use engine::query_planner::{LlmClient, PlanError};
+use engine::row_codec::Value;
+use engine::storage::{Storage, Visibility};
+
+use common::*;
+
+struct StubLlmClient {
+    response: &'static str,
+}
+
+impl LlmClient for StubLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        Ok(self.response.to_string())
+    }
+}
+
+const EXPANSION_RESPONSE: &str =
+    r#"{"search_terms": ["alpha", "beta"], "path_hint": "docs/", "kind_hint": "fn"}"#;
+
+fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-explain-docs");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![1.0, 0.0]),
+            Value::Text("docs/a.md".to_string()),
+            Value::Text("alpha content".to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("insert row");
+
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_query_planner(
+        Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }),
+    );
+    (Arc::new(core), guard)
+}
+
+fn spawn_with_alice(core: Arc<EngineCore>) -> (std::net::TcpStream, std::path::PathBuf) {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "pw-alice")]);
+    let addr = spawn_server_with_engine(&users_path, core);
+    (
+        authenticate_to_ready_for_query(addr, "alice", "pw-alice"),
+        users_path,
+    )
+}
+
+/// SQL-6: `EXPLAIN` は `QUERY PLAN` 単一列の `RowDescription` と、検索語・
+/// ソフトヒント・実効モード・指定元の決定的な行を返し、`CommandComplete` タグは
+/// 行数を付けない `EXPLAIN`（pg 互換）になる。
+#[test]
+fn explain_returns_query_plan_column_and_expected_rows() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+    );
+
+    let columns = read_row_description(&mut stream);
+    assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+
+    let expected_lines = [
+        "search_terms[0]: alpha",
+        "search_terms[1]: beta",
+        "path_hint: docs/",
+        "kind_hint: fn",
+        "mode: recall",
+        "mode_source: default",
+    ];
+    for expected in expected_lines {
+        let row = read_data_row(&mut stream);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].as_deref(), Some(expected));
+    }
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+}
+
+/// SQL-6 × SQL-12: `EXPLAIN` は明示 `USING MODE` の実効モード・指定元
+/// （`query_clause`）も可視化する。
+#[test]
+fn explain_reports_query_clause_mode_source() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'precision'",
+    );
+
+    let _columns = read_row_description(&mut stream);
+    let mut last_two = Vec::new();
+    for _ in 0..6 {
+        last_two.push(read_data_row(&mut stream)[0].clone().expect("cell"));
+    }
+    assert_eq!(last_two[4], "mode: precision");
+    assert_eq!(last_two[5], "mode_source: query_clause");
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+}
+
+/// SQL-6: `EXPLAIN` は検索本体を実行しないため、`USING PLAN` を伴わない通常
+/// `SELECT` への前置は許可リスト外として `42601` で拒否する。
+#[test]
+fn explain_rejects_plain_select_without_using_plan() {
+    let (core, _guard) = new_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
+    );
+    expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
