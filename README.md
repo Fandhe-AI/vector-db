@@ -152,8 +152,8 @@ gh variable set BENCH_TIER_PRECISION_MAX_P95_MS
    gh variable set HYBRID_RECALL_MIN_R100_LARGE --env recall-gate
    ```
 
-3. `RERANK_RECALL_MIN_R20_LARGE`／`RERANK_RECALL_MIN_R20_IMPROVEMENT`（下記 TASK-108 参照）・`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`／`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`／`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（下記 TASK-112 参照）も同じ Environment `recall-gate` に設定する（strict モードは 8 変数すべてを必須とするため）
-4. `gh workflow run recall.yml --ref main` で **main を ref に指定して** 本 workflow を手動実行し、`gh run watch` で `recall-regression` job が **skip ではなく実際に実行され**、strict モード（下記）のもとで 8 変数すべてが正しく評価されて green になることを確認する（main 以外の ref を指定すると job が skip されて green に見えるため注意）
+3. `RERANK_RECALL_MIN_R20_LARGE`／`RERANK_RECALL_MIN_R20_IMPROVEMENT`（下記 TASK-108 参照）・`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`／`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`／`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`／`QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`（下記 TASK-112 参照）も同じ Environment `recall-gate` に設定する（strict モードは 9 変数すべてを必須とするため）
+4. `gh workflow run recall.yml --ref main` で **main を ref に指定して** 本 workflow を手動実行し、`gh run watch` で `recall-regression` job が **skip ではなく実際に実行され**、strict モード（下記）のもとで 9 変数すべてが正しく評価されて green になることを確認する（main 以外の ref を指定すると job が skip されて green に見えるため注意）
 5. 疎通確認が済めば、`schedule` トリガ（週次・#168 で再追加済み）により以降は自動実行されます
 
 **variables を設定するとゲートが有効化されます。** ローカルの `make recall-regression`（`HYBRID_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定（GitHub Actions では空文字列に解決される repo variable も含む）のまま実行すると、`crates/engine/tests/hybrid_recall.rs` は「ゲート未設定＝明示的に対象外」を出力して成功終了します（fail-closed で塞ぐのは、設定済みの値が非数値・範囲外だった場合のみ）。
@@ -166,7 +166,7 @@ gh variable set BENCH_TIER_PRECISION_MAX_P95_MS
 
 ### リランキング効果測定 Recall 閾値ゲートの repo variables（TASK-108）
 
-`.github/workflows/recall.yml` の同一 `recall-regression` job は、上記に続けて `crates/engine/tests/rerank_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）も `make rerank-regression` 経由で実行し、`RERANK_RECALL_MIN_R20_LARGE`（リランキング後の最終 Recall@20 の絶対下限）・`RERANK_RECALL_MIN_R20_IMPROVEMENT`（baseline＝リランキングなしからの改善幅の下限）を同じ Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。設計・実測経緯は `docs/design/rerank-recall-regression.md` を参照してください。Environment `recall-gate` は上記手順ですでに作成済みのため、追加で行うのは variables の設定のみです。`recall.yml` は `workflow_dispatch` / `schedule` の両方で strict モード（`RERANK_RECALL_REQUIRE_THRESHOLDS=1`）で実行されるため、上記 8 変数がすべて揃っていない場合は fail-closed でテスト失敗になります。
+`.github/workflows/recall.yml` の同一 `recall-regression` job は、上記に続けて `crates/engine/tests/rerank_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）も `make rerank-regression` 経由で実行し、`RERANK_RECALL_MIN_R20_LARGE`（リランキング後の最終 Recall@20 の絶対下限）・`RERANK_RECALL_MIN_R20_IMPROVEMENT`（baseline＝リランキングなしからの改善幅の下限）を同じ Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。設計・実測経緯は `docs/design/rerank-recall-regression.md` を参照してください。Environment `recall-gate` は上記手順ですでに作成済みのため、追加で行うのは variables の設定のみです。`recall.yml` は `workflow_dispatch` / `schedule` の両方で strict モード（`RERANK_RECALL_REQUIRE_THRESHOLDS=1`）で実行されるため、上記 9 変数がすべて揃っていない場合は fail-closed でテスト失敗になります。
 
 ```bash
 gh variable set RERANK_RECALL_MIN_R20_LARGE --env recall-gate
@@ -177,12 +177,13 @@ gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 
 ### クエリ展開の受け入れ基準 Recall 閾値ゲートの repo variables（TASK-112）
 
-`.github/workflows/recall.yml` の同一 `recall-regression` job は、上記に続けて `crates/engine/tests/query_planning_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）も `make query-planning-regression` 経由で実行し、`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`（`intent` カテゴリ＝コーパス語彙と重ならない言い換えクエリの、展開なしからの Recall@20 改善幅の下限）・`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（`direct` カテゴリ＝コーパス語彙と一致するクエリの、展開ありの Recall@20 絶対下限）・`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（`NoisyLlmClient`〔非 oracle・劣化展開品質〕による `intent` カテゴリの Recall@20 改善幅下限。既存 2 変数を非 oracle スタブへ流用すると誤検知することが実測で確認されたため独立に追加した変数。`docs/design/query-planning-recall-regression.md` 参照）を同じ Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。設計・実測経緯は `docs/design/query-planning-recall-regression.md` を参照してください。Environment `recall-gate` は上記手順ですでに作成済みのため、追加で行うのは variables の設定のみです。`recall.yml` は `workflow_dispatch` / `schedule` の両方で strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`）で実行されるため、上記 8 変数がすべて揃っていない場合は fail-closed でテスト失敗になります。
+`.github/workflows/recall.yml` の同一 `recall-regression` job は、上記に続けて `crates/engine/tests/query_planning_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）も `make query-planning-regression` 経由で実行し、`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`（`intent` カテゴリ＝コーパス語彙と重ならない言い換えクエリの、展開なしからの Recall@20 改善幅の下限）・`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（`direct` カテゴリ＝コーパス語彙と一致するクエリの、展開ありの Recall@20 絶対下限）・`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（`NoisyLlmClient`〔非 oracle・劣化展開品質〕による `intent` カテゴリの Recall@20 改善幅下限。既存 2 変数を非 oracle スタブへ流用すると誤検知することが実測で確認されたため独立に追加した変数。`docs/design/query-planning-recall-regression.md` 参照）・`QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`（TASK-113・PLAN-3。数万チャンク規模の大規模段における `direct` カテゴリの Recall@20 絶対下限。小規模段の `QUERY_PLANNING_RECALL_MIN_R20_DIRECT` とは別コーパス規模・別変数として独立に評価する）を同じ Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。設計・実測経緯は `docs/design/query-planning-recall-regression.md` を参照してください。Environment `recall-gate` は上記手順ですでに作成済みのため、追加で行うのは variables の設定のみです。`recall.yml` は `workflow_dispatch` / `schedule` の両方で strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`）で実行されるため、上記 9 変数がすべて揃っていない場合は fail-closed でテスト失敗になります。
 
 ```bash
 gh variable set QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT --env recall-gate
 gh variable set QUERY_PLANNING_RECALL_MIN_R20_DIRECT --env recall-gate
 gh variable set QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED --env recall-gate
+gh variable set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 ```
 
 挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo variables」と同一です。ローカルの `make query-planning-regression`（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。

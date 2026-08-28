@@ -309,11 +309,11 @@ else
 endif
 
 # --------------------------------------------------
-# クエリ展開の受け入れ基準 Recall 閾値ゲート（TASK-112。crates/engine/tests/query_planning_recall.rs 層 B）
+# クエリ展開の受け入れ基準 Recall 閾値ゲート（TASK-112・TASK-113。crates/engine/tests/query_planning_recall.rs 層 B）
 # --------------------------------------------------
 
 .PHONY: query-planning-regression
-query-planning-regression: ## TASK-112 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅）Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture
 else
