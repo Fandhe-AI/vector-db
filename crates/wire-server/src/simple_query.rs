@@ -175,9 +175,17 @@ pub(crate) fn execute_and_respond(
 }
 
 /// 緊急応答（TASK-97・RECOVER-6）の事前エンコード済みバイト列を組み立てる。
-/// `state=may_be_committed` の detail フィールドを付与した ErrorResponse
-/// （`'D'` フィールドの暫定運び方は `result_encoder::encode_error_response_with_detail`
-/// のドキュメント参照。ERR-1 のワイヤ形式確定前の暫定実装）。
+///
+/// 既存の 3 フィールド契約（`S`/`C`/`M`）のみの ErrorResponse を送出する
+/// （codex-review P1・PR #253 指摘対応）。ERR-1（commit 成功境界を跨いだ panic
+/// の観測可能性）が本来運びたい「commit は成功しているかもしれない」という
+/// 状態情報は、spec 側でワイヤ形式（運搬フィールド・値）が未確定のため、暫定
+/// 形式をこのクライアント向け送出経路へ接続しない ―― クライアントは
+/// 通常の内部エラー応答（`wire_code`・固定文言）と同じ 3 フィールドの
+/// ErrorResponse を受け取り、少なくとも「接続断ではなく明示的なエラー応答」を
+/// 同期的に観測できる（RECOVER-6 が防ぐ「サイレントな接続断」は引き続き回避
+/// する）。ERR-1 のワイヤ形式が spec 側で確定した後、その契約どおりに
+/// detail フィールドを追加する（`result_encoder.rs` の該当 NOTE 参照）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
 /// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
@@ -185,11 +193,7 @@ pub(crate) fn execute_and_respond(
 fn build_emergency_response_bytes(
     internal_error: &engine::error_format::WireError,
 ) -> Result<Vec<u8>, result_encoder::EncodeError> {
-    result_encoder::encode_error_response_with_detail(
-        internal_error.wire_code(),
-        internal_error.message(),
-        "state=may_be_committed",
-    )
+    result_encoder::encode_error_response(internal_error.wire_code(), internal_error.message())
 }
 
 /// [`build_emergency_response_bytes`] の結果をプロセス生存期間でキャッシュする

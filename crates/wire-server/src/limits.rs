@@ -29,9 +29,11 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// commit 成功境界を跨いだ panic 発生時に緊急応答（`may_be_committed` を運ぶ
-/// ErrorResponse）を書き込むためのソケット書き込みタイムアウト（TASK-97、
-/// 対象ビヘイビア: RECOVER-6）。
+/// commit 成功境界を跨いだ panic 発生時に緊急応答（3 フィールド契約の
+/// ErrorResponse。ERR-1 のワイヤ形式が spec 側で未確定のため、`state=
+/// may_be_committed` 相当の detail フィールドは現時点では運ばない。
+/// `simple_query::build_emergency_response_bytes` 参照）を書き込むための
+/// ソケット書き込みタイムアウト（TASK-97、対象ビヘイビア: RECOVER-6）。
 ///
 /// `crate::simple_query::execute_and_respond` は「outcome を決定する区間」
 /// （`engine.execute_sql_in_session` の呼び出しを含むブロック）だけこの値を

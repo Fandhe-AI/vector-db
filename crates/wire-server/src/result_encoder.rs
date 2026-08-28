@@ -155,33 +155,23 @@ pub fn encode_empty_query_response() -> Vec<u8> {
     msg
 }
 
-/// `ErrorResponse`（'E'）を `S`/`C`/`M` に加え `D`（detail）フィールド付きで
-/// 組み立てる（TASK-97、対象ビヘイビア: RECOVER-6・ERR-1）。
+/// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみで組み立てる
+/// （`severity`/`code`/`message`。他テナント・存在情報は含めない）。
 ///
 /// 呼び出し文脈: `crate::simple_query::execute_and_respond` が「outcome を
-/// 決定する区間」（`engine.execute_sql_in_session` の呼び出しを含むブロック）
-/// の緊急応答チャネル（`engine::recovery::panic_hook::
+/// 決定する区間」の緊急応答チャネル（`engine::recovery::panic_hook::
 /// EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
-/// （panic フックの外）で事前に組み立てるために使う
-/// （panic フック内でのエンコードによるアロケーション・整形失敗を避けるため。
-/// `panic_hook` モジュールドキュメント参照）。
-///
-/// `detail` は commit 成功境界を跨いだ panic により応答未確定のまま接続が
-/// 終了する可能性を示す `state=may_be_committed` を運ぶ（ERR-1 のワイヤ形式は
-/// spec 側で検討中のため、`D` フィールドは暫定の運び方 ―― spec 側確定時に
-/// 追認・修正できるよう本関数に選定理由をコメントとして残す。`handshake.rs`
-/// の既存 `write_error_response`（`S`/`C`/`M` のみ）は変更せず、本関数を
-/// 別途用意することで既存の 3 フィールド契約に影響を与えない）。
+/// （panic フックの外）で事前に組み立てるために使う（panic フック内での
+/// エンコードによるアロケーション・整形失敗を避けるため。`panic_hook`
+/// モジュールドキュメント参照）。`handshake.rs` の `write_error_response`
+/// （ソケットへ直接書き込む版）とはフィールド構成は同じだが、こちらはバイト列を
+/// 返すだけで書き込みを行わない別実装（呼び出し文脈が異なるため統合しない）。
 ///
 /// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
 /// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
 /// 起こさない（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」。
 /// 本関数の入力自体は untrusted ではないが、同じ規律を踏襲する）。
-pub fn encode_error_response_with_detail(
-    sqlstate: &str,
-    message: &str,
-    detail: &str,
-) -> Result<Vec<u8>, EncodeError> {
+pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, EncodeError> {
     let mut body = Vec::new();
     body.push(b'S');
     body.extend_from_slice(b"ERROR");
@@ -192,9 +182,6 @@ pub fn encode_error_response_with_detail(
     body.push(b'M');
     body.extend_from_slice(message.as_bytes());
     body.push(0);
-    body.push(b'D');
-    body.extend_from_slice(detail.as_bytes());
-    body.push(0);
     body.push(0); // フィールド終端
     let total_len = frame_len(body.len())?;
     let mut msg = Vec::with_capacity(1 + body.len() + 4);
@@ -203,6 +190,18 @@ pub fn encode_error_response_with_detail(
     msg.extend_from_slice(&body);
     Ok(msg)
 }
+
+// NOTE（codex-review P1・PR #253 指摘対応）: 以前ここには `S`/`C`/`M` に加え
+// `D`（detail）フィールドを付与する `encode_error_response_with_detail` が
+// あり、ERR-1（commit 成功境界を跨いだ panic の観測可能性）の緊急応答が
+// `state=may_be_committed` を `D` フィールドとして運んでいた。ERR-1 の
+// ワイヤ形式（運搬フィールド・値）は spec 側で未確定であり、暫定形式を
+// クライアント向け送出経路（`simple_query::execute_and_respond` の緊急応答
+// チャネル）へ接続することは、実装都合の契約を先に確定させてしまう
+// （spec-confidentiality・spec との整合の観点で不可）。ERR-1 のワイヤ形式が
+// spec 側で確定するまで、緊急応答は既存の 3 フィールド契約（`S`/`C`/`M`）
+// のみで送出する（`simple_query::build_emergency_response_bytes` 参照）。
+// 確定後にここへ `D` フィールド付き encoder を復元する。
 
 #[cfg(test)]
 mod tests {
@@ -335,13 +334,11 @@ mod tests {
         assert_eq!(msg, vec![b'I', 0, 0, 0, 4]);
     }
 
-    // --- encode_error_response_with_detail（TASK-97・RECOVER-6・ERR-1）---
+    // --- encode_error_response（TASK-97・RECOVER-6、codex-review P1・PR #253 指摘対応）---
 
     #[test]
-    fn error_response_with_detail_contains_s_c_m_d_fields_and_terminator() {
-        let msg =
-            encode_error_response_with_detail("XX000", "internal error", "state=may_be_committed")
-                .expect("encode");
+    fn error_response_contains_s_c_m_fields_and_terminator_only() {
+        let msg = encode_error_response("XX000", "internal error").expect("encode");
         assert_eq!(byte_at(&msg, 0), b'E');
 
         // body は 'E' + length(4 バイト) の直後（インデックス 5）から始まる。
@@ -350,7 +347,9 @@ mod tests {
         assert!(body.windows(6).any(|w| w == b"ERROR\0"));
         assert!(body.windows(6).any(|w| w == b"XX000\0"));
         assert!(body.windows(15).any(|w| w == b"internal error\0"));
-        assert!(body.windows(23).any(|w| w == b"state=may_be_committed\0"));
+        // `D`（detail）フィールドは含まない（ERR-1 のワイヤ形式が spec 側で
+        // 未確定のため。上記 NOTE 参照）。
+        assert!(!body.contains(&b'D'));
         assert_eq!(
             body.last().copied(),
             Some(0),
