@@ -80,19 +80,8 @@ fn err3_content_mismatch_wire_code_is_exclusive_to_its_own_class() {
         "22023 は 23505 に写像してはならない（fail-closed の核心契約）"
     );
 
-    // `ALL` を走査し、`OperationIdContentMismatch` 以外のどの分類とも
-    // `wire_code` が衝突しないことを網羅的に確認する。
-    for other in ErrorClass::ALL {
-        if other == mismatch_class {
-            continue;
-        }
-        assert_ne!(
-            other.wire_code(),
-            mismatch_code,
-            "{:?} の wire_code が 22023 と衝突している",
-            other
-        );
-    }
+    // 全分類間の wire_code 一意性は tests/error_format.rs::err2_all_classes_have_unique_wire_codes
+    // が既にグローバルに保証しているため、ここでの ALL 走査による再検証は行わない。
 
     // `from_wire_code` の逆引きも `OperationIdContentMismatch` へのみ戻る。
     assert_eq!(
