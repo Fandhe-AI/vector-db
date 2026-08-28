@@ -922,6 +922,26 @@ fn resolve_socket_addrs(
     }
 }
 
+/// `Host:` ヘッダの値（authority-form）を組み立てる。`host` が IPv6 リテラル
+/// （`:` を含む）の場合は RFC 3986 に従い `[...]` で囲む（Cursor Bugbot PR #252
+/// 指摘）。ポート番号は HTTP の既定ポート（80）以外では省略できない（RFC 9110
+/// §7.2。省略すると受信側がデフォルトポート＝80 宛と誤解釈しうる）ため、`port`
+/// が 80 以外の場合は `:port` を付与する（codex-review PR #252 P2 指摘）。
+/// `http_post_json` からのみ呼ばれる。`host` はホスト名／IPv4／IPv6 リテラルの
+/// いずれも保持しうる契約（[`resolve_socket_addrs`] のドキュメント参照）。
+fn format_host_header(host: &str, port: u16) -> String {
+    let bracketed_host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    if port == 80 {
+        bracketed_host
+    } else {
+        format!("{bracketed_host}:{port}")
+    }
+}
+
 /// `POST {path}` で `body`（JSON）を送信し、HTTP 応答本文（生バイト列）を返す。
 /// 接続・読み書きタイムアウト、応答ヘッダ・本文の各サイズ上限、`Content-Length`／
 /// `Transfer-Encoding: chunked` の双方に対応する（モジュールドキュメント参照）。
@@ -969,17 +989,7 @@ fn http_post_json(config: &OllamaConfig, path: &str, body: &str) -> Result<Vec<u
         .set_write_timeout(Some(config.read_timeout))
         .map_err(classify_io_error)?;
 
-    // IPv6 リテラル（例: `::1`）はそのまま `Host:` ヘッダへ書くと `:` がポート区切りと
-    // 混同され曖昧になるため、RFC 3986 に従い `[...]` で囲む（Cursor Bugbot PR #252
-    // 指摘）。`config.host()` はホスト名／IPv4／IPv6 リテラルのいずれも保持しうる契約
-    // （`resolve_socket_addrs` のドキュメント参照）のため、`:` を含む場合のみ角括弧を
-    // 付与する（IPv4・ホスト名は `:` を含まないため無変換）。
-    let raw_host = config.host();
-    let header_host = if raw_host.contains(':') {
-        format!("[{raw_host}]")
-    } else {
-        raw_host.to_string()
-    };
+    let header_host = format_host_header(config.host(), config.port());
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
@@ -1803,8 +1813,9 @@ mod tests {
         // アドレス文字列組み立て（`::1:PORT` は不正な文字列になる）ではなく
         // `(host, port)` タプル形式の `ToSocketAddrs` を使うことで正しく接続できる
         // ことを確認する。あわせて Cursor Bugbot PR #252 指摘の回帰確認として、
-        // 送信された `Host:` ヘッダが `[::1]`（RFC 3986 の角括弧付き）形式に
-        // なっていることをスタブ側で受信した生リクエストから検証する。
+        // 送信された `Host:` ヘッダが `[::1]:PORT`（RFC 3986 の角括弧付き、かつ
+        // 非既定ポート付き。codex-review PR #252 P2 指摘）形式になっていることを
+        // スタブ側で受信した生リクエストから検証する。
         let listener = TcpListener::bind("[::1]:0").expect("bind ipv6 stub listener");
         let addr = listener.local_addr().expect("local addr");
         let (header_tx, header_rx) = mpsc::channel::<String>();
@@ -1850,13 +1861,12 @@ mod tests {
             .expect("ipv6 loopback connection should succeed");
         assert!(expansion.contains("search_terms"));
 
-        // Host ヘッダはポート番号を含まない既存契約（本修正のスコープ外。
-        // Cursor Bugbot PR #252 指摘は角括弧欠落のみを対象とする）のため、
-        // 角括弧付きホストのみを検証する。
+        // スタブは OS 割り当ての非既定（非 80）ポートで待ち受けるため、
+        // Host ヘッダにポート番号が付与されることも合わせて検証する。
         let host_header = header_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("stub should capture Host header");
-        assert_eq!(host_header, "Host: [::1]");
+        assert_eq!(host_header, format!("Host: [::1]:{}", addr.port()));
     }
 
     #[test]
@@ -1987,5 +1997,33 @@ mod tests {
         let body = build_generate_request_body("m", "line1\nline2\"quoted\"", "5m");
         assert!(body.contains("\\n"));
         assert!(body.contains("\\\"quoted\\\""));
+    }
+
+    // 回帰テスト（codex-review PR #252 P2 指摘対応）: `format_host_header` の
+    // authority-form 組み立てを、IPv4／ホスト名／IPv6・既定ポート（80）省略／
+    // 非既定ポート付与の各組み合わせで直接検証する。
+    #[test]
+    fn format_host_header_appends_non_default_port_for_ipv4() {
+        assert_eq!(format_host_header("127.0.0.1", 11434), "127.0.0.1:11434");
+    }
+
+    #[test]
+    fn format_host_header_appends_non_default_port_for_hostname() {
+        assert_eq!(format_host_header("localhost", 11434), "localhost:11434");
+    }
+
+    #[test]
+    fn format_host_header_brackets_ipv6_and_appends_non_default_port() {
+        assert_eq!(format_host_header("::1", 11434), "[::1]:11434");
+    }
+
+    #[test]
+    fn format_host_header_omits_default_http_port_for_ipv4() {
+        assert_eq!(format_host_header("127.0.0.1", 80), "127.0.0.1");
+    }
+
+    #[test]
+    fn format_host_header_omits_default_http_port_for_ipv6() {
+        assert_eq!(format_host_header("::1", 80), "[::1]");
     }
 }
