@@ -464,11 +464,33 @@ fn accumulate_ranked(
 }
 
 /// ソフトブースト（TASK-111・PLAN-1）でヒント種別 1 件一致あたりに加点する既定値。
-/// PoC 実測構成（ポインタ: `docs/spec/03-poc/llm-query-planning/scripts/eval_expanded.py`）
-/// に基づく値で、spec 本文は転記しない。[`RrfConfig::default`] のスケール
-/// （`weight / k_const` ≈ 1/60 ≈ 0.0167）に対し、加点はそれより一段小さく、複数ヒント
-/// 一致でも上位の RRF 実順位を覆さない程度に留める。
-pub const SOFT_BOOST_PER_MATCH: f64 = 0.02;
+/// 受け入れ基準の数値そのものは非公開（ポインタ: TASK-111・PLAN-1。spec 本文は
+/// 転記しない）で、本値は spec 由来の数値ではなく [`RrfConfig::default`]
+/// （`k_const=60.0`・`dense_weight=sparse_weight=1.0`、いずれも本ファイル内で
+/// 既に公開済みの定数）から純粋に導出した安全側の値である。
+///
+/// 保証している性質は次の 1 点のみ（codex-review 指摘対応）: [`RrfConfig::default`]
+/// では、融合プールが空でない限り真の 1 位の融合スコアは必ず `weight / (k_const + 1)`
+/// = `1.0 / 61.0` ≈ `0.016393` 以上になる（密・疎いずれかのチャネルで 1 位の候補が
+/// 必ずプールに含まれるため）。一方、[`MAX_BOOST_RULES`] 件（最大 16 件）のルールが
+/// 同一候補へ同時に一致しても加点合計は `16 * 0.001 = 0.016 < 0.016393` に収まる。
+/// したがって、ヒント一致だけでプール最下位級の候補を新たな 1 位へ押し上げる
+/// ことはできない。一方、Top-k 圏外の近接順位候補が圏内へ浮上する程度の入れ替え
+/// （`tests/soft_boost.rs` で検証）は PLAN-1 の意図どおり引き続き起こる。
+///
+/// この境界は [`RrfConfig::default`] の `k_const`／重みに対してのみ成立する。より
+/// 大きい `k_const` やより小さい重みを渡す呼び出し元は、本定数をそのまま使わず
+/// [`BoostRule::new`] の `amount` 側でスケールすること（[`MAX_BOOST_AMOUNT`] は
+/// そうした EXT-4 の他用途向けに意図的に大きく許容してある）。
+pub const SOFT_BOOST_PER_MATCH: f64 = 0.001;
+
+// 上記の安全マージンをコンパイル時に固定する（`MAX_BOOST_RULES` や
+// `SOFT_BOOST_PER_MATCH` の将来変更で無言のうちに破られないようにするガード）。
+const _: () = assert!(
+    (MAX_BOOST_RULES as f64) * SOFT_BOOST_PER_MATCH < 1.0 / 61.0,
+    "SOFT_BOOST_PER_MATCH * MAX_BOOST_RULES must stay below the RrfConfig::default \
+     single-channel top-1 contribution (1/61)"
+);
 
 /// [`apply_soft_boost`] が 1 回の呼び出しで受け付けるブーストルール数の上限
 /// （無制限入力の拒否。coding-rust.md「長さフィールドは上限検証してから」）。
@@ -1369,6 +1391,33 @@ mod tests {
         apply_soft_boost(&mut hits, &[rule]).expect("ok");
         assert_eq!(hits[0].id, 2);
         assert_eq!(hits[1].id, 1);
+    }
+
+    #[test]
+    fn apply_soft_boost_default_amount_cannot_overtake_default_cfg_top_rank() {
+        // codex-review P1 対応の回帰: `SOFT_BOOST_PER_MATCH`（既定値）で
+        // `MAX_BOOST_RULES` 件全てが同一候補へ一致しても、[`RrfConfig::default`]
+        // 下で真の 1 位が取りうる最小スコア（`weight / (k_const + 1)` = 1/61。
+        // モジュールドキュメント参照）を上回れないことを確認する。id=2 はプール
+        // 最下位級の低スコア（0.0）から出発させ、最悪ケースの加点合計を与える。
+        let top1_min_score = 1.0 / 61.0;
+        let mut hits = vec![
+            HybridHit {
+                id: 1,
+                score: top1_min_score,
+            },
+            HybridHit { id: 2, score: 0.0 },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
+        let rules: Vec<BoostRule<'_>> = (0..MAX_BOOST_RULES).map(|_| rule).collect();
+        apply_soft_boost(&mut hits, &rules).expect("ok");
+
+        let h1 = hits.iter().find(|h| h.id == 1).unwrap();
+        let h2 = hits.iter().find(|h| h.id == 2).unwrap();
+        assert!(h2.score < h1.score, "h2={h2:?} must not overtake h1={h1:?}");
+        // 順位（先頭が id=1 のまま）も併せて確認する。
+        assert_eq!(hits[0].id, 1);
     }
 
     #[test]
