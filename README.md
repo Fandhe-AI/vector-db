@@ -114,7 +114,7 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧および値は `cargo bench --bench tier_latency_bench -p engine -- --help` 相当のエラーメッセージ（未設定・不正値は fail-closed で env 名を含む明示エラーとして表示されます）で確認できます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
 
-実測結果は `docs/design/tier-latency-acceptance.md` の「実測状況」節へ記録してください。判定ロジック層（時間非依存の純関数）のみ `crates/engine/tests/tier_latency_accept.rs` として `make ci` 対象です。設計判断の記録は `docs/design/tier-latency-acceptance.md` を参照してください。
+実測値（p95 の数値）そのものは public な `docs/design/tier-latency-acceptance.md` へ転記せず、非公開記録先へ保存してください。同ドキュメントの「実測状態」節には各判定の「実施済み/未実施」「pass/fail」「routing 一致/不一致」という非数値の状態のみを更新してください。判定ロジック層（時間非依存の純関数）のみ `crates/engine/tests/tier_latency_accept.rs` として `make ci` 対象です。設計判断の記録は `docs/design/tier-latency-acceptance.md` を参照してください。
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
 
