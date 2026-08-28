@@ -54,19 +54,44 @@
 //! 3. **全体再構築比判定**（[`index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild`]。
 //!    既存テストの再定義）: `t_full` を増分経路の逐次累積ではなく、一括投入 API
 //!    （`EngineCore::execute_insert_sql_batch`。TASK-122・INDEX-4）による 1 バッチ
-//!    全体再構築で計測し、単一ファイル経路固有の退行を検出できるようにする
-//!    （経路共通の退行の主検出は柱 1・2 が担う）。
+//!    全体再構築で計測する。**限界（PR #296 codex-review 指摘。修正前の本コメントは
+//!    この限界を誤って「解消済み」と記述していた）**: `index_file_batch`
+//!    （`src/incremental.rs`）はバッチ内の各ファイルについて `index_file`（柱 1・2 が
+//!    対象とする単一ファイル経路）と同じ [`embed_and_write_phase`
+//!    (`engine::incremental`)] を順に呼ぶ実装であり、独立した別実装の全体再構築経路
+//!    ではない。そのため「単一ファイル挿入 1 回が既存コーパス規模に比例して重くなる」
+//!    再処理型退行が起きた場合、`t_full` を構成する `BASELINE_FILES + 1` 回の呼び出し
+//!    自体も同じ退行の影響を受けて逐次重くなり（0 件→ `BASELINE_FILES` 件まで増える
+//!    コーパスに対する `embed_and_write_phase` 呼び出しの総和）、退行の有無に関わらず
+//!    `t_full` は `t_inc`（`BASELINE_FILES` 件時点の 1 回分）のおよそ `BASELINE_FILES`
+//!    倍程度の桁になる。結果として `within_ratio_threshold` は退行の有無を問わず
+//!    ほぼ常に真になり、柱 3 単独ではこの再処理型退行を判別できない
+//!    （経路共通の退行の検出は柱 1・2 が担い、両者は `t_full` に依存せず `t_inc` の
+//!    カウント・時間のみで独立に判定するためこの限界の影響を受けない。モジュール
+//!    冒頭の「検出対象」参照）。柱 3 が実際に検出できるのは、`index_file` にのみ存在し
+//!    `index_file_batch` には存在しない、単一ファイル経路固有の退行（例:
+//!    `execute_insert_sql`／`index_file` 呼び出し経路だけに挿入された余分な処理）に
+//!    限られる。
 //!
 //! vacuous pass 防止（Issue #281 AC2）として、上記 3 判定と同一の判定述語
 //! （[`within_ratio_threshold`]・[`within_scaling_slack`]・[`work_is_single_file`]）を、
 //! 「既存コーパス全件の同一パス再投入 ＋ 新規 1 件」という再処理型退行の実測モデル
 //! （[`measure_simulated_full_reprocess`]）に通し、判定が確実に `false`（拒否）を返す
 //! ことを [`index1_judgements_reject_simulated_full_reprocess_regression`] で固定する。
+//! **この負例が検証しているのは「[`measure_simulated_full_reprocess`] というモデルに
+//! 対して各判定述語が `false` を返すこと」であり、柱 3
+//! （[`within_ratio_threshold`]）が実際の実装退行を検出できることの証明ではない**
+//! （上記「限界」参照）。[`measure_simulated_full_reprocess`] は既存 `n_files` 件
+//! 全件を**同一パスへ**再投入する（コーパス総行数は増えず一定のまま `n_files + 1`
+//! 回の呼び出しを行う）ため、`measure_full_rebuild_batch` の「0 件から
+//! `BASELINE_FILES` 件まで増えていくコーパスに対する `BASELINE_FILES + 1` 回の呼び出し
+//! （各呼び出しの重さが右肩上がり）」とは負荷の形が異なり、単純な総和比較にはならない
+//! （柱 3 の負例は判定式ライブラリの動作確認であり、柱 3 単体の検出力を主張する根拠
+//! ではない。柱 3 の実際の検出対象は上記のとおり「経路固有」の退行に限られる）。
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 use engine::batch_limits::BatchLimits;
@@ -83,64 +108,23 @@ use engine::storage::{Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+// 計測系テスト（時間・カウントいずれも既存コーパス規模に応じて重くなる処理を含む）
+// が並列に走って互いのタイミングを乱さないようにする（フレーク対策。coding-rust.md
+// のフレーク対策方針に沿い、判定自体は比率・回数ベースだが、計測対象は実プロセスの
+// CPU 時間である以上、並走する他テストの負荷から隔離する）。
+//
+// Issue #281 codex-review P2 指摘: 従来この直列化機構（プロセス内 Mutex ＋クロス
+// プロセスファイルロック）は本ファイル固有のコピーで、`tests/incremental_write_perf.rs`
+// 等の他 integration-test バイナリはこの Mutex を取得しないため並走し得た。
+// `crates/engine/src/test_util/timing_lock.rs` へ一本化し、計測系テストファイルが
+// 同じロックファイルパスを共有することで、バイナリをまたいだ直列化を成立させる
+// （同モジュールのドキュメンテーションコメント参照。本ファイルも他の計測系テスト
+// ファイルと同じく `#[path]` で取り込む）。
+#[path = "../src/test_util/timing_lock.rs"]
+mod timing_lock;
+use timing_lock::acquire_timing_lock;
+
 const DIM: u32 = 128;
-
-/// 計測系テスト（時間・カウントいずれも既存コーパス規模に応じて重くなる処理を含む）
-/// が並列に走って互いのタイミングを乱さないようにする（フレーク対策。coding-rust.md
-/// のフレーク対策方針に沿い、判定自体は比率・回数ベースだが、計測対象は実プロセスの
-/// CPU 時間である以上、並走する他テストの負荷から隔離する）。poison 時は
-/// `into_inner()` で回復する（1 テストの panic で以降の計測系テストが巻き添えで
-/// 失敗しないようにする）。
-///
-/// 本 Mutex は同一 integration-test バイナリ内（本ファイルの 3 テスト）のみを
-/// 直列化し、`cargo test` が別プロセスとして起動する他の integration-test バイナリ
-/// （例: `tests/incremental_write_perf.rs`）や、この Mutex を取得しない他テストとは
-/// 並走し得る（Issue #281 codex-review P2 指摘）。[`acquire_timing_lock`] はこれに
-/// プロセス間ファイルロックを重ね、本テストバイナリを他プロセスの `cargo test`
-/// 実行（同一リポジトリの再実行・並列 CI ジョブ等）とも直列化する。
-static TIMING_LOCK: Mutex<()> = Mutex::new(());
-
-/// [`acquire_timing_lock`] が返すガード。Drop 順でファイルロック解放 → プロセス内
-/// Mutex 解放となる（`File` の Drop で OS ロックが解放されるため明示 unlock は不要）。
-struct TimingLockGuard {
-    _process_guard: MutexGuard<'static, ()>,
-    _lock_file: File,
-}
-
-/// クロスプロセス直列化用ロックファイルのパス。`CARGO_MANIFEST_DIR/target` 配下に
-/// 固定し、`cargo clean` で自然に掃除される（一時ファイル配置は
-/// `temp_db::unique_db_path` と同じ流儀）。ファイル自体の内容は使わず、OS のファイル
-/// ロック機構（`File::lock`。Unix は `flock` 相当）の対象としてのみ使う。
-fn timing_lock_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("incremental-recall-timing.lock")
-}
-
-/// 計測系テスト専用の直列化ガードを取得する（柱 2・3 の計測開始前に必ず呼ぶ）。
-/// プロセス内 Mutex（同一バイナリ内 3 テストの直列化・poison 復帰）に加え、
-/// [`timing_lock_path`] に対する OS ファイルロック（他 integration-test バイナリ・
-/// 他 `cargo test` プロセスとの直列化）を取得することで、「全競合テストで共有できる
-/// 直列化方式」（Issue #281 codex-review 指摘）とする。同じ規約（このパスをロックする）
-/// に従う限り、他の計測系テストファイルも同じ機構に相乗りできる。
-fn acquire_timing_lock() -> TimingLockGuard {
-    let process_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let path = timing_lock_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create timing lock directory");
-    }
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .expect("open cross-process timing lock file");
-    lock_file.lock().expect("acquire cross-process timing lock");
-    TimingLockGuard {
-        _process_guard: process_guard,
-        _lock_file: lock_file,
-    }
-}
 
 /// 生成チャンク数を小さく固定するための `IncrementalConfig`（1 チャンク = 2 行。
 /// `tests/incremental_index.rs` の `small_chunk_config` と同じ流儀）。
@@ -451,10 +435,15 @@ fn measure_single_file_insert(
 ///
 /// Issue #281 見直し前は増分経路（`execute_insert_sql`）そのものを `BASELINE_FILES + 1`
 /// 回呼ぶ逐次投入だったため、増分経路自体の退行が `t_inc`・`t_full` 双方に同時に乗り
-/// 判定をすり抜け得た（モジュールドキュメント参照）。一括投入 API に切り替えることで、
-/// 測定対象を「engine が提供する一括投入経路」に揃え、単一ファイル経路
-/// （`execute_file_insert`/`index_file`）固有の退行を検出できるようにする
-/// （経路共通の退行の主検出は柱 1・2 が担う）。
+/// 判定をすり抜け得た（モジュールドキュメント参照）。一括投入 API へ切り替えたが、
+/// **`index_file_batch` はバッチ内の各ファイルに対し `index_file` と同じ
+/// `embed_and_write_phase` を順に呼ぶ実装（`src/incremental.rs` 参照）であり、
+/// 経路共通の再処理型退行（既存コーパス規模に比例して単一ファイル挿入が重くなる
+/// 種類の退行）に対しては `t_full` 自身も同じ影響を受けるため判別できない
+/// （PR #296 codex-review 指摘。モジュールドキュメントの柱 3「限界」節に詳細）**。
+/// 本関数が実際に検出できるのは `index_file` にのみ存在し `index_file_batch` には
+/// 存在しない、単一ファイル経路固有の退行に限られる（経路共通の退行の検出は
+/// `t_full` に依存しない柱 1・2 が担う）。
 fn measure_full_rebuild_batch() -> Duration {
     let mut durations = Vec::with_capacity(MEASUREMENT_ROUNDS);
     for round in 0..MEASUREMENT_ROUNDS {
