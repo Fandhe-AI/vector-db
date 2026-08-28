@@ -44,12 +44,20 @@
 //!   しない）」ことを独立にアサートする
 //! - 層 B（`#[ignore]`・`make query-planning-regression` 経由）: spec 由来の下限
 //!   （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`＝intent の改善幅下限・
-//!   `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`＝direct の絶対下限。`.github/workflows/
+//!   `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`＝direct の絶対下限・
+//!   `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`＝[`NoisyLlmClient`]
+//!   （非 oracle・劣化展開品質）による intent 改善幅下限。`.github/workflows/
 //!   recall.yml` が environment `recall-gate` の Actions variables から注入）と
 //!   実測値を比較する閾値ゲート。`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
 //!   （`recall.yml` の Run step からのみ注入）で未設定を fail-closed にする strict
 //!   モードを持つ（`rerank_recall.rs::resolve_gate_threshold` と同型。ログには
-//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）
+//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）。
+//!   `MockLlmClient`（完全 oracle 写像）の下限のみでは production の展開品質劣化を
+//!   検出できない（codex-review・PR #265・P1 指摘）ため、[`NoisyLlmClient`] による
+//!   劣化展開の実測を、oracle 写像の下限とは独立の第 3 の下限として同一ゲートへ
+//!   接続する（既存 2 下限のオーバーロードによる誤検知は既に実測で確認済み・
+//!   `docs/design/query-planning-recall-regression.md` 参照。値そのものは
+//!   引き続き spec・オーナー側の判断事項）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 実 Ollama 接続での実測は対象外（TASK-110 時点からの継続制約。本テストは
@@ -426,7 +434,12 @@ impl LlmClient for MockLlmClient {
 /// 得られない語として残る）。codex-review（PR #265・P2）が指摘した「層 B の受け入れ
 /// ゲートが `MockLlmClient` の完全 oracle 写像に依存し、展開品質の劣化を検出できない」
 /// という制約に対応するため、[`query_planning_recall_detects_degraded_expansion_quality`]
-/// でこの劣化構成を実測し、完全写像との Recall@20 差を独立にアサートする。
+/// （層 A）でこの劣化構成を実測し完全写像との Recall@20 差を独立にアサートするのに
+/// 加え、[`query_planning_recall_threshold_gate`]（層 B）でも独立の下限
+/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` と比較する
+/// （codex-review・PR #265・P1 指摘への対応。既存の oracle 写像下限を非 oracle
+/// スタブへ流用すると誤検知することが実測済みのため、専用の下限を別変数として
+/// 独立に解決する。`docs/design/query-planning-recall-regression.md` 参照）。
 struct NoisyLlmClient;
 
 impl LlmClient for NoisyLlmClient {
@@ -844,25 +857,53 @@ fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
     resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
+/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` 用の
+/// [`resolve_gate_threshold_with`]（許容範囲 `[0.0, 1.0]` の
+/// [`improvement_threshold_from_env`] を使う点は [`resolve_improvement_gate_threshold`]
+/// と同じ。[`NoisyLlmClient`]（非 oracle・劣化展開品質）による intent 改善幅の下限を
+/// 独立に解決する。既存 2 変数の値をそのまま流用しない理由は
+/// [`query_planning_recall_threshold_gate`] のドキュメンテーションコメント参照）。
+fn resolve_degraded_improvement_gate_threshold(var: &str) -> Option<f64> {
+    resolve_gate_threshold_with(var, improvement_threshold_from_env)
+}
+
 /// TASK-112（PLAN-1, PLAN-2）層 B: intent カテゴリの改善幅（after − baseline）が
-/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` 以上、かつ direct カテゴリの
-/// after Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（絶対下限）以上である
-/// ことを確認する閾値ゲート。契約は `rerank_recall.rs::
-/// rerank_recall_large_scale_threshold_gate` と同一（2 つの下限を独立に解決し、
-/// 片方のみ設定済みの場合は設定済みの側だけを判定する。両方未設定かつ非 strict の
-/// 場合のみコーパス生成前に早期 return して成功終了する。strict モードでは
-/// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。ログには
-/// pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
+/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` 以上、direct カテゴリの
+/// after Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（絶対下限）以上、かつ
+/// [`NoisyLlmClient`]（非 oracle・劣化展開品質）による intent カテゴリの改善幅が
+/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` 以上であることを確認する
+/// 閾値ゲート。契約は `rerank_recall.rs::rerank_recall_large_scale_threshold_gate` と
+/// 同型（各下限を独立に解決し、設定済みの下限のみ判定する。3 つとも未設定かつ非
+/// strict の場合のみコーパス生成前に早期 return して成功終了する。strict モードでは
+/// [`resolve_gate_threshold_with`] が未設定を検出した時点で fail-closed になる）。
+/// ログには pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
+///
+/// **3 番目の下限を独立変数にする理由**（codex-review・PR #265・P1 指摘への対応）:
+/// `MockLlmClient`（完全 oracle 写像）専用に較正された既存 2 下限を
+/// `NoisyLlmClient`（非 oracle・劣化展開）の実測へそのまま適用する変更を一度試み
+/// たところ、両クライアントで pass/fail が分かれる閾値域が実測により確認された
+/// （`docs/design/query-planning-recall-regression.md` 参照）。oracle 写像基準の
+/// 下限を非 oracle スタブへ流用すると、production の展開品質が劣化していなくても
+/// 誤って fail しうるため、劣化シナリオ専用の下限を別の Actions variable として
+/// 独立に解決し、それが未設定の間は（strict モードでない限り）この副検査を
+/// 「対象外」として no-op にする（他の 2 下限のいずれかが設定済みなら、それらの
+/// 判定は独立に継続する）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
 fn query_planning_recall_threshold_gate() {
     let min_intent_improvement =
         resolve_improvement_gate_threshold("QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT");
     let min_r20_direct = resolve_gate_threshold("QUERY_PLANNING_RECALL_MIN_R20_DIRECT");
+    let min_intent_improvement_degraded = resolve_degraded_improvement_gate_threshold(
+        "QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED",
+    );
 
-    if min_intent_improvement.is_none() && min_r20_direct.is_none() {
+    if min_intent_improvement.is_none()
+        && min_r20_direct.is_none()
+        && min_intent_improvement_degraded.is_none()
+    {
         println!(
-            "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT/QUERY_PLANNING_RECALL_MIN_R20_DIRECT not configured; gate not enabled (explicit no-op, not a failure)"
+            "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT/QUERY_PLANNING_RECALL_MIN_R20_DIRECT/QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED not configured; gate not enabled (explicit no-op, not a failure)"
         );
         return;
     }
@@ -898,9 +939,33 @@ fn query_planning_recall_threshold_gate() {
             );
         }
     }
+    match min_intent_improvement_degraded {
+        Some(min) => {
+            // `NoisyLlmClient` は intent の言い換え語彙の半数のみ写像するため、
+            // measure_category_recall はこの副検査専用にここでのみ実行する
+            // （oracle 写像の上記 2 検査と生成コストを共有しない独立経路）。
+            let intent_degraded = measure_category_recall_with_client(
+                &docs,
+                &pairs,
+                VOCAB_SIZE,
+                intent_baseline,
+                &NoisyLlmClient,
+            );
+            let intent_improvement_degraded =
+                intent_degraded.after_recall20() - intent_degraded.baseline_recall20();
+            let pass_degraded = intent_improvement_degraded >= min;
+            pass &= pass_degraded;
+            println!("query_planning_recall_threshold_gate: pass_degraded={pass_degraded}");
+        }
+        None => {
+            println!(
+                "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED not configured; sub-check not enabled"
+            );
+        }
+    }
 
     assert!(
         pass,
-        "intent recall improvement or direct after-expansion recall@20 is below the configured QUERY_PLANNING_RECALL_MIN_* threshold"
+        "intent recall improvement, direct after-expansion recall@20, or degraded-expansion intent recall improvement is below the configured QUERY_PLANNING_RECALL_MIN_* threshold"
     );
 }

@@ -68,10 +68,12 @@
 - **層 B**（`#[ignore]`。`make query-planning-regression` 経由）: spec 由来の下限
   （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`＝intent カテゴリの改善幅下限・
   `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`＝direct カテゴリの after Recall@20 絶対
-  下限。`.github/workflows/recall.yml` の同一 job・同一 environment `recall-gate`
-  から注入）と実測値を比較する閾値ゲート。TASK-104/TASK-108 と同じ opt-in
-  （未設定＝対象外）・strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
-  で未設定を fail-closed 化）を持つ
+  下限・`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`＝`NoisyLlmClient`
+  〔非 oracle・劣化展開品質〕による intent カテゴリの改善幅下限。`.github/workflows/
+  recall.yml` の同一 job・同一 environment `recall-gate` から注入）と実測値を比較
+  する閾値ゲート。TASK-104/TASK-108 と同じ opt-in（未設定＝対象外）・strict モード
+  （`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1` で未設定を fail-closed 化）を持つ。
+  3 番目の下限を独立変数にする理由は下記「既知の制約・スコープ外」参照
 
 `.github/workflows/recall.yml` の TASK-104 由来の設計判断（`pull_request` トリガを
 持たない・`workflow_dispatch` のみ・`if: github.ref == 'refs/heads/main'`・
@@ -109,20 +111,31 @@
   `NoisyLlmClient`（劣化した production LLM 応答を模する決定的スタブ）を追加し、
   完全 oracle 写像（`MockLlmClient`）との Recall@20 差を独立にアサートすることで、
   展開戦略の劣化そのものを検出できることを回帰保証する
-- **層 B ゲートを `MockLlmClient` 固定に留める判断**（codex-review・PR #265・P1
-  指摘への対応）: 層 B の受け入れゲート（`query_planning_recall_threshold_gate`）を
-  `NoisyLlmClient`（非 oracle・劣化展開品質）でも同一の spec 閾値
+- **層 B ゲートへの `NoisyLlmClient` 接続**（codex-review・PR #265・P1 指摘への
+  対応。当初は本節で「`MockLlmClient` 固定に留める」判断を記録していたが、以下の
+  理由により撤回し、層 B にも劣化展開シナリオを接続した）: 最初に試みたのは、
+  層 B の受け入れゲート（`query_planning_recall_threshold_gate`）を `NoisyLlmClient`
+  （非 oracle・劣化展開品質）でも既存の 2 つの spec 閾値
   （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`／`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`）
-  で評価する変更を一時追加したが、実測により両ゲートの pass/fail が分かれる閾値域が
-  存在することを確認した。この閾値は完全 oracle 写像（`MockLlmClient`）の実測を基準に
-  設定されたものであり、非 oracle スタブへそのまま適用すると production の展開品質が
-  劣化していなくても（実装は正しいままでも）週次 `recall.yml` が新規に fail しうる。
-  劣化シナリオ専用の閾値を新設する選択肢も検討したが、`resolve_gate_threshold` は
-  strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`。`recall.yml` が設定）
-  で未設定の Actions variable を fail-closed 扱いにするため、本リポ側だけで新しい
-  `QUERY_PLANNING_RECALL_MIN_*` 変数を追加すると、オーナーが対応する値を
-  `recall-gate` environment に設定するまで週次実行が確実に fail する。閾値の新設・
-  再調整は spec・オーナー側の判断事項であり本 PR の範囲外のため、`NoisyLlmClient` 版
-  ゲート（`query_planning_recall_threshold_gate_degraded_expansion`）は追加せず、
-  層 B は `MockLlmClient` 固定のまま維持する。展開品質の劣化検出感度は、上記の層 A
-  （`MockLlmClient` との相対比較）が引き続き回帰保証する
+  で評価する変更だったが、実測により両ゲートの pass/fail が分かれる閾値域が存在する
+  ことを確認した。この 2 閾値は完全 oracle 写像（`MockLlmClient`）の実測を基準に
+  設定されたものであり、非 oracle スタブへそのまま流用すると production の展開品質が
+  劣化していなくても誤って fail しうる。この実測結果自体は正しく、既存 2 変数の
+  値を非 oracle スタブへ流用しない判断は維持する。
+  一方、「劣化シナリオ専用の閾値を新設すると、オーナーが対応する値を `recall-gate`
+  environment に設定するまで週次実行が fail する」という理由だけで層 B への接続
+  自体を見送るのは筋が通らないと判断した: 本 PR は同じ性質（オーナーによる
+  Actions variable 設定が完了するまで `QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
+  の strict モードで週次実行が fail する）を持つ `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`・
+  `QUERY_PLANNING_RECALL_MIN_R20_DIRECT` の 2 変数を新設し、その設定作業を PR 本文の
+  「対象外（out-of-scope）」節でリポジトリ管理者作業として明示的に受け入れている。
+  3 つ目の変数だけを理由に層 B の接続を見送る根拠にはならない。
+  そこで `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（`NoisyLlmClient`
+  による intent カテゴリ改善幅の下限）を第 3 の独立変数として新設し、
+  `query_planning_recall_threshold_gate` 内の第 3 の副検査として接続した（既存
+  2 検査と同じ `resolve_gate_threshold_with` 経路で解決するため、strict モードでの
+  未設定は同様に fail-closed になる）。既存 2 検査には手を入れず、`MockLlmClient`
+  実測のまま維持する。値そのもの（3 変数とも）は引き続き spec・オーナー側の判断
+  事項であり、本リポジトリにはハードコードしない。展開品質の劣化検出感度は、層 A
+  （`MockLlmClient` との相対比較。`query_planning_recall_detects_degraded_expansion_quality`）
+  に加え、層 B のこの第 3 副検査でも回帰保証する
