@@ -182,19 +182,18 @@ jobs:
   # 常駐 Ollama が無いため、既定では `vars.BENCH_TIER` が未設定（空文字）のままで
   # `tier_latency_bench.rs` 側が「測定不能」を明示ログ出力して判定対象外とする
   # （silent skip にしない。`bench-batch` ジョブの BENCH_CORE6/BENCH_CORE16 opt-in
-  # と同一方針）。実測を行う場合は運用者が `gh variable set BENCH_TIER 1` に加え
-  # 下記の接続・閾値 repo variables を設定したうえで、常駐 Ollama を用意した
-  # セルフホスト runner から本ワークフローを workflow_dispatch する。
-  # `runs-on` は `vars.BENCH_TIER_RUNNER`（セルフホスト runner のラベル）で
-  # 差し替える。`workflow_dispatch` はどこから起動しても実行先が `runs-on`
-  # の指すランナープールに固定されるため、`vars.BENCH_TIER_RUNNER` を設定
-  # せずに `BENCH_TIER` だけを有効化すると、実行先は既定の `ubuntu-latest`
-  # （常駐 Ollama なし）のままとなり Ollama 実接続に失敗して fail-closed で
-  # 非ゼロ終了する（README「ティア別レイテンシ受け入れ基準の repo variables」
-  # 参照）。
+  # と同一方針）。public リポジトリのため runner は GitHub ホステッドを既定とし、
+  # self-hosted の使用は codex-review の codex ジョブ（組織承認済み例外）に限る
+  # （AGENTS.md「CI・ワークフローの改変（P1）」）。本ジョブは `runs-on` を
+  # `ubuntu-latest` 固定とし、repo variable によるランナー差し替え経路は設けない。
+  # そのため `BENCH_TIER` を opt-in しても GitHub ホステッド runner には常駐
+  # Ollama が無く、`tier_latency_bench.rs` の Ollama 実接続は失敗して
+  # fail-closed で非ゼロ終了する。常駐 Ollama を用いた実測が必要な場合は、
+  # GitHub Actions 外の承認済み計測手順として分離する（README「ティア別
+  # レイテンシ受け入れ基準の repo variables」参照）。
   bench-tier:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.BENCH_TIER_RUNNER || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read

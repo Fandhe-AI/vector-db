@@ -110,10 +110,9 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 `make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-115（PLAN-8）のティアリング機構が振り分ける対話ティア／高精度ティアそれぞれについて、クエリ展開の追加処理時間 p95（PLAN-4）と展開込みエンドツーエンド p95（PLAN-6/7。`USING PLAN('<query>')` 経由）を実測します。常駐 Ollama への実接続が前提のため、GitHub ホステッド runner 既定では `BENCH_TIER` repo variable が未設定（空文字）のままとし、`tier_latency_bench.rs` が「測定不能」を明示ログ出力して判定対象外のまま正常終了します（`BENCH_CORE6`/`BENCH_CORE16` と同じ opt-in 方式）。
 
 > [!IMPORTANT]
-> `workflow_dispatch` は起動元マシンではなく、`.github/workflows/bench.yml` の `bench-tier` ジョブの `runs-on` が指すランナープールで常に実行されます。そのため常駐 Ollama を用意したセルフホスト環境から本ワークフローを手動起動しても、`runs-on` を差し替えていなければ実行先は既定の GitHub ホステッド runner（常駐 Ollama なし）のままとなり、`tier_latency_bench.rs` の Ollama 実接続が失敗してジョブは常に fail します。`BENCH_TIER` を有効化する前に、必ず `BENCH_TIER_RUNNER` repo variable にセルフホスト runner のラベル（例: `self-hosted`、または runner に付与した固有ラベル）を設定してください（未設定時は既定の `ubuntu-latest` のまま）。
+> public リポジトリのため `.github/workflows/bench.yml` の `bench-tier` ジョブの `runs-on` は `ubuntu-latest` 固定です（self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み例外であり、repo variable によるランナー差し替え経路は設けません）。GitHub ホステッド runner には常駐 Ollama が無いため、`BENCH_TIER` を opt-in しても `tier_latency_bench.rs` の Ollama 実接続は失敗し、ジョブは fail-closed で非ゼロ終了します。常駐 Ollama を用いた実測が必要な場合は、GitHub Actions 外の承認済み計測手順として別途運用者が実行してください（本ワークフロー経由では実測できません）。
 
 ```bash
-gh variable set BENCH_TIER_RUNNER
 gh variable set BENCH_TIER
 gh variable set BENCH_TIER_OLLAMA_HOST
 gh variable set BENCH_TIER_OLLAMA_PORT
@@ -129,8 +128,7 @@ gh variable set BENCH_TIER_PRECISION_MAX_P95_MS
 
 | variable | 形式 |
 | -------- | ---- |
-| `BENCH_TIER_RUNNER` | セルフホスト runner のラベル（例: `self-hosted`）。未設定時は既定の `ubuntu-latest`（常駐 Ollama なし。`BENCH_TIER` opt-in 時は必須） |
-| `BENCH_TIER` | 非空文字なら opt-in（例: `1`）。未設定・空文字は既定の「対象外」 |
+| `BENCH_TIER` | 非空文字なら opt-in（例: `1`）。未設定・空文字は既定の「対象外」（GitHub ホステッド runner には常駐 Ollama が無いため、opt-in しても Ollama 実接続に失敗して fail-closed で非ゼロ終了する） |
 | `BENCH_TIER_OLLAMA_HOST` | ループバックアドレスまたはホスト名（`OllamaConfig::with_host` が非ループバック IP リテラルを拒否） |
 | `BENCH_TIER_OLLAMA_PORT` | `0`〜`65535` のポート番号 |
 | `BENCH_TIER_DIALOGUE_MODEL` / `BENCH_TIER_PRECISION_MODEL` | 空でないモデル名 |
