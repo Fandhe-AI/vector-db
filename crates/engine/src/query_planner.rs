@@ -59,6 +59,10 @@ pub enum PlanError {
     ResponseTooLarge,
     /// 組み立てたプロンプトが [`MAX_PROMPT_BYTES`] を超えた。
     PromptTooLarge,
+    /// 名前解決先がループバック以外だった（SSRF 対策の fail-closed 拒否。
+    /// codex-review PR #252 P0 指摘）。テナント固有情報を含むプロンプトを
+    /// ループバック以外の宛先へ送信しうる構成を許さない。
+    UnsafeTarget,
 }
 
 impl std::fmt::Display for PlanError {
@@ -73,6 +77,12 @@ impl std::fmt::Display for PlanError {
                 write!(f, "query planning llm response exceeded the size limit")
             }
             PlanError::PromptTooLarge => write!(f, "query planning prompt exceeded the size limit"),
+            PlanError::UnsafeTarget => {
+                write!(
+                    f,
+                    "query planning llm target must resolve to a loopback address"
+                )
+            }
         }
     }
 }
@@ -703,13 +713,22 @@ const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
 const MAX_CHUNKED_TOTAL_BYTES: usize = MAX_RESPONSE_BYTES * 8;
 
 /// [`OllamaClient`] の接続構成。
+///
+/// `host`／`port` は private フィールドとし、[`Self::new`] の既定値
+/// （ループバック・標準ポート）または [`Self::with_host`]／[`Self::with_port`]
+/// 経由でのみ設定できる。フィールドを直接代入可能にすると、テナント固有情報
+/// （辞書スナップショット由来のファイルパス・シンボル名等）を含むプロンプトの
+/// 送信先を呼び出し元が任意の値へ設定できてしまう（codex-review PR #252 P0
+/// 指摘）。ただし本当の安全弁は接続直前に [`resolve_socket_addrs`] の結果を
+/// 検証する `is_loopback` チェック（[`http_post_json`]）であり、本構造体の
+/// private 化はその契約を破りにくくする補助的な防御である。
 #[derive(Debug, Clone)]
 pub struct OllamaConfig {
     /// 接続先ホスト。既定はループバック（[`DEFAULT_OLLAMA_HOST`]）。untrusted 入力から
     /// 組み立てず、サーバー構成としてのみ設定する（SSRF 対策。モジュールドキュメント）。
-    pub host: String,
+    host: String,
     /// 接続先ポート（既定 [`DEFAULT_OLLAMA_PORT`]）。
-    pub port: u16,
+    port: u16,
     /// 使用するモデル名。
     pub model: String,
     /// TCP 接続確立のタイムアウト。
@@ -733,6 +752,39 @@ impl OllamaConfig {
             read_timeout: Duration::from_secs(30),
             keep_alive: "5m".to_string(),
         }
+    }
+
+    /// 接続先ホストを差し替える（テスト用スタブ接続先の設定等）。`host` が IP
+    /// リテラルとして解釈できる場合は、ループバック以外を構築時点で
+    /// [`PlanError::UnsafeTarget`] として拒否する（fail-closed の早期化）。
+    /// ホスト名文字列（DNS 名）は名前解決を経ないと判定できないため、ここでは
+    /// そのまま受理する。ホスト名の場合の最終防御は接続直前の名前解決結果を
+    /// 検証する `is_loopback` チェック（[`http_post_json`]）が担う。
+    pub fn with_host(mut self, host: impl Into<String>) -> Result<Self, PlanError> {
+        let host = host.into();
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() {
+                return Err(PlanError::UnsafeTarget);
+            }
+        }
+        self.host = host;
+        Ok(self)
+    }
+
+    /// 接続先ポートを差し替える（テスト用スタブ接続先の設定等）。
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// 現在の接続先ホストを返す。
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// 現在の接続先ポートを返す。
+    pub fn port(&self) -> u16 {
+        self.port
     }
 }
 
@@ -831,7 +883,7 @@ fn is_success_status_line(line: &str) -> bool {
     code.len() == 3 && code.starts_with('2') && code.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// `config.host`／`config.port` を名前解決する（`(host, port)` タプル形式の
+/// `config.host()`／`config.port()` を名前解決する（`(host, port)` タプル形式の
 /// `ToSocketAddrs` を使い、`format!("{host}:{port}")` によるアドレス文字列組み立てを
 /// 避ける。IPv6 リテラル（例: `::1`）は `format!` だと `::1:11434` のような曖昧な
 /// 文字列になり `to_socket_addrs()` が解釈に失敗するため、`codex-review` PR #252 P1
@@ -847,8 +899,8 @@ fn resolve_socket_addrs(
     config: &OllamaConfig,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, PlanError> {
-    let host = config.host.clone();
-    let port = config.port;
+    let host = config.host().to_string();
+    let port = config.port();
     let (tx, rx) = mpsc::channel();
     // スレッド生成に失敗した場合（リソース枯渇等）も fail-closed で Unavailable とし、
     // untrusted な外部要因でパニックさせない。
@@ -878,6 +930,16 @@ fn http_post_json(config: &OllamaConfig, path: &str, body: &str) -> Result<Vec<u
     // 以降の接続試行はゼロ幅の `remaining`（即タイムアウト）として扱われる。
     let deadline = Instant::now() + config.connect_timeout;
     let addrs = resolve_socket_addrs(config, deadline)?;
+
+    // 名前解決結果が 1 件でもループバック外を含む場合は接続前に fail-closed で
+    // 拒否する（codex-review PR #252 P0 指摘）。`OllamaConfig` は公開フィールドの
+    // 直接代入を禁止しているが、設定ミスや将来の呼び出し元がテナント固有情報
+    // （辞書スナップショット由来のプロンプト）を外部ホストへ送信してしまう経路を
+    // 構造的に塞ぐため、実際の安全弁はここに置く。エラーメッセージへ解決先の
+    // ホスト・IP を含めず、他テナント情報はもとより解決先情報自体も漏らさない。
+    if addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+        return Err(PlanError::UnsafeTarget);
+    }
 
     // 名前解決で複数候補（IPv4/IPv6 混在含む）が返る場合、先頭 1 件のみを試すと
     // その 1 件が到達不能なだけで常に Unavailable になりうる（codex-review PR #252
@@ -911,7 +973,7 @@ fn http_post_json(config: &OllamaConfig, path: &str, body: &str) -> Result<Vec<u
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
         path = path,
-        host = config.host,
+        host = config.host(),
         len = body.len(),
         body = body,
     );
@@ -1438,9 +1500,10 @@ mod tests {
     }
 
     fn config_for(addr: std::net::SocketAddr) -> OllamaConfig {
-        let mut config = OllamaConfig::new("test-model");
-        config.host = addr.ip().to_string();
-        config.port = addr.port();
+        let mut config = OllamaConfig::new("test-model")
+            .with_host(addr.ip().to_string())
+            .expect("loopback stub address")
+            .with_port(addr.port());
         config.connect_timeout = Duration::from_secs(2);
         config.read_timeout = Duration::from_secs(2);
         config
@@ -1625,7 +1688,7 @@ mod tests {
 
     #[test]
     fn ollama_client_connects_via_ipv6_literal_host() {
-        // codex-review PR #252 P1 指摘の回帰確認: `config.host` に IPv6 リテラル
+        // codex-review PR #252 P1 指摘の回帰確認: `config.host()` に IPv6 リテラル
         // （`::1`）を設定した場合、`format!("{host}:{port}")` による
         // アドレス文字列組み立て（`::1:PORT` は不正な文字列になる）ではなく
         // `(host, port)` タプル形式の `ToSocketAddrs` を使うことで正しく接続できる
@@ -1653,11 +1716,13 @@ mod tests {
             }
         });
 
-        let mut config = OllamaConfig::new("test-model");
         // `SocketAddr::ip().to_string()` は IPv6 を `::1` のように角括弧なしで返す
-        // （`config.host` はホスト名のみを保持する契約のため、ここでもその形式に揃える）。
-        config.host = addr.ip().to_string();
-        config.port = addr.port();
+        // （`OllamaConfig::with_host` はホスト名のみを保持する契約のため、ここでも
+        // その形式に揃える）。
+        let mut config = OllamaConfig::new("test-model")
+            .with_host(addr.ip().to_string())
+            .expect("ipv6 loopback address")
+            .with_port(addr.port());
         config.connect_timeout = Duration::from_secs(2);
         config.read_timeout = Duration::from_secs(2);
 
@@ -1666,6 +1731,20 @@ mod tests {
             .complete("q")
             .expect("ipv6 loopback connection should succeed");
         assert!(expansion.contains("search_terms"));
+    }
+
+    #[test]
+    fn ollama_config_rejects_non_loopback_ip_literal_at_construction() {
+        // codex-review PR #252 P0 指摘の回帰確認: `with_host` に IP リテラルの
+        // 非ループバックアドレス（ここでは TEST-NET-1 の予約アドレス
+        // `192.0.2.1`。RFC 5737）を渡した場合、構築時点で `UnsafeTarget` として
+        // fail-closed に拒否されることを確認する。テナント固有情報を含む
+        // プロンプトが任意の外部ホストへ送信される経路を残さないための安全弁
+        // （[`OllamaConfig`] ドキュメント参照）。
+        let err = OllamaConfig::new("test-model")
+            .with_host("192.0.2.1")
+            .unwrap_err();
+        assert_eq!(err, PlanError::UnsafeTarget);
     }
 
     #[test]
