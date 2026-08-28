@@ -58,10 +58,13 @@
 ### 2 層構成（PR CI と閾値ゲートの分離。TASK-104/TASK-108 と同方式）
 
 - **層 A**（`#[test]`。常時 `cargo test` 対象）: 両カテゴリの baseline/after の
-  hits20 と改善量を固定値アサーションで回帰トラッキングする。あわせて「intent は
-  after が baseline を上回る」（PLAN-1）「direct は after が baseline を下回らない」
-  （PLAN-2。展開が既存の強みを破壊しないことの最小保証）ことを独立にアサートする。
-  spec の数値基準は使わないため public 資産に閾値を持ち込まない
+  hits20・`ceil20`・`total_correct` を、カテゴリ間・before/after 間の相対関係
+  （不等号・等号）のみで回帰トラッキングする（絶対数値の固定値アサーションは
+  行わない。検索カーネル・クエリ展開パーサ・フィクスチャの変更でこれらの関係が
+  崩れた場合にこのテストが失敗する）。あわせて「intent は after が baseline を
+  上回る」（PLAN-1）「direct は after が baseline を下回らない」（PLAN-2。展開が
+  既存の強みを破壊しないことの最小保証）ことを独立にアサートする。spec の数値
+  基準は使わないため public 資産に閾値を持ち込まない
 - **層 B**（`#[ignore]`。`make query-planning-regression` 経由）: spec 由来の下限
   （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`＝intent カテゴリの改善幅下限・
   `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`＝direct カテゴリの after Recall@20 絶対
