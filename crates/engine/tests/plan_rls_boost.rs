@@ -14,9 +14,10 @@
 //! （engine API 層での検証に限定する。`docs/design/rls-generalized-read-paths.md` と
 //! 同じスコープ境界の整理）。
 //!
-//! 本ファイルが固定する V1〜V5 の各観点は `docs/design/plan-rls-boost-interaction.md`
-//! （TASK-139・Proposed。オーナー確認前）でオーナーの追認を待つ。各観点のテスト関数は
-//! 同レポートの節と対応する。
+//! 本ファイルが固定する検証観点は `docs/design/plan-rls-boost-interaction.md`
+//! （TASK-139・Proposed。本 PR のマージ後、別コミットで Accepted に更新する）の
+//! 「検証方針」節に対応する。個々の観点の具体的な内容・判定根拠は同ドキュメントには
+//! 転記しない（private spec 側の SSOT を参照）。
 
 use std::collections::BTreeSet;
 

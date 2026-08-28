@@ -1,6 +1,6 @@
 # LLM クエリプランニングのソフトブーストヒントと RLS 事前フィルタの競合検証
 
-- ステータス: Proposed（TASK-139。オーナー確認前）
+- ステータス: Proposed（本 PR のマージ後、別コミットで Accepted に更新する）
 - 対応: TASK-139（ポインタ: `docs/spec/05-tasks.md`）
 - 前提: TASK-111（PR #257／Issue #73 でマージ済み。`hybrid.rs` のソフトブースト機構）・
   TASK-133（Issue #44 でマージ済み。`rls.rs::PrefilterIndex`／`ImplicitRlsHook`）
@@ -12,13 +12,12 @@
 
 TASK-110（LLM クエリプランニング）が返す `path_hint`/`kind_hint` を RRF 融合後スコアへ
 反映するソフトブースト機構（TASK-111）と、RLS 事前フィルタ（TASK-133）はいずれも
-独立に実装・検証済みだが、両者を同時に適用した場合の相互作用——ブーストが RLS
-境界を弱めないか、ブースト対象の選定自体が不可視データの存在情報を漏らさないか
-——は検証課題として引き継がれていた（`docs/spec/04-behavior/rls.md`・
-`docs/spec/04-behavior/core-engine.md`・`docs/spec/04-behavior/query-planning.md`
-のポインタ）。本ドキュメントは
-両機構が実際に合流する層のインベントリと、`crates/engine/tests/plan_rls_boost.rs` が
-固定する検証観点 V1〜V5・結果を記録する。
+独立に実装・検証済みだが、両者を同時に適用した場合の相互作用は検証課題として
+引き継がれていた（`docs/spec/04-behavior/rls.md`・`docs/spec/04-behavior/core-engine.md`・
+`docs/spec/04-behavior/query-planning.md` のポインタ）。本ドキュメントは両機構が
+実際に合流する層のインベントリと `crates/engine/tests/plan_rls_boost.rs` の検証方針を
+記録する。個々の検証観点の具体的な内容・結果は private spec 側の SSOT および同テスト
+ファイルのコードを参照すること（本ドキュメントには転記しない）。
 
 ## 両機構の合流点
 
@@ -30,129 +29,41 @@ TASK-110（LLM クエリプランニング）が返す `path_hint`/`kind_hint` �
 | # | 構成要素 | 役割 |
 | - | -------- | ---- |
 | C1 | `tenant::visible_rows`（`crates/engine/src/tenant.rs`） | RLS 事前フィルタ済み候補集合（可視行のみ）の構築 |
-| C2 | `hybrid::path_hint_matches`／`kind_hint_matches`（`crates/engine/src/hybrid.rs`） | ヒント一致判定（部分一致／完全一致、空ヒントは不一致） |
-| C3 | `hybrid::BoostRule::new` | 一致 id 集合・加点量の検証付き構築 |
+| C2 | `hybrid::path_hint_matches`／`kind_hint_matches`（`crates/engine/src/hybrid.rs`） | ヒント一致判定 |
+| C3 | `hybrid::BoostRule::new` | ブーストルールの検証付き構築 |
 | C4 | `hybrid::hybrid_search_boosted` | RRF 融合後・`truncate(k)` 前の加点適用 |
 | C5 | `tenant::verify_hits` | C1〜C4 の結果を独立に再検証する検査器（実装と経路分離） |
 
 呼び出し列は C1 → C2 → C3 → C4 であり、`crates/engine/tests/plan_rls_boost.rs` の
 各テストはこの列を共有する（`rls_filtered_candidates` ヘルパ）。
 
-## 検証観点 V1〜V5 と結果
+## 検証方針
 
-すべて実装変更なしの読み取り検証タスクとして実施した（既存 production コードは
-変更していない）。
+`crates/engine/tests/plan_rls_boost.rs` は実装変更なしの読み取り検証として、上記の
+呼び出し列を対象に次の観点を軸としたテストを固定する（各観点の詳細な構成・
+判定根拠はテストコード自体および private spec 側の SSOT を参照。本ドキュメントには
+転記しない）。
 
-### V1: 非バイパス（混入 0 件）
+- RLS 事前フィルタ済み候補集合の外側から結果が復活しないこと
+- ブーストルールの構築規約を守った場合の可視行への結果の同一性
+- ブースト本来の効果（RLS なし構成との定性一致）が保存されること
+- RLS 事前フィルタと不可視行の存在が可視行の検索結果へ追加の影響を及ぼさないこと
+- ブーストルールの構築時エラーの発生有無が不可視データの状態に依存しないこと
 
-RLS 事前フィルタ済み候補集合（`SearchInput`）にヒント由来ブーストを適用しても、
-不可視行が Top-k に混入しないこと。ブーストルールの `ids` に、テナントをまたいで
-数値衝突する不可視行由来の id（後述 V2 参照）が混入していても、`hybrid_search_boosted`
-は候補集合（`input.ids`）の外側から行を復活させられない（`apply_soft_boost` は
-既存 `Vec` の `score` 更新のみで要素の追加・削除を行わない構造）ことを確認した。
-`tenant::verify_hits` による `(tenant_id, id)` 完全一致の独立検査、および検査器自体が
-実際に fail しうることを確かめる negative test（偽装した `SearchHit` を混入させると
-`HitOutsideVisibleSet` で拒否される）も固定した。
-
-結果: **成立**。ブースト機構は RLS 境界を弱めない。
-
-### V2: 存在情報の非漏えい（応答同一性）
-
-「`BoostRule` は RLS 通過済み可視行のメタデータのみから構築する」規約の下では、
-不可視行がヒントに一致するかどうかに関わらず可視行の検索結果（順位・スコア）が
-完全一致することを確認した。
-
-negative test として、規約に反し**全テナントのメタデータ**（可視性を考慮しない）から
-ルールを構築する誤実装を再現したところ、実際に漏えいが起きることを確認した。
-ヒント一致判定・`BoostRule` はテナント修飾のない生の `u64` id でしか一致を扱わない
-ため、不可視行由来の id が可視行の id と数値衝突する構成（`crates/engine/tests/plan_rls_boost.rs`
-が合成コーパスとして構築。ポインタ: TABLE-12）では、不可視行がたまたまヒントに
-一致すると同じ数値 id を持つ可視行が誤ってブーストされる。これは加点量ちょうど分の
-スコア差として観測可能であり、不可視行の存在情報の漏えい経路になる。
-
-結果: **規約を守れば非漏えい。規約に反した実装は具体的な漏えい経路を持つ**
-（本タスクは読み取り検証のためコード修正は行わない）。
-
-### V3: ブースト効果の保存
-
-RLS 事前フィルタ下でも、ブースト本来の効果（圏外候補の Top-k 浮上・
-ハードフィルタ化しないこと・空ルール時の `hybrid_search` との完全一致）が
-RLS なし構成（`tests/soft_boost.rs`）と定性一致することを、`path_hint`・`kind_hint`
-の両方の経路で確認した。
-
-結果: **成立**。
-
-### V4: 追加損失ゼロ（RLS-4 類推）
-
-RLS 事前フィルタ下での可視行に対するブースト結果（`Vec<HybridHit>` 全体。順序・件数・
-スコアすべて）が、「`ctx_a` から可視な行だけ（tenant-b の不可視行のみを除いた、
-ちょうど可視集合と同型の縮小 `Storage`）に同一ブーストを直接適用した結果」と完全
-一致し、tenant-b の不可視行の存在が tenant-a 自身の可視行の検索結果へ追加の影響を
-一切及ぼさないことを確認した。
-
-結果: **成立**（両機構の併用による追加の Recall 損失なし）。
-
-### V5: エラー契約の非依存性
-
-`BoostRule::new` の拒否エラー（`TooManyBoostIds`）の発生有無が不可視行の存在に
-依存しないこと。正しい構築（可視メタデータのみ）は、不可視行が仮に何件ヒントに
-一致していようと一致 id 集合のサイズに影響しないため、成否が不可視データの件数に
-左右されないことを確認した。`v5_real_path_result_independent_of_invisible_row_count`
-は `tenant::visible_rows` → `BoostRule::new` → `hybrid_search_boosted` の実経路全体を
-通し、不可視行の一致件数（1 件・複数件）を変えても返る `Vec<HybridHit>` が完全一致
-することを確認した（下記の合成境界チェックとは別に、実経路上の件数非依存性を固定
-する）。
-
-negative test として、規約に反した構築（全テナント走査で不可視行由来の一致 id を
-加算し続ける）を模したところ、一致 id 数が `hybrid::MAX_BOOST_IDS`（`crates/engine/src/hybrid.rs`
-の公開定数。コード参照）を超えた時点で初めて `TooManyBoostIds` が発生し、境界の
-1 件差でエラー発生有無が反転することを確認した——これはエラー応答の有無自体が
-不可視データの正確な件数を教えるサイドチャネルになりうることを意味する。
-`MAX_BOOST_IDS` 境界の実データ再現には大量の行投入を要するため、`BoostRule::new`
-が id 集合のサイズのみを検証する契約（実データの意味を解釈しない）であることを
-踏まえ、id 集合そのものを合成して境界を再現した。
-
-結果: **規約を守れば非依存。規約に反した実装は件数依存のエラー差分を持つ**
-（V2 と同じ規約で防げる）。
-
-## 現行 production コードへの影響
-
-本タスクは読み取り検証タスクであり、V2・V5 が示す漏えい経路は**現行 production
-コードには存在しない**。ソフトブースト機構（TASK-111）は `hybrid.rs` 単体で完結して
-おり、`sql/exec.rs` への実結線自体が TASK-111 のドキュメントで明示的にスコープ外と
-されている（本タスクも同様に読み取り検証に限定し、実結線は行わない）。加えて、
-`sql/exec.rs` が実際に `SearchInput`／`BoostRule` へ渡す候補識別子は行 `id` そのもの
-ではなく候補アリーナのスロット番号（`kernel.rs::SearchInput::ids` のドキュメント参照）
-であり、これは呼び出し文脈内で一意になるよう `sql/exec.rs` 自身が払い出す値である。
-V2・V5 で再現した漏えい経路は「行 `id` をテナント修飾なしにそのまま `BoostRule` へ
-渡す」という構築を対象にした fail-closed 化のための先回り検証である。候補識別子の
-一意性契約は `kernel.rs::SearchInput::ids` のドキュメントが既に定めている（ポインタ）。
-
-## 検証コードが前提とする構築手順
-
-`crates/engine/tests/plan_rls_boost.rs` の各テスト（`correct_path_hint_ids` 等の
-ヘルパ）は、`BoostRule` を
-`tenant::visible_rows`／`ImplicitRlsHook`／`PrefilterIndex` 等の RLS 通過済み可視行の
-メタデータのみから構築する手順を前提として組んでいる。この前提を崩す構築
-（`naive_all_tenant_path_hint_ids`）を negative test として対照し、V2・V5 が示す
-差分（応答同一性・エラー契約の非依存性）を検出する。
+構築規約に反した誤実装を再現する negative test も含めて固定するが、その具体的な
+差分の内容は private spec 側の SSOT を参照すること。本タスクは読み取り検証タスクで
+あり、現行 production コードへの変更は行っていない。ソフトブースト機構（TASK-111）
+は `hybrid.rs` 単体で完結しており、`sql/exec.rs` への実結線自体が TASK-111 の
+ドキュメントで明示的にスコープ外とされている（本タスクも同様に読み取り検証に
+限定し、実結線は行わない）。
 
 ## 検証コードの既知の限界
 
-V1〜V5 の各テストは「単一 `ctx` の可視集合内では候補識別子が重複しない」よう合成
-コーパスを設計している（tenant-b の不可視行は tenant-a の可視行と数値 id が衝突する
-が、可視集合には現れない）。しかし一般には、**同一 `ctx` の可視集合自体**が同一の
-数値 id を複数含む合成コーパスも構成可能であり（ポインタ: TABLE-12）、この場合
-`hybrid::HybridHit`／`BoostRule` はテナント修飾を持たないため id だけでは 2 行を
-区別できない。
-
-`crates/engine/tests/plan_rls_boost.rs::raw_id_collision_within_visible_set_is_rejected_fail_closed`
-がこのケースを直接構築して固定する: raw id をそのまま `SearchInput::ids` へ渡す構築
-手順を通した場合、`hybrid::rrf_fuse` の重複検証（`HybridError::DuplicateId`）に阻まれ、
-結果が黙って混同されることはない——2 行のどちらかが誤ってブーストされるのではなく、
-検索そのものが安全に拒否される。これは `kernel.rs::SearchInput::ids` が定める候補
-識別子の一意性契約を代替するものではない——`DuplicateId` は raw id をそのまま渡した
-場合の fail-closed な保険に過ぎない。
+`crates/engine/tests/plan_rls_boost.rs` の一部テストは、単一 `ctx` の可視集合自体が
+同一の数値 id を複数含む合成コーパスの構成可能性（ポインタ: TABLE-12）を対象に、
+`kernel.rs::SearchInput::ids` が定める候補識別子の一意性契約に反した構築が
+fail-closed に拒否されることを固定する。契約の詳細は同ドキュメントを参照
+（ポインタ）。
 
 ## `USING PLAN` 実行器（TASK-77）実装後の残課題
 
