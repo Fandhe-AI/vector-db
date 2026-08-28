@@ -513,6 +513,13 @@ struct DictCacheEntry {
     table: String,
     ctx: PolicyContext,
     dictionary: Arc<crate::dictionary::Dictionary>,
+    /// `dictionary` から 1 度だけ構築した正規化索引（[`crate::tiering::classify`]
+    /// が使う）。`dictionary` と同じ寿命（同一世代の間だけキャッシュされ、世代が
+    /// 変われば両方まとめて破棄・再構築される）で共有することで、
+    /// `crate::tiering::classify` がリクエストごとに辞書全量を再正規化する経路を
+    /// 断つ（codex-review P1 指摘対応・PR #261。`tiering.rs::NormalizedDictionaryIndex`
+    /// ドキュメント参照）。
+    normalized_index: Arc<crate::tiering::NormalizedDictionaryIndex>,
     built_generation: u64,
     approx_bytes: usize,
     /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
@@ -559,12 +566,18 @@ impl DictionaryCache {
     /// `(table, ctx)` に一致し、現在世代と整合するエントリを探す。世代不一致・
     /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う
     /// （fail-closed。[`PrefilterCache::lookup`] と同じ方針）。
+    /// キャッシュヒット時は `(dictionary, normalized_index)` を返す（両者は
+    /// 同一エントリ・同一世代から `Arc::clone` するだけで、辞書の再走査・
+    /// 正規化索引の再構築のいずれも発生しない）。
     fn lookup(
         &self,
         storage: &Storage,
         table: &str,
         ctx: &PolicyContext,
-    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+    ) -> Option<(
+        Arc<crate::dictionary::Dictionary>,
+        Arc<crate::tiering::NormalizedDictionaryIndex>,
+    )> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.write().ok()?;
         // 世代はロック取得後に読み直す（`PrefilterCache::lookup` と同じ理由。
@@ -584,12 +597,15 @@ impl DictionaryCache {
             guard.entries.remove(position);
             return None;
         }
-        let dictionary = {
+        let result = {
             let entry = guard.entries.get_mut(position)?;
             entry.last_used = seq;
-            Arc::clone(&entry.dictionary)
+            (
+                Arc::clone(&entry.dictionary),
+                Arc::clone(&entry.normalized_index),
+            )
         };
-        Some(dictionary)
+        Some(result)
     }
 
     /// 新規構築した辞書を挿入する。単体で総量上限を超える場合はキャッシュしないが
@@ -613,7 +629,21 @@ impl DictionaryCache {
         dictionary: crate::dictionary::Dictionary,
         built_generation: u64,
         approx_bytes: usize,
-    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+    ) -> Option<(
+        Arc<crate::dictionary::Dictionary>,
+        Arc<crate::tiering::NormalizedDictionaryIndex>,
+    )> {
+        // 正規化索引（`tiering::classify` が使う小文字化済みパス・シンボル名）は
+        // ここ・辞書スナップショット構築の 1 回だけ構築する（codex-review P1
+        // 指摘対応・PR #261。[`DictCacheEntry::normalized_index`] ドキュメント
+        // 参照）。以後は `dictionary` と同じ `Arc` 共有・同じ失効規約で使い回す。
+        let normalized_index = Arc::new(crate::tiering::NormalizedDictionaryIndex::build(
+            &dictionary,
+        ));
+        // 正規化索引の保持分（小文字化パス・シンボル名の複製）も容量上限の対象に
+        // 含める（漏らすと CPU-DoS 対策のつもりが総量上限の過小評価という別の
+        // メモリ上限 P1 になる）。
+        let approx_bytes = approx_bytes.saturating_add(normalized_index.approx_heap_bytes());
         let dictionary = Arc::new(dictionary);
 
         let Ok(mut guard) = self.state.write() else {
@@ -634,7 +664,7 @@ impl DictionaryCache {
         }
 
         if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
-            return Some(dictionary);
+            return Some((dictionary, normalized_index));
         }
 
         if let Some(pos) = guard
@@ -663,7 +693,7 @@ impl DictionaryCache {
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(idx, _)| idx);
             let Some(idx) = victim else {
-                return Some(dictionary);
+                return Some((dictionary, normalized_index));
             };
             let removed = guard.entries.remove(idx);
             total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
@@ -674,11 +704,12 @@ impl DictionaryCache {
             table: table.to_string(),
             ctx: ctx.clone(),
             dictionary: Arc::clone(&dictionary),
+            normalized_index: Arc::clone(&normalized_index),
             built_generation,
             approx_bytes,
             last_used: seq,
         });
-        Some(dictionary)
+        Some((dictionary, normalized_index))
     }
 }
 
@@ -809,6 +840,18 @@ impl From<crate::query_planner::PlanError> for CoreError {
     }
 }
 
+/// [`EngineCore::query_planner`] が保持する注入形態（TASK-115・PLAN-8）。単一クライアント
+/// （TASK-110 の既存契約。[`EngineCore::with_query_planner`]）と、質問類型（`crate::tiering`）
+/// に応じてティア別クライアントを振り分ける構成（[`EngineCore::with_tiered_query_planner`]）の
+/// 二択を型で表し、両方同時設定という不整合状態を作れなくする。
+enum PlannerBinding {
+    /// TASK-110 時点の単一クライアント注入（既存の [`EngineCore::with_query_planner`]・
+    /// [`EngineCore::plan_query`] の挙動・契約を変えない）。
+    Single(Box<dyn crate::query_planner::LlmClient>),
+    /// TASK-115・PLAN-8 のティア別クライアント注入（`crate::tiering::TieredPlanner`）。
+    Tiered(crate::tiering::TieredPlanner),
+}
+
 impl From<crate::embedding::EmbedError> for CoreError {
     fn from(e: crate::embedding::EmbedError) -> Self {
         CoreError::QueryEmbedding(e)
@@ -923,11 +966,15 @@ pub struct EngineCore {
     /// 拒否する契約（既定で参照実装を暗黙採用しない。`embedding.rs` モジュール
     /// ドキュメント参照）。差し替えは [`Self::with_embedder`] のみ。
     embedder: Option<Box<dyn crate::embedding::Embedder>>,
-    /// LLM クエリプランニング（TASK-110・PLAN-1）のクエリ展開クライアント注入点。
-    /// 未設定（`None`）は [`Self::plan_query`] を fail-closed に拒否する契約
-    /// （`embedder` と同じ流儀。既定で参照実装を暗黙採用しない）。差し替えは
-    /// [`Self::with_query_planner`] のみ。
-    query_planner: Option<Box<dyn crate::query_planner::LlmClient>>,
+    /// LLM クエリプランニング（TASK-110・PLAN-1／TASK-115・PLAN-8）のクエリ展開
+    /// クライアント注入点。未設定（`None`）は [`Self::plan_query`] を fail-closed に
+    /// 拒否する契約（`embedder` と同じ流儀。既定で参照実装を暗黙採用しない）。
+    /// 単一クライアント注入（[`Self::with_query_planner`]）とティア別クライアント注入
+    /// （[`Self::with_tiered_query_planner`]・TASK-115・`crate::tiering`）のどちらか
+    /// 一方のみを保持する契約を [`PlannerBinding`] の型で表す（両方同時設定という
+    /// 不整合状態を型で作れなくする。`Option<PlannerBinding>` の内側に 2 つ目の
+    /// `Option` を並べる設計だと両方 `Some` の状態を許してしまうため採らない）。
+    query_planner: Option<PlannerBinding>,
     /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定（TASK-120）。
     /// 差し替えは [`Self::with_incremental_config`] のみ。
     incremental_config: crate::incremental::IncrementalConfig,
@@ -1070,7 +1117,27 @@ impl EngineCore {
     /// ビルダーメソッドとし、[`Self::with_embedder`] と同じ流儀。未呼び出しなら
     /// `None` のままで、[`Self::plan_query`] は fail-closed に拒否される）。
     pub fn with_query_planner(mut self, client: Box<dyn crate::query_planner::LlmClient>) -> Self {
-        self.query_planner = Some(client);
+        self.query_planner = Some(PlannerBinding::Single(client));
+        self
+    }
+
+    /// 質問類型推定・ティアリング（TASK-115・PLAN-8）に基づき、対話ティア／高精度
+    /// ティアそれぞれの [`crate::query_planner::LlmClient`] を注入したビルダーを返す
+    /// （所有権を消費するビルダーメソッドとし、[`Self::with_query_planner`] と同じ流儀。
+    /// [`Self::with_query_planner`] と排他: 後に呼んだ側が [`Self::query_planner`] を
+    /// 上書きする。判定基準 [`crate::tiering::TieringCriteria`] は本リポの実装既定値で、
+    /// 呼び出し元が差し替え可能（`docs/design/query-tiering-criteria.md` 参照）。
+    pub fn with_tiered_query_planner(
+        mut self,
+        dialogue: Box<dyn crate::query_planner::LlmClient>,
+        high_precision: Box<dyn crate::query_planner::LlmClient>,
+        criteria: crate::tiering::TieringCriteria,
+    ) -> Self {
+        self.query_planner = Some(PlannerBinding::Tiered(crate::tiering::TieredPlanner::new(
+            dialogue,
+            high_precision,
+            criteria,
+        )));
         self
     }
 
@@ -1153,8 +1220,31 @@ impl EngineCore {
         ctx: &PolicyContext,
         table: &str,
     ) -> Result<Arc<crate::dictionary::Dictionary>, CoreError> {
-        if let Some(dictionary) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
-            return Ok(dictionary);
+        self.dictionary_snapshot_with_index(ctx, table)
+            .map(|(dictionary, _index)| dictionary)
+    }
+
+    /// [`Self::dictionary_snapshot`] と同じ辞書スナップショットに加え、
+    /// [`crate::tiering::classify`] 用に 1 度だけ構築した正規化索引
+    /// （[`crate::tiering::NormalizedDictionaryIndex`]）も返す（codex-review P1
+    /// 指摘対応・PR #261）。呼び出し元は `Self::expand_query`（[`PlannerBinding::Tiered`]
+    /// 構成時のティア判定）のみ。`dictionary`・`normalized_index` は
+    /// [`DictionaryCache`] の同一エントリから `Arc::clone` するため、キャッシュ
+    /// ヒット時は辞書の再走査・索引の再構築のいずれも発生しない
+    /// （[`DictCacheEntry::normalized_index`] ドキュメント参照）。
+    fn dictionary_snapshot_with_index(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<
+        (
+            Arc<crate::dictionary::Dictionary>,
+            Arc<crate::tiering::NormalizedDictionaryIndex>,
+        ),
+        CoreError,
+    > {
+        if let Some(hit) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
+            return Ok(hit);
         }
 
         const MAX_SNAPSHOT_RETRIES: u32 = 5;
@@ -1284,7 +1374,7 @@ impl EngineCore {
             // 呼び出し元へ渡さないためのシグナルであり、ループ先頭へ戻って
             // 最新スナップショットで再試行する（不完全な辞書を正規の結果として
             // 返さない）。
-            if let Some(dictionary) = self.dictionary_cache.insert(
+            if let Some(hit) = self.dictionary_cache.insert(
                 &self.storage,
                 table,
                 ctx,
@@ -1292,7 +1382,7 @@ impl EngineCore {
                 built_generation,
                 approx_bytes,
             ) {
-                return Ok(dictionary);
+                return Ok(hit);
             }
         }
 
@@ -1326,6 +1416,32 @@ impl EngineCore {
         table: &str,
         question: &str,
     ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
+        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
+        Ok(expansion)
+    }
+
+    /// [`Self::plan_query`] と同じ契約に加え、[`Self::query_planner`] が
+    /// [`PlannerBinding::Tiered`] 構成の場合に採用した質問類型・ティア
+    /// （[`crate::tiering::Classification`]）も `Some` で返す（TASK-115・PLAN-8。
+    /// TASK-116 のティア別レイテンシ検証、将来の EXPLAIN 露出〔SQL-6・PLAN-11／
+    /// TASK-164〕の足場）。[`PlannerBinding::Single`] 構成の場合は分類自体を行わず
+    /// `None` を返す（単一クライアントへそのまま委譲する `Self::plan_query` の既存
+    /// 挙動を変えないため）。
+    ///
+    /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
+    /// `Self::plan_query`・`Self::dictionary_snapshot` と同じ理由）。
+    pub fn plan_query_with_classification(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+    ) -> Result<
+        (
+            crate::query_planner::QueryExpansion,
+            Option<crate::tiering::Classification>,
+        ),
+        CoreError,
+    > {
         self.expand_query(ctx, table, question)
     }
 
@@ -1342,7 +1458,9 @@ impl EngineCore {
     /// 由来）を渡す。展開自体の fail-closed 契約（LLM 未接続・プロンプト超過・
     /// LLM 応答不正はすべて `Err`）は [`Self::plan_query`] と共有する（モードの
     /// fail-safe とは独立したエラー系統。`query_planner.rs` モジュールドキュメント
-    /// 参照）。
+    /// 参照）。質問類型・ティア（TASK-115・PLAN-8）の判定結果は本メソッドの戻り値
+    /// には含まれない（必要な呼び出し元は [`Self::plan_query_with_classification`]
+    /// を使う）。
     pub fn plan_query_with_mode(
         &self,
         ctx: &PolicyContext,
@@ -1351,7 +1469,7 @@ impl EngineCore {
         query_mode: Option<crate::sql::mode::SearchMode>,
         session_mode: Option<crate::sql::mode::SearchMode>,
     ) -> Result<crate::query_planner::PlannedQuery, CoreError> {
-        let expansion = self.expand_query(ctx, table, question)?;
+        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
         let resolved = crate::sql::mode::resolve_mode_with_planner(
             query_mode,
             session_mode,
@@ -1360,25 +1478,45 @@ impl EngineCore {
         Ok(crate::query_planner::PlannedQuery::new(expansion, resolved))
     }
 
-    /// [`Self::plan_query`]・[`Self::plan_query_with_mode`] が共有する展開フロー本体
-    /// （辞書スナップショット取得 → 固定接頭辞レンダリング → LLM 呼び出し →
-    /// 厳格パース）。
+    /// [`Self::plan_query`]・[`Self::plan_query_with_classification`]・
+    /// [`Self::plan_query_with_mode`] が共有する展開フロー本体（辞書スナップショット
+    /// 取得 → ティア判定〔[`PlannerBinding::Tiered`] 構成時のみ〕 → 固定接頭辞
+    /// レンダリング → LLM 呼び出し → 厳格パース）。
     fn expand_query(
         &self,
         ctx: &PolicyContext,
         table: &str,
         question: &str,
-    ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
-        let client = self
+    ) -> Result<
+        (
+            crate::query_planner::QueryExpansion,
+            Option<crate::tiering::Classification>,
+        ),
+        CoreError,
+    > {
+        let binding = self
             .query_planner
-            .as_deref()
+            .as_ref()
             .ok_or(CoreError::QueryPlannerUnavailable)?;
-        let dictionary = self.dictionary_snapshot(ctx, table)?;
+        let (dictionary, normalized_index) = self.dictionary_snapshot_with_index(ctx, table)?;
+
+        let (client, classification): (&dyn crate::query_planner::LlmClient, _) = match binding {
+            PlannerBinding::Single(client) => (client.as_ref(), None),
+            PlannerBinding::Tiered(tiered) => {
+                // `normalized_index` は辞書スナップショット（`dictionary`）と同じ
+                // `DictionaryCache` エントリから 1 度だけ構築済み（codex-review P1
+                // 指摘対応・PR #261）。`tiered.select` はここでは借用のみで済み、
+                // リクエストごとの辞書全量の複製・走査は発生しない。
+                let (client, classification) = tiered.select(question, &normalized_index);
+                (client, Some(classification))
+            }
+        };
+
         let prefix = crate::query_planner::render_prompt_prefix(&dictionary);
         let prompt = crate::query_planner::render_full_prompt(&prefix, question)?;
         let response = client.complete(&prompt)?;
         let expansion = crate::query_planner::parse_expansion(&response)?;
-        Ok(expansion)
+        Ok((expansion, classification))
     }
 
     /// `table` に対する自然言語 `question` を [`Self::plan_query`]（TASK-110・PLAN-1）で

@@ -239,6 +239,7 @@ pub mod sparse;
 pub mod sql;
 pub mod storage;
 pub mod tenant;
+pub mod tiering;
 pub mod txn;
 pub mod wasm_udf;
 
