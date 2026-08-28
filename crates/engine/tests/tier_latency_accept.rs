@@ -253,7 +253,10 @@ mod routing {
 //     ことを固定する（時間非依存・スタブ `LlmClient`）。実測（`tier_latency_bench.rs`）
 //     が実行するのと同一の文字列生成関数を経由するため、この e2e が pass すれば
 //     実測側の SQL 構築も許可リスト・スキーマ束縛を通ることが保証される
-//     （`tests/c1_bench_accept.rs::e2e` と同一パターン）。
+//     （`tests/c1_bench_accept.rs::e2e` と同一パターン）。`seeded_core` は
+//     `tier_latency_bench.rs` が実際に使う `EngineCore::with_tiered_query_planner`
+//     （`PlannerBinding::Tiered`）で構築し、ティア構成特有の分岐
+//     （`TieredPlanner::select` の呼び出し）もこの e2e で通す。
 
 mod e2e {
     use super::harness::tier::{
@@ -268,6 +271,7 @@ mod e2e {
     use engine::recovery::required_op_id::OperationId;
     use engine::row_codec::Value;
     use engine::storage::{Storage, Visibility};
+    use engine::tiering::TieringCriteria;
 
     use super::temp_db::{unique_db_path, CleanupGuard};
 
@@ -331,7 +335,11 @@ mod e2e {
 
         let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
             .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
-            .with_query_planner(Box::new(StubLlmClient));
+            .with_tiered_query_planner(
+                Box::new(StubLlmClient),
+                Box::new(StubLlmClient),
+                TieringCriteria::default(),
+            );
         (core, ctx)
     }
 
