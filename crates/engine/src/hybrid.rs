@@ -229,14 +229,27 @@ pub enum HybridError {
     /// （不正な `amount` を通すと [`NonFiniteScore`](HybridError::NonFiniteScore) を
     /// 事後検知に頼ることになり fail-open な経路が広がる）。
     InvalidBoost,
+    /// [`BoostRule::new`] に渡された `ids`（1 ルールの一致対象識別子集合）の要素数が
+    /// [`MAX_BOOST_IDS`] を超えた（TASK-111。PR #257 codex-review P2 指摘対応）。
+    /// [`InvalidBoost`](HybridError::InvalidBoost) は `amount` の値域検証専用の
+    /// バリアントのため、`ids` のサイズ検証には別のバリアントを設ける（[`rrf_fuse`]
+    /// の [`TooManyCandidates`](HybridError::TooManyCandidates) と同じ「アロケーション・
+    /// 走査前に長さを検証する」順序を踏襲する）。
+    TooManyBoostIds { len: usize, max: usize },
     /// [`apply_soft_boost`] に渡された `rules` の件数が [`MAX_BOOST_RULES`] を超えた
     /// （TASK-111）。[`rrf_fuse`] の [`TooManyCandidates`](HybridError::TooManyCandidates)
     /// と同じ「アロケーション・走査前に長さを検証する」順序を踏襲する。
     TooManyBoostRules { len: usize, max: usize },
     /// ある候補（`total`。実際に一致した `rules` の加点合計）が、[`apply_soft_boost`]
-    /// が候補 1 件あたりに許容する加点合計の絶対上限（`max`。
-    /// [`soft_boost_confirm_cap`]）以上だった（TASK-111。3 回目の codex-review P1
-    /// 指摘・cursor bot「Boost error contract is inconsistent」指摘対応）。
+    /// がその候補に許容する加点合計の上限（`max`）以上だった（TASK-111。3 回目の
+    /// codex-review P1 指摘・cursor bot「Boost error contract is inconsistent」
+    /// 指摘対応、および PR #257 codex-review 指摘〔`max` を候補の元スコア込みで
+    /// 判定するよう修正〕対応）。`max` は候補ごとに異なりうる（[`soft_boost_confirm_cap`]
+    /// のドキュメント参照）: 候補の加点前スコア（`hit.score`）が
+    /// [`soft_boost_confirm_cap`] 未満の場合のみ、その上限から `hit.score`（候補の
+    /// 元スコア）を差し引いた残余を `max` として算出し、`hit.score` が
+    /// [`soft_boost_confirm_cap`] 以上の候補（元スコア単独で既に保証下限相当の
+    /// 近接順位級）はこの確定判定の対象外（本エラーを返さない）。
     ///
     /// 過去の実装（2 回目の codex-review P1 指摘対応）は `max` を「その候補の
     /// 実スコアから真の 1 位（融合プール `hits` の実際の最高スコア）までの差」
@@ -289,6 +302,9 @@ impl fmt::Display for HybridError {
                 )
             }
             HybridError::InvalidBoost => write!(f, "invalid soft boost rule amount"),
+            HybridError::TooManyBoostIds { len, max } => {
+                write!(f, "too many ids in soft boost rule: {len} ids (max {max})")
+            }
             HybridError::TooManyBoostRules { len, max } => {
                 write!(f, "too many soft boost rules: {len} rules (max {max})")
             }
@@ -534,6 +550,23 @@ pub const MAX_BOOST_RULES: usize = 16;
 /// [`SOFT_BOOST_PER_MATCH`] の想定を大きく超える加点が可能だった）。
 const MAX_BOOST_AMOUNT: f64 = 1.0;
 
+/// [`BoostRule::new`] が受け付ける `ids`（1 ルールが一致対象とする候補識別子
+/// 集合）の要素数上限（TASK-111。PR #257 codex-review P2 指摘対応）。
+///
+/// 以前は `BoostRule::new` が `ids` のサイズを検証していなかったため、
+/// [`hybrid_search_boosted`] の早期拒否（`per_id_boost` 構築ループ）が、検索対象
+/// `hits` に一切含まれない id まで含め `rules` の全 `ids` 集合を検索実行前に
+/// 走査・複製していた。少数（[`MAX_BOOST_RULES`] 以内）のルールでも、各ルールの
+/// `ids` が巨大であれば `O(全 rule.ids)` の CPU・メモリを無制限に消費できてしまう
+/// （coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
+///
+/// 上限は [`MAX_POOL_DEPTH`] を流用する: `BoostRule` が対象とする id は
+/// [`apply_soft_boost`] が受け取る融合済みプール `hits`（高々 `cfg.pool_depth()`
+/// ≤ [`MAX_POOL_DEPTH`] 件）に含まれる id にしか実際には作用しないため、それを
+/// 超える要素数を許しても呼び出し元の実用上の意味はなく、無制限確保を許すだけの
+/// 安全弁として不要に緩い。
+pub const MAX_BOOST_IDS: usize = MAX_POOL_DEPTH;
+
 /// `cfg`（[`RrfConfig`]）だけから、実際の融合プールの分布を見ずに算出できる
 /// ソフトブースト加点合計の**緩い**（＝安全側に大きすぎることはあっても小さすぎ
 /// ない）上限。[`hybrid_search_boosted`] が `rrf_fuse` 実行より前に行う早期拒否
@@ -578,6 +611,13 @@ fn soft_boost_loose_upper_bound(cfg: &RrfConfig) -> f64 {
 /// 過去 2 回目の codex-review P1 指摘の核心だった「重みが大きい方のチャネルに
 /// 必ず 1 位候補が存在する」という誤仮定を確定判定側で再現してしまい、本来
 /// 拒否すべき加点を通してしまう危険がある。
+///
+/// [`apply_soft_boost`] はこの値を単独では使わず、候補ごとに `この値 -
+/// hit.score` を残余の許容加点として使う（PR #257 codex-review 指摘対応: 本値
+/// 単独を加点合計の上限にすると、候補の加点前スコア（`hit.score`。正の値）を
+/// 無視するため、プール最下位級（`hit.score` が本値未満）の候補でも
+/// `hit.score + candidate_boost` が本値〔＝真の 1 位の保証下限〕を上回りうる
+/// 「安全性コメントと実装の乖離」が生じていた）。
 fn soft_boost_confirm_cap(cfg: &RrfConfig) -> f64 {
     cfg.dense_weight().min(cfg.sparse_weight()) / (cfg.k_const() + 1.0)
 }
@@ -618,10 +658,21 @@ pub struct BoostRule<'a> {
 }
 
 impl<'a> BoostRule<'a> {
-    /// `amount` の検証付きコンストラクタ。`amount` が有限かつ
+    /// `amount`・`ids` の検証付きコンストラクタ。`amount` が有限かつ
     /// `0.0 < amount <= MAX_BOOST_AMOUNT` の範囲外の場合は
-    /// [`HybridError::InvalidBoost`] を返す（fail-closed）。
+    /// [`HybridError::InvalidBoost`] を返す（fail-closed）。`ids.len()` が
+    /// [`MAX_BOOST_IDS`] を超える場合は [`HybridError::TooManyBoostIds`] を返す
+    /// （TASK-111。PR #257 codex-review P2 指摘対応: 呼び出し側〔[`hybrid_search_boosted`]
+    /// の早期拒否〕がこの集合を検索実行前に全件走査・複製するため、構築時点で
+    /// サイズを上限検証しアロケーション・走査コストの無制限な発生を防ぐ）。
+    /// `BTreeSet::len()` は `O(1)` のため、この検証自体は集合を走査しない。
     pub fn new(ids: &'a BTreeSet<u64>, amount: f64) -> Result<Self, HybridError> {
+        if ids.len() > MAX_BOOST_IDS {
+            return Err(HybridError::TooManyBoostIds {
+                len: ids.len(),
+                max: MAX_BOOST_IDS,
+            });
+        }
         if !amount.is_finite() || amount <= 0.0 || amount > MAX_BOOST_AMOUNT {
             return Err(HybridError::InvalidBoost);
         }
@@ -652,21 +703,29 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// アロケーション・走査前に [`HybridError::TooManyBoostRules`] で拒否する（[`rrf_fuse`]
 /// の長さ検証と同じ順序）。入力 `hits` に非有限スコアが 1 件でもあれば加点前に
 /// [`HybridError::NonFiniteScore`] で拒否する（`cfg` に対する検証を非有限値で汚染
-/// させないための順序。fail-closed）。各候補について、実際に一致した `rules` の
-/// 加点合計が [`soft_boost_confirm_cap`]（`cfg` から導出する絶対上限。実データの
-/// 順位関係とは無関係）以上の場合は [`HybridError::BoostSoftBoundExceeded`] で
-/// 拒否する（TASK-111。3 回目の codex-review P1 指摘・cursor bot「Boost error
-/// contract is inconsistent」指摘対応）。過去の実装（2 回目の codex-review P1
-/// 指摘対応）は候補ごとに「実スコアから `hits` の実際の最高スコア（真の 1 位）
-/// までの差」と比較しており、真の 1 位を追い越す加点を一律拒否していた。これは
-/// 近接順位を入れ替えるというソフトブースト本来の用途（PLAN-1 の意図）そのものを
-/// 検索エラーにする過剰拒否だった: 既定 RRF の単一チャネルでの実測順位差は僅か
-/// （例: 約 0.000264）であり、公開済み既定値 [`SOFT_BOOST_PER_MATCH`]（`0.0007`）を
-/// 1 件適用しただけの通常利用でもこの僅差を上回り失敗していた。真の 1 位を
-/// 追い越して新たな 1 位になること自体は正常な結果であり拒否すべきではないため、
-/// 実データの margin ではなく [`soft_boost_confirm_cap`] という絶対値とだけ比較
-/// する（詳細は [`HybridError::BoostSoftBoundExceeded`]・[`soft_boost_confirm_cap`]
-/// のドキュメント参照）。この判定は長さ検証・有限性検証の後、スコア加算より先に
+/// させないための順序。fail-closed）。各候補について、加点前スコア（`hit.score`）が
+/// [`soft_boost_confirm_cap`]（`cfg` から導出する絶対上限）未満の場合、実際に
+/// 一致した `rules` の加点合計が「その上限から `hit.score` を差し引いた残余」
+/// 以上なら [`HybridError::BoostSoftBoundExceeded`] で拒否する（TASK-111。3 回目の
+/// codex-review P1 指摘・cursor bot「Boost error contract is inconsistent」指摘
+/// 対応、および PR #257 codex-review 指摘対応: 以前は加点合計を
+/// [`soft_boost_confirm_cap`] 単独とだけ比較しており、候補の元スコアを無視して
+/// いたため、プール最下位級（元スコアが上限未満）の候補でも「元スコア＋加点」が
+/// 上限〔＝真の 1 位の保証下限〕を上回りえた）。`hit.score` が上限以上の候補
+/// （元スコア単独で既に保証下限相当の近接順位級）はこの確定判定の対象外とする。
+/// 過去の実装（2 回目の codex-review P1 指摘対応）は候補ごとに「実スコアから
+/// `hits` の実際の最高スコア（真の 1 位）までの差」と比較しており、真の 1 位を
+/// 追い越す加点を一律拒否していた。これは近接順位を入れ替えるというソフトブースト
+/// 本来の用途（PLAN-1 の意図）そのものを検索エラーにする過剰拒否だった: 既定 RRF
+/// の単一チャネルでの実測順位差は僅か（例: 約 0.000264）であり、公開済み既定値
+/// [`SOFT_BOOST_PER_MATCH`]（`0.0007`）を 1 件適用しただけの通常利用でもこの僅差を
+/// 上回り失敗していた。真の 1 位を追い越して新たな 1 位になること自体は正常な
+/// 結果であり拒否すべきではないため、実データの `hits` の最高スコアを都度計算する
+/// 方式には戻さず、`cfg` から導出する絶対上限（[`soft_boost_confirm_cap`]）から
+/// 候補自身の元スコアを差し引いた値とだけ比較する（元スコアが上限以上の候補は
+/// この判定を通過し続けるため、近接順位の正当な逆転は従来どおり妨げない。詳細は
+/// [`HybridError::BoostSoftBoundExceeded`]・[`soft_boost_confirm_cap`] のドキュメント
+/// 参照）。この判定は長さ検証・有限性検証の後、スコア加算より先に
 /// 行う（[`TooManyCandidates`] (HybridError::TooManyCandidates) と同じ順序）。
 /// 加算後の非有限化（Inf オーバーフロー）も同様に [`HybridError::NonFiniteScore`]
 /// で拒否する（`rrf_fuse` の融合後検証と同じ方向）。最後に既存と同一の比較器
@@ -704,10 +763,27 @@ pub fn apply_soft_boost(
     let total_boost: f64 = rules.iter().map(|rule| rule.amount).sum();
     if total_boost > 0.0 {
         // 確定判定は候補ごとの加点合計を [`soft_boost_confirm_cap`]（`cfg` から
-        // 導出する絶対上限）とだけ比較する。実際の `hits` の順位関係（真の 1 位
-        // との差）は参照しない（過去の実装が真の 1 位を追い越す正当な加点まで
-        // 拒否していた過剰拒否の再発防止。詳細は [`soft_boost_confirm_cap`] の
-        // ドキュメント参照）。
+        // 導出する絶対上限）と比較するが、`cap` 単独ではなく候補自身の加点前
+        // スコア（`hit.score`）を差し引いた**候補ごとの残余**（`cap - hit.score`）
+        // と比較する（TASK-111。PR #257 codex-review P1 指摘対応: 以前は
+        // `candidate_boost >= cap` のみで判定しており、候補の元スコアを無視して
+        // いたため、`hit.score` が正で `cap` 未満の「プール最下位級」候補でも
+        // `hit.score + candidate_boost` が `cap`（＝真の 1 位の保証下限）を上回り
+        // 得た。`hit.score` が `cap` 以上の候補は元スコア単独で既に保証下限相当
+        // 以上であり「プール最下位級」ではないため、この確定判定の対象外とする
+        // （残余を負にせず素通しする）。これにより、真の 1 位の実際のスコアが
+        // 保証下限を上回る通常のケースで、近接順位（元スコアが `cap` 以上）の
+        // 候補が真の 1 位を追い越す正当な加点まで拒否してしまう過剰拒否
+        // （2 回目の codex-review P1 指摘の再発）を避ける。詳細は
+        // [`soft_boost_confirm_cap`]・[`HybridError::BoostSoftBoundExceeded`] の
+        // ドキュメント参照。`apply_soft_boost_rejects_total_exceeding_soft_bound`
+        // （`hit.score == 0.0` のケース。`cap - 0.0 == cap` で従来どおりの挙動に
+        // 一致）・`apply_soft_boost_allows_near_top_candidate_to_overtake_true_top`
+        // （`hit.score` が `cap` を大きく超える近接順位候補のケース）・
+        // `apply_soft_boost_rejects_boost_that_would_cross_guaranteed_floor`
+        // （本指摘の直接回帰: `hit.score` が `cap` 未満かつ正のプール最下位級
+        // 候補で、`candidate_boost` 単独では `cap` 未満でも `hit.score` を加えると
+        // `cap` を超えるケース）で固定する。
         let cap = soft_boost_confirm_cap(cfg);
         for hit in hits.iter() {
             let candidate_boost: f64 = rules
@@ -718,10 +794,16 @@ pub fn apply_soft_boost(
             if candidate_boost <= 0.0 {
                 continue;
             }
-            if candidate_boost >= cap {
+            if hit.score >= cap {
+                // 元スコア単独で既に保証下限以上（近接順位級）の候補。追い越しは
+                // 正当なソフトブーストの用途のため、この確定判定では拒否しない。
+                continue;
+            }
+            let allowed = cap - hit.score;
+            if candidate_boost >= allowed {
                 return Err(HybridError::BoostSoftBoundExceeded {
                     total: candidate_boost,
-                    max: cap,
+                    max: allowed,
                 });
             }
         }
@@ -1741,6 +1823,67 @@ mod tests {
         assert_eq!(hits[0].id, 2);
         assert_eq!(hits[1].id, 1);
         assert_eq!(hits[2].id, 3);
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_boost_that_would_cross_guaranteed_floor_with_candidate_score() {
+        // PR #257 codex-review P1 指摘の直接回帰: `soft_boost_confirm_cap` 単独
+        // （候補の元スコアを考慮しない）判定では、プール最下位級（元スコアが
+        // `cap` 未満の正の値）の候補に対して「加点単独では `cap` 未満」でも
+        // 「元スコア＋加点」が `cap`（＝真の 1 位の保証下限）を上回る加点を
+        // 誤って受理してしまっていた。本テストの候補（id=2）は元スコアが `cap`
+        // よりわずかに小さく、加点単独は `cap` を下回るが、元スコアを加えると
+        // `cap` を超える。修正後は `cap - hit.score`（残余）と比較するため拒否
+        // される。
+        let cfg = RrfConfig::default();
+        let cap = soft_boost_confirm_cap(&cfg);
+        let near_cap_score = cap - 0.005;
+        let mut hits = vec![
+            HybridHit { id: 1, score: cap },
+            HybridHit {
+                id: 2,
+                score: near_cap_score,
+            },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        // 加点単独 (0.006) は cap (≈0.01639) を下回るが、元スコア (cap - 0.005) と
+        // 合わせると cap を超える。
+        let boost_amount = 0.006;
+        assert!(
+            boost_amount < cap,
+            "test premise: boost alone must stay under cap"
+        );
+        assert!(
+            near_cap_score + boost_amount > cap,
+            "test premise: score + boost must cross the guaranteed floor"
+        );
+        let rule = BoostRule::new(&ids, boost_amount).expect("rule ok");
+        let err = apply_soft_boost(&mut hits, &[rule], &cfg).unwrap_err();
+        match err {
+            HybridError::BoostSoftBoundExceeded { total, max } => {
+                assert!((total - boost_amount).abs() < 1e-15);
+                assert!((max - 0.005).abs() < 1e-12, "max={max}");
+            }
+            other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn boost_rule_construction_rejects_ids_set_exceeding_max_boost_ids() {
+        // PR #257 codex-review P2 指摘の直接回帰: `BoostRule::new` は `ids` の
+        // 要素数を検証せず、[`hybrid_search_boosted`] の早期拒否ループが検索対象
+        // `hits` に含まれない id まで無制限に走査・複製できてしまっていた。
+        // `ids.len() > MAX_BOOST_IDS` はアロケーション・走査（`BTreeMap` への複製）
+        // より前に拒否される。
+        let ids: BTreeSet<u64> = (0..=(MAX_BOOST_IDS as u64)).collect();
+        assert_eq!(ids.len(), MAX_BOOST_IDS + 1);
+        assert_eq!(
+            BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap_err(),
+            HybridError::TooManyBoostIds {
+                len: MAX_BOOST_IDS + 1,
+                max: MAX_BOOST_IDS,
+            }
+        );
     }
 
     #[test]
