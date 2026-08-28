@@ -73,25 +73,38 @@
 //! 4. **一括投入経路の書き込み量判定**
 //!    （[`index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing`]。
 //!    決定的・時間非依存。柱 3 の上記「限界」への対応。PR #296 codex-review 指摘:
-//!    「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」）:
+//!    「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」。
+//!    再指摘（PR #296 Cursor Bugbot）: 応答フィールドの合算だけでは、outcome には
+//!    正しくファイル単位分だけを計上しつつ内部で余分に再処理する退行を検出できず
+//!    vacuous pass しうる）:
 //!    柱 1 の [`CountingEmbedder`] によるカウント判定は単一ファイル経路
 //!    （`index_file`）だけを対象にしており、`t_full` の計測に使う一括投入経路
-//!    （`index_file_batch`）自身は独立に検証していなかった。柱 4 は
-//!    `execute_insert_sql_batch` の応答が返す `chunks_written`／`rows_replaced` を
-//!    `BASELINE_FILES + 1` 件のバッチ全体で積算し、合計が `(BASELINE_FILES + 1) *
+//!    （`index_file_batch`）自身は独立に検証していなかった。柱 4 は柱 1 と同じ
+//!    [`CountingEmbedder`] 計装を一括投入経路へ挿し、`execute_insert_sql_batch`
+//!    呼び出し全体を通した `Embedder::embed_batch` の実際の呼び出し回数・入力
+//!    テキスト総数を直接観測する（応答が返す `chunks_written`／`rows_replaced` の
+//!    自己申告値を経由しない）。`BASELINE_FILES + 1` 件のバッチで、呼び出し回数が
+//!    `BASELINE_FILES + 1` 回、入力テキスト総数が `(BASELINE_FILES + 1) *
 //!    expected_chunks_for_new_file()`（＝各ファイル 1 件あたりちょうど期待チャンク数）
 //!    に一致することを固定する。`index_file_batch` が既存コーパス規模に比例して
-//!    重くなる再処理型退行を起こせば、バッチ後半の呼び出しほど `chunks_written`／
-//!    `rows_replaced` が累積コーパス規模に応じて膨らみ、この合計は期待値を確実に
-//!    上回るため、時間計測に頼らず一括投入経路自身の再処理型退行を検出できる
-//!    （経路共通の退行の検出は柱 1・2・4 が担い、いずれも `t_full` に依存しない。
-//!    モジュール冒頭の「検出対象」参照）。
+//!    重くなる再処理型退行を起こせば、バッチ後半の呼び出しほど余分な
+//!    `embed_batch` 呼び出し・入力テキストが発生し、これらの直接観測値は期待値を
+//!    確実に上回るため、応答フィールドの自己申告を経由せず一括投入経路自身の
+//!    再処理型退行を検出できる（経路共通の退行の検出は柱 1・2・4 が担い、いずれも
+//!    `t_full` に依存しない。モジュール冒頭の「検出対象」参照）。応答フィールド
+//!    （`chunks_written`／`rows_replaced`）はこの直接観測値との整合性チェックとして
+//!    従属的に突き合わせる。
 //!
-//! vacuous pass 防止（Issue #281 AC2）として、柱 1〜3 と同一の判定述語
+//! vacuous pass 防止（Issue #281 AC2。柱 4 分は PR #296 Cursor Bugbot「no negative
+//! control either」指摘への対応も兼ねる）として、柱 1〜3 と同一の判定述語
 //! （[`within_ratio_threshold`]・[`within_scaling_slack`]・[`work_is_single_file`]）を、
 //! 「既存コーパス全件の同一パス再投入 ＋ 新規 1 件」という再処理型退行の実測モデル
 //! （[`measure_simulated_full_reprocess`]）に通し、判定が確実に `false`（拒否）を返す
-//! ことを [`index1_judgements_reject_simulated_full_reprocess_regression`] で固定する。
+//! ことに加え、柱 4 の直接観測値（呼び出し回数・入力テキスト総数）についても
+//! 「バッチ呼び出しごとに累積ファイル分を毎回再埋め込みする」再処理型退行の実測
+//! モデル（[`measure_simulated_batch_full_reprocess_counts`]）を通し、正常時の期待値を
+//! 確実に上回ることを、いずれも
+//! [`index1_judgements_reject_simulated_full_reprocess_regression`] で固定する。
 //! **この負例が検証しているのは「[`measure_simulated_full_reprocess`] というモデルに
 //! 対して各判定述語が `false` を返すこと」であり、柱 3
 //! （[`within_ratio_threshold`]）が実際の実装退行を検出できることの証明ではない**
@@ -508,49 +521,38 @@ fn measure_full_rebuild_batch() -> Duration {
 }
 
 /// `index_file_batch`（`execute_insert_sql_batch` が呼ぶ一括投入経路本体）自身に対する、
-/// 時間非依存の処理量判定（柱 4。PR #296 codex-review 指摘への対応）。
+/// 時間非依存・直接観測の処理量判定（柱 4: 直接観測判定用。PR #296 codex-review・
+/// Cursor Bugbot の再指摘への対応）。
 ///
-/// 柱 3（[`measure_full_rebuild_batch`]）の限界（モジュールドキュメント参照）は
-/// 「`t_full` が増分経路と同じ `embed_and_write_phase` を共有するため、経路共通の
-/// 退行では比較の独立性が失われる」ことだった。柱 1（[`CountingEmbedder`]）は
-/// この種の退行を単一ファイル挿入（`index_file`）に対しては検出できるが、
-/// `index_file_batch`（一括投入経路）自身に対しては検証していなかった
-/// （指摘: 「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」）。
+/// 当初案は `execute_insert_sql_batch` が返す
+/// `IndexOutcome.chunks_written`／`rows_replaced`（wire 応答として公開される、
+/// `index_file_batch` が「自己申告」する論理的な処理結果）だけを合算する判定であり、
+/// `index_file_batch` が実際に `Embedder::embed_batch` を何回・何件のテキストで
+/// 呼んだか（＝内部の再チャンク化・再埋め込み量そのもの）は独立に観測していなかった。
+/// もし `index_file_batch` が「各ファイルの outcome には正しくそのファイル分だけを
+/// 計上しつつ、内部では既存コーパス分も余分に re-chunk・re-embed・re-write する」
+/// 退行を起こした場合、outcome の合算はこの退行の影響を受けず期待値のままとなり
+/// 判定が vacuous pass しうる（PR #296 codex-review・Cursor Bugbot 指摘）。
 ///
-/// 本関数は `execute_insert_sql_batch` の応答（`IndexOutcome`）そのものが返す
-/// `chunks_written`／`rows_replaced` を `0..=n_files` 件のバッチ全体で積算する。
-/// `embed_and_write_phase` は呼び出しごとに **その回に渡された 1 ファイルの
-/// `chunk_phase` 結果**（＝そのファイル自身の本文からのチャンク）だけを埋め込み・
-/// 書き込みするため、退行なしの実装では合計は `(n_files + 1) *
-/// expected_chunks_for_new_file()` に一致するはずである（各ファイル 1 件あたり
-/// ちょうど [`expected_chunks_for_new_file`] 個のチャンク）。もし `index_file_batch`
-/// が「現在までにバッチへ積んだ既存ファイル分も毎回re-chunk・re-embed・re-write する」
-/// 再処理型退行を起こせば、バッチ後半の呼び出しほど `chunks_written`／
-/// `rows_replaced` がその時点までの累積コーパス規模に応じて膨らむため、合計が
-/// 期待値を上回り本判定は決定的に `false`（アサート失敗）となる。時間計測を一切
-/// 使わないため、負荷変動によるフレークの余地もない。
-///
-/// 柱 1 と異なり `CountingEmbedder` を挟まない（`execute_insert_sql_batch` の
-/// 戻り値だけで判定できるため）。`rows_replaced`（`tenant::replace_typed_rows_by_text_key`
-/// が返す `ReplaceOutcome.inserted`）は、`embed_and_write_phase` が渡す
-/// `rows`（＝ `chunks.len()`）の要素数をそのまま数え上げる実装であるため
-/// （`tenant.rs` の挿入ループ参照）、`chunks_written` と常に等しくなるトートロジー
-/// であり、`chunk_phase`／`embed_and_write_phase` の外側（`replace_typed_rows_by_text_key`
-/// 内の既存行巻き込み型の書き込み退行）を独立に検出する力は持たない。ここで
-/// `rows_replaced` も突き合わせるのは、`chunks_written` と食い違わないこと自体を
-/// 固定する冗長な整合性チェックであり、検出力の上乗せを主張するものではない
-/// （既存行を巻き込んだ再書き込みは `tenant::replace_typed_rows_by_text_key` の
-/// 線形走査コストとして現れ、柱 2（[`index1_single_file_insert_time_does_not_scale_with_corpus_size`]。
-/// 単一ファイル挿入の壁時計時間を小規模／大規模コーパスで比較）が担当する）。
-fn full_rebuild_batch_write_quantity(n_files: usize) -> (usize, usize) {
-    let full_path = unique_db_path("recall-full-rebuild-batch-quantity");
+/// 本関数は柱 1（[`CountingEmbedder`]）と同じ計装をバッチ経路（一括投入経路）に
+/// 挿し、`execute_insert_sql_batch` 呼び出し全体を通した `embed_batch` 呼び出し
+/// 回数・入力テキスト総数を、`IndexOutcome` の自己申告を経由せず直接数える。
+/// `embed_and_write_phase` の契約（ファイル 1 件につき `embed_batch` を 1 回、
+/// そのファイル自身のチャンクだけを渡す）が守られていれば、`n_files + 1` 件の
+/// バッチで `calls == n_files + 1` かつ `texts == (n_files + 1) *
+/// expected_chunks_for_new_file()` となるはずである。柱 1 と異なり、この直接観測は
+/// バッチ内の各ファイルが既存コーパス規模に比例して余分な入力テキストで
+/// 再埋め込みされる退行を、応答フィールドを介さずに検出する。
+fn full_rebuild_batch_write_quantity_with_counting(n_files: usize) -> (usize, usize, usize, usize) {
+    let full_path = unique_db_path("recall-full-rebuild-batch-quantity-counting");
     let _full_cleanup = CleanupGuard(full_path.clone());
     let storage = Storage::open(&full_path).expect("open storage");
     storage
         .create_table(&documents_schema())
         .expect("create table");
+    let (embedder, calls, texts) = CountingEmbedder::new(DIM);
     let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
-        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_embedder(Box::new(embedder))
         .with_incremental_config(small_chunk_config())
         .with_batch_limits(BatchLimits {
             max_files_per_batch: n_files + 1,
@@ -561,9 +563,9 @@ fn full_rebuild_batch_write_quantity(n_files: usize) -> (usize, usize) {
         .map(|i| {
             insert_file_sql(
                 "documents",
-                &format!("corpus/full-batch-quantity-{i:04}.txt"),
+                &format!("corpus/full-batch-quantity-counting-{i:04}.txt"),
                 &generic_body(i),
-                &format!("op-full-batch-quantity-{i:04}"),
+                &format!("op-full-batch-quantity-counting-{i:04}"),
             )
         })
         .collect();
@@ -586,7 +588,59 @@ fn full_rebuild_batch_write_quantity(n_files: usize) -> (usize, usize) {
             .expect("total rows_replaced must not overflow");
     }
 
-    (total_chunks_written, total_rows_replaced)
+    (
+        calls.load(Ordering::SeqCst),
+        texts.load(Ordering::SeqCst),
+        total_chunks_written,
+        total_rows_replaced,
+    )
+}
+
+/// [`full_rebuild_batch_write_quantity_with_counting`] の負例用実測モデル（柱 4 の
+/// vacuous pass 防止・PR #296 Cursor Bugbot 指摘「no negative control either」への
+/// 対応）。「バッチ呼び出し `i` 回目が、それまでに積んだ `0..=i` 件分のファイルを
+/// 毎回まとめて再埋め込みする」再処理型退行を、`execute_insert_sql_batch` を
+/// `0..=n_files` 回、呼び出しごとに引数のバッチへ「これまでの全ファイル」を含める
+/// ことで実測モデル化する（モジュール冒頭「検出対象」参照。柱 1 の負例
+/// [`measure_simulated_full_reprocess_counts`] の単一ファイル経路版に対する、
+/// 一括投入経路版）。この呼び出し列全体を通した `embed_batch` 呼び出し回数・
+/// 入力テキスト総数を返す。同一パスへの再投入は置換（`INSERT` の同一パス置換
+/// 書き込みセマンティクス）になるため、コーパスの総行数は各呼び出し後も
+/// `i + 1` 件のままである。
+fn measure_simulated_batch_full_reprocess_counts(n_files: usize, label: &str) -> (usize, usize) {
+    let full_path = unique_db_path(&format!("recall-{label}-batch-reprocess-counts"));
+    let _full_cleanup = CleanupGuard(full_path.clone());
+    let storage = Storage::open(&full_path).expect("open storage");
+    storage
+        .create_table(&documents_schema())
+        .expect("create table");
+    let (embedder, calls, texts) = CountingEmbedder::new(DIM);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(embedder))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_files_per_batch: n_files + 1,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    for i in 0..=n_files {
+        let sqls: Vec<String> = (0..=i)
+            .map(|j| {
+                insert_file_sql(
+                    "documents",
+                    &format!("corpus/{label}-{j:04}.txt"),
+                    &generic_body(j),
+                    &format!("op-{label}-batch-reprocess-{i:04}-{j:04}"),
+                )
+            })
+            .collect();
+        let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+        core.execute_insert_sql_batch(&write_ctx, &sql_refs)
+            .expect("simulated batch reprocess insert should succeed");
+    }
+
+    (calls.load(Ordering::SeqCst), texts.load(Ordering::SeqCst))
 }
 
 /// 負例（vacuous pass 防止・Issue #281 AC2）: 「既存 `n_files` 件全件の同一パス
@@ -743,33 +797,63 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
 fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
     let _timing_guard = acquire_timing_lock();
 
-    let (total_chunks_written, total_rows_replaced) =
-        full_rebuild_batch_write_quantity(BASELINE_FILES);
+    let (calls, texts, total_chunks_written, total_rows_replaced) =
+        full_rebuild_batch_write_quantity_with_counting(BASELINE_FILES);
 
     let expected_chunks_per_file = expected_chunks_for_new_file();
-    let expected_total = (BASELINE_FILES + 1) * expected_chunks_per_file;
+    let expected_calls = BASELINE_FILES + 1;
+    let expected_total = expected_calls * expected_chunks_per_file;
 
     println!(
         "index1 full-rebuild-batch write-quantity judgement: \
-         total_chunks_written={total_chunks_written} total_rows_replaced={total_rows_replaced} \
+         calls={calls} texts={texts} total_chunks_written={total_chunks_written} \
+         total_rows_replaced={total_rows_replaced} expected_calls={expected_calls} \
          expected_total={expected_total} (baseline_files={BASELINE_FILES})"
     );
 
+    // 主判定（直接観測。PR #296 codex-review・Cursor Bugbot 再指摘への対応）:
+    // `execute_insert_sql_batch` の応答フィールドを経由せず、`Embedder::embed_batch`
+    // の実際の呼び出し回数・入力テキスト総数そのものを検査する。
+    // `index_file_batch` が既存コーパス規模に比例して重くなる再処理型退行を起こせば、
+    // 呼び出し回数がファイル数を上回るか、入力テキスト総数が期待値を上回るため、
+    // 自己申告の `IndexOutcome` フィールドが（誤って）退行の影響を受けなかった
+    // 場合でも本判定は確実に失敗する。
     assert_eq!(
-        total_chunks_written,
-        expected_total,
-        "full-rebuild batch (execute_insert_sql_batch, {} files) must write exactly \
-         {expected_chunks_per_file} chunks per file regardless of accumulated corpus size \
-         within the batch; a reprocessing-type O(N) regression in index_file_batch would \
-         inflate this total",
+        calls,
+        expected_calls,
+        "full-rebuild batch (execute_insert_sql_batch, {} files) must call \
+         Embedder::embed_batch exactly once per file regardless of accumulated corpus size \
+         within the batch (embed_and_write_phase contract); a reprocessing-type O(N) \
+         regression in index_file_batch that re-embeds already-processed files would \
+         inflate this call count",
         BASELINE_FILES + 1
+    );
+    assert_eq!(
+        texts,
+        expected_total,
+        "full-rebuild batch (execute_insert_sql_batch, {} files) must feed \
+         Embedder::embed_batch exactly {expected_chunks_per_file} chunks of text per file \
+         regardless of accumulated corpus size within the batch; a reprocessing-type O(N) \
+         regression in index_file_batch would inflate this total independently of what \
+         IndexOutcome self-reports",
+        BASELINE_FILES + 1
+    );
+
+    // 従属判定（冗長な整合性チェック）: 応答フィールド（`chunks_written`／
+    // `rows_replaced`）が直接観測値（`texts`）と食い違わないこと自体を固定する。
+    // 検出力はあくまで上記 `calls`／`texts` の直接観測判定が担う。
+    assert_eq!(
+        total_chunks_written, texts,
+        "IndexOutcome.chunks_written summed across the batch must match the directly \
+         observed embed_batch input text count (texts={texts}); a mismatch would mean \
+         chunks_written under- or over-reports the actual embedding work"
     );
     assert_eq!(
         total_rows_replaced, total_chunks_written,
         "rows actually written via tenant::replace_typed_rows_by_text_key must match the \
          chunk count produced for each file (redundant consistency check; see \
-         full_rebuild_batch_write_quantity doc for why this alone does not add detection \
-         power beyond chunks_written)"
+         full_rebuild_batch_write_quantity_with_counting doc for why this alone does not \
+         add detection power beyond the calls/texts direct-observation judgement)"
     );
 }
 
@@ -945,6 +1029,24 @@ fn index1_judgements_reject_simulated_full_reprocess_regression() {
         "simulated full-reprocess regression must be rejected by the count judgement \
          (i.e. work_is_single_file must return false): calls={calls} texts={texts} \
          expected_chunks={expected_chunks} chunks_written={chunks_written}"
+    );
+
+    // 柱 4（一括投入経路の直接観測判定）の負例（PR #296 Cursor Bugbot 指摘
+    // 「no negative control either」への対応）: バッチ呼び出しごとに、それまでに
+    // 積んだ全ファイルを毎回まとめて再埋め込みする再処理型退行の実測モデルでは、
+    // `embed_batch` 呼び出し回数・入力テキスト総数が、退行なしの一括投入
+    // （ファイル数 + 1 回・ファイルあたり expected_chunks 件）の期待値を確実に
+    // 上回ること。
+    let (batch_calls, batch_texts) =
+        measure_simulated_batch_full_reprocess_counts(CORPUS_FILES_SMALL, "reject-batch-count");
+    let expected_batch_calls = CORPUS_FILES_SMALL + 1;
+    let expected_batch_texts = expected_batch_calls * expected_chunks;
+    println!(
+        "index1 negative control (batch count): batch_calls={batch_calls}          expected_batch_calls={expected_batch_calls} batch_texts={batch_texts}          expected_batch_texts={expected_batch_texts} (n_files={CORPUS_FILES_SMALL})"
+    );
+    assert!(
+        batch_calls > expected_batch_calls && batch_texts > expected_batch_texts,
+        "simulated batch full-reprocess regression model must produce more embed_batch          calls/input texts than a non-regressed batch would (batch_calls={batch_calls}          > expected_batch_calls={expected_batch_calls}, batch_texts={batch_texts}          > expected_batch_texts={expected_batch_texts}); this confirms the direct-observation          judgement used by index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing          has detection power against a reprocessing-type regression in the batch path"
     );
 }
 
