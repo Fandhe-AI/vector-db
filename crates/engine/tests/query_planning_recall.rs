@@ -49,7 +49,13 @@
 //!   実測値を比較する閾値ゲート。`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
 //!   （`recall.yml` の Run step からのみ注入）で未設定を fail-closed にする strict
 //!   モードを持つ（`rerank_recall.rs::resolve_gate_threshold` と同型。ログには
-//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）
+//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）。
+//!   同一の spec 閾値ゲート本体（[`run_threshold_gate`]）を [`MockLlmClient`]
+//!   （完全 oracle 写像。`query_planning_recall_threshold_gate`）と [`NoisyLlmClient`]
+//!   （非 oracle・劣化展開品質。`query_planning_recall_threshold_gate_degraded_expansion`）
+//!   の両方に対して評価する（codex-review・PR #265・P2「層 B の受け入れゲートが
+//!   `MockLlmClient` の完全 oracle 写像に依存し、production の展開品質劣化を検出
+//!   できない」への対応。実 Ollama への疎通は引き続き対象外）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 実 Ollama 接続での実測は対象外（TASK-110 時点からの継続制約。本テストは
@@ -844,32 +850,38 @@ fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
     resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
-/// TASK-112（PLAN-1, PLAN-2）層 B: intent カテゴリの改善幅（after − baseline）が
-/// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` 以上、かつ direct カテゴリの
-/// after Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（絶対下限）以上である
-/// ことを確認する閾値ゲート。契約は `rerank_recall.rs::
+/// TASK-112（PLAN-1, PLAN-2）層 B 閾値ゲートの共通本体。intent カテゴリの改善幅
+/// （after − baseline）が `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` 以上、かつ
+/// direct カテゴリの after Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`
+/// （絶対下限）以上であることを確認する。契約は `rerank_recall.rs::
 /// rerank_recall_large_scale_threshold_gate` と同一（2 つの下限を独立に解決し、
 /// 片方のみ設定済みの場合は設定済みの側だけを判定する。両方未設定かつ非 strict の
 /// 場合のみコーパス生成前に早期 return して成功終了する。strict モードでは
 /// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。ログには
 /// pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
-#[test]
-#[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
-fn query_planning_recall_threshold_gate() {
+///
+/// `client` を差し替え可能にすることで、[`measure_category_recall_with_client`]
+/// 経由で [`MockLlmClient`]（完全 oracle 写像）に限らず [`NoisyLlmClient`]（劣化
+/// 展開品質を模する非 oracle スタブ）でも同じ spec 閾値ゲートを評価できる
+/// （codex-review・PR #265・P2 再指摘への対応。`gate_name` はログ行の接頭辞にのみ
+/// 使う識別子で、実測値は含まない）。
+fn run_threshold_gate(client: &dyn LlmClient, gate_name: &str) {
     let min_intent_improvement =
         resolve_improvement_gate_threshold("QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT");
     let min_r20_direct = resolve_gate_threshold("QUERY_PLANNING_RECALL_MIN_R20_DIRECT");
 
     if min_intent_improvement.is_none() && min_r20_direct.is_none() {
         println!(
-            "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT/QUERY_PLANNING_RECALL_MIN_R20_DIRECT not configured; gate not enabled (explicit no-op, not a failure)"
+            "{gate_name}: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT/QUERY_PLANNING_RECALL_MIN_R20_DIRECT not configured; gate not enabled (explicit no-op, not a failure)"
         );
         return;
     }
 
     let (docs, pairs) = generate_corpus(SEED, NUM_DOCS, NUM_PAIRS, VOCAB_SIZE);
-    let direct = measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline);
-    let intent = measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline);
+    let direct =
+        measure_category_recall_with_client(&docs, &pairs, VOCAB_SIZE, direct_baseline, client);
+    let intent =
+        measure_category_recall_with_client(&docs, &pairs, VOCAB_SIZE, intent_baseline, client);
     let intent_improvement = intent.after_recall20() - intent.baseline_recall20();
     let direct_after_recall20 = direct.after_recall20();
 
@@ -878,11 +890,11 @@ fn query_planning_recall_threshold_gate() {
         Some(min) => {
             let pass_intent = intent_improvement >= min;
             pass &= pass_intent;
-            println!("query_planning_recall_threshold_gate: pass_intent={pass_intent}");
+            println!("{gate_name}: pass_intent={pass_intent}");
         }
         None => {
             println!(
-                "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT not configured; sub-check not enabled"
+                "{gate_name}: QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT not configured; sub-check not enabled"
             );
         }
     }
@@ -890,17 +902,44 @@ fn query_planning_recall_threshold_gate() {
         Some(min) => {
             let pass_direct = direct_after_recall20 >= min;
             pass &= pass_direct;
-            println!("query_planning_recall_threshold_gate: pass_direct={pass_direct}");
+            println!("{gate_name}: pass_direct={pass_direct}");
         }
         None => {
             println!(
-                "query_planning_recall_threshold_gate: QUERY_PLANNING_RECALL_MIN_R20_DIRECT not configured; sub-check not enabled"
+                "{gate_name}: QUERY_PLANNING_RECALL_MIN_R20_DIRECT not configured; sub-check not enabled"
             );
         }
     }
 
     assert!(
         pass,
-        "intent recall improvement or direct after-expansion recall@20 is below the configured QUERY_PLANNING_RECALL_MIN_* threshold"
+        "intent recall improvement or direct after-expansion recall@20 is below the configured QUERY_PLANNING_RECALL_MIN_* threshold ({gate_name})"
+    );
+}
+
+/// TASK-112（PLAN-1, PLAN-2）層 B: [`MockLlmClient`]（完全 oracle 写像）での
+/// [`run_threshold_gate`]。
+#[test]
+#[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
+fn query_planning_recall_threshold_gate() {
+    run_threshold_gate(&MockLlmClient, "query_planning_recall_threshold_gate");
+}
+
+/// TASK-112（PLAN-1, PLAN-2）層 B: [`NoisyLlmClient`]（言い換え語彙の半数のみ正しく
+/// 写像する非 oracle スタブ）での [`run_threshold_gate`]。codex-review（PR #265・P2）
+/// 「層 B の受け入れゲートが `MockLlmClient` の完全 oracle 写像に依存し、production の
+/// 展開品質劣化を検出できない」という再指摘への対応。[`query_planning_recall_detects_degraded_expansion_quality`]
+/// （層 A）は `MockLlmClient` との相対比較のみで劣化検出感度を回帰保証するのに対し、
+/// 本テストは spec 閾値そのものを非 oracle な固定応答（`NoisyLlmClient`）に対して
+/// 評価する点が異なる（層 B の絶対水準ゲートを oracle 写像専用にしない）。実 Ollama
+/// への疎通は引き続き対象外（ファイル冒頭「既知の制約」参照）であり、本テストは
+/// 「固定した非 oracle 応答コーパスを production と同じ展開処理へ入力する評価」と
+/// して spec 閾値を適用する。
+#[test]
+#[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
+fn query_planning_recall_threshold_gate_degraded_expansion() {
+    run_threshold_gate(
+        &NoisyLlmClient,
+        "query_planning_recall_threshold_gate_degraded_expansion",
     );
 }
