@@ -64,9 +64,13 @@
 //! リポジトリの Actions variables（`vars.*`）から渡す想定。未設定・不正値の場合は
 //! fail-closed で非ゼロ終了する（本ファイルにデフォルト値を持たない）。
 //!
-//! 標準出力には実測値と pass/fail のみを記録し、注入された閾値そのものは出力しない
-//! （本 workflow は public リポの Actions ログとして残るため。閾値は spec が SSOT
-//! であり、能動的にログへ書き出さない運用とする。`.claude/rules/spec-confidentiality.md`）。
+//! 標準出力には pass/fail・非数値の状態のみを記録し、注入された閾値・実測値（median・
+//! p95・recall_min・診断 A/B の a_median/b_median/median_ratio）は出力しない（本
+//! workflow は public リポの Actions ログとして残るため。実測値からも数値基準を
+//! 逆算されうる。Issue #277。`contrast_bench.rs`（CORE-5・Issue #224）と同方針。
+//! `.claude/rules/spec-confidentiality.md`）。実測値がローカルで必要な場合は
+//! `--verbose`（[`verbose_requested`]）で opt-in できるが、`GITHUB_ACTIONS` 環境下では
+//! public ログ混入防止のため fail-closed で拒否する（[`running_under_github_actions`]）。
 
 // `harness` は `benches/measurement.rs`・`benches/parallel_smoke.rs` と同様、独立した
 // コンパイル単位（cargo bench バイナリ）から取り込まれる共有ソース。本ファイルが
@@ -183,7 +187,32 @@ fn min_recall_from_env() -> Result<f64, String> {
     Ok(value)
 }
 
+/// `--verbose` 指定の有無を判定する。`[[bench]] simd_bench` は `harness = false` /
+/// `test = false`（`Cargo.toml`）のため cargo 標準のベンチ引数パーサを経由できず、
+/// 自前で `std::env::args()` を走査する（`tier_latency_bench.rs::help_requested` と
+/// 同一パターン）。cargo が付与しうる未知の引数（`--bench` 等）は無視し、完全一致する
+/// `--verbose` の有無のみを見る。
+fn verbose_requested() -> bool {
+    std::env::args().skip(1).any(|arg| arg == "--verbose")
+}
+
+/// GitHub Actions 上で実行されているかを判定する。`GITHUB_ACTIONS` は Actions が
+/// ランナーへ自動設定する環境変数であり、値の中身は見ず存在有無のみを見る
+/// （untrusted な値のパースを避ける）。`--verbose` と併用された場合に実測値の
+/// public ログ混入を防ぐための defense-in-depth（モジュール冒頭コメント参照）。
+fn running_under_github_actions() -> bool {
+    std::env::var_os("GITHUB_ACTIONS").is_some()
+}
+
 fn main() {
+    let verbose = verbose_requested();
+    if verbose && running_under_github_actions() {
+        eprintln!(
+            "simd_bench: --verbose (numeric output) is not permitted under GitHub Actions because workflow logs are public; run locally without GITHUB_ACTIONS to see measured values"
+        );
+        std::process::exit(1);
+    }
+
     let max_p95 = match max_p95_from_env() {
         Ok(v) => v,
         Err(msg) => {
@@ -244,13 +273,16 @@ fn main() {
     let p95 = p95_from_samples(&measurement.samples).expect("non-empty samples must yield a p95");
     let p95_ok = check_p95_within_limit(p95, max_p95);
     passed &= p95_ok;
-    // limit（BENCH_MAX_P95_MS の実測値）は意図的にログへ出力しない。閾値は spec が
-    // SSOT であり、public リポの Actions ログへ能動的に書き出さない
+    // limit（BENCH_MAX_P95_MS）・実測値（median・p95）は意図的にログへ出力しない。
+    // 閾値・実測値のいずれも public リポの Actions ログへ能動的に書き出さない
     // （モジュール冒頭コメント参照）。
-    println!(
-        "p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} isa={isa:?} median={:?} p95={p95:?} pass={p95_ok}",
-        measurement.summary.median,
-    );
+    println!("p95_latency: rows={ROW_COUNT} dim={DIM} k={TOP_K} isa={isa:?} pass={p95_ok}");
+    if verbose {
+        println!(
+            "verbose_p95_latency: median={:?} p95={p95:?}",
+            measurement.summary.median,
+        );
+    }
 
     // --- CORE-4: ParallelSearchProvider（SIMD+並列） vs 真のスカラー逐次和の Top-k 一致率 ---
     // 参照実装は `harness::scalar_reference::top_k_ids_scalar`（`engine::isa::dot_scalar`
@@ -289,11 +321,14 @@ fn main() {
     let recall_ok = check_recall_within_limit(recall_min, min_recall)
         .expect("min_recall validated by min_recall_from_env");
     passed &= recall_ok;
-    // limit（BENCH_MIN_RECALL の実測値）は意図的にログへ出力しない（p95_latency と
-    // 同一方針。モジュール冒頭コメント参照）。
+    // limit（BENCH_MIN_RECALL）・実測値（recall_min）は意図的にログへ出力しない
+    // （p95_latency と同一方針。モジュール冒頭コメント参照）。
     println!(
-        "topk_consistency(simd_parallel_vs_scalar_reference): k={TOP_K} queries={RECALL_QUERY_COUNT} recall_min={recall_min:.6} pass={recall_ok}"
+        "topk_consistency(simd_parallel_vs_scalar_reference): k={TOP_K} queries={RECALL_QUERY_COUNT} pass={recall_ok}"
     );
+    if verbose {
+        println!("verbose_topk_consistency: recall_min={recall_min:.6}");
+    }
 
     // CORE-5（対照エンジン比較）は `contrast_bench.rs` が独立バイナリとして判定する
     // （モジュール冒頭コメント参照）。
@@ -361,9 +396,14 @@ fn main() {
     ) {
         Ok(ab) => {
             println!(
-                "diagnostic_ab({diag_label}, not isolated to SIMD kernel alone): rows={DIAG_AB_ROW_COUNT} dim={DIM} k={TOP_K} expected_threads={diag_expected_threads} a_median={:?} b_median={:?} median_ratio={:.4} (not counted toward pass/fail; small dedicated dataset, not comparable to p95_latency's rows={ROW_COUNT} figure)",
-                ab.a.summary.median, ab.b.summary.median, ab.median_ratio
+                "diagnostic_ab({diag_label}, not isolated to SIMD kernel alone): rows={DIAG_AB_ROW_COUNT} dim={DIM} k={TOP_K} expected_threads={diag_expected_threads} measured=true (not counted toward pass/fail; small dedicated dataset, not comparable to p95_latency's rows={ROW_COUNT} figure)"
             );
+            if verbose {
+                println!(
+                    "verbose_diagnostic_ab: a_median={:?} b_median={:?} median_ratio={:.4}",
+                    ab.a.summary.median, ab.b.summary.median, ab.median_ratio
+                );
+            }
         }
         Err(e) => {
             // A/B は診断情報であり合否に含めないため、算出不能（分母 0 等）でも
