@@ -233,21 +233,32 @@ pub enum HybridError {
     /// （TASK-111）。[`rrf_fuse`] の [`TooManyCandidates`](HybridError::TooManyCandidates)
     /// と同じ「アロケーション・走査前に長さを検証する」順序を踏襲する。
     TooManyBoostRules { len: usize, max: usize },
-    /// ある候補（`total`。実際に一致した `rules` の加点合計）が、その候補の
-    /// 実スコアから真の 1 位（融合プール `hits` の実際の最高スコア）までの差
-    /// （`max`）以上だった（codex-review P1 指摘・cursor bot 指摘・その後 2 回の
-    /// codex-review P1 指摘対応。TASK-111）。判定は候補ごとに個別に行う
-    /// （[`apply_soft_boost`]）。プール全体の最高・最低スコア差
-    /// （[`pool_score_spread`]）とだけ比較する版（過去の実装）は、真の 1 位との
-    /// 差が小さい候補がプール最下位級との差だけを基準に通過してしまい、実際には
-    /// その候補が真の 1 位を追い越せてしまう抜けがあった（`total`・`max` は
-    /// このエラーの発生時点では常に個別候補基準の値であり、プール全体の spread
-    /// ではない）。`MAX_BOOST_AMOUNT` は [`BoostRule::new`] 単体では「有限かつ
-    /// 極端でない」ことしか保証できず、実際にどこまで安全かは融合結果の分布に
-    /// 依存するため、加点の適用時点（[`apply_soft_boost`]）で実データに対して
-    /// 動的に検証する。`cfg` の重みだけから理論上限を導出する方式（過去の実装）
-    /// は、重みが大きい方のチャネルがクエリ不一致で空になるケースを見落として
-    /// 上限を過大評価しうるため使わない。
+    /// ある候補（`total`。実際に一致した `rules` の加点合計）が、[`apply_soft_boost`]
+    /// が候補 1 件あたりに許容する加点合計の絶対上限（`max`。
+    /// [`soft_boost_confirm_cap`]）以上だった（TASK-111。3 回目の codex-review P1
+    /// 指摘・cursor bot「Boost error contract is inconsistent」指摘対応）。
+    ///
+    /// 過去の実装（2 回目の codex-review P1 指摘対応）は `max` を「その候補の
+    /// 実スコアから真の 1 位（融合プール `hits` の実際の最高スコア）までの差」
+    /// として候補ごとに算出しており、真の 1 位を追い越す加点を一律拒否していた。
+    /// しかしこれは近接順位を入れ替えるというソフトブースト本来の用途（PLAN-1 の
+    /// 意図）そのものを検索エラーにしてしまう過剰拒否だった: 既定 RRF の単一
+    /// チャネルでの実測順位差は僅か（例: 約 0.000264）であり、公開済み既定値
+    /// [`SOFT_BOOST_PER_MATCH`]（`0.0007`）を 1 件適用しただけの通常利用でも
+    /// この僅差を上回ってしまい `hybrid_search_boosted` が失敗していた。真の
+    /// 1 位を追い越して新たな 1 位になること自体は正常な結果であり拒否すべき
+    /// ではないため、`max` は実データの順位関係（真の 1 位との margin）とは無関係の
+    /// 絶対値（[`soft_boost_confirm_cap`]。`min(dense_weight, sparse_weight) /
+    /// (k_const + 1)`）とする。`MAX_BOOST_AMOUNT` は [`BoostRule::new`] 単体では
+    /// 「有限かつ極端でない」ことしか保証できず、実際にどこまで安全かは `cfg`
+    /// （[`RrfConfig`]）に依存するため、加点の適用時点（[`apply_soft_boost`]）で
+    /// `cfg` に対して動的に検証する。`min` を使うのは、重みが大きい方のチャネルが
+    /// クエリ不一致で空になるケース（`tests::
+    /// hybrid_search_boosted_rejects_boost_when_heavier_channel_is_empty`）でも
+    /// 安全側（弱い方のチャネルの寄与だけを仮定する）に倒すためで、`max` を使うと
+    /// 本来拒否すべき加点を通してしまい危険（過去 2 回目の codex-review P1
+    /// 指摘の核心だった「重みが大きい方のチャネルに必ず 1 位候補があると誤仮定
+    /// する」問題の再発）。
     BoostSoftBoundExceeded { total: f64, max: f64 },
 }
 
@@ -284,7 +295,7 @@ impl fmt::Display for HybridError {
             HybridError::BoostSoftBoundExceeded { total, max } => {
                 write!(
                     f,
-                    "candidate soft boost total {total} at or above its margin to the true top rank {max}"
+                    "candidate soft boost total {total} at or above the absolute soft boost cap {max}"
                 )
             }
         }
@@ -491,23 +502,23 @@ fn accumulate_ranked(
 /// （`k_const=60.0`・`dense_weight=sparse_weight=1.0`・`pool_depth=200`、いずれも
 /// 本ファイル内で既に公開済みの定数）から純粋に導出した安全側の値である。
 ///
-/// 保証している性質は次の 1 点のみ（codex-review P1・cursor bot 指摘対応。2 回目の
-/// 見直し）: [`RrfConfig::default`] 下で、[`MAX_BOOST_RULES`] 件（最大 16 件）の
-/// ルールが同一候補へ同時に一致しても、その候補が**プール最下位級**（融合プール中で
-/// 唯一の出現が片方のチャネルの最下位順位のみ、という最悪ケース。RRF はヒットしない
+/// 保証している性質は次の 1 点のみ（TASK-111。3 回目の codex-review P1 指摘対応で
+/// 判定方式自体を見直したが、本定数が保証する不変条件は変わらない）:
+/// [`RrfConfig::default`] 下で、[`MAX_BOOST_RULES`] 件（最大 16 件）のルールが
+/// 同一候補へ同時に一致しても、その候補が**プール最下位級**（融合プール中で唯一の
+/// 出現が片方のチャネルの最下位順位のみ、という最悪ケース。RRF はヒットしない
 /// チャネルに `0.0` を割り当てるのではなく、そもそも `hits` に現れない ── 「0.0 と
 /// 比較すれば安全」という誤った前提を置かない）の加点後スコアで、真の 1 位が
-/// 取りうる保証下限（`max(dense_weight, sparse_weight) / (k_const + 1)` =
-/// `1.0 / 61.0` ≈ `0.016393`）を上回ることはできない。この不変条件は実際の融合
-/// プールの分布から [`apply_soft_boost`] が呼び出しのたびに候補ごとの個別マージン
-/// 判定として動的に検証する（[`HybridError::BoostSoftBoundExceeded`]）ため、本定数は
-/// あくまで [`RrfConfig::default`] 向け・**プール最下位級**の候補を想定した一例に
-/// 過ぎず、この定数自体が全ケースでの安全性を保証するわけではない（`tests/hybrid.rs`
-/// 内の `soft_boost.rs` が示すとおり、対象候補が真の 1 位のすぐ近く（例: 密ランク
-/// 3 位）にいる小さなプールでは、本定数そのものが動的判定で拒否されるだけの
-/// 加点量になりうる。これは既存不変条件違反ではなく、確定判定が実データに対して
-/// 正しく機能している証拠である）。Top-k 圏外の近接順位候補が圏内へ浮上する程度の入れ替え
-/// （`tests/soft_boost.rs` で検証）は PLAN-1 の意図どおり引き続き起こる。
+/// 取りうる保証下限（[`soft_boost_confirm_cap`]。`min(dense_weight, sparse_weight) /
+/// (k_const + 1)` = `1.0 / 61.0` ≈ `0.016393`）を上回ることはできない。この
+/// 不変条件は [`apply_soft_boost`] が呼び出しのたびに候補ごとの加点合計を
+/// [`soft_boost_confirm_cap`] という絶対上限と比較する形で動的に検証する
+/// （[`HybridError::BoostSoftBoundExceeded`]）ため、本定数はあくまで
+/// [`RrfConfig::default`] 向け・**プール最下位級**の候補を想定した一例に過ぎず、
+/// この定数自体が全ケースでの安全性を保証するわけではない。真の 1 位のすぐ
+/// 近く（近接順位）にいる候補への加点は、この絶対上限を下回る限り真の 1 位を
+/// 追い越すことも含めて正常に受理される（`tests/soft_boost.rs` で検証。PLAN-1 の
+/// 意図どおりのソフトブースト本来の用途）。
 pub const SOFT_BOOST_PER_MATCH: f64 = 0.0007;
 
 /// [`apply_soft_boost`] が 1 回の呼び出しで受け付けるブーストルール数の上限
@@ -526,12 +537,11 @@ const MAX_BOOST_AMOUNT: f64 = 1.0;
 /// `cfg`（[`RrfConfig`]）だけから、実際の融合プールの分布を見ずに算出できる
 /// ソフトブースト加点合計の**緩い**（＝安全側に大きすぎることはあっても小さすぎ
 /// ない）上限。[`hybrid_search_boosted`] が `rrf_fuse` 実行より前に行う早期拒否
-/// （codex-review P2 指摘対応）専用で、`apply_soft_boost` 側の確定判定
-/// （[`pool_score_spread`]。実際の `hits` の最高・最低スコアから算出）を代替しない
-/// （2 回目の codex-review P1 指摘対応: 以前の版は「重みが大きい方のチャネルに
-/// 必ず 1 位候補が存在する」と誤って仮定しており、そのチャネルがクエリ不一致で
-/// 空になるケース〔例: `dense_weight=1`・`sparse_weight=100` で疎ヒットが空〕を
-/// 見落としていた）。
+/// （codex-review P2 指摘対応）専用で、[`apply_soft_boost`] 側の確定判定
+/// （[`soft_boost_confirm_cap`]）を代替しない（2 回目の codex-review P1 指摘対応:
+/// 以前の版は「重みが大きい方のチャネルに必ず 1 位候補が存在する」と誤って
+/// 仮定しており、そのチャネルがクエリ不一致で空になるケース〔例:
+/// `dense_weight=1`・`sparse_weight=100` で疎ヒットが空〕を見落としていた）。
 ///
 /// 導出根拠: どちらのチャネルが実際に候補を返すかを `cfg` だけからは知り得ないため、
 /// 「両チャネルとも同一候補が 1 位を取った」という**理論上の最良ケース**
@@ -540,62 +550,57 @@ const MAX_BOOST_AMOUNT: f64 = 1.0;
 /// 近づく）ことから、スコア差の絶対上限は分子のみで抑えられる。これは常に
 /// 実際のスコア差以上になる安全側の上界であり、ここを下回った加点合計だけが
 /// 「確定的に安全」というわけではない（確定判定は [`apply_soft_boost`] が候補
-/// ごとに行う個別マージン判定が担う。[`pool_score_spread`] はそのうち「守るべき
-/// 真の 1 位が存在するか」の縮退ケース判定にのみ使われる）。
+/// ごとに行う [`soft_boost_confirm_cap`] 比較が担う。呼び出し元がまだ実際の
+/// `hits` を持たない早期拒否専用のため、意図的に `sum` 集約を使う。`min` 集約の
+/// [`soft_boost_confirm_cap`] より緩い＝早期拒否を漏らす側に倒すのは、早期拒否は
+/// 「確実に危険」の判定であり、確定判定を代替しないため安全）。
 fn soft_boost_loose_upper_bound(cfg: &RrfConfig) -> f64 {
     (cfg.dense_weight() + cfg.sparse_weight()) / (cfg.k_const() + 1.0)
 }
 
-/// [`rrf_fuse`] が返した融合プール `hits`（ブースト適用前）の実際の最高スコアと
-/// 最低スコアの差を返す。[`apply_soft_boost`] の確定判定本体ではなく、その前段の
-/// 縮退ケース判定にのみ使う（codex-review P1 指摘 2 回目対応で確定判定は候補
-/// ごとの個別マージン比較へ置き換えた。プール全体の spread とだけ比較すると、
-/// 真の 1 位との差が小さい候補がプール最下位級との差だけを基準に通過し、
-/// 実際には真の 1 位を追い越せてしまう抜けがあったため）。`cfg` の重みから
-/// チャネルの有無を仮定せず、**実際に `hits` に現れた値**だけを使うため、一方の
-/// チャネルがクエリ不一致で空になっていても誤った大きい上限を導出しない
-/// （「重みが大きい方のチャネルに必ず 1 位候補が存在する」という誤仮定が最初の
-/// P1 指摘の核心だった）。
+/// [`apply_soft_boost`] の確定判定が使う、候補 1 件あたりの加点合計の**絶対**上限
+/// （TASK-111。3 回目の codex-review P1 指摘・cursor bot「Boost error contract is
+/// inconsistent」指摘対応）。[`HybridError::BoostSoftBoundExceeded`] のドキュメント
+/// 参照: 過去の実装（2 回目の codex-review P1 指摘対応）は候補ごとに「実スコアから
+/// 融合プールの実際の最高スコア（真の 1 位）までの差」と比較しており、真の 1 位を
+/// 追い越す加点を一律拒否してしまっていた。これは近接順位を入れ替えるという
+/// ソフトブースト本来の用途（PLAN-1 の意図）そのものを検索エラーにする過剰拒否
+/// だったため、実データの順位関係（margin）とは無関係な絶対値へ置き換える。
 ///
-/// `hits` が空、または全件が同一スコア（`max == min`）の場合は `None` を返す。
-/// 空プールには加点対象がそもそも存在せず安全であり、全件同点の場合も「守るべき
-/// 単独の真の 1 位」が存在しないため、ヒント一致だけで同点集団の中から新たな
-/// 先頭を選ぶこと自体は本モジュールが保証する不変条件（[`SOFT_BOOST_PER_MATCH`]
-/// のドキュメント参照）に反しない。[`apply_soft_boost`] はこの戻り値が `None` の
-/// 場合に候補ごとの個別マージン判定自体をスキップする。
-fn pool_score_spread(hits: &[HybridHit]) -> Option<f64> {
-    let mut iter = hits.iter().map(|h| h.score);
-    let first = iter.next()?;
-    let (min, max) = iter.fold((first, first), |(min, max), score| {
-        (
-            if score.total_cmp(&min) == std::cmp::Ordering::Less {
-                score
-            } else {
-                min
-            },
-            if score.total_cmp(&max) == std::cmp::Ordering::Greater {
-                score
-            } else {
-                max
-            },
-        )
-    });
-    if max > min {
-        Some(max - min)
-    } else {
-        None
-    }
+/// 上限は `min(dense_weight, sparse_weight) / (k_const + 1)`: 融合プールが空でない
+/// 限り、真の 1 位は少なくともどちらか一方のチャネルで rank 1 として出現している
+/// はずであり、その最悪ケース（弱い方のチャネルにのみ rank 1 で出現）でも
+/// 保証される下限がこの値である。[`soft_boost_loose_upper_bound`]（`sum`。
+/// `hybrid_search_boosted` の早期拒否専用）より厳しい `min` を使うのは、重みが
+/// 大きい方のチャネルがクエリ不一致で空になるケース（`tests::
+/// hybrid_search_boosted_rejects_boost_when_heavier_channel_is_empty`）でも安全側
+/// （弱い方のチャネルの寄与だけを仮定する）に倒すため。ここで `max` を使うと、
+/// 過去 2 回目の codex-review P1 指摘の核心だった「重みが大きい方のチャネルに
+/// 必ず 1 位候補が存在する」という誤仮定を確定判定側で再現してしまい、本来
+/// 拒否すべき加点を通してしまう危険がある。
+fn soft_boost_confirm_cap(cfg: &RrfConfig) -> f64 {
+    cfg.dense_weight().min(cfg.sparse_weight()) / (cfg.k_const() + 1.0)
 }
 
-// `RrfConfig::default` に対する緩い上限をコンパイル時にも固定する（`MAX_BOOST_RULES`
-// や `SOFT_BOOST_PER_MATCH` の将来変更で、実行時検証（[`apply_soft_boost`]・
-// [`pool_score_spread`]）を経ない限り無言のうちに破られないようにする回帰ガード。
-// 実行時の確定判定は実際の `hits` に対して行われるため、本 assertion は「デフォルト
-// 設定の早期拒否チェックが常識的な範囲に収まっている」ことの早期発見用に過ぎない）。
+// `RrfConfig::default` に対する早期拒否側の緩い上限をコンパイル時にも固定する
+// （`MAX_BOOST_RULES` や `SOFT_BOOST_PER_MATCH` の将来変更で、実行時検証
+// （[`apply_soft_boost`]・[`soft_boost_confirm_cap`]）を経ない限り無言のうちに
+// 破られないようにする回帰ガード。実行時の確定判定は実際の `hits` に対して
+// 行われるため、本 assertion は「デフォルト設定の早期拒否チェックが常識的な範囲に
+// 収まっている」ことの早期発見用に過ぎない）。
 const _: () = assert!(
     (MAX_BOOST_RULES as f64) * SOFT_BOOST_PER_MATCH < 2.0 / 61.0,
     "SOFT_BOOST_PER_MATCH * MAX_BOOST_RULES must stay below the RrfConfig::default \
      soft_boost_loose_upper_bound ((dense_weight + sparse_weight) / (k_const + 1) = 2/61)"
+);
+
+// 確定判定側（[`soft_boost_confirm_cap`]。`min` 集約）に対する不変条件も同様に
+// コンパイル時固定する。こちらは実際に [`apply_soft_boost`] が候補ごとの加点合計を
+// 拒否するかどうかを左右する、より厳しい（`min <= sum`）実効上の上限である。
+const _: () = assert!(
+    (MAX_BOOST_RULES as f64) * SOFT_BOOST_PER_MATCH < 1.0 / 61.0,
+    "SOFT_BOOST_PER_MATCH * MAX_BOOST_RULES must stay below the RrfConfig::default \
+     soft_boost_confirm_cap (min(dense_weight, sparse_weight) / (k_const + 1) = 1/61)"
 );
 
 /// ソフトブーストの 1 ルール（TASK-111・PLAN-1。EXT-4 の汎用メタデータ一致ブーストの
@@ -648,37 +653,35 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// の長さ検証と同じ順序）。入力 `hits` に非有限スコアが 1 件でもあれば加点前に
 /// [`HybridError::NonFiniteScore`] で拒否する（`cfg` に対する検証を非有限値で汚染
 /// させないための順序。fail-closed）。各候補について、実際に一致した `rules` の
-/// 加点合計が、その候補の実スコアから `hits` の**実際の**最高スコア（真の 1 位）
-/// までの差以上の場合は [`HybridError::BoostSoftBoundExceeded`] で拒否する
-/// （codex-review P1・cursor bot 指摘対応・その後 2 回の codex-review P1 指摘
-/// 対応: `cfg`（重み・`k_const`・`pool_depth`）だけから理論値を導出する方式や、
-/// プール全体の最高・最低スコア差（[`pool_score_spread`]）とだけ比較する方式
-/// （いずれも過去の実装）はどちらも、実際には真の 1 位を追い越せる候補を見逃し
-/// うる。前者は重みが大きい方のチャネルがクエリ不一致で空になるケースを、
-/// 後者は真の 1 位との差が小さい候補がプール最下位級との差だけを基準に通過
-/// してしまうケースを、それぞれ見落とす。真の 1 位自身（同点を含む）は判定対象
-/// から除外する（自分自身を追い越すことはあり得ないため）。この判定は長さ検証・
-/// 有限性検証の後、スコア加算より先に行う（[`TooManyCandidates`]
-/// (HybridError::TooManyCandidates) と同じ順序）。加算後の非有限化（Inf
-/// オーバーフロー）も同様に [`HybridError::NonFiniteScore`] で拒否する（`rrf_fuse` の
-/// 融合後検証と同じ方向）。最後に既存と同一の比較器（スコア降順・同点 id 昇順、
-/// `f64::total_cmp` ベース）で再ソートし、決定性を維持する（`sort_by` を使い
-/// `sort_unstable_*` は使わない。`scripts/check_sort_determinism.sh` の対象）。
+/// 加点合計が [`soft_boost_confirm_cap`]（`cfg` から導出する絶対上限。実データの
+/// 順位関係とは無関係）以上の場合は [`HybridError::BoostSoftBoundExceeded`] で
+/// 拒否する（TASK-111。3 回目の codex-review P1 指摘・cursor bot「Boost error
+/// contract is inconsistent」指摘対応）。過去の実装（2 回目の codex-review P1
+/// 指摘対応）は候補ごとに「実スコアから `hits` の実際の最高スコア（真の 1 位）
+/// までの差」と比較しており、真の 1 位を追い越す加点を一律拒否していた。これは
+/// 近接順位を入れ替えるというソフトブースト本来の用途（PLAN-1 の意図）そのものを
+/// 検索エラーにする過剰拒否だった: 既定 RRF の単一チャネルでの実測順位差は僅か
+/// （例: 約 0.000264）であり、公開済み既定値 [`SOFT_BOOST_PER_MATCH`]（`0.0007`）を
+/// 1 件適用しただけの通常利用でもこの僅差を上回り失敗していた。真の 1 位を
+/// 追い越して新たな 1 位になること自体は正常な結果であり拒否すべきではないため、
+/// 実データの margin ではなく [`soft_boost_confirm_cap`] という絶対値とだけ比較
+/// する（詳細は [`HybridError::BoostSoftBoundExceeded`]・[`soft_boost_confirm_cap`]
+/// のドキュメント参照）。この判定は長さ検証・有限性検証の後、スコア加算より先に
+/// 行う（[`TooManyCandidates`] (HybridError::TooManyCandidates) と同じ順序）。
+/// 加算後の非有限化（Inf オーバーフロー）も同様に [`HybridError::NonFiniteScore`]
+/// で拒否する（`rrf_fuse` の融合後検証と同じ方向）。最後に既存と同一の比較器
+/// （スコア降順・同点 id 昇順、`f64::total_cmp` ベース）で再ソートし、決定性を
+/// 維持する（`sort_by` を使い `sort_unstable_*` は使わない。
+/// `scripts/check_sort_determinism.sh` の対象）。
 ///
-/// `hits` が空、または全件同点（[`pool_score_spread`] が `None`）の場合は候補ごとの
-/// マージン検証をスキップする（守るべき単独の真の 1 位が存在しないため。`rules` の
-/// 長さ・`BoostRule::new` の値域検証は通常どおり適用される）。
+/// `hits` が空の場合は候補が存在せず、加点合計の絶対上限チェックは対象なく
+/// 自然にスキップされる（`rules` の長さ・`BoostRule::new` の値域検証は通常どおり
+/// 適用される）。
 pub fn apply_soft_boost(
     hits: &mut [HybridHit],
     rules: &[BoostRule<'_>],
     cfg: &RrfConfig,
 ) -> Result<(), HybridError> {
-    // 加点上限の確定判定は `hits` 自体から算出する（[`pool_score_spread`]）ため
-    // `cfg` は本関数内では未使用だが、シグネチャは維持する（呼び出し元の
-    // [`hybrid_search_boosted`] が早期拒否（[`soft_boost_loose_upper_bound`]）に
-    // 使う `cfg` と対称にし、「`hits` はこの `cfg` で `rrf_fuse` した結果である」
-    // という既存の呼び出し契約の表明として残す）。
-    let _ = cfg;
     if rules.len() > MAX_BOOST_RULES {
         return Err(HybridError::TooManyBoostRules {
             len: rules.len(),
@@ -686,47 +689,27 @@ pub fn apply_soft_boost(
         });
     }
 
-    // `pool_score_spread` を非有限値で汚染させないため、加点前に入力自体の有限性を
-    // 検証する（fail-closed。`rrf_fuse` は融合結果の有限性を保証するが、
-    // `apply_soft_boost` は `rrf_fuse` の出力に限らず任意の呼び出し元が渡しうる
-    // `hits` を前提としない契約のため、ここでも独立に検証する）。
+    // 加点前に入力自体の有限性を検証する（fail-closed。`rrf_fuse` は融合結果の
+    // 有限性を保証するが、`apply_soft_boost` は `rrf_fuse` の出力に限らず任意の
+    // 呼び出し元が渡しうる `hits` を前提としない契約のため、ここでも独立に
+    // 検証する）。
     if hits.iter().any(|h| !h.score.is_finite()) {
         return Err(HybridError::NonFiniteScore);
     }
 
     // `rules` が空なら加点合計は必ず `0.0` で、`apply_soft_boost` は no-op のまま
     // 安全（`BoostRule::new` は `amount > 0.0` を要求するため、非空の `rules` なら
-    // `total_boost` は必ず正になる）。`total_boost > 0.0` を先に確認しないと、
-    // `pool_score_spread` が `None`（空プール・全件同点）の空ルール呼び出しまで
-    // 拒否してしまう。
+    // `total_boost` は必ず正になる）。`total_boost > 0.0` を先に確認することで、
+    // 空ルール呼び出しでは以下の絶対上限チェックのループ自体を省略する。
     let total_boost: f64 = rules.iter().map(|rule| rule.amount).sum();
-    if total_boost > 0.0 && pool_score_spread(hits).is_some() {
-        // 確定判定は候補ごとに行う（codex-review P1 2 回目指摘対応）: プール
-        // 全体の spread（最高スコア - 最低スコア）とだけ比較すると、真の 1 位との
-        // 差が小さい候補に対する加点合計がプール最下位級との差（＝spread 全体）
-        // 未満でありさえすれば通過してしまい、その候補が実際には真の 1 位を
-        // 追い越せてしまうケースを見逃す（例: スコア `[0.5, 0.4995, 0.4]` で
-        // 第 2 候補だけに `0.001` を加える場合、spread は `0.1` で通過するが
-        // 第 2 候補は `0.5005` となり真の 1 位を追い越す）。そのため、各候補が
-        // 実際に一致したルールの加点合計を、その候補**個別**の「真の 1 位までの
-        // 差」（`max_score - hit.score`）と比較する。真の 1 位自身（同点を含む）は
-        // 自分自身を追い越すことがあり得ないため判定対象から除外する（cursor bot
-        // 指摘対応: プール全体 spread 基準だと、真の 1 位と僅差の正当なブースト
-        // まで誤って拒否していた問題も、この個別差分基準への変更で解消する）。
-        let max_score = hits
-            .iter()
-            .map(|h| h.score)
-            .fold(f64::NEG_INFINITY, |acc, s| {
-                if s.total_cmp(&acc) == std::cmp::Ordering::Greater {
-                    s
-                } else {
-                    acc
-                }
-            });
+    if total_boost > 0.0 {
+        // 確定判定は候補ごとの加点合計を [`soft_boost_confirm_cap`]（`cfg` から
+        // 導出する絶対上限）とだけ比較する。実際の `hits` の順位関係（真の 1 位
+        // との差）は参照しない（過去の実装が真の 1 位を追い越す正当な加点まで
+        // 拒否していた過剰拒否の再発防止。詳細は [`soft_boost_confirm_cap`] の
+        // ドキュメント参照）。
+        let cap = soft_boost_confirm_cap(cfg);
         for hit in hits.iter() {
-            if hit.score.total_cmp(&max_score) == std::cmp::Ordering::Equal {
-                continue;
-            }
             let candidate_boost: f64 = rules
                 .iter()
                 .filter(|rule| rule.ids.contains(&hit.id))
@@ -735,11 +718,10 @@ pub fn apply_soft_boost(
             if candidate_boost <= 0.0 {
                 continue;
             }
-            let margin = max_score - hit.score;
-            if candidate_boost >= margin {
+            if candidate_boost >= cap {
                 return Err(HybridError::BoostSoftBoundExceeded {
                     total: candidate_boost,
-                    max: margin,
+                    max: cap,
                 });
             }
         }
@@ -838,21 +820,36 @@ pub fn hybrid_search_boosted(
         });
     }
     // 加点上限の**確定**判定は融合プールが揃った後の [`apply_soft_boost`]
-    // （[`pool_score_spread`]。実データに基づく）が担う。ここではまだ `hits` が
-    // 存在しないため確定判定はできないが、`cfg` だけから導出できる**緩い**上限
-    // （[`soft_boost_loose_upper_bound`]。理論上のスコア絶対上限を分子に、下限を
-    // `0.0` とみなした安全側の上界）を使い、それすら下回れない加点合計は
-    // `provider.search`・`SparseIndex::search_within`・`rrf_fuse` を経ずに早期拒否
-    // する（codex-review P2 指摘対応）。この早期拒否は「確実に安全」の判定ではなく
-    // 「確実に危険」の判定であり、ここを通過しても [`apply_soft_boost`] 側の確定
-    // 判定で拒否されうる（2 回目の codex-review P1 指摘対応: 以前はここが `cfg` の
-    // 重みだけから理論値を導出し、それを唯一の判定基準にしていたため、重みが大きい
-    // 方のチャネルがクエリ不一致で空になるケースで上限を過大評価していた）。
-    let total_boost: f64 = rules.iter().map(|rule| rule.amount).sum();
+    // （[`soft_boost_confirm_cap`]。`cfg` から導出する絶対上限）が担う。ここでは
+    // まだ `hits` が存在しないため確定判定はできないが、`cfg` だけから導出できる
+    // **緩い**上限（[`soft_boost_loose_upper_bound`]。理論上のスコア絶対上限を
+    // 分子に、下限を `0.0` とみなした安全側の上界）を使い、それすら下回れない
+    // 加点合計は `provider.search`・`SparseIndex::search_within`・`rrf_fuse` を
+    // 経ずに早期拒否する（codex-review P2 指摘対応）。この早期拒否は「確実に安全」
+    // の判定ではなく「確実に危険」の判定であり、ここを通過しても [`apply_soft_boost`]
+    // 側の確定判定で拒否されうる（2 回目の codex-review P1 指摘対応: 以前はここが
+    // `cfg` の重みだけから理論値を導出し、それを唯一の判定基準にしていたため、
+    // 重みが大きい方のチャネルがクエリ不一致で空になるケースで上限を過大評価
+    // していた）。
+    //
+    // 「確実に危険」の見積もりは候補ごとに行う必要がある: `rules` の対象 id が
+    // 互いに素な場合、実際にはどの候補も全ルールの加点を同時に受け取ることは
+    // ないため、単純に全ルールの `amount` を合算すると実際には起こり得ない過大な
+    // 合計で誤って早期拒否してしまう（3 回目の codex-review P1 指摘・cursor bot
+    // 「Boost error contract is inconsistent」指摘対応）。`rules` はまだ `hits` に
+    // 触れていないため、各ルールの対象 `ids`（[`BoostRule`]）自体から「同一 id に
+    // 適用され得る加点の合計」の最大値を求める。
+    let mut per_id_boost: BTreeMap<u64, f64> = BTreeMap::new();
+    for rule in rules {
+        for &id in rule.ids {
+            *per_id_boost.entry(id).or_insert(0.0) += rule.amount;
+        }
+    }
+    let max_candidate_boost = per_id_boost.values().copied().fold(0.0_f64, f64::max);
     let loose_upper_bound = soft_boost_loose_upper_bound(cfg);
-    if total_boost > 0.0 && total_boost >= loose_upper_bound {
+    if max_candidate_boost > 0.0 && max_candidate_boost >= loose_upper_bound {
         return Err(HybridError::BoostSoftBoundExceeded {
-            total: total_boost,
+            total: max_candidate_boost,
             max: loose_upper_bound,
         });
     }
@@ -1594,12 +1591,11 @@ mod tests {
 
     #[test]
     fn apply_soft_boost_changes_rank_order() {
-        // codex-review P1 対応後は加点合計を `pool_score_spread`（実際の hits の
-        // 最高・最低スコア差）未満にしか許さない。近接順位の入れ替え（PLAN-1 の
+        // 確定判定は加点合計を [`soft_boost_confirm_cap`]（既定 cfg では
+        // `1/61 ≈ 0.0164`）未満にしか許さない。近接順位の入れ替え（PLAN-1 の
         // 想定用途）自体は真の 1 位（id=1）とプール最下位（id=3）を残したまま、
         // その中間にいる 2 件（id=2・id=3）の順位だけを逆転させることで確認する
-        // （id=1〜id=3 の全体スコア差 0.5 - 0.4495 = 0.0505 に対し、加点 0.001 は
-        // 十分小さく安全に受理される）。
+        // （加点 0.001 はこの絶対上限より十分小さく安全に受理される）。
         let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
@@ -1627,8 +1623,7 @@ mod tests {
         // cursor bot 指摘どおりの真のプール最下位級スコア（弱い方のチャネル
         // （既定は等重みのため dense=sparse）の最下位順位 `pool_depth` でのみ
         // 出現した場合の `weight / (k_const + pool_depth)` = 1/260）から出発させ、
-        // [`pool_score_spread`] が算出する実際のスコア差と同じ最悪ケースの加点合計を
-        // 与える。
+        // [`soft_boost_confirm_cap`] が有界化する最悪ケースの加点合計を与える。
         let cfg = RrfConfig::default();
         let top1_guaranteed_floor = 1.0 / 61.0;
         let pool_bottom_worst_case = 1.0 / 260.0;
@@ -1656,8 +1651,8 @@ mod tests {
 
     #[test]
     fn soft_boost_loose_upper_bound_matches_default_cfg_compile_time_assert_literal() {
-        // `pool_score_spread` 定義直後の compile-time assertion（`const _: () =
-        // assert!(...)`）は `2.0 / 61.0` を [`RrfConfig::default`] の `k_const`・
+        // `soft_boost_loose_upper_bound` 直後の compile-time assertion（`const _: ()
+        // = assert!(...)`）は `2.0 / 61.0` を [`RrfConfig::default`] の `k_const`・
         // 重みから手計算したリテラルとして埋め込んでいる。`RrfConfig::default` の
         // 値を変更しても、このリテラル自体は自動更新されないため、両者が一致する
         // ことをテストで固定する（不一致になれば compile-time assertion が
@@ -1673,14 +1668,31 @@ mod tests {
     }
 
     #[test]
+    fn soft_boost_confirm_cap_matches_default_cfg_compile_time_assert_literal() {
+        // `soft_boost_confirm_cap` 直後の compile-time assertion（`const _: () =
+        // assert!(...)`）は `1.0 / 61.0` を [`RrfConfig::default`] の `k_const`・
+        // 重みから手計算したリテラルとして埋め込んでいる。`RrfConfig::default` の
+        // 値を変更しても、このリテラル自体は自動更新されないため、両者が一致する
+        // ことをテストで固定する（不一致になれば compile-time assertion が
+        // [`soft_boost_confirm_cap`] の実際の計算とは無関係な値を検証するだけの
+        // 張り子になり、次の `RrfConfig::default` 変更時に無言で確定判定チェックの
+        // 前提を破りうる）。
+        let expected = 1.0 / 61.0;
+        let actual = soft_boost_confirm_cap(&RrfConfig::default());
+        assert!(
+            (actual - expected).abs() < 1e-15,
+            "soft_boost_confirm_cap(default)={actual} must match the const assert literal {expected}"
+        );
+    }
+
+    #[test]
     fn apply_soft_boost_rejects_total_exceeding_soft_bound() {
         // codex-review P1・cursor bot 指摘の回帰: `BoostRule::new` 単体は
         // `MAX_BOOST_AMOUNT`（1.0）まで受理するが、`apply_soft_boost` は加点合計が
-        // 実際の `hits` のスコア差（[`pool_score_spread`]）以上なら構築成功済みの
-        // ルールでも実行時に拒否する（1 ルールだけで再現できることを確認: 以前の
-        // 実装は `BoostRule::new(ids, 1.0)` を渡すだけで最下位候補を新 1 位へ
-        // 押し上げられた）。単一 hit のプールでは順位を守るべき相手が存在しない
-        // ため、id=2 を加える 2 件のプール（スコア差 0.5）で確認する。
+        // [`soft_boost_confirm_cap`]（既定 cfg では `1/61 ≈ 0.0164`）以上なら構築
+        // 成功済みのルールでも実行時に拒否する（1 ルールだけで再現できることを
+        // 確認: 以前の実装は `BoostRule::new(ids, 1.0)` を渡すだけで最下位候補を
+        // 新 1 位へ押し上げられた）。
         let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
@@ -1692,22 +1704,27 @@ mod tests {
         match err {
             HybridError::BoostSoftBoundExceeded { total, max } => {
                 assert!((total - MAX_BOOST_AMOUNT).abs() < 1e-15);
-                assert!((max - 0.5).abs() < 1e-15);
+                assert!((max - 1.0 / 61.0).abs() < 1e-15);
             }
             other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
         }
     }
 
     #[test]
-    fn apply_soft_boost_rejects_middle_candidate_overtaking_true_top_despite_small_pool_spread() {
-        // codex-review P1 2 回目指摘の直接回帰（PR #257 レビューコメント記載の
-        // 反例そのもの）: プール全体の最高・最低スコア差（spread）とだけ比較する
-        // 旧実装は、この入力を安全と誤判定して受理していた
-        // （`total_boost=0.001 < spread=0.1` のため通過）。しかし加点後、第 2 候補
-        // （id=2）のスコアは `0.4995 + 0.001 = 0.5005` となり、加点前の真の 1 位
-        // （id=1・`0.5`）を追い越してしまう。修正後は候補ごとの個別マージン
-        // （`max_score - candidate.score`）で判定するため、id=2 のマージン
-        // （`0.5 - 0.4995 = 0.0005`）を加点合計（`0.001`）が上回っており拒否される。
+    fn apply_soft_boost_allows_near_top_candidate_to_overtake_true_top() {
+        // 3 回目の codex-review P1 指摘の直接回帰（PR #257 レビューコメント記載の
+        // 反例そのもの）: 真の 1 位（id=1・0.5）とごく僅差の第 2 候補
+        // （id=2・0.4995）へ小さい加点（0.001。`SOFT_BOOST_PER_MATCH` と同オーダー）
+        // をすると、過去の実装（2 回目の codex-review P1 指摘対応。候補ごとの
+        // 加点合計を「真の 1 位までの差」と比較する方式）はこれを一律拒否して
+        // いた。しかし真の 1 位を追い越して新たな 1 位になること自体は、近接順位を
+        // 入れ替えるというソフトブースト本来の用途（PLAN-1 の意図。既定 RRF の
+        // 単一チャネルでの実測順位差は約 0.000264 であり、既定値
+        // `SOFT_BOOST_PER_MATCH = 0.0007` の通常適用でも同種の逆転が起こる）であり
+        // 拒否すべきではない。修正後は候補ごとの加点合計を実際の順位関係
+        // （真の 1 位との差）ではなく [`soft_boost_confirm_cap`]（既定 cfg では
+        // `1/61 ≈ 0.0164`）という絶対上限とだけ比較するため、`0.001 < 1/61` の
+        // この加点は受理され id=2 が新たな 1 位になる。
         let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
@@ -1717,20 +1734,13 @@ mod tests {
             },
             HybridHit { id: 3, score: 0.4 },
         ];
-        // 反例が破っていた旧チェックが依然として通過しうることも合わせて確認する
-        // （プール全体 spread は 0.1 で、加点合計 0.001 はこれを大きく下回る）。
-        assert_eq!(pool_score_spread(&hits), Some(0.5 - 0.4));
-
         let ids: BTreeSet<u64> = [2].into_iter().collect();
         let rule = BoostRule::new(&ids, 0.001).unwrap();
-        let err = apply_soft_boost(&mut hits, &[rule], &cfg).unwrap_err();
-        match err {
-            HybridError::BoostSoftBoundExceeded { total, max } => {
-                assert!((total - 0.001).abs() < 1e-15);
-                assert!((max - 0.0005).abs() < 1e-12);
-            }
-            other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
-        }
+        apply_soft_boost(&mut hits, &[rule], &cfg)
+            .expect("legitimate near-top reorder must succeed");
+        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[1].id, 1);
+        assert_eq!(hits[2].id, 3);
     }
 
     #[test]
@@ -1777,9 +1787,10 @@ mod tests {
     #[test]
     fn apply_soft_boost_rejects_non_finite_result() {
         // `apply_soft_boost` は `hits`（`rrf_fuse` の出力に限らず任意の呼び出し元が
-        // 渡しうる）を加点前提とせず、加点上限の算出（`pool_score_spread`）より
-        // 前に全件の有限性を検証する。空ルールでも非有限な入力自体は拒否されることを
-        // 確認する（ルール一致の有無に関わらず検証される契約の確認）。
+        // 渡しうる）を加点前提とせず、加点上限の算出（[`soft_boost_confirm_cap`]
+        // との比較）より前に全件の有限性を検証する。空ルールでも非有限な入力自体は
+        // 拒否されることを確認する（ルール一致の有無に関わらず検証される契約の
+        // 確認）。
         let cfg = RrfConfig::default();
         let mut hits = vec![HybridHit {
             id: 1,
@@ -1838,9 +1849,10 @@ mod tests {
         // （`soft_boost_ceiling` が `max(dense_weight, sparse_weight) / (k_const + 1)`
         // ＝重みが大きい方のチャネルに必ず 1 位候補があると誤仮定）は上限を
         // `≈100/61` と過大評価し、`BoostRule::new(..., 1.0)` を受理してしまっていた。
-        // 実際の真の 1 位は密チャネルのみの寄与（`1/61 ≈ 0.0164`）に過ぎず、修正後は
-        // 実際の融合プール（[`pool_score_spread`]）に基づき正しく拒否されることを
-        // 確認する。
+        // [`soft_boost_confirm_cap`] は `min(dense_weight, sparse_weight) /
+        // (k_const + 1)` = `1/61 ≈ 0.0164`（弱い方のチャネルの寄与だけを仮定する
+        // 安全側）を使うため、重みが大きい方のチャネルが空でも正しく拒否される
+        // ことを確認する。
         let cfg = RrfConfig::new(60.0, 1.0, 100.0, 200).expect("valid cfg");
         let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
         let ids = [1u64, 2u64];
@@ -1864,8 +1876,8 @@ mod tests {
     #[test]
     fn hybrid_search_boosted_accepts_boost_on_empty_pool_as_no_op() {
         // 融合プールが両チャネルとも空（可視集合が空のため密・疎いずれも候補化
-        // されない）の場合、`apply_soft_boost` の `pool_score_spread` は `None` を
-        // 返し加点上限検証をスキップする（守るべき真の 1 位がそもそも存在しない
+        // されない）の場合、`apply_soft_boost` の確定判定ループは走査対象の
+        // `hits` 自体が空のため何も拒否しない（守るべき候補がそもそも存在しない
         // ため安全）。`cfg` だけで判定する早期チェック
         // （[`soft_boost_loose_upper_bound`]）を通過した後、この最終判定でも
         // 誤って拒否しないことを確認する回帰。
