@@ -10,17 +10,37 @@
 //! `.claude/rules/security.md` P0「テナント分離の検査を外す/緩める/バイパス経路を
 //! 作らない」に準ずる）に直結するため、`tests/isa.rs`
 //! `unsafe_is_confined_to_isa_module_with_safety_comments` と同じ「ソーステキスト
-//! 走査」の手法で、`crate::recovery::commit_boundary::commit(...)` の呼び出し箇所を
+//! 走査」の手法で、`crate::recovery::commit_boundary` の commit 系公開関数
+//! （`commit`/`commit_and_finish`/`commit_write_txn_guarded`）の呼び出し箇所を
 //! 悉皆列挙し、各呼び出し箇所が (a) 直前の近傍行に `bump_table_generation_in_txn`
 //! 呼び出しを持つか、(b) 明示的なアローリスト（`user_rows/{table}` を経由しない
 //! 旧・非テーブルスコープ経路であることが確認済みの箇所）に含まれることを固定する。
 //! 新たな書き込み経路（新しい commit 呼び出し）を追加した場合、本テストが
 //! アローリストへの追記または `bump_table_generation_in_txn` 呼び出しの追加を
 //! 強制する。
+//!
+//! 走査対象の呼び出し形は 2 通り: `commit_boundary::commit_write_txn_guarded(...)`
+//! のようなモジュール修飾つき呼び出しと、`crates/engine/src/txn.rs` のように
+//! `use crate::recovery::commit_boundary::commit_write_txn_guarded;` で import した
+//! うえで裸名（`commit_write_txn_guarded(...)`）で呼ぶ呼び出しの両方を検出する
+//! （codex-review 再指摘・PR #266。裸名 import 経路は旧実装では悉皆走査から漏れて
+//! おり、将来 import スタイルで `user_rows/{table}` を書く経路が追加された場合に
+//! バンプ漏れを検出できない fail-open だった）。commit 系公開関数名は
+//! [`commit_boundary_call_names`] が `recovery/commit_boundary.rs` のソースから
+//! 機械的に取得するため、関数追加時に本ファイルを個別に追随する必要はない。
+//! `recovery/commit_boundary.rs` 自身の中で行われる裸名呼び出し（モジュール内部の
+//! 委譲実装。例: `commit_write_txn_guarded` から `commit` への委譲）はモジュール
+//! 修飾を要求しない自己参照であり、上記の「import 漏れ検出」の対象外のため
+//! 裸名走査からは除外する（モジュール修飾つき呼び出しの走査は他ファイルと同様に
+//! 及ぶ）。
 
 use std::path::{Path, PathBuf};
 
-/// `commit_boundary::commit(...)` を直接呼ぶが、意図的に
+/// commit_boundary モジュール自身の定義ファイル（走査対象ではあるが、裸名呼び出し
+/// 走査からは除外する。モジュール冒頭の doc コメント参照）。
+const COMMIT_BOUNDARY_MODULE_FILE: &str = "recovery/commit_boundary.rs";
+
+/// `commit_boundary::commit(...)` 系の呼び出しを直接行うが、意図的に
 /// `bump_table_generation_in_txn` を伴わない箇所（呼び出し元ファイル名・行番号）。
 ///
 /// - `storage.rs` の `Storage::put`/`Storage::put_batch`: `storage.rs::ROWS_TABLE`
@@ -32,11 +52,179 @@ use std::path::{Path, PathBuf};
 ///   対応）。
 /// - `recovery/panic_hook.rs`: `#[cfg(test)]` 内のテスト fixture が
 ///   `storage.rs::ROWS_TABLE` へ直接書き込む箇所で、上記と同じ理由で対象外。
+/// - `txn.rs` の `WriteTxn::commit`/`BatchWriteTxn::commit`
+///   （`commit_write_txn_guarded` を裸名 import で呼ぶ。codex-review 再指摘・
+///   PR #266 で新たに悉皆走査へ含まれるようになった呼び出し箇所）:
+///   これらが書き込むのも `WriteTxn::put`/`BatchWriteTxn::put` 経由の
+///   `storage.rs::ROWS_TABLE`（`txn.rs` 冒頭の import 一覧・`ROWS_TABLE` 使用箇所
+///   参照）であり、上記の `storage.rs` エントリと同一テーブル・同一理由で
+///   `user_rows/{table_name}` を経由しない旧・非テーブルスコープ経路のため対象外。
 const ALLOWLIST: &[(&str, u32)] = &[
     ("storage.rs", 550),
     ("storage.rs", 577),
     ("recovery/panic_hook.rs", 404),
+    ("txn.rs", 191),
+    ("txn.rs", 362),
 ];
+
+/// `recovery/commit_boundary.rs` の `pub(crate) fn`/`pub fn` シグネチャを
+/// `(関数名, 引数リストの生文字列)` として機械的に列挙する。引数リストは括弧の
+/// 深さを数えて対応する `)` まで抜き出すため、`impl FnOnce(&T) -> ...` のような
+/// 引数内の入れ子括弧があっても壊れない（[`commit_boundary_call_names`]・
+/// [`assert_commit_names_cover_by_value_write_txn_params`] の共通基盤）。
+fn commit_boundary_pub_fn_signatures(content: &str) -> Vec<(String, String)> {
+    const MARKERS: [&str; 2] = ["pub(crate) fn ", "pub fn "];
+    let mut sigs = Vec::new();
+    let mut search_from = 0usize;
+    while search_from < content.len() {
+        let next = MARKERS
+            .iter()
+            .filter_map(|m| {
+                content[search_from..]
+                    .find(m)
+                    .map(|rel| (search_from + rel, *m))
+            })
+            .min_by_key(|(start, _)| *start);
+        let Some((start, marker)) = next else {
+            break;
+        };
+        let after = &content[start + marker.len()..];
+        let name_end = after
+            .find(|c: char| c == '(' || c == '<' || c.is_whitespace())
+            .unwrap_or(after.len());
+        let name = after[..name_end].to_string();
+        let Some(open_rel) = after[name_end..].find('(') else {
+            search_from = start + marker.len();
+            continue;
+        };
+        let params_start = name_end + open_rel + 1;
+        let mut depth = 1i32;
+        let mut close_idx = None;
+        for (i, ch) in after[params_start..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = Some(params_start + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close_idx) = close_idx else {
+            search_from = start + marker.len();
+            continue;
+        };
+        sigs.push((name, after[params_start..close_idx].to_string()));
+        search_from = start + marker.len() + close_idx;
+    }
+    sigs
+}
+
+/// `recovery/commit_boundary.rs` のソースから、commit 系の公開関数名
+/// （`pub(crate) fn commit...`）を機械的に取得する。関数を追加・改名しても本テスト
+/// ファイルを個別に追随させずに悉皆走査の対象へ含めるための抽出（PR #266
+/// codex-review 再指摘対応）。
+fn commit_boundary_call_names(src_dir: &Path) -> Vec<String> {
+    let path = src_dir.join(COMMIT_BOUNDARY_MODULE_FILE);
+    let content = std::fs::read_to_string(&path).expect("read commit_boundary.rs");
+    commit_boundary_pub_fn_signatures(&content)
+        .into_iter()
+        .map(|(name, _params)| name)
+        .filter(|name| name.starts_with("commit"))
+        .collect()
+}
+
+/// [`commit_boundary_call_names`] の命名ヒューリスティック（`commit` 接頭辞）が
+/// 取りこぼしていないかを、シグネチャの型情報（`redb::WriteTransaction` を値渡し
+/// する引数を持つか）で交差検証する。`redb::WriteTransaction` を値で受け取る
+/// 公開関数は「commit 呼び出しの起点になり得る関数」の必要条件であり、これが
+/// `commit_names` に含まれていなければ命名規則側の抽出漏れ（例: 将来
+/// `guarded_commit`/`finish_and_commit` のような `commit` 非接頭辞の名前へ改名
+/// された場合）を検出できる（advisor 指摘対応）。
+fn assert_commit_names_cover_by_value_write_txn_params(src_dir: &Path, commit_names: &[String]) {
+    let path = src_dir.join(COMMIT_BOUNDARY_MODULE_FILE);
+    let content = std::fs::read_to_string(&path).expect("read commit_boundary.rs");
+    for (name, params) in commit_boundary_pub_fn_signatures(&content) {
+        let takes_write_txn_by_value = params.contains("redb::WriteTransaction")
+            && !params.contains("&redb::WriteTransaction");
+        if takes_write_txn_by_value {
+            assert!(
+                commit_names.iter().any(|n| n == &name),
+                "pub(crate)/pub fn {name} in {COMMIT_BOUNDARY_MODULE_FILE} takes \
+                 redb::WriteTransaction by value but is not recognized as a commit-shaped \
+                 function by the \"commit\" name-prefix heuristic; update \
+                 commit_boundary_call_names or its callers so this function's call sites are \
+                 covered by the scan",
+                name = name
+            );
+        }
+    }
+}
+
+/// 走査対象の全ファイル中に、`commit_boundary` モジュールを別名で import する
+/// エイリアス（例: `use crate::recovery::commit_boundary as cb;`）が存在しないこと
+/// を確認する。エイリアス経由の呼び出し（`cb::commit(...)`）は、本テストが検出する
+/// 「`commit_boundary::` 修飾つき呼び出し」にも「裸名呼び出し」にも一致せず走査から
+/// 漏れるため、エイリアス import そのものを禁止することで fail-closed に倒す
+/// （advisor 指摘対応。エイリアスが必要になった場合は本テストの走査ロジックへ
+/// 対応を追加したうえで許可すること）。
+fn assert_no_commit_boundary_module_alias_import(rs_files: &[PathBuf], src_dir: &Path) {
+    for path in rs_files {
+        let rel_name = path
+            .strip_prefix(src_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel_name == COMMIT_BOUNDARY_MODULE_FILE {
+            continue;
+        }
+        let content = std::fs::read_to_string(path).expect("read source file");
+        assert!(
+            !content.contains("commit_boundary as "),
+            "{rel_name} imports commit_boundary under an alias, which escapes this test's \
+             \"commit_boundary::\"-prefixed and bare-name call site scan; extend the scan logic \
+             before introducing an alias import"
+        );
+    }
+}
+
+/// `line` 中の `name(` が、`use` で import した裸名の関数呼び出しであるかを判定する
+/// （モジュール修飾つき呼び出し `commit_boundary::name(` や、`.name(` のような
+/// メソッド呼び出し、`fn name(` のような定義行は対象外）。
+fn line_has_bare_call(line: &str, name: &str) -> bool {
+    let needle = format!("{name}(");
+    // 定義行（`pub(crate) fn commit_write_txn_guarded(` 等）は呼び出しではない。
+    if line.contains(&format!("fn {needle}")) {
+        return false;
+    }
+    let bytes = line.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(rel) = line[search_from..].find(needle.as_str()) {
+        let idx = search_from + rel;
+        let preceding = if idx == 0 {
+            None
+        } else {
+            bytes.get(idx - 1).copied()
+        };
+        let is_bare = match preceding {
+            None => true,
+            Some(b) => {
+                let ch = b as char;
+                // メソッド呼び出し（`.name(`）・モジュール修飾（`::name(`）・識別子の
+                // 一部（例: `re_commit(` の `commit(` 誤検出防止）を除外する。
+                !(ch == '.' || ch == ':' || ch.is_ascii_alphanumeric() || ch == '_')
+            }
+        };
+        if is_bare {
+            return true;
+        }
+        search_from = idx + needle.len();
+    }
+    false
+}
 
 #[test]
 fn every_commit_boundary_commit_call_bumps_table_generation_or_is_allowlisted() {
@@ -45,11 +233,17 @@ fn every_commit_boundary_commit_call_bumps_table_generation_or_is_allowlisted() 
     collect_rs_files(&src_dir, &mut rs_files);
     assert!(!rs_files.is_empty(), "no .rs files found under src/");
 
-    let needles = [
-        "commit_boundary::commit(",
-        "commit_boundary::commit_and_finish(",
-        "commit_boundary::commit_write_txn_guarded(",
-    ];
+    let commit_names = commit_boundary_call_names(&src_dir);
+    assert!(
+        !commit_names.is_empty(),
+        "no commit-shaped pub(crate) fn found in commit_boundary.rs; extraction logic is stale"
+    );
+    assert_commit_names_cover_by_value_write_txn_params(&src_dir, &commit_names);
+    assert_no_commit_boundary_module_alias_import(&rs_files, &src_dir);
+    let prefixed_needles: Vec<String> = commit_names
+        .iter()
+        .map(|n| format!("commit_boundary::{n}("))
+        .collect();
 
     let mut checked_call_sites = 0usize;
     let mut allowlist_hits: std::collections::HashSet<(&str, u32)> =
@@ -63,9 +257,15 @@ fn every_commit_boundary_commit_call_bumps_table_generation_or_is_allowlisted() 
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
+        let is_commit_boundary_module = rel_name == COMMIT_BOUNDARY_MODULE_FILE;
 
         for (idx, line) in lines.iter().enumerate() {
-            if !needles.iter().any(|n| line.contains(n)) {
+            let is_call_site = prefixed_needles.iter().any(|n| line.contains(n.as_str()))
+                || (!is_commit_boundary_module
+                    && commit_names
+                        .iter()
+                        .any(|n| line_has_bare_call(line, n.as_str())));
+            if !is_call_site {
                 continue;
             }
             checked_call_sites += 1;
