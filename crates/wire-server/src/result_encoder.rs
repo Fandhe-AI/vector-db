@@ -50,7 +50,9 @@ fn column_name(meta: &ColumnMeta) -> &str {
 }
 
 /// メッセージ長フィールド（自身の 4 バイトを含む i32）を `checked` に計算する。
-fn frame_len(body_len: usize) -> Result<i32, EncodeError> {
+/// `crate::error_response`（TASK-153・ERR-1）も同じ `checked` 方式を踏襲するため
+/// crate 内に限り公開する（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
+pub(crate) fn frame_len(body_len: usize) -> Result<i32, EncodeError> {
     let total = body_len.checked_add(4).ok_or(EncodeError)?;
     i32::try_from(total).map_err(|_| EncodeError)
 }
@@ -155,26 +157,26 @@ pub fn encode_empty_query_response() -> Vec<u8> {
     msg
 }
 
-/// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみで組み立てる
-/// （`severity`/`code`/`message`。他テナント・存在情報は含めない）。
+/// `ErrorResponse`（'E'）body の `S`（severity）/`C`（sqlstate）/`M`（message）の
+/// 3 フィールドを `body` へ書き込む。フィールド終端（末尾の NUL）・フレーム化
+/// （`E` タグ・長さ）は呼び出し元が行う。
 ///
-/// 呼び出し文脈: `crate::simple_query::execute_and_respond` が「outcome を
-/// 決定する区間」の緊急応答チャネル（`engine::recovery::panic_hook::
-/// EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
-/// （panic フックの外）で事前に組み立てるために使う（panic フック内での
-/// エンコードによるアロケーション・整形失敗を避けるため。`panic_hook`
-/// モジュールドキュメント参照）。`handshake.rs` の `write_error_response`
-/// （ソケットへ直接書き込む版）とはフィールド構成は同じだが、こちらはバイト列を
-/// 返すだけで書き込みを行わない別実装（呼び出し文脈が異なるため統合しない）。
+/// `severity` は呼び出し元が明示的に決定した値をそのまま書き込む（本関数自身は
+/// `ErrorClass` 等から severity を判定しない）。接続を閉じる契約の分類
+/// （`ErrorClass::ConnectionLimitExceeded`＝`53300`）は `FATAL`、それ以外は
+/// `ERROR` を渡す契約（codex-review P1 指摘対応・PR #258。`crate::error_response`
+/// の呼び出し元が `severity_for` で決定し本関数へ渡す。写像を本関数側で持たせると
+/// `limits.rs::reject_too_many_connections` の独自実装〔`FATAL` 固定〕と分類の
+/// 判定基準が 2 箇所に分散するため、判定は呼び出し元に閉じる）。
 ///
-/// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
-/// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
-/// 起こさない（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」。
-/// 本関数の入力自体は untrusted ではないが、同じ規律を踏襲する）。
-pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, EncodeError> {
-    let mut body = Vec::new();
+/// [`encode_error_response`] と `crate::error_response::encode`（TASK-153・ERR-1。
+/// `ErrorClass` から severity/SQLSTATE を一元的に決定する横断写像）が共有する
+/// 唯一のレイアウト実体（codex-review Low 指摘対応・PR #101。以前は両者が同じ
+/// S/C/M 書き込みをそれぞれ自前で複製しており、フィールドレイアウト変更時に
+/// 乖離しうる状態だった）。crate 内に限り公開する。
+pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, severity: &str, sqlstate: &str, message: &str) {
     body.push(b'S');
-    body.extend_from_slice(b"ERROR");
+    body.extend_from_slice(severity.as_bytes());
     body.push(0);
     body.push(b'C');
     body.extend_from_slice(sqlstate.as_bytes());
@@ -182,6 +184,28 @@ pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, E
     body.push(b'M');
     body.extend_from_slice(message.as_bytes());
     body.push(0);
+}
+
+/// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみ、severity `ERROR`
+/// 固定で組み立てる（`sqlstate`/`message`。他テナント・存在情報は含めない）。
+///
+/// **本 crate の通常・緊急いずれの送出経路もこの関数は経由しない**
+/// （TASK-153・ERR-1・codex-review P1 指摘対応・PR #258）。`handshake.rs::
+/// write_error_response`・`crate::simple_query::build_emergency_response_bytes`
+/// はいずれも `crate::error_response::encode`（`ErrorClass` から severity・
+/// SQLSTATE を一元的に決定する横断写像。severity は分類ごとに変わりうるため、
+/// 本関数の `ERROR` 固定では `ErrorClass::ConnectionLimitExceeded` の `FATAL`
+/// 契約を表現できない）を使う。フィールド書き込みの実体
+/// （[`push_s_c_m_fields`]）は共有するため、`sqlstate`/`message` を直接受け取る
+/// 薄い公開 API として残す（severity を常に `ERROR` に固定できる用途向け）。
+///
+/// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
+/// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
+/// 起こさない（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」。
+/// 本関数の入力自体は untrusted ではないが、同じ規律を踏襲する）。
+pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, EncodeError> {
+    let mut body = Vec::new();
+    push_s_c_m_fields(&mut body, "ERROR", sqlstate, message);
     body.push(0); // フィールド終端
     let total_len = frame_len(body.len())?;
     let mut msg = Vec::with_capacity(1 + body.len() + 4);
@@ -190,18 +214,6 @@ pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, E
     msg.extend_from_slice(&body);
     Ok(msg)
 }
-
-// NOTE（codex-review P1・PR #253 指摘対応）: 以前ここには `S`/`C`/`M` に加え
-// `D`（detail）フィールドを付与する `encode_error_response_with_detail` が
-// あり、ERR-1（commit 成功境界を跨いだ panic の観測可能性）の緊急応答が
-// `state=may_be_committed` を `D` フィールドとして運んでいた。ERR-1 の
-// ワイヤ形式（運搬フィールド・値）は spec 側で未確定であり、暫定形式を
-// クライアント向け送出経路（`simple_query::execute_and_respond` の緊急応答
-// チャネル）へ接続することは、実装都合の契約を先に確定させてしまう
-// （spec-confidentiality・spec との整合の観点で不可）。ERR-1 のワイヤ形式が
-// spec 側で確定するまで、緊急応答は既存の 3 フィールド契約（`S`/`C`/`M`）
-// のみで送出する（`simple_query::build_emergency_response_bytes` 参照）。
-// 確定後にここへ `D` フィールド付き encoder を復元する。
 
 #[cfg(test)]
 mod tests {

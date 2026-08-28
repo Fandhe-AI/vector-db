@@ -20,8 +20,12 @@ use argon2id::Params;
 /// 認証失敗時に課す固定遅延。ポインタ: TASK-67・WIRE-3（`docs/spec/04-behavior/wire-protocol.md`）。
 const AUTH_FAILURE_DELAY: Duration = Duration::from_millis(200);
 
-/// wire プロトコルの認証失敗応答が用いる SQLSTATE（invalid_password）。
-pub const SQLSTATE_INVALID_PASSWORD: &str = "28P01";
+/// wire プロトコルの認証失敗応答が用いる SQLSTATE（invalid_password）。値は
+/// `engine::error_format::ErrorClass`（SSOT。TASK-152・ERR-2）を単一の真実源とし、
+/// 本モジュールで文字列リテラルを独自に持たない（TASK-153・ERR-1 の分散定数
+/// SSOT 化。`const fn` のため const コンテキストでもそのまま使える）。
+pub const SQLSTATE_INVALID_PASSWORD: &str =
+    engine::error_format::ErrorClass::AuthInvalid.wire_code();
 
 /// ユーザーストア 1 行分のレコード（`username:tenant_id:phc` 形式）。
 struct UserRecord {
