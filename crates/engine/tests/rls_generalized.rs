@@ -8,9 +8,11 @@
 //! （複数の任意スキーマテーブル・任意形状 SELECT・UDF・`VectorCore::search`・
 //! `get_row`・`tenant::visible_rows`）へも同じ契約で一般化されて働くことを検証する。
 //!
-//! `USING PLAN` 展開後クエリの検証は対象外（TASK-77 未実装。fail-closed に拒否される
-//! ことのみ [`using_plan_is_rejected_fail_closed_until_task_77`] で固定し、展開後の
-//! 検証は TASK-77/TASK-117 へ委ねる）。
+//! `USING PLAN` 展開後クエリの RLS 暗黙適用（TASK-77・SQL-5 実装後）は
+//! [`using_plan_dispatch_implicitly_applies_rls`] で検証する（スタブ `LlmClient`／
+//! `Embedder` を注入し、単一テーブルに限定した独立オラクル照合。TASK-77 実装前は
+//! 非規範形の拒否のみを固定していたが、[`using_plan_non_normative_forms_are_rejected_fail_closed`]
+//! へ改名しつつ拒否契約自体は維持する）。全テーブル軸への一般化は TASK-117 の管轄。
 
 use std::collections::HashSet;
 
@@ -733,10 +735,13 @@ fn visible_rows_equals_oracle_set_exactly() {
     }
 }
 
-// ---------- fail-closed: `USING PLAN` 展開後クエリは TASK-77 まで未実装 ----------
+// ---------- fail-closed: `USING PLAN` の非規範形は引き続き拒否（TASK-77） ----------
 
 #[test]
-fn using_plan_is_rejected_fail_closed_until_task_77() {
+fn using_plan_non_normative_forms_are_rejected_fail_closed() {
+    // TASK-77 実装後も、規範形 `USING PLAN('<query>')`（括弧必須）以外の形は
+    // `ORDER BY` との併用込みですべて拒否される（本テストは `ORDER BY` を明示した
+    // 非規範形 `USING PLAN 'x'`（括弧なし）を固定する）。
     let path = unique_db_path("rls8-using-plan");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage(&path);
@@ -744,10 +749,6 @@ fn using_plan_is_rejected_fail_closed_until_task_77() {
     let core = new_core(storage);
     let ctx = ctx_for("tenant-a", true);
 
-    // `USING PLAN` の展開後クエリへの RLS 暗黙適用一般化検証は TASK-77（プラン文字列
-    // 実行器）実装後に TASK-117 の管轄で行う。現状は許可リストが fail-closed に
-    // 拒否することのみを固定し、「未実装経路が暗黙適用なしに開いている」ことがないと
-    // 確認する。
     for t in TABLES.iter() {
         let q = query_vec(t.dim);
         let sql = format!(
@@ -756,9 +757,186 @@ fn using_plan_is_rejected_fail_closed_until_task_77() {
         );
         let err = core
             .execute_sql(&ctx, &sql)
-            .expect_err("USING PLAN must be rejected");
+            .expect_err("non-normative USING PLAN must be rejected");
         assert_eq!(err.wire_code(), "42601", "table={} sql={sql:?}", t.name);
     }
+}
+
+// ---------- `USING PLAN` 展開後クエリの RLS 暗黙適用（TASK-77・SQL-5） ----------
+
+/// [`engine::embedding::Embedder`] のテスト用スタブ。展開後テキストの内容に
+/// 関わらず固定次元の定数ベクトルを返す（本テストの主眼は RLS 境界の検証であり、
+/// ランキング品質は対象外。融合プールへ入る候補は事前に RLS でフィルタ済みの行に
+/// 限られるため、埋め込み値そのものが RLS 判定へ影響しない）。
+struct ConstEmbedder {
+    dim: u32,
+}
+
+impl engine::embedding::Embedder for ConstEmbedder {
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, engine::embedding::EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|_| vec![0.1f32; self.dim as usize])
+            .collect())
+    }
+}
+
+/// [`engine::query_planner::LlmClient`] のテスト用スタブ。固定の
+/// [`engine::query_planner::QueryExpansion`] 相当 JSON を返す（実 LLM への疎通は
+/// TASK-110 と同じくスコープ外。プロセス内スタブで契約を固定する）。
+struct StubLlmClient;
+
+impl engine::query_planner::LlmClient for StubLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, engine::query_planner::PlanError> {
+        Ok(r#"{"search_terms": ["ja"], "path_hint": null, "kind_hint": null}"#.to_string())
+    }
+}
+
+/// `USING PLAN` の LLM クエリ展開（`core.rs::EngineCore::plan_query`、TASK-110）は
+/// 辞書的情報源抽出（TASK-109）を経由するため、規約列 `path`（`TEXT` 非 null）を
+/// 要求する。`TABLES`（`docs`/`notes`/`kb`）はいずれも `path` 列を持たないため、
+/// 本節（TASK-77）専用に `path`／`body` 列を持つ最小テーブルを別途構築する
+/// （増分インデックス、TASK-120 の列規約と同一）。
+const PLAN_TABLE: &str = "plan_docs";
+const PLAN_DIM: u32 = 4;
+
+fn plan_table_schema() -> TableSchema {
+    TableSchema::new(
+        PLAN_TABLE,
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(PLAN_DIM), false),
+            ColumnDef::new("path", ColumnType::Text, false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    )
+}
+
+/// `storage` に [`PLAN_TABLE`] を作成し、[`TENANTS`] × Public/Private の決定的
+/// コーパスを投入する（`seed_corpus` と同じ流儀の縮小版）。戻り値は
+/// `(id, owner_tenant, visibility)` の一覧（独立オラクル用）。
+fn seed_plan_table(storage: &Storage) -> Vec<(u64, &'static str, Visibility)> {
+    storage
+        .create_table(&plan_table_schema())
+        .expect("create table");
+    let mut rng = Xorshift64::new(0x5EED_5EED_1337);
+    let mut truths = Vec::new();
+    let mut id = 1u64;
+    for &tenant in TENANTS.iter() {
+        for i in 0..ROWS_PER_TENANT {
+            let visibility = if i % 2 == 0 {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            let emb: Vec<f32> = (0..PLAN_DIM).map(|_| rng.next_f32_signed()).collect();
+            let ctx =
+                PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+                    .expect("valid tenant");
+            let values = vec![
+                Value::Vector(emb),
+                Value::Text(format!("path/{tenant}/{id}.md")),
+                Value::Text(format!("body {tenant} {id} japanese ja content")),
+            ];
+            let op_id =
+                engine::recovery::required_op_id::OperationId::parse(&format!("plan-op-{id}"))
+                    .expect("valid operation_id");
+            engine::tenant::insert_typed_row(
+                storage, PLAN_TABLE, &ctx, id, visibility, &values, &op_id,
+            )
+            .expect("insert row");
+            truths.push((id, tenant, visibility));
+            id += 1;
+        }
+    }
+    truths
+}
+
+#[test]
+fn using_plan_dispatch_implicitly_applies_rls() {
+    let path = unique_db_path("rls8-using-plan-dispatch");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    let truths = seed_plan_table(&storage);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(ConstEmbedder { dim: PLAN_DIM }))
+        .with_query_planner(Box::new(StubLlmClient));
+
+    for &tenant in TENANTS.iter() {
+        let ctx = ctx_for(tenant, true);
+        let sql = format!(
+            "SELECT id FROM {PLAN_TABLE} USING PLAN('find the japanese docs') LIMIT {}",
+            ROWS_PER_TENANT * TENANTS.len() as u64
+        );
+        let outcome = core
+            .execute_sql_in_session(&ctx, &mut SessionState::default(), &sql)
+            .expect("USING PLAN dispatch should succeed with planner/embedder configured");
+        let result = match outcome {
+            SqlOutcome::Query(result) => result,
+            other => panic!("expected Query outcome, got {other:?}"),
+        };
+        assert!(
+            !result.rows.is_empty(),
+            "USING PLAN dispatch returned no rows for a visible corpus: tenant={tenant}"
+        );
+        for row in &result.rows {
+            let (_, owner_tenant, visibility) = truths
+                .iter()
+                .find(|(id, _, _)| *id == row.id)
+                .expect("returned id must correspond to a seeded row");
+            let allowed = match visibility {
+                Visibility::Public => true,
+                Visibility::Private => *owner_tenant == tenant,
+            };
+            assert!(
+                allowed,
+                "USING PLAN dispatch leaked an invisible row: viewer={tenant} owner={owner_tenant} id={} visibility={visibility:?}",
+                row.id
+            );
+        }
+    }
+}
+
+#[test]
+fn using_plan_dispatch_fails_closed_without_embedder_or_planner() {
+    let sql = format!("SELECT id FROM {PLAN_TABLE} USING PLAN('q') LIMIT 5");
+
+    // planner のみ注入・embedder 未注入。
+    let path_a = unique_db_path("rls8-using-plan-no-embedder");
+    let _guard_a = CleanupGuard(path_a.clone());
+    let storage_a = open_storage(&path_a);
+    storage_a
+        .create_table(&plan_table_schema())
+        .expect("create table");
+    let core_no_embedder = EngineCore::from_storage(storage_a, Box::new(CpuScalarProvider))
+        .with_query_planner(Box::new(StubLlmClient));
+    let ctx = ctx_for("tenant-a", true);
+    let err = core_no_embedder
+        .execute_sql(&ctx, &sql)
+        .expect_err("missing embedder must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+    // エラー本文にプロンプト・LLM 応答本文相当の untrusted な自由記述が含まれない
+    // ことを固定する（security.md P0）。固定文言のみで構成されることを、既知の
+    // 固定文言部分文字列の有無で確認する。
+    assert!(err.client_message().contains("internal error"));
+
+    // embedder のみ注入・planner 未注入。
+    let path_b = unique_db_path("rls8-using-plan-no-planner");
+    let _guard_b = CleanupGuard(path_b.clone());
+    let storage_b = open_storage(&path_b);
+    storage_b
+        .create_table(&plan_table_schema())
+        .expect("create table");
+    let core_no_planner = EngineCore::from_storage(storage_b, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(ConstEmbedder { dim: PLAN_DIM }));
+    let err = core_no_planner
+        .execute_sql(&ctx, &sql)
+        .expect_err("missing query planner must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
+    assert!(err.client_message().contains("internal error"));
 }
 
 // ---------- 負の対照: 検査ヘルパ自体が違反を見逃さないことを固定する ----------

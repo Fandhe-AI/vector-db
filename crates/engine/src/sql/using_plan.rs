@@ -1,0 +1,252 @@
+//! `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。TASK-77、対象ビヘイビア:
+//! SQL-5。ポインタ: `docs/spec/05-tasks.md` TASK-77・
+//! `docs/spec/04-behavior/sql-surface.md` SQL-5）の実行時ディスパッチ。
+//!
+//! 責務境界: `sql::allowlist` が構造受理した自然言語クエリ
+//! （[`ValidatedStatement::using_plan`]）を、既存の LLM クエリ展開ロジック
+//! （`core.rs::EngineCore::plan_query`、TASK-110・PLAN-1）が返した
+//! [`QueryExpansion`] から、既存 C4 ハイブリッド実行形（`sql::parser::Ranking::
+//! Hybrid`）を持つ [`BoundStatement`] へ**一意に**束縛するところまでを担う。
+//!
+//! `EngineCore` の `embedder`／`query_planner` フィールドは private（クレート内
+//! 他モジュールからも不可視）のため、LLM 呼び出し・再埋め込みの実行自体は
+//! 呼び出し元（`core.rs::EngineCore::execute_sql_in_session`）が行い、本モジュールへは
+//! 展開結果 [`QueryExpansion`] と埋め込み済みクエリベクトルを渡す（本モジュールは
+//! 束縛の純粋なロジックのみを持つ）。束縛後の実行（RLS 暗黙適用・`USING MODE`/
+//! `SET search_mode` のモード解決）は既存の `sql::exec::execute_statement` を
+//! そのまま再利用し、呼び出し元がそちらへ委譲する（本モジュールは複製しない）。
+//!
+//! fail-closed: 本文列（規約列 [`BODY_COLUMN_NAME`]。増分インデックス
+//! （TASK-120）のファイル形 `INSERT` の `path`/`body` 列規約と整合）の欠落・型
+//! 不一致は [`SqlSurfaceError::invalid_input`]（`22000`）で拒否する。
+//! プランナー未注入・埋め込み未注入・LLM 応答異常は呼び出し元（`core.rs`）が
+//! 既存分類（`XX000`・`SqlSurfaceError::Internal`）のみで拒否し、新規分類は
+//! 追加しない（ERR-2、TASK-152 の単一真実源を保つ）。エラーへプロンプト本文・
+//! LLM 応答本文を含めない（`query_planner.rs` の P0 方針を維持。`PlanError`/
+//! `EmbedError` の `Display` はいずれも固定文言のみを持つため、そのまま
+//! `SqlSurfaceError::Internal` の detail に使っても入力・応答本文は含まれない）。
+
+use crate::catalog::{ColumnType, TableSchema};
+use crate::query_planner::QueryExpansion;
+use crate::sql::allowlist::{SqlSurfaceError, ValidatedStatement};
+use crate::sql::parser::{self, BoundStatement, Ranking};
+
+/// `USING PLAN` の展開後クエリが密側・疎側のいずれの検索にも使う本文列の規約名。
+/// 増分インデックス（TASK-120）のファイル形 `INSERT`（`path`/`body` 列指定）と
+/// 揃える。
+pub(crate) const BODY_COLUMN_NAME: &str = "body";
+
+/// `question`（クエリ句のリテラル値）と `expansion`（LLM 展開結果）から、密側の
+/// 再埋め込み対象・疎側の検索テキストの両方に使う単一のテキストを決定的に構成する
+/// （PLAN-10 ポインタ: 原質問の埋め込み使い回しをしない再埋め込み規則。
+/// `search_terms` の結合順は `QueryExpansion` の順序をそのまま保つため、同一入力に
+/// 対して常に同一の結果を返す）。
+pub(crate) fn expanded_query_text(question: &str, expansion: &QueryExpansion) -> String {
+    let mut parts: Vec<&str> = Vec::with_capacity(1 + expansion.search_terms.len());
+    parts.push(question);
+    parts.extend(expansion.search_terms.iter().map(String::as_str));
+    parts.join(" ")
+}
+
+/// `schema` 内の規約列 [`BODY_COLUMN_NAME`]（`TEXT`）のインデックスを返す。
+/// 欠落・型不一致は [`SqlSurfaceError::invalid_input`]（`22000`）。
+fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
+    let idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == BODY_COLUMN_NAME)
+        .ok_or_else(|| {
+            SqlSurfaceError::invalid_input(format!(
+                "USING PLAN requires a {BODY_COLUMN_NAME:?} TEXT column"
+            ))
+        })?;
+    let column = schema.columns.get(idx).ok_or_else(|| {
+        SqlSurfaceError::invalid_input(format!(
+            "USING PLAN requires a {BODY_COLUMN_NAME:?} TEXT column"
+        ))
+    })?;
+    match column.ty {
+        ColumnType::Text => Ok(idx),
+        ColumnType::Vector(_) => Err(SqlSurfaceError::invalid_input(format!(
+            "column {BODY_COLUMN_NAME:?} is not a TEXT column"
+        ))),
+    }
+}
+
+/// `stmt`（`using_plan()` が `Some` である前提）・展開結果 `expansion`・埋め込み
+/// 済みの再埋め込みクエリベクトル `query_vector` を `schema` へ束縛し、既存 C4
+/// ハイブリッド実行形（[`Ranking::Hybrid`]）を持つ [`BoundStatement`] を構成する
+/// （TASK-77・SQL-5 の一意ディスパッチ先）。
+///
+/// `SELECT` リスト・`WHERE` 述語の束縛規則は既存の検索 `SELECT` 経路
+/// （`sql::parser::bind_in_session`）と完全に同一の共通ヘルパー
+/// （[`parser::bind_projection`]/[`parser::bind_where_predicates`]）を再利用する
+/// （挙動を複製しない）。`resolved_mode`（`USING MODE`／`SET search_mode` の優先順位
+/// 解決結果）は呼び出し元がそのまま渡す。
+pub(crate) fn bind_expansion(
+    stmt: &ValidatedStatement,
+    schema: &TableSchema,
+    question: &str,
+    expansion: &QueryExpansion,
+    query_vector: Vec<f32>,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    resolved_mode: crate::sql::mode::ResolvedMode,
+) -> Result<BoundStatement, SqlSurfaceError> {
+    let text_column_index = body_column_index(schema)?;
+
+    let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
+    let projection = parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
+    let (metadata_filters, expr_filters, rls_predicate_present) =
+        parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+
+    let limit = usize::try_from(stmt.limit()).map_err(|_| {
+        SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {}", stmt.limit()))
+    })?;
+    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "LIMIT {limit} out of range (must be 1..={})",
+            crate::core::MAX_SEARCH_K
+        )));
+    }
+
+    let query_text = expanded_query_text(question, expansion);
+
+    // `BoundStatement` のフィールドは `pub(crate)`（クレート外からの構造体リテラル
+    // 構築は不可・本モジュールはクレート内のため可）。既存 `sql::parser::
+    // bind_in_session` と同じ束縛結果の形へ直接組み立てる（`expr_filters` を
+    // 引き継ぐため、`BoundStatement::new`（`expr_filters: Vec::new()` 固定の
+    // 外部向け constructor）は使わない）。
+    Ok(BoundStatement {
+        table: stmt.table_name().to_string(),
+        projection,
+        metadata_filters,
+        rls_predicate_present,
+        expr_filters,
+        ranking: Ranking::Hybrid {
+            query: query_vector,
+            text_column_index,
+            query_text,
+        },
+        limit,
+        mode: resolved_mode,
+        evaluation_order: stmt.evaluation_order(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+
+    fn schema_with_body() -> TableSchema {
+        TableSchema {
+            name: "documents".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "embedding".to_string(),
+                    ty: ColumnType::Vector(2),
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "body".to_string(),
+                    ty: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+        }
+    }
+
+    fn sample_expansion() -> QueryExpansion {
+        QueryExpansion {
+            search_terms: vec!["alpha".to_string(), "beta".to_string()],
+            path_hint: None,
+            kind_hint: None,
+        }
+    }
+
+    #[test]
+    fn expanded_query_text_places_question_first_and_keeps_term_order() {
+        let text = expanded_query_text("find auth", &sample_expansion());
+        assert_eq!(text, "find auth alpha beta");
+    }
+
+    #[test]
+    fn expanded_query_text_is_deterministic() {
+        let expansion = sample_expansion();
+        let a = expanded_query_text("q", &expansion);
+        let b = expanded_query_text("q", &expansion);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bind_expansion_produces_hybrid_ranking_with_expanded_text() {
+        let schema = schema_with_body();
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            crate::sql::allowlist::Projection::All,
+            crate::sql::allowlist::OrderByForm::UsingPlan,
+            Vec::new(),
+            5,
+            crate::sql::plan::EvaluationOrder::DEFAULT,
+        )
+        .with_using_plan(Some("find auth".to_string()));
+        let expansion = sample_expansion();
+        let bound = bind_expansion(
+            &stmt,
+            &schema,
+            "find auth",
+            &expansion,
+            vec![0.1, 0.2],
+            &crate::sql::udf_call::UdfRegistry::default(),
+            crate::sql::mode::resolve_mode(None, None),
+        )
+        .expect("bind_expansion should succeed with a body column present");
+
+        match bound.ranking() {
+            Ranking::Hybrid {
+                query,
+                text_column_index,
+                query_text,
+            } => {
+                assert_eq!(query, &vec![0.1, 0.2]);
+                assert_eq!(*text_column_index, 1);
+                assert_eq!(query_text, "find auth alpha beta");
+            }
+            other => panic!("expected Ranking::Hybrid, got {other:?}"),
+        }
+        assert_eq!(bound.limit(), 5);
+    }
+
+    #[test]
+    fn bind_expansion_rejects_missing_body_column() {
+        let schema = TableSchema {
+            name: "documents".to_string(),
+            columns: vec![ColumnDef {
+                name: "embedding".to_string(),
+                ty: ColumnType::Vector(2),
+                nullable: false,
+            }],
+        };
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            crate::sql::allowlist::Projection::All,
+            crate::sql::allowlist::OrderByForm::UsingPlan,
+            Vec::new(),
+            5,
+            crate::sql::plan::EvaluationOrder::DEFAULT,
+        )
+        .with_using_plan(Some("find auth".to_string()));
+        let expansion = sample_expansion();
+        let err = bind_expansion(
+            &stmt,
+            &schema,
+            "find auth",
+            &expansion,
+            vec![0.1, 0.2],
+            &crate::sql::udf_call::UdfRegistry::default(),
+            crate::sql::mode::resolve_mode(None, None),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+}

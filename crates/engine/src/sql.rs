@@ -30,6 +30,8 @@
 //! - [`mode`][]: 取得モード（`recall`／`precision`）の優先順位解決・セッション状態
 //!   （TASK-161・SQL-12）
 //! - [`using_operation_id`][]: `USING OPERATION_ID '<id>'` 文末句の値型・検証（TASK-80）
+//! - [`using_plan`][]: `USING PLAN('<query>')` 文末句（`ORDER BY` の代替。SQL-5）の
+//!   LLM クエリ展開結果 → 既存 C4 ハイブリッド実行形への束縛（TASK-77）
 //! - [`aggregate`][]: 集計関数のみを結果列とする `GROUP BY` なし単一行 SELECT の
 //!   実行（TASK-166・SQL-13）。`GROUP BY` ありの複数行実行は [`group_by`] へ委譲する
 //! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
@@ -73,6 +75,15 @@
 //! `sql::parser::ScalarEq`・`BoundStatement::scalar_filters` を置換。詳細は
 //! `declarative_filter.rs`・`sql/parser.rs` モジュールドキュメント参照）。
 
+//! TASK-77（対象ビヘイビア: SQL-5）: `USING PLAN('<query>')` を `ORDER BY` の代替
+//! （相互排他）として追加した。構文は [`allowlist`]（`ValidatedStatement::
+//! using_plan`）、展開後クエリ → 既存 C4 ハイブリッド実行形への束縛は
+//! [`using_plan::bind_expansion`] が担う。LLM 展開（`core.rs::EngineCore::
+//! plan_query`、TASK-110）→ 展開後テキストの再埋め込み（`Embedder`）→
+//! [`using_plan::bind_expansion`] → [`exec::execute_statement`] という一意の
+//! 経路へディスパッチし、`core.rs::EngineCore::execute_sql_in_session` が
+//! `ValidatedStatement::using_plan` の有無で分岐する。
+
 pub mod aggregate;
 pub mod allowlist;
 pub mod exec;
@@ -83,6 +94,7 @@ pub mod parser;
 pub mod plan;
 pub mod udf_call;
 pub mod using_operation_id;
+pub(crate) mod using_plan;
 
 /// `EngineCore::execute_sql_in_session`（TASK-161）の成功応答。`SELECT` は
 /// [`exec::QueryResult`] を、`SET search_mode` は解決前の設定値

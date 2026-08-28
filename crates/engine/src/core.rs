@@ -1435,12 +1435,21 @@ impl EngineCore {
                                 detail: format!("failed to load table schema: {other}"),
                             },
                         })?;
-                let bound = crate::sql::parser::bind_in_session(
-                    &validated,
-                    &schema,
-                    session.search_mode(),
-                    session.udfs(),
-                )?;
+                // TASK-77（SQL-5）: `USING PLAN('<query>')` は `ORDER BY` の代替
+                // （相互排他）のため、`validated.using_plan()` の有無で束縛経路を
+                // 分岐する。この経路は `sql::parser::bind_in_session` を呼ばない
+                // （`bind_ranking` が `OrderByForm::UsingPlan` を防御的に拒否する
+                // ことと対になる：正規の分岐は必ずここで行われる）。
+                let bound = if let Some(question) = validated.using_plan() {
+                    self.bind_using_plan(ctx, session, &validated, &schema, question)?
+                } else {
+                    crate::sql::parser::bind_in_session(
+                        &validated,
+                        &schema,
+                        session.search_mode(),
+                        session.udfs(),
+                    )?
+                };
                 let result = crate::sql::exec::execute_statement(
                     &read_txn,
                     self.provider.as_ref(),
@@ -1482,6 +1491,73 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
         }
+    }
+
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路の束縛全体を行う。呼び出し元は
+    /// [`Self::execute_sql_in_session`] の `Statement::Select` アームのみ
+    /// （`validated.using_plan()` が `Some` のとき）。`self.embedder`／
+    /// `self.query_planner` はいずれも private フィールドで `sql::using_plan`
+    /// （束縛の純粋なロジックのみを持つ）からは不可視なため、これらへアクセスする
+    /// 処理（LLM 展開・再埋め込みの実行そのもの）は本メソッドに置く。
+    ///
+    /// fail-closed: プランナー未注入・埋め込み未注入・展開失敗・再埋め込み失敗は
+    /// いずれも [`crate::sql::allowlist::SqlSurfaceError::Internal`]（`XX000`。ERR-2
+    /// の既存分類。新規分類は追加しない）で拒否する。detail には [`CoreError`]／
+    /// [`crate::embedding::EmbedError`] の固定文言（プロンプト本文・LLM 応答本文を
+    /// 含まない、`query_planner.rs`・`embedding.rs` の P0 方針）のみを使う。
+    fn bind_using_plan(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedStatement,
+        schema: &crate::catalog::TableSchema,
+        question: &str,
+    ) -> Result<crate::sql::parser::BoundStatement, crate::sql::allowlist::SqlSurfaceError> {
+        let embedder = self.embedder.as_deref().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "no embedder configured for USING PLAN".to_string(),
+            }
+        })?;
+
+        let expansion = self
+            .plan_query(ctx, validated.table_name(), question)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("USING PLAN query expansion failed: {e}"),
+            })?;
+
+        // PLAN-10 ポインタ: 密側の再埋め込み対象は展開後テキスト（原質問＋展開検索語の
+        // 決定的結合）であり、原質問の埋め込みを使い回さない。疎側の検索テキストも
+        // 同じ結合結果を使う（`sql::using_plan::bind_expansion` が疎側へ渡す）。
+        let query_text = crate::sql::using_plan::expanded_query_text(question, &expansion);
+        let embedded = embedder.embed_batch(&[query_text.as_str()]).map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("USING PLAN re-embedding failed: {e}"),
+            }
+        })?;
+        let query_vector = embedded.into_iter().next().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "embedder returned no vector for USING PLAN query".to_string(),
+            }
+        })?;
+
+        // `USING MODE`／`SET search_mode` の優先順位解決は既存の検索 SELECT 経路
+        // （`sql::parser::bind_in_session`）と同一の規則（クエリ句 > セッション変数 >
+        // 既定）を踏襲する。
+        let query_mode = match validated.search_mode() {
+            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+            None => None,
+        };
+        let resolved_mode = crate::sql::mode::resolve_mode(query_mode, session.search_mode());
+
+        crate::sql::using_plan::bind_expansion(
+            validated,
+            schema,
+            question,
+            &expansion,
+            query_vector,
+            session.udfs(),
+            resolved_mode,
+        )
     }
 
     /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。

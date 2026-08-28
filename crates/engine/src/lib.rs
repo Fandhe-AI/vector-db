@@ -89,8 +89,10 @@
 //! 宣言的 UDF・`VectorCore::search`／`get_row`・`tenant::visible_rows`）へも
 //! 一般化されて働くことを `tests/rls_generalized.rs` で機械検証する（経路インベントリ
 //! ・検証マトリクスは `docs/design/rls-generalized-read-paths.md` 参照）。
-//! `USING PLAN` 展開後クエリは TASK-77 未実装のため fail-closed な拒否のみを固定し、
-//! 展開後クエリの暗黙適用検証は TASK-77/TASK-117 の管轄とする。
+//! `USING PLAN` 展開後クエリ（TASK-77・SQL-5。`sql::using_plan::bind_expansion` →
+//! 既存 C4 ハイブリッド実行形への束縛）の RLS 暗黙適用は単一テーブルに限定して
+//! `tests/rls_generalized.rs::using_plan_dispatch_implicitly_applies_rls` で検証済み。
+//! 全テーブル軸への一般化は TASK-117 の管轄。
 //!
 //! TASK-95（対象ビヘイビア: RECOVER-4）: `tenant.rs` にテナント境界付き書き込みガード
 //! （`insert_row`/`update_row`/`delete_row`）を追加し、`policy.rs::PolicyContext::is_owner`
