@@ -114,6 +114,11 @@ pub(crate) fn execute_and_respond(
     // 失敗した場合は登録せず、既存の接続断側〔RECOVER-5 の abort バック
     // ストップ〕へ fail-closed に倒す）。
     //
+    // 登録（eager）と送出（emergency_send_decision による commit 成功フラグの
+    // 世代一致判定）は別軸である ―― ここでの登録はブロック内で panic が
+    // 起きたら常に送られることを意味しない。詳細は
+    // [`build_emergency_response_bytes`] のドキュメント参照。
+    //
     // 応答バイト列の内容は `WireError::internal()` の固定文言のみに依存し
     // クエリごとに変化しないため、初回呼び出し時に一度だけ構築してキャッシュ
     // する（[`cached_emergency_response_bytes`] 参照。毎クエリの
@@ -189,6 +194,30 @@ pub(crate) fn execute_and_respond(
 /// 持たない）。本関数の呼び出しは緊急応答チャネル限定であり、通常のエラー応答
 /// （`respond_error_and_ready` 経由）へ `may_be_committed` を混入させない
 /// （`crate::error_response` モジュールドキュメント参照）。
+///
+/// **本関数はバイト列を組み立てるだけで、送信するかどうかには一切関与しない**
+/// （codex-review P1 指摘対応・PR #258）。この事前エンコード済みバイト列は
+/// [`cached_emergency_response_bytes`] を経由して `execute_and_respond` の
+/// 「outcome を決定する区間」（`engine.execute_sql_in_session` 呼び出しを
+/// 含むブロック）の**開始前**に登録されるが、実際に panic フックが
+/// これをソケットへ書き込む（送出する）かどうかは
+/// `engine::recovery::panic_hook::emergency_send_decision` が別途判定する。
+/// 同関数は「このスレッドが commit 成功後・応答未確定の区間にあるか
+/// （`engine::recovery::commit_boundary::active_commit_pending_generation` が
+/// `Some`）」かつ「その世代が登録時に捕捉した世代と一致するか」の両方を
+/// 満たす場合にのみ真を返す。`execute_sql_in_session` の 4 分岐
+/// （`SetSearchMode`・`CreateFunction`・`Select`・`Aggregate`）はいずれも
+/// `engine::recovery::commit_boundary::commit`／`commit_and_finish` を呼ばない
+/// 読み取り専用経路（モジュール冒頭コメント「INSERT は wire 経由では受理
+/// しない」参照）であるため、これらの区間で panic しても commit-pending 世代は
+/// 立たず `emergency_send_decision` は偽となる ―― 登録は存在するが送出されない
+/// （前段フック `previous_hook` へ委譲され、TASK-97 以前と同じ「接続断のみ」に
+/// 倒れる）。すなわち「事前に登録される」ことと「実際に送出される」ことは別軸
+/// であり、送出可否の唯一の判断材料は panic 発生時点の commit 成功フラグ
+/// （世代一致）である。回帰テストは
+/// `engine::recovery::panic_hook::tests::
+/// try_send_emergency_response_returns_false_when_not_pending_even_if_registered`
+/// を参照。
 fn build_emergency_response_bytes(
     internal_error: &engine::error_format::WireError,
 ) -> Result<Vec<u8>, result_encoder::EncodeError> {

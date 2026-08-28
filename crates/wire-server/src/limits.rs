@@ -29,11 +29,15 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// commit 成功境界を跨いだ panic 発生時に緊急応答（3 フィールド契約の
-/// ErrorResponse。ERR-1 のワイヤ形式が spec 側で未確定のため、`state=
-/// may_be_committed` 相当の detail フィールドは現時点では運ばない。
-/// `simple_query::build_emergency_response_bytes` 参照）を書き込むための
-/// ソケット書き込みタイムアウト（TASK-97、対象ビヘイビア: RECOVER-6）。
+/// commit 成功境界を跨いだ panic 発生時に緊急応答（TASK-153・ERR-1 の
+/// `crate::error_response::encode_may_be_committed` が組み立てる、`S`/`C`/`M`
+/// に加え `D`（detail）フィールドで `state=may_be_committed` を運ぶ
+/// ErrorResponse。`simple_query::build_emergency_response_bytes` 参照）を
+/// 書き込むためのソケット書き込みタイムアウト（TASK-97、対象ビヘイビア:
+/// RECOVER-6）。この detail 付き応答は
+/// `engine::recovery::panic_hook::emergency_send_decision` が commit-pending
+/// 世代の一致を確認できた場合にのみ送出される（`simple_query::
+/// build_emergency_response_bytes` のドキュメント参照）。
 ///
 /// `crate::simple_query::execute_and_respond` は「outcome を決定する区間」
 /// （`engine.execute_sql_in_session` の呼び出しを含むブロック）だけこの値を
