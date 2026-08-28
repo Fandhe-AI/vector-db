@@ -352,10 +352,17 @@ mod tests {
         let (server_stream, _) = listener.accept().expect("accept");
 
         // 1 個目のガード配下で緊急応答を登録する（登録時の世代 = このガードの
-        // 世代）。commit は伴わせず、ガードごと drop する。
+        // 世代）。commit は伴わせず、ガードのみを drop する。`_registration` は
+        // このブロックの外（テスト関数のトップレベル）で束縛し、ガード a の
+        // drop 後も RAII のまま生存させる ――
+        // `std::mem::forget` によるリーク（drop 自体の回避）ではなく、
+        // 単に生存スコープをテスト末尾まで広げるだけなので、
+        // `EMERGENCY_RESPONSE_CHANNEL` の登録解除は本テスト関数を抜ける際に
+        // 通常の Drop 経由で必ず行われる（codex-review 指摘対応・PR #90）。
+        let _registration;
         {
             let _guard_a = commit_boundary::ResponseBoundaryGuard::new();
-            let _registration = EmergencyResponseRegistration::register(
+            _registration = EmergencyResponseRegistration::register(
                 vec![b'E', 0, 0, 0, 4],
                 server_stream,
                 Duration::from_secs(5),
@@ -369,12 +376,9 @@ mod tests {
                 registered_generation.is_some(),
                 "registration inside an active guard must capture Some(generation)"
             );
-
-            // _registration をここでは drop せず、guard_a の drop 後も
-            // チャネルに残したまま次のガード・commit へ進む。
-            std::mem::forget(_registration);
         }
         // guard_a が drop され、次に生成するガードは新しい世代を払い出す。
+        // `_registration` はまだ生存しており、チャネルへの登録も残ったまま。
 
         {
             let _guard_b = commit_boundary::ResponseBoundaryGuard::new();
