@@ -21,8 +21,11 @@ use engine::tenant::TenantWriteError;
 /// [`ErrorClass`] を返す。`wire_code` の具体値は写像先ではなく
 /// `crate::error_format::ErrorClass`（TASK-152・ERR-2 の単一真実源）が持つため、
 /// ここでは分類（variant → `ErrorClass`）だけをピン留めし、`wire_code` の文字列を
-/// 二重管理しない（写像の値そのものは `crates/engine/tests/error_format.rs`
-/// `err2_tenant_write_error_mapping_is_unchanged` が別途検証する）。
+/// 二重管理しない（写像の値そのものは、`Forbidden`/`NotFound`/`IdConflict`/
+/// `DuplicateOperationId`/`MissingOperationId` の 5 variant を
+/// `crates/engine/tests/error_format.rs` の `err2_tenant_write_error_mapping_is_unchanged`
+/// が、残る `OperationIdContentMismatch` の `wire_code`（`22023`）を
+/// `crates/engine/tests/recovery_content_hash.rs` が別途検証する）。
 fn expected_class(e: &TenantWriteError) -> ErrorClass {
     match e {
         TenantWriteError::Forbidden => ErrorClass::ForbiddenTenantMismatch,
