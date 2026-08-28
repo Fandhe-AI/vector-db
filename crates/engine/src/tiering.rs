@@ -13,10 +13,11 @@
 //! 責務境界を保つ）。
 //!
 //! 既定の類型→ティア割り当て（対話ティア = `Direct` 相当／高精度ティア =
-//! `Intent`・`Abstraction` 相当）は spec で確定済みの範囲。判定基準そのもの
-//! （[`TieringCriteria`] が持つ手掛かり語等の具体値）は人間設計の共同タスクであり、
-//! 本モジュールは差し替え可能な既定値までを実装範囲とする（最終確定はオーナー
-//! 判断待ち。詳細は `docs/design/query-tiering-criteria.md` を参照）。
+//! `Intent`・`Abstraction` 相当）は本モジュールの現行実装（TASK-115・PLAN-8）が
+//! 採用する既定値であり、判定基準そのもの（[`TieringCriteria`] が持つ手掛かり語等の
+//! 具体値も含む）は人間設計の共同タスクとして差し替え可能な仮置きまでを実装範囲と
+//! する（最終確定はオーナー判断待ち。詳細は `docs/design/query-tiering-criteria.md`
+//! を参照）。
 //!
 //! fail-safe の方向（security.md「不安全な設計」対応）: 判定が不確実・空入力・
 //! 上限超過などの縮退時は [`QuestionClass::Intent`]（＝高精度ティア）へ倒す。
@@ -27,6 +28,11 @@
 //! `unwrap`/`expect` を使わず、決定的・線形時間のトークナイズのみを行う
 //! （coding-rust.md「untrusted 入力の扱い」）。長さ・トークン数はいずれも上限
 //! （[`MAX_QUESTION_CHARS`]・[`MAX_TOKENS`]）で頭打ちにし、無制限確保を避ける。
+//! トークン数が [`MAX_TOKENS`] を超える入力は、判定材料を黙って切り捨てて誤分類する
+//! のではなく [`ClassificationSignal::Degenerate`] の fail-safe 側へ倒す（超過を検出
+//! できない切り捨てのまま `classify` へ渡さない）。トークンの前後に付く句読点
+//! （`?`・`,`・全角句読点等）は比較前に除去し、自然文中のシンボル名・パス様トークンの
+//! 認識を妨げないようにする。
 
 use std::collections::BTreeSet;
 
@@ -88,8 +94,8 @@ pub struct Classification {
     pub signal: ClassificationSignal,
 }
 
-/// `class` に対する既定のティア割り当て（spec で確定済み。モジュールドキュメント
-/// 「既定の類型→ティア割り当て」参照）。
+/// `class` に対する既定のティア割り当て（本モジュールの現行実装が採用する既定値。
+/// モジュールドキュメント「既定の類型→ティア割り当て」参照）。
 pub fn tier_for_class(class: QuestionClass) -> Tier {
     match class {
         QuestionClass::Direct => Tier::Dialogue,
@@ -159,15 +165,38 @@ fn ascii_lower(s: &str) -> String {
         .collect()
 }
 
+/// トークンの前後から除去する境界句読点。シンボル名・パスの内部で意味を持つ
+/// `_`・`-`・`/` は対象外とし、`.` は含めるが `trim_matches` は片端ずつ最初に
+/// 不一致な文字で止まるため `core.rs.`（文末の `.` 付き）でも内側の拡張子区切りの
+/// `.` は保持される（[`extension_of`] の抽出契約を壊さない）。
+const TOKEN_BOUNDARY_PUNCTUATION: &[char] = &[
+    '?', '!', ',', ';', ':', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>', '.', '、', '。',
+    '！', '？', '「', '」', '『', '』',
+];
+
+/// トークン前後の [`TOKEN_BOUNDARY_PUNCTUATION`] を除去する（`what is
+/// parse_expansion?` のような自然文でシンボル・パス認識を妨げないための正規化）。
+fn strip_boundary_punctuation(token: &str) -> &str {
+    token.trim_matches(|c: char| TOKEN_BOUNDARY_PUNCTUATION.contains(&c))
+}
+
 /// `question` を空白でトークナイズし、[`MAX_TOKENS`] 件までを返す（untrusted 入力の
-/// 有界化。制御文字を含むトークンは判定材料として使わずスキップする）。
-fn tokenize(question: &str) -> Vec<String> {
-    question
-        .split_whitespace()
+/// 有界化。制御文字を含むトークンは判定材料として使わずスキップし、境界句読点は
+/// 除去する）。戻り値の `bool` は [`MAX_TOKENS`] を超過して切り捨てが発生したかを示す
+/// （呼び出し元はこれを見て fail-safe 側へ倒す。切り捨てを黙って進めない）。
+/// 超過判定は素の空白区切り件数（フィルタ前）で行うため、[`MAX_TOKENS`] + 1 件先読み
+/// する以外は走査量が増えない。
+fn tokenize(question: &str) -> (Vec<String>, bool) {
+    let raw: Vec<&str> = question.split_whitespace().take(MAX_TOKENS + 1).collect();
+    let truncated = raw.len() > MAX_TOKENS;
+    let tokens = raw
+        .into_iter()
         .take(MAX_TOKENS)
         .filter(|t| !t.chars().any(|c| c.is_control()))
-        .map(ascii_lower)
-        .collect()
+        .map(|t| ascii_lower(strip_boundary_punctuation(t)))
+        .filter(|t| !t.is_empty())
+        .collect();
+    (tokens, truncated)
 }
 
 /// トークンの拡張子部分（最後の `.` 以降。存在しなければ `None`）を返す。
@@ -194,8 +223,9 @@ fn extension_of(token: &str) -> Option<&str> {
 /// 3. `criteria.abstraction_cues` に一致する手掛かり語を含む → [`QuestionClass::Abstraction`]
 /// 4. 上記以外 → [`QuestionClass::Intent`]
 ///
-/// 空入力・[`MAX_QUESTION_CHARS`] 超過は縮退値として fail-safe 側
-/// （[`QuestionClass::Intent`]）へ倒す。
+/// 空入力・[`MAX_QUESTION_CHARS`] 超過・[`MAX_TOKENS`] 超過はいずれも縮退値として
+/// fail-safe 側（[`QuestionClass::Intent`]）へ倒す（トークン数超過を黙って切り捨てて
+/// `Direct`/`Dialogue` 側に誤分類しない）。
 pub fn classify(
     question: &str,
     dictionary: &Dictionary,
@@ -206,7 +236,10 @@ pub fn classify(
         return fail_safe(ClassificationSignal::Degenerate);
     }
 
-    let tokens = tokenize(question);
+    let (tokens, truncated) = tokenize(question);
+    if truncated {
+        return fail_safe(ClassificationSignal::Degenerate);
+    }
     if tokens.is_empty() {
         return fail_safe(ClassificationSignal::Degenerate);
     }
@@ -395,6 +428,57 @@ mod tests {
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
+    }
+
+    #[test]
+    fn token_count_over_limit_fails_safe_to_intent_even_with_leading_path_hint() {
+        // 先頭に `core.rs` のようなパス様トークンを置いても、MAX_TOKENS を超える
+        // 入力は黙って切り捨てて Direct/Dialogue に誤分類せず、Degenerate として
+        // fail-safe（Intent/HighPrecision）側へ倒れることを確認する
+        // （codex-review P1 指摘: TASK-115/PLAN-8）。
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let mut question = String::from("core.rs");
+        for _ in 0..MAX_TOKENS {
+            question.push_str(" x");
+        }
+        let result = classify(&question, &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Intent);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::Degenerate);
+    }
+
+    #[test]
+    fn token_count_at_limit_does_not_fail_safe() {
+        let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
+        let criteria = TieringCriteria::default();
+        let mut question = String::from("parse_expansion");
+        for _ in 0..(MAX_TOKENS - 1) {
+            question.push_str(" x");
+        }
+        let result = classify(&question, &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
+    }
+
+    #[test]
+    fn trailing_punctuation_does_not_block_symbol_match() {
+        let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
+        let criteria = TieringCriteria::default();
+        let result = classify("what is parse_expansion?", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
+    }
+
+    #[test]
+    fn trailing_punctuation_does_not_block_path_extension_match() {
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let result = classify("open core.rs, please", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::PathMatch);
     }
 
     #[test]
