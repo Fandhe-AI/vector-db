@@ -26,7 +26,7 @@
 //! `t_full` も同じ増分経路を N 回呼ぶ側に乗るため、比較が両方 O(N) 側へシフトして
 //! 判定式を素通りしてしまう経路があった（`t_inc` は O(N)、`t_full` は増分経路を
 //! 65 回呼ぶため O(N²) となり `t_inc * RATIO_THRESHOLD_DENOM <= t_full` は依然成立し
-//! 得る）。本ファイルはこれを 3 本柱の判定へ再構成する。
+//! 得る）。本ファイルはこれを複数本柱の判定へ再構成する。
 //!
 //! **検出対象（本テストが固定する性質）**: 単一ファイル挿入が既存コーパス規模 N に
 //! 比例して重い処理（再チャンク化・再埋め込み・全行再書き込み・置換書き込みの反復等）
@@ -41,21 +41,22 @@
 //! 対象とする。本テストの判定係数（[`SCALING_SLACK`] 等）はこの軽量な線形走査の傾きを
 //! 許容しつつ「再処理型」の桁違いな傾きを検出できるよう校正している。
 //!
-//! **3 本柱の判定**（すべて本テスト固有の回帰検知パラメータであり、private spec の
+//! **4 本柱の判定**（すべて本テスト固有の回帰検知パラメータであり、private spec の
 //! 数値基準・実測値の転記ではない）:
 //! 1. **カウント判定**（[`index1_single_file_insert_work_is_independent_of_corpus_size`]。
 //!    決定的・時間非依存で最優先）: テスト専用 [`CountingEmbedder`] で
 //!    `Embedder::embed_batch` の呼び出し回数・入力テキスト総数を数え、単一ファイル
 //!    挿入がコーパス規模に関わらず「1 回・チャンク数分のテキスト」に収まることを
-//!    固定する。
+//!    固定する。ただしこの経路（`execute_insert_sql`／`index_file`）は一括投入経路
+//!    （`execute_insert_sql_batch`／`index_file_batch`）とは別コード経路であり、
+//!    柱 4 が担うカバレッジをここでは代替しない。
 //! 2. **スケーリング判定**（[`index1_single_file_insert_time_does_not_scale_with_corpus_size`]。
 //!    比率ベース）: 小規模／大規模コーパスでの単一ファイル挿入時間が [`SCALING_SLACK`]
 //!    倍を超えて増加しないことを固定する。
 //! 3. **全体再構築比判定**（[`index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild`]。
 //!    既存テストの再定義）: `t_full` を増分経路の逐次累積ではなく、一括投入 API
 //!    （`EngineCore::execute_insert_sql_batch`。TASK-122・INDEX-4）による 1 バッチ
-//!    全体再構築で計測する。**限界（PR #296 codex-review 指摘。修正前の本コメントは
-//!    この限界を誤って「解消済み」と記述していた）**: `index_file_batch`
+//!    全体再構築で計測する。**限界（PR #296 codex-review 指摘）**: `index_file_batch`
 //!    （`src/incremental.rs`）はバッチ内の各ファイルについて `index_file`（柱 1・2 が
 //!    対象とする単一ファイル経路）と同じ [`embed_and_write_phase`
 //!    (`engine::incremental`)] を順に呼ぶ実装であり、独立した別実装の全体再構築経路
@@ -65,15 +66,28 @@
 //!    コーパスに対する `embed_and_write_phase` 呼び出しの総和）、退行の有無に関わらず
 //!    `t_full` は `t_inc`（`BASELINE_FILES` 件時点の 1 回分）のおよそ `BASELINE_FILES`
 //!    倍程度の桁になる。結果として `within_ratio_threshold` は退行の有無を問わず
-//!    ほぼ常に真になり、柱 3 単独ではこの再処理型退行を判別できない
-//!    （経路共通の退行の検出は柱 1・2 が担い、両者は `t_full` に依存せず `t_inc` の
-//!    カウント・時間のみで独立に判定するためこの限界の影響を受けない。モジュール
-//!    冒頭の「検出対象」参照）。柱 3 が実際に検出できるのは、`index_file` にのみ存在し
-//!    `index_file_batch` には存在しない、単一ファイル経路固有の退行（例:
-//!    `execute_insert_sql`／`index_file` 呼び出し経路だけに挿入された余分な処理）に
-//!    限られる。
+//!    ほぼ常に真になり、柱 3 単独ではこの再処理型退行を判別できない。柱 3 が実際に
+//!    検出できるのは、`index_file` にのみ存在し `index_file_batch` には存在しない、
+//!    単一ファイル経路固有の退行（例: `execute_insert_sql`／`index_file` 呼び出し
+//!    経路だけに挿入された余分な処理）に限られる。
+//! 4. **一括投入経路の書き込み量判定**
+//!    （[`index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing`]。
+//!    決定的・時間非依存。柱 3 の上記「限界」への対応。PR #296 codex-review 指摘:
+//!    「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」）:
+//!    柱 1 の [`CountingEmbedder`] によるカウント判定は単一ファイル経路
+//!    （`index_file`）だけを対象にしており、`t_full` の計測に使う一括投入経路
+//!    （`index_file_batch`）自身は独立に検証していなかった。柱 4 は
+//!    `execute_insert_sql_batch` の応答が返す `chunks_written`／`rows_replaced` を
+//!    `BASELINE_FILES + 1` 件のバッチ全体で積算し、合計が `(BASELINE_FILES + 1) *
+//!    expected_chunks_for_new_file()`（＝各ファイル 1 件あたりちょうど期待チャンク数）
+//!    に一致することを固定する。`index_file_batch` が既存コーパス規模に比例して
+//!    重くなる再処理型退行を起こせば、バッチ後半の呼び出しほど `chunks_written`／
+//!    `rows_replaced` が累積コーパス規模に応じて膨らみ、この合計は期待値を確実に
+//!    上回るため、時間計測に頼らず一括投入経路自身の再処理型退行を検出できる
+//!    （経路共通の退行の検出は柱 1・2・4 が担い、いずれも `t_full` に依存しない。
+//!    モジュール冒頭の「検出対象」参照）。
 //!
-//! vacuous pass 防止（Issue #281 AC2）として、上記 3 判定と同一の判定述語
+//! vacuous pass 防止（Issue #281 AC2）として、柱 1〜3 と同一の判定述語
 //! （[`within_ratio_threshold`]・[`within_scaling_slack`]・[`work_is_single_file`]）を、
 //! 「既存コーパス全件の同一パス再投入 ＋ 新規 1 件」という再処理型退行の実測モデル
 //! （[`measure_simulated_full_reprocess`]）に通し、判定が確実に `false`（拒否）を返す
@@ -81,13 +95,15 @@
 //! **この負例が検証しているのは「[`measure_simulated_full_reprocess`] というモデルに
 //! 対して各判定述語が `false` を返すこと」であり、柱 3
 //! （[`within_ratio_threshold`]）が実際の実装退行を検出できることの証明ではない**
-//! （上記「限界」参照）。[`measure_simulated_full_reprocess`] は既存 `n_files` 件
-//! 全件を**同一パスへ**再投入する（コーパス総行数は増えず一定のまま `n_files + 1`
-//! 回の呼び出しを行う）ため、`measure_full_rebuild_batch` の「0 件から
-//! `BASELINE_FILES` 件まで増えていくコーパスに対する `BASELINE_FILES + 1` 回の呼び出し
-//! （各呼び出しの重さが右肩上がり）」とは負荷の形が異なり、単純な総和比較にはならない
-//! （柱 3 の負例は判定式ライブラリの動作確認であり、柱 3 単体の検出力を主張する根拠
-//! ではない。柱 3 の実際の検出対象は上記のとおり「経路固有」の退行に限られる）。
+//! （上記「限界」参照。柱 3 単独の検出力の不足は柱 4 が補う）。
+//! [`measure_simulated_full_reprocess`] は既存 `n_files` 件全件を**同一パスへ**
+//! 再投入する（コーパス総行数は増えず一定のまま `n_files + 1` 回の呼び出しを行う）
+//! ため、`measure_full_rebuild_batch` の「0 件から `BASELINE_FILES` 件まで増えていく
+//! コーパスに対する `BASELINE_FILES + 1` 回の呼び出し（各呼び出しの重さが右肩上がり）」
+//! とは負荷の形が異なり、単純な総和比較にはならない（柱 3 の負例は判定式ライブラリの
+//! 動作確認であり、柱 3 単体の検出力を主張する根拠ではない。柱 3 の実際の検出対象は
+//! 上記のとおり「経路固有」の退行に限られ、一括投入経路自身の再処理型退行の検出は
+//! 柱 4 が担う）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -491,6 +507,81 @@ fn measure_full_rebuild_batch() -> Duration {
     median(durations)
 }
 
+/// `index_file_batch`（`execute_insert_sql_batch` が呼ぶ一括投入経路本体）自身に対する、
+/// 時間非依存の処理量判定（柱 4。PR #296 codex-review 指摘への対応）。
+///
+/// 柱 3（[`measure_full_rebuild_batch`]）の限界（モジュールドキュメント参照）は
+/// 「`t_full` が増分経路と同じ `embed_and_write_phase` を共有するため、経路共通の
+/// 退行では比較の独立性が失われる」ことだった。柱 1（[`CountingEmbedder`]）は
+/// この種の退行を単一ファイル挿入（`index_file`）に対しては検出できるが、
+/// `index_file_batch`（一括投入経路）自身に対しては検証していなかった
+/// （指摘: 「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」）。
+///
+/// 本関数は `execute_insert_sql_batch` の応答（`IndexOutcome`）そのものが返す
+/// `chunks_written`／`rows_replaced` を `0..=n_files` 件のバッチ全体で積算する。
+/// `embed_and_write_phase` は呼び出しごとに **その回に渡された 1 ファイルの
+/// `chunk_phase` 結果**（＝そのファイル自身の本文からのチャンク）だけを埋め込み・
+/// 書き込みするため、退行なしの実装では合計は `(n_files + 1) *
+/// expected_chunks_for_new_file()` に一致するはずである（各ファイル 1 件あたり
+/// ちょうど [`expected_chunks_for_new_file`] 個のチャンク）。もし `index_file_batch`
+/// が「現在までにバッチへ積んだ既存ファイル分も毎回re-chunk・re-embed・re-write する」
+/// 再処理型退行を起こせば、バッチ後半の呼び出しほど `chunks_written`／
+/// `rows_replaced` がその時点までの累積コーパス規模に応じて膨らむため、合計が
+/// 期待値を上回り本判定は決定的に `false`（アサート失敗）となる。時間計測を一切
+/// 使わないため、負荷変動によるフレークの余地もない。
+///
+/// 柱 1 と異なり `CountingEmbedder` を挟まない（`execute_insert_sql_batch` の
+/// 戻り値だけで判定できるため）。埋め込み呼び出し回数ではなく実際に書き込まれた
+/// 行数（`rows_replaced`）も独立に照合することで、埋め込み層だけでなく
+/// `tenant::replace_typed_rows_by_text_key` への書き込み層の退行（例:
+/// 既存行を巻き込んで再書き込みする）も検出対象に含める。
+fn full_rebuild_batch_write_quantity(n_files: usize) -> (usize, usize) {
+    let full_path = unique_db_path("recall-full-rebuild-batch-quantity");
+    let _full_cleanup = CleanupGuard(full_path.clone());
+    let storage = Storage::open(&full_path).expect("open storage");
+    storage
+        .create_table(&documents_schema())
+        .expect("create table");
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(small_chunk_config())
+        .with_batch_limits(BatchLimits {
+            max_files_per_batch: n_files + 1,
+            ..BatchLimits::default()
+        });
+    let write_ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let sqls: Vec<String> = (0..=n_files)
+        .map(|i| {
+            insert_file_sql(
+                "documents",
+                &format!("corpus/full-batch-quantity-{i:04}.txt"),
+                &generic_body(i),
+                &format!("op-full-batch-quantity-{i:04}"),
+            )
+        })
+        .collect();
+    let sql_refs: Vec<&str> = sqls.iter().map(String::as_str).collect();
+    let outcomes = core
+        .execute_insert_sql_batch(&write_ctx, &sql_refs)
+        .expect("full rebuild batch insert should succeed");
+
+    let mut total_chunks_written: usize = 0;
+    let mut total_rows_replaced: usize = 0;
+    for outcome in outcomes {
+        let incremental = outcome
+            .incremental
+            .expect("file-form insert sets incremental");
+        total_chunks_written = total_chunks_written
+            .checked_add(incremental.chunks_written)
+            .expect("total chunks_written must not overflow");
+        total_rows_replaced = total_rows_replaced
+            .checked_add(incremental.rows_replaced)
+            .expect("total rows_replaced must not overflow");
+    }
+
+    (total_chunks_written, total_rows_replaced)
+}
+
 /// 負例（vacuous pass 防止・Issue #281 AC2）: 「既存 `n_files` 件全件の同一パス
 /// 再投入 ＋ 新規 1 件」を、再処理型 O(N) 退行が実際に行う仕事量の実測モデルとして
 /// 扱い、全区間（チャンク化・埋め込み・書き込み）の `IndexTiming` 合計を返す。
@@ -634,6 +725,33 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
         "incremental single-file insert ({t_inc:?}) must complete within \
          1/{RATIO_THRESHOLD_DENOM} of full rebuild ({t_full:?}) of baseline_files={BASELINE_FILES}; \
          ratio={ratio:.4}"
+    );
+}
+
+// --- INDEX-1 柱 4: 一括投入経路（`index_file_batch`）自身の書き込み量判定
+// （決定的・時間非依存。PR #296 codex-review 指摘: 柱 3 の `t_full` 計測に使う
+// 一括投入経路自体が独立検証されていなかった） -----------------------------------
+
+#[test]
+fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
+    let (total_chunks_written, total_rows_replaced) =
+        full_rebuild_batch_write_quantity(BASELINE_FILES);
+
+    let expected_chunks_per_file = expected_chunks_for_new_file();
+    let expected_total = (BASELINE_FILES + 1) * expected_chunks_per_file;
+
+    println!(
+        "index1 full-rebuild-batch write-quantity judgement:          total_chunks_written={total_chunks_written} total_rows_replaced={total_rows_replaced}          expected_total={expected_total} (baseline_files={BASELINE_FILES})"
+    );
+
+    assert_eq!(
+        total_chunks_written, expected_total,
+        "full-rebuild batch (execute_insert_sql_batch, {} files) must write exactly          {expected_chunks_per_file} chunks per file regardless of accumulated corpus size          within the batch; a reprocessing-type O(N) regression in index_file_batch would          inflate this total",
+        BASELINE_FILES + 1
+    );
+    assert_eq!(
+        total_rows_replaced, total_chunks_written,
+        "rows actually written via tenant::replace_typed_rows_by_text_key must match the          chunk count produced for each file (no extra existing rows rewritten)"
     );
 }
 
