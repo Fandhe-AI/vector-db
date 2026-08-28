@@ -56,10 +56,10 @@
 //! 限定し、正規表現・glob は使わない（ReDoS の余地を作らない）。ヒント文字列・パスの
 //! 内容自体は本モジュールのエラー・ログへ含めない。
 //!
-//! TASK-148（対象ビヘイビア: EXT-4）: [`crate::scoring_boost`] が、本モジュールの
-//! [`BoostRule`]/[`apply_soft_boost`] を、任意の `TEXT` 列への一致条件による汎用
-//! スコアリングブースト API へ一般化する（宣言・スキーマ束縛は `scoring_boost.rs` の
-//! 責務、加点の意味論そのものは本モジュールへ一元化したまま変更しない）。
+//! TASK-148（対象ビヘイビア: EXT-4。ポインタ: `docs/spec/05-tasks.md` TASK-148・
+//! `docs/spec/04-behavior/extensions.md` EXT-4）: [`crate::scoring_boost`] が本モジュールの
+//! [`BoostRule`]/[`apply_soft_boost`] を一般化する（加点の意味論そのものは本モジュールへ
+//! 一元化したまま変更しない。詳細は `scoring_boost.rs` モジュールドキュメント参照）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

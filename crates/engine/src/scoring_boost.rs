@@ -4,9 +4,9 @@
 //! 責務境界: `hybrid.rs` の [`crate::hybrid::BoostRule`]／[`crate::hybrid::apply_soft_boost`]
 //! は「ヒント種別に依存しない候補 id 集合＋加点量」という汎用形で実装済み
 //! （TASK-111・PLAN-1）だが、一致判定（`path_hint_matches`/`kind_hint_matches`）は
-//! クエリ展開ヒント専用の 2 演算に閉じている。本モジュールは、`declarative_filter.rs`
-//! （TASK-147・EXT-3）と同じ「宣言 → スキーマ束縛 → 評価」の 3 段構成で、
-//! **任意の `TEXT` 列への一致条件によるスコア調整**を宣言できる形へ一般化する。
+//! クエリ展開ヒント専用の 2 演算に閉じている。本モジュールは `declarative_filter.rs`
+//! （TASK-147・EXT-3）と同じ構成でこれを一般化する（詳細は TASK-148・EXT-4 ポインタ
+//! 参照）。
 //!
 //! 呼び出し文脈: 呼び出し元（Rust API 直接利用者。SQL 表層への構文露出は TASK-148 の
 //! 成果物指定外のため対象外）が [`ScoringBoost`] を宣言し、対象テーブルの
