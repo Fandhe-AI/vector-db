@@ -6,8 +6,10 @@
 //! 実 `EngineCore` を用いた分類境界（構文・値・テーブル不在）の決定的分類、
 //! `InternalError` がクライアント文言へ内部詳細を運ばないことを検証する。
 //!
-//! 収録範囲は engine・wire-server が現に返す `wire_code` に限る（未実装分類の追加は
-//! TASK-153・TASK-154 の管轄）。
+//! 収録範囲は engine・wire-server が現に返す `wire_code` に限る（未実装分類の追加・wire
+//! 応答への正式写像は TASK-153 の管轄）。`22023`（`OperationIdContentMismatch`）が他の
+//! いかなる分類にも写像しないことの正式検証（対象ビヘイビア ERR-3）は TASK-154 として
+//! `tests/error_format_err3.rs` に切り出す。
 
 use std::collections::HashSet;
 
