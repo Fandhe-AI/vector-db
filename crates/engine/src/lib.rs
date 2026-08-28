@@ -192,6 +192,13 @@
 //! 固定接頭辞コンテキストとして束ねる注入点は `core::EngineCore::with_query_planner` /
 //! `core::EngineCore::plan_query`（詳細は `query_planner.rs` モジュールドキュメント
 //! 参照）。展開結果はソフトヒントに限り、SQL・プラン文字列への未検証連結は行わない。
+//!
+//! TASK-111（対象ビヘイビア: PLAN-1。関連: EXT-4）: `hybrid.rs` に、TASK-110 の
+//! `QueryExpansion::path_hint`/`kind_hint` を融合済みスコアへの加点として反映する
+//! ソフトブースト機構（`BoostRule`・`apply_soft_boost`・`hybrid_search_boosted`）を
+//! 追加する。ヒント一致は候補の除外・絞り込みには使わず、`truncate(k)` 前のプールへ
+//! 小さな加点（既定 `SOFT_BOOST_PER_MATCH`）を行い再順位付けするのみで、ハードフィルタ
+//! 化しない（詳細は `hybrid.rs` モジュールドキュメント参照）。
 
 pub mod arena;
 pub mod batch_fallback;

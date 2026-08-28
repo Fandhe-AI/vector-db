@@ -42,8 +42,21 @@
 //! 検証し、有限な重み（`dense_weight`/`sparse_weight`）同士の加算がオーバーフローして
 //! `+Inf` になった場合を検知する（[`HybridError::NonFiniteScore`]）。
 //! `VectorCore` trait への統合・SQL 表層統合・RLS 統合は後続タスクの管轄でありここでは扱わない。
+//!
+//! TASK-111（対象ビヘイビア: PLAN-1。関連: EXT-4）: `query_planner.rs`（TASK-110）が
+//! 返す `QueryExpansion::path_hint`/`kind_hint` を、[`rrf_fuse`] 融合後の候補スコアへの
+//! 小さな加点として反映する「ソフトブースト」機構（[`BoostRule`]・[`apply_soft_boost`]・
+//! [`hybrid_search_boosted`]）を追加する。設計上の要点は「ハードフィルタ化しない」こと:
+//! ヒント一致は候補の除外・絞り込みには一切使わず、[`truncate(k)`](Vec::truncate) で
+//! 切り詰める**前**の融合済みプールへスコア加点のみを行い再順位付けする。候補集合の
+//! 要素数はブースト前後で不変（メタデータ一致ブーストの共通基盤として EXT-4 でも
+//! 再利用される設計であり、ヒント種別に依存しない `BoostRule` として実装する）。
+//! `path_hint`/`kind_hint` は LLM 由来の untrusted 出力のため、一致判定
+//! （[`path_hint_matches`]/[`kind_hint_matches`]）は部分文字列一致・完全一致のみに
+//! 限定し、正規表現・glob は使わない（ReDoS の余地を作らない）。ヒント文字列・パスの
+//! 内容自体は本モジュールのエラー・ログへ含めない。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
@@ -210,6 +223,16 @@ pub enum HybridError {
     /// で検索全体を拒否する形で fail-closed を保つ。`core.rs::CoreError::ProviderResultRejected`
     /// と同じ設計方向）。
     ProviderResultRejected,
+    /// [`BoostRule::new`] の検証違反（`amount` が非有限、または `0.0 < amount <=
+    /// MAX_BOOST_AMOUNT` の範囲外。TASK-111）。ヒントが誤っていてもハードフィルタで
+    /// 候補を除外しない設計上、加点自体は検証付きコンストラクタでのみ有界化する
+    /// （不正な `amount` を通すと [`NonFiniteScore`](HybridError::NonFiniteScore) を
+    /// 事後検知に頼ることになり fail-open な経路が広がる）。
+    InvalidBoost,
+    /// [`apply_soft_boost`] に渡された `rules` の件数が [`MAX_BOOST_RULES`] を超えた
+    /// （TASK-111）。[`rrf_fuse`] の [`TooManyCandidates`](HybridError::TooManyCandidates)
+    /// と同じ「アロケーション・走査前に長さを検証する」順序を踏襲する。
+    TooManyBoostRules { len: usize, max: usize },
 }
 
 impl fmt::Display for HybridError {
@@ -237,6 +260,10 @@ impl fmt::Display for HybridError {
                     f,
                     "hybrid fusion input list too long: {len} candidates (max {max})"
                 )
+            }
+            HybridError::InvalidBoost => write!(f, "invalid soft boost rule amount"),
+            HybridError::TooManyBoostRules { len, max } => {
+                write!(f, "too many soft boost rules: {len} rules (max {max})")
             }
         }
     }
@@ -436,6 +463,101 @@ fn accumulate_ranked(
     }
 }
 
+/// ソフトブースト（TASK-111・PLAN-1）でヒント種別 1 件一致あたりに加点する既定値。
+/// PoC 実測構成（ポインタ: `docs/spec/03-poc/llm-query-planning/scripts/eval_expanded.py`）
+/// に基づく値で、spec 本文は転記しない。[`RrfConfig::default`] のスケール
+/// （`weight / k_const` ≈ 1/60 ≈ 0.0167）に対し、加点はそれより一段小さく、複数ヒント
+/// 一致でも上位の RRF 実順位を覆さない程度に留める。
+pub const SOFT_BOOST_PER_MATCH: f64 = 0.02;
+
+/// [`apply_soft_boost`] が 1 回の呼び出しで受け付けるブーストルール数の上限
+/// （無制限入力の拒否。coding-rust.md「長さフィールドは上限検証してから」）。
+pub const MAX_BOOST_RULES: usize = 16;
+
+/// [`BoostRule::new`] が受け付ける加点値 `amount` の上限。[`RrfConfig::default`] の
+/// スコアスケール（`weight / k_const` ≈ 0.0167）に対し十分大きいが有界にし、単一
+/// ルールの加点が RRF 融合スコアの意味を完全に覆い隠さないようにする。
+const MAX_BOOST_AMOUNT: f64 = 1.0;
+
+/// ソフトブーストの 1 ルール（TASK-111・PLAN-1。EXT-4 の汎用メタデータ一致ブーストの
+/// 共通基盤として、ヒント種別（path/kind）に依存しない形にしてある）。
+///
+/// `ids` は「このルールに一致した候補識別子の集合」で、パス・種別等のメタデータへの
+/// アクセスは呼び出し元の責務とする（本モジュールは membership 判定のみ行う。
+/// [`hybrid_search`] と同じ「呼び出し元定義の識別子」契約）。フィールドは非公開とし、
+/// [`BoostRule::new`] の検証付きコンストラクタのみで構築できる（`RrfConfig` と同じ
+/// 「構造体リテラルでの直接構築を許すと検証を迂回できる」流儀）。
+#[derive(Debug, Clone, Copy)]
+pub struct BoostRule<'a> {
+    ids: &'a BTreeSet<u64>,
+    amount: f64,
+}
+
+impl<'a> BoostRule<'a> {
+    /// `amount` の検証付きコンストラクタ。`amount` が有限かつ
+    /// `0.0 < amount <= MAX_BOOST_AMOUNT` の範囲外の場合は
+    /// [`HybridError::InvalidBoost`] を返す（fail-closed）。
+    pub fn new(ids: &'a BTreeSet<u64>, amount: f64) -> Result<Self, HybridError> {
+        if !amount.is_finite() || amount <= 0.0 || amount > MAX_BOOST_AMOUNT {
+            return Err(HybridError::InvalidBoost);
+        }
+        Ok(Self { ids, amount })
+    }
+}
+
+/// ヒント一致判定ヘルパ（呼び出し元が [`BoostRule`] 構築に使う共通述語。TASK-111）。
+/// パスヒントは部分文字列一致で判定する。空ヒントは常に不一致（ブーストなし側へ
+/// 倒す fail-closed な既定）。正規表現・glob は使わない（LLM 由来の untrusted
+/// 文字列に対する ReDoS 類の余地を作らない。ヒント文字列長は `query_planner.rs`
+/// （TASK-110・[`crate::query_planner::MAX_HINT_LEN`]）側で上限検証済み）。
+pub fn path_hint_matches(hint: &str, path: &str) -> bool {
+    !hint.is_empty() && path.contains(hint)
+}
+
+/// ヒント一致判定ヘルパ（TASK-111）。種別ヒントは完全一致で判定する。空ヒントは
+/// 常に不一致（[`path_hint_matches`] と同じ fail-closed な既定）。
+pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
+    !hint.is_empty() && hint == kind
+}
+
+/// [`rrf_fuse`] が返した融合済みプール `hits` へソフトブーストを適用する
+/// （TASK-111・PLAN-1）。各 hit につき、所属する全ルールの `amount` を加算する。
+///
+/// 候補の追加・削除は構造的に不可能（既存 `Vec` の `score` 更新のみ）で、EXT-4 の
+/// 「完全除外しない」性質を型レベルで担保する。`rules.len() > MAX_BOOST_RULES` は
+/// アロケーション・走査前に [`HybridError::TooManyBoostRules`] で拒否する（[`rrf_fuse`]
+/// の長さ検証と同じ順序）。加算後の非有限化（Inf オーバーフロー）は
+/// [`HybridError::NonFiniteScore`] で拒否する（`rrf_fuse` の融合後検証と同じ方向）。
+/// 最後に既存と同一の比較器（スコア降順・同点 id 昇順、`f64::total_cmp` ベース）で
+/// 再ソートし、決定性を維持する（`sort_by` を使い `sort_unstable_*` は使わない。
+/// `scripts/check_sort_determinism.sh` の対象）。
+pub fn apply_soft_boost(
+    hits: &mut [HybridHit],
+    rules: &[BoostRule<'_>],
+) -> Result<(), HybridError> {
+    if rules.len() > MAX_BOOST_RULES {
+        return Err(HybridError::TooManyBoostRules {
+            len: rules.len(),
+            max: MAX_BOOST_RULES,
+        });
+    }
+
+    for hit in hits.iter_mut() {
+        for rule in rules {
+            if rule.ids.contains(&hit.id) {
+                hit.score += rule.amount;
+            }
+        }
+    }
+
+    if hits.iter().any(|h| !h.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    Ok(())
+}
+
 /// 密検索 provider と疎検索インデックスを RRF で統合検索する入口
 /// （CORE-3〜5 実装の密検索 provider・`sparse.rs` の疎検索との統合点）。
 ///
@@ -478,6 +600,25 @@ pub fn hybrid_search(
     query_text: &str,
     k: usize,
     cfg: &RrfConfig,
+) -> Result<Vec<HybridHit>, HybridError> {
+    hybrid_search_boosted(provider, input, sparse_index, query_text, k, cfg, &[])
+}
+
+/// [`hybrid_search`] のソフトブースト対応版（TASK-111・PLAN-1）。密・疎の検証・融合は
+/// [`hybrid_search`] と全く同じ手順で行い、[`rrf_fuse`] の融合結果（`truncate(k)` の
+/// **前**、切り詰め前のプール全体）に対してのみ [`apply_soft_boost`] を適用してから
+/// 先頭 `k` 件へ切り詰める。切り詰め前に適用するのは、`k` 圏外だった一致候補が
+/// ブーストで Top-k 内へ浮上できるようにするため（切り詰め後だと圏外候補が浮上
+/// できず効果が失われる）。`rules` が空の場合は [`hybrid_search`] と完全に同じ結果を
+/// 返す（[`apply_soft_boost`] は no-op）。
+pub fn hybrid_search_boosted(
+    provider: &dyn SearchProvider,
+    input: SearchInput<'_>,
+    sparse_index: &SparseIndex,
+    query_text: &str,
+    k: usize,
+    cfg: &RrfConfig,
+    rules: &[BoostRule<'_>],
 ) -> Result<Vec<HybridHit>, HybridError> {
     if k == 0 || k > cfg.pool_depth() {
         return Err(HybridError::InvalidK);
@@ -534,6 +675,9 @@ pub fn hybrid_search(
         sparse_index.search_within(query_text, cfg.pool_depth(), &visible_ids)?;
 
     let mut fused = rrf_fuse(&dense_hits, &sparse_hits, cfg)?;
+    // `truncate(k)` の前にブーストを適用する（本関数ドキュメント参照。切り詰め後だと
+    // 圏外候補が浮上できず EXT-4/PLAN-1 の効果が失われる）。
+    apply_soft_boost(&mut fused, rules)?;
     fused.truncate(k);
     Ok(fused)
 }
@@ -1160,5 +1304,165 @@ mod tests {
                 score: 2.0 / 61.0
             }]
         );
+    }
+
+    // TASK-111（PLAN-1・EXT-4）: ソフトブースト機構のユニットテスト。
+
+    #[test]
+    fn boost_rule_rejects_invalid_amount() {
+        let ids: BTreeSet<u64> = BTreeSet::new();
+        assert_eq!(
+            BoostRule::new(&ids, 0.0).unwrap_err(),
+            HybridError::InvalidBoost
+        );
+        assert_eq!(
+            BoostRule::new(&ids, -0.1).unwrap_err(),
+            HybridError::InvalidBoost
+        );
+        assert_eq!(
+            BoostRule::new(&ids, f64::NAN).unwrap_err(),
+            HybridError::InvalidBoost
+        );
+        assert_eq!(
+            BoostRule::new(&ids, MAX_BOOST_AMOUNT + 0.001).unwrap_err(),
+            HybridError::InvalidBoost
+        );
+        // 境界値ちょうどは受理される。
+        assert!(BoostRule::new(&ids, MAX_BOOST_AMOUNT).is_ok());
+    }
+
+    #[test]
+    fn apply_soft_boost_adds_amount_for_single_match() {
+        let mut hits = vec![
+            HybridHit { id: 1, score: 0.5 },
+            HybridHit { id: 2, score: 0.4 },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
+        apply_soft_boost(&mut hits, &[rule]).expect("ok");
+        let h1 = hits.iter().find(|h| h.id == 1).unwrap();
+        let h2 = hits.iter().find(|h| h.id == 2).unwrap();
+        assert!((h1.score - 0.5).abs() < 1e-15);
+        assert!((h2.score - (0.4 + SOFT_BOOST_PER_MATCH)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn apply_soft_boost_sums_multiple_rule_matches() {
+        let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+        let path_ids: BTreeSet<u64> = [1].into_iter().collect();
+        let kind_ids: BTreeSet<u64> = [1].into_iter().collect();
+        let rule_a = BoostRule::new(&path_ids, SOFT_BOOST_PER_MATCH).unwrap();
+        let rule_b = BoostRule::new(&kind_ids, SOFT_BOOST_PER_MATCH).unwrap();
+        apply_soft_boost(&mut hits, &[rule_a, rule_b]).expect("ok");
+        assert!((hits[0].score - (0.1 + 2.0 * SOFT_BOOST_PER_MATCH)).abs() < 1e-15);
+    }
+
+    #[test]
+    fn apply_soft_boost_changes_rank_order() {
+        let mut hits = vec![
+            HybridHit { id: 1, score: 0.5 },
+            HybridHit { id: 2, score: 0.4 },
+        ];
+        let ids: BTreeSet<u64> = [2].into_iter().collect();
+        // id=2 に十分大きい加点をして順位を逆転させる。
+        let rule = BoostRule::new(&ids, 0.2).unwrap();
+        apply_soft_boost(&mut hits, &[rule]).expect("ok");
+        assert_eq!(hits[0].id, 2);
+        assert_eq!(hits[1].id, 1);
+    }
+
+    #[test]
+    fn apply_soft_boost_tie_breaks_by_id_ascending() {
+        let mut hits = vec![
+            HybridHit { id: 5, score: 0.1 },
+            HybridHit { id: 3, score: 0.1 },
+        ];
+        apply_soft_boost(&mut hits, &[]).expect("ok");
+        assert_eq!(hits[0].id, 3);
+        assert_eq!(hits[1].id, 5);
+    }
+
+    #[test]
+    fn apply_soft_boost_empty_rules_is_no_op() {
+        let mut hits = vec![
+            HybridHit { id: 2, score: 0.5 },
+            HybridHit { id: 1, score: 0.4 },
+        ];
+        let before = hits.clone();
+        apply_soft_boost(&mut hits, &[]).expect("ok");
+        assert_eq!(hits, before);
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_too_many_rules() {
+        let ids: BTreeSet<u64> = BTreeSet::new();
+        let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
+        let rules: Vec<BoostRule<'_>> = (0..(MAX_BOOST_RULES + 1)).map(|_| rule).collect();
+        let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+        let err = apply_soft_boost(&mut hits, &rules).unwrap_err();
+        assert_eq!(
+            err,
+            HybridError::TooManyBoostRules {
+                len: MAX_BOOST_RULES + 1,
+                max: MAX_BOOST_RULES,
+            }
+        );
+    }
+
+    #[test]
+    fn apply_soft_boost_rejects_non_finite_result() {
+        // `apply_soft_boost` は `hits`（`rrf_fuse` の出力に限らず任意の呼び出し元が
+        // 渡しうる）を加点前提とせず全件の有限性を検証する。`MAX_BOOST_AMOUNT`
+        // （既定 1.0）は `f64::MAX` 級の値を加算しても浮動小数点丸めでオーバーフロー
+        // しない微小量のため、非有限化の検知経路は「入力自体が既に非有限（NaN/Inf）」
+        // なケースで確認する（ルール一致の有無に関わらず検証される契約の確認）。
+        let mut hits = vec![HybridHit {
+            id: 1,
+            score: f64::INFINITY,
+        }];
+        let err = apply_soft_boost(&mut hits, &[]).unwrap_err();
+        assert_eq!(err, HybridError::NonFiniteScore);
+    }
+
+    #[test]
+    fn path_hint_matches_substring_and_rejects_empty_hint() {
+        assert!(path_hint_matches("src/hybrid", "src/hybrid.rs"));
+        assert!(!path_hint_matches("src/other", "src/hybrid.rs"));
+        assert!(!path_hint_matches("", "src/hybrid.rs"));
+    }
+
+    #[test]
+    fn kind_hint_matches_exact_and_rejects_empty_hint() {
+        assert!(kind_hint_matches("doc", "doc"));
+        assert!(!kind_hint_matches("doc", "docx"));
+        assert!(!kind_hint_matches("", "doc"));
+    }
+
+    #[test]
+    fn hybrid_search_boosted_with_empty_rules_matches_hybrid_search() {
+        let cfg = RrfConfig::default();
+        let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+        let ids = [1u64, 2u64];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 2,
+        };
+        let index = SparseIndex::build(&[(1, "cat dog"), (2, "bird fish")]).expect("build index");
+
+        let plain = hybrid_search(&CpuScalarProvider, input, &index, "cat", 2, &cfg).expect("ok");
+        let input2 = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 2,
+            query: &[1.0, 0.0],
+            k: 2,
+        };
+        let boosted =
+            hybrid_search_boosted(&CpuScalarProvider, input2, &index, "cat", 2, &cfg, &[])
+                .expect("ok");
+        assert_eq!(plain, boosted);
     }
 }
