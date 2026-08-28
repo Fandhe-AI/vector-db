@@ -297,7 +297,21 @@ pub fn classify(
         return make(QuestionClass::Direct, ClassificationSignal::PathMatch);
     }
 
-    let has_abstraction_cue = tokens.iter().any(|t| criteria.abstraction_cues.contains(t));
+    // ASCII cue（英語手掛かり語）はトークン完全一致のまま維持し、通常の英単語
+    // （"design" など）が他語の部分文字列として誤爆しないようにする。一方で
+    // 日本語（非 ASCII）cue は日本語文に語間空白が無いため、空白区切り
+    // トークンとの完全一致がほぼ成立しない（codex-review 指摘: PR #261）。
+    // 非 ASCII cue のみ、正規化済み質問文字列全体への部分一致（substring）で
+    // 判定する。fail-safe の方向は変えず、判定漏れ（見逃し）を減らす側の
+    // 変更にとどめる。
+    let normalized_question = ascii_lower(question);
+    let has_abstraction_cue = criteria.abstraction_cues.iter().any(|cue| {
+        if cue.is_ascii() {
+            tokens.iter().any(|t| t == cue)
+        } else {
+            normalized_question.contains(cue.as_str())
+        }
+    });
     if has_abstraction_cue {
         return make(
             QuestionClass::Abstraction,
@@ -420,6 +434,21 @@ mod tests {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
         let result = classify("explain the overall architecture", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Abstraction);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
+    }
+
+    #[test]
+    fn japanese_abstraction_cue_without_token_boundary_yields_abstraction() {
+        // codex-review P1 指摘（PR #261）: 日本語の手掛かり語は語間空白なしの
+        // 通常の日本語文中では `tokenize` の空白区切りトークンと完全一致せず、
+        // Abstraction に分類されるべき質問が Intent（fail-safe 側）へ落ちて
+        // いた。日本語（非 ASCII）cue は正規化済み質問文字列への部分一致で
+        // 判定することを確認する回帰テスト。
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let result = classify("これはなぜ必要ですか", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
