@@ -146,6 +146,18 @@ impl ErrorClass {
     pub fn from_wire_code(code: &str) -> Option<ErrorClass> {
         ErrorClass::ALL.into_iter().find(|c| c.wire_code() == code)
     }
+
+    /// この分類が engine・wire-server のいずれかから現に送出されているか
+    /// （モジュール冒頭の「収録範囲は現に返している `wire_code` に限る」という
+    /// 不変条件の唯一の例外を、prose だけでなくコード側でも明示・網羅テスト可能に
+    /// するための判定。`false` を返すのは [`ErrorClass::AuthRequired`] のみで、
+    /// 理由はモジュール冒頭・variant 定義のドキュメンテーションコメント参照
+    /// （TASK-153・ERR-1 の写像テーブル網羅対応での追加。送出経路は未接続）。
+    /// この判定を `false` にする分類を新たに追加する場合は、モジュール冒頭の
+    /// 不変条件コメントも合わせて更新すること（codex-review Low 指摘対応・PR #101）。
+    pub const fn has_connected_send_path(self) -> bool {
+        !matches!(self, ErrorClass::AuthRequired)
+    }
 }
 
 /// エラーメッセージへ含める文言の長さ上限。untrusted 断片（テーブル名・SQL 片等）を
@@ -280,5 +292,18 @@ mod tests {
     fn wire_codes_are_pairwise_distinct() {
         let codes: HashSet<&str> = ErrorClass::ALL.iter().map(|c| c.wire_code()).collect();
         assert_eq!(codes.len(), ErrorClass::ALL.len());
+    }
+
+    /// モジュール冒頭が宣言する「収録範囲は現に返している `wire_code` に限る」
+    /// 不変条件の唯一の許容例外が `AuthRequired` であることを機械的に固定する
+    /// （codex-review Low 指摘対応・PR #101。将来 2 個目以降の未接続分類が
+    /// ドキュメント更新なしに紛れ込むことをこのテストが検出する）。
+    #[test]
+    fn auth_required_is_the_sole_documented_unconnected_exception() {
+        let unconnected: Vec<ErrorClass> = ErrorClass::ALL
+            .into_iter()
+            .filter(|c| !c.has_connected_send_path())
+            .collect();
+        assert_eq!(unconnected, vec![ErrorClass::AuthRequired]);
     }
 }
