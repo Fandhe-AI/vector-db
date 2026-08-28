@@ -513,6 +513,13 @@ struct DictCacheEntry {
     table: String,
     ctx: PolicyContext,
     dictionary: Arc<crate::dictionary::Dictionary>,
+    /// `dictionary` から 1 度だけ構築した正規化索引（[`crate::tiering::classify`]
+    /// が使う）。`dictionary` と同じ寿命（同一世代の間だけキャッシュされ、世代が
+    /// 変われば両方まとめて破棄・再構築される）で共有することで、
+    /// `crate::tiering::classify` がリクエストごとに辞書全量を再正規化する経路を
+    /// 断つ（codex-review P1 指摘対応・PR #261。`tiering.rs::NormalizedDictionaryIndex`
+    /// ドキュメント参照）。
+    normalized_index: Arc<crate::tiering::NormalizedDictionaryIndex>,
     built_generation: u64,
     approx_bytes: usize,
     /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
@@ -559,12 +566,18 @@ impl DictionaryCache {
     /// `(table, ctx)` に一致し、現在世代と整合するエントリを探す。世代不一致・
     /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う
     /// （fail-closed。[`PrefilterCache::lookup`] と同じ方針）。
+    /// キャッシュヒット時は `(dictionary, normalized_index)` を返す（両者は
+    /// 同一エントリ・同一世代から `Arc::clone` するだけで、辞書の再走査・
+    /// 正規化索引の再構築のいずれも発生しない）。
     fn lookup(
         &self,
         storage: &Storage,
         table: &str,
         ctx: &PolicyContext,
-    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+    ) -> Option<(
+        Arc<crate::dictionary::Dictionary>,
+        Arc<crate::tiering::NormalizedDictionaryIndex>,
+    )> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.state.write().ok()?;
         // 世代はロック取得後に読み直す（`PrefilterCache::lookup` と同じ理由。
@@ -584,12 +597,15 @@ impl DictionaryCache {
             guard.entries.remove(position);
             return None;
         }
-        let dictionary = {
+        let result = {
             let entry = guard.entries.get_mut(position)?;
             entry.last_used = seq;
-            Arc::clone(&entry.dictionary)
+            (
+                Arc::clone(&entry.dictionary),
+                Arc::clone(&entry.normalized_index),
+            )
         };
-        Some(dictionary)
+        Some(result)
     }
 
     /// 新規構築した辞書を挿入する。単体で総量上限を超える場合はキャッシュしないが
@@ -613,7 +629,21 @@ impl DictionaryCache {
         dictionary: crate::dictionary::Dictionary,
         built_generation: u64,
         approx_bytes: usize,
-    ) -> Option<Arc<crate::dictionary::Dictionary>> {
+    ) -> Option<(
+        Arc<crate::dictionary::Dictionary>,
+        Arc<crate::tiering::NormalizedDictionaryIndex>,
+    )> {
+        // 正規化索引（`tiering::classify` が使う小文字化済みパス・シンボル名）は
+        // ここ・辞書スナップショット構築の 1 回だけ構築する（codex-review P1
+        // 指摘対応・PR #261。[`DictCacheEntry::normalized_index`] ドキュメント
+        // 参照）。以後は `dictionary` と同じ `Arc` 共有・同じ失効規約で使い回す。
+        let normalized_index = Arc::new(crate::tiering::NormalizedDictionaryIndex::build(
+            &dictionary,
+        ));
+        // 正規化索引の保持分（小文字化パス・シンボル名の複製）も容量上限の対象に
+        // 含める（漏らすと CPU-DoS 対策のつもりが総量上限の過小評価という別の
+        // メモリ上限 P1 になる）。
+        let approx_bytes = approx_bytes.saturating_add(normalized_index.approx_heap_bytes());
         let dictionary = Arc::new(dictionary);
 
         let Ok(mut guard) = self.state.write() else {
@@ -634,7 +664,7 @@ impl DictionaryCache {
         }
 
         if approx_bytes > MAX_DICTIONARY_CACHE_TOTAL_BYTES {
-            return Some(dictionary);
+            return Some((dictionary, normalized_index));
         }
 
         if let Some(pos) = guard
@@ -663,7 +693,7 @@ impl DictionaryCache {
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(idx, _)| idx);
             let Some(idx) = victim else {
-                return Some(dictionary);
+                return Some((dictionary, normalized_index));
             };
             let removed = guard.entries.remove(idx);
             total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
@@ -674,11 +704,12 @@ impl DictionaryCache {
             table: table.to_string(),
             ctx: ctx.clone(),
             dictionary: Arc::clone(&dictionary),
+            normalized_index: Arc::clone(&normalized_index),
             built_generation,
             approx_bytes,
             last_used: seq,
         });
-        Some(dictionary)
+        Some((dictionary, normalized_index))
     }
 }
 
@@ -1145,8 +1176,31 @@ impl EngineCore {
         ctx: &PolicyContext,
         table: &str,
     ) -> Result<Arc<crate::dictionary::Dictionary>, CoreError> {
-        if let Some(dictionary) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
-            return Ok(dictionary);
+        self.dictionary_snapshot_with_index(ctx, table)
+            .map(|(dictionary, _index)| dictionary)
+    }
+
+    /// [`Self::dictionary_snapshot`] と同じ辞書スナップショットに加え、
+    /// [`crate::tiering::classify`] 用に 1 度だけ構築した正規化索引
+    /// （[`crate::tiering::NormalizedDictionaryIndex`]）も返す（codex-review P1
+    /// 指摘対応・PR #261）。呼び出し元は `Self::expand_query`（[`PlannerBinding::Tiered`]
+    /// 構成時のティア判定）のみ。`dictionary`・`normalized_index` は
+    /// [`DictionaryCache`] の同一エントリから `Arc::clone` するため、キャッシュ
+    /// ヒット時は辞書の再走査・索引の再構築のいずれも発生しない
+    /// （[`DictCacheEntry::normalized_index`] ドキュメント参照）。
+    fn dictionary_snapshot_with_index(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+    ) -> Result<
+        (
+            Arc<crate::dictionary::Dictionary>,
+            Arc<crate::tiering::NormalizedDictionaryIndex>,
+        ),
+        CoreError,
+    > {
+        if let Some(hit) = self.dictionary_cache.lookup(&self.storage, table, ctx) {
+            return Ok(hit);
         }
 
         const MAX_SNAPSHOT_RETRIES: u32 = 5;
@@ -1292,7 +1346,7 @@ impl EngineCore {
             // 呼び出し元へ渡さないためのシグナルであり、ループ先頭へ戻って
             // 最新スナップショットで再試行する（不完全な辞書を正規の結果として
             // 返さない）。
-            if let Some(dictionary) = self.dictionary_cache.insert(
+            if let Some(hit) = self.dictionary_cache.insert(
                 &self.storage,
                 table,
                 ctx,
@@ -1300,7 +1354,7 @@ impl EngineCore {
                 built_generation,
                 approx_bytes,
             ) {
-                return Ok(dictionary);
+                return Ok(hit);
             }
         }
 
@@ -1416,12 +1470,16 @@ impl EngineCore {
             .query_planner
             .as_ref()
             .ok_or(CoreError::QueryPlannerUnavailable)?;
-        let dictionary = self.dictionary_snapshot(ctx, table)?;
+        let (dictionary, normalized_index) = self.dictionary_snapshot_with_index(ctx, table)?;
 
         let (client, classification): (&dyn crate::query_planner::LlmClient, _) = match binding {
             PlannerBinding::Single(client) => (client.as_ref(), None),
             PlannerBinding::Tiered(tiered) => {
-                let (client, classification) = tiered.select(question, &dictionary);
+                // `normalized_index` は辞書スナップショット（`dictionary`）と同じ
+                // `DictionaryCache` エントリから 1 度だけ構築済み（codex-review P1
+                // 指摘対応・PR #261）。`tiered.select` はここでは借用のみで済み、
+                // リクエストごとの辞書全量の複製・走査は発生しない。
+                let (client, classification) = tiered.select(question, &normalized_index);
                 (client, Some(classification))
             }
         };

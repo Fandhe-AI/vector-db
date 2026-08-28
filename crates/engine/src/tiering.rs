@@ -223,12 +223,81 @@ fn extension_of(token: &str) -> Option<&str> {
     }
 }
 
-/// `question` と `dictionary`（[`crate::core::EngineCore::dictionary_snapshot`] 経由で
-/// テナント境界済みのスナップショット）から質問類型を判定する。
+/// [`Dictionary::file_tree`]・[`Dictionary::symbols`] を ASCII 小文字化した
+/// 照会専用の索引（codex-review P1 指摘対応・PR #261）。
+///
+/// 以前の `classify` は呼び出しのたびに `Dictionary::file_tree.paths`・
+/// `Dictionary::symbols`（辞書は各最大 20,000 件・パス最大 1,024 文字
+/// 〔`dictionary.rs::MAX_DICTIONARY_PATHS`・`MAX_DICTIONARY_SYMBOLS`・
+/// `MAX_PATH_LEN`〕）の全要素を小文字化して新しい `String`/`BTreeSet` へ複製して
+/// いたため、wire 経由の短い質問を並行送信するだけでリクエストごとに数十 MB 規模の
+/// 一時確保と全辞書走査が発生し、メモリ・CPU 枯渇経路になっていた
+/// （security.md「不安全な設計」対応）。
+///
+/// `core.rs::DictionaryCache` は `(table, ctx)` 単位の辞書スナップショット
+/// （`Arc<Dictionary>`）を世代整合の間キャッシュし続けるため、本構造体もその
+/// スナップショットの構築時（`DictionaryCache::insert`）に一度だけ構築し
+/// `Arc` で共有する。以降の `classify` 呼び出しは本構造体への借用のみで完結し、
+/// リクエストごとの複製・全量走査は発生しない。
+#[derive(Debug, Clone, Default)]
+pub struct NormalizedDictionaryIndex {
+    /// [`Dictionary::file_tree`] のパスを ASCII 小文字化した集合。
+    path_tokens: BTreeSet<String>,
+    /// [`Dictionary::symbols`] のシンボル名を ASCII 小文字化した集合。
+    symbol_names: BTreeSet<String>,
+}
+
+impl NormalizedDictionaryIndex {
+    /// `dictionary` から正規化索引を構築する（辞書全量を走査するのはこの構築時
+    /// 1 回のみ。呼び出し元は辞書スナップショットの構築時に 1 度だけ呼び出し、
+    /// 結果を `Arc` で保持して使い回す契約とする〔`core.rs::DictionaryCache`
+    /// 参照〕）。
+    pub fn build(dictionary: &Dictionary) -> Self {
+        let path_tokens = dictionary
+            .file_tree
+            .paths
+            .iter()
+            .map(|p| ascii_lower(p))
+            .collect();
+        let symbol_names = dictionary
+            .symbols
+            .iter()
+            .map(|s| ascii_lower(&s.name))
+            .collect();
+        Self {
+            path_tokens,
+            symbol_names,
+        }
+    }
+
+    /// キャッシュ容量判定用の概算ヒープバイト数（`core.rs::DictionaryCache` が
+    /// 元の [`Dictionary::approx_heap_bytes`] に加算し、正規化索引の保持分
+    /// （小文字化パス・シンボル名の複製）も容量上限の対象に含める。
+    /// [`Dictionary::approx_heap_bytes`] と同じ粗い概算方針。
+    pub fn approx_heap_bytes(&self) -> usize {
+        let paths: usize = self
+            .path_tokens
+            .iter()
+            .map(|p| p.len().saturating_add(16))
+            .fold(0usize, usize::saturating_add);
+        let symbols: usize = self
+            .symbol_names
+            .iter()
+            .map(|s| s.len().saturating_add(16))
+            .fold(0usize, usize::saturating_add);
+        paths.saturating_add(symbols)
+    }
+}
+
+/// `question` と `index`（[`NormalizedDictionaryIndex`]。
+/// [`crate::core::EngineCore::dictionary_snapshot`] 経由でテナント境界済みの辞書
+/// スナップショットから 1 度だけ構築された正規化索引）から質問類型を判定する。
 ///
 /// 呼び出し元は `core.rs::EngineCore::plan_query`（テナント別辞書スナップショット
-/// 経由。本関数自体はテナント境界の判断を持たず、渡された `dictionary` をそのまま
-/// 使う純粋関数）。
+/// 経由。本関数自体はテナント境界の判断を持たず、渡された `index` をそのまま
+/// 使う純粋関数）。引数が生の [`Dictionary`] ではなく [`NormalizedDictionaryIndex`]
+/// である点が、リクエストごとの辞書全量複製が発生しないことの契約（型で保証。
+/// [`NormalizedDictionaryIndex`] ドキュメント「codex-review P1 指摘対応」参照）。
 ///
 /// 優先順（本リポの実装既定。`docs/design/query-tiering-criteria.md` も参照）:
 /// 1. パス様トークン（[`Dictionary::file_tree`] のパスへの一致、または
@@ -250,7 +319,7 @@ fn extension_of(token: &str) -> Option<&str> {
 /// （[`QuestionClass::Intent`]）へ倒す。
 pub fn classify(
     question: &str,
-    dictionary: &Dictionary,
+    index: &NormalizedDictionaryIndex,
     criteria: &TieringCriteria,
 ) -> Classification {
     // untrusted 入力（wire 経由）に対する走査量の頭打ち契約: 上限超過検知は
@@ -285,15 +354,11 @@ pub fn classify(
 
     // パス様トークン（拡張子付き、または辞書の生パスとの完全一致）を最優先で
     // 判定する。一般英語との衝突が起きにくく、手掛かり語より先に判定してよい
-    // （`classify` ドキュメンテーションコメント「優先順」参照）。
-    let path_tokens: BTreeSet<String> = dictionary
-        .file_tree
-        .paths
-        .iter()
-        .map(|p| ascii_lower(p))
-        .collect();
+    // （`classify` ドキュメンテーションコメント「優先順」参照）。`index` は辞書
+    // スナップショット構築時に 1 度だけ正規化済みのため、ここでは借用による
+    // 照会のみで完結する（[`NormalizedDictionaryIndex`] ドキュメント参照）。
     let has_path_match = tokens.iter().any(|t| {
-        path_tokens.contains(t)
+        index.path_tokens.contains(t)
             || extension_of(t)
                 .map(|ext| criteria.path_like_extensions.contains(ext))
                 .unwrap_or(false)
@@ -328,13 +393,10 @@ pub fn classify(
     // シンボル名（`BTreeSet<Symbol>` の決定的な反復順序。`dictionary.rs`
     // モジュールドキュメント「決定性」参照）と ASCII 小文字化トークンを比較する。
     // 手掛かり語一致より後段で判定する理由は `classify` ドキュメンテーション
-    // コメント「優先順」参照（Bugbot 指摘対応・PR #261）。
-    let symbol_names: BTreeSet<String> = dictionary
-        .symbols
-        .iter()
-        .map(|s| ascii_lower(&s.name))
-        .collect();
-    if tokens.iter().any(|t| symbol_names.contains(t)) {
+    // コメント「優先順」参照（Bugbot 指摘対応・PR #261）。`index.symbol_names` は
+    // 辞書スナップショット構築時に 1 度だけ正規化済み（[`NormalizedDictionaryIndex`]
+    // ドキュメント参照）。
+    if tokens.iter().any(|t| index.symbol_names.contains(t)) {
         return make(QuestionClass::Direct, ClassificationSignal::SymbolMatch);
     }
 
@@ -378,14 +440,15 @@ impl TieredPlanner {
         }
     }
 
-    /// `question` を `dictionary` に基づき分類し、対応するティアの
+    /// `question` を `index`（[`NormalizedDictionaryIndex`]。辞書スナップショット
+    /// 構築時に 1 度だけ正規化済み）に基づき分類し、対応するティアの
     /// [`crate::query_planner::LlmClient`] とその判定結果を返す。
     pub fn select(
         &self,
         question: &str,
-        dictionary: &Dictionary,
+        index: &NormalizedDictionaryIndex,
     ) -> (&dyn crate::query_planner::LlmClient, Classification) {
-        let classification = classify(question, dictionary, &self.criteria);
+        let classification = classify(question, index, &self.criteria);
         let client: &dyn crate::query_planner::LlmClient = match classification.tier {
             Tier::Dialogue => self.dialogue.as_ref(),
             Tier::HighPrecision => self.high_precision.as_ref(),
@@ -432,11 +495,12 @@ mod tests {
     fn symbol_match_yields_direct_and_dialogue_tier() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         // 手掛かり語を含まない質問文で純粋なシンボル一致を検証する（手掛かり語が
         // 混在する場合は Abstraction が優先される。下記
         // `abstraction_cue_takes_priority_over_symbol_match` 参照。Bugbot 指摘
         // 対応・PR #261）。
-        let result = classify("call parse_expansion now", &dict, &criteria);
+        let result = classify("call parse_expansion now", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -446,7 +510,8 @@ mod tests {
     fn path_extension_match_yields_direct() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("open core.rs and check it", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("open core.rs and check it", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);
@@ -456,7 +521,8 @@ mod tests {
     fn abstraction_cue_yields_high_precision() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("explain the overall architecture", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("explain the overall architecture", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
@@ -472,7 +538,8 @@ mod tests {
         // 質問が Abstraction（＝高精度ティア）へ分類されることを確認する。
         let dict = dictionary_with_symbol("new", "src/lib.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("explain how the new parser works", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("explain how the new parser works", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
@@ -486,7 +553,8 @@ mod tests {
         // シンボル一致そのものを壊していないことの確認）。
         let dict = dictionary_with_symbol("new", "src/lib.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("call new to construct the parser", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("call new to construct the parser", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -501,7 +569,8 @@ mod tests {
         // 判定することを確認する回帰テスト。
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("これはなぜ必要ですか", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("これはなぜ必要ですか", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
@@ -511,7 +580,8 @@ mod tests {
     fn no_cue_yields_intent_and_high_precision() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("something totally unrelated here", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("something totally unrelated here", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::NoCue);
@@ -521,7 +591,8 @@ mod tests {
     fn empty_input_fails_safe_to_intent() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("   ", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("   ", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
@@ -531,8 +602,9 @@ mod tests {
     fn over_limit_input_fails_safe_to_intent() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let long_question = "a".repeat(MAX_QUESTION_CHARS + 1);
-        let result = classify(&long_question, &dict, &criteria);
+        let result = classify(&long_question, &index, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
@@ -546,8 +618,9 @@ mod tests {
         // 範囲内に非空白が無いまま超過を検出でき、Degenerate へ倒れる）。
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let long_whitespace = " ".repeat(MAX_QUESTION_CHARS + 1);
-        let result = classify(&long_whitespace, &dict, &criteria);
+        let result = classify(&long_whitespace, &index, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
@@ -561,11 +634,12 @@ mod tests {
         // （codex-review P1 指摘: TASK-115/PLAN-8）。
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let mut question = String::from("core.rs");
         for _ in 0..MAX_TOKENS {
             question.push_str(" x");
         }
-        let result = classify(&question, &dict, &criteria);
+        let result = classify(&question, &index, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
@@ -575,11 +649,12 @@ mod tests {
     fn token_count_at_limit_does_not_fail_safe() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let mut question = String::from("parse_expansion");
         for _ in 0..(MAX_TOKENS - 1) {
             question.push_str(" x");
         }
-        let result = classify(&question, &dict, &criteria);
+        let result = classify(&question, &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
     }
@@ -588,7 +663,8 @@ mod tests {
     fn trailing_punctuation_does_not_block_symbol_match() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("call parse_expansion?", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("call parse_expansion?", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -598,7 +674,8 @@ mod tests {
     fn trailing_punctuation_does_not_block_path_extension_match() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("open core.rs, please", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("open core.rs, please", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);
@@ -611,7 +688,8 @@ mod tests {
         // （Bugbot 指摘: Backticks block symbol and path matches）。
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("call `parse_expansion` now", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("call `parse_expansion` now", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -621,7 +699,8 @@ mod tests {
     fn backtick_wrapped_path_matches_despite_code_span_markup() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
-        let result = classify("open `core.rs` and check it", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("open `core.rs` and check it", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);
@@ -635,7 +714,8 @@ mod tests {
         let mut dict = empty_dictionary();
         dict.file_tree.paths.insert(".gitignore".to_string());
         let criteria = TieringCriteria::default();
-        let result = classify("check .gitignore please", &dict, &criteria);
+        let index = NormalizedDictionaryIndex::build(&dict);
+        let result = classify("check .gitignore please", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);
@@ -645,9 +725,10 @@ mod tests {
     fn multibyte_input_does_not_panic_and_is_deterministic() {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let question = "これはテストです。なぜ動くのか説明して";
-        let first = classify(question, &dict, &criteria);
-        let second = classify(question, &dict, &criteria);
+        let first = classify(question, &index, &criteria);
+        let second = classify(question, &index, &criteria);
         assert_eq!(first, second);
     }
 
@@ -655,18 +736,20 @@ mod tests {
     fn same_input_is_deterministic() {
         let dict = dictionary_with_symbol("render_prompt_prefix", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let question = "how does render_prompt_prefix work";
-        let a = classify(question, &dict, &criteria);
-        let b = classify(question, &dict, &criteria);
+        let a = classify(question, &index, &criteria);
+        let b = classify(question, &index, &criteria);
         assert_eq!(a, b);
     }
 
     #[test]
     fn criteria_adjustment_changes_classification() {
         let dict = empty_dictionary();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let mut criteria = TieringCriteria::default();
         criteria.abstraction_cues.insert("frobnicate".to_string());
-        let result = classify("please frobnicate the thing", &dict, &criteria);
+        let result = classify("please frobnicate the thing", &index, &criteria);
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
     }
@@ -700,12 +783,13 @@ mod tests {
     #[test]
     fn tiered_planner_routes_direct_question_to_dialogue_client() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
+        let index = NormalizedDictionaryIndex::build(&dict);
         let planner = TieredPlanner::new(
             Box::new(RecordingClient::new("dialogue")),
             Box::new(RecordingClient::new("high_precision")),
             TieringCriteria::default(),
         );
-        let (client, classification) = planner.select("call parse_expansion", &dict);
+        let (client, classification) = planner.select("call parse_expansion", &index);
         assert_eq!(classification.tier, Tier::Dialogue);
         let response = client.complete("prompt").unwrap();
         assert!(response.contains("dialogue"));
@@ -714,12 +798,13 @@ mod tests {
     #[test]
     fn tiered_planner_routes_abstract_question_to_high_precision_client() {
         let dict = empty_dictionary();
+        let index = NormalizedDictionaryIndex::build(&dict);
         let planner = TieredPlanner::new(
             Box::new(RecordingClient::new("dialogue")),
             Box::new(RecordingClient::new("high_precision")),
             TieringCriteria::default(),
         );
-        let (client, classification) = planner.select("explain the design", &dict);
+        let (client, classification) = planner.select("explain the design", &index);
         assert_eq!(classification.tier, Tier::HighPrecision);
         let response = client.complete("prompt").unwrap();
         assert!(response.contains("high_precision"));
