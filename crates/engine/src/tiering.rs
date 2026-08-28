@@ -12,17 +12,11 @@
 //! モジュールドキュメントが担う「プロンプト構築・LLM 呼び出し・応答パース」との
 //! 責務境界を保つ）。
 //!
-//! 既定の類型→ティア割り当て（対話ティア = `Direct` 相当／高精度ティア =
-//! `Intent`・`Abstraction` 相当）は本モジュールの現行実装（TASK-115・PLAN-8）が
-//! 採用する既定値であり、判定基準そのもの（[`TieringCriteria`] が持つ手掛かり語等の
-//! 具体値も含む）は人間設計の共同タスクとして差し替え可能な仮置きまでを実装範囲と
-//! する（最終確定はオーナー判断待ち。詳細は `docs/design/query-tiering-criteria.md`
-//! を参照）。
-//!
-//! fail-safe の方向（security.md「不安全な設計」対応）: 判定が不確実・空入力・
-//! 上限超過などの縮退時は [`QuestionClass::Intent`]（＝高精度ティア）へ倒す。
-//! 誤って対話ティア（軽量）に倒して品質劣化するより、高精度ティアでレイテンシを
-//! 払う側を安全側とする（「正解を含むデータ群を広く返す」設計思想と整合）。
+//! 類型→ティア割り当て・判定基準・fail-safe の方向は TASK-115・PLAN-8 の設計事項
+//! （最終確定含めオーナー判断待ちの範囲を含む）であり、本コメントでは詳細を記載
+//! しない。詳細は各公開 API（[`tier_for_class`]・[`TieringCriteria`]・[`classify`]）
+//! のドキュメンテーションコメント、または `docs/design/query-tiering-criteria.md`
+//! （ポインタ表記）を参照。
 //!
 //! untrusted 入力対応: `question` は wire 経由の未検証入力であるため、添字アクセス・
 //! `unwrap`/`expect` を使わず、決定的・線形時間のトークナイズのみを行う
@@ -166,18 +160,29 @@ fn ascii_lower(s: &str) -> String {
 }
 
 /// トークンの前後から除去する境界句読点。シンボル名・パスの内部で意味を持つ
-/// `_`・`-`・`/` は対象外とし、`.` は含めるが `trim_matches` は片端ずつ最初に
-/// 不一致な文字で止まるため `core.rs.`（文末の `.` 付き）でも内側の拡張子区切りの
-/// `.` は保持される（[`extension_of`] の抽出契約を壊さない）。
+/// `_`・`-`・`/` は対象外とする。`.` は末尾側のみの対象とし（[`TRAILING_ONLY`]）、
+/// 先頭側では除去しない（`.gitignore` のような先頭ドット付きファイル名を
+/// `Dictionary::file_tree` 側の生パスと一致させるため。Bugbot 指摘対応）。
 const TOKEN_BOUNDARY_PUNCTUATION: &[char] = &[
-    '?', '!', ',', ';', ':', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>', '.', '、', '。',
-    '！', '？', '「', '」', '『', '』',
+    '?', '!', ',', ';', ':', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>', '、', '。', '！',
+    '？', '「', '」', '『', '』',
 ];
 
-/// トークン前後の [`TOKEN_BOUNDARY_PUNCTUATION`] を除去する（`what is
-/// parse_expansion?` のような自然文でシンボル・パス認識を妨げないための正規化）。
+/// [`TOKEN_BOUNDARY_PUNCTUATION`] に加え、末尾側でのみ除去する句読点（`core.rs.`
+/// のような文末の `.` を落としつつ内側の拡張子区切りの `.` は保持するため、末尾専用
+/// とする。先頭側にも含めると `.gitignore` の先頭ドットまで削られ、パス一致の
+/// 判定契約が壊れる）。
+const TRAILING_ONLY_PUNCTUATION: char = '.';
+
+/// トークン前後の境界句読点を除去する（`what is parse_expansion?` のような自然文で
+/// シンボル・パス認識を妨げないための正規化）。先頭側と末尾側で対象文字集合を分け、
+/// 先頭ドットは保持する（[`TOKEN_BOUNDARY_PUNCTUATION`] ドキュメント参照）。
 fn strip_boundary_punctuation(token: &str) -> &str {
-    token.trim_matches(|c: char| TOKEN_BOUNDARY_PUNCTUATION.contains(&c))
+    token
+        .trim_start_matches(|c: char| TOKEN_BOUNDARY_PUNCTUATION.contains(&c))
+        .trim_end_matches(|c: char| {
+            TOKEN_BOUNDARY_PUNCTUATION.contains(&c) || c == TRAILING_ONLY_PUNCTUATION
+        })
 }
 
 /// `question` を空白でトークナイズし、[`MAX_TOKENS`] 件までを返す（untrusted 入力の
@@ -476,6 +481,20 @@ mod tests {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
         let result = classify("open core.rs, please", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::PathMatch);
+    }
+
+    #[test]
+    fn leading_dot_path_matches_hidden_file_in_dictionary() {
+        // 先頭ドット付きファイル名（`.gitignore` 等）が trim で削られて
+        // `file_tree` 側の生パスと不一致になり Intent へ誤分類されないことを確認する
+        // （Bugbot 指摘: Leading dots break hidden-file matching）。
+        let mut dict = empty_dictionary();
+        dict.file_tree.paths.insert(".gitignore".to_string());
+        let criteria = TieringCriteria::default();
+        let result = classify("check .gitignore please", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);

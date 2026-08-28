@@ -14,20 +14,13 @@ Issue #77（TASK-115）は、LLM クエリプランニング（TASK-110・`query
 本リポジトリで公開している設計方針の範囲は README.md「実装方針（要点）」の通りであり、
 それを超える内容はここに記載しない。
 
-## 実装の要点（コードで公開済みの範囲）
+## 実装の要点（ポインタ表記）
 
-- 質問類型（`crate::tiering::QuestionClass`: `Direct`／`Intent`／`Abstraction`）と
-  ティア（`crate::tiering::Tier`: `Dialogue`／`HighPrecision`）への既定割り当ては
-  `crate::tiering::tier_for_class` に実装済み（`Direct → Dialogue`、`Intent`・
-  `Abstraction → HighPrecision`）。
-- 判定は決定的・線形時間のルールベース（`crate::tiering::classify`）で、辞書的情報源
-  （TASK-109・`dictionary.rs`）から得たシンボル名・パスへの一致を優先し、次に手掛かり語
-  一致、いずれにも一致しなければ意図型（`Intent`）とする。優先順・各シグナルの詳細は
-  `crate::tiering::classify` のドキュメンテーションコメントを参照。
-- fail-safe の方向: 空入力・上限超過等の縮退時は `Intent`（＝高精度ティア）へ倒す
-  （品質を優先する側を安全側とする）。
-- 判定基準の具体値（手掛かり語・拡張子リスト等）は `crate::tiering::TieringCriteria`
-  として構成可能にし、ハードコードしていない。
+判定方式・優先順・fail-safe の方向・判定基準の具体値は TASK-115・PLAN-8 の設計事項
+（最終確定含めオーナー判断待ちの範囲を含む）であり、本ドキュメントでは詳細を記載
+しない。関連する公開 API は `crate::tiering::QuestionClass`・`crate::tiering::Tier`・
+`crate::tiering::tier_for_class`・`crate::tiering::classify`・
+`crate::tiering::TieringCriteria`（各ドキュメンテーションコメント参照）。
 
 ## 判定基準の最終確定について
 
