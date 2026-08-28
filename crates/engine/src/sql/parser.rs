@@ -558,6 +558,29 @@ pub fn bind(
     bind_with_session(stmt, schema, None)
 }
 
+/// 検索 `SELECT`（`ORDER BY`／`USING PLAN` いずれの経路も含む）の `LIMIT`
+/// 生値 `raw` を検証し、`1..=`[`crate::core::MAX_SEARCH_K`] の範囲内であることを
+/// 確認した `usize` を返す（`bind_in_session`・`crate::sql::using_plan::
+/// bind_expansion`・`core.rs::EngineCore::execute_sql_in_session` の `USING PLAN`
+/// 分岐が同一の検証ロジック・エラー文言・`wire_code`（`22000`）を共有する
+/// 単一実装。`core.rs` 側は `plan_using_plan_expansion`〔辞書スナップショット
+/// 構築・LLM クエリ展開・再埋め込み〕という高コスト I/O より前に本関数を呼び、
+/// `bind_expansion` 側の呼び出しは多層防御として残す。codex-review P1 指摘
+/// 対応、PR #266: 高コスト処理の後段でのみ検証すると、`LIMIT 0`／`LIMIT
+/// 4294967295` のような必ず拒否される入力でも untrusted 入力によるリソース
+/// 増幅を許してしまう）。
+pub(crate) fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+    let limit = usize::try_from(raw)
+        .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
+    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "LIMIT {limit} out of range (must be 1..={})",
+            crate::core::MAX_SEARCH_K
+        )));
+    }
+    Ok(limit)
+}
+
 /// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
 /// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
 /// 束縛する（TASK-161 の公開 API）。UDF レジストリを持たないエントリポイント向けの
@@ -610,15 +633,7 @@ pub fn bind_in_session(
 
     let ranking = bind_ranking(&stmt.order_by, schema)?;
 
-    let limit = usize::try_from(stmt.limit).map_err(|_| {
-        SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {}", stmt.limit))
-    })?;
-    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "LIMIT {limit} out of range (must be 1..={})",
-            crate::core::MAX_SEARCH_K
-        )));
-    }
+    let limit = validate_search_limit(stmt.limit)?;
 
     Ok(BoundStatement {
         table: stmt.table_name.clone(),

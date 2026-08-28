@@ -142,15 +142,12 @@ pub(crate) fn bind_expansion(
     let (metadata_filters, expr_filters, rls_predicate_present) =
         parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
 
-    let limit = usize::try_from(stmt.limit()).map_err(|_| {
-        SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {}", stmt.limit()))
-    })?;
-    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "LIMIT {limit} out of range (must be 1..={})",
-            crate::core::MAX_SEARCH_K
-        )));
-    }
+    // `core.rs::EngineCore::execute_sql_in_session` の `USING PLAN` 分岐が
+    // `plan_using_plan_expansion`（高コスト I/O）より前に同じ検証
+    // （[`parser::validate_search_limit`]）を既に一度通しているが、本関数は
+    // `pub(crate)` として他呼び出し元（単体テスト等）からも呼ばれうるため、
+    // ここでも検証する（多層防御。codex-review P1 指摘対応、PR #266）。
+    let limit = parser::validate_search_limit(stmt.limit())?;
 
     let query_text = expanded_query_text(question, expansion);
 

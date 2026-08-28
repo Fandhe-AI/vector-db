@@ -142,6 +142,45 @@ impl LlmClient for FailingLlmClient {
     }
 }
 
+/// 呼び出し回数を記録するスタブ（codex-review P1 指摘対応、PR #266: 無効な
+/// `LIMIT` が高コストな LLM クエリ展開（`plan_using_plan_expansion`）より前に
+/// 拒否されることを、呼び出し回数 0 で直接確認するために使う）。
+struct CountingLlmClient {
+    response: &'static str,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingLlmClient {
+    fn new(response: &'static str) -> Self {
+        Self {
+            response,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl LlmClient for CountingLlmClient {
+    fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.response.to_string())
+    }
+}
+
+/// `CountingLlmClient` を `Arc` で共有しつつ `Box<dyn LlmClient>` として注入する
+/// ための薄い転送アダプタ（テスト後に呼び出し回数を読み出すため、所有権を
+/// `EngineCore` へ渡し切らず `Arc` で保持する必要がある）。
+struct ArcLlmClient(std::sync::Arc<CountingLlmClient>);
+
+impl LlmClient for ArcLlmClient {
+    fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+        self.0.complete(prompt)
+    }
+}
+
 const EXPANSION_RESPONSE: &str =
     r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null}"#;
 
@@ -498,5 +537,64 @@ fn using_plan_applies_planner_mode_hint_when_no_explicit_mode_is_set() {
         implicit_ids, explicit_precision_ids,
         "a planner-estimated precision mode hint (no explicit USING MODE/SET) must resolve to \
          the same effective mode as an explicit USING MODE 'precision' clause"
+    );
+}
+
+#[test]
+fn using_plan_rejects_invalid_limit_before_invoking_query_planner() {
+    // codex-review P1（PR #266）指摘の判別テスト: `LIMIT` の範囲検証（`22000`）が
+    // `plan_using_plan_expansion`（辞書スナップショット構築＋LLM クエリ展開）より
+    // 前に完結する契約（`core.rs::EngineCore::execute_sql_in_session` の
+    // `Statement::Select` アーム・`USING PLAN` 分岐ドキュメント参照）を、スタブ
+    // プランナーの呼び出し回数が 0 のままであることで直接確認する。`LIMIT 0` は
+    // 構文（`sql::allowlist`）上は受理されるが意味論検証で必ず拒否される値であり、
+    // 修正前はこの拒否より前に `plan_query`（プランナー呼び出し）が実行されて
+    // いた。
+    let path = unique_db_path("sql-using-plan-invalid-limit-zero");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 0",
+        )
+        .expect_err("LIMIT 0 must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "invalid LIMIT must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
+fn using_plan_rejects_out_of_range_limit_before_invoking_query_planner() {
+    // 上のテストの対（`LIMIT` 上限超過側）。構文上は `u32::MAX` まで受理されるが、
+    // `MAX_SEARCH_K` 超過は必ず拒否される値であり、こちらも `plan_query` 実行前に
+    // 拒否されることを確認する。
+    let path = unique_db_path("sql-using-plan-invalid-limit-huge");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 4294967295",
+        )
+        .expect_err("LIMIT far beyond MAX_SEARCH_K must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "invalid LIMIT must be rejected before the high-cost query planner call"
     );
 }

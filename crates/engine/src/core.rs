@@ -1574,6 +1574,21 @@ impl EngineCore {
                     });
                 }
                 let bound_result = if let Some(question) = validated.using_plan() {
+                    // `LIMIT` の範囲検証（codex-review P1 指摘対応、PR #266）:
+                    // 従来は範囲検証（`22000`）が `sql::using_plan::bind_expansion`
+                    // 内、すなわち下記の `plan_using_plan_expansion`（辞書スナップ
+                    // ショット構築＋LLM クエリ展開＋再埋め込み）・スキーマ事前検証用
+                    // `read_txn` のいずれよりも後で行われていた。`LIMIT 0`／
+                    // `LIMIT 4294967295` のように構文上は受理されるが必ず拒否される
+                    // 入力でも、検証が高コスト処理・DB I/O の後段にあると外部 API・
+                    // CPU・メモリ・DB スナップショット取得を consume させてしまい、
+                    // untrusted 入力によるリソース増幅になる。fail-closed な拒否は
+                    // I/O 開始前に完結させる。`bind_expansion` 側の検証（下記）は
+                    // 多層防御として残し、この前倒しチェックとの間で挙動・
+                    // `wire_code`・メッセージが食い違わないよう同一関数
+                    // （[`crate::sql::parser::validate_search_limit`]）を共有する。
+                    crate::sql::parser::validate_search_limit(validated.limit())?;
+
                     // I/O（LLM 呼び出し）前のスキーマ事前検証（codex-review P1 指摘
                     // 対応、PR #266）: `plan_using_plan_expansion` 内の `plan_query` は
                     // `dictionary_snapshot`（LLM プロンプトの固定接頭辞構築用）を
