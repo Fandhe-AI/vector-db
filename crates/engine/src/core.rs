@@ -705,7 +705,12 @@ fn map_rls_error(e: RlsError) -> CoreError {
 /// `VectorCore` 公開 API のエラー型。下位層（`storage`/`catalog`/`arena`/`kernel`/`policy`）
 /// のエラーを一本化しつつ、不可視行と不存在行を [`CoreError::NotFound`] に統合する
 /// （呼び出し元へ存在情報を漏らさないため。エラーメッセージはプログラム出力文字列のため英語）。
+///
+/// `#[non_exhaustive]`: 公開 API・エラー契約の互換性（AGENTS.md P1）に従い、以降の
+/// variant 追加を非破壊にするため付与する（PR #252 codex-review P1 指摘対応）。
+/// 呼び出し元は `match` に `_ =>` 等の catch-all アームを用意すること。
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CoreError {
     Storage(StorageError),
     Catalog(CatalogError),
