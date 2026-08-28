@@ -88,6 +88,8 @@ CORE-5（対照エンジンとの p95 レイテンシ比較。ポインタ: `doc
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド（`gpu_batch.rs`）へ接続済みです（Issue #178・#234）。`benches/batch_bench.rs` の A/B 実測ゲートへどちらも配線済みで、CORE-6 は GPU 経路 vs CPU-SIMD 経路、CORE-16 は GPU 側の f16 パック常駐 vs f32 常駐対照経路（`GpuF32ContrastBackend`）を比較します。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6`/`BENCH_CORE16` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限 `BENCH_CORE6_MIN_IMPROVEMENT_PCT`/`BENCH_CORE16_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。GPU が初期化できない環境で opt-in された場合はそれぞれ理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。variables 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
 
+`batch_bench.rs` の標準出力は既定で pass/fail と非数値状態のみを書き、実測値・注入した閾値のどちらも出しません（`contrast_bench.rs` の CORE-5 で採用済みの方針を横展開したもの。Issue #279）。実測値（p95・median）が必要な場合は、ローカルまたは承認済み計測環境で `BENCH_VERBOSE=1 make bench-batch` を実行してください。`BENCH_VERBOSE` は `.github/workflows/bench.yml` の `bench-batch` ジョブへは注入しておらず、`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体を bench 側が fail-closed で拒否します（public な Actions ログへ実測値が漏れないための二重化）。取得した実測値は Issue・PR・docs 等の public 資産へ転記しないでください。
+
 ### C1 p95 専有環境再測定（TASK-83）
 
 `make bench-c1`（`crates/engine/benches/sql_c1_bench.rs`）は SQL 表層（`EngineCore::execute_sql`）経由の C1（純粋 Top-k）p95 を測定します。閾値は SQL-1 専用の `BENCH_SQL_C1_MAX_P95_MS`（正の整数・ms）・`BENCH_SQL_C1_MIN_RECALL`（`(0.0, 1.0]` の浮動小数点）から注入します。上記 TASK-127 の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は `SearchProvider` 単体（CORE-3・SEARCH-4・CORE-4）の基準であり SQL-1 とは spec 上の出所が異なるため、流用せず別 variable として分離しています（流用すると緩い側で false green・厳しい側で false red になります）。値そのものは本リポジトリには記載しません。

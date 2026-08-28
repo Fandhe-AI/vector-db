@@ -5,8 +5,12 @@
 //! `simd_bench.rs`（TASK-127）と同じ設計方針を踏襲する: `make ci` には含めず
 //! `.github/workflows/bench.yml`（workflow_dispatch）から実行する時間依存ベンチであり、
 //! 閾値は環境変数（Actions variables）から注入・未設定は fail-closed で非ゼロ終了する。
-//! 標準出力には実測値と pass/fail のみを書き、注入された閾値そのものは出力しない
-//! （`.claude/rules/spec-confidentiality.md`）。
+//! 標準出力には pass/fail と非数値状態のみを書き、実測値・注入された閾値は出力しない
+//! （`.claude/rules/spec-confidentiality.md`・Issue #279）。実測値が必要な場合のみ
+//! `BENCH_VERBOSE`（非空で有効）の opt-in で追加出力するが、`GITHUB_ACTIONS` 下では
+//! public ログへの漏えいを防ぐため fail-closed で拒否する（PR #224 で CORE-5 側
+//! 〔`contrast_bench.rs`〕に適用済みの「真偽値のみを既定出力にする」方針を本ファイルへ
+//! 横展開したもの）。
 //!
 //! - CORE-7（動的窓の劣化上限・アクティブなゲート）: [`engine::batch_search::
 //!   DynamicWindowAggregator`] の `push`/`drain` それ自体のオーバーヘッドのみを
@@ -58,7 +62,8 @@
 //!     計上しない＝アサーション弱体化を避ける。CORE-6 と同方針）。
 //!
 //!
-//!   いずれも実測値と pass/fail のみを標準出力へ書き、注入した閾値は出力しない。
+//!   いずれも既定では pass/fail・非数値状態のみを標準出力へ書き、実測値・注入した
+//!   閾値は出力しない（`BENCH_VERBOSE` opt-in 時のみ実測値を追加出力する）。
 
 // `harness` の取り込み方針は `simd_bench.rs` と同一（本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
@@ -131,6 +136,23 @@ fn opt_in_requested_from_env(var: &str) -> bool {
     std::env::var(var)
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// `BENCH_VERBOSE` 環境変数（非空で有効。[`opt_in_requested_from_env`] と同じ
+/// 「値の有無のみで判定し内容は解釈しない」規約）を読み取り、実測値（p95・median）を
+/// 標準出力へ追加するかを返す。実測値は public リポの Actions ログへ出すと注入済みの
+/// 非公開閾値を逆算されうるため（Issue #279）、`GITHUB_ACTIONS` が設定された実行環境
+/// （GitHub Actions ランナーは常にこの変数を設定する）では opt-in 自体を拒否する
+/// （fail-closed。`.github/workflows/bench.yml` は `BENCH_VERBOSE` を注入しない運用と
+/// 二重化することで、誤注入時にも public ログへ実測値が漏れないようにする）。
+fn verbose_requested_from_env() -> Result<bool, String> {
+    let requested = opt_in_requested_from_env("BENCH_VERBOSE");
+    if requested && std::env::var("GITHUB_ACTIONS").is_ok() {
+        return Err(
+            "BENCH_VERBOSE is refused under GitHub Actions (public log; Issue #279)".to_string(),
+        );
+    }
+    Ok(requested)
 }
 
 /// `BENCH_CORE6_MIN_IMPROVEMENT_PCT` を読み取り、
@@ -214,7 +236,11 @@ fn gate_batch_queries<'a>(queries: &'a [Vec<f32>], ctx: &'a PolicyContext) -> Ve
 /// opt-in されていなければ「対象外」を出力して合否に数えない（silent skip にしない）。
 /// opt-in 時に GPU が初期化できない・計測中に CPU 縮退した場合は `pass=false`
 /// （fail-closed。CPU 同士の比較値を GPU 実測の代替として計上しない）。
-fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, String> {
+fn run_core6_gate(
+    dataset: &GateDataset,
+    ctx: &PolicyContext,
+    verbose: bool,
+) -> Result<bool, String> {
     const LABEL: &str = "gpu_vs_cpu_simd_p95";
     if !opt_in_requested_from_env("BENCH_CORE6") {
         println!(
@@ -280,8 +306,11 @@ fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, St
         .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
     println!(
         "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
-         cpu_simd_p95={p95_a:?} gpu_p95={p95_b:?} requested=true pass={pass}"
+         requested=true pass={pass}"
     );
+    if verbose {
+        println!("verbose({LABEL}): cpu_simd_p95={p95_a:?} gpu_p95={p95_b:?}");
+    }
     Ok(pass)
 }
 
@@ -298,7 +327,11 @@ fn run_core6_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, St
 /// 合否に数えない（silent skip にしない）。opt-in 時にどちらかの GPU 初期化が
 /// 失敗した場合は `pass=false`（fail-closed。CPU 比較を GPU 実測の代替として
 /// 計上しない＝アサーション弱体化を避ける。CORE-6 と同方針）。
-fn run_core16_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, String> {
+fn run_core16_gate(
+    dataset: &GateDataset,
+    ctx: &PolicyContext,
+    verbose: bool,
+) -> Result<bool, String> {
     const LABEL: &str = "f16_resident_vs_f32_resident_p95";
     if !opt_in_requested_from_env("BENCH_CORE16") {
         println!(
@@ -405,8 +438,11 @@ fn run_core16_gate(dataset: &GateDataset, ctx: &PolicyContext) -> Result<bool, S
         .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
     println!(
         "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
-         f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?} requested=true pass={pass}"
+         requested=true pass={pass}"
     );
+    if verbose {
+        println!("verbose({LABEL}): f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}");
+    }
     Ok(pass)
 }
 
@@ -431,6 +467,16 @@ fn build_query_pool(rng: &mut DeterministicRng, total_iterations: usize) -> Vec<
 
 fn main() {
     let max_degradation_pct = match max_degradation_pct_from_env() {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
+    // 実測値の既定非出力（Issue #279）の opt-in ゲート。CI（`GITHUB_ACTIONS`）下では
+    // `verbose_requested_from_env` 自体が fail-closed で拒否するため、ここで検証不能な
+    // 経路を通す前に必ず判定する。
+    let verbose = match verbose_requested_from_env() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
@@ -492,27 +538,33 @@ fn main() {
     let degradation_ok = check_degradation_within_limit(p95_a, p95_b, max_degradation_pct)
         .expect("max_degradation_pct validated by max_degradation_pct_from_env");
     passed &= degradation_ok;
-    // limit（BENCH_BATCH_MAX_DEGRADATION_PCT の実測値）は意図的にログへ出力しない
-    // （閾値は spec が SSOT であり public リポの Actions ログへ能動的に書き出さない。
-    // モジュール冒頭コメント参照）。
+    // limit（BENCH_BATCH_MAX_DEGRADATION_PCT）・実測値（p95・median）は意図的に
+    // ログへ出力しない（閾値は spec が SSOT・実測値は public リポの Actions ログから
+    // 閾値を逆算されうるため出さない。モジュール冒頭コメント・Issue #279 参照）。
+    // 実測値が必要な場合のみ `BENCH_VERBOSE` opt-in で追加出力する。
     println!(
-        "dynamic_window_degradation: batch_size={AGG_BATCH_SIZE} dim={AGG_QUERY_DIM} direct_median={:?} direct_p95={p95_a:?} windowed_median={:?} windowed_p95={p95_b:?} pass={degradation_ok}",
-        ab.a.summary.median, ab.b.summary.median,
+        "dynamic_window_degradation: batch_size={AGG_BATCH_SIZE} dim={AGG_QUERY_DIM} pass={degradation_ok}"
     );
+    if verbose {
+        println!(
+            "verbose(dynamic_window_degradation): direct_median={:?} direct_p95={p95_a:?} windowed_median={:?} windowed_p95={p95_b:?}",
+            ab.a.summary.median, ab.b.summary.median,
+        );
+    }
 
     // --- CORE-6 / CORE-16: opt-in の実測ゲート（Issue #178 で実 GPU バックエンドへ
     // 接続済み。未 opt-in なら「対象外」を出力するだけで合否に数えない）---
     let gate_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
     let gate_dataset = build_gate_dataset(&mut rng);
 
-    let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx) {
+    let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx, verbose) {
         Ok(ok) => ok,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
     };
-    let core16_ok = match run_core16_gate(&gate_dataset, &gate_ctx) {
+    let core16_ok = match run_core16_gate(&gate_dataset, &gate_ctx, verbose) {
         Ok(ok) => ok,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
