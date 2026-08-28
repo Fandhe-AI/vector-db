@@ -274,9 +274,12 @@ mod tests {
 
     // --- install_panic_hook の冪等性 ---
     // 複数回呼んでも panic しない・後続の通常 panic 処理（catch_unwind）が
-    // そのまま機能し続けることを確認する（RECOVER-8 のスコープ〔全 panic の
-    // fail-fast 統一〕を先取りしないことの確認でもある ―― pending でない
-    // 通常 panic はフック導入後も unwind として観測できる）。
+    // そのまま機能し続けることを確認する。RECOVER-8（全 panic の fail-fast
+    // 統一）は別途 `engine::recovery::fail_fast::install` が明示的な opt-in
+    // として提供し、本テストプロセス（engine 単体のテストバイナリ）はそれを
+    // 呼ばない ―― そのため pending でない通常 panic はフック導入後も unwind
+    // として観測できる（fail-fast は `wire-server::main::run_server` からのみ
+    // 導入される契約。`fail_fast` モジュールドキュメント参照）。
 
     #[test]
     fn install_panic_hook_is_idempotent_and_normal_panics_still_unwind() {

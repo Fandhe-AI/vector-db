@@ -22,9 +22,16 @@
 //! RECOVER-6・ERR-1）を提供する（詳細は `panic_hook` モジュールドキュメント
 //! 参照）。[`commit_boundary`] の abort（安全性側）を無効化せず、その前段で
 //! 緊急応答の送出を試みる。
+//!
+//! [`fail_fast`] が内部エラーの 2 系統統一（TASK-99、対象ビヘイビア:
+//! RECOVER-8）を提供する（詳細は `fail_fast` モジュールドキュメント参照）。
+//! `Result::Err` は ERR-1 応答で処理継続、panic は経路・スレッドを問わず
+//! プロセスを終了させる ―― `commit_boundary`・`panic_hook` の狭い
+//! commit-pending 限定の abort とは異なり、プロセス全体への最終防衛線となる。
 
 pub mod commit_boundary;
 pub(crate) mod content_hash;
+pub mod fail_fast;
 pub mod ledger;
 pub mod panic_hook;
 pub mod required_op_id;
