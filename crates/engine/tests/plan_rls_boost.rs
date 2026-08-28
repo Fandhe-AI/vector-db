@@ -22,7 +22,7 @@
 //! これらをどう構築するかは検証していない。したがって本ファイルは C1〜C4 の
 //! 呼び出し列自体の合成検証であり、`sql/exec.rs` 側の構築経路の不具合（RLS 適用前の
 //! メタデータからヒントを構築する等）は対象外・検出できない。この空白を埋める
-//! production 経路での回帰テストは TASK-77 実装時の必須受け入れ基準として
+//! production 経路での回帰テストは
 //! `docs/design/plan-rls-boost-interaction.md`「`USING PLAN` 実行器（TASK-77）実装後の
 //! 残課題」節で追跡する。
 //!
@@ -91,10 +91,10 @@ fn ctx_a() -> PolicyContext {
 
 /// path ヒント（`"src/hybrid"`）に一致する tenant-a 自身の可視行（id=3。密ランク 3 位、
 /// `k=2` の枠外）と、**同一の数値 id（=5）** を持つ tenant-a の不可視ではない通常行、
-/// および tenant-b の不可視行を含む合成コーパスを構築する。tenant-a の id=5 と
-/// tenant-b の id=5 が同一テーブル内で共存する合成データ（ポインタ: TABLE-12）が、
-/// V2 で検証する漏えい経路（テナントをまたいだ生の id だけでのブースト一致判定）の
-/// 土台になる。
+/// および tenant-b の不可視行を含む合成コーパスを構築する。`hybrid::HybridHit`／
+/// `BoostRule` はテナント修飾を持たない生の `u64` id でしか一致判定できないため、
+/// tenant-a の id=5 と tenant-b の id=5 が同一テーブル内で共存する構成が、V2 が検証する
+/// 「テナントをまたいだ生の id だけでのブースト一致判定」の土台になる。
 ///
 /// `collision_matches_hint` が真の場合のみ、tenant-b の id=5 行の path がヒントに一致
 /// する（不可視な「たまたま一致する」データの有無を切り替えるためのフラグ。V2/V4 が
@@ -262,13 +262,12 @@ fn correct_path_hint_ids(
         .collect()
 }
 
-/// `correct_path_hint_ids` の**規約違反版**: `ctx` の可視性を一切考慮せず、`docs` に
-/// 保持された全テナントのメタデータへヒントを適用してから id だけを集める（実装上の
-/// バグ、または「グローバルなメタデータ索引からヒント一致 id を引いてしまう」実装
-/// ミスを模する）。`BoostRule`／`apply_soft_boost` はテナント修飾のない生の `u64` id
-/// でしか一致判定できないため、本関数が返す集合には他テナントの不可視行由来の id が
-/// 紛れ込みうる——数値 id がテナントをまたいで衝突する合成データ（ポインタ: TABLE-12）
-/// では、可視な別行が意図せずブーストされる（V2 が検出する漏えい経路）。
+/// `correct_path_hint_ids` の対照版: `ctx` の可視性を一切考慮せず、`docs` に保持された
+/// 全テナントのメタデータへヒントを適用してから id だけを集める（実装上のバグ、
+/// または「グローバルなメタデータ索引からヒント一致 id を引いてしまう」実装ミスを
+/// 模する）。`BoostRule`／`apply_soft_boost` はテナント修飾のない生の `u64` id でしか
+/// 一致判定できないため、本関数が返す集合には他テナントの不可視行由来の id が
+/// 紛れ込みうる（V2 がこの差分を検出する）。
 fn naive_all_tenant_path_hint_ids(docs: &[DocMeta], hint: &str) -> BTreeSet<u64> {
     docs.iter()
         .filter(|d| path_hint_matches(hint, d.path))
@@ -308,7 +307,7 @@ fn v1_boosted_rls_results_never_include_invisible_rows() {
     let index = sparse_index_for(&docs, &ids);
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
 
-    // わざと「規約違反」のルール（tenant-b の不可視行由来の id=5 も含む）を使う。
+    // わざと対照版のルール（tenant-b の不可視行由来の id=5 も含む）を使う。
     let naive_ids = naive_all_tenant_path_hint_ids(&docs, "src/hybrid");
     assert_eq!(naive_ids, [3, 5].into_iter().collect::<BTreeSet<u64>>());
     let rule = BoostRule::new(&naive_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
@@ -373,13 +372,10 @@ fn v1_boosted_rls_results_never_include_invisible_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// V2: 存在情報の非漏えい（応答同一性）。`BoostRule` を可視行のメタデータのみから
-// 構築する規約の下では、「不可視行が存在するコーパス」と「可視行のみの同一
-// コーパス」とで結果（順位・スコア）が完全一致する。逆に、規約に反して不可視行の
-// メタデータからルールを構築すると差が生じることを negative test で示し、
-// 「`BoostRule` は RLS 通過済み可視行のメタデータのみから構築する」という本ファイルの
-// 前提（`docs/design/plan-rls-boost-interaction.md`「検証コードが前提とする構築手順」節）
-// を固定する。
+// V2: 応答同一性。`BoostRule` を RLS 通過済み可視行のメタデータのみから構築すると、
+// 「不可視行が存在するコーパス」と「可視行のみの同一コーパス」とで結果（順位・
+// スコア）が完全一致する。対照として、可視性を考慮せず全テナントのメタデータから
+// ルールを構築すると差が生じることを negative test で示す。
 // ---------------------------------------------------------------------------
 #[test]
 fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
@@ -441,9 +437,8 @@ fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
         "correct (visible-only) rule construction must be invariant to invisible matches"
     );
 
-    // negative test: 規約違反（全テナントのメタデータから構築）だと、不可視行の
-    // ヒント一致有無で tenant-a 自身の id=5 のスコアが変わってしまう——存在情報の
-    // 漏えい経路そのものを再現する。
+    // negative test: 全テナントのメタデータから構築すると、不可視行のヒント一致有無で
+    // tenant-a 自身の id=5 のスコアが変わってしまう。
     let naive_ids_a = naive_all_tenant_path_hint_ids(&docs_with_invisible_match, "src/hybrid");
     let naive_ids_b = naive_all_tenant_path_hint_ids(&docs_without_invisible_match, "src/hybrid");
     assert_eq!(naive_ids_a, [3, 5].into_iter().collect::<BTreeSet<u64>>());
@@ -455,13 +450,13 @@ fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
     let score_b = boosted_hit_score(&hits_b_naive, 5);
     assert!(
         score_a > score_b,
-        "regression: naive (tenant-blind) rule construction must leak the presence of an \
-         invisible matching row via tenant-a's own id=5 score (score_a={score_a} score_b={score_b})"
+        "regression: naive (tenant-blind) rule construction changes tenant-a's own id=5 score \
+         depending on an invisible row's hint match (score_a={score_a} score_b={score_b})"
     );
     let diff = score_a - score_b;
     assert!(
         (diff - RANK3_TOP_K_ENTRY_BOOST).abs() < 1e-9,
-        "the leaked score delta must equal exactly one rule's boost amount: diff={diff}"
+        "the score delta must equal exactly one rule's boost amount: diff={diff}"
     );
 }
 
@@ -674,7 +669,7 @@ fn v3_boost_effect_is_preserved_under_rls_prefilter() {
 }
 
 // ---------------------------------------------------------------------------
-// V4: 追加損失ゼロ（RLS-4 類推）。RLS 事前フィルタ下での可視行に対するブースト結果が、
+// V4: 追加損失ゼロ。RLS 事前フィルタ下での可視行に対するブースト結果が、
 // 「可視行のみコーパスに同一ブーストを適用した理論値」と完全一致し、両機構の併用に
 // よる追加の Recall 損失がないこと。「可視行のみコーパス」は `ctx_a` から可視な行
 // （tenant-a 自身の全行 ＋ tenant-b の `Public` 行 id=10）だけを含む縮小 `Storage` として
@@ -744,7 +739,7 @@ fn v4_no_additional_loss_versus_visible_only_corpus() {
 // ---------------------------------------------------------------------------
 // V5: エラー契約の非依存性。`BoostRule::new`/`apply_soft_boost` の拒否エラー
 // （`TooManyBoostIds`・`BoostSoftBoundExceeded` 等）の発生有無が不可視行の存在に
-// 依存しないこと（エラー差分による存在情報漏えいの排除）。
+// 依存しないこと。
 //
 // `v5_real_path_result_independent_of_invisible_row_count` が
 // `tenant::visible_rows` → `BoostRule::new` → `hybrid_search_boosted` の実経路で
@@ -795,11 +790,9 @@ fn v5_boost_id_limit_error_must_not_depend_on_invisible_row_count() {
         "correct (visible-only) rule construction must succeed regardless of invisible matches"
     );
 
-    // 規約違反の構築（全テナント走査）を模する: 可視一致 id（1 件）に、不可視行から
-    // 「たまたま一致した」と仮定する id を追加していく。追加件数が
-    // `MAX_BOOST_IDS` を超えた時点で初めて `TooManyBoostIds` が発生する——つまり
-    // エラーの発生有無が不可視データの件数（存在情報）に依存してしまう、という
-    // 規約違反時の実際の挙動を固定する。
+    // 対照版の構築（全テナント走査）を模する: 可視一致 id（1 件）に、不可視行から
+    // 「たまたま一致した」と仮定する id を追加していく。追加件数が `MAX_BOOST_IDS`
+    // を超えた時点で初めて `TooManyBoostIds` が発生する、という実際の挙動を固定する。
     let mut naive_ids = correct_ids_with.clone();
     for extra in 0..MAX_BOOST_IDS {
         // 可視 id=3 と衝突しない合成 id（十分大きな値から採番）を「不可視行由来の
@@ -813,12 +806,11 @@ fn v5_boost_id_limit_error_must_not_depend_on_invisible_row_count() {
             len: MAX_BOOST_IDS + 1,
             max: MAX_BOOST_IDS,
         },
-        "naive (tenant-blind) rule construction's error contract leaks the count of invisible \
-         matching rows via whether TooManyBoostIds fires"
+        "naive (tenant-blind) rule construction's error outcome depends on the exact count of \
+         invisible matching rows via whether TooManyBoostIds fires"
     );
-    // 不可視行由来の「たまたま一致」の件数がちょうど境界未満なら、規約違反の構築でも
-    // 拒否は発生しない——エラー発生有無そのものが不可視データの正確な件数に左右される
-    // ことの再確認（1 件でも境界を割ればエラーが消える）。
+    // 不可視行由来の「たまたま一致」の件数がちょうど境界未満なら、対照版の構築でも
+    // 拒否は発生しない（1 件でも境界を割ればエラーが消えることの再確認）。
     naive_ids.remove(&(1_000_000 + (MAX_BOOST_IDS as u64 - 1)));
     assert_eq!(naive_ids.len(), MAX_BOOST_IDS);
     assert!(BoostRule::new(&naive_ids, RANK3_TOP_K_ENTRY_BOOST).is_ok());
