@@ -3,10 +3,10 @@
 //!
 //! 責務境界: クエリ単位の `USING MODE` 句・セッション変数 `SET search_mode`
 //! （いずれも [`allowlist`](crate::sql::allowlist) が構文として受理し、生のリテラル
-//! 文字列を返す）から得られる値を、優先順位（クエリ句 > セッション変数 >
-//! プランナー推定 > 既定）に従って決定的に解決する（[`resolve_mode_with_planner`]。
-//! プランナー推定は `query_planner.rs::QueryExpansion::mode_hint` 由来。TASK-164・
-//! PLAN-11）。解決結果（[`ResolvedMode`]）は
+//! 文字列を返す）から得られる値と、`query_planner.rs::QueryExpansion::mode_hint`
+//! 由来のプランナー推定を [`resolve_mode_with_planner`] が決定的に解決する
+//! （優先順位・fail-safe の解決契約は spec のビヘイビア定義〔TASK-164・PLAN-11〕を
+//! 参照）。解決結果（[`ResolvedMode`]）は
 //! [`parser::BoundStatement`](crate::sql::parser::BoundStatement)
 //! （`bind_with_session`）が保持する。SQL 表層はプランナー推定の結線を持たない
 //! （TASK-77/78 の管轄）ため、そちらは引き続き [`resolve_mode`]（2 引数版）を呼ぶ。
@@ -56,9 +56,9 @@ impl SearchMode {
     }
 }
 
-/// 実効モードの指定元。優先順位は **クエリ句 > セッション変数 > プランナー推定 >
-/// 既定** の 4 段（TASK-164・PLAN-11 で `PlannerEstimate` を追加し確定。
-/// `#[non_exhaustive]` により TASK-161 時点で確保していた拡張点を実際に使用した）。
+/// 実効モードの指定元（4 値。TASK-164・PLAN-11 で `PlannerEstimate` を追加し確定。
+/// `#[non_exhaustive]` により TASK-161 時点で確保していた拡張点を実際に使用した。
+/// 優先順位の解決契約は spec のビヘイビア定義〔PLAN-11〕を参照）。
 ///
 /// **TASK-161 で意図的に付与した破壊的変更（BREAKING CHANGE）**: `#[non_exhaustive]` を
 /// 付与したため、クレート外で本 enum を網羅的に `match` していたコードは
@@ -76,10 +76,8 @@ pub enum ModeSource {
     QueryClause,
     SessionVariable,
     /// LLM クエリプランナー（`query_planner.rs`。TASK-110・PLAN-1）の展開結果に
-    /// 含まれる `mode_hint` を採用した場合の指定元（TASK-164・PLAN-11）。
-    /// クエリ句・セッション変数のいずれも未指定のときにのみ採用される
-    /// （[`resolve_mode_with_planner`] の短絡順序。明示指定をプランナー推定が
-    /// 上書きする経路は構造上存在しない）。
+    /// 含まれる `mode_hint` を採用した場合の指定元（TASK-164・PLAN-11。採用条件は
+    /// [`resolve_mode_with_planner`] のドキュメント参照）。
     PlannerEstimate,
     Default,
 }
@@ -149,20 +147,12 @@ pub fn resolve_mode(query: Option<SearchMode>, session: Option<SearchMode>) -> R
     resolve_mode_with_planner(query, session, None)
 }
 
-/// クエリ句・セッション変数・プランナー推定の 3 系統から実効モードを決定する
-/// （TASK-164・PLAN-11）。優先順位は **クエリ句 > セッション変数 > プランナー推定 >
-/// 既定（`recall`）**。
-///
-/// 短絡順序で判定するため、クエリ句またはセッション変数が `Some` の時点で
-/// `planner` を一切読まない構造になっている（明示指定をプランナー推定が上書きする
-/// 経路が構造上存在しないことの担保。security.md「不安全な設計」の裏返し:
-/// 推定はユーザーの明示指定より強い扱いにしない）。
-///
-/// `planner`（`query_planner.rs::QueryExpansion::mode_hint` 由来）が `None`
-/// （推定不確実・応答パース段での fail-safe 化を含む）の場合は次の優先順位
-/// （既定）へフォールスルーする。プランナー推定の不正値を `recall` へ丸める
-/// fail-safe の判断は `query_planner::parse_expansion` 側が担い、本関数は既に
-/// 検証済みの `Option<SearchMode>` を受け取るだけの契約とする。
+/// クエリ句・セッション変数・プランナー推定の 3 系統から実効モードを短絡順序で
+/// 決定的に解決する（TASK-164・PLAN-11。解決契約〔優先順位・fail-safe 方針〕は
+/// spec のビヘイビア定義〔PLAN-11〕を参照）。`planner`
+/// （`query_planner.rs::QueryExpansion::mode_hint` 由来。不正値の丸めは
+/// `query_planner::parse_expansion` 側が担う）は既に検証済みの
+/// `Option<SearchMode>` を受け取るだけの契約とする。
 pub fn resolve_mode_with_planner(
     query: Option<SearchMode>,
     session: Option<SearchMode>,
@@ -324,8 +314,8 @@ mod tests {
         assert_eq!(ModeSource::Default.as_str(), "default");
     }
 
-    // TASK-164・PLAN-11: query × session × planner の全 8 組合せで優先順位
-    // （クエリ句 > セッション変数 > プランナー推定 > 既定）と `source` を検査する。
+    // TASK-164・PLAN-11: query × session × planner の全 8 組合せで解決結果と
+    // `source` を検査する（解決契約は spec のビヘイビア定義〔PLAN-11〕参照）。
     #[test]
     fn resolve_mode_with_planner_query_session_planner_all_set_query_wins() {
         let resolved = resolve_mode_with_planner(

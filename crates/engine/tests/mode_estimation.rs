@@ -4,9 +4,8 @@
 //!
 //! `tests/query_planner.rs`（TASK-110）と同じ流儀（`unique_db_path` / `CleanupGuard`、
 //! 実 `Storage` 上にテーブルを構築、固定 JSON を返すモック `LlmClient` を注入）で、
-//! クエリ句・セッション変数・プランナー推定の優先順位解決（クエリ句が最優先・次点で
-//! セッション変数・その次にプランナー推定・最後に既定）と、プランナー推定が不確実・
-//! 失敗した場合の `recall` への fail-safe を検証する。
+//! クエリ句・セッション変数・プランナー推定の解決結果（`sql/mode.rs::resolve_mode_with_planner`
+//! の解決契約は spec のビヘイビア定義〔PLAN-11〕を参照）を検証する。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CoreError, EngineCore};

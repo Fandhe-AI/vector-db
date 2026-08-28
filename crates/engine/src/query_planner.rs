@@ -33,11 +33,9 @@
 //! - 未知フィールドは無視するが、`search_terms`・`path_hint`・`kind_hint` の型不一致・
 //!   欠落・上限超過は [`PlanError::InvalidResponse`] として応答全体を拒否する
 //!   （切り詰めではなく拒否。不完全な展開結果を正常応答として黙って返さない）。
-//!   **`mode` フィールドのみこの契約の例外**（TASK-164・PLAN-11）: モードは補助情報
-//!   であり、推定の欠落・失敗をクエリ全体の失敗へ昇格させない fail-safe 方針のため、
-//!   キー欠落・`null`・未知値・型不一致はすべて `mode_hint: None`（→
-//!   `sql::mode::resolve_mode_with_planner` が既定 `recall` へフォールスルー）として
-//!   応答全体は成功させる（詳細は [`QueryExpansion::mode_hint`] のドキュメント参照）。
+//!   **`mode` フィールドのみこの契約の例外**（TASK-164・PLAN-11）。扱いの詳細は
+//!   [`QueryExpansion::mode_hint`] のドキュメント、fail-safe の解決契約は spec の
+//!   ビヘイビア定義〔PLAN-11〕を参照。
 //! - 接続先は既定でループバック（`127.0.0.1`）のみとし、untrusted 入力から
 //!   ホスト・URL を組み立てる経路を持たない（SSRF 対策）。
 //! - `PlanError`・ログ出力にプロンプト本文・LLM 応答本文を含めない（`embedding.rs`
@@ -132,14 +130,9 @@ pub struct QueryExpansion {
     /// LLM による取得モード（`recall`／`precision`）推定（TASK-164・PLAN-11）。
     ///
     /// `crate::sql::mode::resolve_mode_with_planner` へそのまま渡す契約の値。
-    /// **fail-safe な非対称性**（モジュールドキュメント参照）: `search_terms`・
-    /// `path_hint`・`kind_hint` と異なり、LLM 応答の `mode` フィールドが
-    /// キー欠落・`null`・未知値・型不一致のいずれであっても [`parse_expansion`] は
-    /// 応答全体を拒否せず本フィールドを `None` にする。モードは検索結果の広さを
-    /// 左右する補助情報であり、推定の不確実性を `precision` の誤選択（空集合の
-    /// fail-closed 応答）ではなく `recall`（広域）側へ倒す（`resolve_mode_with_planner`
-    /// が `None` を既定 `recall` へフォールスルーする）ことが本タスクの規範であり、
-    /// 展開失敗として扱わない。
+    /// `search_terms`・`path_hint`・`kind_hint` とは異なる非対称な検証方針を持つ
+    /// （[`parse_expansion`] のドキュメント参照）。解決契約の詳細は spec の
+    /// ビヘイビア定義〔PLAN-11〕を参照。
     pub mode_hint: Option<crate::sql::mode::SearchMode>,
 }
 
@@ -197,9 +190,8 @@ pub const MAX_QUESTION_CHARS: usize = 2_000;
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 
 /// LLM へ渡す出力スキーマの指示文（英語固定。プログラム出力文字列は英語の規約）。
-/// `mode` フィールド（TASK-164・PLAN-11）は推定不確実な場合 `null` を返すよう明示し、
-/// 呼び出し元（[`parse_expansion`]）がその `null`／欠落／未知値を等しく
-/// `mode_hint: None` へ fail-safe することと整合させる。
+/// `mode` フィールド（TASK-164・PLAN-11）の扱いは呼び出し元（[`parse_expansion`]）の
+/// ドキュメント参照。
 const INSTRUCTION_HEADER: &str = "You are a query planning assistant for a local vector search \
 engine. Given the dictionary context below and a user question, respond with ONLY a single \
 JSON object (no markdown fences, no extra text before or after) with exactly these fields:\n\
@@ -697,10 +689,9 @@ pub const MAX_HINT_LEN: usize = 256;
 /// いずれも [`PlanError::InvalidResponse`] として応答全体を fail-closed に拒否する
 /// （切り詰めて部分的に受理しない。モジュールドキュメント参照）。
 ///
-/// **`mode` フィールドのみ非対称**（TASK-164・PLAN-11。[`QueryExpansion::mode_hint`]
-/// のドキュメント参照）: キー欠落・`null`・`"recall"`／`"precision"` 以外の未知値・
-/// 型不一致はいずれも応答全体を拒否せず `mode_hint: None` とする（fail-safe。
-/// モードは補助情報であり、推定失敗をクエリ失敗へ昇格させない規範のため）。
+/// **`mode` フィールドのみ非対称**（TASK-164・PLAN-11）: 応答全体を拒否せず
+/// `mode_hint: None` とする扱いの詳細は [`QueryExpansion::mode_hint`] のドキュメント、
+/// fail-safe の解決契約は spec のビヘイビア定義〔PLAN-11〕を参照。
 pub fn parse_expansion(response: &str) -> Result<QueryExpansion, PlanError> {
     let json_text = extract_first_json_object(response).ok_or(PlanError::InvalidResponse)?;
     let value = parse_json(json_text)?;
