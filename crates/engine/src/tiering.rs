@@ -233,7 +233,24 @@ pub fn classify(
     dictionary: &Dictionary,
     criteria: &TieringCriteria,
 ) -> Classification {
-    let degenerate = question.trim().is_empty() || question.chars().count() > MAX_QUESTION_CHARS;
+    // untrusted 入力（wire 経由）に対する走査量の頭打ち契約: 上限超過検知は
+    // `MAX_QUESTION_CHARS + 1` 文字先読みで打ち切り、全体走査を避ける
+    // （codex-review 指摘対応。CPU DoS 経路を防ぐ）。空判定もこの有界走査へ
+    // 統合する: 先読み範囲内に非空白文字が 1 つも無ければ、上限超過であっても
+    // 非超過であっても縮退（空相当）とみなしてよい。上限超過の場合は後続の
+    // `too_long` 判定で既に縮退が確定するため、`is_whitespace` 判定を先読み
+    // 範囲に限定しても classify の結果は元の全体走査版と一致する
+    // （`str::trim` と同じ Unicode 空白判定 `char::is_whitespace` を使う）。
+    let mut bounded_len: usize = 0;
+    let mut has_non_whitespace = false;
+    for c in question.chars().take(MAX_QUESTION_CHARS + 1) {
+        bounded_len += 1;
+        if !c.is_whitespace() {
+            has_non_whitespace = true;
+        }
+    }
+    let too_long = bounded_len > MAX_QUESTION_CHARS;
+    let degenerate = !has_non_whitespace || too_long;
     if degenerate {
         return fail_safe(ClassificationSignal::Degenerate);
     }
@@ -427,6 +444,21 @@ mod tests {
         let criteria = TieringCriteria::default();
         let long_question = "a".repeat(MAX_QUESTION_CHARS + 1);
         let result = classify(&long_question, &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Intent);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::Degenerate);
+    }
+
+    #[test]
+    fn over_limit_whitespace_only_input_fails_safe_to_intent() {
+        // 有界走査へ統合した空判定（`has_non_whitespace`）と上限超過判定
+        // （`too_long`）が独立に効くことを確認する回帰テスト（codex-review P1
+        // 指摘対応: 空白のみで MAX_QUESTION_CHARS を超える入力でも、先読み
+        // 範囲内に非空白が無いまま超過を検出でき、Degenerate へ倒れる）。
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let long_whitespace = " ".repeat(MAX_QUESTION_CHARS + 1);
+        let result = classify(&long_whitespace, &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Intent);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::Degenerate);
