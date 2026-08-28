@@ -19,15 +19,23 @@
 //! 応答パース用の最小 JSON パーサを本モジュール内に閉じて自作する（`dictionary.rs` が
 //! 正規表現を手書きパーサで代替した前例に倣う）。
 //!
+//! `crate::sql::mode::SearchMode` への依存（TASK-164・PLAN-11）: `QueryExpansion::mode_hint`
+//! の型として使う新しい結合。モジュール外部（LLM プロセス・SQL 表層）への結線は
+//! 増やさない `Copy` な 2 値 enum の参照に閉じており、循環依存や責務の逆流は生じない
+//! （`sql::mode` 側は本モジュールを知らない一方向の依存）。
+//!
 //! fail-closed の判断根拠（security.md「不安全な設計」対応）:
 //! - LLM 出力（untrusted）は [`QueryExpansion`] として型付き・上限検証を通過したものだけを
 //!   返す。プロンプトインジェクションで LLM が異常出力しても、影響は検証済みの検索語・
 //!   ソフトヒントに閉じ、SQL・プラン文字列へ未検証のまま連結される経路を持たない
 //!   （ハードフィルタ化しない。呼び出し元がハードフィルタへ昇格させないことは
 //!   TASK-111 側の設計判断）。
-//! - 未知フィールドは無視するが、必須フィールドの型不一致・欠落・上限超過は
-//!   [`PlanError::InvalidResponse`] として応答全体を拒否する（切り詰めではなく拒否。
-//!   不完全な展開結果を正常応答として黙って返さない）。
+//! - 未知フィールドは無視するが、`search_terms`・`path_hint`・`kind_hint` の型不一致・
+//!   欠落・上限超過は [`PlanError::InvalidResponse`] として応答全体を拒否する
+//!   （切り詰めではなく拒否。不完全な展開結果を正常応答として黙って返さない）。
+//!   **`mode` フィールドのみこの契約の例外**（TASK-164・PLAN-11）。扱いの詳細は
+//!   [`QueryExpansion::mode_hint`] のドキュメント、fail-safe の解決契約は spec の
+//!   ビヘイビア定義〔PLAN-11〕を参照。
 //! - 接続先は既定でループバック（`127.0.0.1`）のみとし、untrusted 入力から
 //!   ホスト・URL を組み立てる経路を持たない（SSRF 対策）。
 //! - `PlanError`・ログ出力にプロンプト本文・LLM 応答本文を含めない（`embedding.rs`
@@ -103,7 +111,14 @@ pub trait LlmClient: Send + Sync {
 
 /// クエリ展開結果。あくまでソフトな補助情報であり、ハードフィルタ化はしない
 /// （TASK-111 のソフトブースト機構でも同様。本モジュールのドキュメント参照）。
+///
+/// **TASK-164（PLAN-11）で意図的に付与した破壊的変更（BREAKING CHANGE）**:
+/// `mode_hint` フィールド追加に合わせ `#[non_exhaustive]` を付与した。クレート外で
+/// 構造体リテラルを構築していたコードは `QueryExpansion::default()` ＋フィールド
+/// 代入形式へ変更が必須になる（`sql::mode::ResolvedMode` と同種の拡張点保護。
+/// PR #188 の前例に倣う）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QueryExpansion {
     /// 展開された検索語。件数上限は [`MAX_SEARCH_TERMS`]、各語の長さ上限は
     /// [`MAX_TERM_LEN`] 文字。
@@ -112,6 +127,48 @@ pub struct QueryExpansion {
     pub path_hint: Option<String>,
     /// シンボル種別のソフトヒント（例: "fn"・"struct"）。
     pub kind_hint: Option<String>,
+    /// LLM による取得モード（`recall`／`precision`）推定（TASK-164・PLAN-11）。
+    ///
+    /// `crate::sql::mode::resolve_mode_with_planner` へそのまま渡す契約の値。
+    /// `search_terms`・`path_hint`・`kind_hint` とは異なる非対称な検証方針を持つ
+    /// （[`parse_expansion`] のドキュメント参照）。解決契約の詳細は spec の
+    /// ビヘイビア定義〔PLAN-11〕を参照。
+    pub mode_hint: Option<crate::sql::mode::SearchMode>,
+}
+
+/// [`QueryExpansion`] とその `mode_hint` を明示指定（クエリ句・セッション変数）と
+/// 突き合わせて解決した実効モードの組（TASK-164・PLAN-11）。
+///
+/// `core.rs::EngineCore::plan_query_with_mode` が構築する。`EXPLAIN`（TASK-78・SQL-6）
+/// が採用モード・指定元を可視化する際に読むためのデータを提供するところまでが
+/// 本タスクの範囲で、`EXPLAIN` 自体の wire 応答形式・SQL 構文結線
+/// （`USING PLAN`。TASK-77）はここでは扱わない。
+///
+/// `#[non_exhaustive]`: [`ResolvedMode`](crate::sql::mode::ResolvedMode) と同様の
+/// 拡張点保護。将来フィールドを追加してもクレート外の構造体リテラル構築を壊さない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PlannedQuery {
+    expansion: QueryExpansion,
+    mode: crate::sql::mode::ResolvedMode,
+}
+
+impl PlannedQuery {
+    /// `core.rs::EngineCore::plan_query_with_mode` からのみ構築される想定
+    /// （展開結果とモード解決を同じ呼び出しの中で対にするため）。
+    pub(crate) fn new(expansion: QueryExpansion, mode: crate::sql::mode::ResolvedMode) -> Self {
+        Self { expansion, mode }
+    }
+
+    /// LLM クエリ展開結果（検索語・ソフトヒント・生の `mode_hint`）。
+    pub fn expansion(&self) -> &QueryExpansion {
+        &self.expansion
+    }
+
+    /// クエリ句・セッション変数・プランナー推定を優先順位に従って解決した実効モード。
+    pub fn mode(&self) -> crate::sql::mode::ResolvedMode {
+        self.mode
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,12 +190,16 @@ pub const MAX_QUESTION_CHARS: usize = 2_000;
 pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 
 /// LLM へ渡す出力スキーマの指示文（英語固定。プログラム出力文字列は英語の規約）。
+/// `mode` フィールド（TASK-164・PLAN-11）の扱いは呼び出し元（[`parse_expansion`]）の
+/// ドキュメント参照。
 const INSTRUCTION_HEADER: &str = "You are a query planning assistant for a local vector search \
 engine. Given the dictionary context below and a user question, respond with ONLY a single \
 JSON object (no markdown fences, no extra text before or after) with exactly these fields:\n\
   \"search_terms\": an array of short search keyword strings\n\
   \"path_hint\": a file path substring hint, or null\n\
   \"kind_hint\": a symbol kind hint such as \"fn\" or \"struct\", or null\n\
+  \"mode\": \"precision\" if the question asks for a specific, pinpoint answer, \"recall\" if \
+it asks for broad or exploratory results, or null if unsure\n\
 Do not include any explanation outside the JSON object.\n";
 
 /// `out` の末尾へ `s` を追加する。追加後のバイト長が [`MAX_PROMPT_PREFIX_BYTES`] を
@@ -334,8 +395,14 @@ pub fn reembed_expansion(
 
 /// [`crate::core::EngineCore::plan_and_embed_query`] の戻り値。LLM 展開結果と、
 /// [`reembed_expansion`] による再埋め込みベクトルの組。
+///
+/// モード解決結果を運ぶ [`PlannedQuery`]（TASK-164・PLAN-11）とは別の構造体
+/// （名称衝突を避けるため `EmbeddedQuery` とした。両者は独立した呼び出し経路
+/// （[`crate::core::EngineCore::plan_query_with_mode`] と
+/// [`crate::core::EngineCore::plan_and_embed_query`]）が返す異なる戻り値であり、
+/// 統合の要否は spec 側の判断に委ねる）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct PlannedQuery {
+pub struct EmbeddedQuery {
     pub expansion: QueryExpansion,
     pub embedding: Vec<f32>,
 }
@@ -731,6 +798,10 @@ pub const MAX_HINT_LEN: usize = 256;
 /// `path_hint`・`kind_hint` の型不一致・欠落（キー自体が存在しない）・上限超過は
 /// いずれも [`PlanError::InvalidResponse`] として応答全体を fail-closed に拒否する
 /// （切り詰めて部分的に受理しない。モジュールドキュメント参照）。
+///
+/// **`mode` フィールドのみ非対称**（TASK-164・PLAN-11）: 応答全体を拒否せず
+/// `mode_hint: None` とする扱いの詳細は [`QueryExpansion::mode_hint`] のドキュメント、
+/// fail-safe の解決契約は spec のビヘイビア定義〔PLAN-11〕を参照。
 pub fn parse_expansion(response: &str) -> Result<QueryExpansion, PlanError> {
     let json_text = extract_first_json_object(response).ok_or(PlanError::InvalidResponse)?;
     let value = parse_json(json_text)?;
@@ -767,12 +838,26 @@ pub fn parse_expansion(response: &str) -> Result<QueryExpansion, PlanError> {
 
     let path_hint = parse_optional_hint(map.get("path_hint"))?;
     let kind_hint = parse_optional_hint(map.get("kind_hint"))?;
+    let mode_hint = parse_optional_mode(map.get("mode"));
 
     Ok(QueryExpansion {
         search_terms,
         path_hint,
         kind_hint,
+        mode_hint,
     })
+}
+
+/// `mode` フィールドの fail-safe パース（TASK-164・PLAN-11）。
+/// `path_hint`/`kind_hint`（[`parse_optional_hint`]）と異なり `Result` を返さない:
+/// キー欠落・`null`・`"recall"`／`"precision"` 以外の値（未知の文字列・数値・真偽値等）
+/// は区別なくすべて `None` を返し、応答全体を拒否しない（[`parse_expansion`]・
+/// [`QueryExpansion::mode_hint`] のドキュメント参照）。
+fn parse_optional_mode(value: Option<&JsonValue>) -> Option<crate::sql::mode::SearchMode> {
+    match value {
+        Some(JsonValue::String(s)) => crate::sql::mode::SearchMode::parse_literal(s).ok(),
+        _ => None,
+    }
 }
 
 /// `path_hint`/`kind_hint` 共通の検証: キー自体が存在しない場合は拒否
@@ -1548,6 +1633,7 @@ mod tests {
             search_terms: vec!["batch".to_string(), "cache".to_string()],
             path_hint: Some("src/".to_string()),
             kind_hint: Some("fn".to_string()),
+            ..Default::default()
         }
     }
 
@@ -1577,6 +1663,7 @@ mod tests {
             search_terms: vec![],
             path_hint: None,
             kind_hint: None,
+            ..Default::default()
         };
         let text = render_reembedding_text("bare question", &expansion);
         assert_eq!(text, "search_query: bare question");
@@ -1607,6 +1694,7 @@ mod tests {
             search_terms: vec!["term".to_string()],
             path_hint: Some("should/not/appear.rs".to_string()),
             kind_hint: Some("struct".to_string()),
+            ..Default::default()
         };
         let text = render_reembedding_text("q", &expansion);
         assert!(!text.contains("should/not/appear.rs"));
@@ -1622,6 +1710,7 @@ mod tests {
             search_terms: vec!["t".repeat(MAX_TERM_LEN + 50); MAX_SEARCH_TERMS + 10],
             path_hint: None,
             kind_hint: None,
+            ..Default::default()
         };
         let text = render_reembedding_text("q", &expansion);
         let term_count = text
