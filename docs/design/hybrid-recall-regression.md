@@ -231,7 +231,9 @@ PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に�
   以降）が含まれるが未実装のため、本ハーネスはハイブリッド検索単体（クエリ展開なし）
   の測定に留める
 - Actions variables（`HYBRID_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
-  作業（README「Recall 回帰ハーネスの repo variables」参照）
+  作業（README「Recall 回帰ハーネスの repo variables」参照。variable ↔ spec
+  ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
+  Issue #286）
 
 [`SparseIndex::build`]: ../../crates/engine/src/sparse.rs
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs

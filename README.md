@@ -64,6 +64,10 @@ psycopg・node pg から無改造で cleartext password 認証つき接続でき
 
 ### 回帰ベンチの repo variables（TASK-127）
 
+variable ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
+に集約しています（Issue #286。値の実設定は引き続きマージ後の管理者作業。
+`PRECISION_EVAL_*`〔TASK-163〕は目標値未確定のため未設定のままです）。
+
 `.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）・`BENCH_MAX_CONTRAST_RATIO`（対照エンジンに対する p95 レイテンシ比率〔被検/対照〕の上限・TASK-127 CORE-5）をリポジトリの Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
@@ -137,6 +141,9 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契約（成功系・fail-closed 系・RLS 不変）は `crates/wire-server/tests/wire_using_plan.rs`（`make ci` 対象）が決定的スタブで検証します。実 Ollama・実クライアント 3 種（psql／psycopg／pg）を使った PLAN-9 数値基準の実測ハーネスは本リポジトリでは未整備です（TASK-116 の `make bench-tier` と同様の運用者実行手順が必要になる見込み。整備は別タスクとして追跡してください）。
 
 ### Recall 回帰ハーネスの repo variables（TASK-104）
+
+variable ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
+に集約しています（Issue #286。値の実設定は引き続きマージ後の管理者作業）。
 
 `.github/workflows/recall.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 04:00 UTC。`pull_request` トリガは意図的に持たせていません）は `crates/engine/tests/hybrid_recall.rs` の層 B（`#[ignore]` 付き閾値ゲート）を `make recall-regression` 経由で実行し、`HYBRID_RECALL_MIN_R20_SMALL`（小規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R20_LARGE`（大規模段 Recall@20 下限）・`HYBRID_RECALL_MIN_R100_LARGE`（大規模段 Recall@100 下限）を GitHub Environment `recall-gate` の Actions variables（`vars.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。各下限値は `hits@k / Σmin(k,正解集合サイズ)`（正解集合が k 件を超えるクエリがあっても頭打ちにならない、達成可能な理論上限に対する到達率）というスケールで設定してください。マージ後、リポジトリ管理者が以下を実行して設定してください（`gh api` または Settings > Environments）。
 

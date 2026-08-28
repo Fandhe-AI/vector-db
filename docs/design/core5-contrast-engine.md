@@ -136,4 +136,5 @@ CORE-3/CORE-4・CORE-6/CORE-16 と同一の「未評価 run が green として�
 - usearch を不採用とする判断があった場合は `harness/contrast.rs` のアダプタ差し替え
   で別クレートへ移行できる構造にしてある
 - `BENCH_MAX_CONTRAST_RATIO` の値設定はマージ後の管理者作業（未設定のまま週次 run が
-  走ると設計どおり fail-closed で red になる）
+  走ると設計どおり fail-closed で red になる。variable ↔ spec ポインタの対応表・
+  設定手順は `docs/design/ci-gate-variables.md` に集約した。Issue #286）
