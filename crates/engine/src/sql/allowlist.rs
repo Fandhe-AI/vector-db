@@ -572,6 +572,14 @@ pub enum Statement {
     /// 集計関数のみを結果列とする `GROUP BY` なし・単一行結果の `SELECT`
     /// （TASK-166・SQL-13。C6a）。`FROM` 単一テーブルのカタログ存在確認を通過済み。
     Aggregate(ValidatedAggregate),
+    /// `EXPLAIN SELECT ... USING PLAN('<query>') ...`（TASK-78・SQL-6）。`USING PLAN`
+    /// を伴う検索 SELECT の前置のみを受理し（`using_plan()` が必ず `Some`）、
+    /// `FROM` 単一テーブルのカタログ存在確認を通過済み。`EXPLAIN` は検索本体を
+    /// 実行しない（LLM クエリ展開・モード解決結果を可視化する応答を構築するのみ。
+    /// `core.rs::EngineCore::execute_sql_in_session` の管轄）。`USING PLAN` を伴わない
+    /// 通常 SELECT・集計・`SET`・`CREATE FUNCTION` への `EXPLAIN` 前置は許可リスト外
+    /// として `42601` で拒否する。
+    Explain(ValidatedStatement),
 }
 
 /// 集計関数の種別（TASK-166・SQL-13）。関数名は [`is_aggregate_function_name`] で
@@ -1863,6 +1871,10 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("SET"));
     let is_create_function_statement =
         matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("CREATE"));
+    // `EXPLAIN` も `SET`・`CREATE` と同方針（字句解析段階のキーワードにせず、
+    // statement 先頭という文脈でのみ大文字小文字を区別せず判定する。TASK-78・SQL-6）。
+    let is_explain_statement =
+        matches!(tokens.first(), Some(Token::Ident(name)) if name.eq_ignore_ascii_case("EXPLAIN"));
     // TASK-166（SQL-13）: `SELECT` の直後（2 番目・3 番目のトークン）が
     // 集計関数名 `'('` なら集計 SELECT 形状（[`parse_aggregate_shape`]）へ、それ
     // 以外は既存の検索 SELECT 形状（[`parse_select_shape`]）へ分岐する。バック
@@ -1920,8 +1932,45 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
             let (name, params, body) = parse_create_function(&tokens)?;
             Ok(Statement::CreateFunction { name, params, body })
         }
+        // TASK-78（SQL-6）: `EXPLAIN` は「`USING PLAN` を伴う検索 SELECT」の前置
+        // のみを受理する（fail-closed。将来の拡張は別タスクの管轄）。先頭の
+        // `EXPLAIN` トークンを消費した残りを既存の検索 SELECT 形状パーサー
+        // （[`parse_select_shape`]）へそのまま渡し、`USING PLAN` を含まない形
+        // （通常 SELECT・`ORDER BY` 経路）は `shape.using_plan` が `None` になる
+        // ことを利用して一律 `42601` へ落とす（集計 SELECT・`SET`・
+        // `CREATE FUNCTION` への前置は残り先頭が `SELECT` キーワードでない、
+        // または集計形状〔`parse_select_shape` が受理しない〕であるため、同じ
+        // `42601` へ自然に落ちる）。
+        _ if is_explain_statement => {
+            let rest = &tokens[1..];
+            if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN requires a SELECT ... USING PLAN(...) statement",
+                ));
+            }
+            let shape = parse_select_shape(rest)?;
+            if shape.using_plan.is_none() {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is only supported for SELECT ... USING PLAN(...) statements",
+                ));
+            }
+            let exists = lookup.table_exists(&shape.table_name)?;
+            if !exists {
+                return Err(SqlSurfaceError::undefined_table(shape.table_name));
+            }
+            Ok(Statement::Explain(ValidatedStatement {
+                table_name: shape.table_name,
+                projection: shape.projection,
+                order_by: shape.order_by,
+                where_predicates: shape.where_predicates,
+                limit: shape.limit,
+                search_mode: shape.search_mode,
+                evaluation_order: shape.evaluation_order,
+                using_plan: shape.using_plan,
+            }))
+        }
         other => Err(SqlSurfaceError::unsupported(format!(
-            "expected SELECT, SET, or CREATE FUNCTION, got {other:?}"
+            "expected SELECT, SET, CREATE FUNCTION, or EXPLAIN, got {other:?}"
         ))),
     }
 }
@@ -1949,6 +1998,13 @@ pub fn validate_statement(
         // `CREATE FUNCTION` と同じ「このエントリポイントでは非対応」の一律 `42601`）。
         Statement::Aggregate(_) => Err(SqlSurfaceError::unsupported(
             "aggregate SELECT is not a search query statement (use a session-aware entry point)",
+        )),
+        // TASK-78（SQL-6）: `EXPLAIN` は `ValidatedStatement` を包んで返すものの、
+        // 「検索本体を実行しない」という別の実行契約を持つため、`SET`・
+        // `CREATE FUNCTION`・`Aggregate` と同じくこのセッションなしエントリ
+        // ポイントでは受理しない（一律 `42601`）。
+        Statement::Explain(_) => Err(SqlSurfaceError::unsupported(
+            "EXPLAIN is not a search query statement (use a session-aware entry point)",
         )),
     }
 }

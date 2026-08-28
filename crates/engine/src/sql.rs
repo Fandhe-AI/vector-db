@@ -87,6 +87,7 @@
 pub mod aggregate;
 pub mod allowlist;
 pub mod exec;
+pub(crate) mod explain;
 pub mod group_by;
 pub mod lexer;
 pub mod mode;
@@ -101,6 +102,10 @@ pub(crate) mod using_plan;
 /// （[`mode::SearchMode`]）そのものを返す。TASK-79（SQL-9）で `CREATE FUNCTION` の
 /// 応答として `CreateFunction` を追加した（**BREAKING CHANGE**: 既存の網羅的
 /// `match` はワイルドカードアームの追加が必要）。
+///
+/// **TASK-78（SQL-6）で追加した破壊的変更（BREAKING CHANGE）**: `Explain`
+/// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
+/// 必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
     Query(exec::QueryResult),
@@ -110,4 +115,8 @@ pub enum SqlOutcome {
     CreateFunction {
         name: String,
     },
+    /// `EXPLAIN SELECT ... USING PLAN(...)`（TASK-78・SQL-6）の応答。検索本体は
+    /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
+    /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。
+    Explain(exec::QueryResult),
 }

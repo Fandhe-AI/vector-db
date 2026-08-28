@@ -1639,7 +1639,8 @@ impl EngineCore {
                 match self.execute_sql_in_session(ctx, &mut session, sql)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
-                    | crate::sql::SqlOutcome::CreateFunction { .. } => {
+                    | crate::sql::SqlOutcome::CreateFunction { .. }
+                    | crate::sql::SqlOutcome::Explain(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -1658,13 +1659,23 @@ impl EngineCore {
                 match self.execute_sql_in_session(ctx, &mut session, sql)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
-                    | crate::sql::SqlOutcome::CreateFunction { .. } => {
+                    | crate::sql::SqlOutcome::CreateFunction { .. }
+                    | crate::sql::SqlOutcome::Explain(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
                         })
                     }
                 }
+            }
+            // TASK-78（SQL-6）: `EXPLAIN` は検索本体を実行しない別の応答形
+            // （`SqlOutcome::Explain`）を返すため、`QueryResult` のみを返す本
+            // エントリポイントでは受理しない（`SET`・`CREATE FUNCTION` と同じ
+            // 「値の妥当性に関わらず一律 `42601`」の決定的な契約を踏襲する）。
+            crate::sql::allowlist::Statement::Explain(_) => {
+                Err(crate::sql::allowlist::SqlSurfaceError::unsupported(
+                    "EXPLAIN requires a session-aware entry point",
+                ))
             }
         }
     }
@@ -1986,6 +1997,57 @@ impl EngineCore {
                 let result =
                     crate::sql::aggregate::execute_aggregate(&read_txn, ctx, &schema, &bound)?;
                 Ok(crate::sql::SqlOutcome::Query(result))
+            }
+            // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
+            // （ハイブリッド実行）を実行しない。行うのは LIMIT 範囲検証 →
+            // `USING MODE` リテラル検証 → 辞書必須列（`path`/`body`）の事前
+            // スキーマ検証 → LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
+            // までで、すべての拒否を LLM I/O 開始前に完結させる（`Statement::Select`
+            // アームの `USING PLAN` 経路〔PR #266 の是正方針〕を踏襲。
+            // security.md「不安全な設計」対応）。再埋め込み（`Embedder`）は
+            // 応答に不要なため呼ばない（`embedder` 未注入でも `EXPLAIN` 可能）。
+            crate::sql::allowlist::Statement::Explain(validated) => {
+                // `allowlist::validate_sql` は `using_plan` が `Some` の場合のみ
+                // `Statement::Explain` を構築する（`sql::allowlist` モジュール
+                // ドキュメント参照）ため、ここでの `None` 到達は公開 API の誤用
+                // （`ValidatedStatement::new` 等の外部 constructor 経由）時のみの
+                // 防御的経路として fail-closed に拒否する。
+                let question = validated.using_plan().ok_or_else(|| {
+                    crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "EXPLAIN statement missing USING PLAN question".to_string(),
+                    }
+                })?;
+
+                crate::sql::parser::validate_search_limit(validated.limit())?;
+
+                let query_mode = match validated.search_mode() {
+                    Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+                    None => None,
+                };
+
+                let pre_check_schema = {
+                    let (pre_check_txn, schema) =
+                        self.read_txn_with_schema(validated.table_name())?;
+                    drop(pre_check_txn);
+                    schema
+                };
+                dictionary_required_columns(&pre_check_schema)
+                    .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+                let planned = self
+                    .plan_query_with_mode(
+                        ctx,
+                        validated.table_name(),
+                        question,
+                        query_mode,
+                        session.search_mode(),
+                    )
+                    .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: format!("EXPLAIN query expansion failed: {e}"),
+                    })?;
+
+                let result = crate::sql::explain::build_explain_result(&planned);
+                Ok(crate::sql::SqlOutcome::Explain(result))
             }
         }
     }

@@ -103,8 +103,9 @@ pub(crate) fn execute_and_respond(
     // 限定していたが、この区間全体（＝「outcome を決定する区間」）をブロックで
     // 括ることで、将来この区間内に書き込み系 SQL の分岐が追加されても
     // （`EngineCore::execute_sql_in_session` は現状 `SetSearchMode`・
-    // `CreateFunction`・`Select`・`Aggregate` の読み取り専用 4 分岐のみで
-    // commit を伴わない。モジュール冒頭コメント参照）、登録位置を移設せずに
+    // `CreateFunction`・`Select`・`Aggregate`・`Explain`（TASK-78・SQL-6。
+    // 検索本体を実行しない LLM 展開のみの読み取り専用経路）の読み取り専用
+    // 5 分岐のみで commit を伴わない。モジュール冒頭コメント参照）、登録位置を移設せずに
     // そのまま活かせる（codex-review Medium 指摘対応）。区間内で commit 成功後
     // に panic した場合、`engine::recovery::panic_hook` のフックがこの登録済み
     // バイト列を同期的に送出してから abort する（登録が無い・`try_clone` が
@@ -148,7 +149,14 @@ pub(crate) fn execute_and_respond(
     };
 
     match outcome {
-        Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result),
+        Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result, "SELECT"),
+        // TASK-78（SQL-6）: `EXPLAIN` は検索本体を実行しない別応答だが、行の
+        // 形（`QUERY PLAN` 単一列・複数 `Cell::Text` 行）は通常の検索 SELECT と
+        // 同じ `RowDescription`/`DataRow` エンコードを再利用できる（`ColumnMeta`/
+        // `ResultRow` の汎用性による）。CommandComplete タグのみ pg 互換の
+        // `EXPLAIN` に差し替える（`respond_query_result` のタグ引数化。SELECT
+        // との違いはこのタグと呼び出し元の分岐のみ）。
+        Ok(SqlOutcome::Explain(result)) => respond_query_result(stream, &result, "EXPLAIN"),
         Ok(SqlOutcome::SetSearchMode(_)) => match result_encoder::encode_command_complete("SET") {
             Ok(msg) => {
                 write_all(stream, &msg)?;
@@ -202,8 +210,8 @@ pub(crate) fn execute_and_respond(
 /// 同関数は「このスレッドが commit 成功後・応答未確定の区間にあるか
 /// （`engine::recovery::commit_boundary::active_commit_pending_generation` が
 /// `Some`）」かつ「その世代が登録時に捕捉した世代と一致するか」の両方を
-/// 満たす場合にのみ真を返す。`execute_sql_in_session` の 4 分岐
-/// （`SetSearchMode`・`CreateFunction`・`Select`・`Aggregate`）はいずれも
+/// 満たす場合にのみ真を返す。`execute_sql_in_session` の 5 分岐
+/// （`SetSearchMode`・`CreateFunction`・`Select`・`Aggregate`・`Explain`）はいずれも
 /// `engine::recovery::commit_boundary::commit`／`commit_and_finish` を呼ばない
 /// 読み取り専用経路（モジュール冒頭コメント「INSERT は wire 経由では受理
 /// しない」参照）であるため、これらの区間で panic しても commit-pending 世代は
@@ -239,9 +247,15 @@ fn cached_emergency_response_bytes() -> Option<&'static Vec<u8>> {
         .as_ref()
 }
 
+/// 検索 SELECT（`command_tag` = `"SELECT"`）・`EXPLAIN`（`command_tag` =
+/// `"EXPLAIN"`。TASK-78・SQL-6）いずれの応答整形にも使う共通経路。行の
+/// `RowDescription`/`DataRow` エンコードは両者で共通（`ColumnMeta`/`ResultRow`
+/// の汎用性による）。`EXPLAIN` の CommandComplete タグは pg 互換で行数を
+/// 付けない（`"EXPLAIN"` 固定。検索 SELECT は既存どおり `"SELECT <行数>"`）。
 fn respond_query_result(
     stream: &mut TcpStream,
     result: &engine::sql::exec::QueryResult,
+    command_tag: &str,
 ) -> io::Result<()> {
     let row_desc = match result_encoder::encode_row_description(&result.columns) {
         Ok(msg) => msg,
@@ -269,7 +283,11 @@ fn respond_query_result(
         write_all(stream, &data_row)?;
     }
 
-    let tag = format!("SELECT {}", result.rows.len());
+    let tag = if command_tag == "EXPLAIN" {
+        command_tag.to_string()
+    } else {
+        format!("{command_tag} {}", result.rows.len())
+    };
     match result_encoder::encode_command_complete(&tag) {
         Ok(msg) => {
             write_all(stream, &msg)?;
