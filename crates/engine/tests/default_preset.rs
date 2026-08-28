@@ -28,7 +28,7 @@ use engine::dictionary::{DictionaryBuilder, DictionaryConfig};
 use engine::embedding::HashingEmbedder;
 use engine::hybrid::{hybrid_search, RrfConfig};
 use engine::incremental::IncrementalConfig;
-use engine::kernel::{CpuScalarProvider, SearchInput};
+use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::policy::PolicyContext;
 use engine::query_planner::{LlmClient, PlanError};
 use engine::row_codec::Value;
@@ -84,7 +84,8 @@ fn hybrid_table_schema() -> TableSchema {
 /// 既定構成で両チャネルが融合へ寄与していることを確認できるようにする。
 ///
 /// - id=1: キーワード「rust」を含み、かつ密ベクトルもクエリに近い（疎・密ともに当たる）
-/// - id=2: キーワードのみ一致（密ベクトルはクエリから遠い。「疎のみが当てられる文書」）
+/// - id=2: キーワードのみ一致（密ベクトルはクエリから明確に遠い＝負の内積。
+///   「疎のみが当てられる文書」）
 /// - id=3: 密ベクトルのみクエリに近い（テキストに一致語なし。「密のみが当てられる文書」）
 /// - id=4, 100..105: どちらにも当たらないノイズ文書。`LIMIT 4` に対しコーパス総数を
 ///   10 件へ増やすことで `truncate(k)` が実際に候補を絞り込む状況を作り、
@@ -94,10 +95,19 @@ fn hybrid_table_schema() -> TableSchema {
 ///   ノイズ文書の本文は非 NULL に保ち、`sql/exec.rs` の
 ///   `sparse_docs.is_empty()` フォールバック（密のみ経路）ではなく本来比較したい
 ///   `hybrid::hybrid_search` 経路を通す。
+///
+///   id=2 の密ベクトルはクエリ `[1.0, 0.0]` との内積が `-0.5`（ノイズ文書群の内積
+///   `-0.1..=-0.6` の範囲内・かつノイズ上位 2 件より低い）になるよう選んである。
+///   これにより「密のみ」で Top-4 を取ると id=1・id=3・ノイズ上位 2 件が並び、id=2 は
+///   落選する（`dense_only_top_k` で実測して固定する。下記テストの
+///   `assert!(!dense_only_top_k(..).contains(&2), ..)` 参照）。この保証がないと
+///   `sql_ids.contains(&2)` は「密のみの Top-4 に元々含まれていた」ケースと区別が
+///   つかず、hybrid fusion（sparse チャンネルの寄与）が壊れていても検出できない
+///   （Bugbot 指摘・PR #264 review thread 対応）。
 fn hybrid_corpus() -> Vec<(u64, [f32; 2], &'static str)> {
     let mut docs = vec![
         (1u64, [1.0f32, 0.0], "rust vector database search"),
-        (2, [0.0, 1.0], "rust programming language guide"),
+        (2, [-0.5, 0.85], "rust programming language guide"),
         (3, [0.9, 0.1], "completely unrelated topic about gardening"),
         (4, [-1.0, 0.0], "another unrelated topic about cooking"),
     ];
@@ -117,6 +127,27 @@ fn hybrid_corpus() -> Vec<(u64, [f32; 2], &'static str)> {
         ));
     }
     docs
+}
+
+/// `hybrid_corpus()` に対する「密のみ」Top-k ランキングの id 列を、`CpuScalarProvider`
+/// （`kernel.rs` の厳密な総当たり参照実装）で直接計算する。sparse 側を一切経由しない
+/// ため、この結果に id=2 が含まれていれば「id=2 が Top-k に現れる」ことは sparse 融合の
+/// 証拠にならない（Bugbot 指摘対応）。両テストで「id=2 の出現が sparse 融合の証拠として
+/// 有効である」ことをハンドウェーブではなく実測で固定するために使う。
+fn dense_only_top_k(corpus: &[(u64, [f32; 2], &str)], query: &[f32; 2], k: usize) -> Vec<u64> {
+    let ids: Vec<u64> = corpus.iter().map(|(id, ..)| *id).collect();
+    let vectors: Vec<f32> = corpus.iter().flat_map(|(_, emb, _)| *emb).collect();
+    let input = SearchInput {
+        ids: &ids,
+        vectors: &vectors,
+        dim: 2,
+        query,
+        k,
+    };
+    let hits = CpuScalarProvider
+        .search(input)
+        .expect("dense-only baseline search should succeed");
+    hits.iter().map(|h| h.id).collect()
 }
 
 fn seed_hybrid_corpus(storage: &Storage) {
@@ -186,8 +217,20 @@ fn sql_hybrid_query_with_no_additional_config_matches_default_library_level_hybr
         "SQL default hybrid path must match library-level hybrid_search(RrfConfig::default())"
     );
 
+    // 判別力の実測固定（Bugbot 指摘対応）: 「密のみ」の Top-4 に id=2 が含まれないことを
+    // 先に確認する。これがないと下の `sql_ids.contains(&2)` は「密ランキングで元々
+    // Top-4 だった」ケースと区別がつかず、sparse 融合が壊れていても検出できない。
+    let dense_only_ids = dense_only_top_k(&hybrid_corpus(), &[1.0, 0.0], 4);
+    assert!(
+        !dense_only_ids.contains(&2),
+        "test corpus invariant violated: id=2 must NOT be in the dense-only top-4, \
+         otherwise its presence in the hybrid result below has no detection power \
+         for sparse fusion: {dense_only_ids:?}"
+    );
+
     // 密のみ（id=3）・疎のみ（id=2）に強い候補がいずれも Top-k に現れる（両チャネルが
-    // 既定で寄与している = 融合が有効であることの確認）。
+    // 既定で寄与している = 融合が有効であることの確認）。id=2 は上記の通り密のみでは
+    // Top-4 から落選するため、ここに現れることは sparse 融合の寄与の証拠になる。
     assert!(
         sql_ids.contains(&2),
         "sparse-leaning doc must be present: {sql_ids:?}"
@@ -202,9 +245,13 @@ fn sql_hybrid_query_with_no_additional_config_matches_default_library_level_hybr
 fn default_engine_with_no_additional_config_returns_hits_from_both_channels() {
     // 既定 provider（`search_engine::default_engine()`。`EngineCore::open` 経由）を
     // 実際に通すスモークテスト。`CpuScalarProvider` との厳密一致は要求しない
-    // （既定 provider は近似探索のため、`CpuScalarProvider` との完全一致を
-    // 期待するとテスト側が近似許容誤差設計という別の複雑さを持ち込み、かつ
-    // flaky になりうる）。テーブル作成・データ投入は `EngineCore` が storage を
+    // （既定 provider `ParallelSearchProvider`（`search_engine.rs::SearchEngineKind::ParallelBruteForce`）
+    // はマルチスレッド並列の**総当たり**実装であり近似探索ではないが、複数ワーカーの
+    // 部分結果をマージする都合上スコア同点時の順序が `CpuScalarProvider`（単一スレッド
+    // 総当たり）と一致する保証まではない。完全一致を期待するとテスト側が同点順序の
+    // 詳細に依存する別の複雑さを持ち込み、かつ flaky になりうるため、ここでは
+    // 「両チャネルの寄与が Top-k に現れる」ことのみを確認する）。テーブル作成・
+    // データ投入は `EngineCore` が storage を
     // 外へ出さない一方向設計（`core.rs` モジュールドキュメント参照）のため、
     // 同一パスへ先に `Storage::open` で投入してから close し、`EngineCore::open`
     // で同じパスを再オープンする（`tests/extensions.rs` の close/reopen 手法と同じ）。
@@ -228,6 +275,19 @@ fn default_engine_with_no_additional_config_returns_hits_from_both_channels() {
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
 
     assert!(ids.len() <= 4, "hit count must not exceed LIMIT: {ids:?}");
+
+    // 判別力の実測固定（Bugbot 指摘対応。上の SQL 表層テストと同じ理由）: 「密のみ」の
+    // Top-4 に id=2 が含まれないことを先に確認する。これがないと下の
+    // `ids.contains(&2)` は密ランキングでたまたま Top-4 だったケースと区別がつかず、
+    // 既定エンジン経路で sparse 融合が壊れている／skip されていても検出できない。
+    let dense_only_ids = dense_only_top_k(&hybrid_corpus(), &[1.0, 0.0], 4);
+    assert!(
+        !dense_only_ids.contains(&2),
+        "test corpus invariant violated: id=2 must NOT be in the dense-only top-4, \
+         otherwise its presence in the default-engine result below has no detection \
+         power for sparse fusion: {dense_only_ids:?}"
+    );
+
     assert!(
         ids.contains(&2),
         "sparse-leaning doc must be present via the default engine: {ids:?}"
@@ -287,6 +347,30 @@ fn sql_query_with_no_set_search_mode_resolves_to_default_recall_behavior() {
         .expect("plain SELECT with no mode configuration should succeed under default recall");
     let ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![1, 2]);
+
+    // 上の 2 件一致だけでは「既定が precision に化けても検出できない」（codex-review
+    // P2 指摘・PR #264 対応）: precision モードは既定 `PrecisionPolicy::default()`
+    // （`precision.rs::DEFAULT_MAX_RESULTS = 1`）により常に高々 1 件しか返さない。
+    // 同一クエリを `USING MODE 'precision'` で明示実行し、件数が 1 件以下（＝上の
+    // 2 件一致とは構造的に両立し得ない）であることを確認することで、上の結果が
+    // 「たまたま precision でも 2 件返る」ケースではなく実際に recall 経路を
+    // 通っていることの識別力を持たせる。
+    let precision_result = core
+        .execute_sql(
+            &ctx,
+            "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 2 USING MODE 'precision'",
+        )
+        .expect("explicit precision mode should succeed");
+    assert!(
+        precision_result.rows.len() <= 1,
+        "precision mode must return at most DEFAULT_MAX_RESULTS=1 row, proving it is \
+         distinguishable from the 2-row default (recall) result above: {:?}",
+        precision_result
+            .rows
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    );
 }
 
 // --- PLAN-5: シンボル辞書が既定で必須構築されること ----------------------------------
