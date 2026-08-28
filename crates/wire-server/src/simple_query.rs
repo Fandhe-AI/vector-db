@@ -84,12 +84,67 @@ pub(crate) fn execute_and_respond(
         return crate::handshake::write_ready_for_query_io(stream);
     }
 
+    // TASK-97（対象ビヘイビア: RECOVER-6・ERR-1、codex-review Medium 指摘対応・
+    // PR #90）: 登録はブロックスコープで「outcome を決定する区間」だけを覆う
+    // ―― ブロック終端（`engine.execute_sql_in_session` の呼び出し直後）で
+    // レキシカルに drop され、以降の応答書き込み（`match outcome { .. }` 側）
+    // には一切及ばない。これは構造的な安全境界であり、外してはならない ――
+    // 将来 commit を伴う書き込み経路が接続された場合、応答書き込みの途中
+    // （例: `respond_query_result` が行を書き出している最中）で panic すると、
+    // その時点で commit は既に pending 済みのため、もし登録がまだ有効なら
+    // 緊急応答バイト列が「書きかけの通常応答フレームの上に」追記されてしまう
+    // （[`EmergencyResponseRegistration`] のドキュメントが警告する
+    // 「フレーム途中への緊急応答混入・二重応答」そのもの）。`must_use` の
+    // 束縛忘れ検出を利用し、`let _ =` に書き換えて即座に drop してしまう事故を
+    // 防ぐため、束縛名を `_emergency_registration` とし、`drop()` の明示呼び出し
+    // には頼らずブロックの終わりに任せる（呼び出し忘れの手動 `drop` はその後に
+    // コードが追加されると孤立しうるが、ブロックスコープはコードの追加位置に
+    // 関わらず構造的に保たれる）。
+    //
+    // 以前は登録を `engine.execute_sql_in_session` の呼び出し 1 行だけに
+    // 限定していたが、この区間全体（＝「outcome を決定する区間」）をブロックで
+    // 括ることで、将来この区間内に書き込み系 SQL の分岐が追加されても
+    // （`EngineCore::execute_sql_in_session` は現状 `SetSearchMode`・
+    // `CreateFunction`・`Select`・`Aggregate` の読み取り専用 4 分岐のみで
+    // commit を伴わない。モジュール冒頭コメント参照）、登録位置を移設せずに
+    // そのまま活かせる（codex-review Medium 指摘対応）。区間内で commit 成功後
+    // に panic した場合、`engine::recovery::panic_hook` のフックがこの登録済み
+    // バイト列を同期的に送出してから abort する（登録が無い・`try_clone` が
+    // 失敗した場合は登録せず、既存の接続断側〔RECOVER-5 の abort バック
+    // ストップ〕へ fail-closed に倒す）。
+    //
+    // 応答バイト列の内容は `WireError::internal()` の固定文言のみに依存し
+    // クエリごとに変化しないため、初回呼び出し時に一度だけ構築してキャッシュ
+    // する（[`cached_emergency_response_bytes`] 参照。毎クエリの
+    // `WireError::internal()` 構築・エンコード・アロケーションを避ける
+    // ―― codex-review Medium 指摘対応）。write timeout も登録時に固定ソケット
+    // へ設定せず、`EMERGENCY_RESPONSE_WRITE_TIMEOUT` の値を `register` へ
+    // そのまま渡し、panic フック内で緊急応答を書き込む直前にのみ設定する
+    // （`panic_hook` モジュールドキュメント参照）。これにより、登録スコープを
+    // 抜けた後に `limits::READ_TIMEOUT` へ明示的に復元する処理も不要になった
+    // （以前は登録中だけ短いタイムアウトを即時設定していたため必要だった）。
+    //
     // `INSERT` は engine の許可リスト（`sql::allowlist::validate_sql`）が
     // 受理しない構文のため、他の許可外構文と同じ `execute_sql_in_session` へ
     // そのまま渡す（`42601` で fail-closed に拒否される。モジュール冒頭コメント
     // 参照）。wire 層でここを分岐して `execute_insert_sql` へ振り分けることは
     // 意図的に行わない。
-    match engine.execute_sql_in_session(ctx, session, sql) {
+    let outcome = {
+        let _emergency_registration =
+            cached_emergency_response_bytes().and_then(|response_bytes| {
+                let clone = stream.try_clone().ok()?;
+                Some(
+                    engine::recovery::panic_hook::EmergencyResponseRegistration::register(
+                        response_bytes.clone(),
+                        clone,
+                        crate::limits::EMERGENCY_RESPONSE_WRITE_TIMEOUT,
+                    ),
+                )
+            });
+        engine.execute_sql_in_session(ctx, session, sql)
+    };
+
+    match outcome {
         Ok(SqlOutcome::Query(result)) => respond_query_result(stream, &result),
         Ok(SqlOutcome::SetSearchMode(_)) => match result_encoder::encode_command_complete("SET") {
             Ok(msg) => {
@@ -117,6 +172,46 @@ pub(crate) fn execute_and_respond(
         }
         Err(e) => respond_error_and_ready(stream, e.wire_code(), &e.client_message()),
     }
+}
+
+/// 緊急応答（TASK-97・RECOVER-6）の事前エンコード済みバイト列を組み立てる。
+///
+/// 既存の 3 フィールド契約（`S`/`C`/`M`）のみの ErrorResponse を送出する
+/// （codex-review P1・PR #253 指摘対応）。ERR-1（commit 成功境界を跨いだ panic
+/// の観測可能性）が本来運びたい「commit は成功しているかもしれない」という
+/// 状態情報は、spec 側でワイヤ形式（運搬フィールド・値）が未確定のため、暫定
+/// 形式をこのクライアント向け送出経路へ接続しない ―― クライアントは
+/// 通常の内部エラー応答（`wire_code`・固定文言）と同じ 3 フィールドの
+/// ErrorResponse を受け取り、少なくとも「接続断ではなく明示的なエラー応答」を
+/// 同期的に観測できる（RECOVER-6 が防ぐ「サイレントな接続断」は引き続き回避
+/// する）。ERR-1 のワイヤ形式が spec 側で確定した後、その契約どおりに
+/// detail フィールドを追加する（`result_encoder.rs` の該当 NOTE 参照）。
+///
+/// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
+/// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
+/// 持たない）。
+fn build_emergency_response_bytes(
+    internal_error: &engine::error_format::WireError,
+) -> Result<Vec<u8>, result_encoder::EncodeError> {
+    result_encoder::encode_error_response(internal_error.wire_code(), internal_error.message())
+}
+
+/// [`build_emergency_response_bytes`] の結果をプロセス生存期間でキャッシュする
+/// （TASK-97・RECOVER-6、codex-review Medium 指摘対応・PR #90）。
+///
+/// `WireError::internal()` の固定文言のみに依存し、クエリごとに内容が変わらない
+/// ため、初回呼び出し時に一度だけ構築する。以降の呼び出しは `OnceLock` の読み取り
+/// のみで、`WireError::internal()` の構築・エンコード・アロケーションを毎クエリ
+/// 発生させない。エンコード自体が失敗した場合（通常発生しない想定）は `None` を
+/// キャッシュし、以降も緊急応答チャネルへ登録しない側（fail-closed）に倒れる。
+fn cached_emergency_response_bytes() -> Option<&'static Vec<u8>> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let internal_error = engine::error_format::WireError::internal();
+            build_emergency_response_bytes(&internal_error).ok()
+        })
+        .as_ref()
 }
 
 fn respond_query_result(
