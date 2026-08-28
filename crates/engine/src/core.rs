@@ -1438,6 +1438,42 @@ impl EngineCore {
     /// `SET search_mode = '<literal>'` はリテラル値が `recall`／`precision` のいずれか
     /// である場合にのみ `session` を更新する（検証→代入の順）。失敗した `SET` は
     /// `session` を一切変更しない（部分更新＝黙った既定化と同種の fail-open を防ぐ）。
+    /// `table_name` の `read_txn` を新規に開き、同一スナップショット上でスキーマを
+    /// 取得して両方を返す（[`Self::execute_sql_in_session`] の各 `Statement` アームが
+    /// 共有する定型処理）。呼び出し元は返した `read_txn` を、必要な処理
+    /// （束縛・`execute_statement`）が終わるまでにドロップしてよい――本メソッド自体は
+    /// 開いた `read_txn` を長時間保持しない（`USING PLAN` 経路が LLM 呼び出し・
+    /// 再埋め込みの間 `read_txn` を保持しないようにする分割の一部。呼び出し元の
+    /// モジュールドキュメント参照）。テーブル不存在は
+    /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] へ丸め込む。
+    fn read_txn_with_schema(
+        &self,
+        table_name: &str,
+    ) -> Result<
+        (redb::ReadTransaction, crate::catalog::TableSchema),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let read_txn = self.storage.db().begin_read().map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!(
+                    "failed to begin read transaction: {}",
+                    StorageError::from(e)
+                ),
+            }
+        })?;
+        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table_name).map_err(
+            |e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to load table schema: {other}"),
+                },
+            },
+        )?;
+        Ok((read_txn, schema))
+    }
+
     pub fn execute_sql_in_session(
         &self,
         ctx: &PolicyContext,
@@ -1460,39 +1496,43 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }
             crate::sql::allowlist::Statement::Select(validated) => {
-                let read_txn = self.storage.db().begin_read().map_err(|e| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!(
-                            "failed to begin read transaction: {}",
-                            StorageError::from(e)
-                        ),
-                    }
-                })?;
-                let schema =
-                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
-                            }
-                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to load table schema: {other}"),
-                            },
-                        })?;
                 // TASK-77（SQL-5）: `USING PLAN('<query>')` は `ORDER BY` の代替
                 // （相互排他）のため、`validated.using_plan()` の有無で束縛経路を
                 // 分岐する。この経路は `sql::parser::bind_in_session` を呼ばない
                 // （`bind_ranking` が `OrderByForm::UsingPlan` を防御的に拒否する
                 // ことと対になる：正規の分岐は必ずここで行われる）。
-                let bound = if let Some(question) = validated.using_plan() {
-                    self.bind_using_plan(ctx, session, &validated, &schema, question)?
+                //
+                // `USING PLAN` 経路は `bind_using_plan` 内で LLM 呼び出し・
+                // 再埋め込み（`plan_query`・`Embedder::embed_batch`）という
+                // 長時間の I/O を行う。この I/O の間、`execute_statement` 用の
+                // `read_txn` を保持し続けると、redb のスナップショットが I/O 完了
+                // まで固定され続けページ回収不能になるうえ、`plan_query` が内部で
+                // 取得する `dictionary_snapshot` が後続のハイブリッドスキャンと
+                // 異なる世代のデータを読む可能性がある（Cursor Bugbot Medium
+                // 指摘対応）。そのため `USING PLAN` の束縛（`bind_using_plan`）は
+                // 短命な `read_txn`（[`Self::read_txn_with_schema`]）で取得した
+                // スキーマを使って `execute_statement` 用の `read_txn` を開く前に
+                // 完了させ、`execute_statement` 直前に改めて `read_txn` とスキーマを
+                // 取り直す（他経路と同じく bind～execute は単一スナップショットへ
+                // 閉じ込める。束縛完了後・実行直前の間に DDL が挟まった場合の
+                // 整合は `execute_statement` 側の検証に委ねる）。
+                let bound_result = if let Some(question) = validated.using_plan() {
+                    let (_, plan_schema) = self.read_txn_with_schema(&validated.table_name)?;
+                    let bound =
+                        self.bind_using_plan(ctx, session, &validated, &plan_schema, question)?;
+                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                    (read_txn, schema, bound)
                 } else {
-                    crate::sql::parser::bind_in_session(
+                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                    let bound = crate::sql::parser::bind_in_session(
                         &validated,
                         &schema,
                         session.search_mode(),
                         session.udfs(),
-                    )?
+                    )?;
+                    (read_txn, schema, bound)
                 };
+                let (read_txn, schema, bound) = bound_result;
                 let result = crate::sql::exec::execute_statement(
                     &read_txn,
                     self.provider.as_ref(),
@@ -1590,7 +1630,17 @@ impl EngineCore {
             Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
             None => None,
         };
-        let resolved_mode = crate::sql::mode::resolve_mode(query_mode, session.search_mode());
+        // TASK-164（PLAN-11）: プランナー推定（`expansion.mode_hint`）も優先順位
+        // 解決へ含める（明示指定〔クエリ句・セッション変数〕> プランナー推定 >
+        // 既定。codex-review P1 指摘対応: 従来はここで `resolve_mode` を使い
+        // `expansion.mode_hint` を素通しで捨てていたため、明示指定もセッション
+        // 設定もない `USING PLAN` クエリでプランナーが `precision` と推定しても
+        // 常に既定の `recall` になっていた）。
+        let resolved_mode = crate::sql::mode::resolve_mode_with_planner(
+            query_mode,
+            session.search_mode(),
+            expansion.mode_hint,
+        );
 
         crate::sql::using_plan::bind_expansion(
             validated,

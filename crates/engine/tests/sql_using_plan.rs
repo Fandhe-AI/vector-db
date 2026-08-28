@@ -118,6 +118,22 @@ impl LlmClient for StubLlmClient {
     }
 }
 
+/// 常に非有限（NaN）成分を含むベクトルを返す埋め込み（Cursor Bugbot Medium
+/// 指摘の回帰用: 外部埋め込み実装の異常出力を模す）。
+struct NonFiniteEmbedder {
+    dim: u32,
+}
+
+impl Embedder for NonFiniteEmbedder {
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(vec![vec![f32::NAN; self.dim as usize]; texts.len()])
+    }
+}
+
 struct FailingLlmClient;
 
 impl LlmClient for FailingLlmClient {
@@ -395,4 +411,87 @@ fn using_plan_dispatch_error_variant_is_query_planning_or_dispatch_related() {
         .plan_query(&ctx("tenant-a"), TABLE, "q")
         .expect_err("plan_query without a configured planner must fail");
     assert!(matches!(err, CoreError::QueryPlannerUnavailable));
+}
+
+#[test]
+fn using_plan_rejects_non_finite_reembedded_vector() {
+    // codex-review P1 回帰: 再埋め込みベクトルの束縛時に次元しか検証しておらず、
+    // NaN/Inf を含む値がフィルタされないまま `Ranking::Hybrid` へ渡っていた
+    // （既存のベクトルリテラル経路 `parse_vector_literal`・`EngineCore::search` の
+    // 非有限値拒否と非対称）。外部埋め込み実装が異常値を返す場合に fail-closed で
+    // 拒否されることを固定する。
+    let path = unique_db_path("sql-using-plan-non-finite");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(NonFiniteEmbedder { dim: DIM }))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("non-finite re-embedded vector must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
+fn using_plan_applies_planner_mode_hint_when_no_explicit_mode_is_set() {
+    // codex-review P1 回帰: プランナーが推定した検索モード
+    // （`expansion.mode_hint`）を `resolve_mode` へ渡さず捨てていたため、明示指定
+    // （`USING MODE`／`SET search_mode`）が無い `USING PLAN` クエリではプランナーが
+    // `precision` と推定しても常に既定の `recall` になっていた
+    // （`resolve_mode_with_planner` 未使用が原因）。ここでは、明示指定なしで
+    // プランナーが `precision` を推定したクエリの結果が、同じクエリへ明示的に
+    // `USING MODE 'precision'` を付けた場合と一致する（＝プランナー推定が実際に
+    // 効いている）ことを固定する。ダミーの定数ベクトル入力に対する確信度ゲートの
+    // 通過件数自体は非決定的な前提を置かない（`using_plan_respects_using_mode_precision`
+    // 参照）ため、絶対件数ではなく「明示 `precision` と同じ結果集合になる」ことを
+    // 検証する。
+    let path = unique_db_path("sql-using-plan-mode-hint");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM)))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null, "mode": "precision"}"#,
+        }));
+
+    fn query_row_ids(outcome: SqlOutcome) -> Vec<u64> {
+        match outcome {
+            SqlOutcome::Query(result) => {
+                let mut ids: Vec<u64> = result.rows.iter().map(|r| r.id).collect();
+                ids.sort_unstable();
+                ids
+            }
+            other => panic!("expected Query outcome, got {other:?}"),
+        }
+    }
+
+    let mut session = SessionState::default();
+    let implicit_ids = query_row_ids(
+        core.execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect("USING PLAN dispatch with an implicit planner mode hint should succeed"),
+    );
+    let explicit_precision_ids = query_row_ids(
+        core.execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'precision'",
+        )
+        .expect("USING PLAN dispatch with an explicit precision mode should succeed"),
+    );
+
+    assert_eq!(
+        implicit_ids, explicit_precision_ids,
+        "a planner-estimated precision mode hint (no explicit USING MODE/SET) must resolve to \
+         the same effective mode as an explicit USING MODE 'precision' clause"
+    );
 }

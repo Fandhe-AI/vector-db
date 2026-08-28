@@ -126,6 +126,17 @@ pub(crate) fn bind_expansion(
         )));
     }
 
+    // 次元検証と同じ位置で非有限（NaN・Inf）値も拒否する（codex-review P1 指摘
+    // 対応。次元しか検証しないと、外部埋め込み実装が異常値を返した場合に
+    // `Ranking::Hybrid` へそのまま渡り、既存のベクトルリテラル経路
+    // （`parser::parse_vector_literal`）や `EngineCore::search` が課している
+    // 非有限値拒否と非対称になり、リソース増幅を許してしまう）。
+    if query_vector.iter().any(|v| !v.is_finite()) {
+        return Err(SqlSurfaceError::invalid_input(
+            "USING PLAN re-embedded vector must not contain NaN/Inf".to_string(),
+        ));
+    }
+
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
     let (metadata_filters, expr_filters, rls_predicate_present) =
@@ -193,6 +204,7 @@ mod tests {
             search_terms: vec!["alpha".to_string(), "beta".to_string()],
             path_hint: None,
             kind_hint: None,
+            mode_hint: None,
         }
     }
 
