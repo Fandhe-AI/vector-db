@@ -34,8 +34,9 @@ use crate::result_encoder;
 
 /// SQLSTATE `XX000`（internal_error）。応答メッセージの組み立て自体が失敗した
 /// 場合（フレーム長超過等）に用いる。engine が返す SQL エラーの `wire_code()`
-/// とは独立した、wire 層自身の内部エラー用コード。
-const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
+/// とは独立した、wire 層自身の内部エラー用コード。値は `engine::error_format::
+/// ErrorClass`（SSOT）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
+const SQLSTATE_INTERNAL_ERROR: &str = engine::error_format::ErrorClass::InternalError.wire_code();
 
 fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
     stream.write_all(msg)
@@ -174,26 +175,27 @@ pub(crate) fn execute_and_respond(
     }
 }
 
-/// 緊急応答（TASK-97・RECOVER-6）の事前エンコード済みバイト列を組み立てる。
+/// 緊急応答（TASK-97・RECOVER-6、対象ビヘイビア ERR-1）の事前エンコード済み
+/// バイト列を組み立てる。
 ///
-/// 既存の 3 フィールド契約（`S`/`C`/`M`）のみの ErrorResponse を送出する
-/// （codex-review P1・PR #253 指摘対応）。ERR-1（commit 成功境界を跨いだ panic
-/// の観測可能性）が本来運びたい「commit は成功しているかもしれない」という
-/// 状態情報は、spec 側でワイヤ形式（運搬フィールド・値）が未確定のため、暫定
-/// 形式をこのクライアント向け送出経路へ接続しない ―― クライアントは
-/// 通常の内部エラー応答（`wire_code`・固定文言）と同じ 3 フィールドの
-/// ErrorResponse を受け取り、少なくとも「接続断ではなく明示的なエラー応答」を
-/// 同期的に観測できる（RECOVER-6 が防ぐ「サイレントな接続断」は引き続き回避
-/// する）。ERR-1 のワイヤ形式が spec 側で確定した後、その契約どおりに
-/// detail フィールドを追加する（`result_encoder.rs` の該当 NOTE 参照）。
+/// TASK-153 が ERR-1 のワイヤ形式（`RECOVER-5` (3) 該当時限定の `state=
+/// may_be_committed` 付与）を確定化したため、`crate::error_response::
+/// encode_may_be_committed` で `D`（detail）フィールド付きの ErrorResponse を
+/// 組み立てる（旧実装は spec 側の形式未確定を理由に 3 フィールドのみへ暫定的に
+/// 留めていた。`result_encoder.rs` の該当 NOTE 参照）。クライアントは
+/// 「commit は成功しているかもしれない」という状態情報を同期的に観測できる
+/// （RECOVER-6 が防ぐ「サイレントな接続断」の回避に加え、ERR-1 の条件付き
+/// 必須情報も運ぶ）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
 /// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
-/// 持たない）。
+/// 持たない）。本関数の呼び出しは緊急応答チャネル限定であり、通常のエラー応答
+/// （`respond_error_and_ready` 経由）へ `may_be_committed` を混入させない
+/// （`crate::error_response` モジュールドキュメント参照）。
 fn build_emergency_response_bytes(
     internal_error: &engine::error_format::WireError,
 ) -> Result<Vec<u8>, result_encoder::EncodeError> {
-    result_encoder::encode_error_response(internal_error.wire_code(), internal_error.message())
+    crate::error_response::encode_may_be_committed(internal_error.class(), internal_error.message())
 }
 
 /// [`build_emergency_response_bytes`] の結果をプロセス生存期間でキャッシュする

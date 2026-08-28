@@ -28,8 +28,10 @@ const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
 
 /// SQLSTATE `0A000`（feature_not_supported）。簡易クエリ実行未実装・拡張クエリ
-/// プロトコル受信時の応答に用いる。
-const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+/// プロトコル受信時の応答に用いる。値は `engine::error_format::ErrorClass`
+/// （SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
+const SQLSTATE_FEATURE_NOT_SUPPORTED: &str =
+    engine::error_format::ErrorClass::FeatureNotSupported.wire_code();
 /// SQLSTATE `08P01`（protocol_violation）。StartupMessage の構文・バージョン不正
 /// （フレーミング以外のプロトコル違反）に用いる。フレーミング由来の分類・値は
 /// `framing::SQLSTATE_PROTOCOL_VIOLATION` を単一の真実源とする。

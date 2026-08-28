@@ -50,7 +50,9 @@ fn column_name(meta: &ColumnMeta) -> &str {
 }
 
 /// メッセージ長フィールド（自身の 4 バイトを含む i32）を `checked` に計算する。
-fn frame_len(body_len: usize) -> Result<i32, EncodeError> {
+/// `crate::error_response`（TASK-153・ERR-1）も同じ `checked` 方式を踏襲するため
+/// crate 内に限り公開する（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。
+pub(crate) fn frame_len(body_len: usize) -> Result<i32, EncodeError> {
     let total = body_len.checked_add(4).ok_or(EncodeError)?;
     i32::try_from(total).map_err(|_| EncodeError)
 }
@@ -191,17 +193,14 @@ pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, E
     Ok(msg)
 }
 
-// NOTE（codex-review P1・PR #253 指摘対応）: 以前ここには `S`/`C`/`M` に加え
-// `D`（detail）フィールドを付与する `encode_error_response_with_detail` が
-// あり、ERR-1（commit 成功境界を跨いだ panic の観測可能性）の緊急応答が
-// `state=may_be_committed` を `D` フィールドとして運んでいた。ERR-1 の
-// ワイヤ形式（運搬フィールド・値）は spec 側で未確定であり、暫定形式を
-// クライアント向け送出経路（`simple_query::execute_and_respond` の緊急応答
-// チャネル）へ接続することは、実装都合の契約を先に確定させてしまう
-// （spec-confidentiality・spec との整合の観点で不可）。ERR-1 のワイヤ形式が
-// spec 側で確定するまで、緊急応答は既存の 3 フィールド契約（`S`/`C`/`M`）
-// のみで送出する（`simple_query::build_emergency_response_bytes` 参照）。
-// 確定後にここへ `D` フィールド付き encoder を復元する。
+// NOTE（TASK-153・対象ビヘイビア ERR-1 で確定化。旧 NOTE は codex-review P1・
+// PR #253 指摘対応で「D フィールドは spec 側確定待ちのため送出しない」としていた
+// が、TASK-153 のタスク定義自体が `RECOVER-5` (3) 該当時の `state=may_be_committed`
+// 条件付き付与の実装を完了条件に含むため、`crate::error_response::
+// encode_may_be_committed` として D（detail）フィールド付き encoder を正式実装
+// した。`simple_query::build_emergency_response_bytes` は本関数
+// （`encode_error_response`）ではなくそちらを呼ぶ。本関数は 3 フィールド
+// （`S`/`C`/`M`）のみの通常エラー応答用として引き続き使う。
 
 #[cfg(test)]
 mod tests {

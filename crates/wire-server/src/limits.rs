@@ -117,8 +117,10 @@ impl RejectWorkerLimiter {
 }
 
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
-/// `docs/spec/04-behavior/error-format.md`。
-pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+/// `docs/spec/04-behavior/error-format.md`。値は `engine::error_format::
+/// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str =
+    engine::error_format::ErrorClass::ConnectionLimitExceeded.wire_code();
 
 /// 同時接続数の枠 1 つぶんの所有権。`Drop` で確実に解放する（RAII。早期 return や
 /// panic があっても枠解放漏れが起きないようにする）。
