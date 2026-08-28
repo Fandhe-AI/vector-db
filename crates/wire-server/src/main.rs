@@ -12,7 +12,9 @@
 //! ログ・引数に残さない）。
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）・
-//! TASK-69（対象ビヘイビア WIRE-5, WIRE-6）・TASK-70（対象ビヘイビア WIRE-7）。
+//! TASK-69（対象ビヘイビア WIRE-5, WIRE-6）・TASK-70（対象ビヘイビア WIRE-7）・
+//! TASK-99（対象ビヘイビア RECOVER-8。`engine::recovery::fail_fast::install` を
+//! 起動時に結線し、panic を経路・スレッド問わずプロセス終了へ統一する）。
 //! `--bind` は [`wire_server::bind_guard::GuardedBindAddrs::resolve`] により、TLS 未構成
 //! （[`wire_server::bind_guard::TransportSecurity::Cleartext`]）の間は非ループバック
 //! アドレスを起動時に fail-closed で拒否したうえで、検証済みの数値アドレスへ直接 bind
@@ -54,6 +56,16 @@ fn run_server(args: &[String]) -> ExitCode {
     // 初期化（`EngineCore::open` 等）からは呼ばない契約（`panic_hook` モジュール
     // ドキュメント参照。engine 単体のテスト・他バイナリの panic 挙動を変えない）。
     engine::recovery::panic_hook::install_panic_hook();
+    // TASK-99（対象ビヘイビア: RECOVER-8）: 内部エラーの 2 系統統一のうち panic 側
+    // ―― 経路・スレッドを問わない fail-fast ―― を有効化する。`panic_hook` の
+    // **直後**に呼ぶ契約（`engine::recovery::fail_fast` モジュールドキュメント
+    // 「導入順序」参照）: `std::panic::set_hook` は 1 プロセスに 1 フックしか
+    // 保持できないため、`fail_fast::install` は自分がフックへ差し替わる際に
+    // 捕捉した直前のフック（＝ここまでに導入済みの `panic_hook`）を必ず先に
+    // 呼んでから abort する。この順序を逆にする（`fail_fast` を先に呼ぶ）と
+    // `panic_hook` が緊急応答を送る前段が失われ、TASK-97・RECOVER-6 の緊急応答が
+    // 退行する。
+    engine::recovery::fail_fast::install();
 
     let mut users_path: Option<PathBuf> = None;
     let mut db_path: Option<PathBuf> = None;

@@ -89,8 +89,13 @@ pub fn bind_loopback(bind_addr: &str) -> Result<TcpListener, String> {
 ///   ハンドシェイクへ渡す（認証前後を問わず同一値を維持する。WIRE-5）。超過時は
 ///   `handle_connection_bounded` が応答を書かずに `Err` を返し、スレッド終了で枠が解放される
 ///
-/// 各スレッドの panic は `std::thread::spawn` の join ハンドルを無視することで
-/// プロセス全体へは波及させない（他接続の継続稼働を優先する）。
+/// 各スレッドの join ハンドルは無視するが、これは panic をプロセスへ波及させない
+/// ための隔離を意図したものではない（`std::thread::spawn` の join ハンドル無視
+/// 自体は panic の伝播経路に関与しない）。実際には `main.rs::run_server` が起動時に
+/// 導入する `engine::recovery::fail_fast::install`（TASK-99・RECOVER-8）により、
+/// どの接続スレッドで panic が起きてもプロセス全体を fail-fast で終了させる
+/// （panic 発生時点で「共有状態が汚染された可能性がある」ことを安全側に倒すため。
+/// 他接続の継続稼働より優先する）。
 ///
 /// 対応: TASK-69（WIRE-5, WIRE-6）。旧 5 引数シグネチャ（`max_connections` を
 /// 直接受け取る形）は [`accept_loop`]（deprecated 互換ラッパー）として維持する
