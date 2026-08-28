@@ -17,8 +17,14 @@
 //!
 //! [`ledger`] は TASK-98（対象ビヘイビア: RECOVER-7）の対応も含む（詳細は
 //! `ledger` モジュールドキュメント参照）。
+//!
+//! [`panic_hook`] が commit 成功境界の観測可能性側（TASK-97、対象ビヘイビア:
+//! RECOVER-6・ERR-1）を提供する（詳細は `panic_hook` モジュールドキュメント
+//! 参照）。[`commit_boundary`] の abort（安全性側）を無効化せず、その前段で
+//! 緊急応答の送出を試みる。
 
 pub mod commit_boundary;
 pub(crate) mod content_hash;
 pub mod ledger;
+pub mod panic_hook;
 pub mod required_op_id;
