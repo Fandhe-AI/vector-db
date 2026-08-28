@@ -55,6 +55,11 @@
 //! （[`path_hint_matches`]/[`kind_hint_matches`]）は部分文字列一致・完全一致のみに
 //! 限定し、正規表現・glob は使わない（ReDoS の余地を作らない）。ヒント文字列・パスの
 //! 内容自体は本モジュールのエラー・ログへ含めない。
+//!
+//! TASK-148（対象ビヘイビア: EXT-4。ポインタ: `docs/spec/05-tasks.md` TASK-148・
+//! `docs/spec/04-behavior/extensions.md` EXT-4）: [`crate::scoring_boost`] が本モジュールの
+//! [`BoostRule`]/[`apply_soft_boost`] を一般化する（加点の意味論そのものは本モジュールへ
+//! 一元化したまま変更しない。詳細は `scoring_boost.rs` モジュールドキュメント参照）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
