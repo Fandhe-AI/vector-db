@@ -182,19 +182,18 @@ fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     (Arc::new(core), guard)
 }
 
-/// 42601（unsupported_sql_syntax）: `INSERT` は wire 経由では許可リスト外
-/// （`crate::simple_query` モジュールコメント参照）。
+/// 42601（unsupported_sql_syntax）: `UPDATE` は許可リストに存在しない statement
+/// 種別のため拒否される（TASK-82 で `INSERT` は受理するようになったため
+/// （`crate::simple_query` モジュールコメント参照）、本ケースは許可リスト外の
+/// 別 statement 種別へ差し替えた）。
 #[test]
-fn err1_insert_returns_42601_fields() {
+fn err1_update_returns_42601_fields() {
     let (core, _guard) = new_core_with_docs_table();
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
 
-    send_simple_query(
-        &mut stream,
-        "INSERT INTO docs (id, embedding) VALUES (1, '[0.0,0.0,1.0]') USING OPERATION_ID 'op-err1-insert'",
-    );
+    send_simple_query(&mut stream, "UPDATE docs SET id = 2 WHERE id = 1");
 
     assert_error_response(&mut stream, "42601");
 }
