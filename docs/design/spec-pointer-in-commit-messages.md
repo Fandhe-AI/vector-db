@@ -62,6 +62,12 @@ rewrite の実施には branch ruleset `main-protection`（非高速転送・削
   の禁止事項・ポインタ表記が同様に適用される旨を明記する（本 ADR に伴う規約追記）
 - squash merge 後もブランチ上の中間コミットは PR refs で永続するため、
   history rewrite ではなく **マージ前の検査** で防ぐことを原則とする
+- 上記「マージ前の検査」を具体化し、**base..head の全コミットメッセージ検査**を
+  マージ前必須の工程として明記する（`.claude/rules/spec-confidentiality.md`
+  「コミットメッセージ・PR 本文での運用」節）: PR 作成時に実装担当が
+  `git log <base>..HEAD` で中間コミットすべての件名・本文を検査し、抵触があれば
+  マージを停止する。レビュー担当（reviewer / security-auditor）も PR レビュー時に
+  この検査の実施を確認する
 - レビュー指摘（spec 転記）への対応コミットでは、削除内容の説明に spec 規則の
   内容・対象を再転記せず、ID ポインタと削除の事実のみを書く
 - squash merge の件名・本文は PR 本文から生成されるため、PR 本文作成時の
