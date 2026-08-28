@@ -493,12 +493,17 @@ fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
     assert_eq!(select_by_path(&core, "docs/retry.txt"), expected);
 }
 
-/// (2)-c: 旧本文で `INSERT` → 検索でキャッシュ・導出索引を温める（反映済み）→
-/// 新本文・新 `operation_id` で同一 `path` を再送 commit → 読み取らずに drop・
-/// 再オープン → 検索・SELECT に旧チャンクが 1 件も残らず（重複なし）、新チャンクのみ
-/// 完全一致（欠落なし）で現れることを確認する。
+/// (2)-c 前段: 旧本文で `INSERT` → 検索でキャッシュ・導出索引を温める（世代 G で
+/// 反映済み）→ 新本文・新 `operation_id` で同一 `path` を再送 commit → **同一
+/// プロセス内で** 再読み取り → 世代 G の温めたキャッシュが世代 G+1 との不一致で
+/// 破棄・再構築され、新チャンクのみが完全一致（欠落・重複なし）で現れることを
+/// 確認する（`DictionaryCache` の in-process 世代不一致検知経路）。
+/// 再オープン（プロセス再起動相当）を経由しない読み取り専用の検証であり、
+/// commit 直後に一切読み取らず中断する経路は
+/// `resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart`
+/// （本ファイル内・別テスト）が担う。
 #[test]
-fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
+fn resend_replacement_in_process_reread_reflects_new_generation() {
     let path = unique_db_path("index-fail-resend-restart");
     let _guard = CleanupGuard(path.clone());
     let storage = open_storage_with_table(&path);
@@ -586,6 +591,64 @@ fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
             .expect("last operation lookup should succeed"),
         engine::recovery::ledger::LastOperationLookup::Committed(op("op-replace-new"))
     );
+}
+
+/// (2)-c 本題: 旧本文で `INSERT` → 検索でキャッシュ・導出索引を温める（世代 G で
+/// 反映済み）→ 新本文・新 `operation_id` で同一 `path` を再送 commit → **一切
+/// 読み取らずに** `drop_and_reopen`（プロセス再起動相当）→ 検索・SELECT に旧
+/// チャンクが 1 件も残らず（重複なし）、新チャンクのみ完全一致（欠落なし）で
+/// 現れることを確認する。
+///
+/// codex-review P1 指摘対応: 旧テストは commit 直後に `select_by_path` /
+/// `dictionary_snapshot`（in-process 再読み取り）を挟んでから `drop_and_reopen`
+/// していたため、世代 G+1 の導出索引・辞書キャッシュが drop 前に既に
+/// 再構築されており、「commit 直後・一切読み取らず中断」という (2-c) の契約が
+/// 実際には検証されていなかった。本テストは `execute_insert_sql` の直後に
+/// 一切の読み取りを挟まず `drop_and_reopen` を呼ぶことで、その経路を独立に
+/// 検証する。in-process 再読み取り側の検証は
+/// `resend_replacement_in_process_reread_reflects_new_generation`
+/// （本ファイル内・別テスト）が担う。
+#[test]
+fn resend_replacement_leaves_no_stale_or_duplicate_entries_after_restart() {
+    let path = unique_db_path("index-fail-resend-restart");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage_with_table(&path);
+    let config = small_chunk_config();
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+        .with_incremental_config(config.clone());
+
+    let old_body = "old line one stalemarkeraaaa\nold line two\nold line three\nold line four";
+    core.execute_insert_sql(
+        &write_ctx(),
+        &insert_file_sql("docs/replace.md", old_body, "op-replace-old"),
+    )
+    .expect("first insert should succeed");
+
+    // 検索・dictionary_snapshot でキャッシュ・導出索引を温める（世代 G で反映済み）。
+    let warmed = select_by_path(&core, "docs/replace.md");
+    let expected_old = expected_chunk_bodies("docs/replace.md", old_body, &config.chunking);
+    assert_eq!(warmed, expected_old);
+    let warm_dict = core
+        .dictionary_snapshot(&read_ctx(), TABLE)
+        .expect("dictionary snapshot should succeed while warming the cache");
+    // 正コントロール: 世代 G の辞書には旧本文の固有語が実際に現れていることを
+    // 確認する。これが無いと、末尾の否定アサーションが「辞書抽出自体が機能していない」
+    // ことで自明に成立するのを見逃す（実験的に確認済み。上記コメント参照）。
+    assert!(
+        format!("{warm_dict:?}").contains("stalemarkeraaaa"),
+        "positive control: dictionary must contain the old-content marker while warmed"
+    );
+
+    // 新本文・新 operation_id で同一 path を再送 commit（世代 G+1）。
+    // commit 直後は一切読み取らない（in-process 再読み取り経路は別テストが担う）。
+    let new_body = "new line one freshmarkerbbbb\nnew line two\nnew line three\nnew line four\nnew line five\nnew line six";
+    core.execute_insert_sql(
+        &write_ctx(),
+        &insert_file_sql("docs/replace.md", new_body, "op-replace-new"),
+    )
+    .expect("resend insert should succeed");
+    let expected_new = expected_chunk_bodies("docs/replace.md", new_body, &config.chunking);
 
     // 読み取らずに drop・再オープン。
     let core = drop_and_reopen(core, &path);
