@@ -69,6 +69,9 @@ const MAX_SCANNED_ROWS: usize = 1_000_000;
 /// 他テナントの存在情報を漏らさない（`rls.rs::RlsError` と同じ契約。security.md P0）。
 /// `CatalogError` を内部に保持するが、識別子を含む詳細は外部へ一切露出しない
 /// （下記 `Debug`・`Error::source` の手書き実装を参照）。
+///
+/// `#[non_exhaustive]` は付与しない（[`TenantWriteError`] と同じ判断・同じ理由。
+/// Issue #282・`docs/design/error-enum-non-exhaustive-policy.md` 参照）。
 pub enum TenantError {
     /// [`crate::catalog`] 側のエラー（テーブル不存在・行破損・redb バックエンドエラー等）。
     Catalog(CatalogError),
@@ -237,6 +240,15 @@ pub fn verify_hits(
 /// RECOVER-4）。`Display`・`Debug`・`std::error::Error::source` のいずれにもテナント ID・
 /// 行 id・テーブル名を含めず、他テナントの存在情報を漏らさない（[`TenantError`] と同じ
 /// 契約。security.md P0）。
+///
+/// `#[non_exhaustive]` は付与しない: 本 enum は既に公開済みであり、後付けで
+/// `#[non_exhaustive]` を付けると下流の網羅的 `match` がコンパイル不能になる
+/// （それ自体が破壊的変更のため、`#[non_exhaustive]` 化で互換性を装うのではなく
+/// 付けないままにする。`core.rs::CoreError` の PR #252 判断と同方針。Issue #282・
+/// `docs/design/error-enum-non-exhaustive-policy.md` 参照）。variant の追加は
+/// `non_exhaustive` 化の有無に関わらず既存の網羅的 `match` を壊す破壊的変更である
+/// ことに変わりはなく、PR 本文の Breaking changes 節と `BREAKING CHANGE:` フッタで
+/// 明示する。
 pub enum TenantWriteError {
     /// 呼び出し元が入力した `RowInput::tenant_id` が `ctx` のテナントと不一致
     /// （クライアント自身の入力に起因するため存在情報を含まない）。他テナント名義の
