@@ -80,6 +80,19 @@ impl FrameError {
         }
     }
 
+    /// [`sqlstate`](Self::sqlstate) と同じ分岐を `engine::error_format::ErrorClass`
+    /// で返す版。`handshake::respond_and_close` が `crate::error_response::encode`
+    /// （`ErrorClass` 入力）へ横断写像を接続するために使う（codex-review P1 指摘
+    /// 対応・PR #258。`sqlstate()` の `&str` 定数は `ErrorClass::wire_code()` 由来
+    /// のため、写像の分岐自体は本メソッドと重複させず同じ `match` を保つ）。
+    pub fn error_class(&self) -> Option<engine::error_format::ErrorClass> {
+        match self {
+            FrameError::TooLarge { .. } => Some(engine::error_format::ErrorClass::PayloadTooLarge),
+            FrameError::Malformed(_) => Some(engine::error_format::ErrorClass::ProtocolViolation),
+            FrameError::Truncated | FrameError::Io(_) => None,
+        }
+    }
+
     /// クライアントへ返す固定の英語メッセージ（内部理由・違反詳細は含めない）。
     pub fn client_message(&self) -> &'static str {
         match self {

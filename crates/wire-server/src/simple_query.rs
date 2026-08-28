@@ -26,17 +26,12 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 
 use engine::core::EngineCore;
+use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::policy::PolicyContext;
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
 
 use crate::result_encoder;
-
-/// SQLSTATE `XX000`（internal_error）。応答メッセージの組み立て自体が失敗した
-/// 場合（フレーム長超過等）に用いる。engine が返す SQL エラーの `wire_code()`
-/// とは独立した、wire 層自身の内部エラー用コード。値は `engine::error_format::
-/// ErrorClass`（SSOT）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
-const SQLSTATE_INTERNAL_ERROR: &str = engine::error_format::ErrorClass::InternalError.wire_code();
 
 fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
     stream.write_all(msg)
@@ -44,13 +39,15 @@ fn write_all(stream: &mut TcpStream, msg: &[u8]) -> io::Result<()> {
 
 /// ErrorResponse を書いてから ReadyForQuery を書く（簡易クエリのエラーは接続を
 /// 維持する。WIRE-8 の「切断」は拡張クエリプロトコル限定の既存契約であり、ここは
-/// 変更しない）。
+/// 変更しない）。`class` は `crate::handshake::write_error_response_io`（実体は
+/// `crate::error_response::encode`）へそのまま渡り、severity・SQLSTATE の決定を
+/// 横断写像へ一元化する（TASK-153・ERR-1・codex-review P1 指摘対応・PR #258）。
 fn respond_error_and_ready(
     stream: &mut TcpStream,
-    sqlstate: &str,
+    class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
-    crate::handshake::write_error_response_io(stream, sqlstate, message)?;
+    crate::handshake::write_error_response_io(stream, class, message)?;
     crate::handshake::write_ready_for_query_io(stream)
 }
 
@@ -159,7 +156,7 @@ pub(crate) fn execute_and_respond(
             }
             Err(_) => respond_error_and_ready(
                 stream,
-                SQLSTATE_INTERNAL_ERROR,
+                ErrorClass::InternalError,
                 "failed to encode command complete response",
             ),
         },
@@ -171,29 +168,29 @@ pub(crate) fn execute_and_respond(
                 }
                 Err(_) => respond_error_and_ready(
                     stream,
-                    SQLSTATE_INTERNAL_ERROR,
+                    ErrorClass::InternalError,
                     "failed to encode command complete response",
                 ),
             }
         }
-        Err(e) => respond_error_and_ready(stream, e.wire_code(), &e.client_message()),
+        Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }
 
 /// 緊急応答（TASK-97・RECOVER-6、対象ビヘイビア ERR-1）の事前エンコード済み
 /// バイト列を組み立てる。
 ///
-/// `crate::error_response::encode_may_be_committed`（TASK-153・ERR-1・`RECOVER-5`
-/// (3) ポインタ）で `D`（detail）フィールド付きの ErrorResponse を組み立てる。
-/// クライアントは「commit は成功しているかもしれない」という状態情報を同期的に
-/// 観測できる（RECOVER-6 が防ぐ「サイレントな接続断」の回避に加え、ERR-1 の
-/// 条件付き必須情報も運ぶ）。
+/// `crate::error_response::encode`（TASK-153・ERR-1）で通常応答と同じ `S`/`C`/`M`
+/// の 3 フィールドのみの ErrorResponse を組み立てる。クライアントは commit
+/// 成功後の panic を「サイレントな接続断」ではなく同期的な ErrorResponse として
+/// 観測できる（RECOVER-6 が防ぐ範囲）。「commit は成功しているかもしれない」という
+/// 状態情報を運ぶ `D`（detail）フィールドは、wire 形式が spec 側で未確定のため
+/// 追加しない（codex-review P1 指摘対応・PR #258。`crate::error_response`
+/// モジュールドキュメント参照）。
 ///
 /// `internal_error` は呼び出し元が構築済みの `WireError::internal()` を渡す契約
 /// （通常経路の内部エラー応答と同じ固定文言・`wire_code` を使い、文言を二重に
-/// 持たない）。本関数の呼び出しは緊急応答チャネル限定であり、通常のエラー応答
-/// （`respond_error_and_ready` 経由）へ `may_be_committed` を混入させない
-/// （`crate::error_response` モジュールドキュメント参照）。
+/// 持たない）。
 ///
 /// **本関数はバイト列を組み立てるだけで、送信するかどうかには一切関与しない**
 /// （codex-review P1 指摘対応・PR #258）。この事前エンコード済みバイト列は
@@ -221,7 +218,7 @@ pub(crate) fn execute_and_respond(
 fn build_emergency_response_bytes(
     internal_error: &engine::error_format::WireError,
 ) -> Result<Vec<u8>, result_encoder::EncodeError> {
-    crate::error_response::encode_may_be_committed(internal_error.class(), internal_error.message())
+    crate::error_response::encode(internal_error.class(), internal_error.message())
 }
 
 /// [`build_emergency_response_bytes`] の結果をプロセス生存期間でキャッシュする
@@ -251,7 +248,7 @@ fn respond_query_result(
         Err(_) => {
             return respond_error_and_ready(
                 stream,
-                SQLSTATE_INTERNAL_ERROR,
+                ErrorClass::InternalError,
                 "failed to encode row description",
             )
         }
@@ -264,7 +261,7 @@ fn respond_query_result(
             Err(_) => {
                 return respond_error_and_ready(
                     stream,
-                    SQLSTATE_INTERNAL_ERROR,
+                    ErrorClass::InternalError,
                     "failed to encode data row",
                 )
             }
@@ -280,7 +277,7 @@ fn respond_query_result(
         }
         Err(_) => respond_error_and_ready(
             stream,
-            SQLSTATE_INTERNAL_ERROR,
+            ErrorClass::InternalError,
             "failed to encode command complete response",
         ),
     }

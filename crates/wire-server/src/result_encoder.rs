@@ -169,9 +169,9 @@ pub fn encode_empty_query_response() -> Vec<u8> {
 /// `limits.rs::reject_too_many_connections` の独自実装〔`FATAL` 固定〕と分類の
 /// 判定基準が 2 箇所に分散するため、判定は呼び出し元に閉じる）。
 ///
-/// [`encode_error_response`] と `crate::error_response::encode_may_be_committed`
-/// （TASK-153・ERR-1。`D`（detail）フィールドを追加で運ぶ版）が共有する唯一の
-/// レイアウト実体（codex-review Low 指摘対応・PR #101。以前は両者が同じ
+/// [`encode_error_response`] と `crate::error_response::encode`（TASK-153・ERR-1。
+/// `ErrorClass` から severity/SQLSTATE を一元的に決定する横断写像）が共有する
+/// 唯一のレイアウト実体（codex-review Low 指摘対応・PR #101。以前は両者が同じ
 /// S/C/M 書き込みをそれぞれ自前で複製しており、フィールドレイアウト変更時に
 /// 乖離しうる状態だった）。crate 内に限り公開する。
 pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, severity: &str, sqlstate: &str, message: &str) {
@@ -186,25 +186,18 @@ pub(crate) fn push_s_c_m_fields(body: &mut Vec<u8>, severity: &str, sqlstate: &s
     body.push(0);
 }
 
-/// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみで組み立てる
-/// （`severity`/`code`/`message`。他テナント・存在情報は含めない）。
+/// `ErrorResponse`（'E'）を `S`/`C`/`M` の 3 フィールドのみ、severity `ERROR`
+/// 固定で組み立てる（`sqlstate`/`message`。他テナント・存在情報は含めない）。
 ///
-/// 通常エラー応答のバイト列組み立ての唯一の実体（codex-review Low 指摘対応・
-/// PR #101 で重複実装を統合）。呼び出し元は 2 系統ある:
-/// - `handshake.rs::write_error_response`（ソケットへ直接書き込む経路。本関数の
-///   戻り値をそのまま `write_all` へ渡す）
-/// - `crate::simple_query::execute_and_respond` が「outcome を決定する区間」の
-///   緊急応答チャネル（`engine::recovery::panic_hook::
-///   EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
-///   （panic フックの外）で事前に組み立てるために使う（panic フック内での
-///   エンコードによるアロケーション・整形失敗を避けるため。`panic_hook`
-///   モジュールドキュメント参照）
-///
-/// `crate::error_response::encode`（`ErrorClass` を入力に取る版。TASK-153・
-/// ERR-1）も本関数へ委譲する（`ErrorClass::wire_code()` を `sqlstate` として渡す
-/// だけの薄いラッパー）。`crate::error_response::encode_may_be_committed` は
-/// フレームに `D` フィールドを追加で運ぶ必要があり本関数を経由できないが、
-/// フィールド書き込みの実体は [`push_s_c_m_fields`] を共有する。
+/// **本 crate の通常・緊急いずれの送出経路もこの関数は経由しない**
+/// （TASK-153・ERR-1・codex-review P1 指摘対応・PR #258）。`handshake.rs::
+/// write_error_response`・`crate::simple_query::build_emergency_response_bytes`
+/// はいずれも `crate::error_response::encode`（`ErrorClass` から severity・
+/// SQLSTATE を一元的に決定する横断写像。severity は分類ごとに変わりうるため、
+/// 本関数の `ERROR` 固定では `ErrorClass::ConnectionLimitExceeded` の `FATAL`
+/// 契約を表現できない）を使う。フィールド書き込みの実体
+/// （[`push_s_c_m_fields`]）は共有するため、`sqlstate`/`message` を直接受け取る
+/// 薄い公開 API として残す（severity を常に `ERROR` に固定できる用途向け）。
 ///
 /// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
 /// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
@@ -221,12 +214,6 @@ pub fn encode_error_response(sqlstate: &str, message: &str) -> Result<Vec<u8>, E
     msg.extend_from_slice(&body);
     Ok(msg)
 }
-
-// NOTE（TASK-153・対象ビヘイビア ERR-1 ポインタ）: D（detail）フィールド付き
-// encoder は `crate::error_response::encode_may_be_committed` として別途実装
-// している。`simple_query::build_emergency_response_bytes` は本関数
-// （`encode_error_response`）ではなくそちらを呼ぶ。本関数は 3 フィールド
-// （`S`/`C`/`M`）のみの通常エラー応答用として引き続き使う。
 
 #[cfg(test)]
 mod tests {

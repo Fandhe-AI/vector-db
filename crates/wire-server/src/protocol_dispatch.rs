@@ -56,8 +56,12 @@ pub(crate) const LINGER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const LINGER_DRAIN_MAX_BYTES: usize = 64 * 1024;
 
 /// 拒否応答の書き込みを担う関数への依存を注入で切るための trait。
-/// `handshake::write_error_response`（io::Result 版）を実体として渡す。
-type WriteErrorResponseFn = fn(&mut TcpStream, &str, &str) -> io::Result<()>;
+/// `handshake::write_error_response_io` を実体として渡す。`sqlstate: &str` ではなく
+/// `ErrorClass` を受け取ることで、送出経路が `crate::error_response::encode` の
+/// severity/SQLSTATE 一元化・NUL 拒否を必ず経由する（codex-review P1 指摘対応・
+/// PR #258）。
+type WriteErrorResponseFn =
+    fn(&mut TcpStream, engine::error_format::ErrorClass, &str) -> io::Result<()>;
 
 /// 未対応メッセージへの応答（SQLSTATE 0A000 + 分類ごとの固定英語メッセージ）と、
 /// 有界な lingering close を行う（WIRE-8 の本体）。ReadyForQuery は送らない。
@@ -79,7 +83,11 @@ pub(crate) fn reject_and_close(
         describe_kind(kind)
     );
 
-    write_error_response(stream, "0A000", response_message(kind))?;
+    write_error_response(
+        stream,
+        engine::error_format::ErrorClass::FeatureNotSupported,
+        response_message(kind),
+    )?;
     stream.flush()?;
 
     reject_and_close_with(stream, LINGER_DRAIN_TIMEOUT, LINGER_DRAIN_MAX_BYTES);
@@ -223,7 +231,7 @@ mod tests {
 
     fn fake_write_error_response(
         stream: &mut TcpStream,
-        sqlstate: &str,
+        class: engine::error_format::ErrorClass,
         message: &str,
     ) -> io::Result<()> {
         let mut body = Vec::new();
@@ -231,7 +239,7 @@ mod tests {
         body.extend_from_slice(b"ERROR");
         body.push(0);
         body.push(b'C');
-        body.extend_from_slice(sqlstate.as_bytes());
+        body.extend_from_slice(class.wire_code().as_bytes());
         body.push(0);
         body.push(b'M');
         body.extend_from_slice(message.as_bytes());

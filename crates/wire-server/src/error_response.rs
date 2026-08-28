@@ -8,43 +8,40 @@
 //! 唯一の責務。ソケットへの書き込みは行わず、`Vec<u8>` を返す純関数のみで構成する
 //! （`crate::result_encoder` と同じ方針。呼び出し元が I/O を担う）。
 //!
-//! [`encode`] は通常エラー応答（`S`/`C`/`M` の 3 フィールド）を組み立てる。
+//! [`encode`] は通常エラー応答（`S`/`C`/`M` の 3 フィールド）を組み立てる、
+//! **本 crate 内で `ErrorResponse` を送出する全経路が共有する唯一の実体**である
+//! （`handshake::write_error_response`・`simple_query::respond_error_and_ready`・
+//! `simple_query` の緊急応答チャネル（`build_emergency_response_bytes`）はいずれも
+//! `&str` の SQLSTATE を直接扱わず、engine 側の `SqlSurfaceError`／固定の
+//! `ErrorClass` 定数を本関数へ渡す。以前は通常応答が `crate::result_encoder::
+//! encode_error_response`〔`&str` 受け取り・severity `ERROR` 固定〕を独自に経由し、
+//! `ErrorClass` による severity 一元化・NUL 拒否が実際の送出経路に反映されない
+//! 横断写像の不整合があった。codex-review P1 指摘対応・PR #258）。
 //! `S`（severity）は `ErrorClass` ごとに [`severity_for`] が決定する（既定は
 //! `ERROR`、接続を閉じて終了する `ErrorClass::ConnectionLimitExceeded`〔`53300`〕
-//! のみ `limits.rs::reject_too_many_connections` の独自実装と同じ `FATAL`。
-//! 以前は全分類一律 `ERROR` に固定しており、同じ `ErrorClass` から呼び出し経路に
-//! よって異なる severity の `ErrorResponse` が生成される横断写像の不整合があった。
-//! codex-review P1 指摘対応・PR #258）。バイト列組み立ては `handshake.rs::
-//! write_error_response` が使う `crate::result_encoder::encode_error_response`
-//! （severity は `ERROR` 固定）を経由せず、[`crate::result_encoder::push_s_c_m_fields`]
-//! を直接使うことで severity を明示的に渡す（codex-review Low 指摘対応・PR #101 の
-//! 「フィールドレイアウトの実体を共有する」方針は維持しつつ、severity の決定は
-//! 呼び出し元＝本モジュールに閉じる）。
-//! [`encode_may_be_committed`] は `RECOVER-5` (3)（commit 後 panic）該当時**限定**で
-//! `D`（detail）フィールドに `state=may_be_committed` 相当の情報を追加で運ぶ版であり、
-//! 呼び出し元は `crate::simple_query` の緊急応答チャネル（`engine::recovery::
-//! panic_hook::EmergencyResponseRegistration`）に限定して使うこと（通常エラー経路から
-//! 呼ばない。呼び出し面を分けることで誤って通常応答へ `may_be_committed` を混入させる
-//! ことを構造的に防ぐ）。こちらも `severity_for` を共有し、`encode` と同じ severity
-//! 契約を維持する。`D` フィールドを追加するため `crate::result_encoder::
-//! encode_error_response` は経由できないが、`S`/`C`/`M` フィールドの書き込み自体は
-//! 同モジュールの [`crate::result_encoder::push_s_c_m_fields`] を共有し、
-//! フィールドレイアウトの実体が 2 箇所に重複しないようにする（codex-review Low
-//! 指摘対応・PR #101）。
+//! のみ `limits.rs::reject_too_many_connections` の独自実装と同じ `FATAL`）。
+//! バイト列組み立ては [`crate::result_encoder::push_s_c_m_fields`] を直接使うことで
+//! severity を明示的に渡す（codex-review Low 指摘対応・PR #101 の「フィールド
+//! レイアウトの実体を共有する」方針は維持しつつ、severity の決定は呼び出し元＝
+//! 本モジュールに閉じる）。
+//!
+//! `D`（detail）フィールド（`RECOVER-5` (3)・commit 後 panic 時の `state=
+//! may_be_committed` 相当の情報）は、その wire 形式が spec 側でまだ確定していない
+//! ため本モジュールでは導入しない（codex-review P1 指摘対応・PR #258。公開契約の
+//! 拡張は公開済み設計文書または管理者承認を経てから行う）。`crate::simple_query`
+//! の緊急応答チャネルも本 [`encode`]（3 フィールドのみ）を使い、通常応答と同一の
+//! 契約を維持する。
 //!
 //! フレーム長は [`crate::result_encoder::frame_len`]（`checked` 方式）を再利用し、
 //! `as i32` によるオーバーフローを起こさない（`.claude/rules/coding-rust.md`
 //! 「untrusted 入力の扱い」）。メッセージへの NUL バイト混入はフィールド区切り
-//! （NUL 終端）を破壊しフレーム構造を壊すため、[`encode`]・[`encode_may_be_committed`]
-//! はいずれも NUL を含む `message` を fail-closed に拒否する（本モジュールの `message`
-//! 引数は固定英語文言のみを渡す契約だが、防御的に検証する）。
+//! （NUL 終端）を破壊しフレーム構造を壊すため、[`encode`] は NUL を含む `message`
+//! を fail-closed に拒否する（本モジュールの `message` 引数は固定英語文言のみを
+//! 渡す契約だが、防御的に検証する）。
 
 use engine::error_format::ErrorClass;
 
 use crate::result_encoder::{frame_len, push_s_c_m_fields, EncodeError};
-
-/// `D`（detail）フィールドに載せる固定文言（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）。
-const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
 
 /// `message` に NUL バイトが含まれないか検証する（fail-closed）。フィールドは
 /// NUL 終端のため、混入するとフレーム構造そのものが壊れる（後続フィールドの
@@ -96,24 +93,6 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
     reject_embedded_nul(message)?;
     let mut body = Vec::new();
     push_s_c_m_fields(&mut body, severity_for(class), class.wire_code(), message);
-    body.push(0); // フィールド終端
-    wrap_frame(body)
-}
-
-/// `RECOVER-5` (3)（commit 後 panic）該当時**限定**の緊急応答。[`encode`] の 3
-/// フィールドに加え、`D`（detail）フィールドで [`MAY_BE_COMMITTED_DETAIL`] を運ぶ。
-///
-/// 呼び出し元は `crate::simple_query` の緊急応答チャネルに限定すること。通常の
-/// エラー応答経路（`crate::handshake::write_error_response` 等）からは呼ばない
-/// （呼び出し面の分離により、`may_be_committed` が通常応答へ誤って混入すること
-/// を構造的に防ぐ）。
-pub fn encode_may_be_committed(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> {
-    reject_embedded_nul(message)?;
-    let mut body = Vec::new();
-    push_s_c_m_fields(&mut body, severity_for(class), class.wire_code(), message);
-    body.push(b'D');
-    body.extend_from_slice(MAY_BE_COMMITTED_DETAIL.as_bytes());
-    body.push(0);
     body.push(0); // フィールド終端
     wrap_frame(body)
 }
@@ -195,53 +174,20 @@ mod tests {
         }
     }
 
-    /// [`encode_may_be_committed`] は全分類で `D` フィールドを追加で運ぶ。
-    /// severity も [`encode`] と同じ [`severity_for`] 契約に従う
-    /// （codex-review P1 指摘対応・PR #258）。
-    #[test]
-    fn encode_may_be_committed_covers_all_error_classes_with_d_field() {
-        for class in ErrorClass::ALL {
-            let msg = encode_may_be_committed(class, "internal error").expect("encode");
-            let body = body_of(&msg);
-            assert_eq!(
-                find_field(body, b'S').as_deref(),
-                Some(severity_for(class)),
-                "class={class:?}"
-            );
-            assert_eq!(
-                find_field(body, b'C').as_deref(),
-                Some(class.wire_code()),
-                "class={class:?}"
-            );
-            assert_eq!(
-                find_field(body, b'D').as_deref(),
-                Some(MAY_BE_COMMITTED_DETAIL),
-                "class={class:?}"
-            );
-            assert_eq!(body.last().copied(), Some(0), "field terminator");
-        }
-    }
-
     #[test]
     fn encode_rejects_message_with_embedded_nul() {
         let result = encode(ErrorClass::InternalError, "bad\0message");
         assert!(result.is_err(), "embedded NUL must be rejected fail-closed");
     }
 
+    /// `D`（detail）フィールドは spec 側で wire 形式が未確定のため、[`encode`]
+    /// はどの分類でも追加しない（codex-review P1 指摘対応・PR #258）。
     #[test]
-    fn encode_may_be_committed_rejects_message_with_embedded_nul() {
-        let result = encode_may_be_committed(ErrorClass::InternalError, "bad\0message");
-        assert!(result.is_err(), "embedded NUL must be rejected fail-closed");
-    }
-
-    #[test]
-    fn encode_and_encode_may_be_committed_differ_only_by_detail_field() {
-        let plain = encode(ErrorClass::InternalError, "internal error").expect("encode");
-        let committed =
-            encode_may_be_committed(ErrorClass::InternalError, "internal error").expect("encode");
-        assert!(committed.len() > plain.len());
-        assert!(!body_of(&plain).contains(&b'D'));
-        assert!(body_of(&committed).contains(&b'D'));
+    fn encode_never_includes_a_detail_field() {
+        for class in ErrorClass::ALL {
+            let msg = encode(class, "internal error").expect("encode");
+            assert!(!body_of(&msg).contains(&b'D'), "class={class:?}");
+        }
     }
 
     /// codex-review P1 指摘（PR #258）の再発防止: `ErrorClass::
