@@ -37,8 +37,10 @@
 //! `PlanError` を写像する段になった時点の管轄とし、本モジュールでは行わない。
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use std::collections::BTreeMap;
 
@@ -829,16 +831,75 @@ fn is_success_status_line(line: &str) -> bool {
     code.len() == 3 && code.starts_with('2') && code.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// `config.host`／`config.port` を名前解決する（`(host, port)` タプル形式の
+/// `ToSocketAddrs` を使い、`format!("{host}:{port}")` によるアドレス文字列組み立てを
+/// 避ける。IPv6 リテラル（例: `::1`）は `format!` だと `::1:11434` のような曖昧な
+/// 文字列になり `to_socket_addrs()` が解釈に失敗するため、`codex-review` PR #252 P1
+/// 指摘に従いタプル形式へ変更した）。
+///
+/// 名前解決自体は `connect_timeout` の対象外（同期 DNS 呼び出しには締切を渡せない）
+/// ため、別スレッドで実行して `mpsc::Receiver::recv_timeout` で待ち合わせる
+/// （codex-review PR #252 P2 指摘）。締切超過時は呼び出し元へ即座に
+/// [`PlanError::Timeout`] を返すが、バックグラウンドスレッドは解決が完了するか
+/// プロセス終了まで存在し続けうる（std に解決処理を中断する手段がないための
+/// 既知の制約。呼び出し元がブロックされ続けることだけは防ぐ）。
+fn resolve_socket_addrs(
+    config: &OllamaConfig,
+    deadline: Instant,
+) -> Result<Vec<SocketAddr>, PlanError> {
+    let host = config.host.clone();
+    let port = config.port;
+    let (tx, rx) = mpsc::channel();
+    // スレッド生成に失敗した場合（リソース枯渇等）も fail-closed で Unavailable とし、
+    // untrusted な外部要因でパニックさせない。
+    thread::Builder::new()
+        .spawn(move || {
+            let resolved = (host.as_str(), port)
+                .to_socket_addrs()
+                .map(|it| it.collect::<Vec<SocketAddr>>());
+            // 受信側が既にタイムアウトして rx を破棄していても send の失敗は無視する。
+            let _ = tx.send(resolved);
+        })
+        .map_err(|_| PlanError::Unavailable)?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
+        Ok(Ok(_)) | Ok(Err(_)) => Err(PlanError::Unavailable),
+        Err(_) => Err(PlanError::Timeout),
+    }
+}
+
 /// `POST {path}` で `body`（JSON）を送信し、HTTP 応答本文（生バイト列）を返す。
 /// 接続・読み書きタイムアウト、応答ヘッダ・本文の各サイズ上限、`Content-Length`／
 /// `Transfer-Encoding: chunked` の双方に対応する（モジュールドキュメント参照）。
 fn http_post_json(config: &OllamaConfig, path: &str, body: &str) -> Result<Vec<u8>, PlanError> {
-    let addr = format!("{}:{}", config.host, config.port);
-    let mut addrs = addr.to_socket_addrs().map_err(|_| PlanError::Unavailable)?;
-    let sock_addr = addrs.next().ok_or(PlanError::Unavailable)?;
+    // 名前解決＋接続試行の全体に対する締切。名前解決だけで枠を使い切った場合、
+    // 以降の接続試行はゼロ幅の `remaining`（即タイムアウト）として扱われる。
+    let deadline = Instant::now() + config.connect_timeout;
+    let addrs = resolve_socket_addrs(config, deadline)?;
 
-    let mut stream = TcpStream::connect_timeout(&sock_addr, config.connect_timeout)
-        .map_err(classify_io_error)?;
+    // 名前解決で複数候補（IPv4/IPv6 混在含む）が返る場合、先頭 1 件のみを試すと
+    // その 1 件が到達不能なだけで常に Unavailable になりうる（codex-review PR #252
+    // P1 指摘）。締切内で候補を順に試し、最後に観測したエラーを返す。
+    let mut stream: Option<TcpStream> = None;
+    let mut last_err = PlanError::Unavailable;
+    for sock_addr in &addrs {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            last_err = PlanError::Timeout;
+            break;
+        }
+        match TcpStream::connect_timeout(sock_addr, remaining) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = classify_io_error(e),
+        }
+    }
+    let mut stream = stream.ok_or(last_err)?;
+
     stream
         .set_read_timeout(Some(config.read_timeout))
         .map_err(classify_io_error)?;
@@ -1560,6 +1621,51 @@ mod tests {
 
         let client = OllamaClient::new(config_for(addr));
         assert_eq!(client.complete("q").unwrap_err(), PlanError::Unavailable);
+    }
+
+    #[test]
+    fn ollama_client_connects_via_ipv6_literal_host() {
+        // codex-review PR #252 P1 指摘の回帰確認: `config.host` に IPv6 リテラル
+        // （`::1`）を設定した場合、`format!("{host}:{port}")` による
+        // アドレス文字列組み立て（`::1:PORT` は不正な文字列になる）ではなく
+        // `(host, port)` タプル形式の `ToSocketAddrs` を使うことで正しく接続できる
+        // ことを確認する。
+        let listener = TcpListener::bind("[::1]:0").expect("bind ipv6 stub listener");
+        let addr = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut reader = BufReader::new(socket.try_clone().expect("clone socket"));
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = br#"{"model":"test-model","response":"{\"search_terms\":[\"a\"],\"path_hint\":null,\"kind_hint\":null}","done":true}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes());
+                let _ = socket.write_all(body);
+            }
+        });
+
+        let mut config = OllamaConfig::new("test-model");
+        // `SocketAddr::ip().to_string()` は IPv6 を `::1` のように角括弧なしで返す
+        // （`config.host` はホスト名のみを保持する契約のため、ここでもその形式に揃える）。
+        config.host = addr.ip().to_string();
+        config.port = addr.port();
+        config.connect_timeout = Duration::from_secs(2);
+        config.read_timeout = Duration::from_secs(2);
+
+        let client = OllamaClient::new(config);
+        let expansion = client
+            .complete("q")
+            .expect("ipv6 loopback connection should succeed");
+        assert!(expansion.contains("search_terms"));
     }
 
     #[test]
