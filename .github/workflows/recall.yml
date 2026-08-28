@@ -167,3 +167,36 @@ jobs:
           RERANK_RECALL_MIN_R20_LARGE: ${{ vars.RERANK_RECALL_MIN_R20_LARGE }}
           RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ vars.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
         run: make rerank-regression
+      - name: Run query-planning-regression
+        # TASK-112（PLAN-1, PLAN-2）の層 B（`crates/engine/tests/query_planning_recall.rs`）。
+        # 数値基準（intent カテゴリの改善幅下限・direct カテゴリの after Recall@20
+        # 絶対下限・NoisyLlmClient〔非 oracle・劣化展開品質〕による intent 改善幅
+        # 下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
+        # step と同じ environment `recall-gate`（job の `environment:` 参照）の
+        # Actions variables から注入する。
+        #
+        # `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` は、既存 2 変数
+        # （`MockLlmClient` の完全 oracle 写像専用に較正）を `NoisyLlmClient` の
+        # 実測へ流用すると誤検知することが実測で確認された（codex-review・PR #265・
+        # P1 指摘への対応。`crates/engine/tests/query_planning_recall.rs::
+        # query_planning_recall_threshold_gate` のドキュメンテーションコメント・
+        # `docs/design/query-planning-recall-regression.md` 参照）ため、劣化展開
+        # シナリオ専用の下限として独立に追加した変数。
+        #
+        # `QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント
+        # 参照）を常に注入する: `QUERY_PLANNING_RECALL_MIN_*` が未設定の場合、この
+        # workflow からの実行では fail-closed でテスト失敗とし、「一度も評価して
+        # いない run」を green にしない。ローカルの `make query-planning-regression`
+        # にはこのフラグを注入しないため、そちらは未設定を「対象外」として成功終了
+        # する opt-in 挙動を維持する（`crates/engine/tests/query_planning_recall.rs::
+        # resolve_gate_threshold_with` 参照）。設定済みで非数値・範囲外の場合は
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログ
+        # には実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
+        # 出力しない。
+        env:
+          QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS: "1"
+          QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT: ${{ vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT }}
+          QUERY_PLANNING_RECALL_MIN_R20_DIRECT: ${{ vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT }}
+          QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED: ${{
+            vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED }}
+        run: make query-planning-regression
