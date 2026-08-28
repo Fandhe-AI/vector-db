@@ -1369,9 +1369,7 @@ impl EngineCore {
     ///    エラーが伝播し、以降の埋め込み呼び出しは実行しない）
     /// 4. [`crate::query_planner::reembed_expansion`] で再埋め込み
     ///
-    /// 再埋め込みの合成・引数の取り方は `docs/spec/04-behavior/query-planning.md`
-    /// PLAN-10・`query_planner.rs` モジュールドキュメントの規則に従う（規則本文は
-    /// spec 側・本メソッドはその実装）。テーブルスキーマ参照は `execute_insert_sql`
+    /// テーブルスキーマ参照は `execute_insert_sql`
     /// 等の既存経路（`self.storage.get_table_schema`）と同じ流儀を用い、新規の
     /// RLS バイパス経路は作らない（対象はテーブル構造メタデータでありテナント行
     /// データではないため、`ctx` によるフィルタ対象外。`(table, ctx)` に対する

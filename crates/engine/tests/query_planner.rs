@@ -348,8 +348,8 @@ fn plan_query_prefix_is_isolated_per_tenant() {
 // =====================================================================================
 
 /// 埋め込み呼び出しを記録しつつ、実ベクトルは決定的な [`HashingEmbedder`] へ委譲する
-/// スパイ `Embedder`。TASK-114・PLAN-10 の「再埋め込みテキストが構造的に
-/// `render_reembedding_text` の出力と一致すること」「使い回し禁止」の検証に使う。
+/// スパイ `Embedder`。`embed_batch` へ渡されたテキストを記録し、TASK-114・PLAN-10 の
+/// 回帰テストから参照する。
 struct SpyEmbedder {
     inner: HashingEmbedder,
     seen_texts: Arc<Mutex<Vec<String>>>,
