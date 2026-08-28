@@ -24,6 +24,7 @@ use engine::error_format::{ClassifiedError, ErrorClass};
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
+use engine::sql::allowlist::SqlSurfaceError;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::TenantWriteError;
 
@@ -87,6 +88,25 @@ fn err3_content_mismatch_wire_code_is_exclusive_to_its_own_class() {
     assert_eq!(
         ErrorClass::from_wire_code(mismatch_code),
         Some(mismatch_class)
+    );
+
+    // `SqlSurfaceError::OperationIdContentMismatch` 自身の写像を明示的に検証する。
+    // ここまでの検証は `ErrorClass::OperationIdContentMismatch` という値そのものに
+    // 閉じており、SQL 表層の variant → `ErrorClass` の対応（TASK-152・ERR-2 の
+    // `match` 表）が誤って `UniqueViolation` 等の別分類を返しても検出できない
+    // （codex-review 指摘）。`ClassifiedError` トレイト経由で `wire_code()` /
+    // `error_class()` の両方を突き合わせ、`UniqueViolation`（`23505`）への
+    // 誤写像がないことも合わせて確認する。
+    let sql_err = SqlSurfaceError::OperationIdContentMismatch;
+    assert_eq!(
+        ClassifiedError::error_class(&sql_err),
+        ErrorClass::OperationIdContentMismatch
+    );
+    assert_eq!(ClassifiedError::wire_code(&sql_err), "22023");
+    assert_ne!(
+        ClassifiedError::error_class(&sql_err),
+        ErrorClass::UniqueViolation,
+        "SqlSurfaceError::OperationIdContentMismatch は UniqueViolation へ誤写像してはならない"
     );
 }
 
@@ -240,6 +260,13 @@ fn err3_client_message_never_leaks_content_or_tenant_on_update() {
     let core = new_core(&path);
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
+    // 推測しにくい operation_id を用意する。固定の短い値（"op-upd" 等）だと、
+    // client_message の固定文言（例: "operation_id already recorded with
+    // different content"）に偶然含まれる部分文字列と衝突しない保証がなく、
+    // operation_id 自体が client_message() に混入する回帰（codex-review 指摘）を
+    // 検出できない。
+    const SECRET_OP_ID: &str = "op-9f3ac71e2b8d4f0a9c6e5d1b7a4f2e08";
+
     core.insert_row(
         &ctx,
         TABLE,
@@ -253,7 +280,7 @@ fn err3_client_message_never_leaks_content_or_tenant_on_update() {
         TABLE,
         1,
         &row(&[0.4, 0.5, 0.6], b"updated-once"),
-        Some(&op("op-upd")),
+        Some(&op(SECRET_OP_ID)),
     )
     .expect("first update");
 
@@ -263,7 +290,7 @@ fn err3_client_message_never_leaks_content_or_tenant_on_update() {
             TABLE,
             1,
             &row(&[0.7, 0.7, 0.7], b"top-secret-marker"),
-            Some(&op("op-upd")),
+            Some(&op(SECRET_OP_ID)),
         )
         .expect_err("different content resend must be rejected");
     assert_eq!(err.wire_code(), "22023");
@@ -280,5 +307,9 @@ fn err3_client_message_never_leaks_content_or_tenant_on_update() {
     assert!(
         !msg.contains("updated-once"),
         "client_message は旧内容も運ばない: {msg}"
+    );
+    assert!(
+        !msg.contains(SECRET_OP_ID),
+        "client_message は operation_id を運ばない: {msg}"
     );
 }
