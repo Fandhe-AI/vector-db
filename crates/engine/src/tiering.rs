@@ -40,8 +40,7 @@ pub const MAX_QUESTION_CHARS: usize = crate::query_planner::MAX_QUESTION_CHARS;
 /// 極端に多い入力でも判定処理の線形走査量を頭打ちにする）。
 pub const MAX_TOKENS: usize = 256;
 
-/// 質問の類型。既定の類型→ティア割り当ては [`tier_for_class`] を参照
-/// （モジュールドキュメント「既定の類型→ティア割り当て」）。
+/// 質問の類型。既定の類型→ティア割り当ては [`tier_for_class`] を参照。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionClass {
     /// 具体的なシンボル名・パスを名指ししている（対話ティア相当）。
@@ -89,7 +88,8 @@ pub struct Classification {
 }
 
 /// `class` に対する既定のティア割り当て（本モジュールの現行実装が採用する既定値。
-/// モジュールドキュメント「既定の類型→ティア割り当て」参照）。
+/// 具体の割り当ては TASK-115・PLAN-8 の設計事項であり、詳細は実装本体または
+/// `docs/design/query-tiering-criteria.md`（ポインタ表記）を参照）。
 pub fn tier_for_class(class: QuestionClass) -> Tier {
     match class {
         QuestionClass::Direct => Tier::Dialogue,
@@ -162,10 +162,13 @@ fn ascii_lower(s: &str) -> String {
 /// トークンの前後から除去する境界句読点。シンボル名・パスの内部で意味を持つ
 /// `_`・`-`・`/` は対象外とする。`.` は末尾側のみの対象とし（[`TRAILING_ONLY`]）、
 /// 先頭側では除去しない（`.gitignore` のような先頭ドット付きファイル名を
-/// `Dictionary::file_tree` 側の生パスと一致させるため。Bugbot 指摘対応）。
+/// `Dictionary::file_tree` 側の生パスと一致させるため。Bugbot 指摘対応）。バッククォート
+/// （\`）も対象に含める（Markdown のコードスパン記法 \`symbol\` で囲んだシンボル名・
+/// パスを自然文中で名指しした場合に、除去せず残すと辞書側の生の値と一致しなくなる
+/// ため。Bugbot 指摘対応）。
 const TOKEN_BOUNDARY_PUNCTUATION: &[char] = &[
-    '?', '!', ',', ';', ':', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>', '、', '。', '！',
-    '？', '「', '」', '『', '』',
+    '?', '!', ',', ';', ':', '\'', '"', '`', '(', ')', '[', ']', '{', '}', '<', '>', '、', '。',
+    '！', '？', '「', '」', '『', '』',
 ];
 
 /// [`TOKEN_BOUNDARY_PUNCTUATION`] に加え、末尾側でのみ除去する句読点（`core.rs.`
@@ -221,16 +224,10 @@ fn extension_of(token: &str) -> Option<&str> {
 /// 経由。本関数自体はテナント境界の判断を持たず、渡された `dictionary` をそのまま
 /// 使う純粋関数）。
 ///
-/// 優先順（モジュールドキュメント「fail-safe の方向」も参照）:
-/// 1. トークンが辞書シンボル名（[`Dictionary::symbols`]）に完全一致 → [`QuestionClass::Direct`]
-/// 2. パス様トークン（[`Dictionary::file_tree`] のパスへの一致、または
-///    `criteria.path_like_extensions` の拡張子を持つトークン）→ [`QuestionClass::Direct`]
-/// 3. `criteria.abstraction_cues` に一致する手掛かり語を含む → [`QuestionClass::Abstraction`]
-/// 4. 上記以外 → [`QuestionClass::Intent`]
-///
-/// 空入力・[`MAX_QUESTION_CHARS`] 超過・[`MAX_TOKENS`] 超過はいずれも縮退値として
-/// fail-safe 側（[`QuestionClass::Intent`]）へ倒す（トークン数超過を黙って切り捨てて
-/// `Direct`/`Dialogue` 側に誤分類しない）。
+/// 判定の優先順・縮退時の fail-safe の方向は TASK-115・PLAN-8 の設計事項（最終確定
+/// 含めオーナー判断待ちの範囲を含む）であり、本ドキュメンテーションコメントでは
+/// 詳細を記載しない。実装（本関数の実装本体）または `docs/design/query-tiering-criteria.md`
+/// （ポインタ表記）を参照。
 pub fn classify(
     question: &str,
     dictionary: &Dictionary,
@@ -295,8 +292,8 @@ fn make(class: QuestionClass, signal: ClassificationSignal) -> Classification {
     }
 }
 
-/// 縮退時の fail-safe 判定（[`QuestionClass::Intent`]＝高精度ティアへ倒す。
-/// モジュールドキュメント「fail-safe の方向」参照）。
+/// 縮退時の fail-safe 判定。具体の倒し先は TASK-115・PLAN-8 の設計事項であり、
+/// 詳細は実装本体を参照。
 fn fail_safe(signal: ClassificationSignal) -> Classification {
     make(QuestionClass::Intent, signal)
 }
@@ -481,6 +478,29 @@ mod tests {
         let dict = empty_dictionary();
         let criteria = TieringCriteria::default();
         let result = classify("open core.rs, please", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::PathMatch);
+    }
+
+    #[test]
+    fn backtick_wrapped_symbol_matches_despite_code_span_markup() {
+        // Markdown のコードスパン記法 `symbol` で囲んだシンボル名がバッククォート
+        // ごと比較され辞書側の生の値と不一致にならないことを確認する
+        // （Bugbot 指摘: Backticks block symbol and path matches）。
+        let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
+        let criteria = TieringCriteria::default();
+        let result = classify("what does `parse_expansion` do", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
+    }
+
+    #[test]
+    fn backtick_wrapped_path_matches_despite_code_span_markup() {
+        let dict = empty_dictionary();
+        let criteria = TieringCriteria::default();
+        let result = classify("open `core.rs` and check it", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::PathMatch);
