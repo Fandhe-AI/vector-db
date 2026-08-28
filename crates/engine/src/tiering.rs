@@ -16,6 +16,11 @@
 //! （[`tier_for_class`]・[`TieringCriteria`]・[`classify`] の各ドキュメンテーション
 //! コメント、または `docs/design/query-tiering-criteria.md` 参照）。
 //!
+//! fail-safe の方向（security.md「不安全な設計」対応）: 判定が不確実・空入力・
+//! 上限超過などの縮退時は [`QuestionClass::Intent`]（＝高精度ティア）へ倒す。
+//! 誤って対話ティア（軽量）に倒して品質劣化するより、高精度ティアでレイテンシを
+//! 払う側を安全側とする（「正解を含むデータ群を広く返す」設計思想と整合）。
+//!
 //! untrusted 入力対応: `question` は wire 経由の未検証入力であるため、添字アクセス・
 //! `unwrap`/`expect` を使わず、決定的・線形時間のトークナイズのみを行う
 //! （coding-rust.md「untrusted 入力の扱い」）。長さ・トークン数はいずれも上限
@@ -312,8 +317,7 @@ fn make(class: QuestionClass, signal: ClassificationSignal) -> Classification {
 }
 
 /// 縮退時の fail-safe 判定（[`QuestionClass::Intent`]＝高精度ティアへ倒す。
-/// モジュールドキュメント「責務境界」直下の記述、および
-/// `docs/design/query-tiering-criteria.md` 参照）。
+/// モジュールドキュメント「fail-safe の方向」参照）。
 fn fail_safe(signal: ClassificationSignal) -> Classification {
     make(QuestionClass::Intent, signal)
 }
