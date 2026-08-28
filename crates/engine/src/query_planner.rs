@@ -969,11 +969,22 @@ fn http_post_json(config: &OllamaConfig, path: &str, body: &str) -> Result<Vec<u
         .set_write_timeout(Some(config.read_timeout))
         .map_err(classify_io_error)?;
 
+    // IPv6 リテラル（例: `::1`）はそのまま `Host:` ヘッダへ書くと `:` がポート区切りと
+    // 混同され曖昧になるため、RFC 3986 に従い `[...]` で囲む（Cursor Bugbot PR #252
+    // 指摘）。`config.host()` はホスト名／IPv4／IPv6 リテラルのいずれも保持しうる契約
+    // （`resolve_socket_addrs` のドキュメント参照）のため、`:` を含む場合のみ角括弧を
+    // 付与する（IPv4・ホスト名は `:` を含まないため無変換）。
+    let raw_host = config.host();
+    let header_host = if raw_host.contains(':') {
+        format!("[{raw_host}]")
+    } else {
+        raw_host.to_string()
+    };
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
          Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
         path = path,
-        host = config.host(),
+        host = header_host,
         len = body.len(),
         body = body,
     );
@@ -1692,20 +1703,28 @@ mod tests {
         // （`::1`）を設定した場合、`format!("{host}:{port}")` による
         // アドレス文字列組み立て（`::1:PORT` は不正な文字列になる）ではなく
         // `(host, port)` タプル形式の `ToSocketAddrs` を使うことで正しく接続できる
-        // ことを確認する。
+        // ことを確認する。あわせて Cursor Bugbot PR #252 指摘の回帰確認として、
+        // 送信された `Host:` ヘッダが `[::1]`（RFC 3986 の角括弧付き）形式に
+        // なっていることをスタブ側で受信した生リクエストから検証する。
         let listener = TcpListener::bind("[::1]:0").expect("bind ipv6 stub listener");
         let addr = listener.local_addr().expect("local addr");
+        let (header_tx, header_rx) = mpsc::channel::<String>();
         thread::spawn(move || {
             if let Ok((mut socket, _)) = listener.accept() {
                 let mut reader = BufReader::new(socket.try_clone().expect("clone socket"));
                 let mut request_line = String::new();
                 let _ = reader.read_line(&mut request_line);
+                let mut host_header = String::new();
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
+                    if line.to_ascii_lowercase().starts_with("host:") {
+                        host_header = line.trim_end().to_string();
+                    }
                 }
+                let _ = header_tx.send(host_header);
                 let body = br#"{"model":"test-model","response":"{\"search_terms\":[\"a\"],\"path_hint\":null,\"kind_hint\":null}","done":true}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -1718,7 +1737,7 @@ mod tests {
 
         // `SocketAddr::ip().to_string()` は IPv6 を `::1` のように角括弧なしで返す
         // （`OllamaConfig::with_host` はホスト名のみを保持する契約のため、ここでも
-        // その形式に揃える）。
+        // その形式に揃え、角括弧の付与は `http_post_json` 側の責務とする）。
         let mut config = OllamaConfig::new("test-model")
             .with_host(addr.ip().to_string())
             .expect("ipv6 loopback address")
@@ -1731,6 +1750,14 @@ mod tests {
             .complete("q")
             .expect("ipv6 loopback connection should succeed");
         assert!(expansion.contains("search_terms"));
+
+        // Host ヘッダはポート番号を含まない既存契約（本修正のスコープ外。
+        // Cursor Bugbot PR #252 指摘は角括弧欠落のみを対象とする）のため、
+        // 角括弧付きホストのみを検証する。
+        let host_header = header_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stub should capture Host header");
+        assert_eq!(host_header, "Host: [::1]");
     }
 
     #[test]
