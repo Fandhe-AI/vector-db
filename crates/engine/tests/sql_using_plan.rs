@@ -134,6 +134,24 @@ impl Embedder for NonFiniteEmbedder {
     }
 }
 
+/// 要求 1 件に対し常に 2 件のベクトルを返す埋め込み（codex-review P1 回帰用:
+/// `EngineCore::plan_using_plan_expansion` が `embed_batch` の戻り値件数を
+/// 検証せず `into_iter().next()` で先頭 1 件のみを黙って採用していた契約違反、
+/// PR #266）。
+struct TooManyVectorsEmbedder {
+    dim: u32,
+}
+
+impl Embedder for TooManyVectorsEmbedder {
+    fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(vec![vec![0.1; self.dim as usize]; texts.len() + 1])
+    }
+}
+
 struct FailingLlmClient;
 
 impl LlmClient for FailingLlmClient {
@@ -483,6 +501,36 @@ fn using_plan_rejects_non_finite_reembedded_vector() {
         )
         .expect_err("non-finite re-embedded vector must be rejected");
     assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
+fn using_plan_rejects_embedder_returning_multiple_vectors_for_single_query() {
+    // codex-review P1 回帰（PR #266）: `plan_using_plan_expansion` は要求 1 件
+    // （`dense_query_text` の 1 要素スライス）に対し `embed_batch` の戻り値が
+    // 厳密に 1 件であることを確認せず、`into_iter().next()` で先頭 1 件のみを
+    // 黙って採用していた。これは `query_planner::reembed_expansion`
+    // （`vectors.len() != 1` を `EmbedError::InvalidResponse` で fail-closed に
+    // 拒否）が課す既存の防御を迂回する契約違反応答の黙認であり、`USING PLAN`
+    // 経路だけ異なる（緩い）挙動になっていた。ここでは常に 2 件のベクトルを
+    // 返す `Embedder` を注入し、`USING PLAN` が成功として扱わず fail-closed に
+    // 拒否することを固定する（修正前は本テストが `expect_err` の代わりに
+    // `Ok` を返し fail する）。
+    let path = unique_db_path("sql-using-plan-too-many-vectors");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(TooManyVectorsEmbedder { dim: DIM }))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("embedder returning multiple vectors for a single query must be rejected");
+    assert_eq!(err.wire_code(), "XX000");
 }
 
 #[test]

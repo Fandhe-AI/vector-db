@@ -1852,6 +1852,21 @@ impl EngineCore {
             .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("USING PLAN re-embedding failed: {e}"),
             })?;
+        // 要求は 1 件（`dense_query_text` の 1 要素スライス）のため、応答も
+        // 厳密に 1 件でなければ untrusted な `Embedder` 実装の契約違反として
+        // fail-closed に拒否する（codex-review P1 指摘対応、PR #266）。
+        // 以前は `into_iter().next()` で先頭 1 件のみを黙って採用しており、
+        // 複数ベクトルを返す契約違反応答を成功として扱っていた。
+        // `query_planner::reembed_expansion` が課す同種の検証
+        // （`vectors.len() != 1` を `EmbedError::InvalidResponse` で拒否）と
+        // 揃えつつ、本メソッドの既存エラー契約（`SqlSurfaceError::Internal`・
+        // `XX000`）は変えない最小差分とする。
+        if embedded.len() != 1 {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "embedder returned unexpected vector count for USING PLAN query"
+                    .to_string(),
+            });
+        }
         let query_vector = embedded.into_iter().next().ok_or_else(|| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: "embedder returned no vector for USING PLAN query".to_string(),
