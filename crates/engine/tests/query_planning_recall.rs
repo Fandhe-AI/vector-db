@@ -419,14 +419,59 @@ impl LlmClient for MockLlmClient {
     }
 }
 
+/// [`MockLlmClient`]（完全 oracle 写像）よりも劣化した展開品質を模する決定的スタブ
+/// `LlmClient`。言い換え語彙のうち半数（インデックス偶奇で決定的に選出）だけを
+/// コーパス内容語へ正しく写像し、残り半数は写像に失敗した production LLM を模して
+/// 元の言い換え語彙のまま通す（= 密チャネル・疎チャネルいずれからも手がかりを
+/// 得られない語として残る）。codex-review（PR #265・P2）が指摘した「層 B の受け入れ
+/// ゲートが `MockLlmClient` の完全 oracle 写像に依存し、展開品質の劣化を検出できない」
+/// という制約に対応するため、[`query_planning_recall_detects_degraded_expansion_quality`]
+/// でこの劣化構成を実測し、完全写像との Recall@20 差を独立にアサートする。
+struct NoisyLlmClient;
+
+impl LlmClient for NoisyLlmClient {
+    fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+        let question = prompt
+            .split("# Question\n")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or("");
+
+        let mapped_terms: Vec<String> = question
+            .split_whitespace()
+            .map(|token| match parse_synonym_index(token) {
+                // 偶数インデックスのみ正しく写像し、奇数インデックスは意図的に
+                // 未写像のまま通す（production LLM の部分的な写像失敗を模する）。
+                Some(idx) if idx % 2 == 0 => topic_token(idx),
+                _ => token.to_string(),
+            })
+            .collect();
+
+        let terms_json = mapped_terms
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "{{\"search_terms\":[{terms_json}],\"path_hint\":null,\"kind_hint\":null}}"
+        ))
+    }
+}
+
 /// `baseline_query_text` を質問として [`query_planner::render_full_prompt`]（固定
-/// 接頭辞は空文字列）→ [`MockLlmClient::complete`] → [`query_planner::
+/// 接頭辞は空文字列）→ `client.complete` → [`query_planner::
 /// parse_expansion`] の一連（production API）に通し、得られた [`QueryExpansion::
 /// search_terms`] から再構成クエリ（疎チャネル用テキスト・密チャネル用 one-hot
-/// ベクトル）を組み立てる。
-fn expand_and_reconstruct(vocab_size: usize, baseline_query_text: &str) -> (String, Vec<f32>) {
+/// ベクトル）を組み立てる。`client` を差し替え可能にすることで、[`MockLlmClient`]
+/// の完全 oracle 写像に限らず、[`NoisyLlmClient`] のような劣化展開品質のシナリオも
+/// 同じ経路で測定できる。
+fn expand_and_reconstruct_with(
+    client: &dyn LlmClient,
+    vocab_size: usize,
+    baseline_query_text: &str,
+) -> (String, Vec<f32>) {
     let prompt = render_full_prompt("", baseline_query_text).expect("render_full_prompt ok");
-    let response = MockLlmClient.complete(&prompt).expect("mock complete ok");
+    let response = client.complete(&prompt).expect("mock complete ok");
     let expansion: QueryExpansion = parse_expansion(&response).expect("parse_expansion ok");
 
     let text = expansion.search_terms.join(" ");
@@ -462,14 +507,15 @@ impl CategoryRecallResult {
 
 /// [`SparseIndex::build`]・[`ParallelSearchProvider`]・[`hybrid_search`]
 /// （`RrfConfig::default()`）で baseline（`baseline_query_fn` が組み立てるクエリ）・
-/// after（[`expand_and_reconstruct`] 経由の再構成クエリ）の Recall@20 を測定する。
-/// BM25/RRF/JSON パースの再実装はテスト内で行わない（production コード
-/// `crates/engine/src/` は変更しない）。
-fn measure_category_recall(
+/// after（`client` を通した [`expand_and_reconstruct_with`] 経由の再構成クエリ）の
+/// Recall@20 を測定する。BM25/RRF/JSON パースの再実装はテスト内で行わない
+/// （production コード `crates/engine/src/` は変更しない）。
+fn measure_category_recall_with_client(
     docs: &[Doc],
     pairs: &[PairQa],
     vocab_size: usize,
     baseline_query_fn: impl Fn(usize, &PairQa) -> (String, Vec<f32>),
+    client: &dyn LlmClient,
 ) -> CategoryRecallResult {
     let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
     let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
@@ -518,7 +564,8 @@ fn measure_category_recall(
             .filter(|h| pair.correct.contains(&h.id))
             .count();
 
-        let (after_text, after_vector) = expand_and_reconstruct(vocab_size, &baseline_text);
+        let (after_text, after_vector) =
+            expand_and_reconstruct_with(client, vocab_size, &baseline_text);
         let after_input = SearchInput {
             ids: &ids,
             vectors: &vectors,
@@ -541,6 +588,17 @@ fn measure_category_recall(
         after_hits20,
         ceil20,
     }
+}
+
+/// [`measure_category_recall_with_client`] を [`MockLlmClient`]（完全 oracle 写像）で
+/// 固定した従来の呼び出し口（既存の層 A/B テストが使う既定経路）。
+fn measure_category_recall(
+    docs: &[Doc],
+    pairs: &[PairQa],
+    vocab_size: usize,
+    baseline_query_fn: impl Fn(usize, &PairQa) -> (String, Vec<f32>),
+) -> CategoryRecallResult {
+    measure_category_recall_with_client(docs, pairs, vocab_size, baseline_query_fn, &MockLlmClient)
 }
 
 // ---------- 層 A: 相対関係による回帰トラッキング（PR CI 常時実行） ----------
@@ -629,6 +687,61 @@ fn query_planning_recall_regression() {
     assert!(
         intent.baseline_hits20 < direct.baseline_hits20,
         "intent カテゴリ baseline（展開なし）が direct カテゴリ baseline を下回らなかった"
+    );
+}
+
+/// TASK-112（PLAN-1, PLAN-2）層 A 追補: codex-review（PR #265・P2）が指摘した
+/// 「層 B の受け入れゲートが `MockLlmClient` の完全 oracle 写像に依存し、production
+/// の LLM 応答品質・展開戦略の劣化を検出できない」という制約に対応する。[`MockLlmClient`]
+/// （言い換え語彙を完全に写像）と [`NoisyLlmClient`]（半数だけ写像し、残り半数は
+/// 未写像のまま通す＝展開品質が劣化した production LLM を模する）の両方で intent
+/// カテゴリの Recall@20 を実測し、劣化側が完全写像側を厳密に下回ることを独立に
+/// アサートする。これにより、本ハーネスは「`MockLlmClient` が返す固定値をなぞる」
+/// だけでなく、展開品質そのものの劣化を検出できることを回帰保証する（oracle 写像に
+/// 依存しない展開品質評価の追加）。
+#[test]
+fn query_planning_recall_detects_degraded_expansion_quality() {
+    let (docs, pairs) = generate_corpus(SEED, NUM_DOCS, NUM_PAIRS, VOCAB_SIZE);
+    assert_corpus_within_limits(&docs);
+    assert!(!pairs.is_empty());
+
+    let full_oracle = measure_category_recall_with_client(
+        &docs,
+        &pairs,
+        VOCAB_SIZE,
+        intent_baseline,
+        &MockLlmClient,
+    );
+    let degraded = measure_category_recall_with_client(
+        &docs,
+        &pairs,
+        VOCAB_SIZE,
+        intent_baseline,
+        &NoisyLlmClient,
+    );
+
+    // 実測の Recall・hit 数は標準出力（public な CI ログ）へ出さない。
+    println!(
+        "=== TASK-112 展開品質劣化検出（docs={} pairs={} vocab={}） ===",
+        docs.len(),
+        pairs.len(),
+        VOCAB_SIZE
+    );
+
+    // 展開品質が劣化した NoisyLlmClient は、完全 oracle 写像の MockLlmClient を
+    // Recall@20 で厳密に下回る（本ハーネスが展開戦略の劣化を検出できることの
+    // 独立したアサーション。この不等号が崩れた場合、劣化検出感度が失われている）。
+    assert!(
+        degraded.after_hits20 < full_oracle.after_hits20,
+        "展開品質が劣化した NoisyLlmClient の Recall@20 hit 数が、完全 oracle 写像の \
+         MockLlmClient を下回らなかった（劣化検出感度が失われている）"
+    );
+    // それでも NoisyLlmClient は baseline（展開なし）よりは改善する（半数は正しく
+    // 写像されるため）。劣化検出テストが「展開が完全に無意味になった」極端な構成に
+    // 依存していないことを示す。
+    assert!(
+        degraded.after_hits20 > degraded.baseline_hits20,
+        "展開品質が劣化した NoisyLlmClient でも baseline（展開なし）を上回らなかった"
     );
 }
 

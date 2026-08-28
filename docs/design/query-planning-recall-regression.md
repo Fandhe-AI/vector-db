@@ -100,3 +100,12 @@
   比較である。層 A は「回帰（数値の意図しない変化）の検出」を目的とし、
   「絶対水準としての受け入れ基準の判定」は層 B（spec 閾値ゲート）が担うという
   役割分担は TASK-104/TASK-108 と同一
+- **展開品質の劣化検出**（codex-review・PR #265・P2 指摘への追補）: 上記の制約は
+  「層 A の相対関係アサーションが `MockLlmClient` の完全 oracle 写像を前提に構造上
+  自明に成立する」ことを述べたものであり、「本ハーネス全体が完全 oracle 写像でしか
+  評価できない」ことを意味しない。`crates/engine/tests/query_planning_recall.rs::
+  query_planning_recall_detects_degraded_expansion_quality`（層 A・PR CI 常時実行）
+  が、言い換え語彙の半数のみを正しく写像し残り半数を未写像のまま通す
+  `NoisyLlmClient`（劣化した production LLM 応答を模する決定的スタブ）を追加し、
+  完全 oracle 写像（`MockLlmClient`）との Recall@20 差を独立にアサートすることで、
+  展開戦略の劣化そのものを検出できることを回帰保証する
