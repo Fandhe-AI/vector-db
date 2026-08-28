@@ -1,8 +1,8 @@
 //! LLM クエリプランニングのソフトブーストヒント（`hybrid.rs` の `BoostRule`／
 //! `hybrid_search_boosted`。TASK-111・PLAN-1）と RLS 事前フィルタ（`tenant.rs`・
 //! `rls.rs`。TASK-133）の統合検証（TASK-139。対象ビヘイビア: なし〔基盤〕。ポインタ:
-//! `docs/spec/04-behavior/rls.md`・`core-engine.md`「制約・宿題」節・
-//! `query-planning.md`）。
+//! `docs/spec/04-behavior/rls.md`・`docs/spec/04-behavior/core-engine.md`・
+//! `docs/spec/04-behavior/query-planning.md`）。
 //!
 //! 両機構が実際に合流するのは engine クレート内の「RLS 事前フィルタ済み候補集合
 //! （`tenant::visible_rows`）→ ヒント一致判定（`hybrid::path_hint_matches`/
@@ -14,9 +14,9 @@
 //! （engine API 層での検証に限定する。`docs/design/rls-generalized-read-paths.md` と
 //! 同じスコープ境界の整理）。
 //!
-//! 検証観点の設計は本来 spec 上「人間」担当（TASK-139）のため、本ファイルが固定する
-//! V1〜V5 の各観点は `docs/design/plan-rls-boost-interaction.md`（Proposed）でオーナーの
-//! 追認を待つ。各観点のテスト関数は同レポートの節と対応する。
+//! 本ファイルが固定する V1〜V5 の各観点は `docs/design/plan-rls-boost-interaction.md`
+//! （TASK-139・Proposed。オーナー確認前）でオーナーの追認を待つ。各観点のテスト関数は
+//! 同レポートの節と対応する。
 
 use std::collections::BTreeSet;
 
@@ -452,6 +452,88 @@ fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
 }
 
 // ---------------------------------------------------------------------------
+// 検証コードの既知の限界（`docs/design/plan-rls-boost-interaction.md`「検証コードの
+// 既知の限界」節）: 上の V1〜V5 の各テストは「単一 ctx の可視集合内では候補識別子が
+// 重複しない」前提のコーパスを使う（tenant-b の不可視行は tenant-a の可視行と数値 id
+// が衝突するが、可視集合には現れない）。しかし一般には、同一 ctx の可視集合自体が
+// 同一の数値 id を複数含みうる（自テナントの行と、別テナントの `Public` 行が同じ id
+// を持つ場合。TABLE-12）。本テストはこのケースを直接構築し、`HybridHit` がテナント
+// 修飾を持たないため id だけでは 2 行を区別できない状況を再現する。
+//
+// raw id をそのまま `SearchInput::ids` へ渡す本ファイルの構築手順
+// （`rls_filtered_candidates`）を通した場合、`rrf_fuse` の重複検証
+// （`HybridError::DuplicateId`。同一 id の複数回出現を fail-closed に拒否する契約）に
+// 阻まれ、結果が黙って混同されることはない——2 行が「誤ってどちらもブーストされる」
+// のではなく、検索そのものが安全に拒否されることを固定する。これは統合実装時の
+// 必須要件（本ドキュメントの「統合時の実装規約」。候補識別子はスロット番号方式を
+// 使う）を代替するものではない——`DuplicateId` は raw id をそのまま渡した場合の
+// fail-closed な保険であり、スロット番号方式を採らない実装が許容されるわけではない。
+// ---------------------------------------------------------------------------
+#[test]
+fn raw_id_collision_within_visible_set_is_rejected_fail_closed() {
+    let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
+    let ctx = ctx_a();
+
+    // tenant-a 自身の行（ヒント一致・可視）と、別テナントの `Public` 行（ヒント非
+    // 一致・可視）が同一の数値 id（=7）を持つ、ctx_a の可視集合内での衝突を構築する。
+    let docs = vec![
+        DocMeta {
+            id: 7,
+            tenant: TENANT_A,
+            visibility: Visibility::Public,
+            vector: [0.9, 0.0],
+            text: "own",
+            path: "src/hybrid/own.rs",
+            kind: "doc",
+        },
+        DocMeta {
+            id: 7,
+            tenant: TENANT_B,
+            visibility: Visibility::Public,
+            vector: [0.5, 0.0],
+            text: "other-public",
+            path: "src/other/other.rs",
+            kind: "code",
+        },
+    ];
+    let (_cleanup, storage) = open_corpus("plan-rls-boost-id-collision", &docs);
+
+    let (ids, vectors) = rls_filtered_candidates(&storage, &ctx);
+    assert_eq!(
+        ids,
+        vec![7, 7],
+        "tenant-a's own row and tenant-b's Public row must both be visible to ctx_a while \
+         sharing the same raw id=7 (TABLE-12: id uniqueness is scoped per-tenant, not per-table)"
+    );
+
+    let index = sparse_index_for(&docs, &ids);
+    let rule_ids = correct_path_hint_ids(&storage, &ctx, &docs, "src/hybrid");
+    let rule = BoostRule::new(&rule_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
+    let input = SearchInput {
+        ids: &ids,
+        vectors: &vectors,
+        dim: DIM,
+        query: &QUERY_VECTOR,
+        k: 2,
+    };
+    let result = hybrid_search_boosted(
+        &CpuScalarProvider,
+        input,
+        &index,
+        QUERY_TEXT,
+        2,
+        &cfg,
+        &[rule],
+    );
+    assert_eq!(
+        result,
+        Err(HybridError::DuplicateId),
+        "raw id collision within the visible set must be rejected fail-closed \
+         (HybridError::DuplicateId), not silently misboost one of the two colliding rows"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // V3: ブースト効果の保存。RLS 事前フィルタ下でも、可視行に対するブースト本来の
 // 効果（圏外候補の Top-k 浮上・ハードフィルタ化しないこと・空ルール時の
 // `hybrid_search` との完全一致）が RLS なし構成（`tests/soft_boost.rs`）と定性一致
@@ -649,12 +731,16 @@ fn v4_no_additional_loss_versus_visible_only_corpus() {
 // ---------------------------------------------------------------------------
 // V5: エラー契約の非依存性。`BoostRule::new`/`apply_soft_boost` の拒否エラー
 // （`TooManyBoostIds`・`BoostSoftBoundExceeded` 等）の発生有無が不可視行の存在に
-// 依存しないこと（エラー差分による存在情報漏えいの排除）。`MAX_BOOST_IDS`
-// （10,000 件）境界の実データ再現には大量の行投入が要るため、`BoostRule::new` は
-// 実データではなく id 集合のサイズのみを検証する契約（`hybrid.rs` ドキュメント参照）
-// であることを踏まえ、id 集合そのものを合成して境界を再現する（実データを介さず
-// 契約の性質を検証する点は他の V1〜V4 と異なるが、対象は同じ `BoostRule::new`
-// 契約であり本ファイルの検証範囲に含める）。
+// 依存しないこと（エラー差分による存在情報漏えいの排除）。
+//
+// `v5_real_path_result_independent_of_invisible_row_count` が
+// `tenant::visible_rows` → `BoostRule::new` → `hybrid_search_boosted` の実経路で
+// 不可視行「件数」（1 件・複数件、ヒント一致を含む）を変えても結果が完全一致する
+// ことを検証する。本テスト（`v5_boost_id_limit_error_must_not_depend_on_invisible_row_count`）
+// は `MAX_BOOST_IDS`（10,000）境界そのものの検証であり、実データでの再現には
+// 大量の行投入が要るため、`BoostRule::new` が実データではなく id 集合のサイズ
+// のみを検証する契約（`hybrid.rs` ドキュメント参照）であることを踏まえ、id 集合を
+// 合成して境界を再現する（実経路を介さない合成境界チェックである点を明示する）。
 // ---------------------------------------------------------------------------
 #[test]
 fn v5_boost_id_limit_error_must_not_depend_on_invisible_row_count() {
@@ -722,4 +808,77 @@ fn v5_boost_id_limit_error_must_not_depend_on_invisible_row_count() {
     naive_ids.remove(&(1_000_000 + (MAX_BOOST_IDS as u64 - 1)));
     assert_eq!(naive_ids.len(), MAX_BOOST_IDS);
     assert!(BoostRule::new(&naive_ids, RANK3_TOP_K_ENTRY_BOOST).is_ok());
+}
+
+/// `build_docs` の可視部分（tenant-a 全行＋tenant-b の可視 id=10）は固定したまま、
+/// tenant-b の不可視行（`Visibility::Private`）を `extra_invisible_hint_matches` 件
+/// 追加する。追加行はすべてヒント（`"src/hybrid"`）に一致させる（不可視データが
+/// 「たまたま一致」する最悪ケースを件数だけ変えて再現する）。id は既存の可視/不可視
+/// id（1〜10）と衝突しない範囲（2000 以降）から採番する。
+fn build_docs_with_extra_invisible_matches(extra_invisible_hint_matches: usize) -> Vec<DocMeta> {
+    let mut docs = build_docs(false);
+    for i in 0..extra_invisible_hint_matches {
+        docs.push(DocMeta {
+            id: 2000 + i as u64,
+            tenant: TENANT_B,
+            visibility: Visibility::Private,
+            vector: [0.5, 0.0],
+            text: "extra-invisible",
+            path: "src/hybrid/extra-invisible.rs",
+            kind: "doc",
+        });
+    }
+    docs
+}
+
+// ---------------------------------------------------------------------------
+// V5（実経路）: `tenant::visible_rows` → `correct_path_hint_ids`（`BoostRule` 構築の
+// 正しい規約）→ `BoostRule::new` → `hybrid_search_boosted` という実経路全体を通し、
+// 不可視行の「件数」（1 件 vs 複数件、いずれもヒント一致）を変えても返る
+// `Vec<HybridHit>` が完全一致することを検証する。上のテストは `BoostRule::new` 単体の
+// 合成境界チェックに留まっていたため、本テストで実経路上の件数非依存性を固定する。
+// ---------------------------------------------------------------------------
+#[test]
+fn v5_real_path_result_independent_of_invisible_row_count() {
+    let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
+    let ctx = ctx_a();
+    let k = 2;
+
+    let run = |docs: &[DocMeta], label: &str| {
+        let (_cleanup, storage) = open_corpus(label, docs);
+        let (ids, vectors) = rls_filtered_candidates(&storage, &ctx);
+        let index = sparse_index_for(docs, &ids);
+        let rule_ids = correct_path_hint_ids(&storage, &ctx, docs, "src/hybrid");
+        let rule = BoostRule::new(&rule_ids, RANK3_TOP_K_ENTRY_BOOST).expect("rule ok");
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: DIM,
+            query: &QUERY_VECTOR,
+            k,
+        };
+        hybrid_search_boosted(
+            &CpuScalarProvider,
+            input,
+            &index,
+            QUERY_TEXT,
+            k,
+            &cfg,
+            &[rule],
+        )
+        .expect("hybrid search boosted ok")
+    };
+
+    let docs_one_invisible = build_docs_with_extra_invisible_matches(1);
+    let docs_many_invisible = build_docs_with_extra_invisible_matches(5);
+
+    let hits_one = run(&docs_one_invisible, "plan-rls-boost-v5-real-one");
+    let hits_many = run(&docs_many_invisible, "plan-rls-boost-v5-real-many");
+
+    assert_eq!(
+        hits_one, hits_many,
+        "the real tenant::visible_rows -> BoostRule::new -> hybrid_search_boosted path must \
+         return byte-identical results regardless of how many invisible rows happen to match \
+         the hint (V5: result independence from invisible-row count)"
+    );
 }
