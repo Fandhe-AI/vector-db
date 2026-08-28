@@ -65,6 +65,17 @@ TASK-110（LLM クエリプランニング）が返す `path_hint`/`kind_hint` �
 fail-closed に拒否されることを固定する。契約の詳細は同ドキュメントを参照
 （ポインタ）。
 
+`path`/`kind` ヒント一致判定の入力（C2 の前段）についても同様の限界がある。
+`crates/engine/tests/plan_rls_boost.rs::DocMeta` の `path`/`kind` はテスト側の
+グラウンドトゥルースであり、production で `sql/exec.rs`（TASK-77）が可視行
+（C1 の出力）から `path`/`kind` メタデータをどう構築するかは本タスクの検証範囲外
+（未実装のため構築経路自体が存在しない）。したがって本検証は C1（`visible_rows`）
+→ C2（ヒント一致判定）→ C3（`BoostRule::new`）→ C4（`hybrid_search_boosted`）の
+呼び出し列そのものを対象にした engine API 層での合成検証であり、`sql/exec.rs` が
+可視行メタデータから `path`/`kind` を取り違えて構築するような実装不具合（RLS
+適用前のメタデータ源からヒントを構築する等）は本検証の対象外で、混入しても
+本テスト群は検出できない。
+
 ## `USING PLAN` 実行器（TASK-77）実装後の残課題
 
 TASK-77 実装後、SQL 表層・wire 経由での本検証の再実施が必要（`sql/exec.rs` への
@@ -72,3 +83,12 @@ TASK-77 実装後、SQL 表層・wire 経由での本検証の再実施が必要
 スコープ外）。`kernel.rs::SearchInput::ids` の候補識別子契約が `sql/exec.rs` 側の
 実装でも守られていることを、`tests/rls_generalized.rs`（TASK-138）と同様の任意
 テーブル・任意形状 SELECT の軸で機械検証すること。
+
+これに加え、上記「検証コードの既知の限界」で述べた `path`/`kind` メタデータ構築の
+検証空白を埋める回帰テストを TASK-77 実装時の**必須の受け入れ基準**として追跡する。
+具体的には、`sql/exec.rs` が RLS 事前フィルタ済みの可視行（production の
+`Storage`／query planner 経由）から実際に `path`/`kind` を構築し、その結果を C2〜C4
+（ヒント一致判定 → `BoostRule` 構築 → `hybrid_search_boosted`）へ渡す経路を、
+本ファイルの合成コーパス流儀ではなく production 経路そのもので end-to-end 検証する
+こと。TASK-77 着手時にこの回帰テストが計画へ含まれていない場合は、TASK-77 の
+実装を完了扱いにしない。

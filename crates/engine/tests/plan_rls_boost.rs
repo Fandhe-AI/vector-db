@@ -14,6 +14,18 @@
 //! （engine API 層での検証に限定する。`docs/design/rls-generalized-read-paths.md` と
 //! 同じスコープ境界の整理）。
 //!
+//! **既知の限界（`DocMeta::path`/`kind` は production 生成経路ではない）**:
+//! `visible_rows`（RLS 事前フィルタ）以降のヒント一致判定・`BoostRule` 構築・
+//! `hybrid_search_boosted` は本物の engine API を呼ぶが、その入力である
+//! `path`/`kind` 自体は `DocMeta`（後述）が持つテスト側のグラウンドトゥルースから
+//! 得ており、production で `sql/exec.rs`（TASK-77・未実装）が可視行メタデータから
+//! これらをどう構築するかは検証していない。したがって本ファイルは C1〜C4 の
+//! 呼び出し列自体の合成検証であり、`sql/exec.rs` 側の構築経路の不具合（RLS 適用前の
+//! メタデータからヒントを構築する等）は対象外・検出できない。この空白を埋める
+//! production 経路での回帰テストは TASK-77 実装時の必須受け入れ基準として
+//! `docs/design/plan-rls-boost-interaction.md`「`USING PLAN` 実行器（TASK-77）実装後の
+//! 残課題」節で追跡する。
+//!
 //! 本ファイルが固定する検証観点は `docs/design/plan-rls-boost-interaction.md`
 //! （TASK-139・Proposed。本 PR のマージ後、別コミットで Accepted に更新する）の
 //! 「検証方針」節に対応する。個々の観点の具体的な内容・判定根拠は同ドキュメントには
