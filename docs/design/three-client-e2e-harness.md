@@ -89,12 +89,9 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
 
 `USING PLAN`（SQL-5）・`EXPLAIN`（SQL-6）・`HINT ORDER`（SQL-7）・宣言的 UDF
 呼び出し（SQL-9）・`USING OPERATION_ID` 付き `INSERT`（SQL-10）の wire 経由
-検証も同じ層分割に従う。spec（`docs/spec/05-tasks.md` TASK-82）が成果物として
-`wire-server/tests/extended_syntax_e2e.rs` という個別ファイル名を明示している
-ため（TASK-165・TASK-168 は成果物名が「wire 経由統合テスト」と汎用のため
-`three_client_e2e.rs` へ統合したが、TASK-82 はファイル名が specified deliverable
-のため新規ファイルとした）、層 B は `three_client_e2e.rs` とは別ファイルに
-分離した。層 A はそれぞれ既存の流儀（`wire_using_plan.rs`（TASK-117・PLAN-9 で
+検証も同じ層分割に従う。spec（TASK-82）の定義に基づき、層 B は
+`three_client_e2e.rs` とは別ファイル（`extended_syntax_e2e.rs`）に分離した。
+層 A はそれぞれ既存の流儀（`wire_using_plan.rs`（TASK-117・PLAN-9 で
 先行実装済み）・`wire_explain.rs`・新規 `wire_hint_order.rs`・
 `wire_udf_call.rs`・`wire_insert_operation_id.rs`）に従う。
 
@@ -112,11 +109,10 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
   確定済みの拒否経路・順列網羅を層 B へ複製しない方針は TASK-165・TASK-168 と
   同じ）。
 
-**INSERT の wire 受理（判断の記録）**: TASK-82 の完了条件は SQL-10 の wire/SQL
-経由の実測（`docs/spec/04-behavior/sql-surface.md` SQL-10 の「検討中の理由」）を
-含むため、本タスクで wire 経由の `INSERT` 受理へ切り替えた（下記「スコープ外」の
-旧項目を参照。判断の詳細は `simple_query.rs` モジュールコメント）。読み取り
-可視性の既定（`Public` のみ）は拡大していない。
+**INSERT の wire 受理（判断の記録）**: TASK-82（SQL-10）の定義に基づき、本タスク
+で wire 経由の `INSERT` 受理へ切り替えた（下記「スコープ外」の旧項目を参照。
+判断の詳細は `simple_query.rs` モジュールコメント）。読み取り可視性の既定
+（`Public` のみ）は拡大していない。
 
 ## 影響
 
