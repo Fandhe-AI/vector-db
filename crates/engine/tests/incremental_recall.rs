@@ -29,8 +29,22 @@
 //! 得る）。本ファイルはこれを複数本柱の判定へ再構成する。
 //!
 //! **検出対象（本テストが固定する性質）**: 単一ファイル挿入が既存コーパス規模 N に
-//! 比例して重い処理（再チャンク化・再埋め込み・全行再書き込み・置換書き込みの反復等）
-//! を行う「再処理型」の退行。
+//! 比例して重い処理（再チャンク化・再埋め込みを既存コーパス規模分繰り返す）を行う
+//! 「再処理型」の退行。柱 1・4 の直接観測は `Embedder::embed_batch` の呼び出し回数・
+//! 入力テキスト総数という**再埋め込み量**を計装しており、これが検出できるのは
+//! 「余分な再チャンク化・再埋め込みを伴う」退行に限られる（下記検出対象外参照）。
+//!
+//! **検出対象外（PR #296 codex-review P2 指摘。別 Issue の対象）**: 埋め込み呼び出し
+//! 回数・入力テキスト総数が正常値のまま（＝再埋め込みは発生しないまま）、既存の
+//! 埋め込みベクトルを使い回して行を丸ごと再書き込みする、または
+//! `tenant::replace_typed_rows_by_text_key` 呼び出し自体を余分に反復する、といった
+//! 「ストレージ書き込みのみの再処理型」退行は、本テストの計装（`CountingEmbedder`
+//! による `Embedder::embed_batch` 観測）では検出できない。この検出には
+//! `Storage`（`src/storage.rs`。`redb` を直接ラップする具象型で、`EngineCore` から
+//! trait 経由の差し替えができない）自体への書き込み回数計装という engine 側の
+//! production コード変更が要り、本テストファイル（テスト専用計装の追加のみが
+//! スコープ）の変更では解消できない別 Issue の対象とする（本パラグラフが柱 4 の
+//! 契約を「再埋め込み型退行の検出」に限定して明確化する）。
 //!
 //! **検出対象外（別 Issue の対象。従来からの既知の設計事項）**: 実装上、
 //! `tenant::replace_typed_rows_by_text_key`（同一パスの既存行を特定するための置換
@@ -70,8 +84,8 @@
 //!    検出できるのは、`index_file` にのみ存在し `index_file_batch` には存在しない、
 //!    単一ファイル経路固有の退行（例: `execute_insert_sql`／`index_file` 呼び出し
 //!    経路だけに挿入された余分な処理）に限られる。
-//! 4. **一括投入経路の書き込み量判定**
-//!    （[`index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing`]。
+//! 4. **一括投入経路の再埋め込み量判定**
+//!    （[`index1_full_rebuild_batch_embedding_quantity_is_independent_of_reprocessing`]。
 //!    決定的・時間非依存。柱 3 の上記「限界」への対応。PR #296 codex-review 指摘:
 //!    「一括投入側も同じファイル単位処理を反復するため比較の独立性がない」。
 //!    再指摘（PR #296 Cursor Bugbot）: 応答フィールドの合算だけでは、outcome には
@@ -87,13 +101,24 @@
 //!    `BASELINE_FILES + 1` 回、入力テキスト総数が `(BASELINE_FILES + 1) *
 //!    expected_chunks_for_new_file()`（＝各ファイル 1 件あたりちょうど期待チャンク数）
 //!    に一致することを固定する。`index_file_batch` が既存コーパス規模に比例して
-//!    重くなる再処理型退行を起こせば、バッチ後半の呼び出しほど余分な
-//!    `embed_batch` 呼び出し・入力テキストが発生し、これらの直接観測値は期待値を
-//!    確実に上回るため、応答フィールドの自己申告を経由せず一括投入経路自身の
-//!    再処理型退行を検出できる（経路共通の退行の検出は柱 1・2・4 が担い、いずれも
-//!    `t_full` に依存しない。モジュール冒頭の「検出対象」参照）。応答フィールド
-//!    （`chunks_written`／`rows_replaced`）はこの直接観測値との整合性チェックとして
-//!    従属的に突き合わせる。
+//!    重くなる**再埋め込みを伴う**再処理型退行を起こせば、バッチ後半の呼び出しほど
+//!    余分な `embed_batch` 呼び出し・入力テキストが発生し、これらの直接観測値は
+//!    期待値を確実に上回るため、応答フィールドの自己申告を経由せず一括投入経路
+//!    自身の再処理型退行を検出できる（経路共通の退行の検出は柱 1・2・4 が担い、
+//!    いずれも `t_full` に依存しない。モジュール冒頭の「検出対象」参照）。応答
+//!    フィールド（`chunks_written`／`rows_replaced`）はこの直接観測値との整合性
+//!    チェックとして従属的に突き合わせる（**限界（PR #296 codex-review P2
+//!    再指摘）**: 柱 4 が計装しているのは `Embedder::embed_batch` の呼び出し回数・
+//!    入力テキスト総数、つまり**再埋め込み量**である。埋め込み呼び出しは正常値の
+//!    まま、既存の埋め込みベクトルを使い回してコーパス全体を再書き込みする、
+//!    または置換書き込み（`tenant::replace_typed_rows_by_text_key`）自体を余分に
+//!    反復する「ストレージ書き込みのみの再処理型」退行は、この直接観測にも
+//!    従属的な応答フィールド突き合わせにも現れないため柱 4 では検出できない
+//!    （`chunks_written`／`rows_replaced` も同じ実装が返す自己申告値であり、
+//!    独立したストレージ計装ではない。モジュール冒頭「検出対象外」参照）。この
+//!    クラスの退行を検出するには `Storage` 自体への書き込み回数計装という engine
+//!    側の production コード変更が要り、本テストファイルのスコープ外の別 Issue と
+//!    する）。
 //!
 //! vacuous pass 防止（Issue #281 AC2。柱 4 分は PR #296 Cursor Bugbot「no negative
 //! control either」指摘への対応も兼ねる）として、柱 1〜3 と同一の判定述語
@@ -543,7 +568,21 @@ fn measure_full_rebuild_batch() -> Duration {
 /// expected_chunks_for_new_file()` となるはずである。柱 1 と異なり、この直接観測は
 /// バッチ内の各ファイルが既存コーパス規模に比例して余分な入力テキストで
 /// 再埋め込みされる退行を、応答フィールドを介さずに検出する。
-fn full_rebuild_batch_write_quantity_with_counting(n_files: usize) -> (usize, usize, usize, usize) {
+///
+/// **限界（PR #296 codex-review P2 再指摘）**: 本関数が計装するのは
+/// `Embedder::embed_batch` の呼び出し回数・入力テキスト総数、すなわち
+/// **再埋め込み量**である。返り値の `total_chunks_written`／`total_rows_replaced`
+/// も `IndexOutcome` が返す自己申告値の合算であり、`embed_batch` 呼び出しとは
+/// 独立な `Storage` 書き込み回数の計装ではない。したがって、埋め込み呼び出しは
+/// 正常値のまま既存の埋め込みベクトルを使い回して行を再書き込みする、または
+/// 置換書き込み（`tenant::replace_typed_rows_by_text_key`）自体を余分に反復する
+/// 「ストレージ書き込みのみの再処理型」退行は、`calls`／`texts`／
+/// `total_chunks_written`／`total_rows_replaced` のいずれにも現れず検出できない
+/// （モジュールドキュメント「検出対象外」参照。`Storage` への独立した書き込み
+/// 計装は別 Issue の対象）。
+fn full_rebuild_batch_embedding_quantity_with_counting(
+    n_files: usize,
+) -> (usize, usize, usize, usize) {
     let full_path = unique_db_path("recall-full-rebuild-batch-quantity-counting");
     let _full_cleanup = CleanupGuard(full_path.clone());
     let storage = Storage::open(&full_path).expect("open storage");
@@ -596,7 +635,7 @@ fn full_rebuild_batch_write_quantity_with_counting(n_files: usize) -> (usize, us
     )
 }
 
-/// [`full_rebuild_batch_write_quantity_with_counting`] の負例用実測モデル（柱 4 の
+/// [`full_rebuild_batch_embedding_quantity_with_counting`] の負例用実測モデル（柱 4 の
 /// vacuous pass 防止・PR #296 Cursor Bugbot 指摘「no negative control either」への
 /// 対応）。「バッチ呼び出し `i` 回目が、それまでに積んだ `0..=i` 件分のファイルを
 /// 毎回まとめて再埋め込みする」再処理型退行を、`execute_insert_sql_batch` を
@@ -789,16 +828,19 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
     );
 }
 
-// --- INDEX-1 柱 4: 一括投入経路（`index_file_batch`）自身の書き込み量判定
+// --- INDEX-1 柱 4: 一括投入経路（`index_file_batch`）自身の再埋め込み量判定
 // （決定的・時間非依存。PR #296 codex-review 指摘: 柱 3 の `t_full` 計測に使う
-// 一括投入経路自体が独立検証されていなかった） -----------------------------------
+// 一括投入経路自体が独立検証されていなかった。限界（PR #296 codex-review P2
+// 再指摘）: 検出できるのは再埋め込みを伴う退行のみで、既存ベクトルの使い回しに
+// よるストレージ書き込みのみの再処理型退行は検出対象外。モジュールドキュメントの
+// 柱 4 節・「検出対象外」参照） ---------------------------------------------------
 
 #[test]
-fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
+fn index1_full_rebuild_batch_embedding_quantity_is_independent_of_reprocessing() {
     let _timing_guard = acquire_timing_lock();
 
     let (calls, texts, total_chunks_written, total_rows_replaced) =
-        full_rebuild_batch_write_quantity_with_counting(BASELINE_FILES);
+        full_rebuild_batch_embedding_quantity_with_counting(BASELINE_FILES);
 
     let expected_chunks_per_file = expected_chunks_for_new_file();
     let expected_calls = BASELINE_FILES + 1;
@@ -839,9 +881,18 @@ fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
         BASELINE_FILES + 1
     );
 
-    // 従属判定（冗長な整合性チェック）: 応答フィールド（`chunks_written`／
-    // `rows_replaced`）が直接観測値（`texts`）と食い違わないこと自体を固定する。
-    // 検出力はあくまで上記 `calls`／`texts` の直接観測判定が担う。
+    // 従属判定（冗長な整合性チェック。PR #296 codex-review P2 再指摘への対応で
+    // 限界を明記）: 応答フィールド（`chunks_written`／`rows_replaced`）が
+    // 直接観測値（`texts`）と食い違わないこと自体を固定する。検出力はあくまで
+    // 上記 `calls`／`texts` の直接観測判定が担う。`total_chunks_written`／
+    // `total_rows_replaced` はいずれも `execute_insert_sql_batch` 自身が返す
+    // 自己申告値の合算であり、`Storage` への書き込み回数を独立に計装した値では
+    // ない。したがって、埋め込み呼び出しは正常値のまま既存ベクトルを使い回して
+    // 行を再書き込みする、または置換書き込みを余分に反復する「ストレージ書き込み
+    // のみの再処理型」退行が起きても、この自己申告値は退行の影響を受けずに
+    // 期待値のまま一致し得るため、以下 2 つの assert はそのクラスの退行に対して
+    // 検出力を持たない（full_rebuild_batch_embedding_quantity_with_counting doc・
+    // モジュールドキュメント「検出対象外」参照）。
     assert_eq!(
         total_chunks_written, texts,
         "IndexOutcome.chunks_written summed across the batch must match the directly \
@@ -852,7 +903,7 @@ fn index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing() {
         total_rows_replaced, total_chunks_written,
         "rows actually written via tenant::replace_typed_rows_by_text_key must match the \
          chunk count produced for each file (redundant consistency check; see \
-         full_rebuild_batch_write_quantity_with_counting doc for why this alone does not \
+         full_rebuild_batch_embedding_quantity_with_counting doc for why this alone does not \
          add detection power beyond the calls/texts direct-observation judgement)"
     );
 }
@@ -1046,7 +1097,7 @@ fn index1_judgements_reject_simulated_full_reprocess_regression() {
     );
     assert!(
         batch_calls > expected_batch_calls && batch_texts > expected_batch_texts,
-        "simulated batch full-reprocess regression model must produce more embed_batch          calls/input texts than a non-regressed batch would (batch_calls={batch_calls}          > expected_batch_calls={expected_batch_calls}, batch_texts={batch_texts}          > expected_batch_texts={expected_batch_texts}); this confirms the direct-observation          judgement used by index1_full_rebuild_batch_write_quantity_is_independent_of_reprocessing          has detection power against a reprocessing-type regression in the batch path"
+        "simulated batch full-reprocess regression model must produce more embed_batch          calls/input texts than a non-regressed batch would (batch_calls={batch_calls}          > expected_batch_calls={expected_batch_calls}, batch_texts={batch_texts}          > expected_batch_texts={expected_batch_texts}); this confirms the direct-observation          judgement used by index1_full_rebuild_batch_embedding_quantity_is_independent_of_reprocessing          has detection power against a reprocessing-type regression in the batch path"
     );
 }
 
