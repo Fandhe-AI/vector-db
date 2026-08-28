@@ -199,6 +199,15 @@
 //! 追加する。ヒント一致は候補の除外・絞り込みには使わず、`truncate(k)` 前のプールへ
 //! 小さな加点（既定 `SOFT_BOOST_PER_MATCH`）を行い再順位付けするのみで、ハードフィルタ
 //! 化しない（詳細は `hybrid.rs` モジュールドキュメント参照）。
+//!
+//! TASK-148（対象ビヘイビア: EXT-4）: `scoring_boost.rs` が、TASK-111 のヒント固有
+//! ソフトブースト（`hybrid::path_hint_matches`/`kind_hint_matches`）を、任意の `TEXT`
+//! 列への一致条件（完全一致／前方一致／部分文字列一致）によるスコア調整へ一般化する。
+//! `declarative_filter.rs`（TASK-147）と同じ「宣言（`ScoringBoost`） → スキーマ束縛
+//! （`bind`） → 評価（`apply_scoring_boosts`）」の 3 段構成を踏襲し、スコア調整の
+//! 意味論そのもの（加点合計の絶対上限・候補集合不変）は `hybrid::apply_soft_boost` へ
+//! 委譲する（詳細は `scoring_boost.rs` モジュールドキュメント参照）。SQL 表層への構文
+//! 露出は対象外。
 
 pub mod arena;
 pub mod batch_fallback;
@@ -226,6 +235,7 @@ pub mod recovery;
 pub mod rerank;
 pub mod rls;
 pub mod row_codec;
+pub mod scoring_boost;
 pub mod search_engine;
 pub mod sparse;
 pub mod sql;
