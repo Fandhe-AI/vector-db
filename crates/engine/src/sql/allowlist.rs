@@ -1937,15 +1937,36 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
         // `EXPLAIN` トークンを消費した残りを既存の検索 SELECT 形状パーサー
         // （[`parse_select_shape`]）へそのまま渡し、`USING PLAN` を含まない形
         // （通常 SELECT・`ORDER BY` 経路）は `shape.using_plan` が `None` になる
-        // ことを利用して一律 `42601` へ落とす（集計 SELECT・`SET`・
-        // `CREATE FUNCTION` への前置は残り先頭が `SELECT` キーワードでない、
-        // または集計形状〔`parse_select_shape` が受理しない〕であるため、同じ
-        // `42601` へ自然に落ちる）。
+        // ことを利用して一律 `42601` へ落とす（`SET`・`CREATE FUNCTION` への
+        // 前置は残り先頭が `SELECT` キーワードでないため、同じ `42601` へ自然に
+        // 落ちる）。
+        //
+        // 集計 SELECT（TASK-166・SQL-13／TASK-167・SQL-14）は非 EXPLAIN 経路では
+        // `is_aggregate_select` の先読みで `parse_aggregate_shape` へ振り分けられ
+        // `parse_select_shape` には到達しないが、この分岐は残りトークンを無条件に
+        // `parse_select_shape` へ渡すため、同じ先読みを適用しないと内側の
+        // `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` が集計ではなく UDF 呼び出しの検索射影
+        // として誤って受理されうる（Issue #267 Bugbot 指摘）。`EXPLAIN` に集計
+        // SELECT の対応契約は無い（`ValidatedAggregate` に `using_plan` は無く
+        // `USING PLAN` と両立しない）ため、`is_aggregate_select` と同じ先読みを
+        // 残りトークンに適用し、集計形状に見える場合は fail-closed で拒否する。
         _ if is_explain_statement => {
             let rest = &tokens[1..];
             if !matches!(rest.first(), Some(Token::Keyword(Keyword::Select))) {
                 return Err(SqlSurfaceError::unsupported(
                     "EXPLAIN requires a SELECT ... USING PLAN(...) statement",
+                ));
+            }
+            let rest_contains_group_by = rest.windows(2).any(|w| {
+                matches!(&w[0], Token::Ident(name) if name.eq_ignore_ascii_case("GROUP"))
+                    && matches!(w[1], Token::Keyword(Keyword::By))
+            });
+            let rest_is_aggregate_select = (matches!(rest.get(1), Some(Token::Ident(name)) if is_aggregate_function_name(name))
+                && matches!(rest.get(2), Some(Token::Punct('('))))
+                || rest_contains_group_by;
+            if rest_is_aggregate_select {
+                return Err(SqlSurfaceError::unsupported(
+                    "EXPLAIN is not supported for aggregate SELECT statements",
                 ));
             }
             let shape = parse_select_shape(rest)?;
