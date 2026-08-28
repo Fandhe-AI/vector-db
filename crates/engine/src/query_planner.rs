@@ -38,6 +38,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -883,6 +884,42 @@ fn is_success_status_line(line: &str) -> bool {
     code.len() == 3 && code.starts_with('2') && code.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// 名前解決のために同時に存在しうる未完了バックグラウンドスレッド数の上限。
+/// `resolve_socket_addrs` は DNS 解決に締切を渡せないため別スレッドで実行し
+/// `recv_timeout` で待ち合わせるが、名前解決が長時間停止する環境で `plan_query`
+/// が繰り返されると、タイムアウト済みでも解決完了（またはプロセス終了）まで
+/// 存在し続けるスレッドが無制限に蓄積し、メモリ・スレッド上限を枯渇させうる
+/// （codex-review PR #252 P2 指摘）。同時未完了数をこの上限で有界化し、上限
+/// 到達時は新規スレッドを生成せず fail-closed に拒否する。[`try_reserve_slot`]
+/// は `fetch_add` による楽観的な判定のため、複数呼び出しが同時に枠を確保しようと
+/// した場合、上限を一時的に超えて観測されうる（超過分は即座に `fetch_sub` で
+/// 取り消されるため、蓄積自体は有界のまま保たれるソフトな上限）。
+const MAX_OUTSTANDING_NAME_RESOLUTIONS: usize = 64;
+
+/// 現在の名前解決バックグラウンドスレッド数（[`resolve_socket_addrs`] からのみ
+/// 増減する。[`try_reserve_slot`]／[`release_slot`] 経由）。
+static OUTSTANDING_NAME_RESOLUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// `counter` を 1 加算し、加算前の値が `limit` 未満だった場合のみ枠を確保できた
+/// ものとして `true` を返す（超過時は加算を取り消して `false` を返す）。
+/// `resolve_socket_addrs` の同時未完了スレッド数上限判定から独立してテストできる
+/// よう純粋なカウンタ操作として切り出す（グローバル `static` を直接書き換えて
+/// テストすると、並行実行される他テストのスレッド生成と競合し不安定になるため）。
+fn try_reserve_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    let outstanding = counter.fetch_add(1, Ordering::SeqCst);
+    if outstanding >= limit {
+        counter.fetch_sub(1, Ordering::SeqCst);
+        false
+    } else {
+        true
+    }
+}
+
+/// [`try_reserve_slot`] で確保した枠を解放する。
+fn release_slot(counter: &AtomicUsize) {
+    counter.fetch_sub(1, Ordering::SeqCst);
+}
+
 /// `config.host()`／`config.port()` を名前解決する（`(host, port)` タプル形式の
 /// `ToSocketAddrs` を使い、`format!("{host}:{port}")` によるアドレス文字列組み立てを
 /// 避ける。IPv6 リテラル（例: `::1`）は `format!` だと `::1:11434` のような曖昧な
@@ -895,24 +932,51 @@ fn is_success_status_line(line: &str) -> bool {
 /// [`PlanError::Timeout`] を返すが、バックグラウンドスレッドは解決が完了するか
 /// プロセス終了まで存在し続けうる（std に解決処理を中断する手段がないための
 /// 既知の制約。呼び出し元がブロックされ続けることだけは防ぐ）。
+///
+/// `host` が IP リテラル（IPv4/IPv6）の場合は DNS 解決そのものが不要なため、
+/// スレッドを起こさずその場で `SocketAddr` を構築する（codex-review PR #252 P2
+/// 指摘: スレッド生成自体を主要経路で避ける短絡）。本 PR で接続先はループバックへ
+/// 制限済み（[`OllamaConfig::with_host`] 参照）のため、実運用上のホストはほぼ常に
+/// この分岐を通り、以降のスレッド生成・上限判定は事実上使われない。ホスト名
+/// （DNS 名）の場合のみ [`MAX_OUTSTANDING_NAME_RESOLUTIONS`] による同時未完了数の
+/// 上限判定を経てスレッドを生成する。
 fn resolve_socket_addrs(
     config: &OllamaConfig,
     deadline: Instant,
 ) -> Result<Vec<SocketAddr>, PlanError> {
     let host = config.host().to_string();
     let port = config.port();
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    if !try_reserve_slot(
+        &OUTSTANDING_NAME_RESOLUTIONS,
+        MAX_OUTSTANDING_NAME_RESOLUTIONS,
+    ) {
+        return Err(PlanError::Unavailable);
+    }
+
     let (tx, rx) = mpsc::channel();
     // スレッド生成に失敗した場合（リソース枯渇等）も fail-closed で Unavailable とし、
-    // untrusted な外部要因でパニックさせない。
-    thread::Builder::new()
+    // untrusted な外部要因でパニックさせない。確保済みの枠は必ず解放する。
+    if thread::Builder::new()
         .spawn(move || {
             let resolved = (host.as_str(), port)
                 .to_socket_addrs()
                 .map(|it| it.collect::<Vec<SocketAddr>>());
             // 受信側が既にタイムアウトして rx を破棄していても send の失敗は無視する。
             let _ = tx.send(resolved);
+            // このスレッドは解決完了（またはプロセス終了）まで存在し続けうるため、
+            // 完了時に必ず枠を解放し、同時未完了数の上限判定を正しく保つ。
+            release_slot(&OUTSTANDING_NAME_RESOLUTIONS);
         })
-        .map_err(|_| PlanError::Unavailable)?;
+        .is_err()
+    {
+        release_slot(&OUTSTANDING_NAME_RESOLUTIONS);
+        return Err(PlanError::Unavailable);
+    }
 
     let remaining = deadline.saturating_duration_since(Instant::now());
     match rx.recv_timeout(remaining) {
@@ -2025,5 +2089,73 @@ mod tests {
     #[test]
     fn format_host_header_omits_default_http_port_for_ipv6() {
         assert_eq!(format_host_header("::1", 80), "[::1]");
+    }
+
+    // 回帰テスト（codex-review PR #252 P2 指摘対応）: `host` が IP リテラル
+    // （IPv4/IPv6）の場合、`resolve_socket_addrs` はバックグラウンドスレッドを
+    // 起こさずその場で解決する。締切をすでに経過した値（`Instant::now()`。
+    // スレッド＋`recv_timeout` 経路を通っていれば `Timeout` になるはずの締切）
+    // を渡しても `Ok` が決定的に返ることで、スレッド生成を経ていないことを
+    // 確認する。
+    #[test]
+    fn resolve_socket_addrs_short_circuits_ip_literal_without_thread() {
+        let config = OllamaConfig::new("test-model")
+            .with_host("127.0.0.1")
+            .expect("loopback ipv4 literal")
+            .with_port(11434);
+        let deadline = Instant::now();
+        let addrs = resolve_socket_addrs(&config, deadline)
+            .expect("ip literal should resolve synchronously regardless of an elapsed deadline");
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                11434
+            )]
+        );
+    }
+
+    #[test]
+    fn resolve_socket_addrs_short_circuits_ipv6_literal_without_thread() {
+        let config = OllamaConfig::new("test-model")
+            .with_host("::1")
+            .expect("loopback ipv6 literal")
+            .with_port(11434);
+        let deadline = Instant::now();
+        let addrs = resolve_socket_addrs(&config, deadline)
+            .expect("ip literal should resolve synchronously regardless of an elapsed deadline");
+        assert_eq!(
+            addrs,
+            vec![SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                11434
+            )]
+        );
+    }
+
+    // 回帰テスト（codex-review PR #252 P2 指摘対応）: 同時未完了スレッド数の
+    // 上限判定（`try_reserve_slot`）を、グローバル `static` ではなくテスト専用の
+    // 独立した `AtomicUsize` に対して検証する。グローバル `static` を直接
+    // 書き換えるテストは、並行実行される他テストの名前解決スレッド生成と
+    // 競合し不安定になるため避ける。
+    #[test]
+    fn try_reserve_slot_rejects_once_limit_reached() {
+        let counter = AtomicUsize::new(0);
+        let limit = 2;
+        assert!(try_reserve_slot(&counter, limit));
+        assert!(try_reserve_slot(&counter, limit));
+        // 上限（2）に到達済み。3 件目は拒否され、カウンタも加算前へ戻る。
+        assert!(!try_reserve_slot(&counter, limit));
+        assert_eq!(counter.load(Ordering::SeqCst), limit);
+    }
+
+    #[test]
+    fn try_reserve_slot_allows_again_after_release() {
+        let counter = AtomicUsize::new(0);
+        let limit = 1;
+        assert!(try_reserve_slot(&counter, limit));
+        assert!(!try_reserve_slot(&counter, limit));
+        release_slot(&counter);
+        assert!(try_reserve_slot(&counter, limit));
     }
 }
