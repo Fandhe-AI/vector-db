@@ -14,19 +14,31 @@
 //!   遅延構築型（`VectorArena` はクエリ毎に再構築、`DictionaryCache` は世代番号不一致で
 //!   fail-closed に破棄・再構築。post-commit フックは存在しない — `core.rs` の
 //!   `DictionaryCache` ドキュメント参照）。そのため「索引反映」は「commit 後の次回
-//!   読み取り時の導出構造再構築」であり、(2) は次の 2 通りとして実現する:
+//!   読み取り時の導出構造再構築」であり、(2) は次の 3 通りとして実現する:
 //!   (2-a) commit 成功後、導出索引が一度も観測される前にプロセスが中断する
 //!   （読み取りゼロで drop → 再オープン）。
-//!   (2-b) 反映（再構築）の最初の読み取り試行自体が失敗する
-//!   （`FailFirstSearchProvider` で初回 `search` のみ失敗させる）。
+//!   (2-b) 反映（再構築）自体は成功した直後、その反映結果を使う最初の検索段が失敗する
+//!   （`FailFirstSearchProvider` で `VectorArena::build_filtered_with_rows_in_txn`
+//!   完了後の初回 `SearchProvider::search` のみ失敗させる。**再構築処理そのものの途中
+//!   失敗ではない** — `sql::exec::execute_statement_in_txn` はアリーナ構築を完了させて
+//!   から `SearchProvider::search` を呼ぶため、本 provider の注入点はアリーナ構築の
+//!   *後段* にあたる。codex-review P1 指摘。再構築処理そのものの途中失敗は、公開 API
+//!   経由では小さいデータセットで到達可能な注入点が無いため本ファイルでは扱わず、
+//!   `arena.rs` 内の
+//!   `build_filtered_with_limits_failure_mid_rebuild_leaves_committed_rows_intact_and_recovers`
+//!   （既存の境界値検証用 `#[cfg(test)]` シームを再利用し、可視行数が上限を超える
+//!   条件で再構築処理自体を `CapacityExceeded` で途中失敗させ、永続データの無傷・
+//!   再試行での完全一致を検証する）が別途カバーする）。
+//!   (2-c) 旧本文で反映済みのキャッシュ・導出索引がある状態から新本文へ差し替え、
+//!   読み取りゼロで中断 → 再オープンしても新本文のみが完全一致で現れる。
 //!   いずれも「成功応答を返した commit 済みデータ」が、再構築後の索引・SELECT で
 //!   欠落・重複なく完全一致することを検証する。
 //!
 //! 注入点はすべて公開 API 経由で確保する（テスト専用 feature ゲート API は新設しない
 //! 方針・codex P0-2 再発防止。`tests/commit_boundary.rs` 冒頭コメント参照）:
 //! `EngineCore::with_embedder`（(1) の注入）・`EngineCore::from_storage` へ渡す
-//! `Box<dyn SearchProvider>`（(2-b) の注入）・drop ＋ `Storage::open` 再オープン
-//! （(2-a) のプロセス再起動相当）。
+//! `Box<dyn SearchProvider>`（(2-b) の、アリーナ構築完了後の検索段への注入）・
+//! drop ＋ `Storage::open` 再オープン（(2-a)・(2-c) のプロセス再起動相当）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -168,8 +180,14 @@ impl Embedder for FailingEmbedder {
 }
 
 /// 初回 `search` 呼び出しのみ `KernelError::WorkerPanicked` を返し、以降は
-/// `CpuScalarProvider` へ委譲するフェイク検索 provider（commit 成功後・索引反映の
-/// 最初の読み取り試行が失敗するケースの注入用）。`AtomicBool` は
+/// `CpuScalarProvider` へ委譲するフェイク検索 provider（commit 成功後・アリーナ構築
+/// （索引反映の再構築処理そのもの）が完了した *後* の最初の検索段が失敗するケースの
+/// 注入用。`sql::exec::execute_statement_in_txn` は `VectorArena::
+/// build_filtered_with_rows_in_txn` を完了させてから本 provider の `search` を呼ぶため、
+/// ここでの注入点は再構築処理の途中ではない — 再構築処理そのものの途中失敗は
+/// `arena.rs` の
+/// `build_filtered_with_limits_failure_mid_rebuild_leaves_committed_rows_intact_and_recovers`
+/// が別途カバーする。codex-review P1 指摘）。`AtomicBool` は
 /// `SearchProvider: Send + Sync`（object-safe・`&self` メソッドのみ）の制約下で
 /// 呼び出し回数を数える唯一の内部可変性手段。
 ///
@@ -413,9 +431,13 @@ fn postcommit_interruption_then_restart_rebuilds_index_exactly() {
     );
 }
 
-/// (2)-b: `FailFirstSearchProvider` 構成で正常 `INSERT`（成功応答）→ 初回検索
-/// （反映試行）がエラー → 同一プロセス内の再試行検索が完全一致集合を返す →
-/// さらに再オープン後も一致することを確認する（反映失敗が持続的破損を残さない）。
+/// (2)-b: `FailFirstSearchProvider` 構成で正常 `INSERT`（成功応答）→ アリーナ構築
+/// （索引反映の再構築処理そのもの）は成功した後、その結果を使う初回検索段がエラー →
+/// 同一プロセス内の再試行検索が完全一致集合を返す → さらに再オープン後も一致する
+/// ことを確認する（検索段の 1 回限りの失敗が持続的破損を残さない。再構築処理自体の
+/// 途中失敗は `arena.rs` の
+/// `build_filtered_with_limits_failure_mid_rebuild_leaves_committed_rows_intact_and_recovers`
+/// が別途カバーする。codex-review P1 指摘対応）。
 #[test]
 fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
     let path = unique_db_path("index-fail-postcommit-read-retry");
@@ -443,7 +465,7 @@ fn postcommit_first_reflection_read_failure_recovers_on_retry_and_restart() {
         "injected provider must not have been exercised before the first reflection read"
     );
 
-    // 初回検索（索引反映の最初の読み取り試行）は注入した provider により失敗する。
+    // 初回検索（アリーナ構築完了後の検索段）は注入した provider により失敗する。
     let zero_vec = zero_vec_literal();
     core.execute_sql(
         &read_ctx(),

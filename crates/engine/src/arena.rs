@@ -1725,6 +1725,88 @@ mod tests {
         }
     }
 
+    // 対象ビヘイビア: TASK-100・RECOVER-9。`crates/engine/tests/index_failure_injection.rs`
+    // の (2-b) は `SearchProvider::search`（アリーナ構築が完了した後の検索段）だけを
+    // 失敗させており、`VectorArena::build_filtered_with_rows_in_txn` 自体（索引の
+    // 再構築処理そのもの）が途中失敗するケースは公開 API 経由では注入できない
+    // （codex-review P1 指摘。同ファイル冒頭コメント参照）。本テストはその欠落を、
+    // 既に境界値検証用に確立済みの `build_filtered_with_limits`（本 `#[cfg(test)]`
+    // モジュール内から小さい `max_rows` を渡す手法。上のテスト参照）を使って埋める:
+    // 「可視行数が上限を超える」という、実データのみで到達可能な条件で再構築処理を
+    // 実際に途中失敗させ、(a) 失敗が commit 済みの永続データを一切変更しないこと、
+    // (b) 上限内の可視性へ絞った再試行（同じ commit 済みデータからの再構築）が
+    // 欠落・重複なく完全一致で成功することを確認する。テスト専用 feature ゲート API は
+    // 新設しない（本ファイル冒頭・`tests/index_failure_injection.rs` 冒頭コメントの
+    // 方針を維持）。
+    #[test]
+    fn build_filtered_with_limits_failure_mid_rebuild_leaves_committed_rows_intact_and_recovers() {
+        let path = unique_db_path("capacity-mid-rebuild-recovery");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema_for("docs", 2))
+            .expect("create_table");
+
+        // tenant-a の可視行を 5 件 commit する（この行データそのものが検証対象。
+        // 再構築の成否にかかわらず一切変更されないことを後段で確認する）。
+        for i in 0..5u64 {
+            storage
+                .insert_row_into_table(
+                    "docs",
+                    i,
+                    &RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[1.0, 1.0],
+                        metadata: b"m",
+                    },
+                )
+                .expect("seed tenant-a row");
+        }
+
+        // 索引反映（再構築）1 回目: 可視行 5 件に対し上限を 3 件に絞り、再構築処理
+        // そのものを `CapacityExceeded` で途中失敗させる（`build_filtered_with_rows_and_limits`
+        // が行走査ループの途中で上限超過を検出して打ち切る経路。この時点で redb 側の
+        // commit 済み行データには一切触れていない — 読み取り専用トランザクションの
+        // ため書き込みが起きようがない）。
+        let narrow_max_rows = 3usize;
+        let err = VectorArena::build_filtered_with_limits(
+            &storage,
+            "docs",
+            |tenant, _| tenant == "tenant-a",
+            narrow_max_rows,
+            usize::MAX,
+        )
+        .expect_err("rebuild itself must fail while the visible row count exceeds max_rows");
+        assert!(
+            matches!(err, ArenaError::CapacityExceeded),
+            "expected ArenaError::CapacityExceeded from the rebuild path, got: {err:?}"
+        );
+
+        // 索引反映（再構築）2 回目: 同じ commit 済みデータに対し、上限を可視行数以上に
+        // 戻して再試行する。1 回目の途中失敗が永続データを破損・欠落させていなければ、
+        // 5 件全件が欠落・重複なく完全一致で返るはずである。
+        let recovered = VectorArena::build_filtered_with_limits(
+            &storage,
+            "docs",
+            |tenant, _| tenant == "tenant-a",
+            10,
+            usize::MAX,
+        )
+        .expect("retry with a sufficient max_rows must succeed after the mid-rebuild failure");
+        assert_eq!(
+            recovered.len(),
+            5,
+            "no row must be lost or duplicated by the earlier mid-rebuild failure"
+        );
+        let mut recovered_ids: Vec<u64> = recovered.ids().to_vec();
+        recovered_ids.sort_unstable();
+        assert_eq!(recovered_ids, vec![0u64, 1, 2, 3, 4]);
+        for idx in 0..recovered.len() {
+            assert_eq!(recovered.tenant_id(idx), Some("tenant-a"));
+        }
+    }
+
     // 対象ビヘイビア: TABLE-8（codex P1 対応・Issue #137）。`GrowableArenaBuffers` の
     // amortized 成長（capacity を倍々に増やす）が、実際に確保する capacity ベースの
     // 総バイト量を `max_bytes` の範囲内に収め続けることを検証する
