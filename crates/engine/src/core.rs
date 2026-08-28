@@ -1316,8 +1316,7 @@ impl EngineCore {
         table: &str,
         question: &str,
     ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
-        let (expansion, _classification) =
-            self.plan_query_with_classification(ctx, table, question)?;
+        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
         Ok(expansion)
     }
 
@@ -1332,6 +1331,58 @@ impl EngineCore {
     /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
     /// `Self::plan_query`・`Self::dictionary_snapshot` と同じ理由）。
     pub fn plan_query_with_classification(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+    ) -> Result<
+        (
+            crate::query_planner::QueryExpansion,
+            Option<crate::tiering::Classification>,
+        ),
+        CoreError,
+    > {
+        self.expand_query(ctx, table, question)
+    }
+
+    /// `table` に対する自然言語 `question` を LLM クエリプランニング（TASK-110・
+    /// PLAN-1）で展開し、明示指定（`query_mode`・`session_mode`）とプランナー推定
+    /// （展開結果の `mode_hint`）から解決した実効モードまで含めて返す
+    /// （TASK-164・PLAN-11。解決契約は `sql::mode` モジュールドキュメント、
+    /// spec のビヘイビア定義〔PLAN-11〕を参照）。`VectorCore` trait へは昇格しない
+    /// 固有メソッド（[`Self::plan_query`] と同じ理由。`core-api-check` の対象外）。
+    ///
+    /// モード解決は `sql::mode::resolve_mode_with_planner` へ委譲する。呼び出し元
+    /// （wire-server の接続ハンドラ・将来の `USING PLAN` 結線。TASK-77/78 の管轄）は
+    /// `query_mode`（クエリ句由来）・`session_mode`（`SessionState::search_mode()`
+    /// 由来）を渡す。展開自体の fail-closed 契約（LLM 未接続・プロンプト超過・
+    /// LLM 応答不正はすべて `Err`）は [`Self::plan_query`] と共有する（モードの
+    /// fail-safe とは独立したエラー系統。`query_planner.rs` モジュールドキュメント
+    /// 参照）。質問類型・ティア（TASK-115・PLAN-8）の判定結果は本メソッドの戻り値
+    /// には含まれない（必要な呼び出し元は [`Self::plan_query_with_classification`]
+    /// を使う）。
+    pub fn plan_query_with_mode(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+        query_mode: Option<crate::sql::mode::SearchMode>,
+        session_mode: Option<crate::sql::mode::SearchMode>,
+    ) -> Result<crate::query_planner::PlannedQuery, CoreError> {
+        let (expansion, _classification) = self.expand_query(ctx, table, question)?;
+        let resolved = crate::sql::mode::resolve_mode_with_planner(
+            query_mode,
+            session_mode,
+            expansion.mode_hint,
+        );
+        Ok(crate::query_planner::PlannedQuery::new(expansion, resolved))
+    }
+
+    /// [`Self::plan_query`]・[`Self::plan_query_with_classification`]・
+    /// [`Self::plan_query_with_mode`] が共有する展開フロー本体（辞書スナップショット
+    /// 取得 → ティア判定〔[`PlannerBinding::Tiered`] 構成時のみ〕 → 固定接頭辞
+    /// レンダリング → LLM 呼び出し → 厳格パース）。
+    fn expand_query(
         &self,
         ctx: &PolicyContext,
         table: &str,

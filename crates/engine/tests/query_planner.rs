@@ -138,14 +138,13 @@ fn plan_query_returns_expansion_from_mock_llm() {
         .plan_query(&ctx, "documents", "how does batching work?")
         .expect("plan_query should succeed");
 
-    assert_eq!(
-        expansion,
-        QueryExpansion {
-            search_terms: vec!["batch".to_string(), "cache".to_string()],
-            path_hint: Some("src/".to_string()),
-            kind_hint: Some("fn".to_string()),
-        }
-    );
+    // `QueryExpansion` は TASK-164（PLAN-11）で `#[non_exhaustive]` を付与したため、
+    // クレート外からは `default()` ＋フィールド代入でのみ構築できる。
+    let mut expected = QueryExpansion::default();
+    expected.search_terms = vec!["batch".to_string(), "cache".to_string()];
+    expected.path_hint = Some("src/".to_string());
+    expected.kind_hint = Some("fn".to_string());
+    assert_eq!(expansion, expected);
 
     // 辞書接頭辞（シンボル・ファイルツリー）と質問文の両方が実際に LLM へ渡っていること。
     let prompts = seen_prompts.lock().expect("mock lock poisoned");
@@ -153,6 +152,8 @@ fn plan_query_returns_expansion_from_mock_llm() {
     assert!(prompts[0].contains("run_batch"));
     assert!(prompts[0].contains("src/x.rs"));
     assert!(prompts[0].contains("how does batching work?"));
+    // TASK-164（PLAN-11）: 出力スキーマ指示に mode 推定フィールドが含まれること。
+    assert!(prompts[0].contains("\"mode\""));
 }
 
 // --- 固定接頭辞の使い回し: 同一辞書世代での連続呼び出しはバイト同一 -----------------
