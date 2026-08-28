@@ -1812,6 +1812,26 @@ impl EngineCore {
         // 決定的結合）であり、原質問の埋め込みを使い回さない。疎側の検索テキストも
         // 同じ結合結果を使う（`sql::using_plan::bind_expansion` が疎側へ渡す）。
         let query_text = crate::sql::using_plan::expanded_query_text(question, &expansion);
+
+        // 疎側 `hybrid_search`（`sparse::SparseIndex::search`/`search_within`）が
+        // 課すクエリ入力検証（`MAX_QUERY_BYTES`・`MAX_QUERY_TERMS`）を、密側の
+        // 再埋め込み（`embedder.embed_batch`、高コスト I/O）より前に行う
+        // （codex-review P1 指摘対応、PR #266）。`expanded_query_text` は密側・
+        // 疎側の両方へ渡る単一の文字列だが、原質問（最大 `MAX_QUESTION_CHARS` 文字）
+        // ＋展開検索語（最大 `MAX_SEARCH_TERMS` 件 × `MAX_TERM_LEN` 文字）を無条件に
+        // 連結するため、CJK のような多バイト文字を多用する展開結果では文字数上限内
+        // でも結合後のバイト長が `MAX_QUERY_BYTES` を超えうる。検証を後段の
+        // `hybrid_search` 呼び出し時（`sql::exec::map_hybrid_error`）にのみ委ねると、
+        // 再埋め込みという高コスト I/O を消費してから拒否することになり、untrusted
+        // 入力によるリソース増幅になる。fail-closed（`22000`。`map_hybrid_error` が
+        // `hybrid_search` 経由で課す既存のエラー契約と同一の `wire_code`・文言）で
+        // ここで前倒し拒否する（`map_hybrid_error` 側の検証は多層防御として残る）。
+        crate::sparse::validate_query_bounds(&query_text).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "hybrid query text exceeds allowed length",
+            )
+        })?;
+
         let embedded = embedder.embed_batch(&[query_text.as_str()]).map_err(|e| {
             crate::sql::allowlist::SqlSurfaceError::Internal {
                 detail: format!("USING PLAN re-embedding failed: {e}"),

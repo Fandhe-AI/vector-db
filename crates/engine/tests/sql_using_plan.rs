@@ -146,14 +146,14 @@ impl LlmClient for FailingLlmClient {
 /// `LIMIT` が高コストな LLM クエリ展開（`plan_using_plan_expansion`）より前に
 /// 拒否されることを、呼び出し回数 0 で直接確認するために使う）。
 struct CountingLlmClient {
-    response: &'static str,
+    response: String,
     calls: std::sync::atomic::AtomicUsize,
 }
 
 impl CountingLlmClient {
-    fn new(response: &'static str) -> Self {
+    fn new(response: impl Into<String>) -> Self {
         Self {
-            response,
+            response: response.into(),
             calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -166,7 +166,7 @@ impl CountingLlmClient {
 impl LlmClient for CountingLlmClient {
     fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(self.response.to_string())
+        Ok(self.response.clone())
     }
 }
 
@@ -686,3 +686,107 @@ fn using_plan_rejects_unknown_where_column_before_invoking_query_planner() {
     );
 }
 
+#[test]
+fn using_plan_rejects_expanded_query_text_exceeding_sparse_limits_before_reembedding() {
+    // codex-review P1（PR #266）指摘の判別テスト: `sql::using_plan::
+    // expanded_query_text`（原質問＋展開検索語の決定的結合）は密側の再埋め込み
+    // （`Embedder::embed_batch`）と疎側の `hybrid_search` の両方へ渡る単一の文字列
+    // だが、疎側（`sparse::SparseIndex::search`/`search_within`）が課す
+    // `MAX_QUERY_BYTES`（16 KiB）を考慮せずに構成すると、CJK のような多バイト文字を
+    // 多用する展開結果では受理されたクエリが再埋め込み後の `hybrid_search` でのみ
+    // 失敗しうる（拒否自体は既存の `22000` 契約〔`map_hybrid_error`〕で fail-closed
+    // だが、再埋め込みという高コスト I/O を消費した後段でしか検出できていなかった）。
+    //
+    // 原質問（[`engine::query_planner::MAX_QUESTION_CHARS`] ちょうどの CJK）と
+    // 展開検索語（[`engine::query_planner::MAX_SEARCH_TERMS`] 件 ×
+    // [`engine::query_planner::MAX_TERM_LEN`] 文字の CJK）を両方ともそれぞれの
+    // 文字数上限ちょうどに構成し、UTF-8 での多バイト化により結合後のバイト長が
+    // （sparse 側の）バイト長上限を超えるケースを固定する（上限定数の変化に
+    // 追随できるよう、リテラルの決め打ちではなく実際の公開定数から生成する）。
+    // `CountingLlmClient` の呼び出し回数（1 回・展開自体は成功）と
+    // `RecordingEmbedder` の記録件数（0 回）を確認することで、拒否が再埋め込み
+    // より前で完結することを直接確認する。
+    let path = unique_db_path("sql-using-plan-expanded-text-too-long");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+
+    let question = "あ".repeat(engine::query_planner::MAX_QUESTION_CHARS);
+    let term = "い".repeat(engine::query_planner::MAX_TERM_LEN);
+    let terms_json = std::iter::repeat_n(
+        format!("\"{term}\""),
+        engine::query_planner::MAX_SEARCH_TERMS,
+    )
+    .collect::<Vec<_>>()
+    .join(", ");
+    let response =
+        format!("{{\"search_terms\": [{terms_json}], \"path_hint\": null, \"kind_hint\": null}}");
+
+    let planner = std::sync::Arc::new(CountingLlmClient::new(response));
+    let embedder = std::sync::Arc::new(RecordingEmbedder::new(DIM));
+    struct ArcEmbedder(std::sync::Arc<RecordingEmbedder>);
+    impl Embedder for ArcEmbedder {
+        fn dim(&self) -> u32 {
+            self.0.dim()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.0.embed_batch(texts)
+        }
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(ArcEmbedder(embedder.clone())))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            &format!("SELECT id FROM docs USING PLAN('{question}') LIMIT 10"),
+        )
+        .expect_err("expanded query text exceeding sparse limits must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        embedder.seen_texts().len(),
+        0,
+        "over-long expanded query text must be rejected before the high-cost re-embedding call"
+    );
+}
+
+#[test]
+fn using_plan_accepts_cjk_question_within_sparse_limits() {
+    // 上のテスト（`using_plan_rejects_expanded_query_text_exceeding_sparse_limits_
+    // before_reembedding`）の対: sparse 側のバイト長上限（`sparse::
+    // validate_query_bounds`）の事前検証は、限度内の CJK クエリを新たに拒否しては
+    // ならない。展開後テキストが十分短い CJK 質問で `USING PLAN` 経路が従来どおり
+    // 成功し、再埋め込み（`embedder.embed_batch`）が実際に 1 回実行されることを
+    // 固定する。
+    let path = unique_db_path("sql-using-plan-cjk-within-limits");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let embedder = std::sync::Arc::new(RecordingEmbedder::new(DIM));
+    struct ArcEmbedder(std::sync::Arc<RecordingEmbedder>);
+    impl Embedder for ArcEmbedder {
+        fn dim(&self) -> u32 {
+            self.0.dim()
+        }
+        fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.0.embed_batch(texts)
+        }
+    }
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(ArcEmbedder(embedder.clone())))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let question = "日本語のクエリ".repeat(10);
+    core.execute_sql(
+        &ctx("tenant-a"),
+        &format!("SELECT id FROM docs USING PLAN('{question}') LIMIT 10"),
+    )
+    .expect("CJK question within sparse limits must still succeed");
+
+    assert_eq!(
+        embedder.seen_texts().len(),
+        1,
+        "a CJK question within limits must still reach the re-embedding call"
+    );
+}

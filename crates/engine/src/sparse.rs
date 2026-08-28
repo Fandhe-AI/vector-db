@@ -109,6 +109,40 @@ const MAX_QUERY_TERMS: usize = 1024;
 /// 繰り返し入力によるバイト数だけの増幅を有界に保つための上限とする。
 const MAX_QUERY_BYTES: usize = 16 * 1024;
 
+/// [`SparseIndex::search`]／[`SparseIndex::search_within`] が課すクエリ入力検証
+/// （バイト長 [`MAX_QUERY_BYTES`]・一意語数 [`MAX_QUERY_TERMS`]）を、疎検索本体を
+/// 呼ぶ前に単独で行う（`sql::using_plan::expanded_query_text` が密側・疎側へ渡す
+/// 単一のクエリ文字列を、密側の再埋め込み（`Embedder::embed_batch`）前に検証する
+/// ための呼び出し口。codex-review P1 指摘対応、PR #266）。
+///
+/// 上限値・判定順序（バイト長 → `tokenize()` → 一意語数）は [`SparseIndex::
+/// search`]／[`SparseIndex::search_within`] 内の入力検証と同一の値・同一の
+/// 判定条件を用いる（`MAX_QUERY_BYTES`・`MAX_QUERY_TERMS` の単一真実源を保つ）。
+/// スコアリングに使う一意語集合の再構築コストを避けるため、`search`/
+/// `search_within` 自体は本関数を経由せず従来どおり自前で検証する（多層防御。
+/// 呼び出し元が異なるタイミング〔本関数は再埋め込み前、`search`系は疎検索
+/// 実行直前〕で同じ契約を課すことが目的であり、実装の一本化ではない）。
+pub(crate) fn validate_query_bounds(query: &str) -> Result<(), SparseError> {
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(SparseError::QueryTooLong {
+            len: query.len(),
+            max: MAX_QUERY_BYTES,
+        });
+    }
+
+    let mut unique_terms: BTreeSet<String> = BTreeSet::new();
+    for term in tokenize(query) {
+        unique_terms.insert(term);
+    }
+    if unique_terms.len() > MAX_QUERY_TERMS {
+        return Err(SparseError::TooManyQueryTerms {
+            unique_terms: unique_terms.len(),
+            max: MAX_QUERY_TERMS,
+        });
+    }
+    Ok(())
+}
+
 /// [`SparseIndex::with_params`]（構築）が受け付ける 1 文書のバイト長の上限。
 ///
 /// `with_params()` は各文書テキストに対して `tokenize()` を呼ぶため、
@@ -1396,6 +1430,42 @@ mod tests {
             SparseError::QueryTooLong {
                 len: MAX_QUERY_BYTES + 1,
                 max: MAX_QUERY_BYTES,
+            }
+        );
+    }
+
+    // --- `validate_query_bounds`（`search`/`search_within` 呼び出し前の単独検証。
+    //     codex-review P1 指摘対応、PR #266） ---
+
+    #[test]
+    fn validate_query_bounds_accepts_query_within_limits() {
+        assert!(validate_query_bounds("alpha beta").is_ok());
+    }
+
+    #[test]
+    fn validate_query_bounds_rejects_query_exceeding_max_query_bytes() {
+        let query = "a".repeat(MAX_QUERY_BYTES + 1);
+        let err = validate_query_bounds(&query).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::QueryTooLong {
+                len: MAX_QUERY_BYTES + 1,
+                max: MAX_QUERY_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn validate_query_bounds_rejects_query_exceeding_max_query_terms() {
+        // `distinct_term_query` は本ファイル内の既存ヘルパー（一意語数上限テスト群で
+        // 使用済み）。同じ生成規則を再利用し、値の食い違いを避ける。
+        let query = distinct_term_query(MAX_QUERY_TERMS + 1);
+        let err = validate_query_bounds(&query).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyQueryTerms {
+                unique_terms: MAX_QUERY_TERMS + 1,
+                max: MAX_QUERY_TERMS,
             }
         );
     }
