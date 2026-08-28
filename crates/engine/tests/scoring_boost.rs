@@ -9,7 +9,10 @@
 use std::collections::BTreeSet;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
-use engine::hybrid::{kind_hint_matches, path_hint_matches, rrf_fuse, HybridHit, RrfConfig};
+use engine::hybrid::{
+    kind_hint_matches, path_hint_matches, rrf_fuse, HybridError, HybridHit, RrfConfig,
+    MAX_BOOST_IDS,
+};
 use engine::kernel::CandidateHit;
 use engine::scoring_boost::{apply_scoring_boosts, BoostMetadata, ScoringBoost};
 use engine::sparse::ScoredDoc;
@@ -251,4 +254,38 @@ fn apply_scoring_boosts_is_deterministic_across_repeated_runs() {
     apply_scoring_boosts(&mut run2, &[bound], &metadata, &cfg).expect("apply ok");
 
     assert_eq!(run1, run2);
+}
+
+/// DoS 回避（PR #260 codex-review・cursor[bot] 指摘対応）: `metadata.len() >
+/// MAX_BOOST_IDS` はブースト一致判定の線形走査（`boosts.len() * metadata.len()`）
+/// より前に拒否されること。走査を実行してから `BoostRule::new` の
+/// `MAX_BOOST_IDS` 検査で事後的に拒否されるのではなく、`apply_scoring_boosts`
+/// 自身が事前に `HybridError::TooManyBoostIds` を返す（アロケーション・走査前の
+/// 上限検証という fail-closed 方針を維持する）ことを固定する。
+#[test]
+fn apply_scoring_boosts_rejects_oversized_metadata_before_scanning() {
+    let bound = ScoringBoost::equals("kind", "doc", 0.0004)
+        .bind(&schema())
+        .expect("bind ok");
+    // 値は全件 `None`（不一致）にし、万一走査が最後まで実行されても一致 id 集合が
+    // 空のまま素通りしないことを確認できるようにする。
+    let values: Vec<ColumnValues<'_, 1>> = (0..=(MAX_BOOST_IDS as u64))
+        .map(|id| (id, [("kind", None)]))
+        .collect();
+    let metadata: Vec<BoostMetadata<'_>> = values
+        .iter()
+        .map(|(id, kv)| BoostMetadata::new(*id, kv))
+        .collect();
+    assert_eq!(metadata.len(), MAX_BOOST_IDS + 1);
+
+    let mut hits = vec![HybridHit { id: 1, score: 0.1 }];
+    let err = apply_scoring_boosts(&mut hits, &[bound], &metadata, &RrfConfig::default())
+        .expect_err("oversized metadata must be rejected");
+    assert_eq!(
+        err,
+        HybridError::TooManyBoostIds {
+            len: metadata.len(),
+            max: MAX_BOOST_IDS,
+        }
+    );
 }

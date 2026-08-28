@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 
 use crate::catalog::{ColumnType, TableSchema};
 use crate::hybrid::{
-    apply_soft_boost, BoostRule, HybridError, HybridHit, RrfConfig, MAX_BOOST_RULES,
+    apply_soft_boost, BoostRule, HybridError, HybridHit, RrfConfig, MAX_BOOST_IDS, MAX_BOOST_RULES,
 };
 use crate::row_codec::MAX_TEXT_FIELD_LEN;
 use crate::sql::allowlist::SqlSurfaceError;
@@ -217,12 +217,26 @@ pub const MAX_SCORING_BOOSTS: usize = MAX_BOOST_RULES;
 ///
 /// `boosts.len() > MAX_SCORING_BOOSTS` はアロケーション・走査前に
 /// [`HybridError::TooManyBoostRules`] で拒否する（`hybrid::apply_soft_boost` の長さ
-/// 検証と同じ順序・同じエラー型。本 API 独自のエラー分類は増やさない）。各ブースト
-/// について `metadata` を線形走査し、一致した id を [`BTreeSet`] へ集める
-/// （[`BTreeSet`] のサイズは `MAX_BOOST_IDS` を超え得るため、[`BoostRule::new`] が
-/// 改めて検証する）。一致 id 集合の構築後は `hybrid::apply_soft_boost` へ委譲し、
-/// スコア調整の意味論（加点合計の絶対上限・非有限拒否・決定的再ソート・候補集合
-/// 不変）はそちらへ一元化する。
+/// 検証と同じ順序・同じエラー型。本 API 独自のエラー分類は増やさない）。`metadata`
+/// についても、走査（各ブーストごとの線形走査）に先立って `metadata.len() >
+/// MAX_BOOST_IDS` を [`HybridError::TooManyBoostIds`] で拒否する: この事前検証を
+/// 欠くと `boosts.len() * metadata.len()` に比例した無制限 CPU/メモリ消費が
+/// 発生したのち、最終的に一致 id 数超過で拒否されるだけでもリソース枯渇（DoS）を
+/// 招きうる（PR #260 codex-review・cursor[bot] 指摘対応。`rrf_fuse` の
+/// `TooManyCandidates` と同じ「アロケーション・走査前に長さを検証する」順序を
+/// 踏襲する。融合済み候補 1 件につき高々 1 エントリが自然な形のため、候補 id
+/// 集合の上限である `MAX_BOOST_IDS` をそのまま転用する）。この事前検証により、
+/// 続く各ブーストの `metadata` 線形走査は `boosts.len() * metadata.len() <=
+/// MAX_SCORING_BOOSTS * MAX_BOOST_IDS` に有界化される。一致 id 集合の構築後は
+/// `hybrid::apply_soft_boost` へ委譲し、スコア調整の意味論（加点合計の絶対上限・
+/// 非有限拒否・決定的再ソート・候補集合不変）はそちらへ一元化する。
+///
+/// なお `metadata.len() <= MAX_BOOST_IDS` を通過した時点で、各ブーストの一致 id
+/// 集合（`metadata` 中のユニークな `id` の部分集合）は `metadata.len()` を超え
+/// 得ないため `MAX_BOOST_IDS` を自動的に下回る。[`BoostRule::new`] の
+/// `MAX_BOOST_IDS` 検査は本関数のこの不変条件により実質的に到達しないが、
+/// 呼び出し契約を変えない（`ids` を直接構築できる他の呼び出し経路のための
+/// 防御的検証として残す）ため削除しない。
 pub fn apply_scoring_boosts(
     hits: &mut [HybridHit],
     boosts: &[BoundScoringBoost],
@@ -233,6 +247,12 @@ pub fn apply_scoring_boosts(
         return Err(HybridError::TooManyBoostRules {
             len: boosts.len(),
             max: MAX_SCORING_BOOSTS,
+        });
+    }
+    if metadata.len() > MAX_BOOST_IDS {
+        return Err(HybridError::TooManyBoostIds {
+            len: metadata.len(),
+            max: MAX_BOOST_IDS,
         });
     }
     // `ids` 集合は各ブーストごとに構築し、`BoostRule::new` へ渡すまで生存させる
