@@ -184,10 +184,17 @@ jobs:
   # （silent skip にしない。`bench-batch` ジョブの BENCH_CORE6/BENCH_CORE16 opt-in
   # と同一方針）。実測を行う場合は運用者が `gh variable set BENCH_TIER 1` に加え
   # 下記の接続・閾値 repo variables を設定したうえで、常駐 Ollama を用意した
-  # セルフホスト環境等から本ワークフローを workflow_dispatch する。
+  # セルフホスト runner から本ワークフローを workflow_dispatch する。
+  # `runs-on` は `vars.BENCH_TIER_RUNNER`（セルフホスト runner のラベル）で
+  # 差し替える。`workflow_dispatch` はどこから起動しても実行先が `runs-on`
+  # の指すランナープールに固定されるため、`vars.BENCH_TIER_RUNNER` を設定
+  # せずに `BENCH_TIER` だけを有効化すると、実行先は既定の `ubuntu-latest`
+  # （常駐 Ollama なし）のままとなり Ollama 実接続に失敗して fail-closed で
+  # 非ゼロ終了する（README「ティア別レイテンシ受け入れ基準の repo variables」
+  # 参照）。
   bench-tier:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.BENCH_TIER_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     permissions:
       contents: read
