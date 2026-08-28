@@ -63,9 +63,10 @@
 //! （[`measure_simulated_full_reprocess`]）に通し、判定が確実に `false`（拒否）を返す
 //! ことを [`index1_judgements_reject_simulated_full_reprocess_regression`] で固定する。
 
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use engine::batch_limits::BatchLimits;
@@ -90,7 +91,56 @@ const DIM: u32 = 128;
 /// CPU 時間である以上、並走する他テストの負荷から隔離する）。poison 時は
 /// `into_inner()` で回復する（1 テストの panic で以降の計測系テストが巻き添えで
 /// 失敗しないようにする）。
+///
+/// 本 Mutex は同一 integration-test バイナリ内（本ファイルの 3 テスト）のみを
+/// 直列化し、`cargo test` が別プロセスとして起動する他の integration-test バイナリ
+/// （例: `tests/incremental_write_perf.rs`）や、この Mutex を取得しない他テストとは
+/// 並走し得る（Issue #281 codex-review P2 指摘）。[`acquire_timing_lock`] はこれに
+/// プロセス間ファイルロックを重ね、本テストバイナリを他プロセスの `cargo test`
+/// 実行（同一リポジトリの再実行・並列 CI ジョブ等）とも直列化する。
 static TIMING_LOCK: Mutex<()> = Mutex::new(());
+
+/// [`acquire_timing_lock`] が返すガード。Drop 順でファイルロック解放 → プロセス内
+/// Mutex 解放となる（`File` の Drop で OS ロックが解放されるため明示 unlock は不要）。
+struct TimingLockGuard {
+    _process_guard: MutexGuard<'static, ()>,
+    _lock_file: File,
+}
+
+/// クロスプロセス直列化用ロックファイルのパス。`CARGO_MANIFEST_DIR/target` 配下に
+/// 固定し、`cargo clean` で自然に掃除される（一時ファイル配置は
+/// `temp_db::unique_db_path` と同じ流儀）。ファイル自体の内容は使わず、OS のファイル
+/// ロック機構（`File::lock`。Unix は `flock` 相当）の対象としてのみ使う。
+fn timing_lock_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("incremental-recall-timing.lock")
+}
+
+/// 計測系テスト専用の直列化ガードを取得する（柱 2・3 の計測開始前に必ず呼ぶ）。
+/// プロセス内 Mutex（同一バイナリ内 3 テストの直列化・poison 復帰）に加え、
+/// [`timing_lock_path`] に対する OS ファイルロック（他 integration-test バイナリ・
+/// 他 `cargo test` プロセスとの直列化）を取得することで、「全競合テストで共有できる
+/// 直列化方式」（Issue #281 codex-review 指摘）とする。同じ規約（このパスをロックする）
+/// に従う限り、他の計測系テストファイルも同じ機構に相乗りできる。
+fn acquire_timing_lock() -> TimingLockGuard {
+    let process_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = timing_lock_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create timing lock directory");
+    }
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .expect("open cross-process timing lock file");
+    lock_file.lock().expect("acquire cross-process timing lock");
+    TimingLockGuard {
+        _process_guard: process_guard,
+        _lock_file: lock_file,
+    }
+}
 
 /// 生成チャンク数を小さく固定するための `IncrementalConfig`（1 チャンク = 2 行。
 /// `tests/incremental_index.rs` の `small_chunk_config` と同じ流儀）。
@@ -120,8 +170,9 @@ fn documents_schema() -> TableSchema {
 /// 判定用。TASK-281）。`HashingEmbedder` へ委譲しつつ、呼び出し側から見える副作用
 /// （原子カウンタの増加）だけを追加する。`incremental.rs::embed_and_write_phase` は
 /// ファイル 1 件につき `embed_batch` を 1 回、そのファイルの全チャンク本文をまとめて
-/// 呼ぶ契約のため、単一ファイル挿入で `calls == 1` かつ `texts == chunks_written` に
-/// なることを、実行時間に依存せず固定できる（再埋め込み型の O(N) 退行——本番では外部
+/// 呼ぶ契約のため、単一ファイル挿入で `calls == 1` かつ `texts` が
+/// [`expected_chunks_for_new_file`] の期待値と一致することを、実行時間に依存せず
+/// 固定できる（再埋め込み型の O(N) 退行——本番では外部
 /// 埋め込みサービス呼び出し回数の増加として現れる——を、決定的な `HashingEmbedder`
 /// では時間に現れない場合でも検出できる唯一の手段）。
 struct CountingEmbedder {
@@ -291,11 +342,27 @@ fn within_scaling_slack(t_small: Duration, t_large: Duration) -> bool {
     t_large <= t_small.saturating_mul(SCALING_SLACK)
 }
 
+/// 新規ファイル 1 件分の期待チャンク数を、挿入結果（`chunks_written`）を経由せず
+/// テスト側の入力パラメータ（[`LINES_PER_FILE`] と `small_chunk_config()` の
+/// `lines_per_chunk`）から独立に算出する（柱 1: [`work_is_single_file`] の比較対象。
+/// Issue #281 codex-review P2 指摘）。既存コーパス全体を 1 回の `embed_batch` 呼び出しに
+/// 束ねて全チャンクを書き戻す退行では、`calls == 1` は成立しつつ `chunks_written` も
+/// その 1 回の呼び出しが書いた全行数（＝送った全テキスト数）を報告してしまうため、
+/// 挿入結果自身の `chunks_written` と `texts` を比較する判定では `calls == 1 &&
+/// texts == chunks_written` が両方成立し得て検出をすり抜ける。ここでの期待値は
+/// 挿入結果を一切参照しないテスト定数由来の値なので、この退行では
+/// `texts`（全コーパス分）と一致しなくなる。
+fn expected_chunks_for_new_file() -> usize {
+    let lines_per_chunk = small_chunk_config().chunking.lines_per_chunk;
+    LINES_PER_FILE.div_ceil(lines_per_chunk)
+}
+
 /// 「単一ファイル挿入 1 回分の埋め込み呼び出し」の判定（柱 1。時間非依存）。
-/// `calls == 1`（`embed_batch` の呼び出し回数）かつ `texts == chunks_written`
-/// （入力テキスト総数がそのファイルのチャンク数と一致する）ことを要求する。
-fn work_is_single_file(calls: usize, texts: usize, chunks_written: usize) -> bool {
-    calls == 1 && texts == chunks_written
+/// `calls == 1`（`embed_batch` の呼び出し回数）かつ `texts == expected_chunks`
+/// （入力テキスト総数が、[`expected_chunks_for_new_file`] が返す、挿入結果を経由しない
+/// 独立算出の期待チャンク数と一致する）ことを要求する。
+fn work_is_single_file(calls: usize, texts: usize, expected_chunks: usize) -> bool {
+    calls == 1 && texts == expected_chunks
 }
 
 /// `label` で名前空間化した既存ファイル数 `n_files` のベースラインコーパスを構築する
@@ -554,7 +621,7 @@ fn measure_simulated_full_reprocess_counts(
 // 退行を検出する設計ではない（柱 1・2 が担う。モジュールドキュメント参照）。
 #[test]
 fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild() {
-    let _timing_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _timing_guard = acquire_timing_lock();
 
     let (baseline_path, _baseline_cleanup) = build_baseline("incremental", BASELINE_FILES);
     let t_inc = measure_single_file_insert(
@@ -585,7 +652,7 @@ fn index1_incremental_indexing_completes_within_ratio_threshold_of_full_rebuild(
 
 #[test]
 fn index1_single_file_insert_work_is_independent_of_corpus_size() {
-    let _timing_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _timing_guard = acquire_timing_lock();
 
     for &n_files in &[CORPUS_FILES_SMALL, CORPUS_FILES_LARGE] {
         let label = format!("count-{n_files}");
@@ -615,16 +682,18 @@ fn index1_single_file_insert_work_is_independent_of_corpus_size() {
         let observed_calls = calls.load(Ordering::SeqCst);
         let observed_texts = texts.load(Ordering::SeqCst);
 
+        let expected_chunks = expected_chunks_for_new_file();
         println!(
             "index1 count judgement: n_files={n_files} calls={observed_calls} \
-             texts={observed_texts} chunks_written={}",
+             texts={observed_texts} expected_chunks={expected_chunks} chunks_written={}",
             incremental.chunks_written
         );
 
         assert!(
-            work_is_single_file(observed_calls, observed_texts, incremental.chunks_written),
+            work_is_single_file(observed_calls, observed_texts, expected_chunks),
             "single-file insert work must not scale with corpus size (n_files={n_files}): \
-             calls={observed_calls} texts={observed_texts} chunks_written={}",
+             calls={observed_calls} texts={observed_texts} expected_chunks={expected_chunks} \
+             chunks_written={}",
             incremental.chunks_written
         );
 
@@ -650,7 +719,7 @@ fn index1_single_file_insert_work_is_independent_of_corpus_size() {
 
 #[test]
 fn index1_single_file_insert_time_does_not_scale_with_corpus_size() {
-    let _timing_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _timing_guard = acquire_timing_lock();
 
     let (small_baseline, _small_cleanup) = build_baseline("scale-small", CORPUS_FILES_SMALL);
     let (large_baseline, _large_cleanup) = build_baseline("scale-large", CORPUS_FILES_LARGE);
@@ -687,7 +756,7 @@ fn index1_single_file_insert_time_does_not_scale_with_corpus_size() {
 
 #[test]
 fn index1_judgements_reject_simulated_full_reprocess_regression() {
-    let _timing_guard = TIMING_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _timing_guard = acquire_timing_lock();
 
     // 柱 2（スケーリング判定）の負例: 小規模／大規模コーパスそれぞれで「再処理型」の
     // 実測モデルを計測すると、規模比（32 倍）に比例した傾きとなり
@@ -740,15 +809,17 @@ fn index1_judgements_reject_simulated_full_reprocess_regression() {
         CORPUS_FILES_SMALL,
         "reject-count",
     );
+    let expected_chunks = expected_chunks_for_new_file();
     println!(
         "index1 negative control (count): calls={calls} texts={texts} \
-         chunks_written={chunks_written} (n_files={CORPUS_FILES_SMALL})"
+         expected_chunks={expected_chunks} chunks_written={chunks_written} \
+         (n_files={CORPUS_FILES_SMALL})"
     );
     assert!(
-        !work_is_single_file(calls, texts, chunks_written),
+        !work_is_single_file(calls, texts, expected_chunks),
         "simulated full-reprocess regression must be rejected by the count judgement \
          (i.e. work_is_single_file must return false): calls={calls} texts={texts} \
-         chunks_written={chunks_written}"
+         expected_chunks={expected_chunks} chunks_written={chunks_written}"
     );
 }
 
