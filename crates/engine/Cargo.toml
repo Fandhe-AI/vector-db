@@ -139,10 +139,10 @@ test = false
 
 [[bench]]
 # TASK-116（ティア別レイテンシ受け入れ基準の検証。対象ビヘイビア PLAN-4, PLAN-6,
-# PLAN-7）の実測入口。TASK-115（PLAN-8）の `EngineCore::with_tiered_query_planner`
-# 経由で対話ティア／高精度ティアそれぞれのクエリ展開追加処理時間 p95・展開込み
-# e2e p95 を実 Ollama 接続で測る。harness = false / test = false は上記ベンチと
-# 同一方針。`make bench-tier`（Makefile）から実行する。CI（.github/workflows/bench.yml）
+# PLAN-7。判定内容・測定段階は spec 側が SSOT）の実測入口。TASK-115（PLAN-8）の
+# `EngineCore::with_tiered_query_planner` 経由で実 Ollama 接続により計測する。
+# harness = false / test = false は上記ベンチと同一方針。`make bench-tier`
+# （Makefile）から実行する。CI（.github/workflows/bench.yml）
 # には実行経路を置かない（GitHub ホステッド runner に常駐 Ollama が無く、opt-in の
 # 有無を問わず実測を成功させられないため。README「ティア別レイテンシ受け入れ基準の
 # 実測手順」参照）。判定ロジック自体（時間非依存）は harness/tier.rs にあり

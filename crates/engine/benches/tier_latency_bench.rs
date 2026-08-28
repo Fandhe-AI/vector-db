@@ -1,14 +1,12 @@
 //! ティア別レイテンシ受け入れ基準の実測ベンチ（TASK-116。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-116・対象ビヘイビア: `docs/spec/04-behavior/
-//! query-planning.md` PLAN-4, PLAN-6, PLAN-7）。
+//! query-planning.md` PLAN-4, PLAN-6, PLAN-7。判定内容・測定段階・数値基準は
+//! spec 側が SSOT であり本ファイルには転記しない
+//! （`.claude/rules/spec-confidentiality.md`）。
 //!
 //! 前提 TASK-115（PLAN-8）の `EngineCore::with_tiered_query_planner`／
-//! `crate::tiering` を用い、対話ティア／高精度ティアそれぞれについて
-//! (a) クエリ展開の追加処理時間 p95（PLAN-4。[`EngineCore::plan_query_with_classification`]
-//! 単独の所要時間）と (b) 展開込みエンドツーエンド p95（PLAN-6/7。`USING PLAN('<query>')`
-//! による `EngineCore::execute_sql` 経由の一意ディスパッチ——辞書接頭辞レンダリング →
-//! ティア判定 → LLM 展開 → 厳格パース → 再埋め込み → 既存 C4 ハイブリッド実行形、
-//! `sql::using_plan` モジュールドキュメント参照）を計測する。
+//! `crate::tiering` および `USING PLAN('<query>')` 経由の `EngineCore::execute_sql`
+//! 一意ディスパッチ（`sql::using_plan` モジュールドキュメント参照）を用いて計測する。
 //!
 //! wire 経由・3 クライアントでの `USING PLAN` レイテンシ検証は TASK-117（PLAN-9）の
 //! 管轄でありスコープ外（本ベンチは engine クレート内で完結する）。
@@ -18,9 +16,9 @@
 //! [`harness::tier::DIALOGUE_QUESTION`]／[`harness::tier::PRECISION_QUESTION`] の
 //! 実測分類が意図したティアと一致することを本ベンチ内で確認し、不一致は
 //! （閾値を満たしていても）fail とする。誤ったティアのモデルで基準判定する
-//! false green/red を防ぐため（計画「設計方針 3」）。
+//! false green/red を防ぐため。
 //!
-//! # 常駐 Ollama 前提・opt-in（設計方針 5）
+//! # 常駐 Ollama 前提・opt-in
 //!
 //! 常駐 Ollama への実接続が前提のため、[`harness::tier::opt_in_requested`]
 //! （`BENCH_TIER` env）が明示的に要求された run でのみ実測する。未 opt-in の既定
@@ -203,7 +201,7 @@ fn main() {
 
     let config = MeasurementConfig::new(20, 30, 1).expect("protocol minimums satisfied");
 
-    // --- (a) PLAN-4: クエリ展開の追加処理時間 p95（ティア別） ---
+    // --- ティア別クエリ展開の追加処理時間（PLAN-4） ---
     let mut dialogue_routing_matched = true;
     let dialogue_expansion = run(&config, || {
         let (_, classification) = core
@@ -226,7 +224,7 @@ fn main() {
     })
     .expect("measurement must satisfy protocol minimums");
 
-    // --- (b) PLAN-6/7: 展開込みエンドツーエンド p95（`USING PLAN` 一意ディスパッチ） ---
+    // --- ティア別展開込みエンドツーエンド（PLAN-6/7・`USING PLAN` 一意ディスパッチ） ---
     let dialogue_sql = using_plan_statement(TABLE, DIALOGUE_QUESTION, TOP_K);
     let dialogue_e2e = run(&config, || {
         core.execute_sql(&ctx, &dialogue_sql)

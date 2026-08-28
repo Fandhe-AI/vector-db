@@ -1,30 +1,26 @@
 //! ティア別レイテンシ受け入れ基準の時間非依存ヘルパ（TASK-116。ポインタ:
 //! `docs/spec/05-tasks.md` TASK-116・対象ビヘイビア: `docs/spec/04-behavior/
-//! query-planning.md` PLAN-4, PLAN-6, PLAN-7）。
+//! query-planning.md` PLAN-4, PLAN-6, PLAN-7。判定内容・測定段階・数値基準は
+//! spec 側が SSOT であり本ファイルには転記しない
+//! （`.claude/rules/spec-confidentiality.md`）。
 //!
-//! `benches/tier_latency_bench.rs`（実測。時間依存・`make ci` 対象外）が
-//! ティア別に計測した p95（(a) クエリ展開の追加処理時間＝PLAN-4、(b) 展開込み
-//! エンドツーエンド＝PLAN-6/PLAN-7）を本モジュールの判定関数へ渡す。
-//! `tests/tier_latency_accept.rs` が `#[path]` で本モジュールを取り込み、実測
-//! タイマー・env に依存せず `cargo test`（`make ci` 対象）で回帰検証する
-//! （`harness/accept.rs`・`sql_c1_bench.rs`/`c1_bench_accept.rs` と同一パターン）。
+//! `benches/tier_latency_bench.rs`（実測。時間依存・`make ci` 対象外）が計測した
+//! サンプルを本モジュールの判定関数へ渡す。`tests/tier_latency_accept.rs` が
+//! `#[path]` で本モジュールを取り込み、実測タイマー・env に依存せず
+//! `cargo test`（`make ci` 対象）で回帰検証する（`harness/accept.rs`・
+//! `sql_c1_bench.rs`/`c1_bench_accept.rs` と同一パターン）。
 //!
-//! 数値基準（p95 上限）そのものは spec が SSOT であり本ファイルにはハードコード
-//! しない（`.claude/rules/spec-confidentiality.md`）。判定関数はいずれも呼び出し元
-//! （`tier_latency_bench.rs`）から env 経由で注入された閾値を受け取るのみとする
-//! （`harness::accept` と同一方針）。
+//! 判定関数はいずれも呼び出し元（`tier_latency_bench.rs`）から env 経由で注入
+//! された閾値を受け取るのみとする（`harness::accept` と同一方針）。
 //!
-//! # 計測質問（ティア routing 実証。設計方針 3）
+//! # 計測質問（ティア routing 実証）
 //!
-//! [`DIALOGUE_QUESTION`]・[`PRECISION_QUESTION`] は
-//! [`engine::tiering::TieringCriteria::default`] の判定優先順（パス様トークン >
-//! 手掛かり語 > 辞書シンボル名一致、`tiering.rs::classify` ドキュメンテーション
-//! コメント「優先順」参照）のうち、**対象テーブルの辞書スナップショット内容に
-//! 依存しない**判定経路（パス拡張子一致・手掛かり語一致）のみで意図したティアへ
-//! 決定的に分類されるよう選んである。これにより計測用コーパスの内容を変更しても
-//! ルーティングの実証結果が揺れない（`tiering.rs` の
+//! [`DIALOGUE_QUESTION`]・[`PRECISION_QUESTION`] は、**対象テーブルの辞書
+//! スナップショット内容に依存しない**判定経路のみで意図したティアへ決定的に
+//! 分類されるよう選んである（`tiering.rs` の
 //! `path_extension_match_yields_direct`／`abstraction_cue_yields_high_precision`
-//! と同一の判定経路）。
+//! と同一の判定経路）。これにより計測用コーパスの内容を変更してもルーティング
+//! の実証結果が揺れない。判定優先順の詳細は `tiering.rs::classify` を参照。
 
 use std::time::Duration;
 
@@ -161,8 +157,7 @@ pub fn build_ollama_client(host: &str, port: u16, model: &str) -> Result<OllamaC
     Ok(OllamaClient::new(config))
 }
 
-/// TASK-116 の 4 判定（対話ティア／高精度ティアそれぞれの展開追加処理時間 p95・
-/// e2e p95）に使う上限値。
+/// TASK-116 の受け入れ判定（対象ビヘイビア PLAN-4, PLAN-6, PLAN-7）に使う上限値。
 #[derive(Debug, Clone, Copy)]
 pub struct TierThresholds {
     pub dialogue_expansion_max_p95: Duration,
@@ -171,8 +166,7 @@ pub struct TierThresholds {
     pub precision_e2e_max_p95: Duration,
 }
 
-/// 実測サンプル（対話ティア／高精度ティアそれぞれの展開追加処理時間・e2e）と
-/// routing 実証結果（設計方針 3）。
+/// TASK-116 の実測サンプルと routing 実証結果。
 pub struct TierSamples {
     pub dialogue_expansion: Vec<Duration>,
     pub dialogue_e2e: Vec<Duration>,
@@ -187,7 +181,7 @@ pub struct TierSamples {
     pub precision_routing_matched: bool,
 }
 
-/// TASK-116 の 4 判定結果。
+/// TASK-116 の受け入れ判定結果。
 #[derive(Debug, Clone, Copy)]
 pub struct TierJudgment {
     pub dialogue_expansion_p95: Duration,
@@ -203,7 +197,7 @@ pub struct TierJudgment {
 }
 
 impl TierJudgment {
-    /// 4 判定・2 routing 検証すべてが通ったか（合否の単一集約点。`tier_latency_bench.rs`
+    /// すべての判定・routing 検証が通ったか（合否の単一集約点。`tier_latency_bench.rs`
     /// はこの値のみを最終 pass/fail に使う）。
     pub fn all_passed(&self) -> bool {
         self.dialogue_expansion_ok
