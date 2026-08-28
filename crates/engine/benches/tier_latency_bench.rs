@@ -91,6 +91,53 @@ fn env_raw(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }
 
+/// `--help`／`-h` 指定時に表示する env 一覧（変数名と用途 1 行のみ。数値・閾値・
+/// 実測値は一切含めない）。README「ティア別レイテンシ受け入れ基準の実測手順」から
+/// 案内される想定の実処理（案内と実挙動を一致させる。codex-review PR #269 指摘）。
+/// `harness = false`（`Cargo.toml`）のため `std::env::args()` を自前で解析する
+/// 必要がある。
+fn print_help() {
+    println!("tier_latency_bench: env vars used by this benchmark (values/thresholds are not printed; see README)");
+    println!();
+    println!("opt-in:");
+    println!("  BENCH_TIER                                  set to opt in to running this benchmark against a resident Ollama");
+    println!();
+    println!("connection (required once opted in):");
+    println!("  BENCH_TIER_OLLAMA_HOST                        resident Ollama host");
+    println!("  BENCH_TIER_OLLAMA_PORT                        resident Ollama port");
+    println!(
+        "  BENCH_TIER_DIALOGUE_MODEL                     model name used for the dialogue tier"
+    );
+    println!(
+        "  BENCH_TIER_PRECISION_MODEL                    model name used for the high-precision tier"
+    );
+    println!();
+    println!(
+        "thresholds (required once opted in; values are spec-derived and not documented here):"
+    );
+    println!(
+        "  BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS      dialogue tier expansion-only p95 upper bound (ms)"
+    );
+    println!(
+        "  BENCH_TIER_DIALOGUE_MAX_P95_MS                dialogue tier end-to-end p95 upper bound (ms)"
+    );
+    println!(
+        "  BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS     high-precision tier expansion-only p95 upper bound (ms)"
+    );
+    println!(
+        "  BENCH_TIER_PRECISION_MAX_P95_MS               high-precision tier end-to-end p95 upper bound (ms)"
+    );
+}
+
+/// 引数に `--help`／`-h` が含まれるかを判定する。`cargo bench --bench
+/// tier_latency_bench -p engine -- --help` はハーネス無効（`harness = false`）の
+/// ため cargo 標準の help 傍受は効かず、本関数で明示的に処理する。
+fn help_requested() -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+}
+
 fn fail_closed(msg: impl std::fmt::Display) -> ! {
     eprintln!("tier_latency_bench: {msg}");
     std::process::exit(1);
@@ -148,6 +195,11 @@ fn required_connection() -> (String, u16, String, String) {
 }
 
 fn main() {
+    if help_requested() {
+        print_help();
+        return;
+    }
+
     if !opt_in_requested(env_raw("BENCH_TIER").as_deref()) {
         print_not_evaluated();
         return;
