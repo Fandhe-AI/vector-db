@@ -107,7 +107,7 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 ### ティア別レイテンシ受け入れ基準の repo variables（TASK-116）
 
-`make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-115（PLAN-8）のティアリング機構が振り分ける対話ティア／高精度ティアそれぞれについて、クエリ展開の追加処理時間 p95（PLAN-4）と展開込みエンドツーエンド p95（PLAN-6/7。`USING PLAN('<query>')` 経由）を実測します。常駐 Ollama への実接続が前提のため、GitHub ホステッド runner 既定では `BENCH_TIER` repo variable が未設定（空文字）のままとし、`tier_latency_bench.rs` が「測定不能」を明示ログ出力して判定対象外のまま正常終了します（`BENCH_CORE6`/`BENCH_CORE16` と同じ opt-in 方式）。
+`make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-116（PLAN-4・PLAN-6・PLAN-7。詳細は `docs/spec/04-behavior/query-planning.md` を参照）の受け入れ基準を実測します。常駐 Ollama への実接続が前提のため、GitHub ホステッド runner 既定では `BENCH_TIER` repo variable が未設定（空文字）のままとし、`tier_latency_bench.rs` が「測定不能」を明示ログ出力して判定対象外のまま正常終了します（`BENCH_CORE6`/`BENCH_CORE16` と同じ opt-in 方式）。
 
 > [!IMPORTANT]
 > public リポジトリのため `.github/workflows/bench.yml` の `bench-tier` ジョブの `runs-on` は `ubuntu-latest` 固定です（self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み例外であり、repo variable によるランナー差し替え経路は設けません）。GitHub ホステッド runner には常駐 Ollama が無いため、`BENCH_TIER` を opt-in しても `tier_latency_bench.rs` の Ollama 実接続は失敗し、ジョブは fail-closed で非ゼロ終了します。常駐 Ollama を用いた実測が必要な場合は、GitHub Actions 外の承認済み計測手順として別途運用者が実行してください（本ワークフロー経由では実測できません）。

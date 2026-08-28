@@ -10,10 +10,9 @@
 - 関連: TASK-83（同型の p95 再測定 ADR の前例。`docs/design/
   c1-p95-dedicated-env-reverification.md`）・TASK-117（PLAN-9。wire 経由・3 クライアント
   でのレイテンシ検証。本タスクの範囲外）
-- 対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4（クエリ展開の追加
-  処理時間 p95 がティア許容値以内）・PLAN-6（対話ティアのエンドツーエンド p95 基準）・
-  PLAN-7（高精度ティアのエンドツーエンド p95 基準）。**数値基準は spec 由来のため本
-  ドキュメントへは転記しない**（`.claude/rules/spec-confidentiality.md`）
+- 対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4・PLAN-6・PLAN-7
+  （ポインタ表記のみ。定義・数値基準は spec 側を参照し本ドキュメントへは転記しない。
+  `.claude/rules/spec-confidentiality.md`）
 
 ## 背景
 
