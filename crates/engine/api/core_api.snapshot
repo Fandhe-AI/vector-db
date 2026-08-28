@@ -60,7 +60,6 @@ pub trait SearchProvider: Send + Sync {
 
 # source: crates/engine/src/core.rs :: CoreError
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum CoreError {
     Storage(StorageError),
     Catalog(CatalogError),

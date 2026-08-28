@@ -706,11 +706,14 @@ fn map_rls_error(e: RlsError) -> CoreError {
 /// のエラーを一本化しつつ、不可視行と不存在行を [`CoreError::NotFound`] に統合する
 /// （呼び出し元へ存在情報を漏らさないため。エラーメッセージはプログラム出力文字列のため英語）。
 ///
-/// `#[non_exhaustive]`: 公開 API・エラー契約の互換性（AGENTS.md P1）に従い、以降の
-/// variant 追加を非破壊にするため付与する（PR #252 codex-review P1 指摘対応）。
-/// 呼び出し元は `match` に `_ =>` 等の catch-all アームを用意すること。
+/// `#[non_exhaustive]` は付与しない: 本 enum は本 PR より前から公開済みであり、
+/// 後付けで `#[non_exhaustive]` を付けると下流の網羅的 `match` がコンパイル不能に
+/// なる（それ自体が破壊的変更のため、`#[non_exhaustive]` 化で互換性を装うのではなく
+/// 付けないままにする。codex-review PR #252 P1 指摘）。本 PR で追加した
+/// `QueryPlannerUnavailable`／`QueryPlanning` variant の追加自体は、`non_exhaustive`
+/// 化の有無に関わらず既存の網羅的 `match` を壊す破壊的変更であることに変わりはない
+/// （PR 本文の変更点に明記する）。
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum CoreError {
     Storage(StorageError),
     Catalog(CatalogError),
