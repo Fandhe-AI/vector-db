@@ -43,13 +43,26 @@ use std::sync::Once;
 
 use super::commit_boundary;
 
+/// [`EMERGENCY_RESPONSE_CHANNEL`] の要素型: `(事前エンコード済み ErrorResponse
+/// バイト列, 書き込み先 TcpStream のクローン, 登録時点の ResponseBoundaryGuard
+/// 世代)`。型を独立させているのは可読性のためだけでなく、clippy
+/// `type_complexity` を素直に満たすため（実質的な意味は変わらない）。
+type EmergencyChannelEntry = (Vec<u8>, TcpStream, Option<u64>);
+
 thread_local! {
     /// このスレッド（＝ wire-server の 1 接続スレッド）に登録された緊急応答チャネル
-    /// （TASK-97・RECOVER-6）。`(事前エンコード済み ErrorResponse バイト列, 書き込み先
-    /// TcpStream のクローン)` の組。[`EmergencyResponseRegistration`] が RAII で
-    /// 登録・解除し、panic フックが一度だけ `take()` して消費する（二重送信の
-    /// 構造的防止）。
-    static EMERGENCY_RESPONSE_CHANNEL: RefCell<Option<(Vec<u8>, TcpStream)>> =
+    /// （TASK-97・RECOVER-6）。[`EmergencyChannelEntry`] の 3 要素目（世代）は
+    /// [`EmergencyResponseRegistration::register`] が
+    /// [`commit_boundary::current_response_boundary_generation`] を捕捉して保持し、
+    /// panic フックが [`commit_boundary::active_commit_pending_generation`] と
+    /// 突き合わせる（登録されたバイト列が指す commit と、実際に commit-pending に
+    /// なった commit が同一世代であることを保証する ―― `commit_boundary` 側の
+    /// `commit` は `execute_sql_in_session` 以外の経路〔`Storage::put`/`put_batch`・
+    /// `catalog` の DDL〕からも直接呼ばれうるため、同一スレッド内で世代の異なる
+    /// commit が pending に紛れ込む可能性を構造的に排除する）。
+    /// [`EmergencyResponseRegistration`] が RAII で登録・解除し、panic フックが
+    /// 一度だけ `take()` して消費する（二重送信の構造的防止）。
+    static EMERGENCY_RESPONSE_CHANNEL: RefCell<Option<EmergencyChannelEntry>> =
         const { RefCell::new(None) };
 }
 
@@ -81,9 +94,18 @@ impl EmergencyResponseRegistration {
     /// フック内でのアロケーション・整形失敗を避けるため、`response_bytes` は
     /// 呼び出し元が事前に確定済みのバイト列として渡す（フック内で新規に
     /// エンコードしない）。
+    ///
+    /// 登録時点の [`commit_boundary::current_response_boundary_generation`] を
+    /// 併せて捕捉する。呼び出し元（`wire-server::simple_query::
+    /// execute_and_respond`）は本関数の呼び出し前に必ず `ResponseBoundaryGuard`
+    /// を生成済みの契約のため、通常経路ではここが `None` になることはない。
+    /// 仮に `None`（アクティブなガードなし）で登録された場合は、
+    /// [`emergency_send_decision`] が常に偽と判定するため送信されない側
+    /// （fail-closed）に倒れる。
     pub fn register(response_bytes: Vec<u8>, stream: TcpStream) -> Self {
+        let generation = commit_boundary::current_response_boundary_generation();
         EMERGENCY_RESPONSE_CHANNEL.with(|c| {
-            *c.borrow_mut() = Some((response_bytes, stream));
+            *c.borrow_mut() = Some((response_bytes, stream, generation));
         });
         Self { _private: () }
     }
@@ -101,16 +123,24 @@ impl Drop for EmergencyResponseRegistration {
 
 /// 緊急応答を送信してよいかを判定する純関数（TASK-97・RECOVER-6）。
 ///
-/// `pending`: このスレッドが commit 成功後・応答未確定の区間にあるか
-/// （[`commit_boundary::active_commit_pending_generation`] の `is_some()`）。
-/// `registered`: [`EmergencyResponseRegistration`] が登録されているか。
+/// `pending_generation`: [`commit_boundary::active_commit_pending_generation`]
+/// の返り値（このスレッドが commit 成功後・応答未確定の区間にあるなら、その
+/// commit を記録した `ResponseBoundaryGuard` の世代）。
+/// `registered_generation`: [`EmergencyResponseRegistration::register`] が
+/// 登録時点で捕捉した世代（[`commit_boundary::current_response_boundary_generation`]）。
 ///
-/// 両方が真の場合のみ送信してよいと判定する（fail-closed: 判定が曖昧な組み
-/// 合わせは存在しない ―― 4 分岐すべてが確定的に定まる真理値表であり、いずれか
-/// 片方でも欠けていれば送らない）。abort を伴わずにユニットテストで全分岐を
-/// 検証できるよう、実際の書き込み・`abort()` から独立させている。
-pub(crate) fn emergency_send_decision(pending: bool, registered: bool) -> bool {
-    pending && registered
+/// 両方が `Some` で、かつ同一世代の場合のみ送信してよいと判定する（fail-closed:
+/// 曖昧な組み合わせは存在しない ―― pending でない・登録がない・登録はあるが
+/// 世代が異なる〔登録済みバイト列が指す commit とは別の commit が pending に
+/// なっている〕のいずれも送らない）。世代の一致を要求する理由は
+/// [`EMERGENCY_RESPONSE_CHANNEL`] のドキュメント参照。abort を伴わずに
+/// ユニットテストで全分岐を検証できるよう、実際の書き込み・`abort()` から
+/// 独立させている。
+pub(crate) fn emergency_send_decision(
+    pending_generation: Option<u64>,
+    registered_generation: Option<u64>,
+) -> bool {
+    pending_generation.is_some() && pending_generation == registered_generation
 }
 
 /// panic フックの冪等な導入（TASK-97・RECOVER-6）。複数回呼ばれても実際の
@@ -155,13 +185,13 @@ pub fn install_panic_hook() {
 /// `RefCell::borrow_mut` の再入 panic を避けるため、`try_borrow_mut` で
 /// 失敗時は素通しする（フック内で新たに panic させない）。
 fn try_send_emergency_response() -> bool {
-    let pending = commit_boundary::active_commit_pending_generation().is_some();
+    let pending_generation = commit_boundary::active_commit_pending_generation();
 
     // `take()` は判定結果に関わらず無条件に行う（意図的な設計 ―― 「まず覗いて
     // から取る」に書き換えない）。これにより、送信しないと判定した場合も登録は
     // 必ず消費済みになる。同一 unwind 中に本関数が複数回呼ばれる経路は現状存在
-    // しないが、仮に呼ばれても 2 回目は `registered == false` となり必ず前フック
-    // へ委譲する ―― 二重送信より安全な側（fail-closed）に倒れる。
+    // しないが、仮に呼ばれても 2 回目は登録なしとなり必ず前フックへ委譲する ――
+    // 二重送信より安全な側（fail-closed）に倒れる。
     let channel = EMERGENCY_RESPONSE_CHANNEL.with(|c| {
         // 通常経路では再入しないが（フックは unwind 中に 1 回だけ動く）、万一
         // 借用中であれば取得を諦めて fail-closed に倒す（フック内で panic
@@ -172,15 +202,16 @@ fn try_send_emergency_response() -> bool {
         }
     });
 
-    let registered = channel.is_some();
+    let registered_generation = channel.as_ref().and_then(|(_, _, generation)| *generation);
 
-    if !emergency_send_decision(pending, registered) {
+    if !emergency_send_decision(pending_generation, registered_generation) {
         return false;
     }
 
     // ここまで到達した時点で channel は Some（emergency_send_decision が真の
-    // ため registered も真）。
-    let Some((response_bytes, mut stream)) = channel else {
+    // ため registered_generation も Some ―― channel が None なら
+    // registered_generation も None になり判定は偽になっている）。
+    let Some((response_bytes, mut stream, _generation)) = channel else {
         return false;
     };
 
@@ -196,13 +227,16 @@ mod tests {
     use super::*;
 
     // --- emergency_send_decision の全分岐（RECOVER-6 の判定純関数）---
+    // pending・registered それぞれ「なし」「世代 X」「世代 Y（X と異なる）」の
+    // 3 値を取りうるため、単純な bool 4 分岐ではなく世代の一致まで検証する。
 
     #[test]
-    fn emergency_send_decision_true_only_when_pending_and_registered() {
-        assert!(emergency_send_decision(true, true));
-        assert!(!emergency_send_decision(true, false));
-        assert!(!emergency_send_decision(false, true));
-        assert!(!emergency_send_decision(false, false));
+    fn emergency_send_decision_true_only_when_pending_and_registered_generations_match() {
+        assert!(emergency_send_decision(Some(1), Some(1)));
+        assert!(!emergency_send_decision(Some(1), Some(2)));
+        assert!(!emergency_send_decision(Some(1), None));
+        assert!(!emergency_send_decision(None, Some(1)));
+        assert!(!emergency_send_decision(None, None));
     }
 
     // --- install_panic_hook の冪等性 ---
@@ -257,6 +291,88 @@ mod tests {
         );
 
         drop(client);
+    }
+
+    // --- 世代不一致: 登録済みチャネルの世代と実際に pending になった世代が
+    // 異なる場合は送信しないこと（TASK-97・codex-review 指摘対応。
+    // `commit_boundary::commit` は `execute_sql_in_session` 以外の経路からも
+    // 呼ばれうるため、登録時と commit 時で世代がずれるケースを実地で再現する）。
+
+    #[test]
+    fn try_send_emergency_response_does_not_send_when_registered_generation_differs_from_pending() {
+        use crate::storage::{RowInput, Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        let path = unique_db_path("panic-hook-generation-mismatch");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let mut client = std::net::TcpStream::connect(addr).expect("connect");
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("set read timeout");
+        let (server_stream, _) = listener.accept().expect("accept");
+
+        // 1 個目のガード配下で緊急応答を登録する（登録時の世代 = このガードの
+        // 世代）。commit は伴わせず、ガードごと drop する。
+        {
+            let _guard_a = commit_boundary::ResponseBoundaryGuard::new();
+            let _registration =
+                EmergencyResponseRegistration::register(vec![b'E', 0, 0, 0, 4], server_stream);
+
+            // ガード a を drop する前に、ここまでの登録済み世代を検証する
+            // （後続の commit がこの世代と一致しないことを示すための前提確認）。
+            let registered_generation =
+                EMERGENCY_RESPONSE_CHANNEL.with(|c| c.borrow().as_ref().and_then(|(_, _, g)| *g));
+            assert!(
+                registered_generation.is_some(),
+                "registration inside an active guard must capture Some(generation)"
+            );
+
+            // _registration をここでは drop せず、guard_a の drop 後も
+            // チャネルに残したまま次のガード・commit へ進む。
+            std::mem::forget(_registration);
+        }
+        // guard_a が drop され、次に生成するガードは新しい世代を払い出す。
+
+        {
+            let _guard_b = commit_boundary::ResponseBoundaryGuard::new();
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            let row = RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0],
+                metadata: &[],
+            };
+            {
+                let mut table = write_txn
+                    .open_table(crate::storage::ROWS_TABLE)
+                    .expect("open rows table");
+                let encoded = crate::storage::encode_row(&row).expect("encode row");
+                table
+                    .insert(("tenant-a", 1u64), encoded.as_slice())
+                    .expect("insert");
+            }
+            commit_boundary::commit(write_txn).expect("guard_b's commit must succeed");
+
+            // pending 世代（guard_b）は登録済みチャネルの世代（guard_a）とは
+            // 異なるはずなので、送信されないこと。
+            let sent = try_send_emergency_response();
+            assert!(
+                !sent,
+                "must not send when the registered generation differs from the pending generation"
+            );
+
+            let mut buf = [0u8; 1];
+            use std::io::Read as _;
+            let n = client.read(&mut buf);
+            assert!(
+                matches!(n, Err(_) | Ok(0)),
+                "no bytes must have been written on generation mismatch"
+            );
+        }
     }
 
     // --- try_send_emergency_response: モック writer で送信判定・一度きり消費を検証 ---

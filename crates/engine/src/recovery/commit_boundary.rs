@@ -237,13 +237,40 @@ pub(crate) fn should_abort(armed: bool, panicking: bool) -> bool {
 ///
 /// [`COMMIT_PENDING_RESPONSE`] をクリアしない・書き換えない（既存の
 /// [`ResponseBoundaryGuard`] の世代管理・abort 判定ロジックには一切影響しない）。
-/// 返り値は世代番号そのもの（`Some` なら pending 中）であり、呼び出し元
-/// （panic フック）は世代の一致判定をしない契約 ―― フックは panic が発生した
-/// スレッド上で実行されるため、そのスレッドに pending が立っていれば、それは
-/// 常にこの接続スレッド自身の commit に対応する（他スレッド・他接続の世代が
-/// 混入する余地がない。thread-local である本フラグの前提そのもの）。
+/// 返り値は世代番号そのもの（`Some` なら pending 中）。他スレッド・他接続の値が
+/// 混入しない（thread-local）のは前提どおりだが、**同一スレッド内で複数世代の
+/// 混同が起こり得る**点に注意 ―― 本モジュールの `commit` は `crate::tenant`・
+/// `crate::txn` 経由の書き込みだけでなく `crate::storage::Storage::put`/`put_batch`・
+/// `crate::catalog` の DDL からも直接呼ばれる（モジュール冒頭コメント参照）。
+/// `execute_sql_in_session` の呼び出し区間中にそれらの経路が commit した場合、
+/// その commit の世代がここに現れうるが、それは緊急応答チャネルに登録された
+/// バイト列が指す commit と同一とは限らない。呼び出し元（panic フック）は
+/// この返り値を単独で「送信してよい」根拠にせず、
+/// [`current_response_boundary_generation`] と突き合わせて一致した場合のみ
+/// 送信する契約（[`crate::recovery::panic_hook::emergency_send_decision`]
+/// 参照）。
 pub(crate) fn active_commit_pending_generation() -> Option<u64> {
     COMMIT_PENDING_RESPONSE.with(|f| f.get())
+}
+
+/// このスレッドで現在アクティブな [`ResponseBoundaryGuard`] の世代番号を読み取り
+/// 専用で照会する（TASK-97、対象ビヘイビア: RECOVER-6）。
+/// [`crate::recovery::panic_hook::EmergencyResponseRegistration::register`] が
+/// 登録時点でこの値を捕捉し、[`active_commit_pending_generation`] と突き合わせる
+/// ための世代番号として保持する（緊急応答チャネルに登録されたバイト列が指す
+/// commit と、実際に commit-pending になった世代が一致することを保証する。
+/// `active_commit_pending_generation` のドキュメント参照）。
+///
+/// アクティブなガードが存在しない（0）場合は `None` を返す。`0` はガード未生成の
+/// 予約値であり実世代として払い出されない（[`NEXT_RESPONSE_BOUNDARY_GENERATION`]
+/// の初期値が `1` であることに対応）。
+pub(crate) fn current_response_boundary_generation() -> Option<u64> {
+    let generation = ACTIVE_RESPONSE_BOUNDARY_GENERATION.with(|c| c.get());
+    if generation == 0 {
+        None
+    } else {
+        Some(generation)
+    }
 }
 
 /// commit 成功境界の公開 choke point（RECOVER-5）。`write_txn` は呼び出し元が
