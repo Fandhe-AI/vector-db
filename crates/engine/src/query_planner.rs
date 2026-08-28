@@ -308,19 +308,15 @@ pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanEr
 // 再埋め込み規則（TASK-114・PLAN-10）
 // ---------------------------------------------------------------------------
 
-/// 密ベクトル検索へ投入する再埋め込みテキストの先頭に付す固定接頭辞（ポインタ:
-/// `docs/spec/05-tasks.md` TASK-114・`docs/spec/04-behavior/query-planning.md`
-/// PLAN-10）。
-pub const SEARCH_QUERY_PREFIX: &str = "search_query: ";
+/// 再埋め込みテキストの合成規則（本 const・[`render_reembedding_text`] の具体的な
+/// 合成順序・除外判断を含む）を定める規則本文は spec 側にあり、本モジュールは
+/// その実装のみを担う（ポインタ: `docs/spec/05-tasks.md` TASK-114・
+/// `docs/spec/04-behavior/query-planning.md` PLAN-10。規則詳細は spec 側参照）。
+pub(crate) const SEARCH_QUERY_PREFIX: &str = "search_query: ";
 
 /// LLM クエリ展開（[`QueryExpansion`]）の結果から、再埋め込み対象テキストを
-/// 決定的に合成する。
-///
-/// 合成規則: [`SEARCH_QUERY_PREFIX`] ＋ [`sanitize_question`] で有界化した質問文 ＋
-/// `expansion.search_terms` を半角スペース区切りで連結（`search_terms` が空なら
-/// 「プレフィックス＋質問」のみで成立するフォールバック）。`path_hint`・
-/// `kind_hint` はソフトヒント（RRF 融合後スコアへの加点等、TASK-111 の管轄）であり
-/// 埋め込み対象には含めない。
+/// `docs/spec/04-behavior/query-planning.md` PLAN-10 の合成規則に従って決定的に
+/// 合成する（規則本文は spec 側・本関数はその実装）。
 ///
 /// `expansion` はパース済み（[`parse_expansion`] 経由）であれば `search_terms` の
 /// 件数・各語長は [`MAX_SEARCH_TERMS`]・[`MAX_TERM_LEN`] 以内だが、本関数は
@@ -350,9 +346,8 @@ pub fn render_reembedding_text(question: &str, expansion: &QueryExpansion) -> St
 /// （TASK-120）へ渡し、次元・件数を検証したベクトルを返す。
 ///
 /// 呼び出し元は `core.rs::EngineCore::plan_and_embed_query`（TASK-114・PLAN-10）。
-/// **原質問を埋め込んだ既存ベクトルを引数に取らない**シグネチャとし、「LLM 展開前の
-/// 埋め込みをそのまま使い回す」経路を型レベルで構造的に排除する（規則の詳細は
-/// `docs/spec/04-behavior/query-planning.md` PLAN-10 参照）。
+/// 引数の取り方は `docs/spec/04-behavior/query-planning.md` PLAN-10 の規則に従う
+/// （規則本文は spec 側・本関数はその実装）。
 ///
 /// 埋め込みサービスからの戻り値は untrusted 応答として扱い、件数が 1 件でない・
 /// 次元が `embedder.dim()` と異なる場合は [`crate::embedding::EmbedError::InvalidResponse`]・
