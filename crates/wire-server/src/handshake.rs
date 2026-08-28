@@ -17,6 +17,8 @@ use std::io::{self, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use engine::error_format::ErrorClass;
+
 use crate::auth::{self, UserStore};
 use crate::framing::{self, FrameError};
 
@@ -26,14 +28,6 @@ const PROTOCOL_VERSION_3_0: i32 = 0x0003_0000;
 const SSL_REQUEST_CODE: i32 = 80_877_103;
 const GSSENC_REQUEST_CODE: i32 = 80_877_104;
 const CANCEL_REQUEST_CODE: i32 = 80_877_102;
-
-/// SQLSTATE `0A000`（feature_not_supported）。簡易クエリ実行未実装・拡張クエリ
-/// プロトコル受信時の応答に用いる。
-const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
-/// SQLSTATE `08P01`（protocol_violation）。StartupMessage の構文・バージョン不正
-/// （フレーミング以外のプロトコル違反）に用いる。フレーミング由来の分類・値は
-/// `framing::SQLSTATE_PROTOCOL_VIOLATION` を単一の真実源とする。
-const SQLSTATE_PROTOCOL_VIOLATION: &str = framing::SQLSTATE_PROTOCOL_VIOLATION;
 
 #[derive(Debug)]
 enum HandshakeError {
@@ -61,6 +55,17 @@ impl From<FrameError> for HandshakeError {
             FrameError::Io(io_err) => HandshakeError::Io(io_err),
             other => HandshakeError::Frame(other),
         }
+    }
+}
+
+/// [`write_error_response`] が [`crate::error_response::encode`]（ErrorResponse
+/// バイト列組み立ての唯一の実体。TASK-153・ERR-1・codex-review P1 指摘対応・
+/// PR #258）に委譲する際のエラー写像。フレーム長超過等のエンコード失敗は
+/// fail-closed に倒し `Protocol` 分類として扱う（本モジュールの `class`/`message`
+/// 引数は固定英語文言のみを渡す契約のため実運用では発生しない想定）。
+impl From<crate::result_encoder::EncodeError> for HandshakeError {
+    fn from(_: crate::result_encoder::EncodeError) -> Self {
+        HandshakeError::Protocol("failed to encode error response")
     }
 }
 
@@ -175,10 +180,10 @@ fn write_ready_for_query(stream: &mut TcpStream) -> Result<()> {
 /// `pub(crate)` にする（`HandshakeError` 自体は private のまま維持する）。
 pub(crate) fn write_error_response_io(
     stream: &mut TcpStream,
-    sqlstate: &str,
+    class: ErrorClass,
     message: &str,
 ) -> io::Result<()> {
-    write_error_response(stream, sqlstate, message).map_err(io::Error::from)
+    write_error_response(stream, class, message).map_err(io::Error::from)
 }
 
 /// `write_ready_for_query` の `io::Result` 版ラッパー。[`crate::simple_query`] は
@@ -188,23 +193,15 @@ pub(crate) fn write_ready_for_query_io(stream: &mut TcpStream) -> io::Result<()>
     write_ready_for_query(stream).map_err(io::Error::from)
 }
 
-fn write_error_response(stream: &mut TcpStream, sqlstate: &str, message: &str) -> Result<()> {
-    let mut body = Vec::new();
-    body.push(b'S');
-    body.extend_from_slice(b"ERROR");
-    body.push(0);
-    body.push(b'C');
-    body.extend_from_slice(sqlstate.as_bytes());
-    body.push(0);
-    body.push(b'M');
-    body.extend_from_slice(message.as_bytes());
-    body.push(0);
-    body.push(0); // フィールド終端
-    let total_len = (4 + body.len()) as i32;
-    let mut msg = Vec::with_capacity(1 + body.len() + 4);
-    msg.push(b'E');
-    msg.extend_from_slice(&total_len.to_be_bytes());
-    msg.extend_from_slice(&body);
+/// バイト列組み立ては [`crate::error_response::encode`] に委譲する（`ErrorClass`
+/// から severity・SQLSTATE を一元的に決定し、通常応答経路がこの横断写像を必ず
+/// 経由するようにする。TASK-153・ERR-1・codex-review P1 指摘対応・PR #258。
+/// 以前は `crate::result_encoder::encode_error_response`〔`&str` の SQLSTATE を
+/// そのまま受け取り severity は `ERROR` 固定〕を経由しており、`ErrorClass::
+/// ConnectionLimitExceeded` のような `FATAL` 契約の分類でも `ERROR` に丸められる
+/// 不整合があった）。
+fn write_error_response(stream: &mut TcpStream, class: ErrorClass, message: &str) -> Result<()> {
+    let msg = crate::error_response::encode(class, message)?;
     write_all(stream, &msg)
 }
 
@@ -398,7 +395,7 @@ fn post_auth_loop(
                     None => {
                         write_error_response(
                             stream,
-                            SQLSTATE_FEATURE_NOT_SUPPORTED,
+                            ErrorClass::FeatureNotSupported,
                             "simple query execution is not yet implemented",
                         )?;
                         write_ready_for_query(stream)?;
@@ -456,13 +453,13 @@ fn respond_and_close(
         HandshakeError::Io(e) => Err(e),
         HandshakeError::Frame(FrameError::Truncated) => Ok(()),
         HandshakeError::Frame(frame_err) => {
-            if let Some(sqlstate) = frame_err.sqlstate() {
-                let _ = write_error_response(stream, sqlstate, frame_err.client_message());
+            if let Some(class) = frame_err.error_class() {
+                let _ = write_error_response(stream, class, frame_err.client_message());
             }
             Ok(())
         }
         HandshakeError::Protocol(_) => {
-            let _ = write_error_response(stream, SQLSTATE_PROTOCOL_VIOLATION, fallback_message);
+            let _ = write_error_response(stream, ErrorClass::ProtocolViolation, fallback_message);
             Ok(())
         }
     }
@@ -527,7 +524,7 @@ fn handle_connection_inner(
         Err(_failure) => {
             write_error_response(
                 &mut stream,
-                auth::SQLSTATE_INVALID_PASSWORD,
+                ErrorClass::AuthInvalid,
                 auth::AuthFailure::MESSAGE,
             )?;
             Ok(())

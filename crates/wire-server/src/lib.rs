@@ -21,14 +21,18 @@
 //!   委譲・成功/失敗応答の組み立て（TASK-73・WIRE-1）
 //! - [`result_encoder`][]: `RowDescription`/`DataRow`/`CommandComplete`/
 //!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）
+//! - [`error_response`][]: `engine::error_format::ErrorClass` → `ErrorResponse`
+//!   （'E'）バイト列への横断写像（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
 //! TASK-70（対象ビヘイビア WIRE-7）、TASK-71（対象ビヘイビア WIRE-8）、
-//! TASK-73（対象ビヘイビア WIRE-1: 簡易クエリを engine SQL 表層へ接続）。
+//! TASK-73（対象ビヘイビア WIRE-1: 簡易クエリを engine SQL 表層へ接続）、
+//! TASK-153（対象ビヘイビア ERR-1: ErrorResponse 正式写像）。
 
 pub mod auth;
 pub mod bind_guard;
+pub mod error_response;
 pub mod framing;
 pub mod handshake;
 pub mod limits;

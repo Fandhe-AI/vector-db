@@ -29,11 +29,14 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// commit 成功境界を跨いだ panic 発生時に緊急応答（3 フィールド契約の
-/// ErrorResponse。ERR-1 のワイヤ形式が spec 側で未確定のため、`state=
-/// may_be_committed` 相当の detail フィールドは現時点では運ばない。
-/// `simple_query::build_emergency_response_bytes` 参照）を書き込むための
-/// ソケット書き込みタイムアウト（TASK-97、対象ビヘイビア: RECOVER-6）。
+/// commit 成功境界を跨いだ panic 発生時に緊急応答（TASK-153・ERR-1 の
+/// `crate::error_response::encode` が組み立てる `S`/`C`/`M` の 3 フィールドのみの
+/// ErrorResponse。`simple_query::build_emergency_response_bytes` 参照）を
+/// 書き込むためのソケット書き込みタイムアウト（TASK-97、対象ビヘイビア:
+/// RECOVER-6）。この応答は
+/// `engine::recovery::panic_hook::emergency_send_decision` が commit-pending
+/// 世代の一致を確認できた場合にのみ送出される（`simple_query::
+/// build_emergency_response_bytes` のドキュメント参照）。
 ///
 /// `crate::simple_query::execute_and_respond` は「outcome を決定する区間」
 /// （`engine.execute_sql_in_session` の呼び出しを含むブロック）だけこの値を
@@ -117,8 +120,10 @@ impl RejectWorkerLimiter {
 }
 
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
-/// `docs/spec/04-behavior/error-format.md`。
-pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str = "53300";
+/// `docs/spec/04-behavior/error-format.md`。値は `engine::error_format::
+/// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
+pub const SQLSTATE_TOO_MANY_CONNECTIONS: &str =
+    engine::error_format::ErrorClass::ConnectionLimitExceeded.wire_code();
 
 /// 同時接続数の枠 1 つぶんの所有権。`Drop` で確実に解放する（RAII。早期 return や
 /// panic があっても枠解放漏れが起きないようにする）。

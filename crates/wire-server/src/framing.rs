@@ -38,11 +38,15 @@ pub const MIN_STARTUP_LEN: usize = 8;
 pub const MIN_TYPED_MESSAGE_LEN: usize = 4;
 
 /// SQLSTATE `54000`（program_limit_exceeded）。WIRE-4: メッセージ長が
-/// `MAX_MESSAGE_LEN` を超過した場合に用いる。
-pub const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+/// `MAX_MESSAGE_LEN` を超過した場合に用いる。値は `engine::error_format::
+/// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
+pub const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str =
+    engine::error_format::ErrorClass::PayloadTooLarge.wire_code();
 /// SQLSTATE `08P01`（protocol_violation）。WIRE-10: 不正フレーム（負の長さ・
-/// 最小値未満・StartupMessage 上限超過・型固有の形状違反等）に用いる。
-pub const SQLSTATE_PROTOCOL_VIOLATION: &str = "08P01";
+/// 最小値未満・StartupMessage 上限超過・型固有の形状違反等）に用いる。値は
+/// `engine::error_format::ErrorClass`（SSOT）由来。
+pub const SQLSTATE_PROTOCOL_VIOLATION: &str =
+    engine::error_format::ErrorClass::ProtocolViolation.wire_code();
 
 /// フレーミング検証で検出したエラーの分類。sqlstate・クライアント向け定型
 /// メッセージへの写像はそれぞれ [`FrameError::sqlstate`]・[`FrameError::client_message`]
@@ -72,6 +76,19 @@ impl FrameError {
         match self {
             FrameError::TooLarge { .. } => Some(SQLSTATE_PROGRAM_LIMIT_EXCEEDED),
             FrameError::Malformed(_) => Some(SQLSTATE_PROTOCOL_VIOLATION),
+            FrameError::Truncated | FrameError::Io(_) => None,
+        }
+    }
+
+    /// [`sqlstate`](Self::sqlstate) と同じ分岐を `engine::error_format::ErrorClass`
+    /// で返す版。`handshake::respond_and_close` が `crate::error_response::encode`
+    /// （`ErrorClass` 入力）へ横断写像を接続するために使う（codex-review P1 指摘
+    /// 対応・PR #258。`sqlstate()` の `&str` 定数は `ErrorClass::wire_code()` 由来
+    /// のため、写像の分岐自体は本メソッドと重複させず同じ `match` を保つ）。
+    pub fn error_class(&self) -> Option<engine::error_format::ErrorClass> {
+        match self {
+            FrameError::TooLarge { .. } => Some(engine::error_format::ErrorClass::PayloadTooLarge),
+            FrameError::Malformed(_) => Some(engine::error_format::ErrorClass::ProtocolViolation),
             FrameError::Truncated | FrameError::Io(_) => None,
         }
     }
