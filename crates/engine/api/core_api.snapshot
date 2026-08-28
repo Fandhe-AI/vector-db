@@ -22,6 +22,7 @@ pub mod kernel;
 pub mod parallel_search;
 pub mod policy;
 pub mod precision;
+pub mod query_planner;
 pub mod recovery;
 pub mod rerank;
 pub mod rls;
@@ -72,6 +73,8 @@ pub enum CoreError {
     ProviderResultRejected,
     Dispatch(DispatchError),
     GpuPathUnavailable,
+    QueryPlannerUnavailable,
+    QueryPlanning(crate::query_planner::PlanError),
 }
 
 # source: crates/engine/src/kernel.rs :: SearchHit
