@@ -99,8 +99,8 @@ spec に対応する確定値が無いため、以下の規則による暫定値
   安全側（設定しない・`recall.yml` へ未接続のまま）に倒す。
 - **TASK-116（ティア別レイテンシ・PLAN-4/6/7）は対象外**。常駐 Ollama が必要で
   GitHub ホステッド runner に CI 経路が無く、repo variables でもない
-  （`BENCH_TIER_*` は `make bench-tier` の実行時 env）。`docs/design/
-  tier-latency-acceptance.md` の目標値確定はオーナーが承認済み計測環境で実施する。
+  （`BENCH_TIER_*` は `make bench-tier` の実行時 env）。
+  `docs/design/tier-latency-acceptance.md` の目標値確定はオーナーが承認済み計測環境で実施する。
 - **`BENCH_CORE6` / `BENCH_CORE16` の opt-in フラグは有効化しない**。GitHub
   ホステッド runner に GPU が無く、有効化すると必ず `pass=false` で red になる。
   下限値の 2 変数（`BENCH_CORE6_MIN_IMPROVEMENT_PCT` / `BENCH_CORE16_MIN_IMPROVEMENT_PCT`）
@@ -113,32 +113,45 @@ spec に対応する確定値が無いため、以下の規則による暫定値
 ## 設定手順（マージ後・リポジトリ管理者作業）
 
 値をコマンドライン引数・シェル履歴・ファイル（リポジトリ配下）に残さないため、
-必ず stdin 経由で `gh variable set` に渡す。
+対話シェルの `read -rs`（非表示入力・シェル履歴に残らない）で値を変数へ読み込み、
+その変数を stdin 経由で `gh variable set` に渡す（`gh variable set --help` の
+「標準入力から読む」形。`printf "$value" | gh variable set NAME` は
+`value` が展開された時点でコマンドライン全体が一時的にシェル履歴・`ps` に
+現れうるため使わない）。1 変数ずつ次を実行する（`NAME` を対象の変数名に置き換える）。
 
 ```bash
-# repo variables（bench.yml）
-printf '%s' "<spec 値>" | gh variable set BENCH_MAX_P95_MS
-printf '%s' "<spec 値>" | gh variable set BENCH_MIN_RECALL
-printf '%s' "<spec 値>" | gh variable set BENCH_MAX_CONTRAST_RATIO
-printf '%s' "<spec 値>" | gh variable set BENCH_BATCH_MAX_DEGRADATION_PCT
-printf '%s' "<spec 値>" | gh variable set BENCH_SQL_C1_MAX_P95_MS
-printf '%s' "<spec 値>" | gh variable set BENCH_SQL_C1_MIN_RECALL
+# repo variables（bench.yml）: NAME に BENCH_MAX_P95_MS 等を順に指定して繰り返す
+read -rs value && printf '%s' "$value" | gh variable set NAME && unset value
 
-# Environment recall-gate variables（recall.yml）
-printf '%s' "<spec 値>" | gh variable set HYBRID_RECALL_MIN_R20_SMALL --env recall-gate
-printf '%s' "<spec 値>" | gh variable set HYBRID_RECALL_MIN_R20_LARGE --env recall-gate
-printf '%s' "<spec 値>" | gh variable set HYBRID_RECALL_MIN_R100_LARGE --env recall-gate
-printf '%s' "<spec 値>" | gh variable set RERANK_RECALL_MIN_R20_LARGE --env recall-gate
-printf '%s' "<spec 値>" | gh variable set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
-printf '%s' "<spec 値>" | gh variable set QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT --env recall-gate
-printf '%s' "<spec 値>" | gh variable set QUERY_PLANNING_RECALL_MIN_R20_DIRECT --env recall-gate
-printf '%s' "<spec 値>" | gh variable set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
-# DEGRADED は上記「採用条件」を満たした場合のみ設定する
-printf '%s' "<暫定値>" | gh variable set QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED --env recall-gate
+# Environment recall-gate variables（recall.yml）: --env recall-gate を付ける
+read -rs value && printf '%s' "$value" | gh variable set NAME --env recall-gate && unset value
+# DEGRADED は上記「採用条件」を満たした場合のみ、同じ手順で
+# QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED に対して実行する
 
 gh variable list
 gh variable list --env recall-gate
 ```
+
+対象の変数名（repo variables）:
+
+- `BENCH_MAX_P95_MS`
+- `BENCH_MIN_RECALL`
+- `BENCH_MAX_CONTRAST_RATIO`
+- `BENCH_BATCH_MAX_DEGRADATION_PCT`
+- `BENCH_SQL_C1_MAX_P95_MS`
+- `BENCH_SQL_C1_MIN_RECALL`
+
+対象の変数名（environment `recall-gate` variables）:
+
+- `HYBRID_RECALL_MIN_R20_SMALL`
+- `HYBRID_RECALL_MIN_R20_LARGE`
+- `HYBRID_RECALL_MIN_R100_LARGE`
+- `RERANK_RECALL_MIN_R20_LARGE`
+- `RERANK_RECALL_MIN_R20_IMPROVEMENT`
+- `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`
+- `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`
+- `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`
+- `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（不採用時は設定しない）
 
 設定後は必ず以下を確認する:
 
