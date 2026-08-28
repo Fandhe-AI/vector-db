@@ -155,6 +155,54 @@ pub fn encode_empty_query_response() -> Vec<u8> {
     msg
 }
 
+/// `ErrorResponse`（'E'）を `S`/`C`/`M` に加え `D`（detail）フィールド付きで
+/// 組み立てる（TASK-97、対象ビヘイビア: RECOVER-6・ERR-1）。
+///
+/// 呼び出し文脈: `crate::simple_query::execute_and_respond` が
+/// `engine.execute_sql_in_session` の呼び出し区間の緊急応答チャネル
+/// （`engine::recovery::panic_hook::EmergencyResponseRegistration`）へ登録する
+/// バイト列を、通常の実行経路（panic フックの外）で事前に組み立てるために使う
+/// （panic フック内でのエンコードによるアロケーション・整形失敗を避けるため。
+/// `panic_hook` モジュールドキュメント参照）。
+///
+/// `detail` は commit 成功境界を跨いだ panic により応答未確定のまま接続が
+/// 終了する可能性を示す `state=may_be_committed` を運ぶ（ERR-1 のワイヤ形式は
+/// spec 側で検討中のため、`D` フィールドは暫定の運び方 ―― spec 側確定時に
+/// 追認・修正できるよう本関数に選定理由をコメントとして残す。`handshake.rs`
+/// の既存 `write_error_response`（`S`/`C`/`M` のみ）は変更せず、本関数を
+/// 別途用意することで既存の 3 フィールド契約に影響を与えない）。
+///
+/// フレーム長の算出は既存 encoder（[`encode_command_complete`] 等）と同じ
+/// `checked` 方式（[`frame_len`]）を使い、`as i32` によるオーバーフローを
+/// 起こさない（`.claude/rules/coding-rust.md`「untrusted 入力の扱い」。
+/// 本関数の入力自体は untrusted ではないが、同じ規律を踏襲する）。
+pub fn encode_error_response_with_detail(
+    sqlstate: &str,
+    message: &str,
+    detail: &str,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut body = Vec::new();
+    body.push(b'S');
+    body.extend_from_slice(b"ERROR");
+    body.push(0);
+    body.push(b'C');
+    body.extend_from_slice(sqlstate.as_bytes());
+    body.push(0);
+    body.push(b'M');
+    body.extend_from_slice(message.as_bytes());
+    body.push(0);
+    body.push(b'D');
+    body.extend_from_slice(detail.as_bytes());
+    body.push(0);
+    body.push(0); // フィールド終端
+    let total_len = frame_len(body.len())?;
+    let mut msg = Vec::with_capacity(1 + body.len() + 4);
+    msg.push(b'E');
+    msg.extend_from_slice(&total_len.to_be_bytes());
+    msg.extend_from_slice(&body);
+    Ok(msg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +332,36 @@ mod tests {
     fn empty_query_response_has_fixed_length_and_no_body() {
         let msg = encode_empty_query_response();
         assert_eq!(msg, vec![b'I', 0, 0, 0, 4]);
+    }
+
+    // --- encode_error_response_with_detail（TASK-97・RECOVER-6・ERR-1）---
+
+    #[test]
+    fn error_response_with_detail_contains_s_c_m_d_fields_and_terminator() {
+        let msg =
+            encode_error_response_with_detail("XX000", "internal error", "state=may_be_committed")
+                .expect("encode");
+        assert_eq!(byte_at(&msg, 0), b'E');
+
+        // body は 'E' + length(4 バイト) の直後（インデックス 5）から始まる。
+        let body = slice_at(&msg, 5, msg.len() - 5);
+        assert_eq!(body.first().copied(), Some(b'S'));
+        assert!(body.windows(6).any(|w| w == b"ERROR\0"));
+        assert!(body.windows(6).any(|w| w == b"XX000\0"));
+        assert!(body.windows(15).any(|w| w == b"internal error\0"));
+        assert!(body.windows(23).any(|w| w == b"state=may_be_committed\0"));
+        assert_eq!(
+            body.last().copied(),
+            Some(0),
+            "field terminator (double NUL)"
+        );
+
+        // 長さフィールドは i32 で self を含む total_len。
+        let declared_len = i32_at(&msg, 1) as usize;
+        assert_eq!(
+            declared_len,
+            msg.len() - 1,
+            "length field excludes only the leading 'E' type byte"
+        );
     }
 }

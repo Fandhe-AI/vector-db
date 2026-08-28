@@ -46,6 +46,15 @@ fn main() -> ExitCode {
 
 /// `wire-server --users <path> --db <path> [--bind <addr:port>]`。
 fn run_server(args: &[String]) -> ExitCode {
+    // TASK-97（対象ビヘイビア: RECOVER-6・ERR-1）: commit 成功境界を跨いだ panic の
+    // 観測可能性側（緊急応答の送出）を有効化する。プロセス全体で 1 回だけ導入し
+    // （`engine::recovery::panic_hook::install_panic_hook` は `Once` で冪等）、
+    // 起動処理の他のどの失敗経路よりも前に呼ぶことで、後続の初期化中に commit を
+    // 伴う処理が万一走っても保護対象から漏れないようにする。engine のライブラリ
+    // 初期化（`EngineCore::open` 等）からは呼ばない契約（`panic_hook` モジュール
+    // ドキュメント参照。engine 単体のテスト・他バイナリの panic 挙動を変えない）。
+    engine::recovery::panic_hook::install_panic_hook();
+
     let mut users_path: Option<PathBuf> = None;
     let mut db_path: Option<PathBuf> = None;
     let mut bind_addr = DEFAULT_BIND.to_string();

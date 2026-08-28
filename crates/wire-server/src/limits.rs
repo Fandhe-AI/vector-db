@@ -29,6 +29,19 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// 拒否応答自体が accept ループのブロッキング点にならないよう小さく設定する。
 pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// commit 成功境界を跨いだ panic 発生時に緊急応答（`may_be_committed` を運ぶ
+/// ErrorResponse）を書き込むためのソケット書き込みタイムアウト（TASK-97、
+/// 対象ビヘイビア: RECOVER-6）。
+///
+/// `crate::simple_query::execute_and_respond` が `engine.execute_sql_in_session`
+/// の呼び出し区間だけ、この値を設定した `TcpStream` クローンを
+/// `engine::recovery::panic_hook::EmergencyResponseRegistration` へ渡す。
+/// panic フックは unwind 中の同期書き込みであり、読み出しを止めたクライアント
+/// が終了処理を無期限に遅延させる経路を作らないよう、[`REJECT_WRITE_TIMEOUT`]
+/// より緩めつつ有界な値とする（緊急応答は 1 フレームのみで小さいため、通常の
+/// クエリ応答〔[`READ_TIMEOUT`]〕ほど長い猶予は不要）。
+pub const EMERGENCY_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 上限超過接続への拒否応答（[`reject_too_many_connections`]）を書き込むために
 /// 同時に生成できるワーカースレッド数の上限（review 是正・WIRE-6）。
 ///
