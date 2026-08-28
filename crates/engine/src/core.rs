@@ -1819,11 +1819,32 @@ impl EngineCore {
                     // （デコード不整合・世代競合の再試行枯渇・走査量上限超過等）は
                     // 真にサーバー側の内部/一時的障害であり、引き続き `Internal`
                     // として扱う。
-                    let pre_check_schema = {
+                    // 計画開始時の世代を記録する（codex-review P1 指摘対応、PR #266）:
+                    // `plan_using_plan_expansion` は `dictionary_snapshot`（LLM プロンプト
+                    // 用の固定接頭辞）を、下記の I/O 前スキーマ検証に使う
+                    // `pre_check_txn` とは別スナップショットの内部 `read_txn` から構築する
+                    // （`DictionaryCache` のドキュメント参照）。I/O（LLM 呼び出し・
+                    // 再埋め込み）の間に対象テーブルが `DROP TABLE`→同名再作成される、
+                    // またはデータ・スキーマが更新されると、計画時の辞書語彙（旧テーブル
+                    // 由来）による展開・再埋め込みベクトルが、I/O 完了後に新規取得する
+                    // 最新スキーマ・行データ（新テーブル）へ適用され、テーブルの同一性を
+                    // 跨いだ不整合な結果になりうる。`storage.current_generation()` は
+                    // テーブル単位ではなくストレージ全体で任意の write commit ごとに
+                    // 単調増加する（[`Storage::current_generation`] ドキュメント参照。
+                    // `DictionaryCache` と同じ精度）。テーブル単位の精密な世代を持たない
+                    // ため、I/O 中に無関係な他テーブルへ書き込みがあった場合も保守的に
+                    // 拒否する（fail-open で見逃すよりも安全側に倒す設計判断。
+                    // security.md「fail-closed を維持する」）。再計画（辞書再構築・
+                    // 再展開）は行わず、単純に拒否する。
+                    let (pre_check_schema, planning_generation) = {
                         let (pre_check_txn, schema) =
                             self.read_txn_with_schema(&validated.table_name)?;
+                        let generation = crate::storage::current_generation_in_txn(&pre_check_txn)
+                            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to read storage generation: {e}"),
+                            })?;
                         drop(pre_check_txn);
-                        schema
+                        (schema, generation)
                     };
                     dictionary_required_columns(&pre_check_schema).map_err(|msg| {
                         crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
@@ -1844,6 +1865,43 @@ impl EngineCore {
                     let planned =
                         self.plan_using_plan_expansion(ctx, session, &validated, question)?;
                     let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+
+                    // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #266）:
+                    // 上記コメントのとおり、`planning_generation` と現在の世代が
+                    // 一致しなければ、計画時に使った辞書スナップショット・展開結果・
+                    // 再埋め込みベクトルが現在のテーブル世代に対して有効である保証が
+                    // ないため、fail-closed に拒否する（`SqlSurfaceError::Internal`。
+                    // `plan_using_plan_expansion` 自体の既存 fail-closed 契約
+                    // 〔本メソッドのドキュメント参照〕と同じ `XX000` 分類を使い、新規
+                    // 分類は追加しない。クライアントへは `Internal::client_message()`
+                    // による固定の一般化メッセージのみを返し、他テナント・他クエリの
+                    // 書き込み有無という存在情報を漏らさない）。
+                    let current_generation = crate::storage::current_generation_in_txn(&read_txn)
+                        .map_err(|e| {
+                        crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: format!("failed to read storage generation: {e}"),
+                        }
+                    })?;
+                    if current_generation != planning_generation {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "storage generation changed during USING PLAN query \
+                                     expansion; rejecting stale plan"
+                                .to_string(),
+                        });
+                    }
+
+                    // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
+                    // （codex-review P1 指摘対応、PR #266）: 上記の世代照合は
+                    // ストレージ全体の粗い世代のみを見るため、同一世代内であっても
+                    // このスキーマが `pre_check_schema` と異なる可能性を狭義には
+                    // 排除できない（世代不変条件が将来変わった場合の多層防御。
+                    // 現行の `bump_generation_and_commit` 実装では書き込みごとに
+                    // 必ず世代が進むため通常到達しないが、`dictionary_required_columns`
+                    // は軽量な検証であり多層防御として維持する）。
+                    dictionary_required_columns(&schema).map_err(|msg| {
+                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
+                    })?;
+
                     let bound = crate::sql::using_plan::bind_expansion(
                         &validated,
                         &schema,
@@ -3782,6 +3840,146 @@ mod tests {
             vec![crate::sql::exec::Cell::Text("new-path".to_string())],
             "projected `path` must resolve against the post-I/O schema, not stale pre-I/O indices"
         );
+    }
+
+    // codex-review P1 回帰（PR #266）: `USING PLAN` の I/O フェーズ
+    // （`plan_using_plan_expansion`）は計画開始時のテーブル世代を保持せず、I/O
+    // 完了後は新しい `read_txn`・スキーマを取得するだけで、計画時との世代一致を
+    // 照合していなかった。この間に対象テーブルの `DROP TABLE`→同名再作成が挟まると、
+    // 旧テーブルの語彙（辞書スナップショット）による展開・再埋め込みベクトルが
+    // 新テーブルへ適用され、テーブルの同一性を跨いだ不整合な結果になり得た。
+    // 上記の `using_plan_binds_column_indices_against_the_schema_fetched_after_io_not_before`
+    // は列インデックスが post-I/O スキーマを正しく反映することを固定するが、
+    // 「世代不一致そのものを検出して拒否する」契約は別に固定する必要がある。
+    // ここでは `execute_sql_in_session` を直接駆動し（`Statement::Select` アームの
+    // 2 段階〔I/O → 束縛〕を経由する唯一の呼び出し元）、`LlmClient::complete`
+    // コールバック（I/O フェーズの内部）から対象テーブルを `DROP TABLE`→再作成して
+    // 世代を進め、fail-closed に `SqlSurfaceError::Internal` で拒否されることを
+    // 検証する（修正前は `read_txn_with_schema` が新テーブルのスキーマ・
+    // `read_txn` を黙って返し、クエリが成功していた）。
+    #[test]
+    fn execute_sql_in_session_rejects_using_plan_when_table_generation_changes_during_io() {
+        // `LlmClient::complete`（I/O フェーズの内部）から対象テーブルを
+        // `DROP TABLE`→再作成するには、構築中の `EngineCore` 自身（の
+        // `storage` フィールド）へアクセスする必要がある。`Box<dyn LlmClient>`
+        // は `'static` 境界を要求するため借用では持ち回せず、`unsafe`（生
+        // ポインタ）も使わない（`tests/isa.rs::
+        // unsafe_is_confined_to_isa_module_with_safety_comments` が
+        // `crates/engine/src/**/*.rs` 中 `isa.rs` 以外の `unsafe` を禁止する）。
+        // そこで `OnceLock<Weak<EngineCore>>` による安全な二段階初期化
+        // （`EngineCore` は wire-server で実際に `Arc<EngineCore>` として
+        // 共有される・`server.rs` 参照＝`Send + Sync` 済み）を使い、
+        // `complete` 呼び出し時点で必ず設定済みの `Weak` を `upgrade` して
+        // 同一 `EngineCore`（同一 `storage`）へアクセスする。
+        struct GenerationBumpingLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for GenerationBumpingLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                core.storage.drop_table("docs").expect("drop table mid-io");
+                core.storage
+                    .create_table(&TableSchema::new(
+                        "docs",
+                        vec![
+                            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                            ColumnDef::new("body", ColumnType::Text, false),
+                            ColumnDef::new("path", ColumnType::Text, false),
+                        ],
+                    ))
+                    .expect("create table mid-io (new layout)");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        // 旧レイアウト: [embedding, path, body]。
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table (old layout)");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("using-plan-gen-race").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("old-path".to_string()),
+                crate::row_codec::Value::Text("old-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row (old layout)");
+
+        // `core_cell` を `GenerationBumpingLlmClient` と外側スコープの双方で
+        // `Arc::clone` して共有する（`Box<dyn LlmClient>` へ包んだ後は具体型
+        // へ戻す公開経路が無いため、共有元は `with_query_planner` 呼び出し前に
+        // 確保しておく）。`Arc<EngineCore>` は構築完了後にしか作れないため、
+        // 二段階初期化（セル確保 → `EngineCore` 構築 → `Arc` 化 → `Weak` 登録）
+        // にする。
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(GenerationBumpingLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Err(crate::sql::allowlist::SqlSurfaceError::Internal { detail }) => {
+                assert!(
+                    detail.contains("generation changed"),
+                    "expected a generation-mismatch rejection, got: {detail}"
+                );
+            }
+            other => panic!(
+                "expected SqlSurfaceError::Internal (generation mismatch) rejection, got: \
+                 {other:?}"
+            ),
+        }
     }
 
     // codex-review P1 回帰（PR #266）: `plan_using_plan_expansion` が
