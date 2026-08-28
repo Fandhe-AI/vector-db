@@ -7,29 +7,26 @@
 //! 両機構が実際に合流するのは engine クレート内の「RLS 事前フィルタ済み候補集合
 //! （`tenant::visible_rows`）→ ヒント一致判定（`hybrid::path_hint_matches`/
 //! `kind_hint_matches`）→ `BoostRule` 構築 → `hybrid::hybrid_search_boosted`」という
-//! 呼び出し列であり、本ファイルはこの列を end-to-end で検証する
+//! 呼び出し列であり、本ファイルの基本経路はこの列を end-to-end で検証する
 //! （`tests/tenant_isolation.rs` の複数テナント `Storage` 構築流儀と
-//! `tests/soft_boost.rs` の合成コーパス流儀を組み合わせる）。`sql/exec.rs` 経由の
-//! `USING PLAN` 実行器（TASK-77）は未実装のため、SQL 表層・wire 経由の検証は対象外
-//! （engine API 層での検証に限定する。`docs/design/rls-generalized-read-paths.md` と
-//! 同じスコープ境界の整理）。
+//! `tests/soft_boost.rs` の合成コーパス流儀を組み合わせる）。一部のテストは
+//! `BoostRule::new` の境界のみを対象とした合成境界チェックであり、この基本経路を
+//! 通らない（各テストの docstring 参照）。`sql/exec.rs` 経由の `USING PLAN` 実行器
+//! （TASK-77）は未実装のため、SQL 表層・wire 経由の検証は対象外（engine API 層での
+//! 検証に限定する。`docs/design/rls-generalized-read-paths.md` と同じスコープ境界の
+//! 整理）。
 //!
 //! **既知の限界（`DocMeta::path`/`kind` は production 生成経路ではない）**:
 //! `visible_rows`（RLS 事前フィルタ）以降のヒント一致判定・`BoostRule` 構築・
 //! `hybrid_search_boosted` は本物の engine API を呼ぶが、その入力である
 //! `path`/`kind` 自体は `DocMeta`（後述）が持つテスト側のグラウンドトゥルースから
 //! 得ており、production で `sql/exec.rs`（TASK-77・未実装）が可視行メタデータから
-//! これらをどう構築するかは検証していない。したがって本ファイルは C1〜C4 の
-//! 呼び出し列自体の合成検証であり、`sql/exec.rs` 側の構築経路の不具合（RLS 適用前の
-//! メタデータからヒントを構築する等）は対象外・検出できない。この空白を埋める
-//! production 経路での回帰テストは
-//! `docs/design/plan-rls-boost-interaction.md`「`USING PLAN` 実行器（TASK-77）実装後の
-//! 残課題」節で追跡する。
+//! これらをどう構築するかは検証していない。この空白を埋める production 経路での
+//! 回帰テストは `docs/design/plan-rls-boost-interaction.md`「`USING PLAN` 実行器
+//! （TASK-77）実装後の残課題」節で追跡する。
 //!
-//! 本ファイルが固定する検証観点は `docs/design/plan-rls-boost-interaction.md`
-//! （TASK-139・Proposed。本 PR のマージ後、別コミットで Accepted に更新する）の
-//! 「検証方針」節に対応する。個々の観点の具体的な内容・判定根拠は同ドキュメントには
-//! 転記しない（private spec 側の SSOT を参照）。
+//! 検証方針・各テストの観点は `docs/design/plan-rls-boost-interaction.md`（TASK-139）
+//! を参照。
 
 use std::collections::BTreeSet;
 
@@ -93,13 +90,12 @@ fn ctx_a() -> PolicyContext {
 /// `k=2` の枠外）と、**同一の数値 id（=5）** を持つ tenant-a の不可視ではない通常行、
 /// および tenant-b の不可視行を含む合成コーパスを構築する。`hybrid::HybridHit`／
 /// `BoostRule` はテナント修飾を持たない生の `u64` id でしか一致判定できないため、
-/// tenant-a の id=5 と tenant-b の id=5 が同一テーブル内で共存する構成が、V2 が検証する
-/// 「テナントをまたいだ生の id だけでのブースト一致判定」の土台になる。
+/// tenant-a の id=5 と tenant-b の id=5 が同一テーブル内で共存する構成を使う。
 ///
 /// `collision_matches_hint` が真の場合のみ、tenant-b の id=5 行の path がヒントに一致
-/// する（不可視な「たまたま一致する」データの有無を切り替えるためのフラグ。V2/V4 が
-/// 使う）。tenant-b の id=10 行は ctx_a から可視（`Public`・他テナント）だが別 id・
-/// ヒント非一致で、衝突源にはならない「正当な他テナント公開行混入」の対照に使う。
+/// する（不可視な「たまたま一致する」データの有無を切り替えるためのフラグ）。
+/// tenant-b の id=10 行は ctx_a から可視（`Public`・他テナント）だが別 id・ヒント非一致
+/// の対照に使う。
 fn build_docs(collision_matches_hint: bool) -> Vec<DocMeta> {
     vec![
         DocMeta {
@@ -206,8 +202,8 @@ fn open_corpus(label: &str, docs: &[DocMeta]) -> (CleanupGuard, Storage) {
 
 /// RLS 事前フィルタ済み候補集合（`tenant::visible_rows` が返す `ctx` の可視行）から、
 /// `hybrid_search_boosted` へそのまま渡せる `SearchInput` の材料（id 昇順に整列済み）を
-/// 組み立てる。この関数の呼び出しそのものが「RLS 通過済み候補集合の構築」の実演で
-/// あり、両機構の合流点を本ファイルの各テストが共有する唯一の経路にする。
+/// 組み立てる（統合テストの基本経路。`BoostRule::new` の境界のみを検証する合成境界
+/// チェックのテストはこのヘルパを経由しない）。
 fn rls_filtered_candidates(storage: &Storage, ctx: &PolicyContext) -> (Vec<u64>, Vec<f32>) {
     let mut rows = tenant::visible_rows(storage, TABLE, ctx).expect("visible_rows ok");
     rows.sort_by_key(|r| r.id);
@@ -242,9 +238,8 @@ const QUERY_VECTOR: [f32; 2] = [1.0, 0.0];
 const QUERY_TEXT: &str = "zzz-no-match";
 
 /// `docs`（可視・不可視を問わずテスト側が保持する全メタデータ）のうち `ctx` から
-/// 可視な行だけを対象に、`hint` に一致する id を集める——本ファイルが前提とする
-/// 正しい `BoostRule` 構築手順（`docs/design/plan-rls-boost-interaction.md`
-/// 「検証コードが前提とする構築手順」節）。
+/// 可視な行だけを対象に、`hint` に一致する id を集める（本ファイルが前提とする
+/// `BoostRule` 構築手順）。
 fn correct_path_hint_ids(
     storage: &Storage,
     ctx: &PolicyContext,
@@ -263,11 +258,9 @@ fn correct_path_hint_ids(
 }
 
 /// `correct_path_hint_ids` の対照版: `ctx` の可視性を一切考慮せず、`docs` に保持された
-/// 全テナントのメタデータへヒントを適用してから id だけを集める（実装上のバグ、
-/// または「グローバルなメタデータ索引からヒント一致 id を引いてしまう」実装ミスを
-/// 模する）。`BoostRule`／`apply_soft_boost` はテナント修飾のない生の `u64` id でしか
-/// 一致判定できないため、本関数が返す集合には他テナントの不可視行由来の id が
-/// 紛れ込みうる（V2 がこの差分を検出する）。
+/// 全テナントのメタデータへヒントを適用してから id だけを集める。`BoostRule`／
+/// `apply_soft_boost` はテナント修飾のない生の `u64` id でしか一致判定できないため、
+/// 本関数が返す集合には他テナントの不可視行由来の id が紛れ込みうる。
 fn naive_all_tenant_path_hint_ids(docs: &[DocMeta], hint: &str) -> BTreeSet<u64> {
     docs.iter()
         .filter(|d| path_hint_matches(hint, d.path))
@@ -285,18 +278,13 @@ fn boosted_hit_score(hits: &[engine::hybrid::HybridHit], id: u64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// V1: 非バイパス（混入 0 件）。RLS 事前フィルタ済み候補集合にヒント由来ブーストを
-// 適用しても、不可視行が Top-k に混入しないこと。ブーストルールの `ids` に不可視 id
-// （テナントを越えて数値衝突する id を含む）が混入していても、可視集合外の行が
-// 復活しないこと（プール外 id への加点は no-op）を検証する。検査器
-// （`tenant::verify_hits`）はブースト・マスク実装と独立に行 id からテナント・可視性を
-// 再計算するため、独立オラクルとして使う。検査器自体の実効性は、意図的に不可視 id を
-// 混ぜた `hits` を渡す negative test で確かめる。
+// RLS 事前フィルタ済み候補集合にヒント由来ブーストを適用しても、不可視行が Top-k に
+// 混入しないことを検証する（`tenant::verify_hits` を独立オラクルとして使う）。
 // ---------------------------------------------------------------------------
 #[test]
-fn v1_boosted_rls_results_never_include_invisible_rows() {
+fn boosted_rls_results_never_include_invisible_rows() {
     let docs = build_docs(true); // 最悪ケース: tenant-b の衝突行がヒントにも一致する。
-    let (_cleanup, storage) = open_corpus("plan-rls-boost-v1", &docs);
+    let (_cleanup, storage) = open_corpus("plan-rls-boost-nonbypass", &docs);
     let ctx = ctx_a();
 
     let (ids, vectors) = rls_filtered_candidates(&storage, &ctx);
@@ -372,13 +360,12 @@ fn v1_boosted_rls_results_never_include_invisible_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// V2: 応答同一性。`BoostRule` を RLS 通過済み可視行のメタデータのみから構築すると、
-// 「不可視行が存在するコーパス」と「可視行のみの同一コーパス」とで結果（順位・
-// スコア）が完全一致する。対照として、可視性を考慮せず全テナントのメタデータから
-// ルールを構築すると差が生じることを negative test で示す。
+// `BoostRule` を RLS 通過済み可視行のメタデータのみから構築した場合の結果が、
+// 不可視行の存在・ヒント一致有無に左右されないことを検証する（対照として、全
+// テナントのメタデータからルールを構築すると差が生じることも合わせて示す）。
 // ---------------------------------------------------------------------------
 #[test]
-fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
+fn rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
     let ctx = ctx_a();
     let k = 6;
@@ -386,11 +373,13 @@ fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
     // corpus A: tenant-b の衝突行（id=5）がヒントに一致する（不可視の「たまたま一致
     // する」データが存在するケース）。
     let docs_with_invisible_match = build_docs(true);
-    let (_cleanup_a, storage_a) = open_corpus("plan-rls-boost-v2-a", &docs_with_invisible_match);
+    let (_cleanup_a, storage_a) =
+        open_corpus("plan-rls-boost-invariance-a", &docs_with_invisible_match);
     // corpus B: 同じ tenant-b 衝突行が存在するが、ヒントには一致しない（不可視データ
     // 自体は存在するが「たまたま一致」しないケース）。
     let docs_without_invisible_match = build_docs(false);
-    let (_cleanup_b, storage_b) = open_corpus("plan-rls-boost-v2-b", &docs_without_invisible_match);
+    let (_cleanup_b, storage_b) =
+        open_corpus("plan-rls-boost-invariance-b", &docs_without_invisible_match);
 
     let run = |storage: &Storage, docs: &[DocMeta], rule_ids: &BTreeSet<u64>| {
         let (ids, vectors) = rls_filtered_candidates(storage, &ctx);
@@ -462,20 +451,12 @@ fn v2_rule_from_visible_metadata_only_is_invariant_to_invisible_matches() {
 
 // ---------------------------------------------------------------------------
 // 検証コードの既知の限界（`docs/design/plan-rls-boost-interaction.md`「検証コードの
-// 既知の限界」節）: 上の V1〜V5 の各テストは「単一 ctx の可視集合内では候補識別子が
-// 重複しない」前提のコーパスを使う（tenant-b の不可視行は tenant-a の可視行と数値 id
-// が衝突するが、可視集合には現れない）。しかし一般には、同一 ctx の可視集合自体が
-// 同一の数値 id を複数含む合成コーパスも構成可能であり（ポインタ: TABLE-12）、
-// 本テストはこのケースを直接構築し、`HybridHit` がテナント修飾を持たないため id だけ
-// では 2 行を区別できない状況を再現する。
-//
-// raw id をそのまま `SearchInput::ids` へ渡す本ファイルの構築手順
-// （`rls_filtered_candidates`）を通した場合、`rrf_fuse` の重複検証
-// （`HybridError::DuplicateId`。同一 id の複数回出現を fail-closed に拒否する契約）に
-// 阻まれ、結果が黙って混同されることはない——2 行が「誤ってどちらもブーストされる」
-// のではなく、検索そのものが安全に拒否されることを固定する。これは
-// `kernel.rs::SearchInput::ids` が定める候補識別子の一意性契約を代替するものでは
-// ない——`DuplicateId` は raw id をそのまま渡した場合の fail-closed な保険に過ぎない。
+// 既知の限界」節）: 上のテストは「単一 ctx の可視集合内では候補識別子が重複しない」
+// 前提のコーパスを使う。本テストは同一 ctx の可視集合自体が同一の数値 id を複数含む
+// 合成コーパス（ポインタ: TABLE-12）を直接構築し、raw id をそのまま
+// `SearchInput::ids` へ渡す本ファイルの構築手順（`rls_filtered_candidates`）を通した
+// 場合に `rrf_fuse` の重複検証（`HybridError::DuplicateId`）が発火し、結果が黙って
+// 混同されることなく安全に拒否されることを固定する。
 // ---------------------------------------------------------------------------
 #[test]
 fn raw_id_collision_within_visible_set_is_rejected_fail_closed() {
@@ -542,15 +523,14 @@ fn raw_id_collision_within_visible_set_is_rejected_fail_closed() {
 }
 
 // ---------------------------------------------------------------------------
-// V3: ブースト効果の保存。RLS 事前フィルタ下でも、可視行に対するブースト本来の
-// 効果（圏外候補の Top-k 浮上・ハードフィルタ化しないこと・空ルール時の
-// `hybrid_search` との完全一致）が RLS なし構成（`tests/soft_boost.rs`）と定性一致
-// すること。`path_hint`/`kind_hint` の両方を経由させる。
+// RLS 事前フィルタ下でも、可視行に対するブースト本来の効果（圏外候補の Top-k
+// 浮上・ハードフィルタ化しないこと・空ルール時の `hybrid_search` との完全一致）が
+// 保たれることを、`path_hint`/`kind_hint` の両方について検証する。
 // ---------------------------------------------------------------------------
 #[test]
-fn v3_boost_effect_is_preserved_under_rls_prefilter() {
+fn boost_effect_is_preserved_under_rls_prefilter() {
     let docs = build_docs(true);
-    let (_cleanup, storage) = open_corpus("plan-rls-boost-v3", &docs);
+    let (_cleanup, storage) = open_corpus("plan-rls-boost-effect", &docs);
     let ctx = ctx_a();
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
 
@@ -669,16 +649,13 @@ fn v3_boost_effect_is_preserved_under_rls_prefilter() {
 }
 
 // ---------------------------------------------------------------------------
-// V4: 追加損失ゼロ。RLS 事前フィルタ下での可視行に対するブースト結果が、
-// 「可視行のみコーパスに同一ブーストを適用した理論値」と完全一致し、両機構の併用に
-// よる追加の Recall 損失がないこと。「可視行のみコーパス」は `ctx_a` から可視な行
-// （tenant-a 自身の全行 ＋ tenant-b の `Public` 行 id=10）だけを含む縮小 `Storage` として
-// 構築し（tenant-b の不可視行 id=5 のみを除いた、真に「ちょうど可視集合と同型」の
-// コーパス）、tenant-b の不可視行を含む完全なコーパスに対して RLS フィルタを通した
-// 経路と比較する。
+// RLS 事前フィルタ下での可視行に対するブースト結果が、「可視行のみコーパスに同一
+// ブーストを適用した結果」と完全一致することを検証する。「可視行のみコーパス」は
+// `ctx_a` から可視な行だけを含む縮小 `Storage` として構築し、tenant-b の不可視行を
+// 含む完全なコーパスに対して RLS フィルタを通した経路と比較する。
 // ---------------------------------------------------------------------------
 #[test]
-fn v4_no_additional_loss_versus_visible_only_corpus() {
+fn no_additional_loss_versus_visible_only_corpus() {
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
     let ctx = ctx_a();
     let k = 6;
@@ -686,7 +663,7 @@ fn v4_no_additional_loss_versus_visible_only_corpus() {
     // full: tenant-a・tenant-b 混在（tenant-b の不可視行がヒントにも一致する
     // 最悪ケース）。
     let full_docs = build_docs(true);
-    let (_cleanup_full, storage_full) = open_corpus("plan-rls-boost-v4-full", &full_docs);
+    let (_cleanup_full, storage_full) = open_corpus("plan-rls-boost-noloss-full", &full_docs);
 
     // reduced: `ctx_a` から可視な行だけ（tenant-b の不可視行 id=5 のみを除いた、
     // ちょうど可視集合と同型の「理論上の可視行のみコーパス」）。
@@ -695,7 +672,7 @@ fn v4_no_additional_loss_versus_visible_only_corpus() {
         .filter(|d| ctx.is_visible(d.tenant, d.visibility))
         .collect();
     let (_cleanup_reduced, storage_reduced) =
-        open_corpus("plan-rls-boost-v4-reduced", &reduced_docs);
+        open_corpus("plan-rls-boost-noloss-reduced", &reduced_docs);
 
     let run = |storage: &Storage, docs: &[DocMeta]| {
         let (ids, vectors) = rls_filtered_candidates(storage, &ctx);
@@ -737,34 +714,31 @@ fn v4_no_additional_loss_versus_visible_only_corpus() {
 }
 
 // ---------------------------------------------------------------------------
-// V5: エラー契約の非依存性。`BoostRule::new`/`apply_soft_boost` の拒否エラー
-// （`TooManyBoostIds`・`BoostSoftBoundExceeded` 等）の発生有無が不可視行の存在に
-// 依存しないこと。
-//
-// `v5_real_path_result_independent_of_invisible_row_count` が
-// `tenant::visible_rows` → `BoostRule::new` → `hybrid_search_boosted` の実経路で
-// 不可視行「件数」（1 件・複数件、ヒント一致を含む）を変えても結果が完全一致する
-// ことを検証する。本テスト（`v5_boost_id_limit_error_must_not_depend_on_invisible_row_count`）
-// は `hybrid::MAX_BOOST_IDS`（`crates/engine/src/hybrid.rs` の公開定数）境界そのものの
-// 検証であり、実データでの再現には
-// 大量の行投入が要るため、`BoostRule::new` が実データではなく id 集合のサイズ
-// のみを検証する契約（`hybrid.rs` ドキュメント参照）であることを踏まえ、id 集合を
-// 合成して境界を再現する（実経路を介さない合成境界チェックである点を明示する）。
+// `BoostRule::new` の拒否エラー（`TooManyBoostIds` 等）の発生有無が不可視行の存在に
+// 依存しないことを検証する。本テストは `hybrid::MAX_BOOST_IDS`
+// （`crates/engine/src/hybrid.rs` の公開定数）境界そのものの検証であり、実データでの
+// 再現には大量の行投入が要るため、`BoostRule::new` が実データではなく id 集合の
+// サイズのみを検証する契約（`hybrid.rs` ドキュメント参照）を踏まえ、id 集合を合成
+// して境界を再現する合成境界チェックである（`Storage`/RLS 実経路は通さない）。
+// 実経路上の件数非依存性は後続の
+// `real_path_result_independent_of_invisible_row_count` で検証する。
 // ---------------------------------------------------------------------------
 #[test]
-fn v5_boost_id_limit_error_must_not_depend_on_invisible_row_count() {
+fn boost_id_limit_error_must_not_depend_on_invisible_row_count() {
     // 正しい構築（可視メタデータのみ）: 不可視行のヒント一致有無（`collision_matches_hint`
     // で切り替わる、実際に存在・不在する不可視データ）を変えても、可視メタデータのみ
-    // から求めた一致 id 集合そのものが不変であることをまず固定する（V2 の
-    // `correct_path_hint_ids` と同じ規約）。`BoostRule::new` の成否はこの集合だけで
-    // 決まるため、集合が不変なら成否も不可視データの有無・件数に依存しない。
+    // から求めた一致 id 集合そのものが不変であることをまず固定する。`BoostRule::new`
+    // の成否はこの集合だけで決まるため、集合が不変なら成否も不可視データの有無・
+    // 件数に依存しない。
     let ctx = ctx_a();
     let docs_with_invisible_match = build_docs(true);
-    let (_cleanup_with, storage_with) =
-        open_corpus("plan-rls-boost-v5-with-match", &docs_with_invisible_match);
+    let (_cleanup_with, storage_with) = open_corpus(
+        "plan-rls-boost-limit-with-match",
+        &docs_with_invisible_match,
+    );
     let docs_without_invisible_match = build_docs(false);
     let (_cleanup_without, storage_without) = open_corpus(
-        "plan-rls-boost-v5-without-match",
+        "plan-rls-boost-limit-without-match",
         &docs_without_invisible_match,
     );
 
@@ -838,14 +812,13 @@ fn build_docs_with_extra_invisible_matches(extra_invisible_hint_matches: usize) 
 }
 
 // ---------------------------------------------------------------------------
-// V5（実経路）: `tenant::visible_rows` → `correct_path_hint_ids`（`BoostRule` 構築の
-// 正しい規約）→ `BoostRule::new` → `hybrid_search_boosted` という実経路全体を通し、
-// 不可視行の「件数」（1 件 vs 複数件、いずれもヒント一致）を変えても返る
-// `Vec<HybridHit>` が完全一致することを検証する。上のテストは `BoostRule::new` 単体の
-// 合成境界チェックに留まっていたため、本テストで実経路上の件数非依存性を固定する。
+// `tenant::visible_rows` → `correct_path_hint_ids` → `BoostRule::new` →
+// `hybrid_search_boosted` という実経路全体を通し、不可視行の「件数」（1 件 vs
+// 複数件、いずれもヒント一致）を変えても返る `Vec<HybridHit>` が完全一致することを
+// 検証する（上のテストは `BoostRule::new` 単体の合成境界チェックに留まる）。
 // ---------------------------------------------------------------------------
 #[test]
-fn v5_real_path_result_independent_of_invisible_row_count() {
+fn real_path_result_independent_of_invisible_row_count() {
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).expect("cfg ok");
     let ctx = ctx_a();
     let k = 2;
@@ -878,13 +851,13 @@ fn v5_real_path_result_independent_of_invisible_row_count() {
     let docs_one_invisible = build_docs_with_extra_invisible_matches(1);
     let docs_many_invisible = build_docs_with_extra_invisible_matches(5);
 
-    let hits_one = run(&docs_one_invisible, "plan-rls-boost-v5-real-one");
-    let hits_many = run(&docs_many_invisible, "plan-rls-boost-v5-real-many");
+    let hits_one = run(&docs_one_invisible, "plan-rls-boost-realpath-one");
+    let hits_many = run(&docs_many_invisible, "plan-rls-boost-realpath-many");
 
     assert_eq!(
         hits_one, hits_many,
         "the real tenant::visible_rows -> BoostRule::new -> hybrid_search_boosted path must \
          return byte-identical results regardless of how many invisible rows happen to match \
-         the hint (V5: result independence from invisible-row count)"
+         the hint"
     );
 }
