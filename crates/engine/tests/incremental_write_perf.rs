@@ -35,6 +35,17 @@ use engine::storage::{RowInput, Storage, Visibility};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+// 本テストの計測（`put_batch` の実処理時間）は実プロセスの CPU 時間に依存するため、
+// 並走する他の計測系テストの負荷から隔離する（Issue #281 codex-review P2 指摘。
+// `tests/incremental_recall.rs` が持つタイミングロックを本ファイルが取得しないため、
+// `cargo test` が別プロセスとして並列起動するそちらのバイナリと計測区間が並走し
+// 得た）。同じロックファイルパスを共有する
+// `crates/engine/src/test_util/timing_lock.rs` へ `#[path]` で相乗りし、バイナリを
+// またいだ直列化を成立させる（同モジュールのドキュメンテーションコメント参照）。
+#[path = "../src/test_util/timing_lock.rs"]
+mod timing_lock;
+use timing_lock::acquire_timing_lock;
+
 /// 全行に付与するダミーのテナント識別子（本テストは性能測定のみが目的で、
 /// テナント境界の判定経路には踏み込まない。空文字列は `RowInput` 側で拒否されるため
 /// 非空の固定値を使う）。
@@ -143,6 +154,8 @@ fn median(mut values: Vec<Duration>) -> Duration {
 // 増分書き込みが全体再構築より十分速いことを判定閾値（RATIO_THRESHOLD_DENOM）で検証する。
 #[test]
 fn persist2_incremental_write_completes_within_ratio_threshold_of_full_rebuild() {
+    let _timing_guard = acquire_timing_lock();
+
     // 1. ベースライン DB を事前構築する（この書き込み自体は計測対象外）。
     let baseline_path = unique_db_path("baseline");
     let _baseline_cleanup = CleanupGuard(baseline_path.clone());
