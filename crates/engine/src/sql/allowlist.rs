@@ -467,8 +467,25 @@ impl ValidatedStatement {
 
     /// `using_plan`（TASK-77・SQL-5）を設定したコピーを返すビルダー的メソッド。
     /// [`Self::new`] と組み合わせて `using_plan` を含む値を外部から構築する。
+    ///
+    /// **不変条件**（codex-review P1 指摘対応、PR #266）: `using_plan` に `Some`
+    /// を渡した場合、`order_by` を無条件で [`OrderByForm::UsingPlan`] へ揃える。
+    /// `USING PLAN` と `ORDER BY` は構文上相互排他であり、
+    /// `core.rs::EngineCore::execute_sql_in_session` は `order_by` の値ではなく
+    /// `using_plan()` の有無のみで束縛経路を分岐するため、この揃え込みが無いと
+    /// 呼び出し元が [`Self::new`] へ渡した `order_by`（例:
+    /// [`OrderByForm::Distance`]）が無言で無視され、意図せず `USING PLAN` 経路
+    /// （呼び出し元が想定していないハイブリッド実行形）が実行される事故になり得た
+    /// （公開 builder が矛盾した状態を構築できてしまう問題）。`None` を渡した
+    /// 場合は `order_by` を変更しない（[`Self::new`] で渡された値をそのまま保つ）。
+    /// 逆方向（`order_by` に [`OrderByForm::UsingPlan`] を渡しつつ `using_plan` を
+    /// 設定しない）の矛盾は本メソッドだけでは防げないため、`execute_sql_in_session`
+    /// 側でも分岐前に防御的に検証する（同メソッドのドキュメント参照）。
     #[must_use]
     pub fn with_using_plan(mut self, using_plan: Option<String>) -> Self {
+        if using_plan.is_some() {
+            self.order_by = OrderByForm::UsingPlan;
+        }
         self.using_plan = using_plan;
         self
     }
@@ -3070,6 +3087,31 @@ mod tests {
         .expect("normative USING PLAN form should be accepted");
         assert_eq!(stmt.using_plan(), Some("find the auth handler"));
         assert!(matches!(stmt.order_by(), OrderByForm::UsingPlan));
+    }
+
+    #[test]
+    fn with_using_plan_forces_order_by_to_using_plan_variant() {
+        // codex-review P1 指摘対応（PR #266）: 公開 builder が矛盾した
+        // `ValidatedStatement`（`using_plan` は `Some` なのに `order_by` は
+        // `OrderByForm::Distance` のまま）を構築できてしまうと、
+        // `core.rs::EngineCore::execute_sql_in_session` は `using_plan()` の有無
+        // だけで分岐するため、呼び出し元が意図した `order_by` が無言で無視され
+        // 意図しない `USING PLAN` 経路が実行される事故になり得た。`with_using_plan`
+        // が `order_by` を自動的に揃えることを固定する。
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            Projection::All,
+            OrderByForm::Distance {
+                column: "embedding".to_string(),
+                literal: "[0.1]".to_string(),
+            },
+            Vec::new(),
+            5,
+            EvaluationOrder::DEFAULT,
+        )
+        .with_using_plan(Some("find auth".to_string()));
+        assert!(matches!(stmt.order_by(), OrderByForm::UsingPlan));
+        assert_eq!(stmt.using_plan(), Some("find auth"));
     }
 
     #[test]

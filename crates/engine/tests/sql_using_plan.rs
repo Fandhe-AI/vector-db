@@ -294,10 +294,15 @@ fn using_plan_fails_closed_when_llm_response_is_unavailable() {
 fn using_plan_fails_closed_without_body_column() {
     // `path` 列はあるが `body` 列を持たないテーブル。`USING PLAN` の LLM 展開
     // （`plan_query`、TASK-110）が辞書抽出の前提として `path`／`body` の両方を
-    // 非 null `TEXT` 列に要求するため（`core.rs::EngineCore::dictionary_snapshot`）、
-    // `body` 欠落はここで先に拒否される（`sql::using_plan::bind_expansion` 自身の
-    // 本文列解決に到達する前）。`bind_expansion` 側の解決は多層防御として
-    // `crates/engine/src/sql/using_plan.rs` の単体テストで別途固定する。
+    // 非 null `TEXT` 列に要求する（`core.rs::EngineCore::dictionary_snapshot`）ため、
+    // `body` 欠落は本来 LLM 呼び出し前のスキーマ事前検証
+    // （`core.rs::EngineCore::execute_sql_in_session` の `Statement::Select` アーム、
+    // `dictionary_required_columns` 経由）で `SqlSurfaceError::InvalidInput`
+    // （`22000`）として拒否されるべき通常の利用者スキーマ不備であり、LLM 呼び出し
+    // 自体の失敗（`Internal`／`XX000`）ではない（codex-review P1 指摘対応、
+    // PR #266: 事前検証を追加する前は `dictionary_snapshot` の失敗が一律
+    // `Internal` へ丸められていた）。`bind_expansion` 側の本文列解決は多層防御
+    // として `crates/engine/src/sql/using_plan.rs` の単体テストで別途固定する。
     let path = unique_db_path("sql-using-plan-no-body");
     let _guard = CleanupGuard(path.clone());
     let storage = Storage::open(&path).expect("open storage");
@@ -322,7 +327,7 @@ fn using_plan_fails_closed_without_body_column() {
             "SELECT id FROM no_body USING PLAN('q') LIMIT 5",
         )
         .expect_err("missing body column must be rejected");
-    assert_eq!(err.wire_code(), "XX000");
+    assert_eq!(err.wire_code(), "22000");
 }
 
 #[test]

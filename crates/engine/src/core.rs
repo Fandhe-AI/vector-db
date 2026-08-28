@@ -932,6 +932,40 @@ pub struct EngineCore {
     dictionary_config: crate::dictionary::DictionaryConfig,
 }
 
+/// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
+/// （列名の存在・`ColumnType::Text`・non-nullable の 3 条件、TASK-109・PLAN-5）を
+/// `schema` が満たすか検証し、満たす場合はそれぞれの列インデックスを返す。
+///
+/// `USING PLAN('<query>')`（TASK-77・SQL-5）の LLM 呼び出し（`EngineCore::
+/// plan_using_plan_expansion` 内の `plan_query`）は内部で `dictionary_snapshot` を
+/// 呼ぶため、この判定条件を満たさないスキーマは最終的に `dictionary_snapshot` の
+/// 失敗として現れる。呼び出し元ごとに要求するエラー型が異なる
+/// （`dictionary_snapshot` は `CoreError`、`USING PLAN` の事前検証は
+/// `SqlSurfaceError::invalid_input`〔`22000`〕）ため、本関数は判定条件のみを
+/// 共有し、固定メッセージの `String` を返す（各呼び出し元が自分の契約へ変換する。
+/// codex-review P1 指摘対応、PR #266）。
+fn dictionary_required_columns(
+    schema: &crate::catalog::TableSchema,
+) -> Result<(usize, usize), String> {
+    let path_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable)
+        .ok_or_else(|| {
+            "table has no non-nullable text path column required for dictionary extraction"
+                .to_string()
+        })?;
+    let body_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable)
+        .ok_or_else(|| {
+            "table has no non-nullable text body column required for dictionary extraction"
+                .to_string()
+        })?;
+    Ok((path_idx, body_idx))
+}
+
 impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
@@ -1129,33 +1163,17 @@ impl EngineCore {
             // に一致した行が黙ってスキップされ、成功応答の空/不完全な辞書を
             // 返してしまう。スキーマ不整合は fail-closed で固定メッセージの
             // `CatalogError::Invalid` として拒否し、他テナントのデータ・存在情報は
-            // 含めない）。
-            let path_idx = schema
-                .columns
-                .iter()
-                .position(|c| {
-                    c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
-                })
-                .ok_or_else(|| {
-                    CoreError::from(CatalogError::Invalid(
-                        "table has no non-nullable text path column required for dictionary \
-                         extraction"
-                            .to_string(),
-                    ))
-                })?;
-            let body_idx = schema
-                .columns
-                .iter()
-                .position(|c| {
-                    c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
-                })
-                .ok_or_else(|| {
-                    CoreError::from(CatalogError::Invalid(
-                        "table has no non-nullable text body column required for dictionary \
-                         extraction"
-                            .to_string(),
-                    ))
-                })?;
+            // 含めない）。判定条件は [`dictionary_required_columns`] へ切り出し、
+            // `USING PLAN`（TASK-77・SQL-5）の LLM 呼び出し前スキーマ事前検証
+            // （`Self::execute_sql_in_session` の `Statement::Select` アーム、
+            // `using_plan()` が `Some` の分岐を参照）と単一の判定基準を共有する
+            // （codex-review P1 指摘対応、PR #266: 事前検証が無いと、この判定結果は
+            // 呼び出し元で `CoreError::Catalog(CatalogError::Invalid)` を経由して
+            // 一律 `Internal`〔`XX000`〕へ丸められ、body 列欠落等の通常の利用者
+            // スキーマ不備が本来の `SqlSurfaceError::InvalidInput`〔`22000`〕として
+            // 返らなかった）。
+            let (path_idx, body_idx) = dictionary_required_columns(&schema)
+                .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
             let rows =
                 crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
@@ -1533,7 +1551,56 @@ impl EngineCore {
                 // インデックスが別の列を指す状態になり得た。他経路と同じく
                 // 列インデックス解決を含む束縛〜`execute_statement` は単一
                 // スナップショットへ閉じ込める）。
+                //
+                // 不変条件の防御的検証（codex-review P1 指摘対応、PR #266）:
+                // `order_by` が [`crate::sql::allowlist::OrderByForm::UsingPlan`] で
+                // あることと `using_plan()` が `Some` であることは本来一対一で
+                // 対応する必要がある（`sql::allowlist::ValidatedStatement::
+                // with_using_plan` のドキュメント参照）。`validate_sql` の内部
+                // パーサーは常に両者を揃えて構築するが、`ValidatedStatement::new`
+                // （`order_by` を無検証で受け取る公開 constructor）経由で外部から
+                // `order_by == UsingPlan` かつ `using_plan() == None` の矛盾した
+                // 値を構築される可能性を完全には排除できないため、分岐前に
+                // ここで検証し、矛盾していれば内部エラーとして拒否する
+                // （fail-closed。到達は公開 API の誤用時のみの防御的経路）。
+                let order_by_is_using_plan = matches!(
+                    validated.order_by(),
+                    crate::sql::allowlist::OrderByForm::UsingPlan
+                );
+                if order_by_is_using_plan != validated.using_plan().is_some() {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "inconsistent USING PLAN state: order_by and using_plan disagree"
+                            .to_string(),
+                    });
+                }
                 let bound_result = if let Some(question) = validated.using_plan() {
+                    // I/O（LLM 呼び出し）前のスキーマ事前検証（codex-review P1 指摘
+                    // 対応、PR #266）: `plan_using_plan_expansion` 内の `plan_query` は
+                    // `dictionary_snapshot`（LLM プロンプトの固定接頭辞構築用）を
+                    // 経由するが、`dictionary_snapshot` が `path`/`body` 列の存在・
+                    // 型・nullability 不備で失敗すると `CoreError::Catalog(
+                    // CatalogError::Invalid)` に丸め込まれ、`plan_using_plan_expansion`
+                    // の `map_err` で一律 `Internal`（`XX000`）へ変換されてしまう。
+                    // body 列欠落・非 TEXT 等の通常の利用者スキーマ不備は本来
+                    // `SqlSurfaceError::InvalidInput`（`22000`）であるべきなので、
+                    // 同じ判定条件（[`dictionary_required_columns`]）を LLM 呼び出し
+                    // 前にこの位置で検証し、満たさなければ `22000` で即座に拒否する
+                    // （`read_txn` は判定用のスキーマを読んだら即 drop し、I/O の間
+                    // 保持しない。上記コメントの分割方針を踏襲）。この事前検証を
+                    // 通過した後に `dictionary_snapshot` 自身が失敗する場合
+                    // （デコード不整合・世代競合の再試行枯渇・走査量上限超過等）は
+                    // 真にサーバー側の内部/一時的障害であり、引き続き `Internal`
+                    // として扱う。
+                    let pre_check_schema = {
+                        let (pre_check_txn, schema) =
+                            self.read_txn_with_schema(&validated.table_name)?;
+                        drop(pre_check_txn);
+                        schema
+                    };
+                    dictionary_required_columns(&pre_check_schema).map_err(|msg| {
+                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
+                    })?;
+
                     let planned =
                         self.plan_using_plan_expansion(ctx, session, &validated, question)?;
                     let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
