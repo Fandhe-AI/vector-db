@@ -308,6 +308,16 @@ pub enum FunctionArg {
 /// `ORDER BY` 式の許可形状。TASK-74・SQL-8 参照（docs/spec/05-tasks.md）。
 /// TASK-75 でリテラル値・関数引数を保持するよう拡張した（構造判定だけでなく、
 /// 後続の束縛（`sql::parser::bind`）がベクトルリテラル解析・hybrid 引数解釈に使う）。
+///
+/// **TASK-77（SQL-5）で追加した破壊的変更（BREAKING CHANGE、codex-review P1 指摘対応、
+/// PR #266）**: `UsingPlan` variant を追加した。本 enum は `#[non_exhaustive]` を
+/// 付けていない公開型のため、この型に対して網羅的 `match` を書いている下流コードは
+/// 本バージョンで追加された variant に対応するまでコンパイルが通らなくなる
+/// （[`WherePredicate`] の `Expression`（TASK-79）・`Prefix`（TASK-147）追加時と同じ
+/// 既存の破壊的変更運用に倣う）。移行方針: 既存の網羅的 `match` に `UsingPlan` の腕
+/// （`USING PLAN` 文には意味を持つフィールドが無く、通常到達しない防御的経路として
+/// 扱ってよい）を追加する。spec 側の定義変更は不要（TASK-77・SQL-5 のスコープ内の
+/// 追加であり、`docs/spec/05-tasks.md` の対応タスクに包含される）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderByForm {
     /// 距離演算子形（`<列> <=> '<ベクトルリテラル>'`）。
