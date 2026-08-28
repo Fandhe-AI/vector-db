@@ -1032,8 +1032,8 @@ impl EngineCore {
     /// ティアそれぞれの [`crate::query_planner::LlmClient`] を注入したビルダーを返す
     /// （所有権を消費するビルダーメソッドとし、[`Self::with_query_planner`] と同じ流儀。
     /// [`Self::with_query_planner`] と排他: 後に呼んだ側が [`Self::query_planner`] を
-    /// 上書きする。判定基準 [`crate::tiering::TieringCriteria`] は差し替え可能な既定値
-    /// （最終確定はオーナー判断待ち。`docs/design/query-tiering-criteria.md` 参照）。
+    /// 上書きする。判定基準 [`crate::tiering::TieringCriteria`] は本リポの実装既定値で、
+    /// 呼び出し元が差し替え可能（`docs/design/query-tiering-criteria.md` 参照）。
     pub fn with_tiered_query_planner(
         mut self,
         dialogue: Box<dyn crate::query_planner::LlmClient>,

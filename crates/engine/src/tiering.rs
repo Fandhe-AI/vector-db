@@ -12,11 +12,9 @@
 //! モジュールドキュメントが担う「プロンプト構築・LLM 呼び出し・応答パース」との
 //! 責務境界を保つ）。
 //!
-//! 類型→ティア割り当て・判定基準・fail-safe の方向は TASK-115・PLAN-8 の設計事項
-//! （最終確定含めオーナー判断待ちの範囲を含む）であり、本コメントでは詳細を記載
-//! しない。詳細は各公開 API（[`tier_for_class`]・[`TieringCriteria`]・[`classify`]）
-//! のドキュメンテーションコメント、または `docs/design/query-tiering-criteria.md`
-//! （ポインタ表記）を参照。
+//! 類型→ティア割り当て・判定基準・fail-safe の方向は本リポの実装既定値である
+//! （[`tier_for_class`]・[`TieringCriteria`]・[`classify`] の各ドキュメンテーション
+//! コメント、または `docs/design/query-tiering-criteria.md` 参照）。
 //!
 //! untrusted 入力対応: `question` は wire 経由の未検証入力であるため、添字アクセス・
 //! `unwrap`/`expect` を使わず、決定的・線形時間のトークナイズのみを行う
@@ -87,9 +85,8 @@ pub struct Classification {
     pub signal: ClassificationSignal,
 }
 
-/// `class` に対する既定のティア割り当て（本モジュールの現行実装が採用する既定値。
-/// 具体の割り当ては TASK-115・PLAN-8 の設計事項であり、詳細は実装本体または
-/// `docs/design/query-tiering-criteria.md`（ポインタ表記）を参照）。
+/// `class` に対する既定のティア割り当て（本リポの実装既定。モジュールドキュメント
+/// 参照）。
 pub fn tier_for_class(class: QuestionClass) -> Tier {
     match class {
         QuestionClass::Direct => Tier::Dialogue,
@@ -97,9 +94,9 @@ pub fn tier_for_class(class: QuestionClass) -> Tier {
     }
 }
 
-/// 判定基準の調整可能な既定値（[`TieringCriteria::default`]）。手掛かり語等の
-/// 具体値は人間設計の共同タスクであり、ここでは差し替え可能な仮置き値として実装する
-/// （最終確定はオーナー判断待ち。`docs/design/query-tiering-criteria.md` 参照）。
+/// 判定基準の調整可能な既定値（[`TieringCriteria::default`]）。手掛かり語・拡張子等の
+/// 具体値は本リポの実装既定値として持ち、呼び出し元が差し替え可能にする
+/// （`docs/design/query-tiering-criteria.md` 参照）。
 #[derive(Debug, Clone)]
 pub struct TieringCriteria {
     /// 概念・説明要求の言い回しとみなす手掛かり語（小文字化して比較。ASCII
@@ -224,10 +221,15 @@ fn extension_of(token: &str) -> Option<&str> {
 /// 経由。本関数自体はテナント境界の判断を持たず、渡された `dictionary` をそのまま
 /// 使う純粋関数）。
 ///
-/// 判定の優先順・縮退時の fail-safe の方向は TASK-115・PLAN-8 の設計事項（最終確定
-/// 含めオーナー判断待ちの範囲を含む）であり、本ドキュメンテーションコメントでは
-/// 詳細を記載しない。実装（本関数の実装本体）または `docs/design/query-tiering-criteria.md`
-/// （ポインタ表記）を参照。
+/// 優先順（本リポの実装既定。`docs/design/query-tiering-criteria.md` も参照）:
+/// 1. トークンが辞書シンボル名（[`Dictionary::symbols`]）に完全一致 → [`QuestionClass::Direct`]
+/// 2. パス様トークン（[`Dictionary::file_tree`] のパスへの一致、または
+///    `criteria.path_like_extensions` の拡張子を持つトークン）→ [`QuestionClass::Direct`]
+/// 3. `criteria.abstraction_cues` に一致する手掛かり語を含む → [`QuestionClass::Abstraction`]
+/// 4. 上記以外 → [`QuestionClass::Intent`]
+///
+/// 空入力・[`MAX_QUESTION_CHARS`] 超過・[`MAX_TOKENS`] 超過は縮退値として fail-safe 側
+/// （[`QuestionClass::Intent`]）へ倒す。
 pub fn classify(
     question: &str,
     dictionary: &Dictionary,
@@ -309,8 +311,9 @@ fn make(class: QuestionClass, signal: ClassificationSignal) -> Classification {
     }
 }
 
-/// 縮退時の fail-safe 判定。具体の倒し先は TASK-115・PLAN-8 の設計事項であり、
-/// 詳細は実装本体を参照。
+/// 縮退時の fail-safe 判定（[`QuestionClass::Intent`]＝高精度ティアへ倒す。
+/// モジュールドキュメント「責務境界」直下の記述、および
+/// `docs/design/query-tiering-criteria.md` 参照）。
 fn fail_safe(signal: ClassificationSignal) -> Classification {
     make(QuestionClass::Intent, signal)
 }
