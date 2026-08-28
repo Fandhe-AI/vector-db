@@ -357,6 +357,31 @@ fn using_plan_respects_using_mode_precision() {
 }
 
 #[test]
+fn using_plan_fails_closed_on_embedder_table_dim_mismatch() {
+    // `embedding.rs` の契約: 呼び出し元が `Embedder::dim` を対象テーブルの
+    // `VECTOR(N)` と突き合わせて検証する。ここではテーブルが `VECTOR(4)` なのに
+    // 次元 8 を返す埋め込みを注入し、既存の `ORDER BY` 経路
+    // （`sql::parser::parse_vector_literal`）と同じ不変条件が `USING PLAN` の
+    // 再埋め込みベクトルにも課されることを固定する。
+    let path = unique_db_path("sql-using-plan-dim-mismatch");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(RecordingEmbedder::new(DIM * 2)))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE,
+        }));
+
+    let err = core
+        .execute_sql(
+            &ctx("tenant-a"),
+            "SELECT id FROM docs USING PLAN('q') LIMIT 5",
+        )
+        .expect_err("embedder/table dimension mismatch must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+}
+
+#[test]
 fn using_plan_dispatch_error_variant_is_query_planning_or_dispatch_related() {
     // TASK-77 は既存の `CoreError`/`SqlSurfaceError` 分類のみを使い、`PlanError`
     // 用の新規 wire_code 分類を追加しない（ERR-2、TASK-152 の単一真実源を保つ）。

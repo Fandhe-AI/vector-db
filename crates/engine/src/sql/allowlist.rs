@@ -3089,45 +3089,47 @@ mod tests {
         // `USING PLAN($1)` は拡張クエリプロトコル対応後の将来形式。`$` は字句解析
         // 段階で拒否される（TASK-77・SQL-5）。
         let lookup = catalog_with(&["documents"]);
-        assert!(
-            validate_statement("SELECT * FROM documents USING PLAN($1) LIMIT 5", &lookup).is_err()
-        );
+        let err = validate_statement("SELECT * FROM documents USING PLAN($1) LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
     fn rejects_using_plan_without_parens() {
         let lookup = catalog_with(&["documents"]);
-        assert!(
-            validate_statement("SELECT * FROM documents USING PLAN 'q' LIMIT 5", &lookup).is_err()
-        );
+        let err = validate_statement("SELECT * FROM documents USING PLAN 'q' LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
     fn rejects_using_plan_together_with_order_by() {
         let lookup = catalog_with(&["documents"]);
-        assert!(validate_statement(
+        let err = validate_statement(
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' USING PLAN('q') LIMIT 5",
-            &lookup
+            &lookup,
         )
-        .is_err());
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
     fn rejects_duplicate_using_plan_clause() {
         let lookup = catalog_with(&["documents"]);
-        assert!(validate_statement(
+        let err = validate_statement(
             "SELECT * FROM documents USING PLAN('q') USING PLAN('q') LIMIT 5",
-            &lookup
+            &lookup,
         )
-        .is_err());
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
     fn rejects_using_plan_empty_literal() {
         let lookup = catalog_with(&["documents"]);
-        assert!(
-            validate_statement("SELECT * FROM documents USING PLAN('') LIMIT 5", &lookup).is_err()
-        );
+        let err = validate_statement("SELECT * FROM documents USING PLAN('') LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
     }
 
     #[test]
@@ -3144,9 +3146,9 @@ mod tests {
     #[test]
     fn rejects_using_plan_non_string_argument() {
         let lookup = catalog_with(&["documents"]);
-        assert!(
-            validate_statement("SELECT * FROM documents USING PLAN(1) LIMIT 5", &lookup).is_err()
-        );
+        let err = validate_statement("SELECT * FROM documents USING PLAN(1) LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]

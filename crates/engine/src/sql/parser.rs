@@ -290,7 +290,9 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
 /// スキーマの唯一の `VECTOR` 列（インデックス・宣言次元）を返す。`VECTOR` 列を
 /// 持たないテーブルは束縛不能（`catalog.rs::validate_schema` が「`VECTOR` 列は
 /// 高々 1 つ」を DDL 時点で強制済みのため、複数該当は構造上起こらない）。
-fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSurfaceError> {
+/// `sql::using_plan`（TASK-77・SQL-5）が `Embedder` の返すベクトルの次元検証にも
+/// 使うため `pub(crate)`。
+pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSurfaceError> {
     schema
         .columns
         .iter()

@@ -41,10 +41,18 @@ pub(crate) const BODY_COLUMN_NAME: &str = "body";
 /// （PLAN-10 ポインタ: 原質問の埋め込み使い回しをしない再埋め込み規則。
 /// `search_terms` の結合順は `QueryExpansion` の順序をそのまま保つため、同一入力に
 /// 対して常に同一の結果を返す）。
+///
+/// `question` は [`crate::query_planner::sanitize_question`] で `plan_query` が
+/// LLM プロンプトへ組み込んだのと**同一の切り詰め結果**へ正規化してから使う
+/// （呼び出し元がここで別の切り詰め規則を使うと、LLM が実際に見た質問テキストと
+/// 検索に使う質問テキストが食い違い、`54000`〔クエリ句の生バイト長上限〕→
+/// `MAX_QUESTION_CHARS`〔意味論側の決定的切り詰め〕→検索語件数上限、という
+/// 有界化の連鎖が検索テキスト側で途切れてしまう）。
 pub(crate) fn expanded_query_text(question: &str, expansion: &QueryExpansion) -> String {
-    let mut parts: Vec<&str> = Vec::with_capacity(1 + expansion.search_terms.len());
-    parts.push(question);
-    parts.extend(expansion.search_terms.iter().map(String::as_str));
+    let sanitized = crate::query_planner::sanitize_question(question);
+    let mut parts: Vec<String> = Vec::with_capacity(1 + expansion.search_terms.len());
+    parts.push(sanitized);
+    parts.extend(expansion.search_terms.iter().cloned());
     parts.join(" ")
 }
 
@@ -83,6 +91,11 @@ fn body_column_index(schema: &TableSchema) -> Result<usize, SqlSurfaceError> {
 /// （[`parser::bind_projection`]/[`parser::bind_where_predicates`]）を再利用する
 /// （挙動を複製しない）。`resolved_mode`（`USING MODE`／`SET search_mode` の優先順位
 /// 解決結果）は呼び出し元がそのまま渡す。
+///
+/// `expansion.path_hint`／`expansion.kind_hint`（TASK-110・PLAN-1）は本メソッドでは
+/// 意図的に読まない。ソフトブースト（`hybrid::apply_soft_boost`、TASK-111）を
+/// `sql::exec` の融合段へ接続する結線は本タスク（TASK-77）のスコープ外（後続タスク
+/// の管轄）。
 pub(crate) fn bind_expansion(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
@@ -93,6 +106,25 @@ pub(crate) fn bind_expansion(
     resolved_mode: crate::sql::mode::ResolvedMode,
 ) -> Result<BoundStatement, SqlSurfaceError> {
     let text_column_index = body_column_index(schema)?;
+
+    // `Embedder::dim` はテーブルの `VECTOR(N)` と突き合わせて検証する契約
+    // （`embedding.rs` モジュールドキュメント「呼び出し元は対象テーブルの
+    // `VECTOR(N)` と突き合わせて次元不一致を検出する」）。既存の `ORDER BY`
+    // 経路（`sql::parser::parse_vector_literal`）が全てのベクトルリテラルへ
+    // 課している検証と同じ不変条件を、埋め込み由来のベクトルにも課す
+    // （fail-closed。次元不一致のベクトルを検索カーネルへ黙って渡さない）。
+    let (_, vec_dim) = parser::vector_column(schema)?;
+    let got_dim = u32::try_from(query_vector.len()).map_err(|_| {
+        SqlSurfaceError::invalid_input(format!(
+            "USING PLAN re-embedded vector length {} exceeds representable range",
+            query_vector.len()
+        ))
+    })?;
+    if got_dim != vec_dim {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "USING PLAN re-embedded vector dimension mismatch: expected {vec_dim}, got {got_dim}"
+        )));
+    }
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     let projection = parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
@@ -243,6 +275,37 @@ mod tests {
             "find auth",
             &expansion,
             vec![0.1, 0.2],
+            &crate::sql::udf_call::UdfRegistry::default(),
+            crate::sql::mode::resolve_mode(None, None),
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn bind_expansion_rejects_embedder_dim_mismatch_against_table_vector_column() {
+        // `embedding.rs` の契約: 呼び出し元が `Embedder::dim` を対象テーブルの
+        // `VECTOR(N)` と突き合わせて検証する。`schema_with_body` は
+        // `VECTOR(2)` だが、ここでは次元 3 のベクトルを渡し、既存の
+        // `parse_vector_literal` と同じ不変条件が埋め込み由来のベクトルにも
+        // 課されることを固定する。
+        let schema = schema_with_body();
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            crate::sql::allowlist::Projection::All,
+            crate::sql::allowlist::OrderByForm::UsingPlan,
+            Vec::new(),
+            5,
+            crate::sql::plan::EvaluationOrder::DEFAULT,
+        )
+        .with_using_plan(Some("find auth".to_string()));
+        let expansion = sample_expansion();
+        let err = bind_expansion(
+            &stmt,
+            &schema,
+            "find auth",
+            &expansion,
+            vec![0.1, 0.2, 0.3],
             &crate::sql::udf_call::UdfRegistry::default(),
             crate::sql::mode::resolve_mode(None, None),
         )
