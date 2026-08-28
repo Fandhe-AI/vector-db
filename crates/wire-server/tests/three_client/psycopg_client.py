@@ -84,8 +84,16 @@ def main() -> int:
                 for stmt in prelude:
                     cur.execute(stmt)
                 cur.execute(sql)
-                for row in cur.fetchall():
-                    print("|".join(str(value) for value in row))
+                # `INSERT`／`CREATE FUNCTION`（TASK-82）等の `CommandComplete` のみ
+                # を返す文（結果セットを持たない）は `cur.description` が `None`
+                # になり、`fetchall()` を呼ぶと psycopg が
+                # `ProgrammingError` を送出する。結果セットが無いことは
+                # 失敗ではないため、その場合は行の出力をスキップする（既存の
+                # `SELECT` 系呼び出しは常に `description` を持つため挙動は
+                # 変わらない）。
+                if cur.description is not None:
+                    for row in cur.fetchall():
+                        print("|".join(str(value) for value in row))
         return 0
     except Exception as e:  # noqa: BLE001 — ハーネスへ理由を伝える最終防波堤
         sqlstate = getattr(e, "sqlstate", None)

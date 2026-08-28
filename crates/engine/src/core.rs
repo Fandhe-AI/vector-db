@@ -1640,7 +1640,8 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
-                    | crate::sql::SqlOutcome::Explain(_) => {
+                    | crate::sql::SqlOutcome::Explain(_)
+                    | crate::sql::SqlOutcome::Insert(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Select"
                                 .to_string(),
@@ -1660,7 +1661,8 @@ impl EngineCore {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
-                    | crate::sql::SqlOutcome::Explain(_) => {
+                    | crate::sql::SqlOutcome::Explain(_)
+                    | crate::sql::SqlOutcome::Insert(_) => {
                         Err(crate::sql::allowlist::SqlSurfaceError::Internal {
                             detail: "unexpected non-Query outcome for a statement already classified as Aggregate"
                                 .to_string(),
@@ -1732,6 +1734,36 @@ impl EngineCore {
         session: &mut crate::sql::mode::SessionState,
         sql: &str,
     ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
+        // TASK-82（SQL-10）: セッション経由の SQL 実行経路へ `INSERT` を接続する。
+        // `sql::allowlist::validate_sql` は SELECT／SET／CREATE FUNCTION／EXPLAIN
+        // のみを受理し `INSERT` を許可形状に含めない（`INSERT` は
+        // `sql::allowlist::validate_insert`（TASK-80）が独立した専用検証経路を
+        // 持つため。`validate_insert` のドキュメント参照）。ここでは
+        // `validate_sql` を呼ぶ前に先頭トークンだけを覗いて `INSERT` を検出し、
+        // 検出した場合は本メソッドの残りをスキップして既存の
+        // [`Self::execute_insert_sql`]（`validate_insert` → `bind_insert_form` →
+        // 行形/ファイル形実行。`self.ledger_mode` を尊重）へそのまま委譲する
+        // （検証・実行本体の二重実装を避ける）。`EXPLAIN` の前置（`EXPLAIN
+        // INSERT ...`）は先頭トークンが `INSERT` ではなく `EXPLAIN` になるため
+        // ここでは捕捉されず、後続の `validate_sql` の `EXPLAIN` 分岐（次の
+        // トークンが `SELECT` であることを要求）へ流れて `42601` で拒否される
+        // （挙動は本変更の前後で不変）。検索モード句（`USING MODE` 等）は
+        // `INSERT` の許可形状に存在しないため `validate_insert` 側の構文検証で
+        // 同じく拒否される。覗き見トークナイズ自体が失敗した場合は分岐せず
+        // `validate_sql` へフォールスルーし、同一入力に対して同じ構文エラーを
+        // 返す（fail-closed。二重トークナイズによる無駄はあるが untrusted 入力の
+        // 長さは wire 層で既に上限検証済みのため許容する）。
+        let is_insert_statement = crate::sql::lexer::tokenize(sql).is_ok_and(|tokens| {
+            matches!(
+                tokens.first(),
+                Some(crate::sql::lexer::Token::Ident(name)) if name.eq_ignore_ascii_case("INSERT")
+            )
+        });
+        if is_insert_statement {
+            let outcome = self.execute_insert_sql(ctx, sql)?;
+            return Ok(crate::sql::SqlOutcome::Insert(outcome));
+        }
+
         let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
         match stmt {
             crate::sql::allowlist::Statement::SetSearchMode { value } => {

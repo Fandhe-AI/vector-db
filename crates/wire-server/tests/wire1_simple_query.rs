@@ -4,13 +4,17 @@
 //! `docs/spec/04-behavior/wire-protocol.md` WIRE-1）。
 //!
 //! 生バイトの wire クライアント（`tests/common`）で、in-process サーバー
-//! （`accept_loop_with_engine`）に対し C1 相当のクエリ・INSERT 拒否・SET・
+//! （`accept_loop_with_engine`）に対し C1 相当のクエリ・INSERT・SET・
 //! 空クエリ・不正 UTF-8・エラー後の接続維持・3 テナント RLS 分離を検証する。
-//! `INSERT` は wire の簡易クエリプロトコル経由では現時点で公開しない
-//! （`simple_query.rs` のモジュールコメント参照）。実 `psql` 等の
-//! 外部クライアントを使う 3 クライアント統合検証は `tests/three_client_e2e.rs`
-//! （`#[ignore]`）が担い、本ファイルはその契約の中核（受信バイト列は同一）を
-//! 常時（`make ci`）回帰保護する。
+//! `INSERT` は wire の簡易クエリプロトコル経由で受理する（TASK-82・SQL-10。
+//! `simple_query.rs` のモジュールコメント参照）。ただし書き込む行は常に
+//! `Visibility::Private` の固定仕様であり、wire 認証経由の `PolicyContext` は
+//! `Public` のみを許可可視性とする最小権限の既定を維持するため、書いた本人も
+//! 同一 wire セッションではその行を読み戻せない（下記
+//! `wire1_insert_is_accepted_but_row_is_invisible_over_wire_select` が固定する
+//! 契約）。実 `psql` 等の外部クライアントを使う 3 クライアント統合検証は
+//! `tests/extended_syntax_e2e.rs`（`#[ignore]`）が担い、本ファイルはその契約の
+//! 中核（受信バイト列は同一）を常時（`make ci`）回帰保護する。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -107,26 +111,33 @@ fn wire1_c1_query_returns_row_description_and_data_rows() {
     read_ready_for_query(&mut stream);
 }
 
-/// `INSERT` は wire の簡易クエリプロトコル経由では受理せず、他の許可外構文と
-/// 同様に `42601`（`SqlSurfaceError::UnsupportedSyntax`）で拒否し、接続は
-/// 維持されること（続くクエリが応答すること）。
+/// `INSERT INTO <table> (...) VALUES (...) USING OPERATION_ID '<id>'`
+/// （TASK-82・SQL-10）は wire の簡易クエリプロトコル経由で受理し
+/// `CommandComplete("INSERT 0 1")` を返すこと（`EngineCore::
+/// execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`
+/// （TASK-80）へ委譲する。`crates/engine/src/core.rs` 参照）。
 ///
-/// SQL `INSERT` が書き込む行は常に `Visibility::Private`（`sql::exec::
-/// execute_insert` の固定仕様。ポインタ: TASK-80・SQL-10）である一方、wire 認証
-/// 経由の `PolicyContext`（`auth::verify` → `PolicyContext::new`）は `Public` の
-/// みを許可可視性とする（`wire1_three_tenant_visibility_public_shared_private_hidden`
-/// が回帰確認する既存の最小権限境界であり、自テナント自身の `Private` 行も
-/// 対象に含めて意図的に不可視。codex-review P1・PR #210 指摘の検討過程で確認
-/// 済み）。この最小権限境界を緩めずに両立させる唯一の道は、`INSERT` 直後の
-/// 同一セッション SELECT で絶対に読めない行を書き込ませないこと＝wire で
-/// `INSERT` 自体を公開しないことだったため、`simple_query::is_insert_statement`
-/// による INSERT 専用振り分けを撤去し、他の許可外構文と同じ fail-closed 経路
-/// （`engine::sql::allowlist::validate_sql`）へ合流させた。wire 経由での
-/// 書き込み系 SQL 対応は、Private 行が wire 越しに読める経路の設計が定まって
-/// から改めて着手する。
+/// ただし SQL `INSERT` が書き込む行は常に `Visibility::Private`（`sql::exec::
+/// execute_insert` の固定仕様）である一方、wire 認証経由の `PolicyContext`
+/// （`auth::verify` → `PolicyContext::new`）は `Public` のみを許可可視性とする
+/// （`wire1_three_tenant_visibility_public_shared_private_hidden` が回帰確認する
+/// 既存の最小権限境界であり、自テナント自身の `Private` 行も対象に含めて
+/// 意図的に不可視。codex-review P1・PR #210 指摘の検討過程で確認済み）。
+/// TASK-82 はこの最小権限境界を緩めない（読み取り可視性の既定は拡大しない）
+/// 判断のもとで `INSERT` のみを受理するため、書いた本人も**同一 wire
+/// セッションの SELECT ではその行を読み戻せない**（wire セッションへの
+/// 自テナント `Private` 行の読み戻し可視性付与は別途の RLS 設計課題として
+/// スコープ外。PR 本文参照）。本テストはその非対称性——(1) wire 経由の
+/// `INSERT` 成功・(2) 直後の wire `SELECT` では不可視・(3) engine API
+/// （`Private` 可視 `PolicyContext`）では永続化済みとして読める——を 1 つの
+/// 契約として固定する。
 #[test]
-fn wire1_insert_is_rejected_as_unsupported_syntax_and_connection_survives() {
+fn wire1_insert_is_accepted_but_row_is_invisible_over_wire_select() {
     let (core, _guard) = new_core_single_tenant();
+    // `spawn_server_with_engine` は `Arc<EngineCore>` の所有権を消費する
+    // （サーバースレッドへ move）。永続化確認（下記）は同一 `Arc` の clone を
+    // wire 接続とは独立に engine API 直呼び出しで使う。
+    let core_for_verification = Arc::clone(&core);
     let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
     let addr = spawn_server_with_engine(&users_path, core);
     let mut stream = authenticate_to_ready_for_query(addr, "alice", "correct-horse");
@@ -135,22 +146,48 @@ fn wire1_insert_is_rejected_as_unsupported_syntax_and_connection_survives() {
         &mut stream,
         "INSERT INTO docs (id, embedding, lang) VALUES (99, '[0.0,0.0,1.0]', 'fr') USING OPERATION_ID 'op-wire1-insert'",
     );
-    expect_error_response_with_sqlstate(&mut stream, "42601");
+    let tag = read_command_complete(&mut stream);
+    assert_eq!(tag, "INSERT 0 1");
     read_ready_for_query(&mut stream);
 
-    // エラー後も接続は維持され、続く SELECT が正常応答すること。
+    // (2) 同一 wire セッションの SELECT では書き込んだ id=99 が見えない
+    // （`Public` のみ許可可視性の wire `PolicyContext` に対し、書き込んだ行は
+    // `Private`）。既存 3 行のみが返ること。
     send_simple_query(
         &mut stream,
-        "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 3",
+        "SELECT * FROM docs ORDER BY embedding <=> '[0.0,0.0,1.0]' LIMIT 4",
     );
     let columns = read_row_description(&mut stream);
     assert_eq!(columns, vec!["id", "embedding", "lang"]);
+    let mut seen_ids = Vec::new();
     for _ in 0..3 {
-        read_data_row(&mut stream);
+        let row = read_data_row(&mut stream);
+        seen_ids.push(row[0].clone().expect("id is not null"));
     }
+    assert!(
+        !seen_ids.contains(&"99".to_string()),
+        "wire SELECT must not observe the Private row written by wire INSERT, got {seen_ids:?}"
+    );
     let tag = read_command_complete(&mut stream);
     assert_eq!(tag, "SELECT 3");
     read_ready_for_query(&mut stream);
+
+    // (3) engine API 側の `Private` 可視 `PolicyContext` では、書き込んだ id=99
+    // が永続化済みとして読める（wire 不可視＝未永続化ではないことの確認）。
+    let private_ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let result = core_for_verification
+        .execute_sql(
+            &private_ctx,
+            "SELECT * FROM docs ORDER BY embedding <=> '[0.0,0.0,1.0]' LIMIT 4",
+        )
+        .expect("engine-side SELECT with Private visibility must succeed");
+    let engine_ids: Vec<String> = result.rows.iter().map(|row| row.id.to_string()).collect();
+    assert!(
+        engine_ids.contains(&"99".to_string()),
+        "engine API with Private visibility must observe the persisted row, got {engine_ids:?}"
+    );
 }
 
 /// `SET search_mode = '<literal>'` は `CommandComplete("SET")` を返す。

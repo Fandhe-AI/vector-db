@@ -1,7 +1,8 @@
 # ADR: 3 クライアント統合検証ハーネスの層 A/層 B 分割（WIRE-1）
 
 - ステータス: Accepted
-- 対応: TASK-73（WIRE-1）、TASK-165（SQL-12・SEARCH-9）、TASK-168（SQL-13・SQL-14）
+- 対応: TASK-73（WIRE-1）、TASK-165（SQL-12・SEARCH-9）、TASK-168（SQL-13・SQL-14）、
+  TASK-82（SQL-5〜7・9・10）
 - 関連: TASK-67・TASK-68・TASK-69・TASK-70・TASK-71（wire プロトコル層）、
   TASK-74・TASK-75・TASK-80・TASK-161・TASK-162・TASK-166・TASK-167（SQL 表層）、
   TASK-137（RLS 暗黙適用）
@@ -84,6 +85,35 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
   異なる）を避けるため NULL を返す SQL は使わない（NULL 契約は層 A の
   DataRow -1 長検証に閉じる）。
 
+### TASK-82: 拡張構文（SQL-5〜7・9・10）の検証範囲・`extended_syntax_e2e.rs` の採用理由
+
+`USING PLAN`（SQL-5）・`EXPLAIN`（SQL-6）・`HINT ORDER`（SQL-7）・宣言的 UDF
+呼び出し（SQL-9）・`USING OPERATION_ID` 付き `INSERT`（SQL-10）の wire 経由
+検証も同じ層分割に従う。spec（TASK-82）の定義に基づき、層 B は
+`three_client_e2e.rs` とは別ファイル（`extended_syntax_e2e.rs`）に分離した。
+層 A はそれぞれ既存の流儀（`wire_using_plan.rs`（TASK-117・PLAN-9 で
+先行実装済み）・`wire_explain.rs`・新規 `wire_hint_order.rs`・
+`wire_udf_call.rs`・`wire_insert_operation_id.rs`）に従う。
+
+- **層 A**: 各構文の規則自体は engine 側 in-process 結合テスト（`sql_using_plan.rs`
+  等）が確定オラクルとして検証済みのため、同じ規則が wire フレーミング越しに
+  観測できることの確認に徹する。常時（`make ci`）実行される。
+- **層 B**（`crates/wire-server/tests/extended_syntax_e2e.rs`）: `USING PLAN`・
+  `EXPLAIN` は `wire-server` バイナリへの `--planner-endpoint`／
+  `--planner-model`／`--embedder-hashing-dim`（TASK-117）注入を要するため、
+  子プロセス起動前にプロセス内 HTTP スタブ（Ollama `/api/generate` 互換の
+  最小応答。`engine::query_planner` の単体テスト `spawn_stub_server` と同型）を
+  立て、`--planner-endpoint 127.0.0.1:<stub port>` として渡す。`HINT ORDER`・
+  `CREATE FUNCTION`・`INSERT` は追加注入を要しないため素の `wire-server` 起動で
+  足りる。各構文 1 本の代表ケースのみを 3 クライアントで確認する（層 A で
+  確定済みの拒否経路・順列網羅を層 B へ複製しない方針は TASK-165・TASK-168 と
+  同じ）。
+
+**INSERT の wire 受理（判断の記録）**: TASK-82（SQL-10）の定義に基づき、本タスク
+で wire 経由の `INSERT` 受理へ切り替えた（下記「スコープ外」の旧項目を参照。
+判断の詳細は `simple_query.rs` モジュールコメント）。読み取り可視性の既定
+（`Public` のみ）は拡大していない。
+
 ## 影響
 
 - `crates/wire-server/src/{simple_query,result_encoder}.rs`（新規）・
@@ -99,15 +129,16 @@ psql・psycopg・pg の導入自動化を確定させるには、pip/npm の実�
   別途ユーザー承認を要する）
 - Docker 開発コンテナへの `psql`／`psycopg` 追加
 - SQL `INSERT` が書き込む行の可視性（`Visibility::Private` 固定）と wire 認証
-  経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（挿入直後の行が
-  同一セッションからも見えない現状の是非）。codex-review P1・PR #210 指摘の
-  検討過程で、`Private` 許可を wire 認証側へ広げる案は
+  経由の `PolicyContext`（`Public` のみ許可）の非対称の解消（wire セッションへの
+  自テナント `Private` 行の読み戻し可視性付与）。TASK-82（SQL-10）で `INSERT`
+  自体は wire 経由で受理するよう切り替えたが（旧: 当面 `INSERT` 自体を
+  公開しない方針だった。codex-review P1・PR #210 指摘の検討過程の判断）、
+  `Private` 許可を wire 認証側へ広げる案は
   `wire1_three_tenant_visibility_public_shared_private_hidden`
   （自テナント自身の `Private` 行も含め wire 越しには不可視、という既存の
-  最小権限境界）を壊すため不採用と判断した。当面は wire の簡易クエリ経路
-  から `INSERT` 自体を公開しない（`simple_query.rs` のモジュールコメント
-  参照）ことで非対称を回避しており、本項目は「wire 経由の書き込み系 SQL」の
-  設計が定まるまで引き続きスコープ外
+  最小権限境界）を壊すため引き続き不採用とし、非対称（書いた本人も同一
+  セッションでは読み戻せない）はそのまま残した。本項目は「wire セッションへの
+  読み戻し可視性付与」の設計が定まるまで引き続きスコープ外
 - `EXPLAIN` 応答での実効モード・指定元の可視化（SQL-12 が SQL-6 と併せて
   期待する項目）: engine に `EXPLAIN` 自体が未実装のため対象外（SQL-6 の
   確定化で扱う）

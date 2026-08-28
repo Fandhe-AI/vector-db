@@ -106,6 +106,10 @@ pub(crate) mod using_plan;
 /// **TASK-78（SQL-6）で追加した破壊的変更（BREAKING CHANGE）**: `Explain`
 /// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
 /// 必要）。
+///
+/// **TASK-82（SQL-10）で追加した破壊的変更（BREAKING CHANGE）**: `Insert`
+/// variant を追加した（既存の網羅的 `match` はワイルドカードアームの追加が
+/// 必要）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlOutcome {
     Query(exec::QueryResult),
@@ -119,4 +123,11 @@ pub enum SqlOutcome {
     /// 実行せず、LLM クエリ展開・モード解決結果を可視化する `QUERY PLAN` 単一列の
     /// [`exec::QueryResult`]（`sql::explain` モジュールが構築）を返す。
     Explain(exec::QueryResult),
+    /// `INSERT INTO <table> (...) VALUES (...) USING OPERATION_ID '<id>'`
+    /// （TASK-82・SQL-10）がセッション経由の実行経路
+    /// （[`crate::core::EngineCore::execute_sql_in_session`]）で成功したことを
+    /// 示す応答。検証・実行本体は既存の
+    /// [`crate::core::EngineCore::execute_insert_sql`]（TASK-80）に委譲しており、
+    /// 本 variant はその [`exec::InsertOutcome`] をそのまま運ぶ薄いラッパー。
+    Insert(exec::InsertOutcome),
 }

@@ -8,19 +8,23 @@
 //! 受け渡しのみ。SQL の構文解釈・許可リスト判定・RLS 適用はすべて engine 側
 //! （`engine::sql::allowlist::validate_sql`）に委ねる。
 //!
-//! `INSERT` は wire 経由では受理しない。engine 側の `INSERT`
-//! （`sql::exec::execute_insert`）は行を常に `Visibility::Private` で書き込む
-//! 固定仕様（TASK-80・SQL-10）である一方、wire 認証経由の `PolicyContext`
-//! （`auth::verify` → `PolicyContext::new`）は `Public` のみを許可可視性とする
-//! 最小権限の既定を維持している（`wire1_three_tenant_visibility_public_shared_private_hidden`
-//! が、認証したテナント自身の `Private` 行も含めて wire 越しには不可視である
-//! ことを回帰確認済み。codex-review P1・PR #210 指摘の検討過程で確認）。
-//! `INSERT` を wire 側で受理してしまうと、書き込んだ本人にも二度と wire
-//! 経由では読めない行を生成することになるため、`engine::sql::allowlist::
-//! validate_sql` の許可リストに INSERT 文が含まれないことを利用し、他の
-//! 許可外構文と同じ `42601`（fail-closed）で拒否させる。wire 経由での書き込み
-//! 系 SQL 対応は、`Private` 行が wire 越しに読める経路の設計が定まってから
-//! 改めて着手する。
+//! `INSERT` は wire 経由で受理する（TASK-82・SQL-10。`EngineCore::
+//! execute_sql_in_session` が先頭トークンを見て `execute_insert_sql`（TASK-80）
+//! へ委譲し `SqlOutcome::Insert` を返す。`crates/engine/src/core.rs` 参照）。
+//! ただし engine 側の `INSERT`（`sql::exec::execute_insert`）は行を常に
+//! `Visibility::Private` で書き込む固定仕様である一方、wire 認証経由の
+//! `PolicyContext`（`auth::verify` → `PolicyContext::new`）は `Public` のみを
+//! 許可可視性とする最小権限の既定を維持している（
+//! `wire1_three_tenant_visibility_public_shared_private_hidden` が、認証した
+//! テナント自身の `Private` 行も含めて wire 越しには不可視であることを
+//! 回帰確認済み。codex-review P1・PR #210 指摘の検討過程で確認）。そのため
+//! **読み取り可視性の既定は変更しない**（権限拡大なし）: wire 経由で書いた
+//! `Private` 行は wire の `SELECT` では引き続き不可視であり、書いた本人が
+//! その場で読み戻すことはできない（`tests/wire_insert_operation_id.rs` が
+//! この非対称性を契約として固定する。永続化自体は engine API 側の `Private`
+//! 可視 `PolicyContext` から確認できる）。wire セッションへの自テナント
+//! `Private` 行の読み戻し可視性付与は別途の RLS 設計課題としてスコープ外
+//! （PR 本文参照）。
 
 use std::io::{self, Write};
 use std::net::TcpStream;
@@ -102,15 +106,22 @@ pub(crate) fn execute_and_respond(
     // 以前は登録を `engine.execute_sql_in_session` の呼び出し 1 行だけに
     // 限定していたが、この区間全体（＝「outcome を決定する区間」）をブロックで
     // 括ることで、将来この区間内に書き込み系 SQL の分岐が追加されても
-    // （`EngineCore::execute_sql_in_session` は現状 `SetSearchMode`・
-    // `CreateFunction`・`Select`・`Aggregate`・`Explain`（TASK-78・SQL-6。
-    // 検索本体を実行しない LLM 展開のみの読み取り専用経路）の読み取り専用
-    // 5 分岐のみで commit を伴わない。モジュール冒頭コメント参照）、登録位置を移設せずに
-    // そのまま活かせる（codex-review Medium 指摘対応）。区間内で commit 成功後
-    // に panic した場合、`engine::recovery::panic_hook` のフックがこの登録済み
-    // バイト列を同期的に送出してから abort する（登録が無い・`try_clone` が
-    // 失敗した場合は登録せず、既存の接続断側〔RECOVER-5 の abort バック
-    // ストップ〕へ fail-closed に倒す）。
+    // 登録位置を移設せずにそのまま活かせる設計だった（codex-review Medium
+    // 指摘対応）。TASK-82（SQL-10）で実際にその書き込み系分岐（`Insert`）が
+    // 加わった: `EngineCore::execute_sql_in_session` は現在 `SetSearchMode`・
+    // `CreateFunction`・`Select`・`Aggregate`・`Explain`（TASK-78・SQL-6。検索
+    // 本体を実行しない LLM 展開のみの読み取り専用経路）の読み取り専用 5 分岐に
+    // 加え、`Insert`（`execute_insert_sql` 経由。モジュール冒頭コメント参照）の
+    // commit を伴う 1 分岐を持つ。`execute_insert_sql` は
+    // `storage.rs`／`recovery::commit_boundary::commit` へ到達する既存の書き込み
+    // 経路（`EngineCore::insert_row` と同じ commit 境界機構。
+    // `engine/tests/recover6_panic_hook.rs` が `insert_row` 経由で
+    // commit 成功境界を跨いだ panic → 緊急応答の同期送出 → abort を検証済み）を
+    // 通るため、この登録がここで初めて書き込み経路に触れるわけではない。
+    // 区間内で commit 成功後に panic した場合、`engine::recovery::panic_hook`
+    // のフックがこの登録済みバイト列を同期的に送出してから abort する（登録が
+    // 無い・`try_clone` が失敗した場合は登録せず、既存の接続断側〔RECOVER-5 の
+    // abort バックストップ〕へ fail-closed に倒す）。
     //
     // 登録（eager）と送出（emergency_send_decision による commit 成功フラグの
     // 世代一致判定）は別軸である ―― ここでの登録はブロック内で panic が
@@ -128,11 +139,9 @@ pub(crate) fn execute_and_respond(
     // 抜けた後に `limits::READ_TIMEOUT` へ明示的に復元する処理も不要になった
     // （以前は登録中だけ短いタイムアウトを即時設定していたため必要だった）。
     //
-    // `INSERT` は engine の許可リスト（`sql::allowlist::validate_sql`）が
-    // 受理しない構文のため、他の許可外構文と同じ `execute_sql_in_session` へ
-    // そのまま渡す（`42601` で fail-closed に拒否される。モジュール冒頭コメント
-    // 参照）。wire 層でここを分岐して `execute_insert_sql` へ振り分けることは
-    // 意図的に行わない。
+    // `INSERT` の分岐先決定は engine 側（`EngineCore::execute_sql_in_session`。
+    // TASK-82・SQL-10）に一元化する。wire 層はここで構文種別ごとに分岐しない
+    // （モジュール冒頭コメント参照）。
     let outcome = {
         let _emergency_registration =
             cached_emergency_response_bytes().and_then(|response_bytes| {
@@ -181,6 +190,26 @@ pub(crate) fn execute_and_respond(
                 ),
             }
         }
+        // TASK-82（SQL-10）: `INSERT`（行形・ファイル形いずれも
+        // `exec::InsertOutcome::rows_affected` に書き込み件数を保持する。
+        // `sql/exec.rs` ドキュメント参照）の応答を pg 互換の `CommandComplete`
+        // タグ `INSERT <oid> <rows>` へ整形する。OID 機構は本実装に無いため
+        // 固定で `0` を使う（pg プロトコルの規範。他の書き込み系 wire 応答も
+        // 同様の固定値を使う契約はまだ無いためここでのみ導入する）。
+        Ok(SqlOutcome::Insert(outcome)) => match result_encoder::encode_command_complete(&format!(
+            "INSERT 0 {}",
+            outcome.rows_affected
+        )) {
+            Ok(msg) => {
+                write_all(stream, &msg)?;
+                crate::handshake::write_ready_for_query_io(stream)
+            }
+            Err(_) => respond_error_and_ready(
+                stream,
+                ErrorClass::InternalError,
+                "failed to encode command complete response",
+            ),
+        },
         Err(e) => respond_error_and_ready(stream, e.error_class(), &e.client_message()),
     }
 }
@@ -210,16 +239,22 @@ pub(crate) fn execute_and_respond(
 /// 同関数は「このスレッドが commit 成功後・応答未確定の区間にあるか
 /// （`engine::recovery::commit_boundary::active_commit_pending_generation` が
 /// `Some`）」かつ「その世代が登録時に捕捉した世代と一致するか」の両方を
-/// 満たす場合にのみ真を返す。`execute_sql_in_session` の 5 分岐
+/// 満たす場合にのみ真を返す。`execute_sql_in_session` の読み取り専用 5 分岐
 /// （`SetSearchMode`・`CreateFunction`・`Select`・`Aggregate`・`Explain`）はいずれも
 /// `engine::recovery::commit_boundary::commit`／`commit_and_finish` を呼ばない
-/// 読み取り専用経路（モジュール冒頭コメント「INSERT は wire 経由では受理
-/// しない」参照）であるため、これらの区間で panic しても commit-pending 世代は
-/// 立たず `emergency_send_decision` は偽となる ―― 登録は存在するが送出されない
+/// ため、これらの区間で panic しても commit-pending 世代は立たず
+/// `emergency_send_decision` は偽となる ―― 登録は存在するが送出されない
 /// （前段フック `previous_hook` へ委譲され、TASK-97 以前と同じ「接続断のみ」に
-/// 倒れる）。すなわち「事前に登録される」ことと「実際に送出される」ことは別軸
-/// であり、送出可否の唯一の判断材料は panic 発生時点の commit 成功フラグ
-/// （世代一致）である。回帰テストは
+/// 倒れる）。一方 `Insert`（TASK-82・SQL-10）は `execute_insert_sql` 経由で
+/// `commit_boundary::commit` を実際に呼ぶ commit を伴う分岐であり、この区間で
+/// 該当世代の commit が成功した後に panic すれば `emergency_send_decision` は
+/// 真となり緊急応答が送出される（`engine::recovery::panic_hook` モジュール
+/// ドキュメント・`engine/tests/recover6_panic_hook.rs` の
+/// `EngineCore::insert_row` 経由の検証がこの commit 境界機構自体の契約を
+/// 既に固定している。本ファイルはその機構を SQL 表層の `INSERT` 経路へ
+/// 接続するのみで、機構自体を新設しない）。すなわち「事前に登録される」ことと
+/// 「実際に送出される」ことは別軸であり、送出可否の唯一の判断材料は panic
+/// 発生時点の commit 成功フラグ（世代一致）である。回帰テストは
 /// `engine::recovery::panic_hook::tests::
 /// try_send_emergency_response_returns_false_when_not_pending_even_if_registered`
 /// を参照。
