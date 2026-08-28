@@ -17,7 +17,11 @@
 //! 呼び出し元は `crate::simple_query` の緊急応答チャネル（`engine::recovery::
 //! panic_hook::EmergencyResponseRegistration`）に限定して使うこと（通常エラー経路から
 //! 呼ばない。呼び出し面を分けることで誤って通常応答へ `may_be_committed` を混入させる
-//! ことを構造的に防ぐ）。
+//! ことを構造的に防ぐ）。`D` フィールドを追加するため `encode` が委譲する
+//! [`crate::result_encoder::encode_error_response`] は経由できないが、`S`/`C`/`M`
+//! フィールドの書き込み自体は同モジュールの
+//! [`crate::result_encoder::push_s_c_m_fields`] を共有し、フィールドレイアウトの
+//! 実体が 2 箇所に重複しないようにする（codex-review Low 指摘対応・PR #101）。
 //!
 //! フレーム長は [`crate::result_encoder::frame_len`]（`checked` 方式）を再利用し、
 //! `as i32` によるオーバーフローを起こさない（`.claude/rules/coding-rust.md`
@@ -28,7 +32,7 @@
 
 use engine::error_format::ErrorClass;
 
-use crate::result_encoder::{frame_len, EncodeError};
+use crate::result_encoder::{frame_len, push_s_c_m_fields, EncodeError};
 
 /// `D`（detail）フィールドに載せる固定文言。`RECOVER-5` (3) 該当時に限り、commit が
 /// 成功していたかもしれない（応答未達のまま該当操作が確定した可能性がある）ことを
@@ -36,11 +40,6 @@ use crate::result_encoder::{frame_len, EncodeError};
 /// spec の「検討中確定化」として決定したワイヤ形式であり、spec 本文の逐語引用ではない
 /// （`.claude/rules/spec-confidentiality.md`）。
 const MAY_BE_COMMITTED_DETAIL: &str = "state=may_be_committed";
-
-/// severity フィールド（`S`）の固定値。PostgreSQL wire v3 が規定する語彙のうち
-/// 本リポは `ERROR` のみを送出する（`WARNING`/`NOTICE` 等の非エラー応答は簡易
-/// クエリプロトコルの他メッセージ種別で表現し、本モジュールの対象外）。
-const SEVERITY_ERROR: &str = "ERROR";
 
 /// `message` に NUL バイトが含まれないか検証する（fail-closed）。フィールドは
 /// NUL 終端のため、混入するとフレーム構造そのものが壊れる（後続フィールドの
@@ -50,23 +49,6 @@ fn reject_embedded_nul(message: &str) -> Result<(), EncodeError> {
         return Err(EncodeError);
     }
     Ok(())
-}
-
-/// `ErrorResponse`（'E'）本体のうち `S`/`C`/`M` の 3 フィールドを書き込む。
-/// [`encode_may_be_committed`] が `D`（detail）フィールドを追加する前段として使う
-/// （[`encode`] は本関数を経由せず [`crate::result_encoder::encode_error_response`]
-/// へ委譲するため、こちらの利用は `encode_may_be_committed` 限定）。末尾のフィールド
-/// 終端・メッセージ長算出は呼び出し元が行う。
-fn push_s_c_m_fields(body: &mut Vec<u8>, class: ErrorClass, message: &str) {
-    body.push(b'S');
-    body.extend_from_slice(SEVERITY_ERROR.as_bytes());
-    body.push(0);
-    body.push(b'C');
-    body.extend_from_slice(class.wire_code().as_bytes());
-    body.push(0);
-    body.push(b'M');
-    body.extend_from_slice(message.as_bytes());
-    body.push(0);
 }
 
 /// `body`（フィールド終端込みで組み立て済み）を `ErrorResponse`（'E'）フレームへ
@@ -101,7 +83,7 @@ pub fn encode(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> 
 pub fn encode_may_be_committed(class: ErrorClass, message: &str) -> Result<Vec<u8>, EncodeError> {
     reject_embedded_nul(message)?;
     let mut body = Vec::new();
-    push_s_c_m_fields(&mut body, class, message);
+    push_s_c_m_fields(&mut body, class.wire_code(), message);
     body.push(b'D');
     body.extend_from_slice(MAY_BE_COMMITTED_DETAIL.as_bytes());
     body.push(0);
