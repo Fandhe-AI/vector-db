@@ -71,10 +71,7 @@
   下限。`.github/workflows/recall.yml` の同一 job・同一 environment `recall-gate`
   から注入）と実測値を比較する閾値ゲート。TASK-104/TASK-108 と同じ opt-in
   （未設定＝対象外）・strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
-  で未設定を fail-closed 化）を持つ。ゲート本体（`run_threshold_gate`）は
-  `MockLlmClient`（完全 oracle 写像）と `NoisyLlmClient`（非 oracle・劣化展開品質）
-  の両方に対して独立に実行し、同じ spec 閾値をどちらの応答品質でも満たすことを
-  要求する（下記「展開品質の劣化検出」参照）
+  で未設定を fail-closed 化）を持つ
 
 `.github/workflows/recall.yml` の TASK-104 由来の設計判断（`pull_request` トリガを
 持たない・`workflow_dispatch` のみ・`if: github.ref == 'refs/heads/main'`・
@@ -112,23 +109,20 @@
   `NoisyLlmClient`（劣化した production LLM 応答を模する決定的スタブ）を追加し、
   完全 oracle 写像（`MockLlmClient`）との Recall@20 差を独立にアサートすることで、
   展開戦略の劣化そのものを検出できることを回帰保証する
-- **層 B ゲート自体の oracle 依存**（codex-review・PR #265・P2 再指摘への追補）:
-  上記の `NoisyLlmClient` 追加は層 A（相対比較によるハーネスの検出感度の回帰保証）
-  にとどまり、実際に spec 閾値と比較する層 B の受け入れゲート
-  （`query_planning_recall_threshold_gate`）自体は `MockLlmClient` 固定のままだった
-  ため、production の展開品質が劣化してもゲートの pass/fail は変化しないという
-  指摘を受けた。これに対応し、層 B のゲート本体を `run_threshold_gate(client,
-  gate_name)` として `LlmClient` 差し替え可能に切り出し、`MockLlmClient` 版
-  （`query_planning_recall_threshold_gate`）に加えて `NoisyLlmClient` 版
-  （`query_planning_recall_threshold_gate_degraded_expansion`）を追加した。「固定した
-  非 oracle 応答コーパスを production と同じ展開処理（`render_full_prompt` →
-  `LlmClient::complete` → `parse_expansion` → `hybrid_search`）へ入力し、spec 閾値を
-  適用する評価」という位置づけであり、実 Ollama への疎通確認（引き続き対象外）を
-  代替するものではない。**リスク**: `query_planning_recall_threshold_gate_degraded_expansion`
-  は既存の `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`／
-  `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（`recall-gate` environment の同一 Actions
-  variables）をそのまま共用する。`NoisyLlmClient` は `MockLlmClient` より改善幅が
-  小さいため、オーナーが完全 oracle 写像の実測を基準に閾値を設定していた場合、次回
-  `recall.yml` 実行で本ゲートが新規に fail する可能性がある（実測により確認済み:
-  両ゲートの pass/fail が分かれる閾値域が存在する）。閾値の再調整はオーナー・spec
-  リポ側の判断事項であり、本 ADR の範囲外
+- **層 B ゲートを `MockLlmClient` 固定に留める判断**（codex-review・PR #265・P1
+  指摘への対応）: 層 B の受け入れゲート（`query_planning_recall_threshold_gate`）を
+  `NoisyLlmClient`（非 oracle・劣化展開品質）でも同一の spec 閾値
+  （`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`／`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`）
+  で評価する変更を一時追加したが、実測により両ゲートの pass/fail が分かれる閾値域が
+  存在することを確認した。この閾値は完全 oracle 写像（`MockLlmClient`）の実測を基準に
+  設定されたものであり、非 oracle スタブへそのまま適用すると production の展開品質が
+  劣化していなくても（実装は正しいままでも）週次 `recall.yml` が新規に fail しうる。
+  劣化シナリオ専用の閾値を新設する選択肢も検討したが、`resolve_gate_threshold` は
+  strict モード（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`。`recall.yml` が設定）
+  で未設定の Actions variable を fail-closed 扱いにするため、本リポ側だけで新しい
+  `QUERY_PLANNING_RECALL_MIN_*` 変数を追加すると、オーナーが対応する値を
+  `recall-gate` environment に設定するまで週次実行が確実に fail する。閾値の新設・
+  再調整は spec・オーナー側の判断事項であり本 PR の範囲外のため、`NoisyLlmClient` 版
+  ゲート（`query_planning_recall_threshold_gate_degraded_expansion`）は追加せず、
+  層 B は `MockLlmClient` 固定のまま維持する。展開品質の劣化検出感度は、上記の層 A
+  （`MockLlmClient` との相対比較）が引き続き回帰保証する
