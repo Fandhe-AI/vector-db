@@ -705,6 +705,14 @@ fn map_rls_error(e: RlsError) -> CoreError {
 /// `VectorCore` 公開 API のエラー型。下位層（`storage`/`catalog`/`arena`/`kernel`/`policy`）
 /// のエラーを一本化しつつ、不可視行と不存在行を [`CoreError::NotFound`] に統合する
 /// （呼び出し元へ存在情報を漏らさないため。エラーメッセージはプログラム出力文字列のため英語）。
+///
+/// `#[non_exhaustive]` は付与しない: 本 enum は本 PR より前から公開済みであり、
+/// 後付けで `#[non_exhaustive]` を付けると下流の網羅的 `match` がコンパイル不能に
+/// なる（それ自体が破壊的変更のため、`#[non_exhaustive]` 化で互換性を装うのではなく
+/// 付けないままにする。codex-review PR #252 P1 指摘）。本 PR で追加した
+/// `QueryPlannerUnavailable`／`QueryPlanning` variant の追加自体は、`non_exhaustive`
+/// 化の有無に関わらず既存の網羅的 `match` を壊す破壊的変更であることに変わりはない
+/// （PR 本文の変更点に明記する）。
 #[derive(Debug)]
 pub enum CoreError {
     Storage(StorageError),
@@ -739,6 +747,13 @@ pub enum CoreError {
     /// はずの防御的分岐。GPU 実行を提供する `SearchProvider` 実装が後続タスクで
     /// 追加されるまで fail-closed に拒否する。
     GpuPathUnavailable,
+    /// LLM クエリプランニング（TASK-110・PLAN-1）の [`Self::query_planner`] が
+    /// 未注入だった（`embedder` 未構成時のファイル形 `INSERT` 拒否と同じ
+    /// fail-closed 方針。既定で参照実装を暗黙採用しない）。
+    QueryPlannerUnavailable,
+    /// LLM クエリプランニング（TASK-110・PLAN-1）のプロンプト組み立て・LLM 呼び出し・
+    /// 応答パースのいずれかが失敗した（詳細は [`crate::query_planner::PlanError`]）。
+    QueryPlanning(crate::query_planner::PlanError),
 }
 
 impl std::fmt::Display for CoreError {
@@ -762,6 +777,8 @@ impl std::fmt::Display for CoreError {
                     "dispatch selected a gpu execution path with no gpu-capable provider wired"
                 )
             }
+            CoreError::QueryPlannerUnavailable => write!(f, "no query planner configured"),
+            CoreError::QueryPlanning(e) => write!(f, "core query planning error: {e}"),
         }
     }
 }
@@ -771,6 +788,12 @@ impl std::error::Error for CoreError {}
 impl From<DispatchError> for CoreError {
     fn from(e: DispatchError) -> Self {
         CoreError::Dispatch(e)
+    }
+}
+
+impl From<crate::query_planner::PlanError> for CoreError {
+    fn from(e: crate::query_planner::PlanError) -> Self {
+        CoreError::QueryPlanning(e)
     }
 }
 
@@ -872,6 +895,11 @@ pub struct EngineCore {
     /// 拒否する契約（既定で参照実装を暗黙採用しない。`embedding.rs` モジュール
     /// ドキュメント参照）。差し替えは [`Self::with_embedder`] のみ。
     embedder: Option<Box<dyn crate::embedding::Embedder>>,
+    /// LLM クエリプランニング（TASK-110・PLAN-1）のクエリ展開クライアント注入点。
+    /// 未設定（`None`）は [`Self::plan_query`] を fail-closed に拒否する契約
+    /// （`embedder` と同じ流儀。既定で参照実装を暗黙採用しない）。差し替えは
+    /// [`Self::with_query_planner`] のみ。
+    query_planner: Option<Box<dyn crate::query_planner::LlmClient>>,
     /// ファイル形 `INSERT` のチャンク化・チャンク数上限設定（TASK-120）。
     /// 差し替えは [`Self::with_incremental_config`] のみ。
     incremental_config: crate::incremental::IncrementalConfig,
@@ -913,6 +941,7 @@ impl EngineCore {
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
             embedder: None,
+            query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
@@ -939,6 +968,7 @@ impl EngineCore {
             prefilter_cache: PrefilterCache::new(),
             precision_policy: crate::precision::PrecisionPolicy::default(),
             embedder: None,
+            query_planner: None,
             incremental_config: crate::incremental::IncrementalConfig::default(),
             ledger_mode: LedgerMode::default(),
             batch_limits: crate::batch_limits::BatchLimits::default(),
@@ -970,6 +1000,15 @@ impl EngineCore {
     /// なら `None` のままで、ファイル形 `INSERT` は fail-closed に拒否される）。
     pub fn with_embedder(mut self, embedder: Box<dyn crate::embedding::Embedder>) -> Self {
         self.embedder = Some(embedder);
+        self
+    }
+
+    /// LLM クエリプランニング（TASK-110・PLAN-1）のクエリ展開に使う
+    /// [`crate::query_planner::LlmClient`] を注入したビルダーを返す（所有権を消費する
+    /// ビルダーメソッドとし、[`Self::with_embedder`] と同じ流儀。未呼び出しなら
+    /// `None` のままで、[`Self::plan_query`] は fail-closed に拒否される）。
+    pub fn with_query_planner(mut self, client: Box<dyn crate::query_planner::LlmClient>) -> Self {
+        self.query_planner = Some(client);
         self
     }
 
@@ -1216,6 +1255,41 @@ impl EngineCore {
         Err(CoreError::from(CatalogError::Invalid(
             "dictionary snapshot generation kept changing during row scan; retry later".to_string(),
         )))
+    }
+
+    /// `table` に対する自然言語 `question` を LLM クエリプランニング（TASK-110・
+    /// PLAN-1）で展開し、[`crate::query_planner::QueryExpansion`] を返す。
+    /// `VectorCore` trait へは昇格しない固有メソッド（`core-api-check` の対象外。
+    /// `Self::dictionary_snapshot` 等と同じ理由）。
+    ///
+    /// [`Self::query_planner`] が未注入（`None`）の場合は
+    /// [`CoreError::QueryPlannerUnavailable`] で fail-closed に拒否する（`embedder`
+    /// 未構成時のファイル形 `INSERT` 拒否と同じ方針。既定で参照実装を暗黙採用しない）。
+    ///
+    /// 固定接頭辞は必ず `(table, ctx)` 単位の [`Self::dictionary_snapshot`] から
+    /// 都度レンダリングし、テナントをまたぐ接頭辞キャッシュは持たない
+    /// （security.md「テナント境界」対応。レンダリング自体は
+    /// [`DictionaryCache`] 経由で世代整合キャッシュされるため、LLM レイテンシ比で
+    /// 無視できるコストに収まる）。LLM 応答は
+    /// [`crate::query_planner::parse_expansion`] が厳格パースするため、
+    /// プロンプトインジェクションによる異常出力の影響は検証済みの
+    /// `QueryExpansion` に閉じる（`query_planner.rs` モジュールドキュメント参照）。
+    pub fn plan_query(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+    ) -> Result<crate::query_planner::QueryExpansion, CoreError> {
+        let client = self
+            .query_planner
+            .as_deref()
+            .ok_or(CoreError::QueryPlannerUnavailable)?;
+        let dictionary = self.dictionary_snapshot(ctx, table)?;
+        let prefix = crate::query_planner::render_prompt_prefix(&dictionary);
+        let prompt = crate::query_planner::render_full_prompt(&prefix, question)?;
+        let response = client.complete(&prompt)?;
+        let expansion = crate::query_planner::parse_expansion(&response)?;
+        Ok(expansion)
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
