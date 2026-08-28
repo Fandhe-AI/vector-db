@@ -33,9 +33,13 @@ pub const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// ErrorResponse）を書き込むためのソケット書き込みタイムアウト（TASK-97、
 /// 対象ビヘイビア: RECOVER-6）。
 ///
-/// `crate::simple_query::execute_and_respond` が `engine.execute_sql_in_session`
-/// の呼び出し区間だけ、この値を設定した `TcpStream` クローンを
-/// `engine::recovery::panic_hook::EmergencyResponseRegistration` へ渡す。
+/// `crate::simple_query::execute_and_respond` は「outcome を決定する区間」
+/// （`engine.execute_sql_in_session` の呼び出しを含むブロック）だけこの値を
+/// `engine::recovery::panic_hook::EmergencyResponseRegistration::register` へ
+/// `Duration` として渡す（ソケットへは登録時に設定しない ―― `TcpStream::
+/// try_clone` はソケット共有のため登録時に設定すると通常応答の書き込みにも
+/// 波及してしまう。`panic_hook` モジュールドキュメント参照）。panic フックが
+/// 実際に緊急応答を書き込む直前にのみこの値をソケットへ適用する。
 /// panic フックは unwind 中の同期書き込みであり、読み出しを止めたクライアント
 /// が終了処理を無期限に遅延させる経路を作らないよう、[`REJECT_WRITE_TIMEOUT`]
 /// より緩めつつ有界な値とする（緊急応答は 1 フレームのみで小さいため、通常の

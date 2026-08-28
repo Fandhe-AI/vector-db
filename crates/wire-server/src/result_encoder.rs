@@ -158,10 +158,11 @@ pub fn encode_empty_query_response() -> Vec<u8> {
 /// `ErrorResponse`（'E'）を `S`/`C`/`M` に加え `D`（detail）フィールド付きで
 /// 組み立てる（TASK-97、対象ビヘイビア: RECOVER-6・ERR-1）。
 ///
-/// 呼び出し文脈: `crate::simple_query::execute_and_respond` が
-/// `engine.execute_sql_in_session` の呼び出し区間の緊急応答チャネル
-/// （`engine::recovery::panic_hook::EmergencyResponseRegistration`）へ登録する
-/// バイト列を、通常の実行経路（panic フックの外）で事前に組み立てるために使う
+/// 呼び出し文脈: `crate::simple_query::execute_and_respond` が「outcome を
+/// 決定する区間」（`engine.execute_sql_in_session` の呼び出しを含むブロック）
+/// の緊急応答チャネル（`engine::recovery::panic_hook::
+/// EmergencyResponseRegistration`）へ登録するバイト列を、通常の実行経路
+/// （panic フックの外）で事前に組み立てるために使う
 /// （panic フック内でのエンコードによるアロケーション・整形失敗を避けるため。
 /// `panic_hook` モジュールドキュメント参照）。
 ///

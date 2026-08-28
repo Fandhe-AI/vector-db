@@ -152,8 +152,11 @@ fn subprocess_commit_then_panic_sends_emergency_response_then_aborts() {
         // wire-server::simple_query::execute_and_respond と同じ順序を再現する:
         // ResponseBoundaryGuard 生成 → 緊急応答登録 → commit を伴う処理 → panic。
         let _response_boundary = ResponseBoundaryGuard::new();
-        let _registration =
-            EmergencyResponseRegistration::register(EMERGENCY_MARKER.to_vec(), server_stream);
+        let _registration = EmergencyResponseRegistration::register(
+            EMERGENCY_MARKER.to_vec(),
+            server_stream,
+            Duration::from_secs(5),
+        );
 
         core.insert_row(&ctx, TABLE, 1, &row, Some(&op_id))
             .expect("child: commit must succeed");
@@ -268,8 +271,11 @@ fn subprocess_panic_without_commit_does_not_send_emergency_response() {
 
         // commit を一切行わずに登録だけしてから panic する。
         let _response_boundary = ResponseBoundaryGuard::new();
-        let _registration =
-            EmergencyResponseRegistration::register(EMERGENCY_MARKER.to_vec(), server_stream);
+        let _registration = EmergencyResponseRegistration::register(
+            EMERGENCY_MARKER.to_vec(),
+            server_stream,
+            Duration::from_secs(5),
+        );
 
         panic!("injected panic with a registration but no commit (must not send)");
     }

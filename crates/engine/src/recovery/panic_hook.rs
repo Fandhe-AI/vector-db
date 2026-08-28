@@ -13,9 +13,13 @@
 //!
 //! 呼び出し文脈: `wire-server::main`（`run_server` 起動時）が [`install_panic_hook`]
 //! を 1 回呼ぶ。`wire-server::simple_query::execute_and_respond` が
-//! `engine.execute_sql_in_session` の呼び出し区間だけを
-//! [`EmergencyResponseRegistration`] で包み、事前エンコード済みの ErrorResponse
-//! バイト列と `TcpStream` のクローンを登録する。
+//! 「outcome を決定する区間」（`engine.execute_sql_in_session` の呼び出しを含む
+//! ブロック）を [`EmergencyResponseRegistration`] で包み、事前エンコード済みの
+//! ErrorResponse バイト列・`TcpStream` のクローン・緊急応答書き込み用の write
+//! timeout を登録する。登録はブロック終端でレキシカルに drop され、応答の組み
+//! 立て・送信区間には及ばない（[`EmergencyResponseRegistration`] のドキュメント
+//! 参照 ―― 応答書き込み中の panic で緊急応答を書きかけの通常応答フレームへ
+//! 追記してしまう事故を構造的に防ぐ）。
 //!
 //! 設計上の分離（テスト容易性）: 「送信してよいか」の判定は
 //! [`emergency_send_decision`] という純関数へ分離し、`abort()` を伴わない
@@ -40,14 +44,25 @@ use std::cell::RefCell;
 use std::io::Write as _;
 use std::net::TcpStream;
 use std::sync::Once;
+use std::time::Duration;
 
 use super::commit_boundary;
 
 /// [`EMERGENCY_RESPONSE_CHANNEL`] の要素型: `(事前エンコード済み ErrorResponse
 /// バイト列, 書き込み先 TcpStream のクローン, 登録時点の ResponseBoundaryGuard
-/// 世代)`。型を独立させているのは可読性のためだけでなく、clippy
-/// `type_complexity` を素直に満たすため（実質的な意味は変わらない）。
-type EmergencyChannelEntry = (Vec<u8>, TcpStream, Option<u64>);
+/// 世代, 緊急応答書き込み時に適用する write timeout)`。型を独立させているのは
+/// 可読性のためだけでなく、clippy `type_complexity` を素直に満たすため（実質的な
+/// 意味は変わらない）。
+///
+/// write timeout を登録時にソケットへ設定せず値のまま保持する理由（TASK-97・
+/// codex-review Medium 指摘対応・PR #90）: `TcpStream::try_clone` は同一
+/// ソケットの複製であり（`SO_SNDTIMEO` はソケット共有）、登録時に短い緊急応答用
+/// タイムアウトをソケットへ設定してしまうと、登録解除後も元の `stream`
+/// 側のタイムアウトが変わったままになる（呼び出し元が明示的に復元しない限り）。
+/// 値のまま保持し、実際に緊急応答を書き込む直前（[`try_send_emergency_response`]）
+/// にのみ適用することで、登録スコープを抜けた後の通常応答書き込みへ一切影響
+/// させず、呼び出し元にタイムアウト復元の責務を負わせない。
+type EmergencyChannelEntry = (Vec<u8>, TcpStream, Option<u64>, Duration);
 
 thread_local! {
     /// このスレッド（＝ wire-server の 1 接続スレッド）に登録された緊急応答チャネル
@@ -68,12 +83,16 @@ thread_local! {
 
 /// [`EMERGENCY_RESPONSE_CHANNEL`] への登録を表す RAII ガード（TASK-97・RECOVER-6）。
 ///
-/// `wire-server::simple_query::execute_and_respond` が `engine.execute_sql_in_session`
-/// の呼び出し区間だけを本ガードで包む契約 ―― engine から戻った直後にこのガードを
-/// drop して登録解除してから、通常の応答（成功／通常エラー）を書き始める。これに
-/// より「通常応答の書き込み開始後に発生した panic」では緊急応答を送らず、既存の
-/// 接続断側（[`crate::recovery::commit_boundary`] の abort バックストップ）に倒す
-/// ―― フレーム途中への緊急応答混入・二重応答を構造的に排除する。
+/// `wire-server::simple_query::execute_and_respond` が「outcome を決定する区間」
+/// （`engine.execute_sql_in_session` の呼び出しを含むブロック）だけを本ガードで
+/// 包む契約 ―― ブロックを抜けた（＝ engine から戻った）直後にこのガードが
+/// レキシカルに drop されて登録解除されてから、通常の応答（成功／通常エラー）を
+/// 書き始める。これにより「通常応答の書き込み開始後に発生した panic」では緊急
+/// 応答を送らず、既存の接続断側（[`crate::recovery::commit_boundary`] の abort
+/// バックストップ）に倒す ―― フレーム途中への緊急応答混入・二重応答を構造的に
+/// 排除する。呼び出し元がこの境界をブロックスコープで表現し、`drop()` の明示
+/// 呼び出しに頼らないのは、応答書き込み開始前に必ず解除される構造そのものを
+/// 保証するため（手動 `drop` は後から差し込まれたコードに取り残されうる）。
 ///
 /// `must_use` は束縛忘れ（`let _ = ...` による即座の drop）を検出するための注記
 /// （[`crate::recovery::commit_boundary::ResponseBoundaryGuard`] と同じ理由）。
@@ -88,12 +107,14 @@ pub struct EmergencyResponseRegistration {
 
 impl EmergencyResponseRegistration {
     /// `response_bytes`（事前エンコード済み ErrorResponse 全体）と `stream`
-    /// （書き込み先。呼び出し元が `TcpStream::try_clone()` で用意し、必要な
-    /// write timeout を設定済みのものを渡す契約）を登録する。
+    /// （書き込み先。呼び出し元が `TcpStream::try_clone()` で用意したものを渡す
+    /// 契約）、`write_timeout`（実際に緊急応答を書き込む直前にのみ適用する write
+    /// timeout。[`EmergencyChannelEntry`] のドキュメント参照）を登録する。
     ///
     /// フック内でのアロケーション・整形失敗を避けるため、`response_bytes` は
     /// 呼び出し元が事前に確定済みのバイト列として渡す（フック内で新規に
-    /// エンコードしない）。
+    /// エンコードしない）。`write_timeout` の値自体もここではソケットへ設定
+    /// しない（[`EmergencyChannelEntry`] 参照）。
     ///
     /// 登録時点の [`commit_boundary::current_response_boundary_generation`] を
     /// 併せて捕捉する。呼び出し元（`wire-server::simple_query::
@@ -102,10 +123,10 @@ impl EmergencyResponseRegistration {
     /// 仮に `None`（アクティブなガードなし）で登録された場合は、
     /// [`emergency_send_decision`] が常に偽と判定するため送信されない側
     /// （fail-closed）に倒れる。
-    pub fn register(response_bytes: Vec<u8>, stream: TcpStream) -> Self {
+    pub fn register(response_bytes: Vec<u8>, stream: TcpStream, write_timeout: Duration) -> Self {
         let generation = commit_boundary::current_response_boundary_generation();
         EMERGENCY_RESPONSE_CHANNEL.with(|c| {
-            *c.borrow_mut() = Some((response_bytes, stream, generation));
+            *c.borrow_mut() = Some((response_bytes, stream, generation, write_timeout));
         });
         Self { _private: () }
     }
@@ -202,7 +223,9 @@ fn try_send_emergency_response() -> bool {
         }
     });
 
-    let registered_generation = channel.as_ref().and_then(|(_, _, generation)| *generation);
+    let registered_generation = channel
+        .as_ref()
+        .and_then(|(_, _, generation, _)| *generation);
 
     if !emergency_send_decision(pending_generation, registered_generation) {
         return false;
@@ -211,9 +234,19 @@ fn try_send_emergency_response() -> bool {
     // ここまで到達した時点で channel は Some（emergency_send_decision が真の
     // ため registered_generation も Some ―― channel が None なら
     // registered_generation も None になり判定は偽になっている）。
-    let Some((response_bytes, mut stream, _generation)) = channel else {
+    let Some((response_bytes, mut stream, _generation, write_timeout)) = channel else {
         return false;
     };
+
+    // 緊急応答を書き込む直前にのみ write timeout を適用する（登録時には設定
+    // しない理由は [`EmergencyChannelEntry`] のドキュメント参照）。プロセスは
+    // この直後に unwind の続き（`commit_boundary` 側ガードの abort）で終了する
+    // ため、設定を元に戻す必要はない。設定自体が失敗しても、呼び出し元
+    // （`wire-server::simple_query::execute_and_respond`）が渡すクローンは
+    // 接続受理直後に `server.rs` が設定した既定の読み書きタイムアウト
+    // （`wire-server::limits::READ_TIMEOUT`。無期限ではなく有界値）をまだ
+    // 引き継いでいるため、以降の書き込みが無期限にブロックすることはない。
+    let _ = stream.set_write_timeout(Some(write_timeout));
 
     // 書き込み・flush の両方が成功した場合のみ「送信を観測できた」とみなす。
     // 部分書き込み・タイムアウト・I/O エラーはすべて失敗として扱い、緊急応答は
@@ -277,8 +310,11 @@ mod tests {
         );
 
         {
-            let _registration =
-                EmergencyResponseRegistration::register(vec![1, 2, 3], server_stream);
+            let _registration = EmergencyResponseRegistration::register(
+                vec![1, 2, 3],
+                server_stream,
+                Duration::from_secs(5),
+            );
             assert!(
                 EMERGENCY_RESPONSE_CHANNEL.with(|c| c.borrow().is_some()),
                 "registration must be visible while the guard is alive"
@@ -319,13 +355,16 @@ mod tests {
         // 世代）。commit は伴わせず、ガードごと drop する。
         {
             let _guard_a = commit_boundary::ResponseBoundaryGuard::new();
-            let _registration =
-                EmergencyResponseRegistration::register(vec![b'E', 0, 0, 0, 4], server_stream);
+            let _registration = EmergencyResponseRegistration::register(
+                vec![b'E', 0, 0, 0, 4],
+                server_stream,
+                Duration::from_secs(5),
+            );
 
             // ガード a を drop する前に、ここまでの登録済み世代を検証する
             // （後続の commit がこの世代と一致しないことを示すための前提確認）。
-            let registered_generation =
-                EMERGENCY_RESPONSE_CHANNEL.with(|c| c.borrow().as_ref().and_then(|(_, _, g)| *g));
+            let registered_generation = EMERGENCY_RESPONSE_CHANNEL
+                .with(|c| c.borrow().as_ref().and_then(|(_, _, g, _)| *g));
             assert!(
                 registered_generation.is_some(),
                 "registration inside an active guard must capture Some(generation)"
@@ -392,8 +431,11 @@ mod tests {
             .expect("set read timeout");
         let (server_stream, _) = listener.accept().expect("accept");
 
-        let _registration =
-            EmergencyResponseRegistration::register(vec![b'E', 0, 0, 0, 4], server_stream);
+        let _registration = EmergencyResponseRegistration::register(
+            vec![b'E', 0, 0, 0, 4],
+            server_stream,
+            Duration::from_secs(5),
+        );
 
         // このスレッドには commit_boundary 側の pending 状態が一切立っていない
         // （このテストは commit を一切行わない）ため、登録があっても送信されない
