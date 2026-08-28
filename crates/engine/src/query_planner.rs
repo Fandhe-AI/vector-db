@@ -384,11 +384,35 @@ impl<'a> JsonParser<'a> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let cp = self.parse_hex4()?;
-                            // サロゲートペア（絵文字等）は非対応（応答フィールドは
-                            // 検索語・ヒント用途の短い文字列であり、非対応時は
-                            // fail-closed に拒否すれば十分。範囲外コードポイントは
-                            // 置換文字へ丸める）。
-                            out.push(char::from_u32(u32::from(cp)).unwrap_or('\u{fffd}'));
+                            if (0xd800..=0xdbff).contains(&cp) {
+                                // 高位サロゲート: 直後に `\uXXXX` 形式の低位サロゲート
+                                // が続く場合のみ、正規のサロゲートペアとして 1 個の
+                                // 補助平面コードポイントへ復号する（絵文字等）。
+                                if self.bump() != Some(b'\\') || self.bump() != Some(b'u') {
+                                    return Err(PlanError::InvalidResponse);
+                                }
+                                let low = self.parse_hex4()?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    // 低位サロゲートが続かない = 孤立した高位サロゲート。
+                                    // 破損文字列を U+FFFD へ丸めて正常応答として返すと
+                                    // fail-closed 方針に反するため拒否する
+                                    // （codex-review PR #252 P2 指摘）。
+                                    return Err(PlanError::InvalidResponse);
+                                }
+                                let scalar = 0x10000u32
+                                    + (u32::from(cp) - 0xd800) * 0x400
+                                    + (u32::from(low) - 0xdc00);
+                                out.push(char::from_u32(scalar).ok_or(PlanError::InvalidResponse)?);
+                            } else if (0xdc00..=0xdfff).contains(&cp) {
+                                // ペアの相方を伴わない孤立した低位サロゲートも不正な
+                                // JSON 文字列表現であり、fail-closed に拒否する。
+                                return Err(PlanError::InvalidResponse);
+                            } else {
+                                out.push(
+                                    char::from_u32(u32::from(cp))
+                                        .ok_or(PlanError::InvalidResponse)?,
+                                );
+                            }
                         }
                         _ => return Err(PlanError::InvalidResponse),
                     }
@@ -661,6 +685,13 @@ pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 /// HTTP 応答ヘッダ部（ステータス行＋ヘッダ）として受理する最大バイト数。
 const MAX_HTTP_HEADER_BYTES: usize = 8 * 1024;
+/// `Transfer-Encoding: chunked` デコード中にストリームから読み取る総バイト数
+/// （デコード後データだけでなく、チャンクサイズ行・CRLF 等のオーバーヘッドも含む）の
+/// 上限。デコード後データは [`MAX_RESPONSE_BYTES`] で頭打ちにしているが、1 バイトずつの
+/// 極小チャンクを大量に返す応答ではチャンクメタデータのオーバーヘッドだけが際限なく
+/// 蓄積しうる（codex-review PR #252 P1 指摘）。オーバーヘッドを含む受信総量そのものに
+/// 独立した上限を設けて無制限アロケーションを防ぐ（AGENTS.md 入力検証方針）。
+const MAX_CHUNKED_TOTAL_BYTES: usize = MAX_RESPONSE_BYTES * 8;
 
 /// [`OllamaClient`] の接続構成。
 #[derive(Debug, Clone)]
@@ -932,8 +963,20 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
     let mut read_buf = [0u8; 4096];
     let mut out: Vec<u8> = Vec::new();
     let mut pos = 0usize;
+    // ストリームから読み取った総バイト数（チャンクサイズ行・CRLF オーバーヘッドを含む）。
+    // `buf` の増分ごとに加算し [`MAX_CHUNKED_TOTAL_BYTES`] で頭打ちにする。
+    let mut total_received: usize = buf.len();
 
     loop {
+        // 前反復までに処理済みの先頭領域（`buf[..pos]`）を破棄する。破棄せずに
+        // 追記のみ続けると、`buf` 自体の確保量が受信総量に比例して際限なく
+        // 増え続ける（total_received の上限チェックだけでは “その時点までの
+        // ピークメモリ” を抑えられない）ため、処理済み分は都度解放する。
+        if pos > 0 {
+            buf.drain(0..pos);
+            pos = 0;
+        }
+
         let size_line_end = loop {
             if let Some(rel) = find_subslice(&buf[pos..], b"\r\n") {
                 break pos + rel;
@@ -944,6 +987,12 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
             let n = stream.read(&mut read_buf).map_err(classify_io_error)?;
             if n == 0 {
                 return Err(PlanError::InvalidResponse);
+            }
+            total_received = total_received
+                .checked_add(n)
+                .ok_or(PlanError::ResponseTooLarge)?;
+            if total_received > MAX_CHUNKED_TOTAL_BYTES {
+                return Err(PlanError::ResponseTooLarge);
             }
             buf.extend_from_slice(&read_buf[..n]);
         };
@@ -978,6 +1027,12 @@ fn dechunk_body(stream: &mut TcpStream, mut buf: Vec<u8>) -> Result<Vec<u8>, Pla
             let n = stream.read(&mut read_buf).map_err(classify_io_error)?;
             if n == 0 {
                 return Err(PlanError::InvalidResponse);
+            }
+            total_received = total_received
+                .checked_add(n)
+                .ok_or(PlanError::ResponseTooLarge)?;
+            if total_received > MAX_CHUNKED_TOTAL_BYTES {
+                return Err(PlanError::ResponseTooLarge);
             }
             buf.extend_from_slice(&read_buf[..n]);
         }
@@ -1186,6 +1241,41 @@ mod tests {
         assert_eq!(value, JsonValue::String("AB".to_string()));
     }
 
+    // 回帰テスト（codex-review PR #252 P2 指摘対応）: 正規のサロゲートペアは
+    // 補助平面のコードポイント 1 個へ復号され、孤立サロゲート（相方を伴わない
+    // 高位・低位サロゲート）は破損文字列を U+FFFD へ丸めて返さず fail-closed に
+    // 拒否する。
+    #[test]
+    fn parse_json_decodes_surrogate_pair_to_supplementary_plane_char() {
+        // U+1F600 (😀) の UTF-16 サロゲートペア表現。
+        let value = parse_json("\"\\ud83d\\ude00\"").unwrap();
+        assert_eq!(value, JsonValue::String("\u{1f600}".to_string()));
+    }
+
+    #[test]
+    fn parse_json_rejects_isolated_high_surrogate() {
+        assert_eq!(
+            parse_json("\"\\ud800\"").unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn parse_json_rejects_isolated_low_surrogate() {
+        assert_eq!(
+            parse_json("\"\\udc00\"").unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn parse_json_rejects_high_surrogate_not_followed_by_low_surrogate() {
+        assert_eq!(
+            parse_json("\"\\ud800\\u0041\"").unwrap_err(),
+            PlanError::InvalidResponse
+        );
+    }
+
     // --- OllamaClient: プロセス内 TCP スタブサーバー経由の結合テスト ---
 
     /// 1 接続だけを受理し、`handler` が返すバイト列をそのまま応答として返す最小の
@@ -1362,6 +1452,37 @@ mod tests {
         let text = client.complete("q").unwrap();
         let expansion = parse_expansion(&text).unwrap();
         assert!(expansion.search_terms.is_empty());
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: `dechunk_body` はデコード後
+    // データを `MAX_RESPONSE_BYTES` で頭打ちにしているが、1 バイトの極小チャンクを
+    // チャンク拡張パラメータ（`;` 以降のジャンク文字列）で水増しして大量に送る
+    // 応答では、デコード後データはごく小さいままチャンクメタデータの
+    // オーバーヘッドだけが際限なく蓄積しうる。`MAX_CHUNKED_TOTAL_BYTES` による
+    // 受信総量の独立した上限で拒否されることを確認する。
+    #[test]
+    fn ollama_client_rejects_chunked_metadata_overhead_flood() {
+        let addr = spawn_stub_server(|_req| {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+            // 各チャンクはデータ 1 バイトのみだが、チャンクサイズ行に 4000 バイトの
+            // 拡張ジャンクを付け、これを 2100 回繰り返す。デコード後データ総量は
+            // 2100 バイト（`MAX_RESPONSE_BYTES` の 1MiB を大きく下回る）のままだが、
+            // オーバーヘッド総量は約 8.4MiB に達し `MAX_CHUNKED_TOTAL_BYTES`
+            // （`MAX_RESPONSE_BYTES` の 8 倍 = 8MiB）を超える。
+            let extension = "a".repeat(4000);
+            for _ in 0..2100 {
+                out.extend_from_slice(format!("1;{extension}\r\n").as_bytes());
+                out.extend_from_slice(b"X\r\n");
+            }
+            out.extend_from_slice(b"0\r\n\r\n");
+            out
+        });
+        let client = OllamaClient::new(config_for(addr));
+        assert_eq!(
+            client.complete("q").unwrap_err(),
+            PlanError::ResponseTooLarge
+        );
     }
 
     #[test]
