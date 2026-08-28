@@ -706,12 +706,13 @@ fn map_rls_error(e: RlsError) -> CoreError {
 /// のエラーを一本化しつつ、不可視行と不存在行を [`CoreError::NotFound`] に統合する
 /// （呼び出し元へ存在情報を漏らさないため。エラーメッセージはプログラム出力文字列のため英語）。
 ///
-/// `#[non_exhaustive]` は付与しない: 本 enum は本 PR より前から公開済みであり、
-/// 後付けで `#[non_exhaustive]` を付けると下流の網羅的 `match` がコンパイル不能に
-/// なる（それ自体が破壊的変更のため、`#[non_exhaustive]` 化で互換性を装うのではなく
-/// 付けないままにする。codex-review PR #252 P1 指摘）。本 PR で追加した
-/// `QueryPlannerUnavailable`／`QueryPlanning` variant の追加自体は、`non_exhaustive`
-/// 化の有無に関わらず既存の網羅的 `match` を壊す破壊的変更であることに変わりはない
+/// `#[non_exhaustive]` は付与しない: 本 enum は既に公開済みであり、後付けで
+/// `#[non_exhaustive]` を付けると下流の網羅的 `match` がコンパイル不能になる
+/// （それ自体が破壊的変更のため、`#[non_exhaustive]` 化で互換性を装うのではなく
+/// 付けないままにする。codex-review PR #252 P1 指摘）。`QueryPlannerUnavailable`・
+/// `QueryPlanning`（TASK-110・PLAN-1）・`EmbedderUnavailable`・`QueryEmbedding`
+/// （TASK-114・PLAN-10）を含む variant の追加は、`non_exhaustive` 化の有無に
+/// 関わらず既存の網羅的 `match` を壊す破壊的変更であることに変わりはない
 /// （PR 本文の変更点に明記する）。
 #[derive(Debug)]
 pub enum CoreError {
@@ -754,6 +755,15 @@ pub enum CoreError {
     /// LLM クエリプランニング（TASK-110・PLAN-1）のプロンプト組み立て・LLM 呼び出し・
     /// 応答パースのいずれかが失敗した（詳細は [`crate::query_planner::PlanError`]）。
     QueryPlanning(crate::query_planner::PlanError),
+    /// 再埋め込み規則（TASK-114・PLAN-10）の [`Self::plan_and_embed_query`] が
+    /// 呼ばれたが [`Self::embedder`] が未注入だった（ファイル形 `INSERT` の
+    /// embedder 未構成拒否と同じ fail-closed 方針。既定で参照実装を暗黙採用しない）。
+    EmbedderUnavailable,
+    /// 再埋め込み規則（TASK-114・PLAN-10）の [`Self::plan_and_embed_query`] における
+    /// 再埋め込み（[`crate::query_planner::reembed_expansion`]）が失敗した
+    /// （テーブル宣言次元と embedder 次元の不一致・埋め込みサービスの不正応答等。
+    /// 詳細は [`crate::embedding::EmbedError`]）。
+    QueryEmbedding(crate::embedding::EmbedError),
 }
 
 impl std::fmt::Display for CoreError {
@@ -779,6 +789,8 @@ impl std::fmt::Display for CoreError {
             }
             CoreError::QueryPlannerUnavailable => write!(f, "no query planner configured"),
             CoreError::QueryPlanning(e) => write!(f, "core query planning error: {e}"),
+            CoreError::EmbedderUnavailable => write!(f, "no embedder configured"),
+            CoreError::QueryEmbedding(e) => write!(f, "core query embedding error: {e}"),
         }
     }
 }
@@ -807,6 +819,12 @@ enum PlannerBinding {
     Single(Box<dyn crate::query_planner::LlmClient>),
     /// TASK-115・PLAN-8 のティア別クライアント注入（`crate::tiering::TieredPlanner`）。
     Tiered(crate::tiering::TieredPlanner),
+}
+
+impl From<crate::embedding::EmbedError> for CoreError {
+    fn from(e: crate::embedding::EmbedError) -> Self {
+        CoreError::QueryEmbedding(e)
+    }
 }
 
 impl From<StorageError> for CoreError {
@@ -1413,6 +1431,63 @@ impl EngineCore {
         let response = client.complete(&prompt)?;
         let expansion = crate::query_planner::parse_expansion(&response)?;
         Ok((expansion, classification))
+    }
+
+    /// `table` に対する自然言語 `question` を [`Self::plan_query`]（TASK-110・PLAN-1）で
+    /// 展開し、展開結果を再埋め込み規則（TASK-114・PLAN-10）に従って再埋め込みした
+    /// [`crate::query_planner::EmbeddedQuery`] を返す。`VectorCore` trait へは昇格しない
+    /// 固有メソッド（[`Self::plan_query`] と同じ理由。`core-api-check` の対象外）。
+    ///
+    /// 処理順序（fail-closed。`incremental.rs::chunk_phase` が embedder 次元不一致を
+    /// チャンク化・埋め込みサービス呼び出しより前に検出する前例と同じ流儀で、
+    /// LLM 呼び出しという比較的高コストな I/O の前に構成不備を検出する）:
+    /// 1. [`Self::embedder`] 未注入は [`CoreError::EmbedderUnavailable`] で拒否
+    /// 2. 対象テーブルの宣言次元（`VECTOR(N)`）と `embedder.dim()` の不一致は
+    ///    [`CoreError::QueryEmbedding`]（[`crate::embedding::EmbedError::DimMismatch`]）で拒否
+    /// 3. [`Self::plan_query`] で LLM 展開（`query_planner` 未注入は既存の
+    ///    [`CoreError::QueryPlannerUnavailable`]。LLM 展開が失敗した場合はここで
+    ///    エラーが伝播し、以降の埋め込み呼び出しは実行しない）
+    /// 4. [`crate::query_planner::reembed_expansion`] で再埋め込み
+    ///
+    /// テーブルスキーマ参照は `execute_insert_sql`
+    /// 等の既存経路（`self.storage.get_table_schema`）と同じ流儀を用い、新規の
+    /// RLS バイパス経路は作らない（対象はテーブル構造メタデータでありテナント行
+    /// データではないため、`ctx` によるフィルタ対象外。`(table, ctx)` に対する
+    /// テナント境界の担保は [`Self::plan_query`] 内の [`Self::dictionary_snapshot`]
+    /// が引き続き担う）。
+    pub fn plan_and_embed_query(
+        &self,
+        ctx: &PolicyContext,
+        table: &str,
+        question: &str,
+    ) -> Result<crate::query_planner::EmbeddedQuery, CoreError> {
+        let embedder = self
+            .embedder
+            .as_deref()
+            .ok_or(CoreError::EmbedderUnavailable)?;
+
+        let schema = self.storage.get_table_schema(table)?;
+        let table_dim = schema.vector_dim().ok_or_else(|| {
+            CoreError::Catalog(CatalogError::Invalid(
+                "table has no VECTOR column".to_string(),
+            ))
+        })?;
+        let embedder_dim = embedder.dim();
+        if embedder_dim != table_dim {
+            return Err(CoreError::QueryEmbedding(
+                crate::embedding::EmbedError::DimMismatch {
+                    expected: table_dim,
+                    got: embedder_dim as usize,
+                },
+            ));
+        }
+
+        let expansion = self.plan_query(ctx, table, question)?;
+        let embedding = crate::query_planner::reembed_expansion(embedder, question, &expansion)?;
+        Ok(crate::query_planner::EmbeddedQuery {
+            expansion,
+            embedding,
+        })
     }
 
     /// SQL 表層の単一文実行エントリポイント（TASK-75、対象ビヘイビア: SQL-1〜4）。
