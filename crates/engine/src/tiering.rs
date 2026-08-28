@@ -20,6 +20,10 @@
 //! 上限超過などの縮退時は [`QuestionClass::Intent`]（＝高精度ティア）へ倒す。
 //! 誤って対話ティア（軽量）に倒して品質劣化するより、高精度ティアでレイテンシを
 //! 払う側を安全側とする（「正解を含むデータ群を広く返す」設計思想と整合）。
+//! 同じ理由で、抽象的な手掛かり語（[`TieringCriteria::abstraction_cues`]）と
+//! 辞書シンボル名の両方に一致した質問は [`QuestionClass::Abstraction`]（＝高精度
+//! ティア）を優先する（[`classify`] ドキュメンテーションコメント「優先順」参照。
+//! Bugbot 指摘対応・PR #261。この優先順を逆に「戻す」修正はしないこと）。
 //!
 //! untrusted 入力対応: `question` は wire 経由の未検証入力であるため、添字アクセス・
 //! `unwrap`/`expect` を使わず、決定的・線形時間のトークナイズのみを行う
@@ -227,11 +231,20 @@ fn extension_of(token: &str) -> Option<&str> {
 /// 使う純粋関数）。
 ///
 /// 優先順（本リポの実装既定。`docs/design/query-tiering-criteria.md` も参照）:
-/// 1. トークンが辞書シンボル名（[`Dictionary::symbols`]）に完全一致 → [`QuestionClass::Direct`]
-/// 2. パス様トークン（[`Dictionary::file_tree`] のパスへの一致、または
+/// 1. パス様トークン（[`Dictionary::file_tree`] のパスへの一致、または
 ///    `criteria.path_like_extensions` の拡張子を持つトークン）→ [`QuestionClass::Direct`]
-/// 3. `criteria.abstraction_cues` に一致する手掛かり語を含む → [`QuestionClass::Abstraction`]
+/// 2. `criteria.abstraction_cues` に一致する手掛かり語を含む → [`QuestionClass::Abstraction`]
+/// 3. トークンが辞書シンボル名（[`Dictionary::symbols`]）に完全一致 → [`QuestionClass::Direct`]
 /// 4. 上記以外 → [`QuestionClass::Intent`]
+///
+/// パス一致より後段（手掛かり語より後）でシンボル一致を判定する理由（Bugbot 指摘
+/// 対応・PR #261）: Rust コーパスの辞書シンボル名には `new`・`main`・`read` のような
+/// 一般英語と衝突するありふれた識別子が大量に含まれる。シンボル完全一致を手掛かり語
+/// より優先すると、「概要を説明して」のような抽象的な質問が、たまたま本文中に
+/// 一致した識別子だけを理由に対話ティア（軽量）へ誤ってルーティングされ、
+/// fail-safe の方向（迷ったら高精度側）と逆になる。一方でパス様トークンは
+/// `.` + 既知拡張子、または辞書の生パスとの完全一致を要求するため、一般英語との
+/// 衝突が起きにくく、従来どおり手掛かり語より優先してよい。
 ///
 /// 空入力・[`MAX_QUESTION_CHARS`] 超過・[`MAX_TOKENS`] 超過は縮退値として fail-safe 側
 /// （[`QuestionClass::Intent`]）へ倒す。
@@ -270,17 +283,9 @@ pub fn classify(
         return fail_safe(ClassificationSignal::Degenerate);
     }
 
-    // シンボル名（`BTreeSet<Symbol>` の決定的な反復順序。`dictionary.rs`
-    // モジュールドキュメント「決定性」参照）と ASCII 小文字化トークンを比較する。
-    let symbol_names: BTreeSet<String> = dictionary
-        .symbols
-        .iter()
-        .map(|s| ascii_lower(&s.name))
-        .collect();
-    if tokens.iter().any(|t| symbol_names.contains(t)) {
-        return make(QuestionClass::Direct, ClassificationSignal::SymbolMatch);
-    }
-
+    // パス様トークン（拡張子付き、または辞書の生パスとの完全一致）を最優先で
+    // 判定する。一般英語との衝突が起きにくく、手掛かり語より先に判定してよい
+    // （`classify` ドキュメンテーションコメント「優先順」参照）。
     let path_tokens: BTreeSet<String> = dictionary
         .file_tree
         .paths
@@ -297,13 +302,14 @@ pub fn classify(
         return make(QuestionClass::Direct, ClassificationSignal::PathMatch);
     }
 
-    // ASCII cue（英語手掛かり語）はトークン完全一致のまま維持し、通常の英単語
-    // （"design" など）が他語の部分文字列として誤爆しないようにする。一方で
-    // 日本語（非 ASCII）cue は日本語文に語間空白が無いため、空白区切り
-    // トークンとの完全一致がほぼ成立しない（codex-review 指摘: PR #261）。
-    // 非 ASCII cue のみ、正規化済み質問文字列全体への部分一致（substring）で
-    // 判定する。fail-safe の方向は変えず、判定漏れ（見逃し）を減らす側の
-    // 変更にとどめる。
+    // 手掛かり語一致は辞書シンボル一致より先に判定する（Bugbot 指摘対応・PR #261。
+    // `classify` ドキュメンテーションコメント「優先順」参照）。ASCII cue（英語
+    // 手掛かり語）はトークン完全一致のまま維持し、通常の英単語（"design" など）
+    // が他語の部分文字列として誤爆しないようにする。一方で日本語（非 ASCII）cue
+    // は日本語文に語間空白が無いため、空白区切りトークンとの完全一致がほぼ
+    // 成立しない（codex-review 指摘: PR #261）。非 ASCII cue のみ、正規化済み
+    // 質問文字列全体への部分一致（substring）で判定する。fail-safe の方向は
+    // 変えず、判定漏れ（見逃し）を減らす側の変更にとどめる。
     let normalized_question = ascii_lower(question);
     let has_abstraction_cue = criteria.abstraction_cues.iter().any(|cue| {
         if cue.is_ascii() {
@@ -317,6 +323,19 @@ pub fn classify(
             QuestionClass::Abstraction,
             ClassificationSignal::AbstractionCue,
         );
+    }
+
+    // シンボル名（`BTreeSet<Symbol>` の決定的な反復順序。`dictionary.rs`
+    // モジュールドキュメント「決定性」参照）と ASCII 小文字化トークンを比較する。
+    // 手掛かり語一致より後段で判定する理由は `classify` ドキュメンテーション
+    // コメント「優先順」参照（Bugbot 指摘対応・PR #261）。
+    let symbol_names: BTreeSet<String> = dictionary
+        .symbols
+        .iter()
+        .map(|s| ascii_lower(&s.name))
+        .collect();
+    if tokens.iter().any(|t| symbol_names.contains(t)) {
+        return make(QuestionClass::Direct, ClassificationSignal::SymbolMatch);
     }
 
     make(QuestionClass::Intent, ClassificationSignal::NoCue)
@@ -413,7 +432,11 @@ mod tests {
     fn symbol_match_yields_direct_and_dialogue_tier() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("what does parse_expansion do", &dict, &criteria);
+        // 手掛かり語を含まない質問文で純粋なシンボル一致を検証する（手掛かり語が
+        // 混在する場合は Abstraction が優先される。下記
+        // `abstraction_cue_takes_priority_over_symbol_match` 参照。Bugbot 指摘
+        // 対応・PR #261）。
+        let result = classify("call parse_expansion now", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -437,6 +460,36 @@ mod tests {
         assert_eq!(result.class, QuestionClass::Abstraction);
         assert_eq!(result.tier, Tier::HighPrecision);
         assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
+    }
+
+    #[test]
+    fn abstraction_cue_takes_priority_over_symbol_match() {
+        // Bugbot 指摘（PR #261）: Rust コーパスの辞書には `new`・`main`・`read` の
+        // ような一般英語と衝突するありふれた識別子が大量に含まれるため、シンボル
+        // 完全一致を手掛かり語より優先すると、説明・意図の質問（抽象 cue を含む
+        // 文）が対話ティアへ誤ってルーティングされ fail-safe の方向と逆になる。
+        // 手掛かり語（"explain"／"how"）と辞書シンボル名（"new"）の両方に一致する
+        // 質問が Abstraction（＝高精度ティア）へ分類されることを確認する。
+        let dict = dictionary_with_symbol("new", "src/lib.rs");
+        let criteria = TieringCriteria::default();
+        let result = classify("explain how the new parser works", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Abstraction);
+        assert_eq!(result.tier, Tier::HighPrecision);
+        assert_eq!(result.signal, ClassificationSignal::AbstractionCue);
+    }
+
+    #[test]
+    fn symbol_match_without_abstraction_cue_still_yields_direct() {
+        // 上記 `abstraction_cue_takes_priority_over_symbol_match` と対をなす
+        // 回帰テスト: 手掛かり語を含まない質問では、従来どおりシンボル完全一致が
+        // Direct（対話ティア）へ分類されることを固定する（優先順の変更が
+        // シンボル一致そのものを壊していないことの確認）。
+        let dict = dictionary_with_symbol("new", "src/lib.rs");
+        let criteria = TieringCriteria::default();
+        let result = classify("call new to construct the parser", &dict, &criteria);
+        assert_eq!(result.class, QuestionClass::Direct);
+        assert_eq!(result.tier, Tier::Dialogue);
+        assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
     }
 
     #[test]
@@ -535,7 +588,7 @@ mod tests {
     fn trailing_punctuation_does_not_block_symbol_match() {
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("what is parse_expansion?", &dict, &criteria);
+        let result = classify("call parse_expansion?", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -558,7 +611,7 @@ mod tests {
         // （Bugbot 指摘: Backticks block symbol and path matches）。
         let dict = dictionary_with_symbol("parse_expansion", "src/query_planner.rs");
         let criteria = TieringCriteria::default();
-        let result = classify("what does `parse_expansion` do", &dict, &criteria);
+        let result = classify("call `parse_expansion` now", &dict, &criteria);
         assert_eq!(result.class, QuestionClass::Direct);
         assert_eq!(result.tier, Tier::Dialogue);
         assert_eq!(result.signal, ClassificationSignal::SymbolMatch);
@@ -652,7 +705,7 @@ mod tests {
             Box::new(RecordingClient::new("high_precision")),
             TieringCriteria::default(),
         );
-        let (client, classification) = planner.select("what is parse_expansion", &dict);
+        let (client, classification) = planner.select("call parse_expansion", &dict);
         assert_eq!(classification.tier, Tier::Dialogue);
         let response = client.complete("prompt").unwrap();
         assert!(response.contains("dialogue"));

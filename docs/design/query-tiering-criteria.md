@@ -16,8 +16,12 @@ Issue #77（TASK-115）は、LLM クエリプランニング（TASK-110・`query
   `crate::tiering::tier_for_class` に実装済み（`Direct → Dialogue`、`Intent`・
   `Abstraction → HighPrecision`）。
 - 判定は決定的・線形時間のルールベース（`crate::tiering::classify`）で、辞書的情報源
-  （TASK-109・`dictionary.rs`）から得たシンボル名・パスへの一致を優先し、次に手掛かり語
-  一致、いずれにも一致しなければ意図型（`Intent`）とする。優先順・各シグナルの詳細は
+  （TASK-109・`dictionary.rs`）のパス様トークン一致を最優先とし、次に手掛かり語一致
+  （抽象的な言い回し）、次に辞書シンボル名への完全一致、いずれにも一致しなければ
+  意図型（`Intent`）とする。手掛かり語一致をシンボル名一致より先に判定するのは、
+  一般英語と衝突しうるありふれた識別子（`new`・`main`・`read` 等）を辞書シンボル名が
+  含みうるため、説明・意図の質問が対話ティアへ誤ってルーティングされるのを防ぐ
+  fail-safe 上の判断（Bugbot 指摘対応・PR #261）。優先順・各シグナルの詳細は
   `crate::tiering::classify` のドキュメンテーションコメントを参照。
 - fail-safe の方向: 空入力・上限超過等の縮退時は `Intent`（＝高精度ティア）へ倒す
   （品質を優先する側を安全側とする）。
