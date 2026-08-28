@@ -1100,13 +1100,27 @@ fn read_fixed_length_body(
 }
 
 /// 長さ情報を持たない応答本文を、接続が閉じられる（`read` が 0 を返す）まで読む。
+///
+/// ループ先頭の上限チェックは、`extend_from_slice` の直後に必ず次の反復の先頭で
+/// 再評価されるため、`body.len()` が [`MAX_RESPONSE_BYTES`] を超えたまま `break`
+/// （＝ `Ok(body)` での返却）へ到達する経路は無い（`break` は `n == 0` の分岐のみで
+/// 発生し、その分岐へは毎回このチェックを通過してから到達するため）。ただし
+/// 1 回の `read` が無条件に最大 4096 バイトを取り込むため、`body` が上限を最大
+/// 4095 バイト一時的に超過しうる（返り値としては次の反復で確実に拒否されるが、
+/// 一時的な超過アロケーション自体は避けたい）。ヘッダ読み取りループ（本ファイル
+/// 該当箇所）と同様に、残り許容量までに読み取り量を制限し、超過分を一度も
+/// `body` へ取り込まないようにする（codex-review PR #252 P1 指摘）。
 fn read_until_eof_bounded(stream: &mut TcpStream, mut body: Vec<u8>) -> Result<Vec<u8>, PlanError> {
     let mut read_buf = [0u8; 4096];
     loop {
         if body.len() >= MAX_RESPONSE_BYTES {
             return Err(PlanError::ResponseTooLarge);
         }
-        let n = stream.read(&mut read_buf).map_err(classify_io_error)?;
+        let remaining = MAX_RESPONSE_BYTES - body.len();
+        let read_len = remaining.min(read_buf.len());
+        let n = stream
+            .read(&mut read_buf[..read_len])
+            .map_err(classify_io_error)?;
         if n == 0 {
             break;
         }
@@ -1561,6 +1575,28 @@ mod tests {
         let addr = spawn_stub_server(|_req| {
             let len = MAX_RESPONSE_BYTES + 1;
             format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes()
+        });
+        let client = OllamaClient::new(config_for(addr));
+        assert_eq!(
+            client.complete("q").unwrap_err(),
+            PlanError::ResponseTooLarge
+        );
+    }
+
+    // 回帰テスト（codex-review PR #252 P1 指摘対応）: `Content-Length` も
+    // `Transfer-Encoding: chunked` も無い応答（EOF まで読み取る経路。
+    // `read_until_eof_bounded`）で、本文が `MAX_RESPONSE_BYTES` を 1 バイト超えた
+    // 場合に `ResponseTooLarge` を返すことを確認する（`Content-Length` 経由の
+    // `ollama_client_rejects_oversized_response` は同経路をカバーしないため、
+    // 独立した回帰として追加する）。
+    #[test]
+    fn ollama_client_rejects_oversized_response_on_eof_path() {
+        let addr = spawn_stub_server(|_req| {
+            let body = vec![b'a'; MAX_RESPONSE_BYTES + 1];
+            let mut response =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_vec();
+            response.extend_from_slice(&body);
+            response
         });
         let client = OllamaClient::new(config_for(addr));
         assert_eq!(
