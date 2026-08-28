@@ -2000,10 +2000,12 @@ impl EngineCore {
             }
             // TASK-78（SQL-6）: `EXPLAIN SELECT ... USING PLAN(...)` は検索本体
             // （ハイブリッド実行）を実行しない。行うのは LIMIT 範囲検証 →
-            // `USING MODE` リテラル検証 → 辞書必須列（`path`/`body`）の事前
-            // スキーマ検証 → LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
+            // 辞書必須列（`path`/`body`）の事前スキーマ検証 → `USING MODE`
+            // リテラル・`VECTOR` 列・投影列／`WHERE` 述語の事前束縛検証
+            // （[`crate::sql::using_plan::pre_check_bindable`]。PR #267 の是正
+            // 対応）→ LLM クエリ展開・モード解決（`Self::plan_query_with_mode`）
             // までで、すべての拒否を LLM I/O 開始前に完結させる（`Statement::Select`
-            // アームの `USING PLAN` 経路〔PR #266 の是正方針〕を踏襲。
+            // アームの `USING PLAN` 経路〔PR #266・#267 の是正方針〕を踏襲。
             // security.md「不安全な設計」対応）。再埋め込み（`Embedder`）は
             // 応答に不要なため呼ばない（`embedder` 未注入でも `EXPLAIN` 可能）。
             crate::sql::allowlist::Statement::Explain(validated) => {
@@ -2033,6 +2035,22 @@ impl EngineCore {
                 };
                 dictionary_required_columns(&pre_check_schema)
                     .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
+
+                // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
+                // 事前束縛検証（codex-review P1 指摘・Cursor Bugbot 指摘対応、PR
+                // #267）: `Statement::Select` アームの `USING PLAN` 経路（上記
+                // ドキュメント・[`crate::sql::using_plan::pre_check_bindable`]
+                // 参照）と同じ理由で、`EXPLAIN` 経路もこの検証を LLM I/O
+                // （`plan_query_with_mode` 内のクエリ展開）より前に完結させる。
+                // 従来この検証を欠いていたため、対応する通常 `SELECT ... USING
+                // PLAN(...)` なら `22000`（未知列・型不正 WHERE・未登録 UDF）で
+                // 拒否されるはずのクエリが、`EXPLAIN` 経由では LLM I/O まで実行した
+                // うえで成功してしまっていた。
+                crate::sql::using_plan::pre_check_bindable(
+                    &validated,
+                    &pre_check_schema,
+                    session.udfs(),
+                )?;
 
                 let planned = self
                     .plan_query_with_mode(

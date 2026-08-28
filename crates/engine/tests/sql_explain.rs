@@ -507,6 +507,94 @@ fn explain_rejects_invalid_using_mode_before_invoking_query_planner() {
 }
 
 #[test]
+fn explain_rejects_unknown_projection_column_before_invoking_query_planner() {
+    // codex-review P1・Cursor Bugbot 指摘（PR #267）の判別テスト:
+    // `EXPLAIN` 経路も `Statement::Select` の `USING PLAN` 経路（PR #266・
+    // `sql_using_plan.rs::using_plan_rejects_unknown_projection_column_before_invoking_query_planner`）
+    // と同じく、投影列の束縛（`sql::parser::bind_projection`、`22000`）を
+    // I/O 前の `pre_check_schema` で検証すべき。未知列は構文上は受理されるが
+    // 束縛不能で必ず拒否される。
+    let path = unique_db_path("sql-explain-unknown-projection");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT no_such_column FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("unknown projected column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "unknown projection column must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
+fn explain_rejects_unknown_where_column_before_invoking_query_planner() {
+    // 上のテストの対（`WHERE` 述語側）。`sql::parser::bind_where_predicates`
+    // の未知列拒否（`22000`）も同じく I/O 前の `pre_check_schema` で検証される
+    // べき（PR #267 の是正対応）。
+    let path = unique_db_path("sql-explain-unknown-where");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE no_such_column = 'x' USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("unknown WHERE column must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "unknown WHERE column must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
+fn explain_rejects_unregistered_udf_call_before_invoking_query_planner() {
+    // codex-review P1・Cursor Bugbot 指摘（PR #267）の判別テスト:
+    // 投影列・`WHERE` 述語内の未登録 UDF 呼び出し（`sql::udf_call`、`22000`）も
+    // `EXPLAIN` 経路で I/O 前に拒否されるべき（`pre_check_bindable` が
+    // `session.udfs()` を渡して同じ検証を再利用する）。
+    let path = unique_db_path("sql-explain-unregistered-udf");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let planner = std::sync::Arc::new(CountingLlmClient::new(EXPANSION_RESPONSE));
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_query_planner(Box::new(ArcLlmClient(planner.clone())));
+
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT no_such_udf(id) FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect_err("unregistered UDF call must be rejected");
+    assert_eq!(err.wire_code(), "22000");
+    assert_eq!(
+        planner.call_count(),
+        0,
+        "unregistered UDF call must be rejected before the high-cost query planner call"
+    );
+}
+
+#[test]
 fn explain_does_not_write_or_execute_search() {
     // `EXPLAIN` はテーブル行データを一切返さない・書き込まないことを、実行前後で
     // 行数（`SELECT COUNT(*)`）が変化しないことにより確認する（副作用なしの回帰）。
