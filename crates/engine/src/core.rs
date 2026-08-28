@@ -2027,11 +2027,31 @@ impl EngineCore {
                     None => None,
                 };
 
-                let pre_check_schema = {
+                // 計画開始時の対象テーブル世代を記録する（codex-review P1 指摘対応、
+                // PR #267。`Statement::Select` アームの `USING PLAN` 経路〔上記
+                // ドキュメント・[`crate::catalog::table_generation_in_txn`] 参照〕と
+                // 同じ理由: `plan_query_with_mode` 内の辞書スナップショット構築・
+                // LLM クエリ展開の間に対象テーブルへの DDL（`DROP`/同名再作成含む）・
+                // 行書き込みが起きると、`EXPLAIN` が無効化された辞書由来の検索語・
+                // ヒントをあたかも現在有効な計画として返してしまう。`EXPLAIN` は
+                // 検索本体を実行しないため実データ不整合は生じないが、返す
+                // `QUERY PLAN` 自体が古いテーブル世代を前提にした偽の計画になり、
+                // 通常 `SELECT ... USING PLAN(...)` 経路の fail-closed 契約との
+                // 一貫性を欠く（security.md「不安全な設計」対応）。
+                let (pre_check_schema, planning_generation) = {
                     let (pre_check_txn, schema) =
                         self.read_txn_with_schema(validated.table_name())?;
+                    let generation = crate::catalog::table_generation_in_txn(
+                        &pre_check_txn,
+                        validated.table_name(),
+                    )
+                    .map_err(|e| {
+                        crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: format!("failed to read table generation: {e}"),
+                        }
+                    })?;
                     drop(pre_check_txn);
-                    schema
+                    (schema, generation)
                 };
                 dictionary_required_columns(&pre_check_schema)
                     .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
@@ -2063,6 +2083,43 @@ impl EngineCore {
                     .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
                         detail: format!("EXPLAIN query expansion failed: {e}"),
                     })?;
+
+                // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #267）:
+                // `Statement::Select` アームの `USING PLAN` 経路（上記ドキュメント参照）
+                // と同じ契約を `EXPLAIN` にも適用する。新しい `read_txn` で対象
+                // テーブルの現在世代を取得し、`planning_generation` と一致しなければ
+                // `plan_query_with_mode` が使った辞書スナップショット・LLM 展開結果が
+                // 現在のテーブル世代に対して有効である保証がないため、fail-closed に
+                // 拒否する（`Internal`／`XX000`。クライアントへは
+                // `Internal::client_message()` の固定の一般化メッセージのみを返し、
+                // 他テナント・他クエリの書き込み有無という存在情報を漏らさない）。
+                let (post_check_txn, post_check_schema) =
+                    self.read_txn_with_schema(validated.table_name())?;
+                let current_generation = crate::catalog::table_generation_in_txn(
+                    &post_check_txn,
+                    validated.table_name(),
+                )
+                .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to read table generation: {e}"),
+                })?;
+                drop(post_check_txn);
+                if current_generation != planning_generation {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "table generation changed during EXPLAIN USING PLAN query \
+                                 expansion; rejecting stale plan"
+                            .to_string(),
+                    });
+                }
+
+                // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
+                // （`Statement::Select` アームの `USING PLAN` 経路〔上記ドキュメント参照〕
+                // と同じ多層防御）: 上記の世代照合はストレージ全体の粗い世代のみを見る
+                // ため、同一世代内であってもこのスキーマが `pre_check_schema` と異なる
+                // 可能性を狭義には排除できない。現行の `bump_generation_and_commit`
+                // 実装では書き込みごとに必ず世代が進むため通常到達しないが、
+                // `dictionary_required_columns` は軽量な検証であり多層防御として維持する。
+                dictionary_required_columns(&post_check_schema)
+                    .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
                 let result = crate::sql::explain::build_explain_result(&planned);
                 Ok(crate::sql::SqlOutcome::Explain(result))
