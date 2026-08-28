@@ -932,6 +932,16 @@ pub trait VectorCore: Send + Sync {
     ) -> Result<Row, CoreError>;
 }
 
+/// [`EngineCore::plan_using_plan_expansion`] の戻り値。`USING PLAN` 経路の
+/// I/O（LLM 展開・再埋め込み）結果のみを保持し、列インデックス解決（スキーマ
+/// 依存）は含まない（呼び出し元が I/O 完了後に取得し直した最新スキーマで
+/// `sql::using_plan::bind_expansion` へ渡す。同メソッドのドキュメント参照）。
+struct UsingPlanExpansionResult {
+    expansion: crate::query_planner::QueryExpansion,
+    query_vector: Vec<f32>,
+    resolved_mode: crate::sql::mode::ResolvedMode,
+}
+
 /// `VectorCore` の製品実装。永続化・カタログ・アリーナ構築・検索 provider を束ねる。
 ///
 /// 実行バックエンド実装型へ直接依存せず `Box<dyn SearchProvider>` で保持する（CORE-13）。
@@ -985,6 +995,40 @@ pub struct EngineCore {
     /// [`Self::with_dictionary_config`] のみ。クエリ・セッション変数から到達できる
     /// 経路は持たない（[`Self::with_precision_policy`] と同じ流儀）。
     dictionary_config: crate::dictionary::DictionaryConfig,
+}
+
+/// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
+/// （列名の存在・`ColumnType::Text`・non-nullable の 3 条件、TASK-109・PLAN-5）を
+/// `schema` が満たすか検証し、満たす場合はそれぞれの列インデックスを返す。
+///
+/// `USING PLAN('<query>')`（TASK-77・SQL-5）の LLM 呼び出し（`EngineCore::
+/// plan_using_plan_expansion` 内の `plan_query`）は内部で `dictionary_snapshot` を
+/// 呼ぶため、この判定条件を満たさないスキーマは最終的に `dictionary_snapshot` の
+/// 失敗として現れる。呼び出し元ごとに要求するエラー型が異なる
+/// （`dictionary_snapshot` は `CoreError`、`USING PLAN` の事前検証は
+/// `SqlSurfaceError::invalid_input`〔`22000`〕）ため、本関数は判定条件のみを
+/// 共有し、固定メッセージの `String` を返す（各呼び出し元が自分の契約へ変換する。
+/// codex-review P1 指摘対応、PR #266）。
+fn dictionary_required_columns(
+    schema: &crate::catalog::TableSchema,
+) -> Result<(usize, usize), String> {
+    let path_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable)
+        .ok_or_else(|| {
+            "table has no non-nullable text path column required for dictionary extraction"
+                .to_string()
+        })?;
+    let body_idx = schema
+        .columns
+        .iter()
+        .position(|c| c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable)
+        .ok_or_else(|| {
+            "table has no non-nullable text body column required for dictionary extraction"
+                .to_string()
+        })?;
+    Ok((path_idx, body_idx))
 }
 
 impl EngineCore {
@@ -1227,33 +1271,17 @@ impl EngineCore {
             // に一致した行が黙ってスキップされ、成功応答の空/不完全な辞書を
             // 返してしまう。スキーマ不整合は fail-closed で固定メッセージの
             // `CatalogError::Invalid` として拒否し、他テナントのデータ・存在情報は
-            // 含めない）。
-            let path_idx = schema
-                .columns
-                .iter()
-                .position(|c| {
-                    c.name == "path" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
-                })
-                .ok_or_else(|| {
-                    CoreError::from(CatalogError::Invalid(
-                        "table has no non-nullable text path column required for dictionary \
-                         extraction"
-                            .to_string(),
-                    ))
-                })?;
-            let body_idx = schema
-                .columns
-                .iter()
-                .position(|c| {
-                    c.name == "body" && c.ty == crate::catalog::ColumnType::Text && !c.nullable
-                })
-                .ok_or_else(|| {
-                    CoreError::from(CatalogError::Invalid(
-                        "table has no non-nullable text body column required for dictionary \
-                         extraction"
-                            .to_string(),
-                    ))
-                })?;
+            // 含めない）。判定条件は [`dictionary_required_columns`] へ切り出し、
+            // `USING PLAN`（TASK-77・SQL-5）の LLM 呼び出し前スキーマ事前検証
+            // （`Self::execute_sql_in_session` の `Statement::Select` アーム、
+            // `using_plan()` が `Some` の分岐を参照）と単一の判定基準を共有する
+            // （codex-review P1 指摘対応、PR #266: 事前検証が無いと、この判定結果は
+            // 呼び出し元で `CoreError::Catalog(CatalogError::Invalid)` を経由して
+            // 一律 `Internal`〔`XX000`〕へ丸められ、body 列欠落等の通常の利用者
+            // スキーマ不備が本来の `SqlSurfaceError::InvalidInput`〔`22000`〕として
+            // 返らなかった）。
+            let (path_idx, body_idx) = dictionary_required_columns(&schema)
+                .map_err(|msg| CoreError::from(CatalogError::Invalid(msg)))?;
 
             let rows =
                 crate::tenant::visible_rows(&self.storage, table, ctx).map_err(|e| match e {
@@ -1651,6 +1679,42 @@ impl EngineCore {
     /// `SET search_mode = '<literal>'` はリテラル値が `recall`／`precision` のいずれか
     /// である場合にのみ `session` を更新する（検証→代入の順）。失敗した `SET` は
     /// `session` を一切変更しない（部分更新＝黙った既定化と同種の fail-open を防ぐ）。
+    /// `table_name` の `read_txn` を新規に開き、同一スナップショット上でスキーマを
+    /// 取得して両方を返す（[`Self::execute_sql_in_session`] の各 `Statement` アームが
+    /// 共有する定型処理）。呼び出し元は返した `read_txn` を、必要な処理
+    /// （束縛・`execute_statement`）が終わるまでにドロップしてよい――本メソッド自体は
+    /// 開いた `read_txn` を長時間保持しない（`USING PLAN` 経路が LLM 呼び出し・
+    /// 再埋め込みの間 `read_txn` を保持しないようにする分割の一部。呼び出し元の
+    /// モジュールドキュメント参照）。テーブル不存在は
+    /// [`crate::sql::allowlist::SqlSurfaceError::UndefinedTable`] へ丸め込む。
+    fn read_txn_with_schema(
+        &self,
+        table_name: &str,
+    ) -> Result<
+        (redb::ReadTransaction, crate::catalog::TableSchema),
+        crate::sql::allowlist::SqlSurfaceError,
+    > {
+        let read_txn = self.storage.db().begin_read().map_err(|e| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!(
+                    "failed to begin read transaction: {}",
+                    StorageError::from(e)
+                ),
+            }
+        })?;
+        let schema = crate::catalog::get_table_schema_in_txn(&read_txn, table_name).map_err(
+            |e| match e {
+                CatalogError::TableNotFound(name) => {
+                    crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                }
+                other => crate::sql::allowlist::SqlSurfaceError::Internal {
+                    detail: format!("failed to load table schema: {other}"),
+                },
+            },
+        )?;
+        Ok((read_txn, schema))
+    }
+
     pub fn execute_sql_in_session(
         &self,
         ctx: &PolicyContext,
@@ -1673,30 +1737,216 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::CreateFunction { name })
             }
             crate::sql::allowlist::Statement::Select(validated) => {
-                let read_txn = self.storage.db().begin_read().map_err(|e| {
-                    crate::sql::allowlist::SqlSurfaceError::Internal {
-                        detail: format!(
-                            "failed to begin read transaction: {}",
-                            StorageError::from(e)
-                        ),
-                    }
-                })?;
-                let schema =
-                    crate::catalog::get_table_schema_in_txn(&read_txn, &validated.table_name)
-                        .map_err(|e| match e {
-                            CatalogError::TableNotFound(name) => {
-                                crate::sql::allowlist::SqlSurfaceError::UndefinedTable { name }
+                // TASK-77（SQL-5）: `USING PLAN('<query>')` は `ORDER BY` の代替
+                // （相互排他）のため、`validated.using_plan()` の有無で束縛経路を
+                // 分岐する。この経路は `sql::parser::bind_in_session` を呼ばない
+                // （`bind_ranking` が `OrderByForm::UsingPlan` を防御的に拒否する
+                // ことと対になる：正規の分岐は必ずここで行われる）。
+                //
+                // `USING PLAN` 経路は `plan_using_plan_expansion` 内で LLM 呼び出し・
+                // 再埋め込み（`plan_query`・`Embedder::embed_batch`）という
+                // 長時間の I/O を行う。この I/O の間、`execute_statement` 用の
+                // `read_txn` を保持し続けると、redb のスナップショットが I/O 完了
+                // まで固定され続けページ回収不能になるうえ、`plan_query` が内部で
+                // 取得する `dictionary_snapshot` が後続のハイブリッドスキャンと
+                // 異なる世代のデータを読む可能性がある（Cursor Bugbot Medium
+                // 指摘対応）。そのため I/O 自体（`plan_using_plan_expansion`）は
+                // スキーマに依存しない形（展開結果と再埋め込み済み query vector の
+                // 生成のみ）で `read_txn` を開かずに完了させ、I/O 完了後に
+                // `execute_statement` 用の `read_txn` とスキーマを新規に取得し、
+                // その同一スナップショット上で `sql::using_plan::bind_expansion`
+                // （列インデックス解決を含む束縛）を行ってから `execute_statement`
+                // へ渡す（codex-review P1 指摘対応: 以前は I/O 前に取得した旧
+                // スキーマで列インデックスを含む `BoundStatement` を確定し、I/O 後に
+                // 取得し直した最新スキーマとの一致検証なしに旧束縛を
+                // `execute_statement` へ渡していたため、I/O 中に同名テーブルの
+                // `DROP TABLE`→再作成等でレイアウトが変わると、束縛済みの列
+                // インデックスが別の列を指す状態になり得た。他経路と同じく
+                // 列インデックス解決を含む束縛〜`execute_statement` は単一
+                // スナップショットへ閉じ込める）。
+                //
+                // 不変条件の防御的検証（codex-review P1 指摘対応、PR #266）:
+                // `order_by` が [`crate::sql::allowlist::OrderByForm::UsingPlan`] で
+                // あることと `using_plan()` が `Some` であることは本来一対一で
+                // 対応する必要がある（`sql::allowlist::ValidatedStatement::
+                // with_using_plan` のドキュメント参照）。`validate_sql` の内部
+                // パーサーは常に両者を揃えて構築するが、`ValidatedStatement::new`
+                // （`order_by` を無検証で受け取る公開 constructor）経由で外部から
+                // `order_by == UsingPlan` かつ `using_plan() == None` の矛盾した
+                // 値を構築される可能性を完全には排除できないため、分岐前に
+                // ここで検証し、矛盾していれば内部エラーとして拒否する
+                // （fail-closed。到達は公開 API の誤用時のみの防御的経路）。
+                let order_by_is_using_plan = matches!(
+                    validated.order_by(),
+                    crate::sql::allowlist::OrderByForm::UsingPlan
+                );
+                if order_by_is_using_plan != validated.using_plan().is_some() {
+                    return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                        detail: "inconsistent USING PLAN state: order_by and using_plan disagree"
+                            .to_string(),
+                    });
+                }
+                let bound_result = if let Some(question) = validated.using_plan() {
+                    // `LIMIT` の範囲検証（codex-review P1 指摘対応、PR #266）:
+                    // 従来は範囲検証（`22000`）が `sql::using_plan::bind_expansion`
+                    // 内、すなわち下記の `plan_using_plan_expansion`（辞書スナップ
+                    // ショット構築＋LLM クエリ展開＋再埋め込み）・スキーマ事前検証用
+                    // `read_txn` のいずれよりも後で行われていた。`LIMIT 0`／
+                    // `LIMIT 4294967295` のように構文上は受理されるが必ず拒否される
+                    // 入力でも、検証が高コスト処理・DB I/O の後段にあると外部 API・
+                    // CPU・メモリ・DB スナップショット取得を consume させてしまい、
+                    // untrusted 入力によるリソース増幅になる。fail-closed な拒否は
+                    // I/O 開始前に完結させる。`bind_expansion` 側の検証（下記）は
+                    // 多層防御として残し、この前倒しチェックとの間で挙動・
+                    // `wire_code`・メッセージが食い違わないよう同一関数
+                    // （[`crate::sql::parser::validate_search_limit`]）を共有する。
+                    crate::sql::parser::validate_search_limit(validated.limit())?;
+
+                    // I/O（LLM 呼び出し）前のスキーマ事前検証（codex-review P1 指摘
+                    // 対応、PR #266）: `plan_using_plan_expansion` 内の `plan_query` は
+                    // `dictionary_snapshot`（LLM プロンプトの固定接頭辞構築用）を
+                    // 経由するが、`dictionary_snapshot` が `path`/`body` 列の存在・
+                    // 型・nullability 不備で失敗すると `CoreError::Catalog(
+                    // CatalogError::Invalid)` に丸め込まれ、`plan_using_plan_expansion`
+                    // の `map_err` で一律 `Internal`（`XX000`）へ変換されてしまう。
+                    // body 列欠落・非 TEXT 等の通常の利用者スキーマ不備は本来
+                    // `SqlSurfaceError::InvalidInput`（`22000`）であるべきなので、
+                    // 同じ判定条件（[`dictionary_required_columns`]）を LLM 呼び出し
+                    // 前にこの位置で検証し、満たさなければ `22000` で即座に拒否する
+                    // （`read_txn` は判定用のスキーマを読んだら即 drop し、I/O の間
+                    // 保持しない。上記コメントの分割方針を踏襲）。この事前検証を
+                    // 通過した後に `dictionary_snapshot` 自身が失敗する場合
+                    // （デコード不整合・世代競合の再試行枯渇・走査量上限超過等）は
+                    // 真にサーバー側の内部/一時的障害であり、引き続き `Internal`
+                    // として扱う。
+                    // 計画開始時の世代を記録する（codex-review P1 指摘対応、PR #266。
+                    // 対象テーブル限定化: codex-review P1 再指摘、PR #266）:
+                    // `plan_using_plan_expansion` は `dictionary_snapshot`（LLM プロンプト
+                    // 用の固定接頭辞）を、下記の I/O 前スキーマ検証に使う
+                    // `pre_check_txn` とは別スナップショットの内部 `read_txn` から構築する
+                    // （`DictionaryCache` のドキュメント参照）。I/O（LLM 呼び出し・
+                    // 再埋め込み）の間に対象テーブルが `DROP TABLE`→同名再作成される、
+                    // またはデータ・スキーマが更新されると、計画時の辞書語彙（旧テーブル
+                    // 由来）による展開・再埋め込みベクトルが、I/O 完了後に新規取得する
+                    // 最新スキーマ・行データ（新テーブル）へ適用され、テーブルの同一性を
+                    // 跨いだ不整合な結果になりうる。当初 `storage.current_generation()`
+                    // （ストレージ全体で任意の write commit ごとに単調増加する世代）で
+                    // 照合していたが、書き込みが継続する運用では無関係な他テーブル・
+                    // 他テナントへの通常の書き込みが 1 回でも I/O 中に完了しただけで
+                    // `USING PLAN` が恒常的に `XX000` 拒否される可用性問題を生む
+                    // （codex-review P1 再指摘）。対象テーブル（`validated.table_name`）
+                    // 固有の世代 [`crate::catalog::table_generation_in_txn`] へ切り替え、
+                    // 当該テーブルの DDL（`CREATE`/`DROP`/`ALTER TABLE`）・行書き込みが
+                    // あった場合にのみ拒否する（`crate::catalog::
+                    // bump_table_generation_in_txn` のドキュメント参照。書き込み経路
+                    // すべてで commit 前に呼ばれる契約）。無関係な他テーブルへの書き込みは
+                    // 本世代へ影響しない。`user_rows/{table_name}` は複数テナントの行を
+                    // 同居させる単一の物理テーブルのため、同一テーブルへの他テナントの
+                    // 書き込みは本世代の対象に含める（拒否側に倒す）: `dictionary_snapshot`
+                    // が読む行集合は `tenant::visible_rows`（`ctx` に基づく RLS 可視性
+                    // 判定。TASK-137・RLS-6, RLS-7）を経由するため、他テナントが
+                    // `Visibility::Public`/`Shared` で書き込んだ行は要求元テナントの
+                    // 辞書内容にも影響しうる。行ごとの可視性を見ずにテーブル単位で
+                    // 一括して拒否側へ倒すのは過剰検知（他テナントの `Private` 専用の
+                    // 書き込みまで拒否対象に含む）を許容する設計判断であり、テナント
+                    // 単位の精密な世代を持たないことの限界だが、fail-open で見逃す
+                    // よりも安全側に倒す（security.md「fail-closed を維持する」）。
+                    // 再計画（辞書再構築・再展開）は行わず、単純に拒否する。
+                    let (pre_check_schema, planning_generation) = {
+                        let (pre_check_txn, schema) =
+                            self.read_txn_with_schema(&validated.table_name)?;
+                        let generation = crate::catalog::table_generation_in_txn(
+                            &pre_check_txn,
+                            &validated.table_name,
+                        )
+                        .map_err(|e| {
+                            crate::sql::allowlist::SqlSurfaceError::Internal {
+                                detail: format!("failed to read table generation: {e}"),
                             }
-                            other => crate::sql::allowlist::SqlSurfaceError::Internal {
-                                detail: format!("failed to load table schema: {other}"),
-                            },
                         })?;
-                let bound = crate::sql::parser::bind_in_session(
-                    &validated,
-                    &schema,
-                    session.search_mode(),
-                    session.udfs(),
-                )?;
+                        drop(pre_check_txn);
+                        (schema, generation)
+                    };
+                    dictionary_required_columns(&pre_check_schema).map_err(|msg| {
+                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
+                    })?;
+
+                    // `USING MODE` リテラル・`VECTOR` 列の存在・投影列／`WHERE` 述語の
+                    // 事前束縛検証（codex-review P1 指摘対応、PR #266）: 上記の辞書用
+                    // `path`/`body` 列検証・`LIMIT` 範囲検証と同じ理由で、これらも
+                    // I/O（`plan_using_plan_expansion`）より前に完結させる（多層防御
+                    // として I/O 後の再束縛でも同じ検証を通す。詳細は
+                    // [`crate::sql::using_plan::pre_check_bindable`] のドキュメント参照）。
+                    crate::sql::using_plan::pre_check_bindable(
+                        &validated,
+                        &pre_check_schema,
+                        session.udfs(),
+                    )?;
+
+                    let planned =
+                        self.plan_using_plan_expansion(ctx, session, &validated, question)?;
+                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+
+                    // I/O 完了後の世代照合（codex-review P1 指摘対応、PR #266。対象
+                    // テーブル限定化: codex-review P1 再指摘、PR #266）: 上記コメントの
+                    // とおり、`planning_generation` と現在の**対象テーブル**世代が
+                    // 一致しなければ、計画時に使った辞書スナップショット・展開結果・
+                    // 再埋め込みベクトルが現在のテーブル世代に対して有効である保証が
+                    // ないため、fail-closed に拒否する（`SqlSurfaceError::Internal`。
+                    // `plan_using_plan_expansion` 自体の既存 fail-closed 契約
+                    // 〔本メソッドのドキュメント参照〕と同じ `XX000` 分類を使い、新規
+                    // 分類は追加しない。クライアントへは `Internal::client_message()`
+                    // による固定の一般化メッセージのみを返し、他テナント・他クエリの
+                    // 書き込み有無という存在情報を漏らさない）。無関係な他テーブルへの
+                    // 書き込みでは変化しない世代（[`crate::catalog::table_generation_in_txn`]。
+                    // 上記の計画開始時取得箇所のコメント参照）を使うため、書き込みが
+                    // 継続する運用でも対象テーブル・辞書が無変化であれば拒否されない。
+                    let current_generation =
+                        crate::catalog::table_generation_in_txn(&read_txn, &validated.table_name)
+                            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: format!("failed to read table generation: {e}"),
+                        })?;
+                    if current_generation != planning_generation {
+                        return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                            detail: "table generation changed during USING PLAN query \
+                                     expansion; rejecting stale plan"
+                                .to_string(),
+                        });
+                    }
+
+                    // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
+                    // （codex-review P1 指摘対応、PR #266）: 上記の世代照合は
+                    // ストレージ全体の粗い世代のみを見るため、同一世代内であっても
+                    // このスキーマが `pre_check_schema` と異なる可能性を狭義には
+                    // 排除できない（世代不変条件が将来変わった場合の多層防御。
+                    // 現行の `bump_generation_and_commit` 実装では書き込みごとに
+                    // 必ず世代が進むため通常到達しないが、`dictionary_required_columns`
+                    // は軽量な検証であり多層防御として維持する）。
+                    dictionary_required_columns(&schema).map_err(|msg| {
+                        crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
+                    })?;
+
+                    let bound = crate::sql::using_plan::bind_expansion(
+                        &validated,
+                        &schema,
+                        question,
+                        &planned.expansion,
+                        planned.query_vector,
+                        session.udfs(),
+                        planned.resolved_mode,
+                    )?;
+                    (read_txn, schema, bound)
+                } else {
+                    let (read_txn, schema) = self.read_txn_with_schema(&validated.table_name)?;
+                    let bound = crate::sql::parser::bind_in_session(
+                        &validated,
+                        &schema,
+                        session.search_mode(),
+                        session.udfs(),
+                    )?;
+                    (read_txn, schema, bound)
+                };
+                let (read_txn, schema, bound) = bound_result;
                 let result = crate::sql::exec::execute_statement(
                     &read_txn,
                     self.provider.as_ref(),
@@ -1738,6 +1988,154 @@ impl EngineCore {
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
         }
+    }
+
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）経路のうち、スキーマに依存しない
+    /// I/O 部分（LLM によるクエリ展開・再埋め込み）だけを行う。呼び出し元は
+    /// [`Self::execute_sql_in_session`] の `Statement::Select` アームのみ
+    /// （`validated.using_plan()` が `Some` のとき）。`self.embedder`／
+    /// `self.query_planner` はいずれも private フィールドで `sql::using_plan`
+    /// （束縛の純粋なロジックのみを持つ）からは不可視なため、これらへアクセスする
+    /// 処理（LLM 展開・再埋め込みの実行そのもの）は本メソッドに置く。
+    ///
+    /// 列インデックス解決（`sql::using_plan::bind_expansion`）は本メソッドに含めない
+    /// （codex-review P1 指摘対応。呼び出し元が本メソッドの結果を使って I/O 完了後に
+    /// 取得し直した最新スキーマ・`read_txn` の下で `bind_expansion` を呼ぶことで、
+    /// I/O 中の DDL によるスキーマ食い違いを避ける。上記呼び出し元アームの
+    /// ドキュメント参照）。
+    ///
+    /// fail-closed: プランナー未注入・埋め込み未注入・展開失敗・再埋め込み失敗は
+    /// いずれも [`crate::sql::allowlist::SqlSurfaceError::Internal`]（`XX000`。ERR-2
+    /// の既存分類。新規分類は追加しない）で拒否する。detail には [`CoreError`]／
+    /// [`crate::embedding::EmbedError`] の固定文言（プロンプト本文・LLM 応答本文を
+    /// 含まない、`query_planner.rs`・`embedding.rs` の P0 方針）のみを使う。
+    fn plan_using_plan_expansion(
+        &self,
+        ctx: &PolicyContext,
+        session: &crate::sql::mode::SessionState,
+        validated: &crate::sql::allowlist::ValidatedStatement,
+        question: &str,
+    ) -> Result<UsingPlanExpansionResult, crate::sql::allowlist::SqlSurfaceError> {
+        let embedder = self.embedder.as_deref().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "no embedder configured for USING PLAN".to_string(),
+            }
+        })?;
+
+        // `plan_query`（辞書スナップショット構築＋ LLM 呼び出し、高コスト I/O）より
+        // 前に、展開前の原質問（`query_planner::sanitize_question` を通した後）だけで
+        // 疎側の入力上限（`sparse::validate_query_bounds`）を満たせるか検証する
+        // （codex-review P1 + Cursor Bugbot Medium 指摘対応、PR #266）。展開は検索語を
+        // 追加するだけで既存の語を減らさないため、原質問の時点で `MAX_QUERY_BYTES`・
+        // `MAX_QUERY_TERMS` を超える場合、展開後の検証（本メソッド末尾。多層防御として
+        // 残す）まで待っても絶対に成功しえない。特に `MAX_QUESTION_CHARS` 文字以内の
+        // CJK 質問は、`sparse::tokenize` が CJK 文字ごとに unigram／隣接文字との
+        // bigram を生成するため、バイト長は上限内でも一意語数だけが
+        // `MAX_QUERY_TERMS` を超えうる。ここで前倒し拒否しないと、成功不能な入力の
+        // ためだけに辞書スナップショット構築・LLM 呼び出しという I/O を消費してから
+        // 22000 で拒否することになり、untrusted 入力によるリソース増幅になる。
+        let sanitized_question = crate::query_planner::sanitize_question(question);
+        crate::sparse::validate_query_bounds(&sanitized_question).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "hybrid query text exceeds allowed length",
+            )
+        })?;
+
+        let expansion = self
+            .plan_query(ctx, validated.table_name(), question)
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("USING PLAN query expansion failed: {e}"),
+            })?;
+
+        // PLAN-10 ポインタ: 密側（再埋め込み）と疎側（`hybrid_search` の全文検索側）は
+        // 別々のテキストを使う（codex-review P1 指摘対応、PR #266）。密側は
+        // `query_planner::render_reembedding_text` が課す既存の再埋め込み規則
+        // （固定接頭辞 `search_query: `・`MAX_SEARCH_TERMS`/`MAX_TERM_LEN` による
+        // 検索語の防御的上限）に必ず従わせる。`sql::using_plan::expanded_query_text`
+        // （接頭辞なし・上限なしの単純結合）をそのまま `embed_batch` へ渡すと、既存の
+        // 増分索引・クエリ展開受け入れ検証（TASK-114・PLAN-10）が前提とする再埋め込み
+        // 入力と異なるベクトルになり、両経路の Recall 特性が食い違う。疎側の検索
+        // テキストは従来どおり `expanded_query_text`（`sql::using_plan::bind_expansion`
+        // が疎側へ渡す）を使う。
+        let sparse_query_text = crate::sql::using_plan::expanded_query_text(question, &expansion);
+
+        // 疎側 `hybrid_search`（`sparse::SparseIndex::search`/`search_within`）が
+        // 課すクエリ入力検証（`MAX_QUERY_BYTES`・`MAX_QUERY_TERMS`）を、密側の
+        // 再埋め込み（`embedder.embed_batch`、高コスト I/O）より前に行う
+        // （codex-review P1 指摘対応、PR #266）。`expanded_query_text` は原質問
+        // （最大 `MAX_QUESTION_CHARS` 文字）＋展開検索語（最大 `MAX_SEARCH_TERMS` 件 ×
+        // `MAX_TERM_LEN` 文字）を無条件に連結するため、CJK のような多バイト文字を
+        // 多用する展開結果では文字数上限内でも結合後のバイト長が `MAX_QUERY_BYTES` を
+        // 超えうる。検証を後段の `hybrid_search` 呼び出し時
+        // （`sql::exec::map_hybrid_error`）にのみ委ねると、再埋め込みという高コスト
+        // I/O を消費してから拒否することになり、untrusted 入力によるリソース増幅に
+        // なる。fail-closed（`22000`。`map_hybrid_error` が `hybrid_search` 経由で
+        // 課す既存のエラー契約と同一の `wire_code`・文言）でここで前倒し拒否する
+        // （`map_hybrid_error` 側の検証は多層防御として残る）。
+        crate::sparse::validate_query_bounds(&sparse_query_text).map_err(|_| {
+            crate::sql::allowlist::SqlSurfaceError::invalid_input(
+                "hybrid query text exceeds allowed length",
+            )
+        })?;
+
+        // 密側の再埋め込み対象は `query_planner::render_reembedding_text`
+        // （TASK-114・PLAN-10）が課す既存の再埋め込み規則（固定接頭辞・検索語の
+        // 防御的上限）に従わせる。次元検証・非有限値検証は本メソッドでは行わず、
+        // 呼び出し元 `execute_sql_in_session` が I/O 完了後に呼ぶ
+        // `sql::using_plan::bind_expansion` に一本化する（TASK-77 が当初から採る
+        // 既存の役割分担。両検証の実装は `bind_expansion` 内、`vector_column` に
+        // よる次元突き合わせ・非有限値拒否の箇所を参照）。
+        let dense_query_text = crate::query_planner::render_reembedding_text(question, &expansion);
+        let embedded = embedder
+            .embed_batch(&[dense_query_text.as_str()])
+            .map_err(|e| crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: format!("USING PLAN re-embedding failed: {e}"),
+            })?;
+        // 要求は 1 件（`dense_query_text` の 1 要素スライス）のため、応答も
+        // 厳密に 1 件でなければ untrusted な `Embedder` 実装の契約違反として
+        // fail-closed に拒否する（codex-review P1 指摘対応、PR #266）。
+        // 以前は `into_iter().next()` で先頭 1 件のみを黙って採用しており、
+        // 複数ベクトルを返す契約違反応答を成功として扱っていた。
+        // `query_planner::reembed_expansion` が課す同種の検証
+        // （`vectors.len() != 1` を `EmbedError::InvalidResponse` で拒否）と
+        // 揃えつつ、本メソッドの既存エラー契約（`SqlSurfaceError::Internal`・
+        // `XX000`）は変えない最小差分とする。
+        if embedded.len() != 1 {
+            return Err(crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "embedder returned unexpected vector count for USING PLAN query"
+                    .to_string(),
+            });
+        }
+        let query_vector = embedded.into_iter().next().ok_or_else(|| {
+            crate::sql::allowlist::SqlSurfaceError::Internal {
+                detail: "embedder returned no vector for USING PLAN query".to_string(),
+            }
+        })?;
+
+        // `USING MODE`／`SET search_mode` の優先順位解決は既存の検索 SELECT 経路
+        // （`sql::parser::bind_in_session`）と同一の規則（クエリ句 > セッション変数 >
+        // 既定）を踏襲する。スキーマに依存しないためここで解決してよい。
+        let query_mode = match validated.search_mode() {
+            Some(literal) => Some(crate::sql::mode::SearchMode::parse_literal(literal)?),
+            None => None,
+        };
+        // TASK-164（PLAN-11）: プランナー推定（`expansion.mode_hint`）も優先順位
+        // 解決へ含める（明示指定〔クエリ句・セッション変数〕> プランナー推定 >
+        // 既定。codex-review P1 指摘対応: 従来はここで `resolve_mode` を使い
+        // `expansion.mode_hint` を素通しで捨てていたため、明示指定もセッション
+        // 設定もない `USING PLAN` クエリでプランナーが `precision` と推定しても
+        // 常に既定の `recall` になっていた）。
+        let resolved_mode = crate::sql::mode::resolve_mode_with_planner(
+            query_mode,
+            session.search_mode(),
+            expansion.mode_hint,
+        );
+
+        Ok(UsingPlanExpansionResult {
+            expansion,
+            query_vector,
+            resolved_mode,
+        })
     }
 
     /// `table` へ新規行を 1 件挿入する（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -3303,6 +3701,556 @@ mod tests {
         assert!(
             dict_after.file_tree.paths.is_empty(),
             "the new config (file tree disabled) must take effect, not a stale cached dictionary"
+        );
+    }
+
+    // codex-review P1 回帰（PR #266）: `USING PLAN` の I/O フェーズ
+    // （`plan_using_plan_expansion`）はスキーマに依存せず、列インデックス解決
+    // （`sql::using_plan::bind_expansion`）は I/O 完了後に取得し直した最新スキーマ
+    // に対して行う。以前は I/O 前に取得した旧スキーマで列インデックスを含む
+    // `BoundStatement` を確定していたため、I/O 中に同名テーブルの
+    // `DROP TABLE`→再作成でレイアウトが変わると、束縛済みの列インデックスが
+    // 別の列を指す状態になり得た（`execute_sql_in_session` の `Statement::Select`
+    // アーム・[`EngineCore::plan_using_plan_expansion`] のドキュメント参照）。
+    // ここでは `execute_sql_in_session` と同じ 2 段階（I/O → 束縛）を直接呼び出し、
+    // 段階間に DDL を挟んで、列インデックスが post-I/O スキーマを反映することを
+    // 固定する。
+    #[test]
+    fn using_plan_binds_column_indices_against_the_schema_fetched_after_io_not_before() {
+        struct StubLlmClient;
+        impl crate::query_planner::LlmClient for StubLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }))
+            .with_query_planner(Box::new(StubLlmClient));
+
+        // 旧レイアウト: [embedding, path, body]（body index = 2）。
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table (old layout)");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id_old = OperationId::parse("using-plan-race-old").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("old-path".to_string()),
+                crate::row_codec::Value::Text("old-body".to_string()),
+            ],
+            &op_id_old,
+        )
+        .expect("insert row (old layout)");
+
+        let session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let stmt = crate::sql::allowlist::validate_sql(sql, &core.storage).expect("valid sql");
+        let validated = match stmt {
+            crate::sql::allowlist::Statement::Select(v) => v,
+            other => panic!("expected Select statement, got {other:?}"),
+        };
+        let question = validated.using_plan().expect("USING PLAN present");
+
+        // I/O フェーズ（スキーマに依存しない）。
+        let planned = core
+            .plan_using_plan_expansion(&ctx, &session, &validated, question)
+            .expect("plan_using_plan_expansion should succeed");
+
+        // I/O 完了後・束縛前に DDL が挟まる（同名テーブルの列順を入れ替えて再作成）。
+        core.storage.drop_table("docs").expect("drop table");
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table (new layout)");
+        let op_id_new = OperationId::parse("using-plan-race-new").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            2,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("new-body".to_string()),
+                crate::row_codec::Value::Text("new-path".to_string()),
+            ],
+            &op_id_new,
+        )
+        .expect("insert row (new layout)");
+
+        // I/O 完了後に取得し直した最新スキーマで束縛する（本テストの検証対象。
+        // 呼び出し元 `execute_sql_in_session` の `Statement::Select` アームと同じ手順）。
+        let (read_txn, schema) = core
+            .read_txn_with_schema("docs")
+            .expect("read_txn_with_schema should succeed");
+        let bound = crate::sql::using_plan::bind_expansion(
+            &validated,
+            &schema,
+            question,
+            &planned.expansion,
+            planned.query_vector,
+            session.udfs(),
+            planned.resolved_mode,
+        )
+        .expect("bind_expansion should succeed against the post-I/O schema");
+
+        match bound.ranking() {
+            crate::sql::parser::Ranking::Hybrid {
+                text_column_index, ..
+            } => assert_eq!(
+                *text_column_index, 1,
+                "text_column_index must reflect the post-I/O schema (body at index 1), not the \
+                 pre-I/O one (index 2)"
+            ),
+            other => panic!("expected Ranking::Hybrid, got {other:?}"),
+        }
+
+        let result = crate::sql::exec::execute_statement(
+            &read_txn,
+            core.provider.as_ref(),
+            &ctx,
+            &schema,
+            &bound,
+            &core.precision_policy,
+        )
+        .expect("execute_statement should succeed");
+        let row = result
+            .rows
+            .iter()
+            .find(|r| r.id == 2)
+            .expect("row inserted under the new layout should be visible");
+        assert_eq!(
+            row.cells,
+            vec![crate::sql::exec::Cell::Text("new-path".to_string())],
+            "projected `path` must resolve against the post-I/O schema, not stale pre-I/O indices"
+        );
+    }
+
+    // codex-review P1 回帰（PR #266）: `USING PLAN` の I/O フェーズ
+    // （`plan_using_plan_expansion`）は計画開始時のテーブル世代を保持せず、I/O
+    // 完了後は新しい `read_txn`・スキーマを取得するだけで、計画時との世代一致を
+    // 照合していなかった。この間に対象テーブルの `DROP TABLE`→同名再作成が挟まると、
+    // 旧テーブルの語彙（辞書スナップショット）による展開・再埋め込みベクトルが
+    // 新テーブルへ適用され、テーブルの同一性を跨いだ不整合な結果になり得た。
+    // 上記の `using_plan_binds_column_indices_against_the_schema_fetched_after_io_not_before`
+    // は列インデックスが post-I/O スキーマを正しく反映することを固定するが、
+    // 「世代不一致そのものを検出して拒否する」契約は別に固定する必要がある。
+    // ここでは `execute_sql_in_session` を直接駆動し（`Statement::Select` アームの
+    // 2 段階〔I/O → 束縛〕を経由する唯一の呼び出し元）、`LlmClient::complete`
+    // コールバック（I/O フェーズの内部）から対象テーブルを `DROP TABLE`→再作成して
+    // 世代を進め、fail-closed に `SqlSurfaceError::Internal` で拒否されることを
+    // 検証する（修正前は `read_txn_with_schema` が新テーブルのスキーマ・
+    // `read_txn` を黙って返し、クエリが成功していた）。
+    #[test]
+    fn execute_sql_in_session_rejects_using_plan_when_table_generation_changes_during_io() {
+        // `LlmClient::complete`（I/O フェーズの内部）から対象テーブルを
+        // `DROP TABLE`→再作成するには、構築中の `EngineCore` 自身（の
+        // `storage` フィールド）へアクセスする必要がある。`Box<dyn LlmClient>`
+        // は `'static` 境界を要求するため借用では持ち回せず、`unsafe`（生
+        // ポインタ）も使わない（`tests/isa.rs::
+        // unsafe_is_confined_to_isa_module_with_safety_comments` が
+        // `crates/engine/src/**/*.rs` 中 `isa.rs` 以外の `unsafe` を禁止する）。
+        // そこで `OnceLock<Weak<EngineCore>>` による安全な二段階初期化
+        // （`EngineCore` は wire-server で実際に `Arc<EngineCore>` として
+        // 共有される・`server.rs` 参照＝`Send + Sync` 済み）を使い、
+        // `complete` 呼び出し時点で必ず設定済みの `Weak` を `upgrade` して
+        // 同一 `EngineCore`（同一 `storage`）へアクセスする。
+        struct GenerationBumpingLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for GenerationBumpingLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                core.storage.drop_table("docs").expect("drop table mid-io");
+                core.storage
+                    .create_table(&TableSchema::new(
+                        "docs",
+                        vec![
+                            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                            ColumnDef::new("body", ColumnType::Text, false),
+                            ColumnDef::new("path", ColumnType::Text, false),
+                        ],
+                    ))
+                    .expect("create table mid-io (new layout)");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        // 旧レイアウト: [embedding, path, body]。
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table (old layout)");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("using-plan-gen-race").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("old-path".to_string()),
+                crate::row_codec::Value::Text("old-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row (old layout)");
+
+        // `core_cell` を `GenerationBumpingLlmClient` と外側スコープの双方で
+        // `Arc::clone` して共有する（`Box<dyn LlmClient>` へ包んだ後は具体型
+        // へ戻す公開経路が無いため、共有元は `with_query_planner` 呼び出し前に
+        // 確保しておく）。`Arc<EngineCore>` は構築完了後にしか作れないため、
+        // 二段階初期化（セル確保 → `EngineCore` 構築 → `Arc` 化 → `Weak` 登録）
+        // にする。
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(GenerationBumpingLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Err(crate::sql::allowlist::SqlSurfaceError::Internal { detail }) => {
+                assert!(
+                    detail.contains("generation changed"),
+                    "expected a generation-mismatch rejection, got: {detail}"
+                );
+            }
+            other => panic!(
+                "expected SqlSurfaceError::Internal (generation mismatch) rejection, got: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    // codex-review P1 再指摘（PR #266）: 上記
+    // `execute_sql_in_session_rejects_using_plan_when_table_generation_changes_during_io`
+    // が固定した世代照合は、当初ストレージ全体の単調増加世代
+    // （`crate::storage::current_generation_in_txn`）と比較していたため、対象テーブル
+    // （`docs`）自身は無変化でも、I/O（LLM 呼び出し）の間に**無関係な別テーブル**へ
+    // 通常の書き込みが 1 回でも完了すると `USING PLAN` が `XX000` で拒否されていた
+    // （書き込みが継続する運用では恒常的に失敗し、書き込み可能な利用者が無関係
+    // テナントの `USING PLAN` 検索を事実上妨害できる可用性問題）。対象テーブル固有の
+    // 世代（`crate::catalog::table_generation_in_txn`）へ切り替えた後は、無関係な
+    // 他テーブルへの書き込みが `docs` の世代に影響しないため、本テストは
+    // `Ok` を期待する（修正前は本テストが `fail` していたことを確認済み）。
+    #[test]
+    fn execute_sql_in_session_using_plan_succeeds_when_an_unrelated_table_is_written_during_io() {
+        // `GenerationBumpingLlmClient` と同じ二段階初期化パターン（上記テストの
+        // ドキュメントコメント参照）。ここでは `docs`（対象テーブル）ではなく
+        // `other_tenant_docs`（無関係な別テーブル・別テナント名義）を
+        // `LlmClient::complete` から書き込む。
+        struct UnrelatedTableWritingLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for UnrelatedTableWritingLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                // 対象テーブル（`docs`）とは別名の、無関係なテーブルへの通常の書き込み
+                // （別テナント名義。TenantWriteError 経由の RLS 境界付き書き込み API を
+                // 使い、テスト対象の書き込み経路〔tenant.rs〕を実際に通す）。
+                core.storage
+                    .create_table(&TableSchema::new(
+                        "other_docs",
+                        vec![
+                            ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                            ColumnDef::new("path", ColumnType::Text, false),
+                            ColumnDef::new("body", ColumnType::Text, false),
+                        ],
+                    ))
+                    .expect("create unrelated table mid-io");
+                let other_ctx =
+                    PolicyContext::new("tenant-b").expect("valid tenant for unrelated table");
+                let other_op_id =
+                    OperationId::parse("unrelated-write-mid-io").expect("valid operation_id");
+                crate::tenant::insert_typed_row(
+                    &core.storage,
+                    "other_docs",
+                    &other_ctx,
+                    1,
+                    Visibility::Public,
+                    &[
+                        crate::row_codec::Value::Vector(vec![0.5, 0.5]),
+                        crate::row_codec::Value::Text("other-path".to_string()),
+                        crate::row_codec::Value::Text("other-body".to_string()),
+                    ],
+                    &other_op_id,
+                )
+                .expect("insert row into unrelated table mid-io");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table docs");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id = OperationId::parse("using-plan-unrelated-write").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("doc-path".to_string()),
+                crate::row_codec::Value::Text("doc-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row into docs");
+
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(UnrelatedTableWritingLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Ok(crate::sql::SqlOutcome::Query(_)) => {}
+            other => panic!(
+                "expected USING PLAN to succeed despite an unrelated table being written \
+                 during I/O, got: {other:?}"
+            ),
+        }
+    }
+
+    // codex-review P1 回帰（PR #266）: `plan_using_plan_expansion` が
+    // `Embedder::embed_batch` へ渡すテキストは、`query_planner::
+    // render_reembedding_text`（固定接頭辞 `search_query: `・検索語の防御的上限
+    // つき）の出力と一致しなければならない。以前は `sql::using_plan::
+    // expanded_query_text`（接頭辞なし・上限なしの単純結合）をそのまま渡していた
+    // ため、`USING PLAN` 経路の再埋め込みベクトルが既存の増分索引・クエリ展開
+    // 受け入れ検証（TASK-114・PLAN-10）が前提とするベクトルと食い違っていた。
+    #[test]
+    fn plan_using_plan_expansion_embeds_render_reembedding_text_not_expanded_query_text() {
+        struct StubLlmClient;
+        impl crate::query_planner::LlmClient for StubLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                Ok(
+                    r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        // 呼び出し元が `embed_batch` へ渡した入力テキストをそのまま記録するスパイ
+        // 実装（`Mutex` で束ねて `Sync` を満たす。`Embedder` は `&self` のみで
+        // 呼ばれるため内部可変性が必要）。
+        struct SpyEmbedder {
+            dim: u32,
+            seen: std::sync::Mutex<Vec<String>>,
+        }
+        impl crate::embedding::Embedder for SpyEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                self.seen
+                    .lock()
+                    .expect("spy lock not poisoned")
+                    .extend(texts.iter().map(|t| t.to_string()));
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let spy = std::sync::Arc::new(SpyEmbedder {
+            dim: 2,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+
+        // `EngineCore::with_embedder` は `Box<dyn Embedder>` を要求するため、
+        // テスト側から観測を続けられるよう `Arc` を経由する薄いラッパーで包む
+        // （スパイ本体の所有権は `spy` 側にも残す）。
+        struct ArcEmbedder(std::sync::Arc<SpyEmbedder>);
+        impl crate::embedding::Embedder for ArcEmbedder {
+            fn dim(&self) -> u32 {
+                self.0.dim()
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                self.0.embed_batch(texts)
+            }
+        }
+
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(ArcEmbedder(spy.clone())))
+            .with_query_planner(Box::new(StubLlmClient));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table");
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT body FROM docs USING PLAN('find auth') LIMIT 5";
+        let stmt = crate::sql::allowlist::validate_sql(sql, &core.storage).expect("valid sql");
+        let validated = match stmt {
+            crate::sql::allowlist::Statement::Select(v) => v,
+            other => panic!("expected Select statement, got {other:?}"),
+        };
+        let question = validated.using_plan().expect("USING PLAN present");
+
+        let planned = core
+            .plan_using_plan_expansion(&ctx, &session, &validated, question)
+            .expect("plan_using_plan_expansion should succeed");
+
+        let seen = spy.seen.lock().expect("spy lock not poisoned");
+        assert_eq!(
+            seen.len(),
+            1,
+            "embed_batch must be called exactly once for USING PLAN re-embedding"
+        );
+        let expected = crate::query_planner::render_reembedding_text(question, &planned.expansion);
+        assert_eq!(
+            seen[0], expected,
+            "embed_batch input must match query_planner::render_reembedding_text output \
+             (fixed prefix + bounded search terms), not the unprefixed sparse query_text"
+        );
+        assert!(
+            seen[0].starts_with(crate::query_planner::SEARCH_QUERY_PREFIX),
+            "embed_batch input must carry the fixed re-embedding prefix"
         );
     }
 

@@ -290,7 +290,9 @@ pub fn parse_vector_literal(literal: &str, expected_dim: u32) -> Result<Vec<f32>
 /// スキーマの唯一の `VECTOR` 列（インデックス・宣言次元）を返す。`VECTOR` 列を
 /// 持たないテーブルは束縛不能（`catalog.rs::validate_schema` が「`VECTOR` 列は
 /// 高々 1 つ」を DDL 時点で強制済みのため、複数該当は構造上起こらない）。
-fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSurfaceError> {
+/// `sql::using_plan`（TASK-77・SQL-5）が `Embedder` の返すベクトルの次元検証にも
+/// 使うため `pub(crate)`。
+pub(crate) fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSurfaceError> {
     schema
         .columns
         .iter()
@@ -303,7 +305,12 @@ fn vector_column(schema: &TableSchema) -> Result<(usize, u32), SqlSurfaceError> 
 }
 
 /// `name` に一致する `Text` 列のインデックスを返す（`id` 疑似列は対象外）。
-fn text_column_index(schema: &TableSchema, name: &str) -> Result<usize, SqlSurfaceError> {
+/// `sql::using_plan`（TASK-77・SQL-5）が本文列（規約列 `body`）の解決にも使う
+/// ため `pub(crate)`。
+pub(crate) fn text_column_index(
+    schema: &TableSchema,
+    name: &str,
+) -> Result<usize, SqlSurfaceError> {
     schema
         .columns
         .iter()
@@ -384,6 +391,15 @@ fn bind_ranking(order_by: &OrderByForm, schema: &TableSchema) -> Result<Ranking,
                 query_text: query_text.clone(),
             })
         }
+        // `USING PLAN(...)`（TASK-77・SQL-5）が構文上選ばれた文には `ORDER BY` 節が
+        // 存在しない。`core.rs::EngineCore::execute_sql_in_session` は
+        // `ValidatedStatement::using_plan` が `Some` の場合に本関数（通常の
+        // `bind_in_session` 経路）を呼ばず `sql::using_plan` へ分岐するため、この
+        // アームへ到達するのは分岐条件が壊れた場合のみ。黙って既定のランキングへ
+        // 縮退させず、内部エラーとして拒否する（fail-closed）。
+        OrderByForm::UsingPlan => Err(SqlSurfaceError::Internal {
+            detail: "OrderByForm::UsingPlan must not reach bind_ranking (dispatch bug)".to_string(),
+        }),
     }
 }
 
@@ -403,6 +419,85 @@ fn default_expr_alias(expr: &Expr) -> String {
     }
 }
 
+/// SELECT リストの許可形状（[`Projection`]）を束縛する共通ヘルパー（TASK-77・
+/// SQL-5 で `bind_in_session` から切り出した。`USING PLAN` 経路（`sql::using_plan`）も
+/// 同一の投影列解決規則（実カラム優先・疑似列 `id`・`AS` エイリアス付き式項目）を
+/// 必要とするため、この 1 箇所に集約する）。
+pub(crate) fn bind_projection(
+    projection: &Projection,
+    schema: &TableSchema,
+    udfs: &crate::sql::udf_call::UdfRegistry,
+    node_budget: &mut usize,
+) -> Result<Vec<ProjectedColumn>, SqlSurfaceError> {
+    match projection {
+        Projection::All => {
+            let mut cols = Vec::with_capacity(schema.columns.len() + 1);
+            cols.push(ProjectedColumn::Id);
+            for (index, column) in schema.columns.iter().enumerate() {
+                cols.push(ProjectedColumn::Column {
+                    index,
+                    name: column.name.clone(),
+                });
+            }
+            Ok(cols)
+        }
+        Projection::Columns(names) => {
+            let mut cols = Vec::with_capacity(names.len());
+            for name in names {
+                // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
+                // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、
+                // スキーマが `id` という実カラムを持っていても常に行キー疑似列へ
+                // マップされ、実カラムの値を `SELECT id` で取得する経路がなかった）。
+                if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                    cols.push(ProjectedColumn::Column {
+                        index,
+                        name: name.clone(),
+                    });
+                    continue;
+                }
+                if name == "id" {
+                    cols.push(ProjectedColumn::Id);
+                    continue;
+                }
+                return Err(SqlSurfaceError::invalid_input(format!(
+                    "unknown column: {name}"
+                )));
+            }
+            Ok(cols)
+        }
+        Projection::Items(items) => {
+            let mut cols = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    crate::sql::allowlist::SelectItem::Column(name) => {
+                        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
+                            cols.push(ProjectedColumn::Column {
+                                index,
+                                name: name.clone(),
+                            });
+                            continue;
+                        }
+                        if name == "id" {
+                            cols.push(ProjectedColumn::Id);
+                            continue;
+                        }
+                        return Err(SqlSurfaceError::invalid_input(format!(
+                            "unknown column: {name}"
+                        )));
+                    }
+                    crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
+                        let (bound, _ty) =
+                            crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
+                        let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
+                        cols.push(ProjectedColumn::Computed { name, expr: bound });
+                    }
+                }
+            }
+            Ok(cols)
+        }
+    }
+}
+
 /// `WHERE` 句の許可述語列（[`WherePredicate`]）を束縛する共通ヘルパー
 /// （TASK-166・SQL-13 で `bind_in_session` から切り出した。検索 SELECT
 /// （[`bind_in_session`]）・集計 SELECT（[`bind_aggregate`]）の両方が同一の
@@ -410,7 +505,7 @@ fn default_expr_alias(expr: &Expr) -> String {
 /// はフラグのみ、式述語は `Bool` 型を要求）で WHERE を解釈する必要があるため、
 /// 挙動を複製せずこの 1 箇所に集約する。戻り値は
 /// `(metadata_filters, expr_filters, rls_predicate_present)` の組。
-fn bind_where_predicates(
+pub(crate) fn bind_where_predicates(
     where_predicates: &[WherePredicate],
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
@@ -463,6 +558,29 @@ pub fn bind(
     bind_with_session(stmt, schema, None)
 }
 
+/// 検索 `SELECT`（`ORDER BY`／`USING PLAN` いずれの経路も含む）の `LIMIT`
+/// 生値 `raw` を検証し、`1..=`[`crate::core::MAX_SEARCH_K`] の範囲内であることを
+/// 確認した `usize` を返す（`bind_in_session`・`crate::sql::using_plan::
+/// bind_expansion`・`core.rs::EngineCore::execute_sql_in_session` の `USING PLAN`
+/// 分岐が同一の検証ロジック・エラー文言・`wire_code`（`22000`）を共有する
+/// 単一実装。`core.rs` 側は `plan_using_plan_expansion`〔辞書スナップショット
+/// 構築・LLM クエリ展開・再埋め込み〕という高コスト I/O より前に本関数を呼び、
+/// `bind_expansion` 側の呼び出しは多層防御として残す。codex-review P1 指摘
+/// 対応、PR #266: 高コスト処理の後段でのみ検証すると、`LIMIT 0`／`LIMIT
+/// 4294967295` のような必ず拒否される入力でも untrusted 入力によるリソース
+/// 増幅を許してしまう）。
+pub(crate) fn validate_search_limit(raw: u32) -> Result<usize, SqlSurfaceError> {
+    let limit = usize::try_from(raw)
+        .map_err(|_| SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {raw}")))?;
+    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
+        return Err(SqlSurfaceError::invalid_input(format!(
+            "LIMIT {limit} out of range (must be 1..={})",
+            crate::core::MAX_SEARCH_K
+        )));
+    }
+    Ok(limit)
+}
+
 /// [`ValidatedStatement`] を `schema` と `session_mode`（呼び出し元の
 /// [`crate::sql::mode::SessionState::search_mode`]）と照合して [`BoundStatement`] へ
 /// 束縛する（TASK-161 の公開 API）。UDF レジストリを持たないエントリポイント向けの
@@ -508,88 +626,14 @@ pub fn bind_in_session(
     // （security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
 
-    let projection = match &stmt.projection {
-        Projection::All => {
-            let mut cols = Vec::with_capacity(schema.columns.len() + 1);
-            cols.push(ProjectedColumn::Id);
-            for (index, column) in schema.columns.iter().enumerate() {
-                cols.push(ProjectedColumn::Column {
-                    index,
-                    name: column.name.clone(),
-                });
-            }
-            cols
-        }
-        Projection::Columns(names) => {
-            let mut cols = Vec::with_capacity(names.len());
-            for name in names {
-                // カタログ上の実カラムを疑似列 `id` より優先して照合する（Issue #56
-                // レビュー指摘対応: 以前は `name == "id"` を先に判定していたため、
-                // スキーマが `id` という実カラムを持っていても常に行キー疑似列へ
-                // マップされ、実カラムの値を `SELECT id` で取得する経路がなかった）。
-                if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                    cols.push(ProjectedColumn::Column {
-                        index,
-                        name: name.clone(),
-                    });
-                    continue;
-                }
-                if name == "id" {
-                    cols.push(ProjectedColumn::Id);
-                    continue;
-                }
-                return Err(SqlSurfaceError::invalid_input(format!(
-                    "unknown column: {name}"
-                )));
-            }
-            cols
-        }
-        Projection::Items(items) => {
-            let mut cols = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    crate::sql::allowlist::SelectItem::Column(name) => {
-                        if let Some(index) = schema.columns.iter().position(|c| &c.name == name) {
-                            cols.push(ProjectedColumn::Column {
-                                index,
-                                name: name.clone(),
-                            });
-                            continue;
-                        }
-                        if name == "id" {
-                            cols.push(ProjectedColumn::Id);
-                            continue;
-                        }
-                        return Err(SqlSurfaceError::invalid_input(format!(
-                            "unknown column: {name}"
-                        )));
-                    }
-                    crate::sql::allowlist::SelectItem::Expr { expr, alias } => {
-                        let (bound, _ty) =
-                            crate::sql::udf_call::bind_expr(expr, schema, udfs, &mut node_budget)?;
-                        let name = alias.clone().unwrap_or_else(|| default_expr_alias(expr));
-                        cols.push(ProjectedColumn::Computed { name, expr: bound });
-                    }
-                }
-            }
-            cols
-        }
-    };
+    let projection = bind_projection(&stmt.projection, schema, udfs, &mut node_budget)?;
 
     let (metadata_filters, expr_filters, rls_predicate_present) =
         bind_where_predicates(&stmt.where_predicates, schema, udfs, &mut node_budget)?;
 
     let ranking = bind_ranking(&stmt.order_by, schema)?;
 
-    let limit = usize::try_from(stmt.limit).map_err(|_| {
-        SqlSurfaceError::invalid_input(format!("malformed LIMIT value: {}", stmt.limit))
-    })?;
-    if limit == 0 || limit > crate::core::MAX_SEARCH_K {
-        return Err(SqlSurfaceError::invalid_input(format!(
-            "LIMIT {limit} out of range (must be 1..={})",
-            crate::core::MAX_SEARCH_K
-        )));
-    }
+    let limit = validate_search_limit(stmt.limit)?;
 
     Ok(BoundStatement {
         table: stmt.table_name.clone(),

@@ -113,6 +113,10 @@ pub enum CatalogError {
     /// `TableError::TableTypeMismatch` を本 variant へ写像する）。エラー文言には
     /// テーブル名・テナント ID を含めない（存在情報を漏らさない。security.md P0）。
     IncompatibleRowKeyFormat,
+    /// テーブル単位の世代カウンタ（[`bump_table_generation_in_txn`]）が `u64` の
+    /// 上限に達した。現実的には到達しないが、`checked_add` の網羅性のため扱う
+    /// （`storage.rs::StorageError::GenerationCounterOverflow` と同じ方針）。
+    TableGenerationCounterOverflow,
 }
 
 impl fmt::Display for CatalogError {
@@ -130,6 +134,9 @@ impl fmt::Display for CatalogError {
             CatalogError::IncompatibleRowKeyFormat => {
                 write!(f, "incompatible row store key format: rebuild required")
             }
+            CatalogError::TableGenerationCounterOverflow => {
+                write!(f, "table generation counter overflow")
+            }
         }
     }
 }
@@ -144,7 +151,8 @@ impl std::error::Error for CatalogError {
             | CatalogError::TableAlreadyExists(_)
             | CatalogError::ColumnAlreadyExists(_)
             | CatalogError::RowNotFound(_)
-            | CatalogError::IncompatibleRowKeyFormat => None,
+            | CatalogError::IncompatibleRowKeyFormat
+            | CatalogError::TableGenerationCounterOverflow => None,
         }
     }
 }
@@ -659,6 +667,63 @@ fn require_table_exists_read(read_txn: &redb::ReadTransaction, table_name: &str)
     Ok(())
 }
 
+/// テーブル単位の世代カウンタ（codex-review P1 指摘対応、PR #266）。キーは論理
+/// テーブル名（[`validate_identifier`] 通過済み）、値は当該テーブルへの書き込み
+/// commit 回数を表す単調増加カウンタ。`crate::storage::GENERATION_TABLE`
+/// （ストレージ全体で任意の write commit ごとに増える世代）とは別テーブルで、
+/// こちらは対象テーブル（カタログ定義の DDL・`user_rows/{table_name}` への
+/// 行書き込み）に限定して増加する。無関係な他テーブルへの書き込みが本カウンタへ
+/// 影響しないことが `USING PLAN` の I/O 前後世代照合（`core.rs`
+/// `EngineCore::execute_sql_in_session` の `Statement::Select` アーム参照）の
+/// 可用性契約（「テナント境界を跨いだ通常の書き込みトラフィックで USING PLAN が
+/// 恒常的に拒否されない」）の土台になる。
+const TABLE_GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("table_generation");
+
+/// [`TABLE_GENERATION_TABLE`] を 1 つ進める（`write_txn.commit()` 前に呼ぶ）。
+///
+/// 呼び出し元は、当該 `table_name` の `CATALOG_TABLE` エントリ（DDL）または
+/// `user_rows/{table_name}`（DML）のいずれかを同一 `write_txn` 内で変更した
+/// すべての箇所（`Storage::create_table`・`drop_table`・`alter_table_add_column`・
+/// `insert_row_into_table`・`insert_rows_into_table`・`insert_typed_row`、および
+/// `tenant.rs` の `insert_row_unchecked`・`insert_rows_unchecked`・
+/// `insert_typed_row_unchecked`・`update_row_unchecked`・`delete_row_unchecked`・
+/// `replace_typed_rows_by_text_key`）。新たに対象テーブルの行・スキーマを変更する
+/// 書き込み経路を追加する場合は、その commit 前にも本関数を呼ぶこと（呼び忘れは
+/// `USING PLAN` の世代照合が対象テーブルの実変更を見逃す fail-open に直結する）。
+/// 「変更なしの early return（空バッチ・削除 0 件等）で commit 自体を行わない」
+/// 経路は本関数を呼ばない（world 全体の [`crate::storage::bump_generation_and_commit`]
+/// と同じく、commit しない = 世代を進めない、が既存契約）。
+///
+/// `DROP TABLE`→同名再作成の場合もカウンタは単純に増加し続ける（drop 時にリセット
+/// しない）。前後比較で「変化したか」だけを見る呼び出し元にとっては、リセットの
+/// 有無は無関係（drop→再作成でも必ず値が変わることが重要）。
+pub(crate) fn bump_table_generation_in_txn(
+    write_txn: &redb::WriteTransaction,
+    table_name: &str,
+) -> Result<()> {
+    let mut gen_table = write_txn.open_table(TABLE_GENERATION_TABLE)?;
+    let current = gen_table.get(table_name)?.map(|v| v.value()).unwrap_or(0);
+    let next = current
+        .checked_add(1)
+        .ok_or(CatalogError::TableGenerationCounterOverflow)?;
+    gen_table.insert(table_name, next)?;
+    Ok(())
+}
+
+/// [`bump_table_generation_in_txn`] の読み取り側。テーブルが未作成（1 度も
+/// 書き込まれていない）場合は `0` を返す（`crate::storage::current_generation_in_txn`
+/// と同じ「未作成 = 世代 0」の方針）。
+pub(crate) fn table_generation_in_txn(
+    read_txn: &redb::ReadTransaction,
+    table_name: &str,
+) -> Result<u64> {
+    match read_txn.open_table(TABLE_GENERATION_TABLE) {
+        Ok(t) => Ok(t.get(table_name)?.map(|v| v.value()).unwrap_or(0)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// カタログ DDL API。`Storage`（`storage.rs`）の拡張として実装し、
 /// `Storage::db()` を経由して `ROWS_TABLE` とは別のテーブル（[`CATALOG_TABLE`]）
 /// のみを読み書きする。行データへは一切アクセスしない（TABLE-4/TABLE-5）。
@@ -677,6 +742,7 @@ impl Storage {
             }
             table.insert(schema.name.as_str(), encoded.as_slice())?;
         }
+        bump_table_generation_in_txn(&write_txn, &schema.name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -728,6 +794,7 @@ impl Storage {
         // エントリが同居するため）。
         crate::recovery::ledger::delete_table_in_txn(&write_txn, table_name)
             .map_err(convert_storage_error)?;
+        bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -766,6 +833,7 @@ impl Storage {
             let encoded = encode_schema(&schema)?;
             table.insert(table_name, encoded.as_slice())?;
         }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -824,6 +892,7 @@ impl Storage {
             // （認可済みの名前空間で書くのは `crate::tenant::insert_row` の責務）。
             row_table.insert((row.tenant_id, id), encoded.as_slice())?;
         }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -873,6 +942,7 @@ impl Storage {
                 row_table.insert((row.tenant_id, *id), encoded.as_slice())?;
             }
         }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -935,6 +1005,7 @@ impl Storage {
             // （呼び出し元がテナントを明示する契約）。
             row_table.insert((tenant_id, id), encoded.as_slice())?;
         }
+        bump_table_generation_in_txn(&write_txn, table_name)?;
         crate::recovery::commit_boundary::commit(write_txn).map_err(convert_storage_error)
     }
 
@@ -1069,7 +1140,8 @@ impl TableLookup for Storage {
                 | CatalogError::TableAlreadyExists(_)
                 | CatalogError::ColumnAlreadyExists(_)
                 | CatalogError::RowNotFound(_)
-                | CatalogError::IncompatibleRowKeyFormat,
+                | CatalogError::IncompatibleRowKeyFormat
+                | CatalogError::TableGenerationCounterOverflow,
             ) => Err(SqlSurfaceError::Internal {
                 detail: "catalog lookup failed".to_string(),
             }),
@@ -1290,6 +1362,140 @@ mod tests {
             .expect("list tables")
             .iter()
             .any(|t| t == "docs"));
+    }
+
+    // codex-review P1 再指摘（PR #266）「新設する場合は書き込み経路での更新漏れが
+    // ないことをテストで担保」対応: `bump_table_generation_in_txn` を呼ぶすべての
+    // カタログ層 API（`create_table`・`alter_table_add_column`・
+    // `insert_row_into_table`・`insert_rows_into_table`・`Storage::insert_typed_row`・
+    // `drop_table`）が対象テーブル（`docs`）の世代を実際に進めること、かつ無関係な
+    // 別テーブル（`sibling`）の世代には一切影響しないことを固定する。空バッチ
+    // （`insert_rows_into_table` の `rows.is_empty()` 早期 return）は commit 自体を
+    // 行わない既存契約のとおり世代を進めないことも合わせて固定する
+    // （`tenant.rs` 側の書き込み API は
+    // `write_apis_bump_only_the_written_tables_generation` で別途カバーする）。
+    #[test]
+    fn catalog_write_apis_bump_only_the_written_tables_generation() {
+        let path = unique_db_path("table-generation-bump-coverage-catalog");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+
+        let read_gen = |name: &str| -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            table_generation_in_txn(&read_txn, name).expect("read table generation")
+        };
+
+        // 無関係な「sibling」テーブルを先に作る。以降の全操作を通じて
+        // `sibling` の世代が一切変化しないことを都度確認する。
+        storage
+            .create_table(&TableSchema::new(
+                "sibling",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create sibling");
+        let sibling_gen = read_gen("sibling");
+        assert_eq!(
+            sibling_gen, 1,
+            "create_table must bump its own table's generation"
+        );
+
+        assert_eq!(read_gen("docs"), 0, "未作成テーブルの世代は 0");
+        storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+            ))
+            .expect("create docs");
+        let mut prev = read_gen("docs");
+        assert!(prev > 0, "create_table must bump docs' generation");
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        storage
+            .alter_table_add_column("docs", ColumnDef::new("path", ColumnType::Text, true))
+            .expect("alter_table_add_column");
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "alter_table_add_column must bump docs' generation"
+        );
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        storage
+            .insert_row_into_table(
+                "docs",
+                1,
+                &RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.1, 0.2],
+                    metadata: &[],
+                },
+            )
+            .expect("insert_row_into_table");
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "insert_row_into_table must bump docs' generation"
+        );
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        storage
+            .insert_rows_into_table(
+                "docs",
+                &[(
+                    2,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: &[0.3, 0.4],
+                        metadata: &[],
+                    },
+                )],
+            )
+            .expect("insert_rows_into_table (non-empty)");
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "insert_rows_into_table (non-empty) must bump docs' generation"
+        );
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        // 空バッチは commit 自体を行わない既存契約（`insert_rows_into_table` の
+        // ドキュメントコメント参照）のとおり、世代を進めない。
+        storage
+            .insert_rows_into_table("docs", &[])
+            .expect("insert_rows_into_table (empty)");
+        assert_eq!(
+            read_gen("docs"),
+            prev,
+            "insert_rows_into_table with an empty batch must not bump the generation"
+        );
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        storage
+            .insert_typed_row(
+                "docs",
+                3,
+                "tenant-a",
+                Visibility::Public,
+                &[
+                    RowCodecValue::Vector(vec![0.5, 0.6]),
+                    RowCodecValue::Text("typed-path".to_string()),
+                ],
+            )
+            .expect("insert_typed_row");
+        let next = read_gen("docs");
+        assert!(next > prev, "insert_typed_row must bump docs' generation");
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        storage.drop_table("docs").expect("drop_table");
+        let next = read_gen("docs");
+        assert!(next > prev, "drop_table must bump docs' generation");
+        assert_eq!(read_gen("sibling"), sibling_gen);
     }
 
     #[test]

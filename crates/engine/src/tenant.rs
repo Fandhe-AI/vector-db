@@ -535,6 +535,7 @@ pub(crate) fn insert_row_unchecked(
         let encoded = encode_row(row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
@@ -642,6 +643,7 @@ pub(crate) fn insert_rows_unchecked(
             insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
@@ -753,6 +755,7 @@ pub(crate) fn insert_typed_row_unchecked(
         let encoded = encode_row(&row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
@@ -848,6 +851,7 @@ pub(crate) fn update_row_unchecked(
             .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
@@ -933,6 +937,7 @@ pub(crate) fn delete_row_unchecked(
         }
         row_table.remove(&key).map_err(CatalogError::from)?;
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(())
 }
@@ -1220,6 +1225,7 @@ pub(crate) fn replace_typed_rows_by_text_key(
         drop(write_txn);
         return Ok(outcome);
     }
+    crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
     crate::recovery::commit_boundary::commit(write_txn)?;
     Ok(outcome)
 }
@@ -1773,5 +1779,222 @@ mod tests {
             .get_row_from_table("docs", "tenant-a", 3)
             .expect("id=3 must still exist with its original content");
         assert_eq!(row3.metadata, b"original".to_vec());
+    }
+
+    // codex-review P1 再指摘（PR #266）「新設する場合は書き込み経路での更新漏れが
+    // ないことをテストで担保」対応: `bump_table_generation_in_txn` を呼ぶすべての
+    // テナント境界付き書き込み API（`insert_row`・`insert_rows`・`insert_typed_row`・
+    // `update_row`・`delete_row`・`replace_typed_rows_by_text_key`）が対象テーブル
+    // （`docs`）の世代を実際に進めること、かつ無関係な別テーブル（`sibling`）・
+    // 同一テーブルへの他テナント（`tenant-b`）の書き込みには影響を与えないことを
+    // 固定する（`catalog.rs` 側の DDL・生の書き込み API は
+    // `catalog_write_apis_bump_only_the_written_tables_generation` で別途カバーする。
+    // `docs` への他テナント書き込みは意図的に「無関係」扱いしない設計判断＝
+    // `core.rs` `Statement::Select` アームの `USING PLAN` 世代照合コメント参照）。
+    #[test]
+    fn write_apis_bump_only_the_written_tables_generation() {
+        let path = unique_db_path("table-generation-bump-coverage-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&schema("docs"))
+            .expect("create table docs");
+        storage
+            .create_table(&schema("sibling"))
+            .expect("create table sibling");
+
+        let read_gen = |name: &str| -> u64 {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            crate::catalog::table_generation_in_txn(&read_txn, name).expect("read table generation")
+        };
+
+        let a = PolicyContext::new("tenant-a").expect("valid tenant");
+        let sibling_gen = read_gen("sibling");
+        let mut prev = read_gen("docs");
+
+        let op = |suffix: &str| OperationId::parse(suffix).expect("valid operation_id");
+
+        insert_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[1.0, 0.0],
+                metadata: b"one",
+            },
+            &op("bump-insert-row"),
+        )
+        .expect("insert_row");
+        let next = read_gen("docs");
+        assert!(next > prev, "insert_row must bump docs' generation");
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        insert_rows(
+            &storage,
+            "docs",
+            &a,
+            &[(
+                2,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: &[0.0, 1.0],
+                    metadata: b"two",
+                },
+            )],
+            &op("bump-insert-rows"),
+        )
+        .expect("insert_rows (non-empty)");
+        let next = read_gen("docs");
+        assert!(
+            next > prev,
+            "insert_rows (non-empty) must bump docs' generation"
+        );
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        // 空バッチは commit 自体を行わない既存契約（`insert_rows_unchecked` の
+        // ドキュメントコメント参照）のとおり、世代を進めない。
+        insert_rows(&storage, "docs", &a, &[], &op("bump-insert-rows-empty"))
+            .expect("insert_rows (empty)");
+        assert_eq!(
+            read_gen("docs"),
+            prev,
+            "insert_rows with an empty batch must not bump the generation"
+        );
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        insert_typed_row(
+            &storage,
+            "docs",
+            &a,
+            3,
+            Visibility::Public,
+            &[crate::row_codec::Value::Vector(vec![0.2, 0.3])],
+            &op("bump-insert-typed-row"),
+        )
+        .expect("insert_typed_row");
+        let next = read_gen("docs");
+        assert!(next > prev, "insert_typed_row must bump docs' generation");
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        update_row(
+            &storage,
+            "docs",
+            &a,
+            1,
+            &RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: &[9.0, 9.0],
+                metadata: b"one-updated",
+            },
+            &op("bump-update-row"),
+        )
+        .expect("update_row");
+        let next = read_gen("docs");
+        assert!(next > prev, "update_row must bump docs' generation");
+        prev = next;
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        delete_row(&storage, "docs", &a, 2, &op("bump-delete-row")).expect("delete_row");
+        let next = read_gen("docs");
+        assert!(next > prev, "delete_row must bump docs' generation");
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        let file_docs_gen_before_replace = read_gen("docs");
+        replace_typed_rows_by_text_key(
+            &storage,
+            &a,
+            ReplaceByTextKey {
+                table: "docs",
+                key_column: "path",
+                key_value: "nonexistent-key",
+                visibility: Visibility::Private,
+                rows: &[],
+                content_hash_path: "irrelevant",
+                content_hash_body: "",
+                content_hash_template_values: &[],
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        // `schema("docs")` は `path` 列を持たないため、`key_column` 探索が
+        // 見つからない列として `Err(Invalid)` を返す。これは意図的（`docs` は
+        // 埋め込み専用スキーマのため）で、本テストの関心は「世代を進めないこと」
+        // のみなので `Err` を許容し、世代不変のみ確認する。
+        .ok();
+        assert_eq!(
+            read_gen("docs"),
+            file_docs_gen_before_replace,
+            "a rejected replace_typed_rows_by_text_key call must not bump the generation"
+        );
+
+        // `replace_typed_rows_by_text_key` の実変更経路は
+        // `path`/`body` 列を持つ別テーブル（`file_schema` 相当）で確認する
+        // （`replace_same_path_replaces_rows_and_leaves_other_paths_untouched` と
+        // 同型のスキーマ）。
+        let file_table = "docs_file";
+        storage
+            .create_table(&file_schema(file_table))
+            .expect("create file-shaped table");
+        let file_gen_before = read_gen(file_table);
+        replace_typed_rows_by_text_key(
+            &storage,
+            &a,
+            ReplaceByTextKey {
+                table: file_table,
+                key_column: "path",
+                key_value: "note.txt",
+                visibility: Visibility::Private,
+                rows: &[row_values([1.0, 0.0], "note.txt", "v1")],
+                content_hash_path: "note.txt",
+                content_hash_body: "v1",
+                content_hash_template_values: &[],
+                ledger_write: LedgerWrite::Disabled,
+            },
+        )
+        .expect("replace_typed_rows_by_text_key (inserting)");
+        let file_gen_after = read_gen(file_table);
+        assert!(
+            file_gen_after > file_gen_before,
+            "replace_typed_rows_by_text_key must bump the target table's generation when it \
+             inserts/removes rows"
+        );
+        // 対象外のテーブル（`docs`・`sibling`）はいずれも無変化。
+        assert_eq!(read_gen("docs"), file_docs_gen_before_replace);
+        assert_eq!(read_gen("sibling"), sibling_gen);
+
+        // 同一テーブル（`docs`）への他テナント（`tenant-b`）の書き込みは
+        // 「無関係」ではなく引き続き `docs` の世代へ影響する（上記コメント参照。
+        // `user_rows/{table}` は複数テナントの行を同居させる単一の物理テーブル
+        // であり、辞書スナップショットは `tenant::visible_rows` を経由するため
+        // 他テナントの可視行の増減が要求元テナントの辞書内容にも影響しうる）。
+        let b = PolicyContext::new("tenant-b").expect("valid tenant");
+        let docs_gen_before_other_tenant = read_gen("docs");
+        insert_row(
+            &storage,
+            "docs",
+            &b,
+            100,
+            &RowInput {
+                tenant_id: "tenant-b",
+                visibility: Visibility::Public,
+                embedding: &[5.0, 5.0],
+                metadata: b"other-tenant",
+            },
+            &op("bump-other-tenant-insert-row"),
+        )
+        .expect("insert_row (other tenant, same table)");
+        assert!(
+            read_gen("docs") > docs_gen_before_other_tenant,
+            "a write to the same table by a different tenant must still bump the table's \
+             generation (same-table writes are not treated as unrelated)"
+        );
+        assert_eq!(read_gen("sibling"), sibling_gen);
     }
 }

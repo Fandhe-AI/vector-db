@@ -274,12 +274,15 @@ pub fn render_prompt_prefix(dictionary: &crate::dictionary::Dictionary) -> Strin
     out
 }
 
-/// untrusted な `question` から制御文字（改行・タブを除く）を除去し
+/// untrusted な `question` の制御文字（改行・タブを除く）を除去し
 /// [`MAX_QUESTION_CHARS`] 文字で決定的に切り詰める（untrusted 入力の有界化。
 /// coding-rust.md）。[`render_full_prompt`]・[`render_reembedding_text`]
 /// （TASK-114・PLAN-10）の両方が同じ切り詰め規則で質問文を扱うことを、コメントの
-/// 重複ではなく本関数の共有によって保証する。
-fn sanitize_question(question: &str) -> String {
+/// 重複ではなく本関数の共有によって保証する。`sql::using_plan`（TASK-77・SQL-5）も
+/// 密側の再埋め込み対象・疎側の検索テキストの構成に本関数を直接呼び出すため公開する
+/// （呼び出し元が別々に切り詰めロジックを複製すると、LLM が見る質問テキストと検索に
+/// 使う質問テキストが食い違いうる。全経路が常に同じ切り詰め結果を共有する）。
+pub fn sanitize_question(question: &str) -> String {
     question
         .chars()
         .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
@@ -288,7 +291,9 @@ fn sanitize_question(question: &str) -> String {
 }
 
 /// `prefix`（[`render_prompt_prefix`] の出力）と untrusted な `question` から完全な
-/// プロンプトを組み立てる。`question` は [`sanitize_question`] で有界化する。
+/// プロンプトを組み立てる。`question` は [`sanitize_question`] で制御文字を除去し
+/// [`MAX_QUESTION_CHARS`] 文字まで決定的に切り詰める（untrusted 入力の有界化。
+/// coding-rust.md）。
 pub fn render_full_prompt(prefix: &str, question: &str) -> Result<String, PlanError> {
     let sanitized = sanitize_question(question);
 

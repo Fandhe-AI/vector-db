@@ -61,6 +61,13 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 /// 対応）。
 const MAX_AGGREGATE_ITEMS: usize = 32;
 
+/// `USING PLAN('<query>')`（TASK-77・SQL-5）に渡せる自然言語クエリ本文のバイト長
+/// 上限。アロケーション（字句解析・LLM プロンプトへの組み込み）に入る前に拒否する
+/// （`.claude/rules/security.md`「不安全な設計｜無制限リソース確保（DoS）」対応）。
+/// [`crate::sql::parser::MAX_VECTOR_LITERAL_BYTES`] の既存前例と同じ 64 KiB を採用する
+/// （意味論側の決定的切り詰めは `query_planner::MAX_QUESTION_CHARS` が別途担う）。
+const MAX_USING_PLAN_LEN: usize = 64 * 1024;
+
 fn truncate_for_error(s: &str) -> String {
     if s.len() <= MAX_ERROR_DETAIL_LEN {
         return s.to_string();
@@ -301,6 +308,16 @@ pub enum FunctionArg {
 /// `ORDER BY` 式の許可形状。TASK-74・SQL-8 参照（docs/spec/05-tasks.md）。
 /// TASK-75 でリテラル値・関数引数を保持するよう拡張した（構造判定だけでなく、
 /// 後続の束縛（`sql::parser::bind`）がベクトルリテラル解析・hybrid 引数解釈に使う）。
+///
+/// **TASK-77（SQL-5）で追加した破壊的変更（BREAKING CHANGE、codex-review P1 指摘対応、
+/// PR #266）**: `UsingPlan` variant を追加した。本 enum は `#[non_exhaustive]` を
+/// 付けていない公開型のため、この型に対して網羅的 `match` を書いている下流コードは
+/// 本バージョンで追加された variant に対応するまでコンパイルが通らなくなる
+/// （[`WherePredicate`] の `Expression`（TASK-79）・`Prefix`（TASK-147）追加時と同じ
+/// 既存の破壊的変更運用に倣う）。移行方針: 既存の網羅的 `match` に `UsingPlan` の腕
+/// （`USING PLAN` 文には意味を持つフィールドが無く、通常到達しない防御的経路として
+/// 扱ってよい）を追加する。spec 側の定義変更は不要（TASK-77・SQL-5 のスコープ内の
+/// 追加であり、`docs/spec/05-tasks.md` の対応タスクに包含される）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderByForm {
     /// 距離演算子形（`<列> <=> '<ベクトルリテラル>'`）。
@@ -315,6 +332,13 @@ pub enum OrderByForm {
         name: String,
         args: Vec<FunctionArg>,
     },
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）が選ばれた文のプレースホルダ。
+    /// `ORDER BY` 節自体が構文上存在しない（`USING PLAN` は `ORDER BY` と相互排他）
+    /// ため意味を持つフィールドを持たず、ランキングは
+    /// [`ValidatedStatement::using_plan`] から `sql::using_plan` が独立に導出する。
+    /// `sql::parser::bind_ranking` はこの variant に到達すると内部エラーで拒否する
+    /// （到達は `core.rs` の分岐が壊れた場合のみの防御的経路）。
+    UsingPlan,
 }
 
 /// WHERE 句の許可形状。名前を照合する述語呼び出し形は、許可された名前
@@ -409,6 +433,12 @@ pub struct ValidatedStatement {
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。未指定時は
     /// [`EvaluationOrder::DEFAULT`]（既存 TASK-75 の固定順 RLS→SCALAR→DISTANCE）。
     pub(crate) evaluation_order: EvaluationOrder,
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）で指定された自然言語クエリの生
+    /// リテラル値。省略時は `None`。`ORDER BY` と相互排他（`Some` のとき
+    /// `order_by` は必ず [`OrderByForm::UsingPlan`]）。値の展開（LLM クエリ
+    /// プランニング、TASK-110・PLAN-1）・ハイブリッド実行形への束縛は
+    /// `sql::using_plan` の管轄で、本モジュールは構文構造の受理までを担う。
+    pub(crate) using_plan: Option<String>,
 }
 
 impl ValidatedStatement {
@@ -433,6 +463,7 @@ impl ValidatedStatement {
             limit,
             search_mode: None,
             evaluation_order,
+            using_plan: None,
         }
     }
 
@@ -441,6 +472,31 @@ impl ValidatedStatement {
     #[must_use]
     pub fn with_search_mode(mut self, search_mode: Option<String>) -> Self {
         self.search_mode = search_mode;
+        self
+    }
+
+    /// `using_plan`（TASK-77・SQL-5）を設定したコピーを返すビルダー的メソッド。
+    /// [`Self::new`] と組み合わせて `using_plan` を含む値を外部から構築する。
+    ///
+    /// **不変条件**（codex-review P1 指摘対応、PR #266）: `using_plan` に `Some`
+    /// を渡した場合、`order_by` を無条件で [`OrderByForm::UsingPlan`] へ揃える。
+    /// `USING PLAN` と `ORDER BY` は構文上相互排他であり、
+    /// `core.rs::EngineCore::execute_sql_in_session` は `order_by` の値ではなく
+    /// `using_plan()` の有無のみで束縛経路を分岐するため、この揃え込みが無いと
+    /// 呼び出し元が [`Self::new`] へ渡した `order_by`（例:
+    /// [`OrderByForm::Distance`]）が無言で無視され、意図せず `USING PLAN` 経路
+    /// （呼び出し元が想定していないハイブリッド実行形）が実行される事故になり得た
+    /// （公開 builder が矛盾した状態を構築できてしまう問題）。`None` を渡した
+    /// 場合は `order_by` を変更しない（[`Self::new`] で渡された値をそのまま保つ）。
+    /// 逆方向（`order_by` に [`OrderByForm::UsingPlan`] を渡しつつ `using_plan` を
+    /// 設定しない）の矛盾は本メソッドだけでは防げないため、`execute_sql_in_session`
+    /// 側でも分岐前に防御的に検証する（同メソッドのドキュメント参照）。
+    #[must_use]
+    pub fn with_using_plan(mut self, using_plan: Option<String>) -> Self {
+        if using_plan.is_some() {
+            self.order_by = OrderByForm::UsingPlan;
+        }
+        self.using_plan = using_plan;
         self
     }
 
@@ -477,6 +533,11 @@ impl ValidatedStatement {
     /// `HINT ORDER(...)` で指定された評価順序（TASK-76・SQL-7）。
     pub fn evaluation_order(&self) -> EvaluationOrder {
         self.evaluation_order
+    }
+
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）の生リテラル値。未指定時は `None`。
+    pub fn using_plan(&self) -> Option<&str> {
+        self.using_plan.as_deref()
     }
 }
 
@@ -1304,10 +1365,14 @@ impl<'a> Parser<'a> {
     /// [`Parser::peek_ident_matches`] で文脈的（この位置限定）に判定する。続かなければ
     /// 句なし（`Ok(None)`）として扱う。
     /// `USING` の直後は `MODE`（大文字小文字非区別の文脈識別子）のみ許可し、それ以外
-    /// （将来 TASK-77/80 が追加する `PLAN`・`OPERATION_ID` 等）は fail-closed に拒否
-    /// する（未実装の拡張点を黙って受理しない）。句を高々 1 回だけ消費するため、
-    /// 2 回目以降の `USING MODE ...` は本メソッドではなく後続の
-    /// [`Parser::expect_end_of_statement`] が「余剰トークン」として拒否する。
+    /// （`PLAN`・`OPERATION_ID` 等）は fail-closed に拒否する。**この位置**
+    /// （`ORDER BY ... LIMIT n` の直後）に限った制約であり、`USING PLAN(...)` 自体は
+    /// `ORDER BY` の代替として別の位置（`WHERE` 直後、[`Parser::
+    /// parse_using_plan_clause`]）で受理する（TASK-77・SQL-5）。ここで `PLAN` を
+    /// 拒否するのは、`LIMIT` 後は既に `USING PLAN` の受理位置を過ぎているため（両者
+    /// 併用・非規範形 `USING PLAN 'x'`（括弧なし）はいずれもここで `42601` へ落ちる）。
+    /// 句を高々 1 回だけ消費するため、2 回目以降の `USING MODE ...` は本メソッドでは
+    /// なく後続の [`Parser::expect_end_of_statement`] が「余剰トークン」として拒否する。
     fn parse_using_clause(&mut self) -> Result<Option<String>, SqlSurfaceError> {
         if !self.peek_ident_matches("USING") {
             return Ok(None);
@@ -1321,6 +1386,50 @@ impl<'a> Parser<'a> {
         }
         let value = self.expect_string_literal()?;
         Ok(Some(value))
+    }
+
+    /// `ORDER BY` の代わりに置ける文末専用句 `USING PLAN('<query>')`（TASK-77・
+    /// SQL-5）の構造パース。呼び出し元 [`parse_select_shape`] が `WHERE`（省略可）
+    /// の直後で `USING` 識別子を先読みして本メソッドへ分岐した後に呼ぶ（`ORDER BY`
+    /// 経路は必ずキーワード `ORDER` から始まるため、先読み 1 トークンで衝突なく
+    /// 判定できる＝`USING PLAN` と `ORDER BY` は構文上相互排他）。
+    ///
+    /// 受理する規範形は `PLAN('<文字列リテラル>')`（**括弧必須**の関数呼び出し形）
+    /// のみ。以下はすべて構造上の許可リスト外として `42601`（`SqlSurfaceError::
+    /// unsupported`）で拒否する（fail-closed）:
+    /// - `PLAN` 以外の識別子（`unsupported USING clause`）
+    /// - 括弧を伴わない形（例: 非規範形の `USING PLAN 'x'`）
+    /// - パラメータ形式 `USING PLAN($1)`（拡張クエリプロトコル対応後の将来形式。
+    ///   `$` は字句解析段階で [`LexError`] となり、本メソッドへ到達する前に
+    ///   `validate_sql` の `tokenize` 呼び出しが `42601` へ写像する）
+    /// - 文字列リテラル以外の引数・複数引数
+    ///
+    /// 空リテラルは [`SqlSurfaceError::invalid_input`]（`22000`）、
+    /// [`MAX_USING_PLAN_LEN`] 超過は [`SqlSurfaceError::payload_too_large`]
+    /// （`54000`）で拒否する。
+    fn parse_using_plan_clause(&mut self) -> Result<String, SqlSurfaceError> {
+        self.advance(); // `USING`（呼び出し元が `peek_ident_matches("USING")` で確認済み）
+        let name = self.expect_ident()?;
+        if !name.eq_ignore_ascii_case("PLAN") {
+            return Err(SqlSurfaceError::unsupported(format!(
+                "unsupported USING clause: {name}"
+            )));
+        }
+        self.expect_punct('(')?;
+        let value = self.expect_string_literal()?;
+        self.expect_punct(')')?;
+        if value.is_empty() {
+            return Err(SqlSurfaceError::invalid_input(
+                "USING PLAN value must not be empty",
+            ));
+        }
+        if value.len() > MAX_USING_PLAN_LEN {
+            return Err(SqlSurfaceError::payload_too_large(format!(
+                "USING PLAN value length {} exceeds limit {MAX_USING_PLAN_LEN}",
+                value.len()
+            )));
+        }
+        Ok(value)
     }
 
     /// `LIMIT <n>` の直後・文末に 1 箇所だけ許可する `HINT ORDER(<段>, <段>, <段>)`
@@ -1485,10 +1594,14 @@ struct ParsedShape {
     limit: u32,
     search_mode: Option<String>,
     evaluation_order: EvaluationOrder,
+    /// `USING PLAN('<query>')`（TASK-77・SQL-5）。`Some` のとき `order_by` は必ず
+    /// [`OrderByForm::UsingPlan`]。
+    using_plan: Option<String>,
 }
 
 /// 許可した `SELECT` statement 形状を先頭から再帰下降で判定する（TASK-74 由来。
-/// TASK-161 で `LIMIT` 直後の `USING MODE` 句判定を追加した）。
+/// TASK-161 で `LIMIT` 直後の `USING MODE` 句判定を追加した。TASK-77・SQL-5 で
+/// `WHERE`（省略可）直後の `USING PLAN(...)` 分岐を追加した）。
 fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> {
     let mut p = Parser::new(tokens);
 
@@ -1503,6 +1616,38 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
     } else {
         Vec::new()
     };
+
+    // TASK-77・SQL-5: `USING PLAN(...)` は `ORDER BY` の代替経路（相互排他）。
+    // `ORDER BY` 経路は必ずキーワード `ORDER` から始まるため、この位置で文脈的
+    // 識別子 `USING` が現れるかどうかだけで両者を衝突なく判定できる。
+    if p.peek_ident_matches("USING") {
+        let using_plan = p.parse_using_plan_clause()?;
+
+        p.expect_keyword(Keyword::Limit)?;
+        let limit_str = p.expect_number()?;
+        let limit: u32 = limit_str.parse().map_err(|_| {
+            SqlSurfaceError::unsupported(format!("malformed LIMIT value: {limit_str}"))
+        })?;
+
+        // `HINT ORDER(...)` はランキング段順のヒントであり、ランキング自体を
+        // `USING PLAN` の展開結果が決める本経路では意味を持たない。構造上も
+        // 受理しない（`ORDER BY` 経路の既存文法を変えず、`USING PLAN` 側だけを
+        // 素通しで「`USING MODE` のみ許容」に保つ）。
+        let search_mode = p.parse_using_clause()?;
+
+        p.expect_end_of_statement()?;
+
+        return Ok(ParsedShape {
+            table_name,
+            projection,
+            where_predicates,
+            order_by: OrderByForm::UsingPlan,
+            limit,
+            search_mode,
+            evaluation_order: EvaluationOrder::DEFAULT,
+            using_plan: Some(using_plan),
+        });
+    }
 
     p.expect_keyword(Keyword::Order)?;
     p.expect_keyword(Keyword::By)?;
@@ -1527,6 +1672,7 @@ fn parse_select_shape(tokens: &[Token]) -> Result<ParsedShape, SqlSurfaceError> 
         limit,
         search_mode,
         evaluation_order,
+        using_plan: None,
     })
 }
 
@@ -1763,6 +1909,7 @@ pub fn validate_sql(sql: &str, lookup: &impl TableLookup) -> Result<Statement, S
                 limit: shape.limit,
                 search_mode: shape.search_mode,
                 evaluation_order: shape.evaluation_order,
+                using_plan: shape.using_plan,
             }))
         }
         _ if is_set_statement => {
@@ -2894,8 +3041,9 @@ mod tests {
 
     #[test]
     fn rejects_using_clause_with_unsupported_word() {
-        // `USING` 直後は `MODE` のみ許可する（`PLAN`・`OPERATION_ID` は TASK-77/80 の
-        // 拡張点であり本タスクでは未実装。fail-closed に拒否する）。
+        // `LIMIT` 直後の `USING` は `MODE` のみ許可する。`USING PLAN(...)`（TASK-77・
+        // SQL-5）は `ORDER BY` の代替として別の位置でのみ受理するため、`ORDER BY`
+        // 併用かつ非規範形（括弧なし）のこの入力はここで `42601` へ落ちる。
         let lookup = catalog_with(&["documents"]);
         assert!(validate_statement(
             "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' LIMIT 5 USING PLAN 'x'",
@@ -2935,6 +3083,124 @@ mod tests {
             &lookup
         )
         .is_err());
+    }
+
+    // --- TASK-77（SQL-5: `USING PLAN(...)`）----------------------------------------
+
+    #[test]
+    fn accepts_using_plan_normative_form() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents USING PLAN('find the auth handler') LIMIT 5",
+            &lookup,
+        )
+        .expect("normative USING PLAN form should be accepted");
+        assert_eq!(stmt.using_plan(), Some("find the auth handler"));
+        assert!(matches!(stmt.order_by(), OrderByForm::UsingPlan));
+    }
+
+    #[test]
+    fn with_using_plan_forces_order_by_to_using_plan_variant() {
+        // codex-review P1 指摘対応（PR #266）: 公開 builder が矛盾した
+        // `ValidatedStatement`（`using_plan` は `Some` なのに `order_by` は
+        // `OrderByForm::Distance` のまま）を構築できてしまうと、
+        // `core.rs::EngineCore::execute_sql_in_session` は `using_plan()` の有無
+        // だけで分岐するため、呼び出し元が意図した `order_by` が無言で無視され
+        // 意図しない `USING PLAN` 経路が実行される事故になり得た。`with_using_plan`
+        // が `order_by` を自動的に揃えることを固定する。
+        let stmt = ValidatedStatement::new(
+            "documents".to_string(),
+            Projection::All,
+            OrderByForm::Distance {
+                column: "embedding".to_string(),
+                literal: "[0.1]".to_string(),
+            },
+            Vec::new(),
+            5,
+            EvaluationOrder::DEFAULT,
+        )
+        .with_using_plan(Some("find auth".to_string()));
+        assert!(matches!(stmt.order_by(), OrderByForm::UsingPlan));
+        assert_eq!(stmt.using_plan(), Some("find auth"));
+    }
+
+    #[test]
+    fn accepts_using_plan_with_where_and_using_mode() {
+        let lookup = catalog_with(&["documents"]);
+        let stmt = validate_statement(
+            "SELECT * FROM documents WHERE visible() USING PLAN('q') LIMIT 5 USING MODE 'precision'",
+            &lookup,
+        )
+        .expect("USING PLAN with WHERE/USING MODE should be accepted");
+        assert_eq!(stmt.using_plan(), Some("q"));
+        assert_eq!(stmt.search_mode(), Some("precision"));
+    }
+
+    #[test]
+    fn rejects_using_plan_parameter_form() {
+        // `USING PLAN($1)` は拡張クエリプロトコル対応後の将来形式。`$` は字句解析
+        // 段階で拒否される（TASK-77・SQL-5）。
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT * FROM documents USING PLAN($1) LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_using_plan_without_parens() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT * FROM documents USING PLAN 'q' LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_using_plan_together_with_order_by() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT * FROM documents ORDER BY embedding <=> '[0.1]' USING PLAN('q') LIMIT 5",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_duplicate_using_plan_clause() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement(
+            "SELECT * FROM documents USING PLAN('q') USING PLAN('q') LIMIT 5",
+            &lookup,
+        )
+        .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
+    }
+
+    #[test]
+    fn rejects_using_plan_empty_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT * FROM documents USING PLAN('') LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "22000");
+    }
+
+    #[test]
+    fn rejects_using_plan_oversized_literal() {
+        let lookup = catalog_with(&["documents"]);
+        let huge = format!(
+            "SELECT * FROM documents USING PLAN('{}') LIMIT 5",
+            "x".repeat(MAX_USING_PLAN_LEN + 1)
+        );
+        let err = validate_statement(&huge, &lookup).unwrap_err();
+        assert_eq!(err.wire_code(), "54000");
+    }
+
+    #[test]
+    fn rejects_using_plan_non_string_argument() {
+        let lookup = catalog_with(&["documents"]);
+        let err = validate_statement("SELECT * FROM documents USING PLAN(1) LIMIT 5", &lookup)
+            .unwrap_err();
+        assert_eq!(err.wire_code(), "42601");
     }
 
     #[test]
