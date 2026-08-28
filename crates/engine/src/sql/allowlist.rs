@@ -135,8 +135,9 @@ pub enum SqlSurfaceError {
     /// 集計関数（`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`、TASK-166・SQL-13）の数値演算が
     /// `u64`/`f64` の表現範囲を超過した（`checked_add` 失敗・`f64` 側の非有限値化）。
     /// 黙って wrap・非有限値化せず fail-closed に拒否する（`.claude/rules/coding-rust.md`
-    /// 「整数演算は checked_*/saturating_* を使う」対応）。ERR-2
-    /// （`docs/spec/04-behavior/error-format.md`）: `22003`。
+    /// 「整数演算は checked_*/saturating_* を使う」対応）。`22003` は ERR-2
+    /// （`docs/spec/04-behavior/error-format.md`）の表に未掲載のコードであり、
+    /// SQL-13 が ERR-2 の拡張規則に基づいて独自定義する。
     NumericOutOfRange { detail: String },
 }
 
