@@ -44,9 +44,17 @@ fail-closed で red になる。調査時点（2026-08-28）でこれらの vari
 | `BENCH_CORE6_MIN_IMPROVEMENT_PCT`（任意） | `core-engine.md` CORE-6（TASK-130） | 正の浮動小数点（%）。`BENCH_CORE6` opt-in 時のみ読まれる |
 | `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（任意） | `core-engine.md` CORE-16（TASK-130） | 正の浮動小数点（%）。`BENCH_CORE16` opt-in 時のみ読まれる |
 
-前 6 変数は `bench.yml` の既定ゲート（`bench-simd`・`bench-contrast`・
-`bench-batch`・`bench-c1` の各 job）が必須とするため、揃わない限り run は
-fail-closed で red のままとなる。
+上記のうち `bench-simd`・`bench-contrast`・`bench-batch` の 3 job は
+schedule／workflow_dispatch の両方で実行され、`BENCH_MAX_P95_MS`・
+`BENCH_MIN_RECALL`・`BENCH_MAX_CONTRAST_RATIO`・`BENCH_BATCH_MAX_DEGRADATION_PCT`
+の 4 変数が揃わない限り fail-closed で red のままとなる（週次 schedule を
+green にするための必須変数はこの 4 つ）。
+
+一方 `bench-c1` job は `workflow_dispatch` 限定（`if: github.event_name ==
+'workflow_dispatch'`）で **schedule には含まれない**。`BENCH_SQL_C1_MAX_P95_MS`・
+`BENCH_SQL_C1_MIN_RECALL` の 2 変数は `workflow_dispatch` で `bench-c1` を
+明示的に起動したときにのみ必要であり、週次 schedule の red 状態には無関係
+（未設定でも schedule は red のまま変化しない）。
 
 ### Environment `recall-gate` variables（`.github/workflows/recall.yml`）
 
@@ -84,9 +92,10 @@ spec に対応する確定値が無いため、以下の規則による暫定値
 
 - **`PRECISION_EVAL_MIN_TOP1_ACC` / `PRECISION_EVAL_MIN_MRR10` /
   `PRECISION_EVAL_MAX_FALSE_RETURN`（TASK-163・SEARCH-10）は設定しない**。
-  spec（SEARCH-10）が「目標値確定まで必達基準に含めない」「確定はユーザー確認」と
-  定めており、`docs/design/precision-eval-regression.md`・README も同じ申し送りを
-  持つ。仮置き値を週次 strict ゲートへ入れることは spec の申し送りと矛盾するため、
+  spec（SEARCH-10）は目標値未確定の間はこれらを必達基準に含めない方針であり、
+  確定はユーザー確認を要するとしている。`docs/design/precision-eval-regression.md`・
+  README も同じ申し送りを持つ。仮置き値を週次 strict ゲートへ入れることは
+  spec の申し送りと矛盾するため、
   安全側（設定しない・`recall.yml` へ未接続のまま）に倒す。
 - **TASK-116（ティア別レイテンシ・PLAN-4/6/7）は対象外**。常駐 Ollama が必要で
   GitHub ホステッド runner に CI 経路が無く、repo variables でもない
