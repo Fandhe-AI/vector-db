@@ -324,6 +324,14 @@ pub fn reembed_expansion(
             got: vector.len(),
         });
     }
+    // 非有限値（`NaN`/`±Inf`）を検索経路へ渡す前に拒否する。増分索引の
+    // 埋め込み経路（`incremental.rs`）が同じ検証を行っており、この
+    // 再埋め込み経路だけ検証を欠くと後続の密ベクトル検索スコア・順位が
+    // 不定になる（codex-review P1・Cursor Bugbot 指摘・PR #259。
+    // coding-rust.md「エラー契約は fail-closed とする」）。
+    if vector.iter().any(|x| !x.is_finite()) {
+        return Err(crate::embedding::EmbedError::InvalidResponse);
+    }
     Ok(vector)
 }
 
@@ -1679,6 +1687,23 @@ mod tests {
                 got: 4,
             }
         );
+    }
+
+    #[test]
+    fn reembed_expansion_rejects_non_finite_vector() {
+        let embedder = StubEmbedder {
+            dim: 4,
+            response: vec![vec![0.0, f32::NAN, 0.0, 0.0]],
+        };
+        let err = reembed_expansion(&embedder, "q", &sample_expansion()).unwrap_err();
+        assert_eq!(err, crate::embedding::EmbedError::InvalidResponse);
+
+        let embedder = StubEmbedder {
+            dim: 4,
+            response: vec![vec![0.0, f32::INFINITY, 0.0, 0.0]],
+        };
+        let err = reembed_expansion(&embedder, "q", &sample_expansion()).unwrap_err();
+        assert_eq!(err, crate::embedding::EmbedError::InvalidResponse);
     }
 
     // --- 展開結果パース ---
