@@ -173,49 +173,14 @@ jobs:
           BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1
 
-  # --------------------------------------------------
-  # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準。
-  # workflow_dispatch 限定・BENCH_TIER opt-in）
-  # --------------------------------------------------
-  # 対話ティア／高精度ティアそれぞれのクエリ展開追加処理時間 p95・展開込み e2e
-  # p95 を、常駐 Ollama へ実接続して測定する。GitHub ホステッド runner には
-  # 常駐 Ollama が無いため、既定では `vars.BENCH_TIER` が未設定（空文字）のままで
-  # `tier_latency_bench.rs` 側が「測定不能」を明示ログ出力して判定対象外とする
-  # （silent skip にしない。`bench-batch` ジョブの BENCH_CORE6/BENCH_CORE16 opt-in
-  # と同一方針）。public リポジトリのため runner は GitHub ホステッドを既定とし、
-  # self-hosted の使用は codex-review の codex ジョブ（組織承認済み例外）に限る
-  # （AGENTS.md「CI・ワークフローの改変（P1）」）。本ジョブは `runs-on` を
-  # `ubuntu-latest` 固定とし、repo variable によるランナー差し替え経路は設けない。
-  # そのため `BENCH_TIER` を opt-in しても GitHub ホステッド runner には常駐
-  # Ollama が無く、`tier_latency_bench.rs` の Ollama 実接続は失敗して
-  # fail-closed で非ゼロ終了する。常駐 Ollama を用いた実測が必要な場合は、
-  # GitHub Actions 外の承認済み計測手順として分離する（README「ティア別
-  # レイテンシ受け入れ基準の repo variables」参照）。
-  bench-tier:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - name: Install Rust toolchain (rust-toolchain.toml)
-        run: rustup show
-      - name: Run bench-tier
-        # 数値基準（p95 上限）は spec（TASK-116・PLAN-4/6/7）が SSOT のため本
-        # ワークフローにはハードコードしない。接続先（host/port/model）も含め
-        # すべて repo variables から注入する。BENCH_TIER が未設定（空文字）の
-        # 既定では tier_latency_bench.rs 側が opt-in 未充足として明示ログを出し
-        # 判定対象外のまま正常終了する。
-        env:
-          BENCH_TIER: ${{ vars.BENCH_TIER }}
-          BENCH_TIER_OLLAMA_HOST: ${{ vars.BENCH_TIER_OLLAMA_HOST }}
-          BENCH_TIER_OLLAMA_PORT: ${{ vars.BENCH_TIER_OLLAMA_PORT }}
-          BENCH_TIER_DIALOGUE_MODEL: ${{ vars.BENCH_TIER_DIALOGUE_MODEL }}
-          BENCH_TIER_PRECISION_MODEL: ${{ vars.BENCH_TIER_PRECISION_MODEL }}
-          BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS: ${{ vars.BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS }}
-          BENCH_TIER_DIALOGUE_MAX_P95_MS: ${{ vars.BENCH_TIER_DIALOGUE_MAX_P95_MS }}
-          BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS: ${{ vars.BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS }}
-          BENCH_TIER_PRECISION_MAX_P95_MS: ${{ vars.BENCH_TIER_PRECISION_MAX_P95_MS }}
-        run: make bench-tier
+  # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本
+  # workflow に置かない。GitHub ホステッド runner には常駐 Ollama がなく、
+  # self-hosted runner の使用は codex-review の codex ジョブに限る組織承認済み
+  # 例外の範囲外（過去の同種指摘により self-hosted 経路は撤去済み。AGENTS.md
+  # 「CI・ワークフローの改変（P1）」）であるため、`BENCH_TIER` を opt-in しても
+  # 常に Ollama 接続に失敗し、どの設定でも受け入れ基準を実測して成功させる CI
+  # 経路が存在しない設計になってしまう（PR #269 Codex 指摘）。実測は GitHub
+  # Actions 外の承認済み計測手順（README「ティア別レイテンシ受け入れ基準の
+  # 実測手順」・`docs/design/tier-latency-acceptance.md`）のみを正式な入口とし、
+  # 判定ロジック層（`crates/engine/tests/tier_latency_accept.rs`）のみ
+  # `make ci` 対象として維持する。

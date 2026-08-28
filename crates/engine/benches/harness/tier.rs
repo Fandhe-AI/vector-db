@@ -85,12 +85,13 @@ pub fn build_corpus(count: usize, dim: usize, seed: u64) -> Vec<CorpusRow> {
         .collect()
 }
 
-/// `BENCH_TIER` repo variable の opt-in ゲートを有効化するかを返す。値が未設定・
+/// `BENCH_TIER` env の opt-in ゲートを有効化するかを返す。値が未設定・
 /// 空文字のときのみ「対象外」（`false`）とし、それ以外の非空値はすべて opt-in
 /// 要求とみなす（`batch_bench.rs::opt_in_requested_from_env` と同一方針。
-/// TASK-130・CORE-6/16 opt-in ゲートを踏襲。常駐 Ollama 前提の実測環境は
-/// GitHub ホステッド runner 既定では用意できないため、対応する repo variable が
-/// 明示的に設定された run でのみ実測ゲートを評価する）。
+/// TASK-130・CORE-6/16 opt-in ゲートを踏襲）。常駐 Ollama 前提の実測は CI
+/// 経路を持たず（README「ティア別レイテンシ受け入れ基準の実測手順」参照）、
+/// `make bench-tier` をローカル・外部計測環境で運用者が明示指定した run での
+/// み実測ゲートを評価する。
 pub fn opt_in_requested(raw: Option<&str>) -> bool {
     raw.map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
@@ -135,12 +136,11 @@ pub fn parse_model_name(raw: &str, var_name: &str) -> Result<String, String> {
 
 /// 接続ホストの生文字列を検証する（空文字は fail-closed で拒否するのみ）。
 ///
-/// GitHub Actions の未設定 repo variable は空文字列に解決される（`vars.*` が
-/// `Some("")` として env に渡る。`sql_c1_bench.rs::max_p95_from_env` 等と同じ
-/// 前提）ため、`OllamaConfig::with_host` に空文字列をそのまま渡さない
-/// （空文字列は IP リテラルとして解釈できずホスト名として素通りしてしまい、
-/// 未設定にもかかわらず接続を試みて分かりにくい接続エラーになる。README
-/// 「ティア別レイテンシ受け入れ基準の repo variables」が約束する fail-closed
+/// 未設定の env は空文字列として渡ってくる場合がある（`sql_c1_bench.rs::
+/// max_p95_from_env` 等と同じ前提）ため、`OllamaConfig::with_host` に空文字列を
+/// そのまま渡さない（空文字列は IP リテラルとして解釈できずホスト名として素通り
+/// してしまい、未設定にもかかわらず接続を試みて分かりにくい接続エラーになる。
+/// README「ティア別レイテンシ受け入れ基準の実測手順」が約束する fail-closed
 /// 契約を保つため、他の接続・閾値パラメータと同じ「空文字は明示エラー」に揃える）。
 /// ホスト名としての妥当性・ループバック制約自体は [`build_ollama_client`]
 /// （`OllamaConfig::with_host`）が引き続き検証する。

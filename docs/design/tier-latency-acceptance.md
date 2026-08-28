@@ -83,8 +83,8 @@ wire プロトコル経由・3 クライアントでのレイテンシ検証は 
 | 4 判定 | 対話ティア展開 p95・対話ティア e2e p95・高精度ティア展開 p95・高精度ティア e2e p95。いずれも `harness::accept::p95_from_samples`／`check_p95_within_limit` を再利用（複製しない） |
 | routing 検証 | 上記「ティア routing の実証」参照。閾値を満たしていても不一致なら fail |
 | 閾値・接続の注入 | `BENCH_TIER_DIALOGUE_MAX_EXPANSION_P95_MS`・`BENCH_TIER_DIALOGUE_MAX_P95_MS`・`BENCH_TIER_PRECISION_MAX_EXPANSION_P95_MS`・`BENCH_TIER_PRECISION_MAX_P95_MS`（正の整数・ms）・`BENCH_TIER_OLLAMA_HOST`／`BENCH_TIER_OLLAMA_PORT`／`BENCH_TIER_DIALOGUE_MODEL`／`BENCH_TIER_PRECISION_MODEL`。すべて env 経由で注入し本リポジトリにはハードコードしない |
-| opt-in ゲート | `BENCH_TIER`（非空文字で opt-in。`BENCH_CORE6`/`BENCH_CORE16` と同一方針）。未 opt-in の既定 run は「測定不能」を明示ログ出力し正常終了（判定対象外）。opt-in 済みで接続・閾値が未設定・不正なら fail-closed で非ゼロ終了 |
-| CI 配線 | `.github/workflows/bench.yml` の `bench-tier` ジョブ（`workflow_dispatch` 限定。常駐 Ollama 前提のため週次 `schedule` には含めない） |
+| opt-in ゲート | `BENCH_TIER`（非空文字で opt-in。ローカル・外部計測環境で運用者が明示指定する env）。未 opt-in の既定 run は「測定不能」を明示ログ出力し正常終了（判定対象外）。opt-in 済みで接続・閾値が未設定・不正なら fail-closed で非ゼロ終了 |
+| CI 配線 | なし。`.github/workflows/bench.yml` に `bench-tier` ジョブは置かない（GitHub ホステッド runner に常駐 Ollama が無く、self-hosted は組織承認済み例外の範囲外のため、opt-in の有無を問わず実測を成功させる CI 経路が存在しない。PR #269 Codex 指摘）。判定ロジック層 `crates/engine/tests/tier_latency_accept.rs` のみ `make ci` 対象。実測は README「ティア別レイテンシ受け入れ基準の実測手順」記載の Actions 外の承認済み手順で運用者が直接実行する |
 
 ## 実測状況
 
@@ -148,9 +148,11 @@ wire プロトコル経由・3 クライアントでのレイテンシ検証は 
    （実測値・pass・routing_matched のみ。閾値の数値は含まれない）を記録する。
 4. すべて `pass=true` かつ `routing_matched=true` であれば、本ドキュメントのステータス
    を Accepted に更新し、PLAN-4/6/7 を「充足」へ書き換える。
-5. リポジトリ管理者は `.github/workflows/bench.yml` の `bench-tier` ジョブ実行のため、
-   README「ティア別レイテンシ受け入れ基準の repo variables」に記載の repo variables
-   を設定する。
+5. `.github/workflows/bench.yml` に `bench-tier` ジョブは存在しない（GitHub ホステッド
+   runner に常駐 Ollama が無く、self-hosted は組織承認済み例外の範囲外のため、CI 経路
+   では opt-in の有無を問わず実測を成功させられない。PR #269 Codex 指摘）。本手順は
+   README「ティア別レイテンシ受け入れ基準の実測手順」に記載の Actions 外の承認済み
+   計測環境で運用者が直接実行する。
 
 ## 制約・スコープ外
 
@@ -158,8 +160,7 @@ wire プロトコル経由・3 クライアントでのレイテンシ検証は 
 - wire 経由・3 クライアントでのレイテンシ検証は TASK-117（PLAN-9）の管轄
 - 実測値が基準を満たさない場合のチューニング（プロンプト・モデル選定・タイムアウト
   調整等）は別 Issue の管轄
-- spec 側のステータス更新（PLAN-4/6/7 の Accepted 反映）・GitHub repo variables の
-  設定はオーナー作業
+- spec 側のステータス更新（PLAN-4/6/7 の Accepted 反映）はオーナー作業
 
 ## 参照
 

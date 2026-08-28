@@ -22,19 +22,21 @@
 //!
 //! # 常駐 Ollama 前提・opt-in（設計方針 5）
 //!
-//! GitHub ホステッド runner には常駐 Ollama が無くレイテンシ実測環境として不適
-//! なため、[`harness::tier::opt_in_requested`]（`BENCH_TIER` repo variable）が
-//! 明示的に要求された run でのみ実測する。未 opt-in の既定 run は「測定不能」を
-//! 明示ログ出力して判定対象外とする（silent skip 禁止。`batch_bench.rs` の
-//! `BENCH_CORE6`/`BENCH_CORE16` opt-in ゲートと同一方針）。opt-in 済みで接続・
-//! 閾値 env が未設定・不正な場合は fail-closed で非ゼロ終了する。
+//! 常駐 Ollama への実接続が前提のため、[`harness::tier::opt_in_requested`]
+//! （`BENCH_TIER` env）が明示的に要求された run でのみ実測する。未 opt-in の既定
+//! run は「測定不能」を明示ログ出力して判定対象外とする（silent skip 禁止）。
+//! opt-in 済みで接続・閾値 env が未設定・不正な場合は fail-closed で非ゼロ終了する。
 //!
 //! 数値基準（p95 上限）・接続先はいずれも env 経由で注入し、本ファイルには
 //! ハードコードしない。標準出力には実測値と pass/fail のみを記録し、注入された
 //! 閾値そのものは出力しない（`sql_c1_bench.rs` と同一方針）。
 //!
-//! `make bench-tier`（Makefile）・`.github/workflows/bench.yml`（`workflow_dispatch`
-//! 限定・`BENCH_TIER` opt-in）から実行する想定。判定ロジック自体（時間非依存）は
+//! `make bench-tier`（Makefile）から実行する。GitHub ホステッド runner には常駐
+//! Ollama が無く、self-hosted runner の使用は組織承認済み例外の範囲外（AGENTS.md
+//! 「CI・ワークフローの改変（P1）」）のため、`.github/workflows/bench.yml` に本
+//! ベンチの実行経路は置かない（opt-in の有無を問わず実測を成功させられないため。
+//! README「ティア別レイテンシ受け入れ基準の実測手順」参照）。実測は常駐 Ollama を
+//! 持つ環境で運用者が本コマンドを直接実行する。判定ロジック自体（時間非依存）は
 //! `harness::tier` にあり `tests/tier_latency_accept.rs` で `make ci` 側から回帰
 //! 検証する。
 

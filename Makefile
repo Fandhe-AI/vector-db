@@ -277,7 +277,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-tier
-bench-tier: ## TASK-116（PLAN-4/6/7）のティア別レイテンシ受け入れ基準ベンチを実行する（時間依存・常駐 Ollama 前提のため ci には含めない。.github/workflows/bench.yml から workflow_dispatch 限定・BENCH_TIER opt-in で実行。schedule 化はしない）
+bench-tier: ## TASK-116（PLAN-4/6/7）のティア別レイテンシ受け入れ基準ベンチを実行する（時間依存・常駐 Ollama 前提のため ci には含めない。CI 経路は存在せず README「ティア別レイテンシ受け入れ基準の実測手順」記載の Actions 外の承認済み計測環境で運用者が直接実行する）
 ifdef HAS_CARGO
 	cargo bench --bench tier_latency_bench -p engine
 else
