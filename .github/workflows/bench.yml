@@ -7,7 +7,7 @@ name: Bench
 #
 # schedule トリガ（毎週月曜 03:00 UTC。CI 混雑を避けるため PR/push トリガーとは
 # 独立した時間帯にする）は #168 で再追加済み。BENCH_MAX_P95_MS・BENCH_MIN_RECALL・
-# BENCH_BATCH_MAX_DEGRADATION_PCT・BENCH_MAX_CONTRAST_RATIO の repo variables 未設定の
+# BENCH_BATCH_MAX_DEGRADATION_PCT・BENCH_MAX_CONTRAST_RATIO の repo secrets 未設定の
 # まま schedule 実行された場合は `simd_bench.rs` / `batch_bench.rs` /
 # `contrast_bench.rs` 側の fail-closed により run が red になる（「一度も評価していない
 # run」が green として埋もれることはない）。CORE-5（対照エンジン接続。判定基準は
@@ -25,6 +25,30 @@ name: Bench
 # デコードを伴う）の p95 を恒常的な回帰ゲートとして schedule 実行すると、専有環境
 # 前提の基準に対して恒常的に red になりかねない（`sql_c1_bench.rs` 冒頭コメント参照。
 # `BENCH_DEDICATED_ENV` は GitHub ホステッド runner が専有環境でないため注入しない）。
+#
+# 閾値（spec 由来の非公開数値）は Actions secrets（`secrets.*`）から注入する
+# （Issue #286）。以前は repo variables（`vars.*`）を使っていたが、`run` ステップに
+# 渡す `env:` ブロックは Actions のログへ値付きでそのまま出力されるため、閾値の
+# 数値が public な Actions ログへ印字されてしまっていた（spec-confidentiality の
+# P0 違反。詳細は `docs/design/ci-gate-variables.md` 参照）。secrets は Actions が
+# ログ中の一致文字列を自動的に `***` へマスクするため同じ経路では漏えいしない。
+# opt-in フラグである `BENCH_CORE6`・`BENCH_CORE16`・`BENCH_DEDICATED_ENV` は
+# 非機密（有効/無効の 0/1・専有環境フラグ）のため repo variables のまま維持する。
+#
+# secrets を repo レベルに置くだけでは不十分（codex-review P0 指摘）: `workflow_dispatch`
+# は任意の ref を選んで起動でき、選択した ref の workflow YAML・`run` ステップが
+# そのまま実行される。そのため write 権限者が別ブランチで `run` ステップを書き換えて
+# `workflow_dispatch` すれば、repo レベルの secrets を任意の処理（外部送信を含む）へ
+# 渡せてしまう——ログのマスクは Actions のログ出力にのみ効くもので、run ステップが
+# secrets を別経路（外部 HTTP リクエスト等）へ渡すこと自体は防がない。そのため
+# 閾値 secrets は repo レベルではなく Environment `bench-gate`（deployment branch
+# policy で `main` のみに制限。リポジトリ管理者が事前に作成）に置き、閾値 secrets を
+# 使う全 job（bench-simd・bench-contrast・bench-batch・bench-c1）に
+# `environment: bench-gate` を指定する（recall.yml が `recall-gate` で採用している
+# 実行境界と同一方針。各 job の `if: github.ref == 'refs/heads/main'`・
+# `checkout ref: main` は defense-in-depth として維持する）。main 以外の ref から
+# `workflow_dispatch` した run は environment `bench-gate` にアクセスできないため、
+# 閾値 secrets を取得できず、上記の書き換え経路は成立しない。
 on:
   workflow_dispatch: {}
   schedule:
@@ -49,20 +73,39 @@ jobs:
   # ci.yml の crash-test 系ジョブと同一の SHA 固定で参照する（AGENTS.md「CI・ワークフロー
   # の改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
   bench-simd:
+    # `workflow_dispatch` で main 以外の ref が選ばれた場合は job ごとスキップする
+    # （冒頭コメント参照。閾値 secrets を任意 ref の書き換えコードへ渡さないための
+    # fail-closed な制約。recall.yml の recall-regression job と同一方針）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment 保護（deployment branch policy で main のみに制限。
+    # リポジトリ管理者が事前に作成済み）が実際の実行境界。`secrets.BENCH_MAX_P95_MS`
+    # 等はこの environment の secrets として設定し、repo レベルには置かない
+    # （codex-review P0 指摘対応。write 権限者が別ブランチで run ステップを書き換えて
+    # `workflow_dispatch` しても、main 以外の ref からは environment `bench-gate`
+    # にアクセスできず secrets を取得できない。ログのマスクだけでは外部送信を
+    # 防げないため、実行境界そのものを main 限定にする）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （`if: github.ref == 'refs/heads/main'` と合わせた二重の固定。
+          # 万一 if 条件をすり抜けても untrusted な ref のコードを実行しない。
+          # recall.yml と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-simd
         # 数値基準（p95 上限・Recall 下限）は spec（TASK-127）が SSOT のため本ワークフロー
-        # にはハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する
-        # （spec の定量値を secrets 化してまで隠す運用は取らないが、実測ログに閾値・
-        # 実測値の数値そのものは載せない——`crates/engine/benches/simd_bench.rs` が
+        # にはハードコードしない。リポジトリの Actions secrets（`secrets.*`。Issue
+        # #286）から注入する（`env:` ブロックがログへ値付きで印字される variables
+        # では閾値そのものが public ログへ漏えいするため secrets 化した。冒頭コメント
+        # 参照）。実測ログに閾値・実測値の数値そのものは載せない——`crates/engine/benches/simd_bench.rs` が
         # 標準出力へ pass/fail のみを書き出す設計になっている。実測値は `--verbose`
         # opt-in 限定で、GitHub Actions 下では fail-closed で拒否される。Issue #277。
         # `contrast_bench.rs`〔CORE-5・Issue #224〕と同方針）。`--verbose` は付けない。
@@ -71,8 +114,8 @@ jobs:
         # `contrast_bench.rs`（下記 bench-contrast ジョブ）が独立バイナリとして
         # 判定する（Issue #176）。
         env:
-          BENCH_MAX_P95_MS: ${{ vars.BENCH_MAX_P95_MS }}
-          BENCH_MIN_RECALL: ${{ vars.BENCH_MIN_RECALL }}
+          BENCH_MAX_P95_MS: ${{ secrets.BENCH_MAX_P95_MS }}
+          BENCH_MIN_RECALL: ${{ secrets.BENCH_MIN_RECALL }}
         run: make bench-simd
 
   # --------------------------------------------------
@@ -84,13 +127,23 @@ jobs:
   # 波及しない failure domain 分離。`Cargo.toml` の `contrast-bench` feature コメント
   # 参照）。既定ゲート化（旧 opt-in repo variable の撤去）は本 Issue #176 の目的の一つ。
   bench-contrast:
+    # bench-simd と同じ実行境界（冒頭コメント・bench-simd 参照）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_MAX_CONTRAST_RATIO` はこの environment の
+    # secrets として設定する（bench-simd と同一方針）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-contrast
@@ -99,7 +152,7 @@ jobs:
         # `contrast_bench.rs` 側が fail-closed で非ゼロ終了する（variable 未設定のまま
         # schedule run が実行された場合も red になり、false green にはならない）。
         env:
-          BENCH_MAX_CONTRAST_RATIO: ${{ vars.BENCH_MAX_CONTRAST_RATIO }}
+          BENCH_MAX_CONTRAST_RATIO: ${{ secrets.BENCH_MAX_CONTRAST_RATIO }}
         run: make bench-contrast
 
   # --------------------------------------------------
@@ -111,19 +164,32 @@ jobs:
   # 扱う（`batch_bench.rs` 冒頭コメント参照）。bench-simd ジョブと同様、
   # schedule / workflow_dispatch の両方で実行する（#168）。
   bench-batch:
+    # bench-simd と同じ実行境界（冒頭コメント・bench-simd 参照）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_BATCH_MAX_DEGRADATION_PCT`・
+    # `secrets.BENCH_CORE6_MIN_IMPROVEMENT_PCT`・
+    # `secrets.BENCH_CORE16_MIN_IMPROVEMENT_PCT` はこの environment の secrets
+    # として設定する（bench-simd と同一方針）。opt-in フラグ `BENCH_CORE6`/
+    # `BENCH_CORE16` は非機密のため repo variables のまま（`vars.*`）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-batch
         # 数値基準（劣化率上限）は spec（TASK-130）が SSOT のため本ワークフローには
-        # ハードコードしない。リポジトリの Actions variables（`vars.*`）から注入する。
-        # BENCH_BATCH_MAX_DEGRADATION_PCT が未設定の場合は `batch_bench.rs` 側が
+        # ハードコードしない。リポジトリの Actions secrets（`secrets.*`。Issue #286）
+        # から注入する。BENCH_BATCH_MAX_DEGRADATION_PCT が未設定の場合は `batch_bench.rs` 側が
         # fail-closed で非ゼロ終了する。BENCH_CORE6/BENCH_CORE16 は repo variable が
         # 未設定（既定）なら対象外として扱う opt-in フラグで、リポジトリ管理者が
         # `gh variable set BENCH_CORE6 1` 等で有効化する想定（Issue #178・#234 で実
@@ -142,11 +208,11 @@ jobs:
         # では拒否する二重化。実測値が必要な場合は承認済み計測環境で
         # `BENCH_VERBOSE=1 make bench-batch` を直接実行する）。
         env:
-          BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ vars.BENCH_BATCH_MAX_DEGRADATION_PCT }}
+          BENCH_BATCH_MAX_DEGRADATION_PCT: ${{ secrets.BENCH_BATCH_MAX_DEGRADATION_PCT }}
           BENCH_CORE6: ${{ vars.BENCH_CORE6 }}
           BENCH_CORE16: ${{ vars.BENCH_CORE16 }}
-          BENCH_CORE6_MIN_IMPROVEMENT_PCT: ${{ vars.BENCH_CORE6_MIN_IMPROVEMENT_PCT }}
-          BENCH_CORE16_MIN_IMPROVEMENT_PCT: ${{ vars.BENCH_CORE16_MIN_IMPROVEMENT_PCT }}
+          BENCH_CORE6_MIN_IMPROVEMENT_PCT: ${{ secrets.BENCH_CORE6_MIN_IMPROVEMENT_PCT }}
+          BENCH_CORE16_MIN_IMPROVEMENT_PCT: ${{ secrets.BENCH_CORE16_MIN_IMPROVEMENT_PCT }}
         run: make bench-batch
 
   # --------------------------------------------------
@@ -159,14 +225,24 @@ jobs:
   # （参考値としての p95/Recall 実測とゲートの土台整備が本ジョブの目的で、条件7 の
   # 最終判定はオーナーが専有環境で `make bench-c1` を実行して行う）。
   bench-c1:
-    if: github.event_name == 'workflow_dispatch'
+    # workflow_dispatch 限定（既存方針）に加え、main 以外の ref が選ばれた場合は
+    # job ごとスキップする（bench-simd と同じ実行境界。冒頭コメント参照）。
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_SQL_C1_MAX_P95_MS`・`secrets.BENCH_SQL_C1_MIN_RECALL`
+    # はこの environment の secrets として設定する（bench-simd と同一方針）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-c1
@@ -174,14 +250,14 @@ jobs:
         # 本ワークフローにはハードコードしない。bench-simd の
         # BENCH_MAX_P95_MS・BENCH_MIN_RECALL は provider 単体（CORE-3・SEARCH-4・
         # CORE-4）の基準であり SQL-1 とは出所が異なるため流用せず、SQL-1 専用の
-        # repo variables を使う。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
+        # repo secrets を使う（Issue #286）。未設定の場合は `sql_c1_bench.rs` 側が fail-closed で
         # 非ゼロ終了する。`sql_c1_bench.rs` は既定で pass/fail・非数値状態のみを
         # 出力し実測値を public ログへ出さない（Issue #278・AGENTS.md P0）。
         # `BENCH_SQL_C1_VERBOSE` は本ワークフローから注入しない（注入しても
         # `GITHUB_ACTIONS` 検出で fail-closed に非ゼロ終了する）。
         env:
-          BENCH_SQL_C1_MAX_P95_MS: ${{ vars.BENCH_SQL_C1_MAX_P95_MS }}
-          BENCH_SQL_C1_MIN_RECALL: ${{ vars.BENCH_SQL_C1_MIN_RECALL }}
+          BENCH_SQL_C1_MAX_P95_MS: ${{ secrets.BENCH_SQL_C1_MAX_P95_MS }}
+          BENCH_SQL_C1_MIN_RECALL: ${{ secrets.BENCH_SQL_C1_MIN_RECALL }}
         run: make bench-c1
 
   # bench-tier（TASK-116 PLAN-4/6/7 のティア別レイテンシ受け入れ基準）は本

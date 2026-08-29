@@ -128,10 +128,11 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 - spec の基準充足判定（Recall@20 絶対下限・改善幅の下限）は environment
   `recall-gate` の閾値ゲート（層 B）で行う。値そのもの（spec 由来の数値基準）は
   本レポートには記載しない
-- Actions variables（`RERANK_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
-  作業（README「Recall 回帰ハーネスの repo variables」参照。variable ↔ spec
+- Actions secrets（`RERANK_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
+  作業（README「Recall 回帰ハーネスの repo secrets」参照。secret ↔ spec
   ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
-  Issue #286）
+  当初は Actions variables を使っていたが、`env:` ブロックのログ印字による
+  漏えいを防ぐため secrets へ移行した（Issue #286）
 
 [`SparseIndex::build`]: ../../crates/engine/src/sparse.rs
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs

@@ -8,7 +8,8 @@
   いずれもマージ済み（PR #138・#142・#144）
 - 関連: TASK-106（`docs/design/cjk-tokenizer-impact-ja-corpus.md`。決定的合成コーパス
   生成・固定値回帰トラッキング方式の先行実装）・TASK-127（`crates/engine/benches/
-  simd_bench.rs`。spec 閾値の Actions variables 注入パターンの先行実装）
+  simd_bench.rs`。spec 閾値の Actions secrets 注入パターンの先行実装。
+  当初は variables を使っていたが Issue #286 で secrets へ移行）
 
 ## 背景
 
@@ -32,7 +33,9 @@
 - **層 B**（`#[ignore]`。`make recall-regression` 経由）: spec 由来の Recall 下限
   （`HYBRID_RECALL_MIN_R20_SMALL`・`HYBRID_RECALL_MIN_R20_LARGE`・
   `HYBRID_RECALL_MIN_R100_LARGE`。`.github/workflows/recall.yml` が environment
-  `recall-gate` の Actions variables から注入）と実測値を比較する閾値ゲート。
+  `recall-gate` の Actions secrets から注入。Issue #286・`env:` ブロックの
+  ログ印字による漏えいを防ぐため variables ではなく secrets を使う）と実測値を
+  比較する閾値ゲート。
   ローカルの `make recall-regression`（`HYBRID_RECALL_REQUIRE_THRESHOLDS` を
   注入しない）では未設定（GitHub Actions では空文字列に解決される variable も
   含む）は「ゲート未設定＝明示的に対象外」を出力して成功終了し
@@ -40,7 +43,7 @@
   opt-in パターン）、設定済みで非数値・範囲外は fail-closed でテスト失敗とする。
   `recall.yml` からの実行は strict モード（下記「strict モードによる誤 green
   防止」参照）が既定で有効なため、未設定も fail-closed になる。ログには実測値と
-  pass/fail のみを出力する（README「Recall 回帰ハーネスの repo variables」参照）。
+  pass/fail のみを出力する（README「Recall 回帰ハーネスの repo secrets」参照）。
 
   `.github/workflows/recall.yml` は `pull_request` トリガを**意図的に持たない**
   （`workflow_dispatch` + 週次 `schedule`。下記「strict モードによる誤 green
@@ -67,18 +70,18 @@
   workflow_dispatch は選択した ref の YAML 定義をそのまま実行するため、write
   権限者が別ブランチでこのガードを外した `recall.yml` を push して
   `workflow_dispatch` すれば実行境界として機能しない。加えて repo レベルの
-  Actions variables はどのブランチのどの workflow からも読めるため、YAML 内の
+  Actions secrets はどのブランチのどの workflow からも読めるため、YAML 内の
   if 条件だけでは `HYBRID_RECALL_MIN_*` の参照自体を防げない
   （Cursor Bugbot High 指摘）。
 
   そのため実際の実行境界は YAML の条件式ではなく GitHub Environments の
   ブランチ保護で作る: `recall-regression` job に `environment: recall-gate`
   を指定し、`HYBRID_RECALL_MIN_*` は repo レベルではなく environment
-  `recall-gate` の variables として設定する（参照記法は repo レベル variables と
-  同じ `vars.*` だが、job の `environment:` 指定により解決スコープが
+  `recall-gate` の secrets として設定する（参照記法は repo レベル secrets と
+  同じ `secrets.*` だが、job の `environment:` 指定により解決スコープが
   environment レベルへ切り替わる）。environment `recall-gate` は deployment
   branch policy で `main` のみに制限して作成する（リポジトリ管理者作業。
-  README「Recall 回帰ハーネスの repo variables」参照）。main 以外の ref から
+  README「Recall 回帰ハーネスの repo secrets」参照）。main 以外の ref から
   起動した run は environment `recall-gate` にアクセスできないため、別ブランチの
   改変 YAML から `if`／`checkout ref` を外して `workflow_dispatch` したとしても
   environment 自体にアクセスできず閾値を取得できない。`if:
@@ -89,8 +92,8 @@
 
 層 B の opt-in 方式（未設定＝「対象外」として成功終了）は PR 実行を想定した
 設計だったが、`recall.yml` からの実行（現状 `workflow_dispatch` のみ）では
-別の問題を生む: environment `recall-gate` の作成漏れ・variable 名の打ち間違い・
-variable の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、opt-in 方式では
+別の問題を生む: environment `recall-gate` の作成漏れ・secret 名の打ち間違い・
+secret の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、opt-in 方式では
 「一度も評価していない run」が「基準を満たした run」と同じ green になり、閾値
 ゲートが実質的に機能を失っていても気付けない（codex-review P1 継続指摘）。
 
@@ -106,10 +109,10 @@ variable の誤削除で `HYBRID_RECALL_MIN_*` が読めなくなった場合、
 接続確認後に `schedule` を再度追加する）と同型の判断として、`recall.yml` も
 一旦 `schedule` トリガを外し `workflow_dispatch` のみとしていた。Issue #168 の
 オーナー判断により `schedule`（週次・月曜 04:00 UTC）を再度追加済みだが、
-environment `recall-gate` の variables 設定・strict モードでの手動実行による
+environment `recall-gate` の secrets 設定・strict モードでの手動実行による
 疎通確認はリポジトリ管理者作業として別途必要（未実施のまま週次 run が走った
 場合は fail-closed で red になる。false green にはならない。README「Recall
-回帰ハーネスの repo variables」参照）。
+回帰ハーネスの repo secrets」参照）。
 
 ### コーパス・QA セットの生成
 
@@ -230,10 +233,11 @@ PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に�
 - **クエリ展開との統合測定**: SEARCH-2 の前提にはクエリ展開（PLAN-5 系、TASK-109
   以降）が含まれるが未実装のため、本ハーネスはハイブリッド検索単体（クエリ展開なし）
   の測定に留める
-- Actions variables（`HYBRID_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
-  作業（README「Recall 回帰ハーネスの repo variables」参照。variable ↔ spec
+- Actions secrets（`HYBRID_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
+  作業（README「Recall 回帰ハーネスの repo secrets」参照。secret ↔ spec
   ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
-  Issue #286）
+  当初は Actions variables を使っていたが、`env:` ブロックのログ印字による
+  漏えいを防ぐため secrets へ移行した（Issue #286）
 
 [`SparseIndex::build`]: ../../crates/engine/src/sparse.rs
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs

@@ -8,8 +8,8 @@
 - 前提: TASK-127（性能・Recall 受け入れ基準の回帰テスト化。PR #143）で CORE-3/CORE-4
   は稼働済み。CORE-5 は対照エンジンクレート未導入のため `BENCH_CORE5` repo variable
   による opt-in（既定「対象外」）のまま未接続だった
-- 関連: `docs/design/hybrid-recall-regression.md`（spec 閾値の Actions variables
-  注入パターンの先例）
+- 関連: `docs/design/hybrid-recall-regression.md`（spec 閾値の Actions secrets
+  注入パターンの先例。当初は variables を使っていたが Issue #286 で移行）
 
 ## 背景
 
@@ -79,7 +79,7 @@ feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）
 実行するため、`contrast-bench` feature は PR ごとの `make ci`・CI で常時有効化され
 usearch の C++ ビルドが走る（GitHub ホステッド `ubuntu-latest` には g++ が同梱済み。
 初回 1〜3 分、以降はビルドキャッシュ次第）。ローカル実行にも C++17 コンパイラが必要
-になる（README「回帰ベンチの repo variables」に明記）。`deny.toml` は
+になる（README「回帰ベンチの Environment `bench-gate` secrets」に明記）。`deny.toml` は
 `[graph] all-features = true` を追加し、optional 依存も advisories/licenses/sources/
 bans の監査対象に含めた（fail-closed）。
 
