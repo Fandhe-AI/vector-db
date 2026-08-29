@@ -278,23 +278,18 @@ codex-review P1 指摘対応。当初は決定的・id 非依存にそのグル�
 回帰があったため、削除ではなく観測範囲の保持へ変更した）
 `complete_boundary_tie_group` を追加した。
 
-**採用規約と不採用案**: 位置順位（従来挙動。同点グループが大きいほど id の小さい
-候補が根拠なく高順位を得る id 依存バイアスがある）に対し、グループ末尾順位
-（`GroupEnd`）・グループ先頭順位（competition ranking）・平均順位（fractional
-ranking）を層 A の固定値アサーション（`crates/engine/tests/hybrid_recall.rs`）で
-比較し、`GroupEnd` を採用した
-（先頭順位は id 非依存性は満たすが到達率が位置順位を下回る場合があり、平均順位は
-非整数の順位を扱う実装コストに見合う改善幅がなかった）。BM25（疎チャネル）の
-`k1`/`b` の変更は不採用（既定値からの変更は一般性に乏しい）。密プール境界の
-同点グループ完全化は、`pool_depth` を跨ぐ同点グループが id 依存の切り詰めで
-一部だけ取り込まれる問題を、決定的（完全に含めるか完全に除外するかの二択。
-2 度目の provider 呼び出しはしない）に解消する。当初は疎チャネル（BM25 スコアは
-連続値のため同点が実質発生しない）を対象外としていたが、codex-review 指摘
-（PR #320）により同一語頻度・同一文書長の文書は同一スコアになりうると判明した
-ため、密側と同じ `complete_boundary_tie_group`（汎用化した
-`complete_boundary_tie_group_by`）を疎側（`search_within` の拡張取得結果）にも
-適用する形へ改めた（`crates/engine/src/hybrid.rs`）。`rerank.rs` の RRF 型融合への
-`TieRank` 適用は引き続き本 Issue の対象外（フォローアップ候補）。
+**採用した同点順位規約**: RRF 融合の同点順位処理を、位置順位（従来挙動）から
+グループ末尾順位（`TieRank::GroupEnd`・modified competition ranking）へ変更
+（SEARCH-1・SEARCH-3。`crates/engine/src/hybrid.rs::accumulate_ranked` の
+`TieRank` 分岐。詳細は `docs/spec/04-behavior/search.md` 参照）。同時に密プール
+境界の同点グループ完全化（`complete_boundary_tie_group`・`complete_boundary_
+tie_group_by`）を追加し、`pool_depth` 境界が同点グループの途中を切る場合に
+グループ全体を含める（観測できた範囲を保持し位置ベースの `pool_depth` 件切り詰めへ
+フォールバック）。疎チャネル（BM25 スコア）についても、同一語頻度・同一文書長で
+同点が発生しうるため同じ完全化ロジックを適用（`crates/engine/src/hybrid.rs`）。
+`rerank.rs::LexicalOverlapReranker::rank_fused` の `TieRank` 規約統一実装済み
+（`rank_fused` を位置順位から `GroupEnd` へ揃えた。実装の詳細は
+`docs/design/rerank-recall-regression.md`「実測結果」節参照）。
 
 **フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
 `VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも

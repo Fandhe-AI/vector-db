@@ -1284,10 +1284,11 @@ fn complete_boundary_tie_group(
 /// `dense.len() == pool_depth` かつ `!exhaustive`（＝呼び出し元が `fetch_k`（多めの
 /// 取得件数）を [`MAX_POOL_DEPTH`] で頭打ちにされ、`pool_depth` を超える拡張取得が
 /// できなかったケース。`hybrid_search_boosted` 参照）の場合、境界（末尾要素）が
-/// 可視集合内の未取得候補と同点かどうかを比較対象なしに判定できない。この場合も
-/// `dense.len() > pool_depth` の場合と同じ「確定できなければ安全側（id 非依存）で
-/// 末尾の同点グループを丸ごと除外する」規約に従う（2 回目の
-/// `MAX_POOL_DEPTH` 頭打ちで検出漏れになっていた codex-review P1 指摘対応）。
+/// 可視集合内の未取得候補と同点かどうかを比較対象なしに判定できない。この場合
+/// グループ終端を確定できないため、観測できた範囲を保持したまま位置ベースの
+/// `pool_depth` 件切り詰めへフォールバックする（2 回目の `MAX_POOL_DEPTH` 頭打ちで
+/// 検出漏れになっていた codex-review P1 指摘対応。丸ごと除外すると全件同点コーパス
+/// で結果が空になる回帰があった）。
 pub(crate) fn complete_boundary_tie_group_by<T>(
     dense: Vec<T>,
     pool_depth: usize,
