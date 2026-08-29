@@ -159,6 +159,25 @@ CONTROL_FACTOR` 等）が実際に劣化を検知できることを示すミュ�
 失敗することを確認する。詳細・限界（緩やかな劣化までは保証しない点）は
 リンク先の節を参照。
 
+### PR #319 継続指摘: クエリ単位カバレッジの追加・ミューテーションテストの対照値衝突修正
+
+`docs/design/hybrid-recall-regression.md`「PR #319 継続指摘」節と同一方針で
+2 点を修正した。
+
+1. **クエリ単位カバレッジ検査の追加**（codex-review P1 指摘）: 従来は合計
+   hit 数の chance level 比較のみで、「一部クエリだけが多数 hit を稼ぎ残り
+   大半が 0 hit」という部分的な劣化を素通りさせ得た。`RerankRecallResult` へ
+   `baseline_queries_hit20`/`after_queries_hit20`（上位 20 件から正解を 1 件も
+   拾えなかったクエリを除いた件数）を追加し、`qa.len()` に対する最低割合
+   （`MIN_QUERY_COVERAGE_PERCENT`＝70%。`hybrid_recall.rs::
+   LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT` と同一の設計値・同一の理由）を
+   baseline・after それぞれで下回らないことをアサートする。
+2. **ミューテーションテストの対照値がシフト衝突で真の Recall を測ってしまう**
+   （Cursor Bugbot Medium 指摘）: `hybrid_recall.rs`「PR #319 継続指摘」節と
+   同一の原因（ミューテーション側のクエリ差し替えシフトと `measure_rerank_recall`
+   内部の対照値計算シフトがどちらも `+1` で衝突していた）。ミューテーション側の
+   シフト量を `+2` へ変更し、対照値が実際に chance level を測るようにした。
+
 ## 既知の制約・スコープ外
 
 - **暫定リランカーの効果測定である**: 同梱リランカー（[`LexicalOverlapReranker`]）は

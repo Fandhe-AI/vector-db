@@ -416,6 +416,35 @@ P1 指摘を受け、`hybrid_recall.rs` の小規模段・大規模段の両方�
 点は限界として残る——その領域の検知は引き続き層 B（`recall-gate`）が main
 ブランチ上で担う。
 
+### PR #319 継続指摘: 小規模段カバレッジ下限の分離・ミューテーションテストの対照値衝突修正
+
+上記の初版実装には 2 件の codex-review P1 指摘と Cursor Bugbot Medium 指摘が
+入った。
+
+1. **小規模段・大規模段でカバレッジ下限を共有していた**: `MIN_QUERY_COVERAGE_PERCENT`
+   を両段で共有していたため、小規模段（60 クエリ）でも 18 クエリが 0 hit へ
+   劣化してなお層 A が通過し得た。上記の設計意図（「小規模段は決定的コーパスに
+   対して全クエリが hit する実測が安定していたため、より厳格な余裕を確保している」）
+   と実装が不一致だった。大規模段専用の `LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT`
+   （70%）へ改名し、小規模段は `cjk_tokenizer_impact.rs` と同じ厳格な下限
+   `queries_hit20 == qa.len()`（`assert_eq!`）へ変更した。`rerank_recall.rs`
+   （大規模段のみを持つ）にも同型のクエリ単位カバレッジ検査
+   （`baseline_queries_hit20`/`after_queries_hit20`・`MIN_QUERY_COVERAGE_PERCENT`
+   ＝70%）を新規追加した（従来は合計 hit 数と chance level 比較のみで、
+   クエリ単位カバレッジの検査を持たなかった）。
+2. **ミューテーションテストの対照値がシフト衝突で真の Recall を測ってしまう**:
+   ミューテーションテストはクエリを `qa[idx + 1]` へ差し替えるが、
+   `measure_recall`/`measure_rerank_recall` 内部の対照値計算も同じ `+1` シフト
+   （`control_correct = qa[(idx + 1) % qa.len()].correct`）を使うため、
+   ケース `idx` が実際に使うクエリ（`qa[idx + 1]`）の真の正解集合と対照値が
+   完全に一致してしまっていた。その結果 `hits20 > control_hits20 * CONTROL_FACTOR`
+   は「chance level 対 真の Recall」の比較になり、検索が正しく機能する限り
+   常に false（＝この比較単体では「検知できた」と「そもそも測れていない」を
+   区別できない）になる構造的な欠陥だった（Cursor Bugbot Medium 指摘）。
+   ミューテーション側のシフト量を `+1` から `+2` へ変更し、内部シフトとの
+   衝突を避けることで、対照値が実際に chance level を測るようにした
+   （`hybrid_recall.rs`・`rerank_recall.rs` 双方に適用）。
+
 ## 既知の制約・スコープ外
 
 - **合成コーパスによる暫定測定**: 実コーパスでの評価は未了（TASK-106 と同種の制約）

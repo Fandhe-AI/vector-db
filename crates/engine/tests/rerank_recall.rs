@@ -317,6 +317,14 @@ struct RerankRecallResult {
     /// codex-review P1 対応。`CONTROL_FACTOR` 参照）。
     control_baseline_hits20: usize,
     control_after_hits20: usize,
+    /// 上位 20 件から正解を 1 件も拾えなかったクエリを除いた、baseline/after
+    /// それぞれの hit したクエリ数（`hybrid_recall.rs::RecallResult::
+    /// queries_hit20` と同型。PR #319 codex-review P1 対応）。合計 hit 数の
+    /// chance level 比較だけでは「一部クエリだけが多数 hit を稼ぎ、残り大半が
+    /// 0 hit」という部分的な劣化を素通りさせてしまうため、クエリ単位の
+    /// カバレッジも独立に検知する。
+    baseline_queries_hit20: usize,
+    after_queries_hit20: usize,
 }
 
 impl RerankRecallResult {
@@ -369,6 +377,8 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
     let mut ceil200 = 0usize;
     let mut control_baseline_hits20 = 0usize;
     let mut control_after_hits20 = 0usize;
+    let mut baseline_queries_hit20 = 0usize;
+    let mut after_queries_hit20 = 0usize;
 
     for (idx, case) in qa.iter().enumerate() {
         total_correct += case.correct.len();
@@ -402,10 +412,14 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
 
         // ---- baseline: リランキングなし（プール先頭 20 件） ----
         let baseline_top20: Vec<u64> = pool.iter().take(20).map(|h| h.id).collect();
-        baseline_hits20 += baseline_top20
+        let baseline_case_hits20 = baseline_top20
             .iter()
             .filter(|id| case.correct.contains(id))
             .count();
+        baseline_hits20 += baseline_case_hits20;
+        if baseline_case_hits20 > 0 {
+            baseline_queries_hit20 += 1;
+        }
         control_baseline_hits20 += baseline_top20
             .iter()
             .filter(|id| control_correct.contains(id))
@@ -430,10 +444,14 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
             .collect();
         let reranked = rerank_candidates(&reranker, &case.query_text, &candidates, &rerank_cfg)
             .expect("rerank_candidates ok");
-        after_hits20 += reranked
+        let after_case_hits20 = reranked
             .iter()
             .filter(|h| case.correct.contains(&h.id))
             .count();
+        after_hits20 += after_case_hits20;
+        if after_case_hits20 > 0 {
+            after_queries_hit20 += 1;
+        }
         control_after_hits20 += reranked
             .iter()
             .filter(|h| control_correct.contains(&h.id))
@@ -451,6 +469,8 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
         ceil200,
         control_baseline_hits20,
         control_after_hits20,
+        baseline_queries_hit20,
+        after_queries_hit20,
     }
 }
 
@@ -458,6 +478,19 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
 /// 許容倍率（`hybrid_recall.rs::CONTROL_FACTOR` と同じ設計値。spec 由来の
 /// 非公開数値ではない。Issue #312 codex-review P1 対応）。
 const CONTROL_FACTOR: usize = 3;
+
+/// [`RerankRecallResult::baseline_queries_hit20`]/[`after_queries_hit20`] が
+/// `qa.len()` に対して満たすべき最低割合（パーセント）。集計 hit 数の
+/// chance level 比較（[`CONTROL_FACTOR`]）だけでは「一部クエリだけが多数 hit を
+/// 稼ぎ、残り大半のクエリは正解を 1 件も拾えていない」という部分的な劣化を
+/// 素通りさせてしまう（PR #319 codex-review P1 対応。`hybrid_recall.rs::
+/// LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT` と同一の設計値・同一の理由）。
+/// 本ファイルは大規模段（`LARGE_NUM_DOCS`/`LARGE_NUM_QUERIES`）のみを持ち、
+/// 疎・密チャネルの非完全な観測（[`generate_corpus`] のドロップアウト・デコイ）
+/// により少数クエリが構造的に 0 hit となり得るため、実測に対して十分な余裕を
+/// 持たせた下限とする。テストハーネス自身が定める設計値であり、spec 由来の
+/// 非公開数値ではない。
+const MIN_QUERY_COVERAGE_PERCENT: usize = 70;
 
 /// Issue #312: `hybrid_recall.rs::qa_accounting` と同じ設計の会計整合ヘルパ。
 /// `total_correct`/`ceil20`/`ceil100`/`ceil200` を QA セット（[`QaCase::correct`]）
@@ -636,6 +669,22 @@ fn rerank_recall_large_scale_regression() {
         "after の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
          十分に上回らなかった"
     );
+    // クエリ単位カバレッジ（PR #319 codex-review P1 対応。`hybrid_recall.rs` と
+    // 同じ理由）: 合計 hit 数の chance level 比較だけでは、一部クエリだけが
+    // hit 数を稼ぎ残り大半が 0 件という部分的な劣化を素通りさせてしまう。
+    // 上位 20 件から正解を 1 件も拾えなかったクエリの割合が
+    // [`MIN_QUERY_COVERAGE_PERCENT`] を下回らないことを baseline/after
+    // それぞれで確認する。
+    assert!(
+        r.baseline_queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
+        "baseline でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
+         （一部クエリで正解を 1 件も拾えていない懸念）"
+    );
+    assert!(
+        r.after_queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
+        "after でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
+         （一部クエリで正解を 1 件も拾えていない懸念）"
+    );
 }
 
 /// PR #319 codex-review P1 対応: `rerank_recall_large_scale_regression` の
@@ -663,11 +712,24 @@ fn rerank_recall_regression_detects_query_answer_mismatch() {
     );
     assert!(!qa.is_empty());
 
+    // クエリだけをケース i+2 のものへ差し替える（正解集合はケース i のまま）。
+    // シフト量は 1 ではなく 2 を使う: [`measure_rerank_recall`] 内部の対照値
+    // 計算（`control_correct = qa[(idx + 1) % qa.len()].correct`）は「ケース
+    // idx が実際に使うクエリの真の正解集合」と偶然一致してはならない（一致
+    // すると対照値が chance level ではなく真の Recall を測ってしまい、
+    // `hits20 > control_hits20 * CONTROL_FACTOR` が常に false になり実際の
+    // 劣化検知力を示せなくなる）。シフトを 1 にすると、ケース idx が使う
+    // クエリ＝`qa[idx + 1]` の真の正解集合が、内部シフトの参照先
+    // `mismatched_qa[idx + 1].correct` = `qa[idx + 1].correct` と完全に
+    // 一致してしまう（Cursor Bugbot 指摘・PR #319。`hybrid_recall.rs::
+    // hybrid_recall_small_scale_regression_detects_query_answer_mismatch`
+    // と同一の対応）。シフトを 2 にすることでこの衝突を避け、対照値が真の
+    // chance level を測るようにする。
     let mismatched_qa: Vec<QaCase> = qa
         .iter()
         .enumerate()
         .map(|(idx, case)| {
-            let wrong_query = &qa[(idx + 1) % qa.len()];
+            let wrong_query = &qa[(idx + 2) % qa.len()];
             QaCase {
                 query_text: wrong_query.query_text.clone(),
                 query_vector: wrong_query.query_vector.clone(),
@@ -680,11 +742,18 @@ fn rerank_recall_regression_detects_query_answer_mismatch() {
 
     let baseline_assertion_holds = r.baseline_hits20 > r.control_baseline_hits20 * CONTROL_FACTOR;
     let after_assertion_holds = r.after_hits20 > r.control_after_hits20 * CONTROL_FACTOR;
+    let baseline_coverage_holds =
+        r.baseline_queries_hit20 * 100 >= mismatched_qa.len() * MIN_QUERY_COVERAGE_PERCENT;
+    let after_coverage_holds =
+        r.after_queries_hit20 * 100 >= mismatched_qa.len() * MIN_QUERY_COVERAGE_PERCENT;
     assert!(
-        !(baseline_assertion_holds && after_assertion_holds),
-        "クエリ・正解の対応を崩したミューテーションが層 A の chance level 比較を \
-         すり抜けた（baseline・after いずれも検知に失敗した。層 A のゲートが \
-         vacuous pass になっている懸念）"
+        !(baseline_assertion_holds
+            && after_assertion_holds
+            && baseline_coverage_holds
+            && after_coverage_holds),
+        "クエリ・正解の対応を崩したミューテーションが層 A の関係アサーションを \
+         すり抜けた（chance level 比較・クエリ単位カバレッジのいずれも検知に \
+         失敗した。層 A のゲートが vacuous pass になっている懸念）"
     );
 }
 

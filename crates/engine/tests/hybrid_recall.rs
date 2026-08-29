@@ -484,10 +484,14 @@ const CONTROL_FACTOR: usize = 3;
 /// 「一部クエリが hit 数を稼ぎ、他の大半のクエリは 0 件」という部分的な劣化を
 /// 素通りさせてしまう（PR #319 codex-review P1 対応）。[`CONTROL_FACTOR`] と同じ
 /// くテストハーネス自身が定める設計値であり、spec 由来の非公開数値ではない。
+/// **大規模段専用**の下限であり、小規模段には適用しない（小規模段は決定的
+/// コーパスに対し `queries_hit20 == qa.len()`（全クエリ hit）が安定して成立
+/// するため、この緩い下限を小規模段と共有すると 60 クエリ中 18 クエリが 0 hit
+/// へ劣化しても層 A が通過してしまう。PR #319 codex-review P1 継続指摘対応。
 /// 大規模段は疎・密チャネルの非完全な観測（[`generate_corpus`] のドロップアウト・
 /// デコイ）により少数クエリが構造的に 0 hit となり得るため、実測に対して十分な
 /// 余裕を持たせた下限（`docs/design/hybrid-recall-regression.md` 参照）とする。
-const MIN_QUERY_COVERAGE_PERCENT: usize = 70;
+const LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT: usize = 70;
 
 /// [`PlannerFixture`] が [`EngineCore::plan_query`] の辞書スナップショット
 /// （`dictionary_snapshot` → [`query_planner::render_prompt_prefix`]）へ確実に
@@ -1001,14 +1005,17 @@ fn hybrid_recall_small_scale_regression() {
         "小規模段の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
          十分に上回らなかった"
     );
-    // クエリ単位カバレッジ（PR #319 codex-review P1 対応）: 合計 hit 数の
+    // クエリ単位カバレッジ（PR #319 codex-review P1 対応。継続指摘対応で
+    // 大規模段と共有していた緩い割合下限を廃し、小規模段には決定的コーパスに
+    // 対して安定して成立する厳格な下限（全クエリ hit）を課す。合計 hit 数の
     // chance level 比較だけでは、一部クエリが hit 数を稼ぎ残りの大半が 0 件
-    // という部分的な劣化を素通りさせてしまう。上位 20 件から正解を 1 件も
-    // 拾えなかったクエリの割合が [`MIN_QUERY_COVERAGE_PERCENT`] を下回らない
-    // ことを確認する。
-    assert!(
-        r.queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
-        "小規模段でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
+    // という部分的な劣化を素通りさせてしまう。`cjk_tokenizer_impact.rs` の
+    // 同種アサーションと同じく `queries_hit20 == qa.len()` を要求する
+    // （`docs/design/hybrid-recall-regression.md` 参照）。
+    assert_eq!(
+        r.queries_hit20,
+        qa.len(),
+        "小規模段でクエリ単位の Recall@20 カバレッジが全クエリ hit を下回った \
          （一部クエリで正解を 1 件も拾えていない懸念）"
     );
 
@@ -1056,14 +1063,24 @@ fn hybrid_recall_small_scale_regression_detects_query_answer_mismatch() {
     );
     assert!(!qa.is_empty());
 
-    // 正解集合はケース i のまま、クエリだけをケース i+1 のものへ差し替える
-    // （[`RecallResult::control_hits20`] の対照値計算と同じシフトだが、ここでは
-    // 「実際に検索へ投げるクエリ」自体を壊す点が異なる）。
+    // 正解集合はケース i のまま、クエリだけをケース i+2 のものへ差し替える
+    // （「実際に検索へ投げるクエリ」自体を壊す点が [`RecallResult::
+    // control_hits20`] の対照値計算とは異なる）。シフト量は 1 ではなく 2 を
+    // 使う: [`measure_recall`] 内部の対照値計算（`control_correct =
+    // qa[(idx + 1) % qa.len()].correct`）は「ケース idx が実際に使うクエリの
+    // 真の正解集合」と偶然一致してはならない（一致すると対照値が chance level
+    // ではなく真の Recall を測ってしまい、`hits20 > control_hits20 *
+    // CONTROL_FACTOR` が常に false になり実際の劣化検知力を示せなくなる）。
+    // シフトを 1 にすると、ケース idx が使うクエリ＝`qa[idx + 1]` の真の
+    // 正解集合が、内部シフトの参照先 `qa[(idx + 1) + 1 - 1].correct`
+    // （= `mismatched_qa[idx + 1].correct` = `qa[idx + 1].correct`）と
+    // 完全に一致してしまう（Cursor Bugbot 指摘・PR #319）。シフトを 2 にする
+    // ことでこの衝突を避け、対照値が真の chance level を測るようにする。
     let mismatched_qa: Vec<QaCase> = qa
         .iter()
         .enumerate()
         .map(|(idx, case)| {
-            let wrong_query = &qa[(idx + 1) % qa.len()];
+            let wrong_query = &qa[(idx + 2) % qa.len()];
             QaCase {
                 query_text: wrong_query.query_text.clone(),
                 query_vector: wrong_query.query_vector.clone(),
@@ -1077,8 +1094,7 @@ fn hybrid_recall_small_scale_regression_detects_query_answer_mismatch() {
     // 少なくとも一方の関係アサーションが破れることを確認する（本体テストは
     // 両方が成立することを要求するため、片方でも崩れれば層 A は red になる）。
     let chance_level_assertion_holds = r.hits20 > r.control_hits20 * CONTROL_FACTOR;
-    let coverage_assertion_holds =
-        r.queries_hit20 * 100 >= mismatched_qa.len() * MIN_QUERY_COVERAGE_PERCENT;
+    let coverage_assertion_holds = r.queries_hit20 == mismatched_qa.len();
     assert!(
         !(chance_level_assertion_holds && coverage_assertion_holds),
         "クエリ・正解の対応を崩したミューテーションが層 A の関係アサーションを \
@@ -1194,9 +1210,12 @@ fn hybrid_recall_large_scale_regression() {
          十分に上回らなかった"
     );
     // クエリ単位カバレッジ（PR #319 codex-review P1 対応。
-    // `hybrid_recall_small_scale_regression` と同じ理由）。
+    // `hybrid_recall_small_scale_regression` と同じ理由だが、大規模段は
+    // 疎・密チャネルの非完全な観測により少数クエリが構造的に 0 hit と
+    // なり得るため、小規模段より緩い専用下限
+    // [`LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT`] を使う）。
     assert!(
-        r.queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
+        r.queries_hit20 * 100 >= qa.len() * LARGE_SCALE_MIN_QUERY_COVERAGE_PERCENT,
         "大規模段でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
          （一部クエリで正解を 1 件も拾えていない懸念）"
     );
