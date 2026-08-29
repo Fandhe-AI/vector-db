@@ -176,6 +176,12 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
 に集約しています（Issue #286。値の実設定は引き続きマージ後の管理者作業）。
 
+`hybrid_recall.rs` の大規模段層 B（`HYBRID_RECALL_MIN_R20_LARGE`/
+`HYBRID_RECALL_MIN_R100_LARGE`）は、TASK-110〜113 の決定的スタブ `LlmClient` に
+よるクエリ展開ありの経路で測定します（Issue #306。SEARCH-2 の測定前提に整合。
+詳細は `docs/design/hybrid-recall-regression.md`「クエリ展開の結線
+（Issue #306）」参照）。secrets 名・注入手順・9 変数の説明は変わりません。
+
 `hybrid_recall.rs`・`rerank_recall.rs`・`query_planning_recall.rs`・
 `precision_eval.rs` の層 B 閾値ゲートは既定で対象名と pass/fail のみを標準出力へ
 書き、実測値・注入した閾値のどちらも出しません（`batch_bench.rs` の `BENCH_VERBOSE`

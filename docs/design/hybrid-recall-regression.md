@@ -9,7 +9,10 @@
 - 関連: TASK-106（`docs/design/cjk-tokenizer-impact-ja-corpus.md`。決定的合成コーパス
   生成・固定値回帰トラッキング方式の先行実装）・TASK-127（`crates/engine/benches/
   simd_bench.rs`。spec 閾値の Actions secrets 注入パターンの先行実装。
-  当初は variables を使っていたが Issue #286 で secrets へ移行）
+  当初は variables を使っていたが Issue #286 で secrets へ移行）・TASK-110〜113
+  （`docs/design/query-planning-recall-regression.md`。クエリ展開クライアント・
+  決定的スタブ `LlmClient`・展開あり Recall 回帰の先行実装）・Issue #306
+  （大規模段層 B へのクエリ展開結線）
 
 ## 背景
 
@@ -357,6 +360,61 @@ Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいず
 `pull_request` トリガを持たない（「2 層構成」参照。spec 機密保持が優先）ため、
 PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に限られる。
 
+### クエリ展開の結線（Issue #306）
+
+大規模段の層 B（`hybrid_recall_large_scale_threshold_gate`）は、TASK-110〜113
+（`docs/design/query-planning-recall-regression.md`）で確立した決定的スタブ
+`LlmClient`（`query_planning_recall.rs::MockLlmClient` と同一実装。`tests/`
+直下は独立 test crate で共有モジュールを持たないため `hybrid_recall.rs` へ複製）を
+`EngineCore::plan_query`（TASK-110。`with_query_planner`・辞書スナップショット
+〔`dictionary_snapshot` → `render_prompt_prefix`〕を経由する production のクエリ展開
+結線）に通した展開ありクエリで Recall@20・Recall@100 を測定する。これにより、
+SEARCH-2 が前提とする「クエリ展開あり」の測定条件に層 B の構成を揃えた。
+
+この結線は PR #308 で 2 段階の codex-review P1 指摘対応を経て確立した:
+
+1. 当初、層 B は QA セットを `direct` カテゴリ（コーパス語彙 `kw_XXXX` に一致する
+   クエリ）のまま展開経路へ渡していたが、`MockLlmClient` はその形式の語を無変換で
+   通すため、展開ありの実測値が展開なしと構造的に一致してしまい、展開結線の
+   欠落・破損を検出できない問題があった（1 件目の指摘）。
+   `hybrid_recall.rs::to_intent_query` でクエリテキストのみを `intent` 形
+   （`syn_XXXX` 形式。コーパス語彙とは一致しない）へ書き換えたうえで展開経路に
+   通すよう変更し、`MockLlmClient` の同義語写像（展開結果を検索入力へ反映する
+   経路）を経由して初めて Recall が出る非恒等なゲートにした。
+2. しかし (1) の時点では、展開経路自体（`hybrid_recall.rs::
+   expand_and_reconstruct_with`）が `query_planner::render_full_prompt` →
+   `LlmClient::complete` → `query_planner::parse_expansion` を固定接頭辞 `""` で
+   直接呼ぶ手組みのままだったため、`EngineCore::plan_query`・`with_query_planner`・
+   辞書スナップショットという production の結線自体が欠落・破損しても検出できない
+   （2 件目の指摘・本件）。展開経路を `hybrid_recall.rs::PlannerFixture`（`path`/
+   `body` 各 1 行のみの最小テーブルを持つ `EngineCore`。検索対象コーパスとは無関係で
+   `plan_query` を呼ぶためだけの器）経由の `EngineCore::plan_query` へ置き換え、
+   辞書スナップショットに含めたセンチネル値（`hybrid_recall.rs::
+   DICTIONARY_WIRING_SENTINEL_PATH`）が展開時のプロンプトに現れない場合は
+   `MockLlmClient::complete` が `Err(PlanError::InvalidResponse)` を返して展開自体を
+   失敗させるよう変更した。
+
+これにより、(1) の同義語写像と (2) の `plan_query`/`with_query_planner`/辞書
+スナップショット結線のいずれが壊れても Recall 崩壊・ゲート失敗する二重の非恒等
+ゲートになった。正解集合（`correct`）は変更しないため、既存の
+`HYBRID_RECALL_MIN_R20_LARGE`/`HYBRID_RECALL_MIN_R100_LARGE`（Actions secrets 由来）
+の較正・意味は変わらない（結線が壊れていなければ実測値は従来の `direct` 経路と
+一致する）。再埋め込み（`plan_and_embed_query`）・`USING PLAN` SQL 表層は対象外の
+まま（密チャネルの再構成は既存の `one_hot_sum` 契約を維持）。層 A
+（`hybrid_recall_large_scale_regression`）は従来どおり `direct` 形クエリのままの
+展開あり経路（`QuerySource::Expanded`。同じく `PlannerFixture` 経由）を測定対象と
+し、展開なしとの hits/ceil 完全一致をパススルー回帰ガードとして維持する——この
+等式が崩れた場合は展開パーサ・スタブ・再構成経路のいずれかの回帰を意味する（層 B
+と異なり QA を書き換えないため、この層 A の等式・変更対象は無変更）。小規模段の
+層 B・層 A の主測定は引き続き展開なし（`QuerySource::Baseline`）で行う。fixture
+パラメータ・seed・規模定数（`LARGE_*`/`SMALL_*`）は変更していない。
+
+層 B の pass/fail・実測値は本ドキュメントに記載しない（「実測値の既定非出力
+（Issue #303）」節と同方針）。TASK-113（PLAN-3）が定義する `intent` カテゴリ
+（言い換え語彙の QA セット）自体の大規模測定は、`to_intent_query` による疑似
+`intent` 形クエリ（正解集合・fixture は `direct` カテゴリ由来のまま）とは別物であり
+本結線でも対象外のまま（下記「既知の制約・スコープ外」参照）。
+
 ## 既知の制約・スコープ外
 
 - **合成コーパスによる暫定測定**: 実コーパスでの評価は未了（TASK-106 と同種の制約）
@@ -373,9 +431,13 @@ PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に�
   `VECTOR_KEYWORD_DROPOUT_PROB`・`VECTOR_DECOY_PROB` は Recall を 1.0 未満の
   非退化な範囲に収めるために実験的に選んだ値であり、spec 由来の受け入れ基準では
   ない（層 B の閾値のみが spec 由来。「2 層構成」参照）
-- **クエリ展開との統合測定**: SEARCH-2 の前提にはクエリ展開（PLAN-5 系、TASK-109
-  以降）が含まれるが未実装のため、本ハーネスはハイブリッド検索単体（クエリ展開なし）
-  の測定に留める
+- **クエリ展開との統合測定**: 大規模段の層 B は Issue #306（PR #308 で `to_intent_query`
+  による非恒等化・`PlannerFixture` 経由の `EngineCore::plan_query` 結線まで対応済み）
+  で決定的スタブ `LlmClient` による展開ありの経路へ結線済み（上記「クエリ展開の結線
+  （Issue #306）」節参照）。ただし QA の正解集合・
+  fixture は `direct` カテゴリ由来のままで、TASK-113（PLAN-3）が定義する `intent`
+  カテゴリ（言い換え語彙の QA セット）自体での大規模測定は本ハーネスのスコープ外の
+  まま（フォローアップ候補。Issue 起票はユーザー判断待ち）
 - Actions secrets（`HYBRID_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
   作業（README「Recall 回帰ハーネスの repo secrets」参照。secret ↔ spec
   ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
