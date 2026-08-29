@@ -70,8 +70,12 @@ green にするための必須変数はこの 4 つ）。
 | `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE` | `query-planning.md` PLAN-3 → `search.md` SEARCH-2 のスケール条件付き基準（TASK-113） | `(0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` | spec に対応値なし（本リポ独自の劣化展開シナリオ用回帰基準。`docs/design/query-planning-recall-regression.md` 参照） | `[0.0, 1.0]`。導出規則は下記 |
 
-前 8 変数（`DEGRADED` を除く）が揃わない限り `recall-regression` job は
-strict モード（`*_REQUIRE_THRESHOLDS=1`）により fail-closed で red のままとなる。
+`DEGRADED` を含む全 9 変数が揃わない限り `recall-regression` job は
+strict モード（`*_REQUIRE_THRESHOLDS=1`）により fail-closed で red のままとなる
+（`crates/engine/tests/query_planning_recall.rs::resolve_gate_threshold_with` は
+strict モード時、`DEGRADED` を含め未設定の変数を検出した時点で `panic!` する。
+下記「不採用時の扱い」のとおり `DEGRADED` の採用が見送られた場合は、この 1 変数
+のみ未設定のまま残る結果としてこの副検査が red であることを許容する運用になる）。
 
 #### `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` の導出規則（暫定・オーナー確認待ち）
 
