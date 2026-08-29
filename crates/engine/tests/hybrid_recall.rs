@@ -67,6 +67,21 @@
 //! 「クエリ展開の結線（Issue #306）」節も参照）。小規模段の層 B・層 A の主測定は
 //! 引き続き展開なし（[`QuerySource::Baseline`]）で行う。
 //!
+//! `plan_query` 結線の production 経由化（Issue #306・PR #308 codex-review P1
+//! 継続指摘対応）: [`to_intent_query`] だけでは、展開経路（[`expand_and_reconstruct_with`]）
+//! が [`query_planner::render_full_prompt`]/[`query_planner::parse_expansion`] を
+//! 固定接頭辞 `""` で直接呼ぶ手組みのままだったため、[`EngineCore::plan_query`]・
+//! `with_query_planner`・辞書スナップショット（`dictionary_snapshot` →
+//! `render_prompt_prefix`）という production の結線自体が欠落・破損しても検出でき
+//! なかった。[`PlannerFixture`]（`path`/`body` 各 1 行のみの最小テーブルを持つ
+//! `EngineCore`）を介して [`EngineCore::plan_query`] を実際に呼ぶよう
+//! [`expand_and_reconstruct_with`] を書き換え、辞書スナップショットに含めた
+//! センチネル値（[`DICTIONARY_WIRING_SENTINEL_PATH`]）が展開時のプロンプトに
+//! 現れなければ [`MockLlmClient::complete`] が `Err(PlanError::InvalidResponse)` を
+//! 返して展開自体を失敗させる（`plan_query`/`with_query_planner`/辞書スナップショット
+//! 結線のいずれが壊れても検出可能。再埋め込み〔`plan_and_embed_query`〕・`USING PLAN`
+//! SQL 表層は対象外のまま）。
+//!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了
 //!   （`docs/design/hybrid-recall-regression.md` 参照。`cjk_tokenizer_impact.rs` と同種の制約）
@@ -76,12 +91,22 @@
 //!   QA セット）自体の大規模測定はこのハーネスのスコープ外のまま
 //!   （フォローアップ候補。Issue 起票はユーザー判断待ち）
 
+use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::{CoreError, EngineCore};
 use engine::hybrid::{hybrid_search, RrfConfig};
-use engine::kernel::SearchInput;
+use engine::kernel::{CpuScalarProvider, SearchInput};
 use engine::parallel_search::ParallelSearchProvider;
-use engine::query_planner::{parse_expansion, render_full_prompt, LlmClient, PlanError};
+use engine::policy::PolicyContext;
+use engine::query_planner::{LlmClient, PlanError};
+use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::Value;
 use engine::sparse::SparseIndex;
+use engine::storage::{Storage, Visibility};
 use std::collections::{BTreeMap, BTreeSet};
+
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+use temp_db::{unique_db_path, CleanupGuard};
 
 // ---------- 決定的擬似乱数（xorshift64*。外部クレート不使用。cjk_tokenizer_impact.rs と同一実装） ----------
 
@@ -434,19 +459,46 @@ impl RecallResult {
     }
 }
 
-/// [`query_planner::render_full_prompt`]（TASK-110）が組み立てるプロンプトを受け取り、
+/// [`PlannerFixture`] が [`EngineCore::plan_query`] の辞書スナップショット
+/// （`dictionary_snapshot` → [`query_planner::render_prompt_prefix`]）へ確実に
+/// 含める、`plan_query` 結線の生死を判定するためのセンチネル値（`path` 列に
+/// 1 行だけ挿入する。`render_prompt_prefix` は `dictionary.file_tree.paths` を
+/// そのまま出力するため、`Files` 節の 1 行としてバイト同一に現れる契約
+/// （`query_planner.rs::render_prompt_prefix` 参照）。codex-review P1 対応
+/// （Issue #306・PR #308）: これが `prompt` に現れない場合は
+/// [`EngineCore::plan_query`]（`with_query_planner`／辞書スナップショットの結線）
+/// が壊れている signal であり、[`MockLlmClient::complete`] はここで
+/// `Err(PlanError::InvalidResponse)` を返して展開自体を失敗させる。
+const DICTIONARY_WIRING_SENTINEL_PATH: &str = "hybrid-recall-wiring-sentinel/marker.md";
+
 /// `direct` 語彙（`kw_XXXX`。本ファイルの QA セットの唯一のカテゴリ）を無変換で通す
 /// 決定的スタブ `LlmClient`（`query_planning_recall.rs::MockLlmClient` と同一実装。
 /// `tests/` 直下は独立 test crate で共有モジュールを持たないためこのファイルへ複製する。
 /// 実 Ollama へは接続しない＝TASK-110 時点からの継続制約）。
+///
+/// `complete` に渡される `prompt` は [`EngineCore::plan_query`]（[`PlannerFixture`]
+/// 経由）が `dictionary_snapshot` → `render_prompt_prefix` → `render_full_prompt` の
+/// production 結線で組み立てたものであり、本ファイルが直接 `render_full_prompt` を
+/// 呼んで手組みすることはしない（codex-review P1 対応・Issue #306・PR #308。
+/// 以前はここを手組みプロンプトに固定接頭辞 `""` を渡していたため
+/// `EngineCore::plan_query`／`with_query_planner`／辞書スナップショットの結線が
+/// 欠落・破損してもこのゲートは検出できなかった）。
 struct MockLlmClient;
 
 impl LlmClient for MockLlmClient {
     fn complete(&self, prompt: &str) -> Result<String, PlanError> {
-        // `render_full_prompt` は接頭辞（本テストでは空文字列）の直後に
-        // "\n# Question\n" ＋サニタイズ済み質問＋"\n" を追記する契約
-        // （`query_planner.rs::render_full_prompt` 参照）。マーカ以降の 1 行を
-        // 質問本文として取り出す。
+        // [`DICTIONARY_WIRING_SENTINEL_PATH`] のドキュメント参照。辞書コンテキストの
+        // 適用が欠落・破損すると `prompt` からこの行が消えるため、その場合は
+        // production の `LlmClient::complete` 契約が想定する「応答不正」と同じ
+        // `Err` 系統（`PlanError::InvalidResponse`）で fail-closed に展開を失敗させる
+        // （`.expect` で `plan_query` の呼び出し側が確実にパニックし、ゲートが赤くなる）。
+        if !prompt.contains(DICTIONARY_WIRING_SENTINEL_PATH) {
+            return Err(PlanError::InvalidResponse);
+        }
+
+        // `render_full_prompt` は接頭辞の直後に "\n# Question\n" ＋サニタイズ済み
+        // 質問＋"\n" を追記する契約（`query_planner.rs::render_full_prompt` 参照）。
+        // マーカ以降の 1 行を質問本文として取り出す。
         let question = prompt
             .split("# Question\n")
             .nth(1)
@@ -475,19 +527,89 @@ impl LlmClient for MockLlmClient {
     }
 }
 
-/// `baseline_query_text` を質問として [`query_planner::render_full_prompt`]（固定
-/// 接頭辞は空文字列）→ `client.complete` → [`query_planner::parse_expansion`] の
-/// 一連（production API）に通し、得られた `QueryExpansion::search_terms` から
-/// 再構成クエリ（疎チャネル用テキスト・密チャネル用 one-hot ベクトル）を組み立てる
-/// （`query_planning_recall.rs::expand_and_reconstruct_with` と同一実装）。
+/// `plan_query`（[`query_planner`]・辞書スナップショット）の唯一の呼び出し口。
+/// 検索対象コーパス（[`SearchFixture`]）とは無関係の、`EngineCore::plan_query`
+/// （TASK-110。`with_query_planner`・`dictionary_snapshot` の production 結線）を
+/// 実際に経由するためだけの最小構成（`path`/`body` 各 1 行のみのテーブル）を保持する
+/// （codex-review P1 対応・Issue #306・PR #308。`tests/sql_using_plan.rs` の
+/// `EngineCore::from_storage(..).with_query_planner(..)` 流儀を踏襲）。
+struct PlannerFixture {
+    core: EngineCore,
+    ctx: PolicyContext,
+    _guard: CleanupGuard,
+}
+
+impl PlannerFixture {
+    const TABLE: &'static str = "docs";
+
+    fn new() -> Self {
+        let path = unique_db_path("hybrid-recall-query-expansion");
+        let guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage
+            .create_table(&TableSchema::new(
+                Self::TABLE,
+                vec![
+                    // `insert_typed_row` は VECTOR 列を要求する（`tenant.rs`
+                    // `insert_typed_row_unchecked` 参照）。この器は `plan_query`
+                    // （辞書スナップショット・展開）のためだけに存在し検索対象では
+                    // ないため次元は最小の 1 で十分。
+                    ColumnDef::new("embedding", ColumnType::Vector(1), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create dictionary table");
+
+        let ctx =
+            PolicyContext::with_visibilities("hybrid-recall-test-tenant", [Visibility::Public])
+                .expect("valid tenant");
+        let op_id =
+            OperationId::parse("hybrid-recall-dictionary-seed-1").expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            Self::TABLE,
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                Value::Vector(vec![0.0]),
+                Value::Text(DICTIONARY_WIRING_SENTINEL_PATH.to_string()),
+                Value::Text("hybrid_recall.rs query expansion wiring sentinel row".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert dictionary seed row");
+
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_query_planner(Box::new(MockLlmClient));
+        Self {
+            core,
+            ctx,
+            _guard: guard,
+        }
+    }
+
+    /// [`EngineCore::plan_query`] を呼ぶ薄いラッパ（`Self::TABLE` 固定）。
+    fn plan(&self, question: &str) -> Result<engine::query_planner::QueryExpansion, CoreError> {
+        self.core.plan_query(&self.ctx, Self::TABLE, question)
+    }
+}
+
+/// `baseline_query_text` を質問として [`PlannerFixture::plan`]（[`EngineCore::
+/// plan_query`] の production 結線。辞書スナップショット取得 → 固定接頭辞
+/// レンダリング → `LlmClient::complete` → 厳格パースの一連）に通し、得られた
+/// `QueryExpansion::search_terms` から再構成クエリ（疎チャネル用テキスト・密
+/// チャネル用 one-hot ベクトル）を組み立てる。再埋め込み（`plan_and_embed_query`・
+/// `USING PLAN` SQL 表層）は対象外——本ハーネスは密チャネルの再構成に
+/// [`one_hot_sum`] を使う既存契約を維持する（codex-review P1 対応・Issue #306・
+/// PR #308）。
 fn expand_and_reconstruct_with(
-    client: &dyn LlmClient,
+    fixture: &PlannerFixture,
     vocab_size: usize,
     baseline_query_text: &str,
 ) -> (String, Vec<f32>) {
-    let prompt = render_full_prompt("", baseline_query_text).expect("render_full_prompt ok");
-    let response = client.complete(&prompt).expect("mock complete ok");
-    let expansion = parse_expansion(&response).expect("parse_expansion ok");
+    let expansion = fixture.plan(baseline_query_text).expect("plan_query ok");
 
     let text = expansion.search_terms.join(" ");
     let indices = expansion
@@ -506,11 +628,13 @@ fn expand_and_reconstruct_with(
 /// （`direct` のまま展開しても展開なしと構造的に同じ検索が行われてしまう）。
 /// `syn_XXXX` はコーパス語彙（`kw_XXXX`）と一致しないため、[`MockLlmClient`] の
 /// 同義語写像（`query_planning_recall.rs::intent_baseline` と同型の構成）を経由
-/// して初めて検索が成立する——production の展開結線（`query_planner::
-/// render_full_prompt`/`parse_expansion` の呼び出し・展開結果の検索入力への反映）が
-/// 欠落・破損すれば `syn_XXXX` はコーパスのどの文書ともマッチせず Recall が崩壊する
-/// ため、このゲートは非恒等な検証になる。正解集合（`correct`）は `kw_XXXX` の
-/// トピックインデックスから独立に決まるため変更しない。
+/// して初めて検索が成立する——production の展開結線（[`PlannerFixture`] 経由の
+/// [`EngineCore::plan_query`]・展開結果の検索入力への反映）が欠落・破損すれば
+/// `syn_XXXX` はコーパスのどの文書ともマッチせず Recall が崩壊するため、この
+/// ゲートは非恒等な検証になる（`plan_query` 自体の結線破損は
+/// [`DICTIONARY_WIRING_SENTINEL_PATH`] のセンチネル検証が別途捕捉する）。
+/// 正解集合（`correct`）は `kw_XXXX` のトピックインデックスから独立に決まる
+/// ため変更しない。
 fn to_intent_query(qa: &QaCase) -> QaCase {
     let intent_text = qa
         .query_text
@@ -539,7 +663,10 @@ enum QuerySource<'a> {
     Baseline,
     /// 展開あり（[`expand_and_reconstruct_with`] で再構成したクエリを使う）。
     /// 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が使う。
-    Expanded(&'a dyn LlmClient),
+    /// [`EngineCore::plan_query`] の production 結線を実際に経由するため
+    /// `&dyn LlmClient` ではなく [`PlannerFixture`] を保持する（codex-review P1
+    /// 対応・Issue #306・PR #308）。
+    Expanded(&'a PlannerFixture),
 }
 
 /// [`measure_recall_with`]／複数回の測定（baseline・expanded 双方を同じ
@@ -604,8 +731,8 @@ fn measure_recall_against(
         // 無視できるため、参照の分岐より単純さを優先する。
         let (query_text, query_vector): (String, Vec<f32>) = match &source {
             QuerySource::Baseline => (case.query_text.clone(), case.query_vector.clone()),
-            QuerySource::Expanded(client) => {
-                expand_and_reconstruct_with(*client, fixture.dim, &case.query_text)
+            QuerySource::Expanded(planner) => {
+                expand_and_reconstruct_with(planner, fixture.dim, &case.query_text)
             }
         };
 
@@ -804,7 +931,8 @@ fn hybrid_recall_large_scale_regression() {
     // （`query_planning_recall.rs` の同種アサーション「direct カテゴリで展開ありが
     // 展開なしと一致」と同じ性質）。この等式が崩れた場合は展開パーサ・スタブ・
     // 再構成経路のいずれかの回帰であり、層 B の測定前提が壊れていることを示す。
-    let r_exp = measure_recall_against(&fixture, &qa, QuerySource::Expanded(&MockLlmClient));
+    let planner_fixture = PlannerFixture::new();
+    let r_exp = measure_recall_against(&fixture, &qa, QuerySource::Expanded(&planner_fixture));
     assert_eq!(
         r_exp.hits20, r.hits20,
         "展開あり経路（MockLlmClient）の Recall@20 hit 数が展開なしと一致しなかった（パススルー性質が崩れた）"
@@ -1065,25 +1193,32 @@ fn hybrid_recall_small_scale_threshold_gate() {
 /// 行い、SEARCH-2 の測定前提（クエリ展開あり）に揃える。fixture パラメータ・
 /// 閾値・環境変数名・出力形式は変更しない。
 ///
-/// codex-review P1 対応（PR #308）: QA を `direct` カテゴリのまま（`kw_XXXX` 形式）
-/// 展開経路へ渡すと `MockLlmClient` は無変換で通し、実測値が展開なしと構造的に
-/// 一致してしまう——production の query planner 結線・辞書コンテキストの適用・
-/// 展開結果の検索入力への反映のいずれが欠落・破損しても baseline と同じ Recall の
-/// ままこのゲートを通過してしまい、SEARCH-2（クエリ展開ありの測定条件）の検証と
-/// して機能しない。[`to_intent_query`] で `intent` 形（`syn_XXXX` 形式。コーパス
-/// 語彙とは一致しない）へ書き換えたクエリを使うことで、`MockLlmClient` の同義語
-/// 写像（展開結果を実際の検索入力へ反映する経路）を経由して初めて Recall が出る
-/// 非恒等なゲートにする（展開結線が壊れれば `syn_XXXX` はコーパスのどの文書とも
-/// マッチせず Recall が崩壊しゲートが失敗する）。正解集合・fixture パラメータ・
-/// 閾値は `direct` カテゴリのものをそのまま使う（[`to_intent_query`] は
-/// `query_text` のみを書き換え、`correct` は変更しない）ため、既存の
-/// `HYBRID_RECALL_MIN_R20_LARGE`/`HYBRID_RECALL_MIN_R100_LARGE` の較正・意味は
-/// 変わらない（`MockLlmClient` の同義語写像は `syn_XXXX` → `kw_XXXX` の完全な
-/// 1 対 1 対応のため、展開結線が壊れていなければ実測値は従来の `direct` 経路と
-/// 一致する）。小規模段の層 B・層 A の主測定は引き続き展開なし
-/// （[`QuerySource::Baseline`]）で行う。層 A のパススルー等式ガード
-/// （[`hybrid_recall_large_scale_regression`]）は `direct` 形クエリのままの
-/// 展開あり経路を検証対象とし続けるため無変更。
+/// codex-review P1 対応（Issue #306・PR #308。2 段構成）:
+/// 1. QA を `direct` カテゴリのまま（`kw_XXXX` 形式）展開経路へ渡すと
+///    `MockLlmClient` は無変換で通し、実測値が展開なしと構造的に一致してしまう
+///    問題を [`to_intent_query`] で解消する。`intent` 形（`syn_XXXX` 形式。
+///    コーパス語彙とは一致しない）へ書き換えたクエリを使うことで、
+///    `MockLlmClient` の同義語写像（展開結果を実際の検索入力へ反映する経路）を
+///    経由して初めて Recall が出る非恒等なゲートにする。正解集合・fixture
+///    パラメータ・閾値は `direct` カテゴリのものをそのまま使う
+///    （[`to_intent_query`] は `query_text` のみを書き換え、`correct` は
+///    変更しない）ため、既存の `HYBRID_RECALL_MIN_R20_LARGE`/
+///    `HYBRID_RECALL_MIN_R100_LARGE` の較正・意味は変わらない。
+/// 2. (1) は展開経路自体（[`expand_and_reconstruct_with`]）が
+///    `query_planner::render_full_prompt`/`parse_expansion` を固定接頭辞 `""` で
+///    直接呼ぶ手組みのままだったため、`EngineCore::plan_query`・
+///    `with_query_planner`・辞書スナップショットという production の結線自体が
+///    欠落・破損しても検出できない継続指摘を受けた（[`PlannerFixture`] の
+///    ドキュメント参照）。展開経路を [`PlannerFixture`] 経由の
+///    [`EngineCore::plan_query`] へ置き換え、辞書スナップショットに含めた
+///    センチネル（[`DICTIONARY_WIRING_SENTINEL_PATH`]）が展開時のプロンプトに
+///    現れない場合は展開自体を `Err` で失敗させることで、(1)（`syn_XXXX` の
+///    同義語写像）と (2)（`plan_query`/`with_query_planner`/辞書スナップショット
+///    の結線）の両方が壊れれば Recall 崩壊・テスト失敗する二重の非恒等ゲートに
+///    なる。小規模段の層 B・層 A の主測定は引き続き展開なし
+///    （[`QuerySource::Baseline`]）で行う。層 A のパススルー等式ガード
+///    （[`hybrid_recall_large_scale_regression`]）は `direct` 形クエリのままの
+///    展開あり経路を検証対象とし続けるため無変更。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
@@ -1110,7 +1245,8 @@ fn hybrid_recall_large_scale_threshold_gate() {
         LARGE_VOCAB_SIZE,
     );
     let intent_qa: Vec<QaCase> = qa.iter().map(to_intent_query).collect();
-    let r = measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&MockLlmClient));
+    let planner_fixture = PlannerFixture::new();
+    let r = measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture));
     let recall20 = r.recall20();
     let recall100 = r.recall100();
 
