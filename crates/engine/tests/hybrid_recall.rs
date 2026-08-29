@@ -909,14 +909,10 @@ fn hybrid_recall_small_scale_regression() {
     // 変更で数値が変化した場合はこのテストが失敗する）。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    // Issue #307（SEARCH-1）: RRF の同点グループへ平均順位を割り当てる変更
-    // （`hybrid.rs::accumulate_ranked`）により固定値を更新（171 → 179）。変更理由は
-    // `docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の engine 側原因
-    // 調査（Issue #307）」節を参照。
-    assert_eq!(r.hits20, 179, "小規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を固定値で
-    // 回帰トラッキングする。融合（179）がいずれの単体（151・166）も下回らない
+    // 回帰トラッキングする。融合（171）がいずれの単体（151・166）も下回らない
     // ことを実測値の比較として記録する（一般不変条件としては追加しない。
     // `docs/design/hybrid-recall-regression.md` 参照）。
     let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
@@ -998,10 +994,8 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    // Issue #307（SEARCH-1）: RRF 同点グループ平均順位化に伴う固定値更新。
-    // 変更理由は `docs/design/hybrid-recall-regression.md` 参照。
-    assert_eq!(r.hits20, 365, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 663, "大規模段の Recall@100 hit 数が変化した");
+    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー

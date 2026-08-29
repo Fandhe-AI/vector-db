@@ -92,10 +92,7 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 ## 実測結果
 
 （`crates/engine/tests/rerank_recall.rs`、層 A 1/1 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み。Issue #307（SEARCH-1）の
-RRF 同点グループ平均順位化〔詳細は `docs/design/hybrid-recall-regression.md`
-「小規模段ゲート未達の engine 側原因調査（Issue #307）」節参照〕により候補プール
-の構成が変わったため、以下の値を更新した）
+再現可能。hit 数は同テストのアサーションに固定済み）
 
 | 指標 | 値 |
 | ---- | -- |
@@ -103,23 +100,21 @@ RRF 同点グループ平均順位化〔詳細は `docs/design/hybrid-recall-reg
 | QA 件数 | 100 |
 | total_correct | 1,049 |
 | ceil20 | 410 |
-| baseline hits20（リランキングなし） | 378 |
-| after hits20（リランキングあり） | 381 |
-| baseline Recall@20 | 0.9220 |
-| after Recall@20 | 0.9293 |
-| 改善量（after − baseline） | +0.0073 |
-| ceil100 / pool hits100 | 913 / 824（Recall@100 = 0.9025） |
-| ceil200 / pool hits200 | 1,049 / 949（Recall@200 = 0.9047） |
+| baseline hits20（リランキングなし） | 343 |
+| after hits20（リランキングあり） | 368 |
+| baseline Recall@20 | 0.8366 |
+| after Recall@20 | 0.8976 |
+| 改善量（after − baseline） | +0.0610 |
+| ceil100 / pool hits100 | 913 / 809（Recall@100 = 0.8861） |
+| ceil200 / pool hits200 | 1,049 / 948（Recall@200 = 0.9037） |
 
 暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と融合スコア順位を RRF 型で
-再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を改善している
-（378→381、+0.7pt）。Issue #307 の RRF 同点順位変更により候補プール自体の
-Recall@20 が既に高くなった（0.9220）分、リランキングによる改善幅は変更前より
-小さくなっている。プール自体の Recall@200（0.9047）と最終
-Recall@20（after: 0.9293）の差は小さく、pool_depth 200 の候補プールがすでに正解の
-大半を含んでおり、リランキングはその中の順位付けを改善する形で寄与していることを
-示唆する（プールに入っていない正解＝Recall@200 の未達分は、リランキング以前の
-候補生成段（`hybrid.rs`・`sparse.rs`）の課題であり本タスクのスコープ外）。
+再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を有意に改善して
+いる（343→368、+7.3pt）。プール自体の Recall@200（0.9037）と最終 Recall@20（after:
+0.8976）の差は小さく、pool_depth 200 の候補プールがすでに正解の大半を含んでおり、
+リランキングはその中の順位付けを改善する形で寄与していることを示唆する（プールに
+入っていない正解＝Recall@200 の未達分は、リランキング以前の候補生成段
+（`hybrid.rs`・`sparse.rs`）の課題であり本タスクのスコープ外）。
 
 なお本ハーネスは `LexicalOverlapReranker` の効果測定であり、方式確定前の暫定構成
 （下記「既知の制約」参照）における測定値であることに注意する。

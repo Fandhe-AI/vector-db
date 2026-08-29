@@ -358,9 +358,8 @@ mod tests {
     #[test]
     fn apply_scoring_boosts_raises_matching_candidate_without_excluding_others() {
         // `hybrid.rs::apply_soft_boost_changes_rank_order` と同じ流儀: 確定判定は
-        // 加点合計を `soft_boost_confirm_cap`（既定 cfg では約 `1/160.5 ≈ 0.00623`。
-        // Issue #307・SEARCH-1 対応で再導出）未満にしか許さないため、真の 1 位
-        // （id=1）とプール最下位（id=3）はそのままに、
+        // 加点合計を `soft_boost_confirm_cap`（既定 cfg では `1/61 ≈ 0.0164`）未満に
+        // しか許さないため、真の 1 位（id=1）とプール最下位（id=3）はそのままに、
         // 中間 2 件（id=2・id=3）の順位だけを入れ替えて近接順位の逆転を確認する。
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },

@@ -20,7 +20,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **クレート構成**: `engine`（コアロジック: データロード・検索カーネル・認証・RLS）＋ `wire-server`（バイナリ）の workspace 構成（TASK-66 で雛形を構築済み。各機能の実装は後続タスク）
 - **永続化**: `redb` ベース（単一ライタ・スナップショット読み取り。並行書き込み検証は MS-1 の TASK-144）
 - **安全性**: RLS 相当のテナント境界・fail-closed のエラー契約（SQLSTATE 風 `wire_code`）
-- **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）。RRF 融合の同点グループ（スコアが厳密に一致する候補群）内では、各候補が受け取る融合寄与は平均順位で計算され、その同点グループが pool_depth 内に収まる場合は候補 id の並びに依存しない（Issue #307）
+- **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
 - **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ
 
