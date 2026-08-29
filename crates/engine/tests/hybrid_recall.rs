@@ -904,20 +904,22 @@ fn hybrid_recall_small_scale_regression() {
     // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
     // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
     // （理論上限 `ceil20` への 100% 到達）に張り付かない。`total_correct`/`ceil20`/
-    // `hits20` の固定値回帰トラッキングは、決定的ハッシュへ畳み込んでも
-    // フィールドが少値域のため総当たりで復元可能であり
-    // spec-confidentiality の受け入れ条件を満たせない（codex-review P0・PR #320）。
-    // このためここでは数値そのものの固定値アサーションを行わず、値に依存しない
-    // 関係アサーション（下記の非劣化ガード）のみで退行検出する。数値レベルの
-    // 固定値ゲートが必要な場合は spec 閾値と同様に層 B（`environment: recall-gate`
-    // の secrets）側で扱う。
+    // `hits20` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの変更で
+    // 数値が変化した場合はこのテストが失敗する。数値基準・実測値の public 記載は
+    // オーナー判断で許可済み・`.claude/rules/spec-confidentiality.md` 参照）。
+    // Issue #310（RRF 融合の同点順位規約 `TieRank::GroupEnd`・密プール境界の同点
+    // グループ完全化）適用前の `hits20` は 171（`docs/design/
+    // hybrid-recall-regression.md`「Issue #310: engine 側改善」節参照）。
+    assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
+    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
-    // トラッキングする（数値そのものは記録しない。`docs/design/
-    // hybrid-recall-regression.md` 参照）。両チャネルとも 0 件ヒットでは
-    // 「下回らない」が自明に成立してしまう（vacuous pass）ため、正解を
-    // 一部でも拾えていることも合わせて確認する。
+    // トラッキングする。加えて両チャネルの hit 数自体も固定値で記録する
+    // （`docs/design/hybrid-recall-regression.md` 参照）。両チャネルとも 0 件
+    // ヒットでは「下回らない」が自明に成立してしまう（vacuous pass）ため、
+    // 正解を一部でも拾えていることも合わせて確認する。
     let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
     if verbose {
         println!(
@@ -925,6 +927,8 @@ fn hybrid_recall_small_scale_regression() {
             r.ceil20, r.ceil20, r.hits20, r.ceil20
         );
     }
+    assert_eq!(dense_hits20, 151, "密単体の Recall@20 hit 数が変化した");
+    assert_eq!(sparse_hits20, 166, "疎単体の Recall@20 hit 数が変化した");
     assert!(
         dense_hits20 > 0 && sparse_hits20 > 0,
         "密単体・疎単体のいずれかが Recall@20 で正解を 1 件も拾えていない（比較が vacuous pass になる）"
@@ -988,13 +992,17 @@ fn hybrid_recall_large_scale_regression() {
     }
 
     // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
-    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`total_correct`/
-    // `ceil20`/`ceil100`/`hits20`/`hits100` の数値そのものは、決定的ハッシュへ
-    // 畳み込んでもフィールドが少値域のため総当たりで復元可能であり
-    // spec-confidentiality の受け入れ条件を満たせないため（codex-review P0・
-    // PR #320）、ここでは固定値アサーションを行わない。数値レベルの退行検出は
-    // 下記のパススルー等式（展開あり/なしの一致）と、spec 閾値を扱う層 B
-    // （`environment: recall-gate` の secrets）に委ねる。
+    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
+    // `total_correct` を固定値で回帰トラッキングする（数値基準・実測値の public
+    // 記載はオーナー判断で許可済み・`.claude/rules/spec-confidentiality.md`
+    // 参照）。Issue #310 適用前の `hits20`/`hits100` はそれぞれ 328/645
+    // （`docs/design/hybrid-recall-regression.md`「Issue #310: engine 側改善」
+    // 節参照）。
+    assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
+    assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
+    assert_eq!(r.hits20, 385, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 653, "大規模段の Recall@100 hit 数が変化した");
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー

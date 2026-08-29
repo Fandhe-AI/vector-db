@@ -516,48 +516,42 @@ fn rerank_recall_large_scale_regression() {
         );
     }
 
-    // 以前はここで `after_hits20 >= baseline_hits20`（リランキング層が Recall を
-    // 悪化させていないことの独立検証）を assert していたが、Issue #310（RRF 融合の
-    // 同点順位規約変更・密プール境界の同点グループ完全化）で baseline（`hybrid_search`
-    // の生の融合順位）が大きく改善した結果、`LexicalOverlapReranker`（本ファイル冒頭の
-    // コメント・`rerank.rs` 内ドキュメント参照: 「方式確定までの暫定実装」）の字句一致
-    // ヒューリスティックがこの改善後の baseline に追いつけず、`after` が `baseline` を
-    // 下回る組み合わせが生じた（いずれも Issue #310 以前より改善しているが、両者の
-    // 差分の符号は反転した）。
-    //
-    // `after >= baseline` は `LexicalOverlapReranker` の字句一致ブレンドが数学的に
-    // 保証する性質ではなく、従来の（Issue #310 以前の）baseline がたまたま弱かった
-    // ことで成立していた経験則だったため、この個別比較そのものは復元しない
-    // （`LexicalOverlapReranker` は暫定実装であり、字句一致ヒューリスティックを
-    // このフィクスチャ限定の不等式に合わせて調整することはオーバーフィッティング
-    // かつ SEARCH-7 方式選定そのもの＝オーナー判断の先取りになるため行わない。
-    // TASK-108・Issue #39 参照）。
-    //
-    // 代わりに、「正解を含むデータ群を広く返す」という設計思想がリランキング層でも
-    // 崩れていないことを、最終順位ではなく候補プールの水準で検証する: プール
-    // （`hybrid_search` の融合順位。リランカーはこのプールを並べ替えるだけで
-    // 候補を追加・除外しない）の Recall@100/@200 は同一プールの先頭 20 件で
-    // 測る baseline_hits20 を下回り得ない（`take(20)` は `take(100)`/全件の
-    // 先頭部分列であるため常に成立する構造的な不変条件）。これは「個々の実測値」
-    // ではなく実測タプル間の大小関係のみを固定するため public テストへ実測値を
-    // 記録しない（`.claude/rules/spec-confidentiality.md`）。また常に真になる
-    // 関係だけでは reranker 自体の壊れ（例: 何も正解を拾えなくなる退行）を検出
-    // できないため、vacuous pass 防止として after_hits20 が 1 件以上正解を
-    // 拾えていることも合わせて確認する。
-    assert!(
-        r.pool_hits100 >= r.baseline_hits20 && r.pool_hits200 >= r.pool_hits100,
-        "プールの Recall@100/@200 が baseline の Recall@20 を下回った（構造的に成立するはずの不変条件が崩れた）"
+    // `hits`/`ceil`/`total_correct` を固定値で回帰トラッキングする（検索カーネル・
+    // リランカー・フィクスチャの変更で数値が変化した場合はこのテストが失敗する。
+    // 数値基準・実測値の public 記載はオーナー判断で許可済み・
+    // `.claude/rules/spec-confidentiality.md` 参照）。
+    assert_eq!(r.total_correct, 1049, "正解集合の総数が変化した");
+    assert_eq!(r.ceil20, 410, "Recall@20 の理論上限が変化した");
+    assert_eq!(r.ceil100, 913, "Recall@100 の理論上限が変化した");
+    assert_eq!(r.ceil200, 1049, "Recall@200 の理論上限が変化した");
+    assert_eq!(
+        r.baseline_hits20, 386,
+        "baseline（リランキングなし）の Recall@20 hit 数が変化した"
     );
-    assert!(
-        r.after_hits20 > 0,
-        "リランキング後の Recall@20 が正解を 1 件も拾えていない（比較が vacuous pass になる）"
+    assert_eq!(
+        r.after_hits20, 382,
+        "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
+    assert_eq!(r.pool_hits100, 834, "プール Recall@100 hit 数が変化した");
+    assert_eq!(r.pool_hits200, 951, "プール Recall@200 hit 数が変化した");
 
-    // SEARCH-7 契約メモ: Issue #310 以降、`LexicalOverlapReranker`（暫定実装）の
-    // 最終順位（`after_hits20`）は改善後の baseline（`baseline_hits20`）を下回る
-    // 場合がある。`after >= baseline` の非劣化保証は現時点では成立せず、本命
-    // リランク方式の選定（依存承認制・オーナー判断）まで持ち越しの既知の contract
-    // gap である（`docs/design/rerank-recall-regression.md` 参照）。
+    // SEARCH-7 契約メモ: 以前はここで `after_hits20 >= baseline_hits20`
+    // （リランキング層が Recall を悪化させていないことの独立検証）を assert
+    // していたが、Issue #310（RRF 融合の同点順位規約変更・密プール境界の同点
+    // グループ完全化）で baseline（`hybrid_search` の生の融合順位。343→386）が
+    // `LexicalOverlapReranker`（本ファイル冒頭のコメント・`rerank.rs` 内
+    // ドキュメント参照: 「方式確定までの暫定実装」）の改善幅（368→382）を上回る
+    // 幅で改善した結果、after（382）が baseline（386）を −4 件下回るようになった
+    // （いずれも Issue #310 以前の値より改善しているが、両者の差分の符号が
+    // 反転した）。`after >= baseline` は `LexicalOverlapReranker` の字句一致
+    // ブレンドが数学的に保証する性質ではなく、従来の（Issue #310 以前の）
+    // baseline がたまたま弱かったことで成立していた経験則だったため、この
+    // 非劣化アサーションは復元しない（`LexicalOverlapReranker` は暫定実装であり、
+    // 字句一致ヒューリスティックをこのフィクスチャ限定の不等式に合わせて調整
+    // することはオーバーフィッティングかつ SEARCH-7 方式選定そのもの＝オーナー
+    // 判断の先取りになるため行わない。TASK-108・Issue #39 参照）。本命リランク
+    // 方式の選定（依存承認制・オーナー判断）まで持ち越しの既知の contract gap
+    // である（`docs/design/rerank-recall-regression.md` 参照）。
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
