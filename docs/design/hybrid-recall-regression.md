@@ -281,8 +281,18 @@ BM25 スコアが一致するため、同様に同点グループが生じる。
 - 同点でない入力（実埋め込みの連続値スコア）では現行と完全同一の結果になる
   （区間長が常に 1 のため）
 - 順位は `[1, len(items)]`（`len(items) <= pool_depth`）の部分区間に留まるため、
-  ソフトブースト（TASK-111・PLAN-1）の `soft_boost_confirm_cap`／
-  `soft_boost_loose_upper_bound` の上下限導出は不変
+  `soft_boost_loose_upper_bound`（早期拒否専用の緩い上限。`sum` 集約で両チャネル
+  とも rank=1 という理論上の最良ケースを仮定する導出のため、順位の実際の分布に
+  依存しない）の導出式自体は不変。一方 `soft_boost_confirm_cap`（確定判定が使う
+  `min` 集約の絶対上限）は「真の 1 位は少なくとも一方のチャネルで rank=1」という
+  前提に依存しており、この前提は本改善（同点グループへの平均順位割り当て）で
+  崩れる: 真の 1 位が大きな同点グループの先頭に属す場合、平均順位は 1 より大きく
+  なりうるため、以前の導出（`min(dense_weight, sparse_weight) / (k_const + 1)`）
+  はもはや正しい保証下限ではない。そのため本 Issue で `soft_boost_confirm_cap`
+  自体を `worst_top_rank = (1.0 + pool_depth) / 2.0`（同点グループが融合プール
+  全体を覆う最悪ケースの平均順位）を用いる形へ再導出した（`crates/engine/src/
+  hybrid.rs::soft_boost_confirm_cap`。関連する `SOFT_BOOST_PER_MATCH`・
+  コンパイル時 assertion もこの再導出済みの値に合わせて更新済み）
 - 出力側のタイブレーク（スコア降順・id 昇順の安定ソート。
   `docs/design/rrf-tie-break-determinism.md`）とは独立な変更であり、その不変条件は
   維持したまま「同点グループの融合寄与が候補 id の並びに依存しない」性質を追加で
