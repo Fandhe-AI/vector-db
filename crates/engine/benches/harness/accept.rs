@@ -189,6 +189,42 @@ pub fn degradation_pct(baseline_p95: Duration, candidate_p95: Duration) -> Resul
     Ok(pct)
 }
 
+/// A/B 反復ごとに対応する所要時間サンプル列（`ab::run_ab` が返す
+/// `AbMeasurement::a.samples`/`b.samples`。同一インデックスが同一反復を指す
+/// 契約）から、反復ごとの劣化率（%）列を算出する（TASK-130・CORE-7・Issue #302
+/// レビュー対応）。
+///
+/// [`degradation_pct`] は経路ごとに独立算出した p95 の差分を取るため、両経路が
+/// 共有する支配的なコスト（`batch_bench.rs::run_core7_gate` では両経路が経由する
+/// `BatchEngine::batch_search` の全走査）にまつわる反復間ノイズが両者の p95 推定へ
+/// 別々に乗り、測定対象（動的窓集約の push/drain 分の差）を希釈しうる
+/// （`docs/design/core7-dynamic-window-gate.md` 参照）。本関数は同一反復番号の
+/// `a`/`b` を対にして反復内で差分を取ることで、その反復に共通のコスト成分を
+/// 相殺し、対象差分への感度を保つ（ペア化差分によるノイズ低減。一般的な対応
+/// のある実験計画の手法であり、CORE-7 が定義する量そのものは変えない）。
+///
+/// `a_samples`/`b_samples` の長さが一致しない場合、いずれかが空の場合、
+/// 対応するペアで `a` 側が `Duration::ZERO` の場合は `Err`（`degradation_pct`
+/// と同一の fail-closed 方針）。
+pub fn paired_degradation_pct_samples(
+    a_samples: &[Duration],
+    b_samples: &[Duration],
+) -> Result<Vec<f64>, BenchError> {
+    if a_samples.is_empty() || b_samples.is_empty() {
+        return Err(BenchError::EmptySamples);
+    }
+    if a_samples.len() != b_samples.len() {
+        return Err(BenchError::ProtocolViolation(
+            "paired_degradation_pct_samples: a/b sample counts diverged",
+        ));
+    }
+    a_samples
+        .iter()
+        .zip(b_samples.iter())
+        .map(|(&a, &b)| degradation_pct(a, b))
+        .collect()
+}
+
 /// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
 /// （`max_degradation_pct`）以内かを判定する（TASK-130・CORE-7 ポインタ:
 /// 動的窓集約を経由することによる単発クエリ経路の劣化上限）。

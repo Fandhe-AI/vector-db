@@ -25,7 +25,8 @@ mod harness;
 
 use harness::accept::{
     check_degradation_pct_within_limit, check_degradation_within_limit, check_improvement_at_least,
-    degradation_pct, median_degradation_pct, recall_at_k, worst_recall,
+    degradation_pct, median_degradation_pct, paired_degradation_pct_samples, recall_at_k,
+    worst_recall,
 };
 use harness::rng::DeterministicRng;
 use harness::stats::BenchError;
@@ -209,6 +210,65 @@ fn check_degradation_pct_within_limit_rejects_non_finite_or_negative_max_pct() {
 
     let err = check_degradation_pct_within_limit(1.0, -1.0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+// ---------------------------------------------------------------------
+// paired_degradation_pct_samples（CORE-7・Issue #302 レビュー対応: 反復ごとに
+// 対にした所要時間から劣化率列を算出し、`run_core7_gate` が独立算出した p95 の
+// 差分ではなくペア化差分で共通コスト成分を相殺できるようにするヘルパ）
+// ---------------------------------------------------------------------
+
+#[test]
+fn paired_degradation_pct_samples_computes_elementwise_percentage() {
+    let a = [
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+        Duration::from_millis(100),
+    ];
+    let b = [
+        Duration::from_millis(110),
+        Duration::from_millis(180),
+        Duration::from_millis(100),
+    ];
+    let pcts = paired_degradation_pct_samples(&a, &b).unwrap();
+    assert_eq!(pcts.len(), 3);
+    assert!((pcts[0] - 10.0).abs() < 1e-9);
+    assert!((pcts[1] - (-10.0)).abs() < 1e-9);
+    assert!(pcts[2].abs() < 1e-9);
+}
+
+#[test]
+fn paired_degradation_pct_samples_matches_degradation_pct_per_pair() {
+    // 各要素は独立算出した `degradation_pct(a[i], b[i])` と一致する（ペア化
+    // 差分は既存の劣化率算出式そのものを反復単位で適用するだけであり、算出式は
+    // 変えない契約）。
+    let a = [Duration::from_micros(500), Duration::from_millis(3)];
+    let b = [Duration::from_micros(600), Duration::from_millis(2)];
+    let pcts = paired_degradation_pct_samples(&a, &b).unwrap();
+    assert_eq!(pcts[0], degradation_pct(a[0], b[0]).unwrap());
+    assert_eq!(pcts[1], degradation_pct(a[1], b[1]).unwrap());
+}
+
+#[test]
+fn paired_degradation_pct_samples_rejects_mismatched_lengths() {
+    let a = [Duration::from_millis(1), Duration::from_millis(1)];
+    let b = [Duration::from_millis(1)];
+    let err = paired_degradation_pct_samples(&a, &b).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn paired_degradation_pct_samples_rejects_empty_input() {
+    let err = paired_degradation_pct_samples(&[], &[]).unwrap_err();
+    assert!(matches!(err, BenchError::EmptySamples));
+}
+
+#[test]
+fn paired_degradation_pct_samples_rejects_zero_baseline_pair() {
+    let a = [Duration::from_millis(1), Duration::ZERO];
+    let b = [Duration::from_millis(1), Duration::from_millis(1)];
+    let err = paired_degradation_pct_samples(&a, &b).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
 }
 
 // ---------------------------------------------------------------------

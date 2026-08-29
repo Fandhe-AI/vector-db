@@ -24,9 +24,16 @@
 //!     が `false` を返す文脈）、B は「窓を通った場合に単発クエリが払いうる
 //!     最大オーバーヘッド」を課す保守側の構成である。
 //!   - `CORE6`/`CORE-16` と同じ合成データセット（[`build_gate_dataset`]）を
-//!     再利用し、複数試行（[`CORE7_TRIALS`]）の p95 劣化率（%）の**中央値**を
+//!     再利用し、複数試行（[`CORE7_TRIALS`]）の劣化率（%）の**中央値**を
 //!     `BENCH_BATCH_MAX_DEGRADATION_PCT` と比較する。単一試行だけだと突発的な
-//!     計測スパイクが誤 fail を招きうるため中央値採用で緩和する。
+//!     計測スパイクが誤 fail を招きうるため中央値採用で緩和する。A/B のクエリは
+//!     反復ごとに同一内容を複製して使い（`batch_search` の類似度計算コストが
+//!     クエリ値へ左右されるぶんをノイズ源から除く。Issue #302 レビュー対応）、
+//!     劣化率は経路別に独立算出した p95 の差分ではなく `run_ab` の同一反復
+//!     インデックスで対にした所要時間から算出する（[`paired_degradation_pct_samples`]。
+//!     A/B が共有する全走査コストの反復間ノイズが両者の p95 推定へ別々に乗って
+//!     測定対象〔push/drain の差分〕を希釈するのを避ける。詳細は ADR「本ゲートの
+//!     感度の限界」節参照）。
 //!   - ワークロードの戻り値（B の `drain()` 結果等）は計測区間内で drop すると
 //!     解放コストが測定対象へ混入する（`harness::ab::run_ab` のドキュメンテー
 //!     ションコメント参照）ため、各試行内で sink へ退避し `run_ab` 完了後に
@@ -77,8 +84,8 @@ mod harness;
 
 use harness::ab::run_ab;
 use harness::accept::{
-    check_degradation_pct_within_limit, check_improvement_at_least, degradation_pct,
-    median_degradation_pct, p95_from_samples,
+    check_degradation_pct_within_limit, check_improvement_at_least, median_degradation_pct,
+    p95_from_samples, paired_degradation_pct_samples,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -89,10 +96,11 @@ use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
 /// CORE-7 の診断（[`run_dynamic_window_push_drain_diagnostic`]）で 1 反復あたり
-/// 集約器へ通すクエリ本数。1 本単位では `push`/`drain` が数百ナノ秒程度で終わり
-/// `Instant` の分解能・関数呼び出しオーバーヘッドへ埋もれるため、実運用の動的窓
-/// サイズ相当の本数へ増幅してから測る（値そのものは spec の閾値ではなく本ベンチ
-/// 固有の測定条件）。
+/// 集約器へ通すクエリ本数。1 本単位では `push`/`drain` の所要時間が `Instant`
+/// の分解能・関数呼び出しオーバーヘッドへ埋もれるため、実運用の動的窓サイズ
+/// 相当の本数へ増幅してから測る（値そのものは spec の閾値ではなく本ベンチ
+/// 固有の測定条件。実測の時間スケールは書かない——
+/// `.claude/rules/spec-confidentiality.md`）。
 const AGG_BATCH_SIZE: usize = 256;
 
 /// 診断で集約するクエリの次元数。
@@ -290,15 +298,22 @@ fn run_core7_gate(
             .checked_add(config.measured_iterations() as usize)
             .expect("MeasurementConfig::new bounds iteration counts within usize");
 
-        // pool の対称化: A 用・B 用のクエリを 1 つのループで交互に確保する
-        // （モジュール冒頭コメント・ADR 参照。順次確保〔pool_a を全確保した
-        // のち pool_b を全確保〕だと heap 配置がテスト間で非対称になりうる）。
+        // pool の対称化・クエリ内容の一致（Issue #302 レビュー対応）: A/B で
+        // 使うクエリは反復ごとに 1 本だけ生成し、同一内容を複製して両プールへ
+        // 積む（`build_query_pool_pair` の診断側と同一方針）。別々の RNG 引きで
+        // 生成すると A/B のクエリ内容が異なり、`batch_search` の類似度計算・
+        // 上位 k 候補更新コストがクエリ値に左右されるぶんが測定対象（動的窓
+        // 集約の push/drain オーバーヘッド）より大きいノイズ・系統差になりうる。
+        // heap 配置も「1 つのループで交互に確保」する（順次確保〔pool_a を
+        // 全確保したのち pool_b を全確保〕だと heap 配置がテスト間で非対称に
+        // なりうる。モジュール冒頭コメント・ADR 参照）。
         let mut trial_rng = DeterministicRng::new(seed);
         let mut pool_a: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
         let mut pool_b: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
         for _ in 0..total_iterations {
-            pool_a.push(trial_rng.next_vector(GPU_GATE_DIM));
-            pool_b.push(trial_rng.next_vector(GPU_GATE_DIM));
+            let query = trial_rng.next_vector(GPU_GATE_DIM);
+            pool_a.push(query.clone());
+            pool_b.push(query);
         }
 
         // 解放コストの測定区間外化（`harness::ab::run_ab` の drop 契約参照）。
@@ -389,14 +404,22 @@ fn run_core7_gate(
             return Ok(false);
         }
 
-        let p95_a = p95_from_samples(&ab.a.samples).map_err(|err| {
-            format!("{LABEL}: p95 of A samples unavailable (trial {trial}): {err}")
+        // 判別力の希釈対策（Issue #302 レビュー対応）: A/B が共有する支配的な
+        // コスト（`batch_search` の全走査）は、経路ごとに独立算出した p95 の
+        // 差分（`degradation_pct(p95_from_samples(a), p95_from_samples(b))`）
+        // では反復間ノイズが両者へ別々に乗って測定対象（push/drain の差分）を
+        // 希釈しうる（`docs/design/core7-dynamic-window-gate.md` 参照）。
+        // `run_ab` は同一インデックスの `a.samples[i]`/`b.samples[i]` が同一
+        // 反復を指す契約のため、反復ごとに対で劣化率を取って共通コスト成分を
+        // 相殺してから中央値を取る（ペア化差分によるノイズ低減。CORE-7 が
+        // 定義する量そのものは変えない）。
+        let paired_pcts =
+            paired_degradation_pct_samples(&ab.a.samples, &ab.b.samples).map_err(|err| {
+                format!("{LABEL}: paired degradation samples failed (trial {trial}): {err}")
+            })?;
+        let pct = median_degradation_pct(&paired_pcts).map_err(|err| {
+            format!("{LABEL}: median of paired degradation samples failed (trial {trial}): {err}")
         })?;
-        let p95_b = p95_from_samples(&ab.b.samples).map_err(|err| {
-            format!("{LABEL}: p95 of B samples unavailable (trial {trial}): {err}")
-        })?;
-        let pct = degradation_pct(p95_a, p95_b)
-            .map_err(|err| format!("{LABEL}: degradation_pct failed (trial {trial}): {err}"))?;
         trial_pcts.push(pct);
     }
 
