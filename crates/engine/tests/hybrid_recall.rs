@@ -94,7 +94,7 @@
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{CoreError, EngineCore};
 use engine::hybrid::{hybrid_search, RrfConfig};
-use engine::kernel::{CpuScalarProvider, SearchInput};
+use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::query_planner::{LlmClient, PlanError};
@@ -770,6 +770,54 @@ fn measure_recall_against(
     }
 }
 
+/// Issue #307（SEARCH-1）: 融合前の密チャネル単体・疎チャネル単体それぞれの
+/// Recall@20 を測定する（[`measure_recall`] と同じ production API 経由。密は
+/// [`SearchProvider::search`] の Top-20 をそのまま、疎は
+/// [`SparseIndex::search_within`] の Top-20 をそのまま正解判定に使う。RRF 融合
+/// （[`hybrid_search`]）は経由しない）。呼び出し側では「融合がどちらのチャネル
+/// 単体も下回らない（SEARCH-3 相当）」ことを実測値どうしの関係アサーションと
+/// して確認する（数値そのものは public テストへ記録しない。受け入れ条件 2）。
+fn measure_channel_recall20(docs: &[Doc], qa: &[QaCase]) -> (usize, usize) {
+    let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
+    let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
+
+    let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
+    let dim = docs.first().map_or(0, |d| d.vector.len());
+    let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector.iter().copied()).collect();
+    let provider = ParallelSearchProvider;
+    let visible_ids: BTreeSet<u64> = ids.iter().copied().collect();
+
+    let mut dense_hits20 = 0usize;
+    let mut sparse_hits20 = 0usize;
+
+    for case in qa {
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: dim as u32,
+            query: &case.query_vector,
+            k: 20,
+        };
+        let dense_top20 = provider.search(input).expect("dense search ok");
+        dense_hits20 += dense_top20
+            .iter()
+            .take(20)
+            .filter(|h| case.correct.contains(&h.id))
+            .count();
+
+        let sparse_top20 = sparse_index
+            .search_within(&case.query_text, 20, &visible_ids)
+            .expect("sparse search ok");
+        sparse_hits20 += sparse_top20
+            .iter()
+            .take(20)
+            .filter(|d| case.correct.contains(&d.doc_id))
+            .count();
+    }
+
+    (dense_hits20, sparse_hits20)
+}
+
 /// [`SearchFixture::build`] → [`measure_recall_against`] の薄いラッパ。索引・
 /// ベクトル配列を使い回さない 1 回限りの測定呼び出し（既存の層 A・小規模段層 B の
 /// 呼び出しが使う）に用いる。
@@ -861,6 +909,28 @@ fn hybrid_recall_small_scale_regression() {
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
     assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
+
+    // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
+    // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
+    // トラッキングする（数値そのものは記録しない。`docs/design/
+    // hybrid-recall-regression.md` 参照）。両チャネルとも 0 件ヒットでは
+    // 「下回らない」が自明に成立してしまう（vacuous pass）ため、正解を
+    // 一部でも拾えていることも合わせて確認する。
+    let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
+    if verbose {
+        println!(
+            "channel Recall@20: dense={dense_hits20}/{} sparse={sparse_hits20}/{} fused={}/{}",
+            r.ceil20, r.ceil20, r.hits20, r.ceil20
+        );
+    }
+    assert!(
+        dense_hits20 > 0 && sparse_hits20 > 0,
+        "密単体・疎単体のいずれかが Recall@20 で正解を 1 件も拾えていない（比較が vacuous pass になる）"
+    );
+    assert!(
+        r.hits20 >= dense_hits20.max(sparse_hits20),
+        "融合が密単体・疎単体いずれかを下回った（実測値どうしの関係。理論保証ではない）"
+    );
 }
 
 // ---------- 層 A: 大規模段（数万件オーダ。SEARCH-2 対応。固定値回帰トラッキング） ----------

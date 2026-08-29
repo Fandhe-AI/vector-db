@@ -232,6 +232,27 @@ Recall@20（小規模段）・Recall@20/Recall@100（大規模段）は、正解
 であり、その `hits`/`ceil`/`total_correct`/QA 件数（重複除外後）を層 A の固定値
 アサーションで回帰トラッキングする。
 
+## 小規模段ゲート未達の engine 側原因調査（Issue #307）
+
+- 対応: TASK-103／TASK-104／TASK-84（`docs/spec/05-tasks.md`）
+- 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
+- 前提: 親 Issue #301。大規模段（SEARCH-2・クエリ展開結線）は別 Issue（#306）の管轄
+
+**層 A・層 B とも実測値・閾値・pass/fail は本ドキュメントにも public テストにも
+記録しない（`.claude/rules/spec-confidentiality.md`）**。密単体・疎単体・融合後の
+Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall.rs::measure_channel_recall20`
+を使い、融合が両チャネル単体のいずれも下回らない（＝ SEARCH-3 相当の非劣化）
+ことを実測値どうしの関係アサーションとしてのみ回帰トラッキングする。
+
+### 原因調査（受け入れ条件 1・3・4）
+
+原因調査・検討した代替方式・オーナー判断待ち事項の詳細は非公開の内部分析に
+あたるため本ドキュメントには記載しない。production の融合挙動
+（`hybrid.rs::accumulate_ranked`・`rrf_fuse`）・既定値（`k_const`・`pool_depth`・
+重み・BM25 パラメータ）はいずれも本 Issue の範囲では変更していない。
+受け入れ条件・判断事項は spec のビヘイビア定義（SEARCH-1・SEARCH-3。
+`docs/spec/04-behavior/search.md`）を参照。
+
 ## 実測結果
 
 （`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため

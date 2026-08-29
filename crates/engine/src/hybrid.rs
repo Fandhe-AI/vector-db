@@ -4,8 +4,9 @@
 //! `kernel.rs`/`parallel_search.rs`（TASK-124・TASK-126）が提供する密検索 provider
 //! （[`crate::kernel::SearchProvider`]）と、`sparse.rs`（TASK-102）が提供する疎検索
 //! （[`crate::sparse::SparseIndex`]）は独立に存在する。本モジュールはその 2 系統を
-//! RRF（公知のランク融合手法。各リストの順位のみを使い、`weight / (k_const + rank)`
-//! を id ごとに加算する）で統合する、純粋関数的な層として追加する。
+//! RRF（公知のランク融合手法。各リストの順位を使い `weight / (k_const + rank)` を
+//! id ごとに加算する。スコアの大小そのものは使わない）で統合する、純粋関数的な層と
+//! して追加する。
 //!
 //! `sparse.rs` と同様に storage・catalog・policy とは結線しない。可視性判定（RLS 相当の
 //! テナント境界）はこの層より上（`core.rs` 相当）で完結している前提であり、
@@ -343,9 +344,12 @@ impl From<SparseError> for HybridError {
 /// [`HybridError::TooManyCandidates`]。3 回目の codex-review P1 指摘対応）、
 /// 呼び出し元の provider/index が定める順位契約（[`CandidateHit`] はスコア降順・
 /// 同点 id 昇順、[`ScoredDoc`] は同様の契約）に従って既にソート済みであることを
-/// 前提とする。1-based 順位 `r` に対し `weight / (k_const + r)` を id ごとに加算する
-/// （両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず順位のみを
-/// 使う（RRF の定義）。
+/// 前提とする。1-based 順位 `r`（列に現れる位置。同点は候補識別子昇順の位置が
+/// そのまま順位になる）に対し `weight / (k_const + r)` を id ごとに加算する
+/// （両リストに出現する id は和になる）。スコアの大小そのもの（内積・BM25 の実値）は
+/// 使わない（RRF の定義。同点時の順位規約は Issue #307・SEARCH-1・SEARCH-3 の
+/// 原因調査対象であり、詳細は `docs/design/hybrid-recall-regression.md`
+/// 「小規模段ゲート未達の engine 側原因調査（Issue #307）」節を参照）。
 ///
 /// 出力は融合スコア降順・同点は**候補識別子**の昇順（`f64::total_cmp` ベース）で確定する
 /// （識別子は呼び出し元定義。`sql/exec.rs` はアリーナのスロット番号を渡すため実質
@@ -424,15 +428,15 @@ pub fn rrf_fuse(
     let mut scores: BTreeMap<u64, f64> = BTreeMap::new();
 
     accumulate_ranked(
-        dense.iter().map(|h| h.id),
-        cfg.pool_depth(),
+        dense,
+        |h| (f64::from(h.score), h.id),
         cfg.k_const(),
         cfg.dense_weight(),
         &mut scores,
     );
     accumulate_ranked(
-        sparse.iter().map(|d| d.doc_id),
-        cfg.pool_depth(),
+        sparse,
+        |d| (d.score, d.doc_id),
         cfg.k_const(),
         cfg.sparse_weight(),
         &mut scores,
@@ -495,23 +499,35 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
     false
 }
 
-/// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き id 列（先頭 `pool_depth` 件）を
-/// RRF スコアへ変換し、`scores` へ加算する。密・疎の両リストから同じロジックで
-/// 呼ばれることで加算順序を一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`]
-/// で入力リスト全体の重複なしを事前に検証済みのため、`ids` の先頭 `pool_depth` 件も
-/// 重複しないことが保証されており、本関数自体は重複検知を行わない。
-fn accumulate_ranked(
-    ids: impl Iterator<Item = u64>,
-    pool_depth: usize,
+/// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
+/// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
+/// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
+/// 一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`] で入力リスト全体の
+/// 重複なしを事前に検証済みのため、本関数自体は重複検知を行わない。
+///
+/// 1-based の**位置順位**（`items` に現れる並び順がそのまま順位になる。`items` の
+/// 並び順は provider/index が定める「スコア降順、同点は候補識別子昇順」
+/// （[`is_sorted_desc_id_asc`] が検証する契約）に従う）を、同点グループ内の全要素へも
+/// 個別に割り当てる。`key` は `(score, id)` を返すが、本関数はこのうち `id`（順位の
+/// 加算先）のみを使い、`score` 自体は同点判定に使わない（呼び出し元 [`rrf_fuse`] が
+/// スコアの有限性・ソート順を事前検証済みのため）。
+///
+/// 同点グループの順位規約は Issue #307・SEARCH-1・SEARCH-3 の原因調査対象であり、
+/// 詳細は `docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の
+/// engine 側原因調査（Issue #307）」節を参照。
+fn accumulate_ranked<T>(
+    items: &[T],
+    key: impl Fn(&T) -> (f64, u64),
     k_const: f64,
     weight: f64,
     scores: &mut BTreeMap<u64, f64>,
 ) {
-    for (idx, id) in ids.take(pool_depth).enumerate() {
-        // 1-based 順位。`idx` は `take(pool_depth)` により高々 `pool_depth - 1`
-        // （`pool_depth <= MAX_POOL_DEPTH`）に収まるため `as f64` 変換で精度は失われない。
+    for (idx, item) in items.iter().enumerate() {
+        // 1-based 順位。`idx` は `items.len() <= pool_depth <= MAX_POOL_DEPTH` に
+        // 収まるため `as f64` 変換で精度は失われない。
         let rank = (idx as f64) + 1.0;
         let contribution = weight / (k_const + rank);
+        let (_, id) = key(item);
         let entry = scores.entry(id).or_insert(0.0);
         *entry += contribution;
     }
