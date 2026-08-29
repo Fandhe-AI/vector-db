@@ -1140,6 +1140,25 @@ pub fn hybrid_search_boosted(
     if dense_hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
         return Err(HybridError::ProviderResultRejected);
     }
+    // 拡張取得列（`fetch_k` 件。`pool_depth` を超えうる）全体に対し、有限性・
+    // ソート順・重複 id を [`complete_boundary_tie_group`] の前に検証する
+    // （codex-review P1 指摘対応。`complete_boundary_tie_group` は境界より内側を
+    // 保持しつつ末尾側だけを切り詰め/除外する場合があり、切り詰められて消える
+    // 末尾部分は後段の [`rrf_fuse_with_limits`] の検証対象に含まれなくなる。
+    // 例えば `pool_depth=2` で provider が `[score=3, 2, 1, 4]` を返すと、
+    // 順序違反の末尾要素が除去された `[3, 2]` だけが検証され、provider の契約
+    // 違反（順序崩れ・重複 id・非有限スコア）が正常な検索結果として受理されて
+    // しまう。fail-closed 方針（coding-rust.md）に従い、切り詰め前の拡張列
+    // 全体を検証してから初めて [`complete_boundary_tie_group`] へ渡す）。
+    if dense_hits.iter().any(|hit| !hit.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+    if !is_sorted_desc_id_asc(dense_hits.iter().map(|h| (f64::from(h.score), h.id))) {
+        return Err(HybridError::UnsortedInput);
+    }
+    if has_duplicate_id(dense_hits.iter().map(|h| h.id)) {
+        return Err(HybridError::DuplicateId);
+    }
     // `dense_hits` が可視集合内で存在しうる密ヒットを全件含む（＝取得済み範囲の
     // 末尾がそのまま真の終端であると確定できる）かどうか（[`complete_boundary_tie_group`]
     // ドキュメント参照）。`fetch_k` が可視 id 総数以上なら provider はそれ以上返しようが
@@ -2503,6 +2522,54 @@ mod tests {
         let cfg = RrfConfig::default();
         let err = rrf_fuse_with_limits(&[], MAX_POOL_DEPTH + 1, &[], 1, &cfg).unwrap_err();
         assert_eq!(err, HybridError::InvalidConfig);
+    }
+
+    /// [`SearchProvider`] の契約違反（`pool_depth` 境界より後ろ、しかし取得した
+    /// `fetch_k` 件の範囲内で順序契約〔スコア降順〕に違反する）を模したモック
+    /// provider。`complete_boundary_tie_group` が境界で切り詰める範囲の**外側**
+    /// （＝切り詰め後には残らない末尾）に契約違反を仕込む（codex-review P1 指摘・
+    /// threadId PRRT_kwDOUAKASM6dbhNv 対応の回帰固定）。
+    struct TailUnsortedProvider;
+    impl SearchProvider for TailUnsortedProvider {
+        fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+            // pool_depth=2 の境界は先頭 2 件（score=3, 2）。3 件目以降（score=1, 4）は
+            // 降順契約に違反する（1 の次に 4 が来ている）が、境界完全化の切り詰めで
+            // ちょうど除去される位置に置く。
+            Ok(vec![
+                CandidateHit { id: 1, score: 3.0 },
+                CandidateHit { id: 2, score: 2.0 },
+                CandidateHit { id: 3, score: 1.0 },
+                CandidateHit { id: 4, score: 4.0 },
+            ])
+        }
+    }
+
+    #[test]
+    fn hybrid_search_rejects_dense_provider_tail_contract_violation_beyond_pool_boundary() {
+        // codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbhNv）の回帰固定:
+        // `complete_boundary_tie_group` は `dense_hits`（拡張取得列）を境界で
+        // 切り詰めるが、切り詰められて消える末尾部分の契約違反（順序崩れ・重複 id・
+        // 非有限スコア）が検証を迂回して正常な検索結果として受理されてはならない
+        // （fail-closed 方針。coding-rust.md）。`pool_depth=2` で provider が
+        // `[score=3, 2, 1, 4]` を返すケース（末尾の `1 → 4` が降順契約に違反）で、
+        // 境界完全化の切り詰め後は `[3, 2]` のみが `rrf_fuse_with_limits` へ渡り
+        // 契約違反が見逃されていた（修正前は Ok を返してしまう）。修正後は拡張列
+        // 全体を切り詰め前に検証し `UnsortedInput` で拒否する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
+        let index = SparseIndex::build(&[(1, "dummy")]).expect("build ok");
+        let ids = [1u64, 2, 3, 4];
+        let vectors = [1.0f32, 1.0, 1.0, 1.0];
+        let query = [1.0f32];
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 1,
+        };
+        let err =
+            hybrid_search(&TailUnsortedProvider, input, &index, "nomatch", 2, &cfg).unwrap_err();
+        assert_eq!(err, HybridError::UnsortedInput);
     }
 
     #[test]
