@@ -162,9 +162,10 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   どちらかの GPU 初期化が失敗した環境では「測定不能（`pass=false`）」とし、
   CPU 経路同士の比較値を GPU 実測の代替として計上しない（CORE-6 と同方針）
 - CORE-6/CORE-16 の短縮率下限はそれぞれ `BENCH_CORE6_MIN_IMPROVEMENT_PCT` /
-  `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（Actions secrets。Issue #286 で variables
-  から移行）から注入し、未設定・非正値は fail-closed（値は spec が SSOT の
-  ため本リポにデフォルトを持たない）
+  `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（Environment `bench-gate` secrets。
+  Issue #286 で variables から repo secrets へ、その後 codex-review P0 指摘
+  〔PR #299〕で Environment `bench-gate` へ移行）から注入し、未設定・非正値は
+  fail-closed（値は spec が SSOT のため本リポにデフォルトを持たない）
 
 ## 3. ローカル実測（開発環境）
 

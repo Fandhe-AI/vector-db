@@ -26,14 +26,29 @@ name: Bench
 # 前提の基準に対して恒常的に red になりかねない（`sql_c1_bench.rs` 冒頭コメント参照。
 # `BENCH_DEDICATED_ENV` は GitHub ホステッド runner が専有環境でないため注入しない）。
 #
-# 閾値（spec 由来の非公開数値）は repo secrets（`secrets.*`）から注入する（Issue
-# #286）。以前は repo variables（`vars.*`）を使っていたが、`run` ステップに渡す
-# `env:` ブロックは Actions のログへ値付きでそのまま出力されるため、閾値の数値が
-# public な Actions ログへ印字されてしまっていた（spec-confidentiality の P0
-# 違反。詳細は `docs/design/ci-gate-variables.md` 参照）。secrets は Actions が
+# 閾値（spec 由来の非公開数値）は Actions secrets（`secrets.*`）から注入する
+# （Issue #286）。以前は repo variables（`vars.*`）を使っていたが、`run` ステップに
+# 渡す `env:` ブロックは Actions のログへ値付きでそのまま出力されるため、閾値の
+# 数値が public な Actions ログへ印字されてしまっていた（spec-confidentiality の
+# P0 違反。詳細は `docs/design/ci-gate-variables.md` 参照）。secrets は Actions が
 # ログ中の一致文字列を自動的に `***` へマスクするため同じ経路では漏えいしない。
 # opt-in フラグである `BENCH_CORE6`・`BENCH_CORE16`・`BENCH_DEDICATED_ENV` は
 # 非機密（有効/無効の 0/1・専有環境フラグ）のため repo variables のまま維持する。
+#
+# secrets を repo レベルに置くだけでは不十分（codex-review P0 指摘）: `workflow_dispatch`
+# は任意の ref を選んで起動でき、選択した ref の workflow YAML・`run` ステップが
+# そのまま実行される。そのため write 権限者が別ブランチで `run` ステップを書き換えて
+# `workflow_dispatch` すれば、repo レベルの secrets を任意の処理（外部送信を含む）へ
+# 渡せてしまう——ログのマスクは Actions のログ出力にのみ効くもので、run ステップが
+# secrets を別経路（外部 HTTP リクエスト等）へ渡すこと自体は防がない。そのため
+# 閾値 secrets は repo レベルではなく Environment `bench-gate`（deployment branch
+# policy で `main` のみに制限。リポジトリ管理者が事前に作成）に置き、閾値 secrets を
+# 使う全 job（bench-simd・bench-contrast・bench-batch・bench-c1）に
+# `environment: bench-gate` を指定する（recall.yml が `recall-gate` で採用している
+# 実行境界と同一方針。各 job の `if: github.ref == 'refs/heads/main'`・
+# `checkout ref: main` は defense-in-depth として維持する）。main 以外の ref から
+# `workflow_dispatch` した run は environment `bench-gate` にアクセスできないため、
+# 閾値 secrets を取得できず、上記の書き換え経路は成立しない。
 on:
   workflow_dispatch: {}
   schedule:
@@ -58,13 +73,31 @@ jobs:
   # ci.yml の crash-test 系ジョブと同一の SHA 固定で参照する（AGENTS.md「CI・ワークフロー
   # の改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。
   bench-simd:
+    # `workflow_dispatch` で main 以外の ref が選ばれた場合は job ごとスキップする
+    # （冒頭コメント参照。閾値 secrets を任意 ref の書き換えコードへ渡さないための
+    # fail-closed な制約。recall.yml の recall-regression job と同一方針）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment 保護（deployment branch policy で main のみに制限。
+    # リポジトリ管理者が事前に作成済み）が実際の実行境界。`secrets.BENCH_MAX_P95_MS`
+    # 等はこの environment の secrets として設定し、repo レベルには置かない
+    # （codex-review P0 指摘対応。write 権限者が別ブランチで run ステップを書き換えて
+    # `workflow_dispatch` しても、main 以外の ref からは environment `bench-gate`
+    # にアクセスできず secrets を取得できない。ログのマスクだけでは外部送信を
+    # 防げないため、実行境界そのものを main 限定にする）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （`if: github.ref == 'refs/heads/main'` と合わせた二重の固定。
+          # 万一 if 条件をすり抜けても untrusted な ref のコードを実行しない。
+          # recall.yml と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-simd
@@ -94,13 +127,23 @@ jobs:
   # 波及しない failure domain 分離。`Cargo.toml` の `contrast-bench` feature コメント
   # 参照）。既定ゲート化（旧 opt-in repo variable の撤去）は本 Issue #176 の目的の一つ。
   bench-contrast:
+    # bench-simd と同じ実行境界（冒頭コメント・bench-simd 参照）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_MAX_CONTRAST_RATIO` はこの environment の
+    # secrets として設定する（bench-simd と同一方針）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-contrast
@@ -121,13 +164,26 @@ jobs:
   # 扱う（`batch_bench.rs` 冒頭コメント参照）。bench-simd ジョブと同様、
   # schedule / workflow_dispatch の両方で実行する（#168）。
   bench-batch:
+    # bench-simd と同じ実行境界（冒頭コメント・bench-simd 参照）。
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_BATCH_MAX_DEGRADATION_PCT`・
+    # `secrets.BENCH_CORE6_MIN_IMPROVEMENT_PCT`・
+    # `secrets.BENCH_CORE16_MIN_IMPROVEMENT_PCT` はこの environment の secrets
+    # として設定する（bench-simd と同一方針）。opt-in フラグ `BENCH_CORE6`/
+    # `BENCH_CORE16` は非機密のため repo variables のまま（`vars.*`）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-batch
@@ -169,14 +225,24 @@ jobs:
   # （参考値としての p95/Recall 実測とゲートの土台整備が本ジョブの目的で、条件7 の
   # 最終判定はオーナーが専有環境で `make bench-c1` を実行して行う）。
   bench-c1:
-    if: github.event_name == 'workflow_dispatch'
+    # workflow_dispatch 限定（既存方針）に加え、main 以外の ref が選ばれた場合は
+    # job ごとスキップする（bench-simd と同じ実行境界。冒頭コメント参照）。
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # environment `bench-gate`（main 限定 deployment branch policy）が実際の
+    # 実行境界。`secrets.BENCH_SQL_C1_MAX_P95_MS`・`secrets.BENCH_SQL_C1_MIN_RECALL`
+    # はこの environment の secrets として設定する（bench-simd と同一方針）。
+    environment: bench-gate
     permissions:
       contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # dispatch 側の ref 選択に依存させず、常に main を checkout する
+          # （bench-simd と同一方針）。
+          ref: main
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run bench-c1

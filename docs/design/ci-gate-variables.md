@@ -3,7 +3,10 @@
 - ステータス: Proposed（本コミットは secrets ↔ spec ポインタの対応整理・設定手順の
   確立のみ。実際の `gh secret set`・`workflow_dispatch` による疎通確認はマージ後の
   リポジトリ管理者作業。実施後、別コミットで Accepted に更新する）
-- 対応: Issue #286（`ci: 回帰ベンチ・Recall ゲートの閾値注入を variables から secrets へ移行`）
+- 対応: Issue #286（`ci: 回帰ベンチ・Recall ゲートの閾値注入を variables から secrets へ移行`）。
+  PR #299 の codex-review P0 指摘を受け、`bench.yml` の閾値 secrets は repo レベルから
+  Environment `bench-gate`（`recall-gate` と同じく main 限定 deployment branch policy 付き）
+  へ再移設した（下記「Environment `bench-gate` secrets」参照）
 - 前提: TASK-127・TASK-130・TASK-83（`.github/workflows/bench.yml`）、
   TASK-104・TASK-108・TASK-112・TASK-113（`.github/workflows/recall.yml`）。既存 ADR
   （`hybrid-recall-regression.md`・`rerank-recall-regression.md`・
@@ -32,13 +35,31 @@ variables に設定した閾値（spec 由来の非公開数値）が public な
 本コミットのスコープ外**（下記「申し送り」参照。GitHub 設定変更は他の並列作業と
 共有される repository-wide な状態変更であり、レビュー未了の変更として実行しない）。
 
+**追記（PR #299 codex-review P0 指摘）**: `bench.yml` を repo レベルの secrets へ
+移行した直後、`workflow_dispatch` は任意の ref を選んで起動でき、選択した ref の
+`run` ステップがそのまま実行される点を突かれると、write 権限者が別ブランチで
+`run` ステップを書き換えて `workflow_dispatch` した場合に repo レベルの secrets を
+任意の処理（外部送信を含む）へ渡せてしまう、との指摘を受けた。secrets のログ
+マスクは Actions のログ出力にのみ効くもので、書き換えられた `run` ステップが
+secrets を別経路へ渡すこと自体は防がない。`recall.yml` は元々 Environment
+`recall-gate`（main 限定 deployment branch policy）でこの経路を塞いでいたため、
+`bench.yml` も同じ形へ揃えた: Environment `bench-gate`（main 限定）を新設し、
+`bench.yml` の閾値 secrets を使う全 job（`bench-simd`・`bench-contrast`・
+`bench-batch`・`bench-c1`）に `environment: bench-gate` を指定した。main 以外の
+ref から `workflow_dispatch` した run は Environment `bench-gate` にアクセス
+できないため、閾値 secrets を取得できない。
+
 ## secret ↔ spec ポインタ対応（値は書かない）
 
 値そのもの（spec 由来の数値基準）は `.claude/rules/spec-confidentiality.md`
 （本リポ public・spec は private）により本 ADR を含むいかなる public 資産にも
 記載しない。設定時は `docs/spec` の該当ビヘイビア ID の記述を直接参照すること。
 
-### repo secrets（`.github/workflows/bench.yml`）
+### Environment `bench-gate` secrets（`.github/workflows/bench.yml`）
+
+repo レベルの secrets ではなく Environment `bench-gate`（deployment branch
+policy で `main` のみに制限）に置く（上記「追記」参照。`.github/workflows/
+recall.yml` が `recall-gate` で採用済みの実行境界と同一方針）。
 
 | secret | spec ポインタ | 受理形式（実装の検証規則） |
 | -------- | -------------- | -------------------------- |
@@ -58,7 +79,8 @@ schedule／workflow_dispatch の両方で実行され、`BENCH_MAX_P95_MS`・
 green にするための必須 secrets はこの 4 つ）。
 
 一方 `bench-c1` job は `workflow_dispatch` 限定（`if: github.event_name ==
-'workflow_dispatch'`）で **schedule には含まれない**。`BENCH_SQL_C1_MAX_P95_MS`・
+'workflow_dispatch' && github.ref == 'refs/heads/main'`）で **schedule には
+含まれない**。`BENCH_SQL_C1_MAX_P95_MS`・
 `BENCH_SQL_C1_MIN_RECALL` の 2 secrets は `workflow_dispatch` で `bench-c1` を
 明示的に起動したときにのみ必要であり、週次 schedule の red 状態には無関係
 （未設定でも schedule は red のまま変化しない）。
@@ -123,18 +145,18 @@ strict モード時、`DEGRADED` を含め未設定の変数を検出した時�
 置き換える）。
 
 ```bash
-# repo secrets（bench.yml）: NAME に BENCH_MAX_P95_MS 等を順に指定して繰り返す
-read -rs value && printf '%s' "$value" | gh secret set NAME && unset value
+# Environment bench-gate secrets（bench.yml）: --env bench-gate を付ける
+read -rs value && printf '%s' "$value" | gh secret set NAME --env bench-gate && unset value
 
 # Environment recall-gate secrets（recall.yml）: --env recall-gate を付ける
 # DEGRADED を含む全 9 secrets を、DEGRADED の採用可否によらず設定する
 read -rs value && printf '%s' "$value" | gh secret set NAME --env recall-gate && unset value
 
-gh secret list
+gh secret list --env bench-gate
 gh secret list --env recall-gate
 ```
 
-対象の secret 名（repo secrets）:
+対象の secret 名（environment `bench-gate` secrets）:
 
 - `BENCH_MAX_P95_MS`
 - `BENCH_MIN_RECALL`
@@ -142,6 +164,8 @@ gh secret list --env recall-gate
 - `BENCH_BATCH_MAX_DEGRADATION_PCT`
 - `BENCH_SQL_C1_MAX_P95_MS`
 - `BENCH_SQL_C1_MIN_RECALL`
+- `BENCH_CORE6_MIN_IMPROVEMENT_PCT`（任意）
+- `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（任意）
 
 対象の secret 名（environment `recall-gate` secrets）:
 
@@ -155,34 +179,46 @@ gh secret list --env recall-gate
 - `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`
 - `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（strict モードの必須条件として設定する）
 
-既存の repo variables（`vars.BENCH_MAX_P95_MS` 等）・Environment `recall-gate`
-の variables（`vars.HYBRID_RECALL_MIN_*` 等）を過去に設定していた場合は、上記の
-同名 secrets への設定完了後に `gh variable delete NAME`（environment 側は
-`--env recall-gate` を付ける）で削除し、二重管理・古い値の混在を避ける。
+既存の repo secrets（`secrets.BENCH_MAX_P95_MS` 等。本 PR の前段で repo レベルに
+設定していたもの）・repo variables（`vars.BENCH_MAX_P95_MS` 等）・Environment
+`recall-gate` の variables（`vars.HYBRID_RECALL_MIN_*` 等）を過去に設定していた
+場合は、上記の同名 Environment secrets への設定完了後に `gh secret delete NAME`
+（repo secrets）・`gh variable delete NAME`（repo variables。environment 側は
+`--env recall-gate` を付ける）で削除し、二重管理・古い値の混在を避ける。特に
+repo レベルの `BENCH_*` secrets は本 ADR の前段で一時的に設定したものであり、
+Environment `bench-gate` への移行後は速やかに削除する（repo レベルに残したまま
+だと codex-review P0 指摘の書き換え経路が再び成立するため）。
 
 設定後は必ず以下を確認する:
 
-1. `gh api repos/Fandhe-AI/vector-db/environments/recall-gate/deployment-branch-policies`
+1. `gh api repos/Fandhe-AI/vector-db/environments/bench-gate/deployment-branch-policies`
+   / `gh api repos/Fandhe-AI/vector-db/environments/recall-gate/deployment-branch-policies`
    で branch policy が `main` のみに制限されたままであること
    （`hybrid-recall-regression.md` の実行境界設計を参照）
-2. `gh workflow run recall.yml --ref main` / `gh workflow run bench.yml --ref main`
+2. `gh workflow run bench.yml --ref main` / `gh workflow run recall.yml --ref main`
    を実行し、`gh run view <id>` で各 job・step が **skip ではなく実行**され、
-   strict モード（`*_REQUIRE_THRESHOLDS=1`）で pass したことを `pass=`/`pass_*=`
-   行（非数値の判定結果のみ）で確認する。閾値未達（red）の場合は spec 値を変更
-   せず、pass/fail の状態のみを記録する（fail-closed を維持する）。ログ中の
-   secrets の値は GitHub Actions により自動的に `***` へマスクされる（`env:`
-   ブロックが値付きで印字されていた repo variables 時代の問題はこの副作用として
-   解消される）
-3. ログ全文（`gh run view --log`）は保存・転記しない。閾値・実測値を public
+   strict モード（`*_REQUIRE_THRESHOLDS=1`。recall.yml のみ）で pass したことを
+   `pass=`/`pass_*=` 行（非数値の判定結果のみ）で確認する。閾値未達（red）の
+   場合は spec 値を変更せず、pass/fail の状態のみを記録する（fail-closed を
+   維持する）。ログ中の secrets の値は GitHub Actions により自動的に `***` へ
+   マスクされる（`env:` ブロックが値付きで印字されていた repo variables 時代の
+   問題はこの副作用として解消される）
+3. 別ブランチ（`main` 以外）から `bench.yml`/`recall.yml` を `workflow_dispatch`
+   した場合、`environment: bench-gate`/`environment: recall-gate` を指定した
+   job が Environment 保護により実行拒否される（またはスキップされる）ことを
+   確認する（codex-review P0 指摘で問題になった経路が塞がれていることの確認）
+4. ログ全文（`gh run view --log`）は保存・転記しない。閾値・実測値を public
    資産（PR・commit・docs・Issue）へ書かない
 
 ## 申し送り（本コミットのスコープ外）
 
-- repo secrets（6 件必須＋2 件任意）の実値設定
+- Environment `bench-gate` secrets（6 件必須＋2 件任意）の実値設定
 - Environment `recall-gate` secrets（`DEGRADED` を含む全 9 件）の実値設定
-- 旧 repo variables／Environment `recall-gate` variables に実値が設定済みだった
+- 旧 repo secrets（`BENCH_*`。Environment `bench-gate` 移行前に設定していた場合）・
+  旧 repo variables／Environment `recall-gate` variables に実値が設定済みだった
   場合の削除（上記「設定手順」参照）
-- `workflow_dispatch` による strict モード疎通確認と run の記録
+- `workflow_dispatch` による strict モード疎通確認と run の記録（main 以外の ref
+  からの `workflow_dispatch` が Environment 保護で拒否されることの確認を含む）
 - `PRECISION_EVAL_*`（TASK-163・SEARCH-10）目標値確定と `recall.yml` への接続
 - TASK-116（PLAN-4/6/7）の `make bench-tier` 実測と ADR の Accepted 化
 - `BENCH_CORE6` / `BENCH_CORE16` の GPU 搭載ホストでの opt-in 有効化

@@ -62,28 +62,48 @@ fail-closed で起動を拒否します）。`--bind` 省略時は `127.0.0.1:54
 psycopg・node pg から無改造で cleartext password 認証つき接続できます
 （詳細: `docs/design/three-client-e2e-harness.md`）。
 
-### 回帰ベンチの repo secrets（TASK-127）
+### 回帰ベンチの Environment `bench-gate` secrets（TASK-127）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
 に集約しています（Issue #286。値の実設定は引き続きマージ後の管理者作業。
 `PRECISION_EVAL_*`〔TASK-163〕は目標値未確定のため未設定のままです）。
 
-閾値は repo variables ではなく repo **secrets**（`secrets.*`）から注入します。
-`run` ステップに渡す `env:` ブロックは GitHub Actions のログへ値付きでそのまま
-出力されるため、以前使っていた variables では閾値の数値が public な Actions
-ログへ印字されてしまっていました（`docs/design/ci-gate-variables.md` 参照）。
-secrets は Actions が一致文字列を自動的に `***` へマスクするため、同じ経路では
-漏えいしません。opt-in フラグ（`BENCH_CORE6`・`BENCH_CORE16`・
+閾値は repo variables ではなく Environment **`bench-gate`** の **secrets**
+（`secrets.*`）から注入します。`run` ステップに渡す `env:` ブロックは GitHub
+Actions のログへ値付きでそのまま出力されるため、以前使っていた variables では
+閾値の数値が public な Actions ログへ印字されてしまっていました
+（`docs/design/ci-gate-variables.md` 参照）。secrets は Actions が一致文字列を
+自動的に `***` へマスクするため、同じ経路では漏えいしません。
+
+**repo レベルの secrets ではなく main 限定 Environment に置く理由**:
+`workflow_dispatch` は任意の ref を選んで起動でき、選択した ref の workflow
+YAML・`run` ステップがそのまま実行されます。write 権限者が別ブランチで `run`
+ステップを書き換えて `workflow_dispatch` すれば、repo レベルの secrets を任意の
+処理（外部送信を含む）へ渡せてしまいます——ログのマスクは Actions のログ出力
+にのみ効くもので、書き換えられた `run` ステップが secrets を別経路へ渡すこと
+自体は防ぎません（PR #299 codex-review P0 指摘）。そのため閾値 secrets は
+Environment `bench-gate`（deployment branch policy で `main` のみに制限）に
+置き、`.github/workflows/bench.yml` の閾値 secrets を使う全 job
+（`bench-simd`・`bench-contrast`・`bench-batch`・`bench-c1`）に
+`environment: bench-gate` を指定します。main 以外の ref から
+`workflow_dispatch` した run は Environment `bench-gate` にアクセスできない
+ため、閾値 secrets を取得できません（`.github/workflows/recall.yml` が
+`recall-gate` で採用済みの実行境界と同一方針。各 job の `if:
+github.ref == 'refs/heads/main'`・`checkout ref: main` は defense-in-depth
+として維持しています）。opt-in フラグ（`BENCH_CORE6`・`BENCH_CORE16`・
 `BENCH_DEDICATED_ENV`。値は 0/1 や専有環境宣言で非機密）は引き続き repo
 variables のままです。
 
-`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）・`BENCH_MAX_CONTRAST_RATIO`（対照エンジンに対する p95 レイテンシ比率〔被検/対照〕の上限・TASK-127 CORE-5）をリポジトリの Actions secrets（`secrets.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
+> [!WARNING]
+> **workflow を一度でも実行する前に、必ず deployment branch policy（`main` のみ）付きで Environment `bench-gate` を作成してください。** 未作成のまま `environment: bench-gate` を指定した job が走ると、GitHub は branch policy なしの environment を自動作成してしまい、`main` 以外の ref からもアクセスできる状態になります（`recall-gate` と同じ注意点）。**本リポジトリでは Environment `bench-gate` は作成済みです**（branch policy `main` 付き）。
+
+`.github/workflows/bench.yml`（`workflow_dispatch` + 週次 `schedule`。毎週月曜 03:00 UTC）は `BENCH_MAX_P95_MS`（p95 レイテンシ上限・ミリ秒）・`BENCH_MIN_RECALL`（Recall@k 下限）・`BENCH_BATCH_MAX_DEGRADATION_PCT`（バッチ経路の劣化率上限・TASK-130）・`BENCH_MAX_CONTRAST_RATIO`（対照エンジンに対する p95 レイテンシ比率〔被検/対照〕の上限・TASK-127 CORE-5）を Environment `bench-gate` の Actions secrets（`secrets.*`）から注入します。値そのもの（spec 由来の数値基準）は本リポジトリには記載しません。マージ後、リポジトリ管理者が以下を実行して設定してください。
 
 ```bash
-gh secret set BENCH_MAX_P95_MS
-gh secret set BENCH_MIN_RECALL
-gh secret set BENCH_BATCH_MAX_DEGRADATION_PCT
-gh secret set BENCH_MAX_CONTRAST_RATIO
+gh secret set BENCH_MAX_P95_MS --env bench-gate
+gh secret set BENCH_MIN_RECALL --env bench-gate
+gh secret set BENCH_BATCH_MAX_DEGRADATION_PCT --env bench-gate
+gh secret set BENCH_MAX_CONTRAST_RATIO --env bench-gate
 ```
 
 形式は以下のとおりです（値は上記のとおり本リポジトリには記載しません）。
@@ -101,17 +121,17 @@ gh secret set BENCH_MAX_CONTRAST_RATIO
 
 CORE-5（対照エンジンとの p95 レイテンシ比較。ポインタ: `docs/spec/04-behavior/core-engine.md` CORE-5）は usearch の総当たり `exact_search`（`contrast-bench` feature 限定の optional 依存。`crates/engine/Cargo.toml`）を対照エンジンとして接続済みです（TASK-127・Issue #176。クレート採用と公開境界はオーナー承認済み〔2026-08-26〕）。`contrast_bench.rs` が被検（`ParallelSearchProvider`）と対照エンジンを同一データ・同一クエリで interleaved A/B 実行し、両者の p95 レイテンシ比率（被検/対照）が `BENCH_MAX_CONTRAST_RATIO` 以下であることを判定します。CORE-3/CORE-4（`simd_bench.rs`）とは独立した bench-contrast ジョブとして既定ゲート実行され、`BENCH_MAX_CONTRAST_RATIO` 未設定・不正値は fail-closed で非ゼロ終了します（旧 `BENCH_CORE5` repo variable による opt-in 方式は撤去済み）。閾値の具体値は spec が SSOT のため本リポジトリには記載せず、bench の標準出力にも出しません。`contrast-bench` feature は `make lint`／`make test`（lefthook pre-push 含む）が `--all-features` で実行するため、`make bench-contrast` に限らずこれらのローカル実行・CI でも usearch の C++ ビルドが走ります。C++17 コンパイラが必要です（GitHub ホステッド `ubuntu-latest` には同梱済み。ローカルに C++17 コンパイラがない環境では `make lint`／`make test`／`make ci` が失敗します）。
 
-同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド（`gpu_batch.rs`）へ接続済みです（Issue #178・#234）。`benches/batch_bench.rs` の A/B 実測ゲートへどちらも配線済みで、CORE-6 は GPU 経路 vs CPU-SIMD 経路、CORE-16 は GPU 側の f16 パック常駐 vs f32 常駐対照経路（`GpuF32ContrastBackend`）を比較します。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6`/`BENCH_CORE16` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限の secrets `BENCH_CORE6_MIN_IMPROVEMENT_PCT`/`BENCH_CORE16_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。GPU が初期化できない環境で opt-in された場合はそれぞれ理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。secrets 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
+同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド（`gpu_batch.rs`）へ接続済みです（Issue #178・#234）。`benches/batch_bench.rs` の A/B 実測ゲートへどちらも配線済みで、CORE-6 は GPU 経路 vs CPU-SIMD 経路、CORE-16 は GPU 側の f16 パック常駐 vs f32 常駐対照経路（`GpuF32ContrastBackend`）を比較します。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6`/`BENCH_CORE16` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限の Environment `bench-gate` secrets `BENCH_CORE6_MIN_IMPROVEMENT_PCT`/`BENCH_CORE16_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。GPU が初期化できない環境で opt-in された場合はそれぞれ理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。secrets 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
 
 `batch_bench.rs` の標準出力は既定で pass/fail と非数値状態のみを書き、実測値・注入した閾値のどちらも出しません（`contrast_bench.rs` の CORE-5 で採用済みの方針を横展開したもの。Issue #279）。実測値（p95・median）が必要な場合は、ローカルまたは承認済み計測環境で `BENCH_VERBOSE=1 make bench-batch` を実行してください。`BENCH_VERBOSE` は `.github/workflows/bench.yml` の `bench-batch` ジョブへは注入しておらず、`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体を bench 側が fail-closed で拒否します（public な Actions ログへ実測値が漏れないための二重化）。取得した実測値は Issue・PR・docs 等の public 資産へ転記しないでください。
 
 ### C1 p95 専有環境再測定（TASK-83）
 
-`make bench-c1`（`crates/engine/benches/sql_c1_bench.rs`）は SQL 表層（`EngineCore::execute_sql`）経由の C1（純粋 Top-k）p95 を測定します。閾値は SQL-1 専用の `BENCH_SQL_C1_MAX_P95_MS`（正の整数・ms）・`BENCH_SQL_C1_MIN_RECALL`（`(0.0, 1.0]` の浮動小数点）を repo secrets から注入します。上記 TASK-127 の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は `SearchProvider` 単体（CORE-3・SEARCH-4・CORE-4）の基準であり SQL-1 とは spec 上の出所が異なるため、流用せず別 secret として分離しています（流用すると緩い側で false green・厳しい側で false red になります）。値そのものは本リポジトリには記載しません。
+`make bench-c1`（`crates/engine/benches/sql_c1_bench.rs`）は SQL 表層（`EngineCore::execute_sql`）経由の C1（純粋 Top-k）p95 を測定します。閾値は SQL-1 専用の `BENCH_SQL_C1_MAX_P95_MS`（正の整数・ms）・`BENCH_SQL_C1_MIN_RECALL`（`(0.0, 1.0]` の浮動小数点）を Environment `bench-gate` の secrets から注入します。上記 TASK-127 の `BENCH_MAX_P95_MS`／`BENCH_MIN_RECALL` は `SearchProvider` 単体（CORE-3・SEARCH-4・CORE-4）の基準であり SQL-1 とは spec 上の出所が異なるため、流用せず別 secret として分離しています（流用すると緩い側で false green・厳しい側で false red になります）。値そのものは本リポジトリには記載しません。
 
 ```bash
-gh secret set BENCH_SQL_C1_MAX_P95_MS
-gh secret set BENCH_SQL_C1_MIN_RECALL
+gh secret set BENCH_SQL_C1_MAX_P95_MS --env bench-gate
+gh secret set BENCH_SQL_C1_MIN_RECALL --env bench-gate
 ```
 
 未設定のまま実行すると `sql_c1_bench.rs` が fail-closed で判定不能として非ゼロ終了します（デフォルト値は持ちません）。`.github/workflows/bench.yml` の `bench-c1` ジョブは `workflow_dispatch` 限定で、`bench-simd`／`bench-batch` と異なり週次 `schedule` には含めません（GitHub ホステッド runner が専有環境ではないため。詳細は `docs/design/c1-p95-dedicated-env-reverification.md` 参照）。

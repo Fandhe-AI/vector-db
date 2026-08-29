@@ -79,7 +79,7 @@ feature を廃止した経緯（`crates/engine/Cargo.toml` コメント参照）
 実行するため、`contrast-bench` feature は PR ごとの `make ci`・CI で常時有効化され
 usearch の C++ ビルドが走る（GitHub ホステッド `ubuntu-latest` には g++ が同梱済み。
 初回 1〜3 分、以降はビルドキャッシュ次第）。ローカル実行にも C++17 コンパイラが必要
-になる（README「回帰ベンチの repo secrets」に明記）。`deny.toml` は
+になる（README「回帰ベンチの Environment `bench-gate` secrets」に明記）。`deny.toml` は
 `[graph] all-features = true` を追加し、optional 依存も advisories/licenses/sources/
 bans の監査対象に含めた（fail-closed）。
 
