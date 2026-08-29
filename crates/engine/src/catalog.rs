@@ -676,7 +676,10 @@ fn require_table_exists_read(read_txn: &redb::ReadTransaction, table_name: &str)
 /// 影響しないことが `USING PLAN` の I/O 前後世代照合（`core.rs`
 /// `EngineCore::execute_sql_in_session` の `Statement::Select` アーム参照）の
 /// 可用性契約（「テナント境界を跨いだ通常の書き込みトラフィックで USING PLAN が
-/// 恒常的に拒否されない」）の土台になる。
+/// 恒常的に拒否されない」）の土台になる。粒度がテーブル単位・全テナント共通
+/// （テナント単位・可視性境界単位への細分化は行わない）であることの設計判断は
+/// Issue #285 で現状維持として確定した。根拠・移行トリガーは
+/// `docs/design/table-generation-rejection-granularity.md` を参照。
 const TABLE_GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new("table_generation");
 
 /// [`TABLE_GENERATION_TABLE`] を 1 つ進める（`write_txn.commit()` 前に呼ぶ）。
