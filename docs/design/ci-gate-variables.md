@@ -202,7 +202,14 @@ Environment `bench-gate` への移行後は速やかに削除する（repo レ�
    場合は spec 値を変更せず、pass/fail の状態のみを記録する（fail-closed を
    維持する）。ログ中の secrets の値は GitHub Actions により自動的に `***` へ
    マスクされる（`env:` ブロックが値付きで印字されていた repo variables 時代の
-   問題はこの副作用として解消される）
+   問題はこの副作用として解消される）。`recall.yml` は 3 つの gate step
+   （`Run recall-regression` / `Run rerank-regression` /
+   `Run query-planning-regression`）を独立に実行し、job の最終判定は末尾の
+   `Evaluate recall gates` step が 3 step の `outcome` を AND 集約して行う
+   （Issue #311・`docs/design/recall-gate-independent-evaluation.md`）。
+   `Evaluate recall gates` step の `gate=<name> outcome=<...>` 行と最終
+   `pass=true|false` 行で、3 ゲートそれぞれの pass/fail を（数値なしで）
+   確認し、#301 に記録する
 3. 別ブランチ（`main` 以外）から `bench.yml`/`recall.yml` を `workflow_dispatch`
    した場合、`environment: bench-gate`/`environment: recall-gate` を指定した
    job が Environment 保護により実行拒否される（またはスキップされる）ことを
@@ -223,3 +230,6 @@ Environment `bench-gate` への移行後は速やかに削除する（repo レ�
 - TASK-116（PLAN-4/6/7）の `make bench-tier` 実測と ADR の Accepted 化
 - `BENCH_CORE6` / `BENCH_CORE16` の GPU 搭載ホストでの opt-in 有効化
 - `bench-c1`（TASK-83 条件7）の専有環境での最終判定
+- Issue #311（`recall.yml` の 3 ゲート独立評価・AND 集約）のマージ後
+  `workflow_dispatch` 疎通確認と、3 ゲートそれぞれの pass/fail の #301 への記録
+  （`docs/design/recall-gate-independent-evaluation.md` 参照）
