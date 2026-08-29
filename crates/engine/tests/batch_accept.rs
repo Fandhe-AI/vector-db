@@ -25,8 +25,8 @@ mod harness;
 
 use harness::accept::{
     check_degradation_pct_within_limit, check_degradation_within_limit, check_improvement_at_least,
-    degradation_pct, median_degradation_pct, paired_degradation_pct_samples, recall_at_k,
-    worst_recall,
+    degradation_pct, median_degradation_pct, p95_degradation_pct, paired_degradation_pct_samples,
+    recall_at_k, worst_recall,
 };
 use harness::rng::DeterministicRng;
 use harness::stats::BenchError;
@@ -178,6 +178,67 @@ fn median_degradation_pct_rejects_non_finite_samples() {
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 
     let err = median_degradation_pct(&[1.0, f64::INFINITY]).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+// ---------------------------------------------------------------------
+// p95_degradation_pct（CORE-7・Issue #302 codex-review 対応: ペア化した反復
+// ごとの劣化率列から試行内 p95 を算出するヘルパ。中央値では被検側〔B〕の
+// 遅い上位 5% だけの退行を見逃しうるため、契約が定める p95 を試行内統計量に
+// 使う）
+// ---------------------------------------------------------------------
+
+#[test]
+fn p95_degradation_pct_single_sample() {
+    assert_eq!(p95_degradation_pct(&[7.5]).unwrap(), 7.5);
+}
+
+#[test]
+fn p95_degradation_pct_small_sample_returns_max() {
+    // n=3 では rank=ceil(3*0.95)=3 のため最大値そのものを返す
+    // （`p95_from_samples` と同一の最近傍法。少数試行では実質「最悪値」になる）。
+    assert_eq!(p95_degradation_pct(&[1.0, 3.0, 2.0]).unwrap(), 3.0);
+}
+
+#[test]
+fn p95_degradation_pct_is_not_diluted_by_a_single_outlier_among_many() {
+    // 9 件が同一の低い劣化率・1 件だけ大きく退行した反復（B 側の遅い上位 5%
+    // 相当）を混ぜた場合、中央値だと外れ値が埋もれて見逃すが p95 は検出する
+    // （n=10・rank=ceil(10*0.95)=10 のため最悪値である外れ値そのものを返す）。
+    let mut samples: Vec<f64> = std::iter::repeat_n(1.0, 9).collect();
+    samples.push(50.0);
+    let median = median_degradation_pct(&samples).unwrap();
+    let p95 = p95_degradation_pct(&samples).unwrap();
+    assert_eq!(median, 1.0, "median must be diluted by the single outlier");
+    assert_eq!(
+        p95, 50.0,
+        "p95 must surface the single large-degradation outlier"
+    );
+}
+
+#[test]
+fn p95_degradation_pct_ignores_input_order() {
+    let ascending = [1.0, 2.0, 3.0, 4.0, 5.0];
+    let mut shuffled = ascending;
+    shuffled.reverse();
+    assert_eq!(
+        p95_degradation_pct(&ascending).unwrap(),
+        p95_degradation_pct(&shuffled).unwrap()
+    );
+}
+
+#[test]
+fn p95_degradation_pct_rejects_empty_samples() {
+    let err = p95_degradation_pct(&[]).unwrap_err();
+    assert!(matches!(err, BenchError::EmptySamples));
+}
+
+#[test]
+fn p95_degradation_pct_rejects_non_finite_samples() {
+    let err = p95_degradation_pct(&[1.0, f64::NAN, 2.0]).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = p95_degradation_pct(&[1.0, f64::INFINITY]).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 

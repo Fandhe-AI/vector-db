@@ -278,9 +278,48 @@ pub fn median_degradation_pct(samples: &[f64]) -> Result<f64, BenchError> {
     Ok(median)
 }
 
+/// ペア化した反復ごとの劣化率（%）列から p95（試行内の 95 パーセンタイル）を
+/// 算出する（TASK-130・CORE-7・Issue #302 codex-review 対応）。
+///
+/// CORE-7 が定める量は**単発クエリ経路の p95 劣化**であり、[`median_degradation_pct`]
+/// を試行内の統計量に使うと「典型的な反復の劣化率」（中央値）になってしまい、
+/// 被検側（B）の遅い上位 5% だけが退行しても検出できない（`p95_from_samples` を
+/// 経由する非ペア化比較 [`degradation_pct`]`(p95_from_samples(a), p95_from_samples(b))`
+/// より判別力が弱くなる）。本関数はペア化差分（[`paired_degradation_pct_samples`]。
+/// A/B が共有する支配的コストの反復間ノイズを相殺する）による判別力向上を維持
+/// したまま、試行内の統計量を p95 に揃える（`run_core7_gate` は複数試行それぞれで
+/// 本関数を呼び、試行間のスパイク耐性は [`median_degradation_pct`] による
+/// 試行間中央値へ委ねる——単一試行内のばらつき〔本関数が担う〕と複数試行間の
+/// 突発スパイク〔試行間中央値が担う〕は別種のノイズであり、両方を中央値化する
+/// と後者にしか効かない対策で前者〔契約が定める p95 劣化〕を隠してしまう）。
+///
+/// 算出方式は [`p95_from_samples`] と同じ最近傍法（線形補間ではなく実測サンプル
+/// 点をそのまま返す。SLO 判定に使う値のため実測範囲外への補間を避ける）を
+/// `Duration` ではなく `f64`（%）へ適用したもの。`samples` が空の場合は
+/// `Err(BenchError::EmptySamples)`、非有限値を含む場合は
+/// `Err(BenchError::ProtocolViolation)`（[`median_degradation_pct`] と同一の
+/// fail-closed 方針）。
+pub fn p95_degradation_pct(samples: &[f64]) -> Result<f64, BenchError> {
+    if samples.is_empty() {
+        return Err(BenchError::EmptySamples);
+    }
+    if samples.iter().any(|v| !v.is_finite()) {
+        return Err(BenchError::ProtocolViolation(
+            "p95_degradation_pct: samples must all be finite",
+        ));
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len().saturating_sub(1));
+    sorted.get(idx).copied().ok_or(BenchError::EmptySamples)
+}
+
 /// 劣化率（%）の中央値が上限（`max_pct`）以内かを判定する（TASK-130・CORE-7・
 /// Issue #302）。[`check_degradation_within_limit`] の単一試行版に対応する
-/// 複数試行版で、`batch_bench.rs::run_core7_gate` の 5 試行フローから使う。
+/// 複数試行版で、`batch_bench.rs::run_core7_gate` の 5 試行フローから使う
+/// （試行内の統計量には [`p95_degradation_pct`] を使い、本関数はその複数試行の
+/// 結果〔試行ごとの p95〕を束ねる試行間中央値の判定に用いる）。
 ///
 /// `max_pct` の妥当性検証は [`check_degradation_within_limit`] と同一
 /// （有限・非負のみ許容。fail-closed）。
