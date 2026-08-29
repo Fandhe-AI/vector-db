@@ -4,8 +4,7 @@
 //! Recall 受け入れ基準を自動チェックする回帰テスト。
 //!
 //! `crates/engine/tests/cjk_tokenizer_impact.rs`（TASK-106）の決定的合成コーパス生成
-//! （自前 xorshift64*・外部クレート不使用）＋ Recall 実測＋固定値アサーションによる
-//! 回帰トラッキング方式を踏襲する。正解判定は文書の潜在トピック集合
+//! （自前 xorshift64*・外部クレート不使用）方式を踏襲する。正解判定は文書の潜在トピック集合
 //! （[`Doc::keywords`]）から独立に構築し、疎チャネル（テキスト）・密チャネル
 //! （ベクトル）はいずれもその非完全な観測（lossy view）として生成する
 //! （[`generate_corpus`] のドキュメント参照）。これにより疎のみ／密のみでしか
@@ -20,8 +19,10 @@
 //! - 大規模段（`LARGE_NUM_DOCS` 件オーダ）: Recall@20・Recall@100（SEARCH-2 対応）
 //!
 //! 2 層構成（PR CI と閾値ゲートの分離）:
-//! - 層 A（`#[test]`・常時 `cargo test` 対象）: 決定的コーパスでのヒット数を固定値
-//!   アサーションで回帰トラッキングする（`cjk_tokenizer_impact.rs` と同方式）。
+//! - 層 A（`#[test]`・常時 `cargo test` 対象）: 決定的コーパスでの実測値どうしの
+//!   関係（会計整合・上限以下・単調性・非空・非飽和）を、数値リテラルを含まない
+//!   アサーションで回帰トラッキングする（Issue #312。それ以前は hit 数の固定値
+//!   アサーションだったが、層 B の非公開閾値の逆算材料になりうるため除去した）。
 //!   spec の数値基準は使わないため public 資産に閾値を持ち込まない
 //!   （`.claude/rules/spec-confidentiality.md`）。
 //! - 層 B（`#[ignore]`・`make recall-regression` 経由）: spec 由来の Recall 下限
@@ -283,7 +284,7 @@ const VECTOR_DECOY_PROB: f64 = 0.12;
 /// （[`TEXT_KEYWORD_DROPOUT_PROB`]・[`VECTOR_KEYWORD_DROPOUT_PROB`]・
 /// [`VECTOR_DECOY_PROB`]）。ドロップアウト・デコイはいずれも 0/1 の one-hot 次元への
 /// 操作のみで、浮動小数点の連続ノイズは加えない——`ParallelSearchProvider`
-/// の加算順序（並列分割）に依存する丸め誤差を避け、層 A の固定値アサーションが
+/// の加算順序（並列分割）に依存する丸め誤差を避け、層 A の回帰アサーションが
 /// スレッド数に左右されず再現可能であることを保証するため。
 fn generate_corpus(
     seed: u64,
@@ -434,8 +435,8 @@ fn generate_qa_set(
 /// [`recall20`](RecallResult::recall20)/[`recall100`](RecallResult::recall100) は
 /// 分母に理論上限 `ceil20`/`ceil100`（Σmin(k,\|correct_q\|)）を使い、達成可能な上限に
 /// 対する到達率として層 A（回帰トラッキング）・層 B（spec 閾値ゲート）の両方で同じ
-/// 意味の値を扱えるようにする。`total_correct` 自体は層 A の固定値アサーション対象
-/// として残す。
+/// 意味の値を扱えるようにする。`total_correct` 自体は QA セットからの会計整合で
+/// 検証する（[`qa_accounting`]。Issue #312）。
 struct RecallResult {
     total_correct: usize,
     hits20: usize,
@@ -659,7 +660,7 @@ fn to_intent_query(qa: &QaCase) -> QaCase {
 /// 測定前提＝クエリ展開ありへ揃えるための切り替え）。
 enum QuerySource<'a> {
     /// 展開なし（`QaCase::query_text`/`query_vector` をそのまま使う）。既存の
-    /// 層 A 固定値回帰・小規模段層 B はこの経路のまま。
+    /// 層 A 回帰・小規模段層 B はこの経路のまま。
     Baseline,
     /// 展開あり（[`expand_and_reconstruct_with`] で再構成したクエリを使う）。
     /// 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が使う。
@@ -827,9 +828,22 @@ fn measure_recall_with(docs: &[Doc], qa: &[QaCase], source: QuerySource<'_>) -> 
 }
 
 /// [`measure_recall_with`] の展開なし（[`QuerySource::Baseline`]）の薄いラッパ。
-/// 既存呼び出し（層 A 固定値回帰・小規模段層 B）は無変更でこちらを使い続ける。
+/// 既存呼び出し（層 A 回帰・小規模段層 B）は無変更でこちらを使い続ける。
 fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
     measure_recall_with(docs, qa, QuerySource::Baseline)
+}
+
+/// Issue #312: 層 A の固定値アサーション（hit 数・実測値そのもの）を public 資産へ
+/// 記録しない方針への置換で使う会計整合ヘルパ。`total_correct`/`ceil20`/`ceil100`
+/// を QA セット（[`QaCase::correct`]）から独立に再計算し、[`measure_recall_against`]
+/// 内部の同名フィールドと突き合わせる（`query_planning_recall.rs` の同型ヘルパと
+/// 同じ設計）。会計突合せは実装内部の計算バグ検知であり、フィクスチャの縮退検知は
+/// 呼び出し側の `qa.len()` 固定値アサーションが別途担う。
+fn qa_accounting(qa: &[QaCase]) -> (usize, usize, usize) {
+    let total_correct: usize = qa.iter().map(|c| c.correct.len()).sum();
+    let ceil20: usize = qa.iter().map(|c| c.correct.len().min(20)).sum();
+    let ceil100: usize = qa.iter().map(|c| c.correct.len().min(100)).sum();
+    (total_correct, ceil20, ceil100)
 }
 
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（健全性チェック。テスト
@@ -854,7 +868,7 @@ fn assert_corpus_within_limits(docs: &[Doc]) {
     );
 }
 
-// ---------- 層 A: 小規模段（数百件オーダ。SEARCH-1 対応。固定値回帰トラッキング） ----------
+// ---------- 層 A: 小規模段（数百件オーダ。SEARCH-1 対応。関係アサーションによる回帰トラッキング） ----------
 
 const SMALL_NUM_DOCS: usize = 400;
 const SMALL_NUM_QUERIES: usize = 60;
@@ -863,8 +877,8 @@ const SMALL_SEED: u64 = 0x5EED_0104_5341_1101;
 
 /// TASK-104（SEARCH-1）: 小規模コーパス（数百件オーダ）での Recall@20 を実測する。
 ///
-/// 決定的コーパス・QA セットのため実測値は再現可能であり、下部の固定値アサーションで
-/// 回帰トラッキングする。検索カーネル（トークナイザ・BM25・RRF 融合・密検索 provider）
+/// 決定的コーパス・QA セットのため実測値は再現可能であり、下部の関係アサーション（数値
+/// リテラルを含まない）で回帰トラッキングする（Issue #312）。検索カーネル（トークナイザ・BM25・RRF 融合・密検索 provider）
 /// への変更で数値が変化した場合はこのテストが失敗する。
 #[test]
 fn hybrid_recall_small_scale_regression() {
@@ -881,8 +895,13 @@ fn hybrid_recall_small_scale_regression() {
         assert!(!case.correct.is_empty());
     }
     // QA 件数（[`generate_qa_set`] の語ペア重複除外後）も決定的コーパスに対しては
-    // 固定値であり、フィクスチャが実質的に縮退していないことの回帰トラッキングを兼ねる。
-    assert_eq!(qa.len(), 60, "重複除外後の QA 件数が変化した");
+    // フィクスチャ生成時の定数と一致するはずであり、フィクスチャが実質的に縮退
+    // していないことの回帰トラッキングを兼ねる。
+    assert_eq!(
+        qa.len(),
+        SMALL_NUM_QUERIES,
+        "重複除外後の QA 件数が変化した"
+    );
 
     let r = measure_recall(&docs, &qa);
     if verbose {
@@ -903,12 +922,28 @@ fn hybrid_recall_small_scale_regression() {
 
     // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
     // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
-    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`hits20`/`ceil20`/
-    // `total_correct` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの
-    // 変更で数値が変化した場合はこのテストが失敗する）。
-    assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
+    // （理論上限 `ceil20` への 100% 到達）に張り付かない。数値リテラルを含まない
+    // 関係アサーション（会計整合・上限以下・非空・非飽和）で回帰トラッキングする
+    // （検索カーネルやフィクスチャの変更で関係が崩れた場合はこのテストが失敗する。
+    // Issue #312）。
+    let (exp_total_correct, exp_ceil20, _exp_ceil100) = qa_accounting(&qa);
+    assert_eq!(
+        r.total_correct, exp_total_correct,
+        "total_correct が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        r.ceil20, exp_ceil20,
+        "ceil20 が QA セットからの会計整合と一致しなかった"
+    );
+    assert!(r.hits20 <= r.ceil20, "hits20 が理論上限 ceil20 を超えた");
+    assert!(
+        r.hits20 > 0,
+        "小規模段の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
+    );
+    assert!(
+        r.hits20 < r.ceil20,
+        "小規模段の Recall@20 が理論上限に張り付いた（lossy view の設計前提が崩れた）"
+    );
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -933,7 +968,7 @@ fn hybrid_recall_small_scale_regression() {
     );
 }
 
-// ---------- 層 A: 大規模段（数万件オーダ。SEARCH-2 対応。固定値回帰トラッキング） ----------
+// ---------- 層 A: 大規模段（数万件オーダ。SEARCH-2 対応。関係アサーションによる回帰トラッキング） ----------
 
 const LARGE_NUM_DOCS: usize = 20_000;
 const LARGE_NUM_QUERIES: usize = 100;
@@ -959,7 +994,11 @@ fn hybrid_recall_large_scale_regression() {
     for case in &qa {
         assert!(!case.correct.is_empty());
     }
-    assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
+    assert_eq!(
+        qa.len(),
+        LARGE_NUM_QUERIES,
+        "重複除外後の QA 件数が変化した"
+    );
 
     // Issue #306: 展開なし（baseline）・展開あり（[`QuerySource::Expanded`]の
     // パススルー等式ガード）の両方を同一コーパスに対して測るため、疎索引・密
@@ -986,13 +1025,43 @@ fn hybrid_recall_large_scale_regression() {
     }
 
     // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
-    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
-    // `total_correct` を固定値で回帰トラッキングする。
-    assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
+    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。数値リテラルを
+    // 含まない関係アサーション（会計整合・上限以下・単調性・非空・非飽和）で
+    // 回帰トラッキングする（Issue #312）。
+    let (exp_total_correct, exp_ceil20, exp_ceil100) = qa_accounting(&qa);
+    assert_eq!(
+        r.total_correct, exp_total_correct,
+        "total_correct が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        r.ceil20, exp_ceil20,
+        "ceil20 が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        r.ceil100, exp_ceil100,
+        "ceil100 が QA セットからの会計整合と一致しなかった"
+    );
+    assert!(r.hits20 <= r.ceil20, "hits20 が理論上限 ceil20 を超えた");
+    assert!(
+        r.hits100 <= r.ceil100,
+        "hits100 が理論上限 ceil100 を超えた"
+    );
+    assert!(
+        r.hits20 <= r.hits100,
+        "hits20 が hits100 を上回った（k=20 は k=100 の部分集合のはず）"
+    );
+    assert!(
+        r.hits20 > 0,
+        "大規模段の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
+    );
+    assert!(
+        r.hits20 < r.ceil20,
+        "大規模段の Recall@20 が理論上限に張り付いた（lossy view の設計前提が崩れた）"
+    );
+    assert!(
+        r.hits100 < r.ceil100,
+        "大規模段の Recall@100 が理論上限に張り付いた（lossy view の設計前提が崩れた）"
+    );
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー
@@ -1179,11 +1248,11 @@ mod verbose_gate_tests {
         let line = render_gate_line(
             "hybrid_recall_small_scale_threshold_gate",
             "recall@20",
-            0.8465,
+            0.1234,
             false,
             false,
         );
-        assert!(!line.contains("0.8465"));
+        assert!(!line.contains("0.1234"));
         assert!(!line.contains("value="));
         assert!(line.contains("pass=false"));
     }
@@ -1193,11 +1262,11 @@ mod verbose_gate_tests {
         let line = render_gate_line(
             "hybrid_recall_small_scale_threshold_gate",
             "recall@20",
-            0.8465,
+            0.1234,
             true,
             true,
         );
-        assert!(line.contains("value=0.8465"));
+        assert!(line.contains("value=0.1234"));
         assert!(line.contains("pass=true"));
     }
 }

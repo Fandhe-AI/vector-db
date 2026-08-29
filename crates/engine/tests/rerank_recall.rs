@@ -6,7 +6,7 @@
 //! （自前 xorshift64*・外部クレート不使用）・QA セット・[`RecallResult`] 相当
 //! （理論上限 `ceil` を分母とする到達率）・2 層構成（PR CI と閾値ゲートの分離）を
 //! そのまま複製・踏襲する（`cjk_tokenizer_impact.rs` → `hybrid_recall.rs` と同じ
-//! 「複製・踏襲」方式。既存テストの固定値アサーションへは手を入れない）。
+//! 「複製・踏襲」方式。既存テストの関係アサーション方式へは手を入れない）。
 //! production コード（`crates/engine/src/`）は変更しない。
 //!
 //! **比較対象**（いずれも production API のみを使用。BM25/RRF/リランキングの
@@ -21,10 +21,11 @@
 //!   られていないのか、そもそもプールに入っていないのかを切り分ける）
 //!
 //! 2 層構成（PR CI と閾値ゲートの分離。`hybrid_recall.rs` と同方針）:
-//! - 層 A（`#[test]`・常時 `cargo test` 対象）: baseline/after の hits20 と改善量を
-//!   固定値アサーションで回帰トラッキングし、「after が baseline を下回らない」
-//!   ことも独立にアサートする。spec の数値基準は使わないため public 資産に閾値を
-//!   持ち込まない（`.claude/rules/spec-confidentiality.md`）
+//! - 層 A（`#[test]`・常時 `cargo test` 対象）: baseline/after の hits20・改善量を
+//!   数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
+//!   回帰トラッキングし、「after が baseline を下回らない」ことも独立にアサートする
+//!   （改善幅そのものの下限判定は層 B が担う。Issue #312）。spec の数値基準は使わ
+//!   ないため public 資産に閾値を持ち込まない（`.claude/rules/spec-confidentiality.md`）
 //! - 層 B（`#[ignore]`・`make rerank-regression` 経由）: spec 由来の Recall 下限
 //!   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
 //!   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
@@ -432,6 +433,17 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
     }
 }
 
+/// Issue #312: `hybrid_recall.rs::qa_accounting` と同じ設計の会計整合ヘルパ。
+/// `total_correct`/`ceil20`/`ceil100`/`ceil200` を QA セット（[`QaCase::correct`]）
+/// から独立に再計算し、[`measure_rerank_recall`] 内部の同名フィールドと突き合わせる。
+fn qa_accounting(qa: &[QaCase]) -> (usize, usize, usize, usize) {
+    let total_correct: usize = qa.iter().map(|c| c.correct.len()).sum();
+    let ceil20: usize = qa.iter().map(|c| c.correct.len().min(20)).sum();
+    let ceil100: usize = qa.iter().map(|c| c.correct.len().min(100)).sum();
+    let ceil200: usize = qa.iter().map(|c| c.correct.len().min(200)).sum();
+    (total_correct, ceil20, ceil100, ceil200)
+}
+
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（`hybrid_recall.rs::
 /// assert_corpus_within_limits` と同一実装。テストハーネス自身にも「無制限な
 /// コーパス生成を許さない」設計指針を適用する）。
@@ -455,7 +467,7 @@ fn assert_corpus_within_limits(docs: &[Doc]) {
     );
 }
 
-// ---------- 層 A: 大規模段（数万件オーダ。SEARCH-7 のスケール条件対応。固定値回帰トラッキング） ----------
+// ---------- 層 A: 大規模段（数万件オーダ。SEARCH-7 のスケール条件対応。関係アサーションによる回帰トラッキング） ----------
 
 const LARGE_NUM_DOCS: usize = 20_000;
 const LARGE_NUM_QUERIES: usize = 100;
@@ -467,8 +479,8 @@ const LARGE_VOCAB_SIZE: usize = 800;
 const LARGE_SEED: u64 = 0x5EED_0108_4C41_5247;
 
 /// TASK-108（SEARCH-7）層 A: 大規模コーパス（数万件オーダ）で baseline（リランキング
-/// なし）と after（リランキングあり）の最終 Recall@20 を実測し、固定値アサーションで
-/// 回帰トラッキングする。あわせて「after が baseline を下回らない」ことを独立に
+/// なし）と after（リランキングあり）の最終 Recall@20 を実測し、数値リテラルを含まない
+/// 関係アサーションで回帰トラッキングする（Issue #312）。あわせて「after が baseline を下回らない」ことを独立に
 /// アサートする（リランキング層が Recall を悪化させていないことの最小保証。
 /// spec の数値基準は使わない）。
 #[test]
@@ -485,7 +497,11 @@ fn rerank_recall_large_scale_regression() {
     for case in &qa {
         assert!(!case.correct.is_empty());
     }
-    assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
+    assert_eq!(
+        qa.len(),
+        LARGE_NUM_QUERIES,
+        "重複除外後の QA 件数が変化した"
+    );
 
     let r = measure_rerank_recall(&docs, &qa);
     if verbose {
@@ -517,29 +533,70 @@ fn rerank_recall_large_scale_regression() {
     }
 
     // after が baseline を下回らないことの独立したアサーション（リランキング層が
-    // Recall を悪化させていないことの最小保証）。固定値アサーションとは別に、
-    // 数値の再確定漏れでこの性質が崩れた場合にも検出できるようにする。
+    // Recall を悪化させていないことの最小保証）。数値の再確定漏れでこの性質が
+    // 崩れた場合にも検出できるようにする。
     assert!(
         r.after_hits20 >= r.baseline_hits20,
         "リランキング後の Recall@20 が baseline を下回った"
     );
 
-    // `hits`/`ceil`/`total_correct` を固定値で回帰トラッキングする（検索カーネル・
-    // リランカー・フィクスチャの変更で数値が変化した場合はこのテストが失敗する）。
-    assert_eq!(r.total_correct, 1049, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 410, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.ceil100, 913, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.ceil200, 1049, "Recall@200 の理論上限が変化した");
+    // 数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
+    // 回帰トラッキングする（検索カーネル・リランカー・フィクスチャの変更で関係が
+    // 崩れた場合はこのテストが失敗する。改善幅そのものの下限判定は層 B
+    // `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う。Issue #312）。
+    let (exp_total_correct, exp_ceil20, exp_ceil100, exp_ceil200) = qa_accounting(&qa);
     assert_eq!(
-        r.baseline_hits20, 343,
-        "baseline（リランキングなし）の Recall@20 hit 数が変化した"
+        r.total_correct, exp_total_correct,
+        "total_correct が QA セットからの会計整合と一致しなかった"
     );
     assert_eq!(
-        r.after_hits20, 368,
-        "after（リランキングあり）の Recall@20 hit 数が変化した"
+        r.ceil20, exp_ceil20,
+        "ceil20 が QA セットからの会計整合と一致しなかった"
     );
-    assert_eq!(r.pool_hits100, 809, "プール Recall@100 hit 数が変化した");
-    assert_eq!(r.pool_hits200, 948, "プール Recall@200 hit 数が変化した");
+    assert_eq!(
+        r.ceil100, exp_ceil100,
+        "ceil100 が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        r.ceil200, exp_ceil200,
+        "ceil200 が QA セットからの会計整合と一致しなかった"
+    );
+    assert!(
+        r.baseline_hits20 <= r.ceil20,
+        "baseline_hits20 が理論上限 ceil20 を超えた"
+    );
+    assert!(
+        r.after_hits20 <= r.ceil20,
+        "after_hits20 が理論上限 ceil20 を超えた"
+    );
+    assert!(
+        r.pool_hits100 <= r.ceil100,
+        "pool_hits100 が理論上限 ceil100 を超えた"
+    );
+    assert!(
+        r.pool_hits200 <= r.ceil200,
+        "pool_hits200 が理論上限 ceil200 を超えた"
+    );
+    // プール構造の単調性: 候補プールの先頭 20 件 ⊆ 先頭 100 件 ⊆ プール全体
+    // （`pool_depth` = 200）であり、正解ヒット数もこの包含関係に従う。
+    assert!(
+        r.baseline_hits20 <= r.pool_hits100,
+        "baseline_hits20（プール先頭 20 件）が pool_hits100（プール先頭 100 件）を上回った"
+    );
+    assert!(
+        r.pool_hits100 <= r.pool_hits200,
+        "pool_hits100（プール先頭 100 件）が pool_hits200（プール全体）を上回った"
+    );
+    // リランキングはプール内の並べ替えのみであり、プール外から正解を持ち込めない
+    // （after_hits20 はプール全体の hit 数を超えられない）。
+    assert!(
+        r.after_hits20 <= r.pool_hits200,
+        "after_hits20 がプール全体（pool_hits200）の hit 数を超えた"
+    );
+    assert!(
+        r.baseline_hits20 > 0,
+        "baseline の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
+    );
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
@@ -722,11 +779,11 @@ mod verbose_gate_tests {
         let line = render_gate_line(
             "rerank_recall_large_scale_threshold_gate",
             "after_recall@20",
-            0.8465,
+            0.1234,
             false,
             false,
         );
-        assert!(!line.contains("0.8465"));
+        assert!(!line.contains("0.1234"));
         assert!(!line.contains("value="));
         assert!(line.contains("pass=false"));
     }
@@ -736,11 +793,11 @@ mod verbose_gate_tests {
         let line = render_gate_line(
             "rerank_recall_large_scale_threshold_gate",
             "after_recall@20",
-            0.8465,
+            0.1234,
             true,
             true,
         );
-        assert!(line.contains("value=0.8465"));
+        assert!(line.contains("value=0.1234"));
         assert!(line.contains("pass=true"));
     }
 }
