@@ -81,6 +81,15 @@
 実行境界）はそのまま踏襲する（`docs/design/hybrid-recall-regression.md`「2 層構成」
 参照）。
 
+### 出力方針
+
+本ファイルの層 B ゲートは元々 `pass_*=<bool>` のみを出力し実測値を含まない
+（層 A も相対関係のみで固定値を出力しない）。方針統一のため
+`hybrid_recall.rs`（`docs/design/hybrid-recall-regression.md`「出力方針（実測値
+の既定非出力・Issue #303）」参照）と同型の `RECALL_VERBOSE=1`（`GITHUB_ACTIONS`
+下は拒否）opt-in を追加し、ローカル診断時のみ `value=<f64>` を追加出力できる
+ようにしたが、既定出力（`RECALL_VERBOSE` 未設定時）は変更していない。
+
 ### 大規模段（TASK-113・PLAN-3。数万チャンク規模）
 
 小規模段と同じ生成・測定ロジック（`generate_corpus`/`measure_category_recall`/

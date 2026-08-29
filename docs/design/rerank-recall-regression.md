@@ -60,6 +60,14 @@ after を測定することで、コーパス・プール生成のばらつき�
 実行境界）はそのまま踏襲する（`docs/design/hybrid-recall-regression.md`「2 層構成」
 参照。spec 機密保持の理由も同一）。
 
+### 出力方針
+
+`crates/engine/tests/rerank_recall.rs` の標準出力方針（既定は対象名と pass/fail
+のみ・`RECALL_VERBOSE=1` opt-in・`GITHUB_ACTIONS` 下は fail-closed 拒否・
+`recall.yml` へは注入しない）は `hybrid_recall.rs` と同一実装を複製している
+（`docs/design/hybrid-recall-regression.md`「出力方針（実測値の既定非出力・
+Issue #303）」参照）。
+
 ### コーパス・QA セット・測定経路
 
 `crates/engine/tests/rerank_recall.rs` は `hybrid_recall.rs` の決定的合成コーパス

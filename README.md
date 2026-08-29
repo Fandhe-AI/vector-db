@@ -174,6 +174,16 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
 に集約しています（Issue #286。値の実設定は引き続きマージ後の管理者作業）。
 
+`hybrid_recall.rs`・`rerank_recall.rs`・`query_planning_recall.rs`・
+`precision_eval.rs` の層 B 閾値ゲートは既定で対象名と pass/fail のみを標準出力へ
+書き、実測値・注入した閾値のどちらも出しません（`batch_bench.rs` の `BENCH_VERBOSE`
+方針を横展開したもの。Issue #303）。実測値が必要な場合は、ローカルで
+`RECALL_VERBOSE=1 make recall-regression` のように実行してください。
+`RECALL_VERBOSE` は `.github/workflows/recall.yml` へは注入しておらず、
+`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体をテスト側が fail-closed で
+拒否します（public な Actions ログへ実測値が漏れないための二重化）。取得した
+実測値は Issue・PR・docs 等の public 資産へ転記しないでください。
+
 閾値は Environment `recall-gate` の variables ではなく **secrets**（`secrets.*`）
 から注入します。`run` ステップに渡す `env:` ブロックは GitHub Actions のログへ
 値付きでそのまま出力されるため、以前使っていた variables では閾値の数値が
@@ -216,7 +226,7 @@ gh secret set RERANK_RECALL_MIN_R20_LARGE --env recall-gate
 gh secret set RERANK_RECALL_MIN_R20_IMPROVEMENT --env recall-gate
 ```
 
-挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo secrets」と同一です。ローカルの `make rerank-regression`（`RERANK_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`RERANK_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。
+挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo secrets」と同一です。ローカルの `make rerank-regression`（`RERANK_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`RERANK_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。出力は対象名と pass/fail のみで、実測値は上記と同じ `RECALL_VERBOSE=1` opt-in でのみ確認できます。
 
 ### クエリ展開の受け入れ基準 Recall 閾値ゲートの repo secrets（TASK-112）
 
@@ -229,7 +239,7 @@ gh secret set QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED --env recall
 gh secret set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 ```
 
-挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo secrets」と同一です。ローカルの `make query-planning-regression`（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。
+挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo secrets」と同一です。ローカルの `make query-planning-regression`（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。出力は対象名と pass/fail のみで、実測値は上記と同じ `RECALL_VERBOSE=1` opt-in でのみ確認できます。
 
 ### `precision` 評価ハーネス（TASK-163）
 
@@ -242,7 +252,9 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
   上で評価を通しで実行し、構造不変条件と測定の決定性のみを検査します（指標の実測値は
   アサートも出力もしません。品質の回帰判定は層 B が担います）。
 - 層 B（`make precision-regression`）: 閾値ゲートのみを実行し、指標名と pass/fail
-  だけを出力します（閾値の数値も実測値も出力しません）。`PRECISION_EVAL_MIN_TOP1_ACC`・
+  だけを出力します（閾値の数値も実測値も出力しません。`RECALL_VERBOSE=1`
+  〔`GITHUB_ACTIONS` 下では拒否〕opt-in 時のみローカル診断用に実測値を追加出力
+  します。Issue #303）。`PRECISION_EVAL_MIN_TOP1_ACC`・
   `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN` 環境変数
   と比較して判定します。未設定なら評価は実行しつつ判定をスキップし「ゲート未設定＝
   明示的に対象外」として成功終了、`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`（strict
@@ -253,6 +265,8 @@ SEARCH-10 の評価指標を、決定的合成コーパス（正解不在クエ�
   差し替えたパラメータ感度スイープ（`precision_eval_policy_sweep`。hybrid 系列・
   dense 系列）を出力します。実測値を標準出力へ出すため、public runner で動く CI・
   `recall.yml` からは実行しません（`.claude/rules/spec-confidentiality.md`）。
+  `GITHUB_ACTIONS` が設定された環境での実行はテスト側が測定前に fail-closed で
+  拒否します（Makefile 運用のみに依存しない二重化。Issue #303）。
 - **`.github/workflows/recall.yml` への接続は行っていません**: TASK-163 のスコープは
   実測・判断材料の提示までであり目標値の確定は含まないため、上記の
   `PRECISION_EVAL_*` 環境変数は Environment `recall-gate` にまだ設定していません。
