@@ -45,15 +45,32 @@
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
 //!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
 //!
+//! クエリ展開の結線（Issue #306）: 大規模段の層 B
+//! （[`hybrid_recall_large_scale_threshold_gate`]）は TASK-110〜113
+//! （`crates/engine/tests/query_planning_recall.rs`）で確立した決定的スタブ
+//! `LlmClient`（[`MockLlmClient`]。`query_planning_recall.rs::MockLlmClient` と
+//! 同一実装。`tests/` 直下は独立 test crate で共有モジュールを持たないためこの
+//! ファイルへ複製する）による展開ありの経路（[`QuerySource::Expanded`]・
+//! [`measure_recall_with`]）で Recall@20・Recall@100 を測定し、spec の SEARCH-2
+//! （クエリ展開ありを前提とするビヘイビア）の測定前提に揃える。QA セットは
+//! `direct` カテゴリ（コーパス語彙 `kw_XXXX` に一致するクエリ）のままで、
+//! `MockLlmClient` は `kw_` 形式の語を無変換で通すため、展開ありの実測値は
+//! 展開なしと構造的に一致する（[`hybrid_recall_large_scale_regression`] の
+//! パススルー等式アサーション参照。`docs/design/hybrid-recall-regression.md`
+//! 「クエリ展開の結線（Issue #306）」節も参照）。小規模段の層 B・層 A の主測定は
+//! 引き続き展開なし（[`QuerySource::Baseline`]）で行う。
+//!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了
 //!   （`docs/design/hybrid-recall-regression.md` 参照。`cjk_tokenizer_impact.rs` と同種の制約）
-//! - クエリ展開（PLAN-5 系、TASK-109 以降）は未実装のため、本ハーネスはハイブリッド
-//!   検索単体（クエリ展開なし）の測定に留める
+//! - `intent` カテゴリ（言い換え語彙のみのクエリ）での大規模測定は TASK-113
+//!   （PLAN-3）と同様に本ハーネスのスコープ外（フォローアップ候補。Issue 起票は
+//!   ユーザー判断待ち）
 
 use engine::hybrid::{hybrid_search, RrfConfig};
 use engine::kernel::SearchInput;
 use engine::parallel_search::ParallelSearchProvider;
+use engine::query_planner::{parse_expansion, render_full_prompt, LlmClient, PlanError};
 use engine::sparse::SparseIndex;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,6 +117,23 @@ impl Xorshift64 {
 /// 下で必ず 1 トークンになるよう、アンダースコア区切りの接頭辞＋4 桁ゼロ埋め数字とする）。
 fn topic_token(idx: usize) -> String {
     format!("kw_{idx:04}")
+}
+
+/// [`topic_token`] の逆写像。展開結果（`QueryExpansion::search_terms`）から
+/// 再構成クエリの密ベクトルを組み立てる際に使う
+/// （`query_planning_recall.rs::parse_topic_index` と同一実装。`tests/` 直下は
+/// 独立 test crate のため複製する）。
+fn parse_topic_index(token: &str) -> Option<usize> {
+    token.strip_prefix("kw_")?.parse().ok()
+}
+
+/// [`synonym_token`] 形式（`syn_XXXX`）の逆写像。プレフィックス不一致・非数値は
+/// `None`（想定外の語は写像しない = そのまま通す。[`MockLlmClient::complete`]
+/// 参照）。本ファイルの QA セットは `direct` カテゴリ（`kw_XXXX`）のみのため
+/// `syn_` 語は実際には現れないが、`query_planning_recall.rs::parse_synonym_index`
+/// と同一実装を複製し `MockLlmClient` を同一契約に保つ。
+fn parse_synonym_index(token: &str) -> Option<usize> {
+    token.strip_prefix("syn_")?.parse().ok()
 }
 
 /// 文脈語プール（内容語の間に挟む機能語。BM25 の相対比較には影響しない飾り）。
@@ -381,17 +415,123 @@ impl RecallResult {
     }
 }
 
-/// [`SparseIndex::build`]・[`ParallelSearchProvider`]・[`hybrid_search`]
-/// （`RrfConfig::default()` = spec 採用構成: 等重み・pool_depth 200・k_const 60）という
-/// production の検索経路のみを用いて Recall@20・Recall@100 を測定する。テスト内で
-/// BM25/RRF の再実装は行わない（production コード `crates/engine/src/` は変更しない）。
-fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
-    let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
-    let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
+/// [`query_planner::render_full_prompt`]（TASK-110）が組み立てるプロンプトを受け取り、
+/// `direct` 語彙（`kw_XXXX`。本ファイルの QA セットの唯一のカテゴリ）を無変換で通す
+/// 決定的スタブ `LlmClient`（`query_planning_recall.rs::MockLlmClient` と同一実装。
+/// `tests/` 直下は独立 test crate で共有モジュールを持たないためこのファイルへ複製する。
+/// 実 Ollama へは接続しない＝TASK-110 時点からの継続制約）。
+struct MockLlmClient;
 
-    let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
-    let dim = docs.first().map_or(0, |d| d.vector.len());
-    let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector.iter().copied()).collect();
+impl LlmClient for MockLlmClient {
+    fn complete(&self, prompt: &str) -> Result<String, PlanError> {
+        // `render_full_prompt` は接頭辞（本テストでは空文字列）の直後に
+        // "\n# Question\n" ＋サニタイズ済み質問＋"\n" を追記する契約
+        // （`query_planner.rs::render_full_prompt` 参照）。マーカ以降の 1 行を
+        // 質問本文として取り出す。
+        let question = prompt
+            .split("# Question\n")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .unwrap_or("");
+
+        let mapped_terms: Vec<String> = question
+            .split_whitespace()
+            .map(|token| match parse_synonym_index(token) {
+                Some(idx) => topic_token(idx),
+                None => token.to_string(),
+            })
+            .collect();
+
+        // `parse_expansion`（production API）がそのまま受理できる最小 JSON を
+        // 組み立てる（検索語は制御文字を含まない ASCII トークンのみなので、
+        // 文字列エスケープは不要）。
+        let terms_json = mapped_terms
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(format!(
+            "{{\"search_terms\":[{terms_json}],\"path_hint\":null,\"kind_hint\":null}}"
+        ))
+    }
+}
+
+/// `baseline_query_text` を質問として [`query_planner::render_full_prompt`]（固定
+/// 接頭辞は空文字列）→ `client.complete` → [`query_planner::parse_expansion`] の
+/// 一連（production API）に通し、得られた `QueryExpansion::search_terms` から
+/// 再構成クエリ（疎チャネル用テキスト・密チャネル用 one-hot ベクトル）を組み立てる
+/// （`query_planning_recall.rs::expand_and_reconstruct_with` と同一実装）。
+fn expand_and_reconstruct_with(
+    client: &dyn LlmClient,
+    vocab_size: usize,
+    baseline_query_text: &str,
+) -> (String, Vec<f32>) {
+    let prompt = render_full_prompt("", baseline_query_text).expect("render_full_prompt ok");
+    let response = client.complete(&prompt).expect("mock complete ok");
+    let expansion = parse_expansion(&response).expect("parse_expansion ok");
+
+    let text = expansion.search_terms.join(" ");
+    let indices = expansion
+        .search_terms
+        .iter()
+        .filter_map(|t| parse_topic_index(t));
+    let vector = one_hot_sum(vocab_size, indices);
+    (text, vector)
+}
+
+/// [`measure_recall_with`] が測定するクエリ経路の選択（Issue #306。SEARCH-2 の
+/// 測定前提＝クエリ展開ありへ揃えるための切り替え）。
+enum QuerySource<'a> {
+    /// 展開なし（`QaCase::query_text`/`query_vector` をそのまま使う）。既存の
+    /// 層 A 固定値回帰・小規模段層 B はこの経路のまま。
+    Baseline,
+    /// 展開あり（[`expand_and_reconstruct_with`] で再構成したクエリを使う）。
+    /// 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が使う。
+    Expanded(&'a dyn LlmClient),
+}
+
+/// [`measure_recall_with`]／複数回の測定（baseline・expanded 双方を同じ
+/// コーパスに対して測る大規模段層 A 等）で疎索引・密ベクトル配列の構築
+/// （[`SparseIndex::build`] とコーパス全件のベクトル平坦化）を使い回すための
+/// バンドル。索引構築はコーパス規模に対して線形コストがかかるため、同一
+/// コーパスに対する複数回の測定で毎回再構築しない（Issue #306 で大規模段層 A に
+/// パススルー等式ガードを追加したことによる実行時間の悪化を避ける）。
+struct SearchFixture {
+    ids: Vec<u64>,
+    vectors: Vec<f32>,
+    dim: usize,
+    sparse_index: SparseIndex,
+}
+
+impl SearchFixture {
+    /// [`SparseIndex::build`]（production API）でコーパスから疎索引を構築し、
+    /// 密ベクトルを ID 順に平坦化する。テスト内で BM25 の再実装は行わない。
+    fn build(docs: &[Doc]) -> Self {
+        let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
+        let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
+        let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
+        let dim = docs.first().map_or(0, |d| d.vector.len());
+        let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector.iter().copied()).collect();
+        Self {
+            ids,
+            vectors,
+            dim,
+            sparse_index,
+        }
+    }
+}
+
+/// [`ParallelSearchProvider`]・[`hybrid_search`]（`RrfConfig::default()` = spec
+/// 採用構成: 等重み・pool_depth 200・k_const 60）という production の検索経路の
+/// みを用いて、事前構築済みの `fixture`（[`SearchFixture::build`]）に対する
+/// Recall@20・Recall@100 を測定する。`source` が [`QuerySource::Expanded`] の
+/// 場合、各 QA ケースのクエリを [`expand_and_reconstruct_with`]（production の
+/// クエリ展開経路）で再構成してから検索する（Issue #306）。
+fn measure_recall_against(
+    fixture: &SearchFixture,
+    qa: &[QaCase],
+    source: QuerySource<'_>,
+) -> RecallResult {
     let provider = ParallelSearchProvider;
     let cfg = RrfConfig::default();
 
@@ -406,15 +546,33 @@ fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
         ceil20 += case.correct.len().min(20);
         ceil100 += case.correct.len().min(100);
 
+        // `Baseline` は既存の QA クエリをそのまま複製して使い、`Expanded` は
+        // production のクエリ展開経路（[`expand_and_reconstruct_with`]）で
+        // 再構成したクエリを使う。QA 件数（最大 100 件オーダ）に対する複製コストは
+        // 無視できるため、参照の分岐より単純さを優先する。
+        let (query_text, query_vector): (String, Vec<f32>) = match &source {
+            QuerySource::Baseline => (case.query_text.clone(), case.query_vector.clone()),
+            QuerySource::Expanded(client) => {
+                expand_and_reconstruct_with(*client, fixture.dim, &case.query_text)
+            }
+        };
+
         let input = SearchInput {
-            ids: &ids,
-            vectors: &vectors,
-            dim: dim as u32,
-            query: &case.query_vector,
+            ids: &fixture.ids,
+            vectors: &fixture.vectors,
+            dim: fixture.dim as u32,
+            query: &query_vector,
             k: 100,
         };
-        let hits = hybrid_search(&provider, input, &sparse_index, &case.query_text, 100, &cfg)
-            .expect("hybrid_search ok");
+        let hits = hybrid_search(
+            &provider,
+            input,
+            &fixture.sparse_index,
+            &query_text,
+            100,
+            &cfg,
+        )
+        .expect("hybrid_search ok");
 
         hits20 += hits
             .iter()
@@ -431,6 +589,20 @@ fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
         ceil20,
         ceil100,
     }
+}
+
+/// [`SearchFixture::build`] → [`measure_recall_against`] の薄いラッパ。索引・
+/// ベクトル配列を使い回さない 1 回限りの測定呼び出し（既存の層 A・小規模段層 B の
+/// 呼び出しが使う）に用いる。
+fn measure_recall_with(docs: &[Doc], qa: &[QaCase], source: QuerySource<'_>) -> RecallResult {
+    let fixture = SearchFixture::build(docs);
+    measure_recall_against(&fixture, qa, source)
+}
+
+/// [`measure_recall_with`] の展開なし（[`QuerySource::Baseline`]）の薄いラッパ。
+/// 既存呼び出し（層 A 固定値回帰・小規模段層 B）は無変更でこちらを使い続ける。
+fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
+    measure_recall_with(docs, qa, QuerySource::Baseline)
 }
 
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（健全性チェック。テスト
@@ -540,7 +712,11 @@ fn hybrid_recall_large_scale_regression() {
     }
     assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
 
-    let r = measure_recall(&docs, &qa);
+    // Issue #306: 展開なし（baseline）・展開あり（[`QuerySource::Expanded`]の
+    // パススルー等式ガード）の両方を同一コーパスに対して測るため、疎索引・密
+    // ベクトル配列（[`SearchFixture`]）を 1 回だけ構築して使い回す。
+    let fixture = SearchFixture::build(&docs);
+    let r = measure_recall_against(&fixture, &qa, QuerySource::Baseline);
     if verbose {
         println!(
             "=== TASK-104 大規模段 Recall（docs={} queries={} total_correct={}） ===",
@@ -568,6 +744,31 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
     assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
     assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
+
+    // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
+    // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー
+    // 回帰ガード。QA は `direct` カテゴリ（`kw_XXXX`）のみで `MockLlmClient` は
+    // その語を無変換で通すため、展開ありの測定値は展開なしと理論上完全一致する
+    // （`query_planning_recall.rs` の同種アサーション「direct カテゴリで展開ありが
+    // 展開なしと一致」と同じ性質）。この等式が崩れた場合は展開パーサ・スタブ・
+    // 再構成経路のいずれかの回帰であり、層 B の測定前提が壊れていることを示す。
+    let r_exp = measure_recall_against(&fixture, &qa, QuerySource::Expanded(&MockLlmClient));
+    assert_eq!(
+        r_exp.hits20, r.hits20,
+        "展開あり経路（MockLlmClient）の Recall@20 hit 数が展開なしと一致しなかった（パススルー性質が崩れた）"
+    );
+    assert_eq!(
+        r_exp.hits100, r.hits100,
+        "展開あり経路（MockLlmClient）の Recall@100 hit 数が展開なしと一致しなかった（パススルー性質が崩れた）"
+    );
+    assert_eq!(
+        r_exp.ceil20, r.ceil20,
+        "展開あり経路（MockLlmClient）の Recall@20 理論上限が展開なしと一致しなかった"
+    );
+    assert_eq!(
+        r_exp.ceil100, r.ceil100,
+        "展開あり経路（MockLlmClient）の Recall@100 理論上限が展開なしと一致しなかった"
+    );
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make recall-regression` 専用） ----------
@@ -806,6 +1007,13 @@ fn hybrid_recall_small_scale_threshold_gate() {
 /// 未設定側は既定では「対象外」を出力する。両方未設定かつ非 strict の場合のみ
 /// コーパス生成前に早期 return して成功終了する。strict モードでは
 /// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。
+///
+/// Issue #306: 測定は展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]。
+/// TASK-110〜113 の決定的スタブ `LlmClient` による production のクエリ展開経路）で
+/// 行い、SEARCH-2 の測定前提（クエリ展開あり）に揃える。fixture パラメータ・
+/// 閾値・環境変数名・出力形式は変更しない。QA は `direct` カテゴリのみのため
+/// `MockLlmClient` は無変換で通り、実測値は展開なしと構造的に一致する
+/// （[`hybrid_recall_large_scale_regression`] のパススルー等式ガード参照）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
@@ -820,13 +1028,18 @@ fn hybrid_recall_large_scale_threshold_gate() {
         return;
     }
 
+    // 数値を含まない固定文言（実測値・閾値は含めない。spec-confidentiality P0）。
+    println!(
+        "hybrid_recall_large_scale_threshold_gate: query expansion=enabled (deterministic stub LlmClient, Issue #306)"
+    );
+
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
         LARGE_NUM_DOCS,
         LARGE_NUM_QUERIES,
         LARGE_VOCAB_SIZE,
     );
-    let r = measure_recall(&docs, &qa);
+    let r = measure_recall_with(&docs, &qa, QuerySource::Expanded(&MockLlmClient));
     let recall20 = r.recall20();
     let recall100 = r.recall100();
 
