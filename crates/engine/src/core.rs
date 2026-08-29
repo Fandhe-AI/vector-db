@@ -1903,12 +1903,15 @@ impl EngineCore {
                     // 書き込みは本世代の対象に含める（拒否側に倒す）: `dictionary_snapshot`
                     // が読む行集合は `tenant::visible_rows`（`ctx` に基づく RLS 可視性
                     // 判定。TASK-137・RLS-6, RLS-7）を経由するため、他テナントが
-                    // `Visibility::Public`/`Shared` で書き込んだ行は要求元テナントの
-                    // 辞書内容にも影響しうる。行ごとの可視性を見ずにテーブル単位で
-                    // 一括して拒否側へ倒すのは過剰検知（他テナントの `Private` 専用の
-                    // 書き込みまで拒否対象に含む）を許容する設計判断であり、テナント
-                    // 単位の精密な世代を持たないことの限界だが、fail-open で見逃す
-                    // よりも安全側に倒す（security.md「fail-closed を維持する」）。
+                    // `Visibility::Public` で書き込んだ行は要求元テナントの辞書内容にも
+                    // 影響しうる（可視性は `Public`/`Private` の 2 値のみ）。行ごとの
+                    // 可視性を見ずにテーブル単位で一括して拒否側へ倒すのは過剰検知
+                    // （他テナントの `Private` 専用の書き込みまで拒否対象に含む）を
+                    // 許容する設計判断であり、テナント単位の精密な世代を持たないことの
+                    // 限界だが、fail-open で見逃すよりも安全側に倒す（security.md
+                    // 「fail-closed を維持する」）。この粒度の是非は Issue #285 で
+                    // 現状維持として確定した設計判断であり、根拠・移行トリガーは
+                    // `docs/design/table-generation-rejection-granularity.md` を参照。
                     // 再計画（辞書再構築・再展開）は行わず、単純に拒否する。
                     let (pre_check_schema, planning_generation) = {
                         let (pre_check_txn, schema) =
@@ -1973,13 +1976,16 @@ impl EngineCore {
                     }
 
                     // I/O 完了後の最新スキーマにも辞書必須列の検証を再適用する
-                    // （codex-review P1 指摘対応、PR #266）: 上記の世代照合は
-                    // ストレージ全体の粗い世代のみを見るため、同一世代内であっても
-                    // このスキーマが `pre_check_schema` と異なる可能性を狭義には
-                    // 排除できない（世代不変条件が将来変わった場合の多層防御。
-                    // 現行の `bump_generation_and_commit` 実装では書き込みごとに
-                    // 必ず世代が進むため通常到達しないが、`dictionary_required_columns`
-                    // は軽量な検証であり多層防御として維持する）。
+                    // （codex-review P1 指摘対応、PR #266）: 上記の世代照合は対象
+                    // テーブル単位の世代（[`crate::catalog::table_generation_in_txn`]。
+                    // 粒度の設計判断は `docs/design/
+                    // table-generation-rejection-granularity.md` を参照）のみを見る
+                    // ため、同一世代内であってもこのスキーマが `pre_check_schema` と
+                    // 異なる可能性を狭義には排除できない（世代不変条件が将来変わった
+                    // 場合の多層防御。現行の `bump_table_generation_in_txn` 実装では
+                    // 対象テーブルへの書き込みごとに必ず世代が進むため通常到達しないが、
+                    // `dictionary_required_columns` は軽量な検証であり多層防御として
+                    // 維持する）。
                     dictionary_required_columns(&schema).map_err(|msg| {
                         crate::sql::allowlist::SqlSurfaceError::invalid_input(msg)
                     })?;
@@ -4505,6 +4511,263 @@ mod tests {
             other => panic!(
                 "expected USING PLAN to succeed despite an unrelated table being written \
                  during I/O, got: {other:?}"
+            ),
+        }
+    }
+
+    // Issue #285（テーブル単位世代カウンタの拒否精度の設計判断。
+    // `docs/design/table-generation-rejection-granularity.md` 参照）: 同 ADR は
+    // 「対象テーブルへの他テナントの書き込みは、可視性（`Public`/`Private`）を
+    // 問わず拒否する」という現行の意図的な契約（テナント単位・可視性境界単位への
+    // 細分化はしない設計判断）を現状維持として確定した。本テストはその契約のうち
+    // `Visibility::Public` 側（要求元テナントの辞書内容に実際に影響しうる書き込み。
+    // TASK-137・RLS-6, RLS-7 の可視性判定を経由）を固定する。将来 ADR の移行
+    // トリガーが成立し可視性境界単位（選択肢 C）へ切り替える場合、本テストは
+    // その設計変更に合わせて書き換えが必要になる。
+    #[test]
+    fn execute_sql_in_session_rejects_using_plan_when_other_tenant_writes_public_row_to_same_table_during_io(
+    ) {
+        // `GenerationBumpingLlmClient`（本モジュール上部）と同じ二段階初期化
+        // パターンを使い、対象テーブル（`docs`）自身へ他テナント（`tenant-b`）
+        // 名義で `Visibility::Public` 行を `LlmClient::complete`（I/O フェーズの
+        // 内部）から書き込む。
+        struct OtherTenantPublicWriteLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for OtherTenantPublicWriteLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                let other_ctx =
+                    PolicyContext::new("tenant-b").expect("valid tenant for other-tenant write");
+                let other_op_id = OperationId::parse("other-tenant-public-write-mid-io")
+                    .expect("valid operation_id");
+                crate::tenant::insert_typed_row(
+                    &core.storage,
+                    "docs",
+                    &other_ctx,
+                    2,
+                    Visibility::Public,
+                    &[
+                        crate::row_codec::Value::Vector(vec![0.2, 0.3]),
+                        crate::row_codec::Value::Text("other-tenant-public-path".to_string()),
+                        crate::row_codec::Value::Text("other-tenant-public-body".to_string()),
+                    ],
+                    &other_op_id,
+                )
+                .expect("insert Public row into the target table mid-io");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table docs");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id =
+            OperationId::parse("using-plan-other-tenant-public").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("doc-path".to_string()),
+                crate::row_codec::Value::Text("doc-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row into docs");
+
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(OtherTenantPublicWriteLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Err(crate::sql::allowlist::SqlSurfaceError::Internal { detail }) => {
+                assert!(
+                    detail.contains("generation changed"),
+                    "expected a generation-mismatch rejection, got: {detail}"
+                );
+                assert!(
+                    !detail.contains("tenant-b"),
+                    "rejection detail must not leak the other tenant's identity: {detail}"
+                );
+            }
+            other => panic!(
+                "expected SqlSurfaceError::Internal (generation mismatch) rejection when \
+                 another tenant writes a Public row to the same table during I/O, got: {other:?}"
+            ),
+        }
+    }
+
+    // Issue #285（`docs/design/table-generation-rejection-granularity.md` 参照）:
+    // 上記テストの `Visibility::Private` 側。要求元テナント（`tenant-a`）からは
+    // 不可視な他テナントの `Private` 行書き込みであっても、テーブル単位世代照合は
+    // 拒否する（過剰検知を意図的に許容する設計判断。選択肢 C・可視性境界単位への
+    // 細分化を採用しない限りこの契約は変わらない）。
+    #[test]
+    fn execute_sql_in_session_rejects_using_plan_when_other_tenant_writes_private_row_to_same_table_during_io(
+    ) {
+        struct OtherTenantPrivateWriteLlmClient {
+            core: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>>,
+        }
+        impl crate::query_planner::LlmClient for OtherTenantPrivateWriteLlmClient {
+            fn complete(&self, _prompt: &str) -> Result<String, crate::query_planner::PlanError> {
+                let core = self
+                    .core
+                    .get()
+                    .expect("core must be registered before execute_sql_in_session runs")
+                    .upgrade()
+                    .expect("core must still be alive during complete()");
+                let other_ctx =
+                    PolicyContext::new("tenant-b").expect("valid tenant for other-tenant write");
+                let other_op_id = OperationId::parse("other-tenant-private-write-mid-io")
+                    .expect("valid operation_id");
+                crate::tenant::insert_typed_row(
+                    &core.storage,
+                    "docs",
+                    &other_ctx,
+                    2,
+                    Visibility::Private,
+                    &[
+                        crate::row_codec::Value::Vector(vec![0.2, 0.3]),
+                        crate::row_codec::Value::Text("other-tenant-private-path".to_string()),
+                        crate::row_codec::Value::Text("other-tenant-private-body".to_string()),
+                    ],
+                    &other_op_id,
+                )
+                .expect("insert Private row into the target table mid-io");
+                Ok(
+                    r#"{"search_terms": ["alpha"], "path_hint": null, "kind_hint": null}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        struct StubEmbedder {
+            dim: u32,
+        }
+        impl crate::embedding::Embedder for StubEmbedder {
+            fn dim(&self) -> u32 {
+                self.dim
+            }
+            fn embed_batch(
+                &self,
+                texts: &[&str],
+            ) -> Result<Vec<Vec<f32>>, crate::embedding::EmbedError> {
+                Ok(texts.iter().map(|_| vec![0.1; self.dim as usize]).collect())
+            }
+        }
+
+        let dir = tempdir();
+        let core = EngineCore::open(dir.path().join("db.redb"))
+            .expect("open engine core")
+            .with_embedder(Box::new(StubEmbedder { dim: 2 }));
+
+        core.storage
+            .create_table(&TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("path", ColumnType::Text, false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            ))
+            .expect("create table docs");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let op_id =
+            OperationId::parse("using-plan-other-tenant-private").expect("valid operation_id");
+        crate::tenant::insert_typed_row(
+            &core.storage,
+            "docs",
+            &ctx,
+            1,
+            Visibility::Public,
+            &[
+                crate::row_codec::Value::Vector(vec![0.1, 0.2]),
+                crate::row_codec::Value::Text("doc-path".to_string()),
+                crate::row_codec::Value::Text("doc-body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("insert row into docs");
+
+        let core_cell: std::sync::Arc<std::sync::OnceLock<std::sync::Weak<EngineCore>>> =
+            std::sync::Arc::new(std::sync::OnceLock::new());
+        let llm_client = Box::new(OtherTenantPrivateWriteLlmClient {
+            core: std::sync::Arc::clone(&core_cell),
+        });
+        let core = std::sync::Arc::new(core.with_query_planner(llm_client));
+        core_cell
+            .set(std::sync::Arc::downgrade(&core))
+            .unwrap_or_else(|_| panic!("core_cell must be set exactly once"));
+
+        let mut session = crate::sql::mode::SessionState::default();
+        let sql = "SELECT path FROM docs USING PLAN('q') LIMIT 5";
+        let result = core.execute_sql_in_session(&ctx, &mut session, sql);
+
+        match result {
+            Err(crate::sql::allowlist::SqlSurfaceError::Internal { detail }) => {
+                assert!(
+                    detail.contains("generation changed"),
+                    "expected a generation-mismatch rejection, got: {detail}"
+                );
+                assert!(
+                    !detail.contains("tenant-b"),
+                    "rejection detail must not leak the other tenant's identity: {detail}"
+                );
+            }
+            other => panic!(
+                "expected SqlSurfaceError::Internal (generation mismatch) rejection when \
+                 another tenant writes a Private row to the same table during I/O (current \
+                 design: over-rejection is intentional per Issue #285), got: {other:?}"
             ),
         }
     }
