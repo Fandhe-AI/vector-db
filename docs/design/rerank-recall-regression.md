@@ -93,9 +93,9 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 
 （`crates/engine/tests/rerank_recall.rs`、層 A 1/1 pass。決定的コーパスのため
 再現可能。hit 数は同テストのアサーションに固定済み。Issue #307（SEARCH-1）の
-RRF 同点グループ平均順位化〔`hybrid.rs::accumulate_ranked`。詳細は
-`docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の engine 側原因調査
-（Issue #307）」節参照〕により候補プールの構成が変わったため、以下の値を更新した）
+RRF 同点グループ平均順位化〔詳細は `docs/design/hybrid-recall-regression.md`
+「小規模段ゲート未達の engine 側原因調査（Issue #307）」節参照〕により候補プール
+の構成が変わったため、以下の値を更新した）
 
 | 指標 | 値 |
 | ---- | -- |
@@ -114,8 +114,8 @@ RRF 同点グループ平均順位化〔`hybrid.rs::accumulate_ranked`。詳細�
 暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と融合スコア順位を RRF 型で
 再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を改善している
 （378→381、+0.7pt）。Issue #307 の RRF 同点順位変更により候補プール自体の
-Recall@20 が既に高くなった（0.9220）分、リランキングによる改善幅は変更前
-（343→368、+7.3pt）より小さくなっている。プール自体の Recall@200（0.9047）と最終
+Recall@20 が既に高くなった（0.9220）分、リランキングによる改善幅は変更前より
+小さくなっている。プール自体の Recall@200（0.9047）と最終
 Recall@20（after: 0.9293）の差は小さく、pool_depth 200 の候補プールがすでに正解の
 大半を含んでおり、リランキングはその中の順位付けを改善する形で寄与していることを
 示唆する（プールに入っていない正解＝Recall@200 の未達分は、リランキング以前の

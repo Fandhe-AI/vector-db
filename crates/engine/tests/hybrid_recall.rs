@@ -998,7 +998,7 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    // Issue #307（SEARCH-1）: 固定値更新（hits20 328 → 365, hits100 645 → 663）。
+    // Issue #307（SEARCH-1）: RRF 同点グループ平均順位化に伴う固定値更新。
     // 変更理由は `docs/design/hybrid-recall-regression.md` 参照。
     assert_eq!(r.hits20, 365, "大規模段の Recall@20 hit 数が変化した");
     assert_eq!(r.hits100, 663, "大規模段の Recall@100 hit 数が変化した");
