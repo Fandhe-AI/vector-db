@@ -4,7 +4,7 @@
 //!
 //! `simd_bench.rs`（TASK-127）と同じ設計方針を踏襲する: `make ci` には含めず
 //! `.github/workflows/bench.yml`（workflow_dispatch）から実行する時間依存ベンチであり、
-//! 閾値は環境変数（Actions variables）から注入・未設定は fail-closed で非ゼロ終了する。
+//! 閾値は環境変数（Actions secrets）から注入・未設定は fail-closed で非ゼロ終了する。
 //! 標準出力には pass/fail と非数値状態のみを書き、実測値・注入された閾値は出力しない
 //! （`.claude/rules/spec-confidentiality.md`・Issue #279）。実測値が必要な場合のみ
 //! `BENCH_VERBOSE`（非空で有効）の opt-in で追加出力するが、`GITHUB_ACTIONS` 下では
@@ -12,30 +12,61 @@
 //! 〔`contrast_bench.rs`〕に適用済みの「真偽値のみを既定出力にする」方針を本ファイルへ
 //! 横展開したもの）。
 //!
-//! - CORE-7（動的窓の劣化上限・アクティブなゲート）: [`engine::batch_search::
-//!   DynamicWindowAggregator`] の `push`/`drain` それ自体のオーバーヘッドのみを
-//!   測定区間に含める（レビュー指摘対応: 以前は A/B どちらも同一の
-//!   `BatchEngine::batch_search`〔10 万行 × dim 768 の全走査〕を測定区間に含めて
-//!   いたため、全走査のミリ秒級コストの前で `push`/`drain` のナノ〜マイクロ秒級の
-//!   差分が埋もれ、実質どんな劣化を注入しても pass してしまう判別力のないゲートに
-//!   なっていた）。A（対照。集約器を経由しない）は `Vec<Vec<f32>>` へクエリを
-//!   直接 `push`（`Vec::push`。検証なし）する経路、B（被検）は同じ本数のクエリを
-//!   `DynamicWindowAggregator::push` に通してから `drain` する経路とし、両者とも
-//!   1 反復あたり [`AGG_BATCH_SIZE`] 本のクエリを処理する（1 本ずつだとナノ秒級
-//!   すぎて `Instant` の分解能・測定オーバーヘッドに埋もれるため、実運用の窓サイズを
-//!   模した本数へ増幅してから測る）。差分は「集約器の検証・容量管理・所有権移動
-//!   オーバーヘッド」のみになる。測定区間へ渡すクエリ本体（`Vec<f32>`）は
-//!   `run_ab` 呼び出し前に反復回数分すべて事前生成し（[`build_query_pool`]）、
-//!   各反復では事前生成済みの所有権を `Vec::pop` で取り出すだけにする（レビュー
-//!   指摘対応: 以前は各反復の測定区間内で `query_base.clone()`〔dim 768 の
-//!   確保・コピー、1 バッチあたり約 768 KiB〕を毎回行っており、この共通コストが
-//!   両経路の測定時間を支配して `push`/`drain` の差分が p95 比率へ現れない
-//!   ——あるいは無関係な確保コストの揺らぎで誤 fail しうる——状態になっていた）。
-//!   B の p95 が A に対して劣化率上限（`BENCH_BATCH_MAX_DEGRADATION_PCT`）以内かを
-//!   判定する。`BatchEngine::batch_search` 自体（f16 デコード・テナントマスク・
-//!   visibility フィルタ・全走査）は本ゲートの測定対象外とする（CORE-3/CORE-5 側の
-//!   ゲート〔`simd_bench.rs`〕が別途担う関心事であり、本ゲートに混ぜると
-//!   再び判別力を失う）。
+//! - CORE-7（動的窓の劣化上限・アクティブなゲート。Issue #302 で測定方式を再整合）:
+//!   [`run_core7_gate`] が測定する。設計の要点（詳細は `docs/design/
+//!   core7-dynamic-window-gate.md` の ADR を参照。数値は書かない）:
+//!   - A（対照）・B（被検）とも **同一カーネル**（`BatchEngine::batch_search`。f16
+//!     常駐・CPU-SIMD）を経由する。A は事前生成済みクエリ 1 本を直接
+//!     `batch_search` へ渡す経路、B は同じクエリを [`DynamicWindowAggregator`]
+//!     の `push`/`drain` に通してから同じ `batch_search` を呼ぶ経路とし、差分を
+//!     「窓の push/drain・所有権移動・dispatch 相当の分岐」のみに絞る。単発
+//!     クエリは実運用では動的窓に入らないため（`should_aggregate_into_batch`
+//!     が `false` を返す文脈）、B は「窓を通った場合に単発クエリが払いうる
+//!     最大オーバーヘッド」を課す保守側の構成である。
+//!   - `CORE6`/`CORE-16` と同じ合成データセット（[`build_gate_dataset`]）を
+//!     再利用し、複数試行（[`CORE7_TRIALS`]）を行う。A/B のクエリは反復ごとに
+//!     同一内容を複製して使い（`batch_search` の類似度計算コストがクエリ値へ
+//!     左右されるぶんをノイズ源から除く。Issue #302 レビュー対応）、試行内の
+//!     劣化率（%）は CORE-7 が定義する量そのまま、**経路ごとに独立算出した
+//!     p95 の差分**（`degradation_pct(p95_from_samples(a), p95_from_samples(b))`）
+//!     で算出する。試行間はその値の列の**中央値**を
+//!     `BENCH_BATCH_MAX_DEGRADATION_PCT` と比較する（突発的な計測スパイクが
+//!     単一試行だけを外れ値化しても誤 fail しないための試行間ノイズ対策。
+//!     Issue #302 codex-review 対応）。
+//!
+//!     反復ペアの絶対差分 `b_i - a_i` の分布から p95 を取る「ペア化差分」方式
+//!     （旧実装）は一度採用したが、2 回のレビューで撤回した（Issue #302
+//!     Cursor Bugbot・codex-review 双方の指摘）。ペア化差分方式が構造的に
+//!     抱える欠陥: `run_ab` は同一反復番号の `a_i`/`b_i` を直後に連続実行する
+//!     だけであり厳密な同時計測ではないため、`delta_i = b_i - a_i` は A/B が
+//!     完全に同一分布でも平均 0・分散非 0 の分布になる。その**分布の p95**
+//!     （＝ 0 を中心とする対称分布の上側裾）は退行の有無に関わらず構造的に
+//!     正の値を取り続けるため、A/B の分布が完全に一致していても偽陽性を生む
+//!     （codex-review 指摘。旧実装が置いていた合成テストは注入ノイズ幅を
+//!     閾値未満に固定していただけで、この構造的バイアスを検証できていな
+//!     かった）。経路別に独立算出した p95 の差分（本方式）は A が速くも遅くも
+//!     なりうる対称な統計量であり、この構造的バイアスを持たない。
+//!
+//!     本方式は「軽微な push/drain 退行が全走査コストの反復間ノイズへ埋もれ
+//!     判別力を失う」弱点を持つ（ペア化を検討した動機そのもの）。この弱点は
+//!     ペア化ではなく試行数（[`CORE7_TRIALS`]）・反復数（`run_core7_gate` が
+//!     `MeasurementConfig::new` へ渡す測定反復回数）を増やし分位点推定の
+//!     ノイズを下げることで緩和する対象とし、推定量自体をペア化差分へ戻さない。
+//!     詳細は ADR「本ゲートの感度の限界」節参照。
+//!   - ワークロードの戻り値（B の `drain()` 結果等）は計測区間内で drop すると
+//!     解放コストが測定対象へ混入する（`harness::ab::run_ab` のドキュメンテー
+//!     ションコメント参照）ため、各試行内で sink へ退避し `run_ab` 完了後に
+//!     まとめて drop する。
+//!   - 旧来の「256 本まとめて push/drain するだけの経路」比較は判別力を保つ
+//!     診断として [`run_dynamic_window_push_drain_diagnostic`] に残すが、
+//!     合否には数えない（`BatchEngine::batch_search` を経由しないため CORE-7
+//!     の定義量そのものではない）。この旧来比較が `batch_search` を測定区間から
+//!     除外していたのは PR #154 のレビュー対応（全走査コストの前で push/drain の
+//!     差分が埋もれ判別力を失う、という指摘）によるものだった。本 Issue（#302）は
+//!     その判断を誤りとして覆すのではなく、「判別力優先の比較」と「CORE-7 が
+//!     定義する量」は両立しない設計だったと整理し、前者を診断へ、後者
+//!     （[`run_core7_gate`]）をゲート本体へ切り分けて両方を保持する（詳細は
+//!     ADR「PR #154 の判別力優先レビュー対応との関係」節）。
 //! - CORE-6（GPU 経路 vs CPU-SIMD の p95 短縮率）・CORE-16（f16 常駐 vs f32 常駐の
 //!   p95 短縮率）: `BENCH_CORE6`/`BENCH_CORE16` フラグ（opt-in。未設定・空文字のみ
 //!   「対象外」とし、非空値はすべて opt-in 要求とみなす）で有効化する実測ゲート
@@ -65,14 +96,15 @@
 //!   いずれも既定では pass/fail・非数値状態のみを標準出力へ書き、実測値・注入した
 //!   閾値は出力しない（`BENCH_VERBOSE` opt-in 時のみ実測値を追加出力する）。
 
-// `harness` の取り込み方針は `simd_bench.rs` と同一（本ファイルが実際に使う項目
-// のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する）。
+// `harness` の取り込み方針は `simd_bench.rs` と同一(本ファイルが実際に使う項目
+// のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する)。
 #[allow(dead_code)]
 mod harness;
 
 use harness::ab::run_ab;
 use harness::accept::{
-    check_degradation_within_limit, check_improvement_at_least, p95_from_samples,
+    check_degradation_pct_within_limit, check_improvement_at_least, degradation_pct,
+    median_degradation_pct, p95_from_samples,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -82,16 +114,27 @@ use engine::batch_search::{BatchEngine, BatchQuery, DynamicWindowAggregator, Res
 use engine::policy::PolicyContext;
 use engine::storage::Visibility;
 
-/// CORE-7 ゲートで 1 反復あたり集約器へ通すクエリ本数。1 本単位では `push`/`drain`
-/// が数百ナノ秒程度で終わり `Instant` の分解能・関数呼び出しオーバーヘッドへ
-/// 埋もれるため、実運用の動的窓サイズ相当の本数へ増幅してから測る（値そのものは
-/// spec の閾値ではなく本ベンチ固有の測定条件）。
+/// CORE-7 の診断（[`run_dynamic_window_push_drain_diagnostic`]）で 1 反復あたり
+/// 集約器へ通すクエリ本数。1 本単位では `push`/`drain` の所要時間が `Instant`
+/// の分解能・関数呼び出しオーバーヘッドへ埋もれるため、実運用の動的窓サイズ
+/// 相当の本数へ増幅してから測る（値そのものは spec の閾値ではなく本ベンチ
+/// 固有の測定条件。実測の時間スケールは書かない——
+/// `.claude/rules/spec-confidentiality.md`）。
 const AGG_BATCH_SIZE: usize = 256;
 
-/// CORE-7 ゲートで集約するクエリの次元数。
+/// 診断で集約するクエリの次元数。
 const AGG_QUERY_DIM: usize = 768;
 
-/// CORE-6/CORE-16 ゲートの実測に使う合成データセット規模（本ベンチ固有の測定条件で
+/// CORE-7 ゲート（[`run_core7_gate`]）の試行回数（Issue #302）。hosted runner での
+/// 突発的な単発スパイクが 1 試行だけを外れ値化しても、中央値採用により判定全体を
+/// 誤 fail させないための本ベンチ固有の測定条件（spec の閾値ではない）。中央値が
+/// 意味を持つには外れ値以外の「クリーンな」試行が過半数必要であり、2 コア共有の
+/// hosted runner はローカル専有環境よりスパイク頻度が高いと想定されるため、
+/// ローカル実測（`docs/design/core7-dynamic-window-gate.md` 参照）で確認できた
+/// 安定性より余裕を持たせた値を採る。
+const CORE7_TRIALS: usize = 9;
+
+/// CORE-6/CORE-16/CORE-7 ゲートの実測に使う合成データセット規模（本ベンチ固有の測定条件で
 /// あり spec の閾値ではない）。GPU 転送・dispatch の固定コストを償却できる程度の
 /// 行数・次元にしつつ、GPU 非搭載環境でも CORE-16 側（CPU 上の f16/f32 比較）が
 /// 現実的な時間で完走する規模に留める。
@@ -99,7 +142,8 @@ const GPU_GATE_ROW_COUNT: usize = 20_000;
 const GPU_GATE_DIM: usize = 256;
 const GPU_GATE_TOP_K: usize = 10;
 /// 1 反復あたりのバッチ本数（GPU 経路はクエリ単位に dispatch するため、1 本だと
-/// 転送・同期の固定コストが支配的になり経路差が現れない）。
+/// 転送・同期の固定コストが支配的になり経路差が現れない）。CORE-6/CORE-16 のみが
+/// 使う（CORE-7 は単発クエリの p95 を測るため 1 本固定）。
 const GPU_GATE_BATCH_SIZE: usize = 8;
 
 /// CORE-7 ゲートの計測に使うテナント ID（本ベンチ専用の合成データ。実データではない）。
@@ -173,7 +217,7 @@ fn min_improvement_pct_from_env(var: &str) -> Result<f64, String> {
     Ok(value)
 }
 
-/// CORE-6/CORE-16 ゲート用の合成データセット（本ベンチ専用。実データではない）。
+/// CORE-6/CORE-16/CORE-7 ゲート用の合成データセット（本ベンチ専用。実データではない）。
 /// 単一テナント・全 `Public` の素直な配置にし、テナントマスクの分岐差が経路間の
 /// 比較へ混ざらないようにする。
 struct GateDataset {
@@ -230,6 +274,220 @@ fn gate_batch_queries<'a>(queries: &'a [Vec<f32>], ctx: &'a PolicyContext) -> Ve
             ctx,
         })
         .collect()
+}
+
+/// CORE-7 ゲート（動的窓集約を経由する単発クエリ経路の p95 劣化率上限。Issue #302 で
+/// 測定方式を再整合。設計の詳細は `docs/design/core7-dynamic-window-gate.md` の
+/// ADR とモジュール冒頭コメントを参照）。
+///
+/// A（対照）・B（被検）とも `dataset`/`ctx` から構築した同一の CPU-SIMD
+/// `BatchEngine` を経由する。差分は「窓の push/drain・所有権移動」のみに絞り、
+/// `CORE7_TRIALS` 回の試行から劣化率（%）の中央値を算出して
+/// `max_degradation_pct` と突き合わせる。`batch_search` が 1 件でもエラーを
+/// 返した場合は判定不能として `pass=false`（CORE-6/CORE-16 と同一の fail-closed
+/// 方針。エラー経路は通常大幅に軽量なため、これを計測サンプルへ計上すると
+/// 誤って劣化なしと判定しうる）。
+fn run_core7_gate(
+    dataset: &GateDataset,
+    ctx: &PolicyContext,
+    max_degradation_pct: f64,
+    verbose: bool,
+) -> Result<bool, String> {
+    const LABEL: &str = "dynamic_window_degradation";
+
+    let matrix = ResidentMatrix::build(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        GPU_GATE_DIM,
+        &dataset.vectors,
+    )
+    .map_err(|err| format!("{LABEL}: resident matrix build failed: {err}"))?;
+    let engine = BatchEngine::new(matrix);
+
+    let error_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut trial_pcts: Vec<f64> = Vec::with_capacity(CORE7_TRIALS);
+
+    for trial in 0..CORE7_TRIALS {
+        let seed = (trial as u64)
+            .checked_add(1)
+            .expect("CORE7_TRIALS is a small constant far below u64::MAX");
+        let config = MeasurementConfig::new(20, 50, seed).expect("protocol minimums satisfied");
+        let total_iterations = (config.warmup_iterations() as usize)
+            .checked_add(config.measured_iterations() as usize)
+            .expect("MeasurementConfig::new bounds iteration counts within usize");
+
+        // pool の対称化・クエリ内容の一致（Issue #302 レビュー対応）: A/B で
+        // 使うクエリは反復ごとに 1 本だけ生成し、同一内容を複製して両プールへ
+        // 積む（`build_query_pool_pair` の診断側と同一方針）。別々の RNG 引きで
+        // 生成すると A/B のクエリ内容が異なり、`batch_search` の類似度計算・
+        // 上位 k 候補更新コストがクエリ値に左右されるぶんが測定対象（動的窓
+        // 集約の push/drain オーバーヘッド）より大きいノイズ・系統差になりうる。
+        // heap 配置も「1 つのループで交互に確保」する（順次確保〔pool_a を
+        // 全確保したのち pool_b を全確保〕だと heap 配置がテスト間で非対称に
+        // なりうる。モジュール冒頭コメント・ADR 参照）。
+        //
+        // 確保順の A/B 均衡化（Issue #302 codex-review P1 再指摘対応）:
+        // `next_vector` が返す元の `Vec`（後段で移動する側）は常に先に確保され、
+        // `.clone()` が生成する複製（後段で先に push する側）は必ず後に確保
+        // される。そのため「pool_a.push を先に書く」だけでは実際のバッファ
+        // 確保順は変わらず、元 Vec を受け取る側が常に確保順で後手に回る。
+        // 反復インデックスの偶奇で「元 Vec をどちらのプールに渡すか」を
+        // 入れ替え、A/B 間で確保順（先に確保された元 Vec／後に確保された
+        // 複製）を均衡させる。
+        let mut trial_rng = DeterministicRng::new(seed);
+        let mut pool_a: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
+        let mut pool_b: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
+        for i in 0..total_iterations {
+            let query = trial_rng.next_vector(GPU_GATE_DIM);
+            if i % 2 == 0 {
+                pool_a.push(query.clone());
+                pool_b.push(query);
+            } else {
+                pool_b.push(query.clone());
+                pool_a.push(query);
+            }
+        }
+
+        // 解放コストの測定区間外化（`harness::ab::run_ab` の drop 契約参照）。
+        // A は消費したクエリ（`Vec<f32>`）を、B は `drain()` の戻り値
+        // （`Vec<Vec<f32>>`）を測定完了後まとめて drop する。
+        let mut sink_a: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
+        let mut sink_b: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+
+        let error_count_a = std::sync::Arc::clone(&error_count);
+        let error_count_b = std::sync::Arc::clone(&error_count);
+
+        let workload_a = || -> usize {
+            let query = pool_a
+                .pop()
+                .expect("pool sized to warmup + measured iteration count");
+            let batch_queries = [BatchQuery {
+                vector: query.as_slice(),
+                k: GPU_GATE_TOP_K,
+                ctx,
+            }];
+            let count = match engine.batch_search(&batch_queries) {
+                Ok(hits) => hits.len(),
+                Err(err) => {
+                    error_count_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!(
+                        "batch_bench: {LABEL}: direct batch_search returned an error \
+                         during measurement: {err}"
+                    );
+                    0
+                }
+            };
+            sink_a.push(query);
+            count
+        };
+
+        let workload_b = || -> usize {
+            let query = pool_b
+                .pop()
+                .expect("pool sized to warmup + measured iteration count");
+            let mut window = DynamicWindowAggregator::new();
+            window
+                .push(query)
+                .expect("well-formed synthetic query must satisfy window limits");
+            let drained = window.drain();
+            let count = match drained.first() {
+                Some(first) => {
+                    let batch_queries = [BatchQuery {
+                        vector: first.as_slice(),
+                        k: GPU_GATE_TOP_K,
+                        ctx,
+                    }];
+                    match engine.batch_search(&batch_queries) {
+                        Ok(hits) => hits.len(),
+                        Err(err) => {
+                            error_count_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            eprintln!(
+                                "batch_bench: {LABEL}: windowed batch_search returned an \
+                                 error during measurement: {err}"
+                            );
+                            0
+                        }
+                    }
+                }
+                None => {
+                    // 直前に必ず 1 件 push しているため到達しないはずだが、
+                    // untrusted な状態遷移を仮定せず fail-closed に倒す。
+                    error_count_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!(
+                        "batch_bench: {LABEL}: drained window unexpectedly empty during \
+                         measurement"
+                    );
+                    0
+                }
+            };
+            sink_b.push(drained);
+            count
+        };
+
+        let ab = run_ab(&config, workload_a, workload_b)
+            .map_err(|err| format!("{LABEL}: A/B measurement failed (trial {trial}): {err}"))?;
+
+        if error_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            println!(
+                "{LABEL}: not measurable (batch_search returned an error during \
+                 measurement; see stderr) rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} \
+                 k={GPU_GATE_TOP_K} trials={CORE7_TRIALS} pass=false"
+            );
+            return Ok(false);
+        }
+
+        // CORE-7 が定義する量（B の p95 と A の p95 の差）をそのまま算出する
+        // （Issue #302 codex-review 指摘対応）。ペア化差分
+        // `paired_p95_degradation_pct`（反復ごとの絶対差分 `b_i - a_i` の
+        // 分布から p95 を取る旧実装）は、`run_ab` が同一反復番号の `a_i`/`b_i`
+        // を直後に連続実行するだけで厳密な同時計測ではないため、A/B が完全に
+        // 同一分布でも `delta_i = b_i - a_i` は平均 0・分散非 0 の分布になり、
+        // その**分布の p95**（0 を中心とする対称分布の上側裾）は退行の有無に
+        // 関わらず構造的に正の値を取り続け偽陽性を生む（codex-review 指摘。
+        // 旧実装の合成テストは注入ノイズ幅を閾値未満に固定していただけで、この
+        // 構造的バイアスを検証できていなかった）。経路ごとに独立算出した p95 の
+        // 差分（[`degradation_pct`]）は A が速くも遅くもなりうる対称な統計量で
+        // あり、この構造的バイアスを持たない（`docs/design/
+        // core7-dynamic-window-gate.md` 参照）。
+        //
+        // 本方式は「軽微な push/drain 退行が全走査コストの反復間ノイズへ埋もれ
+        // 判別力を失う」弱点を持つ（ペア化を検討した動機そのもの）。この弱点は
+        // ペア化ではなく試行数・反復数（分位点推定のノイズを下げる）で緩和する
+        // 対象とする。
+        //
+        // 試行間のスパイク耐性は次段（`trial_pcts` の `median_degradation_pct`）が
+        // 別途担う（単一試行内のばらつきと複数試行間の突発スパイクは別種のノイズ
+        // であり、試行内側まで中央値化すると契約が定める p95 劣化そのものを
+        // 隠してしまうため、試行内は p95 のまま・試行間だけ中央値を使う設計は
+        // 維持する）。
+        let baseline_p95 = p95_from_samples(&ab.a.samples)
+            .map_err(|err| format!("{LABEL}: baseline p95 failed (trial {trial}): {err}"))?;
+        let candidate_p95 = p95_from_samples(&ab.b.samples)
+            .map_err(|err| format!("{LABEL}: candidate p95 failed (trial {trial}): {err}"))?;
+        let pct = degradation_pct(baseline_p95, candidate_p95)
+            .map_err(|err| format!("{LABEL}: p95 degradation failed (trial {trial}): {err}"))?;
+        trial_pcts.push(pct);
+    }
+
+    let median_pct = median_degradation_pct(&trial_pcts)
+        .map_err(|err| format!("{LABEL}: median_degradation_pct failed: {err}"))?;
+    let pass = check_degradation_pct_within_limit(median_pct, max_degradation_pct)
+        .map_err(|err| format!("{LABEL}: degradation check failed: {err}"))?;
+
+    // limit（BENCH_BATCH_MAX_DEGRADATION_PCT）・実測値（試行別劣化率・中央値）は
+    // 意図的にログへ出力しない（閾値は spec が SSOT・実測値は public リポの
+    // Actions ログから閾値を逆算されうるため出さない。Issue #279 参照）。
+    println!(
+        "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} k={GPU_GATE_TOP_K} \
+         trials={CORE7_TRIALS} pass={pass}"
+    );
+    if verbose {
+        println!(
+            "verbose({LABEL}): trial_degradation_pct={trial_pcts:?} median_pct={median_pct:?}"
+        );
+    }
+    Ok(pass)
 }
 
 /// CORE-6 ゲート（GPU 経路 vs CPU-SIMD 経路の p95 短縮率）。
@@ -446,23 +704,112 @@ fn run_core16_gate(
     Ok(pass)
 }
 
-/// CORE-7 A/B 計測の測定区間からクエリ確保・コピーを追い出すための事前生成
-/// プール。`total_iterations` バッチ分（各バッチ [`AGG_BATCH_SIZE`] 本）を
-/// 呼び出し時（= `run_ab` 呼び出し前・測定区間外）にまとめて `clone` し、
-/// 測定区間側は `Vec::pop` で取り出すだけにする（モジュール冒頭コメント参照。
-/// レビュー指摘対応: 測定区間内の `clone` が両経路のコストを支配していた
-/// 問題の是正）。
-fn build_query_pool(rng: &mut DeterministicRng, total_iterations: usize) -> Vec<Vec<Vec<f32>>> {
+/// 診断用の事前生成プール 1 本（`total_iterations` バッチ分。各バッチ
+/// [`AGG_BATCH_SIZE`] 本のクエリベクトルを持つ）。[`build_query_pool_pair`] の
+/// 戻り値の型（clippy::type_complexity 対応）。
+type DiagnosticQueryPool = Vec<Vec<Vec<f32>>>;
+
+/// 診断（[`run_dynamic_window_push_drain_diagnostic`]）の A/B 計測区間からクエリ
+/// 確保・コピーを追い出すための事前生成プール。`total_iterations` バッチ分
+/// （各バッチ [`AGG_BATCH_SIZE`] 本）を A/B 交互に確保し（heap 配置の系統差を
+/// 避ける。CORE-7 ゲート本体〔[`run_core7_gate`]〕と同じ「pool の対称化」方針）、
+/// 測定区間側は `Vec::pop` で取り出すだけにする。
+fn build_query_pool_pair(
+    rng: &mut DeterministicRng,
+    total_iterations: usize,
+) -> (DiagnosticQueryPool, DiagnosticQueryPool) {
     let base = rng.next_vector(AGG_QUERY_DIM);
-    let mut pool: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+    let mut pool_a: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+    let mut pool_b: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
     for _ in 0..total_iterations {
-        let mut batch: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
+        let mut batch_a: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
+        let mut batch_b: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
         for _ in 0..AGG_BATCH_SIZE {
-            batch.push(base.clone());
+            batch_a.push(base.clone());
+            batch_b.push(base.clone());
         }
-        pool.push(batch);
+        pool_a.push(batch_a);
+        pool_b.push(batch_b);
     }
-    pool
+    (pool_a, pool_b)
+}
+
+/// 診断: [`DynamicWindowAggregator`] の `push`/`drain` それ自体のオーバーヘッドを
+/// （256 本まとめて集約する場合について）検証なしの `Vec::push` と比較する。
+/// **合否には数えない**（`simd_bench.rs::diagnostic_ab` と同型。[`run_core7_gate`]
+/// が CORE-7 の定義量〔単発クエリ p95〕を担うため、本関数は集約器実装の退行を
+/// 可視化する判別力の高い参考値としてのみ残す。詳細は
+/// `docs/design/core7-dynamic-window-gate.md` の ADR 参照）。
+///
+/// `run_core7_gate` と同じく、A（対照。検証なしの `Vec::push`）・B（被検。
+/// `DynamicWindowAggregator::push`/`drain`）双方の戻り値を測定区間外の sink へ
+/// 退避してから drop する（`harness::ab::run_ab` の drop 契約参照）。
+fn run_dynamic_window_push_drain_diagnostic(rng: &mut DeterministicRng, verbose: bool) {
+    const LABEL: &str = "diagnostic_dynamic_window_push_drain";
+    let config = MeasurementConfig::new(20, 50, 1).expect("protocol minimums satisfied");
+    let total_iterations = (config.warmup_iterations() as usize)
+        .checked_add(config.measured_iterations() as usize)
+        .expect("MeasurementConfig::new bounds iteration counts within usize");
+    let (mut pool_a, mut pool_b) = build_query_pool_pair(rng, total_iterations);
+
+    let mut sink_a: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+    let mut sink_b: Vec<Vec<Vec<f32>>> = Vec::with_capacity(total_iterations);
+
+    let workload_a = move || -> usize {
+        let batch = pool_a
+            .pop()
+            .expect("query pool sized to warmup + measured iteration count");
+        let mut queries: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
+        for query in batch {
+            queries.push(query);
+        }
+        let len = queries.len();
+        sink_a.push(queries);
+        len
+    };
+
+    let workload_b = move || -> usize {
+        let batch = pool_b
+            .pop()
+            .expect("query pool sized to warmup + measured iteration count");
+        let mut window = DynamicWindowAggregator::new();
+        for query in batch {
+            window
+                .push(query)
+                .expect("well-formed synthetic query must satisfy window limits");
+        }
+        let drained = window.drain();
+        let len = drained.len();
+        sink_b.push(drained);
+        len
+    };
+
+    match run_ab(&config, workload_a, workload_b) {
+        Ok(ab) => match (
+            p95_from_samples(&ab.a.samples),
+            p95_from_samples(&ab.b.samples),
+        ) {
+            (Ok(p95_a), Ok(p95_b)) => {
+                println!(
+                    "{LABEL}: batch_size={AGG_BATCH_SIZE} dim={AGG_QUERY_DIM} \
+                     measured=true (not counted toward pass/fail)"
+                );
+                if verbose {
+                    println!(
+                        "verbose({LABEL}): direct_median={:?} direct_p95={p95_a:?} \
+                         windowed_median={:?} windowed_p95={p95_b:?}",
+                        ab.a.summary.median, ab.b.summary.median,
+                    );
+                }
+            }
+            _ => {
+                println!("{LABEL}: p95 unavailable (not counted toward pass/fail)");
+            }
+        },
+        Err(e) => {
+            println!("{LABEL}: measurement unavailable ({e}) (not counted toward pass/fail)");
+        }
+    }
 }
 
 fn main() {
@@ -487,76 +834,28 @@ fn main() {
     let mut rng = DeterministicRng::new(1);
     let mut passed = true;
 
-    // --- CORE-7: 動的窓集約それ自体のオーバーヘッドを、`BatchEngine::batch_search`
-    // を測定区間から除外したうえで interleaved A/B で計測する（モジュール冒頭
-    // コメント参照）。A（対照）は検証なしの `Vec::push`、B（被検）は
-    // `DynamicWindowAggregator::push`/`drain` を通す点だけが差分になるよう揃える。
-    // クエリ本体（`Vec<f32>`）は測定開始前にすべて事前生成し（[`build_query_pool`]）、
-    // 各反復の測定区間内では `Vec::pop`（O(1)・確保もコピーもしない所有権移動）で
-    // 取り出すだけにする（レビュー指摘対応: 以前は各反復の測定区間内で
-    // `query_base.clone()` を `AGG_BATCH_SIZE` 回行っており、この確保・コピーの
-    // 共通コストが両経路の測定時間を支配して `push`/`drain` の差分が p95 比率へ
-    // 現れない状態になっていた）。---
-    let config = MeasurementConfig::new(20, 50, 1).expect("protocol minimums satisfied");
-    // `run_ab` は warmup・計測の両フェーズで各経路をちょうど 1 回ずつ呼ぶ
-    // （`harness::ab::run_ab` の契約）ため、必要な「バッチ」総数は
-    // warmup_iterations + measured_iterations と一致する。
-    let total_iterations = (config.warmup_iterations() as usize)
-        .checked_add(config.measured_iterations() as usize)
-        .expect("MeasurementConfig::new bounds iteration counts within usize");
-    let mut pool_a = build_query_pool(&mut rng, total_iterations);
-    let mut pool_b = build_query_pool(&mut rng, total_iterations);
-
-    let workload_a = move || {
-        let batch = pool_a
-            .pop()
-            .expect("query pool sized to warmup + measured iteration count");
-        let mut queries: Vec<Vec<f32>> = Vec::with_capacity(AGG_BATCH_SIZE);
-        for query in batch {
-            queries.push(query);
-        }
-        queries
-    };
-
-    let workload_b = move || {
-        let batch = pool_b
-            .pop()
-            .expect("query pool sized to warmup + measured iteration count");
-        let mut window = DynamicWindowAggregator::new();
-        for query in batch {
-            window
-                .push(query)
-                .expect("well-formed synthetic query must satisfy window limits");
-        }
-        window.drain()
-    };
-
-    let ab = run_ab(&config, workload_a, workload_b)
-        .expect("A/B measurement must satisfy protocol minimums");
-    let p95_a = p95_from_samples(&ab.a.samples).expect("non-empty A samples must yield a p95");
-    let p95_b = p95_from_samples(&ab.b.samples).expect("non-empty B samples must yield a p95");
-    let degradation_ok = check_degradation_within_limit(p95_a, p95_b, max_degradation_pct)
-        .expect("max_degradation_pct validated by max_degradation_pct_from_env");
-    passed &= degradation_ok;
-    // limit（BENCH_BATCH_MAX_DEGRADATION_PCT）・実測値（p95・median）は意図的に
-    // ログへ出力しない（閾値は spec が SSOT・実測値は public リポの Actions ログから
-    // 閾値を逆算されうるため出さない。モジュール冒頭コメント・Issue #279 参照）。
-    // 実測値が必要な場合のみ `BENCH_VERBOSE` opt-in で追加出力する。
-    println!(
-        "dynamic_window_degradation: batch_size={AGG_BATCH_SIZE} dim={AGG_QUERY_DIM} pass={degradation_ok}"
-    );
-    if verbose {
-        println!(
-            "verbose(dynamic_window_degradation): direct_median={:?} direct_p95={p95_a:?} windowed_median={:?} windowed_p95={p95_b:?}",
-            ab.a.summary.median, ab.b.summary.median,
-        );
-    }
-
-    // --- CORE-6 / CORE-16: opt-in の実測ゲート（Issue #178 で実 GPU バックエンドへ
-    // 接続済み。未 opt-in なら「対象外」を出力するだけで合否に数えない）---
+    // CORE-6/CORE-16/CORE-7 で共有する合成データセットを先に構築する（Issue #302:
+    // CORE-7 も CORE-6/16 と同じ `BatchEngine::batch_search` 経由の実測ゲートへ
+    // 再整合したため、同一データセットを流用する）。
     let gate_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
     let gate_dataset = build_gate_dataset(&mut rng);
 
+    // --- CORE-7: 動的窓集約を経由する単発クエリ経路の p95 劣化上限
+    // （アクティブなゲート。モジュール冒頭コメント・[`run_core7_gate`] 参照）---
+    let core7_ok = match run_core7_gate(&gate_dataset, &gate_ctx, max_degradation_pct, verbose) {
+        Ok(ok) => ok,
+        Err(msg) => {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+    };
+    passed &= core7_ok;
+
+    // --- 診断: push/drain 単体のオーバーヘッド（合否には数えない）---
+    run_dynamic_window_push_drain_diagnostic(&mut rng, verbose);
+
+    // --- CORE-6 / CORE-16: opt-in の実測ゲート（Issue #178 で実 GPU バックエンドへ
+    // 接続済み。未 opt-in なら「対象外」を出力するだけで合否に数えない）---
     let core6_ok = match run_core6_gate(&gate_dataset, &gate_ctx, verbose) {
         Ok(ok) => ok,
         Err(msg) => {
