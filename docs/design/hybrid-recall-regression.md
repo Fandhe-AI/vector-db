@@ -253,15 +253,58 @@ Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall
 受け入れ条件・判断事項は spec のビヘイビア定義（SEARCH-1・SEARCH-3。
 `docs/spec/04-behavior/search.md`）を参照。
 
+## Issue #310: engine 側改善（同点順位規約・境界同点グループ）
+
+- 対応: TASK-84・TASK-103（`docs/spec/05-tasks.md`）
+- 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
+- 前提: 親 Issue #301。先行: #306（大規模段へのクエリ展開結線）・#307（小規模段の
+  engine 側原因調査。上記節）
+
+Issue #307 の調査（同節参照）で「原因調査対象」として残していた RRF 融合の同点
+順位規約を確定した。`hybrid.rs::RrfConfig` に同点順位規約 `TieRank`
+（`GroupEnd`（既定。同点グループ全員へグループ末尾の順位を割り当てる
+modified competition ranking）・`Positional`（従来挙動。撤回用に残置）の
+2 バリアント）を追加し、`accumulate_ranked` の同点処理を `Positional` から
+`GroupEnd` へ切り替えた。あわせて `hybrid_search_boosted` の密プール取得を
+`fetch_k`（`pool_depth` の最大 2 倍。`checked_mul`・`MAX_POOL_DEPTH`・可視集合の
+大きさで有界化）へ拡張し、`pool_depth` 境界が同点グループの途中を切る場合に
+グループ全体を含める（境界が取得済み範囲内で確定できない場合は決定的・id 非依存に
+そのグループを丸ごと除外する）`complete_boundary_tie_group` を追加した。
+
+**採用規約と不採用案**: 位置順位（従来挙動。同点グループが大きいほど id の小さい
+候補が根拠なく高順位を得る id 依存バイアスがある）に対し、グループ末尾順位
+（`GroupEnd`）・グループ先頭順位（competition ranking）・平均順位（fractional
+ranking）を層 A の固定値（下記「実測結果」）で比較し、`GroupEnd` を採用した
+（先頭順位は id 非依存性は満たすが到達率が位置順位を下回る場合があり、平均順位は
+非整数の順位を扱う実装コストに見合う改善幅がなかった）。BM25（疎チャネル）の
+`k1`/`b` の変更は不採用（既定値からの変更は一般性に乏しい）。密プール境界の
+同点グループ完全化は、`pool_depth` を跨ぐ同点グループが id 依存の切り詰めで
+一部だけ取り込まれる問題を、決定的（完全に含めるか完全に除外するかの二択。
+2 度目の provider 呼び出しはしない）に解消する。疎チャネル（BM25 スコアは連続値で
+同点が実質発生しない）・`rerank.rs` の RRF 型融合への `TieRank` 適用は本 Issue の
+対象外（フォローアップ候補）。
+
+**フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
+`VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも
+変更していない（Issue #310 の受け入れ条件 2）。層 B の pass/fail・実測値・
+閾値・導出係数は本ドキュメントにも public テストにも記録しない（受け入れ条件 3・
+`.claude/rules/spec-confidentiality.md`）。
+
 ## 実測結果
 
 （`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み）
+再現可能。hit 数は同テストのアサーションに固定済み。Issue #310 実装後の値へ
+再確定済み）
 
 | 段 | 文書数 | QA 件数 | total_correct | ceil20 | hits20 | ceil100 | hits100 | Recall@20 | Recall@100 |
 | -- | ------ | ------- | -------------- | ------ | ------ | ------- | ------- | --------- | ---------- |
-| 小規模 | 400 | 60 | 202 | 202 | 171 | - | - | 0.8465 | - |
-| 大規模 | 20,000 | 100 | 997 | 421 | 328 | 707 | 645 | 0.7791 | 0.9123 |
+| 小規模 | 400 | 60 | 202 | 202 | 182 | - | - | 0.9010 | - |
+| 大規模 | 20,000 | 100 | 997 | 421 | 385 | 707 | 653 | 0.9145 | 0.9236 |
+
+（Issue #310 実装前の値: 小規模 `hits20=171`（Recall@20=0.8465）・大規模
+`hits20=328, hits100=645`（Recall@20=0.7791, Recall@100=0.9123）。`ceil20`/`ceil100`/
+`total_correct`（正解集合の理論上限・総数）は fixture 非変更のため不変で、
+`GroupEnd`＋境界同点グループ完全化により両段とも到達率が改善した）
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の

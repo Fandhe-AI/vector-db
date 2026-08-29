@@ -92,6 +92,14 @@ id 昇順」で事前ソート済みであることを検証し（`is_sorted_des
   いる限り、それ自体は非決定性を生まない（`truncate` は要素の順序を変更しない）。
   ただし切り詰め前の順序が同点タイブレークを欠いていれば、どの位置で切っても
   非決定的になりうる点に注意する。
+- 同点グループへ割り当てる RRF **順位**（同点タイブレーク＝最終出力の**並び順**とは
+  別の契約）は `hybrid.rs::RrfConfig::tie_rank`（`TieRank`。既定 `GroupEnd`）で決め、
+  `pool_depth` 境界で同点グループを分断しない（`complete_boundary_tie_group`。
+  Issue #310。詳細は `docs/design/hybrid-recall-regression.md`「Issue #310: engine
+  側改善」節参照）。この規約変更は上記の同点**タイブレーク**契約（安定ソート・
+  id 昇順・`total_cmp`・`BTreeMap` 累積）を弱めない: `accumulate_ranked` が
+  同点グループ内の全メンバーへ同一の RRF 順位（＝同一の寄与）を割り当てた**後**の
+  最終整列は、従来どおり融合スコア降順・同点 id 昇順の安定ソートで確定する。
 
 ## 例外として許容する箇所
 

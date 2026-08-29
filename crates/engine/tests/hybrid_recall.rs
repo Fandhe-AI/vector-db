@@ -908,7 +908,7 @@ fn hybrid_recall_small_scale_regression() {
     // 変更で数値が変化した場合はこのテストが失敗する）。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -991,8 +991,8 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
+    assert_eq!(r.hits20, 385, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 653, "大規模段の Recall@100 hit 数が変化した");
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー
