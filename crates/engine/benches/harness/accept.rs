@@ -189,42 +189,6 @@ pub fn degradation_pct(baseline_p95: Duration, candidate_p95: Duration) -> Resul
     Ok(pct)
 }
 
-/// A/B 反復ごとに対応する所要時間サンプル列（`ab::run_ab` が返す
-/// `AbMeasurement::a.samples`/`b.samples`。同一インデックスが同一反復を指す
-/// 契約）から、反復ごとの劣化率（%）列を算出する（TASK-130・CORE-7・Issue #302
-/// レビュー対応）。
-///
-/// [`degradation_pct`] は経路ごとに独立算出した p95 の差分を取るため、両経路が
-/// 共有する支配的なコスト（`batch_bench.rs::run_core7_gate` では両経路が経由する
-/// `BatchEngine::batch_search` の全走査）にまつわる反復間ノイズが両者の p95 推定へ
-/// 別々に乗り、測定対象（動的窓集約の push/drain 分の差）を希釈しうる
-/// （`docs/design/core7-dynamic-window-gate.md` 参照）。本関数は同一反復番号の
-/// `a`/`b` を対にして反復内で差分を取ることで、その反復に共通のコスト成分を
-/// 相殺し、対象差分への感度を保つ（ペア化差分によるノイズ低減。一般的な対応
-/// のある実験計画の手法であり、CORE-7 が定義する量そのものは変えない）。
-///
-/// `a_samples`/`b_samples` の長さが一致しない場合、いずれかが空の場合、
-/// 対応するペアで `a` 側が `Duration::ZERO` の場合は `Err`（`degradation_pct`
-/// と同一の fail-closed 方針）。
-pub fn paired_degradation_pct_samples(
-    a_samples: &[Duration],
-    b_samples: &[Duration],
-) -> Result<Vec<f64>, BenchError> {
-    if a_samples.is_empty() || b_samples.is_empty() {
-        return Err(BenchError::EmptySamples);
-    }
-    if a_samples.len() != b_samples.len() {
-        return Err(BenchError::ProtocolViolation(
-            "paired_degradation_pct_samples: a/b sample counts diverged",
-        ));
-    }
-    a_samples
-        .iter()
-        .zip(b_samples.iter())
-        .map(|(&a, &b)| degradation_pct(a, b))
-        .collect()
-}
-
 /// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
 /// （`max_degradation_pct`）以内かを判定する（TASK-130・CORE-7 ポインタ:
 /// 動的窓集約を経由することによる単発クエリ経路の劣化上限）。
@@ -278,114 +242,14 @@ pub fn median_degradation_pct(samples: &[f64]) -> Result<f64, BenchError> {
     Ok(median)
 }
 
-/// ペア化した反復ごとの劣化率（%）列から p95（試行内の 95 パーセンタイル）を
-/// 算出する（TASK-130・CORE-7・Issue #302 codex-review 対応）。
-///
-/// CORE-7 が定める量は**単発クエリ経路の p95 劣化**であり、[`median_degradation_pct`]
-/// を試行内の統計量に使うと「典型的な反復の劣化率」（中央値）になってしまい、
-/// 被検側（B）の遅い上位 5% だけが退行しても検出できない（`p95_from_samples` を
-/// 経由する非ペア化比較 [`degradation_pct`]`(p95_from_samples(a), p95_from_samples(b))`
-/// より判別力が弱くなる）。本関数はペア化差分（[`paired_degradation_pct_samples`]。
-/// A/B が共有する支配的コストの反復間ノイズを相殺する）による判別力向上を維持
-/// したまま、試行内の統計量を p95 に揃える（`run_core7_gate` は複数試行それぞれで
-/// 本関数を呼び、試行間のスパイク耐性は [`median_degradation_pct`] による
-/// 試行間中央値へ委ねる——単一試行内のばらつき〔本関数が担う〕と複数試行間の
-/// 突発スパイク〔試行間中央値が担う〕は別種のノイズであり、両方を中央値化する
-/// と後者にしか効かない対策で前者〔契約が定める p95 劣化〕を隠してしまう）。
-///
-/// 算出方式は [`p95_from_samples`] と同じ最近傍法（線形補間ではなく実測サンプル
-/// 点をそのまま返す。SLO 判定に使う値のため実測範囲外への補間を避ける）を
-/// `Duration` ではなく `f64`（%）へ適用したもの。`samples` が空の場合は
-/// `Err(BenchError::EmptySamples)`、非有限値を含む場合は
-/// `Err(BenchError::ProtocolViolation)`（[`median_degradation_pct`] と同一の
-/// fail-closed 方針）。
-pub fn p95_degradation_pct(samples: &[f64]) -> Result<f64, BenchError> {
-    percentile95_of_f64(samples)
-}
-
-/// `f64` サンプル列から最近傍法（線形補間ではなく実測サンプル点をそのまま返す）
-/// で p95 を取る内部ヘルパ（[`p95_degradation_pct`]・[`paired_p95_degradation_pct`]
-/// が共有する）。空入力・非有限値は `Err`（fail-closed。呼び出し元と同一方針）。
-fn percentile95_of_f64(samples: &[f64]) -> Result<f64, BenchError> {
-    if samples.is_empty() {
-        return Err(BenchError::EmptySamples);
-    }
-    if samples.iter().any(|v| !v.is_finite()) {
-        return Err(BenchError::ProtocolViolation(
-            "percentile95_of_f64: samples must all be finite",
-        ));
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
-    let idx = rank.saturating_sub(1).min(sorted.len().saturating_sub(1));
-    sorted.get(idx).copied().ok_or(BenchError::EmptySamples)
-}
-
-/// 反復ペアの実測時間差（`b_i - a_i`、秒）の p95 を、対照（A）側の p95
-/// レイテンシで正規化した劣化率（%）として算出する（TASK-130・CORE-7・
-/// Issue #302 codex-review・Cursor Bugbot 両指摘対応）。
-///
-/// [`paired_degradation_pct_samples`] → [`p95_degradation_pct`] の従来経路は
-/// 反復ごとに `(b_i - a_i) / a_i * 100`（比率）を取ってから、その比率列の p95 を
-/// 取っていた。この方式は反復ごとに分母 `a_i`（A/B 両経路が共有する全走査コストが
-/// 支配的で、反復ごとの残留ノイズも乗る）で割るため、A/B 双方が持つ残留ノイズが
-/// そのまま個々の比率の分散へ乗り、実際の退行が無くても比率分布の裾（p95）が
-/// 押し上げられうる（Cursor Bugbot 指摘: paired p95 overstates degradation）。
-///
-/// 本関数は正規化を 1 回だけに減らす: まず反復ごとの絶対差分 `b_i - a_i`
-/// （ペア化により両経路が共有する全走査コストの反復間ノイズは相殺され、残るのは
-/// push/drain オーバーヘッド＋相殺しきれない残留ノイズ）を集めてその**分布の
-/// p95**（オーバーヘッド自体の裾）を取り、最後に対照（A）側の p95 レイテンシ
-/// （[`p95_from_samples`]）**1 回だけ**で正規化する。反復ごとに割り算を挟まない
-/// ため、分母側のノイズが比率の分散へ個別に乗って裾を押し上げる経路を作らない。
-/// 分子をペア化差分の p95（push/drain オーバーヘッドの裾を直接捉える量）にした
-/// ことで、`degradation_pct(p95_from_samples(a), p95_from_samples(b))`
-/// （経路ごとに独立算出した p95 の差分）が持っていた「軽微な push/drain 退行が
-/// 全走査コストの反復間ノイズへ別々に埋もれ、判別力を失う」性質（codex-review
-/// 指摘）も、独立算出をやめて分子側をペア化差分に置き換えることで避ける。
-///
-/// `a_samples`/`b_samples` の長さが一致しない場合・いずれかが空の場合・
-/// 対照側の p95 が `Duration::ZERO` の場合は `Err`（`paired_degradation_pct_samples`・
-/// `p95_ratio` と同一の fail-closed 方針）。
-pub fn paired_p95_degradation_pct(
-    a_samples: &[Duration],
-    b_samples: &[Duration],
-) -> Result<f64, BenchError> {
-    if a_samples.is_empty() || b_samples.is_empty() {
-        return Err(BenchError::EmptySamples);
-    }
-    if a_samples.len() != b_samples.len() {
-        return Err(BenchError::ProtocolViolation(
-            "paired_p95_degradation_pct: a/b sample counts diverged",
-        ));
-    }
-    let deltas_secs: Vec<f64> = a_samples
-        .iter()
-        .zip(b_samples.iter())
-        .map(|(&a, &b)| b.as_secs_f64() - a.as_secs_f64())
-        .collect();
-    let p95_delta_secs = percentile95_of_f64(&deltas_secs)?;
-    let baseline_p95 = p95_from_samples(a_samples)?;
-    if baseline_p95.is_zero() {
-        return Err(BenchError::DegenerateRatio(
-            "paired_p95_degradation_pct: baseline (a) p95 is zero",
-        ));
-    }
-    let pct = p95_delta_secs / baseline_p95.as_secs_f64() * 100.0;
-    if !pct.is_finite() {
-        return Err(BenchError::DegenerateRatio(
-            "paired_p95_degradation_pct: computed pct is not finite",
-        ));
-    }
-    Ok(pct)
-}
-
 /// 劣化率（%）の中央値が上限（`max_pct`）以内かを判定する（TASK-130・CORE-7・
 /// Issue #302）。[`check_degradation_within_limit`] の単一試行版に対応する
-/// 複数試行版で、`batch_bench.rs::run_core7_gate` の 5 試行フローから使う
-/// （試行内の統計量には [`p95_degradation_pct`] を使い、本関数はその複数試行の
-/// 結果〔試行ごとの p95〕を束ねる試行間中央値の判定に用いる）。
+/// 複数試行版で、`batch_bench.rs::run_core7_gate` の複数試行フローから使う
+/// （試行内の統計量には [`degradation_pct`]`(p95_from_samples(a),
+/// p95_from_samples(b))` を使い、本関数はその複数試行の結果〔試行ごとの
+/// 劣化率〕を束ねる試行間中央値の判定に用いる。ペア化差分方式からの経緯は
+/// `batch_bench.rs::run_core7_gate` のコメント・`docs/design/
+/// core7-dynamic-window-gate.md` 参照）。
 ///
 /// `max_pct` の妥当性検証は [`check_degradation_within_limit`] と同一
 /// （有限・非負のみ許容。fail-closed）。
