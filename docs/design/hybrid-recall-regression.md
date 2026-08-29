@@ -372,11 +372,49 @@ pass/fail と組み合わせて層 A の実測値から閾値の上下界を逆�
 （「出力方針（Issue #303）」節）を、根本の固定値を消すことで塞いだ。
 
 回帰検知力は固定値方式（数値そのものの変化を検知）より弱くなる（関係が保たれる
-範囲の変化は検知できない）。これは弱体化ではなく設計変更であり、回帰検知力の
-低下分は層 B が引き続き担う。同種の対応を `crates/engine/tests/rerank_recall.rs`・
-`crates/engine/tests/cjk_tokenizer_impact.rs`・対応する ADR
-（`docs/design/rerank-recall-regression.md`・`docs/design/
+範囲の変化は検知できない）。これは弱体化ではなく設計変更であり、同種の対応を
+`crates/engine/tests/rerank_recall.rs`・`crates/engine/tests/cjk_tokenizer_impact.rs`・
+対応する ADR（`docs/design/rerank-recall-regression.md`・`docs/design/
 cjk-tokenizer-impact-ja-corpus.md`）にも適用した。
+
+層 B（`recall-gate` の非公開閾値ゲート）は `workflow_dispatch`/`schedule` のみで
+PR の通常 CI では評価されないため（上記「strict モードによる誤 green 防止」節）、
+「回帰検知力の低下分は層 B が補う」という説明は PR マージ判定の実態と整合しない
+（codex-review P1 指摘。前節「ミスマッチ制御（chance level）比較」で先に対応
+済みの指摘と同根）。PR のマージ判定を実際に担うのは層 A のみであり、層 A 自身が
+持つ検知力が PR 時点の唯一の防御線である
+
+## PR #319: クエリ単位カバレッジ・層 A 検知力のミューテーション証明
+
+上記のミスマッチ制御（chance level）比較は「合計 hit 数が偶然一致水準まで
+崩壊していないか」を見る集計指標であり、「一部クエリが hit 数を稼ぎ、残りの
+大半のクエリは正解を 1 件も拾えていない」という部分的な劣化は素通りしうる
+（`cjk_tokenizer_impact.rs` は変種 A・B について `queries_hit20 == qa.len()`
+というクエリ単位カバレッジを Issue #312 の時点で既に備えていたが、
+`hybrid_recall.rs`・`rerank_recall.rs` には無かった）。PR #319 codex-review
+P1 指摘を受け、`hybrid_recall.rs` の小規模段・大規模段の両方へ
+`RecallResult::queries_hit20`（上位 20 件から正解を 1 件も拾えなかった
+クエリを除いた件数）を追加し、`qa.len()` に対する最低割合
+（`MIN_QUERY_COVERAGE_PERCENT`。`CONTROL_FACTOR` と同じくテストハーネス
+自身の設計値であり spec 由来の非公開数値ではない）を下回らないことを
+アサートする。大規模段は疎・密チャネルの非完全な観測により少数クエリが
+構造的に 0 hit となり得るため、実測値に対して十分な余裕を持たせた閾値と
+した（小規模段は決定的コーパスに対して全クエリが hit する実測が安定して
+いたため、より厳格な余裕を確保している）。
+
+さらに、これらの関係アサーション（chance level 比較・クエリ単位カバレッジ）
+が実際に劣化を検知できることを示すミューテーションテストを
+`hybrid_recall_small_scale_regression_detects_query_answer_mismatch`
+として追加した。各クエリに割り当てるクエリテキスト・クエリベクトルを
+1 つずらして正解集合との対応を崩し（「検索が真の関連度と無関係な結果を
+返すようになった」という重大な回帰を production の検索 API 経由で再現する）、
+この状態で本体テストと同じ関係アサーションが実際に失敗することを確認する。
+同型のミューテーションテストを `rerank_recall.rs`・`cjk_tokenizer_impact.rs`
+にも追加した。数値リテラルを持ち込まずに層 A のゲートが vacuous pass に
+なっていないことを回帰保証する狙いであり、緩やかな劣化（chance level を
+明確に上回るが以前より悪化した状態）を必ず検知することまでは保証しない
+点は限界として残る——その領域の検知は引き続き層 B（`recall-gate`）が main
+ブランチ上で担う。
 
 ## 既知の制約・スコープ外
 

@@ -118,12 +118,12 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
   下回らない」独立アサーション。定性的な効果があること自体は本節で確認するが、
   改善幅そのものの下限判定は層 B `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う）
 - **非空**（vacuous pass 防止）: `baseline_hits20 > 0`
-- **ミスマッチ制御（chance level）比較**: `baseline_hits20 > control_baseline_hits20
-  * CONTROL_FACTOR` かつ `after_hits20 > control_after_hits20 * CONTROL_FACTOR`。
+- **ミスマッチ制御（chance level）比較**: `baseline_hits20 > control_baseline_hits20 * CONTROL_FACTOR`
+  かつ `after_hits20 > control_after_hits20 * CONTROL_FACTOR`。
   `control_baseline_hits20`/`control_after_hits20` は各クエリの baseline/after
   出力を「1 つずらした別クエリの正解集合」に対しても採点した hit 数の合計で、
-  `measure_rerank_recall` が同一ランで実測する対照値（`hybrid_recall.rs` の
-  同型対照値と設計を揃える）。層 B（`RERANK_RECALL_MIN_R20_IMPROVEMENT` 等）は
+  `measure_rerank_recall` が同一ランで実測する対照値（`hybrid_recall.rs` の同型対照値と設計を揃える）。
+  層 B（`RERANK_RECALL_MIN_R20_IMPROVEMENT` 等）は
   `workflow_dispatch`/`schedule` のみで PR の通常 CI では評価されないため、
   「非空」だけでは Recall が chance level 近くまで崩壊しても 1 hit で通過して
   しまう懸念があった（codex-review P1 指摘・Issue #312 フォローアップ）。この
@@ -147,7 +147,17 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 `docs/design/hybrid-recall-regression.md`「Issue #312」節と同一方針・同一
 理由で、本ファイルの「実測結果」節（hit 数・理論上限・改善量の実測表）を
 削除し、`crates/engine/tests/rerank_recall.rs` の層 A 固定値アサーションを
-関係アサーションへ置換した。回帰検知力の低下分は層 B が引き続き担う。
+関係アサーションへ置換した。
+
+## PR #319: 層 A 検知力のミューテーション証明
+
+`docs/design/hybrid-recall-regression.md`「PR #319」節と同一方針で、層 A
+の chance level 比較（`baseline_hits20 > control_baseline_hits20 *
+CONTROL_FACTOR` 等）が実際に劣化を検知できることを示すミューテーション
+テスト（`rerank_recall_regression_detects_query_answer_mismatch`）を追加した。
+クエリ・正解の対応を崩した状態で本体テストと同じ関係アサーションが実際に
+失敗することを確認する。詳細・限界（緩やかな劣化までは保証しない点）は
+リンク先の節を参照。
 
 ## 既知の制約・スコープ外
 

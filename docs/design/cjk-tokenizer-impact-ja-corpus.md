@@ -86,8 +86,8 @@ hit 数（micro-average）として測定した。
   から正解を 1 件も拾えなかったクエリが 0 件であること。合計 hit 数だけでは
   「特定の 1 クエリが hit を稼ぎ、残り全クエリが 0 件」でも通過してしまう
   ため追加。codex-review P1 対応）
-- **変種 A・B のミスマッチ制御（chance level）比較**: `hits20 > control_hits20
-  * CONTROL_FACTOR`（実際の hit 数が、1 つずらした別クエリの正解集合に対する
+- **変種 A・B のミスマッチ制御（chance level）比較**: `hits20 > control_hits20 * CONTROL_FACTOR`
+  （実際の hit 数が、1 つずらした別クエリの正解集合に対する
   偶然一致水準を一定倍率上回ることを同一ランで実測して確認する。Recall が
   chance level 近くまで崩壊した場合に検知する。`CONTROL_FACTOR` はテスト
   ハーネス自身の設計値であり spec 由来の非公開数値ではない。codex-review P1
@@ -146,6 +146,15 @@ hit 数（micro-average）として測定した。
 フォローアップ）。フィクスチャ規模の固定値検査・クエリ単位カバレッジ・
 ミスマッチ制御（chance level）比較を追加し、非公開の絶対値を使わずに検知力を
 補強した（詳細は「測定方法と層 A が検証する関係」節参照）。
+
+## PR #319: 層 A 検知力のミューテーション証明
+
+`docs/design/hybrid-recall-regression.md`「PR #319」節と同一方針で、上記の
+chance level 比較・クエリ単位カバレッジが実際に劣化を検知できることを示す
+ミューテーションテスト（`cjk_tokenizer_impact_on_ja_corpus_detects_query_
+answer_mismatch`）を追加した。除去 ON 変種について、クエリ・正解の対応を
+崩した状態で本体テストと同じ chance level 比較が実際に失敗することを確認
+する。詳細・限界はリンク先の節を参照。
 
 ## 制約・スコープ外
 
