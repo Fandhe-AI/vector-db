@@ -151,7 +151,10 @@ jobs:
         # Actions ログへ出す opt-in のため本 workflow の env へは意図的に追加
         # しない（テスト側も `GITHUB_ACTIONS` 下では拒否する二重化。実測値が
         # 必要な場合は `RECALL_VERBOSE=1 make recall-regression` をローカルで
-        # 直接実行する）。
+        # 直接実行する）。大規模段（`HYBRID_RECALL_MIN_R20_LARGE`/
+        # `HYBRID_RECALL_MIN_R100_LARGE`）は決定的スタブ `LlmClient` によるクエリ
+        # 展開ありの経路で測定する（Issue #306。SEARCH-2 の測定前提に整合。
+        # `docs/design/hybrid-recall-regression.md` 参照）。
         env:
           HYBRID_RECALL_REQUIRE_THRESHOLDS: "1"
           HYBRID_RECALL_MIN_R20_SMALL: ${{ secrets.HYBRID_RECALL_MIN_R20_SMALL }}
