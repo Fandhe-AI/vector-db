@@ -280,9 +280,13 @@ ranking）を層 A の固定値（下記「実測結果」）で比較し、`Gro
 `k1`/`b` の変更は不採用（既定値からの変更は一般性に乏しい）。密プール境界の
 同点グループ完全化は、`pool_depth` を跨ぐ同点グループが id 依存の切り詰めで
 一部だけ取り込まれる問題を、決定的（完全に含めるか完全に除外するかの二択。
-2 度目の provider 呼び出しはしない）に解消する。疎チャネル（BM25 スコアは連続値で
-同点が実質発生しない）・`rerank.rs` の RRF 型融合への `TieRank` 適用は本 Issue の
-対象外（フォローアップ候補）。
+2 度目の provider 呼び出しはしない）に解消する。当初は疎チャネル（BM25 スコアは
+連続値のため同点が実質発生しない）を対象外としていたが、codex-review 指摘
+（PR #320）により同一語頻度・同一文書長の文書は同一スコアになりうると判明した
+ため、密側と同じ `complete_boundary_tie_group`（汎用化した
+`complete_boundary_tie_group_by`）を疎側（`search_within` の拡張取得結果）にも
+適用する形へ改めた（`crates/engine/src/hybrid.rs`）。`rerank.rs` の RRF 型融合への
+`TieRank` 適用は引き続き本 Issue の対象外（フォローアップ候補）。
 
 **フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
 `VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも

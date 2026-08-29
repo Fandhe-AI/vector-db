@@ -1183,19 +1183,43 @@ pub fn hybrid_search_boosted(
     // 可視文書の順位へ影響する」という 2 つの経路でテナント境界を弱めてしまう
     // （後段フィルタでは統計計算・候補選出そのものへの影響を防げない。Issue #36
     // codex-review P0 指摘対応）。`search_within` は統計・Top-k 選出の両方を
-    // `visible_ids` へ縮約した上で計算するため、この 2 経路をともに断つ。疎側は
-    // BM25 スコア（連続値）で同点が実質発生しないため境界完全化の対象外
-    // （Issue #310・`docs/design/rrf-tie-break-determinism.md`「不変条件」参照）。
+    // `visible_ids` へ縮約した上で計算するため、この 2 経路をともに断つ。
+    //
+    // 境界の同点グループ完全化（Issue #310 codex-review P1 指摘対応。当初「BM25 は
+    // 連続値なので同点が実質発生しない」としていたが誤り: 同一語頻度・同一文書長の
+    // 文書は同一スコアになりうるため、`search_within` が内部で `pool_depth` 件へ
+    // 切り詰めた後に `TieRank::GroupEnd` を適用するだけでは境界の同点グループが
+    // `SparseIndex` 内部の doc_id 昇順タイブレークで分断され、密側と同型の id 依存
+    // バイアスが残る）。密側と同じ `fetch_k`（多めに取得）で `search_within` を呼び、
+    // [`complete_boundary_tie_group`] で境界の同点グループを完全化するか丸ごと
+    // 除外するかを決定的に判定してから `rrf_fuse_with_limits` へ渡す。
     let sparse_hits: Vec<ScoredDoc> =
-        sparse_index.search_within(query_text, cfg.pool_depth(), &visible_ids)?;
+        sparse_index.search_within(query_text, fetch_k, &visible_ids)?;
+    // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
+    // 拡張取得列が `fetch_k` を超えていないかを [`complete_boundary_tie_group`] の
+    // 前に検証する。`search_within` は自作の内部関数であり `provider` のような
+    // trait object 契約違反の余地は薄いが、fail-closed の防御を密側と揃える。
+    if sparse_hits.len() > fetch_k {
+        return Err(HybridError::TooManyCandidates {
+            len: sparse_hits.len(),
+            max: fetch_k,
+        });
+    }
+    // `sparse_hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の
+    // 末尾がそのまま真の終端であると確定できる）かどうか。`dense_exhaustive` と同じ
+    // 判定基準（[`hybrid_search_boosted`] 本文の該当コメント参照）。
+    let sparse_exhaustive = fetch_k >= visible_ids.len() || sparse_hits.len() < fetch_k;
+    let sparse_hits =
+        complete_boundary_tie_group_by(sparse_hits, cfg.pool_depth(), sparse_exhaustive, |d| {
+            d.score
+        });
+    // `sparse_limit` も `dense_limit` と同じ理由で `fetch_k` を使う（完全化後の
+    // `sparse_hits.len()` 自体を上限にすると `rrf_fuse_with_limits` の長さ検証が
+    // 常に無条件で通過する「死んだガード」になるため避ける）。
+    let sparse_limit = fetch_k;
 
-    let mut fused = rrf_fuse_with_limits(
-        &dense_hits,
-        dense_limit,
-        &sparse_hits,
-        cfg.pool_depth(),
-        cfg,
-    )?;
+    let mut fused =
+        rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
     // `truncate(k)` の前にブーストを適用する（本関数ドキュメント参照。切り詰め後だと
     // 圏外候補が浮上できず EXT-4/PLAN-1 の効果が失われる）。
     apply_soft_boost(&mut fused, rules, cfg)?;
@@ -1204,26 +1228,32 @@ pub fn hybrid_search_boosted(
 }
 
 /// 密検索プールを [`RrfConfig::pool_depth`] の境界で「同点グループの途中で切らない」
-/// よう完全化する（Issue #310。[`hybrid_search_boosted`] からのみ呼ばれる純粋関数）。
+/// よう完全化する（Issue #310。[`hybrid_search_boosted`] からのみ呼ばれる純粋関数。
+/// 疎側は [`complete_boundary_tie_group_by`] を直接呼ぶ）。
 ///
 /// `dense`（provider 契約どおりスコア降順・同点 id 昇順にソート済みである前提。
 /// この前提自体は呼び出し元の後段 [`rrf_fuse_with_limits`] が独立に検証する）に対し:
-/// - `dense.len() <= pool_depth` なら境界に達していないためそのまま返す。
-/// - 先頭 `pool_depth` 件の末尾スコアと `pool_depth` 番目（0-based で `pool_depth`）の
+/// - `dense.len() < pool_depth` なら呼び出し元の `fetch_k` 未満しか返っていない
+///   （＝呼び出し元の `*_exhaustive` 算出により必ず exhaustive）ためそのまま返す。
+/// - `dense.len() == pool_depth` は 2 通りありうる。`exhaustive` ならそのまま返す。
+///   非 `exhaustive`（＝呼び出し元が `fetch_k` を [`MAX_POOL_DEPTH`] で頭打ちにされ
+///   `pool_depth` を超える拡張取得ができなかった。Issue #310 codex-review P1 指摘
+///   対応）の場合、境界の末尾要素が未取得候補と同点かどうか比較対象なしに判定でき
+///   ないため、安全側（id 非依存）に倒し末尾の同点グループを丸ごと除外する。
+/// - `dense.len() > pool_depth`（`fetch_k > pool_depth` で拡張取得できた通常経路）は
+///   先頭 `pool_depth` 件の末尾スコアと `pool_depth` 番目（0-based で `pool_depth`）の
 ///   スコアが異なれば、境界は同点グループを切っていないため `pool_depth` 件へ
-///   切り詰める（従来と同じ挙動）。
-/// - 一致する場合は境界のグループが `pool_depth` を跨いでいる。そのグループと同点の
-///   要素を末尾まで走査し、グループの終端が取得済み範囲内で確定できればグループ全体
-///   を含めて返す。取得済み範囲の最後の要素までが同点でグループ終端が確定できず、
-///   かつ `exhaustive`（`false`。取得済み範囲を超えてなお可視集合にデータが残り
-///   うる）の場合は、`fetch_k` を増やして再取得する（2 度目の provider 呼び出し）
-///   代わりに決定的・id 非依存な安全側の選択としてそのグループを丸ごと除外し、
-///   `pool_depth` 未満の列を返す（境界より内側の要素はすべて保持するため探索対象を
-///   狭めるだけで可視性検証は弱めない）。
+///   切り詰める（従来と同じ挙動）。一致する場合は境界のグループが `pool_depth` を
+///   跨いでいる。そのグループと同点の要素を末尾まで走査し、グループの終端が取得
+///   済み範囲内で確定できればグループ全体を含めて返す。取得済み範囲の最後の要素
+///   までが同点でグループ終端が確定できず、かつ非 `exhaustive`（取得済み範囲を
+///   超えてなお可視集合にデータが残りうる）の場合は、決定的・id 非依存な安全側の
+///   選択としてそのグループを丸ごと除外し `pool_depth` 未満の列を返す（境界より
+///   内側の要素はすべて保持するため探索対象を狭めるだけで可視性検証は弱めない）。
 ///
-/// `exhaustive`（呼び出し元 [`hybrid_search_boosted`] が算出）が `true`（取得した
-/// `dense` が可視集合内で存在しうる密ヒットを全件含む。`fetch_k` が可視 id 総数以上、
-/// または provider が `fetch_k` 未満しか返さなかった場合）の場合は、取得済み範囲の
+/// `exhaustive`（呼び出し元が算出）が `true`（取得した `dense` が可視集合内で
+/// 存在しうるヒットを全件含む。`fetch_k` が可視 id 総数以上、または provider/
+/// インデックスが `fetch_k` 未満しか返さなかった場合）の場合は、取得済み範囲の
 /// 最後まで同点が続いていてもそれが真の終端（それ以上の要素は存在しない）であると
 /// 確定できるため除外せずグループ全体を含める。この区別がないと、`fetch_k` が
 /// たまたま可視集合サイズと一致した場合に常に安全側の除外へ倒れ、確定できるはずの
@@ -1233,13 +1263,69 @@ fn complete_boundary_tie_group(
     pool_depth: usize,
     exhaustive: bool,
 ) -> Vec<CandidateHit> {
-    if dense.len() <= pool_depth {
+    complete_boundary_tie_group_by(dense, pool_depth, exhaustive, |hit| f64::from(hit.score))
+}
+
+/// [`complete_boundary_tie_group`] の汎用実装（`pub(crate)`）。密側（[`CandidateHit`]・
+/// `score: f32`）・疎側（[`crate::sparse::ScoredDoc`]・`score: f64`）いずれの型からも
+/// `score_of` で `f64` スコアを取り出せるようにし、境界完全化ロジック自体は 1 箇所に
+/// 集約する（Issue #310 codex-review P1 指摘対応: 疎側も密側と同じ境界完全化が必要な
+/// ため、型ごとの実装の重複・乖離を避ける）。
+///
+/// `items` は呼び出し元契約（スコア降順・同点 id 昇順）に従っている前提だが、その
+/// 前提自体は呼び出し元の後段 [`rrf_fuse_with_limits`] が独立に検証する。
+///
+/// `dense.len() == pool_depth` かつ `!exhaustive`（＝呼び出し元が `fetch_k`（多めの
+/// 取得件数）を [`MAX_POOL_DEPTH`] で頭打ちにされ、`pool_depth` を超える拡張取得が
+/// できなかったケース。`hybrid_search_boosted` 参照）の場合、境界（末尾要素）が
+/// 可視集合内の未取得候補と同点かどうかを比較対象なしに判定できない。この場合も
+/// `dense.len() > pool_depth` の場合と同じ「確定できなければ安全側（id 非依存）で
+/// 末尾の同点グループを丸ごと除外する」規約に従う（2 回目の
+/// `MAX_POOL_DEPTH` 頭打ちで検出漏れになっていた codex-review P1 指摘対応）。
+pub(crate) fn complete_boundary_tie_group_by<T>(
+    dense: Vec<T>,
+    pool_depth: usize,
+    exhaustive: bool,
+    score_of: impl Fn(&T) -> f64,
+) -> Vec<T> {
+    if pool_depth == 0 {
         return dense;
+    }
+    if dense.len() < pool_depth {
+        // 取得件数が `pool_depth` 未満: 呼び出し元の `fetch_k`（`>= pool_depth`）
+        // 自体に満たない件数しか返っていない = 呼び出し元の `*_exhaustive` 算出
+        // （`items.len() < fetch_k` 条件）により必ず `exhaustive == true` になる
+        // 契約のため、境界そのものが存在せずそのまま返してよい。
+        return dense;
+    }
+    if dense.len() == pool_depth {
+        // ちょうど `pool_depth` 件: 通常経路（`fetch_k > pool_depth`）で provider/
+        // インデックスが `fetch_k` 未満しか返せなければ `exhaustive == true` になる
+        // 契約のため、ここへ来るのは `exhaustive == true`（真に全件）か、`fetch_k`
+        // が `MAX_POOL_DEPTH` で頭打ちになり `fetch_k == pool_depth` となって拡張
+        // 取得ができなかった場合のいずれか。前者はそのまま返してよいが、後者は
+        // 境界の末尾要素が可視集合内の未取得候補と同点かどうかを比較対象なしに
+        // 判定できないため、安全側（id 非依存）に倒し、末尾の同点グループ
+        // （取得済み範囲から後方へ辿れる分）を丸ごと除外する。
+        if exhaustive {
+            return dense;
+        }
+        let boundary_score = score_of(&dense[pool_depth - 1]);
+        let mut group_start = pool_depth - 1;
+        while group_start > 0
+            && score_of(&dense[group_start - 1]).total_cmp(&boundary_score)
+                == std::cmp::Ordering::Equal
+        {
+            group_start -= 1;
+        }
+        let mut result = dense;
+        result.truncate(group_start);
+        return result;
     }
     // `pool_depth >= 1`（`RrfConfig::new`/`Default` が保証）のため `pool_depth - 1` は
     // 常に有効な添字。
-    let boundary_score = dense[pool_depth - 1].score;
-    let next_score = dense[pool_depth].score;
+    let boundary_score = score_of(&dense[pool_depth - 1]);
+    let next_score = score_of(&dense[pool_depth]);
     if boundary_score.total_cmp(&next_score) != std::cmp::Ordering::Equal {
         let mut truncated = dense;
         truncated.truncate(pool_depth);
@@ -1250,14 +1336,14 @@ fn complete_boundary_tie_group(
     // する）。
     let mut group_start = pool_depth - 1;
     while group_start > 0
-        && dense[group_start - 1].score.total_cmp(&boundary_score) == std::cmp::Ordering::Equal
+        && score_of(&dense[group_start - 1]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
     {
         group_start -= 1;
     }
     // グループの終端を取得済み範囲内で探す。
     let mut group_end = pool_depth;
     while group_end < dense.len()
-        && dense[group_end].score.total_cmp(&boundary_score) == std::cmp::Ordering::Equal
+        && score_of(&dense[group_end]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
     {
         group_end += 1;
     }
@@ -2512,6 +2598,94 @@ mod tests {
         let out_b = complete_boundary_tie_group(dense_b, 2, false);
         assert_eq!(out_a.len(), 3);
         assert_eq!(out_b.len(), 3);
+    }
+
+    #[test]
+    fn complete_boundary_tie_group_by_supports_f64_scored_doc_type() {
+        // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAw）対応:
+        // `complete_boundary_tie_group`（`CandidateHit`・`score: f32` 専用）を
+        // 汎用化した `complete_boundary_tie_group_by` が、疎側 `ScoredDoc`
+        // （`score: f64`）でも同じ完全化ロジックを適用できることを固定する。
+        let docs = vec![doc(1, 2.0), doc(2, 2.0), doc(3, 2.0), doc(4, 1.0)];
+        let out = complete_boundary_tie_group_by(docs, 2, false, |d| d.score);
+        assert_eq!(out, vec![doc(1, 2.0), doc(2, 2.0), doc(3, 2.0)]);
+    }
+
+    #[test]
+    fn complete_boundary_tie_group_excludes_tail_when_fetch_capped_at_pool_depth_and_not_exhaustive(
+    ) {
+        // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAt）の回帰
+        // 固定: `hybrid_search_boosted` の `fetch_k` は `pool_depth * 2` を
+        // `MAX_POOL_DEPTH` で頭打ちにするため、`pool_depth` 自体が
+        // `MAX_POOL_DEPTH` の場合（本テストでは境界処理だけを直接検証するため
+        // `pool_depth == dense.len()` で模擬する）`fetch_k == pool_depth` となり
+        // 拡張取得ができない。この場合 `dense.len() == pool_depth` の早期 return が
+        // `exhaustive` を無視すると、境界（末尾要素）が未取得候補と同点かどうか
+        // 判定できないまま部分グループを受理してしまう（修正前の挙動）。修正後は
+        // `exhaustive == false` の場合、末尾の同点グループを丸ごと除外する。
+        let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)];
+        let out = complete_boundary_tie_group(dense, 3, false);
+        assert!(
+            out.is_empty(),
+            "拡張取得できず境界の同点を確定できない場合は安全側で丸ごと除外する"
+        );
+    }
+
+    #[test]
+    fn complete_boundary_tie_group_keeps_tail_when_fetch_capped_at_pool_depth_but_exhaustive() {
+        // 上記テストと対になるケース: `dense.len() == pool_depth` でも
+        // `exhaustive == true`（取得済み範囲がそのまま真の終端だと確定できる）なら
+        // 末尾の同点グループを除外せずそのまま返す。
+        let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)];
+        let out = complete_boundary_tie_group(dense.clone(), 3, true);
+        assert_eq!(out, dense);
+    }
+
+    #[test]
+    fn hybrid_search_boosted_sparse_tie_group_across_pool_boundary_is_id_independent() {
+        // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAw）の回帰
+        // 固定: 疎チャネル（BM25）も密チャネルと同様に境界の同点グループを完全化
+        // する。6 件すべてが同一テキスト（BM25 同点）・同一密ベクトル（内積同点）
+        // のコーパスに対し `pool_depth=2` で検索すると、`fetch_k`（`min(2*2, 6)=4`）
+        // は可視 6 件に満たず非 exhaustive のため、密・疎いずれの同点グループも
+        // 境界を確定できず丸ごと除外される。修正前は疎側が `search_within` 内部の
+        // doc_id 昇順タイブレークで id 依存に 2 件だけ生き残っていた。id の割り当てを
+        // 入れ替えても結果（空集合）が変わらないことを確認する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
+        let vectors: Vec<f32> = vec![1.0; 6];
+        let query = [1.0f32];
+
+        let ids_a: Vec<u64> = vec![1, 2, 3, 4, 5, 6];
+        let docs_a: Vec<(u64, &str)> = ids_a.iter().map(|&id| (id, "cat")).collect();
+        let index_a = SparseIndex::build(&docs_a).expect("build ok");
+        let input_a = SearchInput {
+            ids: &ids_a,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 2,
+        };
+        let out_a = hybrid_search(&CpuScalarProvider, input_a, &index_a, "cat", 2, &cfg)
+            .expect("search ok");
+
+        let ids_b: Vec<u64> = vec![101, 202, 303, 404, 505, 606];
+        let docs_b: Vec<(u64, &str)> = ids_b.iter().map(|&id| (id, "cat")).collect();
+        let index_b = SparseIndex::build(&docs_b).expect("build ok");
+        let input_b = SearchInput {
+            ids: &ids_b,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 2,
+        };
+        let out_b = hybrid_search(&CpuScalarProvider, input_b, &index_b, "cat", 2, &cfg)
+            .expect("search ok");
+
+        assert_eq!(out_a.len(), out_b.len());
+        assert!(
+            out_a.is_empty(),
+            "境界の同点グループを確定できないため両チャネルとも丸ごと除外され空になる"
+        );
     }
 
     #[test]
