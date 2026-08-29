@@ -45,27 +45,36 @@
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
 //!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
 //!
-//! クエリ展開の結線（Issue #306）: 大規模段の層 B
-//! （[`hybrid_recall_large_scale_threshold_gate`]）は TASK-110〜113
+//! クエリ展開の結線（Issue #306。codex-review P1 対応は PR #308）: 大規模段の
+//! 層 B（[`hybrid_recall_large_scale_threshold_gate`]）は TASK-110〜113
 //! （`crates/engine/tests/query_planning_recall.rs`）で確立した決定的スタブ
 //! `LlmClient`（[`MockLlmClient`]。`query_planning_recall.rs::MockLlmClient` と
 //! 同一実装。`tests/` 直下は独立 test crate で共有モジュールを持たないためこの
 //! ファイルへ複製する）による展開ありの経路（[`QuerySource::Expanded`]・
 //! [`measure_recall_with`]）で Recall@20・Recall@100 を測定し、spec の SEARCH-2
 //! （クエリ展開ありを前提とするビヘイビア）の測定前提に揃える。QA セットは
-//! `direct` カテゴリ（コーパス語彙 `kw_XXXX` に一致するクエリ）のままで、
-//! `MockLlmClient` は `kw_` 形式の語を無変換で通すため、展開ありの実測値は
-//! 展開なしと構造的に一致する（[`hybrid_recall_large_scale_regression`] の
-//! パススルー等式アサーション参照。`docs/design/hybrid-recall-regression.md`
+//! `direct` カテゴリ（コーパス語彙 `kw_XXXX` に一致するクエリ）から生成するが、
+//! そのまま展開経路へ渡すと `MockLlmClient` は `kw_` 形式の語を無変換で通すため
+//! 展開ありの実測値が展開なしと構造的に一致してしまい、production の展開結線が
+//! 欠落・破損してもゲートが通過してしまう（PR #308 codex-review P1 指摘）。
+//! [`to_intent_query`] でクエリテキストのみを `intent` 形（`syn_XXXX` 形式。
+//! コーパス語彙とは一致しない）へ書き換えたうえで展開経路に通すことで、
+//! `MockLlmClient` の同義語写像（展開結果を検索入力へ反映する経路）を経由して
+//! 初めて Recall が出る非恒等なゲートにする（正解集合は変更しないため既存の
+//! 閾値の較正・意味は変わらない）。層 A（[`hybrid_recall_large_scale_regression`]）
+//! は従来どおり `direct` 形クエリのままの展開あり経路とのパススルー等式を
+//! 検証し続ける（`docs/design/hybrid-recall-regression.md`
 //! 「クエリ展開の結線（Issue #306）」節も参照）。小規模段の層 B・層 A の主測定は
 //! 引き続き展開なし（[`QuerySource::Baseline`]）で行う。
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 合成コーパスによる暫定測定であり、実コーパスでの評価は未了
 //!   （`docs/design/hybrid-recall-regression.md` 参照。`cjk_tokenizer_impact.rs` と同種の制約）
-//! - `intent` カテゴリ（言い換え語彙のみのクエリ）での大規模測定は TASK-113
-//!   （PLAN-3）と同様に本ハーネスのスコープ外（フォローアップ候補。Issue 起票は
-//!   ユーザー判断待ち）
+//! - 大規模段層 B の展開結線検証は [`to_intent_query`] による疑似 `intent` 形
+//!   クエリ（`syn_XXXX`。QA の正解集合・fixture 自体は `direct` カテゴリ由来）で
+//!   行っており、TASK-113（PLAN-3）が定義する `intent` カテゴリ（言い換え語彙の
+//!   QA セット）自体の大規模測定はこのハーネスのスコープ外のまま
+//!   （フォローアップ候補。Issue 起票はユーザー判断待ち）
 
 use engine::hybrid::{hybrid_search, RrfConfig};
 use engine::kernel::SearchInput;
@@ -129,11 +138,21 @@ fn parse_topic_index(token: &str) -> Option<usize> {
 
 /// [`synonym_token`] 形式（`syn_XXXX`）の逆写像。プレフィックス不一致・非数値は
 /// `None`（想定外の語は写像しない = そのまま通す。[`MockLlmClient::complete`]
-/// 参照）。本ファイルの QA セットは `direct` カテゴリ（`kw_XXXX`）のみのため
-/// `syn_` 語は実際には現れないが、`query_planning_recall.rs::parse_synonym_index`
-/// と同一実装を複製し `MockLlmClient` を同一契約に保つ。
+/// 参照）。`query_planning_recall.rs::parse_synonym_index` と同一実装を複製し
+/// `MockLlmClient` を同一契約に保つ。[`hybrid_recall_large_scale_threshold_gate`]
+/// が [`to_intent_query`] で構成する `syn_XXXX` 形クエリの展開時にも使われる
+/// （Issue #306 codex-review P1 対応・PR #308）。
 fn parse_synonym_index(token: &str) -> Option<usize> {
     token.strip_prefix("syn_")?.parse().ok()
+}
+
+/// トピック `idx` に対応する「言い換え語彙」トークン（[`topic_token`] の同義語版。
+/// コーパス語彙とは重ならない形式）。`query_planning_recall.rs::synonym_token` と
+/// 同一実装を複製する。[`to_intent_query`] が `direct` カテゴリの QA クエリ
+/// （`kw_XXXX` 形式）を `intent` 形（`syn_XXXX` 形式）へ書き換える際に使う
+/// （Issue #306 codex-review P1 対応・PR #308）。
+fn synonym_token(idx: usize) -> String {
+    format!("syn_{idx:04}")
 }
 
 /// 文脈語プール（内容語の間に挟む機能語。BM25 の相対比較には影響しない飾り）。
@@ -477,6 +496,39 @@ fn expand_and_reconstruct_with(
         .filter_map(|t| parse_topic_index(t));
     let vector = one_hot_sum(vocab_size, indices);
     (text, vector)
+}
+
+/// `direct` カテゴリの QA ケース（`query_text` が `kw_XXXX kw_XXXX` 形式）を
+/// `intent` 形（`syn_XXXX syn_XXXX` 形式）へ書き換える（Issue #306 codex-review
+/// P1 対応・PR #308）。`kw_XXXX` のまま [`expand_and_reconstruct_with`] へ渡すと
+/// [`MockLlmClient`] は `parse_synonym_index` が `kw_` 接頭辞を認識せず無変換で
+/// 通すため、展開経路が実際に検索結果へ寄与しているかをゲートが検出できない
+/// （`direct` のまま展開しても展開なしと構造的に同じ検索が行われてしまう）。
+/// `syn_XXXX` はコーパス語彙（`kw_XXXX`）と一致しないため、[`MockLlmClient`] の
+/// 同義語写像（`query_planning_recall.rs::intent_baseline` と同型の構成）を経由
+/// して初めて検索が成立する——production の展開結線（`query_planner::
+/// render_full_prompt`/`parse_expansion` の呼び出し・展開結果の検索入力への反映）が
+/// 欠落・破損すれば `syn_XXXX` はコーパスのどの文書ともマッチせず Recall が崩壊する
+/// ため、このゲートは非恒等な検証になる。正解集合（`correct`）は `kw_XXXX` の
+/// トピックインデックスから独立に決まるため変更しない。
+fn to_intent_query(qa: &QaCase) -> QaCase {
+    let intent_text = qa
+        .query_text
+        .split_whitespace()
+        .map(|token| match parse_topic_index(token) {
+            Some(idx) => synonym_token(idx),
+            None => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    QaCase {
+        query_text: intent_text,
+        // Expanded 経路（[`measure_recall_against`]）は `query_vector` を参照せず
+        // 展開結果からベクトルを再構成するため、元のベクトルをそのまま引き継いで
+        // 構わない（フィールド整合目的のみ）。
+        query_vector: qa.query_vector.clone(),
+        correct: qa.correct.clone(),
+    }
 }
 
 /// [`measure_recall_with`] が測定するクエリ経路の選択（Issue #306。SEARCH-2 の
@@ -1011,9 +1063,27 @@ fn hybrid_recall_small_scale_threshold_gate() {
 /// Issue #306: 測定は展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]。
 /// TASK-110〜113 の決定的スタブ `LlmClient` による production のクエリ展開経路）で
 /// 行い、SEARCH-2 の測定前提（クエリ展開あり）に揃える。fixture パラメータ・
-/// 閾値・環境変数名・出力形式は変更しない。QA は `direct` カテゴリのみのため
-/// `MockLlmClient` は無変換で通り、実測値は展開なしと構造的に一致する
-/// （[`hybrid_recall_large_scale_regression`] のパススルー等式ガード参照）。
+/// 閾値・環境変数名・出力形式は変更しない。
+///
+/// codex-review P1 対応（PR #308）: QA を `direct` カテゴリのまま（`kw_XXXX` 形式）
+/// 展開経路へ渡すと `MockLlmClient` は無変換で通し、実測値が展開なしと構造的に
+/// 一致してしまう——production の query planner 結線・辞書コンテキストの適用・
+/// 展開結果の検索入力への反映のいずれが欠落・破損しても baseline と同じ Recall の
+/// ままこのゲートを通過してしまい、SEARCH-2（クエリ展開ありの測定条件）の検証と
+/// して機能しない。[`to_intent_query`] で `intent` 形（`syn_XXXX` 形式。コーパス
+/// 語彙とは一致しない）へ書き換えたクエリを使うことで、`MockLlmClient` の同義語
+/// 写像（展開結果を実際の検索入力へ反映する経路）を経由して初めて Recall が出る
+/// 非恒等なゲートにする（展開結線が壊れれば `syn_XXXX` はコーパスのどの文書とも
+/// マッチせず Recall が崩壊しゲートが失敗する）。正解集合・fixture パラメータ・
+/// 閾値は `direct` カテゴリのものをそのまま使う（[`to_intent_query`] は
+/// `query_text` のみを書き換え、`correct` は変更しない）ため、既存の
+/// `HYBRID_RECALL_MIN_R20_LARGE`/`HYBRID_RECALL_MIN_R100_LARGE` の較正・意味は
+/// 変わらない（`MockLlmClient` の同義語写像は `syn_XXXX` → `kw_XXXX` の完全な
+/// 1 対 1 対応のため、展開結線が壊れていなければ実測値は従来の `direct` 経路と
+/// 一致する）。小規模段の層 B・層 A の主測定は引き続き展開なし
+/// （[`QuerySource::Baseline`]）で行う。層 A のパススルー等式ガード
+/// （[`hybrid_recall_large_scale_regression`]）は `direct` 形クエリのままの
+/// 展開あり経路を検証対象とし続けるため無変更。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
@@ -1030,7 +1100,7 @@ fn hybrid_recall_large_scale_threshold_gate() {
 
     // 数値を含まない固定文言（実測値・閾値は含めない。spec-confidentiality P0）。
     println!(
-        "hybrid_recall_large_scale_threshold_gate: query expansion=enabled (deterministic stub LlmClient, Issue #306)"
+        "hybrid_recall_large_scale_threshold_gate: query expansion=enabled, non-identity intent-form queries (deterministic stub LlmClient, Issue #306 / PR #308)"
     );
 
     let (docs, qa) = generate_corpus(
@@ -1039,7 +1109,8 @@ fn hybrid_recall_large_scale_threshold_gate() {
         LARGE_NUM_QUERIES,
         LARGE_VOCAB_SIZE,
     );
-    let r = measure_recall_with(&docs, &qa, QuerySource::Expanded(&MockLlmClient));
+    let intent_qa: Vec<QaCase> = qa.iter().map(to_intent_query).collect();
+    let r = measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&MockLlmClient));
     let recall20 = r.recall20();
     let recall100 = r.recall100();
 
