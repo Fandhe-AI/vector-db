@@ -52,7 +52,7 @@
 //!   検索単体（クエリ展開なし）の測定に留める
 
 use engine::hybrid::{hybrid_search, RrfConfig};
-use engine::kernel::SearchInput;
+use engine::kernel::{SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::sparse::SparseIndex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,6 +433,55 @@ fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
     }
 }
 
+/// Issue #307（SEARCH-1）: 融合前の密チャネル単体・疎チャネル単体それぞれの
+/// Recall@20 を測定する（[`measure_recall`] と同じ production API 経由。密は
+/// [`SearchProvider::search`] の Top-20 をそのまま、疎は
+/// [`SparseIndex::search_within`] の Top-20 をそのまま正解判定に使う。RRF 融合
+/// （[`hybrid_search`]）は経由しない）。「融合がどちらのチャネル単体も下回らない
+/// （SEARCH-3 相当）」ことを固定値の比較として層 A に残す目的の測定であり、
+/// 一般不変条件（`assert!(fused >= max(dense, sparse))`）としては追加しない
+/// （理論保証ではなく実測値の記録。受け入れ条件 2）。
+fn measure_channel_recall20(docs: &[Doc], qa: &[QaCase]) -> (usize, usize) {
+    let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
+    let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
+
+    let ids: Vec<u64> = docs.iter().map(|d| d.id).collect();
+    let dim = docs.first().map_or(0, |d| d.vector.len());
+    let vectors: Vec<f32> = docs.iter().flat_map(|d| d.vector.iter().copied()).collect();
+    let provider = ParallelSearchProvider;
+    let visible_ids: BTreeSet<u64> = ids.iter().copied().collect();
+
+    let mut dense_hits20 = 0usize;
+    let mut sparse_hits20 = 0usize;
+
+    for case in qa {
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: dim as u32,
+            query: &case.query_vector,
+            k: 20,
+        };
+        let dense_top20 = provider.search(input).expect("dense search ok");
+        dense_hits20 += dense_top20
+            .iter()
+            .take(20)
+            .filter(|h| case.correct.contains(&h.id))
+            .count();
+
+        let sparse_top20 = sparse_index
+            .search_within(&case.query_text, 20, &visible_ids)
+            .expect("sparse search ok");
+        sparse_hits20 += sparse_top20
+            .iter()
+            .take(20)
+            .filter(|d| case.correct.contains(&d.doc_id))
+            .count();
+    }
+
+    (dense_hits20, sparse_hits20)
+}
+
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（健全性チェック。テスト
 /// ハーネス自身にも「無制限なコーパス生成を許さない」設計指針を適用する）。
 fn assert_corpus_within_limits(docs: &[Doc]) {
@@ -509,7 +558,35 @@ fn hybrid_recall_small_scale_regression() {
     // 変更で数値が変化した場合はこのテストが失敗する）。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
+    // Issue #307（SEARCH-1）: RRF の同点グループへ平均順位を割り当てる変更
+    // （`hybrid.rs::accumulate_ranked`）により固定値を更新（171 → 179）。変更理由は
+    // `docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の engine 側原因
+    // 調査（Issue #307）」節を参照。
+    assert_eq!(r.hits20, 179, "小規模段の Recall@20 hit 数が変化した");
+
+    // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を固定値で
+    // 回帰トラッキングする。融合（179）がいずれの単体（151・166）も下回らない
+    // ことを実測値の比較として記録する（一般不変条件としては追加しない。
+    // `docs/design/hybrid-recall-regression.md` 参照）。
+    let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
+    if verbose {
+        println!(
+            "channel Recall@20: dense={dense_hits20}/{} sparse={sparse_hits20}/{} fused={}/{}",
+            r.ceil20, r.ceil20, r.hits20, r.ceil20
+        );
+    }
+    assert_eq!(
+        dense_hits20, 151,
+        "小規模段の密単体 Recall@20 hit 数が変化した"
+    );
+    assert_eq!(
+        sparse_hits20, 166,
+        "小規模段の疎単体 Recall@20 hit 数が変化した"
+    );
+    assert!(
+        r.hits20 >= dense_hits20.max(sparse_hits20),
+        "融合が密単体・疎単体いずれかを下回った（実測値の比較。理論保証ではない）"
+    );
 }
 
 // ---------- 層 A: 大規模段（数万件オーダ。SEARCH-2 対応。固定値回帰トラッキング） ----------
@@ -566,8 +643,10 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
+    // Issue #307（SEARCH-1）: 固定値更新（hits20 328 → 365, hits100 645 → 663）。
+    // 変更理由は `docs/design/hybrid-recall-regression.md` 参照。
+    assert_eq!(r.hits20, 365, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 663, "大規模段の Recall@100 hit 数が変化した");
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make recall-regression` 専用） ----------

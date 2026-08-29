@@ -453,3 +453,77 @@ fn hybrid_search_matches_across_dense_provider_implementations() {
 
     assert_eq!(scalar_hits, parallel_hits);
 }
+
+// Issue #307（対象ビヘイビア: SEARCH-1）: 密・疎いずれのチャネルもスコアが離散値に
+// 偏るため、同一内積・同一 BM25 スコアの同点グループが実運用でも生じる
+// （`docs/design/hybrid-recall-regression.md` の分析参照）。同点グループの融合寄与が
+// 「候補 id の並び」という意味を持たない鍵に依存しないことを実 provider・実
+// `SparseIndex` を通した統合レベルで確認する。
+#[test]
+fn hybrid_search_tie_group_scores_do_not_depend_on_candidate_id_order() {
+    // 5 件とも同一ベクトル・同一テキスト（密・疎いずれも完全な同点グループになる）。
+    // id は非連番かつ非昇順の割り当てにして、id の値自体が結果へ影響しないことを
+    // 明確にする。
+    let docs: Vec<Doc> = vec![
+        Doc {
+            id: 40,
+            text: "rust vector search",
+            vector: [1.0, 0.0],
+        },
+        Doc {
+            id: 10,
+            text: "rust vector search",
+            vector: [1.0, 0.0],
+        },
+        Doc {
+            id: 30,
+            text: "rust vector search",
+            vector: [1.0, 0.0],
+        },
+        Doc {
+            id: 20,
+            text: "rust vector search",
+            vector: [1.0, 0.0],
+        },
+        Doc {
+            id: 50,
+            text: "rust vector search",
+            vector: [1.0, 0.0],
+        },
+    ];
+    let index = build_sparse_index(&docs);
+    let (ids, vectors) = flatten_vectors(&docs);
+    let query_vector = [1.0f32, 0.0];
+    // pool_depth=200（既定）は同点グループの件数（5）を十分に上回るため、
+    // 同点グループ全体が 1 回の融合内に収まる（advisor 指摘: 平均順位による
+    // id 順非依存性は同点グループが `pool_depth` 内に収まる場合にのみ成立する）。
+    let cfg = RrfConfig::default();
+    let input = SearchInput {
+        ids: &ids,
+        vectors: &vectors,
+        dim: 2,
+        query: &query_vector,
+        k: ids.len(),
+    };
+    let fused = hybrid_search(
+        &ParallelSearchProvider,
+        input,
+        &index,
+        "rust vector search",
+        ids.len(),
+        &cfg,
+    )
+    .expect("hybrid search ok");
+
+    assert_eq!(fused.len(), 5);
+    let baseline_score = fused[0].score;
+    for hit in &fused {
+        // 従来の位置順位方式では同点グループ内の id 昇順が暗黙にスコアへ反映され
+        // （id が小さいほど高スコア）、内容が完全に同一でも id ごとにスコアが
+        // 割れていた。平均順位方式ではスコアは全 5 件で一致する。
+        assert!(
+            (hit.score - baseline_score).abs() < 1e-12,
+            "tie group score depends on candidate id: {fused:?}"
+        );
+    }
+}

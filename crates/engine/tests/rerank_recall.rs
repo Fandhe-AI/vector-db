@@ -530,16 +530,19 @@ fn rerank_recall_large_scale_regression() {
     assert_eq!(r.ceil20, 410, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 913, "Recall@100 の理論上限が変化した");
     assert_eq!(r.ceil200, 1049, "Recall@200 の理論上限が変化した");
+    // Issue #307（SEARCH-1）: RRF の同点グループへ平均順位を割り当てる変更
+    // （`hybrid.rs::accumulate_ranked`）により固定値を更新。変更理由は
+    // `docs/design/rerank-recall-regression.md` 参照。
     assert_eq!(
-        r.baseline_hits20, 343,
+        r.baseline_hits20, 378,
         "baseline（リランキングなし）の Recall@20 hit 数が変化した"
     );
     assert_eq!(
-        r.after_hits20, 368,
+        r.after_hits20, 381,
         "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
-    assert_eq!(r.pool_hits100, 809, "プール Recall@100 hit 数が変化した");
-    assert_eq!(r.pool_hits200, 948, "プール Recall@200 hit 数が変化した");
+    assert_eq!(r.pool_hits100, 824, "プール Recall@100 hit 数が変化した");
+    assert_eq!(r.pool_hits200, 949, "プール Recall@200 hit 数が変化した");
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------

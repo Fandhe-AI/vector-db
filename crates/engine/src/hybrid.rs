@@ -4,8 +4,9 @@
 //! `kernel.rs`/`parallel_search.rs`（TASK-124・TASK-126）が提供する密検索 provider
 //! （[`crate::kernel::SearchProvider`]）と、`sparse.rs`（TASK-102）が提供する疎検索
 //! （[`crate::sparse::SparseIndex`]）は独立に存在する。本モジュールはその 2 系統を
-//! RRF（公知のランク融合手法。各リストの順位のみを使い、`weight / (k_const + rank)`
-//! を id ごとに加算する）で統合する、純粋関数的な層として追加する。
+//! RRF（公知のランク融合手法。各リストの順位を使い `weight / (k_const + rank)` を
+//! id ごとに加算する。スコアの大小は使わず、同点判定（平均順位。Issue #307・
+//! SEARCH-1）にのみ使う）で統合する、純粋関数的な層として追加する。
 //!
 //! `sparse.rs` と同様に storage・catalog・policy とは結線しない。可視性判定（RLS 相当の
 //! テナント境界）はこの層より上（`core.rs` 相当）で完結している前提であり、
@@ -344,8 +345,11 @@ impl From<SparseError> for HybridError {
 /// 呼び出し元の provider/index が定める順位契約（[`CandidateHit`] はスコア降順・
 /// 同点 id 昇順、[`ScoredDoc`] は同様の契約）に従って既にソート済みであることを
 /// 前提とする。1-based 順位 `r` に対し `weight / (k_const + r)` を id ごとに加算する
-/// （両リストに出現する id は和になる）。元のスコア値（内積・BM25）は使わず順位のみを
-/// 使う（RRF の定義）。
+/// （両リストに出現する id は和になる）。スコアの大小そのもの（内積・BM25 の実値）は
+/// 使わない（RRF の定義）が、同点判定（`f64::total_cmp` での等値）にのみスコアを使い、
+/// 同点グループには区間の平均順位を割り当てる（Issue #307。[`accumulate_ranked`]
+/// ドキュメント参照。同点グループが `cfg.pool_depth()` 内に収まる場合、融合寄与は
+/// 候補 id の並びに依存しない）。
 ///
 /// 出力は融合スコア降順・同点は**候補識別子**の昇順（`f64::total_cmp` ベース）で確定する
 /// （識別子は呼び出し元定義。`sql/exec.rs` はアリーナのスロット番号を渡すため実質
@@ -424,15 +428,15 @@ pub fn rrf_fuse(
     let mut scores: BTreeMap<u64, f64> = BTreeMap::new();
 
     accumulate_ranked(
-        dense.iter().map(|h| h.id),
-        cfg.pool_depth(),
+        dense,
+        |h| (f64::from(h.score), h.id),
         cfg.k_const(),
         cfg.dense_weight(),
         &mut scores,
     );
     accumulate_ranked(
-        sparse.iter().map(|d| d.doc_id),
-        cfg.pool_depth(),
+        sparse,
+        |d| (d.score, d.doc_id),
         cfg.k_const(),
         cfg.sparse_weight(),
         &mut scores,
@@ -495,25 +499,58 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
     false
 }
 
-/// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き id 列（先頭 `pool_depth` 件）を
-/// RRF スコアへ変換し、`scores` へ加算する。密・疎の両リストから同じロジックで
-/// 呼ばれることで加算順序を一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`]
-/// で入力リスト全体の重複なしを事前に検証済みのため、`ids` の先頭 `pool_depth` 件も
-/// 重複しないことが保証されており、本関数自体は重複検知を行わない。
-fn accumulate_ranked(
-    ids: impl Iterator<Item = u64>,
-    pool_depth: usize,
+/// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
+/// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
+/// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
+/// 一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`] で入力リスト全体の
+/// 重複なしを事前に検証済みのため、本関数自体は重複検知を行わない。
+///
+/// Issue #307（対象ビヘイビア: SEARCH-1）: 密チャネルは one-hot 内積・疎チャネルは
+/// BM25 いずれもスコアが離散値に偏るため、同点（`total_cmp` で等しい連続区間）が
+/// 大きな塊で発生しうる。従来は 1-based の**位置順位**（`items` に現れる並び順が
+/// そのまま順位になる）を同点グループ内の全要素へも個別に割り当てていたが、
+/// `items` の並び順は provider/index が定める「スコア降順、同点は候補識別子昇順」
+/// （[`is_sorted_desc_id_asc`] が検証する契約）に従うだけで、RRF が意味を持たせたい
+/// 「意味的な近さ」とは無関係な鍵（候補 id）に融合寄与が依存してしまっていた。
+/// 本関数は同点グループ（`key` で得た `(score, id)` のうち `score` が
+/// `f64::total_cmp` で等しい連続区間。`items` は呼び出し元契約によりスコア降順の
+/// ため、同点は必ず連続する）ごとに**区間の平均 1-based 順位**
+/// （`((start + 1) + (start + len)) / 2.0`。区間は `[1, len(items)]` の部分区間の
+/// ため `len(items) <= pool_depth <= MAX_POOL_DEPTH` の下で `f64` 上厳密に表現できる）
+/// を求め、区間内の各要素へ同じ順位で `weight / (k_const + rank)` を加算する。
+/// 同点でない要素（実埋め込みの連続値スコア等）では区間長が 1 のため従来の位置順位と
+/// 完全に一致し、挙動は変わらない。`docs/design/rrf-tie-break-determinism.md` の
+/// 出力側タイブレーク（スコア降順・id 昇順の安定ソート）はこの変更と独立で、
+/// 引き続き [`rrf_fuse`] の最終ソートが担う。
+fn accumulate_ranked<T>(
+    items: &[T],
+    key: impl Fn(&T) -> (f64, u64),
     k_const: f64,
     weight: f64,
     scores: &mut BTreeMap<u64, f64>,
 ) {
-    for (idx, id) in ids.take(pool_depth).enumerate() {
-        // 1-based 順位。`idx` は `take(pool_depth)` により高々 `pool_depth - 1`
-        // （`pool_depth <= MAX_POOL_DEPTH`）に収まるため `as f64` 変換で精度は失われない。
-        let rank = (idx as f64) + 1.0;
+    // `chunk_by` は隣接要素間の述語で連続区間に分割する。`items` はスコア降順
+    // （呼び出し元 [`rrf_fuse`] が [`is_sorted_desc_id_asc`] で検証済み）のため、
+    // 「隣接する 2 要素のスコアが `total_cmp` で等しい」区間はそのまま同点グループの
+    // 連続区間になる（同点グループが分断されない）。
+    let mut start = 0usize;
+    for group in items.chunk_by(|a, b| key(a).0.total_cmp(&key(b).0) == std::cmp::Ordering::Equal) {
+        // 区間 `[start, start+len)` の 1-based 順位は `start+1` 〜 `start+len`。
+        // その平均を同点グループ内の全要素へ一律に割り当てる。`start`・`len` は
+        // いずれも `items.len() <= pool_depth <= MAX_POOL_DEPTH` に収まる `usize` の
+        // ため、`f64` への変換で精度は失われない。
+        let len = group.len();
+        let rank = ((start + 1) as f64 + (start + len) as f64) / 2.0;
         let contribution = weight / (k_const + rank);
-        let entry = scores.entry(id).or_insert(0.0);
-        *entry += contribution;
+        for item in group {
+            let (_, id) = key(item);
+            let entry = scores.entry(id).or_insert(0.0);
+            *entry += contribution;
+        }
+        // `checked_add` で進める（coding-rust.md「整数演算は checked_*/saturating_*
+        // を使う」）。`start` は `items.len()` を超えない値のみを取るため理論上
+        // オーバーフローしないが、契約を明示的に保つ。
+        start = start.checked_add(len).unwrap_or(items.len());
     }
 }
 
@@ -1156,6 +1193,129 @@ mod tests {
         let id2 = fused.iter().find(|h| h.id == 2).unwrap();
         // dense_weight=2.0 のため id=1 のスコアは id=2 の 2 倍になる。
         assert!((id1.score - 2.0 * id2.score).abs() < 1e-15);
+    }
+
+    // Issue #307（対象ビヘイビア: SEARCH-1）: `accumulate_ranked` の同点グループ
+    // 平均順位化に対する単体テスト群。密チャネル（one-hot 内積）・疎チャネル
+    // （BM25）いずれもスコアが離散値に偏り大きな同点グループが生じる（層 A の
+    // 実測分析は `docs/design/hybrid-recall-regression.md` 参照）ため、
+    // 同点グループ内の融合寄与が候補 id の並びに依存しないことをここで固定する。
+
+    #[test]
+    fn accumulate_ranked_gives_tie_group_the_mean_of_its_position_ranks() {
+        // 同点 3 件（位置順位 2〜4 相当。1 位は別の非同点 id）。平均順位は
+        // (2 + 3 + 4) / 3 = 3 のため、各同点 id の寄与は 1 / (60 + 3) になる。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let dense = [
+            hit(1, 4.0),
+            hit(2, 3.0),
+            hit(3, 3.0),
+            hit(4, 3.0),
+            hit(5, 1.0),
+        ];
+        let sparse: [ScoredDoc; 0] = [];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        let expected_tie = 1.0 / (60.0 + 3.0);
+        for id in [2u64, 3, 4] {
+            let hit = fused.iter().find(|h| h.id == id).expect("tie id present");
+            assert!(
+                (hit.score - expected_tie).abs() < 1e-12,
+                "id={id} expected {expected_tie}, got {}",
+                hit.score
+            );
+        }
+    }
+
+    #[test]
+    fn accumulate_ranked_with_no_ties_matches_position_rank() {
+        // 同点なし入力では区間長が常に 1 のため、平均順位は従来の位置順位と一致する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let dense = [hit(1, 3.0), hit(2, 2.0), hit(3, 1.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        for (id, rank) in [(1u64, 1.0), (2, 2.0), (3, 3.0)] {
+            let hit = fused.iter().find(|h| h.id == id).unwrap();
+            let expected = 1.0 / (60.0 + rank);
+            assert!((hit.score - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn accumulate_ranked_tie_group_score_is_invariant_to_candidate_id_order() {
+        // 同点グループ（3 件。pool_depth=10 内に収まる）の候補 id を昇順・降順で
+        // 入れ替えても、各 id が得るスコアは不変（Issue #307 の核心: 平均順位は
+        // 位置順位と異なり `items` に現れる並び順＝候補 id の並びに依存しない）。
+        // `rrf_fuse` は「同点は id 昇順」の入力契約を検証してしまうため
+        // （[`HybridError::UnsortedInput`]。id 降順の同点入力は契約違反として
+        // 拒否される）、ここでは `accumulate_ranked` を直接呼んで検証する
+        // （`super::*` によりモジュール内 private 関数として同一ファイル内から
+        // 呼び出せる）。
+        let k_const = 60.0;
+        let weight = 1.0;
+        let dense_id_asc = [hit(10, 2.0), hit(20, 2.0), hit(30, 2.0)];
+        let dense_id_desc = [hit(30, 2.0), hit(20, 2.0), hit(10, 2.0)];
+        let key = |h: &CandidateHit| (f64::from(h.score), h.id);
+
+        let mut scores_asc: BTreeMap<u64, f64> = BTreeMap::new();
+        accumulate_ranked(&dense_id_asc, key, k_const, weight, &mut scores_asc);
+        let mut scores_desc: BTreeMap<u64, f64> = BTreeMap::new();
+        accumulate_ranked(&dense_id_desc, key, k_const, weight, &mut scores_desc);
+
+        assert_eq!(scores_asc.len(), scores_desc.len());
+        for (id, score_asc) in &scores_asc {
+            let score_desc = scores_desc.get(id).expect("id present in both orders");
+            assert!((score_asc - score_desc).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn accumulate_ranked_sums_contributions_when_same_id_is_tied_in_both_channels() {
+        // 密・疎双方で同一 id が同点グループに属する場合、それぞれの平均順位由来の
+        // 寄与が加算されることを確認する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        // 密側: id=1,2 が同点 1 位グループ（平均順位 1.5）。
+        let dense = [hit(1, 5.0), hit(2, 5.0)];
+        // 疎側: id=1,3 が同点 1 位グループ（平均順位 1.5）。
+        let sparse = [doc(1, 5.0), doc(3, 5.0)];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        let expected_id1 = 2.0 / (60.0 + 1.5);
+        let id1 = fused.iter().find(|h| h.id == 1).unwrap();
+        assert!((id1.score - expected_id1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn accumulate_ranked_whole_pool_as_one_tie_group_uses_midpoint_rank() {
+        // プール全体（n 件）が 1 つの同点グループの場合、平均順位は (1 + n) / 2。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        let dense = [hit(1, 1.0), hit(2, 1.0), hit(3, 1.0), hit(4, 1.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        let expected = 1.0 / (60.0 + 2.5); // (1 + 4) / 2 = 2.5
+        for h in &fused {
+            assert!((h.score - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn accumulate_ranked_treats_positive_and_negative_zero_as_distinct_groups_without_panicking() {
+        // `total_cmp` は `0.0` と `-0.0` を別値として順序付ける（IEEE 754 の等値
+        // （`==`）とは異なる全順序）。`rrf_fuse` の入力有限性検証は符号だけが
+        // 異なるゼロを弾かないため、同点判定（`total_cmp` での等値）に一貫して
+        // `total_cmp` を使う本実装は `-0.0 < 0.0` として別グループ扱いし、
+        // ソート順契約検証（同点は id 昇順）・平均順位計算のいずれも panic しない
+        // ことを確認する（境界値のフェイルセーフ確認）。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 10).unwrap();
+        // is_sorted_desc_id_asc は total_cmp で降順判定するため、0.0 → -0.0 の順
+        // （total_cmp 上 0.0 > -0.0）で並べる。
+        let dense = [hit(1, 0.0), hit(2, -0.0)];
+        let sparse: [ScoredDoc; 0] = [];
+        let fused = rrf_fuse(&dense, &sparse, &cfg).expect("fuse ok");
+        assert_eq!(fused.len(), 2);
+        // 別グループ（区間長 1 ずつ）のため位置順位どおり 1 位・2 位に分かれる。
+        let id1 = fused.iter().find(|h| h.id == 1).unwrap();
+        let id2 = fused.iter().find(|h| h.id == 2).unwrap();
+        assert!((id1.score - 1.0 / 61.0).abs() < 1e-12);
+        assert!((id2.score - 1.0 / 62.0).abs() < 1e-12);
     }
 
     #[test]
