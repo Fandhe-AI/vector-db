@@ -42,10 +42,13 @@ after を測定することで、コーパス・プール生成のばらつき�
 
 ### 2 層構成（PR CI と閾値ゲートの分離。TASK-104 と同方式）
 
-- **層 A**（`#[test]`。常時 `cargo test` 対象）: baseline/after の hits20 と改善量を
-  固定値アサーションで回帰トラッキングする。あわせて「after が baseline を下回らない」
-  ことを独立にアサートする（リランキング層が Recall を悪化させていないことの最小
-  保証）。spec の数値基準は使わないため public 資産に閾値を持ち込まない
+- **層 A**（`#[test]`。常時 `cargo test` 対象）: baseline/after の hits20・プールの
+  hits100/hits200 を固定値アサーションで回帰トラッキングする。spec の数値基準は
+  使わないため public 資産に閾値を持ち込まない。Issue #310（RRF 融合の同点順位
+  規約変更・密プール境界の同点グループ完全化）以降、baseline が改善幅で after を
+  上回るようになった（下記「実測結果」節）ため、「after が baseline を下回らない」
+  非劣化アサーションは層 A では成立せず行っていない（既知の contract gap。
+  `crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモ参照）
 - **層 B**（`#[ignore]`。`make rerank-regression` 経由）: spec 由来の Recall 下限
   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
@@ -100,21 +103,32 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 | QA 件数 | 100 |
 | total_correct | 1,049 |
 | ceil20 | 410 |
-| baseline hits20（リランキングなし） | 343 |
-| after hits20（リランキングあり） | 368 |
-| baseline Recall@20 | 0.8366 |
-| after Recall@20 | 0.8976 |
-| 改善量（after − baseline） | +0.0610 |
-| ceil100 / pool hits100 | 913 / 809（Recall@100 = 0.8861） |
-| ceil200 / pool hits200 | 1,049 / 948（Recall@200 = 0.9037） |
+| baseline hits20（リランキングなし） | 386 |
+| after hits20（リランキングあり） | 382 |
+| baseline Recall@20 | 0.9415 |
+| after Recall@20 | 0.9317 |
+| 改善量（after − baseline） | −0.0098 |
+| ceil100 / pool hits100 | 913 / 834（Recall@100 = 0.9135） |
+| ceil200 / pool hits200 | 1,049 / 951（Recall@200 = 0.9066） |
 
-暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と融合スコア順位を RRF 型で
-再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を有意に改善して
-いる（343→368、+7.3pt）。プール自体の Recall@200（0.9037）と最終 Recall@20（after:
-0.8976）の差は小さく、pool_depth 200 の候補プールがすでに正解の大半を含んでおり、
-リランキングはその中の順位付けを改善する形で寄与していることを示唆する（プールに
-入っていない正解＝Recall@200 の未達分は、リランキング以前の候補生成段
-（`hybrid.rs`・`sparse.rs`）の課題であり本タスクのスコープ外）。
+上表は Issue #310（RRF 融合の同点順位規約 `TieRank::GroupEnd`・密プール境界の
+同点グループ完全化。`docs/design/hybrid-recall-regression.md`「Issue #310:
+engine 側改善」節参照）適用後の実測値である。適用前は baseline hits20=343・
+after hits20=368（改善量 +0.0610）であった。Issue #310 は baseline（リランキング
+前の生の融合順位）を大きく改善したが、暫定リランカー（[`LexicalOverlapReranker`]。
+字句一致順位と融合スコア順位を RRF 型で再結合する参照実装）の改善幅はそれに
+届かず、after（382）が baseline（386）を −4 件（−0.0098pt）下回る結果になった
+（いずれも Issue #310 以前の値より改善しているが、after − baseline の符号が
+反転した）。この非劣化の崩れは `LexicalOverlapReranker` が暫定実装（下記
+「既知の制約」参照）であることに起因する既知の contract gap であり、本命
+リランク方式の選定（SEARCH-7・オーナー判断・依存承認制）まで持ち越しとする
+（`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモも参照）。
+
+プール自体の Recall@200（0.9066）と最終 Recall@20（after: 0.9317）を比較すると、
+pool_depth 200 の候補プールがすでに正解の大半を含んでおり、リランキングは
+その中の順位付けを改善する形で寄与し続けている（プールに入っていない正解＝
+Recall@200 の未達分は、リランキング以前の候補生成段（`hybrid.rs`・`sparse.rs`）
+の課題であり本タスクのスコープ外）。
 
 なお本ハーネスは `LexicalOverlapReranker` の効果測定であり、方式確定前の暫定構成
 （下記「既知の制約」参照）における測定値であることに注意する。

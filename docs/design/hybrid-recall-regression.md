@@ -238,8 +238,11 @@ Recall@20（小規模段）・Recall@20/Recall@100（大規模段）は、正解
 - 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
 - 前提: 親 Issue #301。大規模段（SEARCH-2・クエリ展開結線）は別 Issue（#306）の管轄
 
-**層 A・層 B とも実測値・閾値・pass/fail は本ドキュメントにも public テストにも
-記録しない（`.claude/rules/spec-confidentiality.md`）**。密単体・疎単体・融合後の
+**層 B（spec 閾値ゲート）の実測値・閾値・pass/fail は引き続き本ドキュメントにも
+public テストにも記録しない（`.claude/rules/spec-confidentiality.md`）**。層 A
+（回帰トラッキング）の実測値は 2026-08-29 のオーナー判断（数値基準・実測値の
+public 記載許可。`.claude/rules/spec-confidentiality.md`）以降、下記「Issue #310」
+節・「実測結果」節に固定値として記録する。密単体・疎単体・融合後の
 Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall.rs::measure_channel_recall20`
 を使い、融合が両チャネル単体のいずれも下回らない（＝ SEARCH-3 相当の非劣化）
 ことを実測値どうしの関係アサーションとしてのみ回帰トラッキングする。
@@ -291,32 +294,40 @@ ranking）を層 A の固定値アサーション（`crates/engine/tests/hybrid_
 
 **フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
 `VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも
-変更していない（Issue #310 の受け入れ条件 2）。層 B の pass/fail・実測値・
-閾値・導出係数は本ドキュメントにも public テストにも記録しない（受け入れ条件 3・
-`.claude/rules/spec-confidentiality.md`）。
+変更していない（Issue #310 の受け入れ条件 2）。`ceil20`／`ceil100`／
+`total_correct`（正解集合の理論上限・総数）が変更前後で一致することは、この
+非変更の実測による裏付けでもある（下記「実測結果」節）。層 B（spec 閾値ゲート）
+の pass/fail・閾値・導出係数は引き続き本ドキュメントにも public テストにも
+記録しない（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`）。
 
 ## 実測結果
 
-`crates/engine/tests/hybrid_recall.rs`（層 A、決定的コーパスのため再現可能）は
-小規模・大規模の両段で pass する。`total_correct`／`ceil20`／`ceil100`・
-`hits20`／`hits100` の実測値は本ドキュメントにも同テストにも記録しない
-（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`）。
+（`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため
+再現可能。hit 数は同テストのアサーションに固定済み）
+
+| 段 | 文書数 | QA 件数 | total_correct | ceil20 | hits20 | ceil100 | hits100 | Recall@20 | Recall@100 |
+| -- | ------ | ------- | -------------- | ------ | ------ | ------- | ------- | --------- | ---------- |
+| 小規模 | 400 | 60 | 202 | 202 | 182 | - | - | 0.9010 | - |
+| 大規模 | 20,000 | 100 | 997 | 421 | 385 | 707 | 653 | 0.9145 | 0.9236 |
+
+小規模段の密単体 Recall@20 は 151/202（0.7475）、疎単体は 166/202（0.8218）
+であり（`crates/engine/tests/hybrid_recall.rs::measure_channel_recall20`）、
+融合（182/202）はいずれの単体チャネルも下回らない。
 
 以前は測定タプル全体を `DefaultHasher`（固定キー）で畳み込んだダイジェスト
 1 個を固定値アサーションの対象にすることで数値非開示のまま退行検出しようと
 していたが、フィクスチャ生成コード自体が本ファイル内に公開されており各
 フィールドが少値域の整数に収まるため、ダイジェスト値からの総当たり復元が
-現実的でありこの方式では受け入れ条件 3 を満たせないと判明した
-（codex-review P0 指摘・PR #320）。このためダイジェスト方式は撤回し、層 A は
-数値に依存しない**関係アサーション**のみで退行検出する（密単体・疎単体・
-融合の Recall@20 の大小関係、展開なし/ありのパススルー等式など）。数値
-そのものの固定値ゲートが必要な場合は、既存の spec 閾値と同様に層 B
-（`environment: recall-gate` の secrets 経由）側で扱う。Issue #310
-（`GroupEnd`＋境界同点グループ完全化）の適用前後で、`ceil20`／`ceil100`／
-`total_correct`（正解集合の理論上限・総数。fixture 非変更のため不変）に対し、
-両段とも `hits20` の到達率が改善したことをローカルでの実測
-（`RECALL_VERBOSE=1` opt-in）で確認済み（本ドキュメントには実測値を記載
-しない）。
+現実的で数値非開示の目的を達成できないと判明した（codex-review P0 指摘・
+PR #320）。2026-08-29 のオーナー判断（数値基準・実測値の public 記載許可）に
+より、この制約自体が解消したため、ダイジェスト方式・関係アサーションのみへの
+置換は撤回し、上記の固定値（実測値そのもの）による層 A 回帰トラッキングへ
+戻した。Issue #310（`GroupEnd`＋境界同点グループ完全化）の適用前、`hits20` は
+小規模段 171・大規模段 328、`hits100` は大規模段 645 であった（`ceil20`／
+`ceil100`／`total_correct` はいずれも上表と同一。フィクスチャ非変更のため
+不変）。両段とも `hits20`（大規模段は `hits100` も）の到達率が改善している。
+数値そのものの固定値ゲートに加え、spec 由来の絶対閾値に対する pass/fail
+判定は既存どおり層 B（`environment: recall-gate` の secrets 経由）側で扱う。
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の
