@@ -1238,8 +1238,11 @@ pub fn hybrid_search_boosted(
 /// - `dense.len() == pool_depth` は 2 通りありうる。`exhaustive` ならそのまま返す。
 ///   非 `exhaustive`（＝呼び出し元が `fetch_k` を [`MAX_POOL_DEPTH`] で頭打ちにされ
 ///   `pool_depth` を超える拡張取得ができなかった。Issue #310 codex-review P1 指摘
-///   対応）の場合、境界の末尾要素が未取得候補と同点かどうか比較対象なしに判定でき
-///   ないため、安全側（id 非依存）に倒し末尾の同点グループを丸ごと除外する。
+///   対応）の場合も、境界の末尾要素が未取得候補と同点かどうかは確定できないが、
+///   取得済み範囲自体が既に `pool_depth` 件ちょうどであり、それ以上切り詰める先が
+///   ないためそのまま返す（Issue #320 codex-review P1 指摘対応: 丸ごと除外すると
+///   全件同点コーパスで結果が空になる回帰があったため、削除ではなく取得済み範囲の
+///   保持へ変更）。
 /// - `dense.len() > pool_depth`（`fetch_k > pool_depth` で拡張取得できた通常経路）は
 ///   先頭 `pool_depth` 件の末尾スコアと `pool_depth` 番目（0-based で `pool_depth`）の
 ///   スコアが異なれば、境界は同点グループを切っていないため `pool_depth` 件へ
@@ -1247,9 +1250,12 @@ pub fn hybrid_search_boosted(
 ///   跨いでいる。そのグループと同点の要素を末尾まで走査し、グループの終端が取得
 ///   済み範囲内で確定できればグループ全体を含めて返す。取得済み範囲の最後の要素
 ///   までが同点でグループ終端が確定できず、かつ非 `exhaustive`（取得済み範囲を
-///   超えてなお可視集合にデータが残りうる）の場合は、決定的・id 非依存な安全側の
-///   選択としてそのグループを丸ごと除外し `pool_depth` 未満の列を返す（境界より
-///   内側の要素はすべて保持するため探索対象を狭めるだけで可視性検証は弱めない）。
+///   超えてなお可視集合にデータが残りうる）の場合は、グループを削除せず、観測できた
+///   範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへフォールバックする
+///   （Issue #320 codex-review P1 指摘対応。境界より内側の要素はすべて保持するため
+///   探索対象を狭めるだけで可視性検証は弱めない。グループ内の順位付けは
+///   [`TieRank::GroupEnd`] がこの切り詰め後の列（観測範囲）自体を走査して決めるため、
+///   フォールバック時のグループ末尾順位は観測できた `pool_depth` 件目になる）。
 ///
 /// `exhaustive`（呼び出し元が算出）が `true`（取得した `dense` が可視集合内で
 /// 存在しうるヒットを全件含む。`fetch_k` が可視 id 総数以上、または provider/
@@ -1303,24 +1309,12 @@ pub(crate) fn complete_boundary_tie_group_by<T>(
         // インデックスが `fetch_k` 未満しか返せなければ `exhaustive == true` になる
         // 契約のため、ここへ来るのは `exhaustive == true`（真に全件）か、`fetch_k`
         // が `MAX_POOL_DEPTH` で頭打ちになり `fetch_k == pool_depth` となって拡張
-        // 取得ができなかった場合のいずれか。前者はそのまま返してよいが、後者は
-        // 境界の末尾要素が可視集合内の未取得候補と同点かどうかを比較対象なしに
-        // 判定できないため、安全側（id 非依存）に倒し、末尾の同点グループ
-        // （取得済み範囲から後方へ辿れる分）を丸ごと除外する。
-        if exhaustive {
-            return dense;
-        }
-        let boundary_score = score_of(&dense[pool_depth - 1]);
-        let mut group_start = pool_depth - 1;
-        while group_start > 0
-            && score_of(&dense[group_start - 1]).total_cmp(&boundary_score)
-                == std::cmp::Ordering::Equal
-        {
-            group_start -= 1;
-        }
-        let mut result = dense;
-        result.truncate(group_start);
-        return result;
+        // 取得ができなかった場合のいずれか。後者は境界の末尾要素が可視集合内の
+        // 未取得候補と同点かどうかを比較対象なしに判定できないが、取得済み範囲が
+        // 既に `pool_depth` 件ちょうどでそれ以上切り詰める先がないため、いずれの
+        // 場合も観測できた範囲をそのまま返す（Issue #320 codex-review P1 指摘対応。
+        // 丸ごと除外すると全件同点コーパスで結果が空になる回帰があった）。
+        return dense;
     }
     // `pool_depth >= 1`（`RrfConfig::new`/`Default` が保証）のため `pool_depth - 1` は
     // 常に有効な添字。
@@ -1355,10 +1349,13 @@ pub(crate) fn complete_boundary_tie_group_by<T>(
         result.truncate(group_end);
     } else {
         // 取得済み範囲の最後までが同点で、かつそれ以上のデータが存在しうる
-        // （非 exhaustive）ためグループ終端を確定できない。グループを丸ごと除外し
-        // `pool_depth` 未満の列にする（決定的・id 非依存。2 度目の provider 呼び出し
-        // はしない）。
-        result.truncate(group_start);
+        // （非 exhaustive）ためグループ終端を確定できない。グループを丸ごと除外
+        // せず、観測できた範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへ
+        // フォールバックする（Issue #320 codex-review P1 指摘対応: 丸ごと除外すると
+        // 全件同点コーパスで結果が空になる回帰があった。境界より内側の要素は
+        // すべて保持するため探索対象を狭めるだけで可視性検証は弱めない。2 度目の
+        // provider 呼び出しはしない）。
+        result.truncate(pool_depth);
     }
     result
 }
@@ -2565,14 +2562,17 @@ mod tests {
     }
 
     #[test]
-    fn complete_boundary_tie_group_excludes_group_when_tail_is_unconfirmed_and_not_exhaustive() {
+    fn complete_boundary_tie_group_falls_back_to_positional_cut_when_tail_is_unconfirmed_and_not_exhaustive(
+    ) {
         // 取得済み範囲（4 件）の最後まで同点（score=2.0）が続き、`exhaustive=false`
         // （取得範囲を超えてなお可視集合にデータが残りうる）のためグループの終端を
-        // 確定できない。決定的・id 非依存な安全側の選択として、境界に触れる同点
-        // グループを丸ごと除外する。
+        // 確定できない。Issue #320 codex-review P1 指摘対応: グループを丸ごと除外
+        // すると全件同点コーパスで結果が空になる回帰があるため、削除ではなく
+        // 観測できた範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへ
+        // フォールバックする（境界より内側の要素はすべて保持）。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(4, 2.0)];
         let out = complete_boundary_tie_group(dense, 2, false);
-        assert!(out.is_empty());
+        assert_eq!(out, vec![hit(1, 2.0), hit(2, 2.0)]);
     }
 
     #[test]
@@ -2612,22 +2612,23 @@ mod tests {
     }
 
     #[test]
-    fn complete_boundary_tie_group_excludes_tail_when_fetch_capped_at_pool_depth_and_not_exhaustive(
+    fn complete_boundary_tie_group_keeps_observed_range_when_fetch_capped_at_pool_depth_and_not_exhaustive(
     ) {
         // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAt）の回帰
         // 固定: `hybrid_search_boosted` の `fetch_k` は `pool_depth * 2` を
         // `MAX_POOL_DEPTH` で頭打ちにするため、`pool_depth` 自体が
         // `MAX_POOL_DEPTH` の場合（本テストでは境界処理だけを直接検証するため
         // `pool_depth == dense.len()` で模擬する）`fetch_k == pool_depth` となり
-        // 拡張取得ができない。この場合 `dense.len() == pool_depth` の早期 return が
-        // `exhaustive` を無視すると、境界（末尾要素）が未取得候補と同点かどうか
-        // 判定できないまま部分グループを受理してしまう（修正前の挙動）。修正後は
-        // `exhaustive == false` の場合、末尾の同点グループを丸ごと除外する。
+        // 拡張取得ができない。この場合、境界（末尾要素）が未取得候補と同点かどうか
+        // 判定できないが、取得済み範囲が既に `pool_depth` 件ちょうどでそれ以上
+        // 切り詰める先がないため、Issue #320 codex-review P1 指摘対応により
+        // 丸ごと除外ではなく観測できた範囲をそのまま返す（全件同点コーパスで結果が
+        // 空になる回帰の修正）。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)];
-        let out = complete_boundary_tie_group(dense, 3, false);
-        assert!(
-            out.is_empty(),
-            "拡張取得できず境界の同点を確定できない場合は安全側で丸ごと除外する"
+        let out = complete_boundary_tie_group(dense.clone(), 3, false);
+        assert_eq!(
+            out, dense,
+            "拡張取得できず境界の同点を確定できない場合も観測範囲を保持する"
         );
     }
 
@@ -2648,9 +2649,12 @@ mod tests {
         // する。6 件すべてが同一テキスト（BM25 同点）・同一密ベクトル（内積同点）
         // のコーパスに対し `pool_depth=2` で検索すると、`fetch_k`（`min(2*2, 6)=4`）
         // は可視 6 件に満たず非 exhaustive のため、密・疎いずれの同点グループも
-        // 境界を確定できず丸ごと除外される。修正前は疎側が `search_within` 内部の
-        // doc_id 昇順タイブレークで id 依存に 2 件だけ生き残っていた。id の割り当てを
-        // 入れ替えても結果（空集合）が変わらないことを確認する。
+        // 境界を確定できない。修正前は疎側が `search_within` 内部の doc_id 昇順
+        // タイブレークで id 依存に 2 件だけ生き残っていた。Issue #320 codex-review
+        // P1 指摘対応で境界完全化のフォールバックを「丸ごと除外」から「観測できた
+        // 範囲を保持し位置ベースで `pool_depth` 件へ切り詰め」へ変更したため、全件
+        // 同点でも結果が空にならない（`pool_depth=2, k=2` 件が返る）。id の割り当てを
+        // 入れ替えても結果件数（空にならないこと）が変わらないことを確認する。
         let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
         let vectors: Vec<f32> = vec![1.0; 6];
         let query = [1.0f32];
@@ -2682,9 +2686,10 @@ mod tests {
             .expect("search ok");
 
         assert_eq!(out_a.len(), out_b.len());
-        assert!(
-            out_a.is_empty(),
-            "境界の同点グループを確定できないため両チャネルとも丸ごと除外され空になる"
+        assert_eq!(
+            out_a.len(),
+            2,
+            "境界の同点グループを確定できなくても観測範囲（pool_depth 件）は保持され空にならない"
         );
     }
 
