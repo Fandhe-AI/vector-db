@@ -546,6 +546,32 @@ impl Reranker for LexicalOverlapReranker {
         let query_tokens: std::collections::BTreeSet<String> =
             tokenize(query_text).into_iter().collect();
 
+        // `rank_fused`（1-based）は候補配列の位置ではなく、`hybrid.rs::TieRank::
+        // GroupEnd`（既定の同点順位規約）と同じグループ末尾順位で求める
+        // （Issue #320 codex-review P1 指摘対応）。`candidates` は `fused_score` の
+        // 同点集合を持ちうる（`hybrid.rs` の融合結果由来のため。同点の連続区間は
+        // `rerank_candidates` が検証済みのソート順契約により必ず連続する）が、
+        // 位置順位（`idx + 1`）のまま扱うと同点グループ内で融合側と異なる順位規約に
+        // なり、`hybrid.rs` 側の GroupEnd 化（Issue #310）の効果がこの層で部分的に
+        // 相殺される。グループ内の全メンバーへグループ末尾の 1-based 位置を割り当てる
+        // （`hybrid.rs::accumulate_ranked` の `TieRank::GroupEnd` 分岐と同じ走査）。
+        let mut rank_fused_by_idx = vec![0usize; candidates.len()];
+        let mut group_idx = 0usize;
+        while group_idx < candidates.len() {
+            let group_score = candidates[group_idx].fused_score;
+            let mut group_end = group_idx + 1;
+            while group_end < candidates.len()
+                && candidates[group_end].fused_score.total_cmp(&group_score)
+                    == std::cmp::Ordering::Equal
+            {
+                group_end += 1;
+            }
+            for slot in rank_fused_by_idx.iter_mut().take(group_end).skip(group_idx) {
+                *slot = group_end;
+            }
+            group_idx = group_end;
+        }
+
         // (id, 融合スコア順位 rank_fused, 字句重なり件数) を候補順（＝融合スコア
         // 降順。`rerank_candidates` が事前検証済み）に集める。
         // `idx` は候補配列の長さ（`rerank_candidates` により高々 `pool_depth`
@@ -555,7 +581,7 @@ impl Reranker for LexicalOverlapReranker {
             .iter()
             .enumerate()
             .map(|(idx, c)| {
-                let rank_fused = idx.saturating_add(1);
+                let rank_fused = rank_fused_by_idx[idx];
                 let doc_tokens: std::collections::BTreeSet<String> =
                     tokenize(c.text).into_iter().collect();
                 let overlap = query_tokens.intersection(&doc_tokens).count();
