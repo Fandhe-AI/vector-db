@@ -539,9 +539,10 @@ const LARGE_SEED: u64 = 0x5EED_0108_4C41_5247;
 
 /// TASK-108（SEARCH-7）層 A: 大規模コーパス（数万件オーダ）で baseline（リランキング
 /// なし）と after（リランキングあり）の最終 Recall@20 を実測し、数値リテラルを含まない
-/// 関係アサーションで回帰トラッキングする（Issue #312）。あわせて「after が baseline を下回らない」ことを独立に
-/// アサートする（リランキング層が Recall を悪化させていないことの最小保証。
-/// spec の数値基準は使わない）。
+/// 関係アサーションで回帰トラッキングする（Issue #312）。あわせて「after が baseline を
+/// 厳密に上回る」ことを独立にアサートする（PR #319 codex-review P1 対応。`>=`
+/// では no-op 退行を層 A の通常 PR CI が素通りさせてしまうため。改善幅の
+/// 具体的な下限は spec の数値基準を使う層 B が担う）。
 #[test]
 fn rerank_recall_large_scale_regression() {
     let verbose = verbose_requested_from_env();
@@ -591,12 +592,15 @@ fn rerank_recall_large_scale_regression() {
         );
     }
 
-    // after が baseline を下回らないことの独立したアサーション（リランキング層が
-    // Recall を悪化させていないことの最小保証）。数値の再確定漏れでこの性質が
-    // 崩れた場合にも検出できるようにする。
+    // after が baseline を「厳密に上回る」ことの独立したアサーション（PR #319
+    // codex-review P1 対応）。`>=`（同値許容）ではリランカーが完全な no-op
+    // （baseline と同一順位）に退行しても層 A の通常 PR CI を通過してしまい、
+    // 検証弱体化になる。spec 由来の非公開な改善幅の絶対値は使わず、非ゼロの
+    // 改善が生じていることだけを公開可能な相対関係として要求する（改善幅の
+    // 具体的な下限判定は引き続き層 B `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う）。
     assert!(
-        r.after_hits20 >= r.baseline_hits20,
-        "リランキング後の Recall@20 が baseline を下回った"
+        r.after_hits20 > r.baseline_hits20,
+        "リランキング後の Recall@20 が baseline を上回らなかった（no-op 退行の懸念）"
     );
 
     // 数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
@@ -807,9 +811,10 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
 }
 
 /// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る（改善幅 = after −
-/// baseline の下限）。改善幅 0 は「改善は必須ではないが悪化は許さない」という
-/// 正当な設定であり（層 A が独立にアサートする `after_hits20 >= baseline_hits20`
-/// と同じ意図）、[`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり
+/// baseline の下限）。改善幅 0 は「非ゼロの改善までは必須ではないが悪化は
+/// 許さない」という設定であり、層 A が独立にアサートする `after_hits20 >
+/// baseline_hits20`（非ゼロの改善を要求）より緩い層 B 側の最小構成として
+/// 意味を持つ。[`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり
 /// `[0.0, 1.0]`（0 を含む）を許容範囲とする。
 fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     threshold_from_env(var, |v| (0.0..=1.0).contains(&v), "[0.0, 1.0]")
