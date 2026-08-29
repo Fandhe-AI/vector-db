@@ -290,7 +290,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: recall-regression
-recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+recall-regression: ## TASK-104 のハイブリッド検索 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test hybrid_recall -- --ignored --nocapture
 else
@@ -302,7 +302,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: rerank-regression
-rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+rerank-regression: ## TASK-108 のリランキング効果測定 Recall 閾値ゲート（層 B）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test rerank_recall -- --ignored --nocapture
 else
@@ -314,7 +314,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: query-planning-regression
-query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行）
+query-planning-regression: ## TASK-112・TASK-113 のクエリ展開受け入れ基準（intent 改善幅・direct 維持・劣化展開時の intent 改善幅・大規模段 direct 絶対下限）Recall 閾値ゲート（層 B。--ignored 一括実行のため大規模段ゲートも対象に含む）を実行する（spec 閾値の環境変数注入が必要。ci には含めない。.github/workflows/recall.yml から実行。標準出力は対象名と pass/fail のみ。実測値は RECALL_VERBOSE=1〔GitHub Actions 外限定〕。Issue #303）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test query_planning_recall -- --ignored --nocapture
 else
@@ -331,7 +331,7 @@ endif
 # 非公開値を出さないようローカル専用の precision-report 側へ分離する
 # （.claude/rules/spec-confidentiality.md。PR #212 codex-review P0）。
 .PHONY: precision-regression
-precision-regression: ## TASK-163 の precision モード評価基準（Top-1 Accuracy・MRR@10・誤返却率）閾値ゲートのみを実行する（pass/fail のみ出力・実測値は出さない。目標値未確定のため .github/workflows/recall.yml には未接続。ci には含めない）
+precision-regression: ## TASK-163 の precision モード評価基準（Top-1 Accuracy・MRR@10・誤返却率）閾値ゲートのみを実行する（pass/fail のみ出力・実測値は出さない。RECALL_VERBOSE=1〔GitHub Actions 外限定〕opt-in 時のみ実測値を追加出力。目標値未確定のため .github/workflows/recall.yml には未接続。ci には含めない。Issue #303）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_threshold_gate
 else
@@ -339,7 +339,7 @@ else
 endif
 
 .PHONY: precision-report
-precision-report: ## TASK-163 の判断材料レポート（hybrid/dense の指標）とパラメータ感度スイープを実行する（実測値を標準出力へ出すためローカル専用。CI・GitHub Actions からは実行しない）
+precision-report: ## TASK-163 の判断材料レポート（hybrid/dense の指標）とパラメータ感度スイープを実行する（実測値を標準出力へ出すためローカル専用。CI・GitHub Actions からは実行しない。GITHUB_ACTIONS 下ではテスト側が fail-closed で拒否する。Issue #303）
 ifdef HAS_CARGO
 	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_report
 	cargo test --release -p engine --test precision_eval -- --ignored --nocapture --exact precision_eval_policy_sweep

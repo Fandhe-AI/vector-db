@@ -42,8 +42,9 @@
   （`crates/engine/benches/simd_bench.rs::core5_requested_from_env` と同じ
   opt-in パターン）、設定済みで非数値・範囲外は fail-closed でテスト失敗とする。
   `recall.yml` からの実行は strict モード（下記「strict モードによる誤 green
-  防止」参照）が既定で有効なため、未設定も fail-closed になる。ログには実測値と
-  pass/fail のみを出力する（README「Recall 回帰ハーネスの repo secrets」参照）。
+  防止」参照）が既定で有効なため、未設定も fail-closed になる。ログには対象名と
+  pass/fail のみを出力する（README「Recall 回帰ハーネスの repo secrets」参照。
+  出力方針の詳細は下記「出力方針（実測値の既定非出力・Issue #303）」参照）。
 
   `.github/workflows/recall.yml` は `pull_request` トリガを**意図的に持たない**
   （`workflow_dispatch` + 週次 `schedule`。下記「strict モードによる誤 green
@@ -113,6 +114,46 @@ environment `recall-gate` の secrets 設定・strict モードでの手動実�
 疎通確認はリポジトリ管理者作業として別途必要（未実施のまま週次 run が走った
 場合は fail-closed で red になる。false green にはならない。README「Recall
 回帰ハーネスの repo secrets」参照）。
+
+### 出力方針（実測値の既定非出力・Issue #303）
+
+層 B ゲートは層 A と同一の決定的コーパス（同一 seed・件数）を測定するため、
+実測 Recall は層 A の固定値定数（`hits20`/`ceil20` 等）から public に導出
+可能である。失敗時（`pass=false`）は「非公開閾値 > 実測値」という上界が、
+成功時は下界が推定できてしまうため、`recall@k=<実測値> pass=<bool>` の
+併記による非公開閾値の逆算を防ぐ defense-in-depth・方針統一として、以下を
+既定挙動とする（`crates/engine/benches/batch_bench.rs::
+verbose_requested_from_env`・Issue #277〜#279 で確立した「既定出力は真偽値
+のみ」方針の Recall テスト側への横展開）。
+
+- **既定出力**: 層 B ゲート（`hybrid_recall_small_scale_threshold_gate`・
+  `hybrid_recall_large_scale_threshold_gate`）・層 A 回帰
+  （`hybrid_recall_small_scale_regression`・`hybrid_recall_large_scale_
+  regression`）のいずれも、標準出力には対象名（テスト名・指標名）と
+  `pass=<bool>` のみを含み、実測値の数値を含めない
+  （`resolve_verbose`・`render_gate_line`）。
+- **`RECALL_VERBOSE=1` opt-in**: ローカルでの実測値確認は明示的な opt-in に
+  限定する。値は厳密一致 `"1"` のみ有効（`crates/engine/benches/harness/
+  sql_c1.rs::resolve_verbose` と同一規約。空白付き値・他表記は無効側へ倒す）。
+- **`GITHUB_ACTIONS` 下の拒否**: opt-in と `GITHUB_ACTIONS`（値を解釈せず
+  存在有無のみ判定）が同時に立っている場合は、コーパス生成・測定の前に
+  `panic!`（固定文言。数値を含まない）で fail-closed に拒否する
+  （`resolve_verbose`）。
+- **`recall.yml` への非注入**: `.github/workflows/recall.yml` は
+  `RECALL_VERBOSE` を意図的に注入しない運用と、上記テスト側の拒否を
+  二重化する（`bench.yml` の `BENCH_VERBOSE` と同型）。
+- **転記禁止**: `RECALL_VERBOSE=1` で得た実測値そのものを本ドキュメント・
+  PR 本文・Issue・コミットメッセージ等の public 資産へ転記しない
+  （`.claude/rules/spec-confidentiality.md`）。
+
+同種の出力方針は `crates/engine/tests/rerank_recall.rs`・
+`crates/engine/tests/query_planning_recall.rs`・
+`crates/engine/tests/precision_eval.rs` へも横展開済み（`query_planning_
+recall.rs`・`precision_eval.rs` の既定出力は本 Issue 以前から実測値を含んで
+おらず、`RECALL_VERBOSE` はローカル診断用の opt-in として方針統一のために
+追加した。`precision_eval.rs` の `precision_eval_report`／
+`precision_eval_policy_sweep`〔判断材料専用の常時実測値出力テスト〕は
+`GITHUB_ACTIONS` 検出時に測定前 `panic!` で拒否する専用ガードを持つ）。
 
 ### コーパス・QA セットの生成
 

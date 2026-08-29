@@ -32,8 +32,9 @@
 //!   variables から注入）と実測値を比較する閾値ゲート。`RERANK_RECALL_REQUIRE_
 //!   THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で未設定を fail-closed
 //!   にする strict モードを持つ（`hybrid_recall.rs::resolve_gate_threshold` と
-//!   同型。ログには実測値と pass/fail のみを出力し、注入された閾値の数値は
-//!   出力しない）
+//!   同型。ログには対象名と pass/fail のみを出力し、実測値は `RECALL_VERBOSE=1`
+//!   （`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時のみ追加出力する
+//!   〔`resolve_verbose`・`verbose_requested_from_env`・`render_gate_line`〕）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 同梱リランカー（[`LexicalOverlapReranker`]）は方式確定までの暫定実装
@@ -472,6 +473,7 @@ const LARGE_SEED: u64 = 0x5EED_0108_4C41_5247;
 /// spec の数値基準は使わない）。
 #[test]
 fn rerank_recall_large_scale_regression() {
+    let verbose = verbose_requested_from_env();
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
         LARGE_NUM_DOCS,
@@ -486,31 +488,33 @@ fn rerank_recall_large_scale_regression() {
     assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
 
     let r = measure_rerank_recall(&docs, &qa);
-    println!(
-        "=== TASK-108 大規模段 Recall（docs={} queries={} total_correct={}） ===",
-        docs.len(),
-        qa.len(),
-        r.total_correct
-    );
-    println!(
-        "baseline Recall@20={:.4} ({}/{})  after Recall@20={:.4} ({}/{})  improvement={:.4}",
-        r.baseline_recall20(),
-        r.baseline_hits20,
-        r.ceil20,
-        r.after_recall20(),
-        r.after_hits20,
-        r.ceil20,
-        r.after_recall20() - r.baseline_recall20(),
-    );
-    println!(
-        "pool Recall@100={:.4} ({}/{})  pool Recall@200={:.4} ({}/{})",
-        r.pool_recall100(),
-        r.pool_hits100,
-        r.ceil100,
-        r.pool_recall200(),
-        r.pool_hits200,
-        r.ceil200,
-    );
+    if verbose {
+        println!(
+            "=== TASK-108 大規模段 Recall（docs={} queries={} total_correct={}） ===",
+            docs.len(),
+            qa.len(),
+            r.total_correct
+        );
+        println!(
+            "baseline Recall@20={:.4} ({}/{})  after Recall@20={:.4} ({}/{})  improvement={:.4}",
+            r.baseline_recall20(),
+            r.baseline_hits20,
+            r.ceil20,
+            r.after_recall20(),
+            r.after_hits20,
+            r.ceil20,
+            r.after_recall20() - r.baseline_recall20(),
+        );
+        println!(
+            "pool Recall@100={:.4} ({}/{})  pool Recall@200={:.4} ({}/{})",
+            r.pool_recall100(),
+            r.pool_hits100,
+            r.ceil100,
+            r.pool_recall200(),
+            r.pool_hits200,
+            r.ceil200,
+        );
+    }
 
     // after が baseline を下回らないことの独立したアサーション（リランキング層が
     // Recall を悪化させていないことの最小保証）。固定値アサーションとは別に、
@@ -645,6 +649,102 @@ fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
     resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
+// ---------- 実測値の既定非出力（Issue #303）。`RECALL_VERBOSE` opt-in ゲート ----------
+// `hybrid_recall.rs` の同名ヘルパと同一実装（`tests/` 直下は独立 test crate・
+// 共有モジュール無しの既存慣行に合わせてファイルごとに複製する）。
+
+/// `RECALL_VERBOSE` の生値と `GITHUB_ACTIONS` 判定を引数化した純関数（単体テスト可能）。
+/// `hybrid_recall.rs::resolve_verbose` と同一契約（Issue #303）。
+fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, &'static str> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(
+            "RECALL_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values",
+        );
+    }
+    Ok(requested)
+}
+
+/// 環境変数を読み取って [`resolve_verbose`] へ渡し、`Err` は `panic!` で fail-closed に
+/// する（各ゲート・層 A 回帰の冒頭、コーパス生成前に呼ぶ）。
+fn verbose_requested_from_env() -> bool {
+    let raw = std::env::var("RECALL_VERBOSE").ok();
+    match resolve_verbose(raw.as_deref(), std::env::var_os("GITHUB_ACTIONS").is_some()) {
+        Ok(v) => v,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+/// 閾値ゲート判定行の描画（`hybrid_recall.rs::render_gate_line` と同一契約）。
+/// `verbose=false`（既定）では実測値を含めず、`verbose=true` では `value=<f64:.4>`
+/// を付加する。
+fn render_gate_line(gate: &str, metric: &str, value: f64, pass: bool, verbose: bool) -> String {
+    if verbose {
+        format!("{gate}: {metric} value={value:.4} pass={pass}")
+    } else {
+        format!("{gate}: {metric} pass={pass}")
+    }
+}
+
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::{render_gate_line, resolve_verbose};
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        for raw in [" 1", "true", "0", ""] {
+            assert_eq!(resolve_verbose(Some(raw), false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert!(resolve_verbose(Some("1"), true).is_err());
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
+
+    #[test]
+    fn render_gate_line_non_verbose_excludes_measured_value() {
+        let line = render_gate_line(
+            "rerank_recall_large_scale_threshold_gate",
+            "after_recall@20",
+            0.8465,
+            false,
+            false,
+        );
+        assert!(!line.contains("0.8465"));
+        assert!(!line.contains("value="));
+        assert!(line.contains("pass=false"));
+    }
+
+    #[test]
+    fn render_gate_line_verbose_includes_measured_value() {
+        let line = render_gate_line(
+            "rerank_recall_large_scale_threshold_gate",
+            "after_recall@20",
+            0.8465,
+            true,
+            true,
+        );
+        assert!(line.contains("value=0.8465"));
+        assert!(line.contains("pass=true"));
+    }
+}
+
 /// TASK-108（SEARCH-7）層 B: 大規模段のリランキング後の最終 Recall@20 が
 /// `RERANK_RECALL_MIN_R20_LARGE`（絶対下限）以上、かつ baseline からの改善幅
 /// （after − baseline）が `RERANK_RECALL_MIN_R20_IMPROVEMENT` 以上であることを
@@ -652,11 +752,13 @@ fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
 /// threshold_gate` と同一（2 つの下限を独立に解決し、片方のみ設定済みの場合は
 /// 設定済みの側だけを判定する。両方未設定かつ非 strict の場合のみコーパス生成前に
 /// 早期 return して成功終了する。strict モードでは [`resolve_gate_threshold`] が
-/// 未設定を検出した時点で fail-closed になる）。ログには実測値と pass/fail のみを
-/// 出力し、注入された閾値の数値は出力しない。
+/// 未設定を検出した時点で fail-closed になる）。ログには対象名と pass/fail のみを
+/// 出力し、注入された閾値・実測値の数値は出力しない（`RECALL_VERBOSE=1` opt-in 時
+/// のみ実測値を追加出力する。Issue #303・[`render_gate_line`] 参照）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make rerank-regression で実行する"]
 fn rerank_recall_large_scale_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_r20_abs = resolve_gate_threshold("RERANK_RECALL_MIN_R20_LARGE");
     let min_r20_improvement =
         resolve_improvement_gate_threshold("RERANK_RECALL_MIN_R20_IMPROVEMENT");
@@ -684,7 +786,14 @@ fn rerank_recall_large_scale_threshold_gate() {
             let pass_abs = after_recall20 >= min;
             pass &= pass_abs;
             println!(
-                "rerank_recall_large_scale_threshold_gate: after_recall@20={after_recall20:.4} pass_abs={pass_abs}"
+                "{}",
+                render_gate_line(
+                    "rerank_recall_large_scale_threshold_gate",
+                    "after_recall@20",
+                    after_recall20,
+                    pass_abs,
+                    verbose
+                )
             );
         }
         None => {
@@ -698,7 +807,14 @@ fn rerank_recall_large_scale_threshold_gate() {
             let pass_improvement = improvement >= min;
             pass &= pass_improvement;
             println!(
-                "rerank_recall_large_scale_threshold_gate: improvement@20={improvement:.4} pass_improvement={pass_improvement}"
+                "{}",
+                render_gate_line(
+                    "rerank_recall_large_scale_threshold_gate",
+                    "improvement@20",
+                    improvement,
+                    pass_improvement,
+                    verbose
+                )
             );
         }
         None => {
