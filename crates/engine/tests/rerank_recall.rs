@@ -311,6 +311,12 @@ struct RerankRecallResult {
     ceil20: usize,
     ceil100: usize,
     ceil200: usize,
+    /// ミスマッチ制御（chance level）: 各クエリの baseline/after 出力を「1 つ
+    /// ずらした別クエリの正解集合」に対しても採点した hit 数の合計
+    /// （`hybrid_recall.rs::RecallResult::control_hits20` と同型。Issue #312
+    /// codex-review P1 対応。`CONTROL_FACTOR` 参照）。
+    control_baseline_hits20: usize,
+    control_after_hits20: usize,
 }
 
 impl RerankRecallResult {
@@ -361,12 +367,17 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
     let mut ceil20 = 0usize;
     let mut ceil100 = 0usize;
     let mut ceil200 = 0usize;
+    let mut control_baseline_hits20 = 0usize;
+    let mut control_after_hits20 = 0usize;
 
-    for case in qa {
+    for (idx, case) in qa.iter().enumerate() {
         total_correct += case.correct.len();
         ceil20 += case.correct.len().min(20);
         ceil100 += case.correct.len().min(100);
         ceil200 += case.correct.len().min(200);
+        // ミスマッチ制御: 1 つずらした別クエリの正解集合（chance level 対照値。
+        // `hybrid_recall.rs::measure_recall_against` と同型）。
+        let control_correct = &qa[(idx + 1) % qa.len()].correct;
 
         let input = SearchInput {
             ids: &ids,
@@ -390,10 +401,14 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
         .expect("hybrid_search ok");
 
         // ---- baseline: リランキングなし（プール先頭 20 件） ----
-        baseline_hits20 += pool
+        let baseline_top20: Vec<u64> = pool.iter().take(20).map(|h| h.id).collect();
+        baseline_hits20 += baseline_top20
             .iter()
-            .take(20)
-            .filter(|h| case.correct.contains(&h.id))
+            .filter(|id| case.correct.contains(id))
+            .count();
+        control_baseline_hits20 += baseline_top20
+            .iter()
+            .filter(|id| control_correct.contains(id))
             .count();
 
         // ---- 補助計測: プール自体の Recall@100/@200（原因分析用） ----
@@ -419,6 +434,10 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
             .iter()
             .filter(|h| case.correct.contains(&h.id))
             .count();
+        control_after_hits20 += reranked
+            .iter()
+            .filter(|h| control_correct.contains(&h.id))
+            .count();
     }
 
     RerankRecallResult {
@@ -430,8 +449,15 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
         ceil20,
         ceil100,
         ceil200,
+        control_baseline_hits20,
+        control_after_hits20,
     }
 }
+
+/// [`RerankRecallResult::control_baseline_hits20`]/[`control_after_hits20`] の
+/// 許容倍率（`hybrid_recall.rs::CONTROL_FACTOR` と同じ設計値。spec 由来の
+/// 非公開数値ではない。Issue #312 codex-review P1 対応）。
+const CONTROL_FACTOR: usize = 3;
 
 /// Issue #312: `hybrid_recall.rs::qa_accounting` と同じ設計の会計整合ヘルパ。
 /// `total_correct`/`ceil20`/`ceil100`/`ceil200` を QA セット（[`QaCase::correct`]）
@@ -596,6 +622,19 @@ fn rerank_recall_large_scale_regression() {
     assert!(
         r.baseline_hits20 > 0,
         "baseline の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
+    );
+    // ミスマッチ制御（chance level）比較: baseline/after いずれも、無関係な
+    // 別クエリの正解集合に対する偶然一致水準の CONTROL_FACTOR 倍を上回ることを
+    // 確認する（Issue #312 codex-review P1 対応。`hybrid_recall.rs` と同型）。
+    assert!(
+        r.baseline_hits20 > r.control_baseline_hits20 * CONTROL_FACTOR,
+        "baseline の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+         十分に上回らなかった"
+    );
+    assert!(
+        r.after_hits20 > r.control_after_hits20 * CONTROL_FACTOR,
+        "after の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+         十分に上回らなかった"
     );
 }
 

@@ -187,6 +187,13 @@ const ASCII_IDS: [&str; 8] = ["API", "TODO", "v2", "memo", "draft", "id01", "ver
 const NUM_DOCS: usize = 5000;
 const NUM_QUERIES: usize = 100;
 
+/// ミスマッチ制御（chance level）比較の許容倍率。実際の hit 数が「無関係な
+/// 別クエリの正解集合」に対する偶然一致数の何倍を上回れば良しとするかを決める
+/// テストハーネス自身の設計値であり、spec 由来の非公開数値ではない
+/// （Issue #312 codex-review P1 対応。`docs/design/cjk-tokenizer-impact-ja-corpus.md`
+/// 参照）。
+const CONTROL_FACTOR: usize = 3;
+
 /// [`zipf_index`] が使う累積重み（重み `1/(i+1)` の累積和）を 1 度だけ構築する。
 /// コーパス生成中（拒否ループ含む）で数万回呼ばれるため、呼び出しごとの
 /// 重みベクトル再構築を避ける。
@@ -448,6 +455,22 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     for case in &qa {
         assert!(!case.correct.is_empty());
     }
+    // フィクスチャ規模そのものの縮退検知（Cursor Bugbot 指摘対応）:
+    // `total_correct`/`ceil20`/`ceil100` は qa 自身から会計整合を再計算するため、
+    // qa（延いてはコーパス）が生成ロジックの変化で縮小しても検知できない。
+    // 生成に使う定数（NUM_DOCS・NUM_QUERIES）に対する固定値検査で fixture
+    // サイズそのものを回帰トラッキングする（hybrid_recall.rs・rerank_recall.rs の
+    // 既存 `qa.len()` 固定値検査と同型）。
+    assert_eq!(
+        docs.len(),
+        NUM_DOCS,
+        "コーパス件数が生成定数から変化した（コーパス生成ロジックの回帰）"
+    );
+    assert_eq!(
+        qa.len(),
+        NUM_QUERIES,
+        "QA 件数が生成定数から変化した（generate_qa_set の重複除外・空集合除外パスでの縮退懸念）"
+    );
 
     let stats_on = build_stats(&docs, |t| tokenize_with_options(t, true));
     let stats_off = build_stats(&docs, |t| tokenize_with_options(t, false));
@@ -461,11 +484,23 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     // が達成可能な hit 数の上限となる。
     let mut ceil20 = 0usize;
     let mut ceil100 = 0usize;
+    // クエリ単位の到達カバレッジ（変種 A/B のみ。正解を 1 件も拾えなかった
+    // クエリの件数を検知する。Issue #312 codex-review P1 対応: 会計整合・
+    // 上限以下・単調性・非空だけでは「1 hit だけ拾えれば全体が通過」してしまい
+    // Recall がほぼゼロまで崩壊しても検知できないため追加する）。
+    let mut queries_hit20 = [0usize; 3];
+    // ミスマッチ制御（chance level）: 各クエリの実際の上位 20 件を「1 つずらした
+    // 別クエリの正解集合」に対しても採点し、偶然一致の水準を同一ランで実測する。
+    // 実際の hit 数がこの chance level を大きく上回ることを下部で確認することで、
+    // Recall が偶然一致の水準まで崩壊していないことを、非公開の絶対値を使わずに
+    // 検知する（Issue #312 codex-review P1 対応）。
+    let mut control_hits20 = [0usize; 3];
 
-    for case in &qa {
+    for (idx, case) in qa.iter().enumerate() {
         total_correct += case.correct.len();
         ceil20 += case.correct.len().min(20);
         ceil100 += case.correct.len().min(100);
+        let control_correct = &qa[(idx + 1) % qa.len()].correct;
 
         let query_on: BTreeSet<String> = tokenize_with_options(&case.query, true)
             .into_iter()
@@ -483,15 +518,20 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
             .into_iter()
             .enumerate()
         {
-            hits20[i] += ranked
-                .iter()
-                .take(20)
-                .filter(|id| case.correct.contains(id))
-                .count();
+            let top20: Vec<u64> = ranked.iter().take(20).copied().collect();
+            let h20 = top20.iter().filter(|id| case.correct.contains(id)).count();
+            hits20[i] += h20;
+            if h20 > 0 {
+                queries_hit20[i] += 1;
+            }
             hits100[i] += ranked
                 .iter()
                 .take(100)
                 .filter(|id| case.correct.contains(id))
+                .count();
+            control_hits20[i] += top20
+                .iter()
+                .filter(|id| control_correct.contains(id))
                 .count();
         }
     }
@@ -561,6 +601,24 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
         assert!(
             hits20[i] > 0,
             "変種 {i} の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
+        );
+        // クエリ単位カバレッジ: 本 QA セットは各クエリの正解を「2 語 AND 一致」で
+        // 厳密に構成しており（`generate_qa_set`）、トークナイザが正しく機能する
+        // 限りどのクエリも上位 20 件から少なくとも 1 件は正解を拾えるはずである。
+        // 合計 hit 数だけでは「特定の 1 クエリが hit を稼ぎ、残り全クエリが 0 件」
+        // でも通過してしまう（Issue #312 codex-review P1 対応）。
+        assert_eq!(
+            queries_hit20[i],
+            qa.len(),
+            "変種 {i} で Recall@20 の hit が 0 件のクエリが存在した（一部クエリで正解を 1 件も拾えていない）"
+        );
+        // ミスマッチ制御（chance level）比較: 実際の hit 数が、無関係な別クエリの
+        // 正解集合に対する偶然一致水準の CONTROL_FACTOR 倍を上回ることを確認する。
+        // Recall が偶然一致の水準まで崩壊すると、この関係が破れて検知できる。
+        assert!(
+            hits20[i] > control_hits20[i] * CONTROL_FACTOR,
+            "変種 {i} の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+             十分に上回らなかった（Recall が chance level 近くまで崩壊した懸念）"
         );
     }
 

@@ -443,6 +443,12 @@ struct RecallResult {
     hits100: usize,
     ceil20: usize,
     ceil100: usize,
+    /// ミスマッチ制御（chance level）: 各クエリの実際の上位 20/100 件を「1 つ
+    /// ずらした別クエリの正解集合」に対しても採点した hit 数の合計。Recall が
+    /// 偶然一致の水準まで崩壊していないことを、非公開の絶対値を使わずに検知する
+    /// ための対照値（Issue #312 codex-review P1 対応。`CONTROL_FACTOR` 参照）。
+    control_hits20: usize,
+    control_hits100: usize,
 }
 
 impl RecallResult {
@@ -459,6 +465,12 @@ impl RecallResult {
         self.hits100 as f64 / self.ceil100 as f64
     }
 }
+
+/// [`RecallResult::control_hits20`]/[`control_hits100`] の許容倍率。実際の
+/// hit 数がこの対照値の何倍を上回れば良しとするかを決めるテストハーネス自身の
+/// 設計値であり、spec 由来の非公開数値ではない（Issue #312 codex-review P1
+/// 対応。`docs/design/hybrid-recall-regression.md` 参照）。
+const CONTROL_FACTOR: usize = 3;
 
 /// [`PlannerFixture`] が [`EngineCore::plan_query`] の辞書スナップショット
 /// （`dictionary_snapshot` → [`query_planner::render_prompt_prefix`]）へ確実に
@@ -720,11 +732,17 @@ fn measure_recall_against(
     let mut hits100 = 0usize;
     let mut ceil20 = 0usize;
     let mut ceil100 = 0usize;
+    let mut control_hits20 = 0usize;
+    let mut control_hits100 = 0usize;
 
-    for case in qa {
+    for (idx, case) in qa.iter().enumerate() {
         total_correct += case.correct.len();
         ceil20 += case.correct.len().min(20);
         ceil100 += case.correct.len().min(100);
+        // ミスマッチ制御: 1 つずらした別クエリの正解集合（chance level 対照値。
+        // [`RecallResult::control_hits20`] 参照）。qa が空でないことは呼び出し側の
+        // 不変条件（`assert!(!qa.is_empty())`）。
+        let control_correct = &qa[(idx + 1) % qa.len()].correct;
 
         // `Baseline` は既存の QA クエリをそのまま複製して使い、`Expanded` は
         // production のクエリ展開経路（[`expand_and_reconstruct_with`]）で
@@ -754,12 +772,17 @@ fn measure_recall_against(
         )
         .expect("hybrid_search ok");
 
-        hits20 += hits
-            .iter()
-            .take(20)
-            .filter(|h| case.correct.contains(&h.id))
-            .count();
+        let top20: Vec<u64> = hits.iter().take(20).map(|h| h.id).collect();
+        hits20 += top20.iter().filter(|id| case.correct.contains(id)).count();
         hits100 += hits.iter().filter(|h| case.correct.contains(&h.id)).count();
+        control_hits20 += top20
+            .iter()
+            .filter(|id| control_correct.contains(id))
+            .count();
+        control_hits100 += hits
+            .iter()
+            .filter(|h| control_correct.contains(&h.id))
+            .count();
     }
 
     RecallResult {
@@ -768,6 +791,8 @@ fn measure_recall_against(
         hits100,
         ceil20,
         ceil100,
+        control_hits20,
+        control_hits100,
     }
 }
 
@@ -944,6 +969,15 @@ fn hybrid_recall_small_scale_regression() {
         r.hits20 < r.ceil20,
         "小規模段の Recall@20 が理論上限に張り付いた（lossy view の設計前提が崩れた）"
     );
+    // ミスマッチ制御（chance level）比較: 実際の hit 数が、無関係な別クエリの
+    // 正解集合に対する偶然一致水準の CONTROL_FACTOR 倍を上回ることを確認する
+    // （Issue #312 codex-review P1 対応。合計 hit 数の非空性・上限以下だけでは
+    // Recall が chance level 近くまで崩壊しても「1 hit」で通過してしまう）。
+    assert!(
+        r.hits20 > r.control_hits20 * CONTROL_FACTOR,
+        "小規模段の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+         十分に上回らなかった"
+    );
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -1061,6 +1095,18 @@ fn hybrid_recall_large_scale_regression() {
     assert!(
         r.hits100 < r.ceil100,
         "大規模段の Recall@100 が理論上限に張り付いた（lossy view の設計前提が崩れた）"
+    );
+    // ミスマッチ制御（chance level）比較（Issue #312 codex-review P1 対応。
+    // `hybrid_recall_small_scale_regression` と同じ理由）。
+    assert!(
+        r.hits20 > r.control_hits20 * CONTROL_FACTOR,
+        "大規模段の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+         十分に上回らなかった"
+    );
+    assert!(
+        r.hits100 > r.control_hits100 * CONTROL_FACTOR,
+        "大規模段の Recall@100 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
+         十分に上回らなかった"
     );
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
