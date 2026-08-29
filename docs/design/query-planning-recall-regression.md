@@ -169,3 +169,13 @@
   事項であり、本リポジトリにはハードコードしない。展開品質の劣化検出感度は、層 A
   （`MockLlmClient` との相対比較。`query_planning_recall_detects_degraded_expansion_quality`）
   に加え、層 B のこの第 3 副検査でも回帰保証する
+
+## 追記（Issue #286）
+
+`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`・`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`・
+`QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`・
+`QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` の
+variable ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に
+集約した。strict モードの必須条件として全 9 変数（`DEGRADED` 含む）の設定が
+必要である旨も同ファイルに記載する。実値設定・`workflow_dispatch` 疎通確認は
+引き続きマージ後のリポジトリ管理者作業。
