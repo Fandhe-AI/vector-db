@@ -74,11 +74,24 @@ hit 数（micro-average）として測定した。
 
 層 A が検証する関係:
 
+- **フィクスチャ規模の固定値検査**: `docs.len() == NUM_DOCS`・
+  `qa.len() == NUM_QUERIES`（コーパス生成ロジックの縮退検知。Cursor Bugbot
+  指摘対応。`hybrid_recall.rs`・`rerank_recall.rs` の同型検査と揃える）
 - **会計整合**: `total_correct`/`ceil20`/`ceil100` が QA セットからの独立な
   再計算と一致する
 - **変種 A・B**: 上限以下（`hits20 <= ceil20`・`hits100 <= ceil100`・
   `hits100 <= total_correct`）・単調性（`hits20 <= hits100`）・非空
   （`hits20 > 0`。vacuous pass 防止）
+- **変種 A・B のクエリ単位カバレッジ**: `queries_hit20 == qa.len()`（上位 20 件
+  から正解を 1 件も拾えなかったクエリが 0 件であること。合計 hit 数だけでは
+  「特定の 1 クエリが hit を稼ぎ、残り全クエリが 0 件」でも通過してしまう
+  ため追加。codex-review P1 対応）
+- **変種 A・B のミスマッチ制御（chance level）比較**: `hits20 > control_hits20
+  * CONTROL_FACTOR`（実際の hit 数が、1 つずらした別クエリの正解集合に対する
+  偶然一致水準を一定倍率上回ることを同一ランで実測して確認する。Recall が
+  chance level 近くまで崩壊した場合に検知する。`CONTROL_FACTOR` はテスト
+  ハーネス自身の設計値であり spec 由来の非公開数値ではない。codex-review P1
+  対応）
 - **変種 C（ASCII のみ）**: `hits20 == 0 && hits100 == 0`（実測値ではなく構造的な
   自明値。詳細は「考察」参照）
 - **A が C を上回る**: `hits100[A] > hits100[C]`（除去 ON が空クエリ構成
@@ -126,9 +139,13 @@ hit 数（micro-average）として測定した。
 関係アサーションへ置換した。あわせて同テストが Recall 実測値を無条件で標準
 出力へ印字していたのを、他の Recall 系テスト（Issue #303）と同一契約の
 `RECALL_VERBOSE` opt-in（`GITHUB_ACTIONS` 下は fail-closed で拒否）へ変更した。
-回帰検知力の低下分は他の Recall 系テストの層 B に相当する仕組みを本ファイルは
-持たないため、関係アサーション自体（会計整合・上限以下・単調性・非空）で
-引き続き検知する。
+本ファイルは他の Recall 系テストの層 B（`#[ignore]`・spec 由来の非公開閾値
+ゲート）に相当する仕組みを持たないため、PR 通常 CI（層 A）自体の検知力を
+会計整合・上限以下・単調性・非空だけに委ねると、Recall が chance level 近くまで
+崩壊しても「1 hit」で通過しうる懸念があった（codex-review P1・Issue #312
+フォローアップ）。フィクスチャ規模の固定値検査・クエリ単位カバレッジ・
+ミスマッチ制御（chance level）比較を追加し、非公開の絶対値を使わずに検知力を
+補強した（詳細は「測定方法と層 A が検証する関係」節参照）。
 
 ## 制約・スコープ外
 

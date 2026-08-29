@@ -118,6 +118,17 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
   下回らない」独立アサーション。定性的な効果があること自体は本節で確認するが、
   改善幅そのものの下限判定は層 B `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う）
 - **非空**（vacuous pass 防止）: `baseline_hits20 > 0`
+- **ミスマッチ制御（chance level）比較**: `baseline_hits20 > control_baseline_hits20
+  * CONTROL_FACTOR` かつ `after_hits20 > control_after_hits20 * CONTROL_FACTOR`。
+  `control_baseline_hits20`/`control_after_hits20` は各クエリの baseline/after
+  出力を「1 つずらした別クエリの正解集合」に対しても採点した hit 数の合計で、
+  `measure_rerank_recall` が同一ランで実測する対照値（`hybrid_recall.rs` の
+  同型対照値と設計を揃える）。層 B（`RERANK_RECALL_MIN_R20_IMPROVEMENT` 等）は
+  `workflow_dispatch`/`schedule` のみで PR の通常 CI では評価されないため、
+  「非空」だけでは Recall が chance level 近くまで崩壊しても 1 hit で通過して
+  しまう懸念があった（codex-review P1 指摘・Issue #312 フォローアップ）。この
+  比較は非公開の絶対値を使わずに PR の通常 CI（層 A）自体で検知するために追加
+  した
 
 暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と融合スコア順位を RRF 型で
 再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を改善している

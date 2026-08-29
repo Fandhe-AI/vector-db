@@ -281,10 +281,20 @@ Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall
 - **非空**（vacuous pass 防止）: `hits20 > 0`（両段）
 - **非飽和**（lossy view の設計前提）: `hits20 < ceil20`（両段）・
   `hits100 < ceil100`（大規模段）
+- **ミスマッチ制御（chance level）比較**（両段）: `hits20 > control_hits20 *
+  CONTROL_FACTOR`（大規模段は `hits100 > control_hits100 * CONTROL_FACTOR` も）。
+  `control_hits20`/`control_hits100` は各クエリの実際の上位 k 件を「1 つずらした
+  別クエリの正解集合」に対しても採点した hit 数の合計で、`measure_recall_against`
+  が同一ランで実測する対照値。実際の hit 数がこの偶然一致水準を一定倍率
+  （`CONTROL_FACTOR`。テストハーネス自身の設計値であり spec 由来の非公開数値
+  ではない）上回ることを要求する
 
-回帰検知力は固定値方式より弱くなるが、これは Issue #312 の方針どおりであり、
-回帰検知力の低下分は層 B（`recall-gate` の非公開閾値ゲート）が担う設計変更で
-ある。
+層 B（`recall-gate` の非公開閾値ゲート）は `workflow_dispatch`/`schedule` のみで
+PR の通常 CI では評価されないため、「回帰検知力の低下分は層 B が補う」という
+前提は PR マージ判定には効かない（codex-review P1 指摘・Issue #312
+フォローアップ）。上記のミスマッチ制御比較は、非公開の絶対値を使わずに
+「Recall が chance level 近くまで崩壊しても 1 hit で通過してしまう」懸念を
+PR の通常 CI（層 A）自体で検知するために追加した。
 
 大規模段のデバッグビルド実行時間はローカル実測で約 4.5 秒であり、PR CI
 （`cargo test`）に含めても許容範囲と判断し、層 A の両テストとも `#[ignore]` に
