@@ -162,9 +162,9 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   どちらかの GPU 初期化が失敗した環境では「測定不能（`pass=false`）」とし、
   CPU 経路同士の比較値を GPU 実測の代替として計上しない（CORE-6 と同方針）
 - CORE-6/CORE-16 の短縮率下限はそれぞれ `BENCH_CORE6_MIN_IMPROVEMENT_PCT` /
-  `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（Actions variables）から注入し、
-  未設定・非正値は fail-closed（値は spec が SSOT のため本リポに
-  デフォルトを持たない）
+  `BENCH_CORE16_MIN_IMPROVEMENT_PCT`（Actions secrets。Issue #286 で variables
+  から移行）から注入し、未設定・非正値は fail-closed（値は spec が SSOT の
+  ため本リポにデフォルトを持たない）
 
 ## 3. ローカル実測（開発環境）
 
@@ -182,7 +182,7 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   （`crates/engine/tests/gpu_batch.rs`）
 - `make bench-batch` の CORE-6 ゲート（`BENCH_CORE6` opt-in）が GPU 経路で
   完走し、CPU-SIMD 経路との A/B p95 を実測できることを確認した（縮退イベント
-  0 件。閾値・判定値そのものは Actions variables 経由で注入されるため本文には
+  0 件。閾値・判定値そのものは Actions secrets 経由で注入されるため本文には
   記録しない）
 - GitHub ホステッド runner（CI）には GPU が無いため、CI では常に
   「初期化失敗 → CPU-SIMD 縮退」分岐のみが実走する。開発環境（GPU あり）で

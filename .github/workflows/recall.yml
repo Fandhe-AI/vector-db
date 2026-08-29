@@ -22,7 +22,7 @@ name: Recall
 # `RERANK_RECALL_MIN_*`（下記 strict モード参照）が environment `recall-gate` に
 # 未設定のまま schedule 実行された場合は fail-closed で run が red になり、
 # 「一度も評価していない run」が green として埋もれることはない
-# （README「Recall 回帰ハーネスの repo variables」参照）。
+# （README「Recall 回帰ハーネスの repo secrets」参照）。
 #
 # `pull_request` トリガは意図的に設定しない（PR #147 codex-review P0 指摘で追加後に
 # 巻き戻した。`pull_request` で起動する job は PR 側の untrusted なコード
@@ -34,7 +34,7 @@ name: Recall
 # （週次自動。#168 で再追加済み）に限定する。PR のマージ判定は層 A（`crates/engine/tests/
 # hybrid_recall.rs` の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
 # `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
-# 役割分担にする（README「Recall 回帰ハーネスの repo variables」・
+# 役割分担にする（README「Recall 回帰ハーネスの repo secrets」・
 # `docs/design/hybrid-recall-regression.md` 参照）。
 #
 # `workflow_dispatch` は任意の ref を選択して起動できるため、トリガを絞るだけでは
@@ -50,24 +50,33 @@ name: Recall
 # write 権限者が別ブランチでこのガードを外した recall.yml を push して
 # `workflow_dispatch` すれば、選択した ref の YAML がそのまま実行される
 # （workflow_dispatch は選択 ref の workflow 定義を使う）。加えて repo レベルの
-# Actions variables（`vars.*`）はどのブランチのどの workflow からも読めるため、
+# Actions secrets（`secrets.*`）はどのブランチのどの workflow からも読めるため、
 # YAML 内の if 条件だけでは `HYBRID_RECALL_MIN_*` の参照を防げない
-# （Cursor Bugbot High 指摘）。
+# （Cursor Bugbot High 指摘。当初の指摘は repo variables に対するものだったが、
+# repo レベルの secrets も同じくどのブランチからも読める点は変わらないため、
+# secrets 化後も environment によるスコープ限定が引き続き必要）。
 #
 # そのため実行境界は YAML の条件式ではなく GitHub Environments のブランチ保護で作る:
 # `recall-regression` job に `environment: recall-gate` を指定し、
 # `HYBRID_RECALL_MIN_*` は repo レベルではなく environment `recall-gate` の
-# variables として設定する（参照記法 `vars.*` は変わらず、environment 指定により
-# 解決スコープが repo レベルから environment レベルへ切り替わる）。environment
-# `recall-gate` は deployment branch policy で `main` のみに制限して作成する
-# （リポジトリ管理者作業。README「Recall 回帰ハーネスの repo variables」参照）。
+# secrets として設定する（参照記法 `secrets.*` は repo レベルと同じだが、
+# environment 指定により解決スコープが repo レベルから environment レベルへ
+# 切り替わる）。environment `recall-gate` は deployment branch policy で
+# `main` のみに制限して作成する（リポジトリ管理者作業。
+# `docs/design/ci-gate-variables.md` 参照）。
 # これにより main 以外の ref から起動した run は environment `recall-gate` に
-# アクセスできず、その run 内の variables 参照はすべて未設定（空文字列）に解決される
+# アクセスできず、その run 内の secrets 参照はすべて未設定（空文字列）に解決される
 # ——別ブランチの改変 YAML から `if`／`checkout ref` を外して workflow_dispatch した
 # としても、`recall-gate` environment 自体にアクセスできないため閾値を取得できない。
 # 既存の `if: github.ref == 'refs/heads/main'`・`checkout ref: main` は
 # defense-in-depth として維持する（environment 保護がバイパスされた場合の
 # 追加防御。単独では実行境界として不十分な点は上記のとおり）。
+#
+# なお `HYBRID_RECALL_MIN_*` 等の閾値注入を variables から environment `recall-gate`
+# の secrets へ切り替えた経緯（Issue #286。`env:` ブロックがログへ値付きで印字される
+# ことによる漏えい）は `docs/design/ci-gate-variables.md` 参照。secrets は Actions が
+# 一致文字列を自動的に `***` へマスクするため同じ経路では漏えいしない。上記の
+# environment によるブランチ保護は secrets 化後も引き続き実行境界として維持する。
 #
 # `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（下の Run step 参照）は strict モードを
 # 有効化するフラグで、`HYBRID_RECALL_MIN_*` が未設定の場合を「一度も評価していない
@@ -104,9 +113,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # environment 保護（deployment branch policy で main のみに制限。
-    # リポジトリ管理者が事前に作成する）が実際の実行境界。`vars.HYBRID_RECALL_MIN_*`
-    # はこの environment の variables として設定し、repo レベルには置かない
-    # （冒頭コメント参照。Cursor Bugbot High 指摘対応）。
+    # リポジトリ管理者が事前に作成する）が実際の実行境界。`secrets.HYBRID_RECALL_MIN_*`
+    # はこの environment の secrets として設定し、repo レベルには置かない
+    # （冒頭コメント参照。Cursor Bugbot High 指摘対応＋Issue #286 の secrets 化）。
     environment: recall-gate
     permissions:
       contents: read
@@ -124,9 +133,9 @@ jobs:
         # 数値基準（Recall 下限）は spec（TASK-104・SEARCH-1, SEARCH-2）が SSOT のため
         # 本ワークフローにはハードコードしない。environment `recall-gate`（上の
         # `environment:` 参照。main のみに制限した deployment branch policy 付き）の
-        # Actions variables（`vars.*`）から注入する。参照記法は repo レベル variables
-        # と同じ `vars.*` だが、job に `environment:` を指定しているため解決スコープが
-        # environment レベルに切り替わる。
+        # Actions secrets（`secrets.*`。Issue #286）から注入する。参照記法は repo
+        # レベル secrets と同じ `secrets.*` だが、job に `environment:` を指定して
+        # いるため解決スコープが environment レベルに切り替わる。
         #
         # `HYBRID_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント参照）を
         # 常に注入する: `HYBRID_RECALL_MIN_*` が未設定（environment 作成漏れ・
@@ -141,16 +150,16 @@ jobs:
         # 出力しない。
         env:
           HYBRID_RECALL_REQUIRE_THRESHOLDS: "1"
-          HYBRID_RECALL_MIN_R20_SMALL: ${{ vars.HYBRID_RECALL_MIN_R20_SMALL }}
-          HYBRID_RECALL_MIN_R20_LARGE: ${{ vars.HYBRID_RECALL_MIN_R20_LARGE }}
-          HYBRID_RECALL_MIN_R100_LARGE: ${{ vars.HYBRID_RECALL_MIN_R100_LARGE }}
+          HYBRID_RECALL_MIN_R20_SMALL: ${{ secrets.HYBRID_RECALL_MIN_R20_SMALL }}
+          HYBRID_RECALL_MIN_R20_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R20_LARGE }}
+          HYBRID_RECALL_MIN_R100_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R100_LARGE }}
         run: make recall-regression
       - name: Run rerank-regression
         # TASK-108（SEARCH-7）の層 B（`crates/engine/tests/rerank_recall.rs`）。
         # 数値基準（リランキング後の Recall@20 絶対下限・baseline からの改善幅の
         # 下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
         # `Run recall-regression` step と同じ environment `recall-gate`
-        # （job の `environment:` 参照）の Actions variables から注入する。
+        # （job の `environment:` 参照）の Actions secrets から注入する（Issue #286）。
         #
         # `RERANK_RECALL_REQUIRE_THRESHOLDS=1`（strict モード。冒頭コメント参照）を
         # 常に注入する: `RERANK_RECALL_MIN_*` が未設定の場合、この workflow からの
@@ -164,8 +173,8 @@ jobs:
         # 出力しない。
         env:
           RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
-          RERANK_RECALL_MIN_R20_LARGE: ${{ vars.RERANK_RECALL_MIN_R20_LARGE }}
-          RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ vars.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
+          RERANK_RECALL_MIN_R20_LARGE: ${{ secrets.RERANK_RECALL_MIN_R20_LARGE }}
+          RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ secrets.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
         run: make rerank-regression
       - name: Run query-planning-regression
         # TASK-112（PLAN-1, PLAN-2）の層 B（`crates/engine/tests/query_planning_recall.rs`）。
@@ -173,7 +182,7 @@ jobs:
         # 絶対下限・NoisyLlmClient〔非 oracle・劣化展開品質〕による intent 改善幅
         # 下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
         # step と同じ environment `recall-gate`（job の `environment:` 参照）の
-        # Actions variables から注入する。
+        # Actions secrets から注入する（Issue #286）。
         #
         # `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` は、既存 2 変数
         # （`MockLlmClient` の完全 oracle 写像専用に較正）を `NoisyLlmClient` の
@@ -202,10 +211,10 @@ jobs:
         # 出力しない。
         env:
           QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS: "1"
-          QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT: ${{ vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT }}
-          QUERY_PLANNING_RECALL_MIN_R20_DIRECT: ${{ vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT }}
+          QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT: ${{ secrets.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT }}
+          QUERY_PLANNING_RECALL_MIN_R20_DIRECT: ${{ secrets.QUERY_PLANNING_RECALL_MIN_R20_DIRECT }}
           QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED: ${{
-            vars.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED }}
+            secrets.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED }}
           QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE: ${{
-            vars.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
+            secrets.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
         run: make query-planning-regression

@@ -175,7 +175,9 @@
 `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`・`QUERY_PLANNING_RECALL_MIN_R20_DIRECT`・
 `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`・
 `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` の
-variable ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に
+secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に
 集約した。strict モードの必須条件として全 9 変数（`DEGRADED` 含む）の設定が
 必要である旨も同ファイルに記載する。実値設定・`workflow_dispatch` 疎通確認は
-引き続きマージ後のリポジトリ管理者作業。
+引き続きマージ後のリポジトリ管理者作業。閾値注入は Actions variables ではなく
+secrets（`secrets.*`）から行う（`env:` ブロックのログ印字による漏えいを防ぐため。
+Issue #286・`docs/design/ci-gate-variables.md` 参照）。
