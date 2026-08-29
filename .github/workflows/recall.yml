@@ -145,9 +145,13 @@ jobs:
         # 注入しないため、そちらは未設定を「対象外」として成功終了する opt-in
         # 挙動を維持する（`crates/engine/tests/hybrid_recall.rs::
         # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は
-        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログには
-        # 実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
-        # 出力しない。
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。ログには
+        # 対象名と pass/fail のみが出力され、注入された閾値・実測値のいずれの
+        # 数値も出力しない（Issue #303）。`RECALL_VERBOSE` は実測値を public な
+        # Actions ログへ出す opt-in のため本 workflow の env へは意図的に追加
+        # しない（テスト側も `GITHUB_ACTIONS` 下では拒否する二重化。実測値が
+        # 必要な場合は `RECALL_VERBOSE=1 make recall-regression` をローカルで
+        # 直接実行する）。
         env:
           HYBRID_RECALL_REQUIRE_THRESHOLDS: "1"
           HYBRID_RECALL_MIN_R20_SMALL: ${{ secrets.HYBRID_RECALL_MIN_R20_SMALL }}
@@ -168,9 +172,10 @@ jobs:
         # 注入しないため、そちらは未設定を「対象外」として成功終了する opt-in
         # 挙動を維持する（`crates/engine/tests/rerank_recall.rs::
         # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は
-        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログには
-        # 実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
-        # 出力しない。
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。ログには
+        # 対象名と pass/fail のみが出力され、注入された閾値・実測値のいずれの
+        # 数値も出力しない（Issue #303）。`RECALL_VERBOSE` は本 workflow の env へ
+        # 意図的に追加しない（`Run recall-regression` step と同方針）。
         env:
           RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
           RERANK_RECALL_MIN_R20_LARGE: ${{ secrets.RERANK_RECALL_MIN_R20_LARGE }}
@@ -206,9 +211,10 @@ jobs:
         # にはこのフラグを注入しないため、そちらは未設定を「対象外」として成功終了
         # する opt-in 挙動を維持する（`crates/engine/tests/query_planning_recall.rs::
         # resolve_gate_threshold_with` 参照）。設定済みで非数値・範囲外の場合は
-        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。実測ログ
-        # には実測値と pass/fail のみが出力され、注入された閾値の数値そのものは
-        # 出力しない。
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。ログ
+        # には対象名と pass/fail のみが出力され、注入された閾値・実測値のいずれの
+        # 数値も出力しない（Issue #303）。`RECALL_VERBOSE` は本 workflow の env へ
+        # 意図的に追加しない（`Run recall-regression` step と同方針）。
         env:
           QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS: "1"
           QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT: ${{ secrets.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT }}

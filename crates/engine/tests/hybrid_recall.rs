@@ -36,8 +36,11 @@
 //!   variable 名の誤り・variable の誤削除により「一度も評価していない run」が
 //!   基準を満たした run と同じ green になる事故を防ぐ（PR #147 codex-review P1
 //!   継続指摘対応。[`GateThreshold`]・[`resolve_gate_threshold`] 参照）。ログには
-//!   実測値と pass/fail のみを出力する（`crates/engine/benches/simd_bench.rs`
-//!   と同方針）。実測値（Recall@k）は
+//!   対象名と pass/fail のみを出力し、実測値は `RECALL_VERBOSE=1`（`GITHUB_ACTIONS`
+//!   下では拒否。Issue #303）の opt-in 時のみ追加出力する（`crates/engine/benches/
+//!   batch_bench.rs::verbose_requested_from_env`・Issue #277〜#279 と同方針。
+//!   [`resolve_verbose`]・[`verbose_requested_from_env`]・[`render_gate_line`] 参照）。
+//!   実測値（Recall@k）は
 //!   [`RecallResult::recall20`]/[`RecallResult::recall100`] が定義するとおり
 //!   理論上限（`ceil20`/`ceil100`）を分母とする到達率であり、正解集合の総数
 //!   （`total_correct`）を分母にしない（層 A と分母の意味を揃える）。
@@ -466,6 +469,7 @@ const SMALL_SEED: u64 = 0x5EED_0104_5341_1101;
 /// への変更で数値が変化した場合はこのテストが失敗する。
 #[test]
 fn hybrid_recall_small_scale_regression() {
+    let verbose = verbose_requested_from_env();
     let (docs, qa) = generate_corpus(
         SMALL_SEED,
         SMALL_NUM_DOCS,
@@ -482,19 +486,21 @@ fn hybrid_recall_small_scale_regression() {
     assert_eq!(qa.len(), 60, "重複除外後の QA 件数が変化した");
 
     let r = measure_recall(&docs, &qa);
-    println!(
-        "=== TASK-104 小規模段 Recall（docs={} queries={} total_correct={}） ===",
-        docs.len(),
-        qa.len(),
-        r.total_correct
-    );
-    println!(
-        "Recall@20={:.4} ({}/{} of ceil20; total_correct={})",
-        r.recall20(),
-        r.hits20,
-        r.ceil20,
-        r.total_correct
-    );
+    if verbose {
+        println!(
+            "=== TASK-104 小規模段 Recall（docs={} queries={} total_correct={}） ===",
+            docs.len(),
+            qa.len(),
+            r.total_correct
+        );
+        println!(
+            "Recall@20={:.4} ({}/{} of ceil20; total_correct={})",
+            r.recall20(),
+            r.hits20,
+            r.ceil20,
+            r.total_correct
+        );
+    }
 
     // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
     // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
@@ -520,6 +526,7 @@ const LARGE_SEED: u64 = 0x5EED_0104_4C41_5247;
 /// する判断へ切り替えること）。
 #[test]
 fn hybrid_recall_large_scale_regression() {
+    let verbose = verbose_requested_from_env();
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
         LARGE_NUM_DOCS,
@@ -534,22 +541,24 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(qa.len(), 100, "重複除外後の QA 件数が変化した");
 
     let r = measure_recall(&docs, &qa);
-    println!(
-        "=== TASK-104 大規模段 Recall（docs={} queries={} total_correct={}） ===",
-        docs.len(),
-        qa.len(),
-        r.total_correct
-    );
-    println!(
-        "Recall@20={:.4} ({}/{} of ceil20)  Recall@100={:.4} ({}/{} of ceil100; total_correct={})",
-        r.recall20(),
-        r.hits20,
-        r.ceil20,
-        r.recall100(),
-        r.hits100,
-        r.ceil100,
-        r.total_correct
-    );
+    if verbose {
+        println!(
+            "=== TASK-104 大規模段 Recall（docs={} queries={} total_correct={}） ===",
+            docs.len(),
+            qa.len(),
+            r.total_correct
+        );
+        println!(
+            "Recall@20={:.4} ({}/{} of ceil20)  Recall@100={:.4} ({}/{} of ceil100; total_correct={})",
+            r.recall20(),
+            r.hits20,
+            r.ceil20,
+            r.recall100(),
+            r.hits100,
+            r.ceil100,
+            r.total_correct
+        );
+    }
 
     // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
     // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
@@ -640,16 +649,120 @@ fn resolve_gate_threshold(var: &str) -> Option<f64> {
     }
 }
 
+// ---------- 実測値の既定非出力（Issue #303）。`RECALL_VERBOSE` opt-in ゲート ----------
+
+/// `RECALL_VERBOSE` の生値と `GITHUB_ACTIONS` 判定を引数化した純関数（単体テスト可能・
+/// 環境変数を直接読まない）。`raw == Some("1")` の厳密一致のみ verbose 要求とみなす
+/// （`crates/engine/benches/harness/sql_c1.rs::resolve_verbose` と同じ規約。public
+/// ログへの実測値露出を左右する opt-in のため空白付き値・他表記へ寛容に倒さない）。
+/// `under_github_actions` が真の場合、verbose 要求は defense-in-depth として `Err` で
+/// fail-closed に拒否する（`.github/workflows/recall.yml` は `RECALL_VERBOSE` を
+/// 注入しない運用と二重化する。Issue #303・#277〜#279 と同方針）。
+fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, &'static str> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(
+            "RECALL_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values",
+        );
+    }
+    Ok(requested)
+}
+
+/// 環境変数を読み取って [`resolve_verbose`] へ渡し、`Err` は `panic!` で fail-closed に
+/// する（各ゲート・層 A 回帰の冒頭、コーパス生成前に呼ぶ）。`GITHUB_ACTIONS` の有無は
+/// 値を解釈せず存在有無のみで判定する（`crates/engine/benches/simd_bench.rs::
+/// running_under_github_actions` と同方針）。
+fn verbose_requested_from_env() -> bool {
+    let raw = std::env::var("RECALL_VERBOSE").ok();
+    match resolve_verbose(raw.as_deref(), std::env::var_os("GITHUB_ACTIONS").is_some()) {
+        Ok(v) => v,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+/// 閾値ゲート判定行の描画。`verbose=false`（既定）では `gate`・`metric`・`pass` のみを
+/// 含み実測値（`value`）を含めない（PR #224・CORE-5 対応と同方針。pass/fail と実測値の
+/// 併記による非公開閾値の逆算を防ぐ）。`verbose=true` では `value=<f64:.4>` を付加する
+/// （`crates/engine/benches/harness/sql_c1.rs::render_p95_line` と同型）。
+fn render_gate_line(gate: &str, metric: &str, value: f64, pass: bool, verbose: bool) -> String {
+    if verbose {
+        format!("{gate}: {metric} value={value:.4} pass={pass}")
+    } else {
+        format!("{gate}: {metric} pass={pass}")
+    }
+}
+
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::{render_gate_line, resolve_verbose};
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        for raw in [" 1", "true", "0", ""] {
+            assert_eq!(resolve_verbose(Some(raw), false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert!(resolve_verbose(Some("1"), true).is_err());
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
+
+    #[test]
+    fn render_gate_line_non_verbose_excludes_measured_value() {
+        let line = render_gate_line(
+            "hybrid_recall_small_scale_threshold_gate",
+            "recall@20",
+            0.8465,
+            false,
+            false,
+        );
+        assert!(!line.contains("0.8465"));
+        assert!(!line.contains("value="));
+        assert!(line.contains("pass=false"));
+    }
+
+    #[test]
+    fn render_gate_line_verbose_includes_measured_value() {
+        let line = render_gate_line(
+            "hybrid_recall_small_scale_threshold_gate",
+            "recall@20",
+            0.8465,
+            true,
+            true,
+        );
+        assert!(line.contains("value=0.8465"));
+        assert!(line.contains("pass=true"));
+    }
+}
+
 /// TASK-104（SEARCH-1）層 B: 小規模段 Recall@20（[`RecallResult::recall20`]。分母は
 /// 理論上限 `ceil20`）が `HYBRID_RECALL_MIN_R20_SMALL`（Actions variables 由来）以上
 /// であることを確認する閾値ゲート。未設定は既定（非 strict）では「対象外」として
 /// 明示的に成功終了し、strict モード（[`strict_thresholds_required`]）では
 /// fail-closed でテスト失敗とする。設定済みで非数値・範囲外は常に fail-closed
-/// でテスト失敗とする（skip しない）。ログには実測値と pass/fail のみを出力し、
-/// 注入された閾値の数値は出力しない。
+/// でテスト失敗とする（skip しない）。ログには対象名と pass/fail のみを出力し、
+/// 注入された閾値・実測値の数値は出力しない（`RECALL_VERBOSE=1` opt-in 時のみ
+/// 実測値を追加出力する。Issue #303・[`render_gate_line`] 参照）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_small_scale_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_r20 = match resolve_gate_threshold("HYBRID_RECALL_MIN_R20_SMALL") {
         Some(v) => v,
         None => {
@@ -670,7 +783,16 @@ fn hybrid_recall_small_scale_threshold_gate() {
     let recall20 = r.recall20();
     let pass = recall20 >= min_r20;
 
-    println!("hybrid_recall_small_scale_threshold_gate: recall@20={recall20:.4} pass={pass}");
+    println!(
+        "{}",
+        render_gate_line(
+            "hybrid_recall_small_scale_threshold_gate",
+            "recall@20",
+            recall20,
+            pass,
+            verbose
+        )
+    );
     assert!(
         pass,
         "small-scale Recall@20 below HYBRID_RECALL_MIN_R20_SMALL"
@@ -687,6 +809,7 @@ fn hybrid_recall_small_scale_threshold_gate() {
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make recall-regression で実行する"]
 fn hybrid_recall_large_scale_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_r20 = resolve_gate_threshold("HYBRID_RECALL_MIN_R20_LARGE");
     let min_r100 = resolve_gate_threshold("HYBRID_RECALL_MIN_R100_LARGE");
 
@@ -713,7 +836,14 @@ fn hybrid_recall_large_scale_threshold_gate() {
             let pass20 = recall20 >= min;
             pass &= pass20;
             println!(
-                "hybrid_recall_large_scale_threshold_gate: recall@20={recall20:.4} pass20={pass20}"
+                "{}",
+                render_gate_line(
+                    "hybrid_recall_large_scale_threshold_gate",
+                    "recall@20",
+                    recall20,
+                    pass20,
+                    verbose
+                )
             );
         }
         None => {
@@ -727,7 +857,14 @@ fn hybrid_recall_large_scale_threshold_gate() {
             let pass100 = recall100 >= min;
             pass &= pass100;
             println!(
-                "hybrid_recall_large_scale_threshold_gate: recall@100={recall100:.4} pass100={pass100}"
+                "{}",
+                render_gate_line(
+                    "hybrid_recall_large_scale_threshold_gate",
+                    "recall@100",
+                    recall100,
+                    pass100,
+                    verbose
+                )
             );
         }
         None => {

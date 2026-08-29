@@ -74,6 +74,9 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
   fail-closed。ログには指標名と pass/fail のみを出力し、閾値の数値も実測値も出力
   しない（解決規則は `hybrid_recall.rs::resolve_gate_threshold` と同型。将来 public
   runner の `recall.yml` から実行されても非公開値が Actions ログへ出ないようにする）。
+  `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303。`hybrid_recall.rs`
+  と同一実装の `resolve_verbose`／`render_verbose_value_line`）の opt-in 時のみ、
+  ローカル診断用に `value=<f64>` を追加出力する（既定出力は変更しない）。
 - **`.github/workflows/recall.yml` への接続は本 PR では行わない**: TASK-163 の
   スコープは実測・判断材料の提示までであり目標値の確定は含まない。未確定の閾値変数を
   strict モードの週次 job へ追加すると、管理者に未確定値の設定を強いるか schedule
@@ -83,11 +86,14 @@ lossy view・Zipf 語彙・低頻度 2 語 AND クエリ）を複製・踏襲し
   アサートなし）: 既定ポリシーでの hybrid・dense 双方の指標を出力する。
   `PrecisionPolicy` は dense/hybrid で別々の既定閾値を持つため、両方の妥当性判断には
   両系列の実測が要る。実測値を標準出力へ出すため CI・GitHub Actions（`recall.yml`
-  含む）からは実行しない。
+  含む）からは実行しない。従来 `Makefile` 運用のみで守られていた「ローカル専用」を、
+  `GITHUB_ACTIONS`（値を解釈せず存在有無のみ判定）検出時に測定前 `panic!` で拒否する
+  `refuse_measured_output_under_github_actions` により二重化した（Issue #303）。
 - **パラメータ感度スイープ**（`#[ignore]`。`make precision-report`＝ローカル専用。
   アサートなし）: `with_precision_policy`
   で hybrid 閾値・dense 閾値をそれぞれ差し替え、対応するランキングの指標の変化を
   表形式で出力する（判断材料の提示専用。production の既定値は変更しない）。
+  こちらも `refuse_measured_output_under_github_actions` で同様に二重化する。
 
 ## 実測結果・パラメータ感度・目標値確定の判断材料
 
