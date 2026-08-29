@@ -347,11 +347,9 @@ impl From<SparseError> for HybridError {
 /// 前提とする。1-based 順位 `r`（列に現れる位置。同点は候補識別子昇順の位置が
 /// そのまま順位になる）に対し `weight / (k_const + r)` を id ごとに加算する
 /// （両リストに出現する id は和になる）。スコアの大小そのもの（内積・BM25 の実値）は
-/// 使わない（RRF の定義。Issue #307・SEARCH-1 の原因調査では、同点グループへ
-/// 区間の平均順位を割り当てる代替方式を診断的に検証したが、この規約自体の
-/// spec 側確定が未了のため production の融合挙動は変更しない。
-/// `docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の engine 側
-/// 原因調査（Issue #307）」節参照）。
+/// 使わない（RRF の定義。同点時の順位規約は Issue #307・SEARCH-1・SEARCH-3 の
+/// 原因調査対象であり、詳細は `docs/design/hybrid-recall-regression.md`
+/// 「小規模段ゲート未達の engine 側原因調査（Issue #307）」節を参照）。
 ///
 /// 出力は融合スコア降順・同点は**候補識別子**の昇順（`f64::total_cmp` ベース）で確定する
 /// （識別子は呼び出し元定義。`sql/exec.rs` はアリーナのスロット番号を渡すため実質
@@ -514,12 +512,9 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
 /// 加算先）のみを使い、`score` 自体は同点判定に使わない（呼び出し元 [`rrf_fuse`] が
 /// スコアの有限性・ソート順を事前検証済みのため）。
 ///
-/// Issue #307・SEARCH-1 の原因調査では、同点グループ（`total_cmp` で等しい連続区間）
-/// へ区間の平均 1-based 順位を割り当てる代替方式（融合寄与が候補 id の並びに依存
-/// しなくなる）を診断的に検証したが、この規約自体の spec 側確定はオーナー判断待ちの
-/// ため production の融合挙動としては採用していない（`docs/design/
-/// hybrid-recall-regression.md`「小規模段ゲート未達の engine 側原因調査
-/// （Issue #307）」節参照）。
+/// 同点グループの順位規約は Issue #307・SEARCH-1・SEARCH-3 の原因調査対象であり、
+/// 詳細は `docs/design/hybrid-recall-regression.md`「小規模段ゲート未達の
+/// engine 側原因調査（Issue #307）」節を参照。
 fn accumulate_ranked<T>(
     items: &[T],
     key: impl Fn(&T) -> (f64, u64),
