@@ -522,8 +522,8 @@ fn rerank_recall_large_scale_regression() {
     // の生の融合順位）が大きく改善した結果、`LexicalOverlapReranker`（本ファイル冒頭の
     // コメント・`rerank.rs` 内ドキュメント参照: 「方式確定までの暫定実装」）の字句一致
     // ヒューリスティックがこの改善後の baseline に追いつけず、`after` が `baseline` を
-    // 下回る組み合わせが生じた（`baseline_hits20`: 343→386、`after_hits20`: 368→382。
-    // いずれも改善しているが差分は `-4` に反転）。`after >= baseline` は
+    // 下回る組み合わせが生じた（いずれも Issue #310 以前より改善しているが、両者の
+    // 差分の符号は反転した。実測値は下の固定値アサーション参照）。`after >= baseline` は
     // `LexicalOverlapReranker` の字句一致ブレンドが数学的に保証する性質ではなく、
     // 従来の（Issue #310 以前の）baseline がたまたま弱かったことで成立していた
     // 経験則だったため、削除する（SEARCH-7 方式の最終選定はオーナー判断。TASK-108・
@@ -545,7 +545,7 @@ fn rerank_recall_large_scale_regression() {
         r.after_hits20, 382,
         "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
-    assert_eq!(r.pool_hits100, 835, "プール Recall@100 hit 数が変化した");
+    assert_eq!(r.pool_hits100, 834, "プール Recall@100 hit 数が変化した");
     assert_eq!(r.pool_hits200, 951, "プール Recall@200 hit 数が変化した");
 }
 

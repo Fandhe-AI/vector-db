@@ -274,7 +274,8 @@ modified competition ranking）・`Positional`（従来挙動。撤回用に残�
 **採用規約と不採用案**: 位置順位（従来挙動。同点グループが大きいほど id の小さい
 候補が根拠なく高順位を得る id 依存バイアスがある）に対し、グループ末尾順位
 （`GroupEnd`）・グループ先頭順位（competition ranking）・平均順位（fractional
-ranking）を層 A の固定値（下記「実測結果」）で比較し、`GroupEnd` を採用した
+ranking）を層 A の固定値アサーション（`crates/engine/tests/hybrid_recall.rs`）で
+比較し、`GroupEnd` を採用した
 （先頭順位は id 非依存性は満たすが到達率が位置順位を下回る場合があり、平均順位は
 非整数の順位を扱う実装コストに見合う改善幅がなかった）。BM25（疎チャネル）の
 `k1`/`b` の変更は不採用（既定値からの変更は一般性に乏しい）。密プール境界の
@@ -296,19 +297,14 @@ ranking）を層 A の固定値（下記「実測結果」）で比較し、`Gro
 
 ## 実測結果
 
-（`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み。Issue #310 実装後の値へ
-再確定済み）
-
-| 段 | 文書数 | QA 件数 | total_correct | ceil20 | hits20 | ceil100 | hits100 | Recall@20 | Recall@100 |
-| -- | ------ | ------- | -------------- | ------ | ------ | ------- | ------- | --------- | ---------- |
-| 小規模 | 400 | 60 | 202 | 202 | 182 | - | - | 0.9010 | - |
-| 大規模 | 20,000 | 100 | 997 | 421 | 385 | 707 | 653 | 0.9145 | 0.9236 |
-
-（Issue #310 実装前の値: 小規模 `hits20=171`（Recall@20=0.8465）・大規模
-`hits20=328, hits100=645`（Recall@20=0.7791, Recall@100=0.9123）。`ceil20`/`ceil100`/
-`total_correct`（正解集合の理論上限・総数）は fixture 非変更のため不変で、
-`GroupEnd`＋境界同点グループ完全化により両段とも到達率が改善した）
+`crates/engine/tests/hybrid_recall.rs`（層 A、決定的コーパスのため再現可能）は
+小規模・大規模の両段で pass する。`total_correct`／`ceil20`／`ceil100`・
+`hits20`／`hits100` の実測値は本ドキュメントには記録せず、同テストの固定値
+アサーションを退行検出の記録場所とする（受け入れ条件 3・
+`.claude/rules/spec-confidentiality.md`）。Issue #310（`GroupEnd`＋境界同点
+グループ完全化）の適用前後で、`ceil20`／`ceil100`／`total_correct`（正解集合の
+理論上限・総数。fixture 非変更のため不変）に対し、両段とも `hits20` の到達率が
+改善したことをアサーションの更新差分（本 PR の diff）で確認済み。
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の
