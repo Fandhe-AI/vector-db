@@ -49,7 +49,9 @@ use engine::kernel::SearchInput;
 use engine::parallel_search::ParallelSearchProvider;
 use engine::rerank::{rerank_candidates, LexicalOverlapReranker, RerankCandidate, RerankConfig};
 use engine::sparse::SparseIndex;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 // ---------- 決定的擬似乱数（xorshift64*。外部クレート不使用。hybrid_recall.rs と同一実装） ----------
 
@@ -330,6 +332,21 @@ impl RerankRecallResult {
     }
 }
 
+/// 層 A の固定値回帰トラッキングを実測値非開示のまま行うためのダイジェスト
+/// （`hybrid_recall.rs::regression_digest` と同じ役割・同一方式。統合テストは
+/// 個別クレートとしてコンパイルされるため各ファイルへ複製する）。測定タプル
+/// 全体を決定的ハッシュへ畳み込み、ダイジェスト値のみを固定値アサーションの
+/// 対象にすることで、public テストに個々の実測値（`total_correct`/`ceil*`/
+/// `*_hits*`）を記録せずに退行検出する（`docs/design/hybrid-recall-regression.md`
+/// 「Issue #310: engine 側改善」節の受け入れ条件 3）。
+fn regression_digest(fields: &[usize]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for &field in fields {
+        field.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 /// [`SparseIndex::build`]・[`ParallelSearchProvider`]・[`hybrid_search`]
 /// （`RrfConfig::default()`＝pool_depth 200）で候補プールを 1 回取得し、その同じ
 /// プールから baseline（先頭 20 件）・after（[`rerank_candidates`] ＋
@@ -523,30 +540,33 @@ fn rerank_recall_large_scale_regression() {
     // コメント・`rerank.rs` 内ドキュメント参照: 「方式確定までの暫定実装」）の字句一致
     // ヒューリスティックがこの改善後の baseline に追いつけず、`after` が `baseline` を
     // 下回る組み合わせが生じた（いずれも Issue #310 以前より改善しているが、両者の
-    // 差分の符号は反転した。実測値は下の固定値アサーション参照）。`after >= baseline` は
-    // `LexicalOverlapReranker` の字句一致ブレンドが数学的に保証する性質ではなく、
-    // 従来の（Issue #310 以前の）baseline がたまたま弱かったことで成立していた
-    // 経験則だったため、削除する（SEARCH-7 方式の最終選定はオーナー判断。TASK-108・
-    // Issue #39 参照）。下の固定値アサーションが `baseline_hits20`・`after_hits20`
-    // 双方を厳密に固定するため、退行検出としてはこちらの方が厳格（`>=` より狭い
-    // 「値そのものが変化した」を検知する）。
+    // 差分の符号は反転した。実測値は public テストへ記録しないため、下の
+    // [`regression_digest`] による固定値アサーションのみが記録場所）。
+    // `after >= baseline` は `LexicalOverlapReranker` の字句一致ブレンドが数学的に
+    // 保証する性質ではなく、従来の（Issue #310 以前の）baseline がたまたま弱かった
+    // ことで成立していた経験則だったため、削除する（SEARCH-7 方式の最終選定は
+    // オーナー判断。TASK-108・Issue #39 参照）。下の固定値アサーションが
+    // `baseline_hits20`・`after_hits20` 双方を厳密に固定するため、退行検出としては
+    // こちらの方が厳格（`>=` より狭い「値そのものが変化した」を検知する）。
     //
-    // `hits`/`ceil`/`total_correct` を固定値で回帰トラッキングする（検索カーネル・
-    // リランカー・フィクスチャの変更で数値が変化した場合はこのテストが失敗する）。
-    assert_eq!(r.total_correct, 1049, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 410, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.ceil100, 913, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.ceil200, 1049, "Recall@200 の理論上限が変化した");
+    // `total_correct`/`ceil20`/`ceil100`/`ceil200`/`baseline_hits20`/`after_hits20`/
+    // `pool_hits100`/`pool_hits200` を [`regression_digest`] で固定値回帰トラッキング
+    // する（検索カーネル・リランカー・フィクスチャの変更で数値が 1 件でも変化した
+    // 場合はこのテストが失敗するが、個々の実測値は public テストへ記録しない）。
     assert_eq!(
-        r.baseline_hits20, 386,
-        "baseline（リランキングなし）の Recall@20 hit 数が変化した"
+        regression_digest(&[
+            r.total_correct,
+            r.ceil20,
+            r.ceil100,
+            r.ceil200,
+            r.baseline_hits20,
+            r.after_hits20,
+            r.pool_hits100,
+            r.pool_hits200,
+        ]),
+        0x97a9_ff4e_af83_8530,
+        "正解集合総数・理論上限・baseline/after/プール hit 数のいずれかが変化した"
     );
-    assert_eq!(
-        r.after_hits20, 382,
-        "after（リランキングあり）の Recall@20 hit 数が変化した"
-    );
-    assert_eq!(r.pool_hits100, 834, "プール Recall@100 hit 数が変化した");
-    assert_eq!(r.pool_hits200, 951, "プール Recall@200 hit 数が変化した");
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------

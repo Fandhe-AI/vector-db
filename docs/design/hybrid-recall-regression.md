@@ -299,12 +299,17 @@ ranking）を層 A の固定値アサーション（`crates/engine/tests/hybrid_
 
 `crates/engine/tests/hybrid_recall.rs`（層 A、決定的コーパスのため再現可能）は
 小規模・大規模の両段で pass する。`total_correct`／`ceil20`／`ceil100`・
-`hits20`／`hits100` の実測値は本ドキュメントには記録せず、同テストの固定値
-アサーションを退行検出の記録場所とする（受け入れ条件 3・
-`.claude/rules/spec-confidentiality.md`）。Issue #310（`GroupEnd`＋境界同点
-グループ完全化）の適用前後で、`ceil20`／`ceil100`／`total_correct`（正解集合の
-理論上限・総数。fixture 非変更のため不変）に対し、両段とも `hits20` の到達率が
-改善したことをアサーションの更新差分（本 PR の diff）で確認済み。
+`hits20`／`hits100` の実測値は本ドキュメントにも同テストにも数値のまま記録
+せず、測定タプル全体を決定的ハッシュへ畳み込んだダイジェスト
+（`hybrid_recall.rs::regression_digest`・`rerank_recall.rs::regression_digest`）
+1 個を固定値アサーションの対象とすることで退行検出の記録場所とする
+（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`。個々のフィールドが
+1 件でも変化すればダイジェストも変化するため検出力は個別 `assert_eq!` と同等
+だが、数値そのものは非公開のまま）。Issue #310（`GroupEnd`＋境界同点グループ
+完全化）の適用前後で、`ceil20`／`ceil100`／`total_correct`（正解集合の理論
+上限・総数。fixture 非変更のため不変）に対し、両段とも `hits20` の到達率が
+改善したことをローカルでの実測（`RECALL_VERBOSE=1` opt-in）で確認済み
+（本ドキュメントには実測値を記載しない）。
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の

@@ -102,7 +102,9 @@ use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
 use engine::sparse::SparseIndex;
 use engine::storage::{Storage, Visibility};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
@@ -457,6 +459,26 @@ impl RecallResult {
     fn recall100(&self) -> f64 {
         self.hits100 as f64 / self.ceil100 as f64
     }
+}
+
+/// 層 A の固定値回帰トラッキングを実測値非開示のまま行うためのダイジェスト。
+/// `total_correct`/`ceil20`/`hits20` 等の測定タプルを個々の `assert_eq!` で
+/// public テストへ数値のまま記録すると spec-confidentiality の受け入れ条件
+/// （「実測値は public テストにも記録しない」。`docs/design/
+/// hybrid-recall-regression.md`「Issue #310: engine 側改善」節）に抵触するため、
+/// 測定タプル全体を決定的ハッシュへ畳み込み、そのダイジェスト値のみを固定値
+/// アサーションの対象にする。フィールドが 1 件でも変化すればダイジェストも
+/// 変化し退行を検出できるが、個々の数値は復元できない。`DefaultHasher::new()`
+/// は固定キーを使うため実行間・プラットフォーム間で決定的（Rust std ドキュメント。
+/// アルゴリズムの API 安定性自体は保証されないが、本ハーネスは同一 CI イメージ・
+/// 同一 Rust toolchain（`rust-toolchain.toml`）前提の回帰トラッキング用途であり
+/// 十分）。
+fn regression_digest(fields: &[usize]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for &field in fields {
+        field.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// [`PlannerFixture`] が [`EngineCore::plan_query`] の辞書スナップショット
@@ -903,12 +925,15 @@ fn hybrid_recall_small_scale_regression() {
 
     // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
     // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
-    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`hits20`/`ceil20`/
-    // `total_correct` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの
-    // 変更で数値が変化した場合はこのテストが失敗する）。
-    assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
+    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`total_correct`/`ceil20`/
+    // `hits20` を [`regression_digest`] で固定値回帰トラッキングする（検索カーネルや
+    // フィクスチャの変更で数値が 1 件でも変化した場合はこのテストが失敗するが、
+    // 個々の実測値は public テストへ記録しない）。
+    assert_eq!(
+        regression_digest(&[r.total_correct, r.ceil20, r.hits20]),
+        0x8987_7507_ab38_cbd1,
+        "小規模段の正解集合総数・Recall@20 理論上限・hit 数のいずれかが変化した"
+    );
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -986,13 +1011,14 @@ fn hybrid_recall_large_scale_regression() {
     }
 
     // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
-    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
-    // `total_correct` を固定値で回帰トラッキングする。
-    assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
-    assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 385, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 653, "大規模段の Recall@100 hit 数が変化した");
+    // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`total_correct`/
+    // `ceil20`/`ceil100`/`hits20`/`hits100` を [`regression_digest`] で固定値
+    // 回帰トラッキングする（個々の実測値は public テストへ記録しない）。
+    assert_eq!(
+        regression_digest(&[r.total_correct, r.ceil20, r.ceil100, r.hits20, r.hits100]),
+        0xce2d_dd3b_d101_11c5,
+        "大規模段の正解集合総数・理論上限・Recall@20/@100 hit 数のいずれかが変化した"
+    );
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー
