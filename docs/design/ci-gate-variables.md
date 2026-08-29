@@ -94,8 +94,8 @@ repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml
 | secret | spec ポインタ | 受理形式 |
 | -------- | -------------- | -------- |
 | `HYBRID_RECALL_MIN_R20_SMALL` | `search.md` SEARCH-1（TASK-104） | `(0.0, 1.0]` |
-| `HYBRID_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-2（TASK-104） | `(0.0, 1.0]` |
-| `HYBRID_RECALL_MIN_R100_LARGE` | `search.md` SEARCH-2（TASK-104） | `(0.0, 1.0]` |
+| `HYBRID_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-2（TASK-104。クエリ展開あり・決定的スタブ。Issue #306） | `(0.0, 1.0]` |
+| `HYBRID_RECALL_MIN_R100_LARGE` | `search.md` SEARCH-2（TASK-104。クエリ展開あり・決定的スタブ。Issue #306） | `(0.0, 1.0]` |
 | `RERANK_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-7（TASK-108。絶対下限） | `(0.0, 1.0]` |
 | `RERANK_RECALL_MIN_R20_IMPROVEMENT` | `search.md` SEARCH-7（TASK-108。改善幅＝after − baseline。spec の pt 表記は Recall の差＝小数へ換算して設定する） | `[0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` | `query-planning.md` PLAN-1（TASK-112。改善幅。pt → 小数換算） | `[0.0, 1.0]` |

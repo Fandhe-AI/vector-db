@@ -9,7 +9,10 @@
 - 関連: TASK-106（`docs/design/cjk-tokenizer-impact-ja-corpus.md`。決定的合成コーパス
   生成・固定値回帰トラッキング方式の先行実装）・TASK-127（`crates/engine/benches/
   simd_bench.rs`。spec 閾値の Actions secrets 注入パターンの先行実装。
-  当初は variables を使っていたが Issue #286 で secrets へ移行）
+  当初は variables を使っていたが Issue #286 で secrets へ移行）・TASK-110〜113
+  （`docs/design/query-planning-recall-regression.md`。クエリ展開クライアント・
+  決定的スタブ `LlmClient`・展開あり Recall 回帰の先行実装）・Issue #306
+  （大規模段層 B へのクエリ展開結線）
 
 ## 背景
 
@@ -255,6 +258,33 @@ Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいず
 `pull_request` トリガを持たない（「2 層構成」参照。spec 機密保持が優先）ため、
 PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に限られる。
 
+### クエリ展開の結線（Issue #306）
+
+大規模段の層 B（`hybrid_recall_large_scale_threshold_gate`）は、TASK-110〜113
+（`docs/design/query-planning-recall-regression.md`）で確立した決定的スタブ
+`LlmClient`（`query_planning_recall.rs::MockLlmClient` と同一実装。`tests/`
+直下は独立 test crate で共有モジュールを持たないため `hybrid_recall.rs` へ複製）を
+`query_planner::render_full_prompt` → `LlmClient::complete` → `query_planner::
+parse_expansion` という production のクエリ展開経路に通した展開ありクエリで
+Recall@20・Recall@100 を測定する。これにより、SEARCH-2 が前提とする「クエリ展開
+あり」の測定条件に層 B の構成を揃えた。
+
+測定対象は展開の有無で変わるが、本ハーネスの QA セットは `direct` カテゴリ
+（コーパス語彙 `kw_XXXX` に一致するクエリ）のみであり、`MockLlmClient` はその形式の
+語を無変換で通す。そのため展開ありの実測値は展開なしと構造的に一致し、既存の
+`HYBRID_RECALL_MIN_R20_LARGE`/`HYBRID_RECALL_MIN_R100_LARGE`（Actions secrets 由来）
+の較正・意味は変わらない。層 A（`hybrid_recall_large_scale_regression`）は展開なしの
+固定値回帰を引き続き主測定として維持しつつ、展開あり経路（`QuerySource::Expanded`）
+との hits/ceil 完全一致をパススルー回帰ガードとして追加した——この等式が崩れた場合は
+展開パーサ・スタブ・再構成経路のいずれかの回帰を意味する。小規模段の層 B・層 A の
+主測定は引き続き展開なし（`QuerySource::Baseline`）で行う。fixture パラメータ・
+seed・規模定数（`LARGE_*`/`SMALL_*`）は変更していない。
+
+層 B の pass/fail・実測値は本ドキュメントに記載しない（「実測値の既定非出力
+（Issue #303）」節と同方針）。`intent` カテゴリ（言い換え語彙のみのクエリ）での
+大規模測定は TASK-113（PLAN-3）と同様に本結線でも対象外のまま（下記「既知の制約・
+スコープ外」参照）。
+
 ## 既知の制約・スコープ外
 
 - **合成コーパスによる暫定測定**: 実コーパスでの評価は未了（TASK-106 と同種の制約）
@@ -271,9 +301,11 @@ PR ごとの実行コストは層 A（layer A の `cargo test` 分のみ）に�
   `VECTOR_KEYWORD_DROPOUT_PROB`・`VECTOR_DECOY_PROB` は Recall を 1.0 未満の
   非退化な範囲に収めるために実験的に選んだ値であり、spec 由来の受け入れ基準では
   ない（層 B の閾値のみが spec 由来。「2 層構成」参照）
-- **クエリ展開との統合測定**: SEARCH-2 の前提にはクエリ展開（PLAN-5 系、TASK-109
-  以降）が含まれるが未実装のため、本ハーネスはハイブリッド検索単体（クエリ展開なし）
-  の測定に留める
+- **クエリ展開との統合測定**: 大規模段の層 B は Issue #306 で決定的スタブ
+  `LlmClient` による展開ありの経路へ結線済み（上記「クエリ展開の結線
+  （Issue #306）」節参照）。ただし QA セットは `direct` カテゴリのみで、`intent`
+  カテゴリ（言い換え語彙のみのクエリ）での大規模測定は TASK-113（PLAN-3）と同様に
+  本ハーネスのスコープ外のまま（フォローアップ候補。Issue 起票はユーザー判断待ち）
 - Actions secrets（`HYBRID_RECALL_MIN_*`）の実値設定はマージ後のリポジトリ管理者
   作業（README「Recall 回帰ハーネスの repo secrets」参照。secret ↔ spec
   ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
