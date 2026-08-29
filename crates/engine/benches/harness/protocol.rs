@@ -116,7 +116,9 @@ pub struct Measurement {
 ///
 /// `workload` は毎回呼び出され、戻り値は `black_box` に通してコンパイラによる
 /// 呼び出し省略・結果未使用最適化を防ぐ（結果を使わない計測はゼロ秒に最適化され
-/// うるため）。
+/// うるため）。戻り値は `black_box` 通過後、計測区間の内側で drop される
+/// （`ab::run_ab` と同一の契約。Issue #302。ヒープ確保を伴う戻り値の解放コストが
+/// 無視できない場合、呼び出し側は測定区間外の sink へ退避してから `run` を呼ぶ）。
 pub fn run<T>(
     config: &MeasurementConfig,
     mut workload: impl FnMut() -> T,

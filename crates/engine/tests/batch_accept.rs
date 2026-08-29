@@ -24,7 +24,8 @@
 mod harness;
 
 use harness::accept::{
-    check_degradation_within_limit, check_improvement_at_least, recall_at_k, worst_recall,
+    check_degradation_pct_within_limit, check_degradation_within_limit, check_improvement_at_least,
+    degradation_pct, median_degradation_pct, recall_at_k, worst_recall,
 };
 use harness::rng::DeterministicRng;
 use harness::stats::BenchError;
@@ -100,6 +101,113 @@ fn check_degradation_within_limit_rejects_non_finite_or_negative_max_pct() {
         -1.0,
     )
     .unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+// ---------------------------------------------------------------------
+// degradation_pct / median_degradation_pct / check_degradation_pct_within_limit
+// （TASK-130・CORE-7・Issue #302: 複数試行＋中央値採用への再整合で追加した
+// ヘルパの単体検証。`batch_bench.rs::run_core7_gate` は時間依存のため本テストの
+// 対象外だが、判定ロジック自体は `make ci` から回帰検証する）。
+// ---------------------------------------------------------------------
+
+#[test]
+fn degradation_pct_computes_signed_percentage() {
+    // `Duration` の内部表現（秒・ナノ秒）を経由するため厳密な浮動小数点一致ではなく
+    // 許容誤差付きで比較する（`f64` の丸め誤差。`check_degradation_within_limit_*`
+    // の既存テストと同一の許容方針）。
+    assert!(
+        (degradation_pct(Duration::from_millis(100), Duration::from_millis(110)).unwrap() - 10.0)
+            .abs()
+            < 1e-9
+    );
+    assert!(
+        (degradation_pct(Duration::from_millis(100), Duration::from_millis(90)).unwrap() - (-10.0))
+            .abs()
+            < 1e-9
+    );
+    assert_eq!(
+        degradation_pct(Duration::from_millis(100), Duration::from_millis(100)).unwrap(),
+        0.0
+    );
+}
+
+#[test]
+fn degradation_pct_rejects_zero_baseline() {
+    let err = degradation_pct(Duration::ZERO, Duration::from_millis(1)).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+#[test]
+fn check_degradation_within_limit_is_consistent_with_degradation_pct() {
+    // `check_degradation_within_limit` は `degradation_pct` 経由へリファクタした
+    // （Issue #302）。両者の判定結果が食い違わないことを固定する。
+    let baseline = Duration::from_millis(100);
+    let candidate = Duration::from_millis(109);
+    let pct = degradation_pct(baseline, candidate).unwrap();
+    assert!((pct - 9.0).abs() < 1e-9);
+    assert!(check_degradation_within_limit(baseline, candidate, 10.0).unwrap());
+    assert!(!check_degradation_within_limit(baseline, candidate, 5.0).unwrap());
+}
+
+#[test]
+fn median_degradation_pct_odd_count_returns_middle_value() {
+    assert_eq!(median_degradation_pct(&[3.0, 1.0, 2.0]).unwrap(), 2.0);
+}
+
+#[test]
+fn median_degradation_pct_even_count_averages_middle_two() {
+    assert_eq!(median_degradation_pct(&[1.0, 2.0, 3.0, 4.0]).unwrap(), 2.5);
+}
+
+#[test]
+fn median_degradation_pct_single_sample() {
+    assert_eq!(median_degradation_pct(&[7.5]).unwrap(), 7.5);
+}
+
+#[test]
+fn median_degradation_pct_rejects_empty_samples() {
+    let err = median_degradation_pct(&[]).unwrap_err();
+    assert!(matches!(err, BenchError::EmptySamples));
+}
+
+#[test]
+fn median_degradation_pct_rejects_non_finite_samples() {
+    let err = median_degradation_pct(&[1.0, f64::NAN, 2.0]).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = median_degradation_pct(&[1.0, f64::INFINITY]).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn check_degradation_pct_within_limit_accepts_boundary_equal() {
+    assert!(check_degradation_pct_within_limit(10.0, 10.0).unwrap());
+}
+
+#[test]
+fn check_degradation_pct_within_limit_rejects_above_limit() {
+    assert!(!check_degradation_pct_within_limit(10.1, 10.0).unwrap());
+}
+
+#[test]
+fn check_degradation_pct_within_limit_accepts_negative_pct_regardless_of_limit() {
+    // 劣化なし（負の劣化率）は上限が 0 でも常に通過する。
+    assert!(check_degradation_pct_within_limit(-5.0, 0.0).unwrap());
+}
+
+#[test]
+fn check_degradation_pct_within_limit_rejects_non_finite_pct() {
+    let err = check_degradation_pct_within_limit(f64::NAN, 10.0).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+#[test]
+fn check_degradation_pct_within_limit_rejects_non_finite_or_negative_max_pct() {
+    let err = check_degradation_pct_within_limit(1.0, f64::NAN).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+
+    let err = check_degradation_pct_within_limit(1.0, -1.0).unwrap_err();
     assert!(matches!(err, BenchError::ProtocolViolation(_)));
 }
 

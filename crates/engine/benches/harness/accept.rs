@@ -163,34 +163,103 @@ pub fn parse_contrast_ratio_limit(raw: &str) -> Result<f64, BenchError> {
     Ok(value)
 }
 
-/// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
-/// （`max_degradation_pct`）以内かを判定する（TASK-130・CORE-7 ポインタ:
-/// 動的窓集約を経由することによる単発クエリ経路の劣化上限）。
+/// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率（%）を算出する
+/// （TASK-130・CORE-7 ポインタ）。`check_degradation_within_limit`・
+/// `median_degradation_pct`（Issue #302。複数試行の中央値化）の双方から共有する
+/// 算出ロジックとして切り出す。
 ///
 /// 劣化率は `(candidate - baseline) / baseline * 100`（%）。`candidate` が
-/// `baseline` より速い（劣化なし）場合は負値になり、`max_degradation_pct` が
-/// 正である限り自動的に判定を通過する。`baseline` が `Duration::ZERO` だと
-/// 除算不能（NaN/inf 化し暗黙の fail-open を招く）なため `Err`
-/// （`ab::median_ratio` と同一の fail-closed 方針）。
-pub fn check_degradation_within_limit(
-    baseline_p95: Duration,
-    candidate_p95: Duration,
-    max_degradation_pct: f64,
-) -> Result<bool, BenchError> {
+/// `baseline` より速い（劣化なし）場合は負値になる。`baseline` が
+/// `Duration::ZERO` だと除算不能（NaN/inf 化し暗黙の fail-open を招く）なため
+/// `Err`（`ab::median_ratio` と同一の fail-closed 方針）。
+pub fn degradation_pct(baseline_p95: Duration, candidate_p95: Duration) -> Result<f64, BenchError> {
     if baseline_p95.is_zero() {
         return Err(BenchError::DegenerateRatio(
             "cannot compute degradation: baseline p95 is zero",
         ));
     }
+    let pct = (candidate_p95.as_secs_f64() - baseline_p95.as_secs_f64())
+        / baseline_p95.as_secs_f64()
+        * 100.0;
+    if !pct.is_finite() {
+        return Err(BenchError::DegenerateRatio(
+            "computed degradation_pct is not finite",
+        ));
+    }
+    Ok(pct)
+}
+
+/// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 劣化率が上限
+/// （`max_degradation_pct`）以内かを判定する（TASK-130・CORE-7 ポインタ:
+/// 動的窓集約を経由することによる単発クエリ経路の劣化上限）。
+///
+/// 劣化率の算出は [`degradation_pct`] に委譲する（Issue #302 でヘルパを共有化）。
+/// `max_degradation_pct` が正である限り、劣化なし（負の劣化率）は自動的に判定を
+/// 通過する。
+pub fn check_degradation_within_limit(
+    baseline_p95: Duration,
+    candidate_p95: Duration,
+    max_degradation_pct: f64,
+) -> Result<bool, BenchError> {
+    let pct = degradation_pct(baseline_p95, candidate_p95)?;
     if !max_degradation_pct.is_finite() || max_degradation_pct < 0.0 {
         return Err(BenchError::ProtocolViolation(
             "max_degradation_pct must be a finite, non-negative value",
         ));
     }
-    let degradation_pct = (candidate_p95.as_secs_f64() - baseline_p95.as_secs_f64())
-        / baseline_p95.as_secs_f64()
-        * 100.0;
-    Ok(degradation_pct <= max_degradation_pct)
+    Ok(pct <= max_degradation_pct)
+}
+
+/// 複数試行の劣化率（%）列から中央値を算出する（TASK-130・CORE-7・Issue #302。
+/// hosted runner での突発的な単発スパイクが 1 試行だけを外れ値化しても、
+/// ゲート全体の判定を歪めないようにする「複数試行＋中央値採用」方針の要）。
+///
+/// `samples` が空の場合は判定不能として `Err(BenchError::EmptySamples)`
+/// （`worst_recall`・`p95_from_samples` と同一の空入力拒否方針）。非有限値
+/// （NaN・±inf）を含む場合も `Err(BenchError::ProtocolViolation)`
+/// （[`degradation_pct`] は非有限な結果を既に `Err` で拒否するため、ここに
+/// 非有限値が渡ること自体が呼び出し元の契約違反であり fail-closed に倒す）。
+pub fn median_degradation_pct(samples: &[f64]) -> Result<f64, BenchError> {
+    if samples.is_empty() {
+        return Err(BenchError::EmptySamples);
+    }
+    if samples.iter().any(|v| !v.is_finite()) {
+        return Err(BenchError::ProtocolViolation(
+            "median_degradation_pct: samples must all be finite",
+        ));
+    }
+    let mut sorted = samples.to_vec();
+    // 浮動小数点は `Ord` を持たないため `partial_cmp` を使う。直前に非有限値を
+    // 拒否済みのため `unwrap_or` の分岐へは到達しない（防御的に等価扱いへ倒す）。
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    let median = if sorted.len().is_multiple_of(2) {
+        // 偶数個: 中央 2 件の平均。`mid` は 1 以上（空入力は上で拒否済み）。
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    };
+    Ok(median)
+}
+
+/// 劣化率（%）の中央値が上限（`max_pct`）以内かを判定する（TASK-130・CORE-7・
+/// Issue #302）。[`check_degradation_within_limit`] の単一試行版に対応する
+/// 複数試行版で、`batch_bench.rs::run_core7_gate` の 5 試行フローから使う。
+///
+/// `max_pct` の妥当性検証は [`check_degradation_within_limit`] と同一
+/// （有限・非負のみ許容。fail-closed）。
+pub fn check_degradation_pct_within_limit(pct: f64, max_pct: f64) -> Result<bool, BenchError> {
+    if !pct.is_finite() {
+        return Err(BenchError::DegenerateRatio(
+            "check_degradation_pct_within_limit: pct must be finite",
+        ));
+    }
+    if !max_pct.is_finite() || max_pct < 0.0 {
+        return Err(BenchError::ProtocolViolation(
+            "max_pct must be a finite, non-negative value",
+        ));
+    }
+    Ok(pct <= max_pct)
 }
 
 /// `baseline`（対照経路）に対する `candidate`（被検経路）の p95 短縮率が下限

@@ -1,0 +1,146 @@
+# CORE-7 動的窓ゲート（`bench-batch`）の測定設計是正
+
+- ステータス: Accepted（本コミットで `batch_bench.rs` の CORE-7 ゲート・診断を
+  実装。マージ後のリポジトリ管理者作業〔受け入れ条件 3〕は下記「申し送り」参照）
+- 対応: Issue #302（`fix(engine): bench-batch の dynamic_window_degradation 失敗の切り分け`）。
+  親: #300（閾値ゲート初回 strict 評価の後続対応）
+- 前提: TASK-130（`docs/spec/05-tasks.md`・対象ビヘイビア CORE-7。
+  `docs/spec/04-behavior/core-engine.md` ポインタ参照）、
+  `docs/design/ci-gate-variables.md`（`BENCH_BATCH_MAX_DEGRADATION_PCT` の secrets 注入）
+
+## 背景
+
+`.github/workflows/bench.yml` の `bench-batch` job（CORE-7 ゲート
+`dynamic_window_degradation`）が、閾値 secret 設定後の `workflow_dispatch` 2 回で
+いずれも `pass=false` になった。本 ADR は、その原因切り分けと測定方式の是正を
+記録する。数値（閾値・実測値）は一切含めない
+（`.claude/rules/spec-confidentiality.md`）。
+
+## 原因調査
+
+ローカル／隔離環境での再現実行と独立プローブにより、以下を切り分けた。
+
+1. **ノイズではない**: 複数回のローカル再現で被検側（動的窓集約経由）の p95 が
+   対照側（検証なしの `Vec::push`）より系統的に大きく、失敗は再現性のある構造的な
+   ものだった。
+2. **engine の実退行ではない**: 集約器実装（`engine::batch_search::
+   DynamicWindowAggregator`）に直近の関連変更はなく、独立プローブでも
+   push/drain 自体のコストは対照とほぼ同スケール（マイクロ秒未満）だった。
+3. **根本原因はベンチ側の測定設計**:
+   - 旧実装は `harness::ab::run_ab` の戻り値（`Vec<Vec<f32>>`。256 本 ×
+     dim 768 規模）を測定区間の内側で drop していた。`run_ab` はワークロードの
+     戻り値を `black_box` 経由で測定区間内に drop する契約（`harness/ab.rs`・
+     `harness/protocol.rs` に本コミットで明記）であり、解放コストが push/drain
+     本体の差分（マイクロ秒未満）に対して支配的だった。
+   - 加えて、対照側・被検側のクエリプールを「対照側を全確保 → 被検側を全確保」
+     の順で構築していたため、両者の heap 配置が非対称になり、glibc の `free` 挙動
+     （top chunk への併合・trim 誘発）が経路間で異なるコストを生んでいた。
+   - この 2 点により、実際には測定しているのが集約器のオーバーヘッドではなく
+     アロケータの挙動になっていた。
+   - さらに、drop コストを外して push/drain 本体だけを比較しても、対照側が
+     「検証なしの `Vec::push`」という数ナノ秒の操作である以上、検証・amortized
+     成長を持つどんな集約器実装も百分率上限を安定して満たせない。CORE-7 が
+     定める量（動的窓構成における**単発クエリ経路**の p95 劣化）と、旧来の
+     「256 本まとめて push/drain するだけ」の比較は測定対象がそもそも異なって
+     いた。
+
+## 設計方針
+
+### CORE-7 ゲート本体（`batch_bench.rs::run_core7_gate`）
+
+- A（対照）・B（被検）とも **同一カーネル**（`engine::batch_search::
+  BatchEngine::batch_search`。f16 常駐・CPU-SIMD）を経由させ、CORE-6/CORE-16 と
+  同じ合成データセット（`build_gate_dataset`）を再利用する。
+- A は事前生成済みクエリ 1 本を直接 `batch_search` へ渡す経路、B は同じ形状の
+  クエリを `DynamicWindowAggregator::push`/`drain` に通してから同じ
+  `batch_search` を呼ぶ経路とし、差分を「窓の push/drain・所有権移動・dispatch
+  相当の分岐」だけに絞る。単発クエリは実運用では動的窓に入らない
+  （`should_aggregate_into_batch` が `false` を返す文脈）ため、B は「窓を通った
+  場合に単発クエリが払いうる最大オーバーヘッド」を課す**保守側**の構成である。
+- 複数試行（`CORE7_TRIALS`）を行い、劣化率（%）の**中央値**を閾値と比較する。
+  単一試行だけでは hosted runner 上の突発的な計測スパイクが 1 回でも起きると
+  誤 fail しうるため、中央値採用でその影響を緩和する（本コミットのローカル
+  検証でも、複数試行中 1 試行だけが大きく外れる事象を実際に観測しており、
+  中央値がその対策として機能することを確認した）。
+- 解放コストの測定区間外化: 各ワークロードの戻り値（B の `drain()` 結果等）は
+  試行内の sink へ退避し、`run_ab` 完了後にまとめて drop する
+  （`harness::ab::run_ab`・`harness::protocol::run` のドキュメンテーション
+  コメントに明記した「戻り値の drop は測定区間内」契約への対応）。
+- pool の対称化: 対照用・被検用のクエリ確保を「全確保 → 全確保」の順にせず、
+  1 つのループで交互に確保する。
+- `batch_search` が 1 件でもエラーを返した場合は判定不能として `pass=false`
+  （CORE-6/CORE-16 と同一の fail-closed 方針。エラー経路は通常大幅に軽量なため、
+  計測サンプルへ計上すると誤って劣化なしと判定しうる）。
+
+### 診断への降格（`batch_bench.rs::run_dynamic_window_push_drain_diagnostic`）
+
+旧来の「256 本まとめて push/drain するだけ」の比較は、集約器実装そのものの
+退行を可視化する判別力の高い参考値として、**合否に数えない診断**として残す
+（`simd_bench.rs::diagnostic_ab` と同型）。`BatchEngine::batch_search` を経由
+しないため CORE-7 の定義量そのものではないが、集約器単体の実装変更を素早く
+検知する用途では引き続き有用と判断した。診断側にも「解放コストの測定区間
+外化」「pool の対称化」を適用する（そのままだと診断値も heap 配置効果を
+映してしまうため）。
+
+## PR #154 の判別力優先レビュー対応との関係
+
+旧実装（本コミットで置き換えた `main` 内の直接比較）は PR #154 のレビュー対応で
+確立されたものだった。当時の設計は「A/B 双方が同一の `BatchEngine::batch_search`
+（全走査）を測定区間へ含めると、全走査のミリ秒級コストの前で push/drain の
+ナノ〜マイクロ秒級の差分が埋もれ、実質どんな劣化を注入しても pass してしまう
+判別力のないゲートになる」という指摘への対応であり、`batch_search` を測定区間
+から除外することで判別力を確保していた。
+
+本コミットは、CORE-7 の定義量（動的窓構成における単発クエリ経路の p95 劣化）を
+測るには `batch_search` を経由する必要があるという理由から、その除外を**ゲート
+本体については取り消す**。判別力優先の判断そのものが誤りだったのではなく、
+「判別力の高い比較」と「CORE-7 が定義する量」が両立しない設計だったため、
+前者を `run_dynamic_window_push_drain_diagnostic` として合否に数えない診断へ
+切り出し、両方を別々に保持する形で解決した（アサーション弱体化ではなく、
+ゲート本体の測定対象を定義量へ合わせ直したうえで判別力は診断側に温存する構成）。
+
+## 本ゲートの感度の限界
+
+B（被検）は A（対照）に窓の push/drain・所有権移動を上乗せしただけの経路であり、
+理論上 B が A より速くなることはない。しかし実測では負の劣化率（B が A より
+速く見える試行）が繰り返し観測されている。これは push/drain 自体のコスト
+（ナノ〜マイクロ秒未満）が、ミリ秒オーダーの全走査を含む 1 反復全体の計測
+ノイズ（キャッシュ・スケジューラ・周波数遷移等）に対して非常に小さいためで
+あり、**本ゲートは全走査コストに対して大きな劣化（実装の重大な退行）だけを
+検出できる**という感度の限界を持つ。push/drain 自体のノイズ床に埋もれる程度の
+軽微な退行は本ゲートでは検出できず、`run_dynamic_window_push_drain_diagnostic`
+（合否に数えない診断）と `tests/batch_accept.rs` の単体テストが引き続きその
+役割を担う。
+
+## 検討したが採らなかった案
+
+- **旧来の micro ゲートを維持し spec 側で閾値を見直す**: 対照が数ナノ秒の
+  `Vec::push` である限り、百分率上限をどこに置いても検証コストを持つ実装は
+  安定して満たせない。CORE-7 の定義量（単発クエリ p95）とも一致しない。
+- **`DynamicWindowAggregator` の最適化で被検側を対照側に寄せる**: 検証コストが
+  残る以上サブマイクロ秒スケールの比率は改善しきれず、hosted runner での
+  ノイズ耐性も得られない。本 Issue のスコープ外（engine 本体は変更しない）。
+- **`bench.yml` の変更**: 不要。job 定義・環境変数・実測値非出力の運用方針は
+  変更していない。
+
+## 実測値・閾値の非出力方針（維持）
+
+既定出力は pass/fail と非数値状態のみ。実測値（試行別劣化率・中央値等）は
+`BENCH_VERBOSE` opt-in 時のみ追加出力し、`GITHUB_ACTIONS` 下では
+`BENCH_VERBOSE` 自体を fail-closed で拒否する（Issue #279 の既定方針を維持。
+本 ADR にも数値を書かない）。
+
+## 申し送り
+
+- **受け入れ条件 3（連続 3 回 green）**: Environment `bench-gate` は main 限定の
+  ため、マージ後にリポジトリ管理者が `gh workflow run bench.yml --ref main` を
+  3 回連続で実行して確認する（`README.md` 参照）。
+- **`bench-c1` job の別失敗**: 同じ失敗 run で `p95_latency(sql_c1)` も
+  `pass=false` だったが、`workflow_dispatch` 限定・専有環境前提の基準であり
+  本 Issue の対象外。ユーザーへ別途報告済み（起票要否はユーザー判断待ち）。
+- **Actions ログのマスクによる secret 値の推定経路**: 失敗 run のログで、bench
+  出力中の固定文字列（ID・数値等）の一部が secret の値と部分一致してマスク
+  された痕跡があり、マスクされた位置から間接的に値を推定できる余地がある。
+  対策候補の検討は spec-confidentiality に関わる別 Issue としてユーザーへ
+  報告する（本 ADR・PR には推定値を書かない）。
+- **wire 層経由の再測定**: 引き続き未実施（既存の申し送りのまま）。
