@@ -24,20 +24,26 @@
 //!     が `false` を返す文脈）、B は「窓を通った場合に単発クエリが払いうる
 //!     最大オーバーヘッド」を課す保守側の構成である。
 //!   - `CORE6`/`CORE-16` と同じ合成データセット（[`build_gate_dataset`]）を
-//!     再利用し、複数試行（[`CORE7_TRIALS`]）を行う。試行内の統計量には
-//!     契約が定める p95 をそのまま使い（[`p95_degradation_pct`]。単一試行内で
-//!     「典型的な反復」ではなく「遅い側の反復」を捉える）、試行間はその p95
-//!     列の**中央値**を `BENCH_BATCH_MAX_DEGRADATION_PCT` と比較する（突発的な
+//!     再利用し、複数試行（[`CORE7_TRIALS`]）を行う。A/B のクエリは反復ごとに
+//!     同一内容を複製して使い（`batch_search` の類似度計算コストがクエリ値へ
+//!     左右されるぶんをノイズ源から除く。Issue #302 レビュー対応）、試行内の
+//!     劣化率（%）は `run_ab` の同一反復インデックスで対にした所要時間の
+//!     **絶対差分（秒）の p95** を対照側の p95 レイテンシで 1 回だけ正規化して
+//!     算出する（[`paired_p95_degradation_pct`]）。試行間はその値の列の
+//!     **中央値**を `BENCH_BATCH_MAX_DEGRADATION_PCT` と比較する（突発的な
 //!     計測スパイクが単一試行だけを外れ値化しても誤 fail しないための試行間
-//!     ノイズ対策であり、試行内統計量〔p95〕とは別種のノイズに対する別処置。
-//!     Issue #302 codex-review 対応）。A/B のクエリは反復ごとに同一内容を複製
-//!     して使い（`batch_search` の類似度計算コストがクエリ値へ左右されるぶんを
-//!     ノイズ源から除く。Issue #302 レビュー対応）、劣化率は経路別に独立算出
-//!     した p95 の差分ではなく `run_ab` の同一反復インデックスで対にした所要
-//!     時間から算出する（[`paired_degradation_pct_samples`]。A/B が共有する
-//!     全走査コストの反復間ノイズが両者の p95 推定へ別々に乗って測定対象
-//!     〔push/drain の差分〕を希釈するのを避ける。詳細は ADR「本ゲートの感度の
-//!     限界」節参照）。
+//!     ノイズ対策であり、試行内統計量〔ペア化差分の p95〕とは別種のノイズに
+//!     対する別処置。Issue #302 codex-review 対応）。反復ごとに `(b_i - a_i) /
+//!     a_i` という比率へ正規化してから比率列の p95 を取る旧方式は、A/B 双方が
+//!     共有する全走査コストの残留ノイズが個々の比率の分散へ別々に乗り、実退行が
+//!     無くても比率分布の裾を押し上げうる（Cursor Bugbot 指摘: paired p95
+//!     overstates degradation・Issue #302）。正規化を「差分の p95 を取ってから
+//!     1 回だけ割る」順序に変えることでこれを避けつつ、経路別に独立算出した
+//!     p95 の差分（`degradation_pct(p95_from_samples(a), p95_from_samples(b))`）
+//!     が持つ「軽微な push/drain 退行が全走査コストの反復間ノイズへ別々に埋もれ
+//!     判別力を失う」問題（codex-review 指摘）も、分子をペア化差分の p95に
+//!     すること自体は変えないため回避したまま維持する。詳細は ADR「本ゲートの
+//!     感度の限界」節参照。
 //!   - ワークロードの戻り値（B の `drain()` 結果等）は計測区間内で drop すると
 //!     解放コストが測定対象へ混入する（`harness::ab::run_ab` のドキュメンテー
 //!     ションコメント参照）ため、各試行内で sink へ退避し `run_ab` 完了後に
@@ -89,7 +95,7 @@ mod harness;
 use harness::ab::run_ab;
 use harness::accept::{
     check_degradation_pct_within_limit, check_improvement_at_least, median_degradation_pct,
-    p95_degradation_pct, p95_from_samples, paired_degradation_pct_samples,
+    p95_from_samples, paired_p95_degradation_pct,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -414,24 +420,26 @@ fn run_core7_gate(
         // では反復間ノイズが両者へ別々に乗って測定対象（push/drain の差分）を
         // 希釈しうる（`docs/design/core7-dynamic-window-gate.md` 参照）。
         // `run_ab` は同一インデックスの `a.samples[i]`/`b.samples[i]` が同一
-        // 反復を指す契約のため、反復ごとに対で劣化率を取って共通コスト成分を
-        // 相殺する（ペア化差分によるノイズ低減。CORE-7 が定義する量そのものは
-        // 変えない）。
+        // 反復を指す契約のため、反復ごとに対で絶対差分（秒）を取って共通コスト
+        // 成分を相殺し、その差分列の p95（オーバーヘッド自体の裾）を対照側の
+        // p95 レイテンシで**1 回だけ**正規化する（[`paired_p95_degradation_pct`]）。
         //
-        // 試行内の統計量には中央値ではなく p95（`p95_degradation_pct`）を使う
-        // （Issue #302 codex-review 対応）: CORE-7 は単発クエリ経路の p95 劣化を
-        // 定めるゲート契約であり、ペア化した反復ごとの劣化率列の中央値は
-        // 「典型的な反復の比率」に過ぎず、B（被検）側の遅い上位 5% だけが退行
-        // しても中央値には現れない。試行間のスパイク耐性は次段（`trial_pcts` の
-        // `median_degradation_pct`）が別途担うため、ここを中央値化すると
-        // 試行間ノイズにしか効かない対策で契約が定める p95 劣化そのものを
-        // 隠してしまう。
-        let paired_pcts =
-            paired_degradation_pct_samples(&ab.a.samples, &ab.b.samples).map_err(|err| {
-                format!("{LABEL}: paired degradation samples failed (trial {trial}): {err}")
-            })?;
-        let pct = p95_degradation_pct(&paired_pcts).map_err(|err| {
-            format!("{LABEL}: p95 of paired degradation samples failed (trial {trial}): {err}")
+        // 反復ごとに `(b_i - a_i) / a_i` という比率へ正規化してから比率列の p95
+        // を取る旧方式（`paired_degradation_pct_samples` → `p95_degradation_pct`）
+        // は、A/B 双方の残留ノイズが個々の比率の分散へ別々に乗り、実退行が無くても
+        // 比率分布の裾を押し上げうる（Cursor Bugbot 指摘: paired p95 overstates
+        // degradation・Issue #302）。`paired_p95_degradation_pct` は正規化を
+        // 「差分の p95 を取ってから 1 回だけ割る」順序に変えることでこれを避けつつ、
+        // 分子をペア化差分の p95 にする（＝全走査コストへ経路別に独立算出した p95
+        // の差分より判別力を落とさない。codex-review 指摘）性質は維持する。
+        //
+        // 試行間のスパイク耐性は次段（`trial_pcts` の `median_degradation_pct`）が
+        // 別途担う（単一試行内のばらつきと複数試行間の突発スパイクは別種のノイズ
+        // であり、試行内側まで中央値化すると契約が定める p95 劣化そのものを
+        // 隠してしまうため、試行内は p95 のまま・試行間だけ中央値を使う設計は
+        // 維持する）。
+        let pct = paired_p95_degradation_pct(&ab.a.samples, &ab.b.samples).map_err(|err| {
+            format!("{LABEL}: paired p95 degradation failed (trial {trial}): {err}")
         })?;
         trial_pcts.push(pct);
     }

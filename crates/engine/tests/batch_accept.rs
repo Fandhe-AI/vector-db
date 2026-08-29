@@ -26,7 +26,7 @@ mod harness;
 use harness::accept::{
     check_degradation_pct_within_limit, check_degradation_within_limit, check_improvement_at_least,
     degradation_pct, median_degradation_pct, p95_degradation_pct, paired_degradation_pct_samples,
-    recall_at_k, worst_recall,
+    paired_p95_degradation_pct, recall_at_k, worst_recall,
 };
 use harness::rng::DeterministicRng;
 use harness::stats::BenchError;
@@ -330,6 +330,181 @@ fn paired_degradation_pct_samples_rejects_zero_baseline_pair() {
     let b = [Duration::from_millis(1), Duration::from_millis(1)];
     let err = paired_degradation_pct_samples(&a, &b).unwrap_err();
     assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+// ---------------------------------------------------------------------
+// paired_p95_degradation_pct（CORE-7・Issue #302 Cursor Bugbot 指摘対応:
+// 反復ごとの絶対差分〔秒〕の p95 を対照側 p95 レイテンシで 1 回だけ正規化する。
+// 反復ごとに比率へ正規化してから比率列の p95 を取る旧方式は、A/B 双方の残留
+// ノイズが個々の比率の分散へ乗り実退行が無くても裾を押し上げうる問題があった）
+// ---------------------------------------------------------------------
+
+#[test]
+fn paired_p95_degradation_pct_matches_manual_computation() {
+    // a はすべて 100ms、b は 3 反復中 1 反復だけ +20ms（他は劣化なし）。
+    // 差分列は [20ms, 0ms, 0ms] → p95（最近傍法・3 件中 rank=ceil(3*0.95)=3）は
+    // 最大値 20ms。対照側 p95（100ms）で正規化すると 20%。
+    let a = [
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    ];
+    let b = [
+        Duration::from_millis(120),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    ];
+    let pct = paired_p95_degradation_pct(&a, &b).unwrap();
+    assert!((pct - 20.0).abs() < 1e-6, "pct={pct}");
+}
+
+#[test]
+fn paired_p95_degradation_pct_is_zero_when_b_equals_a() {
+    let a = [Duration::from_millis(100), Duration::from_millis(50)];
+    let b = a;
+    let pct = paired_p95_degradation_pct(&a, &b).unwrap();
+    assert!(pct.abs() < 1e-9, "pct={pct}");
+}
+
+#[test]
+fn paired_p95_degradation_pct_overstates_less_than_ratio_based_p95_on_same_input() {
+    // 旧方式（`paired_degradation_pct_samples` → `p95_degradation_pct`。反復ごとに
+    // `(b_i - a_i) / a_i` へ正規化してから比率列の p95 を取る）と新方式（本関数。
+    // 反復ごとの絶対差分の p95 を対照側 p95 で 1 回だけ正規化する）を**同一入力**
+    // へ適用し、旧方式が過大評価することを直接比較で固定する（Cursor Bugbot
+    // 指摘・Issue #302 の再発防止）。
+    //
+    // 入力: 4 反復中 1 反復だけ分母 `a_i` が極端に小さい（1us）。この反復の
+    // 絶対差分はわずか 1us（無視できる規模）だが、旧方式は分母が小さいせいで
+    // 比率が 100% に跳ね上がり、それがそのまま比率列の p95 候補（4 件中
+    // rank=ceil(4*0.95)=4 → 最大値）に混入する。新方式は分母を対照側全体の
+    // p95（100ms）に固定しているため、この反復の小さな絶対差分は薄まる。
+    let a = [
+        Duration::from_micros(1), // 極端に小さい分母（旧方式の比率を増幅させる反復）
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    ];
+    let b = [
+        Duration::from_micros(2), // a との差は 1us のみ（無視できる規模の絶対差）
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    ];
+
+    let old_paired_pcts = paired_degradation_pct_samples(&a, &b).unwrap();
+    let old_pct = p95_degradation_pct(&old_paired_pcts).unwrap();
+    let new_pct = paired_p95_degradation_pct(&a, &b).unwrap();
+
+    // 旧方式: 1us/1us=100% という比率がそのまま p95 になる（実際の絶対劣化は
+    // 無視できる規模にもかかわらず）。
+    assert!((old_pct - 100.0).abs() < 1e-6, "old_pct={old_pct}");
+    // 新方式: 同じ入力でも実際の絶対劣化（1us / 100ms 基準）に見合う小さい値に
+    // 留まり、旧方式を明確に下回る。
+    assert!(new_pct < 1.0, "new_pct={new_pct} should stay small");
+    assert!(
+        new_pct < old_pct,
+        "new_pct={new_pct} should overstate less than old_pct={old_pct}"
+    );
+}
+
+#[test]
+fn paired_p95_degradation_pct_rejects_mismatched_lengths() {
+    let a = [Duration::from_millis(1), Duration::from_millis(1)];
+    let b = [Duration::from_millis(1)];
+    let err = paired_p95_degradation_pct(&a, &b).unwrap_err();
+    assert!(matches!(err, BenchError::ProtocolViolation(_)));
+}
+
+#[test]
+fn paired_p95_degradation_pct_rejects_empty_input() {
+    let err = paired_p95_degradation_pct(&[], &[]).unwrap_err();
+    assert!(matches!(err, BenchError::EmptySamples));
+}
+
+#[test]
+fn paired_p95_degradation_pct_rejects_zero_baseline() {
+    let a = [Duration::ZERO, Duration::ZERO];
+    let b = [Duration::from_millis(1), Duration::from_millis(1)];
+    let err = paired_p95_degradation_pct(&a, &b).unwrap_err();
+    assert!(matches!(err, BenchError::DegenerateRatio(_)));
+}
+
+// ---------------------------------------------------------------------
+// 検出力検証（CORE-7・Issue #302 codex-review 指摘対応: 「感度の高い比較を
+// 合否判定に残すか、既知の退行を注入して新ゲートが確実に失敗する検出力検証を
+// 追加せよ」の後者を満たす）。
+//
+// `run_core7_gate`（`batch_bench.rs`）と同型の統計パイプライン（複数試行 →
+// 各試行で `paired_p95_degradation_pct` → 試行間 `median_degradation_pct` →
+// `check_degradation_pct_within_limit`）を、実測タイマーを使わず合成サンプルへ
+// 適用する。合成サンプルは実際のベンチ構成（データセット規模・全走査コスト・
+// 閾値）を再現するものではなく、本テスト専用の合成値である（spec 実測値・
+// 閾値はここにも書かない）。
+// ---------------------------------------------------------------------
+
+/// `run_core7_gate` の統計パイプラインを合成サンプルへ適用し、試行間中央値
+/// （%）を返すテスト専用ヘルパ。A（対照）は「全走査コスト＋独立ノイズ」のみ、
+/// B（被検）はそこへ固定の `injected_overhead_ns`（push/drain 退行を模した
+/// 反復ごと一定のオーバーヘッド）を上乗せする。`injected_overhead_ns == 0` は
+/// 「実退行なし・ノイズのみ」のケースに対応する。
+fn synthetic_gate_median_pct(
+    seed_base: u64,
+    trials: u64,
+    iterations: usize,
+    injected_overhead_ns: u64,
+    jitter_ns: u64,
+) -> f64 {
+    const SHARED_SCAN_COST_NS: u64 = 50_000_000; // 合成値。実際の全走査コストとは無関係
+
+    let mut trial_pcts: Vec<f64> = Vec::with_capacity(trials as usize);
+    for trial in 0..trials {
+        let mut rng = DeterministicRng::new(seed_base + trial);
+        let mut a_samples: Vec<Duration> = Vec::with_capacity(iterations);
+        let mut b_samples: Vec<Duration> = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            // A/B 双方に独立なノイズ（残留ノイズの模擬。Bugbot が指摘した
+            // 「ノイズだけで裾が押し上げられる」経路を合成データでも再現する）。
+            let jitter_a_ns = (rng.next_f32() * jitter_ns as f32) as u64;
+            let jitter_b_ns = (rng.next_f32() * jitter_ns as f32) as u64;
+            let a_ns = SHARED_SCAN_COST_NS + jitter_a_ns;
+            let b_ns = SHARED_SCAN_COST_NS + jitter_b_ns + injected_overhead_ns;
+            a_samples.push(Duration::from_nanos(a_ns));
+            b_samples.push(Duration::from_nanos(b_ns));
+        }
+        let pct = paired_p95_degradation_pct(&a_samples, &b_samples).unwrap();
+        trial_pcts.push(pct);
+    }
+    median_degradation_pct(&trial_pcts).unwrap()
+}
+
+#[test]
+fn core7_gate_pipeline_fails_when_a_push_drain_regression_is_injected() {
+    // 本テスト専用のしきい値・注入量（実際の `BENCH_BATCH_MAX_DEGRADATION_PCT`
+    // とは無関係の合成値）。
+    const TEST_MAX_PCT: f64 = 2.0;
+    const TRIALS: u64 = 5;
+    const ITERATIONS: usize = 50;
+    const JITTER_NS: u64 = 1_000_000; // ±1ms 相当の独立ノイズ
+    const INJECTED_OVERHEAD_NS: u64 = 3_000_000; // 反復ごと一定 3ms の push/drain 退行
+
+    let no_regression_pct = synthetic_gate_median_pct(1, TRIALS, ITERATIONS, 0, JITTER_NS);
+    let regression_pct =
+        synthetic_gate_median_pct(1, TRIALS, ITERATIONS, INJECTED_OVERHEAD_NS, JITTER_NS);
+
+    // ノイズのみ（実退行なし）は通過する（Bugbot 指摘の再発防止: ノイズだけで
+    // 誤 fail しない）。
+    assert!(
+        check_degradation_pct_within_limit(no_regression_pct, TEST_MAX_PCT).unwrap(),
+        "no_regression_pct={no_regression_pct} should pass at TEST_MAX_PCT={TEST_MAX_PCT}"
+    );
+    // 既知の push/drain 退行を注入すると確実に失敗する（codex-review 指摘の
+    // 検出力検証: 感度の高い比較を維持したまま新ゲートが機能することを固定する）。
+    assert!(
+        !check_degradation_pct_within_limit(regression_pct, TEST_MAX_PCT).unwrap(),
+        "regression_pct={regression_pct} should fail at TEST_MAX_PCT={TEST_MAX_PCT} \
+         (gate must retain detection power for injected regressions)"
+    );
 }
 
 // ---------------------------------------------------------------------
