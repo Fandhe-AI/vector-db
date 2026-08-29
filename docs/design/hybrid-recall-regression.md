@@ -299,17 +299,24 @@ ranking）を層 A の固定値アサーション（`crates/engine/tests/hybrid_
 
 `crates/engine/tests/hybrid_recall.rs`（層 A、決定的コーパスのため再現可能）は
 小規模・大規模の両段で pass する。`total_correct`／`ceil20`／`ceil100`・
-`hits20`／`hits100` の実測値は本ドキュメントにも同テストにも数値のまま記録
-せず、測定タプル全体を決定的ハッシュへ畳み込んだダイジェスト
-（`hybrid_recall.rs::regression_digest`・`rerank_recall.rs::regression_digest`）
-1 個を固定値アサーションの対象とすることで退行検出の記録場所とする
-（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`。個々のフィールドが
-1 件でも変化すればダイジェストも変化するため検出力は個別 `assert_eq!` と同等
-だが、数値そのものは非公開のまま）。Issue #310（`GroupEnd`＋境界同点グループ
-完全化）の適用前後で、`ceil20`／`ceil100`／`total_correct`（正解集合の理論
-上限・総数。fixture 非変更のため不変）に対し、両段とも `hits20` の到達率が
-改善したことをローカルでの実測（`RECALL_VERBOSE=1` opt-in）で確認済み
-（本ドキュメントには実測値を記載しない）。
+`hits20`／`hits100` の実測値は本ドキュメントにも同テストにも記録しない
+（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`）。
+
+以前は測定タプル全体を `DefaultHasher`（固定キー）で畳み込んだダイジェスト
+1 個を固定値アサーションの対象にすることで数値非開示のまま退行検出しようと
+していたが、フィクスチャ生成コード自体が本ファイル内に公開されており各
+フィールドが少値域の整数に収まるため、ダイジェスト値からの総当たり復元が
+現実的でありこの方式では受け入れ条件 3 を満たせないと判明した
+（codex-review P0 指摘・PR #320）。このためダイジェスト方式は撤回し、層 A は
+数値に依存しない**関係アサーション**のみで退行検出する（密単体・疎単体・
+融合の Recall@20 の大小関係、展開なし/ありのパススルー等式など）。数値
+そのものの固定値ゲートが必要な場合は、既存の spec 閾値と同様に層 B
+（`environment: recall-gate` の secrets 経由）側で扱う。Issue #310
+（`GroupEnd`＋境界同点グループ完全化）の適用前後で、`ceil20`／`ceil100`／
+`total_correct`（正解集合の理論上限・総数。fixture 非変更のため不変）に対し、
+両段とも `hits20` の到達率が改善したことをローカルでの実測
+（`RECALL_VERBOSE=1` opt-in）で確認済み（本ドキュメントには実測値を記載
+しない）。
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の
