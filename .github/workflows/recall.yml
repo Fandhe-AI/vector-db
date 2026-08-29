@@ -14,6 +14,15 @@ name: Recall
 # 同一 job（`recall-regression`）・同一 environment（`recall-gate`）から実行する
 # （検証設計・実測経緯は `docs/design/rerank-recall-regression.md` 参照）。
 #
+# 3 つの gate step（recall-regression・rerank-regression・query-planning-regression）は
+# それぞれ `continue-on-error: true` を付与して独立に実行し、job 末尾の
+# `Evaluate recall gates` step が各 step の `outcome` を AND 集約して job の合否を
+# 決める（Issue #311）。従来は直列実行のみで先頭の hybrid step が fail すると
+# 後続 2 step が GitHub Actions の既定挙動で skipped になり、一度も評価されない
+# 状態が続いていた（実測: run 33251403345）。独立評価後も 3 step すべて pass の
+# 所要時間は従来の直列実行と変わらないため `timeout-minutes: 30` は据え置く。
+# 詳細は `docs/design/recall-gate-independent-evaluation.md` 参照。
+#
 # `schedule` トリガ（毎週月曜 04:00 UTC。`bench.yml`（03:00 UTC）と重ならないよう
 # ずらす）は #168 で再追加済み。`schedule` は default branch（main）の workflow
 # 定義・最新 commit のみを実行するため `github.ref` は常に `refs/heads/main` に
@@ -130,6 +139,15 @@ jobs:
       - name: Install Rust toolchain (rust-toolchain.toml)
         run: rustup show
       - name: Run recall-regression
+        id: hybrid
+        continue-on-error: true
+        # 本 step が fail しても後続の rerank / query-planning step を評価するため
+        # `continue-on-error: true` を付与する（Issue #311。従来は直列実行で本 step
+        # が fail すると後続 2 step が GitHub Actions の既定挙動で skipped になり、
+        # 一度も評価されない状態が続いていた）。job 全体の最終判定は末尾の
+        # `Evaluate recall gates` step が 3 step の `outcome`（`continue-on-error`
+        # 適用前の結果）を AND 集約して行う。
+        #
         # 数値基準（Recall 下限）は spec（TASK-104・SEARCH-1, SEARCH-2）が SSOT のため
         # 本ワークフローにはハードコードしない。environment `recall-gate`（上の
         # `environment:` 参照。main のみに制限した deployment branch policy 付き）の
@@ -162,6 +180,11 @@ jobs:
           HYBRID_RECALL_MIN_R100_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R100_LARGE }}
         run: make recall-regression
       - name: Run rerank-regression
+        id: rerank
+        continue-on-error: true
+        # 上の `Run recall-regression` step と同じ理由で `continue-on-error: true`
+        # を付与し、hybrid の fail 有無に関わらず本 step を独立に評価する（Issue #311）。
+        #
         # TASK-108（SEARCH-7）の層 B（`crates/engine/tests/rerank_recall.rs`）。
         # 数値基準（リランキング後の Recall@20 絶対下限・baseline からの改善幅の
         # 下限）は spec が SSOT のため本 workflow にはハードコードしない。上の
@@ -185,6 +208,11 @@ jobs:
           RERANK_RECALL_MIN_R20_IMPROVEMENT: ${{ secrets.RERANK_RECALL_MIN_R20_IMPROVEMENT }}
         run: make rerank-regression
       - name: Run query-planning-regression
+        id: query_planning
+        continue-on-error: true
+        # 上の 2 step と同じ理由で `continue-on-error: true` を付与し、hybrid /
+        # rerank の fail 有無に関わらず本 step を独立に評価する（Issue #311）。
+        #
         # TASK-112（PLAN-1, PLAN-2）の層 B（`crates/engine/tests/query_planning_recall.rs`）。
         # 数値基準（intent カテゴリの改善幅下限・direct カテゴリの after Recall@20
         # 絶対下限・NoisyLlmClient〔非 oracle・劣化展開品質〕による intent 改善幅
@@ -227,3 +255,37 @@ jobs:
           QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE: ${{
             secrets.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
         run: make query-planning-regression
+      - name: Evaluate recall gates
+        # 3 つの gate step（hybrid / rerank / query_planning）は `continue-on-error: true`
+        # のため単体では job を failure にしない。本 step が `steps.<id>.outcome`
+        # （`continue-on-error` 適用前の結果。`success` / `failure` / `cancelled` /
+        # `skipped`）を AND 集約し、1 つでも `success` 以外なら非ゼロ終了して job を
+        # failure にする（Issue #311）。`conclusion`（適用後。`continue-on-error` により
+        # 常に `success` になる）ではなく `outcome` を見ることで、hybrid が fail した
+        # run で rerank / query-planning が一度も評価されず job だけ green になる
+        # （実測: run 33251403345 で後続 2 step が skipped）誤 green 化を防ぐ。
+        # 値は `run:` へ直接展開せず `env:` 経由で渡す（式インジェクション回避の定石）。
+        # 出力は gate 名と outcome / pass のみで、閾値・実測値は扱わない（Issue #303 の
+        # 抑止方針を維持）。既定の `if: success()` のまま（`if:` を付けない）にする
+        # ことで、gate step の fail では本 step は skip されず（`continue-on-error` に
+        # より conclusion が success のため）、一方 Checkout・rustup 等の前段が失敗
+        # した場合は本 step も走らず job がそのまま red になる（いずれも誤 green
+        # 化しない）。
+        env:
+          HYBRID_OUTCOME: ${{ steps.hybrid.outcome }}
+          RERANK_OUTCOME: ${{ steps.rerank.outcome }}
+          QUERY_PLANNING_OUTCOME: ${{ steps.query_planning.outcome }}
+        run: |
+          set -eu
+          pass=true
+          for gate in hybrid rerank query_planning; do
+            case "$gate" in
+              hybrid) outcome="${HYBRID_OUTCOME:-}" ;;
+              rerank) outcome="${RERANK_OUTCOME:-}" ;;
+              query_planning) outcome="${QUERY_PLANNING_OUTCOME:-}" ;;
+            esac
+            echo "gate=${gate} outcome=${outcome:-unknown}"
+            if [ "${outcome}" != "success" ]; then pass=false; fi
+          done
+          echo "pass=${pass}"
+          [ "${pass}" = "true" ]
