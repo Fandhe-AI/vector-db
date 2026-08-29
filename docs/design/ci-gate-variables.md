@@ -68,29 +68,16 @@ green にするための必須変数はこの 4 つ）。
 | `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` | `query-planning.md` PLAN-1（TASK-112。改善幅。pt → 小数換算） | `[0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_R20_DIRECT` | `query-planning.md` PLAN-2（TASK-112） | `(0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE` | `query-planning.md` PLAN-3 → `search.md` SEARCH-2 のスケール条件付き基準（TASK-113） | `(0.0, 1.0]` |
-| `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` | spec に対応値なし（本リポ独自の劣化展開シナリオ用回帰基準。`docs/design/query-planning-recall-regression.md` 参照） | `[0.0, 1.0]`。導出規則は下記 |
+| `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` | spec に対応値なし（本リポ独自の劣化展開シナリオ用回帰基準。`docs/design/query-planning-recall-regression.md` 参照） | `[0.0, 1.0]` |
 
 `DEGRADED` を含む全 9 変数が揃わない限り `recall-regression` job は
 strict モード（`*_REQUIRE_THRESHOLDS=1`）により fail-closed で red のままとなる
 （`crates/engine/tests/query_planning_recall.rs::resolve_gate_threshold_with` は
-strict モード時、`DEGRADED` を含め未設定の変数を検出した時点で `panic!` する。
-下記「不採用時の扱い」のとおり `DEGRADED` の採用が見送られた場合は、この 1 変数
-のみ未設定のまま残る結果としてこの副検査が red であることを許容する運用になる）。
-
-#### `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` の導出規則（暫定・オーナー確認待ち）
-
-spec に対応する確定値が無いため、以下の規則による暫定値をオーナー確認待ちとして
-提案する（値そのものは非公開のまま、規則のみを記録する）:
-
-- 規則: `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`（PLAN-1 の改善幅下限）×
-  0.5。`NoisyLlmClient`（決定的スタブ。言い換え語彙の半数のみを正しく写像）が
-  非劣化スタブの半分の改善しか生まないことに対応させた比例規則。
-- 採用条件: ローカルで `make query-planning-regression`（strict フラグなし・
-  4 変数のみ注入）を実行し、この暫定値のもとで `pass_degraded=true` が確認できる
-  場合に限り採用する。
-- 不採用時の扱い: 確認できない場合はこの変数のみ未設定のまま残し
-  （strict モードにより fail-closed で red）、他 3 変数（`INTENT`・`DIRECT`・
-  `DIRECT_LARGE`）には影響させない。閾値を実測に合わせて緩めることはしない。
+strict モード時、`DEGRADED` を含め未設定の変数を検出した時点で `panic!` する）。
+そのため **オーナーは `DEGRADED` の採用可否によらず、strict モードの必須条件
+として全 9 変数の値を確定・設定する**（下記「設定手順」参照）。`DEGRADED` の
+副検査を他 8 変数の回帰検知から独立させたい場合（別 job・非 strict 経路への
+分離等）は本 ADR のスコープ外とし、別 Issue で扱う。
 
 ## 意図的に据え置く事項
 
@@ -128,9 +115,8 @@ spec に対応する確定値が無いため、以下の規則による暫定値
 read -rs value && printf '%s' "$value" | gh variable set NAME && unset value
 
 # Environment recall-gate variables（recall.yml）: --env recall-gate を付ける
+# DEGRADED を含む全 9 変数を、DEGRADED の採用可否によらず設定する
 read -rs value && printf '%s' "$value" | gh variable set NAME --env recall-gate && unset value
-# DEGRADED は上記「採用条件」を満たした場合のみ、同じ手順で
-# QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED に対して実行する
 
 gh variable list
 gh variable list --env recall-gate
@@ -155,7 +141,7 @@ gh variable list --env recall-gate
 - `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`
 - `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`
 - `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`
-- `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（不採用時は設定しない）
+- `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED`（strict モードの必須条件として設定する）
 
 設定後は必ず以下を確認する:
 
@@ -173,7 +159,7 @@ gh variable list --env recall-gate
 ## 申し送り（本コミットのスコープ外）
 
 - repo variables（6 件必須＋2 件任意）の実値設定
-- Environment `recall-gate` variables（8 件必須＋`DEGRADED` 暫定値）の実値設定
+- Environment `recall-gate` variables（`DEGRADED` を含む全 9 件）の実値設定
 - `workflow_dispatch` による strict モード疎通確認と run の記録
 - `PRECISION_EVAL_*`（TASK-163・SEARCH-10）目標値確定と `recall.yml` への接続
 - TASK-116（PLAN-4/6/7）の `make bench-tier` 実測と ADR の Accepted 化
