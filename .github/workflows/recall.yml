@@ -3,7 +3,8 @@ name: Recall
 # TASK-104（ハイブリッド検索カーネルの Recall 受け入れ基準の回帰テスト化。対象
 # ビヘイビア: SEARCH-1, SEARCH-2）の閾値ゲート実行。`crates/engine/tests/hybrid_recall.rs`
 # の層 B（`#[ignore]` 付き。spec 由来の Recall 下限と比較する閾値ゲート）を
-# `make recall-regression` 経由で実行する。層 A（決定的コーパスの固定値回帰）は
+# `make recall-regression` 経由で実行する。層 A（決定的コーパスでの数値リテラルを
+# 含まない関係アサーションによる回帰。Issue #312）は
 # `.github/workflows/ci.yml` の `cargo test` に自動的に含まれるため、本 workflow の対象は
 # 層 B のみ。`.github/workflows/bench.yml`（TASK-127）を雛形にする。private submodule
 # （docs/spec）は取得しない（README「開発環境構築」: ビルド・テストは spec 抜きで成立する
@@ -32,7 +33,8 @@ name: Recall
 # ——`.claude/rules/spec-confidentiality.md` の P0 違反。層 B（spec 閾値ゲート）は
 # 既定ブランチの trusted なコードのみが走る `workflow_dispatch`（手動）・`schedule`
 # （週次自動。#168 で再追加済み）に限定する。PR のマージ判定は層 A（`crates/engine/tests/
-# hybrid_recall.rs` の `#[test]`。spec 数値を含まない public な固定値回帰）が担い、
+# hybrid_recall.rs` の `#[test]`。spec 数値を含まない public な、数値リテラルを
+# 含まない関係アサーションによる回帰。Issue #312）が担い、
 # `.github/workflows/ci.yml` の `cargo test` で PR ごとに常時実行される——という
 # 役割分担にする（README「Recall 回帰ハーネスの repo secrets」・
 # `docs/design/hybrid-recall-regression.md` 参照）。
