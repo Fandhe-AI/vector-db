@@ -449,6 +449,13 @@ struct RecallResult {
     /// ための対照値（Issue #312 codex-review P1 対応。`CONTROL_FACTOR` 参照）。
     control_hits20: usize,
     control_hits100: usize,
+    /// 上位 20 件から正解を 1 件も拾えなかったクエリを除いた、hit したクエリ数
+    /// （Issue #312 codex-review P1 追加対応）。合計 hit 数の非空性・chance level
+    /// 比較だけでは「一部クエリが hit 数を稼ぎ、他クエリは軒並み 0 件」という
+    /// 部分的な劣化を素通りさせてしまう（`cjk_tokenizer_impact.rs` の
+    /// `queries_hit20` と同型）。`qa.len()` と一致することを呼び出し側で
+    /// 確認し、クエリ単位のカバレッジ崩壊を検知する。
+    queries_hit20: usize,
 }
 
 impl RecallResult {
@@ -471,6 +478,16 @@ impl RecallResult {
 /// 設計値であり、spec 由来の非公開数値ではない（Issue #312 codex-review P1
 /// 対応。`docs/design/hybrid-recall-regression.md` 参照）。
 const CONTROL_FACTOR: usize = 3;
+
+/// [`RecallResult::queries_hit20`] が `qa.len()` に対して満たすべき最低割合
+/// （パーセント）。集計 hit 数の chance level 比較（[`CONTROL_FACTOR`]）だけでは
+/// 「一部クエリが hit 数を稼ぎ、他の大半のクエリは 0 件」という部分的な劣化を
+/// 素通りさせてしまう（PR #319 codex-review P1 対応）。[`CONTROL_FACTOR`] と同じ
+/// くテストハーネス自身が定める設計値であり、spec 由来の非公開数値ではない。
+/// 大規模段は疎・密チャネルの非完全な観測（[`generate_corpus`] のドロップアウト・
+/// デコイ）により少数クエリが構造的に 0 hit となり得るため、実測に対して十分な
+/// 余裕を持たせた下限（`docs/design/hybrid-recall-regression.md` 参照）とする。
+const MIN_QUERY_COVERAGE_PERCENT: usize = 70;
 
 /// [`PlannerFixture`] が [`EngineCore::plan_query`] の辞書スナップショット
 /// （`dictionary_snapshot` → [`query_planner::render_prompt_prefix`]）へ確実に
@@ -734,6 +751,7 @@ fn measure_recall_against(
     let mut ceil100 = 0usize;
     let mut control_hits20 = 0usize;
     let mut control_hits100 = 0usize;
+    let mut queries_hit20 = 0usize;
 
     for (idx, case) in qa.iter().enumerate() {
         total_correct += case.correct.len();
@@ -773,7 +791,11 @@ fn measure_recall_against(
         .expect("hybrid_search ok");
 
         let top20: Vec<u64> = hits.iter().take(20).map(|h| h.id).collect();
-        hits20 += top20.iter().filter(|id| case.correct.contains(id)).count();
+        let case_hits20 = top20.iter().filter(|id| case.correct.contains(id)).count();
+        hits20 += case_hits20;
+        if case_hits20 > 0 {
+            queries_hit20 += 1;
+        }
         hits100 += hits.iter().filter(|h| case.correct.contains(&h.id)).count();
         control_hits20 += top20
             .iter()
@@ -793,6 +815,7 @@ fn measure_recall_against(
         ceil100,
         control_hits20,
         control_hits100,
+        queries_hit20,
     }
 }
 
@@ -978,6 +1001,16 @@ fn hybrid_recall_small_scale_regression() {
         "小規模段の Recall@20 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
          十分に上回らなかった"
     );
+    // クエリ単位カバレッジ（PR #319 codex-review P1 対応）: 合計 hit 数の
+    // chance level 比較だけでは、一部クエリが hit 数を稼ぎ残りの大半が 0 件
+    // という部分的な劣化を素通りさせてしまう。上位 20 件から正解を 1 件も
+    // 拾えなかったクエリの割合が [`MIN_QUERY_COVERAGE_PERCENT`] を下回らない
+    // ことを確認する。
+    assert!(
+        r.queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
+        "小規模段でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
+         （一部クエリで正解を 1 件も拾えていない懸念）"
+    );
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -999,6 +1032,58 @@ fn hybrid_recall_small_scale_regression() {
     assert!(
         r.hits20 >= dense_hits20.max(sparse_hits20),
         "融合が密単体・疎単体いずれかを下回った（実測値どうしの関係。理論保証ではない）"
+    );
+}
+
+/// PR #319 codex-review P1 対応: `hybrid_recall_small_scale_regression` の
+/// 関係アサーション（chance level 比較・クエリ単位カバレッジ）が、公開資産に
+/// 実測値を持ち込まずに実際の劣化を検知できることを証明するミューテーション
+/// テスト。各クエリに割り当てるクエリテキスト・クエリベクトルを 1 つずらして
+/// 正解集合（[`QaCase::correct`]）との対応を崩す（`generate_corpus` が生成する
+/// 正解データはそのまま、検索に投げるクエリだけを別ケースへ差し替える）ことで、
+/// 「検索が真の関連度と無関係な結果を返すようになった」という重大な回帰を
+/// production の検索 API 経由で再現する。この状態で本体テストと同じ関係
+/// アサーション（`hits20 > control_hits20 * CONTROL_FACTOR` 相当・クエリ単位
+/// カバレッジ）が実際に失敗することを確認し、層 A のゲートが vacuous でない
+/// ことを回帰保証する。
+#[test]
+fn hybrid_recall_small_scale_regression_detects_query_answer_mismatch() {
+    let (docs, qa) = generate_corpus(
+        SMALL_SEED,
+        SMALL_NUM_DOCS,
+        SMALL_NUM_QUERIES,
+        SMALL_VOCAB_SIZE,
+    );
+    assert!(!qa.is_empty());
+
+    // 正解集合はケース i のまま、クエリだけをケース i+1 のものへ差し替える
+    // （[`RecallResult::control_hits20`] の対照値計算と同じシフトだが、ここでは
+    // 「実際に検索へ投げるクエリ」自体を壊す点が異なる）。
+    let mismatched_qa: Vec<QaCase> = qa
+        .iter()
+        .enumerate()
+        .map(|(idx, case)| {
+            let wrong_query = &qa[(idx + 1) % qa.len()];
+            QaCase {
+                query_text: wrong_query.query_text.clone(),
+                query_vector: wrong_query.query_vector.clone(),
+                correct: case.correct.clone(),
+            }
+        })
+        .collect();
+
+    let r = measure_recall(&docs, &mismatched_qa);
+
+    // 少なくとも一方の関係アサーションが破れることを確認する（本体テストは
+    // 両方が成立することを要求するため、片方でも崩れれば層 A は red になる）。
+    let chance_level_assertion_holds = r.hits20 > r.control_hits20 * CONTROL_FACTOR;
+    let coverage_assertion_holds =
+        r.queries_hit20 * 100 >= mismatched_qa.len() * MIN_QUERY_COVERAGE_PERCENT;
+    assert!(
+        !(chance_level_assertion_holds && coverage_assertion_holds),
+        "クエリ・正解の対応を崩したミューテーションが層 A の関係アサーションを \
+         すり抜けた（chance level 比較・クエリ単位カバレッジのいずれも検知に \
+         失敗した。層 A のゲートが vacuous pass になっている懸念）"
     );
 }
 
@@ -1107,6 +1192,13 @@ fn hybrid_recall_large_scale_regression() {
         r.hits100 > r.control_hits100 * CONTROL_FACTOR,
         "大規模段の Recall@100 hit 数が、無関係クエリに対する偶然一致水準（chance level）を \
          十分に上回らなかった"
+    );
+    // クエリ単位カバレッジ（PR #319 codex-review P1 対応。
+    // `hybrid_recall_small_scale_regression` と同じ理由）。
+    assert!(
+        r.queries_hit20 * 100 >= qa.len() * MIN_QUERY_COVERAGE_PERCENT,
+        "大規模段でクエリ単位の Recall@20 カバレッジが最低割合を下回った \
+         （一部クエリで正解を 1 件も拾えていない懸念）"
     );
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が

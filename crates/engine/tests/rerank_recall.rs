@@ -638,6 +638,56 @@ fn rerank_recall_large_scale_regression() {
     );
 }
 
+/// PR #319 codex-review P1 対応: `rerank_recall_large_scale_regression` の
+/// chance level 比較（`CONTROL_FACTOR`）が、公開資産に実測値を持ち込まずに
+/// 実際の劣化を検知できることを証明するミューテーションテスト
+/// （`hybrid_recall.rs::hybrid_recall_small_scale_regression_detects_query_
+/// answer_mismatch` と同型）。大規模段と独立の小規模コーパスで、各クエリに
+/// 割り当てるクエリテキスト・クエリベクトルを 1 つずらして正解集合
+/// （[`QaCase::correct`]）との対応を崩し、「検索が真の関連度と無関係な結果を
+/// 返すようになった」という重大な回帰を production の検索・リランキング API
+/// 経由で再現する。この状態で本体テストと同じ chance level 比較が実際に
+/// 失敗することを確認する。
+#[test]
+fn rerank_recall_regression_detects_query_answer_mismatch() {
+    const MUTATION_SEED: u64 = 0x5EED_0108_4D55_5441;
+    const MUTATION_NUM_DOCS: usize = 300;
+    const MUTATION_NUM_QUERIES: usize = 40;
+    const MUTATION_VOCAB_SIZE: usize = 60;
+
+    let (docs, qa) = generate_corpus(
+        MUTATION_SEED,
+        MUTATION_NUM_DOCS,
+        MUTATION_NUM_QUERIES,
+        MUTATION_VOCAB_SIZE,
+    );
+    assert!(!qa.is_empty());
+
+    let mismatched_qa: Vec<QaCase> = qa
+        .iter()
+        .enumerate()
+        .map(|(idx, case)| {
+            let wrong_query = &qa[(idx + 1) % qa.len()];
+            QaCase {
+                query_text: wrong_query.query_text.clone(),
+                query_vector: wrong_query.query_vector.clone(),
+                correct: case.correct.clone(),
+            }
+        })
+        .collect();
+
+    let r = measure_rerank_recall(&docs, &mismatched_qa);
+
+    let baseline_assertion_holds = r.baseline_hits20 > r.control_baseline_hits20 * CONTROL_FACTOR;
+    let after_assertion_holds = r.after_hits20 > r.control_after_hits20 * CONTROL_FACTOR;
+    assert!(
+        !(baseline_assertion_holds && after_assertion_holds),
+        "クエリ・正解の対応を崩したミューテーションが層 A の chance level 比較を \
+         すり抜けた（baseline・after いずれも検知に失敗した。層 A のゲートが \
+         vacuous pass になっている懸念）"
+    );
+}
+
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
 
 /// `RERANK_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果

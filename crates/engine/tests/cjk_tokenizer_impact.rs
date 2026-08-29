@@ -644,6 +644,47 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
     );
 }
 
+/// PR #319 codex-review P1 対応: `cjk_tokenizer_impact_on_ja_corpus`
+/// の関係アサーション（chance level 比較・クエリ単位カバレッジ）が、公開資産に
+/// 実測値を持ち込まずに実際の劣化を検知できることを証明するミューテーション
+/// テスト（`hybrid_recall.rs` の同名ミューテーションテストと同型）。除去 ON
+/// 変種について、各クエリを 1 つずらして正解集合（[`QaCase::correct`]）との
+/// 対応を崩し、この状態で本体テストと同じ chance level 比較が実際に失敗する
+/// ことを確認する。
+#[test]
+fn cjk_tokenizer_impact_on_ja_corpus_detects_query_answer_mismatch() {
+    let (docs, qa) = generate_corpus(0x5EED_C0FF_EE42_1337);
+    assert!(!qa.is_empty());
+
+    let stats_on = build_stats(&docs, |text| tokenize_with_options(text, true));
+
+    let mut hits20 = 0usize;
+    let mut control_hits20 = 0usize;
+    for (idx, case) in qa.iter().enumerate() {
+        // 正解集合はケース idx のまま、クエリだけをケース idx+1 のものへ
+        // 差し替える（`hybrid_recall.rs` のミューテーションテストと同じ構成）。
+        let wrong_query = &qa[(idx + 1) % qa.len()].query;
+        let control_correct = &qa[(idx + 2) % qa.len()].correct;
+
+        let query_terms: BTreeSet<String> = tokenize_with_options(wrong_query, true)
+            .into_iter()
+            .collect();
+        let ranked = rank(&stats_on, &query_terms);
+        let top20: Vec<u64> = ranked.iter().take(20).copied().collect();
+        hits20 += top20.iter().filter(|id| case.correct.contains(id)).count();
+        control_hits20 += top20
+            .iter()
+            .filter(|id| control_correct.contains(id))
+            .count();
+    }
+
+    assert!(
+        hits20 <= control_hits20 * CONTROL_FACTOR,
+        "クエリ・正解の対応を崩したミューテーションが層 A の chance level 比較を \
+         すり抜けた（層 A のゲートが vacuous pass になっている懸念）"
+    );
+}
+
 // ---------- 実測値の既定非出力（Issue #312）。`RECALL_VERBOSE` opt-in ゲート ----------
 // `hybrid_recall.rs::resolve_verbose`/`verbose_requested_from_env` と同一契約
 // （`tests/` 直下は独立 test crate・共有モジュール無しの既存慣行のため複製する）。
