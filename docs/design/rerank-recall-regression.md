@@ -42,10 +42,12 @@ after を測定することで、コーパス・プール生成のばらつき�
 
 ### 2 層構成（PR CI と閾値ゲートの分離。TASK-104 と同方式）
 
-- **層 A**（`#[test]`。常時 `cargo test` 対象）: baseline/after の hits20 と改善量を
-  固定値アサーションで回帰トラッキングする。あわせて「after が baseline を下回らない」
-  ことを独立にアサートする（リランキング層が Recall を悪化させていないことの最小
-  保証）。spec の数値基準は使わないため public 資産に閾値を持ち込まない
+- **層 A**（`#[test]`。常時 `cargo test` 対象）: baseline/after の hits20・改善量を
+  数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
+  回帰トラッキングする。あわせて「after が baseline を下回らない」ことを独立に
+  アサートする（リランキング層が Recall を悪化させていないことの最小保証。改善幅
+  そのものの下限判定は層 B が担う。Issue #312）。spec の数値基準は使わないため
+  public 資産に閾値を持ち込まない
 - **層 B**（`#[ignore]`。`make rerank-regression` 経由）: spec 由来の Recall 下限
   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
@@ -73,8 +75,8 @@ Issue #303）」参照）。
 `crates/engine/tests/rerank_recall.rs` は `hybrid_recall.rs` の決定的合成コーパス
 生成（xorshift64*・Zipf 近似分布・疎密チャネルの lossy view）・QA セット生成
 （`direct` カテゴリ相当）をそのまま複製する（`cjk_tokenizer_impact.rs` →
-`hybrid_recall.rs` と同じ「複製・踏襲」方式。既存の `hybrid_recall.rs` の固定値
-アサーションへは手を入れない）。シードは本ファイル専用の値を使う（`hybrid_recall.rs`
+`hybrid_recall.rs` と同じ「複製・踏襲」方式。既存の `hybrid_recall.rs` の関係
+アサーション方式へは手を入れない）。シードは本ファイル専用の値を使う（`hybrid_recall.rs`
 と依存関係を持たない自己完結を保つため）。
 
 production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
@@ -89,35 +91,52 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 （`total_correct`）ではなく理論上限（`ceil` = Σmin(k,\|correct_q\|)）を分母とする
 到達率（`hits / ceil`）として測定する。
 
-## 実測結果
+## 測定方法と層 A が検証する関係（Issue #312）
 
-（`crates/engine/tests/rerank_recall.rs`、層 A 1/1 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み）
+（`crates/engine/tests/rerank_recall.rs`、層 A 1/1 pass。決定的コーパス・QA
+セットのため実測値は再現可能。Issue #312 以前は本節に hit 数・理論上限・改善量の
+実測表を記録していたが、層 B の非公開閾値ゲートの pass/fail と組み合わせた閾値の
+逆算材料になりうるため削除した。以下は測定方法と層 A が検証する関係のみを記す）
 
-| 指標 | 値 |
-| ---- | -- |
-| 文書数 | 20,000 |
-| QA 件数 | 100 |
-| total_correct | 1,049 |
-| ceil20 | 410 |
-| baseline hits20（リランキングなし） | 343 |
-| after hits20（リランキングあり） | 368 |
-| baseline Recall@20 | 0.8366 |
-| after Recall@20 | 0.8976 |
-| 改善量（after − baseline） | +0.0610 |
-| ceil100 / pool hits100 | 913 / 809（Recall@100 = 0.8861） |
-| ceil200 / pool hits200 | 1,049 / 948（Recall@200 = 0.9037） |
+文書数・QA 件数の規模（`LARGE_NUM_DOCS`/`LARGE_NUM_QUERIES`）は
+`hybrid_recall.rs` の大規模段と同一オーダを使う。
+
+層 A が数値リテラルを含まずに検証する関係（`qa_accounting` ヘルパ・
+`RerankRecallResult`）:
+
+- **会計整合**: `total_correct`/`ceil20`/`ceil100`/`ceil200` が QA セット
+  （`QaCase::correct`）からの独立な再計算と一致する
+- **QA 件数**: 重複除外後の QA 件数がフィクスチャ定数（`LARGE_NUM_QUERIES`）と
+  一致する（フィクスチャ縮退の回帰検知を兼ねる）
+- **上限以下**: `baseline_hits20 <= ceil20`・`after_hits20 <= ceil20`・
+  `pool_hits100 <= ceil100`・`pool_hits200 <= ceil200`
+- **プール構造の単調性**: 候補プールの先頭 20 件 ⊆ 先頭 100 件 ⊆ プール全体
+  （`pool_depth` 200）であり、`baseline_hits20 <= pool_hits100 <= pool_hits200`
+- **リランキングの範囲制約**: リランキングはプール内の並べ替えのみでありプール外
+  から正解を持ち込めないため `after_hits20 <= pool_hits200`
+- **改善（劣化しない）**: `after_hits20 >= baseline_hits20`（「after が baseline を
+  下回らない」独立アサーション。定性的な効果があること自体は本節で確認するが、
+  改善幅そのものの下限判定は層 B `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う）
+- **非空**（vacuous pass 防止）: `baseline_hits20 > 0`
 
 暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と融合スコア順位を RRF 型で
-再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を有意に改善して
-いる（343→368、+7.3pt）。プール自体の Recall@200（0.9037）と最終 Recall@20（after:
-0.8976）の差は小さく、pool_depth 200 の候補プールがすでに正解の大半を含んでおり、
-リランキングはその中の順位付けを改善する形で寄与していることを示唆する（プールに
-入っていない正解＝Recall@200 の未達分は、リランキング以前の候補生成段
-（`hybrid.rs`・`sparse.rs`）の課題であり本タスクのスコープ外）。
+再結合する参照実装）は本合成コーパス・QA セット上で最終 Recall@20 を改善している
+ことを、上記「改善（劣化しない）」関係で確認している。プール自体の Recall@200 と
+最終 Recall@20（after）の差が小さいこと（pool_depth 200 の候補プールがすでに正解の
+大半を含んでおり、リランキングはその中の順位付けを改善する形で寄与している）は
+定性的な考察であり、数値は記録しない（プールに入っていない正解＝Recall@200 の
+未達分は、リランキング以前の候補生成段（`hybrid.rs`・`sparse.rs`）の課題であり
+本タスクのスコープ外）。
 
 なお本ハーネスは `LexicalOverlapReranker` の効果測定であり、方式確定前の暫定構成
-（下記「既知の制約」参照）における測定値であることに注意する。
+（下記「既知の制約」参照）における測定であることに注意する。
+
+## Issue #312: 層 A 固定値の除去（public 資産からの実測値排除）
+
+`docs/design/hybrid-recall-regression.md`「Issue #312」節と同一方針・同一
+理由で、本ファイルの「実測結果」節（hit 数・理論上限・改善量の実測表）を
+削除し、`crates/engine/tests/rerank_recall.rs` の層 A 固定値アサーションを
+関係アサーションへ置換した。回帰検知力の低下分は層 B が引き続き担う。
 
 ## 既知の制約・スコープ外
 

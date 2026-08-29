@@ -7,7 +7,7 @@
   （RRF 融合・`crates/engine/src/hybrid.rs`）・TASK-105（CJK ストップワード除去）は
   いずれもマージ済み（PR #138・#142・#144）
 - 関連: TASK-106（`docs/design/cjk-tokenizer-impact-ja-corpus.md`。決定的合成コーパス
-  生成・固定値回帰トラッキング方式の先行実装）・TASK-127（`crates/engine/benches/
+  生成方式の先行実装）・TASK-127（`crates/engine/benches/
   simd_bench.rs`。spec 閾値の Actions secrets 注入パターンの先行実装。
   当初は variables を使っていたが Issue #286 で secrets へ移行）・TASK-110〜113
   （`docs/design/query-planning-recall-regression.md`。クエリ展開クライアント・
@@ -29,10 +29,11 @@
 
 ### 2 層構成（PR CI と閾値ゲートの分離。役割分担は spec 機密保持が優先）
 
-- **層 A**（`#[test]`。常時 `cargo test` 対象）: 決定的コーパスでのヒット数を固定値
-  アサーションで回帰トラッキングする（TASK-106 と同方式）。spec の数値基準を使わない
-  ため public 資産に閾値を持ち込まない。`.github/workflows/ci.yml` の `cargo test`
-  で PR ごとに常時実行されるため、**PR のマージ判定は層 A が担う**
+- **層 A**（`#[test]`。常時 `cargo test` 対象）: 決定的コーパスでの実測値どうしの
+  関係（会計整合・上限以下・単調性・非空・非飽和）を、数値リテラルを含まない
+  アサーションで回帰トラッキングする（Issue #312。TASK-106 も同方式）。spec の数値
+  基準を使わないため public 資産に閾値を持ち込まない。`.github/workflows/ci.yml` の
+  `cargo test` で PR ごとに常時実行されるため、**PR のマージ判定は層 A が担う**
 - **層 B**（`#[ignore]`。`make recall-regression` 経由）: spec 由来の Recall 下限
   （`HYBRID_RECALL_MIN_R20_SMALL`・`HYBRID_RECALL_MIN_R20_LARGE`・
   `HYBRID_RECALL_MIN_R100_LARGE`。`.github/workflows/recall.yml` が environment
@@ -58,7 +59,7 @@
   spec の数値基準を取得できてしまう（`.claude/rules/spec-confidentiality.md` の
   P0 違反。PR #147 codex-review で一度 `pull_request` トリガを追加したが、この
   P0 指摘により巻き戻した）。この経緯から、層 B は「trusted なコードのみが走る
-  非公開閾値ゲート」、層 A は「PR ごとに走る public な固定値ゲート」という役割分担を
+  非公開閾値ゲート」、層 A は「PR ごとに走る public な関係アサーションゲート」という役割分担を
   設計判断として採用する
 
   トリガを絞るだけでは不十分な点にも注意が必要である: `workflow_dispatch` は
@@ -121,9 +122,11 @@ environment `recall-gate` の secrets 設定・strict モードでの手動実�
 ### 出力方針（実測値の既定非出力・Issue #303）
 
 層 B ゲートは層 A と同一の決定的コーパス（同一 seed・件数）を測定するため、
-実測 Recall は層 A の固定値定数（`hits20`/`ceil20` 等）から public に導出
-可能である。失敗時（`pass=false`）は「非公開閾値 > 実測値」という上界が、
-成功時は下界が推定できてしまうため、`recall@k=<実測値> pass=<bool>` の
+（Issue #312 以前は）実測 Recall が層 A の固定値定数（`hits20`/`ceil20` 等）から
+public に導出可能だった。Issue #312 で層 A の固定値アサーション自体を関係
+アサーションへ置換し導出経路を塞いだが、defense-in-depth として既定非出力の
+方針はそのまま維持する。失敗時（`pass=false`）は「非公開閾値 > 実測値」という
+上界が、成功時は下界が推定できてしまうため、`recall@k=<実測値> pass=<bool>` の
 併記による非公開閾値の逆算を防ぐ defense-in-depth・方針統一として、以下を
 既定挙動とする（`crates/engine/benches/batch_bench.rs::
 verbose_requested_from_env`・Issue #277〜#279 で確立した「既定出力は真偽値
@@ -208,7 +211,7 @@ recall.rs`・`precision_eval.rs` の既定出力は本 Issue 以前から実測�
 （`.claude/rules/spec-confidentiality.md`）。脱落・混入はいずれも 0/1 の one-hot
 次元への操作のみで、浮動小数点の連続ノイズは加えない——スコアが常に小さい整数値の
 厳密な和になるため、`ParallelSearchProvider` の行範囲分割（スレッド数）に依存する
-丸め誤差や順序依存が生じず、層 A の固定値アサーションが決定的に再現できる。
+丸め誤差や順序依存が生じず、層 A の回帰アサーションが決定的に再現できる。
 クエリ側の密ベクトル・テキストは潜在集合から直接構成し、lossy view はドキュメント
 側にのみ適用する（「意図が明確なクエリ」を表す簡略化。「既知の制約」参照）。
 
@@ -229,8 +232,9 @@ Recall@20（小規模段）・Recall@20/Recall@100（大規模段）は、正解
 層 B（spec 閾値ゲート）とも `ceil` を分母に統一している
 （`crates/engine/tests/hybrid_recall.rs::RecallResult::recall20`/`recall100`）。
 「疎・密チャネルの lossy view」の導入後は `hits < ceil`（到達率 100% 未満）が通常
-であり、その `hits`/`ceil`/`total_correct`/QA 件数（重複除外後）を層 A の固定値
-アサーションで回帰トラッキングする。
+であり、その非飽和性（`hits < ceil`）・上限以下（`hits <= ceil`）・QA 件数
+（重複除外後。フィクスチャ定数と一致）を、数値リテラルを含まない層 A の関係
+アサーションで回帰トラッキングする（Issue #312）。
 
 ## 小規模段ゲート未達の engine 側原因調査（Issue #307）
 
@@ -253,21 +257,34 @@ Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall
 受け入れ条件・判断事項は spec のビヘイビア定義（SEARCH-1・SEARCH-3。
 `docs/spec/04-behavior/search.md`）を参照。
 
-## 実測結果
+## 測定方法と層 A が検証する関係（Issue #312）
 
-（`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み）
+（`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパス・QA
+セットのため実測値は再現可能。Issue #312 以前は本節に hit 数・理論上限・
+到達率の実測表を記録していたが、層 B の非公開閾値ゲートの pass/fail と組み
+合わせた閾値の逆算材料になりうるため削除した。以下は測定方法と層 A が検証する
+関係のみを記す）
 
-| 段 | 文書数 | QA 件数 | total_correct | ceil20 | hits20 | ceil100 | hits100 | Recall@20 | Recall@100 |
-| -- | ------ | ------- | -------------- | ------ | ------ | ------- | ------- | --------- | ---------- |
-| 小規模 | 400 | 60 | 202 | 202 | 171 | - | - | 0.8465 | - |
-| 大規模 | 20,000 | 100 | 997 | 421 | 328 | 707 | 645 | 0.7791 | 0.9123 |
+- 小規模段（`SMALL_NUM_DOCS`/`SMALL_NUM_QUERIES` 件オーダ）: Recall@20 のみ
+- 大規模段（`LARGE_NUM_DOCS`/`LARGE_NUM_QUERIES` 件オーダ）: Recall@20・
+  Recall@100
 
-疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
-Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の
-クエリ候補数（小規模 60・大規模 100）と一致しており、本コーパス規模では語ペアの
-重複は発生していない（コーパス規模・語彙数が変わると重複除外により QA 件数が
-`num_queries` を下回る可能性がある。`generate_qa_set` のドキュメント参照）。
+層 A が数値リテラルを含まずに検証する関係（`qa_accounting` ヘルパ・
+`RecallResult` の各段）:
+
+- **会計整合**: `total_correct`/`ceil20`/`ceil100` が QA セット（`QaCase::
+  correct`）からの独立な再計算と一致する
+- **QA 件数**: 重複除外後の QA 件数がフィクスチャ定数（`SMALL_NUM_QUERIES`/
+  `LARGE_NUM_QUERIES`）と一致する（フィクスチャ縮退の回帰検知を兼ねる）
+- **上限以下**: `hits20 <= ceil20`（両段）・`hits100 <= ceil100`（大規模段）
+- **単調性**: `hits20 <= hits100`（大規模段）
+- **非空**（vacuous pass 防止）: `hits20 > 0`（両段）
+- **非飽和**（lossy view の設計前提）: `hits20 < ceil20`（両段）・
+  `hits100 < ceil100`（大規模段）
+
+回帰検知力は固定値方式より弱くなるが、これは Issue #312 の方針どおりであり、
+回帰検知力の低下分は層 B（`recall-gate` の非公開閾値ゲート）が担う設計変更で
+ある。
 
 大規模段のデバッグビルド実行時間はローカル実測で約 4.5 秒であり、PR CI
 （`cargo test`）に含めても許容範囲と判断し、層 A の両テストとも `#[ignore]` に
@@ -333,6 +350,23 @@ SEARCH-2 が前提とする「クエリ展開あり」の測定条件に層 B �
 （言い換え語彙の QA セット）自体の大規模測定は、`to_intent_query` による疑似
 `intent` 形クエリ（正解集合・fixture は `direct` カテゴリ由来のまま）とは別物であり
 本結線でも対象外のまま（下記「既知の制約・スコープ外」参照）。
+
+## Issue #312: 層 A 固定値の除去（public 資産からの実測値排除）
+
+層 A（`crates/engine/tests/hybrid_recall.rs`）の hit 数・理論上限・実測 Recall
+値を固定値アサーション・実測表として public 資産（テストコード・本ドキュメント）
+へ記録していたのを、数値リテラルを含まない関係アサーション（会計整合・上限
+以下・単調性・非空・非飽和）へ置換した（「実測結果」節だった箇所は「測定方法と
+層 A が検証する関係」節へ改めた）。層 B の非公開閾値ゲート（`recall-gate`）の
+pass/fail と組み合わせて層 A の実測値から閾値の上下界を逆算できる経路
+（「出力方針（Issue #303）」節）を、根本の固定値を消すことで塞いだ。
+
+回帰検知力は固定値方式（数値そのものの変化を検知）より弱くなる（関係が保たれる
+範囲の変化は検知できない）。これは弱体化ではなく設計変更であり、回帰検知力の
+低下分は層 B が引き続き担う。同種の対応を `crates/engine/tests/rerank_recall.rs`・
+`crates/engine/tests/cjk_tokenizer_impact.rs`・対応する ADR
+（`docs/design/rerank-recall-regression.md`・`docs/design/
+cjk-tokenizer-impact-ja-corpus.md`）にも適用した。
 
 ## 既知の制約・スコープ外
 
