@@ -35,10 +35,13 @@
 //!   （`hybrid_recall.rs::resolve_gate_threshold` と同型の解決規則）による閾値ゲート。
 //!   未設定時は「評価は実行するが判定はスキップ」（`PRECISION_EVAL_REQUIRE_THRESHOLDS=1`
 //!   の strict モードでは fail-closed）。`.github/workflows/recall.yml` への接続は
-//!   本タスクでは行わない（README 参照）。
+//!   本タスクでは行わない（README 参照）。`RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では
+//!   拒否。Issue #303）の opt-in 時のみローカル診断用に実測値〔`value=`〕を追加出力
+//!   する（`hybrid_recall.rs` 等と方針統一。既定出力は変更しない）。
 //! - 判断材料レポート（`#[ignore]`・アサートなし）: 既定ポリシーでの hybrid・dense
 //!   双方の指標を出力する。実測値を標準出力へ出すため**ローカル専用**の
-//!   `make precision-report` からのみ実行し、CI・GitHub Actions からは実行しない。
+//!   `make precision-report` からのみ実行し、CI・GitHub Actions からは実行しない
+//!   （`GITHUB_ACTIONS` 検出時は測定前に fail-closed で拒否する。Issue #303）。
 //! - 感度スイープ（`#[ignore]`・アサートなし）: `PrecisionPolicy::new` の閾値を
 //!   小さな格子で差し替え、hybrid 系列・dense 系列それぞれの指標の変化を `println!`
 //!   で表示する（目標値確定の判断材料。production の既定値は変更しない。結果の
@@ -848,6 +851,145 @@ fn resolve_gate_threshold(var: &str, kind: ThresholdKind) -> Option<f64> {
     }
 }
 
+// ---------- 実測値の既定非出力（Issue #303）。`RECALL_VERBOSE` opt-in・`GITHUB_ACTIONS`
+// 下の実測値出力の二重拒否ゲート ----------
+// `hybrid_recall.rs`/`rerank_recall.rs`/`query_planning_recall.rs` の同名ヘルパと
+// 同一実装（`tests/` 直下は独立 test crate・共有モジュール無しの既存慣行に合わせて
+// ファイルごとに複製する）。
+
+/// `RECALL_VERBOSE` の生値と `GITHUB_ACTIONS` 判定を引数化した純関数（単体テスト可能）。
+/// `hybrid_recall.rs::resolve_verbose` と同一契約（Issue #303）。
+fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, &'static str> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(
+            "RECALL_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values",
+        );
+    }
+    Ok(requested)
+}
+
+/// 環境変数を読み取って [`resolve_verbose`] へ渡し、`Err` は `panic!` で fail-closed に
+/// する（[`precision_eval_threshold_gate`] の冒頭で呼ぶ）。
+fn verbose_requested_from_env() -> bool {
+    let raw = std::env::var("RECALL_VERBOSE").ok();
+    match resolve_verbose(raw.as_deref(), std::env::var_os("GITHUB_ACTIONS").is_some()) {
+        Ok(v) => v,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+/// `verbose=true` のときのみ実測値（`value=<f64:.4>`）を付加した診断行を描画する
+/// （`query_planning_recall.rs::render_verbose_value_line` と同型）。
+fn render_verbose_value_line(
+    gate: &str,
+    metric: &str,
+    value: f64,
+    verbose: bool,
+) -> Option<String> {
+    verbose.then(|| format!("{gate}: {metric} value={value:.4}"))
+}
+
+/// [`precision_eval_report`]・[`precision_eval_policy_sweep`]（実測値を常時出力する
+/// 判断材料専用テスト。ローカル専用の `make precision-report` 経由を想定）の冒頭で
+/// 呼ぶ fail-closed ガード。`GITHUB_ACTIONS`（値を解釈せず存在有無のみ判定）が
+/// 設定された環境での実行は、コーパス生成・測定の前に `panic!` で拒否する
+/// （実測値そのものを出力する専用テストのため、他ハーネスの `RECALL_VERBOSE` opt-in
+/// ゲートと異なり opt-in の余地を設けない。従来 `Makefile` 運用〔`make
+/// precision-report` はローカル専用〕のみで守られていた「ローカル専用」制約を、
+/// テスト側の拒否で二重化する。Issue #303）。
+fn refuse_measured_output_under_github_actions(test_name: &str) {
+    if let Err(msg) =
+        check_measured_output_allowed(test_name, std::env::var_os("GITHUB_ACTIONS").is_some())
+    {
+        panic!("{msg}");
+    }
+}
+
+/// [`refuse_measured_output_under_github_actions`] の判定本体を環境変数から切り離した
+/// 純関数（単体テスト可能）。`under_github_actions` が真なら `Err` を返す。
+fn check_measured_output_allowed(
+    test_name: &str,
+    under_github_actions: bool,
+) -> Result<(), String> {
+    if under_github_actions {
+        return Err(format!(
+            "{test_name} prints measured values and is refused while running under GitHub Actions (GITHUB_ACTIONS is set); run locally via `make precision-report`"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::{check_measured_output_allowed, render_verbose_value_line, resolve_verbose};
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        for raw in [" 1", "true", "0", ""] {
+            assert_eq!(resolve_verbose(Some(raw), false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert!(resolve_verbose(Some("1"), true).is_err());
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
+
+    #[test]
+    fn render_verbose_value_line_non_verbose_is_none() {
+        assert_eq!(
+            render_verbose_value_line(
+                "precision_eval_threshold_gate",
+                "top1_accuracy",
+                0.1234,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn render_verbose_value_line_verbose_includes_measured_value() {
+        let line = render_verbose_value_line(
+            "precision_eval_threshold_gate",
+            "top1_accuracy",
+            0.1234,
+            true,
+        )
+        .expect("verbose line");
+        assert!(line.contains("value=0.1234"));
+    }
+
+    #[test]
+    fn check_measured_output_allowed_ok_outside_github_actions() {
+        assert!(check_measured_output_allowed("precision_eval_report", false).is_ok());
+    }
+
+    #[test]
+    fn check_measured_output_allowed_fails_closed_under_github_actions() {
+        let err = check_measured_output_allowed("precision_eval_report", true)
+            .expect_err("must be refused under GitHub Actions");
+        assert!(err.contains("precision_eval_report"));
+        assert!(err.contains("GitHub Actions"));
+    }
+}
+
 /// TASK-163（SEARCH-10）層 B: hybrid ランキングの 3 指標が `PRECISION_EVAL_MIN_TOP1_ACC`・
 /// `PRECISION_EVAL_MIN_MRR10`・`PRECISION_EVAL_MAX_FALSE_RETURN`（未確定。Actions
 /// variables 由来を想定）を満たすかを判定する閾値ゲート。評価自体は閾値の設定状況に
@@ -860,6 +1002,7 @@ fn resolve_gate_threshold(var: &str, kind: ThresholdKind) -> Option<f64> {
 #[test]
 #[ignore = "spec 閾値（目標値。Actions variables 由来を想定）が必要なため既定では実行しない。make precision-regression で実行する"]
 fn precision_eval_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_top1 = resolve_gate_threshold("PRECISION_EVAL_MIN_TOP1_ACC", ThresholdKind::Min);
     let min_mrr10 = resolve_gate_threshold("PRECISION_EVAL_MIN_MRR10", ThresholdKind::Min);
     let max_false_return =
@@ -887,19 +1030,43 @@ fn precision_eval_threshold_gate() {
     // （[`precision_eval_report`]・[`precision_eval_policy_sweep`]）が担う。
     let mut pass = true;
     if let Some(min) = min_top1 {
-        let p = r.top1_accuracy() >= min;
+        let value = r.top1_accuracy();
+        let p = value >= min;
         pass &= p;
         println!("precision_eval_threshold_gate: top1_accuracy pass={p}");
+        if let Some(line) = render_verbose_value_line(
+            "precision_eval_threshold_gate",
+            "top1_accuracy",
+            value,
+            verbose,
+        ) {
+            println!("{line}");
+        }
     }
     if let Some(min) = min_mrr10 {
-        let p = r.mrr10() >= min;
+        let value = r.mrr10();
+        let p = value >= min;
         pass &= p;
         println!("precision_eval_threshold_gate: mrr10 pass={p}");
+        if let Some(line) =
+            render_verbose_value_line("precision_eval_threshold_gate", "mrr10", value, verbose)
+        {
+            println!("{line}");
+        }
     }
     if let Some(max) = max_false_return {
-        let p = r.false_return_rate() <= max;
+        let value = r.false_return_rate();
+        let p = value <= max;
         pass &= p;
         println!("precision_eval_threshold_gate: false_return_rate pass={p}");
+        if let Some(line) = render_verbose_value_line(
+            "precision_eval_threshold_gate",
+            "false_return_rate",
+            value,
+            verbose,
+        ) {
+            println!("{line}");
+        }
     }
 
     assert!(
@@ -922,6 +1089,7 @@ fn precision_eval_threshold_gate() {
 #[test]
 #[ignore = "判断材料の提示専用（実測値の出力）。ローカル専用の make precision-report または cargo test -- --ignored precision_eval_report --nocapture で実行する"]
 fn precision_eval_report() {
+    refuse_measured_output_under_github_actions("precision_eval_report");
     let (core, _guard, ctx, qa, no_answer) = build_fixture();
     print_eval_result(
         "hybrid",
@@ -944,6 +1112,7 @@ fn precision_eval_report() {
 #[test]
 #[ignore = "判断材料の提示専用（表出力）。ローカル専用の make precision-report または cargo test -- --ignored precision_eval_policy_sweep --nocapture で実行する"]
 fn precision_eval_policy_sweep() {
+    refuse_measured_output_under_github_actions("precision_eval_policy_sweep");
     let (docs, inverted) = generate_corpus(CORPUS_SEED, NUM_DOCS, VOCAB_SIZE);
     let mut qa_rng = DeterministicRng::new(CORPUS_SEED.wrapping_add(QA_SEED_OFFSET));
     let qa = generate_qa_set(&mut qa_rng, &docs, &inverted, VOCAB_SIZE, NUM_QPLUS_QUERIES);

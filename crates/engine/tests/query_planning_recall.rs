@@ -52,7 +52,10 @@
 //!   実測値を比較する閾値ゲート。`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1`
 //!   （`recall.yml` の Run step からのみ注入）で未設定を fail-closed にする strict
 //!   モードを持つ（`rerank_recall.rs::resolve_gate_threshold` と同型。ログには
-//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない）。
+//!   pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
+//!   `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時のみ
+//!   ローカル診断用に実測値〔`value=`〕を追加出力する。他ハーネスとの方針統一が
+//!   目的であり既定出力は変更しない）。
 //!   `MockLlmClient`（完全 oracle 写像）の下限のみでは production の展開品質劣化を
 //!   検出できない（codex-review・PR #265・P1 指摘）ため、[`NoisyLlmClient`] による
 //!   劣化展開の実測を、oracle 写像の下限とは独立の第 3 の下限として同一ゲートへ
@@ -954,6 +957,104 @@ fn resolve_degraded_improvement_gate_threshold(var: &str) -> Option<f64> {
     resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
+// ---------- 実測値のローカル診断 opt-in（Issue #303）。`RECALL_VERBOSE` ゲート ----------
+// `hybrid_recall.rs`/`rerank_recall.rs` の同名ヘルパと同一実装（`tests/` 直下は
+// 独立 test crate・共有モジュール無しの既存慣行に合わせてファイルごとに複製する）。
+// 本ファイルの既定出力は元々実測値を含まないため（ファイル冒頭コメント参照）、
+// この opt-in は「他ハーネスとの方針統一・ローカル診断用の追加出力」のみを目的とし、
+// 既定挙動（`RECALL_VERBOSE` 未設定時の出力内容）は変更しない。
+
+/// `RECALL_VERBOSE` の生値と `GITHUB_ACTIONS` 判定を引数化した純関数（単体テスト可能）。
+/// `hybrid_recall.rs::resolve_verbose` と同一契約（Issue #303）。
+fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, &'static str> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(
+            "RECALL_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values",
+        );
+    }
+    Ok(requested)
+}
+
+/// 環境変数を読み取って [`resolve_verbose`] へ渡し、`Err` は `panic!` で fail-closed に
+/// する（各ゲートの冒頭、コーパス生成前に呼ぶ）。
+fn verbose_requested_from_env() -> bool {
+    let raw = std::env::var("RECALL_VERBOSE").ok();
+    match resolve_verbose(raw.as_deref(), std::env::var_os("GITHUB_ACTIONS").is_some()) {
+        Ok(v) => v,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+/// `verbose=true` のときのみ実測値（`value=<f64:.4>`）を付加した診断行を描画する
+/// （`hybrid_recall.rs::render_gate_line` と異なり、本ファイルの既定行は元から
+/// `pass=` のみのため、ここでは追加の `value=` 行を返すか `None` かを返す形にする）。
+fn render_verbose_value_line(
+    gate: &str,
+    metric: &str,
+    value: f64,
+    verbose: bool,
+) -> Option<String> {
+    verbose.then(|| format!("{gate}: {metric} value={value:.4}"))
+}
+
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::{render_verbose_value_line, resolve_verbose};
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        for raw in [" 1", "true", "0", ""] {
+            assert_eq!(resolve_verbose(Some(raw), false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert!(resolve_verbose(Some("1"), true).is_err());
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
+
+    #[test]
+    fn render_verbose_value_line_non_verbose_is_none() {
+        assert_eq!(
+            render_verbose_value_line(
+                "query_planning_recall_threshold_gate",
+                "pass_intent",
+                0.1234,
+                false
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn render_verbose_value_line_verbose_includes_measured_value() {
+        let line = render_verbose_value_line(
+            "query_planning_recall_threshold_gate",
+            "pass_intent",
+            0.1234,
+            true,
+        )
+        .expect("verbose line");
+        assert!(line.contains("value=0.1234"));
+    }
+}
+
 /// TASK-112（PLAN-1, PLAN-2）層 B: intent カテゴリの改善幅（after − baseline）が
 /// `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` 以上、direct カテゴリの
 /// after Recall@20 が `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`（絶対下限）以上、かつ
@@ -978,6 +1079,7 @@ fn resolve_degraded_improvement_gate_threshold(var: &str) -> Option<f64> {
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
 fn query_planning_recall_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_intent_improvement =
         resolve_improvement_gate_threshold("QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT");
     let min_r20_direct = resolve_gate_threshold("QUERY_PLANNING_RECALL_MIN_R20_DIRECT");
@@ -1007,6 +1109,14 @@ fn query_planning_recall_threshold_gate() {
             let pass_intent = intent_improvement >= min;
             pass &= pass_intent;
             println!("query_planning_recall_threshold_gate: pass_intent={pass_intent}");
+            if let Some(line) = render_verbose_value_line(
+                "query_planning_recall_threshold_gate",
+                "intent_improvement",
+                intent_improvement,
+                verbose,
+            ) {
+                println!("{line}");
+            }
         }
         None => {
             println!(
@@ -1019,6 +1129,14 @@ fn query_planning_recall_threshold_gate() {
             let pass_direct = direct_after_recall20 >= min;
             pass &= pass_direct;
             println!("query_planning_recall_threshold_gate: pass_direct={pass_direct}");
+            if let Some(line) = render_verbose_value_line(
+                "query_planning_recall_threshold_gate",
+                "direct_after_recall20",
+                direct_after_recall20,
+                verbose,
+            ) {
+                println!("{line}");
+            }
         }
         None => {
             println!(
@@ -1043,6 +1161,14 @@ fn query_planning_recall_threshold_gate() {
             let pass_degraded = intent_improvement_degraded >= min;
             pass &= pass_degraded;
             println!("query_planning_recall_threshold_gate: pass_degraded={pass_degraded}");
+            if let Some(line) = render_verbose_value_line(
+                "query_planning_recall_threshold_gate",
+                "intent_improvement_degraded",
+                intent_improvement_degraded,
+                verbose,
+            ) {
+                println!("{line}");
+            }
         }
         None => {
             println!(
@@ -1069,6 +1195,7 @@ fn query_planning_recall_threshold_gate() {
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
 fn query_planning_recall_large_scale_threshold_gate() {
+    let verbose = verbose_requested_from_env();
     let min_r20_direct_large = resolve_gate_threshold("QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE");
 
     let Some(min) = min_r20_direct_large else {
@@ -1085,8 +1212,17 @@ fn query_planning_recall_large_scale_threshold_gate() {
         LARGE_VOCAB_SIZE,
     );
     let direct = measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline);
-    let pass = direct.after_recall20() >= min;
+    let direct_after_recall20 = direct.after_recall20();
+    let pass = direct_after_recall20 >= min;
     println!("query_planning_recall_large_scale_threshold_gate: pass={pass}");
+    if let Some(line) = render_verbose_value_line(
+        "query_planning_recall_large_scale_threshold_gate",
+        "direct_after_recall20",
+        direct_after_recall20,
+        verbose,
+    ) {
+        println!("{line}");
+    }
 
     assert!(
         pass,
