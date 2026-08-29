@@ -44,10 +44,11 @@ after を測定することで、コーパス・プール生成のばらつき�
 
 - **層 A**（`#[test]`。常時 `cargo test` 対象）: baseline/after の hits20・改善量を
   数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
-  回帰トラッキングする。あわせて「after が baseline を下回らない」ことを独立に
-  アサートする（リランキング層が Recall を悪化させていないことの最小保証。改善幅
-  そのものの下限判定は層 B が担う。Issue #312）。spec の数値基準は使わないため
-  public 資産に閾値を持ち込まない
+  回帰トラッキングする。あわせて「after が baseline を厳密に上回る」ことを独立に
+  アサートする（`>=`（同値許容）ではリランカーが完全な no-op でも通過してしまうため、
+  リランキング層が実際に Recall へ寄与していることを最小限保証する形へ強化した。
+  改善幅そのものの下限判定は層 B が担う。Issue #312・PR #319 codex-review P1
+  対応）。spec の数値基準は使わないため public 資産に閾値を持ち込まない
 - **層 B**（`#[ignore]`。`make rerank-regression` 経由）: spec 由来の Recall 下限
   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
@@ -114,8 +115,9 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
   （`pool_depth` 200）であり、`baseline_hits20 <= pool_hits100 <= pool_hits200`
 - **リランキングの範囲制約**: リランキングはプール内の並べ替えのみでありプール外
   から正解を持ち込めないため `after_hits20 <= pool_hits200`
-- **改善（劣化しない）**: `after_hits20 >= baseline_hits20`（「after が baseline を
-  下回らない」独立アサーション。定性的な効果があること自体は本節で確認するが、
+- **改善（no-op を許さない）**: `after_hits20 > baseline_hits20`（「after が
+  baseline を厳密に上回る」独立アサーション。`>=` では完全な no-op でも通過して
+  しまうため厳密な不等号を使う。定性的な効果があること自体は本節で確認するが、
   改善幅そのものの下限判定は層 B `RERANK_RECALL_MIN_R20_IMPROVEMENT` が担う）
 - **非空**（vacuous pass 防止）: `baseline_hits20 > 0`
 - **ミスマッチ制御（chance level）比較**: `baseline_hits20 > control_baseline_hits20 * CONTROL_FACTOR`
