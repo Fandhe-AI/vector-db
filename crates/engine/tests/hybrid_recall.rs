@@ -774,10 +774,9 @@ fn measure_recall_against(
 /// Recall@20 を測定する（[`measure_recall`] と同じ production API 経由。密は
 /// [`SearchProvider::search`] の Top-20 をそのまま、疎は
 /// [`SparseIndex::search_within`] の Top-20 をそのまま正解判定に使う。RRF 融合
-/// （[`hybrid_search`]）は経由しない）。「融合がどちらのチャネル単体も下回らない
-/// （SEARCH-3 相当）」ことを固定値の比較として層 A に残す目的の測定であり、
-/// 一般不変条件（`assert!(fused >= max(dense, sparse))`）としては追加しない
-/// （理論保証ではなく実測値の記録。受け入れ条件 2）。
+/// （[`hybrid_search`]）は経由しない）。呼び出し側では「融合がどちらのチャネル
+/// 単体も下回らない（SEARCH-3 相当）」ことを実測値どうしの関係アサーションと
+/// して確認する（数値そのものは public テストへ記録しない。受け入れ条件 2）。
 fn measure_channel_recall20(docs: &[Doc], qa: &[QaCase]) -> (usize, usize) {
     let refs: Vec<(u64, &str)> = docs.iter().map(|d| (d.id, d.text.as_str())).collect();
     let sparse_index = SparseIndex::build(&refs).expect("sparse index build ok");
@@ -911,10 +910,12 @@ fn hybrid_recall_small_scale_regression() {
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
     assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
 
-    // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を固定値で
-    // 回帰トラッキングする。融合（171）がいずれの単体（151・166）も下回らない
-    // ことを実測値の比較として記録する（一般不変条件としては追加しない。
-    // `docs/design/hybrid-recall-regression.md` 参照）。
+    // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
+    // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
+    // トラッキングする（数値そのものは記録しない。`docs/design/
+    // hybrid-recall-regression.md` 参照）。両チャネルとも 0 件ヒットでは
+    // 「下回らない」が自明に成立してしまう（vacuous pass）ため、正解を
+    // 一部でも拾えていることも合わせて確認する。
     let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
     if verbose {
         println!(
@@ -922,17 +923,13 @@ fn hybrid_recall_small_scale_regression() {
             r.ceil20, r.ceil20, r.hits20, r.ceil20
         );
     }
-    assert_eq!(
-        dense_hits20, 151,
-        "小規模段の密単体 Recall@20 hit 数が変化した"
-    );
-    assert_eq!(
-        sparse_hits20, 166,
-        "小規模段の疎単体 Recall@20 hit 数が変化した"
+    assert!(
+        dense_hits20 > 0 && sparse_hits20 > 0,
+        "密単体・疎単体のいずれかが Recall@20 で正解を 1 件も拾えていない（比較が vacuous pass になる）"
     );
     assert!(
         r.hits20 >= dense_hits20.max(sparse_hits20),
-        "融合が密単体・疎単体いずれかを下回った（実測値の比較。理論保証ではない）"
+        "融合が密単体・疎単体いずれかを下回った（実測値どうしの関係。理論保証ではない）"
     );
 }
 

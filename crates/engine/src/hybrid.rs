@@ -1720,7 +1720,7 @@ mod tests {
     #[test]
     fn apply_soft_boost_changes_rank_order() {
         // 確定判定は加点合計を [`soft_boost_confirm_cap`]（既定 cfg では
-        // 約 `1/61 ≈ 0.0164`）未満にしか許さない。近接順位の入れ替え（PLAN-1 の
+        // `1/61 ≈ 0.0164`）未満にしか許さない。近接順位の入れ替え（PLAN-1 の
         // 想定用途）自体は真の 1 位（id=1）とプール最下位（id=3）を残したまま、
         // その中間にいる 2 件（id=2・id=3）の順位だけを逆転させることで確認する
         // （加点 0.001 はこの絶対上限より十分小さく安全に受理される）。
@@ -1817,13 +1817,11 @@ mod tests {
     fn apply_soft_boost_rejects_total_exceeding_soft_bound() {
         // codex-review P1・cursor bot 指摘の回帰: `BoostRule::new` 単体は
         // `MAX_BOOST_AMOUNT`（1.0）まで受理するが、`apply_soft_boost` は加点合計が
-        // [`soft_boost_confirm_cap`]（既定 cfg では約 `1/61 ≈ 0.0164`）以上なら
-        // 構築成功済みのルールでも実行時に拒否する（1 ルールだけで再現できることを
-        // 確認: 以前の実装は
-        // `BoostRule::new(ids, 1.0)` を渡すだけで最下位候補を新 1 位へ押し上げ
-        // られた）。
+        // [`soft_boost_confirm_cap`]（既定 cfg では `1/61 ≈ 0.0164`）以上なら構築
+        // 成功済みのルールでも実行時に拒否する（1 ルールだけで再現できることを
+        // 確認: 以前の実装は `BoostRule::new(ids, 1.0)` を渡すだけで最下位候補を
+        // 新 1 位へ押し上げられた）。
         let cfg = RrfConfig::default();
-        let cap = soft_boost_confirm_cap(&cfg);
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
             HybridHit { id: 2, score: 0.0 },
@@ -1834,7 +1832,7 @@ mod tests {
         match err {
             HybridError::BoostSoftBoundExceeded { total, max } => {
                 assert!((total - MAX_BOOST_AMOUNT).abs() < 1e-15);
-                assert!((max - cap).abs() < 1e-15);
+                assert!((max - 1.0 / 61.0).abs() < 1e-15);
             }
             other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
         }
@@ -1853,8 +1851,8 @@ mod tests {
         // `SOFT_BOOST_PER_MATCH = 0.0007` の通常適用でも同種の逆転が起こる）であり
         // 拒否すべきではない。修正後は候補ごとの加点合計を実際の順位関係
         // （真の 1 位との差）ではなく [`soft_boost_confirm_cap`]（既定 cfg では
-        // 約 `1/61 ≈ 0.0164`）という絶対上限とだけ比較するため、
-        // `0.001 < 1/61` のこの加点は受理され id=2 が新たな 1 位になる。
+        // `1/61 ≈ 0.0164`）という絶対上限とだけ比較するため、`0.001 < 1/61` の
+        // この加点は受理され id=2 が新たな 1 位になる。
         let cfg = RrfConfig::default();
         let mut hits = vec![
             HybridHit { id: 1, score: 0.5 },
@@ -1894,8 +1892,8 @@ mod tests {
             },
         ];
         let ids: BTreeSet<u64> = [2].into_iter().collect();
-        // 加点単独 (0.006) は cap (≈0.00623。Issue #307・SEARCH-1 対応で再導出) を
-        // 下回るが、元スコア (cap - 0.005) と合わせると cap を超える。
+        // 加点単独 (0.006) は cap (≈0.01639) を下回るが、元スコア (cap - 0.005) と
+        // 合わせると cap を超える。
         let boost_amount = 0.006;
         assert!(
             boost_amount < cap,
@@ -1923,8 +1921,7 @@ mod tests {
         // 無条件に `continue` していたため、`BoostRule::new` が許す範囲内で
         // `soft_boost_confirm_cap` を大幅に超える加点を同一 id へ積み上げられて
         // いた。本テストは指摘のとおり合計 0.03 の加点（`soft_boost_confirm_cap`
-        // ≈ 0.00623（Issue #307・SEARCH-1 対応で再導出）を超えるが
-        // `soft_boost_loose_upper_bound` ≈ 0.03279 未満）を
+        // ≈ 0.01639 を超えるが `soft_boost_loose_upper_bound` ≈ 0.03279 未満）を
         // 元スコアが `cap` 以上の候補へ与える。修正後は近接順位の逆転自体は
         // 許しつつ、加点量自体（`candidate_boost`）が `cap` 未満であることを
         // 全候補に要求するため拒否される。
@@ -2080,10 +2077,11 @@ mod tests {
         // で疎チャネルがクエリ不一致により空になる場合、以前の実装
         // （`soft_boost_ceiling` が `max(dense_weight, sparse_weight) / (k_const + 1)`
         // ＝重みが大きい方のチャネルに必ず 1 位候補があると誤仮定）は上限を
-        // 過大評価し、`BoostRule::new(..., 1.0)` を受理してしまっていた。
+        // `≈100/61` と過大評価し、`BoostRule::new(..., 1.0)` を受理してしまっていた。
         // [`soft_boost_confirm_cap`] は `min(dense_weight, sparse_weight) /
-        // (k_const + 1)`（弱い方のチャネルの寄与だけを仮定する安全側）を使うため、
-        // 重みが大きい方のチャネルが空でも正しく拒否されることを確認する。
+        // (k_const + 1)` = `1/61 ≈ 0.0164`（弱い方のチャネルの寄与だけを仮定する
+        // 安全側）を使うため、重みが大きい方のチャネルが空でも正しく拒否される
+        // ことを確認する。
         let cfg = RrfConfig::new(60.0, 1.0, 100.0, 200).expect("valid cfg");
         let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
         let ids = [1u64, 2u64];
