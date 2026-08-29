@@ -326,13 +326,27 @@ fn run_core7_gate(
         // heap 配置も「1 つのループで交互に確保」する（順次確保〔pool_a を
         // 全確保したのち pool_b を全確保〕だと heap 配置がテスト間で非対称に
         // なりうる。モジュール冒頭コメント・ADR 参照）。
+        //
+        // 確保順の A/B 均衡化（Issue #302 codex-review P1 再指摘対応）:
+        // `next_vector` が返す元の `Vec`（後段で移動する側）は常に先に確保され、
+        // `.clone()` が生成する複製（後段で先に push する側）は必ず後に確保
+        // される。そのため「pool_a.push を先に書く」だけでは実際のバッファ
+        // 確保順は変わらず、元 Vec を受け取る側が常に確保順で後手に回る。
+        // 反復インデックスの偶奇で「元 Vec をどちらのプールに渡すか」を
+        // 入れ替え、A/B 間で確保順（先に確保された元 Vec／後に確保された
+        // 複製）を均衡させる。
         let mut trial_rng = DeterministicRng::new(seed);
         let mut pool_a: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
         let mut pool_b: Vec<Vec<f32>> = Vec::with_capacity(total_iterations);
-        for _ in 0..total_iterations {
+        for i in 0..total_iterations {
             let query = trial_rng.next_vector(GPU_GATE_DIM);
-            pool_a.push(query.clone());
-            pool_b.push(query);
+            if i % 2 == 0 {
+                pool_a.push(query.clone());
+                pool_b.push(query);
+            } else {
+                pool_b.push(query.clone());
+                pool_a.push(query);
+            }
         }
 
         // 解放コストの測定区間外化（`harness::ab::run_ab` の drop 契約参照）。
