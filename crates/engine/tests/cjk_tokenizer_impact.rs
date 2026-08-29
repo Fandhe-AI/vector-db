@@ -15,9 +15,12 @@
 //! 既知の制約として評価レポート（`docs/design/cjk-tokenizer-impact-ja-corpus.md`）に
 //! 明記する。
 //!
-//! 測定値は決定的コーパスのため再現可能であり、下部のアサーションで固定する
-//! （回帰トラッキング）。トークナイザ実装が変わり数値が変化した場合はこのテストが
-//! 失敗し、レポートの再測定を促す。
+//! 測定値は決定的コーパスのため再現可能であり、下部の関係アサーション（数値
+//! リテラルを含まない。Issue #312）で回帰トラッキングする。トークナイザ実装が
+//! 変わって関係が崩れた場合はこのテストが失敗し、レポートの再測定を促す。
+//! 実測値（hit 数・到達率）は既定では標準出力へも出さず、`RECALL_VERBOSE=1`
+//! （`hybrid_recall.rs::resolve_verbose` と同一契約。`GITHUB_ACTIONS` 下は
+//! fail-closed で拒否）の opt-in 時のみ出力する。
 
 use engine::sparse::tokenize_with_options;
 use std::collections::{BTreeMap, BTreeSet};
@@ -411,11 +414,12 @@ fn tokenize_ascii_only(text: &str) -> Vec<String> {
 /// Issue #31 / TASK-106（SEARCH-2, SEARCH-5）: 日本語主体コーパスでの CJK トークナイザ
 /// 構成差（除去 ON / 除去 OFF / ASCII のみ）の Recall@20・Recall@100 を実測する。
 ///
-/// 合成コーパス・QA セットは決定的に生成されるため、実測値はこのテスト内に固定した
-/// hit 数（回帰トラッキング）と常に一致する。数値は
-/// `docs/design/cjk-tokenizer-impact-ja-corpus.md` の実測結果と対応する。
+/// 合成コーパス・QA セットは決定的に生成されるため実測値は再現可能であり、下部の
+/// 関係アサーション（数値リテラルを含まない。Issue #312）で回帰トラッキングする。
+/// 測定方法・関係の詳細は `docs/design/cjk-tokenizer-impact-ja-corpus.md` を参照。
 #[test]
 fn cjk_tokenizer_impact_on_ja_corpus() {
+    let verbose = verbose_requested_from_env();
     let (docs, qa) = generate_corpus(0x5EED_C0FF_EE42_1337);
 
     // 健全性の検証: コーパスが sparse.rs の各上限（MAX_CORPUS_DOCS・MAX_DOC_BYTES・
@@ -492,67 +496,152 @@ fn cjk_tokenizer_impact_on_ja_corpus() {
         }
     }
 
-    println!("=== TASK-106 CJK トークナイザ影響度（日本語主体合成コーパス） ===");
-    println!(
-        "docs={} queries={} total_correct={}",
-        docs.len(),
-        qa.len(),
-        total_correct
-    );
-    let labels = ["A:除去ON", "B:除去OFF", "C:ASCIIのみ"];
-    for i in 0..3 {
+    if verbose {
+        println!("=== TASK-106 CJK トークナイザ影響度（日本語主体合成コーパス） ===");
         println!(
-            "{}: Recall@20={:.4} ({}/{})  Recall@100={:.4} ({}/{})",
-            labels[i],
-            hits20[i] as f64 / total_correct as f64,
-            hits20[i],
-            total_correct,
-            hits100[i] as f64 / total_correct as f64,
-            hits100[i],
-            total_correct,
+            "docs={} queries={} total_correct={}",
+            docs.len(),
+            qa.len(),
+            total_correct
+        );
+        let labels = ["A:除去ON", "B:除去OFF", "C:ASCIIのみ"];
+        for i in 0..3 {
+            println!(
+                "{}: Recall@20={:.4} ({}/{})  Recall@100={:.4} ({}/{})",
+                labels[i],
+                hits20[i] as f64 / total_correct as f64,
+                hits20[i],
+                total_correct,
+                hits100[i] as f64 / total_correct as f64,
+                hits100[i],
+                total_correct,
+            );
+        }
+    }
+
+    // 数値リテラルを含まない関係アサーション（会計整合・上限以下・単調性・非空）で
+    // 回帰トラッキングする（トークナイザ実装が変わって関係が崩れた場合はこのテストが
+    // 失敗し、レポート（docs/design/cjk-tokenizer-impact-ja-corpus.md）の再測定を
+    // 促す。Issue #312。それ以前は hit 数・理論上限の固定値アサーションだったが、
+    // 層 B の非公開閾値の逆算材料になりうるため除去した）。
+    let exp_total_correct: usize = qa.iter().map(|c| c.correct.len()).sum();
+    let exp_ceil20: usize = qa.iter().map(|c| c.correct.len().min(20)).sum();
+    let exp_ceil100: usize = qa.iter().map(|c| c.correct.len().min(100)).sum();
+    assert_eq!(
+        total_correct, exp_total_correct,
+        "total_correct が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        ceil20, exp_ceil20,
+        "ceil20 が QA セットからの会計整合と一致しなかった"
+    );
+    assert_eq!(
+        ceil100, exp_ceil100,
+        "ceil100 が QA セットからの会計整合と一致しなかった"
+    );
+
+    // 変種 A（除去 ON）・B（除去 OFF）: 上限以下・単調性・非空（vacuous pass 防止）。
+    for i in [0usize, 1usize] {
+        assert!(
+            hits20[i] <= ceil20,
+            "変種 {i} の Recall@20 hit 数が理論上限 ceil20 を超えた"
+        );
+        assert!(
+            hits100[i] <= ceil100,
+            "変種 {i} の Recall@100 hit 数が理論上限 ceil100 を超えた"
+        );
+        assert!(
+            hits100[i] <= total_correct,
+            "変種 {i} の Recall@100 hit 数が正解集合の総数を超えた"
+        );
+        assert!(
+            hits20[i] <= hits100[i],
+            "変種 {i} の Recall@20 hit 数が Recall@100 hit 数を上回った"
+        );
+        assert!(
+            hits20[i] > 0,
+            "変種 {i} の Recall@20 hit 数が 0 件（vacuous pass の懸念）"
         );
     }
 
-    // 回帰トラッキング: 決定的コーパス・決定的 QA セットのため実測値は再現可能。
-    // トークナイザ実装が変わって数値が変化した場合はここで検知し、レポート
-    // （docs/design/cjk-tokenizer-impact-ja-corpus.md）の再測定を強制する。
-    assert_eq!(total_correct, 2047, "正解集合の総数が変化した");
-    assert_eq!(hits20[0], 933, "除去 ON の Recall@20 hit 数が変化した");
-    assert_eq!(hits100[0], 1630, "除去 ON の Recall@100 hit 数が変化した");
-    assert_eq!(hits20[1], 935, "除去 OFF の Recall@20 hit 数が変化した");
-    assert_eq!(hits100[1], 1635, "除去 OFF の Recall@100 hit 数が変化した");
-    assert_eq!(hits20[2], 0, "ASCII のみの Recall@20 hit 数が変化した");
-    assert_eq!(hits100[2], 0, "ASCII のみの Recall@100 hit 数が変化した");
-
-    // 天井効果の回帰チェック（ADR「考察」の「実測が理論上限の 99% 超」という主張を
-    // 固定する）。理論上限（ceil20・ceil100）自体も QA セットが変われば動くため、
-    // 決定的コーパスに対する既知値として固定し、実測 hit 数が理論上限の 99% を
-    // 上回ることをアサートする。整数演算のみで比較する（hits * 100 > ceil * 99）。
+    // 変種 C（ASCII のみ）: 本 QA セットのクエリは CONTENT_VOCAB（純 CJK 語彙）のみ
+    // から構成されるため、ASCII のみ構成では query_ascii が構造的に空集合となり、
+    // rank() は恒等的に空を返す。これは劣化度の実測値ではなく構造的に自明な値
+    // （詳細は docs/design/cjk-tokenizer-impact-ja-corpus.md「考察」参照）であり、
+    // 実測値ではなく構造不変条件として維持する。
     assert_eq!(
-        ceil20, 938,
-        "Recall@20 の理論上限（Σmin(20,|correct_q|)）が変化した"
+        hits20[2], 0,
+        "ASCII のみ構成の Recall@20 hit 数が構造的な自明値 0 から変化した"
     );
     assert_eq!(
-        ceil100, 1644,
-        "Recall@100 の理論上限（Σmin(100,|correct_q|)）が変化した"
-    );
-    assert!(
-        hits20[0] * 100 > ceil20 * 99,
-        "除去 ON の Recall@20 が理論上限の 99% を下回った"
-    );
-    assert!(
-        hits100[0] * 100 > ceil100 * 99,
-        "除去 ON の Recall@100 が理論上限の 99% を下回った"
+        hits100[2], 0,
+        "ASCII のみ構成の Recall@100 hit 数が構造的な自明値 0 から変化した"
     );
 
-    // 注記: 本 QA セットのクエリは CONTENT_VOCAB（純 CJK 語彙）のみから構成される
-    // ため、ASCII のみ構成では query_ascii が構造的に空集合となり、rank() は
-    // 恒等的に空を返す（Recall@20/100 = 0.0000 は劣化度の実測値ではなく、空
-    // クエリによる自明値）。この assert は「除去 ON が空クエリ構成を上回る」
-    // という構造的に真な回帰チェックであり、劣化度の実測検証ではない
-    // （詳細は docs/design/cjk-tokenizer-impact-ja-corpus.md「考察」参照）。
+    // 除去 ON が空クエリ構成（変種 C）を上回ることを確認する（構造的に真な
+    // 回帰チェックであり、劣化度の実測検証ではない）。
     assert!(
         hits100[0] > hits100[2],
         "除去 ON が ASCII のみ構成を上回ることを期待したが逆転した"
     );
+}
+
+// ---------- 実測値の既定非出力（Issue #312）。`RECALL_VERBOSE` opt-in ゲート ----------
+// `hybrid_recall.rs::resolve_verbose`/`verbose_requested_from_env` と同一契約
+// （`tests/` 直下は独立 test crate・共有モジュール無しの既存慣行のため複製する）。
+
+/// `RECALL_VERBOSE` の生値と `GITHUB_ACTIONS` 判定を引数化した純関数（単体テスト可能・
+/// 環境変数を直接読まない）。`raw == Some("1")` の厳密一致のみ verbose 要求とみなす。
+/// `under_github_actions` が真の場合、verbose 要求は defense-in-depth として `Err` で
+/// fail-closed に拒否する。
+fn resolve_verbose(raw: Option<&str>, under_github_actions: bool) -> Result<bool, &'static str> {
+    let requested = raw == Some("1");
+    if requested && under_github_actions {
+        return Err(
+            "RECALL_VERBOSE=1 is refused while running under GitHub Actions (GITHUB_ACTIONS is set); rerun outside GitHub Actions to print measured values",
+        );
+    }
+    Ok(requested)
+}
+
+/// 環境変数を読み取って [`resolve_verbose`] へ渡し、`Err` は `panic!` で fail-closed に
+/// する（テスト冒頭、コーパス生成前に呼ぶ）。
+fn verbose_requested_from_env() -> bool {
+    let raw = std::env::var("RECALL_VERBOSE").ok();
+    match resolve_verbose(raw.as_deref(), std::env::var_os("GITHUB_ACTIONS").is_some()) {
+        Ok(v) => v,
+        Err(msg) => panic!("{msg}"),
+    }
+}
+
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::resolve_verbose;
+
+    #[test]
+    fn resolve_verbose_defaults_to_false_when_unset() {
+        assert_eq!(resolve_verbose(None, false), Ok(false));
+    }
+
+    #[test]
+    fn resolve_verbose_true_on_exact_match_outside_github_actions() {
+        assert_eq!(resolve_verbose(Some("1"), false), Ok(true));
+    }
+
+    #[test]
+    fn resolve_verbose_rejects_non_exact_values() {
+        for raw in [" 1", "true", "0", ""] {
+            assert_eq!(resolve_verbose(Some(raw), false), Ok(false));
+        }
+    }
+
+    #[test]
+    fn resolve_verbose_fails_closed_under_github_actions_when_requested() {
+        assert!(resolve_verbose(Some("1"), true).is_err());
+    }
+
+    #[test]
+    fn resolve_verbose_unset_under_github_actions_does_not_block_normal_gate_runs() {
+        assert_eq!(resolve_verbose(None, true), Ok(false));
+    }
 }
