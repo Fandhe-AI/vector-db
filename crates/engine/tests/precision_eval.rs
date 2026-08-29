@@ -997,8 +997,10 @@ mod verbose_gate_tests {
 /// 明示的に成功終了し、strict モードでは fail-closed でテスト失敗とする。設定済みで非数値・範囲外は常に fail-closed（`hybrid_recall.rs::
 /// hybrid_recall_small_scale_threshold_gate` と同一契約）。ログには指標名と pass/fail
 /// のみを出力し、注入された閾値の数値も実測値も出力しない（`make precision-regression`
-/// は将来 public runner から実行されうるため）。3 指標はいずれも `precision` モードの
-/// 返却列から算出する（[`measure`] 参照）。
+/// は将来 public runner から実行されうるため）。`RECALL_VERBOSE=1`（`GITHUB_ACTIONS`
+/// 下では拒否。Issue #303）の opt-in 時のみローカル診断用に `value=` を追加出力する
+/// （[`render_verbose_value_line`]。既定出力は変更しない）。3 指標はいずれも
+/// `precision` モードの返却列から算出する（[`measure`] 参照）。
 #[test]
 #[ignore = "spec 閾値（目標値。Actions variables 由来を想定）が必要なため既定では実行しない。make precision-regression で実行する"]
 fn precision_eval_threshold_gate() {
@@ -1022,11 +1024,13 @@ fn precision_eval_threshold_gate() {
         return;
     }
 
-    // 出力は指標名と pass/fail のみ。閾値の数値も実測値も出さない——本テストは
+    // 出力は既定では指標名と pass/fail のみ。閾値の数値も実測値も出さない——本テストは
     // `make precision-regression` を通じて将来 public runner（`recall.yml`）から
     // 実行されうるため、Actions ログに非公開値を残さない
     // （`.claude/rules/spec-confidentiality.md`。PR #212 codex-review P0）。
-    // 実測値の出力は ローカル専用の `make precision-report`
+    // `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否）の opt-in 時のみローカル
+    // 診断用に `value=` を追加出力する（Issue #303）。判断材料としての実測値出力は
+    // 引き続きローカル専用の `make precision-report`
     // （[`precision_eval_report`]・[`precision_eval_policy_sweep`]）が担う。
     let mut pass = true;
     if let Some(min) = min_top1 {

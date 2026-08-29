@@ -1064,7 +1064,9 @@ mod verbose_gate_tests {
 /// 同型（各下限を独立に解決し、設定済みの下限のみ判定する。3 つとも未設定かつ非
 /// strict の場合のみコーパス生成前に早期 return して成功終了する。strict モードでは
 /// [`resolve_gate_threshold_with`] が未設定を検出した時点で fail-closed になる）。
-/// ログには pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない。
+/// ログには pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない
+/// （`RECALL_VERBOSE=1`〔`GITHUB_ACTIONS` 下では拒否。Issue #303〕の opt-in 時のみ
+/// ローカル診断用に `value=` を追加出力する。既定出力は変更しない）。
 ///
 /// **3 番目の下限を独立変数にする理由**（codex-review・PR #265・P1 指摘への対応）:
 /// `MockLlmClient`（完全 oracle 写像）専用に較正された既存 2 下限を
@@ -1191,7 +1193,9 @@ fn query_planning_recall_threshold_gate() {
 /// 非 strict の場合はコーパス生成前に早期 return して成功終了する。strict モードでは
 /// [`resolve_gate_threshold`] が未設定を検出した時点で fail-closed になる）。ログには
 /// pass/fail のみを出力し、注入された閾値・実測値のいずれの数値も出力しない
-/// （本ファイルの既存方針。ファイル冒頭コメント参照）。
+/// （本ファイルの既存方針。ファイル冒頭コメント参照）。`RECALL_VERBOSE=1`
+/// （`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時のみローカル診断用に
+/// `value=` を追加出力する（既定出力は変更しない）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make query-planning-regression で実行する"]
 fn query_planning_recall_large_scale_threshold_gate() {
