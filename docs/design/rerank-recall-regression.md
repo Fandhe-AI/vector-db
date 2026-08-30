@@ -111,6 +111,8 @@ green。詳細は下記）
 | 改善量（after − baseline） | +0.0049（Issue #330 対応前は +0.0024） |
 | ceil100 / pool hits100 | 913 / 837（Recall@100 = 0.9168） |
 | ceil200 / pool hits200 | 1,049 / 951（Recall@200 = 0.9066） |
+| pool_ceiling_hits20（Issue #330 改訂で導入） | 396 |
+| improvement_ratio（Issue #330 改訂。`(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`） | 2/9 ≈ 0.2222 |
 
 上表は `hybrid.rs::complete_boundary_tie_group_by` の境界同点グループ完全化を
 「終端未確定時は再取得ループ（`fetch_k` 倍増）で終端確定を試み、再取得の上限に
@@ -196,6 +198,35 @@ overlap が同点の候補グループ内でも、ソートの安定性により
 7 hit をカバーするための候補生成段（`hybrid.rs`・`sparse.rs`）の改善、フィクスチャ
 自体の見直し、リランカー方式（クロスエンコーダ等）の確定のいずれかが必要であり、
 オーナー判断事項となる。
+
+### Issue #330 追記: 改善幅ゲートを候補プール上限に対する相対比率へ再定義（SEARCH-7 改訂）
+
+上記の分析が示すとおり、baseline hits20（387）と ceil20（410）の差 23 hit のうち、
+14 hit はプール外（候補生成段の課題・リランキング単独では原理的に到達不能）であり、
+リランキングが到達しうる改善余地はプール内の 9 hit のみである。改善幅を
+`ceil20` に対する絶対差（`after_recall20 − baseline_recall20`）で測る従来の
+ゲート定義は、この「原理的に到達不能な範囲」を分母に含めてしまうため、暫定
+リランカー（字句一致方式）の効果を過小評価する。
+
+そこでオーナー承認済みの spec 改訂（vector-db-spec#7）に合わせ、`recall.yml` の
+`RERANK_RECALL_MIN_R20_IMPROVEMENT` ゲートの判定基準を以下へ再定義した
+（`crates/engine/tests/rerank_recall.rs::RerankRecallResult::improvement_ratio`）:
+
+1. 非劣化: `after_hits20 >= baseline_hits20`（既存の層 A 固定値アサーションを維持）
+2. 相対比率:
+   `(after_hits20 − baseline_hits20) / (pool_ceiling_hits20 − baseline_hits20) >= RERANK_RECALL_MIN_R20_IMPROVEMENT`。
+   ここで `pool_ceiling_hits20`
+   （＝候補プール 200 件内に完璧な並び替えを施した場合に上位 20 件で回収しうる
+   理論上限。クエリ単位の `min(20, プール内正解数)` の総和）は本フィクスチャで
+   実測 396（プール内回収余地 9 hit のうち可能な最大＝ 387 + 9）
+3. 改善余地（分母 `pool_ceiling_hits20 − baseline_hits20`）が `ceil20` の 1%
+   未満（構造的にほぼ改善不可能）の場合は条件 2 を自動充足とし、条件 1 のみで
+   判定する（分母 0 に近づく不安定さを避ける fail-closed 対策を兼ねる）
+
+Issue #330 対応後の本フィクスチャでの実測比率は
+`improvement_ratio = (389 − 387) / (396 − 387) = 2 / 9 ≈ 0.2222`
+（字句信号の構造的上限に達している状態での実測値）。`RERANK_RECALL_MIN_R20_LARGE`
+（絶対下限）の判定方式は変更していない。
 
 ## 既知の制約・スコープ外
 
