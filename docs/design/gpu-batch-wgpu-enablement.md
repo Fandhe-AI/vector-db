@@ -166,6 +166,9 @@ CPU 経路（`batch_search.rs::run_batch_search` の「選出後の独立再検�
   Issue #286 で variables から repo secrets へ、その後 codex-review P0 指摘
   〔PR #299〕で Environment `bench-gate` へ移行）から注入し、未設定・非正値は
   fail-closed（値は spec が SSOT のため本リポにデフォルトを持たない）
+- Apple GPU（Metal）環境での CORE-16 fail 報告（Issue #313）の切り分け・
+  規模スイープ診断（`BENCH_CORE16_DIAG`）は
+  `docs/design/core16-f16-resident-gate.md` 参照
 
 ## 3. ローカル実測（開発環境）
 

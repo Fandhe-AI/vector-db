@@ -88,6 +88,10 @@ green にするための必須 secrets はこの 4 つ）。
 `BENCH_CORE6`・`BENCH_CORE16`・`BENCH_DEDICATED_ENV`（opt-in フラグ・専有環境
 フラグ）は数値基準ではなく非機密の 0/1 フラグのため、secrets 化の対象外とし
 repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml` 参照）。
+`BENCH_CORE16_DIAG`（Issue #313・CORE-16 の Apple GPU〔Metal〕fail 切り分け用
+規模スイープ診断の opt-in フラグ。`docs/design/core16-f16-resident-gate.md`
+参照）も同様に非機密であり、`bench.yml` へは注入しない（`BENCH_VERBOSE` と
+同じく手動実行〔`make bench-batch`〕専用の opt-in とし CI では設定しない）。
 
 ### Environment `recall-gate` secrets（`.github/workflows/recall.yml`）
 

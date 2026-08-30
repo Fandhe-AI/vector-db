@@ -95,6 +95,23 @@
 //!
 //!   いずれも既定では pass/fail・非数値状態のみを標準出力へ書き、実測値・注入した
 //!   閾値は出力しない（`BENCH_VERBOSE` opt-in 時のみ実測値を追加出力する）。
+//! - CORE-16 規模点診断（Issue #313。[`run_core16_scaling_diagnostic`]）:
+//!   Apple GPU（Metal）環境での CORE-16 fail 報告を受け、「測定設計（固定コスト
+//!   支配）」「Apple GPU/UMA 環境要因」「f16 シェーダの性能不足」のどれが支配的かを
+//!   切り分けるための opt-in 診断。`BENCH_CORE16_DIAG`（非空で有効）かつ
+//!   `BENCH_VERBOSE` の両方が設定されたときのみ、`BENCH_CORE16_DIAG_SCALE_INDEX`
+//!   （必須。`0`〜`5`）が選ぶ 1 規模点で CORE-16 と同じ A/B（f32 常駐 vs f16 常駐）
+//!   を測定し実測値を出力する。複数規模点を同一プロセス内で連続測定すると比較不能
+//!   なノイズが乗ることを `docs/design/core16-f16-resident-gate.md` の ADR で確認
+//!   済みのため、1 プロセス = 1 規模点とし、規模点間の比較はプロセスを分けて複数回
+//!   実行することで行う。さらに `BENCH_CORE16_DIAG` opt-in 時は `main` が CORE-7/
+//!   CORE-6/CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して
+//!   終了する（PR #326 codex-review 指摘対応: 先行するゲートの GPU バックエンド
+//!   構築・破棄・GPU 占有状態が同一プロセス内で診断計測へ持ち越されるのを防ぎ、
+//!   `docs/design/core16-f16-resident-gate.md` が要求する「方法 A と同型のクリーン
+//!   な単独計測」を保つ）。CORE-6/16 ゲート本体とは独立に動作し合否には数えない。
+//!   詳細・本開発環境（NVIDIA/Vulkan）での実測に基づく判断は
+//!   `docs/design/core16-f16-resident-gate.md` を参照。
 
 // `harness` の取り込み方針は `simd_bench.rs` と同一(本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する)。
@@ -229,17 +246,24 @@ struct GateDataset {
 }
 
 fn build_gate_dataset(rng: &mut DeterministicRng) -> GateDataset {
-    let ids: Vec<u64> = (0..GPU_GATE_ROW_COUNT as u64).collect();
-    let tenant_ids: Vec<String> =
-        std::iter::repeat_n(BENCH_TENANT.to_string(), GPU_GATE_ROW_COUNT).collect();
-    let visibilities: Vec<Visibility> =
-        std::iter::repeat_n(Visibility::Public, GPU_GATE_ROW_COUNT).collect();
-    let mut vectors = Vec::with_capacity(GPU_GATE_ROW_COUNT * GPU_GATE_DIM);
-    for _ in 0..GPU_GATE_ROW_COUNT {
-        vectors.extend(rng.next_vector(GPU_GATE_DIM));
+    build_scaled_gate_dataset(rng, GPU_GATE_ROW_COUNT, GPU_GATE_DIM)
+}
+
+/// [`build_gate_dataset`] の行数・次元を可変にした版（Issue #313・
+/// [`run_core16_scaling_diagnostic`] の規模スイープ用）。CORE-6/CORE-16/CORE-7
+/// ゲート本体は固定規模（[`GPU_GATE_ROW_COUNT`]/[`GPU_GATE_DIM`]）のまま
+/// [`build_gate_dataset`] を使い続け、本関数はそれを呼ぶ薄いラッパーとして
+/// 挙動を変えない。
+fn build_scaled_gate_dataset(rng: &mut DeterministicRng, rows: usize, dim: usize) -> GateDataset {
+    let ids: Vec<u64> = (0..rows as u64).collect();
+    let tenant_ids: Vec<String> = std::iter::repeat_n(BENCH_TENANT.to_string(), rows).collect();
+    let visibilities: Vec<Visibility> = std::iter::repeat_n(Visibility::Public, rows).collect();
+    let mut vectors = Vec::with_capacity(rows * dim);
+    for _ in 0..rows {
+        vectors.extend(rng.next_vector(dim));
     }
     let queries: Vec<Vec<f32>> = (0..GPU_GATE_BATCH_SIZE)
-        .map(|_| rng.next_vector(GPU_GATE_DIM))
+        .map(|_| rng.next_vector(dim))
         .collect();
     GateDataset {
         ids,
@@ -600,40 +624,62 @@ fn run_core16_gate(
     }
     let min_improvement_pct = min_improvement_pct_from_env("BENCH_CORE16_MIN_IMPROVEMENT_PCT")?;
 
-    let f32_backend = match engine::gpu_batch::GpuF32ContrastBackend::try_new(
-        &dataset.ids,
-        &dataset.tenant_ids,
-        &dataset.visibilities,
-        GPU_GATE_DIM,
-        &dataset.vectors,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
+    let (p95_a, p95_b) = match measure_core16_resident_p95(dataset, ctx, GPU_GATE_DIM, LABEL) {
+        Ok(pair) => pair,
+        Err(msg) => {
             println!(
-                "{LABEL}: not measurable in this environment (f32-resident gpu contrast \
-                 backend unavailable: {e}) requested=true pass=false"
+                "{LABEL}: not measurable in this environment ({msg}) requested=true pass=false"
             );
             return Ok(false);
         }
     };
+
+    let pass = check_improvement_at_least(p95_a, p95_b, min_improvement_pct)
+        .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
+    println!(
+        "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
+         requested=true pass={pass}"
+    );
+    if verbose {
+        println!("verbose({LABEL}): f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}");
+    }
+    Ok(pass)
+}
+
+/// CORE-16 の A/B（f32 常駐対照 vs f16 パック常駐）を 1 回測定し、両経路の p95 を
+/// 返す共有ヘルパー（[`run_core16_gate`]・[`run_core16_scaling_diagnostic`]
+/// 〔Issue #313〕の双方から呼ぶ）。`dim` は `dataset` に格納された行ベクトルの
+/// 次元（`GateDataset` はフラット化済みの `vectors` のみを持つため、次元は
+/// 呼び出し側が別途渡す契約——[`build_scaled_gate_dataset`] 参照）。
+///
+/// GPU 初期化失敗・計測中のエラーはいずれも `Err` として呼び出し側へ返す
+/// （fail-closed。CPU 比較を GPU 実測の代替として計上しない＝アサーション弱体化を
+/// 避ける。ゲート本体〔[`run_core16_gate`]〕はこれを `pass=false` へ、診断
+/// 〔[`run_core16_scaling_diagnostic`]〕は「測定不能」表示へ変換する）。
+fn measure_core16_resident_p95(
+    dataset: &GateDataset,
+    ctx: &PolicyContext,
+    dim: usize,
+    label: &str,
+) -> Result<(std::time::Duration, std::time::Duration), String> {
+    let f32_backend = engine::gpu_batch::GpuF32ContrastBackend::try_new(
+        &dataset.ids,
+        &dataset.tenant_ids,
+        &dataset.visibilities,
+        dim,
+        &dataset.vectors,
+    )
+    .map_err(|e| format!("f32-resident gpu contrast backend unavailable: {e}"))?;
     let f16_matrix = ResidentMatrix::build(
         &dataset.ids,
         &dataset.tenant_ids,
         &dataset.visibilities,
-        GPU_GATE_DIM,
+        dim,
         &dataset.vectors,
     )
-    .map_err(|err| format!("{LABEL}: resident matrix build failed: {err}"))?;
-    let f16_backend = match engine::gpu_batch::GpuBatchBackend::try_new(f16_matrix) {
-        Ok(b) => b,
-        Err(e) => {
-            println!(
-                "{LABEL}: not measurable in this environment (f16-resident gpu backend \
-                 unavailable: {e}) requested=true pass=false"
-            );
-            return Ok(false);
-        }
-    };
+    .map_err(|err| format!("resident matrix build failed: {err}"))?;
+    let f16_backend = engine::gpu_batch::GpuBatchBackend::try_new(f16_matrix)
+        .map_err(|e| format!("f16-resident gpu backend unavailable: {e}"))?;
 
     // レビュー指摘対応（PR #245）: `gate_batch_queries` の `Vec<BatchQuery>` 確保・
     // 構築は測定区間の外（`run_ab` 呼び出し前）で 1 回だけ行い、両ワークロードから
@@ -650,7 +696,7 @@ fn run_core16_gate(
     // `check_improvement_at_least` が誤って `pass=true` を返しうる状態だった
     // （CORE-6 の縮退カウントに相当する fail-closed チェックが本ゲートに無かった）。
     // 両ワークロードのエラー発生を計測中も観測し、1 件でもあれば「判定不能」として
-    // `pass=false` に倒す。
+    // `Err` に倒す。
     let error_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let error_count_a = std::sync::Arc::clone(&error_count);
     let error_count_b = std::sync::Arc::clone(&error_count);
@@ -661,7 +707,7 @@ fn run_core16_gate(
         Err(err) => {
             error_count_a.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             eprintln!(
-                "batch_bench: {LABEL}: f32-resident batch_search returned an error \
+                "batch_bench: {label}: f32-resident batch_search returned an error \
                  during measurement: {err}"
             );
             0
@@ -672,36 +718,122 @@ fn run_core16_gate(
         Err(err) => {
             error_count_b.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             eprintln!(
-                "batch_bench: {LABEL}: f16-resident batch_search returned an error \
+                "batch_bench: {label}: f16-resident batch_search returned an error \
                  during measurement: {err}"
             );
             0
         }
     };
     let ab = run_ab(&config, workload_a, workload_b)
-        .map_err(|err| format!("{LABEL}: A/B measurement failed: {err}"))?;
+        .map_err(|err| format!("A/B measurement failed: {err}"))?;
     if error_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        println!(
-            "{LABEL}: not measurable in this environment (batch_search returned an \
-             error during measurement; see stderr) requested=true pass=false"
-        );
-        return Ok(false);
+        return Err("batch_search returned an error during measurement; see stderr".to_string());
     }
 
     let p95_a = p95_from_samples(&ab.a.samples)
-        .map_err(|err| format!("{LABEL}: p95 of A samples unavailable: {err}"))?;
+        .map_err(|err| format!("p95 of A samples unavailable: {err}"))?;
     let p95_b = p95_from_samples(&ab.b.samples)
-        .map_err(|err| format!("{LABEL}: p95 of B samples unavailable: {err}"))?;
-    let pass = check_improvement_at_least(p95_a, p95_b, min_improvement_pct)
-        .map_err(|err| format!("{LABEL}: improvement check failed: {err}"))?;
-    println!(
-        "{LABEL}: rows={GPU_GATE_ROW_COUNT} dim={GPU_GATE_DIM} batch={GPU_GATE_BATCH_SIZE} \
-         requested=true pass={pass}"
-    );
-    if verbose {
-        println!("verbose({LABEL}): f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}");
+        .map_err(|err| format!("p95 of B samples unavailable: {err}"))?;
+    Ok((p95_a, p95_b))
+}
+
+/// 規模スイープの候補点（行数, 次元）一覧。CORE-16 ゲート本体
+/// （`GPU_GATE_ROW_COUNT`/`GPU_GATE_DIM` 固定）より広い規模域を掃引し、短縮率が
+/// 測定規模に応じてどう変化するかを見る（Issue #313: 測定設計〔固定コスト支配〕/
+/// f16 シェーダの性能不足の切り分けが目的。本ベンチ固有の測定条件であり spec の
+/// 閾値ではない）。
+const CORE16_DIAG_SCALE_POINTS: [(usize, usize); 6] = [
+    (64, GPU_GATE_DIM),
+    (500, GPU_GATE_DIM),
+    (GPU_GATE_ROW_COUNT, 64),
+    (GPU_GATE_ROW_COUNT, GPU_GATE_DIM),
+    (GPU_GATE_ROW_COUNT, 1024),
+    (GPU_GATE_ROW_COUNT * 4, GPU_GATE_DIM),
+];
+
+/// `BENCH_CORE16_DIAG_SCALE_INDEX`（[`CORE16_DIAG_SCALE_POINTS`] への添字。
+/// `0`〜`5`）を読み取る。未設定・非数値・範囲外は fail-closed で `Err` を返す
+/// （PR #326 codex-review 指摘対応: `run_core16_scaling_diagnostic` が複数規模点を
+/// 同一プロセス内で逐次測定していたが、`docs/design/core16-f16-resident-gate.md`
+/// の ADR（方法 B の実測）が「GPU バックエンドの繰り返し構築・破棄に由来する
+/// 逐次測定ノイズにより値・符号が比較不能になる」ことを確認済みのため、1 プロセス
+/// = 1 規模点の測定へ変更し、規模点間の比較は複数回のプロセス起動〔別プロセス〕に
+/// 委ねる）。
+fn core16_diag_scale_index_from_env() -> Result<usize, String> {
+    let raw = std::env::var("BENCH_CORE16_DIAG_SCALE_INDEX").map_err(|_| {
+        format!(
+            "BENCH_CORE16_DIAG_SCALE_INDEX is not set (required when BENCH_CORE16_DIAG is set; \
+             pick one index 0..{} — measuring multiple scale points within a single process is \
+             not valid comparative evidence, see docs/design/core16-f16-resident-gate.md)",
+            CORE16_DIAG_SCALE_POINTS.len() - 1
+        )
+    })?;
+    let index: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| "BENCH_CORE16_DIAG_SCALE_INDEX must be a non-negative integer".to_string())?;
+    if index >= CORE16_DIAG_SCALE_POINTS.len() {
+        return Err(format!(
+            "BENCH_CORE16_DIAG_SCALE_INDEX must be in range 0..{} (got {index})",
+            CORE16_DIAG_SCALE_POINTS.len() - 1
+        ));
     }
-    Ok(pass)
+    Ok(index)
+}
+
+/// CORE-16 の規模点診断（Issue #313）。モジュール冒頭コメント参照。
+/// `BENCH_CORE16_DIAG`（非空で有効）かつ `BENCH_VERBOSE` の両方が設定されている
+/// ときのみ動作し、`BENCH_CORE16_DIAG` 未設定なら何も出力しない
+/// （既定挙動を変えない）。CORE-6/CORE-16 ゲート本体が使う固定規模の
+/// `GateDataset` は再利用せず、選択した規模点だけを [`build_scaled_gate_dataset`]
+/// で構築する（合否には数えない・スタンドアロンの参考出力）。
+///
+/// 1 回の呼び出しで測定するのは [`core16_diag_scale_index_from_env`] が選ぶ 1
+/// 規模点のみ（`docs/design/core16-f16-resident-gate.md` 参照。複数規模点を
+/// 同一プロセス内で連続測定すると GPU バックエンドの繰り返し構築・破棄に由来する
+/// ノイズで値・符号が比較不能になることを ADR で確認済みのため、規模点間の比較は
+/// プロセスを分けて複数回実行することで行う）。
+fn run_core16_scaling_diagnostic(
+    rng: &mut DeterministicRng,
+    ctx: &PolicyContext,
+    verbose: bool,
+) -> Result<(), String> {
+    const LABEL: &str = "core16_diag";
+    if !opt_in_requested_from_env("BENCH_CORE16_DIAG") {
+        return Ok(());
+    }
+    if !verbose {
+        println!(
+            "{LABEL}: requires BENCH_VERBOSE=1 to run (numeric diagnostic; not counted toward \
+             pass/fail)"
+        );
+        return Ok(());
+    }
+
+    let index = core16_diag_scale_index_from_env()?;
+    let (rows, dim) = CORE16_DIAG_SCALE_POINTS[index];
+
+    let dataset = build_scaled_gate_dataset(rng, rows, dim);
+    match measure_core16_resident_p95(&dataset, ctx, dim, LABEL) {
+        Ok((p95_a, p95_b)) => {
+            println!(
+                "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} \
+                 f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}"
+            );
+        }
+        Err(msg) => {
+            // 測定不能を `Ok(())` へ合流させると、GPU 初期化失敗等で診断が
+            // 1 件も測定値を得られなかった実行を運用者・スクリプトが成功と
+            // 誤認しうる（fail-closed。PR #326 codex-review P1 指摘対応）。
+            // `main` の `Err` ハンドラ（`std::process::exit(1)`）へ委ね、
+            // 非ゼロ終了させる。
+            return Err(format!(
+                "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} not measurable \
+                 ({msg})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 診断用の事前生成プール 1 本（`total_iterations` バッチ分。各バッチ
@@ -813,17 +945,37 @@ fn run_dynamic_window_push_drain_diagnostic(rng: &mut DeterministicRng, verbose:
 }
 
 fn main() {
-    let max_degradation_pct = match max_degradation_pct_from_env() {
+    // 実測値の既定非出力（Issue #279）の opt-in ゲート。CI（`GITHUB_ACTIONS`）下では
+    // `verbose_requested_from_env` 自体が fail-closed で拒否するため、ここで検証不能な
+    // 経路を通す前に必ず判定する。
+    let verbose = match verbose_requested_from_env() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
     };
-    // 実測値の既定非出力（Issue #279）の opt-in ゲート。CI（`GITHUB_ACTIONS`）下では
-    // `verbose_requested_from_env` 自体が fail-closed で拒否するため、ここで検証不能な
-    // 経路を通す前に必ず判定する。
-    let verbose = match verbose_requested_from_env() {
+
+    // CORE-16 規模点診断（Issue #313）が opt-in されている場合は、CORE-7/CORE-6/
+    // CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して終了する
+    // （PR #326 codex-review 指摘対応: 診断を他ゲートの後に呼ぶと、先行するゲートの
+    // GPU バックエンド構築・破棄・GPU 占有状態が同一プロセス内で診断計測へ持ち越され、
+    // `docs/design/core16-f16-resident-gate.md` が「方法 A と同型の測定形」として
+    // 要求するクリーンな単独計測にならない。1 プロセス = 1 規模点の診断専用実行と
+    // することで、他ゲート測定を経由しない構成に変更した）。CORE-7 用の
+    // `BENCH_BATCH_MAX_DEGRADATION_PCT` もこの経路では読み取らない（CORE-7 自体を
+    // 測定しないため不要）。
+    if opt_in_requested_from_env("BENCH_CORE16_DIAG") {
+        let mut diag_rng = DeterministicRng::new(1);
+        let diag_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
+        if let Err(msg) = run_core16_scaling_diagnostic(&mut diag_rng, &diag_ctx, verbose) {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let max_degradation_pct = match max_degradation_pct_from_env() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
