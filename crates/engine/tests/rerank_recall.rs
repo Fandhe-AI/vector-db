@@ -628,6 +628,135 @@ fn rerank_recall_large_scale_regression() {
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
 
+/// 層 B の改善幅ゲート判定ロジック（環境変数非依存の純関数）。
+///
+/// `rerank_recall_large_scale_threshold_gate` にインライン展開されていた判定式
+/// （条件(1) 非劣化 `after_hits20 >= baseline_hits20` と条件(2) [`RerankRecallResult::
+/// improvement_ratio`] が `threshold` 以上〔`None`＝改善余地が構造的にほぼ 0 の場合は
+/// 自動充足〕の AND）を関数として切り出し、`#[ignore]` の層 B テスト（spec 閾値・
+/// Actions variables 依存）を経由せずに常時実行の単体テストから境界条件を検証できる
+/// ようにする（PR #332 codex-review P2 対応・Issue #330）。挙動は変更しない。
+fn improvement_gate_passes(result: &RerankRecallResult, threshold: f64) -> bool {
+    let non_degraded = result.after_hits20 >= result.baseline_hits20;
+    let pass_ratio = result.improvement_ratio().is_none_or(|v| v >= threshold);
+    non_degraded && pass_ratio
+}
+
+#[cfg(test)]
+mod improvement_ratio_tests {
+    use super::{improvement_gate_passes, RerankRecallResult};
+
+    /// テスト用の [`RerankRecallResult`] を直接構築するヘルパ（`measure_rerank_recall`
+    /// を経由せず、`improvement_ratio`/`improvement_gate_passes` の境界条件を単体で
+    /// 固定する。PR #332 codex-review P2 対応・Issue #330: 層 A の固定値回帰テスト
+    /// （`rerank_recall_large_scale_regression`）が通る通常経路〔`Some(2/9)`〕以外の
+    /// `headroom == 0`・1% 境界の直前/直後・`after < baseline` の組み合わせが未検証
+    /// だった指摘への対応。他フィールド（`total_correct`/`pool_hits100`/`pool_hits200`/
+    /// `ceil100`/`ceil200`）は `improvement_ratio`/`improvement_gate_passes` の計算に
+    /// 使われないためダミー値で固定する。
+    fn result_with(
+        baseline_hits20: usize,
+        after_hits20: usize,
+        pool_ceiling_hits20: usize,
+        ceil20: usize,
+    ) -> RerankRecallResult {
+        RerankRecallResult {
+            total_correct: 0,
+            baseline_hits20,
+            after_hits20,
+            pool_hits100: 0,
+            pool_hits200: 0,
+            pool_ceiling_hits20,
+            ceil20,
+            ceil100: 0,
+            ceil200: 0,
+        }
+    }
+
+    #[test]
+    fn improvement_ratio_none_when_headroom_zero() {
+        // headroom = pool_ceiling_hits20 - baseline_hits20 = 0（ceiling == baseline。
+        // 分母 0 で改善余地が構造的に存在しない）。
+        let r = result_with(100, 100, 100, 1000);
+        assert_eq!(r.improvement_headroom(), 0);
+        assert_eq!(r.improvement_ratio(), None);
+    }
+
+    #[test]
+    fn improvement_ratio_none_just_below_one_percent_boundary() {
+        // ceil20 = 1000 → 1% しきい値 = 10。headroom = 9（境界直前）は分母不安定と
+        // みなし None（自動充足扱い）にしなければならない。
+        let r = result_with(100, 105, 109, 1000);
+        assert_eq!(r.improvement_headroom(), 9);
+        assert_eq!(r.improvement_ratio(), None);
+    }
+
+    #[test]
+    fn improvement_ratio_some_at_exact_one_percent_boundary() {
+        // headroom = 10 = ちょうど 1%（境界。`< 0.01 * ceil20` は偽になり Some を返す）。
+        let r = result_with(100, 105, 110, 1000);
+        assert_eq!(r.improvement_headroom(), 10);
+        assert_eq!(r.improvement_ratio(), Some(0.5));
+    }
+
+    #[test]
+    fn improvement_ratio_some_just_above_one_percent_boundary() {
+        let r = result_with(100, 106, 111, 1000);
+        assert_eq!(r.improvement_headroom(), 11);
+        let ratio = r
+            .improvement_ratio()
+            .expect("headroom above the 1% threshold must be Some");
+        assert!((ratio - (6.0 / 11.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn improvement_ratio_matches_large_scale_regression_fixture_value() {
+        // `rerank_recall_large_scale_regression` の固定値（after 389・baseline 387・
+        // pool_ceiling_hits20 396・ceil20 410。同テストのアサーション参照）から算出
+        // される比率 2/9（同テストのドキュメンテーションコメントに明記済み・
+        // `.claude/rules/spec-confidentiality.md` の実測値公開許可の範囲内）と
+        // `improvement_ratio()` の算出結果が一致することを固定する。
+        let r = result_with(387, 389, 396, 410);
+        let ratio = r
+            .improvement_ratio()
+            .expect("large-scale regression fixture headroom is well above the 1% threshold");
+        assert!((ratio - (2.0 / 9.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn improvement_gate_passes_none_ratio_auto_passes_regardless_of_threshold() {
+        // headroom 0 → improvement_ratio() は None。条件(2)を自動充足として threshold
+        // の値によらず pass する（条件(1)の非劣化のみで判定）。
+        let r = result_with(100, 100, 100, 1000);
+        assert!(improvement_gate_passes(&r, 1.0));
+    }
+
+    #[test]
+    fn improvement_gate_passes_some_ratio_at_or_above_threshold() {
+        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
+        assert!(improvement_gate_passes(&r, 0.5));
+        assert!(improvement_gate_passes(&r, 0.0));
+    }
+
+    #[test]
+    fn improvement_gate_fails_some_ratio_below_threshold() {
+        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
+        assert!(!improvement_gate_passes(&r, 0.6));
+    }
+
+    #[test]
+    fn improvement_gate_fails_when_after_below_baseline_regardless_of_ratio() {
+        // 非劣化条件（条件(1)）違反は独立にゲートを fail させなければならない
+        // （比較演算子・分母計算の将来変更で fail-open にならないことを固定する回帰）。
+        // headroom = pool_ceiling_hits20(110).saturating_sub(baseline_hits20(105)) = 5 <
+        // 1%（10）のため improvement_ratio() 自体は None（条件(2)は自動充足）だが、
+        // after(100) < baseline(105) の非劣化違反により threshold=0.0 でも fail する。
+        let r = result_with(105, 100, 110, 1000);
+        assert_eq!(r.improvement_ratio(), None);
+        assert!(!improvement_gate_passes(&r, 0.0));
+    }
+}
+
 /// `RERANK_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果
 /// （`hybrid_recall.rs::GateThreshold` と同一の役割）。
 enum GateThreshold {
@@ -874,7 +1003,6 @@ fn rerank_recall_large_scale_threshold_gate() {
     // (2) 候補プール上限に対する相対比率（[`RerankRecallResult::improvement_ratio`]）
     // の 2 条件からなる。改善余地（分母）が構造的にほぼ 0（`improvement_ratio` が
     // `None`）の場合は (2) を自動充足とし (1) のみで判定する。
-    let non_degraded = r.after_hits20 >= r.baseline_hits20;
     let improvement_ratio = r.improvement_ratio();
 
     let mut pass = true;
@@ -901,8 +1029,7 @@ fn rerank_recall_large_scale_threshold_gate() {
     }
     match min_r20_improvement {
         Some(min) => {
-            let pass_ratio = improvement_ratio.is_none_or(|v| v >= min);
-            let pass_improvement = non_degraded && pass_ratio;
+            let pass_improvement = improvement_gate_passes(&r, min);
             pass &= pass_improvement;
             match improvement_ratio {
                 Some(ratio) => {
