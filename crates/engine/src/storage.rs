@@ -1555,6 +1555,71 @@ mod tests {
         );
     }
 
+    // Issue #314 レビュー指摘（Low）: `decode_row_embedding_and_metadata_into` の
+    // fail-closed 分岐（オーバーフロー安全・MAX_EMBEDDING_DIM・MAX_METADATA_LEN 上限・
+    // trailing bytes 検証）は既存 `decode_row` と同一のはずだが、テストは正常系
+    // （`_matches_full_decode`・`_reuses_scratch_capacity_across_calls`）のみで
+    // 拒否系のテストカバレッジが無かった。`decode_row` の既存拒否系テスト
+    // （`decode_row_rejects_oversized_dim_without_allocating`・
+    // `decode_row_rejects_trailing_garbage`・`encode_row_rejects_oversized_metadata`）と
+    // 対になる形で、`decode_row` と `decode_row_embedding_and_metadata_into` の両方が
+    // 同じ入力を fail-closed で拒否することを確認する。
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_oversized_dim_without_allocating() {
+        // dim をアロケーション上限より大きい値に書き換えたバッファ。
+        // `decode_row_embedding_and_metadata_into` は `out_embedding.reserve` を呼ぶ前に
+        // dim の上限検証で拒否するべき（decode_row_rejects_oversized_dim_without_allocating
+        // と同じ意図）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let oversized = MAX_EMBEDDING_DIM + 1;
+        // レイアウト: [version(1)][tenant_len(2)]["tenant-a"(8)][visibility(1)][dim(4)]。
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        buf[dim_offset..dim_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_oversized_metadata_len() {
+        // metadata_len フィールドを MAX_METADATA_LEN 超過に書き換え、実バッファは
+        // 追随させない（decode_row 側でも metadata_len 検証はバッファ長に依らず
+        // フィールド値のみで先に拒否される契約）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let metadata_len_offset = dim_offset + 4 + 4; // dim=1 分の embedding バイト列（4 バイト）後
+        let oversized = MAX_METADATA_LEN + 1;
+        buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_trailing_garbage() {
+        let mut buf = sample_row(&[1.0], b"m");
+        buf.push(0);
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_truncated_buffer() {
+        // embedding フィールドの途中でバッファを切り詰める（dim=2 を宣言しつつ
+        // embedding バイト列を 1 要素分しか持たない）。
+        let buf = sample_row(&[1.0, 2.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let truncated = &buf[..dim_offset + 4 + 4]; // dim フィールド + embedding 4 バイトのみ
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, truncated).is_err());
+        assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
+    }
+
     // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な
     // 読み取り操作では増加しないことを確認する。
     #[test]
