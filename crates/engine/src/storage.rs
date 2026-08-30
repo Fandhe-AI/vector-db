@@ -950,6 +950,99 @@ pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visi
 /// `MAX_SCANNED_ROWS` 級の走査で無視できない一時確保が発生し得る
 /// （coding-rust.md「不安全な設計 / DoS」対応。`decode_row_tenant_and_visibility` が
 /// 可視性判定のためにヘッダのみを借用で返す設計と同じ方針）。
+/// 行バイト列から embedding・metadata を取り出す（[`decode_row`] と同じヘッダ・
+/// 各フィールド検証を経るが、embedding は呼び出し元が渡した `out_embedding` へ
+/// `clear()` 後に書き込む——[`decode_row`] のように行ごとに新しい `Vec<f32>` を
+/// 確保しない。`out_embedding` の capacity は呼び出し元が複数行にわたって
+/// 使い回すことを想定する（同一次元のテーブルを走査する限り、2 行目以降は
+/// 再確保が発生しない）。`metadata` は [`decode_row_metadata_borrowed`] と同じく
+/// `buf` を借用した `&[u8]`。返り値は `(dim, metadata)`。
+///
+/// 呼び出し文脈: `arena.rs::VectorArena::build_filtered_with_rows_and_limits_in_txn`
+/// が、可視行 1 件ごとに `decode_row` を呼んで `Vec<f32>` を確保・即座に
+/// `GrowableArenaBuffers::push_row`（単一の平坦バッファへ `extend_from_slice`）
+/// でコピーしてから破棄していた冗長な確保を避けるために使う（Issue #314・
+/// SQL-1・TASK-83 条件7: SQL 表層 C1 経路の固定コスト削減。行数に比例する
+/// ヒープ確保回数を削るのが目的で、RLS 判定順序（`predicate` 通過後にのみ
+/// embedding をデコードする契約）は変えない）。
+pub(crate) fn decode_row_embedding_and_metadata_into<'a>(
+    buf: &'a [u8],
+    out_embedding: &mut Vec<f32>,
+) -> Result<(u32, &'a [u8])> {
+    let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
+
+    let dim_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at dim field".to_string()))?;
+    let dim_bytes = buf
+        .get(offset..dim_field_end)
+        .ok_or_else(|| StorageError::Codec("row buffer truncated at dim field".to_string()))?;
+    let dim_arr: [u8; 4] = dim_bytes
+        .try_into()
+        .map_err(|_| StorageError::Codec("dim field is not 4 bytes".to_string()))?;
+    let dim = u32::from_le_bytes(dim_arr);
+    if dim > MAX_EMBEDDING_DIM {
+        return Err(StorageError::Codec(format!(
+            "embedding dim {dim} exceeds limit {MAX_EMBEDDING_DIM}"
+        )));
+    }
+    offset = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow after dim field".to_string()))?;
+
+    let embedding_bytes_len = (dim as usize)
+        .checked_mul(4)
+        .ok_or_else(|| StorageError::Codec("embedding byte length overflow".to_string()))?;
+    let embedding_end = offset
+        .checked_add(embedding_bytes_len)
+        .ok_or_else(|| StorageError::Codec("offset overflow after embedding field".to_string()))?;
+    let embedding_bytes = buf.get(offset..embedding_end).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at embedding field".to_string())
+    })?;
+    // `out_embedding` の capacity は上限検証済みの `dim`（`MAX_EMBEDDING_DIM` 以下）に
+    // 有界。`clear()` は既存 capacity を保持するため、呼び出し元が同一バッファを
+    // 複数行にわたって渡す限り 2 行目以降は再確保が発生しない。
+    out_embedding.clear();
+    out_embedding.reserve(dim as usize);
+    for chunk in embedding_bytes.as_chunks::<4>().0 {
+        out_embedding.push(f32::from_le_bytes(*chunk));
+    }
+    offset = embedding_end;
+
+    let metadata_len_field_end = offset
+        .checked_add(4)
+        .ok_or_else(|| StorageError::Codec("offset overflow at metadata_len field".to_string()))?;
+    let metadata_len_bytes = buf.get(offset..metadata_len_field_end).ok_or_else(|| {
+        StorageError::Codec("row buffer truncated at metadata_len field".to_string())
+    })?;
+    let metadata_len_arr: [u8; 4] = metadata_len_bytes
+        .try_into()
+        .map_err(|_| StorageError::Codec("metadata_len field is not 4 bytes".to_string()))?;
+    let metadata_len = u32::from_le_bytes(metadata_len_arr);
+    if metadata_len > MAX_METADATA_LEN {
+        return Err(StorageError::Codec(format!(
+            "metadata length {metadata_len} exceeds limit {MAX_METADATA_LEN}"
+        )));
+    }
+    offset = offset.checked_add(4).ok_or_else(|| {
+        StorageError::Codec("offset overflow after metadata_len field".to_string())
+    })?;
+
+    let metadata_end = offset
+        .checked_add(metadata_len as usize)
+        .ok_or_else(|| StorageError::Codec("offset overflow after metadata field".to_string()))?;
+    let metadata_bytes = buf
+        .get(offset..metadata_end)
+        .ok_or_else(|| StorageError::Codec("row buffer truncated at metadata field".to_string()))?;
+    if metadata_end != buf.len() {
+        return Err(StorageError::Codec(
+            "row buffer has trailing bytes beyond declared metadata length".to_string(),
+        ));
+    }
+
+    Ok((dim, metadata_bytes))
+}
+
 pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
     let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
 
@@ -1390,6 +1483,141 @@ mod tests {
             assert!(header_result.is_err(), "header decode should fail-closed");
             assert!(full_result.is_err(), "full decode should fail-closed");
         }
+    }
+
+    // Issue #314・SQL-1・TASK-83 条件7: `decode_row_embedding_and_metadata_into`
+    // （行ごとのヒープ確保を避ける借用デコード API。`arena.rs` の可視行走査から
+    // 呼ばれる）が `decode_row` と同じ結果（embedding・metadata）を返すことを
+    // 確認する。
+    #[test]
+    fn decode_row_embedding_and_metadata_into_matches_full_decode() {
+        let embedding = [1.0_f32, -2.5, 0.0, 3.75];
+        let metadata = b"scalar-columns";
+        let buf = sample_row(&embedding, metadata);
+
+        let full = decode_row(1, &buf).expect("full decode");
+
+        let mut scratch: Vec<f32> = Vec::new();
+        let (dim, borrowed_metadata) =
+            decode_row_embedding_and_metadata_into(&buf, &mut scratch).expect("borrowed decode");
+
+        assert_eq!(dim, embedding.len() as u32);
+        assert_eq!(scratch, full.embedding);
+        assert_eq!(borrowed_metadata, full.metadata.as_slice());
+    }
+
+    // 呼び出し元（`arena.rs`）は 1 本の `scratch: Vec<f32>` を可視行の走査ループ全体で
+    // 使い回す契約（構築時は行数分の `Vec<f32>` を個別確保しない設計。上記対応
+    // Issue 参照）。同一次元の行を 2 回デコードしても capacity が伸長しない
+    // （＝2 回目の呼び出しで再確保が発生しない）ことを、既存の
+    // `decode_row_tenant_and_visibility_borrows_from_input_buffer` と同じ「ポインタ／
+    // capacity に基づく確保有無の証明」方針（本ファイル上部のコメント参照。
+    // `#[global_allocator]` によるカウントは並列テスト下で非決定的になりやすく
+    // 依存追加も避けたいため採用しない、という既存方針を踏襲する）で確認する。
+    #[test]
+    fn decode_row_embedding_and_metadata_into_reuses_scratch_capacity_across_calls() {
+        let dim = 8;
+        let embedding_a: Vec<f32> = (0..dim).map(|i| i as f32).collect();
+        let embedding_b: Vec<f32> = (0..dim).map(|i| -(i as f32)).collect();
+        let buf_a = sample_row(&embedding_a, b"a");
+        let buf_b = sample_row(&embedding_b, b"bb");
+
+        let mut scratch: Vec<f32> = Vec::new();
+        decode_row_embedding_and_metadata_into(&buf_a, &mut scratch).expect("decode row a");
+        let capacity_after_first = scratch.capacity();
+        let ptr_after_first = scratch.as_ptr();
+        assert!(
+            capacity_after_first >= embedding_a.len(),
+            "first decode must reserve at least dim capacity"
+        );
+
+        decode_row_embedding_and_metadata_into(&buf_b, &mut scratch).expect("decode row b");
+        // capacity の一致だけでは「たまたま同じ大きさで再確保した」場合を見逃す
+        // （新しい確保・解放のポインタが偶然一致する可能性は排除できないが、通常の
+        // アロケータでは同一プロセス内の確保直後に同一ポインタが再利用されることは
+        // 稀であり、実装が誤って毎回新しい `Vec` を作る退行へ落ちた場合はほぼ確実に
+        // ポインタが変わる）。ポインタ同一性を主な証拠、capacity 一致を補助的な
+        // 証拠として両方確認する。
+        assert_eq!(
+            scratch.as_ptr(),
+            ptr_after_first,
+            "同一次元の 2 回目の呼び出しでバッファの確保先ポインタが変わっては \
+             ならない（行ごとの新規ヒープ確保を避ける契約。Issue #314）"
+        );
+        assert_eq!(
+            scratch.capacity(),
+            capacity_after_first,
+            "同一次元の 2 回目の呼び出しで capacity が伸長してはならない"
+        );
+        assert_eq!(
+            scratch, embedding_b,
+            "2 回目の呼び出し後は最新行の embedding を保持する"
+        );
+    }
+
+    // Issue #314 レビュー指摘（Low）: `decode_row_embedding_and_metadata_into` の
+    // fail-closed 分岐（オーバーフロー安全・MAX_EMBEDDING_DIM・MAX_METADATA_LEN 上限・
+    // trailing bytes 検証）は既存 `decode_row` と同一のはずだが、テストは正常系
+    // （`_matches_full_decode`・`_reuses_scratch_capacity_across_calls`）のみで
+    // 拒否系のテストカバレッジが無かった。`decode_row` の既存拒否系テスト
+    // （`decode_row_rejects_oversized_dim_without_allocating`・
+    // `decode_row_rejects_trailing_garbage`・`encode_row_rejects_oversized_metadata`）と
+    // 対になる形で、`decode_row` と `decode_row_embedding_and_metadata_into` の両方が
+    // 同じ入力を fail-closed で拒否することを確認する。
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_oversized_dim_without_allocating() {
+        // dim をアロケーション上限より大きい値に書き換えたバッファ。
+        // `decode_row_embedding_and_metadata_into` は `out_embedding.reserve` を呼ぶ前に
+        // dim の上限検証で拒否するべき（decode_row_rejects_oversized_dim_without_allocating
+        // と同じ意図）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let oversized = MAX_EMBEDDING_DIM + 1;
+        // レイアウト: [version(1)][tenant_len(2)]["tenant-a"(8)][visibility(1)][dim(4)]。
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        buf[dim_offset..dim_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_oversized_metadata_len() {
+        // metadata_len フィールドを MAX_METADATA_LEN 超過に書き換え、実バッファは
+        // 追随させない（decode_row 側でも metadata_len 検証はバッファ長に依らず
+        // フィールド値のみで先に拒否される契約）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let metadata_len_offset = dim_offset + 4 + 4; // dim=1 分の embedding バイト列（4 バイト）後
+        let oversized = MAX_METADATA_LEN + 1;
+        buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_trailing_garbage() {
+        let mut buf = sample_row(&[1.0], b"m");
+        buf.push(0);
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_embedding_and_metadata_into(&buf, &mut scratch).is_err());
+    }
+
+    #[test]
+    fn decode_row_embedding_and_metadata_into_rejects_truncated_buffer() {
+        // embedding フィールドの途中でバッファを切り詰める（dim=2 を宣言しつつ
+        // embedding バイト列を 1 要素分しか持たない）。
+        let buf = sample_row(&[1.0, 2.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let truncated = &buf[..dim_offset + 4 + 4]; // dim フィールド + embedding 4 バイトのみ
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row(1, truncated).is_err());
+        assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
     }
 
     // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な
