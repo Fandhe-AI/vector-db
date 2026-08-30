@@ -1,6 +1,8 @@
 # `USING PLAN` が実 Ollama 経由で SQL エラーなしに 0 行を返す事象の調査
 
-- ステータス: Accepted
+- ステータス: Accepted（決定的フィクスチャでの再現・切り分け手順の確定という範囲。
+  実 Ollama・実埋め込みサービスでの `mode` 値・出力そのものの確認は未実施。
+  下記「検証結果」「実 Ollama 環境での再現・切り分け手順」参照）
 - 対応: Issue #315
 - 前提: TASK-117（PLAN-9 確定化の層 A。`crates/wire-server/tests/wire_using_plan.rs`）・
   TASK-77（SQL-5。`sql::using_plan::bind_expansion`）・TASK-111（PLAN-1。ソフトブースト
@@ -25,7 +27,7 @@ SQL エラーなしで毎回 0 行が返る。同一 DB に対する平易な `O
 
 | # | 仮説 | 読解結果 | 判定 |
 | - | ---- | -------- | ---- |
-| H1 | プランナーの `mode_hint`（PLAN-11）が `precision` を返し、`precision` の確信度ゲート（SEARCH-9）が空集合へ倒している | `query_planner.rs` の展開結果パースは `mode` フィールド（`"precision"`／`"recall"`／`null`）を受理する。明示 `USING MODE`／`SET search_mode` が無い場合、`sql/mode.rs::resolve_mode_with_planner` はプランナー推定を採用する。`precision` モードの確信度ゲートは正規化 RRF スコアに下限を課すため、密・疎の 1 位が食い違うと最良スコアが下限を下回り **0 行**になりうる。この経路は SQL エラーを発生させず `CommandComplete("SELECT 0")` になる | **確認済み**（下記「検証結果」参照） |
+| H1 | プランナーの `mode_hint`（PLAN-11）が `precision` を返し、`precision` の確信度ゲート（SEARCH-9）が空集合へ倒している | `query_planner.rs` の展開結果パースは `mode` フィールド（`"precision"`／`"recall"`／`null`）を受理する。明示 `USING MODE`／`SET search_mode` が無い場合、`sql/mode.rs::resolve_mode_with_planner` はプランナー推定を採用する。`precision` モードの確信度ゲートは正規化 RRF スコアに下限を課すため、密・疎の 1 位が食い違うと最良スコアが下限を下回り **0 行**になりうる。この経路は SQL エラーを発生させず `CommandComplete("SELECT 0")` になる | **決定的フィクスチャで再現・確認済み**（実 Ollama・実埋め込みサービスでの確認は未実施。下記「検証結果」参照） |
 | H2 | 疎チャネル 0 件のとき密のみへ縮退できていない | `hybrid_search`／`rrf_fuse_with_limits` は空スライスを許容し、疎 0 件時は密のみへ縮退する契約（SEARCH-3）。単独では 0 行の原因にならない | 棄却（H1 と独立） |
 | H3 | `path_hint`/`kind_hint` がハードフィルタ化している | `sql::using_plan::bind_expansion` は両ヒントを読まず、`sql/exec.rs` へのソフトブースト結線も未実装（TASK-111 の対象外）。フィルタ化する経路は存在しない | 棄却 |
 | H4 | 密プール境界の同点グループ除外（Issue #310・#320）で密が空になる | 小規模コーパス（可視行が `MAX_FETCH_K` 以下）では `complete_boundary_tie_group_by` が常に `Resolved` を返す。除外は非 exhaustive（大規模スケール）時のみ | 棄却（本事象の小規模条件には該当しない） |
@@ -54,14 +56,16 @@ using_plan_wire_precision_hint_returns_zero_rows_then_recall_override_returns_ro
 → `ReadyForQuery`（エラー応答を経由しない・接続継続）→ 同一接続での `USING MODE 'recall'`
 再送で `SELECT 2`。
 
-この結果は Issue の観測（エラーなし・0 行・複数回とも同じ）と整合する。**0 行は
-「プランナー推定 `precision` → 確信度ゲートによる空集合の通常応答」という既存契約
-（SEARCH-9）どおりの挙動であり、SEARCH-3（融合が単体チャネルを下回らない）違反ではない。**
-
-ただし、この確認はあくまで決定的スタブ `LlmClient`・決定的 `Embedder` を用いた
-engine/wire レベルの再現であり、実 Ollama が実際に返した `mode` フィールドの値・
-実埋め込みサービスの出力そのものは確認していない（受け入れ条件によりモデル名・
-LLM 応答本文は記録しない）。したがって以下の再現手順で実環境側を切り分けることを推奨する。
+この決定的フィクスチャの結果は、Issue の観測（エラーなし・0 行・複数回とも同じ）と
+**矛盾しない**（同じ「エラーなし・0 行」という外形を、確信度ゲート経路だけで再現できる
+ことを示した）。**0 行は「プランナー推定 `precision` → 確信度ゲートによる空集合の通常応答」
+という既存契約（SEARCH-9）どおりの挙動として説明可能であり、実 Ollama 環境でも同じ経路が
+働いているというのが本ドキュメントの最有力仮説である。** ただし、この確認はあくまで決定的
+スタブ `LlmClient`・決定的 `Embedder` を用いた engine/wire レベルの再現であり、実 Ollama が
+実際に返した `mode` フィールドの値・実埋め込みサービスの出力そのものは確認していない（受け
+入れ条件によりモデル名・LLM 応答本文は記録しない）。したがって Issue #315 の実事象が
+本当にこの経路によるものかは**未確定**であり、SEARCH-3 違反ではないと断定することもできない。
+以下の再現手順で実環境側を切り分けるまでは、H1 を「原因候補」として扱う。
 
 ## 実 Ollama 環境での再現・切り分け手順
 
@@ -87,10 +91,13 @@ LLM 応答本文は記録しない）。したがって以下の再現手順で�
 
 - production コード（`crates/engine/src/**`・`crates/wire-server/src/**`）は変更しない。
   上記「検証結果」により、決定的フィクスチャの範囲では 0 行が SEARCH-9 の契約どおりの
-  挙動であることを確認済み
+  挙動として再現できることを確認済み。ただし実 Ollama 環境での `mode` 値・実埋め込み
+  出力そのものは未確認であり、Issue #315 の実事象がこの経路によるものかは**未確定**
+  （原因候補・最有力仮説の位置づけ）
 - 「`EXPLAIN` が `mode: precision`」を再現手順の切り分け基準として明文化し、
   `mode: recall` でも 0 行が再現する場合は別経路の欠陥として扱う二分岐をドキュメント化した
-  （本ドキュメントは前者の分岐を確定させるのみで、後者を否定するものではない）
+  （本ドキュメントは前者の分岐が主原因候補であることを示すのみで、実環境での確定・
+  後者の可能性の否定のいずれも行わない）
 
 ## スコープ外（本 Issue では対応しない。起票はオーナー判断）
 
