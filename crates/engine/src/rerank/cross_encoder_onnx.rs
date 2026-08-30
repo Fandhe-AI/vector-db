@@ -32,7 +32,8 @@ use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
 
 use super::{
-    CrossEncoderBackend, CrossEncoderError, MAX_CROSS_ENCODER_BATCH_SIZE, MAX_CROSS_ENCODER_SEQ_LEN,
+    CrossEncoderBackend, CrossEncoderError, MAX_CANDIDATE_TEXT_BYTES, MAX_CROSS_ENCODER_BATCH_SIZE,
+    MAX_CROSS_ENCODER_SEQ_LEN, MAX_QUERY_TEXT_BYTES, MAX_TOTAL_CANDIDATE_TEXT_BYTES,
 };
 
 /// `ort`（ONNX Runtime）+ `tokenizers` による実推論バックエンド。
@@ -133,6 +134,48 @@ impl OnnxCrossEncoderBackend {
     }
 }
 
+/// codex-review 指摘（PR #336 P1、threadId: PRRT_kwDOUAKASM6dkqJv）への対応:
+/// [`OnnxCrossEncoderBackend::score_pairs`] は `CrossEncoderReranker::rerank`
+/// （`rerank_candidates` 経由の `MAX_QUERY_TEXT_BYTES`/`MAX_CANDIDATE_TEXT_BYTES`/
+/// 合計長検証）を介さず `CrossEncoderBackend` として直接呼び出せる公開経路のため、
+/// ここでも同じバイト長上限を `Tokenizer::encode_batch` へ渡す前に fail-closed で
+/// 強制する。truncation はトークナイズ後のシーケンス長のみを制限し、巨大な原文の
+/// 走査・中間割り当て（`encode_batch` 内部のバイト単位の正規化・分割処理）を
+/// 有界化しないため、この検証を怠ると未検証の巨大原文によるメモリ／CPU 枯渇
+/// （DoS）を許してしまう。すべて checked 加算で判定し、オーバーフローも拒否側へ
+/// 倒す。`score_pairs` 本体から切り出した独立関数（`OnnxCrossEncoderBackend` の
+/// 構築＝実 ONNX dylib／モデルファイルを要さずに単体テストできるようにするため）。
+fn validate_pair_text_lengths(query: &str, passages: &[&str]) -> Result<(), CrossEncoderError> {
+    if query.len() > MAX_QUERY_TEXT_BYTES {
+        return Err(CrossEncoderError::QueryTextTooLong {
+            len: query.len(),
+            max: MAX_QUERY_TEXT_BYTES,
+        });
+    }
+    if let Some(oversized) = passages.iter().find(|p| p.len() > MAX_CANDIDATE_TEXT_BYTES) {
+        return Err(CrossEncoderError::CandidateTextTooLong {
+            len: oversized.len(),
+            max: MAX_CANDIDATE_TEXT_BYTES,
+        });
+    }
+    let total_candidate_bytes = passages
+        .iter()
+        .try_fold(0usize, |acc, p| acc.checked_add(p.len()));
+    match total_candidate_bytes {
+        Some(total) if total > MAX_TOTAL_CANDIDATE_TEXT_BYTES => {
+            Err(CrossEncoderError::TotalCandidateTextTooLong {
+                total,
+                max: MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+            })
+        }
+        None => Err(CrossEncoderError::TotalCandidateTextTooLong {
+            total: usize::MAX,
+            max: MAX_TOTAL_CANDIDATE_TEXT_BYTES,
+        }),
+        Some(_) => Ok(()),
+    }
+}
+
 impl CrossEncoderBackend for OnnxCrossEncoderBackend {
     fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f64>, CrossEncoderError> {
         if passages.is_empty() {
@@ -153,6 +196,9 @@ impl CrossEncoderBackend for OnnxCrossEncoderBackend {
                 max: MAX_CROSS_ENCODER_BATCH_SIZE,
             });
         }
+
+        // 上記 `validate_pair_text_lengths` のドキュメント参照。
+        validate_pair_text_lengths(query, passages)?;
 
         // (query, passage) ペアをクロスエンコーダの規範形（sentence-pair）で
         // トークナイズする。`add_special_tokens = true` で [CLS]/[SEP] 等を付与する。
@@ -291,5 +337,74 @@ mod tests {
                 "expected TruncationFailed error for max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN"
             ),
         }
+    }
+
+    /// codex-review 指摘（PR #336 P1、threadId: PRRT_kwDOUAKASM6dkqJv）の固定テスト:
+    /// `score_pairs` が `encode_batch` へ渡す前に `query` のバイト長を
+    /// `MAX_QUERY_TEXT_BYTES` で拒否することを、実 ONNX バックエンドを構築せずに
+    /// 検証する（`validate_pair_text_lengths` は `OnnxCrossEncoderBackend` の状態に
+    /// 依存しない自由関数のため）。
+    #[test]
+    fn validate_pair_text_lengths_rejects_oversized_query() {
+        let oversized_query = "a".repeat(MAX_QUERY_TEXT_BYTES + 1);
+        let passages = ["passage"];
+        match validate_pair_text_lengths(&oversized_query, &passages) {
+            Err(CrossEncoderError::QueryTextTooLong { len, max }) => {
+                assert_eq!(len, MAX_QUERY_TEXT_BYTES + 1);
+                assert_eq!(max, MAX_QUERY_TEXT_BYTES);
+            }
+            other => panic!("expected QueryTextTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_pair_text_lengths_accepts_boundary_query() {
+        let boundary_query = "a".repeat(MAX_QUERY_TEXT_BYTES);
+        let passages = ["passage"];
+        assert!(validate_pair_text_lengths(&boundary_query, &passages).is_ok());
+    }
+
+    #[test]
+    fn validate_pair_text_lengths_rejects_oversized_passage() {
+        let oversized_passage = "a".repeat(MAX_CANDIDATE_TEXT_BYTES + 1);
+        let passages = [oversized_passage.as_str()];
+        match validate_pair_text_lengths("query", &passages) {
+            Err(CrossEncoderError::CandidateTextTooLong { len, max }) => {
+                assert_eq!(len, MAX_CANDIDATE_TEXT_BYTES + 1);
+                assert_eq!(max, MAX_CANDIDATE_TEXT_BYTES);
+            }
+            other => panic!("expected CandidateTextTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_pair_text_lengths_accepts_boundary_passage() {
+        let boundary_passage = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        let passages = [boundary_passage.as_str()];
+        assert!(validate_pair_text_lengths("query", &passages).is_ok());
+    }
+
+    /// 個々の passage は上限以下でも、合計バイト長が
+    /// `MAX_TOTAL_CANDIDATE_TEXT_BYTES` を超える場合に拒否することを確認する。
+    #[test]
+    fn validate_pair_text_lengths_rejects_oversized_total() {
+        // 1 件あたり MAX_CANDIDATE_TEXT_BYTES ぎりぎりの passage を複数束ね、
+        // 合計だけが MAX_TOTAL_CANDIDATE_TEXT_BYTES を超えるようにする。
+        let per_passage = "a".repeat(MAX_CANDIDATE_TEXT_BYTES);
+        let count = MAX_TOTAL_CANDIDATE_TEXT_BYTES / MAX_CANDIDATE_TEXT_BYTES + 1;
+        let passages: Vec<&str> = std::iter::repeat_n(per_passage.as_str(), count).collect();
+        match validate_pair_text_lengths("query", &passages) {
+            Err(CrossEncoderError::TotalCandidateTextTooLong { total, max }) => {
+                assert_eq!(max, MAX_TOTAL_CANDIDATE_TEXT_BYTES);
+                assert!(total > MAX_TOTAL_CANDIDATE_TEXT_BYTES);
+            }
+            other => panic!("expected TotalCandidateTextTooLong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_pair_text_lengths_accepts_small_batch() {
+        let passages = ["short passage one", "short passage two"];
+        assert!(validate_pair_text_lengths("short query", &passages).is_ok());
     }
 }

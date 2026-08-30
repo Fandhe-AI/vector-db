@@ -759,6 +759,17 @@ pub enum CrossEncoderError {
     /// 構築を許すと、推論経路の実際の truncation 上限と無関係な設定値を掲げること
     /// になり、DoS／メモリ上限の有界化を保証できない（Issue #333 codex-review 指摘）。
     BackendSeqLenMismatch { backend: usize, configured: usize },
+    /// codex-review 指摘（PR #336 P1）: `query` のバイト長が [`MAX_QUERY_TEXT_BYTES`]
+    /// を超える。`CrossEncoderReranker` を介さず [`CrossEncoderBackend::score_pairs`]
+    /// を直接呼ぶ利用者に対しても、`rerank_candidates`（`validate_text_lengths`）と
+    /// 同じ上限をトークナイズ前に強制し、巨大な原文の走査・中間割り当てを
+    /// 有界化する（fail-closed）。
+    QueryTextTooLong { len: usize, max: usize },
+    /// 同上。`passages` 中の 1 件が [`MAX_CANDIDATE_TEXT_BYTES`] を超える。
+    CandidateTextTooLong { len: usize, max: usize },
+    /// 同上。`passages` 全体の合計バイト長が [`MAX_TOTAL_CANDIDATE_TEXT_BYTES`]
+    /// を超える（checked 加算。オーバーフローも同じエラーへ丸めて拒否する）。
+    TotalCandidateTextTooLong { total: usize, max: usize },
 }
 
 impl fmt::Display for CrossEncoderError {
@@ -786,6 +797,18 @@ impl fmt::Display for CrossEncoderError {
             } => write!(
                 f,
                 "cross-encoder backend max_seq_len ({backend}) does not match configured max_seq_len ({configured})"
+            ),
+            CrossEncoderError::QueryTextTooLong { len, max } => write!(
+                f,
+                "cross-encoder query text too long: {len} bytes (max {max})"
+            ),
+            CrossEncoderError::CandidateTextTooLong { len, max } => write!(
+                f,
+                "cross-encoder candidate text too long: {len} bytes (max {max})"
+            ),
+            CrossEncoderError::TotalCandidateTextTooLong { total, max } => write!(
+                f,
+                "cross-encoder total candidate text too long: {total} bytes (max {max})"
             ),
         }
     }
