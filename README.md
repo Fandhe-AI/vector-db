@@ -187,6 +187,34 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
 `docs/design/hybrid-refetch-latency.md` を参照してください。
 
+### クロスエンコーダリランカーの実測手順（Issue #333）
+
+`make rerank-cross-encoder-eval`（`crates/engine/tests/rerank_cross_encoder_recall.rs`。
+`cross-encoder` feature 限定）は、実 ONNX 推論バックエンド
+`OnnxCrossEncoderBackend`（`crates/engine/src/rerank/cross_encoder_onnx.rs`）
+による自然言語 fixture（`tests/fixtures/nl_qa.rs`）上の Recall@20 実測を行います。
+`bench-tier` と同様に CI には配線せず、運用者が手動実行します。
+
+以下の環境変数が必要です（値そのものは含みません。未設定の場合は明確な
+エラーメッセージとともに fail します）:
+
+- `ORT_DYLIB_PATH`: onnxruntime 共有ライブラリ（`libonnxruntime.so` 等）へのパス
+- `CROSS_ENCODER_MODEL_PATH`: ONNX 形式のクロスエンコーダモデルファイルへのパス
+- `CROSS_ENCODER_TOKENIZER_PATH`: 対応する `tokenizer.json` へのパス
+
+```bash
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+export CROSS_ENCODER_MODEL_PATH=/path/to/model.onnx
+export CROSS_ENCODER_TOKENIZER_PATH=/path/to/tokenizer.json
+make rerank-cross-encoder-eval
+```
+
+モデル・トークナイザ・onnxruntime 共有ライブラリはいずれもリポジトリへ
+コミットしません。運用者が別途取得してください（実測で使用したモデル・
+ライセンス・実測値・原因分析は `docs/design/rerank-recall-regression.md`
+「Issue #333 追記」節を参照してください）。`GITHUB_ACTIONS` が設定された
+実行環境では起動直後に fail-closed で拒否します。
+
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`

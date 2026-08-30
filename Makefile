@@ -298,6 +298,18 @@ else
 endif
 
 # --------------------------------------------------
+# クロスエンコーダリランカー実測（Issue #333・SEARCH-7。crates/engine/tests/rerank_cross_encoder_recall.rs）
+# --------------------------------------------------
+
+.PHONY: rerank-cross-encoder-eval
+rerank-cross-encoder-eval: ## Issue #333（SEARCH-7 方式変更）の実 ONNX クロスエンコーダによる自然言語 fixture 実測を実行する（手動・ローカル専用。ci には含めない。CROSS_ENCODER_MODEL_PATH・CROSS_ENCODER_TOKENIZER_PATH・ORT_DYLIB_PATH の環境変数指定が必要。実測値・再現手順は docs/design/rerank-recall-regression.md「Issue #333」節参照）
+ifdef HAS_CARGO
+	cargo test --release -p engine --features cross-encoder --test rerank_cross_encoder_recall -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため rerank-cross-encoder-eval をスキップ"
+endif
+
+# --------------------------------------------------
 # ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
 # --------------------------------------------------
 
