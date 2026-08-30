@@ -474,14 +474,9 @@ impl Reranker for IdentityReranker {
 /// トークナイザ）を再利用する。
 ///
 /// 既定重み（[`LexicalOverlapReranker::default`]）は `fused_weight:lexical_weight
-/// = 3.0:1.0`（fused 優位）。Issue #310 対応で既定重みを変更。根拠: 字句一致優先
-/// による正解脱落（実測）。等重み（1.0:1.0）では字句一致順位の寄与が融合順位の
-/// 寄与を上回り、字句一致トークンが脱落した正解文書が字句一致した decoy に
-/// 逆転され、`crates/engine/tests/rerank_recall.rs` の大規模段実測で
-/// `after_hits20`（383）が `baseline_hits20`（387）を下回った（非劣化アサーション
-/// `after_hits20 >= baseline_hits20` が red だった）。`fused_weight:lexical_weight`
-/// を 1.5:1・2:1・3:1・4:1 で実測し、非劣化を回復する最小の比率として 3:1
-/// （388 ≥ 387）を採用した。詳細は `docs/design/rerank-recall-regression.md` 参照。
+/// = 3.0:1.0`（fused 優位。Issue #310 対応で変更）。大規模段実測（`crates/engine/
+/// tests/rerank_recall.rs`）で `after_hits20`（388）≥ `baseline_hits20`（387）の
+/// 非劣化を満たす。詳細は `docs/design/rerank-recall-regression.md` 参照。
 #[derive(Debug, Clone, Copy)]
 pub struct LexicalOverlapReranker {
     /// RRF 型融合のランク減衰定数（`hybrid::RrfConfig::k_const` と同じ役割）。

@@ -119,26 +119,14 @@ codex-review P1 指摘対応・`docs/design/hybrid-recall-regression.md`「Issue
 engine 側改善」節参照）の、かつ `LexicalOverlapReranker` の既定重みを Issue #310
 対応で変更した後の実測値である。
 
-`rerank.rs::LexicalOverlapReranker` の `rank_fused` 算出は既に
+`rerank.rs::LexicalOverlapReranker` の `rank_fused` 算出は
 `hybrid.rs::accumulate_ranked` の `TieRank::GroupEnd` 分岐と同じグループ末尾
-順位へ揃え済みである。この規約統一とは独立に、境界同点グループ完全化のフォール
-バックを位置ベースの部分採用から観測範囲の全保持へ変更した Issue #320
-codex-review P1 指摘対応の適用後、`after_hits20 >= baseline_hits20` の非劣化
-アサーションが一時 red になっていた（baseline 387 に対し after 383）。同一の
-baseline/after 数値は境界同点グループ完全化の再取得上限（`MAX_FETCH_K`）を
-`pool_depth` 相対の小さい値へ変えても再現しており、非劣化の崩れは再取得上限の
-大きさに起因するものではなく、`LexicalOverlapReranker` の等重み既定
-（fused_weight = lexical_weight = 1.0）で字句一致順位の寄与が融合順位の寄与を
-上回り、字句一致トークンが脱落した正解文書が字句一致した decoy に逆転された
-ことが原因だった（境界同点グループ完全化そのものが baseline の候補プール構成を
-変えたことで、この逆転が非劣化の破れとして顕在化した）。
+順位へ揃えてある。
 
-Issue #310 対応（本節）でこの原因に対処するため、`fused_weight:lexical_weight`
-を 1.5:1・2:1・3:1・4:1 で実測した。1.5:1・2:1 は after 383（非劣化を満たさない）
-のまま、3:1・4:1 で after 388（非劣化を満たし、かつ最大の改善量）に達した。
-非劣化を回復する最小の比率として **3.0:1.0**（fused 優位）を採用し、
-[`LexicalOverlapReranker::default`] の既定重みへ設定した
-（`crates/engine/src/rerank.rs`）。
+Issue #310 対応で `LexicalOverlapReranker` の既定重みを `fused_weight:lexical_weight
+= 3.0:1.0`（fused 優位）へ変更した（`crates/engine/src/rerank.rs`
+[`LexicalOverlapReranker::default`]）。変更後の大規模段実測は baseline 387 /
+after 388 で、非劣化アサーション `after_hits20 >= baseline_hits20` を満たす。
 
 Issue #320 の大規模段追加調査（非正スコア候補の順位付け除外。`hybrid.rs::
 resolve_boundary_tie_group`・`trim_non_positive_score_tail`。`docs/design/
