@@ -645,29 +645,23 @@ impl Reranker for LexicalOverlapReranker {
         // 「Issue #330」節参照。
         overlap_ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
 
-        let mut rank_lexical_by_idx = vec![0usize; overlap_ranked.len()];
-        let mut group_idx = 0usize;
-        while group_idx < overlap_ranked.len() {
-            let group_overlap = overlap_ranked[group_idx].2;
-            let mut group_end = group_idx + 1;
-            while group_end < overlap_ranked.len() && overlap_ranked[group_end].2 == group_overlap {
-                group_end += 1;
-            }
-            for slot in rank_lexical_by_idx
-                .iter_mut()
-                .take(group_end)
-                .skip(group_idx)
-            {
-                *slot = group_end;
-            }
-            group_idx = group_end;
+        // 添字アクセスを避けるため `chunk_by` で overlap 同点グループを連続部分
+        // スライスへ分割し、各グループへグループ末尾の 1-based 順位を一括付与する
+        // （`rerank_candidates` は wire/SQL 表層から到達しうる経路であり、
+        // coding-rust.md の untrusted 入力経路での添字アクセス禁止に合わせる）。
+        let mut rank_lexical_by_idx: Vec<usize> = Vec::with_capacity(overlap_ranked.len());
+        let mut consumed = 0usize;
+        for group in overlap_ranked.chunk_by(|a, b| a.2 == b.2) {
+            consumed += group.len();
+            rank_lexical_by_idx.extend(std::iter::repeat_n(consumed, group.len()));
         }
 
         let mut scores: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
-        for (idx, (id, rank_fused, _)) in overlap_ranked.iter().enumerate() {
-            let rank_lexical = rank_lexical_by_idx[idx];
+        for ((id, rank_fused, _), rank_lexical) in
+            overlap_ranked.iter().zip(rank_lexical_by_idx.iter())
+        {
             let contribution_fused = self.fused_weight / (self.k_const + *rank_fused as f64);
-            let contribution_lexical = self.lexical_weight / (self.k_const + rank_lexical as f64);
+            let contribution_lexical = self.lexical_weight / (self.k_const + *rank_lexical as f64);
             let entry = scores.entry(*id).or_insert(0.0);
             *entry += contribution_fused + contribution_lexical;
         }
