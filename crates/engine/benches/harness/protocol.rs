@@ -225,10 +225,15 @@ pub fn run_fallible<T, E: std::fmt::Display>(
         measured_attempts += 1;
         let start = Instant::now();
         let result = black_box(workload());
-        let elapsed = start.elapsed();
         match result {
+            // 成功値は `run` と同じく所有値を `black_box` へ渡して計測区間の内側で
+            // drop してから `elapsed` を取る（codex-review 指摘・PR #329。以前は
+            // `elapsed()` 取得後に `black_box(&v)` していたため drop が計測区間外に
+            // なり、ヒープ所有値を返す workload では `run` より短い値を記録して
+            // A/B 比較を歪めていた）。
             Ok(v) => {
-                black_box(&v);
+                black_box(v);
+                let elapsed = start.elapsed();
                 samples.push(elapsed);
             }
             Err(e) => match classify(&e) {
