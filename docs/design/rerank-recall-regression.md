@@ -46,10 +46,8 @@ after を測定することで、コーパス・プール生成のばらつき�
   hits100/hits200 を固定値アサーションで回帰トラッキングする。spec の数値基準は
   使わないため public 資産に閾値を持ち込まない。「after が baseline を下回らない」
   非劣化アサーション（`after_hits20 >= baseline_hits20`）も層 A に含む
-  （`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモ参照。Issue #320
-  codex-review P1 指摘対応で `rerank.rs::LexicalOverlapReranker` の `rank_fused`
-  算出を `hybrid.rs` 側の同点順位規約と揃えたことで回復した経緯は下記
-  「実測結果」節）
+  （`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモ参照。現在の
+  実測状況は下記「実測結果」節）
 - **層 B**（`#[ignore]`。`make rerank-regression` 経由）: spec 由来の Recall 下限
   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
@@ -95,8 +93,9 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 
 ## 実測結果
 
-（`crates/engine/tests/rerank_recall.rs`、層 A 1/1 pass。決定的コーパスのため
-再現可能。hit 数は同テストのアサーションに固定済み）
+（`crates/engine/tests/rerank_recall.rs`、層 A の固定値アサーションは実測値へ
+更新済み。決定的コーパスのため再現可能。非劣化アサーション
+`after_hits20 >= baseline_hits20` は現在 red。詳細は下記）
 
 | 指標 | 値 |
 | ---- | -- |
@@ -104,34 +103,34 @@ production API（[`SparseIndex::build`]・[`ParallelSearchProvider`]・
 | QA 件数 | 100 |
 | total_correct | 1,049 |
 | ceil20 | 410 |
-| baseline hits20（リランキングなし） | 383 |
+| baseline hits20（リランキングなし） | 387 |
 | after hits20（リランキングあり） | 383 |
-| baseline Recall@20 | 0.9341 |
+| baseline Recall@20 | 0.9439 |
 | after Recall@20 | 0.9341 |
-| 改善量（after − baseline） | 0.0000 |
-| ceil100 / pool hits100 | 913 / 821（Recall@100 = 0.8992） |
-| ceil200 / pool hits200 | 1,049 / 949（Recall@200 = 0.9047） |
+| 改善量（after − baseline） | −0.0098 |
+| ceil100 / pool hits100 | 913 / 837（Recall@100 = 0.9168） |
+| ceil200 / pool hits200 | 1,049 / 951（Recall@200 = 0.9066） |
 
-上表は Issue #320（`hybrid.rs::complete_boundary_tie_group_by` の境界同点グループ
-完全化フォールバックを「丸ごと除外」から「観測範囲を保持し位置ベースで
-`pool_depth` 件へ切り詰め」へ変更・`docs/design/hybrid-recall-regression.md`
-「Issue #310: engine 側改善」節参照）適用後の実測値である。
+上表は `hybrid.rs::complete_boundary_tie_group_by` の境界同点グループ完全化を
+「終端未確定時は再取得ループ（`fetch_k` 倍増）で終端確定を試み、再取得の上限に
+達してもなお未確定なら観測範囲を全保持する」契約へ変更した後（Issue #320
+codex-review P1 指摘対応・`docs/design/hybrid-recall-regression.md`「Issue #310:
+engine 側改善」節参照）の実測値である。
 
-この Issue #320 対応の一部として、`rerank.rs::LexicalOverlapReranker` の
-`rank_fused` 算出も、候補配列の位置順位（`idx + 1`）から
+`rerank.rs::LexicalOverlapReranker` の `rank_fused` 算出は既に
 `hybrid.rs::accumulate_ranked` の `TieRank::GroupEnd` 分岐と同じグループ末尾
-順位へ揃えた（codex-review P1 指摘）。変更前（Issue #310 適用直後・`rank_fused`
-がまだ位置順位のまま）は baseline hits20=386・after hits20=382（改善量
-−0.0098）であり、Issue #310 が baseline（リランキング前の生の融合順位）を
-大きく改善した一方、暫定リランカー（[`LexicalOverlapReranker`]。字句一致順位と
-融合スコア順位を RRF 型で再結合する参照実装）が同点グループを跨ぐ候補間で
-本来ゼロであるべき順位差を字句一致寄与へ混入させ、after が baseline を −4 件
-下回る非劣化の崩れが生じていた。`rank_fused` の規約を揃えたことでこの崩れは
-解消し、本フィクスチャでは after が baseline と一致する（`after_hits20 >=
-baseline_hits20` の非劣化アサーションを層 A へ復元した。
-`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモも参照）。
+順位へ揃え済みである。この規約統一とは独立に、`after_hits20 >= baseline_hits20`
+の非劣化アサーションは上記の変更後 red になっている（baseline 387 に対し
+after 383）。同一の baseline/after 数値は、境界同点グループ完全化の再取得上限
+（`MAX_FETCH_K`）を `pool_depth` 相対の小さい値へ変えても再現するため、
+非劣化の崩れは再取得上限の大きさに起因するものではなく、境界同点グループを
+丸ごと保持する変更そのものが baseline（リランキング前の生の融合順位）の候補
+プール構成を変えたことに起因する。`LexicalOverlapReranker` 側の対応要否は
+オーナー判断待ちであり、本タスク（production コードは変更しない契約）の
+スコープでは非劣化アサーションを弱めずそのまま残している
+（`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモも参照）。
 
-プール自体の Recall@200（0.9047）と最終 Recall@20（after: 0.9341）を比較すると、
+プール自体の Recall@200（0.9066）と最終 Recall@20（after: 0.9341）を比較すると、
 pool_depth 200 の候補プールがすでに正解の大半を含んでおり、リランキングは
 その中の順位付けを改善する形で寄与し続けている（プールに入っていない正解＝
 Recall@200 の未達分は、リランキング以前の候補生成段（`hybrid.rs`・`sparse.rs`）

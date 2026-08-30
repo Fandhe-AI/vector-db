@@ -73,6 +73,22 @@ use crate::sparse::{ScoredDoc, SparseError, SparseIndex};
 /// （coding-rust.md「無制限確保禁止」）。
 pub(crate) const MAX_POOL_DEPTH: usize = 10_000;
 
+/// [`hybrid_search_boosted`] の境界同点グループ完全化（Issue #310・Issue #320）が
+/// 再取得（`fetch_k` を倍増しての再フェッチ）で終端確定を試みる際の `fetch_k` 上限
+/// （Issue #320 codex-review P1 指摘対応）。`pool_depth` 境界のグループが `fetch_k`
+/// 末尾まで同点で終端確定できない場合、位置ベースの `pool_depth` 件切り詰め
+/// （ID 昇順で最小 ID だけが生き残る id 依存）はせず、`fetch_k` を倍増して再取得する。
+/// この再取得は無制限には続けられない（coding-rust.md「無制限確保禁止」）ため、
+/// [`MAX_POOL_DEPTH`] を基準に上限を定める。[`MAX_POOL_DEPTH`] の 4 倍を絶対上限
+/// とし、これを [`rrf_fuse_with_limits`] の長さ上限にもそのまま使う（境界完全化で
+/// `fetch_k` を超えて保持することはないため、融合対象の長さ上限を `fetch_k` の
+/// 上限と揃えれば整合する）。可視集合が本上限より小さい構成では、通常の初期
+/// `fetch_k = pool_depth * 2` から可視集合の大きさに達するまで（本上限より先に）
+/// 倍増を繰り返す（可視集合サイズに達した時点で `exhaustive` が確定するため、
+/// それ以上の倍増は起こらない）。可視集合が本上限以上に大きい構成でのみ、
+/// 倍増が本上限で打ち切られうる。
+pub(crate) const MAX_FETCH_K: usize = MAX_POOL_DEPTH * 4;
+
 /// RRF 融合の設定（本モジュールの既定値。関連: TASK-103）。
 ///
 /// - `k_const`: RRF のランク減衰定数（一般的な既定値 60.0 を採用）。
@@ -251,14 +267,15 @@ pub enum HybridError {
     /// 本モジュールでも順序検証より先に入力の有限性を検知する（融合後の有限性検証は
     /// 加算そのものが終わった後にしか行えないため、これとは別に行う）。
     NonFiniteScore,
-    /// 融合対象の入力リスト（密・疎いずれか）の長さが `cfg.pool_depth()` を超えていた
-    /// （3 回目の codex-review P1 指摘対応）。[`rrf_fuse`] は各リストの先頭
-    /// `cfg.pool_depth()` 件のみを融合対象として使うが、以前は長さそのものを検証せず
+    /// 融合対象の入力リスト（密・疎いずれか）の長さが呼び出し元の指定する上限
+    /// （[`rrf_fuse`] からは `cfg.pool_depth()`、[`hybrid_search_boosted`] の境界
+    /// 同点グループ完全化からは再取得後の `fetch_k`。いずれも高々 [`MAX_FETCH_K`]）を
+    /// 超えていた（3 回目の codex-review P1 指摘対応）。以前は長さそのものを検証せず
     /// 全件を [`is_sorted_desc_id_asc`]・重複検査（`BTreeSet` への全件挿入）に通して
-    /// いたため、契約違反の provider・呼び出し元が `cfg.pool_depth()`（高々
-    /// `MAX_POOL_DEPTH`）を大きく超える件数を返すとその分だけ無制限にメモリ・CPU を
-    /// 消費できた（coding-rust.md「無制限確保禁止」違反）。融合前（有限性・ソート順・
-    /// 重複検査より先）に長さを検証し、超過は fail-closed に拒否する。
+    /// いたため、契約違反の provider・呼び出し元が上限を大きく超える件数を返すと
+    /// その分だけ無制限にメモリ・CPU を消費できた（coding-rust.md「無制限確保禁止」
+    /// 違反）。融合前（有限性・ソート順・重複検査より先）に長さを検証し、超過は
+    /// fail-closed に拒否する。
     TooManyCandidates { len: usize, max: usize },
     /// 密検索 `provider`（[`SearchProvider`] trait object）が、渡した
     /// `input.ids`（可視集合）に含まれない id を 1 件でも返した（provider 実装の
@@ -420,9 +437,12 @@ pub fn rrf_fuse(
 /// `dense_limit = sparse_limit = cfg.pool_depth()` で呼ぶだけの契約維持ラッパで、
 /// 既存の検証順序・エラー種別は変えない。
 ///
-/// `dense_limit`（`sparse_limit` も同様）は [`MAX_POOL_DEPTH`] 以下のみ受理する
+/// `dense_limit`（`sparse_limit` も同様）は [`MAX_FETCH_K`] 以下のみ受理する
 /// （[`RrfConfig::new`] と同じ fail-closed 検証。呼び出し元が構造体リテラル相当の
-/// 迂回で無制限な上限を渡せないようにする）。
+/// 迂回で無制限な上限を渡せないようにする）。境界同点グループ完全化（Issue #310・
+/// Issue #320）の再取得ループが `fetch_k` を `pool_depth` 超まで伸ばすことがある
+/// ため、上限は [`MAX_POOL_DEPTH`] ではなく再取得の上限である [`MAX_FETCH_K`] に
+/// 揃える。
 pub(crate) fn rrf_fuse_with_limits(
     dense: &[CandidateHit],
     dense_limit: usize,
@@ -430,7 +450,7 @@ pub(crate) fn rrf_fuse_with_limits(
     sparse_limit: usize,
     cfg: &RrfConfig,
 ) -> Result<Vec<HybridHit>, HybridError> {
-    if dense_limit > MAX_POOL_DEPTH || sparse_limit > MAX_POOL_DEPTH {
+    if dense_limit > MAX_FETCH_K || sparse_limit > MAX_FETCH_K {
         return Err(HybridError::InvalidConfig);
     }
     // 長さ検証を他のどの検証よりも先に行う。以降の検証（有限性・ソート順・重複）は
@@ -485,8 +505,9 @@ pub(crate) fn rrf_fuse_with_limits(
         return Err(HybridError::DuplicateId);
     }
 
-    // 融合マップの要素数は高々 `2 * pool_depth` に有界（`pool_depth` は
-    // `RrfConfig::new` で検証済みの値のみが渡される契約）。id をキーにした
+    // 融合マップの要素数は高々 `dense_limit + sparse_limit`（境界同点グループ完全化の
+    // 再取得により `pool_depth` を超えうるが、[`MAX_FETCH_K`] を上回ることはない
+    // 上記の長さ検証で保証済み）に有界。id をキーにした
     // `BTreeMap` を使うことで、出現順・ハッシュ実装に依存しない決定的な走査順序を
     // 保証する（同点タイブレークの安定性に寄与）。
     let mut scores: BTreeMap<u64, f64> = BTreeMap::new();
@@ -684,10 +705,13 @@ const MAX_BOOST_AMOUNT: f64 = 1.0;
 /// （coding-rust.md「長さフィールドは上限検証してからアロケーションに使う」）。
 ///
 /// 上限は [`MAX_POOL_DEPTH`] を流用する: `BoostRule` が対象とする id は
-/// [`apply_soft_boost`] が受け取る融合済みプール `hits`（高々 `cfg.pool_depth()`
-/// ≤ [`MAX_POOL_DEPTH`] 件）に含まれる id にしか実際には作用しないため、それを
-/// 超える要素数を許しても呼び出し元の実用上の意味はなく、無制限確保を許すだけの
-/// 安全弁として不要に緩い。
+/// [`apply_soft_boost`] が受け取る融合済みプール `hits`（境界同点グループ完全化の
+/// 再取得〔Issue #320〕により `cfg.pool_depth()` を超えうるが、高々
+/// `dense_limit + sparse_limit` ≤ `2 * `[`MAX_FETCH_K`] 件に有界）に含まれる id
+/// にしか実際には作用しないため、それを大きく超える要素数を許しても呼び出し元の
+/// 実用上の意味はなく、無制限確保を許すだけの安全弁として不要に緩い
+/// （`MAX_BOOST_IDS` 自体は素朴な安全弁であり、実プールの厳密な上限に追従させる
+/// 必要はない）。
 pub const MAX_BOOST_IDS: usize = MAX_POOL_DEPTH;
 
 /// `cfg`（[`RrfConfig`]）だけから、実際の融合プールの分布を見ずに算出できる
@@ -1086,96 +1110,100 @@ pub fn hybrid_search_boosted(
 
     let visible_ids: std::collections::BTreeSet<u64> = input.ids.iter().copied().collect();
 
-    // 密プール境界の同点グループ完全化（Issue #310）: `cfg.pool_depth()` ちょうどで
-    // 要求すると、境界（`pool_depth` 番目と `pool_depth + 1` 番目）が同点グループの
-    // 途中を切っている場合にグループの一部だけを取り込んでしまい、[`accumulate_ranked`]
-    // の [`TieRank::GroupEnd`] 規約がグループ全体を見られない（グループ末尾順位を
-    // 過小評価する）。`fetch_k`（`checked_mul` で `pool_depth * 2` を安全に計算し
-    // [`MAX_POOL_DEPTH`]・可視集合の大きさで有界化）で多めに取得し、
-    // [`complete_boundary_tie_group`] が境界の同点グループを完全に含めるか丸ごと
-    // 除外するかを決定的に判定する。1 回の走査で取得し、2 度目の provider 呼び出しは
-    // 行わない。
-    let fetch_k = cfg
+    // 密プール境界の同点グループ完全化（Issue #310・Issue #320）: `cfg.pool_depth()`
+    // ちょうどで要求すると、境界（`pool_depth` 番目と `pool_depth + 1` 番目）が
+    // 同点グループの途中を切っている場合にグループの一部だけを取り込んでしまい、
+    // [`accumulate_ranked`] の [`TieRank::GroupEnd`] 規約がグループ全体を見られない
+    // （グループ末尾順位を過小評価する）。初期 `fetch_k`（`pool_depth * 2`）で取得し、
+    // [`complete_boundary_tie_group`] が境界の同点グループの終端を確定できなければ
+    // （[`TieBoundary::Undetermined`]）、`fetch_k` を倍増して provider を再度呼び、
+    // 上限 [`MAX_FETCH_K`]（可視集合の大きさでも有界化）まで終端確定を試みる。
+    // 上限に達してもなお終端確定できない場合は、観測できた同点グループの全メンバーを
+    // そのまま保持する（位置ベースで `pool_depth` 件へ部分採用すると、拡張取得列は
+    // 常に同点 id 昇順のため最小 id だけが根拠なく生き残る id 依存バイアスが残る。
+    // Issue #320 codex-review P1 指摘対応）。
+    let dense_cap = MAX_FETCH_K.min(input.ids.len());
+    let mut dense_fetch_k = cfg
         .pool_depth()
         .checked_mul(2)
-        .unwrap_or(MAX_POOL_DEPTH)
-        .min(MAX_POOL_DEPTH)
-        .min(input.ids.len());
-    let dense_input = SearchInput {
-        ids: input.ids,
-        vectors: input.vectors,
-        dim: input.dim,
-        query: input.query,
-        k: fetch_k,
+        .unwrap_or(dense_cap)
+        .min(dense_cap);
+    let (dense_hits, dense_limit) = loop {
+        let dense_input = SearchInput {
+            ids: input.ids,
+            vectors: input.vectors,
+            dim: input.dim,
+            query: input.query,
+            k: dense_fetch_k,
+        };
+        // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
+        // 返さない」「要求した `k`（＝ `dense_fetch_k`）以下の件数しか返さない」ことは
+        // いずれも型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
+        let hits: Vec<CandidateHit> = provider.search(dense_input)?;
+        // 長さ検証を可視性走査より先に行う（3 回目の codex-review P1 指摘対応）。
+        // `rrf_fuse_with_limits` 自身も同じ長さ検証を行うが、ここで早期に拒否する
+        // ことで、契約違反 provider が `dense_fetch_k` を大きく超える件数を返した
+        // 場合に直後の可視性走査（`.iter().any(...)`）が不要な O(n) コストを
+        // 払わずに済む（[`HybridError::TooManyCandidates`] のドキュメント参照）。
+        if hits.len() > dense_fetch_k {
+            return Err(HybridError::TooManyCandidates {
+                len: hits.len(),
+                max: dense_fetch_k,
+            });
+        }
+        // 事後フィルタ（不可視 id だけを黙って除外する）はしない: 不可視 id が
+        // `dense_fetch_k` の候補枠を占有していた場合、フィルタ後に可視ヒットを
+        // 復元できず、結果件数の差から不可視データの有無が外部へ漏れる（2 回目の
+        // codex-review P0 指摘対応。モジュールドキュメント参照）。可視性検証は
+        // 取得した全件（拡張後の `dense_fetch_k` 件）に対して行い、境界完全化が
+        // この検証を弱めない（[`complete_boundary_tie_group`] は可視性検証を
+        // 通過した後の列にのみ作用する）。1 件でも可視集合外の id が含まれていたら
+        // 検索全体を拒否する（fail-closed）。
+        // 識別子の契約（TABLE-12 関連）: 融合キーは `input.ids`（および疎側
+        // `DocId`）が何を表すかに従う「呼び出し元定義の識別子」であり、本モジュール
+        // は行 `id` であることを前提にしない。行 `id` の一意性スコープはテナント
+        // 内に閉じている（同一 `id` の可視行が自テナントと他テナントの `Public` 行
+        // で並存しうる）ため、唯一の production 呼び出し元である `sql/exec.rs` は
+        // 行 `id` ではなくアリーナのスロット番号を渡し、同一 `id` の別テナント行が
+        // 1 エントリへ畳み込まれないようにしている（`tests/row_id_tenant_scope.rs`
+        // が固定）。
+        if hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
+            return Err(HybridError::ProviderResultRejected);
+        }
+        // 拡張取得列（`dense_fetch_k` 件。`pool_depth` を超えうる）全体に対し、
+        // 有限性・ソート順・重複 id を [`complete_boundary_tie_group`] の前に検証
+        // する（codex-review P1 指摘対応。`complete_boundary_tie_group` は境界より
+        // 内側を保持しつつ末尾側だけを切り詰める場合があり、切り詰められて消える
+        // 末尾部分は後段の [`rrf_fuse_with_limits`] の検証対象に含まれなくなる。
+        // fail-closed 方針（coding-rust.md）に従い、切り詰め前の拡張列全体を検証
+        // してから初めて [`complete_boundary_tie_group`] へ渡す）。
+        if hits.iter().any(|hit| !hit.score.is_finite()) {
+            return Err(HybridError::NonFiniteScore);
+        }
+        if !is_sorted_desc_id_asc(hits.iter().map(|h| (f64::from(h.score), h.id))) {
+            return Err(HybridError::UnsortedInput);
+        }
+        if has_duplicate_id(hits.iter().map(|h| h.id)) {
+            return Err(HybridError::DuplicateId);
+        }
+        // `hits` が可視集合内で存在しうる密ヒットを全件含む（＝取得済み範囲の末尾が
+        // そのまま真の終端であると確定できる）かどうか。`dense_fetch_k` が可視 id
+        // 総数以上なら provider はそれ以上返しようがなく、`hits.len() <
+        // dense_fetch_k` なら provider 自身が「これ以上ない」ことを示している。
+        let exhaustive = dense_fetch_k >= input.ids.len() || hits.len() < dense_fetch_k;
+        match complete_boundary_tie_group(hits, cfg.pool_depth(), exhaustive) {
+            TieBoundary::Resolved(resolved) => break (resolved, dense_fetch_k),
+            TieBoundary::Undetermined(observed) => {
+                if dense_fetch_k >= dense_cap {
+                    // 再取得の余地がない（[`MAX_FETCH_K`]・可視集合の大きさに
+                    // 達した）: 観測できた同点グループの全メンバーをそのまま最終
+                    // 結果として受理する（位置ベースの部分採用はしない）。
+                    break (observed, dense_fetch_k);
+                }
+                dense_fetch_k = dense_fetch_k.saturating_mul(2).min(dense_cap);
+            }
+        }
     };
-    // `provider` は trait object（[`SearchProvider`]）であり、「`input.ids` 外の id を
-    // 返さない」「要求した `k`（＝ `fetch_k`）以下の件数しか返さない」ことは
-    // いずれも型では強制されない（呼び出し元の実装ミス・バグの余地がある）。
-    let dense_hits: Vec<CandidateHit> = provider.search(dense_input)?;
-    // 長さ検証を可視性走査より先に行う（3 回目の codex-review P1 指摘対応）。
-    // `rrf_fuse_with_limits` 自身も同じ長さ検証を行うが、ここで早期に拒否することで、
-    // 契約違反 provider が `fetch_k` を大きく超える件数を返した場合に直後の可視性
-    // 走査（`.iter().any(...)`）が不要な O(n) コストを払わずに済む
-    // （[`HybridError::TooManyCandidates`] のドキュメント参照）。
-    if dense_hits.len() > fetch_k {
-        return Err(HybridError::TooManyCandidates {
-            len: dense_hits.len(),
-            max: fetch_k,
-        });
-    }
-    // 事後フィルタ（不可視 id だけを黙って除外する）はしない: 不可視 id が
-    // `fetch_k` の候補枠を占有していた場合、フィルタ後に可視ヒットを復元できず、
-    // 結果件数の差から不可視データの有無が外部へ漏れる（2 回目の codex-review P0
-    // 指摘対応。モジュールドキュメント参照）。可視性検証は取得した全件（拡張後の
-    // `fetch_k` 件）に対して行い、境界完全化がこの検証を弱めない（[`complete_boundary_tie_group`]
-    // は可視性検証を通過した後の列にのみ作用する）。1 件でも可視集合外の id が
-    // 含まれていたら検索全体を拒否する（fail-closed）。
-    // 識別子の契約（TABLE-12 関連）: 融合キーは `input.ids`（および疎側 `DocId`）が
-    // 何を表すかに従う「呼び出し元定義の識別子」であり、本モジュールは行 `id` である
-    // ことを前提にしない。行 `id` の一意性スコープはテナント内に閉じている
-    // （同一 `id` の可視行が自テナントと他テナントの `Public` 行で並存しうる）ため、
-    // 唯一の production 呼び出し元である `sql/exec.rs` は行 `id` ではなくアリーナの
-    // スロット番号を渡し、同一 `id` の別テナント行が 1 エントリへ畳み込まれないように
-    // している（`tests/row_id_tenant_scope.rs` が固定）。
-    if dense_hits.iter().any(|hit| !visible_ids.contains(&hit.id)) {
-        return Err(HybridError::ProviderResultRejected);
-    }
-    // 拡張取得列（`fetch_k` 件。`pool_depth` を超えうる）全体に対し、有限性・
-    // ソート順・重複 id を [`complete_boundary_tie_group`] の前に検証する
-    // （codex-review P1 指摘対応。`complete_boundary_tie_group` は境界より内側を
-    // 保持しつつ末尾側だけを切り詰め/除外する場合があり、切り詰められて消える
-    // 末尾部分は後段の [`rrf_fuse_with_limits`] の検証対象に含まれなくなる。
-    // 例えば `pool_depth=2` で provider が `[score=3, 2, 1, 4]` を返すと、
-    // 順序違反の末尾要素が除去された `[3, 2]` だけが検証され、provider の契約
-    // 違反（順序崩れ・重複 id・非有限スコア）が正常な検索結果として受理されて
-    // しまう。fail-closed 方針（coding-rust.md）に従い、切り詰め前の拡張列
-    // 全体を検証してから初めて [`complete_boundary_tie_group`] へ渡す）。
-    if dense_hits.iter().any(|hit| !hit.score.is_finite()) {
-        return Err(HybridError::NonFiniteScore);
-    }
-    if !is_sorted_desc_id_asc(dense_hits.iter().map(|h| (f64::from(h.score), h.id))) {
-        return Err(HybridError::UnsortedInput);
-    }
-    if has_duplicate_id(dense_hits.iter().map(|h| h.id)) {
-        return Err(HybridError::DuplicateId);
-    }
-    // `dense_hits` が可視集合内で存在しうる密ヒットを全件含む（＝取得済み範囲の
-    // 末尾がそのまま真の終端であると確定できる）かどうか（[`complete_boundary_tie_group`]
-    // ドキュメント参照）。`fetch_k` が可視 id 総数以上なら provider はそれ以上返しようが
-    // なく、`dense_hits.len() < fetch_k` なら provider 自身が「これ以上ない」ことを
-    // 示している。
-    let dense_exhaustive = fetch_k >= input.ids.len() || dense_hits.len() < fetch_k;
-    // 可視性検証を通過した拡張列から、`cfg.pool_depth()` 境界の同点グループを完全化
-    // する（Issue #310）。`dense_hits` は provider 契約（スコア降順・同点 id 昇順）
-    // に従っている前提だが、その前提自体は [`rrf_fuse_with_limits`] が後段で
-    // 検証する（[`complete_boundary_tie_group`] のドキュメント参照）。
-    let dense_hits = complete_boundary_tie_group(dense_hits, cfg.pool_depth(), dense_exhaustive);
-    // `dense_limit` は `rrf_fuse_with_limits` の長さ検証（[`HybridError::TooManyCandidates`]）
-    // が実効的に効くよう、完全化後の `dense_hits` を上界としつつも常に `fetch_k`
-    // （既に検証済みで `dense_hits.len()` 以上・`MAX_POOL_DEPTH` 以下）を使う。
-    // `dense_hits.len()` 自体を上限にすると検証が常に無条件で通過し「死んだガード」に
-    // なる（`dense.len() > dense_limit` が構造上偽になる）ため避ける。
-    let dense_limit = fetch_k;
     // 疎側は `sparse_index.search()`（インデックス全体を母数に統計・Top-k を計算する
     // API）ではなく `search_within()`（[`SparseIndex::search_within`]）を使う。
     // `search()` の後段フィルタ（旧実装）は「不可視文書が Top-k のプールを占有して
@@ -1190,33 +1218,42 @@ pub fn hybrid_search_boosted(
     // 文書は同一スコアになりうるため、`search_within` が内部で `pool_depth` 件へ
     // 切り詰めた後に `TieRank::GroupEnd` を適用するだけでは境界の同点グループが
     // `SparseIndex` 内部の doc_id 昇順タイブレークで分断され、密側と同型の id 依存
-    // バイアスが残る）。密側と同じ `fetch_k`（多めに取得）で `search_within` を呼び、
-    // [`complete_boundary_tie_group`] で境界の同点グループを完全化するか丸ごと
-    // 除外するかを決定的に判定してから `rrf_fuse_with_limits` へ渡す。
-    let sparse_hits: Vec<ScoredDoc> =
-        sparse_index.search_within(query_text, fetch_k, &visible_ids)?;
-    // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
-    // 拡張取得列が `fetch_k` を超えていないかを [`complete_boundary_tie_group`] の
-    // 前に検証する。`search_within` は自作の内部関数であり `provider` のような
-    // trait object 契約違反の余地は薄いが、fail-closed の防御を密側と揃える。
-    if sparse_hits.len() > fetch_k {
-        return Err(HybridError::TooManyCandidates {
-            len: sparse_hits.len(),
-            max: fetch_k,
-        });
-    }
-    // `sparse_hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の
-    // 末尾がそのまま真の終端であると確定できる）かどうか。`dense_exhaustive` と同じ
-    // 判定基準（[`hybrid_search_boosted`] 本文の該当コメント参照）。
-    let sparse_exhaustive = fetch_k >= visible_ids.len() || sparse_hits.len() < fetch_k;
-    let sparse_hits =
-        complete_boundary_tie_group_by(sparse_hits, cfg.pool_depth(), sparse_exhaustive, |d| {
-            d.score
-        });
-    // `sparse_limit` も `dense_limit` と同じ理由で `fetch_k` を使う（完全化後の
-    // `sparse_hits.len()` 自体を上限にすると `rrf_fuse_with_limits` の長さ検証が
-    // 常に無条件で通過する「死んだガード」になるため避ける）。
-    let sparse_limit = fetch_k;
+    // バイアスが残る）。密側と同じ再取得ループ（Issue #320）で `search_within` を
+    // 呼び、[`complete_boundary_tie_group_by`] で境界の同点グループの終端確定を
+    // 試みる。
+    let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
+    let mut sparse_fetch_k = cfg
+        .pool_depth()
+        .checked_mul(2)
+        .unwrap_or(sparse_cap)
+        .min(sparse_cap);
+    let (sparse_hits, sparse_limit) = loop {
+        let hits: Vec<ScoredDoc> =
+            sparse_index.search_within(query_text, sparse_fetch_k, &visible_ids)?;
+        // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
+        // 拡張取得列が `sparse_fetch_k` を超えていないかを検証する。`search_within`
+        // は自作の内部関数であり `provider` のような trait object 契約違反の余地は
+        // 薄いが、fail-closed の防御を密側と揃える。
+        if hits.len() > sparse_fetch_k {
+            return Err(HybridError::TooManyCandidates {
+                len: hits.len(),
+                max: sparse_fetch_k,
+            });
+        }
+        // `hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の末尾が
+        // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
+        // 同じ判定基準。
+        let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
+        match complete_boundary_tie_group_by(hits, cfg.pool_depth(), exhaustive, |d| d.score) {
+            TieBoundary::Resolved(resolved) => break (resolved, sparse_fetch_k),
+            TieBoundary::Undetermined(observed) => {
+                if sparse_fetch_k >= sparse_cap {
+                    break (observed, sparse_fetch_k);
+                }
+                sparse_fetch_k = sparse_fetch_k.saturating_mul(2).min(sparse_cap);
+            }
+        }
+    };
 
     let mut fused =
         rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
@@ -1227,48 +1264,33 @@ pub fn hybrid_search_boosted(
     Ok(fused)
 }
 
+/// [`complete_boundary_tie_group_by`] の判定結果（Issue #320 codex-review P1 指摘
+/// 対応）。境界の同点グループが取得済み範囲内で終端確定できたか（`Resolved`）、
+/// できず再取得が必要か（`Undetermined`）を型で区別し、位置ベースの部分採用
+/// （ID 昇順で最小 ID だけが残る id 依存バイアス）を呼び出し元が誤って選べない
+/// ようにする。いずれのバリアントも内部の `Vec<T>` は元の並び順（スコア降順・
+/// 同点 id 昇順）を保持したまま返す。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TieBoundary<T> {
+    /// 境界の同点グループを終端まで含めて（または境界がグループを割っていない
+    /// ため単純に）切り詰め済み。呼び出し元はこの列をそのまま融合対象として使える。
+    Resolved(Vec<T>),
+    /// 取得済み範囲の末尾まで境界の同点グループが続いており、かつ可視集合に
+    /// まだ未取得の候補が残りうる（非 exhaustive）ため終端を確定できない。
+    /// 呼び出し元は `fetch_k` を伸ばして再取得するか（[`MAX_FETCH_K`] 未満なら）、
+    /// 再取得の余地がなければこの列（観測できた同点グループの全メンバー）を
+    /// そのまま最終結果として受理する（部分採用はしない）。
+    Undetermined(Vec<T>),
+}
+
 /// 密検索プールを [`RrfConfig::pool_depth`] の境界で「同点グループの途中で切らない」
 /// よう完全化する（Issue #310。[`hybrid_search_boosted`] からのみ呼ばれる純粋関数。
 /// 疎側は [`complete_boundary_tie_group_by`] を直接呼ぶ）。
-///
-/// `dense`（provider 契約どおりスコア降順・同点 id 昇順にソート済みである前提。
-/// この前提自体は呼び出し元の後段 [`rrf_fuse_with_limits`] が独立に検証する）に対し:
-/// - `dense.len() < pool_depth` なら呼び出し元の `fetch_k` 未満しか返っていない
-///   （＝呼び出し元の `*_exhaustive` 算出により必ず exhaustive）ためそのまま返す。
-/// - `dense.len() == pool_depth` は 2 通りありうる。`exhaustive` ならそのまま返す。
-///   非 `exhaustive`（＝呼び出し元が `fetch_k` を [`MAX_POOL_DEPTH`] で頭打ちにされ
-///   `pool_depth` を超える拡張取得ができなかった。Issue #310 codex-review P1 指摘
-///   対応）の場合も、境界の末尾要素が未取得候補と同点かどうかは確定できないが、
-///   取得済み範囲自体が既に `pool_depth` 件ちょうどであり、それ以上切り詰める先が
-///   ないためそのまま返す（Issue #320 codex-review P1 指摘対応: 丸ごと除外すると
-///   全件同点コーパスで結果が空になる回帰があったため、削除ではなく取得済み範囲の
-///   保持へ変更）。
-/// - `dense.len() > pool_depth`（`fetch_k > pool_depth` で拡張取得できた通常経路）は
-///   先頭 `pool_depth` 件の末尾スコアと `pool_depth` 番目（0-based で `pool_depth`）の
-///   スコアが異なれば、境界は同点グループを切っていないため `pool_depth` 件へ
-///   切り詰める（従来と同じ挙動）。一致する場合は境界のグループが `pool_depth` を
-///   跨いでいる。そのグループと同点の要素を末尾まで走査し、グループの終端が取得
-///   済み範囲内で確定できればグループ全体を含めて返す。取得済み範囲の最後の要素
-///   までが同点でグループ終端が確定できず、かつ非 `exhaustive`（取得済み範囲を
-///   超えてなお可視集合にデータが残りうる）の場合は、グループを削除せず、観測できた
-///   範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへフォールバックする
-///   （Issue #320 codex-review P1 指摘対応。境界より内側の要素はすべて保持するため
-///   探索対象を狭めるだけで可視性検証は弱めない。グループ内の順位付けは
-///   [`TieRank::GroupEnd`] がこの切り詰め後の列（観測範囲）自体を走査して決めるため、
-///   フォールバック時のグループ末尾順位は観測できた `pool_depth` 件目になる）。
-///
-/// `exhaustive`（呼び出し元が算出）が `true`（取得した `dense` が可視集合内で
-/// 存在しうるヒットを全件含む。`fetch_k` が可視 id 総数以上、または provider/
-/// インデックスが `fetch_k` 未満しか返さなかった場合）の場合は、取得済み範囲の
-/// 最後まで同点が続いていてもそれが真の終端（それ以上の要素は存在しない）であると
-/// 確定できるため除外せずグループ全体を含める。この区別がないと、`fetch_k` が
-/// たまたま可視集合サイズと一致した場合に常に安全側の除外へ倒れ、確定できるはずの
-/// グループまで失う（Issue #310 実装時に確認した回帰）。
 fn complete_boundary_tie_group(
     dense: Vec<CandidateHit>,
     pool_depth: usize,
     exhaustive: bool,
-) -> Vec<CandidateHit> {
+) -> TieBoundary<CandidateHit> {
     complete_boundary_tie_group_by(dense, pool_depth, exhaustive, |hit| f64::from(hit.score))
 }
 
@@ -1281,84 +1303,83 @@ fn complete_boundary_tie_group(
 /// `items` は呼び出し元契約（スコア降順・同点 id 昇順）に従っている前提だが、その
 /// 前提自体は呼び出し元の後段 [`rrf_fuse_with_limits`] が独立に検証する。
 ///
-/// `dense.len() == pool_depth` かつ `!exhaustive`（＝呼び出し元が `fetch_k`（多めの
-/// 取得件数）を [`MAX_POOL_DEPTH`] で頭打ちにされ、`pool_depth` を超える拡張取得が
-/// できなかったケース。`hybrid_search_boosted` 参照）の場合、境界（末尾要素）が
-/// 可視集合内の未取得候補と同点かどうかを比較対象なしに判定できない。この場合
-/// グループ終端を確定できないため、観測できた範囲を保持したまま位置ベースの
-/// `pool_depth` 件切り詰めへフォールバックする（2 回目の `MAX_POOL_DEPTH` 頭打ちで
-/// 検出漏れになっていた codex-review P1 指摘対応。丸ごと除外すると全件同点コーパス
-/// で結果が空になる回帰があった）。
+/// - `items.len() < pool_depth` なら呼び出し元の `fetch_k` 未満しか返っていない
+///   （＝呼び出し元の `*_exhaustive` 算出により必ず exhaustive）ためそのまま
+///   `Resolved` で返す（境界そのものが存在しない）。
+/// - `items.len() == pool_depth` は、境界の末尾要素が未取得候補と同点かどうかを
+///   比較対象なしに判定できない。`exhaustive` ならそのまま真の終端として
+///   `Resolved` で返す。非 `exhaustive` なら終端を確定できないため `Undetermined`
+///   で返す（呼び出し元が `fetch_k` を伸ばして再取得するか、再取得の余地がなければ
+///   この列を最終結果として受理する。Issue #320 codex-review P1 指摘対応: 丸ごと
+///   除外すると全件同点コーパスで結果が空になる回帰があったため、削除ではなく
+///   観測できた範囲を保持する設計にした上で、さらに位置ベースの `pool_depth` 件
+///   切り詰め〔ID 依存〕もしない設計へ改めた）。
+/// - `items.len() > pool_depth`（`fetch_k > pool_depth` で拡張取得できた通常経路）は
+///   先頭 `pool_depth` 件の末尾スコアと `pool_depth` 番目（0-based で `pool_depth`）の
+///   スコアが異なれば、境界は同点グループを切っていないため `pool_depth` 件へ
+///   切り詰めて `Resolved` で返す（従来と同じ挙動）。一致する場合は境界のグループが
+///   `pool_depth` を跨いでいる。そのグループと同点の要素を末尾まで走査し、グループの
+///   終端が取得済み範囲内で確定できればグループ全体を含めて `Resolved` で返す。
+///   取得済み範囲の最後の要素までが同点でグループ終端が確定できない場合、
+///   `exhaustive` なら取得済み範囲の末尾がそのまま真の終端だと確定できるため
+///   グループ全体（＝取得済み範囲全体）を含めて `Resolved` で返す。非 `exhaustive`
+///   なら `Undetermined` で返す（グループを削除せず、観測できた範囲をそのまま
+///   保持する。呼び出し元が再取得するか、再取得の余地がなければこの列を最終結果
+///   として受理する）。
 pub(crate) fn complete_boundary_tie_group_by<T>(
-    dense: Vec<T>,
+    items: Vec<T>,
     pool_depth: usize,
     exhaustive: bool,
     score_of: impl Fn(&T) -> f64,
-) -> Vec<T> {
-    if pool_depth == 0 {
-        return dense;
+) -> TieBoundary<T> {
+    if pool_depth == 0 || items.len() < pool_depth {
+        // 境界そのものが存在しない（`pool_depth == 0` は呼び出し元契約上
+        // 到達しないが、関数を全域にするため明示的に扱う）。
+        return TieBoundary::Resolved(items);
     }
-    if dense.len() < pool_depth {
-        // 取得件数が `pool_depth` 未満: 呼び出し元の `fetch_k`（`>= pool_depth`）
-        // 自体に満たない件数しか返っていない = 呼び出し元の `*_exhaustive` 算出
-        // （`items.len() < fetch_k` 条件）により必ず `exhaustive == true` になる
-        // 契約のため、境界そのものが存在せずそのまま返してよい。
-        return dense;
-    }
-    if dense.len() == pool_depth {
-        // ちょうど `pool_depth` 件: 通常経路（`fetch_k > pool_depth`）で provider/
-        // インデックスが `fetch_k` 未満しか返せなければ `exhaustive == true` になる
-        // 契約のため、ここへ来るのは `exhaustive == true`（真に全件）か、`fetch_k`
-        // が `MAX_POOL_DEPTH` で頭打ちになり `fetch_k == pool_depth` となって拡張
-        // 取得ができなかった場合のいずれか。後者は境界の末尾要素が可視集合内の
-        // 未取得候補と同点かどうかを比較対象なしに判定できないが、取得済み範囲が
-        // 既に `pool_depth` 件ちょうどでそれ以上切り詰める先がないため、いずれの
-        // 場合も観測できた範囲をそのまま返す（Issue #320 codex-review P1 指摘対応。
-        // 丸ごと除外すると全件同点コーパスで結果が空になる回帰があった）。
-        return dense;
+    if items.len() == pool_depth {
+        return if exhaustive {
+            TieBoundary::Resolved(items)
+        } else {
+            TieBoundary::Undetermined(items)
+        };
     }
     // `pool_depth >= 1`（`RrfConfig::new`/`Default` が保証）のため `pool_depth - 1` は
     // 常に有効な添字。
-    let boundary_score = score_of(&dense[pool_depth - 1]);
-    let next_score = score_of(&dense[pool_depth]);
+    let boundary_score = score_of(&items[pool_depth - 1]);
+    let next_score = score_of(&items[pool_depth]);
     if boundary_score.total_cmp(&next_score) != std::cmp::Ordering::Equal {
-        let mut truncated = dense;
+        let mut truncated = items;
         truncated.truncate(pool_depth);
-        return truncated;
+        return TieBoundary::Resolved(truncated);
     }
     // 境界のグループは `pool_depth - 1` 番目（0-based）から同点が始まっている保証は
     // ないため、グループの開始位置を後方から探す（同点は provider 契約により連続
-    // する）。
-    let mut group_start = pool_depth - 1;
-    while group_start > 0
-        && score_of(&dense[group_start - 1]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
-    {
-        group_start -= 1;
-    }
+    // する）。グループ開始位置自体は終端確定の判定には使わないため変数に保持しない。
     // グループの終端を取得済み範囲内で探す。
     let mut group_end = pool_depth;
-    while group_end < dense.len()
-        && score_of(&dense[group_end]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
+    while group_end < items.len()
+        && score_of(&items[group_end]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
     {
         group_end += 1;
     }
-    let mut result = dense;
-    if group_end < result.len() || exhaustive {
-        // グループ終端が取得済み範囲内で確定できた（`group_end` の要素は非同点）、
-        // または `exhaustive` により取得済み範囲の末尾がそのまま真の終端だと確定
-        // できる。グループ全体（`group_start..group_end`）を含めて返す。
+    if group_end < items.len() {
+        // グループ終端が取得済み範囲内で確定できた（`group_end` の要素は非同点）。
+        // グループ全体を含めて返す。
+        let mut result = items;
         result.truncate(group_end);
+        TieBoundary::Resolved(result)
+    } else if exhaustive {
+        // 取得済み範囲の末尾まで同点だが、`exhaustive` により取得済み範囲の末尾が
+        // そのまま真の終端だと確定できる。グループ全体（＝取得済み範囲全体）を
+        // 含めて返す。
+        TieBoundary::Resolved(items)
     } else {
         // 取得済み範囲の最後までが同点で、かつそれ以上のデータが存在しうる
-        // （非 exhaustive）ためグループ終端を確定できない。グループを丸ごと除外
-        // せず、観測できた範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへ
-        // フォールバックする（Issue #320 codex-review P1 指摘対応: 丸ごと除外すると
-        // 全件同点コーパスで結果が空になる回帰があった。境界より内側の要素は
-        // すべて保持するため探索対象を狭めるだけで可視性検証は弱めない。2 度目の
-        // provider 呼び出しはしない）。
-        result.truncate(pool_depth);
+        // （非 exhaustive）ためグループ終端を確定できない。呼び出し元が再取得
+        // するか、再取得の余地がなければこの観測範囲を最終結果として受理する。
+        TieBoundary::Undetermined(items)
     }
-    result
 }
 
 #[cfg(test)]
@@ -2532,12 +2553,36 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    /// テスト専用ヘルパ: [`TieBoundary::Resolved`] であることを検証しつつ内側の
+    /// `Vec<T>` を取り出す。`Undetermined` だった場合はパニックさせてテストを
+    /// 失敗させる（本関数はテストコードのみから呼ばれ、production コードの
+    /// untrusted 入力経路には現れない）。
+    fn expect_resolved<T: std::fmt::Debug>(out: TieBoundary<T>) -> Vec<T> {
+        match out {
+            TieBoundary::Resolved(v) => v,
+            TieBoundary::Undetermined(v) => {
+                panic!("expected Resolved, got Undetermined({v:?})")
+            }
+        }
+    }
+
+    /// [`expect_resolved`] と対になる、[`TieBoundary::Undetermined`] 専用の
+    /// テストヘルパ。
+    fn expect_undetermined<T: std::fmt::Debug>(out: TieBoundary<T>) -> Vec<T> {
+        match out {
+            TieBoundary::Undetermined(v) => v,
+            TieBoundary::Resolved(v) => {
+                panic!("expected Undetermined, got Resolved({v:?})")
+            }
+        }
+    }
+
     #[test]
     fn complete_boundary_tie_group_returns_input_unchanged_when_no_boundary() {
         // `dense.len() <= pool_depth` の場合は境界そのものが存在しないためそのまま
-        // 返す。
+        // `Resolved` で返す。
         let dense = vec![hit(1, 3.0), hit(2, 2.0)];
-        let out = complete_boundary_tie_group(dense.clone(), 5, false);
+        let out = expect_resolved(complete_boundary_tie_group(dense.clone(), 5, false));
         assert_eq!(out, dense);
     }
 
@@ -2545,9 +2590,9 @@ mod tests {
     fn complete_boundary_tie_group_truncates_when_boundary_does_not_split_a_tie() {
         // 境界（pool_depth=2）の直後（3 番目）のスコアが境界末尾（2 番目）と異なる
         // ため、同点グループを分断していない。従来どおり先頭 `pool_depth` 件へ
-        // 切り詰める。
+        // 切り詰めて `Resolved` で返す。
         let dense = vec![hit(1, 3.0), hit(2, 2.0), hit(3, 1.0)];
-        let out = complete_boundary_tie_group(dense, 2, false);
+        let out = expect_resolved(complete_boundary_tie_group(dense, 2, false));
         assert_eq!(out, vec![hit(1, 3.0), hit(2, 2.0)]);
     }
 
@@ -2555,48 +2600,52 @@ mod tests {
     fn complete_boundary_tie_group_includes_full_group_when_boundary_splits_a_tie() {
         // 境界（pool_depth=2）の 2 番目・3 番目が同点（score=2.0）で、4 番目は
         // 非同点（score=1.0）のためグループ終端が取得済み範囲内で確定できる。
-        // グループ全体（id=1,2,3）を含めて返す（`exhaustive` に関わらず確定できる
-        // ケース）。
+        // グループ全体（id=1,2,3）を含めて `Resolved` で返す（`exhaustive` に
+        // 関わらず確定できるケース）。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(4, 1.0)];
-        let out = complete_boundary_tie_group(dense, 2, false);
+        let out = expect_resolved(complete_boundary_tie_group(dense, 2, false));
         assert_eq!(out, vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)]);
     }
 
     #[test]
-    fn complete_boundary_tie_group_falls_back_to_positional_cut_when_tail_is_unconfirmed_and_not_exhaustive(
-    ) {
+    fn complete_boundary_tie_group_is_undetermined_when_tail_is_unconfirmed_and_not_exhaustive() {
         // 取得済み範囲（4 件）の最後まで同点（score=2.0）が続き、`exhaustive=false`
         // （取得範囲を超えてなお可視集合にデータが残りうる）のためグループの終端を
-        // 確定できない。Issue #320 codex-review P1 指摘対応: グループを丸ごと除外
-        // すると全件同点コーパスで結果が空になる回帰があるため、削除ではなく
-        // 観測できた範囲を保持したまま位置ベースの `pool_depth` 件切り詰めへ
-        // フォールバックする（境界より内側の要素はすべて保持）。
+        // 確定できない。Issue #320 codex-review P1 指摘対応: 位置ベースの
+        // `pool_depth` 件切り詰め（ID 昇順で最小 ID だけが残る id 依存バイアス）は
+        // せず、`Undetermined` として観測できた同点グループの全メンバーをそのまま
+        // 返す。呼び出し元（[`hybrid_search_boosted`]）が再取得するか、再取得の
+        // 余地がなければこの列を最終結果として受理する。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(4, 2.0)];
-        let out = complete_boundary_tie_group(dense, 2, false);
-        assert_eq!(out, vec![hit(1, 2.0), hit(2, 2.0)]);
+        let out = expect_undetermined(complete_boundary_tie_group(dense.clone(), 2, false));
+        assert_eq!(
+            out, dense,
+            "終端未確定でも観測できた同点グループの全メンバーを保持する（部分採用しない）"
+        );
     }
 
     #[test]
     fn complete_boundary_tie_group_includes_group_when_tail_reaches_end_and_exhaustive() {
-        // 取得済み範囲の最後まで同点が続くのは `excludes_..._not_exhaustive` と同じ
-        // だが、`exhaustive=true`（`fetch_k` が可視集合全体を覆っており取得済み範囲の
-        // 末尾が真の終端だと確定できる）の場合はグループを除外せず全体を含める
-        // （Issue #310 実装時に確認した回帰の直接固定: `fetch_k` が可視集合サイズと
-        // 一致する場合に常に除外へ倒れると、確定できるはずのグループまで失う）。
+        // 取得済み範囲の最後まで同点が続くのは上記の未確定ケースと同じだが、
+        // `exhaustive=true`（`fetch_k` が可視集合全体を覆っており取得済み範囲の
+        // 末尾が真の終端だと確定できる）の場合はグループを除外せず全体を含めて
+        // `Resolved` で返す（Issue #310 実装時に確認した回帰の直接固定: `fetch_k`
+        // が可視集合サイズと一致する場合に常に除外へ倒れると、確定できるはずの
+        // グループまで失う）。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(4, 2.0)];
-        let out = complete_boundary_tie_group(dense.clone(), 2, true);
+        let out = expect_resolved(complete_boundary_tie_group(dense.clone(), 2, true));
         assert_eq!(out, dense);
     }
 
     #[test]
     fn complete_boundary_tie_group_is_id_independent() {
-        // 同一の同点集合を id の割り当てだけ入れ替えても、完全化後の id 集合
-        // （順序を無視した集合として）は変わらない（Issue #310 の目的である
-        // id 依存バイアスの除去を固定する）。
+        // 同一の同点集合を id の割り当てだけ入れ替えても、`Undetermined` として
+        // 観測できるグループの要素数（id 集合の大きさ）は変わらない（Issue #310 の
+        // 目的である id 依存バイアスの除去を固定する）。
         let dense_a = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(9, 1.0)];
         let dense_b = vec![hit(10, 2.0), hit(20, 2.0), hit(30, 2.0), hit(90, 1.0)];
-        let out_a = complete_boundary_tie_group(dense_a, 2, false);
-        let out_b = complete_boundary_tie_group(dense_b, 2, false);
+        let out_a = expect_resolved(complete_boundary_tie_group(dense_a, 2, false));
+        let out_b = expect_resolved(complete_boundary_tie_group(dense_b, 2, false));
         assert_eq!(out_a.len(), 3);
         assert_eq!(out_b.len(), 3);
     }
@@ -2608,25 +2657,22 @@ mod tests {
         // 汎用化した `complete_boundary_tie_group_by` が、疎側 `ScoredDoc`
         // （`score: f64`）でも同じ完全化ロジックを適用できることを固定する。
         let docs = vec![doc(1, 2.0), doc(2, 2.0), doc(3, 2.0), doc(4, 1.0)];
-        let out = complete_boundary_tie_group_by(docs, 2, false, |d| d.score);
+        let out = expect_resolved(complete_boundary_tie_group_by(docs, 2, false, |d| d.score));
         assert_eq!(out, vec![doc(1, 2.0), doc(2, 2.0), doc(3, 2.0)]);
     }
 
     #[test]
-    fn complete_boundary_tie_group_keeps_observed_range_when_fetch_capped_at_pool_depth_and_not_exhaustive(
+    fn complete_boundary_tie_group_is_undetermined_when_fetch_capped_at_pool_depth_and_not_exhaustive(
     ) {
-        // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAt）の回帰
-        // 固定: `hybrid_search_boosted` の `fetch_k` は `pool_depth * 2` を
-        // `MAX_POOL_DEPTH` で頭打ちにするため、`pool_depth` 自体が
-        // `MAX_POOL_DEPTH` の場合（本テストでは境界処理だけを直接検証するため
-        // `pool_depth == dense.len()` で模擬する）`fetch_k == pool_depth` となり
-        // 拡張取得ができない。この場合、境界（末尾要素）が未取得候補と同点かどうか
-        // 判定できないが、取得済み範囲が既に `pool_depth` 件ちょうどでそれ以上
-        // 切り詰める先がないため、Issue #320 codex-review P1 指摘対応により
-        // 丸ごと除外ではなく観測できた範囲をそのまま返す（全件同点コーパスで結果が
-        // 空になる回帰の修正）。
+        // `items.len() == pool_depth` かつ非 `exhaustive`（境界＝末尾要素が未取得
+        // 候補と同点かどうか比較対象なしに判定できないケース。[`hybrid_search_boosted`]
+        // の再取得ループが [`MAX_FETCH_K`]・可視集合の大きさで頭打ちになった場合に
+        // 相当する。本テストでは境界処理だけを直接検証するため
+        // `pool_depth == items.len()` で模擬する）は `Undetermined` を返す
+        // （Issue #320 codex-review P1 指摘対応: 丸ごと除外すると全件同点コーパスで
+        // 結果が空になる回帰があった）。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)];
-        let out = complete_boundary_tie_group(dense.clone(), 3, false);
+        let out = expect_undetermined(complete_boundary_tie_group(dense.clone(), 3, false));
         assert_eq!(
             out, dense,
             "拡張取得できず境界の同点を確定できない場合も観測範囲を保持する"
@@ -2637,9 +2683,9 @@ mod tests {
     fn complete_boundary_tie_group_keeps_tail_when_fetch_capped_at_pool_depth_but_exhaustive() {
         // 上記テストと対になるケース: `dense.len() == pool_depth` でも
         // `exhaustive == true`（取得済み範囲がそのまま真の終端だと確定できる）なら
-        // 末尾の同点グループを除外せずそのまま返す。
+        // 末尾の同点グループを除外せず `Resolved` でそのまま返す。
         let dense = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0)];
-        let out = complete_boundary_tie_group(dense.clone(), 3, true);
+        let out = expect_resolved(complete_boundary_tie_group(dense.clone(), 3, true));
         assert_eq!(out, dense);
     }
 
@@ -2648,14 +2694,14 @@ mod tests {
         // Issue #310 codex-review P1 指摘（threadId PRRT_kwDOUAKASM6dbmAw）の回帰
         // 固定: 疎チャネル（BM25）も密チャネルと同様に境界の同点グループを完全化
         // する。6 件すべてが同一テキスト（BM25 同点）・同一密ベクトル（内積同点）
-        // のコーパスに対し `pool_depth=2` で検索すると、`fetch_k`（`min(2*2, 6)=4`）
-        // は可視 6 件に満たず非 exhaustive のため、密・疎いずれの同点グループも
-        // 境界を確定できない。修正前は疎側が `search_within` 内部の doc_id 昇順
-        // タイブレークで id 依存に 2 件だけ生き残っていた。Issue #320 codex-review
-        // P1 指摘対応で境界完全化のフォールバックを「丸ごと除外」から「観測できた
-        // 範囲を保持し位置ベースで `pool_depth` 件へ切り詰め」へ変更したため、全件
-        // 同点でも結果が空にならない（`pool_depth=2, k=2` 件が返る）。id の割り当てを
-        // 入れ替えても結果件数（空にならないこと）が変わらないことを確認する。
+        // のコーパスに対し `pool_depth=2` で検索すると、初期 `fetch_k`
+        // （`min(2*2, 6)=4`）は可視 6 件に満たず非 exhaustive のため境界の同点
+        // グループを確定できないが、Issue #320 codex-review P1 指摘対応の再取得
+        // ループ（`fetch_k` を倍増して再フェッチ）が `fetch_k=6` まで伸ばし、
+        // 可視集合全体を覆って `exhaustive=true` になるため確定できる（密・疎とも
+        // 6 件全体を保持）。修正前は疎側が `search_within` 内部の doc_id 昇順
+        // タイブレークで id 依存に 2 件だけ生き残っていた。id の割り当てを入れ替えて
+        // も結果件数（空にならないこと）が変わらないことを確認する。
         let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
         let vectors: Vec<f32> = vec![1.0; 6];
         let query = [1.0f32];
@@ -2695,12 +2741,69 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fuse_with_limits_rejects_dense_limit_above_max_pool_depth() {
-        // `dense_limit`（`sparse_limit` も同様）は `RrfConfig::new` と同じ
-        // fail-closed 検証を独立に持つ: `MAX_POOL_DEPTH` を超える上限は構造体
+    fn hybrid_search_retention_pool_scores_are_permutation_invariant() {
+        // Issue #320 codex-review P1 指摘対応の意図（境界同点グループの完全化が
+        // 位置ベースの部分採用に頼らないこと）を、id の割り当てを変えても融合
+        // スコアが変わらないことで固定する。ここで検証するのは「取得済み同点
+        // グループの融合スコアが id に依存しない」こと（`TieRank::GroupEnd` が
+        // グループ全体を見て順位を決めるための前提）である。「同点 m 件から `k`
+        // 件へ絞り込む際にどの id が生き残るか」は本関数ドキュメント（`truncate(k)`
+        // は id 昇順で確定的）が定める既存の別契約であり、Issue #310/#320 の
+        // 対象（境界完全化がグループの一部だけを取り込んでしまう問題）ではない
+        // ため、本テストでは意図的にアサーションしない。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
+        let vectors: Vec<f32> = vec![1.0; 6];
+        let query = [1.0f32];
+
+        let ids_a: Vec<u64> = vec![1, 2, 3, 4, 5, 6];
+        let docs_a: Vec<(u64, &str)> = ids_a.iter().map(|&id| (id, "cat")).collect();
+        let index_a = SparseIndex::build(&docs_a).expect("build ok");
+        let input_a = SearchInput {
+            ids: &ids_a,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 2,
+        };
+        let out_a = hybrid_search(&CpuScalarProvider, input_a, &index_a, "cat", 2, &cfg)
+            .expect("search ok");
+
+        let ids_b: Vec<u64> = vec![101, 202, 303, 404, 505, 606];
+        let docs_b: Vec<(u64, &str)> = ids_b.iter().map(|&id| (id, "cat")).collect();
+        let index_b = SparseIndex::build(&docs_b).expect("build ok");
+        let input_b = SearchInput {
+            ids: &ids_b,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 2,
+        };
+        let out_b = hybrid_search(&CpuScalarProvider, input_b, &index_b, "cat", 2, &cfg)
+            .expect("search ok");
+
+        assert_eq!(out_a.len(), 2);
+        assert_eq!(out_b.len(), 2);
+        let scores_a: Vec<f64> = out_a.iter().map(|h| h.score).collect();
+        let scores_b: Vec<f64> = out_b.iter().map(|h| h.score).collect();
+        assert_eq!(
+            scores_a, scores_b,
+            "6 件全件同点コーパスの融合スコアは id 割り当てに依存しない"
+        );
+        assert!(
+            (scores_a[0] - scores_a[1]).abs() < 1e-12,
+            "TieRank::GroupEnd により同点グループ内の全メンバーは同一の融合スコア（グループ末尾順位）を持つ"
+        );
+    }
+
+    #[test]
+    fn rrf_fuse_with_limits_rejects_dense_limit_above_max_fetch_k() {
+        // `dense_limit`（`sparse_limit` も同様）は独自の fail-closed 検証を持つ:
+        // 境界同点グループ完全化（Issue #310・Issue #320）の再取得ループが
+        // `fetch_k` を `pool_depth` 超まで伸ばすことがあるため上限は
+        // `MAX_POOL_DEPTH` ではなく `MAX_FETCH_K`。それを超える上限は構造体
         // リテラル相当の検証迂回になるため拒否する。
         let cfg = RrfConfig::default();
-        let err = rrf_fuse_with_limits(&[], MAX_POOL_DEPTH + 1, &[], 1, &cfg).unwrap_err();
+        let err = rrf_fuse_with_limits(&[], MAX_FETCH_K + 1, &[], 1, &cfg).unwrap_err();
         assert_eq!(err, HybridError::InvalidConfig);
     }
 

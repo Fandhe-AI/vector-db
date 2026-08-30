@@ -1001,8 +1001,8 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 381, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 651, "大規模段の Recall@100 hit 数が変化した");
+    assert_eq!(r.hits20, 385, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 648, "大規模段の Recall@100 hit 数が変化した");
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー

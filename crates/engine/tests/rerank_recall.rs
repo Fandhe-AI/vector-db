@@ -525,30 +525,28 @@ fn rerank_recall_large_scale_regression() {
     assert_eq!(r.ceil100, 913, "Recall@100 の理論上限が変化した");
     assert_eq!(r.ceil200, 1049, "Recall@200 の理論上限が変化した");
     assert_eq!(
-        r.baseline_hits20, 383,
+        r.baseline_hits20, 387,
         "baseline（リランキングなし）の Recall@20 hit 数が変化した"
     );
     assert_eq!(
         r.after_hits20, 383,
         "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
-    assert_eq!(r.pool_hits100, 821, "プール Recall@100 hit 数が変化した");
-    assert_eq!(r.pool_hits200, 949, "プール Recall@200 hit 数が変化した");
+    assert_eq!(r.pool_hits100, 837, "プール Recall@100 hit 数が変化した");
+    assert_eq!(r.pool_hits200, 951, "プール Recall@200 hit 数が変化した");
 
     // SEARCH-7 契約メモ: `after_hits20 >= baseline_hits20`（リランキング層が
-    // Recall を悪化させていないことの独立検証）。Issue #310（RRF 融合の同点順位
-    // 規約変更・密プール境界の同点グループ完全化）適用直後は baseline の改善幅が
-    // `LexicalOverlapReranker` の改善幅を上回り、この非劣化アサーションが破れる
-    // 期間があった。原因は `rerank.rs::LexicalOverlapReranker` の `rank_fused`
-    // 算出が候補配列の位置順位（`idx + 1`）のまま据え置かれ、`hybrid.rs` 側の
-    // 同点順位規約（既定 `TieRank::GroupEnd`）とずれていたことで、同点グループを
-    // 跨ぐ候補の間で本来ゼロであるべき順位差が字句一致寄与へ混入していたため
-    // （`docs/design/rerank-recall-regression.md` 参照）。Issue #320
-    // codex-review P1 指摘対応で `rank_fused` も `hybrid.rs::accumulate_ranked`
-    // の `TieRank::GroupEnd` 分岐と同じグループ末尾順位で算出するよう揃えた結果、
-    // このフィクスチャでは非劣化が回復した（このフィクスチャでは after が
-    // baseline と一致。厳密な `>` は `LexicalOverlapReranker` が数学的に保証する
-    // 性質ではなく、規約を揃えたことで生じた実測結果である）。
+    // Recall を悪化させていないことの独立検証）。境界同点グループ完全化の
+    // フォールバックを位置ベースの部分採用から観測範囲の全保持へ変更した
+    // Issue #320 codex-review P1 指摘対応適用後、この非劣化アサーションが
+    // 再び破れている（本フィクスチャでは baseline 387 > after 383）。原因は
+    // `rank_fused`（Issue #320 で `TieRank::GroupEnd` へ揃え済み）の不整合では
+    // なく、境界の同点グループを丸ごと保持する変更そのものが baseline の
+    // 候補プール構成を変えたことによる（この非劣化と Issue #320 の再取得
+    // 上限〔`MAX_FETCH_K`〕の大きさは独立: 上限を `pool_depth` 相対の小さい値へ
+    // 変えても同じ baseline 387 / after 383 が再現する）。`LexicalOverlapReranker`
+    // 側の対応要否はオーナー判断待ち（本テストファイルは「production コードは
+    // 変更しない」契約のため、ここでは非劣化アサーションを弱めずそのまま残す）。
     assert!(
         r.after_hits20 >= r.baseline_hits20,
         "リランキング層（LexicalOverlapReranker）が baseline（リランキングなし）の Recall@20 を悪化させた"
