@@ -31,7 +31,9 @@ use tokenizers::utils::padding::PaddingParams;
 use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
 
-use super::{CrossEncoderBackend, CrossEncoderError, MAX_CROSS_ENCODER_SEQ_LEN};
+use super::{
+    CrossEncoderBackend, CrossEncoderError, MAX_CROSS_ENCODER_BATCH_SIZE, MAX_CROSS_ENCODER_SEQ_LEN,
+};
 
 /// `ort`（ONNX Runtime）+ `tokenizers` による実推論バックエンド。
 /// [`CrossEncoderReranker`](super::CrossEncoderReranker) から `&self` で呼ばれるため、
@@ -135,6 +137,21 @@ impl CrossEncoderBackend for OnnxCrossEncoderBackend {
     fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f64>, CrossEncoderError> {
         if passages.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // codex-review 指摘（PR #336 P1）: 本メソッドは `CrossEncoderBackend` の
+        // 公開実装であり、`CrossEncoderReranker::rerank` が `cfg.batch_size()`
+        // （`MAX_CROSS_ENCODER_BATCH_SIZE` 以下）へ分割してから呼ぶ想定だが、この
+        // 分割は呼び出し元の責務でしかなく、本バックエンドを直接呼び出す利用者は
+        // その防御を迂回できる。`tokenizer.encode_batch` 以降の一括テンソル化が
+        // `passages.len()` に比例したメモリを確保するため、ここでも共有上限
+        // `MAX_CROSS_ENCODER_BATCH_SIZE` を fail-closed で強制し、無制限な
+        // passages 件数によるメモリ枯渇（DoS）を構造的に防ぐ。
+        if passages.len() > MAX_CROSS_ENCODER_BATCH_SIZE {
+            return Err(CrossEncoderError::TooManyCandidates {
+                len: passages.len(),
+                max: MAX_CROSS_ENCODER_BATCH_SIZE,
+            });
         }
 
         // (query, passage) ペアをクロスエンコーダの規範形（sentence-pair）で
