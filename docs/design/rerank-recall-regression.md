@@ -114,7 +114,8 @@ green。詳細は下記）
 
 上表は `hybrid.rs::complete_boundary_tie_group_by` の境界同点グループ完全化を
 「終端未確定時は再取得ループ（`fetch_k` 倍増）で終端確定を試み、再取得の上限に
-達してもなお未確定なら観測範囲を全保持する」契約へ変更した後（Issue #320
+達してもなお未確定なら境界同点グループ全体を除外し厳密に上位の候補のみ
+保持する」契約へ変更した後（Issue #320
 codex-review P1 指摘対応・`docs/design/hybrid-recall-regression.md`「Issue #310:
 engine 側改善」節参照）の、かつ `LexicalOverlapReranker` の既定重みを Issue #310
 対応で変更した後の実測値である。
