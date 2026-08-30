@@ -346,14 +346,14 @@ hits20/hits100 算出対象クエリに非正スコア候補由来の正解ヒ�
 かった）。
 
 **`crates/engine/tests/rerank_recall.rs` への影響なし**: 同ハーネスの大規模段
-固定値（baseline hits20=387・after hits20=383・pool hits100=837・
-pool hits200=951）はこの変更適用前後で数値の変化がなかった（本フィクスチャでは
-非正スコア候補がリランキング測定対象クエリの結果へ影響しなかった）。
-`after_hits20 >= baseline_hits20` の非劣化アサーションは、上記「Issue #310:
-engine 側改善」節に記載の原因（境界同点グループを丸ごと保持する変更そのものが
-baseline の候補プール構成を変えたこと）のまま red が継続しており、本調査の対象
-（可視集合全体までの再取得到達）とは独立の事象である。詳細は
-`docs/design/rerank-recall-regression.md`「実測結果」節参照。
+固定値（baseline hits20=387・pool hits100=837・pool hits200=951）はこの変更
+適用前後で数値の変化がなかった（本フィクスチャでは非正スコア候補がリランキング
+測定対象クエリの結果へ影響しなかった）。当時（本調査の時点）は
+`after_hits20 >= baseline_hits20` の非劣化アサーションが after hits20=383 で
+red だったが、本調査（可視集合全体までの再取得到達の解消）とは独立の事象
+だった。この red は後日 Issue #310 対応（`LexicalOverlapReranker` の既定重み
+変更）で解消済み。詳細は `docs/design/rerank-recall-regression.md`「実測結果」
+節参照。
 
 ## 実測結果
 

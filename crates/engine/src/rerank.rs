@@ -472,6 +472,16 @@ impl Reranker for IdentityReranker {
 /// `hybrid.rs` が RRF で採った設計判断（元スコアではなく順位ベースで統合する）を
 /// 踏襲する。字句トークン化は [`crate::sparse::tokenize`]（TASK-102 実装済みの簡易
 /// トークナイザ）を再利用する。
+///
+/// 既定重み（[`LexicalOverlapReranker::default`]）は `fused_weight:lexical_weight
+/// = 3.0:1.0`（fused 優位）。Issue #310 対応で既定重みを変更。根拠: 字句一致優先
+/// による正解脱落（実測）。等重み（1.0:1.0）では字句一致順位の寄与が融合順位の
+/// 寄与を上回り、字句一致トークンが脱落した正解文書が字句一致した decoy に
+/// 逆転され、`crates/engine/tests/rerank_recall.rs` の大規模段実測で
+/// `after_hits20`（383）が `baseline_hits20`（387）を下回った（非劣化アサーション
+/// `after_hits20 >= baseline_hits20` が red だった）。`fused_weight:lexical_weight`
+/// を 1.5:1・2:1・3:1・4:1 で実測し、非劣化を回復する最小の比率として 3:1
+/// （388 ≥ 387）を採用した。詳細は `docs/design/rerank-recall-regression.md` 参照。
 #[derive(Debug, Clone, Copy)]
 pub struct LexicalOverlapReranker {
     /// RRF 型融合のランク減衰定数（`hybrid::RrfConfig::k_const` と同じ役割）。
@@ -484,9 +494,11 @@ pub struct LexicalOverlapReranker {
 
 impl Default for LexicalOverlapReranker {
     fn default() -> Self {
+        // 既定重み 3.0:1.0（fused 優位）の採用根拠は本 struct のドキュメンテー
+        // ションコメント（Issue #310）を参照。
         Self {
             k_const: 60.0,
-            fused_weight: 1.0,
+            fused_weight: 3.0,
             lexical_weight: 1.0,
         }
     }
@@ -694,10 +706,11 @@ mod tests {
     #[test]
     fn lexical_overlap_reranker_surfaces_matching_document_to_top() {
         // 融合スコアでは 1 位の候補（id=1）を、クエリと字句一致する文書（id=2）が
-        // 最終的に上回ることを確認する（SEARCH-7: 再順位付けの動作）。等重み既定
-        // （[`LexicalOverlapReranker::default`]）では融合順位 1 位の優位が大きく
-        // 拮抗しうるため、字句一致信号を優勢にする重み構成（`lexical_weight` を
-        // 大きく取る）で検証する。
+        // 最終的に上回ることを確認する（SEARCH-7: 再順位付けの動作）。既定重み
+        // （[`LexicalOverlapReranker::default`]。Issue #310 対応で fused 優位
+        // 3.0:1.0 へ変更済み）でも融合順位 1 位の優位が大きく拮抗しうるため、
+        // 字句一致信号を優勢にする重み構成（`lexical_weight` を大きく取る）で
+        // 検証する。
         let cfg = RerankConfig::new(10, 3).unwrap();
         let candidates = [
             cand(1, 3.0, "unrelated content about nothing"),
@@ -728,8 +741,11 @@ mod tests {
 
     #[test]
     fn lexical_overlap_reranker_tie_breaks_by_id_ascending() {
-        // 真の同点スコアを作るため、rank_fused と rank_lexical が入れ替わる構成にする
-        // （既定の等重み: fused_weight = lexical_weight = 1.0）。
+        // 真の同点スコアを作るため、rank_fused と rank_lexical が入れ替わる構成にする。
+        // 既定（[`LexicalOverlapReranker::default`]。Issue #310 対応で fused 優位
+        // 3.0:1.0）ではこの入れ替えだけで真の同点は作れないため、本テストの関心
+        // （タイブレーク分岐そのもの）に絞って等重み（fused_weight = lexical_weight
+        // = 1.0）を明示的に構築する。
         // id=5: rank_fused=1（融合スコア降順で先頭）・rank_lexical=2（字句重なり少）
         // id=6: rank_fused=2                       ・rank_lexical=1（字句重なり多）
         // スコア = weight/(k+rank_fused) + weight/(k+rank_lexical) は rank の組が
@@ -738,7 +754,7 @@ mod tests {
         // `.then(a.id.cmp(&b.id))`）を実際に通過する。
         let cfg = RerankConfig::new(10, 2).unwrap();
         let candidates = [cand(5, 3.0, "alpha"), cand(6, 2.0, "alpha bravo")];
-        let reranker = LexicalOverlapReranker::default();
+        let reranker = LexicalOverlapReranker::new(60.0, 1.0, 1.0).unwrap();
         let hits = rerank_candidates(&reranker, "alpha bravo", &candidates, &cfg).expect("ok");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].score, hits[1].score, "must be a true score tie");

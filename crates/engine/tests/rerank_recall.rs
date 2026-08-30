@@ -6,8 +6,11 @@
 //! （自前 xorshift64*・外部クレート不使用）・QA セット・[`RecallResult`] 相当
 //! （理論上限 `ceil` を分母とする到達率）・2 層構成（PR CI と閾値ゲートの分離）を
 //! そのまま複製・踏襲する（`cjk_tokenizer_impact.rs` → `hybrid_recall.rs` と同じ
-//! 「複製・踏襲」方式。既存テストの固定値アサーションへは手を入れない）。
-//! production コード（`crates/engine/src/`）は変更しない。
+//! 「複製・踏襲」方式）。production コード（`crates/engine/src/`）は原則変更しない
+//! 契約だが、Issue #310 対応（[`LexicalOverlapReranker`] の既定重みを字句一致優先
+//! から fused 優位へ変更。理由: 等重み既定では字句一致優先による正解脱落が実測され、
+//! `after_hits20 >= baseline_hits20` の非劣化アサーションが red だった）はオーナー
+//! 判断による例外で、本ファイルの固定値アサーションも実測値へ合わせて更新している。
 //!
 //! **比較対象**（いずれも production API のみを使用。BM25/RRF/リランキングの
 //! 再実装は行わない）:
@@ -529,7 +532,7 @@ fn rerank_recall_large_scale_regression() {
         "baseline（リランキングなし）の Recall@20 hit 数が変化した"
     );
     assert_eq!(
-        r.after_hits20, 383,
+        r.after_hits20, 388,
         "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
     assert_eq!(r.pool_hits100, 837, "プール Recall@100 hit 数が変化した");
@@ -538,15 +541,15 @@ fn rerank_recall_large_scale_regression() {
     // SEARCH-7 契約メモ: `after_hits20 >= baseline_hits20`（リランキング層が
     // Recall を悪化させていないことの独立検証）。境界同点グループ完全化の
     // フォールバックを位置ベースの部分採用から観測範囲の全保持へ変更した
-    // Issue #320 codex-review P1 指摘対応適用後、この非劣化アサーションが
-    // 再び破れている（本フィクスチャでは baseline 387 > after 383）。原因は
+    // Issue #320 codex-review P1 指摘対応適用後、この非劣化アサーションが一時
+    // 破れていた（本フィクスチャでは baseline 387 > after 383）。原因は
     // `rank_fused`（Issue #320 で `TieRank::GroupEnd` へ揃え済み）の不整合では
-    // なく、境界の同点グループを丸ごと保持する変更そのものが baseline の
-    // 候補プール構成を変えたことによる（この非劣化と Issue #320 の再取得
-    // 上限〔`MAX_FETCH_K`〕の大きさは独立: 上限を `pool_depth` 相対の小さい値へ
-    // 変えても同じ baseline 387 / after 383 が再現する）。`LexicalOverlapReranker`
-    // 側の対応要否はオーナー判断待ち（本テストファイルは「production コードは
-    // 変更しない」契約のため、ここでは非劣化アサーションを弱めずそのまま残す）。
+    // なく、`LexicalOverlapReranker` の等重み既定（fused_weight = lexical_weight
+    // = 1.0）で字句一致順位の寄与が融合順位の寄与を上回り、字句一致トークンが
+    // 脱落した正解文書が字句一致した decoy に逆転されたことによる。Issue #310
+    // 対応で既定重みを `fused_weight:lexical_weight = 3.0:1.0`（fused 優位）へ
+    // 変更し、この非劣化を回復した（after 388 ≥ baseline 387。採用比率の実測は
+    // `docs/design/rerank-recall-regression.md` 参照）。
     assert!(
         r.after_hits20 >= r.baseline_hits20,
         "リランキング層（LexicalOverlapReranker）が baseline（リランキングなし）の Recall@20 を悪化させた"
@@ -604,9 +607,9 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
 
 /// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る（改善幅 = after −
 /// baseline の下限）。改善幅 0 は「改善は必須ではないが悪化は許さない」という
-/// 正当な設定である（Issue #310 以降、この非劣化は層 A では成立しない既知の
-/// contract gap があり `after_hits20 >= baseline_hits20` の固定値検証は行って
-/// いない。SEARCH-7 方式選定＝オーナー判断まで層 B 側の任意設定として残す）。
+/// 正当な設定である（層 A の `after_hits20 >= baseline_hits20` 固定値検証
+/// （Issue #310 対応で既定重み変更後は成立する）と同じ非劣化条件を、層 B では
+/// spec 由来の下限として任意設定できるようにする）。
 /// [`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり `[0.0, 1.0]`
 /// （0 を含む）を許容範囲とする。
 fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
