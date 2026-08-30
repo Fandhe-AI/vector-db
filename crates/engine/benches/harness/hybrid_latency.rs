@@ -118,6 +118,23 @@ pub fn generate_corpus(
     }
 
     let mut rng = DeterministicRng::new(seed);
+    // 疎チャネル（`texts`）専用の独立 RNG 系列。`rng`（密ベクトル用）と同じ系列を
+    // 共有すると、クラスタモード（`Some(levels)`）はプロトタイプ生成
+    // （`levels` 回の `next_vector` 消費）と各文書のインデックス選択（1 回の
+    // `next_u64` 消費）という `quantize_levels` の値に依存した消費量になり、
+    // 通常モード（`None`。文書ごとに `next_vector(dim)` で `dim` 回消費）とは
+    // `rng` の消費ペースが食い違う。同一 `rng` から続けて `texts` を生成すると、
+    // その消費量の差がそのまま `texts` の内容差として伝播し、A/B 比較
+    // （`hybrid_latency_bench.rs`）が密チャネルの再取得ループ以外の要因
+    // （疎チャネルの内容差 → `SparseIndex` の内容・疎候補・RRF 融合結果の変化）
+    // まで含んでしまう（codex-review P1・PR #325 指摘）。`texts` を `rng` から
+    // 完全に切り離した専用系列（`seed` に固定オフセットを加えるだけで、
+    // ベクトル生成の消費量には一切依存しない）にすることで、同一
+    // `(seed, num_docs, vocab_size)` に対して `texts` は `quantize_levels` の値に
+    // 関わらず常に同一になる。オフセット定数は [`generate_query`] が使う
+    // `0x5151_5151_5151_5151`（+ クエリ番号 `0..NUM_QUERIES` 分の加算）と衝突しない
+    // 値を選ぶ。
+    let mut text_rng = DeterministicRng::new(seed.wrapping_add(0x9e37_79b9_9e37_79b9));
     let mut ids = Vec::with_capacity(num_docs);
     let mut vectors = Vec::with_capacity(num_docs * dim);
     let mut texts = Vec::with_capacity(num_docs);
@@ -143,14 +160,16 @@ pub fn generate_corpus(
 
         // 疎チャネル: 語彙サイズ内のトークンを数語連結するだけの合成文（BM25 統計が
         // 退化しない程度の非自明な内容であれば足りる。QA 的な正解判定は本ベンチの
-        // 対象外——密側再取得ループの所要時間のみを計測する）。
-        let num_tokens = 3 + (rng.next_u64() % 4) as usize; // 3..=6
+        // 対象外——密側再取得ループの所要時間のみを計測する）。`text_rng`（上記）
+        // から消費するため、`rng` 側の消費量（`quantize_levels` に依存）とは
+        // 無関係に決定的な内容になる。
+        let num_tokens = 3 + (text_rng.next_u64() % 4) as usize; // 3..=6
         let mut text = String::new();
         for i in 0..num_tokens {
             if i > 0 {
                 text.push(' ');
             }
-            let token_idx = (rng.next_u64() as usize) % vocab_size.max(1);
+            let token_idx = (text_rng.next_u64() as usize) % vocab_size.max(1);
             text.push_str(&format!("tok{token_idx}"));
         }
         texts.push(text);

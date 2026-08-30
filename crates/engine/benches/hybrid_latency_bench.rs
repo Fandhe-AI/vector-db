@@ -82,8 +82,12 @@ fn fail_closed(msg: impl std::fmt::Display) -> ! {
 }
 
 /// 1 段（コーパス規模 × 量子化有無）の計測。`corpus` に対する `queries` 件の
-/// クエリを round-robin し、`RefetchTrackingProvider` で再取得統計を集計しつつ
-/// `harness::protocol::run` で p95/median を測る。
+/// クエリを round-robin しつつ `harness::protocol::run` で p95/median を測る
+/// （計測区間は `hybrid_search` 呼び出しのみで `RefetchTrackingProvider` の
+/// 統計読み取りは行わない）。再取得統計（`RefetchStats`）は計測とは独立した
+/// 時間非依存の 1 パスで `queries` を 1 回ずつ処理して集計する（PR #325
+/// レビュー対応: 計測区間内での統計蓄積は warmup 分の混入・`Vec` 再確保による
+/// p95 汚染を招くため分離した）。
 fn measure_stage(stage_name: &str, corpus: &Corpus, queries: &[Query], cfg: &RrfConfig) {
     let sparse_index = corpus
         .build_sparse_index()
@@ -94,10 +98,19 @@ fn measure_stage(stage_name: &str, corpus: &Corpus, queries: &[Query], cfg: &Rrf
     let config = MeasurementConfig::new(20, 30, SEED)
         .unwrap_or_else(|e| fail_closed(format!("measurement config: {e}")));
 
-    // クエリ単位の再取得統計は計測フェーズの外側（`run` の外）で 1 回集計する
-    // （`run` は同じ workload を warmup + 計測回数だけ繰り返すため、`run` の内側で
-    // 統計をリセット・蓄積すると warmup 分と計測分が混在し集計が破綻する）。
-    let mut refetch_stats: Vec<RefetchStats> = Vec::with_capacity(queries.len());
+    // 計測フェーズ（`run` の内側）は p95/median を得るためだけの区間で、
+    // `queries` を round-robin しつつ warmup 回・計測回（合計 `run` が
+    // `workload` を呼ぶ回数）繰り返す。ここで再取得統計（`RefetchStats`）を
+    // `push` すると、(1) warmup 分と計測分の呼び出しが同じ `Vec` に混在して
+    // クエリ数の集計が呼び出し回数まで水増しされ（Cursor Bugbot 指摘・PR #325）、
+    // (2) 事前確保した容量を超えたときの `Vec` 再確保（ヒープ確保）が計測区間の
+    // 内側で発生し p95 を汚染する（codex-review P1 指摘・PR #325）という 2 つの
+    // 計測汚染が起きる。再取得統計はクエリと同一コーパスに対して決定的
+    // （`hybrid_search` は純粋な検索呼び出しで、同じ `(query, corpus)` なら
+    // provider 呼び出し回数・`max_k_seen` は常に同じ）ため、`run` による計測とは
+    // 完全に切り離した別パスで 1 クエリにつき 1 回だけ集計すれば情報は失われない。
+    // 計測区間（`run` に渡す `workload`）は `provider` を経由した `hybrid_search`
+    // 呼び出しのみを行い、統計の読み取り・蓄積を一切行わない。
     let mut query_idx = 0usize;
 
     let measurement = run(&config, || {
@@ -111,16 +124,32 @@ fn measure_stage(stage_name: &str, corpus: &Corpus, queries: &[Query], cfg: &Rrf
             query: &query.vector,
             k: TOP_K,
         };
-        let hits = hybrid_search(&provider, input, &sparse_index, &query.text, TOP_K, cfg)
-            .unwrap_or_else(|e| fail_closed(format!("hybrid_search failed: {e}")));
+        hybrid_search(&provider, input, &sparse_index, &query.text, TOP_K, cfg)
+            .unwrap_or_else(|e| fail_closed(format!("hybrid_search failed: {e}")))
+    })
+    .unwrap_or_else(|e| fail_closed(format!("measurement protocol violation: {e}")));
+
+    // 再取得統計は計測（`run`）とは別の、時間非依存の 1 パスで集計する（上記コメント
+    // 参照）。`queries` の各要素をちょうど 1 回だけ処理するため、`summarize_refetch_stats`
+    // が返す `queries` はユニーククエリ数（`queries.len()`）と一致する。
+    let mut refetch_stats: Vec<RefetchStats> = Vec::with_capacity(queries.len());
+    for query in queries {
+        provider.reset();
+        let input = SearchInput {
+            ids: &corpus.ids,
+            vectors: &corpus.vectors,
+            dim: corpus.dim,
+            query: &query.vector,
+            k: TOP_K,
+        };
+        hybrid_search(&provider, input, &sparse_index, &query.text, TOP_K, cfg)
+            .unwrap_or_else(|e| fail_closed(format!("hybrid_search failed (stats pass): {e}")));
         refetch_stats.push(aggregate_refetch_stats(
             provider.calls(),
             provider.max_k_seen(),
             visible_set_size,
         ));
-        hits
-    })
-    .unwrap_or_else(|e| fail_closed(format!("measurement protocol violation: {e}")));
+    }
 
     let summary = summarize_refetch_stats(&refetch_stats);
     let p95 = harness::accept::p95_from_samples(&measurement.samples)

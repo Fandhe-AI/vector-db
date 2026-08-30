@@ -111,6 +111,28 @@ fn quantized_corpus_produces_far_fewer_distinct_vectors_than_continuous() {
     );
 }
 
+#[test]
+fn generate_corpus_texts_are_identical_across_quantize_modes() {
+    // A/B 比較（`hybrid_latency_bench.rs`）が密チャネルの再取得ループ以外の変数を
+    // 持たないための前提: 同一 `(seed, num_docs, vocab_size)` なら `quantize_levels`
+    // の値（`None`/`Some(n)`）に関わらず `texts`（疎チャネル）は完全に一致しなければ
+    // ならない（codex-review P1 指摘・PR #325。`quantize_levels` はベクトル生成のみに
+    // 影響し、疎チャネルへ波及してはいけない契約を固定する）。
+    let continuous = generate_corpus(11, 200, 16, 4, None).expect("corpus ok");
+    let quantized_a = generate_corpus(11, 200, 16, 4, Some(3)).expect("corpus ok");
+    let quantized_b = generate_corpus(11, 200, 16, 4, Some(7)).expect("corpus ok");
+
+    assert_eq!(
+        continuous.texts, quantized_a.texts,
+        "quantize_levels=None と Some(3) で texts が食い違った"
+    );
+    assert_eq!(
+        continuous.texts, quantized_b.texts,
+        "quantize_levels=None と Some(7) で texts が食い違った（quantize_levels の \
+         値自体が texts に波及している）"
+    );
+}
+
 // --- generate_query ---
 
 #[test]
