@@ -31,7 +31,7 @@ use tokenizers::utils::padding::PaddingParams;
 use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
 
-use super::{CrossEncoderBackend, CrossEncoderError};
+use super::{CrossEncoderBackend, CrossEncoderError, MAX_CROSS_ENCODER_SEQ_LEN};
 
 /// `ort`（ONNX Runtime）+ `tokenizers` による実推論バックエンド。
 /// [`CrossEncoderReranker`](super::CrossEncoderReranker) から `&self` で呼ばれるため、
@@ -65,7 +65,12 @@ impl OnnxCrossEncoderBackend {
         tokenizer_path: &Path,
         max_seq_len: usize,
     ) -> Result<Self, CrossEncoderError> {
-        if max_seq_len == 0 {
+        // codex-review 指摘（PR #336 P1）: `CrossEncoderConfig::new` を経由しない
+        // 直接呼び出し経路でも `MAX_CROSS_ENCODER_SEQ_LEN` の上限を必ず強制する
+        // （`CrossEncoderReranker::new` の一致検査だけに委ねると、`from_files`／
+        // `score_pairs` を直接呼ぶ利用者がこの上限契約を回避してトークナイズ時の
+        // テンソル確保を無制限化できてしまうため、構築時点で fail-closed に拒否する）。
+        if max_seq_len == 0 || max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN {
             return Err(CrossEncoderError::TruncationFailed);
         }
 
@@ -249,6 +254,25 @@ mod tests {
         match OnnxCrossEncoderBackend::from_files(&bogus, &bogus_tokenizer, 0) {
             Err(e) => assert_eq!(e, CrossEncoderError::TruncationFailed),
             Ok(_) => panic!("expected TruncationFailed error for max_seq_len == 0"),
+        }
+    }
+
+    /// codex-review 指摘（PR #336 P1）の固定テスト: `CrossEncoderConfig::new` を
+    /// 経由しない `from_files` 直接呼び出しでも `MAX_CROSS_ENCODER_SEQ_LEN` を
+    /// 超える `max_seq_len` を拒否することを確認する。
+    #[test]
+    fn from_files_rejects_max_seq_len_exceeding_shared_limit() {
+        let bogus = PathBuf::from("/nonexistent/path/does-not-exist.onnx");
+        let bogus_tokenizer = PathBuf::from("/nonexistent/path/does-not-exist-tokenizer.json");
+        match OnnxCrossEncoderBackend::from_files(
+            &bogus,
+            &bogus_tokenizer,
+            MAX_CROSS_ENCODER_SEQ_LEN + 1,
+        ) {
+            Err(e) => assert_eq!(e, CrossEncoderError::TruncationFailed),
+            Ok(_) => panic!(
+                "expected TruncationFailed error for max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN"
+            ),
         }
     }
 }
