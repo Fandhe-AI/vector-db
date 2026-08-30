@@ -822,10 +822,15 @@ fn run_core16_scaling_diagnostic(
             );
         }
         Err(msg) => {
-            println!(
+            // 測定不能を `Ok(())` へ合流させると、GPU 初期化失敗等で診断が
+            // 1 件も測定値を得られなかった実行を運用者・スクリプトが成功と
+            // 誤認しうる（fail-closed。PR #326 codex-review P1 指摘対応）。
+            // `main` の `Err` ハンドラ（`std::process::exit(1)`）へ委ね、
+            // 非ゼロ終了させる。
+            return Err(format!(
                 "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} not measurable \
                  ({msg})"
-            );
+            ));
         }
     }
     Ok(())
