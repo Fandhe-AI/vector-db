@@ -300,6 +300,51 @@ fn using_plan_wire_dispatch_rejects_when_embedder_unconfigured() {
     read_ready_for_query(&mut stream);
 }
 
+/// Issue #315 ポインタ:「`USING PLAN` が実 Ollama 経由で SQL エラーなしに
+/// 0 行を返す」観測を wire フレーミング越しに再確認する。プランナーが
+/// `mode_hint: "precision"` を推定すると確信度ゲート（SEARCH-9）により
+/// `RowDescription`→`CommandComplete("SELECT 0")`→`ReadyForQuery`（エラー
+/// 応答なし・接続継続）となり、続けて同一クエリへ `USING MODE 'recall'` を
+/// 付けるとゲートを経由せず seed 2 行が返る（`crates/engine/tests/
+/// sql_using_plan.rs::using_plan_respects_using_mode_precision` の
+/// in-process オラクルと同じ決定的フィクスチャ。判断根拠は
+/// `docs/design/using-plan-precision-empty-result.md` 参照）。
+#[test]
+fn using_plan_wire_precision_hint_returns_zero_rows_then_recall_override_returns_rows() {
+    let (storage, _guard) = seeded_storage();
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+        .with_embedder(Box::new(DeterministicEmbedder { dim: DIM }))
+        .with_query_planner(Box::new(StubLlmClient {
+            response: r#"{"search_terms": ["alpha", "beta"], "path_hint": null, "kind_hint": null, "mode": "precision"}"#,
+        }));
+    let (mut stream, _users_path) = spawn_with_alice(Arc::new(core));
+
+    // プランナー推定 `precision`（明示 `USING MODE`/`SET search_mode` なし）:
+    // エラー応答を経由せず `RowDescription` の直後に `CommandComplete("SELECT 0")`
+    // が届く（`DataRow` は 0 件のため待たない）。
+    send_simple_query(&mut stream, USING_PLAN_SELECT);
+    let _columns = read_row_description(&mut stream);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 0");
+    read_ready_for_query(&mut stream);
+
+    // 同一接続・同一クエリへ明示 `USING MODE 'recall'` を付けると確信度ゲートを
+    // 経由せず seed 2 行が返る（positive control。空集合が embedder/query_planner
+    // の設定不備やテナント境界の取りこぼしではないことを示す）。
+    send_simple_query(
+        &mut stream,
+        "SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'recall'",
+    );
+    let _columns = read_row_description(&mut stream);
+    let mut ids: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        ids.push(read_data_row(&mut stream)[0].clone().expect("id"));
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["1", "2"]);
+    assert_eq!(read_command_complete(&mut stream), "SELECT 2");
+    read_ready_for_query(&mut stream);
+}
+
 /// TASK-117・PLAN-9・fail-closed: 展開クライアントが不正な JSON を返した場合も
 /// `query_planner::parse_expansion` の既存 fail-closed 契約により `XX000`
 /// （固定の一般化メッセージ）で拒否される。実 LLM の応答内容は untrusted 入力

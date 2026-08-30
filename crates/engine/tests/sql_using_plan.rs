@@ -406,6 +406,13 @@ fn using_plan_respects_using_mode_precision() {
     // 意図した挙動。SEARCH-9 の管轄）。本テストの目的は「`USING MODE` の優先順位
     // 解決が `USING PLAN` 経路でも既存どおり効くこと」であり、`recall`（既定）
     // モードでは同じクエリが結果を返すことと対比して確認する。
+    //
+    // Issue #315 ポインタ: 「`USING PLAN` が実 Ollama 経由で SQL エラーなしに
+    // 0 行を返す」という観測は、この `precision` 経路の契約どおりの挙動と一致する
+    // （`docs/design/using-plan-precision-empty-result.md` 参照）。以下 0 件は
+    // 非決定的な偶然ではなく、`RecordingEmbedder` が seed 2 行・クエリのいずれにも
+    // `t.len()` 由来の定数ベクトルを返すため、密・疎の 1 位が一致せず正規化 RRF の
+    // 最良スコアが確信度ゲートの下限を下回ることで決定的に生じる。
     let mut session = SessionState::default();
     let outcome = core
         .execute_sql_in_session(
@@ -413,11 +420,17 @@ fn using_plan_respects_using_mode_precision() {
             &mut session,
             "SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'precision'",
         )
-        .expect("USING MODE should be honored alongside USING PLAN");
-    assert!(
-        matches!(outcome, SqlOutcome::Query(_)),
-        "expected Query outcome"
-    );
+        .expect("USING MODE should be honored alongside USING PLAN (SQL エラーにならない)");
+    match outcome {
+        SqlOutcome::Query(result) => {
+            assert!(
+                result.rows.is_empty(),
+                "precision mode's confidence gate is expected to yield an empty result set \
+                 (not a SQL error) for this deterministic constant-vector fixture — Issue #315"
+            );
+        }
+        other => panic!("expected Query outcome, got {other:?}"),
+    }
 
     let recall_outcome = core
         .execute_sql_in_session(
