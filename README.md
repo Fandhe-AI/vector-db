@@ -173,6 +173,8 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契約（成功系・fail-closed 系・RLS 不変）は `crates/wire-server/tests/wire_using_plan.rs`（`make ci` 対象）が決定的スタブで検証します。実 Ollama・実クライアント 3 種（psql／psycopg／pg）を使った PLAN-9 数値基準の実測ハーネスは本リポジトリでは未整備です（TASK-116 の `make bench-tier` と同様の運用者実行手順が必要になる見込み。整備は別タスクとして追跡してください）。
 
+**0 行時の切り分け**: `USING PLAN` が SQL エラーなしで 0 行を返す場合、まず `EXPLAIN SELECT ... USING PLAN(...)` の `mode`/`mode_source` を確認してください。`mode: precision` / `mode_source: planner_estimate` であれば確信度ゲート（SEARCH-9）による既知の空集合応答です（`USING MODE 'recall'` 等で明示上書きできます）。詳細な調査結果・再現手順は `docs/design/using-plan-precision-empty-result.md`（Issue #315）を参照してください。
+
 ### 境界同点グループ再取得ループのレイテンシ計測（Issue #324）
 
 `make bench-hybrid`（`crates/engine/benches/hybrid_latency_bench.rs`）は、PR #320
