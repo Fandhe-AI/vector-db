@@ -910,9 +910,13 @@ fn hybrid_recall_small_scale_regression() {
     // Issue #310（RRF 融合の同点順位規約 `TieRank::GroupEnd`・密プール境界の同点
     // グループ完全化）適用前の `hits20` は 171（`docs/design/
     // hybrid-recall-regression.md`「Issue #310: engine 側改善」節参照）。
+    // Issue #320 大規模段追加調査（非正スコア候補の順位付け除外。`hybrid.rs::
+    // trim_non_positive_score_tail` 参照）適用前の `hits20` は 182。非正スコア
+    // （無シグナル）候補が偶然正解集合に含まれていたケースが除外対象になった分、
+    // 180 へ 2 件減少した。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits20, 180, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
@@ -1028,6 +1032,116 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(
         r_exp.ceil100, r.ceil100,
         "展開あり経路（MockLlmClient）の Recall@100 理論上限が展開なしと一致しなかった"
+    );
+}
+
+/// [`ParallelSearchProvider`]（production 実装）へ委譲しつつ、境界同点グループ
+/// 完全化（`hybrid.rs` 内部実装）の再取得ループが要求する `SearchInput::k`
+/// （＝密側 `fetch_k`）の最大値をクエリ単位で観測する診断用ラッパ（Issue #320
+/// 大規模段追加調査）。`hybrid_search` は `SearchProvider` を `&dyn` で受け取る
+/// ため、密側の再取得進行はこのラッパ経由でのみテストから観測できる
+/// （`hybrid.rs::MAX_FETCH_K` は `pub(crate)` のため本クレート外の統合テストからは
+/// 参照できない。可視集合サイズ [`LARGE_NUM_DOCS`] への到達有無で代用する:
+/// 本フィクスチャでは `MAX_FETCH_K`〔`MAX_POOL_DEPTH * 4` = 40,000〕が可視集合
+/// サイズ〔20,000〕を上回るため、再取得ループの実質的な上限は可視集合サイズで
+/// 頭打ちになる）。挙動そのものは変えない（`search` は無条件に `inner` へ委譲）。
+struct MaxKTrackingProvider {
+    inner: ParallelSearchProvider,
+    max_k_seen: std::sync::atomic::AtomicUsize,
+}
+
+impl MaxKTrackingProvider {
+    fn new() -> Self {
+        Self {
+            inner: ParallelSearchProvider,
+            max_k_seen: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.max_k_seen
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn max_k_seen(&self) -> usize {
+        self.max_k_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl SearchProvider for MaxKTrackingProvider {
+    fn search(
+        &self,
+        input: SearchInput<'_>,
+    ) -> Result<Vec<engine::kernel::CandidateHit>, engine::kernel::KernelError> {
+        self.max_k_seen
+            .fetch_max(input.k, std::sync::atomic::Ordering::Relaxed);
+        self.inner.search(input)
+    }
+}
+
+/// TASK-104（SEARCH-2）Issue #320 大規模段追加調査の直接固定: 非正スコア（無
+/// シグナル）候補を境界同点グループ完全化の対象から外す（`hybrid.rs::
+/// trim_non_positive_score_tail`）ことで、密側の再取得ループが可視集合全体
+/// （[`LARGE_NUM_DOCS`] = 20,000 件）まで到達するクエリが 0 件になることを固定
+/// する（対応前は 100 クエリ中 53 件で到達していた。修正方針の直接検証）。
+#[test]
+fn hybrid_recall_large_scale_dense_refetch_never_reaches_visible_set() {
+    let verbose = verbose_requested_from_env();
+    let (docs, qa) = generate_corpus(
+        LARGE_SEED,
+        LARGE_NUM_DOCS,
+        LARGE_NUM_QUERIES,
+        LARGE_VOCAB_SIZE,
+    );
+    assert_corpus_within_limits(&docs);
+
+    let fixture = SearchFixture::build(&docs);
+    let provider = MaxKTrackingProvider::new();
+    let cfg = RrfConfig::default();
+    let dim = fixture.dim as u32;
+
+    let mut reached_visible_set = 0usize;
+    let mut max_k_across_queries = 0usize;
+    for case in &qa {
+        provider.reset();
+        let input = SearchInput {
+            ids: &fixture.ids,
+            vectors: &fixture.vectors,
+            dim,
+            query: &case.query_vector,
+            k: 20,
+        };
+        let _ = hybrid_search(
+            &provider,
+            input,
+            &fixture.sparse_index,
+            &case.query_text,
+            20,
+            &cfg,
+        )
+        .expect("hybrid search ok");
+        let max_k = provider.max_k_seen();
+        max_k_across_queries = max_k_across_queries.max(max_k);
+        if max_k >= LARGE_NUM_DOCS {
+            reached_visible_set += 1;
+        }
+    }
+
+    if verbose {
+        println!(
+            "=== Issue #320 大規模段 密側再取得診断（docs={} queries={}） ===",
+            docs.len(),
+            qa.len()
+        );
+        println!(
+            "dense fetch_k max across queries={max_k_across_queries}  \
+             queries reaching visible set size ({LARGE_NUM_DOCS})={reached_visible_set}"
+        );
+    }
+
+    assert_eq!(
+        reached_visible_set, 0,
+        "密側の境界同点グループ完全化の再取得ループが可視集合全体まで到達したクエリが存在する"
     );
 }
 

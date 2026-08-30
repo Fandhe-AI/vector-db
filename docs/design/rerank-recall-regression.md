@@ -130,6 +130,15 @@ after 383）。同一の baseline/after 数値は、境界同点グループ完�
 スコープでは非劣化アサーションを弱めずそのまま残している
 （`crates/engine/tests/rerank_recall.rs` の SEARCH-7 契約メモも参照）。
 
+Issue #320 の大規模段追加調査（非正スコア候補の順位付け除外。`hybrid.rs::
+trim_non_positive_score_tail`。`docs/design/hybrid-recall-regression.md`「Issue
+#320 大規模段追加調査」節参照）の適用前後で、本ハーネスの上表の数値
+（baseline hits20・after hits20・pool hits100/hits200）はいずれも変化していない
+（本フィクスチャでは非正スコア候補が測定対象クエリの結果へ影響しなかった）。
+`after_hits20 >= baseline_hits20` の red は同追加調査（可視集合全体までの再取得
+到達の解消）とは独立の事象であり、下記の原因（境界同点グループを丸ごと保持する
+変更そのものによる baseline 候補プール構成の変化）のまま継続している。
+
 プール自体の Recall@200（0.9066）と最終 Recall@20（after: 0.9341）を比較すると、
 pool_depth 200 の候補プールがすでに正解の大半を含んでおり、リランキングは
 その中の順位付けを改善する形で寄与し続けている（プールに入っていない正解＝

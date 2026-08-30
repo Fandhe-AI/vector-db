@@ -613,6 +613,31 @@ fn validate_extended_pool<T>(
     Ok(())
 }
 
+/// 非正スコア（`score <= 0.0`）の候補は RRF の寄与がゼロ（`rank` 由来の減衰項のみが
+/// 加算され、スコアそのものは融合に使われない設計だが、意味的には「無シグナル」を
+/// 表す）であり、境界同点グループ完全化（[`complete_boundary_tie_group_by`]）の対象
+/// から外す（Issue #320 大規模段追加調査）。密（[`CandidateHit::score`]）・疎
+/// （[`crate::sparse::ScoredDoc::score`]。BM25 は語一致なしで 0）いずれも、
+/// 「クエリと一切無関係」を意味する非正スコアの候補が可視集合の大半を占める
+/// コーパスでは、その長い同点尾（無関係文書のスコア 0 同点）が境界同点グループ
+/// の完全化ループを可視集合全体（[`MAX_FETCH_K`] またはそれに近い `fetch_k`）まで
+/// 引き伸ばしてしまう。`items` は呼び出し元がスコア降順であることを検証済み
+/// （[`validate_extended_pool`]）のため、非正スコアの範囲は必ず末尾の連続区間になり、
+/// 先頭から見て最初に非正スコアが現れた位置で単純に切り詰めれば足りる。
+///
+/// 契約検証（[`validate_extended_pool`]）は本関数の呼び出し**前**、切り詰め前の
+/// 拡張取得列全体に対して行う（呼び出し元の既存契約を維持。本関数はランク付け対象
+/// の絞り込みのみを行い、有限性・ソート順・重複 id の検証は行わない）。
+fn trim_non_positive_score_tail<T>(items: Vec<T>, score_of: impl Fn(&T) -> f64) -> Vec<T> {
+    let cut = items
+        .iter()
+        .position(|item| score_of(item) <= 0.0)
+        .unwrap_or(items.len());
+    let mut items = items;
+    items.truncate(cut);
+    items
+}
+
 /// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
 /// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
 /// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
@@ -1211,7 +1236,16 @@ pub fn hybrid_search_boosted(
         // 総数以上なら provider はそれ以上返しようがなく、`hits.len() <
         // dense_fetch_k` なら provider 自身が「これ以上ない」ことを示している。
         let exhaustive = dense_fetch_k >= input.ids.len() || hits.len() < dense_fetch_k;
-        match complete_boundary_tie_group(hits, cfg.pool_depth(), exhaustive) {
+        // 非正スコア（無シグナル）の末尾を境界完全化の対象から外す
+        // （[`trim_non_positive_score_tail`] ドキュメント参照）。降順ソート済みの
+        // 列から非正スコアが 1 件でも切り落とされた場合、それより先の未取得候補は
+        // 単調非増加の順序契約上すべて非正スコアであることが保証されるため、
+        // 正スコアの候補はこの時点で取得済み範囲に全件含まれている
+        // （`positive_exhaustive` を `true` とみなせる）。
+        let raw_len = hits.len();
+        let positive_hits = trim_non_positive_score_tail(hits, |h| f64::from(h.score));
+        let positive_exhaustive = exhaustive || positive_hits.len() < raw_len;
+        match complete_boundary_tie_group(positive_hits, cfg.pool_depth(), positive_exhaustive) {
             TieBoundary::Resolved(resolved) => break (resolved, dense_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if dense_fetch_k >= dense_cap {
@@ -1268,7 +1302,17 @@ pub fn hybrid_search_boosted(
         // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
         // 同じ判定基準。
         let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
-        match complete_boundary_tie_group_by(hits, cfg.pool_depth(), exhaustive, |d| d.score) {
+        // 密側と同じ理由（[`trim_non_positive_score_tail`] ドキュメント参照）で、
+        // 非正スコア（BM25 は語一致なしで 0）の末尾を境界完全化の対象から外す。
+        let raw_len = hits.len();
+        let positive_hits = trim_non_positive_score_tail(hits, |d| d.score);
+        let positive_exhaustive = exhaustive || positive_hits.len() < raw_len;
+        match complete_boundary_tie_group_by(
+            positive_hits,
+            cfg.pool_depth(),
+            positive_exhaustive,
+            |d| d.score,
+        ) {
             TieBoundary::Resolved(resolved) => break (resolved, sparse_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if sparse_fetch_k >= sparse_cap {
@@ -2480,8 +2524,13 @@ mod tests {
         // (k_const + 1)` = `1/61 ≈ 0.0164`（弱い方のチャネルの寄与だけを仮定する
         // 安全側）を使うため、重みが大きい方のチャネルが空でも正しく拒否される
         // ことを確認する。
+        // Issue #320 大規模段追加調査による非正スコア（無シグナル）候補の順位付け
+        // 除外（`trim_non_positive_score_tail` ドキュメント参照）により、id 2 の
+        // 密スコアは 0.0 ではなく正の小さい値（0.05）にする必要がある。0.0 のままだと
+        // id 2 は密プールから除外され、疎チャネルも空のためプールへ一切現れず、
+        // ブースト対象が不在で本テストの意図（安全側キャップでの拒否）を検証できない。
         let cfg = RrfConfig::new(60.0, 1.0, 100.0, 200).expect("valid cfg");
-        let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 1.0];
+        let vectors: Vec<f32> = vec![1.0, 0.0, 0.05, 0.5];
         let ids = [1u64, 2u64];
         let input = SearchInput {
             ids: &ids,
