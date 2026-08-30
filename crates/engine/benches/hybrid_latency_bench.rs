@@ -27,7 +27,7 @@
 //! 分布そのもの（連続値 vs. プロトタイプクラスタ）が異なり、厳密には「再取得
 //! ループの有無だけ」が変数ではない（疎チャネルの内容は `rng` 系列を分離して
 //! 両段で共有するため揃えている。`harness::hybrid_latency::generate_corpus`
-//! ドキュメント参照）。また今回の同点誘発コーパスは `reached_visible_set=0/50`
+//! ドキュメント参照）。また今回の同点誘発コーパスは `reached_visible_set=0/20`
 //! （`docs/design/hybrid-refetch-latency.md`「実測結果」節）であり、再取得
 //! ループが可視集合サイズまで到達する最悪ケース（`tests/hybrid_recall.rs::
 //! hybrid_recall_large_scale_dense_refetch_is_bounded_by_visible_set_size` が
@@ -107,7 +107,11 @@ fn measure_stage(stage_name: &str, corpus: &Corpus, queries: &[Query], cfg: &Rrf
     let provider = RefetchTrackingProvider::new(ParallelSearchProvider);
     let visible_set_size = corpus.ids.len();
 
-    let config = MeasurementConfig::new(20, 30, SEED)
+    // 計測回数（`measured_iterations`）は `NUM_QUERIES` の倍数にする。round-robin
+    // で `queries[query_idx % queries.len()]` を選ぶため、倍数でないとクエリ 0..r-1
+    // （`r = measured_iterations % NUM_QUERIES`）だけ 1 回多く計測され、p95/median が
+    // 特定クエリへ偏って重み付けされる（codex-review P1 指摘・PR #325）。
+    let config = MeasurementConfig::new(20, 2 * NUM_QUERIES as u32, SEED)
         .unwrap_or_else(|e| fail_closed(format!("measurement config: {e}")));
 
     // 計測フェーズ（`run` の内側）は p95/median を得るためだけの区間で、
