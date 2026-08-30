@@ -36,7 +36,7 @@
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::catalog::{self, CatalogError};
-use crate::storage::{decode_row, Storage, StorageError, Visibility};
+use crate::storage::{Storage, StorageError, Visibility};
 
 /// アリーナが保持してよい行数の上限（アロケーション前の事前検証に使う。
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。`pub(crate)`:
@@ -655,6 +655,14 @@ impl VectorArena {
         let mut buffers = GrowableArenaBuffers::new();
         // `predicate` を通過した（＝実際に格納する）行数。上限検証はこの値に対して行う。
         let mut visible_row_count: usize = 0;
+        // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #314・SQL-1・
+        // TASK-83 条件7）。`decode_row`（`Vec::with_capacity` を行ごとに新規確保）の
+        // 代わりに `storage::decode_row_embedding_and_metadata_into` で本バッファへ
+        // 書き込み、`buffers.push_row` が `extend_from_slice` で平坦バッファへコピー
+        // した直後に次の行へ再利用する。同一テーブルは全行同一次元
+        // （`validated_vector_dim_in_txn` で確認済み）のため、初回のみ確保が発生し
+        // 2 行目以降は再確保なしで使い回せる。
+        let mut embedding_scratch: Vec<f32> = Vec::new();
 
         for entry in table.iter().map_err(StorageError::from)? {
             let (k, v) = entry.map_err(StorageError::from)?;
@@ -683,14 +691,12 @@ impl VectorArena {
 
             // ここに到達するのは可視行だけ。以降は embedding を含む完全デコードを行い、
             // 次元不一致・デコードエラーは従来どおり fail-closed に伝播する
-            // （部分的なアリーナを返さない）。
-            let row = decode_row(id, buf).map_err(ArenaError::from)?;
-            let found_dim =
-                u32::try_from(row.embedding.len()).map_err(|_| ArenaError::DimMismatch {
-                    id,
-                    expected: expected_dim,
-                    found: u32::MAX,
-                })?;
+            // （部分的なアリーナを返さない）。行ごとに新しい `Vec<f32>` を確保する
+            // `decode_row` の代わりに、ループ外で確保した `embedding_scratch` へ
+            // 書き込む借用デコード API を使う（上記コメント参照。Issue #314）。
+            let (found_dim, metadata) =
+                crate::storage::decode_row_embedding_and_metadata_into(buf, &mut embedding_scratch)
+                    .map_err(ArenaError::from)?;
             if found_dim != expected_dim {
                 return Err(ArenaError::DimMismatch {
                     id,
@@ -711,11 +717,12 @@ impl VectorArena {
             // 閉じたため、`id` は 1 つの可視集合内で行を一意に指せない。スロット番号は
             // `(tenant_id, id)` の行と 1 対 1 に対応する）。呼び出し元側で
             // 別カウンタを持たせない（本ループの push 条件とドリフトさせない）。
-            // TASK-79（SQL-9）: `row.embedding` はこの時点で既にデコード済み（直前の
-            // `decode_row` 呼び出し）のため、追加コピーなしでフックへ渡せる。呼び出し元
-            // （`sql::exec.rs` の `on_visible_row`）は `WHERE` の式述語（宣言的 UDF・
-            // 組み込み関数呼び出し）を SCALAR 段の一部として評価するために使う。
-            if !on_visible_row(visible_row_count, id, &row.embedding, &row.metadata)? {
+            // TASK-79（SQL-9）: `embedding_scratch` はこの時点で既にデコード済み
+            // （直前の `decode_row_embedding_and_metadata_into` 呼び出し）のため、
+            // 追加コピーなしでフックへ渡せる。呼び出し元（`sql::exec.rs` の
+            // `on_visible_row`）は `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）
+            // を SCALAR 段の一部として評価するために使う。
+            if !on_visible_row(visible_row_count, id, &embedding_scratch, metadata)? {
                 continue;
             }
 
@@ -739,7 +746,12 @@ impl VectorArena {
             // メモリ不足時は `Err(ArenaError::AllocationFailed)` として呼び出し元へ返す
             // （`Vec::with_capacity`/`push` の内部確保のように abort しない）。
             buffers.ensure_capacity(visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
-            buffers.push_row(id, &row.embedding, row.tenant_id, row.visibility);
+            // `tenant_id`（`decode_row_tenant_and_visibility` の借用結果）をここで
+            // 初めて所有化する。`GrowableArenaBuffers::tenant_ids` は行ごとに独立した
+            // `String` を保持する契約のため、テナントごとの共有化（インターン化）は
+            // 本変更のスコープ外とする（Issue #314 の対応範囲は embedding 側の
+            // 行ごとのヒープ確保削減のみ）。
+            buffers.push_row(id, &embedding_scratch, tenant_id.to_string(), visibility);
         }
 
         Ok(VectorArena {

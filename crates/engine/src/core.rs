@@ -1645,13 +1645,16 @@ impl EngineCore {
                     "CREATE FUNCTION requires a session-aware entry point",
                 ))
             }
-            crate::sql::allowlist::Statement::Select(_) => {
-                // `SELECT` と判定済みのため、[`Self::execute_sql_in_session`] が
+            stmt @ crate::sql::allowlist::Statement::Select(_) => {
+                // `SELECT` と判定済みのため、[`Self::execute_validated_in_session`] が
                 // `SqlOutcome::SetSearchMode`／`SqlOutcome::CreateFunction` を返すことは
-                // ない（同一 `sql` を `validate_sql` で 2 度構文解析するが、副作用の
-                // ない決定的なパースのため安全側に倒した単純さを優先する）。
+                // ない。ここで得た `stmt`（`validate_sql` 済み）をそのまま
+                // `execute_validated_in_session` へ渡し、SQL 文字列の再パースを
+                // 避ける（Issue #314・SQL-1・TASK-83 条件7: SQL 表層 C1 p95 の
+                // 固定コスト削減。以前は `execute_sql_in_session(ctx, &mut session,
+                // sql)` を呼び直しており、同一 `sql` を 2 回構文解析していた）。
                 let mut session = crate::sql::mode::SessionState::default();
-                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
@@ -1666,13 +1669,15 @@ impl EngineCore {
             }
             // TASK-166（SQL-13）: 集計 SELECT は UDF 呼び出しをその引数に含みうる
             // ため（セッション UDF レジストリ参照）、`Select` と同じくセッションを
-            // 要する実行本体（`execute_sql_in_session`）へ委譲する。UDF を持たない
-            // 空セッションで束縛するため、セッションに定義済みの UDF を参照する
-            // 集計は（`Select` と同様）このセッションなしエントリポイントでは
-            // 使えない（`22000`。「未知の関数」として拒否される）。
-            crate::sql::allowlist::Statement::Aggregate(_) => {
+            // 要する実行本体（`execute_validated_in_session`）へ委譲する。UDF を
+            // 持たない空セッションで束縛するため、セッションに定義済みの UDF を
+            // 参照する集計は（`Select` と同様）このセッションなしエントリポイント
+            // では使えない（`22000`。「未知の関数」として拒否される）。
+            stmt @ crate::sql::allowlist::Statement::Aggregate(_) => {
+                // `stmt` は上と同じく `validate_sql` 済みのため再パースしない
+                // （Issue #314・SQL-1・TASK-83 条件7）。
                 let mut session = crate::sql::mode::SessionState::default();
-                match self.execute_sql_in_session(ctx, &mut session, sql)? {
+                match self.execute_validated_in_session(ctx, &mut session, stmt)? {
                     crate::sql::SqlOutcome::Query(result) => Ok(result),
                     crate::sql::SqlOutcome::SetSearchMode(_)
                     | crate::sql::SqlOutcome::CreateFunction { .. }
@@ -1780,6 +1785,23 @@ impl EngineCore {
         }
 
         let stmt = crate::sql::allowlist::validate_sql(sql, &self.storage)?;
+        self.execute_validated_in_session(ctx, session, stmt)
+    }
+
+    /// [`Self::execute_sql_in_session`] の実行本体。`validate_sql` 済みの
+    /// [`crate::sql::allowlist::Statement`] を受け取ることで、呼び出し元
+    /// （[`Self::execute_sql`] の `Select`／`Aggregate` アーム）が既に構文解析
+    /// 済みの `Statement` を持つ場合に同一 SQL 文字列の再パースを避けられる
+    /// （Issue #314・SQL-1・TASK-83 条件7: SQL 表層 C1 経路の固定コスト削減。
+    /// `execute_sql_in_session` 自身（`sql: &str` を受け取る公開 API）は本メソッド
+    /// より前に `INSERT` 判定・`validate_sql` を済ませてから委譲するため、挙動・
+    /// エラー契約は分割前と不変）。
+    fn execute_validated_in_session(
+        &self,
+        ctx: &PolicyContext,
+        session: &mut crate::sql::mode::SessionState,
+        stmt: crate::sql::allowlist::Statement,
+    ) -> Result<crate::sql::SqlOutcome, crate::sql::allowlist::SqlSurfaceError> {
         match stmt {
             crate::sql::allowlist::Statement::SetSearchMode { value } => {
                 let mode = crate::sql::mode::SearchMode::parse_literal(&value)?;
