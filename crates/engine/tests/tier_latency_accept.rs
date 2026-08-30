@@ -219,18 +219,19 @@ fn judge_reports_invalid_response_ok_within_cap() {
     assert!(judgment.all_passed());
 }
 
-/// `invalid_response_ok` は `all_passed()` に含めない設計判断（`judge`
-/// ドキュメント参照）。除外率上限超過を模した `TierSamples` を直接構築しても
-/// 全体の合否には影響しない——実測経路では `run_fallible` が判定到達前に
-/// `BenchError::ExcludedTrialsExceeded` で打ち切るため、`judge` に上限超過状態が
-/// 渡ることはない（本テストは直接構築した場合の二重防御動作のみを固定する）。
+/// `invalid_response_ok` は `all_passed()` の AND 条件に含める（PR #329
+/// codex-review P2 対応・Issue #316）。実測経路では `run_fallible` が計測時点で
+/// 上限超過を先に検知し `BenchError::ExcludedTrialsExceeded` として判定到達前に
+/// 打ち切るため `judge` に上限超過状態が渡ることは無いが、`TierSamples` を
+/// 直接構築して `judge` を単独で呼び出す経路（本テスト）でも判定 API 自体が
+/// fail-closed であることを固定する。
 #[test]
-fn judge_reports_invalid_response_not_ok_when_cap_exceeded_but_does_not_affect_all_passed() {
+fn judge_reports_invalid_response_not_ok_when_cap_exceeded_and_fails_all_passed() {
     let mut samples = passing_samples();
     samples.dialogue_expansion_invalid_responses = 4; // cap is 3 (generous_thresholds)
     let judgment = judge(&samples, &generous_thresholds()).expect("non-empty samples");
     assert!(!judgment.invalid_response_ok);
-    assert!(judgment.all_passed());
+    assert!(!judgment.all_passed());
 }
 
 // --- parse_max_invalid_response_trials ---

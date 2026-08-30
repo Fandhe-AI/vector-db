@@ -122,10 +122,12 @@ Issue #316 で実装した。spec（PLAN-4/6/7 のポインタ）には不正応
    `BenchError::ExcludedTrialsExceeded` を返し、`tier_latency_bench.rs` は該当段名
    を含む非ゼロ終了メッセージとともに判定未到達のまま終了する。
    `harness::tier::TierJudgment::invalid_response_ok`／`judge` にも同じ上限判定を
-   実装しているが、これは `TierSamples` を直接構築した場合の二重防御にすぎず、
-   実測経路では `run_fallible` が判定到達前に打ち切るため到達しない
-   （`all_passed()` には含めていない。「不正応答率を spec の判定項目に含めるか」
-   はオーナー判断として残し、本実装はベンチ側ガード〔除外率上限〕に留める）。
+   実装し、`all_passed()` の AND 条件に含める（PR #329 codex-review P2 対応）。
+   実測経路では `run_fallible` が計測時点で上限超過を先に検知し判定到達前に
+   打ち切るため冗長になるが、`judge` は `TierSamples` を直接構築して単独で
+   呼び出すこともできる公開 API であり、判定 API 自体を fail-closed に保つため
+   `all_passed()` から除外しない（「不正応答率を spec の判定項目に含めるか」は
+   オーナー判断として残し、本実装はベンチ側ガード〔除外率上限〕に留める）。
 4. **試行回数・除外回数は標準出力に出す**（本リポ既定値であり spec 閾値ではない
    ため出力可。p95 上限は従来どおり非出力）。
 5. **warmup フェーズの不正応答は上限判定に数えない**（件数のみ `warmup_excluded`

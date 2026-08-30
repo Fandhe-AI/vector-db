@@ -243,9 +243,9 @@ pub struct TierThresholds {
     pub precision_expansion_max_p95: Duration,
     pub precision_e2e_max_p95: Duration,
     /// LLM 不正応答試行の除外数上限（段ごと共通。TASK-116・Issue #316）。
-    /// `judge` の `invalid_response_ok` 算出にのみ使う参考値であり、実際の
-    /// 打ち切りは [`super::protocol::run_fallible`] が計測時点で行う
-    /// （[`TierJudgment::invalid_response_ok`] のドキュメント参照）。
+    /// 実測経路では [`super::protocol::run_fallible`] が計測時点で上限超過を
+    /// 先に検知し打ち切るが、`judge` 単独呼び出し経路の fail-closed 性も
+    /// この値が担う（[`TierJudgment::invalid_response_ok`] のドキュメント参照）。
     pub max_invalid_response_trials: u32,
 }
 
@@ -285,25 +285,25 @@ pub struct TierJudgment {
     pub dialogue_routing_matched: bool,
     pub precision_routing_matched: bool,
     /// 4 段の除外数がいずれも [`TierThresholds::max_invalid_response_trials`]
-    /// 以内だったか（TASK-116・Issue #316 設計判断: 除外率上限のガード自体は
-    /// `super::protocol::run_fallible` が計測時点で行い、上限超過は
-    /// `BenchError::ExcludedTrialsExceeded` として `tier_latency_bench.rs` を
-    /// 判定到達前に打ち切る。したがって実測経路では本フィールドは常に `true`
-    /// になる——`judge` を直接呼ぶ形（本テストの `TierSamples` 手動構築）での
-    /// 二重防御としてのみ意味を持つ。`all_passed()` には含めない）。
+    /// 以内だったか（TASK-116・Issue #316）。実測経路（`tier_latency_bench.rs`）
+    /// では `super::protocol::run_fallible` が計測時点で上限超過を検知し
+    /// `BenchError::ExcludedTrialsExceeded` として判定到達前に打ち切るため、
+    /// `judge` に到達する時点では常に `true` になる。一方 `judge` は
+    /// `TierSamples` を直接構築して単独で呼び出す経路（本モジュールのテスト等）
+    /// でも成立する契約であり、判定 API 自体を fail-closed に保つため
+    /// `all_passed()` の AND 条件に含める（PR #329 codex-review P2 指摘）。
     pub invalid_response_ok: bool,
 }
 
 impl TierJudgment {
-    /// すべての判定・routing 検証が通ったか（合否の単一集約点。`tier_latency_bench.rs`
-    /// はこの値のみを最終 pass/fail に使う）。
+    /// すべての判定・routing 検証・除外数上限チェックが通ったか（合否の単一
+    /// 集約点。`tier_latency_bench.rs` はこの値のみを最終 pass/fail に使う）。
     ///
-    /// `invalid_response_ok` は含めない（TASK-116・Issue #316 設計判断:
-    /// 除外率上限のガードは `super::protocol::run_fallible` が計測時点で行い
-    /// 判定到達前に打ち切るため、実測経路で `judge` が呼ばれる時点では常に
-    /// `true`。ここに含めると「合否に効いているように見えるが実際は到達
-    /// 不能」という vacuous な判定項目になる。[`TierJudgment::invalid_response_ok`]
-    /// のドキュメント参照）。
+    /// `invalid_response_ok` を含める（TASK-116・Issue #316）。実測経路では
+    /// `super::protocol::run_fallible` が計測時点で上限超過を先に検知し打ち切る
+    /// ため冗長になるが、`judge` は `TierSamples` を直接構築して呼び出すことも
+    /// できる公開 API であり、`all_passed()` から除外すると呼び出し元によっては
+    /// 除外上限超過を見逃す fail-open な判定になる（PR #329 codex-review P2 指摘）。
     pub fn all_passed(&self) -> bool {
         self.dialogue_expansion_ok
             && self.dialogue_e2e_ok
@@ -311,6 +311,7 @@ impl TierJudgment {
             && self.precision_e2e_ok
             && self.dialogue_routing_matched
             && self.precision_routing_matched
+            && self.invalid_response_ok
     }
 }
 
