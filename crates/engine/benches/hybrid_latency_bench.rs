@@ -18,13 +18,25 @@
 //! 分離して計測する入口が存在しなかった。本ベンチはその隙間を埋める
 //! （`docs/design/hybrid-refetch-latency.md` 参照）。
 //!
-//! # 計測方式（in-build 比較）
+//! # 計測方式（in-build 比較・近似）
 //!
 //! 2 コミット間 worktree A/B ではなく、単一ビルド内で「再取得がほぼ発生しない
-//! 通常コーパス」と「再取得が可視集合サイズまで到達する量子化コーパス」を比較する
-//! （`harness::hybrid_latency` モジュールドキュメント参照）。再取得ループの有無が
-//! 唯一の変数であり、2 段の差分がそのままループの寄与を表す。加えて小規模・
-//! 大規模の 2 スケールで測る（`tests/hybrid_recall.rs` の段構成に合わせる）。
+//! 通常コーパス（連続値ベクトル）」と「同点グループを誘発し再取得を複数回発生
+//! させるプロトタイプクラスタコーパス」を比較する（`harness::hybrid_latency`
+//! モジュールドキュメント参照）。**近似比較である**点に注意: 2 段は密ベクトルの
+//! 分布そのもの（連続値 vs. プロトタイプクラスタ）が異なり、厳密には「再取得
+//! ループの有無だけ」が変数ではない（疎チャネルの内容は `rng` 系列を分離して
+//! 両段で共有するため揃えている。`harness::hybrid_latency::generate_corpus`
+//! ドキュメント参照）。また今回の同点誘発コーパスは `reached_visible_set=0/50`
+//! （`docs/design/hybrid-refetch-latency.md`「実測結果」節）であり、再取得
+//! ループが可視集合サイズまで到達する最悪ケース（`tests/hybrid_recall.rs::
+//! hybrid_recall_large_scale_dense_refetch_is_bounded_by_visible_set_size` が
+//! 追跡する大規模 Recall フィクスチャで実際に起きる挙動）は本ベンチでは
+//! 再現・測定できていない。stage 名 `*_tie_refetch` は「同点誘発による複数回
+//! 再取得」を表し、可視集合到達を含意しない（可視集合到達を含意していた旧名
+//! `*_max_refetch` から改称。PR #325 レビュー対応）。2 段の差分は再取得ループの
+//! 寄与の**近似値**として扱う。加えて小規模・大規模の 2 スケールで測る
+//! （`tests/hybrid_recall.rs` の段構成に合わせる）。
 //!
 //! 測定対象は `hybrid::hybrid_search`（`RrfConfig::default()`）の単発呼び出しのみで、
 //! SQL パース・テーブル走査を含めない（`sql/exec.rs` の C4 経路から再取得ループの
@@ -186,7 +198,7 @@ fn main() {
     for (label, num_docs) in [("small", SMALL_NUM_DOCS), ("large", LARGE_NUM_DOCS)] {
         let no_refetch_corpus = generate_corpus(SEED, num_docs, VOCAB_SIZE, DIM, None)
             .unwrap_or_else(|e| fail_closed(format!("corpus generation failed: {e}")));
-        let max_refetch_corpus =
+        let tie_refetch_corpus =
             generate_corpus(SEED, num_docs, VOCAB_SIZE, DIM, Some(QUANTIZE_LEVELS))
                 .unwrap_or_else(|e| fail_closed(format!("corpus generation failed: {e}")));
 
@@ -204,8 +216,8 @@ fn main() {
             &cfg,
         );
         measure_stage(
-            &format!("{label}_max_refetch"),
-            &max_refetch_corpus,
+            &format!("{label}_tie_refetch"),
+            &tie_refetch_corpus,
             &queries,
             &cfg,
         );

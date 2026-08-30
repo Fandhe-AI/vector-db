@@ -234,8 +234,8 @@ fn render_stage_line_includes_measured_values() {
         max_k_seen: 150,
         reached_visible_set: false,
     }]);
-    let line = render_stage_line("small_max_refetch", 1200, 1800, summary);
-    assert!(line.contains("stage=small_max_refetch"));
+    let line = render_stage_line("small_tie_refetch", 1200, 1800, summary);
+    assert!(line.contains("stage=small_tie_refetch"));
     assert!(line.contains("p95_us=1800"));
     assert!(line.contains("median_us=1200"));
     assert!(line.contains("provider_calls_max=3"));
