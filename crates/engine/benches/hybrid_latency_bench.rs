@@ -193,7 +193,7 @@ fn main() {
     println!(
         "hybrid_latency_bench: measures hybrid_search_boosted's boundary tie-group refetch \
          loop (Issue #320) latency contribution via an in-build comparison (no-refetch vs \
-         max-refetch corpora), not a pass/fail gate (Issue #324; see docs/design/\
+         tie-refetch corpora), not a pass/fail gate (Issue #324; see docs/design/\
          hybrid-refetch-latency.md)"
     );
 
