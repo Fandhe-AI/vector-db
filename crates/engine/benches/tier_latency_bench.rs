@@ -37,16 +37,29 @@
 //! 持つ環境で運用者が本コマンドを直接実行する。判定ロジック自体（時間非依存）は
 //! `harness::tier` にあり `tests/tier_latency_accept.rs` で `make ci` 側から回帰
 //! 検証する。
+//!
+//! # LLM 不正応答時の扱い（TASK-116・Issue #316）
+//!
+//! 各段の試行は `harness::protocol::run_fallible` 経由で実行し、`PlanError::
+//! InvalidResponse`（`harness::tier::classify_core_error`／`classify_sql_error`
+//! が `Excluded` に分類）は有効サンプルから除外し追加試行で埋め合わせる。
+//! `Timeout`・`Unavailable` 等は除外せず即座に致命エラーとして打ち切る
+//! （除外すると p95 判定が fail-open になるため）。除外数の段ごと上限は
+//! 既定値（`harness::tier::DEFAULT_MAX_INVALID_RESPONSE_TRIALS`）または任意
+//! env `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS` で決まり、超過は非ゼロ終了する
+//! （詳細: `harness::tier` モジュールドキュメント・`docs/design/
+//! tier-latency-acceptance.md`「不正応答試行の扱い」節）。
 
 #[allow(dead_code)]
 mod harness;
 
 use harness::env_report::EnvReport;
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run_fallible, MeasurementConfig};
 use harness::tier::{
-    build_corpus, build_ollama_client, judge, opt_in_requested, parse_host, parse_max_p95_ms,
+    build_corpus, build_ollama_client, classify_core_error, classify_sql_error, judge,
+    opt_in_requested, parse_host, parse_max_invalid_response_trials, parse_max_p95_ms,
     parse_model_name, parse_port, using_plan_statement, TierSamples, TierThresholds,
-    DIALOGUE_QUESTION, PRECISION_QUESTION,
+    DEFAULT_MAX_INVALID_RESPONSE_TRIALS, DIALOGUE_QUESTION, PRECISION_QUESTION,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -127,6 +140,11 @@ fn print_help() {
     println!(
         "  BENCH_TIER_PRECISION_MAX_P95_MS               high-precision tier end-to-end p95 upper bound (ms)"
     );
+    println!();
+    println!("optional (Issue #316: LLM invalid-response trial handling):");
+    println!(
+        "  BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS        per-stage cap on excluded (invalid-response) trials; repo-default if unset"
+    );
 }
 
 /// 引数に `--help`／`-h` が含まれるかを判定する。`cargo bench --bench
@@ -167,11 +185,22 @@ fn required_thresholds() -> TierThresholds {
         None => fail_closed("BENCH_TIER_PRECISION_MAX_P95_MS is not set"),
     };
 
+    let max_invalid_response_trials = match env_raw("BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS") {
+        Some(raw) => {
+            parse_max_invalid_response_trials(&raw, "BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS")
+                .unwrap_or_else(|e| fail_closed(e))
+        }
+        // 任意 env（Issue #316）: 未設定は本リポ既定値を使う（fail-closed で拒否
+        // しない。必須の接続・閾値 env とは異なる契約）。
+        None => DEFAULT_MAX_INVALID_RESPONSE_TRIALS,
+    };
+
     TierThresholds {
         dialogue_expansion_max_p95,
         dialogue_e2e_max_p95,
         precision_expansion_max_p95,
         precision_e2e_max_p95,
+        max_invalid_response_trials,
     }
 }
 
@@ -252,53 +281,100 @@ fn main() {
         );
 
     let config = MeasurementConfig::new(20, 30, 1).expect("protocol minimums satisfied");
+    let max_excluded = thresholds.max_invalid_response_trials;
 
     // --- ティア別クエリ展開の追加処理時間（PLAN-4） ---
+    // 各試行は `Result` を返し、LLM 不正応答（`PlanError::InvalidResponse`）は
+    // `classify_core_error` が `Excluded` に分類する。`run_fallible` が除外分を
+    // 追加試行で埋め合わせ、段ごとの上限（`max_excluded`）超過は
+    // `BenchError::ExcludedTrialsExceeded` として `Err` を返す（Issue #316）。
     let mut dialogue_routing_matched = true;
-    let dialogue_expansion = run(&config, || {
-        let (_, classification) = core
-            .plan_query_with_classification(&ctx, TABLE, DIALOGUE_QUESTION)
-            .expect("plan_query_with_classification must succeed against a resident Ollama");
-        if classification.map(|c| c.tier) != Some(Tier::Dialogue) {
-            dialogue_routing_matched = false;
-        }
-    })
-    .expect("measurement must satisfy protocol minimums");
+    let dialogue_expansion = run_fallible(
+        &config,
+        max_excluded,
+        || {
+            core.plan_query_with_classification(&ctx, TABLE, DIALOGUE_QUESTION)
+                .map(|(_, classification)| {
+                    if classification.map(|c| c.tier) != Some(Tier::Dialogue) {
+                        dialogue_routing_matched = false;
+                    }
+                })
+        },
+        classify_core_error,
+    )
+    .unwrap_or_else(|e| fail_closed(format!("dialogue_expansion stage: {e}")));
 
     let mut precision_routing_matched = true;
-    let precision_expansion = run(&config, || {
-        let (_, classification) = core
-            .plan_query_with_classification(&ctx, TABLE, PRECISION_QUESTION)
-            .expect("plan_query_with_classification must succeed against a resident Ollama");
-        if classification.map(|c| c.tier) != Some(Tier::HighPrecision) {
-            precision_routing_matched = false;
-        }
-    })
-    .expect("measurement must satisfy protocol minimums");
+    let precision_expansion = run_fallible(
+        &config,
+        max_excluded,
+        || {
+            core.plan_query_with_classification(&ctx, TABLE, PRECISION_QUESTION)
+                .map(|(_, classification)| {
+                    if classification.map(|c| c.tier) != Some(Tier::HighPrecision) {
+                        precision_routing_matched = false;
+                    }
+                })
+        },
+        classify_core_error,
+    )
+    .unwrap_or_else(|e| fail_closed(format!("precision_expansion stage: {e}")));
 
     // --- ティア別展開込みエンドツーエンド（PLAN-6/7・`USING PLAN` 一意ディスパッチ） ---
     let dialogue_sql = using_plan_statement(TABLE, DIALOGUE_QUESTION, TOP_K);
-    let dialogue_e2e = run(&config, || {
-        core.execute_sql(&ctx, &dialogue_sql)
-            .expect("USING PLAN dispatch must succeed against a resident Ollama")
-    })
-    .expect("measurement must satisfy protocol minimums");
+    let dialogue_e2e = run_fallible(
+        &config,
+        max_excluded,
+        || core.execute_sql(&ctx, &dialogue_sql).map(|_| ()),
+        classify_sql_error,
+    )
+    .unwrap_or_else(|e| fail_closed(format!("dialogue_e2e stage: {e}")));
 
     let precision_sql = using_plan_statement(TABLE, PRECISION_QUESTION, TOP_K);
-    let precision_e2e = run(&config, || {
-        core.execute_sql(&ctx, &precision_sql)
-            .expect("USING PLAN dispatch must succeed against a resident Ollama")
-    })
-    .expect("measurement must satisfy protocol minimums");
+    let precision_e2e = run_fallible(
+        &config,
+        max_excluded,
+        || core.execute_sql(&ctx, &precision_sql).map(|_| ()),
+        classify_sql_error,
+    )
+    .unwrap_or_else(|e| fail_closed(format!("precision_e2e stage: {e}")));
 
     let samples = TierSamples {
-        dialogue_expansion: dialogue_expansion.samples,
-        dialogue_e2e: dialogue_e2e.samples,
-        precision_expansion: precision_expansion.samples,
-        precision_e2e: precision_e2e.samples,
+        dialogue_expansion: dialogue_expansion.measurement.samples,
+        dialogue_e2e: dialogue_e2e.measurement.samples,
+        precision_expansion: precision_expansion.measurement.samples,
+        precision_e2e: precision_e2e.measurement.samples,
         dialogue_routing_matched,
         precision_routing_matched,
+        dialogue_expansion_invalid_responses: dialogue_expansion.measured_excluded,
+        dialogue_e2e_invalid_responses: dialogue_e2e.measured_excluded,
+        precision_expansion_invalid_responses: precision_expansion.measured_excluded,
+        precision_e2e_invalid_responses: precision_e2e.measured_excluded,
     };
+
+    // 試行回数・除外回数（本リポ既定値であり spec 閾値ではないため出力可。
+    // モジュール冒頭コメント「数値基準（p95 上限）」参照——p95 上限そのものは
+    // 引き続き出力しない）。
+    println!(
+        "tier_latency_bench: dialogue_expansion attempts={} invalid_responses={} (warmup_invalid_responses={})",
+        dialogue_expansion.measured_attempts,
+        dialogue_expansion.measured_excluded,
+        dialogue_expansion.warmup_excluded
+    );
+    println!(
+        "tier_latency_bench: dialogue_e2e attempts={} invalid_responses={} (warmup_invalid_responses={})",
+        dialogue_e2e.measured_attempts, dialogue_e2e.measured_excluded, dialogue_e2e.warmup_excluded
+    );
+    println!(
+        "tier_latency_bench: precision_expansion attempts={} invalid_responses={} (warmup_invalid_responses={})",
+        precision_expansion.measured_attempts,
+        precision_expansion.measured_excluded,
+        precision_expansion.warmup_excluded
+    );
+    println!(
+        "tier_latency_bench: precision_e2e attempts={} invalid_responses={} (warmup_invalid_responses={})",
+        precision_e2e.measured_attempts, precision_e2e.measured_excluded, precision_e2e.warmup_excluded
+    );
 
     let judgment = judge(&samples, &thresholds).expect("non-empty measurement samples");
 

@@ -21,14 +21,33 @@
 //! `path_extension_match_yields_direct`／`abstraction_cue_yields_high_precision`
 //! と同一の判定経路）。これにより計測用コーパスの内容を変更してもルーティング
 //! の実証結果が揺れない。判定優先順の詳細は `tiering.rs::classify` を参照。
+//!
+//! # LLM 不正応答（`PlanError::InvalidResponse`）試行の扱い（TASK-116・Issue #316）
+//!
+//! 常駐 Ollama の応答形式は非決定的であり、`plan_query_with_classification`／
+//! `execute_sql`（`USING PLAN`）の各試行が `PlanError::InvalidResponse`（または
+//! それを丸め込んだ `SqlSurfaceError::Internal`）で失敗しうる。本リポでは
+//! **除外対象は `InvalidResponse` のみ**とし、[`classify_core_error`]・
+//! [`classify_sql_error`] で分類のうえ [`super::protocol::run_fallible`] へ渡す。
+//! `Timeout`・`Unavailable` 等の他エラーは除外せず致命扱いとする（除外すると
+//! p95 判定が fail-open になるため）。除外試行は有効サンプル数に達するまで
+//! 追加試行で埋め合わせ、段ごとの除外数上限（[`DEFAULT_MAX_INVALID_RESPONSE_TRIALS`]・
+//! `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS` で上書き可能）を超えた場合は
+//! `run_fallible` が `BenchError::ExcludedTrialsExceeded` で打ち切る。この既定値・
+//! 上限方式はいずれも spec 由来の受け入れ基準ではなく、本リポ独自の実装既定値
+//! （`docs/design/query-tiering-criteria.md` の判定基準と同じ位置づけ。
+//! `docs/design/tier-latency-acceptance.md`「不正応答試行の扱い」節参照）。
 
 use std::time::Duration;
 
 use super::accept::{check_p95_within_limit, p95_from_samples};
+use super::protocol::TrialFailure;
 use super::rng::DeterministicRng;
 use super::stats::BenchError;
 
+use engine::core::CoreError;
 use engine::query_planner::{OllamaClient, OllamaConfig, PlanError};
+use engine::sql::allowlist::SqlSurfaceError;
 
 /// 対話ティア（[`engine::tiering::Tier::Dialogue`]）へ決定的に分類される質問。
 /// パス拡張子（`.rs`）一致による [`engine::tiering::ClassificationSignal::PathMatch`]
@@ -157,6 +176,65 @@ pub fn build_ollama_client(host: &str, port: u16, model: &str) -> Result<OllamaC
     Ok(OllamaClient::new(config))
 }
 
+/// LLM 不正応答（`PlanError::InvalidResponse`）試行の除外数上限の既定値
+/// （TASK-116・Issue #316「設計判断」節。spec 由来の数値基準ではなく、本リポ
+/// 独自の実装既定値——`query-tiering-criteria.md` の判定基準と同じ位置づけ）。
+/// 計測回数（`MeasurementConfig::new` へ渡す固定値 30。`tier_latency_bench.rs`
+/// 参照）の 10% を採用する。
+pub const DEFAULT_MAX_INVALID_RESPONSE_TRIALS: u32 = 3;
+
+/// `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS`（任意 env）の生文字列を解析する。
+/// 未設定時は呼び出し元が [`DEFAULT_MAX_INVALID_RESPONSE_TRIALS`] を使う（本関数
+/// へは非 `None` の値のみを渡す想定）。空文字・非整数・負は `Err`（fail-closed）。
+/// `0` は「除外を許容しない」設定として明示的に許容する。
+pub fn parse_max_invalid_response_trials(raw: &str, var_name: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{var_name} must not be empty"));
+    }
+    trimmed
+        .parse::<u32>()
+        .map_err(|_| format!("{var_name} must be a non-negative integer"))
+}
+
+/// [`engine::core::CoreError`] を [`TrialFailure`] へ分類する（TASK-116・
+/// Issue #316）。`plan_query_with_classification`（ティア別展開の追加処理時間
+/// 計測、PLAN-4）が返すエラーの分類に使う。
+///
+/// 除外対象は `QueryPlanning(PlanError::InvalidResponse)` のみ。`Timeout`・
+/// `Unavailable` 等の他 `PlanError` variant・他 `CoreError` variant はすべて
+/// `Fatal`（除外すると p95 判定が fail-open になるため。設計判断 1 参照）。
+pub fn classify_core_error(err: &CoreError) -> TrialFailure {
+    match err {
+        CoreError::QueryPlanning(PlanError::InvalidResponse) => TrialFailure::Excluded,
+        _ => TrialFailure::Fatal,
+    }
+}
+
+/// [`engine::sql::allowlist::SqlSurfaceError`] を [`TrialFailure`] へ分類する
+/// （TASK-116・Issue #316）。`execute_sql`（`USING PLAN` 経由のティア別
+/// エンドツーエンド計測、PLAN-6/7）が返すエラーの分類に使う。
+///
+/// `USING PLAN` 経路の LLM 呼び出し失敗は `core.rs::plan_using_plan_expansion`
+/// が `SqlSurfaceError::Internal { detail: format!("USING PLAN query expansion
+/// failed: {CoreError}") }` へ丸め込む（`sql/using_plan.rs` モジュール
+/// ドキュメント「プランナー未注入・埋め込み未注入・LLM 応答異常は呼び出し元が
+/// 既存分類（`XX000`・`SqlSurfaceError::Internal`）のみで拒否」）ため、新規
+/// `wire_code` 分類は追加せず、`detail` 文字列に `PlanError::InvalidResponse`
+/// の `Display` 文言が部分文字列として含まれるかで判定する（ハードコード
+/// せず `PlanError::InvalidResponse.to_string()` から動的に構成する。
+/// `EmbedError::InvalidResponse` の `Display` 文言とは重ならないため、
+/// 埋め込みサービス側の不正応答を誤って除外することはない）。
+pub fn classify_sql_error(err: &SqlSurfaceError) -> TrialFailure {
+    if let SqlSurfaceError::Internal { detail } = err {
+        let needle = PlanError::InvalidResponse.to_string();
+        if detail.contains(&needle) {
+            return TrialFailure::Excluded;
+        }
+    }
+    TrialFailure::Fatal
+}
+
 /// TASK-116 の受け入れ判定（対象ビヘイビア PLAN-4, PLAN-6, PLAN-7）に使う上限値。
 #[derive(Debug, Clone, Copy)]
 pub struct TierThresholds {
@@ -164,6 +242,11 @@ pub struct TierThresholds {
     pub dialogue_e2e_max_p95: Duration,
     pub precision_expansion_max_p95: Duration,
     pub precision_e2e_max_p95: Duration,
+    /// LLM 不正応答試行の除外数上限（段ごと共通。TASK-116・Issue #316）。
+    /// `judge` の `invalid_response_ok` 算出にのみ使う参考値であり、実際の
+    /// 打ち切りは [`super::protocol::run_fallible`] が計測時点で行う
+    /// （[`TierJudgment::invalid_response_ok`] のドキュメント参照）。
+    pub max_invalid_response_trials: u32,
 }
 
 /// TASK-116 の実測サンプルと routing 実証結果。
@@ -179,6 +262,13 @@ pub struct TierSamples {
     /// [`PRECISION_QUESTION`] の実測ティアが [`engine::tiering::Tier::HighPrecision`]
     /// と一致したか。
     pub precision_routing_matched: bool,
+    /// 4 段それぞれの計測フェーズで `Excluded`（LLM 不正応答）と分類された
+    /// 試行数（`super::protocol::FallibleMeasurement::measured_excluded`）。
+    /// TASK-116・Issue #316。
+    pub dialogue_expansion_invalid_responses: u32,
+    pub dialogue_e2e_invalid_responses: u32,
+    pub precision_expansion_invalid_responses: u32,
+    pub precision_e2e_invalid_responses: u32,
 }
 
 /// TASK-116 の受け入れ判定結果。
@@ -194,11 +284,26 @@ pub struct TierJudgment {
     pub precision_e2e_ok: bool,
     pub dialogue_routing_matched: bool,
     pub precision_routing_matched: bool,
+    /// 4 段の除外数がいずれも [`TierThresholds::max_invalid_response_trials`]
+    /// 以内だったか（TASK-116・Issue #316 設計判断: 除外率上限のガード自体は
+    /// `super::protocol::run_fallible` が計測時点で行い、上限超過は
+    /// `BenchError::ExcludedTrialsExceeded` として `tier_latency_bench.rs` を
+    /// 判定到達前に打ち切る。したがって実測経路では本フィールドは常に `true`
+    /// になる——`judge` を直接呼ぶ形（本テストの `TierSamples` 手動構築）での
+    /// 二重防御としてのみ意味を持つ。`all_passed()` には含めない）。
+    pub invalid_response_ok: bool,
 }
 
 impl TierJudgment {
     /// すべての判定・routing 検証が通ったか（合否の単一集約点。`tier_latency_bench.rs`
     /// はこの値のみを最終 pass/fail に使う）。
+    ///
+    /// `invalid_response_ok` は含めない（TASK-116・Issue #316 設計判断:
+    /// 除外率上限のガードは `super::protocol::run_fallible` が計測時点で行い
+    /// 判定到達前に打ち切るため、実測経路で `judge` が呼ばれる時点では常に
+    /// `true`。ここに含めると「合否に効いているように見えるが実際は到達
+    /// 不能」という vacuous な判定項目になる。[`TierJudgment::invalid_response_ok`]
+    /// のドキュメント参照）。
     pub fn all_passed(&self) -> bool {
         self.dialogue_expansion_ok
             && self.dialogue_e2e_ok
@@ -222,6 +327,12 @@ pub fn judge(
     let precision_expansion_p95 = p95_from_samples(&samples.precision_expansion)?;
     let precision_e2e_p95 = p95_from_samples(&samples.precision_e2e)?;
 
+    let invalid_response_ok = samples.dialogue_expansion_invalid_responses
+        <= thresholds.max_invalid_response_trials
+        && samples.dialogue_e2e_invalid_responses <= thresholds.max_invalid_response_trials
+        && samples.precision_expansion_invalid_responses <= thresholds.max_invalid_response_trials
+        && samples.precision_e2e_invalid_responses <= thresholds.max_invalid_response_trials;
+
     Ok(TierJudgment {
         dialogue_expansion_p95,
         dialogue_expansion_ok: check_p95_within_limit(
@@ -242,5 +353,6 @@ pub fn judge(
         ),
         dialogue_routing_matched: samples.dialogue_routing_matched,
         precision_routing_matched: samples.precision_routing_matched,
+        invalid_response_ok,
     })
 }
