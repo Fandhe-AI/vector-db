@@ -528,6 +528,9 @@ SEARCH-2 が前提とする「クエリ展開あり」の測定条件に層 B �
   ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md` に集約した。
   当初は Actions variables を使っていたが、`env:` ブロックのログ印字による
   漏えいを防ぐため secrets へ移行した（Issue #286）
+- PR #320 が追加した境界同点グループ再取得ループ（本 ADR「Issue #310: engine
+  側改善」節）の単発クエリレイテンシへの寄与計測は `docs/design/
+  hybrid-refetch-latency.md`（Issue #324）を参照
 
 [`SparseIndex::build`]: ../../crates/engine/src/sparse.rs
 [`ParallelSearchProvider`]: ../../crates/engine/src/parallel_search.rs

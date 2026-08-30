@@ -171,6 +171,16 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契約（成功系・fail-closed 系・RLS 不変）は `crates/wire-server/tests/wire_using_plan.rs`（`make ci` 対象）が決定的スタブで検証します。実 Ollama・実クライアント 3 種（psql／psycopg／pg）を使った PLAN-9 数値基準の実測ハーネスは本リポジトリでは未整備です（TASK-116 の `make bench-tier` と同様の運用者実行手順が必要になる見込み。整備は別タスクとして追跡してください）。
 
+### 境界同点グループ再取得ループのレイテンシ計測（Issue #324）
+
+`make bench-hybrid`（`crates/engine/benches/hybrid_latency_bench.rs`）は、PR #320
+が追加した境界同点グループ再取得ループ（`hybrid.rs::hybrid_search_boosted`）の
+単発クエリレイテンシへの寄与を、単一ビルド内の A/B（通常コーパス vs 同点誘発
+コーパス）で計測します。spec 由来の pass/fail 閾値を持たない情報提供専用のベンチ
+のため `.github/workflows/*` へは配線せず、手動実行専用です。`GITHUB_ACTIONS` が
+設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
+`docs/design/hybrid-refetch-latency.md` を参照してください。
+
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`

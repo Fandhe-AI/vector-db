@@ -151,3 +151,16 @@ test = false
 name = "tier_latency_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・
+# PLAN-4/6/7 の関連ポインタ）の実測入口。`hybrid::hybrid_search` を SQL パース・
+# テーブル走査を含めずに直接計測し、再取得ループの寄与を単一ビルド内の A/B
+# （通常コーパス vs 同点誘発コーパス）で切り分ける。spec 由来の pass/fail 閾値は
+# 持たない情報提供専用ベンチのため `.github/workflows/*` へは配線しない。harness =
+# false / test = false は上記ベンチと同一方針。`make bench-hybrid`（Makefile）から
+# 実行する。判定ロジック自体（時間非依存）は harness/hybrid_latency.rs にあり
+# tests/hybrid_latency_accept.rs で make ci 側から回帰検証する。
+name = "hybrid_latency_bench"
+harness = false
+test = false

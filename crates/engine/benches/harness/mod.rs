@@ -49,6 +49,7 @@ pub mod accept;
 #[cfg(feature = "contrast-bench")]
 pub mod contrast;
 pub mod env_report;
+pub mod hybrid_latency;
 pub mod protocol;
 pub mod rng;
 pub mod scalar_reference;

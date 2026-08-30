@@ -286,6 +286,18 @@ else
 endif
 
 # --------------------------------------------------
+# 境界同点グループ再取得ループのレイテンシ影響計測（Issue #324。crates/engine/benches/hybrid_latency_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hybrid
+bench-hybrid: ## Issue #324（境界同点グループ再取得ループ〔Issue #320〕のレイテンシ影響計測。CORE-7・PLAN-4/6/7 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench hybrid_latency_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid をスキップ"
+endif
+
+# --------------------------------------------------
 # ハイブリッド検索 Recall 閾値ゲート（TASK-104。crates/engine/tests/hybrid_recall.rs 層 B）
 # --------------------------------------------------
 
