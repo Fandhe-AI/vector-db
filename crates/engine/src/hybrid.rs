@@ -340,11 +340,13 @@ pub enum HybridError {
     /// `soft_boost_confirm_cap` が仮定する「真の 1 位は必ずどちらかのチャネルで
     /// rank 1 として出現する」という保証は、`RrfConfig` の既定同点順位規約
     /// [`TieRank::GroupEnd`]（Issue #310）下では先頭スコアの同点グループが大きい
-    /// 場合に崩れる。そのため `apply_soft_boost` は `max` の算出元となる上限を
-    /// `soft_boost_confirm_cap(cfg)` と `hits` の実際の最高融合スコアの `min` へ
-    /// 置き換えており（PR #320 codex-review P1 指摘対応）、その場合 `max` は本
-    /// エラーメッセージの値としても静的な `soft_boost_confirm_cap` より小さくなる
-    /// ことがある。
+    /// 場合に崩れる。そのため `apply_soft_boost` は加点量そのものの絶対上限
+    /// （`amount_cap`）を `soft_boost_confirm_cap(cfg)` と `hits` の実際の最高融合
+    /// スコアの `min` へ切り下げており（PR #320 codex-review P1 指摘対応）、`max`
+    /// はこの `amount_cap` によって静的な `soft_boost_confirm_cap` より小さくなる
+    /// ことがある。ただし候補ごとの残余判定の基準自体は静的
+    /// `soft_boost_confirm_cap` に据え置く（同 PR 2 回目の指摘対応。詳細は
+    /// [`apply_soft_boost`] 関数本体の実装コメント参照）。
     BoostSoftBoundExceeded { total: f64, max: f64 },
 }
 
@@ -1067,9 +1069,12 @@ pub fn kind_hint_matches(hint: &str, kind: &str) -> bool {
 /// ドキュメント参照）。ただし `soft_boost_confirm_cap` が前提とする「融合プールが
 /// 空でなければ真の 1 位は必ずどちらかのチャネルで rank 1 として出現する」という
 /// 保証は `RrfConfig` の既定同点順位規約 [`TieRank::GroupEnd`]（Issue #310）下では
-/// 崩れうるため、この絶対上限自体は `hits` の実際の最高融合スコアとの `min` で
-/// 切り下げる（PR #320 codex-review P1 指摘対応。実スコアを都度計算するのは
-/// 上限の切り下げ目的のみで、`margin` 方式への回帰ではない）。この判定は長さ検証・
+/// 崩れうるため、加点量そのものの絶対上限（`amount_cap`）は `hits` の実際の最高
+/// 融合スコアとの `min` で切り下げる（PR #320 codex-review P1 指摘対応）。ただし
+/// 候補ごとの残余判定の基準は静的 `soft_boost_confirm_cap` に据え置き、その結果を
+/// `amount_cap` でさらに切り下げる二段構成にする（同 PR 2 回目の指摘対応。残余の
+/// 基準に実測 `observed_top` を使うと `margin` 方式へ回帰し正当な近接順位逆転まで
+/// 過剰拒否するため）。詳細は関数本体の実装コメント参照。この判定は長さ検証・
 /// 有限性検証の後、スコア加算より先に
 /// 行う（[`TooManyCandidates`] (HybridError::TooManyCandidates) と同じ順序）。
 /// 加算後の非有限化（Inf オーバーフロー）も同様に [`HybridError::NonFiniteScore`]
@@ -1136,35 +1141,59 @@ pub fn apply_soft_boost(
         // （本指摘の直接回帰: `hit.score` が `cap` 以上の近接順位候補へ、加点量
         // 自体が `cap` を超える大幅な加点を与えるケース）で固定する。
         //
-        // PR #320 codex-review P1 指摘対応（Issue #310 由来）: `RrfConfig` の既定
-        // 同点順位規約が [`TieRank::GroupEnd`] になったことで、`soft_boost_confirm_cap`
-        // が前提としていた「融合プールが空でない限り真の 1 位はどちらかのチャネルで
-        // 必ず rank 1 として出現し、少なくとも `min(dense_weight, sparse_weight) /
-        // (k_const + 1)` を得る」という下限保証が崩れうる。先頭スコアで N 件が同点の
-        // 場合、[`accumulate_ranked`] は同点グループ内の全候補へグループ末尾順位
-        // （`rank = 1 + N`）を割り当てるため、実際の最高融合スコアは
-        // `weight / (k_const + N)` まで下がりうる（`N` が大きいほど `cap` を
-        // 大きく下回る）。`soft_boost_confirm_cap`（`cfg` のみから導出する静的値）を
+        // PR #320 codex-review P1 指摘対応（Issue #310 由来。1 回目）: `RrfConfig`
+        // の既定同点順位規約が [`TieRank::GroupEnd`] になったことで、
+        // `soft_boost_confirm_cap` が前提としていた「融合プールが空でない限り真の
+        // 1 位はどちらかのチャネルで必ず rank 1 として出現し、少なくとも
+        // `min(dense_weight, sparse_weight) / (k_const + 1)` を得る」という下限保証が
+        // 崩れうる。先頭スコアで N 件が同点の場合、[`accumulate_ranked`] は同点
+        // グループ内の全候補へグループ末尾順位（`rank = 1 + N`）を割り当てるため、
+        // 実際の最高融合スコアは `weight / (k_const + N)` まで下がりうる（`N` が
+        // 大きいほど静的 `soft_boost_confirm_cap` を大きく下回る）。これを静的値
         // 単独で確定判定の上限に使い続けると、この場合に許容される加点量が実際の
         // 融合スコア分布に対して過大になり、「小さな加点のみ」（PLAN-1）の契約が
-        // 破れる。そこで確定判定は、静的 `cap` と `hits` の実際の最高融合スコア
-        // （`observed_top`）の小さい方を使う。`margin`（真の 1 位との差）を上限にする
-        // 方式（2 回目の codex-review P1 指摘で撤回済み。正当な近接順位の逆転まで
-        // 過剰拒否していた）には戻さない: `observed_top` は上限そのものの**切り下げ**
-        // にのみ使い、候補ごとの残余計算（`allowed`）や「真の 1 位追い越しの許容」
-        // という判定方式自体は変えない。`hits` が空でない場合のみこの分岐に入るため
+        // 破れる。
+        //
+        // PR #320 codex-review P1 指摘対応（2 回目・cursor-bot 指摘）: 1 回目の
+        // 対応では静的 `cap` と `observed_top` の小さい方をそのまま候補ごとの残余
+        // 計算（`allowed = cap - hit.score`）の基準にも使っていた。これだと
+        // `hit.score < cap` の候補の残余がまさに「実際の 1 位との差（margin）」に
+        // 退化し、`GroupEnd` 下で同点上位グループのすぐ下に位置する候補へ既定加点
+        // `SOFT_BOOST_PER_MATCH` を与えるだけで拒否されてしまう（2 回目の
+        // codex-review P1 指摘で撤回済みの margin 拒否方式の再発）。そこで役割を
+        // 分離する: 加点量そのものの絶対上限（`amount_cap`）は引き続き静的
+        // `soft_boost_confirm_cap` と `observed_top` の小さい方で切り下げるが、
+        // 候補ごとの残余判定の基準（`static_cap - hit.score`）は静的 `cap` に戻し、
+        // その結果を `amount_cap` でさらに切り下げる。これにより
+        // `observed_top` がどれだけ小さくても近接順位への小さな既定加点は通る
+        // （margin 拒否の再発防止）一方、加点量自体は常に `observed_top` で
+        // 頭打ちにされる（実際の融合スコア分布に対して過大な加点は通さない、
+        // 1 回目の対応の目的も維持）。`hits` が空でない場合のみこの分岐に入るため
         // `fold` の初期値 `NEG_INFINITY` が実際に採用されることはない
-        // （`apply_soft_boost_cap_is_bounded_by_observed_top_when_top_is_tied_group`
+        // （`apply_soft_boost_cap_is_bounded_by_observed_top_when_top_is_tied_group`・
+        // `apply_soft_boost_default_amount_passes_for_near_top_hit_below_tied_top`
         // で固定）。`observed_top <= 0.0` の退化ケース（極端な `cfg` で融合スコアが
-        // 非正になる場合）は `cap <= 0.0` となり全加点を拒否する側に倒れるが、これは
-        // fail-closed として妥当（加点対象となる保証下限自体が存在しない状況で
-        // 加点を通す理由がない）。
+        // 非正になる場合）は `amount_cap <= 0.0` となり全加点を拒否する側に倒れるが、
+        // これは fail-closed として妥当（加点対象となる保証下限自体が存在しない
+        // 状況で加点を通す理由がない）。
         let static_cap = soft_boost_confirm_cap(cfg);
         let observed_top = hits
             .iter()
             .map(|hit| hit.score)
             .fold(f64::NEG_INFINITY, f64::max);
-        let cap = static_cap.min(observed_top);
+        // `amount_cap` は「加点量そのものの絶対上限」（codex-review P1 対応。
+        // `observed_top` が `static_cap` を下回る退化ケースでも、加点量自体を
+        // 実際の融合スコア分布に対して過大にしない）。一方、候補ごとの残余判定
+        // （`allowed`）は `static_cap` を基準に据え直す（PR #320 2 回目の
+        // cursor-bot 指摘対応。`observed_top` を残余の基準にすると
+        // `cap - hit.score` が「実際の 1 位との差（margin）」そのものに退化し、
+        // `GroupEnd` 下で同点上位グループのすぐ下に位置する候補へ既定加点
+        // `SOFT_BOOST_PER_MATCH` を与えるだけで拒否されてしまう〔過去に 2 回目の
+        // codex-review P1 指摘で撤回した margin 拒否方式の再発〕。残余の基準を
+        // `static_cap` に固定することで、`observed_top` がどれだけ小さくても
+        // 同点上位グループ直下への小さな既定加点は通す一方、`amount_cap` により
+        // 加点量自体の絶対上限は常に `observed_top` で頭打ちにする）。
+        let amount_cap = static_cap.min(observed_top);
         for hit in hits.iter() {
             let candidate_boost: f64 = rules
                 .iter()
@@ -1175,19 +1204,21 @@ pub fn apply_soft_boost(
                 continue;
             }
             // `allowed` は「この候補が受け取れる加点量そのものの上限」。元スコアが
-            // `cap` 未満の候補は残余（`cap - hit.score`）を上限とし（近接順位でない
-            // 候補が加点だけで保証下限を飛び越えるのを防ぐ、従来どおりの判定）、
-            // 元スコアが `cap` 以上の候補（近接順位級。追い越し自体は PLAN-1 の
-            // 正当な用途のため拒否しない）でも `cap` 自体を上限にする（4 回目の
+            // `static_cap` 未満の候補は残余（`static_cap - hit.score`）を `amount_cap`
+            // でさらに切り下げる（近接順位でない候補が加点だけで保証下限を飛び越え
+            // るのを防ぐ、従来どおりの判定。基準を `static_cap` に据えることで
+            // margin 拒否の再発を防ぐ。上記コメント参照）。元スコアが `static_cap`
+            // 以上の候補（近接順位級。追い越し自体は PLAN-1 の正当な用途のため
+            // 拒否しない）でも `amount_cap` 自体を上限にする（4 回目の
             // codex-review P1 指摘対応: 以前は `hit.score >= cap` の候補を確定判定
             // から無条件に除外していたため、`BoostRule::new` の範囲内で複数ルールを
             // 同一 id に積むと `soft_boost_confirm_cap` を大幅に超える加点量
             // （早期検査 `soft_boost_loose_upper_bound` は通過する程度の合計）を
             // 適用でき、「小さな加点のみ」という契約〔PLAN-1〕に反していた）。
-            let allowed = if hit.score >= cap {
-                cap
+            let allowed = if hit.score >= static_cap {
+                amount_cap
             } else {
-                cap - hit.score
+                amount_cap.min(static_cap - hit.score)
             };
             if candidate_boost >= allowed {
                 return Err(HybridError::BoostSoftBoundExceeded {
@@ -2458,14 +2489,15 @@ mod tests {
 
     #[test]
     fn apply_soft_boost_cap_is_bounded_by_observed_top_when_top_is_tied_group() {
-        // PR #320 codex-review P1 指摘の直接回帰（Issue #310 由来）: `RrfConfig`
-        // の既定同点順位規約が [`TieRank::GroupEnd`] になったため、先頭スコアが
-        // N 件同点の融合プールでは実際の最高融合スコアが `soft_boost_confirm_cap`
-        // （`cfg` のみから導出する静的下限。既定 cfg では `1/61 ≈ 0.01639`）を
-        // 下回りうる。ここでは 5 件が同一スコア `1.0 / (60.0 + 5.0) ≈ 0.01538`
-        // （`< 1/61`）で同点になっているケースを再現し、確定判定が静的な
+        // PR #320 codex-review P1 指摘の直接回帰（Issue #310 由来。1 回目）:
+        // `RrfConfig` の既定同点順位規約が [`TieRank::GroupEnd`] になったため、
+        // 先頭スコアが N 件同点の融合プールでは実際の最高融合スコアが
+        // `soft_boost_confirm_cap`（`cfg` のみから導出する静的下限。既定 cfg では
+        // `1/61 ≈ 0.01639`）を下回りうる。ここでは 5 件が同一スコア
+        // `1.0 / (60.0 + 5.0) ≈ 0.01538`（`< 1/61`）で同点になっているケースを
+        // 再現し、加点量そのものの絶対上限（`amount_cap`）が静的な
         // `soft_boost_confirm_cap` だけでなく `hits` の実際の最高スコア
-        // （`observed_top`）でも上限を切り下げていることを検証する。
+        // （`observed_top`）でも切り下げられていることを検証する。
         let cfg = RrfConfig::default();
         let static_cap = soft_boost_confirm_cap(&cfg);
         let observed_top = 1.0 / (cfg.k_const() + 5.0);
@@ -2485,8 +2517,11 @@ mod tests {
         };
 
         // 静的 cap 未満・observed_top 以上の加点量（0.0155）は、静的
-        // `soft_boost_confirm_cap` だけを見れば通ってしまうが、observed_top まで
-        // 切り下げた `cap` では拒否される。
+        // `soft_boost_confirm_cap` だけを見れば通ってしまうが、`observed_top` まで
+        // 切り下げた `amount_cap` では拒否される。この場合の `max`（許容上限）は
+        // 「静的 cap 基準の残余」（`static_cap - observed_top`）を `amount_cap` で
+        // さらに切り下げた値になる（残余の基準自体は `static_cap` に据え置く。
+        // margin 拒否の再発防止。`apply_soft_boost` 実装コメント参照）。
         let mut hits = make_hits();
         let ids: BTreeSet<u64> = [1].into_iter().collect();
         let over_observed_top = BoostRule::new(&ids, 0.0155).unwrap();
@@ -2495,22 +2530,81 @@ mod tests {
             "boost amount must stay below the static cap to isolate the observed_top narrowing"
         );
         let err = apply_soft_boost(&mut hits, &[over_observed_top], &cfg).unwrap_err();
+        let expected_max = (static_cap - observed_top).min(observed_top);
         match err {
             HybridError::BoostSoftBoundExceeded { max, .. } => {
                 assert!(
-                    (max - observed_top).abs() < 1e-12,
-                    "max must be narrowed down to observed_top, got {max}"
+                    (max - expected_max).abs() < 1e-12,
+                    "max must equal min(static_cap, observed_top)-scaled residual, \
+                     expected {expected_max}, got {max}"
                 );
             }
             other => panic!("expected BoostSoftBoundExceeded, got {other:?}"),
         }
 
-        // 通常既定の加点量（`SOFT_BOOST_PER_MATCH`）は observed_top を下限に
-        // した cap にも収まり、従来どおり通過する。
+        // 通常既定の加点量（`SOFT_BOOST_PER_MATCH`）は `observed_top` を下限に
+        // した `amount_cap` にも収まり、従来どおり通過する。
         let mut hits = make_hits();
         let small = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
         apply_soft_boost(&mut hits, &[small], &cfg)
             .expect("SOFT_BOOST_PER_MATCH must stay within the observed_top-narrowed cap");
+    }
+
+    #[test]
+    fn apply_soft_boost_default_amount_passes_for_near_top_hit_below_tied_top() {
+        // PR #320 codex-review P1 指摘の直接回帰（2 回目・cursor-bot 指摘）:
+        // 1 回目の対応（`amount_cap = static_cap.min(observed_top)` を残余計算の
+        // 基準にも使う実装）は、`GroupEnd` の同点上位グループのすぐ下に位置する
+        // 候補への残余を「実際の 1 位との差（margin）」そのものへ退化させ、
+        // 既定加点 `SOFT_BOOST_PER_MATCH`（0.0007）だけで `BoostSoftBoundExceeded`
+        // になってしまっていた（2 回目の codex-review P1 指摘で撤回済みの margin
+        // 拒否方式の再発）。ここでは top 群（5 件同点・`observed_top = 1/65`）の
+        // すぐ下に位置する候補（`observed_top - 0.0002`。top 群との差は
+        // `SOFT_BOOST_PER_MATCH` 未満）を用意し、既定加点を適用しても拒否されず、
+        // 加点後にその候補が top 群を追い越すことを確認する。
+        let cfg = RrfConfig::default();
+        let static_cap = soft_boost_confirm_cap(&cfg);
+        let observed_top = 1.0 / (cfg.k_const() + 5.0);
+        assert!(observed_top < static_cap);
+
+        let near_top_score = observed_top - 0.0002;
+        assert!(
+            observed_top - near_top_score < SOFT_BOOST_PER_MATCH,
+            "near_top hit must sit within a single default boost of the tied top group"
+        );
+
+        let mut hits: Vec<HybridHit> = (1..=5)
+            .map(|id| HybridHit {
+                id,
+                score: observed_top,
+            })
+            .collect();
+        hits.push(HybridHit {
+            id: 6,
+            score: near_top_score,
+        });
+
+        let ids: BTreeSet<u64> = [6].into_iter().collect();
+        let rule = BoostRule::new(&ids, SOFT_BOOST_PER_MATCH).unwrap();
+        apply_soft_boost(&mut hits, &[rule], &cfg).expect(
+            "default SOFT_BOOST_PER_MATCH boost for a near-top hit below a tied top group \
+             must not be rejected as a margin violation",
+        );
+
+        let boosted = hits
+            .iter()
+            .find(|hit| hit.id == 6)
+            .expect("id=6 must still be present (soft boost never removes candidates)");
+        assert!(
+            boosted.score > observed_top,
+            "boosted near-top hit must overtake the tied top group, got {}",
+            boosted.score
+        );
+        assert_eq!(
+            hits.first().map(|hit| hit.id),
+            Some(6),
+            "boosted near-top hit must sort to the front after re-sort"
+        );
     }
 
     #[test]
