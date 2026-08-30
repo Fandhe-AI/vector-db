@@ -228,6 +228,72 @@ Issue #330 対応後の本フィクスチャでの実測比率は
 （字句信号の構造的上限に達している状態での実測値）。`RERANK_RECALL_MIN_R20_LARGE`
 （絶対下限）の判定方式は変更していない。
 
+### Issue #333: クロスエンコーダ方式の導入試行と依存追加の中断
+
+SEARCH-7 の相対基準（`improvement_ratio` の下限。オーナー承認済みの公開可能な
+数値基準として ratio ≥ 0.6。`.claude/rules/spec-confidentiality.md`「許可される
+参照」参照）に対し、上記「Issue #330 追記」の実測（ratio ≈ 0.2222）が字句一致
+方式の構造上限であることを踏まえ、方式変更としてクロスエンコーダ型リランカーの
+導入を試みた（オーナー承認 2026-08-30・Issue #333 案A）。
+
+**実装した部分（依存追加なし・本 PR に含む）**:
+
+- `crates/engine/src/rerank.rs` に推論バックエンドを差し替え可能にする
+  [`CrossEncoderBackend`] trait（`(query, passage)` ペアのスコアリングを抽象化）・
+  [`CrossEncoderConfig`]（`batch_size`/`max_candidates`/`max_seq_len` の検証付き
+  構築）・[`CrossEncoderReranker`]（[`Reranker`] 実装。バッチ分割・fail-closed な
+  長さ不一致/非有限スコア/バックエンド失敗の拒否）・`CrossEncoderError`
+  （[`RerankError::CrossEncoder`] へ委譲）を追加した
+- `crates/engine/tests/rerank_cross_encoder.rs`（feature 非依存・常時 `cargo test`
+  対象）に決定的スタブ推論バックエンドによる契約テスト（順序決定性・
+  `max_candidates`/バッチサイズの有界化・長さ不一致/非有限スコア/バックエンド
+  失敗時の fail-closed）を追加した（受け入れ条件 2 を満たす）
+- `crates/engine/tests/fixtures/nl_qa.rs` に、事前学習済みモデルの評価に適した
+  自然言語 QA 決定的 fixture（60 種の潜在概念、各 2〜3 種の英語表層変種。文書は
+  常に主要な言い回し、クエリは常に別の言い回しで生成し、字句一致では拾いにくい
+  意味的一致ペアを意図的に作る設計）と、`&dyn Reranker` を受け取る一般化した
+  測定関数 `measure_recall_with_reranker`（`rerank_recall.rs::
+  measure_rerank_recall` の複製・一般化版。既存ファイル・既存ゲートは無変更）を
+  追加した
+
+**依存追加を中断した経緯**: `ort = "=2.0.0-rc.13"` + `tokenizers = "=0.23.1"`
+（`optional = true` + `cross-encoder` feature。実装計画どおり `default-features =
+false` + `load-dynamic` 構成）を `crates/engine/Cargo.toml` へ追加し、
+`cargo tree -p engine --features cross-encoder -e features` で依存解決・
+`load-dynamic` 以外の feature が有効化されていないこと・`cargo tree -p
+wire-server` に両クレートが出現しないことを確認したが、`make deny` の
+advisories チェックが `tokenizers` の推移的依存 `paste`（unmaintained advisory
+RUSTSEC-2024-0436）で fail した。実装計画の fail-closed 方針（承認範囲を超える
+`deny.toml` の allow-list 追加・別バージョン採用・別クレート追加は行わず、
+計画外事項として報告する）に従い、`Cargo.toml`・`Cargo.lock` への依存追加は
+ロールバックした。
+
+**結果として本 PR に含まれないもの**（受け入れ条件 3・4 は実測未了）:
+
+- 実 ONNX 推論バックエンド（`OnnxCrossEncoderBackend` サブモジュール。設計・
+  想定 API は実装計画に記録済みだが、依存が追加できないため実装していない）
+- モデルパス環境変数による opt-in 実測ハーネス（`ort`/`tokenizers` に依存する
+  ため同様に未実装）
+- 自然言語 fixture 上でのクロスエンコーダ実測値・SEARCH-7 相対基準への到達可否・
+  #330 への報告
+
+`CrossEncoderBackend` trait を先に確立してあるため、依存の扱い
+（`RUSTSEC-2024-0436` を受容する owner 判断での `deny.toml` 例外追加、`paste` を
+含まない `tokenizers` の代替バージョン選定、または別クレートの検討）が
+オーナー判断で解決した後続 PR では、この trait・[`CrossEncoderReranker`] 自体の
+再設計なしに `cross_encoder_onnx` サブモジュールを追加するだけで実推論・実測へ
+進められる。
+
+**参考実測（`LexicalOverlapReranker`、クロスエンコーダではない）**: 自然言語
+fixture（`tests/nl_qa_fixture.rs`。seed `0x1234_5678`・200 docs・20 queries）で
+`LexicalOverlapReranker::default()` を測定したところ、`baseline_hits20=43` →
+`after_hits20=41`（`pool_ceiling_hits20=79`。改善余地に対して字句一致リランキング
+が *悪化* させた）。既存の合成トークン fixture（`rerank_recall.rs`）とは異なり、
+本 fixture は文書・クエリで意図的に異なる言い回し（表層変種）を使うため字句
+一致では拾いにくい設計であり、この結果は字句一致方式の限界を裏付ける
+（クロスエンコーダを検討する動機の直接的な実測根拠）。クロスエンコーダ自体の
+実測値は前述のとおり未取得。
+
 ## 既知の制約・スコープ外
 
 - **暫定リランカーの効果測定である**: 同梱リランカー（[`LexicalOverlapReranker`]）は
@@ -256,3 +322,8 @@ Issue #330 対応後の本フィクスチャでの実測比率は
 [`hybrid_search`]: ../../crates/engine/src/hybrid.rs
 [`rerank_candidates`]: ../../crates/engine/src/rerank.rs
 [`LexicalOverlapReranker`]: ../../crates/engine/src/rerank.rs
+[`Reranker`]: ../../crates/engine/src/rerank.rs
+[`CrossEncoderBackend`]: ../../crates/engine/src/rerank.rs
+[`CrossEncoderConfig`]: ../../crates/engine/src/rerank.rs
+[`CrossEncoderReranker`]: ../../crates/engine/src/rerank.rs
+[`RerankError::CrossEncoder`]: ../../crates/engine/src/rerank.rs

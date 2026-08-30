@@ -174,6 +174,15 @@ pub enum RerankError {
     /// 判定し fail-closed に拒否する（`sparse.rs::SparseError::CorpusTooLarge` と
     /// 同じ理由: 候補ごとの上限だけでは合計コストが無制限に増幅しうる）。
     TotalCandidateTextTooLong { total: usize, max: usize },
+    /// [`CrossEncoderReranker`]（Issue #333・SEARCH-7 方式変更）が
+    /// [`CrossEncoderBackend`] 実装の呼び出しで失敗した。バックエンド固有の理由は
+    /// [`CrossEncoderError`] へ委譲し、ここでは種別のみを保持する。`RerankError` は
+    /// `#[non_exhaustive]` を持たない既公開 enum であり、`docs/design/
+    /// error-enum-non-exhaustive-policy.md` の方針（既公開エラー enum への
+    /// `#[non_exhaustive]` 後付け不採用）どおり、この variant 追加はソース非互換な
+    /// **破壊的変更**として扱う（コミットの `BREAKING CHANGE:` フッタ・PR 本文の
+    /// Breaking changes 節で明示する）。
+    CrossEncoder(CrossEncoderError),
 }
 
 impl fmt::Display for RerankError {
@@ -216,11 +225,18 @@ impl fmt::Display for RerankError {
                 f,
                 "rerank candidate text total too long: {total} bytes (max {max})"
             ),
+            RerankError::CrossEncoder(e) => write!(f, "cross-encoder reranker error: {e}"),
         }
     }
 }
 
 impl std::error::Error for RerankError {}
+
+impl From<CrossEncoderError> for RerankError {
+    fn from(e: CrossEncoderError) -> Self {
+        RerankError::CrossEncoder(e)
+    }
+}
 
 /// リランキング方式を差し替え可能にする trait（object-safe・`&self` のみ。
 /// [`crate::kernel::SearchProvider`] と同じ制約）。クロスエンコーダ等の本命方式は
@@ -679,6 +695,250 @@ impl Reranker for LexicalOverlapReranker {
         Ok(out)
     }
 }
+
+// ---------- クロスエンコーダ型リランカー（Issue #333・SEARCH-7 方式変更） ----------
+//
+// `LexicalOverlapReranker`（字句一致順位の RRF 型融合）は Issue #330 で構造上限
+// （ratio ≈ 0.22）に達しており、SEARCH-7 の相対基準（ratio ≥ 0.6。
+// `docs/design/rerank-recall-regression.md`「Issue #330」節）には方式変更なしでは
+// 到達できない。ここでは推論バックエンドを [`CrossEncoderBackend`] trait で抽象化し、
+// 実 ONNX 推論（`cross_encoder_onnx` サブモジュール。`cross-encoder` feature 限定・
+// オーナー承認済み依存 `ort`/`tokenizers`）とテスト用スタブの双方から
+// [`CrossEncoderReranker`] を構築できるようにする。これにより受け入れ条件 2
+// （スタブ推論での契約テスト: 順序決定性・有界化・エラー契約）は feature 無効の
+// 通常ビルドでも常時 `cargo test` の対象にできる。
+
+/// [`CrossEncoderReranker`] が使う推論バックエンドの抽象化（`(query, passage)` ペアの
+/// 関連度スコアを返す）。ONNX 実推論（`cross_encoder_onnx::OnnxCrossEncoderBackend`。
+/// `cross-encoder` feature 限定）とテスト用の決定的スタブの双方がこの trait を実装する。
+/// [`Reranker`] と同じ object-safe・`&self` のみの制約。
+pub trait CrossEncoderBackend: Send + Sync {
+    /// `query` と `passages` の各要素とのペアに対する関連度スコアを、`passages` と
+    /// 同じ長さ・同じ順序で返す。返却長が一致しない場合や非有限値を含む場合の検証は
+    /// 呼び出し元（[`CrossEncoderReranker::rerank`]）が行う（バックエンド実装自身に
+    /// 検証を要求しない。fail-closed の判定点を一箇所に集約するため）。
+    fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f64>, CrossEncoderError>;
+
+    /// バックエンドが想定する最大シーケンス長（情報提供用。トークナイザの
+    /// truncation 設定値の記録・ログ用途で、[`CrossEncoderReranker`] 自身は
+    /// この値を上限検証には使わない。上限検証は [`CrossEncoderConfig::max_seq_len`]
+    /// が別途担う。現時点で呼び出し元はない: 本 PR では実 ONNX バックエンド
+    /// （`ort`/`tokenizers` 依存。`make deny` advisories fail により追加見送り。
+    /// `docs/design/rerank-recall-regression.md`「Issue #333」節参照）を実装して
+    /// いないため、後続 PR でロード時ログ・診断出力から参照する想定の予約 API）。
+    fn max_seq_len(&self) -> usize;
+}
+
+/// [`CrossEncoderReranker`] が [`Reranker`] を実装する際に返すエラー
+/// （[`RerankError::CrossEncoder`] へ `From` 変換で包む）。fail-closed:
+/// バックエンド呼び出しの失敗・出力契約違反はいずれも部分受理せず検索全体を拒否する
+/// （`rerank_candidates` の既存 fail-closed 方針と同じ）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CrossEncoderError {
+    /// [`CrossEncoderConfig::new`] の検証違反。
+    InvalidConfig,
+    /// バックエンド初期化（`cross_encoder_onnx::OnnxCrossEncoderBackend::from_files`
+    /// 等）の失敗。理由文字列にはバックエンド固有のエラー文言のみを含め、候補
+    /// テキスト・id 集合は含めない（security.md「エラー・ログ経由で情報を漏らさない」）。
+    Backend(String),
+    /// [`CrossEncoderBackend::score_pairs`] が渡した `passages` と異なる長さの
+    /// スコア列を返した。
+    LengthMismatch { expected: usize, got: usize },
+    /// [`CrossEncoderBackend::score_pairs`] が非有限（NaN・Inf）スコアを返した。
+    NonFiniteScore,
+    /// 候補件数が [`CrossEncoderConfig::max_candidates`] を超えた
+    /// （`rerank_candidates` の [`RerankError::TooManyCandidates`] と同じ理由で、
+    /// [`Reranker`] を経由しない直接呼び出しでもこの実装自身が検証する）。
+    TooManyCandidates { len: usize, max: usize },
+    /// トークナイザの truncation 設定に失敗した（`cross_encoder_onnx` 限定）。
+    /// 3.2 節の契約どおり、この失敗は `from_files` 段階（ロード時）で検出され、
+    /// 推論時に無制限シーケンス長へ伸びる経路を構造的に塞ぐ。
+    TruncationFailed,
+}
+
+impl fmt::Display for CrossEncoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CrossEncoderError::InvalidConfig => write!(f, "invalid cross-encoder config"),
+            CrossEncoderError::Backend(msg) => write!(f, "cross-encoder backend error: {msg}"),
+            CrossEncoderError::LengthMismatch { expected, got } => write!(
+                f,
+                "cross-encoder backend returned {got} scores (expected {expected})"
+            ),
+            CrossEncoderError::NonFiniteScore => {
+                write!(f, "cross-encoder backend returned a non-finite score")
+            }
+            CrossEncoderError::TooManyCandidates { len, max } => write!(
+                f,
+                "cross-encoder candidate list too long: {len} candidates (max {max})"
+            ),
+            CrossEncoderError::TruncationFailed => {
+                write!(f, "cross-encoder tokenizer truncation setup failed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CrossEncoderError {}
+
+/// [`CrossEncoderReranker`] の設定（[`RerankConfig`] と同じ「非 `pub` フィールド +
+/// 検証付き `new`」構築パターン）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CrossEncoderConfig {
+    /// 1 回の `score_pairs` 呼び出しへ渡す passage 件数の上限（DoS・メモリ上限の
+    /// 有界化。バックエンド実装がこれを超えるバッチを一括でテンソル化しない
+    /// ことを保証するのは呼び出し元 = [`CrossEncoderReranker::rerank`] の責務）。
+    batch_size: usize,
+    /// 受理する候補件数の上限（[`MAX_POOL_DEPTH`] 以下）。
+    max_candidates: usize,
+    /// バックエンドへ伝える最大シーケンス長（情報提供用の記録値。truncation の
+    /// 実施自体はバックエンド実装の責務）。
+    max_seq_len: usize,
+}
+
+/// バッチサイズの実装上の上限（`wgpu` バッチ経路等と異なりモデル推論の
+/// メモリ使用量に直結するため、小さめの値で頭打ちする）。
+const MAX_CROSS_ENCODER_BATCH_SIZE: usize = 256;
+
+/// `max_seq_len` の実装上の上限（トークン長。一般的な事前学習済みクロスエンコーダの
+/// 実用域を大きく超える値を拒否し、テンソル確保コストを有界にする）。
+const MAX_CROSS_ENCODER_SEQ_LEN: usize = 8192;
+
+impl CrossEncoderConfig {
+    /// 検証付きコンストラクタ。`batch_size`・`max_candidates`・`max_seq_len` が
+    /// いずれも正かつ実装上限以下であることを検証する。
+    pub fn new(
+        batch_size: usize,
+        max_candidates: usize,
+        max_seq_len: usize,
+    ) -> Result<Self, CrossEncoderError> {
+        if batch_size == 0 || batch_size > MAX_CROSS_ENCODER_BATCH_SIZE {
+            return Err(CrossEncoderError::InvalidConfig);
+        }
+        if max_candidates == 0 || max_candidates > MAX_POOL_DEPTH {
+            return Err(CrossEncoderError::InvalidConfig);
+        }
+        if max_seq_len == 0 || max_seq_len > MAX_CROSS_ENCODER_SEQ_LEN {
+            return Err(CrossEncoderError::InvalidConfig);
+        }
+        Ok(Self {
+            batch_size,
+            max_candidates,
+            max_seq_len,
+        })
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub fn max_candidates(&self) -> usize {
+        self.max_candidates
+    }
+
+    /// [`CrossEncoderBackend::max_seq_len`] と同じ理由で現時点は呼び出し元がない
+    /// 予約 API（実 ONNX バックエンド未実装。同メソッドのドキュメント参照）。
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+}
+
+/// クロスエンコーダ型リランカー本体（[`Reranker`] 実装）。[`CrossEncoderBackend`]
+/// （ONNX 実推論またはテスト用スタブ）へ委譲し、候補を `batch_size` 件ずつバッチ化
+/// して推論、スコア降順・同点 id 昇順の決定的順序で上位 `final_k` 件を返す。
+///
+/// fail-closed 契約: バックエンド呼び出しの失敗・返却長不一致・非有限スコアは
+/// いずれも部分受理せず [`RerankError::CrossEncoder`] で検索全体を拒否する
+/// （`rerank_candidates` の既存方針と同じ。事後フィルタは件数差から情報が漏れる
+/// 経路になるため使わない）。
+pub struct CrossEncoderReranker<B: CrossEncoderBackend> {
+    backend: B,
+    cfg: CrossEncoderConfig,
+}
+
+impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
+    pub fn new(backend: B, cfg: CrossEncoderConfig) -> Self {
+        Self { backend, cfg }
+    }
+}
+
+impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
+    fn rerank(
+        &self,
+        query_text: &str,
+        candidates: &[RerankCandidate<'_>],
+        final_k: usize,
+    ) -> Result<Vec<RerankedHit>, RerankError> {
+        // [`Reranker`] は公開 trait のため `rerank_candidates` を経由しない直接
+        // 呼び出しが型上ありうる（`LexicalOverlapReranker::rerank` と同じ理由）。
+        // この実装自身でも件数・テキスト長を検証してから推論バックエンドへ渡す。
+        if candidates.len() > self.cfg.max_candidates() {
+            return Err(RerankError::CrossEncoder(
+                CrossEncoderError::TooManyCandidates {
+                    len: candidates.len(),
+                    max: self.cfg.max_candidates(),
+                },
+            ));
+        }
+        validate_text_lengths(query_text, candidates)?;
+
+        if candidates.iter().any(|c| !c.fused_score.is_finite()) {
+            return Err(RerankError::NonFiniteScore);
+        }
+        if !is_sorted_desc_id_asc(candidates.iter().map(|c| (c.fused_score, c.id))) {
+            return Err(RerankError::UnsortedInput);
+        }
+        if has_duplicate_id(candidates.iter().map(|c| c.id)) {
+            return Err(RerankError::DuplicateId);
+        }
+
+        // 候補を `batch_size` 件ずつバックエンドへ渡す。バッチ間で id → score の
+        // 対応が崩れないよう `scores` は候補順（＝ `candidates` の順）にそのまま
+        // 積み上げる（`Vec` の位置対応。バックエンドは長さを保つ契約
+        // [`CrossEncoderError::LengthMismatch`] で検証済み）。
+        let mut scores: Vec<f64> = Vec::with_capacity(candidates.len());
+        for chunk in candidates.chunks(self.cfg.batch_size()) {
+            let passages: Vec<&str> = chunk.iter().map(|c| c.text).collect();
+            let chunk_scores = self
+                .backend
+                .score_pairs(query_text, &passages)
+                .map_err(RerankError::CrossEncoder)?;
+            if chunk_scores.len() != passages.len() {
+                return Err(RerankError::CrossEncoder(
+                    CrossEncoderError::LengthMismatch {
+                        expected: passages.len(),
+                        got: chunk_scores.len(),
+                    },
+                ));
+            }
+            if chunk_scores.iter().any(|s| !s.is_finite()) {
+                return Err(RerankError::CrossEncoder(CrossEncoderError::NonFiniteScore));
+            }
+            scores.extend(chunk_scores);
+        }
+
+        // スコア降順・同点 id 昇順の決定的順序（`rerank_candidates` の出力契約と
+        // 同一。`total_cmp` は浮動小数の全順序を与える）で安定させるため、
+        // まず (id, score) のペアへ変換してから比較ソートする。
+        let mut out: Vec<RerankedHit> = candidates
+            .iter()
+            .zip(scores.iter())
+            .map(|(c, &score)| RerankedHit { id: c.id, score })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        out.truncate(final_k);
+        Ok(out)
+    }
+}
+
+// `OnnxCrossEncoderBackend`（実 ONNX 推論。`ort`/`tokenizers` 依存）は
+// `crates/engine/Cargo.toml` の `make deny` advisories fail（`tokenizers` の
+// 推移的依存 `paste` の unmaintained advisory）により本 PR では追加を見送った
+// （`Cargo.toml` 冒頭コメント・`docs/design/rerank-recall-regression.md`
+// 「Issue #333」節参照）。[`CrossEncoderBackend`] trait は実装を差し替え可能な
+// 形で公開済みのため、依存の扱いが解決した後続 PR で `cross_encoder_onnx`
+// サブモジュールを追加すれば足りる（この trait・[`CrossEncoderReranker`] 自体の
+// 再設計は不要）。
 
 #[cfg(test)]
 mod tests {
@@ -1247,5 +1507,179 @@ mod tests {
         let hits = rerank_candidates(&IdentityReranker, "q", &candidates, &cfg).expect("ok");
         let input_ids: std::collections::BTreeSet<u64> = candidates.iter().map(|c| c.id).collect();
         assert!(hits.iter().all(|h| input_ids.contains(&h.id)));
+    }
+
+    // ---------- CrossEncoderReranker（Issue #333）: 決定的スタブによる契約テスト ----------
+    //
+    // `crates/engine/tests/rerank_cross_encoder.rs`（feature 非依存・常時 CI 対象）が
+    // より広い契約（バッチ分割呼び出し数の検証等）を担うため、ここでは
+    // `CrossEncoderReranker::rerank` 自身の内部検証（件数上限・バックエンド委譲・
+    // fail-closed）に絞った最小限のスタブテストのみを置く。
+
+    /// 決定的スタブ: passage の長さをスコアとして返す（順序が決定的になるだけの
+    /// 単純な合成信号。実モデルの近似ではない）。
+    struct LengthScoreBackend;
+
+    impl CrossEncoderBackend for LengthScoreBackend {
+        fn score_pairs(
+            &self,
+            _query: &str,
+            passages: &[&str],
+        ) -> Result<Vec<f64>, CrossEncoderError> {
+            Ok(passages.iter().map(|p| p.len() as f64).collect())
+        }
+
+        fn max_seq_len(&self) -> usize {
+            512
+        }
+    }
+
+    #[test]
+    fn cross_encoder_reranker_orders_by_backend_score_descending() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let candidates = [
+            cand(1, 3.0, "aa"),
+            cand(2, 2.0, "aaaaaa"),
+            cand(3, 1.0, "aaaa"),
+        ];
+        let hits =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
+        assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn cross_encoder_reranker_is_deterministic_across_calls() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let candidates = [cand(1, 3.0, "aa"), cand(2, 2.0, "aaaaaa")];
+        let first =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
+        let second =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
+        assert_eq!(first, second);
+    }
+
+    struct LengthMismatchBackend;
+
+    impl CrossEncoderBackend for LengthMismatchBackend {
+        fn score_pairs(
+            &self,
+            _query: &str,
+            passages: &[&str],
+        ) -> Result<Vec<f64>, CrossEncoderError> {
+            Ok(vec![0.0; passages.len().saturating_sub(1)])
+        }
+
+        fn max_seq_len(&self) -> usize {
+            512
+        }
+    }
+
+    #[test]
+    fn cross_encoder_reranker_rejects_backend_length_mismatch() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthMismatchBackend, cfg);
+        let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
+        let err =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::LengthMismatch { .. })
+        ));
+    }
+
+    struct NonFiniteScoreBackend;
+
+    impl CrossEncoderBackend for NonFiniteScoreBackend {
+        fn score_pairs(
+            &self,
+            _query: &str,
+            passages: &[&str],
+        ) -> Result<Vec<f64>, CrossEncoderError> {
+            Ok(vec![f64::NAN; passages.len()])
+        }
+
+        fn max_seq_len(&self) -> usize {
+            512
+        }
+    }
+
+    #[test]
+    fn cross_encoder_reranker_rejects_backend_non_finite_score() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(NonFiniteScoreBackend, cfg);
+        let candidates = [cand(1, 2.0, "a")];
+        let err =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::NonFiniteScore)
+        ));
+    }
+
+    struct FailingBackend;
+
+    impl CrossEncoderBackend for FailingBackend {
+        fn score_pairs(
+            &self,
+            _query: &str,
+            _passages: &[&str],
+        ) -> Result<Vec<f64>, CrossEncoderError> {
+            Err(CrossEncoderError::Backend("stub failure".to_string()))
+        }
+
+        fn max_seq_len(&self) -> usize {
+            512
+        }
+    }
+
+    #[test]
+    fn cross_encoder_reranker_propagates_backend_error() {
+        let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(FailingBackend, cfg);
+        let candidates = [cand(1, 2.0, "a")];
+        let err =
+            rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn cross_encoder_reranker_rejects_too_many_candidates() {
+        // `max_candidates` を `pool_depth` より小さく設定し、`rerank_candidates` の
+        // `TooManyCandidates`（入口検証）を通過しても `CrossEncoderReranker::rerank`
+        // 自身が候補数上限を検証することを固定する。
+        let cfg = CrossEncoderConfig::new(32, 1, 512).unwrap();
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
+        let rerank_cfg = RerankConfig::new(200, 20).unwrap();
+        let err = rerank_candidates(&reranker, "q", &candidates, &rerank_cfg).unwrap_err();
+        assert!(matches!(
+            err,
+            RerankError::CrossEncoder(CrossEncoderError::TooManyCandidates { len: 2, max: 1 })
+        ));
+    }
+
+    #[test]
+    fn cross_encoder_config_rejects_invalid_values() {
+        assert_eq!(
+            CrossEncoderConfig::new(0, 200, 512).unwrap_err(),
+            CrossEncoderError::InvalidConfig
+        );
+        assert_eq!(
+            CrossEncoderConfig::new(32, 0, 512).unwrap_err(),
+            CrossEncoderError::InvalidConfig
+        );
+        assert_eq!(
+            CrossEncoderConfig::new(32, 200, 0).unwrap_err(),
+            CrossEncoderError::InvalidConfig
+        );
+        assert_eq!(
+            CrossEncoderConfig::new(32, MAX_POOL_DEPTH + 1, 512).unwrap_err(),
+            CrossEncoderError::InvalidConfig
+        );
     }
 }
