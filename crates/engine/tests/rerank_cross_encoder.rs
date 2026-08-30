@@ -68,7 +68,7 @@ impl CrossEncoderBackend for CallCountingBackend {
 fn cross_encoder_reranker_splits_candidates_into_batches_within_batch_size() {
     let cfg = CrossEncoderConfig::new(4, 200, 512).unwrap();
     let (backend, call_lengths) = CallCountingBackend::new();
-    let reranker = CrossEncoderReranker::new(backend, cfg);
+    let reranker = CrossEncoderReranker::new(backend, cfg).unwrap();
 
     // 10 candidates, batch_size = 4 → 呼び出しは 3 回（4, 4, 2）で、いずれも
     // batch_size を超えない。
@@ -87,7 +87,7 @@ fn cross_encoder_reranker_splits_candidates_into_batches_within_batch_size() {
 fn cross_encoder_reranker_is_deterministic_across_repeated_calls() {
     let cfg = CrossEncoderConfig::new(8, 200, 512).unwrap();
     let (backend, _call_lengths) = CallCountingBackend::new();
-    let reranker = CrossEncoderReranker::new(backend, cfg);
+    let reranker = CrossEncoderReranker::new(backend, cfg).unwrap();
     let candidates: Vec<RerankCandidate<'_>> = vec![
         cand(1, 3.0, "short"),
         cand(2, 2.0, "a much longer passage text"),
@@ -127,7 +127,7 @@ fn cross_encoder_reranker_rejects_max_candidates_exceeded_via_rerank_candidates(
     let backend = FixedScoreBackend {
         scores: vec![1.0, 2.0, 3.0],
     };
-    let reranker = CrossEncoderReranker::new(backend, cfg);
+    let reranker = CrossEncoderReranker::new(backend, cfg).unwrap();
     let candidates = [cand(1, 3.0, "a"), cand(2, 2.0, "b"), cand(3, 1.0, "c")];
     let rerank_cfg = RerankConfig::new(200, 20).unwrap();
     let err = rerank_candidates(&reranker, "q", &candidates, &rerank_cfg).unwrap_err();
@@ -152,7 +152,7 @@ impl CrossEncoderBackend for LengthMismatchBackend {
 #[test]
 fn cross_encoder_reranker_rejects_backend_length_mismatch_via_rerank_candidates() {
     let cfg = CrossEncoderConfig::new(8, 200, 512).unwrap();
-    let reranker = CrossEncoderReranker::new(LengthMismatchBackend, cfg);
+    let reranker = CrossEncoderReranker::new(LengthMismatchBackend, cfg).unwrap();
     let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
     let rerank_cfg = RerankConfig::default();
     let err = rerank_candidates(&reranker, "q", &candidates, &rerank_cfg).unwrap_err();
@@ -184,7 +184,7 @@ impl CrossEncoderBackend for NonFiniteBackend {
 #[test]
 fn cross_encoder_reranker_rejects_backend_non_finite_score_via_rerank_candidates() {
     let cfg = CrossEncoderConfig::new(8, 200, 512).unwrap();
-    let reranker = CrossEncoderReranker::new(NonFiniteBackend, cfg);
+    let reranker = CrossEncoderReranker::new(NonFiniteBackend, cfg).unwrap();
     let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
     let rerank_cfg = RerankConfig::default();
     let err = rerank_candidates(&reranker, "q", &candidates, &rerank_cfg).unwrap_err();
@@ -212,7 +212,7 @@ impl CrossEncoderBackend for AlwaysFailingBackend {
 fn cross_encoder_reranker_rejects_whole_search_on_backend_failure() {
     // fail-closed: バッチの一部だけが失敗しても部分受理はせず検索全体を拒否する。
     let cfg = CrossEncoderConfig::new(2, 200, 512).unwrap();
-    let reranker = CrossEncoderReranker::new(AlwaysFailingBackend, cfg);
+    let reranker = CrossEncoderReranker::new(AlwaysFailingBackend, cfg).unwrap();
     let candidates: Vec<RerankCandidate<'_>> =
         (0..5).map(|i| cand(i, (5 - i) as f64, "x")).collect();
     let rerank_cfg = RerankConfig::default();
@@ -255,7 +255,7 @@ fn cross_encoder_reranker_output_is_subset_of_input_pool() {
     let backend = FixedScoreBackend {
         scores: vec![5.0, 4.0, 3.0, 2.0, 1.0],
     };
-    let reranker = CrossEncoderReranker::new(backend, cfg);
+    let reranker = CrossEncoderReranker::new(backend, cfg).unwrap();
     let candidates: Vec<RerankCandidate<'_>> =
         (0..5).map(|i| cand(i, (5 - i) as f64, "x")).collect();
     let rerank_cfg = RerankConfig::default();

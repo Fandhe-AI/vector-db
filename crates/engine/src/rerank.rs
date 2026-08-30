@@ -719,13 +719,12 @@ pub trait CrossEncoderBackend: Send + Sync {
     /// 検証を要求しない。fail-closed の判定点を一箇所に集約するため）。
     fn score_pairs(&self, query: &str, passages: &[&str]) -> Result<Vec<f64>, CrossEncoderError>;
 
-    /// バックエンドが想定する最大シーケンス長（情報提供用。トークナイザの
-    /// truncation 設定値の記録・ログ用途で、[`CrossEncoderReranker`] 自身は
-    /// この値を上限検証には使わない。上限検証は [`CrossEncoderConfig::max_seq_len`]
-    /// が別途担う。現時点で呼び出し元はない: 本 PR では実 ONNX バックエンド
-    /// （`ort`/`tokenizers` 依存。`make deny` advisories fail により追加見送り。
-    /// `docs/design/rerank-recall-regression.md`「Issue #333」節参照）を実装して
-    /// いないため、後続 PR でロード時ログ・診断出力から参照する想定の予約 API）。
+    /// バックエンドが実際にトークナイザへ設定した最大シーケンス長。
+    /// [`CrossEncoderReranker::new`] がこの値と [`CrossEncoderConfig::max_seq_len`]
+    /// の一致を構築時に検証し、不一致を [`CrossEncoderError::BackendSeqLenMismatch`]
+    /// で拒否する（Issue #333 codex-review 指摘への対応。設定値が推論経路の実際の
+    /// truncation 上限と無関係に構築できてしまうと、DoS／メモリ上限の有界化と
+    /// [`CrossEncoderError::TruncationFailed`] の fail-closed 契約を保証できないため）。
     fn max_seq_len(&self) -> usize;
 }
 
@@ -754,6 +753,12 @@ pub enum CrossEncoderError {
     /// 3.2 節の契約どおり、この失敗は `from_files` 段階（ロード時）で検出され、
     /// 推論時に無制限シーケンス長へ伸びる経路を構造的に塞ぐ。
     TruncationFailed,
+    /// [`CrossEncoderReranker::new`] の構築時検証違反: バックエンドが実際に
+    /// トークナイザへ設定した最大シーケンス長（[`CrossEncoderBackend::max_seq_len`]）
+    /// と設定値（[`CrossEncoderConfig::max_seq_len`]）が一致しない。不一致のまま
+    /// 構築を許すと、推論経路の実際の truncation 上限と無関係な設定値を掲げること
+    /// になり、DoS／メモリ上限の有界化を保証できない（Issue #333 codex-review 指摘）。
+    BackendSeqLenMismatch { backend: usize, configured: usize },
 }
 
 impl fmt::Display for CrossEncoderError {
@@ -775,6 +780,13 @@ impl fmt::Display for CrossEncoderError {
             CrossEncoderError::TruncationFailed => {
                 write!(f, "cross-encoder tokenizer truncation setup failed")
             }
+            CrossEncoderError::BackendSeqLenMismatch {
+                backend,
+                configured,
+            } => write!(
+                f,
+                "cross-encoder backend max_seq_len ({backend}) does not match configured max_seq_len ({configured})"
+            ),
         }
     }
 }
@@ -836,8 +848,8 @@ impl CrossEncoderConfig {
         self.max_candidates
     }
 
-    /// [`CrossEncoderBackend::max_seq_len`] と同じ理由で現時点は呼び出し元がない
-    /// 予約 API（実 ONNX バックエンド未実装。同メソッドのドキュメント参照）。
+    /// [`CrossEncoderReranker::new`] が [`CrossEncoderBackend::max_seq_len`] との
+    /// 一致検証に使う（同メソッドのドキュメント参照）。
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
@@ -857,8 +869,19 @@ pub struct CrossEncoderReranker<B: CrossEncoderBackend> {
 }
 
 impl<B: CrossEncoderBackend> CrossEncoderReranker<B> {
-    pub fn new(backend: B, cfg: CrossEncoderConfig) -> Self {
-        Self { backend, cfg }
+    /// 検証付きコンストラクタ。`backend.max_seq_len()`（バックエンドが実際に
+    /// トークナイザへ設定した最大シーケンス長）と `cfg.max_seq_len()`（設定値）の
+    /// 一致を検証し、不一致は [`CrossEncoderError::BackendSeqLenMismatch`] で拒否する
+    /// （Issue #333 codex-review 指摘: この検証なしでは設定値が推論経路の実際の
+    /// truncation 上限と無関係になり、DoS／メモリ上限の有界化を保証できない）。
+    pub fn new(backend: B, cfg: CrossEncoderConfig) -> Result<Self, CrossEncoderError> {
+        if backend.max_seq_len() != cfg.max_seq_len() {
+            return Err(CrossEncoderError::BackendSeqLenMismatch {
+                backend: backend.max_seq_len(),
+                configured: cfg.max_seq_len(),
+            });
+        }
+        Ok(Self { backend, cfg })
     }
 }
 
@@ -1537,7 +1560,7 @@ mod tests {
     #[test]
     fn cross_encoder_reranker_orders_by_backend_score_descending() {
         let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg).unwrap();
         let candidates = [
             cand(1, 3.0, "aa"),
             cand(2, 2.0, "aaaaaa"),
@@ -1551,7 +1574,7 @@ mod tests {
     #[test]
     fn cross_encoder_reranker_is_deterministic_across_calls() {
         let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg).unwrap();
         let candidates = [cand(1, 3.0, "aa"), cand(2, 2.0, "aaaaaa")];
         let first =
             rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).expect("ok");
@@ -1579,7 +1602,7 @@ mod tests {
     #[test]
     fn cross_encoder_reranker_rejects_backend_length_mismatch() {
         let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(LengthMismatchBackend, cfg);
+        let reranker = CrossEncoderReranker::new(LengthMismatchBackend, cfg).unwrap();
         let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
         let err =
             rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
@@ -1608,7 +1631,7 @@ mod tests {
     #[test]
     fn cross_encoder_reranker_rejects_backend_non_finite_score() {
         let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(NonFiniteScoreBackend, cfg);
+        let reranker = CrossEncoderReranker::new(NonFiniteScoreBackend, cfg).unwrap();
         let candidates = [cand(1, 2.0, "a")];
         let err =
             rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
@@ -1637,7 +1660,7 @@ mod tests {
     #[test]
     fn cross_encoder_reranker_propagates_backend_error() {
         let cfg = CrossEncoderConfig::new(32, 200, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(FailingBackend, cfg);
+        let reranker = CrossEncoderReranker::new(FailingBackend, cfg).unwrap();
         let candidates = [cand(1, 2.0, "a")];
         let err =
             rerank_candidates(&reranker, "q", &candidates, &RerankConfig::default()).unwrap_err();
@@ -1653,7 +1676,7 @@ mod tests {
         // `TooManyCandidates`（入口検証）を通過しても `CrossEncoderReranker::rerank`
         // 自身が候補数上限を検証することを固定する。
         let cfg = CrossEncoderConfig::new(32, 1, 512).unwrap();
-        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        let reranker = CrossEncoderReranker::new(LengthScoreBackend, cfg).unwrap();
         let candidates = [cand(1, 2.0, "a"), cand(2, 1.0, "b")];
         let rerank_cfg = RerankConfig::new(200, 20).unwrap();
         let err = rerank_candidates(&reranker, "q", &candidates, &rerank_cfg).unwrap_err();
@@ -1681,5 +1704,24 @@ mod tests {
             CrossEncoderConfig::new(32, MAX_POOL_DEPTH + 1, 512).unwrap_err(),
             CrossEncoderError::InvalidConfig
         );
+    }
+
+    // Issue #333 codex-review 指摘: `CrossEncoderConfig::max_seq_len` の検証済み値が
+    // 推論経路（`CrossEncoderBackend::max_seq_len`）と無関係に構築できてしまうと、
+    // DoS／メモリ上限の有界化を保証できない。`CrossEncoderReranker::new` が構築時に
+    // 両者の一致を検証し、不一致を拒否することを固定する。
+    #[test]
+    fn cross_encoder_reranker_new_rejects_backend_seq_len_mismatch() {
+        // `LengthScoreBackend::max_seq_len` は 512 固定。`cfg` 側を異なる値
+        // （256）にすることで不一致を作り、構築拒否を固定する。
+        let cfg = CrossEncoderConfig::new(32, 200, 256).unwrap();
+        let result = CrossEncoderReranker::new(LengthScoreBackend, cfg);
+        assert!(matches!(
+            result,
+            Err(CrossEncoderError::BackendSeqLenMismatch {
+                backend: 512,
+                configured: 256,
+            })
+        ));
     }
 }
