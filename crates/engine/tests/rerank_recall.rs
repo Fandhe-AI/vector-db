@@ -33,14 +33,21 @@
 //!   持ち込まない（`.claude/rules/spec-confidentiality.md`）
 //! - 層 B（`#[ignore]`・`make rerank-regression` 経由）: spec 由来の Recall 下限
 //!   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
-//!   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限。
-//!   `.github/workflows/recall.yml` が environment `recall-gate` の Actions
-//!   variables から注入）と実測値を比較する閾値ゲート。`RERANK_RECALL_REQUIRE_
-//!   THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で未設定を fail-closed
-//!   にする strict モードを持つ（`hybrid_recall.rs::resolve_gate_threshold` と
-//!   同型。ログには対象名と pass/fail のみを出力し、実測値は `RECALL_VERBOSE=1`
-//!   （`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時のみ追加出力する
-//!   〔`resolve_verbose`・`verbose_requested_from_env`・`render_gate_line`〕）
+//!   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限）と実測値を
+//!   比較する閾値ゲート。Issue #330（SEARCH-7 改訂・vector-db-spec#7）により
+//!   `RERANK_RECALL_MIN_R20_IMPROVEMENT` の判定基準は絶対差（after − baseline）
+//!   から候補プール上限に対する相対比率（[`RerankRecallResult::improvement_
+//!   ratio`]＝`(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`）
+//!   へ再定義した。「(1) 非劣化 `after_hits20 >= baseline_hits20`」と「(2) 相対
+//!   比率が下限以上」の 2 条件からなり、改善余地（分母）が構造的にほぼ 0 の場合は
+//!   (2) を自動充足として (1) のみで判定する（`.github/workflows/recall.yml` が
+//!   environment `recall-gate` の Actions variables から注入）。`RERANK_RECALL_
+//!   REQUIRE_THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で未設定を
+//!   fail-closed にする strict モードを持つ（`hybrid_recall.rs::resolve_gate_
+//!   threshold` と同型。ログには対象名と pass/fail のみを出力し、実測値は
+//!   `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時
+//!   のみ追加出力する〔`resolve_verbose`・`verbose_requested_from_env`・
+//!   `render_gate_line`〕）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 同梱リランカー（[`LexicalOverlapReranker`]）は方式確定までの暫定実装
@@ -313,6 +320,12 @@ struct RerankRecallResult {
     after_hits20: usize,
     pool_hits100: usize,
     pool_hits200: usize,
+    /// クエリ単位の `min(20, プール（200件）内の正解数)` の総和。「候補プール内に
+    /// 完璧な並び替えを施した場合に上位 20 件で回収しうる理論上限」（Issue #330・
+    /// SEARCH-7 改訂で導入。`ceil20` はコーパス全体に対する理論上限であり、プールに
+    /// 入っていない正解＝候補生成段の課題まで含むため、リランキング単独の改善余地を
+    /// 測るにはこちらを分母に使う）。
+    pool_ceiling_hits20: usize,
     ceil20: usize,
     ceil100: usize,
     ceil200: usize,
@@ -333,6 +346,32 @@ impl RerankRecallResult {
 
     fn pool_recall200(&self) -> f64 {
         self.pool_hits200 as f64 / self.ceil200 as f64
+    }
+
+    /// baseline から見た「候補プール内でリランキングが到達しうる改善余地」
+    /// （`pool_ceiling_hits20 − baseline_hits20`）。baseline は候補プールの部分集合
+    /// （先頭 20 件）に対する測定であり、`pool_ceiling_hits20` は同一プール全体を
+    /// 分母とするため常に `baseline_hits20 <= pool_ceiling_hits20`（負にならない）。
+    fn improvement_headroom(&self) -> usize {
+        self.pool_ceiling_hits20
+            .saturating_sub(self.baseline_hits20)
+    }
+
+    /// Issue #330（SEARCH-7 改訂）: `RERANK_RECALL_MIN_R20_IMPROVEMENT` ゲートが
+    /// 比較する改善幅を、絶対差（after − baseline）から候補プール上限に対する
+    /// 相対比率 `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)` へ
+    /// 再定義したもの。改善余地（分母）がコーパス全体理論上限 `ceil20` の 1%
+    /// （`< 0.01 × ceil20`）未満の場合は、構造的にほぼ改善不可能な状況であり相対比率
+    /// の分母が 0 に近づき不安定になるため `None` を返す（fail-closed の分母 0
+    /// 対策を兼ねる）。呼び出し側は `None` を「条件(2)は自動充足」として扱う
+    /// （条件(1)＝非劣化のみで判定する）。
+    fn improvement_ratio(&self) -> Option<f64> {
+        let headroom = self.improvement_headroom();
+        if (headroom as f64) < 0.01 * self.ceil20 as f64 {
+            return None;
+        }
+        let improved = self.after_hits20.saturating_sub(self.baseline_hits20);
+        Some(improved as f64 / headroom as f64)
     }
 }
 
@@ -363,6 +402,7 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
     let mut after_hits20 = 0usize;
     let mut pool_hits100 = 0usize;
     let mut pool_hits200 = 0usize;
+    let mut pool_ceiling_hits20 = 0usize;
     let mut ceil20 = 0usize;
     let mut ceil100 = 0usize;
     let mut ceil200 = 0usize;
@@ -407,7 +447,11 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
             .take(100)
             .filter(|h| case.correct.contains(&h.id))
             .count();
-        pool_hits200 += pool.iter().filter(|h| case.correct.contains(&h.id)).count();
+        let pool_hits_this_case = pool.iter().filter(|h| case.correct.contains(&h.id)).count();
+        pool_hits200 += pool_hits_this_case;
+        // クエリ単位の「プール内に完璧に並び替えた場合の上位 20 件到達上限」
+        // （Issue #330・SEARCH-7 改訂）。
+        pool_ceiling_hits20 += pool_hits_this_case.min(20);
 
         // ---- after: リランキングあり ----
         let candidates: Vec<RerankCandidate<'_>> = pool
@@ -432,6 +476,7 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
         after_hits20,
         pool_hits100,
         pool_hits200,
+        pool_ceiling_hits20,
         ceil20,
         ceil100,
         ceil200,
@@ -520,6 +565,13 @@ fn rerank_recall_large_scale_regression() {
             r.pool_hits200,
             r.ceil200,
         );
+        println!(
+            "pool_ceiling_hits20={}  improvement_ratio={}",
+            r.pool_ceiling_hits20,
+            r.improvement_ratio()
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "N/A (negligible headroom; auto-pass)".to_string()),
+        );
     }
 
     // `hits`/`ceil`/`total_correct` を固定値で回帰トラッキングする（検索カーネル・
@@ -540,6 +592,10 @@ fn rerank_recall_large_scale_regression() {
     );
     assert_eq!(r.pool_hits100, 837, "プール Recall@100 hit 数が変化した");
     assert_eq!(r.pool_hits200, 951, "プール Recall@200 hit 数が変化した");
+    assert_eq!(
+        r.pool_ceiling_hits20, 396,
+        "候補プール内でリランキングが到達しうる Recall@20 上限（pool_ceiling_hits20）が変化した"
+    );
 
     // SEARCH-7 契約メモ: `after_hits20 >= baseline_hits20`（リランキング層が
     // Recall を悪化させていないことの独立検証）。境界同点グループ完全化の
@@ -557,6 +613,13 @@ fn rerank_recall_large_scale_regression() {
     // の同点規約を位置順位から `rank_fused` と同じ GroupEnd へ統一し、字句信号の
     // 構造的上限（`docs/design/rerank-recall-regression.md`「Issue #330」節参照）
     // まで改善幅を引き上げた（after 389 ≥ baseline 387。採用比率の実測は同節参照）。
+    //
+    // 同 Issue #330（vector-db-spec#7 改訂・SEARCH-7）でゲート側の基準を絶対差
+    // （after − baseline）から候補プール上限に対する相対比率
+    // （[`RerankRecallResult::improvement_ratio`]。分母 `pool_ceiling_hits20 −
+    // baseline_hits20` が構造的な改善余地を表す）へ再定義した。字句信号の構造的
+    // 上限に達している本フィクスチャでは
+    // `improvement_ratio() = (389 − 387) / (396 − 387) = 2 / 9 ≈ 0.222`。
     assert!(
         r.after_hits20 >= r.baseline_hits20,
         "リランキング層（LexicalOverlapReranker）が baseline（リランキングなし）の Recall@20 を悪化させた"
@@ -564,6 +627,135 @@ fn rerank_recall_large_scale_regression() {
 }
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
+
+/// 層 B の改善幅ゲート判定ロジック（環境変数非依存の純関数）。
+///
+/// `rerank_recall_large_scale_threshold_gate` にインライン展開されていた判定式
+/// （条件(1) 非劣化 `after_hits20 >= baseline_hits20` と条件(2) [`RerankRecallResult::
+/// improvement_ratio`] が `threshold` 以上〔`None`＝改善余地が構造的にほぼ 0 の場合は
+/// 自動充足〕の AND）を関数として切り出し、`#[ignore]` の層 B テスト（spec 閾値・
+/// Actions variables 依存）を経由せずに常時実行の単体テストから境界条件を検証できる
+/// ようにする（PR #332 codex-review P2 対応・Issue #330）。挙動は変更しない。
+fn improvement_gate_passes(result: &RerankRecallResult, threshold: f64) -> bool {
+    let non_degraded = result.after_hits20 >= result.baseline_hits20;
+    let pass_ratio = result.improvement_ratio().is_none_or(|v| v >= threshold);
+    non_degraded && pass_ratio
+}
+
+#[cfg(test)]
+mod improvement_ratio_tests {
+    use super::{improvement_gate_passes, RerankRecallResult};
+
+    /// テスト用の [`RerankRecallResult`] を直接構築するヘルパ（`measure_rerank_recall`
+    /// を経由せず、`improvement_ratio`/`improvement_gate_passes` の境界条件を単体で
+    /// 固定する。PR #332 codex-review P2 対応・Issue #330: 層 A の固定値回帰テスト
+    /// （`rerank_recall_large_scale_regression`）が通る通常経路〔`Some(2/9)`〕以外の
+    /// `headroom == 0`・1% 境界の直前/直後・`after < baseline` の組み合わせが未検証
+    /// だった指摘への対応。他フィールド（`total_correct`/`pool_hits100`/`pool_hits200`/
+    /// `ceil100`/`ceil200`）は `improvement_ratio`/`improvement_gate_passes` の計算に
+    /// 使われないためダミー値で固定する。
+    fn result_with(
+        baseline_hits20: usize,
+        after_hits20: usize,
+        pool_ceiling_hits20: usize,
+        ceil20: usize,
+    ) -> RerankRecallResult {
+        RerankRecallResult {
+            total_correct: 0,
+            baseline_hits20,
+            after_hits20,
+            pool_hits100: 0,
+            pool_hits200: 0,
+            pool_ceiling_hits20,
+            ceil20,
+            ceil100: 0,
+            ceil200: 0,
+        }
+    }
+
+    #[test]
+    fn improvement_ratio_none_when_headroom_zero() {
+        // headroom = pool_ceiling_hits20 - baseline_hits20 = 0（ceiling == baseline。
+        // 分母 0 で改善余地が構造的に存在しない）。
+        let r = result_with(100, 100, 100, 1000);
+        assert_eq!(r.improvement_headroom(), 0);
+        assert_eq!(r.improvement_ratio(), None);
+    }
+
+    #[test]
+    fn improvement_ratio_none_just_below_one_percent_boundary() {
+        // ceil20 = 1000 → 1% しきい値 = 10。headroom = 9（境界直前）は分母不安定と
+        // みなし None（自動充足扱い）にしなければならない。
+        let r = result_with(100, 105, 109, 1000);
+        assert_eq!(r.improvement_headroom(), 9);
+        assert_eq!(r.improvement_ratio(), None);
+    }
+
+    #[test]
+    fn improvement_ratio_some_at_exact_one_percent_boundary() {
+        // headroom = 10 = ちょうど 1%（境界。`< 0.01 * ceil20` は偽になり Some を返す）。
+        let r = result_with(100, 105, 110, 1000);
+        assert_eq!(r.improvement_headroom(), 10);
+        assert_eq!(r.improvement_ratio(), Some(0.5));
+    }
+
+    #[test]
+    fn improvement_ratio_some_just_above_one_percent_boundary() {
+        let r = result_with(100, 106, 111, 1000);
+        assert_eq!(r.improvement_headroom(), 11);
+        let ratio = r
+            .improvement_ratio()
+            .expect("headroom above the 1% threshold must be Some");
+        assert!((ratio - (6.0 / 11.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn improvement_ratio_matches_large_scale_regression_fixture_value() {
+        // `rerank_recall_large_scale_regression` の固定値（after 389・baseline 387・
+        // pool_ceiling_hits20 396・ceil20 410。同テストのアサーション参照）から算出
+        // される比率 2/9（同テストのドキュメンテーションコメントに明記済み・
+        // `.claude/rules/spec-confidentiality.md` の実測値公開許可の範囲内）と
+        // `improvement_ratio()` の算出結果が一致することを固定する。
+        let r = result_with(387, 389, 396, 410);
+        let ratio = r
+            .improvement_ratio()
+            .expect("large-scale regression fixture headroom is well above the 1% threshold");
+        assert!((ratio - (2.0 / 9.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn improvement_gate_passes_none_ratio_auto_passes_regardless_of_threshold() {
+        // headroom 0 → improvement_ratio() は None。条件(2)を自動充足として threshold
+        // の値によらず pass する（条件(1)の非劣化のみで判定）。
+        let r = result_with(100, 100, 100, 1000);
+        assert!(improvement_gate_passes(&r, 1.0));
+    }
+
+    #[test]
+    fn improvement_gate_passes_some_ratio_at_or_above_threshold() {
+        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
+        assert!(improvement_gate_passes(&r, 0.5));
+        assert!(improvement_gate_passes(&r, 0.0));
+    }
+
+    #[test]
+    fn improvement_gate_fails_some_ratio_below_threshold() {
+        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
+        assert!(!improvement_gate_passes(&r, 0.6));
+    }
+
+    #[test]
+    fn improvement_gate_fails_when_after_below_baseline_regardless_of_ratio() {
+        // 非劣化条件（条件(1)）違反は独立にゲートを fail させなければならない
+        // （比較演算子・分母計算の将来変更で fail-open にならないことを固定する回帰）。
+        // headroom = pool_ceiling_hits20(110).saturating_sub(baseline_hits20(105)) = 5 <
+        // 1%（10）のため improvement_ratio() 自体は None（条件(2)は自動充足）だが、
+        // after(100) < baseline(105) の非劣化違反により threshold=0.0 でも fail する。
+        let r = result_with(105, 100, 110, 1000);
+        assert_eq!(r.improvement_ratio(), None);
+        assert!(!improvement_gate_passes(&r, 0.0));
+    }
+}
 
 /// `RERANK_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果
 /// （`hybrid_recall.rs::GateThreshold` と同一の役割）。
@@ -612,13 +804,15 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     threshold_from_env(var, |v| v > 0.0 && v <= 1.0, "(0.0, 1.0]")
 }
 
-/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る（改善幅 = after −
-/// baseline の下限）。改善幅 0 は「改善は必須ではないが悪化は許さない」という
-/// 正当な設定である（層 A の `after_hits20 >= baseline_hits20` 固定値検証
-/// （Issue #310 対応で既定重み変更後は成立する）と同じ非劣化条件を、層 B では
-/// spec 由来の下限として任意設定できるようにする）。
-/// [`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり `[0.0, 1.0]`
-/// （0 を含む）を許容範囲とする。
+/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る。Issue #330
+/// （SEARCH-7 改訂・vector-db-spec#7）により、この値は改善幅の絶対差ではなく
+/// [`RerankRecallResult::improvement_ratio`] が返す相対比率（`(after −
+/// baseline) / (pool_ceiling_hits20 − baseline_hits20)`）の下限として解釈する。
+/// 比率 0 は「改善は必須ではないが悪化は許さない」という正当な設定である（層 A の
+/// `after_hits20 >= baseline_hits20` 固定値検証（Issue #310 対応で既定重み変更後は
+/// 成立する）と同じ非劣化条件を、層 B では spec 由来の下限として任意設定できる
+/// ようにする）。[`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり
+/// `[0.0, 1.0]`（0 を含む）を許容範囲とする。
 fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     threshold_from_env(var, |v| (0.0..=1.0).contains(&v), "[0.0, 1.0]")
 }
@@ -769,8 +963,11 @@ mod verbose_gate_tests {
 }
 
 /// TASK-108（SEARCH-7）層 B: 大規模段のリランキング後の最終 Recall@20 が
-/// `RERANK_RECALL_MIN_R20_LARGE`（絶対下限）以上、かつ baseline からの改善幅
-/// （after − baseline）が `RERANK_RECALL_MIN_R20_IMPROVEMENT` 以上であることを
+/// `RERANK_RECALL_MIN_R20_LARGE`（絶対下限）以上、かつ非劣化
+/// （`after_hits20 >= baseline_hits20`）を保った上で候補プール上限に対する相対
+/// 改善比率（[`RerankRecallResult::improvement_ratio`]）が
+/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 以上（改善余地が構造的にほぼ 0 の場合は
+/// 非劣化のみで判定。Issue #330・SEARCH-7 改訂・vector-db-spec#7）であることを
 /// 確認する閾値ゲート。契約は `hybrid_recall.rs::hybrid_recall_large_scale_
 /// threshold_gate` と同一（2 つの下限を独立に解決し、片方のみ設定済みの場合は
 /// 設定済みの側だけを判定する。両方未設定かつ非 strict の場合のみコーパス生成前に
@@ -801,7 +998,12 @@ fn rerank_recall_large_scale_threshold_gate() {
     );
     let r = measure_rerank_recall(&docs, &qa);
     let after_recall20 = r.after_recall20();
-    let improvement = r.after_recall20() - r.baseline_recall20();
+    // Issue #330（SEARCH-7 改訂・vector-db-spec#7）: 改善幅ゲートは
+    // (1) 非劣化（after_hits20 >= baseline_hits20。層 A の固定値検証と同じ条件）と
+    // (2) 候補プール上限に対する相対比率（[`RerankRecallResult::improvement_ratio`]）
+    // の 2 条件からなる。改善余地（分母）が構造的にほぼ 0（`improvement_ratio` が
+    // `None`）の場合は (2) を自動充足とし (1) のみで判定する。
+    let improvement_ratio = r.improvement_ratio();
 
     let mut pass = true;
     match min_r20_abs {
@@ -827,18 +1029,27 @@ fn rerank_recall_large_scale_threshold_gate() {
     }
     match min_r20_improvement {
         Some(min) => {
-            let pass_improvement = improvement >= min;
+            let pass_improvement = improvement_gate_passes(&r, min);
             pass &= pass_improvement;
-            println!(
-                "{}",
-                render_gate_line(
-                    "rerank_recall_large_scale_threshold_gate",
-                    "improvement@20",
-                    improvement,
-                    pass_improvement,
-                    verbose
-                )
-            );
+            match improvement_ratio {
+                Some(ratio) => {
+                    println!(
+                        "{}",
+                        render_gate_line(
+                            "rerank_recall_large_scale_threshold_gate",
+                            "improvement_ratio@20",
+                            ratio,
+                            pass_improvement,
+                            verbose
+                        )
+                    );
+                }
+                None => {
+                    println!(
+                        "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 headroom negligible; sub-check (2) auto-pass, judged by non-degradation only (pass={pass_improvement})"
+                    );
+                }
+            }
         }
         None => {
             println!(
