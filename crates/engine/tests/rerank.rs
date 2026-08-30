@@ -133,9 +133,10 @@ fn lexical_reranker_resurfaces_matching_document_over_identity_baseline() {
         "identity reranker must preserve fused-score order"
     );
 
-    // 等重み既定（[`LexicalOverlapReranker::default`]）では融合順位 1 位（id=1）の
-    // 優位が字句一致信号と拮抗しうるため、字句一致信号を優勢にする重み構成
-    // （`lexical_weight` を大きく取る）で再浮上を検証する。
+    // 既定重み（[`LexicalOverlapReranker::default`]。Issue #310 対応で fused 優位
+    // 3.0:1.0 へ変更済み）でも融合順位 1 位（id=1）の優位が字句一致信号と
+    // 拮抗しうるため、字句一致信号を優勢にする重み構成（`lexical_weight` を
+    // 大きく取る）で再浮上を検証する。
     let reranker = LexicalOverlapReranker::new(60.0, 1.0, 5.0).expect("valid weights");
     let reranked = rerank_candidates(&reranker, "vector search kernel", &candidates, &cfg)
         .expect("lexical ok");

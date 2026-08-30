@@ -65,6 +65,9 @@ fn default_rrf_config_matches_publicly_documented_defaults() {
     assert_eq!(cfg.sparse_weight(), 1.0);
     assert_eq!(cfg.pool_depth(), 200);
     assert_eq!(cfg.k_const(), 60.0);
+    // Issue #310: 同点順位規約の既定は `TieRank::GroupEnd`（id 依存バイアス除去のため
+    // `Positional` から切り替え）。
+    assert_eq!(cfg.tie_rank(), engine::hybrid::TieRank::GroupEnd);
 }
 
 // --- SEARCH-1〜3: 追加設定なしの SQL 表層でハイブリッド検索が既定構成で動くこと -----

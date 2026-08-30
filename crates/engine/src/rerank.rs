@@ -441,6 +441,14 @@ pub fn rerank_candidates(
 /// ベースラインの参照実装: 候補の入力順序（融合スコア降順）をそのまま保持して
 /// `final_k` 件へ切り詰めるだけの恒等リランカー。TASK-108（Issue #39）における
 /// 「リランキングなし構成」との前後比較の基準実装を兼ねる。
+///
+/// Issue #320 codex-review P1 指摘は [`LexicalOverlapReranker`] の隣接グループ化
+/// （fused_score 降順を前提にした走査）に対するものであり、この
+/// `IdentityReranker` は候補配列を位置順にそのまま透過するだけで、そのような
+/// 隣接前提のグループ化ロジックを持たない。そのため未検証の入力に対して
+/// [`RerankError::UnsortedInput`] 等を能動的に検出する意味のある不変条件は
+/// 無く、本対応のスコープ外とする（`rerank_candidates` 経由の呼び出しでは
+/// 引き続き入口検証で保護される）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IdentityReranker;
 
@@ -472,6 +480,11 @@ impl Reranker for IdentityReranker {
 /// `hybrid.rs` が RRF で採った設計判断（元スコアではなく順位ベースで統合する）を
 /// 踏襲する。字句トークン化は [`crate::sparse::tokenize`]（TASK-102 実装済みの簡易
 /// トークナイザ）を再利用する。
+///
+/// 既定重み（[`LexicalOverlapReranker::default`]）は `fused_weight:lexical_weight
+/// = 3.0:1.0`（fused 優位。Issue #310 対応で変更）。大規模段実測（`crates/engine/
+/// tests/rerank_recall.rs`）で `after_hits20`（388）≥ `baseline_hits20`（387）の
+/// 非劣化を満たす。詳細は `docs/design/rerank-recall-regression.md` 参照。
 #[derive(Debug, Clone, Copy)]
 pub struct LexicalOverlapReranker {
     /// RRF 型融合のランク減衰定数（`hybrid::RrfConfig::k_const` と同じ役割）。
@@ -484,9 +497,11 @@ pub struct LexicalOverlapReranker {
 
 impl Default for LexicalOverlapReranker {
     fn default() -> Self {
+        // 既定重み 3.0:1.0（fused 優位）の採用根拠は本 struct のドキュメンテー
+        // ションコメント（Issue #310）を参照。
         Self {
             k_const: 60.0,
-            fused_weight: 1.0,
+            fused_weight: 3.0,
             lexical_weight: 1.0,
         }
     }
@@ -542,9 +557,59 @@ impl Reranker for LexicalOverlapReranker {
         // 候補件数に対して線形かつ [`MAX_POOL_DEPTH`] で有界なため許容する）。
         validate_text_lengths(query_text, candidates)?;
 
+        // 直後の `rank_fused_by_idx` グループ化（Issue #320 codex-review P1 指摘対応）は
+        // 「`candidates` が融合スコア降順・同点 id 昇順で隣接グループを成す」ことを
+        // 前提に走査する。この前提は本来 `rerank_candidates` の入口検証
+        // （[`is_sorted_desc_id_asc`]・[`has_duplicate_id`]・有限性検証）で保証される
+        // が、[`Reranker`] は公開 trait のため `rerank_candidates` を経由しないこの
+        // `rerank()` の直接呼び出しも型上ありうる。同点集合が非連続に渡された場合に
+        // 隣接走査だけでは検出できず、同一同点集合へ異なる順位を割り当てて
+        // `hybrid.rs::TieRank::GroupEnd` の順位契約を静かに破りうるため、
+        // グループ化より前にこの実装自身でも `rerank_candidates` と同じ検証
+        // （有限性→順序→重複の順。理由は [`rerank_candidates`] のドキュメント参照）を
+        // 行い、迂回できない構造にする（`validate_text_lengths` と同じ設計判断）。
+        if candidates.iter().any(|c| !c.fused_score.is_finite()) {
+            return Err(RerankError::NonFiniteScore);
+        }
+        if !is_sorted_desc_id_asc(candidates.iter().map(|c| (c.fused_score, c.id))) {
+            return Err(RerankError::UnsortedInput);
+        }
+        if has_duplicate_id(candidates.iter().map(|c| c.id)) {
+            return Err(RerankError::DuplicateId);
+        }
+
         // クエリ側トークンは候補ごとの重なり計算で使い回すため一度だけ計算する。
         let query_tokens: std::collections::BTreeSet<String> =
             tokenize(query_text).into_iter().collect();
+
+        // `rank_fused`（1-based）は候補配列の位置ではなく、`hybrid.rs::TieRank::
+        // GroupEnd`（既定の同点順位規約）と同じグループ末尾順位で求める
+        // （Issue #320 codex-review P1 指摘対応）。`candidates` は `fused_score` の
+        // 同点集合を持ちうる（`hybrid.rs` の融合結果由来のため）。この隣接走査での
+        // グループ化が安全なのは、直前の `is_sorted_desc_id_asc` 検証〔`rerank_candidates`
+        // 経由・この `rerank()` への直接呼び出しのいずれでも本関数自身が検証済み〕が
+        // 「fused_score 降順」を保証しており、降順制約下では等スコアの要素同士は
+        // 必ず隣接する（間に異なるスコアを挟むと降順が破綻する）という不変条件が
+        // 成り立つため。位置順位（`idx + 1`）のまま扱うと同点グループ内で融合側と異なる順位規約に
+        // なり、`hybrid.rs` 側の GroupEnd 化（Issue #310）の効果がこの層で部分的に
+        // 相殺される。グループ内の全メンバーへグループ末尾の 1-based 位置を割り当てる
+        // （`hybrid.rs::accumulate_ranked` の `TieRank::GroupEnd` 分岐と同じ走査）。
+        let mut rank_fused_by_idx = vec![0usize; candidates.len()];
+        let mut group_idx = 0usize;
+        while group_idx < candidates.len() {
+            let group_score = candidates[group_idx].fused_score;
+            let mut group_end = group_idx + 1;
+            while group_end < candidates.len()
+                && candidates[group_end].fused_score.total_cmp(&group_score)
+                    == std::cmp::Ordering::Equal
+            {
+                group_end += 1;
+            }
+            for slot in rank_fused_by_idx.iter_mut().take(group_end).skip(group_idx) {
+                *slot = group_end;
+            }
+            group_idx = group_end;
+        }
 
         // (id, 融合スコア順位 rank_fused, 字句重なり件数) を候補順（＝融合スコア
         // 降順。`rerank_candidates` が事前検証済み）に集める。
@@ -555,7 +620,7 @@ impl Reranker for LexicalOverlapReranker {
             .iter()
             .enumerate()
             .map(|(idx, c)| {
-                let rank_fused = idx.saturating_add(1);
+                let rank_fused = rank_fused_by_idx[idx];
                 let doc_tokens: std::collections::BTreeSet<String> =
                     tokenize(c.text).into_iter().collect();
                 let overlap = query_tokens.intersection(&doc_tokens).count();
@@ -668,10 +733,11 @@ mod tests {
     #[test]
     fn lexical_overlap_reranker_surfaces_matching_document_to_top() {
         // 融合スコアでは 1 位の候補（id=1）を、クエリと字句一致する文書（id=2）が
-        // 最終的に上回ることを確認する（SEARCH-7: 再順位付けの動作）。等重み既定
-        // （[`LexicalOverlapReranker::default`]）では融合順位 1 位の優位が大きく
-        // 拮抗しうるため、字句一致信号を優勢にする重み構成（`lexical_weight` を
-        // 大きく取る）で検証する。
+        // 最終的に上回ることを確認する（SEARCH-7: 再順位付けの動作）。既定重み
+        // （[`LexicalOverlapReranker::default`]。Issue #310 対応で fused 優位
+        // 3.0:1.0 へ変更済み）でも融合順位 1 位の優位が大きく拮抗しうるため、
+        // 字句一致信号を優勢にする重み構成（`lexical_weight` を大きく取る）で
+        // 検証する。
         let cfg = RerankConfig::new(10, 3).unwrap();
         let candidates = [
             cand(1, 3.0, "unrelated content about nothing"),
@@ -702,8 +768,11 @@ mod tests {
 
     #[test]
     fn lexical_overlap_reranker_tie_breaks_by_id_ascending() {
-        // 真の同点スコアを作るため、rank_fused と rank_lexical が入れ替わる構成にする
-        // （既定の等重み: fused_weight = lexical_weight = 1.0）。
+        // 真の同点スコアを作るため、rank_fused と rank_lexical が入れ替わる構成にする。
+        // 既定（[`LexicalOverlapReranker::default`]。Issue #310 対応で fused 優位
+        // 3.0:1.0）ではこの入れ替えだけで真の同点は作れないため、本テストの関心
+        // （タイブレーク分岐そのもの）に絞って等重み（fused_weight = lexical_weight
+        // = 1.0）を明示的に構築する。
         // id=5: rank_fused=1（融合スコア降順で先頭）・rank_lexical=2（字句重なり少）
         // id=6: rank_fused=2                       ・rank_lexical=1（字句重なり多）
         // スコア = weight/(k+rank_fused) + weight/(k+rank_lexical) は rank の組が
@@ -712,7 +781,7 @@ mod tests {
         // `.then(a.id.cmp(&b.id))`）を実際に通過する。
         let cfg = RerankConfig::new(10, 2).unwrap();
         let candidates = [cand(5, 3.0, "alpha"), cand(6, 2.0, "alpha bravo")];
-        let reranker = LexicalOverlapReranker::default();
+        let reranker = LexicalOverlapReranker::new(60.0, 1.0, 1.0).unwrap();
         let hits = rerank_candidates(&reranker, "alpha bravo", &candidates, &cfg).expect("ok");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].score, hits[1].score, "must be a true score tie");
@@ -892,6 +961,52 @@ mod tests {
                 max: MAX_POOL_DEPTH,
             }
         );
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_non_finite_score() {
+        // Issue #320 codex-review P1 指摘対応: rerank_candidates を経由しない直接
+        // 呼び出しでも、隣接グループ化（rank_fused_by_idx）の前に有限性を検証し
+        // 拒否することを確認する。
+        let reranker = LexicalOverlapReranker::default();
+        let candidates = [cand(1, f64::NAN, "a")];
+        let err = reranker.rerank("q", &candidates, 1).unwrap_err();
+        assert_eq!(err, RerankError::NonFiniteScore);
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_descending_order_violation() {
+        // 同上（降順違反）。融合スコアが昇順（本来は降順であるべき契約に違反）。
+        let reranker = LexicalOverlapReranker::default();
+        let candidates = [cand(1, 1.0, "a"), cand(2, 2.0, "b")];
+        let err = reranker.rerank("q", &candidates, 2).unwrap_err();
+        assert_eq!(err, RerankError::UnsortedInput);
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_tie_group_violating_id_ascending() {
+        // Issue #320 codex-review P1 指摘の核心ケース: 直後の `rank_fused_by_idx`
+        // グループ化は「fused_score 降順であれば同点集合は必ず連続する」という
+        // 不変条件（降順制約下では等スコアの要素は隣接せざるを得ない）に依拠して
+        // 隣接走査のみでグループを求める。この不変条件が成立するのは降順性が
+        // 保証されている場合に限るため、降順性は保ちつつ同点グループ内部の
+        // id 昇順（`is_sorted_desc_id_asc` の `score_order == Equal && id < prev_id`
+        // 分岐）にだけ違反する入力（id=2 の直後に同点 id=1 が来る）で、この
+        // 実装自身が UnsortedInput を返すことを確認する（隣接グループ化に
+        // 静かに委ねない）。
+        let reranker = LexicalOverlapReranker::default();
+        let candidates = [cand(2, 2.0, "a"), cand(1, 2.0, "b"), cand(3, 1.0, "c")];
+        let err = reranker.rerank("q", &candidates, 3).unwrap_err();
+        assert_eq!(err, RerankError::UnsortedInput);
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_direct_call_rejects_duplicate_id() {
+        // 同上（重複 id）。
+        let reranker = LexicalOverlapReranker::default();
+        let candidates = [cand(1, 2.0, "a"), cand(1, 1.0, "b")];
+        let err = reranker.rerank("q", &candidates, 2).unwrap_err();
+        assert_eq!(err, RerankError::DuplicateId);
     }
 
     #[test]

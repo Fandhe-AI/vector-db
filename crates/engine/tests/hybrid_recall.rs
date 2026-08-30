@@ -903,19 +903,34 @@ fn hybrid_recall_small_scale_regression() {
 
     // 疎（テキスト）・密（ベクトル）の各チャネルは正解トピック集合の非完全な観測
     // （[`generate_corpus`] のドロップアウト／デコイ）であるため、Recall@20 は 1.0
-    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`hits20`/`ceil20`/
-    // `total_correct` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの
-    // 変更で数値が変化した場合はこのテストが失敗する）。
+    // （理論上限 `ceil20` への 100% 到達）に張り付かない。`total_correct`/`ceil20`/
+    // `hits20` を固定値で回帰トラッキングする（検索カーネルやフィクスチャの変更で
+    // 数値が変化した場合はこのテストが失敗する。数値基準・実測値の public 記載は
+    // オーナー判断で許可済み・`.claude/rules/spec-confidentiality.md` 参照）。
+    // Issue #310（RRF 融合の同点順位規約 `TieRank::GroupEnd`・密プール境界の同点
+    // グループ完全化）適用前の `hits20` は 171（`docs/design/
+    // hybrid-recall-regression.md`「Issue #310: engine 側改善」節参照）。
+    // Issue #320 大規模段追加調査で導入した非正スコア候補の順位付け除外
+    // （`hybrid.rs::trim_non_positive_score_tail`）は、取得列が exhaustive
+    // （可視集合全体を覆い切っている）場合には適用しない契約へ改めた
+    // （`hybrid.rs::resolve_boundary_tie_group` 参照。`sql_precision_mode` の
+    // 密・疎順位不一致 → RRF 同点 → 空集合契約〔SEARCH-9〕がスコア 0 の候補にも
+    // 依存するため）。この小規模コーパスでは取得列が exhaustive になるケースが
+    // 多く、非正スコア候補が除外対象から外れた結果 `hits20` は 180 から 182 へ
+    // 戻った。さらに Issue #320 codex-review P1 指摘対応で、非 exhaustive 時の
+    // 除外自体を疎（BM25）チャネル限定へ改めた（密の 0・負値は有効な相対順位
+    // であり無シグナルではないため）。この変更では本フィクスチャの `hits20` は
+    // 変化しない。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 171, "小規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰
-    // トラッキングする（数値そのものは記録しない。`docs/design/
-    // hybrid-recall-regression.md` 参照）。両チャネルとも 0 件ヒットでは
-    // 「下回らない」が自明に成立してしまう（vacuous pass）ため、正解を
-    // 一部でも拾えていることも合わせて確認する。
+    // トラッキングする。加えて両チャネルの hit 数自体も固定値で記録する
+    // （`docs/design/hybrid-recall-regression.md` 参照）。両チャネルとも 0 件
+    // ヒットでは「下回らない」が自明に成立してしまう（vacuous pass）ため、
+    // 正解を一部でも拾えていることも合わせて確認する。
     let (dense_hits20, sparse_hits20) = measure_channel_recall20(&docs, &qa);
     if verbose {
         println!(
@@ -923,6 +938,8 @@ fn hybrid_recall_small_scale_regression() {
             r.ceil20, r.ceil20, r.hits20, r.ceil20
         );
     }
+    assert_eq!(dense_hits20, 151, "密単体の Recall@20 hit 数が変化した");
+    assert_eq!(sparse_hits20, 166, "疎単体の Recall@20 hit 数が変化した");
     assert!(
         dense_hits20 > 0 && sparse_hits20 > 0,
         "密単体・疎単体のいずれかが Recall@20 で正解を 1 件も拾えていない（比較が vacuous pass になる）"
@@ -987,12 +1004,16 @@ fn hybrid_recall_large_scale_regression() {
 
     // `hybrid_recall_small_scale_regression` と同じ理由（[`generate_corpus`] の
     // lossy view）で Recall@20/Recall@100 は 1.0 に張り付かない。`hits`/`ceil`/
-    // `total_correct` を固定値で回帰トラッキングする。
+    // `total_correct` を固定値で回帰トラッキングする（数値基準・実測値の public
+    // 記載はオーナー判断で許可済み・`.claude/rules/spec-confidentiality.md`
+    // 参照）。Issue #310 適用前の `hits20`/`hits100` はそれぞれ 328/645
+    // （`docs/design/hybrid-recall-regression.md`「Issue #310: engine 側改善」
+    // 節参照）。
     assert_eq!(r.total_correct, 997, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 421, "Recall@20 の理論上限が変化した");
     assert_eq!(r.ceil100, 707, "Recall@100 の理論上限が変化した");
-    assert_eq!(r.hits20, 328, "大規模段の Recall@20 hit 数が変化した");
-    assert_eq!(r.hits100, 645, "大規模段の Recall@100 hit 数が変化した");
+    assert_eq!(r.hits20, 385, "大規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits100, 648, "大規模段の Recall@100 hit 数が変化した");
 
     // Issue #306: 大規模段層 B（[`hybrid_recall_large_scale_threshold_gate`]）が
     // 使う展開あり経路（[`QuerySource::Expanded`]・[`MockLlmClient`]）のパススルー
@@ -1018,6 +1039,132 @@ fn hybrid_recall_large_scale_regression() {
     assert_eq!(
         r_exp.ceil100, r.ceil100,
         "展開あり経路（MockLlmClient）の Recall@100 理論上限が展開なしと一致しなかった"
+    );
+}
+
+/// [`ParallelSearchProvider`]（production 実装）へ委譲しつつ、境界同点グループ
+/// 完全化（`hybrid.rs` 内部実装）の再取得ループが要求する `SearchInput::k`
+/// （＝密側 `fetch_k`）の最大値をクエリ単位で観測する診断用ラッパ（Issue #320
+/// 大規模段追加調査）。`hybrid_search` は `SearchProvider` を `&dyn` で受け取る
+/// ため、密側の再取得進行はこのラッパ経由でのみテストから観測できる
+/// （`hybrid.rs::MAX_FETCH_K` は `pub(crate)` のため本クレート外の統合テストからは
+/// 参照できない。可視集合サイズ [`LARGE_NUM_DOCS`] への到達有無で代用する:
+/// 本フィクスチャでは `MAX_FETCH_K`〔`MAX_POOL_DEPTH * 4` = 40,000〕が可視集合
+/// サイズ〔20,000〕を上回るため、再取得ループの実質的な上限は可視集合サイズで
+/// 頭打ちになる）。挙動そのものは変えない（`search` は無条件に `inner` へ委譲）。
+struct MaxKTrackingProvider {
+    inner: ParallelSearchProvider,
+    max_k_seen: std::sync::atomic::AtomicUsize,
+}
+
+impl MaxKTrackingProvider {
+    fn new() -> Self {
+        Self {
+            inner: ParallelSearchProvider,
+            max_k_seen: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.max_k_seen
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn max_k_seen(&self) -> usize {
+        self.max_k_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl SearchProvider for MaxKTrackingProvider {
+    fn search(
+        &self,
+        input: SearchInput<'_>,
+    ) -> Result<Vec<engine::kernel::CandidateHit>, engine::kernel::KernelError> {
+        self.max_k_seen
+            .fetch_max(input.k, std::sync::atomic::Ordering::Relaxed);
+        self.inner.search(input)
+    }
+}
+
+/// TASK-104（SEARCH-2）Issue #320 codex-review P1 指摘対応の直接固定:
+/// 非正スコア（無シグナル）候補の境界同点グループ完全化からの除外
+/// （`hybrid.rs::trim_non_positive_score_tail`）は疎（BM25）チャネル限定へ
+/// 改めたため、密側の再取得ループが可視集合全体（[`LARGE_NUM_DOCS`] =
+/// 20,000 件）まで到達するクエリが 0 件でなくなること自体は許容する
+/// （密の 0・負値も有効な相対順位であり、除外すると recall が落ちるため。
+/// `resolve_boundary_tie_group` ドキュメント参照）。本テストは代わりに
+/// 密側の再取得ループが常に可視集合サイズ（このフィクスチャでは
+/// `MAX_FETCH_K` > `LARGE_NUM_DOCS` のため実質的な上限＝
+/// `dense_cap = MAX_FETCH_K.min(visible_ids.len())`）を超えて要求しない
+/// （＝再取得ループが無限に伸び続けない）ことを固定する。
+#[test]
+fn hybrid_recall_large_scale_dense_refetch_is_bounded_by_visible_set_size() {
+    let verbose = verbose_requested_from_env();
+    let (docs, qa) = generate_corpus(
+        LARGE_SEED,
+        LARGE_NUM_DOCS,
+        LARGE_NUM_QUERIES,
+        LARGE_VOCAB_SIZE,
+    );
+    assert_corpus_within_limits(&docs);
+
+    let fixture = SearchFixture::build(&docs);
+    let provider = MaxKTrackingProvider::new();
+    let cfg = RrfConfig::default();
+    let dim = fixture.dim as u32;
+
+    let mut reached_visible_set = 0usize;
+    let mut max_k_across_queries = 0usize;
+    for case in &qa {
+        provider.reset();
+        let input = SearchInput {
+            ids: &fixture.ids,
+            vectors: &fixture.vectors,
+            dim,
+            query: &case.query_vector,
+            k: 20,
+        };
+        let _ = hybrid_search(
+            &provider,
+            input,
+            &fixture.sparse_index,
+            &case.query_text,
+            20,
+            &cfg,
+        )
+        .expect("hybrid search ok");
+        let max_k = provider.max_k_seen();
+        max_k_across_queries = max_k_across_queries.max(max_k);
+        if max_k >= LARGE_NUM_DOCS {
+            reached_visible_set += 1;
+        }
+    }
+
+    if verbose {
+        println!(
+            "=== Issue #320 大規模段 密側再取得診断（docs={} queries={}） ===",
+            docs.len(),
+            qa.len()
+        );
+        println!(
+            "dense fetch_k max across queries={max_k_across_queries}  \
+             queries reaching visible set size ({LARGE_NUM_DOCS})={reached_visible_set}"
+        );
+    }
+
+    assert!(
+        max_k_across_queries <= LARGE_NUM_DOCS,
+        "密側の再取得ループが可視集合サイズ（実質的な上限 dense_cap）を超えて \
+         fetch_k を要求した（`dense_cap = MAX_FETCH_K.min(input.ids.len())` の \
+         算出自体が壊れていない限り本来到達しない構造的な保証の固定）"
+    );
+    // 決定的コーパス・QA セットに対する実測値を固定値で回帰トラッキングする
+    // （本ハーネスの他アサーションと同じ方針。codex-review P1 指摘対応前は
+    // 密チャネルの非正スコア除外により 0 件、Issue #310 時点（境界完全化導入
+    // 前）は 53 件だった）。
+    assert_eq!(
+        reached_visible_set, 40,
+        "密チャネルの再取得ループが可視集合全体まで到達したクエリ数が変化した"
     );
 }
 

@@ -238,8 +238,11 @@ Recall@20（小規模段）・Recall@20/Recall@100（大規模段）は、正解
 - 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
 - 前提: 親 Issue #301。大規模段（SEARCH-2・クエリ展開結線）は別 Issue（#306）の管轄
 
-**層 A・層 B とも実測値・閾値・pass/fail は本ドキュメントにも public テストにも
-記録しない（`.claude/rules/spec-confidentiality.md`）**。密単体・疎単体・融合後の
+**層 B（spec 閾値ゲート）の実測値・閾値・pass/fail は引き続き本ドキュメントにも
+public テストにも記録しない（`.claude/rules/spec-confidentiality.md`）**。層 A
+（回帰トラッキング）の実測値は 2026-08-29 のオーナー判断（数値基準・実測値の
+public 記載許可。`.claude/rules/spec-confidentiality.md`）以降、下記「Issue #310」
+節・「実測結果」節に固定値として記録する。密単体・疎単体・融合後の
 Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall.rs::measure_channel_recall20`
 を使い、融合が両チャネル単体のいずれも下回らない（＝ SEARCH-3 相当の非劣化）
 ことを実測値どうしの関係アサーションとしてのみ回帰トラッキングする。
@@ -253,6 +256,144 @@ Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall
 受け入れ条件・判断事項は spec のビヘイビア定義（SEARCH-1・SEARCH-3。
 `docs/spec/04-behavior/search.md`）を参照。
 
+## Issue #310: engine 側改善（同点順位規約・境界同点グループ）
+
+- 対応: TASK-84・TASK-103（`docs/spec/05-tasks.md`）
+- 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
+- 前提: 親 Issue #301。先行: #306（大規模段へのクエリ展開結線）・#307（小規模段の
+  engine 側原因調査。上記節）
+
+Issue #307 の調査（同節参照）で「原因調査対象」として残していた RRF 融合の同点
+順位規約を確定した。`hybrid.rs::RrfConfig` に同点順位規約 `TieRank`
+（`GroupEnd`（既定。同点グループ全員へグループ末尾の順位を割り当てる
+modified competition ranking）・`Positional`（従来挙動。撤回用に残置）の
+2 バリアント）を追加し、`accumulate_ranked` の同点処理を `Positional` から
+`GroupEnd` へ切り替えた。あわせて `hybrid_search_boosted` の密・疎プール取得を
+`fetch_k`（初期値は `pool_depth` の 2 倍）で行い、`pool_depth` 境界が同点グループの
+途中を切る場合はグループ全体を含める。境界の終端が取得済み範囲内で確定できない
+場合は、`fetch_k` を倍増して再取得し（`MAX_FETCH_K`・可視集合の大きさで有界化）、
+終端確定を試みる（Issue #320 codex-review P1 指摘対応）。再取得の上限に達しても
+なお終端確定できない場合は、境界の同点グループ全体（開始位置から観測末尾まで）を
+丸ごと除外し、そのグループより上位（スコアが厳密に高い候補）だけをそのチャネルの
+最終結果として確定する（`exclude_undetermined_boundary_group`。位置ベースで
+`pool_depth` 件へ部分採用する・観測できた分をそのまま保持するのいずれも、拡張
+取得列が常に同点 id 昇順であることに起因して最小 id 側だけが根拠なく生き残る
+id 依存バイアスが残るため採らない）。除外は密・疎いずれのチャネルにも
+対称に適用し、そのチャネルの結果が空になった場合でも `hybrid_search_boosted` は
+もう一方のチャネルで融合を継続する（両方空なら空結果を返す。エラーにしない）。
+`complete_boundary_tie_group` を追加した。
+
+**採用した同点順位規約**: RRF 融合の同点順位処理を、位置順位（従来挙動）から
+グループ末尾順位（`TieRank::GroupEnd`・modified competition ranking）へ変更
+（SEARCH-1・SEARCH-3。`crates/engine/src/hybrid.rs::accumulate_ranked` の
+`TieRank` 分岐。詳細は `docs/spec/04-behavior/search.md` 参照）。同時に密プール
+境界の同点グループ完全化（`complete_boundary_tie_group`・`complete_boundary_
+tie_group_by`）を追加し、`pool_depth` 境界が同点グループの途中を切る場合に
+グループ全体を含める（終端が確定できない場合は `fetch_k` を倍増して再取得し、
+再取得の上限に達してもなお確定できない場合は境界の同点グループ全体を除外する。
+位置ベースの部分採用・観測できた範囲の全保持のいずれも id 依存バイアスが残る
+ため採らない）。疎チャネル（BM25 スコア）についても、同一語頻度・
+同一文書長で同点が発生しうるため同じ完全化ロジックを適用（`crates/engine/src/
+hybrid.rs`）。
+`rerank.rs::LexicalOverlapReranker::rank_fused` の `TieRank` 規約統一実装済み
+（`rank_fused` を位置順位から `GroupEnd` へ揃えた。実装の詳細は
+`docs/design/rerank-recall-regression.md`「実測結果」節参照）。
+
+**フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
+`VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも
+変更していない（Issue #310 の受け入れ条件 2）。`ceil20`／`ceil100`／
+`total_correct`（正解集合の理論上限・総数）が変更前後で一致することは、この
+非変更の実測による裏付けでもある（下記「実測結果」節）。層 B（spec 閾値ゲート）
+の pass/fail・閾値・導出係数は引き続き本ドキュメントにも public テストにも
+記録しない（受け入れ条件 3・`.claude/rules/spec-confidentiality.md`）。
+
+## Issue #320 大規模段追加調査: 非正スコア候補の順位付け除外
+
+- 対応: TASK-84・TASK-103（`docs/spec/05-tasks.md`）
+- 対象ビヘイビア: SEARCH-1・SEARCH-3（`docs/spec/04-behavior/search.md`）
+- 前提: 上記「Issue #310: engine 側改善」節（境界同点グループ完全化の再取得ループ）
+
+Issue #310 の再取得ループ（`fetch_k` 倍増による境界同点グループの終端確定）を
+大規模段コーパス（100 クエリ・可視集合 20,000 件）で実測したところ、100 クエリ中
+53 件で密チャネルの再取得が可視集合全体（20,000 件）まで到達していた。原因は
+「クエリと一致しない文書（疎はスコア 0。密は 0 に限らずスコアが低い文書一般）」
+の長い同点尾が境界同点グループとして扱われ、完全化ループがその尾を可視集合の
+末端まで追い続けてしまうことにあった。
+
+**採用した契約**: 非正スコア（`score <= 0.0`）の候補の扱いを、拡張取得列が
+exhaustive（可視集合全体を覆い切っている）かどうかで分岐する
+（`hybrid.rs::resolve_boundary_tie_group`。`precision` モード（SEARCH-9）の
+密・疎順位不一致 → RRF 同点 → 空集合契約は exhaustive なケースでスコア 0 の
+候補にも依存するため、exhaustive 時は除外しない）。
+
+非 exhaustive 時の除外は**疎（BM25）チャネル限定**（`zero_is_no_signal` 引数）で
+適用する。密（`CandidateHit::score`。内積・コサイン類似度）は 0・負値も有効な
+相対順位を持ち「クエリと無関係」を意味しないため、密チャネルには非 exhaustive
+時の除外を適用しない（Issue #320 codex-review P1 指摘対応。密の上位 `pool_depth`
+件が全て非正スコアになるクエリ・埋め込み分布は珍しくなく、除外すると密チャネル
+の候補が丸ごと消え recall が落ちるため）。BM25 は語一致が一切ない文書のスコアが
+定義上 0 になるため、疎チャネルに限っては非正スコア＝無シグナルが保証される。
+
+- **exhaustive**（密・疎共通）: 取得済み範囲がそのまま可視集合全体であることが
+  確定しているため、非正スコアも含め全件をそのまま境界同点グループ完全化へ渡す
+  （除外しない）。
+- **非 exhaustive・疎チャネルのみ**: 境界位置（0-based で `pool_depth - 1`）の
+  スコアが非正なら、そのグループは「クエリとのシグナルが一切ない」無シグナル群
+  であり全メンバーが等価（ID に依存しない）とみなし、再取得ループへ進めずその場
+  で非正スコアの末尾を丸ごと除外して確定する（拡張取得列は呼び出し元契約により
+  スコア降順のため、非正スコアの範囲は必ず末尾の連続区間になる）。境界位置の
+  スコアが正なら非正の末尾を切らずに完全化ロジックへそのまま渡す（正の境界同点
+  グループは非正スコアと隣接しないため影響しない）。
+- **非 exhaustive・密チャネル**: `zero_is_no_signal = false` により上記の除外を
+  適用せず、常に完全化ロジック（通常の再取得ループ、上限到達時は
+  `exclude_undetermined_boundary_group` による対称除外）へそのまま渡す。
+
+切り詰めに先立つ契約検証（有限性・ソート順・重複 id。`validate_extended_pool`）は
+どの分岐でも切り詰め**前**の拡張取得列全体に対して行い、この検証範囲は変更して
+いない。
+
+この分岐により、非 exhaustive な再取得ループが「クエリと無関係」と保証できる
+無シグナル群（疎チャネルのスコア 0）の同点尾を可視集合全体まで追い続ける経路は
+疎チャネル限定で断ちつつ、exhaustive な小規模可視集合ではスコア 0 の候補も境界
+同点判定に正しく参加できるようにした。**密チャネルは非 exhaustive でもこの経路
+を断たない**（0・負値が有効な相対順位を持つため除外できない。Issue #320
+codex-review P1 指摘対応で密チャネル限定にこの除外を撤廃した結果、密チャネルの
+再取得が可視集合全体まで到達するクエリが再び生じうる。実測は下記「検証」節
+参照）。
+
+**検証**: `crates/engine/tests/hybrid_recall.rs::
+hybrid_recall_large_scale_dense_refetch_is_bounded_by_visible_set_size`が、
+`ParallelSearchProvider` をラップする診断用 `SearchProvider`
+（`MaxKTrackingProvider`）で密側再取得ループが要求する `fetch_k` の最大値を
+クエリ単位で観測する。密チャネルは非正スコアでも除外しない契約（上記 codex-review
+P1 指摘対応）のため、密側再取得ループが可視集合全体（20,000 件）まで到達する
+クエリ数（`reached_visible_set`）は決定的コーパスに対する実測値として固定値
+アサーション（`== 40`）で回帰トラッキングする（codex-review P1 指摘対応前は
+密チャネルの非正スコア除外により 0 件、Issue #310 時点〔境界完全化導入前〕は
+53 件だった）。加えて、再取得ループが常に `dense_cap`（このフィクスチャでは
+`MAX_FETCH_K` > 可視集合サイズのため実質的な上限＝可視集合サイズ）を超えて
+`fetch_k` を要求しない（＝無限に伸び続けない）ことも構造的な保証として固定する。
+密チャネルに `crates/engine/src/hybrid.rs::
+AllNegativeDenseProvider`（テスト専用）を使う単体テスト
+（`hybrid_search_boosted_keeps_dense_candidates_when_boundary_scores_are_non_positive`）
+で、上位 `pool_depth` 件が全て非正スコアでも密チャネルの候補が除外されず融合
+結果に現れることを直接固定する。
+
+**hits20 への影響**: 小規模段 182・大規模段 385/648（下記「実測結果」節）。
+密チャネルの非 exhaustive 時除外撤廃（codex-review P1 指摘対応）後もこれらの
+固定値は変化しなかった（本フィクスチャでは密チャネルの境界が非正スコアになる
+クエリが、除外の有無に関わらず融合結果へ影響しなかった）。
+
+**`crates/engine/tests/rerank_recall.rs` への影響なし**: 同ハーネスの大規模段
+固定値（baseline hits20=387・pool hits100=837・pool hits200=951）はこの変更
+適用前後で数値の変化がなかった（本フィクスチャでは非正スコア候補がリランキング
+測定対象クエリの結果へ影響しなかった）。当時（本調査の時点）は
+`after_hits20 >= baseline_hits20` の非劣化アサーションが after hits20=383 で
+red だったが、本調査（可視集合全体までの再取得到達の解消）とは独立の事象
+だった。この red は後日 Issue #310 対応（`LexicalOverlapReranker` の既定重み
+変更）で解消済み。詳細は `docs/design/rerank-recall-regression.md`「実測結果」
+節参照。
+
 ## 実測結果
 
 （`crates/engine/tests/hybrid_recall.rs`、層 A 2/2 pass。決定的コーパスのため
@@ -260,8 +401,33 @@ Recall@20 比較（受け入れ条件 1）は `crates/engine/tests/hybrid_recall
 
 | 段 | 文書数 | QA 件数 | total_correct | ceil20 | hits20 | ceil100 | hits100 | Recall@20 | Recall@100 |
 | -- | ------ | ------- | -------------- | ------ | ------ | ------- | ------- | --------- | ---------- |
-| 小規模 | 400 | 60 | 202 | 202 | 171 | - | - | 0.8465 | - |
-| 大規模 | 20,000 | 100 | 997 | 421 | 328 | 707 | 645 | 0.7791 | 0.9123 |
+| 小規模 | 400 | 60 | 202 | 202 | 182 | - | - | 0.9010 | - |
+| 大規模 | 20,000 | 100 | 997 | 421 | 385 | 707 | 648 | 0.9145 | 0.9165 |
+
+小規模段の密単体 Recall@20 は 151/202（0.7475）、疎単体は 166/202（0.8218）
+であり（`crates/engine/tests/hybrid_recall.rs::measure_channel_recall20`）、
+融合（182/202）はいずれの単体チャネルも下回らない。上表の小規模段 `hits20` は
+上記「Issue #320 大規模段追加調査: 非正スコア候補の順位付け除外」節の契約
+適用後の値。大規模段は 385/648。
+
+以前は測定タプル全体を `DefaultHasher`（固定キー）で畳み込んだダイジェスト
+1 個を固定値アサーションの対象にすることで数値非開示のまま退行検出しようと
+していたが、フィクスチャ生成コード自体が本ファイル内に公開されており各
+フィールドが少値域の整数に収まるため、ダイジェスト値からの総当たり復元が
+現実的で数値非開示の目的を達成できないと判明した（codex-review P0 指摘・
+PR #320）。2026-08-29 のオーナー判断（数値基準・実測値の public 記載許可）に
+より、この制約自体が解消したため、ダイジェスト方式・関係アサーションのみへの
+置換は撤回し、上記の固定値（実測値そのもの）による層 A 回帰トラッキングへ
+戻した。Issue #310（`GroupEnd`＋境界同点グループ完全化）の適用前、`hits20` は
+小規模段 171・大規模段 328、`hits100` は大規模段 645 であった（`ceil20`／
+`ceil100`／`total_correct` はいずれも上表と同一。フィクスチャ非変更のため不変）。
+両段とも `hits20`（大規模段は `hits100` も）の到達率が改善している。境界同点
+グループを終端確定できない場合の契約は上記「Issue #310: engine 側改善」節の
+とおり（再取得ループ、上限到達時は境界同点グループ全体を除外し厳密に上位の
+候補のみ保持）。この契約での実測値が上表（大規模段 `hits20=385`／`hits100=648`）であり、`ceil20`／`ceil100`／
+`total_correct` はいずれも不変のため測定前提自体は崩れていない。数値そのものの
+固定値ゲートに加え、spec 由来の絶対閾値に対する pass/fail 判定は既存どおり
+層 B（`environment: recall-gate` の secrets 経由）側で扱う。
 
 疎・密チャネルの lossy view（ドロップアウト・デコイ）により、いずれの段も
 Recall@k が 1.0 未満の現実的な値になっている。QA 件数はいずれも重複除外前の
