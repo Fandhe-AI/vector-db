@@ -110,12 +110,16 @@ f32 と同等〜劣後する結果が観測され、既定規模点の絶対値�
 | 本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend） | 実施済み（本 ADR） | pass（CORE-16 ゲート本体。方法 A の規模スイープでも f16 が一貫して優位または同等。ただし方法 B〔本コミットの逐次診断〕では既定規模を含む一部規模点で優劣が反転し不安定——上記「判断」参照） |
 | DGX Spark 等（NVIDIA・Vulkan／別ハードウェア） | 未実施 | 運用者追記欄: `_______________`（Actions 外の承認済み計測環境で `BENCH_CORE6=1 BENCH_CORE16=1 make bench-batch` を実行し pass/fail のみ追記） |
 
-## 使い方（規模スイープ診断）
+## 使い方（規模点診断）
 
 ```sh
-BENCH_CORE16_DIAG=1 BENCH_VERBOSE=1 make bench-batch
+BENCH_BATCH_MAX_DEGRADATION_PCT=<値> BENCH_CORE16_DIAG=1 \
+  BENCH_CORE16_DIAG_SCALE_INDEX=<0..5> BENCH_VERBOSE=1 make bench-batch
 ```
 
+- `BENCH_BATCH_MAX_DEGRADATION_PCT` は `batch_bench.rs::main` 冒頭で CORE-7
+  ゲート用に無条件で要求される（未設定は fail-closed で診断に到達する前に
+  終了する）。診断のみが目的の実行でも設定が必要。
 - `BENCH_CORE16_DIAG` 単独（`BENCH_VERBOSE` 未設定）では、`BENCH_VERBOSE` の
   設定を促す 1 行のみを出力し診断は実行しない。
 - `BENCH_CORE16_DIAG` 未設定時は診断コード自体が一切出力しない（既定挙動は
@@ -123,13 +127,18 @@ BENCH_CORE16_DIAG=1 BENCH_VERBOSE=1 make bench-batch
 - `GITHUB_ACTIONS` 下では既存の `verbose_requested_from_env` の fail-closed
   拒否（Issue #279）にそのまま乗るため、本診断専用の追加ガードは設けていない。
   `bench.yml` には `BENCH_CORE16_DIAG` を注入しない運用とする。
-- 診断は CORE-6/CORE-16 ゲート本体とは独立の合成データセットを規模点ごとに
-  構築するため、合否には数えない参考出力である。
-- **注意（本 ADR の「判断」節参照）**: 本診断は複数規模点を同一プロセス内で
-  逐次測定する（方法 B）。この方式は GPU バックエンドの繰り返し構築・破棄に
-  由来すると疑われる測定ノイズにより値・符号が不安定になることを本 ADR で
-  確認しており、「ある規模点で f16 が劣後して見えた」という診断の出力単体を
-  性能退行の証拠として扱わない。傾向を確認する目的の参考出力として使うこと。
+- 診断は CORE-6/CORE-16 ゲート本体とは独立の合成データセットを、選択した
+  1 規模点についてのみ構築するため、合否には数えない参考出力である。
+- **1 プロセス = 1 規模点（本 ADR の「判断」節参照。PR #326 codex-review
+  指摘対応）**: 本診断は当初、複数規模点を同一プロセス内で逐次測定していた
+  （方法 B）。この方式は GPU バックエンドの繰り返し構築・破棄に由来すると
+  疑われる測定ノイズにより値・符号が不安定になることを本 ADR で確認して
+  おり、方法 A（クリーンな単独計測）の結論を裏付ける証拠として使えない
+  ことが判明したため、`BENCH_CORE16_DIAG_SCALE_INDEX`（`CORE16_DIAG_SCALE_POINTS`
+  への添字。`0`〜`5`。未設定・範囲外は fail-closed）で 1 回の実行につき
+  1 規模点だけを測定する形へ変更した（方法 A と同型の測定形）。複数規模点間
+  の傾向を見たい場合は、`BENCH_CORE16_DIAG_SCALE_INDEX` を変えてプロセスを
+  分けて複数回実行すること（同一プロセス内での連続測定はしない）。
 
 ## 検討したが採らなかった案
 
@@ -144,12 +153,12 @@ BENCH_CORE16_DIAG=1 BENCH_VERBOSE=1 make bench-batch
 - **Apple 実機・DGX Spark での実測**: 本 ADR の「環境別 pass/fail 表」に運用者
   追記欄を残した。承認済み計測環境で `make bench-batch` を実行し結果を追記
   する運用者作業。
-- **規模スイープ診断を「1 規模点 = 1 プロセス」で実行できる形へ改める**
-  （「判断」節の H2-逐次測定ノイズ）: 現行の `run_core16_scaling_diagnostic`
-  は複数規模点を同一プロセス内で逐次測定するため、値・符号が比較不能な
-  ノイズを含む。規模点を環境変数で選択して 1 回の実行で 1 点だけ測る形、
-  または点ごとに GPU コンテキストを再構築した後にウォームアップ区間を
-  挟む等の是正が必要。
+- **規模点診断を「1 規模点 = 1 プロセス」で実行できる形へ改める**
+  （「判断」節の H2-逐次測定ノイズ）: PR #326（codex-review 指摘対応）で
+  対応済み。`run_core16_scaling_diagnostic` は `BENCH_CORE16_DIAG_SCALE_INDEX`
+  で選んだ 1 規模点のみを測定する形へ変更し、複数規模点を同一プロセス内で
+  逐次測定する経路は撤去した。規模点間の傾向確認は環境変数を変えてプロセス
+  を分けて複数回実行する運用とする（「使い方」節参照）。
 - **CORE-16 ゲート本体が「CORE-6 → CORE-7 → CORE-16」の順で後続に測定
   される構成そのものの妥当性検証**: Metal 環境の fail 報告
   （CORE-6・CORE-7 は pass、CORE-16 のみ fail）が本 ADR で確認した

@@ -95,14 +95,18 @@
 //!
 //!   いずれも既定では pass/fail・非数値状態のみを標準出力へ書き、実測値・注入した
 //!   閾値は出力しない（`BENCH_VERBOSE` opt-in 時のみ実測値を追加出力する）。
-//! - CORE-16 規模スイープ診断（Issue #313。[`run_core16_scaling_diagnostic`]）:
+//! - CORE-16 規模点診断（Issue #313。[`run_core16_scaling_diagnostic`]）:
 //!   Apple GPU（Metal）環境での CORE-16 fail 報告を受け、「測定設計（固定コスト
 //!   支配）」「Apple GPU/UMA 環境要因」「f16 シェーダの性能不足」のどれが支配的かを
 //!   切り分けるための opt-in 診断。`BENCH_CORE16_DIAG`（非空で有効）かつ
-//!   `BENCH_VERBOSE` の両方が設定されたときのみ、行数・次元を変えた複数の規模点で
-//!   CORE-16 と同じ A/B（f32 常駐 vs f16 常駐）を測定し実測値を出力する。CORE-6/16
-//!   ゲート本体とは独立に動作し合否には数えない。詳細・本開発環境（NVIDIA/Vulkan）
-//!   での実測に基づく判断は `docs/design/core16-f16-resident-gate.md` を参照。
+//!   `BENCH_VERBOSE` の両方が設定されたときのみ、`BENCH_CORE16_DIAG_SCALE_INDEX`
+//!   （必須。`0`〜`5`）が選ぶ 1 規模点で CORE-16 と同じ A/B（f32 常駐 vs f16 常駐）
+//!   を測定し実測値を出力する。複数規模点を同一プロセス内で連続測定すると比較不能
+//!   なノイズが乗ることを `docs/design/core16-f16-resident-gate.md` の ADR で確認
+//!   済みのため、1 プロセス = 1 規模点とし、規模点間の比較はプロセスを分けて複数回
+//!   実行することで行う。CORE-6/16 ゲート本体とは独立に動作し合否には数えない。
+//!   詳細・本開発環境（NVIDIA/Vulkan）での実測に基づく判断は
+//!   `docs/design/core16-f16-resident-gate.md` を参照。
 
 // `harness` の取り込み方針は `simd_bench.rs` と同一(本ファイルが実際に使う項目
 // のみで、未到達の `pub` 項目は `dead_code` 警告になりうるためモジュール全体を許容する)。
@@ -728,52 +732,98 @@ fn measure_core16_resident_p95(
     Ok((p95_a, p95_b))
 }
 
-/// CORE-16 の規模スイープ診断（Issue #313）。モジュール冒頭コメント参照。
+/// 規模スイープの候補点（行数, 次元）一覧。CORE-16 ゲート本体
+/// （`GPU_GATE_ROW_COUNT`/`GPU_GATE_DIM` 固定）より広い規模域を掃引し、短縮率が
+/// 測定規模に応じてどう変化するかを見る（Issue #313: 測定設計〔固定コスト支配〕/
+/// f16 シェーダの性能不足の切り分けが目的。本ベンチ固有の測定条件であり spec の
+/// 閾値ではない）。
+const CORE16_DIAG_SCALE_POINTS: [(usize, usize); 6] = [
+    (64, GPU_GATE_DIM),
+    (500, GPU_GATE_DIM),
+    (GPU_GATE_ROW_COUNT, 64),
+    (GPU_GATE_ROW_COUNT, GPU_GATE_DIM),
+    (GPU_GATE_ROW_COUNT, 1024),
+    (GPU_GATE_ROW_COUNT * 4, GPU_GATE_DIM),
+];
+
+/// `BENCH_CORE16_DIAG_SCALE_INDEX`（[`CORE16_DIAG_SCALE_POINTS`] への添字。
+/// `0`〜`5`）を読み取る。未設定・非数値・範囲外は fail-closed で `Err` を返す
+/// （PR #326 codex-review 指摘対応: `run_core16_scaling_diagnostic` が複数規模点を
+/// 同一プロセス内で逐次測定していたが、`docs/design/core16-f16-resident-gate.md`
+/// の ADR（方法 B の実測）が「GPU バックエンドの繰り返し構築・破棄に由来する
+/// 逐次測定ノイズにより値・符号が比較不能になる」ことを確認済みのため、1 プロセス
+/// = 1 規模点の測定へ変更し、規模点間の比較は複数回のプロセス起動〔別プロセス〕に
+/// 委ねる）。
+fn core16_diag_scale_index_from_env() -> Result<usize, String> {
+    let raw = std::env::var("BENCH_CORE16_DIAG_SCALE_INDEX").map_err(|_| {
+        format!(
+            "BENCH_CORE16_DIAG_SCALE_INDEX is not set (required when BENCH_CORE16_DIAG is set; \
+             pick one index 0..{} — measuring multiple scale points within a single process is \
+             not valid comparative evidence, see docs/design/core16-f16-resident-gate.md)",
+            CORE16_DIAG_SCALE_POINTS.len() - 1
+        )
+    })?;
+    let index: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| "BENCH_CORE16_DIAG_SCALE_INDEX must be a non-negative integer".to_string())?;
+    if index >= CORE16_DIAG_SCALE_POINTS.len() {
+        return Err(format!(
+            "BENCH_CORE16_DIAG_SCALE_INDEX must be in range 0..{} (got {index})",
+            CORE16_DIAG_SCALE_POINTS.len() - 1
+        ));
+    }
+    Ok(index)
+}
+
+/// CORE-16 の規模点診断（Issue #313）。モジュール冒頭コメント参照。
 /// `BENCH_CORE16_DIAG`（非空で有効）かつ `BENCH_VERBOSE` の両方が設定されている
 /// ときのみ動作し、`BENCH_CORE16_DIAG` 未設定なら何も出力しない
 /// （既定挙動を変えない）。CORE-6/CORE-16 ゲート本体が使う固定規模の
-/// `GateDataset` は再利用せず、規模点ごとに [`build_scaled_gate_dataset`] で
-/// 別データセットを構築する（合否には数えない・スタンドアロンの参考出力）。
-fn run_core16_scaling_diagnostic(rng: &mut DeterministicRng, ctx: &PolicyContext, verbose: bool) {
+/// `GateDataset` は再利用せず、選択した規模点だけを [`build_scaled_gate_dataset`]
+/// で構築する（合否には数えない・スタンドアロンの参考出力）。
+///
+/// 1 回の呼び出しで測定するのは [`core16_diag_scale_index_from_env`] が選ぶ 1
+/// 規模点のみ（`docs/design/core16-f16-resident-gate.md` 参照。複数規模点を
+/// 同一プロセス内で連続測定すると GPU バックエンドの繰り返し構築・破棄に由来する
+/// ノイズで値・符号が比較不能になることを ADR で確認済みのため、規模点間の比較は
+/// プロセスを分けて複数回実行することで行う）。
+fn run_core16_scaling_diagnostic(
+    rng: &mut DeterministicRng,
+    ctx: &PolicyContext,
+    verbose: bool,
+) -> Result<(), String> {
     const LABEL: &str = "core16_diag";
     if !opt_in_requested_from_env("BENCH_CORE16_DIAG") {
-        return;
+        return Ok(());
     }
     if !verbose {
         println!(
             "{LABEL}: requires BENCH_VERBOSE=1 to run (numeric diagnostic; not counted toward \
              pass/fail)"
         );
-        return;
+        return Ok(());
     }
 
-    // 規模点（行数, 次元）。CORE-16 ゲート本体（`GPU_GATE_ROW_COUNT`/
-    // `GPU_GATE_DIM` 固定）より広い規模域を掃引し、短縮率が測定規模に応じて
-    // どう変化するかを見る（Issue #313: 測定設計〔固定コスト支配〕/f16 シェーダの
-    // 性能不足の切り分けが目的。本ベンチ固有の測定条件であり spec の閾値ではない）。
-    let scale_points: [(usize, usize); 6] = [
-        (64, GPU_GATE_DIM),
-        (500, GPU_GATE_DIM),
-        (GPU_GATE_ROW_COUNT, 64),
-        (GPU_GATE_ROW_COUNT, GPU_GATE_DIM),
-        (GPU_GATE_ROW_COUNT, 1024),
-        (GPU_GATE_ROW_COUNT * 4, GPU_GATE_DIM),
-    ];
+    let index = core16_diag_scale_index_from_env()?;
+    let (rows, dim) = CORE16_DIAG_SCALE_POINTS[index];
 
-    for (rows, dim) in scale_points {
-        let dataset = build_scaled_gate_dataset(rng, rows, dim);
-        match measure_core16_resident_p95(&dataset, ctx, dim, LABEL) {
-            Ok((p95_a, p95_b)) => {
-                println!(
-                    "verbose({LABEL}): rows={rows} dim={dim} f32_resident_p95={p95_a:?} \
-                     f16_resident_p95={p95_b:?}"
-                );
-            }
-            Err(msg) => {
-                println!("verbose({LABEL}): rows={rows} dim={dim} not measurable ({msg})");
-            }
+    let dataset = build_scaled_gate_dataset(rng, rows, dim);
+    match measure_core16_resident_p95(&dataset, ctx, dim, LABEL) {
+        Ok((p95_a, p95_b)) => {
+            println!(
+                "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} \
+                 f32_resident_p95={p95_a:?} f16_resident_p95={p95_b:?}"
+            );
+        }
+        Err(msg) => {
+            println!(
+                "verbose({LABEL}): scale_index={index} rows={rows} dim={dim} not measurable \
+                 ({msg})"
+            );
         }
     }
+    Ok(())
 }
 
 /// 診断用の事前生成プール 1 本（`total_iterations` バッチ分。各バッチ
@@ -945,9 +995,12 @@ fn main() {
     passed &= core6_ok;
     passed &= core16_ok;
 
-    // --- CORE-16 規模スイープ診断（Issue #313。合否には数えない。opt-in 未設定
+    // --- CORE-16 規模点診断（Issue #313。合否には数えない。opt-in 未設定
     // なら run_core16_scaling_diagnostic 自体が何も出力しない）---
-    run_core16_scaling_diagnostic(&mut rng, &gate_ctx, verbose);
+    if let Err(msg) = run_core16_scaling_diagnostic(&mut rng, &gate_ctx, verbose) {
+        eprintln!("batch_bench: {msg}");
+        std::process::exit(1);
+    }
 
     if !passed {
         eprintln!("batch_bench: acceptance criteria not met (TASK-130 CORE-6/CORE-7/CORE-16)");
