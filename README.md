@@ -125,7 +125,9 @@ CORE-7（動的窓集約を経由する単発クエリ経路の p95 劣化上限
 
 同様に CORE-6（GPU vs CPU-SIMD）・CORE-16（f16 常駐 vs f32 常駐）は実 GPU バックエンド（`gpu_batch.rs`）へ接続済みです（Issue #178・#234）。`benches/batch_bench.rs` の A/B 実測ゲートへどちらも配線済みで、CORE-6 は GPU 経路 vs CPU-SIMD 経路、CORE-16 は GPU 側の f16 パック常駐 vs f32 常駐対照経路（`GpuF32ContrastBackend`）を比較します。GitHub ホステッド runner に GPU が無いこと・閾値が spec SSOT であることから `BENCH_CORE6`/`BENCH_CORE16` repo variable による opt-in 方式を維持します（未設定＝既定で対象外。opt-in 時は短縮率下限の Environment `bench-gate` secrets `BENCH_CORE6_MIN_IMPROVEMENT_PCT`/`BENCH_CORE16_MIN_IMPROVEMENT_PCT` も必要で、未設定なら fail-closed）。GPU が初期化できない環境で opt-in された場合はそれぞれ理由とともに `pass=false` を報告します。`schedule` トリガ（週次）は #168 で再追加済みです。secrets 未設定のまま週次 run が実行された場合は fail-closed で red になります（false green にはなりません）。GitHub ホステッド runner には GPU が無いため、CORE-6/16 の実測には GPU 搭載ホストでの手動実行が必要です。
 
-`batch_bench.rs` の標準出力は既定で pass/fail と非数値状態のみを書き、実測値・注入した閾値のどちらも出しません（`contrast_bench.rs` の CORE-5 で採用済みの方針を横展開したもの。Issue #279）。実測値（p95・median）が必要な場合は、ローカルまたは承認済み計測環境で `BENCH_VERBOSE=1 make bench-batch` を実行してください。`BENCH_VERBOSE` は `.github/workflows/bench.yml` の `bench-batch` ジョブへは注入しておらず、`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体を bench 側が fail-closed で拒否します（public な Actions ログへ実測値が漏れないための二重化）。取得した実測値は Issue・PR・docs 等の public 資産へ転記しないでください。
+`batch_bench.rs` の標準出力は既定で pass/fail と非数値状態のみを書き、実測値・注入した閾値のどちらも出しません（`contrast_bench.rs` の CORE-5 で採用済みの方針を横展開したもの。Issue #279）。実測値（p95・median）が必要な場合は、ローカルまたは承認済み計測環境で `BENCH_VERBOSE=1 make bench-batch` を実行してください。`BENCH_VERBOSE` は `.github/workflows/bench.yml` の `bench-batch` ジョブへは注入しておらず、`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体を bench 側が fail-closed で拒否します（public な Actions ログへ実測値が漏れないための二重化）。
+
+Apple GPU（Metal）環境での CORE-16 fail 報告（Issue #313）を切り分けるための規模スイープ診断は `BENCH_CORE16_DIAG=1 BENCH_VERBOSE=1 make bench-batch` で実行できます（`BENCH_CORE16_DIAG` 単独では `BENCH_VERBOSE` の設定を促す 1 行のみ出力し、合否には数えません）。切り分け結果・環境別 pass/fail は `docs/design/core16-f16-resident-gate.md` を参照してください。
 
 ### C1 p95 専有環境再測定（TASK-83）
 
