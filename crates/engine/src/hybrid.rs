@@ -615,15 +615,18 @@ fn validate_extended_pool<T>(
 
 /// 非正スコア（`score <= 0.0`）の候補は RRF の寄与がゼロ（`rank` 由来の減衰項のみが
 /// 加算され、スコアそのものは融合に使われない設計だが、意味的には「無シグナル」を
-/// 表す）であり、境界同点グループ完全化（[`complete_boundary_tie_group_by`]）の対象
-/// から外す（Issue #320 大規模段追加調査）。密（[`CandidateHit::score`]）・疎
-/// （[`crate::sparse::ScoredDoc::score`]。BM25 は語一致なしで 0）いずれも、
-/// 「クエリと一切無関係」を意味する非正スコアの候補が可視集合の大半を占める
-/// コーパスでは、その長い同点尾（無関係文書のスコア 0 同点）が境界同点グループ
-/// の完全化ループを可視集合全体（[`MAX_FETCH_K`] またはそれに近い `fetch_k`）まで
-/// 引き伸ばしてしまう。`items` は呼び出し元がスコア降順であることを検証済み
-/// （[`validate_extended_pool`]）のため、非正スコアの範囲は必ず末尾の連続区間になり、
-/// 先頭から見て最初に非正スコアが現れた位置で単純に切り詰めれば足りる。
+/// 表す）である。密（[`CandidateHit::score`]）・疎（[`crate::sparse::ScoredDoc::score`]。
+/// BM25 は語一致なしで 0）いずれも、「クエリと一切無関係」を意味する非正スコアの
+/// 候補が可視集合の大半を占めるコーパスでは、その長い同点尾（無関係文書のスコア 0
+/// 同点）が境界同点グループの完全化ループを可視集合全体（[`MAX_FETCH_K`] またはそれ
+/// に近い `fetch_k`）まで引き伸ばしてしまう（Issue #320 大規模段追加調査）。
+///
+/// 呼び出し元は [`resolve_boundary_tie_group`] 経由でのみ本関数を使う。境界（`pool_depth`
+/// 位置）の同点グループが非正スコアで、かつ取得列が非 exhaustive（可視集合全体を
+/// 覆い切っていない）の場合に限り本関数を適用する。取得列が exhaustive なら非正スコア
+/// も含め全件を境界処理へ渡すべきであり（`items` は呼び出し元がスコア降順であることを
+/// 検証済み〔[`validate_extended_pool`]〕のため、非正スコアの範囲は必ず末尾の連続区間
+/// になる）、本関数はその末尾を単純に切り詰めるだけの補助である。
 ///
 /// 契約検証（[`validate_extended_pool`]）は本関数の呼び出し**前**、切り詰め前の
 /// 拡張取得列全体に対して行う（呼び出し元の既存契約を維持。本関数はランク付け対象
@@ -636,6 +639,42 @@ fn trim_non_positive_score_tail<T>(items: Vec<T>, score_of: impl Fn(&T) -> f64) 
     let mut items = items;
     items.truncate(cut);
     items
+}
+
+/// [`complete_boundary_tie_group_by`] の前処理。密・疎いずれの拡張取得列
+/// （`hits`）に対しても同じ規約で呼ばれる（[`hybrid_search_boosted`] からのみ
+/// 使用。Issue #320 codex-review 追加指摘対応）。
+///
+/// - `exhaustive`（拡張取得列が可視集合全体を覆い切っている）なら非正スコアの
+///   末尾も含め全件をそのまま境界完全化へ渡す。取得済み範囲の末尾がそのまま
+///   真の終端であることが確定しているため、非正スコアの候補を除外する理由が
+///   ない（`sql_precision_mode` の密・疎順位不一致 → RRF 同点 → 空集合契約
+///   〔SEARCH-9〕はこの経路に依存する: 可視集合が小さく取得列が exhaustive な
+///   場合でもスコア 0 の候補が境界同点判定に必要）。
+/// - 非 exhaustive で境界位置（0-based で `pool_depth - 1`）のスコアが非正なら、
+///   その候補群は「クエリと無関係」を表す無シグナル群であり全員が等価（ID に
+///   依存しない）。再取得ループへ進めず、その場で非正スコアの末尾を丸ごと除外
+///   して `Resolved` として確定する。これにより無シグナル群のために可視集合
+///   全体まで再取得を続ける経路を断つ。
+/// - 非 exhaustive で境界位置のスコアが正なら、非正の末尾を切らずに
+///   [`complete_boundary_tie_group_by`] へそのまま渡す（正の境界同点グループは
+///   非正スコアと隣接しないため、末尾を保持しても完全化の結果に影響しない）。
+fn resolve_boundary_tie_group<T>(
+    hits: Vec<T>,
+    pool_depth: usize,
+    exhaustive: bool,
+    score_of: impl Fn(&T) -> f64,
+) -> TieBoundary<T> {
+    if exhaustive || pool_depth == 0 || hits.len() < pool_depth {
+        return complete_boundary_tie_group_by(hits, pool_depth, exhaustive, score_of);
+    }
+    // `pool_depth >= 1` かつ `hits.len() >= pool_depth` のため `pool_depth - 1` は
+    // 常に有効な添字。
+    if score_of(&hits[pool_depth - 1]) <= 0.0 {
+        let trimmed = trim_non_positive_score_tail(hits, score_of);
+        return TieBoundary::Resolved(trimmed);
+    }
+    complete_boundary_tie_group_by(hits, pool_depth, exhaustive, score_of)
 }
 
 /// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
@@ -1236,16 +1275,10 @@ pub fn hybrid_search_boosted(
         // 総数以上なら provider はそれ以上返しようがなく、`hits.len() <
         // dense_fetch_k` なら provider 自身が「これ以上ない」ことを示している。
         let exhaustive = dense_fetch_k >= input.ids.len() || hits.len() < dense_fetch_k;
-        // 非正スコア（無シグナル）の末尾を境界完全化の対象から外す
-        // （[`trim_non_positive_score_tail`] ドキュメント参照）。降順ソート済みの
-        // 列から非正スコアが 1 件でも切り落とされた場合、それより先の未取得候補は
-        // 単調非増加の順序契約上すべて非正スコアであることが保証されるため、
-        // 正スコアの候補はこの時点で取得済み範囲に全件含まれている
-        // （`positive_exhaustive` を `true` とみなせる）。
-        let raw_len = hits.len();
-        let positive_hits = trim_non_positive_score_tail(hits, |h| f64::from(h.score));
-        let positive_exhaustive = exhaustive || positive_hits.len() < raw_len;
-        match complete_boundary_tie_group(positive_hits, cfg.pool_depth(), positive_exhaustive) {
+        // 非正スコア（無シグナル）の扱いは exhaustive かどうかで分岐する
+        // （[`resolve_boundary_tie_group`] ドキュメント参照）。
+        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, |h| f64::from(h.score))
+        {
             TieBoundary::Resolved(resolved) => break (resolved, dense_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if dense_fetch_k >= dense_cap {
@@ -1302,17 +1335,9 @@ pub fn hybrid_search_boosted(
         // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
         // 同じ判定基準。
         let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
-        // 密側と同じ理由（[`trim_non_positive_score_tail`] ドキュメント参照）で、
-        // 非正スコア（BM25 は語一致なしで 0）の末尾を境界完全化の対象から外す。
-        let raw_len = hits.len();
-        let positive_hits = trim_non_positive_score_tail(hits, |d| d.score);
-        let positive_exhaustive = exhaustive || positive_hits.len() < raw_len;
-        match complete_boundary_tie_group_by(
-            positive_hits,
-            cfg.pool_depth(),
-            positive_exhaustive,
-            |d| d.score,
-        ) {
+        // 非正スコア（BM25 は語一致なしで 0）の扱いは exhaustive かどうかで分岐する
+        // （[`resolve_boundary_tie_group`] ドキュメント参照。密側と同一契約）。
+        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, |d| d.score) {
             TieBoundary::Resolved(resolved) => break (resolved, sparse_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if sparse_fetch_k >= sparse_cap {
@@ -1352,8 +1377,11 @@ pub(crate) enum TieBoundary<T> {
 }
 
 /// 密検索プールを [`RrfConfig::pool_depth`] の境界で「同点グループの途中で切らない」
-/// よう完全化する（Issue #310。[`hybrid_search_boosted`] からのみ呼ばれる純粋関数。
-/// 疎側は [`complete_boundary_tie_group_by`] を直接呼ぶ）。
+/// よう完全化する（Issue #310）。production 経路（[`hybrid_search_boosted`]）は
+/// 密・疎とも [`resolve_boundary_tie_group`] 経由で [`complete_boundary_tie_group_by`]
+/// を直接呼ぶため、本関数はテスト専用（Issue #320 の非正スコア分岐導入で production
+/// 呼び出しが無くなった）。
+#[cfg(test)]
 fn complete_boundary_tie_group(
     dense: Vec<CandidateHit>,
     pool_depth: usize,

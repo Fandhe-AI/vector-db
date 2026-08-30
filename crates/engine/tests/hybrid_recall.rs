@@ -910,13 +910,17 @@ fn hybrid_recall_small_scale_regression() {
     // Issue #310（RRF 融合の同点順位規約 `TieRank::GroupEnd`・密プール境界の同点
     // グループ完全化）適用前の `hits20` は 171（`docs/design/
     // hybrid-recall-regression.md`「Issue #310: engine 側改善」節参照）。
-    // Issue #320 大規模段追加調査（非正スコア候補の順位付け除外。`hybrid.rs::
-    // trim_non_positive_score_tail` 参照）適用前の `hits20` は 182。非正スコア
-    // （無シグナル）候補が偶然正解集合に含まれていたケースが除外対象になった分、
-    // 180 へ 2 件減少した。
+    // Issue #320 大規模段追加調査で導入した非正スコア候補の順位付け除外
+    // （`hybrid.rs::trim_non_positive_score_tail`）は、取得列が exhaustive
+    // （可視集合全体を覆い切っている）場合には適用しない契約へ改めた
+    // （`hybrid.rs::resolve_boundary_tie_group` 参照。`sql_precision_mode` の
+    // 密・疎順位不一致 → RRF 同点 → 空集合契約〔SEARCH-9〕がスコア 0 の候補にも
+    // 依存するため）。この小規模コーパスでは取得列が exhaustive になるケースが
+    // 多く、非正スコア候補が除外対象から外れた結果 `hits20` は 180 から 182 へ
+    // 戻った。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
-    assert_eq!(r.hits20, 180, "小規模段の Recall@20 hit 数が変化した");
+    assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
 
     // Issue #307（SEARCH-1）: 密単体・疎単体チャネルの Recall@20 を実測し、
     // 融合が両単体のいずれも下回らないことを関係アサーションとして回帰

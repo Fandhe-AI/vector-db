@@ -141,10 +141,11 @@ Issue #310 対応（本節）でこの原因に対処するため、`fused_weigh
 （`crates/engine/src/rerank.rs`）。
 
 Issue #320 の大規模段追加調査（非正スコア候補の順位付け除外。`hybrid.rs::
-trim_non_positive_score_tail`。`docs/design/hybrid-recall-regression.md`「Issue
-#320 大規模段追加調査」節参照）の適用前後で、本ハーネスの上表の数値
-（baseline hits20・pool hits100/hits200）はいずれも変化していない（本フィクス
-チャでは非正スコア候補が測定対象クエリの結果へ影響しなかった）。
+resolve_boundary_tie_group`・`trim_non_positive_score_tail`。`docs/design/
+hybrid-recall-regression.md`「Issue #320 大規模段追加調査」節参照。exhaustive
+かどうかで除外対象を分岐する契約への改訂を含む）の適用前後で、本ハーネスの
+上表の数値（baseline hits20・pool hits100/hits200）はいずれも変化していない
+（本フィクスチャでは非正スコア候補が測定対象クエリの結果へ影響しなかった）。
 
 プール自体の Recall@200（0.9066）と最終 Recall@20（after: 0.9463）を比較すると、
 pool_depth 200 の候補プールがすでに正解の大半を含んでおり、リランキングは
