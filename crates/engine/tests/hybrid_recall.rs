@@ -917,7 +917,10 @@ fn hybrid_recall_small_scale_regression() {
     // 密・疎順位不一致 → RRF 同点 → 空集合契約〔SEARCH-9〕がスコア 0 の候補にも
     // 依存するため）。この小規模コーパスでは取得列が exhaustive になるケースが
     // 多く、非正スコア候補が除外対象から外れた結果 `hits20` は 180 から 182 へ
-    // 戻った。
+    // 戻った。さらに Issue #320 codex-review P1 指摘対応で、非 exhaustive 時の
+    // 除外自体を疎（BM25）チャネル限定へ改めた（密の 0・負値は有効な相対順位
+    // であり無シグナルではないため）。この変更では本フィクスチャの `hits20` は
+    // 変化しない。
     assert_eq!(r.total_correct, 202, "正解集合の総数が変化した");
     assert_eq!(r.ceil20, 202, "Recall@20 の理論上限が変化した");
     assert_eq!(r.hits20, 182, "小規模段の Recall@20 hit 数が変化した");
@@ -1083,13 +1086,19 @@ impl SearchProvider for MaxKTrackingProvider {
     }
 }
 
-/// TASK-104（SEARCH-2）Issue #320 大規模段追加調査の直接固定: 非正スコア（無
-/// シグナル）候補を境界同点グループ完全化の対象から外す（`hybrid.rs::
-/// trim_non_positive_score_tail`）ことで、密側の再取得ループが可視集合全体
-/// （[`LARGE_NUM_DOCS`] = 20,000 件）まで到達するクエリが 0 件になることを固定
-/// する（対応前は 100 クエリ中 53 件で到達していた。修正方針の直接検証）。
+/// TASK-104（SEARCH-2）Issue #320 codex-review P1 指摘対応の直接固定:
+/// 非正スコア（無シグナル）候補の境界同点グループ完全化からの除外
+/// （`hybrid.rs::trim_non_positive_score_tail`）は疎（BM25）チャネル限定へ
+/// 改めたため、密側の再取得ループが可視集合全体（[`LARGE_NUM_DOCS`] =
+/// 20,000 件）まで到達するクエリが 0 件でなくなること自体は許容する
+/// （密の 0・負値も有効な相対順位であり、除外すると recall が落ちるため。
+/// `resolve_boundary_tie_group` ドキュメント参照）。本テストは代わりに
+/// 密側の再取得ループが常に可視集合サイズ（このフィクスチャでは
+/// `MAX_FETCH_K` > `LARGE_NUM_DOCS` のため実質的な上限＝
+/// `dense_cap = MAX_FETCH_K.min(visible_ids.len())`）を超えて要求しない
+/// （＝再取得ループが無限に伸び続けない）ことを固定する。
 #[test]
-fn hybrid_recall_large_scale_dense_refetch_never_reaches_visible_set() {
+fn hybrid_recall_large_scale_dense_refetch_is_bounded_by_visible_set_size() {
     let verbose = verbose_requested_from_env();
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
@@ -1143,9 +1152,19 @@ fn hybrid_recall_large_scale_dense_refetch_never_reaches_visible_set() {
         );
     }
 
+    assert!(
+        max_k_across_queries <= LARGE_NUM_DOCS,
+        "密側の再取得ループが可視集合サイズ（実質的な上限 dense_cap）を超えて \
+         fetch_k を要求した（`dense_cap = MAX_FETCH_K.min(input.ids.len())` の \
+         算出自体が壊れていない限り本来到達しない構造的な保証の固定）"
+    );
+    // 決定的コーパス・QA セットに対する実測値を固定値で回帰トラッキングする
+    // （本ハーネスの他アサーションと同じ方針。codex-review P1 指摘対応前は
+    // 密チャネルの非正スコア除外により 0 件、Issue #310 時点（境界完全化導入
+    // 前）は 53 件だった）。
     assert_eq!(
-        reached_visible_set, 0,
-        "密側の境界同点グループ完全化の再取得ループが可視集合全体まで到達したクエリが存在する"
+        reached_visible_set, 40,
+        "密チャネルの再取得ループが可視集合全体まで到達したクエリ数が変化した"
     );
 }
 

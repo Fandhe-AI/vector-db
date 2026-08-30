@@ -613,20 +613,28 @@ fn validate_extended_pool<T>(
     Ok(())
 }
 
-/// 非正スコア（`score <= 0.0`）の候補は RRF の寄与がゼロ（`rank` 由来の減衰項のみが
-/// 加算され、スコアそのものは融合に使われない設計だが、意味的には「無シグナル」を
-/// 表す）である。密（[`CandidateHit::score`]）・疎（[`crate::sparse::ScoredDoc::score`]。
-/// BM25 は語一致なしで 0）いずれも、「クエリと一切無関係」を意味する非正スコアの
-/// 候補が可視集合の大半を占めるコーパスでは、その長い同点尾（無関係文書のスコア 0
-/// 同点）が境界同点グループの完全化ループを可視集合全体（[`MAX_FETCH_K`] またはそれ
-/// に近い `fetch_k`）まで引き伸ばしてしまう（Issue #320 大規模段追加調査）。
+/// 非正スコア（`score <= 0.0`）を「無シグナル」とみなして末尾除外できるのは
+/// **疎チャネル（[`crate::sparse::ScoredDoc::score`]。BM25）限定**である。BM25 は
+/// 語一致が一切ない文書のスコアが定義上 0 になるため、非正スコア＝「クエリと
+/// 無関係」が保証される。可視集合の大半がこの無関係文書で占められるコーパスでは、
+/// その長い同点尾（スコア 0 同点）が境界同点グループの完全化ループを可視集合全体
+/// （[`MAX_FETCH_K`] またはそれに近い `fetch_k`）まで引き伸ばしてしまう（Issue #320
+/// 大規模段追加調査）。
 ///
-/// 呼び出し元は [`resolve_boundary_tie_group`] 経由でのみ本関数を使う。境界（`pool_depth`
-/// 位置）の同点グループが非正スコアで、かつ取得列が非 exhaustive（可視集合全体を
-/// 覆い切っていない）の場合に限り本関数を適用する。取得列が exhaustive なら非正スコア
-/// も含め全件を境界処理へ渡すべきであり（`items` は呼び出し元がスコア降順であることを
-/// 検証済み〔[`validate_extended_pool`]〕のため、非正スコアの範囲は必ず末尾の連続区間
-/// になる）、本関数はその末尾を単純に切り詰めるだけの補助である。
+/// **密チャネル（[`CandidateHit::score`]。内積・コサイン類似度）には適用しない**
+/// （Issue #320 codex-review P1 指摘対応）。密の類似度は 0・負値も有効な相対順位を
+/// 持ち「無関係」を意味しない。上位 `pool_depth` 件が全て非正スコアになるクエリ・
+/// 埋め込み分布は珍しくなく、密チャネルへ本関数を適用すると候補が丸ごと除外されて
+/// recall が落ちる。RRF は順位（`rank`）由来の減衰項のみで寄与を決めるため、
+/// 「非正スコアは寄与ゼロ」という前提もそもそも密には成立しない。
+///
+/// 呼び出し元は [`resolve_boundary_tie_group`] 経由でのみ本関数を使う（`zero_is_no_signal`
+/// 引数で疎チャネルの呼び出しに限定する）。境界（`pool_depth` 位置）の同点グループが
+/// 非正スコアで、かつ取得列が非 exhaustive（可視集合全体を覆い切っていない）の場合に
+/// 限り本関数を適用する。取得列が exhaustive なら非正スコアも含め全件を境界処理へ渡す
+/// べきであり（`items` は呼び出し元がスコア降順であることを検証済み〔[`validate_extended_pool`]〕
+/// のため、非正スコアの範囲は必ず末尾の連続区間になる）、本関数はその末尾を単純に
+/// 切り詰めるだけの補助である。
 ///
 /// 契約検証（[`validate_extended_pool`]）は本関数の呼び出し**前**、切り詰め前の
 /// 拡張取得列全体に対して行う（呼び出し元の既存契約を維持。本関数はランク付け対象
@@ -642,30 +650,42 @@ fn trim_non_positive_score_tail<T>(items: Vec<T>, score_of: impl Fn(&T) -> f64) 
 }
 
 /// [`complete_boundary_tie_group_by`] の前処理。密・疎いずれの拡張取得列
-/// （`hits`）に対しても同じ規約で呼ばれる（[`hybrid_search_boosted`] からのみ
-/// 使用。Issue #320 codex-review 追加指摘対応）。
+/// （`hits`）に対しても呼ばれるが、非正スコアの無シグナル除外（`zero_is_no_signal`）
+/// を適用するかどうかはチャネル種別で分岐する（[`hybrid_search_boosted`] からのみ
+/// 使用。Issue #320 codex-review P1 指摘対応: 密チャネルは 0・負値も有効な相対順位
+/// を持つため密には適用しない。[`trim_non_positive_score_tail`] ドキュメント参照）。
 ///
-/// - `exhaustive`（拡張取得列が可視集合全体を覆い切っている）なら非正スコアの
-///   末尾も含め全件をそのまま境界完全化へ渡す。取得済み範囲の末尾がそのまま
-///   真の終端であることが確定しているため、非正スコアの候補を除外する理由が
-///   ない（`sql_precision_mode` の密・疎順位不一致 → RRF 同点 → 空集合契約
-///   〔SEARCH-9〕はこの経路に依存する: 可視集合が小さく取得列が exhaustive な
-///   場合でもスコア 0 の候補が境界同点判定に必要）。
-/// - 非 exhaustive で境界位置（0-based で `pool_depth - 1`）のスコアが非正なら、
-///   その候補群は「クエリと無関係」を表す無シグナル群であり全員が等価（ID に
-///   依存しない）。再取得ループへ進めず、その場で非正スコアの末尾を丸ごと除外
-///   して `Resolved` として確定する。これにより無シグナル群のために可視集合
-///   全体まで再取得を続ける経路を断つ。
-/// - 非 exhaustive で境界位置のスコアが正なら、非正の末尾を切らずに
-///   [`complete_boundary_tie_group_by`] へそのまま渡す（正の境界同点グループは
-///   非正スコアと隣接しないため、末尾を保持しても完全化の結果に影響しない）。
+/// - `zero_is_no_signal`: 呼び出し元がこのチャネルで「非正スコア＝無シグナル
+///   （クエリと無関係）」を意味論的に保証できる場合にのみ `true` を渡す。疎
+///   （BM25）チャネルの呼び出し元はこれを保証できるため `true`、密（内積・
+///   コサイン類似度）チャネルの呼び出し元は保証できないため `false` を渡す。
+/// - `exhaustive`（拡張取得列が可視集合全体を覆い切っている）なら
+///   `zero_is_no_signal` の値によらず非正スコアの末尾も含め全件をそのまま境界
+///   完全化へ渡す。取得済み範囲の末尾がそのまま真の終端であることが確定して
+///   いるため、非正スコアの候補を除外する理由がない（`sql_precision_mode` の
+///   密・疎順位不一致 → RRF 同点 → 空集合契約〔SEARCH-9〕はこの経路に依存
+///   する: 可視集合が小さく取得列が exhaustive な場合でもスコア 0 の候補が
+///   境界同点判定に必要）。
+/// - `zero_is_no_signal` かつ非 exhaustive で境界位置（0-based で
+///   `pool_depth - 1`）のスコアが非正なら、その候補群は「クエリと無関係」を
+///   表す無シグナル群であり全員が等価（ID に依存しない）。再取得ループへ
+///   進めず、その場で非正スコアの末尾を丸ごと除外して `Resolved` として確定
+///   する。これにより無シグナル群のために可視集合全体まで再取得を続ける経路
+///   を断つ。
+/// - それ以外（`zero_is_no_signal` が `false`、または境界位置のスコアが正）は、
+///   非正の末尾を切らずに [`complete_boundary_tie_group_by`] へそのまま渡す
+///   （正の境界同点グループは非正スコアと隣接しないため、末尾を保持しても
+///   完全化の結果に影響しない。密チャネルは非 exhaustive でも常にこの経路
+///   を通り、通常の再取得ループ／[`exclude_undetermined_boundary_group`]
+///   による対称除外にのみ委ねる）。
 fn resolve_boundary_tie_group<T>(
     hits: Vec<T>,
     pool_depth: usize,
     exhaustive: bool,
+    zero_is_no_signal: bool,
     score_of: impl Fn(&T) -> f64,
 ) -> TieBoundary<T> {
-    if exhaustive || pool_depth == 0 || hits.len() < pool_depth {
+    if exhaustive || pool_depth == 0 || hits.len() < pool_depth || !zero_is_no_signal {
         return complete_boundary_tie_group_by(hits, pool_depth, exhaustive, score_of);
     }
     // `pool_depth >= 1` かつ `hits.len() >= pool_depth` のため `pool_depth - 1` は
@@ -1330,10 +1350,12 @@ pub fn hybrid_search_boosted(
         // 総数以上なら provider はそれ以上返しようがなく、`hits.len() <
         // dense_fetch_k` なら provider 自身が「これ以上ない」ことを示している。
         let exhaustive = dense_fetch_k >= input.ids.len() || hits.len() < dense_fetch_k;
-        // 非正スコア（無シグナル）の扱いは exhaustive かどうかで分岐する
-        // （[`resolve_boundary_tie_group`] ドキュメント参照）。
-        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, |h| f64::from(h.score))
-        {
+        // 密チャネルは非正スコアも有効な相対順位を持つため無シグナル除外を
+        // 適用しない（`zero_is_no_signal = false`。[`trim_non_positive_score_tail`]・
+        // [`resolve_boundary_tie_group`] ドキュメント参照）。
+        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, false, |h| {
+            f64::from(h.score)
+        }) {
             TieBoundary::Resolved(resolved) => break (resolved, dense_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if dense_fetch_k >= dense_cap {
@@ -1396,9 +1418,10 @@ pub fn hybrid_search_boosted(
         // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
         // 同じ判定基準。
         let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
-        // 非正スコア（BM25 は語一致なしで 0）の扱いは exhaustive かどうかで分岐する
-        // （[`resolve_boundary_tie_group`] ドキュメント参照。密側と同一契約）。
-        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, |d| d.score) {
+        // 疎チャネル（BM25 は語一致なしで 0）は非正スコア＝無シグナルを保証
+        // できるため `zero_is_no_signal = true`（[`trim_non_positive_score_tail`]・
+        // [`resolve_boundary_tie_group`] ドキュメント参照。密側とは異なる契約）。
+        match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, true, |d| d.score) {
             TieBoundary::Resolved(resolved) => break (resolved, sparse_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if sparse_fetch_k >= sparse_cap {
@@ -2624,11 +2647,10 @@ mod tests {
         // (k_const + 1)` = `1/61 ≈ 0.0164`（弱い方のチャネルの寄与だけを仮定する
         // 安全側）を使うため、重みが大きい方のチャネルが空でも正しく拒否される
         // ことを確認する。
-        // Issue #320 大規模段追加調査による非正スコア（無シグナル）候補の順位付け
-        // 除外（`trim_non_positive_score_tail` ドキュメント参照）により、id 2 の
-        // 密スコアは 0.0 ではなく正の小さい値（0.05）にする必要がある。0.0 のままだと
-        // id 2 は密プールから除外され、疎チャネルも空のためプールへ一切現れず、
-        // ブースト対象が不在で本テストの意図（安全側キャップでの拒否）を検証できない。
+        // id 2 の密スコアは正の小さい値（0.05）にしておく（密チャネルは非正スコアの
+        // 無シグナル除外を適用しない〔`resolve_boundary_tie_group` ドキュメント参照〕
+        // ため 0.0 でも動作は変わらないが、ブースト対象が密プールに現れることを
+        // 明確にするため 0 は避ける）。
         let cfg = RrfConfig::new(60.0, 1.0, 100.0, 200).expect("valid cfg");
         let vectors: Vec<f32> = vec![1.0, 0.0, 0.05, 0.5];
         let ids = [1u64, 2u64];
@@ -3289,5 +3311,80 @@ mod tests {
             out_a, out_b,
             "密チャネルの id 割り当て（id_offset）を変えても融合結果は一致する"
         );
+    }
+
+    /// 上位 `pool_depth` 件がすべて非正スコア（内積・コサイン類似度としては有効な
+    /// 相対順位）を返す密 provider（Issue #320 codex-review P1 指摘の回帰固定用
+    /// モック）。要求された `input.k` 件を、スコアが厳密に降順（同点なし）になる
+    /// よう返す。
+    struct AllNegativeDenseProvider;
+    impl SearchProvider for AllNegativeDenseProvider {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+            Ok((0..input.k)
+                .map(|i| CandidateHit {
+                    id: (i + 1) as u64,
+                    // `i` が大きいほど小さい（より負の）値にし、スコア降順・
+                    // 同点なしを保つ。
+                    score: -0.01 * (i as f32 + 1.0),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn hybrid_search_boosted_keeps_dense_candidates_when_boundary_scores_are_non_positive() {
+        // Issue #320 codex-review P1 指摘の直接固定: 密チャネルは疎（BM25）と異なり
+        // 非正スコアも「クエリと無関係」を意味しない。境界（`pool_depth` 位置）の
+        // スコアが非正であっても、密チャネルの候補が丸ごと除外されず融合結果に
+        // 現れることを確認する（`resolve_boundary_tie_group` の
+        // `zero_is_no_signal = false` 経路の固定）。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 5).unwrap();
+        // 可視集合を初期 `fetch_k`（`pool_depth * 2 = 10`）より大きくし、
+        // 非 exhaustive な取得（`resolve_boundary_tie_group` が非正スコア判定を
+        // 行う分岐）を強制する。
+        let ids: Vec<u64> = (1..=1000u64).collect();
+        let vectors: Vec<f32> = vec![0.0; ids.len()];
+        let query = [0.0f32];
+        // 疎チャネルはクエリと一致しない（"zzz"）ため空にし、融合結果が密チャネル
+        // 由来であることを確定させる。
+        let sparse_index = SparseIndex::build(&[(1, "cat"), (2, "dog")]).expect("build ok");
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 5,
+        };
+
+        let out = hybrid_search(
+            &AllNegativeDenseProvider,
+            input,
+            &sparse_index,
+            "zzz",
+            5,
+            &cfg,
+        )
+        .expect("search ok");
+
+        // 密チャネルのみが寄与する（疎チャネルは "zzz" 不一致で空）ため、RRF
+        // スコアは `1 / (k_const + rank)`（`dense_weight = 1.0`・`k_const = 60.0`）
+        // のみで決まり、疎の寄与がないぶん密スコア自体には依存しない。上位
+        // `pool_depth`（5）件すべてが id 昇順（＝スコア降順）のまま生き残ること
+        // を固定する（`!out.is_empty()` だけでは一部候補の脱落を見逃すため、
+        // 件数・id 列・スコアまで固定する）。
+        let expected_ids: Vec<u64> = (1..=5).collect();
+        assert_eq!(
+            out.iter().map(|h| h.id).collect::<Vec<_>>(),
+            expected_ids,
+            "上位 pool_depth 件が非正スコアでも密チャネルの候補が丸ごと除外されず、\
+             かつ順位（id 昇順）を保って融合結果に現れる"
+        );
+        for (rank, hit) in out.iter().enumerate() {
+            let expected_score = 1.0 / (60.0 + (rank + 1) as f64);
+            assert!(
+                (hit.score - expected_score).abs() < 1e-12,
+                "RRF スコアが密チャネル単独の理論値と一致しない: {hit:?}"
+            );
+        }
     }
 }
