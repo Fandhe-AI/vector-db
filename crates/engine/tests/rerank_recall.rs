@@ -9,8 +9,11 @@
 //! 「複製・踏襲」方式）。production コード（`crates/engine/src/`）は原則変更しない
 //! 契約だが、Issue #310 対応（[`LexicalOverlapReranker`] の既定重みを字句一致優先
 //! から fused 優位へ変更。理由: 等重み既定では字句一致優先による正解脱落が実測され、
-//! `after_hits20 >= baseline_hits20` の非劣化アサーションが red だった）はオーナー
-//! 判断による例外で、本ファイルの固定値アサーションも実測値へ合わせて更新している。
+//! `after_hits20 >= baseline_hits20` の非劣化アサーションが red だった）・
+//! Issue #330 対応（[`LexicalOverlapReranker`] の `rank_lexical` 同点規約を位置順位
+//! から `rank_fused` と同じ GroupEnd へ統一。理由: 大規模段 improvement@20 が字句
+//! 信号の構造的上限に対して未達だった）はオーナー判断による例外で、本ファイルの
+//! 固定値アサーションも実測値へ合わせて更新している。
 //!
 //! **比較対象**（いずれも production API のみを使用。BM25/RRF/リランキングの
 //! 再実装は行わない）:
@@ -532,7 +535,7 @@ fn rerank_recall_large_scale_regression() {
         "baseline（リランキングなし）の Recall@20 hit 数が変化した"
     );
     assert_eq!(
-        r.after_hits20, 388,
+        r.after_hits20, 389,
         "after（リランキングあり）の Recall@20 hit 数が変化した"
     );
     assert_eq!(r.pool_hits100, 837, "プール Recall@100 hit 数が変化した");
@@ -548,8 +551,12 @@ fn rerank_recall_large_scale_regression() {
     // = 1.0）で字句一致順位の寄与が融合順位の寄与を上回り、字句一致トークンが
     // 脱落した正解文書が字句一致した decoy に逆転されたことによる。Issue #310
     // 対応で既定重みを `fused_weight:lexical_weight = 3.0:1.0`（fused 優位）へ
-    // 変更し、この非劣化を回復した（after 388 ≥ baseline 387。採用比率の実測は
-    // `docs/design/rerank-recall-regression.md` 参照）。
+    // 変更し、この非劣化を回復した（after 388 ≥ baseline 387）。
+    //
+    // Issue #330（大規模段 improvement@20 ゲート未達の是正）対応: `rank_lexical`
+    // の同点規約を位置順位から `rank_fused` と同じ GroupEnd へ統一し、字句信号の
+    // 構造的上限（`docs/design/rerank-recall-regression.md`「Issue #330」節参照）
+    // まで改善幅を引き上げた（after 389 ≥ baseline 387。採用比率の実測は同節参照）。
     assert!(
         r.after_hits20 >= r.baseline_hits20,
         "リランキング層（LexicalOverlapReranker）が baseline（リランキングなし）の Recall@20 を悪化させた"

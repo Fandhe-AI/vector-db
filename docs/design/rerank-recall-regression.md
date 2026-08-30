@@ -105,10 +105,10 @@ green。詳細は下記）
 | total_correct | 1,049 |
 | ceil20 | 410 |
 | baseline hits20（リランキングなし） | 387 |
-| after hits20（リランキングあり） | 388 |
+| after hits20（リランキングあり） | 389（Issue #330 対応後。対応前は 388） |
 | baseline Recall@20 | 0.9439 |
-| after Recall@20 | 0.9463 |
-| 改善量（after − baseline） | +0.0024 |
+| after Recall@20 | 0.9488（Issue #330 対応前は 0.9463） |
+| 改善量（after − baseline） | +0.0049（Issue #330 対応前は +0.0024） |
 | ceil100 / pool hits100 | 913 / 837（Recall@100 = 0.9168） |
 | ceil200 / pool hits200 | 1,049 / 951（Recall@200 = 0.9066） |
 
@@ -144,6 +144,76 @@ Recall@200 の未達分は、リランキング以前の候補生成段（`hybri
 
 なお本ハーネスは `LexicalOverlapReranker` の効果測定であり、方式確定前の暫定構成
 （下記「既知の制約」参照）における測定値であることに注意する。
+
+## Issue #330: 改善幅未達の原因分析と engine 側改善
+
+`recall.yml` の rerank 大規模段ゲートのうち、改善幅ゲート
+（`RERANK_RECALL_MIN_R20_IMPROVEMENT`）が未達だった（Issue #310 対応後の
+improvement@20 は +0.0024 相当）。絶対下限ゲート（after Recall@20 そのもの）は
+達していた。本節はこの未達要因の分析と、その分析に基づく engine 側改善
+（`crates/engine/src/rerank.rs::LexicalOverlapReranker`）を記録する。
+
+### 未達要因の分析（診断内訳。上表と同一フィクスチャ）
+
+理論上限 ceil20（410）と baseline hits20（387）の差 23 hit のうち、リランカーの
+入力である候補プール自体に含まれない（プール外）ものが 14 hit、プール内に
+含まれる（＝リランキングで到達しうる）ものが 9 hit だった。プール内 9 hit を
+クエリ語と候補 text の字句重なり数（overlap）で内訳すると、overlap=2（クエリ 2
+トークンとも一致）が 2 件、overlap=1 が 6 件、overlap=0 が 1 件だった。
+
+一方、top20 中の不正解の overlap 分布は overlap=1 が大半（クエリ当たり ≒16 件）を
+占め、overlap=2 は 0 件だった。本フィクスチャでは「text がクエリ 2 語とも含む
+（overlap=2）⇒ ほぼ確実に正解」という構造がある一方、正解の大半は overlap=1 で
+top20 中の不正解と字句・fused いずれの信号でも区別がつかない。したがって字句一致
+信号で追加的に引き上げ可能なのは overlap=2 の 2 件のみであり、**字句信号での改善
+到達上限は 389（+2 hit・改善幅 ≈ +0.0049）** と見積もられる（プール外 14 hit・
+overlap=1/0 の 7 hit はリランカー単独では原理的に到達不能）。
+
+### 現行実装が上限に届かなかった原因と対応
+
+`LexicalOverlapReranker::rerank` の `rank_lexical`（字句一致順位）は、overlap
+降順の安定ソート後の**位置順位**（`rank_idx + 1`）で算出していた。この方式では
+overlap が同点の候補グループ内でも、ソートの安定性により元の並び順（＝融合スコア
+降順）がそのまま順位差として残り、`contribution_fused`（融合順位の寄与）と
+`contribution_lexical`（字句順位の寄与）の両方に融合スコア順位の情報が二重に
+反映される非対称が生じていた。`rank_fused` 側は Issue #310 対応で
+`hybrid.rs::TieRank::GroupEnd`（同点グループは末尾の共通順位を共有）へ統一済み
+だったため、字句側だけがこの規約と異なるままだった。
+
+対応として、`rank_lexical` の算出を `rank_fused_by_idx` と同じグループ末尾順位
+（GroupEnd）へ変更した（overlap が同点のグループ内では全メンバーが同一の
+`rank_lexical` を共有し、順位差は `rank_fused` 側のみに由来する）。フィクスチャ
+パラメータ（`*_DROPOUT_PROB`・`VECTOR_DECOY_PROB`・規模・シード・`k`）は変更せず、
+`crates/engine/src/rerank.rs::LexicalOverlapReranker`（既定重み 3.0:1.0 は不変）の
+みを変更した結果、after hits20 は 388 → 389（改善幅 +0.0024 → +0.0049）となり、
+字句信号の到達上限（389）に一致した。
+
+検討した他の候補方式（採用しなかったもの。同一フィクスチャでの実測 after
+hits20）:
+
+| 方式 | after hits20 |
+| ---- | ------------ |
+| 現行既定 3:1（位置順位。Issue #330 対応前） | 388 |
+| 等重み 1:1（位置順位） | 383 |
+| overlap の比率をスコアへ直接加算する方式 | 383〜388 |
+| overlap 段階で完全に層別（tier）し層内 fused 順 | 383 |
+| 全被覆（overlap=クエリトークン数）候補を先頭へ昇格 | 389 |
+| **`rank_lexical` を GroupEnd へ変更（採用）** | **389** |
+| 同上 + 全被覆ボーナス加算 | 389（追加効果なし） |
+| `rank_lexical` を GroupStart（グループ先頭の共通順位）へ変更 | 383〜385 |
+
+GroupEnd 化が最小変更で上限に到達し、かつ `rank_fused` 側の既存規約（Issue #310
+採用済みの `TieRank::GroupEnd`）との整合性も最も高いため、この方式を採用した。
+全被覆ボーナスの追加は本フィクスチャで効果がなく（YAGNI）不採用とした。
+
+### 重要な制約: 到達上限は字句信号の構造的上限
+
+389（改善幅 +0.0049）は本フィクスチャにおける字句一致信号の構造的上限であり、
+`recall.yml` の閾値（spec 由来・非公開）がこれを上回る場合、`LexicalOverlapReranker`
+単独では改善幅ゲートに到達できない。その場合はプール外 14 hit・overlap=0/1 の
+7 hit をカバーするための候補生成段（`hybrid.rs`・`sparse.rs`）の改善、フィクスチャ
+自体の見直し、リランカー方式（クロスエンコーダ等）の確定のいずれかが必要であり、
+オーナー判断事項となる。
 
 ## 既知の制約・スコープ外
 
