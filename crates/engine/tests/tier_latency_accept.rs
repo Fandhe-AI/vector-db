@@ -30,9 +30,12 @@ mod harness;
 #[path = "../src/test_util/temp_db.rs"]
 mod temp_db;
 
+use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
+use harness::stats::BenchError;
 use harness::tier::{
-    build_corpus, build_ollama_client, judge, opt_in_requested, parse_host, parse_max_p95_ms,
-    parse_model_name, parse_port, TierSamples, TierThresholds,
+    build_corpus, build_ollama_client, judge, opt_in_requested, parse_host,
+    parse_max_invalid_response_trials, parse_max_p95_ms, parse_model_name, parse_port, TierSamples,
+    TierThresholds, MAX_INVALID_RESPONSE_TRIALS_CAP,
 };
 
 use std::time::Duration;
@@ -157,6 +160,10 @@ fn passing_samples() -> TierSamples {
         precision_e2e: vec![Duration::from_millis(90); 20],
         dialogue_routing_matched: true,
         precision_routing_matched: true,
+        dialogue_expansion_invalid_responses: 0,
+        dialogue_e2e_invalid_responses: 0,
+        precision_expansion_invalid_responses: 0,
+        precision_e2e_invalid_responses: 0,
     }
 }
 
@@ -166,6 +173,7 @@ fn generous_thresholds() -> TierThresholds {
         dialogue_e2e_max_p95: Duration::from_millis(50),
         precision_expansion_max_p95: Duration::from_millis(80),
         precision_e2e_max_p95: Duration::from_millis(150),
+        max_invalid_response_trials: 3,
     }
 }
 
@@ -198,6 +206,338 @@ fn judge_rejects_empty_samples() {
     let mut samples = passing_samples();
     samples.dialogue_expansion = vec![];
     assert!(judge(&samples, &generous_thresholds()).is_err());
+}
+
+// --- 不正応答（`InvalidResponse`）試行の除外数上限（TASK-116・Issue #316） ---
+
+#[test]
+fn judge_reports_invalid_response_ok_within_cap() {
+    let mut samples = passing_samples();
+    samples.dialogue_expansion_invalid_responses = 3;
+    let judgment = judge(&samples, &generous_thresholds()).expect("non-empty samples");
+    assert!(judgment.invalid_response_ok);
+    assert!(judgment.all_passed());
+}
+
+/// `invalid_response_ok` は `all_passed()` の AND 条件に含める（PR #329
+/// codex-review P2 対応・Issue #316）。実測経路では `run_fallible` が計測時点で
+/// 上限超過を先に検知し `BenchError::ExcludedTrialsExceeded` として判定到達前に
+/// 打ち切るため `judge` に上限超過状態が渡ることは無いが、`TierSamples` を
+/// 直接構築して `judge` を単独で呼び出す経路（本テスト）でも判定 API 自体が
+/// fail-closed であることを固定する。
+#[test]
+fn judge_reports_invalid_response_not_ok_when_cap_exceeded_and_fails_all_passed() {
+    let mut samples = passing_samples();
+    samples.dialogue_expansion_invalid_responses = 4; // cap is 3 (generous_thresholds)
+    let judgment = judge(&samples, &generous_thresholds()).expect("non-empty samples");
+    assert!(!judgment.invalid_response_ok);
+    assert!(!judgment.all_passed());
+}
+
+// --- parse_max_invalid_response_trials ---
+
+#[test]
+fn parse_max_invalid_response_trials_accepts_zero_and_positive() {
+    assert_eq!(parse_max_invalid_response_trials("0", "VAR").unwrap(), 0);
+    assert_eq!(parse_max_invalid_response_trials("3", "VAR").unwrap(), 3);
+}
+
+#[test]
+fn parse_max_invalid_response_trials_rejects_empty_non_integer_and_negative() {
+    assert!(parse_max_invalid_response_trials("", "VAR").is_err());
+    assert!(parse_max_invalid_response_trials("   ", "VAR").is_err());
+    assert!(parse_max_invalid_response_trials("abc", "VAR").is_err());
+    assert!(parse_max_invalid_response_trials("-1", "VAR").is_err());
+    assert!(parse_max_invalid_response_trials("1.5", "VAR").is_err());
+}
+
+// codex-review P2 指摘（PR #329・Issue #316）: 巨大値を許すと `run_fallible` の
+// 除外率ガードが事実上無効化されるため、固定上限ちょうどは受理・超過は拒否する
+// ことを固定する。
+#[test]
+fn parse_max_invalid_response_trials_accepts_cap_and_rejects_above_cap() {
+    assert_eq!(
+        parse_max_invalid_response_trials(&MAX_INVALID_RESPONSE_TRIALS_CAP.to_string(), "VAR")
+            .unwrap(),
+        MAX_INVALID_RESPONSE_TRIALS_CAP
+    );
+    assert!(parse_max_invalid_response_trials(
+        &(MAX_INVALID_RESPONSE_TRIALS_CAP + 1).to_string(),
+        "VAR"
+    )
+    .is_err());
+}
+
+// --- classify_core_error ---
+
+mod classify_core {
+    use super::harness::tier::classify_core_error;
+    use super::TrialFailure;
+    use engine::core::CoreError;
+    use engine::query_planner::PlanError;
+
+    #[test]
+    fn invalid_response_is_excluded() {
+        let err = CoreError::QueryPlanning(PlanError::InvalidResponse);
+        assert_eq!(classify_core_error(&err), TrialFailure::Excluded);
+    }
+
+    #[test]
+    fn timeout_and_unavailable_are_fatal() {
+        assert_eq!(
+            classify_core_error(&CoreError::QueryPlanning(PlanError::Timeout)),
+            TrialFailure::Fatal
+        );
+        assert_eq!(
+            classify_core_error(&CoreError::QueryPlanning(PlanError::Unavailable)),
+            TrialFailure::Fatal
+        );
+    }
+}
+
+// --- classify_sql_error ---
+//
+// 実経路の detail 文字列（`core.rs::plan_using_plan_expansion` が
+// `SqlSurfaceError::Internal { detail: format!("USING PLAN query expansion
+// failed: {CoreError}") }` へ丸め込む）との整合を、`execute_sql` 経由の e2e で
+// 固定する（`classify_sql_error` を手構築した `SqlSurfaceError` に対してのみ
+// 検証すると、実経路の detail 文字列とドリフトしても検知できないため）。
+mod classify_sql {
+    use super::harness::tier::{classify_sql_error, using_plan_statement};
+    use super::TrialFailure;
+    use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+    use engine::core::EngineCore;
+    use engine::embedding::HashingEmbedder;
+    use engine::kernel::CpuScalarProvider;
+    use engine::policy::PolicyContext;
+    use engine::query_planner::{LlmClient, PlanError};
+    use engine::recovery::required_op_id::OperationId;
+    use engine::row_codec::Value;
+    use engine::sql::allowlist::SqlSurfaceError;
+    use engine::storage::{Storage, Visibility};
+
+    use super::temp_db::{unique_db_path, CleanupGuard};
+
+    const TABLE: &str = "tier_bench_docs";
+    const DIM: u32 = 4;
+    const TOP_K: usize = 3;
+    const TENANT_ID: &str = "bench-tenant";
+    const QUESTION: &str = "open src/module.rs and check it";
+
+    fn schema() -> TableSchema {
+        TableSchema::new(
+            TABLE,
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        )
+    }
+
+    /// 不正 JSON を返すスタブ（`PlanError::InvalidResponse` を誘発する。
+    /// `query_planner.rs` の応答パース契約: JSON として解釈できない応答は
+    /// `InvalidResponse`）。
+    struct InvalidJsonStubLlmClient;
+
+    impl LlmClient for InvalidJsonStubLlmClient {
+        fn complete(&self, _prompt: &str) -> Result<String, PlanError> {
+            Ok("not valid json".to_string())
+        }
+    }
+
+    fn seeded_core_with_planner(
+        path: &std::path::Path,
+        planner: impl LlmClient + 'static,
+    ) -> (EngineCore, PolicyContext) {
+        let storage = Storage::open(path).expect("open storage");
+        storage.create_table(&schema()).expect("create table");
+        let ctx = PolicyContext::new(TENANT_ID).expect("valid tenant id");
+
+        let embedding = vec![0.1_f32; DIM as usize];
+        let op_id = OperationId::parse("tier-classify-sql-seed-0").expect("valid operation_id");
+        engine::tenant::insert_typed_row(
+            &storage,
+            TABLE,
+            &ctx,
+            0,
+            Visibility::Public,
+            &[
+                Value::Vector(embedding),
+                Value::Text("corpus/doc_0.txt".to_string()),
+                Value::Text("synthetic document body".to_string()),
+            ],
+            &op_id,
+        )
+        .expect("seed row insert");
+
+        let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider))
+            .with_embedder(Box::new(HashingEmbedder::new(DIM).expect("valid dim")))
+            .with_query_planner(Box::new(planner));
+        (core, ctx)
+    }
+
+    /// 本テストの核心（Issue #316）: `execute_sql`（`USING PLAN` 経路）が
+    /// LLM 不正応答で失敗した場合、その `SqlSurfaceError` が
+    /// `classify_sql_error` によって `Excluded` に分類されることを、実際の
+    /// `plan_using_plan_expansion` 経由で固定する（手構築した
+    /// `SqlSurfaceError` への分類のみでは実経路とのドリフトを検知できない）。
+    #[test]
+    fn invalid_json_llm_response_via_execute_sql_is_classified_excluded() {
+        let path = unique_db_path("tier-classify-sql-invalid-json");
+        let _guard = CleanupGuard(path.clone());
+        let (core, ctx) = seeded_core_with_planner(&path, InvalidJsonStubLlmClient);
+
+        let sql = using_plan_statement(TABLE, QUESTION, TOP_K);
+        let err = core
+            .execute_sql(&ctx, &sql)
+            .expect_err("invalid JSON LLM response must fail USING PLAN dispatch");
+        assert_eq!(classify_sql_error(&err), TrialFailure::Excluded);
+    }
+
+    /// `Internal` の別 detail（不正応答に由来しない内部エラー）は `Fatal`
+    /// のまま（除外条件を広げすぎて他の内部エラーまで誤って除外しない）。
+    #[test]
+    fn internal_error_with_unrelated_detail_is_fatal() {
+        let err = SqlSurfaceError::Internal {
+            detail: "no embedder configured for USING PLAN".to_string(),
+        };
+        assert_eq!(classify_sql_error(&err), TrialFailure::Fatal);
+    }
+
+    /// `InvalidInput`（許可リスト・束縛段の意味論エラー）は `Internal` ではない
+    /// ため、常に `Fatal`（除外条件が `Internal` variant 限定であることを固定）。
+    #[test]
+    fn invalid_input_is_fatal() {
+        let err = SqlSurfaceError::InvalidInput {
+            detail: "some validation failure".to_string(),
+        };
+        assert_eq!(classify_sql_error(&err), TrialFailure::Fatal);
+    }
+}
+
+// --- run_fallible ---
+
+mod run_fallible_tests {
+    use super::{run_fallible, BenchError, MeasurementConfig, TrialFailure};
+
+    fn config() -> MeasurementConfig {
+        MeasurementConfig::new(20, 20, 0).expect("protocol minimums satisfied")
+    }
+
+    fn classify(_: &&str) -> TrialFailure {
+        TrialFailure::Excluded
+    }
+
+    #[test]
+    fn all_success_yields_measured_iterations_samples() {
+        let mut calls = 0u32;
+        let result = run_fallible::<(), &str>(
+            &config(),
+            0,
+            || {
+                calls += 1;
+                Ok(())
+            },
+            classify,
+        )
+        .expect("all-success run must satisfy protocol minimums");
+        assert_eq!(result.measurement.samples.len(), 20);
+        assert_eq!(result.measured_attempts, 20);
+        assert_eq!(result.measured_excluded, 0);
+        assert_eq!(result.warmup_excluded, 0);
+        // warmup 20 回 + 計測 20 回。
+        assert_eq!(calls, 40);
+    }
+
+    /// 除外試行が上限以内なら追加試行で埋め合わせ、有効サンプル数はちょうど
+    /// `measured_iterations` になる（Issue #316 設計判断: 「有効サンプル数
+    /// 固定・試行回数可変」方式）。
+    #[test]
+    fn excluded_trials_within_cap_are_backfilled_to_full_sample_count() {
+        let mut attempt = 0u32;
+        let result = run_fallible::<(), &str>(
+            &config(),
+            3,
+            move || {
+                attempt += 1;
+                // 計測フェーズの 5・10・15 回目の試行のみ Excluded（3 回。上限
+                // ちょうど）。warmup フェーズ（先に 20 回消費）には影響しない
+                // よう、warmup 完了後の呼び出し番号のみで判定する。
+                if attempt > 20 && (attempt - 20).is_multiple_of(5) && attempt <= 20 + 15 {
+                    Err("invalid response")
+                } else {
+                    Ok(())
+                }
+            },
+            classify,
+        )
+        .expect("exclusions within cap must still reach full sample count");
+        assert_eq!(result.measurement.samples.len(), 20);
+        assert_eq!(result.measured_excluded, 3);
+        // 20 件の有効サンプル + 3 件の除外 = 23 回の計測試行。
+        assert_eq!(result.measured_attempts, 23);
+    }
+
+    #[test]
+    fn excluded_trials_exceeding_cap_return_err() {
+        let result = run_fallible::<(), &str>(&config(), 2, || Err("invalid response"), classify);
+        match result {
+            Err(BenchError::ExcludedTrialsExceeded {
+                excluded,
+                max_excluded,
+            }) => {
+                assert_eq!(excluded, 3);
+                assert_eq!(max_excluded, 2);
+            }
+            other => panic!("expected ExcludedTrialsExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fatal_trial_returns_err_immediately() {
+        fn classify_fatal(_: &&str) -> TrialFailure {
+            TrialFailure::Fatal
+        }
+        let mut calls = 0u32;
+        let result = run_fallible::<(), &str>(
+            &config(),
+            5,
+            || {
+                calls += 1;
+                Err("timeout")
+            },
+            classify_fatal,
+        );
+        assert!(matches!(result, Err(BenchError::FatalTrial(_))));
+        // warmup フェーズの 1 回目で即座に打ち切られる（計測フェーズへ進まない）。
+        assert_eq!(calls, 1);
+    }
+
+    /// warmup フェーズの `Excluded` は上限に数えない（`warmup_excluded` へのみ
+    /// 加算し、計測フェーズの `max_excluded` 判定へは影響しない）。
+    #[test]
+    fn warmup_excluded_trials_are_not_counted_against_the_measured_cap() {
+        let mut attempt = 0u32;
+        let result = run_fallible::<(), &str>(
+            &config(),
+            0,
+            move || {
+                attempt += 1;
+                if attempt <= 20 {
+                    // warmup 20 回すべて Excluded。
+                    Err("invalid response")
+                } else {
+                    Ok(())
+                }
+            },
+            classify,
+        )
+        .expect("warmup exclusions must not count against the measured-phase cap");
+        assert_eq!(result.warmup_excluded, 20);
+        assert_eq!(result.measured_excluded, 0);
+        assert_eq!(result.measurement.samples.len(), 20);
+    }
 }
 
 // --- 層A相当: 計測質問の production classify() 結果を固定 --------------------

@@ -165,6 +165,8 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 常駐 Ollama を持つ環境で `make bench-tier` を実行してください。必要な opt-in・接続・閾値 env の一覧（変数名と用途のみ。値は含みません）は `cargo bench --bench tier_latency_bench -p engine -- --help` で表示されます。未設定・不正値のまま opt-in（`BENCH_TIER` 設定）した場合は fail-closed で不足している env 名を含む明示エラーとして表示されます。値そのもの・p95 上限は spec 由来のため本リポジトリには記載しません。
 
+常駐 Ollama の応答形式は非決定的で、`PlanError::InvalidResponse`（LLM 不正応答）が試行中に発生することがあります（Issue #316）。本ベンチはこれを除外対象として扱い、規定の有効サンプル数に達するまで追加試行で埋め合わせます（`Timeout`／`Unavailable` 等は従来どおり致命エラーとして即座に非ゼロ終了します）。段ごとの除外数上限は任意 env `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS`（未設定時は本リポ既定値、固定上限値 1000 を超える値は fail-closed で拒否）で調整でき、上限を超えた場合は該当段名を含む非ゼロ終了メッセージとともに判定未到達のまま終了します。標準出力には各段の試行回数・除外回数（`attempts=… invalid_responses=…`）を記録します（p95 上限は引き続き非出力）。詳細は `docs/design/tier-latency-acceptance.md`「不正応答試行の扱い」節を参照してください。
+
 実測値（p95 の数値）そのものは public な `docs/design/tier-latency-acceptance.md` へ転記せず、非公開記録先へ保存してください。同ドキュメントの「実測状態」節には各判定の「実施済み/未実施」「pass/fail」「routing 一致/不一致」という非数値の状態のみを更新してください。判定ロジック層（時間非依存の純関数）のみ `crates/engine/tests/tier_latency_accept.rs` として `make ci` 対象です。設計判断の記録は `docs/design/tier-latency-acceptance.md` を参照してください。
 
 ### `USING PLAN` wire 経由受け入れ基準の実測準備（TASK-117）

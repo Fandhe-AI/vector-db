@@ -138,3 +138,124 @@ pub fn run<T>(
     let summary = stats::summarize(&samples)?;
     Ok(Measurement { summary, samples })
 }
+
+/// [`run_fallible`] が 1 試行の失敗をどう扱うかを表す分類（TASK-116・Issue #316）。
+/// 呼び出し元（`tier_latency_bench.rs`）が `classify` クロージャで各エラー値を
+/// 本 enum へ写像する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialFailure {
+    /// 有効サンプルに数えず、追加試行で埋め合わせる対象（例: LLM の不正応答
+    /// `PlanError::InvalidResponse`）。除外数には段ごとの上限（`max_excluded`）が
+    /// あり、超過は `BenchError::ExcludedTrialsExceeded`。
+    Excluded,
+    /// p95 判定を fail-open にしないため除外しない致命エラー（例: `Timeout`・
+    /// `Unavailable`）。即座に `BenchError::FatalTrial` として計測全体を打ち切る。
+    Fatal,
+}
+
+/// [`run_fallible`] の結果。時間統計に加え、試行回数・除外回数の内訳を保持する
+/// （`tier_latency_bench.rs` が段ごとに `attempts=… invalid_responses=…` として
+/// 出力するために使う。p95 上限自体は含まないため出力しても閾値漏えいにならない）。
+#[derive(Debug, Clone)]
+pub struct FallibleMeasurement {
+    pub measurement: Measurement,
+    /// 計測フェーズで実際に行った試行回数（成功・除外を問わない）。
+    pub measured_attempts: u32,
+    /// 計測フェーズで `Excluded` と分類された試行数。
+    pub measured_excluded: u32,
+    /// warmup フェーズで `Excluded` と分類された試行数（合否には数えない。
+    /// モジュールドキュメント・呼び出し元の設計判断コメント参照）。
+    pub warmup_excluded: u32,
+}
+
+/// warmup フェーズ（計測しない）ののち、失敗許容の計測フェーズを実行する
+/// （TASK-116・Issue #316: `tier_latency_bench.rs` が LLM 不正応答〔`Excluded`〕を
+/// 交えても既定の有効サンプル数（`config.measured_iterations`）に到達できるよう
+/// 一般化した計測プリミティブ。既存 [`run`] の契約・挙動は変更しない）。
+///
+/// - warmup: `config.warmup_iterations` 回試行する。`Excluded` は
+///   `warmup_excluded` へ加算するのみ（合否に数えない）。`Fatal` は直ちに
+///   `Err(FatalTrial)` で打ち切る（warmup 中の致命エラーも計測を継続しない）。
+/// - 計測: 有効サンプル（`Ok`）が `config.measured_iterations` 件に達するまで
+///   試行を続ける。`Excluded` が `max_excluded` を超えた時点で
+///   `Err(ExcludedTrialsExceeded)`。`Fatal` は直ちに `Err(FatalTrial)`。
+///
+/// 試行総数の上限は `config.measured_iterations.checked_add(max_excluded)`
+/// （coding-rust.md「整数演算は `checked_*`／`saturating_*` を使う」対応。
+/// オーバーフロー時は `BenchError::ProtocolViolation` で拒否し、無限ループを
+/// 防ぐ）。`workload` の呼び出し規約（`black_box` の位置・同期完了の責務）は
+/// [`run`] と同一。
+pub fn run_fallible<T, E: std::fmt::Display>(
+    config: &MeasurementConfig,
+    max_excluded: u32,
+    mut workload: impl FnMut() -> Result<T, E>,
+    classify: impl Fn(&E) -> TrialFailure,
+) -> Result<FallibleMeasurement, BenchError> {
+    let attempt_bound = config.measured_iterations.checked_add(max_excluded).ok_or(
+        BenchError::ProtocolViolation("measured_iterations + max_excluded overflows u32"),
+    )?;
+
+    let mut warmup_excluded: u32 = 0;
+    for _ in 0..config.warmup_iterations {
+        match black_box(workload()) {
+            Ok(v) => {
+                black_box(v);
+            }
+            Err(e) => match classify(&e) {
+                TrialFailure::Excluded => warmup_excluded += 1,
+                TrialFailure::Fatal => return Err(BenchError::FatalTrial(format!("{e}"))),
+            },
+        }
+    }
+
+    let mut samples = Vec::with_capacity(config.measured_iterations as usize);
+    let mut measured_excluded: u32 = 0;
+    let mut measured_attempts: u32 = 0;
+
+    while samples.len() < config.measured_iterations as usize {
+        if measured_attempts >= attempt_bound {
+            // 上限は measured_iterations + max_excluded なので、ここに到達するのは
+            // 除外数が max_excluded を超えた場合のみ（Excluded 分類のたびに下の
+            // if で早期 Err を返すため、通常は到達しないガード。防御的に残す）。
+            return Err(BenchError::ExcludedTrialsExceeded {
+                excluded: measured_excluded,
+                max_excluded,
+            });
+        }
+        measured_attempts += 1;
+        let start = Instant::now();
+        let result = black_box(workload());
+        match result {
+            // 成功値は `run` と同じく所有値を `black_box` へ渡して計測区間の内側で
+            // drop してから `elapsed` を取る（codex-review 指摘・PR #329。以前は
+            // `elapsed()` 取得後に `black_box(&v)` していたため drop が計測区間外に
+            // なり、ヒープ所有値を返す workload では `run` より短い値を記録して
+            // A/B 比較を歪めていた）。
+            Ok(v) => {
+                black_box(v);
+                let elapsed = start.elapsed();
+                samples.push(elapsed);
+            }
+            Err(e) => match classify(&e) {
+                TrialFailure::Excluded => {
+                    measured_excluded += 1;
+                    if measured_excluded > max_excluded {
+                        return Err(BenchError::ExcludedTrialsExceeded {
+                            excluded: measured_excluded,
+                            max_excluded,
+                        });
+                    }
+                }
+                TrialFailure::Fatal => return Err(BenchError::FatalTrial(format!("{e}"))),
+            },
+        }
+    }
+
+    let summary = stats::summarize(&samples)?;
+    Ok(FallibleMeasurement {
+        measurement: Measurement { summary, samples },
+        measured_attempts,
+        measured_excluded,
+        warmup_excluded,
+    })
+}

@@ -2,8 +2,11 @@
 
 - ステータス: Proposed（計測ハーネス・ゲート・opt-in 配線は整備済み。Mac の
   承認済み計測環境での初回実測は 2026-08-29 に実施済み〔下記「実測状態」〕だが、
-  複数回の実行のうち判定前に中断した回があり、中断の扱いが spec 側で未確定〔#316〕のため
-  Accepted 化は保留）
+  複数回の実行のうち判定前に中断した回があった。中断の扱いは Issue #316 で
+  「LLM 不正応答（`InvalidResponse`）試行は除外・上限付きで追加試行に埋め合わせる」
+  として本リポ独自の実装既定値を確定した〔下記「不正応答試行の扱い」節〕が、
+  連続実行で毎回判定に到達することの確認自体は常駐 Ollama を要するためオーナー
+  作業として未実施であり、Accepted 化は保留のまま）
 - 対応: TASK-116（Issue #78。ポインタ: `docs/spec/05-tasks.md`）
 - 前提: TASK-115（PLAN-8。`tiering.rs`・`EngineCore::with_tiered_query_planner`／
   `plan_query_with_classification`）・TASK-110（PLAN-1。`query_planner.rs`）・
@@ -94,15 +97,67 @@ LLM 応答が展開結果として解釈できない形式（`InvalidResponse`�
 p95 の実測値・閾値・使用モデル名は非公開記録先に保存し、本ドキュメントへは
 転記しない。DGX Spark での実測は未実施。
 
-## PLAN-4/6/7 の判定: 判定保留（判定到達回は pass・中断の扱いが spec 側で未確定）
+## 不正応答（`InvalidResponse`）試行の扱い（Issue #316）
+
+Mac 実測（2026-08-29）で観測した「対話ティアの LLM 応答が展開結果として解釈できない
+形式（`PlanError::InvalidResponse`）で返り、判定前にベンチが中断する」事象への対応を
+Issue #316 で実装した。spec（PLAN-4/6/7 のポインタ）には不正応答試行の扱いが定義
+されていないため、**spec の受け入れ基準を変更・具体化せず、本リポ独自の「ベンチ
+実装既定値」**（`docs/design/query-tiering-criteria.md` の判定基準と同じ位置づけ）
+として以下を採用する:
+
+1. **除外対象は `InvalidResponse` のみ**。`Timeout`／`Unavailable`／
+   `ResponseTooLarge` 等の他エラーは従来どおり致命扱い（除外すると p95 判定が
+   fail-open になるため）。`crates/engine/benches/harness/tier.rs::classify_core_error`／
+   `classify_sql_error` が分類する。
+2. **不正応答試行は「失敗試行」として記録し p95 サンプルから除外、規定の有効
+   サンプル数に達するまで追加試行する**（リトライではなく「有効サンプル数固定・
+   試行回数可変」方式）。`crates/engine/benches/harness/protocol.rs::run_fallible`
+   が実装する。
+3. **除外数に段ごとの上限を設ける**。既定値は `harness::tier::
+   DEFAULT_MAX_INVALID_RESPONSE_TRIALS`、任意 env `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS`
+   で上書き可能（値そのものは spec 由来の数値基準ではなく本リポ実装既定値のため
+   本ドキュメントに記載してよい範囲だが、`README.md` の実測手順にのみ言及し、
+   ここでは変数名のみを記す）。上限超過は `run_fallible` が
+   `BenchError::ExcludedTrialsExceeded` を返し、`tier_latency_bench.rs` は該当段名
+   を含む非ゼロ終了メッセージとともに判定未到達のまま終了する。
+   `harness::tier::TierJudgment::invalid_response_ok`／`judge` にも同じ上限判定を
+   実装し、`all_passed()` の AND 条件に含める（PR #329 codex-review P2 対応）。
+   実測経路では `run_fallible` が計測時点で上限超過を先に検知し判定到達前に
+   打ち切るため冗長になるが、`judge` は `TierSamples` を直接構築して単独で
+   呼び出すこともできる公開 API であり、判定 API 自体を fail-closed に保つため
+   `all_passed()` から除外しない（「不正応答率を spec の判定項目に含めるか」は
+   オーナー判断として残し、本実装はベンチ側ガード〔除外率上限〕に留める）。
+4. **試行回数・除外回数は標準出力に出す**（本リポ既定値であり spec 閾値ではない
+   ため出力可。p95 上限は従来どおり非出力）。
+5. **warmup フェーズの不正応答は上限判定に数えない**（件数のみ `warmup_excluded`
+   として記録。warmup 中の致命エラーは即終了）。
+6. **`BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS` には固定上限を設ける**
+   （`harness::tier::MAX_INVALID_RESPONSE_TRIALS_CAP`。codex-review P2 指摘・
+   PR #329・Issue #316）。上限が無いと巨大値を設定した run で `run_fallible` の
+   試行上限（`measured_iterations + max_excluded`）が事実上無制限になり、LLM が
+   不正応答を返し続ける状況で除外率ガードが無効化され無期限に近い再試行が発生
+   しうる。上限超過は `harness::tier::parse_max_invalid_response_trials` が
+   fail-closed で拒否する。
+
+実装・テストは `crates/engine/benches/harness/protocol.rs`（`run_fallible`）・
+`crates/engine/benches/harness/tier.rs`（分類関数・既定値・env パーサ）・
+`crates/engine/benches/tier_latency_bench.rs`（4 段への結線）・
+`crates/engine/tests/tier_latency_accept.rs`（時間非依存の回帰。実際の
+`plan_using_plan_expansion` 経由の detail 文字列整合を固定する e2e を含む）。
+production コード（`crates/engine/src/`）は無変更。
+
+## PLAN-4/6/7 の判定: 判定保留（判定到達回は pass・連続実行での判定到達確認は未実施）
 
 Mac の承認済み計測環境での初回実測では、判定に到達した回はすべて `pass`・記録対象の
 routing は `一致` だったが、連続実行の一部は LLM 応答形式の非決定性により判定前に
 中断している（「実測状態」節）。受け入れ条件は spec（PLAN-4/6/7）が SSOT であり本
-ドキュメントでは変更・具体化しない。判定前に中断した実行を受け入れ判定上どう扱うかは
-spec 側で未確定（#316）のため、**今回の実測に限った暫定判断として** PLAN-4/6/7 を
-**確定せず判定保留**とする。#316 でオーナーが確定した後に再実測し、spec の条件で
-充足と判断できれば本ドキュメントを Accepted に更新する（TASK-83 の ADR と同じ流儀）。
+ドキュメントでは変更・具体化しない。中断への対応（除外・上限付き追加試行）は
+Issue #316 で本リポ独自の実装既定値として確定した（上記「不正応答試行の扱い」節）が、
+**この対応を適用した状態で連続実行しても毎回判定に到達するか自体は未確認**のため、
+**今回の実測に限った暫定判断として** PLAN-4/6/7 を**確定せず判定保留**とする。
+連続実行での判定到達確認をオーナーが実施した後に再実測し、spec の条件で充足と
+判断できれば本ドキュメントを Accepted に更新する（TASK-83 の ADR と同じ流儀）。
 
 ## 実測手順（オーナー作業）
 
@@ -120,20 +175,22 @@ spec 側で未確定（#316）のため、**今回の実測に限った暫定判
 いずれか `fail` または `routing 不一致` の場合も、数値は書かず「実施済み」「fail」等の
 状態のみを表へ反映する。
 
-実行が判定前に中断した場合（`InvalidResponse` 等の LLM 応答不正による panic）の
-扱いは spec 側で未確定（#316）のため、中断の有無・要因を非数値の状態（「中断あり」
+Issue #316 の対応後、除外上限内の `InvalidResponse` は追加試行で埋め合わされ判定へ
+到達する（除外上限超過時のみ非ゼロ終了。上記「不正応答試行の扱い」節）。それでもなお
+判定前に非ゼロ終了した場合（除外上限超過・`Timeout`／`Unavailable` 等の致命エラー）は、
+段名を含む終了メッセージとともに中断の有無・要因を非数値の状態（「中断あり」
 「到達回あり／未到達回あり」）として表・本文へ記録するに留め、Accepted 更新は行わず
-オーナー判断（#316）へ回す（実行回数・中断回数は非公開記録先へ）。
-`.github/workflows/bench.yml` に `bench-tier` ジョブは存在しない（GitHub ホステッド
-runner に常駐 Ollama が無く、self-hosted は組織承認済み例外の範囲外のため。PR #269
-Codex 指摘）。
+オーナーが連続実行で毎回判定に到達することを確認したうえで判断する（実行回数・中断
+回数は非公開記録先へ）。`.github/workflows/bench.yml` に `bench-tier` ジョブは存在
+しない（GitHub ホステッド runner に常駐 Ollama が無く、self-hosted は組織承認済み
+例外の範囲外のため。PR #269 Codex 指摘）。
 
 ## 制約・スコープ外
 
-- 常駐 Ollama を用意した環境での実測はオーナー作業（Mac は初回実施済み。中断の扱い
-  確定後の再実測・DGX Spark での実測は未実施）
-- ベンチ側での LLM 不正応答（`InvalidResponse`）時の扱い（リトライ・除外・判定項目化）
-  の定義は #316 の管轄
+- 常駐 Ollama を用意した環境での実測はオーナー作業（Mac は初回実施済み。Issue #316
+  対応後の連続実行での判定到達確認・DGX Spark での実測は未実施）
+- `query_planner.rs` 側のプロンプト・応答パースの堅牢化（不正応答の発生自体を減らす
+  対応）は Issue #316 の管轄外・別 Issue の管轄
 - wire 経由・3 クライアントでのレイテンシ検証は TASK-117（PLAN-9）の管轄
 - 実測値が基準を満たさない場合のチューニング（プロンプト・モデル選定・タイムアウト
   調整等）は別 Issue の管轄
@@ -147,3 +204,4 @@ Codex 指摘）。
 - `crates/engine/benches/tier_latency_bench.rs`・`crates/engine/benches/harness/tier.rs`
 - `crates/engine/tests/tier_latency_accept.rs`
 - `docs/design/c1-p95-dedicated-env-reverification.md`（同型の再測定・判断記録 ADR の前例）
+- Issue #316（LLM 不正応答試行の除外・上限ガードの設計判断）

@@ -25,6 +25,19 @@ pub enum BenchError {
     /// 文字列化して保持する（動的な理由文字列を要するため他の variant の `&'static str`
     /// では表現できない）。
     ExternalEngine(String),
+    /// 失敗許容計測（[`super::protocol::run_fallible`]。TASK-116・Issue #316）で、
+    /// 除外対象と分類された試行（`TrialFailure::Excluded`）が段ごとの上限
+    /// （`max_excluded`）を超えた。有効サンプル数を規定回数まで満たせなかった
+    /// ことを示す fail-closed なエラーであり、呼び出し元（`tier_latency_bench.rs`）
+    /// はこれを判定未到達として非ゼロ終了する。
+    ExcludedTrialsExceeded { excluded: u32, max_excluded: u32 },
+    /// 失敗許容計測で、除外対象ではない試行が失敗した（`TrialFailure::Fatal`）。
+    /// `PlanError::Timeout`／`PlanError::Unavailable` 等、p95 判定を fail-open に
+    /// しないため除外しない致命エラーが該当する（Issue #316 設計方針: 除外対象は
+    /// `InvalidResponse` のみ）。理由文字列は呼び出し元エラー型の `Display`
+    /// （固定文言のみ・LLM 応答本文を含まない。`query_planner.rs` の P0 方針を
+    /// 維持）から構成する。
+    FatalTrial(String),
 }
 
 impl std::fmt::Display for BenchError {
@@ -39,6 +52,18 @@ impl std::fmt::Display for BenchError {
             }
             BenchError::ExternalEngine(reason) => {
                 write!(f, "external engine error: {reason}")
+            }
+            BenchError::ExcludedTrialsExceeded {
+                excluded,
+                max_excluded,
+            } => {
+                write!(
+                    f,
+                    "excluded trials exceeded limit: excluded={excluded} max_excluded={max_excluded}"
+                )
+            }
+            BenchError::FatalTrial(reason) => {
+                write!(f, "fatal trial error: {reason}")
             }
         }
     }
