@@ -48,6 +48,16 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
     "wgsl",
 ] }
 
+# Issue #333（SEARCH-7 方式変更。クロスエンコーダ型リランカーの導入）:
+# `ort = "=2.0.0-rc.13"` + `tokenizers = "=0.23.1"`（optional・`cross-encoder`
+# feature 限定・オーナー承認済み 2026-08-30・Issue #333 案A）の追加を試みたが、
+# `make deny` の advisories チェックが `tokenizers` の推移的依存 `paste`（不使用
+# 化アドバイザリ RUSTSEC-2024-0436）で fail した。実装計画の fail-closed 方針
+# （承認範囲を超える `deny.toml` allow-list 追加・別バージョン採用は行わず、
+# 計画外事項として報告する）に従い、本依存の追加は見送り・`rerank.rs` の
+# `CrossEncoderBackend` trait 抽象化 + スタブ契約テストまでを本 PR の範囲とした
+# （`docs/design/rerank-recall-regression.md`「Issue #333」節参照）。
+
 [features]
 # CORE-5 の対照エンジン（usearch の総当たり `exact_search`）を bench 専用に有効化する
 # feature。`test-support` feature 廃止時（本ファイル上部の redb dev-dependency コメント
