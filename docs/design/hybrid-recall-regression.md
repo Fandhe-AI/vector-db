@@ -297,7 +297,9 @@ tie_group_by`）を追加し、`pool_depth` 境界が同点グループの途中
 hybrid.rs`）。
 `rerank.rs::LexicalOverlapReranker::rank_fused` の `TieRank` 規約統一実装済み
 （`rank_fused` を位置順位から `GroupEnd` へ揃えた。実装の詳細は
-`docs/design/rerank-recall-regression.md`「実測結果」節参照）。
+`docs/design/rerank-recall-regression.md`「実測結果」節参照）。Issue #330 で
+`rank_lexical`（字句一致順位）も同じ GroupEnd 規約へ統一した
+（`docs/design/rerank-recall-regression.md`「Issue #330」節参照）。
 
 **フィクスチャ非変更**: `TEXT_KEYWORD_DROPOUT_PROB`・`VECTOR_KEYWORD_DROPOUT_PROB`・
 `VECTOR_DECOY_PROB` を含む fixture パラメータ・seed・規模定数は本 Issue でも

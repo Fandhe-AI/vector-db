@@ -483,8 +483,9 @@ impl Reranker for IdentityReranker {
 ///
 /// 既定重み（[`LexicalOverlapReranker::default`]）は `fused_weight:lexical_weight
 /// = 3.0:1.0`（fused 優位。Issue #310 対応で変更）。大規模段実測（`crates/engine/
-/// tests/rerank_recall.rs`）で `after_hits20`（388）≥ `baseline_hits20`（387）の
-/// 非劣化を満たす。詳細は `docs/design/rerank-recall-regression.md` 参照。
+/// tests/rerank_recall.rs`）で `after_hits20`（389）≥ `baseline_hits20`（387）の
+/// 非劣化を満たす（389 は Issue #330 対応後の実測値。詳細は
+/// `docs/design/rerank-recall-regression.md` 参照）。
 #[derive(Debug, Clone, Copy)]
 pub struct LexicalOverlapReranker {
     /// RRF 型融合のランク減衰定数（`hybrid::RrfConfig::k_const` と同じ役割）。
@@ -629,16 +630,38 @@ impl Reranker for LexicalOverlapReranker {
             .collect();
 
         // 字句重なり件数の多い順（同点は候補順＝融合スコア降順を保つ安定ソート）で
-        // 並べ替える。並べ替え後の位置（enumerate の rank_idx）がそのまま字句一致順位
-        // rank_lexical（1-based）になるため、BTreeMap 経由の再引きは不要（id 集合の
-        // 不一致による `expect` 到達不能パスをそもそも作らない）。
+        // 並べ替える。
+        //
+        // Issue #330（SEARCH-7 大規模段 improvement@20 ゲート未達の是正）対応:
+        // rank_lexical は並べ替え後の位置（enumerate の rank_idx + 1、以下「位置順位」）
+        // ではなく、`rank_fused_by_idx` と同じグループ末尾順位（GroupEnd）で求める。
+        // 位置順位のままだと、overlap（字句重なり件数）が同点の候補グループ内でも
+        // ソート前の並び順（＝ソート安定性により融合スコア降順）がそのまま順位差に
+        // なってしまい、`fused_weight/(k+rank_fused)` の寄与と二重に効く非対称が
+        // 生じていた。`rank_fused` 側は Issue #310 で `hybrid.rs::TieRank::GroupEnd`
+        // （同点グループは末尾の共通順位）へ統一済みのため、字句側もグループ内の
+        // 全メンバーへ同一順位（グループ末尾の 1-based 位置）を割り当てて同じ規約に
+        // 揃える。詳細・実測値は `docs/design/rerank-recall-regression.md`
+        // 「Issue #330」節参照。
         overlap_ranked.sort_by_key(|entry| std::cmp::Reverse(entry.2));
 
+        // 添字アクセスを避けるため `chunk_by` で overlap 同点グループを連続部分
+        // スライスへ分割し、各グループへグループ末尾の 1-based 順位を一括付与する
+        // （`rerank_candidates` は wire/SQL 表層から到達しうる経路であり、
+        // coding-rust.md の untrusted 入力経路での添字アクセス禁止に合わせる）。
+        let mut rank_lexical_by_idx: Vec<usize> = Vec::with_capacity(overlap_ranked.len());
+        let mut consumed = 0usize;
+        for group in overlap_ranked.chunk_by(|a, b| a.2 == b.2) {
+            consumed += group.len();
+            rank_lexical_by_idx.extend(std::iter::repeat_n(consumed, group.len()));
+        }
+
         let mut scores: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
-        for (rank_idx, (id, rank_fused, _)) in overlap_ranked.iter().enumerate() {
-            let rank_lexical = rank_idx.saturating_add(1);
+        for ((id, rank_fused, _), rank_lexical) in
+            overlap_ranked.iter().zip(rank_lexical_by_idx.iter())
+        {
             let contribution_fused = self.fused_weight / (self.k_const + *rank_fused as f64);
-            let contribution_lexical = self.lexical_weight / (self.k_const + rank_lexical as f64);
+            let contribution_lexical = self.lexical_weight / (self.k_const + *rank_lexical as f64);
             let entry = scores.entry(*id).or_insert(0.0);
             *entry += contribution_fused + contribution_lexical;
         }
@@ -787,6 +810,54 @@ mod tests {
         assert_eq!(hits[0].score, hits[1].score, "must be a true score tie");
         assert_eq!(hits[0].id, 5, "tie must break by ascending id");
         assert_eq!(hits[1].id, 6);
+    }
+
+    #[test]
+    fn lexical_overlap_reranker_lexical_rank_uses_group_end_for_tied_overlap() {
+        // Issue #330: overlap（字句重なり件数）が同点の候補グループには、グループ内の
+        // 全メンバーへ同一の rank_lexical（グループ末尾の 1-based 位置。GroupEnd）を
+        // 割り当てる。位置順位（並べ替え後の enumerate 位置）のままだと、この 3 件は
+        // いずれも overlap=1（"alpha" のみ一致）で同点のはずが id=1・id=2・id=3 の
+        // 順に rank_lexical=1,2,3 と異なる値になり、`contribution_lexical` が
+        // fused_score 降順（＝元の候補順）とは無関係な id ごとの寄与差を生む。
+        // GroupEnd では 3 件とも rank_lexical=3（グループ末尾）を共有するため、
+        // 3 候補間のスコア差は `contribution_fused`（rank_fused の差）のみに由来する
+        // ことを検証する。
+        let cfg = RerankConfig::new(10, 3).unwrap();
+        // fused_score は互いに異なる（rank_fused は 1・2・3 で確定）が、text は
+        // すべて "alpha" のみを含み overlap は 3 件とも 1 で同点にする。
+        let candidates = [
+            cand(1, 3.0, "alpha unrelated"),
+            cand(2, 2.0, "alpha filler"),
+            cand(3, 1.0, "alpha noise"),
+        ];
+        let reranker = LexicalOverlapReranker::new(60.0, 1.0, 1.0).unwrap();
+        let hits = rerank_candidates(&reranker, "alpha", &candidates, &cfg).expect("ok");
+        assert_eq!(hits.len(), 3);
+
+        // GroupEnd では 3 件とも rank_lexical=3 を共有するため、期待スコアは
+        // fused_weight/(k+rank_fused) + lexical_weight/(k+3) で計算できる
+        // （rank_fused は候補順そのまま 1・2・3）。
+        let k = 60.0;
+        let expected = |rank_fused: f64| 1.0 / (k + rank_fused) + 1.0 / (k + 3.0);
+        let by_id = |id: u64| hits.iter().find(|h| h.id == id).expect("id present").score;
+        assert!(
+            (by_id(1) - expected(1.0)).abs() < 1e-9,
+            "id=1 score must match GroupEnd-based expected value"
+        );
+        assert!(
+            (by_id(2) - expected(2.0)).abs() < 1e-9,
+            "id=2 score must match GroupEnd-based expected value"
+        );
+        assert!(
+            (by_id(3) - expected(3.0)).abs() < 1e-9,
+            "id=3 score must match GroupEnd-based expected value"
+        );
+        // 出力順は fused_score 降順のまま保たれる（rank_lexical が全員同一のため
+        // 逆転は起きない）。
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[1].id, 2);
+        assert_eq!(hits[2].id, 3);
     }
 
     #[test]
