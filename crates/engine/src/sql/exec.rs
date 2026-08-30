@@ -525,27 +525,41 @@ pub fn execute_statement(
             row_struct_bytes,
             MAX_CANDIDATE_SCALAR_BYTES,
         )?;
-        let mut kept: Vec<Value> = Vec::new();
-        kept.try_reserve_exact(scanned.len()).map_err(|e| {
-            ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
-        })?;
-        for (idx, slot) in scanned.into_iter().enumerate() {
-            if !needed_column_indices.contains(&idx) {
-                kept.push(Value::Null);
-                continue;
-            }
-            match slot {
-                None => kept.push(Value::Null),
-                Some(t) => {
-                    let owned = try_alloc_text_for_budget(
-                        t,
-                        &mut candidate_scalar_bytes,
-                        MAX_CANDIDATE_SCALAR_BYTES,
-                    )?;
-                    kept.push(Value::Text(owned));
+        // 投影で参照される列が 1 つも無い（`SELECT id ...`。TASK-83 条件7 の C1
+        // 規範形）場合、下のループは全件 `Value::Null` を積むだけになる。その値は
+        // `project_rows` で一切読まれない（`candidate_columns.get(slot)` は存在
+        // 確認のみに使われ、`ProjectedColumn::Id` のみの投影では中身を見ない。
+        // `project_rows` のドキュメント参照）ため、行数分のヒープ確保・push を
+        // 省略できる（Issue #314・SQL-1・TASK-83 条件7: SQL 表層 C1 経路の固定
+        // コスト削減）。`Vec::new()` は容量 0 でヒープ確保しない。スロット添字
+        // 契約（`candidate_columns[slot]` が可視行と 1 対 1）は空 `Vec` でも
+        // `candidate_columns.push` によって維持される。
+        let kept: Vec<Value> = if needed_column_indices.is_empty() {
+            Vec::new()
+        } else {
+            let mut kept: Vec<Value> = Vec::new();
+            kept.try_reserve_exact(scanned.len()).map_err(|e| {
+                ArenaError::AllocationFailed(format!("failed to reserve scalar column slots: {e}"))
+            })?;
+            for (idx, slot) in scanned.into_iter().enumerate() {
+                if !needed_column_indices.contains(&idx) {
+                    kept.push(Value::Null);
+                    continue;
+                }
+                match slot {
+                    None => kept.push(Value::Null),
+                    Some(t) => {
+                        let owned = try_alloc_text_for_budget(
+                            t,
+                            &mut candidate_scalar_bytes,
+                            MAX_CANDIDATE_SCALAR_BYTES,
+                        )?;
+                        kept.push(Value::Text(owned));
+                    }
                 }
             }
-        }
+            kept
+        };
         // `slot` は「これから push される行の添字」（アリーナ側の契約）。ここでの
         // push により `candidate_columns[slot] == kept` が成立する。両者がずれた場合は
         // 後続の投影で誤った行を返しうるため、デバッグビルドで不変条件を固定する。
