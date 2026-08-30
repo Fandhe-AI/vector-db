@@ -586,6 +586,33 @@ fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
     false
 }
 
+/// [`hybrid_search_boosted`] が拡張取得列（`fetch_k` 件。`cfg.pool_depth()` を超え
+/// うる）を [`complete_boundary_tie_group_by`] へ渡す前に行う契約検証（有限性・
+/// ソート順・重複 id）を密・疎で共通化するヘルパ（Issue #320 codex-review P1
+/// 指摘対応）。以前は密側だけがこの拡張列全体を検証しており、疎側は長さのみ
+/// 検証していた。`complete_boundary_tie_group_by` は境界より内側を保持しつつ
+/// 末尾側だけを切り詰める場合があり、切り詰められて消える末尾部分は後段の
+/// [`rrf_fuse_with_limits`] の検証対象に含まれなくなる。疎側だけこの検証を省くと、
+/// 順序違反・重複 id・非有限スコアを含む末尾が疎側でだけ正常な検索結果として
+/// 素通りしてしまう非対称があったため、密・疎いずれも本関数で同じ 3 検証
+/// （有限性 → ソート順 → 重複 id。[`rrf_fuse_with_limits`] と同じ順序）を行う。
+fn validate_extended_pool<T>(
+    items: &[T],
+    score_of: impl Fn(&T) -> f64,
+    id_of: impl Fn(&T) -> u64,
+) -> Result<(), HybridError> {
+    if items.iter().any(|item| !score_of(item).is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+    if !is_sorted_desc_id_asc(items.iter().map(|item| (score_of(item), id_of(item)))) {
+        return Err(HybridError::UnsortedInput);
+    }
+    if has_duplicate_id(items.iter().map(&id_of)) {
+        return Err(HybridError::DuplicateId);
+    }
+    Ok(())
+}
+
 /// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
 /// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
 /// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
@@ -1176,16 +1203,9 @@ pub fn hybrid_search_boosted(
         // 内側を保持しつつ末尾側だけを切り詰める場合があり、切り詰められて消える
         // 末尾部分は後段の [`rrf_fuse_with_limits`] の検証対象に含まれなくなる。
         // fail-closed 方針（coding-rust.md）に従い、切り詰め前の拡張列全体を検証
-        // してから初めて [`complete_boundary_tie_group`] へ渡す）。
-        if hits.iter().any(|hit| !hit.score.is_finite()) {
-            return Err(HybridError::NonFiniteScore);
-        }
-        if !is_sorted_desc_id_asc(hits.iter().map(|h| (f64::from(h.score), h.id))) {
-            return Err(HybridError::UnsortedInput);
-        }
-        if has_duplicate_id(hits.iter().map(|h| h.id)) {
-            return Err(HybridError::DuplicateId);
-        }
+        // してから初めて [`complete_boundary_tie_group`] へ渡す。[`validate_extended_pool`]
+        // ドキュメント参照）。
+        validate_extended_pool(&hits, |h| f64::from(h.score), |h| h.id)?;
         // `hits` が可視集合内で存在しうる密ヒットを全件含む（＝取得済み範囲の末尾が
         // そのまま真の終端であると確定できる）かどうか。`dense_fetch_k` が可視 id
         // 総数以上なら provider はそれ以上返しようがなく、`hits.len() <
@@ -1220,7 +1240,10 @@ pub fn hybrid_search_boosted(
     // `SparseIndex` 内部の doc_id 昇順タイブレークで分断され、密側と同型の id 依存
     // バイアスが残る）。密側と同じ再取得ループ（Issue #320）で `search_within` を
     // 呼び、[`complete_boundary_tie_group_by`] で境界の同点グループの終端確定を
-    // 試みる。
+    // 試みる。密側と対称に、拡張取得列の契約検証（[`validate_extended_pool`]）も
+    // `complete_boundary_tie_group_by` の前に必ず行う（codex-review P1 指摘対応:
+    // 以前は疎側だけ長さ検証のみで、切り詰められて消える末尾の契約違反を検知
+    // できなかった）。
     let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
     let mut sparse_fetch_k = cfg
         .pool_depth()
@@ -1240,6 +1263,7 @@ pub fn hybrid_search_boosted(
                 max: sparse_fetch_k,
             });
         }
+        validate_extended_pool(&hits, |d| d.score, |d| d.doc_id)?;
         // `hits` が可視集合内で存在しうる疎ヒットを全件含む（＝取得済み範囲の末尾が
         // そのまま真の終端であると確定できる）かどうか。密側の `exhaustive` 算出と
         // 同じ判定基準。
@@ -2793,6 +2817,39 @@ mod tests {
             (scores_a[0] - scores_a[1]).abs() < 1e-12,
             "TieRank::GroupEnd により同点グループ内の全メンバーは同一の融合スコア（グループ末尾順位）を持つ"
         );
+    }
+
+    #[test]
+    fn validate_extended_pool_rejects_unsorted_tail_symmetrically_for_dense_and_sparse() {
+        // Issue #320 codex-review P1 指摘対応の回帰固定: 密側専用だった拡張取得列
+        // 全体の契約検証（有限性・ソート順・重複 id）を疎側にも同じ強度で適用した
+        // ことを、密側 `CandidateHit`・疎側 `ScoredDoc` それぞれ同型の入力
+        // （先頭 2 件は降順契約を満たし、3 件目以降に `pool_depth` の切り詰め後には
+        // 残らない末尾の順序違反を仕込む）で対称に固定する。以前は疎側が長さのみ
+        // 検証しており、この種の違反が疎側でだけ正常な検索結果として素通りして
+        // いた。
+        let dense = vec![hit(1, 3.0), hit(2, 2.0), hit(3, 1.0), hit(4, 4.0)];
+        let dense_err =
+            validate_extended_pool(&dense, |h| f64::from(h.score), |h| h.id).unwrap_err();
+        assert_eq!(dense_err, HybridError::UnsortedInput);
+
+        let sparse = vec![doc(1, 3.0), doc(2, 2.0), doc(3, 1.0), doc(4, 4.0)];
+        let sparse_err = validate_extended_pool(&sparse, |d| d.score, |d| d.doc_id).unwrap_err();
+        assert_eq!(sparse_err, HybridError::UnsortedInput);
+    }
+
+    #[test]
+    fn validate_extended_pool_rejects_duplicate_id_symmetrically_for_dense_and_sparse() {
+        // 上記テストと対になるケース: 重複 id（順序契約自体は満たすが id が重複）も
+        // 密・疎双方で同じ [`HybridError::DuplicateId`] を返すことを固定する。
+        let dense = vec![hit(1, 3.0), hit(2, 2.0), hit(2, 2.0)];
+        let dense_err =
+            validate_extended_pool(&dense, |h| f64::from(h.score), |h| h.id).unwrap_err();
+        assert_eq!(dense_err, HybridError::DuplicateId);
+
+        let sparse = vec![doc(1, 3.0), doc(2, 2.0), doc(2, 2.0)];
+        let sparse_err = validate_extended_pool(&sparse, |d| d.score, |d| d.doc_id).unwrap_err();
+        assert_eq!(sparse_err, HybridError::DuplicateId);
     }
 
     #[test]
