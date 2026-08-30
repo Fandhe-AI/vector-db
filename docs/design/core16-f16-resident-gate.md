@@ -113,13 +113,15 @@ f32 と同等〜劣後する結果が観測され、既定規模点の絶対値�
 ## 使い方（規模点診断）
 
 ```sh
-BENCH_BATCH_MAX_DEGRADATION_PCT=<値> BENCH_CORE16_DIAG=1 \
+BENCH_CORE16_DIAG=1 \
   BENCH_CORE16_DIAG_SCALE_INDEX=<0..5> BENCH_VERBOSE=1 make bench-batch
 ```
 
-- `BENCH_BATCH_MAX_DEGRADATION_PCT` は `batch_bench.rs::main` 冒頭で CORE-7
-  ゲート用に無条件で要求される（未設定は fail-closed で診断に到達する前に
-  終了する）。診断のみが目的の実行でも設定が必要。
+- `BENCH_CORE16_DIAG` opt-in 時は `batch_bench.rs::main` が CORE-7/CORE-6/
+  CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して終了
+  する（PR #326 codex-review 指摘対応。「1 プロセス = 1 規模点」節参照）。
+  そのため CORE-7 用の `BENCH_BATCH_MAX_DEGRADATION_PCT` はこの経路では
+  読み取られず、診断のみが目的の実行では設定不要。
 - `BENCH_CORE16_DIAG` 単独（`BENCH_VERBOSE` 未設定）では、`BENCH_VERBOSE` の
   設定を促す 1 行のみを出力し診断は実行しない。
 - `BENCH_CORE16_DIAG` 未設定時は診断コード自体が一切出力しない（既定挙動は
@@ -139,6 +141,11 @@ BENCH_BATCH_MAX_DEGRADATION_PCT=<値> BENCH_CORE16_DIAG=1 \
   1 規模点だけを測定する形へ変更した（方法 A と同型の測定形）。複数規模点間
   の傾向を見たい場合は、`BENCH_CORE16_DIAG_SCALE_INDEX` を変えてプロセスを
   分けて複数回実行すること（同一プロセス内での連続測定はしない）。
+  さらに `main` 側も、`BENCH_CORE16_DIAG` opt-in 時は CORE-7/CORE-6/CORE-16
+  ゲートを一切測定せず選択規模点の診断のみを直ちに実行する構成へ変更した
+  （PR #326 codex-review 指摘対応）。1 規模点に絞っても、先行するゲートの
+  GPU バックエンド構築・破棄・GPU 占有状態が同一プロセス内で診断計測へ
+  持ち越されれば方法 A と同型のクリーンな単独計測にならないため。
 
 ## 検討したが採らなかった案
 

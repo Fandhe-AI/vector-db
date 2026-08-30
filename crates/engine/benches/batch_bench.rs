@@ -104,7 +104,12 @@
 //!   を測定し実測値を出力する。複数規模点を同一プロセス内で連続測定すると比較不能
 //!   なノイズが乗ることを `docs/design/core16-f16-resident-gate.md` の ADR で確認
 //!   済みのため、1 プロセス = 1 規模点とし、規模点間の比較はプロセスを分けて複数回
-//!   実行することで行う。CORE-6/16 ゲート本体とは独立に動作し合否には数えない。
+//!   実行することで行う。さらに `BENCH_CORE16_DIAG` opt-in 時は `main` が CORE-7/
+//!   CORE-6/CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して
+//!   終了する（PR #326 codex-review 指摘対応: 先行するゲートの GPU バックエンド
+//!   構築・破棄・GPU 占有状態が同一プロセス内で診断計測へ持ち越されるのを防ぎ、
+//!   `docs/design/core16-f16-resident-gate.md` が要求する「方法 A と同型のクリーン
+//!   な単独計測」を保つ）。CORE-6/16 ゲート本体とは独立に動作し合否には数えない。
 //!   詳細・本開発環境（NVIDIA/Vulkan）での実測に基づく判断は
 //!   `docs/design/core16-f16-resident-gate.md` を参照。
 
@@ -935,17 +940,37 @@ fn run_dynamic_window_push_drain_diagnostic(rng: &mut DeterministicRng, verbose:
 }
 
 fn main() {
-    let max_degradation_pct = match max_degradation_pct_from_env() {
+    // 実測値の既定非出力（Issue #279）の opt-in ゲート。CI（`GITHUB_ACTIONS`）下では
+    // `verbose_requested_from_env` 自体が fail-closed で拒否するため、ここで検証不能な
+    // 経路を通す前に必ず判定する。
+    let verbose = match verbose_requested_from_env() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
             std::process::exit(1);
         }
     };
-    // 実測値の既定非出力（Issue #279）の opt-in ゲート。CI（`GITHUB_ACTIONS`）下では
-    // `verbose_requested_from_env` 自体が fail-closed で拒否するため、ここで検証不能な
-    // 経路を通す前に必ず判定する。
-    let verbose = match verbose_requested_from_env() {
+
+    // CORE-16 規模点診断（Issue #313）が opt-in されている場合は、CORE-7/CORE-6/
+    // CORE-16 ゲートを一切測定せず、選択規模点の診断のみを直ちに実行して終了する
+    // （PR #326 codex-review 指摘対応: 診断を他ゲートの後に呼ぶと、先行するゲートの
+    // GPU バックエンド構築・破棄・GPU 占有状態が同一プロセス内で診断計測へ持ち越され、
+    // `docs/design/core16-f16-resident-gate.md` が「方法 A と同型の測定形」として
+    // 要求するクリーンな単独計測にならない。1 プロセス = 1 規模点の診断専用実行と
+    // することで、他ゲート測定を経由しない構成に変更した）。CORE-7 用の
+    // `BENCH_BATCH_MAX_DEGRADATION_PCT` もこの経路では読み取らない（CORE-7 自体を
+    // 測定しないため不要）。
+    if opt_in_requested_from_env("BENCH_CORE16_DIAG") {
+        let mut diag_rng = DeterministicRng::new(1);
+        let diag_ctx = PolicyContext::new(BENCH_TENANT).expect("valid tenant");
+        if let Err(msg) = run_core16_scaling_diagnostic(&mut diag_rng, &diag_ctx, verbose) {
+            eprintln!("batch_bench: {msg}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let max_degradation_pct = match max_degradation_pct_from_env() {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("batch_bench: {msg}");
@@ -994,13 +1019,6 @@ fn main() {
     };
     passed &= core6_ok;
     passed &= core16_ok;
-
-    // --- CORE-16 規模点診断（Issue #313。合否には数えない。opt-in 未設定
-    // なら run_core16_scaling_diagnostic 自体が何も出力しない）---
-    if let Err(msg) = run_core16_scaling_diagnostic(&mut rng, &gate_ctx, verbose) {
-        eprintln!("batch_bench: {msg}");
-        std::process::exit(1);
-    }
 
     if !passed {
         eprintln!("batch_bench: acceptance criteria not met (TASK-130 CORE-6/CORE-7/CORE-16)");

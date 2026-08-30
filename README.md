@@ -127,7 +127,7 @@ CORE-7（動的窓集約を経由する単発クエリ経路の p95 劣化上限
 
 `batch_bench.rs` の標準出力は既定で pass/fail と非数値状態のみを書き、実測値・注入した閾値のどちらも出しません（`contrast_bench.rs` の CORE-5 で採用済みの方針を横展開したもの。Issue #279）。実測値（p95・median）が必要な場合は、ローカルまたは承認済み計測環境で `BENCH_VERBOSE=1 make bench-batch` を実行してください。`BENCH_VERBOSE` は `.github/workflows/bench.yml` の `bench-batch` ジョブへは注入しておらず、`GITHUB_ACTIONS` が設定された実行環境では opt-in 自体を bench 側が fail-closed で拒否します（public な Actions ログへ実測値が漏れないための二重化）。
 
-Apple GPU（Metal）環境での CORE-16 fail 報告（Issue #313）を切り分けるための規模点診断は `BENCH_BATCH_MAX_DEGRADATION_PCT=<値> BENCH_CORE16_DIAG=1 BENCH_CORE16_DIAG_SCALE_INDEX=<0..5> BENCH_VERBOSE=1 make bench-batch` で実行できます（`BENCH_CORE16_DIAG` 単独では `BENCH_VERBOSE` の設定を促す 1 行のみ出力し、合否には数えません。`BENCH_BATCH_MAX_DEGRADATION_PCT` は `main` 冒頭で CORE-7 ゲート用に無条件で要求されるため、診断のみが目的でも設定が必要です。複数規模点を同一プロセス内で連続測定すると比較不能なノイズが乗ることを ADR で確認済みのため、`BENCH_CORE16_DIAG_SCALE_INDEX` で 1 回の実行につき 1 規模点のみを選び、規模点間の比較はプロセスを分けて複数回実行してください）。切り分け結果・環境別 pass/fail は `docs/design/core16-f16-resident-gate.md` を参照してください。
+Apple GPU（Metal）環境での CORE-16 fail 報告（Issue #313）を切り分けるための規模点診断は `BENCH_CORE16_DIAG=1 BENCH_CORE16_DIAG_SCALE_INDEX=<0..5> BENCH_VERBOSE=1 make bench-batch` で実行できます（`BENCH_CORE16_DIAG` 単独では `BENCH_VERBOSE` の設定を促す 1 行のみ出力し、合否には数えません。`BENCH_CORE16_DIAG` opt-in 時は `main` が CORE-7/CORE-6/CORE-16 ゲートを一切測定せず選択規模点の診断のみを直ちに実行するため（PR #326 codex-review 指摘対応: 先行ゲートの GPU バックエンド構築・破棄が同一プロセス内で診断計測へ持ち越されるのを防ぐ）、CORE-7 用の `BENCH_BATCH_MAX_DEGRADATION_PCT` はこの経路では不要です。複数規模点を同一プロセス内で連続測定すると比較不能なノイズが乗ることを ADR で確認済みのため、`BENCH_CORE16_DIAG_SCALE_INDEX` で 1 回の実行につき 1 規模点のみを選び、規模点間の比較はプロセスを分けて複数回実行してください）。切り分け結果・環境別 pass/fail は `docs/design/core16-f16-resident-gate.md` を参照してください。
 
 ### C1 p95 専有環境再測定（TASK-83）
 
