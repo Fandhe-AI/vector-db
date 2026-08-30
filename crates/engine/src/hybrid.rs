@@ -677,6 +677,59 @@ fn resolve_boundary_tie_group<T>(
     complete_boundary_tie_group_by(hits, pool_depth, exhaustive, score_of)
 }
 
+/// [`resolve_boundary_tie_group`] が `Undetermined`（境界〔正スコア〕の同点グループが
+/// 取得済み範囲の末尾まで続いており終端未確定）を返し、かつ呼び出し元の再取得ループが
+/// [`MAX_FETCH_K`]（または可視集合の大きさ）の上限に達して再取得の余地がない場合に、
+/// 密・疎の両チャネルから共通に呼ばれる終端処理（Issue #320 codex-review P1 指摘対応）。
+///
+/// 上限に達してもなお境界の同点グループの終端を確定できないとき、観測できた分を
+/// そのまま採用すると、provider/index の同点順序契約（同点は候補識別子昇順で並ぶ。
+/// [`is_sorted_desc_id_asc`]）により、グループが `MAX_FETCH_K` を超えて存在する場合に
+/// 常に「同点グループ内で id が小さい候補だけ」が融合対象として生き残ってしまう
+/// （グループ末尾順位を割り当てる [`TieRank::GroupEnd`] の順位自体も真の末尾より過小に
+/// なる）。これは id への依存であり、境界完全化がそもそも解消しようとしていたバイアスの
+/// 再発になる。
+///
+/// この再発を避けるため、境界の同点グループ全体（グループ開始位置から観測末尾まで）を
+/// 丸ごと除外し、そのグループより上位（スコアが厳密に高い候補）だけを最終結果として
+/// 確定する。除外は同点集合全体に対して対称に効く（グループ内のどの id が採用/除外
+/// されるかという非対称な選別を行わない）ため、id の割り当て（permutation）を変えても
+/// 除外後の集合は変わらない。
+///
+/// このチャネル（密または疎）の結果はそのグループより上位のみとなり、そのグループが
+/// 先頭から始まる退行ケース（`MAX_FETCH_K` 件以上の候補が同一の最高スコア）では
+/// このチャネルの結果が空になりうる。`hybrid_search_boosted` は密・疎いずれか一方が
+/// 空でも他方の結果で融合を継続し（[`rrf_fuse_with_limits`] は空スライスをエラーに
+/// しない）、両チャネルとも空になった場合は空の融合結果を返す（呼び出し元をエラーに
+/// しない）。
+fn exclude_undetermined_boundary_group<T>(
+    items: Vec<T>,
+    pool_depth: usize,
+    score_of: impl Fn(&T) -> f64,
+) -> Vec<T> {
+    if pool_depth == 0 || items.len() < pool_depth {
+        // 呼び出し元契約上（[`resolve_boundary_tie_group`]・
+        // [`complete_boundary_tie_group_by`]）`Undetermined` はこの条件では
+        // 返らないが、関数を全域にするため境界そのものが存在しない場合は
+        // 全件保持で扱う。
+        return items;
+    }
+    // `pool_depth >= 1` かつ `items.len() >= pool_depth` のため
+    // `pool_depth - 1` は常に有効な添字。
+    let boundary_score = score_of(&items[pool_depth - 1]);
+    // 境界の同点グループの開始位置を後方走査で求める（同点は provider/index の
+    // 契約により連続する）。
+    let mut group_start = pool_depth - 1;
+    while group_start > 0
+        && score_of(&items[group_start - 1]).total_cmp(&boundary_score) == std::cmp::Ordering::Equal
+    {
+        group_start -= 1;
+    }
+    let mut items = items;
+    items.truncate(group_start);
+    items
+}
+
 /// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
 /// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
 /// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
@@ -1209,10 +1262,12 @@ pub fn hybrid_search_boosted(
     // [`complete_boundary_tie_group`] が境界の同点グループの終端を確定できなければ
     // （[`TieBoundary::Undetermined`]）、`fetch_k` を倍増して provider を再度呼び、
     // 上限 [`MAX_FETCH_K`]（可視集合の大きさでも有界化）まで終端確定を試みる。
-    // 上限に達してもなお終端確定できない場合は、観測できた同点グループの全メンバーを
-    // そのまま保持する（位置ベースで `pool_depth` 件へ部分採用すると、拡張取得列は
-    // 常に同点 id 昇順のため最小 id だけが根拠なく生き残る id 依存バイアスが残る。
-    // Issue #320 codex-review P1 指摘対応）。
+    // 上限に達してもなお終端確定できない場合は、境界の同点グループ全体を除外する
+    // （[`exclude_undetermined_boundary_group`] ドキュメント参照。位置ベースで
+    // `pool_depth` 件へ部分採用する・観測できた分をそのまま受理するのいずれも、
+    // 拡張取得列が常に同点 id 昇順であることに起因して最小 id 側だけが根拠なく
+    // 生き残る id 依存バイアスが残るため採らない。Issue #320 codex-review P1
+    // 指摘対応）。
     let dense_cap = MAX_FETCH_K.min(input.ids.len());
     let mut dense_fetch_k = cfg
         .pool_depth()
@@ -1283,9 +1338,15 @@ pub fn hybrid_search_boosted(
             TieBoundary::Undetermined(observed) => {
                 if dense_fetch_k >= dense_cap {
                     // 再取得の余地がない（[`MAX_FETCH_K`]・可視集合の大きさに
-                    // 達した）: 観測できた同点グループの全メンバーをそのまま最終
-                    // 結果として受理する（位置ベースの部分採用はしない）。
-                    break (observed, dense_fetch_k);
+                    // 達した）: 境界の同点グループ全体を除外する
+                    // （[`exclude_undetermined_boundary_group`] ドキュメント参照。
+                    // Issue #320 codex-review P1 指摘対応: 観測分をそのまま受理
+                    // すると provider の同点順序〔id 昇順〕依存の偏りが残るため）。
+                    let resolved =
+                        exclude_undetermined_boundary_group(observed, cfg.pool_depth(), |h| {
+                            f64::from(h.score)
+                        });
+                    break (resolved, dense_fetch_k);
                 }
                 dense_fetch_k = dense_fetch_k.saturating_mul(2).min(dense_cap);
             }
@@ -1341,7 +1402,13 @@ pub fn hybrid_search_boosted(
             TieBoundary::Resolved(resolved) => break (resolved, sparse_fetch_k),
             TieBoundary::Undetermined(observed) => {
                 if sparse_fetch_k >= sparse_cap {
-                    break (observed, sparse_fetch_k);
+                    // 密側と対称の終端処理
+                    // （[`exclude_undetermined_boundary_group`] ドキュメント参照）。
+                    let resolved =
+                        exclude_undetermined_boundary_group(observed, cfg.pool_depth(), |d| {
+                            d.score
+                        });
+                    break (resolved, sparse_fetch_k);
                 }
                 sparse_fetch_k = sparse_fetch_k.saturating_mul(2).min(sparse_cap);
             }
@@ -1371,8 +1438,13 @@ pub(crate) enum TieBoundary<T> {
     /// 取得済み範囲の末尾まで境界の同点グループが続いており、かつ可視集合に
     /// まだ未取得の候補が残りうる（非 exhaustive）ため終端を確定できない。
     /// 呼び出し元は `fetch_k` を伸ばして再取得するか（[`MAX_FETCH_K`] 未満なら）、
-    /// 再取得の余地がなければこの列（観測できた同点グループの全メンバー）を
-    /// そのまま最終結果として受理する（部分採用はしない）。
+    /// 再取得の余地がなければこの列をどう扱うかを自身の契約で決める（本型自体は
+    /// 「終端未確定」の事実のみを表し、以降の扱いは規定しない）。production 経路
+    /// （[`hybrid_search_boosted`]）は再取得の余地がない場合に境界の同点グループ
+    /// 全体を除外する（[`exclude_undetermined_boundary_group`] ドキュメント参照。
+    /// 位置ベースの部分採用〔ID 昇順で最小 ID だけが残る〕・観測分をそのまま受理
+    /// する〔グループが [`MAX_FETCH_K`] を超えて存在する場合に同じ id 依存バイアスが
+    /// 残る〕のいずれも採らない）。
     Undetermined(Vec<T>),
 }
 
@@ -3051,5 +3123,171 @@ mod tests {
                 .expect("search ok");
             assert_eq!(first, repeat);
         }
+    }
+
+    #[test]
+    fn exclude_undetermined_boundary_group_removes_only_the_tied_boundary_tail() {
+        // 境界（pool_depth=2・0-based index=1）の score=2.0 同点グループが
+        // observed 列の末尾（id=1,2,4,5）を占める一方、先頭 1 件（id=10・
+        // score=5.0）は境界より上位で同点グループに含まれない。除外後は
+        // 境界より上位の候補のみが残る。
+        let items = vec![
+            hit(10, 5.0),
+            hit(1, 2.0),
+            hit(2, 2.0),
+            hit(4, 2.0),
+            hit(5, 2.0),
+        ];
+        let out = exclude_undetermined_boundary_group(items, 2, |h| f64::from(h.score));
+        assert_eq!(out, vec![hit(10, 5.0)]);
+    }
+
+    #[test]
+    fn exclude_undetermined_boundary_group_empties_when_tied_from_the_start() {
+        // Issue #320 codex-review P1 指摘の直接固定: 先頭から境界を跨いで全件が
+        // 同点（`MAX_FETCH_K` 件以上が同一の最高スコアで始まる退行ケースに相当）。
+        // 境界より上位の候補が存在しないため、除外後は空になる。
+        let items = vec![hit(1, 2.0), hit(2, 2.0), hit(3, 2.0), hit(4, 2.0)];
+        let out = exclude_undetermined_boundary_group(items, 2, |h| f64::from(h.score));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn exclude_undetermined_boundary_group_is_permutation_invariant() {
+        // 同点グループへの id 割り当てだけを入れ替えても、除外後に残る件数・
+        // スコアは変わらない（Issue #320 codex-review P1 指摘対応の目的である
+        // id 依存バイアスの除去を境界完全化ヘルパ単体で固定する）。
+        let items_a = vec![
+            hit(10, 5.0),
+            hit(1, 2.0),
+            hit(2, 2.0),
+            hit(4, 2.0),
+            hit(5, 2.0),
+        ];
+        let items_b = vec![
+            hit(10, 5.0),
+            hit(100, 2.0),
+            hit(200, 2.0),
+            hit(400, 2.0),
+            hit(500, 2.0),
+        ];
+        let out_a = exclude_undetermined_boundary_group(items_a, 2, |h| f64::from(h.score));
+        let out_b = exclude_undetermined_boundary_group(items_b, 2, |h| f64::from(h.score));
+        assert_eq!(out_a, vec![hit(10, 5.0)]);
+        assert_eq!(out_b, vec![hit(10, 5.0)]);
+    }
+
+    /// [`MAX_FETCH_K`] を超える規模ですべて同点スコア（`score=1.0`）を返す密
+    /// provider（Issue #320 codex-review P1 指摘対応の回帰固定用モック）。要求
+    /// された `input.k`（＝再取得ループの `dense_fetch_k`）件を、常に
+    /// `id_offset` を起点に昇順で返す。実 provider の同点順序契約（同点は
+    /// 候補識別子昇順。[`is_sorted_desc_id_asc`]）を模す。
+    struct TiedAtCapProvider {
+        id_offset: u64,
+    }
+    impl SearchProvider for TiedAtCapProvider {
+        fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
+            Ok((0..input.k)
+                .map(|i| CandidateHit {
+                    id: self.id_offset + i as u64,
+                    score: 1.0,
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn hybrid_search_boosted_excludes_entire_dense_boundary_group_when_tied_from_start_beyond_max_fetch_k(
+    ) {
+        // Issue #320 codex-review P1 指摘の直接固定: 密チャネル全体（可視集合が
+        // `MAX_FETCH_K` を超える）が先頭からすべて同点スコアの退行ケース。
+        // 再取得ループは `MAX_FETCH_K` に達しても境界の同点グループの終端を
+        // 確定できない（`TieBoundary::Undetermined` が返り続ける）。修正前は
+        // 観測できた `MAX_FETCH_K` 件（provider の同点順序＝id 昇順により常に
+        // 最小 id 側のみ）をそのまま融合対象に採用しており id 依存バイアスが
+        // 残っていた。修正後は密チャネルの結果を空にする（境界同点グループ
+        // 全体を除外）。疎チャネルは密チャネルの id 範囲に含まれない少数の
+        // 実コーパスから構成し、密チャネルが空でも融合が疎チャネルの結果で
+        // 継続する（`hybrid_search_boosted` はエラーにしない）ことを確認する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 5).unwrap();
+        let ids: Vec<u64> = (1..=(MAX_FETCH_K as u64 + 10)).collect();
+        let vectors: Vec<f32> = vec![0.0; ids.len()];
+        let query = [0.0f32];
+        // 疎チャネルの実コーパスは密チャネル provider が返す id 範囲
+        // （`id_offset=3` 起点）と重ならない id=1,2 に置く。
+        let sparse_index = SparseIndex::build(&[(1, "cat"), (2, "dog")]).expect("build ok");
+        let input = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 5,
+        };
+        let provider = TiedAtCapProvider { id_offset: 3 };
+
+        let out = hybrid_search(&provider, input, &sparse_index, "cat", 5, &cfg)
+            .expect("密チャネルが空でもエラーにしない");
+
+        assert!(
+            !out.is_empty(),
+            "疎チャネル（実コーパス 'cat' 一致）が融合結果を継続して返す"
+        );
+        assert!(
+            out.iter().all(|h| h.id < 3),
+            "密チャネルの同点グループ（id>=3）由来の候補が id 依存で混入していない: {out:?}"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_boosted_dense_boundary_group_exclusion_is_permutation_invariant_beyond_max_fetch_k(
+    ) {
+        // 上記と同じ退行ケース（密チャネル全体が先頭から同点で `MAX_FETCH_K` を
+        // 超過）で、密チャネルへ割り当てる id の範囲（`id_offset`）だけを変えても
+        // 融合結果（文書集合・スコア）が一致することを確認する（境界同点グループ
+        // 全体を除外する設計により、id の割り当てに依存しなくなったことの固定）。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 5).unwrap();
+        let ids: Vec<u64> = (1..=(MAX_FETCH_K as u64 + 1000)).collect();
+        let vectors: Vec<f32> = vec![0.0; ids.len()];
+        let query = [0.0f32];
+        let sparse_index = SparseIndex::build(&[(1, "cat"), (2, "dog")]).expect("build ok");
+
+        let input_a = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 5,
+        };
+        let out_a = hybrid_search(
+            &TiedAtCapProvider { id_offset: 3 },
+            input_a,
+            &sparse_index,
+            "cat",
+            5,
+            &cfg,
+        )
+        .expect("search ok");
+
+        let input_b = SearchInput {
+            ids: &ids,
+            vectors: &vectors,
+            dim: 1,
+            query: &query,
+            k: 5,
+        };
+        let out_b = hybrid_search(
+            &TiedAtCapProvider { id_offset: 500 },
+            input_b,
+            &sparse_index,
+            "cat",
+            5,
+            &cfg,
+        )
+        .expect("search ok");
+
+        assert_eq!(
+            out_a, out_b,
+            "密チャネルの id 割り当て（id_offset）を変えても融合結果は一致する"
+        );
     }
 }
