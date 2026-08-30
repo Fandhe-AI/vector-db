@@ -183,18 +183,37 @@ pub fn build_ollama_client(host: &str, port: u16, model: &str) -> Result<OllamaC
 /// 参照）の 10% を採用する。
 pub const DEFAULT_MAX_INVALID_RESPONSE_TRIALS: u32 = 3;
 
+/// `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS` が受理する値の固定上限
+/// （codex-review P2 指摘・PR #329・Issue #316）。上限が無いと巨大値を設定した
+/// run で `run_fallible` の試行上限（`measured_iterations + max_excluded`）が
+/// 事実上無制限になり、LLM が不正応答を返し続ける状況で除外率ガードが無効化され
+/// 無期限に近い再試行が発生しうる（`measured_iterations + max_excluded` の
+/// オーバーフロー検査は `u32::MAX` 近辺しか拒否できず、この経路を塞がない）。
+/// `measured_iterations`（固定値 30。`tier_latency_bench.rs` 参照）を大きく上回る
+/// 妥当な小さい上限として 1000 を採用する（本リポ独自の実装既定値。
+/// spec 由来の数値基準ではない）。
+pub const MAX_INVALID_RESPONSE_TRIALS_CAP: u32 = 1000;
+
 /// `BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS`（任意 env）の生文字列を解析する。
 /// 未設定時は呼び出し元が [`DEFAULT_MAX_INVALID_RESPONSE_TRIALS`] を使う（本関数
 /// へは非 `None` の値のみを渡す想定）。空文字・非整数・負は `Err`（fail-closed）。
 /// `0` は「除外を許容しない」設定として明示的に許容する。
+/// [`MAX_INVALID_RESPONSE_TRIALS_CAP`] を超える値も `Err`（fail-closed。
+/// 除外率ガードの無効化を防ぐ）。
 pub fn parse_max_invalid_response_trials(raw: &str, var_name: &str) -> Result<u32, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(format!("{var_name} must not be empty"));
     }
-    trimmed
-        .parse::<u32>()
-        .map_err(|_| format!("{var_name} must be a non-negative integer"))
+    let value: u32 = trimmed
+        .parse()
+        .map_err(|_| format!("{var_name} must be a non-negative integer"))?;
+    if value > MAX_INVALID_RESPONSE_TRIALS_CAP {
+        return Err(format!(
+            "{var_name} must not exceed {MAX_INVALID_RESPONSE_TRIALS_CAP}"
+        ));
+    }
+    Ok(value)
 }
 
 /// [`engine::core::CoreError`] を [`TrialFailure`] へ分類する（TASK-116・

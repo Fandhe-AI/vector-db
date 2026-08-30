@@ -35,7 +35,7 @@ use harness::stats::BenchError;
 use harness::tier::{
     build_corpus, build_ollama_client, judge, opt_in_requested, parse_host,
     parse_max_invalid_response_trials, parse_max_p95_ms, parse_model_name, parse_port, TierSamples,
-    TierThresholds,
+    TierThresholds, MAX_INVALID_RESPONSE_TRIALS_CAP,
 };
 
 use std::time::Duration;
@@ -249,6 +249,23 @@ fn parse_max_invalid_response_trials_rejects_empty_non_integer_and_negative() {
     assert!(parse_max_invalid_response_trials("abc", "VAR").is_err());
     assert!(parse_max_invalid_response_trials("-1", "VAR").is_err());
     assert!(parse_max_invalid_response_trials("1.5", "VAR").is_err());
+}
+
+// codex-review P2 指摘（PR #329・Issue #316）: 巨大値を許すと `run_fallible` の
+// 除外率ガードが事実上無効化されるため、固定上限ちょうどは受理・超過は拒否する
+// ことを固定する。
+#[test]
+fn parse_max_invalid_response_trials_accepts_cap_and_rejects_above_cap() {
+    assert_eq!(
+        parse_max_invalid_response_trials(&MAX_INVALID_RESPONSE_TRIALS_CAP.to_string(), "VAR")
+            .unwrap(),
+        MAX_INVALID_RESPONSE_TRIALS_CAP
+    );
+    assert!(parse_max_invalid_response_trials(
+        &(MAX_INVALID_RESPONSE_TRIALS_CAP + 1).to_string(),
+        "VAR"
+    )
+    .is_err());
 }
 
 // --- classify_core_error ---

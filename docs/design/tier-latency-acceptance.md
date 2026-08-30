@@ -132,6 +132,13 @@ Issue #316 で実装した。spec（PLAN-4/6/7 のポインタ）には不正応
    ため出力可。p95 上限は従来どおり非出力）。
 5. **warmup フェーズの不正応答は上限判定に数えない**（件数のみ `warmup_excluded`
    として記録。warmup 中の致命エラーは即終了）。
+6. **`BENCH_TIER_MAX_INVALID_RESPONSE_TRIALS` には固定上限を設ける**
+   （`harness::tier::MAX_INVALID_RESPONSE_TRIALS_CAP`。codex-review P2 指摘・
+   PR #329・Issue #316）。上限が無いと巨大値を設定した run で `run_fallible` の
+   試行上限（`measured_iterations + max_excluded`）が事実上無制限になり、LLM が
+   不正応答を返し続ける状況で除外率ガードが無効化され無期限に近い再試行が発生
+   しうる。上限超過は `harness::tier::parse_max_invalid_response_trials` が
+   fail-closed で拒否する。
 
 実装・テストは `crates/engine/benches/harness/protocol.rs`（`run_fallible`）・
 `crates/engine/benches/harness/tier.rs`（分類関数・既定値・env パーサ）・
