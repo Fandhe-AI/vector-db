@@ -294,6 +294,110 @@ fixture（`tests/nl_qa_fixture.rs`。seed `0x1234_5678`・200 docs・20 queries�
 （クロスエンコーダを検討する動機の直接的な実測根拠）。クロスエンコーダ自体の
 実測値は前述のとおり未取得。
 
+### Issue #333 追記: 依存追加の完了・実 ONNX バックエンド接続・実測結果
+
+上記「Issue #333」節の中断後、オーナー承認（2026-08-30・Issue #333 再 open
+コメント）により `deny.toml` の `[advisories] ignore` へ `RUSTSEC-2024-0436`
+（`paste`。proc-macro 専用クレート・unmaintained advisory のみで既知の脆弱性
+advisory ではない）を理由・承認記録付きで追加し、`ort = "=2.0.0-rc.13"`
+（`default-features = false` + `load-dynamic` + `api-17`）・
+`tokenizers = "=0.23.1"`（`default-features = false` + `onig`）を
+`crates/engine/Cargo.toml` の `cross-encoder` feature（optional 依存）背後へ
+追加した。`api-17`（`ort-sys` 側の既定 API レベル）・`onig`（`tokenizer.json` の
+正規表現ベース pre-tokenizer 設定のロードに必要な既定機能）はいずれも承認済み
+クレート内の最小 feature 追加であり、新規クレート・別バージョンの追加ではない
+（実装計画の fail-closed 方針の範囲内）。`cargo deny --locked check advisories
+bans licenses sources`（`[graph] all-features = true` により `cross-encoder`
+経由の推移的依存も監査対象）は advisories・bans・licenses・sources いずれも
+`ok` を確認済み。
+
+**実 ONNX 推論バックエンド**: `crates/engine/src/rerank/cross_encoder_onnx.rs`
+（`cross-encoder` feature 限定）に `OnnxCrossEncoderBackend`
+（[`CrossEncoderBackend`] 実装）を追加した。設計上の要点:
+
+- `ort` の `load-dynamic` feature は既定で固定名の共有ライブラリ
+  （linux では `libonnxruntime.so`）を `dlopen` するが、多くの環境の実ファイル名は
+  バージョン付き（`libonnxruntime.so.N`）でこれと一致しない。既定解決に任せて
+  `ort` の他 API へ触れると、`ort` 内部の dylib ロード失敗処理が `Result` を
+  返さず panic する経路があるため（coding-rust.md「ライブラリコードでは
+  `Result` を返し、panic させない」に抵触）、`OnnxCrossEncoderBackend::from_files`
+  は環境変数 `ORT_DYLIB_PATH` を自前で読み、未設定ならここで `Err` を返して
+  `ort::` の他 API を一切呼ばずに打ち切る。設定済みの場合のみ `ort::init_from`
+  （`Result` を返す明示ロード API）で dylib を確定させてから `Session` を構築する
+- ロード時にモデルの入力名（`input_ids`/`attention_mask`/`token_type_ids`）を
+  検査し、想定外の構成は構築時に fail-closed で拒否する
+- 単体テスト（`ORT_DYLIB_PATH` 未設定・モデル/トークナイザファイル不在の環境。
+  `--all-features` の `make test`/`make ci`・pre-push フックの既定経路）で
+  panic せず `Err` を返すことを固定した
+
+**opt-in 実測ハーネス**: `crates/engine/tests/rerank_cross_encoder_recall.rs`
+（`#![cfg(feature = "cross-encoder")]`・`#[ignore]`）を追加し、
+`make rerank-cross-encoder-eval`（Makefile）から手動実行する。`bench-tier`
+（TASK-116）と同じ位置づけで CI には配線しない。`CROSS_ENCODER_MODEL_PATH`・
+`CROSS_ENCODER_TOKENIZER_PATH`・`ORT_DYLIB_PATH` が未設定の場合は明確な
+メッセージで fail する（fail-closed）。
+
+**実測結果**（seed `0x1234_5678`・200 docs・20 queries。`tests/fixtures/
+nl_qa.rs`。採用モデル: `cross-encoder/ms-marco-MiniLM-L-6-v2` の ONNX 変換版
+〔配布元 `Xenova/ms-marco-MiniLM-L-6-v2`〕。ライセンス Apache-2.0。onnxruntime
+共有ライブラリ・モデルファイルはリポジトリへコミットしていない）:
+
+| 指標 | 値 |
+| ---- | -- |
+| `baseline_hits20`（リランキングなし） | 43 |
+| `after_hits20`（クロスエンコーダ適用後） | 18 |
+| `pool_hits100` / `pool_hits200` | 77 / 89 |
+| `pool_ceiling_hits20` | 79 |
+| `ceil20` / `ceil100` / `ceil200` | 79 / 89 / 89 |
+| `improvement_ratio` | `0`（`after_hits20 < baseline_hits20` のため `saturating_sub` により改善幅が 0 扱い） |
+
+同一モデル・同一入力での 2 回実測は完全一致（決定性を確認済み）。
+
+**SEARCH-7 相対基準（ratio ≥ 0.6）には未到達**。むしろ字句一致方式
+（`LexicalOverlapReranker`。上記参考実測 `after_hits20=41`）よりも悪化した。
+
+**原因分析**（`tests/fixtures/nl_qa.rs::generate_nl_corpus` の文書生成ロジックを
+踏まえた切り分け。個別クエリ・文書ペアでの生スコア確認では、正解文書が不正解
+文書より高いスコアを得るケース自体は観測でき、スコアの向き自体は妥当——モデルの
+呼び出し・入出力対応が反転しているような実装バグではない）:
+
+- `Doc.text` は文書の主要概念 2 件（`{a}`/`{b}`）を流暢な英文テンプレートへ
+  埋め込む一方、3 件目以降の追加概念語（キーワード数 2〜4 のうち超過分）は
+  文末へ単語＋ピリオドのみを機械的に追記する構造になっている（同ファイルの
+  文書生成ロジック参照）。クエリは各文書の「出現頻度が最も低い 2 概念」を
+  AND 条件に選ぶため、正解判定に使う概念が文末の非流暢な追記フレーズ側に
+  偏りやすい
+- 事前学習済みクロスエンコーダ（MS MARCO passage ranking で学習）は文全体の
+  自然な意味構造を読む前提のモデルであり、この「主要 2 概念を流暢な文で
+  記述し、正解概念は文末に無関係な内容の後付けで追記する」という
+  fixture 特有の構造は学習分布から外れる。文全体の主題（無関係な 2 概念の
+  組み合わせ）に引きずられ、文末の短い追記フレーズ（実際の正解根拠）を
+  相対的に軽視しやすいと考えられる
+- 対照的に、RRF 融合ベースの baseline は文の流暢さに依存せず `keywords`
+  集合（疎チャネルの語彙 one-hot・密チャネルのベクトル）を直接手がかりに
+  するため、この構造による不利益を受けない
+
+**到達可否の判断**: 本 fixture・本モデルの組み合わせでは SEARCH-7 相対基準に
+到達しない。これは方式（クロスエンコーダ）自体の欠陥ではなく、fixture の
+文書生成が「流暢な自然文としての意味理解」を前提とするモデル評価に適さない
+構造（正解概念が非流暢な追記フレーズに偏る）を持つことが主因と考えられる。
+到達可否・原因分析は Issue #330 へ報告する。fixture 側の再設計（正解概念を
+主要 2 概念スロット `{a}`/`{b}` にも均等に含める等）・別モデル選定の要否は
+オーナー判断に委ねる。
+
+**再現手順**:
+
+```bash
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so
+export CROSS_ENCODER_MODEL_PATH=/path/to/model.onnx
+export CROSS_ENCODER_TOKENIZER_PATH=/path/to/tokenizer.json
+make rerank-cross-encoder-eval
+```
+
+`model.onnx`・`tokenizer.json` は `cross-encoder/ms-marco-MiniLM-L-6-v2`
+（Apache-2.0）の ONNX 変換版を運用者が取得する。onnxruntime 共有ライブラリは
+ONNX Runtime（MIT）配布物を使う。いずれもリポジトリへはコミットしない。
+
 ## 既知の制約・スコープ外
 
 - **暫定リランカーの効果測定である**: 同梱リランカー（[`LexicalOverlapReranker`]）は

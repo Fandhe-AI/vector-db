@@ -18,6 +18,16 @@ all-features = true
 # ignore へアドバイザリ ID を追加する場合は、理由・解消予定（追跡 Issue 番号）を
 # コメント付きで記録し、レビューを必須とする。
 version = 2
+ignore = [
+    # RUSTSEC-2024-0436（`paste`・unmaintained）: Issue #333 でクロスエンコーダ
+    # リランカー（`cross-encoder` feature）の依存として追加した `tokenizers` の
+    # 推移的依存。`paste` はコンパイル時にのみ展開される proc-macro 専用クレートで
+    # 実行時コードを含まず、advisory 種別も unmaintained のみ（既知の脆弱性
+    # advisory ではない）。オーナー承認済み（2026-08-30・Issue #333 再 open
+    # コメント）。解消予定: `tokenizers` が `paste` 非依存の新版を出すまで、または
+    # 別クレートへの置き換えが承認されるまで（追跡: Issue #333）。
+    { id = "RUSTSEC-2024-0436", reason = "paste is a compile-time-only proc-macro crate (transitive dep of tokenizers); unmaintained advisory only, no known vulnerability. Owner-approved 2026-08-30 (Issue #333)." },
+]
 
 [licenses]
 version = 2

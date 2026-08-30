@@ -954,14 +954,15 @@ impl<B: CrossEncoderBackend> Reranker for CrossEncoderReranker<B> {
     }
 }
 
-// `OnnxCrossEncoderBackend`（実 ONNX 推論。`ort`/`tokenizers` 依存）は
-// `crates/engine/Cargo.toml` の `make deny` advisories fail（`tokenizers` の
-// 推移的依存 `paste` の unmaintained advisory）により本 PR では追加を見送った
-// （`Cargo.toml` 冒頭コメント・`docs/design/rerank-recall-regression.md`
-// 「Issue #333」節参照）。[`CrossEncoderBackend`] trait は実装を差し替え可能な
-// 形で公開済みのため、依存の扱いが解決した後続 PR で `cross_encoder_onnx`
-// サブモジュールを追加すれば足りる（この trait・[`CrossEncoderReranker`] 自体の
-// 再設計は不要）。
+// `OnnxCrossEncoderBackend`（実 ONNX 推論。`ort`/`tokenizers` 依存。
+// オーナー承認済み 2026-08-30・Issue #333 再 open コメント）を
+// `cross-encoder` feature 限定のサブモジュールとして接続する。上記
+// [`CrossEncoderBackend`] trait・[`CrossEncoderReranker`] 自体は変更しない
+// （feature 無効時は決定的スタブ経由の契約テスト＝下記 `tests` モジュールのみが
+// 対象。feature 有効時のみ `cross_encoder_onnx::OnnxCrossEncoderBackend` が
+// 追加で利用可能になる）。
+#[cfg(feature = "cross-encoder")]
+pub mod cross_encoder_onnx;
 
 #[cfg(test)]
 mod tests {

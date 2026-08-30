@@ -49,14 +49,33 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 ] }
 
 # Issue #333（SEARCH-7 方式変更。クロスエンコーダ型リランカーの導入）:
-# `ort = "=2.0.0-rc.13"` + `tokenizers = "=0.23.1"`（optional・`cross-encoder`
-# feature 限定・オーナー承認済み 2026-08-30・Issue #333 案A）の追加を試みたが、
-# `make deny` の advisories チェックが `tokenizers` の推移的依存 `paste`（不使用
-# 化アドバイザリ RUSTSEC-2024-0436）で fail した。実装計画の fail-closed 方針
-# （承認範囲を超える `deny.toml` allow-list 追加・別バージョン採用は行わず、
-# 計画外事項として報告する）に従い、本依存の追加は見送り・`rerank.rs` の
-# `CrossEncoderBackend` trait 抽象化 + スタブ契約テストまでを本 PR の範囲とした
-# （`docs/design/rerank-recall-regression.md`「Issue #333」節参照）。
+# `rerank::CrossEncoderReranker`（`rerank.rs`）が呼ぶ実 ONNX 推論バックエンド
+# （`src/rerank/cross_encoder_onnx.rs`。`cross-encoder` feature 限定）用の依存。
+# 当初 `make deny` advisories が `tokenizers` の推移的依存 `paste`
+# （unmaintained・RUSTSEC-2024-0436）で fail したためロールバックしたが、
+# オーナー承認済み（2026-08-30・Issue #333 再 open コメント）で
+# `deny.toml` の `[advisories] ignore` へ登録のうえ追加した。
+#   - `ort = "=2.0.0-rc.13"`（default-features = false。ビルド時バイナリ
+#     ダウンロードなし・実行時 `ORT_DYLIB_PATH` で共有ライブラリを解決する
+#     `load-dynamic` に加え、`ort-sys` 側の既定 API レベル `api-17`（`ort-sys` を
+#     `default-features = false` にした際 `ort` の feature 経由で明示指定しないと
+#     Session 構築・推論に必要なシンボルが有効化されない）を最小追加。テンソル
+#     構築は `Tensor::from_array((shape, data))`（`(Vec<i64>, Vec<T>)` タプル）を
+#     使うため `ndarray` feature は不要（ライセンス: MIT）。
+#   - `tokenizers = "=0.23.1"`（default-features = false + `onig`。`tokenizer.json`
+#     が正規表現ベースの pre-tokenizer 設定を含む場合のロードに必要な既定機能の
+#     最小分。`esaxx_fast`／`progressbar`〔BPE 学習・進捗表示用〕は推論専用の
+#     本用途では不要なため含めない）
+# いずれも optional・下記 `cross-encoder` feature の背後に限定し、`wire-server` は
+# リンクしない（`cargo tree -p wire-server` に出現しないことを確認済み）。
+# .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
+ort = { version = "=2.0.0-rc.13", optional = true, default-features = false, features = [
+    "load-dynamic",
+    "api-17",
+] }
+tokenizers = { version = "=0.23.1", optional = true, default-features = false, features = [
+    "onig",
+] }
 
 [features]
 # CORE-5 の対照エンジン（usearch の総当たり `exact_search`）を bench 専用に有効化する
@@ -64,6 +83,12 @@ wgpu = { version = "=30.0.1", default-features = false, features = [
 # 参照）と異なり、テナント境界・RLS 迂回 API は一切露出しない
 # （bench 専用の依存有効化のみで安全境界に触れない）。
 contrast-bench = ["dep:usearch"]
+
+# Issue #333（SEARCH-7 方式変更）: `rerank::CrossEncoderReranker` の実 ONNX 推論
+# バックエンド（`src/rerank/cross_encoder_onnx.rs`）を有効化する feature。
+# `contrast-bench` と同パターンで、既定ビルド・`wire-server` には一切結線しない
+# （テナント境界・RLS 迂回 API は露出しない）。
+cross-encoder = ["dep:ort", "dep:tokenizers"]
 
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
