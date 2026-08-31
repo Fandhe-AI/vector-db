@@ -1,0 +1,469 @@
+//! `sql::exec::execute_statement` の hybrid 実行（`ORDER BY hybrid_rrf(...)` /
+//! `HYBRID(...)`）が参照する [`crate::sparse::SparseIndex`]（BM25 語彙・統計）の
+//! テーブル世代整合キャッシュ（Issue #357）。
+//!
+//! **背景**: hybrid 実行は毎クエリ RLS 可視行走査中に本文テキストを疎コーパスへ
+//! 複製蓄積し、`SparseIndex::build`（語彙 `BTreeMap` 構築・BM25 統計計算）を
+//! 再実行していた。テーブル・可視集合が無変化でも build コストがクエリごとに
+//! 発生する。本キャッシュは `(table, ctx, text_column_index)` 単位でこれを
+//! 再利用する。
+//!
+//! **キーと世代**: `core.rs::PrefilterCache`（TASK-169）・`core.rs::DictionaryCache`
+//! （TASK-109・PLAN-5）と同じ設計を踏襲する。キーは `(table, ctx,
+//! text_column_index)` の完全一致（`PolicyContext` はテナント境界を含むため、
+//! 他テナントのコーパスを構造的に参照不能にする。`text_column_index`
+//! （`Ranking::Hybrid` が保持する、hybrid 本文として使う TEXT 列のインデックス。
+//! `hybrid_rrf(embedding, '<vec>', <col>, '<query>')` の 3 引数目に対応）が
+//! キーに含まれない場合、同一テーブルの異なる TEXT 列を本文に指定する 2 つの
+//! hybrid クエリが互いのキャッシュを誤ヒットし、片方の列で構築した索引をもう
+//! 片方の列のクエリへ提供してしまう。コーパス内容が問い合わせごとに異なる
+//! パラメータであるため、キーへ含める）。世代は `catalog::table_generation_in_txn`
+//! （テーブル単位。粒度の設計判断は
+//! `docs/design/table-generation-rejection-granularity.md` 参照）を使う。
+//! グローバル世代ではなくテーブル世代を使うことで、無関係な他テーブルへの
+//! 書き込みでは失効しない。
+//!
+//! **適用条件**: 呼び出し元（`sql::exec::execute_statement`）は、`bound.
+//! metadata_filters`・`bound.expr_filters` がともに空の hybrid クエリに限り本
+//! キャッシュを経由させる。疎コーパス（`DocId` = アリーナのスロット番号）は
+//! SCALAR 事前フィルタを通過した行にのみ割り当てられるため、フィルタが無い
+//! 場合に限り「RLS 可視行のうち本文非 NULL の全行」というクエリ非依存のコーパスが
+//! 成立し、同一世代内であればスロット番号の割当も含めて完全に再現される
+//! （redb の走査順・RLS 判定の純粋性に依存する不変条件。`sql/exec.rs` の
+//! 呼び出し箇所のコメント参照）。フィルタ付きクエリ・DISTANCE 専用クエリは
+//! 呼び出し元が本キャッシュへ到達させない。
+//!
+//! **fail-closed 契約（[`Self::lookup`] と [`Self::insert`] で非対称）**:
+//! - [`Self::lookup`] は世代不一致・ロック毒化・世代読み取り失敗のいずれも
+//!   「見つからなかった」として扱う（`PrefilterCache::lookup` と同じ方針。
+//!   古い可能性のある索引でクエリへ応答する経路を作らない）。
+//! - [`Self::insert`] は他の 2 キャッシュ（Issue #280 で `None` 統一済み）とは
+//!   意図的に異なる契約を持つ。挿入対象自身が既に古い場合・ロック毒化時は
+//!   キャッシュへ**反映しない**が、呼び出し元へは常に構築済みの `Arc<SparseIndex>`
+//!   を返す。呼び出し元がこの索引を構築したのは自分自身のクエリの `read_txn`
+//!   （単一スナップショット）上であり、そのスナップショットの中でのみ使う限り
+//!   stale にはなり得ない（`PrefilterCache`/`DictionaryCache` が「キャッシュから
+//!   古い可能性のあるものを取り出して使う」経路を塞ぐのに対し、本関数が禁じるのは
+//!   「キャッシュへ古い索引を常駐させる」ことのみ）。
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+
+use crate::policy::PolicyContext;
+use crate::sparse::SparseIndex;
+use crate::storage::Storage;
+
+/// [`SparseIndexCache`] のエントリ数上限（`core.rs::MAX_PREFILTER_CACHE_ENTRIES`
+/// と同じ DoS 対策方針。少数テーブル × 少数ポリシーの組み合わせを十分満たしつつ、
+/// 線形走査コストが問題にならない桁に留める）。
+const MAX_SPARSE_CACHE_ENTRIES: usize = 32;
+
+/// [`SparseIndexCache`] が保持する [`SparseIndex`] 群の概算バイト量の合計上限
+/// （`core.rs::MAX_PREFILTER_CACHE_TOTAL_BYTES` と同じ桁に揃える）。
+const MAX_SPARSE_CACHE_TOTAL_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// [`SparseIndexCache`] の観測用統計（テナント ID・行 ID 等の機微情報は含まない。
+/// `core.rs::PrefilterCacheStats` と同方針）。`EngineCore::sparse_index_cache_stats`
+/// からのみ公開する（`VectorCore` trait には載せない固有 API）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SparseIndexCacheStats {
+    /// キャッシュヒット数（世代整合まで確認できた再利用）。
+    pub hits: u64,
+    /// `SparseIndexCache::insert` の呼び出し回数（未登録、または世代不一致で
+    /// 破棄した後に新規索引を構築してキャッシュへ挿入を試みた回数）。lookup が
+    /// ミスしても、対象クエリの疎コーパスが空（`sparse_docs.is_empty()`）で
+    /// `SparseIndex::build` 自体を呼ばない場合や、`precision` の完全性ゲートで
+    /// DISTANCE 検索自体を実行しない場合は `insert` を呼ばないため計上されない
+    /// （hits + misses が「lookup を実行した回数」と一致するとは限らない）。
+    pub misses: u64,
+    /// 世代不一致による破棄回数（lookup 時の stale 検出 + insert 時の一括破棄）。
+    pub stale_evictions: u64,
+    /// 容量上限超過による LRU 追い出し回数。
+    pub capacity_evictions: u64,
+    /// 現在キャッシュが保持しているエントリ数。
+    pub entries: usize,
+}
+
+/// [`SparseIndexCache`] の 1 エントリ。`table`・`ctx`・`text_column_index` の組が
+/// キャッシュキー（`PolicyContext` は `Hash` を実装しないため `HashMap` ではなく
+/// `Vec` 線形走査で照合する。`core.rs::CacheEntry`/`DictCacheEntry` と同じ理由。
+/// `text_column_index` をキーへ含める理由はモジュールドキュメント参照）。
+struct CacheEntry {
+    table: String,
+    ctx: PolicyContext,
+    text_column_index: usize,
+    index: Arc<SparseIndex>,
+    built_generation: u64,
+    approx_bytes: usize,
+    /// LRU 追い出し判定用の単調シーケンス（アクセスのたびに更新）。
+    last_used: u64,
+}
+
+/// ロックが保護する可変状態（[`RwLock`] 内側）。
+#[derive(Default)]
+struct CacheState {
+    entries: Vec<CacheEntry>,
+}
+
+/// `sql::exec::execute_statement` の hybrid 実行が参照する [`SparseIndex`] の
+/// テーブル世代整合キャッシュ本体（モジュールドキュメント参照）。
+pub(crate) struct SparseIndexCache {
+    state: RwLock<CacheState>,
+    seq: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    stale_evictions: AtomicU64,
+    capacity_evictions: AtomicU64,
+}
+
+impl SparseIndexCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: RwLock::new(CacheState::default()),
+            seq: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            stale_evictions: AtomicU64::new(0),
+            capacity_evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// `(table, ctx, text_column_index)` に一致し、`read_txn` のスナップショットに
+    /// おけるテーブル世代と整合するエントリを探す。世代不一致のエントリは見つけ
+    /// 次第破棄する（fail-closed。`core.rs::PrefilterCache::lookup` と同じ方針）。
+    /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う。
+    ///
+    /// `read_txn` は呼び出し元（`sql::exec::execute_statement`）がこのクエリ全体で
+    /// 使う単一の read トランザクションそのものを渡す契約とする（新規トランザクション
+    /// を開かない）。これにより、ここで読む世代は呼び出し元がこれから走査する行集合と
+    /// 同一スナップショットのものになる。
+    pub(crate) fn lookup(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+        text_column_index: usize,
+    ) -> Option<Arc<SparseIndex>> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.state.write().ok()?;
+        // 世代はロック取得後に読み直す（`PrefilterCache::lookup` と同じ理由。ロック
+        // 待機中の他スレッドの挿入を誤って「不一致」と判定しないため）。
+        let current_generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
+        let position = guard.entries.iter().position(|e| {
+            e.table == table && &e.ctx == ctx && e.text_column_index == text_column_index
+        })?;
+        let stale = guard
+            .entries
+            .get(position)
+            .map(|e| e.built_generation != current_generation)
+            .unwrap_or(true);
+        if stale {
+            guard.entries.remove(position);
+            self.stale_evictions.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let index = {
+            let entry = guard.entries.get_mut(position)?;
+            entry.last_used = seq;
+            Arc::clone(&entry.index)
+        };
+        drop(guard);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(index)
+    }
+
+    /// 新規構築した索引を挿入する。`built_generation` は呼び出し元が構築に使った
+    /// `read_txn` のスナップショットにおけるテーブル世代（[`Self::lookup`] に渡した
+    /// のと同じ `read_txn` から `catalog::table_generation_in_txn` で読んだ値）を渡す
+    /// 契約とする。
+    ///
+    /// **戻り値は常に `Arc<SparseIndex>`（`Option` ではない）**（モジュール
+    /// ドキュメント「fail-closed 契約」参照）。キャッシュへ反映できるかどうかに
+    /// 関わらず、呼び出し元は返された索引を「このクエリのスナップショットから
+    /// 自分で構築した索引」としてそのまま使ってよい。`storage` は挿入直前の
+    /// 「現在の」テーブル世代を新規 read トランザクションで再読取するために使う
+    /// （並行書き込みとの競合検出。`catalog.rs::Storage::table_generation`
+    /// ドキュメント参照）。世代が一致しない、またはロック毒化・世代読み取り失敗の
+    /// 場合はキャッシュへの反映のみを諦め、`index` をそのまま呼び出し元へ返す
+    /// （常駐させない・古い索引を後続クエリへ渡さない、の両方を満たす）。
+    pub(crate) fn insert(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+        text_column_index: usize,
+        index: SparseIndex,
+        built_generation: u64,
+    ) -> Arc<SparseIndex> {
+        let index = Arc::new(index);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+
+        let Ok(mut guard) = self.state.write() else {
+            // ロック毒化時は世代整合を判定できないため常駐させない（fail-closed）。
+            // 呼び出し元へは構築済みの索引をそのまま返す（モジュールドキュメント参照）。
+            return index;
+        };
+
+        let Ok(current_generation) = storage.table_generation(table) else {
+            return index;
+        };
+        if built_generation != current_generation {
+            // 並行書き込みで挿入対象自身が既に古い。キャッシュへは反映しないが、
+            // 呼び出し元の今回のクエリのスナップショットとしては整合しているため
+            // そのまま返す（モジュールドキュメント参照）。
+            return index;
+        }
+
+        let own_bytes = index.approx_heap_bytes();
+        if own_bytes > MAX_SPARSE_CACHE_TOTAL_BYTES {
+            // 単体で総量上限を超える索引は常駐させない（DoS 対策）。
+            return index;
+        }
+
+        // 同一 (table, ctx, text_column_index) キーの既存エントリは挿入前に取り除く
+        // （`PrefilterCache::insert` と同じ理由。重複登録による無駄な容量消費を
+        // 避ける）。
+        if let Some(pos) = guard.entries.iter().position(|e| {
+            e.table == table && &e.ctx == ctx && e.text_column_index == text_column_index
+        }) {
+            guard.entries.remove(pos);
+        }
+
+        // 現在世代と不整合なエントリを先に全破棄する。
+        let before = guard.entries.len();
+        guard
+            .entries
+            .retain(|e| e.built_generation == current_generation);
+        let removed_stale = before.saturating_sub(guard.entries.len());
+        if removed_stale > 0 {
+            self.stale_evictions
+                .fetch_add(removed_stale as u64, Ordering::Relaxed);
+        }
+
+        // それでも件数・総量が上限を超えるなら `last_used` 最小から追い出す（LRU）。
+        let mut total_bytes: usize = guard
+            .entries
+            .iter()
+            .map(|e| e.approx_bytes)
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        while guard.entries.len() >= MAX_SPARSE_CACHE_ENTRIES
+            || total_bytes.saturating_add(own_bytes) > MAX_SPARSE_CACHE_TOTAL_BYTES
+        {
+            let victim = guard
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(idx, _)| idx);
+            let Some(idx) = victim else {
+                // これ以上追い出せるエントリがない（空）のに超過している場合は、
+                // 挿入自体を諦めてキャッシュを汚さない。
+                return index;
+            };
+            let removed = guard.entries.remove(idx);
+            total_bytes = total_bytes.saturating_sub(removed.approx_bytes);
+            self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        guard.entries.push(CacheEntry {
+            table: table.to_string(),
+            ctx: ctx.clone(),
+            text_column_index,
+            index: Arc::clone(&index),
+            built_generation,
+            approx_bytes: own_bytes,
+            last_used: seq,
+        });
+        index
+    }
+
+    pub(crate) fn stats(&self) -> SparseIndexCacheStats {
+        let entries = self.state.read().map(|g| g.entries.len()).unwrap_or(0);
+        SparseIndexCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            stale_evictions: self.stale_evictions.load(Ordering::Relaxed),
+            capacity_evictions: self.capacity_evictions.load(Ordering::Relaxed),
+            entries,
+        }
+    }
+}
+
+/// `sql::exec::execute_statement` へ渡すキャッシュアクセス束（TASK: Issue #357）。
+/// `storage`（[`SparseIndexCache::insert`] の世代再読取用）と `cache` 本体を 1
+/// 引数へ束ねることで、`execute_statement` の引数数を clippy の
+/// `too_many_arguments` 閾値内に保つ。`execute_statement` が `pub fn` であるのに
+/// 合わせ、構造体自体も `pub`（フィールドは `pub(crate)`。`storage`/`cache` の型
+/// （[`Storage`]・[`SparseIndexCache`]）は crate 外から到達できないため、この型を
+/// crate 外で構築・分解することはできない）。
+pub struct SparseCacheAccess<'a> {
+    pub(crate) storage: &'a Storage,
+    pub(crate) cache: &'a SparseIndexCache,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    use crate::policy::PolicyContext;
+    use crate::storage::Storage;
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+    use redb::ReadableDatabase;
+
+    fn ctx(tenant: &str) -> PolicyContext {
+        PolicyContext::new(tenant).expect("valid tenant")
+    }
+
+    fn create_table(storage: &Storage, name: &str) {
+        storage
+            .create_table(&TableSchema::new(
+                name,
+                vec![ColumnDef::new("path", ColumnType::Text, false)],
+            ))
+            .expect("create table");
+    }
+
+    fn sample_index() -> SparseIndex {
+        SparseIndex::build(&[(1u64, "alpha beta"), (2u64, "beta gamma")]).unwrap()
+    }
+
+    #[test]
+    fn lookup_hits_same_table_ctx_same_generation() {
+        let path = unique_db_path("sparse-cache-hit");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let inserted = cache.insert(&storage, "docs", &c, 0, sample_index(), gen);
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        let hit = cache.lookup(&read_txn2, "docs", &c, 0);
+        assert!(hit.is_some());
+        assert!(Arc::ptr_eq(&hit.unwrap(), &inserted));
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn lookup_misses_and_evicts_after_table_generation_bump() {
+        let path = unique_db_path("sparse-cache-stale");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        cache.insert(&storage, "docs", &c, 0, sample_index(), gen);
+
+        // 対象テーブルへの書き込みでテーブル世代を進める（fail-closed の失効確認）。
+        let write_txn = storage.db().begin_write().unwrap();
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").unwrap();
+        crate::recovery::commit_boundary::commit(write_txn).unwrap();
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        let hit = cache.lookup(&read_txn2, "docs", &c, 0);
+        assert!(hit.is_none(), "stale entry must be evicted, not reused");
+        assert_eq!(cache.stats().stale_evictions, 1);
+    }
+
+    #[test]
+    fn lookup_misses_for_different_tenant_ctx() {
+        let path = unique_db_path("sparse-cache-tenant");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let owner = ctx("tenant-a");
+        let other = ctx("tenant-b");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        cache.insert(&storage, "docs", &owner, 0, sample_index(), gen);
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        assert!(cache.lookup(&read_txn2, "docs", &other, 0).is_none());
+    }
+
+    #[test]
+    fn lookup_misses_for_different_text_column_index_same_table_and_ctx() {
+        // 同一テーブル・同一 ctx でも、hybrid 本文として使う TEXT 列
+        // （`text_column_index`）が異なれば別クエリ・別コーパスであり、キャッシュを
+        // 取り違えてはならない（モジュールドキュメント「キーと世代」参照。異なる列
+        // で構築した索引を誤って提供すると、コーパス内容自体が異なるため誤った
+        // ハイブリッドスコアを返しかねない）。
+        let path = unique_db_path("sparse-cache-text-column");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        // text_column_index = 1（例: body 列）で挿入する。
+        cache.insert(&storage, "docs", &c, 1, sample_index(), gen);
+
+        // text_column_index = 2（例: title 列）での lookup はミスでなければならない。
+        let read_txn2 = storage.db().begin_read().unwrap();
+        assert!(
+            cache.lookup(&read_txn2, "docs", &c, 2).is_none(),
+            "a different text_column_index must not hit the entry built for another column"
+        );
+        // 同一 text_column_index (=1) の lookup は引き続きヒットする。
+        let read_txn3 = storage.db().begin_read().unwrap();
+        assert!(cache.lookup(&read_txn3, "docs", &c, 1).is_some());
+    }
+
+    #[test]
+    fn insert_does_not_cache_when_generation_already_advanced_but_still_returns_index() {
+        let path = unique_db_path("sparse-cache-insert-stale");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // `built_generation` に、実際より 1 つ古い世代を渡す（並行書き込みで自身が
+        // 既に stale になったことを模す）。
+        let read_txn = storage.db().begin_read().unwrap();
+        let stale_gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let write_txn = storage.db().begin_write().unwrap();
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").unwrap();
+        crate::recovery::commit_boundary::commit(write_txn).unwrap();
+
+        let returned = cache.insert(&storage, "docs", &c, 0, sample_index(), stale_gen);
+        // 呼び出し元へは索引そのものを返す（Issue #280 の他 2 キャッシュと異なり
+        // `None` にしない。モジュールドキュメント参照）。
+        assert!(returned.approx_heap_bytes() > 0);
+
+        // ただしキャッシュへは反映されていない（次の lookup はミス）。
+        let read_txn2 = storage.db().begin_read().unwrap();
+        assert!(cache.lookup(&read_txn2, "docs", &c, 0).is_none());
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn capacity_eviction_keeps_entries_within_limit() {
+        let path = unique_db_path("sparse-cache-capacity");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+        for i in 0..(MAX_SPARSE_CACHE_ENTRIES + 1) {
+            let table = format!("docs_{i}");
+            create_table(&storage, &table);
+            let read_txn = storage.db().begin_read().unwrap();
+            let gen = crate::catalog::table_generation_in_txn(&read_txn, &table).unwrap();
+            cache.insert(&storage, &table, &c, 0, sample_index(), gen);
+        }
+        let stats = cache.stats();
+        assert!(stats.entries <= MAX_SPARSE_CACHE_ENTRIES);
+        assert!(stats.capacity_evictions >= 1);
+    }
+}

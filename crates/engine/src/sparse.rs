@@ -886,6 +886,35 @@ impl SparseIndex {
         scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
         Ok(scored)
     }
+
+    /// この `SparseIndex` が保持するヒープ確保分の概算バイト量（Issue #357・
+    /// `sql/sparse_cache.rs::SparseIndexCache` の容量判定用）。`dictionary.rs::
+    /// Dictionary::approx_heap_bytes` と同じ「厳密なメモリ計測ではなく DoS 対策の
+    /// ための粗い上限判定用」という位置づけの概算であり、`docs`（文書ごとの
+    /// `term_freq` の `String` キー・エントリ分）・`doc_freq`（語彙 `String` キー分）・
+    /// `id_index`（`DocId` → `usize` のエントリ分）を加算する。
+    pub fn approx_heap_bytes(&self) -> usize {
+        let docs: usize = self
+            .docs
+            .iter()
+            .map(|d| {
+                d.term_freq
+                    .keys()
+                    .map(|k| k.len().saturating_add(16))
+                    .fold(0usize, |acc, n| acc.saturating_add(n))
+            })
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        let doc_freq: usize = self
+            .doc_freq
+            .keys()
+            .map(|k| k.len().saturating_add(16))
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        let id_index: usize = self
+            .id_index
+            .len()
+            .saturating_mul(std::mem::size_of::<(DocId, usize)>());
+        docs.saturating_add(doc_freq).saturating_add(id_index)
+    }
 }
 
 #[cfg(test)]
@@ -1639,5 +1668,26 @@ mod tests {
                 max: MAX_QUERY_TERMS,
             }
         );
+    }
+
+    // --- approx_heap_bytes（Issue #357・sql/sparse_cache.rs の容量判定用） ---
+
+    #[test]
+    fn approx_heap_bytes_is_positive_for_nonempty_corpus() {
+        let docs = vec![(1u64, "alpha beta"), (2u64, "beta gamma")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        assert!(idx.approx_heap_bytes() > 0);
+    }
+
+    #[test]
+    fn approx_heap_bytes_grows_with_corpus_size() {
+        let small = vec![(1u64, "alpha")];
+        let large = vec![
+            (1u64, "alpha beta gamma delta epsilon"),
+            (2u64, "zeta eta theta"),
+        ];
+        let small_idx = SparseIndex::build(&small).unwrap();
+        let large_idx = SparseIndex::build(&large).unwrap();
+        assert!(large_idx.approx_heap_bytes() > small_idx.approx_heap_bytes());
     }
 }

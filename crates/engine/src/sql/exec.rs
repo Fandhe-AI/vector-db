@@ -32,6 +32,7 @@
 //! を束ねる。
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
@@ -341,6 +342,12 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
 /// 走査することになり、新設列の欠落や `row_codec` デコード失敗（スキーマ世代不一致）
 /// が生じ得た。同一 `read_txn` を型で強制することで、スキーマ取得・bind・候補走査を
 /// 単一スナップショットへ閉じ込める）。
+///
+/// `sparse_cache`（Issue #357・[`crate::sql::sparse_cache::SparseIndexCache`]）は
+/// hybrid ランキング（[`Ranking::Hybrid`]）かつ `bound.metadata_filters`・
+/// `bound.expr_filters` がともに空のクエリに限り経由する（詳細は
+/// `sql/sparse_cache.rs` モジュールドキュメントの「適用条件」参照）。それ以外の
+/// クエリ（DISTANCE 専用・フィルタ付き hybrid）は本関数内で一切参照しない。
 pub fn execute_statement(
     read_txn: &redb::ReadTransaction,
     provider: &dyn SearchProvider,
@@ -348,6 +355,7 @@ pub fn execute_statement(
     schema: &TableSchema,
     bound: &BoundStatement,
     precision_policy: &crate::precision::PrecisionPolicy,
+    sparse_cache: crate::sql::sparse_cache::SparseCacheAccess<'_>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
@@ -375,6 +383,29 @@ pub fn execute_statement(
         } => Some(*text_column_index),
         Ranking::Distance { .. } => None,
     };
+
+    // Issue #357: `SparseIndex` のテーブル世代整合キャッシュ。フィルタなし hybrid
+    // クエリに限り経由する（`sql/sparse_cache.rs` モジュールドキュメント「適用条件」
+    // 参照。疎コーパスは SCALAR 事前フィルタ通過行にのみ割り当てられるため、
+    // フィルタが無い場合のみ「RLS 可視行のうち本文非 NULL の全行」というクエリ
+    // 非依存のコーパスが成立し、同一世代内でのスロット番号割当を含む再現性
+    // 不変条件を満たす）。ヒットした場合は下の `on_visible_row` で疎コーパスへの
+    // 複製蓄積自体を省略し（`skip_sparse_accumulation`）、フュージョン段で
+    // キャッシュ済み索引をそのまま使う。
+    let sparse_cache_eligible =
+        is_hybrid && bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
+    // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
+    // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
+    // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール
+    // ドキュメント参照（同一テーブルで異なる TEXT 列を hybrid 本文に指定する 2
+    // クエリを取り違えないため）。
+    let cached_sparse_index: Option<Arc<SparseIndex>> = if sparse_cache_eligible {
+        text_column_index
+            .and_then(|idx| sparse_cache.cache.lookup(read_txn, &bound.table, ctx, idx))
+    } else {
+        None
+    };
+    let skip_sparse_accumulation = cached_sparse_index.is_some();
 
     // 疎コーパスへ蓄積する累計文書数・バイト量。`sparse::SparseIndex::build` の上限
     // （`MAX_CORPUS_DOCS`・`MAX_CORPUS_BYTES`）は `try_alloc_text_for_budget` が
@@ -487,7 +518,11 @@ pub fn execute_statement(
                 }
             }
         }
-        if is_hybrid {
+        // Issue #357: キャッシュヒット時（`skip_sparse_accumulation`）は疎コーパスの
+        // 複製蓄積自体を省略する（フュージョン段でキャッシュ済み索引をそのまま使う
+        // ため、ここで文書を複製・保持する必要がない。上のキャッシュ lookup のドキュ
+        // メント参照）。
+        if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
                 if let Some(Some(t)) = scanned.get(idx) {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
@@ -667,7 +702,10 @@ pub fn execute_statement(
                 raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
             }
             Ranking::Hybrid {
-                query, query_text, ..
+                query,
+                query_text,
+                text_column_index: hybrid_text_column_index,
+                ..
             } => {
                 let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
                 let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
@@ -682,46 +720,84 @@ pub fn execute_statement(
                     query,
                     k: k_eff,
                 };
-                let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
-                    // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                    // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
-                    // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
-                    // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
-                    // `hybrid::hybrid_search` と同じ理由でここでも行う）。
-                    let dense_input = SearchInput {
-                        ids: &slot_ids,
-                        vectors: arena.vectors(),
-                        dim: arena.dim(),
-                        query,
-                        k: cfg.pool_depth(),
+                // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
+                // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
+                // 蓄積した本文）から新規構築し、`sparse_cache_eligible` なら
+                // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
+                // 成否に関わらず構築済みの索引そのものを返す契約。
+                // `sql/sparse_cache.rs` モジュールドキュメント参照）。
+                let sparse_index_for_fusion: Option<Arc<SparseIndex>> =
+                    if let Some(idx) = &cached_sparse_index {
+                        Some(Arc::clone(idx))
+                    } else if sparse_docs.is_empty() {
+                        // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
+                        // `SparseIndex::build` が空コーパスを拒否する
+                        // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
+                        // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
+                        // （`SparseIndex::build` 自体が拒否するため構築できない）。
+                        None
+                    } else {
+                        let doc_refs: Vec<(DocId, &str)> = sparse_docs
+                            .iter()
+                            .map(|(id, text)| (*id, text.as_str()))
+                            .collect();
+                        let built = SparseIndex::build(&doc_refs)
+                            .map_err(HybridError::Sparse)
+                            .map_err(map_hybrid_error)?;
+                        if sparse_cache_eligible {
+                            // `built_generation` はこのクエリの `read_txn` スナップ
+                            // ショットにおけるテーブル世代（`SparseIndexCache::insert`
+                            // の契約。読み取れない場合はキャッシュへ積まず、この場で
+                            // 構築した索引をそのまま使う）。
+                            match crate::catalog::table_generation_in_txn(read_txn, &bound.table) {
+                                Ok(built_generation) => Some(sparse_cache.cache.insert(
+                                    sparse_cache.storage,
+                                    &bound.table,
+                                    ctx,
+                                    *hybrid_text_column_index,
+                                    built,
+                                    built_generation,
+                                )),
+                                Err(_) => Some(Arc::new(built)),
+                            }
+                        } else {
+                            Some(Arc::new(built))
+                        }
                     };
-                    let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                    // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
-                    // キー存在で判定する。TABLE-12 の重複 id については
-                    // `core::provider_result_is_valid` のドキュメント参照）。
-                    if dense_hits
-                        .iter()
-                        .any(|h| !visible_id_counts.contains_key(&h.id))
-                    {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "search provider returned a hit outside the visible id set"
-                                .to_string(),
-                        });
+                let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
+                    None => {
+                        // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
+                        // 密のみの順序契約へ縮退させる（密側の可視性検証は
+                        // `hybrid::hybrid_search` と同じ理由でここでも行う）。
+                        let dense_input = SearchInput {
+                            ids: &slot_ids,
+                            vectors: arena.vectors(),
+                            dim: arena.dim(),
+                            query,
+                            k: cfg.pool_depth(),
+                        };
+                        let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
+                        // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                        // キー存在で判定する。TABLE-12 の重複 id については
+                        // `core::provider_result_is_valid` のドキュメント参照）。
+                        if dense_hits
+                            .iter()
+                            .any(|h| !visible_id_counts.contains_key(&h.id))
+                        {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "search provider returned a hit outside the visible id set"
+                                    .to_string(),
+                            });
+                        }
+                        let mut fused =
+                            hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
+                        fused.truncate(k_eff);
+                        fused
                     }
-                    let mut fused =
-                        hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                    fused.truncate(k_eff);
-                    fused
-                } else {
-                    let doc_refs: Vec<(DocId, &str)> = sparse_docs
-                        .iter()
-                        .map(|(id, text)| (*id, text.as_str()))
-                        .collect();
-                    let sparse_index = SparseIndex::build(&doc_refs)
-                        .map_err(HybridError::Sparse)
-                        .map_err(map_hybrid_error)?;
-                    hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
-                        .map_err(map_hybrid_error)?
+                    Some(idx) => {
+                        hybrid::hybrid_search(provider, input, idx, query_text, k_eff, &cfg)
+                            .map_err(map_hybrid_error)?
+                    }
                 };
                 fused.into_iter().map(|h| (h.id, h.score)).collect()
             }

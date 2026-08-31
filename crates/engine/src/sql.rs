@@ -37,6 +37,9 @@
 //! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
 //!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
 //!   `ORDER BY`・`LIMIT` を担う
+//! - [`sparse_cache`][]: `exec` の hybrid 実行が参照する `SparseIndex`（BM25 語彙・
+//!   統計）のテーブル世代整合キャッシュ（Issue #357）。フィルタなし hybrid クエリに
+//!   限り、同一世代内の連続クエリで疎索引の再構築を償却する
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -93,6 +96,7 @@ pub mod lexer;
 pub mod mode;
 pub mod parser;
 pub mod plan;
+pub(crate) mod sparse_cache;
 pub mod udf_call;
 pub mod using_operation_id;
 pub(crate) mod using_plan;
