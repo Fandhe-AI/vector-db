@@ -190,23 +190,28 @@ fn main() {
     let query = rng.next_vector(DIM);
 
     // --- S4/S5/S5': pub API（`&storage` 使用）。--------------------------------
+    // S4 は「arena 構築の実コスト」のみを対象とする。`harness::protocol::run` は
+    // 戻り値を `black_box` 通過後、計測区間の内側で drop する契約
+    // （`protocol.rs` モジュールコメント・Issue #302）のため、クロージャが
+    // `VectorArena`（ヒープ確保を伴う）をそのまま返すと全バッファの解放コストが
+    // 構築コストへ混入する（codex-review 指摘・PR #378）。構築済み `VectorArena`
+    // は計測区間外の sink（`batch_bench.rs` と同じパターン）へ退避し、クロージャの
+    // 戻り値は軽量な行数のみにすることで解放コストを計測区間外へ追い出す。
+    let s4_total_iterations = (config.warmup_iterations() + config.measured_iterations()) as usize;
+    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(s4_total_iterations);
     let s4 = run(&config, || {
-        VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
+        let built_arena = VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
             policy_ctx.is_visible(tenant, visibility)
         })
-        .expect("arena build must succeed for well-formed synthetic corpus")
+        .expect("arena build must succeed for well-formed synthetic corpus");
+        let row_count = built_arena.len();
+        s4_sink.push(built_arena);
+        row_count
     })
     .expect("measurement must satisfy protocol minimums");
+    // sink に退避した全 `VectorArena` の解放はここで行い、計測区間の外側にする。
+    drop(s4_sink);
     let s4_median = s4.summary.median;
-    println!(
-        "{}",
-        render_stage_line(
-            "S4_arena_build",
-            TOTAL_ROWS,
-            s4_median,
-            ns_per_row(s4_median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     // S5/S5' は事前構築済みの単一アリーナに対して測る（クエリ毎の再構築コストは
     // S4 で分離済みのため、ここでは検索カーネル段のみを対象にする）。
@@ -234,15 +239,6 @@ fn main() {
             .expect("parallel search must succeed for well-formed synthetic input")
     })
     .expect("measurement must satisfy protocol minimums");
-    println!(
-        "{}",
-        render_stage_line(
-            "S5_search_parallel",
-            TOTAL_ROWS,
-            s5_parallel.summary.median,
-            ns_per_row(s5_parallel.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     let scalar_provider = CpuScalarProvider;
     let s5_scalar = run(&config, || {
@@ -257,15 +253,6 @@ fn main() {
             .expect("scalar search must succeed for well-formed synthetic input")
     })
     .expect("measurement must satisfy protocol minimums");
-    println!(
-        "{}",
-        render_stage_line(
-            "S5_search_scalar",
-            TOTAL_ROWS,
-            s5_scalar.summary.median,
-            ns_per_row(s5_scalar.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     let s5_prime = run(&config, || {
         let mut acc = 0.0f32;
@@ -276,15 +263,6 @@ fn main() {
         acc
     })
     .expect("measurement must satisfy protocol minimums");
-    println!(
-        "{}",
-        render_stage_line(
-            "S5prime_distance_only",
-            TOTAL_ROWS,
-            s5_prime.summary.median,
-            ns_per_row(s5_prime.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     // 検索ループの追加コスト分離は S5_scalar − S5' を用いる（S5_parallel − S5' は
     // 使わない）。`ParallelSearchProvider::search` はワーカースレッド生成・行範囲
@@ -301,23 +279,20 @@ fn main() {
     // `s5_prime` と `s5_scalar` は入れ子ではなく独立に計測した別経路であるため、
     // 差分が理論上非負である保証はない（`s5_scalar` 側にのみ `#[inline(never)]`
     // 呼び出しオーバーヘッドが乗らない等の要因で、僅差は測定ノイズにより逆転し
-    // 得る。cursor 指摘・PR #378）。よってこの 1 行のみ非致命扱いとし、負の
+    // 得る。cursor 指摘・PR #378）。よってこの差分のみ非致命扱いとし、負の
     // 差分が出ても `fail_closed` でベンチ全体を中断せず、以降の S0/S1〜S4 の
-    // 計測・出力を継続する（S1〜S4 等の入れ子な累積段の非単調性チェックは
-    // 従来どおり fail-closed を維持する）。
-    match stage_diff_ns_per_row(
+    // 計測を継続する（S1〜S4 等の入れ子な累積段の非単調性チェックは従来どおり
+    // fail-closed を維持する）。出力自体も他の段と同様、全計測・整合性検証が
+    // 完了してからまとめて行う（codex-review 指摘・PR #378。fail-closed 契約に
+    // 反して整合性検証前に測定値を出力しないため、ここでは結果を変数へ保持する
+    // のみで println! しない）。
+    let s5prime_vs_scalar_diff = stage_diff_ns_per_row(
         s5_prime.summary.median,
         s5_scalar.summary.median,
         TOTAL_ROWS,
         "S5prime",
         "S5_scalar",
-    ) {
-        Ok(diff) => println!("{}", render_diff_line("S5prime", "S5_scalar", diff)),
-        Err(e) => println!(
-            "diff(S5prime->S5_scalar): skipped (独立経路間の測定ノイズにより非単調 \
-             ・非致命として継続: {e})"
-        ),
-    }
+    );
 
     // --- S0/S0': SQL 表層 e2e（`EngineCore::execute_sql`）。--------------------
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
@@ -342,15 +317,6 @@ fn main() {
             "S0 result row count mismatch: expected {TOP_K}, got {s0_result_len}"
         ));
     }
-    println!(
-        "{}",
-        render_stage_line(
-            "S0_sql_e2e",
-            TOTAL_ROWS,
-            s0.summary.median,
-            ns_per_row(s0.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
     let s0_prime = run(&config, || {
@@ -358,7 +324,7 @@ fn main() {
             .expect("execute_sql must succeed for COUNT(*) query")
     })
     .expect("measurement must satisfy protocol minimums");
-    // S0 の TOP_K 検証（下記）と同様、計測クロージャの戻り値は `black_box` へ渡す
+    // S0 の TOP_K 検証（上記）と同様、計測クロージャの戻り値は `black_box` へ渡す
     // だけで中身を検証しない。SQL 経路が誤った件数を返しても計測は成功してしまう
     // ため、計測外で COUNT(*) を再実行し値を TOTAL_ROWS と突き合わせる
     // （codex-review 指摘・PR #378。fail-closed）。
@@ -380,15 +346,6 @@ fn main() {
             "S0' COUNT(*) value mismatch: expected {TOTAL_ROWS}, got {count_value}"
         ));
     }
-    println!(
-        "{}",
-        render_stage_line(
-            "S0prime_count_star",
-            TOTAL_ROWS,
-            s0_prime.summary.median,
-            ns_per_row(s0_prime.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     // --- S1〜S3: 生 redb 再オープンでの走査・デコード。--------------------------
     // `core`（`EngineCore::from_storage` が所有する `Storage`）を drop してファイル
@@ -417,15 +374,6 @@ fn main() {
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         table.iter().expect("iter row table").count()
     };
-    println!(
-        "{}",
-        render_stage_line(
-            "S1_redb_scan",
-            TOTAL_ROWS,
-            s1.summary.median,
-            ns_per_row(s1.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
 
     // S2: S1 ＋ ヘッダデコード。
     let s2 = run(&config, || {
@@ -452,24 +400,8 @@ fn main() {
         }
         rows
     };
-    println!(
-        "{}",
-        render_stage_line(
-            "S2_header_decode",
-            TOTAL_ROWS,
-            s2.summary.median,
-            ns_per_row(s2.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
-    println!(
-        "{}",
-        render_diff_line(
-            "S1",
-            "S2",
-            stage_diff_ns_per_row(s1.summary.median, s2.summary.median, TOTAL_ROWS, "S1", "S2")
-                .unwrap_or_else(|e| fail_closed(e)),
-        )
-    );
+    let diff_s1_s2 =
+        stage_diff_ns_per_row(s1.summary.median, s2.summary.median, TOTAL_ROWS, "S1", "S2");
 
     // S3: S2 ＋ f32 デコード。スクラッチバッファはループ間で使い回す
     // （`storage.rs::decode_row_embedding_and_metadata_into` と同じ設計を
@@ -516,43 +448,21 @@ fn main() {
             s3_rows += 1;
         }
     }
-    println!(
-        "{}",
-        render_stage_line(
-            "S3_f32_decode",
-            TOTAL_ROWS,
-            s3.summary.median,
-            ns_per_row(s3.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
-        )
-    );
-    println!(
-        "{}",
-        render_diff_line(
-            "S2",
-            "S3",
-            stage_diff_ns_per_row(s2.summary.median, s3.summary.median, TOTAL_ROWS, "S2", "S3")
-                .unwrap_or_else(|e| fail_closed(e)),
-        )
-    );
-    println!(
-        "{}",
-        render_diff_line(
-            "S3",
-            "S4",
-            stage_diff_ns_per_row(s3.summary.median, s4_median, TOTAL_ROWS, "S3", "S4")
-                .unwrap_or_else(|e| fail_closed(e)),
-        )
-    );
+    let diff_s2_s3 =
+        stage_diff_ns_per_row(s2.summary.median, s3.summary.median, TOTAL_ROWS, "S2", "S3");
+    let diff_s3_s4 = stage_diff_ns_per_row(s3.summary.median, s4_median, TOTAL_ROWS, "S3", "S4");
 
     // --- 残差: S0 -（S4 + S5） ---------------------------------------------------
     let s4_plus_s5 = s4_median.saturating_add(s5_parallel.summary.median);
     let residual = s0.summary.median.saturating_sub(s4_plus_s5);
-    println!(
-        "residual(S0-(S4+S5)): median={:.3}ms (parse/bind/result-assembly 等。read_txn 境界差を含みうる保守的な残差)",
-        residual.as_secs_f64() * 1e3
-    );
 
     // --- 整合性検証（fail-closed） ---------------------------------------------
+    // モジュール冒頭コメントの契約（「不一致ならベンチはエラー終了し測定値を
+    // 出力しない」）どおり、S1〜S4・S0/S0' の全測定・全差分計算を終えたこの時点で
+    // 全チェックを完了させ、以降で初めて結果を出力する（codex-review 指摘・
+    // PR #378: 従来は各段の println! を測定直後に行っていたため、後段の
+    // 整合性チェック〔行数不一致・レイアウトドリフト〕で fail_closed する場合でも
+    // 失敗前に出力済みの測定値が有効な結果として残ってしまっていた）。
     if let Err(e) =
         assert_scan_row_counts_match(&[("S1", s1_rows), ("S2", s2_rows), ("S3", s3_rows)])
     {
@@ -592,6 +502,111 @@ fn main() {
             );
         }
     }
+    // S1〜S3 の入れ子な累積段の差分は非単調なら整合性検証扱いで fail-closed する
+    // （S5prime-S5_scalar のみ独立経路間の測定ノイズを理由に非致命扱い。上記コメント
+    // 参照）。ここで初めて `unwrap_or_else` を評価し、これ以降は出力のみを行う。
+    let diff_s1_s2 = diff_s1_s2.unwrap_or_else(|e| fail_closed(e));
+    let diff_s2_s3 = diff_s2_s3.unwrap_or_else(|e| fail_closed(e));
+    let diff_s3_s4 = diff_s3_s4.unwrap_or_else(|e| fail_closed(e));
+
+    // --- 出力: 全測定・全整合性検証を完了したここまでの間、測定値は一切
+    // println! していない（fail-closed 契約。上記「整合性検証」節参照）。以降は
+    // 検証済みの結果をまとめて出力するのみで、新たな fail_closed 分岐は持たない。
+    println!(
+        "{}",
+        render_stage_line(
+            "S4_arena_build",
+            TOTAL_ROWS,
+            s4_median,
+            ns_per_row(s4_median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S5_search_parallel",
+            TOTAL_ROWS,
+            s5_parallel.summary.median,
+            ns_per_row(s5_parallel.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S5_search_scalar",
+            TOTAL_ROWS,
+            s5_scalar.summary.median,
+            ns_per_row(s5_scalar.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S5prime_distance_only",
+            TOTAL_ROWS,
+            s5_prime.summary.median,
+            ns_per_row(s5_prime.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    match s5prime_vs_scalar_diff {
+        Ok(diff) => println!("{}", render_diff_line("S5prime", "S5_scalar", diff)),
+        Err(e) => println!(
+            "diff(S5prime->S5_scalar): skipped (独立経路間の測定ノイズにより非単調 \
+             ・非致命として継続: {e})"
+        ),
+    }
+    println!(
+        "{}",
+        render_stage_line(
+            "S0_sql_e2e",
+            TOTAL_ROWS,
+            s0.summary.median,
+            ns_per_row(s0.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S0prime_count_star",
+            TOTAL_ROWS,
+            s0_prime.summary.median,
+            ns_per_row(s0_prime.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S1_redb_scan",
+            TOTAL_ROWS,
+            s1.summary.median,
+            ns_per_row(s1.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S2_header_decode",
+            TOTAL_ROWS,
+            s2.summary.median,
+            ns_per_row(s2.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!("{}", render_diff_line("S1", "S2", diff_s1_s2));
+    println!(
+        "{}",
+        render_stage_line(
+            "S3_f32_decode",
+            TOTAL_ROWS,
+            s3.summary.median,
+            ns_per_row(s3.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!("{}", render_diff_line("S2", "S3", diff_s2_s3));
+    println!("{}", render_diff_line("S3", "S4", diff_s3_s4));
+    println!(
+        "residual(S0-(S4+S5)): median={:.3}ms (parse/bind/result-assembly 等。read_txn 境界差を含みうる保守的な残差)",
+        residual.as_secs_f64() * 1e3
+    );
 
     println!("knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S0' COUNT(*) value, S3 vs VectorArena cross-check)");
 }
