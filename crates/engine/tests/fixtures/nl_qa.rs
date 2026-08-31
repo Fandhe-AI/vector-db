@@ -22,6 +22,35 @@
 //! クロスエンコーダ（意味表現に基づく関連度推定）の効果が出うる構成にする
 //! （正解判定は表層語ではなく潜在概念集合 [`Doc::keywords`] のみで行う点は
 //! `rerank_recall.rs::Doc`/`hybrid_recall.rs::Doc` と同じ設計）。
+//!
+//! ## 文書テキスト生成方式（Issue #337 で再設計）
+//!
+//! 旧方式（Issue #333 時点）は「主要 2 概念のみを流暢な英文テンプレート
+//! （[`DOC_TEMPLATES`]）へ埋め込み、3 件目以降の概念は文末へ単語＋ピリオドで
+//! 機械的に追記する」構造だった。QA 生成（[`generate_nl_qa_set`]）は文書内で
+//! 最も出現頻度の低い概念 2 件を正解条件に選ぶため、低頻度概念ほど 3 件目以降の
+//! 追記スロットに落ちやすく、正解概念が非流暢な追記フレーズ側に偏っていた。
+//! 事前学習済みクロスエンコーダ（MS MARCO 学習・流暢な自然文が前提）はこの
+//! 非自然文を「関連性の低いノイズ」に近く扱ってしまい、字句一致リランカーより
+//! 悪化する結果になった（詳細な原因分析は `docs/design/rerank-recall-regression.md`
+//! 「Issue #333 追記」節参照。spec 本文ではなく本リポ独自の分析）。
+//!
+//! 新方式は文書テキストに現れる概念（dropout 後の `ordered_kw`。主要 2 件は
+//! [`DOC_TEMPLATES`] の導入文、3 件目以降は [`CONCEPT_SENTENCE_TEMPLATES`]）の
+//! すべてを完結した英文テンプレートへ 1 概念 1 文で埋め込み、単語の裸追記を
+//! 全廃する。各文は「{ctx} という運用文脈の中で {kw} がどう振る舞うか」を説明する
+//! MS MARCO passage に近い短い説明文で、導入文・3 件目以降の単独文のいずれも
+//! 同じ流暢さの文体にする。これにより QA が選ぶ正解概念がどの位置（2 件目までか
+//! 3 件目以降か）にあっても、テキストに現れる限り常に流暢な自然文中に現れ、
+//! クロスエンコーダの学習分布（流暢な自然文ペアでの関連度判定）と整合する。
+//! 3 件目以降の文テンプレート選択は、正解集合（[`Doc::keywords`]）を決める
+//! キーワード抽選用の rng ストリームとは独立させている（[`generate_nl_corpus`]
+//! 参照。テキスト生成方式の変更だけを独立変数にし、Issue #333 との比較可能性を
+//! 保つための設計）。
+//!
+//! 字句ミスマッチ設計（文書は variant 0・クエリは末尾 variant）・決定的生成
+//! （xorshift64* seed 固定）・疎/密チャネルの dropout・decoy 構造は変更しない
+//! （比較可能性のため。Issue #337 実装計画「fixture 再設計の方針」参照）。
 
 #![allow(dead_code)] // 一部の補助 API は harness 側の feature 分岐によって未使用になりうる。
 
@@ -405,6 +434,26 @@ const QUERY_TEMPLATES: [&str; 3] = [
     "Why does {a} sometimes impact {b}?",
 ];
 
+/// 3 件目以降の概念（[`DOC_TEMPLATES`] の導入文に入らない残りの概念語）を、
+/// 単語の裸追記ではなく完結した英文へ 1 概念 1 文で埋め込むためのテンプレート
+/// （モジュールドキュメント「文書テキスト生成方式（Issue #337 で再設計）」参照）。
+/// `{kw}` は当該概念の variant 0（[`doc_form`]）、`{ctx}` は文書全体で共有する
+/// 運用文脈（[`CONTEXTS`]）に置換する。MS MARCO passage に近い、運用状況・
+/// 因果関係を説明する短い文体で統一し、[`DOC_TEMPLATES`] による導入文と地続きの
+/// 流暢さを保つ。
+const CONCEPT_SENTENCE_TEMPLATES: [&str; 10] = [
+    "Teams operating {ctx} frequently rely on {kw} to keep the system predictable under load.",
+    "A common failure mode surfaced in {ctx} is tied to {kw}, which can quietly degrade reliability if it is ignored.",
+    "When engineers investigate incidents in {ctx}, {kw} is usually one of the first areas they check.",
+    "Documentation for {ctx} recommends monitoring {kw} closely, since problems there tend to cascade quickly.",
+    "Understanding {kw} helps operators of {ctx} reason about trade-offs during peak traffic.",
+    "In postmortems written for {ctx}, {kw} shows up repeatedly as either a root cause or a contributing factor.",
+    "Onboarding material for {ctx} usually introduces {kw} early, since most later topics build on it.",
+    "Capacity reviews for {ctx} routinely revisit {kw} to decide whether current limits still make sense.",
+    "Changes to {ctx} are often evaluated by how they interact with {kw} in production.",
+    "Runbooks for {ctx} describe how {kw} behaves during degraded conditions and how to recover from it.",
+];
+
 /// 合成コーパス 1 文書（`rerank_recall.rs::Doc` と同じ役割: `text`（疎チャネル）・
 /// `vector`（密チャネル）はいずれも潜在概念集合 `keywords` の非完全な観測であり、
 /// 正解判定そのものには使わない）。
@@ -448,6 +497,13 @@ pub fn generate_nl_corpus(
 
     let mut rng = Xorshift64::new(seed);
     let zipf_weights = build_zipf_cumulative_weights(vocab_size);
+    // 3 概念目以降の文テンプレート選択（[`CONCEPT_SENTENCE_TEMPLATES`]）専用の
+    // 独立した rng ストリーム。`rng`（キーワード集合・dropout・vector・ctx/doc
+    // テンプレート選択に使う主ストリーム）から分離することで、Issue #337 の文書
+    // テキスト生成方式の変更が正解集合（`kw_set`・`inverted`。QA の `correct` は
+    // ここから決まる）の抽選そのものへ波及しない不変条件を保つ（テキスト生成の
+    // 変更だけを独立変数にするための意図的な設計。Issue #333 との比較可能性）。
+    let mut sentence_rng = Xorshift64::new(seed ^ 0x9E37_79B9_7F4A_7C15);
 
     let mut docs = Vec::with_capacity(num_docs);
     let mut inverted: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
@@ -481,12 +537,18 @@ pub fn generate_nl_corpus(
             .replace("{a}", doc_form(ordered_kw[0]))
             .replace("{b}", doc_form(ordered_kw[1]))
             .replace("{ctx}", ctx);
-        // 3 語以上ある場合は追加の文で残りの概念語も文書テキストへ含める
-        // （字句一致・密チャネル双方に反映するため）。
+        // 3 概念目以降も [`CONCEPT_SENTENCE_TEMPLATES`] で 1 概念 1 文の完結した
+        // 英文として追記する（旧方式の単語＋ピリオド追記を廃止。Issue #337）。
+        // テンプレート選択は概念ごとに rng で決定的に選び、同一概念でも文書間で
+        // 文体が単調にならないようにする。
         for &extra in ordered_kw.iter().skip(2) {
+            let sentence_template = CONCEPT_SENTENCE_TEMPLATES
+                [sentence_rng.next_range(CONCEPT_SENTENCE_TEMPLATES.len())];
+            let sentence = sentence_template
+                .replace("{kw}", doc_form(extra))
+                .replace("{ctx}", ctx);
             text.push(' ');
-            text.push_str(doc_form(extra));
-            text.push('.');
+            text.push_str(&sentence);
         }
 
         let mut vector_keywords: Vec<usize> = kw_set

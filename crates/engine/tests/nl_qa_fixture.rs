@@ -4,11 +4,16 @@
 //! 持ち込まず、決定性の固定と `LexicalOverlapReranker` 実測値の回帰トラッキング
 //! のみを行う）。
 //!
-//! `cross-encoder` feature（`ort`/`tokenizers`）は本 PR では追加していない
+//! `cross-encoder` feature（`ort`/`tokenizers`）は本ファイルには含めない
 //! （`docs/design/rerank-recall-regression.md`「Issue #333」節参照）ため、
 //! クロスエンコーダの実測はここに含まれない。以下の固定値は
 //! **`LexicalOverlapReranker`（暫定・字句一致方式）のみ**の実測であり、
 //! クロスエンコーダの効果を主張するものではない。
+//!
+//! Issue #337 で `nl_qa.rs` の文書テキスト生成方式を再設計（正解概念の非流暢な
+//! 追記フレーズを全廃し、全概念を流暢な自然文へ埋め込む方式へ変更）したため、
+//! 以下の固定値は再設計後の実測値に更新済み（`docs/design/
+//! rerank-recall-regression.md`「Issue #337」節参照）。
 
 #[path = "fixtures/nl_qa.rs"]
 mod nl_qa;
@@ -51,19 +56,23 @@ fn nl_qa_fixture_corpus_within_limits() {
 /// 方針）。この自然言語 fixture は文書生成に variant 0、クエリ生成に別 variant を
 /// 使う設計（`nl_qa.rs` モジュールドキュメント参照）により字句一致では拾いにくい
 /// クエリ・文書ペアを意図的に作っており、実測は字句一致リランキングが
-/// after_hits20 < baseline_hits20（41 < 43）と *悪化* することを示す
+/// after_hits20 < baseline_hits20（43 < 46）と *悪化* することを示す
 /// （`pool_ceiling_hits20`＝79 の改善余地に対して字句信号が逆効果になりうる
-/// 一例。Issue #333 が方式変更〔クロスエンコーダ〕を検討する動機の直接的な
-/// 裏付けであり、`docs/design/rerank-recall-regression.md`「Issue #333」節にも
-/// 記録する）。
+/// 一例。Issue #337 の fixture 再設計〔正解概念を流暢な自然文へ埋め込む方式へ
+/// 変更。文書テキストの語数増加により `ceil20` は 79 のまま・baseline_hits20 は
+/// 43→46 へ変動——正解集合そのものを決める kw_set/QA 抽選用 rng ストリームは
+/// 文テンプレート選択用ストリームと分離し不変に保っている（`nl_qa.rs::
+/// generate_nl_corpus` 参照）〕後もこの傾向自体は変わらない。字句一致リランカーの
+/// 弱点そのものが Issue #333 が方式変更〔クロスエンコーダ〕を検討する動機であり、
+/// `docs/design/rerank-recall-regression.md`「Issue #337」節にも記録する）。
 #[test]
 fn nl_qa_fixture_lexical_reranker_recall_regression() {
     let (docs, qa) = nl_qa::generate_nl_corpus(SEED, NUM_DOCS, NUM_QUERIES);
     let reranker = LexicalOverlapReranker::default();
     let result = nl_qa::measure_recall_with_reranker(&docs, &qa, &reranker);
 
-    assert_eq!(result.baseline_hits20, 43);
-    assert_eq!(result.after_hits20, 41);
+    assert_eq!(result.baseline_hits20, 46);
+    assert_eq!(result.after_hits20, 43);
     assert_eq!(result.pool_ceiling_hits20, 79);
     assert_eq!(result.ceil20, 79);
 }
