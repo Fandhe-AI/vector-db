@@ -42,9 +42,18 @@
 
 | tier | 内容 | 使用関数 |
 | ---- | ---- | -------- |
-| `Fast` | ヘッダ（tenant・visibility）＋ TABLE-12 のキー/ヘッダ tenant 整合検査のみ | `storage::decode_row_tenant_and_visibility`・`storage::verify_row_key_tenant` |
-| `DimAndScalar` | dim・マスク済み metadata まで。embedding は構造検証のみで `Vec<f32>` へ確保しない | `storage::decode_row_dim_and_metadata_borrowed`・`row_codec::scan_scalar_columns_masked` |
+| `Fast` | ヘッダ（tenant・visibility）＋ TABLE-12 のキー/ヘッダ tenant 整合検査＋ dim・embedding 境界・metadata 境界の構造検証（`Vec<f32>`／`&str` 化は省略） | `storage::decode_row_tenant_and_visibility`・`storage::verify_row_key_tenant`・`storage::decode_row_dim_and_metadata_borrowed` |
+| `DimAndScalar` | `Fast` と同じ構造検証に加え、マスク済み metadata 列の `&str` 化まで行う | `storage::decode_row_dim_and_metadata_borrowed`・`row_codec::scan_scalar_columns_masked` |
 | `Embedding` | embedding を含む完全デコード | `storage::decode_row_embedding_and_metadata_into`（スクラッチ `Vec<f32>` 再利用） |
+
+`Fast` と `DimAndScalar` はどちらもヒープ確保を伴わない
+`storage::decode_row_dim_and_metadata_borrowed`（dim・embedding 境界・metadata 境界・
+末尾余剰バイトの構造検証。破損は `XX000`）を通る。両者の違いは
+`row_codec::scan_scalar_columns_masked` による metadata 列の `&str` 化・保持を
+`Fast` が省略する点のみで、破損検知（fail-closed 契約）に差は無い（PR #369
+codex-review P1 指摘対応。旧実装は `Fast` がこの構造検証自体を丸ごと省略しており、
+破損した可視行を `COUNT(*)`/`SUM(id)` 等の集計結果へ黙って含めてしまう契約変更に
+なっていた）。
 
 `Fast` は `sql::aggregate::execute_aggregate`（`GROUP BY` なし）専用で、
 `needs_embedding`・`needs_vector_presence`・`scalar_mask` がすべて偽、かつ
@@ -74,12 +83,18 @@ green）。
 自体を省略し空スライスを使う（構造検証コストも避ける。読まないデータの構造検証を
 省略しても RLS・結果の正しさに影響しない）。
 
-## 契約変更点（意図的）
+## 契約変更点（PR #369 codex-review P1 対応で撤回）
 
-`DecodeTier::Fast` 到達クエリでは、可視行の embedding/metadata セクションの構造破損・
-次元不一致（従来 `XX000` で query 失敗）を検出しなくなる。RLS 可視性判定・TABLE-12 の
-キー/ヘッダ tenant 整合検査は全 tier で維持するため、テナント境界の弱化ではない。この
-挙動は `sql::aggregate::tests` の固定テスト（後述）で明示的に固定する。
+初版実装では `DecodeTier::Fast` 到達クエリが可視行の embedding/metadata セクションの
+構造破損・次元不一致（従来 `XX000` で query 失敗）を検出しなくなっており、意図的な
+契約変更として記述していた。しかし codex-review（PR #369）の指摘により、この契約
+変更が spec 側の対応する定義変更を伴わないまま行われていた点が P1 として指摘され、
+`Fast` にも `decode_row_dim_and_metadata_borrowed`（ヒープ確保を伴わない構造検証）を
+必ず通す実装へ修正した。これにより従来の `XX000` fail-closed 契約は `Fast` を含む
+全 tier で維持され、契約変更は生じていない（`Fast`/`DimAndScalar`/`Embedding` の差は
+純粋にデコード「範囲」の縮小のみで、検証水準の差ではない）。RLS 可視性判定・
+TABLE-12 のキー/ヘッダ tenant 整合検査は元々全 tier で維持していた。この挙動は
+`sql::aggregate::tests` の固定テスト（後述）で明示的に固定する。
 
 ## `redb::Table::len()` への縮退は不採用
 
@@ -101,11 +116,12 @@ tenant プレフィクスの range scan 化等の更なる最適化はスコー�
 - `crates/engine/src/sql/udf_call.rs`: `references_embedding` の直接参照・`Builtin`/
   `Binary` 経由の間接参照・非参照式
 - `crates/engine/src/sql/aggregate.rs`:
-  `count_star_fastpath_does_not_decode_a_row_with_a_corrupted_embedding_section`
-  （`DecodeTier::Fast` が embedding セクションの破損を検出しないことを実証。契約変更点の
-  固定）・
+  `count_star_fastpath_still_fails_closed_on_corrupted_embedding_section`
+  （`DecodeTier::Fast` が embedding セクションの破損を fail-closed（`XX000`）で
+  検出することを実証。PR #369 codex-review P1 対応の固定）・
   `count_vector_column_on_same_corrupted_row_still_fails_closed`（`VECTOR` 列参照経路
-  〔`DecodeTier::DimAndScalar`〕は同じ破損を従来どおり検出する対照テスト）
+  〔`DecodeTier::DimAndScalar`〕も同じ破損を検出し、`Fast` との検証水準の差が無いことの
+  対照テスト）
 - 既存の結合テスト（`crates/engine/tests/sql_aggregate.rs`・`sql_group_by.rs`）は
   無変更のまま green（`WHERE`・`vec_norm` を含む式・`GROUP BY` 等の end-to-end oracle
   一致を維持）

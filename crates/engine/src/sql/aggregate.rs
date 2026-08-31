@@ -56,9 +56,11 @@ pub(crate) fn accumulator_bug(detail: &str) -> SqlSurfaceError {
 /// embedding（`Some`）か、デコードを省略した状態（`None`。`dim` のみ既知）かで
 /// 埋め分ける。`dim > 0` は「`VECTOR` 列が NULL でない」を表す（
 /// `storage::Row::embedding` が空 = 未設定という既存契約の dim 版）。ファストパス
-/// （[`DecodeTier::Fast`]）では `dim` 自体も未知のため `0`（NULL 相当）で埋める——
-/// ファストパス到達条件は `VectorColumnPresence`/`ScalarExpr` 系項目を含まないため
-/// この値が集計結果へ影響することはない。
+/// （[`DecodeTier::Fast`]）でも `dim` は `decode_row_dim_and_metadata_borrowed`
+/// による構造検証込みの実値を持つ（PR #369 codex-review P1 対応。破損行を fail-open
+/// で見逃さないための変更で、値自体はファストパス到達条件
+/// （`VectorColumnPresence`/`ScalarExpr` 系項目を含まない）により集計結果へは
+/// 影響しない）。
 pub(crate) struct RowVector<'a> {
     pub(crate) dim: u32,
     pub(crate) values: Option<&'a [f32]>,
@@ -178,10 +180,14 @@ impl ReferencedColumns {
 /// 順序・全行実行には関与しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodeTier {
-    /// ヘッダ（tenant・visibility）のみ。`COUNT(*)`・`COUNT(id)`・
-    /// `SUM`/`AVG`/`MIN`/`MAX(id)` のみ・`WHERE` 述語なし・`GROUP BY` なしの場合に
-    /// 限り選択する（受入条件 3。単一行集計〔`execute_aggregate`〕専用で、
-    /// `GROUP BY` はグループキー列を必ず読む必要があるため到達しない）。
+    /// `COUNT(*)`・`COUNT(id)`・`SUM`/`AVG`/`MIN`/`MAX(id)` のみ・`WHERE` 述語なし・
+    /// `GROUP BY` なしの場合に限り選択する（受入条件 3。単一行集計
+    /// 〔`execute_aggregate`〕専用で、`GROUP BY` はグループキー列を必ず読む必要が
+    /// あるため到達しない）。dim・metadata の構造検証は `DimAndScalar` と同じ
+    /// `decode_row_dim_and_metadata_borrowed` を通す（PR #369 codex-review P1
+    /// 対応。破損した可視行を fail-open で集計へ含めない）。`DimAndScalar` との
+    /// 違いは metadata の `&str` 化・保持（`scan_scalar_columns_masked`）を
+    /// 省略する点のみ。
     Fast,
     /// dim・metadata（マスク済み `scan_scalar_columns_masked`）まで。embedding は
     /// 構造検証のみで `Vec<f32>` へ確保しない
@@ -650,9 +656,19 @@ pub(crate) fn execute_aggregate(
             // 対象を持たない `0` で表す（ファストパス到達条件は `VECTOR` 列・
             // スカラー列のいずれも参照しないため、この値が誤って観測に使われる
             // ことはない）。
+            // `DecodeTier::Fast` も `DecodeTier::DimAndScalar` と同じ
+            // `decode_row_dim_and_metadata_borrowed`（ヒープ確保を伴わない構造検証
+            // のみ・embedding は境界検証のみで `Vec<f32>` へ確保しない）を必ず通す
+            // （codex-review P1 指摘・PR #369: `DecodeTier::Fast` が embedding/
+            // metadata セクションの切断・長さ不整合・次元不一致を検査せず破損した
+            // 可視行を集計結果へ含めてしまう fail-open な契約変更になっていたため。
+            // `Fast` が省略するのは metadata の `&str` 化・保持
+            // （`scan_scalar_columns_masked`。呼び出し側で
+            // `any_scalar_column_referenced()` が偽の場合は既に省略済み）と
+            // embedding の `f32` 変換・確保（`decode_row_embedding_and_metadata_into`）
+            // だけであり、破損検知（`XX000`）は全 tier で維持する）。
             let (dim, metadata): (u32, &[u8]) = match tier {
-                DecodeTier::Fast => (0, &[]),
-                DecodeTier::DimAndScalar => {
+                DecodeTier::Fast | DecodeTier::DimAndScalar => {
                     storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
                 }
                 DecodeTier::Embedding => {
@@ -665,8 +681,9 @@ pub(crate) fn execute_aggregate(
             // `storage::Row` の既存契約に従い、次元検証は値が実際に存在する行に
             // だけ行う。空を無条件に次元不一致として拒否すると、`COUNT(*)` 等
             // `VECTOR` 値を参照しない集計まで nullable 列の NULL 行で `XX000`
-            // 失敗する（PR #229 codex-review 指摘対応）。`DecodeTier::Fast` は
-            // dim 自体を読まないためこの検証を経ない（3.5 の契約変更点）。
+            // 失敗する（PR #229 codex-review 指摘対応）。`DecodeTier::Fast` も
+            // dim を実際に読むため（PR #369 codex-review P1 対応）この検証を
+            // 同じく経る。
             if let Some(expected) = expected_dim {
                 if dim != 0 && dim != expected {
                     return Err(SqlSurfaceError::Internal {
@@ -902,16 +919,17 @@ mod tests {
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
     }
 
-    // --- DecodeTier::Fast の実証（Issue #350） ---------------------------------
+    // --- DecodeTier::Fast の破損検知（Issue #350・PR #369 codex-review P1 対応） ---
 
     #[test]
-    fn count_star_fastpath_does_not_decode_a_row_with_a_corrupted_embedding_section() {
+    fn count_star_fastpath_still_fails_closed_on_corrupted_embedding_section() {
         // `COUNT(*)`（`WHERE` なし・`VECTOR`/スカラー列参照なし）は
-        // `DecodeTier::Fast` に到達し、ヘッダ（tenant・visibility）と TABLE-12 の
-        // キー/ヘッダ tenant 整合検査だけで完結する。embedding セクションの `dim`
-        // フィールドを構造的に破綻させても数え上げが成功することで、実際に
-        // embedding/metadata が一切デコードされていないことを実証する（3.5 の
-        // 契約変更点の固定テスト）。
+        // `DecodeTier::Fast` に到達するが、`decode_row_dim_and_metadata_borrowed`
+        // による構造検証（ヒープ確保は伴わない）を `DecodeTier::DimAndScalar` と
+        // 共有するため、embedding セクションの `dim` フィールドを構造的に
+        // 破綻させた行は fail-closed（`XX000`）で拒否される（PR #369
+        // codex-review P1 指摘対応: 従来案のように破損可視行を集計結果へ
+        // 黙って含めない）。
         let path = unique_db_path("agg-fastpath-corrupt");
         let _guard = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
@@ -933,17 +951,17 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
-            .expect("COUNT(*) fast path must not decode the corrupted embedding/metadata section");
-        assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+            .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
+        assert_eq!(err.wire_code(), "XX000");
     }
 
     #[test]
     fn count_vector_column_on_same_corrupted_row_still_fails_closed() {
         // 同じ破損行に対し、`VECTOR` 列を参照する `COUNT(embedding)`
-        // （`DecodeTier::DimAndScalar`）は dim フィールドを実際に読むため、
-        // 破損を検出して `Err`（`XX000`）になる——参照経路の検証水準は
-        // 変わっていないことの対照テスト。
+        // （`DecodeTier::DimAndScalar`）も同じく dim フィールドを実際に読むため、
+        // 破損を検出して `Err`（`XX000`）になる——`Fast`/`DimAndScalar` 間で
+        // 検証水準に差が無いことの対照テスト。
         let path = unique_db_path("agg-dimscalar-corrupt");
         let _guard = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
