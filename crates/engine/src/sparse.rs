@@ -887,32 +887,59 @@ impl SparseIndex {
         Ok(scored)
     }
 
+    /// `BTreeMap`/`Vec` の 1 エントリあたりのアロケータ管理領域・ノードポインタ分の
+    /// 概算オーバーヘッド（Issue #357 レビュー指摘対応・codex-review P1:
+    /// [`Self::approx_heap_bytes`] が文字列長・キー/値サイズしか加算せず
+    /// `MAX_SPARSE_CACHE_TOTAL_BYTES` の DoS 防御を過少計上で回避できた問題への
+    /// 対応。実際の `BTreeMap` B-tree ノードは複数エントリを 1 ブロックへまとめて
+    /// 確保するため実測値はこれより小さくなり得るが、本関数はそもそも「厳密な
+    /// メモリ計測ではなく DoS 対策のための粗い上限判定用」（下記コメント）の
+    /// ため、実確保量を下回らないよう安全側に保守的な固定値を使う）。
+    const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
+
     /// この `SparseIndex` が保持するヒープ確保分の概算バイト量（Issue #357・
     /// `sql/sparse_cache.rs::SparseIndexCache` の容量判定用）。`dictionary.rs::
     /// Dictionary::approx_heap_bytes` と同じ「厳密なメモリ計測ではなく DoS 対策の
-    /// ための粗い上限判定用」という位置づけの概算であり、`docs`（文書ごとの
-    /// `term_freq` の `String` キー・エントリ分）・`doc_freq`（語彙 `String` キー分）・
-    /// `id_index`（`DocId` → `usize` のエントリ分）を加算する。
+    /// ための粗い上限判定用」という位置づけの概算だが、Issue #357 レビュー指摘
+    /// 対応（codex-review P1）により以下をすべて加算するよう見直した:
+    /// `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() * size_of::<DocEntry>()`〕
+    /// ＋各文書の `term_freq` の `String` キー容量・`u32` 値・`BTreeMap` ノード
+    /// オーバーヘッド分）・`doc_freq`（語彙 `String` キー容量・`u32` 値・ノード
+    /// オーバーヘッド分）・`id_index`（`DocId` → `usize` のエントリ分＋ノード
+    /// オーバーヘッド分）。`String` は `len()` ではなく `capacity()` を使う
+    /// （成長により確保容量が長さを上回り得るため、下回らない側の概算にする）。
     pub fn approx_heap_bytes(&self) -> usize {
-        let docs: usize = self
+        let docs_container = self
+            .docs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DocEntry>());
+        let docs_term_freq: usize = self
             .docs
             .iter()
             .map(|d| {
                 d.term_freq
                     .keys()
-                    .map(|k| k.len().saturating_add(16))
+                    .map(|k| {
+                        k.capacity()
+                            .saturating_add(std::mem::size_of::<u32>())
+                            .saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES)
+                    })
                     .fold(0usize, |acc, n| acc.saturating_add(n))
             })
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        let docs = docs_container.saturating_add(docs_term_freq);
         let doc_freq: usize = self
             .doc_freq
             .keys()
-            .map(|k| k.len().saturating_add(16))
+            .map(|k| {
+                k.capacity()
+                    .saturating_add(std::mem::size_of::<u32>())
+                    .saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES)
+            })
             .fold(0usize, |acc, n| acc.saturating_add(n));
-        let id_index: usize = self
-            .id_index
-            .len()
-            .saturating_mul(std::mem::size_of::<(DocId, usize)>());
+        let id_index: usize = self.id_index.len().saturating_mul(
+            std::mem::size_of::<(DocId, usize)>().saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES),
+        );
         docs.saturating_add(doc_freq).saturating_add(id_index)
     }
 }

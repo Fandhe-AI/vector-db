@@ -2048,17 +2048,17 @@ impl EngineCore {
                     (read_txn, schema, bound)
                 };
                 let (read_txn, schema, bound) = bound_result;
-                let result = crate::sql::exec::execute_statement(
+                let result = crate::sql::exec::execute_statement_with_cache(
                     &read_txn,
                     self.provider.as_ref(),
                     ctx,
                     &schema,
                     &bound,
                     &self.precision_policy,
-                    crate::sql::sparse_cache::SparseCacheAccess {
+                    Some(crate::sql::sparse_cache::SparseCacheAccess {
                         storage: &self.storage,
                         cache: &self.sparse_index_cache,
-                    },
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -4259,17 +4259,17 @@ mod tests {
             other => panic!("expected Ranking::Hybrid, got {other:?}"),
         }
 
-        let result = crate::sql::exec::execute_statement(
+        let result = crate::sql::exec::execute_statement_with_cache(
             &read_txn,
             core.provider.as_ref(),
             &ctx,
             &schema,
             &bound,
             &core.precision_policy,
-            crate::sql::sparse_cache::SparseCacheAccess {
+            Some(crate::sql::sparse_cache::SparseCacheAccess {
                 storage: &core.storage,
                 cache: &core.sparse_index_cache,
-            },
+            }),
         )
         .expect("execute_statement should succeed");
         let row = result

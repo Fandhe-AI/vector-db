@@ -129,16 +129,30 @@ impl SparseIndexCache {
     }
 
     /// `(table, ctx, text_column_index)` に一致し、`read_txn` のスナップショットに
-    /// おけるテーブル世代と整合するエントリを探す。世代不一致のエントリは見つけ
-    /// 次第破棄する（fail-closed。`core.rs::PrefilterCache::lookup` と同じ方針）。
-    /// ロック毒化・世代読み取り失敗はいずれも「見つからなかった」として扱う。
+    /// おけるテーブル世代と整合するエントリを探す。ロック毒化・世代読み取り失敗は
+    /// いずれも「見つからなかった」として扱う（fail-closed。
+    /// `core.rs::PrefilterCache::lookup` と同じ方針）。
     ///
     /// `read_txn` は呼び出し元（`sql::exec::execute_statement`）がこのクエリ全体で
     /// 使う単一の read トランザクションそのものを渡す契約とする（新規トランザクション
     /// を開かない）。これにより、ここで読む世代は呼び出し元がこれから走査する行集合と
     /// 同一スナップショットのものになる。
+    ///
+    /// **世代不一致時の破棄条件（Issue #357 レビュー指摘対応・codex-review P2・
+    /// Cursor Bugbot 指摘）**: `read_txn` は呼び出し元ごとに異なるスナップショット
+    /// （古い可能性がある）であり、`current_generation`（`read_txn` から読んだ世代）
+    /// より新しいエントリが存在し得る。そのエントリは「この `read_txn` の視点では
+    /// 使えない（ミス）」が、真に stale なわけではなく、より新しいスナップショット
+    /// から見る別の in-flight クエリにとっては依然有効な場合がある。そのため
+    /// エントリを見つけ次第破棄はせず、`storage`（`SparseIndexCache::insert` と
+    /// 同様に新規 read トランザクションで再読取する。並行書き込みとの競合検出用）
+    /// から読んだ「真に最新の」世代と比較し、エントリがそれより厳密に古い場合
+    /// （`entry.built_generation < true_current_generation`）に限り stale と判定して
+    /// 破棄する。世代は単調増加のため `entry.built_generation` が真の最新世代を
+    /// 上回ることはない。
     pub(crate) fn lookup(
         &self,
+        storage: &Storage,
         read_txn: &redb::ReadTransaction,
         table: &str,
         ctx: &PolicyContext,
@@ -152,24 +166,28 @@ impl SparseIndexCache {
         let position = guard.entries.iter().position(|e| {
             e.table == table && &e.ctx == ctx && e.text_column_index == text_column_index
         })?;
-        let stale = guard
-            .entries
-            .get(position)
-            .map(|e| e.built_generation != current_generation)
-            .unwrap_or(true);
-        if stale {
-            guard.entries.remove(position);
-            self.stale_evictions.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let index = {
+        let built_generation = guard.entries.get(position)?.built_generation;
+        if built_generation == current_generation {
             let entry = guard.entries.get_mut(position)?;
             entry.last_used = seq;
-            Arc::clone(&entry.index)
+            let index = Arc::clone(&entry.index);
+            drop(guard);
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(index);
+        }
+        // 不一致。`read_txn`（呼び出し元のスナップショット）視点ではミスだが、
+        // 破棄してよいのはエントリが真に stale（最新世代より古い）と確認できた
+        // 場合のみ（上記ドキュメント参照）。真の最新世代を読めない場合は破棄を
+        // 諦める（fail-closed。古い可能性のある `read_txn` の世代だけを根拠に
+        // 有効な可能性があるエントリを消さない）。
+        let Ok(true_current_generation) = storage.table_generation(table) else {
+            return None;
         };
-        drop(guard);
-        self.hits.fetch_add(1, Ordering::Relaxed);
-        Some(index)
+        if built_generation < true_current_generation {
+            guard.entries.remove(position);
+            self.stale_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+        None
     }
 
     /// 新規構築した索引を挿入する。`built_generation` は呼び出し元が構築に使った
@@ -229,11 +247,18 @@ impl SparseIndexCache {
             guard.entries.remove(pos);
         }
 
-        // 現在世代と不整合なエントリを先に全破棄する。
+        // 現在世代と不整合なエントリを先に破棄する。テーブルごとに世代カウンタが
+        // 独立している（モジュールドキュメント「キーと世代」参照）ため、
+        // `current_generation` は挿入対象テーブル自身の世代であり、他テーブルの
+        // エントリと比較しても無意味（Issue #357 レビュー指摘対応・codex-review
+        // P2・Cursor Bugbot 指摘: 従来は `built_generation == current_generation`
+        // を全エントリへ一律適用しており、他テーブルの有効なエントリまで
+        // 世代不一致と誤判定して破棄していた）。同一テーブルのエントリに限定して
+        // 世代不一致を判定する。
         let before = guard.entries.len();
         guard
             .entries
-            .retain(|e| e.built_generation == current_generation);
+            .retain(|e| e.table != table || e.built_generation == current_generation);
         let removed_stale = before.saturating_sub(guard.entries.len());
         if removed_stale > 0 {
             self.stale_evictions
@@ -342,7 +367,7 @@ mod tests {
         let inserted = cache.insert(&storage, "docs", &c, 0, sample_index(), gen);
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        let hit = cache.lookup(&read_txn2, "docs", &c, 0);
+        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0);
         assert!(hit.is_some());
         assert!(Arc::ptr_eq(&hit.unwrap(), &inserted));
         assert_eq!(cache.stats().hits, 1);
@@ -367,7 +392,7 @@ mod tests {
         crate::recovery::commit_boundary::commit(write_txn).unwrap();
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        let hit = cache.lookup(&read_txn2, "docs", &c, 0);
+        let hit = cache.lookup(&storage, &read_txn2, "docs", &c, 0);
         assert!(hit.is_none(), "stale entry must be evicted, not reused");
         assert_eq!(cache.stats().stale_evictions, 1);
     }
@@ -387,7 +412,9 @@ mod tests {
         cache.insert(&storage, "docs", &owner, 0, sample_index(), gen);
 
         let read_txn2 = storage.db().begin_read().unwrap();
-        assert!(cache.lookup(&read_txn2, "docs", &other, 0).is_none());
+        assert!(cache
+            .lookup(&storage, &read_txn2, "docs", &other, 0)
+            .is_none());
     }
 
     #[test]
@@ -412,12 +439,12 @@ mod tests {
         // text_column_index = 2（例: title 列）での lookup はミスでなければならない。
         let read_txn2 = storage.db().begin_read().unwrap();
         assert!(
-            cache.lookup(&read_txn2, "docs", &c, 2).is_none(),
+            cache.lookup(&storage, &read_txn2, "docs", &c, 2).is_none(),
             "a different text_column_index must not hit the entry built for another column"
         );
         // 同一 text_column_index (=1) の lookup は引き続きヒットする。
         let read_txn3 = storage.db().begin_read().unwrap();
-        assert!(cache.lookup(&read_txn3, "docs", &c, 1).is_some());
+        assert!(cache.lookup(&storage, &read_txn3, "docs", &c, 1).is_some());
     }
 
     #[test]
@@ -444,7 +471,7 @@ mod tests {
 
         // ただしキャッシュへは反映されていない（次の lookup はミス）。
         let read_txn2 = storage.db().begin_read().unwrap();
-        assert!(cache.lookup(&read_txn2, "docs", &c, 0).is_none());
+        assert!(cache.lookup(&storage, &read_txn2, "docs", &c, 0).is_none());
         assert_eq!(cache.stats().entries, 0);
     }
 
@@ -465,5 +492,82 @@ mod tests {
         let stats = cache.stats();
         assert!(stats.entries <= MAX_SPARSE_CACHE_ENTRIES);
         assert!(stats.capacity_evictions >= 1);
+    }
+
+    #[test]
+    fn insert_does_not_evict_valid_entries_of_other_tables() {
+        // Issue #357 レビュー指摘対応（codex-review P2・Cursor Bugbot 指摘）:
+        // `insert` の世代不一致 retain がテーブル横断で全エントリを見てしまうと、
+        // 挿入対象テーブルの世代（他テーブルとは無関係な値）とたまたま一致しない
+        // 他テーブルの有効なエントリまで誤って破棄してしまう。
+        let path = unique_db_path("sparse-cache-cross-table");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs_a");
+        create_table(&storage, "docs_b");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // docs_a へ挿入した後、書き込みで世代を進める（docs_a 自身の世代のみ）。
+        let read_txn_a = storage.db().begin_read().unwrap();
+        let gen_a = crate::catalog::table_generation_in_txn(&read_txn_a, "docs_a").unwrap();
+        cache.insert(&storage, "docs_a", &c, 0, sample_index(), gen_a);
+        let write_txn = storage.db().begin_write().unwrap();
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs_a").unwrap();
+        crate::recovery::commit_boundary::commit(write_txn).unwrap();
+
+        // docs_b へ挿入する時点で docs_a のキャッシュエントリは docs_a 自身の
+        // 世代とは既に不整合（bump 済み）だが、docs_b への insert がこれを
+        // 巻き込んで破棄してはならない。
+        let read_txn_b = storage.db().begin_read().unwrap();
+        let gen_b = crate::catalog::table_generation_in_txn(&read_txn_b, "docs_b").unwrap();
+        cache.insert(&storage, "docs_b", &c, 0, sample_index(), gen_b);
+
+        assert_eq!(
+            cache.stats().entries,
+            2,
+            "docs_b insert must not evict docs_a's differently-generationed entry"
+        );
+    }
+
+    #[test]
+    fn lookup_does_not_delete_newer_entry_when_caller_snapshot_is_stale() {
+        // Issue #357 レビュー指摘対応（Cursor Bugbot 指摘）: 呼び出し元の
+        // `read_txn` が古いスナップショットの場合、そのスナップショット視点の
+        // 世代と不一致というだけで、より新しい（真に有効な）エントリを
+        // 削除してはならない。
+        let path = unique_db_path("sparse-cache-old-snapshot");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs");
+        let cache = SparseIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // 古いスナップショット（in-flight クエリを模す）を先に開始しておく。
+        let old_read_txn = storage.db().begin_read().unwrap();
+
+        // その後、世代を 1 つ進めてから新しい索引を挿入する（新しいスナップ
+        // ショットの世代で構築・挿入）。
+        let write_txn = storage.db().begin_write().unwrap();
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").unwrap();
+        crate::recovery::commit_boundary::commit(write_txn).unwrap();
+        let fresh_read_txn = storage.db().begin_read().unwrap();
+        let fresh_gen = crate::catalog::table_generation_in_txn(&fresh_read_txn, "docs").unwrap();
+        cache.insert(&storage, "docs", &c, 0, sample_index(), fresh_gen);
+        assert_eq!(cache.stats().entries, 1);
+
+        // 古いスナップショットからの lookup はミス（世代が違うので使えない）だが、
+        // 真に新しい有効なエントリを削除してはならない。
+        let miss = cache.lookup(&storage, &old_read_txn, "docs", &c, 0);
+        assert!(miss.is_none());
+        assert_eq!(
+            cache.stats().entries,
+            1,
+            "an old-snapshot lookup miss must not delete a genuinely newer, still-valid entry"
+        );
+
+        // 新しいスナップショットからの lookup は引き続きヒットする。
+        let hit = cache.lookup(&storage, &fresh_read_txn, "docs", &c, 0);
+        assert!(hit.is_some());
     }
 }
