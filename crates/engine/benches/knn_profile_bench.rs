@@ -286,28 +286,38 @@ fn main() {
         )
     );
 
-    // Top-k 選出コストの分離は S5_scalar − S5' を用いる（S5_parallel − S5' は
+    // 検索ループの追加コスト分離は S5_scalar − S5' を用いる（S5_parallel − S5' は
     // 使わない）。`ParallelSearchProvider::search` はワーカースレッド生成・行範囲
     // 分割・部分 Top-k・結果マージ・入力検証を含み、`s5_prime`（呼び出し元スレッド
-    // で `dot_wrapper` を逐次実行するのみ）との差分に Top-k 選出（`BinaryHeap`
-    // 部分ソート）以外の並列化コストが混在してしまう（codex-review 指摘・PR #378）。
-    // `s5_scalar`（`CpuScalarProvider`）は `s5_prime` と同じ単線・逐次走査条件の
-    // ため、この差分であれば Top-k 選出コストへ帰属できる。
-    println!(
-        "{}",
-        render_diff_line(
-            "S5prime",
-            "S5_scalar",
-            stage_diff_ns_per_row(
-                s5_prime.summary.median,
-                s5_scalar.summary.median,
-                TOTAL_ROWS,
-                "S5prime",
-                "S5_scalar",
-            )
-            .unwrap_or_else(|e| fail_closed(e)),
-        )
-    );
+    // で `dot_wrapper` を逐次実行するのみ）との差分には並列化コストが混在して
+    // しまう（codex-review 指摘・PR #378）。`s5_scalar`（`CpuScalarProvider`）は
+    // `s5_prime` と同じ単線・逐次走査条件のため、並列化コストは混在しない。ただし
+    // `CpuScalarProvider::search` は Top-k 選出（`BinaryHeap` 部分ソート）のほかにも
+    // 次元検証・クエリの有限値検査・行ごとの範囲取得（境界チェック付き slice）・
+    // スコアの有限値検査・候補構築を行うため、この差分は「Top-k 選出のみ」の
+    // コストではなく「Top-k を含む検索ループ全体の追加コスト」である
+    // （codex-review 指摘・PR #378）。
+    //
+    // `s5_prime` と `s5_scalar` は入れ子ではなく独立に計測した別経路であるため、
+    // 差分が理論上非負である保証はない（`s5_scalar` 側にのみ `#[inline(never)]`
+    // 呼び出しオーバーヘッドが乗らない等の要因で、僅差は測定ノイズにより逆転し
+    // 得る。cursor 指摘・PR #378）。よってこの 1 行のみ非致命扱いとし、負の
+    // 差分が出ても `fail_closed` でベンチ全体を中断せず、以降の S0/S1〜S4 の
+    // 計測・出力を継続する（S1〜S4 等の入れ子な累積段の非単調性チェックは
+    // 従来どおり fail-closed を維持する）。
+    match stage_diff_ns_per_row(
+        s5_prime.summary.median,
+        s5_scalar.summary.median,
+        TOTAL_ROWS,
+        "S5prime",
+        "S5_scalar",
+    ) {
+        Ok(diff) => println!("{}", render_diff_line("S5prime", "S5_scalar", diff)),
+        Err(e) => println!(
+            "diff(S5prime->S5_scalar): skipped (独立経路間の測定ノイズにより非単調 \
+             ・非致命として継続: {e})"
+        ),
+    }
 
     // --- S0/S0': SQL 表層 e2e（`EngineCore::execute_sql`）。--------------------
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
