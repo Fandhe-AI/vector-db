@@ -98,6 +98,11 @@ pub mod parser;
 pub mod plan;
 pub(crate) mod sparse_cache;
 pub mod udf_call;
+
+/// `EngineCore::sparse_index_cache_stats`（`pub`）の戻り値型を外部から
+/// 名前解決可能にするための再エクスポート。`sparse_cache` モジュール自体は
+/// 内部実装として `pub(crate)` のまま維持する（codex-review 指摘対応）。
+pub use sparse_cache::SparseIndexCacheStats;
 pub mod using_operation_id;
 pub(crate) mod using_plan;
 
