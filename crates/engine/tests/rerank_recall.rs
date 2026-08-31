@@ -32,22 +32,28 @@
 //!   ことも独立にアサートする。spec の数値基準は使わないため public 資産に閾値を
 //!   持ち込まない（`.claude/rules/spec-confidentiality.md`）
 //! - 層 B（`#[ignore]`・`make rerank-regression` 経由）: spec 由来の Recall 下限
-//!   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限・
-//!   `RERANK_RECALL_MIN_R20_IMPROVEMENT`＝baseline からの改善幅の下限）と実測値を
-//!   比較する閾値ゲート。Issue #330（SEARCH-7 改訂・vector-db-spec#7）により
-//!   `RERANK_RECALL_MIN_R20_IMPROVEMENT` の判定基準は絶対差（after − baseline）
-//!   から候補プール上限に対する相対比率（[`RerankRecallResult::improvement_
-//!   ratio`]＝`(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`）
-//!   へ再定義した。「(1) 非劣化 `after_hits20 >= baseline_hits20`」と「(2) 相対
-//!   比率が下限以上」の 2 条件からなり、改善余地（分母）が構造的にほぼ 0 の場合は
-//!   (2) を自動充足として (1) のみで判定する（`.github/workflows/recall.yml` が
-//!   environment `recall-gate` の Actions variables から注入）。`RERANK_RECALL_
-//!   REQUIRE_THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で未設定を
-//!   fail-closed にする strict モードを持つ（`hybrid_recall.rs::resolve_gate_
-//!   threshold` と同型。ログには対象名と pass/fail のみを出力し、実測値は
-//!   `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時
-//!   のみ追加出力する〔`resolve_verbose`・`verbose_requested_from_env`・
-//!   `render_gate_line`〕）
+//!   （`RERANK_RECALL_MIN_R20_LARGE`＝リランキング後の最終 Recall@20 の絶対下限）
+//!   と実測値を比較し、あわせて非劣化（`after_hits20 >= baseline_hits20`）を
+//!   ブロッキング条件とする閾値ゲート。改善幅（[`RerankRecallResult::
+//!   improvement_ratio`]＝候補プール上限に対する相対比率
+//!   `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`）は
+//!   SEARCH-7 改訂（2026-08-31・vector-db-spec#8）により実コーパス評価まで
+//!   informational（非ブロッキング）へ降格した——Issue #330・#333・#337 で
+//!   字句一致方式・クロスエンコーダ方式の 2 方式 × 2 fixture の全実測が
+//!   improvement_ratio 0.222・0 で下限未達であり、原因が合成 fixture 側の
+//!   構造要因（キーワード抽選による正解集合・表層語の偶発重複・人工的語彙密度。
+//!   `docs/design/rerank-recall-regression.md`「SEARCH-7 改訂（2026-08-31）」節
+//!   参照）と判明したため。`after_recall@20` 等の閾値近傍の実測値は
+//!   `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時に
+//!   限りログ出力する一方、informational な `improvement_ratio`（判定に使わない
+//!   実測値。閾値そのものは含まない）は `verbose`／`GITHUB_ACTIONS` の有無に
+//!   かかわらず常時ログ出力する（codex-review P1・PR #340。通常 CI 実行から
+//!   実測値が一切記録できなくなっていた抜けを塞ぐ）。`RERANK_RECALL_
+//!   REQUIRE_THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で
+//!   `RERANK_RECALL_MIN_R20_LARGE` の未設定を fail-closed にする strict モードを
+//!   持つ（`hybrid_recall.rs::resolve_gate_threshold` と同型。`after_recall@20` の
+//!   ログには対象名と pass/fail のみを出力する〔`resolve_verbose`・
+//!   `verbose_requested_from_env`・`render_gate_line`〕）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 同梱リランカー（[`LexicalOverlapReranker`]）は方式確定までの暫定実装
@@ -357,14 +363,15 @@ impl RerankRecallResult {
             .saturating_sub(self.baseline_hits20)
     }
 
-    /// Issue #330（SEARCH-7 改訂）: `RERANK_RECALL_MIN_R20_IMPROVEMENT` ゲートが
-    /// 比較する改善幅を、絶対差（after − baseline）から候補プール上限に対する
-    /// 相対比率 `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)` へ
-    /// 再定義したもの。改善余地（分母）がコーパス全体理論上限 `ceil20` の 1%
-    /// （`< 0.01 × ceil20`）未満の場合は、構造的にほぼ改善不可能な状況であり相対比率
-    /// の分母が 0 に近づき不安定になるため `None` を返す（fail-closed の分母 0
-    /// 対策を兼ねる）。呼び出し側は `None` を「条件(2)は自動充足」として扱う
-    /// （条件(1)＝非劣化のみで判定する）。
+    /// baseline からの改善幅を、絶対差（after − baseline）ではなく候補プール上限に
+    /// 対する相対比率 `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`
+    /// として表したもの（Issue #330・SEARCH-7 改訂）。改善余地（分母）がコーパス
+    /// 全体理論上限 `ceil20` の 1%（`< 0.01 × ceil20`）未満の場合は、構造的にほぼ
+    /// 改善不可能な状況であり相対比率の分母が 0 に近づき不安定になるため `None` を
+    /// 返す（fail-closed の分母 0 対策を兼ねる）。この値は SEARCH-7 改訂
+    /// （2026-08-31・vector-db-spec#8）により実コーパス評価まで informational
+    /// （非ブロッキング。層 B ゲートの判定には使わない）。層 A・層 B いずれも実測値の
+    /// ログ出力にのみ使う。
     fn improvement_ratio(&self) -> Option<f64> {
         let headroom = self.improvement_headroom();
         if (headroom as f64) < 0.01 * self.ceil20 as f64 {
@@ -628,32 +635,19 @@ fn rerank_recall_large_scale_regression() {
 
 // ---------- 層 B: spec 閾値ゲート（`#[ignore]`。`make rerank-regression` 専用） ----------
 
-/// 層 B の改善幅ゲート判定ロジック（環境変数非依存の純関数）。
-///
-/// `rerank_recall_large_scale_threshold_gate` にインライン展開されていた判定式
-/// （条件(1) 非劣化 `after_hits20 >= baseline_hits20` と条件(2) [`RerankRecallResult::
-/// improvement_ratio`] が `threshold` 以上〔`None`＝改善余地が構造的にほぼ 0 の場合は
-/// 自動充足〕の AND）を関数として切り出し、`#[ignore]` の層 B テスト（spec 閾値・
-/// Actions variables 依存）を経由せずに常時実行の単体テストから境界条件を検証できる
-/// ようにする（PR #332 codex-review P2 対応・Issue #330）。挙動は変更しない。
-fn improvement_gate_passes(result: &RerankRecallResult, threshold: f64) -> bool {
-    let non_degraded = result.after_hits20 >= result.baseline_hits20;
-    let pass_ratio = result.improvement_ratio().is_none_or(|v| v >= threshold);
-    non_degraded && pass_ratio
-}
-
 #[cfg(test)]
 mod improvement_ratio_tests {
-    use super::{improvement_gate_passes, RerankRecallResult};
+    use super::RerankRecallResult;
 
     /// テスト用の [`RerankRecallResult`] を直接構築するヘルパ（`measure_rerank_recall`
-    /// を経由せず、`improvement_ratio`/`improvement_gate_passes` の境界条件を単体で
-    /// 固定する。PR #332 codex-review P2 対応・Issue #330: 層 A の固定値回帰テスト
+    /// を経由せず、`improvement_ratio` の境界条件を単体で固定する。PR #332
+    /// codex-review P2 対応・Issue #330: 層 A の固定値回帰テスト
     /// （`rerank_recall_large_scale_regression`）が通る通常経路〔`Some(2/9)`〕以外の
-    /// `headroom == 0`・1% 境界の直前/直後・`after < baseline` の組み合わせが未検証
-    /// だった指摘への対応。他フィールド（`total_correct`/`pool_hits100`/`pool_hits200`/
-    /// `ceil100`/`ceil200`）は `improvement_ratio`/`improvement_gate_passes` の計算に
-    /// 使われないためダミー値で固定する。
+    /// `headroom == 0`・1% 境界の直前/直後の組み合わせが未検証だった指摘への対応
+    /// （`improvement_ratio` は SEARCH-7 改訂・2026-08-31 以降 informational だが、
+    /// 実測値ログとして計算し続けるためこの単体テストは維持する）。他フィールド
+    /// （`total_correct`/`pool_hits100`/`pool_hits200`/`ceil100`/`ceil200`）は
+    /// `improvement_ratio` の計算に使われないためダミー値で固定する。
     fn result_with(
         baseline_hits20: usize,
         after_hits20: usize,
@@ -722,39 +716,6 @@ mod improvement_ratio_tests {
             .expect("large-scale regression fixture headroom is well above the 1% threshold");
         assert!((ratio - (2.0 / 9.0)).abs() < 1e-12);
     }
-
-    #[test]
-    fn improvement_gate_passes_none_ratio_auto_passes_regardless_of_threshold() {
-        // headroom 0 → improvement_ratio() は None。条件(2)を自動充足として threshold
-        // の値によらず pass する（条件(1)の非劣化のみで判定）。
-        let r = result_with(100, 100, 100, 1000);
-        assert!(improvement_gate_passes(&r, 1.0));
-    }
-
-    #[test]
-    fn improvement_gate_passes_some_ratio_at_or_above_threshold() {
-        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
-        assert!(improvement_gate_passes(&r, 0.5));
-        assert!(improvement_gate_passes(&r, 0.0));
-    }
-
-    #[test]
-    fn improvement_gate_fails_some_ratio_below_threshold() {
-        let r = result_with(100, 105, 110, 1000); // ratio = 0.5
-        assert!(!improvement_gate_passes(&r, 0.6));
-    }
-
-    #[test]
-    fn improvement_gate_fails_when_after_below_baseline_regardless_of_ratio() {
-        // 非劣化条件（条件(1)）違反は独立にゲートを fail させなければならない
-        // （比較演算子・分母計算の将来変更で fail-open にならないことを固定する回帰）。
-        // headroom = pool_ceiling_hits20(110).saturating_sub(baseline_hits20(105)) = 5 <
-        // 1%（10）のため improvement_ratio() 自体は None（条件(2)は自動充足）だが、
-        // after(100) < baseline(105) の非劣化違反により threshold=0.0 でも fail する。
-        let r = result_with(105, 100, 110, 1000);
-        assert_eq!(r.improvement_ratio(), None);
-        assert!(!improvement_gate_passes(&r, 0.0));
-    }
 }
 
 /// `RERANK_RECALL_MIN_*` 環境変数（`(0.0, 1.0]` の浮動小数点）の解決結果
@@ -768,8 +729,8 @@ enum GateThreshold {
 }
 
 /// 環境変数を f64 として読み取り、`validate` で許容範囲を検査する共通ヘルパ
-/// （[`recall_threshold_from_env`]/[`improvement_threshold_from_env`] が範囲だけを
-/// 差し替えて再利用する）。未設定・空文字列は [`GateThreshold::NotConfigured`]、
+/// （[`recall_threshold_from_env`] が範囲を差し替えて再利用する）。未設定・空文字列は
+/// [`GateThreshold::NotConfigured`]、
 /// 非数値・範囲外は fail-closed（`Err`）、それ以外は [`GateThreshold::Value`] を
 /// 返す。数値そのもの（spec の Recall 下限）はこのファイル・ログのいずれにも
 /// ハードコードしない（`.claude/rules/spec-confidentiality.md`）。
@@ -804,19 +765,6 @@ fn recall_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
     threshold_from_env(var, |v| v > 0.0 && v <= 1.0, "(0.0, 1.0]")
 }
 
-/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 環境変数を読み取る。Issue #330
-/// （SEARCH-7 改訂・vector-db-spec#7）により、この値は改善幅の絶対差ではなく
-/// [`RerankRecallResult::improvement_ratio`] が返す相対比率（`(after −
-/// baseline) / (pool_ceiling_hits20 − baseline_hits20)`）の下限として解釈する。
-/// 比率 0 は「改善は必須ではないが悪化は許さない」という正当な設定である（層 A の
-/// `after_hits20 >= baseline_hits20` 固定値検証（Issue #310 対応で既定重み変更後は
-/// 成立する）と同じ非劣化条件を、層 B では spec 由来の下限として任意設定できる
-/// ようにする）。[`recall_threshold_from_env`] の `(0.0, 1.0]` とは異なり
-/// `[0.0, 1.0]`（0 を含む）を許容範囲とする。
-fn improvement_threshold_from_env(var: &str) -> Result<GateThreshold, String> {
-    threshold_from_env(var, |v| (0.0..=1.0).contains(&v), "[0.0, 1.0]")
-}
-
 /// `RERANK_RECALL_REQUIRE_THRESHOLDS` 環境変数（`"1"` のときのみ true）。
 /// `.github/workflows/recall.yml` からの実行（dispatch / schedule）時のみ
 /// 注入される strict モードフラグ（`hybrid_recall.rs::strict_thresholds_required`
@@ -827,15 +775,12 @@ fn strict_thresholds_required() -> bool {
         .unwrap_or(false)
 }
 
-/// `resolver`（[`recall_threshold_from_env`] または [`improvement_threshold_from_env`]）
-/// を読み取り、[`GateThreshold::NotConfigured`] を strict モード
-/// （[`strict_thresholds_required`]）に応じて分岐させる共通ヘルパ（`hybrid_recall.rs::
-/// resolve_gate_threshold` と同一の役割）。strict モード有効時の未設定は
-/// fail-closed（`panic!`）、無効時は `None`（呼び出し側で「対象外」を出力して
-/// early return する）。非数値・範囲外は strict モードの有無によらず常に
-/// fail-closed とする。[`resolve_gate_threshold`]/[`resolve_improvement_gate_
-/// threshold`] が resolver だけを差し替えて再利用し、strict モード時の panic
-/// メッセージ等の実装を層 B の 2 つの閾値（絶対下限・改善幅）間でドリフトさせない。
+/// `resolver`（[`recall_threshold_from_env`]）を読み取り、[`GateThreshold::
+/// NotConfigured`] を strict モード（[`strict_thresholds_required`]）に応じて
+/// 分岐させる共通ヘルパ（`hybrid_recall.rs::resolve_gate_threshold` と同一の役割）。
+/// strict モード有効時の未設定は fail-closed（`panic!`）、無効時は `None`
+/// （呼び出し側で「対象外」を出力して early return する）。非数値・範囲外は
+/// strict モードの有無によらず常に fail-closed とする。
 fn resolve_gate_threshold_with(
     var: &str,
     resolver: impl Fn(&str) -> Result<GateThreshold, String>,
@@ -857,13 +802,6 @@ fn resolve_gate_threshold_with(
 /// [`RERANK_RECALL_MIN_R20_LARGE`] 用の [`resolve_gate_threshold_with`]。
 fn resolve_gate_threshold(var: &str) -> Option<f64> {
     resolve_gate_threshold_with(var, recall_threshold_from_env)
-}
-
-/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 用の [`resolve_gate_threshold_with`]
-/// （許容範囲 `[0.0, 1.0]` の [`improvement_threshold_from_env`] を使う点のみ
-/// [`resolve_gate_threshold`] と異なる）。
-fn resolve_improvement_gate_threshold(var: &str) -> Option<f64> {
-    resolve_gate_threshold_with(var, improvement_threshold_from_env)
 }
 
 // ---------- 実測値の既定非出力（Issue #303）。`RECALL_VERBOSE` opt-in ゲート ----------
@@ -964,31 +902,38 @@ mod verbose_gate_tests {
 
 /// TASK-108（SEARCH-7）層 B: 大規模段のリランキング後の最終 Recall@20 が
 /// `RERANK_RECALL_MIN_R20_LARGE`（絶対下限）以上、かつ非劣化
-/// （`after_hits20 >= baseline_hits20`）を保った上で候補プール上限に対する相対
-/// 改善比率（[`RerankRecallResult::improvement_ratio`]）が
-/// `RERANK_RECALL_MIN_R20_IMPROVEMENT` 以上（改善余地が構造的にほぼ 0 の場合は
-/// 非劣化のみで判定。Issue #330・SEARCH-7 改訂・vector-db-spec#7）であることを
-/// 確認する閾値ゲート。契約は `hybrid_recall.rs::hybrid_recall_large_scale_
-/// threshold_gate` と同一（2 つの下限を独立に解決し、片方のみ設定済みの場合は
-/// 設定済みの側だけを判定する。両方未設定かつ非 strict の場合のみコーパス生成前に
-/// 早期 return して成功終了する。strict モードでは [`resolve_gate_threshold`] が
-/// 未設定を検出した時点で fail-closed になる）。ログには対象名と pass/fail のみを
-/// 出力し、注入された閾値・実測値の数値は出力しない（`RECALL_VERBOSE=1` opt-in 時
-/// のみ実測値を追加出力する。Issue #303・[`render_gate_line`] 参照）。
+/// （`after_hits20 >= baseline_hits20`）を保つことを確認する閾値ゲート。
+/// baseline からの改善幅（[`RerankRecallResult::improvement_ratio`]）は
+/// SEARCH-7 改訂（2026-08-31・vector-db-spec#8）により実コーパス評価まで
+/// informational（非ブロッキング）へ降格した——2 方式（字句一致・クロス
+/// エンコーダ）× 2 fixture の全実測が下限未達で、原因が合成 fixture 側の構造要因と
+/// 判明したため（`docs/design/rerank-recall-regression.md`「SEARCH-7 改訂
+/// （2026-08-31）」節参照）。実測比率はログにのみ出力し、pass/fail の判定には
+/// 使わない。契約は `hybrid_recall.rs::hybrid_recall_large_scale_threshold_gate`
+/// と同型（未設定かつ非 strict の場合はコーパス生成前に早期 return して成功終了
+/// する。strict モードでは [`resolve_gate_threshold`] が未設定を検出した時点で
+/// fail-closed になる）。`after_recall@20` の実測値は注入された閾値の近傍情報を
+/// 含むため `RECALL_VERBOSE=1` opt-in 時のみ追加出力する（Issue #303・
+/// [`render_gate_line`] 参照。秘匿境界は閾値そのものであり、常時出力する導出入力の
+/// hits 件数は層 A の公開固定アサート値〔spec-confidentiality のオーナー判断
+/// 2026-08-29 により公開可〕と同一で新規情報を含まない——verbose ゲートは
+/// `hybrid_recall.rs` と揃えたログ最小化方針であって機密境界ではない）。一方 informational な `improvement_ratio`（判定に
+/// 使わない実測値）は閾値を含まないため、`verbose`／`GITHUB_ACTIONS` の有無に
+/// かかわらず常時出力する（codex-review P1・PR #340。`GITHUB_ACTIONS` 下では
+/// `RECALL_VERBOSE=1` が fail-closed に拒否され、通常 CI 実行から実測値を一切
+/// 記録できなくなっていた抜けを塞ぐ）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make rerank-regression で実行する"]
 fn rerank_recall_large_scale_threshold_gate() {
     let verbose = verbose_requested_from_env();
     let min_r20_abs = resolve_gate_threshold("RERANK_RECALL_MIN_R20_LARGE");
-    let min_r20_improvement =
-        resolve_improvement_gate_threshold("RERANK_RECALL_MIN_R20_IMPROVEMENT");
 
-    if min_r20_abs.is_none() && min_r20_improvement.is_none() {
+    let Some(min) = min_r20_abs else {
         println!(
-            "rerank_recall_large_scale_threshold_gate: RERANK_RECALL_MIN_R20_LARGE/RERANK_RECALL_MIN_R20_IMPROVEMENT not configured; gate not enabled (explicit no-op, not a failure)"
+            "rerank_recall_large_scale_threshold_gate: RERANK_RECALL_MIN_R20_LARGE not configured; gate not enabled (explicit no-op, not a failure)"
         );
         return;
-    }
+    };
 
     let (docs, qa) = generate_corpus(
         LARGE_SEED,
@@ -998,68 +943,52 @@ fn rerank_recall_large_scale_threshold_gate() {
     );
     let r = measure_rerank_recall(&docs, &qa);
     let after_recall20 = r.after_recall20();
-    // Issue #330（SEARCH-7 改訂・vector-db-spec#7）: 改善幅ゲートは
-    // (1) 非劣化（after_hits20 >= baseline_hits20。層 A の固定値検証と同じ条件）と
-    // (2) 候補プール上限に対する相対比率（[`RerankRecallResult::improvement_ratio`]）
-    // の 2 条件からなる。改善余地（分母）が構造的にほぼ 0（`improvement_ratio` が
-    // `None`）の場合は (2) を自動充足とし (1) のみで判定する。
-    let improvement_ratio = r.improvement_ratio();
 
-    let mut pass = true;
-    match min_r20_abs {
-        Some(min) => {
-            let pass_abs = after_recall20 >= min;
-            pass &= pass_abs;
+    // ブロッキング条件: (1) after_recall@20 が RERANK_RECALL_MIN_R20_LARGE 以上、
+    // (2) 非劣化（after_hits20 >= baseline_hits20。層 A の固定値検証と同じ条件）。
+    let pass_abs = after_recall20 >= min;
+    let non_degraded = r.after_hits20 >= r.baseline_hits20;
+    let pass = pass_abs && non_degraded;
+    println!(
+        "{}",
+        render_gate_line(
+            "rerank_recall_large_scale_threshold_gate",
+            "after_recall@20",
+            after_recall20,
+            pass_abs,
+            verbose
+        )
+    );
+    println!(
+        "rerank_recall_large_scale_threshold_gate: non_degraded (after_hits20 >= baseline_hits20) pass={non_degraded}"
+    );
+
+    // 改善幅は informational（非ブロッキング。SEARCH-7 改訂 2026-08-31・
+    // vector-db-spec#8）。判定に使わない実測値のため `verbose`／`GITHUB_ACTIONS` の
+    // 有無にかかわらず常時出力する（閾値近傍の詳細出力を絞る `render_gate_line` の
+    // verbose ゲートとは別扱い。codex-review P1・PR #340: informational な
+    // improvement_ratio の実測値が通常 CI 実行〔`GITHUB_ACTIONS` 下で
+    // `RECALL_VERBOSE=1` は fail-closed に拒否される〕から一切記録されなくなる
+    // 抜けを塞ぐ。閾値そのもの〔`RERANK_RECALL_MIN_*`〕は引き続き出力しない）。
+    println!(
+        "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 inputs (informational, non-blocking since SEARCH-7 rev 2026-08-31) baseline_hits20={} after_hits20={} pool_ceiling_hits20={}",
+        r.baseline_hits20, r.after_hits20, r.pool_ceiling_hits20
+    );
+    match r.improvement_ratio() {
+        Some(ratio) => {
             println!(
-                "{}",
-                render_gate_line(
-                    "rerank_recall_large_scale_threshold_gate",
-                    "after_recall@20",
-                    after_recall20,
-                    pass_abs,
-                    verbose
-                )
+                "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 (informational, non-blocking since SEARCH-7 rev 2026-08-31) value={ratio:.4}"
             );
         }
         None => {
             println!(
-                "rerank_recall_large_scale_threshold_gate: RERANK_RECALL_MIN_R20_LARGE not configured; sub-check not enabled"
-            );
-        }
-    }
-    match min_r20_improvement {
-        Some(min) => {
-            let pass_improvement = improvement_gate_passes(&r, min);
-            pass &= pass_improvement;
-            match improvement_ratio {
-                Some(ratio) => {
-                    println!(
-                        "{}",
-                        render_gate_line(
-                            "rerank_recall_large_scale_threshold_gate",
-                            "improvement_ratio@20",
-                            ratio,
-                            pass_improvement,
-                            verbose
-                        )
-                    );
-                }
-                None => {
-                    println!(
-                        "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 headroom negligible; sub-check (2) auto-pass, judged by non-degradation only (pass={pass_improvement})"
-                    );
-                }
-            }
-        }
-        None => {
-            println!(
-                "rerank_recall_large_scale_threshold_gate: RERANK_RECALL_MIN_R20_IMPROVEMENT not configured; sub-check not enabled"
+                "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 headroom negligible (informational, non-blocking since SEARCH-7 rev 2026-08-31)"
             );
         }
     }
 
     assert!(
         pass,
-        "reranked Recall@20 or its improvement over baseline is below the configured RERANK_RECALL_MIN_* threshold"
+        "reranked Recall@20 is below RERANK_RECALL_MIN_R20_LARGE, or the reranked result degraded below baseline"
     );
 }

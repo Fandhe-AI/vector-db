@@ -100,21 +100,25 @@ repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml
 | `HYBRID_RECALL_MIN_R20_SMALL` | `search.md` SEARCH-1（TASK-104） | `(0.0, 1.0]` |
 | `HYBRID_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-2（TASK-104。クエリ展開あり・決定的スタブ。Issue #306） | `(0.0, 1.0]` |
 | `HYBRID_RECALL_MIN_R100_LARGE` | `search.md` SEARCH-2（TASK-104。クエリ展開あり・決定的スタブ。Issue #306） | `(0.0, 1.0]` |
-| `RERANK_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-7（TASK-108。絶対下限） | `(0.0, 1.0]` |
-| `RERANK_RECALL_MIN_R20_IMPROVEMENT` | `search.md` SEARCH-7（TASK-108。Issue #330 改訂・vector-db-spec#7: 絶対差ではなく候補プール上限に対する相対比率 `(after − baseline) / (pool_ceiling_hits20 − baseline_hits20)`。改善余地が構造的にほぼ 0 の場合は非劣化のみで判定。`crates/engine/tests/rerank_recall.rs::RerankRecallResult::improvement_ratio` 参照） | `[0.0, 1.0]` |
+| `RERANK_RECALL_MIN_R20_LARGE` | `search.md` SEARCH-7（TASK-108。絶対下限。非劣化 `after_hits20 >= baseline_hits20` とあわせてブロッキング条件） | `(0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT` | `query-planning.md` PLAN-1（TASK-112。改善幅。pt → 小数換算） | `[0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_R20_DIRECT` | `query-planning.md` PLAN-2（TASK-112） | `(0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE` | `query-planning.md` PLAN-3 → `search.md` SEARCH-2 のスケール条件付き基準（TASK-113） | `(0.0, 1.0]` |
 | `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED` | spec に対応値なし（本リポ独自の劣化展開シナリオ用回帰基準。`docs/design/query-planning-recall-regression.md` 参照） | `[0.0, 1.0]` |
 
-`DEGRADED` を含む全 9 secrets が揃わない限り `recall-regression` job は
+`DEGRADED` を含む全 8 secrets が揃わない限り `recall-regression` job は
 strict モード（`*_REQUIRE_THRESHOLDS=1`）により fail-closed で red のままとなる
 （`crates/engine/tests/query_planning_recall.rs::resolve_gate_threshold_with` は
 strict モード時、`DEGRADED` を含め未設定の変数を検出した時点で `panic!` する）。
 そのため **オーナーは `DEGRADED` の採用可否によらず、strict モードの必須条件
-として全 9 secrets の値を確定・設定する**（下記「設定手順」参照）。`DEGRADED` の
-副検査を他 8 secrets の回帰検知から独立させたい場合（別 job・非 strict 経路への
-分離等）は本 ADR のスコープ外とし、別 Issue で扱う。
+として全 8 secrets の値を確定・設定する**（下記「設定手順」参照）。`DEGRADED` の
+副検査を他 7 secrets の回帰検知から独立させたい場合（別 job・非 strict 経路への
+分離等）は本 ADR のスコープ外とし、別 Issue で扱う。`RERANK_RECALL_MIN_R20_
+IMPROVEMENT` は SEARCH-7 改訂（2026-08-31・vector-db-spec#8）で判定から除外
+された（`recall.yml` は不読・`rerank_recall.rs` は同名変数を参照しない）ため
+この一覧・strict モードの必須条件からは対象外である。過去に設定していた場合は
+リポジトリ管理者が `gh secret delete RERANK_RECALL_MIN_R20_IMPROVEMENT --env
+recall-gate` で削除してよい（削除しなくても未読のため red 化はしない）。
 
 ## 意図的に据え置く事項
 
@@ -153,7 +157,7 @@ strict モード時、`DEGRADED` を含め未設定の変数を検出した時�
 read -rs value && printf '%s' "$value" | gh secret set NAME --env bench-gate && unset value
 
 # Environment recall-gate secrets（recall.yml）: --env recall-gate を付ける
-# DEGRADED を含む全 9 secrets を、DEGRADED の採用可否によらず設定する
+# DEGRADED を含む全 8 secrets を、DEGRADED の採用可否によらず設定する
 read -rs value && printf '%s' "$value" | gh secret set NAME --env recall-gate && unset value
 
 gh secret list --env bench-gate
@@ -177,7 +181,6 @@ gh secret list --env recall-gate
 - `HYBRID_RECALL_MIN_R20_LARGE`
 - `HYBRID_RECALL_MIN_R100_LARGE`
 - `RERANK_RECALL_MIN_R20_LARGE`
-- `RERANK_RECALL_MIN_R20_IMPROVEMENT`
 - `QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT`
 - `QUERY_PLANNING_RECALL_MIN_R20_DIRECT`
 - `QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE`
@@ -224,7 +227,7 @@ Environment `bench-gate` への移行後は速やかに削除する（repo レ�
 ## 申し送り（本コミットのスコープ外）
 
 - Environment `bench-gate` secrets（6 件必須＋2 件任意）の実値設定
-- Environment `recall-gate` secrets（`DEGRADED` を含む全 9 件）の実値設定
+- Environment `recall-gate` secrets（`DEGRADED` を含む全 8 件）の実値設定
 - 旧 repo secrets（`BENCH_*`。Environment `bench-gate` 移行前に設定していた場合）・
   旧 repo variables／Environment `recall-gate` variables に実値が設定済みだった
   場合の削除（上記「設定手順」参照）

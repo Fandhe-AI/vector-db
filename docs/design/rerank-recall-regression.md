@@ -68,7 +68,13 @@ after を測定することで、コーパス・プール生成のばらつき�
 のみ・`RECALL_VERBOSE=1` opt-in・`GITHUB_ACTIONS` 下は fail-closed 拒否・
 `recall.yml` へは注入しない）は `hybrid_recall.rs` と同一実装を複製している
 （`docs/design/hybrid-recall-regression.md`「出力方針（実測値の既定非出力・
-Issue #303）」参照）。
+Issue #303）」参照）。**例外（SEARCH-7 改訂 2026-08-31・PR #340 codex P1）**:
+informational へ降格した `improvement_ratio@20` の実測値とその導出入力
+（`baseline_hits20`／`after_hits20`／`pool_ceiling_hits20`）は「実測値の記録と
+報告のみ必須」の契約を満たすため、`RECALL_VERBOSE`・`GITHUB_ACTIONS` の有無に
+かかわらず常時出力する（実測値は公開可のため機密保持上の問題はない。閾値
+`RERANK_RECALL_MIN_*` の値・閾値近傍の `after_recall@20` 実測値は従来どおり
+verbose ゲートを維持する）。
 
 ### コーパス・QA セット・測定経路
 
@@ -499,6 +505,42 @@ variant 数が少なく表層語の偶発的重複が生じやすいこと、ド
 **再現手順**: 上記「Issue #333 追記」節と同一（`ORT_DYLIB_PATH`・
 `CROSS_ENCODER_MODEL_PATH`・`CROSS_ENCODER_TOKENIZER_PATH` を設定して
 `make rerank-cross-encoder-eval`）。
+
+### SEARCH-7 改訂（2026-08-31）: improvement ゲートの informational 降格
+
+**総括**: Issue #330・#333・#337 で 2 方式（字句一致・クロスエンコーダ）×
+2 fixture（当初の合成コーパス・自然言語再設計後の合成コーパス）の組み合わせを
+すべて実測したが、改善幅の相対比率
+（`crates/engine/tests/rerank_recall.rs::RerankRecallResult::improvement_ratio`）
+はいずれも下限に未達だった（字句一致方式: 0.222。クロスエンコーダ方式: 0）。
+双方の未達要因分析（本ファイル「Issue #330」「Issue #333 追記」「Issue #337」の
+各節参照）により、原因はリランキング方式の欠陥ではなく合成 fixture 側の構造要因
+（キーワード抽選による正解集合の作られ方・表層語の偶発的重複・人工的に高い
+語彙密度）にあると判断した。これ以上の fixture パラメータ調整による到達は
+「ゲートを通すためのパラメータ操作」に該当し許容されないため、Issue #337 は
+これを最終報告として Issue #330 へ差し戻した。
+
+**spec 改訂**: 上記の実測・分析結果を受け、オーナー承認済みの spec 改訂
+（vector-db-spec#8・2026-08-31）により、SEARCH-7 の改善幅相対基準
+（improvement_ratio ≥ 下限）は実コーパス評価まで informational（非ブロッキング・
+実測値の記録と報告のみ必須）へ降格された。ブロッキング判定は非劣化
+（`after_hits20 >= baseline_hits20`）と絶対下限（`RERANK_RECALL_MIN_R20_LARGE`）
+のみとする。
+
+**本リポ側の変更**: `crates/engine/tests/rerank_recall.rs` の層 B ゲート
+（`rerank_recall_large_scale_threshold_gate`）から `RERANK_RECALL_MIN_R20_
+IMPROVEMENT` の読み取り・pass/fail への算入を削除し、`RERANK_RECALL_MIN_R20_
+LARGE`（絶対下限）と非劣化のみで判定する形に変更した。`improvement_ratio`
+（`RerankRecallResult::improvement_ratio`）の実測値とその導出入力は
+「実測値の記録と報告のみ必須」の契約を満たすため、`RECALL_VERBOSE`・
+`GITHUB_ACTIONS` の有無にかかわらず**常時出力**する（本ファイル「出力方針」節の
+例外記載・PR #340 codex P1 対応参照）。層 A の固定値回帰
+（`rerank_recall_large_scale_regression`）でも引き続き算出・出力する。
+`.github/workflows/recall.yml` の rerank step からは `RERANK_RECALL_MIN_R20_
+IMPROVEMENT` secret の注入を外した（`docs/design/ci-gate-variables.md` 参照）。
+
+**申し送り**: 実コーパスでの評価が行われた際、改善幅相対基準を再びブロッキング
+化するかどうかはその実測結果をもとにオーナーが再判断する。
 
 ## 既知の制約・スコープ外
 
