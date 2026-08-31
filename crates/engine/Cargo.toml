@@ -199,3 +199,17 @@ test = false
 name = "hybrid_latency_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #360（SQL パース・束縛結果のセッション内キャッシュ検討）の実測入口。
+# `validate_sql` 単体・`validate_sql`＋スキーマ取得＋`bind_in_session`・
+# `EngineCore::execute_sql` フル実行の 3 系列を計測し、パース・束縛コストが
+# フル実行に対してどの程度の比率かを実測してキャッシュ導入の要否判断材料とする。
+# spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため
+# `.github/workflows/*` へは配線しない。harness = false / test = false は
+# 上記ベンチと同一方針。`make bench-parse-bind`（Makefile）から実行する。
+# 判定ロジック自体（時間非依存）は harness/parse_bind.rs にあり
+# tests/parse_bind_bench_accept.rs で make ci 側から回帰検証する。
+name = "sql_parse_bind_bench"
+harness = false
+test = false
