@@ -693,22 +693,23 @@ pub(crate) fn execute_aggregate(
                 }
             }
 
-            // マスク外の列は presence・長さ・バッファ境界の構造検証だけを行い
-            // `&str` 化を省略する（[`row_codec::scan_scalar_columns_masked`]）。
-            // どの列も参照しない場合（`DecodeTier::Fast` を含む）は呼び出し自体を
-            // 省略し空スライスとする（`referenced.any_scalar_column_referenced()`
-            // が偽なら `metadata_filters` も必ず空——`MetadataFilter` は自身の
-            // 列を必ずマスクへ反映するため——であり `matches_all` は無条件で
-            // 真になる）。
-            let scanned: Vec<Option<&str>> = if referenced.any_scalar_column_referenced() {
-                row_codec::scan_scalar_columns_masked(
-                    schema,
-                    metadata,
-                    Some(referenced.scalar_mask()),
-                )?
-            } else {
-                Vec::new()
-            };
+            // マスク外の列は presence・長さ・バッファ境界・UTF-8 妥当性の構造検証
+            // だけを行い `&str` 化・保持を省略する
+            // （[`row_codec::scan_scalar_columns_masked`]）。`referenced.scalar_mask()`
+            // が全列 `false`（どの列も参照しない。`COUNT(*)`・`SUM(id)` 等や
+            // `DecodeTier::Fast` を含む）の場合でも呼び出し自体は省略しない
+            // （codex-review P1 指摘・PR #369: 呼び出し自体を省略すると metadata の
+            // presence・列長・UTF-8・余剰バイトの構造検証が全く行われず、破損した
+            // 可視行を検出できないまま集計が成功してしまう fail-open な契約変更に
+            // なるため。値の保持のみを省略し検証は全 tier・全マスクで維持する）。
+            // マスクが全列 `false` のとき `metadata_filters` は必ず空
+            // （`MetadataFilter` は自身の列を必ずマスクへ反映するため）であり
+            // `matches_all` は無条件で真になる。
+            let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
+                schema,
+                metadata,
+                Some(referenced.scalar_mask()),
+            )?;
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
@@ -984,6 +985,59 @@ mod tests {
 
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
         let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_vec).unwrap_err();
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    #[test]
+    fn count_star_still_fails_closed_on_corrupted_metadata_with_no_scalar_reference() {
+        // `COUNT(*)`（`VECTOR`/スカラー列いずれも非参照）で `referenced.scalar_mask()`
+        // が全 `false` になっても、`scan_scalar_columns_masked` の呼び出し自体は
+        // 省略しない（codex-review P1 指摘・PR #369: 呼び出しごと省略すると
+        // metadata の presence・列長・UTF-8・余剰バイトの構造検証が全く行われず、
+        // 破損した可視行（不正 UTF-8 を含む `Text` 列）が集計結果へ黙って含まれて
+        // しまう fail-open な契約変更になっていたための回帰テスト）。
+        let path = unique_db_path("agg-metadata-corrupt-no-scalar-ref");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let mut metadata = row_codec::encode_scalar_columns(
+            &schema,
+            &[
+                row_codec::Value::Null,
+                row_codec::Value::Text("hello".to_string()),
+            ],
+        )
+        .expect("encode scalar columns");
+        // 妥当な `Text` 値のバイト列を、presence タグ・長さフィールドはそのまま
+        // 不正 UTF-8（単独継続バイト）へ書き換える。
+        let corrupt_offset = metadata.len() - 1;
+        metadata[corrupt_offset] = 0x80;
+
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star).expect_err(
+            "COUNT(*) must fail closed on corrupted metadata even with no scalar column referenced",
+        );
         assert_eq!(err.wire_code(), "XX000");
     }
 

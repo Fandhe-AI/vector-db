@@ -79,9 +79,14 @@ untrusted な行バッファに対する構造検証・内容検証はマスク�
 green）。
 
 `scalar_mask` が全 `false`（= `metadata_filters` も必ず空。`MetadataFilter` は自身の列を
-必ずマスクへ反映するため）の場合、走査ループ側で `scan_scalar_columns_masked` の呼び出し
-自体を省略し空スライスを使う（構造検証コストも避ける。読まないデータの構造検証を
-省略しても RLS・結果の正しさに影響しない）。
+必ずマスクへ反映するため。`COUNT(*)`・`SUM(id)` 等 `VECTOR`/スカラー列のいずれも参照
+しないクエリ・`DecodeTier::Fast` を含む）であっても、走査ループ側は
+`scan_scalar_columns_masked` の呼び出し自体は省略しない（codex-review P1 指摘・
+PR #369: 呼び出しごと省略すると metadata の presence・列長・UTF-8・余剰バイトの
+構造検証が全く行われなくなり、破損した可視行を検出できないまま集計が成功して
+しまう fail-open な契約変更になるため）。全 `false` マスクで呼び出しても構造検証・
+UTF-8 妥当性検証は他マスクと同様に全列へ行われ、省略されるのは検証済み `&str` の
+生成・保持だけである。
 
 ## 契約変更点（PR #369 codex-review P1 対応で撤回）
 
