@@ -448,10 +448,13 @@ fn main() {
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         for entry in table.iter().expect("iter row table") {
             let (k, v) = entry.expect("iterate row entry");
-            let decoded = decode_row_reimpl(v.value(), &mut s3_scratch).expect("row decode");
+            let _decoded = decode_row_reimpl(v.value(), &mut s3_scratch).expect("row decode");
             if cross_check_sample.is_none() {
                 let (_tenant, id) = k.value();
-                cross_check_sample = Some((id, decoded.embedding.clone()));
+                // クロスチェック用の 1 件のみ計測外で所有化する（`decoded` は
+                // embedding を持たないスクラッチ参照のみを返す設計に変更済み。
+                // モジュール冒頭コメント参照。codex-review 指摘 #1・PR #378）。
+                cross_check_sample = Some((id, s3_scratch.clone()));
             }
             s3_rows += 1;
         }

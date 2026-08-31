@@ -37,6 +37,11 @@ use std::time::Duration;
 pub const MAX_REIMPL_DIM: u32 = 1_000_000;
 pub const MAX_REIMPL_METADATA_LEN: u32 = 64 * 1024 * 1024;
 
+/// `storage.rs::MAX_TENANT_ID_LEN`（256）と同値の、ベンチ内デコード再実装側の
+/// 独立コピー（codex-review 指摘 #2・PR #378。正本は空 tenant_id・上限超過を
+/// 拒否する検証契約を持つため、再実装側でも同じ契約を再現する）。
+pub const MAX_REIMPL_TENANT_ID_LEN: u16 = 256;
+
 /// 本モジュールのエラー型（`harness` 全体の `stats::BenchError` とは責務が異なる。
 /// `sql_c1.rs::SqlC1Error` と同じ理由で独立させる）。
 #[derive(Debug, Clone, PartialEq)]
@@ -85,23 +90,34 @@ pub fn refuse_under_github_actions(under_github_actions: bool) -> Result<(), Knn
     Ok(())
 }
 
-/// [`decode_row_reimpl`] の結果（ヘッダ＋embedding。metadata は本ベンチの
-/// 段別分解では使わないため長さのみ保持し、バイト列は所有化しない）。
+/// [`decode_row_reimpl`] の結果（ヘッダ＋metadata 長。embedding は呼び出し元が
+/// 渡した `out_embedding` スクラッチへデコード済みのため、この構造体は所有化
+/// しない。`tenant_id` も `buf` を借用した `&str` で、`storage.rs::decode_row_header`
+/// と同じくヒープアロケーションを伴わない（codex-review 指摘 #1・PR #378。
+/// 計測対象の段〔S2/S3〕へ再実装固有の確保・コピーを混入させないため）。
 #[derive(Debug, Clone, PartialEq)]
-pub struct ReimplDecodedRow {
-    pub tenant_id: String,
+pub struct ReimplDecodedRow<'a> {
+    pub tenant_id: &'a str,
     /// `storage.rs::Visibility::PUBLIC_BYTE`（`0x01`）と一致するかどうか。値そのものは
-    /// `storage.rs` 側が `pub(crate)` で非公開のため、本モジュールはバイト値 `1` を
-    /// 「公開」の意味として独立に定義する（[`is_public_byte`]。ドリフト検出は
+    /// `storage.rs` 側が `pub(crate)` で非公開のため、本モジュールはバイト値 `1`/`2` を
+    /// 独立に定義する（[`decode_visibility_byte_reimpl`]。ドリフト検出は
     /// アクセプトテストが `Storage::scan()` との突き合わせで行う）。
     pub is_public: bool,
-    pub embedding: Vec<f32>,
     pub metadata_len: usize,
 }
 
-/// `storage.rs::Visibility::PUBLIC_BYTE` 相当の値（モジュール冒頭コメント参照）。
-fn is_public_byte(byte: u8) -> bool {
-    byte == 1
+/// `storage.rs::Visibility::from_byte` 相当の検証（モジュール冒頭コメント参照）。
+/// 未知のバイト値は `storage.rs` と同じく `Public` へ黙殺フォールバックせず
+/// `Err` で拒否する（fail-closed。codex-review 指摘 #2・PR #378: 再実装が正本の
+/// 検証契約〔未知 visibility の拒否〕を再現していなかったドリフトの是正）。
+fn decode_visibility_byte_reimpl(byte: u8) -> Result<bool, KnnProfileError> {
+    match byte {
+        1 => Ok(true),
+        2 => Ok(false),
+        other => Err(KnnProfileError::Codec(format!(
+            "unknown visibility byte: {other}"
+        ))),
+    }
 }
 
 /// 行バイト列のヘッダ部（バージョン・`tenant_len`・`tenant_id`・`visibility`）だけを
@@ -111,7 +127,7 @@ fn is_public_byte(byte: u8) -> bool {
 /// 呼び出し文脈: [`decode_row_reimpl`]（S3 相当のフルデコード）の前段として、
 /// `knn_profile_bench.rs` の S2 段が単独でも呼ぶ（S2 は embedding を読まないため、
 /// この関数だけを計測ループへ渡す）。
-pub fn decode_header_reimpl(buf: &[u8]) -> Result<(String, bool, usize), KnnProfileError> {
+pub fn decode_header_reimpl(buf: &[u8]) -> Result<(&str, bool, usize), KnnProfileError> {
     let version = *buf
         .first()
         .ok_or_else(|| KnnProfileError::Codec("row buffer is empty".to_string()))?;
@@ -132,6 +148,11 @@ pub fn decode_header_reimpl(buf: &[u8]) -> Result<(String, bool, usize), KnnProf
         .try_into()
         .map_err(|_| KnnProfileError::Codec("tenant_len is not 2 bytes".to_string()))?;
     let tenant_len = u16::from_le_bytes(tenant_len_arr);
+    if tenant_len > MAX_REIMPL_TENANT_ID_LEN {
+        return Err(KnnProfileError::Codec(format!(
+            "tenant_id length {tenant_len} exceeds reimpl limit {MAX_REIMPL_TENANT_ID_LEN}"
+        )));
+    }
     offset = tenant_len_end;
 
     let tenant_end = offset
@@ -140,29 +161,37 @@ pub fn decode_header_reimpl(buf: &[u8]) -> Result<(String, bool, usize), KnnProf
     let tenant_bytes = buf
         .get(offset..tenant_end)
         .ok_or_else(|| KnnProfileError::Codec("truncated at tenant_id".to_string()))?;
+    if tenant_bytes.is_empty() {
+        return Err(KnnProfileError::Codec(
+            "tenant_id must not be empty".to_string(),
+        ));
+    }
+    // `storage.rs::decode_row_header` と同じく `buf` を借用した `&str` を返す
+    // （`.to_string()` を行わない。codex-review 指摘 #1・PR #378: S2 段〔ヘッダ
+    // デコード〕の計測へ再実装固有のヒープ確保を混入させないため）。
     let tenant_id = std::str::from_utf8(tenant_bytes)
-        .map_err(|_| KnnProfileError::Codec("tenant_id is not valid UTF-8".to_string()))?
-        .to_string();
+        .map_err(|_| KnnProfileError::Codec("tenant_id is not valid UTF-8".to_string()))?;
     offset = tenant_end;
 
     let visibility_byte = *buf
         .get(offset)
         .ok_or_else(|| KnnProfileError::Codec("truncated at visibility".to_string()))?;
+    let is_public = decode_visibility_byte_reimpl(visibility_byte)?;
     offset = offset
         .checked_add(1)
         .ok_or_else(|| KnnProfileError::Codec("offset overflow after visibility".to_string()))?;
 
-    Ok((tenant_id, is_public_byte(visibility_byte), offset))
+    Ok((tenant_id, is_public, offset))
 }
 
 /// [`decode_header_reimpl`] に続けて `dim`・embedding（f32 LE 配列）・metadata 長を
 /// デコードする（S3 段の再実装本体）。`out_embedding` は呼び出し元が複数行にわたり
 /// 使い回すスクラッチ（`storage.rs::decode_row_embedding_and_metadata_into` と同じ
 /// 「2 行目以降は再確保しない」設計を再実装側でも踏襲する）。
-pub fn decode_row_reimpl(
-    buf: &[u8],
+pub fn decode_row_reimpl<'a>(
+    buf: &'a [u8],
     out_embedding: &mut Vec<f32>,
-) -> Result<ReimplDecodedRow, KnnProfileError> {
+) -> Result<ReimplDecodedRow<'a>, KnnProfileError> {
     let (tenant_id, is_public, mut offset) = decode_header_reimpl(buf)?;
 
     let dim_end = offset
@@ -213,11 +242,33 @@ pub fn decode_row_reimpl(
             "metadata_len {metadata_len} exceeds reimpl limit {MAX_REIMPL_METADATA_LEN}"
         )));
     }
+    offset = metadata_len_end;
 
+    let metadata_end = offset
+        .checked_add(metadata_len as usize)
+        .ok_or_else(|| KnnProfileError::Codec("offset overflow at metadata".to_string()))?;
+    if buf.get(offset..metadata_end).is_none() {
+        return Err(KnnProfileError::Codec(
+            "row buffer truncated at metadata".to_string(),
+        ));
+    }
+    // `storage.rs::decode_row_embedding_and_metadata_into` と同じく、宣言された
+    // metadata 長がバッファ終端と一致することを検証する（末尾 garbage の拒否。
+    // codex-review 指摘 #2・PR #378: 再実装がこの検証を欠いていたドリフトの是正）。
+    if metadata_end != buf.len() {
+        return Err(KnnProfileError::Codec(
+            "row buffer has trailing bytes beyond declared metadata length".to_string(),
+        ));
+    }
+
+    // `out_embedding` は呼び出し元が使い回すスクラッチであり、この構造体は
+    // embedding を所有化しない（モジュール冒頭コメント・`ReimplDecodedRow` の
+    // ドキュメンテーションコメント参照。codex-review 指摘 #1・Bugbot 指摘・
+    // PR #378: 計測対象の S3 段〔f32 デコード〕へ再実装固有の `Vec` 確保・
+    // コピーを混入させないため）。
     Ok(ReimplDecodedRow {
         tenant_id,
         is_public,
-        embedding: out_embedding.clone(),
         metadata_len: metadata_len as usize,
     })
 }

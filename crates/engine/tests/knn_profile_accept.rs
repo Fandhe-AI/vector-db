@@ -101,18 +101,21 @@ fn decode_row_reimpl_matches_storage_scan_for_every_row() {
     for entry in table.iter().expect("iter rows table") {
         let (_k, v) = entry.expect("iterate row entry");
         let decoded = decode_row_reimpl(v.value(), &mut scratch).expect("reimpl decode");
+        // `decoded` は embedding を所有化しない（`scratch` へ書き込まれる。
+        // `ReimplDecodedRow` のドキュメンテーションコメント参照）ため、
+        // 突き合わせは `scratch` を直接使う。
         let expected_row = expected
             .iter()
             .find(|row| {
                 row.tenant_id == decoded.tenant_id
                     && (row.visibility == Visibility::Public) == decoded.is_public
-                    && row.embedding == decoded.embedding
+                    && row.embedding == scratch
             })
             .unwrap_or_else(|| {
                 panic!(
                     "reimpl decoded row not found in Storage::scan() result \
                      (layout drift suspected): tenant_id={} is_public={} embedding={:?}",
-                    decoded.tenant_id, decoded.is_public, decoded.embedding
+                    decoded.tenant_id, decoded.is_public, scratch
                 )
             });
         assert_eq!(expected_row.metadata.len(), decoded.metadata_len);
@@ -164,6 +167,98 @@ fn decode_row_reimpl_rejects_unsupported_version() {
     let mut scratch: Vec<f32> = Vec::new();
     let buf = [9u8, 0u8, 0u8]; // version=9 は未対応
     let err = decode_row_reimpl(&buf, &mut scratch).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+// --- 検証契約の突き合わせ（codex-review 指摘 #2・PR #378）-------------------
+//
+// 以下は `storage.rs::decode_row_header`／`decode_row_embedding_and_metadata_into`
+// が拒否する不正入力（未知 visibility・空/過長 tenant_id・metadata の切断/末尾
+// garbage）を、ベンチ内再実装（`decode_header_reimpl`/`decode_row_reimpl`）も
+// 同じく拒否することを確認する。バイト列は v2 レイアウト（モジュール冒頭
+// コメント参照）を手組みし、`Storage`（pub API）を経由しない——正本側は
+// これらの入力を書き込み時点で `RowInput` 検証済みのため拒否できず、再現
+// できない（`decode_row_reimpl_rejects_truncated_buffer` と同じ手法）。
+
+/// v2 行フォーマットのバイト列を組み立てる（テスト専用ヘルパー）。
+/// `visibility_byte` は検証を素通しするため生の値を渡せる。
+fn encode_row_v2_bytes(
+    tenant: &[u8],
+    visibility_byte: u8,
+    embedding: &[f32],
+    metadata: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.push(2u8); // version
+    buf.extend_from_slice(&(tenant.len() as u16).to_le_bytes());
+    buf.extend_from_slice(tenant);
+    buf.push(visibility_byte);
+    buf.extend_from_slice(&(embedding.len() as u32).to_le_bytes());
+    for v in embedding {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    buf.extend_from_slice(metadata);
+    buf
+}
+
+#[test]
+fn decode_header_reimpl_rejects_unknown_visibility_byte() {
+    // `storage.rs::Visibility::from_byte` は未知バイトを `Public` へ黙殺
+    // フォールバックせず拒否する。ベンチ内再実装が誤って `false`（非公開）
+    // 扱いへ黙殺していないことを確認する。
+    let buf = encode_row_v2_bytes(b"tenant-a", 0xFF, &[1.0], b"");
+    let err = decode_header_reimpl(&buf).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+#[test]
+fn decode_row_reimpl_rejects_unknown_visibility_byte() {
+    let buf = encode_row_v2_bytes(b"tenant-a", 0xFF, &[1.0], b"");
+    let mut scratch: Vec<f32> = Vec::new();
+    let err = decode_row_reimpl(&buf, &mut scratch).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+#[test]
+fn decode_header_reimpl_rejects_empty_tenant_id() {
+    let buf = encode_row_v2_bytes(b"", 1, &[1.0], b"");
+    let err = decode_header_reimpl(&buf).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+#[test]
+fn decode_header_reimpl_rejects_oversized_tenant_id() {
+    // `storage.rs::MAX_TENANT_ID_LEN`（256）超過は拒否される
+    // （[`harness::knn_profile::MAX_REIMPL_TENANT_ID_LEN`] が同値のコピー）。
+    let oversized_tenant = vec![b't'; 257];
+    let buf = encode_row_v2_bytes(&oversized_tenant, 1, &[1.0], b"");
+    let err = decode_header_reimpl(&buf).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+#[test]
+fn decode_row_reimpl_rejects_metadata_trailing_garbage() {
+    // 宣言された metadata 長よりバッファが長い（末尾 garbage）場合を拒否する
+    // （`storage.rs::decode_row_embedding_and_metadata_into` の
+    // `metadata_end != buf.len()` 検証と同じ契約）。
+    let mut buf = encode_row_v2_bytes(b"tenant-a", 1, &[1.0], b"meta");
+    buf.push(0); // 宣言長を超える余剰バイト
+    let mut scratch: Vec<f32> = Vec::new();
+    let err = decode_row_reimpl(&buf, &mut scratch).unwrap_err();
+    assert!(matches!(err, KnnProfileError::Codec(_)));
+}
+
+#[test]
+fn decode_row_reimpl_rejects_metadata_truncated_buffer() {
+    // metadata_len フィールドが実バッファより長い長さを宣言している場合を
+    // 拒否する（宣言された長さ分の存在確認）。
+    let full = encode_row_v2_bytes(b"tenant-a", 1, &[1.0], b"meta");
+    // metadata バイト列（末尾 4 バイト "meta"）を落として、metadata_len
+    // フィールド（宣言値 4）だけを残す。
+    let truncated = &full[..full.len() - 4];
+    let mut scratch: Vec<f32> = Vec::new();
+    let err = decode_row_reimpl(truncated, &mut scratch).unwrap_err();
     assert!(matches!(err, KnnProfileError::Codec(_)));
 }
 
