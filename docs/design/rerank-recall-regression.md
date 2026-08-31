@@ -68,7 +68,13 @@ after を測定することで、コーパス・プール生成のばらつき�
 のみ・`RECALL_VERBOSE=1` opt-in・`GITHUB_ACTIONS` 下は fail-closed 拒否・
 `recall.yml` へは注入しない）は `hybrid_recall.rs` と同一実装を複製している
 （`docs/design/hybrid-recall-regression.md`「出力方針（実測値の既定非出力・
-Issue #303）」参照）。
+Issue #303）」参照）。**例外（SEARCH-7 改訂 2026-08-31・PR #340 codex P1）**:
+informational へ降格した `improvement_ratio@20` の実測値とその導出入力
+（`baseline_hits20`／`after_hits20`／`pool_ceiling_hits20`）は「実測値の記録と
+報告のみ必須」の契約を満たすため、`RECALL_VERBOSE`・`GITHUB_ACTIONS` の有無に
+かかわらず常時出力する（実測値は公開可のため機密保持上の問題はない。閾値
+`RERANK_RECALL_MIN_*` の値・閾値近傍の `after_recall@20` 実測値は従来どおり
+verbose ゲートを維持する）。
 
 ### コーパス・QA セット・測定経路
 
