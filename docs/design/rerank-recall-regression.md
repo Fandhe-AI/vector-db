@@ -531,8 +531,10 @@ variant 数が少なく表層語の偶発的重複が生じやすいこと、ド
 （`rerank_recall_large_scale_threshold_gate`）から `RERANK_RECALL_MIN_R20_
 IMPROVEMENT` の読み取り・pass/fail への算入を削除し、`RERANK_RECALL_MIN_R20_
 LARGE`（絶対下限）と非劣化のみで判定する形に変更した。`improvement_ratio`
-（`RerankRecallResult::improvement_ratio`）の実測値ログ出力（`RECALL_
-VERBOSE=1` opt-in 時）は informational として維持し、層 A の固定値回帰
+（`RerankRecallResult::improvement_ratio`）の実測値とその導出入力は
+「実測値の記録と報告のみ必須」の契約を満たすため、`RECALL_VERBOSE`・
+`GITHUB_ACTIONS` の有無にかかわらず**常時出力**する（本ファイル「出力方針」節の
+例外記載・PR #340 codex P1 対応参照）。層 A の固定値回帰
 （`rerank_recall_large_scale_regression`）でも引き続き算出・出力する。
 `.github/workflows/recall.yml` の rerank step からは `RERANK_RECALL_MIN_R20_
 IMPROVEMENT` secret の注入を外した（`docs/design/ci-gate-variables.md` 参照）。
