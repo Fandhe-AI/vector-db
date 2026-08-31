@@ -500,14 +500,16 @@ pub fn scan_scalar_columns<'a>(
 }
 
 /// [`scan_scalar_columns`] の列限定版（Issue #350: 集計経路が実際に参照しない列の
-/// `&str` 生成・UTF-8 検証コストを避けるための必要列限定デコード）。`mask` が
-/// `Some(m)` のとき `m[i] == false` の列は構造検証（presence タグ・宣言長上限
-/// [`MAX_TEXT_FIELD_LEN`]・バッファ境界）だけを行いオフセットを進め、`&str` 生成・
-/// UTF-8 検証を省略して常に `None` を積む（untrusted な行バッファに対する検証は
-/// マスク外の列でも一切弱めない。`.claude/rules/coding-rust.md`「untrusted 入力の
-/// 扱い」）。`mask` が `None`（[`scan_scalar_columns`] 経由）は従来どおり全列を
-/// `&str` 化する。`mask.len() != schema.columns.len()` は fail-closed に `Err`
-/// とし、呼び出し元の列インデックス計算の誤りを黙って無視しない。
+/// `&str` 生成コストを避けるための必要列限定デコード）。`mask` が `Some(m)` のとき
+/// `m[i] == false` の列も構造検証（presence タグ・宣言長上限 [`MAX_TEXT_FIELD_LEN`]・
+/// バッファ境界）に加え UTF-8 妥当性検証まで常に行い（codex-review P1 指摘・PR #369:
+/// 未参照列でも不正 UTF-8 を含む永続行を fail-closed で拒否する既存のエラー契約を
+/// 維持する必要があるため）、検証済みの `&str` の生成・保持のみを省略して常に `None`
+/// を積む（untrusted な行バッファに対する検証はマスク外の列でも一切弱めない。
+/// `.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。`mask` が `None`
+/// （[`scan_scalar_columns`] 経由）は従来どおり全列を `&str` 化する。
+/// `mask.len() != schema.columns.len()` は fail-closed に `Err` とし、呼び出し元の
+/// 列インデックス計算の誤りを黙って無視しない。
 pub fn scan_scalar_columns_masked<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
@@ -592,14 +594,16 @@ pub fn scan_scalar_columns_masked<'a>(
                     RowCodecError::Invalid("scalar payload truncated at text field".to_string())
                 })?;
                 offset = text_end;
+                // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
+                // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
+                // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
+                // マスクで要求されなかった列は、検証済みの `&str` を破棄して
+                // `None` を積むことで `&str` 生成コストのみを省略する
+                // （Issue #350: 必要列限定デコード）。
+                let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                })?;
                 if wanted {
-                    // マスクで要求された列のみ UTF-8 検証・`&str` 生成を行う。
-                    // 未要求列は presence・長さ・バッファ境界の構造検証（上の
-                    // `buf.get` 群）だけを通過させてオフセットを進め、`None` を
-                    // 積む（Issue #350: 必要列限定デコード）。
-                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
-                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                    })?;
                     values.push(Some(text));
                 } else {
                     values.push(None);
@@ -1097,10 +1101,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_scalar_columns_masked_unwanted_column_with_invalid_utf8_still_succeeds() {
-        // マスク対象外の列は UTF-8 検証自体を省略するため、不正な UTF-8 バイト列
-        // でも構造（presence・宣言長・境界）さえ妥当なら `Err` にならない
-        // （Issue #350 の意図した性質。マスク対象の列は従来どおり検証する）。
+    fn scan_scalar_columns_masked_unwanted_column_with_invalid_utf8_is_rejected() {
+        // マスク対象外の列でも UTF-8 妥当性検証は省略しない（codex-review P1
+        // 指摘・PR #369: 不正な UTF-8 バイト列を含む永続行は、参照されない列
+        // 経由であっても従来どおり `Err`（`XX000`）で拒否する。省略するのは
+        // 検証済み値の `&str` 生成・保持のみ）。
         let schema = text_vector_schema();
         let mut buf = Vec::new();
         // VECTOR 列（embedding）は presence バイト自体を持たないため、
@@ -1111,9 +1116,8 @@ mod tests {
         buf.extend_from_slice(invalid_utf8);
         // tag（nullable）は省略（バッファ末尾で打ち切り = NULL として許容）。
         let mask = [false, false, false];
-        let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan masked");
-        assert_eq!(scanned[1], None);
-        assert_eq!(scanned[2], None);
+        let result = scan_scalar_columns_masked(&schema, &buf, Some(&mask));
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 
     #[test]

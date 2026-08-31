@@ -60,11 +60,14 @@
 
 ### `scan_scalar_columns_masked`（必要列限定デコード）
 
-`row_codec::scan_scalar_columns_masked(schema, buf, mask)` は、`mask[i] == false` の列を
-presence・宣言長（`MAX_TEXT_FIELD_LEN`）・バッファ境界の構造検証だけでオフセットを
-進め、`&str` 生成・UTF-8 検証を省略して `None` を積む。untrusted な行バッファに対する
-構造検証はマスク外の列でも一切弱めない。既存 `scan_scalar_columns` は全列 `true` の
-薄いラッパーへ変更した（呼び出し元・テストは無変更で green）。
+`row_codec::scan_scalar_columns_masked(schema, buf, mask)` は、`mask[i] == false` の列も
+presence・宣言長（`MAX_TEXT_FIELD_LEN`）・バッファ境界の構造検証に加え UTF-8 妥当性検証
+まで常に行い（codex-review P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を
+fail-closed で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）、検証済みの
+`&str` の生成・保持（呼び出し元への返却値としての保持）のみを省略して `None` を積む。
+untrusted な行バッファに対する構造検証・内容検証はマスク外の列でも一切弱めない。既存
+`scan_scalar_columns` は全列 `true` の薄いラッパーへ変更した（呼び出し元・テストは無変更で
+green）。
 
 `scalar_mask` が全 `false`（= `metadata_filters` も必ず空。`MetadataFilter` は自身の列を
 必ずマスクへ反映するため）の場合、走査ループ側で `scan_scalar_columns_masked` の呼び出し
@@ -91,7 +94,8 @@ tenant プレフィクスの range scan 化等の更なる最適化はスコー�
 ## 固定したテスト
 
 - `crates/engine/src/row_codec.rs`: `scan_scalar_columns_masked` のマスク挙動（マスク
-  外列の構造検証維持・`&str` 化省略・不正 UTF-8 でも成功・マスク長不一致は `Err`）
+  外列でも構造検証・UTF-8 妥当性検証は維持し `&str` 化・保持のみ省略・不正 UTF-8 は
+  マスク内外を問わず `Err`・マスク長不一致は `Err`）
 - `crates/engine/src/storage.rs`: `decode_row_dim_and_metadata_borrowed` の完全デコード
   との一致・`decode_row` と同じ破損検知・`verify_row_key_tenant` の受理/拒否
 - `crates/engine/src/sql/udf_call.rs`: `references_embedding` の直接参照・`Builtin`/
