@@ -88,6 +88,7 @@ pub mod aggregate;
 pub mod allowlist;
 pub mod exec;
 pub(crate) mod explain;
+pub(crate) mod expr_program;
 pub mod group_by;
 pub mod lexer;
 pub mod mode;

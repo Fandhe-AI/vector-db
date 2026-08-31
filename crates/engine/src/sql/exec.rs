@@ -443,6 +443,12 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
+    // Issue #353: `expr_program::ExprProgram::eval` の明示スタック。
+    // `on_visible_row`（下記。`FnMut` として `build_filtered_with_rows_in_txn`
+    // へ渡される。`Send`/`Sync` は要求されないため単純な可変借用で足り、
+    // `RefCell`/`Mutex` は不要）が行ごとに使い回す。
+    let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
+
     let on_visible_row = |slot: usize,
                           id: u64,
                           embedding: &[f32],
@@ -473,8 +479,11 @@ pub fn execute_statement(
             // 式が一切評価されない。評価エラー（0 除算・非有限値等）は当該行を
             // 黙ってスキップせず、クエリ全体の失敗として fail-closed に伝播する
             // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
-            for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, embedding).map_err(expr_eval_error_to_arena)? {
+            for program in &bound.expr_filter_programs {
+                match program
+                    .eval(id, embedding, &mut expr_scratch)
+                    .map_err(expr_eval_error_to_arena)?
+                {
                     udf_call::ExprValue::Bool(true) => {}
                     udf_call::ExprValue::Bool(false) => return Ok(false),
                     // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
@@ -745,6 +754,10 @@ pub fn execute_statement(
         // （当該行だけを黙ってスキップしない。`on_visible_row` の事前フィルタ経路と
         // 同じ方針）。
         let mut filtered = Vec::with_capacity(hits.len());
+        // Issue #353: DISTANCE 段の後で事後適用する `expr_filter_programs` の
+        // 明示スタック（`on_visible_row` とは別ループのため個別に確保。行数分
+        // 使い回す）。
+        let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
         for (slot_id, score) in hits {
             // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
             // として fail-closed に除去する。
@@ -764,7 +777,7 @@ pub fn execute_statement(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            if !bound.expr_filters.is_empty() {
+            if !bound.expr_filter_programs.is_empty() {
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
@@ -772,8 +785,8 @@ pub fn execute_statement(
                     continue;
                 };
                 let mut expr_ok = true;
-                for expr in &bound.expr_filters {
-                    match udf_call::eval(expr, row_id, embedding)? {
+                for program in &bound.expr_filter_programs {
+                    match program.eval(row_id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
                         udf_call::ExprValue::Bool(false) => {
                             expr_ok = false;
@@ -937,6 +950,21 @@ fn project_rows(
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
     let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
+    // Issue #353: `ProjectedColumn`（`pub` enum）の形状は変えず、`Computed` 列の
+    // 式を行ループの**外**（本関数の入口）で 1 回だけステップ列コンパイルする。
+    // `projection` と添字が 1 対 1 対応する（`Computed` 以外は `None`）。行ループは
+    // 明示スタック（`expr_scratch`）を使い回し、`sql::udf_call::eval` の再帰
+    // 呼び出しを一切行わない。
+    let computed_programs: Vec<Option<crate::sql::expr_program::ExprProgram>> = projection
+        .iter()
+        .map(|col| match col {
+            ProjectedColumn::Computed { expr, .. } => {
+                Some(crate::sql::expr_program::ExprProgram::compile(expr))
+            }
+            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+        })
+        .collect();
+    let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
     for (slot_id, score) in hits {
         // ヒットの第 1 要素はアリーナのスロット番号（`execute_statement` の
         // `slot_ids` 参照）。embedding・スカラー列・行 `id` の 3 者すべてを同じ
@@ -963,7 +991,7 @@ fn project_rows(
                 detail: "candidate arena index out of range".to_string(),
             })?;
         let mut cells = Vec::with_capacity(projection.len());
-        for col in projection {
+        for (col_idx, col) in projection.iter().enumerate() {
             match col {
                 ProjectedColumn::Id => cells.push(Cell::Integer(id)),
                 ProjectedColumn::Column { index, .. } => {
@@ -989,12 +1017,21 @@ fn project_rows(
                         },
                     }
                 }
-                ProjectedColumn::Computed { expr, .. } => {
+                ProjectedColumn::Computed { .. } => {
                     // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
                     // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
                     // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
                     // （行値・テナントを含まない固定文言。`sql::udf_call::eval` 参照）。
-                    match udf_call::eval(expr, id, embedding)? {
+                    // Issue #353: `expr` の再帰評価ではなく、入口で 1 回だけ
+                    // コンパイルした `computed_programs[col_idx]` を線形実行する。
+                    let program = computed_programs
+                        .get(col_idx)
+                        .and_then(|p| p.as_ref())
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "computed projection program missing at evaluation time"
+                                .to_string(),
+                        })?;
+                    match program.eval(id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
                         udf_call::ExprValue::Vector(v) => cells.push(Cell::Vector(v)),
                         udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),

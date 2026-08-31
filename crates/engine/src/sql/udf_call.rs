@@ -228,7 +228,10 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
 }
 
 /// 組み込み関数の引数個数・型シグネチャ（束縛時の検査に使う）。
-fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
+/// `sql::expr_program::ExprStep::Builtin` の実行時（明示スタックからの pop 数決定）
+/// でも束縛時と同じ arity 判定を使うため `pub(crate)` で共有する
+/// （Issue #353・式評価のステップ列コンパイル化）。
+pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
     match f {
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
@@ -810,7 +813,7 @@ fn bind_call(
 /// 仮数部で正確に表現できる範囲（`2^53` 以下）かを確認する。これを超える `id` を
 /// 無条件に `as f64` で丸めると、`WHERE id = <literal>` のような等価述語が精度欠落
 /// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22000` で拒否する）。
-fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
+pub(crate) fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
     if id > MAX_EXACT_F64_INT {
         return Err(SqlSurfaceError::invalid_input(
             "row id exceeds the range that can be exactly represented for comparison",
@@ -859,27 +862,50 @@ pub fn eval(expr: &BoundExpr, id: u64, embedding: &[f32]) -> Result<ExprValue, S
     }
 }
 
+/// 組み込み関数を木の再帰評価から呼ぶ経路（引数式を左から順に評価してから
+/// [`apply_builtin`] へ委譲する）。`args` の評価順は元の実装（`eval_vector_arg`／
+/// `eval_scalar_arg` を順に呼ぶ）と同じ左→右を保つ（評価順に依存するエラー発生
+/// 順序を変えないため。`sql_evaluation_order` 等の既存契約に対応）。
 fn eval_builtin(
     f: BuiltinFn,
     args: &[BoundExpr],
     id: u64,
     embedding: &[f32],
 ) -> Result<ExprValue, SqlSurfaceError> {
+    let mut values = Vec::with_capacity(args.len());
+    for a in args {
+        values.push(eval(a, id, embedding)?);
+    }
+    apply_builtin(f, values)
+}
+
+/// 組み込み関数を値ベースで評価する（引数はすでに評価済みの [`ExprValue`] 列で
+/// 受け取り、式木を再帰評価しない）。[`eval_builtin`]（再帰 `eval` 経由）と
+/// `sql::expr_program::ExprProgram::eval`（`ExprStep::Builtin`。明示スタックから
+/// arity 分 pop した値を渡す）の両方が本関数を共有することで、0 除算・非有限値
+/// （`f64`/`f32` 双方）の fail-closed 契約（`22000`）と `try_reserve_exact` に
+/// よる確保失敗時の `54000` 写像を 1 箇所に保つ（Issue #353）。`args` の要素数が
+/// [`builtin_signature`] の arity と不一致な場合（束縛段の不変条件が崩れた場合の
+/// 保険）は `Internal` として拒否する。
+pub(crate) fn apply_builtin(
+    f: BuiltinFn,
+    mut args: Vec<ExprValue>,
+) -> Result<ExprValue, SqlSurfaceError> {
     match f {
         BuiltinFn::VecNorm => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
+            let v = take_vector_arg(&mut args, 0)?;
             let sum_sq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
             let norm = sum_sq.sqrt();
             finite_scalar(norm, "vec_norm")
         }
         BuiltinFn::VecSum => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
+            let v = take_vector_arg(&mut args, 0)?;
             let sum: f64 = v.iter().map(|&x| x as f64).sum();
             finite_scalar(sum, "vec_sum")
         }
         BuiltinFn::VecDiv => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
-            let s = eval_scalar_arg(args, 1, id, embedding)?;
+            let v = take_vector_arg(&mut args, 0)?;
+            let s = take_scalar_arg(&mut args, 1)?;
             if s == 0.0 {
                 return Err(SqlSurfaceError::invalid_input("vec_div: division by zero"));
             }
@@ -907,6 +933,39 @@ fn eval_builtin(
             }
             Ok(ExprValue::Vector(out))
         }
+    }
+}
+
+/// `args[idx]` を `Vector` として取り出す（クローンせず `mem::replace` で
+/// 所有権を移す。プレースホルダは同一インデックスを 2 度取り出さない前提の
+/// 呼び出し規約のため無害な `Scalar(0.0)`）。型不一致・欠落は `Internal`。
+fn take_vector_arg(args: &mut [ExprValue], idx: usize) -> Result<Vec<f32>, SqlSurfaceError> {
+    match args.get_mut(idx) {
+        Some(slot) => match std::mem::replace(slot, ExprValue::Scalar(0.0)) {
+            ExprValue::Vector(v) => Ok(v),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "function argument type mismatch at evaluation time".to_string(),
+            }),
+        },
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// `args[idx]` を `Scalar` として取り出す（[`take_vector_arg`] と対の値ベース
+/// 抽出ヘルパー）。
+fn take_scalar_arg(args: &mut [ExprValue], idx: usize) -> Result<f64, SqlSurfaceError> {
+    match args.get_mut(idx) {
+        Some(slot) => match std::mem::replace(slot, ExprValue::Scalar(0.0)) {
+            ExprValue::Scalar(s) => Ok(s),
+            _ => Err(SqlSurfaceError::Internal {
+                detail: "function argument type mismatch at evaluation time".to_string(),
+            }),
+        },
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
     }
 }
 
@@ -948,7 +1007,10 @@ fn eval_scalar_arg(
     }
 }
 
-fn finite_scalar(v: f64, fn_name: &str) -> Result<ExprValue, SqlSurfaceError> {
+/// 非有限値（NaN/∞）を fail-closed に拒否してスカラー値へ包む共通ヘルパー。
+/// `sql::expr_program::ExprProgram::eval` の `WasmCall` ステップも共有する
+/// （Issue #353。fail-closed 判定を 1 箇所に保つ）。
+pub(crate) fn finite_scalar(v: f64, fn_name: &str) -> Result<ExprValue, SqlSurfaceError> {
     if !v.is_finite() {
         return Err(SqlSurfaceError::invalid_input(format!(
             "{fn_name}: result is not finite"
@@ -957,7 +1019,16 @@ fn finite_scalar(v: f64, fn_name: &str) -> Result<ExprValue, SqlSurfaceError> {
     Ok(ExprValue::Scalar(v))
 }
 
-fn eval_binary(op: BinOp, l: ExprValue, r: ExprValue) -> Result<ExprValue, SqlSurfaceError> {
+/// 2 項演算を値ベースで評価する（引数式の再帰評価は行わない）。再帰 `eval` の
+/// `BoundExpr::Binary` 分岐と `sql::expr_program::ExprProgram::eval` の
+/// `ExprStep::Binary` 分岐が共有する（Issue #353）。定数畳み込み
+/// （`expr_program::try_fold_scalar`）もここを経由することで、畳み込み結果と
+/// 実行時評価が同一の fail-closed 契約（0 除算・非有限値の `22000`）を持つ。
+pub(crate) fn eval_binary(
+    op: BinOp,
+    l: ExprValue,
+    r: ExprValue,
+) -> Result<ExprValue, SqlSurfaceError> {
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {

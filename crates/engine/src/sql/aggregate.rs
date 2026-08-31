@@ -34,7 +34,7 @@ use crate::row_codec;
 use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::parser::{AggregateInput, BoundAggregate};
-use crate::sql::udf_call::{self, ExprValue};
+use crate::sql::udf_call::ExprValue;
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
 
@@ -97,13 +97,13 @@ impl Accumulator {
             },
             (Min, AggregateInput::IdU64) => Accumulator::IdMin(None),
             (Max, AggregateInput::IdU64) => Accumulator::IdMax(None),
-            (Sum, AggregateInput::ScalarExpr(_)) => Accumulator::FloatSum(None),
-            (Avg, AggregateInput::ScalarExpr(_)) => Accumulator::FloatAvg {
+            (Sum, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatSum(None),
+            (Avg, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatAvg {
                 sum: None,
                 count: 0,
             },
-            (Min, AggregateInput::ScalarExpr(_)) => Accumulator::FloatMin(None),
-            (Max, AggregateInput::ScalarExpr(_)) => Accumulator::FloatMax(None),
+            (Min, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMin(None),
+            (Max, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMax(None),
             (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
             (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
@@ -112,12 +112,17 @@ impl Accumulator {
 
     /// 可視行 1 件を観測して状態を更新する。`scanned` は同じ行の
     /// `row_codec::scan_scalar_columns` 結果（借用のまま）。
+    /// `scratch` は [`crate::sql::expr_program::ExprProgram::eval`] が使う
+    /// スクラッチスタック（呼び出し元の行ループの外で確保し使い回す。Issue #353
+    /// で行ごとの再帰評価をなくすために導入。`ScalarExpr` 以外の入力では
+    /// 参照されない）。
     pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
         id: u64,
         embedding: &[f32],
         scanned: &[Option<&str>],
+        scratch: &mut Vec<ExprValue>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
             AggregateInput::AllVisible => self.observe_present(),
@@ -137,15 +142,17 @@ impl Accumulator {
                 let value = scanned.get(*index).copied().flatten();
                 self.observe_text(value)
             }
-            AggregateInput::ScalarExpr(expr) => match udf_call::eval(expr, id, embedding)? {
-                ExprValue::Scalar(v) => self.observe_float(v),
-                // `resolve_aggregate_input` が `ExprType::Scalar` のみを
-                // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
-                // 評価結果の型が食い違う実装バグの検出用）。
-                _ => Err(accumulator_bug(
-                    "scalar-typed BoundExpr evaluated to a non-scalar value",
-                )),
-            },
+            AggregateInput::ScalarExpr { program, .. } => {
+                match program.eval(id, embedding, scratch)? {
+                    ExprValue::Scalar(v) => self.observe_float(v),
+                    // `resolve_aggregate_input` が `ExprType::Scalar` のみを
+                    // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
+                    // 評価結果の型が食い違う実装バグの検出用）。
+                    _ => Err(accumulator_bug(
+                        "scalar-typed BoundExpr evaluated to a non-scalar value",
+                    )),
+                }
+            }
         }
     }
 
@@ -395,6 +402,10 @@ pub(crate) fn execute_aggregate(
     for item in &bound.items {
         accumulators.push(Accumulator::new(item.func, &item.input)?);
     }
+    // Issue #353: `ExprProgram::eval` の明示スタック。行ループの外で 1 回だけ
+    // 確保し、WHERE 式述語・`ScalarExpr` 集計項目の評価で使い回す
+    // （行ごとの再確保・再帰呼び出しをなくす）。
+    let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
     // `VECTOR` 列を宣言するスキーマのみ次元検証を行う（`VECTOR` 列を持たない
     // テーブルは `row_codec`/`storage` 側で常に埋め込み次元 0 として符号化される
@@ -469,8 +480,8 @@ pub(crate) fn execute_aggregate(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, &row.embedding)? {
+            for program in &bound.expr_filter_programs {
+                match program.eval(id, &row.embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
@@ -493,7 +504,13 @@ pub(crate) fn execute_aggregate(
 
             // AGG 段。
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
+                accumulator.observe(
+                    &item.input,
+                    id,
+                    &row.embedding,
+                    &scanned,
+                    &mut expr_scratch,
+                )?;
             }
         }
     }
@@ -579,6 +596,7 @@ mod tests {
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
             rls_predicate_present: false,
             projection: vec![crate::sql::parser::ProjectionColumn::Aggregate {
                 item_index: 0,

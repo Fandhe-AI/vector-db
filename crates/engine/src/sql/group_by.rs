@@ -26,7 +26,7 @@ use crate::sql::aggregate::{accumulator_bug, storage_internal, try_clone_str, Ac
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
-use crate::sql::udf_call::{self, BinOp, ExprValue};
+use crate::sql::udf_call::{BinOp, ExprValue};
 use crate::storage;
 use redb::ReadableTable;
 use std::collections::BTreeMap;
@@ -256,6 +256,10 @@ pub(crate) fn execute_grouped_aggregate(
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
+    // Issue #353: `ExprProgram::eval` の明示スタック。行ループの外で 1 回だけ
+    // 確保し、WHERE 式述語・`ScalarExpr` 集計項目の評価で使い回す
+    // （`sql::aggregate::execute_aggregate` と同方針）。
+    let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -289,8 +293,8 @@ pub(crate) fn execute_grouped_aggregate(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, &row.embedding)? {
+            for program in &bound.expr_filter_programs {
+                match program.eval(id, &row.embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     _ => {
@@ -339,7 +343,13 @@ pub(crate) fn execute_grouped_aggregate(
                 // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
                 // 実際の保持量を正確に反映する）。
                 let before = accumulator.text_len();
-                accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
+                accumulator.observe(
+                    &item.input,
+                    id,
+                    &row.embedding,
+                    &scanned,
+                    &mut expr_scratch,
+                )?;
                 let after = accumulator.text_len();
                 if after > before {
                     let delta = after - before;
