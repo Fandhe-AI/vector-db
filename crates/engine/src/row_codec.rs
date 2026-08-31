@@ -496,16 +496,41 @@ pub fn scan_scalar_columns<'a>(
     schema: &TableSchema,
     buf: &'a [u8],
 ) -> Result<Vec<Option<&'a str>>> {
+    scan_scalar_columns_masked(schema, buf, None)
+}
+
+/// [`scan_scalar_columns`] の列限定版（Issue #350: 集計経路が実際に参照しない列の
+/// `&str` 生成・UTF-8 検証コストを避けるための必要列限定デコード）。`mask` が
+/// `Some(m)` のとき `m[i] == false` の列は構造検証（presence タグ・宣言長上限
+/// [`MAX_TEXT_FIELD_LEN`]・バッファ境界）だけを行いオフセットを進め、`&str` 生成・
+/// UTF-8 検証を省略して常に `None` を積む（untrusted な行バッファに対する検証は
+/// マスク外の列でも一切弱めない。`.claude/rules/coding-rust.md`「untrusted 入力の
+/// 扱い」）。`mask` が `None`（[`scan_scalar_columns`] 経由）は従来どおり全列を
+/// `&str` 化する。`mask.len() != schema.columns.len()` は fail-closed に `Err`
+/// とし、呼び出し元の列インデックス計算の誤りを黙って無視しない。
+pub fn scan_scalar_columns_masked<'a>(
+    schema: &TableSchema,
+    buf: &'a [u8],
+    mask: Option<&[bool]>,
+) -> Result<Vec<Option<&'a str>>> {
+    if let Some(m) = mask {
+        if m.len() != schema.columns.len() {
+            return Err(RowCodecError::Invalid(
+                "scalar column mask length does not match schema column count".to_string(),
+            ));
+        }
+    }
     let mut values: Vec<Option<&'a str>> = Vec::new();
     values
         .try_reserve_exact(schema.columns.len())
         .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
     let mut offset = 0usize;
-    for column in &schema.columns {
+    for (col_index, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
             values.push(None);
             continue;
         }
+        let wanted = mask.map(|m| m[col_index]).unwrap_or(true);
         let presence = match buf.get(offset) {
             Some(&b) => b,
             None => {
@@ -566,11 +591,19 @@ pub fn scan_scalar_columns<'a>(
                 let text_bytes = buf.get(offset..text_end).ok_or_else(|| {
                     RowCodecError::Invalid("scalar payload truncated at text field".to_string())
                 })?;
-                let text = std::str::from_utf8(text_bytes).map_err(|_| {
-                    RowCodecError::Invalid("text field is not valid UTF-8".to_string())
-                })?;
                 offset = text_end;
-                values.push(Some(text));
+                if wanted {
+                    // マスクで要求された列のみ UTF-8 検証・`&str` 生成を行う。
+                    // 未要求列は presence・長さ・バッファ境界の構造検証（上の
+                    // `buf.get` 群）だけを通過させてオフセットを進め、`None` を
+                    // 積む（Issue #350: 必要列限定デコード）。
+                    let text = std::str::from_utf8(text_bytes).map_err(|_| {
+                        RowCodecError::Invalid("text field is not valid UTF-8".to_string())
+                    })?;
+                    values.push(Some(text));
+                } else {
+                    values.push(None);
+                }
             }
             other => {
                 return Err(RowCodecError::Invalid(format!(
@@ -1026,5 +1059,74 @@ mod tests {
                 other => panic!("scan/decode mismatch: {other:?}"),
             }
         }
+    }
+
+    // --- scan_scalar_columns_masked（Issue #350: 必要列限定デコード） ------------
+
+    #[test]
+    fn scan_scalar_columns_masked_none_mask_matches_scan_scalar_columns() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Text("world".to_string()),
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let via_none = scan_scalar_columns_masked(&schema, &buf, None).expect("scan masked none");
+        let via_scan = scan_scalar_columns(&schema, &buf).expect("scan scalar");
+        assert_eq!(via_none, via_scan);
+    }
+
+    #[test]
+    fn scan_scalar_columns_masked_unwanted_column_is_none_but_wanted_column_still_decodes() {
+        // `body`（マスク対象外）は presence・長さ・境界の構造検証だけを通過して
+        // `None` になり、`tag`（マスク対象）は通常どおり `&str` 化される。
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("unwanted-but-structurally-valid".to_string()),
+            Value::Text("wanted".to_string()),
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        // mask: [embedding(無視), body(不要), tag(必要)]
+        let mask = [false, false, true];
+        let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan masked");
+        assert_eq!(scanned[0], None); // VECTOR 列は常に None
+        assert_eq!(scanned[1], None); // マスク対象外
+        assert_eq!(scanned[2], Some("wanted"));
+    }
+
+    #[test]
+    fn scan_scalar_columns_masked_unwanted_column_with_invalid_utf8_still_succeeds() {
+        // マスク対象外の列は UTF-8 検証自体を省略するため、不正な UTF-8 バイト列
+        // でも構造（presence・宣言長・境界）さえ妥当なら `Err` にならない
+        // （Issue #350 の意図した性質。マスク対象の列は従来どおり検証する）。
+        let schema = text_vector_schema();
+        let mut buf = Vec::new();
+        // VECTOR 列（embedding）は presence バイト自体を持たないため、
+        // 先頭は body（マスク対象外）の presence から書き始める。
+        let invalid_utf8: &[u8] = &[0xff, 0xfe, 0xfd];
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&(invalid_utf8.len() as u32).to_le_bytes());
+        buf.extend_from_slice(invalid_utf8);
+        // tag（nullable）は省略（バッファ末尾で打ち切り = NULL として許容）。
+        let mask = [false, false, false];
+        let scanned = scan_scalar_columns_masked(&schema, &buf, Some(&mask)).expect("scan masked");
+        assert_eq!(scanned[1], None);
+        assert_eq!(scanned[2], None);
+    }
+
+    #[test]
+    fn scan_scalar_columns_masked_mask_length_mismatch_is_rejected() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Null,
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        let short_mask = [true, true];
+        let result = scan_scalar_columns_masked(&schema, &buf, Some(&short_mask));
+        assert!(matches!(result, Err(RowCodecError::Invalid(_))));
     }
 }

@@ -1044,6 +1044,19 @@ pub(crate) fn decode_row_embedding_and_metadata_into<'a>(
 }
 
 pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
+    decode_row_dim_and_metadata_borrowed(buf).map(|(_dim, metadata)| metadata)
+}
+
+/// [`decode_row_metadata_borrowed`] の dim 込み版。embedding 自体は境界検証のみで
+/// `f32` へ変換・確保しない点は同じだが、次元検証（`schema.vector_dim()` との
+/// 比較）を必要とする呼び出し元向けに `dim` も返す。
+///
+/// 呼び出し文脈: `sql::aggregate.rs`／`sql::group_by.rs` の集計行走査が、
+/// embedding 自体は参照しないが `VECTOR` 列の NULL 判定（`dim == 0`）や次元検証は
+/// 必要とするケース（Issue #350: embedding 非参照集計のデコードスキップ）で使う。
+/// embedding を `Vec<f32>` へ確保する必要がある場合は
+/// [`decode_row_embedding_and_metadata_into`] を使う。
+pub(crate) fn decode_row_dim_and_metadata_borrowed(buf: &[u8]) -> Result<(u32, &[u8])> {
     let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset
@@ -1110,7 +1123,20 @@ pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
         ));
     }
 
-    Ok(metadata_bytes)
+    Ok((dim, metadata_bytes))
+}
+
+/// キー側 `tenant_id`（複合キーの一部）とヘッダ側 `tenant_id`（エンコード済み行
+/// 内容）の整合を検査する（対象ビヘイビア: TABLE-12）。raw `redb` 書き込みや
+/// 将来のバグでキーのテナントと行内容のテナントがずれた行を黙って返さない
+/// fail-closed な検査。[`decode_row_for_key`] から切り出した実体で、embedding を
+/// 完全デコードしない部分デコード経路（Issue #350 の集計走査）でも同じ検査を
+/// 1 本化して再利用する。
+pub(crate) fn verify_row_key_tenant(key_tenant: &str, header_tenant: &str) -> Result<()> {
+    if header_tenant != key_tenant {
+        return Err(StorageError::Codec("row key tenant mismatch".to_string()));
+    }
+    Ok(())
 }
 
 /// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
@@ -1210,9 +1236,7 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 /// ため既存 variant を再利用する）。
 pub(crate) fn decode_row_for_key(key_tenant: &str, id: u64, raw: &[u8]) -> Result<Row> {
     let row = decode_row(id, raw)?;
-    if row.tenant_id != key_tenant {
-        return Err(StorageError::Codec("row key tenant mismatch".to_string()));
-    }
+    verify_row_key_tenant(key_tenant, &row.tenant_id)?;
     Ok(row)
 }
 
@@ -1618,6 +1642,66 @@ mod tests {
         let mut scratch: Vec<f32> = Vec::new();
         assert!(decode_row(1, truncated).is_err());
         assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
+    }
+
+    // --- decode_row_dim_and_metadata_borrowed / verify_row_key_tenant（Issue #350） ---
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_matches_full_decode() {
+        let embedding = vec![1.0_f32, 2.0, 3.0];
+        let metadata = b"scalar-payload".to_vec();
+        let buf = sample_row(&embedding, &metadata);
+
+        let full = decode_row(1, &buf).expect("full decode");
+        let (dim, borrowed_metadata) =
+            decode_row_dim_and_metadata_borrowed(&buf).expect("dim+metadata decode");
+        assert_eq!(dim as usize, full.embedding.len());
+        assert_eq!(borrowed_metadata, full.metadata.as_slice());
+    }
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_agrees_with_metadata_borrowed_wrapper() {
+        let buf = sample_row(&[1.0, 2.0], b"m");
+        let (_dim, via_dim_fn) =
+            decode_row_dim_and_metadata_borrowed(&buf).expect("dim+metadata decode");
+        let via_wrapper = decode_row_metadata_borrowed(&buf).expect("metadata-only decode");
+        assert_eq!(via_dim_fn, via_wrapper);
+    }
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_rejects_same_corruptions_as_decode_row() {
+        // metadata_len を MAX_METADATA_LEN 超過に書き換えても、`decode_row`（完全
+        // デコード）と同じ理由で `Err` になる（部分デコード経路が検証を弱めない
+        // ことの固定）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let metadata_len_offset = dim_offset + 4 + 4;
+        let oversized = MAX_METADATA_LEN + 1;
+        buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_dim_and_metadata_borrowed(&buf).is_err());
+    }
+
+    #[test]
+    fn verify_row_key_tenant_accepts_matching_tenant() {
+        assert!(verify_row_key_tenant("tenant-a", "tenant-a").is_ok());
+    }
+
+    #[test]
+    fn verify_row_key_tenant_rejects_mismatched_tenant() {
+        let err = verify_row_key_tenant("tenant-a", "tenant-b").unwrap_err();
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_row_for_key_and_verify_row_key_tenant_agree_on_mismatch() {
+        // `decode_row_for_key`（完全デコード経路の TABLE-12 検査）と
+        // `verify_row_key_tenant`（部分デコード経路が再利用する切り出し済み検査）
+        // が同じ入力に対して同じ結論（拒否）に達することを確認する。
+        let buf = sample_row(&[1.0], b"m");
+        assert!(decode_row_for_key("tenant-b", 1, &buf).is_err());
+        assert!(verify_row_key_tenant("tenant-b", "tenant-a").is_err());
     }
 
     // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な
