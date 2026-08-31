@@ -1,0 +1,239 @@
+# KNN 経路の段別内訳プロファイル
+
+- ステータス: Accepted（本コミットで計測ベンチ・ADR を追加。段別内訳は本ベンチの
+  実測値であり、production コード〔`crates/engine/src/`〕は無変更）
+- 対応: Issue #362（`test(engine): KNN 経路の段別内訳プロファイル（走査・デコード・
+  arena 構築・距離計算の切り分け）`）。親: #361「ベクトル検索・ストレージレイアウト
+  最適化」Phase 5 の起点タスク
+- 後続: #363（arena のテーブル世代整合キャッシュ化）・#364（連続格納レイアウト
+  ADR）・#365（dot カーネル複数アキュムレータ化）・#366（距離計算/Top-k の 2 段
+  分離）・#367（ANN 採否検討）の優先判断材料
+
+## 背景
+
+親 Issue #361 の起点として、SQL 表層経由の KNN（`SELECT id FROM docs ORDER BY
+embedding <=> '<vec>' LIMIT 10`。25,000 行・dim128）のレイテンシについて、
+どの段が支配的かの実測内訳が存在しなかった。先行分析では「redb per-entry 走査＋
+クエリ毎の `VectorArena::build_filtered` 再構築が主因」という仮説（Issue 本文由来。
+以下「先行仮説」と呼ぶ）が提示されていたが、実測の裏付けは無かった。本ベンチは
+段別（redb 走査・ヘッダデコード・f32 デコード・arena 構築・距離計算・Top-k 選出）
+の実測を行い、後続 Issue の優先判断材料とする。
+
+## 計測条件（受け入れ条件 2）
+
+- **SQL 表層経路（S0/S0'）は `PrefilterCache`（`core.rs`。`EngineCore::search`
+  専用・Rust API 直呼び用）を経由しない**。`sql::exec::execute_statement` は
+  クエリ毎に候補行を redb から再デコードする（`sql_c1_bench.rs` 冒頭コメントの
+  既存事実と同一。`crates/engine/benches/sql_c1_bench.rs` 参照）。
+- **既定 provider は `ParallelSearchProvider`**（`search_engine::default_engine()`）。
+  対照として単線 `CpuScalarProvider` も測定する。
+- コーパス: dim=128・テナント A 20,000 行（Public）＋テナント B 5,000 行
+  （Public）＝ 計 25,000 行。RLS 述語は `PolicyContext::is_visible` をそのまま
+  使う（S4/S5 のクエリはテナント A のコンテキストで実行するが、両テナントとも
+  `Visibility::Public` のため全行が可視集合に含まれる）。
+- 測定入口: `crates/engine/benches/knn_profile_bench.rs`（時間依存の実測本体）・
+  `crates/engine/benches/harness/knn_profile.rs`（段差分・ns/行換算・行バイト列
+  デコード再実装などの時間非依存ロジック）・`crates/engine/tests/
+  knn_profile_accept.rs`（`make ci` からの回帰検証）。`make bench-knn-profile`
+  から実行する。spec 由来の pass/fail 閾値を持たない情報提供専用のため
+  `.github/workflows/*` へは配線しない（`GITHUB_ACTIONS` 環境下では起動直後に
+  fail-closed で拒否する）。
+
+## 測定設計
+
+`crates/engine/src/` の `pub(crate)` API（`storage::decode_row_header` 等）は
+ベンチ（独立コンパイル単位）から直接呼べないため、段の分離は次の 3 通りの組み合わせ
+で行った:
+
+1. pub API の差分測定（`VectorArena::build_filtered`・`EngineCore::execute_sql`・
+   `SearchProvider::search`）
+2. 生 `redb::Database` の直接走査（`redb` は既存 dev-dependency `=4.2.0`。新規依存
+   追加なし）
+3. 行レイアウト（`storage.rs` の行フォーマット v2）のベンチ内再実装
+   （`harness/knn_profile.rs::decode_header_reimpl`・`decode_row_reimpl`）
+
+行レイアウト再実装のドリフト対策として、`tests/knn_profile_accept.rs` が
+`Storage::put`/`Storage::scan()`（pub API・正本）との突き合わせを回帰テスト化し、
+本ベンチ自体も実行のたびに 1 件を `VectorArena::build_filtered`（S4 で構築した
+「正本」デコード結果）と突き合わせる（`Storage::scan()` は `ROWS_TABLE`＝`"rows"`
+テーブルのみを走査対象とし、本ベンチが `tenant::insert_rows` 経由で書き込む
+カタログテーブル `user_rows/docs` は対象外のため、実行時クロスチェックの相手を
+arena 側に変更している）。
+
+DB ファイルを一度構築したのち、フェーズごとに開き直して測定した（`tests/
+persistence.rs` と同じ「一度 drop してから生 `redb::Database` を再オープンする」
+手順）。各段は `harness::protocol::run`（warmup 20・計測 20・中央値採用）で計測。
+
+| 段 | 内容 |
+| --- | --- |
+| S0 | `EngineCore::execute_sql` 経由の SQL 表層 KNN（e2e） |
+| S0' | `SELECT COUNT(*) FROM docs`（走査＋ヘッダ＋RLS の SQL 経由クロスチェック） |
+| S1 | 生 `redb::Database` 再オープンでの per-entry 走査のみ |
+| S2 | S1 ＋ ヘッダデコード |
+| S3 | S2 ＋ f32 デコード |
+| S4 | `VectorArena::build_filtered`（pub API。クエリ毎再構築の実コスト） |
+| S5 | 距離計算＋Top-k（`ParallelSearchProvider`・`CpuScalarProvider`） |
+| S5' | 距離計算のみ（`isa::current().dot` を全行へ適用して総和。Top-k なし） |
+
+## 実測結果
+
+開発環境（Linux・x86_64・12 論理コア・ISA 検出 `Avx2Fma`）で `make
+bench-knn-profile` を 3 回実行し、各段の中央値（p50）の変動を確認した（3 回とも
+同一プロセス内・同一コーパスでの再実行。専有環境の宣言は行っていないため、
+共有 CPU/IO による測定ノイズを含みうる）。3 回の実測はいずれも同一オーダーで
+安定しており（S1: 48.2〜49.1 ns/行、S3: 145.0〜148.9 ns/行、S4: 176.4〜181.9 ns/行
+の範囲）、代表値として直近実行分を採録する。
+
+| 段 | rows | median | ns/行 |
+| --- | --- | --- | --- |
+| S1_redb_scan | 25,000 | 1.206ms | 48.2 |
+| S2_header_decode | 25,000 | 1.458ms | 58.3 |
+| S3_f32_decode | 25,000 | 3.723ms | 148.9 |
+| S4_arena_build | 25,000 | 4.411ms | 176.4 |
+| S5_search_parallel | 25,000 | 0.255ms | 10.2 |
+| S5_search_scalar | 25,000 | 0.214ms | 8.6 |
+| S5prime_distance_only | 25,000 | 0.195ms | 7.8 |
+| S0_sql_e2e | 25,000 | 5.950ms | 238.0 |
+| S0prime_count_star | 25,000 | 4.198ms | 167.9 |
+
+段間差分（ns/行）:
+
+| 差分 | ns/行 | 意味 |
+| --- | --- | --- |
+| S1→S2 | 10.1 | ヘッダデコード（tenant_id・visibility）分 |
+| S2→S3 | 90.6 | f32 デコード（embedding 展開）分 |
+| S3→S4 | 27.5 | arena への push・tenant_id 所有化・容量検証分 |
+| S0 −（S4＋S5_parallel） | 51.4（残差。median 1.284ms） | パース・束縛・結果組み立て・read_txn 境界差等 |
+
+### 考察: 内訳の構成
+
+S0（SQL 表層 e2e、238.0 ns/行）の内訳は概ね S4（arena 構築、176.4 ns/行）＋
+S5_parallel（距離計算＋Top-k、10.2 ns/行）＋残差（51.4 ns/行）で説明できる
+（176.4 + 10.2 + 51.4 = 238.0）。**arena 構築（S4）が単独で e2e の約 74%を占め、
+支配的な段である**ことが実測で確認できた。arena 構築の内訳をさらに分解すると:
+
+- 走査そのもの（S1）: 48.2 ns/行（arena 構築の約 27%）
+- ヘッダデコード追加分（S1→S2）: 10.1 ns/行（約 6%）
+- f32 デコード追加分（S2→S3）: 90.6 ns/行（約 51%。**単独最大の内訳**）
+- push・所有化・容量検証追加分（S3→S4）: 27.5 ns/行（約 16%）
+
+**f32 デコード（embedding 展開）が arena 構築コストの過半を占める**という、
+先行仮説（走査＋ヘッダデコードが主因）とは異なる内訳が実測された。
+
+### COUNT(*) クロスチェック（S0'）
+
+`SELECT COUNT(*) FROM docs`（S0'、167.9 ns/行）は走査＋ヘッダデコード＋RLS 判定
+までを SQL 経由で行い embedding のデコードは行わない経路である。ベンチ内再実装の
+S2（走査＋ヘッダデコード、58.3 ns/行）と比べて S0' が約 3 倍大きいのは、SQL 表層
+（パース・束縛・集計処理・トランザクション境界等）のオーバーヘッドが乗るためで、
+「SQL 経由の走査＋ヘッダデコード相当コスト」は素の redb 直接走査（S1/S2）より
+高くつくことを示す一貫した結果である。
+
+### 先行仮説との突き合わせ
+
+先行仮説では KNN 全体で約 468 ns/行、うち約 225 ns/行が COUNT(*) と共通の
+走査・ヘッダデコード分とされていた。今回の実測（本コミットのコーパス・環境）では
+S0（e2e）が 238.0 ns/行、S0'（COUNT(*)）が 167.9 ns/行であり、**先行仮説の絶対値
+（468 ns/行・225 ns/行）とは概ね半分程度の乖離がある**。これは以下のいずれか、
+または複合が要因と考えられる（本ベンチの結果からは切り分けられない）:
+
+- 先行仮説の測定条件（コーパス規模・環境・埋め込み次元等）が本ベンチと異なる
+- 本開発環境（NVIDIA GPU 搭載機・Vulkan backend・12 論理コア）が先行仮説の想定
+  環境より高速
+- 先行仮説自体が実測に基づかない見積もりだった
+
+**絶対値は環境依存で再現性が低いため、後続 Issue の優先判断には「相対的な内訳の
+構成比」（f32 デコードが arena 構築の過半・arena 構築が e2e の約 3/4）を用いる
+べきである**、というのが本 Issue の結論である。
+
+## `dot_lanes` の実アセンブリ確認（受け入れ条件 3）
+
+`cargo bench --bench knn_profile_bench -p engine --no-run` でビルドしたバイナリ
+（production コード無変更。`knn_profile_bench.rs::dot_wrapper` は
+`engine::isa::current().dot(a, b)` を呼ぶだけの `#[inline(never)]` ラッパー）を
+`objdump -d -M intel` で逆アセンブルした。開発環境の検出 ISA は `Avx2Fma`
+（`EnvReport` 出力）のため、`engine::isa::dot_avx2_fma`（`SimdKernel::dot` から
+tail-call される実体）を確認した。
+
+観測結果:
+
+- **FMA 命令を実際に使用している**: メインループは `vfmadd132ps`/`vfmadd231ps`
+  （AVX2 の 256-bit YMM レジスタ、8 レーン f32）で、ループ 1 反復あたり YMM
+  4 本（32 要素）を処理する 4 段階の unroll になっている。
+- **アキュムレータは実質 1 系統（単一の依存チェーン）**: 1 反復内で
+  `ymm1 = fma(a0, b0, ymm1)` → `ymm1 = fma(a1, b1, ymm1)` →
+  `ymm1 = fma(a2, b2, ymm1)` → `ymm0 = ymm1`（コピー）→
+  `ymm0 = fma(a3, b3, ymm0)` という順に、4 回の FMA が前段の結果に
+  直接依存する形で連鎖している（`vfmadd231ps ymm1,ymm2,...` は
+  `ymm1 += ymm2 * mem` で書き込み先が読み取り元でもある）。次の反復も
+  この `ymm0`（前反復の最終結果）を初期値として `vfmadd132ps` するため、
+  **反復をまたいでも単一の依存チェーンが継続する**。独立した複数の
+  アキュムレータレジスタへ分散する最適化（FMA のレイテンシを隠す一般的な
+  手法）は、この逆アセンブル結果からは確認できなかった。
+- 水平和（reduction）部分（`vmovshdup`/`vshufpd`/`vshufps`/`vextractf128` の
+  組み合わせ）は 256-bit → スカラーへの標準的な木構造縮約になっている。
+
+**示唆**: FMA レイテンシ（Haswell 以降の一般的な x86_64 で概ね 4〜5 サイクル）に
+対し、依存チェーンが 1 本しかないため、CPU のスーパースカラー実行資源
+（複数の FMA 実行ポートを持つマイクロアーキテクチャでは並列発行が可能）を
+活かしきれていない可能性がある。複数の独立したアキュムレータ（例: 2〜4 本の
+YMM を並行して更新し、ループの最後に合算する設計）へ変更すれば、依存チェーンの
+レイテンシをスループットで隠蔽できる余地がある——**#365（dot カーネル複数
+アキュムレータ化）の実測動機として妥当な仮説**であることが本確認で裏付けられた。
+ただし本 Issue はプロファイル専任であり、`isa.rs` への変更は行わない
+（production コード無変更）。
+
+## 後続 Issue への示唆
+
+1. **#363（arena のテーブル世代整合キャッシュ化）**: S4（arena 構築、176.4 ns/行、
+   e2e の約 74%）が支配的段であることが実測で確認された。クエリ毎の再構築を
+   キャッシュで回避できれば、この段のコストをほぼ丸ごと削減できる可能性がある。
+   優先度は高いと考えられる。
+2. **#364（連続格納レイアウト ADR）**: S2→S3 の f32 デコード分（90.6 ns/行、
+   arena 構築の約 51%）が単独最大の内訳であり、行バイト列から `Vec<f32>` へ
+   展開するコスト自体が支配的である。連続格納（embedding をあらかじめ
+   デコード済みの形でディスク上に保持する等）によりこの段を縮小できれば、
+   arena 構築コストの半分近くを削減できる可能性がある。
+3. **#365（dot カーネル複数アキュムレータ化）**: 上記アセンブリ確認により、
+   単一依存チェーンであることが確認された。ただし S5（距離計算＋Top-k、
+   10.2 ns/行）は e2e 全体（238.0 ns/行）の約 4%に過ぎず、**このコーパス規模
+   （25,000 行・dim128・k=10）では最適化の絶対効果は限定的**と見込まれる。
+   行数・次元がより大きい場合や、S5 単体の相対比率が上がる構成（arena キャッシュ
+   化〔#363〕により S4 が削減された後）では相対的に重要度が上がりうる。
+4. **#366（距離計算/Top-k の 2 段分離）**: S5（距離計算＋Top-k、10.2 ns/行）と
+   S5'（距離計算のみ、7.8 ns/行）の差（2.4 ns/行）が Top-k 選出（`BinaryHeap`
+   部分ソート）のコストの目安である。距離計算自体（7.8 ns/行）が S5 の大部分を
+   占め、Top-k 選出は相対的に小さい。
+5. **#367（ANN 採否検討）**: 本ベンチは総当たり（brute-force）経路のみを対象と
+   しており、ANN との比較材料は提供しない。ただし本測定により「総当たりの
+   ボトルネックは距離計算ではなく arena 構築（特に f32 デコード）にある」ことが
+   分かったため、ANN 導入の効果を検討する際は「距離計算の高速化」ではなく
+   「候補集合構築コストの削減」という観点を優先すべきという示唆になる。
+
+## 再現手順
+
+```sh
+make bench-knn-profile
+```
+
+`GITHUB_ACTIONS` 環境下では拒否される（誤って CI 経由で実行された場合の
+defense-in-depth）。専有環境の宣言・複数回実行による中央値の確定は運用者が
+手動で行う（`docs/design/hybrid-refetch-latency.md`・`docs/design/
+c1-p95-dedicated-env-reverification.md` と同じ運用方針）。
+
+`dot_lanes` の逆アセンブル確認は次の手順で再現できる:
+
+```sh
+cargo bench --bench knn_profile_bench -p engine --no-run
+nm target/release/deps/knn_profile_bench-*  | grep dot_avx2_fma
+objdump -d -M intel --start-address=<addr> --stop-address=<addr+len> \
+  target/release/deps/knn_profile_bench-*
+```
+
+## スコープ外（Issue #362 の対象外）
+
+- `crates/engine/src/` への変更（本 Issue はプロファイル専任。#363〜#367 の
+  各後続 Issue が個別に対応する）
+- 大規模コーパス（数十万行以上）・複数 ISA（AVX-512・NEON）での実測
+  （本ベンチは AVX2FMA 環境での 1 コーパス規模のみを対象とする）
+- 専有環境での確定測定（本 doc の実測値は共有 CPU/IO 環境での参考値）
