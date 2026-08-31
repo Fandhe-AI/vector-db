@@ -914,7 +914,10 @@ mod verbose_gate_tests {
 /// する。strict モードでは [`resolve_gate_threshold`] が未設定を検出した時点で
 /// fail-closed になる）。`after_recall@20` の実測値は注入された閾値の近傍情報を
 /// 含むため `RECALL_VERBOSE=1` opt-in 時のみ追加出力する（Issue #303・
-/// [`render_gate_line`] 参照）。一方 informational な `improvement_ratio`（判定に
+/// [`render_gate_line`] 参照。秘匿境界は閾値そのものであり、常時出力する導出入力の
+/// hits 件数は層 A の公開固定アサート値〔spec-confidentiality のオーナー判断
+/// 2026-08-29 により公開可〕と同一で新規情報を含まない——verbose ゲートは
+/// `hybrid_recall.rs` と揃えたログ最小化方針であって機密境界ではない）。一方 informational な `improvement_ratio`（判定に
 /// 使わない実測値）は閾値を含まないため、`verbose`／`GITHUB_ACTIONS` の有無に
 /// かかわらず常時出力する（codex-review P1・PR #340。`GITHUB_ACTIONS` 下では
 /// `RECALL_VERBOSE=1` が fail-closed に拒否され、通常 CI 実行から実測値を一切
