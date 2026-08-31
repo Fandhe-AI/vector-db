@@ -514,6 +514,296 @@ impl PrefilterCache {
     }
 }
 
+/// [`SqlArenaCache`] のエントリ数上限（Issue #363。[`PrefilterCache`]（TASK-169）と
+/// 同じ DoS 対策方針を踏襲する）。
+const MAX_SQL_ARENA_CACHE_ENTRIES: usize = 32;
+
+/// [`SqlArenaCache`] が保持するスナップショット群（アリーナ本体＋行 metadata 複製）の
+/// 概算バイト量の合計上限（[`MAX_PREFILTER_CACHE_TOTAL_BYTES`] と同じ桁に揃える）。
+const MAX_SQL_ARENA_CACHE_TOTAL_BYTES: usize = crate::arena::MAX_ARENA_TOTAL_BYTES;
+
+/// [`SqlArenaCache`] の観測用統計（Issue #363）。テナント ID・行 ID 等の機微情報は
+/// 一切含まない（[`PrefilterCacheStats`] と同じ方針。`VectorCore` trait には載せない
+/// 固有 API `EngineCore::sql_arena_cache_stats` としてのみ公開する）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SqlArenaCacheStats {
+    /// キャッシュヒット数（テーブル世代整合まで確認できた再利用）。
+    pub hits: u64,
+    /// キャッシュミス数（未登録、またはテーブル世代不一致で破棄した後の再構築）。
+    pub misses: u64,
+    /// テーブル世代不一致による破棄回数。
+    pub stale_evictions: u64,
+    /// 容量上限超過による LRU 追い出し回数。
+    pub capacity_evictions: u64,
+    /// 現在キャッシュが保持しているエントリ数。
+    pub entries: usize,
+}
+
+/// `sql::exec::execute_statement_cached` が [`SqlArenaCache`] に格納・再利用する
+/// スナップショット（Issue #363）。`arena`（RLS 段のみを適用して構築した
+/// [`VectorArena`]）と `metadata`（`arena` とスロット添字が 1 対 1 に対応する行
+/// metadata の複製。`VectorArena::build_from_cached_rls_rows` のドキュメント参照）を
+/// 一組で保持する。SCALAR 段（`WHERE`）はクエリごとに異なるため事前適用しない
+/// （キャッシュヒット時にクエリごと `on_visible_row` を再適用する。
+/// `sql::exec` モジュールドキュメント参照）。
+pub(crate) struct SqlArenaSnapshot {
+    arena: VectorArena,
+    metadata: Vec<Vec<u8>>,
+    built_ctx: PolicyContext,
+    built_table_generation: u64,
+}
+
+impl SqlArenaSnapshot {
+    /// `sql::exec::execute_statement_cached`（キャッシュミス時）が、RLS 通過行の
+    /// 採取結果（[`crate::arena::SqlArenaCaptureBuilder::finish`]）とクエリ実行時の
+    /// `ctx`・テーブル世代からスナップショットを組み立てる。
+    pub(crate) fn new(
+        arena: VectorArena,
+        metadata: Vec<Vec<u8>>,
+        built_ctx: PolicyContext,
+        built_table_generation: u64,
+    ) -> Self {
+        Self {
+            arena,
+            metadata,
+            built_ctx,
+            built_table_generation,
+        }
+    }
+
+    pub(crate) fn arena(&self) -> &VectorArena {
+        &self.arena
+    }
+
+    pub(crate) fn metadata(&self) -> &[Vec<u8>] {
+        &self.metadata
+    }
+
+    fn built_ctx(&self) -> &PolicyContext {
+        &self.built_ctx
+    }
+
+    fn built_table_generation(&self) -> u64 {
+        self.built_table_generation
+    }
+
+    /// キャッシュ容量判定用の概算バイト量（`arena` 本体＋`metadata` 複製の実バイト数）。
+    fn approx_heap_bytes(&self) -> usize {
+        let metadata_bytes: usize = self
+            .metadata
+            .iter()
+            .map(|m| m.len().saturating_add(std::mem::size_of::<Vec<u8>>()))
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        self.arena
+            .approx_heap_bytes()
+            .saturating_add(metadata_bytes)
+    }
+}
+
+struct SqlArenaCacheEntry {
+    table: String,
+    snapshot: Arc<SqlArenaSnapshot>,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct SqlArenaCacheState {
+    entries: Vec<SqlArenaCacheEntry>,
+}
+
+/// SQL 表層（`sql::exec::execute_statement_cached`）専用の [`VectorArena`] 世代整合
+/// キャッシュ（Issue #363・VectorArena のテーブル世代整合キャッシュ化）。
+///
+/// [`PrefilterCache`]（`EngineCore::search`・Rust API 直呼び経路が使う）と役割は同種
+/// だが、失効判定の世代源泉が異なる: `PrefilterCache` はストレージ全体世代
+/// （[`Storage::current_generation`]）を見るのに対し、本キャッシュは**テーブル単位
+/// 世代**（[`crate::catalog::table_generation_in_txn`]。`USING PLAN` の I/O 前後照合
+/// が使うのと同じ源泉）を見る。SQL 表層は 1 クエリが 1 テーブルのみを対象とするため、
+/// テーブル単位世代の方が「無関係な他テーブルへの書き込みでエントリを不要に失効
+/// させない」点でキャッシュの有効性が高い（`docs/design/
+/// table-generation-rejection-granularity.md` の粒度判断を踏襲。両者を混在させず、
+/// `PrefilterCache` をテーブル単位世代へ統一する判断は本 Issue のスコープ外
+/// ——`sql::exec` 経路の追加のみを対象とする）。
+///
+/// **キー**: `(table, ctx)` の完全一致（[`PolicyContext`] は `PartialEq`/`Eq` を
+/// テナント ID・許可可視性集合の値比較として実装しており、`ImplicitRlsHook::predicate`
+/// はこれら以外の入力を一切読まない。security.md P0「テナント分離の検査を外す/
+/// 緩める/バイパス経路を作らない」: ctx が 1 bit でも異なれば別エントリになり、
+/// 他テナント・他可視性のスナップショットを供する経路を構造的に作らない）。
+///
+/// **失効**: [`Self::lookup`] は、呼び出し元がクエリ実行そのものに使う**同一**
+/// `read_txn` の中でテーブル世代を読み、`snapshot.built_table_generation()` と
+/// 完全一致する場合のみ返す（fail-closed。世代読み取り自体の失敗・ロック毒化も
+/// 「見つからなかった」として扱う）。クエリ実行と同一スナップショット内の照合なので
+/// `PrefilterCache::lookup` のような「ロック取得と世代読み取りの前後関係」に起因する
+/// 競合を考慮する必要がない（同一 txn 内の値は以後変化しない）。
+///
+/// **insert の非対称性**: [`PrefilterCache::insert`] と異なり、`insert` が `None` を
+/// 返した（＝キャッシュへ反映されなかった）場合でも、呼び出し元は自分の `read_txn`
+/// で構築済みの結果をそのままクエリ応答として使ってよい（スナップショット分離
+/// として正当な応答であり、fail-closed が守るべき対象は「stale な**キャッシュ**を
+/// 別クエリへ供すること」であって、この 1 回限りの自分自身の結果ではないため）。
+/// この点だけが [`PrefilterCache::insert`] の契約と異なる（呼び出し元
+/// `sql::exec::execute_statement_cached` のドキュメント参照）。
+///
+/// **容量**: [`MAX_SQL_ARENA_CACHE_ENTRIES`]・[`MAX_SQL_ARENA_CACHE_TOTAL_BYTES`] を
+/// 超えないよう、[`PrefilterCache`] と同じ手順（同一キー重複除去 → 現在世代と
+/// 不整合なエントリの一括破棄 → それでも超過するなら LRU 追い出し）で管理する。
+pub(crate) struct SqlArenaCache {
+    state: RwLock<SqlArenaCacheState>,
+    seq: AtomicU64,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    stale_evictions: AtomicU64,
+    capacity_evictions: AtomicU64,
+}
+
+impl SqlArenaCache {
+    fn new() -> Self {
+        Self {
+            state: RwLock::new(SqlArenaCacheState::default()),
+            seq: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            stale_evictions: AtomicU64::new(0),
+            capacity_evictions: AtomicU64::new(0),
+        }
+    }
+
+    /// `(table, ctx)` に一致し、かつ `read_txn`（呼び出し元のクエリ実行そのものが
+    /// 使う txn）内で読んだテーブル世代と整合するエントリを探す。型ドキュメント
+    /// 「失効」参照。世代不一致のエントリは見つけ次第破棄する。
+    pub(crate) fn lookup(
+        &self,
+        read_txn: &redb::ReadTransaction,
+        table: &str,
+        ctx: &PolicyContext,
+    ) -> Option<Arc<SqlArenaSnapshot>> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let current_generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
+
+        let mut guard = self.state.write().ok()?;
+        let position = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && e.snapshot.built_ctx() == ctx)?;
+        let stale = guard
+            .entries
+            .get(position)
+            .map(|e| e.snapshot.built_table_generation() != current_generation)
+            .unwrap_or(true);
+        if stale {
+            guard.entries.remove(position);
+            self.stale_evictions.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let snapshot = {
+            let entry = guard.entries.get_mut(position)?;
+            entry.last_used = seq;
+            Arc::clone(&entry.snapshot)
+        };
+        drop(guard);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(snapshot)
+    }
+
+    /// 新規構築したスナップショットを挿入する。`storage` から新規に読んだテーブル
+    /// 世代と `snapshot.built_table_generation()` が一致しない場合（並行書き込みで
+    /// 挿入対象自身が既に古い）・世代を確認できない場合は `None`（[`PrefilterCache::insert`]
+    /// と同じ fail-closed 契約。Issue #280 対応の踏襲）。型ドキュメント「insert の
+    /// 非対称性」参照: `None` は「キャッシュへ反映しない」ことのみを意味し、
+    /// 呼び出し元が自分の `read_txn` で構築済みの結果を使うことは妨げない。
+    pub(crate) fn insert(
+        &self,
+        storage: &Storage,
+        table: &str,
+        ctx: &PolicyContext,
+        snapshot: SqlArenaSnapshot,
+    ) -> Option<Arc<SqlArenaSnapshot>> {
+        let snapshot = Arc::new(snapshot);
+        self.misses.fetch_add(1, Ordering::Relaxed);
+
+        let Ok(mut guard) = self.state.write() else {
+            return None;
+        };
+
+        let Ok(read_txn) = storage.db().begin_read() else {
+            return None;
+        };
+        let Ok(current_generation) = crate::catalog::table_generation_in_txn(&read_txn, table)
+        else {
+            return None;
+        };
+        if snapshot.built_table_generation() != current_generation {
+            return None;
+        }
+
+        let own_bytes = snapshot.approx_heap_bytes();
+        if own_bytes > MAX_SQL_ARENA_CACHE_TOTAL_BYTES {
+            return Some(snapshot);
+        }
+
+        if let Some(pos) = guard
+            .entries
+            .iter()
+            .position(|e| e.table == table && e.snapshot.built_ctx() == ctx)
+        {
+            guard.entries.remove(pos);
+        }
+
+        let before = guard.entries.len();
+        guard
+            .entries
+            .retain(|e| e.snapshot.built_table_generation() == current_generation);
+        let removed_stale = before.saturating_sub(guard.entries.len());
+        if removed_stale > 0 {
+            self.stale_evictions
+                .fetch_add(removed_stale as u64, Ordering::Relaxed);
+        }
+
+        let mut total_bytes: usize = guard
+            .entries
+            .iter()
+            .map(|e| e.snapshot.approx_heap_bytes())
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        while guard.entries.len() >= MAX_SQL_ARENA_CACHE_ENTRIES
+            || total_bytes.saturating_add(own_bytes) > MAX_SQL_ARENA_CACHE_TOTAL_BYTES
+        {
+            let victim = guard
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(idx, _)| idx);
+            let Some(idx) = victim else {
+                return Some(snapshot);
+            };
+            let removed = guard.entries.remove(idx);
+            total_bytes = total_bytes.saturating_sub(removed.snapshot.approx_heap_bytes());
+            self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        guard.entries.push(SqlArenaCacheEntry {
+            table: table.to_string(),
+            snapshot: Arc::clone(&snapshot),
+            last_used: seq,
+        });
+        Some(snapshot)
+    }
+
+    fn stats(&self) -> SqlArenaCacheStats {
+        let entries = self.state.read().map(|g| g.entries.len()).unwrap_or(0);
+        SqlArenaCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            stale_evictions: self.stale_evictions.load(Ordering::Relaxed),
+            capacity_evictions: self.capacity_evictions.load(Ordering::Relaxed),
+            entries,
+        }
+    }
+}
+
 /// [`DictionaryCache`] のエントリ数上限（TASK-109・PLAN-5。[`PrefilterCache`]
 /// （TASK-169）と同じ DoS 対策方針を踏襲する）。
 const MAX_DICTIONARY_CACHE_ENTRIES: usize = 16;
@@ -1010,6 +1300,12 @@ pub struct EngineCore {
     /// [`Self::with_dictionary_config`] のみ。クエリ・セッション変数から到達できる
     /// 経路は持たない（[`Self::with_precision_policy`] と同じ流儀）。
     dictionary_config: crate::dictionary::DictionaryConfig,
+    /// SQL 表層（`sql::exec::execute_statement_cached`）専用の `VectorArena` テーブル
+    /// 世代整合キャッシュ（Issue #363）。[`Self::execute_validated_in_session`] の
+    /// `Statement::Select` アームがこれを経由してアリーナ再構築（redb 全行走査・
+    /// デコード）を同一テーブル世代内で再利用する（詳細は [`SqlArenaCache`] の
+    /// ドキュメント参照）。
+    sql_arena_cache: SqlArenaCache,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1071,6 +1367,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
+            sql_arena_cache: SqlArenaCache::new(),
         })
     }
 
@@ -1098,6 +1395,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
+            sql_arena_cache: SqlArenaCache::new(),
         }
     }
 
@@ -1106,6 +1404,14 @@ impl EngineCore {
     /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
     pub fn prefilter_cache_stats(&self) -> PrefilterCacheStats {
         self.prefilter_cache.stats()
+    }
+
+    /// [`SqlArenaCache`] の現在の統計を返す（Issue #363。テスト・運用観測用）。
+    /// テナント ID・行 ID 等の機微情報は含まない（[`SqlArenaCacheStats`] 参照）。
+    /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外。
+    /// `prefilter_cache_stats` と同じ方針）。
+    pub fn sql_arena_cache_stats(&self) -> SqlArenaCacheStats {
+        self.sql_arena_cache.stats()
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -2033,13 +2339,19 @@ impl EngineCore {
                     (read_txn, schema, bound)
                 };
                 let (read_txn, schema, bound) = bound_result;
-                let result = crate::sql::exec::execute_statement(
+                // Issue #363: SQL 表層の SELECT（`USING PLAN` 展開経由を含む、本アーム
+                // 全体）は `sql_arena_cache`（テーブル世代整合キャッシュ）を経由して
+                // `VectorArena` の再構築（redb 全行走査・デコード）を同一テーブル世代内
+                // で再利用する（詳細は `SqlArenaCache`・`sql::exec::execute_statement_cached`
+                // のドキュメント参照）。
+                let result = crate::sql::exec::execute_statement_cached(
                     &read_txn,
                     self.provider.as_ref(),
                     ctx,
                     &schema,
                     &bound,
                     &self.precision_policy,
+                    Some((&self.sql_arena_cache, &self.storage)),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }

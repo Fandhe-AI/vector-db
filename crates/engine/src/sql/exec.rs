@@ -349,6 +349,45 @@ pub fn execute_statement(
     bound: &BoundStatement,
     precision_policy: &crate::precision::PrecisionPolicy,
 ) -> Result<QueryResult, SqlSurfaceError> {
+    execute_statement_cached(
+        read_txn,
+        provider,
+        ctx,
+        schema,
+        bound,
+        precision_policy,
+        None,
+    )
+}
+
+/// [`execute_statement`] の本体（Issue #363・VectorArena のテーブル世代整合
+/// キャッシュ化）。`cache` が `Some` の場合、候補構築（`VectorArena` の RLS 段
+/// アリーナ・行 metadata）を [`crate::core::SqlArenaCache`] 経由で同一テーブル世代内
+/// 再利用する。`cache` が `None`（[`execute_statement`] からの呼び出し・テスト等）
+/// の場合は従来どおり毎回 redb を走査する。
+///
+/// 呼び出し文脈: `core.rs::EngineCore::execute_validated_in_session` の
+/// `Statement::Select` アーム（`USING PLAN` 展開経由を含む）が、自身が保持する
+/// `sql_arena_cache: SqlArenaCache` と `storage: Storage` を渡して呼ぶ唯一の
+/// production 経路。`cache`／キャッシュ用の `storage` 参照はいずれも「クエリ実行に
+/// 使う `read_txn` と同一テーブルを対象とする」契約を呼び出し元が保証する
+/// （`SqlArenaCache::lookup` は `read_txn` 自身からテーブル世代を読むため、
+/// 呼び出し元が異なるテーブルの `read_txn` を渡す誤りを構造的に防げない点は
+/// `bound.table` との一致を前提にする既存の `execute_statement` 契約と同じ）。
+///
+/// ヒット時・ミス時いずれも、SCALAR 段（`on_visible_row`。`WHERE`・hybrid 疎コーパス
+/// 蓄積・投影用スカラー列保持）はクエリごとに毎回このまま実行する（キャッシュする
+/// のは RLS 段まで通過した行の埋め込み・metadata のみ。モジュールドキュメント
+/// 「RLS → SCALAR → DISTANCE」の責務境界は変えない）。
+pub(crate) fn execute_statement_cached(
+    read_txn: &redb::ReadTransaction,
+    provider: &dyn SearchProvider,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundStatement,
+    precision_policy: &crate::precision::PrecisionPolicy,
+    cache: Option<(&crate::core::SqlArenaCache, &crate::storage::Storage)>,
+) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
     // 切り出してあり、本関数は適用位置（DISTANCE 段＋事後 SCALAR フィルタの後・
@@ -568,14 +607,140 @@ pub fn execute_statement(
         Ok(true)
     };
 
+    // キャッシュヒット時、SCALAR 段（`on_visible_row`）が全行を無条件に通過させる
+    // だけ（＝恒等写像）であると静的に判定できる場合、行単位ループ自体
+    // （`push_visible_row` の `tenant_id.to_string()` 複製・`GrowableArenaBuffers`
+    // への再構築）を丸ごと省略し、キャッシュ済みスナップショットの `VectorArena` を
+    // 直接借用する（Issue #363 追補: `build_from_cached_rls_rows` 経由の複製でも
+    // redb 走査・デコードは避けられるが、行数が多いテーブルではこの per-row
+    // コピー自体が支配的コストになることが実測〔`make bench-c1` 相当〕で判明した）。
+    // 4 条件がすべて成り立つ場合のみ SCALAR 段が恒等写像になる（`on_visible_row`
+    // の実装〔本関数冒頭〕参照）: (a) メタデータフィルタなし (b) 式述語なし
+    // (c) hybrid でない（疎コーパス蓄積が不要） (d) 投影が候補スカラー列を
+    // 一切参照しない（`needed_column_indices` が空）。この場合 `HINT ORDER` の
+    // 内容（`plan.scalar_prefilter`）によらず結果は変わらない（SCALAR 段が
+    // 空判定である以上、先行でも後行でも同じ）。
+    let cache_fast_path_eligible = bound.metadata_filters.is_empty()
+        && bound.expr_filters.is_empty()
+        && !is_hybrid
+        && needed_column_indices.is_empty();
+
     let rls_hook = ImplicitRlsHook::new(ctx);
-    let arena = VectorArena::build_filtered_with_rows_in_txn(
-        read_txn,
-        &bound.table,
-        rls_hook.predicate(),
-        on_visible_row,
-    )
-    .map_err(|e| map_arena_error(&bound.table, e))?;
+    // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
+    // 指す `&VectorArena` になる。ミス／フォールバック経路は `owned_arena` へ、
+    // 高速経路は `cache_hit_snapshot`〔`Arc` でキャッシュ本体と共有〕へ格納する）。
+    // `Option::insert` で値を格納しつつそのまま `&mut T`（ここでは即座に `&T` へ
+    // 落とす）を受け取ることで、受信データ経路での `unwrap`/`expect` 禁止
+    // （.claude/rules/coding-rust.md）に抵触する「直後に取り出す」形の
+    // `expect("just assigned")` を書かずに済む。
+    let mut owned_arena: Option<VectorArena> = None;
+    let mut cache_hit_snapshot: Option<std::sync::Arc<crate::core::SqlArenaSnapshot>> = None;
+    let arena: &VectorArena = match cache {
+        None => owned_arena.insert(
+            VectorArena::build_filtered_with_rows_in_txn(
+                read_txn,
+                &bound.table,
+                rls_hook.predicate(),
+                on_visible_row,
+            )
+            .map_err(|e| map_arena_error(&bound.table, e))?,
+        ),
+        Some((sql_cache, storage)) => {
+            if let Some(snapshot) = sql_cache.lookup(read_txn, &bound.table, ctx) {
+                if cache_fast_path_eligible {
+                    // 高速経路: SCALAR 段が恒等写像なので `on_visible_row` を
+                    // 一切呼ばず（呼んでも常に `Ok(true)` を返すだけで副作用が
+                    // ない）、`candidate_columns` だけスロット数分の空 `Vec` で
+                    // 埋める（`on_visible_row` 本体の「`needed_column_indices` が
+                    // 空なら `Vec::new()` を積むだけ」という既存分岐と同じ結果を、
+                    // 呼び出しなしで再現する。空 `Vec` はヒープ確保しないため
+                    // 行数分の確保コストも発生しない）。
+                    candidate_columns.reserve(snapshot.arena().len());
+                    for _ in 0..snapshot.arena().len() {
+                        candidate_columns.push(Vec::new());
+                    }
+                    cache_hit_snapshot.insert(snapshot).arena()
+                } else {
+                    // ヒットだが SCALAR 段に実質的な処理がある: 従来どおり
+                    // キャッシュ済みスナップショットへ `on_visible_row` を
+                    // クエリごとに再適用して候補集合を再構築する
+                    // （モジュールドキュメント「RLS → SCALAR → DISTANCE」の
+                    // 責務境界は変えない）。
+                    let expected_dim = schema
+                        .vector_dim()
+                        .ok_or(ArenaError::InvalidDim)
+                        .map_err(|e| map_arena_error(&bound.table, e))?;
+                    owned_arena.insert(
+                        VectorArena::build_from_cached_rls_rows(
+                            &bound.table,
+                            expected_dim,
+                            snapshot.arena(),
+                            snapshot.metadata(),
+                            on_visible_row,
+                            crate::arena::MAX_ARENA_ROWS,
+                            crate::arena::MAX_ARENA_TOTAL_BYTES,
+                        )
+                        .map_err(|e| map_arena_error(&bound.table, e))?,
+                    )
+                }
+            } else {
+                // ミス: 従来どおり redb を走査するが、`rls_capture` で RLS 通過行
+                // （SCALAR 段の判定結果に関係なく全件）を同一走査の中で同時に採取し、
+                // 次回以降のクエリが再利用できるスナップショットとしてキャッシュへ
+                // 登録する（`SqlArenaCaptureBuilder` のドキュメント参照。容量超過等で
+                // 採取を断念した場合はキャッシュへ反映しないだけで、このクエリ自体の
+                // 応答には影響しない）。
+                let expected_dim = schema
+                    .vector_dim()
+                    .ok_or(ArenaError::InvalidDim)
+                    .map_err(|e| map_arena_error(&bound.table, e))?;
+                let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+                    expected_dim,
+                    crate::arena::MAX_ARENA_ROWS,
+                    crate::arena::MAX_ARENA_TOTAL_BYTES,
+                    crate::arena::MAX_ARENA_TOTAL_BYTES,
+                );
+                let mut rls_capture = |id: u64,
+                                       tenant_id: &str,
+                                       visibility,
+                                       embedding: &[f32],
+                                       metadata: &[u8]|
+                 -> std::result::Result<(), ArenaError> {
+                    capture.push(id, tenant_id, visibility, embedding, metadata);
+                    Ok(())
+                };
+                let built = VectorArena::build_filtered_with_rows_in_txn_capturing(
+                    read_txn,
+                    &bound.table,
+                    rls_hook.predicate(),
+                    on_visible_row,
+                    &mut rls_capture,
+                )
+                .map_err(|e| map_arena_error(&bound.table, e))?;
+                // キャッシュ登録用のテーブル世代は、クエリ実行そのものに使った
+                // `read_txn`（＝この走査が観測したスナップショット）から読む。
+                // `SqlArenaCache::insert` 側が挿入直前に別途フレッシュな世代と
+                // 再照合するため、ここでの読み取りは「採取したスナップショットが
+                // どの世代由来か」を記録するだけでよい。読み取り自体に失敗した場合は
+                // キャッシュへ登録せず、クエリ応答（`built`）はそのまま返す
+                // （fail-closed: 判定できないなら常駐させない。クエリ自体は失敗させない）。
+                if let Ok(built_table_generation) =
+                    crate::catalog::table_generation_in_txn(read_txn, &bound.table)
+                {
+                    if let Some((cache_arena, cache_metadata)) = capture.finish(&bound.table) {
+                        let snapshot = crate::core::SqlArenaSnapshot::new(
+                            cache_arena,
+                            cache_metadata,
+                            ctx.clone(),
+                            built_table_generation,
+                        );
+                        let _ = sql_cache.insert(storage, &bound.table, ctx, snapshot);
+                    }
+                }
+                owned_arena.insert(built)
+            }
+        }
+    };
 
     // provider へ渡す id は行 `id` ではなく**アリーナのスロット番号**（0..n）にする。
     // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、1 つの
@@ -896,7 +1061,7 @@ pub fn execute_statement(
         verified,
         &bound.projection,
         schema,
-        &arena,
+        arena,
         &candidate_columns,
     )?;
 
