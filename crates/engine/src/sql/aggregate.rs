@@ -84,6 +84,13 @@ pub(crate) struct ReferencedColumns {
     /// `VectorColumnPresence`（`COUNT(<VECTOR 列>)`）項目がある場合に `true`
     /// （embedding 自体は不要・dim のみ必要）。
     needs_vector_presence: bool,
+    /// `TextColumn` 項目・`metadata_filters`・`GROUP BY` キー列のいずれかが
+    /// スカラー列を参照する場合に `true`。`scalar_mask` への反映（`get_mut`）が
+    /// 範囲外インデックスで黙って無視された場合でも、この値は参照の有無を
+    /// 直接記録するため `any_scalar_column_referenced()`（`scalar_mask` 経由の
+    /// 間接判定）だけに依存せず `DecodeTier::Fast` の誤選択を防ぐ
+    /// （codex-review 指摘対応）。
+    has_scalar_reference: bool,
 }
 
 impl ReferencedColumns {
@@ -100,10 +107,12 @@ impl ReferencedColumns {
         let mut scalar_mask = vec![false; schema.columns.len()];
         let mut needs_embedding = false;
         let mut needs_vector_presence = false;
+        let mut has_scalar_reference = false;
 
         for item in items {
             match &item.input {
                 AggregateInput::TextColumn(index) => {
+                    has_scalar_reference = true;
                     if let Some(slot) = scalar_mask.get_mut(*index) {
                         *slot = true;
                     }
@@ -117,6 +126,9 @@ impl ReferencedColumns {
                 AggregateInput::AllVisible | AggregateInput::IdU64 => {}
             }
         }
+        if !metadata_filters.is_empty() {
+            has_scalar_reference = true;
+        }
         for filter in metadata_filters {
             if let Some(slot) = scalar_mask.get_mut(filter.column_index()) {
                 *slot = true;
@@ -128,6 +140,7 @@ impl ReferencedColumns {
             }
         }
         if let Some(index) = extra_scalar_index {
+            has_scalar_reference = true;
             if let Some(slot) = scalar_mask.get_mut(index) {
                 *slot = true;
             }
@@ -137,11 +150,16 @@ impl ReferencedColumns {
             scalar_mask,
             needs_embedding,
             needs_vector_presence,
+            has_scalar_reference,
         }
     }
 
+    /// `DecodeTier::Fast` 選択可否の判定に使う。`scalar_mask`（`get_mut` が
+    /// 範囲外インデックスで無視された場合に値が反映されない可能性がある）
+    /// ではなく `has_scalar_reference`（参照の有無を直接記録した値）を主とし、
+    /// 両者いずれかが立っていれば `true` を返す fail-closed 判定にする。
     fn any_scalar_column_referenced(&self) -> bool {
-        self.scalar_mask.iter().any(|&wanted| wanted)
+        self.has_scalar_reference || self.scalar_mask.iter().any(|&wanted| wanted)
     }
 
     pub(crate) fn scalar_mask(&self) -> &[bool] {
