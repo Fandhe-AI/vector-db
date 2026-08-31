@@ -48,12 +48,17 @@
 
 `Fast` と `DimAndScalar` はどちらもヒープ確保を伴わない
 `storage::decode_row_dim_and_metadata_borrowed`（dim・embedding 境界・metadata 境界・
-末尾余剰バイトの構造検証。破損は `XX000`）を通る。両者の違いは
-`row_codec::scan_scalar_columns_masked` による metadata 列の `&str` 化・保持を
-`Fast` が省略する点のみで、破損検知（fail-closed 契約）に差は無い（PR #369
-codex-review P1 指摘対応。旧実装は `Fast` がこの構造検証自体を丸ごと省略しており、
-破損した可視行を `COUNT(*)`/`SUM(id)` 等の集計結果へ黙って含めてしまう契約変更に
-なっていた）。
+末尾余剰バイトの構造検証。破損は `XX000`）を通る。両者の違いは metadata 列の
+presence・長さ・UTF-8 の構造検証を、`Fast` は結果を一切保持しない
+`row_codec::validate_scalar_columns`（`Vec` 確保なし）で行い、`DimAndScalar` は
+`&str` 化した結果を `Vec<Option<&str>>` へ保持する `row_codec::scan_scalar_columns_masked`
+で行う点のみで、破損検知（fail-closed 契約）に差は無い（両者は走査本体
+`row_codec::scan_scalar_columns_validated` を共有し、検証済みの値を `Vec` へ積むか
+捨てるかだけを呼び出し元が選ぶ。PR #369 codex-review P1 指摘対応・2 件: (1) `Fast` が
+この構造検証自体を丸ごと省略し、破損した可視行を `COUNT(*)`/`SUM(id)` 等の集計結果へ
+黙って含めてしまう契約変更になっていた旧実装を修正。(2) その後も `Fast` が
+`scan_scalar_columns_masked` を呼び毎行 `Vec<Option<&str>>` を確保しており、`Fast` は
+結果 `Vec` 生成を省略するという本 tier 契約に反していた実装バグを修正）。
 
 `Fast` は `sql::aggregate::execute_aggregate`（`GROUP BY` なし）専用で、
 `needs_embedding`・`needs_vector_presence`・`scalar_mask` がすべて偽、かつ
@@ -67,26 +72,32 @@ codex-review P1 指摘対応。旧実装は `Fast` がこの構造検証自体�
 どの tier でも必ず・同じ順序で行う。この 2 つはデコード「範囲」の縮小と独立した
 不変条件であり、`ReferencedColumns`・`DecodeTier` はここへ一切手を加えない。
 
-### `scan_scalar_columns_masked`（必要列限定デコード）
+### `scan_scalar_columns_masked` / `validate_scalar_columns`（必要列限定デコード）
 
-`row_codec::scan_scalar_columns_masked(schema, buf, mask)` は、`mask[i] == false` の列も
+`row_codec::scan_scalar_columns_masked(schema, buf, mask)` と
+`row_codec::validate_scalar_columns(schema, buf)` は、内部の走査本体
+`row_codec::scan_scalar_columns_validated` を共有する。`mask[i] == false` の列も
 presence・宣言長（`MAX_TEXT_FIELD_LEN`）・バッファ境界の構造検証に加え UTF-8 妥当性検証
 まで常に行い（codex-review P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を
-fail-closed で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）、検証済みの
-`&str` の生成・保持（呼び出し元への返却値としての保持）のみを省略して `None` を積む。
-untrusted な行バッファに対する構造検証・内容検証はマスク外の列でも一切弱めない。既存
-`scan_scalar_columns` は全列 `true` の薄いラッパーへ変更した（呼び出し元・テストは無変更で
-green）。
+fail-closed で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）、
+`scan_scalar_columns_masked` は検証済みの値のうち要求列だけを `&str` として
+`Vec<Option<&str>>` へ積む一方、`validate_scalar_columns` は検証のみ行い値を一切
+保持・返却しない（呼び出し元は `Vec` を確保しない）。untrusted な行バッファに
+対する構造検証・内容検証は、マスク外の列・`validate_scalar_columns` 経由のいずれでも
+一切弱めない。既存 `scan_scalar_columns` は全列 `true` の薄いラッパーへ変更した
+（呼び出し元・テストは無変更で green）。
 
-`scalar_mask` が全 `false`（= `metadata_filters` も必ず空。`MetadataFilter` は自身の列を
-必ずマスクへ反映するため。`COUNT(*)`・`SUM(id)` 等 `VECTOR`/スカラー列のいずれも参照
-しないクエリ・`DecodeTier::Fast` を含む）であっても、走査ループ側は
-`scan_scalar_columns_masked` の呼び出し自体は省略しない（codex-review P1 指摘・
-PR #369: 呼び出しごと省略すると metadata の presence・列長・UTF-8・余剰バイトの
-構造検証が全く行われなくなり、破損した可視行を検出できないまま集計が成功して
-しまう fail-open な契約変更になるため）。全 `false` マスクで呼び出しても構造検証・
-UTF-8 妥当性検証は他マスクと同様に全列へ行われ、省略されるのは検証済み `&str` の
-生成・保持だけである。
+`DecodeTier::Fast`（`scalar_mask` が全 `false`。`metadata_filters` も必ず空。
+`MetadataFilter` は自身の列を必ずマスクへ反映するため）は `validate_scalar_columns`
+を使い、走査そのもの（presence・列長・UTF-8・余剰バイトの構造検証）は省略しない一方、
+`Vec<Option<&str>>` の確保は行わない（codex-review P1 指摘・PR #369・2 件。(1)
+走査自体を省略すると破損した可視行を検出できないまま集計が成功してしまう
+fail-open な契約変更になるため走査は必須。(2) 走査を `scan_scalar_columns_masked`
+で行うと `Fast` でも毎行 `Vec` を確保してしまい「`Fast` は結果 `Vec` 生成を省略する」
+という本 tier 契約に反するため、検証専用 API を新設して置き換えた）。`DimAndScalar`
+は引き続き `scan_scalar_columns_masked` を使い、全 `false` マスクで呼び出しても
+構造検証・UTF-8 妥当性検証は他マスクと同様に全列へ行われ、省略されるのは検証済み
+`&str` の生成・保持だけである。
 
 ## 契約変更点（PR #369 codex-review P1 対応で撤回）
 

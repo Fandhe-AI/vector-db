@@ -694,22 +694,35 @@ pub(crate) fn execute_aggregate(
             }
 
             // マスク外の列は presence・長さ・バッファ境界・UTF-8 妥当性の構造検証
-            // だけを行い `&str` 化・保持を省略する
-            // （[`row_codec::scan_scalar_columns_masked`]）。`referenced.scalar_mask()`
-            // が全列 `false`（どの列も参照しない。`COUNT(*)`・`SUM(id)` 等や
-            // `DecodeTier::Fast` を含む）の場合でも呼び出し自体は省略しない
-            // （codex-review P1 指摘・PR #369: 呼び出し自体を省略すると metadata の
-            // presence・列長・UTF-8・余剰バイトの構造検証が全く行われず、破損した
-            // 可視行を検出できないまま集計が成功してしまう fail-open な契約変更に
-            // なるため。値の保持のみを省略し検証は全 tier・全マスクで維持する）。
-            // マスクが全列 `false` のとき `metadata_filters` は必ず空
-            // （`MetadataFilter` は自身の列を必ずマスクへ反映するため）であり
-            // `matches_all` は無条件で真になる。
-            let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
-                schema,
-                metadata,
-                Some(referenced.scalar_mask()),
-            )?;
+            // だけを行い `&str` 化・保持を省略する。`referenced.scalar_mask()` が
+            // 全列 `false`（どの列も参照しない。`COUNT(*)`・`SUM(id)` 等）でも
+            // 構造検証自体は省略しない（codex-review P1 指摘・PR #369: 検証を丸ごと
+            // 省略すると metadata の presence・列長・UTF-8・余剰バイトの構造検証が
+            // 全く行われず、破損した可視行を検出できないまま集計が成功してしまう
+            // fail-open な契約変更になるため）。
+            //
+            // `DecodeTier::Fast` は `docs/design/aggregate-decode-skip.md` の tier
+            // 契約どおり [`row_codec::validate_scalar_columns`]（検証専用・`Vec`
+            // 確保なし）を使う（codex-review P1 指摘・PR #369: 全 tier で
+            // `scan_scalar_columns_masked` を呼び毎行 `Vec<Option<&str>>` を確保
+            // していたのは、`Fast` がこの確保自体を省略するという tier 契約に反する
+            // 実装バグだった）。`Fast` 到達時は `scalar_mask` が全列 `false` かつ
+            // `metadata_filters`・`expr_filters` が空（tier 決定条件）であるため、
+            // 空スライスで安全に代用できる（`matches_all` は無条件で真、
+            // `Accumulator::observe` の `TextColumn` はこの tier では出現しない）。
+            let scanned: Vec<Option<&str>> = match tier {
+                DecodeTier::Fast => {
+                    row_codec::validate_scalar_columns(schema, metadata)?;
+                    Vec::new()
+                }
+                DecodeTier::DimAndScalar | DecodeTier::Embedding => {
+                    row_codec::scan_scalar_columns_masked(
+                        schema,
+                        metadata,
+                        Some(referenced.scalar_mask()),
+                    )?
+                }
+            };
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。

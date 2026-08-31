@@ -515,6 +515,44 @@ pub fn scan_scalar_columns_masked<'a>(
     buf: &'a [u8],
     mask: Option<&[bool]>,
 ) -> Result<Vec<Option<&'a str>>> {
+    let mut values: Vec<Option<&'a str>> = Vec::new();
+    values
+        .try_reserve_exact(schema.columns.len())
+        .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
+    scan_scalar_columns_validated(schema, buf, mask, |_, value| {
+        values.push(value);
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+/// [`scan_scalar_columns_masked`] の検証専用版（codex-review P1 指摘対応・PR #369:
+/// `sql::aggregate::DecodeTier::Fast` は `scalar_mask` が全列 `false`
+/// （`COUNT(*)`・`SUM(id)` 等でどのスカラー列も参照しない）のときに使う tier だが、
+/// 従来は `scan_scalar_columns_masked` を呼び `Vec<Option<&str>>` を毎行確保しており、
+/// `docs/design/aggregate-decode-skip.md` が定める「`Fast` は結果 Vec 生成を省略する」
+/// という tier 契約に反していた）。presence タグ・宣言長上限
+/// （[`MAX_TEXT_FIELD_LEN`]）・バッファ境界・UTF-8 妥当性の構造検証は
+/// [`scan_scalar_columns_masked`] と完全に同じ経路（[`scan_scalar_columns_validated`]）
+/// を通り一切弱めない（untrusted な行バッファへの fail-closed 契約を維持。
+/// `.claude/rules/coding-rust.md`「untrusted 入力の扱い」）。検証済みの値を
+/// 呼び出し元へ返さない・保持しないため `Vec` を一切確保しない。
+pub fn validate_scalar_columns(schema: &TableSchema, buf: &[u8]) -> Result<()> {
+    scan_scalar_columns_validated(schema, buf, None, |_, _| Ok(()))
+}
+
+/// [`scan_scalar_columns_masked`]・[`validate_scalar_columns`] が共有する走査本体。
+/// 列ごとの構造検証（presence タグ・宣言長上限・バッファ境界・UTF-8 妥当性）を
+/// 一箇所に集約し、検証済みの値（`col_index`・`Option<&'a str>`）を `sink` へ渡す
+/// だけで、値の保持要否（`Vec` へ積むか捨てるか）は呼び出し元が選ぶ。`mask` の意味
+/// は [`scan_scalar_columns_masked`] のドキュメントコメントを参照
+/// （`m[i] == false` の列も検証は行い、`sink` へは `None` を渡す）。
+fn scan_scalar_columns_validated<'a>(
+    schema: &TableSchema,
+    buf: &'a [u8],
+    mask: Option<&[bool]>,
+    mut sink: impl FnMut(usize, Option<&'a str>) -> Result<()>,
+) -> Result<()> {
     if let Some(m) = mask {
         if m.len() != schema.columns.len() {
             return Err(RowCodecError::Invalid(
@@ -522,14 +560,10 @@ pub fn scan_scalar_columns_masked<'a>(
             ));
         }
     }
-    let mut values: Vec<Option<&'a str>> = Vec::new();
-    values
-        .try_reserve_exact(schema.columns.len())
-        .map_err(|_| RowCodecError::Invalid("failed to reserve scalar scan output".to_string()))?;
     let mut offset = 0usize;
     for (col_index, column) in schema.columns.iter().enumerate() {
         if matches!(column.ty, ColumnType::Vector(_)) {
-            values.push(None);
+            sink(col_index, None)?;
             continue;
         }
         let wanted = mask.map(|m| m[col_index]).unwrap_or(true);
@@ -537,7 +571,7 @@ pub fn scan_scalar_columns_masked<'a>(
             Some(&b) => b,
             None => {
                 if column.nullable {
-                    values.push(None);
+                    sink(col_index, None)?;
                     continue;
                 } else {
                     return Err(RowCodecError::Invalid(format!(
@@ -559,7 +593,7 @@ pub fn scan_scalar_columns_masked<'a>(
                         column.name
                     )));
                 }
-                values.push(None);
+                sink(col_index, None)?;
             }
             PRESENCE_VALUE => {
                 let len_bytes = buf
@@ -597,16 +631,17 @@ pub fn scan_scalar_columns_masked<'a>(
                 // UTF-8 妥当性検証は要求列・非要求列を問わず常に行う（codex-review
                 // P1 指摘・PR #369: 未参照列でも不正 UTF-8 を含む永続行を fail-closed
                 // で拒否する既存のエラー契約（`XX000`）を維持する必要があるため）。
-                // マスクで要求されなかった列は、検証済みの `&str` を破棄して
-                // `None` を積むことで `&str` 生成コストのみを省略する
-                // （Issue #350: 必要列限定デコード）。
+                // マスクで要求されなかった列（`validate_scalar_columns` 経由は常に
+                // 全列非要求）は、検証済みの `&str` を破棄して `None` を渡すことで
+                // `&str` 生成・保持コストのみを省略する（Issue #350: 必要列限定
+                // デコード）。
                 let text = std::str::from_utf8(text_bytes).map_err(|_| {
                     RowCodecError::Invalid("text field is not valid UTF-8".to_string())
                 })?;
                 if wanted {
-                    values.push(Some(text));
+                    sink(col_index, Some(text))?;
                 } else {
-                    values.push(None);
+                    sink(col_index, None)?;
                 }
             }
             other => {
@@ -623,7 +658,7 @@ pub fn scan_scalar_columns_masked<'a>(
         ));
     }
 
-    Ok(values)
+    Ok(())
 }
 
 /// [`encode_scalar_columns`] の逆変換。戻り値は `schema.columns` と同じ長さ・順序を
@@ -1132,5 +1167,58 @@ mod tests {
         let short_mask = [true, true];
         let result = scan_scalar_columns_masked(&schema, &buf, Some(&short_mask));
         assert!(matches!(result, Err(RowCodecError::Invalid(_))));
+    }
+
+    // --- validate_scalar_columns（Issue #350・PR #369 codex-review P1 対応:
+    // `DecodeTier::Fast` 用の検証専用・Vec 確保なし API） --------------------------
+
+    #[test]
+    fn validate_scalar_columns_accepts_structurally_valid_row() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Text("world".to_string()),
+        ];
+        let buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        assert!(validate_scalar_columns(&schema, &buf).is_ok());
+    }
+
+    #[test]
+    fn validate_scalar_columns_rejects_invalid_utf8_same_as_masked_scan() {
+        // `scan_scalar_columns_masked` の全 `false` マスクと同じ破損検知を、
+        // 検証専用 API でも維持することを確認する（走査本体
+        // `scan_scalar_columns_validated` の共有を裏付ける）。
+        let schema = text_vector_schema();
+        let mut buf = Vec::new();
+        let invalid_utf8: &[u8] = &[0xff, 0xfe, 0xfd];
+        buf.push(PRESENCE_VALUE);
+        buf.extend_from_slice(&(invalid_utf8.len() as u32).to_le_bytes());
+        buf.extend_from_slice(invalid_utf8);
+        assert!(matches!(
+            validate_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
+        let mask = [false, false, false];
+        assert!(matches!(
+            scan_scalar_columns_masked(&schema, &buf, Some(&mask)),
+            Err(RowCodecError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validate_scalar_columns_rejects_trailing_bytes() {
+        let schema = text_vector_schema();
+        let values = vec![
+            Value::Vector(vec![1.0, 2.0, 3.0]),
+            Value::Text("hello".to_string()),
+            Value::Text("world".to_string()),
+        ];
+        let mut buf = encode_scalar_columns(&schema, &values).expect("encode scalar");
+        buf.push(0xff);
+        assert!(matches!(
+            validate_scalar_columns(&schema, &buf),
+            Err(RowCodecError::Invalid(_))
+        ));
     }
 }
