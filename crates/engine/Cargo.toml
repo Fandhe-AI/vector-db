@@ -199,3 +199,17 @@ test = false
 name = "hybrid_latency_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #362（親 Issue #361「ベクトル検索・ストレージレイアウト最適化」Phase 5 の
+# 起点タスク）の実測入口。SQL 表層経由 KNN のレイテンシを redb 走査・ヘッダ
+# デコード・f32 デコード・arena 構築・距離計算・Top-k 選出の段別に分解して測る。
+# spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため `.github/workflows/*`
+# へは配線しない。harness = false / test = false は上記ベンチと同一方針。`make
+# bench-knn-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
+# harness/knn_profile.rs にあり tests/knn_profile_accept.rs で make ci 側から
+# 回帰検証する。redb は本ファイル冒頭の dev-dependency（=4.2.0）を再利用し、
+# 新規依存の追加は行わない。
+name = "knn_profile_bench"
+harness = false
+test = false

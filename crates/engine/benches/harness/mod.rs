@@ -50,6 +50,7 @@ pub mod accept;
 pub mod contrast;
 pub mod env_report;
 pub mod hybrid_latency;
+pub mod knn_profile;
 pub mod protocol;
 pub mod rng;
 pub mod scalar_reference;

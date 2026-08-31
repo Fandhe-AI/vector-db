@@ -298,6 +298,18 @@ else
 endif
 
 # --------------------------------------------------
+# KNN 経路の段別内訳プロファイル（Issue #362。crates/engine/benches/knn_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-knn-profile
+bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench knn_profile_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-profile をスキップ"
+endif
+
+# --------------------------------------------------
 # クロスエンコーダリランカー実測（Issue #333・SEARCH-7。crates/engine/tests/rerank_cross_encoder_recall.rs）
 # --------------------------------------------------
 
