@@ -205,9 +205,14 @@ jobs:
         # このフラグを注入しないため、そちらは未設定を「対象外」として成功終了する
         # opt-in 挙動を維持する（`crates/engine/tests/rerank_recall.rs::
         # resolve_gate_threshold` 参照）。設定済みで非数値・範囲外の場合は
-        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。ログには
-        # 対象名と pass/fail のみが出力され、注入された閾値・実測値のいずれの
-        # 数値も出力しない（Issue #303）。`RECALL_VERBOSE` は本 workflow の env へ
+        # strict モードの有無によらず常に fail-closed で非ゼロ終了する。ログ出力の
+        # 契約（PR #340 で改訂）: 注入された閾値（`RERANK_RECALL_MIN_*`）の値と
+        # 閾値近傍の `after_recall@20` 実測値は出力しない（後者は `RECALL_VERBOSE`
+        # opt-in 時のみ。Issue #303）。一方、informational へ降格した
+        # `improvement_ratio@20` とその導出入力（baseline/after/pool_ceiling の
+        # hits 件数。層 A の公開固定アサート値と同一）は「実測値の記録と報告のみ
+        # 必須」の契約（SEARCH-7 改訂 2026-08-31）を満たすため常時出力される。
+        # `RECALL_VERBOSE` は本 workflow の env へ
         # 意図的に追加しない（`Run recall-regression` step と同方針）。
         env:
           RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
