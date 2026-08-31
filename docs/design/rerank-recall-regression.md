@@ -500,6 +500,40 @@ variant 数が少なく表層語の偶発的重複が生じやすいこと、ド
 `CROSS_ENCODER_MODEL_PATH`・`CROSS_ENCODER_TOKENIZER_PATH` を設定して
 `make rerank-cross-encoder-eval`）。
 
+### SEARCH-7 改訂（2026-08-31）: improvement ゲートの informational 降格
+
+**総括**: Issue #330・#333・#337 で 2 方式（字句一致・クロスエンコーダ）×
+2 fixture（当初の合成コーパス・自然言語再設計後の合成コーパス）の組み合わせを
+すべて実測したが、改善幅の相対比率
+（`crates/engine/tests/rerank_recall.rs::RerankRecallResult::improvement_ratio`）
+はいずれも下限に未達だった（字句一致方式: 0.222。クロスエンコーダ方式: 0）。
+双方の未達要因分析（本ファイル「Issue #330」「Issue #333 追記」「Issue #337」の
+各節参照）により、原因はリランキング方式の欠陥ではなく合成 fixture 側の構造要因
+（キーワード抽選による正解集合の作られ方・表層語の偶発的重複・人工的に高い
+語彙密度）にあると判断した。これ以上の fixture パラメータ調整による到達は
+「ゲートを通すためのパラメータ操作」に該当し許容されないため、Issue #337 は
+これを最終報告として Issue #330 へ差し戻した。
+
+**spec 改訂**: 上記の実測・分析結果を受け、オーナー承認済みの spec 改訂
+（vector-db-spec#8・2026-08-31）により、SEARCH-7 の改善幅相対基準
+（improvement_ratio ≥ 下限）は実コーパス評価まで informational（非ブロッキング・
+実測値の記録と報告のみ必須）へ降格された。ブロッキング判定は非劣化
+（`after_hits20 >= baseline_hits20`）と絶対下限（`RERANK_RECALL_MIN_R20_LARGE`）
+のみとする。
+
+**本リポ側の変更**: `crates/engine/tests/rerank_recall.rs` の層 B ゲート
+（`rerank_recall_large_scale_threshold_gate`）から `RERANK_RECALL_MIN_R20_
+IMPROVEMENT` の読み取り・pass/fail への算入を削除し、`RERANK_RECALL_MIN_R20_
+LARGE`（絶対下限）と非劣化のみで判定する形に変更した。`improvement_ratio`
+（`RerankRecallResult::improvement_ratio`）の実測値ログ出力（`RECALL_
+VERBOSE=1` opt-in 時）は informational として維持し、層 A の固定値回帰
+（`rerank_recall_large_scale_regression`）でも引き続き算出・出力する。
+`.github/workflows/recall.yml` の rerank step からは `RERANK_RECALL_MIN_R20_
+IMPROVEMENT` secret の注入を外した（`docs/design/ci-gate-variables.md` 参照）。
+
+**申し送り**: 実コーパスでの評価が行われた際、改善幅相対基準を再びブロッキング
+化するかどうかはその実測結果をもとにオーナーが再判断する。
+
 ## 既知の制約・スコープ外
 
 - **暫定リランカーの効果測定である**: 同梱リランカー（[`LexicalOverlapReranker`]）は
