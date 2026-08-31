@@ -356,17 +356,19 @@ fn main() {
     let db = Database::open(&path).expect("reopen raw database for S1-S3");
 
     // S1: per-entry 走査のみ（`black_box` は harness::protocol::run が内包する）。
+    // 段間差分（S2 - S1 等）を正しく「ヘッダデコード等の追加コストのみ」に
+    // 保つため、S1 のループ本体は S2/S3 と同じ「行数を数えるだけ」に揃える
+    // （バイト数集計等 S1 固有の処理を追加しない。S1 ⊆ S2 ⊆ S3 の入れ子を
+    // 崩すと差分が歪む。codex-review 指摘・PR #378）。
     let s1 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
-        let mut total_bytes = 0usize;
         let mut rows = 0usize;
         for entry in table.iter().expect("iter row table") {
-            let (_k, v) = entry.expect("iterate row entry");
-            total_bytes += v.value().len();
+            let _entry = entry.expect("iterate row entry");
             rows += 1;
         }
-        (rows, total_bytes)
+        rows
     })
     .expect("measurement must satisfy protocol minimums");
     let s1_rows = {
