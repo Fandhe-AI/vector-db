@@ -43,13 +43,17 @@
 //!   improvement_ratio 0.222・0 で下限未達であり、原因が合成 fixture 側の
 //!   構造要因（キーワード抽選による正解集合・表層語の偶発重複・人工的語彙密度。
 //!   `docs/design/rerank-recall-regression.md`「SEARCH-7 改訂（2026-08-31）」節
-//!   参照）と判明したため。実測値は `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では
-//!   拒否。Issue #303）の opt-in 時に引き続きログ出力する。`RERANK_RECALL_
+//!   参照）と判明したため。`after_recall@20` 等の閾値近傍の実測値は
+//!   `RECALL_VERBOSE=1`（`GITHUB_ACTIONS` 下では拒否。Issue #303）の opt-in 時に
+//!   限りログ出力する一方、informational な `improvement_ratio`（判定に使わない
+//!   実測値。閾値そのものは含まない）は `verbose`／`GITHUB_ACTIONS` の有無に
+//!   かかわらず常時ログ出力する（codex-review P1・PR #340。通常 CI 実行から
+//!   実測値が一切記録できなくなっていた抜けを塞ぐ）。`RERANK_RECALL_
 //!   REQUIRE_THRESHOLDS=1`（`recall.yml` の Run step からのみ注入）で
 //!   `RERANK_RECALL_MIN_R20_LARGE` の未設定を fail-closed にする strict モードを
-//!   持つ（`hybrid_recall.rs::resolve_gate_threshold` と同型。ログには対象名と
-//!   pass/fail のみを出力する〔`resolve_verbose`・`verbose_requested_from_env`・
-//!   `render_gate_line`〕）
+//!   持つ（`hybrid_recall.rs::resolve_gate_threshold` と同型。`after_recall@20` の
+//!   ログには対象名と pass/fail のみを出力する〔`resolve_verbose`・
+//!   `verbose_requested_from_env`・`render_gate_line`〕）
 //!
 //! 既知の制約（スコープ外・フォローアップ）:
 //! - 同梱リランカー（[`LexicalOverlapReranker`]）は方式確定までの暫定実装
@@ -908,9 +912,13 @@ mod verbose_gate_tests {
 /// 使わない。契約は `hybrid_recall.rs::hybrid_recall_large_scale_threshold_gate`
 /// と同型（未設定かつ非 strict の場合はコーパス生成前に早期 return して成功終了
 /// する。strict モードでは [`resolve_gate_threshold`] が未設定を検出した時点で
-/// fail-closed になる）。ログには対象名と pass/fail のみを出力し、注入された
-/// 閾値・実測値の数値は出力しない（`RECALL_VERBOSE=1` opt-in 時のみ実測値を
-/// 追加出力する。Issue #303・[`render_gate_line`] 参照）。
+/// fail-closed になる）。`after_recall@20` の実測値は注入された閾値の近傍情報を
+/// 含むため `RECALL_VERBOSE=1` opt-in 時のみ追加出力する（Issue #303・
+/// [`render_gate_line`] 参照）。一方 informational な `improvement_ratio`（判定に
+/// 使わない実測値）は閾値を含まないため、`verbose`／`GITHUB_ACTIONS` の有無に
+/// かかわらず常時出力する（codex-review P1・PR #340。`GITHUB_ACTIONS` 下では
+/// `RECALL_VERBOSE=1` が fail-closed に拒否され、通常 CI 実行から実測値を一切
+/// 記録できなくなっていた抜けを塞ぐ）。
 #[test]
 #[ignore = "spec 閾値（Actions variables 由来）が必要なため既定では実行しない。make rerank-regression で実行する"]
 fn rerank_recall_large_scale_threshold_gate() {
@@ -953,18 +961,21 @@ fn rerank_recall_large_scale_threshold_gate() {
     );
 
     // 改善幅は informational（非ブロッキング。SEARCH-7 改訂 2026-08-31・
-    // vector-db-spec#8）。実測値のログ出力のみ行い、上の `pass` には算入しない。
+    // vector-db-spec#8）。判定に使わない実測値のため `verbose`／`GITHUB_ACTIONS` の
+    // 有無にかかわらず常時出力する（閾値近傍の詳細出力を絞る `render_gate_line` の
+    // verbose ゲートとは別扱い。codex-review P1・PR #340: informational な
+    // improvement_ratio の実測値が通常 CI 実行〔`GITHUB_ACTIONS` 下で
+    // `RECALL_VERBOSE=1` は fail-closed に拒否される〕から一切記録されなくなる
+    // 抜けを塞ぐ。閾値そのもの〔`RERANK_RECALL_MIN_*`〕は引き続き出力しない）。
+    println!(
+        "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 inputs (informational, non-blocking since SEARCH-7 rev 2026-08-31) baseline_hits20={} after_hits20={} pool_ceiling_hits20={}",
+        r.baseline_hits20, r.after_hits20, r.pool_ceiling_hits20
+    );
     match r.improvement_ratio() {
         Some(ratio) => {
-            let msg = if verbose {
-                format!(
-                    "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 (informational, non-blocking since SEARCH-7 rev 2026-08-31) value={ratio:.4}"
-                )
-            } else {
-                "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 (informational, non-blocking since SEARCH-7 rev 2026-08-31)"
-                    .to_string()
-            };
-            println!("{msg}");
+            println!(
+                "rerank_recall_large_scale_threshold_gate: improvement_ratio@20 (informational, non-blocking since SEARCH-7 rev 2026-08-31) value={ratio:.4}"
+            );
         }
         None => {
             println!(
