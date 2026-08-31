@@ -5,7 +5,9 @@
 //! 共有ライブラリ）を前提とするため CI には配線せず、`make rerank-cross-encoder-eval`
 //! から運用者が明示実行する（`#[ignore]`。`GITHUB_ACTIONS` 下は拒否）。
 //!
-//! `docs/design/rerank-recall-regression.md`「Issue #333」節に実測手順・実測値を
+//! `docs/design/rerank-recall-regression.md`「Issue #333 追記」節（実測ハーネス
+//! 導入時点の実測）・「Issue #337」節（自然言語 fixture 再設計後の再実測。
+//! `tests/fixtures/nl_qa.rs` モジュールドキュメント参照）に実測手順・実測値を
 //! 記録する。production コード（`crates/engine/src/`）は変更しない。
 
 #![cfg(feature = "cross-encoder")]
