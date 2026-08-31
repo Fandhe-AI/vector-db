@@ -37,8 +37,9 @@
 //! `Storage::scan()`（pub API・完全デコード）の結果と突き合わせて一致すること
 //! （`tests/knn_profile_accept.rs` が同じ突き合わせを時間非依存の回帰として持つ。
 //! 本ベンチは実データ規模での 1 回限りのクロスチェックを行う）、S0 の結果行数が
-//! `TOP_K` に一致することを実行時にアサートする。不一致ならベンチはエラー終了し
-//! 測定値を出力しない。
+//! `TOP_K` に一致すること、S0' の `COUNT(*)` が計測外の再実行で `TOTAL_ROWS` と
+//! 一致することを実行時にアサートする。不一致ならベンチはエラー終了し測定値を
+//! 出力しない。
 //!
 //! # `dot_lanes` の実アセンブリ確認（受け入れ条件 3）
 //!
@@ -76,6 +77,7 @@ use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::search_engine;
+use engine::sql::exec::Cell;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::{arena::VectorArena, tenant};
 
@@ -284,6 +286,29 @@ fn main() {
         )
     );
 
+    // Top-k 選出コストの分離は S5_scalar − S5' を用いる（S5_parallel − S5' は
+    // 使わない）。`ParallelSearchProvider::search` はワーカースレッド生成・行範囲
+    // 分割・部分 Top-k・結果マージ・入力検証を含み、`s5_prime`（呼び出し元スレッド
+    // で `dot_wrapper` を逐次実行するのみ）との差分に Top-k 選出（`BinaryHeap`
+    // 部分ソート）以外の並列化コストが混在してしまう（codex-review 指摘・PR #378）。
+    // `s5_scalar`（`CpuScalarProvider`）は `s5_prime` と同じ単線・逐次走査条件の
+    // ため、この差分であれば Top-k 選出コストへ帰属できる。
+    println!(
+        "{}",
+        render_diff_line(
+            "S5prime",
+            "S5_scalar",
+            stage_diff_ns_per_row(
+                s5_prime.summary.median,
+                s5_scalar.summary.median,
+                TOTAL_ROWS,
+                "S5prime",
+                "S5_scalar",
+            )
+            .unwrap_or_else(|e| fail_closed(e)),
+        )
+    );
+
     // --- S0/S0': SQL 表層 e2e（`EngineCore::execute_sql`）。--------------------
     let core = EngineCore::from_storage(storage, search_engine::default_engine());
     let literal = vector_literal(&query).expect("finite query vector");
@@ -323,6 +348,28 @@ fn main() {
             .expect("execute_sql must succeed for COUNT(*) query")
     })
     .expect("measurement must satisfy protocol minimums");
+    // S0 の TOP_K 検証（下記）と同様、計測クロージャの戻り値は `black_box` へ渡す
+    // だけで中身を検証しない。SQL 経路が誤った件数を返しても計測は成功してしまう
+    // ため、計測外で COUNT(*) を再実行し値を TOTAL_ROWS と突き合わせる
+    // （codex-review 指摘・PR #378。fail-closed）。
+    let count_result = core
+        .execute_sql(&policy_ctx, &count_sql)
+        .expect("execute_sql must succeed for COUNT(*) query");
+    if count_result.rows.len() != 1 {
+        fail_closed(format!(
+            "S0' COUNT(*) row count mismatch: expected 1, got {}",
+            count_result.rows.len()
+        ));
+    }
+    let count_value = match count_result.rows[0].cells.first() {
+        Some(Cell::Integer(v)) => *v,
+        other => fail_closed(format!("S0' COUNT(*) cell type mismatch: got {other:?}")),
+    };
+    if count_value != TOTAL_ROWS as u64 {
+        fail_closed(format!(
+            "S0' COUNT(*) value mismatch: expected {TOTAL_ROWS}, got {count_value}"
+        ));
+    }
     println!(
         "{}",
         render_stage_line(
@@ -536,7 +583,7 @@ fn main() {
         }
     }
 
-    println!("knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S3 vs VectorArena cross-check)");
+    println!("knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S0' COUNT(*) value, S3 vs VectorArena cross-check)");
 }
 
 /// [`engine::isa::current().dot`] を呼ぶだけの薄いラッパー。`#[inline(never)]` に
