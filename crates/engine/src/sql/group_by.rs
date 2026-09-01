@@ -24,12 +24,15 @@ use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
-use crate::sql::aggregate::{accumulator_bug, storage_internal, try_clone_str, Accumulator};
+use crate::sql::aggregate::{
+    accumulator_bug, storage_internal, try_clone_str, Accumulator, DecodeTier, ReferencedColumns,
+    RowVector,
+};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{self, BinOp, ExprValue};
-use crate::storage::{self, StorageError};
+use crate::storage;
 use redb::ReadableTable;
 use std::collections::BTreeMap;
 
@@ -241,6 +244,24 @@ pub(crate) fn execute_grouped_aggregate(
         .ok_or_else(|| accumulator_bug("execute_grouped_aggregate called without a GROUP BY"))?;
 
     let expected_dim = schema.vector_dim();
+
+    // Issue #350: `GROUP BY` キー列（`group_by.column_index`）は必ず参照するため
+    // `extra_scalar_index` へ渡す。`GROUP BY` は複数グループの走査を要するため
+    // `aggregate.rs::DecodeTier::Fast`（ヘッダのみ）は選ばず、embedding 参照の
+    // 有無だけで `DimAndScalar`／`Embedding` の 2 段階を切り替える。
+    let referenced = ReferencedColumns::derive(
+        schema,
+        &bound.items,
+        &bound.metadata_filters,
+        &bound.expr_filters,
+        Some(group_by.column_index),
+    );
+    let tier = if referenced.needs_embedding() {
+        DecodeTier::Embedding
+    } else {
+        DecodeTier::DimAndScalar
+    };
+
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
         Ok(t) => Some(t),
@@ -277,18 +298,32 @@ pub(crate) fn execute_grouped_aggregate(
                 continue;
             }
 
-            // TABLE-12 の整合検査（`aggregate.rs::execute_aggregate` と同一。
-            // 従来 `storage::decode_row_for_key` の内部検査だったものを明示比較へ
-            // 移設）。
-            if tenant_id != key_tenant {
-                return Err(storage_internal(StorageError::Codec(
-                    "row key tenant mismatch".to_string(),
-                )));
-            }
+            // 可視行・常に: TABLE-12 のキー/ヘッダ tenant 整合検査（`aggregate.rs`
+            // と同一の切り出しヘルパを使う。Issue #350）。従来
+            // `storage::decode_row_for_key` の内部検査だったものを明示比較へ
+            // 移設。`tier` に関わらず必ず行う。
+            storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
 
-            let (dim, metadata) =
-                storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
-                    .map_err(storage_internal)?;
+            // 可視行・必要時のみ（Issue #350）: `tier` が要求する範囲だけ dim・
+            // metadata・embedding をデコードする。`DecodeTier::Embedding` は
+            // 上で読み済みの `offset` を引き継いで本体のみをデコードし、ヘッダの
+            // 二重デコードを避ける（Issue #349）。
+            let (dim, metadata): (u32, &[u8]) = match tier {
+                DecodeTier::DimAndScalar => {
+                    storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+                }
+                DecodeTier::Embedding => {
+                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                        .map_err(storage_internal)?
+                }
+                // `GROUP BY` はヘッダのみのファストパスを持たない
+                // （`tier` 決定ロジック参照）。
+                DecodeTier::Fast => {
+                    return Err(accumulator_bug(
+                        "GROUP BY execution reached DecodeTier::Fast, which it never selects",
+                    ))
+                }
+            };
             if let Some(expected) = expected_dim {
                 if dim != 0 && dim != expected {
                     return Err(SqlSurfaceError::Internal {
@@ -298,14 +333,34 @@ pub(crate) fn execute_grouped_aggregate(
                 }
             }
 
-            let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
+            // マスク外の列は構造検証のみで `&str` 化を省略する
+            // （`row_codec::scan_scalar_columns_masked`）。`GROUP BY` キー列は
+            // `ReferencedColumns::derive` の `extra_scalar_index` で常にマスクへ
+            // 含まれるため、`any_scalar_column_referenced()` は常に真。
+            let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
+                schema,
+                metadata,
+                Some(referenced.scalar_mask()),
+            )?;
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
             for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, &embedding_scratch)? {
+                let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                    match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => {
+                            return Err(accumulator_bug(
+                                "WHERE expression references the VECTOR column but tier did not decode it",
+                            ))
+                        }
+                    }
+                } else {
+                    &[]
+                };
+                match udf_call::eval(expr, id, embedding)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     _ => {
@@ -316,8 +371,10 @@ pub(crate) fn execute_grouped_aggregate(
                 }
             }
 
-            // 構造的なトリップワイヤ（独立した二重検証ではない点を含め
-            // `aggregate.rs::execute_aggregate` の同一箇所のドキュメント参照）。
+            // defense-in-depth（RlsSafetyNet と同趣旨）。ヘッダから取り出した
+            // `tenant_id`・`visibility` に対して再適用する（独立した二重検証では
+            // ない点を含め `aggregate.rs::execute_aggregate` の同一箇所のドキュメント
+            // 参照）。
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
@@ -348,6 +405,13 @@ pub(crate) fn execute_grouped_aggregate(
                 .get_mut(&key)
                 .ok_or_else(|| accumulator_bug("group entry disappeared after insertion"))?;
 
+            let vector = RowVector {
+                dim,
+                values: match tier {
+                    DecodeTier::Embedding => Some(embedding_scratch.as_slice()),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => None,
+                },
+            };
             for (accumulator, item) in accs.iter_mut().zip(&bound.items) {
                 // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
                 // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
@@ -355,7 +419,7 @@ pub(crate) fn execute_grouped_aggregate(
                 // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
                 // 実際の保持量を正確に反映する）。
                 let before = accumulator.text_len();
-                accumulator.observe(&item.input, id, &embedding_scratch, &scanned)?;
+                accumulator.observe(&item.input, id, &vector, &scanned)?;
                 let after = accumulator.text_len();
                 if after > before {
                     let delta = after - before;
