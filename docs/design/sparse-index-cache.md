@@ -101,3 +101,6 @@ SparseIndexCache }` を 1 引数として追加した（引数を素で 2 つ増
 同一テーブル・同一 ctx で異なる TEXT 列を本文に指定する 2 クエリが誤ヒットし得た。
 `tests/sparse_cache.rs::hybrid_queries_on_different_text_columns_do_not_share_cache_entry`
 で固定した（上記「キャッシュキーと世代」節参照）。
+
+導入後の Recall 非劣化・RRF 同点順位規約の不変・前後比較実測は Issue #358・
+`docs/design/sparse-index-cache-verification.md` を参照。
