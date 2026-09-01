@@ -297,6 +297,26 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid をスキップ"
 endif
 
+.PHONY: bench-parse-bind
+bench-parse-bind: ## Issue #360（SQL パース・束縛結果のセッション内キャッシュ検討）のパース・束縛コスト比率実測ベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench sql_parse_bind_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-parse-bind をスキップ"
+endif
+
+# --------------------------------------------------
+# hybrid_rrf クエリ段別内訳プロファイル（Issue #356。crates/engine/benches/hybrid_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hybrid-profile
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench hybrid_profile_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
 # --------------------------------------------------
 # KNN 経路の段別内訳プロファイル（Issue #362。crates/engine/benches/knn_profile_bench.rs）
 # --------------------------------------------------

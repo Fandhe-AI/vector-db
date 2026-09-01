@@ -3,8 +3,10 @@
 //! 責務境界: [`crate::sql::aggregate::execute_aggregate`] が `BoundAggregate::group_by`
 //! を検出した場合にのみ呼ばれる（`GROUP BY` なしの単一行集計は `aggregate.rs` が
 //! 引き続き担う）。行の走査・RLS 適用順序（ヘッダのみで可視性判定 → 可視行のみ
-//! 完全デコード → `WHERE` → 可視性の再検査 → 集計）は `aggregate.rs` の単一行経路と
-//! 同一の規約を踏襲する（`.claude/rules/security.md`「テナント境界（P0）」）。
+//! ヘッダのオフセットを引き継いで本体デコード → `WHERE` → 可視性の再検査 → 集計）は
+//! `aggregate.rs` の単一行経路と同一の規約を踏襲する（`.claude/rules/security.md`
+//! 「テナント境界（P0）」。スクラッチ再利用による二重デコード排除は Issue #349・
+//! Issue #314 の横展開）。
 //! **不可視行のグループキーは結果に一切現れない**（他テナントにしか存在しない
 //! グループ値からの存在推測を防ぐ。RLS-7・RLS-8 の `GROUP BY` 版）。
 //!
@@ -17,14 +19,29 @@
 //! ならない。単一行集計〔`aggregate.rs`〕は `TextMin`/`TextMax` インスタンスが
 //! 項目数分（高々 SELECT リスト長）で頭打ちだが、`GROUP BY` はグループ数倍に
 //! なるため別途累計管理が必要。PR #230 codex-review 指摘対応）。
+//!
+//! 行走査ループの集計表は非 NULL グループ（`string_groups: BTreeMap<String, _>`）と
+//! NULL グループ（`null_group: Option<_>`）に分割する（Issue #351）。`String:
+//! Borrow<str>` により標準 API のまま借用キー（`&str`）でのルックアップができる
+//! ため、既存グループへ累積するだけの行では追加のヒープ確保が発生せず、マップ
+//! 探索も `get_mut` 1 回で済む（従来は `contains_key` → `get_mut` の 2 回探索＋
+//! 新規グループ挿入時の二重確保だった）。新規グループが発生した行のみ
+//! [`check_new_group_budget`] の予算検査を経てからキーを 1 回所有化する
+//! （[`new_accumulators`]・[`accumulate_row`] 参照）。FINISH 段では
+//! `string_groups` の昇順走査のあとに `null_group` を末尾へ連結することで、
+//! 分割前の `GroupKey::Ord`（非 NULL 昇順 → NULL 末尾）と同一の走査順を保つ。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
 use crate::policy::PolicyContext;
 use crate::row_codec;
-use crate::sql::aggregate::{accumulator_bug, storage_internal, try_clone_str, Accumulator};
+use crate::sql::aggregate::{
+    accumulator_bug, storage_internal, try_clone_str, Accumulator, DecodeTier, ReferencedColumns,
+    RowVector,
+};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
@@ -76,18 +93,21 @@ impl Ord for GroupKey {
 /// [`MAX_GROUP_KEY_TOTAL_BYTES`]）。呼び出し元が「このキーは表に存在しない」ことを
 /// 確認済みの場合にのみ呼ぶ（既存キーの更新では追加コストが発生しないため呼ばない）。
 /// 成功時は `total_key_bytes` へ今回のキー分のバイト数を加算する。
+///
+/// `key_len` はグループキーのバイト数（NULL グループは 0）。Issue #351 で行走査
+/// ループが借用キー（`&str`）主体に変わったため、所有 `String`/`Option<String>`
+/// ではなくバイト数のみを引数に取る（予算検査の時点ではまだキーを所有化しない）。
 fn check_new_group_budget(
     current_group_count: usize,
     total_key_bytes: &mut usize,
-    key: &Option<String>,
+    key_len: usize,
 ) -> Result<(), SqlSurfaceError> {
     if current_group_count >= MAX_GROUPS {
         return Err(SqlSurfaceError::payload_too_large(
             "GROUP BY result exceeds the allowed number of groups",
         ));
     }
-    let added = key.as_ref().map(|s| s.len()).unwrap_or(0);
-    let next = total_key_bytes.checked_add(added).ok_or_else(|| {
+    let next = total_key_bytes.checked_add(key_len).ok_or_else(|| {
         SqlSurfaceError::payload_too_large("GROUP BY key size accounting overflowed")
     })?;
     if next > MAX_GROUP_KEY_TOTAL_BYTES {
@@ -96,6 +116,84 @@ fn check_new_group_budget(
         ));
     }
     *total_key_bytes = next;
+    Ok(())
+}
+
+/// 新規グループ 1 件分のアキュムレータ列を確保する（`bound.items` の項目ごとに
+/// [`Accumulator::new`]）。既存グループへの累積では呼ばない（グループ発生行のみ
+/// のコストに留める。Issue #351）。
+fn new_accumulators(
+    items: &[crate::sql::parser::BoundAggregateItem],
+) -> Result<Vec<Accumulator>, SqlSurfaceError> {
+    let mut accs = Vec::new();
+    accs.try_reserve_exact(items.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large(
+            "aggregate accumulator allocation exceeds available memory",
+        )
+    })?;
+    for item in items {
+        accs.push(Accumulator::new(item.func, &item.input)?);
+    }
+    Ok(accs)
+}
+
+/// 1 行分の値を、対象グループのアキュムレータ列へ反映する（`observe`）と同時に
+/// `MIN`/`MAX(<TEXT 列>)` の累計バイト数予算（[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]）
+/// を更新する。既存グループ・新規グループどちらの行からも呼ばれる共通 helper
+/// （Issue #351 で行ループから抽出。before/after 比較による加算・減算ロジックは
+/// 抽出前と完全に同一）。`vector` は呼び出し元が `tier`（[`DecodeTier`]）に応じて
+/// 組み立てた行 1 件分の `VECTOR` 列ビュー（Issue #350。embedding 未デコード時は
+/// `values: None`）。`expr_scratch` は [`Accumulator::observe`] が内部で
+/// `ExprProgram::eval` を呼ぶ際の明示スタック（Issue #353。行に依存する借用を
+/// 保持しないため、呼び出し元が行ループの外で 1 回だけ確保したバッファを
+/// 使い回せる。`aggregate.rs::execute_aggregate` と同じ方針）。
+fn accumulate_row(
+    accs: &mut [Accumulator],
+    items: &[crate::sql::parser::BoundAggregateItem],
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<&str>],
+    total_text_accumulator_bytes: &mut usize,
+    expr_scratch: &mut Vec<StackValue>,
+) -> Result<(), SqlSurfaceError> {
+    for (accumulator, item) in accs.iter_mut().zip(items) {
+        // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
+        // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
+        // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
+        // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
+        // 実際の保持量を正確に反映する）。
+        let before = accumulator.text_len();
+        accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
+        let after = accumulator.text_len();
+        if after > before {
+            let delta = after - before;
+            *total_text_accumulator_bytes = total_text_accumulator_bytes
+                .checked_add(delta)
+                .ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large(
+                        "GROUP BY TEXT aggregate size accounting overflowed",
+                    )
+                })?;
+            if *total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "GROUP BY TEXT aggregate state exceeds the allowed total size",
+                ));
+            }
+        } else if after < before {
+            // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
+            // 実際の保持量を正確に反映するため減算する（`checked_sub` の
+            // 失敗＝内部不整合は `XX000` の accumulator_bug へ落とし、
+            // fail-open にはしない）。減算しないと過去の増加量が
+            // 累積し続け、実保持量が予算内でも正常なクエリを
+            // 誤って 54000 で拒否してしまう。
+            let delta = before - after;
+            *total_text_accumulator_bytes = total_text_accumulator_bytes
+                .checked_sub(delta)
+                .ok_or_else(|| {
+                    accumulator_bug("GROUP BY TEXT aggregate size accounting underflowed")
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -224,9 +322,9 @@ fn order_with_nulls_last(
 /// [`crate::sql::aggregate::execute_aggregate`] が判定済み）を実行し、複数行の
 /// [`QueryResult`] を返す（TASK-167・SQL-14）。RLS 適用順序・行走査は
 /// `aggregate.rs::execute_aggregate` の単一行経路と同一の規約
-/// （ヘッダのみで可視性判定 → 可視行のみ完全デコード → `WHERE` → 可視性再検査）を
-/// 独立して踏襲する（責務分離のためモジュールを分けたことによる意図的な複製。
-/// 変更する際は両モジュールの規約を揃えること）。
+/// （ヘッダのみで可視性判定 → 可視行のみヘッダのオフセットを引き継いで本体デコード
+/// → `WHERE` → 可視性再検査）を独立して踏襲する（責務分離のためモジュールを分けた
+/// ことによる意図的な複製。変更する際は両モジュールの規約を揃えること）。
 pub(crate) fn execute_grouped_aggregate(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -239,6 +337,24 @@ pub(crate) fn execute_grouped_aggregate(
         .ok_or_else(|| accumulator_bug("execute_grouped_aggregate called without a GROUP BY"))?;
 
     let expected_dim = schema.vector_dim();
+
+    // Issue #350: `GROUP BY` キー列（`group_by.column_index`）は必ず参照するため
+    // `extra_scalar_index` へ渡す。`GROUP BY` は複数グループの走査を要するため
+    // `aggregate.rs::DecodeTier::Fast`（ヘッダのみ）は選ばず、embedding 参照の
+    // 有無だけで `DimAndScalar`／`Embedding` の 2 段階を切り替える。
+    let referenced = ReferencedColumns::derive(
+        schema,
+        &bound.items,
+        &bound.metadata_filters,
+        &bound.expr_filters,
+        Some(group_by.column_index),
+    );
+    let tier = if referenced.needs_embedding() {
+        DecodeTier::Embedding
+    } else {
+        DecodeTier::DimAndScalar
+    };
+
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
         Ok(t) => Some(t),
@@ -253,9 +369,22 @@ pub(crate) fn execute_grouped_aggregate(
         }
     };
 
-    let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
+    // 集計表を非 NULL（`string_groups`）と NULL（`null_group`）に分割する
+    // （Issue #351）。`string_groups: BTreeMap<String, _>` は `String: Borrow<str>`
+    // により `get_mut(&str)` の借用キー検索が標準 API のまま可能で、既存グループ
+    // への累積では追加のヒープ確保・二重探索が発生しない。
+    let mut string_groups: BTreeMap<String, Vec<Accumulator>> = BTreeMap::new();
+    let mut null_group: Option<Vec<Accumulator>> = None;
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
+    // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
+    // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。[`StackValue`] は行 `embedding` への借用を保持しないため、
+    // `embedding_scratch` を毎行 `&mut` で上書きデコードするこのループの外でも
+    // 1 回だけ確保し使い回せる（`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -264,33 +393,77 @@ pub(crate) fn execute_grouped_aggregate(
             let buf = v.value();
 
             // RLS 段（無条件・デコード前）: `aggregate.rs` の単一行経路と同一順序。
-            let (tenant_id, visibility) =
-                storage::decode_row_tenant_and_visibility(buf).map_err(storage_internal)?;
+            // `offset` は本体デコードの再開位置（Issue #349: ヘッダの二重デコード
+            // 排除。`aggregate.rs::execute_aggregate` のドキュメント参照）。
+            let (tenant_id, visibility, offset) =
+                storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
-            let row = storage::decode_row_for_key(key_tenant, id, buf).map_err(storage_internal)?;
-            if let Some(dim) = expected_dim {
-                if !row.embedding.is_empty() {
-                    let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
-                    if found != dim {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "aggregate row scan failed: embedding dimension mismatch"
-                                .to_string(),
-                        });
-                    }
+            // 可視行・常に: TABLE-12 のキー/ヘッダ tenant 整合検査（`aggregate.rs`
+            // と同一の切り出しヘルパを使う。Issue #350）。従来
+            // `storage::decode_row_for_key` の内部検査だったものを明示比較へ
+            // 移設。`tier` に関わらず必ず行う。
+            storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
+
+            // 可視行・必要時のみ（Issue #350）: `tier` が要求する範囲だけ dim・
+            // metadata・embedding をデコードする。`DecodeTier::Embedding` は
+            // 上で読み済みの `offset` を引き継いで本体のみをデコードし、ヘッダの
+            // 二重デコードを避ける（Issue #349）。
+            let (dim, metadata): (u32, &[u8]) = match tier {
+                DecodeTier::DimAndScalar => {
+                    storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+                }
+                DecodeTier::Embedding => {
+                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                        .map_err(storage_internal)?
+                }
+                // `GROUP BY` はヘッダのみのファストパスを持たない
+                // （`tier` 決定ロジック参照）。
+                DecodeTier::Fast => {
+                    return Err(accumulator_bug(
+                        "GROUP BY execution reached DecodeTier::Fast, which it never selects",
+                    ))
+                }
+            };
+            if let Some(expected) = expected_dim {
+                if dim != 0 && dim != expected {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "aggregate row scan failed: embedding dimension mismatch"
+                            .to_string(),
+                    });
                 }
             }
 
-            let scanned = row_codec::scan_scalar_columns(schema, &row.metadata)?;
+            // マスク外の列は構造検証のみで `&str` 化を省略する
+            // （`row_codec::scan_scalar_columns_masked`）。`GROUP BY` キー列は
+            // `ReferencedColumns::derive` の `extra_scalar_index` で常にマスクへ
+            // 含まれるため、`any_scalar_column_referenced()` は常に真。
+            let scanned: Vec<Option<&str>> = row_codec::scan_scalar_columns_masked(
+                schema,
+                metadata,
+                Some(referenced.scalar_mask()),
+            )?;
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, &row.embedding)? {
+            for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
+                let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                    match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => {
+                            return Err(accumulator_bug(
+                                "WHERE expression references the VECTOR column but tier did not decode it",
+                            ))
+                        }
+                    }
+                } else {
+                    &[]
+                };
+                match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     _ => {
@@ -301,73 +474,86 @@ pub(crate) fn execute_grouped_aggregate(
                 }
             }
 
-            // defense-in-depth（RlsSafetyNet と同趣旨）。
-            if !ctx.is_visible(&row.tenant_id, row.visibility) {
+            // defense-in-depth（RlsSafetyNet と同趣旨）。ヘッダから取り出した
+            // `tenant_id`・`visibility` に対して再適用する（独立した二重検証では
+            // ない点を含め `aggregate.rs::execute_aggregate` の同一箇所のドキュメント
+            // 参照）。
+            if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
             // GROUP 段: グループキーを確定してから、可視行のみをグループ表へ
             // 反映する（このため他テナントにしか存在しないキーはグループとして
-            // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。
+            // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。借用キー（`&str`）で
+            // まず既存グループを 1 回だけ探索し、ヒットした行では所有 `String` を
+            // 一切確保しない（Issue #351）。
             let key_value = scanned.get(group_by.column_index).copied().flatten();
-            let key = GroupKey(match key_value {
-                Some(v) => Some(try_clone_str(v)?),
-                None => None,
-            });
+            let total_group_count = string_groups.len() + usize::from(null_group.is_some());
 
-            if !groups.contains_key(&key) {
-                check_new_group_budget(groups.len(), &mut total_key_bytes, &key.0)?;
-                let mut accs = Vec::new();
-                accs.try_reserve_exact(bound.items.len()).map_err(|_| {
-                    SqlSurfaceError::payload_too_large(
-                        "aggregate accumulator allocation exceeds available memory",
-                    )
-                })?;
-                for item in &bound.items {
-                    accs.push(Accumulator::new(item.func, &item.input)?);
-                }
-                groups.insert(key.clone(), accs);
-            }
-            let accs = groups
-                .get_mut(&key)
-                .ok_or_else(|| accumulator_bug("group entry disappeared after insertion"))?;
-
-            for (accumulator, item) in accs.iter_mut().zip(&bound.items) {
-                // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
-                // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
-                // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
-                // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
-                // 実際の保持量を正確に反映する）。
-                let before = accumulator.text_len();
-                accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
-                let after = accumulator.text_len();
-                if after > before {
-                    let delta = after - before;
-                    total_text_accumulator_bytes = total_text_accumulator_bytes
-                        .checked_add(delta)
-                        .ok_or_else(|| {
-                            SqlSurfaceError::payload_too_large(
-                                "GROUP BY TEXT aggregate size accounting overflowed",
-                            )
-                        })?;
-                    if total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            "GROUP BY TEXT aggregate state exceeds the allowed total size",
-                        ));
+            // 行 1 件分の `VECTOR` 列ビュー（Issue #350）。`tier` が
+            // `DecodeTier::Embedding` を選んだ場合のみ実体（`embedding_scratch`）を
+            // 持ち、それ以外は `dim` のみで `values: None`（`Accumulator::observe`
+            // 側が `ScalarExpr` の embedding 参照を fail-closed に拒否する仕組みで
+            // 誤用を防ぐ）。
+            let vector = RowVector {
+                dim,
+                values: match tier {
+                    DecodeTier::Embedding => Some(embedding_scratch.as_slice()),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => None,
+                },
+            };
+            match key_value {
+                Some(key_str) => {
+                    if let Some(accs) = string_groups.get_mut(key_str) {
+                        // 既存グループへの累積: 探索 1 回・String 確保 0 回。
+                        accumulate_row(
+                            accs,
+                            &bound.items,
+                            id,
+                            &vector,
+                            &scanned,
+                            &mut total_text_accumulator_bytes,
+                            &mut expr_scratch,
+                        )?;
+                    } else {
+                        // 新規グループ: 予算検査 → ローカルでアキュムレータを
+                        // 確保・累積 → 確定後に 1 回だけキーを所有化して挿入
+                        // する（挿入後の再探索は不要）。
+                        check_new_group_budget(
+                            total_group_count,
+                            &mut total_key_bytes,
+                            key_str.len(),
+                        )?;
+                        let mut accs = new_accumulators(&bound.items)?;
+                        accumulate_row(
+                            &mut accs,
+                            &bound.items,
+                            id,
+                            &vector,
+                            &scanned,
+                            &mut total_text_accumulator_bytes,
+                            &mut expr_scratch,
+                        )?;
+                        string_groups.insert(try_clone_str(key_str)?, accs);
                     }
-                } else if after < before {
-                    // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
-                    // 実際の保持量を正確に反映するため減算する（`checked_sub` の
-                    // 失敗＝内部不整合は `XX000` の accumulator_bug へ落とし、
-                    // fail-open にはしない）。減算しないと過去の増加量が
-                    // 累積し続け、実保持量が予算内でも正常なクエリを
-                    // 誤って 54000 で拒否してしまう。
-                    let delta = before - after;
-                    total_text_accumulator_bytes = total_text_accumulator_bytes
-                        .checked_sub(delta)
-                        .ok_or_else(|| {
-                            accumulator_bug("GROUP BY TEXT aggregate size accounting underflowed")
-                        })?;
+                }
+                None => {
+                    if null_group.is_none() {
+                        check_new_group_budget(total_group_count, &mut total_key_bytes, 0)?;
+                        null_group = Some(new_accumulators(&bound.items)?);
+                    }
+                    let accs = null_group.as_mut().ok_or_else(|| {
+                        accumulator_bug("null group entry disappeared after insertion")
+                    })?;
+                    accumulate_row(
+                        accs,
+                        &bound.items,
+                        id,
+                        &vector,
+                        &scanned,
+                        &mut total_text_accumulator_bytes,
+                        &mut expr_scratch,
+                    )?;
                 }
             }
         }
@@ -379,8 +565,18 @@ pub(crate) fn execute_grouped_aggregate(
     // 保証済みの内部添字だが、untrusted 入力に由来する添字アクセスを避ける
     // 方針（`.claude/rules/coding-rust.md`）に従い、ここでも `.get()` で明示的に
     // 扱い、万一の不整合は panic ではなく [`accumulator_bug`]（`XX000`）へ落とす。
-    let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(groups.len());
-    for (key, accs) in groups {
+    // 分割前の `GroupKey::Ord`（非 NULL はバイト昇順・NULL は常に末尾）と同一の
+    // 走査順にするため、`string_groups`（`BTreeMap` の昇順 `into_iter`）→
+    // `null_group` の順で連結する（Issue #351。`sort-determinism-check`・
+    // 決定性テストが前提とする順序を維持）。
+    let total_group_count = string_groups.len() + usize::from(null_group.is_some());
+    let group_entries = string_groups
+        .into_iter()
+        .map(|(k, accs)| (GroupKey(Some(k)), accs))
+        .chain(null_group.into_iter().map(|accs| (GroupKey(None), accs)));
+
+    let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(total_group_count);
+    for (key, accs) in group_entries {
         let cells: Vec<Cell> = accs.into_iter().map(Accumulator::finish).collect();
         let mut keep = true;
         for h in &group_by.having {
@@ -474,4 +670,119 @@ pub(crate) fn execute_grouped_aggregate(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    use crate::sql::allowlist::AggregateFunc;
+    use crate::sql::parser::{AggregateInput, BoundAggregate, BoundAggregateItem, BoundGroupBy};
+    use crate::storage::{RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+    /// （`header_tenant`）を意図的にずらして raw redb 書き込みする（TABLE-12 の
+    /// 整合検査を検証するための専用ヘルパ。`sql::aggregate::tests` の同名ヘルパと
+    /// 同じ方針。Issue #349）。
+    fn write_row_with_mismatched_key_tenant(
+        storage: &Storage,
+        table_name: &str,
+        key_tenant: &str,
+        header_tenant: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: header_tenant,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((key_tenant, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    fn schema_with_text_group_column() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    fn bound_count_star_grouped_by_lang() -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: AggregateInput::AllVisible,
+                name: "result".to_string(),
+            }],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            rls_predicate_present: false,
+            projection: vec![
+                crate::sql::parser::ProjectionColumn::GroupKey {
+                    name: "lang".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 0,
+                    name: "result".to_string(),
+                },
+            ],
+            group_by: Some(BoundGroupBy {
+                column_index: 1,
+                having: Vec::new(),
+                order_by: None,
+                limit: None,
+            }),
+        }
+    }
+
+    // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
+    // `tenant_id` の不一致）が、`decode_row_for_key` 呼び出しをやめた後の
+    // 明示比較でも従来どおり fail-closed（`XX000`・`SqlSurfaceError::Internal`）に
+    // 拒否されることを固定する（`sql::aggregate::tests` の単一行経路と同一の
+    // 回帰を `GROUP BY` 経路で検証する）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed() {
+        let path = unique_db_path("group-by-table12-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_count_star_grouped_by_lang();
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
+    }
 }

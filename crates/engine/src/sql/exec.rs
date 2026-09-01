@@ -32,6 +32,7 @@
 //! を束ねる。
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::arena::{ArenaError, VectorArena};
 use crate::catalog::{CatalogError, ColumnType, TableSchema};
@@ -341,13 +342,28 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
 /// 走査することになり、新設列の欠落や `row_codec` デコード失敗（スキーマ世代不一致）
 /// が生じ得た。同一 `read_txn` を型で強制することで、スキーマ取得・bind・候補走査を
 /// 単一スナップショットへ閉じ込める）。
-pub fn execute_statement(
+///
+/// `sparse_cache`（Issue #357・[`crate::sql::sparse_cache::SparseIndexCache`]）は
+/// hybrid ランキング（[`Ranking::Hybrid`]）かつ `bound.metadata_filters`・
+/// `bound.expr_filters` がともに空のクエリに限り経由する（詳細は
+/// `sql/sparse_cache.rs` モジュールドキュメントの「適用条件」参照）。それ以外の
+/// クエリ（DISTANCE 専用・フィルタ付き hybrid）は本関数内で一切参照しない。
+/// `None` を渡した場合はキャッシュを一切経由せず、常に新規構築する（下記
+/// [`execute_statement`] 参照）。
+///
+/// crate 内部専用（`pub(crate)`）。[`crate::sql::sparse_cache::SparseCacheAccess`]
+/// が属する `sql::sparse_cache` モジュールは `pub(crate)` であり、その型は crate
+/// 外から構築不能（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。公開 API
+/// としては下記の [`execute_statement`]（従来シグネチャを維持し `None` を渡す薄い
+/// ラッパー）のみを経由させ、この拡張版は `core.rs` の crate 内呼び出し専用とする。
+pub(crate) fn execute_statement_with_cache(
     read_txn: &redb::ReadTransaction,
     provider: &dyn SearchProvider,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundStatement,
     precision_policy: &crate::precision::PrecisionPolicy,
+    sparse_cache: Option<crate::sql::sparse_cache::SparseCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
@@ -375,6 +391,39 @@ pub fn execute_statement(
         } => Some(*text_column_index),
         Ranking::Distance { .. } => None,
     };
+
+    // Issue #357: `SparseIndex` のテーブル世代整合キャッシュ。フィルタなし hybrid
+    // クエリに限り経由する（`sql/sparse_cache.rs` モジュールドキュメント「適用条件」
+    // 参照。疎コーパスは SCALAR 事前フィルタ通過行にのみ割り当てられるため、
+    // フィルタが無い場合のみ「RLS 可視行のうち本文非 NULL の全行」というクエリ
+    // 非依存のコーパスが成立し、同一世代内でのスロット番号割当を含む再現性
+    // 不変条件を満たす）。ヒットした場合は下の `on_visible_row` で疎コーパスへの
+    // 複製蓄積自体を省略し（`skip_sparse_accumulation`）、フュージョン段で
+    // キャッシュ済み索引をそのまま使う。
+    // `sparse_cache` が `None`（公開ラッパー `execute_statement` 経由。モジュール
+    // 冒頭ドキュメント参照）の場合はキャッシュを一切経由しない。
+    let filters_empty = bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
+    let sparse_cache_eligible = sparse_cache.is_some() && is_hybrid && filters_empty;
+    // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
+    // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
+    // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール
+    // ドキュメント参照（同一テーブルで異なる TEXT 列を hybrid 本文に指定する 2
+    // クエリを取り違えないため）。`sparse_cache.as_ref()` と `is_hybrid`・
+    // `filters_empty` を独立に再チェックすることで、`expect`/`unwrap` を使わず
+    // `sparse_cache_eligible` と実際の分岐を一致させる。
+    let cached_sparse_index: Option<Arc<SparseIndex>> = if is_hybrid && filters_empty {
+        match (sparse_cache.as_ref(), text_column_index) {
+            (Some(access), Some(idx)) => {
+                access
+                    .cache
+                    .lookup(access.storage, read_txn, &bound.table, ctx, idx)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let skip_sparse_accumulation = cached_sparse_index.is_some();
 
     // 疎コーパスへ蓄積する累計文書数・バイト量。`sparse::SparseIndex::build` の上限
     // （`MAX_CORPUS_DOCS`・`MAX_CORPUS_BYTES`）は `try_alloc_text_for_budget` が
@@ -443,6 +492,16 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。`on_visible_row`（下記クロージャ）は行ごとに異なる late-bound
+    // ライフタイムで `embedding` を受け取るが、[`crate::sql::expr_program::StackValue`]
+    // は借用を保持しないため `embedding` のライフタイムに紐付かない。そのため
+    // このクロージャの外（行ループの外）で 1 回だけ確保し、`&mut` 捕獲で
+    // 行ごとに使い回せる（以前は `ExprValue<'a>` を直接積んでおり、クロージャ
+    // 境界を越える借用の衝突（E0521）を避けるためクロージャ本体のローカルとして
+    // 毎呼び出し新規確保していた）。
+    let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
     let on_visible_row = |slot: usize,
                           id: u64,
                           embedding: &[f32],
@@ -473,8 +532,11 @@ pub fn execute_statement(
             // 式が一切評価されない。評価エラー（0 除算・非有限値等）は当該行を
             // 黙ってスキップせず、クエリ全体の失敗として fail-closed に伝播する
             // （`expr_eval_error_to_arena` 経由で `22000`／`54000` へ写像）。
-            for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, embedding).map_err(expr_eval_error_to_arena)? {
+            for program in &bound.expr_filter_programs {
+                match program
+                    .eval(id, embedding, &mut expr_scratch)
+                    .map_err(expr_eval_error_to_arena)?
+                {
                     udf_call::ExprValue::Bool(true) => {}
                     udf_call::ExprValue::Bool(false) => return Ok(false),
                     // 束縛段（`sql::parser::bind_in_session`）が `WHERE` 式述語の型を
@@ -487,7 +549,11 @@ pub fn execute_statement(
                 }
             }
         }
-        if is_hybrid {
+        // Issue #357: キャッシュヒット時（`skip_sparse_accumulation`）は疎コーパスの
+        // 複製蓄積自体を省略する（フュージョン段でキャッシュ済み索引をそのまま使う
+        // ため、ここで文書を複製・保持する必要がない。上のキャッシュ lookup のドキュ
+        // メント参照）。
+        if is_hybrid && !skip_sparse_accumulation {
             if let Some(idx) = text_column_index {
                 if let Some(Some(t)) = scanned.get(idx) {
                     if sparse_docs.len() >= crate::sparse::MAX_CORPUS_DOCS {
@@ -667,7 +733,10 @@ pub fn execute_statement(
                 raw.into_iter().map(|h| (h.id, h.score as f64)).collect()
             }
             Ranking::Hybrid {
-                query, query_text, ..
+                query,
+                query_text,
+                text_column_index: hybrid_text_column_index,
+                ..
             } => {
                 let pool_depth = k_eff.max(DEFAULT_HYBRID_POOL_DEPTH);
                 let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth).map_err(|_| {
@@ -682,46 +751,87 @@ pub fn execute_statement(
                     query,
                     k: k_eff,
                 };
-                let fused: Vec<HybridHit> = if sparse_docs.is_empty() {
+                // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
+                // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
+                // 蓄積した本文）から新規構築し、`sparse_cache_eligible` なら
+                // キャッシュへの挿入を試みる（`SparseIndexCache::insert` は挿入の
+                // 成否に関わらず構築済みの索引そのものを返す契約。
+                // `sql/sparse_cache.rs` モジュールドキュメント参照）。
+                let sparse_index_for_fusion: Option<Arc<SparseIndex>> = if let Some(idx) =
+                    &cached_sparse_index
+                {
+                    Some(Arc::clone(idx))
+                } else if sparse_docs.is_empty() {
                     // 疎文書が 0 件（可視行に本文を持つ行が 1 件もない）の場合は
-                    // `SparseIndex::build` が空コーパスを拒否する（`SparseError::EmptyCorpus`）
-                    // ため、密側のみを `rrf_fuse` に通して密のみの順序契約へ縮退させる
-                    // （疎側の寄与を単に 0 件として扱う。密側の可視性検証は
-                    // `hybrid::hybrid_search` と同じ理由でここでも行う）。
-                    let dense_input = SearchInput {
-                        ids: &slot_ids,
-                        vectors: arena.vectors(),
-                        dim: arena.dim(),
-                        query,
-                        k: cfg.pool_depth(),
-                    };
-                    let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
-                    // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
-                    // キー存在で判定する。TABLE-12 の重複 id については
-                    // `core::provider_result_is_valid` のドキュメント参照）。
-                    if dense_hits
-                        .iter()
-                        .any(|h| !visible_id_counts.contains_key(&h.id))
-                    {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "search provider returned a hit outside the visible id set"
-                                .to_string(),
-                        });
-                    }
-                    let mut fused =
-                        hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
-                    fused.truncate(k_eff);
-                    fused
+                    // `SparseIndex::build` が空コーパスを拒否する
+                    // （`SparseError::EmptyCorpus`）ため、密のみへ縮退させる
+                    // （下の `None` 分岐）。空コーパスはキャッシュへも積まない
+                    // （`SparseIndex::build` 自体が拒否するため構築できない）。
+                    None
                 } else {
                     let doc_refs: Vec<(DocId, &str)> = sparse_docs
                         .iter()
                         .map(|(id, text)| (*id, text.as_str()))
                         .collect();
-                    let sparse_index = SparseIndex::build(&doc_refs)
+                    let built = SparseIndex::build(&doc_refs)
                         .map_err(HybridError::Sparse)
                         .map_err(map_hybrid_error)?;
-                    hybrid::hybrid_search(provider, input, &sparse_index, query_text, k_eff, &cfg)
-                        .map_err(map_hybrid_error)?
+                    match (sparse_cache_eligible, sparse_cache.as_ref()) {
+                        (true, Some(access)) => {
+                            // `built_generation` はこのクエリの `read_txn`
+                            // スナップショットにおけるテーブル世代
+                            // （`SparseIndexCache::insert` の契約。読み取れない
+                            // 場合はキャッシュへ積まず、この場で構築した索引を
+                            // そのまま使う）。
+                            match crate::catalog::table_generation_in_txn(read_txn, &bound.table) {
+                                Ok(built_generation) => Some(access.cache.insert(
+                                    access.storage,
+                                    &bound.table,
+                                    ctx,
+                                    *hybrid_text_column_index,
+                                    built,
+                                    built_generation,
+                                )),
+                                Err(_) => Some(Arc::new(built)),
+                            }
+                        }
+                        _ => Some(Arc::new(built)),
+                    }
+                };
+                let fused: Vec<HybridHit> = match &sparse_index_for_fusion {
+                    None => {
+                        // 疎側の寄与を 0 件として扱い、密側のみを `rrf_fuse` に通して
+                        // 密のみの順序契約へ縮退させる（密側の可視性検証は
+                        // `hybrid::hybrid_search` と同じ理由でここでも行う）。
+                        let dense_input = SearchInput {
+                            ids: &slot_ids,
+                            vectors: arena.vectors(),
+                            dim: arena.dim(),
+                            query,
+                            k: cfg.pool_depth(),
+                        };
+                        let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
+                        // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
+                        // キー存在で判定する。TABLE-12 の重複 id については
+                        // `core::provider_result_is_valid` のドキュメント参照）。
+                        if dense_hits
+                            .iter()
+                            .any(|h| !visible_id_counts.contains_key(&h.id))
+                        {
+                            return Err(SqlSurfaceError::Internal {
+                                detail: "search provider returned a hit outside the visible id set"
+                                    .to_string(),
+                            });
+                        }
+                        let mut fused =
+                            hybrid::rrf_fuse(&dense_hits, &[], &cfg).map_err(map_hybrid_error)?;
+                        fused.truncate(k_eff);
+                        fused
+                    }
+                    Some(idx) => {
+                        hybrid::hybrid_search(provider, input, idx, query_text, k_eff, &cfg)
+                            .map_err(map_hybrid_error)?
+                    }
                 };
                 fused.into_iter().map(|h| (h.id, h.score)).collect()
             }
@@ -745,6 +855,10 @@ pub fn execute_statement(
         // （当該行だけを黙ってスキップしない。`on_visible_row` の事前フィルタ経路と
         // 同じ方針）。
         let mut filtered = Vec::with_capacity(hits.len());
+        // Issue #353: DISTANCE 段の後で事後適用する `expr_filter_programs` の
+        // 明示スタック（`on_visible_row` とは別ループのため個別に確保。行数分
+        // 使い回す）。
+        let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
         for (slot_id, score) in hits {
             // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
             // として fail-closed に除去する。
@@ -764,7 +878,7 @@ pub fn execute_statement(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            if !bound.expr_filters.is_empty() {
+            if !bound.expr_filter_programs.is_empty() {
                 let Some(embedding) = arena.vector(slot) else {
                     continue;
                 };
@@ -772,8 +886,8 @@ pub fn execute_statement(
                     continue;
                 };
                 let mut expr_ok = true;
-                for expr in &bound.expr_filters {
-                    match udf_call::eval(expr, row_id, embedding)? {
+                for program in &bound.expr_filter_programs {
+                    match program.eval(row_id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Bool(true) => {}
                         udf_call::ExprValue::Bool(false) => {
                             expr_ok = false;
@@ -920,6 +1034,33 @@ pub fn execute_statement(
     Ok(QueryResult { columns, rows })
 }
 
+/// [`BoundStatement`] を実行する（TASK-75 の公開 API）。従来の 6 引数シグネチャを
+/// 維持する薄いラッパー（Issue #357 レビュー指摘対応・AGENTS.md「公開 API・
+/// エラー契約の互換性（P1）」: [`execute_statement_with_cache`] へ `SparseCacheAccess`
+/// を追加した際、その型が属する `sql::sparse_cache` モジュールが `pub(crate)` の
+/// ため crate 外から構築不能になり、本関数を呼べなくなる破壊的変更を招いていた。
+/// 本ラッパーは `sparse_cache: None` を渡し、Issue #357 のキャッシュ最適化を経由
+/// しない従来どおりの新規構築のみの経路として動作する）。crate 内部の hybrid
+/// キャッシュ経路（`core.rs`）は [`execute_statement_with_cache`] を直接呼ぶ。
+pub fn execute_statement(
+    read_txn: &redb::ReadTransaction,
+    provider: &dyn SearchProvider,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
+    bound: &BoundStatement,
+    precision_policy: &crate::precision::PrecisionPolicy,
+) -> Result<QueryResult, SqlSurfaceError> {
+    execute_statement_with_cache(
+        read_txn,
+        provider,
+        ctx,
+        schema,
+        bound,
+        precision_policy,
+        None,
+    )
+}
+
 /// 投影段（TASK-136・RLS-5）。引数を [`RlsVerifiedHits`]（witness 型）に固定する
 /// ことで、[`RlsSafetyNet::apply`] を経由しない生の `Vec<(u64, f64)>` から本関数へ
 /// 到達する経路を型として作れなくする（`execute_statement` からのみ呼ばれる）。
@@ -937,6 +1078,21 @@ fn project_rows(
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
     let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
+    // Issue #353: `ProjectedColumn`（`pub` enum）の形状は変えず、`Computed` 列の
+    // 式を行ループの**外**（本関数の入口）で 1 回だけステップ列コンパイルする。
+    // `projection` と添字が 1 対 1 対応する（`Computed` 以外は `None`）。行ループは
+    // 明示スタック（`expr_scratch`）を使い回し、`sql::udf_call::eval` の再帰
+    // 呼び出しを一切行わない。
+    let computed_programs: Vec<Option<crate::sql::expr_program::ExprProgram>> = projection
+        .iter()
+        .map(|col| match col {
+            ProjectedColumn::Computed { expr, .. } => {
+                Some(crate::sql::expr_program::ExprProgram::compile(expr))
+            }
+            ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
+        })
+        .collect();
+    let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     for (slot_id, score) in hits {
         // ヒットの第 1 要素はアリーナのスロット番号（`execute_statement` の
         // `slot_ids` 参照）。embedding・スカラー列・行 `id` の 3 者すべてを同じ
@@ -963,7 +1119,7 @@ fn project_rows(
                 detail: "candidate arena index out of range".to_string(),
             })?;
         let mut cells = Vec::with_capacity(projection.len());
-        for col in projection {
+        for (col_idx, col) in projection.iter().enumerate() {
             match col {
                 ProjectedColumn::Id => cells.push(Cell::Integer(id)),
                 ProjectedColumn::Column { index, .. } => {
@@ -989,14 +1145,31 @@ fn project_rows(
                         },
                     }
                 }
-                ProjectedColumn::Computed { expr, .. } => {
+                ProjectedColumn::Computed { .. } => {
                     // TASK-79（SQL-9）: 結果列位置の式項目。候補選択と同一スナップショット
                     // の `id`・embedding で評価する（投影段は再取得を行わない既存契約と
                     // 同方針）。評価エラーはクエリ全体の失敗として fail-closed に伝播する
                     // （行値・テナントを含まない固定文言。`sql::udf_call::eval` 参照）。
-                    match udf_call::eval(expr, id, embedding)? {
+                    // Issue #353: `expr` の再帰評価ではなく、入口で 1 回だけ
+                    // コンパイルした `computed_programs[col_idx]` を線形実行する。
+                    let program = computed_programs
+                        .get(col_idx)
+                        .and_then(|p| p.as_ref())
+                        .ok_or_else(|| SqlSurfaceError::Internal {
+                            detail: "computed projection program missing at evaluation time"
+                                .to_string(),
+                        })?;
+                    match program.eval(id, embedding, &mut expr_scratch)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                        udf_call::ExprValue::Vector(v) => cells.push(Cell::Vector(v)),
+                        udf_call::ExprValue::Vector(v) => {
+                            // Issue #352: `VectorRef` 単体評価は行データを借用する
+                            // だけになった（確保ゼロ）ため、応答行として行データより
+                            // 長く保持する必要があるここ（投影段）でのみ
+                            // `into_owned_vector` により fail-closed な確保・複製を
+                            // 行う（`Cow::Owned`＝`vec_div` 等の構築結果はそのまま
+                            // move し再確保しない）。
+                            cells.push(Cell::Vector(udf_call::into_owned_vector(v)?))
+                        }
                         udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                     }
                 }

@@ -20,6 +20,7 @@
 //! （`.claude/rules/coding-rust.md`）。0 除算・非有限値（NaN/∞）の生成は行単位で
 //! fail-closed に拒否し、黙って 0 や NULL へ丸めない（security.md「不安全な設計」）。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::catalog;
@@ -199,11 +200,40 @@ pub enum ExprType {
 }
 
 /// 評価結果の値。
+///
+/// `Vector` は `Cow<'a, [f32]>`（Issue #352）で保持する。`VectorRef`（テーブルの
+/// `VECTOR` 列をそのまま参照する式）の評価は行データを複製せず `Cow::Borrowed` を
+/// 返し、`vec_div`・vector×scalar 演算のように新しいベクトルを構築する評価だけが
+/// `Cow::Owned` で `try_reserve_exact`（fail-closed）による確保を行う。呼び出し元が
+/// 所有データを必要とする場合（投影段で応答セルへ変換する等）は
+/// [`into_owned_vector`] を使う。
 #[derive(Debug, Clone, PartialEq)]
-pub enum ExprValue {
+pub enum ExprValue<'a> {
     Scalar(f64),
-    Vector(Vec<f32>),
+    Vector(Cow<'a, [f32]>),
     Bool(bool),
+}
+
+/// [`ExprValue::Vector`] を所有 `Vec<f32>` へ変換する（投影段など、評価結果を
+/// 行データより長く保持する必要がある呼び出し元向け）。`Cow::Owned` はそのまま
+/// move するため確保が発生しない（`vec_div` 等、評価内で既に新規構築済みの場合）。
+/// `Cow::Borrowed`（`VectorRef` の借用評価）は `Vec::to_vec()`（内部で infallible
+/// alloc を使い OOM 時にプロセスを abort しうる）ではなく `try_reserve_exact` で
+/// 確保成否を確認してから複製する（同一ファイル内の `vec_div`・
+/// `apply_vector_scalar_op` と同じ fail-closed 方針。確保失敗は `54000` へ写像し、
+/// abort させない）。
+pub fn into_owned_vector(v: Cow<'_, [f32]>) -> Result<Vec<f32>, SqlSurfaceError> {
+    match v {
+        Cow::Owned(v) => Ok(v),
+        Cow::Borrowed(s) => {
+            let mut out: Vec<f32> = Vec::new();
+            out.try_reserve_exact(s.len()).map_err(|_| {
+                SqlSurfaceError::payload_too_large("vector value exceeds available memory")
+            })?;
+            out.extend_from_slice(s);
+            Ok(out)
+        }
+    }
 }
 
 /// 組み込み関数（対象ビヘイビア SQL-9。`sqrt`/`abs` 等の追加は本タスクのスコープ外
@@ -228,13 +258,24 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
 }
 
 /// 組み込み関数の引数個数・型シグネチャ（束縛時の検査に使う）。
-fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
+/// `sql::expr_program::ExprStep::Builtin` の実行時（明示スタックからの pop 数決定）
+/// でも束縛時と同じ arity 判定を使うため `pub(crate)` で共有する
+/// （Issue #353・式評価のステップ列コンパイル化）。
+pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType) {
     match f {
         BuiltinFn::VecNorm => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecSum => (&[ExprType::Vector], ExprType::Scalar),
         BuiltinFn::VecDiv => (&[ExprType::Vector, ExprType::Scalar], ExprType::Vector),
     }
 }
+
+/// 組み込み関数の arity（[`builtin_signature`] が返す引数個数）の上限。
+/// `sql::expr_program::ExprStep::Builtin` の実行時、この上限個数の固定配列
+/// （ヒープ確保なし）へ引数を積んでから [`apply_builtin`] を呼ぶために使う
+/// （PR #373 codex-review 指摘対応・追加 `Vec` 確保の排除）。新しい組み込み関数を
+/// 追加してこの上限を超える arity になる場合はここも合わせて引き上げる
+/// （`builtin_arities_fit_max_arity` で全 [`BuiltinFn`] 網羅的に検証する）。
+pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
 
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
 /// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
@@ -534,6 +575,28 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
     }
 }
 
+/// 式木が `VECTOR` 列（[`BoundExpr::VectorRef`]）へ到達するかを判定する
+/// （Issue #350: 集計経路が `embedding` を実際にデコードすべきかの判定基盤）。
+/// `embedding` アクセスは束縛段で `VectorRef` に一元化されている（本モジュールの
+/// [`eval`] 参照。`Builtin`/`Binary`/`WasmCall` は自身では embedding を持たず
+/// 引数式の評価結果のみを使う）ため、全 variant を網羅する `match`（`_` 禁止）で
+/// 判定すれば過小評価が起きない。呼び出し元
+/// （`sql::aggregate.rs`／`sql::group_by.rs`）はこの判定結果に基づき embedding の
+/// デコードそのものをスキップするため、将来 `BoundExpr` に新 variant が
+/// 追加された際にここへの追随漏れがあれば早期にコンパイルエラーとして検出できる
+/// ことを意図して非網羅を許さない。
+pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::VectorRef => true,
+        BoundExpr::Number(_) | BoundExpr::IdRef => false,
+        BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            references_embedding(lhs) || references_embedding(rhs)
+        }
+        BoundExpr::WasmCall { args, .. } => args.iter().any(references_embedding),
+    }
+}
+
 /// [`Expr`] を意味論的に束縛する（`sql::parser::bind_in_session` から呼ばれる公開 API）。
 /// 列参照は `schema` から、UDF 呼び出しは `registry` から解決し、UDF はインライン
 /// 展開して自己完結した [`BoundExpr`] を返す。`node_budget` は展開後のノード数上限
@@ -810,7 +873,7 @@ fn bind_call(
 /// 仮数部で正確に表現できる範囲（`2^53` 以下）かを確認する。これを超える `id` を
 /// 無条件に `as f64` で丸めると、`WHERE id = <literal>` のような等価述語が精度欠落
 /// により別 ID の行にも一致しうる（fail-closed: 黙って丸めず `22000` で拒否する）。
-fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
+pub(crate) fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
     if id > MAX_EXACT_F64_INT {
         return Err(SqlSurfaceError::invalid_input(
             "row id exceeds the range that can be exactly represented for comparison",
@@ -819,22 +882,23 @@ fn id_as_finite_scalar(id: u64) -> Result<f64, SqlSurfaceError> {
     Ok(id as f64)
 }
 
-pub fn eval(expr: &BoundExpr, id: u64, embedding: &[f32]) -> Result<ExprValue, SqlSurfaceError> {
+pub fn eval<'a>(
+    expr: &BoundExpr,
+    id: u64,
+    embedding: &'a [f32],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match expr {
         BoundExpr::Number(v) => Ok(ExprValue::Scalar(*v)),
         BoundExpr::IdRef => id_as_finite_scalar(id).map(ExprValue::Scalar),
         BoundExpr::VectorRef => {
-            // untrusted SQL から到達しうる経路（`WHERE`・`SELECT` 式の `VECTOR` 列参照）
-            // のため、`Vec::to_vec()`（内部で infallible alloc を使い OOM 時にプロセスを
-            // abort しうる）ではなく `try_reserve_exact` で確保成否を確認してからコピー
-            // する。同一ファイル内の `vec_div`・`apply_vector_scalar_op` と同じ
-            // fail-closed 方針（確保失敗は `54000` へ写像し、abort させない）。
-            let mut out: Vec<f32> = Vec::new();
-            out.try_reserve_exact(embedding.len()).map_err(|_| {
-                SqlSurfaceError::payload_too_large("vector value exceeds available memory")
-            })?;
-            out.extend_from_slice(embedding);
-            Ok(ExprValue::Vector(out))
+            // Issue #352: 行の embedding をそのまま借用する。テーブル `VECTOR` 列の
+            // 素通し参照（`WHERE vec_norm(embedding) > x` 等の読み取り経路）では
+            // 確保・複製が一切発生しない。新しいベクトルを構築する評価
+            // （`vec_div`・vector×scalar 演算）だけが `try_reserve_exact` による
+            // fail-closed な確保を行う（下記 `eval_builtin`・`apply_vector_scalar_op`
+            // 参照）。呼び出し元が所有データを要する場合は [`into_owned_vector`] で
+            // 変換する（確保は投影段など必要な箇所のみへ限定される）。
+            Ok(ExprValue::Vector(Cow::Borrowed(embedding)))
         }
         BoundExpr::Builtin { f, args } => eval_builtin(*f, args, id, embedding),
         BoundExpr::Binary { op, lhs, rhs } => {
@@ -859,36 +923,70 @@ pub fn eval(expr: &BoundExpr, id: u64, embedding: &[f32]) -> Result<ExprValue, S
     }
 }
 
-fn eval_builtin(
+/// 組み込み関数を木の再帰評価から呼ぶ経路（引数式を左から順に評価してから
+/// [`apply_builtin`] へ委譲する）。`args` の評価順は元の実装（`eval_vector_arg`／
+/// `eval_scalar_arg` を順に呼ぶ）と同じ左→右を保つ（評価順に依存するエラー発生
+/// 順序を変えないため。`sql_evaluation_order` 等の既存契約に対応）。
+fn eval_builtin<'a>(
     f: BuiltinFn,
     args: &[BoundExpr],
     id: u64,
-    embedding: &[f32],
-) -> Result<ExprValue, SqlSurfaceError> {
+    embedding: &'a [f32],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
+    // 参照実装（再帰 `eval`）専用の非ホットパス。ステップ列実行
+    // （`sql::expr_program::ExprProgram::eval`）は固定長スタック配列を使う別経路
+    // （下記 `apply_builtin` のシグネチャ参照）を通るため、ここでの `Vec` 確保は
+    // 行ごとのホットパスには影響しない。
+    let mut values: Vec<Option<ExprValue<'a>>> = Vec::with_capacity(args.len());
+    for a in args {
+        values.push(Some(eval(a, id, embedding)?));
+    }
+    apply_builtin(f, &mut values)
+}
+
+/// 組み込み関数を値ベースで評価する（引数はすでに評価済みの [`ExprValue`] を
+/// `&mut [Option<ExprValue>]` スライスで受け取り、式木を再帰評価しない）。
+/// [`eval_builtin`]（再帰 `eval` 経由）と `sql::expr_program::ExprProgram::eval`
+/// （`ExprStep::Builtin`。明示スタックから arity 分 pop した値を、行ループの外で
+/// 確保済みの固定長配列へ積んで渡す。PR #373 codex-review 指摘対応・追加 `Vec`
+/// 確保の排除）の両方が本関数を共有することで、0 除算・非有限値（`f64`/`f32`
+/// 双方）の fail-closed 契約（`22000`）と `try_reserve_exact` による確保失敗時の
+/// `54000` 写像を 1 箇所に保つ（Issue #353）。引数はスライスの `Option::take`
+/// で所有権を抜き取る（[`take_vector_arg`]・[`take_scalar_arg`]）ため、呼び出し元
+/// が `Vec` を所有している必要はない。`args` の要素数が [`builtin_signature`] の
+/// arity と不一致な場合（束縛段の不変条件が崩れた場合の保険）は `Internal` として
+/// 拒否する。
+pub(crate) fn apply_builtin<'a>(
+    f: BuiltinFn,
+    args: &mut [Option<ExprValue<'a>>],
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match f {
         BuiltinFn::VecNorm => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
+            let v = take_vector_arg(args, 0)?;
             let sum_sq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
             let norm = sum_sq.sqrt();
             finite_scalar(norm, "vec_norm")
         }
         BuiltinFn::VecSum => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
+            let v = take_vector_arg(args, 0)?;
             let sum: f64 = v.iter().map(|&x| x as f64).sum();
             finite_scalar(sum, "vec_sum")
         }
         BuiltinFn::VecDiv => {
-            let v = eval_vector_arg(args, 0, id, embedding)?;
-            let s = eval_scalar_arg(args, 1, id, embedding)?;
+            let v = take_vector_arg(args, 0)?;
+            let s = take_scalar_arg(args, 1)?;
             if s == 0.0 {
                 return Err(SqlSurfaceError::invalid_input("vec_div: division by zero"));
             }
+            // `vec_div` は成分ごとに新しい値を作る（借用元をそのまま流用できない）
+            // ため、ここでは Issue #352 の限定どおり `try_reserve_exact` による
+            // fail-closed な新規確保を維持する。
             let mut out: Vec<f32> = Vec::new();
             out.try_reserve_exact(v.len()).map_err(|_| {
                 SqlSurfaceError::payload_too_large("vec_div result exceeds available memory")
             })?;
-            for x in v {
-                let r = (x as f64) / s;
+            for x in v.iter() {
+                let r = (*x as f64) / s;
                 if !r.is_finite() {
                     return Err(SqlSurfaceError::invalid_input(
                         "vec_div: result is not finite",
@@ -905,17 +1003,49 @@ fn eval_builtin(
                 }
                 out.push(r32);
             }
-            Ok(ExprValue::Vector(out))
+            Ok(ExprValue::Vector(Cow::Owned(out)))
         }
     }
 }
 
-fn eval_vector_arg(
+/// `args[idx]` を `Vector` として取り出す（`Option::take` で所有権を移す。
+/// 同一インデックスを 2 度取り出さない呼び出し規約のため、取り出し後の
+/// スロットは `None` のまま残る）。型不一致・欠落は `Internal`。
+fn take_vector_arg<'a>(
+    args: &mut [Option<ExprValue<'a>>],
+    idx: usize,
+) -> Result<Cow<'a, [f32]>, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Vector(v)) => Ok(v),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+/// `args[idx]` を `Scalar` として取り出す（[`take_vector_arg`] と対の値ベース
+/// 抽出ヘルパー）。
+fn take_scalar_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<f64, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Scalar(s)) => Ok(s),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
+        None => Err(SqlSurfaceError::Internal {
+            detail: "missing function argument at evaluation time".to_string(),
+        }),
+    }
+}
+
+fn eval_vector_arg<'a>(
     args: &[BoundExpr],
     idx: usize,
     id: u64,
-    embedding: &[f32],
-) -> Result<Vec<f32>, SqlSurfaceError> {
+    embedding: &'a [f32],
+) -> Result<Cow<'a, [f32]>, SqlSurfaceError> {
     match args.get(idx) {
         Some(e) => match eval(e, id, embedding)? {
             ExprValue::Vector(v) => Ok(v),
@@ -948,7 +1078,10 @@ fn eval_scalar_arg(
     }
 }
 
-fn finite_scalar(v: f64, fn_name: &str) -> Result<ExprValue, SqlSurfaceError> {
+/// 非有限値（NaN/∞）を fail-closed に拒否してスカラー値へ包む共通ヘルパー。
+/// `sql::expr_program::ExprProgram::eval` の `WasmCall` ステップも共有する
+/// （Issue #353。fail-closed 判定を 1 箇所に保つ）。
+pub(crate) fn finite_scalar<'a>(v: f64, fn_name: &str) -> Result<ExprValue<'a>, SqlSurfaceError> {
     if !v.is_finite() {
         return Err(SqlSurfaceError::invalid_input(format!(
             "{fn_name}: result is not finite"
@@ -957,7 +1090,16 @@ fn finite_scalar(v: f64, fn_name: &str) -> Result<ExprValue, SqlSurfaceError> {
     Ok(ExprValue::Scalar(v))
 }
 
-fn eval_binary(op: BinOp, l: ExprValue, r: ExprValue) -> Result<ExprValue, SqlSurfaceError> {
+/// 2 項演算を値ベースで評価する（引数式の再帰評価は行わない）。再帰 `eval` の
+/// `BoundExpr::Binary` 分岐と `sql::expr_program::ExprProgram::eval` の
+/// `ExprStep::Binary` 分岐が共有する（Issue #353）。定数畳み込み
+/// （`expr_program::try_fold_scalar`）もここを経由することで、畳み込み結果と
+/// 実行時評価が同一の fail-closed 契約（0 除算・非有限値の `22000`）を持つ。
+pub(crate) fn eval_binary<'a>(
+    op: BinOp,
+    l: ExprValue<'a>,
+    r: ExprValue<'a>,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (l, r) {
             (ExprValue::Scalar(a), ExprValue::Scalar(b)) => {
@@ -1024,7 +1166,11 @@ fn apply_scalar_op(op: BinOp, a: f64, b: f64) -> Result<f64, SqlSurfaceError> {
     Ok(v)
 }
 
-fn apply_vector_scalar_op(op: BinOp, v: &[f32], s: f64) -> Result<ExprValue, SqlSurfaceError> {
+fn apply_vector_scalar_op<'a>(
+    op: BinOp,
+    v: &[f32],
+    s: f64,
+) -> Result<ExprValue<'a>, SqlSurfaceError> {
     if op == BinOp::Div && s == 0.0 {
         return Err(SqlSurfaceError::invalid_input("division by zero"));
     }
@@ -1058,7 +1204,7 @@ fn apply_vector_scalar_op(op: BinOp, v: &[f32], s: f64) -> Result<ExprValue, Sql
         }
         out.push(r32);
     }
-    Ok(ExprValue::Vector(out))
+    Ok(ExprValue::Vector(Cow::Owned(out)))
 }
 
 #[cfg(test)]
@@ -1412,5 +1558,180 @@ mod tests {
         let mut budget = MAX_EXPR_NODES;
         let err = bind_expr(&ident("other"), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- references_embedding（Issue #350） -----------------------------------
+
+    #[test]
+    fn references_embedding_true_for_direct_vector_ref() {
+        assert!(references_embedding(&BoundExpr::VectorRef));
+    }
+
+    #[test]
+    fn references_embedding_false_for_id_and_number_only() {
+        assert!(!references_embedding(&BoundExpr::IdRef));
+        assert!(!references_embedding(&BoundExpr::Number(1.0)));
+        assert!(!references_embedding(&BoundExpr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(BoundExpr::IdRef),
+            rhs: Box::new(BoundExpr::Number(1.0)),
+        }));
+    }
+
+    #[test]
+    fn references_embedding_true_through_builtin_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(
+            &call("vec_norm", vec![ident("embedding")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("vec_norm(embedding) should bind");
+        assert_eq!(ty, ExprType::Scalar);
+        assert!(references_embedding(&bound));
+    }
+
+    #[test]
+    fn references_embedding_true_through_binary_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _ty) = bind_expr(
+            &bin(
+                BinOp::Add,
+                call("vec_norm", vec![ident("embedding")]),
+                num("1"),
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("vec_norm(embedding) + 1 should bind");
+        assert!(references_embedding(&bound));
+    }
+
+    #[test]
+    fn vector_ref_evaluation_borrows_the_row_embedding_without_allocating() {
+        // Issue #352: `VectorRef`（テーブル VECTOR 列の素通し参照）の評価結果は
+        // 行データを複製せず借用する（毎行 Vec 確保の排除）。`Cow::Borrowed` で
+        // あることを固定し、確保が発生していないことを型レベルで検証する。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(&ident("embedding"), &schema, &registry, &mut budget)
+            .expect("bind should succeed");
+        assert_eq!(ty, ExprType::Vector);
+        let embedding = [3.0f32, 4.0, 0.0];
+        let value = eval(&bound, 1, &embedding).expect("eval should succeed");
+        match value {
+            ExprValue::Vector(Cow::Borrowed(v)) => assert_eq!(v, &embedding),
+            other => panic!("expected borrowed vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vec_norm_and_vec_sum_argument_evaluation_borrows_without_allocating() {
+        // Issue #352: 読み取りのみの組み込み関数（`vec_norm`/`vec_sum`）の引数評価
+        // （`eval_vector_arg` 経由）も、`VectorRef` を直接渡す限り借用のまま完結し
+        // ヒープ確保が発生しないことを固定する。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let embedding = [3.0f32, 4.0, 0.0];
+
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _) = bind_expr(
+            &call("vec_norm", vec![ident("embedding")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("bind should succeed");
+        // `vec_norm` 自体は Scalar を返すため、引数評価の借用性は
+        // `eval_vector_arg` を直接呼び出して検証する。
+        if let BoundExpr::Builtin { args, .. } = &bound {
+            let arg_value = eval(&args[0], 1, &embedding).expect("arg eval should succeed");
+            match arg_value {
+                ExprValue::Vector(Cow::Borrowed(v)) => assert_eq!(v, &embedding),
+                other => panic!("expected borrowed vector, got {other:?}"),
+            }
+        } else {
+            panic!("expected Builtin bound expr");
+        }
+    }
+
+    #[test]
+    fn vec_div_result_is_owned_not_borrowed() {
+        // Issue #352: `vec_div` は新しいベクトルを構築するため、結果は
+        // `Cow::Owned`（新規確保）であるべきで、借用元へのエイリアシングであっては
+        // ならない。
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let expr = call("vec_div", vec![ident("embedding"), num("2.0")]);
+        let (bound, _) =
+            bind_expr(&expr, &schema, &registry, &mut budget).expect("bind should succeed");
+        let embedding = [3.0f32, 4.0, 0.0];
+        let value = eval(&bound, 1, &embedding).expect("eval should succeed");
+        match value {
+            ExprValue::Vector(Cow::Owned(v)) => assert_eq!(v, vec![1.5f32, 2.0, 0.0]),
+            other => panic!("expected owned vector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn into_owned_vector_copies_borrowed_without_aliasing_source() {
+        let source = [1.0f32, 2.0, 3.0];
+        let owned = into_owned_vector(Cow::Borrowed(&source[..])).expect("copy should succeed");
+        assert_eq!(owned, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn into_owned_vector_moves_owned_without_reallocating() {
+        let source = vec![1.0f32, 2.0, 3.0];
+        let ptr_before = source.as_ptr();
+        let owned = into_owned_vector(Cow::Owned(source)).expect("move should succeed");
+        // move のみで再確保されていないことをポインタの同一性で確認する。
+        assert_eq!(owned.as_ptr(), ptr_before);
+        assert_eq!(owned, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// PR #373 codex-review 指摘 2 対応の回帰テスト: `sql::expr_program::ExprStep::Builtin`
+    /// の実行時（行ループ）は arity 分の引数を [`MAX_BUILTIN_ARITY`] 長の固定配列
+    /// （ヒープ確保なし）へ積んでから [`apply_builtin`] を呼ぶ。すべての
+    /// [`BuiltinFn`] の arity がこの固定長に収まっていることを網羅的に検証し、
+    /// 将来 arity の大きい組み込み関数が追加された際に固定長バッファの上限
+    /// （実行時は `sql::expr_program::ExprProgram::eval` が `Internal` へ
+    /// fail-closed に拒否する）と乖離しないようにする。
+    #[test]
+    fn builtin_arities_fit_max_arity() {
+        for f in [BuiltinFn::VecNorm, BuiltinFn::VecSum, BuiltinFn::VecDiv] {
+            let (params, _) = builtin_signature(f);
+            assert!(
+                params.len() <= MAX_BUILTIN_ARITY,
+                "{f:?} arity {} exceeds MAX_BUILTIN_ARITY {MAX_BUILTIN_ARITY}",
+                params.len()
+            );
+        }
+    }
+
+    /// [`apply_builtin`] がスライス（`&mut [Option<ExprValue>]`）で引数を受け取り、
+    /// 呼び出し元が `Vec` を所有・生成する必要がないことを確認する
+    /// （PR #373 codex-review 指摘 2 対応）。固定長配列をスタックに確保し、
+    /// スライスとして渡すだけで組み込み関数が評価できることを型レベルで示す
+    /// 実行例。
+    #[test]
+    fn apply_builtin_accepts_fixed_size_array_slice_without_owning_vec() {
+        let mut args: [Option<ExprValue<'_>>; MAX_BUILTIN_ARITY] = [
+            Some(ExprValue::Vector(Cow::Borrowed(&[3.0f32, 4.0][..]))),
+            None,
+        ];
+        let result = apply_builtin(BuiltinFn::VecNorm, &mut args[..1]).expect("should evaluate");
+        match result {
+            ExprValue::Scalar(v) => assert!((v - 5.0).abs() < 1e-9),
+            other => panic!("expected scalar, got {other:?}"),
+        }
     }
 }
