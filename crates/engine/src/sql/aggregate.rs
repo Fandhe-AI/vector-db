@@ -38,6 +38,7 @@ use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{AggregateInput, BoundAggregate};
 use crate::sql::udf_call::ExprValue;
 use crate::storage::{self, StorageError};
@@ -119,20 +120,18 @@ impl Accumulator {
     /// `row_codec::scan_scalar_columns` 結果（借用のまま）。
     /// `scratch` は [`crate::sql::expr_program::ExprProgram::eval`] が使う
     /// スクラッチスタック（呼び出し元の行ループの外で確保し使い回す。Issue #353
-    /// で行ごとの再帰評価をなくすために導入。`ScalarExpr` 以外の入力では
-    /// 参照されない）。`embedding` と `scratch` を同一ライフタイム `'a` で
-    /// 結び、`ExprProgram::eval`（PR #373 codex-review 指摘対応）が
-    /// `embedding` を借用のまま `scratch` 経由で返せるようにする——本関数は
-    /// 戻り値を `f64`（`Scalar`）へ確定させて即座に消費するため、呼び出し元の
-    /// 行ループが次の行で `embedding` スクラッチバッファを再デコード（`&mut`
-    /// 借用）する時点にはこの借用は既に終わっている。
-    pub(crate) fn observe<'a>(
+    /// で行ごとの再帰評価をなくすために導入）。[`StackValue`] は行 `embedding` へ
+    /// の借用を保持しないため（PR #373 codex-review 指摘対応）、`embedding` が
+    /// 行ごとに異なるライフタイムを持つ呼び出し元（`embedding_scratch` を毎行
+    /// `&mut` 上書きデコードする `execute_aggregate`）でも `scratch` を行ループの
+    /// 外から使い回せる。`ScalarExpr` 以外の入力では参照されない。
+    pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
         id: u64,
-        embedding: &'a [f32],
+        embedding: &[f32],
         scanned: &[Option<&str>],
-        scratch: &mut Vec<ExprValue<'a>>,
+        scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
             AggregateInput::AllVisible => self.observe_present(),
@@ -444,6 +443,14 @@ pub(crate) fn execute_aggregate(
     // 使い回せる（`arena.rs::build_filtered_with_rows_and_limits_in_txn` と同じ方針）。
     let mut embedding_scratch: Vec<f32> = Vec::new();
 
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。[`StackValue`] は行 `embedding` への借用を保持しないため、
+    // `embedding_scratch` を毎行 `&mut` で上書きデコードするこのループの外でも
+    // 1 回だけ確保し使い回せる（以前は `Vec<ExprValue<'a>>` を直接積んでおり、
+    // 借用ライフタイムが行ごとに変わることと両立しないため行ごとに新規確保して
+    // いた）。
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
+
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
             let (k, v) = entry.map_err(storage_internal)?;
@@ -499,17 +506,6 @@ pub(crate) fn execute_aggregate(
             }
 
             let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
-
-            // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の
-            // 明示スタック。`embedding_scratch` は本ループが毎行 `&mut` で
-            // 上書きデコードするバッファのため、`ExprValue::Vector` が
-            // `Cow::Borrowed(embedding_scratch)`（Issue #352 の借用契約）を
-            // 保持しうるスタックを行ループの外へ persist させると、次行の
-            // デコードとの間で借用が衝突する（invariance・NLL の限界）。行ごとに
-            // 新規確保する（`Vec::new()` は push まで確保しない）ことで、
-            // embedding 自体の複製は避けつつ、この小さいスタックのみ行単位で
-            // 再生成する。
-            let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。

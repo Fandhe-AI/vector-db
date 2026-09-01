@@ -20,9 +20,20 @@ enum マッチの分岐分散が発生していた。本 Issue は PostgreSQL �
   （短絡評価なし）に評価するため（`BoundExpr` に `And`/`Or` 相当の分岐評価
   ノードは存在しない）、平坦化は再帰 `eval` と同一の評価順・エラー発生順を
   厳密に保つ
-- `ExprProgram::eval(id, embedding, scratch: &mut Vec<ExprValue>)`: 明示スタック
-  （`scratch`）で線形実行する（再帰しない）。`scratch` は行ループの外で 1 回
-  だけ確保し、行ごとに使い回す
+- `ExprProgram::eval(id, embedding, scratch: &mut Vec<StackValue>)`: 明示スタック
+  （`scratch`）で線形実行する（再帰しない）。`StackValue` は行 `embedding` への
+  借用を保持しない値表現（`Scalar`/`Bool`/`VectorRef`〔行 embedding への参照
+  マーカー〕/`VectorOwned`）で、`ExprValue<'a>`（`Cow<'a, [f32]>` を保持し行
+  ごとに異なる借用ライフタイム `'a` を持つ）とは別型にすることで、`scratch` を
+  行ループの外で 1 回だけ確保し、行ごとに使い回せるようにしている（呼び出し元が
+  行フックのクロージャ境界を跨ぐ場合や、`embedding` デコード先バッファを毎行
+  `&mut` 上書きする場合でも、`Vec<StackValue>` は `'a` に紐付かないため
+  persist できる。PR #373 codex-review 指摘対応。詳細は `StackValue` の
+  ドキュメンテーションコメント（`sql/expr_program.rs`）参照）。`ExprStep::Builtin`
+  の実行は、arity 分の `StackValue` を `Vec::drain`（新規バッファ確保なし）で
+  取り出し、行ループの外に持ち出さない固定長スタック配列（`MAX_BUILTIN_ARITY`
+  長。ヒープ確保なし）へ積み替えてから `udf_call::apply_builtin`（`&mut
+  [Option<ExprValue>]` スライスを受け取るシグネチャ）へ渡す
 - 定数畳み込み: コンパイル時にリテラルのみからなるスカラー算術・比較部分式を
   1 回だけ評価し `ConstScalar`/`ConstBool` へ置換する（`try_fold_scalar`）。
   畳み込み中にエラーになる部分式（例: 定数 0 除算）は畳み込まず、平坦化のみ

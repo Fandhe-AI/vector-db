@@ -443,6 +443,16 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。`on_visible_row`（下記クロージャ）は行ごとに異なる late-bound
+    // ライフタイムで `embedding` を受け取るが、[`crate::sql::expr_program::StackValue`]
+    // は借用を保持しないため `embedding` のライフタイムに紐付かない。そのため
+    // このクロージャの外（行ループの外）で 1 回だけ確保し、`&mut` 捕獲で
+    // 行ごとに使い回せる（以前は `ExprValue<'a>` を直接積んでおり、クロージャ
+    // 境界を越える借用の衝突（E0521）を避けるためクロージャ本体のローカルとして
+    // 毎呼び出し新規確保していた）。
+    let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
+
     let on_visible_row = |slot: usize,
                           id: u64,
                           embedding: &[f32],
@@ -467,14 +477,6 @@ pub fn execute_statement(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 return Ok(false);
             }
-            // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の
-            // 明示スタック。`embedding` は `on_visible_row`（本クロージャ）の
-            // 呼び出しごとに異なる late-bound ライフタイムを持つため、外側で
-            // 捕獲した変数へ persist させると（`ExprValue::Vector` が
-            // `Cow::Borrowed(embedding)` を保持しうる契約と衝突し）借用が
-            // クロージャ境界を越えて漏れる（E0521）。クロージャ本体のローカル
-            // として毎呼び出し新規確保する（`Vec::new()` は push まで確保しない）。
-            let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
             // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
             // 既存のメタデータフィルタと同じ SCALAR 段の一部として事前適用する。可視行
             // （RLS-8 の暗黙適用を通過した行）にのみ到達するため、不可視行では
@@ -759,7 +761,7 @@ pub fn execute_statement(
         // Issue #353: DISTANCE 段の後で事後適用する `expr_filter_programs` の
         // 明示スタック（`on_visible_row` とは別ループのため個別に確保。行数分
         // 使い回す）。
-        let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
+        let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
         for (slot_id, score) in hits {
             // `slot_id` はアリーナのスロット番号（上記参照）。範囲外はデータ不整合
             // として fail-closed に除去する。
@@ -966,7 +968,7 @@ fn project_rows(
             ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
         })
         .collect();
-    let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
+    let mut expr_scratch: Vec<crate::sql::expr_program::StackValue> = Vec::new();
     for (slot_id, score) in hits {
         // ヒットの第 1 要素はアリーナのスロット番号（`execute_statement` の
         // `slot_ids` 参照）。embedding・スカラー列・行 `id` の 3 者すべてを同じ

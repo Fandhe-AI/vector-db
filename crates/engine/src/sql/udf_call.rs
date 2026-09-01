@@ -269,6 +269,14 @@ pub(crate) fn builtin_signature(f: BuiltinFn) -> (&'static [ExprType], ExprType)
     }
 }
 
+/// 組み込み関数の arity（[`builtin_signature`] が返す引数個数）の上限。
+/// `sql::expr_program::ExprStep::Builtin` の実行時、この上限個数の固定配列
+/// （ヒープ確保なし）へ引数を積んでから [`apply_builtin`] を呼ぶために使う
+/// （PR #373 codex-review 指摘対応・追加 `Vec` 確保の排除）。新しい組み込み関数を
+/// 追加してこの上限を超える arity になる場合はここも合わせて引き上げる
+/// （`builtin_arities_fit_max_arity` で全 [`BuiltinFn`] 網羅的に検証する）。
+pub(crate) const MAX_BUILTIN_ARITY: usize = 2;
+
 /// `WHERE`・`ORDER BY` の既存許可名（`allowlist::is_allowed_where_predicate_name`
 /// 等）・組み込み関数名・集計関数名（`allowlist::is_aggregate_function_name`。
 /// TASK-166・SQL-13）と衝突する UDF 名を拒否するための一覧。名前空間を一本化する
@@ -903,40 +911,48 @@ fn eval_builtin<'a>(
     id: u64,
     embedding: &'a [f32],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
-    let mut values = Vec::with_capacity(args.len());
+    // 参照実装（再帰 `eval`）専用の非ホットパス。ステップ列実行
+    // （`sql::expr_program::ExprProgram::eval`）は固定長スタック配列を使う別経路
+    // （下記 `apply_builtin` のシグネチャ参照）を通るため、ここでの `Vec` 確保は
+    // 行ごとのホットパスには影響しない。
+    let mut values: Vec<Option<ExprValue<'a>>> = Vec::with_capacity(args.len());
     for a in args {
-        values.push(eval(a, id, embedding)?);
+        values.push(Some(eval(a, id, embedding)?));
     }
-    apply_builtin(f, values)
+    apply_builtin(f, &mut values)
 }
 
-/// 組み込み関数を値ベースで評価する（引数はすでに評価済みの [`ExprValue`] 列で
-/// 受け取り、式木を再帰評価しない）。[`eval_builtin`]（再帰 `eval` 経由）と
-/// `sql::expr_program::ExprProgram::eval`（`ExprStep::Builtin`。明示スタックから
-/// arity 分 pop した値を渡す）の両方が本関数を共有することで、0 除算・非有限値
-/// （`f64`/`f32` 双方）の fail-closed 契約（`22000`）と `try_reserve_exact` に
-/// よる確保失敗時の `54000` 写像を 1 箇所に保つ（Issue #353）。`args` の要素数が
-/// [`builtin_signature`] の arity と不一致な場合（束縛段の不変条件が崩れた場合の
-/// 保険）は `Internal` として拒否する。
+/// 組み込み関数を値ベースで評価する（引数はすでに評価済みの [`ExprValue`] を
+/// `&mut [Option<ExprValue>]` スライスで受け取り、式木を再帰評価しない）。
+/// [`eval_builtin`]（再帰 `eval` 経由）と `sql::expr_program::ExprProgram::eval`
+/// （`ExprStep::Builtin`。明示スタックから arity 分 pop した値を、行ループの外で
+/// 確保済みの固定長配列へ積んで渡す。PR #373 codex-review 指摘対応・追加 `Vec`
+/// 確保の排除）の両方が本関数を共有することで、0 除算・非有限値（`f64`/`f32`
+/// 双方）の fail-closed 契約（`22000`）と `try_reserve_exact` による確保失敗時の
+/// `54000` 写像を 1 箇所に保つ（Issue #353）。引数はスライスの `Option::take`
+/// で所有権を抜き取る（[`take_vector_arg`]・[`take_scalar_arg`]）ため、呼び出し元
+/// が `Vec` を所有している必要はない。`args` の要素数が [`builtin_signature`] の
+/// arity と不一致な場合（束縛段の不変条件が崩れた場合の保険）は `Internal` として
+/// 拒否する。
 pub(crate) fn apply_builtin<'a>(
     f: BuiltinFn,
-    mut args: Vec<ExprValue<'a>>,
+    args: &mut [Option<ExprValue<'a>>],
 ) -> Result<ExprValue<'a>, SqlSurfaceError> {
     match f {
         BuiltinFn::VecNorm => {
-            let v = take_vector_arg(&mut args, 0)?;
+            let v = take_vector_arg(args, 0)?;
             let sum_sq: f64 = v.iter().map(|&x| (x as f64) * (x as f64)).sum();
             let norm = sum_sq.sqrt();
             finite_scalar(norm, "vec_norm")
         }
         BuiltinFn::VecSum => {
-            let v = take_vector_arg(&mut args, 0)?;
+            let v = take_vector_arg(args, 0)?;
             let sum: f64 = v.iter().map(|&x| x as f64).sum();
             finite_scalar(sum, "vec_sum")
         }
         BuiltinFn::VecDiv => {
-            let v = take_vector_arg(&mut args, 0)?;
-            let s = take_scalar_arg(&mut args, 1)?;
+            let v = take_vector_arg(args, 0)?;
+            let s = take_scalar_arg(args, 1)?;
             if s == 0.0 {
                 return Err(SqlSurfaceError::invalid_input("vec_div: division by zero"));
             }
@@ -970,20 +986,18 @@ pub(crate) fn apply_builtin<'a>(
     }
 }
 
-/// `args[idx]` を `Vector` として取り出す（クローンせず `mem::replace` で
-/// 所有権を移す。プレースホルダは同一インデックスを 2 度取り出さない前提の
-/// 呼び出し規約のため無害な `Scalar(0.0)`）。型不一致・欠落は `Internal`。
+/// `args[idx]` を `Vector` として取り出す（`Option::take` で所有権を移す。
+/// 同一インデックスを 2 度取り出さない呼び出し規約のため、取り出し後の
+/// スロットは `None` のまま残る）。型不一致・欠落は `Internal`。
 fn take_vector_arg<'a>(
-    args: &mut [ExprValue<'a>],
+    args: &mut [Option<ExprValue<'a>>],
     idx: usize,
 ) -> Result<Cow<'a, [f32]>, SqlSurfaceError> {
-    match args.get_mut(idx) {
-        Some(slot) => match std::mem::replace(slot, ExprValue::Scalar(0.0)) {
-            ExprValue::Vector(v) => Ok(v),
-            _ => Err(SqlSurfaceError::Internal {
-                detail: "function argument type mismatch at evaluation time".to_string(),
-            }),
-        },
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Vector(v)) => Ok(v),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
         None => Err(SqlSurfaceError::Internal {
             detail: "missing function argument at evaluation time".to_string(),
         }),
@@ -992,14 +1006,12 @@ fn take_vector_arg<'a>(
 
 /// `args[idx]` を `Scalar` として取り出す（[`take_vector_arg`] と対の値ベース
 /// 抽出ヘルパー）。
-fn take_scalar_arg(args: &mut [ExprValue<'_>], idx: usize) -> Result<f64, SqlSurfaceError> {
-    match args.get_mut(idx) {
-        Some(slot) => match std::mem::replace(slot, ExprValue::Scalar(0.0)) {
-            ExprValue::Scalar(s) => Ok(s),
-            _ => Err(SqlSurfaceError::Internal {
-                detail: "function argument type mismatch at evaluation time".to_string(),
-            }),
-        },
+fn take_scalar_arg(args: &mut [Option<ExprValue<'_>>], idx: usize) -> Result<f64, SqlSurfaceError> {
+    match args.get_mut(idx).and_then(Option::take) {
+        Some(ExprValue::Scalar(s)) => Ok(s),
+        Some(_) => Err(SqlSurfaceError::Internal {
+            detail: "function argument type mismatch at evaluation time".to_string(),
+        }),
         None => Err(SqlSurfaceError::Internal {
             detail: "missing function argument at evaluation time".to_string(),
         }),
@@ -1609,5 +1621,42 @@ mod tests {
         // move のみで再確保されていないことをポインタの同一性で確認する。
         assert_eq!(owned.as_ptr(), ptr_before);
         assert_eq!(owned, vec![1.0, 2.0, 3.0]);
+    }
+
+    /// PR #373 codex-review 指摘 2 対応の回帰テスト: `sql::expr_program::ExprStep::Builtin`
+    /// の実行時（行ループ）は arity 分の引数を [`MAX_BUILTIN_ARITY`] 長の固定配列
+    /// （ヒープ確保なし）へ積んでから [`apply_builtin`] を呼ぶ。すべての
+    /// [`BuiltinFn`] の arity がこの固定長に収まっていることを網羅的に検証し、
+    /// 将来 arity の大きい組み込み関数が追加された際に固定長バッファの上限
+    /// （実行時は `sql::expr_program::ExprProgram::eval` が `Internal` へ
+    /// fail-closed に拒否する）と乖離しないようにする。
+    #[test]
+    fn builtin_arities_fit_max_arity() {
+        for f in [BuiltinFn::VecNorm, BuiltinFn::VecSum, BuiltinFn::VecDiv] {
+            let (params, _) = builtin_signature(f);
+            assert!(
+                params.len() <= MAX_BUILTIN_ARITY,
+                "{f:?} arity {} exceeds MAX_BUILTIN_ARITY {MAX_BUILTIN_ARITY}",
+                params.len()
+            );
+        }
+    }
+
+    /// [`apply_builtin`] がスライス（`&mut [Option<ExprValue>]`）で引数を受け取り、
+    /// 呼び出し元が `Vec` を所有・生成する必要がないことを確認する
+    /// （PR #373 codex-review 指摘 2 対応）。固定長配列をスタックに確保し、
+    /// スライスとして渡すだけで組み込み関数が評価できることを型レベルで示す
+    /// 実行例。
+    #[test]
+    fn apply_builtin_accepts_fixed_size_array_slice_without_owning_vec() {
+        let mut args: [Option<ExprValue<'_>>; MAX_BUILTIN_ARITY] = [
+            Some(ExprValue::Vector(Cow::Borrowed(&[3.0f32, 4.0][..]))),
+            None,
+        ];
+        let result = apply_builtin(BuiltinFn::VecNorm, &mut args[..1]).expect("should evaluate");
+        match result {
+            ExprValue::Scalar(v) => assert!((v - 5.0).abs() < 1e-9),
+            other => panic!("expected scalar, got {other:?}"),
+        }
     }
 }

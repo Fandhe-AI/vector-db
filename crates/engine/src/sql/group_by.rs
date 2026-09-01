@@ -27,6 +27,7 @@ use crate::row_codec;
 use crate::sql::aggregate::{accumulator_bug, storage_internal, try_clone_str, Accumulator};
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{BinOp, ExprValue};
 use crate::storage::{self, StorageError};
@@ -261,6 +262,11 @@ pub(crate) fn execute_grouped_aggregate(
     // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
     // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
     let mut embedding_scratch: Vec<f32> = Vec::new();
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。[`StackValue`] は行 `embedding` への借用を保持しないため、
+    // `embedding_scratch` を毎行 `&mut` で上書きデコードするこのループの外でも
+    // 1 回だけ確保し使い回せる（`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -299,12 +305,6 @@ pub(crate) fn execute_grouped_aggregate(
             }
 
             let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
-
-            // Issue #353・PR #373 codex-review 指摘対応: `aggregate.rs::execute_aggregate`
-            // と同じ理由（`embedding_scratch` の毎行 `&mut` 上書きデコードと、
-            // `Cow::Borrowed` で借用する `ExprValue::Vector` の persist は
-            // invariance の下で両立しない）で、このスタックは行ごとに新規確保する。
-            let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {

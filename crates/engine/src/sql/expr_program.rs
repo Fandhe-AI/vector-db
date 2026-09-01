@@ -42,7 +42,8 @@ use std::sync::Arc;
 
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::udf_call::{
-    self, apply_builtin, finite_scalar, id_as_finite_scalar, BinOp, BoundExpr, BuiltinFn, ExprValue,
+    self, apply_builtin, finite_scalar, id_as_finite_scalar, BinOp, BoundExpr, BuiltinFn,
+    ExprValue, MAX_BUILTIN_ARITY,
 };
 use crate::wasm_udf::WasmUdfBackend;
 
@@ -57,13 +58,22 @@ pub(crate) enum ExprStep {
     ConstBool(bool),
     /// 行 `id` を [`id_as_finite_scalar`] 経由でスカラー値として push する。
     PushId,
-    /// テーブルの `VECTOR` 列（行の `embedding`）をそのまま借用して push する
-    /// （`Cow::Borrowed`。`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐
-    /// （Issue #352）と同じ契約——`vec_norm(embedding)` 等の読み取り専用式では
-    /// 確保・複製が一切発生しない。PR #373 codex-review 指摘対応: 当初実装は
-    /// 毎行 `Vec<f32>` を確保していたが、`ExprProgram::eval` の `embedding`
-    /// 引数と行ループのスクラッチスタックへ同一ライフタイム `'a` を通すことで
-    /// 借用へ戻した）。
+    /// テーブルの `VECTOR` 列（行の `embedding`）への参照を push する。
+    /// スタック格納値は [`StackValue::VectorRef`]（マーカーのみ。借用そのものは
+    /// 保持しない）で、実際の `Cow::Borrowed(embedding)` は `ExprProgram::eval`
+    /// が当該ステップを消費する時点で `embedding` 引数から都度組み立てる
+    /// （`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐（Issue #352）と
+    /// 同じ契約——`vec_norm(embedding)` 等の読み取り専用式では確保・複製が
+    /// 一切発生しない）。PR #373 codex-review 指摘対応: 当初は
+    /// `Vec<ExprValue<'a>>` をスタックに使い `embedding` と同一ライフタイム `'a`
+    /// で行ループの外から使い回そうとしたが、行フックの呼び出し境界ごとに
+    /// `'a` が変わる（`sql::exec::on_visible_row` のようにクロージャで
+    /// `for<'r> Fn(..., &'r [f32], ...)` 相当になる、または
+    /// `sql::aggregate`/`sql::group_by` のように `embedding_scratch` を毎行
+    /// `&mut` 上書きデコードする）呼び出し元では `Vec<ExprValue<'a>>` を
+    /// 行ループの外に persist できず（invariance・NLL の限界）、結局行ごとに
+    /// 新規確保していた。[`StackValue`] は借用を保持しないためこの制約を受けず、
+    /// `Vec<StackValue>` は行ループの外で 1 回だけ確保して使い回せる。
     PushVector,
     /// 組み込み関数呼び出し。arity 分（[`udf_call::builtin_signature`]）を
     /// スタックから pop し、[`apply_builtin`] へ渡す。
@@ -93,6 +103,56 @@ impl PartialEq for ExprStep {
             }
             _ => false,
         }
+    }
+}
+
+/// `ExprProgram::eval` の明示スタックが積む値表現。`ExprValue<'a>` と異なり
+/// 行 embedding への借用をスタック要素の型として持たない（[`ExprStep::PushVector`]
+/// 参照）。これにより `Vec<StackValue>` は行ごとに変わる借用ライフタイムに
+/// 紐付かず、呼び出し元の行ループの外で 1 回だけ確保し使い回せる
+/// （Issue #353・PR #373 codex-review 指摘対応: 行ごとの `Vec::new()` 確保・
+/// 解放を排除する）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum StackValue {
+    Scalar(f64),
+    Bool(bool),
+    /// 現在評価中の行の `embedding` への参照を表すマーカー
+    /// （[`ExprStep::PushVector`] が push する）。実体は `ExprProgram::eval` の
+    /// `embedding: &'a [f32]` 引数から都度解決する。
+    VectorRef,
+    /// 組み込み関数・二項演算が新規構築したベクトル（例: `vec_div`・
+    /// vector×scalar 演算）。行データとは独立した所有データのため、そのまま
+    /// スタックへ持ち回れる。
+    VectorOwned(Vec<f32>),
+}
+
+/// [`StackValue`] を、eval 呼び出しスコープに閉じたライフタイム `'a` を持つ
+/// [`ExprValue`] へ変換する（[`apply_builtin`]・[`udf_call::eval_binary`] へ渡す
+/// 直前にのみ使う。変換結果を `'a` を超えて `Vec<StackValue>` へ書き戻すことは
+/// ない——書き戻しは必ず [`expr_value_to_stack`] を経由し、借用ではなく
+/// マーカー／所有データへ変換し直す）。
+fn stack_to_expr_value(v: StackValue, embedding: &[f32]) -> ExprValue<'_> {
+    match v {
+        StackValue::Scalar(s) => ExprValue::Scalar(s),
+        StackValue::Bool(b) => ExprValue::Bool(b),
+        StackValue::VectorRef => ExprValue::Vector(Cow::Borrowed(embedding)),
+        StackValue::VectorOwned(v) => ExprValue::Vector(Cow::Owned(v)),
+    }
+}
+
+/// [`ExprValue`] を [`StackValue`] へ変換する（[`stack_to_expr_value`] の逆。
+/// [`apply_builtin`]・[`udf_call::eval_binary`] の評価結果をスタックへ積み戻す
+/// ときに使う）。`Cow::Borrowed` は [`ExprStep::PushVector`] 以外の経路
+/// （`apply_builtin`・`udf_call::eval_binary` の各実装）が生成することはなく
+/// （常に `Cow::Owned` で新規構築するか `Scalar`/`Bool` を返す。`udf_call.rs`
+/// 参照）、常に現在行の `embedding` を指す。そのため `Cow::Borrowed` は
+/// [`StackValue::VectorRef`] マーカーへ戻して問題ない。
+fn expr_value_to_stack(v: ExprValue<'_>) -> StackValue {
+    match v {
+        ExprValue::Scalar(s) => StackValue::Scalar(s),
+        ExprValue::Bool(b) => StackValue::Bool(b),
+        ExprValue::Vector(Cow::Borrowed(_)) => StackValue::VectorRef,
+        ExprValue::Vector(Cow::Owned(v)) => StackValue::VectorOwned(v),
     }
 }
 
@@ -257,54 +317,88 @@ impl ExprProgram {
     /// 通常発生しない）、0 除算・非有限値・確保失敗はそれぞれ既存の
     /// `22000`／`54000` 写像を共有する（[`apply_builtin`]・
     /// [`crate::sql::udf_call::eval_binary`] 経由）。
+    ///
+    /// `scratch` は行に依存しない借用のない値表現（[`StackValue`]）を積む
+    /// ため、`embedding` の借用ライフタイム `'a` に紐付かない。呼び出し元は
+    /// `scratch` を行ループの外で 1 回だけ確保し、行ごとに使い回してよい
+    /// （PR #373 codex-review 指摘対応。以前は `Vec<ExprValue<'a>>` をスタックに
+    /// 使っており、行フックの呼び出し境界ごとに変わる `'a` を持つ呼び出し元では
+    /// 行ループの外へ persist できず行ごとの新規確保が必要だった。詳細は
+    /// [`ExprStep::PushVector`] のドキュメント参照）。
     pub(crate) fn eval<'a>(
         &self,
         id: u64,
         embedding: &'a [f32],
-        scratch: &mut Vec<ExprValue<'a>>,
+        scratch: &mut Vec<StackValue>,
     ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
         for step in &self.steps {
             match step {
-                ExprStep::ConstScalar(v) => scratch.push(ExprValue::Scalar(*v)),
-                ExprStep::ConstBool(b) => scratch.push(ExprValue::Bool(*b)),
+                ExprStep::ConstScalar(v) => scratch.push(StackValue::Scalar(*v)),
+                ExprStep::ConstBool(b) => scratch.push(StackValue::Bool(*b)),
                 ExprStep::PushId => {
-                    scratch.push(ExprValue::Scalar(id_as_finite_scalar(id)?));
+                    scratch.push(StackValue::Scalar(id_as_finite_scalar(id)?));
                 }
                 ExprStep::PushVector => {
-                    // Issue #352 の契約を踏襲: 行の embedding をそのまま借用する
-                    // （確保・複製なし）。`eval` のシグネチャで `embedding: &'a
-                    // [f32]` と `scratch: &mut Vec<ExprValue<'a>>` を同一
-                    // ライフタイムで結び、借用したベクトルをスタック経由で返せる
-                    // ようにしている。
-                    scratch.push(ExprValue::Vector(Cow::Borrowed(embedding)));
+                    // マーカーのみを push する（Issue #352 の「借用のみで確保・
+                    // 複製なし」契約は、このマーカーを `stack_to_expr_value` で
+                    // 消費する際に `Cow::Borrowed(embedding)` として復元する
+                    // ことで維持する）。
+                    scratch.push(StackValue::VectorRef);
                 }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
                     if scratch.len() < arity {
                         return Err(stack_underflow());
                     }
+                    if arity > MAX_BUILTIN_ARITY {
+                        // 束縛時（`udf_call::builtin_signature`）が保証する
+                        // 不変条件が崩れた場合の保険（実行時には到達しない）。
+                        // 固定長バッファの上限を超える場合は fail-closed に拒否
+                        // する（PR #373 codex-review 指摘対応・追加 `Vec`
+                        // 確保なしで引数を受け渡すための固定配列。
+                        // `builtin_arities_fit_max_arity` 参照）。
+                        return Err(SqlSurfaceError::Internal {
+                            detail: "builtin arity exceeds compiled argument buffer".to_string(),
+                        });
+                    }
                     let split_at = scratch.len() - arity;
-                    let args = scratch.split_off(split_at);
-                    let result = apply_builtin(*f, args)?;
-                    scratch.push(result);
+                    // `Vec::drain` はタプル末尾（`split_at..`）を in-place で
+                    // 取り除くだけで新規バッファを確保しない（`Vec::split_off`
+                    // と異なり、取り除いた要素用の別 `Vec` を作らない。PR #373
+                    // codex-review 指摘対応）。取り出した [`StackValue`] は
+                    // 行ループの外に持ち出さない固定長配列（スタック確保）へ
+                    // 積み替えてから `apply_builtin` へ渡す。
+                    let mut arg_buf: [Option<ExprValue<'a>>; MAX_BUILTIN_ARITY] = [None, None];
+                    for (slot, value) in arg_buf.iter_mut().zip(scratch.drain(split_at..)) {
+                        *slot = Some(stack_to_expr_value(value, embedding));
+                    }
+                    let result = apply_builtin(*f, &mut arg_buf[..arity])?;
+                    scratch.push(expr_value_to_stack(result));
                 }
                 ExprStep::Binary(op) => {
                     let r = scratch.pop().ok_or_else(stack_underflow)?;
                     let l = scratch.pop().ok_or_else(stack_underflow)?;
-                    let result = udf_call::eval_binary(*op, l, r)?;
-                    scratch.push(result);
+                    let result = udf_call::eval_binary(
+                        *op,
+                        stack_to_expr_value(l, embedding),
+                        stack_to_expr_value(r, embedding),
+                    )?;
+                    scratch.push(expr_value_to_stack(result));
                 }
                 ExprStep::WasmCall { backend } => {
                     let scalar_val = scratch.pop().ok_or_else(stack_underflow)?;
                     let vector_val = scratch.pop().ok_or_else(stack_underflow)?;
                     let v = match vector_val {
-                        ExprValue::Vector(v) => v,
-                        _ => return Err(type_mismatch()),
+                        StackValue::VectorRef => Cow::Borrowed(embedding),
+                        StackValue::VectorOwned(v) => Cow::Owned(v),
+                        StackValue::Scalar(_) | StackValue::Bool(_) => return Err(type_mismatch()),
                     };
                     let s = match scalar_val {
-                        ExprValue::Scalar(s) => s,
-                        _ => return Err(type_mismatch()),
+                        StackValue::Scalar(s) => s,
+                        StackValue::Bool(_)
+                        | StackValue::VectorRef
+                        | StackValue::VectorOwned(_) => return Err(type_mismatch()),
                     };
                     // バックエンドの失敗（deadline 超過・トラップ・メモリ確保
                     // 失敗・`Mutex` poison 等）は種別を問わずすべて `22000` へ
@@ -315,11 +409,12 @@ impl ExprProgram {
                     let result = backend
                         .call_vector_scalar(&v, s)
                         .map_err(|e| SqlSurfaceError::invalid_input(e.to_string()))?;
-                    scratch.push(finite_scalar(result, "wasm udf")?);
+                    scratch.push(expr_value_to_stack(finite_scalar(result, "wasm udf")?));
                 }
             }
         }
-        scratch.pop().ok_or_else(stack_underflow)
+        let result = scratch.pop().ok_or_else(stack_underflow)?;
+        Ok(stack_to_expr_value(result, embedding))
     }
 }
 
@@ -571,5 +666,47 @@ mod tests {
         let program = ExprProgram::compile(&expr);
         assert!(program.steps.len() <= MAX_EXPR_NODES);
         assert!(program.max_stack <= program.steps.len());
+    }
+
+    /// PR #373 codex-review 指摘 1 対応の回帰テスト: `scratch`（[`StackValue`]
+    /// スタック）が行ループの外で 1 回だけ確保され、`eval` 呼び出しのたびに
+    /// `Vec::new()` で再確保されないことを検証する。`eval` は先頭で `clear()`
+    /// するのみで容量は保つ契約（本モジュールドキュメント参照）のため、
+    /// 事前に `with_capacity` で確保した容量が複数回の呼び出しを経ても
+    /// 縮小しない（`Vec::new()` に置き換わっていれば容量は 0 へ戻る）ことを
+    /// 確認する。`Builtin`（`vec_norm`）ステップを含む式で検証し、
+    /// `ExprStep::Builtin` の実行（固定長引数バッファ経由。指摘 2 対応）が
+    /// スタック自体の再確保を引き起こさないことも合わせて確かめる。
+    #[test]
+    fn scratch_buffer_retains_capacity_across_repeated_eval_calls() {
+        let expr = bin(
+            BinOp::Gt,
+            BoundExpr::Builtin {
+                f: BuiltinFn::VecNorm,
+                args: vec![BoundExpr::VectorRef],
+            },
+            num(2.0),
+        );
+        let program = ExprProgram::compile(&expr);
+        let embedding = [3.0f32, 4.0];
+
+        let mut scratch: Vec<StackValue> = Vec::with_capacity(8);
+        let reserved_capacity = scratch.capacity();
+        assert!(reserved_capacity >= 8);
+
+        for id in 0..100u64 {
+            let result = program
+                .eval(id, &embedding, &mut scratch)
+                .expect("vec_norm(embedding) > 2.0 should evaluate successfully");
+            assert_eq!(result, ExprValue::Bool(true));
+            // `eval` は `clear()` のみを行うため、事前に確保した容量を
+            // 下回ることはない（`Vec::new()` による再確保であれば容量は 0 に
+            // 戻り、このアサーションが失敗する）。
+            assert!(
+                scratch.capacity() >= reserved_capacity,
+                "scratch capacity shrank at id={id}, indicating a fresh Vec allocation \
+                 inside eval() rather than buffer reuse"
+            );
+        }
     }
 }
