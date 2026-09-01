@@ -61,3 +61,4 @@ ANN 導入時に個別に検証が必要である。
 - タスク: TASK-131（#43・完了）・TASK-132（本メモ）・TASK-133（#44・完了）
 - ビヘイビア: CORE-9・CORE-10
 - 関連ソース: `crates/engine/src/search_engine.rs`・`crates/engine/src/rls.rs`
+- 採否判断材料: `docs/design/ann-index-adoption.md`（Issue #367）
