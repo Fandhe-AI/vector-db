@@ -48,6 +48,7 @@ pub mod ab;
 pub mod accept;
 #[cfg(feature = "contrast-bench")]
 pub mod contrast;
+pub mod dot_kernel;
 pub mod env_report;
 pub mod hybrid_latency;
 pub mod hybrid_profile;

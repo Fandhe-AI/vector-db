@@ -330,6 +330,18 @@ else
 endif
 
 # --------------------------------------------------
+# isa.rs dot カーネルの複数アキュムレータ化マイクロベンチ（Issue #365。crates/engine/benches/dot_kernel_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-dot-kernel
+bench-dot-kernel: ## Issue #365（isa.rs dot カーネルの複数アキュムレータ化）のマイクロベンチを実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench dot_kernel_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-dot-kernel をスキップ"
+endif
+
+# --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------
 
