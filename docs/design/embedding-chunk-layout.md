@@ -90,11 +90,26 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
   - キー: `(tenant_id: &str, chunk_no: u64)`
   - 値: `[version u8 | dim u32 | slot_count u16 | live_count u16 |
     public_live u16 | private_live u16 | slot_bits (2bit/slot: live, visibility) |
-    f32 LE × slot_count × dim]`
+    row_ids (u64 × slot_count) | f32 LE × slot_count × dim]`
+    （`row_ids[slot]` はそのスロットの行 `id`。チャンクはテナント単位キーのため
+    `tenant_id` は補わずに済み、`(tenant_id, row_ids[slot])` で行を一意に特定
+    できる。tombstone 済み・未使用スロットは `id` を 0 埋めのままとし、
+    `slot_bits` の live ビットで判別する — `0` を有効な行 `id` として使わない
+    ことは T1 のコーデック検証に含める）
+  - KNN・`SearchTimeFilter`・`batch_search` はチャンク走査で得たスロットの
+    `row_ids[slot]` から直接 `(tenant_id, id)` を復元し、`user_rows` へは
+    metadata 取得（RLS predicate 評価後、返却対象に絞ってから）のためだけに
+    ポイントルックアップする。`user_rows` の全件走査は発生しない（この逆引きが
+    無いと KNN 結果からの行復元に全件走査が必要になり、本 ADR が狙う per-entry
+    コスト削減が成立しない。codex-review 指摘）
 - 行値（`user_rows`）からは embedding を外し
   `[header | locator(chunk_no u64, slot u16) | metadata]` へ（行フォーマット v3。
   v2 は fail-closed 拒否・マイグレーション非提供の既存方針を維持するか、下記
-  「行単位レイアウトとの互換・移行方針」に従う）
+  「行単位レイアウトとの互換・移行方針」に従う）。この行→チャンクの locator は
+  「行 id からチャンク位置を引く」順方向専用であり、上記 `row_ids` 配列（チャンク
+  →行の逆方向）と役割が異なる。再パック（下記「削除（tombstone）」節）でスロット
+  が移動した場合はチャンク側 `row_ids` の更新に加え、移動した行の `user_rows`
+  locator も同一 txn 内で更新する（`row_ids` と `locator` の不一致を残さない）
 - チャンクは **テナント単位**（キー先頭が `tenant_id`）とし、1 チャンクに複数
   テナントの行を混在させない。理由:
   - RLS の単一照合パス維持（後述「チャンク単位可視性ビットマップ」）
@@ -116,7 +131,10 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
 
 ### 1. チャンクサイズ N
 
-チャンク値バイト量は `N × dim × 4`。見積り例:
+チャンク値バイト量は `N × dim × 4 + N × 8`（f32 ベクトル本体 ＋ 逆引き用
+`row_ids`。header 分は別途数十バイト）。`row_ids` の寄与は dim が小さいほど
+相対的に大きくなる（dim=128 では f32 部 32KiB に対し `row_ids` は 512B ≈ 1.6%）。
+見積り例（f32 部のみ。上記のとおり `row_ids` 分を追加で見込む）:
 
 | dim | N=64 | N=256 | N=1024 |
 | --- | ---- | ----- | ------ |
@@ -126,7 +144,7 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
 
 redb は値を leaf ページへ inline 格納し、値の一部更新は値全体の再書き込み
 （copy-on-write）になる。N を大きくするほど読み取りの償却効率は上がるが、1 行
-更新あたりの書き込み増幅（`N × dim × 4` バイト）が増える。既定候補と上限
+更新あたりの書き込み増幅（`N × dim × 4 + N × 8` バイト）が増える。既定候補と上限
 （`MAX_CHUNK_BYTES` を `MAX_SCAN_TOTAL_BYTES`・`MAX_ARENA_TOTAL_BYTES` と整合する
 確保前検証値として新設）は実測（#362 相当のプロファイル）に基づき別途確定する。
 
@@ -143,6 +161,15 @@ live ビットを落とすのみとする（header 部分のみの更新であ�
 | 遅延コンパクション（バックグラウンド） | 別途スイープ処理で断片化チャンクをまとめて再パック | 実装複雑度が高く、回復契約（RECOVER 系）との整合検証が別途必要 |
 
 初期実装は前者（同一 txn 内・対象チャンクのみ）に限定する案を推奨する。
+
+再パックでスロットが詰め直されると、生き残った行の `slot` が移動する。この移動は
+チャンク値内の `row_ids[slot]`（新スロット位置へ書き直し）と、移動した各行の
+`user_rows` 値の `locator(chunk_no, slot)` の両方を更新して初めて整合する。再パック
+は同一 write txn 内で完結させる（本節冒頭の推奨方式）ため、この 2 箇所の更新も
+同一 txn 内で完結し、commit 境界を跨いだ不整合（`row_ids` は新位置だが `locator`
+が旧位置を指す、または逆）は生じない。crash-test・`power_loss.rs`（下記「7.
+クラッシュ回復・crash-test」節）の検証対象に「再パック後の `row_ids` ⇔ 移動行
+`locator` の相互整合」を明記する。
 
 ### 3. 増分反映（TASK-120）との統合
 
@@ -197,8 +224,8 @@ live ビットを落とすのみとする（header 部分のみの更新であ�
 | ------ | ---- | ---------- |
 | `scripts/crash_test.sh` | `Storage::put` 経路を検証 | チャンク経路用の `crash_tool` サブコマンド追加 |
 | `scripts/crash_test_cross_table.sh` | `BatchWriteTxn::log_batch` を検証 | 3 テーブル（行・チャンク・台帳）横断整合検証への拡張 |
-| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認 |
-| `crates/engine/tests/index_failure_injection.rs`（RECOVER-9） | 再構築処理の途中失敗注入 | チャンク再パック処理の途中失敗で commit 済み行が無傷であることの確認 |
+| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認。`row_ids[slot]` ⇔ `user_rows` 側 `locator` の相互不整合（再パック中の電源断を含む）も同一の fail-closed 検出対象に含める |
+| `crates/engine/tests/index_failure_injection.rs`（RECOVER-9） | 再構築処理の途中失敗注入 | チャンク再パック処理の途中失敗で commit 済み行が無傷であることの確認。途中失敗後も `row_ids` と `locator` が旧配置のまま一貫していること（半端な書き換えが残らないこと）を含める |
 
 `recovery/commit_boundary.rs` の choke point 経由は維持する。
 
@@ -212,7 +239,7 @@ live ビットを落とすのみとする（header 部分のみの更新であ�
 - **副次効果**: 行値から embedding が抜けるため `COUNT(*)`／集計／`GROUP BY`／
   TASK-120 の path 一致走査（metadata のみ参照）で leaf ページあたりの行数が
   増え、ページ読み取り数が減る見込み（dim=128 で行値 ≈540B → ≈60B 程度への縮小）
-- **書き込み**: 1 行挿入/削除あたりチャンク値全体の再書き込み（`N × dim × 4`
+- **書き込み**: 1 行挿入/削除あたりチャンク値全体の再書き込み（`N × dim × 4 + N × 8`
   バイト）が追加コストとなる。TASK-120 の一括投入（ファイル単位で複数行）では
   チャンク単位にまとまるため増幅は相対的に小さいが、単発 DML
   （`insert_row`/`delete_row`/`update_row`）では悪化するため、N の上限設定と
