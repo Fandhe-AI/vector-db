@@ -605,6 +605,60 @@ fn dividing_by_a_zero_norm_vector_is_fail_closed_with_22000() {
     assert_eq!(err.wire_code(), "22000");
 }
 
+/// Issue #353（式評価のステップ列コンパイル化）: `WHERE` 式述語が定数のみから
+/// なる部分式（例: `1/0`）を含む場合、束縛時のステップ列コンパイル
+/// （`sql::expr_program::ExprProgram::compile`）は defer-on-error（畳み込み時に
+/// エラーになる部分式は畳み込まず実行時評価に委ねる）を守るため、可視行が
+/// 1 行も評価されなければクエリ全体は成功する（既存契約「可視行が 1 行も
+/// 評価されなければエラーは発生しない」を、定数畳み込みの導入で変えない）。
+#[test]
+fn constant_subexpression_error_is_deferred_and_does_not_fail_a_query_with_no_visible_rows() {
+    let path = unique_db_path("defer-on-error-empty");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![ColumnDef::new("embedding", ColumnType::Vector(2), false)],
+        ))
+        .expect("create table");
+    // 行を 1 件も投入しない: `WHERE 1/0 > 0` の定数部分式は実行時にのみ評価
+    // されうるが、可視行が存在しないため評価自体が発生しない。
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    let result = expect_query(
+        core.execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT id FROM docs WHERE 1/0 > 0 \
+             ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
+        )
+        .expect("a WHERE clause with an unreached constant-error subexpression must not fail a query with no visible rows"),
+    );
+    assert!(result.rows.is_empty());
+}
+
+/// 上記のちょうど対偶: 可視行が実際に存在する場合、`WHERE 1/0 > 0` の定数
+/// 部分式は行評価のタイミングで評価され、`22000` として fail-closed に拒否
+/// される（畳み込みが「エラーになりうる式を黙って成功扱いにする」方向へ
+/// 縮退していないことの確認）。
+#[test]
+fn constant_subexpression_error_still_fails_a_query_with_a_visible_row() {
+    let (core, _guard) = new_core_with_docs();
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &ctx,
+            &mut session,
+            "SELECT id FROM docs WHERE 1/0 > 0 \
+             ORDER BY embedding <=> '[1.0,0.0,0.0]' LIMIT 1",
+        )
+        .expect_err("a constant 0-division in WHERE must be fail-closed once a row is evaluated");
+    assert_eq!(err.wire_code(), "22000");
+}
+
 #[test]
 fn redefining_a_function_in_the_same_session_is_rejected_with_22000() {
     let (core, _guard) = new_core_with_docs();

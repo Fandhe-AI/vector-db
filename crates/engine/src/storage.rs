@@ -851,17 +851,24 @@ pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
 /// [`decode_row`] の共有前段。embedding・metadata のバイト列へは触れないため、
 /// それらが破損していても本関数の成否には影響しない。
 ///
-/// 呼び出し文脈: [`decode_row`]（フル デコード）と [`decode_row_tenant_and_visibility`]
-/// （ヘッダのみ）の両方がこの関数を呼ぶ。ロジックを 1 箇所に集約することで、
-/// 検証条件（`tenant_len` 上限・UTF-8・空文字列拒否等）が両者で食い違わないようにする。
+/// 呼び出し文脈: [`decode_row`]（フル デコード）・[`decode_row_tenant_and_visibility`]
+/// （ヘッダのみ）に加え、`sql/aggregate.rs`・`sql/group_by.rs` の走査ループ
+/// （TASK-166/167・SQL-13/14）が、ヘッダのみでの可視性判定と本体デコード
+/// （[`decode_row_body_into`]）を分離二段階で行うために直接呼ぶ（Issue #349。
+/// 従来は可視性判定用のヘッダデコードと `decode_row_for_key` 内部の
+/// フルデコード用ヘッダデコードが二重に走っていた）。ロジックを 1 箇所に
+/// 集約することで、検証条件（`tenant_len` 上限・UTF-8・空文字列拒否等）が
+/// 呼び出し元間で食い違わないようにする。
 /// 成功時は `(tenant_id, visibility, visibility バイトの直後のオフセット)` を返す。
+/// このオフセットは [`decode_row_body_into`] へそのまま渡せる（本体デコードの
+/// 再開位置）。
 ///
 /// `tenant_id` は `buf` を借用した `&str`（所有化しない）。呼び出し元は `buf` の
 /// 生存期間中のみこの値を参照できる。ヘッダ比較（可視性判定）の経路を行ごとの
 /// ヒープアロケーションなしで処理するための設計（Issue #174。PR #151 の性能
 /// フォローアップ）。行を所有化して保持する必要がある場合（[`decode_row`] が
 /// `Row` を構築する場合）は、呼び出し元が明示的に `.to_string()` する。
-fn decode_row_header(buf: &[u8]) -> Result<(&str, Visibility, usize)> {
+pub(crate) fn decode_row_header(buf: &[u8]) -> Result<(&str, Visibility, usize)> {
     let version = *buf
         .first()
         .ok_or_else(|| StorageError::Codec("row buffer is empty".to_string()))?;
@@ -965,12 +972,40 @@ pub(crate) fn decode_row_tenant_and_visibility(buf: &[u8]) -> Result<(&str, Visi
 /// SQL-1・TASK-83 条件7: SQL 表層 C1 経路の固定コスト削減。行数に比例する
 /// ヒープ確保回数を削るのが目的で、RLS 判定順序（`predicate` 通過後にのみ
 /// embedding をデコードする契約）は変えない）。
+///
+/// ヘッダデコード（[`decode_row_header`]）を内部で行ってから本体デコード
+/// （[`decode_row_body_into`]）へ委譲する薄いラッパー。呼び出し元が可視性判定の
+/// ためにヘッダを別途デコード済みの場合（`sql/aggregate.rs`・`sql/group_by.rs`。
+/// Issue #349）は、このラッパーではなく [`decode_row_body_into`] を直接呼んで
+/// ヘッダの二重デコードを避けること。
 pub(crate) fn decode_row_embedding_and_metadata_into<'a>(
     buf: &'a [u8],
     out_embedding: &mut Vec<f32>,
 ) -> Result<(u32, &'a [u8])> {
-    let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
+    let (_tenant_id, _visibility, offset) = decode_row_header(buf)?;
+    decode_row_body_into(buf, offset, out_embedding)
+}
 
+/// [`decode_row_embedding_and_metadata_into`] の本体デコード部分（Issue #349 で
+/// ヘッダデコードから分離）。`offset` は [`decode_row_header`] が返した
+/// 「visibility バイトの直後のオフセット」をそのまま渡す——呼び出し元が
+/// 可視性判定のために既にヘッダをデコード済みの場合、本関数はヘッダを
+/// 再デコードしない。`out_embedding`・返り値の契約は
+/// [`decode_row_embedding_and_metadata_into`] と同一。
+///
+/// 呼び出し文脈: `sql/aggregate.rs::execute_aggregate`・
+/// `sql/group_by.rs::execute_grouped_aggregate` の走査ループが、
+/// [`decode_row_header`] で可視性判定した直後にこの関数で本体をデコードする
+/// （二段階デコード。ヘッダを 2 回読まない）。TABLE-12（キー側 `tenant_id` と
+/// ヘッダ側 `tenant_id` の整合検査）は本関数の責務外——呼び出し元が
+/// [`decode_row_header`] の返り値と物理キーを比較して行う（旧
+/// `decode_row_for_key` が担っていた検査の呼び出し元側への移設）。
+pub(crate) fn decode_row_body_into<'a>(
+    buf: &'a [u8],
+    offset: usize,
+    out_embedding: &mut Vec<f32>,
+) -> Result<(u32, &'a [u8])> {
+    let mut offset = offset;
     let dim_field_end = offset
         .checked_add(4)
         .ok_or_else(|| StorageError::Codec("offset overflow at dim field".to_string()))?;
@@ -1044,6 +1079,19 @@ pub(crate) fn decode_row_embedding_and_metadata_into<'a>(
 }
 
 pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
+    decode_row_dim_and_metadata_borrowed(buf).map(|(_dim, metadata)| metadata)
+}
+
+/// [`decode_row_metadata_borrowed`] の dim 込み版。embedding 自体は境界検証のみで
+/// `f32` へ変換・確保しない点は同じだが、次元検証（`schema.vector_dim()` との
+/// 比較）を必要とする呼び出し元向けに `dim` も返す。
+///
+/// 呼び出し文脈: `sql::aggregate.rs`／`sql::group_by.rs` の集計行走査が、
+/// embedding 自体は参照しないが `VECTOR` 列の NULL 判定（`dim == 0`）や次元検証は
+/// 必要とするケース（Issue #350: embedding 非参照集計のデコードスキップ）で使う。
+/// embedding を `Vec<f32>` へ確保する必要がある場合は
+/// [`decode_row_embedding_and_metadata_into`] を使う。
+pub(crate) fn decode_row_dim_and_metadata_borrowed(buf: &[u8]) -> Result<(u32, &[u8])> {
     let (_tenant_id, _visibility, mut offset) = decode_row_header(buf)?;
 
     let dim_field_end = offset
@@ -1110,7 +1158,20 @@ pub(crate) fn decode_row_metadata_borrowed(buf: &[u8]) -> Result<&[u8]> {
         ));
     }
 
-    Ok(metadata_bytes)
+    Ok((dim, metadata_bytes))
+}
+
+/// キー側 `tenant_id`（複合キーの一部）とヘッダ側 `tenant_id`（エンコード済み行
+/// 内容）の整合を検査する（対象ビヘイビア: TABLE-12）。raw `redb` 書き込みや
+/// 将来のバグでキーのテナントと行内容のテナントがずれた行を黙って返さない
+/// fail-closed な検査。[`decode_row_for_key`] から切り出した実体で、embedding を
+/// 完全デコードしない部分デコード経路（Issue #350 の集計走査）でも同じ検査を
+/// 1 本化して再利用する。
+pub(crate) fn verify_row_key_tenant(key_tenant: &str, header_tenant: &str) -> Result<()> {
+    if header_tenant != key_tenant {
+        return Err(StorageError::Codec("row key tenant mismatch".to_string()));
+    }
+    Ok(())
 }
 
 /// [`encode_row`] の逆変換。欠落・不正値はすべて `Err` で拒否する（fail-closed。
@@ -1210,9 +1271,7 @@ pub(crate) fn decode_row(id: u64, buf: &[u8]) -> Result<Row> {
 /// ため既存 variant を再利用する）。
 pub(crate) fn decode_row_for_key(key_tenant: &str, id: u64, raw: &[u8]) -> Result<Row> {
     let row = decode_row(id, raw)?;
-    if row.tenant_id != key_tenant {
-        return Err(StorageError::Codec("row key tenant mismatch".to_string()));
-    }
+    verify_row_key_tenant(key_tenant, &row.tenant_id)?;
     Ok(row)
 }
 
@@ -1506,6 +1565,77 @@ mod tests {
         assert_eq!(borrowed_metadata, full.metadata.as_slice());
     }
 
+    // Issue #349: `sql/aggregate.rs`・`sql/group_by.rs` の走査ループが使う
+    // 「ヘッダを 1 回だけデコードし、そのオフセットを本体デコードへ引き継ぐ」経路
+    // （`decode_row_header` → `decode_row_body_into`）が、ヘッダを再デコードする
+    // 従来経路（`decode_row_embedding_and_metadata_into`）と同じ結果を返すことを
+    // 確認する（オフセット引き継ぎの正しさの roundtrip 検証）。
+    #[test]
+    fn decode_row_header_then_body_into_matches_decode_row_embedding_and_metadata_into() {
+        let embedding = [4.5_f32, -1.0, 0.0, 9.25, 2.0];
+        let metadata = b"header-body-split";
+        let buf = sample_row(&embedding, metadata);
+
+        let (tenant_id, visibility, offset) = decode_row_header(&buf).expect("header decode");
+        assert_eq!(tenant_id, "tenant-a");
+        assert_eq!(visibility, Visibility::Public);
+
+        let mut scratch_split: Vec<f32> = Vec::new();
+        let (dim_split, metadata_split) =
+            decode_row_body_into(&buf, offset, &mut scratch_split).expect("body decode");
+
+        let mut scratch_direct: Vec<f32> = Vec::new();
+        let (dim_direct, metadata_direct) =
+            decode_row_embedding_and_metadata_into(&buf, &mut scratch_direct)
+                .expect("direct decode");
+
+        assert_eq!(dim_split, dim_direct);
+        assert_eq!(scratch_split, scratch_direct);
+        assert_eq!(metadata_split, metadata_direct);
+    }
+
+    // Issue #349: ヘッダは正常だが本体（dim 超過）が破損している場合、
+    // `decode_row_body_into` は fail-closed に `Err` を返す（ヘッダデコードの
+    // 成否と本体デコードの成否は独立に検証されるべきという契約の確認）。
+    #[test]
+    fn decode_row_body_into_rejects_dim_exceeding_limit() {
+        let mut buf = sample_row(&[1.0_f32], b"m");
+        let (_tenant_id, _visibility, offset) = decode_row_header(&buf).expect("header decode");
+        // dim フィールド（オフセット直後 4 バイト）を上限超過値へ書き換える。
+        let oversized_dim = (MAX_EMBEDDING_DIM + 1).to_le_bytes();
+        buf[offset..offset + 4].copy_from_slice(&oversized_dim);
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row_body_into(&buf, offset, &mut scratch).is_err());
+    }
+
+    // Issue #349: ヘッダは正常だが本体が途中で truncate されている場合も
+    // `decode_row_body_into` は fail-closed に `Err` を返す。
+    #[test]
+    fn decode_row_body_into_rejects_truncated_body() {
+        let buf = sample_row(&[1.0_f32, 2.0, 3.0], b"metadata-here");
+        let (_tenant_id, _visibility, offset) = decode_row_header(&buf).expect("header decode");
+        // embedding の途中で切り詰める（metadata_len・metadata に到達しない）。
+        let truncated = &buf[..offset + 4 + 4];
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row_body_into(truncated, offset, &mut scratch).is_err());
+    }
+
+    // Issue #349: 末尾に余剰バイトが付与された行は `decode_row_body_into` でも
+    // 従来どおり拒否される（`decode_row`/`decode_row_embedding_and_metadata_into`
+    // と同じ「宣言済み metadata 長を超えるバイトを許さない」契約を本体分割後も
+    // 維持することの確認）。
+    #[test]
+    fn decode_row_body_into_rejects_trailing_bytes() {
+        let mut buf = sample_row(&[1.0_f32], b"m");
+        let (_tenant_id, _visibility, offset) = decode_row_header(&buf).expect("header decode");
+        buf.push(0xFF);
+
+        let mut scratch: Vec<f32> = Vec::new();
+        assert!(decode_row_body_into(&buf, offset, &mut scratch).is_err());
+    }
+
     // 呼び出し元（`arena.rs`）は 1 本の `scratch: Vec<f32>` を可視行の走査ループ全体で
     // 使い回す契約（構築時は行数分の `Vec<f32>` を個別確保しない設計。上記対応
     // Issue 参照）。同一次元の行を 2 回デコードしても capacity が伸長しない
@@ -1618,6 +1748,66 @@ mod tests {
         let mut scratch: Vec<f32> = Vec::new();
         assert!(decode_row(1, truncated).is_err());
         assert!(decode_row_embedding_and_metadata_into(truncated, &mut scratch).is_err());
+    }
+
+    // --- decode_row_dim_and_metadata_borrowed / verify_row_key_tenant（Issue #350） ---
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_matches_full_decode() {
+        let embedding = vec![1.0_f32, 2.0, 3.0];
+        let metadata = b"scalar-payload".to_vec();
+        let buf = sample_row(&embedding, &metadata);
+
+        let full = decode_row(1, &buf).expect("full decode");
+        let (dim, borrowed_metadata) =
+            decode_row_dim_and_metadata_borrowed(&buf).expect("dim+metadata decode");
+        assert_eq!(dim as usize, full.embedding.len());
+        assert_eq!(borrowed_metadata, full.metadata.as_slice());
+    }
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_agrees_with_metadata_borrowed_wrapper() {
+        let buf = sample_row(&[1.0, 2.0], b"m");
+        let (_dim, via_dim_fn) =
+            decode_row_dim_and_metadata_borrowed(&buf).expect("dim+metadata decode");
+        let via_wrapper = decode_row_metadata_borrowed(&buf).expect("metadata-only decode");
+        assert_eq!(via_dim_fn, via_wrapper);
+    }
+
+    #[test]
+    fn decode_row_dim_and_metadata_borrowed_rejects_same_corruptions_as_decode_row() {
+        // metadata_len を MAX_METADATA_LEN 超過に書き換えても、`decode_row`（完全
+        // デコード）と同じ理由で `Err` になる（部分デコード経路が検証を弱めない
+        // ことの固定）。
+        let mut buf = sample_row(&[1.0], b"m");
+        let dim_offset = 1 + 2 + "tenant-a".len() + 1;
+        let metadata_len_offset = dim_offset + 4 + 4;
+        let oversized = MAX_METADATA_LEN + 1;
+        buf[metadata_len_offset..metadata_len_offset + 4].copy_from_slice(&oversized.to_le_bytes());
+
+        assert!(decode_row(1, &buf).is_err());
+        assert!(decode_row_dim_and_metadata_borrowed(&buf).is_err());
+    }
+
+    #[test]
+    fn verify_row_key_tenant_accepts_matching_tenant() {
+        assert!(verify_row_key_tenant("tenant-a", "tenant-a").is_ok());
+    }
+
+    #[test]
+    fn verify_row_key_tenant_rejects_mismatched_tenant() {
+        let err = verify_row_key_tenant("tenant-a", "tenant-b").unwrap_err();
+        assert!(matches!(err, StorageError::Codec(_)));
+    }
+
+    #[test]
+    fn decode_row_for_key_and_verify_row_key_tenant_agree_on_mismatch() {
+        // `decode_row_for_key`（完全デコード経路の TABLE-12 検査）と
+        // `verify_row_key_tenant`（部分デコード経路が再利用する切り出し済み検査）
+        // が同じ入力に対して同じ結論（拒否）に達することを確認する。
+        let buf = sample_row(&[1.0], b"m");
+        assert!(decode_row_for_key("tenant-b", 1, &buf).is_err());
+        assert!(verify_row_key_tenant("tenant-b", "tenant-a").is_err());
     }
 
     // TASK-133 P1 対応: 書き込みコミットのたびに世代カウンタが単調増加し、無関係な

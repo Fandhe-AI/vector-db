@@ -1,13 +1,41 @@
 # SQL 表層 VectorArena のテーブル世代整合キャッシュ化
 
-- ステータス: Accepted（本コミットで実装）
+- ステータス: Accepted（PR #379 の初期実装後、codex-review P1・Cursor Bugbot
+  指摘対応を経て確定）
 - 対応: Issue #363（`perf(engine): VectorArena のテーブル世代整合キャッシュ化（SQL 表層への拡張）`）
 - 前提: TASK-169（`crates/engine/src/core.rs::PrefilterCache`。Rust API 直呼び経路
   `EngineCore::search` 用の世代整合キャッシュ）、`crates/engine/src/catalog.rs`
   のテーブル単位世代カウンタ（`table_generation_in_txn`／`bump_table_generation_in_txn`。
   `USING PLAN` の I/O 前後照合が使う源泉と同一）、Issue #285
   （`docs/design/table-generation-rejection-granularity.md`。テーブル単位世代の
-  拒否精度に関する既存判断）
+  拒否精度に関する既存判断）、Issue #357（`sql/sparse_cache.rs::SparseIndexCache`。
+  同じ「テーブル世代整合・fail-closed」契約を先行して確立したキャッシュで、
+  レビュー指摘対応後の設計を本キャッシュがそのまま踏襲する）
+
+## レビュー指摘対応（codex-review P1・Cursor Bugbot）
+
+初期実装（`core.rs` に直置き）に対し、PR #379 で 2 件の指摘を受けた。いずれも
+`sql/sparse_cache.rs::SparseIndexCache`（Issue #357）が同種の指摘を先に受けて
+確立した契約へ揃える形で解消し、実装は `crates/engine/src/sql/arena_cache.rs`
+（新設）へ移設した:
+
+- **P1（`insert` の巻き添え失効）**: `SqlArenaCache::insert` の世代不一致
+  一括破棄（`retain`）が挿入対象テーブル以外のエントリも含めて全件を見ており、
+  無関係な別テーブルの有効なエントリまで誤って破棄していた。テーブルごとに
+  世代カウンタが独立している以上、比較は挿入対象テーブルに限定する必要がある
+  （`retain(|e| e.table != table || e.snapshot.built_table_generation() ==
+  current_generation)` へ修正）。
+- **Bugbot（`lookup` の新しい有効エントリの誤破棄）**: `SqlArenaCache::lookup` は
+  呼び出し元の `read_txn`（古い可能性があるスナップショット）から読んだ世代と
+  一致しないだけでエントリを削除していたため、より新しいスナップショットに
+  とって依然有効なエントリを、古い `read_txn` からの参照だけで消してしまい
+  得た。`storage` から新規 read トランザクションで再読取した「真に最新の」
+  世代と比較し、エントリがそれより厳密に古いと確認できた場合のみ破棄する
+  よう修正（`SqlArenaCache::lookup` は `storage` 引数を追加）。
+
+これに伴い `SqlArenaCache::insert` の戻り値も `Option<Arc<SqlArenaSnapshot>>`
+から `Arc<SqlArenaSnapshot>`（`SparseIndexCache::insert` と同じ非対称契約）へ
+変更した。詳細な契約は `sql/arena_cache.rs` のモジュールドキュメント参照。
 
 ## 背景
 
@@ -25,7 +53,7 @@ SQL 表層の SELECT（`crates/engine/src/sql/exec.rs::execute_statement`）は�
 
 ### キャッシュキーと失効源泉
 
-`SqlArenaCache`（`core.rs`）は `PrefilterCache` と同じキー（`(table,
+`SqlArenaCache`（`sql/arena_cache.rs`）は `PrefilterCache` と同じキー（`(table,
 PolicyContext)` 完全一致）・容量管理（エントリ数上限・総バイト上限・LRU 追い出し・
 stale 一括破棄）を踏襲するが、失効判定の世代源泉が異なる:
 
@@ -67,11 +95,23 @@ SQL 表層は 1 クエリが 1 テーブルのみを対象とするため、テ�
 
 ### insert の非対称性
 
-`PrefilterCache::insert` と異なり、`SqlArenaCache::insert` が `None`（＝キャッシュ
-へ反映されなかった）を返しても、呼び出し元はクエリ応答自体には自分の `read_txn`
-で構築済みの結果をそのまま使ってよい。fail-closed が守る対象は「stale な
-**キャッシュ**を別クエリへ供すること」であり、この 1 回限りの自分自身の応答では
-ないため。
+`PrefilterCache::insert` と異なり、`SqlArenaCache::insert` は常に
+`Arc<SqlArenaSnapshot>` を返す（`Option` ではない。レビュー指摘対応で
+`SparseIndexCache::insert` と同じ契約へ統一した）。キャッシュへ反映できたか
+どうかに関わらず、呼び出し元はクエリ応答自体には自分の `read_txn` で構築済みの
+結果をそのまま使ってよい。fail-closed が守る対象は「stale な**キャッシュ**を
+別クエリへ供すること」であり、この 1 回限りの自分自身の応答ではないため。
+
+### main との統合（`execute_statement_with_cache` の 1 本化）
+
+main には並行して Issue #357（`SparseIndexCache`）が `sql::exec::
+execute_statement_with_cache(..., sparse_cache: Option<SparseCacheAccess>)` を
+追加していた。本キャッシュは同じ関数へ `arena_cache: Option<ArenaCacheAccess>`
+引数を追加する形で統合し（`sql::exec::execute_statement_cached` という別名の
+関数は作らない）、公開ラッパー `execute_statement`（6 引数）は両方に `None` を
+渡す。`core.rs::EngineCore` は `sparse_index_cache`・`sql_arena_cache` の 2
+フィールドをともに保持し、`Statement::Select` アームが両方の `*CacheAccess`
+を組み立てて渡す唯一の production 経路になる。
 
 ## 安全性（テナント境界・fail-closed）
 
@@ -135,6 +175,12 @@ BY ... LIMIT ...`）はこの経路に該当する。
 
 - 単体（`arena.rs::tests`）: `SqlArenaCaptureBuilder` の metadata バイト上限
   超過時の soft-fail（`failed()`・`finish()` が `None`）・予算内での正常完了
+- 単体（`sql/arena_cache.rs::tests`。7 ケース。`sql/sparse_cache.rs::tests` と
+  同型）: 同一世代でのヒット・世代 bump 後の失効・別テナント ctx でのミス・
+  挿入対象自身が既に古い場合はキャッシュへ反映せずスナップショットのみ返す・
+  容量上限での LRU 追い出し、および上記レビュー指摘対応の 2 件（**別テーブルの
+  有効エントリを insert が巻き添え失効させない**・**古い `read_txn` からの
+  lookup がより新しい有効エントリを削除しない**）の回帰固定
 - 結合（`tests/sql_arena_cache.rs`。9 ケース）:
   - 同一世代内の反復でヒットのみ増加し、結果がコールドキャッシュと完全一致
   - `WHERE` 句がキャッシュヒット時も正しく再適用される

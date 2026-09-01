@@ -429,7 +429,7 @@ fn hint_order_distance_first_cache_hit_matches_cold_cache() {
     );
 }
 
-// `sql::exec::execute_statement_cached` の高速経路（WHERE・式述語・hybrid・投影用
+// `sql::exec::execute_statement_with_cache` の高速経路（WHERE・式述語・hybrid・投影用
 // スカラー列参照のいずれも無い場合、SCALAR 段が恒等写像であることを利用して
 // キャッシュ済みスナップショットを行単位コピーなしで直接借用する分岐。
 // `SELECT id ...`〔`sql_c1_bench.rs` の規範形〕がこの経路に該当する）の結果が、

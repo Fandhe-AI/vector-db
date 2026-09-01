@@ -380,7 +380,7 @@ where
     Ok(())
 }
 
-/// `sql::exec::execute_statement_cached`（Issue #363・`SqlArenaCache` ミス時）が、
+/// `sql::exec::execute_statement_with_cache`（Issue #363・`SqlArenaCache` ミス時）が、
 /// redb 走査中に採取した RLS 通過行から、キャッシュ用スナップショット材料
 /// （RLS-only の [`VectorArena`]＋行ごとの metadata 複製）を組み立てる蓄積器。
 ///
@@ -774,7 +774,7 @@ impl VectorArena {
 
     /// [`Self::build_filtered_with_rows_in_txn`] の、RLS 通過行の
     /// `(id, tenant_id, visibility, embedding, metadata)` を追加採取する版（Issue #363・
-    /// `sql::exec::execute_statement_cached` の `SqlArenaCache` ミス時専用）。
+    /// `sql::exec::execute_statement_with_cache` の `SqlArenaCache` ミス時専用）。
     /// `rls_capture` は `on_visible_row`（SCALAR 段）の判定結果に関係なく、RLS 段を
     /// 通過した行ごとに必ず 1 回呼ばれる（[`Self::build_filtered_with_rows_and_limits_in_txn_capturing`]
     /// のドキュメント参照）。
@@ -804,7 +804,7 @@ impl VectorArena {
     /// アリーナを構築する（Issue #363）。`rows` は
     /// [`Self::build_filtered_with_rows_in_txn_capturing`] の `rls_capture` で採取した
     /// 行のみを渡すこと（本関数は RLS 述語を一切評価しない。呼び出し元
-    /// `sql::exec::execute_statement_cached` が、キャッシュ構築時に使った
+    /// `sql::exec::execute_statement_with_cache` が、キャッシュ構築時に使った
     /// `PolicyContext` と本クエリの `PolicyContext` の完全一致をキャッシュ照合
     /// （`SqlArenaCache::lookup`）で保証している契約に依存する。security.md P0
     /// 「テナント分離の検査を外す/緩める/バイパス経路を作らない」: 本関数自体は
@@ -814,7 +814,7 @@ impl VectorArena {
     ///
     /// `source_arena`（RLS 段のみを適用して構築済みの、キャッシュ由来のアリーナ）と
     /// `metadata`（`source_arena` とスロット添字が 1 対 1 に対応する行 metadata の
-    /// 複製。[`crate::core::SqlArenaSnapshot`] が保持する）の行数が一致しない場合は
+    /// 複製。[`crate::sql::arena_cache::SqlArenaSnapshot`] が保持する）の行数が一致しない場合は
     /// 呼び出し元の不変条件違反として fail-closed に `Err` を返す（`[]` での無検査
     /// 添字アクセスを避け、`get`/インデックスアクセサ経由で取得する。
     /// .claude/rules/coding-rust.md 方針）。
@@ -913,7 +913,7 @@ impl VectorArena {
     /// `(id, tenant_id, visibility, embedding, metadata)` を、`on_visible_row`
     /// （SCALAR 段）の判定結果に関係なく必ず 1 回渡す。
     ///
-    /// 呼び出し文脈: `sql::exec::execute_statement_cached`（Issue #363・
+    /// 呼び出し文脈: `sql::exec::execute_statement_with_cache`（Issue #363・
     /// `SqlArenaCache` ミス時）が、クエリ実行そのものの候補構築（`on_visible_row`
     /// による SCALAR 事前フィルタ・hybrid 疎コーパス蓄積等）と**同一の redb 走査**
     /// の中で、次回以降のクエリが再利用できる「RLS 通過行全体」のスナップショット
@@ -1176,7 +1176,7 @@ mod tests {
     // `SqlArenaCaptureBuilder`（Issue #363）: metadata バイト上限超過時は `push` を
     // 静かに無視して `failed()` を立てるだけで `finish()` が `None` を返すことを
     // 確認する（型ドキュメント「容量超過・確保失敗により…」参照）。この経路は
-    // `sql::exec::execute_statement_cached` にとって「キャッシュ登録を諦めるが
+    // `sql::exec::execute_statement_with_cache` にとって「キャッシュ登録を諦めるが
     // クエリ応答は妨げない」唯一の分岐であり、ここが誤って `panic`／`Err` へ
     // 変わるとキャッシュ容量超過だけでクエリ全体が失敗する fail-open ならぬ
     // 過剰拒否のリグレッションになるため固定する。

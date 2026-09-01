@@ -205,12 +205,20 @@ pub(crate) fn bind_expansion(
     // bind_in_session` と同じ束縛結果の形へ直接組み立てる（`expr_filters` を
     // 引き継ぐため、`BoundStatement::new`（`expr_filters: Vec::new()` 固定の
     // 外部向け constructor）は使わない）。
+    // Issue #353: `bind_in_session`（`sql::parser`）と同じく `expr_filters` を
+    // 束縛時に 1 回だけステップ列コンパイルする。
+    let expr_filter_programs = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+
     Ok(BoundStatement {
         table: stmt.table_name().to_string(),
         projection,
         metadata_filters,
         rls_predicate_present,
         expr_filters,
+        expr_filter_programs,
         ranking: Ranking::Hybrid {
             query: query_vector,
             text_column_index,
