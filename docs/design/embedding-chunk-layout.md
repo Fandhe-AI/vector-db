@@ -103,6 +103,15 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
     する（値の内容——0 埋めか直前の生存値の残置かは問わない）。T1 のコーデック
     検証は「非 live スロットの `row_ids` を読まないこと」を対象とし、「`0` を
     無効値として拒否すること」は対象としない）
+  - **`slot_bits` の visibility ビット・header の `public_live`／`private_live`
+    集計値は、いずれも `user_rows` 側行ヘッダの tenant／visibility から** `insert_row`
+    **等の書き込み経路が同一 txn 内で複製した派生値であり、権威（authoritative）
+    な値ではない**。権威は常に `user_rows` 側行ヘッダ（`decode_row_tenant_and_visibility`）
+    にあり、チャンク側の複製はスキップ判定（候補を絞る最適化）にのみ用いてよい。
+    チャンク側の複製と行側ヘッダが不整合（破損・再パックの取りこぼし等）の場合に
+    複製側を信じて行を確定的に可視／不可視と判定することは行わない（下記
+    「点検索を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節の
+    fail-closed 相互検証を参照。codex-review P0 指摘への対応）
   - KNN・`SearchTimeFilter`・`batch_search` はチャンク走査で得たスロットの
     `row_ids[slot]` から直接 `(tenant_id, id)` を復元し、`user_rows` へは
     metadata 取得のためポイントルックアップする。`user_rows` の全件走査は発生
@@ -135,6 +144,34 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
       コピー）に残り、metadata 分の点検索コストは RLS 可視行数に比例したまま
       である点を「コスト見積り」節に反映する（T7 の効果実測でフィルタなし
       クエリとの差を計測する）
+    - **返却直前の権威検証（fail-closed。codex-review P0 指摘への対応）**:
+      KNN（`WHERE` なし）・`SearchTimeFilter`・`batch_search`（metadata 不要述語）
+      は上記のとおりランキング後・返却対象に絞ってから `user_rows` を取得するが、
+      この取得は「metadata を得るため」だけでなく「チャンク側の複製が権威と
+      一致することを確認するため」でもある。この経路（チャンク走査から
+      `row_ids[slot]` を経由した点検索）は `layout: chunked`（v3）のテーブルに
+      限って発生する（`layout: row` のテーブルは `user_vecs` を持たず本節の対象外。
+      上記「物理設計案」節参照）ため、次の 4 点は常にすべて揃って検証できる:
+      1. `row_ids[slot]` と取得した行の `id` が一致する
+      2. チャンクキーの `tenant_id` と取得した行の `tenant_id` が一致する
+      3. 取得した行の `locator(chunk_no, slot)` が走査元の `(chunk_no, slot)` と
+         一致する
+      4. `slot_bits` の visibility ビットと取得した行の visibility が一致する
+      - **一致時（正常系）**: 4 点とも一致した場合に限り、行側の権威値
+        （`decode_row_tenant_and_visibility` が返す tenant／visibility）のみを
+        `PolicyContext::is_visible` へ渡して admission を確定する（チャンク側の
+        複製はこの判定に用いない。上記「物理設計案」節の「単一権威」原則の
+        具体化）
+      - **不一致時**: 1 つでも不一致なら、その行を可視・不可視のどちらとも
+        確定せず、`is_visible` による再判定も行わず、**黙って除外もせず**
+        fail-closed で `Err` を返す（黙って除外すると結果集合が不整合に縮む形で
+        改ざん・破損を隠蔽しうるため）
+      この検証は「返却される行数」分のみに発生し（O(返却行数)。チャンク走査
+      そのものを O(N) から変えない）、本 ADR が狙う per-entry コスト削減の前提
+      （上記コスト見積り）と矛盾しない。誤って admit されたチャンク側複製上の
+      private 行が上位 k 件から可視行を押し出す形で結果集合を歪める可能性が
+      あるため、検証結果は「短い結果集合を黙って返す」のではなく fail-closed
+      エラーとして伝播させる
 - 行値（`user_rows`）の物理レイアウトは、下記「行単位レイアウトとの互換・移行方針」
   で採用する (2) opt-in 方式のもとでは **テーブルのカタログ `layout` 属性に従い
   2 形式が併存する**（codex-review P1 指摘への対応。一律に v3 化するとは規定しない）:
@@ -249,6 +286,19 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
   （可視性判定の順序契約は現行と同じに保つ）
 - header 破損時は「不可視だからスキップ」と判断せず fail-closed で `Err` とする
   （`decode_row_tenant_and_visibility` と同じ理由）
+- **チャンク単位・スロット単位のいずれも、`slot_bits`／header 集計値による判定は
+  「候補を減らす」方向にのみ作用してよく、「候補を確定的に admit する」方向には
+  使わない**（codex-review P0 指摘への対応。上記「物理設計案」節の単一権威
+  原則を可視性ビットマップの運用へ適用したもの）。両者は性質が異なる fail-closed
+  として区別する:
+  - **デコード失敗**（本節冒頭の header 破損）: チャンク値自体が壊れて読めない
+    ケース。「スキップしない＝即 `Err`」とする
+  - **意味的不整合**（チャンク側複製と `user_rows` 側権威値の食い違い）: チャンク
+    値は正常にデコードできるが、複製した visibility／`row_ids` が権威と一致しない
+    ケース。デコードは成功するため本節の判定だけでは検出できず、上記「点検索を
+    行うタイミング」節の「返却直前の権威検証」で検出・`Err` とする。本節の
+    チャンク／スロットスキップは飽くまで走査コスト削減の最適化であり、最終的な
+    RLS 可否の確定はこの返却直前検証が担う
 
 ### 6. アライメント
 
@@ -274,8 +324,8 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
 | ------ | ---- | ---------- |
 | `scripts/crash_test.sh` | `Storage::put` 経路を検証 | チャンク経路用の `crash_tool` サブコマンド追加 |
 | `scripts/crash_test_cross_table.sh` | `BatchWriteTxn::log_batch` を検証 | 3 テーブル（行・チャンク・台帳）横断整合検証への拡張 |
-| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認。`row_ids[slot]` ⇔ `user_rows` 側 `locator` の相互不整合（再パック中の電源断を含む）も同一の fail-closed 検出対象に含める |
-| `crates/engine/tests/index_failure_injection.rs`（RECOVER-9） | 再構築処理の途中失敗注入 | チャンク再パック処理の途中失敗で commit 済み行が無傷であることの確認。途中失敗後も `row_ids` と `locator` が旧配置のまま一貫していること（半端な書き換えが残らないこと）を含める |
+| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認。`row_ids[slot]` ⇔ `user_rows` 側 `locator` の相互不整合（再パック中の電源断を含む）に加え、`slot_bits` visibility ⇔ `user_rows` 側 tenant／visibility の不整合（返却直前の権威検証。上記「点検索を行うタイミング」節参照）も同一の fail-closed 検出対象に含める |
+| `crates/engine/tests/index_failure_injection.rs`（RECOVER-9） | 再構築処理の途中失敗注入 | チャンク再パック処理の途中失敗で commit 済み行が無傷であることの確認。途中失敗後も `row_ids` と `locator` が旧配置のまま一貫していること（半端な書き換えが残らないこと）、および `slot_bits` visibility と行側 tenant／visibility の一致が崩れていないことを含める |
 
 `recovery/commit_boundary.rs` の choke point 経由は維持する。
 
@@ -376,7 +426,19 @@ header の `live_count`／`public_live`／`private_live` 集計値を可視性�
 `user_rows` を一切走査せずに算出できる余地があるが、この最適化は本 ADR の対象外
 （将来検討）とし、T3 では実装しない。`WHERE`・宣言的フィルタ API を伴う集計は
 metadata 参照が必須のため、上記「候補段階での metadata 取得」節と同じ理由で
-`user_rows` 走査（縮小後）を維持する。
+`user_rows` 走査（縮小後）を維持する。**この将来最適化は「物理設計案」節・
+「5. チャンク単位可視性ビットマップ」節で定めた単一権威原則（チャンク側複製は
+候補を減らす方向にのみ使い、確定的な admit には使わない）の唯一の例外候補である
+ことに注意する**。`COUNT(*)` は個々の行を返却しないため返却直前の権威検証
+（行側 `user_rows` の読み取り）を行う対象行が存在せず、上記の検証パターンを
+そのまま適用できない。したがって、この最適化を将来実装する場合は
+`live_count`／`public_live`／`private_live` 集計値そのものの改ざん・破損検出
+（チャンク書き込み経路が同一 txn 内で集計値と行側 tenant／visibility を同時に
+更新することの保証、および集計値と実スロット走査の定期的な整合検証等）を伴う
+別途の整合性保護境界を設計してからでなければ採用しない。この保護境界の設計を
+伴わずに集計値のみで `user_rows` 走査を省略する実装は、本 ADR が禁じる
+「チャンク側複製のみで確定的に可視と判定する」パターンに該当するため採用しない
+（codex-review P0 指摘への対応）。
 
 ## セキュリティ考慮（OWASP Top 10 + AGENTS.md P0）
 
@@ -384,7 +446,7 @@ metadata 参照が必須のため、上記「候補段階での metadata 取得�
 | ---- | ---------------------------- | ------------------------ |
 | private spec 漏えい（P0） | spec 本文・非公開設計議論を転記していない。参照は TASK-nn／ビヘイビア ID／パスのみ。数値は public Issue #344／#361 由来の実測値と本リポ定数に限定 | — |
 | 秘密情報混入（P0） | 実トークン・資格情報は記載していない | — |
-| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。header 破損は fail-closed（スキップしない）。エラーに他テナントの存在情報を含めない |
+| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。header 破損は fail-closed（スキップしない）。エラーに他テナントの存在情報を含めない。**チャンク側 `slot_bits`／header 集計値は `user_rows` 側 tenant／visibility の派生複製であり単一権威ではない**（`user_rows` 側行ヘッダが権威）。複製は候補を減らす最適化にのみ使用し、確定的な admit には使わない。返却直前に権威検証（`row_ids[slot]`・tenant・`locator`・visibility の 4 点突合。この経路は `layout: chunked` に限って発生するため常に 4 点とも検証する）を行い、不一致は黙って除外・再判定せず `Err` とする（「点検索を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節参照） |
 | インジェクション | — | テーブル名は `validate_identifier` 通過後のみ `user_vecs/{table}` へ用いる（`user_rows` と同じ扱い） |
 | 不安全な設計／DoS | — | チャンク header の `slot_count`・`dim`・値長は確保前に上限検証（`MAX_EMBEDDING_DIM`・新設 `MAX_CHUNK_BYTES`）。`checked_*` 演算を用いる。走査総量は `MAX_ARENA_ROWS`／`MAX_ARENA_TOTAL_BYTES` と整合させる |
 | `unsafe`（P1） | — | 導入しない（`isa.rs` 限定テストにより構造的に禁止）。zero-copy 再解釈は採らない |
