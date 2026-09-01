@@ -139,6 +139,56 @@ pub fn run<T>(
     Ok(Measurement { summary, samples })
 }
 
+/// warmup フェーズののち、`workload` の戻り値の解放を計測区間の外側へ追い出す
+/// 計測を行う（[`run`] は戻り値を `black_box` 通過後、計測区間の内側で drop
+/// する契約——モジュールコメント・Issue #302——のため、ヒープ確保を伴う戻り値の
+/// 解放コストが無視できない workload では `run` を使えない）。
+///
+/// `Instant::elapsed()` 取得直後、次回計測の `Instant::now()` より前の
+/// 計測区間の外側でのみ戻り値を扱う。`retain_capacity` 件までを固定容量の
+/// リングバッファへ保持し、超過分は最も古い値と入れ替える（入れ替えによる
+/// 古い値の drop も計測区間の外側で発生する）。同時に生存する戻り値の数は
+/// 常に `retain_capacity` 以下に保たれ、`retain_capacity == 0` なら毎回の
+/// 戻り値を計測直後に即座に drop する（Issue #362 codex-review 指摘・PR #378。
+/// 無条件に全反復分を retain すると `T` のサイズ分だけ反復ごとに常駐メモリが
+/// 積み上がり、後半の反復が前半と異なるページ圧力・アロケータ状態で実行される
+/// ため、同時保持数を一定にしたうえで解放コストそのものも計測区間から除く）。
+///
+/// 戻り値の第 2 要素は、計測フェーズ終了時点でリングバッファに残っていた
+/// 値（呼び出し側が事後に再利用したい場合に使う。不要なら破棄してよい）。
+pub fn run_bounded_retain<T>(
+    config: &MeasurementConfig,
+    retain_capacity: usize,
+    mut workload: impl FnMut() -> T,
+) -> Result<(Measurement, Vec<T>), BenchError> {
+    for _ in 0..config.warmup_iterations {
+        black_box(workload());
+    }
+
+    let mut samples = Vec::with_capacity(config.measured_iterations as usize);
+    let mut retained: Vec<T> = Vec::with_capacity(retain_capacity);
+    let mut next_slot: usize = 0;
+    for _ in 0..config.measured_iterations {
+        let start = Instant::now();
+        let value = black_box(workload());
+        let elapsed = start.elapsed();
+        samples.push(elapsed);
+
+        // ここから先は計測区間の外側（`elapsed` を取得済み）。
+        if retain_capacity == 0 {
+            drop(value);
+        } else if retained.len() < retain_capacity {
+            retained.push(value);
+        } else {
+            let _evicted = std::mem::replace(&mut retained[next_slot], value);
+            next_slot = (next_slot + 1) % retain_capacity;
+        }
+    }
+
+    let summary = stats::summarize(&samples)?;
+    Ok((Measurement { summary, samples }, retained))
+}
+
 /// [`run_fallible`] が 1 試行の失敗をどう扱うかを表す分類（TASK-116・Issue #316）。
 /// 呼び出し元（`tier_latency_bench.rs`）が `classify` クロージャで各エラー値を
 /// 本 enum へ写像する。
