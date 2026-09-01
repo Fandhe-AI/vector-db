@@ -6,8 +6,8 @@
 - 関連ポインタ: `docs/spec/04-behavior/data-model.md`（TABLE-12）・
   `docs/spec/04-behavior/rls.md`・`docs/spec/05-tasks.md`（TASK-75・TASK-89/133 系）。
   spec 本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
-- 関連コード: `crates/engine/src/storage.rs`（`ROWS_TABLE`）・
-  `crates/engine/src/catalog.rs`（`TABLE_GENERATION_TABLE`）・
+- 関連コード: `crates/engine/src/catalog.rs`（テーブルスコープ行ストア
+  `user_rows_table_def(user_rows_table_name(...))`・`TABLE_GENERATION_TABLE`）・
   `crates/engine/src/arena.rs`（`build_filtered_with_rows`）・
   `crates/engine/src/declarative_filter.rs`・`crates/engine/src/sql/plan.rs`
   （`ExecutionPlan`）・`crates/engine/src/policy.rs`（`PolicyContext::is_visible`）
@@ -45,10 +45,13 @@ Phase 1（#345 配下）で行ったデコード段の最適化（`storage::deco
 
 ## 現状の物理構造（事実整理）
 
-- 行ストアは `storage.rs::ROWS_TABLE`（複合キー `(tenant_id, id)` の `redb::TableDefinition`）
-  で、値は `tenant_id` / `visibility` / embedding / metadata を同居させた v2 行エンコー
-  ディング。テーブルごとの行テーブル名は `catalog.rs::user_rows_table_name`
-  経由で解決される
+- SQL テーブルごとの行ストアは `catalog.rs::user_rows_table_def(user_rows_table_name(table_name))`
+  （複合キー `(tenant_id, id)` の動的 `redb::TableDefinition`。テーブル名は
+  `user_rows_table_name` が `table_name` から解決する）で、値は `tenant_id` /
+  `visibility` / embedding / metadata を同居させた v2 行エンコーディング。
+  `storage.rs::ROWS_TABLE`（固定テーブル名 `rows`）は**旧・非テーブルスコープ API 専用**
+  の別テーブルであり、本 ADR の索引対象（SQL 表層の `WHERE` 評価が使う行ストア）では
+  ない——本 ADR の対象外とする
 - `WHERE` 評価は `arena.rs::build_filtered_with_rows` が担い、RLS 述語 `predicate`
   （`tenant_id`・`visibility` のみで判定）→ SCALAR フック `on_visible_row`（等価・前方
   一致）の順で固定。不可視行は `on_visible_row` に到達しない
@@ -85,8 +88,9 @@ B 案は前方一致（`declarative_filter.rs::starts_with` / `parse_prefix_patt
 | Public 横断索引（Index-P） | `(value_key, tenant_id, id)` | `visibility = Public` の行のみ（全テナント） | `policy.rs::PolicyContext::is_visible` が定義するとおり `Public` 行は元々全テナントから可視のため、この層への収録・横断スキャンは新たな漏えいを生まない |
 
 `WHERE` 条件の索引経路は Index-T（自テナント prefix scan）と Index-P（value_key
-prefix scan）の**和集合**を候補として返す。行ストア（`storage.rs::ROWS_TABLE`）
-の物理キーが `(tenant_id, id)` の複合キーであるとおり `id` はテナント内でのみ
+prefix scan）の**和集合**を候補として返す。行ストア（`catalog.rs::user_rows_table_def
+(user_rows_table_name(...))`）の物理キーが `(tenant_id, id)` の複合キーであるとおり
+`id` はテナント内でのみ
 一意な識別子であるため、和集合の重複排除は `id` 単独ではなく `(tenant_id, id)`
 の組で行う（`id` 単独で dedup すると異なるテナントの別行を同一視しうる）。両層
 とも索引ヒット後の可視性再判定（`is_visible` の再適用）は必須で変わらない
@@ -113,10 +117,10 @@ prefix scan）の**和集合**を候補として返す。行ストア（`storage
 
 ## 一貫性（DML 反映・世代整合）
 
-索引エントリの更新は、対応する行の `ROWS_TABLE` への書き込みと**同一の
-`redb::WriteTransaction` 内**でコミットする。redb の write txn は単一トランザクション
-内の複数テーブル書き込みをアトミックにコミットするため、この設計により「行は書けたが
-索引は書けていない」という不整合状態を構造的に排除する。
+索引エントリの更新は、対応する行の `user_rows_table_def(user_rows_table_name(...))`
+への書き込みと**同一の `redb::WriteTransaction` 内**でコミットする。redb の write txn は
+単一トランザクション内の複数テーブル書き込みをアトミックにコミットするため、この設計
+により「行は書けたが索引は書けていない」という不整合状態を構造的に排除する。
 
 具体的なハザードと対応方針:
 
@@ -161,7 +165,8 @@ prefix scan）の**和集合**を候補として返す。行ストア（`storage
 7. **DDL（`ALTER TABLE ADD COLUMN`）時の索引同期**: 現行 `catalog.rs::Storage::
    alter_table_add_column`（808 行目〜）は `CATALOG_TABLE` のスキーマ更新と
    `bump_table_generation_in_txn` のみを同一 `write_txn` で行い、既存行
-   （`ROWS_TABLE`）のバイト列には一切触れない（追加列は暗黙 nullable）。索引対象は
+   （`user_rows_table_def(user_rows_table_name(...))`）のバイト列には一切触れない
+   （追加列は暗黙 nullable）。索引対象は
    列名または `MetadataFilter::column_index` で指定される以上、列追加時点では
    当該列の索引エントリは存在しない（既存行はその列を持たないため対象が無く、
    索引未構築自体は false-negative を生まない）。ただし列追加後の `INSERT` が
