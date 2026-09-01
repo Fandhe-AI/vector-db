@@ -174,6 +174,19 @@ fn percentiles(mut samples: Vec<u64>) -> (u64, u64, u64, u64, u64, f64) {
     (min, pick(0.50), pick(0.95), pick(0.99), max, mean)
 }
 
+/// ベンチの前提条件（クエリ成功・RLS 境界の期待値一致）が破れた場合に、
+/// エラー内容を stderr へ出力してベンチを異常終了させる（fail-closed）。
+/// `std::process::exit` は unwind をスキップし `main` の `CleanupGuard`
+/// （一時 redb ファイル削除）が走らないため、`panic!` で呼び出し元へ
+/// 伝播させ通常の unwind 経路（`Cargo.toml` に `panic = "abort"` の指定は
+/// なく既定の unwind）でクリーンアップを効かせる。構文・実行契約の退行や
+/// テナント境界違反を「エラー生成時間の計測」「`no_leak:false` の記録のみ」
+/// として握りつぶしてベンチが正常終了しないようにする
+/// （PR #380 codex-review P1 指摘・AGENTS.md のテナント境界・fail-closed 基準）。
+fn fail_bench(context: &str, detail: &str) -> ! {
+    panic!("feature_bench: {context}: {detail}");
+}
+
 /// `warmup` 回のウォームアップ後、`iters` 回のレイテンシ（マイクロ秒）を計測する。
 /// `f` の戻り値は `black_box` で消費し、コンパイラによる呼び出し省略を避ける。
 fn measure_us<F: FnMut() -> R, R>(warmup: usize, iters: usize, mut f: F) -> Vec<u64> {
@@ -421,7 +434,9 @@ fn run_ingest(
 
 /// `execute_sql`（セッション不要の SELECT/集計）を warmup+計測ループで実行する
 /// 汎用フェーズヘルパー。事前の 1 回の「プローブ」呼び出しで正当性・行数を確認し、
-/// `extra` へ記録する。
+/// `extra` へ記録する。プローブ・各反復いずれも `Err` を返した場合は構文・実行
+/// 契約の退行を示すため、エラー生成時間を p50/p95 として報告せず [`fail_bench`]
+/// でベンチを止める（PR #380 codex-review P1 指摘）。
 fn run_select_phase(
     name: &'static str,
     core: &EngineCore,
@@ -431,18 +446,24 @@ fn run_select_phase(
     let probe = core.execute_sql(ctx, sql);
     let extra = match &probe {
         Ok(r) => format!("\"ok\":true,\"rows\":{}", r.rows.len()),
-        Err(_) => "\"ok\":false".to_string(),
+        Err(e) => fail_bench(&format!("{name} probe query failed"), &format!("{e:?}")),
     };
     let cpu_before = read_proc_stats().cpu_ticks;
-    let samples = measure_us(WARMUP, ITERS, || core.execute_sql(ctx, sql));
+    let samples = measure_us(WARMUP, ITERS, || match core.execute_sql(ctx, sql) {
+        Ok(r) => r,
+        Err(e) => fail_bench(&format!("{name} iteration query failed"), &format!("{e:?}")),
+    });
     let after = read_proc_stats();
     let cpu_delta = after.cpu_ticks.saturating_sub(cpu_before);
     build_phase(name, samples, after.vm_rss_kb, cpu_delta, extra)
 }
 
 /// `USING MODE '<mode>'` 付きクエリのフェーズ。`precision` は確信度ゲートにより
-/// 空集合を返しうる契約（エラーではない）ため、成功・失敗いずれでもベンチ全体を
-/// 止めず `extra` へ結果を記録する。
+/// 空集合（`SqlOutcome::Query` で 0 行）を返しうる契約（エラーではない）ため
+/// それ自体はベンチを止めない。一方 `Err`（構文・実行契約の退行）や
+/// `SqlOutcome::Query` 以外の想定外の outcome は正常な計測対象ではないため、
+/// エラー生成時間を p50/p95 として報告せず [`fail_bench`] でベンチを止める
+/// （PR #380 codex-review P1 指摘）。
 fn run_mode_phase(
     name: &'static str,
     core: &EngineCore,
@@ -453,13 +474,20 @@ fn run_mode_phase(
     let probe = core.execute_sql_in_session(ctx, &mut probe_session, sql);
     let extra = match &probe {
         Ok(SqlOutcome::Query(r)) => format!("\"ok\":true,\"rows\":{}", r.rows.len()),
-        Ok(_) => "\"ok\":true,\"note\":\"unexpected non-query outcome\"".to_string(),
-        Err(_) => "\"ok\":false,\"note\":\"mode query returned an error\"".to_string(),
+        Ok(_) => fail_bench(
+            &format!("{name} probe query"),
+            "unexpected non-query outcome",
+        ),
+        Err(e) => fail_bench(&format!("{name} probe query failed"), &format!("{e:?}")),
     };
     let cpu_before = read_proc_stats().cpu_ticks;
     let samples = measure_us(WARMUP, ITERS, || {
         let mut session = SessionState::default();
-        core.execute_sql_in_session(ctx, &mut session, sql)
+        match core.execute_sql_in_session(ctx, &mut session, sql) {
+            Ok(SqlOutcome::Query(r)) => r,
+            Ok(_) => fail_bench(&format!("{name} iteration"), "unexpected non-query outcome"),
+            Err(e) => fail_bench(&format!("{name} iteration query failed"), &format!("{e:?}")),
+        }
     });
     let after = read_proc_stats();
     let cpu_delta = after.cpu_ticks.saturating_sub(cpu_before);
@@ -468,7 +496,10 @@ fn run_mode_phase(
 
 /// UDF 呼び出しフェーズ（TASK-79・SQL-9）。`CREATE FUNCTION` はセッションへの
 /// 登録のため計測対象外（1 回だけセットアップし、以降はそのセッションを使い回して
-/// `SELECT ... norm_scale(embedding, 2.0) ...` を計測する）。
+/// `SELECT ... norm_scale(embedding, 2.0) ...` を計測する）。プローブ・各反復が
+/// `Err` あるいは `SqlOutcome::Query` 以外を返した場合は構文・実行契約の退行を
+/// 示すため、エラー生成時間を p50/p95 として報告せず [`fail_bench`] でベンチを
+/// 止める（PR #380 codex-review P1 指摘）。
 fn run_udf_phase(core: &EngineCore, ctx: &PolicyContext, query_vec_literal: &str) -> PhaseStat {
     let mut session = SessionState::default();
     core.execute_sql_in_session(
@@ -484,12 +515,16 @@ fn run_udf_phase(core: &EngineCore, ctx: &PolicyContext, query_vec_literal: &str
     let probe = core.execute_sql_in_session(ctx, &mut session, &sql);
     let extra = match &probe {
         Ok(SqlOutcome::Query(r)) => format!("\"ok\":true,\"rows\":{}", r.rows.len()),
-        Ok(_) => "\"ok\":true,\"note\":\"unexpected non-query outcome\"".to_string(),
-        Err(_) => "\"ok\":false".to_string(),
+        Ok(_) => fail_bench("udf_call probe query", "unexpected non-query outcome"),
+        Err(e) => fail_bench("udf_call probe query failed", &format!("{e:?}")),
     };
     let cpu_before = read_proc_stats().cpu_ticks;
     let samples = measure_us(WARMUP, ITERS, || {
-        core.execute_sql_in_session(ctx, &mut session, &sql)
+        match core.execute_sql_in_session(ctx, &mut session, &sql) {
+            Ok(SqlOutcome::Query(r)) => r,
+            Ok(_) => fail_bench("udf_call iteration", "unexpected non-query outcome"),
+            Err(e) => fail_bench("udf_call iteration query failed", &format!("{e:?}")),
+        }
     });
     let after = read_proc_stats();
     let cpu_delta = after.cpu_ticks.saturating_sub(cpu_before);
@@ -504,14 +539,44 @@ fn count_of(result: &QueryResult) -> Option<u64> {
     }
 }
 
+/// `ctx` の `COUNT(*)` を実行し、成功かつ整数セルが得られた件数を返す。クエリ
+/// エラー・想定外の結果形状はいずれも RLS 境界の検査不能を意味し、実際の漏えいと
+/// 区別できないまま計測を続けてはならないため、[`fail_bench`] で即座にベンチを
+/// 止める（PR #380 codex-review P1 指摘。`.ok()` で件数 0 へ畳み込まない）。
+fn count_visible_rows_or_fail(
+    core: &EngineCore,
+    ctx: &PolicyContext,
+    sql: &str,
+    label: &str,
+) -> u64 {
+    match core.execute_sql(ctx, sql) {
+        Ok(r) => count_of(&r).unwrap_or_else(|| {
+            fail_bench(
+                "RLS isolation check",
+                &format!("{label}: COUNT(*) の結果が整数セルを持たない"),
+            )
+        }),
+        Err(e) => fail_bench(
+            "RLS isolation check",
+            &format!("{label}: COUNT(*) query failed: {e:?}"),
+        ),
+    }
+}
+
 /// フェーズ 11: RLS テナント境界の確認。tenant-a（Public のみ／Public+Private）・
 /// tenant-b（Public のみ）それぞれから見える件数を、[`run_ingest`] が投入した
-/// fixture の期待値（tenant-a: Public `ROWS_A - ROWS_A / TENANT_A_PRIVATE_EVERY_N`・
-/// full `ROWS_A`、tenant-b: Public `ROWS_B`）と個別に照合し、他テナントの行が
-/// 混入していない（=期待値どおりの件数しか見えない）ことを確認する。
-/// tenant-a・tenant-b の Public 件数は 18,000 対 5,000 と非対称であり単純な相互
-/// 一致比較では正しい分離時にも false になるため使わない（Issue #358 PR #380
-/// codex-review 指摘）。計測対象クエリは tenant-b 視点の `COUNT(*)`。
+/// fixture の期待値と照合し、他テナントの行が混入していない（=期待値どおりの
+/// 件数しか見えない）ことを確認する。`PolicyContext::is_visible`（`policy.rs`）は
+/// 許可可視性集合の判定後、可視性ラベルが `Public` であれば行テナントの一致判定
+/// より先に可視と短絡させる（テナント一致判定を経ない）ため、`Public` 行は
+/// テナントを問わず「Public を許可する ctx すべて」から見える（グローバルな
+/// 可視性プール）。したがって各 ctx の期待値は「自テナントの Public 件数」では
+/// なく「全テナントの Public 件数の合計」を基準にする必要がある（各テナント自身
+/// の fixture サイズとのみ比較すると、正しい分離時にも他テナントの Public 行分
+/// だけ実測が期待値を上回り false になる。PR #380 Bugbot 指摘）。件数不一致・
+/// クエリエラーはいずれも [`count_visible_rows_or_fail`] が fail-closed で
+/// ベンチを止めるため、以降の tenant-b 計測へ検査不能なまま進むことはない
+/// （PR #380 codex-review P1 指摘・AGENTS.md のテナント境界・fail-closed 基準）。
 fn run_rls_isolation_phase(
     core: &EngineCore,
     ctx_a_public: &PolicyContext,
@@ -519,42 +584,59 @@ fn run_rls_isolation_phase(
     ctx_b: &PolicyContext,
 ) -> PhaseStat {
     let sql = "SELECT COUNT(*) FROM docs";
-    let count_a_public = core
-        .execute_sql(ctx_a_public, sql)
-        .ok()
-        .and_then(|r| count_of(&r));
-    let count_a_full = core
-        .execute_sql(ctx_a_full, sql)
-        .ok()
-        .and_then(|r| count_of(&r));
-    let count_b = core.execute_sql(ctx_b, sql).ok().and_then(|r| count_of(&r));
+    let count_a_public = count_visible_rows_or_fail(core, ctx_a_public, sql, "tenant-a public");
+    let count_a_full = count_visible_rows_or_fail(core, ctx_a_full, sql, "tenant-a full");
+    let count_b = count_visible_rows_or_fail(core, ctx_b, sql, "tenant-b public");
 
     // fixture（run_ingest）の期待件数。tenant-a は ROWS_A 行中
-    // id % TENANT_A_PRIVATE_EVERY_N == 0 のみ Private（make_batch 参照）。
+    // id % TENANT_A_PRIVATE_EVERY_N == 0 のみ Private（make_batch 参照）、
+    // tenant-b は ROWS_B 行すべて Public。
     let expected_private_a = ROWS_A / TENANT_A_PRIVATE_EVERY_N;
     let expected_public_a = ROWS_A - expected_private_a;
+    // Public は全テナントから見えるグローバルプール（上記ドキュメンテーション
+    // コメント参照）のため、Public を許可する ctx（tenant-a Public のみ・
+    // tenant-b）はいずれも tenant-a と tenant-b の Public 行合計を見る。
+    let expected_public_global = expected_public_a + ROWS_B;
+    let expected_full_a = expected_public_global + expected_private_a;
 
-    // 各コンテキストの件数が fixture の期待値どおりであれば、他テナントの行の
-    // 混入（漏えい）も自テナント内 Private/Public の取り違えも起きていない
-    // （RLS-7/RLS-8 相当の境界確認。数値基準そのものは本ベンチの管轄外）。
-    let no_leak = count_a_public == Some(expected_public_a)
-        && count_a_full == Some(ROWS_A)
-        && count_b == Some(ROWS_B);
-    let private_rows_a = match (count_a_full, count_a_public) {
-        (Some(full), Some(public)) => full.saturating_sub(public),
-        _ => 0,
-    };
+    // fail-closed: 件数が 1 つでも期待値とずれたら、それを `no_leak:false` として
+    // 記録したまま計測を続けず、[`fail_bench`] で即座にベンチを止める
+    // （検査不能と実際のテナント漏えいを区別できないまま成功終了させない）。
+    if count_a_public != expected_public_global {
+        fail_bench(
+            "RLS isolation check",
+            &format!(
+                "tenant-a public COUNT(*) mismatch: expected {expected_public_global}, got {count_a_public}"
+            ),
+        );
+    }
+    if count_a_full != expected_full_a {
+        fail_bench(
+            "RLS isolation check",
+            &format!(
+                "tenant-a full COUNT(*) mismatch: expected {expected_full_a}, got {count_a_full}"
+            ),
+        );
+    }
+    if count_b != expected_public_global {
+        fail_bench(
+            "RLS isolation check",
+            &format!("tenant-b public COUNT(*) mismatch: expected {expected_public_global}, got {count_b}"),
+        );
+    }
+
+    let private_rows_a = count_a_full.saturating_sub(count_a_public);
     let extra = format!(
-        "\"count_tenant_a_public\":{},\"count_tenant_a_full\":{},\"count_tenant_b_public\":{},\
-         \"private_rows_tenant_a\":{private_rows_a},\"no_cross_tenant_leak\":{}",
-        count_a_public.unwrap_or(0),
-        count_a_full.unwrap_or(0),
-        count_b.unwrap_or(0),
-        no_leak,
+        "\"count_tenant_a_public\":{count_a_public},\"count_tenant_a_full\":{count_a_full},\
+         \"count_tenant_b_public\":{count_b},\"private_rows_tenant_a\":{private_rows_a},\
+         \"no_cross_tenant_leak\":true"
     );
 
     let cpu_before = read_proc_stats().cpu_ticks;
-    let samples = measure_us(WARMUP, ITERS, || core.execute_sql(ctx_b, sql));
+    let samples = measure_us(WARMUP, ITERS, || match core.execute_sql(ctx_b, sql) {
+        Ok(r) => r,
+        Err(e) => fail_bench("RLS isolation measurement query failed", &format!("{e:?}")),
+    });
     let after = read_proc_stats();
     let cpu_delta = after.cpu_ticks.saturating_sub(cpu_before);
     build_phase("rls_isolation", samples, after.vm_rss_kb, cpu_delta, extra)
