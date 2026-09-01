@@ -398,7 +398,7 @@ fn wire1_three_tenant_visibility_public_shared_private_hidden() {
             "SELECT * FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
         );
         let _columns = read_row_description(&mut stream);
-        // LIMIT 10 だが可視な Public 行はちょうど 3 件（`allowed_visibilities` が
+        // LIMIT 10 だが可視な Public 行はちょうど 3 件（許可可視性が
         // `Private` を含まないため、他テナントを含む全 `Private` 行は候補にすら
         // 入らない。`VectorArena::build_filtered` が構築時点で除外する）。
         let mut seen_ids = std::collections::BTreeSet::new();
