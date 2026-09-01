@@ -87,10 +87,8 @@ persistence.rs` と同じ「一度 drop してから生 `redb::Database` を再�
 
 | 段 | 内容 |
 | --- | --- |
-| S0-cold | `EngineCore::execute_sql` 経由の SQL 表層 KNN（e2e。`SqlArenaCache` を
-毎回空の状態から測る） |
-| S0-hot | S0-cold と同じクエリを単一 `EngineCore` へ繰り返し、`SqlArenaCache`
-ヒット時のオーバーヘッドを測る |
+| S0-cold | `EngineCore::execute_sql` 経由の SQL 表層 KNN（e2e。`SqlArenaCache` を毎回空の状態から測る） |
+| S0-hot | S0-cold と同じクエリを単一 `EngineCore` へ繰り返し、`SqlArenaCache` ヒット時のオーバーヘッドを測る |
 | S0' | `SELECT COUNT(*) FROM docs`（走査＋ヘッダ＋RLS の SQL 経由クロスチェック） |
 | S1 | 生 `redb::Database` 再オープンでの per-entry 走査のみ |
 | S2 | S1 ＋ ヘッダデコード |
