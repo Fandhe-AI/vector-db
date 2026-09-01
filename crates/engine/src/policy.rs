@@ -11,8 +11,6 @@
 //! TASK-89 / TABLE-9。spec 本文は転記しない）。テーブル単位の物理分離は本タスクの
 //! スコープ外（[`crate::tenant`] のモジュールドキュメント参照）。
 
-use std::collections::HashSet;
-
 use crate::storage::Visibility;
 
 /// [`PolicyContext::new`] の構築時検証で発生するエラー。
@@ -79,22 +77,47 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), PolicyError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyContext {
     tenant_id: String,
-    allowed_visibilities: HashSet<AllowedVisibility>,
+    allowed: AllowedVisibilities,
 }
 
-/// [`PolicyContext`] 内部でのみ使う可視性集合のキー型。`Visibility` は `Eq`/`Hash` を
-/// 持たないため、判定に必要な最小限のラベル種別だけを表す内部型を介する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum AllowedVisibility {
-    Public,
-    Private,
+/// [`PolicyContext`] 内部でのみ使う許可可視性フラグ（Issue #354・呼び出しコスト軽量化。
+/// 契約不変）。
+///
+/// `Visibility` は 2 値（`Public`/`Private`）の閉じた集合であるため、[`std::collections::HashSet`]
+/// による集合表現（`contains` の都度 `SipHash` を計算する）を、構築時に確定する 2 個の
+/// `bool` フラグへ置き換える。`{Public, Private}` の部分集合と `(bool, bool)` は全単射なので、
+/// 導出 `PartialEq`/`Eq` の意味論は元の `HashSet` 版の集合同値と厳密に一致し、
+/// `rls.rs::PrefilterIndex::search` が構築時 ctx と検索時 ctx の完全一致照合に用いる
+/// 契約（TASK-133）は変わらない。判定に使う値の集合が変わるだけで、[`PolicyContext::is_visible`]
+/// の判定順序・チェック回数・fail-closed（空集合 → 両フラグ false → 常に不可視）は不変。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllowedVisibilities {
+    public: bool,
+    private: bool,
 }
 
-impl From<Visibility> for AllowedVisibility {
-    fn from(v: Visibility) -> Self {
-        match v {
-            Visibility::Public => AllowedVisibility::Public,
-            Visibility::Private => AllowedVisibility::Private,
+impl AllowedVisibilities {
+    /// 許可可視性の反復から事前計算する（重複入力は冪等。`HashSet` 挿入と同値）。
+    fn from_visibilities(visibilities: impl IntoIterator<Item = Visibility>) -> Self {
+        let mut allowed = Self {
+            public: false,
+            private: false,
+        };
+        for v in visibilities {
+            match v {
+                Visibility::Public => allowed.public = true,
+                Visibility::Private => allowed.private = true,
+            }
+        }
+        allowed
+    }
+
+    /// 指定した可視性ラベルが許可集合に含まれるか（`HashSet::contains` 相当）。
+    #[inline]
+    fn contains(&self, visibility: Visibility) -> bool {
+        match visibility {
+            Visibility::Public => self.public,
+            Visibility::Private => self.private,
         }
     }
 }
@@ -120,14 +143,12 @@ impl PolicyContext {
         validate_tenant_id(tenant_id)?;
         Ok(Self {
             tenant_id: tenant_id.to_string(),
-            allowed_visibilities: visibilities
-                .into_iter()
-                .map(AllowedVisibility::from)
-                .collect(),
+            allowed: AllowedVisibilities::from_visibilities(visibilities),
         })
     }
 
     /// このコンテキストが属するテナント ID。
+    #[inline]
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
     }
@@ -139,14 +160,19 @@ impl PolicyContext {
     ///
     /// 呼び出し側（検索カーネル・行取得）はこのメソッド以外でテナント比較を
     /// 行わない。
+    ///
+    /// ホットパス（全読み取り経路で毎行・defense-in-depth により最大 2 回呼ばれる。
+    /// Issue #354）のため `#[inline]` を付与する。判定順序（許可可視性集合 → `Public`
+    /// 短絡 → テナント比較）・チェック回数・fail-closed は変更しない。
+    #[inline]
     pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
-        let allowed = self
-            .allowed_visibilities
-            .contains(&AllowedVisibility::from(row_visibility));
-        if !allowed {
+        if !self.allowed.contains(row_visibility) {
             return false;
         }
-        row_visibility == Visibility::Public || row_tenant == self.tenant_id
+        // バイト列の一発比較（memcmp 相当）に確実に落とすため `as_bytes()` で比較する
+        // （Issue #354）。`tenant_id` は `String` のまま保持し `tenant_id()` API・
+        // 構築時検証 `validate_tenant_id` は不変。
+        row_visibility == Visibility::Public || row_tenant.as_bytes() == self.tenant_id.as_bytes()
     }
 
     /// 書き込み認可の単一照合パス（TASK-95・対象ビヘイビア: RECOVER-4）。
@@ -157,8 +183,9 @@ impl PolicyContext {
     /// 呼び出し元（[`crate::tenant`]・[`crate::core`]）はこのメソッド以外で書き込み用の
     /// テナント比較を行わない（security.md P0「テナント分離の検査を外す/緩める/
     /// バイパス経路を作らない」）。
+    #[inline]
     pub fn is_owner(&self, row_tenant: &str) -> bool {
-        row_tenant == self.tenant_id
+        row_tenant.as_bytes() == self.tenant_id.as_bytes()
     }
 }
 
@@ -261,5 +288,45 @@ mod tests {
                 max: crate::storage::MAX_TENANT_ID_LEN,
             }
         );
+    }
+
+    // Issue #354（`AllowedVisibilities` フラグ表現への置換）の回帰: 空の可視性反復から
+    // 構築した ctx はいかなる行も不可視（fail-closed 維持）。
+    #[test]
+    fn empty_visibilities_iterator_makes_everything_invisible() {
+        let ctx =
+            PolicyContext::with_visibilities("tenant-a", std::iter::empty()).expect("valid tenant");
+        assert!(!ctx.is_visible("tenant-a", Visibility::Public));
+        assert!(!ctx.is_visible("tenant-a", Visibility::Private));
+    }
+
+    // Issue #354: 重複を含む可視性反復は冪等（`HashSet` 挿入と同じ意味論）。
+    // 判定結果・ctx の同値性のいずれも重複の有無で変わらない。
+    #[test]
+    fn duplicate_visibilities_are_idempotent() {
+        let dup = PolicyContext::with_visibilities(
+            "tenant-a",
+            [Visibility::Public, Visibility::Public, Visibility::Private],
+        )
+        .expect("valid tenant");
+        let once =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        assert_eq!(dup, once);
+        assert!(dup.is_visible("tenant-a", Visibility::Public));
+        assert!(dup.is_visible("tenant-a", Visibility::Private));
+    }
+
+    // Issue #354: 入力順序が異なっても構築される ctx は同値（集合同値の意味論維持。
+    // `rls.rs::PrefilterIndex::search` の ctx 完全一致照合が入力順序に依存しないことの回帰）。
+    #[test]
+    fn visibility_order_does_not_affect_equality() {
+        let a =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant");
+        let b =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Private, Visibility::Public])
+                .expect("valid tenant");
+        assert_eq!(a, b);
     }
 }
