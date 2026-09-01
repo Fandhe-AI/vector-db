@@ -141,6 +141,47 @@ arena 規模（25,000 行 × dim768）では改善が約 8% にとどまり、DR
 | 768 | 126.10 | 107.79 | 0.855 | Improved |
 | 1536 | 255.86 | 207.92 | 0.813 | Improved |
 
+## 実アセンブリ確認
+
+決定規則の条件3（「実アセンブリで独立アキュムレータ ACC 本が確認できること」）
+の根拠を再現手順として記録する。「参考プロトタイプ実測」節（リポ外の使い捨て
+クレート）とは別に、本実装（`crates/engine` の実 `dot_lanes` 相当構造）の
+`dot_avx2_fma` シンボルを実際に逆アセンブルして確認した。
+
+### 手順
+
+1. `isa.rs` の `dot_avx2_fma` を一時的に「設計」節の 2 段構造（`WIDE = LANES *
+   DOT_ACCUMULATORS` の平坦アキュムレータ配列）へ書き換える（`DOT_ACCUMULATORS`
+   は検証対象の値。baseline 確認時は無変更のまま）。
+2. `cargo bench --bench dot_kernel_bench -p engine --no-run` でビルドし、
+   `target/release/deps/dot_kernel_bench-<hash>` を確認用に退避する。
+3. `nm <バイナリ> | grep dot_avx2_fma` でマングル済みシンボル名
+   （`_ZN6engine3isa12dot_avx2_fma...`）を取得する。
+4. `objdump -d --disassemble='<シンボル名>' -M intel <バイナリ>` で当該関数のみ
+   逆アセンブルする。
+5. 確認後 `isa.rs` を `git checkout -- crates/engine/src/isa.rs` 等で元に戻す
+   （production コードは無変更のまま維持）。
+
+### 確認結果
+
+- **baseline（現行 `dot_lanes::<8>`。1 チェーン）**: 主ループは 4 段 unroll
+  だが、`vfmadd132ps`／`vfmadd231ps` の宛先レジスタが `ymm1` 1 本に畳み込まれる
+  逐次依存チェーンであることを確認した（1 反復内の 4 命令が `ymm1 → ymm1 →
+  ymm1 → ymm0(=ymm1 コピー) → ymm0` と直列に連鎖する）。Issue #362
+  （`docs/design/knn-stage-profile.md`「`dot_lanes` の実アセンブリ確認」節）の
+  既存確認と整合する。
+- **ACC=2**: 主ループの 1 反復に `vfmadd231ps ymm1,...` と
+  `vfmadd231ps ymm2,...` が 2 組（計 4 命令）現れ、`ymm1` 系列と `ymm2` 系列が
+  互いに参照し合わない独立したレジスタ依存チェーンであることを確認した
+  （命令列がインターリーブされ、`ymm1`/`ymm2` それぞれの自己再帰のみで閉じる）。
+- **ACC=4**: 同様に `ymm1`〜`ymm4` の 4 系列が独立して現れ、各系列内でのみ
+  自己再帰する構造を確認した。
+
+以上により、ACC=2・ACC=4 のいずれも「LLVM が `DOT_ACCUMULATORS` 本の独立 FMA
+チェーンへ展開する」という「設計」節の想定どおりの機械語が生成されており、
+決定規則の条件3は両候補とも満たすと判断できる（実測環境: Linux x86_64・検出
+ISA `Avx2Fma`。「本実装での実測結果」節と同一開発環境）。
+
 ## 判断
 
 ACC=2・ACC=4 のいずれも決定規則の条件 1（全 dim で `Regressed` なし）を満たさ
