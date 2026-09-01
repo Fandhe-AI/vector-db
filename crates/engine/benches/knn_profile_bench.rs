@@ -197,19 +197,34 @@ fn main() {
     // 構築コストへ混入する（codex-review 指摘・PR #378）。構築済み `VectorArena`
     // は計測区間外の sink（`batch_bench.rs` と同じパターン）へ退避し、クロージャの
     // 戻り値は軽量な行数のみにすることで解放コストを計測区間外へ追い出す。
-    let s4_total_iterations = (config.warmup_iterations() + config.measured_iterations()) as usize;
-    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(s4_total_iterations);
+    //
+    // sink には計測フェーズ（`measured_iterations`）分の `VectorArena` のみを
+    // 退避する。warmup フェーズ（`run` 内部で計測区間の外側・`Instant` 計測前に
+    // 実行される）分はクロージャ内で即座に drop してよい——warmup の drop は
+    // どのみち計測区間の外なので測定値へ混入しない。これにより sink の同時保持数を
+    // `warmup_iterations + measured_iterations` から `measured_iterations` のみへ
+    // 抑え、後半の反復ほどメモリ常駐量・ページ圧力が測定結果へ混入する度合いを
+    // 半減させる（codex-review 指摘・PR #378。メモリの小さい手動計測環境での
+    // OOM 懸念に対応。`run` は warmup を先に全回実行してから計測フェーズへ入る
+    // 契約〔`protocol.rs`〕のため、呼び出し回数カウンタで両フェーズを判別できる）。
+    let mut s4_call_count: u32 = 0;
+    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(config.measured_iterations() as usize);
     let s4 = run(&config, || {
         let built_arena = VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
             policy_ctx.is_visible(tenant, visibility)
         })
         .expect("arena build must succeed for well-formed synthetic corpus");
         let row_count = built_arena.len();
-        s4_sink.push(built_arena);
+        s4_call_count += 1;
+        if s4_call_count > config.warmup_iterations() {
+            // 計測フェーズ分のみ sink へ退避し、解放を計測区間外（`run` 完了後）へ追い出す。
+            s4_sink.push(built_arena);
+        }
+        // warmup フェーズ分は退避せずここで drop する（計測区間外のため安全）。
         row_count
     })
     .expect("measurement must satisfy protocol minimums");
-    // sink に退避した全 `VectorArena` の解放はここで行い、計測区間の外側にする。
+    // sink に退避した計測フェーズ分の `VectorArena` の解放はここで行い、計測区間の外側にする。
     drop(s4_sink);
     let s4_median = s4.summary.median;
 
