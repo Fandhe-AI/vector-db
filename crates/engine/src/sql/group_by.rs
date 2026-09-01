@@ -258,10 +258,6 @@ pub(crate) fn execute_grouped_aggregate(
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
-    // Issue #353: `ExprProgram::eval` の明示スタック。行ループの外で 1 回だけ
-    // 確保し、WHERE 式述語・`ScalarExpr` 集計項目の評価で使い回す
-    // （`sql::aggregate::execute_aggregate` と同方針）。
-    let mut expr_scratch: Vec<ExprValue> = Vec::new();
     // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
     // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
     let mut embedding_scratch: Vec<f32> = Vec::new();
@@ -303,6 +299,12 @@ pub(crate) fn execute_grouped_aggregate(
             }
 
             let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
+
+            // Issue #353・PR #373 codex-review 指摘対応: `aggregate.rs::execute_aggregate`
+            // と同じ理由（`embedding_scratch` の毎行 `&mut` 上書きデコードと、
+            // `Cow::Borrowed` で借用する `ExprValue::Vector` の persist は
+            // invariance の下で両立しない）で、このスタックは行ごとに新規確保する。
+            let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {

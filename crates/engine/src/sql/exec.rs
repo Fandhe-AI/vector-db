@@ -443,12 +443,6 @@ pub fn execute_statement(
         .len()
         .saturating_mul(std::mem::size_of::<Value>());
 
-    // Issue #353: `expr_program::ExprProgram::eval` の明示スタック。
-    // `on_visible_row`（下記。`FnMut` として `build_filtered_with_rows_in_txn`
-    // へ渡される。`Send`/`Sync` は要求されないため単純な可変借用で足り、
-    // `RefCell`/`Mutex` は不要）が行ごとに使い回す。
-    let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
-
     let on_visible_row = |slot: usize,
                           id: u64,
                           embedding: &[f32],
@@ -473,6 +467,14 @@ pub fn execute_statement(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 return Ok(false);
             }
+            // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の
+            // 明示スタック。`embedding` は `on_visible_row`（本クロージャ）の
+            // 呼び出しごとに異なる late-bound ライフタイムを持つため、外側で
+            // 捕獲した変数へ persist させると（`ExprValue::Vector` が
+            // `Cow::Borrowed(embedding)` を保持しうる契約と衝突し）借用が
+            // クロージャ境界を越えて漏れる（E0521）。クロージャ本体のローカル
+            // として毎呼び出し新規確保する（`Vec::new()` は push まで確保しない）。
+            let mut expr_scratch: Vec<udf_call::ExprValue> = Vec::new();
             // TASK-79（SQL-9）: `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）を
             // 既存のメタデータフィルタと同じ SCALAR 段の一部として事前適用する。可視行
             // （RLS-8 の暗黙適用を通過した行）にのみ到達するため、不可視行では

@@ -120,14 +120,19 @@ impl Accumulator {
     /// `scratch` は [`crate::sql::expr_program::ExprProgram::eval`] が使う
     /// スクラッチスタック（呼び出し元の行ループの外で確保し使い回す。Issue #353
     /// で行ごとの再帰評価をなくすために導入。`ScalarExpr` 以外の入力では
-    /// 参照されない）。
-    pub(crate) fn observe(
+    /// 参照されない）。`embedding` と `scratch` を同一ライフタイム `'a` で
+    /// 結び、`ExprProgram::eval`（PR #373 codex-review 指摘対応）が
+    /// `embedding` を借用のまま `scratch` 経由で返せるようにする——本関数は
+    /// 戻り値を `f64`（`Scalar`）へ確定させて即座に消費するため、呼び出し元の
+    /// 行ループが次の行で `embedding` スクラッチバッファを再デコード（`&mut`
+    /// 借用）する時点にはこの借用は既に終わっている。
+    pub(crate) fn observe<'a>(
         &mut self,
         input: &AggregateInput,
         id: u64,
-        embedding: &[f32],
+        embedding: &'a [f32],
         scanned: &[Option<&str>],
-        scratch: &mut Vec<ExprValue>,
+        scratch: &mut Vec<ExprValue<'a>>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
             AggregateInput::AllVisible => self.observe_present(),
@@ -407,11 +412,6 @@ pub(crate) fn execute_aggregate(
     for item in &bound.items {
         accumulators.push(Accumulator::new(item.func, &item.input)?);
     }
-    // Issue #353: `ExprProgram::eval` の明示スタック。行ループの外で 1 回だけ
-    // 確保し、WHERE 式述語・`ScalarExpr` 集計項目の評価で使い回す
-    // （行ごとの再確保・再帰呼び出しをなくす）。
-    let mut expr_scratch: Vec<ExprValue> = Vec::new();
-
     // `VECTOR` 列を宣言するスキーマのみ次元検証を行う（`VECTOR` 列を持たない
     // テーブルは `row_codec`/`storage` 側で常に埋め込み次元 0 として符号化される
     // ため検証対象がない）。`arena.rs::validated_vector_dim_in_txn` と異なり
@@ -499,6 +499,17 @@ pub(crate) fn execute_aggregate(
             }
 
             let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
+
+            // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の
+            // 明示スタック。`embedding_scratch` は本ループが毎行 `&mut` で
+            // 上書きデコードするバッファのため、`ExprValue::Vector` が
+            // `Cow::Borrowed(embedding_scratch)`（Issue #352 の借用契約）を
+            // 保持しうるスタックを行ループの外へ persist させると、次行の
+            // デコードとの間で借用が衝突する（invariance・NLL の限界）。行ごとに
+            // 新規確保する（`Vec::new()` は push まで確保しない）ことで、
+            // embedding 自体の複製は避けつつ、この小さいスタックのみ行単位で
+            // 再生成する。
+            let mut expr_scratch: Vec<ExprValue> = Vec::new();
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。

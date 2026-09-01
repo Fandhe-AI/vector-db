@@ -57,9 +57,13 @@ pub(crate) enum ExprStep {
     ConstBool(bool),
     /// 行 `id` を [`id_as_finite_scalar`] 経由でスカラー値として push する。
     PushId,
-    /// テーブルの `VECTOR` 列（行の `embedding`）を fail-closed にコピーして
-    /// push する（`try_reserve_exact` で確保成否を確認。`sql::udf_call::eval`
-    /// の `BoundExpr::VectorRef` 分岐と同じ方針）。
+    /// テーブルの `VECTOR` 列（行の `embedding`）をそのまま借用して push する
+    /// （`Cow::Borrowed`。`sql::udf_call::eval` の `BoundExpr::VectorRef` 分岐
+    /// （Issue #352）と同じ契約——`vec_norm(embedding)` 等の読み取り専用式では
+    /// 確保・複製が一切発生しない。PR #373 codex-review 指摘対応: 当初実装は
+    /// 毎行 `Vec<f32>` を確保していたが、`ExprProgram::eval` の `embedding`
+    /// 引数と行ループのスクラッチスタックへ同一ライフタイム `'a` を通すことで
+    /// 借用へ戻した）。
     PushVector,
     /// 組み込み関数呼び出し。arity 分（[`udf_call::builtin_signature`]）を
     /// スタックから pop し、[`apply_builtin`] へ渡す。
@@ -256,7 +260,7 @@ impl ExprProgram {
     pub(crate) fn eval<'a>(
         &self,
         id: u64,
-        embedding: &[f32],
+        embedding: &'a [f32],
         scratch: &mut Vec<ExprValue<'a>>,
     ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
@@ -268,12 +272,12 @@ impl ExprProgram {
                     scratch.push(ExprValue::Scalar(id_as_finite_scalar(id)?));
                 }
                 ExprStep::PushVector => {
-                    let mut out: Vec<f32> = Vec::new();
-                    out.try_reserve_exact(embedding.len()).map_err(|_| {
-                        SqlSurfaceError::payload_too_large("vector value exceeds available memory")
-                    })?;
-                    out.extend_from_slice(embedding);
-                    scratch.push(ExprValue::Vector(Cow::Owned(out)));
+                    // Issue #352 の契約を踏襲: 行の embedding をそのまま借用する
+                    // （確保・複製なし）。`eval` のシグネチャで `embedding: &'a
+                    // [f32]` と `scratch: &mut Vec<ExprValue<'a>>` を同一
+                    // ライフタイムで結び、借用したベクトルをスタック経由で返せる
+                    // ようにしている。
+                    scratch.push(ExprValue::Vector(Cow::Borrowed(embedding)));
                 }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();
@@ -419,9 +423,31 @@ mod tests {
     }
 
     #[test]
-    fn vector_ref_copies_embedding_and_matches_recursive_eval() {
+    fn vector_ref_matches_recursive_eval() {
         let expr = BoundExpr::VectorRef;
         assert_matches_recursive_eval(&expr, 1, &[1.0, 2.0, 3.0]);
+    }
+
+    /// PR #373 codex-review 指摘対応: `ExprStep::PushVector` が行の embedding を
+    /// 確保・複製せず借用のまま返すことを検証する（Issue #352 の
+    /// `sql::udf_call::eval` の `Cow::Borrowed` 契約と同じ挙動を、ステップ列
+    /// コンパイル経由の評価でも維持することの回帰防止）。ポインタ一致
+    /// （`as_ptr`）まで確認し、`Cow::Owned` へコピーされていないことを保証する。
+    #[test]
+    fn vector_ref_borrows_embedding_without_copy() {
+        let expr = BoundExpr::VectorRef;
+        let program = ExprProgram::compile(&expr);
+        let embedding = [1.0f32, 2.0, 3.0];
+        let mut scratch = Vec::new();
+        let value = program
+            .eval(1, &embedding, &mut scratch)
+            .expect("VectorRef eval should succeed");
+        match value {
+            ExprValue::Vector(Cow::Borrowed(borrowed)) => {
+                assert_eq!(borrowed.as_ptr(), embedding.as_ptr());
+            }
+            other => panic!("expected Cow::Borrowed vector, got {other:?}"),
+        }
     }
 
     #[test]
