@@ -10,9 +10,13 @@
 //! # 計測条件（受け入れ条件 2）
 //!
 //! - SQL 表層経路（S0/S0'）は `PrefilterCache`（`core.rs`。`EngineCore::search`
-//!   専用・Rust API 直呼び用）を経由しない。`sql::exec::execute_statement` は
-//!   クエリ毎に `VectorArena::build_filtered_with_rows_in_txn` で候補行を redb から
-//!   再デコードする（`sql_c1_bench.rs` 冒頭コメントの既存事実と同一）。
+//!   専用・Rust API 直呼び用）を経由しない。ただし `sql::exec::execute_statement`
+//!   の `VectorArena` はテーブル単位世代整合キャッシュ（`sql/arena_cache.rs::
+//!   SqlArenaCache`。Issue #363）を経由するため、「クエリ毎に候補行を redb から
+//!   再デコードする e2e コスト」は S0-cold（毎サンプル新規 `EngineCore` で
+//!   `SqlArenaCache` を空の状態から測る）でのみ表れる。S0-hot は同一
+//!   `EngineCore` を使い回し `SqlArenaCache` ヒット時のオーバーヘッドを測る
+//!   （下記「`SqlArenaCache` と S0 の cold/hot 分離」節参照）。
 //! - 既定 provider は `ParallelSearchProvider`（`search_engine::default_engine()`）。
 //!   対照として単線 `CpuScalarProvider` も測定する。
 //!
@@ -167,7 +171,7 @@ fn main() {
         EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
     );
     println!("knn_profile_bench: rows={TOTAL_ROWS} dim={DIM} top_k={TOP_K} (tenant_a={TENANT_A_ROWS} tenant_b={TENANT_B_ROWS})");
-    println!("knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。");
+    println!("knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。");
 
     // --- データ投入: 一時 DB へテナント A・B の行を投入する ---
     let path = unique_db_path("issue362-knn-profile");

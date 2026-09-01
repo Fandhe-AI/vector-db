@@ -22,9 +22,13 @@ embedding <=> '<vec>' LIMIT 10`。25,000 行・dim128）のレイテンシにつ
 ## 計測条件（受け入れ条件 2）
 
 - **SQL 表層経路（S0/S0'）は `PrefilterCache`（`core.rs`。`EngineCore::search`
-  専用・Rust API 直呼び用）を経由しない**。`sql::exec::execute_statement` は
-  クエリ毎に候補行を redb から再デコードする（`sql_c1_bench.rs` 冒頭コメントの
-  既存事実と同一。`crates/engine/benches/sql_c1_bench.rs` 参照）。
+  専用・Rust API 直呼び用）を経由しない**。ただし `sql::exec::execute_statement`
+  の `VectorArena` はテーブル単位世代整合キャッシュ（`sql/arena_cache.rs::
+  SqlArenaCache`。Issue #363）を経由するため、「クエリ毎に候補行を redb から
+  再デコードする e2e コスト」は S0-cold（毎サンプル新規 `EngineCore` で
+  `SqlArenaCache` を空の状態から測る）でのみ表れる。S0-hot は同一
+  `EngineCore` を使い回し `SqlArenaCache` ヒット時のオーバーヘッドを測る
+  （下記「S0 の cold/hot 分離」節参照）。
 - **既定 provider は `ParallelSearchProvider`**（`search_engine::default_engine()`）。
   対照として単線 `CpuScalarProvider` も測定する。
 - コーパス: dim=128・テナント A 20,000 行（Public）＋テナント B 5,000 行
@@ -197,11 +201,15 @@ f32 デコード追加分（S2→S3、54.8 ns/行）と push・所有化・容�
 支配的とする先行仮説とは異なる結果である。
 
 arena 構築（S4、173.1 ns/行）が e2e（S0-cold、648.5 ns/行）に占める比率は約 27%
-にとどまり、**残差（473.4 ns/行。search カーネル〔S5〕を除く SQL 表層固有の
-パース・束縛・`SqlArenaCache` への挿入処理・結果整形等）が e2e の過半（約 73%）を
-占める**（S5 は 9.6 ns/行と e2e の 1.5% 未満で無視できる）。この残差の内訳
-（パース・束縛・キャッシュ挿入・結果整形のどれが支配的か）は本ベンチの対象外
-であり、後続 Issue（#363 の周辺実装・SQL 表層のプロファイル）の材料とする。
+にとどまる。残差は `残差 = S0-cold − (S4 + S5)`（`knn_profile_bench.rs` の
+`s4_plus_s5`/`residual` 算出。S5 は `S5_search_parallel`＝9.6 ns/行）で算出し、
+648.5 − (173.1 + 9.6) = 465.8 ns/行（e2e の約 72%）となる。**残差（465.8 ns/行。
+search カーネル〔S5〕を控除した SQL 表層固有のパース・束縛・`SqlArenaCache`
+への挿入処理・結果整形等）が e2e の過半（約 72%）を占める**（S5 自体は
+9.6 ns/行と e2e の 1.5% 未満で寄与は小さいが、上記のとおり残差の算出では
+控除済み）。この残差の内訳（パース・束縛・キャッシュ挿入・結果整形のどれが
+支配的か）は本ベンチの対象外であり、後続 Issue（#363 の周辺実装・SQL 表層の
+プロファイル）の材料とする。
 
 ### COUNT(*) クロスチェック（S0'）
 
@@ -241,8 +249,8 @@ codex-review 指摘・PR #378）。
 
 **絶対値は環境依存で再現性が低いため、後続 Issue の優先判断には「相対的な内訳の
 構成比」（f32 デコードと push・所有化・容量検証がほぼ同水準で arena 構築コストの
-過半を占め、arena 構築自体は e2e〔S0-cold〕の約 27%・残差が約 73%）を用いるべき
-である**、というのが本 Issue の結論である。
+過半を占め、arena 構築自体は e2e〔S0-cold〕の約 27%・残差（S5 控除後）が約 72%）
+を用いるべきである**、というのが本 Issue の結論である。
 
 ## `dot_lanes` の実アセンブリ確認（受け入れ条件 3）
 
