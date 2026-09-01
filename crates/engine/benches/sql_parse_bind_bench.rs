@@ -158,7 +158,7 @@ fn measure_config(label: &str, row_count: usize) {
 
     // --- (a) validate_sql 単体 ---
     let measurement_a = run(&config, || {
-        validate_sql(&sql, &storage).unwrap_or_else(|e| fail_closed(format!("validate_sql: {e}")));
+        validate_sql(&sql, &storage).unwrap_or_else(|e| fail_closed(format!("validate_sql: {e}")))
     })
     .unwrap_or_else(|e| fail_closed(format!("measurement (a) protocol violation: {e}")));
 
@@ -177,7 +177,7 @@ fn measure_config(label: &str, row_count: usize) {
             .get_table_schema(TABLE)
             .unwrap_or_else(|e| fail_closed(format!("get_table_schema: {e}")));
         bind_in_session(&validated, &schema, session.search_mode(), session.udfs())
-            .unwrap_or_else(|e| fail_closed(format!("bind_in_session: {e}")));
+            .unwrap_or_else(|e| fail_closed(format!("bind_in_session: {e}")))
     })
     .unwrap_or_else(|e| fail_closed(format!("measurement (b) protocol violation: {e}")));
 
@@ -198,7 +198,7 @@ fn measure_config(label: &str, row_count: usize) {
     // 同一 `MeasurementConfig` の単独計測として比較する。
     let measurement_c = run(&config, || {
         core.execute_sql(&ctx, &sql)
-            .unwrap_or_else(|e| fail_closed(format!("execute_sql (c): {e}")));
+            .unwrap_or_else(|e| fail_closed(format!("execute_sql (c): {e}")))
     })
     .unwrap_or_else(|e| fail_closed(format!("measurement (c) protocol violation: {e}")));
 
