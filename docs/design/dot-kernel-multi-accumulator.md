@@ -181,12 +181,14 @@ Issue #365 は本 ADR の実測表・判断根拠をもって**現状維持で c
 # ベンチ・ハーネスをビルド（isa.rs は無変更のまま）
 cargo bench --bench dot_kernel_bench -p engine --no-run
 # ビルド成果物を退避（target/release/deps/ に旧ビルドの成果物が残っていると
-# glob が複数マッチしうるため、最新の実行可能ファイル 1 件を明示的に選ぶ）
-cp "$(find target/release/deps -maxdepth 1 -name 'dot_kernel_bench-*' -type f -executable | head -1)" /path/to/baseline
+# glob が複数マッチしうるため、mtime 降順で最新の実行可能ファイル 1 件を明示的に選ぶ。
+# find の出力順序はファイルシステム依存でタイムスタンプ順の保証が無いため、
+# ここでは ls -t（mtime 降順）で明示的にソートする）
+cp "$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | head -1)" /path/to/baseline
 
 # isa.rs の DOT_ACCUMULATORS を変更（例: 2）して再ビルド
 cargo bench --bench dot_kernel_bench -p engine --no-run
-cp "$(find target/release/deps -maxdepth 1 -name 'dot_kernel_bench-*' -type f -executable | head -1)" /path/to/cand2
+cp "$(ls -t target/release/deps/dot_kernel_bench-* 2>/dev/null | head -1)" /path/to/cand2
 
 # 交互実行して比較（例: 5 回）
 for i in 1 2 3 4 5; do /path/to/baseline; /path/to/cand2; done
