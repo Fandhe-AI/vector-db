@@ -107,51 +107,78 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
     集計値は、いずれも `user_rows` 側行ヘッダの tenant／visibility から** `insert_row`
     **等の書き込み経路が同一 txn 内で複製した派生値であり、権威（authoritative）
     な値ではない**。権威は常に `user_rows` 側行ヘッダ（`decode_row_tenant_and_visibility`）
-    にあり、チャンク側の複製はスキップ判定（候補を絞る最適化）にのみ用いてよい。
-    チャンク側の複製と行側ヘッダが不整合（破損・再パックの取りこぼし等）の場合に
-    複製側を信じて行を確定的に可視／不可視と判定することは行わない（下記
-    「点検索を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節の
-    fail-closed 相互検証を参照。codex-review P0 指摘への対応）
+    にある。この単一権威原則を「admission 方向」と「除外方向」で分けて適用する
+    （下記「権威検証を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節。
+    codex-review P0 指摘への対応。両節の分割契約が唯一の正で、本節はその要約）:
+    - **admission 方向（無条件に保証）**: チャンク側複製の値だけを根拠に行を
+      可視と確定して admit することは一切行わない。ポイントルックアップに到達した
+      候補は必ず `user_rows` 側権威値で検証し、不一致は `Err`（黙って除外しない）
+    - **除外方向（`slot_bits`／header 集計値によるスキップ最適化。保証範囲が
+      限定的）**: この最適化はポイントルックアップに到達する前に候補を減らす
+      ためのものであり、除外判定自体は自己検証されない。正しさは書き込み経路の
+      同一 txn 不変条件（下記「4. 世代整合」・T2）とコミット前後の障害注入検証
+      （T5）に依拠し、コミット後の複製値のみの破損（デコードは成功するが値が
+      誤っている——bit-rot 等）で本来可視な行が誤って除外される事象はクエリ
+      経路では検出できない残存リスクとして明示的に許容する。この残存リスクは
+      T8（下記「5. チャンク単位可視性ビットマップ」節）による帯域外整合性検証が
+      存在することを前提とし、T8 未実装のあいだは `layout: chunked` のチャンク
+      header／`slot_bits` スキップ最適化を有効化しない（`layout: row` は本 ADR の
+      対象外であり影響を受けない）
   - KNN・`SearchTimeFilter`・`batch_search` はチャンク走査で得たスロットの
     `row_ids[slot]` から直接 `(tenant_id, id)` を復元し、`user_rows` へは
     metadata 取得のためポイントルックアップする。`user_rows` の全件走査は発生
     しない（この逆引きが無いと KNN 結果からの行復元に全件走査が必要になり、本
     ADR が狙う per-entry コスト削減が成立しない。codex-review 指摘）。
-    **点検索を行うタイミングは「RLS predicate 通過後・返却対象への絞り込み前」**
-    であり、「最終的な返却行に絞ってから」ではない（既存の評価順序
-    `predicate`（RLS 段）→ `on_visible_row`（`WHERE`・宣言的フィルタ API 等の
-    SCALAR 段）は `arena.rs::build_filtered_with_rows` のドキュメントに明記された
-    固定順序であり、SCALAR 段は「ランキング前の候補集合」に対して metadata を
-    要求する。したがって RLS predicate を通過した行はすべて、SCALAR 段の評価
-    前に `user_rows` へポイントルックアップして metadata を取得する必要がある。
-    codex-review P1 指摘）。実行計画別の取得段階は次のとおりとし、既存のフィルタ
-    順序・エラー契約（fail-closed のまま維持）を変えない:
+    **権威検証を行うタイミングは「RLS predicate 通過後」であり、経路によって
+    「返却対象への絞り込み前（WHERE・宣言的フィルタ API 経路）」または
+    「返却対象へ絞ってから（フィルタなし経路）」のいずれかに一意に決まる**
+    （既存の評価順序 `predicate`（RLS 段）→ `on_visible_row`（`WHERE`・宣言的
+    フィルタ API 等の SCALAR 段）は `arena.rs::build_filtered_with_rows` の
+    ドキュメントに明記された固定順序であり、SCALAR 段は「ランキング前の候補
+    集合」に対して metadata を要求する。したがって RLS predicate を通過した
+    行はすべて、SCALAR 段の評価前に `user_rows` へポイントルックアップして
+    metadata を取得する必要がある。codex-review P1 指摘）。**この権威検証は
+    ポイントルックアップが発生する経路すべてに単一のルールとして適用し、
+    段階（候補時点／返却時点）による例外を設けない**（Bugbot High 指摘への
+    対応。以前の記述は「返却直前」の経路のみを規定し `WHERE` 経路の候補時点
+    ポイントルックアップを対象外としていたため、`slot_bits` で admit された
+    private 行の public 複製が metadata デコードだけで返却されうる欠落が
+    あった）。単一ルールは次のとおり:
+    1. `user_rows` へポイントルックアップする
+    2. **metadata をデコードする前に** `decode_row_tenant_and_visibility` で
+       行側ヘッダの tenant／visibility を取得する
+    3. 4 点検証（後述）を行う
+    4. 一致時のみ、行側の権威値（チャンク側複製ではなく）を
+       `PolicyContext::is_visible` へ渡して admission を確定し、確定後に
+       初めて metadata をデコードして SCALAR 段・返却へ用いる
+    5. 不一致時は metadata を用いず、可視・不可視のどちらとも確定せず
+       fail-closed で `Err` を返す（黙って除外しない。理由は下記）
+    実行計画別の取得段階・4 点検証は次のとおりとし、既存のフィルタ順序・
+    エラー契約（fail-closed のまま維持）を変えない:
     - KNN（`WHERE`・宣言的フィルタ API を伴う場合）: RLS predicate 通過直後・
-      SCALAR 述語評価の直前に metadata をポイントルックアップし、SCALAR 述語も
-      通過した行だけをアリーナへ積む（`arena.rs::build_filtered_with_rows` の
-      `predicate` → `on_visible_row` の 2 段構成を維持しつつ、`on_visible_row`
-      の評価に必要な metadata をこの時点で取得する形へ結線する）
+      SCALAR 述語評価の直前に上記 5 ステップ（4 点検証込み）を実行し、
+      admission が確定し SCALAR 述語も通過した行だけをアリーナへ積む
+      （`arena.rs::build_filtered_with_rows` の `predicate` → `on_visible_row`
+      の 2 段構成を維持しつつ、`on_visible_row` の評価に必要な metadata の
+      デコードを 4 点検証の**後**に結線する）
     - KNN（`WHERE`・宣言的フィルタ API を伴わない場合）: 従来案どおり、ランキング
-      後に返却対象へ絞ってから取得してよい（候補段階で metadata を必要としない
-      ため）
+      後に返却対象へ絞ってから上記 5 ステップを実行する（候補段階で metadata を
+      必要としないため）
     - `SearchTimeFilter`・`batch_search`: 適用する述語が RLS のみ（metadata 不要）
-      であれば従来案のとおり返却対象に絞ってから取得する。metadata を用いる
-      述語を渡す呼び出し経路がある場合は KNN の `WHERE` 付き経路と同じ「RLS
-      直後」の段階で取得する
+      であれば従来案のとおり返却対象に絞ってから上記 5 ステップを実行する。
+      metadata を用いる述語を渡す呼び出し経路がある場合は KNN の `WHERE` 付き
+      経路と同じ「RLS 直後・候補段階」で実行する
     - この結果、`WHERE`・宣言的フィルタ API を伴うクエリでは「RLS 可視行数」分の
-      ポイントルックアップが発生し、「最終的な返却行数」分に絞られる従来案より
-      点検索の母数が増える。per-entry 削減効果は主に embedding 分（f32 デコード・
-      コピー）に残り、metadata 分の点検索コストは RLS 可視行数に比例したまま
-      である点を「コスト見積り」節に反映する（T7 の効果実測でフィルタなし
-      クエリとの差を計測する）
-    - **返却直前の権威検証（fail-closed。codex-review P0 指摘への対応）**:
-      KNN（`WHERE` なし）・`SearchTimeFilter`・`batch_search`（metadata 不要述語）
-      は上記のとおりランキング後・返却対象に絞ってから `user_rows` を取得するが、
-      この取得は「metadata を得るため」だけでなく「チャンク側の複製が権威と
-      一致することを確認するため」でもある。この経路（チャンク走査から
-      `row_ids[slot]` を経由した点検索）は `layout: chunked`（v3）のテーブルに
-      限って発生する（`layout: row` のテーブルは `user_vecs` を持たず本節の対象外。
-      上記「物理設計案」節参照）ため、次の 4 点は常にすべて揃って検証できる:
+      ポイントルックアップが発生し、「最終的な返却行数」分に絞られるフィルタなし
+      経路より点検索の母数が増える。per-entry 削減効果は主に embedding 分（f32
+      デコード・コピー）に残り、metadata 分の点検索コストは RLS 可視行数に
+      比例したままである点を「コスト見積り」節に反映する（T7 の効果実測で
+      フィルタなしクエリとの差を計測する）
+    - **4 点検証の内容（fail-closed。codex-review P0 指摘・Bugbot High 指摘への
+      対応）**: この経路（チャンク走査から `row_ids[slot]` を経由した点検索）は
+      `layout: chunked`（v3）のテーブルに限って発生する（`layout: row` の
+      テーブルは `user_vecs` を持たず本節の対象外。上記「物理設計案」節参照）
+      ため、次の 4 点は常にすべて揃って検証できる:
       1. `row_ids[slot]` と取得した行の `id` が一致する
       2. チャンクキーの `tenant_id` と取得した行の `tenant_id` が一致する
       3. 取得した行の `locator(chunk_no, slot)` が走査元の `(chunk_no, slot)` と
@@ -166,12 +193,17 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
         確定せず、`is_visible` による再判定も行わず、**黙って除外もせず**
         fail-closed で `Err` を返す（黙って除外すると結果集合が不整合に縮む形で
         改ざん・破損を隠蔽しうるため）
-      この検証は「返却される行数」分のみに発生し（O(返却行数)。チャンク走査
-      そのものを O(N) から変えない）、本 ADR が狙う per-entry コスト削減の前提
-      （上記コスト見積り）と矛盾しない。誤って admit されたチャンク側複製上の
-      private 行が上位 k 件から可視行を押し出す形で結果集合を歪める可能性が
-      あるため、検証結果は「短い結果集合を黙って返す」のではなく fail-closed
-      エラーとして伝播させる
+      この検証は「ポイントルックアップに到達した行数」分のみに発生し
+      （`WHERE` 系は O(RLS 可視行数)、フィルタなし系は O(返却行数)。チャンク
+      走査そのものを O(N) から変えない）、本 ADR が狙う per-entry コスト削減の
+      前提（上記コスト見積り）と矛盾しない。誤って admit されたチャンク側複製上の
+      private 行が上位 k 件から可視行を押し出す・`WHERE` 述語を通過して metadata
+      を露出する形で結果集合を歪める可能性があるため、検証結果は「短い結果集合を
+      黙って返す」のではなく fail-closed エラーとして伝播させる。ただし、この
+      検証はポイントルックアップに到達した候補についてのみ保証するものであり、
+      「候補に到達する前」の `slot_bits`／header 集計値によるスキップ段階は
+      この検証の対象外である（上記「除外方向」の限定的保証・下記「5. チャンク
+      単位可視性ビットマップ」節参照）
 - 行値（`user_rows`）の物理レイアウトは、下記「行単位レイアウトとの互換・移行方針」
   で採用する (2) opt-in 方式のもとでは **テーブルのカタログ `layout` 属性に従い
   2 形式が併存する**（codex-review P1 指摘への対応。一律に v3 化するとは規定しない）:
@@ -295,10 +327,34 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
     ケース。「スキップしない＝即 `Err`」とする
   - **意味的不整合**（チャンク側複製と `user_rows` 側権威値の食い違い）: チャンク
     値は正常にデコードできるが、複製した visibility／`row_ids` が権威と一致しない
-    ケース。デコードは成功するため本節の判定だけでは検出できず、上記「点検索を
-    行うタイミング」節の「返却直前の権威検証」で検出・`Err` とする。本節の
-    チャンク／スロットスキップは飽くまで走査コスト削減の最適化であり、最終的な
-    RLS 可否の確定はこの返却直前検証が担う
+    ケース。デコードは成功するため本節の判定だけでは検出できず、上記「権威検証を
+    行うタイミング」節の 4 点検証で検出・`Err` とする。ただしこの検出は
+    **ポイントルックアップに到達した候補**（4 点検証節参照）にのみ保証される。
+    本節のチャンク／スロットスキップ自体は、除外判定の対象になった行を
+    ポイントルックアップへ進ませない（＝候補から外す）ため、この 4 点検証の
+    対象から外れる。デコードは正常に成功したまま複製値が誤っている
+    （bit-rot 等のコミット後破損）ケースで本来可視な行が誤って除外される
+    事象は、クエリ経路の検証だけでは検出できない（codex-review P1 指摘。
+    「不一致を黙って除外しない」契約は、あくまで admission 方向の
+    fail-closed 保証であり、ポイントルックアップに到達する前の除外方向の
+    最適化には及ばない。上記「物理設計案」節「admission 方向／除外方向」を
+    参照）
+  - **除外判定自体の整合性検証（T8。上記の残存リスクへの対応）**: 除外方向の
+    正しさは書き込み時の同一 txn 不変条件（「4. 世代整合」節・T2）とコミット
+    境界を跨ぐ障害注入検証（T5）でのみ担保され、コミット後の複製値のみの
+    破損はクエリ経路では検出されない。この残存リスクをクエリの都度検出する
+    ことはコスト見積りの前提（per-entry コスト削減）と両立しないため、
+    帯域外（クエリのホットパス外）の**世界単位（`(tenant_id, chunk_no)` 単位）
+    整合性検証ツール**を T8 として実装タスク分解案に追加する。T8 は各
+    world について `live_count`／`public_live`／`private_live`／`slot_bits` を
+    対応する `user_rows` エントリ集合の全件走査結果と突合し、不一致を
+    operator が対処すべき fail-closed エラーとして報告する（`crash_tool` 系の
+    運用者専用サブコマンドと同様の位置付け。クエリ応答経路には結線しない）。
+    **T8 が実装されるまでは、`layout: chunked` テーブルのチャンク header／
+    `slot_bits` によるスキップ最適化（本節・「4 点検証」節の対象を減らす方向の
+    最適化）を有効化しない**。これにより「不一致を黙って除外しない」契約は、
+    admission 方向（無条件）に加え除外方向（T8 による帯域外検証込みで運用時に
+    担保）の双方について、最適化を有効化する前提条件として一貫させる
 
 ### 6. アライメント
 
@@ -324,18 +380,36 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
 | ------ | ---- | ---------- |
 | `scripts/crash_test.sh` | `Storage::put` 経路を検証 | チャンク経路用の `crash_tool` サブコマンド追加 |
 | `scripts/crash_test_cross_table.sh` | `BatchWriteTxn::log_batch` を検証 | 3 テーブル（行・チャンク・台帳）横断整合検証への拡張 |
-| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認。`row_ids[slot]` ⇔ `user_rows` 側 `locator` の相互不整合（再パック中の電源断を含む）に加え、`slot_bits` visibility ⇔ `user_rows` 側 tenant／visibility の不整合（返却直前の権威検証。上記「点検索を行うタイミング」節参照）も同一の fail-closed 検出対象に含める |
+| `crates/engine/tests/power_loss.rs` | `StorageBackend` 差し替え電源断モデル | 部分書き戻し像でのチャンク値と locator の不整合検出（fail-closed 拒否）の確認。`row_ids[slot]` ⇔ `user_rows` 側 `locator` の相互不整合（再パック中の電源断を含む）に加え、`slot_bits` visibility ⇔ `user_rows` 側 tenant／visibility の不整合（権威検証。上記「権威検証を行うタイミング」節参照）も同一の fail-closed 検出対象に含める |
 | `crates/engine/tests/index_failure_injection.rs`（RECOVER-9） | 再構築処理の途中失敗注入 | チャンク再パック処理の途中失敗で commit 済み行が無傷であることの確認。途中失敗後も `row_ids` と `locator` が旧配置のまま一貫していること（半端な書き換えが残らないこと）、および `slot_bits` visibility と行側 tenant／visibility の一致が崩れていないことを含める |
 
 `recovery/commit_boundary.rs` の choke point 経由は維持する。
 
 ## コスト見積り
 
-- **読み取り**: per-entry コスト（≈225ns/行の走査＋ヘッダデコード分）が概ね `1/N`
-  に償却される見積り。25,000 行・N=256 では約 98 エントリまで削減される計算になる。
-  KNN の arena 構築段（≈468ns/行 の残り ≈243ns/行 = f32 デコード＋コピー）は
-  連続コピー化により減少が見込まれる（定量は #362 の実測で確定させる。本 ADR では
-  上限見積りとして提示するに留める）
+- **読み取り（フィルタなし経路。`WHERE`・宣言的フィルタ API を伴わない KNN・
+  `SearchTimeFilter`・`batch_search`）**: per-entry コスト（≈225ns/行の走査＋
+  ヘッダデコード分）が概ね `1/N` に償却される見積り。25,000 行・N=256 では約 98
+  エントリまで削減される計算になる。KNN の arena 構築段（≈468ns/行 の残り
+  ≈243ns/行 = f32 デコード＋コピー）は連続コピー化により減少が見込まれる
+  （定量は #362 の実測で確定させる。本 ADR では上限見積りとして提示するに留める）。
+  この経路のポイントルックアップは「最終的な返却行数」分のみに限られる（上記
+  「権威検証を行うタイミング」節）
+- **読み取り（metadata 必須経路。`WHERE`・宣言的フィルタ API を伴うクエリ）**:
+  上記の per-entry 削減はチャンク走査・ヘッダデコード段と embedding 分（f32
+  デコード・コピー）にのみ適用され、metadata 分は適用されない。SCALAR 段の
+  評価前に「RLS predicate 通過後の可視行数」分の `user_rows` ポイントルック
+  アップ（B-tree 探索が可視行数に比例）が発生するため（上記「権威検証を行う
+  タイミング」節の 4 点検証込み）、フィルタなし経路の見積りをそのまま適用
+  できない。読み取りコストのモデルは
+  `O(N_scan / N) 償却分（走査＋ヘッダデコード＋embedding デコード） +
+  O(RLS 可視行数) の user_rows ポイントルックアップ（metadata デコード＋
+  4 点検証込み）` の 2 項で表す。RLS 可視行数が走査対象の大半を占める
+  ワークロードでは、後者の項が per-entry 削減効果を相殺しうる。T7 の効果実測
+  では、この 2 経路（フィルタなし／metadata 必須）を分離して個別に測定し
+  （測定条件: 同一コーパス・同一 N に対し `WHERE` 句の有無のみを変えた A/B）、
+  フィルタなし経路の改善幅と metadata 必須経路の改善幅（またはその欠如）を
+  別々に報告する
 - **副次効果**: 行値から embedding が抜けるため `COUNT(*)`／集計／`GROUP BY`／
   TASK-120 の path 一致走査（metadata のみ参照）で leaf ページあたりの行数が
   増え、ページ読み取り数が減る見込み（dim=128 で行値 ≈540B → ≈60B 程度への縮小）
@@ -396,11 +470,12 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 | - | ------ | ---- | -------- |
 | T1 | チャンクテーブル定義・コーデック（header 検証・上限定数・`unsafe` なし） | — | `storage/chunk.rs`（新規）・`catalog.rs`（`user_vecs` 命名・`drop_table`） |
 | T2 | 書き込み経路の結線（挿入・削除・更新・TASK-120 置換・tombstone・同一 txn） | T1 | `tenant.rs`・`recovery/ledger.rs` 連携・`table_generation_bump_coverage.rs` |
-| T3 | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋可視性集計スキップ。集計は下記「T3 の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない） | T1 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
+| T3 | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋可視性集計スキップ＋権威検証〔「権威検証を行うタイミング」節の 4 点検証〕。集計は下記「T3 の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない。検証には実際に書き込まれたチャンク〔T2〕と `layout: chunked` 選択・v2/v3 分岐〔T4〕の両方が必要なため依存に含める） | T1・T2・T4 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
 | T4 | カタログのレイアウト属性と opt-in・オフライン再構築ツール | T1 | `catalog.rs`・`examples/` |
 | T5 | 回復検証の拡張（crash_tool サブコマンド・cross-table 3 テーブル・power_loss・RECOVER-9 注入） | T2 | `scripts/`・`examples/crash_tool*.rs`・`tests/` |
 | T6 | 再パック（コンパクション）と閾値 | T2 | `storage/chunk.rs`・`tenant.rs` |
 | T7 | 効果実測（`feature_bench` 前後比較・`sql_c1_bench`・#362 内訳との突合）と README「実装方針（要点）」反映 | T3・T4 | `examples/feature_bench.rs`・`docs/` |
+| T8 | 世界単位（`(tenant_id, chunk_no)` 単位）整合性検証ツール（`live_count`／`public_live`／`private_live`／`slot_bits` と対応する `user_rows` 全件走査結果の突合。運用者専用・クエリ応答経路には結線しない。「5. チャンク単位可視性ビットマップ」節「除外判定自体の整合性検証」参照）。**T3 のチャンク header／`slot_bits` によるスキップ最適化は T8 実装まで有効化しない** | T2 | `examples/crash_tool*.rs` 系（新規サブコマンド）・`storage/chunk.rs` |
 
 ### T3 の対象範囲・集計の読み取り元（codex-review P1 指摘への対応）
 
@@ -446,7 +521,7 @@ metadata 参照が必須のため、上記「候補段階での metadata 取得�
 | ---- | ---------------------------- | ------------------------ |
 | private spec 漏えい（P0） | spec 本文・非公開設計議論を転記していない。参照は TASK-nn／ビヘイビア ID／パスのみ。数値は public Issue #344／#361 由来の実測値と本リポ定数に限定 | — |
 | 秘密情報混入（P0） | 実トークン・資格情報は記載していない | — |
-| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。header 破損は fail-closed（スキップしない）。エラーに他テナントの存在情報を含めない。**チャンク側 `slot_bits`／header 集計値は `user_rows` 側 tenant／visibility の派生複製であり単一権威ではない**（`user_rows` 側行ヘッダが権威）。複製は候補を減らす最適化にのみ使用し、確定的な admit には使わない。返却直前に権威検証（`row_ids[slot]`・tenant・`locator`・visibility の 4 点突合。この経路は `layout: chunked` に限って発生するため常に 4 点とも検証する）を行い、不一致は黙って除外・再判定せず `Err` とする（「点検索を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節参照） |
+| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。header 破損は fail-closed（スキップしない）。エラーに他テナントの存在情報を含めない。**チャンク側 `slot_bits`／header 集計値は `user_rows` 側 tenant／visibility の派生複製であり単一権威ではない**（`user_rows` 側行ヘッダが権威）。単一権威原則は方向で保証範囲が異なる: **admission 方向は無条件**——複製は候補を減らす最適化にのみ使用し確定的な admit には使わず、ポイントルックアップに到達した候補は `WHERE` 経路・フィルタなし経路のいずれも metadata デコード**前**に権威検証（`row_ids[slot]`・tenant・`locator`・visibility の 4 点突合。`layout: chunked` に限って発生するため常に 4 点とも検証する）を行い、不一致は黙って除外・再判定せず `Err` とする。**除外方向（`slot_bits`／header 集計値によるチャンク・スロットスキップ）は保証が限定的**——ポイントルックアップに到達する前の除外はこの 4 点検証の対象外であり、コミット後の複製値のみの破損による誤除外はクエリ経路では検出できない残存リスクとして明示する。この残存リスクは世界単位の帯域外整合性検証（T8）を前提として運用時に担保し、**T8 実装まで除外方向の最適化を有効化しない**（「権威検証を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節参照） |
 | インジェクション | — | テーブル名は `validate_identifier` 通過後のみ `user_vecs/{table}` へ用いる（`user_rows` と同じ扱い） |
 | 不安全な設計／DoS | — | チャンク header の `slot_count`・`dim`・値長は確保前に上限検証（`MAX_EMBEDDING_DIM`・新設 `MAX_CHUNK_BYTES`）。`checked_*` 演算を用いる。走査総量は `MAX_ARENA_ROWS`／`MAX_ARENA_TOTAL_BYTES` と整合させる |
 | `unsafe`（P1） | — | 導入しない（`isa.rs` 限定テストにより構造的に禁止）。zero-copy 再解釈は採らない |
