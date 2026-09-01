@@ -185,7 +185,10 @@ make bench-hybrid-profile
 ## 申し送り
 
 - 本実測は非専有環境（並行エージェントあり）での 1 回実測であり、専有環境での
-  再実測・Issue #357 実装後の before/after 比較はオーナー／実装担当の判断で
-  別途実施する
+  再実測はオーナー／実装担当の判断で別途実施する
+- Issue #357（疎索引キャッシュ）実装後の `feature_bench` `hybrid_rrf` フェーズの
+  before/after 比較は Issue #358 で実施済み（`docs/design/
+  sparse-index-cache-verification.md` 参照。`hybrid_profile_bench` 自体の
+  before/after 再実測は同 Issue で時間予算の都合により見送り、申し送り事項）
 - production コード（`crates/engine/src/`）は本 Issue で無変更（テスト・ベンチ
   専任）
