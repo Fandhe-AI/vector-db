@@ -31,6 +31,11 @@ use std::time::Instant;
 const DIM: u32 = 128;
 const ROWS_A: u64 = 20_000;
 const ROWS_B: u64 = 5_000;
+/// tenant-a 投入時に Private 可視性を割り当てる周期（[`run_ingest`] の
+/// `make_batch` 呼び出しに使う）。RLS 境界確認（[`run_rls_isolation_phase`]）が
+/// tenant-a の期待 Public/Private 件数をこの定数から導出するため、投入側と
+/// 検証側で値がずれないよう単一の定数として共有する。
+const TENANT_A_PRIVATE_EVERY_N: u64 = 10;
 const BATCH_SIZE: u64 = 1_000;
 const WARMUP: usize = 5;
 const ITERS: usize = 50;
@@ -362,7 +367,8 @@ fn run_ingest(
     let mut id = 1u64;
     while id <= ROWS_A {
         let end = (id + BATCH_SIZE - 1).min(ROWS_A);
-        let (ids, viss, embs, encoded) = make_batch(schema, embedder, id, end, Some(10));
+        let (ids, viss, embs, encoded) =
+            make_batch(schema, embedder, id, end, Some(TENANT_A_PRIVATE_EVERY_N));
         let us = insert_batch(
             storage,
             ctx_a,
@@ -498,10 +504,14 @@ fn count_of(result: &QueryResult) -> Option<u64> {
     }
 }
 
-/// フェーズ 11: RLS テナント境界の確認。tenant-b（Public のみ）から見える件数と
-/// tenant-a（Public のみ／Public+Private）から見える件数を突き合わせ、tenant-a の
-/// Private 行が tenant-b へ漏れていないこと（両者の Public 件数が一致すること）を
-/// 確認する。計測対象クエリは tenant-b 視点の `COUNT(*)`。
+/// フェーズ 11: RLS テナント境界の確認。tenant-a（Public のみ／Public+Private）・
+/// tenant-b（Public のみ）それぞれから見える件数を、[`run_ingest`] が投入した
+/// fixture の期待値（tenant-a: Public `ROWS_A - ROWS_A / TENANT_A_PRIVATE_EVERY_N`・
+/// full `ROWS_A`、tenant-b: Public `ROWS_B`）と個別に照合し、他テナントの行が
+/// 混入していない（=期待値どおりの件数しか見えない）ことを確認する。
+/// tenant-a・tenant-b の Public 件数は 18,000 対 5,000 と非対称であり単純な相互
+/// 一致比較では正しい分離時にも false になるため使わない（Issue #358 PR #380
+/// codex-review 指摘）。計測対象クエリは tenant-b 視点の `COUNT(*)`。
 fn run_rls_isolation_phase(
     core: &EngineCore,
     ctx_a_public: &PolicyContext,
@@ -519,10 +529,17 @@ fn run_rls_isolation_phase(
         .and_then(|r| count_of(&r));
     let count_b = core.execute_sql(ctx_b, sql).ok().and_then(|r| count_of(&r));
 
-    // tenant-b から見える件数が tenant-a（Public のみ視点）と一致するなら、
-    // tenant-a の Private 行は tenant-b へ漏れていない（RLS-7/RLS-8 相当の
-    // 境界確認。数値基準そのものは本ベンチの管轄外）。
-    let no_leak = matches!((count_a_public, count_b), (Some(a), Some(b)) if a == b);
+    // fixture（run_ingest）の期待件数。tenant-a は ROWS_A 行中
+    // id % TENANT_A_PRIVATE_EVERY_N == 0 のみ Private（make_batch 参照）。
+    let expected_private_a = ROWS_A / TENANT_A_PRIVATE_EVERY_N;
+    let expected_public_a = ROWS_A - expected_private_a;
+
+    // 各コンテキストの件数が fixture の期待値どおりであれば、他テナントの行の
+    // 混入（漏えい）も自テナント内 Private/Public の取り違えも起きていない
+    // （RLS-7/RLS-8 相当の境界確認。数値基準そのものは本ベンチの管轄外）。
+    let no_leak = count_a_public == Some(expected_public_a)
+        && count_a_full == Some(ROWS_A)
+        && count_b == Some(ROWS_B);
     let private_rows_a = match (count_a_full, count_a_public) {
         (Some(full), Some(public)) => full.saturating_sub(public),
         _ => 0,
