@@ -66,7 +66,7 @@ use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
     refuse_under_github_actions, render_diff_line, render_stage_line, stage_diff_ns_per_row,
 };
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 use harness::rng::DeterministicRng;
 use harness::sql_c1::{c1_statement, vector_literal};
 
@@ -195,52 +195,20 @@ fn main() {
     // S4 は「arena 構築の実コスト」のみを対象とする。`harness::protocol::run` は
     // 戻り値を `black_box` 通過後、計測区間の内側で drop する契約
     // （`protocol.rs` モジュールコメント・Issue #302）のため、クロージャが
-    // `VectorArena`（ヒープ確保を伴う）をそのまま返すと全バッファの解放コストが
-    // 構築コストへ混入する（codex-review 指摘・PR #378）。構築済み `VectorArena`
-    // は計測区間外の sink（`batch_bench.rs` と同じパターン）へ退避し、クロージャの
-    // 戻り値は軽量な行数のみにすることで解放コストを計測区間外へ追い出す。
-    //
-    // sink は固定容量（`S4_SINK_CAPACITY`）のリングバッファとし、同時に生存する
-    // `VectorArena` の数を計測フェーズを通じて一定に保つ（codex-review 指摘・PR #378。
-    // 全 `measured_iterations` 分を無条件に retain すると、行あたり ≈51KB
-    // （25,000 行 × dim128 × f32）の arena が反復ごとに積み上がり、終盤の反復ほど
-    // 常駐メモリ・ページ圧力が増えて S4 中央値を歪める）。容量超過時は最も古い
-    // エントリをその場で `mem::replace` により解放する——この解放は計測フェーズの
-    // 3 反復目以降、毎回ひとつの arena 分だけ一様に計測区間へ混入するが、全反復で
-    // 同じ大きさの一様バイアスであるため、中央値が示す「構築＋１回分の解放」という
-    // 相対比較には影響しない（growing sink 方式が持ち込む反復間の不均一な
-    // メモリ常駐差よりも、一様な追加コストの方が中央値の代表性を保てる）。
-    // warmup フェーズ（`run` 内部で計測区間の外側・`Instant` 計測前に実行される）分は
-    // sink に触れずクロージャ内で即座に drop する——計測区間の外なので測定値へ
-    // 混入しない。
-    const S4_SINK_CAPACITY: usize = 2;
-    let mut s4_call_count: u32 = 0;
-    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(S4_SINK_CAPACITY);
-    let mut s4_sink_next: usize = 0;
-    let s4 = run(&config, || {
-        let built_arena = VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
+    // `VectorArena`（ヒープ確保を伴う）をそのまま返すと解放コストが構築コストへ
+    // 混入する（codex-review 指摘・PR #378）。`run_bounded_retain`
+    // （`retain_capacity = 0`）を使い、`elapsed()` 取得後・計測区間の外側で
+    // 毎回即座に drop することで、同時に生存する `VectorArena` を常に 0 件に
+    // 保ちつつ解放コストも計測区間から除く（codex-review 指摘・PR #378 追記。
+    // `mem::replace` によるリングバッファ入れ替えは入れ替え自体が計測区間の内側で
+    // 発生していたため、解放コスト除外の要求を満たしていなかった）。
+    let (s4, _retained) = run_bounded_retain(&config, 0, || {
+        VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
             policy_ctx.is_visible(tenant, visibility)
         })
-        .expect("arena build must succeed for well-formed synthetic corpus");
-        let row_count = built_arena.len();
-        s4_call_count += 1;
-        if s4_call_count > config.warmup_iterations() {
-            // 計測フェーズ分のみリングバッファへ退避する。容量未満の間は単純 push、
-            // 容量到達後は最も古いスロットを新しい arena で置き換え、追い出された
-            // 古い arena はこの場で drop する（同時生存数を常に容量以下へ保つ）。
-            if s4_sink.len() < S4_SINK_CAPACITY {
-                s4_sink.push(built_arena);
-            } else {
-                let _evicted = std::mem::replace(&mut s4_sink[s4_sink_next], built_arena);
-                s4_sink_next = (s4_sink_next + 1) % S4_SINK_CAPACITY;
-            }
-        }
-        // warmup フェーズ分は retain せずここで drop する（計測区間外のため安全）。
-        row_count
+        .expect("arena build must succeed for well-formed synthetic corpus")
     })
     .expect("measurement must satisfy protocol minimums");
-    // sink に残った最終分の `VectorArena` の解放はここで行い、計測区間の外側にする。
-    drop(s4_sink);
     let s4_median = s4.summary.median;
 
     // S5/S5' は事前構築済みの単一アリーナに対して測る（クエリ毎の再構築コストは

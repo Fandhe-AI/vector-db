@@ -18,7 +18,7 @@
 mod harness;
 
 use harness::ab::{median_ratio, run_ab, AbMeasurement};
-use harness::protocol::{run, Measurement, MeasurementConfig};
+use harness::protocol::{run, run_bounded_retain, Measurement, MeasurementConfig};
 use harness::rng::DeterministicRng;
 use harness::stats::{self, BenchError, Summary};
 use std::time::Duration;
@@ -206,4 +206,102 @@ fn median_ratio_computes_finite_nonnegative_value_for_nonzero_denominator() {
 fn invalid_config_returns_err_without_panicking() {
     let result = MeasurementConfig::new(1, 1, 0);
     assert!(result.is_err());
+}
+
+// run_bounded_retain: 同時生存数の上限・解放コストの計測区間外化（Issue #362
+// codex-review 指摘・PR #378）。
+
+/// 構築・drop を計数するテスト用の値。`Drop::drop` で `alive` を減算する。
+struct DropCounter {
+    alive: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DropCounter {
+    fn new(alive: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        alive.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            alive: alive.clone(),
+        }
+    }
+}
+
+impl Drop for DropCounter {
+    fn drop(&mut self) {
+        self.alive.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn run_bounded_retain_bounds_concurrently_alive_values_by_capacity() {
+    let config = MeasurementConfig::new(20, 20, 0).unwrap();
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_alive = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const RETAIN_CAPACITY: usize = 2;
+
+    let (measurement, retained) = run_bounded_retain(&config, RETAIN_CAPACITY, || {
+        let counter = DropCounter::new(&alive);
+        // 新しい値の構築中は、まだ入れ替えられていない旧い保持分
+        // （最大 RETAIN_CAPACITY 件）と一時的に共存しうるため、観測される
+        // 同時生存数の上限は RETAIN_CAPACITY + 1 になる（`run_bounded_retain`
+        // の入れ替えはこの構築完了後・計測区間の外側で行われる）。
+        max_alive.fetch_max(
+            alive.load(std::sync::atomic::Ordering::SeqCst),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        counter
+    })
+    .expect("valid config must run");
+
+    assert_eq!(measurement.samples.len(), 20);
+    assert_eq!(retained.len(), RETAIN_CAPACITY);
+    assert!(
+        max_alive.load(std::sync::atomic::Ordering::SeqCst) <= RETAIN_CAPACITY + 1,
+        "concurrently alive values exceeded retain_capacity + 1"
+    );
+
+    drop(retained);
+    assert_eq!(alive.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn run_bounded_retain_with_capacity_at_or_above_measured_iterations_retains_all_values() {
+    let config = MeasurementConfig::new(20, 20, 0).unwrap();
+    let (_measurement, retained) =
+        run_bounded_retain(&config, 100, || 1u32).expect("valid config must run");
+    assert_eq!(retained.len(), 20); // measured_iterations 分すべて残る
+}
+
+#[test]
+fn run_bounded_retain_with_zero_capacity_drops_every_value_immediately() {
+    let config = MeasurementConfig::new(20, 20, 0).unwrap();
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let (_measurement, retained) =
+        run_bounded_retain(&config, 0, || DropCounter::new(&alive)).expect("valid config must run");
+
+    assert_eq!(retained.len(), 0);
+    assert_eq!(alive.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn run_bounded_retain_excludes_drop_cost_from_measured_samples() {
+    /// drop 時に一定時間スリープする値。解放コストが計測区間の内側に
+    /// 混入していれば中央値がこのスリープ時間近くまで膨らむはずである。
+    struct SlowDrop;
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    let config = MeasurementConfig::new(20, 20, 0).unwrap();
+    let (measurement, retained) =
+        run_bounded_retain(&config, 0, || SlowDrop).expect("valid config must run");
+
+    assert_eq!(retained.len(), 0);
+    assert!(
+        measurement.summary.median < Duration::from_millis(1),
+        "median {:?} suggests drop cost leaked into the measured interval",
+        measurement.summary.median
+    );
 }
