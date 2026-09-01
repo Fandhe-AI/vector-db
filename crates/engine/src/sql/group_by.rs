@@ -3,8 +3,10 @@
 //! 責務境界: [`crate::sql::aggregate::execute_aggregate`] が `BoundAggregate::group_by`
 //! を検出した場合にのみ呼ばれる（`GROUP BY` なしの単一行集計は `aggregate.rs` が
 //! 引き続き担う）。行の走査・RLS 適用順序（ヘッダのみで可視性判定 → 可視行のみ
-//! 完全デコード → `WHERE` → 可視性の再検査 → 集計）は `aggregate.rs` の単一行経路と
-//! 同一の規約を踏襲する（`.claude/rules/security.md`「テナント境界（P0）」）。
+//! ヘッダのオフセットを引き継いで本体デコード → `WHERE` → 可視性の再検査 → 集計）は
+//! `aggregate.rs` の単一行経路と同一の規約を踏襲する（`.claude/rules/security.md`
+//! 「テナント境界（P0）」。スクラッチ再利用による二重デコード排除は Issue #349・
+//! Issue #314 の横展開）。
 //! **不可視行のグループキーは結果に一切現れない**（他テナントにしか存在しない
 //! グループ値からの存在推測を防ぐ。RLS-7・RLS-8 の `GROUP BY` 版）。
 //!
@@ -227,9 +229,9 @@ fn order_with_nulls_last(
 /// [`crate::sql::aggregate::execute_aggregate`] が判定済み）を実行し、複数行の
 /// [`QueryResult`] を返す（TASK-167・SQL-14）。RLS 適用順序・行走査は
 /// `aggregate.rs::execute_aggregate` の単一行経路と同一の規約
-/// （ヘッダのみで可視性判定 → 可視行のみ完全デコード → `WHERE` → 可視性再検査）を
-/// 独立して踏襲する（責務分離のためモジュールを分けたことによる意図的な複製。
-/// 変更する際は両モジュールの規約を揃えること）。
+/// （ヘッダのみで可視性判定 → 可視行のみヘッダのオフセットを引き継いで本体デコード
+/// → `WHERE` → 可視性再検査）を独立して踏襲する（責務分離のためモジュールを分けた
+/// ことによる意図的な複製。変更する際は両モジュールの規約を揃えること）。
 pub(crate) fn execute_grouped_aggregate(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -259,7 +261,6 @@ pub(crate) fn execute_grouped_aggregate(
     } else {
         DecodeTier::DimAndScalar
     };
-    let mut embedding_scratch: Vec<f32> = Vec::new();
 
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
@@ -278,6 +279,9 @@ pub(crate) fn execute_grouped_aggregate(
     let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
+    // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
+    // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut embedding_scratch: Vec<f32> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -286,24 +290,30 @@ pub(crate) fn execute_grouped_aggregate(
             let buf = v.value();
 
             // RLS 段（無条件・デコード前）: `aggregate.rs` の単一行経路と同一順序。
-            let (tenant_id, visibility) =
-                storage::decode_row_tenant_and_visibility(buf).map_err(storage_internal)?;
+            // `offset` は本体デコードの再開位置（Issue #349: ヘッダの二重デコード
+            // 排除。`aggregate.rs::execute_aggregate` のドキュメント参照）。
+            let (tenant_id, visibility, offset) =
+                storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
             // 可視行・常に: TABLE-12 のキー/ヘッダ tenant 整合検査（`aggregate.rs`
-            // と同一の切り出しヘルパを使う。Issue #350）。
+            // と同一の切り出しヘルパを使う。Issue #350）。従来
+            // `storage::decode_row_for_key` の内部検査だったものを明示比較へ
+            // 移設。`tier` に関わらず必ず行う。
             storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
 
             // 可視行・必要時のみ（Issue #350）: `tier` が要求する範囲だけ dim・
-            // metadata・embedding をデコードする。
+            // metadata・embedding をデコードする。`DecodeTier::Embedding` は
+            // 上で読み済みの `offset` を引き継いで本体のみをデコードし、ヘッダの
+            // 二重デコードを避ける（Issue #349）。
             let (dim, metadata): (u32, &[u8]) = match tier {
                 DecodeTier::DimAndScalar => {
                     storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
                 }
                 DecodeTier::Embedding => {
-                    storage::decode_row_embedding_and_metadata_into(buf, &mut embedding_scratch)
+                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
                         .map_err(storage_internal)?
                 }
                 // `GROUP BY` はヘッダのみのファストパスを持たない
@@ -362,7 +372,9 @@ pub(crate) fn execute_grouped_aggregate(
             }
 
             // defense-in-depth（RlsSafetyNet と同趣旨）。ヘッダから取り出した
-            // `tenant_id`・`visibility` に対して再適用する。
+            // `tenant_id`・`visibility` に対して再適用する（独立した二重検証では
+            // ない点を含め `aggregate.rs::execute_aggregate` の同一箇所のドキュメント
+            // 参照）。
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
@@ -542,4 +554,118 @@ pub(crate) fn execute_grouped_aggregate(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    use crate::sql::allowlist::AggregateFunc;
+    use crate::sql::parser::{AggregateInput, BoundAggregate, BoundAggregateItem, BoundGroupBy};
+    use crate::storage::{RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+    /// （`header_tenant`）を意図的にずらして raw redb 書き込みする（TABLE-12 の
+    /// 整合検査を検証するための専用ヘルパ。`sql::aggregate::tests` の同名ヘルパと
+    /// 同じ方針。Issue #349）。
+    fn write_row_with_mismatched_key_tenant(
+        storage: &Storage,
+        table_name: &str,
+        key_tenant: &str,
+        header_tenant: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: header_tenant,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((key_tenant, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    fn schema_with_text_group_column() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    fn bound_count_star_grouped_by_lang() -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: AggregateInput::AllVisible,
+                name: "result".to_string(),
+            }],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            rls_predicate_present: false,
+            projection: vec![
+                crate::sql::parser::ProjectionColumn::GroupKey {
+                    name: "lang".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 0,
+                    name: "result".to_string(),
+                },
+            ],
+            group_by: Some(BoundGroupBy {
+                column_index: 1,
+                having: Vec::new(),
+                order_by: None,
+                limit: None,
+            }),
+        }
+    }
+
+    // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
+    // `tenant_id` の不一致）が、`decode_row_for_key` 呼び出しをやめた後の
+    // 明示比較でも従来どおり fail-closed（`XX000`・`SqlSurfaceError::Internal`）に
+    // 拒否されることを固定する（`sql::aggregate::tests` の単一行経路と同一の
+    // 回帰を `GROUP BY` 経路で検証する）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed() {
+        let path = unique_db_path("group-by-table12-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_count_star_grouped_by_lang();
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
+    }
 }

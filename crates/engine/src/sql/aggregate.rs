@@ -19,15 +19,27 @@
 //!
 //! RLS 適用順序は [`crate::arena`] モジュールの走査ループと同一の規約に揃える
 //! （`.claude/rules/security.md`「テナント境界（P0）」）: 行ヘッダから
-//! `tenant_id`・`visibility` のみを取り出し（[`crate::storage::decode_row_tenant_and_visibility`]）、
-//! [`crate::policy::PolicyContext::is_visible`] が `false` を返す行は embedding・
-//! metadata を一切デコードせずスキップする。可視行のみ、実際にクエリが参照する
-//! データだけを段階的にデコードして SCALAR 段（`WHERE`）・集計へ進む
-//! （[`ReferencedColumns`]・[`DecodeTier`] 参照。Issue #350: embedding 非参照集計の
-//! デコードスキップと必要列限定デコード）。`COUNT` 等の集計値から他テナント行の
-//! 存在・件数を推測できないという契約（RLS-7・RLS-8）は、この「不可視行は集約対象に
-//! 一切現れない」という走査自体の構造で担保し、デコード段階の縮小はこの構造に
-//! 一切手を加えない（可視性判定は全経路で常にヘッダから全行に対して行う）。
+//! `tenant_id`・`visibility`・本体デコード再開オフセットを取り出し
+//! （[`crate::storage::decode_row_header`]）、[`crate::policy::PolicyContext::is_visible`]
+//! が `false` を返す行は embedding・metadata を一切デコードせずスキップする。
+//! 可視行はまず物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id` の
+//! 整合検査（TABLE-12。従来 `storage::decode_row_for_key` が担っていた検査を
+//! 呼び出し元の明示比較へ移設。`storage::verify_row_key_tenant`）を`tier` に
+//! 関わらず必ず経てから、実際にクエリが参照するデータだけを段階的にデコードして
+//! SCALAR 段（`WHERE`）・集計へ進む（[`ReferencedColumns`]・[`DecodeTier`] 参照。
+//! Issue #350: embedding 非参照集計のデコードスキップと必要列限定デコード。
+//! `DecodeTier::Embedding` はヘッダのオフセットを引き継いで本体のみをデコードし
+//! （[`crate::storage::decode_row_body_into`]。スクラッチ再利用によりヘッダの
+//! 二重デコード・行ごとの `Vec<f32>` 新規確保を避ける。Issue #349・Issue #314
+//! の横展開）、`DecodeTier::Fast`・`DecodeTier::DimAndScalar` は
+//! `storage::decode_row_dim_and_metadata_borrowed`（ヒープ確保を伴わない構造検証・
+//! embedding 自体は `Vec<f32>` へ確保しない）を必ず通す（codex-review P1 指摘・
+//! PR #369: `DecodeTier::Fast` が構造検証を省略すると破損した可視行を集計結果へ
+//! 含めてしまう fail-open な契約変更になるため）。
+//! `COUNT` 等の集計値から他テナント行の存在・件数を推測できないという契約
+//! （RLS-7・RLS-8）は、この「不可視行は集約対象に一切現れない」という走査自体の
+//! 構造で担保し、デコード段階の縮小はこの構造に一切手を加えない（可視性判定・
+//! TABLE-12 の整合検査・metadata の構造検証は全 tier で常に行う）。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -635,9 +647,13 @@ pub(crate) fn execute_aggregate(
             // （ヘッダのみ読み `predicate` 相当を通過しない行は embedding・
             // metadata を一切デコードしない）。不可視行の破損状態が対象テナントの
             // クエリ可用性へ干渉しない設計を踏襲する（codex P0 対応・Issue #137、
-            // security.md P0「テナント境界」）。
-            let (tenant_id, visibility) =
-                storage::decode_row_tenant_and_visibility(buf).map_err(storage_internal)?;
+            // security.md P0「テナント境界」）。`offset` は本体デコードの再開位置
+            // （[`storage::decode_row_body_into`] へそのまま渡す。Issue #349:
+            // ここで一度ヘッダを読んだ後に本体デコード関数の内部でヘッダを
+            // もう一度読む二重デコードを、`DecodeTier::Embedding` 到達時は
+            // 避ける）。
+            let (tenant_id, visibility, offset) =
+                storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
@@ -672,7 +688,9 @@ pub(crate) fn execute_aggregate(
                     storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
                 }
                 DecodeTier::Embedding => {
-                    storage::decode_row_embedding_and_metadata_into(buf, &mut embedding_scratch)
+                    // 上で読み済みの `offset`（ヘッダ直後の再開位置）を引き継ぎ、
+                    // ヘッダの二重デコードを避ける（Issue #349）。
+                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
                         .map_err(storage_internal)?
                 }
             };
@@ -845,6 +863,40 @@ mod tests {
         crate::storage::bump_generation_and_commit(write_txn).expect("commit");
     }
 
+    /// 物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+    /// （`header_tenant`）を意図的にずらして raw redb 書き込みする（TABLE-12 の
+    /// 整合検査を検証するための専用ヘルパ。Issue #349: 旧 `decode_row_for_key`
+    /// 内部検査から `execute_aggregate`/`execute_grouped_aggregate` 側の明示比較へ
+    /// 移設した後も、この不一致が fail-closed に拒否されることを固定する）。
+    fn write_row_with_mismatched_key_tenant(
+        storage: &Storage,
+        table_name: &str,
+        key_tenant: &str,
+        header_tenant: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: header_tenant,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((key_tenant, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
     /// nullable な `VECTOR` 列（TABLE-5 想定）を単一列として持つテーブルの
     /// スキーマ・空 `BoundAggregate` を組み立てる共通部。
     fn nullable_vector_schema() -> TableSchema {
@@ -931,6 +983,40 @@ mod tests {
         let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
             .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+    }
+
+    // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
+    // `tenant_id` の不一致）が、`decode_row_for_key` 呼び出しをやめた後の
+    // 明示比較でも従来どおり fail-closed（`XX000`・`SqlSurfaceError::Internal`）に
+    // 拒否されることを固定する（旧 `decode_row_for_key` 内部検査への暗黙依存を
+    // 解消するための回帰）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed() {
+        let path = unique_db_path("agg-table12-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        // key 側は tenant-a、ヘッダ側は tenant-b（tenant-a から見て可視な
+        // Public 行だが、key/ヘッダ不一致という異常な行）。
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
     }
 
     // --- DecodeTier::Fast の破損検知（Issue #350・PR #369 codex-review P1 対応） ---
