@@ -88,6 +88,7 @@ use harness::env_report::EnvReport;
 use harness::knn_profile::{
     assert_scan_row_counts_match, decode_header_reimpl, decode_row_reimpl, ns_per_row,
     refuse_under_github_actions, render_diff_line, render_stage_line, stage_diff_ns_per_row,
+    KnnProfileError,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 use harness::rng::DeterministicRng;
@@ -137,6 +138,23 @@ const ROW_TABLE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("use
 fn fail_closed(msg: impl std::fmt::Display) -> ! {
     eprintln!("knn_profile_bench: {msg}");
     std::process::exit(1);
+}
+
+/// 段間差分（[`stage_diff_ns_per_row`]）の結果を出力する。S1〜S4・S5prime-S5_scalar
+/// はいずれも段ごとに独立した `run` 呼び出し（別トランザクション・別 warmup/
+/// サンプル列）による中央値どうしの比較であり、測定ノイズにより逆転しうる
+/// （`Err(KnnProfileError::NonMonotonicStages)`）。この逆転は行数不一致・レイアウト
+/// ドリフト等の整合性検証（`fail_closed` で維持）とは性質が異なるため、ベンチを
+/// 失敗させず「未確定（n/a）」として出力を継続する（codex-review P2-2 指摘・
+/// PR #378）。
+fn print_stage_diff_or_unconfirmed(from: &str, to: &str, diff: Result<f64, KnnProfileError>) {
+    match diff {
+        Ok(value) => println!("{}", render_diff_line(from, to, value)),
+        Err(e) => println!(
+            "diff({from}->{to}): n/a (独立計測どうしの中央値比較のため測定ノイズにより \
+             逆転・未確定として継続: {e})"
+        ),
+    }
 }
 
 fn main() {
@@ -436,15 +454,30 @@ fn main() {
     // 保つため、S1 のループ本体は S2/S3 と同じ「行数を数えるだけ」に揃える
     // （バイト数集計等 S1 固有の処理を追加しない。S1 ⊆ S2 ⊆ S3 の入れ子を
     // 崩すと差分が歪む。codex-review 指摘・PR #378）。
+    //
+    // S1〜S3 は全段で「同じ型（u64）の累積器へ、行あたり同じ回数（2 回）だけ
+    // `std::hint::black_box` 経由で `wrapping_add` する」という同形・同量の
+    // 観測処理を持つ（S1 は行データを読まないため加算対象は定数、S2 はヘッダ
+    // 由来値、S3 は f32 由来値のビット列。観測処理自体の演算コストを全段で
+    // 揃えることで、S2−S1／S3−S2 の差分にヘッダデコード・f32 デコード以外の
+    // コスト〔checksum 演算の非対称性〕が混入しないようにする。
+    // codex-review P2-1 指摘・PR #378）。
     let s1 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
+        let mut checksum: u64 = 0;
         for entry in table.iter().expect("iter row table") {
             let _entry = entry.expect("iterate row entry");
+            // S2/S3 と同形の観測処理（モジュール冒頭コメント・上記コメント参照）。
+            // S1 は行バイト列を読まないため加算対象は定数だが、S2/S3 と同じ
+            // 回数・同じ型の演算を `black_box` 経由で行い、段間差分から
+            // checksum 演算コスト自体を相殺する。
+            checksum = checksum.wrapping_add(std::hint::black_box(1u64));
+            checksum = checksum.wrapping_add(std::hint::black_box(1u64));
             rows += 1;
         }
-        rows
+        (rows, checksum)
     })
     .expect("measurement must satisfy protocol minimums");
     let s1_rows = {
@@ -458,6 +491,11 @@ fn main() {
     // の長さ・`is_public` フラグはいずれもデコード結果に実際に依存する軽量な値の
     // ため、release 最適化でヘッダデコード自体が未観測として除去されるのを防ぐ。
     // codex-review P1-2 指摘・PR #378。S3 と同種の是正）。
+    //
+    // S1 と同形の観測処理（上記「S1〜S3 は全段で…」コメント参照）: 行あたり
+    // 常に 2 回、`black_box` 経由で `u64` 累積器へ加算する。分岐（`if is_public`）
+    // による加算回数の増減を避けるため、`is_public` は `bool as u64`（0/1）へ
+    // 変換してから無条件に加算する（codex-review P2-1 指摘・PR #378）。
     let s2 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
@@ -467,10 +505,8 @@ fn main() {
             let (_k, v) = entry.expect("iterate row entry");
             let (tenant_id, is_public, _offset) = decode_header_reimpl(v.value())
                 .expect("header decode must succeed for well-formed synthetic rows");
-            checksum = checksum.wrapping_add(tenant_id.len() as u64);
-            if is_public {
-                checksum = checksum.wrapping_add(1);
-            }
+            checksum = checksum.wrapping_add(std::hint::black_box(tenant_id.len() as u64));
+            checksum = checksum.wrapping_add(std::hint::black_box(is_public as u64));
             rows += 1;
         }
         (rows, checksum)
@@ -498,18 +534,26 @@ fn main() {
     // 借用参照のみのため checksum の元にならず、`scratch`（f32 デコードの実出力）
     // を直接使う必要がある（release 最適化で f32 デコード自体が未観測として
     // 除去されるのを防ぐ。codex-review P1-2 指摘・PR #378）。
+    //
+    // S1/S2 と同形の観測処理（上記「S1〜S3 は全段で…」コメント参照）: 行あたり
+    // 常に 2 回、`black_box` 経由で `u64` 累積器へ加算する。S1/S2 と型を揃える
+    // ため、f32 由来値は `f32::to_bits`（ビット列の再解釈。丸め等の追加浮動小数点
+    // 演算を持ち込まない）で `u32` へ変換したうえで `u64` へ拡張する
+    // （codex-review P2-1 指摘・PR #378）。
     let mut scratch: Vec<f32> = Vec::with_capacity(DIM);
     let s3 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
-        let mut checksum: f32 = 0.0;
+        let mut checksum: u64 = 0;
         for entry in table.iter().expect("iter row table") {
             let (_k, v) = entry.expect("iterate row entry");
             let _decoded = decode_row_reimpl(v.value(), &mut scratch)
                 .expect("row decode must succeed for well-formed synthetic rows");
-            checksum +=
-                scratch.first().copied().unwrap_or(0.0) + scratch.last().copied().unwrap_or(0.0);
+            let first_bits = scratch.first().copied().unwrap_or(0.0).to_bits() as u64;
+            let last_bits = scratch.last().copied().unwrap_or(0.0).to_bits() as u64;
+            checksum = checksum.wrapping_add(std::hint::black_box(first_bits));
+            checksum = checksum.wrapping_add(std::hint::black_box(last_bits));
             rows += 1;
         }
         (rows, checksum)
@@ -601,12 +645,15 @@ fn main() {
             );
         }
     }
-    // S1〜S3 の入れ子な累積段の差分は非単調なら整合性検証扱いで fail-closed する
-    // （S5prime-S5_scalar のみ独立経路間の測定ノイズを理由に非致命扱い。上記コメント
-    // 参照）。ここで初めて `unwrap_or_else` を評価し、これ以降は出力のみを行う。
-    let diff_s1_s2 = diff_s1_s2.unwrap_or_else(|e| fail_closed(e));
-    let diff_s2_s3 = diff_s2_s3.unwrap_or_else(|e| fail_closed(e));
-    let diff_s3_s4 = diff_s3_s4.unwrap_or_else(|e| fail_closed(e));
+    // S1〜S4 の段間差分は、各段が入れ子（S1 ⊆ S2 ⊆ S3 ⊆ S4）の処理を行う設計では
+    // あるものの、実測は段ごとに独立した `run` 呼び出し（別トランザクション・別
+    // warmup/サンプル列）であり、中央値どうしの比較である以上は測定ノイズにより
+    // 逆転しうる（S5prime-S5_scalar と同じ理由。上記コメント参照。codex-review
+    // P2-2 指摘・PR #378: 独立計測である事実を見落として fail_closed していた
+    // ため、以前は測定ノイズだけでベンチ全体が失敗しえた）。よってこれらの差分は
+    // 整合性検証（行数不一致・レイアウトドリフト等。fail-closed を維持）とは
+    // 区別し、非致命扱いとする。逆転した場合は該当差分のみ「未確定」として出力し、
+    // 他の測定値はそのまま出力を継続する。
 
     // --- 出力: 全測定・全整合性検証を完了したここまでの間、測定値は一切
     // println! していない（fail-closed 契約。上記「整合性検証」節参照）。以降は
@@ -647,13 +694,7 @@ fn main() {
             ns_per_row(s5_prime.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
         )
     );
-    match s5prime_vs_scalar_diff {
-        Ok(diff) => println!("{}", render_diff_line("S5prime", "S5_scalar", diff)),
-        Err(e) => println!(
-            "diff(S5prime->S5_scalar): skipped (独立経路間の測定ノイズにより非単調 \
-             ・非致命として継続: {e})"
-        ),
-    }
+    print_stage_diff_or_unconfirmed("S5prime", "S5_scalar", s5prime_vs_scalar_diff);
     println!(
         "{}",
         render_stage_line(
@@ -699,7 +740,7 @@ fn main() {
             ns_per_row(s2.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
         )
     );
-    println!("{}", render_diff_line("S1", "S2", diff_s1_s2));
+    print_stage_diff_or_unconfirmed("S1", "S2", diff_s1_s2);
     println!(
         "{}",
         render_stage_line(
@@ -709,8 +750,8 @@ fn main() {
             ns_per_row(s3.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
         )
     );
-    println!("{}", render_diff_line("S2", "S3", diff_s2_s3));
-    println!("{}", render_diff_line("S3", "S4", diff_s3_s4));
+    print_stage_diff_or_unconfirmed("S2", "S3", diff_s2_s3);
+    print_stage_diff_or_unconfirmed("S3", "S4", diff_s3_s4);
     println!(
         "residual(S0-(S4+S5)): median={:.3}ms (parse/bind/result-assembly 等。read_txn 境界差を含みうる保守的な残差)",
         residual.as_secs_f64() * 1e3
