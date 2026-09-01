@@ -24,6 +24,17 @@ use super::rng::DeterministicRng;
 /// `harness/hybrid_latency.rs::MAX_CORPUS_DOCS_GUARD` と同一方針）。
 pub const MAX_CORPUS_ROWS_GUARD: usize = 200_000;
 
+/// [`generate_corpus`] が許容する総要素数（`rows * dim`）の安全上限。`rows` は
+/// [`MAX_CORPUS_ROWS_GUARD`] で個別に上限検証しているが、`dim` は呼び出し元の
+/// 引数でありそれ自体に上限が無いため、乗算結果を `Vec::with_capacity` へ渡す前に
+/// 総要素数として別途上限を課す（coding-rust.md「無制限確保禁止」。乗算は
+/// `checked_mul` を使い、オーバーフロー時に `saturating_mul` のような巨大値への
+/// 丸めで `Vec::with_capacity` が OOM/abort する経路を作らない）。本ベンチが使う
+/// 最大次元（`dot_kernel_bench.rs::DIMS` の 1536）に十分な余裕を持たせつつ、
+/// 誤って巨大な `dim` を渡した場合に早期拒否できる値として 1 行あたり 65536
+/// 要素（次元）を上限に採る。
+pub const MAX_CORPUS_ELEMENTS_GUARD: usize = MAX_CORPUS_ROWS_GUARD * 65_536;
+
 /// 本モジュールのエラー型。
 #[derive(Debug, Clone, PartialEq)]
 pub enum DotKernelError {
@@ -49,7 +60,10 @@ impl fmt::Display for DotKernelError {
             ),
             DotKernelError::ZeroDots => write!(f, "cannot compute ns/dot for zero dot calls"),
             DotKernelError::CorpusTooLarge => {
-                write!(f, "rows exceeds {MAX_CORPUS_ROWS_GUARD}")
+                write!(
+                    f,
+                    "rows exceeds {MAX_CORPUS_ROWS_GUARD} or rows * dim exceeds {MAX_CORPUS_ELEMENTS_GUARD}"
+                )
             }
             DotKernelError::NonFiniteResult => write!(f, "measured result is not finite"),
             DotKernelError::ToleranceExceeded { actual, expected } => write!(
@@ -120,8 +134,17 @@ pub fn generate_corpus(seed: u64, dim: usize, rows: usize) -> Result<Vec<f32>, D
     if rows > MAX_CORPUS_ROWS_GUARD {
         return Err(DotKernelError::CorpusTooLarge);
     }
+    // `dim` は呼び出し元の引数で上限が無いため、`rows * dim` を `checked_mul` で
+    // 計算し、オーバーフロー（`None`）または [`MAX_CORPUS_ELEMENTS_GUARD`] 超過を
+    // ここで拒否してから `Vec::with_capacity` へ渡す（`saturating_mul` は
+    // オーバーフロー時に `usize::MAX` へ丸まり、巨大 capacity 要求で
+    // `Vec::with_capacity` が OOM/abort し得るため使わない）。
+    let total_elements = rows
+        .checked_mul(dim)
+        .filter(|&total| total <= MAX_CORPUS_ELEMENTS_GUARD)
+        .ok_or(DotKernelError::CorpusTooLarge)?;
     let mut rng = DeterministicRng::new(seed);
-    let mut out = Vec::with_capacity(rows.saturating_mul(dim));
+    let mut out = Vec::with_capacity(total_elements);
     for _ in 0..rows {
         out.extend_from_slice(&rng.next_vector(dim));
     }
