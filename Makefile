@@ -330,6 +330,18 @@ else
 endif
 
 # --------------------------------------------------
+# 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
+# --------------------------------------------------
+
+.PHONY: sparse-cache-recall-large
+sparse-cache-recall-large: ## Issue #358（疎索引キャッシュ導入後の Recall 非劣化検証。SEARCH-1・SEARCH-3 関連ポインタ）の大規模段 cold/hot 等価性テストを実行する（数万件規模で cargo test の既定実行時間を超えるため #[ignore]・手動実行専用。ci には含めない）
+ifdef HAS_CARGO
+	cargo test -p engine --test sparse_cache_recall -- --ignored
+else
+	@echo "skip: Cargo.toml 未追加のため sparse-cache-recall-large をスキップ"
+endif
+
+# --------------------------------------------------
 # クロスエンコーダリランカー実測（Issue #333・SEARCH-7。crates/engine/tests/rerank_cross_encoder_recall.rs）
 # --------------------------------------------------
 
