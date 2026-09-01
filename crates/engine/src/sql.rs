@@ -89,6 +89,7 @@
 
 pub mod aggregate;
 pub mod allowlist;
+pub(crate) mod arena_cache;
 pub mod exec;
 pub(crate) mod explain;
 pub(crate) mod expr_program;
