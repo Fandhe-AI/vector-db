@@ -107,6 +107,13 @@ pub struct BoundStatement {
     /// 行フックで事前適用し、`HINT ORDER` で DISTANCE 先行時は DISTANCE 段の後で
     /// 事後適用する）。
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `expr_filters` をステップ列コンパイルした実行形（Issue #353）。
+    /// `expr_filters` と要素数・評価順が 1 対 1 対応する（各インデックス `i`
+    /// について `expr_filter_programs[i]` は `expr_filters[i]` のコンパイル
+    /// 結果）。`sql::exec` の SCALAR 段行フックはこちらを評価する。
+    /// `expr_filters` フィールド自体は EXPLAIN・テスト等の可観測性のため
+    /// 残置し、実行経路からは参照しない。
+    pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
     pub(crate) ranking: Ranking,
     pub(crate) limit: usize,
     /// 取得モードの優先順位解決結果（TASK-161・SQL-12）。クエリ句 `USING MODE`
@@ -146,6 +153,7 @@ impl BoundStatement {
             metadata_filters,
             rls_predicate_present,
             expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
             ranking,
             limit,
             mode: crate::sql::mode::resolve_mode(None, None),
@@ -635,12 +643,21 @@ pub fn bind_in_session(
 
     let limit = validate_search_limit(stmt.limit)?;
 
+    // Issue #353: `expr_filters` を束縛時に 1 回だけステップ列コンパイルする
+    // （行ループでの再帰評価をなくす）。`expr_filters` と要素数・評価順が
+    // 1 対 1 対応するよう順序を保って構築する。
+    let expr_filter_programs = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+
     Ok(BoundStatement {
         table: stmt.table_name.clone(),
         projection,
         metadata_filters,
         rls_predicate_present,
         expr_filters,
+        expr_filter_programs,
         ranking,
         limit,
         mode: resolved_mode,
@@ -989,9 +1006,14 @@ pub(crate) enum AggregateInput {
     /// [`resolve_aggregate_input`] が型不整合として拒否済み）。
     TextColumn(usize),
     /// 上記以外の `Scalar` 型に束縛された式（列参照 `id` 単体を除く。`vec_norm(...)`
-    /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`sql::udf_call::eval` で
-    /// `id`・embedding から評価する。
-    ScalarExpr(crate::sql::udf_call::BoundExpr),
+    /// 等の組み込み関数・宣言的 UDF 呼び出し・四則演算）。`program`（束縛時に
+    /// ステップ列コンパイル済み、Issue #353）を行ループで評価する。`source` は
+    /// 元の `BoundExpr`（EXPLAIN・テストの可観測性のため残置。実行経路は
+    /// `program` のみを見る）。
+    ScalarExpr {
+        source: crate::sql::udf_call::BoundExpr,
+        program: crate::sql::expr_program::ExprProgram,
+    },
     /// `VECTOR` 列の裸の列参照（`COUNT` 限定。[`resolve_aggregate_input`] 参照）。
     /// 列は `ALTER TABLE ADD COLUMN`（TABLE-5）で追加された nullable な `VECTOR`
     /// 列の可能性があり、値が未設定の可視行は NULL として `COUNT` から除外する
@@ -1068,6 +1090,9 @@ pub(crate) struct BoundAggregate {
     pub(crate) items: Vec<BoundAggregateItem>,
     pub(crate) metadata_filters: Vec<MetadataFilter>,
     pub(crate) expr_filters: Vec<crate::sql::udf_call::BoundExpr>,
+    /// `expr_filters` をステップ列コンパイルした実行形（Issue #353。
+    /// `BoundStatement::expr_filter_programs` と同じ 1 対 1 対応の契約）。
+    pub(crate) expr_filter_programs: Vec<crate::sql::expr_program::ExprProgram>,
     pub(crate) rls_predicate_present: bool,
     /// 出力列順（`items` とは独立。`GROUP BY` の有無によらず常に構築する）。
     pub(crate) projection: Vec<ProjectionColumn>,
@@ -1141,7 +1166,13 @@ fn resolve_aggregate_input(
         AggregateArg::Expr(expr) => {
             let (bound, ty) = crate::sql::udf_call::bind_expr(expr, schema, udfs, node_budget)?;
             match ty {
-                ExprType::Scalar => Ok(AggregateInput::ScalarExpr(bound)),
+                ExprType::Scalar => {
+                    let program = crate::sql::expr_program::ExprProgram::compile(&bound);
+                    Ok(AggregateInput::ScalarExpr {
+                        source: bound,
+                        program,
+                    })
+                }
                 ExprType::Vector | ExprType::Bool => Err(SqlSurfaceError::invalid_input(
                     "aggregate argument must evaluate to a scalar",
                 )),
@@ -1226,11 +1257,19 @@ pub(crate) fn bind_aggregate(
         )?),
     };
 
+    // Issue #353: `BoundStatement` と同じく `expr_filters` を束縛時に 1 回だけ
+    // ステップ列コンパイルする。
+    let expr_filter_programs = expr_filters
+        .iter()
+        .map(crate::sql::expr_program::ExprProgram::compile)
+        .collect();
+
     Ok(BoundAggregate {
         table: stmt.table_name().to_string(),
         items,
         metadata_filters,
         expr_filters,
+        expr_filter_programs,
         rls_predicate_present,
         projection,
         group_by,
@@ -2143,7 +2182,7 @@ mod tests {
         assert_eq!(bound.items[2].input, AggregateInput::IdU64);
         assert!(matches!(
             bound.items[3].input,
-            AggregateInput::ScalarExpr(_)
+            AggregateInput::ScalarExpr { .. }
         ));
         assert!(matches!(
             bound.items[4].input,

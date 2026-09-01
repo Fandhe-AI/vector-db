@@ -47,6 +47,7 @@ use crate::policy::PolicyContext;
 use crate::row_codec;
 use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{AggregateInput, BoundAggregate};
 use crate::sql::udf_call::{self, BoundExpr, ExprValue};
 use crate::storage::{self, StorageError};
@@ -131,8 +132,8 @@ impl ReferencedColumns {
                         *slot = true;
                     }
                 }
-                AggregateInput::ScalarExpr(expr) => {
-                    if udf_call::references_embedding(expr) {
+                AggregateInput::ScalarExpr { source, .. } => {
+                    if udf_call::references_embedding(source) {
                         needs_embedding = true;
                     }
                 }
@@ -258,13 +259,13 @@ impl Accumulator {
             },
             (Min, AggregateInput::IdU64) => Accumulator::IdMin(None),
             (Max, AggregateInput::IdU64) => Accumulator::IdMax(None),
-            (Sum, AggregateInput::ScalarExpr(_)) => Accumulator::FloatSum(None),
-            (Avg, AggregateInput::ScalarExpr(_)) => Accumulator::FloatAvg {
+            (Sum, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatSum(None),
+            (Avg, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatAvg {
                 sum: None,
                 count: 0,
             },
-            (Min, AggregateInput::ScalarExpr(_)) => Accumulator::FloatMin(None),
-            (Max, AggregateInput::ScalarExpr(_)) => Accumulator::FloatMax(None),
+            (Min, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMin(None),
+            (Max, AggregateInput::ScalarExpr { .. }) => Accumulator::FloatMax(None),
             (Min, AggregateInput::TextColumn(_)) => Accumulator::TextMin(None),
             (Max, AggregateInput::TextColumn(_)) => Accumulator::TextMax(None),
             _ => return Err(accumulator_bug("unsupported (func, input) combination")),
@@ -277,12 +278,20 @@ impl Accumulator {
     /// `ScalarExpr` は [`accumulator_bug`] で fail-closed に拒否する——
     /// `ReferencedColumns` の導出漏れという実装バグの検出用であり、黙って空
     /// embedding として評価しない）。
+    /// `scratch` は [`crate::sql::expr_program::ExprProgram::eval`] が使う
+    /// スクラッチスタック（呼び出し元の行ループの外で確保し使い回す。Issue #353
+    /// で行ごとの再帰評価をなくすために導入）。[`StackValue`] は行 `embedding` へ
+    /// の借用を保持しないため（PR #373 codex-review 指摘対応）、`embedding` が
+    /// 行ごとに異なるライフタイムを持つ呼び出し元（`embedding_scratch` を毎行
+    /// `&mut` 上書きデコードする `execute_aggregate`）でも `scratch` を行ループの
+    /// 外から使い回せる。`ScalarExpr` 以外の入力では参照されない。
     pub(crate) fn observe(
         &mut self,
         input: &AggregateInput,
         id: u64,
         vector: &RowVector<'_>,
         scanned: &[Option<&str>],
+        scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
         match input {
             AggregateInput::AllVisible => self.observe_present(),
@@ -304,7 +313,7 @@ impl Accumulator {
                 let value = scanned.get(*index).copied().flatten();
                 self.observe_text(value)
             }
-            AggregateInput::ScalarExpr(expr) => {
+            AggregateInput::ScalarExpr { source, program } => {
                 // 式木が実際に embedding へ到達する場合のみ `vector.values` を
                 // 要求する（`references_embedding` は `ReferencedColumns::derive`
                 // が `needs_embedding` を立てる際と同じ判定関数。式木に
@@ -312,7 +321,7 @@ impl Accumulator {
                 // 空スライスで安全に評価できる）。`None` に到達したら
                 // `ReferencedColumns` の導出漏れという実装バグとして fail-closed
                 // に拒否する（黙って空 embedding へ縮退しない）。
-                let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                let embedding: &[f32] = if udf_call::references_embedding(source) {
                     match vector.values {
                         Some(v) => v,
                         None => {
@@ -324,7 +333,7 @@ impl Accumulator {
                 } else {
                     &[]
                 };
-                match udf_call::eval(expr, id, embedding)? {
+                match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
                     // `ScalarExpr` として束縛するため到達しない（束縛段の型検査と
@@ -583,7 +592,6 @@ pub(crate) fn execute_aggregate(
     for item in &bound.items {
         accumulators.push(Accumulator::new(item.func, &item.input)?);
     }
-
     // `VECTOR` 列を宣言するスキーマのみ次元検証を行う（`VECTOR` 列を持たない
     // テーブルは `row_codec`/`storage` 側で常に埋め込み次元 0 として符号化される
     // ため検証対象がない）。`arena.rs::validated_vector_dim_in_txn` と異なり
@@ -616,9 +624,6 @@ pub(crate) fn execute_aggregate(
         // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
         DecodeTier::Fast
     };
-    // embedding デコード（[`DecodeTier::Embedding`]）専用のスクラッチバッファ。
-    // 複数行にわたって capacity を使い回す（Issue #314 と同じパターン）。
-    let mut embedding_scratch: Vec<f32> = Vec::new();
 
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
@@ -636,6 +641,21 @@ pub(crate) fn execute_aggregate(
             })
         }
     };
+
+    // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
+    // 横展開）。行ごとに新しい `Vec<f32>` を確保する代わりにループ外で 1 本だけ
+    // 確保し、`storage::decode_row_body_into` が `clear()` 後に書き込む。同一
+    // テーブルは全行同一次元のため、初回のみ確保が発生し 2 行目以降は再確保なしで
+    // 使い回せる（`arena.rs::build_filtered_with_rows_and_limits_in_txn` と同じ方針）。
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。[`StackValue`] は行 `embedding` への借用を保持しないため、
+    // `embedding_scratch` を毎行 `&mut` で上書きデコードするこのループの外でも
+    // 1 回だけ確保し使い回せる（以前は `Vec<ExprValue<'a>>` を直接積んでおり、
+    // 借用ライフタイムが行ごとに変わることと両立しないため行ごとに新規確保して
+    // いた）。
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -749,8 +769,10 @@ pub(crate) fn execute_aggregate(
             }
             // `expr_filters` が embedding を参照する場合のみ実データを渡す
             // （`references_embedding` は `tier` 決定時と同じ判定関数）。参照しない
-            // 式は `id` のみで評価できるため空スライスで安全に評価できる。
-            for expr in &bound.expr_filters {
+            // 式は `id` のみで評価できるため空スライスで安全に評価できる。評価自体は
+            // 束縛時にステップ列コンパイル済みの `expr_filter_programs`（`expr_filters`
+            // と要素数・評価順が 1 対 1 対応。Issue #353）を使う。
+            for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
                 let embedding: &[f32] = if udf_call::references_embedding(expr) {
                     match tier {
                         DecodeTier::Embedding => embedding_scratch.as_slice(),
@@ -765,7 +787,7 @@ pub(crate) fn execute_aggregate(
                 } else {
                     &[]
                 };
-                match udf_call::eval(expr, id, embedding)? {
+                match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
@@ -796,7 +818,7 @@ pub(crate) fn execute_aggregate(
                 },
             };
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                accumulator.observe(&item.input, id, &vector, &scanned)?;
+                accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
             }
         }
     }
@@ -916,6 +938,7 @@ mod tests {
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
             rls_predicate_present: false,
             projection: vec![crate::sql::parser::ProjectionColumn::Aggregate {
                 item_index: 0,

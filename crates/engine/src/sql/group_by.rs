@@ -41,6 +41,7 @@ use crate::sql::aggregate::{
 };
 use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
+use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{self, BinOp, ExprValue};
 use crate::storage;
@@ -142,7 +143,10 @@ fn new_accumulators(
 /// （Issue #351 で行ループから抽出。before/after 比較による加算・減算ロジックは
 /// 抽出前と完全に同一）。`vector` は呼び出し元が `tier`（[`DecodeTier`]）に応じて
 /// 組み立てた行 1 件分の `VECTOR` 列ビュー（Issue #350。embedding 未デコード時は
-/// `values: None`）。
+/// `values: None`）。`expr_scratch` は [`Accumulator::observe`] が内部で
+/// `ExprProgram::eval` を呼ぶ際の明示スタック（Issue #353。行に依存する借用を
+/// 保持しないため、呼び出し元が行ループの外で 1 回だけ確保したバッファを
+/// 使い回せる。`aggregate.rs::execute_aggregate` と同じ方針）。
 fn accumulate_row(
     accs: &mut [Accumulator],
     items: &[crate::sql::parser::BoundAggregateItem],
@@ -150,6 +154,7 @@ fn accumulate_row(
     vector: &RowVector<'_>,
     scanned: &[Option<&str>],
     total_text_accumulator_bytes: &mut usize,
+    expr_scratch: &mut Vec<StackValue>,
 ) -> Result<(), SqlSurfaceError> {
     for (accumulator, item) in accs.iter_mut().zip(items) {
         // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
@@ -158,7 +163,7 @@ fn accumulate_row(
         // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
         // 実際の保持量を正確に反映する）。
         let before = accumulator.text_len();
-        accumulator.observe(&item.input, id, vector, scanned)?;
+        accumulator.observe(&item.input, id, vector, scanned, expr_scratch)?;
         let after = accumulator.text_len();
         if after > before {
             let delta = after - before;
@@ -375,6 +380,11 @@ pub(crate) fn execute_grouped_aggregate(
     // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
     // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
     let mut embedding_scratch: Vec<f32> = Vec::new();
+    // Issue #353・PR #373 codex-review 指摘対応: `ExprProgram::eval` の明示
+    // スタック。[`StackValue`] は行 `embedding` への借用を保持しないため、
+    // `embedding_scratch` を毎行 `&mut` で上書きデコードするこのループの外でも
+    // 1 回だけ確保し使い回せる（`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut expr_scratch: Vec<StackValue> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -440,7 +450,7 @@ pub(crate) fn execute_grouped_aggregate(
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            for expr in &bound.expr_filters {
+            for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
                 let embedding: &[f32] = if udf_call::references_embedding(expr) {
                     match tier {
                         DecodeTier::Embedding => embedding_scratch.as_slice(),
@@ -453,7 +463,7 @@ pub(crate) fn execute_grouped_aggregate(
                 } else {
                     &[]
                 };
-                match udf_call::eval(expr, id, embedding)? {
+                match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     _ => {
@@ -492,7 +502,6 @@ pub(crate) fn execute_grouped_aggregate(
                     DecodeTier::Fast | DecodeTier::DimAndScalar => None,
                 },
             };
-
             match key_value {
                 Some(key_str) => {
                     if let Some(accs) = string_groups.get_mut(key_str) {
@@ -504,6 +513,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &vector,
                             &scanned,
                             &mut total_text_accumulator_bytes,
+                            &mut expr_scratch,
                         )?;
                     } else {
                         // 新規グループ: 予算検査 → ローカルでアキュムレータを
@@ -522,6 +532,7 @@ pub(crate) fn execute_grouped_aggregate(
                             &vector,
                             &scanned,
                             &mut total_text_accumulator_bytes,
+                            &mut expr_scratch,
                         )?;
                         string_groups.insert(try_clone_str(key_str)?, accs);
                     }
@@ -541,6 +552,7 @@ pub(crate) fn execute_grouped_aggregate(
                         &vector,
                         &scanned,
                         &mut total_text_accumulator_bytes,
+                        &mut expr_scratch,
                     )?;
                 }
             }
@@ -722,6 +734,7 @@ mod tests {
             }],
             metadata_filters: Vec::new(),
             expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
             rls_predicate_present: false,
             projection: vec![
                 crate::sql::parser::ProjectionColumn::GroupKey {
