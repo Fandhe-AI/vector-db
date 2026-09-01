@@ -22,15 +22,24 @@
 //! `tenant_id`・`visibility`・本体デコード再開オフセットを取り出し
 //! （[`crate::storage::decode_row_header`]）、[`crate::policy::PolicyContext::is_visible`]
 //! が `false` を返す行は embedding・metadata を一切デコードせずスキップする。
-//! 可視行のみ、ヘッダのオフセットを引き継いで本体デコール（[`crate::storage::decode_row_body_into`]。
-//! スクラッチ再利用によりヘッダの二重デコード・行ごとの `Vec<f32>` 新規確保を
-//! 避ける。Issue #349・Issue #314 の横展開）して SCALAR 段（`WHERE`）・集計へ進む。
+//! 可視行はまず物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id` の
+//! 整合検査（TABLE-12。従来 `storage::decode_row_for_key` が担っていた検査を
+//! 呼び出し元の明示比較へ移設。`storage::verify_row_key_tenant`）を`tier` に
+//! 関わらず必ず経てから、実際にクエリが参照するデータだけを段階的にデコードして
+//! SCALAR 段（`WHERE`）・集計へ進む（[`ReferencedColumns`]・[`DecodeTier`] 参照。
+//! Issue #350: embedding 非参照集計のデコードスキップと必要列限定デコード。
+//! `DecodeTier::Embedding` はヘッダのオフセットを引き継いで本体のみをデコードし
+//! （[`crate::storage::decode_row_body_into`]。スクラッチ再利用によりヘッダの
+//! 二重デコード・行ごとの `Vec<f32>` 新規確保を避ける。Issue #349・Issue #314
+//! の横展開）、`DecodeTier::Fast`・`DecodeTier::DimAndScalar` は
+//! `storage::decode_row_dim_and_metadata_borrowed`（ヒープ確保を伴わない構造検証・
+//! embedding 自体は `Vec<f32>` へ確保しない）を必ず通す（codex-review P1 指摘・
+//! PR #369: `DecodeTier::Fast` が構造検証を省略すると破損した可視行を集計結果へ
+//! 含めてしまう fail-open な契約変更になるため）。
 //! `COUNT` 等の集計値から他テナント行の存在・件数を推測できないという契約
 //! （RLS-7・RLS-8）は、この「不可視行は集約対象に一切現れない」という走査自体の
-//! 構造で担保する。物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
-//! の整合検査（TABLE-12。従来 `storage::decode_row_for_key` が担っていた検査）は、
-//! 本体デコード直前に明示比較として実行する（呼び出し元へ移設。検査自体は
-//! 削除しない）。
+//! 構造で担保し、デコード段階の縮小はこの構造に一切手を加えない（可視性判定・
+//! TABLE-12 の整合検査・metadata の構造検証は全 tier で常に行う）。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -40,7 +49,7 @@ use crate::sql::allowlist::{AggregateFunc, SqlSurfaceError};
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::expr_program::StackValue;
 use crate::sql::parser::{AggregateInput, BoundAggregate};
-use crate::sql::udf_call::ExprValue;
+use crate::sql::udf_call::{self, BoundExpr, ExprValue};
 use crate::storage::{self, StorageError};
 use redb::ReadableTable;
 
@@ -52,6 +61,153 @@ pub(crate) fn accumulator_bug(detail: &str) -> SqlSurfaceError {
     SqlSurfaceError::Internal {
         detail: format!("aggregate accumulator/input type mismatch: {detail}"),
     }
+}
+
+/// 可視行 1 件から取り出した `VECTOR` 列の値のビュー（Issue #350）。
+/// [`ReferencedColumns::needs_embedding`] に応じて呼び出し元（`execute_aggregate`・
+/// `sql::group_by::execute_grouped_aggregate`）が `values` を実際にデコード済みの
+/// embedding（`Some`）か、デコードを省略した状態（`None`。`dim` のみ既知）かで
+/// 埋め分ける。`dim > 0` は「`VECTOR` 列が NULL でない」を表す（
+/// `storage::Row::embedding` が空 = 未設定という既存契約の dim 版）。ファストパス
+/// （[`DecodeTier::Fast`]）でも `dim` は `decode_row_dim_and_metadata_borrowed`
+/// による構造検証込みの実値を持つ（PR #369 codex-review P1 対応。破損行を fail-open
+/// で見逃さないための変更で、値自体はファストパス到達条件
+/// （`VectorColumnPresence`/`ScalarExpr` 系項目を含まない）により集計結果へは
+/// 影響しない）。
+pub(crate) struct RowVector<'a> {
+    pub(crate) dim: u32,
+    pub(crate) values: Option<&'a [f32]>,
+}
+
+/// [`BoundAggregate`] が実際に参照する列集合（Issue #350）。行走査ループが
+/// 可視行 1 件ごとにどこまでデコードすべきか（[`DecodeTier`]）を決めるために
+/// 束縛結果から一度だけ導出する。
+///
+/// `embedding` へのアクセスは束縛段で [`BoundExpr::VectorRef`] に一元化されている
+/// （`sql::udf_call::eval` 参照）ため、`references_embedding` による式木の再帰走査は
+/// 過小評価が起きない精密判定になる。判定に自信が持てない新 variant が将来
+/// `BoundExpr` へ追加された場合は、`references_embedding` 側の非網羅 `match`（`_`
+/// パターン禁止）がコンパイルエラーとして検出する設計にしてあり、ここで黙って
+/// 「デコード不要」側に倒れることはない。
+pub(crate) struct ReferencedColumns {
+    /// `schema.columns` と同じ長さ。[`row_codec::scan_scalar_columns_masked`] へ
+    /// そのまま渡すマスク。
+    scalar_mask: Vec<bool>,
+    /// `ScalarExpr` 項目または `expr_filters`（`WHERE`）の式木が embedding へ
+    /// 到達する場合に `true`。
+    needs_embedding: bool,
+    /// `VectorColumnPresence`（`COUNT(<VECTOR 列>)`）項目がある場合に `true`
+    /// （embedding 自体は不要・dim のみ必要）。
+    needs_vector_presence: bool,
+    /// `TextColumn` 項目・`metadata_filters`・`GROUP BY` キー列のいずれかが
+    /// スカラー列を参照する場合に `true`。`scalar_mask` への反映（`get_mut`）が
+    /// 範囲外インデックスで黙って無視された場合でも、この値は参照の有無を
+    /// 直接記録するため `any_scalar_column_referenced()`（`scalar_mask` 経由の
+    /// 間接判定）だけに依存せず `DecodeTier::Fast` の誤選択を防ぐ
+    /// （codex-review 指摘対応）。
+    has_scalar_reference: bool,
+}
+
+impl ReferencedColumns {
+    /// `items`・`metadata_filters`・`expr_filters` に加え、`GROUP BY` キー列
+    /// （`extra_scalar_index`。`GROUP BY` なしの単一行集計では `None`）から
+    /// 参照列集合を導出する。
+    pub(crate) fn derive(
+        schema: &TableSchema,
+        items: &[crate::sql::parser::BoundAggregateItem],
+        metadata_filters: &[declarative_filter::MetadataFilter],
+        expr_filters: &[BoundExpr],
+        extra_scalar_index: Option<usize>,
+    ) -> Self {
+        let mut scalar_mask = vec![false; schema.columns.len()];
+        let mut needs_embedding = false;
+        let mut needs_vector_presence = false;
+        let mut has_scalar_reference = false;
+
+        for item in items {
+            match &item.input {
+                AggregateInput::TextColumn(index) => {
+                    has_scalar_reference = true;
+                    if let Some(slot) = scalar_mask.get_mut(*index) {
+                        *slot = true;
+                    }
+                }
+                AggregateInput::ScalarExpr { source, .. } => {
+                    if udf_call::references_embedding(source) {
+                        needs_embedding = true;
+                    }
+                }
+                AggregateInput::VectorColumnPresence => needs_vector_presence = true,
+                AggregateInput::AllVisible | AggregateInput::IdU64 => {}
+            }
+        }
+        if !metadata_filters.is_empty() {
+            has_scalar_reference = true;
+        }
+        for filter in metadata_filters {
+            if let Some(slot) = scalar_mask.get_mut(filter.column_index()) {
+                *slot = true;
+            }
+        }
+        for expr in expr_filters {
+            if udf_call::references_embedding(expr) {
+                needs_embedding = true;
+            }
+        }
+        if let Some(index) = extra_scalar_index {
+            has_scalar_reference = true;
+            if let Some(slot) = scalar_mask.get_mut(index) {
+                *slot = true;
+            }
+        }
+
+        ReferencedColumns {
+            scalar_mask,
+            needs_embedding,
+            needs_vector_presence,
+            has_scalar_reference,
+        }
+    }
+
+    /// `DecodeTier::Fast` 選択可否の判定に使う。`scalar_mask`（`get_mut` が
+    /// 範囲外インデックスで無視された場合に値が反映されない可能性がある）
+    /// ではなく `has_scalar_reference`（参照の有無を直接記録した値）を主とし、
+    /// 両者いずれかが立っていれば `true` を返す fail-closed 判定にする。
+    fn any_scalar_column_referenced(&self) -> bool {
+        self.has_scalar_reference || self.scalar_mask.iter().any(|&wanted| wanted)
+    }
+
+    pub(crate) fn scalar_mask(&self) -> &[bool] {
+        &self.scalar_mask
+    }
+
+    pub(crate) fn needs_embedding(&self) -> bool {
+        self.needs_embedding
+    }
+}
+
+/// 可視行 1 件のデコード段階（Issue #350: embedding 非参照集計のデコードスキップと
+/// 必要列限定デコード）。段階が進むほどデコードコストが増える（`Fast` <
+/// `DimAndScalar` < `Embedding`）。可視性判定・TABLE-12 のキー/ヘッダ tenant 整合
+/// 検査はどの段階でも必ず行う（この列挙自体はデコード「範囲」だけを制御し、RLS 段の
+/// 順序・全行実行には関与しない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeTier {
+    /// `COUNT(*)`・`COUNT(id)`・`SUM`/`AVG`/`MIN`/`MAX(id)` のみ・`WHERE` 述語なし・
+    /// `GROUP BY` なしの場合に限り選択する（受入条件 3。単一行集計
+    /// 〔`execute_aggregate`〕専用で、`GROUP BY` はグループキー列を必ず読む必要が
+    /// あるため到達しない）。dim・metadata の構造検証は `DimAndScalar` と同じ
+    /// `decode_row_dim_and_metadata_borrowed` を通す（PR #369 codex-review P1
+    /// 対応。破損した可視行を fail-open で集計へ含めない）。`DimAndScalar` との
+    /// 違いは metadata の `&str` 化・保持（`scan_scalar_columns_masked`）を
+    /// 省略する点のみ。
+    Fast,
+    /// dim・metadata（マスク済み `scan_scalar_columns_masked`）まで。embedding は
+    /// 構造検証のみで `Vec<f32>` へ確保しない
+    /// （[`storage::decode_row_dim_and_metadata_borrowed`]）。
+    DimAndScalar,
+    /// embedding を含む完全デコード（[`storage::decode_row_embedding_and_metadata_into`]）。
+    Embedding,
 }
 
 /// 集計項目 1 つの実行時アキュムレータ（TASK-166・SQL-13）。すべて O(1) 状態
@@ -117,7 +273,11 @@ impl Accumulator {
     }
 
     /// 可視行 1 件を観測して状態を更新する。`scanned` は同じ行の
-    /// `row_codec::scan_scalar_columns` 結果（借用のまま）。
+    /// `row_codec::scan_scalar_columns_masked` 結果（借用のまま。`vector` が
+    /// `values: None` を持つ場合は embedding 未デコードのため、そこへ到達する
+    /// `ScalarExpr` は [`accumulator_bug`] で fail-closed に拒否する——
+    /// `ReferencedColumns` の導出漏れという実装バグの検出用であり、黙って空
+    /// embedding として評価しない）。
     /// `scratch` は [`crate::sql::expr_program::ExprProgram::eval`] が使う
     /// スクラッチスタック（呼び出し元の行ループの外で確保し使い回す。Issue #353
     /// で行ごとの再帰評価をなくすために導入）。[`StackValue`] は行 `embedding` へ
@@ -129,7 +289,7 @@ impl Accumulator {
         &mut self,
         input: &AggregateInput,
         id: u64,
-        embedding: &[f32],
+        vector: &RowVector<'_>,
         scanned: &[Option<&str>],
         scratch: &mut Vec<StackValue>,
     ) -> Result<(), SqlSurfaceError> {
@@ -138,9 +298,11 @@ impl Accumulator {
             // nullable な `VECTOR` 列（TABLE-5 の `ALTER TABLE ADD COLUMN` で追加
             // された列を含む）の裸の列参照。`row.embedding` が空 = 未設定（NULL）
             // という `storage::Row` の既存契約に従い、NULL 行は数えない
-            // （PR #229 codex-review 指摘対応）。
+            // （PR #229 codex-review 指摘対応）。embedding 自体は不要なため
+            // `dim`（`storage::decode_row_dim_and_metadata_borrowed` 由来）だけで
+            // 判定する。
             AggregateInput::VectorColumnPresence => {
-                if embedding.is_empty() {
+                if vector.dim == 0 {
                     Ok(())
                 } else {
                     self.observe_present()
@@ -151,7 +313,26 @@ impl Accumulator {
                 let value = scanned.get(*index).copied().flatten();
                 self.observe_text(value)
             }
-            AggregateInput::ScalarExpr { program, .. } => {
+            AggregateInput::ScalarExpr { source, program } => {
+                // 式木が実際に embedding へ到達する場合のみ `vector.values` を
+                // 要求する（`references_embedding` は `ReferencedColumns::derive`
+                // が `needs_embedding` を立てる際と同じ判定関数。式木に
+                // `VectorRef` が無ければ `eval` は embedding を一切参照しないため
+                // 空スライスで安全に評価できる）。`None` に到達したら
+                // `ReferencedColumns` の導出漏れという実装バグとして fail-closed
+                // に拒否する（黙って空 embedding へ縮退しない）。
+                let embedding: &[f32] = if udf_call::references_embedding(source) {
+                    match vector.values {
+                        Some(v) => v,
+                        None => {
+                            return Err(accumulator_bug(
+                                "ScalarExpr references the VECTOR column but the row's embedding was not decoded",
+                            ))
+                        }
+                    }
+                } else {
+                    &[]
+                };
                 match program.eval(id, embedding, scratch)? {
                     ExprValue::Scalar(v) => self.observe_float(v),
                     // `resolve_aggregate_input` が `ExprType::Scalar` のみを
@@ -419,6 +600,31 @@ pub(crate) fn execute_aggregate(
     // 独自の走査を持つ）。
     let expected_dim = schema.vector_dim();
 
+    // Issue #350: クエリが実際に参照する列集合から、可視行 1 件あたりの最小限の
+    // デコード段階（[`DecodeTier`]）を一度だけ決める（`GROUP BY` なしなので
+    // `extra_scalar_index` は無し）。
+    let referenced = ReferencedColumns::derive(
+        schema,
+        &bound.items,
+        &bound.metadata_filters,
+        &bound.expr_filters,
+        None,
+    );
+    let tier = if referenced.needs_embedding {
+        DecodeTier::Embedding
+    } else if referenced.needs_vector_presence
+        || referenced.any_scalar_column_referenced()
+        || !bound.expr_filters.is_empty()
+    {
+        DecodeTier::DimAndScalar
+    } else {
+        // `WHERE`（`metadata_filters`・`expr_filters` いずれも空）・`VECTOR` 列
+        // 参照・スカラー列参照のいずれも無い場合のみ（`COUNT(*)`・`COUNT(id)`・
+        // `SUM`/`AVG`/`MIN`/`MAX(id)` の組み合わせ）。RLS 可視判定＋TABLE-12 の
+        // キー/ヘッダ tenant 整合検査だけで完結する（受入条件 3）。
+        DecodeTier::Fast
+    };
+
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
         Ok(t) => Some(t),
@@ -463,39 +669,59 @@ pub(crate) fn execute_aggregate(
             // クエリ可用性へ干渉しない設計を踏襲する（codex P0 対応・Issue #137、
             // security.md P0「テナント境界」）。`offset` は本体デコードの再開位置
             // （[`storage::decode_row_body_into`] へそのまま渡す。Issue #349:
-            // 従来はここで一度ヘッダを読んだ後、`decode_row_for_key` の内部で
-            // ヘッダをもう一度読んでいた二重デコードを排除する）。
+            // ここで一度ヘッダを読んだ後に本体デコード関数の内部でヘッダを
+            // もう一度読む二重デコードを、`DecodeTier::Embedding` 到達時は
+            // 避ける）。
             let (tenant_id, visibility, offset) =
                 storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
-            // ここに到達するのは可視行のみ。複合キー側の `key_tenant` とヘッダ側
-            // `tenant_id` の不一致（内部バグ・raw redb 書き込みによる異常）を
-            // fail-closed に拒否する（TABLE-12 の整合検査。従来は
-            // `storage::decode_row_for_key` の内部検査だったものを明示比較として
-            // 呼び出し元へ移設。検査内容・拒否時のエラーメッセージは変えない。
-            // codex P0 指摘対応・PR #229 の踏襲）。
-            if tenant_id != key_tenant {
-                return Err(storage_internal(StorageError::Codec(
-                    "row key tenant mismatch".to_string(),
-                )));
-            }
+            // 可視行・常に: 複合キー側の `key_tenant` とヘッダ側 `tenant_id` の
+            // 不一致（内部バグ・raw redb 書き込みによる異常）を fail-closed に
+            // 拒否する（対象ビヘイビア: TABLE-12。codex P0 指摘対応・PR #229の
+            // 踏襲）。以降の embedding・metadata デコードは `tier`（Issue #350）に
+            // 応じて必要な範囲のみ行う。
+            storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
 
-            // 以降は本体（embedding・metadata）をデコードして SCALAR 段・集計へ
-            // 進む。ヘッダは上で既にデコード済みのため、そのオフセットを引き継いで
-            // 本体のみをデコードする（行ごとに新しい `Vec<f32>` を確保する
-            // `decode_row` の代わりにループ外の `embedding_scratch` へ書き込む）。
-            let (dim, metadata) =
-                storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
-                    .map_err(storage_internal)?;
+            // 可視行・必要時のみ（Issue #350: embedding 非参照集計のデコード
+            // スキップと必要列限定デコード）: `tier` が要求する範囲だけ dim・
+            // metadata・embedding をデコードする。`DecodeTier::Fast` は
+            // embedding・metadata を一切デコードしないため、`dim` は次元検証の
+            // 対象を持たない `0` で表す（ファストパス到達条件は `VECTOR` 列・
+            // スカラー列のいずれも参照しないため、この値が誤って観測に使われる
+            // ことはない）。
+            // `DecodeTier::Fast` も `DecodeTier::DimAndScalar` と同じ
+            // `decode_row_dim_and_metadata_borrowed`（ヒープ確保を伴わない構造検証
+            // のみ・embedding は境界検証のみで `Vec<f32>` へ確保しない）を必ず通す
+            // （codex-review P1 指摘・PR #369: `DecodeTier::Fast` が embedding/
+            // metadata セクションの切断・長さ不整合・次元不一致を検査せず破損した
+            // 可視行を集計結果へ含めてしまう fail-open な契約変更になっていたため。
+            // `Fast` が省略するのは metadata の `&str` 化・保持
+            // （`scan_scalar_columns_masked`。呼び出し側で
+            // `any_scalar_column_referenced()` が偽の場合は既に省略済み）と
+            // embedding の `f32` 変換・確保（`decode_row_embedding_and_metadata_into`）
+            // だけであり、破損検知（`XX000`）は全 tier で維持する）。
+            let (dim, metadata): (u32, &[u8]) = match tier {
+                DecodeTier::Fast | DecodeTier::DimAndScalar => {
+                    storage::decode_row_dim_and_metadata_borrowed(buf).map_err(storage_internal)?
+                }
+                DecodeTier::Embedding => {
+                    // 上で読み済みの `offset`（ヘッダ直後の再開位置）を引き継ぎ、
+                    // ヘッダの二重デコードを避ける（Issue #349）。
+                    storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                        .map_err(storage_internal)?
+                }
+            };
             // `dim == 0` = `VECTOR` 列が未設定（NULL、TABLE-5 の
             // `ALTER TABLE ADD COLUMN` で追加された nullable 列を含む）という
             // `storage::Row` の既存契約に従い、次元検証は値が実際に存在する行に
             // だけ行う。空を無条件に次元不一致として拒否すると、`COUNT(*)` 等
             // `VECTOR` 値を参照しない集計まで nullable 列の NULL 行で `XX000`
-            // 失敗する（PR #229 codex-review 指摘対応）。
+            // 失敗する（PR #229 codex-review 指摘対応）。`DecodeTier::Fast` も
+            // dim を実際に読むため（PR #369 codex-review P1 対応）この検証を
+            // 同じく経る。
             if let Some(expected) = expected_dim {
                 if dim != 0 && dim != expected {
                     return Err(SqlSurfaceError::Internal {
@@ -505,15 +731,63 @@ pub(crate) fn execute_aggregate(
                 }
             }
 
-            let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
+            // マスク外の列は presence・長さ・バッファ境界・UTF-8 妥当性の構造検証
+            // だけを行い `&str` 化・保持を省略する。`referenced.scalar_mask()` が
+            // 全列 `false`（どの列も参照しない。`COUNT(*)`・`SUM(id)` 等）でも
+            // 構造検証自体は省略しない（codex-review P1 指摘・PR #369: 検証を丸ごと
+            // 省略すると metadata の presence・列長・UTF-8・余剰バイトの構造検証が
+            // 全く行われず、破損した可視行を検出できないまま集計が成功してしまう
+            // fail-open な契約変更になるため）。
+            //
+            // `DecodeTier::Fast` は `docs/design/aggregate-decode-skip.md` の tier
+            // 契約どおり [`row_codec::validate_scalar_columns`]（検証専用・`Vec`
+            // 確保なし）を使う（codex-review P1 指摘・PR #369: 全 tier で
+            // `scan_scalar_columns_masked` を呼び毎行 `Vec<Option<&str>>` を確保
+            // していたのは、`Fast` がこの確保自体を省略するという tier 契約に反する
+            // 実装バグだった）。`Fast` 到達時は `scalar_mask` が全列 `false` かつ
+            // `metadata_filters`・`expr_filters` が空（tier 決定条件）であるため、
+            // 空スライスで安全に代用できる（`matches_all` は無条件で真、
+            // `Accumulator::observe` の `TextColumn` はこの tier では出現しない）。
+            let scanned: Vec<Option<&str>> = match tier {
+                DecodeTier::Fast => {
+                    row_codec::validate_scalar_columns(schema, metadata)?;
+                    Vec::new()
+                }
+                DecodeTier::DimAndScalar | DecodeTier::Embedding => {
+                    row_codec::scan_scalar_columns_masked(
+                        schema,
+                        metadata,
+                        Some(referenced.scalar_mask()),
+                    )?
+                }
+            };
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
-            for program in &bound.expr_filter_programs {
-                match program.eval(id, &embedding_scratch, &mut expr_scratch)? {
+            // `expr_filters` が embedding を参照する場合のみ実データを渡す
+            // （`references_embedding` は `tier` 決定時と同じ判定関数）。参照しない
+            // 式は `id` のみで評価できるため空スライスで安全に評価できる。評価自体は
+            // 束縛時にステップ列コンパイル済みの `expr_filter_programs`（`expr_filters`
+            // と要素数・評価順が 1 対 1 対応。Issue #353）を使う。
+            for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
+                let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                    match tier {
+                        DecodeTier::Embedding => embedding_scratch.as_slice(),
+                        // `tier` 決定は `expr_filters` の embedding 参照有無も
+                        // 見ているため到達しない（実装バグの検出用）。
+                        DecodeTier::Fast | DecodeTier::DimAndScalar => {
+                            return Err(accumulator_bug(
+                                "WHERE expression references the VECTOR column but tier did not decode it",
+                            ))
+                        }
+                    }
+                } else {
+                    &[]
+                };
+                match program.eval(id, embedding, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
@@ -526,28 +800,25 @@ pub(crate) fn execute_aggregate(
                 }
             }
 
-            // 構造的なトリップワイヤ（Issue #349 で単一ヘッダデコードへ統合した
-            // ため、独立した二重検証ではなくなった点に注意——`tenant_id`・
-            // `visibility` は上の判定と同じ [`storage::decode_row_header`] 呼び出し
-            // 由来の束縛で、この間に値を書き換える経路もない。したがって現状は
-            // 論理的に到達不能だが、AGG 段の直前にもう一段 `is_visible` を通す
-            // ゲートを残しておくことで、将来ここに `tenant_id`/`visibility` を
-            // 再導出・再束縛するコードが差し込まれた場合でも RLS 判定を経由せずに
-            // 集約へ抜けられないようにする（`arena.rs::build_filtered_with_rows_and_limits_in_txn`
-            // も Issue #314 で同じ単一ゲート構成を採用済み。security.md P0）。
+            // defense-in-depth（RlsSafetyNet と同趣旨）: 上のヘッダ由来判定と
+            // 独立した検査ではなく、ヘッダから取り出した同じ `tenant_id`・
+            // `visibility` に対して `PolicyContext::is_visible` を再適用するだけの
+            // 重ね掛け。デコード前判定が唯一の防御線にならないようにする
+            // （security.md P0）。
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
             // AGG 段。
+            let vector = RowVector {
+                dim,
+                values: match tier {
+                    DecodeTier::Embedding => Some(embedding_scratch.as_slice()),
+                    DecodeTier::Fast | DecodeTier::DimAndScalar => None,
+                },
+            };
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                accumulator.observe(
-                    &item.input,
-                    id,
-                    &embedding_scratch,
-                    &scanned,
-                    &mut expr_scratch,
-                )?;
+                accumulator.observe(&item.input, id, &vector, &scanned, &mut expr_scratch)?;
             }
         }
     }
@@ -677,6 +948,36 @@ mod tests {
         }
     }
 
+    /// 検証専用: `encode_row` で組み立てた妥当な行バイト列を、そのまま行テーブルへ
+    /// 直接書き込む（`storage::encode_row` の検証をバイパスして任意バイト列を
+    /// 挿入する `write_row_direct` とは異なり、ここでは呼び出し元が事前に破損させた
+    /// `buf` をそのまま書き込む）。
+    fn write_row_raw(storage: &Storage, table_name: &str, tenant_id: &str, id: u64, buf: &[u8]) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            table.insert((tenant_id, id), buf).expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    /// `encode_row` が組み立てた行バイト列の `dim` フィールドを
+    /// `MAX_EMBEDDING_DIM` 超過の値へ書き換える（embedding/metadata セクション
+    /// 全体の以降のデコードを構造的に破綻させる検証専用ヘルパ）。オフセット計算は
+    /// `storage.rs` の行フォーマット（version 1B + tenant_len 2B + tenant_id +
+    /// visibility 1B + dim 4B ...）に対応する（`storage.rs` 側の同種テスト
+    /// `decode_row_dim_and_metadata_borrowed_rejects_same_corruptions_as_decode_row`
+    /// 等と同じオフセット計算）。
+    fn corrupt_dim_field(mut buf: Vec<u8>, tenant_id: &str) -> Vec<u8> {
+        let dim_offset = 1 + 2 + tenant_id.len() + 1;
+        buf[dim_offset..dim_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        buf
+    }
+
     #[test]
     fn count_vector_column_skips_null_rows_but_count_star_does_not() {
         let path = unique_db_path("agg-nullable-vector");
@@ -738,6 +1039,127 @@ mod tests {
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
         let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
             .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    // --- DecodeTier::Fast の破損検知（Issue #350・PR #369 codex-review P1 対応） ---
+
+    #[test]
+    fn count_star_fastpath_still_fails_closed_on_corrupted_embedding_section() {
+        // `COUNT(*)`（`WHERE` なし・`VECTOR`/スカラー列参照なし）は
+        // `DecodeTier::Fast` に到達するが、`decode_row_dim_and_metadata_borrowed`
+        // による構造検証（ヒープ確保は伴わない）を `DecodeTier::DimAndScalar` と
+        // 共有するため、embedding セクションの `dim` フィールドを構造的に
+        // 破綻させた行は fail-closed（`XX000`）で拒否される（PR #369
+        // codex-review P1 指摘対応: 従来案のように破損可視行を集計結果へ
+        // 黙って含めない）。
+        let path = unique_db_path("agg-fastpath-corrupt");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        let good = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &[],
+        })
+        .expect("encode row");
+        let corrupted = corrupt_dim_field(good, "tenant-a");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &corrupted);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+            .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    #[test]
+    fn count_vector_column_on_same_corrupted_row_still_fails_closed() {
+        // 同じ破損行に対し、`VECTOR` 列を参照する `COUNT(embedding)`
+        // （`DecodeTier::DimAndScalar`）も同じく dim フィールドを実際に読むため、
+        // 破損を検出して `Err`（`XX000`）になる——`Fast`/`DimAndScalar` 間で
+        // 検証水準に差が無いことの対照テスト。
+        let path = unique_db_path("agg-dimscalar-corrupt");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        let good = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &[],
+        })
+        .expect("encode row");
+        let corrupted = corrupt_dim_field(good, "tenant-a");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &corrupted);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_vec).unwrap_err();
+        assert_eq!(err.wire_code(), "XX000");
+    }
+
+    #[test]
+    fn count_star_still_fails_closed_on_corrupted_metadata_with_no_scalar_reference() {
+        // `COUNT(*)`（`VECTOR`/スカラー列いずれも非参照）で `referenced.scalar_mask()`
+        // が全 `false` になっても、`scan_scalar_columns_masked` の呼び出し自体は
+        // 省略しない（codex-review P1 指摘・PR #369: 呼び出しごと省略すると
+        // metadata の presence・列長・UTF-8・余剰バイトの構造検証が全く行われず、
+        // 破損した可視行（不正 UTF-8 を含む `Text` 列）が集計結果へ黙って含まれて
+        // しまう fail-open な契約変更になっていたための回帰テスト）。
+        let path = unique_db_path("agg-metadata-corrupt-no-scalar-ref");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), true),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        );
+        storage.create_table(&schema).expect("create table");
+
+        let mut metadata = row_codec::encode_scalar_columns(
+            &schema,
+            &[
+                row_codec::Value::Null,
+                row_codec::Value::Text("hello".to_string()),
+            ],
+        )
+        .expect("encode scalar columns");
+        // 妥当な `Text` 値のバイト列を、presence タグ・長さフィールドはそのまま
+        // 不正 UTF-8（単独継続バイト）へ書き換える。
+        let corrupt_offset = metadata.len() - 1;
+        metadata[corrupt_offset] = 0x80;
+
+        let buf = crate::storage::encode_row(&RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: &metadata,
+        })
+        .expect("encode row");
+        write_row_raw(&storage, "docs", "tenant-a", 1, &buf);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star).expect_err(
+            "COUNT(*) must fail closed on corrupted metadata even with no scalar column referenced",
+        );
         assert_eq!(err.wire_code(), "XX000");
     }
 

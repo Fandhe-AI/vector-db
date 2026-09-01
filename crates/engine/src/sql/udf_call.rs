@@ -575,6 +575,28 @@ fn count_bound_nodes(expr: &BoundExpr) -> usize {
     }
 }
 
+/// 式木が `VECTOR` 列（[`BoundExpr::VectorRef`]）へ到達するかを判定する
+/// （Issue #350: 集計経路が `embedding` を実際にデコードすべきかの判定基盤）。
+/// `embedding` アクセスは束縛段で `VectorRef` に一元化されている（本モジュールの
+/// [`eval`] 参照。`Builtin`/`Binary`/`WasmCall` は自身では embedding を持たず
+/// 引数式の評価結果のみを使う）ため、全 variant を網羅する `match`（`_` 禁止）で
+/// 判定すれば過小評価が起きない。呼び出し元
+/// （`sql::aggregate.rs`／`sql::group_by.rs`）はこの判定結果に基づき embedding の
+/// デコードそのものをスキップするため、将来 `BoundExpr` に新 variant が
+/// 追加された際にここへの追随漏れがあれば早期にコンパイルエラーとして検出できる
+/// ことを意図して非網羅を許さない。
+pub(crate) fn references_embedding(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::VectorRef => true,
+        BoundExpr::Number(_) | BoundExpr::IdRef => false,
+        BoundExpr::Builtin { args, .. } => args.iter().any(references_embedding),
+        BoundExpr::Binary { lhs, rhs, .. } => {
+            references_embedding(lhs) || references_embedding(rhs)
+        }
+        BoundExpr::WasmCall { args, .. } => args.iter().any(references_embedding),
+    }
+}
+
 /// [`Expr`] を意味論的に束縛する（`sql::parser::bind_in_session` から呼ばれる公開 API）。
 /// 列参照は `schema` から、UDF 呼び出しは `registry` から解決し、UDF はインライン
 /// 展開して自己完結した [`BoundExpr`] を返す。`node_budget` は展開後のノード数上限
@@ -1536,6 +1558,59 @@ mod tests {
         let mut budget = MAX_EXPR_NODES;
         let err = bind_expr(&ident("other"), &schema, &registry, &mut budget).unwrap_err();
         assert_eq!(err.wire_code(), "22000");
+    }
+
+    // --- references_embedding（Issue #350） -----------------------------------
+
+    #[test]
+    fn references_embedding_true_for_direct_vector_ref() {
+        assert!(references_embedding(&BoundExpr::VectorRef));
+    }
+
+    #[test]
+    fn references_embedding_false_for_id_and_number_only() {
+        assert!(!references_embedding(&BoundExpr::IdRef));
+        assert!(!references_embedding(&BoundExpr::Number(1.0)));
+        assert!(!references_embedding(&BoundExpr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(BoundExpr::IdRef),
+            rhs: Box::new(BoundExpr::Number(1.0)),
+        }));
+    }
+
+    #[test]
+    fn references_embedding_true_through_builtin_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, ty) = bind_expr(
+            &call("vec_norm", vec![ident("embedding")]),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("vec_norm(embedding) should bind");
+        assert_eq!(ty, ExprType::Scalar);
+        assert!(references_embedding(&bound));
+    }
+
+    #[test]
+    fn references_embedding_true_through_binary_argument() {
+        let schema = schema_with_vector();
+        let registry = UdfRegistry::default();
+        let mut budget = MAX_EXPR_NODES;
+        let (bound, _ty) = bind_expr(
+            &bin(
+                BinOp::Add,
+                call("vec_norm", vec![ident("embedding")]),
+                num("1"),
+            ),
+            &schema,
+            &registry,
+            &mut budget,
+        )
+        .expect("vec_norm(embedding) + 1 should bind");
+        assert!(references_embedding(&bound));
     }
 
     #[test]
