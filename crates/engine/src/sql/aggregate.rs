@@ -19,13 +19,18 @@
 //!
 //! RLS 適用順序は [`crate::arena`] モジュールの走査ループと同一の規約に揃える
 //! （`.claude/rules/security.md`「テナント境界（P0）」）: 行ヘッダから
-//! `tenant_id`・`visibility` のみを取り出し（[`crate::storage::decode_row_tenant_and_visibility`]）、
-//! [`crate::policy::PolicyContext::is_visible`] が `false` を返す行は embedding・
-//! metadata を一切デコードせずスキップする。可視行のみ完全デコード
-//! （[`crate::storage::decode_row`]）して SCALAR 段（`WHERE`）・集計へ進む。
+//! `tenant_id`・`visibility`・本体デコード再開オフセットを取り出し
+//! （[`crate::storage::decode_row_header`]）、[`crate::policy::PolicyContext::is_visible`]
+//! が `false` を返す行は embedding・metadata を一切デコードせずスキップする。
+//! 可視行のみ、ヘッダのオフセットを引き継いで本体デコール（[`crate::storage::decode_row_body_into`]。
+//! スクラッチ再利用によりヘッダの二重デコード・行ごとの `Vec<f32>` 新規確保を
+//! 避ける。Issue #349・Issue #314 の横展開）して SCALAR 段（`WHERE`）・集計へ進む。
 //! `COUNT` 等の集計値から他テナント行の存在・件数を推測できないという契約
 //! （RLS-7・RLS-8）は、この「不可視行は集約対象に一切現れない」という走査自体の
-//! 構造で担保する。
+//! 構造で担保する。物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+//! の整合検査（TABLE-12。従来 `storage::decode_row_for_key` が担っていた検査）は、
+//! 本体デコード直前に明示比較として実行する（呼び出し元へ移設。検査自体は
+//! 削除しない）。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -421,6 +426,13 @@ pub(crate) fn execute_aggregate(
         }
     };
 
+    // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
+    // 横展開）。行ごとに新しい `Vec<f32>` を確保する代わりにループ外で 1 本だけ
+    // 確保し、`storage::decode_row_body_into` が `clear()` 後に書き込む。同一
+    // テーブルは全行同一次元のため、初回のみ確保が発生し 2 行目以降は再確保なしで
+    // 使い回せる（`arena.rs::build_filtered_with_rows_and_limits_in_txn` と同じ方針）。
+    let mut embedding_scratch: Vec<f32> = Vec::new();
+
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
             let (k, v) = entry.map_err(storage_internal)?;
@@ -431,38 +443,51 @@ pub(crate) fn execute_aggregate(
             // （ヘッダのみ読み `predicate` 相当を通過しない行は embedding・
             // metadata を一切デコードしない）。不可視行の破損状態が対象テナントの
             // クエリ可用性へ干渉しない設計を踏襲する（codex P0 対応・Issue #137、
-            // security.md P0「テナント境界」）。
-            let (tenant_id, visibility) =
-                storage::decode_row_tenant_and_visibility(buf).map_err(storage_internal)?;
+            // security.md P0「テナント境界」）。`offset` は本体デコードの再開位置
+            // （[`storage::decode_row_body_into`] へそのまま渡す。Issue #349:
+            // 従来はここで一度ヘッダを読んだ後、`decode_row_for_key` の内部で
+            // ヘッダをもう一度読んでいた二重デコードを排除する）。
+            let (tenant_id, visibility, offset) =
+                storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
-            // ここに到達するのは可視行のみ。以降は完全デコードして SCALAR 段・
-            // 集計へ進む。複合キー側の `key_tenant` とヘッダ側 `tenant_id` の
-            // 不一致（内部バグ・raw redb 書き込みによる異常）を fail-closed に
-            // 拒否するため、単純な `decode_row` ではなく `decode_row_for_key`
-            // （TABLE-12 の整合検査）を使う（codex P0 指摘対応。PR #229）。
-            let row = storage::decode_row_for_key(key_tenant, id, buf).map_err(storage_internal)?;
-            // `row.embedding` が空 = `VECTOR` 列が未設定（NULL、TABLE-5 の
+            // ここに到達するのは可視行のみ。複合キー側の `key_tenant` とヘッダ側
+            // `tenant_id` の不一致（内部バグ・raw redb 書き込みによる異常）を
+            // fail-closed に拒否する（TABLE-12 の整合検査。従来は
+            // `storage::decode_row_for_key` の内部検査だったものを明示比較として
+            // 呼び出し元へ移設。検査内容・拒否時のエラーメッセージは変えない。
+            // codex P0 指摘対応・PR #229 の踏襲）。
+            if tenant_id != key_tenant {
+                return Err(storage_internal(StorageError::Codec(
+                    "row key tenant mismatch".to_string(),
+                )));
+            }
+
+            // 以降は本体（embedding・metadata）をデコードして SCALAR 段・集計へ
+            // 進む。ヘッダは上で既にデコード済みのため、そのオフセットを引き継いで
+            // 本体のみをデコードする（行ごとに新しい `Vec<f32>` を確保する
+            // `decode_row` の代わりにループ外の `embedding_scratch` へ書き込む）。
+            let (dim, metadata) =
+                storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                    .map_err(storage_internal)?;
+            // `dim == 0` = `VECTOR` 列が未設定（NULL、TABLE-5 の
             // `ALTER TABLE ADD COLUMN` で追加された nullable 列を含む）という
             // `storage::Row` の既存契約に従い、次元検証は値が実際に存在する行に
             // だけ行う。空を無条件に次元不一致として拒否すると、`COUNT(*)` 等
             // `VECTOR` 値を参照しない集計まで nullable 列の NULL 行で `XX000`
             // 失敗する（PR #229 codex-review 指摘対応）。
-            if let Some(dim) = expected_dim {
-                if !row.embedding.is_empty() {
-                    let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
-                    if found != dim {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "aggregate row scan failed: embedding dimension mismatch"
-                                .to_string(),
-                        });
-                    }
+            if let Some(expected) = expected_dim {
+                if dim != 0 && dim != expected {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "aggregate row scan failed: embedding dimension mismatch"
+                            .to_string(),
+                    });
                 }
             }
 
-            let scanned = row_codec::scan_scalar_columns(schema, &row.metadata)?;
+            let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
 
             // SCALAR 段（WHERE）: 既存の検索 SELECT 実行経路（`sql::exec`）と同じ
             // 意味論（等価・前方一致条件 → 式述語の順）で適用する。
@@ -470,7 +495,7 @@ pub(crate) fn execute_aggregate(
                 continue;
             }
             for expr in &bound.expr_filters {
-                match udf_call::eval(expr, id, &row.embedding)? {
+                match udf_call::eval(expr, id, &embedding_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     // 束縛段（`sql::parser::bind_where_predicates`）が `WHERE` 式
@@ -483,17 +508,22 @@ pub(crate) fn execute_aggregate(
                 }
             }
 
-            // defense-in-depth（RlsSafetyNet と同趣旨）: 上のヘッダ由来判定と
-            // 独立した検査ではなく、デコード済みの行データに対して同じ
-            // `PolicyContext::is_visible` を再適用するだけの重ね掛け。デコード前
-            // 判定が唯一の防御線にならないようにする（security.md P0）。
-            if !ctx.is_visible(&row.tenant_id, row.visibility) {
+            // 構造的なトリップワイヤ（Issue #349 で単一ヘッダデコードへ統合した
+            // ため、独立した二重検証ではなくなった点に注意——`tenant_id`・
+            // `visibility` は上の判定と同じ [`storage::decode_row_header`] 呼び出し
+            // 由来の束縛で、この間に値を書き換える経路もない。したがって現状は
+            // 論理的に到達不能だが、AGG 段の直前にもう一段 `is_visible` を通す
+            // ゲートを残しておくことで、将来ここに `tenant_id`/`visibility` を
+            // 再導出・再束縛するコードが差し込まれた場合でも RLS 判定を経由せずに
+            // 集約へ抜けられないようにする（`arena.rs::build_filtered_with_rows_and_limits_in_txn`
+            // も Issue #314 で同じ単一ゲート構成を採用済み。security.md P0）。
+            if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
             // AGG 段。
             for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
-                accumulator.observe(&item.input, id, &row.embedding, &scanned)?;
+                accumulator.observe(&item.input, id, &embedding_scratch, &scanned)?;
             }
         }
     }
@@ -560,6 +590,40 @@ mod tests {
         crate::storage::bump_generation_and_commit(write_txn).expect("commit");
     }
 
+    /// 物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+    /// （`header_tenant`）を意図的にずらして raw redb 書き込みする（TABLE-12 の
+    /// 整合検査を検証するための専用ヘルパ。Issue #349: 旧 `decode_row_for_key`
+    /// 内部検査から `execute_aggregate`/`execute_grouped_aggregate` 側の明示比較へ
+    /// 移設した後も、この不一致が fail-closed に拒否されることを固定する）。
+    fn write_row_with_mismatched_key_tenant(
+        storage: &Storage,
+        table_name: &str,
+        key_tenant: &str,
+        header_tenant: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: header_tenant,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((key_tenant, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
     /// nullable な `VECTOR` 列（TABLE-5 想定）を単一列として持つテーブルの
     /// スキーマ・空 `BoundAggregate` を組み立てる共通部。
     fn nullable_vector_schema() -> TableSchema {
@@ -616,6 +680,40 @@ mod tests {
         let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
             .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
+    }
+
+    // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
+    // `tenant_id` の不一致）が、`decode_row_for_key` 呼び出しをやめた後の
+    // 明示比較でも従来どおり fail-closed（`XX000`・`SqlSurfaceError::Internal`）に
+    // 拒否されることを固定する（旧 `decode_row_for_key` 内部検査への暗黙依存を
+    // 解消するための回帰）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed() {
+        let path = unique_db_path("agg-table12-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        // key 側は tenant-a、ヘッダ側は tenant-b（tenant-a から見て可視な
+        // Public 行だが、key/ヘッダ不一致という異常な行）。
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
+        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
     }
 
     fn count_acc() -> Accumulator {

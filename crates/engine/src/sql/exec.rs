@@ -996,7 +996,15 @@ fn project_rows(
                     // （行値・テナントを含まない固定文言。`sql::udf_call::eval` 参照）。
                     match udf_call::eval(expr, id, embedding)? {
                         udf_call::ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                        udf_call::ExprValue::Vector(v) => cells.push(Cell::Vector(v)),
+                        udf_call::ExprValue::Vector(v) => {
+                            // Issue #352: `VectorRef` 単体評価は行データを借用する
+                            // だけになった（確保ゼロ）ため、応答行として行データより
+                            // 長く保持する必要があるここ（投影段）でのみ
+                            // `into_owned_vector` により fail-closed な確保・複製を
+                            // 行う（`Cow::Owned`＝`vec_div` 等の構築結果はそのまま
+                            // move し再確保しない）。
+                            cells.push(Cell::Vector(udf_call::into_owned_vector(v)?))
+                        }
                         udf_call::ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                     }
                 }

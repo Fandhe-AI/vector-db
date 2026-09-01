@@ -199,3 +199,18 @@ test = false
 name = "hybrid_latency_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。
+# ポインタ: `docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3）の実測入口。
+# `EngineCore::execute_sql` 経由の hybrid_rrf/dense KNN 対照・本文 String 収集・
+# `SparseIndex::build`（tokenize/term_freq/doc_freq の累積 3 段）を単一ビルド内で
+# 計測し、後続の Issue #357（キャッシュ設計）が対象段を判断できる分解能を提供する。
+# spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため `.github/workflows/*`
+# へは配線しない。harness = false / test = false は上記ベンチと同一方針。
+# `make bench-hybrid-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
+# harness/hybrid_profile.rs にあり tests/hybrid_profile_accept.rs で make ci 側から
+# 回帰検証する。
+name = "hybrid_profile_bench"
+harness = false
+test = false

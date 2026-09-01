@@ -85,17 +85,23 @@ pub struct ImplicitRlsHook<'c> {
 
 impl<'c> ImplicitRlsHook<'c> {
     /// 認証済みセッションから導出済みの `ctx` を束縛する。
+    #[inline]
     pub fn new(ctx: &'c PolicyContext) -> Self {
         Self { ctx }
     }
 
     /// 束縛済みの `PolicyContext`（読み取り専用）。
+    #[inline]
     pub fn context(&self) -> &'c PolicyContext {
         self.ctx
     }
 
     /// 単点判定（`core.rs::EngineCore::get_row` 等）。
     /// [`PolicyContext::is_visible`] へ委譲するだけで独自比較を持たない。
+    ///
+    /// 全読み取り経路で毎行呼ばれるホットパス（Issue #354）のため `#[inline]` を付与し、
+    /// 委譲先 [`PolicyContext::is_visible`] とあわせてインライン化されやすくする。
+    #[inline]
     pub fn is_visible(&self, row_tenant: &str, row_visibility: Visibility) -> bool {
         self.ctx.is_visible(row_tenant, row_visibility)
     }
@@ -103,6 +109,7 @@ impl<'c> ImplicitRlsHook<'c> {
     /// 候補集合構築（`VectorArena::build_filtered`・
     /// `build_filtered_with_rows_in_txn` 系）へそのまま渡せる述語を返す。
     /// 返す関数も `PolicyContext` 以外の入力を一切持たない。
+    #[inline]
     pub fn predicate(&self) -> impl Fn(&str, Visibility) -> bool + 'c {
         let ctx = self.ctx;
         move |tenant, visibility| ctx.is_visible(tenant, visibility)
