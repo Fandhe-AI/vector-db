@@ -24,8 +24,13 @@
 //!
 //! | 段 | 内容 |
 //! | --- | --- |
-//! | S0 | `EngineCore::execute_sql` 経由の SQL 表層 KNN（e2e） |
-//! | S0' | `SELECT COUNT(*) FROM docs`（走査＋ヘッダ＋RLS の SQL 経由クロスチェック） |
+//! | S0-cold | `EngineCore::execute_sql` 経由の SQL 表層 KNN（e2e。サンプルごとに
+//! 新規 `Storage::open` + `EngineCore::from_storage` で `SqlArenaCache`〔Issue #363〕
+//! を空の状態から測る。下記「`SqlArenaCache` と S0 の cold/hot 分離」節参照） |
+//! | S0-hot | S0-cold と同じクエリを単一 `EngineCore` へ 40 回以上繰り返し、初回
+//! 以降は `SqlArenaCache` がヒットする状態（キャッシュヒット時のオーバーヘッド） |
+//! | S0' | `SELECT COUNT(*) FROM docs`（走査＋ヘッダ＋RLS の SQL 経由クロスチェック。
+//! 集計クエリのため `SqlArenaCache`〔`VectorArena` 専用〕の対象外） |
 //! | S1 | 生 `redb::Database` 再オープンでの per-entry 走査のみ |
 //! | S2 | S1 ＋ ヘッダデコード（`harness::knn_profile::decode_header_reimpl`） |
 //! | S3 | S2 ＋ f32 デコード（`harness::knn_profile::decode_row_reimpl`） |
@@ -33,13 +38,31 @@
 //! | S5 | 距離計算＋Top-k（`ParallelSearchProvider`・`CpuScalarProvider`） |
 //! | S5' | 距離計算のみ（`isa::current().dot` を全行へ適用して総和。Top-k なし） |
 //!
+//! ## `SqlArenaCache` と S0 の cold/hot 分離
+//!
+//! Issue #363 で SQL 表層 `SELECT`（`USING PLAN` 展開経由を含む）の `VectorArena` が
+//! テーブル単位世代整合キャッシュ（`sql/arena_cache.rs::SqlArenaCache`）を経由する
+//! ようになったため、同一 `EngineCore` へ同一クエリを繰り返すだけでは初回以降
+//! ほぼ全呼び出しがキャッシュヒットになり、「クエリ毎に候補行を redb から
+//! 再デコードする e2e コスト」を S0 が表さなくなる（codex-review P1-1 指摘・
+//! PR #378）。`SqlArenaCache`／`EngineCore` に既存の invalidate/clear 相当の
+//! 公開 API は無く、世代を進めるダミー DML はコーパスのデータを変えてしまうため
+//! 使わない。代わりに S0-cold は、warmup・計測フェーズの各サンプルごとに計測
+//! 区間の外側（`Instant::now()` の前）で新規 `Storage::open` + `EngineCore::
+//! from_storage` を構築し、常に空の `SqlArenaCache` から `execute_sql` を計測する
+//! （`harness::protocol::run`/`run_bounded_retain` は setup を計測区間の外側に
+//! 置けない〔クロージャ 1 本に setup と計測を束ねる契約〕ため、本段のみ独自の
+//! warmup/計測ループを持ち `harness::stats::summarize` で統計手順を揃える）。
+//! S0-hot は従来どおり単一 `EngineCore` を使い回し、キャッシュヒット時の
+//! オーバーヘッドを別段として測る。
+//!
 //! 整合性検証（fail-closed）: S1〜S3 の走査行数が一致すること、S3 のデコード結果を
 //! `Storage::scan()`（pub API・完全デコード）の結果と突き合わせて一致すること
 //! （`tests/knn_profile_accept.rs` が同じ突き合わせを時間非依存の回帰として持つ。
-//! 本ベンチは実データ規模での 1 回限りのクロスチェックを行う）、S0 の結果行数が
-//! `TOP_K` に一致すること、S0' の `COUNT(*)` が計測外の再実行で `TOTAL_ROWS` と
-//! 一致することを実行時にアサートする。不一致ならベンチはエラー終了し測定値を
-//! 出力しない。
+//! 本ベンチは実データ規模での 1 回限りのクロスチェックを行う）、S0-cold・S0-hot
+//! それぞれの結果行数が `TOP_K` に一致すること、S0' の `COUNT(*)` が計測外の
+//! 再実行で `TOTAL_ROWS` と一致することを実行時にアサートする。不一致ならベンチは
+//! エラー終了し測定値を出力しない。
 //!
 //! # `dot_lanes` の実アセンブリ確認（受け入れ条件 3）
 //!
@@ -69,6 +92,10 @@ use harness::knn_profile::{
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 use harness::rng::DeterministicRng;
 use harness::sql_c1::{c1_statement, vector_literal};
+use harness::stats;
+
+use std::hint::black_box;
+use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -292,27 +319,78 @@ fn main() {
         "S5_scalar",
     );
 
-    // --- S0/S0': SQL 表層 e2e（`EngineCore::execute_sql`）。--------------------
-    let core = EngineCore::from_storage(storage, search_engine::default_engine());
     let literal = vector_literal(&query).expect("finite query vector");
     let sql = c1_statement(TABLE, COLUMN, &literal, TOP_K)
         .expect("well-formed C1 statement from validated identifiers");
-    let s0 = run(&config, || {
+
+    // `storage`（S4/S5 で使い終えた元ハンドル）を明示的に drop し、redb のファイル
+    // ロックを解放する。redb は書き込み可能ハンドルを同時に複数開けない契約
+    // （`redb::DatabaseError::DatabaseAlreadyOpen`）のため、直後の S0-cold 測定が
+    // 毎回開く一時ハンドルと同時生存させられない（P1-1 是正・PR #378
+    // codex-review 指摘）。
+    drop(storage);
+
+    // --- S0-cold: SqlArenaCache を毎回空の状態から測る e2e 計測。----------------
+    // モジュール冒頭コメント「`SqlArenaCache` と S0 の cold/hot 分離」節参照。
+    // `harness::protocol::run` 系は setup（DB オープン）と計測を単一クロージャに
+    // 束ねる契約のため使えず、本段のみ独自の warmup/計測ループを持つ。
+    for _ in 0..config.warmup_iterations() {
+        let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold warmup");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        black_box(
+            cold_core
+                .execute_sql(&policy_ctx, &sql)
+                .expect("execute_sql must succeed for well-formed synthetic KNN query"),
+        );
+    }
+    let mut s0_cold_samples: Vec<Duration> =
+        Vec::with_capacity(config.measured_iterations() as usize);
+    let mut s0_cold_last_result_len: Option<usize> = None;
+    for _ in 0..config.measured_iterations() {
+        let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold measurement");
+        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let start = Instant::now();
+        let result = black_box(
+            cold_core
+                .execute_sql(&policy_ctx, &sql)
+                .expect("execute_sql must succeed for well-formed synthetic KNN query"),
+        );
+        let elapsed = start.elapsed();
+        s0_cold_samples.push(elapsed);
+        // 計測区間の外側でのみ結果行数を観測する（`run`/`run_bounded_retain` と
+        // 同じく、計測区間そのものへは戻り値の検証を混ぜない）。
+        s0_cold_last_result_len = Some(result.rows.len());
+    }
+    if s0_cold_samples.is_empty() {
+        fail_closed("S0-cold measurement produced no samples");
+    }
+    if s0_cold_last_result_len != Some(TOP_K) {
+        fail_closed(format!(
+            "S0-cold result row count mismatch: expected {TOP_K}, got {s0_cold_last_result_len:?}"
+        ));
+    }
+    let s0_cold_summary =
+        stats::summarize(&s0_cold_samples).expect("S0-cold summarize must succeed");
+
+    // --- S0-hot/S0': SQL 表層 e2e（単一 `EngineCore` を使い回すホットパス）。----
+    let storage = Storage::open(&path).expect("reopen storage for S0-hot/S0'");
+    let core = EngineCore::from_storage(storage, search_engine::default_engine());
+    let s0_hot = run(&config, || {
         core.execute_sql(&policy_ctx, &sql)
             .expect("execute_sql must succeed for well-formed synthetic KNN query")
     })
     .expect("measurement must satisfy protocol minimums");
-    if s0.samples.is_empty() {
-        fail_closed("S0 measurement produced no samples");
+    if s0_hot.samples.is_empty() {
+        fail_closed("S0-hot measurement produced no samples");
     }
-    let s0_result_len = core
+    let s0_hot_result_len = core
         .execute_sql(&policy_ctx, &sql)
         .expect("execute_sql must succeed for well-formed synthetic KNN query")
         .rows
         .len();
-    if s0_result_len != TOP_K {
+    if s0_hot_result_len != TOP_K {
         fail_closed(format!(
-            "S0 result row count mismatch: expected {TOP_K}, got {s0_result_len}"
+            "S0-hot result row count mismatch: expected {TOP_K}, got {s0_hot_result_len}"
         ));
     }
 
@@ -322,9 +400,9 @@ fn main() {
             .expect("execute_sql must succeed for COUNT(*) query")
     })
     .expect("measurement must satisfy protocol minimums");
-    // S0 の TOP_K 検証（上記）と同様、計測クロージャの戻り値は `black_box` へ渡す
-    // だけで中身を検証しない。SQL 経路が誤った件数を返しても計測は成功してしまう
-    // ため、計測外で COUNT(*) を再実行し値を TOTAL_ROWS と突き合わせる
+    // S0-hot の TOP_K 検証（上記）と同様、計測クロージャの戻り値は `black_box` へ
+    // 渡すだけで中身を検証しない。SQL 経路が誤った件数を返しても計測は成功して
+    // しまうため、計測外で COUNT(*) を再実行し値を TOTAL_ROWS と突き合わせる
     // （codex-review 指摘・PR #378。fail-closed）。
     let count_result = core
         .execute_sql(&policy_ctx, &count_sql)
@@ -375,18 +453,27 @@ fn main() {
         table.iter().expect("iter row table").count()
     };
 
-    // S2: S1 ＋ ヘッダデコード。
+    // S2: S1 ＋ ヘッダデコード。ヘッダデコード結果（`tenant_id`・`is_public`）は
+    // 単に破棄せず、行数と組み合わせた値依存の checksum へ混入して返す（`tenant_id`
+    // の長さ・`is_public` フラグはいずれもデコード結果に実際に依存する軽量な値の
+    // ため、release 最適化でヘッダデコード自体が未観測として除去されるのを防ぐ。
+    // codex-review P1-2 指摘・PR #378。S3 と同種の是正）。
     let s2 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
+        let mut checksum: u64 = 0;
         for entry in table.iter().expect("iter row table") {
             let (_k, v) = entry.expect("iterate row entry");
-            let _header = decode_header_reimpl(v.value())
+            let (tenant_id, is_public, _offset) = decode_header_reimpl(v.value())
                 .expect("header decode must succeed for well-formed synthetic rows");
+            checksum = checksum.wrapping_add(tenant_id.len() as u64);
+            if is_public {
+                checksum = checksum.wrapping_add(1);
+            }
             rows += 1;
         }
-        rows
+        (rows, checksum)
     })
     .expect("measurement must satisfy protocol minimums");
     let s2_rows = {
@@ -405,19 +492,27 @@ fn main() {
 
     // S3: S2 ＋ f32 デコード。スクラッチバッファはループ間で使い回す
     // （`storage.rs::decode_row_embedding_and_metadata_into` と同じ設計を
-    // 再実装側でも踏襲する。モジュール冒頭コメント参照）。
+    // 再実装側でも踏襲する。モジュール冒頭コメント参照）。デコード結果
+    // （`scratch`）は行数のみのカウントへ捨てず、先頭・末尾要素を checksum へ
+    // 加算して返す。`_decoded`（`ReimplDecodedRow`）自体は embedding を保持しない
+    // 借用参照のみのため checksum の元にならず、`scratch`（f32 デコードの実出力）
+    // を直接使う必要がある（release 最適化で f32 デコード自体が未観測として
+    // 除去されるのを防ぐ。codex-review P1-2 指摘・PR #378）。
     let mut scratch: Vec<f32> = Vec::with_capacity(DIM);
     let s3 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
+        let mut checksum: f32 = 0.0;
         for entry in table.iter().expect("iter row table") {
             let (_k, v) = entry.expect("iterate row entry");
             let _decoded = decode_row_reimpl(v.value(), &mut scratch)
                 .expect("row decode must succeed for well-formed synthetic rows");
+            checksum +=
+                scratch.first().copied().unwrap_or(0.0) + scratch.last().copied().unwrap_or(0.0);
             rows += 1;
         }
-        rows
+        (rows, checksum)
     })
     .expect("measurement must satisfy protocol minimums");
     let mut s3_scratch: Vec<f32> = Vec::with_capacity(DIM);
@@ -452,14 +547,18 @@ fn main() {
         stage_diff_ns_per_row(s2.summary.median, s3.summary.median, TOTAL_ROWS, "S2", "S3");
     let diff_s3_s4 = stage_diff_ns_per_row(s3.summary.median, s4_median, TOTAL_ROWS, "S3", "S4");
 
-    // --- 残差: S0 -（S4 + S5） ---------------------------------------------------
+    // --- 残差: S0-cold -（S4 + S5） -----------------------------------------------
+    // S0-hot はキャッシュヒット時のオーバーヘッドを測る別段のため、段別分解・残差の
+    // 基準には使わない（S0-cold が「クエリ毎に候補行を再デコードする e2e コスト」を
+    // 表す段。モジュール冒頭コメント「`SqlArenaCache` と S0 の cold/hot 分離」節
+    // 参照。P1-1 是正・PR #378 codex-review 指摘）。
     let s4_plus_s5 = s4_median.saturating_add(s5_parallel.summary.median);
-    let residual = s0.summary.median.saturating_sub(s4_plus_s5);
+    let residual = s0_cold_summary.median.saturating_sub(s4_plus_s5);
 
     // --- 整合性検証（fail-closed） ---------------------------------------------
     // モジュール冒頭コメントの契約（「不一致ならベンチはエラー終了し測定値を
-    // 出力しない」）どおり、S1〜S4・S0/S0' の全測定・全差分計算を終えたこの時点で
-    // 全チェックを完了させ、以降で初めて結果を出力する（codex-review 指摘・
+    // 出力しない」）どおり、S1〜S4・S0-cold/S0-hot/S0' の全測定・全差分計算を終えた
+    // この時点で全チェックを完了させ、以降で初めて結果を出力する（codex-review 指摘・
     // PR #378: 従来は各段の println! を測定直後に行っていたため、後段の
     // 整合性チェック〔行数不一致・レイアウトドリフト〕で fail_closed する場合でも
     // 失敗前に出力済みの測定値が有効な結果として残ってしまっていた）。
@@ -558,10 +657,19 @@ fn main() {
     println!(
         "{}",
         render_stage_line(
-            "S0_sql_e2e",
+            "S0_cold_sql_e2e",
             TOTAL_ROWS,
-            s0.summary.median,
-            ns_per_row(s0.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+            s0_cold_summary.median,
+            ns_per_row(s0_cold_summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
+        )
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S0_hot_sql_e2e",
+            TOTAL_ROWS,
+            s0_hot.summary.median,
+            ns_per_row(s0_hot.summary.median, TOTAL_ROWS).expect("TOTAL_ROWS > 0"),
         )
     );
     println!(
