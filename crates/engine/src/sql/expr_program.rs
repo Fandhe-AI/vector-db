@@ -37,6 +37,7 @@
 //! （`try_fold_scalar` は `WasmCall`/`IdRef`/`VectorRef`/`Builtin` を素通りし
 //! `None` を返す）。
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::sql::allowlist::SqlSurfaceError;
@@ -252,12 +253,12 @@ impl ExprProgram {
     /// 通常発生しない）、0 除算・非有限値・確保失敗はそれぞれ既存の
     /// `22000`／`54000` 写像を共有する（[`apply_builtin`]・
     /// [`crate::sql::udf_call::eval_binary`] 経由）。
-    pub(crate) fn eval(
+    pub(crate) fn eval<'a>(
         &self,
         id: u64,
         embedding: &[f32],
-        scratch: &mut Vec<ExprValue>,
-    ) -> Result<ExprValue, SqlSurfaceError> {
+        scratch: &mut Vec<ExprValue<'a>>,
+    ) -> Result<ExprValue<'a>, SqlSurfaceError> {
         scratch.clear();
         for step in &self.steps {
             match step {
@@ -272,7 +273,7 @@ impl ExprProgram {
                         SqlSurfaceError::payload_too_large("vector value exceeds available memory")
                     })?;
                     out.extend_from_slice(embedding);
-                    scratch.push(ExprValue::Vector(out));
+                    scratch.push(ExprValue::Vector(Cow::Owned(out)));
                 }
                 ExprStep::Builtin(f) => {
                     let arity = udf_call::builtin_signature(*f).0.len();

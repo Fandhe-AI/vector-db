@@ -3,8 +3,10 @@
 //! 責務境界: [`crate::sql::aggregate::execute_aggregate`] が `BoundAggregate::group_by`
 //! を検出した場合にのみ呼ばれる（`GROUP BY` なしの単一行集計は `aggregate.rs` が
 //! 引き続き担う）。行の走査・RLS 適用順序（ヘッダのみで可視性判定 → 可視行のみ
-//! 完全デコード → `WHERE` → 可視性の再検査 → 集計）は `aggregate.rs` の単一行経路と
-//! 同一の規約を踏襲する（`.claude/rules/security.md`「テナント境界（P0）」）。
+//! ヘッダのオフセットを引き継いで本体デコード → `WHERE` → 可視性の再検査 → 集計）は
+//! `aggregate.rs` の単一行経路と同一の規約を踏襲する（`.claude/rules/security.md`
+//! 「テナント境界（P0）」。スクラッチ再利用による二重デコード排除は Issue #349・
+//! Issue #314 の横展開）。
 //! **不可視行のグループキーは結果に一切現れない**（他テナントにしか存在しない
 //! グループ値からの存在推測を防ぐ。RLS-7・RLS-8 の `GROUP BY` 版）。
 //!
@@ -27,7 +29,7 @@ use crate::sql::allowlist::SqlSurfaceError;
 use crate::sql::exec::{Cell, ColumnMeta, QueryResult, ResultRow};
 use crate::sql::parser::{BoundAggregate, OrderTarget, ProjectionColumn};
 use crate::sql::udf_call::{BinOp, ExprValue};
-use crate::storage;
+use crate::storage::{self, StorageError};
 use redb::ReadableTable;
 use std::collections::BTreeMap;
 
@@ -224,9 +226,9 @@ fn order_with_nulls_last(
 /// [`crate::sql::aggregate::execute_aggregate`] が判定済み）を実行し、複数行の
 /// [`QueryResult`] を返す（TASK-167・SQL-14）。RLS 適用順序・行走査は
 /// `aggregate.rs::execute_aggregate` の単一行経路と同一の規約
-/// （ヘッダのみで可視性判定 → 可視行のみ完全デコード → `WHERE` → 可視性再検査）を
-/// 独立して踏襲する（責務分離のためモジュールを分けたことによる意図的な複製。
-/// 変更する際は両モジュールの規約を揃えること）。
+/// （ヘッダのみで可視性判定 → 可視行のみヘッダのオフセットを引き継いで本体デコード
+/// → `WHERE` → 可視性再検査）を独立して踏襲する（責務分離のためモジュールを分けた
+/// ことによる意図的な複製。変更する際は両モジュールの規約を揃えること）。
 pub(crate) fn execute_grouped_aggregate(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
@@ -260,6 +262,9 @@ pub(crate) fn execute_grouped_aggregate(
     // 確保し、WHERE 式述語・`ScalarExpr` 集計項目の評価で使い回す
     // （`sql::aggregate::execute_aggregate` と同方針）。
     let mut expr_scratch: Vec<ExprValue> = Vec::new();
+    // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
+    // 横展開。`aggregate.rs::execute_aggregate` と同じ方針）。
+    let mut embedding_scratch: Vec<f32> = Vec::new();
 
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
@@ -268,33 +273,43 @@ pub(crate) fn execute_grouped_aggregate(
             let buf = v.value();
 
             // RLS 段（無条件・デコード前）: `aggregate.rs` の単一行経路と同一順序。
-            let (tenant_id, visibility) =
-                storage::decode_row_tenant_and_visibility(buf).map_err(storage_internal)?;
+            // `offset` は本体デコードの再開位置（Issue #349: ヘッダの二重デコード
+            // 排除。`aggregate.rs::execute_aggregate` のドキュメント参照）。
+            let (tenant_id, visibility, offset) =
+                storage::decode_row_header(buf).map_err(storage_internal)?;
             if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
-            let row = storage::decode_row_for_key(key_tenant, id, buf).map_err(storage_internal)?;
-            if let Some(dim) = expected_dim {
-                if !row.embedding.is_empty() {
-                    let found = u32::try_from(row.embedding.len()).unwrap_or(u32::MAX);
-                    if found != dim {
-                        return Err(SqlSurfaceError::Internal {
-                            detail: "aggregate row scan failed: embedding dimension mismatch"
-                                .to_string(),
-                        });
-                    }
+            // TABLE-12 の整合検査（`aggregate.rs::execute_aggregate` と同一。
+            // 従来 `storage::decode_row_for_key` の内部検査だったものを明示比較へ
+            // 移設）。
+            if tenant_id != key_tenant {
+                return Err(storage_internal(StorageError::Codec(
+                    "row key tenant mismatch".to_string(),
+                )));
+            }
+
+            let (dim, metadata) =
+                storage::decode_row_body_into(buf, offset, &mut embedding_scratch)
+                    .map_err(storage_internal)?;
+            if let Some(expected) = expected_dim {
+                if dim != 0 && dim != expected {
+                    return Err(SqlSurfaceError::Internal {
+                        detail: "aggregate row scan failed: embedding dimension mismatch"
+                            .to_string(),
+                    });
                 }
             }
 
-            let scanned = row_codec::scan_scalar_columns(schema, &row.metadata)?;
+            let scanned = row_codec::scan_scalar_columns(schema, metadata)?;
 
             // SCALAR 段（WHERE）。
             if !declarative_filter::matches_all(&bound.metadata_filters, &scanned) {
                 continue;
             }
             for program in &bound.expr_filter_programs {
-                match program.eval(id, &row.embedding, &mut expr_scratch)? {
+                match program.eval(id, &embedding_scratch, &mut expr_scratch)? {
                     ExprValue::Bool(true) => {}
                     ExprValue::Bool(false) => continue 'rows,
                     _ => {
@@ -305,8 +320,9 @@ pub(crate) fn execute_grouped_aggregate(
                 }
             }
 
-            // defense-in-depth（RlsSafetyNet と同趣旨）。
-            if !ctx.is_visible(&row.tenant_id, row.visibility) {
+            // 構造的なトリップワイヤ（独立した二重検証ではない点を含め
+            // `aggregate.rs::execute_aggregate` の同一箇所のドキュメント参照）。
+            if !ctx.is_visible(tenant_id, visibility) {
                 continue;
             }
 
@@ -346,7 +362,7 @@ pub(crate) fn execute_grouped_aggregate(
                 accumulator.observe(
                     &item.input,
                     id,
-                    &row.embedding,
+                    &embedding_scratch,
                     &scanned,
                     &mut expr_scratch,
                 )?;
@@ -484,4 +500,119 @@ pub(crate) fn execute_grouped_aggregate(
     }
 
     Ok(QueryResult { columns, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnDef, ColumnType, TableSchema};
+    use crate::sql::allowlist::AggregateFunc;
+    use crate::sql::parser::{AggregateInput, BoundAggregate, BoundAggregateItem, BoundGroupBy};
+    use crate::storage::{RowInput, Storage, Visibility};
+    use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 物理キー側 `tenant_id`（`key_tenant`）とヘッダ側 `tenant_id`
+    /// （`header_tenant`）を意図的にずらして raw redb 書き込みする（TABLE-12 の
+    /// 整合検査を検証するための専用ヘルパ。`sql::aggregate::tests` の同名ヘルパと
+    /// 同じ方針。Issue #349）。
+    fn write_row_with_mismatched_key_tenant(
+        storage: &Storage,
+        table_name: &str,
+        key_tenant: &str,
+        header_tenant: &str,
+        id: u64,
+        embedding: &[f32],
+    ) {
+        let write_txn = storage.db().begin_write().expect("begin_write");
+        {
+            let mut table = write_txn
+                .open_table(crate::catalog::user_rows_table_def(
+                    &crate::catalog::user_rows_table_name(table_name),
+                ))
+                .expect("open row table");
+            let buf = crate::storage::encode_row(&RowInput {
+                tenant_id: header_tenant,
+                visibility: Visibility::Public,
+                embedding,
+                metadata: &[],
+            })
+            .expect("encode row");
+            table
+                .insert((key_tenant, id), buf.as_slice())
+                .expect("insert row");
+        }
+        crate::storage::bump_generation_and_commit(write_txn).expect("commit");
+    }
+
+    fn schema_with_text_group_column() -> TableSchema {
+        TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(3), false),
+                ColumnDef::new("lang", ColumnType::Text, true),
+            ],
+        )
+    }
+
+    fn bound_count_star_grouped_by_lang() -> BoundAggregate {
+        BoundAggregate {
+            table: "docs".to_string(),
+            items: vec![BoundAggregateItem {
+                func: AggregateFunc::Count,
+                input: AggregateInput::AllVisible,
+                name: "result".to_string(),
+            }],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            rls_predicate_present: false,
+            projection: vec![
+                crate::sql::parser::ProjectionColumn::GroupKey {
+                    name: "lang".to_string(),
+                },
+                crate::sql::parser::ProjectionColumn::Aggregate {
+                    item_index: 0,
+                    name: "result".to_string(),
+                },
+            ],
+            group_by: Some(BoundGroupBy {
+                column_index: 1,
+                having: Vec::new(),
+                order_by: None,
+                limit: None,
+            }),
+        }
+    }
+
+    // Issue #349: TABLE-12 の整合検査（物理キー側 `tenant_id` とヘッダ側
+    // `tenant_id` の不一致）が、`decode_row_for_key` 呼び出しをやめた後の
+    // 明示比較でも従来どおり fail-closed（`XX000`・`SqlSurfaceError::Internal`）に
+    // 拒否されることを固定する（`sql::aggregate::tests` の単一行経路と同一の
+    // 回帰を `GROUP BY` 経路で検証する）。
+    #[test]
+    fn key_tenant_header_tenant_mismatch_is_rejected_fail_closed() {
+        let path = unique_db_path("group-by-table12-mismatch");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = schema_with_text_group_column();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_with_mismatched_key_tenant(
+            &storage,
+            "docs",
+            "tenant-a",
+            "tenant-b",
+            1,
+            &[1.0, 2.0, 3.0],
+        );
+
+        let ctx = PolicyContext::new("tenant-b").expect("valid tenant");
+        use redb::ReadableDatabase;
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        let bound = bound_count_star_grouped_by_lang();
+        let err = execute_grouped_aggregate(&read_txn, &ctx, &schema, &bound)
+            .expect_err("key/header tenant mismatch must be rejected fail-closed");
+        assert_eq!(err.wire_code(), "XX000");
+    }
 }

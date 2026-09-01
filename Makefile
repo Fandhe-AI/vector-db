@@ -298,6 +298,18 @@ else
 endif
 
 # --------------------------------------------------
+# hybrid_rrf クエリ段別内訳プロファイル（Issue #356。crates/engine/benches/hybrid_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hybrid-profile
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench hybrid_profile_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
+# --------------------------------------------------
 # クロスエンコーダリランカー実測（Issue #333・SEARCH-7。crates/engine/tests/rerank_cross_encoder_recall.rs）
 # --------------------------------------------------
 
