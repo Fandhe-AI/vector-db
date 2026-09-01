@@ -708,7 +708,16 @@ pub(crate) fn execute_statement_with_cache(
                     // 空なら `Vec::new()` を積むだけ」という既存分岐と同じ結果を、
                     // 呼び出しなしで再現する。空 `Vec` はヒープ確保しないため
                     // 行数分の確保コストも発生しない）。
-                    candidate_columns.reserve(snapshot.arena().len());
+                    candidate_columns
+                        .try_reserve_exact(snapshot.arena().len())
+                        .map_err(|e| {
+                            map_arena_error(
+                                &bound.table,
+                                ArenaError::AllocationFailed(format!(
+                                    "failed to reserve candidate column slots: {e}"
+                                )),
+                            )
+                        })?;
                     for _ in 0..snapshot.arena().len() {
                         candidate_columns.push(Vec::new());
                     }
