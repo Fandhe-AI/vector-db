@@ -351,11 +351,33 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
 /// `None` を渡した場合はキャッシュを一切経由せず、常に新規構築する（下記
 /// [`execute_statement`] 参照）。
 ///
-/// crate 内部専用（`pub(crate)`）。[`crate::sql::sparse_cache::SparseCacheAccess`]
-/// が属する `sql::sparse_cache` モジュールは `pub(crate)` であり、その型は crate
-/// 外から構築不能（AGENTS.md「公開 API・エラー契約の互換性（P1）」）。公開 API
-/// としては下記の [`execute_statement`]（従来シグネチャを維持し `None` を渡す薄い
-/// ラッパー）のみを経由させ、この拡張版は `core.rs` の crate 内呼び出し専用とする。
+/// `arena_cache`（Issue #363・[`crate::sql::arena_cache::SqlArenaCache`]）が
+/// `Some` の場合、候補構築（`VectorArena` の RLS 段アリーナ・行 metadata）を同一
+/// テーブル世代内で再利用する。`None`（[`execute_statement`] からの呼び出し・
+/// テスト等）の場合は従来どおり毎回 redb を走査する。`arena_cache` 内の `storage`
+/// 参照は「クエリ実行に使う `read_txn` と同一テーブルを対象とする」契約を呼び出し
+/// 元が保証する（`SqlArenaCache::lookup` は `read_txn` 自身からテーブル世代を読む
+/// ため、呼び出し元が異なるテーブルの `read_txn` を渡す誤りを構造的に防げない点は
+/// `bound.table` との一致を前提にする既存の契約と同じ）。ヒット時・ミス時いずれも、
+/// SCALAR 段（`on_visible_row`。`WHERE`・hybrid 疎コーパス蓄積・投影用スカラー列
+/// 保持）はクエリごとに毎回このまま実行する（キャッシュするのは RLS 段まで通過した
+/// 行の埋め込み・metadata のみ。モジュールドキュメント「RLS → SCALAR →
+/// DISTANCE」の責務境界は変えない）。
+///
+/// crate 内部専用（`pub(crate)`）。[`crate::sql::sparse_cache::SparseCacheAccess`]・
+/// [`crate::sql::arena_cache::ArenaCacheAccess`] が属するモジュールはいずれも
+/// `pub(crate)` であり、両型は crate 外から構築不能（AGENTS.md「公開 API・エラー
+/// 契約の互換性（P1）」）。公開 API としては下記の [`execute_statement`]（従来
+/// シグネチャを維持し両方に `None` を渡す薄いラッパー）のみを経由させ、この拡張版は
+/// `core.rs::EngineCore::execute_validated_in_session` の `Statement::Select`
+/// アーム（`USING PLAN` 展開経由を含む）からの crate 内呼び出し専用とする。
+///
+/// `sparse_cache`・`arena_cache` の 2 引数を追加した結果 `clippy::too_many_arguments`
+/// の閾値（7）を超える。両キャッシュアクセス束は意味の異なる独立したオプション
+/// パラメータであり、1 つの構造体へまとめると「呼ばれない方にも常に `None` を
+/// 明示する」契約が読み取りにくくなるため、`pub(crate)` 専用の内部関数としてここで
+/// 許容する（公開 API である [`execute_statement`] は従来どおり 6 引数のまま）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_statement_with_cache(
     read_txn: &redb::ReadTransaction,
     provider: &dyn SearchProvider,
@@ -364,6 +386,7 @@ pub(crate) fn execute_statement_with_cache(
     bound: &BoundStatement,
     precision_policy: &crate::precision::PrecisionPolicy,
     sparse_cache: Option<crate::sql::sparse_cache::SparseCacheAccess<'_>>,
+    arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
@@ -634,14 +657,169 @@ pub(crate) fn execute_statement_with_cache(
         Ok(true)
     };
 
+    // キャッシュヒット時、SCALAR 段（`on_visible_row`）が全行を無条件に通過させる
+    // だけ（＝恒等写像）であると静的に判定できる場合、行単位ループ自体
+    // （`push_visible_row` の `tenant_id.to_string()` 複製・`GrowableArenaBuffers`
+    // への再構築）を丸ごと省略し、キャッシュ済みスナップショットの `VectorArena` を
+    // 直接借用する（Issue #363 追補: `build_from_cached_rls_rows` 経由の複製でも
+    // redb 走査・デコードは避けられるが、行数が多いテーブルではこの per-row
+    // コピー自体が支配的コストになることが実測〔`make bench-c1` 相当〕で判明した）。
+    // 4 条件がすべて成り立つ場合のみ SCALAR 段が恒等写像になる（`on_visible_row`
+    // の実装〔本関数冒頭〕参照）: (a) メタデータフィルタなし (b) 式述語なし
+    // (c) hybrid でない（疎コーパス蓄積が不要） (d) 投影が候補スカラー列を
+    // 一切参照しない（`needed_column_indices` が空）。この場合 `HINT ORDER` の
+    // 内容（`plan.scalar_prefilter`）によらず結果は変わらない（SCALAR 段が
+    // 空判定である以上、先行でも後行でも同じ）。
+    let cache_fast_path_eligible = bound.metadata_filters.is_empty()
+        && bound.expr_filters.is_empty()
+        && !is_hybrid
+        && needed_column_indices.is_empty();
+
     let rls_hook = ImplicitRlsHook::new(ctx);
-    let arena = VectorArena::build_filtered_with_rows_in_txn(
-        read_txn,
-        &bound.table,
-        rls_hook.predicate(),
-        on_visible_row,
-    )
-    .map_err(|e| map_arena_error(&bound.table, e))?;
+    // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
+    // 指す `&VectorArena` になる。ミス／フォールバック経路は `owned_arena` へ、
+    // 高速経路は `cache_hit_snapshot`〔`Arc` でキャッシュ本体と共有〕へ格納する）。
+    // `Option::insert` で値を格納しつつそのまま `&mut T`（ここでは即座に `&T` へ
+    // 落とす）を受け取ることで、受信データ経路での `unwrap`/`expect` 禁止
+    // （.claude/rules/coding-rust.md）に抵触する「直後に取り出す」形の
+    // `expect("just assigned")` を書かずに済む。
+    let mut owned_arena: Option<VectorArena> = None;
+    let mut cache_hit_snapshot: Option<std::sync::Arc<crate::sql::arena_cache::SqlArenaSnapshot>> =
+        None;
+    let arena: &VectorArena = match arena_cache {
+        None => owned_arena.insert(
+            VectorArena::build_filtered_with_rows_in_txn(
+                read_txn,
+                &bound.table,
+                rls_hook.predicate(),
+                on_visible_row,
+            )
+            .map_err(|e| map_arena_error(&bound.table, e))?,
+        ),
+        Some(access) => {
+            let sql_cache = access.cache;
+            let storage = access.storage;
+            if let Some(snapshot) = sql_cache.lookup(storage, read_txn, &bound.table, ctx) {
+                if cache_fast_path_eligible {
+                    // 高速経路: SCALAR 段が恒等写像なので `on_visible_row` を
+                    // 一切呼ばず（呼んでも常に `Ok(true)` を返すだけで副作用が
+                    // ない）、`candidate_columns` だけスロット数分の空 `Vec` で
+                    // 埋める（`on_visible_row` 本体の「`needed_column_indices` が
+                    // 空なら `Vec::new()` を積むだけ」という既存分岐と同じ結果を、
+                    // 呼び出しなしで再現する。空 `Vec` はヒープ確保しないため
+                    // 行数分の確保コストも発生しない）。
+                    candidate_columns
+                        .try_reserve_exact(snapshot.arena().len())
+                        .map_err(|e| {
+                            map_arena_error(
+                                &bound.table,
+                                ArenaError::AllocationFailed(format!(
+                                    "failed to reserve candidate column slots: {e}"
+                                )),
+                            )
+                        })?;
+                    for _ in 0..snapshot.arena().len() {
+                        candidate_columns.push(Vec::new());
+                    }
+                    cache_hit_snapshot.insert(snapshot).arena()
+                } else {
+                    // ヒットだが SCALAR 段に実質的な処理がある: 従来どおり
+                    // キャッシュ済みスナップショットへ `on_visible_row` を
+                    // クエリごとに再適用して候補集合を再構築する
+                    // （モジュールドキュメント「RLS → SCALAR → DISTANCE」の
+                    // 責務境界は変えない）。
+                    let expected_dim = schema
+                        .vector_dim()
+                        .ok_or(ArenaError::InvalidDim)
+                        .map_err(|e| map_arena_error(&bound.table, e))?;
+                    owned_arena.insert(
+                        VectorArena::build_from_cached_rls_rows(
+                            &bound.table,
+                            expected_dim,
+                            snapshot.arena(),
+                            snapshot.metadata(),
+                            on_visible_row,
+                            crate::arena::MAX_ARENA_ROWS,
+                            crate::arena::MAX_ARENA_TOTAL_BYTES,
+                        )
+                        .map_err(|e| map_arena_error(&bound.table, e))?,
+                    )
+                }
+            } else {
+                // ミス: 従来どおり redb を走査するが、`rls_capture` で RLS 通過行
+                // （SCALAR 段の判定結果に関係なく全件）を同一走査の中で同時に採取し、
+                // 次回以降のクエリが再利用できるスナップショットとしてキャッシュへ
+                // 登録する（`SqlArenaCaptureBuilder` のドキュメント参照。容量超過等で
+                // 採取を断念した場合はキャッシュへ反映しないだけで、このクエリ自体の
+                // 応答には影響しない）。
+                let expected_dim = schema
+                    .vector_dim()
+                    .ok_or(ArenaError::InvalidDim)
+                    .map_err(|e| map_arena_error(&bound.table, e))?;
+                // `max_bytes`（第 3 引数）・`metadata_byte_cap`（第 4 引数）はいずれも
+                // `MAX_ARENA_TOTAL_BYTES` を渡すが、クエリ本体（応答用アリーナ）と
+                // 独立した別枠の予算ではない。`SqlArenaCaptureBuilder::push` へ渡す
+                // `external_bytes_in_use`（応答用アリーナの現在使用量）と合算した
+                // 単一のピーク予算として扱われる（Issue #379 codex-review P1 対応。
+                // 型・`push` のドキュメント参照。以前は応答用アリーナ・採取用
+                // embedding・採取用 metadata がそれぞれ独立に `MAX_ARENA_TOTAL_BYTES`
+                // まで確保でき、単一クエリのピークメモリが最大で約 3 倍〔付随バッファ
+                // 除く〕に膨らみ得た）。
+                let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
+                    expected_dim,
+                    crate::arena::MAX_ARENA_ROWS,
+                    crate::arena::MAX_ARENA_TOTAL_BYTES,
+                    crate::arena::MAX_ARENA_TOTAL_BYTES,
+                );
+                let mut rls_capture = |id: u64,
+                                       tenant_id: &str,
+                                       visibility,
+                                       embedding: &[f32],
+                                       metadata: &[u8],
+                                       response_arena_bytes_in_use: usize|
+                 -> std::result::Result<(), ArenaError> {
+                    capture.push(
+                        id,
+                        tenant_id,
+                        visibility,
+                        embedding,
+                        metadata,
+                        response_arena_bytes_in_use,
+                    );
+                    Ok(())
+                };
+                let built = VectorArena::build_filtered_with_rows_in_txn_capturing(
+                    read_txn,
+                    &bound.table,
+                    rls_hook.predicate(),
+                    on_visible_row,
+                    &mut rls_capture,
+                )
+                .map_err(|e| map_arena_error(&bound.table, e))?;
+                // キャッシュ登録用のテーブル世代は、クエリ実行そのものに使った
+                // `read_txn`（＝この走査が観測したスナップショット）から読む。
+                // `SqlArenaCache::insert` 側が挿入直前に別途フレッシュな世代と
+                // 再照合するため、ここでの読み取りは「採取したスナップショットが
+                // どの世代由来か」を記録するだけでよい。読み取り自体に失敗した場合は
+                // キャッシュへ登録せず、クエリ応答（`built`）はそのまま返す
+                // （fail-closed: 判定できないなら常駐させない。クエリ自体は失敗させない）。
+                if let Ok(built_table_generation) =
+                    crate::catalog::table_generation_in_txn(read_txn, &bound.table)
+                {
+                    if let Some((cache_arena, cache_metadata)) = capture.finish(&bound.table) {
+                        let snapshot = crate::sql::arena_cache::SqlArenaSnapshot::new(
+                            cache_arena,
+                            cache_metadata,
+                            ctx.clone(),
+                            built_table_generation,
+                        );
+                        let _ = sql_cache.insert(storage, &bound.table, ctx, snapshot);
+                    }
+                }
+                owned_arena.insert(built)
+            }
+        }
+    };
 
     // provider へ渡す id は行 `id` ではなく**アリーナのスロット番号**（0..n）にする。
     // 行 `id` の一意性スコープはテナント内（対象ビヘイビア: TABLE-12）であり、1 つの
@@ -1010,7 +1188,7 @@ pub(crate) fn execute_statement_with_cache(
         verified,
         &bound.projection,
         schema,
-        &arena,
+        arena,
         &candidate_columns,
     )?;
 
@@ -1035,13 +1213,14 @@ pub(crate) fn execute_statement_with_cache(
 }
 
 /// [`BoundStatement`] を実行する（TASK-75 の公開 API）。従来の 6 引数シグネチャを
-/// 維持する薄いラッパー（Issue #357 レビュー指摘対応・AGENTS.md「公開 API・
-/// エラー契約の互換性（P1）」: [`execute_statement_with_cache`] へ `SparseCacheAccess`
-/// を追加した際、その型が属する `sql::sparse_cache` モジュールが `pub(crate)` の
+/// 維持する薄いラッパー（Issue #357・#363 レビュー指摘対応・AGENTS.md「公開 API・
+/// エラー契約の互換性（P1）」: [`execute_statement_with_cache`] へ
+/// `SparseCacheAccess`・`ArenaCacheAccess` を追加した際、両型が属する
+/// `sql::sparse_cache`／`sql::arena_cache` モジュールがいずれも `pub(crate)` の
 /// ため crate 外から構築不能になり、本関数を呼べなくなる破壊的変更を招いていた。
-/// 本ラッパーは `sparse_cache: None` を渡し、Issue #357 のキャッシュ最適化を経由
-/// しない従来どおりの新規構築のみの経路として動作する）。crate 内部の hybrid
-/// キャッシュ経路（`core.rs`）は [`execute_statement_with_cache`] を直接呼ぶ。
+/// 本ラッパーは両方に `None` を渡し、それぞれのキャッシュ最適化を経由しない
+/// 従来どおりの新規構築のみの経路として動作する）。crate 内部のキャッシュ経路
+/// （`core.rs`）は [`execute_statement_with_cache`] を直接呼ぶ。
 pub fn execute_statement(
     read_txn: &redb::ReadTransaction,
     provider: &dyn SearchProvider,
@@ -1057,6 +1236,7 @@ pub fn execute_statement(
         schema,
         bound,
         precision_policy,
+        None,
         None,
     )
 }

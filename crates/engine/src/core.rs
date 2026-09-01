@@ -1015,6 +1015,12 @@ pub struct EngineCore {
     /// （Issue #357）。詳細は `sql/sparse_cache.rs::SparseIndexCache` のドキュメント
     /// 参照。
     sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache,
+    /// SQL 表層（`sql::exec::execute_statement_with_cache`）専用の `VectorArena`
+    /// テーブル世代整合キャッシュ（Issue #363）。[`Self::execute_validated_in_session`]
+    /// の `Statement::Select` アームがこれを経由してアリーナ再構築（redb 全行走査・
+    /// デコード）を同一テーブル世代内で再利用する（詳細は
+    /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
+    sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1077,6 +1083,7 @@ impl EngineCore {
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
+            sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
         })
     }
 
@@ -1105,6 +1112,7 @@ impl EngineCore {
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
+            sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
         }
     }
 
@@ -1121,6 +1129,14 @@ impl EngineCore {
     /// （`core_api.snapshot` の対象外）。
     pub fn sparse_index_cache_stats(&self) -> crate::sql::sparse_cache::SparseIndexCacheStats {
         self.sparse_index_cache.stats()
+    }
+
+    /// `sql::arena_cache::SqlArenaCache` の現在の統計を返す（Issue #363。
+    /// テスト・運用観測用）。テナント ID・行 ID 等の機微情報は含まない
+    /// （`SqlArenaCacheStats` 参照）。`VectorCore` trait には載せない固有メソッド
+    /// （`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ方針）。
+    pub fn sql_arena_cache_stats(&self) -> crate::sql::arena_cache::SqlArenaCacheStats {
+        self.sql_arena_cache.stats()
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -2048,6 +2064,12 @@ impl EngineCore {
                     (read_txn, schema, bound)
                 };
                 let (read_txn, schema, bound) = bound_result;
+                // Issue #357: hybrid 実行が参照する SparseIndex のテーブル世代整合
+                // キャッシュ。Issue #363: SQL 表層の SELECT（`USING PLAN` 展開経由を
+                // 含む、本アーム全体）は sql_arena_cache（テーブル世代整合キャッシュ）
+                // を経由して VectorArena の再構築（redb 全行走査・デコード）を同一
+                // テーブル世代内で再利用する（詳細は `SqlArenaCache`・
+                // `sql::exec::execute_statement_with_cache` のドキュメント参照）。
                 let result = crate::sql::exec::execute_statement_with_cache(
                     &read_txn,
                     self.provider.as_ref(),
@@ -2058,6 +2080,10 @@ impl EngineCore {
                     Some(crate::sql::sparse_cache::SparseCacheAccess {
                         storage: &self.storage,
                         cache: &self.sparse_index_cache,
+                    }),
+                    Some(crate::sql::arena_cache::ArenaCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.sql_arena_cache,
                     }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
@@ -4269,6 +4295,10 @@ mod tests {
             Some(crate::sql::sparse_cache::SparseCacheAccess {
                 storage: &core.storage,
                 cache: &core.sparse_index_cache,
+            }),
+            Some(crate::sql::arena_cache::ArenaCacheAccess {
+                storage: &core.storage,
+                cache: &core.sql_arena_cache,
             }),
         )
         .expect("execute_statement should succeed");
