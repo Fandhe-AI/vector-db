@@ -272,7 +272,39 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
 の値全体の再書き込みが発生する点に留意）。コーデックの破損検証（T1）は
 「非 live スロットの `row_ids`／embedding の内容」を正規形の一部とはみなさず、
 検証対象外とする。`live_count` が閾値（例: 50%）を下回ったチャンク
-は再パック対象とする。再パック方式の比較:
+は再パック対象とする。
+
+**集計値の原子更新不変条件（codex-review P1 指摘への対応）**: `slot_bits` の
+live ビットはチャンク単位・テナント単位（`public_live`／`private_live`）の
+集計値の分解であり複製ではない。header の `live_count`・`public_live`・
+`private_live` は「そのチャンク内で該当条件を満たす live スロットの個数」を
+表すため、live ビットを 1 本落とす／立てる操作は必ず対応する集計値の
+増減と対になる。したがって `delete_row`（tombstone）・`update_row`（embedding
+差し替え・visibility 変更を含む）・TASK-120 置換の削除側・再パックのいずれの
+経路も、対象スロットの `slot_bits` 更新と `live_count`・`public_live`・
+`private_live` の増減を**同一 write txn 内で原子的に**行う（一方のみ更新して
+commit する中間状態を作らない）。この不変条件が崩れると「4. 世代整合」節・
+「5. チャンク単位可視性ビットマップ」節のチャンク単位スキップ判定が実際の
+live スロット集合と乖離し、可視であるべき行が誤ってスキップされる／削除済み
+行が再パック判定に誤って算入される。将来 `COUNT(*)` を集計値のみから算出する
+最適化（下記「T3a の対象範囲・集計の読み取り元」節の例外候補）を検討する場合も
+この原子性が前提になる。検証対象:
+
+- T2（書き込み経路の結線）: 単体テストで、削除・更新（embedding 差し替え・
+  visibility 変更）・TASK-120 置換の各経路について、コミット後のチャンク値
+  `live_count`／`public_live`／`private_live` が実スロット走査結果（`slot_bits`
+  の live ビット集計）と一致することを確認する
+- T5（回復検証の拡張）: `index_failure_injection.rs`（RECOVER-9）・
+  `power_loss.rs` に、削除・更新・再パックの途中失敗／部分書き戻し像で
+  `slot_bits` と `live_count`／`public_live`／`private_live` が不整合な状態の
+  まま commit されないこと（fail-closed 拒否、または commit 前失敗として無傷に
+  戻ること）を検証対象として明記する
+- T8（帯域外整合性検証ツール）: 運用時の恒久的な担保として、世界単位で
+  `live_count`／`public_live`／`private_live`／`slot_bits` を `user_rows` 全件
+  走査結果と突合し、この原子性が破れた場合（実装バグ・bit-rot 等）の残存
+  リスクを検出する
+
+再パック方式の比較:
 
 | 方式 | 内容 | 判断 |
 | ---- | ---- | ---- |
@@ -452,7 +484,7 @@ embedding を取得できなくなる退行は生じない。
 Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると、同一世代内の反復 KNN
 では arena 再構築自体が発生しなくなるため、チャンク化による KNN 側の利得は
 「コールドスタート・書き込み後の再構築・`SearchTimeFilter`（動的ポリシー）・
-`batch_search`」に限定される（下記「T3 の対象範囲・集計の読み取り元」のとおり
+`batch_search`」に限定される（下記「T3a の対象範囲・集計の読み取り元」のとおり
 集計（`SUM`／`GROUP BY`／`HAVING` 等）はチャンク走査へ移らず縮小後の `user_rows`
 を走査し続けるため、この一覧から除く）。
 
@@ -470,14 +502,15 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 | - | ------ | ---- | -------- |
 | T1 | チャンクテーブル定義・コーデック（header 検証・上限定数・`unsafe` なし） | — | `storage/chunk.rs`（新規）・`catalog.rs`（`user_vecs` 命名・`drop_table`） |
 | T2 | 書き込み経路の結線（挿入・削除・更新・TASK-120 置換・tombstone・同一 txn） | T1 | `tenant.rs`・`recovery/ledger.rs` 連携・`table_generation_bump_coverage.rs` |
-| T3 | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋可視性集計スキップ＋権威検証〔「権威検証を行うタイミング」節の 4 点検証〕。集計は下記「T3 の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない。検証には実際に書き込まれたチャンク〔T2〕と `layout: chunked` 選択・v2/v3 分岐〔T4〕の両方が必要なため依存に含める） | T1・T2・T4 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
+| T3a | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋権威検証〔「権威検証を行うタイミング」節の 4 点検証〕。集計は下記「T3a の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない。チャンク header／`slot_bits` によるスキップ最適化はコード上実装するが**既定無効**（フィーチャーフラグ／設定で off）とし、T3b（T8 完了後）まで有効化しない。検証には実際に書き込まれたチャンク〔T2〕と `layout: chunked` 選択・v2/v3 分岐〔T4〕の両方が必要なため依存に含める） | T1・T2・T4 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
+| T3b | T3a で実装したチャンク header／`slot_bits` によるスキップ最適化の有効化（既定 off → on への切り替え）。T8（帯域外整合性検証ツール）の完了を前提条件とする（下記「除外判定自体の整合性検証」節参照。**T8 未完了のまま有効化しない**） | T3a・T8 | `arena.rs`・`rls.rs`・`batch_search.rs`（フラグ切り替えのみ） |
 | T4 | カタログのレイアウト属性と opt-in・オフライン再構築ツール | T1 | `catalog.rs`・`examples/` |
-| T5 | 回復検証の拡張（crash_tool サブコマンド・cross-table 3 テーブル・power_loss・RECOVER-9 注入） | T2 | `scripts/`・`examples/crash_tool*.rs`・`tests/` |
+| T5 | 回復検証の拡張（crash_tool サブコマンド・cross-table 3 テーブル・power_loss・RECOVER-9 注入。「2. 削除（tombstone）」節「集計値の原子更新不変条件」の途中失敗検証を含む） | T2 | `scripts/`・`examples/crash_tool*.rs`・`tests/` |
 | T6 | 再パック（コンパクション）と閾値 | T2 | `storage/chunk.rs`・`tenant.rs` |
-| T7 | 効果実測（`feature_bench` 前後比較・`sql_c1_bench`・#362 内訳との突合）と README「実装方針（要点）」反映 | T3・T4 | `examples/feature_bench.rs`・`docs/` |
-| T8 | 世界単位（`(tenant_id, chunk_no)` 単位）整合性検証ツール（`live_count`／`public_live`／`private_live`／`slot_bits` と対応する `user_rows` 全件走査結果の突合。運用者専用・クエリ応答経路には結線しない。「5. チャンク単位可視性ビットマップ」節「除外判定自体の整合性検証」参照）。**T3 のチャンク header／`slot_bits` によるスキップ最適化は T8 実装まで有効化しない** | T2 | `examples/crash_tool*.rs` 系（新規サブコマンド）・`storage/chunk.rs` |
+| T7 | 効果実測（`feature_bench` 前後比較・`sql_c1_bench`・#362 内訳との突合）と README「実装方針（要点）」反映 | T3b・T4 | `examples/feature_bench.rs`・`docs/` |
+| T8 | 世界単位（`(tenant_id, chunk_no)` 単位）整合性検証ツール（`live_count`／`public_live`／`private_live`／`slot_bits` と対応する `user_rows` 全件走査結果の突合。運用者専用・クエリ応答経路には結線しない。「5. チャンク単位可視性ビットマップ」節「除外判定自体の整合性検証」参照。「2. 削除（tombstone）」節「集計値の原子更新不変条件」の恒久的な帯域外担保を兼ねる）。**T3a のチャンク header／`slot_bits` によるスキップ最適化は本タスク完了まで有効化しない（有効化自体は T3b で行う）** | T2 | `examples/crash_tool*.rs` 系（新規サブコマンド）・`storage/chunk.rs` |
 
-### T3 の対象範囲・集計の読み取り元（codex-review P1 指摘への対応）
+### T3a の対象範囲・集計の読み取り元（codex-review P1 指摘への対応）
 
 提案するチャンク値（`row_ids`・embedding・`slot_bits`）には `SUM`／`AVG`／`MIN`／
 `MAX`／`GROUP BY`／`HAVING` が要求するスカラー metadata が含まれない。metadata は
@@ -485,7 +518,7 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 移さず、`user_rows` を走査し続ける**（`sql/aggregate.rs`・`sql/group_by.rs` は
 `user_rows` の `range`／`iter` 走査を維持し、チャンクテーブルには触れない）。
 対象テーブルが `layout: chunked`（opt-in 済み）の場合、走査する `user_rows` は
-embedding を外した縮小後の行フォーマット v3 であり、T3 における
+embedding を外した縮小後の行フォーマット v3 であり、T3a における
 `sql/aggregate.rs`・`sql/group_by.rs` への変更は「チャンク走査への切り替え」では
 なく、v3（embedding を含まない縮小行）へ追随するデコード経路の更新に限定する。
 `layout: row`（既定・非 opt-in）のテーブルでは行値は引き続き v2（embedding
@@ -499,7 +532,7 @@ inline）のままであり、集計の走査・デコード経路は本 ADR に
 例外として `COUNT(*)`（`WHERE` を伴わず metadata 不要な場合に限る）は、チャンク
 header の `live_count`／`public_live`／`private_live` 集計値を可視性判定に用いて
 `user_rows` を一切走査せずに算出できる余地があるが、この最適化は本 ADR の対象外
-（将来検討）とし、T3 では実装しない。`WHERE`・宣言的フィルタ API を伴う集計は
+（将来検討）とし、T3a では実装しない。`WHERE`・宣言的フィルタ API を伴う集計は
 metadata 参照が必須のため、上記「候補段階での metadata 取得」節と同じ理由で
 `user_rows` 走査（縮小後）を維持する。**この将来最適化は「物理設計案」節・
 「5. チャンク単位可視性ビットマップ」節で定めた単一権威原則（チャンク側複製は
@@ -539,7 +572,7 @@ metadata 参照が必須のため、上記「候補段階での metadata 取得�
   検討として記載のみ
 - 旧 `ROWS_TABLE` の扱い
 
-ADR の Accepted 化・実装タスク（T1〜T7）の Issue 起票・README「実装方針（要点）」
+ADR の Accepted 化・実装タスク（T1〜T8）の Issue 起票・README「実装方針（要点）」
 への反映は、いずれもオーナー承認後の別作業とする
 （[out-of-scope-tracking.md](../../.claude/rules/out-of-scope-tracking.md) の
 承認制）。
