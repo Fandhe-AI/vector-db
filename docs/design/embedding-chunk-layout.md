@@ -135,14 +135,25 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
       コピー）に残り、metadata 分の点検索コストは RLS 可視行数に比例したまま
       である点を「コスト見積り」節に反映する（T7 の効果実測でフィルタなし
       クエリとの差を計測する）
-- 行値（`user_rows`）からは embedding を外し
-  `[header | locator(chunk_no u64, slot u16) | metadata]` へ（行フォーマット v3。
-  v2 は fail-closed 拒否・マイグレーション非提供の既存方針を維持するか、下記
-  「行単位レイアウトとの互換・移行方針」に従う）。この行→チャンクの locator は
-  「行 id からチャンク位置を引く」順方向専用であり、上記 `row_ids` 配列（チャンク
-  →行の逆方向）と役割が異なる。再パック（下記「削除（tombstone）」節）でスロット
-  が移動した場合はチャンク側 `row_ids` の更新に加え、移動した行の `user_rows`
-  locator も同一 txn 内で更新する（`row_ids` と `locator` の不一致を残さない）
+- 行値（`user_rows`）の物理レイアウトは、下記「行単位レイアウトとの互換・移行方針」
+  で採用する (2) opt-in 方式のもとでは **テーブルのカタログ `layout` 属性に従い
+  2 形式が併存する**（codex-review P1 指摘への対応。一律に v3 化するとは規定しない）:
+  - `layout: row`（既定・非 opt-in）: 現行の v2 のまま据え置く。embedding は
+    引き続き行値に inline 格納され、既存のデコード経路（`decode_row_header`／
+    `decode_row_embedding_and_metadata_into`）は無変更で動作する
+  - `layout: chunked`（opt-in 済みテーブルのみ）: 行値から embedding を外し
+    `[header | locator(chunk_no u64, slot u16) | metadata]` へ（行フォーマット v3）。
+    v3 は `layout: chunked` のテーブルにのみ書き込まれ、`layout: row` のテーブルの
+    行が v3 になることはない。この行→チャンクの locator は「行 id からチャンク
+    位置を引く」順方向専用であり、上記 `row_ids` 配列（チャンク→行の逆方向）と
+    役割が異なる。再パック（下記「削除（tombstone）」節）でスロットが移動した
+    場合はチャンク側 `row_ids` の更新に加え、移動した行の `user_rows` locator も
+    同一 txn 内で更新する（`row_ids` と `locator` の不一致を残さない）
+  - デコーダはテーブルの `layout` 属性を読み、v2/v3 いずれの形式で読むかを分岐
+    する（`ROW_FORMAT_VERSION` の単純な拒否ではなく、テーブル単位の属性で経路を
+    切り替える）。異なる `layout` の行が同一テーブル内に混在することはない
+    （テーブル単位の属性でありレイアウト変更はオフライン再構築ツール経由の
+    全件書き直しでのみ発生するため）
 - チャンクは **テナント単位**（キー先頭が `tenant_id`）とし、1 チャンクに複数
   テナントの行を混在させない。理由:
   - RLS の単一照合パス維持（後述「チャンク単位可視性ビットマップ」）
@@ -301,6 +312,14 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
 マイグレーションは提供しない）。理由: 実装着手直後でデータ互換保証は不要という
 既存判断と整合しつつ、#362／#363 の結果に応じてテーブル単位で効果検証できるため。
 
+(2) を採用する場合、(1) の「行フォーマット v3 へ一斉移行」は選択しない
+（(1)／(2) は互いに排他的な選択肢であり、本 ADR は (2) のみを推奨する）。
+`layout: row`（既定・非 opt-in）のテーブルは埋め込みを外した v3 形式へは
+移行せず、v2（embedding inline）のまま恒久的に維持される。v3（行フォーマット）が
+書き込まれるのは `layout: chunked` へ opt-in 済みのテーブルに限られる（上記
+「物理設計案」節参照）。これにより、opt-in していないテーブルの検索経路が
+embedding を取得できなくなる退行は生じない。
+
 旧 `ROWS_TABLE`（`Storage::put` 系・`txn.rs`・`crash_tool` 系）はテーブルスコープ
 行ストア（`user_rows/{table}`）とは別系統であり、本 ADR の対象外とする。
 
@@ -338,11 +357,14 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 提案するチャンク値（`row_ids`・embedding・`slot_bits`）には `SUM`／`AVG`／`MIN`／
 `MAX`／`GROUP BY`／`HAVING` が要求するスカラー metadata が含まれない。metadata は
 引き続き `user_rows` 側にのみ存在するため、これらの集計は **チャンク走査へは
-移さず、embedding を外した縮小後の `user_rows`（行フォーマット v3）を走査し続ける**
-（`sql/aggregate.rs`・`sql/group_by.rs` は `user_rows` の `range`／`iter` 走査を
-維持し、チャンクテーブルには触れない）。T3 における `sql/aggregate.rs`・
-`sql/group_by.rs` への変更は「チャンク走査への切り替え」ではなく、行フォーマット
-v3（embedding を含まない縮小行）へ追随するデコード経路の更新に限定する。
+移さず、`user_rows` を走査し続ける**（`sql/aggregate.rs`・`sql/group_by.rs` は
+`user_rows` の `range`／`iter` 走査を維持し、チャンクテーブルには触れない）。
+対象テーブルが `layout: chunked`（opt-in 済み）の場合、走査する `user_rows` は
+embedding を外した縮小後の行フォーマット v3 であり、T3 における
+`sql/aggregate.rs`・`sql/group_by.rs` への変更は「チャンク走査への切り替え」では
+なく、v3（embedding を含まない縮小行）へ追随するデコード経路の更新に限定する。
+`layout: row`（既定・非 opt-in）のテーブルでは行値は引き続き v2（embedding
+inline）のままであり、集計の走査・デコード経路は本 ADR による変更を受けない。
 
 この方針は「コスト見積り」節の副次効果（行値縮小により集計・`GROUP BY`・TASK-120
 の path 一致走査が縮小後の `user_rows` を走査する前提でページ読み取り数が減る
