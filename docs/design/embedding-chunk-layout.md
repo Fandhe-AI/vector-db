@@ -105,10 +105,36 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
     無効値として拒否すること」は対象としない）
   - KNN・`SearchTimeFilter`・`batch_search` はチャンク走査で得たスロットの
     `row_ids[slot]` から直接 `(tenant_id, id)` を復元し、`user_rows` へは
-    metadata 取得（RLS predicate 評価後、返却対象に絞ってから）のためだけに
-    ポイントルックアップする。`user_rows` の全件走査は発生しない（この逆引きが
-    無いと KNN 結果からの行復元に全件走査が必要になり、本 ADR が狙う per-entry
-    コスト削減が成立しない。codex-review 指摘）
+    metadata 取得のためポイントルックアップする。`user_rows` の全件走査は発生
+    しない（この逆引きが無いと KNN 結果からの行復元に全件走査が必要になり、本
+    ADR が狙う per-entry コスト削減が成立しない。codex-review 指摘）。
+    **点検索を行うタイミングは「RLS predicate 通過後・返却対象への絞り込み前」**
+    であり、「最終的な返却行に絞ってから」ではない（既存の評価順序
+    `predicate`（RLS 段）→ `on_visible_row`（`WHERE`・宣言的フィルタ API 等の
+    SCALAR 段）は `arena.rs::build_filtered_with_rows` のドキュメントに明記された
+    固定順序であり、SCALAR 段は「ランキング前の候補集合」に対して metadata を
+    要求する。したがって RLS predicate を通過した行はすべて、SCALAR 段の評価
+    前に `user_rows` へポイントルックアップして metadata を取得する必要がある。
+    codex-review P1 指摘）。実行計画別の取得段階は次のとおりとし、既存のフィルタ
+    順序・エラー契約（fail-closed のまま維持）を変えない:
+    - KNN（`WHERE`・宣言的フィルタ API を伴う場合）: RLS predicate 通過直後・
+      SCALAR 述語評価の直前に metadata をポイントルックアップし、SCALAR 述語も
+      通過した行だけをアリーナへ積む（`arena.rs::build_filtered_with_rows` の
+      `predicate` → `on_visible_row` の 2 段構成を維持しつつ、`on_visible_row`
+      の評価に必要な metadata をこの時点で取得する形へ結線する）
+    - KNN（`WHERE`・宣言的フィルタ API を伴わない場合）: 従来案どおり、ランキング
+      後に返却対象へ絞ってから取得してよい（候補段階で metadata を必要としない
+      ため）
+    - `SearchTimeFilter`・`batch_search`: 適用する述語が RLS のみ（metadata 不要）
+      であれば従来案のとおり返却対象に絞ってから取得する。metadata を用いる
+      述語を渡す呼び出し経路がある場合は KNN の `WHERE` 付き経路と同じ「RLS
+      直後」の段階で取得する
+    - この結果、`WHERE`・宣言的フィルタ API を伴うクエリでは「RLS 可視行数」分の
+      ポイントルックアップが発生し、「最終的な返却行数」分に絞られる従来案より
+      点検索の母数が増える。per-entry 削減効果は主に embedding 分（f32 デコード・
+      コピー）に残り、metadata 分の点検索コストは RLS 可視行数に比例したまま
+      である点を「コスト見積り」節に反映する（T7 の効果実測でフィルタなし
+      クエリとの差を計測する）
 - 行値（`user_rows`）からは embedding を外し
   `[header | locator(chunk_no u64, slot u16) | metadata]` へ（行フォーマット v3。
   v2 は fail-closed 拒否・マイグレーション非提供の既存方針を維持するか、下記
@@ -283,7 +309,9 @@ live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は
 Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると、同一世代内の反復 KNN
 では arena 再構築自体が発生しなくなるため、チャンク化による KNN 側の利得は
 「コールドスタート・書き込み後の再構築・`SearchTimeFilter`（動的ポリシー）・
-`batch_search`・集計走査」に限定される。
+`batch_search`」に限定される（下記「T3 の対象範囲・集計の読み取り元」のとおり
+集計（`SUM`／`GROUP BY`／`HAVING` 等）はチャンク走査へ移らず縮小後の `user_rows`
+を走査し続けるため、この一覧から除く）。
 
 判断基準案: #362 の実測で「走査・ヘッダデコード段」が KNN 内訳の支配項であり、
 かつ書き込み頻度が高く #363 のキャッシュヒット率が低いワークロードを重視する
@@ -299,11 +327,34 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 | - | ------ | ---- | -------- |
 | T1 | チャンクテーブル定義・コーデック（header 検証・上限定数・`unsafe` なし） | — | `storage/chunk.rs`（新規）・`catalog.rs`（`user_vecs` 命名・`drop_table`） |
 | T2 | 書き込み経路の結線（挿入・削除・更新・TASK-120 置換・tombstone・同一 txn） | T1 | `tenant.rs`・`recovery/ledger.rs` 連携・`table_generation_bump_coverage.rs` |
-| T3 | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search`・集計のチャンク走査＋可視性集計スキップ） | T1 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
+| T3 | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋可視性集計スキップ。集計は下記「T3 の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない） | T1 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
 | T4 | カタログのレイアウト属性と opt-in・オフライン再構築ツール | T1 | `catalog.rs`・`examples/` |
 | T5 | 回復検証の拡張（crash_tool サブコマンド・cross-table 3 テーブル・power_loss・RECOVER-9 注入） | T2 | `scripts/`・`examples/crash_tool*.rs`・`tests/` |
 | T6 | 再パック（コンパクション）と閾値 | T2 | `storage/chunk.rs`・`tenant.rs` |
 | T7 | 効果実測（`feature_bench` 前後比較・`sql_c1_bench`・#362 内訳との突合）と README「実装方針（要点）」反映 | T3・T4 | `examples/feature_bench.rs`・`docs/` |
+
+### T3 の対象範囲・集計の読み取り元（codex-review P1 指摘への対応）
+
+提案するチャンク値（`row_ids`・embedding・`slot_bits`）には `SUM`／`AVG`／`MIN`／
+`MAX`／`GROUP BY`／`HAVING` が要求するスカラー metadata が含まれない。metadata は
+引き続き `user_rows` 側にのみ存在するため、これらの集計は **チャンク走査へは
+移さず、embedding を外した縮小後の `user_rows`（行フォーマット v3）を走査し続ける**
+（`sql/aggregate.rs`・`sql/group_by.rs` は `user_rows` の `range`／`iter` 走査を
+維持し、チャンクテーブルには触れない）。T3 における `sql/aggregate.rs`・
+`sql/group_by.rs` への変更は「チャンク走査への切り替え」ではなく、行フォーマット
+v3（embedding を含まない縮小行）へ追随するデコード経路の更新に限定する。
+
+この方針は「コスト見積り」節の副次効果（行値縮小により集計・`GROUP BY`・TASK-120
+の path 一致走査が縮小後の `user_rows` を走査する前提でページ読み取り数が減る
+見積り）と整合する。チャンクからポイントルックアップして `user_rows` を走査する
+利点を失う設計（全チャンク→全行ポイントルックアップ）は採らない。
+
+例外として `COUNT(*)`（`WHERE` を伴わず metadata 不要な場合に限る）は、チャンク
+header の `live_count`／`public_live`／`private_live` 集計値を可視性判定に用いて
+`user_rows` を一切走査せずに算出できる余地があるが、この最適化は本 ADR の対象外
+（将来検討）とし、T3 では実装しない。`WHERE`・宣言的フィルタ API を伴う集計は
+metadata 参照が必須のため、上記「候補段階での metadata 取得」節と同じ理由で
+`user_rows` 走査（縮小後）を維持する。
 
 ## セキュリティ考慮（OWASP Top 10 + AGENTS.md P0）
 
