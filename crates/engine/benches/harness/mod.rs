@@ -51,6 +51,7 @@ pub mod contrast;
 pub mod env_report;
 pub mod hybrid_latency;
 pub mod hybrid_profile;
+pub mod parse_bind;
 pub mod protocol;
 pub mod rng;
 pub mod scalar_reference;

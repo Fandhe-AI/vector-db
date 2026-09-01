@@ -847,6 +847,17 @@ impl Storage {
         get_table_schema_in_txn(&read_txn, table_name)
     }
 
+    /// テーブル単位の世代（[`table_generation_in_txn`]）を新規 read トランザクション
+    /// で読み直す（Issue #357・`sql/sparse_cache.rs::SparseIndexCache::insert`
+    /// 専用の呼び出し口）。呼び出し元のクエリが使う `read_txn` とは別スナップショットを
+    /// 意図的に開く: 挿入直前に他スレッドがコミットした書き込みを見逃さないため
+    /// （`core.rs::PrefilterCache::insert` が `storage.current_generation()` を
+    /// 同じ理由で挿入時に再読取するのと同じ方針）。
+    pub(crate) fn table_generation(&self, table_name: &str) -> Result<u64> {
+        let read_txn = self.db().begin_read()?;
+        table_generation_in_txn(&read_txn, table_name)
+    }
+
     /// 定義済みテーブル名の一覧をスナップショット読み取りで返す。件数上限
     /// （[`MAX_LIST_TABLES`]）を超える場合は `Err`（無制限 `Vec` 確保を防ぐ）。
     pub fn list_tables(&self) -> Result<Vec<String>> {
