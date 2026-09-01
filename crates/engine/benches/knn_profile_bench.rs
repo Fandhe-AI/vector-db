@@ -140,8 +140,6 @@ fn main() {
         .expect("create table for bench seeding");
 
     let mut rng = DeterministicRng::new(1);
-    let mut all_ids: Vec<u64> = Vec::with_capacity(TOTAL_ROWS);
-    let mut all_vectors: Vec<f32> = Vec::with_capacity(TOTAL_ROWS * DIM);
     let mut next_id: u64 = 0;
     for (tenant_id, count) in [(TENANT_A, TENANT_A_ROWS), (TENANT_B, TENANT_B_ROWS)] {
         let ctx = PolicyContext::new(tenant_id).expect("valid tenant id");
@@ -171,15 +169,19 @@ fn main() {
             let op_id = OperationId::parse(&format!("seed-{tenant_id}-{next_id}"))
                 .expect("valid operation_id");
             tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id).expect("seed batch insert");
-            for (i, v) in batch_vectors.iter().enumerate() {
-                all_ids.push(next_id + i as u64);
-                all_vectors.extend_from_slice(v);
-            }
             next_id += batch_len as u64;
             remaining -= batch_len;
         }
     }
-    debug_assert_eq!(all_ids.len(), TOTAL_ROWS);
+    // 投入件数の検証は `debug_assert!` ではなく明示チェックにする。ベンチは
+    // release ビルドで動かすため `debug_assert!` は既定でコンパイルから除去され、
+    // 検査が事実上無効化される（codex-review 指摘・PR #378）。投入済みベクトルを
+    // 別バッファへ複製して件数検証する必要はない（`next_id` の到達値で足りる）。
+    if next_id as usize != TOTAL_ROWS {
+        fail_closed(format!(
+            "seeded row count mismatch: expected {TOTAL_ROWS}, got {next_id}"
+        ));
+    }
 
     let policy_ctx = PolicyContext::new(TENANT_A).expect("valid tenant id");
     let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
@@ -198,17 +200,23 @@ fn main() {
     // は計測区間外の sink（`batch_bench.rs` と同じパターン）へ退避し、クロージャの
     // 戻り値は軽量な行数のみにすることで解放コストを計測区間外へ追い出す。
     //
-    // sink には計測フェーズ（`measured_iterations`）分の `VectorArena` のみを
-    // 退避する。warmup フェーズ（`run` 内部で計測区間の外側・`Instant` 計測前に
-    // 実行される）分はクロージャ内で即座に drop してよい——warmup の drop は
-    // どのみち計測区間の外なので測定値へ混入しない。これにより sink の同時保持数を
-    // `warmup_iterations + measured_iterations` から `measured_iterations` のみへ
-    // 抑え、後半の反復ほどメモリ常駐量・ページ圧力が測定結果へ混入する度合いを
-    // 半減させる（codex-review 指摘・PR #378。メモリの小さい手動計測環境での
-    // OOM 懸念に対応。`run` は warmup を先に全回実行してから計測フェーズへ入る
-    // 契約〔`protocol.rs`〕のため、呼び出し回数カウンタで両フェーズを判別できる）。
+    // sink は固定容量（`S4_SINK_CAPACITY`）のリングバッファとし、同時に生存する
+    // `VectorArena` の数を計測フェーズを通じて一定に保つ（codex-review 指摘・PR #378。
+    // 全 `measured_iterations` 分を無条件に retain すると、行あたり ≈51KB
+    // （25,000 行 × dim128 × f32）の arena が反復ごとに積み上がり、終盤の反復ほど
+    // 常駐メモリ・ページ圧力が増えて S4 中央値を歪める）。容量超過時は最も古い
+    // エントリをその場で `mem::replace` により解放する——この解放は計測フェーズの
+    // 3 反復目以降、毎回ひとつの arena 分だけ一様に計測区間へ混入するが、全反復で
+    // 同じ大きさの一様バイアスであるため、中央値が示す「構築＋１回分の解放」という
+    // 相対比較には影響しない（growing sink 方式が持ち込む反復間の不均一な
+    // メモリ常駐差よりも、一様な追加コストの方が中央値の代表性を保てる）。
+    // warmup フェーズ（`run` 内部で計測区間の外側・`Instant` 計測前に実行される）分は
+    // sink に触れずクロージャ内で即座に drop する——計測区間の外なので測定値へ
+    // 混入しない。
+    const S4_SINK_CAPACITY: usize = 2;
     let mut s4_call_count: u32 = 0;
-    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(config.measured_iterations() as usize);
+    let mut s4_sink: Vec<VectorArena> = Vec::with_capacity(S4_SINK_CAPACITY);
+    let mut s4_sink_next: usize = 0;
     let s4 = run(&config, || {
         let built_arena = VectorArena::build_filtered(&storage, TABLE, |tenant, visibility| {
             policy_ctx.is_visible(tenant, visibility)
@@ -217,14 +225,21 @@ fn main() {
         let row_count = built_arena.len();
         s4_call_count += 1;
         if s4_call_count > config.warmup_iterations() {
-            // 計測フェーズ分のみ sink へ退避し、解放を計測区間外（`run` 完了後）へ追い出す。
-            s4_sink.push(built_arena);
+            // 計測フェーズ分のみリングバッファへ退避する。容量未満の間は単純 push、
+            // 容量到達後は最も古いスロットを新しい arena で置き換え、追い出された
+            // 古い arena はこの場で drop する（同時生存数を常に容量以下へ保つ）。
+            if s4_sink.len() < S4_SINK_CAPACITY {
+                s4_sink.push(built_arena);
+            } else {
+                let _evicted = std::mem::replace(&mut s4_sink[s4_sink_next], built_arena);
+                s4_sink_next = (s4_sink_next + 1) % S4_SINK_CAPACITY;
+            }
         }
-        // warmup フェーズ分は退避せずここで drop する（計測区間外のため安全）。
+        // warmup フェーズ分は retain せずここで drop する（計測区間外のため安全）。
         row_count
     })
     .expect("measurement must satisfy protocol minimums");
-    // sink に退避した計測フェーズ分の `VectorArena` の解放はここで行い、計測区間の外側にする。
+    // sink に残った最終分の `VectorArena` の解放はここで行い、計測区間の外側にする。
     drop(s4_sink);
     let s4_median = s4.summary.median;
 
