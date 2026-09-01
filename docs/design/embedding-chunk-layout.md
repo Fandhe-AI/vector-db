@@ -1,6 +1,7 @@
 # ADR: embedding チャンク連続格納レイアウト（Issue #364）
 
-- ステータス: Proposed（オーナー承認待ち。承認後に別コミットで Accepted へ更新）
+- ステータス: Proposed（本 ADR の公開はオーナー承認済み〔2026-09-01〕。設計の
+  Accepted 化は別途オーナー判断で別コミットにて更新）
 - 対応: Issue #364（親 Issue #361「ベクトル検索・ストレージレイアウト最適化」の子。
   ルート Issue #344）
 - 関連ポインタ: `docs/spec/04-behavior/data-model.md`（TABLE-8・TABLE-12）・
