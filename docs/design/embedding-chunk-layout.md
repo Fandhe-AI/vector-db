@@ -93,9 +93,16 @@ Lance のような列指向ストレージが採る「固定長ベクトル列�
     row_ids (u64 × slot_count) | f32 LE × slot_count × dim]`
     （`row_ids[slot]` はそのスロットの行 `id`。チャンクはテナント単位キーのため
     `tenant_id` は補わずに済み、`(tenant_id, row_ids[slot])` で行を一意に特定
-    できる。tombstone 済み・未使用スロットは `id` を 0 埋めのままとし、
-    `slot_bits` の live ビットで判別する — `0` を有効な行 `id` として使わない
-    ことは T1 のコーデック検証に含める）
+    できる。**スロットの有効性は `slot_bits` の live ビットのみを唯一の正とし、
+    `row_ids[slot]` の値そのものに意味を持たせない**（既存の `insert_row` は
+    `id: u64` の 0 を拒否しておらず、`0` を「未使用」の予約値として扱うと有効な
+    `id=0` の行と衝突する破壊的変更になる。codex-review P1 指摘。よって `0` を
+    予約しない・既存の公開 API 契約〔`id` の入力域〕を変更しない）。tombstone・
+    未使用スロットの `row_ids[slot]` は不定値として扱い、デコーダは live ビットが
+    立っていないスロットの `row_ids[slot]`／embedding を読み取り対象から常に除外
+    する（値の内容——0 埋めか直前の生存値の残置かは問わない）。T1 のコーデック
+    検証は「非 live スロットの `row_ids` を読まないこと」を対象とし、「`0` を
+    無効値として拒否すること」は対象としない）
   - KNN・`SearchTimeFilter`・`batch_search` はチャンク走査で得たスロットの
     `row_ids[slot]` から直接 `(tenant_id, id)` を復元し、`user_rows` へは
     metadata 取得（RLS predicate 評価後、返却対象に絞ってから）のためだけに
@@ -151,8 +158,14 @@ redb は値を leaf ページへ inline 格納し、値の一部更新は値全�
 ### 2. 削除（tombstone）
 
 `delete_row`／`update_row`／TASK-120 置換の削除側は、チャンク値の `slot_bits` の
-live ビットを落とすのみとする（header 部分のみの更新であっても redb の値全体の
-再書き込みが発生する点に留意）。`live_count` が閾値（例: 50%）を下回ったチャンク
+live ビットを落とすのみとし、**`row_ids[slot]`／embedding 本体は書き戻さない**
+（0 埋め等のゼロ化は行わない。上記「物理設計案」節のとおり非 live スロットの
+`row_ids`／embedding はデコーダが読み取り対象から常に除外するため、内容を
+ゼロ化する必要も意味も無い。ゼロ化しないことで tombstone 時の書き込みバイト量も
+`slot_bits` の該当ビットのみに抑えられる。header 部分のみの更新であっても redb
+の値全体の再書き込みが発生する点に留意）。コーデックの破損検証（T1）は
+「非 live スロットの `row_ids`／embedding の内容」を正規形の一部とはみなさず、
+検証対象外とする。`live_count` が閾値（例: 50%）を下回ったチャンク
 は再パック対象とする。再パック方式の比較:
 
 | 方式 | 内容 | 判断 |
