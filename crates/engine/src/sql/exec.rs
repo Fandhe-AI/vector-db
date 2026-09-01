@@ -756,6 +756,15 @@ pub(crate) fn execute_statement_with_cache(
                     .vector_dim()
                     .ok_or(ArenaError::InvalidDim)
                     .map_err(|e| map_arena_error(&bound.table, e))?;
+                // `max_bytes`（第 3 引数）・`metadata_byte_cap`（第 4 引数）はいずれも
+                // `MAX_ARENA_TOTAL_BYTES` を渡すが、クエリ本体（応答用アリーナ）と
+                // 独立した別枠の予算ではない。`SqlArenaCaptureBuilder::push` へ渡す
+                // `external_bytes_in_use`（応答用アリーナの現在使用量）と合算した
+                // 単一のピーク予算として扱われる（Issue #379 codex-review P1 対応。
+                // 型・`push` のドキュメント参照。以前は応答用アリーナ・採取用
+                // embedding・採取用 metadata がそれぞれ独立に `MAX_ARENA_TOTAL_BYTES`
+                // まで確保でき、単一クエリのピークメモリが最大で約 3 倍〔付随バッファ
+                // 除く〕に膨らみ得た）。
                 let mut capture = crate::arena::SqlArenaCaptureBuilder::new(
                     expected_dim,
                     crate::arena::MAX_ARENA_ROWS,
@@ -766,9 +775,17 @@ pub(crate) fn execute_statement_with_cache(
                                        tenant_id: &str,
                                        visibility,
                                        embedding: &[f32],
-                                       metadata: &[u8]|
+                                       metadata: &[u8],
+                                       response_arena_bytes_in_use: usize|
                  -> std::result::Result<(), ArenaError> {
-                    capture.push(id, tenant_id, visibility, embedding, metadata);
+                    capture.push(
+                        id,
+                        tenant_id,
+                        visibility,
+                        embedding,
+                        metadata,
+                        response_arena_bytes_in_use,
+                    );
                     Ok(())
                 };
                 let built = VectorArena::build_filtered_with_rows_in_txn_capturing(
