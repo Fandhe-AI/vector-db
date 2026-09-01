@@ -65,18 +65,17 @@ fn measure_stage(label: &str, working_set: WorkingSet, dim: usize) -> Result<(us
         WorkingSet::ArenaScale => 1,
     };
 
-    // まず 1 回分の総和をスカラー参照と突き合わせる（計測ループへ入る前の
-    // fail-closed 検証。総和値なので `dot_scalar` の総和を期待値とする）。
-    let mut expected_sum = 0f32;
-    for chunk in corpus.chunks_exact(dim) {
-        expected_sum += isa::dot_scalar(chunk, &query);
+    // 各行を個別にスカラー参照と突き合わせる（計測ループへ入る前の fail-closed
+    // 検証）。行ごとの誤差を総和してから比較すると複数行の正負誤差が相殺されて
+    // 個々の行の誤計算を見逃しうる（codex-review 指摘）ため、`dot_wrapper` の
+    // 各行結果を対応する `dot_scalar` 結果と 1 行ずつ照合し、最初の不一致で
+    // 即座に拒否する。
+    for (row_idx, chunk) in corpus.chunks_exact(dim).enumerate() {
+        let expected = isa::dot_scalar(chunk, &query);
+        let actual = dot_wrapper(chunk, &query);
+        check_matches_scalar_reference(actual, expected, expected)
+            .map_err(|e| format!("{label} dim={dim} row={row_idx}: {e}"))?;
     }
-    let mut actual_sum = 0f32;
-    for chunk in corpus.chunks_exact(dim) {
-        actual_sum += dot_wrapper(chunk, &query);
-    }
-    check_matches_scalar_reference(actual_sum, expected_sum, expected_sum)
-        .map_err(|e| format!("{label} dim={dim}: {e}"))?;
 
     let config = MeasurementConfig::new(20, 50, 0xC0FF_EE00 ^ dim as u64)
         .map_err(|e| format!("{label} dim={dim}: {e}"))?;

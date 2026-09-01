@@ -24,16 +24,27 @@ use super::rng::DeterministicRng;
 /// `harness/hybrid_latency.rs::MAX_CORPUS_DOCS_GUARD` と同一方針）。
 pub const MAX_CORPUS_ROWS_GUARD: usize = 200_000;
 
+/// [`generate_corpus`] が許容する 1 行あたりの次元数（`dim`）の安全上限。`dim` は
+/// 呼び出し元の引数でそれ自体に上限が無いため、[`MAX_CORPUS_ELEMENTS_GUARD`]
+/// （`rows * dim` の総量）とは独立に単独でも検証する。本ベンチが使う最大次元
+/// （`dot_kernel_bench.rs::DIMS` の 1536）に対し約 10 倍の余裕を持たせた値
+/// （codex-review 指摘: `rows * dim` の乗算結果だけを見るガードでは、
+/// `rows` が小さいまま `dim` だけ巨大にする入力を単独では弾けなかった）。
+pub const MAX_DIM_GUARD: usize = 16_384;
+
 /// [`generate_corpus`] が許容する総要素数（`rows * dim`）の安全上限。`rows` は
-/// [`MAX_CORPUS_ROWS_GUARD`] で個別に上限検証しているが、`dim` は呼び出し元の
-/// 引数でありそれ自体に上限が無いため、乗算結果を `Vec::with_capacity` へ渡す前に
-/// 総要素数として別途上限を課す（coding-rust.md「無制限確保禁止」。乗算は
-/// `checked_mul` を使い、オーバーフロー時に `saturating_mul` のような巨大値への
-/// 丸めで `Vec::with_capacity` が OOM/abort する経路を作らない）。本ベンチが使う
-/// 最大次元（`dot_kernel_bench.rs::DIMS` の 1536）に十分な余裕を持たせつつ、
-/// 誤って巨大な `dim` を渡した場合に早期拒否できる値として 1 行あたり 65536
-/// 要素（次元）を上限に採る。
-pub const MAX_CORPUS_ELEMENTS_GUARD: usize = MAX_CORPUS_ROWS_GUARD * 65_536;
+/// [`MAX_CORPUS_ROWS_GUARD`]、`dim` は [`MAX_DIM_GUARD`] でそれぞれ個別に上限
+/// 検証しているが、両者を掛け合わせた総量そのものにも歯止めを掛けるため、
+/// 乗算結果を `Vec::with_capacity` へ渡す前に総要素数として別途上限を課す
+/// （coding-rust.md「無制限確保禁止」。乗算は `checked_mul` を使い、
+/// オーバーフロー時に `saturating_mul` のような巨大値への丸めで
+/// `Vec::with_capacity` が OOM/abort する経路を作らない）。値は本ベンチの実
+/// ワークロード（`ARENA_SCALE_ROWS` の 25,000 行 × 最大次元 1536 ≈ 3,840 万要素・
+/// 約 147 MiB）に対し約 1.75 倍の余裕を持たせた現実的な固定上限
+/// （67,108,864 要素・f32 換算で約 256 MiB）とする（codex-review 指摘:
+/// 旧値 `MAX_CORPUS_ROWS_GUARD * 65_536` ≈ 131 億要素・約 52 GiB は
+/// `Vec::with_capacity` がプロセスを終了させ得る非現実的な値だった）。
+pub const MAX_CORPUS_ELEMENTS_GUARD: usize = 64 * 1024 * 1024;
 
 /// 本モジュールのエラー型。
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +73,8 @@ impl fmt::Display for DotKernelError {
             DotKernelError::CorpusTooLarge => {
                 write!(
                     f,
-                    "rows exceeds {MAX_CORPUS_ROWS_GUARD} or rows * dim exceeds {MAX_CORPUS_ELEMENTS_GUARD}"
+                    "rows exceeds {MAX_CORPUS_ROWS_GUARD}, dim exceeds {MAX_DIM_GUARD}, \
+                     or rows * dim exceeds {MAX_CORPUS_ELEMENTS_GUARD}"
                 )
             }
             DotKernelError::NonFiniteResult => write!(f, "measured result is not finite"),
@@ -134,11 +146,16 @@ pub fn generate_corpus(seed: u64, dim: usize, rows: usize) -> Result<Vec<f32>, D
     if rows > MAX_CORPUS_ROWS_GUARD {
         return Err(DotKernelError::CorpusTooLarge);
     }
-    // `dim` は呼び出し元の引数で上限が無いため、`rows * dim` を `checked_mul` で
-    // 計算し、オーバーフロー（`None`）または [`MAX_CORPUS_ELEMENTS_GUARD`] 超過を
-    // ここで拒否してから `Vec::with_capacity` へ渡す（`saturating_mul` は
-    // オーバーフロー時に `usize::MAX` へ丸まり、巨大 capacity 要求で
-    // `Vec::with_capacity` が OOM/abort し得るため使わない）。
+    // `dim` は呼び出し元の引数で上限が無いため、`rows * dim` の乗算結果だけでなく
+    // `dim` 単独でも [`MAX_DIM_GUARD`] で検証する（`rows` が小さいまま `dim` だけ
+    // 巨大にする入力は乗算結果側の上限だけでは弾ける保証が無いため）。
+    if dim > MAX_DIM_GUARD {
+        return Err(DotKernelError::CorpusTooLarge);
+    }
+    // `rows * dim` を `checked_mul` で計算し、オーバーフロー（`None`）または
+    // [`MAX_CORPUS_ELEMENTS_GUARD`] 超過をここで拒否してから `Vec::with_capacity`
+    // へ渡す（`saturating_mul` はオーバーフロー時に `usize::MAX` へ丸まり、巨大
+    // capacity 要求で `Vec::with_capacity` が OOM/abort し得るため使わない）。
     let total_elements = rows
         .checked_mul(dim)
         .filter(|&total| total <= MAX_CORPUS_ELEMENTS_GUARD)
