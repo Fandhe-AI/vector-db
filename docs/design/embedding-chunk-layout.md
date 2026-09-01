@@ -106,10 +106,19 @@ SQL 表層合成コスト（≈225ns/行）より 1 桁小さい。下記「コ�
   （詳細・役割は下記「5. チャンク単位可視性ビットマップ」節「孤立行のオンライン
   検出（world 完全性マーカー）」参照）
   - キー: `(tenant_id: &str, chunk_no: u64)`
-  - 値: `[version u8 | dim u32 | slot_count u16 | live_count u16 |
+  - 値: `[version u8 | generation u64 | dim u32 | slot_count u16 | live_count u16 |
     public_live u16 | private_live u16 | slot_bits (2bit/slot: live, visibility) |
     row_ids (u64 × slot_count) | f32 LE × slot_count × dim]`
-    （`row_ids[slot]` はそのスロットの行 `id`。チャンクはテナント単位キーのため
+    （**`generation`** はカタログ `world_completeness` エントリが保持する権威
+    `generation` の複製であり、当該 world の書き込み経路（下記「書き込み経路の
+    同一 txn 不変条件」参照）が `world_completeness.generation` の更新と**同一
+    write txn 内**で書き戻す。他の header 集計値〔`live_count`／`public_live`／
+    `private_live`〕と同じく非権威の複製であり、権威は常に `world_completeness`
+    側にある。この複製を header 自身に持たせるのは、「孤立行のオンライン検出
+    （world 完全性マーカー）」節ステップ 0 で `world_completeness` の権威値との
+    突合対象として header 自身の `(generation, live_count)` を読む必要があり、
+    header にフィールドが無いと突合できないため。`row_ids[slot]` はそのスロット
+    の行 `id`。チャンクはテナント単位キーのため
     `tenant_id` は補わずに済み、`(tenant_id, row_ids[slot])` で行を一意に特定
     できる。**スロットの有効性は `slot_bits` の live ビットのみを唯一の正とし、
     `row_ids[slot]` の値そのものに意味を持たせない**（既存の `insert_row` は
@@ -342,25 +351,36 @@ SQL 表層合成コスト（≈225ns/行）より 1 桁小さい。下記「コ�
          の帯域外検証で扱う〔下記「コストへの帰結」節〕）
       統一順序（両経路の相対位置が完全一致することを保つ。段階〔候補時点／
       返却時点〕による例外を設けない）:
-      0. **（新設。P1-2 是正）** 当該 world のチャンク走査を開始する前に、
-         カタログの `world_completeness` エントリ（権威 `(generation,
-         live_count)`）を点検索し、まだ読んでいないチャンク header の
-         `(generation, live_count)` と突合する（詳細・突合対象・マーカー破損時の
-         扱いは下記「孤立行のオンライン検出（world 完全性マーカー）」節参照）。
-         不一致・マーカーエントリ欠落はいずれも `Err` にせず、ステップ 1
-         （チャンク走査）を行わずに直接当該 world を row-store 範囲走査へ
-         フォールバックする（この時点でチャンク走査自体が未実施のため、
-         破棄すべき既収集候補は存在しない）
-      1. チャンク走査で live スロットを列挙する（`slot_bits` の live ビットのみを
-         正とする。T3b で有効化するスキップ最適化は候補をさらに減らす最適化に
-         すぎず、T3a では全 live スロットが対象）。このとき `slot_bits` から
-         `popcount`（立っている live ビット数）を求め、ステップ 0 で取得済みの
-         `world_completeness`（権威）・チャンク header 自身が保持する
-         `live_count`（複製）の 3 値を突合する（`slot_bits` のデコードはこの
-         列挙で既に行っているため追加コストは popcount 計算のみ）。3 値が
-         一致しない場合は `Err` にせず、この時点までに収集した当該 world の
-         候補を破棄したうえで row-store 範囲走査へフォールバックする（詳細は
-         下記「孤立行のオンライン検出（world 完全性マーカー）」節参照）
+      0. **（新設。P1-2 是正・Bugbot Medium 指摘への対応で実行順序を是正）**
+         当該 world のチャンク走査を開始する前に、まずチャンク header
+         （`version`／**`generation`**／`dim`／`slot_count`／`live_count`／
+         `public_live`／`private_live`。`slot_bits`／`row_ids`／embedding 本体
+         は含まない固定長部分）を読みデコードする。**デコードに失敗した場合は
+         `Err` にせず**、ステップ 1（チャンク走査）を行わずに直接当該 world を
+         row-store 範囲走査へフォールバックする（上記「5. チャンク単位可視性
+         ビットマップ」節「チャンク header 自体のデコード失敗時は…」と同一の
+         帰結。この時点でチャンク走査自体が未実施のため、破棄すべき既収集候補は
+         存在しない）。デコードに成功したら、カタログの `world_completeness`
+         エントリ（権威 `(generation, live_count)`）を点検索し、**今読んだ**
+         チャンク header 自身が保持する `(generation, live_count)`（複製）と
+         突合する（詳細・突合対象・マーカー破損時の扱いは下記「孤立行の
+         オンライン検出（world 完全性マーカー）」節参照）。不一致・マーカー
+         エントリ欠落はいずれも `Err` にせず、ステップ 1（チャンク走査）を
+         行わずに直接当該 world を row-store 範囲走査へフォールバックする
+      1. ステップ 0 を通過した world についてのみ、チャンク走査で live スロットを
+         列挙する（`slot_bits` の live ビットのみを正とする。T3b で有効化する
+         スキップ最適化は候補をさらに減らす最適化にすぎず、T3a では全 live
+         スロットが対象）。このとき `slot_bits` から `popcount`（立っている
+         live ビット数）を求め、ステップ 0 で読み取り済みのチャンク header
+         自身が保持する `live_count`（複製。ステップ 0 で `world_completeness`
+         と一致確認済みのため `world_completeness` の権威値の代理として扱える）
+         と突合する（`slot_bits` のデコードはこの列挙で既に行っているため追加
+         コストは popcount 計算のみ）。ステップ 0・ステップ 1 を合わせて
+         `world_completeness.live_count` ↔ チャンク header `live_count` ↔
+         `popcount(slot_bits)` の 3 値照合が完結する。一致しない場合は `Err`
+         にせず、この時点までに収集した当該 world の候補を破棄したうえで
+         row-store 範囲走査へフォールバックする（詳細は下記「孤立行の
+         オンライン検出（world 完全性マーカー）」節参照）
       2. 各候補スロットについて `user_rows` へポイントルックアップし、
          **metadata はまだデコードせず** `decode_row_tenant_and_visibility` の
          みで権威 tenant／visibility を取得する（header デコードのみ。これが
@@ -701,8 +721,10 @@ live スロット集合と乖離し、可視であるべき行が誤ってスキ
   の live ビット集計）と一致することを確認する。加えて、下記「5. チャンク単位
   可視性ビットマップ」節「孤立行のオンライン検出（world 完全性マーカー）」の
   `world_completeness` エントリもこの原子性の対象に含め、コミット後の
-  `world_completeness.live_count` がチャンク側 `live_count` と一致することを
-  同じ単体テストで確認する
+  `world_completeness.(generation, live_count)` が、チャンク header 自身が
+  複製として保持する `(generation, live_count)` フィールドと一致すること
+  （両者がコミットのたび同一 write txn で揃って更新されること）を同じ単体
+  テストで確認する
 - T5（回復検証の拡張）: `index_failure_injection.rs`（RECOVER-9）・
   `power_loss.rs` に、削除・更新・再パックの途中失敗／部分書き戻し像で
   `slot_bits` と `live_count`／`public_live`／`private_live` が不整合な状態の
@@ -856,23 +878,31 @@ live スロット集合と乖離し、可視であるべき行が誤ってスキ
   「一致しない」（＝マーカー未整備）として扱い、無条件にフォールバックへ回す**
   （後述「マーカー自体が破損・欠落している場合」参照）
 - **書き込み経路の同一 txn 不変条件**: `world_completeness` の当該 world
-  エントリは、その world のチャンク値（`slot_bits`／`live_count`）を更新する
-  すべての書き込み経路（`insert_row`・`delete_row`（tombstone）・`update_row`・
-  TASK-120 置換・再パック）が、チャンク側 `live_count` 更新（「2. 削除
-  （tombstone）」節「集計値の原子更新不変条件」参照）と**同一 write txn 内**で
-  更新する。`generation` は `catalog::bump_table_generation_in_txn` と同型の
+  エントリ、および上記「物理設計案」節で新設したチャンク header 自身の
+  `generation`／`live_count` フィールドは、その world のチャンク値
+  （`slot_bits`／`live_count`）を更新するすべての書き込み経路（`insert_row`・
+  `delete_row`（tombstone）・`update_row`・TASK-120 置換・再パック）が、
+  チャンク側 `live_count` 更新（「2. 削除（tombstone）」節「集計値の原子更新
+  不変条件」参照）と**同一 write txn 内**で更新する（`world_completeness` 側
+  ・チャンク header 側のいずれか一方のみを更新して commit する中間状態を
+  作らない）。`generation` は `catalog::bump_table_generation_in_txn` と同型の
   `checked_add` 単調増加カウンタとし、当該 world への書き込みのたび `+1` する
   （テーブル単位世代〔`TABLE_GENERATION_TABLE`〕とは別カウンタであり、世界
-  単位に閉じる）。この不変条件により、コミット直後は
-  `world_completeness.live_count` == チャンク header `live_count` ==
-  `popcount(slot_bits)` の 3 値が常に一致する（「4. 世代整合」節参照。
-  `bump_table_generation_in_txn` 等の既存 commit 前呼び出し位置は変更しない
-  ——本マーカーは既存の同一 txn に相乗りするだけで新たな commit 境界を
-  作らない）
+  単位に閉じる。`world_completeness` 側が権威、チャンク header 側は同一 txn で
+  書き戻される複製）。この不変条件により、コミット直後は
+  `world_completeness.(generation, live_count)` == チャンク header
+  `(generation, live_count)` == `(_, popcount(slot_bits))` の 3 値が常に
+  一致する（「4. 世代整合」節参照。`bump_table_generation_in_txn` 等の既存
+  commit 前呼び出し位置は変更しない——本マーカーは既存の同一 txn に相乗りする
+  だけで新たな commit 境界を作らない）
 - **クエリ時の突合（3 値照合）**: 上記「権威検証を行うタイミング」節の統一
-  順序ステップ 0（`world_completeness` 権威値 ↔ チャンク header の
-  `live_count` 複製）・ステップ 1（`slot_bits` の `popcount` 実測値との
-  再突合）で 3 値を照合する。**いずれか 2 値でも不一致なら、`Err` にはせず**
+  順序ステップ 0（チャンク header をデコードし〔デコード失敗は world 単位
+  フォールバック〕、`world_completeness` 権威値 `(generation, live_count)` と
+  今読んだチャンク header 自身の `(generation, live_count)` 複製を突合）・
+  ステップ 1（ステップ 0 を通過した world についてのみ、チャンク走査で得た
+  `slot_bits` の `popcount` 実測値とステップ 0 で読み取り済みのチャンク header
+  `live_count` との再突合）で 3 値を照合する。**いずれか 2 値でも不一致なら、
+  `Err` にはせず**
   当該 world を row-store 範囲走査へフォールバックする（上記「権威検証を
   行うタイミング」節「フォールバック契約」と同一の帰結——`world_completeness`
   も `layout: chunked` にのみ存在する非権威側の検証用複製であり、チャンク
@@ -1164,8 +1194,8 @@ Issue #363 が SQL 表層に世代整合 arena キャッシュを導入すると
 
 | # | タスク | 依存 | 主な対象 |
 | - | ------ | ---- | -------- |
-| T1 | チャンクテーブル定義・コーデック（header 検証・上限定数・`unsafe` なし）＋ `world_completeness` カタログテーブル定義（`(table_name, tenant_id, chunk_no)` → `(generation, live_count)`。上記「5. チャンク単位可視性ビットマップ」節「孤立行のオンライン検出（world 完全性マーカー）」参照） | — | `storage/chunk.rs`（新規）・`catalog.rs`（`user_vecs`・`world_completeness` 命名・`drop_table`） |
-| T2 | 書き込み経路の結線（挿入・削除・更新・TASK-120 置換・tombstone・同一 txn）。**チャンク側 `live_count` 更新と同一 write txn 内で `world_completeness` の当該 world エントリ（`generation`・`live_count`）も更新する**（上記「孤立行のオンライン検出」節「書き込み経路の同一 txn 不変条件」参照。呼び忘れは T8 の帯域外検証まで検出されない孤立行の再発に直結するため、対象の書き込み経路すべてに結線すること） | T1 | `tenant.rs`・`recovery/ledger.rs` 連携・`table_generation_bump_coverage.rs` |
+| T1 | チャンクテーブル定義・コーデック（header 検証〔新設 `generation` フィールドを含む固定長部分のデコードを含む〕・上限定数・`unsafe` なし）＋ `world_completeness` カタログテーブル定義（`(table_name, tenant_id, chunk_no)` → `(generation, live_count)`。上記「5. チャンク単位可視性ビットマップ」節「孤立行のオンライン検出（world 完全性マーカー）」参照） | — | `storage/chunk.rs`（新規）・`catalog.rs`（`user_vecs`・`world_completeness` 命名・`drop_table`） |
+| T2 | 書き込み経路の結線（挿入・削除・更新・TASK-120 置換・tombstone・同一 txn）。**チャンク側 `live_count` 更新と同一 write txn 内で `world_completeness` の当該 world エントリ（`generation`・`live_count`）と、チャンク header 自身が複製として保持する `generation`・`live_count` フィールドの双方を更新する**（上記「孤立行のオンライン検出」節「書き込み経路の同一 txn 不変条件」参照。呼び忘れは T8 の帯域外検証まで検出されない孤立行の再発に直結するため、対象の書き込み経路すべてに結線すること） | T1 | `tenant.rs`・`recovery/ledger.rs` 連携・`table_generation_bump_coverage.rs` |
 | T3a | 読み取り経路の結線（`VectorArena`・`SearchTimeFilter`・`batch_search` のチャンク走査＋権威検証〔「権威検証を行うタイミング」節の統一順序（**ステップ 0・`world_completeness` 突合**→header デコード→locator／逆参照の同一性検査（不一致・miss は同一 tenant の全 world の既収集候補を破棄し `user_rows` の当該 `tenant_id` 範囲走査〔`chunk_no` フィルタなし〕へ**tenant 単位**フォールバック。`Err` にはしない）→ `is_visible` 判定→不可視行は検証せず黙ってスキップ→可視行のみ残りの複製値検査（3 点。`slot_bits` の `popcount` と `world_completeness`／チャンク header `live_count` の 3 値照合を含む。不一致は当該 world のみを対象に `chunk_no` フィルタ付きで**world 単位**フォールバック）→ metadata／SCALAR）。フィルタなし経路も同節の統一順序で実装する〕。集計は下記「T3a の対象範囲・集計の読み取り元」のとおりチャンク走査へ移さない。チャンク header／`slot_bits` によるスキップ最適化はコード上実装するが**既定無効**（フィーチャーフラグ／設定で off）とし、T3b（T8 完了後）まで有効化しない。検証には実際に書き込まれたチャンク〔T2〕と `layout: chunked` 選択・v2/v3 分岐〔T4〕の両方が必要なため依存に含める。**検証対象に「権威検証を行うタイミング」節の不変条件（短い結果集合を返さない・不可視行が順位/件数に影響しない・複製ドリフトが `Err` として観測されない・`Err` は row-store 経路でも `Err` になる破損に限られる）を追加**〔Bugbot Medium 指摘・codex-review P0 指摘への対応。他テナントの不可視行・private 行を混在させたコーパスで、可視行が k 件以上あるとき返却が k 未満へ縮まらないこと、不可視行の有無で可視行の順位・件数が変化しないこと、他テナントの複製ドリフト（locator 不一致・3 点検査不一致・チャンク header 破損）が `Err` として観測されないこと、`row_ids[slot]` がドリフトして無関係な不可視行を指す場合にスロットが黙って落ちず**当該 world が world 単位フォールバックし結果が row-store 経路と一致すること**（フォールバック発動テスト。locator／逆参照の同一性検査の直接回帰）、および**チャンク側（`slot_bits`・`live_count`・`world_completeness`）を無傷のまま生存行 1 件の `user_rows` 側 `locator.chunk_no` のみを A→B へ破損させ（3 値照合はいずれも通過する条件を保ったまま）、home world A のチャンク走査がこの行に到達した際に tenant 単位フォールバックが発動し結果集合が row-store 経路と一致すること（P1 是正の直接回帰。3 値照合が通過する条件下での検証であることを明記し、マーカー検出との重複による vacuous pass を避ける）**を回帰テスト化する〕） | T1・T2・T4 | `arena.rs`・`rls.rs`・`batch_search.rs`・`sql/aggregate.rs`・`sql/group_by.rs` |
 | T3b | T3a で実装したチャンク header／`slot_bits` によるスキップ最適化の有効化（既定 off → on への切り替え）。T8（帯域外整合性検証ツール）の完了を前提条件とする（下記「除外判定自体の整合性検証」節参照。**T8 未完了のまま有効化しない**） | T3a・T8 | `arena.rs`・`rls.rs`・`batch_search.rs`（フラグ切り替えのみ） |
 | T4 | カタログのレイアウト属性と opt-in・オフライン再構築ツール。`drop_table` の同一 txn 削除対象へ `user_vecs/{table}` と併せて `world_completeness` の当該テーブル分エントリを追加する | T1 | `catalog.rs`・`examples/` |
@@ -1223,7 +1253,7 @@ metadata 参照が必須のため、上記「権威検証を行うタイミン�
 | ---- | ---------------------------- | ------------------------ |
 | private spec 漏えい（P0） | spec 本文・非公開設計議論を転記していない。参照は TASK-nn／ビヘイビア ID／パスのみ。数値は public Issue #344／#361 由来の実測値と本リポ定数に限定 | — |
 | 秘密情報混入（P0） | 実トークン・資格情報は記載していない | — |
-| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。エラーに他テナントの存在情報を含めない。**チャンク側 `slot_bits`／header 集計値・`world_completeness` エントリはいずれも `user_rows` 側行ヘッダの tenant／visibility から派生した複製であり単一権威ではない**（`user_rows` 側行ヘッダが権威。`embedding` 本体も P1-1 是正により `user_rows` 側が権威コピーで `user_vecs` チャンク側は走査高速化用の派生複製である）。単一権威原則は方向で保証範囲が異なる: **admission 方向は無条件**——チャンク走査を開始する前に、まず `world_completeness`（権威 `(generation, live_count)`）とチャンク header の `live_count` を突合し（ステップ 0）、チャンク走査中は `slot_bits` から求めた `popcount` とも 3 値照合する（ステップ 1）。いずれか 2 値でも不一致・マーカーエントリ欠落・チャンク header デコード失敗なら `Err` にはせず**当該 world のみ**（`chunk_no` フィルタ付き。破損がチャンク側の値のみで完結し行側 `locator` を参照しないため）を row-store 範囲走査へフォールバックする——これにより「孤立行（生存行が到達不能になり黙って結果集合から欠落する事象）」のうちチャンク側破損由来のクラスはクエリ時にオンラインで検出される（P1-2 是正。詳細は「5. チャンク単位可視性ビットマップ」節「孤立行のオンライン検出（world 完全性マーカー）」参照）。この点検を通過した world についてのみ、チャンク走査で候補になりうる全 live スロットについて、まず `user_rows` へポイントルックアップし header デコードのみで権威 tenant／visibility を取得する。取得直後、テナントデータに一切依存しない構造的整合性検査として、取得した行の header が走査元の `(chunk_no, slot)` を指し戻すこと（locator／逆参照の同一性検査）を確認し、不一致・ポイントルックアップ自体の miss は、いずれも**`Err` にはせず**、そのチャンク（world = `(tenant_id, chunk_no)`）の chunked 高速経路を放棄し、**同一 tenant の全 world について既収集候補を破棄したうえで `user_rows` の当該 `tenant_id` 範囲走査（`chunk_no` フィルタなし。embedding は `user_rows` 側の権威コピーから取得）へ tenant 単位フォールバックする**（この検査は行側 `locator`（`chunk_no`・`slot`）を参照して初めて検出できるため、`chunk_no` フィルタ付き world 単位フォールバックでは絞り込み条件自体が破損しうる同じフィールドに依存し、破損した行を取りこぼす。よって locator 依存の検出はフィルタなしの tenant 単位で回収する。**RLS の `predicate`／`PolicyContext::is_visible` 判定自体はこの範囲拡張の影響を受けず、フォールバック先の権威経路〔`user_rows` 側ヘッダ〕でそのまま適用される**——`chunk_no` フィルタを外すのは locator ベースの world 分割のみであり、fail-closed 性は変わらない。詳細・却下案は上記「権威検証を行うタイミング」節「フォールバック契約」参照。他 tenant の候補は影響を受けない。codex-review P0 指摘・P1 指摘への対応——`Err` にすると他テナント側の locator 状態でクエリの成否が変わるエラーオラクルになるため）。フォールバック先の row-store 走査自体が `Err` を返す場合（`user_rows` 側 header デコード失敗等、row-store 経路でも `Err` になる破損）は、その `Err` をそのまま伝播する。この検査を通過した候補についてのみ `PolicyContext::is_visible` による RLS 判定を行う。**RLS 不可視と判定された候補はここで残りの複製値検査（3 点）を行わずフォールバックも発動させず、黙ってスキップする**（他テナントの不可視行の `slot_bits`・可視性集計のドリフトを観測させないため。Issue #137 と同種のエラーオラクルを避ける設計であり、row-store〔`arena.rs::build_filtered_with_rows_and_limits_in_txn`〕が header デコード成功後に不可視行を検証なしでスキップする挙動と同一の契約。Bugbot High 指摘への対応）。**RLS 可視と判定された候補についてのみ**、`WHERE` 経路・フィルタなし経路のいずれも距離計算・ランキングより前（`WHERE` 系はさらに metadata デコードより前）に残りの複製値検査（`row_ids[slot]`・tenant・`slot_bits` visibility の 3 点突合。locator の同一性は上記のとおり `is_visible` 判定より前で全候補に対し検査済みのため、ここでは扱わない。`layout: chunked` に限って発生するため常に 3 点とも検証する）を行い、不一致も同様に `Err` にせず・黙って除外もせず、**当該 world のみ**（この検査に到達した時点で locator 一致は確認済みのため `chunk_no` フィルタ付き world 単位で足りる）を row-store 範囲走査へフォールバックする（誤った行を返さない fail-closed 性は、フォールバック先が権威経路であることで担保される。詳細な順序は「権威検証を行うタイミング」節参照）。**除外方向（`slot_bits`／header 集計値によるチャンク・スロットスキップ）は保証が限定的**——ポイントルックアップに到達する前の除外はこの複製値検査の対象外であり、コミット後の複製値のみの破損による誤除外はチャンク走査だけでは検出できない残存リスクとして明示する（ポイントルックアップに到達した候補はフォールバックで回復するため、残存リスクは「候補にすら到達しない」除外方向の最適化に限定される）。**`world_completeness` マーカーが構造的に保証するのはチャンク側破損由来の孤立行が無いこと（生存行数の一致）のみであり、行側 `locator` のみの破損由来の孤立行の網羅性（ステップ 2・tenant 単位フォールバックが担う）や `public_live`／`private_live`／`slot_bits` visibility ビットの個別の正しさまでは保証しない**（上記「孤立行のオンライン検出」節「保証範囲の限定（スコープ）」参照）ため、visibility ビットの残存リスクは世界単位の帯域外整合性検証（T8。`row_ids` ⇔ 行側 `locator` の双方向突合を含む）を前提として運用時に担保し、**T8 実装まで除外方向の最適化を有効化しない**（「権威検証を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節参照）。**フィルタなし経路（`WHERE`・宣言的フィルタ API を伴わない KNN・`SearchTimeFilter`・`batch_search`）も、上記の統一順序（header デコード→locator／逆参照の同一性検査→ `is_visible` 判定→不可視行は検証せず黙ってスキップ→可視行のみ残りの複製値検査）でランキング前の候補段階に権威検証を行う（ランキング後に不足分を再取得する案は、非権威な複製値でランキングしてから検証する構造ゆえ存在情報漏えいの残存差分があり Rejected として却下済み。locator 不一致・複製値検査不一致を即 `Err` にする旧案も、他テナント側の保存状態でクエリの成否が変わるエラーオラクルになるため Rejected として却下済み）ことで「短い結果集合を返さない」「不可視行が順位・件数に影響しない」「複製ドリフトが `Err` として観測されない」「`Err` は row-store 経路でも `Err` になる破損に限られる」の 4 不変条件を満たすことを実装タスク（T3a・T5）の検証対象とする（フォールバックの有無・回数、および world 単位／tenant 単位いずれで発動したかは結果集合・エラー応答には現れず〔呼び出し元の wire 可視契約には影響しない〕、レイテンシ差のみが残存としてプロセス内メトリクス／T8 の帯域外検証の対象となる——blast radius が world から tenant へ広がる場合も同様に wire 可視契約には現れない。Bugbot Medium 指摘・codex-review P0 指摘への対応。「権威検証を行うタイミング」節参照） |
+| テナント境界（P0） | — | 可視性判定は `PolicyContext::is_visible` の単一照合パスのみを用いる。チャンクスキップは同 predicate の結果から導出し、独自テナント比較を新設しない。チャンクはテナント単位キー。エラーに他テナントの存在情報を含めない。**チャンク側 `slot_bits`／header 集計値・`world_completeness` エントリはいずれも `user_rows` 側行ヘッダの tenant／visibility から派生した複製であり単一権威ではない**（`user_rows` 側行ヘッダが権威。`embedding` 本体も P1-1 是正により `user_rows` 側が権威コピーで `user_vecs` チャンク側は走査高速化用の派生複製である）。単一権威原則は方向で保証範囲が異なる: **admission 方向は無条件**——チャンク走査を開始する前に、まずチャンク header をデコードし（デコード失敗なら以降を行わずフォールバック）、`world_completeness`（権威 `(generation, live_count)`）と今読んだチャンク header 自身の `(generation, live_count)` を突合し（ステップ 0）、ステップ 0 を通過した world についてのみチャンク走査を行い `slot_bits` から求めた `popcount` とステップ 0 で読み取り済みのチャンク header `live_count` を再突合する（ステップ 1。ステップ 0・1 を合わせて `world_completeness.live_count` ↔ チャンク header `live_count` ↔ `popcount(slot_bits)` の 3 値照合が完結する）。いずれか 2 値でも不一致・マーカーエントリ欠落・チャンク header デコード失敗なら `Err` にはせず**当該 world のみ**（`chunk_no` フィルタ付き。破損がチャンク側の値のみで完結し行側 `locator` を参照しないため）を row-store 範囲走査へフォールバックする——これにより「孤立行（生存行が到達不能になり黙って結果集合から欠落する事象）」のうちチャンク側破損由来のクラスはクエリ時にオンラインで検出される（P1-2 是正。詳細は「5. チャンク単位可視性ビットマップ」節「孤立行のオンライン検出（world 完全性マーカー）」参照）。この点検を通過した world についてのみ、チャンク走査で候補になりうる全 live スロットについて、まず `user_rows` へポイントルックアップし header デコードのみで権威 tenant／visibility を取得する。取得直後、テナントデータに一切依存しない構造的整合性検査として、取得した行の header が走査元の `(chunk_no, slot)` を指し戻すこと（locator／逆参照の同一性検査）を確認し、不一致・ポイントルックアップ自体の miss は、いずれも**`Err` にはせず**、そのチャンク（world = `(tenant_id, chunk_no)`）の chunked 高速経路を放棄し、**同一 tenant の全 world について既収集候補を破棄したうえで `user_rows` の当該 `tenant_id` 範囲走査（`chunk_no` フィルタなし。embedding は `user_rows` 側の権威コピーから取得）へ tenant 単位フォールバックする**（この検査は行側 `locator`（`chunk_no`・`slot`）を参照して初めて検出できるため、`chunk_no` フィルタ付き world 単位フォールバックでは絞り込み条件自体が破損しうる同じフィールドに依存し、破損した行を取りこぼす。よって locator 依存の検出はフィルタなしの tenant 単位で回収する。**RLS の `predicate`／`PolicyContext::is_visible` 判定自体はこの範囲拡張の影響を受けず、フォールバック先の権威経路〔`user_rows` 側ヘッダ〕でそのまま適用される**——`chunk_no` フィルタを外すのは locator ベースの world 分割のみであり、fail-closed 性は変わらない。詳細・却下案は上記「権威検証を行うタイミング」節「フォールバック契約」参照。他 tenant の候補は影響を受けない。codex-review P0 指摘・P1 指摘への対応——`Err` にすると他テナント側の locator 状態でクエリの成否が変わるエラーオラクルになるため）。フォールバック先の row-store 走査自体が `Err` を返す場合（`user_rows` 側 header デコード失敗等、row-store 経路でも `Err` になる破損）は、その `Err` をそのまま伝播する。この検査を通過した候補についてのみ `PolicyContext::is_visible` による RLS 判定を行う。**RLS 不可視と判定された候補はここで残りの複製値検査（3 点）を行わずフォールバックも発動させず、黙ってスキップする**（他テナントの不可視行の `slot_bits`・可視性集計のドリフトを観測させないため。Issue #137 と同種のエラーオラクルを避ける設計であり、row-store〔`arena.rs::build_filtered_with_rows_and_limits_in_txn`〕が header デコード成功後に不可視行を検証なしでスキップする挙動と同一の契約。Bugbot High 指摘への対応）。**RLS 可視と判定された候補についてのみ**、`WHERE` 経路・フィルタなし経路のいずれも距離計算・ランキングより前（`WHERE` 系はさらに metadata デコードより前）に残りの複製値検査（`row_ids[slot]`・tenant・`slot_bits` visibility の 3 点突合。locator の同一性は上記のとおり `is_visible` 判定より前で全候補に対し検査済みのため、ここでは扱わない。`layout: chunked` に限って発生するため常に 3 点とも検証する）を行い、不一致も同様に `Err` にせず・黙って除外もせず、**当該 world のみ**（この検査に到達した時点で locator 一致は確認済みのため `chunk_no` フィルタ付き world 単位で足りる）を row-store 範囲走査へフォールバックする（誤った行を返さない fail-closed 性は、フォールバック先が権威経路であることで担保される。詳細な順序は「権威検証を行うタイミング」節参照）。**除外方向（`slot_bits`／header 集計値によるチャンク・スロットスキップ）は保証が限定的**——ポイントルックアップに到達する前の除外はこの複製値検査の対象外であり、コミット後の複製値のみの破損による誤除外はチャンク走査だけでは検出できない残存リスクとして明示する（ポイントルックアップに到達した候補はフォールバックで回復するため、残存リスクは「候補にすら到達しない」除外方向の最適化に限定される）。**`world_completeness` マーカーが構造的に保証するのはチャンク側破損由来の孤立行が無いこと（生存行数の一致）のみであり、行側 `locator` のみの破損由来の孤立行の網羅性（ステップ 2・tenant 単位フォールバックが担う）や `public_live`／`private_live`／`slot_bits` visibility ビットの個別の正しさまでは保証しない**（上記「孤立行のオンライン検出」節「保証範囲の限定（スコープ）」参照）ため、visibility ビットの残存リスクは世界単位の帯域外整合性検証（T8。`row_ids` ⇔ 行側 `locator` の双方向突合を含む）を前提として運用時に担保し、**T8 実装まで除外方向の最適化を有効化しない**（「権威検証を行うタイミング」節・「5. チャンク単位可視性ビットマップ」節参照）。**フィルタなし経路（`WHERE`・宣言的フィルタ API を伴わない KNN・`SearchTimeFilter`・`batch_search`）も、上記の統一順序（header デコード→locator／逆参照の同一性検査→ `is_visible` 判定→不可視行は検証せず黙ってスキップ→可視行のみ残りの複製値検査）でランキング前の候補段階に権威検証を行う（ランキング後に不足分を再取得する案は、非権威な複製値でランキングしてから検証する構造ゆえ存在情報漏えいの残存差分があり Rejected として却下済み。locator 不一致・複製値検査不一致を即 `Err` にする旧案も、他テナント側の保存状態でクエリの成否が変わるエラーオラクルになるため Rejected として却下済み）ことで「短い結果集合を返さない」「不可視行が順位・件数に影響しない」「複製ドリフトが `Err` として観測されない」「`Err` は row-store 経路でも `Err` になる破損に限られる」の 4 不変条件を満たすことを実装タスク（T3a・T5）の検証対象とする（フォールバックの有無・回数、および world 単位／tenant 単位いずれで発動したかは結果集合・エラー応答には現れず〔呼び出し元の wire 可視契約には影響しない〕、レイテンシ差のみが残存としてプロセス内メトリクス／T8 の帯域外検証の対象となる——blast radius が world から tenant へ広がる場合も同様に wire 可視契約には現れない。Bugbot Medium 指摘・codex-review P0 指摘への対応。「権威検証を行うタイミング」節参照） |
 | インジェクション | — | テーブル名は `validate_identifier` 通過後のみ `user_vecs/{table}` へ用いる（`user_rows` と同じ扱い） |
 | 不安全な設計／DoS | — | チャンク header の `slot_count`・`dim`・値長は確保前に上限検証（`MAX_EMBEDDING_DIM`・新設 `MAX_CHUNK_BYTES`）。`checked_*` 演算を用いる。走査総量は `MAX_ARENA_ROWS`／`MAX_ARENA_TOTAL_BYTES` と整合させる |
 | `unsafe`（P1） | — | 導入しない（`isa.rs` 限定テストにより構造的に禁止）。zero-copy 再解釈は採らない |
