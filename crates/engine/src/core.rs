@@ -1010,6 +1010,11 @@ pub struct EngineCore {
     /// [`Self::with_dictionary_config`] のみ。クエリ・セッション変数から到達できる
     /// 経路は持たない（[`Self::with_precision_policy`] と同じ流儀）。
     dictionary_config: crate::dictionary::DictionaryConfig,
+    /// `sql::exec::execute_statement` の hybrid 実行が参照する
+    /// `crate::sparse::SparseIndex`（BM25 語彙・統計）のテーブル世代整合キャッシュ
+    /// （Issue #357）。詳細は `sql/sparse_cache.rs::SparseIndexCache` のドキュメント
+    /// 参照。
+    sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1071,6 +1076,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
+            sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
         })
     }
 
@@ -1098,6 +1104,7 @@ impl EngineCore {
             batch_limits: crate::batch_limits::BatchLimits::default(),
             dictionary_cache: DictionaryCache::new(),
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
+            sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
         }
     }
 
@@ -1106,6 +1113,14 @@ impl EngineCore {
     /// `VectorCore` trait には載せない固有メソッド（`core_api.snapshot` の対象外）。
     pub fn prefilter_cache_stats(&self) -> PrefilterCacheStats {
         self.prefilter_cache.stats()
+    }
+
+    /// [`crate::sql::sparse_cache::SparseIndexCache`] の現在の統計を返す
+    /// （Issue #357。テスト・運用観測用）。テナント ID・行 ID 等の機微情報は含まない
+    /// （`SparseIndexCacheStats` 参照）。`VectorCore` trait には載せない固有メソッド
+    /// （`core_api.snapshot` の対象外）。
+    pub fn sparse_index_cache_stats(&self) -> crate::sql::sparse_cache::SparseIndexCacheStats {
+        self.sparse_index_cache.stats()
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -2033,13 +2048,17 @@ impl EngineCore {
                     (read_txn, schema, bound)
                 };
                 let (read_txn, schema, bound) = bound_result;
-                let result = crate::sql::exec::execute_statement(
+                let result = crate::sql::exec::execute_statement_with_cache(
                     &read_txn,
                     self.provider.as_ref(),
                     ctx,
                     &schema,
                     &bound,
                     &self.precision_policy,
+                    Some(crate::sql::sparse_cache::SparseCacheAccess {
+                        storage: &self.storage,
+                        cache: &self.sparse_index_cache,
+                    }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -4240,13 +4259,17 @@ mod tests {
             other => panic!("expected Ranking::Hybrid, got {other:?}"),
         }
 
-        let result = crate::sql::exec::execute_statement(
+        let result = crate::sql::exec::execute_statement_with_cache(
             &read_txn,
             core.provider.as_ref(),
             &ctx,
             &schema,
             &bound,
             &core.precision_policy,
+            Some(crate::sql::sparse_cache::SparseCacheAccess {
+                storage: &core.storage,
+                cache: &core.sparse_index_cache,
+            }),
         )
         .expect("execute_statement should succeed");
         let row = result

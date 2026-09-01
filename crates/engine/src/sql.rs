@@ -37,6 +37,9 @@
 //! - [`group_by`][]: `GROUP BY <TEXT 列>` 集計の複数行実行（TASK-167・SQL-14）。
 //!   グループ表の有界化（`MAX_GROUPS`・`MAX_GROUP_KEY_TOTAL_BYTES`）・`HAVING`・
 //!   `ORDER BY`・`LIMIT` を担う
+//! - [`sparse_cache`][]: `exec` の hybrid 実行が参照する `SparseIndex`（BM25 語彙・
+//!   統計）のテーブル世代整合キャッシュ（Issue #357）。フィルタなし hybrid クエリに
+//!   限り、同一世代内の連続クエリで疎索引の再構築を償却する
 //!
 //! TASK-166（対象ビヘイビア: SQL-13）: `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` のみを結果列
 //! とする単一テーブル SELECT（C6a）を追加した。構文は [`allowlist`]（`Statement::Aggregate`）、
@@ -93,7 +96,13 @@ pub mod lexer;
 pub mod mode;
 pub mod parser;
 pub mod plan;
+pub(crate) mod sparse_cache;
 pub mod udf_call;
+
+/// `EngineCore::sparse_index_cache_stats`（`pub`）の戻り値型を外部から
+/// 名前解決可能にするための再エクスポート。`sparse_cache` モジュール自体は
+/// 内部実装として `pub(crate)` のまま維持する（codex-review 指摘対応）。
+pub use sparse_cache::SparseIndexCacheStats;
 pub mod using_operation_id;
 pub(crate) mod using_plan;
 
