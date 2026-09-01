@@ -126,6 +126,13 @@ WARMUP 後すべてキャッシュヒット経路。
 
 p50 で約 2.5 倍、p95 で約 1.65 倍のレイテンシ改善を確認した。
 
+注記: after は `#377` に加え、その後の origin/main HEAD（`#371`〔`GROUP BY` 性能
+改善〕・`#373`〔式評価のステップ列コンパイル化〕を含む）である。`hybrid_rrf` は
+`WHERE`・`GROUP BY` を持たないクエリであるため、両者の寄与は構造的にほぼ無いと
+判断した（`#356` の段別内訳実測〔`docs/design/hybrid-rrf-latency-breakdown.md`〕で
+`SparseIndex::build` がコストの過半を占めることを既に確認済み）。`65fdb86`
+（`#377` 直後）時点での再測定は行っていない。
+
 ### 対照: `vector_knn`（親 Issue #355「密検索と同オーダー」判定用）
 
 | 指標 | before | after |
@@ -150,11 +157,17 @@ p50 で約 2.5 倍、p95 で約 1.65 倍のレイテンシ改善を確認した�
 
 ## 3 クライアント wire 経由検証（要件 4）
 
-- 層 A（`cargo test -p wire-server`）: green
-- 層 B（`#[ignore]` の e2e）: psql 経路は個別実行を試行したが、`psycopg`
-  （python）・node `pg` モジュールが本環境に未導入のため、それらを要する
-  テストケースは実行不能（依存導入はユーザー承認制のため本 Issue では行わない）。
-  未実施の事実を記録し、オーナー環境での実行を申し送る（silent skip にしない）
+- 層 A（`cargo test -p wire-server`）: green（全 crate 実行。109 + 各結合テスト
+  ファイル含め failure 0）
+- 層 B（`#[ignore]` の 3 クライアント e2e）: `three_clients_run_c1_through_c4_and_
+  reject_wrong_password`（`crates/wire-server/tests/three_client_e2e.rs`。
+  hybrid_rrf を含む C4 を検証する）を試行実行したところ、psql・psycopg（python）・
+  node `pg` を同一テストケース内で逐次実行する構成のため、psycopg 未導入
+  （`No module named 'psycopg'`）の時点で panic し停止した。テストが 3 クライアント
+  を単一ケース内で連続実行する設計のため、psql 部分のみを単独で分離実行すること
+  はできない。node `pg` モジュールも未導入であり、依存導入はユーザー承認制のため
+  本 Issue では行わない。3 クライアント e2e は未実施のまま記録し、`psycopg`・
+  node `pg` を導入したオーナー環境での実行を申し送る（silent skip にしない）
 - `.github/workflows/recall.yml`（層 B・main 限定）は本 PR からは実行不能。
   マージ後の `workflow_dispatch`/週次 run の確認をオーナー／管理者作業として
   申し送る（本 Issue の新規テストは cache 非経由の既存ゲートに影響しないため、
