@@ -42,6 +42,22 @@ use crate::storage::{Storage, StorageError, Visibility};
 /// security.md「不安全な設計｜無制限リソース確保（DoS）」対応）。`pub(crate)`:
 /// `rls.rs::SearchTimeFilter`（TASK-134、ストリーミング走査。アリーナを保持しないが
 /// 可視行の論理データ量上限は本モジュールと揃える）が同じ数値を参照する。
+/// `VectorArena::build_filtered_with_rows_in_txn_capturing` の `rls_capture` フックの
+/// 型（Issue #363。RLS 段を通過した行ごとの `(id, tenant_id, visibility, embedding,
+/// metadata)` 通知。`clippy::type_complexity` 回避のためのエイリアス。呼び出し文脈は
+/// 同関数のドキュメント参照）。
+///
+/// 第 6 引数 `response_arena_bytes_in_use` は、呼び出し元（`build_filtered_with_rows_
+/// and_limits_in_txn_capturing` 本体）がこの時点までにクエリ応答用アリーナ
+/// （`buffers`）へ確保済みの見積もりバイト量（Issue #379 codex-review P1 対応）。
+/// `SqlArenaCaptureBuilder::push` はこの値を自身の採取済みバイト量と合算し、単一の
+/// ピークメモリ予算（`max_bytes`）で判定する。クエリ本体と採取データを別枠の上限で
+/// 並行構築すると、選択性の高い `WHERE` で応答用アリーナが小さくても RLS 通過行
+/// 全体を採取する採取用アリーナが単独で上限まで膨らみ得るため（型ドキュメント
+/// 「型ドキュメント」参照）、両者を合算した単一予算に統一する。
+pub(crate) type RlsCaptureFn<'a> = dyn FnMut(u64, &str, Visibility, &[f32], &[u8], usize) -> std::result::Result<(), ArenaError>
+    + 'a;
+
 pub(crate) const MAX_ARENA_ROWS: usize = 1_000_000;
 
 /// アリーナが確保してよい総バイト量の上限。`vectors: Vec<f32>` だけでなく、
@@ -176,6 +192,22 @@ pub(crate) fn check_capacity(
     let total_floats = row_count
         .checked_mul(dim as usize)
         .ok_or(ArenaError::CapacityExceeded)?;
+    let total_bytes = estimate_row_bytes(row_count, dim)?;
+    if total_bytes > max_bytes {
+        return Err(ArenaError::CapacityExceeded);
+    }
+    Ok(total_floats)
+}
+
+/// `row_count` 行分の `vectors`/`ids`/`tenant_ids`/`visibilities` の見積もりバイト量
+/// （[`check_capacity`] の本体から切り出した純粋計算部分。Issue #379 codex-review P1
+/// 対応: `sql::exec.rs` のキャッシュ採取経路が、クエリ応答用アリーナ（本関数と同じ式で
+/// 見積もる）と採取用アリーナ（[`SqlArenaCaptureBuilder`]）を合算した単一のピーク
+/// メモリ予算で上限判定できるよう、両者が同じ見積もり式を共有する）。
+fn estimate_row_bytes(row_count: usize, dim: u32) -> Result<usize> {
+    let total_floats = row_count
+        .checked_mul(dim as usize)
+        .ok_or(ArenaError::CapacityExceeded)?;
     let vectors_bytes = total_floats
         .checked_mul(4)
         .ok_or(ArenaError::CapacityExceeded)?;
@@ -185,13 +217,9 @@ pub(crate) fn check_capacity(
         .checked_mul(per_row_aux_bytes)
         .ok_or(ArenaError::CapacityExceeded)?;
 
-    let total_bytes = vectors_bytes
+    vectors_bytes
         .checked_add(aux_bytes)
-        .ok_or(ArenaError::CapacityExceeded)?;
-    if total_bytes > max_bytes {
-        return Err(ArenaError::CapacityExceeded);
-    }
-    Ok(total_floats)
+        .ok_or(ArenaError::CapacityExceeded)
 }
 
 /// `ids: Vec<u64>`・`tenant_ids: Vec<String>`・`visibilities: Vec<Visibility>` の
@@ -325,6 +353,221 @@ impl GrowableArenaBuffers {
         self.ids.push(id);
         self.tenant_ids.push(tenant_id);
         self.visibilities.push(visibility);
+    }
+}
+
+/// RLS 段（`predicate`）を通過済みの 1 行に対し、SCALAR 段フック（`on_visible_row`）を
+/// 呼び、通過した行だけをアリーナへ追加する共通処理（Issue #363。
+/// `VectorArena::build_filtered_with_rows_and_limits_in_txn_capturing`（redb 走査・
+/// コールドパス）と [`VectorArena::build_from_cached_rls_rows`]（`SqlArenaCache`
+/// ヒット時・キャッシュ済み行からの再構築）の両方が本関数を経由することで、
+/// スロット番号契約（`on_visible_row` の第 1 引数＝`candidate_columns`/疎 DocId/
+/// provider id が 1 対 1 に対応する契約。TABLE-12 対応）・容量検証・push の実装を
+/// 1 箇所に集約する（2 経路が個別に実装すると、どちらか一方だけを直してもう一方を
+/// 直し忘れる形でスロット番号契約が壊れうるため）。
+///
+/// `visible_row_count` は呼び出し元が管理する可変カウンタで、次に push される行の
+/// スロット番号（＝呼び出しごとに 1 ずつ進む）の源泉。`on_visible_row` が `Ok(false)`
+/// を返した行は容量検証・push のいずれの対象にもしない（元実装と同じ契約）。
+#[allow(clippy::too_many_arguments)]
+fn push_visible_row<G>(
+    buffers: &mut GrowableArenaBuffers,
+    visible_row_count: &mut usize,
+    dim: usize,
+    expected_dim: u32,
+    max_rows: usize,
+    max_bytes: usize,
+    id: u64,
+    tenant_id: &str,
+    visibility: Visibility,
+    embedding: &[f32],
+    metadata: &[u8],
+    on_visible_row: &mut G,
+) -> Result<()>
+where
+    G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+{
+    if !on_visible_row(*visible_row_count, id, embedding, metadata)? {
+        return Ok(());
+    }
+    // アロケーション前の上限検証（.claude/rules/security.md「不安全な設計｜無制限
+    // リソース確保（DoS）」対応）を、行を追加する直前に可視行数基準で行う。
+    *visible_row_count = visible_row_count
+        .checked_add(1)
+        .ok_or(ArenaError::CapacityExceeded)?;
+    check_capacity(*visible_row_count, expected_dim, max_rows, max_bytes)?;
+    buffers.ensure_capacity(*visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
+    buffers.push_row(id, embedding, tenant_id.to_string(), visibility);
+    Ok(())
+}
+
+/// `sql::exec::execute_statement_with_cache`（Issue #363・`SqlArenaCache` ミス時）が、
+/// redb 走査中に採取した RLS 通過行から、キャッシュ用スナップショット材料
+/// （RLS-only の [`VectorArena`]＋行ごとの metadata 複製）を組み立てる蓄積器。
+///
+/// クエリ本体の候補構築（`on_visible_row`・SCALAR 段）とは**別に**、
+/// `VectorArena::build_filtered_with_rows_in_txn_capturing` の `rls_capture` から
+/// 呼ばれる想定（RLS 段を通過した行を無条件・全件受け取る）。
+///
+/// 行 metadata の複製バイト量が `metadata_byte_cap` を超えた場合、または
+/// [`check_capacity`]・確保自体が失敗した場合は、以降の [`Self::push`] を静かに
+/// 無視して [`Self::failed`] を立てるだけで `Err` を伝播しない（キャッシュ採取の
+/// 断念であり、クエリ本体の失敗ではないため。呼び出し元がこの状態を見て
+/// `SqlArenaCache::insert` 自体を取りやめる）。
+pub(crate) struct SqlArenaCaptureBuilder {
+    buffers: GrowableArenaBuffers,
+    metadata: Vec<Vec<u8>>,
+    row_count: usize,
+    metadata_bytes: usize,
+    metadata_byte_cap: usize,
+    max_rows: usize,
+    max_bytes: usize,
+    dim: usize,
+    expected_dim: u32,
+    failed: bool,
+}
+
+impl SqlArenaCaptureBuilder {
+    pub(crate) fn new(
+        expected_dim: u32,
+        max_rows: usize,
+        max_bytes: usize,
+        metadata_byte_cap: usize,
+    ) -> Self {
+        Self {
+            buffers: GrowableArenaBuffers::new(),
+            metadata: Vec::new(),
+            row_count: 0,
+            metadata_bytes: 0,
+            metadata_byte_cap,
+            max_rows,
+            max_bytes,
+            dim: expected_dim as usize,
+            expected_dim,
+            failed: false,
+        }
+    }
+
+    /// 容量超過・確保失敗により、これ以上行を蓄積できなくなったか
+    /// （[`Self::finish`] が `None` を返すことが確定した状態か）。`#[cfg(test)]`
+    /// 専用（本番経路は [`Self::finish`] の `None` 判定のみで十分なため）。
+    #[cfg(test)]
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// RLS 通過行を 1 件追加する。型ドキュメント参照。
+    /// `external_bytes_in_use`（Issue #379 codex-review P1 対応）: 同一クエリで並行
+    /// 構築中のクエリ応答用アリーナが既に確保済みの見積もりバイト量（[`RlsCaptureFn`]
+    /// ドキュメント参照）。本メソッドは自身の採取済みバイト量（embedding 相当＋
+    /// metadata）とこの値を合算した単一のピーク予算で `max_bytes` を判定する。
+    /// 採取単体では上限未達でも、応答用アリーナと合算した総量が `max_bytes` を
+    /// 超える場合は、このクエリの応答自体は妨げずに採取だけを断念する
+    /// （型ドキュメント「行 metadata の複製バイト量が…」参照）。
+    pub(crate) fn push(
+        &mut self,
+        id: u64,
+        tenant_id: &str,
+        visibility: Visibility,
+        embedding: &[f32],
+        metadata: &[u8],
+        external_bytes_in_use: usize,
+    ) {
+        if self.failed {
+            return;
+        }
+        let Some(next_count) = self.row_count.checked_add(1) else {
+            self.failed = true;
+            return;
+        };
+        if check_capacity(next_count, self.expected_dim, self.max_rows, self.max_bytes).is_err() {
+            self.failed = true;
+            return;
+        }
+        let next_metadata_bytes = self.metadata_bytes.saturating_add(metadata.len());
+        if next_metadata_bytes > self.metadata_byte_cap {
+            self.failed = true;
+            return;
+        }
+        // 単一のピークメモリ予算判定（Issue #379 codex-review P1 対応。上記
+        // ドキュメント参照）。自身（採取用アリーナの embedding 相当＋metadata）と
+        // `external_bytes_in_use`（応答用アリーナ）を合算した総量で `max_bytes` を
+        // 判定することで、選択性の高い `WHERE` で応答用アリーナが小さくても採取用
+        // アリーナが単独で `max_bytes` まで膨らむ「実質 3 倍のピークメモリ」を防ぐ。
+        let Ok(self_bytes) = estimate_row_bytes(next_count, self.expected_dim) else {
+            self.failed = true;
+            return;
+        };
+        let combined_bytes = self_bytes
+            .saturating_add(next_metadata_bytes)
+            .saturating_add(external_bytes_in_use);
+        if combined_bytes > self.max_bytes {
+            self.failed = true;
+            return;
+        }
+        if self
+            .buffers
+            .ensure_capacity(
+                next_count,
+                self.dim,
+                self.expected_dim,
+                self.max_rows,
+                self.max_bytes,
+            )
+            .is_err()
+        {
+            self.failed = true;
+            return;
+        }
+        let mut owned_metadata: Vec<u8> = Vec::new();
+        if owned_metadata.try_reserve_exact(metadata.len()).is_err() {
+            self.failed = true;
+            return;
+        }
+        owned_metadata.extend_from_slice(metadata);
+        // `tenant_id.to_string()`（infallible。確保失敗時 OOM abort）の代わりに
+        // `try_reserve_exact` で事前確保してから複製する（Issue #379 codex-review P1
+        // 対応: 本型は soft-fail 契約〔型ドキュメント参照〕であり、確保失敗は
+        // `failed` へ遷移させるだけでプロセスを止めてはならない）。
+        let mut owned_tenant_id = String::new();
+        if owned_tenant_id.try_reserve_exact(tenant_id.len()).is_err() {
+            self.failed = true;
+            return;
+        }
+        owned_tenant_id.push_str(tenant_id);
+        // `self.metadata: Vec<Vec<u8>>`（行ごとの outer コンテナ）自体の成長も
+        // `Vec::push` の内部確保（infallible）に任せず、`try_reserve` で事前に
+        // 予約してから追加する（同上。`owned_metadata` 自体の確保は既に
+        // `try_reserve_exact` 済みだが、それを保持する外側 `Vec` の成長は別途
+        // fallible 化が必要）。
+        if self.metadata.try_reserve(1).is_err() {
+            self.failed = true;
+            return;
+        }
+        self.buffers
+            .push_row(id, embedding, owned_tenant_id, visibility);
+        self.metadata.push(owned_metadata);
+        self.row_count = next_count;
+        self.metadata_bytes = next_metadata_bytes;
+    }
+
+    /// 蓄積結果を確定する。[`Self::push`] が一度でも断念（[`Self::failed`]）した
+    /// 場合は `None`（キャッシュへ登録しない。型ドキュメント参照）。
+    pub(crate) fn finish(self, table_name: &str) -> Option<(VectorArena, Vec<Vec<u8>>)> {
+        if self.failed {
+            return None;
+        }
+        Some((
+            VectorArena {
+                table_name: table_name.to_string(),
+                dim: self.expected_dim,
+                vectors: self.buffers.vectors,
+                ids: self.buffers.ids,
+                tenant_ids: self.buffers.tenant_ids,
+                visibilities: self.buffers.visibilities,
+            },
+            self.metadata,
+        ))
     }
 }
 
@@ -593,6 +836,104 @@ impl VectorArena {
         )
     }
 
+    /// [`Self::build_filtered_with_rows_in_txn`] の、RLS 通過行の
+    /// `(id, tenant_id, visibility, embedding, metadata)` を追加採取する版（Issue #363・
+    /// `sql::exec::execute_statement_with_cache` の `SqlArenaCache` ミス時専用）。
+    /// `rls_capture` は `on_visible_row`（SCALAR 段）の判定結果に関係なく、RLS 段を
+    /// 通過した行ごとに必ず 1 回呼ばれる（[`Self::build_filtered_with_rows_and_limits_in_txn_capturing`]
+    /// のドキュメント参照）。
+    pub(crate) fn build_filtered_with_rows_in_txn_capturing<F, G>(
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+        rls_capture: &mut RlsCaptureFn<'_>,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        Self::build_filtered_with_rows_and_limits_in_txn_capturing(
+            read_txn,
+            table_name,
+            predicate,
+            on_visible_row,
+            MAX_ARENA_ROWS,
+            MAX_ARENA_TOTAL_BYTES,
+            Some(rls_capture),
+        )
+    }
+
+    /// `SqlArenaCache` ヒット時、redb を再走査せずキャッシュ済みの RLS 通過行から
+    /// アリーナを構築する（Issue #363）。`rows` は
+    /// [`Self::build_filtered_with_rows_in_txn_capturing`] の `rls_capture` で採取した
+    /// 行のみを渡すこと（本関数は RLS 述語を一切評価しない。呼び出し元
+    /// `sql::exec::execute_statement_with_cache` が、キャッシュ構築時に使った
+    /// `PolicyContext` と本クエリの `PolicyContext` の完全一致をキャッシュ照合
+    /// （`SqlArenaCache::lookup`）で保証している契約に依存する。security.md P0
+    /// 「テナント分離の検査を外す/緩める/バイパス経路を作らない」: 本関数自体は
+    /// 検査を行わないため、呼び出し元のキー完全一致照合が唯一の防御線になる）。
+    /// 行単位の処理（SCALAR 段フック呼び出し・容量検証・push）は
+    /// [`push_visible_row`] を共有し、redb コールドパスと同一の挙動を保証する。
+    ///
+    /// `source_arena`（RLS 段のみを適用して構築済みの、キャッシュ由来のアリーナ）と
+    /// `metadata`（`source_arena` とスロット添字が 1 対 1 に対応する行 metadata の
+    /// 複製。[`crate::sql::arena_cache::SqlArenaSnapshot`] が保持する）の行数が一致しない場合は
+    /// 呼び出し元の不変条件違反として fail-closed に `Err` を返す（`[]` での無検査
+    /// 添字アクセスを避け、`get`/インデックスアクセサ経由で取得する。
+    /// .claude/rules/coding-rust.md 方針）。
+    pub(crate) fn build_from_cached_rls_rows<G>(
+        table_name: &str,
+        expected_dim: u32,
+        source_arena: &VectorArena,
+        metadata: &[Vec<u8>],
+        mut on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        if source_arena.len() != metadata.len() {
+            return Err(ArenaError::InvalidInput(
+                "cached RLS snapshot row/metadata count mismatch".to_string(),
+            ));
+        }
+        let dim = expected_dim as usize;
+        let mut buffers = GrowableArenaBuffers::new();
+        let mut visible_row_count: usize = 0;
+        let out_of_bounds =
+            || ArenaError::InvalidInput("cached RLS snapshot row index out of bounds".to_string());
+        for (i, meta) in metadata.iter().enumerate() {
+            let id = *source_arena.ids().get(i).ok_or_else(out_of_bounds)?;
+            let tenant_id = source_arena.tenant_id(i).ok_or_else(out_of_bounds)?;
+            let visibility = source_arena.visibility(i).ok_or_else(out_of_bounds)?;
+            let embedding = source_arena.vector(i).ok_or_else(out_of_bounds)?;
+            push_visible_row(
+                &mut buffers,
+                &mut visible_row_count,
+                dim,
+                expected_dim,
+                max_rows,
+                max_bytes,
+                id,
+                tenant_id,
+                visibility,
+                embedding,
+                meta,
+                &mut on_visible_row,
+            )?;
+        }
+        Ok(VectorArena {
+            table_name: table_name.to_string(),
+            dim: expected_dim,
+            vectors: buffers.vectors,
+            ids: buffers.ids,
+            tenant_ids: buffers.tenant_ids,
+            visibilities: buffers.visibilities,
+        })
+    }
+
     /// [`Self::build_filtered_with_limits`] の行フック付き版。呼び出し元が管理する
     /// `read_txn` 上で実行する実装本体（[`Self::build_filtered_with_rows_and_limits`]・
     /// `sql::exec::execute_statement_in_txn`（TASK-75・Issue #56 レビュー指摘対応）が
@@ -611,10 +952,47 @@ impl VectorArena {
     fn build_filtered_with_rows_and_limits_in_txn<F, G>(
         read_txn: &redb::ReadTransaction,
         table_name: &str,
+        predicate: F,
+        on_visible_row: G,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self>
+    where
+        F: FnMut(&str, Visibility) -> bool,
+        G: FnMut(usize, u64, &[f32], &[u8]) -> std::result::Result<bool, ArenaError>,
+    {
+        Self::build_filtered_with_rows_and_limits_in_txn_capturing(
+            read_txn,
+            table_name,
+            predicate,
+            on_visible_row,
+            max_rows,
+            max_bytes,
+            None,
+        )
+    }
+
+    /// [`Self::build_filtered_with_rows_and_limits_in_txn`] の本体。加えて
+    /// `rls_capture` が `Some` の場合、RLS 段（`predicate`）を通過した行ごとに
+    /// `(id, tenant_id, visibility, embedding, metadata)` を、`on_visible_row`
+    /// （SCALAR 段）の判定結果に関係なく必ず 1 回渡す。
+    ///
+    /// 呼び出し文脈: `sql::exec::execute_statement_with_cache`（Issue #363・
+    /// `SqlArenaCache` ミス時）が、クエリ実行そのものの候補構築（`on_visible_row`
+    /// による SCALAR 事前フィルタ・hybrid 疎コーパス蓄積等）と**同一の redb 走査**
+    /// の中で、次回以降のクエリが再利用できる「RLS 通過行全体」のスナップショット
+    /// （`(id, embedding, metadata)` の複製）を同時に採取するために追加した。
+    /// RLS 判定・redb 走査はそれぞれ 1 回で済み、キャッシュ採取のための追加走査は
+    /// 発生しない。`rls_capture` が `Err` を返した場合はアリーナ構築全体を
+    /// fail-closed に拒否する（`on_visible_row` と同じ契約）。
+    fn build_filtered_with_rows_and_limits_in_txn_capturing<F, G>(
+        read_txn: &redb::ReadTransaction,
+        table_name: &str,
         mut predicate: F,
         mut on_visible_row: G,
         max_rows: usize,
         max_bytes: usize,
+        mut rls_capture: Option<&mut RlsCaptureFn<'_>>,
     ) -> Result<Self>
     where
         F: FnMut(&str, Visibility) -> bool,
@@ -705,6 +1083,31 @@ impl VectorArena {
                 });
             }
 
+            // `rls_capture`（Issue #363・`SqlArenaCache` ミス時のみ `Some`）: RLS 段を
+            // 通過した行を、直後の SCALAR 段（`on_visible_row`）の判定結果に関係なく
+            // 無条件に 1 回だけ通知する。同一 redb 走査の中で「RLS 通過行全体」の
+            // スナップショットを採取するための唯一のフック地点（上記関数ドキュメント
+            // 参照）。
+            if let Some(capture) = rls_capture.as_deref_mut() {
+                // クエリ応答用アリーナ（`buffers`）がこの時点までに確保済みの
+                // 見積もりバイト量。`visible_row_count`（SCALAR 段を通過し既に
+                // `buffers` へ push 済みの行数）を [`estimate_row_bytes`] と同じ式に
+                // 通す（Issue #379 codex-review P1 対応。[`RlsCaptureFn`] ドキュメント
+                // 参照）。見積もり自体が失敗する（オーバーフロー等）場合は
+                // fail-closed に `max_bytes` そのものを渡し、採取側の予算を実質 0 へ
+                // 倒す（採取を諦めるだけでクエリ応答自体は継続する）。
+                let response_arena_bytes_in_use =
+                    estimate_row_bytes(visible_row_count, expected_dim).unwrap_or(max_bytes);
+                capture(
+                    id,
+                    tenant_id,
+                    visibility,
+                    &embedding_scratch,
+                    metadata,
+                    response_arena_bytes_in_use,
+                )?;
+            }
+
             // SCALAR 段（TASK-75）: RLS 段（`predicate`）を通過した行の metadata に対し
             // 呼び出し元のスカラー等価条件を適用する。`false` はアリーナへ格納せず
             // スキップし（容量検証の対象にも含めない）、`Err` は fail-closed に
@@ -722,36 +1125,20 @@ impl VectorArena {
             // 追加コピーなしでフックへ渡せる。呼び出し元（`sql::exec.rs` の
             // `on_visible_row`）は `WHERE` の式述語（宣言的 UDF・組み込み関数呼び出し）
             // を SCALAR 段の一部として評価するために使う。
-            if !on_visible_row(visible_row_count, id, &embedding_scratch, metadata)? {
-                continue;
-            }
-
-            // アロケーション前の上限検証（.claude/rules/security.md「不安全な設計｜
-            // 無制限リソース確保（DoS）」対応）を、行を追加する直前に可視行数基準で行う
-            // （codex 指摘対応。上記ドキュメント参照）。`check_capacity` は
-            // checked_mul/checked_add でオーバーフロー安全に判定する既存ヘルパーを
-            // そのまま再利用する（`visible_row_count` を都度渡すだけで、行数・バイト量の
-            // 両方が可視行基準で検証される）。
-            visible_row_count = visible_row_count
-                .checked_add(1)
-                .ok_or(ArenaError::CapacityExceeded)?;
-            check_capacity(visible_row_count, expected_dim, max_rows, max_bytes)?;
-
-            // capacity の成長は `GrowableArenaBuffers::ensure_capacity` に委ねる。
-            // amortized 成長の候補（capacity 換算の行数）自体を `check_capacity` で
-            // 検証してから `try_reserve_exact`（要求量ちょうど）で確保するため、
-            // `Vec::try_reserve`（要求量より多く確保しうる）を直接使う場合と異なり、
-            // 実際に確保される capacity ベースの総バイト量が上限を超えることはない
-            // （codex P1 対応・Issue #137。`GrowableArenaBuffers` のドキュメント参照）。
-            // メモリ不足時は `Err(ArenaError::AllocationFailed)` として呼び出し元へ返す
-            // （`Vec::with_capacity`/`push` の内部確保のように abort しない）。
-            buffers.ensure_capacity(visible_row_count, dim, expected_dim, max_rows, max_bytes)?;
-            // `tenant_id`（`decode_row_tenant_and_visibility` の借用結果）をここで
-            // 初めて所有化する。`GrowableArenaBuffers::tenant_ids` は行ごとに独立した
-            // `String` を保持する契約のため、テナントごとの共有化（インターン化）は
-            // 本変更のスコープ外とする（Issue #314 の対応範囲は embedding 側の
-            // 行ごとのヒープ確保削減のみ）。
-            buffers.push_row(id, &embedding_scratch, tenant_id.to_string(), visibility);
+            push_visible_row(
+                &mut buffers,
+                &mut visible_row_count,
+                dim,
+                expected_dim,
+                max_rows,
+                max_bytes,
+                id,
+                tenant_id,
+                visibility,
+                &embedding_scratch,
+                metadata,
+                &mut on_visible_row,
+            )?;
         }
 
         Ok(VectorArena {
@@ -865,6 +1252,95 @@ impl VectorArena {
 mod tests {
     use super::*;
     use crate::storage::RowInput;
+
+    // `SqlArenaCaptureBuilder`（Issue #363）: metadata バイト上限超過時は `push` を
+    // 静かに無視して `failed()` を立てるだけで `finish()` が `None` を返すことを
+    // 確認する（型ドキュメント「容量超過・確保失敗により…」参照）。この経路は
+    // `sql::exec::execute_statement_with_cache` にとって「キャッシュ登録を諦めるが
+    // クエリ応答は妨げない」唯一の分岐であり、ここが誤って `panic`／`Err` へ
+    // 変わるとキャッシュ容量超過だけでクエリ全体が失敗する fail-open ならぬ
+    // 過剰拒否のリグレッションになるため固定する。
+    #[test]
+    fn sql_arena_capture_builder_soft_fails_when_metadata_byte_cap_is_exceeded() {
+        let mut capture =
+            SqlArenaCaptureBuilder::new(2, 100, usize::MAX, /* metadata_byte_cap */ 4);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"ab", 0);
+        assert!(!capture.failed(), "first push stays within the 4-byte cap");
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"cdef", 0);
+        assert!(
+            capture.failed(),
+            "second push exceeds the 4-byte cap (2 + 4 > 4) and must soft-fail"
+        );
+        // 断念後の追加 `push` も静かに無視され続ける（`failed` のまま）。
+        capture.push(3, "tenant-a", Visibility::Public, &[1.0, 1.0], b"x", 0);
+        assert!(capture.failed());
+        assert!(
+            capture.finish("docs").is_none(),
+            "a failed capture must never be registered into the cache"
+        );
+    }
+
+    #[test]
+    fn sql_arena_capture_builder_finishes_within_budget() {
+        let mut capture = SqlArenaCaptureBuilder::new(2, 100, usize::MAX, 1024);
+        capture.push(1, "tenant-a", Visibility::Public, &[1.0, 0.0], b"a", 0);
+        capture.push(2, "tenant-a", Visibility::Public, &[0.0, 1.0], b"b", 0);
+        assert!(!capture.failed());
+        let (arena, metadata) = capture.finish("docs").expect("within budget must finish");
+        assert_eq!(arena.ids(), &[1, 2]);
+        assert_eq!(metadata, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    // `SqlArenaCaptureBuilder::push` の `external_bytes_in_use`（Issue #379
+    // codex-review P1 対応）: 採取用アリーナ自身は `max_bytes` 未満でも、呼び出し元
+    // （クエリ応答用アリーナ）が既に確保済みの見積もりバイト量と合算した総量が
+    // `max_bytes` を超えれば採取を断念する（単一のピークメモリ予算。型・`push` の
+    // ドキュメント参照）。応答用アリーナと採取用アリーナがそれぞれ独立に `max_bytes`
+    // まで確保できてしまうリグレッション（1 クエリのピークメモリが実質数倍化する
+    // DoS 増幅）を固定する。
+    #[test]
+    fn sql_arena_capture_builder_soft_fails_when_combined_with_response_arena_exceeds_budget() {
+        // 1 行あたりの見積もりバイト量（`estimate_row_bytes`）が `max_bytes` の
+        // ちょうど半分になるよう `dim` を選ぶ。採取用アリーナ単体では 2 行目まで
+        // 収まるが、`external_bytes_in_use`（応答用アリーナが既に使用中の量）を
+        // 合算すると 1 行目の時点で超過する設定にする。
+        let dim: u32 = 4;
+        let one_row_bytes =
+            estimate_row_bytes(1, dim).expect("single row byte estimate must not overflow");
+        let max_bytes = one_row_bytes * 4;
+        let mut capture = SqlArenaCaptureBuilder::new(dim, 100, max_bytes, usize::MAX);
+        // 応答用アリーナが既に `max_bytes` の半分を超えて使用中と仮定する。
+        let external_bytes_in_use = max_bytes / 2 + 1;
+        capture.push(
+            1,
+            "tenant-a",
+            Visibility::Public,
+            &[1.0, 2.0, 3.0, 4.0],
+            b"m",
+            external_bytes_in_use,
+        );
+        assert!(
+            !capture.failed(),
+            "single row combined with external usage must still fit within max_bytes"
+        );
+        capture.push(
+            2,
+            "tenant-a",
+            Visibility::Public,
+            &[5.0, 6.0, 7.0, 8.0],
+            b"m",
+            external_bytes_in_use,
+        );
+        assert!(
+            capture.failed(),
+            "second row pushes the combined (self + external) total past max_bytes even \
+             though the capture builder alone would still be within its own row/byte limits"
+        );
+        assert!(
+            capture.finish("docs").is_none(),
+            "a failed capture must never be registered into the cache"
+        );
+    }
 
     #[test]
     fn capacity_check_accepts_at_row_limit() {
