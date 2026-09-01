@@ -47,7 +47,7 @@ Phase 1（#345 配下）で行ったデコード段の最適化（`storage::deco
 
 - 行ストアは `storage.rs::ROWS_TABLE`（複合キー `(tenant_id, id)` の `redb::TableDefinition`）
   で、値は `tenant_id` / `visibility` / embedding / metadata を同居させた v2 行エンコー
-  ディング。テーブルごとの行テーブル名は `catalog.rs::row_table_name` / `user_rows_table_name`
+  ディング。テーブルごとの行テーブル名は `catalog.rs::user_rows_table_name`
   経由で解決される
 - `WHERE` 評価は `arena.rs::build_filtered_with_rows` が担い、RLS 述語 `predicate`
   （`tenant_id`・`visibility` のみで判定）→ SCALAR フック `on_visible_row`（等価・前方
@@ -143,6 +143,21 @@ prefix scan）の**和集合**を候補として返す。行ストア（`storage
 5. **`operation_id` 台帳との独立性**: 索引更新は `operation_id` 再送契約（TASK-101・
    RECOVER-10 系）の対象である行データの内容とは独立した副次構造であり、索引の存在・
    不在は `operation_id` の重複判定（`23505` / `22023`）に影響を与えない設計とする
+6. **DDL（`DROP TABLE`）時の索引破棄**: 現行 `catalog.rs::Storage::drop_table`
+   （776 行目〜）は、`CATALOG_TABLE` からのスキーマ削除・行テーブル
+   （`user_rows_table_name` が返す名前の `delete_table`）・`recovery::ledger` の
+   テーブル分エントリ削除・`bump_table_generation_in_txn` を同一
+   `write_txn`・単一 `commit_boundary::commit` で行っている（索引はまだ実装されて
+   いないため、現行コードにこれ以上の破棄対象は無い）。索引導入後は、この同一
+   `write_txn` 内に **Index-T・Index-P の両テーブルおよびカーディナリティ統計
+   （テナント横断で保持する Index-P 由来統計を含む）の破棄**を追加することを不変
+   条件とする。索引・統計の破棄が行テーブル削除より後続の別 txn・別 commit に
+   分離されると、`drop_table` 後に同名テーブルが再作成された場合、旧
+   `(tenant_id, id)` を指す stale-positive エントリが新テーブルの索引経路へ紛れ込み、
+   誤った検索結果に加え旧テナントデータの存在情報漏えい（RLS 境界の実質的な迂回）
+   につながる。「行テーブル・Index-T・Index-P・カーディナリティ統計を同一 write txn
+   で破棄する」契約は、行データの `write_txn` 統一契約（本節冒頭）と同格の不変条件
+   として扱う
 
 ## RLS 境界
 
@@ -233,10 +248,10 @@ s\* の具体値は実装フェーズでの実測が必要であり、本 ADR �
 | # | タスク | 依存 | 見積り（目安） |
 | - | ------ | ---- | -------------- |
 | 1 | 索引テーブルの物理設計確定＋プロトタイプ計測（A 案 / B 案、Index-T / Index-P 二層構成比較） | 本 ADR 承認 | 中 |
-| 2 | 索引テーブルの物理実装＋ DML（`INSERT` / 削除 / 同一パス置換 / 可視性変更）同期反映（Index-T・Index-P 両層） | (1) | 大 |
+| 2 | 索引テーブルの物理実装＋ DML（`INSERT` / 削除 / 同一パス置換 / 可視性変更）同期反映（Index-T・Index-P 両層）＋ `catalog.rs::Storage::drop_table` への Index-T・Index-P・カーディナリティ統計の同一 write txn 破棄追加 | (1) | 大 |
 | 3 | 既存データからの索引ビルド＋世代整合（`PrefilterCache` 相乗り）＋途中失敗の fail-closed 注入試験 | (2) | 中 |
 | 4 | `ExecutionPlan` への経路統合＋ Index-T/Index-P 和集合の候補列挙＋カーディナリティ推定による索引経路 / 全走査経路の選択度切替 | (2) | 大 |
-| 5 | RLS 不変テスト（索引ヒット後の可視性再判定・テナント境界・索引経路と全走査経路の結果一致）＋統計・処理時間経由のクロステナント（`Private` 行）漏えい防止検証 | (3)(4) | 中 |
+| 5 | RLS 不変テスト（索引ヒット後の可視性再判定・テナント境界・索引経路と全走査経路の結果一致・`DROP TABLE` 後の同名テーブル再作成で旧索引エントリが候補に復活しないこと）＋統計・処理時間経由のクロステナント（`Private` 行）漏えい防止検証 | (3)(4) | 中 |
 | 6 | ベンチによる損益分岐選択度 s\* の実測・行数スケーリング測定 | (4) | 中 |
 
 実装タスクの Issue 起票は本 ADR の承認後、ユーザー承認を経て別途行う
