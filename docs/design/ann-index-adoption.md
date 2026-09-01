@@ -4,7 +4,7 @@
 - **対応 Issue**: #367
 - **関連ポインタ（spec・本文は転記しない）**: CORE-9・CORE-10・CORE-12・CORE-13・
   `docs/spec/05-tasks.md` TASK-131・TASK-132・`docs/spec/06-roadmap.md` MS-2・
-  `docs/spec/01-brainstorm.md`（想定規模・エンジン自作方針の決定項目）・
+  `docs/spec/01-brainstorm.md`・
   `docs/spec/03-poc/real-scale-recall-reeval/README.md`（実データ規模での Recall 再評価）
 - **関連ドキュメント**: `crates/engine/docs/ann-future-work.md`・
   `docs/design/core5-contrast-engine.md`・`docs/design/hybrid-recall-regression.md`・
@@ -53,9 +53,8 @@ RLS 再評価の観点」の列挙に留まり、採否判断そのものに必�
   （`contrast-bench` feature 限定の optional 依存・Apache-2.0・オーナー承認
   済み〔2026-08-26〕）。usearch 本体は HNSW 実装だが、この承認は「総当たり
   対照としての利用」に限定されたものであり、ANN 方式としての採用可否を評価
-  したものではない。`hnsw_rs`／`instant-distance`（pure Rust）は「総当たり
-  API を持たない」ことを理由に対照役として不採用となっており、ANN 候補と
-  しての評価はこれまで行われていない。
+  したものではない。ANN 候補としての評価（`hnsw_rs`／`instant-distance` 等の
+  pure Rust クレートを含む）はこれまで行われていない。
 - 公開済みの実測値として、大規模段（20,000 件）ハイブリッド経路の p95 が
   通常コーパスで約 5.6 ms であることや、C1（100,000 行×768 次元）p95 が
   専有環境で閾値僅差の fail 状態にあることが `docs/design` に記録されている
