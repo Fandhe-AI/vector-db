@@ -19,6 +19,17 @@
 //! ならない。単一行集計〔`aggregate.rs`〕は `TextMin`/`TextMax` インスタンスが
 //! 項目数分（高々 SELECT リスト長）で頭打ちだが、`GROUP BY` はグループ数倍に
 //! なるため別途累計管理が必要。PR #230 codex-review 指摘対応）。
+//!
+//! 行走査ループの集計表は非 NULL グループ（`string_groups: BTreeMap<String, _>`）と
+//! NULL グループ（`null_group: Option<_>`）に分割する（Issue #351）。`String:
+//! Borrow<str>` により標準 API のまま借用キー（`&str`）でのルックアップができる
+//! ため、既存グループへ累積するだけの行では追加のヒープ確保が発生せず、マップ
+//! 探索も `get_mut` 1 回で済む（従来は `contains_key` → `get_mut` の 2 回探索＋
+//! 新規グループ挿入時の二重確保だった）。新規グループが発生した行のみ
+//! [`check_new_group_budget`] の予算検査を経てからキーを 1 回所有化する
+//! （[`new_accumulators`]・[`accumulate_row`] 参照）。FINISH 段では
+//! `string_groups` の昇順走査のあとに `null_group` を末尾へ連結することで、
+//! 分割前の `GroupKey::Ord`（非 NULL 昇順 → NULL 末尾）と同一の走査順を保つ。
 
 use crate::catalog::{self, TableSchema};
 use crate::declarative_filter;
@@ -81,18 +92,21 @@ impl Ord for GroupKey {
 /// [`MAX_GROUP_KEY_TOTAL_BYTES`]）。呼び出し元が「このキーは表に存在しない」ことを
 /// 確認済みの場合にのみ呼ぶ（既存キーの更新では追加コストが発生しないため呼ばない）。
 /// 成功時は `total_key_bytes` へ今回のキー分のバイト数を加算する。
+///
+/// `key_len` はグループキーのバイト数（NULL グループは 0）。Issue #351 で行走査
+/// ループが借用キー（`&str`）主体に変わったため、所有 `String`/`Option<String>`
+/// ではなくバイト数のみを引数に取る（予算検査の時点ではまだキーを所有化しない）。
 fn check_new_group_budget(
     current_group_count: usize,
     total_key_bytes: &mut usize,
-    key: &Option<String>,
+    key_len: usize,
 ) -> Result<(), SqlSurfaceError> {
     if current_group_count >= MAX_GROUPS {
         return Err(SqlSurfaceError::payload_too_large(
             "GROUP BY result exceeds the allowed number of groups",
         ));
     }
-    let added = key.as_ref().map(|s| s.len()).unwrap_or(0);
-    let next = total_key_bytes.checked_add(added).ok_or_else(|| {
+    let next = total_key_bytes.checked_add(key_len).ok_or_else(|| {
         SqlSurfaceError::payload_too_large("GROUP BY key size accounting overflowed")
     })?;
     if next > MAX_GROUP_KEY_TOTAL_BYTES {
@@ -101,6 +115,80 @@ fn check_new_group_budget(
         ));
     }
     *total_key_bytes = next;
+    Ok(())
+}
+
+/// 新規グループ 1 件分のアキュムレータ列を確保する（`bound.items` の項目ごとに
+/// [`Accumulator::new`]）。既存グループへの累積では呼ばない（グループ発生行のみ
+/// のコストに留める。Issue #351）。
+fn new_accumulators(
+    items: &[crate::sql::parser::BoundAggregateItem],
+) -> Result<Vec<Accumulator>, SqlSurfaceError> {
+    let mut accs = Vec::new();
+    accs.try_reserve_exact(items.len()).map_err(|_| {
+        SqlSurfaceError::payload_too_large(
+            "aggregate accumulator allocation exceeds available memory",
+        )
+    })?;
+    for item in items {
+        accs.push(Accumulator::new(item.func, &item.input)?);
+    }
+    Ok(accs)
+}
+
+/// 1 行分の値を、対象グループのアキュムレータ列へ反映する（`observe`）と同時に
+/// `MIN`/`MAX(<TEXT 列>)` の累計バイト数予算（[`MAX_TEXT_ACCUMULATOR_TOTAL_BYTES`]）
+/// を更新する。既存グループ・新規グループどちらの行からも呼ばれる共通 helper
+/// （Issue #351 で行ループから抽出。before/after 比較による加算・減算ロジックは
+/// 抽出前と完全に同一）。`vector` は呼び出し元が `tier`（[`DecodeTier`]）に応じて
+/// 組み立てた行 1 件分の `VECTOR` 列ビュー（Issue #350。embedding 未デコード時は
+/// `values: None`）。
+fn accumulate_row(
+    accs: &mut [Accumulator],
+    items: &[crate::sql::parser::BoundAggregateItem],
+    id: u64,
+    vector: &RowVector<'_>,
+    scanned: &[Option<&str>],
+    total_text_accumulator_bytes: &mut usize,
+) -> Result<(), SqlSurfaceError> {
+    for (accumulator, item) in accs.iter_mut().zip(items) {
+        // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
+        // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
+        // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
+        // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
+        // 実際の保持量を正確に反映する）。
+        let before = accumulator.text_len();
+        accumulator.observe(&item.input, id, vector, scanned)?;
+        let after = accumulator.text_len();
+        if after > before {
+            let delta = after - before;
+            *total_text_accumulator_bytes = total_text_accumulator_bytes
+                .checked_add(delta)
+                .ok_or_else(|| {
+                    SqlSurfaceError::payload_too_large(
+                        "GROUP BY TEXT aggregate size accounting overflowed",
+                    )
+                })?;
+            if *total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
+                return Err(SqlSurfaceError::payload_too_large(
+                    "GROUP BY TEXT aggregate state exceeds the allowed total size",
+                ));
+            }
+        } else if after < before {
+            // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
+            // 実際の保持量を正確に反映するため減算する（`checked_sub` の
+            // 失敗＝内部不整合は `XX000` の accumulator_bug へ落とし、
+            // fail-open にはしない）。減算しないと過去の増加量が
+            // 累積し続け、実保持量が予算内でも正常なクエリを
+            // 誤って 54000 で拒否してしまう。
+            let delta = before - after;
+            *total_text_accumulator_bytes = total_text_accumulator_bytes
+                .checked_sub(delta)
+                .ok_or_else(|| {
+                    accumulator_bug("GROUP BY TEXT aggregate size accounting underflowed")
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -276,7 +364,12 @@ pub(crate) fn execute_grouped_aggregate(
         }
     };
 
-    let mut groups: BTreeMap<GroupKey, Vec<Accumulator>> = BTreeMap::new();
+    // 集計表を非 NULL（`string_groups`）と NULL（`null_group`）に分割する
+    // （Issue #351）。`string_groups: BTreeMap<String, _>` は `String: Borrow<str>`
+    // により `get_mut(&str)` の借用キー検索が標準 API のまま可能で、既存グループ
+    // への累積では追加のヒープ確保・二重探索が発生しない。
+    let mut string_groups: BTreeMap<String, Vec<Accumulator>> = BTreeMap::new();
+    let mut null_group: Option<Vec<Accumulator>> = None;
     let mut total_key_bytes: usize = 0;
     let mut total_text_accumulator_bytes: usize = 0;
     // 可視行ごとの embedding デコード先スクラッチバッファ（Issue #349・Issue #314
@@ -381,30 +474,17 @@ pub(crate) fn execute_grouped_aggregate(
 
             // GROUP 段: グループキーを確定してから、可視行のみをグループ表へ
             // 反映する（このため他テナントにしか存在しないキーはグループとして
-            // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。
+            // 一切現れない＝RLS-7・RLS-8 の `GROUP BY` 版）。借用キー（`&str`）で
+            // まず既存グループを 1 回だけ探索し、ヒットした行では所有 `String` を
+            // 一切確保しない（Issue #351）。
             let key_value = scanned.get(group_by.column_index).copied().flatten();
-            let key = GroupKey(match key_value {
-                Some(v) => Some(try_clone_str(v)?),
-                None => None,
-            });
+            let total_group_count = string_groups.len() + usize::from(null_group.is_some());
 
-            if !groups.contains_key(&key) {
-                check_new_group_budget(groups.len(), &mut total_key_bytes, &key.0)?;
-                let mut accs = Vec::new();
-                accs.try_reserve_exact(bound.items.len()).map_err(|_| {
-                    SqlSurfaceError::payload_too_large(
-                        "aggregate accumulator allocation exceeds available memory",
-                    )
-                })?;
-                for item in &bound.items {
-                    accs.push(Accumulator::new(item.func, &item.input)?);
-                }
-                groups.insert(key.clone(), accs);
-            }
-            let accs = groups
-                .get_mut(&key)
-                .ok_or_else(|| accumulator_bug("group entry disappeared after insertion"))?;
-
+            // 行 1 件分の `VECTOR` 列ビュー（Issue #350）。`tier` が
+            // `DecodeTier::Embedding` を選んだ場合のみ実体（`embedding_scratch`）を
+            // 持ち、それ以外は `dim` のみで `values: None`（`Accumulator::observe`
+            // 側が `ScalarExpr` の embedding 参照を fail-closed に拒否する仕組みで
+            // 誤用を防ぐ）。
             let vector = RowVector {
                 dim,
                 values: match tier {
@@ -412,42 +492,56 @@ pub(crate) fn execute_grouped_aggregate(
                     DecodeTier::Fast | DecodeTier::DimAndScalar => None,
                 },
             };
-            for (accumulator, item) in accs.iter_mut().zip(&bound.items) {
-                // `MIN`/`MAX(<TEXT 列>)` は 1 グループ・1 項目あたり高々 1 本の
-                // `String` を保持するが、`GROUP BY` はグループ数倍に増えるため
-                // クエリ全体の累計バイト数を予算管理する（before/after 比較で、
-                // 増加方向は加算・縮小方向〔より短い極値への更新〕は減算し、
-                // 実際の保持量を正確に反映する）。
-                let before = accumulator.text_len();
-                accumulator.observe(&item.input, id, &vector, &scanned)?;
-                let after = accumulator.text_len();
-                if after > before {
-                    let delta = after - before;
-                    total_text_accumulator_bytes = total_text_accumulator_bytes
-                        .checked_add(delta)
-                        .ok_or_else(|| {
-                            SqlSurfaceError::payload_too_large(
-                                "GROUP BY TEXT aggregate size accounting overflowed",
-                            )
-                        })?;
-                    if total_text_accumulator_bytes > MAX_TEXT_ACCUMULATOR_TOTAL_BYTES {
-                        return Err(SqlSurfaceError::payload_too_large(
-                            "GROUP BY TEXT aggregate state exceeds the allowed total size",
-                        ));
+
+            match key_value {
+                Some(key_str) => {
+                    if let Some(accs) = string_groups.get_mut(key_str) {
+                        // 既存グループへの累積: 探索 1 回・String 確保 0 回。
+                        accumulate_row(
+                            accs,
+                            &bound.items,
+                            id,
+                            &vector,
+                            &scanned,
+                            &mut total_text_accumulator_bytes,
+                        )?;
+                    } else {
+                        // 新規グループ: 予算検査 → ローカルでアキュムレータを
+                        // 確保・累積 → 確定後に 1 回だけキーを所有化して挿入
+                        // する（挿入後の再探索は不要）。
+                        check_new_group_budget(
+                            total_group_count,
+                            &mut total_key_bytes,
+                            key_str.len(),
+                        )?;
+                        let mut accs = new_accumulators(&bound.items)?;
+                        accumulate_row(
+                            &mut accs,
+                            &bound.items,
+                            id,
+                            &vector,
+                            &scanned,
+                            &mut total_text_accumulator_bytes,
+                        )?;
+                        string_groups.insert(try_clone_str(key_str)?, accs);
                     }
-                } else if after < before {
-                    // MIN/MAX(TEXT) の極値がより短い文字列へ更新された縮小方向。
-                    // 実際の保持量を正確に反映するため減算する（`checked_sub` の
-                    // 失敗＝内部不整合は `XX000` の accumulator_bug へ落とし、
-                    // fail-open にはしない）。減算しないと過去の増加量が
-                    // 累積し続け、実保持量が予算内でも正常なクエリを
-                    // 誤って 54000 で拒否してしまう。
-                    let delta = before - after;
-                    total_text_accumulator_bytes = total_text_accumulator_bytes
-                        .checked_sub(delta)
-                        .ok_or_else(|| {
-                            accumulator_bug("GROUP BY TEXT aggregate size accounting underflowed")
-                        })?;
+                }
+                None => {
+                    if null_group.is_none() {
+                        check_new_group_budget(total_group_count, &mut total_key_bytes, 0)?;
+                        null_group = Some(new_accumulators(&bound.items)?);
+                    }
+                    let accs = null_group.as_mut().ok_or_else(|| {
+                        accumulator_bug("null group entry disappeared after insertion")
+                    })?;
+                    accumulate_row(
+                        accs,
+                        &bound.items,
+                        id,
+                        &vector,
+                        &scanned,
+                        &mut total_text_accumulator_bytes,
+                    )?;
                 }
             }
         }
@@ -459,8 +553,18 @@ pub(crate) fn execute_grouped_aggregate(
     // 保証済みの内部添字だが、untrusted 入力に由来する添字アクセスを避ける
     // 方針（`.claude/rules/coding-rust.md`）に従い、ここでも `.get()` で明示的に
     // 扱い、万一の不整合は panic ではなく [`accumulator_bug`]（`XX000`）へ落とす。
-    let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(groups.len());
-    for (key, accs) in groups {
+    // 分割前の `GroupKey::Ord`（非 NULL はバイト昇順・NULL は常に末尾）と同一の
+    // 走査順にするため、`string_groups`（`BTreeMap` の昇順 `into_iter`）→
+    // `null_group` の順で連結する（Issue #351。`sort-determinism-check`・
+    // 決定性テストが前提とする順序を維持）。
+    let total_group_count = string_groups.len() + usize::from(null_group.is_some());
+    let group_entries = string_groups
+        .into_iter()
+        .map(|(k, accs)| (GroupKey(Some(k)), accs))
+        .chain(null_group.into_iter().map(|accs| (GroupKey(None), accs)));
+
+    let mut finished: Vec<(GroupKey, Vec<Cell>)> = Vec::with_capacity(total_group_count);
+    for (key, accs) in group_entries {
         let cells: Vec<Cell> = accs.into_iter().map(Accumulator::finish).collect();
         let mut keep = true;
         for h in &group_by.having {
