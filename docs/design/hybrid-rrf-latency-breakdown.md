@@ -381,3 +381,107 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
   指摘していた）
 - 転置索引化そのもの（設計・実装）は本 Issue のスコープ外。本節の帰属分析・
   優先順位は次段の設計判断の入力として記録するに留める
+
+## Issue #388: term インターニング後の build・`search_within` 実測
+
+親 Issue #386（転置索引化）の基盤整備として、`SparseIndex` の内部表現を
+`BTreeMap<String, _>` から term 辞書（`String -> TermId(u32)`）＋
+`TermId` キーの `Vec` へ置き換えた（`crates/engine/src/sparse.rs`。
+公開 API のシグネチャ・契約は不変）。本節は Issue #356・#387 と同一の
+`make bench-hybrid-profile` を変更後に再実行した実測値を、変更前
+（本 ADR 前節時点。以下「基線」）と比較する。
+
+### 測定条件
+
+- 測定環境・コーパス・クエリ集合・プロトコルは Issue #356・#387 と同一
+  （25,000 行・dim 128・単一テナント・全行 `Visibility::Public`・
+  `MeasurementConfig::new(20, 30, SEED)`）。基線・本実測はいずれも
+  非専有環境（並行エージェントあり）での 1 回実測であり、時点も異なる
+  （厳密な同一マシン・同一時刻での前後比較ではなく、Issue #356・#387 の
+  ADR 記載値を参考基線として扱う）
+- ベンチ起動時の忠実性検証（`replica matches real search_within` を含む
+  `hybrid_profile: fidelity checks passed ...`）は変更後も通過しており、
+  クエリ語の走査順（辞書順）を維持したことによるスコアのビット一致は
+  この検証と `sparse.rs` 内の参照実装比較テスト（`search_score_is_bit_
+  identical_to_reference_btreemap_implementation` 等）の双方で担保される
+- `harness/hybrid_profile.rs::ProfileSparseIndex`（`search_within` の
+  区間分解複製）・build 3 段複製（`tokenize_term_freq`／
+  `tokenize_term_doc_freq`）は本 Issue では変更していない（3.6 節の設計
+  判断どおり、旧 `BTreeMap<String,u32>` 構造の参照実装として据え置き）。
+  そのため下表の `search_within_subset_only`／`subset_df`／
+  `replica_full`（複製経由の区間別測定）は変更の影響を受けず基線と
+  近い値のままであり、**実装の変更を反映するのは `sparse_build_total`・
+  `hybrid_search_cached_index`・`search_within_fetch_k=<k>`
+  （いずれも実 `SparseIndex` の公開 API を直接呼ぶ測定）のみ**である点に
+  注意する
+
+### 実測結果（前後比較）
+
+| 段 | 基線 median | 本実測 median | 変化 |
+| -- | ----------: | -------------: | ---- |
+| `sparse_build_total`（`SparseIndex::build` 単体） | 176.4ms | 50.1ms | **約 71.6% 短縮** |
+| `tokenize_only`（累積） | 20.3ms | 22.2ms | ほぼ不変（ノイズ帯。tokenize 段自体は本 Issue の対象外） |
+| `tokenize_term_freq`（累積） | 85.2ms | 82.3ms | ほぼ不変（複製は旧構造のまま） |
+| `tokenize_term_doc_freq`（累積） | 150.9ms | 159.5ms | ほぼ不変（同上） |
+| `hybrid_search_cached_index`（`provider_calls_max=1`） | 115.7ms | 25.3ms | **約 78.1% 短縮** |
+| `search_within_fetch_k=400`〜`25000`（実 API 単体） | 17.2〜18.8ms | 2.6〜3.4ms | **約 82〜86% 短縮** |
+| `search_within_subset_only`（複製・区間 1） | 0.78ms | 0.80ms | ほぼ不変（複製は旧構造のまま） |
+| `search_within_subset_df`（複製・区間 1+2） | 9.66ms | 9.61ms | ほぼ不変（同上） |
+| `search_within_replica_full`（複製・区間 1+2+3） | 15.25〜16.76ms | 15.42〜16.27ms | ほぼ不変（同上） |
+
+疎側再取得ループの発火回数・`fetch_ks`（`engine::hybrid::
+sparse_refetch_observed` 経由の実観測）は基線と完全に一致した
+（`calls=7/7/7/6/6`・各 `fetch_ks` 列・`reached_cap_count=3` すべて同一）。
+これは term インターニングがスコア・順位を変えないことの追加の裏付けであり、
+境界同点判定（`hybrid.rs`）はそもそも本 Issue の変更対象外なので当然の帰結
+でもある。
+
+### 解釈
+
+- `sparse_build_total`・`search_within_fetch_k`・`hybrid_search_cached_index`
+  （いずれも実装を直接測る経路）はすべて基線を大きく下回っており、
+  ノイズ帯（本開発環境の非専有実測で見られる数 % 〜十数 % の run-to-run
+  差分）を明確に超える改善である。一方、`tokenize_*`・
+  `search_within_subset_*`／`replica_full`（いずれも旧構造の複製経由）は
+  ほぼ横ばいであり、これは複製が変更対象外であることの整合的な裏付けに
+  なっている（変更の影響を受けるべき経路とそうでない経路が期待どおりに
+  分離して観測された）
+- `search_within_fetch_k` の改善幅（82〜86%）が `search_within_subset_df`
+  （複製・ほぼ不変）と乖離しているのは、複製が模しているのは旧
+  `BTreeMap<String,u32>` 方式の df 再計算パスであり、実装済みの新方式
+  （`TermId` 添字での `Vec<u32>` アクセス・`binary_search` によるクエリ側
+  `term_freq` 参照）は複製に反映されていないため。実装の効果を見るには
+  `search_within_fetch_k`（実 API）を正とする（3.6 節と同じ位置づけ）
+- `hybrid_search_cached_index` の改善（78.1%）は `search_within` 1 回あたりの
+  短縮が疎側再取得ループ（5〜7 回発火）を通じて積算されたものであり、
+  受け入れ条件 2（`SparseIndex::build` の短縮を実測・記録）に加えて
+  検索経路全体への波及効果も確認できた
+- `sparse_build_total` の内訳（tokenize／term_freq 構築／doc_freq マージが
+  ほぼ均等）を前提にすると、term インターニングは term_freq 構築・
+  doc_freq マージの 2 段（Issue #356 実測で合計約 6 割）が主な短縮対象と
+  見込んでいたが、実測の短縮幅（71.6%）はその見込みを上回った。tokenize 後
+  の `Vec<TermId>` への intern・sort・ランレングス圧縮が `BTreeMap` の
+  都度挿入（比較木の再バランス・エントリごとのヒープ確保）より単純な
+  線形処理で完結することが寄与していると考えられる（詳細な段別内訳への
+  分解は本 Issue のスコープ外）
+
+### 受け入れ条件との対応
+
+計画（`_/local-plans` 相当）の受け入れ条件 2「`SparseIndex::build` の所要
+時間が基線比で短縮していることを `make bench-hybrid-profile` で実測・記録」
+を、上表の `sparse_build_total`（176.4ms → 50.1ms）で満たしたと判断する。
+
+### 申し送り
+
+- 本節の実測は非専有環境・1 回実測であり、専有環境での再実測はオーナー／
+  実装担当の判断で別途実施する
+- `harness/hybrid_profile.rs` の build 3 段複製・`ProfileSparseIndex` は
+  旧 `BTreeMap<String,u32>` 構造の参照実装のまま残置した。これらの複製の
+  刷新（`TermId` 構造を反映した複製への更新）は本 Issue のスコープ外とし、
+  後続（#389／#390 または別 Issue）への申し送りとする
+- 後続 #389（posting list）・#390（可視ビットマップ＋posting 走査）は
+  `TermId` を前提にする。本節の実測（特に df 再計算パス・スコアリング
+  パスの改善余地の見立て）は前節（Issue #387）「転置索引化（Phase 1
+  後続）への示唆」の優先順位付けを変えるものではない（転置索引化は
+  `search_within` 単体のアルゴリズム的な計算量を変える話であり、本 Issue
+  の定数倍改善とは独立に効果が見込まれる）
