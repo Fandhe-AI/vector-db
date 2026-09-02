@@ -2,7 +2,8 @@
 
 - ステータス: Accepted（本コミットで計測ベンチ・ADR を追加。実測は本開発環境
   ——非専有・並行エージェントあり——での 1 回実測。専有環境での再実測は運用者判断）
-- 対応: Issue #356（`test(engine): hybrid_rrf 288ms の内訳プロファイル切り分け`）。
+- 対応: Issue #356（`test(engine): hybrid_rrf 288ms の内訳プロファイル切り分け`）・
+  Issue #387（`search_within` の段別プロファイル・疎側再取得発火回数の追加）。
   親: Issue #355（`SparseIndex` のクエリ毎再構築の排除）
 - 前提: `docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3（判定内容・数値基準は
   spec 側が SSOT。本 ADR は spec 由来の pass/fail 閾値を持たない情報提供専用の
@@ -180,7 +181,16 @@ make bench-hybrid-profile
 が設定された実行環境下では起動直後に fail-closed で拒否する
 （`harness::hybrid_profile::refuse_under_github_actions`）。判定ロジック自体
 （時間非依存）は `crates/engine/tests/hybrid_profile_accept.rs` で `make ci`
-側から回帰検証する。
+側から回帰検証する。`engine::hybrid::sparse_refetch_observed`（ベンチ・診断専用
+公開フック）は非既定 feature `bench-internals` の背後にあるため、これに依存する
+関数（`harness::hybrid_profile::sparse_refetch_schedule`）とその import・依存
+テスト 2 件（`sparse_refetch_schedule_*`）のみ同 feature の背後に置く。コーパス
+生成・SQL 文組み立て・tokenize 複製・`refuse_under_github_actions` 等、大半の
+時間非依存テストは feature 無指定の通常の `cargo test -p engine` でも実行され
+（42 件）、`bench-internals` を含む `--all-features` では上記 2 件を加えた 44 件が
+検証される（Issue #387 PR #416 codex-review P2 指摘対応・2 巡目。1 巡目の対応では
+ファイル全体を `#![cfg(feature = "bench-internals")]` で覆っており、依存しない
+既存テストまで既定 feature で 0 件になっていた）。
 
 ## 申し送り
 
@@ -192,3 +202,182 @@ make bench-hybrid-profile
   before/after 再実測は同 Issue で時間予算の都合により見送り、申し送り事項）
 - production コード（`crates/engine/src/`）は本 Issue で無変更（テスト・ベンチ
   専任）
+
+## Issue #387: `search_within` 段別・再取得発火回数の基線
+
+Issue #357（`SparseIndex` のテーブル世代整合キャッシュ）導入後、キャッシュ
+ヒット時になお残るコストが `crates/engine/src/sparse.rs::search_within`
+単体（可視 subset 構築／df 再計算パス／スコアリングパスの 3 区間）と、それを
+繰り返し呼ぶ `hybrid.rs::hybrid_search_boosted` の疎側再取得ループ
+（Issue #320）のどちらにどれだけ帰属するかは未計測だった。本節はその内訳と、疎側の
+再取得発火回数・密側の発火回数を実測した基線を記録する（Issue #358 の
+`feature_bench` `hybrid_rrf` hot p50 約 147ms・本 ADR 前節の残差 36%
+〔約 100ms〕の主な内訳仮説を検証する位置づけ）。
+
+### 測定設計
+
+`crates/engine/src/sparse.rs::SparseIndex`（`docs`・`id_index`・`k1`・`b` は
+private フィールド）・`crates/engine/src/hybrid.rs` の境界同点判定
+（`resolve_boundary_tie_group`/`complete_boundary_tie_group_by`。いずれも
+`pub(crate)`/private）はいずれもベンチ・統合テストから直接呼べないため、
+`harness/hybrid_profile.rs` に以下を追加した:
+
+- `ProfileSparseIndex`: `search_within` の 3 区間（`subset_only`／`subset_df`／
+  `search_within_replica`）を個別に呼び分けられる複製索引。`replica_matches_real`
+  が実 `SparseIndex::search_within` の出力（`doc_id` 列・スコア）と数値一致する
+  ことをベンチ起動時に fail-closed で検証してから使う（Issue #356 の build
+  複製と異なり、本複製は公開 API 経由で出力を直接比較できる）
+- `boundary_tie_decision`: 境界同点判定の**判定結果のみ**（列の切り詰めは
+  行わない）を複製し、`dense_refetch_schedule`（鏡像定数
+  `MAX_POOL_DEPTH_MIRROR`/`MAX_FETCH_K_MIRROR` を使い、初期 `fetch_k` から
+  倍増しつつ実 `provider.search` を呼ぶ）が密側の再取得スケジュールを予測する。
+  この密側予測はベンチ起動時に `RefetchTrackingProvider`（既存 Issue #324
+  ハーネス）が観測する実際の呼び出し回数と突き合わせて fail-closed 検証する。
+  疎側の `sparse_refetch_schedule` は当初 `boundary_tie_decision` による予測
+  だったが、codex-review P1 指摘（PR #416）対応で production の疎側再取得
+  ループ実装（`hybrid.rs::sparse_refetch_loop`）をテスト・ベンチ向け公開フック
+  `engine::hybrid::sparse_refetch_observed` 経由で直接呼ぶ方式へ変更した
+  （「限界・申し送り」節参照）。以降の予測固有の限界の記述はこの変更前の
+  設計時点のものであり、密側（`dense_refetch_schedule`）のみに適用される
+
+複製固有の限界: `MAX_POOL_DEPTH_MIRROR`/`MAX_FETCH_K_MIRROR` は `hybrid.rs`
+側の値をこのファイルへ手動転記したものであり、コード上の同期は強制されない
+（ドリフトは `max_pool_depth_mirror_matches_rrf_config_bounds` アクセプトテストが
+`RrfConfig::new` の受理境界との突き合わせで検知する）。境界同点判定の複製は
+判定結果（`Resolved`/`Undetermined`）のみを再現し、`hybrid_search_boosted` が
+行う「境界の同点グループ全体を対称に除外する」列操作（`exclude_undetermined_
+boundary_group`）自体は複製しない（本測定が必要とするのはスケジュール
+——何回・どの `fetch_k` で呼ばれるか——であり、最終的にどの候補が採用されるかの
+複製は不要なため）。
+
+計測条件は Issue #356 と同一コーパス（25,000 行・dim 128・単一テナント・全行
+`Visibility::Public`）・同一クエリ集合（5 件）・同一プロトコル
+（`MeasurementConfig::new(20, 30, SEED)`）。`pool_depth` は SQL 表層の既定
+（`sql/exec.rs::DEFAULT_HYBRID_POOL_DEPTH` の鏡像 `SQL_DEFAULT_HYBRID_POOL_DEPTH`
+= 200）を使い、`SparseIndex`・`ProfileSparseIndex` は事前に 1 回だけ構築して
+以降の全段で使い回す（`sql/sparse_cache.rs::SparseIndexCache` のキャッシュ
+ヒット経路と同型の前提）。
+
+### 実測結果（本開発環境・非専有・並行エージェントあり・1 回実測）
+
+忠実性検証（`search_within` 3 区間複製 ↔ 実 API・密側スケジュール予測
+〔`dense_refetch_schedule`〕↔ `RefetchTrackingProvider` 実測呼び出し回数）は
+いずれも通過（`hybrid_profile: fidelity checks passed ...`）。
+
+| 段 | median | p95 | 備考 |
+| -- | -----: | --: | ---- |
+| `hybrid_search_cached_index`（キャッシュヒット相当・`hybrid_search` 直接呼び出し） | 115.7ms | 136.1ms | `provider_calls_max=1`（密側は 1 回で確定） |
+| `search_within_fetch_k=400`〜`25000`（各 fetch_k 単体） | 17.2〜18.8ms | 18.3〜21.7ms | `fetch_k` によらずほぼ一定 |
+| `search_within_subset_only`（区間 1・k 非依存） | 0.78ms | 0.81ms | `fetch_k` を受け取らず可視集合サイズのみに依存するため 1 回のみ測定 |
+| `search_within_subset_df`（区間 1+2・k 非依存） | 9.66ms | 10.76ms | `fetch_k` を受け取らず可視集合サイズのみに依存するため 1 回のみ測定。区間 2 単独の寄与 ≈ 8.9ms |
+| `search_within_replica_full`（区間 1+2+3） | 15.25〜16.76ms | 17.09〜17.89ms | 区間 3 単独の寄与 ≈ 5.6〜6.8ms |
+
+疎側再取得ループの実測（5 クエリ。codex-review P1 指摘対応〔PR #416〕後の
+`engine::hybrid::sparse_refetch_observed` 経由の再実行——production の
+`sparse_refetch_loop` を直接呼ぶため、以下の `fetch_ks`／`calls`／
+`reached_cap` は予測ではなく実際に発火した呼び出し列そのもの）:
+
+```
+sparse_refetch query=0 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=17501 reached_cap=true
+sparse_refetch query=1 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=13125 reached_cap=true
+sparse_refetch query=2 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=18125 reached_cap=true
+sparse_refetch query=3 calls=6 fetch_ks=400,800,1600,3200,6400,12800       final_hits=12500 reached_cap=false
+sparse_refetch query=4 calls=6 fetch_ks=400,800,1600,3200,6400,12800       final_hits=12500 reached_cap=false
+sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 max_fetch_k=25000
+```
+
+（発火回数・`fetch_ks` は修正前の複製予測による実行結果と一致した——
+`sparse_refetch_loop` の抽出はロジックを変えない純粋なリファクタリングであり、
+この一致はその不変性を裏付ける。）
+
+密側は `provider_calls_max=1`（初回 `fetch_k=400` で境界確定）で再取得が
+発生していない。疎側は 5 クエリ全件で 6〜7 回発火し、うち 3 クエリは可視集合
+全体（25,000 件）まで倍増し続ける exhaustive 到達（本ベンチの合成コーパスは
+文書ごとに語彙を等間隔で回転させるだけの構成のため BM25 スコアが大量に同点に
+なりやすく、Issue #356 前提調査で想定した「最悪ケースに近い同点誘発」が
+実際に生じている）。
+
+### 帰属分析
+
+- `search_within` 単体は `fetch_k` によらずほぼ一定（17〜19ms）であり、これは
+  区間 1（subset 構築・0.8ms・全体の 4〜5%）・区間 2（df 再計算パス・8.9〜
+  9.2ms・全体の約 50%）・区間 3（スコアリング・5.6〜6.8ms・全体の 35〜40%）の
+  合算で説明できる。**df 再計算パス（区間 2）が単独最大の寄与**であり、
+  「クエリ語ごとに可視 subset 全件を線形走査して df を数え直す」処理
+  （`sparse.rs::search_within` 832〜842 行の複製）が `fetch_k` に依存しない
+  固定コスト（可視集合サイズにのみ依存）として支配的である
+- 疎側再取得ループの累積コストは `sparse_refetch_summary` の
+  `estimated_cumulative_mixed_median_us=124551`（`search_within_fetch_k=<k>`
+  段——各 `fetch_k` を全クエリで round-robin 測定した**全クエリ混合集団**の
+  実測中央値であり、クエリ別の実測値ではない——を、最も再取得回数が多い
+  クエリの実スケジュールに沿って合算した**推定値**。以前は
+  `cumulative_median_us`・「実測値」「最悪ケース」と表記していたが、実体は
+  全クエリ混合中央値による推定である。codex-review P1 指摘対応・PR #416）で、
+  `hybrid_search_cached_index` の実測 median（115.7ms）と近い値になった
+  （`search_within` 自体が `fetch_k` に依存せずほぼ一定のため、再取得回数の
+  多寡がほぼ線形にコストへ跳ね返る。ただし上記のとおり全クエリ混合中央値に
+  よる推定であり、クエリ別の真の累積コストとの乖離は未検証）
+- 本 ADR 前節（Issue #356）が「残差 36%（約 100ms）」としていた帰属不能分は、
+  本実測により**大部分が疎側再取得ループ（`search_within` を 6〜7 回繰り返す
+  こと）で説明できる**ことが確認された。`search_within` 1 回あたりのコストの
+  半分（区間 2・df 再計算パス）は `fetch_k` を増やしても変わらないため、
+  再取得回数そのものを減らす（同点誘発を弱める・境界判定を改善する）よりも、
+  df 再計算パスを転置索引（`term -> doc_id` の逆引き構造）で置き換え、
+  クエリ語ごとに可視 subset を全走査せず該当 posting のみを辿る方式へ変える
+  方が、再取得 1 回あたりのコストを直接削減でき効果が大きいと考えられる
+
+### 転置索引化（Phase 1 後続）への示唆
+
+親 Issue 系譜（#355 → #356 → #357 → #358 → 本 Issue）が指す「転置索引化」を
+実施する場合、本実測が示す優先順位は以下のとおり:
+
+1. **df 再計算パス（区間 2）**: 転置索引があれば「クエリ語ごとに `term -> df`
+   を可視 subset に限定して再計算する」処理は、posting リストの長さを
+   可視集合でフィルタしてカウントするだけになり、可視 subset 全件の線形走査
+   （現状 O(|subset| × |query_terms|)）を避けられる
+2. **スコアリングパス（区間 3）**: 同様に posting リスト経由で「その語を含む
+   文書」だけを走査すればよくなり、subset 全件を舐めて `term_freq.get` する
+   現状より削減余地がある（ただし本実測では区間 3 は区間 2 より小さい寄与
+   〔35〜40% 対 50%〕であり、優先度は区間 2 より低い）
+3. 疎側再取得ループの発火回数自体（本ベンチの同点誘発が強い合成コーパスでは
+   6〜7 回）は転置索引化では直接減らない（境界同点判定のロジックは変わらない
+   ため）。ただし 1 回あたりのコストが下がれば累積コストは比例して下がる
+
+### 限界・申し送り
+
+- 本実測は非専有環境（並行エージェントあり）での 1 回実測であり、専有環境
+  での再実測はオーナー／実装担当の判断で別途実施する
+- 本ベンチの合成コーパス（40 語の語彙を等間隔で回転させるだけの構成）は
+  BM25 スコアが同点になりやすく、疎側再取得の発火回数（6〜7 回・うち過半が
+  exhaustive 到達）は実コーパスでの発火回数の上限に近い可能性がある。実
+  コーパスでの疎側再取得発火回数は本実測より少ない可能性がある点に注意
+- production 側フック案（`hybrid_search_with_diagnostics` のような診断 API を
+  `hybrid.rs` へ追加する案）は、当初の実測ではベンチ側複製＋忠実性検証のみで
+  要件を満たせると判断し一旦不採用としたが、後述の codex-review P1 指摘への
+  対応で production の疎側再取得ループ本体を共有内部関数へ抽出したうえ診断用
+  の公開フックを追加する形へ変更した（`crates/engine/src/` は最終的に変更あり。
+  詳細は直後の記述を参照）。
+  `SparseIndex::search_within` は当初 `hybrid.rs::hybrid_search_boosted` から
+  具象型 `&SparseIndex` へ直接呼ばれる構造で、密側の `RefetchTrackingProvider`
+  （`&dyn SearchProvider` を介した外部観測）と同型の呼び出し回数観測フックが
+  存在しなかった（codex-review P1 指摘・PR #416。当初の `sparse_refetch_schedule`
+  はベンチ側複製〔`boundary_tie_decision`〕による予測値であり、production の
+  実呼び出し列そのものとは突き合わせていなかった）。この指摘への対応として、
+  `hybrid_search_boosted` の疎側再取得ループ本体を `hybrid.rs::sparse_refetch_loop`
+  （private）へ抽出し、テスト・ベンチ向けの薄い公開フック
+  `engine::hybrid::sparse_refetch_observed`（署名・挙動は同一。実際に呼ばれた
+  `fetch_k` の列も返す）を追加した（production の疎側検索処理自体は無変更・
+  1 実装を production 経路とフックの双方が共有）。`harness/hybrid_profile.rs::
+  sparse_refetch_schedule` はこのフック経由で production と同一のコードパスを
+  実行するようになったため、`fetch_ks` はベンチ側予測ではなく実観測であり、
+  境界同点判定の複製（`boundary_tie_decision`）はもはや疎側スケジュールの
+  算出に使わない（密側 `dense_refetch_schedule` の予測 ↔
+  `RefetchTrackingProvider` 実測突き合わせでのみ引き続き使用）。この変更に伴い、
+  間接検証だった `verify_sparse_schedule_terminal_is_stable`（終端 1 段先の
+  プレフィックス固定点チェック）は不要になったため削除した（実観測に対する
+  終端安定性の間接検証という位置づけ自体が意味を失うため。加えて cursor[bot]
+  レビュー〔PR #416〕は同チェックが `k >= pool_depth` の場合に境界同点グループ
+  が成長中でもプレフィックスが不変になり早期停止を検出できない構造的な穴を
+  指摘していた）
+- 転置索引化そのもの（設計・実装）は本 Issue のスコープ外。本節の帰属分析・
+  優先順位は次段の設計判断の入力として記録するに留める

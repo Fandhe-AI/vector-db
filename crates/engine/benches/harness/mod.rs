@@ -51,6 +51,14 @@ pub mod contrast;
 pub mod dot_kernel;
 pub mod env_report;
 pub mod hybrid_latency;
+// Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `hybrid_profile` の
+// 大半（コーパス生成・SQL 文組み立て・tokenize 複製・fail-closed 判定等）は
+// `engine::hybrid::sparse_refetch_observed`（非既定 feature `bench-internals`
+// 限定・`crates/engine/src/hybrid.rs` 参照）に依存しない時間非依存の複製
+// ロジックであり、既定 feature の `cargo test -p engine` でも検証すべき対象
+// のため、モジュール自体は無条件でコンパイルする。`sparse_refetch_observed`
+// に依存する関数（`sparse_refetch_schedule`）のみモジュール内で個別に
+// `#[cfg(feature = "bench-internals")]` を付ける。
 pub mod hybrid_profile;
 pub mod ingest_profile;
 pub mod knn_profile;

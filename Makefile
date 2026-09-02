@@ -310,9 +310,9 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid-profile
-bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
 ifdef HAS_CARGO
-	cargo bench --bench hybrid_profile_bench -p engine
+	cargo bench --bench hybrid_profile_bench -p engine --features bench-internals
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
 endif

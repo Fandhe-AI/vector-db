@@ -90,6 +90,13 @@ contrast-bench = ["dep:usearch"]
 # （テナント境界・RLS 迂回 API は露出しない）。
 cross-encoder = ["dep:ort", "dep:tokenizers"]
 
+# Issue #387 PR #416 codex-review P2 指摘対応: `hybrid.rs::sparse_refetch_observed`
+# （疎側再取得ループの実発火 `fetch_k` 列を観測するベンチ・診断専用フック）を
+# 既定の公開 API から外すための feature。依存は追加しない（`[]`）。
+# `contrast-bench`/`cross-encoder` と同パターンで、既定ビルド・`wire-server` には
+# 一切結線せずテナント境界・RLS 迂回 API も露出しない。
+bench-internals = []
+
 [dev-dependencies]
 # codex P0-2 指摘（Issue #137）対応: 以前は `test-support` feature ＋ self
 # dev-dependency で `EngineCore::storage`/`from_storage`（テナント境界の単一照合パス
@@ -239,9 +246,20 @@ test = false
 # `make bench-hybrid-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
 # harness/hybrid_profile.rs にあり tests/hybrid_profile_accept.rs で make ci 側から
 # 回帰検証する。
+# Issue #387: SparseIndex::search_within の段別（可視 subset 構築／df 再計算パス／
+# スコアリングパス）実測・疎側再取得ループの発火回数計測を追加。production の
+# 疎側再取得ループ本体〔hybrid.rs::sparse_refetch_loop〕を共有内部関数へ抽出し、
+# 診断用の公開フック engine::hybrid::sparse_refetch_observed を追加した（通常経路
+# の挙動・分岐・定数は不変）。ベンチはこのフックを直接呼び、production から実観測
+# した fetch_k 列を使う（予測の複製ではない）。
+# Issue #387 PR #416 codex-review P2 指摘対応: `sparse_refetch_observed` を
+# 非既定 feature `bench-internals` へ限定したため、本ベンチも
+# `required-features` で同 feature を要求する（`contrast_bench` と同パターン）。
+# `make lint`/`make test` は `--all-features` のため通常の CI 経路は変わらない。
 name = "hybrid_profile_bench"
 harness = false
 test = false
+required-features = ["bench-internals"]
 
 [[bench]]
 # Issue #365（前提 Issue #362・`docs/design/knn-stage-profile.md`「`dot_lanes` の

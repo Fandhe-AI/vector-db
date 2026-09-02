@@ -17,6 +17,19 @@
 //!    tokenize / term_freq 構築 / doc_freq マージの累積 3 段（複製実装。
 //!    `harness::hybrid_profile` モジュールドキュメント「複製近似の限界」参照）
 //!
+//! Issue #387 は、キャッシュヒット後（Issue #357）になお残る `search_within`
+//! 単体コストと疎側再取得ループの寄与を切り分けるため、以下を追加する:
+//!
+//! 5. `hybrid_search_cached_index`: 事前構築済み `SparseIndex`（キャッシュヒット
+//!    相当）を使った `hybrid::hybrid_search` の直接呼び出し。密・疎双方の再取得
+//!    発火回数（`sparse_refetch`／`provider_calls_max`）を併記する
+//! 6. `search_within_fetch_k=<k>`: `SparseIndex::search_within` 単体を、疎側再取得
+//!    スケジュール上で実際に呼ばれる `fetch_k` ごとに実測する
+//! 7. `search_within_subset_only` / `search_within_subset_df` /
+//!    `search_within_replica_full`: `search_within` 内部の可視 subset 構築／df 再
+//!    計算パス／スコアリングパスの累積 3 区間（複製実装。起動時に実 API の出力と
+//!    数値一致するかを fail-closed 検証してから使う）
+//!
 //! # 実測値の比較可能性についての重要な注意
 //!
 //! `harness::hybrid_profile` モジュールドキュメント参照: Issue #355 が言及する
@@ -44,16 +57,26 @@
 #[allow(dead_code)]
 mod harness;
 
+use std::collections::BTreeSet;
+
 use harness::env_report::EnvReport;
+use harness::hybrid_latency::RefetchTrackingProvider;
 use harness::hybrid_profile::{
-    build_actually_succeeds, collect_body_strings, generate_corpus, generate_queries,
-    refuse_under_github_actions, render_stage_line, sql_dense_statement, sql_hybrid_statement,
-    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq,
+    build_actually_succeeds, collect_body_strings, dense_refetch_schedule, fetch_cap,
+    generate_corpus, generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
+    refuse_under_github_actions, render_dense_refetch_line, render_sparse_refetch_line,
+    render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
+    sparse_refetch_schedule, sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch,
+    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq, ProfileSparseIndex,
+    SQL_DEFAULT_HYBRID_POOL_DEPTH,
 };
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::hybrid::{hybrid_search, RrfConfig};
+use engine::kernel::SearchInput;
+use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::row_codec::{encode_scalar_columns, Value};
 use engine::search_engine;
@@ -324,6 +347,300 @@ fn main() {
          tokenize_term_freq_total_unique_terms={term_freq_check} \
          tokenize_term_doc_freq_vocab_size={term_doc_freq_check}"
     );
+
+    // --- Issue #387: キャッシュヒット後（Issue #357）になお残る search_within ---
+    // --- 単体コスト・疎側再取得ループの寄与 -----------------------------------
+
+    let sparse_index = SparseIndex::build(&doc_refs)
+        .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (Issue #387) failed: {e}")));
+    let replica = ProfileSparseIndex::build(&doc_refs)
+        .unwrap_or_else(|e| fail_closed(format!("ProfileSparseIndex::build failed: {e}")));
+    let visible: BTreeSet<u64> = corpus.ids.iter().copied().collect();
+    let pool_depth = SQL_DEFAULT_HYBRID_POOL_DEPTH;
+    let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth)
+        .unwrap_or_else(|e| fail_closed(format!("RrfConfig::new failed: {e:?}")));
+
+    // 疎側再取得スケジュールの収集（Issue #387 PR #416 codex-review P1 指摘
+    // 対応）: `sparse_refetch_schedule` は production の疎側再取得ループ実装
+    // （`hybrid.rs::sparse_refetch_loop`）をテスト・ベンチ向け公開フック
+    // `engine::hybrid::sparse_refetch_observed` 経由でそのまま呼び出すため、
+    // `schedule.fetch_ks` は予測・複製ではなく実際に発火した `fetch_k` の列
+    // そのものである（`hybrid_search_boosted` が内部で呼ぶのと同一の
+    // `sparse_index`・`query_text`・`visible_ids`・`cfg.pool_depth()` を渡して
+    // 同じ決定的コードパスを実行するため、別途の呼び出し回数突き合わせ・終端
+    // 安定性検証は不要。以前はここで境界同点判定〔`boundary_tie_decision`〕を
+    // ベンチ側で複製・予測しており、複製の追随漏れリスクを終端固定点検証で
+    // 間接的に補っていたが、実観測へ切り替えたことでその補償自体が不要になった）。
+    //
+    // 忠実性検証（fail-closed）: `search_within` 内部の subset/df/score 3 区間
+    // 分解（後段の `search_within_subset_only`/`_subset_df`/`_replica_full`）に
+    // 使う複製 `ProfileSparseIndex` の出力が、上記スケジュール上で実際に呼ばれる
+    // 各 `fetch_k` について実 `SparseIndex::search_within` の出力と数値一致する
+    // ことを起動時に確認する（`harness::hybrid_profile` モジュールドキュメント
+    // 「複製固有の限界」参照）。
+    let mut sparse_schedules = Vec::with_capacity(queries.len());
+    for q in &queries {
+        let schedule = sparse_refetch_schedule(&sparse_index, &q.text, &visible, pool_depth)
+            .unwrap_or_else(|e| fail_closed(format!("sparse_refetch_schedule failed: {e}")));
+        for &fetch_k in &schedule.fetch_ks {
+            replica_matches_real(&sparse_index, &replica, &q.text, fetch_k, &visible)
+                .unwrap_or_else(|e| fail_closed(format!("replica fidelity check failed: {e}")));
+        }
+        sparse_schedules.push(schedule);
+    }
+
+    // 密側の忠実性検証: 複製予測（dense_refetch_schedule）の呼び出し回数と、
+    // 実 hybrid_search 呼び出し時に RefetchTrackingProvider が観測した回数を
+    // 突き合わせる。
+    let provider = RefetchTrackingProvider::new(ParallelSearchProvider);
+    for (idx, q) in queries.iter().enumerate() {
+        let predicted = dense_refetch_schedule(
+            &provider,
+            &corpus.ids,
+            &corpus.vectors,
+            corpus.dim,
+            &q.vector,
+            pool_depth,
+        )
+        .unwrap_or_else(|e| fail_closed(format!("dense_refetch_schedule failed: {e}")));
+        provider.reset();
+        let input = SearchInput {
+            ids: &corpus.ids,
+            vectors: &corpus.vectors,
+            dim: corpus.dim,
+            query: &q.vector,
+            k: TOP_K,
+        };
+        hybrid_search(&provider, input, &sparse_index, &q.text, TOP_K, &cfg)
+            .unwrap_or_else(|e| fail_closed(format!("hybrid_search (fidelity pass) failed: {e}")));
+        refetch_schedule_matches_observed_calls(idx, &predicted, provider.calls())
+            .unwrap_or_else(|e| fail_closed(format!("dense refetch fidelity check failed: {e}")));
+    }
+    println!(
+        "hybrid_profile: fidelity checks passed (sparse_refetch_schedule now calls production's \
+         shared sparse_refetch_loop via engine::hybrid::sparse_refetch_observed, so its \
+         fetch_ks are an actual observation of hybrid_search_boosted's sparse refetch calls, \
+         not a prediction — no separate call-count cross-check is needed for it; replica \
+         search_within matches real API for every fetch_k on that schedule (used by the \
+         subset/df/score breakdown below); dense refetch schedule predictions still match \
+         observed hybrid_search calls via RefetchTrackingProvider)"
+    );
+
+    // --- hybrid_search_cached_index: 事前構築済み SparseIndex（キャッシュヒット
+    // 相当）を使った直接 API 呼び出し。計測区間（timed pass）は素の
+    // `ParallelSearchProvider` を使う（`RefetchTrackingProvider` は呼び出しの
+    // たびに atomic な呼び出し回数・最大 k 更新を行うため、計測区間へ混ぜると
+    // p95/median にその分のオーバーヘッドが混入する。codex-review 指摘・
+    // Issue #387 PR #416）。呼び出し回数・最大 k の統計は別パス（stats pass。
+    // `hybrid_latency_bench.rs::measure_stage` と同じ「計測区間内では統計蓄積を
+    // 行わない」方針）で `RefetchTrackingProvider` を使って集計する。
+    let timed_provider = ParallelSearchProvider;
+    let mut query_idx = 0usize;
+    let hybrid_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        let input = SearchInput {
+            ids: &corpus.ids,
+            vectors: &corpus.vectors,
+            dim: corpus.dim,
+            query: &q.vector,
+            k: TOP_K,
+        };
+        hybrid_search(&timed_provider, input, &sparse_index, &q.text, TOP_K, &cfg)
+            .unwrap_or_else(|e| fail_closed(format!("hybrid_search (timed) failed: {e}")))
+    })
+    .unwrap_or_else(|e| {
+        fail_closed(format!(
+            "hybrid_search_cached_index measurement failed: {e}"
+        ))
+    });
+    let p95 = harness::accept::p95_from_samples(&hybrid_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+
+    let mut dense_stats = Vec::with_capacity(queries.len());
+    for q in &queries {
+        provider.reset();
+        let input = SearchInput {
+            ids: &corpus.ids,
+            vectors: &corpus.vectors,
+            dim: corpus.dim,
+            query: &q.vector,
+            k: TOP_K,
+        };
+        hybrid_search(&provider, input, &sparse_index, &q.text, TOP_K, &cfg)
+            .unwrap_or_else(|e| fail_closed(format!("hybrid_search (stats pass) failed: {e}")));
+        dense_stats.push(harness::hybrid_latency::aggregate_refetch_stats(
+            provider.calls(),
+            provider.max_k_seen(),
+            corpus.ids.len(),
+        ));
+    }
+    let dense_summary = harness::hybrid_latency::summarize_refetch_stats(&dense_stats);
+    println!(
+        "{}",
+        render_dense_refetch_line(
+            "hybrid_search_cached_index",
+            hybrid_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            &dense_summary,
+        )
+    );
+
+    // --- 疎側再取得スケジュールの出力 ---
+    for (idx, schedule) in sparse_schedules.iter().enumerate() {
+        println!("{}", render_sparse_refetch_line(idx, schedule));
+    }
+    let sparse_summary = summarize_sparse_refetch(&sparse_schedules);
+
+    // --- search_within_fetch_k=<k>: 疎側再取得スケジュール上で実際に呼ばれる
+    // 各 fetch_k について、実 search_within 単体を round-robin クエリで実測する。
+    let mut union_fetch_ks: Vec<usize> = sparse_schedules
+        .iter()
+        .flat_map(|s| s.fetch_ks.iter().copied())
+        .collect();
+    union_fetch_ks.sort_unstable();
+    union_fetch_ks.dedup();
+
+    let mut median_by_fetch_k: std::collections::BTreeMap<usize, u128> =
+        std::collections::BTreeMap::new();
+    for &fetch_k in &union_fetch_ks {
+        let mut query_idx = 0usize;
+        let measurement = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            sparse_index
+                .search_within(&q.text, fetch_k, &visible)
+                .unwrap_or_else(|e| {
+                    fail_closed(format!("search_within(fetch_k={fetch_k}) failed: {e}"))
+                })
+        })
+        .unwrap_or_else(|e| {
+            fail_closed(format!(
+                "search_within_fetch_k={fetch_k} measurement failed: {e}"
+            ))
+        });
+        let p95 = harness::accept::p95_from_samples(&measurement.samples)
+            .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+        let check = sparse_index
+            .search_within(&queries[0].text, fetch_k, &visible)
+            .map(|hits| hits.len())
+            .unwrap_or(0);
+        median_by_fetch_k.insert(fetch_k, measurement.summary.median.as_micros());
+        println!(
+            "{}",
+            render_stage_line(
+                &format!("search_within_fetch_k={fetch_k}"),
+                measurement.summary.median.as_micros(),
+                p95.as_micros(),
+                check,
+            )
+        );
+    }
+
+    // 推定累積時間（codex-review P1 指摘対応。PR #416）: `median_by_fetch_k[k]`
+    // は各 fetch_k を全クエリで round-robin 測定した**全クエリ混合集団**の実測
+    // 中央値であり、特定クエリの実測値ではない。以下はその混合集団中央値を、
+    // 最も再取得回数が多いクエリの実スケジュールに沿って合算した**推定値**
+    // （クエリ別の真の累積コストの実測ではない。以前は「最悪ケース」＝
+    // クエリ別実測であるかのように扱っていたが、実体は全クエリ混合中央値に
+    // よる推定である。詳細は `render_sparse_refetch_summary_line` ドキュメント
+    // 参照）。
+    let estimated_worst_cumulative_mixed_median_us: u128 = sparse_schedules
+        .iter()
+        .map(|s| {
+            s.fetch_ks
+                .iter()
+                .map(|k| median_by_fetch_k.get(k).copied().unwrap_or(0))
+                .sum::<u128>()
+        })
+        .max()
+        .unwrap_or(0);
+    println!(
+        "{}",
+        render_sparse_refetch_summary_line(
+            &sparse_summary,
+            estimated_worst_cumulative_mixed_median_us
+        )
+    );
+
+    // --- search_within 内部 3 区間（複製実装）---
+    // codex-review P2 指摘対応（PR #416）: `subset_only`／`subset_df` は
+    // `fetch_k` を受け取らず、可視集合サイズのみに依存するため k に対して
+    // 不変である。以前は initial_k/final_k の k ループ内で再測定しラベルに
+    // `k=<k>` を付けていたため、反復測定の揺らぎを fetch_k による差である
+    // かのように誤読させていた。ここでは k ループの外で 1 回だけ測定し、
+    // ラベルからも `k=` を外して k 非依存であることを明示する。k が実際に
+    // 効く `search_within_replica_full` のみ initial_k/final_k の 2 点で
+    // 計測するループに残す。
+    let mut query_idx = 0usize;
+    let subset_only_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        replica.subset_only(&q.text, &visible)
+    })
+    .unwrap_or_else(|e| fail_closed(format!("search_within_subset_only measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&subset_only_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    println!(
+        "{}",
+        render_stage_line(
+            "search_within_subset_only (k-independent)",
+            subset_only_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            visible.len(),
+        )
+    );
+
+    let mut query_idx = 0usize;
+    let subset_df_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        replica.subset_df(&q.text, &visible)
+    })
+    .unwrap_or_else(|e| fail_closed(format!("search_within_subset_df measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&subset_df_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    println!(
+        "{}",
+        render_stage_line(
+            "search_within_subset_df (k-independent)",
+            subset_df_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            visible.len(),
+        )
+    );
+
+    let cap = fetch_cap(visible.len());
+    let initial_k = initial_fetch_k(pool_depth, cap);
+    let final_k = union_fetch_ks.last().copied().unwrap_or(initial_k);
+    for &fetch_k in &[initial_k, final_k] {
+        let mut query_idx = 0usize;
+        let (replica_full_measurement, _retained) = run_bounded_retain(&config, 0, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            replica.search_within_replica(&q.text, fetch_k, &visible)
+        })
+        .unwrap_or_else(|e| {
+            fail_closed(format!(
+                "search_within_replica_full measurement failed: {e}"
+            ))
+        });
+        let p95 = harness::accept::p95_from_samples(&replica_full_measurement.samples)
+            .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+        let check = replica
+            .search_within_replica(&queries[0].text, fetch_k, &visible)
+            .len();
+        println!(
+            "{}",
+            render_stage_line(
+                &format!("search_within_replica_full k={fetch_k}"),
+                replica_full_measurement.summary.median.as_micros(),
+                p95.as_micros(),
+                check,
+            )
+        );
+    }
+
     println!(
         "hybrid_profile: done (see docs/design/hybrid-rrf-latency-breakdown.md for the \
          attribution table transcribed from this run's output)"
