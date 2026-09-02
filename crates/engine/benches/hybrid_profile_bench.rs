@@ -69,13 +69,12 @@ use std::collections::BTreeSet;
 use harness::env_report::EnvReport;
 use harness::hybrid_latency::RefetchTrackingProvider;
 use harness::hybrid_profile::{
-    build_actually_succeeds, collect_body_strings, dense_refetch_schedule, fetch_cap,
-    generate_corpus, generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
-    refuse_under_github_actions, render_dense_refetch_line, render_sparse_refetch_line,
-    render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
-    sparse_refetch_schedule, sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch,
-    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq, ProfileSparseIndex,
-    SQL_DEFAULT_HYBRID_POOL_DEPTH,
+    collect_body_strings, dense_refetch_schedule, fetch_cap, generate_corpus, generate_queries,
+    initial_fetch_k, refetch_schedule_matches_observed_calls, refuse_under_github_actions,
+    render_dense_refetch_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
+    render_stage_line, replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
+    sql_hybrid_statement, summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq,
+    tokenize_term_freq, ProfileSparseIndex, SQL_DEFAULT_HYBRID_POOL_DEPTH,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
@@ -136,36 +135,34 @@ fn main() {
         .unwrap_or_else(|e| fail_closed(format!("corpus generation failed: {e}")));
     let queries = generate_queries(SEED, NUM_QUERIES, DIM);
 
-    // 複製実装（tokenize/term_freq/doc_freq の累積 3 段）の構造的整合性チェック
-    // （`harness::hybrid_profile::build_actually_succeeds` ドキュメント参照。
-    // 複製実装に転記ミスがあり `SparseIndex::build` 自体が失敗する入力を
-    // 生成してしまっている場合、ここで即座に検知して打ち切る）。
-    if !build_actually_succeeds(&corpus) {
-        fail_closed(
-            "SparseIndex::build failed for the generated corpus (replication integrity check)",
-        );
-    }
-
     let doc_refs = corpus.sparse_docs();
 
     // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
-    // プロセス内で `core.execute_sql` を一度も呼んでいない、つまり
-    // `sql/sparse_cache.rs::SparseIndexCache`（Issue #357）経由で
-    // `SparseIndex` が構築される機会がまだ一切無い時点で 1 回だけ計測する
-    // （codex-review 指摘・PR #424: 下流の `sql_hybrid_measurement` は
-    // `core.execute_sql` の hybrid_rrf 経路を反復実行しており、疎索引キャッシュ
-    // により初回呼び出し時点で既に `SparseIndex::build` が実行済みになる。
-    // その後で計測すると「未ウォーム状態からの増分」という前提が崩れ、
-    // アロケータが直前の確保分のページを再利用して増分を過小評価しうる。
-    // そのため本計測は SQL 実行（テーブル作成・投入・COUNT(*)・hybrid/dense
+    // プロセス内でこれが最初かつ唯一の `SparseIndex::build` 呼び出しになるよう、
+    // 複製実装（tokenize/term_freq/doc_freq の累積 3 段）の構造的整合性チェック
+    // （`harness::hybrid_profile::build_actually_succeeds` ドキュメント参照）を
+    // この 1 回の構築で兼務させる（codex-review 指摘・Cursor Bugbot 指摘・PR #424:
+    // 整合性チェック用に別途 `SparseIndex::build` を呼んで破棄すると、その確保・
+    // 解放でアロケータ／ページがウォームになり、続く RSS 計測が「未ウォーム状態
+    // からの増分」にならず過小評価しうる。整合性チェックの目的〔複製実装の転記
+    // ミス検出〕は「同一入力で `SparseIndex::build` 自体が成功するか」の確認に
+    // 尽きるため、ここで構築したインデックスの `is_ok()` をそのままその判定に
+    // 使い、計測対象としても保持し続ければ二重構築を避けられる）。また
+    // `core.execute_sql` も未呼び出し、つまり `sql/sparse_cache.rs::
+    // SparseIndexCache`（Issue #357）経由の構築機会もまだ無い時点で計測する
+    // （そのため本計測は SQL 実行（テーブル作成・投入・COUNT(*)・hybrid/dense
     // いずれのクエリも含む）より前、コーパス生成直後に置く）。
     // `SparseIndex` を保持したまま前後の VmRSS を比較する（保持しなければ
     // drop されて増分を観測できない）。`approx_heap_bytes()` はテスト・
     // ベンチ以外の一般利用側（`sql/sparse_cache.rs`）が実際に参照する
     // 概算値であり、RSS 実測と並記することで概算の妥当性を突き合わせられる。
     let vm_rss_kb_before = harness::proc_stats::read_vm_rss_kb();
-    let resident_index = SparseIndex::build(&doc_refs)
-        .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (memory) failed: {e}")));
+    let resident_index = SparseIndex::build(&doc_refs).unwrap_or_else(|e| {
+        fail_closed(format!(
+            "SparseIndex::build failed for the generated corpus \
+             (replication integrity check via memory-measurement build): {e}"
+        ))
+    });
     let approx_heap_bytes = resident_index.approx_heap_bytes();
     let vm_rss_kb_after = harness::proc_stats::read_vm_rss_kb();
     let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();

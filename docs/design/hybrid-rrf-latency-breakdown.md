@@ -520,19 +520,22 @@ implementation` 等の既存参照実装比較テストが green のまま）。
 | 指標（新規計測。Issue #389） | 実測値 |
 | ---- | -----: |
 | `approx_heap_bytes()`（`SparseIndex` 保持時） | 19,553,564 バイト（約 18.65 MiB） |
-| `vm_rss_kb_before` → `vm_rss_kb_after`（`SparseIndex::build` 1 回分の直前直後） | 39,992 kB → 44,400 kB（差分 4,408 kB。約 4.31 MiB） |
-| `vm_hwm_kb`（測定時点までのピーク RSS） | 44,400 kB |
+| `vm_rss_kb_before` → `vm_rss_kb_after`（`SparseIndex::build` 1 回分の直前直後） | 23,416 kB → 43,928 kB（差分 20,512 kB。約 20.03 MiB） |
+| `vm_hwm_kb`（測定時点までのピーク RSS） | 43,928 kB |
 
-RSS 計測は、プロセス内で `core.execute_sql` を一度も呼んでいない時点
-（コーパス生成直後・テーブル作成／投入／`COUNT(*)`／`sql_hybrid`／
-`sql_dense_knn` いずれの SQL 実行よりも前）へ位置づけている
-（codex-review 指摘・PR #424。下流の `sql_hybrid_measurement` は
-`core.execute_sql` の hybrid_rrf 経路を反復実行しており、疎索引キャッシュ
-〔`sql/sparse_cache.rs::SparseIndexCache`。Issue #357〕により初回呼び出し
-時点で既に `SparseIndex::build` が実行済みになる。RSS 計測をその後段に
-置くと「未ウォーム状態からの増分」という前提が崩れ、アロケータが直前の
-確保分のページを再利用して増分を過小評価しうるため、本計測はあらゆる
-SQL 実行より前に置く）。
+RSS 計測は、プロセス内でこの 1 回が最初かつ唯一の `SparseIndex::build`
+呼び出しになる位置へ置いている（codex-review 指摘・Cursor Bugbot 指摘・
+PR #424。当初は複製実装の構造的整合性チェック〔`build_actually_
+succeeds`〕を別途 `SparseIndex::build` して破棄する形で RSS 計測の直前に
+残しており、その確保・解放でアロケータ／ページがウォームになって、
+続く RSS 計測が「未ウォーム状態からの増分」にならず過小評価していた
+（後述の旧実測値）。整合性チェックの目的〔複製実装の転記ミスで build
+自体が失敗する入力を検出する〕は「同一入力で `SparseIndex::build` が
+成功するか」の確認に尽きるため、RSS 計測用に構築するインデックスの
+`is_ok()` をそのままその判定に使う形へ統合し、二重構築を無くした。
+これにより `core.execute_sql` 未呼び出し〔`sql/sparse_cache.rs::
+SparseIndexCache`（Issue #357）経由の構築機会も無い〕に加えて、コーパス
+生成後の `SparseIndex::build` としても最初の 1 回になっている）。
 
 ### 解釈
 
@@ -541,17 +544,18 @@ SQL 実行より前に置く）。
   圧縮済み `term_freq` を 1 回追加走査するだけの線形処理）が build 全体の
   所要時間へ与える影響は、本測定の分解能では有意な劣化として観測されな
   かった
-- RSS 差分は 4,408 kB（約 4.31 MiB）であり、`approx_heap_bytes()`
-  （約 18.65 MiB）を大きく下回る。これは RSS 計測がプロセス起動後最初の
-  `SparseIndex::build` 呼び出し（本計測自体）であっても、直前の
-  コーパス生成（`generate_corpus`。25,000 件の本文・ベクトル生成）や
-  一時 DB オープン等で既にアロケータがヒープ領域を確保・ページイン済み
-  であり、`SparseIndex::build` 内部の確保がその既存領域の再利用で賄える
-  部分と新規ページイン分とに分かれるためと考えられる（`approx_heap_bytes()`
-  は DoS 対策用の粗い概算で実確保量を下回らない側に倒す設計であり
-  〔`approx_heap_bytes` のドキュメンテーションコメント参照〕、RSS 増分は
-  「その時点でのプロセス全体に対する新規ページイン量」であって両者は
-  異なる量を指す）。真に隔離された増分（他の処理を一切行わない、
+- RSS 差分は 20,512 kB（約 20.03 MiB）であり、`approx_heap_bytes()`
+  （約 18.65 MiB）と近い水準まで一致した。修正前は事前ウォームアップの
+  影響で RSS 差分が 4,408 kB（約 4.31 MiB）と大きく過小評価されていたが
+  （上記「RSS 計測」節参照）、二重構築を解消したことで
+  `approx_heap_bytes()` の概算（実確保量を下回らない側に倒す設計。
+  `approx_heap_bytes` のドキュメンテーションコメント参照）との差が
+  実装の付随確保分（`HashMap`／`Vec` の予約容量の余剰等）相当の範囲に
+  収まった。なお RSS 増分は「その時点でのプロセス全体に対する新規
+  ページイン量」であり `approx_heap_bytes()` とは厳密には異なる量を
+  指すため、コーパス生成（`generate_corpus`。25,000 件の本文・ベクトル
+  生成）や一時 DB オープン等の先行処理が確保したページの再利用分が
+  含まれていない保証はない。真に隔離された増分（他の処理を一切行わない、
   プロセス起動直後の 1 回の `SparseIndex::build` 前後の RSS 差分）を
   見たい場合は、この計測点のみを単独プロセスで実行する運用
   （`BENCH_CORE16_DIAG` 系の「1 プロセス = 1 規模点」運用と同様の方針）が
