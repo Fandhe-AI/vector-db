@@ -13,15 +13,15 @@
 //! コンパイル時は `#[test]` 項目が丸ごと除去されるため `use super::*;` が
 //! unused import になる）。
 //!
-//! Issue #387 PR #416 codex-review P2 指摘対応: `harness::hybrid_profile` は
-//! `engine::hybrid::sparse_refetch_observed`（非既定 feature `bench-internals`
-//! 限定）を無条件 import するモジュールへ変わったため、本テストファイル全体を
-//! `cross-encoder` feature 限定の `tests/rerank_cross_encoder_recall.rs` と同じ
-//! `#![cfg(feature = "...")]` パターンで同 feature の背後に置く。通常の
-//! `cargo test -p engine`（feature 無指定）では本ファイルは空になり実行対象から
-//! 外れる（`make lint`/`make test` は `--all-features` のため CI 経路は従来どおり）。
-
-#![cfg(feature = "bench-internals")]
+//! Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `harness::hybrid_profile`
+//! モジュール自体は既定 feature でもコンパイルされる（`benches/harness/mod.rs`
+//! 参照）。`engine::hybrid::sparse_refetch_observed`（非既定 feature
+//! `bench-internals` 限定）に依存する [`sparse_refetch_schedule`] とその import・
+//! 依存テストのみを同 feature の背後に個別に置き、コーパス生成・SQL 文組み立て・
+//! tokenize 複製・`refuse_under_github_actions` 等の時間非依存テストは
+//! `cargo test -p engine`（feature 無指定）でも実行される（1 巡目の対応では
+//! ファイル全体を `#![cfg(...)]` で覆っていたため、これらの既存テストまで既定
+//! feature で 0 件になっていた）。
 
 #[allow(dead_code)]
 #[path = "../benches/harness/mod.rs"]
@@ -34,11 +34,15 @@ use harness::hybrid_profile::{
     fetch_cap, generate_corpus, generate_queries, initial_fetch_k, is_exhaustive, next_fetch_k,
     refetch_schedule_matches_observed_calls, refuse_under_github_actions,
     render_dense_refetch_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
-    render_stage_line, replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
-    sql_hybrid_statement, summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq,
-    tokenize_term_freq, ProfileError, ProfileSparseIndex, RefetchSchedule, TieDecision,
-    MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
+    render_stage_line, replica_matches_real, sql_dense_statement, sql_hybrid_statement,
+    summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq, tokenize_term_freq,
+    ProfileError, ProfileSparseIndex, RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD,
+    MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
 };
+// `sparse_refetch_schedule` は `sparse_refetch_observed`（非既定 feature
+// `bench-internals` 限定）に依存するため import も同 feature 限定にする。
+#[cfg(feature = "bench-internals")]
+use harness::hybrid_profile::sparse_refetch_schedule;
 
 use harness::hybrid_latency::RefetchTrackingProvider;
 
@@ -405,7 +409,11 @@ fn fetch_k_schedule_helpers_behave_as_expected() {
 }
 
 // --- sparse_refetch_schedule / dense_refetch_schedule ---------------------------
+//
+// `sparse_refetch_schedule` は `sparse_refetch_observed`（非既定 feature
+// `bench-internals` 限定）経由のため、以下 2 件のみ同 feature 限定。
 
+#[cfg(feature = "bench-internals")]
 #[test]
 fn sparse_refetch_schedule_stops_at_first_resolved_for_non_tied_corpus() {
     // 文書ごとに固有の語彙を割り当て、同点が実質発生しないコーパスでは
@@ -421,6 +429,7 @@ fn sparse_refetch_schedule_stops_at_first_resolved_for_non_tied_corpus() {
     assert_eq!(schedule.fetch_ks.len(), 1);
 }
 
+#[cfg(feature = "bench-internals")]
 #[test]
 fn sparse_refetch_schedule_reaches_cap_on_all_tied_corpus() {
     // 全文書が同一語彙・同一文書長を持つ同点誘発コーパス。可視集合 64 件・

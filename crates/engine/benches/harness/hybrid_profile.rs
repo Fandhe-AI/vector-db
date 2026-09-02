@@ -50,6 +50,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Write as _;
 
+// Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `sparse_refetch_observed`
+// は非既定 feature `bench-internals` 限定公開（`hybrid.rs` 参照）のため、
+// これに依存する関数（`sparse_refetch_schedule`）だけを同 feature の背後に置き、
+// `RrfConfig`（同関数内でのみ使う）の import もそこに限定する。モジュール本体は
+// 既定 feature でもコンパイルする（`mod.rs` の `pub mod hybrid_profile;` コメント
+// 参照）。
+#[cfg(feature = "bench-internals")]
 use engine::hybrid::{sparse_refetch_observed, RrfConfig};
 use engine::kernel::{SearchInput, SearchProvider};
 use engine::sparse::{tokenize, DocId, ScoredDoc, SparseIndex};
@@ -848,6 +855,11 @@ pub struct RefetchSchedule {
 /// ため、本関数はそれをそのまま [`RefetchSchedule`] へ写すだけであり、判定ロジック
 /// の予測・複製は行わない（[`boundary_tie_decision`]・[`TieDecision`] は密側
 /// [`dense_refetch_schedule`] の忠実性検証でのみ引き続き使う）。
+///
+/// [`sparse_refetch_observed`] が非既定 feature `bench-internals` 限定公開
+/// のため、本関数も同 feature の背後に置く（Issue #387 PR #416 codex-review
+/// P2 指摘対応・2 巡目）。
+#[cfg(feature = "bench-internals")]
 pub fn sparse_refetch_schedule(
     index: &SparseIndex,
     query: &str,

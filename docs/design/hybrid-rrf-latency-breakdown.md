@@ -182,11 +182,15 @@ make bench-hybrid-profile
 （`harness::hybrid_profile::refuse_under_github_actions`）。判定ロジック自体
 （時間非依存）は `crates/engine/tests/hybrid_profile_accept.rs` で `make ci`
 側から回帰検証する。`engine::hybrid::sparse_refetch_observed`（ベンチ・診断専用
-公開フック）は非既定 feature `bench-internals` の背後にあるため、
-`tests/hybrid_profile_accept.rs` は同 feature 無指定の通常の `cargo test -p
-engine` ではファイル全体が `#![cfg(feature = "bench-internals")]` により空になり
-0 tests として実行される（`make lint`/`make test` は `--all-features` のため
-CI 経路は従来どおり 44 件検証される。Issue #387 PR #416 codex-review P2 指摘対応）。
+公開フック）は非既定 feature `bench-internals` の背後にあるため、これに依存する
+関数（`harness::hybrid_profile::sparse_refetch_schedule`）とその import・依存
+テスト 2 件（`sparse_refetch_schedule_*`）のみ同 feature の背後に置く。コーパス
+生成・SQL 文組み立て・tokenize 複製・`refuse_under_github_actions` 等、大半の
+時間非依存テストは feature 無指定の通常の `cargo test -p engine` でも実行され
+（42 件）、`bench-internals` を含む `--all-features` では上記 2 件を加えた 44 件が
+検証される（Issue #387 PR #416 codex-review P2 指摘対応・2 巡目。1 巡目の対応では
+ファイル全体を `#![cfg(feature = "bench-internals")]` で覆っており、依存しない
+既存テストまで既定 feature で 0 件になっていた）。
 
 ## 申し送り
 
