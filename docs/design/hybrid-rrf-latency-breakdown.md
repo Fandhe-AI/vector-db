@@ -699,16 +699,23 @@ spec 側が SSOT。本節も spec 由来の pass/fail 閾値を持たない情�
 
 `crates/engine/src/sparse.rs::score_by_postings` のホットパスを 2 点変更した。
 
-1. **文書長正規化項のテーブル化**: BM25 の `k1 * len_norm`（`len_norm =
+1. **文書長正規化項のキャッシュ化**: BM25 の `k1 * len_norm`（`len_norm =
    1-b+b*doc_len/avgdl`）はクエリ内で `avgdl` が確定した後は文書長のみに
    依存するため、ヒットごとに再計算する代わりに、build 時に構築した文書長
    クラス表（`len_classes: Vec<u32>`。コーパス中の相異なる文書長を昇順・
    重複なしに並べたもの・`doc_len_class: Vec<u32>`。`doc_idx` → クラス添字）
-   をもとに、クエリ時（`avgdl` 確定直後）に 1 回だけ `k1_len_norm: Vec<f64>`
-   （クラス数分）を構築し、ヒットループでは配列参照のみを行う。tantivy の
-   fieldnorm 量子化に相当する着想だが、段数を「相異なる文書長の個数」まで
-   上げた厳密写像であり、ロッシー量子化はしない（式・演算順は旧来のインライン
-   計算と完全に同一のため `denominator` は旧実装とビット一致する）
+   をもとに、当初はクエリ時（`avgdl` 確定直後）に `len_classes` 全体を
+   走査して `k1_len_norm: Vec<f64>`（クラス数分）を一括構築する設計を
+   採ったが、これは実際にヒットする文書長クラス数（<= ヒット数 `M`）に
+   関わらず常に `len_classes.len()`（コーパス中の相異なる文書長数。最悪
+   `O(N)`）分の計算を行ってしまい、選択性の高いクエリで `search`/
+   `search_within` の走査量に比例する計算量契約から外れるという指摘
+   （PR #426 codex-review）を受け、ヒットループ内で実際にタッチした
+   クラスのみを `k1_len_norm_cache: HashMap<u32, f64>` へ遅延計算・
+   キャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]` は旧実装の
+   `self.k1 * len_norm` と同一算出）は不変のため `denominator` は旧実装と
+   引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class`
+   → 一意な `f64`）ためスコア自体の決定性には影響しない
 2. **Top-k 選出の select_nth 型化**: `BinaryHeap<Reverse<Candidate>>` への
    逐次 `O(log k)` 挿入を、tantivy の `TopNComputer` を参考にした
    `TopKSelector`（2k 件バッファ＋`select_nth_unstable_by` による一括切り詰め
