@@ -36,11 +36,13 @@
 //! `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・`doc_freq`・
 //! `doc_len` の統計を汚染しうる。
 //!
-//! [`SparseIndex::search`] は文書集合への線形走査で実装するが、走査中に各文書について
-//! クエリの一意語集合（最大 `Q` 語）を `BTreeMap` で検索するため、時間計算量は
-//! 文書数のみに比例するのではなく `O(N * Q * log V + M log k)`（`N`: コーパス文書数、
-//! `Q`: クエリの一意語数、`V`: コーパス全体の語彙数、`M`: スコア `> 0` の一致文書数）
-//! である。長いクエリは `N * Q` の積として CPU コストを増幅するため、一意語数の上限を
+//! [`SparseIndex::search`] は文書集合への線形走査で実装するが、クエリ語の辞書
+//! （[`TermId`]）lookup は走査に入る前に一度だけ `O(Q)` で済ませ（Issue #388・term
+//! インターニング）、走査中は各文書について `TermId` へ写像済みのクエリ語集合
+//! （最大 `Q` 語）を各文書の `term_freq`（`TermId` 昇順ソート済み）へ二分探索する
+//! ため、時間計算量は文書数のみに比例するのではなく `O(Q + N * Q * log T_d + M log k)`
+//! （`N`: コーパス文書数、`Q`: クエリの一意語数、`T_d`: 各文書の一意語数、`M`: スコア
+//! `> 0` の一致文書数）である。長いクエリは `N * Q` の積として CPU コストを増幅するため、一意語数の上限を
 //! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。ただし
 //! `tokenize()` 自体はクエリのバイト長に比例したコストを持つため、一意語数の少ない
 //! 繰り返し入力（同じ語や区切り文字の反復）はこの検証だけでは防げない。そのため
@@ -78,6 +80,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
 pub type DocId = u64;
@@ -187,14 +190,83 @@ const _: () = assert!(MAX_CORPUS_BYTES.is_multiple_of(MAX_DOC_BYTES));
 /// [`MAX_CORPUS_BYTES`] は入力テキストのバイト数のみを制限し、`tokenize()` が
 /// 生成するトークン数を直接制限しない。CJK 文字はユニグラム＋バイグラムを生成する
 /// ため 1 文字（3 バイト）あたり最大 2 トークンとなり、64 MiB の CJK 主体の入力から
-/// 数千万規模のトークンが生じうる。各トークンは `term_freq`・`doc_freq` の双方の
-/// `BTreeMap` キーとして個別にヒープ確保される（`String` の見出し用ヒープ確保
-/// ×2／トークン、加えて `BTreeMap` ノードのオーバーヘッド）ため、トークン 1 件
-/// あたり数百バイト程度の実効メモリを要すると見積もる。800 万トークンはこの見積もり
-/// でも実行時メモリを概ね 1 GiB 程度の現実的な範囲に収めつつ、典型的な（CJK 一辺倒
-/// ではない）コーパスであれば [`MAX_CORPUS_BYTES`] に近いサイズでも許容できる規模の
-/// 上限とする。
+/// 数千万規模のトークンが生じうる。トークンは term 辞書（[`TermDictionary`]。
+/// Issue #388・term インターニング）へ intern され、新出語のみが辞書内に `String` を
+/// 1 回だけヒープ確保する（既知語は `TermId`〔`u32`〕のコピーのみで追加確保なし）。
+/// 各文書側は `(TermId, u32)` の 8 バイトタプルとして `Vec` に保持するため、旧来の
+/// `String` キー木構造（1 トークンごとに `String` の見出し用ヒープ確保が発生する
+/// 構造）よりも実効メモリは小さくなる方向だが、新出語彙数の多い入力（CJK 一辺倒の
+/// 入力等）では辞書側の `String` 確保が支配的になりうる。800 万トークンはこの見積もり
+/// でも実行時メモリを現実的な範囲に収めつつ、典型的な（CJK 一辺倒ではない）コーパス
+/// であれば [`MAX_CORPUS_BYTES`] に近いサイズでも許容できる規模の上限とする。
 const MAX_CORPUS_TOKENS: usize = 8_000_000;
+
+// [`TermId`] は build 時に確定する語彙内の term を `u32` で表す（Issue #388・
+// term インターニング）。語彙数はコーパス全体のトークン数（[`MAX_CORPUS_TOKENS`]
+// で上限検証済み）を超えないため、`u32` の表現域に収まることをコンパイル時に固定する
+// （実行時のオーバーフローチェックはこの不変条件の防御線として [`TermDictionary::
+// intern`] にも残す）。
+const _: () = assert!(MAX_CORPUS_TOKENS <= u32::MAX as usize);
+
+/// build 時に確定する語彙内の term 識別子（Issue #388・term インターニング。
+/// 対象ビヘイビア: SEARCH-1, SEARCH-3）。0 始まりで [`TermDictionary::intern`] の
+/// 初出順に採番する。文書側・コーパス側の統計を `String` キーの木構造ではなく
+/// この `u32` キーで持つことで、ホットパス（[`SparseIndex::with_params`]・
+/// [`SparseIndex::search`]・[`SparseIndex::search_within`]）の文字列比較・
+/// `String::clone` を排除する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct TermId(u32);
+
+/// `String` → [`TermId`] の辞書（Issue #388）。[`SparseIndex::with_params`] が
+/// コーパス構築中に term を intern し、[`SparseIndex::search`]／
+/// [`SparseIndex::search_within`] がクエリ語を `TermId` へ写像する lookup に使う。
+///
+/// `HashMap`（標準既定の `RandomState`／SipHash-1-3）を用いる。イテレーション順は
+/// 不定であり、[`SparseIndex::approx_heap_bytes`] は容量見積りのため本辞書の
+/// キーを走査する。ただしその走査は整数和（バイト数の合計）にのみ用いるため
+/// 順序に依存せず、出力の決定性（スコアのビット一致・タイブレーク）には影響しない
+/// （語彙順に依存する走査は `search`/`search_within` のクエリ側処理が
+/// クエリ語の `String` 辞書順で行う。[`SparseIndex::search`] を参照）。
+#[derive(Debug, Default)]
+struct TermDictionary {
+    ids: HashMap<String, TermId>,
+}
+
+impl TermDictionary {
+    /// `term` を intern し [`TermId`] を返す。既知の語は追加確保なしで既存 ID を返し
+    /// （`String::clone` を発生させない）、未知語は `term`（所有権ごと）を辞書へ
+    /// move して新しい ID を採番する。
+    ///
+    /// 新規語彙数が `u32` の表現域を超える場合は fail-closed に `Err` を返す
+    /// （`.claude/rules/coding-rust.md`: 整数演算は checked に倒す）。語彙数は
+    /// コーパスの総トークン数を超えないため [`MAX_CORPUS_TOKENS`] の検証により
+    /// 実質到達しないが、この不変条件が将来崩れても ID の衝突・サイレントな
+    /// 統計汚染を起こさないための防御線として明示的に検証する。
+    fn intern(&mut self, term: String) -> Result<TermId, SparseError> {
+        if let Some(&id) = self.ids.get(term.as_str()) {
+            return Ok(id);
+        }
+        let next = u32::try_from(self.ids.len()).map_err(|_| SparseError::TooManyTokens {
+            total: self.ids.len(),
+            // この分岐が到達するのは語彙数が `u32::MAX` に達した場合であり、
+            // 呼び出し元（`with_params`）の `MAX_CORPUS_TOKENS` 検証により
+            // 実質到達不能な防御的分岐（コメント参照）。`max` に `MAX_CORPUS_TOKENS`
+            // を報告すると `total`（~4.29e9）が `max`（8,000,000）を超える
+            // 自己矛盾したエラーペイロードになるため、この分岐の実際の境界値
+            // （`u32` の表現域）を報告する。
+            max: u32::MAX as usize,
+        })?;
+        let id = TermId(next);
+        self.ids.insert(term, id);
+        Ok(id)
+    }
+
+    /// `term` の [`TermId`] を返す（未知語は `None`）。クエリ側で構築後の辞書へ
+    /// 追加せず参照のみ行う（不変な辞書として扱う）。
+    fn lookup(&self, term: &str) -> Option<TermId> {
+        self.ids.get(term).copied()
+    }
+}
 
 /// 疎検索モジュールの公開エラー型。fail-closed 方針に従い、構築時の異常入力は
 /// 曖昧に握りつぶさず `Err` として明示する（`.claude/rules/coding-rust.md`）。
@@ -452,11 +524,27 @@ pub fn tokenize_with_options(text: &str, remove_stopwords: bool) -> Vec<String> 
 struct DocEntry {
     /// この統計が属する文書の ID（呼び出し側が割り当てた ID をそのまま保持する）。
     doc_id: DocId,
-    /// トークン → 出現回数。イテレーション順が出力に影響しないよう `BTreeMap` を用いる
-    /// （決定性確保。`HashMap` はイテレーション順が不定なため使わない）。
-    term_freq: BTreeMap<String, u32>,
+    /// [`TermId`] → 出現回数（Issue #388・term インターニング）。`TermId` 昇順に
+    /// ソート済み・重複なし（[`SparseIndex::with_params`] が構築時に保証する不変条件）。
+    /// この順序により [`Self::freq`] は `binary_search_by_key` で `O(log T_d)`
+    /// （`T_d`: この文書の一意語数）に検索できる。
+    term_freq: Vec<(TermId, u32)>,
     /// この文書の総トークン数（`term_freq` の値の合計）。
     doc_len: u32,
+}
+
+impl DocEntry {
+    /// この文書における `term_id` の出現回数（未出現なら `None`）。`term_freq` が
+    /// `TermId` 昇順ソート済みという不変条件（構築時に保証）に依存する二分探索。
+    fn freq(&self, term_id: TermId) -> Option<u32> {
+        // `binary_search_by_key` が `Ok(i)` を返す時点で `i` は必ず `term_freq` の
+        // 範囲内であることが保証されるため、`.get(i)` による再取得は不要（添字で
+        // 直接取り出す）。
+        self.term_freq
+            .binary_search_by_key(&term_id, |&(t, _)| t)
+            .ok()
+            .map(|i| self.term_freq[i].1)
+    }
 }
 
 /// BM25 Okapi による疎検索インデックス。
@@ -475,8 +563,15 @@ pub struct SparseIndex {
     avg_doc_len: f64,
     /// 文書ごとの統計（構築時の入力順を保持。`search()` はこの順に線形走査する）。
     docs: Vec<DocEntry>,
-    /// トークン → 出現文書数（`df`）。`BTreeMap` で決定的な走査順を保つ。
-    doc_freq: BTreeMap<String, u32>,
+    /// build 時に確定した語彙の term 辞書（Issue #388・term インターニング）。
+    /// `search`／`search_within` はクエリ語をこの辞書で [`TermId`] へ写像し、
+    /// 未知語（辞書に存在しない語）は候補から除外する（旧実装で全文書 miss して
+    /// `continue` していたのと同じ加算結果になる）。
+    terms: TermDictionary,
+    /// [`TermId`] を添字とする出現文書数（`df`）。長さは常に `terms.len()` と一致する
+    /// 不変条件を構築時に保証する（[`SparseIndex::with_params`] が新語の intern の
+    /// たびに `push(0)` して同期を保つ）。
+    doc_freq: Vec<u32>,
     /// `DocId` → `docs` 内のインデックス。[`SparseIndex::search_within`] が
     /// `visible_ids`（呼び出し元の可視集合）から該当文書へ `O(log n)` で辿るために使う
     /// （Issue #36 codex-review P0 指摘対応。`docs` は構築時の入力順であり `doc_id` で
@@ -531,7 +626,10 @@ impl SparseIndex {
         let mut seen_ids: BTreeMap<DocId, ()> = BTreeMap::new();
         let mut entries: Vec<DocEntry> = Vec::with_capacity(docs.len());
         let mut id_index: BTreeMap<DocId, usize> = BTreeMap::new();
-        let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut terms = TermDictionary::default();
+        // [`TermId`] を添字とする df。`terms.intern()` が新語を採番するたびに `push(0)`
+        // して `terms.len()` と長さを同期させる（Issue #388・term インターニング）。
+        let mut doc_freq: Vec<u32> = Vec::new();
         let mut total_len: u64 = 0;
         // コーパス全体のバイト長累計。`saturating_add` によりオーバーフロー時は
         // `usize::MAX` へ飽和させる（この桁数の入力は現実的に想定しないが、
@@ -573,22 +671,50 @@ impl SparseIndex {
                 });
             }
 
-            let mut term_freq: BTreeMap<String, u32> = BTreeMap::new();
-            for tok in &doc_tokens {
-                let counter = term_freq.entry(tok.clone()).or_insert(0u32);
-                *counter = counter.saturating_add(1);
-            }
-
             // `doc_tokens.len()` が `u32::MAX` を超える場合は `u32::MAX` に飽和させる
             // （文書長の理論上限を意図的に切り詰め、オーバーフローを未定義動作にしない）。
             // 実運用でこの桁数の単一文書は想定しないが、fail-closed のため checked に倒す。
+            // `doc_tokens` を intern へ move する前に長さを退避する。
             let doc_len = u32::try_from(doc_tokens.len()).unwrap_or(u32::MAX);
             total_len = total_len.saturating_add(u64::from(doc_len));
 
-            for term in term_freq.keys() {
-                let counter = doc_freq.entry(term.clone()).or_insert(0u32);
-                *counter = counter.saturating_add(1);
+            // 各トークンを辞書へ intern する（`String` の所有権を辞書へ move。
+            // 既知語はヒープ確保なしで既存 `TermId` を返す）。新語が採番されるたびに
+            // `doc_freq` を `terms.len()` と同じ長さまで `push(0)` して同期させる。
+            let mut ids: Vec<TermId> = Vec::with_capacity(doc_tokens.len());
+            for tok in doc_tokens {
+                let id = terms.intern(tok)?;
+                if id.0 as usize >= doc_freq.len() {
+                    doc_freq.push(0);
+                }
+                ids.push(id);
             }
+
+            // `TermId` 昇順にソートしランレングス圧縮して `(TermId, count)` へ畳み込む
+            // （`DocEntry::term_freq` の不変条件: ソート済み・重複なし）。同時に
+            // `doc_freq`（この文書に出現した語のみ 1 件ずつ加算）を更新する。
+            ids.sort_unstable();
+            let mut term_freq: Vec<(TermId, u32)> = Vec::with_capacity(ids.len());
+            for id in ids {
+                match term_freq.last_mut() {
+                    Some((last_id, count)) if *last_id == id => {
+                        *count = count.saturating_add(1);
+                    }
+                    _ => {
+                        term_freq.push((id, 1));
+                        if let Some(df) = doc_freq.get_mut(id.0 as usize) {
+                            *df = df.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            // ランレングス圧縮後、`term_freq` の容量は圧縮前の `ids.len()`
+            // （元のトークン総数）分を保持したままになる。同一語を大量に繰り返す
+            // 文書ではこの余剰容量が無視できず、term インターニングによる
+            // メモリ削減の設計意図を損なうほか `approx_heap_bytes()` を過大評価させ
+            // `PrefilterCache` の退避判定（Issue #357・sql/sparse_cache.rs）を
+            // 必要以上に早める。実使用長まで縮めて解放する。
+            term_freq.shrink_to_fit();
 
             // `id_index` は自分がこれから push する要素自身のインデックスのみを記録する
             // ため、値は常に `entries` の範囲内になる（範囲外を指す不変条件違反は
@@ -612,6 +738,7 @@ impl SparseIndex {
             doc_count,
             avg_doc_len,
             docs: entries,
+            terms,
             doc_freq,
             id_index,
         })
@@ -631,10 +758,12 @@ impl SparseIndex {
     /// 実装上もバイト長検証 → `tokenize()` → 一意語数検証の全経路を終えてから
     /// `k == 0` を判定する順序を維持する。
     ///
-    /// 計算量: コーパスの全文書（`N` 件）についてクエリの一意語集合（`Q` 語）を
-    /// `BTreeMap`（語彙数 `V`）で検索するため `O(N * Q * log V)`、その上で
-    /// スコア `> 0` の一致文書（`M` 件）から Top-k をヒープ選出するため
-    /// `O(M log k)` を要する（合計 `O(N * Q * log V + M log k)`）。クエリの一意語数
+    /// 計算量: クエリ語の辞書 lookup（[`TermId`] への写像）を走査に入る前に一度だけ
+    /// `O(Q)` で行い（Issue #388・term インターニング）、コーパスの全文書（`N` 件）
+    /// について `TermId` へ写像済みのクエリ語集合（`Q` 語）を各文書の `term_freq`
+    /// （`TermId` 昇順ソート済み・一意語数 `T_d`）へ二分探索するため `O(N * Q * log T_d)`、
+    /// その上でスコア `> 0` の一致文書（`M` 件）から Top-k をヒープ選出するため
+    /// `O(M log k)` を要する（合計 `O(Q + N * Q * log T_d + M log k)`）。クエリの一意語数
     /// `Q` が大きいほどコーパス全体との積で処理コストが増幅するため、`Q` が
     /// [`MAX_QUERY_TERMS`] を超える場合は走査に入る前に
     /// [`SparseError::TooManyQueryTerms`] で拒否する。また `tokenize()` はクエリ全体を
@@ -679,6 +808,24 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
 
+        // クエリ語を辞書で `TermId` へ写像する（Issue #388・term インターニング）。
+        // `unique_terms`（`String` 辞書順）の走査順をそのまま保つ `Vec<TermId>` を
+        // 作ることで、下記スコア加算のループ順序＝f64 の加算順が旧実装（`BTreeMap<String,_>`
+        // を辞書順走査）とビット一致する（スコアのビット一致は本モジュールの不変条件。
+        // `make bench-hybrid-profile` の `replica_matches_real` 完全一致検証・
+        // `sparse_cache_recall.rs` の cold/hot 等価性・Recall ゲート層 A の固定値
+        // アサーションが依存する）。辞書に存在しない語（未知語）はここで除外する
+        // （旧実装では全文書で `term_freq.get` が miss して `continue` していたのと
+        // 加算結果は同一であり、フィルタ後にコーパス側で改めて miss 判定する必要はない）。
+        let query_ids: Vec<TermId> = unique_terms
+            .keys()
+            .filter_map(|t| self.terms.lookup(t))
+            .collect();
+
+        if query_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // 現在の Top-k 候補を保持する固定サイズ（最大 k 件）のヒープ。`Reverse` により
         // `Candidate` の自然順序（大きい方が良い）に対する min-heap として働くため、
         // `heap.peek()` は常に「保持中で最も悪い」候補を指す。悪い候補から順に入れ替える
@@ -688,15 +835,15 @@ impl SparseIndex {
         let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
         for doc in &self.docs {
             let mut score = 0.0f64;
-            for term in unique_terms.keys() {
-                let Some(&f) = doc.term_freq.get(term) else {
+            for &term in &query_ids {
+                let Some(f) = doc.freq(term) else {
                     continue;
                 };
                 // `term` はこの `doc` の `term_freq` に存在する（`f` を得た時点の前提）ため、
                 // build() 側で同じ `term` が必ず `doc_freq` にも計上済みであり、`df >= 1` が
-                // 保証される。`unwrap_or(&0)` は `doc_freq` の型契約を壊さないための防御的
+                // 保証される。`unwrap_or(0)` は `doc_freq` の型契約を壊さないための防御的
                 // フォールバックであり、この呼び出し経路では実質到達しない。
-                let df = *self.doc_freq.get(term).unwrap_or(&0);
+                let df = self.doc_freq.get(term.0 as usize).copied().unwrap_or(0);
                 let idf = self.idf(df);
                 let numerator = f64::from(f) * (self.k1 + 1.0);
                 let len_norm = 1.0 - self.b
@@ -805,6 +952,17 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
 
+        // クエリ語を辞書で `TermId` へ写像する（`search()` と同一の理由・同一の
+        // 辞書順維持。Issue #388・term インターニング）。
+        let query_ids: Vec<TermId> = unique_terms
+            .keys()
+            .filter_map(|t| self.terms.lookup(t))
+            .collect();
+
+        if query_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
         // 可視文書のみへ縮約した部分集合。`id_index` は構築時に自分自身の `docs`
         // インデックスのみを記録しているため範囲外を指すことはないが、`.get()` で
         // 明示的に防御し、万一の不整合時は当該文書を候補から除外する
@@ -828,18 +986,18 @@ impl SparseIndex {
         let local_avg_doc_len = local_total_len as f64 / local_n as f64;
 
         // 可視部分集合内での df（クエリ語ごとに何件の可視文書が含むか）を数え直す
-        // （インデックス全体の `self.doc_freq` は使わない）。
-        let mut local_doc_freq: BTreeMap<&str, u32> = BTreeMap::new();
-        for term in unique_terms.keys() {
-            let df = subset
-                .iter()
-                .filter(|d| d.term_freq.contains_key(term))
-                .count();
-            // `df <= local_n <= self.docs.len() <= MAX_CORPUS_DOCS` であり `u32` へ
-            // 安全に収まるが、将来の変更に備え `try_from` 失敗時は飽和させる
-            // （coding-rust.md: 整数演算は checked/saturating を用いる）。
-            local_doc_freq.insert(term.as_str(), u32::try_from(df).unwrap_or(u32::MAX));
-        }
+        // （インデックス全体の `self.doc_freq` は使わない）。`query_ids` と同じ添字で
+        // 持つ（`zip` で対応付ける。Issue #388・term インターニング）。
+        let local_doc_freq: Vec<u32> = query_ids
+            .iter()
+            .map(|&term| {
+                let df = subset.iter().filter(|d| d.freq(term).is_some()).count();
+                // `df <= local_n <= self.docs.len() <= MAX_CORPUS_DOCS` であり `u32` へ
+                // 安全に収まるが、将来の変更に備え `try_from` 失敗時は飽和させる
+                // （coding-rust.md: 整数演算は checked/saturating を用いる）。
+                u32::try_from(df).unwrap_or(u32::MAX)
+            })
+            .collect();
 
         // 選出ロジック（ヒープ・タイブレーク）は `search()` と同一だが、母数を
         // 可視部分集合（`local_n`・`local_avg_doc_len`・`local_doc_freq`）に限定する
@@ -849,11 +1007,10 @@ impl SparseIndex {
         let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
         for doc in &subset {
             let mut score = 0.0f64;
-            for term in unique_terms.keys() {
-                let Some(&f) = doc.term_freq.get(term) else {
+            for (&term, &df) in query_ids.iter().zip(local_doc_freq.iter()) {
+                let Some(f) = doc.freq(term) else {
                     continue;
                 };
-                let df = *local_doc_freq.get(term.as_str()).unwrap_or(&0);
                 let idf = Self::idf_for(local_n as f64, df);
                 let numerator = f64::from(f) * (self.k1 + 1.0);
                 let len_norm = 1.0 - self.b
@@ -897,17 +1054,26 @@ impl SparseIndex {
     /// ため、実確保量を下回らないよう安全側に保守的な固定値を使う）。
     const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
 
+    /// `HashMap`（[`TermDictionary`]）の 1 エントリあたりの概算オーバーヘッド
+    /// （Issue #388・term インターニング）。[`Self::BTREE_ENTRY_OVERHEAD_BYTES`] と
+    /// 同じ位置づけ（厳密な計測ではなく DoS 対策の粗い上限判定用の保守的固定値）。
+    /// `HashMap` は制御バイト＋ロードファクタ（7/8）による容量余裕を持つため、
+    /// `BTreeMap` のノードオーバーヘッドと同水準の固定値を割り当てても実確保量を
+    /// 下回らない側に倒れる。
+    const HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 48;
+
     /// この `SparseIndex` が保持するヒープ確保分の概算バイト量（Issue #357・
     /// `sql/sparse_cache.rs::SparseIndexCache` の容量判定用）。`dictionary.rs::
     /// Dictionary::approx_heap_bytes` と同じ「厳密なメモリ計測ではなく DoS 対策の
-    /// ための粗い上限判定用」という位置づけの概算だが、Issue #357 レビュー指摘
-    /// 対応（codex-review P1）により以下をすべて加算するよう見直した:
-    /// `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() * size_of::<DocEntry>()`〕
-    /// ＋各文書の `term_freq` の `String` キー容量・`u32` 値・`BTreeMap` ノード
-    /// オーバーヘッド分）・`doc_freq`（語彙 `String` キー容量・`u32` 値・ノード
-    /// オーバーヘッド分）・`id_index`（`DocId` → `usize` のエントリ分＋ノード
-    /// オーバーヘッド分）。`String` は `len()` ではなく `capacity()` を使う
-    /// （成長により確保容量が長さを上回り得るため、下回らない側の概算にする）。
+    /// ための粗い上限判定用」という位置づけの概算。Issue #388（term インターニング）
+    /// で構造が `String` キーの木から `TermId` キーの構造へ変わったことに合わせて
+    /// 再計上した: `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() *
+    /// size_of::<DocEntry>()`〕＋各文書の `term_freq: Vec<(TermId, u32)>` の確保領域）・
+    /// `terms`（辞書に保持する `String` 語彙のキー容量＋`HashMap` のエントリ・
+    /// 容量余裕分）・`doc_freq`（`Vec<u32>` の確保領域）・`id_index`（`DocId` →
+    /// `usize` のエントリ分＋ノードオーバーヘッド分）。`String` は `len()` ではなく
+    /// `capacity()` を使う（成長により確保容量が長さを上回り得るため、下回らない側の
+    /// 概算にする）。
     pub fn approx_heap_bytes(&self) -> usize {
         let docs_container = self
             .docs
@@ -918,29 +1084,40 @@ impl SparseIndex {
             .iter()
             .map(|d| {
                 d.term_freq
-                    .keys()
-                    .map(|k| {
-                        k.capacity()
-                            .saturating_add(std::mem::size_of::<u32>())
-                            .saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES)
-                    })
-                    .fold(0usize, |acc, n| acc.saturating_add(n))
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(TermId, u32)>())
             })
             .fold(0usize, |acc, n| acc.saturating_add(n));
         let docs = docs_container.saturating_add(docs_term_freq);
-        let doc_freq: usize = self
-            .doc_freq
+        let terms_keys: usize = self
+            .terms
+            .ids
             .keys()
             .map(|k| {
                 k.capacity()
-                    .saturating_add(std::mem::size_of::<u32>())
-                    .saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES)
+                    .saturating_add(std::mem::size_of::<TermId>())
+                    .saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES)
             })
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        // `HashMap` の容量（`capacity()`）は要素数より大きい（ロードファクタ余裕）。
+        // その余裕分を保守的に別途加算し、キー実体の集計（`terms_keys`）だけでは
+        // 捉えられない `HashMap` 自体の確保領域を過少計上しないようにする。
+        let terms_table = self
+            .terms
+            .ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(String, TermId)>().saturating_add(1));
+        let terms = terms_keys.saturating_add(terms_table);
+        let doc_freq: usize = self
+            .doc_freq
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
         let id_index: usize = self.id_index.len().saturating_mul(
             std::mem::size_of::<(DocId, usize)>().saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES),
         );
-        docs.saturating_add(doc_freq).saturating_add(id_index)
+        docs.saturating_add(terms)
+            .saturating_add(doc_freq)
+            .saturating_add(id_index)
     }
 }
 
@@ -1716,5 +1893,315 @@ mod tests {
         let small_idx = SparseIndex::build(&small).unwrap();
         let large_idx = SparseIndex::build(&large).unwrap();
         assert!(large_idx.approx_heap_bytes() > small_idx.approx_heap_bytes());
+    }
+
+    // --- term インターニング（Issue #388） ---
+
+    #[test]
+    fn term_dictionary_interns_same_string_to_same_id_and_assigns_ids_in_first_seen_order() {
+        let mut dict = TermDictionary::default();
+        let a1 = dict.intern("alpha".to_string()).unwrap();
+        let b1 = dict.intern("beta".to_string()).unwrap();
+        let a2 = dict.intern("alpha".to_string()).unwrap();
+        assert_eq!(a1, a2, "同じ文字列は同じ TermId を返す");
+        assert_ne!(a1, b1);
+        assert_eq!(a1.0, 0, "初出順に 0 始まりで採番される");
+        assert_eq!(b1.0, 1);
+        assert_eq!(dict.lookup("alpha"), Some(a1));
+        assert_eq!(dict.lookup("gamma"), None, "未 intern の語は None");
+    }
+
+    #[test]
+    fn doc_entry_term_freq_is_sorted_by_term_id_without_duplicates() {
+        let docs = vec![
+            (1u64, "alpha beta alpha gamma beta alpha"),
+            (2u64, "beta gamma delta"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+        for doc in &idx.docs {
+            let ids: Vec<TermId> = doc.term_freq.iter().map(|&(t, _)| t).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                ids, sorted,
+                "term_freq は TermId 昇順ソート済み・重複なしという不変条件を持つ"
+            );
+        }
+        // doc_id=1 の "alpha" は 3 回出現する。
+        let doc1 = idx.docs.iter().find(|d| d.doc_id == 1).unwrap();
+        let alpha_id = idx.terms.lookup("alpha").unwrap();
+        assert_eq!(doc1.freq(alpha_id), Some(3));
+    }
+
+    #[test]
+    fn doc_freq_len_equals_dictionary_len_and_matches_manual_count() {
+        let docs = vec![
+            (1u64, "alpha beta"),
+            (2u64, "beta gamma"),
+            (3u64, "alpha gamma delta"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+        assert_eq!(idx.doc_freq.len(), idx.terms.ids.len());
+
+        // "alpha" は doc 1・3 の 2 件に出現、"beta" は doc 1・2 の 2 件、
+        // "gamma" は doc 2・3 の 2 件、"delta" は doc 3 の 1 件。
+        let alpha = idx.terms.lookup("alpha").unwrap();
+        let beta = idx.terms.lookup("beta").unwrap();
+        let gamma = idx.terms.lookup("gamma").unwrap();
+        let delta = idx.terms.lookup("delta").unwrap();
+        assert_eq!(idx.doc_freq[alpha.0 as usize], 2);
+        assert_eq!(idx.doc_freq[beta.0 as usize], 2);
+        assert_eq!(idx.doc_freq[gamma.0 as usize], 2);
+        assert_eq!(idx.doc_freq[delta.0 as usize], 1);
+    }
+
+    #[test]
+    fn search_ignores_unknown_query_terms_but_still_validates_max_query_terms() {
+        let docs = vec![(1u64, "alpha beta"), (2u64, "gamma delta")];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        // 未知語のみのクエリはコーパスとの一致が無いため空結果（Err にはならない）。
+        let results = idx.search("zeta omega", 10).unwrap();
+        assert!(results.is_empty());
+
+        // MAX_QUERY_TERMS の判定は辞書で未知語を除外する前の一意語数で行う
+        // （辞書に存在しない語だけで構成されたクエリでも上限超過は拒否する）。
+        let unknown_terms: String = (0..=MAX_QUERY_TERMS)
+            .map(|i| format!("unknownterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = idx.search(&unknown_terms, 10).unwrap_err();
+        assert_eq!(
+            err,
+            SparseError::TooManyQueryTerms {
+                unique_terms: MAX_QUERY_TERMS + 1,
+                max: MAX_QUERY_TERMS,
+            }
+        );
+    }
+
+    /// 旧実装（`BTreeMap<String, u32>` によるクエリ語走査）の参照実装。Issue #388 の
+    /// term インターニング後もスコアがビット一致することを検証するための最小再実装
+    /// （`benches/harness/hybrid_profile.rs::replica_matches_real` と同種の検証を
+    /// `make ci` 経路〔単体テスト〕へ持ち込む）。
+    /// 参照実装（旧 `BTreeMap<String, u32>` 方式）が母数として参照する統計一式。
+    /// `reference_bm25_score` の引数を集約し（`clippy::too_many_arguments` 回避）、
+    /// `search`（コーパス全体を母数）・`search_within`（可視部分集合を母数）の
+    /// 両方をこの 1 つの構造体で表現する。
+    struct ReferenceCorpusStats<'a> {
+        doc_freq_all: &'a BTreeMap<String, u32>,
+        n: f64,
+        avg_doc_len: f64,
+        k1: f64,
+        b: f64,
+    }
+
+    fn reference_bm25_score(
+        query: &str,
+        doc_term_freq: &BTreeMap<String, u32>,
+        doc_len: u32,
+        stats: &ReferenceCorpusStats<'_>,
+    ) -> f64 {
+        let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
+        for t in tokenize(query) {
+            unique_terms.insert(t, ());
+        }
+        let mut score = 0.0f64;
+        for term in unique_terms.keys() {
+            let Some(&f) = doc_term_freq.get(term) else {
+                continue;
+            };
+            let df = *stats.doc_freq_all.get(term).unwrap_or(&0);
+            let idf = ((stats.n - f64::from(df) + 0.5) / (f64::from(df) + 0.5) + 1.0).ln();
+            let numerator = f64::from(f) * (stats.k1 + 1.0);
+            let len_norm = 1.0 - stats.b
+                + stats.b * (f64::from(doc_len) / stats.avg_doc_len.max(f64::MIN_POSITIVE));
+            let denominator = f64::from(f) + stats.k1 * len_norm;
+            if denominator > 0.0 {
+                score += idf * (numerator / denominator);
+            }
+        }
+        score
+    }
+
+    /// `reference_bm25_score` を全文書へ適用し、`SparseIndex::search`/
+    /// `search_within` と同じ選出規約（`score > 0.0` のみ候補化・スコア降順→
+    /// `doc_id` 昇順のタイブレーク・上位 `k` 件切り出し）で Top-k を再現する
+    /// （Issue #388 レビュー指摘対応: 個々の返却行のスコア一致だけでなく
+    /// `results.len()` と返却 `doc_id` 集合そのものを参照実装と突き合わせるための
+    /// ヘルパー。term インターニングによる取りこぼし・過剰ヒットの vacuous pass を
+    /// 防ぐ）。
+    fn reference_search_top_k(
+        query: &str,
+        ref_docs: &BTreeMap<DocId, (BTreeMap<String, u32>, u32)>,
+        stats: &ReferenceCorpusStats<'_>,
+        k: usize,
+    ) -> Vec<(DocId, f64)> {
+        let mut scored: Vec<(DocId, f64)> = ref_docs
+            .iter()
+            .filter_map(|(&doc_id, (tf, doc_len))| {
+                let score = reference_bm25_score(query, tf, *doc_len, stats);
+                (score > 0.0).then_some((doc_id, score))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
+    #[test]
+    fn search_score_is_bit_identical_to_reference_btreemap_implementation() {
+        let docs = vec![
+            (1u64, "the quick brown fox jumps over the lazy dog"),
+            (2u64, "a quick brown dog outpaces a quick fox"),
+            (3u64, "lazy cats and lazy dogs sleep all day"),
+            (4u64, "東京都は日本の首都である"),
+            (5u64, "京都は日本の古都である"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        // 参照実装用に旧構造（BTreeMap<String,u32>）を手計算で組み立てる。
+        let mut ref_docs: BTreeMap<DocId, (BTreeMap<String, u32>, u32)> = BTreeMap::new();
+        let mut ref_doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ref_total_len: u64 = 0;
+        for &(doc_id, text) in &docs {
+            let toks = tokenize(text);
+            let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in &toks {
+                *tf.entry(t.clone()).or_insert(0) += 1;
+            }
+            let doc_len = u32::try_from(toks.len()).unwrap();
+            ref_total_len += u64::from(doc_len);
+            for t in tf.keys() {
+                *ref_doc_freq.entry(t.clone()).or_insert(0) += 1;
+            }
+            ref_docs.insert(doc_id, (tf, doc_len));
+        }
+        let ref_n = docs.len() as f64;
+        let ref_avg_doc_len = ref_total_len as f64 / ref_n;
+
+        for query in [
+            "quick fox",
+            "lazy dog cats",
+            "東京 京都",
+            "日本 首都",
+            "no match here",
+        ] {
+            let results = idx.search(query, 10).unwrap();
+            let stats = ReferenceCorpusStats {
+                doc_freq_all: &ref_doc_freq,
+                n: ref_n,
+                avg_doc_len: ref_avg_doc_len,
+                k1: DEFAULT_K1,
+                b: DEFAULT_B,
+            };
+            // まず件数・返却 doc_id 集合そのものを参照実装の Top-k 選出と突き合わせる
+            // （取りこぼし・余分ヒットは個々のスコア一致チェックでは検出できない）。
+            let expected_top_k = reference_search_top_k(query, &ref_docs, &stats, 10);
+            assert_eq!(
+                results.len(),
+                expected_top_k.len(),
+                "query={query:?}: 返却件数が参照実装の Top-k と一致しない"
+            );
+            assert_eq!(
+                results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                "query={query:?}: 返却 doc_id の並びが参照実装の Top-k と一致しない"
+            );
+            for scored in &results {
+                let (tf, doc_len) = ref_docs.get(&scored.doc_id).unwrap();
+                let expected = reference_bm25_score(query, tf, *doc_len, &stats);
+                assert_eq!(
+                    scored.score.total_cmp(&expected),
+                    std::cmp::Ordering::Equal,
+                    "query={query:?} doc_id={} score={} expected={}",
+                    scored.doc_id,
+                    scored.score,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_within_score_is_bit_identical_to_reference_for_visible_subset() {
+        let docs = vec![
+            (1u64, "the quick brown fox jumps over the lazy dog"),
+            (2u64, "a quick brown dog outpaces a quick fox"),
+            (3u64, "lazy cats and lazy dogs sleep all day"),
+            (4u64, "quick cats nap all afternoon"),
+        ];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let visible: BTreeSet<DocId> = [1u64, 2u64, 4u64].into_iter().collect();
+
+        // 可視部分集合のみから参照実装用の統計を組み立てる（search_within と同じ縮約）。
+        let mut ref_docs: BTreeMap<DocId, (BTreeMap<String, u32>, u32)> = BTreeMap::new();
+        let mut ref_doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ref_total_len: u64 = 0;
+        for &(doc_id, text) in &docs {
+            if !visible.contains(&doc_id) {
+                continue;
+            }
+            let toks = tokenize(text);
+            let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in &toks {
+                *tf.entry(t.clone()).or_insert(0) += 1;
+            }
+            let doc_len = u32::try_from(toks.len()).unwrap();
+            ref_total_len += u64::from(doc_len);
+            for t in tf.keys() {
+                *ref_doc_freq.entry(t.clone()).or_insert(0) += 1;
+            }
+            ref_docs.insert(doc_id, (tf, doc_len));
+        }
+        let ref_n = visible.len() as f64;
+        let ref_avg_doc_len = ref_total_len as f64 / ref_n;
+
+        for query in ["quick fox", "lazy dog cats", "quick", "no match here"] {
+            let results = idx.search_within(query, 10, &visible).unwrap();
+            let stats = ReferenceCorpusStats {
+                doc_freq_all: &ref_doc_freq,
+                n: ref_n,
+                avg_doc_len: ref_avg_doc_len,
+                k1: DEFAULT_K1,
+                b: DEFAULT_B,
+            };
+            let expected_top_k = reference_search_top_k(query, &ref_docs, &stats, 10);
+            assert_eq!(
+                results.len(),
+                expected_top_k.len(),
+                "query={query:?}: 返却件数が参照実装の Top-k と一致しない"
+            );
+            assert_eq!(
+                results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                "query={query:?}: 返却 doc_id の並びが参照実装の Top-k と一致しない"
+            );
+            for scored in &results {
+                let (tf, doc_len) = ref_docs.get(&scored.doc_id).unwrap();
+                let expected = reference_bm25_score(query, tf, *doc_len, &stats);
+                assert_eq!(
+                    scored.score.total_cmp(&expected),
+                    std::cmp::Ordering::Equal,
+                    "query={query:?} doc_id={} score={} expected={}",
+                    scored.doc_id,
+                    scored.score,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn approx_heap_bytes_accounts_dictionary_and_term_freq_vectors() {
+        let small = vec![(1u64, "alpha")];
+        let large = vec![(1u64, "alpha beta gamma delta epsilon zeta eta theta")];
+        let small_idx = SparseIndex::build(&small).unwrap();
+        let large_idx = SparseIndex::build(&large).unwrap();
+        assert!(
+            large_idx.approx_heap_bytes() > small_idx.approx_heap_bytes(),
+            "語彙数の増加に伴い approx_heap_bytes は単調増加する"
+        );
     }
 }
