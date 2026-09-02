@@ -264,8 +264,8 @@ boundary_group`）自体は複製しない（本測定が必要とするのは�
 | -- | -----: | --: | ---- |
 | `hybrid_search_cached_index`（キャッシュヒット相当・`hybrid_search` 直接呼び出し） | 115.7ms | 136.1ms | `provider_calls_max=1`（密側は 1 回で確定） |
 | `search_within_fetch_k=400`〜`25000`（各 fetch_k 単体） | 17.2〜18.8ms | 18.3〜21.7ms | `fetch_k` によらずほぼ一定 |
-| `search_within_subset_only`（区間 1） | 0.78〜0.79ms | 0.81ms | k=400/25000 でほぼ不変（可視集合サイズのみに依存） |
-| `search_within_subset_df`（区間 1+2） | 9.66〜10.01ms | 10.76〜10.95ms | 区間 2 単独の寄与 ≈ 8.9〜9.2ms |
+| `search_within_subset_only`（区間 1・k 非依存） | 0.78ms | 0.81ms | `fetch_k` を受け取らず可視集合サイズのみに依存するため 1 回のみ測定 |
+| `search_within_subset_df`（区間 1+2・k 非依存） | 9.66ms | 10.76ms | `fetch_k` を受け取らず可視集合サイズのみに依存するため 1 回のみ測定。区間 2 単独の寄与 ≈ 8.9ms |
 | `search_within_replica_full`（区間 1+2+3） | 15.25〜16.76ms | 17.09〜17.89ms | 区間 3 単独の寄与 ≈ 5.6〜6.8ms |
 
 疎側再取得ループの実測（5 クエリ。codex-review P1 指摘対応〔PR #416〕後の

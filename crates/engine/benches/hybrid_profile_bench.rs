@@ -563,54 +563,57 @@ fn main() {
         )
     );
 
-    // --- search_within 内部 3 区間（複製実装。初期 fetch_k と最終 fetch_k の
-    // 2 点で計測する）---
+    // --- search_within 内部 3 区間（複製実装）---
+    // codex-review P2 指摘対応（PR #416）: `subset_only`／`subset_df` は
+    // `fetch_k` を受け取らず、可視集合サイズのみに依存するため k に対して
+    // 不変である。以前は initial_k/final_k の k ループ内で再測定しラベルに
+    // `k=<k>` を付けていたため、反復測定の揺らぎを fetch_k による差である
+    // かのように誤読させていた。ここでは k ループの外で 1 回だけ測定し、
+    // ラベルからも `k=` を外して k 非依存であることを明示する。k が実際に
+    // 効く `search_within_replica_full` のみ initial_k/final_k の 2 点で
+    // 計測するループに残す。
+    let mut query_idx = 0usize;
+    let subset_only_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        replica.subset_only(&q.text, &visible)
+    })
+    .unwrap_or_else(|e| fail_closed(format!("search_within_subset_only measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&subset_only_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    println!(
+        "{}",
+        render_stage_line(
+            "search_within_subset_only (k-independent)",
+            subset_only_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            visible.len(),
+        )
+    );
+
+    let mut query_idx = 0usize;
+    let subset_df_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        replica.subset_df(&q.text, &visible)
+    })
+    .unwrap_or_else(|e| fail_closed(format!("search_within_subset_df measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&subset_df_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    println!(
+        "{}",
+        render_stage_line(
+            "search_within_subset_df (k-independent)",
+            subset_df_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            visible.len(),
+        )
+    );
+
     let cap = fetch_cap(visible.len());
     let initial_k = initial_fetch_k(pool_depth, cap);
     let final_k = union_fetch_ks.last().copied().unwrap_or(initial_k);
     for &fetch_k in &[initial_k, final_k] {
-        let mut query_idx = 0usize;
-        let subset_only_measurement = run(&config, || {
-            let q = &queries[query_idx % queries.len()];
-            query_idx += 1;
-            replica.subset_only(&q.text, &visible)
-        })
-        .unwrap_or_else(|e| {
-            fail_closed(format!("search_within_subset_only measurement failed: {e}"))
-        });
-        let p95 = harness::accept::p95_from_samples(&subset_only_measurement.samples)
-            .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
-        println!(
-            "{}",
-            render_stage_line(
-                &format!("search_within_subset_only k={fetch_k}"),
-                subset_only_measurement.summary.median.as_micros(),
-                p95.as_micros(),
-                visible.len(),
-            )
-        );
-
-        let mut query_idx = 0usize;
-        let subset_df_measurement = run(&config, || {
-            let q = &queries[query_idx % queries.len()];
-            query_idx += 1;
-            replica.subset_df(&q.text, &visible)
-        })
-        .unwrap_or_else(|e| {
-            fail_closed(format!("search_within_subset_df measurement failed: {e}"))
-        });
-        let p95 = harness::accept::p95_from_samples(&subset_df_measurement.samples)
-            .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
-        println!(
-            "{}",
-            render_stage_line(
-                &format!("search_within_subset_df k={fetch_k}"),
-                subset_df_measurement.summary.median.as_micros(),
-                p95.as_micros(),
-                visible.len(),
-            )
-        );
-
         let mut query_idx = 0usize;
         let (replica_full_measurement, _retained) = run_bounded_retain(&config, 0, || {
             let q = &queries[query_idx % queries.len()];
