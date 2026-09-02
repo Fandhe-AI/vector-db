@@ -686,3 +686,142 @@ median 1,267µs で、可視集合サイズに対して準線形に近い伸び�
   の外形計測に留めた）。より細かい内訳が必要になった場合の追加ポイントは
   `sparse.rs::score_by_postings` 内の各段
 - 専有環境での再実測はオーナー／運用者判断で別途実施する
+
+## Issue #391: 文書長クラス別テーブルと select_nth 型 Top-k 導入後の実測
+
+対応: Issue #391（`perf(engine): fieldnorm 量子化スコアテーブルと select_nth 型
+top-k を SparseIndex へ導入`）。前提: TASK-102・TASK-104、
+`docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3（判定内容・数値基準は
+spec 側が SSOT。本節も spec 由来の pass/fail 閾値を持たない情報提供専用の
+実測記録）。
+
+### 変更内容
+
+`crates/engine/src/sparse.rs::score_by_postings` のホットパスを 2 点変更した。
+
+1. **文書長正規化項のキャッシュ化**: BM25 の `k1 * len_norm`（`len_norm =
+   1-b+b*doc_len/avgdl`）はクエリ内で `avgdl` が確定した後は文書長のみに
+   依存するため、ヒットごとに再計算する代わりに、build 時に構築した文書長
+   クラス表（`len_classes: Vec<u32>`。コーパス中の相異なる文書長を昇順・
+   重複なしに並べたもの・`doc_len_class: Vec<u32>`。`doc_idx` → クラス添字）
+   をもとに、当初はクエリ時（`avgdl` 確定直後）に `len_classes` 全体を
+   走査して `k1_len_norm: Vec<f64>`（クラス数分）を一括構築する設計を
+   採ったが、これは実際にヒットする文書長クラス数（<= ヒット数 `M`）に
+   関わらず常に `len_classes.len()`（コーパス中の相異なる文書長数。最悪
+   `O(N)`）分の計算を行ってしまい、選択性の高いクエリで `search`/
+   `search_within` の走査量に比例する計算量契約から外れるという指摘
+   （PR #426 codex-review）を受け、ヒットループ内で実際にタッチした
+   クラスのみを `k1_len_norm_cache: HashMap<u32, f64>` へ遅延計算・
+   キャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]` は旧実装の
+   `self.k1 * len_norm` と同一算出）は不変のため `denominator` は旧実装と
+   引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class`
+   → 一意な `f64`）ためスコア自体の決定性には影響しない
+2. **Top-k 選出の select_nth 型化**: `BinaryHeap<Reverse<Candidate>>` への
+   逐次 `O(log k)` 挿入を、tantivy の `TopNComputer` を参考にした
+   `TopKSelector`（2k 件バッファ＋`select_nth_unstable_by` による一括切り詰め
+   ＋`threshold` による早期棄却）へ置き換えた。出力する Top-k 集合・順序は
+   いずれも `Candidate` の全順序（スコア降順・同点は `doc_id` 昇順）だけで
+   一意に決まるため、選出アルゴリズムの違いは出力に影響しない
+
+`SparseIndex` の公開 API（`build`/`with_params`/`search`/`search_within`/
+`approx_heap_bytes`）シグネチャは無変更。新規エラー変種
+`SparseError::LenClassBuildFailed`（文書長クラス表構築の不変条件違反。
+構築ロジック上到達不能だが `unwrap`/`expect` を使わず fail-closed に拒否する
+防御）を追加したが、呼び出し側（`sql/exec.rs::map_hybrid_error`）はワイルド
+カード分岐で受けるため既存の分類・応答契約に影響しない。
+
+### 受け入れ条件 1（ビット一致）の検証
+
+`crates/engine/src/sparse.rs` 内の単体テストに以下を追加し、いずれも green
+であることを確認した（詳細な観点は各テスト名を参照）。
+
+- `len_classes_are_sorted_unique_and_map_back_to_doc_len`
+- `len_norm_table_reproduces_inline_formula_bitwise`
+- `search_and_search_within_top_k_bit_identical_to_reference_on_mixed_corpus`
+  （2,000 件規模の混成コーパス・複数クエリ・`k ∈ {1, 5, 20, 100, M/2, M, M+1}`
+  で `search`／`search_within` 双方が参照実装〔`BTreeMap` 手計算〕とビット一致）
+- `top_k_selector_matches_full_sort_for_random_candidates`（`M`/`k` の境界
+  `M > 2k`・`M <= k`・`k == 0`・`M == 0` を網羅）
+- `top_k_selector_boundary_tie_group_prefers_smaller_doc_id`
+- `search_within_top_k_cut_inside_tie_group_is_deterministic_and_prefix_consistent`
+  （`hybrid.rs::sparse_refetch_loop` の倍増再取得と整合する前方一致契約）
+- `search_within_len_norm_table_uses_visible_avgdl_only`（RLS 縮約契約の回帰。
+  可視外の文書長がテーブル・スコアへ影響しないことを固定）
+- `approx_heap_bytes_accounts_len_class_arrays`
+
+既存のビット一致テスト（`search_score_is_bit_identical_to_reference_
+btreemap_implementation`・`search_within_score_is_bit_identical_to_reference_
+for_visible_subset`・`search_selection_boundary_prefers_smaller_doc_id_on_
+tie`・`search_tie_breaks_by_doc_id_ascending`）・`hybrid_profile_accept.rs::
+profile_sparse_index_replica_matches_real_search_within`（ベンチ起動時
+fail-closed の忠実性検証）・`sparse_cache_recall.rs`（cold/hot 等価性）・
+`hybrid_recall.rs` 層 A の固定値アサーション（`hits20 == 182`・
+`sparse_hits20 == 166`・大規模段 `hits20 == 385`/`hits100 == 648`）は無変更で
+green のまま（スコアのビット一致契約により構造的に不変）。
+
+**256 段ロッシー量子化の実験（Step 4・不採用判断）**: `sparse.rs` 内の
+`#[ignore]` 手動実験テスト `fieldnorm_256_quantization_rank_divergence_
+report`（`crates/engine/src/sparse.rs` 内 test-only。tantivy の実装・テーブル
+値は転記せず自作の代表値写像規則のみを使う）で、production の厳密クラス表と
+256 段代表値写像を 5,000 件規模のコーパス・複数クエリ・複数 `k` で比較できる
+ようにした。5 クエリ × 3 段の `k`（10・20・100）＝ 15 組の比較で、実測は
+「0/15 件で Top-k の doc_id 列が量子化により変動」（本開発環境・1 回実測。
+決定的フィクスチャのため再現性はある）だった。production は本実験の結果
+によらず厳密クラス表（`len_classes`）を採用し、256 段ロッシー量子化は
+不採用（Rejected）と判断する。理由はビット一致契約（`replica_matches_real`・
+Recall 層 A 固定値・`sparse_cache_recall.rs` cold/hot 等価性が前提とする）に
+反すること自体であり、変動件数が実測どおり 0 であっても判断は変わらない
+（Issue #391 実装計画の「変動が 0 だった場合も同じ結論とし、その事実を記録
+する」方針どおり）。性能面でも、テーブル参照コストはクラス数に依存しない
+ため厳密表（クラス数 = 相異なる文書長の個数、通常は文書数以下）に対する
+優位はない。
+
+### 受け入れ条件 3（前後比較）の実測
+
+`make bench-hybrid-profile`（`cargo bench --bench hybrid_profile_bench -p
+engine --features bench-internals`）を本開発環境（非専有・並行エージェント
+あり）で本変更の前後（before: 本 Issue の変更を `git stash` で除いた状態・
+after: 本 Issue の変更を適用した状態）それぞれ 1 回ずつ実行した。
+
+| 指標 | before | after |
+| ---- | -----: | ----: |
+| `hybrid_search_cached_index` p95 | 10,602µs | 9,014µs |
+| `hybrid_search_cached_index` median | 9,785µs | 8,288µs |
+| `search_within_fetch_k=25000`（全可視集合）p95 | 1,317µs | 813µs |
+| `search_within_fetch_k=25000`（全可視集合）median | 1,289µs | 798µs |
+| `sparse_index_resident` `approx_heap_bytes()` | 12,153,564 | 12,253,568 |
+
+`search_within_fetch_k` の他段（400〜12,800）も一様に短縮しており
+（例: `fetch_k=12800` median 1,102µs → 637µs）、Top-k 選出の
+`select_nth_unstable_by` 化・文書長正規化項テーブル化の効果は `k`（フェッチ
+件数）が大きいほど顕著に表れている。`sparse_build_total`（build 経路。本
+Issue は `score_by_postings` のみを変更対象とし build 側の文書長クラス表
+構築コスト自体は変更していない）は before/after で誤差の範囲（47,476µs →
+47,091µs）に留まり、想定どおり変化していない。
+
+`approx_heap_bytes()` はクラス表 2 本（`len_classes`・`doc_len_class`）の追加
+分だけわずかに増加した（+100,004 bytes ≈ +97.7 KiB。25,000 件規模コーパス
+での実測）。文書長のバリエーションが多いほど `len_classes` が大きくなるため
+この増加量はコーパス依存だが、`search_within_fetch_k` の短縮幅（数百µs〜
+数百µs、大きな `k` ほど拡大）に対して無視できる規模と判断する。
+
+### 受け入れ条件との対応
+
+1. §「受け入れ条件 1（ビット一致）の検証」参照。決定的フィクスチャで
+   Top-k・同点グループは導入前と一致することを機械検証した（不一致は
+   検出されなかった）
+2. Recall 層 A は green のまま不変（スコアのビット一致契約により構造的に
+   不変）。層 B（`recall.yml`。environment `recall-gate` の secrets 閾値）は
+   ローカルで実行できないため、マージ後の `workflow_dispatch` 実測は
+   引き続き管理者作業として申し送る
+3. §「受け入れ条件 3（前後比較）の実測」参照
+
+### 申し送り
+
+- `acc: Vec<f64>` の `O(N)` 確保・`VisibleBitmap` の再取得ループ間再利用は
+  引き続き #392 領域の判断材料
+- posting の CSR 化・量子化・skip list への圧縮は引き続き #394 の判断材料
+- 専有環境での `bench-hybrid-profile` 再実測はオーナー／運用者判断で別途実施
+- 256 段ロッシー fieldnorm 量子化は本 Issue で不採用と判断した（理由は上記
+  「256 段ロッシー量子化の実験」節参照）。将来スコア型・ビット一致契約自体を
+  見直す場合の再検討ポイントとして記録する
