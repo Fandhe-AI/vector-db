@@ -445,15 +445,23 @@ impl HnswIndex {
         vectors: &[f32],
     ) -> Result<u32, HnswError> {
         let mut current = start;
-        let mut current_score = self.score(current, query, dim, vectors)?;
+        let mut current_best = ScoredNode {
+            node: current,
+            score: self.score(current, query, dim, vectors)?,
+        };
         loop {
             let mut improved = false;
             if let Some(neighbors) = self.neighbors(level, current) {
                 for &cand in neighbors {
-                    let cand_score = self.score(cand, query, dim, vectors)?;
-                    if cand_score > current_score {
+                    let cand_scored = ScoredNode {
+                        node: cand,
+                        score: self.score(cand, query, dim, vectors)?,
+                    };
+                    // スコアのみでなく `ScoredNode::cmp`（スコア降順・同点は id 昇順）
+                    // で比較する。同点時にモジュール冒頭の順序契約から外れないため。
+                    if cand_scored > current_best {
                         current = cand;
-                        current_score = cand_score;
+                        current_best = cand_scored;
                         improved = true;
                     }
                 }
@@ -506,7 +514,9 @@ impl HnswIndex {
             // 候補集合の最良要素が、結果集合中の最悪要素より劣るなら打ち切る
             // （Algorithm 2 の停止条件）。
             if let Some(std::cmp::Reverse(worst)) = results.peek() {
-                if results.len() >= ef && top_candidate.score < worst.score {
+                // スコアのみでなく `ScoredNode::cmp`（スコア降順・同点は id 昇順）で
+                // 比較する。同点時にモジュール冒頭の順序契約から外れないため。
+                if results.len() >= ef && top_candidate < *worst {
                     break;
                 }
             }
@@ -525,17 +535,17 @@ impl HnswIndex {
                         continue;
                     }
                     let neighbor_score = self.score(neighbor, query, dim, vectors)?;
+                    let scored = ScoredNode {
+                        node: neighbor,
+                        score: neighbor_score,
+                    };
+                    // スコアのみでなく `ScoredNode::cmp`（スコア降順・同点は id 昇順）で
+                    // 比較する。同点時にモジュール冒頭の順序契約から外れないため。
                     let worst_ok = match results.peek() {
-                        Some(std::cmp::Reverse(worst)) => {
-                            results.len() < ef || neighbor_score > worst.score
-                        }
+                        Some(std::cmp::Reverse(worst)) => results.len() < ef || scored > *worst,
                         None => true,
                     };
                     if worst_ok {
-                        let scored = ScoredNode {
-                            node: neighbor,
-                            score: neighbor_score,
-                        };
                         candidates.push(scored);
                         results.push(std::cmp::Reverse(scored));
                         if results.len() > ef {
