@@ -108,3 +108,12 @@ fn n_log_n_ratio_is_positive_for_valid_input() {
     let ratio = n_log_n_ratio(1_000, Duration::from_millis(50)).unwrap();
     assert!(ratio > 0.0);
 }
+
+#[test]
+fn n_log_n_ratio_rejects_zero_duration() {
+    // `scaling_exponent` が `t1_secs <= 0.0` を InsufficientSamples として
+    // 拒否するのと対称に、Duration::ZERO を有効な比率 0.0 として受理しない
+    // ことを固定する回帰（codex-review P2 指摘）。
+    let err = n_log_n_ratio(1_000, Duration::ZERO).unwrap_err();
+    assert_eq!(err, HnswBuildBenchError::InsufficientSamples);
+}

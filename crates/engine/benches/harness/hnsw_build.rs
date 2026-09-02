@@ -141,9 +141,12 @@ pub fn scaling_exponent(
 
 /// `t / (n * ln(n))` の比率（N log N 仮説の下で規模点間でおおむね一定になる
 /// はずの量。実効指数が 2.0 に近いかどうかの判定を補強する情報提供指標）。
-/// `n <= 1`（`ln(n) <= 0`）は [`HnswBuildBenchError::InsufficientSamples`]。
+/// `n <= 1`（`ln(n) <= 0`）・`t == 0`（測定不能な所要時間）は
+/// [`HnswBuildBenchError::InsufficientSamples`]。[`scaling_exponent`] が
+/// `t1_secs <= 0.0` を同様に拒否しているのと対称にするため、ゼロ時間を
+/// 有効な比率 `0.0` として受理しない。
 pub fn n_log_n_ratio(n: usize, t: Duration) -> Result<f64, HnswBuildBenchError> {
-    if n <= 1 {
+    if n <= 1 || t.is_zero() {
         return Err(HnswBuildBenchError::InsufficientSamples);
     }
     let denom = n as f64 * (n as f64).ln();
