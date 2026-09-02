@@ -261,15 +261,29 @@ fn main() {
 
         for batch_idx in 0..warmup {
             let batch = make_batch(&table_schema, 1, batch_idx, rows, dim);
-            run_replica_batch(&replica_db, &batch, batch_idx, None);
+            run_replica_batch(&replica_db, &ctx, &table_schema, &batch, batch_idx, None);
         }
         let mut stage_samples = StageSamples::new();
         for batch_idx in warmup..total_batches {
             let batch = make_batch(&table_schema, 1, batch_idx, rows, dim);
-            run_replica_batch(&replica_db, &batch, batch_idx, Some(&mut stage_samples));
+            run_replica_batch(
+                &replica_db,
+                &ctx,
+                &table_schema,
+                &batch,
+                batch_idx,
+                Some(&mut stage_samples),
+            );
         }
 
-        // --- 段別集計・出力 --------------------------------------------------
+        // --- 段別集計（出力はまだ行わない） --------------------------------------
+        // fail-closed 契約（モジュール冒頭コメント「いずれかが不一致ならベンチは
+        // エラー終了し測定値を出力しない」）を満たすため、ここでは中央値の算出
+        // （＝ `fail_closed` を伴いうる集計処理そのもの）のみ行い、実際の
+        // `println!` は後続の整合性検証 1〜3 がすべて通過した後にまとめて行う
+        // （Issue #396・Bugbot 指摘: 整合性検証より前に測定値を stdout へ出力
+        // してはならない）。
+        let mut stage_lines: Vec<String> = Vec::with_capacity(StageId::ALL.len());
         let mut stage_medians = Vec::with_capacity(StageId::ALL.len());
         for stage in StageId::ALL {
             let samples = stage_samples.samples_for(stage);
@@ -277,30 +291,27 @@ fn main() {
                 fail_closed(format!("stage {:?} summarize failed: {e}", stage))
             });
             let npr = ns_per_row(summary.median, rows).unwrap_or_else(|e| fail_closed(e));
-            println!(
-                "{}",
-                render_stage_line(stage.label(), rows, summary.median, npr)
-            );
+            stage_lines.push(render_stage_line(stage.label(), rows, summary.median, npr));
             stage_medians.push(summary.median);
         }
         let stage_sum = sum_durations(&stage_medians);
         let stage_sum_npr = ns_per_row(stage_sum, rows).unwrap_or_else(|e| fail_closed(e));
-        println!(
+        stage_lines.push(format!(
             "stage(SUM_I1_I8): rows={rows} median={:.3}ms ns_per_row={stage_sum_npr:.1}",
             stage_sum.as_secs_f64() * 1e3
-        );
+        ));
         let e0_npr = ns_per_row(e2e_summary.median, rows).unwrap_or_else(|e| fail_closed(e));
-        println!(
+        stage_lines.push(format!(
             "stage(E0_insert_rows): rows={rows} median={:.3}ms ns_per_row={e0_npr:.1}",
             e2e_summary.median.as_secs_f64() * 1e3
-        );
+        ));
         match residual_ns_per_row(e2e_summary.median, stage_sum, rows) {
-                Ok(residual_npr) => println!(
+                Ok(residual_npr) => stage_lines.push(format!(
                     "residual(E0-SUM): ns_per_row={residual_npr:.1} (schema fetch / commit_boundary guard / abstraction overhead)"
-                ),
-                Err(e) => println!(
+                )),
+                Err(e) => stage_lines.push(format!(
                     "residual(E0-SUM): n/a (Σ(I1..I8) の中央値が E0 の中央値を上回った。独立計測どうしの比較のため測定ノイズにより逆転しうる: {e})"
-                ),
+                )),
             }
 
         // --- 整合性検証 1: user_rows/docs のバイト単位一致 -----------------------
@@ -415,6 +426,14 @@ fn main() {
             }
         }
         println!("integrity: op_ledger content_hash matches content_hash_insert_batch_reimpl for all measured batches");
+
+        // --- 段別集計の出力（整合性検証 1〜3 をすべて通過した後） ------------------
+        // fail-closed 契約（モジュール冒頭コメント参照）を満たすため、測定値の
+        // stdout 出力はここまで遅延する（上の「段別集計（出力はまだ行わない）」
+        // ブロック参照）。
+        for line in &stage_lines {
+            println!("{line}");
+        }
     }
 
     println!("ingest_profile_bench: OK");
@@ -462,20 +481,27 @@ fn insert_e2e_batch(
 /// `None` で計測しない）。
 fn run_replica_batch(
     db: &Database,
+    ctx: &PolicyContext,
+    schema: &TableSchema,
     batch: &Batch,
     batch_idx: u64,
     mut stage_samples: Option<&mut StageSamples>,
 ) {
     let rows = batch.ids.len();
 
-    // I1: 所有権検査 ＋ バッチ内 id 重複検出。
+    // I1: 所有権検査 ＋ バッチ内 id 重複検出。production
+    // （`insert_rows_unchecked`）は `rows.iter().any(|(_, row)| !ctx.is_owner(
+    // row.tenant_id))` として単一の `PolicyContext`（バッチ外・呼び出し元が
+    // 生成）を全行で使い回すため、ここでも呼び出し元から受け取った `ctx` を
+    // バッチ内ループの外で 1 度だけ生成された値として再利用する
+    // （`PolicyContext::new` を行ごとに呼ばない）。各行の実際の tenant 値
+    // （すべて `TENANT`。`insert_e2e_batch` が `RowInput::tenant_id` を
+    // `ctx.tenant_id()` から組み立てるため E0 と一致）を渡した `is_owner` の
+    // 戻り値を `black_box` し、判定コストが最適化で消えないようにする
+    // （codex-review P2・Issue #396 指摘）。
     let t = Instant::now();
-    for is_public in &batch.is_public {
-        // 自テナントのみを生成しているため常に true。`is_owner` を実際に呼び、
-        // production の判定コストを再現する（Value を消費しないため副作用なし）。
-        let ctx = PolicyContext::new(TENANT).expect("valid tenant id");
-        let _ = ctx.is_owner(TENANT);
-        std::hint::black_box(is_public);
+    for _ in &batch.ids {
+        std::hint::black_box(ctx.is_owner(TENANT));
     }
     let mut seen_ids: HashSet<u64> = HashSet::new();
     seen_ids.try_reserve(rows).expect("reserve id set");
@@ -544,11 +570,19 @@ fn run_replica_batch(
     }
     record(&mut stage_samples, StageId::Ledger, t.elapsed());
 
-    // I5: encode（行ループ内。I3 と同じ内容を再度 encode する。モジュール冒頭
-    // コメント「encode が 2 回」参照）。
+    // I5: 次元検証 ＋ encode（行ループ内。I3 と同じ内容を再度 encode する。
+    // モジュール冒頭コメント「encode が 2 回」参照）。production
+    // （`insert_rows_unchecked`）は行ループの中で `schema.validate_embedding_dim(
+    // row.embedding.len())?` を encode・insert の直前に毎行呼ぶため、その
+    // コストが E0 の残差へ混入しないよう I5 の計測区間へ含める
+    // （codex-review P2・Issue #396 指摘: 検証が欠落すると測定契約「残差＝
+    // スキーマ取得・commit_boundary ガード・抽象化コスト」が成立しない）。
     let t = Instant::now();
     let row_encoded: Vec<Vec<u8>> = (0..rows)
         .map(|i| {
+            schema
+                .validate_embedding_dim(batch.embeddings[i].len())
+                .expect("validate_embedding_dim for I5 (matches production per-row check)");
             encode_row_reimpl(
                 TENANT,
                 batch.is_public[i],
