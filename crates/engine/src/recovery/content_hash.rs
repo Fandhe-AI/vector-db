@@ -136,6 +136,48 @@ impl HashInputBuilder {
     }
 }
 
+/// [`HashInputBuilder`] の参照実装（Issue #399 以前の一括処理版。バッチ全体を
+/// `Vec<u8>` へ都度 `extend_from_slice` で連結し、`finish` で [`sha256_reference`]
+/// （パディングのため全体をもう一度複製する二重コピー構造）を 1 回呼ぶ）。
+/// `#[cfg(test)]`。本番経路は経由しない（理由は [`for_insert`] 参照）。同じ
+/// `push_bytes`／`push_u64` 呼び出しパターンを共有する [`for_insert_batch_encoded_reference`]
+/// から、production の [`HashInputBuilder`]（ストリーミング版）と同一のフィールド
+/// 境界（行ごとに `push_u64` 1 回＋ `push_bytes` 1 回）で A/B 計測できるようにする
+/// （codex-review 指摘・PR #419: 単一の巨大バッファへの 1 回 `update` 呼び出しでは
+/// 本番経路〔行・フィールド単位の多数回 `update`〕を再現しない）。
+#[cfg(test)]
+struct HashInputBuilderReference(Vec<u8>);
+
+#[cfg(test)]
+impl HashInputBuilderReference {
+    fn new(tag: OpTag) -> Self {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DOMAIN_TAG);
+        buf.push(tag as u8);
+        HashInputBuilderReference(buf)
+    }
+
+    fn push_bytes(&mut self, field: &[u8]) -> Result<(), StorageError> {
+        let len = u32::try_from(field.len())
+            .map_err(|_| StorageError::Codec("content hash field too large".to_string()))?;
+        self.0.extend_from_slice(&len.to_le_bytes());
+        self.0.extend_from_slice(field);
+        Ok(())
+    }
+
+    fn push_u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_raw(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    fn finish(self) -> ContentHash {
+        ContentHash(sha256_reference(&self.0))
+    }
+}
+
 /// `row_codec::Value` 1 個をタグ＋長さプレフィクス付きで連結する。スキーマに
 /// 依存せず（`Value` の判別子のみで境界を確定できる）、ハッシュ対象を DB 状態
 /// （カタログのスキーマ定義）から独立させる。
@@ -262,6 +304,24 @@ pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHa
         let encoded = encode_row(row)?;
         b.push_u64(*id);
         b.push_bytes(&encoded)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_insert_batch_encoded`] と同一のフィールド境界（行ごとに `push_u64` 1 回＋
+/// `push_bytes` 1 回）を、[`HashInputBuilderReference`]（Issue #399 以前の一括処理版）
+/// で計算する A/B 計測専用の参照実装。`#[cfg(test)]`。`encoded_row` は呼び出し元が
+/// 用意した `&[u8]` をそのまま受け取り、production の `for_insert_batch_encoded` と
+/// 引数・呼び出しパターンを完全に揃える（codex-review 指摘・PR #419）。
+#[cfg(test)]
+fn for_insert_batch_encoded_reference(rows: &[(u64, &[u8])]) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilderReference::new(OpTag::InsertBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (id, encoded_row) in rows {
+        b.push_u64(*id);
+        b.push_bytes(encoded_row)?;
     }
     Ok(b.finish())
 }
@@ -966,6 +1026,20 @@ mod tests {
         assert_eq!(h_new, h_ref);
     }
 
+    // [`for_insert_batch_encoded_reference`]（Issue #399 以前の一括処理版・A/B 計測
+    // 専用）が production の [`for_insert_batch_encoded`]（ストリーミング版）と
+    // 同一ダイジェストを返すことをピン留めする（codex-review 指摘・PR #419）。
+    #[test]
+    fn for_insert_batch_encoded_reference_matches_streaming() {
+        let encoded_a: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        let encoded_b: Vec<u8> = (0..700u32).map(|i| ((i * 3) % 256) as u8).collect();
+        let hash_input: [(u64, &[u8]); 2] = [(1, &encoded_a), (2, &encoded_b)];
+
+        let h_streaming = for_insert_batch_encoded(&hash_input).expect("hash");
+        let h_reference = for_insert_batch_encoded_reference(&hash_input).expect("hash");
+        assert_eq!(h_streaming, h_reference);
+    }
+
     #[test]
     fn for_update_encoded_matches_reference_impl() {
         let row = RowInput {
@@ -980,42 +1054,74 @@ mod tests {
         assert_eq!(h_new, h_ref);
     }
 
-    // Issue #399 受け入れ 2: ストリーミング版（本番経路）と参照実装（旧・一括処理版。
-    // バッチ全体を `Vec` へ連結してからパディングする）の処理時間を、
-    // 台帳ハッシュ対象と同オーダー（1,000 行 × 約 0.5KB ≈ 500KB）の入力で
-    // 手元比較するための手動専用テスト（CI 非配線・既定 ignore。
-    // `docs/design/ingest-stage-profile.md`「Issue #399 追記」節の実測手順・
-    // 前後比較表の根拠）。`cargo test --release -p engine --lib
+    // Issue #399 受け入れ 2: ストリーミング版（本番経路 `for_insert_batch_encoded`）と
+    // 参照実装（旧・一括処理版 `for_insert_batch_encoded_reference`。バッチ全体を
+    // `Vec` へ連結してからパディングする）の処理時間を、台帳ハッシュ対象と同オーダー
+    // （1,000 行 × 約 0.5KB ≈ 500KB）の入力で手元比較するための手動専用テスト
+    // （CI 非配線・既定 ignore）。`cargo test --release -p engine --lib
     // recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing
     // -- --ignored --nocapture` で実行する。
+    //
+    // codex-review 指摘（PR #419）: 従来はここで事前構築済みの 500KB 単一バッファへ
+    // `update`/一括ハッシュを 1 回だけ呼んでおり、本番経路（`HashInputBuilder` が
+    // 行・フィールド単位で `push_u64`／`push_bytes` を多数回呼ぶ）を再現していなかった。
+    // 本版は `for_insert_batch_encoded`（本番。ストリーミング）と
+    // `for_insert_batch_encoded_reference`（旧・一括処理版。同じ行・フィールド境界を
+    // 共有する `#[cfg(test)]` 参照実装）を、同一の 1,000 行入力へ通す形で比較する。
     #[test]
     #[ignore = "手動計測専用（CI 非配線。--ignored --nocapture で明示実行する）"]
     fn sha256_streaming_vs_reference_manual_timing() {
         use std::time::Instant;
 
-        let input: Vec<u8> = (0..500_000u32).map(|i| (i % 256) as u8).collect();
+        // 1 行あたり約 0.5KB（実運用の embedding + metadata の encode 済みバイト列
+        // と同オーダー）× 1,000 行 ≈ 500KB。行ごとに長さを僅かに変えて境界処理
+        // （パディング境界近辺）も網羅する。
+        let rows_owned: Vec<(u64, Vec<u8>)> = (0..1_000u64)
+            .map(|id| {
+                let len = 480 + (id % 41) as usize; // 480..=520 バイトで揺らす
+                let row: Vec<u8> = (0..len as u32)
+                    .map(|i| ((i.wrapping_add(id as u32)) % 256) as u8)
+                    .collect();
+                (id, row)
+            })
+            .collect();
+        let hash_input: Vec<(u64, &[u8])> = rows_owned
+            .iter()
+            .map(|(id, row)| (*id, row.as_slice()))
+            .collect();
+        let total_bytes: usize = rows_owned.iter().map(|(_, row)| row.len()).sum();
         let iterations = 200;
 
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(sha256_reference(std::hint::black_box(&input)));
+            std::hint::black_box(
+                for_insert_batch_encoded_reference(std::hint::black_box(&hash_input))
+                    .expect("hash"),
+            );
         }
         let reference_elapsed = start.elapsed();
 
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(sha256(std::hint::black_box(&input)));
+            std::hint::black_box(
+                for_insert_batch_encoded(std::hint::black_box(&hash_input)).expect("hash"),
+            );
         }
         let streaming_elapsed = start.elapsed();
 
         println!(
-            "sha256_reference: {reference_elapsed:?} ({:.3} ns/byte)",
-            reference_elapsed.as_nanos() as f64 / (input.len() as f64 * iterations as f64)
+            "for_insert_batch_encoded_reference (旧・一括処理版): {reference_elapsed:?} \
+             ({:.3} ns/byte)",
+            reference_elapsed.as_nanos() as f64 / (total_bytes as f64 * iterations as f64)
         );
         println!(
-            "sha256 (streaming): {streaming_elapsed:?} ({:.3} ns/byte)",
-            streaming_elapsed.as_nanos() as f64 / (input.len() as f64 * iterations as f64)
+            "for_insert_batch_encoded (新・ストリーミング版・本番経路): {streaming_elapsed:?} \
+             ({:.3} ns/byte)",
+            streaming_elapsed.as_nanos() as f64 / (total_bytes as f64 * iterations as f64)
         );
-        assert_eq!(sha256_reference(&input), sha256(&input));
+        assert_eq!(
+            for_insert_batch_encoded_reference(&hash_input).expect("hash"),
+            for_insert_batch_encoded(&hash_input).expect("hash")
+        );
     }
 }
