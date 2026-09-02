@@ -1,16 +1,25 @@
 # ANN 索引（HNSW/IVF）採否の設計検討
 
-- **ステータス**: Proposed（オーナー判断待ち）
-- **対応 Issue**: #367
+- **ステータス**: Accepted（2026-09-02 オーナー承認〔Issue #402〕。B 案
+  〔条件付き opt-in 採用〕・自作 HNSW・依存追加なし。判断記録・実装契約は
+  本書「判断記録」「実装契約（B 案）」節を参照。実装は Phase 3 タスク
+  #404〜#413 で行う）
+- **対応 Issue**: #367（判断材料整理）・#403（判断記録・実装契約の追記）・
+  #402（Phase 3 親トラッキング）・#385（feature_bench 再測定トラッキング）
 - **関連ポインタ（spec・本文は転記しない）**: CORE-9・CORE-10・CORE-12・CORE-13・
-  `docs/spec/05-tasks.md` TASK-131・TASK-132・`docs/spec/06-roadmap.md` MS-2・
+  SEARCH-1・SEARCH-3・SEARCH-7・
+  `docs/spec/05-tasks.md` TASK-120・TASK-121・TASK-131・TASK-132・
+  `docs/spec/06-roadmap.md` MS-2・
   `docs/spec/01-brainstorm.md`・
   `docs/spec/03-poc/real-scale-recall-reeval/README.md`（実データ規模での Recall 再評価）
 - **関連ドキュメント**: `crates/engine/docs/ann-future-work.md`・
   `docs/design/core5-contrast-engine.md`・`docs/design/hybrid-recall-regression.md`・
   `docs/design/hybrid-refetch-latency.md`・`docs/design/rrf-tie-break-determinism.md`・
   `docs/design/c1-p95-dedicated-env-reverification.md`・
-  `docs/design/precision-confidence-gate.md`
+  `docs/design/precision-confidence-gate.md`・
+  `docs/design/knn-stage-profile.md`・`docs/design/knn-two-stage-topk.md`・
+  `docs/design/dot-kernel-multi-accumulator.md`・
+  `docs/design/sql-arena-generation-cache.md`・`docs/design/sparse-index-cache.md`
 
 ## 目的・位置づけ
 
@@ -22,6 +31,12 @@
 RLS 再評価の観点」の列挙に留まり、採否判断そのものに必要な方式比較・規模
 閾値・依存コストの整理は行っていない。本書はその欠落を埋める位置づけであり、
 同メモの内容を置き換えるものではない。
+
+Issue #402 でオーナーが B 案（条件付き opt-in 採用）を採用したため、本書は
+判断材料に加えて Phase 3 実装（#404〜#413）の契約 SSOT を兼ねる。以下の
+「ANN 方式の概観と比較」〜「選択肢比較と推奨」の判断材料本文（比較表・
+仮説・推奨 A の記述）は判断時点の記録として改変せず残す。判断結果・実装
+契約は「判断記録」節以降に追記した。
 
 ## 現状の前提（コード事実）
 
@@ -186,9 +201,8 @@ ANN は本質的に recall と探索コストのトレードオフを導入す�
   ・決定性契約との整合コストが最も高く、A・B で判断材料が揃ってから再検討
   すべき。
 
-**推奨は A を既定とする。** B は将来のトリガー条件（実測での損益分岐点超過・
-実コーパス規模の判明・オーナー承認）が揃った時点で再検討する選択肢として
-明文化するに留める。
+**推奨は A を既定とする。**（判断結果）Issue #402 でオーナーは B を採用した。
+推奨 A からの転換理由は「判断記録」節を参照。
 
 ## 採用時の前提条件・受け入れ基準案（B を選ぶ場合）
 
@@ -204,14 +218,150 @@ ANN は本質的に recall と探索コストのトレードオフを導入す�
 
 | 項目 | 内容 |
 | ---- | ---- |
-| 判断（採用／見送り／条件付き採用） | （未記入） |
-| 根拠 | （未記入） |
-| 条件（条件付き採用の場合） | （未記入） |
-| 判断日 | （未記入） |
-| 記入者 | （未記入） |
+| 判断（採用／見送り／条件付き採用） | 条件付き採用（B 案）。既定エンジンは `ParallelBruteForce` のまま不変とし、`SearchEngineKind` へ opt-in variant を追加する |
+| 根拠 | (1) main 時点の `feature_bench` 再測定（Issue #385）で `vector_knn`／`mode_recall`／`mode_precision` が総当たりのまま規模線形（p50 数 ms オーダー）に残存し、Issue #362〜#366 の総当たり側最適化（arena キャッシュ・2 段分離・複数アキュムレータ）では規模線形性そのものは解消しないことが確認された（`knn-stage-profile.md`・`knn-two-stage-topk.md`・`dot-kernel-multi-accumulator.md`）。(2) 依存最小方針（[dependency-policy](../../.claude/rules/dependency-policy.md)）との整合のため方式は**自作 HNSW**（pure Rust・`unsafe` 不使用・依存追加なし）を選択する。(3) `usearch` を production 採用しない理由: `cxx`/`cxx-build` 経由の C++17 ビルドが `wire-server` の production ビルド・aarch64 クロスコンパイル確認（`make check-cross`）に波及すること、Rust バインディングが `unsafe impl Send`/`unsafe impl Sync` を前提とし本リポの `unsafe` 原則禁止規約（[coding-rust](../../.claude/rules/coding-rust.md)）と整合しないこと、`filtered_search` が FFI 越しの述語コールバックによる走査時フィルタであり `(table, PolicyContext)` 単位の事前フィルタ縮約集合上に索引を構築し `PolicyContext::is_visible` の単一照合パスで結果を確定させる本リポの契約と噛み合わないこと。(4) pure Rust の ANN クレート（`hnsw_rs`・`instant-distance` 等）は個別評価しておらず、依存追加そのものを回避する方針を優先した |
+| 条件（条件付き採用の場合） | 「採用時の前提条件・受け入れ基準案」の 4 条件の充足方針: 条件 1（損益分岐点の A/B 事前実測）は事前実測を行わず、Issue #385 の再測定（規模線形残存）を着手根拠とし、Phase 3 完了時の前後比較（#413）で事後確認する運用へ差し替える（オーナー判断による逸脱）。条件 2（可視カーディナリティ推定による plain scan / ANN 切替・fail-closed）は #409／#410 で実装する。条件 3（SEARCH 系 Recall ゲートの同一閾値通過）は #412 で検証する。条件 4（依存追加のオーナー承認）は自作のため不要 |
+| 判断日 | 2026-09-02（Issue #385／#402 の議論を経てオーナーが承認。本 ADR への転記は Issue #403） |
+| 記入者 | Issue #403 の実装担当（自動運転の実装 Agent）がオーナー承認内容を本節へ転記した |
 
-判断確定後は、本節を記入のうえ別コミットでステータスを `Accepted` へ更新する
+本コミットで、本節の記入とあわせてステータスを `Accepted` へ更新した
 （`docs/design/precision-confidence-gate.md` の運用と同様の流儀）。
+
+## 実装契約（B 案・Phase 3 の SSOT）
+
+以下は B 案採用に伴う実装契約であり、Phase 3 の各タスク（#404〜#413）は
+本節に従う。パラメータ初期値は実装・実測の結果に応じて本節を更新しながら
+調整してよい。
+
+### 1. opt-in 方法（#407）
+
+- `search_engine.rs::SearchEngineKind` へ `Hnsw(HnswParams)` variant を追加し、
+  `build` から `HnswSearchProvider` を返す分岐を 1 つ加える
+- エンジン選択は **コード上の明示指定（`EngineCore` 構築時オプション）のみ**
+  とし、環境変数・設定ファイルによる実行時上書きは設けない（CORE-12 踏襲）
+- テーブル単位カタログ属性による opt-in・`wire-server` CLI オプションでの
+  露出は初期スコープ外とする（カタログ・永続化の変更を伴うため別 Issue で
+  判断する）
+- 既定エンジンが変わらないことをテストで固定する
+- 不正パラメータ（`M`/`ef_construction`/`ef_search` の 0 や上限超過等）は
+  `22023` 相当の `wire_code` で fail-closed に拒否する
+
+### 2. 既定パラメータ（#404〜#406）
+
+- `HnswParams { m: 16, ef_construction: 100, ef_search: 64 }`
+- ground layer（最下層）の次数上限は `2*M`、上位層は `M`
+- 層割当は決定的シードによる乱択とする
+- 上記は初期値であり、#413 の実測結果に応じて調整してよい（調整時は本節を
+  更新する）
+
+### 3. 決定性契約（#405・#410・#411）
+
+- ANN 経路が保証するのは「同一索引・同一クエリ・同一パラメータで結果が
+  再現される」ことと「取得済み候補内の同点は id 昇順」であることまでとする
+- 総当たりを前提とする境界同点グループ完全化
+  （`docs/design/rrf-tie-break-determinism.md`）は **ANN 経路では保証しない**
+  （探索打ち切りにより未探索の同点候補が生じうるため）。既定エンジン経路の
+  既存契約は不変
+- hybrid 密チャネルで ANN を使う場合、密プールの再取得ループ（`ef` 倍増
+  再探索・`MAX_FETCH_K` 上限）で k 件充足を保証し、上限到達時は brute-force
+  へ縮退する。`complete_boundary_tie_group` との相互作用は決定的フィクスチャ
+  で検証する
+- 使用エンジン種別・brute-force への縮退有無を `EXPLAIN` へ露出する
+  （`path_hint`／`kind_hint`／`mode`／`mode_source` と同じ体系。既定エンジン
+  使用時は既存出力から後方互換を保つ）
+
+### 4. RLS 事前フィルタとの切替方針（#409・#410）
+
+- 事後フィルタは不採用（ADR 既存判断・P0）を維持する
+- `SearchInput.ids`（可視行集合）の件数と索引全体件数の比
+  `full_scan_ratio`（初期値 0.1・実測で調整）で判定し、可視率が閾値未満なら
+  可視縮約集合上の brute-force、閾値以上なら可視 id マスク付き HNSW 探索
+  とする。非可視ノードは探索経路として通過してよいが、結果・スコア・
+  エラー・レイテンシへ露出してはならない
+- 索引未構築・構築失敗・世代不一致など不確実な場合は常に厳密検索へ倒す
+  （fail-closed）
+- 結果は必ず `PolicyContext::is_visible` の単一照合パスを通す
+- 可視カーディナリティ・`full_scan_ratio` の数値は `EXPLAIN` へ露出しない
+  （既存 EXPLAIN の行数非露出方針を踏襲）
+- TASK-138（RLS 暗黙適用の全読み取り経路一般化検証）・
+  `crates/engine/tests/plan_rls_boost.rs` の検証対象へ ANN 経路を追加する
+
+### 5. 増分更新（#408・#412）
+
+- `(table, PolicyContext)` × テーブル世代をキーに構築済み索引をキャッシュ
+  する（`sql/arena_cache.rs::SqlArenaCache`・`sql/sparse_cache.rs::SparseIndexCache`
+  と同型で、失効源泉は `catalog::table_generation_in_txn`）
+- 挿入直後の未索引分は brute-force で併用して結果をマージし、未索引比率
+  （行数比）が閾値を超えたら再構築する
+- 同一パス置換（TASK-120）で消えた旧チャンクは可視 id 集合に含まれないため
+  結果からマスクされ、再構築で物理的に除去する（tombstone 相当）
+- 世代競合時の insert 拒否は Issue #280 の fail-closed 契約を踏襲する
+- 索引構築失敗時は brute-force へ縮退し、結果契約は不変とする
+- TASK-121 系の増分回帰へ ANN 経路の非劣化アサーションを追加する
+
+### 6. 永続化
+
+- 初期スコープ外とする。索引はメモリ内のみに保持し、プロセス再起動で
+  再構築する。redb への索引永続化・クラッシュ耐性検証は別 Issue 候補とする
+
+### 7. Recall 受け入れ（#412）
+
+- SEARCH 系 3 ゲート（hybrid 小規模／大規模・rerank 非劣化・query-planning
+  大規模）を ANN opt-in 経路でも同一閾値で通過することを求める
+- `recall.yml` は既定エンジンのまま接続し、ANN 側はローカルでの
+  `RECALL_VERBOSE`・手動実行により実測を記録する（閾値の非公開運用は維持）
+
+### 8. 並列構築（#406）
+
+- `std::thread` ベース（`parallel_search.rs` と同方針）とし、要素単位ロック・
+  エントリポイント更新のみ排他する
+- 初期の少数点は単一スレッドで構築する
+- `unsafe` は使用しない
+
+## 受け入れ基準と Phase 3 タスクの対応
+
+「採用時の前提条件・受け入れ基準案（B を選ぶ場合）」節の各項目と Phase 3
+タスクの対応は以下のとおり。
+
+| 受け入れ基準 | 対応タスク |
+| ---- | ---- |
+| 既定エンジン不変・ANN は明示選択のみ | #407 |
+| `EXPLAIN` へエンジン種別露出 | #411 |
+| 決定性契約（同点規約・境界完全化 or 代替契約）の明文化 | #403（本書）・#405・#410 |
+| `PolicyContext::is_visible` 単一照合パス・fail-closed の維持 | #409・#410 |
+| SEARCH 系 Recall ゲートを ANN 有効経路でも同一閾値で通過 | #412 |
+| TASK-121 系増分回帰の ANN 対応 | #408・#412 |
+| （B 案条件 1）損益分岐点の実測 | #413（事後の前後比較） |
+| 基盤（HNSW 構築・探索・並列化） | #404・#405・#406 |
+
+## 参照した外部実装（手法名・ライセンスのみ・コード転記なし）
+
+自作 HNSW の設計にあたり、以下の手法・実装を参照した。ソースコード・
+コメントの転記は行わず、公開されている手法名・設計方針・ライセンスのみを
+記す。
+
+- **HNSW**（Malkov & Yashunin の論文）: 層構造・`ef` 探索・近傍選択
+  ヒューリスティックの基本設計
+- **qdrant**（Apache-2.0）: HNSW の既定パラメータ・`full_scan_threshold` に
+  よる plain scan 切替・初期点の単一スレッド構築という設計方針
+- **pgvector**（PostgreSQL License）: 並列ビルドのロック粒度・
+  `iterative_scan` 型の境界再取得という設計方針
+- **usearch**（Apache-2.0）: 既定パラメータの参考・CORE-5 の bench 対照
+  エンジンとしての既存利用（production は非採用のまま）
+- **Lance**（Apache-2.0）: 未索引分 brute-force 併用＋再構築という設計方針
+
+各実装の既定値等を数値として引用する場合は実装時に上流ドキュメントで
+確認し、確認できない値は本リポの採用値としてのみ記載する（出典の数値を
+誤って帰属させない）。
+
+## 判断確定後のスコープ外（申し送り）
+
+- HNSW 索引の永続化（「実装契約」6 節参照）
+- テーブル単位カタログ属性による opt-in・`wire-server` CLI オプション露出
+- pure Rust ANN クレート（`hnsw_rs`・`instant-distance` 等）の個別評価
+- README「実装方針（要点）」の opt-in 手順・公開境界拡張（#413 が担当）
+- CLAUDE.md の `- ステータス:` 行が 2 本重複し内容が一部乖離している件の
+  統合（本 Issue のスコープ外。両行を同一内容へ更新するに留める）
 
 ## spec 側への申し送り候補（ポインタのみ）
 
@@ -224,10 +374,12 @@ ANN は本質的に recall と探索コストのトレードオフを導入す�
 
 ## スコープ外
 
-- ANN の実装・`SearchEngineKind` への variant 追加
+- ANN の実装・`SearchEngineKind` への variant 追加は Phase 3 タスク
+  #404〜#413 で実装する。本 Issue（#403）は判断記録・実装契約の記述のみ
 - 依存追加（usearch の production 採用・pure Rust クレート導入）
 - `contrast_bench.rs` への HNSW 対照経路追加とその実測
-- README「実装方針（要点）」の公開境界拡張
+- HNSW 索引の永続化・テーブル単位カタログ属性による opt-in・
+  `wire-server` CLI オプション露出・pure Rust ANN クレートの個別評価
+- README「実装方針（要点）」の公開境界拡張（#413 で扱う）
 
-いずれも採用判断（B 以上を選ぶ場合）が確定し、オーナー承認を得た後に別
-Issue で扱う。
+いずれも Phase 3 タスク（#404〜#413）または判断確定後の別 Issue で扱う。
