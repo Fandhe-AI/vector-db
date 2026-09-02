@@ -7,8 +7,9 @@
 //! # 段の再実装（ドリフト対策）
 //!
 //! `insert_rows_unchecked`（`crates/engine/src/tenant.rs`）の内部段（`storage.rs::
-//! encode_row`・`recovery::content_hash::for_insert_batch`・`recovery::ledger::
-//! record_in_txn` の台帳エントリ符号化）はいずれも `pub(crate)` で、独立コンパイル
+//! encode_row`・`recovery::content_hash::for_insert_batch_encoded`（Issue #397 で
+//! 事前エンコード共有化）・`recovery::ledger::record_in_txn` の台帳エントリ符号化）は
+//! いずれも `pub(crate)` で、独立コンパイル
 //! 単位であるベンチからは呼べない（`knn_profile.rs` と同じ制約。`docs/design/
 //! ingest-stage-profile.md`「前提調査の要点」節参照）。本モジュールはこれらを
 //! `std` のみで再実装し、`tests/ingest_profile_accept.rs` が正本（`engine::storage::
@@ -242,12 +243,15 @@ pub enum StageId {
     Precheck,
     /// I2: `begin_write`。
     BeginWrite,
-    /// I3: content_hash（全行の encode 再実装 ＋ SHA-256）。
+    /// I3: content_hash（I5 のエンコード済みバイト列に対する SHA-256 再実装のみ。
+    /// Issue #397 以前は本段の内部でも全行を再度 encode していたが、production の
+    /// 事前エンコード共有化に追随してレプリカも I5 の結果を共有する形へ変更した）。
     ContentHash,
     /// I4: 台帳記録（`op_ledger` get+insert・`last_op` insert）。
     Ledger,
-    /// I5: encode（行ループ内。I3 とは別に再度全行 encode する。モジュール冒頭
-    /// コメント「段の再実装」節参照）。
+    /// I5: encode（行ごとに 1 回のみ。I3・I6 の双方がこの結果を共有する。
+    /// `ingest_profile_bench.rs` では I2 の直後・I3 より前に実行する順序へ変更済み
+    /// （Issue #397）。モジュール冒頭コメント「段の再実装」節参照）。
     Encode,
     /// I6: redb insert（`insert_unique_row` 相当）。
     RedbInsert,

@@ -20,14 +20,23 @@
 //!   `op_ledger`・`last_op`・`table_generation`）・同じ順序で再現し、段ごとに
 //!   `Instant` で区切って計測する。
 //!
+//! 段の実行順序は production（`insert_rows_unchecked`）に合わせて
+//! I1 → I2 → **I5 → I3** → I4 → I6 → I7 → I8 とする（Issue #397 で production が
+//! 「行ごとに 1 回だけ encode し、その結果を台帳ハッシュと redb 書き込みで共有する」
+//! 構成へ変更されたことに追随。段の識別子・ラベル・8 段構成そのものは Issue #396 の
+//! ものを維持し、実行順序のみ入れ替える）。
+//!
 //! | 段 | 内容 |
 //! | --- | --- |
 //! | I1 | 所有権検査（`PolicyContext::is_owner` 全件）＋ バッチ内 id 重複検出 |
 //! | I2 | `begin_write` |
-//! | I3 | content_hash（全行の encode 再実装 ＋ SHA-256 再実装） |
+//! | I5 | encode（行ごとに 1 回のみ。Issue #397 以前は I3 の内部でも再度 encode
+//! しており **encode が 2 回**走っていたが、現在は行ごとに 1 回のみで
+//! I3・I6 の双方が I5 の結果を共有する） |
+//! | I3 | content_hash（I5 のエンコード済みバイト列に対する SHA-256 再実装のみ） |
 //! | I4 | 台帳記録（`op_ledger` get+insert・`last_op` insert） |
-//! | I5 | encode（行ループ内。実経路は I3 と I5 で **encode が 2 回**走る） |
-//! | I6 | redb insert（`insert` の戻り値が `None` であることを検査） |
+//! | I6 | 次元検証（行ごと）＋ redb insert（`insert` の戻り値が `None` であることを
+//! 検査） |
 //! | I7 | 世代更新（`table_generation` get→checked_add→insert） |
 //! | I8 | `commit` |
 //! | 残差 | E0 − Σ(I1..I8)。スキーマ取得（カタログデコード）・`commit_boundary`
@@ -543,9 +552,14 @@ fn run_replica_batch(
     let write_txn = db.begin_write().expect("begin_write for replica batch");
     record(&mut stage_samples, StageId::BeginWrite, t.elapsed());
 
-    // I3: content_hash（全行 encode 再実装 ＋ SHA-256）。
+    // I5: encode（行ごとに 1 回のみ。Issue #397 で production
+    //〔`insert_rows_unchecked`〕が「ハッシュ計算用と書き込み用でそれぞれ
+    // encode し合計 2 回走らせる」構成から「1 回 encode し、その結果をハッシュと
+    // 書き込みで共有する」構成へ変更されたことに追随し、レプリカでも I3 より
+    // 前で 1 回だけ encode する。`validate_embedding_dim` は production では
+    // encode 共有化後も行ループ内（I6 側）に残っているため、ここでは呼ばない）。
     let t = Instant::now();
-    let hash_encoded: Vec<Vec<u8>> = (0..rows)
+    let row_encoded: Vec<Vec<u8>> = (0..rows)
         .map(|i| {
             encode_row_reimpl(
                 TENANT,
@@ -553,13 +567,19 @@ fn run_replica_batch(
                 &batch.embeddings[i],
                 &batch.metadata[i],
             )
-            .expect("encode_row_reimpl for I3")
+            .expect("encode_row_reimpl for I5")
         })
         .collect();
+    record(&mut stage_samples, StageId::Encode, t.elapsed());
+
+    // I3: content_hash（I5 で得たエンコード済みバイト列に対する SHA-256 再実装のみ。
+    // Issue #397 以前はここで全行を再度 encode していたが、事前エンコード共有化に
+    // 伴い不要になった）。
+    let t = Instant::now();
     let rows_for_hash: Vec<(u64, &[u8])> = batch
         .ids
         .iter()
-        .zip(hash_encoded.iter())
+        .zip(row_encoded.iter())
         .map(|(id, enc)| (*id, enc.as_slice()))
         .collect();
     let hash = content_hash_insert_batch_reimpl(&rows_for_hash).expect("content_hash for I3");
@@ -596,37 +616,22 @@ fn run_replica_batch(
     }
     record(&mut stage_samples, StageId::Ledger, t.elapsed());
 
-    // I5: 次元検証 ＋ encode（行ループ内。I3 と同じ内容を再度 encode する。
-    // モジュール冒頭コメント「encode が 2 回」参照）。production
-    // （`insert_rows_unchecked`）は行ループの中で `schema.validate_embedding_dim(
-    // row.embedding.len())?` を encode・insert の直前に毎行呼ぶため、その
-    // コストが E0 の残差へ混入しないよう I5 の計測区間へ含める
-    // （codex-review P2・Issue #396 指摘: 検証が欠落すると測定契約「残差＝
-    // スキーマ取得・commit_boundary ガード・抽象化コスト」が成立しない）。
-    let t = Instant::now();
-    let row_encoded: Vec<Vec<u8>> = (0..rows)
-        .map(|i| {
-            schema
-                .validate_embedding_dim(batch.embeddings[i].len())
-                .expect("validate_embedding_dim for I5 (matches production per-row check)");
-            encode_row_reimpl(
-                TENANT,
-                batch.is_public[i],
-                &batch.embeddings[i],
-                &batch.metadata[i],
-            )
-            .expect("encode_row_reimpl for I5")
-        })
-        .collect();
-    record(&mut stage_samples, StageId::Encode, t.elapsed());
-
-    // I6: redb insert（`insert_unique_row` 相当。戻り値が `None` であることを検査）。
+    // I6: 次元検証 ＋ redb insert（`insert_unique_row` 相当。戻り値が `None`
+    // であることを検査）。production の行ループが `validate_embedding_dim` を
+    // encode・insert の直前ではなく I3・I4 の後（台帳記録後）に行うため
+    // （`tenant.rs::insert_rows_unchecked`。Issue #397 で事前エンコードへ変更
+    // した後も位置は不変）、レプリカでもここへ含める（codex-review P2・
+    // Issue #396 指摘の測定契約「残差＝スキーマ取得・commit_boundary ガード・
+    // 抽象化コスト」を維持するため。E0 の残差へ検証コストが混入しないようにする）。
     let t = Instant::now();
     {
         let mut row_table = write_txn
             .open_table(ROW_TABLE)
             .expect("open user_rows/docs table for I6");
-        for (id, encoded) in batch.ids.iter().zip(row_encoded.iter()) {
+        for (i, (id, encoded)) in batch.ids.iter().zip(row_encoded.iter()).enumerate() {
+            schema
+                .validate_embedding_dim(batch.embeddings[i].len())
+                .expect("validate_embedding_dim for I6 (matches production per-row check)");
             let prev = row_table
                 .insert((TENANT, *id), encoded.as_slice())
                 .expect("insert row for I6");

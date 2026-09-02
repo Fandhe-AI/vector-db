@@ -522,6 +522,10 @@ pub(crate) fn insert_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
+        // エンコードは 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用と redb 書き込み用で
+        // それぞれ `encode_row` していた二重実行を排除し、ここで計算した結果を
+        // `content_hash::for_insert_encoded` と `insert_unique_row` の双方で共有する。
+        let encoded = encode_row(row)?;
         // 台帳照合用ハッシュ（TASK-101・RECOVER-10）はクライアント要求由来の内容
         // （id・行データ）のみから計算する（DB 状態に依存しない決定性の担保。
         // `content_hash` モジュールドキュメント参照）。同一 write トランザクション内で
@@ -530,7 +534,7 @@ pub(crate) fn insert_row_unchecked(
         // 行の書き込みへ進まず、この後 `write_txn` が commit されない（呼び出し元の `?`
         // で早期 return → drop）ため台帳追記も破棄され、部分書き込みが残らない
         // （fail-closed。TASK-94・RECOVER-3 の原子性契約を包含する）。
-        let content_hash = content_hash::for_insert(id, row)?;
+        let content_hash = content_hash::for_insert_encoded(id, &encoded)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -544,7 +548,6 @@ pub(crate) fn insert_row_unchecked(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
-        let encoded = encode_row(row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -631,12 +634,41 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
+        // エンコードは行ごとに 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用
+        // （`content_hash::for_insert_batch` 内部）と redb 書き込み用でそれぞれ
+        // `encode_row` していた二重実行を排除する。要求記載順のまま事前に全行を
+        // エンコードし、その結果をハッシュ計算・行書き込みの双方で共有する。
+        // 件数は呼び出し元のスライス長で上限が決まるため、確保はフォールブルにする
+        // （無制限 `with_capacity` を使わない。coding-rust.md）。エンコードの失敗
+        // （tenant 空・上限超過等）は、以前 `for_insert_batch` が行ごとに
+        // `encode_row` していた際と同じ要求記載順で最初に発生するため、
+        // どの行が最初に失敗するか・エラー種別は変更前と同一になる。
+        let mut encoded_rows: Vec<Vec<u8>> = Vec::new();
+        encoded_rows.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch encode buffer".to_string(),
+            ))
+        })?;
+        for (_, row) in rows {
+            encoded_rows.push(encode_row(row)?);
+        }
         // バッチ全体で 1 ハッシュ（TASK-101・RECOVER-10。`content_hash` モジュール
         // ドキュメント参照。要求記載順を含めて連結する）。`Err` の場合は行の書き込みへ
         // 進まず、この後 `write_txn` が commit されない（呼び出し元の `?` で早期
         // return → drop）ため台帳追記も破棄され、部分書き込みが残らない（fail-closed。
         // TASK-94・RECOVER-3 の原子性契約を包含する）。
-        let content_hash = content_hash::for_insert_batch(rows)?;
+        let mut hash_input: Vec<(u64, &[u8])> = Vec::new();
+        hash_input.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch hash input".to_string(),
+            ))
+        })?;
+        hash_input.extend(
+            rows.iter()
+                .zip(encoded_rows.iter())
+                .map(|((id, _), encoded)| (*id, encoded.as_slice())),
+        );
+        let content_hash = content_hash::for_insert_batch_encoded(&hash_input)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -648,10 +680,9 @@ pub(crate) fn insert_rows_unchecked(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
-        for (id, row) in rows {
+        for ((id, row), encoded) in rows.iter().zip(encoded_rows.iter()) {
             schema.validate_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
-            let encoded = encode_row(row)?;
             insert_unique_row(&mut row_table, key, encoded.as_slice())?;
         }
     }
@@ -827,7 +858,13 @@ pub(crate) fn update_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
-        let content_hash = content_hash::for_update(id, row)?;
+        // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
+        // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
+        // ここでの `encode_row` は変更前も `owns_existing` 判定より前（台帳ハッシュ
+        // 計算の内部）で無条件に走っていたため、この位置へ移してもエラー優先順位
+        // （`encode_row` のエラー → 台帳の内容照合 → `NotFound`）は変わらない。
+        let encoded = encode_row(row)?;
+        let content_hash = content_hash::for_update_encoded(id, &encoded)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -858,7 +895,6 @@ pub(crate) fn update_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        let encoded = encode_row(row)?;
         row_table
             .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;

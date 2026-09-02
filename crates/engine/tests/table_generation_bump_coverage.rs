@@ -66,8 +66,8 @@ const COMMIT_BOUNDARY_MODULE_FILE: &str = "recovery/commit_boundary.rs";
 ///   参照）であり、上記の `storage.rs` エントリと同一テーブル・同一理由で
 ///   `user_rows/{table_name}` を経由しない旧・非テーブルスコープ経路のため対象外。
 const ALLOWLIST: &[(&str, u32)] = &[
-    ("storage.rs", 550),
-    ("storage.rs", 577),
+    ("storage.rs", 553),
+    ("storage.rs", 580),
     ("recovery/panic_hook.rs", 404),
     ("txn.rs", 191),
     ("txn.rs", 362),

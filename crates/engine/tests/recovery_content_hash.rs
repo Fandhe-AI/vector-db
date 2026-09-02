@@ -493,3 +493,100 @@ fn concurrent_same_operation_id_same_content_inserts_yield_exactly_one_success()
         );
     }
 }
+
+// --- Issue #397 のピン留め: 事前エンコード共有化後も既存のエラー優先順位が
+//     不変であること。--------------------------------------------------------
+
+// バッチ INSERT: 同一 operation_id の内容不一致（本来なら 22023）よりも、
+// バッチ内の行の `encode_row` 失敗（本テストでは metadata 上限超過）を先に返す。
+// これは Issue #397 以前から成立していた順序（`for_insert_batch` が台帳記録前に
+// 全行を要求記載順で `encode_row` していたため）であり、事前エンコードへ変更しても
+// 崩れていないことを確認する（`insert_rows_unchecked` の事前エンコードは
+// 台帳記録より前に行われる設計。3.2 節参照）。
+#[test]
+fn insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch() {
+    let path = unique_db_path("content-hash-batch-encode-priority");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = op("op-batch-priority");
+
+    // 1 回目: 台帳へ内容を記録する（後続の再送が内容不一致になるための前提）。
+    engine::tenant::insert_rows(
+        &storage,
+        TABLE,
+        &ctx,
+        &[(1, row(&[0.1, 0.2, 0.3], b"first"))],
+        &op_id,
+    )
+    .expect("first batch insert must succeed");
+
+    // 2 回目: 同一 operation_id だが内容が異なる（22023 の対象）うえ、
+    // バッチ内の 2 行目が metadata 上限超過で encode に失敗する。
+    let oversized_metadata = vec![0u8; 4 * 1024 * 1024 + 1];
+    let rows = vec![
+        (2u64, row(&[0.4, 0.5, 0.6], b"second")),
+        (3u64, row(&[0.7, 0.8, 0.9], oversized_metadata.as_slice())),
+    ];
+    let result = engine::tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id);
+
+    assert!(
+        matches!(result, Err(TenantWriteError::Storage(_))),
+        "encode failure must be returned before operation_id content-mismatch \
+         is even evaluated, got {result:?}"
+    );
+}
+
+// UPDATE: 既存行に対する embedding 次元不一致は、schema 取得直後の
+// `validate_embedding_dim` が台帳照合（`content_hash::for_update_encoded` の
+// 呼び出し）より前に位置しているため、同一 operation_id の内容不一致（22023）
+// よりも先に返る。Issue #397 の事前エンコードは `validate_embedding_dim` の後に
+// 置いており、この優先順位は変更前後で不変であることをピン留めする。
+#[test]
+fn update_row_embedding_dim_mismatch_takes_priority_over_operation_id_content_mismatch() {
+    let path = unique_db_path("content-hash-update-dim-priority");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage.create_table(&schema(TABLE)).expect("create table");
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    engine::tenant::insert_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        &row(&[0.1, 0.2, 0.3], b"initial"),
+        &op("op-update-dim-insert"),
+    )
+    .expect("insert must succeed");
+
+    let op_id = op("op-update-dim-priority");
+    engine::tenant::update_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        &row(&[0.4, 0.5, 0.6], b"first update"),
+        &op_id,
+    )
+    .expect("first update must succeed");
+
+    // 同一 operation_id だが内容も異なり（22023 の対象）、かつ次元も不一致
+    // （テーブルは DIM=3 だが 5 次元を渡す）。
+    let mismatched_dim = [0.1_f32, 0.2, 0.3, 0.4, 0.5];
+    let result = engine::tenant::update_row(
+        &storage,
+        TABLE,
+        &ctx,
+        1,
+        &row(&mismatched_dim, b"second update"),
+        &op_id,
+    );
+
+    assert!(
+        matches!(result, Err(TenantWriteError::Catalog(_))),
+        "embedding dim mismatch must be returned before operation_id content-mismatch \
+         is even evaluated, got {result:?}"
+    );
+}

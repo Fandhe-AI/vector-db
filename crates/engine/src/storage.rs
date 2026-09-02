@@ -477,7 +477,10 @@ impl Visibility {
     }
 }
 
-/// 永続化予定の行データ（呼び出し側が構築する入力形）。
+/// 永続化予定の行データ（呼び出し側が構築する入力形）。フィールドはすべて
+/// `Copy`（参照・`Visibility`）のため `Clone`/`Copy` を導出できる（Issue #397 の
+/// `content_hash` 等価性テストが複数箇所で同一値を再利用するために使う）。
+#[derive(Clone, Copy)]
 pub struct RowInput<'a> {
     /// RLS 相当のテナント境界判定に使う不透明な識別子（対象ビヘイビア: PERSIST-3）。
     /// 空文字列はテナント境界判定を曖昧にするため、エンコード時に拒否する（fail-closed）。

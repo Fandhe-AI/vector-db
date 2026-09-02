@@ -191,8 +191,9 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 
 `make bench-ingest-profile`（`crates/engine/benches/ingest_profile_bench.rs`）は、
 書き込み経路（`engine::tenant::insert_rows` → `insert_rows_unchecked`）を所有権
-検査・`begin_write`・content_hash・台帳記録・encode・redb insert・世代更新・
-commit の段別に分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供
+検査・`begin_write`・encode（1 回。台帳の内容照合ハッシュと redb 書き込みで共有。
+Issue #397）・content_hash・台帳記録・redb insert・世代更新・commit の段別に
+分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供
 専用のベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
 `GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
 `BENCH_INGEST_PROFILE_ROWS`／`BENCH_INGEST_PROFILE_DIM` でバッチ行数・次元を
