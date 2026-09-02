@@ -796,9 +796,12 @@ fn cold_and_hot_hybrid_results_match_for_unknown_terms_only_query() {
 
 // --- 2.5（Issue #393）: 空クエリ文字列。実測した契約は `Ok`（`sparse.rs::tokenize`
 // が空トークン列 → 疎側無信号 → 密のみへ縮退）であり、本テストは cold/hot で
-// 同一の結果になることを固定する（万一 `Err` を観測した実装へ変わった場合も
-// cold/hot が同一 `wire_code` であることまでは分岐で検証し、アサーションを
-// 黙って弱めない）。
+// 同一の結果になることを固定する。契約は `Ok` 必須として `expect` し、`Err` への
+// 退行（拒否側への契約変更）が起きた場合はテスト失敗で検出する（codex-review
+// 指摘・PR #428: cold/hot 双方が同一 `Err` を返せば成功してしまう分岐は削除した）。
+// あわせて `sparse_index_cache_stats()` で 1 回目 miss・2 回目 hit を確認し、
+// 空クエリがキャッシュ経路を実際に迂回していないこと（vacuous pass 防止）も
+// 固定する。
 
 #[test]
 fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
@@ -817,54 +820,52 @@ fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
     );
     let ctx = PolicyContext::new("tenant-empty-query").expect("valid tenant");
 
-    let cold = {
+    let cold_ids = {
         // redb は同一パスへの二重オープンを許さないため、cold 側の `EngineCore` は
         // hot 側を開く前にスコープを抜けて閉じる。
         let core_cold = open_core(&path);
-        core_cold.execute_sql(&ctx, &sql)
+        let cold_result = core_cold
+            .execute_sql(&ctx, &sql)
+            .expect("empty-query hybrid query must stay Ok (dense-only fallback)");
+        let cold_stats = core_cold.sparse_index_cache_stats();
+        assert_eq!(
+            cold_stats.misses, 1,
+            "空クエリ: cold は 1 回目で miss するはず"
+        );
+        assert_eq!(
+            cold_stats.hits, 0,
+            "空クエリ: cold は 1 回目で hit しないはず"
+        );
+        result_ids(&cold_result)
     };
 
     let core_hot = open_core(&path);
-    let hot_1 = core_hot.execute_sql(&ctx, &sql);
-    let hot_2 = core_hot.execute_sql(&ctx, &sql);
+    let hot_result_1 = core_hot
+        .execute_sql(&ctx, &sql)
+        .expect("empty-query hybrid query must stay Ok (dense-only fallback, hot 1st)");
+    let hot_result_2 = core_hot
+        .execute_sql(&ctx, &sql)
+        .expect("empty-query hybrid query must stay Ok (dense-only fallback, hot 2nd)");
+    let hot_stats = core_hot.sparse_index_cache_stats();
+    assert_eq!(
+        hot_stats.misses, 1,
+        "空クエリ: hot は 1 回目のみ miss するはず"
+    );
+    assert_eq!(
+        hot_stats.hits, 1,
+        "空クエリ: 2 件目はキャッシュヒットするはず（キャッシュ迂回の退行検出）"
+    );
 
-    // cold/hot で観測した契約（Ok/Err）が一致すること自体を先に確認する。
-    match (&cold, &hot_1) {
-        (Ok(cold_result), Ok(hot_result)) => {
-            assert_eq!(
-                result_ids(cold_result),
-                result_ids(hot_result),
-                "空クエリ: cold と hot(1st) の結果 id 列が乖離した"
-            );
-        }
-        (Err(cold_err), Err(hot_err)) => {
-            assert_eq!(
-                cold_err.wire_code(),
-                hot_err.wire_code(),
-                "空クエリ: cold と hot(1st) の wire_code が乖離した"
-            );
-        }
-        _ => panic!(
-            "空クエリ: cold と hot(1st) で Ok/Err の観測結果自体が乖離した \
-             (cold={cold:?}, hot={hot_1:?})"
-        ),
-    }
-    match (&hot_1, &hot_2) {
-        (Ok(a), Ok(b)) => assert_eq!(
-            result_ids(a),
-            result_ids(b),
-            "空クエリ: hot の 1st と 2nd（キャッシュヒット後）が乖離した"
-        ),
-        (Err(a), Err(b)) => assert_eq!(
-            a.wire_code(),
-            b.wire_code(),
-            "空クエリ: hot の 1st と 2nd（キャッシュヒット後）の wire_code が乖離した"
-        ),
-        _ => panic!(
-            "空クエリ: hot の 1st と 2nd で Ok/Err の観測結果自体が乖離した \
-             (1st={hot_1:?}, 2nd={hot_2:?})"
-        ),
-    }
+    assert_eq!(
+        cold_ids,
+        result_ids(&hot_result_1),
+        "空クエリ: cold と hot(1st) の結果 id 列が乖離した"
+    );
+    assert_eq!(
+        result_ids(&hot_result_1),
+        result_ids(&hot_result_2),
+        "空クエリ: hot の 1st と 2nd（キャッシュヒット後）が乖離した"
+    );
 }
 
 // --- 大規模段: 数万件規模での cold/hot 等価性（Issue #358 検証設計 2.1 の大規模段。
