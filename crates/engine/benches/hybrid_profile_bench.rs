@@ -287,29 +287,18 @@ fn main() {
     );
 
     let doc_refs = corpus.sparse_docs();
-    let build_measurement = run(&config, || {
-        SparseIndex::build(&doc_refs)
-            .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build failed: {e}")))
-    })
-    .unwrap_or_else(|e| fail_closed(format!("sparse_build_total measurement failed: {e}")));
-    let p95 = harness::accept::p95_from_samples(&build_measurement.samples)
-        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
-    println!(
-        "{}",
-        render_stage_line(
-            "sparse_build_total",
-            build_measurement.summary.median.as_micros(),
-            p95.as_micros(),
-            NUM_DOCS,
-        )
-    );
 
     // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
-    // 計測用ビルド（上記 `build_measurement`）とは別に、1 回だけ `SparseIndex`
-    // を保持したまま前後の VmRSS を比較する（保持しなければ drop されて増分を
-    // 観測できない）。`approx_heap_bytes()` はテスト・ベンチ以外の一般利用側
-    // （`sql/sparse_cache.rs`）が実際に参照する概算値であり、RSS 実測と並記する
-    // ことで概算の妥当性を突き合わせられる。
+    // 反復計測（下記 `build_measurement`）より前に、プロセス起動後まだ
+    // `SparseIndex::build` を一度も実行していない時点で 1 回だけ計測する
+    // （codex-review 指摘・PR #424: 反復ビルド後に計測するとアロケータが
+    // 直前の解放分のページを再利用し、`vm_rss_kb_after - vm_rss_kb_before`
+    // が実際の常駐メモリ増分を過小評価しうる。ウォームアップ前に計測する
+    // ことで、この経路で最初に確保されるページに限定した増分を観測する）。
+    // `SparseIndex` を保持したまま前後の VmRSS を比較する（保持しなければ
+    // drop されて増分を観測できない）。`approx_heap_bytes()` はテスト・
+    // ベンチ以外の一般利用側（`sql/sparse_cache.rs`）が実際に参照する
+    // 概算値であり、RSS 実測と並記することで概算の妥当性を突き合わせられる。
     let vm_rss_kb_before = harness::proc_stats::read_vm_rss_kb();
     let resident_index = SparseIndex::build(&doc_refs)
         .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (memory) failed: {e}")));
@@ -328,6 +317,23 @@ fn main() {
     // `resident_index` は RSS 差分計測の対象そのものであり、以降の段では参照
     // しないため、計測直後に明示的に drop してよい（メモリ計測意図の明確化）。
     drop(resident_index);
+
+    let build_measurement = run(&config, || {
+        SparseIndex::build(&doc_refs)
+            .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build failed: {e}")))
+    })
+    .unwrap_or_else(|e| fail_closed(format!("sparse_build_total measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&build_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    println!(
+        "{}",
+        render_stage_line(
+            "sparse_build_total",
+            build_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            NUM_DOCS,
+        )
+    );
 
     let tokenize_measurement = run(&config, || tokenize_only(&corpus.bodies))
         .unwrap_or_else(|e| fail_closed(format!("tokenize_only measurement failed: {e}")));
