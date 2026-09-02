@@ -699,6 +699,13 @@ impl SparseIndex {
                     }
                 }
             }
+            // ランレングス圧縮後、`term_freq` の容量は圧縮前の `ids.len()`
+            // （元のトークン総数）分を保持したままになる。同一語を大量に繰り返す
+            // 文書ではこの余剰容量が無視できず、term インターニングによる
+            // メモリ削減の設計意図を損なうほか `approx_heap_bytes()` を過大評価させ
+            // `PrefilterCache` の退避判定（Issue #357・sql/sparse_cache.rs）を
+            // 必要以上に早める。実使用長まで縮めて解放する。
+            term_freq.shrink_to_fit();
 
             // `id_index` は自分がこれから push する要素自身のインデックスのみを記録する
             // ため、値は常に `entries` の範囲内になる（範囲外を指す不変条件違反は
