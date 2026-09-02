@@ -37,6 +37,18 @@
 //!    VmRSS 増分（`/proc/self/status`。読めない環境では `unavailable`）と
 //!    `approx_heap_bytes()` の実測値
 //!
+//! Issue #392 は疎側再取得ループの再スコアリング回避（`SparseIndex::
+//! score_within`／`SparseScored::top`）の効果を実測するため、以下を追加する:
+//!
+//! 9. `score_within_once`: `SparseIndex::score_within` 単体（クエリ 1 回分の
+//!    スコア計算のみ。Top-k 選出を含まない）
+//! 10. `sparse_refetch_loop`: `engine::hybrid::sparse_refetch_observed`
+//!     （`hybrid_search_boosted` の疎側再取得ループ本体そのもの。Issue #387
+//!     PR #416 で production 経路と共有化済み）を round-robin クエリで
+//!     直接計測した、疎側再取得ループの実測累積コスト。既存の `search_within_
+//!     fetch_k=<k>`＋`sparse_refetch_summary`（複数ラウンドの medianを合算
+//!     した推定値）を実測で補完する
+//!
 //! # 実測値の比較可能性についての重要な注意
 //!
 //! `harness::hybrid_profile` モジュールドキュメント参照: Issue #355 が言及する
@@ -80,7 +92,7 @@ use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
-use engine::hybrid::{hybrid_search, RrfConfig};
+use engine::hybrid::{hybrid_search, sparse_refetch_observed, RrfConfig};
 use engine::kernel::SearchInput;
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
@@ -522,6 +534,63 @@ fn main() {
             hybrid_measurement.summary.median.as_micros(),
             p95.as_micros(),
             &dense_summary,
+        )
+    );
+
+    // --- score_within_once: `SparseIndex::score_within` 単体（Issue #392）。
+    // クエリ 1 回分のスコア計算のみを round-robin クエリで実測する
+    // （Top-k 選出〔`SparseScored::top`〕を含まない）。
+    let mut query_idx = 0usize;
+    let score_within_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        sparse_index
+            .score_within(&q.text, &visible)
+            .unwrap_or_else(|e| fail_closed(format!("score_within failed: {e}")))
+    })
+    .unwrap_or_else(|e| fail_closed(format!("score_within_once measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&score_within_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    let check = sparse_index
+        .score_within(&queries[0].text, &visible)
+        .map(|scored| scored.len())
+        .unwrap_or(0);
+    println!(
+        "{}",
+        render_stage_line(
+            "score_within_once",
+            score_within_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            check,
+        )
+    );
+
+    // --- sparse_refetch_loop: 疎側再取得ループ本体（`hybrid_search_boosted` が
+    // 実際に呼ぶコードパスそのもの。Issue #392）の実測累積コスト。Issue #387
+    // PR #416 で production 経路とテスト・ベンチ向け公開フック
+    // `sparse_refetch_observed` が同一実装を共有する構成になったため、下記の
+    // `search_within_fetch_k=<k>`＋`sparse_refetch_summary`（複数ラウンドの
+    // median 合算による推定値）とは異なり本区間は実測値そのものである。
+    let mut query_idx = 0usize;
+    let sparse_refetch_loop_measurement = run(&config, || {
+        let q = &queries[query_idx % queries.len()];
+        query_idx += 1;
+        sparse_refetch_observed(&sparse_index, &q.text, &visible, &cfg)
+            .unwrap_or_else(|e| fail_closed(format!("sparse_refetch_observed failed: {e}")))
+    })
+    .unwrap_or_else(|e| fail_closed(format!("sparse_refetch_loop measurement failed: {e}")));
+    let p95 = harness::accept::p95_from_samples(&sparse_refetch_loop_measurement.samples)
+        .unwrap_or_else(|e| fail_closed(format!("p95 computation failed: {e}")));
+    let check = sparse_refetch_observed(&sparse_index, &queries[0].text, &visible, &cfg)
+        .map(|(hits, _limit, _fetch_ks)| hits.len())
+        .unwrap_or(0);
+    println!(
+        "{}",
+        render_stage_line(
+            "sparse_refetch_loop",
+            sparse_refetch_loop_measurement.summary.median.as_micros(),
+            p95.as_micros(),
+            check,
         )
     );
 

@@ -1459,22 +1459,27 @@ pub fn hybrid_search_boosted(
         }
     };
     // 疎側は `sparse_index.search()`（インデックス全体を母数に統計・Top-k を計算する
-    // API）ではなく `search_within()`（[`SparseIndex::search_within`]）を使う。
+    // API）ではなく `search_within()`／`score_within()`（[`SparseIndex::
+    // search_within`]・[`SparseIndex::score_within`]。Issue #392 で後者へ切替え。
+    // 統計母数・候補選出を `visible_ids` へ縮約する契約は共通）を使う。
     // `search()` の後段フィルタ（旧実装）は「不可視文書が Top-k のプールを占有して
     // 可視文書を押し出す」「`doc_count`/`doc_freq` を通じて不可視文書の内容・存在が
     // 可視文書の順位へ影響する」という 2 つの経路でテナント境界を弱めてしまう
     // （後段フィルタでは統計計算・候補選出そのものへの影響を防げない。Issue #36
-    // codex-review P0 指摘対応）。`search_within` は統計・Top-k 選出の両方を
+    // codex-review P0 指摘対応）。`search_within`／`score_within` は統計・候補選出を
     // `visible_ids` へ縮約した上で計算するため、この 2 経路をともに断つ。
     //
     // 境界の同点グループ完全化（Issue #310 codex-review P1 指摘対応。当初「BM25 は
     // 連続値なので同点が実質発生しない」としていたが誤り: 同一語頻度・同一文書長の
-    // 文書は同一スコアになりうるため、`search_within` が内部で `pool_depth` 件へ
-    // 切り詰めた後に `TieRank::GroupEnd` を適用するだけでは境界の同点グループが
+    // 文書は同一スコアになりうるため、`search_within`（旧実装）が内部で `pool_depth`
+    // 件へ切り詰めた後に `TieRank::GroupEnd` を適用するだけでは境界の同点グループが
     // `SparseIndex` 内部の doc_id 昇順タイブレークで分断され、密側と同型の id 依存
-    // バイアスが残る）。密側と同じ再取得ループ（Issue #320）で `search_within` を
-    // 呼び、[`complete_boundary_tie_group_by`] で境界の同点グループの終端確定を
-    // 試みる。密側と対称に、拡張取得列の契約検証（[`validate_extended_pool`]）も
+    // バイアスが残る）。密側と同じ再取得ループ（Issue #320）で疎側を再評価し、
+    // [`complete_boundary_tie_group_by`] で境界の同点グループの終端確定を試みる
+    // （Issue #392 以降は `score_within` を 1 回・各ラウンドは [`crate::sparse::
+    // SparseScored::top`] による前方一致な切り出しで再評価する。詳細は
+    // `sparse_refetch_loop` ドキュメント参照）。密側と対称に、拡張取得列の契約検証
+    // （[`validate_extended_pool`]）も
     // `complete_boundary_tie_group_by` の前に必ず行う（codex-review P1 指摘対応:
     // 以前は疎側だけ長さ検証のみで、切り詰められて消える末尾の契約違反を検知
     // できなかった）。
@@ -1524,13 +1529,22 @@ fn sparse_refetch_loop(
         .checked_mul(2)
         .unwrap_or(sparse_cap)
         .min(sparse_cap);
+    // 疎側（BM25）は 1 回の posting 走査でスコア `> 0` の可視ヒット全体が
+    // 確定するため（[`crate::sparse::SparseIndex::score_within`] ドキュメント
+    // 参照）、`fetch_k` を倍増させる各ラウンドでクエリを再スコアリングする
+    // 必要はない（Issue #392。旧実装は各ラウンドで `search_within` を呼び
+    // `acc: Vec<f64>` の `O(N)` 再確保・posting 再走査・Top-k 再選出を
+    // 繰り返していた）。ここでスコア計算を 1 回だけ行い、各ラウンドは
+    // [`crate::sparse::SparseScored::top`] による前方一致な Top-k 拡張へ
+    // 置き換える。`fetch_k` のスケジュール・`hits.len()`（`min(fetch_k, M)`）・
+    // 以降の境界同点判定はいずれも旧実装と同一のまま変わらない。
+    let mut scored = sparse_index.score_within(query_text, visible_ids)?;
     let (sparse_hits, sparse_limit) = loop {
         record_fetch_k(sparse_fetch_k);
-        let hits: Vec<ScoredDoc> =
-            sparse_index.search_within(query_text, sparse_fetch_k, visible_ids)?;
+        let hits: Vec<ScoredDoc> = scored.top(sparse_fetch_k);
         // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
-        // 拡張取得列が `sparse_fetch_k` を超えていないかを検証する。`search_within`
-        // は自作の内部関数であり `provider` のような trait object 契約違反の余地は
+        // 拡張取得列が `sparse_fetch_k` を超えていないかを検証する。`SparseScored::
+        // top` は自作の内部型であり `provider` のような trait object 契約違反の余地は
         // 薄いが、fail-closed の防御を密側と揃える。
         if hits.len() > sparse_fetch_k {
             return Err(HybridError::TooManyCandidates {
@@ -1574,8 +1588,9 @@ fn sparse_refetch_loop(
 /// `sparse_refetch_loop` ドキュメント参照）。
 ///
 /// 戻り値は `(疎ヒット, 疎側 fetch_k 上限〔最終ラウンドの fetch_k〕, 実際に
-/// 呼ばれた fetch_k の列)`。`sparse_index.search_within` を実際に複数回
-/// 呼び出すため副作用（計算コスト）は production の疎側検索と同一。
+/// 呼ばれた fetch_k の列)`。`sparse_index.score_within` を 1 回・
+/// `SparseScored::top` を実際に複数回呼び出すため副作用（計算コスト）は
+/// production の疎側検索と同一（Issue #392）。
 ///
 /// **ベンチ・診断専用**。非既定 feature `bench-internals` でのみ公開する
 /// （codex-review P2 指摘対応・PR #416: 以前は無条件で engine の公開 API に
@@ -3202,6 +3217,108 @@ mod tests {
             2,
             "境界の同点グループを確定できなくても観測範囲（pool_depth 件）は保持され空にならない"
         );
+    }
+
+    /// Issue #392 導入前の疎側再取得ループ（各ラウンドで
+    /// `SparseIndex::search_within` を呼び直す方式）をテスト内に独立再実装
+    /// したオラクル。`sparse_refetch_loop`（本 Issue で `score_within` を
+    /// 1 回・`SparseScored::top` の複数回呼び出しへ差し替えた実装）と
+    /// `(hits, sparse_limit)` が一致することを固定するために使う
+    /// （`sparse_refetch_loop_matches_per_round_search_within_oracle`）。
+    fn sparse_refetch_loop_oracle_via_search_within(
+        sparse_index: &SparseIndex,
+        query_text: &str,
+        visible_ids: &BTreeSet<u64>,
+        cfg: &RrfConfig,
+    ) -> Result<(Vec<ScoredDoc>, usize), HybridError> {
+        let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
+        let mut sparse_fetch_k = cfg
+            .pool_depth()
+            .checked_mul(2)
+            .unwrap_or(sparse_cap)
+            .min(sparse_cap);
+        loop {
+            let hits: Vec<ScoredDoc> =
+                sparse_index.search_within(query_text, sparse_fetch_k, visible_ids)?;
+            if hits.len() > sparse_fetch_k {
+                return Err(HybridError::TooManyCandidates {
+                    len: hits.len(),
+                    max: sparse_fetch_k,
+                });
+            }
+            validate_extended_pool(&hits, |d| d.score, |d| d.doc_id)?;
+            let exhaustive = sparse_fetch_k >= visible_ids.len() || hits.len() < sparse_fetch_k;
+            match resolve_boundary_tie_group(hits, cfg.pool_depth(), exhaustive, true, |d| d.score)
+            {
+                TieBoundary::Resolved(resolved) => return Ok((resolved, sparse_fetch_k)),
+                TieBoundary::Undetermined(observed) => {
+                    if sparse_fetch_k >= sparse_cap {
+                        let resolved =
+                            exclude_undetermined_boundary_group(observed, cfg.pool_depth(), |d| {
+                                d.score
+                            });
+                        return Ok((resolved, sparse_fetch_k));
+                    }
+                    sparse_fetch_k = sparse_fetch_k.saturating_mul(2).min(sparse_cap);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_refetch_loop_matches_per_round_search_within_oracle() {
+        // `sparse_refetch_loop`（Issue #392: `score_within` 1 回＋`SparseScored::
+        // top` の複数回呼び出し）が、導入前の実装（各ラウンドで `search_within`
+        // を呼び直すオラクル）と `(hits, sparse_limit)` を完全一致で返すことを
+        // 通常コーパス・全件同点コーパス・境界同点コーパスの 3 種で固定する。
+        let cfg = RrfConfig::new(60.0, 1.0, 1.0, 2).unwrap();
+
+        // (1) 通常コーパス（同点なし）。
+        let normal_docs: Vec<(u64, String)> = (1u64..=50)
+            .map(|id| (id, format!("alpha beta gamma term{id} extra{}", id % 7)))
+            .collect();
+        let normal_refs: Vec<(u64, &str)> = normal_docs
+            .iter()
+            .map(|(id, s)| (*id, s.as_str()))
+            .collect();
+        let normal_index = SparseIndex::build(&normal_refs).expect("build ok");
+        let normal_visible: BTreeSet<u64> = normal_refs.iter().map(|&(id, _)| id).collect();
+
+        // (2) 全件同点コーパス（同一テキスト）。
+        let tie_ids: Vec<u64> = (1u64..=30).collect();
+        let tie_docs: Vec<(u64, &str)> = tie_ids.iter().map(|&id| (id, "cat")).collect();
+        let tie_index = SparseIndex::build(&tie_docs).expect("build ok");
+        let tie_visible: BTreeSet<u64> = tie_ids.iter().copied().collect();
+
+        // (3) 境界同点コーパス（`hybrid_search_boosted_sparse_tie_group_across_
+        // pool_boundary_is_id_independent` と同型: 6 件全件同点で pool_depth=2）。
+        let boundary_ids: Vec<u64> = vec![1, 2, 3, 4, 5, 6];
+        let boundary_docs: Vec<(u64, &str)> = boundary_ids.iter().map(|&id| (id, "cat")).collect();
+        let boundary_index = SparseIndex::build(&boundary_docs).expect("build ok");
+        let boundary_visible: BTreeSet<u64> = boundary_ids.iter().copied().collect();
+
+        let cases: Vec<(&str, &SparseIndex, &BTreeSet<u64>)> = vec![
+            ("alpha beta", &normal_index, &normal_visible),
+            ("cat", &tie_index, &tie_visible),
+            ("cat", &boundary_index, &boundary_visible),
+        ];
+
+        for (query, index, visible) in cases {
+            let (actual_hits, actual_limit) =
+                sparse_refetch_loop(index, query, visible, &cfg, |_fetch_k| {})
+                    .expect("sparse_refetch_loop ok");
+            let (expected_hits, expected_limit) =
+                sparse_refetch_loop_oracle_via_search_within(index, query, visible, &cfg)
+                    .expect("oracle ok");
+            assert_eq!(
+                actual_hits, expected_hits,
+                "query={query:?}: hits が per-round search_within オラクルと一致しない"
+            );
+            assert_eq!(
+                actual_limit, expected_limit,
+                "query={query:?}: sparse_limit が per-round search_within オラクルと一致しない"
+            );
+        }
     }
 
     #[test]
