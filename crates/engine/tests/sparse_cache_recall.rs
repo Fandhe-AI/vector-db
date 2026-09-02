@@ -30,6 +30,12 @@
 //! `hybrid_recall.rs` の Recall 実測値とは無関係（本ファイルの目的は Recall の
 //! 絶対値ではなく cold/hot 等価性の検証）。
 //!
+//! **Issue #393 での拡張**: 転置索引化（Issue #386 Phase 1・#388〜#392）後も上記の
+//! cold/hot 等価性が維持されることを、(a) 可視集合が全体の一部になる RLS ケース、
+//! (b) 未知語のみのクエリ、(c) 空クエリの 3 ケースで追加検証する
+//! （`docs/design/sparse-inverted-index-recall-verification.md` 参照。既存ケースは
+//! 無変更のまま追加する）。
+//!
 //! 対応 spec ビヘイビア（ポインタのみ・本文非転記）: SEARCH-1, SEARCH-2, SEARCH-3。
 
 use std::collections::BTreeSet;
@@ -468,6 +474,397 @@ fn cold_and_hot_hybrid_tie_group_across_limit_boundary_match() {
         "LIMIT 2 must include the full tie group in id order"
     );
     assert_eq!(result_ids(&result_kw), hot_by_limit[0]);
+}
+
+// --- 2.3（Issue #393）: RLS 部分可視ケース。可視集合が全体の一部になる場合にも
+// cold/hot が一致し、不可視行が結果・統計へ漏えいしないこと。
+
+const RLS_VOCAB_SIZE: usize = 50;
+const RLS_GROUP_SIZE: usize = 60;
+
+/// `docs` の各 id を `offset` だけ平行移動する（グループ間で id 帯域を分けるため）。
+fn offset_docs(mut docs: Vec<Doc>, offset: u64) -> Vec<Doc> {
+    for d in &mut docs {
+        d.id += offset;
+    }
+    docs
+}
+
+/// tenant-b の Private 群専用フィクスチャ: どの 2 語対クエリに対しても高密度に
+/// 一致するよう、ほぼ全語彙対を均等にカバーする文書群を決定的に生成する
+/// （不可視行の内容・df・N が可視文書の統計へ漏えいした場合に強く順位へ影響する
+/// 構成。本モジュール冒頭ドキュメント「統計縮約オラクル」参照）。
+fn dense_keyword_docs(offset: u64, vocab_size: usize, count: usize) -> Vec<Doc> {
+    let mut docs = Vec::with_capacity(count);
+    for i in 0..count {
+        let a = i % vocab_size;
+        let b = (i / vocab_size + 1) % vocab_size;
+        let keywords: BTreeSet<usize> = if a == b {
+            BTreeSet::from([a])
+        } else {
+            [a, b].into()
+        };
+        let mut text = String::new();
+        for &kw in &keywords {
+            let token = topic_token(kw);
+            text.push_str(validate_identifier_token(&token));
+            text.push(' ');
+            text.push_str(validate_identifier_token(&token));
+            text.push(' ');
+        }
+        let vector = one_hot_sum(vocab_size, keywords.iter().copied());
+        docs.push(Doc {
+            id: offset + i as u64 + 1,
+            text: text.trim_end().to_string(),
+            vector,
+            keywords,
+        });
+    }
+    docs
+}
+
+/// 指定したテナント・可視性で `docs` を投入する（`insert_corpus` の単一テナント・
+/// 両可視性前提を、tenant/visibility を個別指定できる形へ一般化したもの）。
+fn insert_group(storage: &Storage, tenant: &str, visibility: Visibility, docs: &[Doc], tag: &str) {
+    let ctx = PolicyContext::with_visibilities(tenant, [Visibility::Public, Visibility::Private])
+        .expect("valid tenant");
+    for doc in docs {
+        engine::tenant::insert_typed_row(
+            storage,
+            "docs",
+            &ctx,
+            doc.id,
+            visibility,
+            &[
+                Value::Vector(doc.vector.clone()),
+                Value::Text(doc.text.clone()),
+            ],
+            &engine::recovery::required_op_id::OperationId::parse(&format!(
+                "sparse-cache-recall-rls-{tag}-{}",
+                doc.id
+            ))
+            .expect("valid operation_id"),
+        )
+        .expect("insert row");
+    }
+}
+
+#[test]
+fn cold_and_hot_hybrid_results_match_under_partial_visibility_and_never_leak_invisible_rows() {
+    let path = unique_db_path("sparse-cache-recall-rls");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_docs_table(&storage, RLS_VOCAB_SIZE);
+
+    // 4 群（id 帯域を分けて重複しないようにする）。
+    let a_pub = generate_corpus(0xA1, RLS_GROUP_SIZE, RLS_VOCAB_SIZE); // id 1..=60
+    let a_priv = offset_docs(generate_corpus(0xA2, RLS_GROUP_SIZE, RLS_VOCAB_SIZE), 1000); // id 1001..=1060
+    let b_pub = offset_docs(generate_corpus(0xB1, RLS_GROUP_SIZE, RLS_VOCAB_SIZE), 2000); // id 2001..=2060
+    let b_priv = dense_keyword_docs(3000, RLS_VOCAB_SIZE, RLS_GROUP_SIZE); // id 3001..=3060（高密度）
+
+    insert_group(&storage, "tenant-a", Visibility::Public, &a_pub, "a-pub");
+    insert_group(&storage, "tenant-a", Visibility::Private, &a_priv, "a-priv");
+    insert_group(&storage, "tenant-b", Visibility::Public, &b_pub, "b-pub");
+    insert_group(&storage, "tenant-b", Visibility::Private, &b_priv, "b-priv");
+    drop(storage);
+
+    // クエリは a-pub の語彙から生成する（a-pub は両文脈で必ず可視）。
+    let mut qa_rng = Xorshift64::new(0xA1 ^ 0xA5A5_A5A5_A5A5_A5A5);
+    let qa = generate_qa_set(&mut qa_rng, &a_pub, RLS_VOCAB_SIZE, 10);
+    assert!(
+        !qa.is_empty(),
+        "RLS ケースの QA generation が非空の AND クエリを見つけられなかった"
+    );
+
+    let visible_ctx1: BTreeSet<u64> = a_pub.iter().chain(b_pub.iter()).map(|d| d.id).collect();
+    let invisible_ctx1: BTreeSet<u64> = a_priv.iter().chain(b_priv.iter()).map(|d| d.id).collect();
+    let visible_ctx2: BTreeSet<u64> = a_pub
+        .iter()
+        .chain(a_priv.iter())
+        .chain(b_pub.iter())
+        .map(|d| d.id)
+        .collect();
+    let invisible_ctx2: BTreeSet<u64> = b_priv.iter().map(|d| d.id).collect();
+
+    // (i)+(ii): 文脈ごとに cold/hot が完全一致し、結果が可視集合の部分集合であること。
+    for (label, ctx, visible, invisible) in [
+        (
+            "ctx1-public-only",
+            PolicyContext::new("tenant-a").expect("valid tenant"),
+            &visible_ctx1,
+            &invisible_ctx1,
+        ),
+        (
+            "ctx2-with-a-private",
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+                .expect("valid tenant"),
+            &visible_ctx2,
+            &invisible_ctx2,
+        ),
+    ] {
+        let mut cold_ids = Vec::with_capacity(qa.len());
+        for case in &qa {
+            let core = open_core(&path);
+            let sql = hybrid_sql(case, 20);
+            let result = core.execute_sql(&ctx, &sql).expect("cold hybrid query ok");
+            cold_ids.push(result_ids(&result));
+        }
+
+        let core = open_core(&path);
+        let mut hot_ids = Vec::with_capacity(qa.len());
+        for case in &qa {
+            let sql = hybrid_sql(case, 20);
+            let result = core.execute_sql(&ctx, &sql).expect("hot hybrid query ok");
+            hot_ids.push(result_ids(&result));
+        }
+
+        for (i, (cold, hot)) in cold_ids.iter().zip(hot_ids.iter()).enumerate() {
+            assert_eq!(cold, hot, "{label} case {i}: cold と hot が乖離した");
+        }
+        for ids in cold_ids.iter().chain(hot_ids.iter()) {
+            for id in ids {
+                assert!(
+                    visible.contains(id),
+                    "{label}: 可視集合外の id {id} が結果に混入した"
+                );
+                assert!(
+                    !invisible.contains(id),
+                    "{label}: 不可視 id {id} が結果へ漏えいした"
+                );
+            }
+        }
+    }
+
+    // (iii): 単一 EngineCore で 2 文脈を連続実行すると文脈ごとに別キャッシュエントリ
+    // になる（misses == 2）。1 件目は各文脈とも miss、2 件目以降は hit。
+    let ctx1 = PolicyContext::new("tenant-a").expect("valid tenant");
+    let ctx2 =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    let core = open_core(&path);
+    let sql = hybrid_sql(&qa[0], 20);
+    let _ = core.execute_sql(&ctx1, &sql).expect("ctx1 1st query ok");
+    let _ = core.execute_sql(&ctx2, &sql).expect("ctx2 1st query ok");
+    let stats_after_first = core.sparse_index_cache_stats();
+    assert_eq!(
+        stats_after_first.misses, 2,
+        "文脈（PolicyContext）ごとに別キャッシュエントリになるはず"
+    );
+    assert_eq!(stats_after_first.hits, 0);
+    let _ = core.execute_sql(&ctx1, &sql).expect("ctx1 2nd query ok");
+    let _ = core.execute_sql(&ctx2, &sql).expect("ctx2 2nd query ok");
+    let stats_after_second = core.sparse_index_cache_stats();
+    assert_eq!(stats_after_second.misses, 2);
+    assert_eq!(
+        stats_after_second.hits, 2,
+        "各文脈の 2 件目以降はキャッシュヒットするはず"
+    );
+    // 以降で同一パスを再オープンするため、ここで明示的に閉じる（redb は同一パスの
+    // 二重オープンを許さない）。
+    drop(core);
+
+    // (iv) 統計縮約オラクル: 不可視行を物理的に含まない対照 DB（ctx1 の可視行
+    // 〔a-pub ∪ b-pub〕のみを同一 id・tenant・visibility で投入）で同じクエリを
+    // 実行し、元 DB の ctx1 結果と完全一致することを確認する。不一致は不可視行の
+    // 統計（df・N・avgdl）漏えいを意味するため fail-closed に扱う（本 Issue では
+    // production コードを修正せず、乖離があれば原因調査へ差し戻す）。
+    let oracle_path = unique_db_path("sparse-cache-recall-rls-oracle");
+    let _oracle_guard = CleanupGuard(oracle_path.clone());
+    let oracle_storage = open_storage(&oracle_path);
+    create_docs_table(&oracle_storage, RLS_VOCAB_SIZE);
+    insert_group(
+        &oracle_storage,
+        "tenant-a",
+        Visibility::Public,
+        &a_pub,
+        "oracle-a-pub",
+    );
+    insert_group(
+        &oracle_storage,
+        "tenant-b",
+        Visibility::Public,
+        &b_pub,
+        "oracle-b-pub",
+    );
+    drop(oracle_storage);
+
+    let oracle_core = open_core(&oracle_path);
+    let main_core = open_core(&path);
+    for (i, case) in qa.iter().enumerate() {
+        let sql = hybrid_sql(case, 20);
+        let main_result = main_core
+            .execute_sql(&ctx1, &sql)
+            .expect("main hybrid query ok");
+        let oracle_result = oracle_core
+            .execute_sql(&ctx1, &sql)
+            .expect("oracle hybrid query ok");
+        assert_eq!(
+            result_ids(&main_result),
+            result_ids(&oracle_result),
+            "case {i}: 不可視行を含まない対照 DB と結果が一致しない（統計漏えいの疑い）"
+        );
+    }
+}
+
+// --- 2.4（Issue #393）: 未知語のみのクエリ。疎チャネルが無信号でも密のみへ
+// 縮退し、cold/hot が一致すること・純密クエリと同じ順位になること。
+
+#[test]
+fn cold_and_hot_hybrid_results_match_for_unknown_terms_only_query() {
+    let path = unique_db_path("sparse-cache-recall-unknown");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_docs_table(&storage, SMALL_VOCAB_SIZE);
+    let docs = generate_corpus(SMALL_SEED, SMALL_NUM_DOCS, SMALL_VOCAB_SIZE);
+    insert_corpus(&storage, "tenant-unknown", &docs);
+    drop(storage);
+
+    // コーパス語彙（`kw_NNNN`）に存在しない ASCII トークン。密ベクトルは通常の
+    // QA と同様に語彙 2 語の one-hot 和（疎側が無信号でも密側は有意な近傍を持つ）。
+    let query_vector = one_hot_sum(SMALL_VOCAB_SIZE, [3usize, 7]);
+    let query_text = "zzunknowna zzunknownb".to_string();
+    for ch in query_text.chars() {
+        assert!(
+            ch.is_ascii_lowercase() || ch == ' ',
+            "unexpected unknown-term query char: {ch}"
+        );
+    }
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '{}', body, '{}') LIMIT 20",
+        vector_literal(&query_vector),
+        query_text,
+    );
+    let dense_only_sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 20",
+        vector_literal(&query_vector)
+    );
+
+    let ctx = PolicyContext::new("tenant-unknown").expect("valid tenant");
+    let cold_ids = {
+        // redb は同一パスへの二重オープンを許さないため、cold 側の `EngineCore` は
+        // hot 側を開く前にスコープを抜けて閉じる。
+        let core_cold = open_core(&path);
+        let cold_result = core_cold
+            .execute_sql(&ctx, &sql)
+            .expect("cold unknown-term hybrid query ok");
+        let cold_stats = core_cold.sparse_index_cache_stats();
+        assert_eq!(cold_stats.misses, 1);
+        assert_eq!(cold_stats.hits, 0);
+        result_ids(&cold_result)
+    };
+
+    let core_hot = open_core(&path);
+    let hot_result_1 = core_hot
+        .execute_sql(&ctx, &sql)
+        .expect("hot unknown-term hybrid query ok (1st)");
+    let hot_result_2 = core_hot
+        .execute_sql(&ctx, &sql)
+        .expect("hot unknown-term hybrid query ok (2nd)");
+    let hot_stats = core_hot.sparse_index_cache_stats();
+    assert_eq!(hot_stats.misses, 1);
+    assert_eq!(hot_stats.hits, 1, "2 件目はキャッシュヒットするはず");
+
+    assert_eq!(
+        cold_ids,
+        result_ids(&hot_result_1),
+        "cold と hot(1st) が乖離した"
+    );
+    assert_eq!(
+        result_ids(&hot_result_1),
+        result_ids(&hot_result_2),
+        "hot の 1st と 2nd（キャッシュヒット後）が乖離した"
+    );
+    assert_eq!(
+        cold_ids.len(),
+        20,
+        "疎側無信号でも密のみで LIMIT 件数を満たすはず"
+    );
+
+    // 疎チャネルが無信号（RRF 単一チャネル）の場合、融合順位は密順位の単調写像に
+    // なるはずであり、純密クエリと同一の Top-20 id 列になることを確認する
+    // （不一致の場合は縮退契約の原因を調査し doc へ記録する。アサーションは
+    // 弱めない）。
+    let dense_only_result = core_hot
+        .execute_sql(&ctx, &dense_only_sql)
+        .expect("dense-only query ok");
+    assert_eq!(
+        cold_ids,
+        result_ids(&dense_only_result),
+        "未知語のみクエリの hybrid 結果は純密クエリの Top-20 と一致するはず"
+    );
+}
+
+// --- 2.5（Issue #393）: 空クエリ文字列。実測した契約は `Ok`（`sparse.rs::tokenize`
+// が空トークン列 → 疎側無信号 → 密のみへ縮退）であり、本テストは cold/hot で
+// 同一の結果になることを固定する（万一 `Err` を観測した実装へ変わった場合も
+// cold/hot が同一 `wire_code` であることまでは分岐で検証し、アサーションを
+// 黙って弱めない）。
+
+#[test]
+fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
+    let path = unique_db_path("sparse-cache-recall-empty");
+    let _guard = CleanupGuard(path.clone());
+    let storage = open_storage(&path);
+    create_docs_table(&storage, SMALL_VOCAB_SIZE);
+    let docs = generate_corpus(SMALL_SEED, SMALL_NUM_DOCS, SMALL_VOCAB_SIZE);
+    insert_corpus(&storage, "tenant-empty-query", &docs);
+    drop(storage);
+
+    let query_vector = one_hot_sum(SMALL_VOCAB_SIZE, [3usize, 7]);
+    let sql = format!(
+        "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '{}', body, '') LIMIT 20",
+        vector_literal(&query_vector)
+    );
+    let ctx = PolicyContext::new("tenant-empty-query").expect("valid tenant");
+
+    let cold = {
+        // redb は同一パスへの二重オープンを許さないため、cold 側の `EngineCore` は
+        // hot 側を開く前にスコープを抜けて閉じる。
+        let core_cold = open_core(&path);
+        core_cold.execute_sql(&ctx, &sql)
+    };
+
+    let core_hot = open_core(&path);
+    let hot_1 = core_hot.execute_sql(&ctx, &sql);
+    let hot_2 = core_hot.execute_sql(&ctx, &sql);
+
+    // cold/hot で観測した契約（Ok/Err）が一致すること自体を先に確認する。
+    match (&cold, &hot_1) {
+        (Ok(cold_result), Ok(hot_result)) => {
+            assert_eq!(
+                result_ids(cold_result),
+                result_ids(hot_result),
+                "空クエリ: cold と hot(1st) の結果 id 列が乖離した"
+            );
+        }
+        (Err(cold_err), Err(hot_err)) => {
+            assert_eq!(
+                cold_err.wire_code(),
+                hot_err.wire_code(),
+                "空クエリ: cold と hot(1st) の wire_code が乖離した"
+            );
+        }
+        _ => panic!(
+            "空クエリ: cold と hot(1st) で Ok/Err の観測結果自体が乖離した \
+             (cold={cold:?}, hot={hot_1:?})"
+        ),
+    }
+    match (&hot_1, &hot_2) {
+        (Ok(a), Ok(b)) => assert_eq!(
+            result_ids(a),
+            result_ids(b),
+            "空クエリ: hot の 1st と 2nd（キャッシュヒット後）が乖離した"
+        ),
+        (Err(a), Err(b)) => assert_eq!(
+            a.wire_code(),
+            b.wire_code(),
+            "空クエリ: hot の 1st と 2nd（キャッシュヒット後）の wire_code が乖離した"
+        ),
+        _ => panic!(
+            "空クエリ: hot の 1st と 2nd で Ok/Err の観測結果自体が乖離した \
+             (1st={hot_1:?}, 2nd={hot_2:?})"
+        ),
+    }
 }
 
 // --- 大規模段: 数万件規模での cold/hot 等価性（Issue #358 検証設計 2.1 の大規模段。
