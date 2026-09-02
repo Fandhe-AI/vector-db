@@ -330,8 +330,8 @@ fn each_layer_is_connected_from_the_entry_point() {
     let (_, index) = build_fixture(params, 55);
     let entry = index.entry_point().unwrap();
     let max_level = index.max_level().unwrap();
-    // 上位層（level >= 1）が実際に構築・検証されることを保証する（advisor レビュー
-    // 指摘: 上位層が常に 0 のまま偶然 green になる回帰を防ぐ）。
+    // 上位層（level >= 1）が実際に構築・検証されることを保証する（上位層が
+    // 常に 0 のまま偶然 green になる回帰を防ぐ）。
     assert!(
         max_level >= 1,
         "fixture did not exercise any upper layer (max_level={max_level})"

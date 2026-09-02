@@ -555,8 +555,9 @@ impl HnswIndex {
     /// `keep_pruned_connections=true`（余った枠を枝刈り済み候補で埋め、次数を
     /// 確保する）。この既定の採用理由・#405 での見直し余地は
     /// `docs/design/hnsw-graph-construction.md` に記録する。`extend_candidates=true`
-    /// 形（候補の隣接をさらに候補へ加える拡張）は実装しない（advisor レビュー指摘:
-    /// 到達しない分岐は将来のバグ源になるため、既定を有効化する場合に別途実装する）。
+    /// 形（候補の隣接をさらに候補へ加える拡張）は実装しない（到達しない分岐は
+    /// 検証されないままコードに残り将来のバグ源になるため。既定を有効化する
+    /// 場合に別途実装する）。
     fn select_neighbors_heuristic(
         &self,
         candidates: &[ScoredNode],
