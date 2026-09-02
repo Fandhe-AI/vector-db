@@ -188,3 +188,6 @@ fail-closed の方針）。
 - 専有環境での再測定要否・より強い同点誘発フィクスチャの要否は、本 ADR の
   実測結果（大規模段で p95 約 2.2 倍・median 約 2.8 倍の明確な劣化が観測できている）を踏まえて
   運用者が判断する
+- 疎側再取得ループの再スコアリング回避（Issue #392）による本ベンチ
+  （`make bench-hybrid`）の A/B 前後比較・受け入れ条件との対応は
+  `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #392」節参照

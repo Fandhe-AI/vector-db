@@ -506,6 +506,96 @@ impl TopKSelector {
     }
 }
 
+/// [`SparseIndex::score_within`] が返す、1 クエリ分のスコア済み候補集合
+/// （Issue #392）。`hybrid.rs::sparse_refetch_loop`（疎側再取得ループ）は
+/// `fetch_k` を倍増させながら同じクエリを何度も評価するが、疎側（BM25）は
+/// 1 回の posting 走査でスコア `> 0` の全候補が確定するため、ラウンドごとに
+/// 必要なのは「同じスコア集合からより深い Top-k を切り出す」ことだけである。
+/// 本型はスコア計算そのもの（[`SparseIndex::score_pass`]）を 1 回だけ行い、
+/// [`Self::top`] の複数回呼び出しで前方一致な Top-k 拡張を提供することで、
+/// ラウンドごとの `acc: Vec<f64>` の `O(N)` 再確保・posting 再走査・Top-k
+/// 再選出を避ける。
+///
+/// `candidates` は [`Candidate`] の全順序（スコア降順・同点は `doc_id` 昇順）
+/// に従う Top-k 契約を構造的に保証する材料（スコア `> 0` の可視ヒット全件）で
+/// あり、[`Self::top`] は `candidates` の先頭 `sorted_len` 件がこの順序で
+/// 確定済みであるという不変条件を保ちながら未整列の尾部だけを段階的に
+/// 整列する。
+#[derive(Debug)]
+pub struct SparseScored {
+    candidates: Vec<Candidate>,
+    /// `candidates[..sorted_len]` は既にスコア降順（同点 `doc_id` 昇順）に
+    /// 確定済み。`sorted_len <= candidates.len()`（不変条件）。
+    sorted_len: usize,
+}
+
+impl SparseScored {
+    /// スコア `> 0` の可視ヒット総数（`M`）。
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// [`Self::len`] が `0` かどうか。
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    /// スコア降順（同点は `doc_id` 昇順）で先頭 `k.min(self.len())` 件を返す
+    /// （[`SparseIndex::search_within`] と同一の順序契約）。
+    ///
+    /// 前方一致契約: `k1 <= k2` なら `top(k1)` は `top(k2)` の前方一致な
+    /// 部分列になる（[`Candidate`] の全順序に基づき同一の候補配列から切り出す
+    /// ため構造的に保証される）。冪等（同じ `k` を複数回呼んでも同じ列を返す）。
+    ///
+    /// `&mut self` である理由: 呼び出しごとに `candidates[sorted_len..]` を
+    /// 段階的に整列して `sorted_len` を前進させる in-place 分割方式のため
+    /// （`hybrid.rs::sparse_refetch_loop` は同一の `SparseScored` を再取得
+    /// ラウンドごとに `top` で呼び直す）。
+    ///
+    /// 確保量: 新規確保は行わず、返す `Vec<ScoredDoc>` の長さも `min(k,
+    /// self.len())` で有界（untrusted な `k` によって `M` を超えて増幅
+    /// しない。`.claude/rules/coding-rust.md`）。
+    pub fn top(&mut self, k: usize) -> Vec<ScoredDoc> {
+        let want = k.min(self.candidates.len());
+        if want == 0 {
+            return Vec::new();
+        }
+        if want > self.sorted_len {
+            let tail_start = self.sorted_len;
+            // `need` は尾部のうち今回新たに確定させたい件数（>= 1。
+            // `want > self.sorted_len` の分岐内のため常に正）。
+            let need = want - tail_start;
+            if let Some(tail) = self.candidates.get_mut(tail_start..) {
+                // `select_nth_unstable_by` は事前条件（添字 < スライス長）を
+                // 満たす場合のみ呼ぶ（`TopKSelector::shrink_to_k_eff` と同じ
+                // fail-closed な防御。範囲外なら何もしない＝下の `sort_unstable_by`
+                // だけで全尾部を整列することになり安全側に倒れる）。
+                if need >= 1 && need <= tail.len() {
+                    // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的
+                    // タイブレークを含む全順序（同点の doc_id が同一になることは
+                    // ない）ため、不安定な select_nth でも相対順序の非決定性は
+                    // 生じない（`TopKSelector::shrink_to_k_eff` と同じ根拠）。
+                    tail.select_nth_unstable_by(need - 1, |a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+                }
+            }
+            if let Some(newly_sorted) = self.candidates.get_mut(tail_start..want) {
+                // 同上の全順序により不安定ソートでも出力順序は決定的
+                // （`TopKSelector::into_sorted` と同じ根拠）。
+                newly_sorted.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+            }
+            self.sorted_len = want;
+        }
+        self.candidates
+            .get(..want)
+            .map(|s| {
+                s.iter()
+                    .map(|&Candidate { score, doc_id }| ScoredDoc { doc_id, score })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// 小文字化した 1 文字が ASCII 単語トークンの構成要素かどうか。
 fn is_ascii_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
@@ -756,6 +846,17 @@ enum ScoreScope<'a> {
     /// 可視ビットマップに縮約した部分集合を母数とする
     /// （[`SparseIndex::search_within`]。RLS 相当のテナント境界縮約契約）。
     Visible(&'a VisibleBitmap),
+}
+
+/// [`SparseIndex::score_pass`] の出力（Issue #392）。`acc` はコーパス全体の
+/// `doc_idx` を添字とするスコアアキュムレータ（`> 0.0` の要素がヒット）、
+/// `touched` はヒットした `doc_idx` を初回加算順（決定的）に記録した列。
+/// この 2 つだけでスコア `> 0` の全候補を復元できるため、[`SparseIndex::
+/// score_by_postings`]・[`SparseIndex::score_within`] の両方がこの中間表現を
+/// 共有する。
+struct ScorePass {
+    acc: Vec<f64>,
+    touched: Vec<u32>,
 }
 
 // `doc_idx`（`docs`/`doc_len`/`doc_ids`/`postings` 内側要素の添字）を `u32` で
@@ -1187,6 +1288,104 @@ impl SparseIndex {
         Ok(self.score_by_postings(&query_ids, ScoreScope::Visible(&bitmap), k))
     }
 
+    /// [`Self::search_within`] の「スコアリングと Top-k 選出を分離した」版
+    /// （Issue #392）。呼び出し元が渡す `k` に対して 1 回限りの Top-k を返す
+    /// `search_within` とは異なり、本メソッドは可視集合に縮約したスコア
+    /// `> 0` の全候補を 1 回のスコア計算（[`Self::score_pass`]）で確定させた
+    /// [`SparseScored`] を返し、呼び出し元は [`SparseScored::top`] を複数回
+    /// 呼んで `k` を伸ばしながら Top-k を切り出せる。
+    ///
+    /// `hybrid.rs::sparse_refetch_loop`（疎側再取得ループ。境界の同点グループ
+    /// 完全化のため `fetch_k` を倍増させながら同じクエリを再評価する）向けの
+    /// 最適化であり、`search_within` を単体で使う既存の呼び出し元
+    /// （`tests/hybrid.rs` の独立オラクル等）はそのまま `search_within` を
+    /// 使い続けられる（両者は別経路のまま残し、出力の一致は単体テストで
+    /// 固定する。両経路とも [`Self::score_pass`] を共有するため、ロジックの
+    /// 二重実装ではない）。
+    ///
+    /// 入力検証（クエリのバイト長・一意語数上限）・空結果ケース
+    /// （無トークンクエリ・空可視集合）・RLS 相当のテナント境界縮約契約
+    /// （統計母数・候補選出を `visible_ids` へ限定し、インデックス全体の
+    /// `self.doc_count`/`self.avg_doc_len`/`self.doc_freq` を参照しない）は
+    /// [`Self::search_within`] と同一（同メソッドのドキュメンテーション
+    /// コメント参照）。`k == 0` 判定は本メソッドには存在しない
+    /// （`k` を受け取らないため。[`SparseScored::top`] 側が `k == 0` を
+    /// 空 `Vec` として扱う）。
+    pub fn score_within(
+        &self,
+        query: &str,
+        visible_ids: &BTreeSet<DocId>,
+    ) -> Result<SparseScored, SparseError> {
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(SparseError::QueryTooLong {
+                len: query.len(),
+                max: MAX_QUERY_BYTES,
+            });
+        }
+
+        let query_terms = tokenize(query);
+
+        let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
+        for t in &query_terms {
+            unique_terms.insert(t.clone(), ());
+        }
+
+        if unique_terms.len() > MAX_QUERY_TERMS {
+            return Err(SparseError::TooManyQueryTerms {
+                unique_terms: unique_terms.len(),
+                max: MAX_QUERY_TERMS,
+            });
+        }
+
+        let empty = || SparseScored {
+            candidates: Vec::new(),
+            sorted_len: 0,
+        };
+
+        if query_terms.is_empty() || visible_ids.is_empty() {
+            return Ok(empty());
+        }
+
+        let query_ids: Vec<TermId> = unique_terms
+            .keys()
+            .filter_map(|t| self.terms.lookup(t))
+            .collect();
+
+        if query_ids.is_empty() {
+            return Ok(empty());
+        }
+
+        let bitmap = VisibleBitmap::build(self, visible_ids);
+        if bitmap.n == 0 {
+            return Ok(empty());
+        }
+
+        let ScorePass { acc, touched } = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap));
+
+        // touched 順（決定的。posting 走査でヒットを初めて記録した順）のまま
+        // 候補列を材料化する。`SparseScored::top` はこの列を全順序
+        // （`Candidate::Ord`）に基づき整列するため、ここでの並び順自体は
+        // 最終的な出力順序に影響しない。
+        let mut candidates = Vec::with_capacity(touched.len());
+        for &doc_idx in &touched {
+            let idx = doc_idx as usize;
+            let Some(&score) = acc.get(idx) else {
+                continue;
+            };
+            if score > 0.0 {
+                let Some(&doc_id) = self.doc_ids.get(idx) else {
+                    continue;
+                };
+                candidates.push(Candidate { score, doc_id });
+            }
+        }
+
+        Ok(SparseScored {
+            candidates,
+            sorted_len: 0,
+        })
+    }
+
     /// `search`/`search_within` が共有する 1 パススコアリングコア（Issue #390。
     /// 旧実装は可視部分集合へ縮約した文書配列を全件線形走査し、クエリ語ごとに
     /// 各文書の `term_freq` を二分探索していたが、本関数はクエリ語ごとに
@@ -1242,6 +1441,50 @@ impl SparseIndex {
         scope: ScoreScope<'_>,
         k: usize,
     ) -> Vec<ScoredDoc> {
+        let ScorePass { acc, touched } = self.score_pass(query_ids, scope);
+
+        // Top-k 選出（Issue #391・[`TopKSelector`]）。`k_eff` はコーパス側で
+        // 有界な `touched.len()` と untrusted な `k` の小さい方であり、
+        // `TopKSelector` の確保量（`O(k_eff)`）を有界化する
+        // （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の
+        // 増幅防止）。
+        let k_eff = k.min(touched.len());
+        let mut selector = TopKSelector::new(k_eff);
+        for &doc_idx in &touched {
+            let idx = doc_idx as usize;
+            // `touched` は `acc.get_mut(idx)` が `Some` を返した添字のみを記録している
+            // ため理論上範囲内だが、`.claude/rules/coding-rust.md`（`[]` 禁止）に従い
+            // `.get()` で明示的に防御する（範囲外は fail-closed で候補から除外）。
+            let Some(&score) = acc.get(idx) else {
+                continue;
+            };
+            if score > 0.0 {
+                let Some(&doc_id) = self.doc_ids.get(idx) else {
+                    continue;
+                };
+                selector.push(Candidate { score, doc_id });
+            }
+        }
+
+        selector
+            .into_sorted()
+            .into_iter()
+            .map(|Candidate { score, doc_id }| ScoredDoc { doc_id, score })
+            .collect()
+    }
+
+    /// [`Self::score_by_postings`]・[`Self::score_within`] が共有する 1 パス
+    /// スコア計算コア（Issue #392）。クエリ語の posting 走査によりスコア
+    /// `> 0` の全候補を求める処理そのものを切り出したもので、Top-k 選出方式
+    /// （[`TopKSelector`] による 1 回限りの選出か、[`SparseScored::top`] による
+    /// 複数ラウンドの前方一致な切り出しか）には関知しない。呼び出し元
+    /// （`hybrid.rs::sparse_refetch_loop`）が疎側再取得ループで `fetch_k` を
+    /// 倍増させながら同じクエリを何度も評価する際、本関数は 1 回だけ呼べば
+    /// 済む（スコア > 0 の候補集合はクエリ・可視集合が変わらない限り不変な
+    /// ため）。分離前は `search_within` を呼ぶたびに本関数相当の処理
+    /// （`acc: Vec<f64>` の `O(N)` 確保・ゼロ初期化を含む）をラウンドごとに
+    /// 繰り返していた。
+    fn score_pass(&self, query_ids: &[TermId], scope: ScoreScope<'_>) -> ScorePass {
         let (n, avg_doc_len) = match scope {
             ScoreScope::All => (f64::from(self.doc_count), self.avg_doc_len),
             ScoreScope::Visible(bitmap) => {
@@ -1334,34 +1577,7 @@ impl SparseIndex {
             }
         }
 
-        // Top-k 選出（Issue #391・[`TopKSelector`]）。`k_eff` はコーパス側で
-        // 有界な `touched.len()` と untrusted な `k` の小さい方であり、
-        // `TopKSelector` の確保量（`O(k_eff)`）を有界化する
-        // （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の
-        // 増幅防止）。
-        let k_eff = k.min(touched.len());
-        let mut selector = TopKSelector::new(k_eff);
-        for &doc_idx in &touched {
-            let idx = doc_idx as usize;
-            // `touched` は `acc.get_mut(idx)` が `Some` を返した添字のみを記録している
-            // ため理論上範囲内だが、`.claude/rules/coding-rust.md`（`[]` 禁止）に従い
-            // `.get()` で明示的に防御する（範囲外は fail-closed で候補から除外）。
-            let Some(&score) = acc.get(idx) else {
-                continue;
-            };
-            if score > 0.0 {
-                let Some(&doc_id) = self.doc_ids.get(idx) else {
-                    continue;
-                };
-                selector.push(Candidate { score, doc_id });
-            }
-        }
-
-        selector
-            .into_sorted()
-            .into_iter()
-            .map(|Candidate { score, doc_id }| ScoredDoc { doc_id, score })
-            .collect()
+        ScorePass { acc, touched }
     }
 
     /// `HashMap` の 1 エントリあたりのアロケータ管理領域・制御バイト分の概算
@@ -2974,6 +3190,158 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn score_within_top_is_bit_identical_to_search_within_on_mixed_corpus() {
+        // `score_within(q, vis).top(k)` と `search_within(q, k, vis)` が同一の
+        // 出力（doc_id 列・スコアともビット一致）を返すことを固定する
+        // （Issue #392。両者は [`SparseIndex::score_pass`] を共有するが、
+        // Top-k 選出の実装〔`TopKSelector` 対 `SparseScored::top`〕が異なる
+        // ため、出力が一致することそのものが本テストの検証対象になる）。
+        let corpus = generate_mixed_corpus(2_000);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        let visible: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| id % 2 == 0)
+            .collect();
+        let m = visible.len();
+        // 疎側再取得ループの倍増スケジュール相当の値を含める（Issue #320・#392）。
+        let ks = [1usize, 5, 20, 100, m / 2, m, m + 1, 2, 4, 8, 16, 32, 64];
+        for query in [
+            "alpha beta",
+            "検索 評価",
+            "alpha検索",
+            "gamma delta epsilon",
+        ] {
+            let mut scored = idx.score_within(query, &visible).unwrap();
+            for &k in &ks {
+                let via_scored = scored.top(k);
+                let via_search_within = idx.search_within(query, k, &visible).unwrap();
+                assert_eq!(
+                    via_scored, via_search_within,
+                    "query={query:?} k={k}: score_within(..).top(k) と \
+                     search_within(.., k, ..) が一致しない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_scored_top_is_prefix_consistent_and_idempotent() {
+        // `top(k1)` → `top(k2 > k1)` → `top(k1)` の順に呼んでも前方一致・
+        // 冪等であることを固定する（Issue #392。[`SparseScored::top`] の
+        // ドキュメンテーションコメントの契約）。
+        let corpus = generate_mixed_corpus(500);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+
+        let mut scored = idx.score_within("alpha beta", &visible).unwrap();
+        let m = scored.len();
+        assert!(m > 40, "テスト前提: 十分なヒット数が必要 (m={m})");
+
+        let k1 = 5usize;
+        let k2 = 40usize;
+        let top_k1_first = scored.top(k1);
+        let top_k2 = scored.top(k2);
+        let top_k1_again = scored.top(k1);
+
+        assert_eq!(
+            top_k1_first, top_k1_again,
+            "同じ k を複数回呼んでも同一列を返す（冪等性）"
+        );
+        assert_eq!(
+            top_k2[..k1],
+            top_k1_first[..],
+            "top(k1) は top(k2) の前方一致な部分列である"
+        );
+
+        // k > M（全ヒット数）は M 件で頭打ちになる。
+        let top_over = scored.top(m + 10);
+        assert_eq!(top_over.len(), m);
+        assert_eq!(&top_over[..k2], &top_k2[..]);
+    }
+
+    #[test]
+    fn sparse_scored_top_k_zero_and_empty_scored_return_empty() {
+        let corpus = generate_mixed_corpus(50);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+
+        let mut scored = idx.score_within("alpha beta", &visible).unwrap();
+        assert!(scored.top(0).is_empty());
+
+        // 未知語のみのクエリ・空可視集合はいずれも空の `SparseScored` を返す。
+        let mut scored_unknown = idx
+            .score_within("zzz_not_a_real_token_zzz", &visible)
+            .unwrap();
+        assert!(scored_unknown.is_empty());
+        assert!(scored_unknown.top(10).is_empty());
+
+        let mut scored_empty_visible = idx.score_within("alpha beta", &BTreeSet::new()).unwrap();
+        assert!(scored_empty_visible.is_empty());
+        assert!(scored_empty_visible.top(10).is_empty());
+    }
+
+    #[test]
+    fn score_within_input_validation_precedes_empty_cases() {
+        // `search_within_query_too_long_is_rejected_before_visible_ids_check`
+        // と対（Issue #392）。`QueryTooLong`・`TooManyQueryTerms` が空可視集合
+        // より優先して評価される契約は `score_within` でも同一。
+        let corpus = generate_mixed_corpus(20);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let empty_visible: BTreeSet<DocId> = BTreeSet::new();
+
+        let too_long_query = "a".repeat(MAX_QUERY_BYTES + 1);
+        let err = idx
+            .score_within(&too_long_query, &empty_visible)
+            .unwrap_err();
+        assert!(matches!(err, SparseError::QueryTooLong { .. }));
+
+        let too_many_terms_query = (0..=MAX_QUERY_TERMS)
+            .map(|i| format!("distinctterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = idx
+            .score_within(&too_many_terms_query, &empty_visible)
+            .unwrap_err();
+        assert!(matches!(err, SparseError::TooManyQueryTerms { .. }));
+    }
+
+    #[test]
+    fn score_within_statistics_are_isolated_from_invisible_docs() {
+        // `search_within_statistics_are_isolated_from_invisible_docs` と対
+        // （Issue #392）。可視部分集合（id=1 のみ "cat" を含む）を固定したまま
+        // 共有インデックスへ大量の不可視文書（"cat" を含むものを含む）を追加
+        // しても `score_within` のスコアが不変であること（RLS 相当のテナント
+        // 境界縮約契約の回帰。`doc_count`/`doc_freq` を通じた統計汚染の防止）。
+        let small_docs = vec![(1u64, "cat"), (2u64, "dog")];
+        let small_idx = SparseIndex::build(&small_docs).expect("build ok");
+        let visible: BTreeSet<u64> = [1u64].into_iter().collect();
+        let small_result = small_idx
+            .score_within("cat", &visible)
+            .expect("score_within ok")
+            .top(10);
+
+        let mut large_docs: Vec<(u64, &str)> = vec![(1u64, "cat"), (2u64, "dog")];
+        let filler: Vec<(u64, &str)> = (100u64..150).map(|id| (id, "cat cat cat")).collect();
+        large_docs.extend(filler.iter().copied());
+        let large_idx = SparseIndex::build(&large_docs).expect("build ok");
+        let large_result = large_idx
+            .score_within("cat", &visible)
+            .expect("score_within ok")
+            .top(10);
+
+        assert_eq!(
+            small_result, large_result,
+            "invisible corpus growth must not change visible-only score"
+        );
     }
 
     /// 決定的 xorshift による疑似乱数列（テスト専用。暗号用途ではない）。
