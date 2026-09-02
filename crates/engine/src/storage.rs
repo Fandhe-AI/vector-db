@@ -570,9 +570,13 @@ impl Storage {
             let mut table = write_txn
                 .open_table(ROWS_TABLE)
                 .map_err(map_rows_table_error)?;
+            // clear 再利用の 1 面スクラッチ（Issue #398。`tenant.rs` の同パターンと
+            // 揃える）。txn 内でのみ有効なため、行数分の `Vec<u8>` 確保を避ける。
+            let mut scratch: Vec<u8> = Vec::new();
             for (id, row) in rows {
-                let encoded = encode_row(row)?;
-                table.insert((row.tenant_id, *id), encoded.as_slice())?;
+                scratch.clear();
+                encode_row_into(&mut scratch, row)?;
+                table.insert((row.tenant_id, *id), scratch.as_slice())?;
             }
         }
         // commit 成功境界（TASK-96・RECOVER-5）の choke point 経由でコミットする
@@ -802,13 +806,48 @@ fn check_batch_log_limit(entries: usize) -> Result<()> {
 ///
 /// `pub(crate)`: `txn.rs`（TASK-88）の書き込みトランザクションハンドルが、`Storage::put`
 /// と同一のエンコーディングで行を書き込むために再利用する。
+///
+/// 実体は [`encode_row_into`] へ委譲する薄いラッパー（Issue #398）。単発の書き込み
+/// （`txn.rs::WriteTxn::put`／`BatchWriteTxn::put` 等、行数分のバッファ再利用が
+/// 割に合わない呼び出し元）はこちらを使い続けてよい。バッチ経路（`tenant.rs`・
+/// `catalog.rs`）は `encode_row_into` を直接呼び、呼び出し元が保持するバッファへ
+/// 追記することで行ごとの `Vec<u8>` 確保を避ける。
 pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
-    if row.tenant_id.is_empty() {
+    let mut buf = Vec::new();
+    encode_row_into(&mut buf, row)?;
+    Ok(buf)
+}
+
+/// [`encode_row_into`] が書き込む前に呼び出し元が把握しておくためのバイト長計算
+/// （検証込み）。バッチ経路（`tenant.rs::insert_rows_unchecked`）が連続 arena の
+/// 総サイズを事前に `checked_add` で積算し、`try_reserve_exact` へ渡すために使う
+/// （Issue #398）。検証条件・エラー種別は `encode_row_into` と同一に保つ
+/// （どちらかだけが通る／拒否する行が発生しないようにするため）。
+pub(crate) fn encoded_row_len(row: &RowInput<'_>) -> Result<usize> {
+    let tenant_len = validate_tenant_id(row.tenant_id)?;
+    let dim = validate_embedding_dim(row.embedding)?;
+    let metadata_len = validate_metadata_len(row.metadata)?;
+    let len = 1usize
+        .checked_add(2)
+        .and_then(|n| n.checked_add(tenant_len as usize))
+        .and_then(|n| n.checked_add(1))
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| n.checked_add((dim as usize).checked_mul(4)?))
+        .and_then(|n| n.checked_add(4))
+        .and_then(|n| n.checked_add(metadata_len as usize))
+        .ok_or_else(|| StorageError::Codec("encoded row length overflow".to_string()))?;
+    Ok(len)
+}
+
+/// `tenant_id` の検証（空文字列拒否・[`MAX_TENANT_ID_LEN`] 上限）。
+/// [`encode_row_into`]・[`encoded_row_len`] で検証条件を一致させるための共有関数。
+fn validate_tenant_id(tenant_id: &str) -> Result<u16> {
+    if tenant_id.is_empty() {
         return Err(StorageError::Codec(
             "tenant_id must not be empty".to_string(),
         ));
     }
-    let tenant_bytes = row.tenant_id.as_bytes();
+    let tenant_bytes = tenant_id.as_bytes();
     let tenant_len = u16::try_from(tenant_bytes.len()).map_err(|_| {
         StorageError::Codec(format!("tenant_id too long: {} bytes", tenant_bytes.len()))
     })?;
@@ -817,37 +856,96 @@ pub(crate) fn encode_row(row: &RowInput<'_>) -> Result<Vec<u8>> {
             "tenant_id length {tenant_len} exceeds limit {MAX_TENANT_ID_LEN}"
         )));
     }
+    Ok(tenant_len)
+}
 
-    let dim = u32::try_from(row.embedding.len()).map_err(|_| {
-        StorageError::Codec(format!("embedding dim too large: {}", row.embedding.len()))
+/// embedding 次元数の検証（[`MAX_EMBEDDING_DIM`] 上限）。
+/// [`encode_row_into`]・[`encoded_row_len`] で検証条件を一致させるための共有関数。
+fn validate_embedding_dim(embedding: &[f32]) -> Result<u32> {
+    let dim = u32::try_from(embedding.len()).map_err(|_| {
+        StorageError::Codec(format!("embedding dim too large: {}", embedding.len()))
     })?;
     if dim > MAX_EMBEDDING_DIM {
         return Err(StorageError::Codec(format!(
             "embedding dim {dim} exceeds limit {MAX_EMBEDDING_DIM}"
         )));
     }
-    let metadata_len = u32::try_from(row.metadata.len())
-        .map_err(|_| StorageError::Codec(format!("metadata too large: {}", row.metadata.len())))?;
+    Ok(dim)
+}
+
+/// メタデータ長の検証（[`MAX_METADATA_LEN`] 上限）。
+/// [`encode_row_into`]・[`encoded_row_len`] で検証条件を一致させるための共有関数。
+fn validate_metadata_len(metadata: &[u8]) -> Result<u32> {
+    let metadata_len = u32::try_from(metadata.len())
+        .map_err(|_| StorageError::Codec(format!("metadata too large: {}", metadata.len())))?;
     if metadata_len > MAX_METADATA_LEN {
         return Err(StorageError::Codec(format!(
             "metadata length {metadata_len} exceeds limit {MAX_METADATA_LEN}"
         )));
     }
+    Ok(metadata_len)
+}
 
-    let mut buf = Vec::with_capacity(
-        1 + 2 + tenant_bytes.len() + 1 + 4 + row.embedding.len() * 4 + 4 + row.metadata.len(),
-    );
+/// `values` を LE バイト列として `buf` の末尾へ追記するバルク変換ヘルパ（Issue #398）。
+/// `to_le_bytes` ベースのためホストエンディアンに依存しない（LE ホストでは
+/// memcpy 相当へ最適化される）。要素ごとの `extend_from_slice` 呼び出しを
+/// 避け、事前に確保した領域へ `chunks_exact_mut` で書き込む。
+/// `unsafe`・`bytemuck` 等の再解釈は使わない（dependency-policy・coding-rust）。
+fn extend_f32_le(buf: &mut Vec<u8>, values: &[f32]) -> Result<()> {
+    let start = buf.len();
+    let bytes = values
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| StorageError::Codec("embedding byte length overflow".to_string()))?;
+    let new_len = start
+        .checked_add(bytes)
+        .ok_or_else(|| StorageError::Codec("embedding byte length overflow".to_string()))?;
+    buf.try_reserve(bytes)
+        .map_err(|_| StorageError::Codec("failed to reserve embedding buffer".to_string()))?;
+    buf.resize(new_len, 0);
+    let dst = buf
+        .get_mut(start..)
+        .ok_or_else(|| StorageError::Codec("embedding buffer write out of bounds".to_string()))?;
+    let (chunks, _remainder) = dst.as_chunks_mut::<4>();
+    for (chunk, v) in chunks.iter_mut().zip(values) {
+        *chunk = v.to_le_bytes();
+    }
+    Ok(())
+}
+
+/// 行を v2 レイアウトで `buf` の末尾へ追記する（対象ビヘイビア: PERSIST-3。
+/// レイアウトは [`encode_row`] のドキュメンテーションコメント参照）。`buf` を
+/// `clear` しない append 型のため、呼び出し元は連続 arena（`tenant.rs`。1
+/// バッチ 1 バッファ）・clear 再利用スクラッチ（`catalog.rs`・`tenant.rs` の
+/// 別経路）いずれの再利用パターンにも使える（Issue #398）。
+///
+/// 検証（`validate_tenant_id`・`validate_embedding_dim`・`validate_metadata_len`）
+/// → サイズ計算（[`encoded_row_len`] と同一の `checked_*` 演算）→
+/// `try_reserve`（無制限 `Vec::with_capacity` 禁止・coding-rust）→ 書き込み
+/// の順で行うため、`Err` を返す場合 `buf` は呼び出し前と同一の長さ・内容の
+/// まま（部分追記が残らない）。
+///
+/// `pub(crate)`: `tenant.rs`（`insert_rows_unchecked`・`replace_typed_rows_by_text_key`）・
+/// `catalog.rs`（`insert_rows_into_table`）・`storage.rs::Storage::put_batch` が
+/// バッチ書き込み経路で直接呼ぶ。
+pub(crate) fn encode_row_into(buf: &mut Vec<u8>, row: &RowInput<'_>) -> Result<()> {
+    let tenant_len = validate_tenant_id(row.tenant_id)?;
+    let dim = validate_embedding_dim(row.embedding)?;
+    let metadata_len = validate_metadata_len(row.metadata)?;
+
+    let additional = encoded_row_len(row)?;
+    buf.try_reserve(additional)
+        .map_err(|_| StorageError::Codec("failed to reserve row buffer".to_string()))?;
+
     buf.push(ROW_FORMAT_VERSION);
     buf.extend_from_slice(&tenant_len.to_le_bytes());
-    buf.extend_from_slice(tenant_bytes);
+    buf.extend_from_slice(row.tenant_id.as_bytes());
     buf.push(row.visibility.to_byte());
     buf.extend_from_slice(&dim.to_le_bytes());
-    for v in row.embedding {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
+    extend_f32_le(buf, row.embedding)?;
     buf.extend_from_slice(&metadata_len.to_le_bytes());
     buf.extend_from_slice(row.metadata);
-    Ok(buf)
+    Ok(())
 }
 
 /// 行バイト列の先頭（バージョン・`tenant_id`・`visibility`）だけをデコードする
@@ -1449,6 +1547,149 @@ mod tests {
             metadata: &huge,
         });
         assert!(result.is_err());
+    }
+
+    // Issue #398: `encode_row_into`（append 型）が `encode_row`（ラッパー）と
+    // 完全一致すること・エラー時にバッファを変更しないこと・エンディアン非依存
+    // であることを検証する。
+
+    fn sample_rows_for_encode_into_matrix() -> Vec<RowInput<'static>> {
+        // embedding 長 0/1/3/128・metadata 空/非空・tenant 長の組み合わせ
+        // （4.5 節）。`'static` にするためリテラル・リークした Vec を使う。
+        const EMB0: &[f32] = &[];
+        const EMB1: &[f32] = &[1.5];
+        const EMB3: &[f32] = &[1.0, -2.5, 0.0];
+        let emb128: &'static [f32] = Box::leak(vec![0.25_f32; 128].into_boxed_slice());
+        let long_tenant: &'static str =
+            Box::leak(("t".repeat(MAX_TENANT_ID_LEN as usize)).into_boxed_str());
+        vec![
+            RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Public,
+                embedding: EMB0,
+                metadata: b"",
+            },
+            RowInput {
+                tenant_id: "tenant-a",
+                visibility: Visibility::Private,
+                embedding: EMB1,
+                metadata: b"meta",
+            },
+            RowInput {
+                tenant_id: "t",
+                visibility: Visibility::Public,
+                embedding: EMB3,
+                metadata: b"",
+            },
+            RowInput {
+                tenant_id: long_tenant,
+                visibility: Visibility::Private,
+                embedding: emb128,
+                metadata: b"opaque-metadata-bytes",
+            },
+        ]
+    }
+
+    #[test]
+    fn encode_row_into_matches_encode_row() {
+        for row in sample_rows_for_encode_into_matrix() {
+            let expected = encode_row(&row).unwrap();
+            let mut buf = Vec::new();
+            encode_row_into(&mut buf, &row).unwrap();
+            assert_eq!(buf, expected);
+        }
+    }
+
+    #[test]
+    fn encode_row_into_appends_after_existing_prefix() {
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[1.0, 2.0],
+            metadata: b"meta",
+        };
+        let expected = encode_row(&row).unwrap();
+        let prefix = vec![0xAAu8, 0xBB, 0xCC];
+        let mut buf = prefix.clone();
+        encode_row_into(&mut buf, &row).unwrap();
+        assert_eq!(&buf[..prefix.len()], prefix.as_slice());
+        assert_eq!(&buf[prefix.len()..], expected.as_slice());
+    }
+
+    #[test]
+    fn encode_row_into_leaves_buffer_unchanged_on_error() {
+        let bad_rows = [
+            RowInput {
+                tenant_id: "",
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &[],
+            },
+            RowInput {
+                tenant_id: &"t".repeat((MAX_TENANT_ID_LEN as usize) + 1),
+                visibility: Visibility::Public,
+                embedding: &[],
+                metadata: &[],
+            },
+        ];
+        for row in &bad_rows {
+            let mut buf = vec![1u8, 2, 3];
+            let snapshot = buf.clone();
+            let result = encode_row_into(&mut buf, row);
+            assert!(result.is_err());
+            assert_eq!(buf, snapshot, "buffer must be unchanged after Err");
+        }
+    }
+
+    #[test]
+    fn encode_row_into_embedding_bytes_are_little_endian_fixed() {
+        // ホストに依存しない固定期待バイト列（`to_le_bytes` の定義どおり）。
+        let embedding: Vec<f32> = vec![1.0, -2.5, f32::MIN_POSITIVE, f32::NAN, 0.0, -0.0];
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &embedding,
+            metadata: b"",
+        };
+        let mut buf = Vec::new();
+        encode_row_into(&mut buf, &row).unwrap();
+
+        // ヘッダ長: version(1) + tenant_len(2) + "tenant-a"(8) + visibility(1) + dim(4)
+        let header_len = 1 + 2 + "tenant-a".len() + 1 + 4;
+        let embedding_bytes = &buf[header_len..header_len + embedding.len() * 4];
+
+        // 参照ループ: `to_le_bytes` を直接連結したもの（ホスト非依存の定義）。
+        let mut reference = Vec::new();
+        for v in &embedding {
+            reference.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(embedding_bytes, reference.as_slice());
+
+        // 固定バイト列の一例（1.0f32 → 00 00 80 3F）。
+        assert_eq!(&embedding_bytes[0..4], &[0x00, 0x00, 0x80, 0x3F]);
+
+        // decode_row で往復一致（NaN はビットパターン比較）。
+        let decoded = decode_row(1, &buf).unwrap();
+        assert_eq!(decoded.embedding.len(), embedding.len());
+        for (a, b) in decoded.embedding.iter().zip(embedding.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    #[test]
+    fn encoded_row_len_matches_actual_encoded_len() {
+        for row in sample_rows_for_encode_into_matrix() {
+            let expected_len = encode_row(&row).unwrap().len();
+            assert_eq!(encoded_row_len(&row).unwrap(), expected_len);
+        }
+
+        let oversized_metadata = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[],
+            metadata: &vec![0u8; (MAX_METADATA_LEN as usize) + 1],
+        };
+        assert!(encoded_row_len(&oversized_metadata).is_err());
     }
 
     // 一時 DB パス払い出し（`unique_db_path` / `CleanupGuard`）は Issue #173 で

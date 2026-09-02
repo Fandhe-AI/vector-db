@@ -634,23 +634,49 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
-        // エンコードは行ごとに 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用
-        // （`content_hash::for_insert_batch` 内部）と redb 書き込み用でそれぞれ
-        // `encode_row` していた二重実行を排除する。要求記載順のまま事前に全行を
-        // エンコードし、その結果をハッシュ計算・行書き込みの双方で共有する。
-        // 件数は呼び出し元のスライス長で上限が決まるため、確保はフォールブルにする
-        // （無制限 `with_capacity` を使わない。coding-rust.md）。エンコードの失敗
-        // （tenant 空・上限超過等）は、以前 `for_insert_batch` が行ごとに
-        // `encode_row` していた際と同じ要求記載順で最初に発生するため、
-        // どの行が最初に失敗するか・エラー種別は変更前と同一になる。
-        let mut encoded_rows: Vec<Vec<u8>> = Vec::new();
-        encoded_rows.try_reserve_exact(rows.len()).map_err(|_| {
+        // エンコードは行ごとに 1 回のみ（Issue #397）: 台帳ハッシュ計算用
+        // （`content_hash::for_insert_batch` 内部）と redb 書き込み用で
+        // `encode_row` を二重実行しない。要求記載順のまま事前に全行をエンコードし、
+        // その結果をハッシュ計算・行書き込みの双方で共有する。
+        //
+        // 1 バッチ 1 バッファ（Issue #398）: 行数分の `Vec<u8>` 確保
+        // （`encoded_rows: Vec<Vec<u8>>`）を、連続 arena（`arena: Vec<u8>`）＋
+        // 各行の範囲表（`ranges: Vec<Range<usize>>`）へ置換する。総サイズは
+        // `encoded_row_len` で事前に `checked_add` 積算し `try_reserve_exact` で
+        // 1 回だけ確保する（無制限 `with_capacity` を使わない。coding-rust.md）。
+        // 範囲は `encode_row_into` 呼び出し前後の `arena.len()` から機械的に
+        // 導出するため、行の取り違え（別行のバイト列を書き込む事故）は起きない。
+        //
+        // エンコードの失敗（tenant 空・上限超過等）は、以前 `for_insert_batch` が
+        // 行ごとに `encode_row` していた際と同じ要求記載順で最初に発生するため、
+        // どの行が最初に失敗するか・エラー種別は変更前と同一になる（サイズ計算
+        // 段階の `encoded_row_len` も `encode_row_into` と同一の検証条件を使う
+        // ため、事前積算でも失敗する行・エラー種別は変わらない）。
+        let mut total_len: usize = 0;
+        for (_, row) in rows {
+            let len = crate::storage::encoded_row_len(row)?;
+            total_len = total_len.checked_add(len).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encoded length overflow".to_string(),
+                ))
+            })?;
+        }
+        let mut arena: Vec<u8> = Vec::new();
+        arena.try_reserve_exact(total_len).map_err(|_| {
             TenantWriteError::Storage(StorageError::Codec(
                 "failed to reserve batch encode buffer".to_string(),
             ))
         })?;
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        ranges.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch range table".to_string(),
+            ))
+        })?;
         for (_, row) in rows {
-            encoded_rows.push(encode_row(row)?);
+            let start = arena.len();
+            crate::storage::encode_row_into(&mut arena, row)?;
+            ranges.push(start..arena.len());
         }
         // バッチ全体で 1 ハッシュ（TASK-101・RECOVER-10。`content_hash` モジュール
         // ドキュメント参照。要求記載順を含めて連結する）。`Err` の場合は行の書き込みへ
@@ -663,11 +689,14 @@ pub(crate) fn insert_rows_unchecked(
                 "failed to reserve batch hash input".to_string(),
             ))
         })?;
-        hash_input.extend(
-            rows.iter()
-                .zip(encoded_rows.iter())
-                .map(|((id, _), encoded)| (*id, encoded.as_slice())),
-        );
+        for ((id, _), range) in rows.iter().zip(ranges.iter()) {
+            let encoded = arena.get(range.clone()).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encode arena range out of bounds".to_string(),
+                ))
+            })?;
+            hash_input.push((*id, encoded));
+        }
         let content_hash = content_hash::for_insert_batch_encoded(&hash_input)?;
         ledger::record_in_txn(
             &write_txn,
@@ -680,10 +709,15 @@ pub(crate) fn insert_rows_unchecked(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
-        for ((id, row), encoded) in rows.iter().zip(encoded_rows.iter()) {
+        for ((id, row), range) in rows.iter().zip(ranges.iter()) {
             schema.validate_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
-            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+            let encoded = arena.get(range.clone()).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encode arena range out of bounds".to_string(),
+                ))
+            })?;
+            insert_unique_row(&mut row_table, key, encoded)?;
         }
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -1213,6 +1247,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 .map_err(CatalogError::from)?;
         }
 
+        // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
+        // （`Vec<u8>` 新規確保）を避け、`scratch.clear()` → `encode_row_into` で
+        // 同一バッファへ追記する。この経路（`execute_insert_sql_batch`）の台帳
+        // ハッシュ `for_replace_by_text_key` はエンコード済みバイト列を使わないため、
+        // `insert_rows_unchecked`（Issue #398）の連続 arena は不要（ハッシュ計算
+        // 完了後の行ループでのみエンコードすれば足りる）。
+        let mut scratch: Vec<u8> = Vec::new();
         let mut next_id = max_id.map_or(Ok(0u64), |m| {
             m.checked_add(1).ok_or_else(|| {
                 TenantWriteError::Catalog(CatalogError::Invalid(
@@ -1247,9 +1288,10 @@ pub(crate) fn replace_typed_rows_by_text_key(
             if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
                 return Err(TenantWriteError::IdConflict);
             }
-            let encoded = encode_row(&row)?;
+            scratch.clear();
+            crate::storage::encode_row_into(&mut scratch, &row)?;
             row_table
-                .insert(key, encoded.as_slice())
+                .insert(key, scratch.as_slice())
                 .map_err(CatalogError::from)?;
             if first_id.is_none() {
                 first_id = Some(id);
@@ -2044,5 +2086,71 @@ mod tests {
              generation (same-table writes are not treated as unrelated)"
         );
         assert_eq!(read_gen("sibling"), sibling_gen);
+    }
+
+    // Issue #398: `insert_rows_unchecked` を連続 arena（`arena: Vec<u8>` ＋
+    // `ranges: Vec<Range<usize>>`）へ置換した際の最大リスクは「範囲の取り違え
+    // （別行のバイト列を書き込む・読み戻す）」であるため、metadata 長・
+    // visibility が行ごとに異なる複数行を投入し、読み戻した各行が投入した
+    // 値と一致することを機械的に検証する。
+    #[test]
+    fn insert_rows_batch_rows_round_trip_with_varying_lengths() {
+        let path = unique_db_path("insert-rows-batch-round-trip");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let metadatas: Vec<Vec<u8>> = (0..8u32).map(|i| vec![i as u8; (i as usize) * 3]).collect();
+        let visibilities = [
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+        ];
+        let embeddings: Vec<[f32; 2]> = (0..8).map(|i| [i as f32, -(i as f32)]).collect();
+
+        let rows: Vec<(u64, RowInput<'_>)> = (0..8u64)
+            .map(|i| {
+                (
+                    i,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: visibilities[i as usize],
+                        embedding: &embeddings[i as usize],
+                        metadata: &metadatas[i as usize],
+                    },
+                )
+            })
+            .collect();
+
+        insert_rows(
+            &storage,
+            "docs",
+            &ctx,
+            &rows,
+            &OperationId::parse("round-trip-batch").expect("valid operation_id"),
+        )
+        .expect("insert_rows batch");
+
+        for i in 0..8u64 {
+            let row = storage
+                .get_row_from_table("docs", "tenant-a", i)
+                .expect("row must exist");
+            assert_eq!(
+                row.visibility, visibilities[i as usize],
+                "row {i} visibility"
+            );
+            assert_eq!(
+                row.embedding,
+                embeddings[i as usize].to_vec(),
+                "row {i} embedding"
+            );
+            assert_eq!(row.metadata, metadatas[i as usize], "row {i} metadata");
+        }
     }
 }
