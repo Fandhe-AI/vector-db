@@ -479,8 +479,11 @@ impl TopKSelector {
         // 添字 `k_eff - 1` の要素はちょうど「上位 `k_eff` 件中で最も悪い候補」に
         // なり、それより前は同等以上に良い・後は同等以下に悪いという整列条件を
         // `select_nth_unstable_by` が保証する。
+        // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的タイブレークを含む
+        // 全順序（同点の doc_id が同一になることはない）ため、不安定な select_nth でも
+        // 相対順序の非決定性は生じない。
         self.buffer
-            .select_nth_unstable_by(self.k_eff - 1, |a, b| b.cmp(a));
+            .select_nth_unstable_by(self.k_eff - 1, |a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
         self.buffer.truncate(self.k_eff);
         self.threshold = self.buffer.get(self.k_eff - 1).copied();
     }
@@ -490,7 +493,9 @@ impl TopKSelector {
         if self.buffer.len() > self.k_eff {
             self.shrink_to_k_eff();
         }
-        self.buffer.sort_unstable_by(|a, b| b.cmp(a));
+        // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的タイブレークを含む
+        // 全順序のため、不安定ソートでも出力順序は決定的。
+        self.buffer.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
         self.buffer
     }
 }
@@ -1209,18 +1214,22 @@ impl SparseIndex {
     /// フォローアップ課題として #392 領域・
     /// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節へ申し送る。
     ///
-    /// BM25 文書長正規化項のテーブル化・Top-k 選出方式（Issue #391）:
+    /// BM25 文書長正規化項のテーブル化・Top-k 選出方式（Issue #391。テーブル化を
+    /// 遅延キャッシュ方式へ改めた経緯は PR #426 の codex-review 指摘参照）:
     /// ヒットごとの `len_norm`（`1-b+b*doc_len/avgdl` 由来の `k1 * len_norm`）は
     /// クエリ内で `avgdl`（母数 `n`／`avg_doc_len`。[`ScoreScope`] により変わる）が
-    /// 確定した後は文書長のみに依存するため、走査前に文書長クラス
-    /// （[`Self::len_classes`]）ごとに 1 回だけ計算したテーブル `k1_len_norm` を
-    /// 参照する（tantivy の fieldnorm 量子化に相当。ただし本実装はロッシー量子化
-    /// をせず「相異なる文書長 = クラス」の厳密写像とする。式・演算順は旧来の
+    /// 確定した後は文書長のみに依存するため、文書長クラス（[`Self::len_classes`]）
+    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し `HashMap` へ
+    /// キャッシュする（tantivy の fieldnorm 量子化に相当。ただし本実装はロッシー
+    /// 量子化をせず「相異なる文書長 = クラス」の厳密写像とする。式・演算順は旧来の
     /// インライン計算と完全に同一であるため `denominator` は旧実装とビット一致
-    /// する）。Top-k 選出は [`TopKSelector`]（2k バッファ＋`select_nth_unstable_by`）
-    /// を使う。いずれも `Candidate` の全順序によって出力集合・順序が一意に決まる
-    /// ため、旧実装（インライン計算＋`BinaryHeap<Reverse<Candidate>>`）とは
-    /// 出力がビット一致・集合一致する。
+    /// する）。`len_classes` 全体を走査前に事前構築する方式では実際にヒットする
+    /// クラス数（<= M）に関わらず `len_classes.len()`（最悪 `O(N)`）分の計算が
+    /// 毎クエリ発生し、選択性の高いクエリで本関数の計算量契約から外れるため、
+    /// 遅延計算へ変更した。Top-k 選出は [`TopKSelector`]（2k バッファ＋
+    /// `select_nth_unstable_by`）を使う。いずれも `Candidate` の全順序によって
+    /// 出力集合・順序が一意に決まるため、旧実装（インライン計算＋
+    /// `BinaryHeap<Reverse<Candidate>>`）とは出力がビット一致・集合一致する。
     fn score_by_postings(
         &self,
         query_ids: &[TermId],
@@ -1234,22 +1243,20 @@ impl SparseIndex {
             }
         };
 
-        // BM25 の `k1 * (k1+1)` 側の定数・文書長クラス別 `k1 * len_norm` テーブルを
-        // クエリ（母数 `n`／`avg_doc_len` が確定した後）ごとに 1 回だけ構築する
-        // （Issue #391）。ヒットループ内でのインライン再計算を置き換えるが、式・
-        // 演算順は完全に同一（`k1_plus_1 = self.k1 + 1.0` は旧実装の
-        // `self.k1 + 1.0` と同一算出、`k1_len_norm[c]` は旧実装の
-        // `self.k1 * len_norm` と同一算出）であり `denominator` はビット一致する。
+        // BM25 の `k1 * (k1+1)` 側の定数。
+        // 文書長クラス別 `k1 * len_norm` テーブル値はクエリ内で `avgdl` が確定した
+        // 後は文書長のみに依存するため以前は `len_classes` 全体を走査して事前構築
+        // していたが（Issue #391）、これは実際にヒットする文書長クラス数（<= M）に
+        // 関わらず `len_classes.len()`（コーパス中の相異なる文書長数。最悪 `O(N)`）
+        // 分の計算を常に行ってしまい、選択性の高いクエリで `search`/`search_within`
+        // の `O(Q + Σ|postings(t)| + M log k)` 契約から外れるという codex-review
+        // 指摘（PR #426）に対応し、ヒットループ内で実際にタッチしたクラスのみを
+        // 遅延計算してキャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]`
+        // は旧実装の `self.k1 * len_norm` と同一算出）は不変のため `denominator` は
+        // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
+        // 一意な `f64`）ためスコア自体の決定性に影響しない。
         let k1_plus_1 = self.k1 + 1.0;
-        let k1_len_norm: Vec<f64> = self
-            .len_classes
-            .iter()
-            .map(|&len| {
-                self.k1
-                    * (1.0 - self.b
-                        + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
-            })
-            .collect();
+        let mut k1_len_norm_cache: HashMap<u32, f64> = HashMap::new();
 
         // `doc_idx` を添字とするスコアアキュムレータ（f64。ビット一致契約のため
         // f32 化はしない）。`idf`・分子は常に正であり、`denominator > 0.0` ガードを
@@ -1289,14 +1296,19 @@ impl SparseIndex {
                 let idx = doc_idx as usize;
                 // `doc_len_class` は `doc_len` と同じ添字空間・同じ長さで build 時に
                 // 同期構築される（不変条件）。`.get()` で範囲外を防御しつつ、
-                // 対応するテーブル値を `k1_len_norm.get()` で取得する
-                // （範囲外はどちらも fail-closed で当該ヒットを棄却する）。
+                // 対応するテーブル値をクラスごとに初回タッチ時のみ計算しキャッシュへ
+                // 記録する（範囲外は fail-closed で当該ヒットを棄却する）。
                 let Some(&class) = self.doc_len_class.get(idx) else {
                     continue;
                 };
-                let Some(&kln) = k1_len_norm.get(class as usize) else {
+                let Some(&len) = self.len_classes.get(class as usize) else {
                     continue;
                 };
+                let kln = *k1_len_norm_cache.entry(class).or_insert_with(|| {
+                    self.k1
+                        * (1.0 - self.b
+                            + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
+                });
                 let f = f64::from(tf);
                 let numerator = f * k1_plus_1;
                 let denominator = f + kln;
@@ -3000,7 +3012,9 @@ mod tests {
             let k_eff = k.min(m);
 
             let mut expected = candidates.clone();
-            expected.sort_unstable_by(|a, b| b.cmp(a));
+            // Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序のため、
+            // 不安定ソートでも期待値の順序は決定的。
+            expected.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
             expected.truncate(k_eff);
 
             let mut selector = TopKSelector::new(k_eff);
