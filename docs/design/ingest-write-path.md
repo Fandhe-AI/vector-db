@@ -231,11 +231,16 @@ cd /path/to/wt-before
 cargo run --release -p engine --example feature_bench
 make bench-ingest-profile
 
-# after（origin/main 最新）
-cd /path/to/repo
+# after（本 doc 掲載値の計測対象。2.1 節の badd9d9 で固定）
+git worktree add /path/to/wt-after badd9d9 --detach
+cd /path/to/wt-after
 cargo run --release -p engine --example feature_bench
 make bench-ingest-profile
 ```
+
+`badd9d9` は本 doc 掲載値の計測時点であり、`origin/main` は以後のコミットで
+進み得るため再現には使わない（before と同様、detached worktree で固定コミットを
+チェックアウトする）。
 
 各コマンドを交互（before → after → before → …）に複数回実行し、フェーズ／段
 ごとの中央値を比較する。専有環境での再実測が望ましい（3.3 参照）。
