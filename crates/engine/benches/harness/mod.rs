@@ -64,6 +64,7 @@ pub mod hybrid_profile;
 pub mod ingest_profile;
 pub mod knn_profile;
 pub mod parse_bind;
+pub mod proc_stats;
 pub mod protocol;
 pub mod rng;
 pub mod scalar_reference;
