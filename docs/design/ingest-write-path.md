@@ -26,8 +26,8 @@
 | #399 | 自作 SHA-256 の最適化 | **open（未マージ）**。本 doc の前後比較には含まれない |
 
 本 doc は Phase 2 を通した **前後比較**（before: `61fc943`／after: `origin/main`
-時点の `badd9d9`）と、調査段階で検討し **棄却した選択肢の判断根拠**
-（redb `Durability::None` の中間利用・`set_two_phase_commit`・キー順挿入）、
+時点の `badd9d9`）と、調査段階で検討し棄却した選択肢の記録（4 節。詳細は
+RECOVER-5／RECOVER-6／RECOVER-8・TABLE-12 のポインタ表記に留める）、
 および PostgreSQL `COPY` のバッファフラッシュ基準と本リポの一括投入上限
 （`batch_limits.rs`）の対比を記録する。production コードは無変更（docs 専任）。
 
@@ -107,8 +107,9 @@ Linux・x86_64・12 論理コア・AVX2FMA。`docs/design/ingest-stage-profile.m
 | rls_isolation | 2,818 | 2,796 | 0.992 | 3,096 | 2,909 | 0.940 | pass |
 | udf_call | 690 | 695 | 1.007 | 738 | 1,040 | 1.409 | 要注記（下記） |
 
-単位はすべて µs/クエリ。12 フェーズ（`ingest` を除く。`ingest` は 3.1 参照）は
-すべて判定基準内で pass。
+単位はすべて µs/クエリ。12 フェーズ（`ingest` を除く。`ingest` は 3.1 参照）のうち
+11 フェーズは判定基準内で pass。残る `udf_call` は p95 が判定基準（×1.10）を
+超過しており、下記のとおり退行の疑いとして注記する。
 
 **udf_call の p95 について**: 比 1.409 は判定基準（×1.10）を超過する。
 before 側 3 run の p95 幅は `[756, 734, 738]`（範囲 22 µs）と極めて小さいのに対し、
@@ -150,11 +151,14 @@ INSERT_MODE` は既定 `insert`）を交互 3 ペア実行した中央値（ms/1
 | E0 (`insert_rows` e2e) | 3.609 | 3.434 | 0.95 |
 
 各 run の I3/I6 生データ（ms）: before I3 `[1.680, 1.679]`・I6 `[0.806, 0.809]`
-（3 run 中 2 run。3 run 目も同水準）／after I3 `[1.967, 1.982]`・I6 `[1.059,
-1.057]`。before 側は 3 run とも 1% 未満の幅で極めて安定している一方、after 側は
-I3・I6 とも一貫して before を上回った。
+／after I3 `[1.967, 1.982]`・I6 `[1.059, 1.057]`。**3 run 目の生データは記録が
+残っておらず、上記は 3 ペア中 2 ペア分のみである**。第三者が中央値を再計算できる
+形で 3 ペア全件を記載できていないため、本節の中央値（I3/I6 の median 列）自体の
+確からしさは未確定として扱う。
 
-**この結果は「実際の退行」とは判断していない**。理由は次のとおり:
+以下の所見は、記録が残っている 2 ペア分の生データと E0（pub API 実測）を根拠と
+した**暫定所見（判定保留）**であり、3 run 目を含む生データの再測定・再記録が
+完了するまでは「退行ではない」の確定判定とはしない:
 
 1. **E0（`insert_rows` の pub API 実測）は after のほうが小さい**（3.609 →
    3.434 ms、0.95 倍）。I3・I6 は `insert_rows_unchecked` の内部段を独立再現
@@ -180,71 +184,23 @@ I3・I6 とも一貫して before を上回った。
    `Table::insert` に渡す点は変更前後で同一）、insert 自体の redb 内部処理は
    不変であるため、31% もの増加を production 変更で説明できる要因はない。
 
-以上により、I3・I6 の増加は本 Issue の production 変更に起因する退行ではなく、
-共有計測環境のノイズ（今回の計測タイミングに偏って乗った外的要因）と判断する。
-E0（実経路の pub API 計測）が悪化していないことが、この判断の一次的な根拠である。
-段別レプリカによる再現性の高い前後比較（専有環境での再実測）は 7 節へ申し送る。
+以上の状況証拠（1〜4）は、I3・I6 の増加が本 Issue の production 変更に起因する
+退行ではなく共有計測環境のノイズである可能性を支持するが、**生データ不足のため
+本 doc 単独では確定判定としない（計測不成立／判定保留）**。3 run 全件の生データを
+伴う再測定を 7 節へ申し送り、その結果をもって確定判定とする。
 
-## 4. 棄却判断の記録
+## 4. 棄却判断の記録（ポインタ表記）
 
-Phase 2 の検討過程で採否を判断し、production コードへ反映しなかった選択肢を記録する。
+Phase 2 の検討過程で採否を判断し、production コードへ反映しなかった選択肢を
+記録する。判断根拠の詳細（脅威モデル・再評価条件を含む）は private spec 側の
+判断事項であり、本 doc では TASK/ビヘイビア ID のポインタ表記に留める
+（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）。
 
-### 4.1 redb `Durability::None` によるバッチ中間 commit の高速化
-
-**検討内容**: バッチ内の複数 commit のうち最終 commit のみ `Durability::
-Immediate`（既定）とし、中間 commit を `Durability::None`（次の `Immediate`
-commit まで永続化されない）にすることで fsync 相当のコストを削減できないか。
-
-**redb 4.2.0 の実装事実**（`redb-4.2.0/src/transactions.rs`）: `Durability`
-は `None`／`Immediate` の 2 値（`#[non_exhaustive]`）。engine は
-`redb::Database::create(path)`（`storage.rs`）のみを呼び、`set_durability`・
-`set_two_phase_commit`・`set_quick_repair` はどこでも呼んでいない（リポ全体で
-0 件）。既定は `Immediate`・1 相 commit。
-
-**棄却根拠**: `recovery::commit_boundary`（TASK-96・RECOVER-5）は
-「`write_txn.commit()` の返却 ＝ durable 確定の point of no return」を前提に
-応答一意性・panic ガードを構成しており、RECOVER-6（TASK-97）の緊急応答経路も
-この境界に依存する。`Durability::None` での中間 commit は「commit 成功応答を
-返したのに durable でない」状態を作り、この既存契約と根本的に不整合となる。
-fail-closed・「回復可能エラーは継続、それ以外は fail-fast」（RECOVER-8）という
-本リポの回復設計方針とも相容れないため不採用と判断する。
-
-**再評価条件**: spec 側で durable 境界の定義そのものが再定義される場合のみ。
-
-### 4.2 `set_two_phase_commit` / `set_quick_repair` の有効化
-
-**検討内容**: 2 相 commit（slot 書き込み → fsync → god byte 反転 → fsync の
-fsync 2 回）を有効化し、クラッシュ耐性を既定の 1 相 commit（xxhash checksum に
-よる復旧）より強化できないか。
-
-**棄却根拠**: 2 相化は fsync が 1 回から 2 回に増える方向であり、I8（commit）
-段は Σ(I1..I8) の約 11〜12%（`docs/design/ingest-stage-profile.md`「実測結果」
-節）を占めるため、コスト増の方向にしか働かない。既定の 1 相 commit・checksum
-復旧で本リポの crash-test 系 CI（`crash_test.sh`・interrupt・cross_table）の
-回復契約は満たしており、2 相 commit が想定する脅威モデル（ワークロード完全制御
-下でのクラッシュ誘発耐性）は現行 spec の脅威モデルの範囲外と判断する。
-
-**再評価条件**: 脅威モデルが変更される場合のみ。
-
-### 4.3 キー順挿入によるツリー構築の高速化
-
-**検討内容**: バッチ内の行をキー（`(tenant_id, id)`）昇順に並べ替えてから
-挿入することで、redb の木構築コストを削減できないか。
-
-**redb 4.2.0 の実装事実**（`tree_store/btree_mutator.rs`）: 専用の bulk-load
-／append API は無い。ただし「木の全キーより大きいキーを挿入し、最右 leaf が
-満杯のとき、均等分割せずに新 leaf を新規ペアだけで開始する」という rightmost
-fast-path（昇順ロード向けの分割ヒューリスティック）が既に存在する
-（`rightmost` は全上位ブランチが最後の子へ降りたときに true になる）。
-
-**棄却根拠**: engine の物理キーは `(tenant_id, id)`（TABLE-12）であり、
-`feature_bench`・`insert_rows` の呼び出しパターンは id を範囲で昇順投入する
-ため、この条件では上記ヒューリスティックが既に効いている可能性が高く、
-engine 側で追加のソートを行っても効果は見込みにくい。さらにバッチ内の並べ替えは
-「要求記載順＝台帳内容照合ハッシュの入力順・encode 失敗のエラー優先順位」という
-既存契約（#397 で固定。`recovery_content_hash.rs::
-insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch`）に
-触れるため、不採用と判断する。
+| 検討した選択肢 | redb 4.2.0 の実装事実（本リポ依存クレート） | 判断 |
+| --- | --- | --- |
+| redb `Durability::None` によるバッチ中間 commit の高速化 | `Durability` は `None`／`Immediate` の 2 値。engine は `set_durability` をどこでも呼んでいない（既定 `Immediate`・1 相 commit） | 不採用。RECOVER-5／RECOVER-6・TASK-96／TASK-97 の既存契約を参照 |
+| `set_two_phase_commit` / `set_quick_repair` の有効化 | engine はこれらの API をどこでも呼んでいない（既定の 1 相 commit・checksum 復旧） | 不採用。RECOVER-8・TASK-99 のポインタを参照 |
+| キー順挿入によるツリー構築の高速化 | redb には昇順ロード向けの rightmost fast-path が既に実装されている（`tree_store/btree_mutator.rs`） | 不採用。TABLE-12・#397 で固定した既存契約（`recovery_content_hash.rs` の優先順位テスト）を参照 |
 
 ## 5. 参考: PostgreSQL `COPY` のバッファ二重基準と本リポのバッチ上限
 
@@ -292,7 +248,8 @@ make bench-ingest-profile
 
 - #399（自作 SHA-256 最適化）マージ後の再計測・専有環境での確定測定。
 - `bench-ingest-profile` の段別内訳（3.3 の I3・I6）の専有環境での再実測
-  （本 doc の共有環境計測はノイズの影響を排除できていない）。
+  （本 doc の共有環境計測はノイズの影響を排除できていない。3 run 全件の生データ
+  記録を含め、判定保留を解消するための再測定が必要）。
 - `udf_call` フェーズ p95 の専有環境での切り分け（3.2）。
 - 行形バッチ `insert_rows` への行数×バイト予算の導入（5 節。別 Issue・
   ユーザー承認後）。

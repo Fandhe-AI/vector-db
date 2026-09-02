@@ -202,8 +202,8 @@ INSERT_MODE`（`insert`〔既定〕／`reserve`）で I6 段の redb `insert_res
 計測モードを切替できます（Issue #400。`insert`／`reserve` 以外は fail-closed に
 拒否）。実測結果・設計は `docs/design/ingest-stage-profile.md`・
 `docs/design/redb-insert-reserve-zero-copy.md` を参照してください。
-Phase 2（親 Issue #395）を通した前後比較・棄却判断（Durability／2 相 commit／
-キー順挿入）・バッチ上限の申し送りは `docs/design/ingest-write-path.md`
+Phase 2（親 Issue #395）を通した前後比較・棄却判断（RECOVER-5／RECOVER-6／
+RECOVER-8 ポインタ）・バッチ上限の申し送りは `docs/design/ingest-write-path.md`
 （Issue #401）を参照してください。
 
 ### クロスエンコーダリランカーの実測手順（Issue #333）
