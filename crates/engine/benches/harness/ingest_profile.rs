@@ -121,9 +121,13 @@ pub fn parse_bounded_env(
 /// I6（redb insert）段の A/B 計測モード（Issue #400）。`Insert` は既存の
 /// `Table::insert`（スクラッチ → ページコピー）、`Reserve` は redb 4.2.0
 /// `Table::insert_reserve`（`&[u8]` が `MutInPlaceValue` を実装済みのため
-/// `unsafe` 不要で呼べる）を使い、`AccessGuardMutInPlace::as_mut()` へ
-/// [`encode_row_reimpl_into_slice`] で直接書き込む。両モードとも I5 の
-/// エンコード結果（`row_encoded`）を再利用する契約は不変。
+/// `unsafe` 不要で呼べる）で予約した `AccessGuardMutInPlace::as_mut()` へ、
+/// I5 で作成済みのエンコード結果（`row_encoded`）をそのまま
+/// `copy_from_slice` で書き込む（計測範囲の訂正・codex-review 指摘・
+/// PR #420。訂正前は [`encode_row_reimpl_into_slice`] で予約済みバッファへ
+/// 再エンコードしており、`Insert` 側と処理範囲が揃わない二重エンコードに
+/// なっていた）。両モードとも I5 のエンコード結果（`row_encoded`）を
+/// 再利用する契約は不変。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertMode {
     /// 既定。`Table::insert(key, encoded.as_slice())`。
