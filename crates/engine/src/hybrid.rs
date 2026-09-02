@@ -1478,8 +1478,12 @@ pub fn hybrid_search_boosted(
     // `complete_boundary_tie_group_by` の前に必ず行う（codex-review P1 指摘対応:
     // 以前は疎側だけ長さ検証のみで、切り詰められて消える末尾の契約違反を検知
     // できなかった）。
-    let (sparse_hits, sparse_limit, _sparse_fetch_ks) =
-        sparse_refetch_loop(sparse_index, query_text, &visible_ids, cfg)?;
+    // 発火した `fetch_k` の記録は診断専用（[`sparse_refetch_observed`]）であり、
+    // 通常の検索経路では使わない。no-op クロージャを渡すことで記録用の
+    // `Vec` 確保・push を通常経路のホットパスへ持ち込まない
+    // （codex-review P2 指摘対応・PR #416）。
+    let (sparse_hits, sparse_limit) =
+        sparse_refetch_loop(sparse_index, query_text, &visible_ids, cfg, |_fetch_k| {})?;
 
     let mut fused =
         rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
@@ -1500,24 +1504,27 @@ pub fn hybrid_search_boosted(
 /// 報告しうる構造だった。本関数を切り出して公開フックから同じコードパスを
 /// 呼べるようにすることで、ベンチ側の「予測」を production の「実測」へ置き換える。
 ///
-/// 戻り値の第 3 要素は実際に呼ばれた `fetch_k` の列（呼び出し順。再取得が
-/// 発火しなければ長さ 1）。production 経路（[`hybrid_search_boosted`]）はこの
-/// 列を使わないため `_` で無視する。
+/// `record_fetch_k` は各ラウンドで実際に呼んだ `fetch_k` を通知するフック。
+/// production 経路（[`hybrid_search_boosted`]）は記録が不要なため no-op
+/// クロージャを渡し、診断経路（[`sparse_refetch_observed`]）だけが `Vec` へ
+/// 蓄積する（codex-review P2 指摘対応・PR #416: 以前は本関数が常に `Vec` を
+/// 確保していたため、記録を使わない通常の hybrid 検索にも不要なヒープ確保・
+/// push が追加されていた）。
 fn sparse_refetch_loop(
     sparse_index: &SparseIndex,
     query_text: &str,
     visible_ids: &BTreeSet<u64>,
     cfg: &RrfConfig,
-) -> Result<(Vec<ScoredDoc>, usize, Vec<usize>), HybridError> {
+    mut record_fetch_k: impl FnMut(usize),
+) -> Result<(Vec<ScoredDoc>, usize), HybridError> {
     let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
     let mut sparse_fetch_k = cfg
         .pool_depth()
         .checked_mul(2)
         .unwrap_or(sparse_cap)
         .min(sparse_cap);
-    let mut fetch_ks = Vec::new();
     let (sparse_hits, sparse_limit) = loop {
-        fetch_ks.push(sparse_fetch_k);
+        record_fetch_k(sparse_fetch_k);
         let hits: Vec<ScoredDoc> =
             sparse_index.search_within(query_text, sparse_fetch_k, visible_ids)?;
         // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
@@ -1554,14 +1561,16 @@ fn sparse_refetch_loop(
             }
         }
     };
-    Ok((sparse_hits, sparse_limit, fetch_ks))
+    Ok((sparse_hits, sparse_limit))
 }
 
 /// [`sparse_refetch_loop`]（[`hybrid_search_boosted`] の疎側再取得ループ実装
 /// そのもの）を呼び出し、実際に発火した `fetch_k` の列も含めて返すテスト・
 /// ベンチ向け公開フック（Issue #387 PR #416 codex-review P1 指摘対応。
 /// `sparse_refetch_loop` ドキュメント参照）。production の挙動を変えず、
-/// 呼び出し列を外部から観測できるようにするためだけの薄いラッパー。
+/// 呼び出し列を外部から観測できるようにするためだけの薄いラッパー。列の
+/// 確保・記録はこの診断経路だけが行う（codex-review P2 指摘対応・PR #416。
+/// `sparse_refetch_loop` ドキュメント参照）。
 ///
 /// 戻り値は `(疎ヒット, 疎側 fetch_k 上限〔最終ラウンドの fetch_k〕, 実際に
 /// 呼ばれた fetch_k の列)`。`sparse_index.search_within` を実際に複数回
@@ -1572,7 +1581,12 @@ pub fn sparse_refetch_observed(
     visible_ids: &BTreeSet<u64>,
     cfg: &RrfConfig,
 ) -> Result<(Vec<ScoredDoc>, usize, Vec<usize>), HybridError> {
-    sparse_refetch_loop(sparse_index, query_text, visible_ids, cfg)
+    let mut fetch_ks = Vec::new();
+    let (sparse_hits, sparse_limit) =
+        sparse_refetch_loop(sparse_index, query_text, visible_ids, cfg, |fetch_k| {
+            fetch_ks.push(fetch_k)
+        })?;
+    Ok((sparse_hits, sparse_limit, fetch_ks))
 }
 
 /// [`complete_boundary_tie_group_by`] の判定結果（Issue #320 codex-review P1 指摘
