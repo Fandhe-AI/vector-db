@@ -355,6 +355,103 @@ fn each_layer_is_connected_from_the_entry_point() {
     }
 }
 
+/// `each_layer_is_connected_from_the_entry_point` と同じ判定（各層でエント
+/// リポイントからの BFS が全メンバへ到達する）を任意の索引へ適用する共通化
+/// ヘルパ。ランダム構成・重複ヘビーコーパスの連結性テスト（下記）から再利用
+/// する。
+fn assert_fully_connected_from_entry(index: &HnswIndex) {
+    let Some(entry) = index.entry_point() else {
+        return;
+    };
+    let Some(max_level) = index.max_level() else {
+        return;
+    };
+    for level in 0..=max_level {
+        let members: std::collections::HashSet<u32> = (0..index.len() as u32)
+            .filter(|&n| index.level_of(n).map(|l| l >= level).unwrap_or(false))
+            .collect();
+        let reachable = bfs_reachable(index, level, entry);
+        let missing: Vec<u32> = members.difference(&reachable).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "level {level} not fully connected from entry point; unreachable nodes: {missing:?}"
+        );
+    }
+}
+
+/// `clusters` 個のクラスタ中心を生成し、各行をいずれかの中心の**完全な複製**
+/// にする（ジッタなし）。同一クラスタに属する行同士は任意のクエリに対し
+/// 常に厳密同点スコアになるため、逆方向リンクの枝刈り・`search_layer` の
+/// 停止／受理判定の双方を同時に強くストレスする決定的コーパス
+/// （`docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性保証」
+/// 「`search_layer` の停止・受理判定: 順序規約の使い分け」各節参照）。
+fn gen_duplicate_heavy_corpus(seed: u64, dim: usize, rows: usize, clusters: usize) -> Vec<f32> {
+    let mut rng = TestRng::new(seed);
+    let centers: Vec<Vec<f32>> = (0..clusters.max(1)).map(|_| rng.next_vector(dim)).collect();
+    let mut out = Vec::with_capacity(rows * dim);
+    for i in 0..rows {
+        let center = &centers[i % centers.len()];
+        out.extend_from_slice(center);
+    }
+    out
+}
+
+/// 逆方向リンク枝刈りによる到達不能・`search_layer` の同点早期打ち切りは
+/// いずれも固定 1 fixture（`build_fixture`／`SEED`）では顕在化しなかった
+/// 入力依存のバグだったため、複数 seed × 複数 `(rows, dim, m)` のランダム
+/// 構成、および完全同点スコアを誘発する重複ヘビーコーパスの双方で最終
+/// グラフの全層連結性を検証する（受け入れ条件 (a) の拡張）。
+#[test]
+fn randomized_configs_and_duplicate_heavy_corpus_stay_fully_connected() {
+    struct Config {
+        dim: usize,
+        rows: usize,
+        m: usize,
+    }
+    let configs = [
+        Config {
+            dim: 8,
+            rows: 300,
+            m: 4,
+        },
+        Config {
+            dim: 16,
+            rows: 500,
+            m: 8,
+        },
+        Config {
+            dim: 32,
+            rows: 200,
+            m: 16,
+        },
+    ];
+    for (ci, cfg) in configs.iter().enumerate() {
+        for seed_idx in 0..10u64 {
+            let seed = (0xA5A5_0000_0000_0000u64) ^ ((ci as u64) << 32) ^ seed_idx;
+            let vectors = gen_corpus(seed ^ 0x1111_1111, cfg.dim, cfg.rows);
+            let params = HnswParams {
+                m: cfg.m,
+                ef_construction: 48,
+                ef_search: 24,
+            };
+            let index = HnswIndex::build(params, cfg.dim as u32, &vectors, seed)
+                .expect("build should succeed");
+            assert_fully_connected_from_entry(&index);
+        }
+    }
+
+    for seed in 0..10u64 {
+        let vectors = gen_duplicate_heavy_corpus(seed, 12, 400, 5);
+        let params = HnswParams {
+            m: 6,
+            ef_construction: 32,
+            ef_search: 16,
+        };
+        let index = HnswIndex::build(params, 12, &vectors, seed).expect("build should succeed");
+        assert_fully_connected_from_entry(&index);
+    }
+}
+
 #[test]
 fn build_rejects_node_count_beyond_max_hnsw_nodes() {
     // dim=1 なら MAX_HNSW_NODES+1 行分でも約 4 MB で確保可能（テストとして許容範囲）。
