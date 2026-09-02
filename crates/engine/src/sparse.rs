@@ -326,6 +326,12 @@ pub enum SparseError {
     /// 構築時に不変条件が満たされなかった。`len_classes` は `doc_len_by_idx` の値
     /// 集合そのものから作るため理論上到達不能だが、`unwrap`/`expect` で処理せず
     /// fail-closed に構築を拒否する（`.claude/rules/coding-rust.md`）。
+    ///
+    /// `SparseError` は `#[non_exhaustive]` を持たない既公開 enum であり
+    /// （`docs/design/error-enum-non-exhaustive-policy.md`）、本 variant の追加は
+    /// 同 ADR の方針（既公開エラー enum への `#[non_exhaustive]` 後付け不採用）
+    /// どおりソース非互換な破壊的変更として扱う（コミットの `BREAKING CHANGE:`
+    /// フッタで明示する）。
     LenClassBuildFailed,
 }
 
