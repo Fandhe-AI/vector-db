@@ -403,14 +403,22 @@ fn main() {
             .unwrap_or_else(|e| fail_closed(format!("dense refetch fidelity check failed: {e}")));
     }
     println!(
-        "hybrid_profile: fidelity checks passed (replica search_within matches real API; \
-         dense/sparse refetch schedule predictions match observed calls)"
+        "hybrid_profile: fidelity checks passed (replica search_within matches real API for \
+         every fetch_k on the sparse schedule; dense refetch schedule predictions match \
+         observed hybrid_search calls via RefetchTrackingProvider — sparse has no equivalent \
+         internal-call observation hook, so sparse_refetch_schedule's boundary_tie_decision-driven \
+         loop is a reproduction, not a call-count cross-check against real hybrid_search)"
     );
 
     // --- hybrid_search_cached_index: 事前構築済み SparseIndex（キャッシュヒット
-    // 相当）を使った直接 API 呼び出し。密側の再取得発火回数は provider を
-    // 別パスで走らせて集計する（`hybrid_latency_bench.rs::measure_stage` と
-    // 同じ「計測区間内では統計蓄積を行わない」方針）。
+    // 相当）を使った直接 API 呼び出し。計測区間（timed pass）は素の
+    // `ParallelSearchProvider` を使う（`RefetchTrackingProvider` は呼び出しの
+    // たびに atomic な呼び出し回数・最大 k 更新を行うため、計測区間へ混ぜると
+    // p95/median にその分のオーバーヘッドが混入する。codex-review 指摘・
+    // Issue #387 PR #416）。呼び出し回数・最大 k の統計は別パス（stats pass。
+    // `hybrid_latency_bench.rs::measure_stage` と同じ「計測区間内では統計蓄積を
+    // 行わない」方針）で `RefetchTrackingProvider` を使って集計する。
+    let timed_provider = ParallelSearchProvider;
     let mut query_idx = 0usize;
     let hybrid_measurement = run(&config, || {
         let q = &queries[query_idx % queries.len()];
@@ -422,7 +430,7 @@ fn main() {
             query: &q.vector,
             k: TOP_K,
         };
-        hybrid_search(&provider, input, &sparse_index, &q.text, TOP_K, &cfg)
+        hybrid_search(&timed_provider, input, &sparse_index, &q.text, TOP_K, &cfg)
             .unwrap_or_else(|e| fail_closed(format!("hybrid_search (timed) failed: {e}")))
     })
     .unwrap_or_else(|e| {
