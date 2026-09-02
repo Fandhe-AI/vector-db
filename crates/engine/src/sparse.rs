@@ -222,10 +222,11 @@ struct TermId(u32);
 /// [`SparseIndex::search_within`] がクエリ語を `TermId` へ写像する lookup に使う。
 ///
 /// `HashMap`（標準既定の `RandomState`／SipHash-1-3）を用いる。イテレーション順は
-/// 不定だが、本辞書はイテレーションを行わず `intern`（挿入）・`lookup`（参照）にのみ
-/// 使うため、出力の決定性（スコアのビット一致・タイブレーク）には影響しない
-/// （語彙順に依存する走査は呼び出し側がクエリ語の `String` 辞書順で行う。
-/// [`SparseIndex::search`] のクエリ側処理を参照）。
+/// 不定であり、[`SparseIndex::approx_heap_bytes`] は容量見積りのため本辞書の
+/// キーを走査する。ただしその走査は整数和（バイト数の合計）にのみ用いるため
+/// 順序に依存せず、出力の決定性（スコアのビット一致・タイブレーク）には影響しない
+/// （語彙順に依存する走査は `search`/`search_within` のクエリ側処理が
+/// クエリ語の `String` 辞書順で行う。[`SparseIndex::search`] を参照）。
 #[derive(Debug, Default)]
 struct TermDictionary {
     ids: HashMap<String, TermId>,
@@ -530,11 +531,13 @@ impl DocEntry {
     /// この文書における `term_id` の出現回数（未出現なら `None`）。`term_freq` が
     /// `TermId` 昇順ソート済みという不変条件（構築時に保証）に依存する二分探索。
     fn freq(&self, term_id: TermId) -> Option<u32> {
+        // `binary_search_by_key` が `Ok(i)` を返す時点で `i` は必ず `term_freq` の
+        // 範囲内であることが保証されるため、`.get(i)` による再取得は不要（添字で
+        // 直接取り出す）。
         self.term_freq
             .binary_search_by_key(&term_id, |&(t, _)| t)
             .ok()
-            .and_then(|i| self.term_freq.get(i))
-            .map(|&(_, f)| f)
+            .map(|i| self.term_freq[i].1)
     }
 }
 
@@ -2016,6 +2019,31 @@ mod tests {
         score
     }
 
+    /// `reference_bm25_score` を全文書へ適用し、`SparseIndex::search`/
+    /// `search_within` と同じ選出規約（`score > 0.0` のみ候補化・スコア降順→
+    /// `doc_id` 昇順のタイブレーク・上位 `k` 件切り出し）で Top-k を再現する
+    /// （Issue #388 レビュー指摘対応: 個々の返却行のスコア一致だけでなく
+    /// `results.len()` と返却 `doc_id` 集合そのものを参照実装と突き合わせるための
+    /// ヘルパー。term インターニングによる取りこぼし・過剰ヒットの vacuous pass を
+    /// 防ぐ）。
+    fn reference_search_top_k(
+        query: &str,
+        ref_docs: &BTreeMap<DocId, (BTreeMap<String, u32>, u32)>,
+        stats: &ReferenceCorpusStats<'_>,
+        k: usize,
+    ) -> Vec<(DocId, f64)> {
+        let mut scored: Vec<(DocId, f64)> = ref_docs
+            .iter()
+            .filter_map(|(&doc_id, (tf, doc_len))| {
+                let score = reference_bm25_score(query, tf, *doc_len, stats);
+                (score > 0.0).then_some((doc_id, score))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        scored.truncate(k);
+        scored
+    }
+
     #[test]
     fn search_score_is_bit_identical_to_reference_btreemap_implementation() {
         let docs = vec![
@@ -2055,20 +2083,29 @@ mod tests {
             "no match here",
         ] {
             let results = idx.search(query, 10).unwrap();
+            let stats = ReferenceCorpusStats {
+                doc_freq_all: &ref_doc_freq,
+                n: ref_n,
+                avg_doc_len: ref_avg_doc_len,
+                k1: DEFAULT_K1,
+                b: DEFAULT_B,
+            };
+            // まず件数・返却 doc_id 集合そのものを参照実装の Top-k 選出と突き合わせる
+            // （取りこぼし・余分ヒットは個々のスコア一致チェックでは検出できない）。
+            let expected_top_k = reference_search_top_k(query, &ref_docs, &stats, 10);
+            assert_eq!(
+                results.len(),
+                expected_top_k.len(),
+                "query={query:?}: 返却件数が参照実装の Top-k と一致しない"
+            );
+            assert_eq!(
+                results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                "query={query:?}: 返却 doc_id の並びが参照実装の Top-k と一致しない"
+            );
             for scored in &results {
                 let (tf, doc_len) = ref_docs.get(&scored.doc_id).unwrap();
-                let expected = reference_bm25_score(
-                    query,
-                    tf,
-                    *doc_len,
-                    &ReferenceCorpusStats {
-                        doc_freq_all: &ref_doc_freq,
-                        n: ref_n,
-                        avg_doc_len: ref_avg_doc_len,
-                        k1: DEFAULT_K1,
-                        b: DEFAULT_B,
-                    },
-                );
+                let expected = reference_bm25_score(query, tf, *doc_len, &stats);
                 assert_eq!(
                     scored.score.total_cmp(&expected),
                     std::cmp::Ordering::Equal,
@@ -2117,20 +2154,27 @@ mod tests {
 
         for query in ["quick fox", "lazy dog cats", "quick", "no match here"] {
             let results = idx.search_within(query, 10, &visible).unwrap();
+            let stats = ReferenceCorpusStats {
+                doc_freq_all: &ref_doc_freq,
+                n: ref_n,
+                avg_doc_len: ref_avg_doc_len,
+                k1: DEFAULT_K1,
+                b: DEFAULT_B,
+            };
+            let expected_top_k = reference_search_top_k(query, &ref_docs, &stats, 10);
+            assert_eq!(
+                results.len(),
+                expected_top_k.len(),
+                "query={query:?}: 返却件数が参照実装の Top-k と一致しない"
+            );
+            assert_eq!(
+                results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                "query={query:?}: 返却 doc_id の並びが参照実装の Top-k と一致しない"
+            );
             for scored in &results {
                 let (tf, doc_len) = ref_docs.get(&scored.doc_id).unwrap();
-                let expected = reference_bm25_score(
-                    query,
-                    tf,
-                    *doc_len,
-                    &ReferenceCorpusStats {
-                        doc_freq_all: &ref_doc_freq,
-                        n: ref_n,
-                        avg_doc_len: ref_avg_doc_len,
-                        k1: DEFAULT_K1,
-                        b: DEFAULT_B,
-                    },
-                );
+                let expected = reference_bm25_score(query, tf, *doc_len, &stats);
                 assert_eq!(
                     scored.score.total_cmp(&expected),
                     std::cmp::Ordering::Equal,
