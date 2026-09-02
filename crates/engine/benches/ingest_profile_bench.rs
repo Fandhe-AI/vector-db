@@ -74,8 +74,8 @@ use harness::env_report::EnvReport;
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
     last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env,
-    refuse_under_github_actions, render_stage_line, residual_ns_per_row, sum_durations, StageId,
-    StageSamples,
+    refuse_under_github_actions, render_stage_line, residual_ns_per_row, sum_durations,
+    IngestProfileError, StageId, StageSamples,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -116,6 +116,24 @@ const TABLE_GENERATION_TABLE: TableDefinition<&str, u64> = TableDefinition::new(
 fn fail_closed(msg: impl std::fmt::Display) -> ! {
     eprintln!("ingest_profile_bench: {msg}");
     std::process::exit(1);
+}
+
+/// `std::env::var` を fail-closed に読む（codex-review 指摘・PR #415）。
+/// `std::env::var(...).ok()` は未設定（`VarError::NotPresent`）だけでなく
+/// 非 UTF-8 値（`VarError::NotUnicode`）も一律 `None` に変換してしまい、
+/// [`parse_bounded_env`] の「未設定→既定値」経路へ誤って合流する
+/// （不正な非 UTF-8 値が既定値へフォールバックし、モジュール冒頭コメント
+/// 「R2」節が宣言する fail-closed 契約に反する）。ここで両者を区別し、
+/// `NotUnicode` は [`IngestProfileError::InvalidEnv`] として明示的に拒否する。
+fn read_env_var(name: &'static str) -> Result<Option<String>, IngestProfileError> {
+    match std::env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(IngestProfileError::InvalidEnv {
+            name,
+            reason: "value is not valid UTF-8".to_string(),
+        }),
+    }
 }
 
 /// 1 バッチ分の投入データ（id・可視性・embedding・metadata）。呼び出し元が
@@ -181,9 +199,13 @@ fn main() {
         fail_closed(e);
     }
 
+    let rows_raw = match read_env_var("BENCH_INGEST_PROFILE_ROWS") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
     let rows = match parse_bounded_env(
         "BENCH_INGEST_PROFILE_ROWS",
-        std::env::var("BENCH_INGEST_PROFILE_ROWS").ok().as_deref(),
+        rows_raw.as_deref(),
         1_000,
         1,
         10_000,
@@ -191,9 +213,13 @@ fn main() {
         Ok(v) => v,
         Err(e) => fail_closed(e),
     };
+    let dim_raw = match read_env_var("BENCH_INGEST_PROFILE_DIM") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
     let dim = match parse_bounded_env(
         "BENCH_INGEST_PROFILE_DIM",
-        std::env::var("BENCH_INGEST_PROFILE_DIM").ok().as_deref(),
+        dim_raw.as_deref(),
         128,
         1,
         4_096,
