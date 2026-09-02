@@ -107,9 +107,21 @@ fail-closed）・`encode_row_reimpl_into_slice`（`encode_row_reimpl` と同一�
 1. `row_table.get((tenant, id))` で一意性を事前検査（`insert_unique_row`
    相当。契約面の制約節）
 2. `row_table.insert_reserve((tenant, id), encoded.len())` で確保
-3. `guard.as_mut()` へ `encode_row_reimpl_into_slice` で直接書き込む
+3. `guard.as_mut()` へ、I5 で作成済みの `encoded`（`row_encoded`）を
+   `copy_from_slice` でそのまま書き込む
 
 `unsafe` は使用しない。production コード（`crates/engine/src/`）は無変更。
+
+### 計測範囲の訂正（codex-review 指摘・PR #420）
+
+初版では手順 3 を `encode_row_reimpl_into_slice` による予約済みバッファへの
+**再エンコード**として実装しており、`Insert` 側（I5 で作成済みの
+`row_encoded` を I6 では insert するだけ）と処理範囲が揃っていなかった
+（`Reserve` 側だけ I6 内で二重にエンコードしていた）。両モードとも I6 の
+処理範囲を「I5 のエンコード結果を書き込むだけ」に揃えるため、上記手順 3 を
+`encode_row_reimpl_into_slice` の再実行から `copy_from_slice`（既存
+`encoded` のコピー）へ修正した。以下の実測値はこの訂正後のコードによる
+再計測値（訂正前の数値は本節末尾に参考として残す）。
 
 ## 前後比較の実測
 
@@ -123,32 +135,43 @@ fail-closed）・`encode_row_reimpl_into_slice`（`encode_row_reimpl` と同一�
 
 | ペア | insert（ns/行） | reserve（ns/行） |
 | ---- | ---------------- | ------------------ |
-| 1 | 833.5 | 1633.5 |
-| 2 | 822.5 | 1644.6 |
-| 3 | 846.9 | 1640.8 |
-| 4 | 842.7 | 1637.2 |
-| 5 | 828.1 | 1638.8 |
-| **median** | **833.5** | **1638.8** |
+| 1 | 789.9 | 1193.7 |
+| 2 | 884.0 | 1218.2 |
+| 3 | 804.0 | 1204.3 |
+| 4 | 794.5 | 1210.8 |
+| 5 | 870.2 | 1203.4 |
+| **median** | **804.0** | **1204.3** |
 
-`reserve` は `insert` に対し **中央値で約 +97%（ほぼ倍）** 悪化した。
-E0（`engine::tenant::insert_rows`。両モードで production コードは無変更の
-ため同一経路）は 3,424.7〜3,489.2 ns/行のレンジで両モード間に系統差は無く、
-測定対象外区間（E0）の run-to-run 変動幅（最大約 65 ns/行）に対し、I6 の
-`reserve` 側の悪化幅（約 800 ns/行）は 1 桁以上大きい。ノイズでは説明できない
-一貫した悪化と判断できる。
+`reserve` は `insert` に対し **中央値で約 +49.8%** 悪化した（訂正前の
+二重エンコードを含む計測では約 +97% だったが、二重エンコード分を除いても
+なお `insert` を明確に上回る）。E0（`engine::tenant::insert_rows`。両モード
+で production コードは無変更のため同一経路）は 3,395.2〜3,429.7 ns/行の
+レンジで両モード間に系統差は無く、測定対象外区間（E0）の run-to-run 変動幅
+（最大約 35 ns/行）に対し、I6 の `reserve` 側の悪化幅（約 400 ns/行）は
+1 桁大きい。ノイズでは説明できない一貫した悪化と判断できる。
 
-### 規模点（dim=1024・rows=200。各モード 1 回）
+### 規模点（dim=1024・rows=200。各モード 2 回）
 
 | モード | I6（ns/行） |
 | ------ | ------------ |
-| insert | 4977.7 |
-| reserve | 8349.1 |
+| insert | 5068.6, 4929.2 |
+| reserve | 5563.5, 5463.2 |
 
-次元が大きいほど零埋めコスト（`value_length` に比例）が効くという想定どおり、
-絶対値では悪化幅が拡大した（dim=128: +805 ns/行 → dim=1024: +3371 ns/行）。
-相対悪化率は dim=128 の約 +97% に対し dim=1024 では約 +68% とやや縮小する
-（E0・SUM 側の他段コストが相対的に大きくなるため）が、いずれの規模でも
-`reserve` が `insert` を明確に上回ることに変わりはない。
+次元が大きいほど零埋めコスト（`value_length` に比例）が効くという想定どおり
+絶対値の悪化幅は dim=128（約 400 ns/行）より拡大する（約 450〜530 ns/行）が、
+相対悪化率は約 +9.8〜10.8% で dim=128（約 +49.8%）より縮小する（E0・SUM 側の
+他段コストが相対的に大きくなるため）。いずれの規模でも `reserve` が
+`insert` を明確に上回ることに変わりはない。
+
+### 参考: 訂正前（二重エンコードを含む）計測値
+
+`encode_row_reimpl_into_slice` による再エンコードを含んでいた訂正前の
+実測値（dim=128・rows=1,000・交互 5 ペア）: insert median 833.5 ns/行・
+reserve median 1638.8 ns/行（約 +97%）。規模点（dim=1024・rows=200）:
+insert 4977.7 ns/行・reserve 8349.1 ns/行（約 +68%）。二重エンコード分
+（I6 内で `encode_row_reimpl_into_slice` を追加実行していた分）が悪化幅を
+過大に見せていたが、訂正後もなお `reserve` が `insert` を上回るため
+「判断」節の不採用（Rejected）という結論そのものは変わらない。
 
 ### fail-closed の確認
 
@@ -171,9 +194,11 @@ min-of-N でも改善方向であること。加えて契約変更を伴わず `
 ## 判断
 
 **不採用**。`crates/engine/src/` は無変更。bench 側の A/B 計測モード
-（`InsertMode`・`parse_insert_mode`・`encode_row_reimpl_into_slice`）は
-`Rejected` の判断根拠を再現可能にする記録として残し、`Table::insert` を
-既定経路のまま維持する。
+（`InsertMode`・`parse_insert_mode`。`encode_row_reimpl_into_slice` は
+`encode_row_reimpl` とのバイト単位一致を回帰固定する独立ヘルパーとして
+`tests/ingest_profile_accept.rs` に残置し、I6 段の計測経路からは「計測範囲の
+訂正」節のとおり除いた）は `Rejected` の判断根拠を再現可能にする記録として
+残し、`Table::insert` を既定経路のまま維持する。
 
 「契約面の制約」節の懸念（`insert_unique_row` の `Option` 契約・
 `insert_rows_unchecked` のハッシュ順序）は、性能改善が無い以上いずれも

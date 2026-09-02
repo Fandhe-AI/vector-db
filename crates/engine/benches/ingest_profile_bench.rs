@@ -82,9 +82,9 @@ mod harness;
 use harness::env_report::EnvReport;
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
-    encode_row_reimpl_into_slice, last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row,
-    parse_bounded_env, parse_insert_mode, refuse_under_github_actions, render_stage_line,
-    residual_ns_per_row, sum_durations, IngestProfileError, InsertMode, StageId, StageSamples,
+    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_insert_mode,
+    refuse_under_github_actions, render_stage_line, residual_ns_per_row, sum_durations,
+    IngestProfileError, InsertMode, StageId, StageSamples,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -673,6 +673,16 @@ fn run_replica_batch(
                 // 返さない契約（redb 4.2.0 `Table::insert_reserve`）ため、
                 // `insert_unique_row` 相当の一意性検査を事前 `get` で代替する
                 // （試作限定の許容コスト。計画「契約面の制約」節参照）。
+                //
+                // codex-review 指摘（PR #420）: 以前はここで `encoded`
+                // （I5 で作成済み）を使わず `encode_row_reimpl_into_slice` で
+                // 予約済みバッファへ再度エンコードしており、Insert 側
+                // （I5 の結果をそのまま insert するだけ）と処理範囲が
+                // 揃わない二重エンコードになっていた。両モードとも I6 では
+                // 「I5 のエンコード結果を書き込むだけ」に処理範囲を揃えるため、
+                // 予約済みバッファへは encode し直さず `encoded` をコピーする
+                // （`insert_reserve` に渡した長さと `guard.as_mut()` の長さは
+                // 常に一致するため `copy_from_slice` は長さ不一致で panic しない）。
                 for (i, (id, encoded)) in batch.ids.iter().zip(row_encoded.iter()).enumerate() {
                     schema
                         .validate_embedding_dim(batch.embeddings[i].len())
@@ -689,14 +699,7 @@ fn run_replica_batch(
                     let mut guard = row_table
                         .insert_reserve((TENANT, *id), encoded.len())
                         .expect("insert_reserve row for I6");
-                    encode_row_reimpl_into_slice(
-                        guard.as_mut(),
-                        TENANT,
-                        batch.is_public[i],
-                        &batch.embeddings[i],
-                        &batch.metadata[i],
-                    )
-                    .expect("encode_row_reimpl_into_slice for I6 reserve mode");
+                    guard.as_mut().copy_from_slice(encoded.as_slice());
                 }
             }
         }
