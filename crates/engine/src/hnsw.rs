@@ -281,6 +281,44 @@ pub struct HnswIndex {
     entry_point: Option<u32>,
 }
 
+/// `search_layer` が呼び出しをまたいで再利用する visited 集合（世代カウンタ
+/// 方式）。挿入ごとに新規の `Vec<bool>` を割り当てて毎回ゼロ初期化すると、
+/// `build` は各挿入で少なくとも層 0 の `search_layer` を 1 回呼ぶため
+/// Σ_{i=1..N} O(i) = O(N^2) の初期化コストが積み上がる（codex-review #423
+/// P1 指摘）。本構造体は `epoch` 配列を挿入間で使い回し、リセットを
+/// カウンタのインクリメントだけの O(1) にすることでこれを避ける。
+/// `current` は `u64` とし、`build` 1 回あたりの呼び出し回数
+/// （高々 `N * (MAX_LEVEL+1)` 程度）に対して十分な余裕を持たせ、桁あふれ
+/// 処理そのものを不要にする（到達しない分岐を残さない）。
+#[derive(Debug, Default)]
+pub(crate) struct VisitedScratch {
+    epoch: Vec<u64>,
+    current: u64,
+}
+
+impl VisitedScratch {
+    /// 次の呼び出しに備えてリセットする。`len` は呼び出し時点の
+    /// `self.nodes.len()`（構築中は挿入のたびに増加するため、呼び出し
+    /// ごとに現在値を渡す。使い回すバッファは伸長のみで縮めない）。
+    fn reset(&mut self, len: usize) {
+        if self.epoch.len() < len {
+            self.epoch.resize(len, 0);
+        }
+        self.current += 1;
+    }
+
+    /// `id` を訪問済みとして記録する。戻り値は「今回のリセット以降で
+    /// 既に訪問済みだったか」（`true`＝既訪問なのでスキップ、`false`＝
+    /// 新規訪問なので処理を続行）。範囲外の `id` は `None`
+    /// （呼び出し元は untrusted 添字アクセスをせず `continue` する）。
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        let slot = self.epoch.get_mut(id)?;
+        let already = *slot == self.current;
+        *slot = self.current;
+        Some(already)
+    }
+}
+
 /// 層 `level` におけるノードの隣接リスト最大次数を返す（層 0 は `2*m`、
 /// 層 1 以上は `m`。[`HnswIndex::max_degree`] の内部実装から共有する）。
 fn max_degree_for(params: &HnswParams, level: usize) -> usize {
@@ -348,12 +386,16 @@ impl HnswIndex {
         }
 
         let mut rng = DeterministicRng::new(seed);
+        // 全挿入をまたいで使い回す visited スクラッチ（`VisitedScratch` 参照。
+        // 挿入ごとに新規確保しないことで search_layer の初期化コストを
+        // O(N^2) から O(N) 相当へ落とす）。
+        let mut visited = VisitedScratch::default();
         // 挿入順はノード番号昇順に固定する（呼び出し元の入力順＝挿入順。決定性の
         // 唯一の自由度は `seed` によるレベル割当だけにする）。
         for node_idx in 0..n {
             let level = assign_level(&mut rng, params.m);
             let node_id = node_idx as u32; // n <= MAX_HNSW_NODES であることを上で検証済み
-            index.insert_node(node_id, level, dim_usize, vectors)?;
+            index.insert_node(node_id, level, dim_usize, vectors, &mut visited)?;
         }
 
         index.repair_reachability(dim_usize, vectors)?;
@@ -387,16 +429,30 @@ impl HnswIndex {
     /// 入力規模に依存しない小さな絶対上限 [`PRECISE_REPAIR_CAP`] に固定し、
     /// それを超えて残る未到達ノードはフェーズ 2 が閉じる。
     ///
-    /// フェーズ 2 は最近傍探索・`shrink_links` を一切行わず、エントリ
-    /// ポイント（定義上つねに到達可能）へ直結するだけで残りを閉じる
-    /// （O(1) per node）。`connect` は既存リンクを削除しない単調な追加のみ
-    /// なので、この結線は他ノードの到達性へ一切影響しない（BFS 再計算・
-    /// whack-a-mole の再検証が不要で、層あたり高々 1 回の BFS で済む）。
-    /// フェーズ 1 の上限を入力非依存の定数に保つことで、層あたりの総コストは
-    /// O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も定数上限
-    /// （32）であるため `HnswIndex::build` 全体では入力規模に対しほぼ線形
-    /// （N log N 契約の範囲内）に収まる。安全側 = 全ノードの到達性を最終的に
-    /// 必ず保証する。
+    /// フェーズ 2 は残存ノードを id 昇順の**片方向チェーン**（`entry ->
+    /// remaining[0] -> remaining[1] -> ...`）として連結するだけで残りを
+    /// 閉じる。旧実装（全残存ノードをエントリポイントへ直結）は
+    /// (1) `connect` の重複検査（`Vec::contains`）を経てエントリポイントの
+    /// 隣接リストが残存ノード数に比例して伸び続け二次関数的コストになる
+    /// （Bugbot 指摘）、(2) `shrink_links` を一切呼ばないため次数が
+    /// `max_degree` を大幅に超え得る（codex-review #423 P1 指摘）、という
+    /// 2 つの問題を持っていた。チェーン方式では各ノードが新たに得る次数は
+    /// 高々 1（チェーンの「出発点」役を一度だけ務める）なので、
+    /// `connect` 直後に `shrink_links` を掛けても 1 ノードあたり
+    /// O(`max_degree`) に収まり、全体で O(remaining.len()) を保ったまま
+    /// 次数上限も維持できる。`shrink_links` は「次数が上限を超えていれば
+    /// `protect` を強制的に残しつつヒューリスティックで上限内へ再選択し、
+    /// 超えていなければ何もしない」契約（同関数のドキュメンテーション
+    /// コメント参照）を持つため、チェーンの起点を entry の現在の次数に
+    /// 関わらず常に選べる（"余裕があるか" を事前に走査する必要がなく、
+    /// 失敗しうる分岐も生まれない）。entry への `shrink_links` 適用が
+    /// entry の既存リンクを 1 本犠牲にし得る点は、フェーズ 1 が到達済み
+    /// 任意ノードへ毎回同じ `shrink_links` を適用しているのと同じ性質の
+    /// リスクであり、新たに導入するものではない。フェーズ 1 の上限を
+    /// 入力非依存の定数に保つことで、層あたりの
+    /// 総コストは O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も
+    /// 定数上限（32）であるため `HnswIndex::build` 全体では入力規模に対し
+    /// ほぼ線形（N log N 契約の範囲内）に収まる。
     fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
         /// フェーズ 1（`shrink_links` つきの厳密修復）の反復回数の絶対上限。
         /// 意図的に `member_count`／`n` に比例させない（比例させると入力
@@ -461,20 +517,68 @@ impl HnswIndex {
             }
 
             // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
-            // エントリポイントへの直結（次数上限超過を許容する O(1) の
-            // フォールバック）で確定的に閉じる。通常の挿入経路とフェーズ 1
-            // の範囲内では次数上限は従来どおり維持されるが、この残差
-            // フォールバックのみ例外的に超過し得る（安全側 = 全ノードの
-            // 到達性を優先。詳細は `docs/design/hnsw-graph-construction.md`
-            // 「逆方向リンクの到達性保証」節参照）。
+            // 上記モジュールコメントのとおり id 昇順の片方向チェーンで
+            // 確定的に閉じる。`remaining` は `0..len` の昇順フィルタなので
+            // 既に決定的な id 昇順である。
             let reachable = self.bfs_reachable(level, entry);
             let remaining: Vec<u32> = (0..self.nodes.len() as u32)
                 .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
                 .filter(|n| !reachable.contains(n))
                 .collect();
-            for node in remaining {
-                self.connect(node, entry, level);
-                self.connect(entry, node, level);
+            if let Some((&head, tail)) = remaining.split_first() {
+                // チェーンは entry を起点にする: `entry -> head -> tail[0]
+                // -> tail[1] -> ...`。`entry -> head` の 1 本だけが「既に
+                // 到達済みのノード（entry 自身）」の隣接リストを変更する
+                // 危険な結線であり、それ以降の `tail` への結線はすべて
+                // 「直前まで未到達だった（＝他ノードの到達性に寄与しない）
+                // orphan 同士」の結線なので安全（下記ループのコメント参照）。
+                //
+                // `entry` は他の到達済みノードへの唯一の到達経路を握って
+                // いる場合があるため、`shrink_links(entry, ...)` が次数
+                // 超過を解消する際に既存リンクを 1 本犠牲にすると、その
+                // 犠牲先ノードが到達不能に戻り得る（Phase 1 はこれを
+                // 「1 ノードずつ直して BFS をやり直す」ワークリスト方式で
+                // 検知・再修復するが、Phase 2 は計算量上限のためそれをしない
+                // 設計）。そのためここだけは特別に、`shrink_links` 適用前後
+                // で entry の隣接集合を比較し、犠牲になったノード（あれば
+                // 高々 1 件。`shrink_links` は次数超過分の 1 件しか削らない）
+                // をチェーンの末尾へ追加で連結し直すことで、この 1 箇所の
+                // リスクだけを O(1) の追加コストで確定的に解消する。
+                let old_entry_links: Vec<u32> = self
+                    .neighbors(level, entry)
+                    .map(|links| links.to_vec())
+                    .unwrap_or_default();
+                self.connect(entry, head, level);
+                self.shrink_links(entry, level, dim, vectors, head)?;
+                let evicted = self.neighbors(level, entry).and_then(|new_links| {
+                    old_entry_links
+                        .into_iter()
+                        .find(|old| !new_links.contains(old))
+                });
+
+                let mut prev = head;
+                for &node in tail {
+                    // `connect(prev, node, level)` は `prev` 自身の隣接
+                    // リストのみを伸ばす（`node` 側は変化しない。モジュール
+                    // 冒頭のノード表現）。`prev` はこの時点でまだ
+                    // 未到達だったノード（またはチェーンの `head`）であり、
+                    // 未到達ノードの「自身の」隣接リストは（BFS が一度も
+                    // 辿っていないため）他ノードの到達性に寄与していない。
+                    // よってここで `shrink_links(prev, ...)` が `prev` の
+                    // 既存リンクを 1 本犠牲にしても安全。
+                    self.connect(prev, node, level);
+                    self.shrink_links(prev, level, dim, vectors, node)?;
+                    prev = node;
+                }
+
+                // entry の shrink で犠牲になったノードがあれば、チェーンの
+                // 末尾（= 直前まで未到達だった orphan）から結線し直す。
+                // `prev` は orphan なので、ここでの `shrink_links` も上記と
+                // 同じ理由で安全。
+                if let Some(evicted) = evicted {
+                    self.connect(prev, evicted, level);
+                    self.shrink_links(prev, level, dim, vectors, evicted)?;
+                }
             }
         }
         Ok(())
@@ -509,6 +613,7 @@ impl HnswIndex {
         level: usize,
         dim: usize,
         vectors: &[f32],
+        visited: &mut VisitedScratch,
     ) -> Result<(), HnswError> {
         self.nodes.push(Node {
             level,
@@ -548,6 +653,7 @@ impl HnswIndex {
                 l,
                 dim,
                 vectors,
+                visited,
             )?;
             // 層 0 は次数上限が最大 2*m まで許容される（`shrink_links` が参照する
             // `max_degree_for` 側で扱う）が、新規ノード自身の選択本数は Algorithm 1
@@ -619,9 +725,13 @@ impl HnswIndex {
     /// 件の候補を返す。`pub(crate)` にして #405（探索 API）が `ef_search` で再利用
     /// できるようにする。
     ///
-    /// visited は呼び出しごとに新規の `Vec<bool>` を確保する（構築段は挿入ノード
-    /// あたり高々 `level+1` 回しか呼ばれず、ホットパスではないため。#405 が
-    /// クエリ多発経路で再利用する場合はエポック方式へ差し替える余地を残す）。
+    /// `visited` は呼び出し元（`insert_node`／`build` あるいはテスト）が
+    /// 全呼び出しをまたいで所有する [`VisitedScratch`]。挿入ごとに新規の
+    /// `Vec<bool>` を確保しゼロ初期化していた旧実装は、`build` が挿入ごとに
+    /// 少なくとも層 0 で本関数を呼ぶため合計 O(N^2) の初期化コストになって
+    /// いた（codex-review #423 P1 指摘）。世代カウンタ方式のスクラッチへ
+    /// 切り替え、各呼び出しの先頭で `reset` するだけに変更した。
+    #[allow(clippy::too_many_arguments)] // visited 追加で 8 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
     pub(crate) fn search_layer(
         &self,
         entry_points: Vec<u32>,
@@ -630,20 +740,18 @@ impl HnswIndex {
         level: usize,
         dim: usize,
         vectors: &[f32],
+        visited: &mut VisitedScratch,
     ) -> Result<Vec<ScoredNode>, HnswError> {
-        let mut visited = vec![false; self.nodes.len()];
+        visited.reset(self.nodes.len());
         let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
         // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
         let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
 
         for ep in entry_points {
-            if let Some(slot) = visited.get_mut(ep as usize) {
-                if *slot {
-                    continue;
-                }
-                *slot = true;
-            } else {
-                continue;
+            match visited.mark_visited(ep as usize) {
+                Some(true) => continue,
+                Some(false) => {}
+                None => continue,
             }
             let score = self.score(ep, query, dim, vectors)?;
             let scored = ScoredNode { node: ep, score };
@@ -674,12 +782,8 @@ impl HnswIndex {
 
             if let Some(neighbors) = self.neighbors(level, top_candidate.node) {
                 for &neighbor in neighbors {
-                    let already = match visited.get_mut(neighbor as usize) {
-                        Some(slot) => {
-                            let seen = *slot;
-                            *slot = true;
-                            seen
-                        }
+                    let already = match visited.mark_visited(neighbor as usize) {
+                        Some(seen) => seen,
                         None => continue,
                     };
                     if already {
@@ -1176,8 +1280,17 @@ mod tests {
             let true_nearest = brute[0].node;
 
             let ep = index.entry_point().unwrap();
+            let mut visited = VisitedScratch::default();
             let found = index
-                .search_layer(vec![ep], &query, params.ef_construction, 0, dim, &vectors)
+                .search_layer(
+                    vec![ep],
+                    &query,
+                    params.ef_construction,
+                    0,
+                    dim,
+                    &vectors,
+                    &mut visited,
+                )
                 .unwrap();
             if found.iter().any(|c| c.node == true_nearest) {
                 hits += 1;
@@ -1224,8 +1337,9 @@ mod tests {
             entry_point: Some(0),
         };
         let query = [1.0f32];
+        let mut visited = VisitedScratch::default();
         let results = index
-            .search_layer(vec![0], &query, 1, 0, dim, &vectors)
+            .search_layer(vec![0], &query, 1, 0, dim, &vectors, &mut visited)
             .expect("search_layer should succeed");
         assert_eq!(
             results.iter().map(|s| s.node).collect::<Vec<_>>(),

@@ -257,15 +257,10 @@ fn layer_structure_invariants_hold() {
     );
 }
 
-#[test]
-fn degree_limits_are_respected_and_links_are_well_formed() {
-    let params = HnswParams {
-        m: 6,
-        ef_construction: 32,
-        ef_search: 16,
-    };
-    let (_, index) = build_fixture(params, 11);
-
+/// `degree_limits_are_respected_and_links_are_well_formed`／
+/// `degree_limits_are_respected_on_duplicate_heavy_corpus` 共通の不変条件
+/// 検証（次数上限・自己ループなし・重複なし・隣接先の層整合）。
+fn assert_degree_and_wellformed_invariants(index: &HnswIndex) {
     for node in 0..index.len() as u32 {
         let level = index.level_of(node).unwrap();
         for l in 0..=level {
@@ -298,8 +293,41 @@ fn degree_limits_are_respected_and_links_are_well_formed() {
             }
         }
     }
+}
+
+#[test]
+fn degree_limits_are_respected_and_links_are_well_formed() {
+    let params = HnswParams {
+        m: 6,
+        ef_construction: 32,
+        ef_search: 16,
+    };
+    let (_, index) = build_fixture(params, 11);
+
+    assert_degree_and_wellformed_invariants(&index);
     assert_eq!(index.max_degree(0), params.m * 2);
     assert_eq!(index.max_degree(1), params.m);
+}
+
+/// 到達性修復フェーズ 2（`hnsw.rs::repair_reachability`）は重複ヘビー
+/// コーパスでは残存ノードの大半（数百件規模）を処理することが判明している
+/// （codex-review #423 検証時の instrumentation で確認）。`build_fixture`
+/// （ランダムコーパス）はフェーズ 2 をほとんど経由しないため、次数上限の
+/// 単体テストをこの重複ヘビーコーパスにも適用し、フェーズ 2 の結線
+/// （id 昇順の片方向チェーン＋ entry の犠牲リンク再結線。codex-review #423
+/// P1・Bugbot 指摘の是正）が次数上限を破らないことを直接検証する。
+#[test]
+fn degree_limits_are_respected_on_duplicate_heavy_corpus() {
+    let params = HnswParams {
+        m: 6,
+        ef_construction: 32,
+        ef_search: 16,
+    };
+    for seed in 0..10u64 {
+        let vectors = gen_duplicate_heavy_corpus(seed, 12, 400, 5);
+        let index = HnswIndex::build(params, 12, &vectors, seed).expect("build should succeed");
+        assert_degree_and_wellformed_invariants(&index);
+    }
 }
 
 /// 層 `level` 上でエントリポイントから幅優先探索し、到達可能なノード集合を返す。
