@@ -50,6 +50,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt::Write as _;
 
+use engine::hybrid::{sparse_refetch_observed, RrfConfig};
 use engine::kernel::{SearchInput, SearchProvider};
 use engine::sparse::{tokenize, DocId, ScoredDoc, SparseIndex};
 
@@ -835,11 +836,18 @@ pub struct RefetchSchedule {
     pub reached_cap: bool,
 }
 
-/// 疎側の再取得スケジュールを、実 `SparseIndex::search_within` を呼びながら
-/// 再現する（Issue #387）。境界同点判定は [`boundary_tie_decision`]（複製）で
-/// 行うが、各 `fetch_k` での検索そのものは実 API を呼ぶため、複製の忠実性が
-/// [`replica_matches_real`] で保証されていれば、このスケジュール自体も実際の
-/// `hybrid_search_boosted` の疎側再取得ループと一致する。
+/// 疎側の再取得スケジュールを、production の疎側再取得ループ実装そのもの
+/// （`hybrid.rs::sparse_refetch_loop`。テスト・ベンチ向け公開フック
+/// [`engine::hybrid::sparse_refetch_observed`] 経由）を呼んで**実際に観測する**
+/// （Issue #387 PR #416 codex-review P1 指摘対応）。
+///
+/// 以前は境界同点判定（`hybrid.rs::resolve_boundary_tie_group`）をこのモジュール
+/// 側で複製・予測しており、production の分岐・定数が変わっても複製が追随せず
+/// 誤った基線を実測値として報告しうる構造だった。`sparse_refetch_observed` は
+/// production と同一のコードパスを実行して実際に呼ばれた `fetch_k` の列を返す
+/// ため、本関数はそれをそのまま [`RefetchSchedule`] へ写すだけであり、判定ロジック
+/// の予測・複製は行わない（[`boundary_tie_decision`]・[`TieDecision`] は密側
+/// [`dense_refetch_schedule`] の忠実性検証でのみ引き続き使う）。
 pub fn sparse_refetch_schedule(
     index: &SparseIndex,
     query: &str,
@@ -847,45 +855,22 @@ pub fn sparse_refetch_schedule(
     pool_depth: usize,
 ) -> Result<RefetchSchedule, ProfileError> {
     let cap = fetch_cap(visible.len());
-    let mut fetch_k = initial_fetch_k(pool_depth, cap);
-    let mut fetch_ks = Vec::new();
-    for _round in 0..MAX_REFETCH_ROUNDS {
-        fetch_ks.push(fetch_k);
-        let hits = index.search_within(query, fetch_k, visible).map_err(|e| {
-            ProfileError::ContractViolation(format!(
-                "search_within failed during schedule reproduction: {e}"
-            ))
+    // 疎側再取得ループはスコア重み（`k_const`・`dense_weight`・`sparse_weight`）を
+    // 参照しない（`fetch_k` の決定は `cfg.pool_depth()` のみに依存。
+    // `hybrid.rs::sparse_refetch_loop` 参照）ため、ここでは妥当性検証さえ通る
+    // 任意の正値を渡し、`pool_depth` のみを呼び出し元の指定値に合わせる。
+    let cfg = RrfConfig::new(1.0, 1.0, 1.0, pool_depth).map_err(|e| {
+        ProfileError::ContractViolation(format!("RrfConfig::new failed for pool_depth: {e}"))
+    })?;
+    let (hits, sparse_limit, fetch_ks) = sparse_refetch_observed(index, query, visible, &cfg)
+        .map_err(|e| {
+            ProfileError::ContractViolation(format!("sparse_refetch_observed failed: {e}"))
         })?;
-        if hits.len() > fetch_k {
-            return Err(ProfileError::ContractViolation(
-                "search_within returned more hits than requested fetch_k".to_string(),
-            ));
-        }
-        let scores: Vec<f64> = hits.iter().map(|d| d.score).collect();
-        let exhaustive = is_exhaustive(fetch_k, hits.len(), visible.len());
-        match boundary_tie_decision(&scores, pool_depth, exhaustive, true) {
-            TieDecision::Resolved => {
-                return Ok(RefetchSchedule {
-                    fetch_ks,
-                    final_hits: hits.len(),
-                    reached_cap: fetch_k >= cap,
-                });
-            }
-            TieDecision::Undetermined => {
-                if fetch_k >= cap {
-                    return Ok(RefetchSchedule {
-                        fetch_ks,
-                        final_hits: hits.len(),
-                        reached_cap: true,
-                    });
-                }
-                fetch_k = next_fetch_k(fetch_k, cap).unwrap_or(cap);
-            }
-        }
-    }
-    Err(ProfileError::ContractViolation(
-        "sparse refetch schedule reproduction exceeded MAX_REFETCH_ROUNDS".to_string(),
-    ))
+    Ok(RefetchSchedule {
+        fetch_ks,
+        final_hits: hits.len(),
+        reached_cap: sparse_limit >= cap,
+    })
 }
 
 /// 密側の再取得スケジュールを、実 `provider.search` を呼びながら再現する
@@ -965,70 +950,6 @@ pub fn refetch_schedule_matches_observed_calls(
         });
     }
     Ok(())
-}
-
-/// 疎側再取得スケジュールの終端判定が実 API 上でも安定した固定点であることを
-/// 検証する（Issue #387 PR #416 codex-review P1 指摘対応）。
-///
-/// [`sparse_refetch_schedule`] は各 `fetch_k` で実 [`SparseIndex::search_within`]
-/// を呼ぶが、いつ止めるか（[`TieDecision::Resolved`]）の判定自体は複製
-/// （[`boundary_tie_decision`]）に基づく。`hybrid.rs::hybrid_search_boosted` の
-/// 疎側再取得ループは `search_within` を `&SparseIndex`（具象型）へ直接呼ぶ構造
-/// のため、密側の `RefetchTrackingProvider`
-/// （[`super::hybrid_latency::RefetchTrackingProvider`]）のような呼び出し回数の
-/// 外部観測フックを持たない。production 側への診断フック追加は
-/// `docs/design/hybrid-rrf-latency-breakdown.md`「限界・申し送り」節が記録する
-/// とおり本 Issue のスコープ外（テスト専任）として既に不採用が確定している
-/// ため、本関数は代わりに「終端が実 API 上でも固定点であること」を検証する:
-/// 予測終端 `fetch_k` を超えてもう 1 回（倍増後の `fetch_k`）
-/// `search_within` を実際に呼び、`pool_depth` 件までの上位プレフィックス
-/// （`(doc_id, score)`）が変化しないことを確認する。`reached_cap`（これ以上
-/// 取得できない）の場合は検証不要のため `Ok(true)`。
-///
-/// **限界**: これは呼び出し回数そのものの観測ではなく、終端判定の正しさの
-/// 間接検証にとどまる。production の境界同点判定ロジックそのものではなく
-/// 本複製（[`boundary_tie_decision`]）の判定結果を実データで裏付けるに
-/// すぎないため、production 側の判定ロジック自体が変わった場合の乖離は
-/// 検知できない（呼び出し元 `hybrid_profile_bench.rs::main` のコメント参照）。
-pub fn verify_sparse_schedule_terminal_is_stable(
-    index: &SparseIndex,
-    query: &str,
-    visible: &BTreeSet<DocId>,
-    schedule: &RefetchSchedule,
-    pool_depth: usize,
-) -> Result<bool, ProfileError> {
-    if schedule.reached_cap {
-        return Ok(true);
-    }
-    let Some(&terminal_k) = schedule.fetch_ks.last() else {
-        return Ok(true);
-    };
-    let cap = fetch_cap(visible.len());
-    let Some(next_k) = next_fetch_k(terminal_k, cap) else {
-        return Ok(true);
-    };
-    let terminal_hits = index
-        .search_within(query, terminal_k, visible)
-        .map_err(|e| {
-            ProfileError::ContractViolation(format!(
-                "search_within failed during terminal stability check (terminal_k): {e}"
-            ))
-        })?;
-    let next_hits = index.search_within(query, next_k, visible).map_err(|e| {
-        ProfileError::ContractViolation(format!(
-            "search_within failed during terminal stability check (next_k): {e}"
-        ))
-    })?;
-    let prefix_len = pool_depth.min(terminal_hits.len()).min(next_hits.len());
-    for i in 0..prefix_len {
-        let same_doc = terminal_hits[i].doc_id == next_hits[i].doc_id;
-        let same_score =
-            terminal_hits[i].score.total_cmp(&next_hits[i].score) == std::cmp::Ordering::Equal;
-        if !same_doc || !same_score {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// 複数クエリ分の疎側再取得スケジュールの要約（Issue #387）。

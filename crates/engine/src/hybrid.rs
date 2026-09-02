@@ -1478,15 +1478,48 @@ pub fn hybrid_search_boosted(
     // `complete_boundary_tie_group_by` の前に必ず行う（codex-review P1 指摘対応:
     // 以前は疎側だけ長さ検証のみで、切り詰められて消える末尾の契約違反を検知
     // できなかった）。
+    let (sparse_hits, sparse_limit, _sparse_fetch_ks) =
+        sparse_refetch_loop(sparse_index, query_text, &visible_ids, cfg)?;
+
+    let mut fused =
+        rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
+    // `truncate(k)` の前にブーストを適用する（本関数ドキュメント参照。切り詰め後だと
+    // 圏外候補が浮上できず EXT-4/PLAN-1 の効果が失われる）。
+    apply_soft_boost(&mut fused, rules, cfg)?;
+    fused.truncate(k);
+    Ok(fused)
+}
+
+/// 疎側再取得ループ本体（Issue #320 の再取得ループ実装そのもの）。
+/// [`hybrid_search_boosted`] とテスト・ベンチ向け公開フック
+/// [`sparse_refetch_observed`] の双方がこの 1 実装を共有する。分離した理由は
+/// Issue #387 PR #416 codex-review P1 指摘対応: 以前は
+/// `crates/engine/benches/harness/hybrid_profile.rs` が本ループの境界同点判定
+/// （[`resolve_boundary_tie_group`]）をベンチ側で複製・予測しており、
+/// production 側の分岐・定数が変わっても複製が追随せず誤った基線を実測値として
+/// 報告しうる構造だった。本関数を切り出して公開フックから同じコードパスを
+/// 呼べるようにすることで、ベンチ側の「予測」を production の「実測」へ置き換える。
+///
+/// 戻り値の第 3 要素は実際に呼ばれた `fetch_k` の列（呼び出し順。再取得が
+/// 発火しなければ長さ 1）。production 経路（[`hybrid_search_boosted`]）はこの
+/// 列を使わないため `_` で無視する。
+fn sparse_refetch_loop(
+    sparse_index: &SparseIndex,
+    query_text: &str,
+    visible_ids: &BTreeSet<u64>,
+    cfg: &RrfConfig,
+) -> Result<(Vec<ScoredDoc>, usize, Vec<usize>), HybridError> {
     let sparse_cap = MAX_FETCH_K.min(visible_ids.len());
     let mut sparse_fetch_k = cfg
         .pool_depth()
         .checked_mul(2)
         .unwrap_or(sparse_cap)
         .min(sparse_cap);
+    let mut fetch_ks = Vec::new();
     let (sparse_hits, sparse_limit) = loop {
+        fetch_ks.push(sparse_fetch_k);
         let hits: Vec<ScoredDoc> =
-            sparse_index.search_within(query_text, sparse_fetch_k, &visible_ids)?;
+            sparse_index.search_within(query_text, sparse_fetch_k, visible_ids)?;
         // 密側と同じ理由（[`HybridError::TooManyCandidates`] のドキュメント参照）で、
         // 拡張取得列が `sparse_fetch_k` を超えていないかを検証する。`search_within`
         // は自作の内部関数であり `provider` のような trait object 契約違反の余地は
@@ -1521,14 +1554,25 @@ pub fn hybrid_search_boosted(
             }
         }
     };
+    Ok((sparse_hits, sparse_limit, fetch_ks))
+}
 
-    let mut fused =
-        rrf_fuse_with_limits(&dense_hits, dense_limit, &sparse_hits, sparse_limit, cfg)?;
-    // `truncate(k)` の前にブーストを適用する（本関数ドキュメント参照。切り詰め後だと
-    // 圏外候補が浮上できず EXT-4/PLAN-1 の効果が失われる）。
-    apply_soft_boost(&mut fused, rules, cfg)?;
-    fused.truncate(k);
-    Ok(fused)
+/// [`sparse_refetch_loop`]（[`hybrid_search_boosted`] の疎側再取得ループ実装
+/// そのもの）を呼び出し、実際に発火した `fetch_k` の列も含めて返すテスト・
+/// ベンチ向け公開フック（Issue #387 PR #416 codex-review P1 指摘対応。
+/// `sparse_refetch_loop` ドキュメント参照）。production の挙動を変えず、
+/// 呼び出し列を外部から観測できるようにするためだけの薄いラッパー。
+///
+/// 戻り値は `(疎ヒット, 疎側 fetch_k 上限〔最終ラウンドの fetch_k〕, 実際に
+/// 呼ばれた fetch_k の列)`。`sparse_index.search_within` を実際に複数回
+/// 呼び出すため副作用（計算コスト）は production の疎側検索と同一。
+pub fn sparse_refetch_observed(
+    sparse_index: &SparseIndex,
+    query_text: &str,
+    visible_ids: &BTreeSet<u64>,
+    cfg: &RrfConfig,
+) -> Result<(Vec<ScoredDoc>, usize, Vec<usize>), HybridError> {
+    sparse_refetch_loop(sparse_index, query_text, visible_ids, cfg)
 }
 
 /// [`complete_boundary_tie_group_by`] の判定結果（Issue #320 codex-review P1 指摘

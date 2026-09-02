@@ -67,8 +67,8 @@ use harness::hybrid_profile::{
     refuse_under_github_actions, render_dense_refetch_line, render_sparse_refetch_line,
     render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
     sparse_refetch_schedule, sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch,
-    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq,
-    verify_sparse_schedule_terminal_is_stable, ProfileSparseIndex, SQL_DEFAULT_HYBRID_POOL_DEPTH,
+    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq, ProfileSparseIndex,
+    SQL_DEFAULT_HYBRID_POOL_DEPTH,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
@@ -360,10 +360,24 @@ fn main() {
     let cfg = RrfConfig::new(60.0, 1.0, 1.0, pool_depth)
         .unwrap_or_else(|e| fail_closed(format!("RrfConfig::new failed: {e:?}")));
 
-    // 忠実性検証（fail-closed）: 疎側再取得スケジュール上で実際に呼ばれる各
-    // fetch_k について、複製（ProfileSparseIndex）の出力が実 SparseIndex の
-    // 出力と数値一致することを起動時に確認する（`harness::hybrid_profile`
-    // モジュールドキュメント「複製固有の限界」参照）。
+    // 疎側再取得スケジュールの収集（Issue #387 PR #416 codex-review P1 指摘
+    // 対応）: `sparse_refetch_schedule` は production の疎側再取得ループ実装
+    // （`hybrid.rs::sparse_refetch_loop`）をテスト・ベンチ向け公開フック
+    // `engine::hybrid::sparse_refetch_observed` 経由でそのまま呼び出すため、
+    // `schedule.fetch_ks` は予測・複製ではなく実際に発火した `fetch_k` の列
+    // そのものである（`hybrid_search_boosted` が内部で呼ぶのと同一の
+    // `sparse_index`・`query_text`・`visible_ids`・`cfg.pool_depth()` を渡して
+    // 同じ決定的コードパスを実行するため、別途の呼び出し回数突き合わせ・終端
+    // 安定性検証は不要。以前はここで境界同点判定〔`boundary_tie_decision`〕を
+    // ベンチ側で複製・予測しており、複製の追随漏れリスクを終端固定点検証で
+    // 間接的に補っていたが、実観測へ切り替えたことでその補償自体が不要になった）。
+    //
+    // 忠実性検証（fail-closed）: `search_within` 内部の subset/df/score 3 区間
+    // 分解（後段の `search_within_subset_only`/`_subset_df`/`_replica_full`）に
+    // 使う複製 `ProfileSparseIndex` の出力が、上記スケジュール上で実際に呼ばれる
+    // 各 `fetch_k` について実 `SparseIndex::search_within` の出力と数値一致する
+    // ことを起動時に確認する（`harness::hybrid_profile` モジュールドキュメント
+    // 「複製固有の限界」参照）。
     let mut sparse_schedules = Vec::with_capacity(queries.len());
     for q in &queries {
         let schedule = sparse_refetch_schedule(&sparse_index, &q.text, &visible, pool_depth)
@@ -371,31 +385,6 @@ fn main() {
         for &fetch_k in &schedule.fetch_ks {
             replica_matches_real(&sparse_index, &replica, &q.text, fetch_k, &visible)
                 .unwrap_or_else(|e| fail_closed(format!("replica fidelity check failed: {e}")));
-        }
-        // 終端固定点検証（codex-review P1 指摘対応。PR #416）: `schedule` の終端
-        // 判定（`boundary_tie_decision` 複製）が実 `search_within` 出力でも
-        // 安定していることを、予測終端の 1 段先まで実際に呼んで確認する
-        // （`verify_sparse_schedule_terminal_is_stable` ドキュメント参照。
-        // 疎側呼び出し回数そのものの外部観測ではなく終端判定の間接検証にとどまる
-        // 限界は同ドキュメントに明記）。
-        let stable = verify_sparse_schedule_terminal_is_stable(
-            &sparse_index,
-            &q.text,
-            &visible,
-            &schedule,
-            pool_depth,
-        )
-        .unwrap_or_else(|e| {
-            fail_closed(format!(
-                "sparse schedule terminal stability check failed: {e}"
-            ))
-        });
-        if !stable {
-            fail_closed(
-                "sparse refetch schedule terminal fetch_k is not a stable fixed point against \
-                 real search_within output one round further (boundary_tie_decision replica may \
-                 have diverged from what the real index data supports)",
-            );
         }
         sparse_schedules.push(schedule);
     }
@@ -428,16 +417,13 @@ fn main() {
             .unwrap_or_else(|e| fail_closed(format!("dense refetch fidelity check failed: {e}")));
     }
     println!(
-        "hybrid_profile: fidelity checks passed (replica search_within matches real API for \
-         every fetch_k on the sparse schedule; each sparse schedule's terminal fetch_k was \
-         verified as a stable fixed point one round further via a real search_within call \
-         [verify_sparse_schedule_terminal_is_stable]; dense refetch schedule predictions match \
-         observed hybrid_search calls via RefetchTrackingProvider — sparse still has no \
-         equivalent internal-call-count observation hook [production diagnostic hook rejected, \
-         see docs/design/hybrid-rrf-latency-breakdown.md 限界・申し送り], so \
-         sparse_refetch_schedule's boundary_tie_decision-driven loop remains a reproduction \
-         cross-checked for output fidelity and terminal stability, not a call-count \
-         cross-check against real hybrid_search)"
+        "hybrid_profile: fidelity checks passed (sparse_refetch_schedule now calls production's \
+         shared sparse_refetch_loop via engine::hybrid::sparse_refetch_observed, so its \
+         fetch_ks are an actual observation of hybrid_search_boosted's sparse refetch calls, \
+         not a prediction — no separate call-count cross-check is needed for it; replica \
+         search_within matches real API for every fetch_k on that schedule (used by the \
+         subset/df/score breakdown below); dense refetch schedule predictions still match \
+         observed hybrid_search calls via RefetchTrackingProvider)"
     );
 
     // --- hybrid_search_cached_index: 事前構築済み SparseIndex（キャッシュヒット

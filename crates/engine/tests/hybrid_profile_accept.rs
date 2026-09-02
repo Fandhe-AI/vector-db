@@ -26,9 +26,8 @@ use harness::hybrid_profile::{
     render_dense_refetch_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
     render_stage_line, replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
     sql_hybrid_statement, summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq,
-    tokenize_term_freq, verify_sparse_schedule_terminal_is_stable, ProfileError,
-    ProfileSparseIndex, RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR,
-    MAX_POOL_DEPTH_MIRROR,
+    tokenize_term_freq, ProfileError, ProfileSparseIndex, RefetchSchedule, TieDecision,
+    MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
 };
 
 use harness::hybrid_latency::RefetchTrackingProvider;
@@ -428,45 +427,6 @@ fn sparse_refetch_schedule_reaches_cap_on_all_tied_corpus() {
         .expect("schedule reproduction ok");
     assert!(schedule.reached_cap);
     assert_eq!(*schedule.fetch_ks.last().expect("nonempty schedule"), 64);
-}
-
-#[test]
-fn verify_sparse_schedule_terminal_is_stable_true_for_non_tied_corpus() {
-    // 同点が実質発生しないコーパス（`sparse_refetch_schedule_stops_at_first_resolved_...`
-    // と同一構成）では、終端の 1 段先まで実際に呼んでも上位プレフィックスは
-    // 変化しないはず（codex-review P1 指摘対応。PR #416）。
-    let docs: Vec<(u64, String)> = (0..64u64)
-        .map(|i| (i, format!("uniqueterm{i} filler filler filler")))
-        .collect();
-    let doc_refs: Vec<(u64, &str)> = docs.iter().map(|(id, t)| (*id, t.as_str())).collect();
-    let index = SparseIndex::build(&doc_refs).expect("index ok");
-    let visible: BTreeSet<u64> = (0..64u64).collect();
-    let schedule = sparse_refetch_schedule(&index, "uniqueterm0", &visible, 8)
-        .expect("schedule reproduction ok");
-    let stable =
-        verify_sparse_schedule_terminal_is_stable(&index, "uniqueterm0", &visible, &schedule, 8)
-            .expect("stability check ok");
-    assert!(stable);
-}
-
-#[test]
-fn verify_sparse_schedule_terminal_is_stable_skips_when_schedule_reached_cap() {
-    // `reached_cap` の場合はこれ以上取得できないため検証不要（`Ok(true)`）。
-    let docs: Vec<(u64, String)> = (0..64u64)
-        .map(|_| (0u64, "vector search dense sparse".to_string()))
-        .enumerate()
-        .map(|(i, (_, t))| (i as u64, t))
-        .collect();
-    let doc_refs: Vec<(u64, &str)> = docs.iter().map(|(id, t)| (*id, t.as_str())).collect();
-    let index = SparseIndex::build(&doc_refs).expect("index ok");
-    let visible: BTreeSet<u64> = (0..64u64).collect();
-    let schedule = sparse_refetch_schedule(&index, "vector search", &visible, 8)
-        .expect("schedule reproduction ok");
-    assert!(schedule.reached_cap);
-    let stable =
-        verify_sparse_schedule_terminal_is_stable(&index, "vector search", &visible, &schedule, 8)
-            .expect("stability check ok");
-    assert!(stable);
 }
 
 #[test]

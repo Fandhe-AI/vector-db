@@ -219,12 +219,17 @@ private フィールド）・`crates/engine/src/hybrid.rs` の境界同点判定
   ことをベンチ起動時に fail-closed で検証してから使う（Issue #356 の build
   複製と異なり、本複製は公開 API 経由で出力を直接比較できる）
 - `boundary_tie_decision`: 境界同点判定の**判定結果のみ**（列の切り詰めは
-  行わない）を複製し、`sparse_refetch_schedule`／`dense_refetch_schedule`
-  （鏡像定数 `MAX_POOL_DEPTH_MIRROR`/`MAX_FETCH_K_MIRROR` を使い、初期
-  `fetch_k` から倍増しつつ実 `search_within`/`provider.search` を呼ぶ）が
-  疎側・密側それぞれの再取得スケジュールを予測する。密側予測はベンチ起動時に
-  `RefetchTrackingProvider`（既存 Issue #324 ハーネス）が観測する実際の呼び出し
-  回数と突き合わせて fail-closed 検証する
+  行わない）を複製し、`dense_refetch_schedule`（鏡像定数
+  `MAX_POOL_DEPTH_MIRROR`/`MAX_FETCH_K_MIRROR` を使い、初期 `fetch_k` から
+  倍増しつつ実 `provider.search` を呼ぶ）が密側の再取得スケジュールを予測する。
+  この密側予測はベンチ起動時に `RefetchTrackingProvider`（既存 Issue #324
+  ハーネス）が観測する実際の呼び出し回数と突き合わせて fail-closed 検証する。
+  疎側の `sparse_refetch_schedule` は当初 `boundary_tie_decision` による予測
+  だったが、codex-review P1 指摘（PR #416）対応で production の疎側再取得
+  ループ実装（`hybrid.rs::sparse_refetch_loop`）をテスト・ベンチ向け公開フック
+  `engine::hybrid::sparse_refetch_observed` 経由で直接呼ぶ方式へ変更した
+  （「限界・申し送り」節参照）。以降の予測固有の限界の記述はこの変更前の
+  設計時点のものであり、密側（`dense_refetch_schedule`）のみに適用される
 
 複製固有の限界: `MAX_POOL_DEPTH_MIRROR`/`MAX_FETCH_K_MIRROR` は `hybrid.rs`
 側の値をこのファイルへ手動転記したものであり、コード上の同期は強制されない
@@ -246,8 +251,9 @@ boundary_group`）自体は複製しない（本測定が必要とするのは�
 
 ### 実測結果（本開発環境・非専有・並行エージェントあり・1 回実測）
 
-忠実性検証（複製 ↔ 実 API・密側スケジュール予測 ↔ 実測呼び出し回数）はいずれも
-通過（`hybrid_profile: fidelity checks passed ...`）。
+忠実性検証（`search_within` 3 区間複製 ↔ 実 API・密側スケジュール予測
+〔`dense_refetch_schedule`〕↔ `RefetchTrackingProvider` 実測呼び出し回数）は
+いずれも通過（`hybrid_profile: fidelity checks passed ...`）。
 
 | 段 | median | p95 | 備考 |
 | -- | -----: | --: | ---- |
@@ -257,16 +263,23 @@ boundary_group`）自体は複製しない（本測定が必要とするのは�
 | `search_within_subset_df`（区間 1+2） | 9.66〜10.01ms | 10.76〜10.95ms | 区間 2 単独の寄与 ≈ 8.9〜9.2ms |
 | `search_within_replica_full`（区間 1+2+3） | 15.25〜16.76ms | 17.09〜17.89ms | 区間 3 単独の寄与 ≈ 5.6〜6.8ms |
 
-疎側再取得ループの実測（5 クエリ）:
+疎側再取得ループの実測（5 クエリ。codex-review P1 指摘対応〔PR #416〕後の
+`engine::hybrid::sparse_refetch_observed` 経由の再実行——production の
+`sparse_refetch_loop` を直接呼ぶため、以下の `fetch_ks`／`calls`／
+`reached_cap` は予測ではなく実際に発火した呼び出し列そのもの）:
 
 ```
-sparse_refetch query=0 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 reached_cap=true
-sparse_refetch query=1 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 reached_cap=true
-sparse_refetch query=2 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 reached_cap=true
-sparse_refetch query=3 calls=6 fetch_ks=400,800,1600,3200,6400,12800       reached_cap=false
-sparse_refetch query=4 calls=6 fetch_ks=400,800,1600,3200,6400,12800       reached_cap=false
+sparse_refetch query=0 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=17501 reached_cap=true
+sparse_refetch query=1 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=13125 reached_cap=true
+sparse_refetch query=2 calls=7 fetch_ks=400,800,1600,3200,6400,12800,25000 final_hits=18125 reached_cap=true
+sparse_refetch query=3 calls=6 fetch_ks=400,800,1600,3200,6400,12800       final_hits=12500 reached_cap=false
+sparse_refetch query=4 calls=6 fetch_ks=400,800,1600,3200,6400,12800       final_hits=12500 reached_cap=false
 sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 max_fetch_k=25000
 ```
+
+（発火回数・`fetch_ks` は修正前の複製予測による実行結果と一致した——
+`sparse_refetch_loop` の抽出はロジックを変えない純粋なリファクタリングであり、
+この一致はその不変性を裏付ける。）
 
 密側は `provider_calls_max=1`（初回 `fetch_k=400` で境界確定）で再取得が
 発生していない。疎側は 5 クエリ全件で 6〜7 回発火し、うち 3 クエリは可視集合
@@ -285,7 +298,7 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
   （`sparse.rs::search_within` 832〜842 行の複製）が `fetch_k` に依存しない
   固定コスト（可視集合サイズにのみ依存）として支配的である
 - 疎側再取得ループの累積コストは `sparse_refetch_summary` の
-  `estimated_cumulative_mixed_median_us=125613`（`search_within_fetch_k=<k>`
+  `estimated_cumulative_mixed_median_us=124551`（`search_within_fetch_k=<k>`
   段——各 `fetch_k` を全クエリで round-robin 測定した**全クエリ混合集団**の
   実測中央値であり、クエリ別の実測値ではない——を、最も再取得回数が多い
   クエリの実スケジュールに沿って合算した**推定値**。以前は
@@ -332,18 +345,27 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
 - production 側フック案（`hybrid_search_with_diagnostics` のような診断 API を
   `hybrid.rs` へ追加する案）は、本実測でベンチ側複製＋忠実性検証のみで要件を
   満たせたため不採用（`crates/engine/src/` は本 Issue で無変更）。
-  `SparseIndex::search_within` は `hybrid.rs::hybrid_search_boosted` から
-  具象型 `&SparseIndex` へ直接呼ばれる構造のため、密側の
-  `RefetchTrackingProvider`（`&dyn SearchProvider` を介した外部観測）と
-  同型の呼び出し回数観測フックは存在しない、という制約自体は変わらない
-  （codex-review P1 指摘・PR #416。`sparse_refetch_schedule` の疎側発火回数は
-  依然としてベンチ側複製〔`boundary_tie_decision`〕の予測値であり、
-  production の実呼び出し列そのものと突き合わせた call-count 一致検証では
-  ない）。代わりに `verify_sparse_schedule_terminal_is_stable`
-  （`harness/hybrid_profile.rs`）を追加し、各クエリのスケジュール終端が
-  予測 `fetch_k` の 1 段先まで実際に呼んでも上位プレフィックスが変化しない
-  固定点であることを実 API で確認する間接検証を起動時 fail-closed に行う
-  （呼び出し回数の外部観測ではなく終端判定の正しさの間接検証にとどまる限界
-  は同関数のドキュメント参照）
+  `SparseIndex::search_within` は当初 `hybrid.rs::hybrid_search_boosted` から
+  具象型 `&SparseIndex` へ直接呼ばれる構造で、密側の `RefetchTrackingProvider`
+  （`&dyn SearchProvider` を介した外部観測）と同型の呼び出し回数観測フックが
+  存在しなかった（codex-review P1 指摘・PR #416。当初の `sparse_refetch_schedule`
+  はベンチ側複製〔`boundary_tie_decision`〕による予測値であり、production の
+  実呼び出し列そのものとは突き合わせていなかった）。この指摘への対応として、
+  `hybrid_search_boosted` の疎側再取得ループ本体を `hybrid.rs::sparse_refetch_loop`
+  （private）へ抽出し、テスト・ベンチ向けの薄い公開フック
+  `engine::hybrid::sparse_refetch_observed`（署名・挙動は同一。実際に呼ばれた
+  `fetch_k` の列も返す）を追加した（production の疎側検索処理自体は無変更・
+  1 実装を production 経路とフックの双方が共有）。`harness/hybrid_profile.rs::
+  sparse_refetch_schedule` はこのフック経由で production と同一のコードパスを
+  実行するようになったため、`fetch_ks` はベンチ側予測ではなく実観測であり、
+  境界同点判定の複製（`boundary_tie_decision`）はもはや疎側スケジュールの
+  算出に使わない（密側 `dense_refetch_schedule` の予測 ↔
+  `RefetchTrackingProvider` 実測突き合わせでのみ引き続き使用）。この変更に伴い、
+  間接検証だった `verify_sparse_schedule_terminal_is_stable`（終端 1 段先の
+  プレフィックス固定点チェック）は不要になったため削除した（実観測に対する
+  終端安定性の間接検証という位置づけ自体が意味を失うため。加えて cursor[bot]
+  レビュー〔PR #416〕は同チェックが `k >= pool_depth` の場合に境界同点グループ
+  が成長中でもプレフィックスが不変になり早期停止を検出できない構造的な穴を
+  指摘していた）
 - 転置索引化そのもの（設計・実装）は本 Issue のスコープ外。本節の帰属分析・
   優先順位は次段の設計判断の入力として記録するに留める
