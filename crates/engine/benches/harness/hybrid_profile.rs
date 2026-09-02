@@ -452,6 +452,33 @@ pub fn render_stage_line(stage: &str, median_us: u128, p95_us: u128, check_value
     format!("hybrid_profile: stage={stage} p95_us={p95_us} median_us={median_us} check_value={check_value}")
 }
 
+/// `SparseIndex` 常駐時の常駐メモリ（RSS）増分行を描画する（`hybrid_profile_bench.rs
+/// ::main` から呼ぶ。Issue #389・受け入れ条件 5「メモリ増分を bench-hybrid-profile
+/// の RSS で記録する」）。`Option<u64>` は `harness::proc_stats` が `/proc` を読めない
+/// 環境（Linux 以外・sandbox 制限）で `None` を返す契約をそのまま反映し、`"unavailable"`
+/// として出力する（診断目的のためベンチ自体は止めない）。`approx_heap_bytes` は
+/// `sparse.rs::SparseIndex::approx_heap_bytes` の実測値（DoS 対策用の粗い概算だが、
+/// RSS 実測とあわせて記録することで概算の妥当性を突き合わせられる）。
+pub fn render_memory_line(
+    approx_heap_bytes: usize,
+    vm_rss_kb_before: Option<u64>,
+    vm_rss_kb_after: Option<u64>,
+    vm_hwm_kb: Option<u64>,
+) -> String {
+    let fmt_opt = |v: Option<u64>| v.map_or_else(|| "unavailable".to_string(), |v| v.to_string());
+    let rss_delta = match (vm_rss_kb_before, vm_rss_kb_after) {
+        (Some(before), Some(after)) => after.saturating_sub(before).to_string(),
+        _ => "unavailable".to_string(),
+    };
+    format!(
+        "hybrid_profile: memory stage=sparse_index_resident approx_heap_bytes={approx_heap_bytes} \
+         vm_rss_kb_before={} vm_rss_kb_after={} rss_delta_kb={rss_delta} vm_hwm_kb={}",
+        fmt_opt(vm_rss_kb_before),
+        fmt_opt(vm_rss_kb_after),
+        fmt_opt(vm_hwm_kb),
+    )
+}
+
 // --- Issue #387: search_within の段別プロファイル・再取得ループ発火回数 ----------
 //
 // `hybrid.rs::MAX_POOL_DEPTH`/`MAX_FETCH_K`・`sparse.rs::SparseIndex` の内部

@@ -30,6 +30,13 @@
 //!    計算パス／スコアリングパスの累積 3 区間（複製実装。起動時に実 API の出力と
 //!    数値一致するかを fail-closed 検証してから使う）
 //!
+//! Issue #389（転置索引・doc_len／doc_ids 配列の追加）は受け入れ条件として
+//! メモリ増分の実測・記録を求めるため、以下を追加する:
+//!
+//! 8. `memory stage=sparse_index_resident`: `SparseIndex` を保持したままの
+//!    VmRSS 増分（`/proc/self/status`。読めない環境では `unavailable`）と
+//!    `approx_heap_bytes()` の実測値
+//!
 //! # 実測値の比較可能性についての重要な注意
 //!
 //! `harness::hybrid_profile` モジュールドキュメント参照: Issue #355 が言及する
@@ -296,6 +303,31 @@ fn main() {
             NUM_DOCS,
         )
     );
+
+    // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
+    // 計測用ビルド（上記 `build_measurement`）とは別に、1 回だけ `SparseIndex`
+    // を保持したまま前後の VmRSS を比較する（保持しなければ drop されて増分を
+    // 観測できない）。`approx_heap_bytes()` はテスト・ベンチ以外の一般利用側
+    // （`sql/sparse_cache.rs`）が実際に参照する概算値であり、RSS 実測と並記する
+    // ことで概算の妥当性を突き合わせられる。
+    let vm_rss_kb_before = harness::proc_stats::read_vm_rss_kb();
+    let resident_index = SparseIndex::build(&doc_refs)
+        .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (memory) failed: {e}")));
+    let approx_heap_bytes = resident_index.approx_heap_bytes();
+    let vm_rss_kb_after = harness::proc_stats::read_vm_rss_kb();
+    let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();
+    println!(
+        "{}",
+        harness::hybrid_profile::render_memory_line(
+            approx_heap_bytes,
+            vm_rss_kb_before,
+            vm_rss_kb_after,
+            vm_hwm_kb,
+        )
+    );
+    // `resident_index` は RSS 差分計測の対象そのものであり、以降の段では参照
+    // しないため、計測直後に明示的に drop してよい（メモリ計測意図の明確化）。
+    drop(resident_index);
 
     let tokenize_measurement = run(&config, || tokenize_only(&corpus.bodies))
         .unwrap_or_else(|e| fail_closed(format!("tokenize_only measurement failed: {e}")));

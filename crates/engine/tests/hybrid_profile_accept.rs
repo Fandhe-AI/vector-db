@@ -33,12 +33,13 @@ use harness::hybrid_profile::{
     boundary_tie_decision, build_actually_succeeds, collect_body_strings, dense_refetch_schedule,
     fetch_cap, generate_corpus, generate_queries, initial_fetch_k, is_exhaustive, next_fetch_k,
     refetch_schedule_matches_observed_calls, refuse_under_github_actions,
-    render_dense_refetch_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
-    render_stage_line, replica_matches_real, sql_dense_statement, sql_hybrid_statement,
-    summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq, tokenize_term_freq,
-    ProfileError, ProfileSparseIndex, RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD,
-    MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
+    render_dense_refetch_line, render_memory_line, render_sparse_refetch_line,
+    render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
+    sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch, tokenize_only,
+    tokenize_term_doc_freq, tokenize_term_freq, ProfileError, ProfileSparseIndex, RefetchSchedule,
+    TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
 };
+use harness::proc_stats::{parse_kb_line, read_vm_hwm_kb, read_vm_rss_kb};
 // `sparse_refetch_schedule` は `sparse_refetch_observed`（非既定 feature
 // `bench-internals` 限定）に依存するため import も同 feature 限定にする。
 #[cfg(feature = "bench-internals")]
@@ -651,4 +652,46 @@ fn profile_error_display_is_nonempty_for_new_variants() {
     for v in variants {
         assert!(!v.to_string().is_empty());
     }
+}
+
+// --- Issue #389: harness::proc_stats・render_memory_line（時間非依存の判定ロジック） ---
+
+#[test]
+fn parse_kb_line_reads_leading_numeric_token() {
+    assert_eq!(parse_kb_line("    12345 kB"), Some(12345));
+}
+
+#[test]
+fn parse_kb_line_rejects_non_numeric_input() {
+    assert_eq!(parse_kb_line(""), None);
+    assert_eq!(parse_kb_line("not-a-number kB"), None);
+}
+
+#[test]
+fn read_vm_rss_and_hwm_do_not_panic_regardless_of_environment() {
+    // `/proc` が読めない環境（Linux 以外・sandbox 制限）でも `None` を返す
+    // だけで panic しないことを固定する（診断目的でベンチを止めない契約）。
+    // 値の有無自体は環境依存のためここでは固定しない。
+    let _ = read_vm_rss_kb();
+    let _ = read_vm_hwm_kb();
+}
+
+#[test]
+fn render_memory_line_includes_all_measured_values() {
+    let line = render_memory_line(12345, Some(1000), Some(1200), Some(1500));
+    assert!(line.contains("stage=sparse_index_resident"));
+    assert!(line.contains("approx_heap_bytes=12345"));
+    assert!(line.contains("vm_rss_kb_before=1000"));
+    assert!(line.contains("vm_rss_kb_after=1200"));
+    assert!(line.contains("rss_delta_kb=200"));
+    assert!(line.contains("vm_hwm_kb=1500"));
+}
+
+#[test]
+fn render_memory_line_reports_unavailable_when_rss_unreadable() {
+    let line = render_memory_line(999, None, None, None);
+    assert!(line.contains("vm_rss_kb_before=unavailable"));
+    assert!(line.contains("vm_rss_kb_after=unavailable"));
+    assert!(line.contains("rss_delta_kb=unavailable"));
+    assert!(line.contains("vm_hwm_kb=unavailable"));
 }

@@ -485,3 +485,92 @@ sparse_refetch_observed` 経由の実観測）は基線と完全に一致した
   後続）への示唆」の優先順位付けを変えるものではない（転置索引化は
   `search_within` 単体のアルゴリズム的な計算量を変える話であり、本 Issue
   の定数倍改善とは独立に効果が見込まれる）
+
+## Issue #389: posting list・doc_len／doc_ids 配列追加後の build・常駐メモリ実測
+
+親 Issue #386（転置索引化）Phase 1 の 3 番目のタスクとして、`SparseIndex`
+（`crates/engine/src/sparse.rs`）へ `TermId` 添字の転置索引
+（`postings: Vec<Vec<(u32, u32)>>`）・`doc_idx` 添字の `doc_len`／`doc_ids`
+配列を追加し、`id_index` を `BTreeMap` から `HashMap` へ置換した。文書を
+`doc_idx` 昇順に処理する構築順序自体が posting list の
+「`doc_idx` 昇順・重複なし」不変条件を満たすため、ソートは不要（`with_params`
+内でランレングス圧縮済みの `term_freq` を 1 回走査して各 `postings[t]` へ
+`append` するのみ）。`search`／`search_within` は本 Issue では未参照のまま
+残置し（撤去・経路切替は #390）、公開 API のシグネチャ・契約・スコアの
+ビット一致は不変（`search_score_is_bit_identical_to_reference_btreemap_
+implementation` 等の既存参照実装比較テストが green のまま）。
+
+### 測定条件
+
+- 測定環境・コーパス・クエリ集合・プロトコルは Issue #356・#387・#388 と
+  同一（25,000 行・dim 128・単一テナント・全行 `Visibility::Public`・
+  `MeasurementConfig::new(20, 30, SEED)`）。非専有環境（並行エージェントあり）
+  での 1 回実測であり、Issue #388 の実測値を参考基線として扱う（厳密な
+  同一マシン・同一時刻での前後比較ではない）
+- ベンチ起動時の忠実性検証（`fidelity checks passed ...`）は本 Issue の
+  変更後も通過している
+
+### 実測結果
+
+| 指標 | Issue #388（参考基線） | 本実測 |
+| ---- | ----------------------: | -----: |
+| `sparse_build_total` median | 50.1ms | 48.1ms（ノイズ帯内。転置索引構築分の増加は測定誤差に埋もれる規模） |
+| `sparse_build_total` p95 | — | 49.5ms |
+
+| 指標（新規計測。Issue #389） | 実測値 |
+| ---- | -----: |
+| `approx_heap_bytes()`（`SparseIndex` 保持時） | 19,553,564 バイト（約 18.65 MiB） |
+| `vm_rss_kb_before` → `vm_rss_kb_after`（`SparseIndex::build` 1 回分の直前直後） | 119,368 kB → 119,368 kB（差分 0） |
+| `vm_hwm_kb`（測定時点までのピーク RSS） | 119,368 kB |
+
+### 解釈
+
+- `sparse_build_total` は Issue #388 実測（50.1ms）とノイズ帯内で同水準
+  （48.1ms）であり、posting list・`doc_len`／`doc_ids` 配列の構築（ランレングス
+  圧縮済み `term_freq` を 1 回追加走査するだけの線形処理）が build 全体の
+  所要時間へ与える影響は、本測定の分解能では有意な劣化として観測されな
+  かった
+- RSS 差分が 0 と観測されたのは、この計測点の直前に同一プロセス内で
+  `sparse_build_total` 段（同一コーパスに対する `SparseIndex::build` の
+  複数回反復測定）が既に実行されており、その過程でアロケータが確保・
+  解放を繰り返した結果、プロセスの RSS が既にこの規模のコーパスを
+  賄えるだけの水準まで到達済み（`vm_hwm_kb` と一致）であるため。単一
+  `SparseIndex` の実メモリ使用量は `approx_heap_bytes()`（約 18.65 MiB）
+  の方が直接的な指標であり、DoS 対策用の粗い概算（実確保量を下回らない
+  側に倒す設計。`approx_heap_bytes` のドキュメンテーションコメント参照）
+  として妥当な桁数感（文書数 25,000・語彙数約 25,000 に対して 1 桁 MiB
+  台後半）に収まっている
+- 受け入れ条件 5「メモリ増分を `bench-hybrid-profile` の RSS で記録する」は
+  上記のとおり記録したが、本実測は「プロセス全体に対する新規追加分」を
+  切り分けられる条件（前段の反復測定による RSS 事前高水準化）ではなかった。
+  真に隔離された増分（他の測定を一切行わない、プロセス起動直後の 1 回の
+  `SparseIndex::build` 前後の RSS 差分）を見たい場合は、この計測点のみを
+  単独プロセスで実行する運用（`BENCH_CORE16_DIAG` 系の「1 プロセス = 1
+  規模点」運用と同様の方針）が必要であり、これは今回のスコープでは実施
+  していない（オーナー・運用者への申し送り）
+
+### 受け入れ条件との対応
+
+1. posting list（`doc_idx` 昇順・順序構築）・`doc_len`・`doc_ids` を
+   `SparseIndex` へ追加し、`DocEntry` は残置した（3.1〜3.2 節。実装は
+   `crates/engine/src/sparse.rs`）
+2. `id_index` を `HashMap<DocId, usize>` へ置換した
+3. 単体テスト（`postings_reconstruct_tf_and_df_matching_doc_entry_for_
+   all_docs` 等）で posting list から復元した tf／df が `DocEntry` 経由の
+   値と全件一致することを固定した
+4. 既存テスト（`cargo test -p engine --all-features`）は green・依存追加
+   なし
+5. メモリ増分を `bench-hybrid-profile` の RSS で記録した（上表。解釈欄の
+   限界も含めて記録）
+
+### 申し送り
+
+- `search`／`search_within` の posting 走査化・`docs: Vec<DocEntry>` の
+  撤去は #390 のスコープ
+- `postings` の CSR 形（単一 `Vec` ＋ offsets）や量子化・skip list への
+  圧縮は #391 以降・#394 の判断材料
+- `harness/hybrid_profile.rs::ProfileSparseIndex`・build 3 段複製は
+  Issue #388 からの申し送りどおり旧構造（`BTreeMap<String,u32>`）の参照
+  実装のまま据え置いた（本 Issue でも変更していない）
+- 専有環境での再実測・真に隔離された RSS 増分の単独プロセス実測は
+  オーナー／運用者判断で別途実施する
