@@ -405,7 +405,7 @@ pub fn tokenize_term_freq(bodies: &[String]) -> usize {
 }
 
 /// tokenize + term_freq + doc_freq マージ（`with_params` が構築する
-/// `DocEntry`/`id_index` を除いた残り全て）。戻り値はコーパス全体の語彙数
+/// `id_index`/`postings`/`doc_len`/`doc_ids` を除いた残り全て）。戻り値はコーパス全体の語彙数
 /// （`doc_freq.len()`）で、`SparseIndex::build` の語彙数と一致するはずの検算値。
 pub fn tokenize_term_doc_freq(bodies: &[String]) -> usize {
     let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
@@ -432,7 +432,7 @@ pub fn collect_body_strings(ids: &[u64], bodies: &[String]) -> Vec<(u64, String)
 }
 
 /// [`tokenize_term_doc_freq`] の複製実装が構造的に妥当であることを確認する
-/// 整合性チェック（複製近似の限界: `SparseIndex` の `doc_freq`/`docs` は private
+/// 整合性チェック（複製近似の限界: `SparseIndex` の `doc_freq` は private
 /// フィールドのため、公開 API 経由で実際の内部語彙数・文書統計を読み出して
 /// 複製実装と数値比較する手段が存在しない。そのため fidelity は「同一入力に
 /// 対して `SparseIndex::build` 自体が成功するか」という構造的な確認に留める。
@@ -482,7 +482,7 @@ pub fn render_memory_line(
 // --- Issue #387: search_within の段別プロファイル・再取得ループ発火回数 ----------
 //
 // `hybrid.rs::MAX_POOL_DEPTH`/`MAX_FETCH_K`・`sparse.rs::SparseIndex` の内部
-// フィールド（`docs`・`id_index`・`k1`・`b`）はいずれも `pub(crate)`/private の
+// フィールド（`postings`・`id_index`・`k1`・`b`）はいずれも `pub(crate)`/private の
 // ため、本クレート外のベンチ・統合テストから直接参照できない。以下は Issue #356
 // の build 複製（上記）と同じ方針で、`search_within` の 3 区間（可視 subset 構築／
 // df 再計算パス／スコアリングパス）・境界同点判定（`resolve_boundary_tie_group`/
@@ -516,7 +516,11 @@ pub const SQL_DEFAULT_HYBRID_POOL_DEPTH: usize = 200;
 /// 無限ループしてしまう場合に備え、有限回で必ず打ち切る。
 pub const MAX_REFETCH_ROUNDS: usize = 64;
 
-/// [`ProfileSparseIndex`] 内の 1 文書分の統計（`sparse.rs::DocEntry` の複製）。
+/// [`ProfileSparseIndex`] 内の 1 文書分の統計（Issue #390 以前の
+/// `sparse.rs::DocEntry`〔全件線形走査＋文書ごとの二分探索方式〕を模した旧方式
+/// 複製。`sparse.rs` 本体は Issue #390 で可視ビットマップ＋posting 走査 1 パス方式
+/// へ再実装済みだが、本複製は [`replica_matches_real`] による等価性検証の基準点
+/// として意図的にこの旧方式のまま維持する）。
 #[derive(Debug, Clone)]
 struct ProfileDocEntry {
     doc_id: DocId,
@@ -548,15 +552,22 @@ impl Ord for ProfileCandidate {
     }
 }
 
-/// `sparse.rs::SparseIndex` の計測用複製（Issue #387）。private フィールド
-/// （`docs`・`id_index`・`k1`・`b`）を持つ実 `SparseIndex` の代わりに、
-/// `search_within` の内部区間（可視 subset 構築／df 再計算パス／スコアリング
-/// パス）を個別に呼び分けられる同型構造を持つ。既定パラメータ（`k1=1.2`・
-/// `b=0.75`）は `sparse.rs::DEFAULT_K1`/`DEFAULT_B` の鏡像。
+/// `sparse.rs::SparseIndex` の計測用複製（Issue #387）。private フィールドを持つ
+/// 実 `SparseIndex` の代わりに、`search_within` の内部区間（可視 subset 構築／
+/// df 再計算パス／スコアリングパス）を個別に呼び分けられる同型構造を持つ。既定
+/// パラメータ（`k1=1.2`・`b=0.75`）は `sparse.rs::DEFAULT_K1`/`DEFAULT_B` の鏡像。
+///
+/// Issue #390 で `sparse.rs` 本体は可視ビットマップ＋posting 走査 1 パス方式へ
+/// 再実装済みだが、本複製は意図的に **旧方式**（可視部分集合の全件線形走査＋
+/// 文書ごとの二分探索）のまま据え置く。段別プロファイルの内訳（可視 subset
+/// 構築／df 再計算パス／スコアリングパス）を個別に計測する目的自体が旧方式の
+/// 内部構造に依存するため、新方式へ追従させると計測対象が失われる（詳細は
+/// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節参照）。
 ///
 /// 出力の忠実性は [`replica_matches_real`] が実 `SparseIndex::search_within` の
 /// 出力と突き合わせて検証する（Issue #356 の build 複製と異なり、本複製は
-/// 公開 API 経由で数値比較可能）。
+/// 公開 API 経由で数値比較可能。この検証は同時に「旧方式 vs Issue #390 新方式」
+/// の等価性検証としても機能する）。
 #[derive(Debug)]
 pub struct ProfileSparseIndex {
     k1: f64,
