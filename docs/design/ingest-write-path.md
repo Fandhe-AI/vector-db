@@ -191,16 +191,12 @@ INSERT_MODE` は既定 `insert`）を交互 3 ペア実行した中央値（ms/1
 
 ## 4. 棄却判断の記録（ポインタ表記）
 
-Phase 2 の検討過程で採否を判断し、production コードへ反映しなかった選択肢を
-記録する。判断根拠の詳細（脅威モデル・再評価条件を含む）は private spec 側の
-判断事項であり、本 doc では TASK/ビヘイビア ID のポインタ表記に留める
+Phase 2 の検討過程で採否を判断し、production コードへ反映しなかった選択肢が
+ある。検討した選択肢・redb の実装事実・棄却理由の詳細は private spec 側の
+判断事項であり、本 doc では転記しない
 （[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）。
-
-| 検討した選択肢 | redb 4.2.0 の実装事実（本リポ依存クレート） | 判断 |
-| --- | --- | --- |
-| redb `Durability::None` によるバッチ中間 commit の高速化 | `Durability` は `None`／`Immediate` の 2 値。engine は `set_durability` をどこでも呼んでいない（既定 `Immediate`・1 相 commit） | 不採用。RECOVER-5／RECOVER-6・TASK-96／TASK-97 の既存契約を参照 |
-| `set_two_phase_commit` / `set_quick_repair` の有効化 | engine はこれらの API をどこでも呼んでいない（既定の 1 相 commit・checksum 復旧） | 不採用。RECOVER-8・TASK-99 のポインタを参照 |
-| キー順挿入によるツリー構築の高速化 | redb には昇順ロード向けの rightmost fast-path が既に実装されている（`tree_store/btree_mutator.rs`） | 不採用。TABLE-12・#397 で固定した既存契約（`recovery_content_hash.rs` の優先順位テスト）を参照 |
+判断は RECOVER-5／RECOVER-6・TASK-96／TASK-97、RECOVER-8・TASK-99、
+TABLE-12・#397 の既存契約の範囲内で行っている。
 
 ## 5. 参考: PostgreSQL `COPY` のバッファ二重基準と本リポのバッチ上限
 
