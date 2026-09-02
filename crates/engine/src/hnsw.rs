@@ -369,17 +369,40 @@ impl HnswIndex {
     /// し、到達できないノードが残っていれば、その層の到達済み集合中で最も
     /// 近い（`dot` が最大の）ノードへ双方向リンクを追加して修復する。
     ///
+    /// # 2 フェーズ構成（計算量の上限。codex-review #423 P1 指摘）
+    ///
     /// 検証の過程で、`shrink_links` によるヒューリスティック再選択を修復
     /// バッチとして複数ノードへ一括適用すると、ある未到達ノードを直すための
     /// 枝刈りが**無関係な別の**既存ノードの唯一の到達経路を巻き込んで壊し、
     /// 新たな到達不能ノードを生む whack-a-mole が起こり得ることが分かった。
-    /// そのためこの関数は 1 ノードずつ確定的に修復し、直後に BFS をやり直して
-    /// 次の未到達ノード（新たに生まれたものを含む）を選ぶワークリスト方式を
-    /// 取る（本体のコメント参照）。反復回数の上限までは通常どおり
-    /// `shrink_links`（`protect` つき）を経由するため次数上限を維持するが、
-    /// 収束せず上限に達した残りは `connect` のみ（次数上限超過を許容）で
-    /// 強制的に閉じる。安全側 = 全ノードの到達性を最終的に必ず保証する。
+    /// そのためフェーズ 1 は 1 ノードずつ確定的に修復し、直後に BFS を
+    /// やり直して次の未到達ノード（新たに生まれたものを含む）を選ぶ
+    /// ワークリスト方式を取る（`shrink_links`・`protect` つきで次数上限を
+    /// 維持する厳密な修復）。この「全体 BFS ＋ 到達済み全ノードとの `dot`
+    /// 計算」を伴う反復は、旧実装では上限を `member_count` の定数倍として
+    /// おり、残差の多い入力（重複ベクトルが多い adversarial な入力等）では
+    /// 反復回数・1 反復あたりのコストの双方が入力規模に比例して膨らみ、
+    /// 少なくとも O(N^2) 相当となって `MAX_HNSW_NODES`（100 万）まで受理
+    /// する構築 API 全体を計算量 DoS にさらしていた。フェーズ 1 の反復回数は
+    /// 入力規模に依存しない小さな絶対上限 [`PRECISE_REPAIR_CAP`] に固定し、
+    /// それを超えて残る未到達ノードはフェーズ 2 が閉じる。
+    ///
+    /// フェーズ 2 は最近傍探索・`shrink_links` を一切行わず、エントリ
+    /// ポイント（定義上つねに到達可能）へ直結するだけで残りを閉じる
+    /// （O(1) per node）。`connect` は既存リンクを削除しない単調な追加のみ
+    /// なので、この結線は他ノードの到達性へ一切影響しない（BFS 再計算・
+    /// whack-a-mole の再検証が不要で、層あたり高々 1 回の BFS で済む）。
+    /// フェーズ 1 の上限を入力非依存の定数に保つことで、層あたりの総コストは
+    /// O(`PRECISE_REPAIR_CAP` * N + N) に収まり、`MAX_LEVEL` も定数上限
+    /// （32）であるため `HnswIndex::build` 全体では入力規模に対しほぼ線形
+    /// （N log N 契約の範囲内）に収まる。安全側 = 全ノードの到達性を最終的に
+    /// 必ず保証する。
     fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
+        /// フェーズ 1（`shrink_links` つきの厳密修復）の反復回数の絶対上限。
+        /// 意図的に `member_count`／`n` に比例させない（比例させると入力
+        /// 規模に応じて計算量 DoS を招く。上記モジュールコメント参照）。
+        const PRECISE_REPAIR_CAP: usize = 64;
+
         let Some(entry) = self.entry_point else {
             return Ok(());
         };
@@ -387,30 +410,9 @@ impl HnswIndex {
             return Ok(());
         };
         for level in 0..=max_level {
-            let member_count = (0..self.nodes.len() as u32)
-                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
-                .count();
-            // `shrink_links`（次数上限維持のためのヒューリスティック再選択）を
-            // 修復対象ノードへ適用すると、その枝刈りが無関係な**別の**既存
-            // ノードの唯一の到達経路を巻き込んで壊し、新たな到達不能ノードを
-            // 生む whack-a-mole が起こり得る。次数上限を維持したまま到達性を
-            // 保つには、1 ノードずつ確定的に修復し、直後に BFS をやり直して
-            // 次の未到達ノード（新たに生まれたものを含む）を選ぶワークリスト
-            // 方式が要る。反復回数の上限（`member_count` の定数倍）までは次数
-            // 上限を維持する `shrink_links` 経由で厳密に修復し、それを超えた
-            // 反復は `shrink_links` を呼ばず `connect` のみ（重複追加をしない
-            // 純粋な追加。既存リンクを一切削除しない）で確定させる。この
-            // フォールバックは、ノード数が有限であり `connect` のみの反復が
-            // 必ず 1 ノードを恒久的に到達可能にする（後続の反復が既存の到達
-            // 経路を巻き戻さない）ことから、有限回で必ず終了する。次数上限は
-            // 通常の挿入経路と反復回数の上限内の修復では従来どおり保証される
-            // が、この残差フォールバックのみ例外的に超過し得る（安全側 = 全
-            // ノードの到達性を優先）。詳細は
-            // `docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性
-            // 保証」節参照。
-            let iteration_cap = member_count.saturating_mul(4).max(4);
-            let mut iterations = 0usize;
-            loop {
+            // フェーズ 1: 全体 BFS ＋ 到達済み全ノードとの `dot` 計算を伴う
+            // 厳密な修復を `PRECISE_REPAIR_CAP` 回までに限定する。
+            for _ in 0..PRECISE_REPAIR_CAP {
                 let reachable = self.bfs_reachable(level, entry);
                 let missing_node = (0..self.nodes.len() as u32)
                     .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
@@ -424,8 +426,20 @@ impl HnswIndex {
                 for &candidate in &reachable {
                     let cand_vec = node_vector(vectors, dim, candidate)?;
                     let score = dot(node_vec, cand_vec);
+                    // スコア降順・同点は id 昇順（モジュール冒頭の順序規約）。
+                    // `reachable` は `HashSet<u32>` であり走査順はプロセス
+                    // ごとに変わり得るハッシュ状態に依存するため、同点時に
+                    // 単純な `>` 比較（最初に見つかった候補を保持）のままだと
+                    // 同一 seed・同一入力でも修復先ノードが非決定的になる
+                    // （codex-review #423 P1 指摘）。ここでスコア・id の複合
+                    // 順序で明示的にタイブレークすることで、`reachable` の
+                    // 走査順に関係なく常に同じ (score, id) の組が選ばれる。
                     let better = match best {
-                        Some((_, best_score)) => score > best_score,
+                        Some((best_node, best_score)) => match score.total_cmp(&best_score) {
+                            std::cmp::Ordering::Greater => true,
+                            std::cmp::Ordering::Equal => candidate < best_node,
+                            std::cmp::Ordering::Less => false,
+                        },
                         None => true,
                     };
                     if better {
@@ -435,20 +449,32 @@ impl HnswIndex {
                 // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
                 // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
                 // `reachable` が空という到達不能な状態であり、fail-closed で
-                // 何もしない（次の反復の BFS が変化のないまま同じ `node` を選び
-                // 続けることになるが、`iteration_cap` により有限で打ち切られる）。
+                // 何もしない（次の反復の BFS が変化のないまま同じ `node` を
+                // 選び続けることになるが、フェーズ 1 の反復回数上限で有限に
+                // 打ち切られ、フェーズ 2 が確定的に閉じる）。
                 if let Some((target, _)) = best {
                     self.connect(node, target, level);
                     self.connect(target, node, level);
-                    if iterations < iteration_cap {
-                        self.shrink_links(target, level, dim, vectors, node)?;
-                        self.shrink_links(node, level, dim, vectors, target)?;
-                    }
-                    // `iterations >= iteration_cap` の場合は `shrink_links` を
-                    // 呼ばず `connect` のみで確定させる（次数上限超過を許容する
-                    // フォールバック）。
+                    self.shrink_links(target, level, dim, vectors, node)?;
+                    self.shrink_links(node, level, dim, vectors, target)?;
                 }
-                iterations += 1;
+            }
+
+            // フェーズ 2: フェーズ 1 の絶対上限までで解消しなかった残りを、
+            // エントリポイントへの直結（次数上限超過を許容する O(1) の
+            // フォールバック）で確定的に閉じる。通常の挿入経路とフェーズ 1
+            // の範囲内では次数上限は従来どおり維持されるが、この残差
+            // フォールバックのみ例外的に超過し得る（安全側 = 全ノードの
+            // 到達性を優先。詳細は `docs/design/hnsw-graph-construction.md`
+            // 「逆方向リンクの到達性保証」節参照）。
+            let reachable = self.bfs_reachable(level, entry);
+            let remaining: Vec<u32> = (0..self.nodes.len() as u32)
+                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .filter(|n| !reachable.contains(n))
+                .collect();
+            for node in remaining {
+                self.connect(node, entry, level);
+                self.connect(entry, node, level);
             }
         }
         Ok(())
