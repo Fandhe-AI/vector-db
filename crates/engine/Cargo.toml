@@ -258,3 +258,17 @@ test = false
 name = "dot_kernel_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #396（ingest 経路〔`engine::tenant::insert_rows` → `insert_rows_unchecked`〕
+# の段別内訳プロファイル。所有権検査・id 重複検出・`begin_write`・content_hash・
+# 台帳記録・encode・redb insert・世代更新・commit の各段を分解して測る）の実測入口。
+# spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため `.github/workflows/*`
+# へは配線しない。harness = false / test = false は上記ベンチと同一方針。`make
+# bench-ingest-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
+# harness/ingest_profile.rs にあり tests/ingest_profile_accept.rs で make ci 側から
+# 回帰検証する。redb は本ファイル冒頭の dev-dependency（=4.2.0）を再利用し、
+# 新規依存の追加は行わない。
+name = "ingest_profile_bench"
+harness = false
+test = false
