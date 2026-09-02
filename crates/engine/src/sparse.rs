@@ -573,13 +573,39 @@ pub struct SparseIndex {
     /// たびに `push(0)` して同期を保つ）。
     doc_freq: Vec<u32>,
     /// `DocId` → `docs` 内のインデックス。[`SparseIndex::search_within`] が
-    /// `visible_ids`（呼び出し元の可視集合）から該当文書へ `O(log n)` で辿るために使う
+    /// `visible_ids`（呼び出し元の可視集合）から該当文書へ `O(1)` で辿るために使う
     /// （Issue #36 codex-review P0 指摘対応。`docs` は構築時の入力順であり `doc_id` で
     /// ソートされていないため、この逆引きマップなしでは可視集合ごとに線形走査が
     /// 必要になる）。値は構築時に自分自身が割り当てた `docs` のインデックスのみを
     /// 保持するため、`search_within` からの参照は常に範囲内である。
-    id_index: BTreeMap<DocId, usize>,
+    id_index: HashMap<DocId, usize>,
+    /// [`TermId`] を添字とする転置索引（posting list。Issue #389・親 Issue #386）。
+    /// `postings[t]` は `TermId(t)` が出現する文書の `(doc_idx, tf)` の並びであり、
+    /// `doc_idx` 昇順・重複なしを構築時（[`SparseIndex::with_params`]）に保証する
+    /// （ソートは行わず、文書を `doc_idx` 昇順に処理する構築順序自体がこの不変条件を
+    /// 満たす）。`doc_idx` は `docs`/`doc_len`/`doc_ids` の添字と対応する。
+    /// `search`/`search_within` は本 Issue では未参照（残置。#390 でクエリ語の
+    /// posting だけを辿る 1 パス方式へ切り替える際の下準備。可視集合への縮約は
+    /// #390 側で可視ビットマップにより維持する契約とする。SEARCH-1, SEARCH-3）。
+    /// 不変条件は `postings.len() == doc_freq.len() == terms.ids.len()`・
+    /// 各 `t` について `postings[t].len() == doc_freq[t] as usize`。
+    postings: Vec<Vec<(u32, u32)>>,
+    /// `doc_idx` 添字の文書長配列（`docs[i].doc_len` の写し。Issue #389）。
+    /// `postings` 走査時に `docs[doc_idx]` へのランダムアクセス・二分探索を経ずに
+    /// 文書長正規化項（BM25 の `|d| / avgdl`）を得られるようにするための下準備で、
+    /// 本 Issue では未参照（#390 で使用）。
+    doc_len: Vec<u32>,
+    /// `doc_idx` 添字の `DocId` 配列（`docs[i].doc_id` の写し。Issue #389）。
+    /// `postings` 走査結果（`doc_idx`）からスコア出力の `DocId` へ戻すための下準備で、
+    /// 本 Issue では未参照（#390 で使用）。
+    doc_ids: Vec<DocId>,
 }
+
+// `doc_idx`（`docs`/`doc_len`/`doc_ids`/`postings` 内側要素の添字）を `u32` で
+// 表現する前提の静的検査（Issue #389）。[`MAX_CORPUS_DOCS`] が `u32::MAX` を
+// 超えないことをコンパイル時に固定し、実行時の `doc_idx` 変換（`with_params` 内
+// `u32::try_from`）が理論上失敗しないことの根拠とする。
+const _: () = assert!(MAX_CORPUS_DOCS <= u32::MAX as usize);
 
 impl SparseIndex {
     /// Okapi BM25 の既定パラメータ（`k1 = 1.2`, `b = 0.75`）でインデックスを構築する。
@@ -623,13 +649,23 @@ impl SparseIndex {
             });
         }
 
-        let mut seen_ids: BTreeMap<DocId, ()> = BTreeMap::new();
         let mut entries: Vec<DocEntry> = Vec::with_capacity(docs.len());
-        let mut id_index: BTreeMap<DocId, usize> = BTreeMap::new();
+        // `DocId` → `entries` インデックスの逆引き（Issue #389: `HashMap` 化）。
+        // 従来の重複検査専用 `seen_ids: BTreeMap<DocId, ()>` を統合し、重複判定と
+        // 逆引き構築を 1 マップで兼ねる（`O(1)` 化・マップ 1 本削減）。挿入時に
+        // 既存キーがあれば重複 `DocId` として拒否する（判定順序は従来どおり最優先）。
+        let mut id_index: HashMap<DocId, usize> = HashMap::with_capacity(docs.len());
         let mut terms = TermDictionary::default();
         // [`TermId`] を添字とする df。`terms.intern()` が新語を採番するたびに `push(0)`
         // して `terms.len()` と長さを同期させる（Issue #388・term インターニング）。
         let mut doc_freq: Vec<u32> = Vec::new();
+        // [`TermId`] を添字とする posting list（Issue #389）。`doc_freq` と同じ
+        // タイミング（新語 intern 時）で `push(Vec::new())` し長さを同期させる。
+        let mut postings: Vec<Vec<(u32, u32)>> = Vec::new();
+        // `doc_idx` 添字の文書長・`DocId` 配列（Issue #389）。`entries` と同時に push
+        // するため長さは常に `entries.len()` と一致する。
+        let mut doc_len_by_idx: Vec<u32> = Vec::with_capacity(docs.len());
+        let mut doc_ids_by_idx: Vec<DocId> = Vec::with_capacity(docs.len());
         let mut total_len: u64 = 0;
         // コーパス全体のバイト長累計。`saturating_add` によりオーバーフロー時は
         // `usize::MAX` へ飽和させる（この桁数の入力は現実的に想定しないが、
@@ -642,7 +678,11 @@ impl SparseIndex {
         let mut corpus_tokens_seen: usize = 0;
 
         for &(doc_id, text) in docs {
-            if seen_ids.insert(doc_id, ()).is_some() {
+            // `entries.len()` は現在の文書に割り当てる `doc_idx`。挿入前に確定させる
+            // ことで、これから push する `entries`/`doc_len_by_idx`/`doc_ids_by_idx`
+            // すべてに対応する添字を一貫して使える（Issue #389）。
+            let doc_idx = entries.len();
+            if id_index.insert(doc_id, doc_idx).is_some() {
                 return Err(SparseError::DuplicateDocId(doc_id));
             }
             if text.len() > MAX_DOC_BYTES {
@@ -680,12 +720,14 @@ impl SparseIndex {
 
             // 各トークンを辞書へ intern する（`String` の所有権を辞書へ move。
             // 既知語はヒープ確保なしで既存 `TermId` を返す）。新語が採番されるたびに
-            // `doc_freq` を `terms.len()` と同じ長さまで `push(0)` して同期させる。
+            // `doc_freq`／`postings` を `terms.len()` と同じ長さまで `push` して同期
+            // させる（Issue #389: `postings` は `doc_freq` と対で伸長する）。
             let mut ids: Vec<TermId> = Vec::with_capacity(doc_tokens.len());
             for tok in doc_tokens {
                 let id = terms.intern(tok)?;
                 if id.0 as usize >= doc_freq.len() {
                     doc_freq.push(0);
+                    postings.push(Vec::new());
                 }
                 ids.push(id);
             }
@@ -716,15 +758,36 @@ impl SparseIndex {
             // 必要以上に早める。実使用長まで縮めて解放する。
             term_freq.shrink_to_fit();
 
-            // `id_index` は自分がこれから push する要素自身のインデックスのみを記録する
-            // ため、値は常に `entries` の範囲内になる（範囲外を指す不変条件違反は
-            // 構造的に起こり得ない）。
-            id_index.insert(doc_id, entries.len());
+            // `doc_idx` は [`MAX_CORPUS_DOCS`] 以下（関数冒頭で検証済み）であり、
+            // モジュール直下の `const _` 静的アサーションにより `MAX_CORPUS_DOCS` は
+            // 常に `u32::MAX` 以下なので、この変換は理論上失敗しない。それでも
+            // untrusted 入力由来の値を `unwrap`/`expect` で扱わない方針
+            // （`.claude/rules/coding-rust.md`）に従い `unwrap_or` で飽和させる。
+            let doc_idx_u32 = u32::try_from(doc_idx).unwrap_or(u32::MAX);
+            // `term_freq` 確定後の文書は `doc_idx` 昇順に処理されるため、各
+            // `postings[t]` へは常に `docs[doc_idx].doc_id` の位置を末尾 append する
+            // だけで `doc_idx` 昇順・重複なし（同一文書は同一語を高々 1 回登録）を
+            // 保つ（Issue #389・ソート不要な順序構築）。
+            for &(id, tf) in &term_freq {
+                if let Some(list) = postings.get_mut(id.0 as usize) {
+                    list.push((doc_idx_u32, tf));
+                }
+            }
+
+            doc_len_by_idx.push(doc_len);
+            doc_ids_by_idx.push(doc_id);
             entries.push(DocEntry {
                 doc_id,
                 term_freq,
                 doc_len,
             });
+        }
+
+        // 語彙数分の `postings[t]` は `term_freq` と同じ理由（コメント参照）で成長
+        // 余剰容量を持ち得るため、`approx_heap_bytes()` の過大評価を避けるため
+        // 実使用長まで縮めて解放する（Issue #389）。
+        for list in &mut postings {
+            list.shrink_to_fit();
         }
 
         // `entries.len() == docs.len()` であり、`docs.is_empty()` は関数冒頭で拒否済みの
@@ -741,6 +804,9 @@ impl SparseIndex {
             terms,
             doc_freq,
             id_index,
+            postings,
+            doc_len: doc_len_by_idx,
+            doc_ids: doc_ids_by_idx,
         })
     }
 
@@ -1044,36 +1110,30 @@ impl SparseIndex {
         Ok(scored)
     }
 
-    /// `BTreeMap`/`Vec` の 1 エントリあたりのアロケータ管理領域・ノードポインタ分の
-    /// 概算オーバーヘッド（Issue #357 レビュー指摘対応・codex-review P1:
+    /// `HashMap` の 1 エントリあたりのアロケータ管理領域・制御バイト分の概算
+    /// オーバーヘッド（Issue #357 レビュー指摘対応・codex-review P1:
     /// [`Self::approx_heap_bytes`] が文字列長・キー/値サイズしか加算せず
     /// `MAX_SPARSE_CACHE_TOTAL_BYTES` の DoS 防御を過少計上で回避できた問題への
-    /// 対応。実際の `BTreeMap` B-tree ノードは複数エントリを 1 ブロックへまとめて
-    /// 確保するため実測値はこれより小さくなり得るが、本関数はそもそも「厳密な
-    /// メモリ計測ではなく DoS 対策のための粗い上限判定用」（下記コメント）の
-    /// ため、実確保量を下回らないよう安全側に保守的な固定値を使う）。
-    const BTREE_ENTRY_OVERHEAD_BYTES: usize = 48;
-
-    /// `HashMap`（[`TermDictionary`]）の 1 エントリあたりの概算オーバーヘッド
-    /// （Issue #388・term インターニング）。[`Self::BTREE_ENTRY_OVERHEAD_BYTES`] と
-    /// 同じ位置づけ（厳密な計測ではなく DoS 対策の粗い上限判定用の保守的固定値）。
-    /// `HashMap` は制御バイト＋ロードファクタ（7/8）による容量余裕を持つため、
-    /// `BTreeMap` のノードオーバーヘッドと同水準の固定値を割り当てても実確保量を
-    /// 下回らない側に倒れる。
+    /// 対応。本関数はそもそも「厳密なメモリ計測ではなく DoS 対策のための粗い
+    /// 上限判定用」（下記コメント）のため、実確保量を下回らないよう安全側に
+    /// 保守的な固定値を使う。`terms`（[`TermDictionary`]）・`id_index`
+    /// （Issue #389 で `BTreeMap` から `HashMap` へ置換）双方の `HashMap` に
+    /// 共用する）。
     const HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 48;
 
     /// この `SparseIndex` が保持するヒープ確保分の概算バイト量（Issue #357・
     /// `sql/sparse_cache.rs::SparseIndexCache` の容量判定用）。`dictionary.rs::
     /// Dictionary::approx_heap_bytes` と同じ「厳密なメモリ計測ではなく DoS 対策の
-    /// ための粗い上限判定用」という位置づけの概算。Issue #388（term インターニング）
-    /// で構造が `String` キーの木から `TermId` キーの構造へ変わったことに合わせて
-    /// 再計上した: `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() *
-    /// size_of::<DocEntry>()`〕＋各文書の `term_freq: Vec<(TermId, u32)>` の確保領域）・
-    /// `terms`（辞書に保持する `String` 語彙のキー容量＋`HashMap` のエントリ・
-    /// 容量余裕分）・`doc_freq`（`Vec<u32>` の確保領域）・`id_index`（`DocId` →
-    /// `usize` のエントリ分＋ノードオーバーヘッド分）。`String` は `len()` ではなく
-    /// `capacity()` を使う（成長により確保容量が長さを上回り得るため、下回らない側の
-    /// 概算にする）。
+    /// ための粗い上限判定用」という位置づけの概算。Issue #389（転置索引・`doc_len`／
+    /// `doc_ids` 配列の追加、`id_index` の `HashMap` 化）で以下を再計上した:
+    /// `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() * size_of::<DocEntry>()`〕
+    /// ＋各文書の `term_freq: Vec<(TermId, u32)>` の確保領域）・`terms`（辞書に保持
+    /// する `String` 語彙のキー容量＋`HashMap` のエントリ・容量余裕分）・`doc_freq`
+    /// （`Vec<u32>` の確保領域）・`postings`（外側 `Vec<Vec<_>>` の確保領域＋各内側
+    /// `Vec<(u32, u32)>` の確保領域）・`doc_len`／`doc_ids`（各 `Vec` の確保領域）・
+    /// `id_index`（`HashMap` のエントリ分＋容量余裕分。`terms` と同じ算出方式）。
+    /// `String` は `len()` ではなく `capacity()` を使う（成長により確保容量が長さを
+    /// 上回り得るため、下回らない側の概算にする）。
     pub fn approx_heap_bytes(&self) -> usize {
         let docs_container = self
             .docs
@@ -1112,11 +1172,47 @@ impl SparseIndex {
             .doc_freq
             .capacity()
             .saturating_mul(std::mem::size_of::<u32>());
-        let id_index: usize = self.id_index.len().saturating_mul(
-            std::mem::size_of::<(DocId, usize)>().saturating_add(Self::BTREE_ENTRY_OVERHEAD_BYTES),
+        // `postings` 外側 `Vec` の確保領域＋各内側 `Vec<(u32, u32)>` の確保領域
+        // （Issue #389）。内側 `Vec` は build 時に `shrink_to_fit()` 済みだが、
+        // 容量ベースで数える方針（下回らない側の概算）を他フィールドと統一する。
+        let postings_outer = self
+            .postings
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<(u32, u32)>>());
+        let postings_inner: usize = self
+            .postings
+            .iter()
+            .map(|list| {
+                list.capacity()
+                    .saturating_mul(std::mem::size_of::<(u32, u32)>())
+            })
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        let postings = postings_outer.saturating_add(postings_inner);
+        let doc_len: usize = self
+            .doc_len
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
+        let doc_ids: usize = self
+            .doc_ids
+            .capacity()
+            .saturating_mul(std::mem::size_of::<DocId>());
+        // `id_index`（`HashMap`）は `terms.ids` と同じ算出方式（要素分＋容量分）。
+        // キー・値は固定長（`String` のようなヒープ間接参照を持たない）ため
+        // 要素分はエントリサイズ＋オーバーヘッドの単純積で足りる。
+        let id_index_entries: usize = self.id_index.len().saturating_mul(
+            std::mem::size_of::<(DocId, usize)>()
+                .saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
         );
+        let id_index_table = self
+            .id_index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(DocId, usize)>().saturating_add(1));
+        let id_index = id_index_entries.saturating_add(id_index_table);
         docs.saturating_add(terms)
             .saturating_add(doc_freq)
+            .saturating_add(postings)
+            .saturating_add(doc_len)
+            .saturating_add(doc_ids)
             .saturating_add(id_index)
     }
 }
@@ -1954,6 +2050,169 @@ mod tests {
         assert_eq!(idx.doc_freq[beta.0 as usize], 2);
         assert_eq!(idx.doc_freq[gamma.0 as usize], 2);
         assert_eq!(idx.doc_freq[delta.0 as usize], 1);
+    }
+
+    // --- 転置索引（posting list）・doc_len／doc_ids 配列（Issue #389） ---
+
+    /// 決定的 LCG（線形合同法）で ASCII・CJK・繰り返し語・記号のみ文書を混ぜた
+    /// コーパスを生成する（テスト専用。乱数源は固定シードで再現性を持つ）。
+    fn generate_mixed_corpus(n: usize) -> Vec<(DocId, String)> {
+        let ascii_words = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let cjk_words = ["検索", "東京都", "評価"];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            // 標準的な LCG パラメータ（Numerical Recipes）。テスト専用の決定的
+            // 疑似乱数であり暗号用途ではない。
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        (0..n)
+            .map(|i| {
+                let doc_id = i as u64;
+                let text = match i % 4 {
+                    0 => {
+                        // ASCII 語を複数回・複数語混ぜる（重複語の圧縮経路を通す）。
+                        let a = ascii_words[(next() as usize) % ascii_words.len()];
+                        let b = ascii_words[(next() as usize) % ascii_words.len()];
+                        format!("{a} {a} {b}")
+                    }
+                    1 => {
+                        // CJK 語（ユニグラム＋バイグラム展開経路を通す）。
+                        let w = cjk_words[(next() as usize) % cjk_words.len()];
+                        w.to_string()
+                    }
+                    2 => {
+                        // 記号のみ（トークンなし文書）。
+                        "!!! ???".to_string()
+                    }
+                    _ => {
+                        // ASCII と CJK の混在。
+                        let a = ascii_words[(next() as usize) % ascii_words.len()];
+                        let w = cjk_words[(next() as usize) % cjk_words.len()];
+                        format!("{a}{w}")
+                    }
+                };
+                (doc_id, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn postings_len_equals_dictionary_and_doc_freq_len() {
+        let corpus = generate_mixed_corpus(300);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        assert_eq!(idx.postings.len(), idx.doc_freq.len());
+        assert_eq!(idx.postings.len(), idx.terms.ids.len());
+    }
+
+    #[test]
+    fn postings_are_sorted_by_doc_idx_ascending_without_duplicates() {
+        let corpus = generate_mixed_corpus(300);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        for list in &idx.postings {
+            let doc_idxs: Vec<u32> = list.iter().map(|&(doc_idx, _)| doc_idx).collect();
+            let mut sorted = doc_idxs.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(
+                doc_idxs, sorted,
+                "posting list は doc_idx 昇順ソート済み・重複なしという不変条件を持つ"
+            );
+        }
+    }
+
+    #[test]
+    fn postings_reconstruct_tf_and_df_matching_doc_entry_for_all_docs() {
+        let corpus = generate_mixed_corpus(400);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        // 総 posting 数 == Σ 各文書の term_freq.len()（双方向の突合の前提）。
+        let total_postings: usize = idx.postings.iter().map(std::vec::Vec::len).sum();
+        let total_term_freq_entries: usize = idx.docs.iter().map(|d| d.term_freq.len()).sum();
+        assert_eq!(total_postings, total_term_freq_entries);
+
+        for (term_id, list) in idx.postings.iter().enumerate() {
+            let term_id = TermId(term_id as u32);
+            // df との一致。
+            assert_eq!(
+                list.len(),
+                idx.doc_freq[term_id.0 as usize] as usize,
+                "postings[{}].len() は doc_freq[{}] と一致する",
+                term_id.0,
+                term_id.0
+            );
+            // postings → DocEntry 方向: 全 (doc_idx, tf) が該当文書の freq() と一致。
+            for &(doc_idx, tf) in list {
+                let doc = &idx.docs[doc_idx as usize];
+                assert_eq!(
+                    doc.freq(term_id),
+                    Some(tf),
+                    "postings[{}] の (doc_idx={}, tf={}) は docs[{}].freq() と一致する",
+                    term_id.0,
+                    doc_idx,
+                    tf,
+                    doc_idx
+                );
+            }
+        }
+        // DocEntry → postings 方向: 全文書の term_freq が対応する postings 内に
+        // (doc_idx, tf) として存在する。
+        for (doc_idx, doc) in idx.docs.iter().enumerate() {
+            let doc_idx_u32 = doc_idx as u32;
+            for &(term_id, tf) in &doc.term_freq {
+                let list = &idx.postings[term_id.0 as usize];
+                assert!(
+                    list.contains(&(doc_idx_u32, tf)),
+                    "docs[{doc_idx}].term_freq の ({term_id:?}, {tf}) は postings 内に存在する"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doc_len_and_doc_ids_arrays_mirror_doc_entries() {
+        let corpus = generate_mixed_corpus(200);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        assert_eq!(idx.doc_len.len(), idx.docs.len());
+        assert_eq!(idx.doc_ids.len(), idx.docs.len());
+        for (i, doc) in idx.docs.iter().enumerate() {
+            assert_eq!(idx.doc_len[i], doc.doc_len);
+            assert_eq!(idx.doc_ids[i], doc.doc_id);
+        }
+    }
+
+    #[test]
+    fn id_index_maps_every_doc_id_to_its_position() {
+        let corpus = generate_mixed_corpus(200);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        assert_eq!(idx.id_index.len(), idx.docs.len());
+        for (i, doc) in idx.docs.iter().enumerate() {
+            assert_eq!(idx.id_index.get(&doc.doc_id), Some(&i));
+        }
+    }
+
+    #[test]
+    fn approx_heap_bytes_accounts_postings_and_doc_arrays() {
+        // 同一語彙で文書数を増やすと、postings/doc_len/doc_ids 分の増加により
+        // approx_heap_bytes は単調増加する（Issue #389）。
+        let small: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
+        let large: Vec<(DocId, &str)> = vec![
+            (1, "alpha beta"),
+            (2, "beta gamma"),
+            (3, "alpha gamma"),
+            (4, "beta delta"),
+            (5, "gamma delta"),
+        ];
+        let idx_small = SparseIndex::build(&small).unwrap();
+        let idx_large = SparseIndex::build(&large).unwrap();
+        assert!(idx_large.approx_heap_bytes() > idx_small.approx_heap_bytes());
     }
 
     #[test]

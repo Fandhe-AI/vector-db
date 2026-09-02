@@ -485,3 +485,107 @@ sparse_refetch_observed` 経由の実観測）は基線と完全に一致した
   後続）への示唆」の優先順位付けを変えるものではない（転置索引化は
   `search_within` 単体のアルゴリズム的な計算量を変える話であり、本 Issue
   の定数倍改善とは独立に効果が見込まれる）
+
+## Issue #389: posting list・doc_len／doc_ids 配列追加後の build・常駐メモリ実測
+
+親 Issue #386（転置索引化）Phase 1 の 3 番目のタスクとして、`SparseIndex`
+（`crates/engine/src/sparse.rs`）へ `TermId` 添字の転置索引
+（`postings: Vec<Vec<(u32, u32)>>`）・`doc_idx` 添字の `doc_len`／`doc_ids`
+配列を追加し、`id_index` を `BTreeMap` から `HashMap` へ置換した。文書を
+`doc_idx` 昇順に処理する構築順序自体が posting list の
+「`doc_idx` 昇順・重複なし」不変条件を満たすため、ソートは不要（`with_params`
+内でランレングス圧縮済みの `term_freq` を 1 回走査して各 `postings[t]` へ
+`append` するのみ）。`search`／`search_within` は本 Issue では未参照のまま
+残置し（撤去・経路切替は #390）、公開 API のシグネチャ・契約・スコアの
+ビット一致は不変（`search_score_is_bit_identical_to_reference_btreemap_
+implementation` 等の既存参照実装比較テストが green のまま）。
+
+### 測定条件
+
+- 測定環境・コーパス・クエリ集合・プロトコルは Issue #356・#387・#388 と
+  同一（25,000 行・dim 128・単一テナント・全行 `Visibility::Public`・
+  `MeasurementConfig::new(20, 30, SEED)`）。非専有環境（並行エージェントあり）
+  での 1 回実測であり、Issue #388 の実測値を参考基線として扱う（厳密な
+  同一マシン・同一時刻での前後比較ではない）
+- ベンチ起動時の忠実性検証（`fidelity checks passed ...`）は本 Issue の
+  変更後も通過している
+
+### 実測結果
+
+| 指標 | Issue #388（参考基線） | 本実測 |
+| ---- | ----------------------: | -----: |
+| `sparse_build_total` median | 50.1ms | 48.1ms（ノイズ帯内。転置索引構築分の増加は測定誤差に埋もれる規模） |
+| `sparse_build_total` p95 | — | 49.5ms |
+
+| 指標（新規計測。Issue #389） | 実測値 |
+| ---- | -----: |
+| `approx_heap_bytes()`（`SparseIndex` 保持時） | 19,553,564 バイト（約 18.65 MiB） |
+| `vm_rss_kb_before` → `vm_rss_kb_after`（`SparseIndex::build` 1 回分の直前直後） | 23,416 kB → 43,928 kB（差分 20,512 kB。約 20.03 MiB） |
+| `vm_hwm_kb`（測定時点までのピーク RSS） | 43,928 kB |
+
+RSS 計測は、プロセス内でこの 1 回が最初かつ唯一の `SparseIndex::build`
+呼び出しになる位置へ置いている（codex-review 指摘・Cursor Bugbot 指摘・
+PR #424。当初は複製実装の構造的整合性チェック〔`build_actually_
+succeeds`〕を別途 `SparseIndex::build` して破棄する形で RSS 計測の直前に
+残しており、その確保・解放でアロケータ／ページがウォームになって、
+続く RSS 計測が「未ウォーム状態からの増分」にならず過小評価していた
+（後述の旧実測値）。整合性チェックの目的〔複製実装の転記ミスで build
+自体が失敗する入力を検出する〕は「同一入力で `SparseIndex::build` が
+成功するか」の確認に尽きるため、RSS 計測用に構築するインデックスの
+`is_ok()` をそのままその判定に使う形へ統合し、二重構築を無くした。
+これにより `core.execute_sql` 未呼び出し〔`sql/sparse_cache.rs::
+SparseIndexCache`（Issue #357）経由の構築機会も無い〕に加えて、コーパス
+生成後の `SparseIndex::build` としても最初の 1 回になっている）。
+
+### 解釈
+
+- `sparse_build_total` は Issue #388 実測（50.1ms）とノイズ帯内で同水準
+  （48.1ms）であり、posting list・`doc_len`／`doc_ids` 配列の構築（ランレングス
+  圧縮済み `term_freq` を 1 回追加走査するだけの線形処理）が build 全体の
+  所要時間へ与える影響は、本測定の分解能では有意な劣化として観測されな
+  かった
+- RSS 差分は 20,512 kB（約 20.03 MiB）であり、`approx_heap_bytes()`
+  （約 18.65 MiB）と近い水準まで一致した。修正前は事前ウォームアップの
+  影響で RSS 差分が 4,408 kB（約 4.31 MiB）と大きく過小評価されていたが
+  （上記「RSS 計測」節参照）、二重構築を解消したことで
+  `approx_heap_bytes()` の概算（実確保量を下回らない側に倒す設計。
+  `approx_heap_bytes` のドキュメンテーションコメント参照）との差が
+  実装の付随確保分（`HashMap`／`Vec` の予約容量の余剰等）相当の範囲に
+  収まった。なお RSS 増分は「その時点でのプロセス全体に対する新規
+  ページイン量」であり `approx_heap_bytes()` とは厳密には異なる量を
+  指すため、コーパス生成（`generate_corpus`。25,000 件の本文・ベクトル
+  生成）や一時 DB オープン等の先行処理が確保したページの再利用分が
+  含まれていない保証はない。真に隔離された増分（他の処理を一切行わない、
+  プロセス起動直後の 1 回の `SparseIndex::build` 前後の RSS 差分）を
+  見たい場合は、この計測点のみを単独プロセスで実行する運用
+  （`BENCH_CORE16_DIAG` 系の「1 プロセス = 1 規模点」運用と同様の方針）が
+  必要であり、これは今回のスコープでは実施していない（オーナー・運用者
+  への申し送り）
+- 受け入れ条件 5「メモリ増分を `bench-hybrid-profile` の RSS で記録する」は
+  上記のとおり記録した
+
+### 受け入れ条件との対応
+
+1. posting list（`doc_idx` 昇順・順序構築）・`doc_len`・`doc_ids` を
+   `SparseIndex` へ追加し、`DocEntry` は残置した（3.1〜3.2 節。実装は
+   `crates/engine/src/sparse.rs`）
+2. `id_index` を `HashMap<DocId, usize>` へ置換した
+3. 単体テスト（`postings_reconstruct_tf_and_df_matching_doc_entry_for_
+   all_docs` 等）で posting list から復元した tf／df が `DocEntry` 経由の
+   値と全件一致することを固定した
+4. 既存テスト（`cargo test -p engine --all-features`）は green・依存追加
+   なし
+5. メモリ増分を `bench-hybrid-profile` の RSS で記録した（上表。解釈欄の
+   限界も含めて記録）
+
+### 申し送り
+
+- `search`／`search_within` の posting 走査化・`docs: Vec<DocEntry>` の
+  撤去は #390 のスコープ
+- `postings` の CSR 形（単一 `Vec` ＋ offsets）や量子化・skip list への
+  圧縮は #391 以降・#394 の判断材料
+- `harness/hybrid_profile.rs::ProfileSparseIndex`・build 3 段複製は
+  Issue #388 からの申し送りどおり旧構造（`BTreeMap<String,u32>`）の参照
+  実装のまま据え置いた（本 Issue でも変更していない）
+- 専有環境での再実測・真に隔離された RSS 増分の単独プロセス実測は
+  オーナー／運用者判断で別途実施する
