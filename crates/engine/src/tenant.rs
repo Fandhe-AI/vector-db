@@ -522,6 +522,10 @@ pub(crate) fn insert_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
+        // エンコードは 1 回のみ（Issue #397）: 以前は台帳ハッシュ計算用と redb 書き込み用で
+        // それぞれ `encode_row` していた二重実行を排除し、ここで計算した結果を
+        // `content_hash::for_insert_encoded` と `insert_unique_row` の双方で共有する。
+        let encoded = encode_row(row)?;
         // 台帳照合用ハッシュ（TASK-101・RECOVER-10）はクライアント要求由来の内容
         // （id・行データ）のみから計算する（DB 状態に依存しない決定性の担保。
         // `content_hash` モジュールドキュメント参照）。同一 write トランザクション内で
@@ -530,7 +534,7 @@ pub(crate) fn insert_row_unchecked(
         // 行の書き込みへ進まず、この後 `write_txn` が commit されない（呼び出し元の `?`
         // で早期 return → drop）ため台帳追記も破棄され、部分書き込みが残らない
         // （fail-closed。TASK-94・RECOVER-3 の原子性契約を包含する）。
-        let content_hash = content_hash::for_insert(id, row)?;
+        let content_hash = content_hash::for_insert_encoded(id, &encoded)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -544,7 +548,6 @@ pub(crate) fn insert_row_unchecked(
             .map_err(map_row_table_error)?;
         // 物理キーはサーバー側導出テナントで名前空間化する（TABLE-12・RLS-9）。
         let key = (ctx.tenant_id(), id);
-        let encoded = encode_row(row)?;
         insert_unique_row(&mut row_table, key, encoded.as_slice())?;
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -631,12 +634,70 @@ pub(crate) fn insert_rows_unchecked(
             drop(write_txn);
             return Ok(());
         }
+        // エンコードは行ごとに 1 回のみ（Issue #397）: 台帳ハッシュ計算用
+        // （`content_hash::for_insert_batch` 内部）と redb 書き込み用で
+        // `encode_row` を二重実行しない。要求記載順のまま事前に全行をエンコードし、
+        // その結果をハッシュ計算・行書き込みの双方で共有する。
+        //
+        // 1 バッチ 1 バッファ（Issue #398）: 行数分の `Vec<u8>` 確保
+        // （`encoded_rows: Vec<Vec<u8>>`）を、連続 arena（`arena: Vec<u8>`）＋
+        // 各行の範囲表（`ranges: Vec<Range<usize>>`）へ置換する。総サイズは
+        // `encoded_row_len` で事前に `checked_add` 積算し `try_reserve_exact` で
+        // 1 回だけ確保する（無制限 `with_capacity` を使わない。coding-rust.md）。
+        // 範囲は `encode_row_into` 呼び出し前後の `arena.len()` から機械的に
+        // 導出するため、行の取り違え（別行のバイト列を書き込む事故）は起きない。
+        //
+        // エンコードの失敗（tenant 空・上限超過等）は、以前 `for_insert_batch` が
+        // 行ごとに `encode_row` していた際と同じ要求記載順で最初に発生するため、
+        // どの行が最初に失敗するか・エラー種別は変更前と同一になる（サイズ計算
+        // 段階の `encoded_row_len` も `encode_row_into` と同一の検証条件を使う
+        // ため、事前積算でも失敗する行・エラー種別は変わらない）。
+        let mut total_len: usize = 0;
+        for (_, row) in rows {
+            let len = crate::storage::encoded_row_len(row)?;
+            total_len = total_len.checked_add(len).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encoded length overflow".to_string(),
+                ))
+            })?;
+        }
+        let mut arena: Vec<u8> = Vec::new();
+        arena.try_reserve_exact(total_len).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch encode buffer".to_string(),
+            ))
+        })?;
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        ranges.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch range table".to_string(),
+            ))
+        })?;
+        for (_, row) in rows {
+            let start = arena.len();
+            crate::storage::encode_row_into(&mut arena, row)?;
+            ranges.push(start..arena.len());
+        }
         // バッチ全体で 1 ハッシュ（TASK-101・RECOVER-10。`content_hash` モジュール
         // ドキュメント参照。要求記載順を含めて連結する）。`Err` の場合は行の書き込みへ
         // 進まず、この後 `write_txn` が commit されない（呼び出し元の `?` で早期
         // return → drop）ため台帳追記も破棄され、部分書き込みが残らない（fail-closed。
         // TASK-94・RECOVER-3 の原子性契約を包含する）。
-        let content_hash = content_hash::for_insert_batch(rows)?;
+        let mut hash_input: Vec<(u64, &[u8])> = Vec::new();
+        hash_input.try_reserve_exact(rows.len()).map_err(|_| {
+            TenantWriteError::Storage(StorageError::Codec(
+                "failed to reserve batch hash input".to_string(),
+            ))
+        })?;
+        for ((id, _), range) in rows.iter().zip(ranges.iter()) {
+            let encoded = arena.get(range.clone()).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encode arena range out of bounds".to_string(),
+                ))
+            })?;
+            hash_input.push((*id, encoded));
+        }
+        let content_hash = content_hash::for_insert_batch_encoded(&hash_input)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -648,11 +709,15 @@ pub(crate) fn insert_rows_unchecked(
         let mut row_table = write_txn
             .open_table(user_rows_table_def(&row_table_name))
             .map_err(map_row_table_error)?;
-        for (id, row) in rows {
+        for ((id, row), range) in rows.iter().zip(ranges.iter()) {
             schema.validate_embedding_dim(row.embedding.len())?;
             let key = (ctx.tenant_id(), *id);
-            let encoded = encode_row(row)?;
-            insert_unique_row(&mut row_table, key, encoded.as_slice())?;
+            let encoded = arena.get(range.clone()).ok_or_else(|| {
+                TenantWriteError::Storage(StorageError::Codec(
+                    "batch encode arena range out of bounds".to_string(),
+                ))
+            })?;
+            insert_unique_row(&mut row_table, key, encoded)?;
         }
     }
     crate::catalog::bump_table_generation_in_txn(&write_txn, table)?;
@@ -827,7 +892,13 @@ pub(crate) fn update_row_unchecked(
     {
         let schema = require_table_schema_write(&write_txn, table)?;
         schema.validate_embedding_dim(row.embedding.len())?;
-        let content_hash = content_hash::for_update(id, row)?;
+        // エンコードは 1 回のみ（Issue #397）: `for_update` が内部で `encode_row` し、
+        // 書き込み側で同じ行をもう一度 `encode_row` していた二重実行を排除する。
+        // ここでの `encode_row` は変更前も `owns_existing` 判定より前（台帳ハッシュ
+        // 計算の内部）で無条件に走っていたため、この位置へ移してもエラー優先順位
+        // （`encode_row` のエラー → 台帳の内容照合 → `NotFound`）は変わらない。
+        let encoded = encode_row(row)?;
+        let content_hash = content_hash::for_update_encoded(id, &encoded)?;
         ledger::record_in_txn(
             &write_txn,
             ctx.tenant_id(),
@@ -858,7 +929,6 @@ pub(crate) fn update_row_unchecked(
         if !owns_existing {
             return Err(TenantWriteError::NotFound);
         }
-        let encoded = encode_row(row)?;
         row_table
             .insert(key, encoded.as_slice())
             .map_err(CatalogError::from)?;
@@ -1177,6 +1247,13 @@ pub(crate) fn replace_typed_rows_by_text_key(
                 .map_err(CatalogError::from)?;
         }
 
+        // clear 再利用の 1 面スクラッチ（Issue #398）: 行ごとの `encode_row`
+        // （`Vec<u8>` 新規確保）を避け、`scratch.clear()` → `encode_row_into` で
+        // 同一バッファへ追記する。この経路（`execute_insert_sql_batch`）の台帳
+        // ハッシュ `for_replace_by_text_key` はエンコード済みバイト列を使わないため、
+        // `insert_rows_unchecked`（Issue #398）の連続 arena は不要（ハッシュ計算
+        // 完了後の行ループでのみエンコードすれば足りる）。
+        let mut scratch: Vec<u8> = Vec::new();
         let mut next_id = max_id.map_or(Ok(0u64), |m| {
             m.checked_add(1).ok_or_else(|| {
                 TenantWriteError::Catalog(CatalogError::Invalid(
@@ -1211,9 +1288,10 @@ pub(crate) fn replace_typed_rows_by_text_key(
             if row_table.get(&key).map_err(CatalogError::from)?.is_some() {
                 return Err(TenantWriteError::IdConflict);
             }
-            let encoded = encode_row(&row)?;
+            scratch.clear();
+            crate::storage::encode_row_into(&mut scratch, &row)?;
             row_table
-                .insert(key, encoded.as_slice())
+                .insert(key, scratch.as_slice())
                 .map_err(CatalogError::from)?;
             if first_id.is_none() {
                 first_id = Some(id);
@@ -2008,5 +2086,71 @@ mod tests {
              generation (same-table writes are not treated as unrelated)"
         );
         assert_eq!(read_gen("sibling"), sibling_gen);
+    }
+
+    // Issue #398: `insert_rows_unchecked` を連続 arena（`arena: Vec<u8>` ＋
+    // `ranges: Vec<Range<usize>>`）へ置換した際の最大リスクは「範囲の取り違え
+    // （別行のバイト列を書き込む・読み戻す）」であるため、metadata 長・
+    // visibility が行ごとに異なる複数行を投入し、読み戻した各行が投入した
+    // 値と一致することを機械的に検証する。
+    #[test]
+    fn insert_rows_batch_rows_round_trip_with_varying_lengths() {
+        let path = unique_db_path("insert-rows-batch-round-trip");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        storage.create_table(&schema("docs")).expect("create table");
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let metadatas: Vec<Vec<u8>> = (0..8u32).map(|i| vec![i as u8; (i as usize) * 3]).collect();
+        let visibilities = [
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+            Visibility::Public,
+            Visibility::Private,
+        ];
+        let embeddings: Vec<[f32; 2]> = (0..8).map(|i| [i as f32, -(i as f32)]).collect();
+
+        let rows: Vec<(u64, RowInput<'_>)> = (0..8u64)
+            .map(|i| {
+                (
+                    i,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: visibilities[i as usize],
+                        embedding: &embeddings[i as usize],
+                        metadata: &metadatas[i as usize],
+                    },
+                )
+            })
+            .collect();
+
+        insert_rows(
+            &storage,
+            "docs",
+            &ctx,
+            &rows,
+            &OperationId::parse("round-trip-batch").expect("valid operation_id"),
+        )
+        .expect("insert_rows batch");
+
+        for i in 0..8u64 {
+            let row = storage
+                .get_row_from_table("docs", "tenant-a", i)
+                .expect("row must exist");
+            assert_eq!(
+                row.visibility, visibilities[i as usize],
+                "row {i} visibility"
+            );
+            assert_eq!(
+                row.embedding,
+                embeddings[i as usize].to_vec(),
+                "row {i} embedding"
+            );
+            assert_eq!(row.metadata, metadatas[i as usize], "row {i} metadata");
+        }
     }
 }

@@ -7,8 +7,9 @@
 //! # 段の再実装（ドリフト対策）
 //!
 //! `insert_rows_unchecked`（`crates/engine/src/tenant.rs`）の内部段（`storage.rs::
-//! encode_row`・`recovery::content_hash::for_insert_batch`・`recovery::ledger::
-//! record_in_txn` の台帳エントリ符号化）はいずれも `pub(crate)` で、独立コンパイル
+//! encode_row`・`recovery::content_hash::for_insert_batch_encoded`（Issue #397 で
+//! 事前エンコード共有化）・`recovery::ledger::record_in_txn` の台帳エントリ符号化）は
+//! いずれも `pub(crate)` で、独立コンパイル
 //! 単位であるベンチからは呼べない（`knn_profile.rs` と同じ制約。`docs/design/
 //! ingest-stage-profile.md`「前提調査の要点」節参照）。本モジュールはこれらを
 //! `std` のみで再実装し、`tests/ingest_profile_accept.rs` が正本（`engine::storage::
@@ -117,6 +118,40 @@ pub fn parse_bounded_env(
     Ok(value)
 }
 
+/// I6（redb insert）段の A/B 計測モード（Issue #400）。`Insert` は既存の
+/// `Table::insert`（スクラッチ → ページコピー）、`Reserve` は redb 4.2.0
+/// `Table::insert_reserve`（`&[u8]` が `MutInPlaceValue` を実装済みのため
+/// `unsafe` 不要で呼べる）で予約した `AccessGuardMutInPlace::as_mut()` へ、
+/// I5 で作成済みのエンコード結果（`row_encoded`）をそのまま
+/// `copy_from_slice` で書き込む（計測範囲の訂正・codex-review 指摘・
+/// PR #420。訂正前は [`encode_row_reimpl_into_slice`] で予約済みバッファへ
+/// 再エンコードしており、`Insert` 側と処理範囲が揃わない二重エンコードに
+/// なっていた）。両モードとも I5 のエンコード結果（`row_encoded`）を
+/// 再利用する契約は不変。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertMode {
+    /// 既定。`Table::insert(key, encoded.as_slice())`。
+    Insert,
+    /// 試作。`Table::insert_reserve(key, encoded.len())` へ直接書き込む。
+    Reserve,
+}
+
+/// `BENCH_INGEST_PROFILE_INSERT_MODE` を解釈する（R2・fail-closed）。未設定は
+/// 既定 `Insert` へ倒す一方、空文字・大文字小文字違い・未知値は黙って既定へ
+/// フォールバックせず拒否する（`parse_bounded_env` と同じ untrusted 入力方針。
+/// coding-rust.md「untrusted 入力の扱い」）。
+pub fn parse_insert_mode(raw: Option<&str>) -> Result<InsertMode, IngestProfileError> {
+    match raw {
+        None => Ok(InsertMode::Insert),
+        Some("insert") => Ok(InsertMode::Insert),
+        Some("reserve") => Ok(InsertMode::Reserve),
+        Some(other) => Err(IngestProfileError::InvalidEnv {
+            name: "BENCH_INGEST_PROFILE_INSERT_MODE",
+            reason: format!("unknown insert mode: {other:?} (expected \"insert\" or \"reserve\")"),
+        }),
+    }
+}
+
 /// `storage.rs::encode_row` の行フォーマット v2 再実装（モジュール冒頭コメント
 /// 参照）。`storage.rs` と同じフィールド検証順序・エラー条件を踏襲する。
 pub fn encode_row_reimpl(
@@ -171,6 +206,88 @@ pub fn encode_row_reimpl(
     buf.extend_from_slice(&metadata_len.to_le_bytes());
     buf.extend_from_slice(metadata);
     Ok(buf)
+}
+
+/// [`encode_row_reimpl`] と同一の検証・フィールド順序を、呼び出し元が確保した
+/// 固定長スライス `dst` へ直接書き込む版（Issue #400。`Table::insert_reserve`
+/// が返す `AccessGuardMutInPlace::as_mut()` の書き込み先を模す）。`dst.len()`
+/// は事前に呼び出し元が算出した符号化後長（[`encode_row_reimpl`] が返す
+/// `Vec` の長さと同じ計算式）と一致していなければならず、不一致は `Err`
+/// にする（`unsafe` を使わず `get_mut` による範囲検証付きスライスで書く。
+/// coding-rust.md「受信データ経路での添字アクセス禁止」と同方針をベンチ内
+/// 再実装にも適用する）。
+pub fn encode_row_reimpl_into_slice(
+    dst: &mut [u8],
+    tenant_id: &str,
+    is_public: bool,
+    embedding: &[f32],
+    metadata: &[u8],
+) -> Result<(), IngestProfileError> {
+    if tenant_id.is_empty() {
+        return Err(IngestProfileError::Codec(
+            "tenant_id must not be empty".to_string(),
+        ));
+    }
+    let tenant_bytes = tenant_id.as_bytes();
+    let tenant_len = u16::try_from(tenant_bytes.len()).map_err(|_| {
+        IngestProfileError::Codec(format!("tenant_id too long: {} bytes", tenant_bytes.len()))
+    })?;
+    if tenant_len > MAX_REIMPL_TENANT_ID_LEN {
+        return Err(IngestProfileError::Codec(format!(
+            "tenant_id length {tenant_len} exceeds reimpl limit {MAX_REIMPL_TENANT_ID_LEN}"
+        )));
+    }
+    let dim = u32::try_from(embedding.len()).map_err(|_| {
+        IngestProfileError::Codec(format!("embedding dim too large: {}", embedding.len()))
+    })?;
+    if dim > MAX_REIMPL_DIM {
+        return Err(IngestProfileError::Codec(format!(
+            "embedding dim {dim} exceeds reimpl limit {MAX_REIMPL_DIM}"
+        )));
+    }
+    let metadata_len = u32::try_from(metadata.len()).map_err(|_| {
+        IngestProfileError::Codec(format!("metadata too large: {}", metadata.len()))
+    })?;
+    if metadata_len > MAX_REIMPL_METADATA_LEN {
+        return Err(IngestProfileError::Codec(format!(
+            "metadata length {metadata_len} exceeds reimpl limit {MAX_REIMPL_METADATA_LEN}"
+        )));
+    }
+
+    let expected_len =
+        1 + 2 + tenant_bytes.len() + 1 + 4 + embedding.len() * 4 + 4 + metadata.len();
+    if dst.len() != expected_len {
+        return Err(IngestProfileError::Codec(format!(
+            "dst length {} does not match encoded row length {expected_len}",
+            dst.len()
+        )));
+    }
+
+    let mut offset = 0usize;
+    let write =
+        |src: &[u8], dst: &mut [u8], offset: &mut usize| -> Result<(), IngestProfileError> {
+            let end = offset
+                .checked_add(src.len())
+                .ok_or_else(|| IngestProfileError::Codec("offset overflow".to_string()))?;
+            let slot = dst.get_mut(*offset..end).ok_or_else(|| {
+                IngestProfileError::Codec("dst slice out of bounds while encoding".to_string())
+            })?;
+            slot.copy_from_slice(src);
+            *offset = end;
+            Ok(())
+        };
+
+    write(&[2u8], dst, &mut offset)?; // storage.rs::ROW_FORMAT_VERSION
+    write(&tenant_len.to_le_bytes(), dst, &mut offset)?;
+    write(tenant_bytes, dst, &mut offset)?;
+    write(&[if is_public { 0x01 } else { 0x02 }], dst, &mut offset)?; // Visibility::{PUBLIC,PRIVATE}_BYTE
+    write(&dim.to_le_bytes(), dst, &mut offset)?;
+    for v in embedding {
+        write(&v.to_le_bytes(), dst, &mut offset)?;
+    }
+    write(&metadata_len.to_le_bytes(), dst, &mut offset)?;
+    write(metadata, dst, &mut offset)?;
+    Ok(())
 }
 
 /// `recovery::content_hash.rs::DOMAIN_TAG` の独立コピー。
@@ -242,12 +359,15 @@ pub enum StageId {
     Precheck,
     /// I2: `begin_write`。
     BeginWrite,
-    /// I3: content_hash（全行の encode 再実装 ＋ SHA-256）。
+    /// I3: content_hash（I5 のエンコード済みバイト列に対する SHA-256 再実装のみ。
+    /// Issue #397 以前は本段の内部でも全行を再度 encode していたが、production の
+    /// 事前エンコード共有化に追随してレプリカも I5 の結果を共有する形へ変更した）。
     ContentHash,
     /// I4: 台帳記録（`op_ledger` get+insert・`last_op` insert）。
     Ledger,
-    /// I5: encode（行ループ内。I3 とは別に再度全行 encode する。モジュール冒頭
-    /// コメント「段の再実装」節参照）。
+    /// I5: encode（行ごとに 1 回のみ。I3・I6 の双方がこの結果を共有する。
+    /// `ingest_profile_bench.rs` では I2 の直後・I3 より前に実行する順序へ変更済み
+    /// （Issue #397）。モジュール冒頭コメント「段の再実装」節参照）。
     Encode,
     /// I6: redb insert（`insert_unique_row` 相当）。
     RedbInsert,
