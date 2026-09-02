@@ -53,7 +53,7 @@
 //! `unwrap`／`expect`／`[]` を使わない。`unsafe` は使わない。環境変数・feature flag
 //! による経路上書きは設けない（CORE-12 踏襲）。
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::kernel::dot;
@@ -356,7 +356,122 @@ impl HnswIndex {
             index.insert_node(node_id, level, dim_usize, vectors)?;
         }
 
+        index.repair_reachability(dim_usize, vectors)?;
+
         Ok(index)
+    }
+
+    /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
+    /// `protect` 引数（呼び出し時点のみの保護）だけでは、後続ノードの挿入が
+    /// 同じ近傍を再度枝刈りして到達不能ノードを生む残差ケースを閉じきれない
+    /// （`docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性保証」
+    /// 節参照）。各層でエントリポイントから BFS
+    /// し、到達できないノードが残っていれば、その層の到達済み集合中で最も
+    /// 近い（`dot` が最大の）ノードへ双方向リンクを追加して修復する。
+    ///
+    /// 検証の過程で、`shrink_links` によるヒューリスティック再選択を修復
+    /// バッチとして複数ノードへ一括適用すると、ある未到達ノードを直すための
+    /// 枝刈りが**無関係な別の**既存ノードの唯一の到達経路を巻き込んで壊し、
+    /// 新たな到達不能ノードを生む whack-a-mole が起こり得ることが分かった。
+    /// そのためこの関数は 1 ノードずつ確定的に修復し、直後に BFS をやり直して
+    /// 次の未到達ノード（新たに生まれたものを含む）を選ぶワークリスト方式を
+    /// 取る（本体のコメント参照）。反復回数の上限までは通常どおり
+    /// `shrink_links`（`protect` つき）を経由するため次数上限を維持するが、
+    /// 収束せず上限に達した残りは `connect` のみ（次数上限超過を許容）で
+    /// 強制的に閉じる。安全側 = 全ノードの到達性を最終的に必ず保証する。
+    fn repair_reachability(&mut self, dim: usize, vectors: &[f32]) -> Result<(), HnswError> {
+        let Some(entry) = self.entry_point else {
+            return Ok(());
+        };
+        let Some(max_level) = self.level_of(entry) else {
+            return Ok(());
+        };
+        for level in 0..=max_level {
+            let member_count = (0..self.nodes.len() as u32)
+                .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                .count();
+            // `shrink_links`（次数上限維持のためのヒューリスティック再選択）を
+            // 修復対象ノードへ適用すると、その枝刈りが無関係な**別の**既存
+            // ノードの唯一の到達経路を巻き込んで壊し、新たな到達不能ノードを
+            // 生む whack-a-mole が起こり得る。次数上限を維持したまま到達性を
+            // 保つには、1 ノードずつ確定的に修復し、直後に BFS をやり直して
+            // 次の未到達ノード（新たに生まれたものを含む）を選ぶワークリスト
+            // 方式が要る。反復回数の上限（`member_count` の定数倍）までは次数
+            // 上限を維持する `shrink_links` 経由で厳密に修復し、それを超えた
+            // 反復は `shrink_links` を呼ばず `connect` のみ（重複追加をしない
+            // 純粋な追加。既存リンクを一切削除しない）で確定させる。この
+            // フォールバックは、ノード数が有限であり `connect` のみの反復が
+            // 必ず 1 ノードを恒久的に到達可能にする（後続の反復が既存の到達
+            // 経路を巻き戻さない）ことから、有限回で必ず終了する。次数上限は
+            // 通常の挿入経路と反復回数の上限内の修復では従来どおり保証される
+            // が、この残差フォールバックのみ例外的に超過し得る（安全側 = 全
+            // ノードの到達性を優先）。詳細は
+            // `docs/design/hnsw-graph-construction.md`「逆方向リンクの到達性
+            // 保証」節参照。
+            let iteration_cap = member_count.saturating_mul(4).max(4);
+            let mut iterations = 0usize;
+            loop {
+                let reachable = self.bfs_reachable(level, entry);
+                let missing_node = (0..self.nodes.len() as u32)
+                    .filter(|&n| self.level_of(n).map(|l| l >= level).unwrap_or(false))
+                    .find(|n| !reachable.contains(n));
+                let Some(node) = missing_node else {
+                    break;
+                };
+
+                let node_vec = node_vector(vectors, dim, node)?;
+                let mut best: Option<(u32, f32)> = None;
+                for &candidate in &reachable {
+                    let cand_vec = node_vector(vectors, dim, candidate)?;
+                    let score = dot(node_vec, cand_vec);
+                    let better = match best {
+                        Some((_, best_score)) => score > best_score,
+                        None => true,
+                    };
+                    if better {
+                        best = Some((candidate, score));
+                    }
+                }
+                // `reachable` は entry 自身を含むため必ず 1 件以上存在し、`best`
+                // は常に `Some` になる（entry 自身が候補になり得る）。`None` は
+                // `reachable` が空という到達不能な状態であり、fail-closed で
+                // 何もしない（次の反復の BFS が変化のないまま同じ `node` を選び
+                // 続けることになるが、`iteration_cap` により有限で打ち切られる）。
+                if let Some((target, _)) = best {
+                    self.connect(node, target, level);
+                    self.connect(target, node, level);
+                    if iterations < iteration_cap {
+                        self.shrink_links(target, level, dim, vectors, node)?;
+                        self.shrink_links(node, level, dim, vectors, target)?;
+                    }
+                    // `iterations >= iteration_cap` の場合は `shrink_links` を
+                    // 呼ばず `connect` のみで確定させる（次数上限超過を許容する
+                    // フォールバック）。
+                }
+                iterations += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// 層 `level` 上でノード `start` からリンクを辿って到達可能なノード集合を
+    /// 返す（`repair_reachability` 専用の内部 BFS。`tests/hnsw.rs` は公開 API
+    /// `neighbors` を使い同等の BFS を独立に実装して検証する）。
+    fn bfs_reachable(&self, level: usize, start: u32) -> HashSet<u32> {
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(start);
+        queue.push_back(start);
+        while let Some(node) = queue.pop_front() {
+            if let Some(neighbors) = self.neighbors(level, node) {
+                for &n in neighbors {
+                    if visited.insert(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        visited
     }
 
     /// 1 ノードをグラフへ挿入する（Algorithm 1 相当）。探索段（不変参照のみ）と
@@ -417,7 +532,7 @@ impl HnswIndex {
             for &neighbor in &selected {
                 self.connect(node_id, neighbor, l);
                 self.connect(neighbor, node_id, l);
-                self.shrink_links(neighbor, l, dim, vectors)?;
+                self.shrink_links(neighbor, l, dim, vectors, node_id)?;
             }
 
             entry_candidates = if candidates.is_empty() {
@@ -511,12 +626,22 @@ impl HnswIndex {
         }
 
         while let Some(top_candidate) = candidates.pop() {
-            // 候補集合の最良要素が、結果集合中の最悪要素より劣るなら打ち切る
-            // （Algorithm 2 の停止条件）。
+            // 候補集合の最良要素が、結果集合中の最悪要素より「厳密に」劣るなら
+            // 打ち切る（Algorithm 2 の停止条件）。ここは `ScoredNode::cmp`（id
+            // 昇順タイブレーク込みの複合順序）ではなく **スコアのみ**の比較に
+            // 限定する。複合順序で判定すると、スコアが同点で id が大きいだけの
+            // 候補まで「より遠い」と誤判定して打ち切ってしまい、その候補の
+            // 未訪問隣接ノードがより近い可能性を探索し損なう（同点候補が
+            // 生じやすい重複 embedding で顕在化。
+            // `docs/design/hnsw-graph-construction.md`「`search_layer` の
+            // 停止・受理判定: 順序規約の使い分け」節参照）。
+            // id 順の複合順序は結果集合の内容（`results.pop()` によるヒープ
+            // 内での追い出し順）・最終出力の安定ソートでのみ使い、探索を続ける
+            // か否かの判定には使わない。
             if let Some(std::cmp::Reverse(worst)) = results.peek() {
-                // スコアのみでなく `ScoredNode::cmp`（スコア降順・同点は id 昇順）で
-                // 比較する。同点時にモジュール冒頭の順序契約から外れないため。
-                if results.len() >= ef && top_candidate < *worst {
+                let strictly_farther =
+                    top_candidate.score.total_cmp(&worst.score) == std::cmp::Ordering::Less;
+                if results.len() >= ef && strictly_farther {
                     break;
                 }
             }
@@ -539,10 +664,14 @@ impl HnswIndex {
                         node: neighbor,
                         score: neighbor_score,
                     };
-                    // スコアのみでなく `ScoredNode::cmp`（スコア降順・同点は id 昇順）で
-                    // 比較する。同点時にモジュール冒頭の順序契約から外れないため。
+                    // 受理判定も打ち切り判定と同じ理由でスコアのみの比較に限定
+                    // する（`scored` が `worst` とスコア同点なら、id 順の複合
+                    // 順序で「劣る」と判定されても受理する）。
                     let worst_ok = match results.peek() {
-                        Some(std::cmp::Reverse(worst)) => results.len() < ef || scored > *worst,
+                        Some(std::cmp::Reverse(worst)) => {
+                            results.len() < ef
+                                || scored.score.total_cmp(&worst.score) != std::cmp::Ordering::Less
+                        }
                         None => true,
                     };
                     if worst_ok {
@@ -643,12 +772,34 @@ impl HnswIndex {
     /// `node` の層 `level` における隣接数が次数上限を超えていれば、その隣接集合
     /// 全体へヒューリスティック近傍選択を再適用して上限内へ縮退させる
     /// （Algorithm 1 の「次数上限超過時の再選択」段）。
+    ///
+    /// `protect` は、この呼び出し直前に `insert_node` が `node <-> protect` へ
+    /// 張ったばかりの逆方向リンク先（新規挿入ノード自身）。ヒューリスティックが
+    /// `protect` を枝刈りしてしまうと、新規ノードへの唯一の入口だった逆方向
+    /// リンクが失われ、エントリポイントからの到達路が残らないまま孤立し得る
+    /// （挿入ノードは自身の外向きリンクは持つが、探索はエントリポイントから
+    /// 既存ノードの隣接リストを辿って到達するため入方向のリンクが要る）。
+    /// ヒューリスティック選択後に `protect` が漏れて
+    /// いれば、選択済み集合中で最もスコアが低い（＝末尾の）要素と差し替えて
+    /// 強制的に残す。
+    ///
+    /// この保証は「`protect` の挿入時点で選ばれた各近傍が `protect` への逆方向
+    /// リンクを保持する」ことのみを担保する insertion-time の不変条件であり、
+    /// 後続の別ノード挿入がこれらの近傍を再度 `shrink_links` する際に `protect`
+    /// が漏れる余地までは塞がない（グローバルな到達性の恒久保証ではない）。
+    /// 全ノード挿入後に残るその残差ケースは `HnswIndex::build` 末尾の
+    /// [`Self::repair_reachability`] が閉じる（この関数自体は呼ばない。
+    /// 呼ぶと、他の未到達ノードを直すための枝刈りが無関係な第三のノードの
+    /// 唯一の到達経路を巻き込んで壊す whack-a-mole が起こり得るため）。
+    /// 詳細は `docs/design/hnsw-graph-construction.md`
+    /// 「逆方向リンクの到達性保証」節参照。
     fn shrink_links(
         &mut self,
         node: u32,
         level: usize,
         dim: usize,
         vectors: &[f32],
+        protect: u32,
     ) -> Result<(), HnswError> {
         let limit = max_degree_for(&self.params, level);
         let current_len = self
@@ -679,7 +830,27 @@ impl HnswIndex {
         }
         scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
 
-        let shrunk = self.select_neighbors_heuristic(&scored, limit, dim, vectors)?;
+        let mut shrunk = self.select_neighbors_heuristic(&scored, limit, dim, vectors)?;
+        // `node == protect`（自己ループ）は `connect` が張らないため起こらないが、
+        // 呼び出し契約が壊れても panic せず何もしない防御的分岐にしておく。
+        // `protect` は直前に `connect(node, protect, level)` で張られたばかりの
+        // 隣接であり、上の `scored` 構築元 `neighbor_ids` に必ず含まれる。
+        if node != protect && !shrunk.contains(&protect) {
+            if shrunk.len() >= limit {
+                // `limit >= 2`（`HnswParams::validate` の `m >= 2` から層 0 も
+                // 層 1 以上も導出される）なので `pop` は必ず要素を持つ。
+                shrunk.pop();
+            }
+            shrunk.push(protect);
+            // 差し替え後も次数上限超過検出時と同じ「スコア降順・同点は id 昇順」
+            // の順序（モジュール冒頭の順序規約）を保つ。`scored` は既に同じ規約で
+            // ソート済みなので、その並び順を基準にフィルタし直すだけでよい。
+            shrunk = scored
+                .iter()
+                .filter(|s| shrunk.contains(&s.node))
+                .map(|s| s.node)
+                .collect();
+        }
         if let Some(n) = self.nodes.get_mut(node as usize) {
             if let Some(links) = n.links.get_mut(level) {
                 *links = shrunk;
@@ -987,5 +1158,55 @@ mod tests {
             }
         }
         assert!(hits as f64 / queries as f64 >= 0.9, "hits={hits}/{queries}");
+    }
+
+    /// `search_layer` の停止・受理判定が `ScoredNode` の複合順序（id 昇順
+    /// タイブレーク込み）ではなく**スコアのみ**で行われることを直接検証する
+    /// （`docs/design/hnsw-graph-construction.md`「`search_layer` の停止・
+    /// 受理判定: 順序規約の使い分け」節参照）。手作りの 3 ノードグラフ
+    /// （`entry(id0) -> node1(id1, entry と厳密同点スコア) -> node2(id2, 全体
+    /// 最良スコア)`。node0 と node2 の間には直接リンクを張らない）に対し、
+    /// `ef=1` で `search_layer` を呼ぶと、複合順序で判定した場合は
+    /// entry と node1 の同点比較で `node1.cmp(entry) == Less`（id が大きい方が
+    /// 複合順序では「より遠い」）となるため、受理判定（`worst_ok`）が node1 を
+    /// 拒否し、node1 経由でしか到達できない node2 を発見できない。スコアのみの
+    /// 判定であれば同点は拒否されず node1 の隣接探索まで進み、最終的に
+    /// より良いスコアの node2 が結果に残る。
+    #[test]
+    fn search_layer_continues_through_tied_score_candidates_to_find_a_strictly_closer_node() {
+        let dim = 1usize;
+        // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
+        // ノード値そのものになる。
+        let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+        };
+        let query = [1.0f32];
+        let results = index
+            .search_layer(vec![0], &query, 1, 0, dim, &vectors)
+            .expect("search_layer should succeed");
+        assert_eq!(
+            results.iter().map(|s| s.node).collect::<Vec<_>>(),
+            vec![2],
+            "search_layer must traverse through a tied-score node to reach a \
+             strictly closer one; an id-tiebreak (complex-order) stopping or \
+             admission predicate would stop at the tie and miss node 2"
+        );
     }
 }
