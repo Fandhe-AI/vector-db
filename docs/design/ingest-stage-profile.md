@@ -256,3 +256,67 @@ insert）のままで変わらず、本変更単独でのボトルネック解�
 - `insert_typed_row_unchecked`／`replace_typed_rows_by_text_key` は `encode_row` を
   経由しない別経路（`content_hash.rs` モジュールドキュメント参照）のため対象外。
 - 専有環境での確定測定は引き続き未実施。
+
+## Issue #399 追記: 自作 SHA-256 のストリーミング化
+
+### 設計
+
+`recovery/content_hash.rs` の自作 SHA-256（依存最小方針。TASK-101・RECOVER-10
+ポインタ）を、バッチ全体（1,000 行 × 約 0.5KB ≈ 500KB）を `Vec<u8>` へ一度
+連結し、さらにパディングのため丸ごと複製していた一括処理版から、ブロック単位
+ストリーミング更新型の `Sha256`（`update`/`finalize`）へ再構成した。
+`HashInputBuilder` の内部を `Vec<u8>` から `Sha256` へ置換し、各 `push_*` が
+`Sha256::update` を直接呼ぶことで、バッチ全体を保持する中間バッファを排除した。
+圧縮関数のメッセージスケジュールも 64 語配列から 16 語のローリング配列
+（`w[t & 15]`）へ変更し、固定サイズの境界チェックで済むようにした。
+
+ハッシュ入力バイト列のレイアウト（ドメインタグ・操作種別タグ・長さプレフィクス
+付きフィールド連結の順序）は 1 ビットも変えていない。旧実装は `sha256_reference`
+として `#[cfg(test)]` に残し、ストリーミング版との等価性をテストで機械検証する
+（FIPS 180-4／NIST 公開テストベクタ 5 本〔`abc`・空・2 ブロック・4 ブロック・
+100 万 `'a'`〕、境界長 0..=200・4096・65537 バイトの網羅比較、1/3/63/64/65/100
+バイト刻みの分割 `update` 等価性）。既存の `for_*_encoded` 系ハッシュ関数の
+単体・結合テスト（`recovery_content_hash.rs`・`recovery_ledger.rs`・
+`sql_operation_id.rs`・`recovery_two_path.rs`・`tenant_write_error_exhaustive.rs`）
+も無変更のまま green であり、独立再実装との照合テスト
+（`ingest_profile_accept.rs::content_hash_insert_batch_reimpl_matches_stored_op_ledger_hash`）
+も含めて既存 content_hash 値が不変であることを確認済み。
+
+### 実測（受け入れ 2）
+
+`crates/engine/benches/ingest_profile_bench.rs` の I3 は harness 側の独立再実装
+（`sha256_reimpl`）で計測しており、production の `content_hash.rs` を変更しても
+自動では反映されない構造（本ファイル冒頭の「測定設計」節参照）のため、本 Issue
+では `content_hash.rs` 内の手動専用テスト
+（`recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing`。
+`#[ignore]`・CI 非配線。`cargo test --release -p engine --lib
+recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing --
+--ignored --nocapture` で実行）により、台帳ハッシュ対象と同オーダー（500KB・
+200 回反復）の入力でストリーミング版（本番経路）と参照実装（旧・一括処理版）を
+同一プロセス内で直接比較した。共有計測環境での 4 回実測（開発環境。専有環境での
+再測定は未実施）:
+
+| 実装 | 実測（4 回） | ns/byte（4 回） |
+| --- | --- | --- |
+| `sha256_reference`（旧・一括処理版） | 265.3 / 280.1 / 277.0 / 309.4 ms | 2.65 / 2.80 / 2.77 / 3.09 |
+| `sha256`（新・ストリーミング版） | 263.8 / 265.7 / 266.1 / 266.1 ms | 2.64 / 2.66 / 2.66 / 2.66 |
+
+ストリーミング版は 4 回すべてで参照実装以下（改善幅 0.6〜14.0%）であり、
+参照実装側は `Vec` の確保・再確保に由来すると見られる run-to-run 変動
+（265〜309 ms）が大きい一方、ストリーミング版は 264〜266 ms とばらつきが小さい。
+バッチ全体の 2 回の全量コピー（約 1MB）を排除した構造的な効果は確認できたが、
+改善幅自体は小さく（中央値で約 5%）、`docs/design/dot-kernel-multi-accumulator.md`
+等で採用してきた「複数回実測でノイズ帯を超える悪化がないこと」を判定基準とすると、
+本変更は悪化を示していない（4 回すべてで同等以上）ため**採用**と判断した
+（Issue #365・#366 と異なり、本件は改善方向で一貫しており撤回の理由がない）。
+
+### スコープ外（申し送り）
+
+- `bench-ingest-profile` の I3 を production と同じストリーミング構成の
+  再実装（harness 側 `Sha256Reimpl` 等）で計測し直す本格的な A/B 配線
+  （段別プロファイルベンチへの正式な結線）は本 Issue では実施せず、上記の
+  モジュール内手動テストによる直接比較に留めた。
+- ループ展開（8 ラウンド単位のマクロ展開等）の追加検証は実施していない
+  （16 語ローリングスケジュールへの変更のみを採用）。
+- SHA-NI 等のハードウェア命令（`unsafe` 前提）は対象外。
+- 専有環境での確定再測定は引き続き未実施。
