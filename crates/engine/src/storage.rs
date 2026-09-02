@@ -906,8 +906,9 @@ fn extend_f32_le(buf: &mut Vec<u8>, values: &[f32]) -> Result<()> {
     let dst = buf
         .get_mut(start..)
         .ok_or_else(|| StorageError::Codec("embedding buffer write out of bounds".to_string()))?;
-    for (chunk, v) in dst.chunks_exact_mut(4).zip(values) {
-        chunk.copy_from_slice(&v.to_le_bytes());
+    let (chunks, _remainder) = dst.as_chunks_mut::<4>();
+    for (chunk, v) in chunks.iter_mut().zip(values) {
+        *chunk = v.to_le_bytes();
     }
     Ok(())
 }
