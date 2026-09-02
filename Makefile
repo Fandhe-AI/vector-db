@@ -342,6 +342,18 @@ else
 endif
 
 # --------------------------------------------------
+# ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-ingest-profile
+bench-ingest-profile: ## Issue #396（ingest 経路の段別内訳プロファイル。所有権検査・content_hash・台帳記録・encode・redb insert・世代更新・commit の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_INGEST_PROFILE_ROWS／BENCH_INGEST_PROFILE_DIM で規模を上書き可能）
+ifdef HAS_CARGO
+	cargo bench --bench ingest_profile_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-ingest-profile をスキップ"
+endif
+
+# --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------
 
