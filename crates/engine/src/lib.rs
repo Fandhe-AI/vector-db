@@ -221,6 +221,7 @@ pub mod dispatch;
 pub mod embedding;
 pub mod error_format;
 pub mod gpu_batch;
+pub mod hnsw;
 pub mod hybrid;
 pub mod incremental;
 pub mod isa;
