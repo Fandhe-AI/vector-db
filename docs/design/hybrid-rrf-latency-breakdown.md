@@ -285,11 +285,16 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
   （`sparse.rs::search_within` 832〜842 行の複製）が `fetch_k` に依存しない
   固定コスト（可視集合サイズにのみ依存）として支配的である
 - 疎側再取得ループの累積コストは `sparse_refetch_summary` の
-  `cumulative_median_us=125613`（各クエリの実際のスケジュールに沿って
-  `search_within_fetch_k=<k>` の実測中央値を合算した、最も再取得回数が多い
-  クエリの累積値）で、`hybrid_search_cached_index` の実測 median
-  （115.7ms）と近い値になった（`search_within` 自体が `fetch_k` に依存せず
-  ほぼ一定のため、再取得回数の多寡がほぼ線形にコストへ跳ね返る）
+  `estimated_cumulative_mixed_median_us=125613`（`search_within_fetch_k=<k>`
+  段——各 `fetch_k` を全クエリで round-robin 測定した**全クエリ混合集団**の
+  実測中央値であり、クエリ別の実測値ではない——を、最も再取得回数が多い
+  クエリの実スケジュールに沿って合算した**推定値**。以前は
+  `cumulative_median_us`・「実測値」「最悪ケース」と表記していたが、実体は
+  全クエリ混合中央値による推定である。codex-review P1 指摘対応・PR #416）で、
+  `hybrid_search_cached_index` の実測 median（115.7ms）と近い値になった
+  （`search_within` 自体が `fetch_k` に依存せずほぼ一定のため、再取得回数の
+  多寡がほぼ線形にコストへ跳ね返る。ただし上記のとおり全クエリ混合中央値に
+  よる推定であり、クエリ別の真の累積コストとの乖離は未検証）
 - 本 ADR 前節（Issue #356）が「残差 36%（約 100ms）」としていた帰属不能分は、
   本実測により**大部分が疎側再取得ループ（`search_within` を 6〜7 回繰り返す
   こと）で説明できる**ことが確認された。`search_within` 1 回あたりのコストの
@@ -326,6 +331,19 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
   コーパスでの疎側再取得発火回数は本実測より少ない可能性がある点に注意
 - production 側フック案（`hybrid_search_with_diagnostics` のような診断 API を
   `hybrid.rs` へ追加する案）は、本実測でベンチ側複製＋忠実性検証のみで要件を
-  満たせたため不採用（`crates/engine/src/` は本 Issue で無変更）
+  満たせたため不採用（`crates/engine/src/` は本 Issue で無変更）。
+  `SparseIndex::search_within` は `hybrid.rs::hybrid_search_boosted` から
+  具象型 `&SparseIndex` へ直接呼ばれる構造のため、密側の
+  `RefetchTrackingProvider`（`&dyn SearchProvider` を介した外部観測）と
+  同型の呼び出し回数観測フックは存在しない、という制約自体は変わらない
+  （codex-review P1 指摘・PR #416。`sparse_refetch_schedule` の疎側発火回数は
+  依然としてベンチ側複製〔`boundary_tie_decision`〕の予測値であり、
+  production の実呼び出し列そのものと突き合わせた call-count 一致検証では
+  ない）。代わりに `verify_sparse_schedule_terminal_is_stable`
+  （`harness/hybrid_profile.rs`）を追加し、各クエリのスケジュール終端が
+  予測 `fetch_k` の 1 段先まで実際に呼んでも上位プレフィックスが変化しない
+  固定点であることを実 API で確認する間接検証を起動時 fail-closed に行う
+  （呼び出し回数の外部観測ではなく終端判定の正しさの間接検証にとどまる限界
+  は同関数のドキュメント参照）
 - 転置索引化そのもの（設計・実装）は本 Issue のスコープ外。本節の帰属分析・
   優先順位は次段の設計判断の入力として記録するに留める

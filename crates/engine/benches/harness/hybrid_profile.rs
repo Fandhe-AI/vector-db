@@ -967,6 +967,70 @@ pub fn refetch_schedule_matches_observed_calls(
     Ok(())
 }
 
+/// 疎側再取得スケジュールの終端判定が実 API 上でも安定した固定点であることを
+/// 検証する（Issue #387 PR #416 codex-review P1 指摘対応）。
+///
+/// [`sparse_refetch_schedule`] は各 `fetch_k` で実 [`SparseIndex::search_within`]
+/// を呼ぶが、いつ止めるか（[`TieDecision::Resolved`]）の判定自体は複製
+/// （[`boundary_tie_decision`]）に基づく。`hybrid.rs::hybrid_search_boosted` の
+/// 疎側再取得ループは `search_within` を `&SparseIndex`（具象型）へ直接呼ぶ構造
+/// のため、密側の `RefetchTrackingProvider`
+/// （[`super::hybrid_latency::RefetchTrackingProvider`]）のような呼び出し回数の
+/// 外部観測フックを持たない。production 側への診断フック追加は
+/// `docs/design/hybrid-rrf-latency-breakdown.md`「限界・申し送り」節が記録する
+/// とおり本 Issue のスコープ外（テスト専任）として既に不採用が確定している
+/// ため、本関数は代わりに「終端が実 API 上でも固定点であること」を検証する:
+/// 予測終端 `fetch_k` を超えてもう 1 回（倍増後の `fetch_k`）
+/// `search_within` を実際に呼び、`pool_depth` 件までの上位プレフィックス
+/// （`(doc_id, score)`）が変化しないことを確認する。`reached_cap`（これ以上
+/// 取得できない）の場合は検証不要のため `Ok(true)`。
+///
+/// **限界**: これは呼び出し回数そのものの観測ではなく、終端判定の正しさの
+/// 間接検証にとどまる。production の境界同点判定ロジックそのものではなく
+/// 本複製（[`boundary_tie_decision`]）の判定結果を実データで裏付けるに
+/// すぎないため、production 側の判定ロジック自体が変わった場合の乖離は
+/// 検知できない（呼び出し元 `hybrid_profile_bench.rs::main` のコメント参照）。
+pub fn verify_sparse_schedule_terminal_is_stable(
+    index: &SparseIndex,
+    query: &str,
+    visible: &BTreeSet<DocId>,
+    schedule: &RefetchSchedule,
+    pool_depth: usize,
+) -> Result<bool, ProfileError> {
+    if schedule.reached_cap {
+        return Ok(true);
+    }
+    let Some(&terminal_k) = schedule.fetch_ks.last() else {
+        return Ok(true);
+    };
+    let cap = fetch_cap(visible.len());
+    let Some(next_k) = next_fetch_k(terminal_k, cap) else {
+        return Ok(true);
+    };
+    let terminal_hits = index
+        .search_within(query, terminal_k, visible)
+        .map_err(|e| {
+            ProfileError::ContractViolation(format!(
+                "search_within failed during terminal stability check (terminal_k): {e}"
+            ))
+        })?;
+    let next_hits = index.search_within(query, next_k, visible).map_err(|e| {
+        ProfileError::ContractViolation(format!(
+            "search_within failed during terminal stability check (next_k): {e}"
+        ))
+    })?;
+    let prefix_len = pool_depth.min(terminal_hits.len()).min(next_hits.len());
+    for i in 0..prefix_len {
+        let same_doc = terminal_hits[i].doc_id == next_hits[i].doc_id;
+        let same_score =
+            terminal_hits[i].score.total_cmp(&next_hits[i].score) == std::cmp::Ordering::Equal;
+        if !same_doc || !same_score {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// 複数クエリ分の疎側再取得スケジュールの要約（Issue #387）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseRefetchSummary {
@@ -1019,16 +1083,27 @@ pub fn render_sparse_refetch_line(query_idx: usize, schedule: &RefetchSchedule) 
     )
 }
 
-/// 疎側再取得の要約行を描画する。`cumulative_median_us` は呼び出し元
-/// （`hybrid_profile_bench.rs::main`）がスケジュール上の各 `fetch_k` での
-/// `search_within` 実測中央値を合算した値（区間コストの帰属分析に使う）。
+/// 疎側再取得の要約行を描画する。`estimated_cumulative_mixed_median_us` は
+/// 呼び出し元（`hybrid_profile_bench.rs::main`）が
+/// `search_within_fetch_k=<k>` 段（各 `fetch_k` を全クエリで round-robin
+/// 測定した**全クエリ混合集団**の実測中央値。クエリ別の実測値ではない）を、
+/// 最も再取得回数が多いクエリのスケジュールに沿って合算した**推定値**
+/// （Issue #387 PR #416 codex-review P1 指摘対応。以前は
+/// `cumulative_median_us`・「実測中央値」「最悪ケース」と表記しており、混合
+/// 集団の中央値をクエリ別の実測累積コストであるかのように扱っていた）。
+/// クエリ別の真の累積コストが必要な場合は各 `(query, fetch_k)` を個別に
+/// 測定する必要があるが、本ベンチはその代わりに全クエリ混合中央値による
+/// 推定を採用している（`fetch_k` ごとの実測が `fetch_k` によらずほぼ一定
+/// （`docs/design/hybrid-rrf-latency-breakdown.md` 参照）であれば、この
+/// 推定とクエリ別実測の乖離は小さいと考えられるが未検証）。
 pub fn render_sparse_refetch_summary_line(
     summary: &SparseRefetchSummary,
-    cumulative_median_us: u128,
+    estimated_cumulative_mixed_median_us: u128,
 ) -> String {
     format!(
         "hybrid_profile: sparse_refetch_summary queries={} calls_max={} calls_total={} \
-         reached_cap_count={} max_fetch_k={} cumulative_median_us={cumulative_median_us}",
+         reached_cap_count={} max_fetch_k={} \
+         estimated_cumulative_mixed_median_us={estimated_cumulative_mixed_median_us}",
         summary.queries,
         summary.calls_max,
         summary.calls_total,

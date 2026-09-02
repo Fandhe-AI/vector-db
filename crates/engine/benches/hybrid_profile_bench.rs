@@ -67,8 +67,8 @@ use harness::hybrid_profile::{
     refuse_under_github_actions, render_dense_refetch_line, render_sparse_refetch_line,
     render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
     sparse_refetch_schedule, sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch,
-    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq, ProfileSparseIndex,
-    SQL_DEFAULT_HYBRID_POOL_DEPTH,
+    tokenize_only, tokenize_term_doc_freq, tokenize_term_freq,
+    verify_sparse_schedule_terminal_is_stable, ProfileSparseIndex, SQL_DEFAULT_HYBRID_POOL_DEPTH,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
@@ -372,6 +372,31 @@ fn main() {
             replica_matches_real(&sparse_index, &replica, &q.text, fetch_k, &visible)
                 .unwrap_or_else(|e| fail_closed(format!("replica fidelity check failed: {e}")));
         }
+        // 終端固定点検証（codex-review P1 指摘対応。PR #416）: `schedule` の終端
+        // 判定（`boundary_tie_decision` 複製）が実 `search_within` 出力でも
+        // 安定していることを、予測終端の 1 段先まで実際に呼んで確認する
+        // （`verify_sparse_schedule_terminal_is_stable` ドキュメント参照。
+        // 疎側呼び出し回数そのものの外部観測ではなく終端判定の間接検証にとどまる
+        // 限界は同ドキュメントに明記）。
+        let stable = verify_sparse_schedule_terminal_is_stable(
+            &sparse_index,
+            &q.text,
+            &visible,
+            &schedule,
+            pool_depth,
+        )
+        .unwrap_or_else(|e| {
+            fail_closed(format!(
+                "sparse schedule terminal stability check failed: {e}"
+            ))
+        });
+        if !stable {
+            fail_closed(
+                "sparse refetch schedule terminal fetch_k is not a stable fixed point against \
+                 real search_within output one round further (boundary_tie_decision replica may \
+                 have diverged from what the real index data supports)",
+            );
+        }
         sparse_schedules.push(schedule);
     }
 
@@ -404,10 +429,15 @@ fn main() {
     }
     println!(
         "hybrid_profile: fidelity checks passed (replica search_within matches real API for \
-         every fetch_k on the sparse schedule; dense refetch schedule predictions match \
-         observed hybrid_search calls via RefetchTrackingProvider — sparse has no equivalent \
-         internal-call observation hook, so sparse_refetch_schedule's boundary_tie_decision-driven \
-         loop is a reproduction, not a call-count cross-check against real hybrid_search)"
+         every fetch_k on the sparse schedule; each sparse schedule's terminal fetch_k was \
+         verified as a stable fixed point one round further via a real search_within call \
+         [verify_sparse_schedule_terminal_is_stable]; dense refetch schedule predictions match \
+         observed hybrid_search calls via RefetchTrackingProvider — sparse still has no \
+         equivalent internal-call-count observation hook [production diagnostic hook rejected, \
+         see docs/design/hybrid-rrf-latency-breakdown.md 限界・申し送り], so \
+         sparse_refetch_schedule's boundary_tie_decision-driven loop remains a reproduction \
+         cross-checked for output fidelity and terminal stability, not a call-count \
+         cross-check against real hybrid_search)"
     );
 
     // --- hybrid_search_cached_index: 事前構築済み SparseIndex（キャッシュヒット
@@ -521,10 +551,15 @@ fn main() {
         );
     }
 
-    // クエリごとの累積時間（そのクエリの実際の疎側再取得スケジュールに沿って
-    // 各 fetch_k の実測中央値を合算する）のうち最大値を要約行へ添える
-    // （最悪ケース＝再取得が最も多く発火したクエリの累積コスト）。
-    let worst_cumulative_median_us: u128 = sparse_schedules
+    // 推定累積時間（codex-review P1 指摘対応。PR #416）: `median_by_fetch_k[k]`
+    // は各 fetch_k を全クエリで round-robin 測定した**全クエリ混合集団**の実測
+    // 中央値であり、特定クエリの実測値ではない。以下はその混合集団中央値を、
+    // 最も再取得回数が多いクエリの実スケジュールに沿って合算した**推定値**
+    // （クエリ別の真の累積コストの実測ではない。以前は「最悪ケース」＝
+    // クエリ別実測であるかのように扱っていたが、実体は全クエリ混合中央値に
+    // よる推定である。詳細は `render_sparse_refetch_summary_line` ドキュメント
+    // 参照）。
+    let estimated_worst_cumulative_mixed_median_us: u128 = sparse_schedules
         .iter()
         .map(|s| {
             s.fetch_ks
@@ -536,7 +571,10 @@ fn main() {
         .unwrap_or(0);
     println!(
         "{}",
-        render_sparse_refetch_summary_line(&sparse_summary, worst_cumulative_median_us)
+        render_sparse_refetch_summary_line(
+            &sparse_summary,
+            estimated_worst_cumulative_mixed_median_us
+        )
     );
 
     // --- search_within 内部 3 区間（複製実装。初期 fetch_k と最終 fetch_k の
