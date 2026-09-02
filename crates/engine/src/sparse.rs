@@ -248,7 +248,13 @@ impl TermDictionary {
         }
         let next = u32::try_from(self.ids.len()).map_err(|_| SparseError::TooManyTokens {
             total: self.ids.len(),
-            max: MAX_CORPUS_TOKENS,
+            // この分岐が到達するのは語彙数が `u32::MAX` に達した場合であり、
+            // 呼び出し元（`with_params`）の `MAX_CORPUS_TOKENS` 検証により
+            // 実質到達不能な防御的分岐（コメント参照）。`max` に `MAX_CORPUS_TOKENS`
+            // を報告すると `total`（~4.29e9）が `max`（8,000,000）を超える
+            // 自己矛盾したエラーペイロードになるため、この分岐の実際の境界値
+            // （`u32` の表現域）を報告する。
+            max: u32::MAX as usize,
         })?;
         let id = TermId(next);
         self.ids.insert(term, id);
