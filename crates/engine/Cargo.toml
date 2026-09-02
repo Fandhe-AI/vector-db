@@ -240,9 +240,11 @@ test = false
 # harness/hybrid_profile.rs にあり tests/hybrid_profile_accept.rs で make ci 側から
 # 回帰検証する。
 # Issue #387: SparseIndex::search_within の段別（可視 subset 構築／df 再計算パス／
-# スコアリングパス）実測・疎側再取得ループの発火回数計測を追加。production コード
-# 〔crates/engine/src/〕は無変更で、ベンチ側複製〔ProfileSparseIndex〕と実 API の
-# 出力を起動時に fail-closed で突き合わせてから使う。
+# スコアリングパス）実測・疎側再取得ループの発火回数計測を追加。production の
+# 疎側再取得ループ本体〔hybrid.rs::sparse_refetch_loop〕を共有内部関数へ抽出し、
+# 診断用の公開フック engine::hybrid::sparse_refetch_observed を追加した（通常経路
+# の挙動・分岐・定数は不変）。ベンチはこのフックを直接呼び、production から実観測
+# した fetch_k 列を使う（予測の複製ではない）。
 name = "hybrid_profile_bench"
 harness = false
 test = false

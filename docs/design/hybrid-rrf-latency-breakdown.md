@@ -343,8 +343,11 @@ sparse_refetch_summary queries=5 calls_max=7 calls_total=33 reached_cap_count=3 
   exhaustive 到達）は実コーパスでの発火回数の上限に近い可能性がある。実
   コーパスでの疎側再取得発火回数は本実測より少ない可能性がある点に注意
 - production 側フック案（`hybrid_search_with_diagnostics` のような診断 API を
-  `hybrid.rs` へ追加する案）は、本実測でベンチ側複製＋忠実性検証のみで要件を
-  満たせたため不採用（`crates/engine/src/` は本 Issue で無変更）。
+  `hybrid.rs` へ追加する案）は、当初の実測ではベンチ側複製＋忠実性検証のみで
+  要件を満たせると判断し一旦不採用としたが、後述の codex-review P1 指摘への
+  対応で production の疎側再取得ループ本体を共有内部関数へ抽出したうえ診断用
+  の公開フックを追加する形へ変更した（`crates/engine/src/` は最終的に変更あり。
+  詳細は直後の記述を参照）。
   `SparseIndex::search_within` は当初 `hybrid.rs::hybrid_search_boosted` から
   具象型 `&SparseIndex` へ直接呼ばれる構造で、密側の `RefetchTrackingProvider`
   （`&dyn SearchProvider` を介した外部観測）と同型の呼び出し回数観測フックが
