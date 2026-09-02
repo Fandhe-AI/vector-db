@@ -187,6 +187,18 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
 `docs/design/hybrid-refetch-latency.md` を参照してください。
 
+### ingest 段別内訳プロファイル（Issue #396）
+
+`make bench-ingest-profile`（`crates/engine/benches/ingest_profile_bench.rs`）は、
+書き込み経路（`engine::tenant::insert_rows` → `insert_rows_unchecked`）を所有権
+検査・`begin_write`・content_hash・台帳記録・encode・redb insert・世代更新・
+commit の段別に分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供
+専用のベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
+`GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
+`BENCH_INGEST_PROFILE_ROWS`／`BENCH_INGEST_PROFILE_DIM` でバッチ行数・次元を
+上書きできます（許容範囲外・非数値は fail-closed に拒否）。実測結果・設計は
+`docs/design/ingest-stage-profile.md` を参照してください。
+
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 
 `make rerank-cross-encoder-eval`（`crates/engine/tests/rerank_cross_encoder_recall.rs`。

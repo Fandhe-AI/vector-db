@@ -52,6 +52,7 @@ pub mod dot_kernel;
 pub mod env_report;
 pub mod hybrid_latency;
 pub mod hybrid_profile;
+pub mod ingest_profile;
 pub mod knn_profile;
 pub mod parse_bind;
 pub mod protocol;
