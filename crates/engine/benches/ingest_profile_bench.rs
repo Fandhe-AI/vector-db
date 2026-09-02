@@ -82,9 +82,9 @@ mod harness;
 use harness::env_report::EnvReport;
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
-    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env,
+    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_insert_mode,
     refuse_under_github_actions, render_stage_line, residual_ns_per_row, sum_durations,
-    IngestProfileError, StageId, StageSamples,
+    IngestProfileError, InsertMode, StageId, StageSamples,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
@@ -236,12 +236,26 @@ fn main() {
         Ok(v) => v,
         Err(e) => fail_closed(e),
     };
+    let insert_mode_raw = match read_env_var("BENCH_INGEST_PROFILE_INSERT_MODE") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let insert_mode = match parse_insert_mode(insert_mode_raw.as_deref()) {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let insert_mode_label = match insert_mode {
+        InsertMode::Insert => "insert",
+        InsertMode::Reserve => "reserve",
+    };
 
     println!(
         "{}",
         EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
     );
-    println!("ingest_profile_bench: rows_per_batch={rows} dim={dim} tenant={TENANT} table={TABLE}");
+    println!(
+        "ingest_profile_bench: rows_per_batch={rows} dim={dim} tenant={TENANT} table={TABLE} insert_mode={insert_mode_label}"
+    );
 
     let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
     let warmup = config.warmup_iterations() as u64;
@@ -296,7 +310,15 @@ fn main() {
 
         for batch_idx in 0..warmup {
             let batch = make_batch(&table_schema, 1, batch_idx, rows, dim);
-            run_replica_batch(&replica_db, &ctx, &table_schema, &batch, batch_idx, None);
+            run_replica_batch(
+                &replica_db,
+                &ctx,
+                &table_schema,
+                &batch,
+                batch_idx,
+                None,
+                insert_mode,
+            );
         }
         let mut stage_samples = StageSamples::new();
         for batch_idx in warmup..total_batches {
@@ -308,6 +330,7 @@ fn main() {
                 &batch,
                 batch_idx,
                 Some(&mut stage_samples),
+                insert_mode,
             );
         }
 
@@ -521,6 +544,7 @@ fn run_replica_batch(
     batch: &Batch,
     batch_idx: u64,
     mut stage_samples: Option<&mut StageSamples>,
+    insert_mode: InsertMode,
 ) {
     let rows = batch.ids.len();
 
@@ -628,17 +652,55 @@ fn run_replica_batch(
         let mut row_table = write_txn
             .open_table(ROW_TABLE)
             .expect("open user_rows/docs table for I6");
-        for (i, (id, encoded)) in batch.ids.iter().zip(row_encoded.iter()).enumerate() {
-            schema
-                .validate_embedding_dim(batch.embeddings[i].len())
-                .expect("validate_embedding_dim for I6 (matches production per-row check)");
-            let prev = row_table
-                .insert((TENANT, *id), encoded.as_slice())
-                .expect("insert row for I6");
-            if prev.is_some() {
-                fail_closed(format!(
-                    "unexpected existing row for id={id} (I6 uniqueness check)"
-                ));
+        match insert_mode {
+            InsertMode::Insert => {
+                for (i, (id, encoded)) in batch.ids.iter().zip(row_encoded.iter()).enumerate() {
+                    schema
+                        .validate_embedding_dim(batch.embeddings[i].len())
+                        .expect("validate_embedding_dim for I6 (matches production per-row check)");
+                    let prev = row_table
+                        .insert((TENANT, *id), encoded.as_slice())
+                        .expect("insert row for I6");
+                    if prev.is_some() {
+                        fail_closed(format!(
+                            "unexpected existing row for id={id} (I6 uniqueness check)"
+                        ));
+                    }
+                }
+            }
+            InsertMode::Reserve => {
+                // Issue #400: `insert_reserve` は `insert` と異なり既存値を
+                // 返さない契約（redb 4.2.0 `Table::insert_reserve`）ため、
+                // `insert_unique_row` 相当の一意性検査を事前 `get` で代替する
+                // （試作限定の許容コスト。計画「契約面の制約」節参照）。
+                //
+                // codex-review 指摘（PR #420）: 以前はここで `encoded`
+                // （I5 で作成済み）を使わず `encode_row_reimpl_into_slice` で
+                // 予約済みバッファへ再度エンコードしており、Insert 側
+                // （I5 の結果をそのまま insert するだけ）と処理範囲が
+                // 揃わない二重エンコードになっていた。両モードとも I6 では
+                // 「I5 のエンコード結果を書き込むだけ」に処理範囲を揃えるため、
+                // 予約済みバッファへは encode し直さず `encoded` をコピーする
+                // （`insert_reserve` に渡した長さと `guard.as_mut()` の長さは
+                // 常に一致するため `copy_from_slice` は長さ不一致で panic しない）。
+                for (i, (id, encoded)) in batch.ids.iter().zip(row_encoded.iter()).enumerate() {
+                    schema
+                        .validate_embedding_dim(batch.embeddings[i].len())
+                        .expect("validate_embedding_dim for I6 (matches production per-row check)");
+                    if row_table
+                        .get((TENANT, *id))
+                        .expect("read row for I6 reserve-mode uniqueness check")
+                        .is_some()
+                    {
+                        fail_closed(format!(
+                            "unexpected existing row for id={id} (I6 uniqueness check, reserve mode)"
+                        ));
+                    }
+                    let mut guard = row_table
+                        .insert_reserve((TENANT, *id), encoded.len())
+                        .expect("insert_reserve row for I6");
+                    guard.as_mut().copy_from_slice(encoded.as_slice());
+                }
             }
         }
     }

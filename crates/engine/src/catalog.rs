@@ -949,11 +949,16 @@ impl Storage {
             let mut row_table = write_txn
                 .open_table(user_rows_table_def(&row_table_name))
                 .map_err(map_row_table_error)?;
+            // clear 再利用の 1 面スクラッチ（Issue #398。`tenant.rs`・
+            // `storage.rs::Storage::put_batch` の同パターンと揃える）。
+            let mut scratch: Vec<u8> = Vec::new();
             for (id, row) in rows {
                 schema.validate_embedding_dim(row.embedding.len())?;
-                let encoded = crate::storage::encode_row(row).map_err(convert_storage_error)?;
+                scratch.clear();
+                crate::storage::encode_row_into(&mut scratch, row)
+                    .map_err(convert_storage_error)?;
                 // 物理キーは `(tenant_id, id)`（TABLE-12。`insert_row_into_table` と同じ）。
-                row_table.insert((row.tenant_id, *id), encoded.as_slice())?;
+                row_table.insert((row.tenant_id, *id), scratch.as_slice())?;
             }
         }
         bump_table_generation_in_txn(&write_txn, table_name)?;
