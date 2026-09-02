@@ -367,3 +367,12 @@ btree.rs::BtreeMut::insert_reserve`）は `vec![0u8; value_length]` の零埋め
 production コード（`crates/engine/src/`）は無変更のまま **不採用**（Rejected）
 と判断。詳細な静的解析・実測表・判断根拠は
 `docs/design/redb-insert-reserve-zero-copy.md` を参照。
+
+## Issue #401 追記
+
+Issue #398 追記節で高負荷のため記録できなかった前後比較（`feature_bench` 13
+フェーズ・本ベンチの段別内訳）を、Phase 2（親 Issue #395）を通した総括として
+before（`61fc943`）/after（`origin/main`）交互実測で記録した。前後比較表・
+棄却判断（`Durability::None`・2 相 commit・キー順挿入）・PostgreSQL `COPY` の
+バッファ二重基準と `batch_limits.rs`／行形 `insert_rows` の対比は
+`docs/design/ingest-write-path.md` を参照。
