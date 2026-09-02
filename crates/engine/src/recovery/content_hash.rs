@@ -30,9 +30,19 @@
 //! 呼び出し元は `crate::tenant::*_unchecked`（6 箇所。TASK-93 の台帳追記と同一の
 //! write トランザクション内でハッシュ計算済みの値を渡す設計）。各操作種別の入力
 //! レイアウトは対応する `for_*` 関数のコメントを参照。
+//!
+//! `encode_row` を経由する操作種別（挿入・バッチ挿入・更新）は、呼び出し元が
+//! **1 回だけ** `encode_row` した結果（`&[u8]`）を受け取る `for_*_encoded` 系を
+//! production から呼ぶ（Issue #397。encoded バイト列は台帳ハッシュと redb 書き込みの
+//! 双方で共有され、以前存在した「ハッシュ計算用と書き込み用でそれぞれ 1 回ずつ、
+//! 合計 2 回 `encode_row` する」二重実行を排除する）。`RowInput` を受けて内部で
+//! `encode_row` する旧形（`for_insert`／`for_insert_batch`／`for_update`）は
+//! `#[cfg(test)]` の参照実装として残し、`for_*_encoded` との等価性テストにのみ使う。
 
 use crate::row_codec::Value;
-use crate::storage::{encode_row, RowInput, StorageError, Visibility};
+#[cfg(test)]
+use crate::storage::{encode_row, RowInput};
+use crate::storage::{StorageError, Visibility};
 
 /// SHA-256 ダイジェスト（32 バイト）を保持する台帳内容ハッシュ。中身の生バイト列は
 /// [`ContentHash::as_bytes`] 経由でのみ参照する（`recovery::ledger` の台帳値
@@ -177,19 +187,46 @@ fn push_named_scalar_columns(
 
 /// `insert_row_unchecked` 用（TASK-101 対象経路 1）。入力: `(id, encoded_row)`。
 /// `encoded_row` は [`crate::storage::encode_row`] の出力（`tenant_id`・`visibility`・
-/// `embedding`・`metadata` を含む正準表現。呼び出し元がクライアント要求から構築した
-/// [`RowInput`] をそのままエンコードしたもの）。
-pub(crate) fn for_insert(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
-    let encoded = encode_row(row)?;
+/// `embedding`・`metadata` を含む正準表現）を**呼び出し元が 1 回だけ計算した結果**
+/// （Issue #397。以前は本関数が内部で `encode_row` し、呼び出し元が redb 書き込み用に
+/// 同じ行をもう一度 `encode_row` していた二重実行を、呼び出し元が事前エンコードした
+/// 結果をここと redb 書き込みの双方で共有する形に変更した。ハッシュ入力バイト列の
+/// レイアウトは変更前と完全一致する）。
+pub(crate) fn for_insert_encoded(id: u64, encoded_row: &[u8]) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::Insert);
     b.push_u64(id);
-    b.push_bytes(&encoded)?;
+    b.push_bytes(encoded_row)?;
     Ok(b.finish())
+}
+
+/// [`for_insert_encoded`] の参照実装（`RowInput` から内部で `encode_row` する旧形。
+/// production からは呼ばれず、`for_insert_encoded` との等価性テストのみに使うため
+/// `#[cfg(test)]`。Issue #353 が `sql/udf_call::eval` を同様の位置づけで残置した
+/// 運用に倣う）。
+#[cfg(test)]
+pub(crate) fn for_insert(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
+    let encoded = encode_row(row)?;
+    for_insert_encoded(id, &encoded)
 }
 
 /// `insert_rows_unchecked` 用（TASK-101 対象経路 2）。バッチ全体で 1 ハッシュ。
 /// 入力: 要求記載順の `(id, encoded_row)` 列（順序も入力に含める。並び替えた同一集合の
-/// 再送を意図的に区別する設計）。
+/// 再送を意図的に区別する設計）。`encoded_row` は呼び出し元が事前に 1 回だけ
+/// `encode_row` した結果（[`for_insert_encoded`] と同じ理由。Issue #397）。
+pub(crate) fn for_insert_batch_encoded(rows: &[(u64, &[u8])]) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilder::new(OpTag::InsertBatch);
+    b.0.extend_from_slice(&count.to_le_bytes());
+    for (id, encoded_row) in rows {
+        b.push_u64(*id);
+        b.push_bytes(encoded_row)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_insert_batch_encoded`] の参照実装（`#[cfg(test)]`。理由は [`for_insert`] 参照）。
+#[cfg(test)]
 pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHash, StorageError> {
     let count = u32::try_from(rows.len())
         .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
@@ -238,12 +275,20 @@ pub(crate) fn for_typed_insert(
 }
 
 /// `update_row_unchecked` 用（TASK-101 対象経路 4）。入力: `(id, encoded_row)`。
-pub(crate) fn for_update(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
-    let encoded = encode_row(row)?;
+/// `encoded_row` は呼び出し元が事前に 1 回だけ `encode_row` した結果
+/// （[`for_insert_encoded`] と同じ理由。Issue #397）。
+pub(crate) fn for_update_encoded(id: u64, encoded_row: &[u8]) -> Result<ContentHash, StorageError> {
     let mut b = HashInputBuilder::new(OpTag::Update);
     b.push_u64(id);
-    b.push_bytes(&encoded)?;
+    b.push_bytes(encoded_row)?;
     Ok(b.finish())
+}
+
+/// [`for_update_encoded`] の参照実装（`#[cfg(test)]`。理由は [`for_insert`] 参照）。
+#[cfg(test)]
+pub(crate) fn for_update(id: u64, row: &RowInput<'_>) -> Result<ContentHash, StorageError> {
+    let encoded = encode_row(row)?;
+    for_update_encoded(id, &encoded)
 }
 
 /// `delete_row_unchecked` 用（TASK-101 対象経路 5）。入力: `id` のみ（削除要求は
@@ -641,5 +686,73 @@ mod tests {
         let h_public = for_typed_insert(7, Visibility::Public, &embedding, &cols).expect("hash");
         let h_private = for_typed_insert(7, Visibility::Private, &embedding, &cols).expect("hash");
         assert_ne!(h_public, h_private);
+    }
+
+    // Issue #397 のピン留め: `for_insert_encoded` は「呼び出し元が事前エンコードした
+    // 結果を渡す」新形、`for_insert` は「内部で `encode_row` する」旧形（参照実装）。
+    // 同じ論理内容に対して常に同一ハッシュを返すことを確認し、事前エンコード共有化が
+    // ハッシュ入力バイト列を変えていないことを機械検証する（既存台帳エントリとの
+    // 互換の根拠）。
+    #[test]
+    fn for_insert_encoded_matches_reference_impl() {
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Private,
+            embedding: &[1.0, 2.0, 3.0, 4.0],
+            metadata: b"meta",
+        };
+        let encoded = encode_row(&row).expect("encode");
+        let h_new = for_insert_encoded(7, &encoded).expect("hash");
+        let h_ref = for_insert(7, &row).expect("hash");
+        assert_eq!(h_new, h_ref);
+    }
+
+    #[test]
+    fn for_insert_batch_encoded_matches_reference_impl() {
+        let row_a = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Private,
+            embedding: &[1.0, 2.0, 3.0],
+            metadata: b"meta-a",
+        };
+        let row_b = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[4.0, 5.0, 6.0],
+            metadata: b"",
+        };
+        let rows: [(u64, RowInput<'_>); 2] = [(1, row_a), (2, row_b)];
+        let h_ref = for_insert_batch(&rows).expect("hash");
+
+        let encoded_a = encode_row(&row_a).expect("encode");
+        let encoded_b = encode_row(&row_b).expect("encode");
+        let hash_input: [(u64, &[u8]); 2] = [(1, &encoded_a), (2, &encoded_b)];
+        let h_new = for_insert_batch_encoded(&hash_input).expect("hash");
+
+        assert_eq!(h_new, h_ref);
+    }
+
+    // 空バッチも一致する（境界値）。
+    #[test]
+    fn for_insert_batch_encoded_matches_reference_impl_for_empty_batch() {
+        let empty_rows: [(u64, RowInput<'_>); 0] = [];
+        let h_ref = for_insert_batch(&empty_rows).expect("hash");
+        let empty_hash_input: [(u64, &[u8]); 0] = [];
+        let h_new = for_insert_batch_encoded(&empty_hash_input).expect("hash");
+        assert_eq!(h_new, h_ref);
+    }
+
+    #[test]
+    fn for_update_encoded_matches_reference_impl() {
+        let row = RowInput {
+            tenant_id: "tenant-a",
+            visibility: Visibility::Public,
+            embedding: &[9.0, 8.0, 7.0],
+            metadata: b"updated",
+        };
+        let encoded = encode_row(&row).expect("encode");
+        let h_new = for_update_encoded(3, &encoded).expect("hash");
+        let h_ref = for_update(3, &row).expect("hash");
+        assert_eq!(h_new, h_ref);
     }
 }

@@ -195,3 +195,184 @@ cargo run --release -p engine --example feature_bench
   （ファイル形 `INSERT` 経路）の段別内訳。
 - 専有環境での確定測定・複数規模点（rows/dim の掃引）の系統的記録
   （env による 1 点確認のみ）。
+
+## Issue #397 追記: `encode_row` の二重実行排除
+
+- ステータス: Accepted（`crates/engine/src/` へ production 変更あり）
+- 対応: Issue #397（`perf(engine): encode_row の二重実行を排除（エンコード済み
+  バイト列を content_hash と書き込みで共有）`）
+
+上記「後続への示唆」節で見積もった「content_hash 側の encode（I3 内部）と行ループ側
+の encode（I5）の共有化」を実装した。`tenant.rs::insert_rows_unchecked`（バッチ
+INSERT）・`insert_row_unchecked`（単一 INSERT）・`update_row_unchecked`（UPDATE）の
+3 経路で、行を要求記載順に **1 回だけ** `storage::encode_row` し、その結果を
+`recovery::content_hash::for_insert_batch_encoded`／`for_insert_encoded`／
+`for_update_encoded`（いずれも `encoded_row: &[u8]` を受け取る新形）と redb 書き込み
+の双方で共有する。ハッシュ入力バイト列のレイアウト（`DOMAIN_TAG`・`OpTag`・長さ
+プレフィクス・連結順）は変更していない（`RowInput` から内部で `encode_row` する旧形
+`for_insert`／`for_insert_batch`／`for_update` を `#[cfg(test)]` の参照実装として
+残し、新形との等価性を単体テストで機械検証。既存台帳エントリとの互換は
+`tests/ingest_profile_accept.rs::content_hash_insert_batch_reimpl_matches_stored_op_ledger_hash`
+〔独立再実装との照合。production 側は無関係のため本 Issue の変更前後で無変更のまま
+green〕でも確認済み）。
+
+エラー優先順位も変更前と同一に保っている: バッチ経路は事前エンコードを台帳記録より
+前・要求記載順で行うため、encode 失敗が最初に発生する行・エラー種別は変更前と同じ
+（`crates/engine/tests/recovery_content_hash.rs::
+insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch`）。
+UPDATE 経路は `validate_embedding_dim` の位置を変えていない（変更前から
+`content_hash::for_update` 内部の `encode_row` より前で無条件に走っていたため、
+その `encode_row` を共有用に外出ししても位置関係は変わらない。
+`update_row_embedding_dim_mismatch_takes_priority_over_operation_id_content_mismatch`）。
+
+### 前後比較実測
+
+計測環境は本ファイル冒頭の実測環境と同一（共有計測環境。`rows=1,000・dim=128`・
+既定 `make bench-ingest-profile`）。
+
+| 段 | 変更前（本ファイル上記実測。encode+SHA を含む I3 ＋ 別途 I5） | 変更後（I5 を先に 1 回・I3 は SHA のみ） |
+| --- | --- | --- |
+| I3（content_hash） | 1.70〜1.73 ms/1,000 行 | 1.58〜1.59 ms/1,000 行 |
+| I5（encode） | 0.09〜0.11 ms/1,000 行（次元検証込み） | 0.08〜0.11 ms/1,000 行（encode のみ） |
+| I3＋I5 合計 | 約 1.80〜1.83 ms/1,000 行 | 約 1.67〜1.70 ms/1,000 行 |
+| Σ（I1..I8） | — | 2.85〜2.86 ms/1,000 行 |
+| E0（e2e） | 3.58〜3.77 ms/1,000 行 | 3.53〜3.57 ms/1,000 行（3 回実測） |
+
+encode の実行回数は段モデル上で 2 回（I3 内部の再 encode ＋ I5）→ 1 回（I5 のみ。
+I3 は共有結果への SHA-256 適用のみ）へ構造的に半減しており、これは実装（本ファイル
+「測定設計」節の段の再実装・`tenant.rs` の事前エンコード化）から直接導かれる事実
+である。時間面では I3＋I5 合計が約 0.1〜0.15 ms/1,000 行（1 回分の encode コストと
+同オーダー）減っており構造的半減と整合するが、E0・Σ を含む全体としては共有計測
+環境の run-to-run 変動（Issue #366・#365 と同じ扱い）の範囲内にとどまり、統計的に
+有意な e2e 改善とまでは主張しない。支配的段は I3（SHA-256 計算コスト）・I6（redb
+insert）のままで変わらず、本変更単独でのボトルネック解消は意図していない
+（見積もり通り「Σ 全体を数 % 程度削減」の範囲）。
+
+### スコープ外（申し送り）
+
+- エンコードバッファの再利用・ストリーミング SHA-256（`push_bytes` の内部コピーを
+  含む複数回コピーの削減）は本 Issue のスコープ外（Issue 起票は自動運転では行わず
+  ユーザー承認を経てから判断）。
+- `insert_typed_row_unchecked`／`replace_typed_rows_by_text_key` は `encode_row` を
+  経由しない別経路（`content_hash.rs` モジュールドキュメント参照）のため対象外。
+- 専有環境での確定測定は引き続き未実施。
+
+## Issue #398 追記: 行エンコードのバッファ再利用と embedding バルク LE 変換
+
+Issue #397 で encode 実行回数を 1 行 1 回へ揃えた後も、`insert_rows_unchecked`
+は行数分の `Vec<u8>` 確保（`encoded_rows: Vec<Vec<u8>>`）が残っていた。本 Issue は
+その確保回数そのものを削減する。
+
+### 変更内容
+
+- `storage::encode_row_into(&mut Vec<u8>, &RowInput) -> Result<()>`（append 型。
+  呼び出し元が保持するバッファへ追記する）・`storage::encoded_row_len(&RowInput)
+  -> Result<usize>`（書き込み前のサイズ計算。検証込み）を追加。既存
+  `storage::encode_row` はこれらへ委譲する薄いラッパーへ変更（出力バイト列は
+  完全一致。単体テスト `encode_row_into_matches_encode_row` で固定）。
+- embedding 部分は要素ごとの `extend_from_slice` から、事前に長さ分を確保した
+  領域へ `chunks_exact_mut(4)` + `copy_from_slice(&v.to_le_bytes())` で書く
+  バルク変換（`extend_f32_le`）へ変更。`to_le_bytes` ベースのためホスト
+  エンディアンに依存しない（単体テスト
+  `encode_row_into_embedding_bytes_are_little_endian_fixed` で固定バイト列と
+  照合。`make check-cross`〔aarch64〕でクロスコンパイル確認済み）。
+- `tenant.rs::insert_rows_unchecked`: 行数分の `Vec<Vec<u8>>` 確保を、連続 arena
+  （`arena: Vec<u8>`）＋ 各行の範囲表（`ranges: Vec<Range<usize>>`）へ置換。
+  総サイズは `encoded_row_len` で事前に `checked_add` 積算し
+  `try_reserve_exact` で 1 回だけ確保する。範囲は `encode_row_into` 呼び出し
+  前後の `arena.len()` から機械的に導出するため、行の取り違え（別行のバイト列を
+  書き込む事故）は起きない（単体テスト
+  `insert_rows_batch_rows_round_trip_with_varying_lengths` で読み戻し一致を
+  機械検証）。
+- `tenant.rs::replace_typed_rows_by_text_key`（`execute_insert_sql_batch` 経路）・
+  `storage.rs::Storage::put_batch`・`catalog.rs::insert_rows_into_table` は、
+  台帳ハッシュがエンコード済みバイト列を使わないため連続 arena は不要と判断し、
+  行ループ内で `scratch.clear()` → `encode_row_into` する clear 再利用の 1 面
+  スクラッチへ置換した（1 バッチ 1 バッファより単純で、行数分の確保を避ける
+  効果は同等）。
+
+### 検証
+
+- 出力バイト列の完全一致・エラー時のバッファ不変・エンディアン非依存は
+  `storage.rs` の単体テストで固定（`encode_row_into_matches_encode_row`・
+  `encode_row_into_appends_after_existing_prefix`・
+  `encode_row_into_leaves_buffer_unchanged_on_error`・
+  `encode_row_into_embedding_bytes_are_little_endian_fixed`・
+  `encoded_row_len_matches_actual_encoded_len`）。
+- 台帳ハッシュ入力バイト列・記録順序・エラー優先順位（encode 失敗 → 台帳照合 →
+  IdConflict）は不変であることを既存の回帰テストで確認済み
+  （`crates/engine/tests/recovery_content_hash.rs::
+  insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch`・
+  `insert_resend_same_content_is_23505_and_different_content_is_022023` 系・
+  `crates/engine/tests/ingest_profile_accept.rs::
+  content_hash_insert_batch_reimpl_matches_stored_op_ledger_hash`）。
+- `put_batch` のバッチ途中 encode 失敗時の全トランザクション破棄は
+  `crates/engine/tests/persistence.rs::
+  persist2_put_batch_discards_whole_transaction_on_mid_batch_encode_failure`
+  で確認済み。
+- `cargo test -p engine --lib`（1,215 件）・関連結合テスト（`recovery_content_
+  hash`・`ingest_profile_accept`・`incremental_index`・`incremental_recall`・
+  `batch_limits`・`persistence`・`power_loss`・`index_failure_injection`・
+  `sql_surface`）・`cargo clippy -p engine --all-targets -- -D warnings`・
+  `make check-cross`（aarch64）はいずれも green。
+
+### 前後比較実測
+
+共有計測環境（本ファイル冒頭・Issue #397 追記節と同一環境）が本セッション実行時
+に他エージェントの並列実行で高負荷状態にあり、`make bench-ingest-profile`
+（release ビルド・多数回試行）を安定した条件で再実行できなかったため、本 Issue
+の前後比較実測は本コミットには含めない。構造面での削減は実装から直接導かれる
+事実として記録する:
+
+- I5（encode）の `Vec<u8>` アロケーション回数は行数分（Issue #397 時点で
+  `encoded_rows: Vec<Vec<u8>>` が保持していた本数）から、バッチ経路
+  （`insert_rows_unchecked`）では 1 バッチ 1 回（`arena: Vec<u8>` の
+  `try_reserve_exact` 1 回のみ）へ削減。`put_batch`・`insert_rows_into_table`・
+  `replace_typed_rows_by_text_key` も同様に、行ループ内の確保をゼロ回
+  （`scratch.clear()` の再利用のみ）へ削減。
+- embedding 部分の書き込みは要素ごとの `extend_from_slice` 呼び出し（dim 回）
+  から、事前確保した領域への `chunks_exact_mut` バルク書き込み（1 回の
+  確保 + dim 回のコピーのみ、Vec の再確保・再配置なし）へ変更。次元が大きい
+  ほど、要素ごとの `extend_from_slice` が伴いうる再確保コストの削減効果が
+  大きくなる想定（本コミットでは未実測）。
+- 専有環境（または安定した共有環境）での `make bench-ingest-profile`
+  前後比較・`BENCH_INGEST_PROFILE_ROWS=200 BENCH_INGEST_PROFILE_DIM=64`／
+  `BENCH_INGEST_PROFILE_DIM=1024` の規模点確認は、運用者作業として申し送る
+  （Issue #314・#366 等、同種の専有環境実測待ちの既存申し送りと同じ扱い）。
+
+### スコープ外（申し送り）
+
+- `content_hash::HashInputBuilder::push_bytes` の内部コピー削減・ストリーミング
+  SHA-256（Issue #397 申し送りの継続）。
+- `replace_typed_rows_by_text_key` の embedding `clone()`・
+  `encode_scalar_columns` の行ごと確保。
+- `txn.rs::WriteTxn::put`／`BatchWriteTxn::put`（単一行 API）のスクラッチ化
+  （呼び出し元が行ループを持つため、API 形状変更を伴う）。
+- `incremental.rs::index_file_batch` のファイル横断 1 面スクラッチ（本 Issue の
+  実装ステップでは対象外に留めた。既存の単一ファイル単位トランザクション構造の
+  ままで足りると判断）。
+- 専有環境での確定測定。
+
+## Issue #400 追記
+
+I6（redb insert）段の中間コピー排除を狙い、redb 4.2.0 `Table::insert_reserve`
+（`&[u8]` が `MutInPlaceValue` を実装済みのため `unsafe` 不要で呼べる）を
+bench 側 A/B 計測モードとして試作・実測した。redb 内部（`tree_store/
+btree.rs::BtreeMut::insert_reserve`）は `vec![0u8; value_length]` の零埋め
+ヒープ確保を通常の insert 経路へ渡す実装であり「ゼロコピー」にはならない
+構造だと静的解析で確認したうえで、実測でも I6 段が `insert` 比で中央値
+約 +49.8%（dim=128・rows=1,000・交互 5 ペア。二重エンコードを含んでいた
+訂正前計測では約 +97% だったが、計測範囲の訂正〔codex-review 指摘・PR #420〕
+後もなお悪化）することを確認した。
+production コード（`crates/engine/src/`）は無変更のまま **不採用**（Rejected）
+と判断。詳細な静的解析・実測表・判断根拠は
+`docs/design/redb-insert-reserve-zero-copy.md` を参照。
+
+## Issue #401 追記
+
+Issue #398 追記節で高負荷のため記録できなかった前後比較（`feature_bench` 13
+フェーズ・本ベンチの段別内訳）を、Phase 2（親 Issue #395）を通した総括として
+before（`61fc943`）/after（`origin/main`）交互実測で記録した。前後比較表・
+棄却判断（RECOVER-5／RECOVER-6／RECOVER-8 ポインタ）・PostgreSQL `COPY` の
+バッファ二重基準と `batch_limits.rs`／行形 `insert_rows` の対比は
+`docs/design/ingest-write-path.md` を参照。

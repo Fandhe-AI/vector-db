@@ -191,13 +191,20 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 
 `make bench-ingest-profile`（`crates/engine/benches/ingest_profile_bench.rs`）は、
 書き込み経路（`engine::tenant::insert_rows` → `insert_rows_unchecked`）を所有権
-検査・`begin_write`・content_hash・台帳記録・encode・redb insert・世代更新・
-commit の段別に分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供
+検査・`begin_write`・encode（1 回。台帳の内容照合ハッシュと redb 書き込みで共有。
+Issue #397）・content_hash・台帳記録・redb insert・世代更新・commit の段別に
+分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供
 専用のベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
 `GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
 `BENCH_INGEST_PROFILE_ROWS`／`BENCH_INGEST_PROFILE_DIM` でバッチ行数・次元を
-上書きできます（許容範囲外・非数値は fail-closed に拒否）。実測結果・設計は
-`docs/design/ingest-stage-profile.md` を参照してください。
+上書きできます（許容範囲外・非数値は fail-closed に拒否）。`BENCH_INGEST_PROFILE_
+INSERT_MODE`（`insert`〔既定〕／`reserve`）で I6 段の redb `insert_reserve` A/B
+計測モードを切替できます（Issue #400。`insert`／`reserve` 以外は fail-closed に
+拒否）。実測結果・設計は `docs/design/ingest-stage-profile.md`・
+`docs/design/redb-insert-reserve-zero-copy.md` を参照してください。
+Phase 2（親 Issue #395）を通した前後比較・棄却判断（RECOVER-5／RECOVER-6／
+RECOVER-8 ポインタ）・バッチ上限の申し送りは `docs/design/ingest-write-path.md`
+（Issue #401）を参照してください。
 
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 
