@@ -34,7 +34,11 @@
 //! 持たないため `total_cmp` を使い、非有限値は構築入力の段で拒否する
 //! （[`HnswError::NonFiniteVector`]）ため探索段では常に有限値のみを比較する。
 //! ソートは安定ソート（`sort_by`）のみを使う（`sort_unstable_by` 系は
-//! `scripts/check_sort_determinism.sh` が禁止する）。
+//! `scripts/check_sort_determinism.sh` が禁止する）。入力ベクトルが有限
+//! （`NonFiniteVector` 検証済み）でも、有限な大きな `f32` 同士の積・総和は
+//! オーバーフロー（`Inf`）や `NaN` になり得るため、`dot` の呼び出し直後にも
+//! 結果が有限か検証し、非有限なら `HnswError::NonFiniteScore` として拒否する
+//! （codex-review #423 P1 指摘）。
 //!
 //! # レベル割当の決定性・非暗号 PRNG
 //!
@@ -155,6 +159,17 @@ pub enum HnswError {
     /// 入力ベクトルに NaN／Inf が含まれる（構築後に順序を壊す経路を作らないため
     /// 構築段で拒否する）。
     NonFiniteVector { node: usize },
+    /// `dot` の計算結果が非有限（NaN／Inf）だった。各入力要素は
+    /// `NonFiniteVector` 検証で有限であることを確認済みでも、有限な大きな
+    /// `f32` 同士の積・その総和は `Inf`（オーバーフロー）や `NaN`（正負の
+    /// `Inf` の加算）になり得る。この非有限スコアが `ScoredNode::cmp`・
+    /// ヒープ・近傍選択へそのまま入ると「探索段では常に有限値のみを比較
+    /// する」契約が破れ、順序が壊れたグラフを正常結果として返してしまう
+    /// ため、`dot` を呼ぶ全経路（[`HnswIndex::score`]・
+    /// [`HnswIndex::repair_reachability`]・
+    /// [`HnswIndex::select_neighbors_heuristic`]・[`HnswIndex::shrink_links`]）
+    /// で計算直後に検証し fail-closed で拒否する。
+    NonFiniteScore { node: u32 },
     /// オフセット・容量計算が `usize`／`u32` の範囲を超えた。
     CapacityOverflow,
 }
@@ -177,6 +192,9 @@ impl fmt::Display for HnswError {
             }
             HnswError::NonFiniteVector { node } => {
                 write!(f, "vector for node {node} contains a non-finite value")
+            }
+            HnswError::NonFiniteScore { node } => {
+                write!(f, "dot product score for node {node} is non-finite")
             }
             HnswError::CapacityOverflow => write!(f, "capacity computation overflowed"),
         }
@@ -482,6 +500,9 @@ impl HnswIndex {
                 for &candidate in &reachable {
                     let cand_vec = node_vector(vectors, dim, candidate)?;
                     let score = dot(node_vec, cand_vec);
+                    if !score.is_finite() {
+                        return Err(HnswError::NonFiniteScore { node: candidate });
+                    }
                     // スコア降順・同点は id 昇順（モジュール冒頭の順序規約）。
                     // `reachable` は `HashSet<u32>` であり走査順はプロセス
                     // ごとに変わり得るハッシュ状態に依存するため、同点時に
@@ -855,6 +876,9 @@ impl HnswIndex {
             for &sel in &selected {
                 let sel_vec = node_vector(vectors, dim, sel.node)?;
                 let d_to_selected = dot(cand_vec, sel_vec);
+                if !d_to_selected.is_finite() {
+                    return Err(HnswError::NonFiniteScore { node: cand.node });
+                }
                 if d_to_selected > cand.score {
                     keep = false;
                     break;
@@ -953,10 +977,11 @@ impl HnswIndex {
         let mut scored: Vec<ScoredNode> = Vec::with_capacity(neighbor_ids.len());
         for id in neighbor_ids {
             let v = node_vector(vectors, dim, id)?;
-            scored.push(ScoredNode {
-                node: id,
-                score: dot(node_vec, v),
-            });
+            let d = dot(node_vec, v);
+            if !d.is_finite() {
+                return Err(HnswError::NonFiniteScore { node: id });
+            }
+            scored.push(ScoredNode { node: id, score: d });
         }
         scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
 
@@ -991,7 +1016,9 @@ impl HnswIndex {
 
     /// `dot(node, query)`。ノード id が範囲外／`vectors` が短すぎる場合は
     /// `NonFiniteVector` 相当ではなく、境界検証は [`node_vector`] が担う
-    /// （呼び出し元は構築時に検証済みの id しか渡さない内部専用パス）。
+    /// （呼び出し元は構築時に検証済みの id しか渡さない内部専用パス）。結果が
+    /// 非有限（オーバーフロー・`NaN`）なら `NonFiniteScore` として拒否する
+    /// （モジュール冒頭「順序規約」節参照）。
     fn score(
         &self,
         node: u32,
@@ -1000,7 +1027,11 @@ impl HnswIndex {
         vectors: &[f32],
     ) -> Result<f32, HnswError> {
         let v = node_vector(vectors, dim, node)?;
-        Ok(dot(v, query))
+        let d = dot(v, query);
+        if !d.is_finite() {
+            return Err(HnswError::NonFiniteScore { node });
+        }
+        Ok(d)
     }
 
     /// 構築済みパラメータを返す。

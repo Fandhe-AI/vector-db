@@ -147,6 +147,27 @@ fn build_rejects_non_finite_vector() {
 }
 
 #[test]
+fn build_rejects_overflow_induced_non_finite_score() {
+    // codex-review #423 P1 指摘の回帰テスト: 各成分は有限（`f32::MAX` 近傍）
+    // でも、内積計算（積・総和）は `f32` の範囲を超えて `Inf` へオーバーフロー
+    // し得る。`NonFiniteVector` の入力検証（各成分の `is_finite()`）はこの
+    // ケースを通してしまうため、`dot` の計算結果そのものを検証する
+    // `HnswError::NonFiniteScore` が拒否することを確認する。
+    let dim = 4usize;
+    let big = f32::MAX / 2.0;
+    // 各ノードは全成分が `big`（有限）の一様ベクトル。異なるノード同士の
+    // `dot` は `dim * big * big` となり `f32::MAX` を大きく超えて `Inf` に
+    // オーバーフローする。
+    let vectors: Vec<f32> = (0..4).flat_map(|_| vec![big; dim]).collect();
+    let err = HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 1)
+        .expect_err("overflowing dot product must be rejected");
+    assert!(
+        matches!(err, HnswError::NonFiniteScore { .. }),
+        "expected NonFiniteScore, got {err:?}"
+    );
+}
+
+#[test]
 fn build_empty_input_yields_empty_index() {
     let index = HnswIndex::build(HnswParams::default(), 8, &[], 1).unwrap();
     assert_eq!(index.len(), 0);
