@@ -195,3 +195,64 @@ cargo run --release -p engine --example feature_bench
   （ファイル形 `INSERT` 経路）の段別内訳。
 - 専有環境での確定測定・複数規模点（rows/dim の掃引）の系統的記録
   （env による 1 点確認のみ）。
+
+## Issue #397 追記: `encode_row` の二重実行排除
+
+- ステータス: Accepted（`crates/engine/src/` へ production 変更あり）
+- 対応: Issue #397（`perf(engine): encode_row の二重実行を排除（エンコード済み
+  バイト列を content_hash と書き込みで共有）`）
+
+上記「後続への示唆」節で見積もった「content_hash 側の encode（I3 内部）と行ループ側
+の encode（I5）の共有化」を実装した。`tenant.rs::insert_rows_unchecked`（バッチ
+INSERT）・`insert_row_unchecked`（単一 INSERT）・`update_row_unchecked`（UPDATE）の
+3 経路で、行を要求記載順に **1 回だけ** `storage::encode_row` し、その結果を
+`recovery::content_hash::for_insert_batch_encoded`／`for_insert_encoded`／
+`for_update_encoded`（いずれも `encoded_row: &[u8]` を受け取る新形）と redb 書き込み
+の双方で共有する。ハッシュ入力バイト列のレイアウト（`DOMAIN_TAG`・`OpTag`・長さ
+プレフィクス・連結順）は変更していない（`RowInput` から内部で `encode_row` する旧形
+`for_insert`／`for_insert_batch`／`for_update` を `#[cfg(test)]` の参照実装として
+残し、新形との等価性を単体テストで機械検証。既存台帳エントリとの互換は
+`tests/ingest_profile_accept.rs::content_hash_insert_batch_reimpl_matches_stored_op_ledger_hash`
+〔独立再実装との照合。production 側は無関係のため本 Issue の変更前後で無変更のまま
+green〕でも確認済み）。
+
+エラー優先順位も変更前と同一に保っている: バッチ経路は事前エンコードを台帳記録より
+前・要求記載順で行うため、encode 失敗が最初に発生する行・エラー種別は変更前と同じ
+（`crates/engine/tests/recovery_content_hash.rs::
+insert_rows_encode_error_takes_priority_over_operation_id_content_mismatch`）。
+UPDATE 経路は `validate_embedding_dim` の位置を変えていない（変更前から
+`content_hash::for_update` 内部の `encode_row` より前で無条件に走っていたため、
+その `encode_row` を共有用に外出ししても位置関係は変わらない。
+`update_row_embedding_dim_mismatch_takes_priority_over_operation_id_content_mismatch`）。
+
+### 前後比較実測
+
+計測環境は本ファイル冒頭の実測環境と同一（共有計測環境。`rows=1,000・dim=128`・
+既定 `make bench-ingest-profile`）。
+
+| 段 | 変更前（本ファイル上記実測。encode+SHA を含む I3 ＋ 別途 I5） | 変更後（I5 を先に 1 回・I3 は SHA のみ） |
+| --- | --- | --- |
+| I3（content_hash） | 1.70〜1.73 ms/1,000 行 | 1.58〜1.59 ms/1,000 行 |
+| I5（encode） | 0.09〜0.11 ms/1,000 行（次元検証込み） | 0.08〜0.11 ms/1,000 行（encode のみ） |
+| I3＋I5 合計 | 約 1.80〜1.83 ms/1,000 行 | 約 1.67〜1.70 ms/1,000 行 |
+| Σ（I1..I8） | — | 2.85〜2.86 ms/1,000 行 |
+| E0（e2e） | 3.58〜3.77 ms/1,000 行 | 3.53〜3.57 ms/1,000 行（3 回実測） |
+
+encode の実行回数は段モデル上で 2 回（I3 内部の再 encode ＋ I5）→ 1 回（I5 のみ。
+I3 は共有結果への SHA-256 適用のみ）へ構造的に半減しており、これは実装（本ファイル
+「測定設計」節の段の再実装・`tenant.rs` の事前エンコード化）から直接導かれる事実
+である。時間面では I3＋I5 合計が約 0.1〜0.15 ms/1,000 行（1 回分の encode コストと
+同オーダー）減っており構造的半減と整合するが、E0・Σ を含む全体としては共有計測
+環境の run-to-run 変動（Issue #366・#365 と同じ扱い）の範囲内にとどまり、統計的に
+有意な e2e 改善とまでは主張しない。支配的段は I3（SHA-256 計算コスト）・I6（redb
+insert）のままで変わらず、本変更単独でのボトルネック解消は意図していない
+（見積もり通り「Σ 全体を数 % 程度削減」の範囲）。
+
+### スコープ外（申し送り）
+
+- エンコードバッファの再利用・ストリーミング SHA-256（`push_bytes` の内部コピーを
+  含む複数回コピーの削減）は本 Issue のスコープ外（Issue 起票は自動運転では行わず
+  ユーザー承認を経てから判断）。
+- `insert_typed_row_unchecked`／`replace_typed_rows_by_text_key` は `encode_row` を
+  経由しない別経路（`content_hash.rs` モジュールドキュメント参照）のため対象外。
+- 専有環境での確定測定は引き続き未実施。
