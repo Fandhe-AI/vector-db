@@ -589,3 +589,88 @@ SparseIndexCache`（Issue #357）経由の構築機会も無い〕に加えて�
   実装のまま据え置いた（本 Issue でも変更していない）
 - 専有環境での再実測・真に隔離された RSS 増分の単独プロセス実測は
   オーナー／運用者判断で別途実施する
+
+## Issue #390: 可視ビットマップ＋posting 走査 1 パス化後の実測
+
+親 Issue #386（転置索引化）Phase 1 の最終タスクとして、`search`／
+`search_within`（`crates/engine/src/sparse.rs`）を Issue #389 で追加した
+転置索引（`postings`）へ切り替え、可視部分集合の全件線形走査（`docs: Vec<
+DocEntry>` を経由し各文書の `term_freq` を二分探索する方式）を、可視集合を
+`doc_idx` 空間のビットマップへ変換したうえでクエリ語ごとに `postings[t]`
+だけを辿る 1 パス走査（共通コア `score_by_postings`）へ置き換えた。
+`DocEntry`／`docs` フィールド自体を撤去し、`search`（`ScoreScope::All`）・
+`search_within`（`ScoreScope::Visible`。RLS 相当のテナント境界縮約契約は
+不変）の両方をこの共通コアへ統一した。スコアの f64 ビット一致は不変
+（`crates/engine/tests/hybrid_profile_accept.rs::profile_sparse_index_
+replica_matches_real_search_within`〔ベンチ起動時の忠実性検証としても実行〕・
+`tests/sparse_cache_recall.rs` の cold/hot 等価性・大規模段〔25,000 件〕・
+`tests/hybrid_recall.rs` 層 A 固定値アサーションで検証済み）。
+
+### 測定条件
+
+Issue #356・#387・#388・#389 と同一環境・同一コーパス・クエリ集合・
+プロトコル（25,000 行・dim 128・単一テナント・`MeasurementConfig::new(20,
+30, SEED)`）。非専有環境（並行エージェントあり）での 1 回実測であり、
+Issue #389 の実測値を参考基線として扱う。
+
+### 実測結果
+
+| 指標 | Issue #388/#389（参考基線） | 本実測（Issue #390） |
+| ---- | ---------------------------: | --------------------: |
+| `sparse_build_total` median | 48.1ms（#389） | 47.1ms（ノイズ帯内・不変。posting 走査化は build 経路を変更しないため想定どおり） |
+| `approx_heap_bytes()`（`SparseIndex` 保持時） | 19,553,564 バイト（約 18.65 MiB。#389） | 12,153,564 バイト（約 11.59 MiB。`docs: Vec<DocEntry>` 撤去分だけ縮小） |
+| `search_within_fetch_k=25000`（全可視集合。実 API・単発呼び出し） | 2.6〜3.4ms（#388） | median 1,267µs／p95 1,318µs（約 1.27〜1.32ms。基線比で概ね 2〜2.7 倍短縮） |
+| `hybrid_search_cached_index`（事前構築済み `SparseIndex`。実クエリ経由の hybrid 経路全体） | 25.3ms（#388） | median 9,699µs／p95 10,318µs（約 9.7〜10.3ms。基線比で概ね 2.5 倍短縮） |
+
+`search_within_fetch_k` は疎側再取得ループの各段（400〜25,000）でいずれも
+明確に短縮しており（例: `fetch_k=400` は median 478µs、`fetch_k=25000` は
+median 1,267µs で、可視集合サイズに対して準線形に近い伸び方を保っている）、
+可視集合の大きさに関わらず「密検索と同オーダー」（`sql_dense_knn` median
+6,152µs）を下回る水準まで達した。
+
+### 解釈
+
+- `search_within_fetch_k` の短縮は、旧実装（可視部分集合の全件線形走査＋
+  文書ごとの `term_freq` 二分探索）から「クエリ語ごとに posting list だけを
+  辿る」方式への計算量オーダーの変化（モジュール doc コメント参照）が
+  そのまま実測へ反映されたものと解釈できる
+- `hybrid_search_cached_index`（sparse index はキャッシュヒット・実際の
+  hybrid 検索経路。疎側再取得ループを含む）が 25.3ms → 9.7ms（概ね 2.5 倍）
+  短縮したことは、Issue #387 で確認した「疎側再取得ループが単発クエリ
+  レイテンシへ寄与する」構造（`sparse_refetch query=* calls=6〜7`）を踏まえ、
+  ループ 1 回あたりのコストが本 Issue の変更で大きく下がったことを裏付ける
+- `approx_heap_bytes()` の縮小（約 18.65 MiB → 約 11.59 MiB）は
+  `docs: Vec<DocEntry>`（各文書の `term_freq: Vec<(TermId, u32)>` を含む）
+  撤去分にほぼ相当する。`postings`・`doc_len`・`doc_ids` は既存のまま
+  （Issue #389 で構築済み）であり本 Issue では増減していない
+- `sparse_build_total` が変化しないのは想定どおり（本 Issue の変更対象は
+  `search`／`search_within` のみで、build 経路〔posting 構築含む〕は
+  Issue #389 のまま無変更）
+
+### 受け入れ条件との対応
+
+1. `search`／`search_within` を可視ビットマップ＋posting 走査の共通コアへ
+   統一し、`DocEntry`／`docs` を撤去した（`crates/engine/src/sparse.rs`）
+2. 旧実装（`BTreeMap<String,u32>` 参照実装・`harness/hybrid_profile.rs::
+   ProfileSparseIndex` 複製）との等価性を単体テスト（部分可視・境界値
+   ケース含む）・25,000 件規模の cold/hot 等価性テスト
+   （`tests/sparse_cache_recall.rs`）で固定した
+3. `make bench-hybrid-profile` を実行し、`search_within_fetch_k`・
+   `hybrid_search_cached_index`・`approx_heap_bytes` の前後比較を上表に
+   記録した（目標「密検索と同オーダー」を達成）
+4. Recall 層 A（固定値アサーション。`tests/hybrid_recall.rs`）は
+   green のまま不変（スコアのビット一致契約により構造的に不変）
+
+### 申し送り
+
+- ビットマップ構築（`VisibleBitmap::build`。`BTreeSet` 走査＋`HashMap`
+  lookup × 可視集合サイズ）が疎側再取得ループの各段で毎回再構築される点
+  （再取得ループ間でのビットマップ再利用）は #392 領域の判断材料として
+  申し送る
+- `postings` の CSR 形・量子化・skip list への圧縮は引き続き #391 以降・
+  #394 の判断材料
+- 段別観測フック（`search_within` 内部の bitmap 構築／posting 走査／
+  Top-k 選出の内訳）は本 Issue では追加していない（`search_within_fetch_k`
+  の外形計測に留めた）。より細かい内訳が必要になった場合の追加ポイントは
+  `sparse.rs::score_by_postings` 内の各段
+- 専有環境での再実測はオーナー／運用者判断で別途実施する
