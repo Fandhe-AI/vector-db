@@ -146,6 +146,42 @@ fn main() {
         );
     }
 
+    let doc_refs = corpus.sparse_docs();
+
+    // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
+    // プロセス内で `core.execute_sql` を一度も呼んでいない、つまり
+    // `sql/sparse_cache.rs::SparseIndexCache`（Issue #357）経由で
+    // `SparseIndex` が構築される機会がまだ一切無い時点で 1 回だけ計測する
+    // （codex-review 指摘・PR #424: 下流の `sql_hybrid_measurement` は
+    // `core.execute_sql` の hybrid_rrf 経路を反復実行しており、疎索引キャッシュ
+    // により初回呼び出し時点で既に `SparseIndex::build` が実行済みになる。
+    // その後で計測すると「未ウォーム状態からの増分」という前提が崩れ、
+    // アロケータが直前の確保分のページを再利用して増分を過小評価しうる。
+    // そのため本計測は SQL 実行（テーブル作成・投入・COUNT(*)・hybrid/dense
+    // いずれのクエリも含む）より前、コーパス生成直後に置く）。
+    // `SparseIndex` を保持したまま前後の VmRSS を比較する（保持しなければ
+    // drop されて増分を観測できない）。`approx_heap_bytes()` はテスト・
+    // ベンチ以外の一般利用側（`sql/sparse_cache.rs`）が実際に参照する
+    // 概算値であり、RSS 実測と並記することで概算の妥当性を突き合わせられる。
+    let vm_rss_kb_before = harness::proc_stats::read_vm_rss_kb();
+    let resident_index = SparseIndex::build(&doc_refs)
+        .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (memory) failed: {e}")));
+    let approx_heap_bytes = resident_index.approx_heap_bytes();
+    let vm_rss_kb_after = harness::proc_stats::read_vm_rss_kb();
+    let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();
+    println!(
+        "{}",
+        harness::hybrid_profile::render_memory_line(
+            approx_heap_bytes,
+            vm_rss_kb_before,
+            vm_rss_kb_after,
+            vm_hwm_kb,
+        )
+    );
+    // `resident_index` は RSS 差分計測の対象そのものであり、以降の段では参照
+    // しないため、計測直後に明示的に drop してよい（メモリ計測意図の明確化）。
+    drop(resident_index);
+
     // --- SQL 段用の一時 DB へ投入 ---
     let path = unique_db_path("issue356-hybrid-profile");
     let _guard = CleanupGuard(path.clone());
@@ -285,38 +321,6 @@ fn main() {
             NUM_DOCS,
         )
     );
-
-    let doc_refs = corpus.sparse_docs();
-
-    // --- Issue #389: SparseIndex 常駐時の常駐メモリ（RSS）増分 -----------------
-    // 反復計測（下記 `build_measurement`）より前に、プロセス起動後まだ
-    // `SparseIndex::build` を一度も実行していない時点で 1 回だけ計測する
-    // （codex-review 指摘・PR #424: 反復ビルド後に計測するとアロケータが
-    // 直前の解放分のページを再利用し、`vm_rss_kb_after - vm_rss_kb_before`
-    // が実際の常駐メモリ増分を過小評価しうる。ウォームアップ前に計測する
-    // ことで、この経路で最初に確保されるページに限定した増分を観測する）。
-    // `SparseIndex` を保持したまま前後の VmRSS を比較する（保持しなければ
-    // drop されて増分を観測できない）。`approx_heap_bytes()` はテスト・
-    // ベンチ以外の一般利用側（`sql/sparse_cache.rs`）が実際に参照する
-    // 概算値であり、RSS 実測と並記することで概算の妥当性を突き合わせられる。
-    let vm_rss_kb_before = harness::proc_stats::read_vm_rss_kb();
-    let resident_index = SparseIndex::build(&doc_refs)
-        .unwrap_or_else(|e| fail_closed(format!("SparseIndex::build (memory) failed: {e}")));
-    let approx_heap_bytes = resident_index.approx_heap_bytes();
-    let vm_rss_kb_after = harness::proc_stats::read_vm_rss_kb();
-    let vm_hwm_kb = harness::proc_stats::read_vm_hwm_kb();
-    println!(
-        "{}",
-        harness::hybrid_profile::render_memory_line(
-            approx_heap_bytes,
-            vm_rss_kb_before,
-            vm_rss_kb_after,
-            vm_hwm_kb,
-        )
-    );
-    // `resident_index` は RSS 差分計測の対象そのものであり、以降の段では参照
-    // しないため、計測直後に明示的に drop してよい（メモリ計測意図の明確化）。
-    drop(resident_index);
 
     let build_measurement = run(&config, || {
         SparseIndex::build(&doc_refs)
