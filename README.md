@@ -197,8 +197,11 @@ Issue #397）・content_hash・台帳記録・redb insert・世代更新・commi
 専用のベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
 `GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
 `BENCH_INGEST_PROFILE_ROWS`／`BENCH_INGEST_PROFILE_DIM` でバッチ行数・次元を
-上書きできます（許容範囲外・非数値は fail-closed に拒否）。実測結果・設計は
-`docs/design/ingest-stage-profile.md` を参照してください。
+上書きできます（許容範囲外・非数値は fail-closed に拒否）。`BENCH_INGEST_PROFILE_
+INSERT_MODE`（`insert`〔既定〕／`reserve`）で I6 段の redb `insert_reserve` A/B
+計測モードを切替できます（Issue #400。`insert`／`reserve` 以外は fail-closed に
+拒否）。実測結果・設計は `docs/design/ingest-stage-profile.md`・
+`docs/design/redb-insert-reserve-zero-copy.md` を参照してください。
 
 ### クロスエンコーダリランカーの実測手順（Issue #333）
 

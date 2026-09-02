@@ -352,3 +352,18 @@ Issue #397 で encode 実行回数を 1 行 1 回へ揃えた後も、`insert_ro
   実装ステップでは対象外に留めた。既存の単一ファイル単位トランザクション構造の
   ままで足りると判断）。
 - 専有環境での確定測定。
+
+## Issue #400 追記
+
+I6（redb insert）段の中間コピー排除を狙い、redb 4.2.0 `Table::insert_reserve`
+（`&[u8]` が `MutInPlaceValue` を実装済みのため `unsafe` 不要で呼べる）を
+bench 側 A/B 計測モードとして試作・実測した。redb 内部（`tree_store/
+btree.rs::BtreeMut::insert_reserve`）は `vec![0u8; value_length]` の零埋め
+ヒープ確保を通常の insert 経路へ渡す実装であり「ゼロコピー」にはならない
+構造だと静的解析で確認したうえで、実測でも I6 段が `insert` 比で中央値
+約 +49.8%（dim=128・rows=1,000・交互 5 ペア。二重エンコードを含んでいた
+訂正前計測では約 +97% だったが、計測範囲の訂正〔codex-review 指摘・PR #420〕
+後もなお悪化）することを確認した。
+production コード（`crates/engine/src/`）は無変更のまま **不採用**（Rejected）
+と判断。詳細な静的解析・実測表・判断根拠は
+`docs/design/redb-insert-reserve-zero-copy.md` を参照。
