@@ -19,9 +19,9 @@ mod harness;
 
 use harness::ingest_profile::{
     content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
-    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env,
-    refuse_under_github_actions, residual_ns_per_row, sha256_reimpl, sum_durations,
-    IngestProfileError, StageId, StageSamples,
+    encode_row_reimpl_into_slice, last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row,
+    parse_bounded_env, parse_insert_mode, refuse_under_github_actions, residual_ns_per_row,
+    sha256_reimpl, sum_durations, IngestProfileError, InsertMode, StageId, StageSamples,
 };
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
@@ -429,4 +429,102 @@ fn stage_id_labels_are_unique_and_all_covers_eight_stages() {
     labels.sort_unstable();
     labels.dedup();
     assert_eq!(labels.len(), 8);
+}
+
+// --- Issue #400: InsertMode / encode_row_reimpl_into_slice の回帰 -----------
+
+#[test]
+fn parse_insert_mode_defaults_to_insert_when_unset() {
+    assert_eq!(
+        parse_insert_mode(None).expect("default"),
+        InsertMode::Insert
+    );
+}
+
+#[test]
+fn parse_insert_mode_accepts_insert_and_reserve() {
+    assert_eq!(
+        parse_insert_mode(Some("insert")).expect("insert"),
+        InsertMode::Insert
+    );
+    assert_eq!(
+        parse_insert_mode(Some("reserve")).expect("reserve"),
+        InsertMode::Reserve
+    );
+}
+
+#[test]
+fn parse_insert_mode_rejects_empty_string() {
+    let err = parse_insert_mode(Some("")).unwrap_err();
+    assert!(matches!(err, IngestProfileError::InvalidEnv { .. }));
+}
+
+#[test]
+fn parse_insert_mode_rejects_wrong_case() {
+    // fail-closed: 大文字小文字違いを黙って既定へフォールバックしない
+    // （coding-rust.md「untrusted 入力の扱い」）。
+    assert!(parse_insert_mode(Some("Insert")).is_err());
+    assert!(parse_insert_mode(Some("RESERVE")).is_err());
+}
+
+#[test]
+fn parse_insert_mode_rejects_unknown_value() {
+    let err = parse_insert_mode(Some("foo")).unwrap_err();
+    assert!(matches!(err, IngestProfileError::InvalidEnv { .. }));
+}
+
+#[test]
+fn encode_row_reimpl_into_slice_matches_encode_row_reimpl_byte_for_byte() {
+    let embedding = [0.5f32, -1.25, 3.0, 0.0];
+    let metadata = b"{\"path\":\"docs/a.md\"}";
+    let expected = encode_row_reimpl("tenant-x", true, &embedding, metadata)
+        .expect("encode_row_reimpl baseline");
+
+    let mut dst = vec![0u8; expected.len()];
+    encode_row_reimpl_into_slice(&mut dst, "tenant-x", true, &embedding, metadata)
+        .expect("encode_row_reimpl_into_slice");
+
+    assert_eq!(dst, expected);
+}
+
+#[test]
+fn encode_row_reimpl_into_slice_matches_for_private_row_and_empty_metadata() {
+    let embedding = [1.0f32, 2.0];
+    let metadata: &[u8] = b"";
+    let expected =
+        encode_row_reimpl("t", false, &embedding, metadata).expect("encode_row_reimpl baseline");
+
+    let mut dst = vec![0u8; expected.len()];
+    encode_row_reimpl_into_slice(&mut dst, "t", false, &embedding, metadata)
+        .expect("encode_row_reimpl_into_slice");
+
+    assert_eq!(dst, expected);
+}
+
+#[test]
+fn encode_row_reimpl_into_slice_rejects_length_mismatch() {
+    let embedding = [1.0f32, 2.0, 3.0];
+    let metadata = b"abc";
+    let expected = encode_row_reimpl("tenant", true, &embedding, metadata)
+        .expect("encode_row_reimpl baseline");
+
+    // 1 バイト短いスライスは Err（`unsafe` を使わない範囲検証。calling-rust.md
+    // 「受信データ経路での添字アクセス禁止」と同方針をベンチ再実装に適用）。
+    let mut too_short = vec![0u8; expected.len() - 1];
+    let err = encode_row_reimpl_into_slice(&mut too_short, "tenant", true, &embedding, metadata)
+        .unwrap_err();
+    assert!(matches!(err, IngestProfileError::Codec(_)));
+
+    // 1 バイト長いスライスも Err。
+    let mut too_long = vec![0u8; expected.len() + 1];
+    let err = encode_row_reimpl_into_slice(&mut too_long, "tenant", true, &embedding, metadata)
+        .unwrap_err();
+    assert!(matches!(err, IngestProfileError::Codec(_)));
+}
+
+#[test]
+fn encode_row_reimpl_into_slice_rejects_empty_tenant_id() {
+    let mut dst = vec![0u8; 16];
+    let err = encode_row_reimpl_into_slice(&mut dst, "", true, &[1.0], b"m").unwrap_err();
+    assert!(matches!(err, IngestProfileError::Codec(_)));
 }
