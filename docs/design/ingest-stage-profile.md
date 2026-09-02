@@ -353,6 +353,79 @@ Issue #397 で encode 実行回数を 1 行 1 回へ揃えた後も、`insert_ro
   ままで足りると判断）。
 - 専有環境での確定測定。
 
+## Issue #399 追記: 自作 SHA-256 のストリーミング化
+
+### 設計
+
+`recovery/content_hash.rs` の自作 SHA-256（依存最小方針。TASK-101・RECOVER-10
+ポインタ）を、バッチ全体（1,000 行 × 約 0.5KB ≈ 500KB）を `Vec<u8>` へ一度
+連結し、さらにパディングのため丸ごと複製していた一括処理版から、ブロック単位
+ストリーミング更新型の `Sha256`（`update`/`finalize`）へ再構成した。
+`HashInputBuilder` の内部を `Vec<u8>` から `Sha256` へ置換し、各 `push_*` が
+`Sha256::update` を直接呼ぶことで、バッチ全体を保持する中間バッファを排除した。
+圧縮関数のメッセージスケジュールも 64 語配列から 16 語のローリング配列
+（`w[t & 15]`）へ変更し、固定サイズの境界チェックで済むようにした。
+
+ハッシュ入力バイト列のレイアウト（ドメインタグ・操作種別タグ・長さプレフィクス
+付きフィールド連結の順序）は 1 ビットも変えていない。旧実装は `sha256_reference`
+として `#[cfg(test)]` に残し、ストリーミング版との等価性をテストで機械検証する
+（FIPS 180-4／NIST 公開テストベクタ 5 本〔`abc`・空・2 ブロック・4 ブロック・
+100 万 `'a'`〕、境界長 0..=200・4096・65537 バイトの網羅比較、1/3/63/64/65/100
+バイト刻みの分割 `update` 等価性）。既存の `for_*_encoded` 系ハッシュ関数の
+単体・結合テスト（`recovery_content_hash.rs`・`recovery_ledger.rs`・
+`sql_operation_id.rs`・`recovery_two_path.rs`・`tenant_write_error_exhaustive.rs`）
+も無変更のまま green であり、独立再実装との照合テスト
+（`ingest_profile_accept.rs::content_hash_insert_batch_reimpl_matches_stored_op_ledger_hash`）
+も含めて既存 content_hash 値が不変であることを確認済み。
+
+### 実測（受け入れ 2）
+
+`crates/engine/benches/ingest_profile_bench.rs` の I3 は harness 側の独立再実装
+（`sha256_reimpl`）で計測しており、production の `content_hash.rs` を変更しても
+自動では反映されない構造（本ファイル冒頭の「測定設計」節参照）のため、本 Issue
+では `content_hash.rs` 内の手動専用テスト
+（`recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing`。
+`#[ignore]`・CI 非配線。`cargo test --release -p engine --lib
+recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing --
+--ignored --nocapture` で実行）で計測した。
+
+初版の同テストは、事前に一括構築した 500KB 単一バッファへ `update`（新・
+ストリーミング版）／一括ハッシュ（旧・参照実装）を 1 回だけ呼ぶ構成であり、
+本番経路（`HashInputBuilder` が行・フィールド単位で `push_u64`／`push_bytes` を
+1,000 行 × 2 回ずつ、計 2,000 回呼ぶ）を再現していなかった（codex-review 指摘・
+PR #419）。本版は production の `for_insert_batch_encoded`（ストリーミング版・
+本番経路）と、同じ行・フィールド境界を共有する `#[cfg(test)]` 参照実装
+`for_insert_batch_encoded_reference`（旧・一括処理版。`HashInputBuilderReference`
+が `Vec<u8>` へ都度 `extend_from_slice` で連結し、`finish` で `sha256_reference`
+の二重コピー構造を 1 回呼ぶ）を、同一の 1,000 行（480〜520 バイト／行で長さを
+揺らした合計約 500KB）入力へ通す形へ改めた。
+
+共有計測環境での 5 回実測（開発環境。専有環境での再測定は未実施）:
+
+| 実装 | 実測（5 回） | ns/byte（5 回） |
+| --- | --- | --- |
+| `for_insert_batch_encoded_reference`（旧・一括処理版） | 308.2 / 304.3 / 305.7 / 308.6 / 305.6 ms | 3.084 / 3.044 / 3.058 / 3.088 / 3.057 |
+| `for_insert_batch_encoded`（新・ストリーミング版・本番経路） | 263.2 / 261.7 / 260.7 / 262.3 / 261.7 ms | 2.633 / 2.618 / 2.608 / 2.624 / 2.618 |
+
+ストリーミング版は 5 回すべてで参照実装を明確に下回り（改善幅 14.6〜15.5%・
+中央値約 15%）、両者の分布に重なりがない。行・フィールド単位の呼び出しパターンを
+本番経路と揃えたことで、初版時点（500KB 単一バッファ比較・中央値約 5%）よりも
+明確な改善幅が確認でき、`docs/design/dot-kernel-multi-accumulator.md` 等で採用して
+きた「複数回実測でノイズ帯を超える悪化がないこと」を判定基準としても、本変更は
+悪化を示していない（5 回すべてで明確に改善）ため**採用**の判断は変わらない
+（Issue #365・#366 と異なり、本件は改善方向で一貫しており撤回の理由がない）。
+
+### スコープ外（申し送り）
+
+- `bench-ingest-profile` の I3 を production と同じストリーミング構成の
+  再実装（harness 側 `Sha256Reimpl` 等）で計測し直す本格的な A/B 配線
+  （段別プロファイルベンチへの正式な結線）は本 Issue では実施せず、上記の
+  モジュール内手動テストによる直接比較に留めた。
+- ループ展開（8 ラウンド単位のマクロ展開等）の追加検証は実施していない
+  （16 語ローリングスケジュールへの変更のみを採用）。
+- SHA-NI 等のハードウェア命令（`unsafe` 前提）は対象外。
+- 専有環境での確定再測定は引き続き未実施。
+
 ## Issue #400 追記
 
 I6（redb insert）段の中間コピー排除を狙い、redb 4.2.0 `Table::insert_reserve`

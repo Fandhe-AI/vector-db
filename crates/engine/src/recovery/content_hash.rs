@@ -89,20 +89,74 @@ enum OpTag {
 
 /// 長さプレフィクス付きフィールド連結でハッシュ入力を組み立てるビルダー
 /// （本モジュールドキュメントの「正規化の方針」参照）。
-struct HashInputBuilder(Vec<u8>);
+///
+/// Issue #399: 内部を `Vec<u8>`（バッチ全体を一度連結し、`finish` でさらに
+/// パディング用に全体を複製する二重コピー構造）から [`Sha256`] のストリーミング
+/// 更新へ置換した。各 `push_*` は `Sha256::update` を直接呼ぶため、バッチ全体
+/// （数百 KB 規模）を保持する中間バッファは存在しない。出力（ダイジェスト）は
+/// 旧実装（`#[cfg(test)] sha256_reference`）と等価であることをテストで機械検証する。
+struct HashInputBuilder(Sha256);
 
 impl HashInputBuilder {
     fn new(tag: OpTag) -> Self {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(DOMAIN_TAG);
-        buf.push(tag as u8);
-        HashInputBuilder(buf)
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN_TAG);
+        hasher.update(&[tag as u8]);
+        HashInputBuilder(hasher)
     }
 
     /// 可変長バイト列を「4 バイト LE 長さ＋本体」で連結する。untrusted 入力由来の
     /// 長さを上限検証してからアロケーションに使う契約（coding-rust.md）に従い、
     /// `u32` へ収まらない場合は `Err` で拒否する（`encode_row` 等の既存エンコーダが
     /// 既に検証済みの値のみが渡る想定だが、本関数単体でも fail-closed を保つ）。
+    fn push_bytes(&mut self, field: &[u8]) -> Result<(), StorageError> {
+        let len = u32::try_from(field.len())
+            .map_err(|_| StorageError::Codec("content hash field too large".to_string()))?;
+        self.0.update(&len.to_le_bytes());
+        self.0.update(field);
+        Ok(())
+    }
+
+    fn push_u64(&mut self, v: u64) {
+        self.0.update(&v.to_le_bytes());
+    }
+
+    fn push_u8(&mut self, v: u8) {
+        self.0.update(&[v]);
+    }
+
+    /// 長さプレフィクスなしで生バイト列をそのまま流し込む（バッチ件数プレフィクス
+    /// 等、[`push_bytes`] の長さプレフィクス契約に合わない箇所専用の内部 API）。
+    fn push_raw(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(self) -> ContentHash {
+        ContentHash(self.0.finalize())
+    }
+}
+
+/// [`HashInputBuilder`] の参照実装（Issue #399 以前の一括処理版。バッチ全体を
+/// `Vec<u8>` へ都度 `extend_from_slice` で連結し、`finish` で [`sha256_reference`]
+/// （パディングのため全体をもう一度複製する二重コピー構造）を 1 回呼ぶ）。
+/// `#[cfg(test)]`。本番経路は経由しない（理由は [`for_insert`] 参照）。同じ
+/// `push_bytes`／`push_u64` 呼び出しパターンを共有する [`for_insert_batch_encoded_reference`]
+/// から、production の [`HashInputBuilder`]（ストリーミング版）と同一のフィールド
+/// 境界（行ごとに `push_u64` 1 回＋ `push_bytes` 1 回）で A/B 計測できるようにする
+/// （codex-review 指摘・PR #419: 単一の巨大バッファへの 1 回 `update` 呼び出しでは
+/// 本番経路〔行・フィールド単位の多数回 `update`〕を再現しない）。
+#[cfg(test)]
+struct HashInputBuilderReference(Vec<u8>);
+
+#[cfg(test)]
+impl HashInputBuilderReference {
+    fn new(tag: OpTag) -> Self {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(DOMAIN_TAG);
+        buf.push(tag as u8);
+        HashInputBuilderReference(buf)
+    }
+
     fn push_bytes(&mut self, field: &[u8]) -> Result<(), StorageError> {
         let len = u32::try_from(field.len())
             .map_err(|_| StorageError::Codec("content hash field too large".to_string()))?;
@@ -115,12 +169,12 @@ impl HashInputBuilder {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
 
-    fn push_u8(&mut self, v: u8) {
-        self.0.push(v);
+    fn push_raw(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
     }
 
     fn finish(self) -> ContentHash {
-        ContentHash(sha256(&self.0))
+        ContentHash(sha256_reference(&self.0))
     }
 }
 
@@ -148,9 +202,23 @@ fn push_value(b: &mut HashInputBuilder, v: &Value) -> Result<(), StorageError> {
 fn push_vector(b: &mut HashInputBuilder, vector: &[f32]) -> Result<(), StorageError> {
     let len = u32::try_from(vector.len())
         .map_err(|_| StorageError::Codec("content hash vector too large".to_string()))?;
-    b.0.extend_from_slice(&len.to_le_bytes());
+    b.push_raw(&len.to_le_bytes());
+    // f32 を 1 要素ずつ update するとバッチ規模のベクトルで呼び出し回数が
+    // 膨らむため、固定長スタックバッファ（64 要素分）へ詰めてからまとめて
+    // update する（Issue #399。ヒープ確保は増やさない）。
+    let mut scratch = [0u8; 256];
+    let mut filled = 0usize;
     for f in vector {
-        b.0.extend_from_slice(&f.to_le_bytes());
+        let bytes = f.to_le_bytes();
+        if filled + 4 > scratch.len() {
+            b.push_raw(&scratch[..filled]);
+            filled = 0;
+        }
+        scratch[filled..filled + 4].copy_from_slice(&bytes);
+        filled += 4;
+    }
+    if filled > 0 {
+        b.push_raw(&scratch[..filled]);
     }
     Ok(())
 }
@@ -217,7 +285,7 @@ pub(crate) fn for_insert_batch_encoded(rows: &[(u64, &[u8])]) -> Result<ContentH
     let count = u32::try_from(rows.len())
         .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
     let mut b = HashInputBuilder::new(OpTag::InsertBatch);
-    b.0.extend_from_slice(&count.to_le_bytes());
+    b.push_raw(&count.to_le_bytes());
     for (id, encoded_row) in rows {
         b.push_u64(*id);
         b.push_bytes(encoded_row)?;
@@ -231,11 +299,29 @@ pub(crate) fn for_insert_batch(rows: &[(u64, RowInput<'_>)]) -> Result<ContentHa
     let count = u32::try_from(rows.len())
         .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
     let mut b = HashInputBuilder::new(OpTag::InsertBatch);
-    b.0.extend_from_slice(&count.to_le_bytes());
+    b.push_raw(&count.to_le_bytes());
     for (id, row) in rows {
         let encoded = encode_row(row)?;
         b.push_u64(*id);
         b.push_bytes(&encoded)?;
+    }
+    Ok(b.finish())
+}
+
+/// [`for_insert_batch_encoded`] と同一のフィールド境界（行ごとに `push_u64` 1 回＋
+/// `push_bytes` 1 回）を、[`HashInputBuilderReference`]（Issue #399 以前の一括処理版）
+/// で計算する A/B 計測専用の参照実装。`#[cfg(test)]`。`encoded_row` は呼び出し元が
+/// 用意した `&[u8]` をそのまま受け取り、production の `for_insert_batch_encoded` と
+/// 引数・呼び出しパターンを完全に揃える（codex-review 指摘・PR #419）。
+#[cfg(test)]
+fn for_insert_batch_encoded_reference(rows: &[(u64, &[u8])]) -> Result<ContentHash, StorageError> {
+    let count = u32::try_from(rows.len())
+        .map_err(|_| StorageError::Codec("content hash batch too large".to_string()))?;
+    let mut b = HashInputBuilderReference::new(OpTag::InsertBatch);
+    b.push_raw(&count.to_le_bytes());
+    for (id, encoded_row) in rows {
+        b.push_u64(*id);
+        b.push_bytes(encoded_row)?;
     }
     Ok(b.finish())
 }
@@ -344,6 +430,15 @@ pub(crate) fn for_replace_by_text_key(
 // 自動運転下では既存の依存最小方針を維持する側に倒し、標準ライブラリのみで
 // 実装する。`unsafe` は使わず、固定サイズ配列・`wrapping_*` 演算（FIPS 180-4 が
 // 定める mod 2^32 加算そのもの。未定義動作にはならない）で構成する。
+//
+// Issue #399: バッチ全体（数百 KB 規模）を `Vec<u8>` へ一度連結してからパディング
+// のためにさらに複製する旧実装（2 回の全量コピー）を、[`Sha256`] の
+// ブロック単位ストリーミング更新へ再構成した。呼び出し側（[`HashInputBuilder`]）は
+// 中間 `Vec` を持たず各フィールドを直接 `update` する。メッセージスケジュールも
+// 64 語配列ではなく 16 語ローリング配列（`w[t & 15]`）にして固定サイズの境界
+// チェックだけで済むようにした。出力（ダイジェスト）は下部 `sha256_reference`
+// （旧実装をそのまま残した参照実装）と完全に等価であることを `tests` モジュールの
+// FIPS ベクタ・境界長網羅・分割 `update` 等価性テストで機械検証する。
 // ---------------------------------------------------------------------------
 
 const H0: [u32; 8] = [
@@ -361,82 +456,188 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-/// FIPS 180-4 5.1.1 節のパディング。長さフィールドは入力バイト長（`usize`）から
-/// `u64` ビット長へ変換する。エンジン内部のハッシュ対象（台帳エントリ・行データ）は
-/// 実運用上 `u64::MAX / 8` バイトに到達し得ないため `checked` 変換は不要（`as u64` は
-/// 64 bit ターゲットの `usize` から可逆）。
-fn pad(input: &[u8]) -> Vec<u8> {
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut msg = input.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    msg
-}
-
-fn sha256(input: &[u8]) -> [u8; 32] {
-    let padded = pad(input);
-    let mut h = H0;
-
-    for chunk in padded.as_chunks::<64>().0 {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
-            // `as_chunks::<4>()` は固定長 4 バイト配列を返すため `from_be_bytes` は
-            // 失敗しない。添字直接アクセスの代わりに `get_mut` で明示的に処理する
-            // （coding-rust.md「untrusted 入力の扱い」と同じ規律を内部処理にも適用する）。
-            if let Some(slot) = w.get_mut(i) {
-                *slot = u32::from_be_bytes(*word);
-            }
+/// 1 ブロック（64 バイト）ぶんの圧縮関数（FIPS 180-4 6.2.2 節）。メッセージ
+/// スケジュールは 64 語配列ではなく 16 語のローリングバッファ（`w[t & 15]`）で
+/// 保持する。`t >= 16` のラウンドでは、更新前の `w[t & 15]` が
+/// （16 引くごとに同じスロットへ戻ってくるため）ちょうど `w[t - 16]` を保持して
+/// いることを利用し、そのスロットへ新しい `w[t]` を上書きしてから同じラウンドの
+/// 圧縮に使う（Issue #399）。
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 16];
+    for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+        // `as_chunks::<4>()` は固定長 4 バイト配列を返すため `from_be_bytes` は
+        // 失敗しない。添字直接アクセスの代わりに `get_mut` で明示的に処理する
+        // （coding-rust.md「untrusted 入力の扱い」と同じ規律を内部処理にも適用する）。
+        if let Some(slot) = w.get_mut(i) {
+            *slot = u32::from_be_bytes(*word);
         }
-        for i in 16..64 {
-            let w15 = w[i - 15];
-            let w2 = w[i - 2];
+    }
+
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *state;
+
+    for t in 0..64usize {
+        let idx = t & 15;
+        if t >= 16 {
+            let w15 = w[(t - 15) & 15];
+            let w2 = w[(t - 2) & 15];
             let s0 = w15.rotate_right(7) ^ w15.rotate_right(18) ^ (w15 >> 3);
             let s1 = w2.rotate_right(17) ^ w2.rotate_right(19) ^ (w2 >> 10);
-            w[i] = w[i - 16]
+            // 上書き前の w[idx] は w[t - 16]（ローリングバッファでは同一スロット
+            // を 16 ラウンドごとに再利用する）。
+            let prev16 = w[idx];
+            w[idx] = prev16
                 .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
+                .wrapping_add(w[(t - 7) & 15])
                 .wrapping_add(s1);
         }
 
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let k = K.get(t).copied().unwrap_or(0);
+        let temp1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(k)
+            .wrapping_add(w[idx]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
 
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
 
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(hh);
+}
+
+/// ストリーミング更新型の SHA-256 状態（Issue #399）。[`HashInputBuilder`] の
+/// 各 `push_*` から `update` を直接呼ぶことで、旧実装が行っていた
+/// 「バッチ全体を `Vec` へ連結 → パディングのため再度複製」という 2 回の
+/// 全量コピーを排除する。固定長スタックバッファ（64 バイト）のみを使い、
+/// 入力長に比例したヒープ確保は行わない。
+struct Sha256 {
+    state: [u32; 8],
+    /// 64 バイト未満の未処理端数（`buffered` バイトぶんのみ有効）。
+    buffer: [u8; 64],
+    buffered: usize,
+    /// 入力バイト総数。`finalize` でビット長（`wrapping_mul(8)`）へ変換する
+    /// （既存の `pad()` と同じ契約。エンジン内部のハッシュ対象が実運用上
+    /// `u64::MAX / 8` バイトへ到達することはない）。
+    total_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Sha256 {
+            state: H0,
+            buffer: [0u8; 64],
+            buffered: 0,
+            total_len: 0,
+        }
+    }
+
+    /// `total_len` を増やさずにバイト列をブロックバッファへ吸収する（`update` と
+    /// `finalize` のパディング処理が共有する内部処理）。
+    fn absorb(&mut self, mut data: &[u8]) {
+        if self.buffered > 0 {
+            let need = 64 - self.buffered;
+            let take = need.min(data.len());
+            if let Some(slot) = self.buffer.get_mut(self.buffered..self.buffered + take) {
+                slot.copy_from_slice(&data[..take]);
+            }
+            self.buffered += take;
+            data = &data[take..];
+            if self.buffered == 64 {
+                let block = self.buffer;
+                compress(&mut self.state, &block);
+                self.buffered = 0;
+            }
         }
 
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        let (chunks, remainder) = data.as_chunks::<64>();
+        for chunk in chunks {
+            compress(&mut self.state, chunk);
+        }
+
+        if !remainder.is_empty() {
+            if let Some(slot) = self.buffer.get_mut(..remainder.len()) {
+                slot.copy_from_slice(remainder);
+            }
+            self.buffered = remainder.len();
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        self.absorb(data);
+    }
+
+    /// FIPS 180-4 5.1.1 節のパディング（`0x80` 1 バイト → 零埋め → 8 バイト BE
+    /// ビット長）をブロックバッファ経由で適用してからダイジェストを取り出す。
+    fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        self.absorb(&[0x80]);
+
+        const ZEROS: [u8; 64] = [0u8; 64];
+        let zero_pad = if self.buffered <= 56 {
+            56 - self.buffered
+        } else {
+            56 + 64 - self.buffered
+        };
+        if let Some(zeros) = ZEROS.get(..zero_pad) {
+            self.absorb(zeros);
+        }
+        self.absorb(&bit_len.to_be_bytes());
+
+        let mut out = [0u8; 32];
+        for (i, word) in self.state.iter().enumerate() {
+            let bytes = word.to_be_bytes();
+            let start = i * 4;
+            if let Some(slot) = out.get_mut(start..start + 4) {
+                slot.copy_from_slice(&bytes);
+            }
+        }
+        out
+    }
+}
+
+/// [`Sha256`] の参照実装（Issue #399 以前の一括処理版。バッチ全体を `Vec` へ
+/// 連結してからパディングする旧実装をそのまま残す）。production からは
+/// 呼ばれず、ストリーミング版との等価性テストにのみ使うため `#[cfg(test)]`。
+#[cfg(test)]
+fn sha256_reference(input: &[u8]) -> [u8; 32] {
+    fn pad(input: &[u8]) -> Vec<u8> {
+        let bit_len = (input.len() as u64).wrapping_mul(8);
+        let mut msg = input.to_vec();
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0x00);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+        msg
+    }
+
+    let padded = pad(input);
+    let mut state = H0;
+    for chunk in padded.as_chunks::<64>().0 {
+        compress(&mut state, chunk);
     }
 
     let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
+    for (i, word) in state.iter().enumerate() {
         let bytes = word.to_be_bytes();
         let start = i * 4;
         if let Some(slot) = out.get_mut(start..start + 4) {
@@ -444,6 +645,17 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         }
     }
     out
+}
+
+/// 一括ハッシュのヘルパー（テスト専用。production は [`HashInputBuilder`] が
+/// [`Sha256::update`] をフィールドごとに直接呼ぶため、この一括版は経由しない。
+/// テストヘルパー [`ContentHash::for_test`] と `tests` モジュールの NIST/FIPS
+/// 既知ダイジェスト検証・境界長網羅・分割 `update` 等価性テストで使う）。
+#[cfg(test)]
+fn sha256(input: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize()
 }
 
 #[cfg(test)]
@@ -484,6 +696,78 @@ mod tests {
             hex(&digest),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
+    }
+
+    // Issue #399 追加: FIPS 180-4 附属の 896 bit（4 ブロックにまたがる）テストベクタ。
+    #[test]
+    fn sha256_matches_fips_test_vector_four_blocks() {
+        let input = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        let digest = sha256(input);
+        assert_eq!(
+            hex(&digest),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
+    }
+
+    // Issue #399 追加: NIST 公開の 1,000,000 × 'a' 反復テストベクタ。ストリーミング
+    // 版の分割 `update`（`absorb` のブロック境界処理）を長大入力で検証する。
+    #[test]
+    fn sha256_matches_nist_million_a_vector() {
+        let input = vec![b'a'; 1_000_000];
+        let digest = sha256(&input);
+        assert_eq!(
+            hex(&digest),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    // Issue #399: ストリーミング版と参照実装（一括処理版）が境界長 0..=200 バイト
+    // で完全一致することを機械検証する（55/56/63/64/65/119/120 バイト等の
+    // パディング分岐を網羅する）。決定的 LCG で生成した入力を使う。
+    #[test]
+    fn sha256_streaming_matches_reference_for_boundary_lengths() {
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next_byte = || {
+            // xorshift* 相当の決定的 LCG（暗号強度は不要。境界長網羅の入力生成専用）。
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xff) as u8
+        };
+        for len in 0..=200usize {
+            let input: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            assert_eq!(
+                sha256(&input),
+                sha256_reference(&input),
+                "mismatch at len={len}"
+            );
+        }
+        for &len in &[4096usize, 65_537] {
+            let input: Vec<u8> = (0..len).map(|_| next_byte()).collect();
+            assert_eq!(
+                sha256(&input),
+                sha256_reference(&input),
+                "mismatch at len={len}"
+            );
+        }
+    }
+
+    // Issue #399: 同一入力を異なる粒度（1・3・63・64・65・100 バイト刻み）で
+    // 分割 `update` した結果が、一括 `update` と一致することを検証する
+    // （`Sha256::absorb` のバッファ境界処理のピン留め）。
+    #[test]
+    fn sha256_streaming_split_update_matches_one_shot_for_various_chunk_sizes() {
+        let input: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let expected = sha256_reference(&input);
+
+        for chunk_size in [1usize, 3, 63, 64, 65, 100] {
+            let mut hasher = Sha256::new();
+            for chunk in input.chunks(chunk_size) {
+                hasher.update(chunk);
+            }
+            let digest = hasher.finalize();
+            assert_eq!(digest, expected, "mismatch at chunk_size={chunk_size}");
+        }
     }
 
     // 操作種別が違えば同じフィールド列でも異なるハッシュになる（連結曖昧性排除の
@@ -742,6 +1026,20 @@ mod tests {
         assert_eq!(h_new, h_ref);
     }
 
+    // [`for_insert_batch_encoded_reference`]（Issue #399 以前の一括処理版・A/B 計測
+    // 専用）が production の [`for_insert_batch_encoded`]（ストリーミング版）と
+    // 同一ダイジェストを返すことをピン留めする（codex-review 指摘・PR #419）。
+    #[test]
+    fn for_insert_batch_encoded_reference_matches_streaming() {
+        let encoded_a: Vec<u8> = (0..300u32).map(|i| (i % 256) as u8).collect();
+        let encoded_b: Vec<u8> = (0..700u32).map(|i| ((i * 3) % 256) as u8).collect();
+        let hash_input: [(u64, &[u8]); 2] = [(1, &encoded_a), (2, &encoded_b)];
+
+        let h_streaming = for_insert_batch_encoded(&hash_input).expect("hash");
+        let h_reference = for_insert_batch_encoded_reference(&hash_input).expect("hash");
+        assert_eq!(h_streaming, h_reference);
+    }
+
     #[test]
     fn for_update_encoded_matches_reference_impl() {
         let row = RowInput {
@@ -754,5 +1052,76 @@ mod tests {
         let h_new = for_update_encoded(3, &encoded).expect("hash");
         let h_ref = for_update(3, &row).expect("hash");
         assert_eq!(h_new, h_ref);
+    }
+
+    // Issue #399 受け入れ 2: ストリーミング版（本番経路 `for_insert_batch_encoded`）と
+    // 参照実装（旧・一括処理版 `for_insert_batch_encoded_reference`。バッチ全体を
+    // `Vec` へ連結してからパディングする）の処理時間を、台帳ハッシュ対象と同オーダー
+    // （1,000 行 × 約 0.5KB ≈ 500KB）の入力で手元比較するための手動専用テスト
+    // （CI 非配線・既定 ignore）。`cargo test --release -p engine --lib
+    // recovery::content_hash::tests::sha256_streaming_vs_reference_manual_timing
+    // -- --ignored --nocapture` で実行する。
+    //
+    // codex-review 指摘（PR #419）: 従来はここで事前構築済みの 500KB 単一バッファへ
+    // `update`/一括ハッシュを 1 回だけ呼んでおり、本番経路（`HashInputBuilder` が
+    // 行・フィールド単位で `push_u64`／`push_bytes` を多数回呼ぶ）を再現していなかった。
+    // 本版は `for_insert_batch_encoded`（本番。ストリーミング）と
+    // `for_insert_batch_encoded_reference`（旧・一括処理版。同じ行・フィールド境界を
+    // 共有する `#[cfg(test)]` 参照実装）を、同一の 1,000 行入力へ通す形で比較する。
+    #[test]
+    #[ignore = "手動計測専用（CI 非配線。--ignored --nocapture で明示実行する）"]
+    fn sha256_streaming_vs_reference_manual_timing() {
+        use std::time::Instant;
+
+        // 1 行あたり約 0.5KB（実運用の embedding + metadata の encode 済みバイト列
+        // と同オーダー）× 1,000 行 ≈ 500KB。行ごとに長さを僅かに変えて境界処理
+        // （パディング境界近辺）も網羅する。
+        let rows_owned: Vec<(u64, Vec<u8>)> = (0..1_000u64)
+            .map(|id| {
+                let len = 480 + (id % 41) as usize; // 480..=520 バイトで揺らす
+                let row: Vec<u8> = (0..len as u32)
+                    .map(|i| ((i.wrapping_add(id as u32)) % 256) as u8)
+                    .collect();
+                (id, row)
+            })
+            .collect();
+        let hash_input: Vec<(u64, &[u8])> = rows_owned
+            .iter()
+            .map(|(id, row)| (*id, row.as_slice()))
+            .collect();
+        let total_bytes: usize = rows_owned.iter().map(|(_, row)| row.len()).sum();
+        let iterations = 200;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(
+                for_insert_batch_encoded_reference(std::hint::black_box(&hash_input))
+                    .expect("hash"),
+            );
+        }
+        let reference_elapsed = start.elapsed();
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(
+                for_insert_batch_encoded(std::hint::black_box(&hash_input)).expect("hash"),
+            );
+        }
+        let streaming_elapsed = start.elapsed();
+
+        println!(
+            "for_insert_batch_encoded_reference (旧・一括処理版): {reference_elapsed:?} \
+             ({:.3} ns/byte)",
+            reference_elapsed.as_nanos() as f64 / (total_bytes as f64 * iterations as f64)
+        );
+        println!(
+            "for_insert_batch_encoded (新・ストリーミング版・本番経路): {streaming_elapsed:?} \
+             ({:.3} ns/byte)",
+            streaming_elapsed.as_nanos() as f64 / (total_bytes as f64 * iterations as f64)
+        );
+        assert_eq!(
+            for_insert_batch_encoded_reference(&hash_input).expect("hash"),
+            for_insert_batch_encoded(&hash_input).expect("hash")
+        );
     }
 }
