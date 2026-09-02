@@ -51,6 +51,11 @@ pub mod contrast;
 pub mod dot_kernel;
 pub mod env_report;
 pub mod hybrid_latency;
+// Issue #387 PR #416 codex-review P2 指摘対応: `hybrid_profile` は
+// `engine::hybrid::sparse_refetch_observed`（非既定 feature `bench-internals`
+// 限定・`crates/engine/src/hybrid.rs` 参照）を無条件 import するため、本モジュール
+// 自体も同 feature の背後に置く。
+#[cfg(feature = "bench-internals")]
 pub mod hybrid_profile;
 pub mod ingest_profile;
 pub mod knn_profile;

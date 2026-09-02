@@ -181,7 +181,12 @@ make bench-hybrid-profile
 が設定された実行環境下では起動直後に fail-closed で拒否する
 （`harness::hybrid_profile::refuse_under_github_actions`）。判定ロジック自体
 （時間非依存）は `crates/engine/tests/hybrid_profile_accept.rs` で `make ci`
-側から回帰検証する。
+側から回帰検証する。`engine::hybrid::sparse_refetch_observed`（ベンチ・診断専用
+公開フック）は非既定 feature `bench-internals` の背後にあるため、
+`tests/hybrid_profile_accept.rs` は同 feature 無指定の通常の `cargo test -p
+engine` ではファイル全体が `#![cfg(feature = "bench-internals")]` により空になり
+0 tests として実行される（`make lint`/`make test` は `--all-features` のため
+CI 経路は従来どおり 44 件検証される。Issue #387 PR #416 codex-review P2 指摘対応）。
 
 ## 申し送り
 

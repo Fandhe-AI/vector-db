@@ -12,6 +12,16 @@
 //! `#[path]` 経由で bench クレートと本テストクレートの双方に取り込まれ、bench
 //! コンパイル時は `#[test]` 項目が丸ごと除去されるため `use super::*;` が
 //! unused import になる）。
+//!
+//! Issue #387 PR #416 codex-review P2 指摘対応: `harness::hybrid_profile` は
+//! `engine::hybrid::sparse_refetch_observed`（非既定 feature `bench-internals`
+//! 限定）を無条件 import するモジュールへ変わったため、本テストファイル全体を
+//! `cross-encoder` feature 限定の `tests/rerank_cross_encoder_recall.rs` と同じ
+//! `#![cfg(feature = "...")]` パターンで同 feature の背後に置く。通常の
+//! `cargo test -p engine`（feature 無指定）では本ファイルは空になり実行対象から
+//! 外れる（`make lint`/`make test` は `--all-features` のため CI 経路は従来どおり）。
+
+#![cfg(feature = "bench-internals")]
 
 #[allow(dead_code)]
 #[path = "../benches/harness/mod.rs"]

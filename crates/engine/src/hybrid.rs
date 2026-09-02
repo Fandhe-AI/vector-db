@@ -1496,7 +1496,8 @@ pub fn hybrid_search_boosted(
 
 /// 疎側再取得ループ本体（Issue #320 の再取得ループ実装そのもの）。
 /// [`hybrid_search_boosted`] とテスト・ベンチ向け公開フック
-/// [`sparse_refetch_observed`] の双方がこの 1 実装を共有する。分離した理由は
+/// `sparse_refetch_observed`（非既定 feature `bench-internals` 限定のため
+/// プレーンな code span で参照する）の双方がこの 1 実装を共有する。分離した理由は
 /// Issue #387 PR #416 codex-review P1 指摘対応: 以前は
 /// `crates/engine/benches/harness/hybrid_profile.rs` が本ループの境界同点判定
 /// （[`resolve_boundary_tie_group`]）をベンチ側で複製・予測しており、
@@ -1506,7 +1507,7 @@ pub fn hybrid_search_boosted(
 ///
 /// `record_fetch_k` は各ラウンドで実際に呼んだ `fetch_k` を通知するフック。
 /// production 経路（[`hybrid_search_boosted`]）は記録が不要なため no-op
-/// クロージャを渡し、診断経路（[`sparse_refetch_observed`]）だけが `Vec` へ
+/// クロージャを渡し、診断経路（`sparse_refetch_observed`）だけが `Vec` へ
 /// 蓄積する（codex-review P2 指摘対応・PR #416: 以前は本関数が常に `Vec` を
 /// 確保していたため、記録を使わない通常の hybrid 検索にも不要なヒープ確保・
 /// push が追加されていた）。
@@ -1575,6 +1576,12 @@ fn sparse_refetch_loop(
 /// 戻り値は `(疎ヒット, 疎側 fetch_k 上限〔最終ラウンドの fetch_k〕, 実際に
 /// 呼ばれた fetch_k の列)`。`sparse_index.search_within` を実際に複数回
 /// 呼び出すため副作用（計算コスト）は production の疎側検索と同一。
+///
+/// **ベンチ・診断専用**。非既定 feature `bench-internals` でのみ公開する
+/// （codex-review P2 指摘対応・PR #416: 以前は無条件で engine の公開 API に
+/// 含まれており、production の公開面がベンチ都合の内部観測フックまで広がって
+/// いた）。既定ビルド・`wire-server` からは到達不能。
+#[cfg(feature = "bench-internals")]
 pub fn sparse_refetch_observed(
     sparse_index: &SparseIndex,
     query_text: &str,
