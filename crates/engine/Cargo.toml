@@ -239,6 +239,10 @@ test = false
 # `make bench-hybrid-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
 # harness/hybrid_profile.rs にあり tests/hybrid_profile_accept.rs で make ci 側から
 # 回帰検証する。
+# Issue #387: SparseIndex::search_within の段別（可視 subset 構築／df 再計算パス／
+# スコアリングパス）実測・疎側再取得ループの発火回数計測を追加。production コード
+# 〔crates/engine/src/〕は無変更で、ベンチ側複製〔ProfileSparseIndex〕と実 API の
+# 出力を起動時に fail-closed で突き合わせてから使う。
 name = "hybrid_profile_bench"
 harness = false
 test = false
