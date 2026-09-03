@@ -119,7 +119,17 @@ impl fmt::Display for SearchEngineError {
     }
 }
 
-impl std::error::Error for SearchEngineError {}
+impl std::error::Error for SearchEngineError {
+    /// 内包する [`crate::hnsw::HnswError`] をエラーチェーンへ接続する
+    /// （codex-review 指摘・PR #433 追記。`core.rs::OpenWithEngineError::source` と
+    /// 同じ方針。空の `impl Error` のままだと `HnswError` の詳細情報が
+    /// `std::error::Error::source()` チェーン越しには辿れず失われるため）。
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SearchEngineError::InvalidHnswParams(e) => Some(e),
+        }
+    }
+}
 
 impl fmt::Display for SearchEngineKind {
     /// 診断・`EXPLAIN`（#411 の担当。本 Issue は表示専用の生成元のみ用意する）向けの
@@ -283,6 +293,27 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, SearchEngineError::InvalidHnswParams(_)));
+    }
+
+    // `SearchEngineError::source()` が内包 `HnswError` を返すことの固定
+    // （Cursor Bugbot Low 指摘・PR #433 追記。空の `impl Error` により `source()` が
+    // 常に `None` を返し、`OpenWithEngineError::source()`（`core.rs`）から
+    // `InvalidHnswParams` 経由で `HnswError` の詳細まで辿れなかった不備の回帰防止）。
+    #[test]
+    fn search_engine_error_source_returns_hnsw_error() {
+        use std::error::Error as _;
+        let inner = crate::hnsw::HnswError::InvalidParams {
+            reason: "test reason",
+        };
+        let err = SearchEngineError::InvalidHnswParams(inner.clone());
+        let source = err
+            .source()
+            .expect("InvalidHnswParams variant must expose a source");
+        assert_eq!(
+            source.to_string(),
+            inner.to_string(),
+            "source() must return the wrapped HnswError"
+        );
     }
 
     // `build`（crate 内部専用）に直接 Hnsw(invalid_params) を渡すコードは crate 内に
