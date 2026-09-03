@@ -29,10 +29,15 @@
 //! には影響しない。テーブル単位カタログ属性・wire-server CLI からの露出は対象外
 //! （ADR「判断確定後のスコープ外」節、および本 Issue のスコープ外事項）。
 //!
-//! 本 Issue 時点では [`hnsw::provider::HnswSearchProvider`](crate::hnsw::provider::HnswSearchProvider)
-//! は索引を構築・保持せず、`ParallelSearchProvider` へ全件フォールバックする
-//! （世代整合キャッシュが無く索引済み集合と `SearchInput` の差分を判定できないため。
-//! 索引の実利用は #408 の担当。詳細は `hnsw/provider.rs` モジュールドキュメント参照）。
+//! [`hnsw::provider::HnswSearchProvider`](crate::hnsw::provider::HnswSearchProvider)
+//! 自体（`SearchProvider::search` の実装）は本 Issue 時点のまま索引を構築・保持
+//! せず、常に `ParallelSearchProvider` へ全件フォールバックする。索引済み集合と
+//! `SearchInput` の差分を判定する世代整合キャッシュは、provider の外側
+//! （`sql::hnsw_cache::HnswIndexCache`）として Issue #408 で SQL 表層の
+//! フィルタなし `Ranking::Distance` クエリに限り接続済み（詳細は
+//! `hnsw/provider.rs` モジュールドキュメント・`docs/design/
+//! hnsw-generation-cache.md` 参照。Rust API・フィルタ付き・hybrid クエリは
+//! 引き続き本 provider の全件フォールバックのみ）。
 //!
 //! ## 不正な `HnswParams` を型で到達不能にする（codex-review P1 指摘・Issue #407・PR #433 追記）
 //!

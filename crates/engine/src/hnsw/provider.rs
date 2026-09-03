@@ -14,29 +14,39 @@
 //! 構築時点のスナップショットしか探索できない。索引済み集合と `SearchInput` の
 //! 差分を安全に判定するには世代整合キャッシュが要る（`sql::sparse_cache::
 //! SparseIndexCache`〔Issue #357〕・`sql::arena_cache::SqlArenaCache`〔Issue #363〕と
-//! 同型の設計）が、これは #408 の担当であり本 Issue のスコープ外。差分判定なしに
-//! 索引だけを探索すると、索引構築後に追加された行・不可視化された行を検索結果へ
-//! 混入・欠落させる（テナント境界・RLS 可視性契約を壊す）ため、安全側に倒して
-//! 「索引済み集合は常に空」＝全件フォールバックとして実装する。
+//! 同型の設計）。差分判定なしに索引だけを探索すると、索引構築後に追加された行・
+//! 不可視化された行を検索結果へ混入・欠落させる（テナント境界・RLS 可視性契約を
+//! 壊す）ため、[`SearchProvider`] の実装としての本 provider・[`SearchInput`] を
+//! 直接受ける経路は安全側に倒して「索引済み集合は常に空」＝全件フォールバックの
+//! ままにする。
 //!
-//! # #408 が接続する索引経路の seam（本タスクでは実装しない）
+//! # #408 が接続した索引経路の seam
 //!
-//! 1. 索引済み集合と `SearchInput` の差分を判定する世代整合キャッシュは、本
-//!    provider の外側（`core.rs`／`sql` 側のテーブル世代整合機構）が持つ契約とする。
+//! 世代整合キャッシュ・索引探索・Top-k マージは Issue #408 で接続済みだが、
+//! **本 provider（`SearchProvider::search`）の外側**として接続する（下記参照）。
+//! `SearchProvider` trait 自体・本 provider の `search` 実装は無変更のまま：
+//!
+//! 1. 世代整合キャッシュは `sql::hnsw_cache::HnswIndexCache`（`(table, ctx)` ×
+//!    テーブル単位世代キー）として本 provider の外側（`sql::exec::
+//!    execute_statement_with_cache` から `core.rs::EngineCore::hnsw_state` 経由）に
+//!    実装した。SQL 表層のフィルタなし `Ranking::Distance` クエリに限る適用条件。
 //! 2. 索引側の探索は [`HnswIndex::search`](crate::hnsw::HnswIndex::search) を
 //!    `HnswIndex::search(query, k, self.effective_ef(k), scratch)` の形で呼び、
 //!    [`HnswSearchScratch`](crate::hnsw::HnswSearchScratch) は呼び出しスレッドごとに
-//!    呼び出し元が所有する（`hnsw.rs` モジュールドキュメント「ベクトルの所有方針」・
-//!    `docs/design/hnsw-search.md` の申し送りを踏襲）。untrusted な `k` の上限保証は
-//!    [`HnswSearchProvider::effective_ef`] ではなく `HnswIndex::search` 自身の
-//!    `k > MAX_EF` fail-closed 検証が担う（[`HnswSearchProvider::effective_ef`] の
-//!    ドキュメンテーションコメント参照。codex-review P2 指摘・Issue #407 追記）。
+//!    `thread_local!` で所有する（`hnsw.rs` モジュールドキュメント「ベクトルの
+//!    所有方針」・`docs/design/hnsw-search.md` の申し送りどおり）。untrusted な
+//!    `k` の上限保証は [`HnswSearchProvider::effective_ef`] ではなく
+//!    `HnswIndex::search` 自身の `k > MAX_EF` fail-closed 検証が担う
+//!    （[`HnswSearchProvider::effective_ef`] のドキュメンテーションコメント参照。
+//!    codex-review P2 指摘・Issue #407 追記）。
 //! 3. 索引側 hit と brute-force 側（未索引分）hit の Top-k マージは、
 //!    `kernel.rs::TopKSelector` と同じ順序規約（スコア `total_cmp` 降順・同点 id
-//!    昇順）を保った安定マージで行う（`sort_unstable` 系は
+//!    昇順）を保った `sort_by`（安定ソート）で行う（`sort_unstable` 系は
 //!    `scripts/check_sort_determinism.sh` が禁止する）。
 //!
-//! これらは未実装のまま production へ置かない（未使用コードを持ち込まない）。
+//! Rust API（`VectorCore::search`）・フィルタ付きクエリ・hybrid クエリは
+//! `sql::hnsw_cache` を経由せず、本 provider の全件フォールバックのまま
+//! （詳細・段階化の理由は `docs/design/hnsw-generation-cache.md` 参照）。
 
 use crate::hnsw::{HnswParams, ValidatedHnswParams, MAX_EF};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};

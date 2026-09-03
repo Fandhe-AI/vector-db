@@ -1231,6 +1231,44 @@ impl HnswIndex {
         self.nodes.is_empty()
     }
 
+    /// `build` 時点の内部スナップショット（`self.vectors`）から `node` 番目の
+    /// ベクトルを返す（Issue #408・`sql::hnsw_cache` 専用の公開アクセサ）。
+    /// `node_vector` の公開版だが、こちらは範囲外時に `Err` ではなく `None` を
+    /// 返す（呼び出し元がテーブル世代整合キャッシュの差分判定〔`Overlay::compute`〕
+    /// で「索引済みノードが現在も存在するか」を確認する用途のため、専用の
+    /// エラー型を経由させる必要がない）。
+    pub fn vector(&self, node: u32) -> Option<&[f32]> {
+        node_vector(&self.vectors, self.dim as usize, node).ok()
+    }
+
+    /// 索引本体（隣接リスト・複製ベクトル）の概算ヒープバイト量（Issue #408。
+    /// `sql::hnsw_cache::HnswIndexCache` の容量判定・観測用統計が使う）。
+    /// `self.vectors`（`build` 時に複製した `Arc<[f32]>`）＋各ノードの隣接
+    /// リスト（層ごとの `Vec<u32>`）の `capacity()` を合算する。
+    pub fn approx_heap_bytes(&self) -> usize {
+        let vectors_bytes = self
+            .vectors
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+        let nodes_bytes: usize = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let links_bytes: usize = node
+                    .links
+                    .iter()
+                    .map(|l| {
+                        l.capacity()
+                            .saturating_mul(std::mem::size_of::<u32>())
+                            .saturating_add(std::mem::size_of::<Vec<u32>>())
+                    })
+                    .fold(0usize, |acc, n| acc.saturating_add(n));
+                links_bytes.saturating_add(std::mem::size_of::<Node>())
+            })
+            .fold(0usize, |acc, n| acc.saturating_add(n));
+        vectors_bytes.saturating_add(nodes_bytes)
+    }
+
     /// グラフ全体の最大層（エントリポイントのレベル）。空索引では `None`。
     pub fn max_level(&self) -> Option<usize> {
         self.entry_point.and_then(|ep| self.level_of(ep))
@@ -1604,6 +1642,34 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn vector_returns_none_out_of_range_and_some_in_range() {
+        let dim = 4u32;
+        let vectors = gen_corpus(1, dim as usize, 10);
+        let index = HnswIndex::build(HnswParams::default(), dim, &vectors, 7).unwrap();
+        assert!(index.vector(0).is_some());
+        assert!(index.vector(9).is_some());
+        assert_eq!(index.vector(10), None, "out-of-range node must be None");
+        assert_eq!(
+            index.vector(0).unwrap(),
+            &vectors[0..dim as usize],
+            "vector() must return the same bytes build() was given"
+        );
+    }
+
+    #[test]
+    fn approx_heap_bytes_at_least_covers_raw_vector_storage() {
+        let dim = 8usize;
+        let rows = 50usize;
+        let vectors = gen_corpus(2, dim, rows);
+        let index = HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 11).unwrap();
+        let raw_bytes = rows * dim * std::mem::size_of::<f32>();
+        assert!(
+            index.approx_heap_bytes() >= raw_bytes,
+            "approx_heap_bytes must at least cover the raw vector copy"
+        );
     }
 
     #[test]
