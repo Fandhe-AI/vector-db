@@ -355,6 +355,7 @@ spec 側変更が存在しない）ことを指摘され、破壊的変更を伴
    `hnsw/provider.rs::HnswSearchProvider::effective_ef` の docstring から
    誤った一文を削除し、「戻り値は `k` に依存する」ことを明記したうえで、
    「`k` 自体は書き換えない」という正しい主張だけを残した
+
 - production コードの変更は `core.rs::EngineCore::open`／`open_with_engine`
   の戻り値型変更（`OpenWithEngineError` 新設）のみ（`effective_ef` の
   クランプ計算式自体は変更していない。修正はドキュメンテーションコメントと
