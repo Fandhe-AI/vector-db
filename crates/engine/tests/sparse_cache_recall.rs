@@ -801,7 +801,10 @@ fn cold_and_hot_hybrid_results_match_for_unknown_terms_only_query() {
 // 指摘・PR #428: cold/hot 双方が同一 `Err` を返せば成功してしまう分岐は削除した）。
 // あわせて `sparse_index_cache_stats()` で 1 回目 miss・2 回目 hit を確認し、
 // 空クエリがキャッシュ経路を実際に迂回していないこと（vacuous pass 防止）も
-// 固定する。
+// 固定する。さらに結果件数（LIMIT 20 を満たす）と純密クエリの Top-20 id 列との
+// 一致を明示的にアサートし、「dense-only ランキングへのフォールバック」自体を
+// 固定する（codex-review 指摘・PR #428: Empty query result not pinned。空の
+// `Ok`（0 件）でも通ってしまう分岐を解消した）。
 
 #[test]
 fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
@@ -816,6 +819,10 @@ fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
     let query_vector = one_hot_sum(SMALL_VOCAB_SIZE, [3usize, 7]);
     let sql = format!(
         "SELECT id FROM docs ORDER BY hybrid_rrf(embedding, '{}', body, '') LIMIT 20",
+        vector_literal(&query_vector)
+    );
+    let dense_only_sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 20",
         vector_literal(&query_vector)
     );
     let ctx = PolicyContext::new("tenant-empty-query").expect("valid tenant");
@@ -865,6 +872,24 @@ fn cold_and_hot_hybrid_results_match_for_empty_query_text() {
         result_ids(&hot_result_1),
         result_ids(&hot_result_2),
         "空クエリ: hot の 1st と 2nd（キャッシュヒット後）が乖離した"
+    );
+
+    // `Ok`・cold/hot 一致のみでは空の `Ok`（0 件）でも通ってしまい、コメントで
+    // 主張している「密のみへの縮退」自体は固定されない（codex-review 指摘・
+    // PR #428: Empty query result not pinned）。件数と、純密クエリの Top-20 id 列
+    // との一致を明示的にアサートし、dense-only フォールバックの契約を固定する。
+    assert_eq!(
+        cold_ids.len(),
+        20,
+        "空クエリ: 疎側無信号でも密のみで LIMIT 件数を満たすはず"
+    );
+    let dense_only_result = core_hot
+        .execute_sql(&ctx, &dense_only_sql)
+        .expect("dense-only query ok");
+    assert_eq!(
+        cold_ids,
+        result_ids(&dense_only_result),
+        "空クエリ: hybrid 結果は純密クエリの Top-20 と一致するはず（dense-only フォールバック）"
     );
 }
 

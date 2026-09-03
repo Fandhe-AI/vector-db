@@ -286,3 +286,103 @@ fn hybrid_sparse_tie_group_across_pool_boundary_is_deterministic_over_multiple_r
         );
     }
 }
+// --- 5（codex-review 指摘対応・PR #428・Medium）: 上のテスト 4 は tie group の
+// 全 300 件が同一本文のため、疎側境界同点グループの完全化（`sparse_refetch_loop`
+// の複数ラウンド発火・`TieRank::GroupEnd` によるグループ末尾順位の割当）を
+// スキップする退行が起きても、密側の（同じく全件同点な）タイブレークだけで
+// id 昇順 1..=8 が再現できてしまい、いずれの経路でも結果が一致する
+// vacuous pass になっていた（bugbot 指摘）。
+//
+// 本テストは、疎側でのみ一致する巨大な同点グループ（`tie_group_size=20`。
+// `pool_depth=8` を跨ぎ、`sparse_refetch_loop` の複数ラウンド発火を要する
+// 大きさ）と、疎側では一切一致しないが密側で優位な「競合グループ」
+// （8 件、id 昇順にわずかに減衰する密スコアで密ランクを確定）を対置する。
+//
+// 正しい完全化（`TieRank::GroupEnd`）の下では、疎側の巨大同点グループは
+// グループ末尾順位（20 件全体の末尾＝低優先度）を割り当てられるため RRF
+// 融合スコアが低く抑えられ、密側でのみ強い競合グループが最終 top-k を
+// 独占する（実測: id 501..=508）。もし境界同点グループの完全化が壊れて
+// 位置ベースの強い順位（先頭で観測できた数件に 1..8 相当の順位）を誤って
+// 割り当てる退行が起きれば、疎側同点グループの一部（id 1..=8 相当）が
+// 競合グループを押しのけて結果に混入し、本テストが red になる
+// （fixture の構造そのものが「密側の同点タイブレーク」に依存しないため、
+// テスト 4 とは異なり vacuous にならない）。
+#[test]
+fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing_dense_group() {
+    let tie_group_size = 20u64;
+    let competitor_size = 8u64;
+
+    let mut ids: Vec<u64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut vectors: Vec<f32> = Vec::new();
+
+    // 疎側でのみ一致する巨大同点グループ。密側は完全に無関係な方向 [0,1]
+    // （クエリ [1,0] との内積が 0）で全件同一のため、密側は本グループを
+    // 一切優遇しない。
+    for id in 1..=tie_group_size {
+        ids.push(id);
+        texts.push("anchor anchor anchor".to_string());
+        vectors.push(0.0);
+        vectors.push(1.0);
+    }
+    // 密側でのみ強く一致する競合グループ。疎側は "anchor" と無関係のため
+    // BM25 score が 0 になり疎チャネルから除外される（`zero_is_no_signal`）。
+    // id 昇順にわずかに減衰するスコアを割り当て、密側自身の同点を避けて
+    // 密ランクを id 昇順（501 が最上位）に確定させる。
+    for i in 0..competitor_size {
+        let id = 501 + i;
+        ids.push(id);
+        texts.push("unrelated filler text".to_string());
+        vectors.push(1.0 - 0.001 * (i as f32));
+        vectors.push(0.0);
+    }
+
+    let refs: Vec<(u64, &str)> = ids
+        .iter()
+        .zip(texts.iter())
+        .map(|(&id, t)| (id, t.as_str()))
+        .collect();
+    let index = SparseIndex::build(&refs).expect("sparse index build ok");
+
+    let cfg = RrfConfig::new(60.0, 1.0, 1.0, 8).expect("valid rrf config (small pool_depth)");
+
+    let input_scalar = SearchInput {
+        ids: &ids,
+        vectors: &vectors,
+        dim: 2,
+        query: &[1.0, 0.0],
+        k: 8,
+    };
+    let scalar_hits = hybrid_search(&CpuScalarProvider, input_scalar, &index, "anchor", 8, &cfg)
+        .expect("hybrid_search (scalar) ok");
+
+    let input_parallel = SearchInput {
+        ids: &ids,
+        vectors: &vectors,
+        dim: 2,
+        query: &[1.0, 0.0],
+        k: 8,
+    };
+    let parallel_hits = hybrid_search(
+        &ParallelSearchProvider,
+        input_parallel,
+        &index,
+        "anchor",
+        8,
+        &cfg,
+    )
+    .expect("hybrid_search (parallel) ok");
+
+    assert_eq!(
+        scalar_hits, parallel_hits,
+        "CpuScalarProvider と ParallelSearchProvider で競合グループ構成の結果が乖離した"
+    );
+
+    let result_ids: Vec<u64> = scalar_hits.iter().map(|h| h.id).collect();
+    let expected: Vec<u64> = (501u64..(501 + competitor_size)).collect();
+    assert_eq!(
+        result_ids, expected,
+        "疎側巨大同点グループの境界完全化が正しければ、密側でのみ優位な競合グループが \
+         top-k を独占するはず（疎側同点グループの一部が混入した場合は境界完全化の退行）"
+    );
+}
