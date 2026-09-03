@@ -38,41 +38,38 @@
 //!
 //! これらは未実装のまま production へ置かない（未使用コードを持ち込まない）。
 
-use crate::hnsw::{HnswParams, MAX_EF};
+use crate::hnsw::{HnswParams, ValidatedHnswParams, MAX_EF};
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider};
 use crate::parallel_search::ParallelSearchProvider;
 
 /// [`crate::search_engine::SearchEngineKind::Hnsw`] が構築する provider。
 ///
-/// `HnswSearchProvider`（[`crate::hnsw::provider`]）は `crate::hnsw` が公開モジュール
-/// （`lib.rs::pub mod hnsw`）のため `search_engine::build_validated` を経由せず本構造体を
-/// 直接構築する外部呼び出しも到達しうる。そのため [`Self::new`] 自身が
-/// [`HnswParams::validate`] を通し、不正値を保持した provider が構築される経路を
-/// 構造的に無くす（codex-review P1 指摘・Issue #407 追記。`search_engine.rs` 側の
-/// `build_validated` はこの検証と重複するが、呼び出し元ごとに異なるエラー型
-/// （[`crate::search_engine::SearchEngineError`] と [`crate::hnsw::HnswError`]）を
-/// そのまま返すため二重実装ではなく境界の異なる同一契約とする）。
+/// [`Self::new`] は [`ValidatedHnswParams`] のみを受け取る。`ValidatedHnswParams` は
+/// private フィールドで [`ValidatedHnswParams::new`]（[`HnswParams::validate`] を必ず
+/// 経由する）以外の経路では構築できないため、不正値を保持した provider は型として
+/// 存在しえない（codex-review P1 指摘・Issue #407・PR #433 追記。実行時エラー分類の
+/// 流用・偽装ではなく型システムで到達不能にする設計）。`crate::hnsw` が公開モジュール
+/// （`lib.rs::pub mod hnsw`）で本構造体へ直接到達できても、検証済み値なしには
+/// 構築できない点は変わらない。
 #[derive(Debug, Clone, Copy)]
 pub struct HnswSearchProvider {
-    params: HnswParams,
+    params: ValidatedHnswParams,
     fallback: ParallelSearchProvider,
 }
 
 impl HnswSearchProvider {
-    /// `params` を検証したうえで保持する provider を構築する。不正な `params`
-    /// （[`HnswParams::validate`] が拒否する値）は [`crate::hnsw::HnswError`] として
-    /// fail-closed に拒否し、`HnswSearchProvider` を構築しない。
-    pub fn new(params: HnswParams) -> Result<Self, crate::hnsw::HnswError> {
-        params.validate()?;
-        Ok(HnswSearchProvider {
+    /// 検証済みパラメータを保持する provider を構築する（infallible。検証は
+    /// [`ValidatedHnswParams::new`] の時点で完了済み）。
+    pub fn new(params: ValidatedHnswParams) -> Self {
+        HnswSearchProvider {
             params,
             fallback: ParallelSearchProvider,
-        })
+        }
     }
 
     /// 保持している構築パラメータを返す（テスト・診断用）。
     pub fn params(&self) -> HnswParams {
-        self.params
+        self.params.get()
     }
 
     /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値を返す
@@ -141,7 +138,7 @@ mod tests {
 
     #[test]
     fn dim_mismatch_matches_fallback() {
-        let provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+        let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
         let vectors = deterministic_corpus(4, 3, 7);
         let ids = ids_for(4);
         let query = vec![0.0_f32, 1.0]; // dim=3 のはずが 2 要素
@@ -164,7 +161,7 @@ mod tests {
 
     #[test]
     fn non_finite_query_matches_fallback() {
-        let provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+        let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
         let vectors = deterministic_corpus(4, 3, 11);
         let ids = ids_for(4);
         let query = vec![f32::NAN, 0.0, 0.0];
@@ -183,7 +180,7 @@ mod tests {
 
     #[test]
     fn k_zero_and_empty_input_return_empty() {
-        let provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+        let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
         let vectors = deterministic_corpus(4, 3, 13);
         let ids = ids_for(4);
         let query = vec![0.0_f32, 0.0, 0.0];
@@ -221,7 +218,7 @@ mod tests {
         let ids = ids_for(n);
         let query = deterministic_corpus(1, dim, 4242);
 
-        let hnsw_provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+        let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
         let reference = CpuScalarProvider;
 
         for k in [1usize, 5, 20, 200] {
@@ -247,23 +244,27 @@ mod tests {
 
     #[test]
     fn effective_ef_clamps_to_max_ef_and_respects_k() {
-        let small_ef = HnswSearchProvider::new(HnswParams {
-            m: 16,
-            ef_construction: 100,
-            ef_search: 10,
-        })
-        .unwrap();
+        let small_ef = HnswSearchProvider::new(
+            ValidatedHnswParams::new(HnswParams {
+                m: 16,
+                ef_construction: 100,
+                ef_search: 10,
+            })
+            .unwrap(),
+        );
         // k > ef_search のときは k まで引き上げる。
         assert_eq!(small_ef.effective_ef(50), 50);
         // k <= ef_search のときは ef_search をそのまま使う。
         assert_eq!(small_ef.effective_ef(1), 10);
 
-        let large_ef = HnswSearchProvider::new(HnswParams {
-            m: 16,
-            ef_construction: 100,
-            ef_search: MAX_EF,
-        })
-        .unwrap();
+        let large_ef = HnswSearchProvider::new(
+            ValidatedHnswParams::new(HnswParams {
+                m: 16,
+                ef_construction: 100,
+                ef_search: MAX_EF,
+            })
+            .unwrap(),
+        );
         // untrusted な k が MAX_EF を超えても MAX_EF でクランプする。
         assert_eq!(large_ef.effective_ef(MAX_EF + 10_000), MAX_EF);
     }
@@ -275,19 +276,20 @@ mod tests {
             ef_construction: 50,
             ef_search: 32,
         };
-        let provider = HnswSearchProvider::new(params).unwrap();
+        let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
         assert_eq!(provider.params(), params);
     }
 
-    // `new` 自身が検証すること（codex-review P1 指摘・Issue #407 追記）: 直接
-    // `HnswSearchProvider::new(invalid_params)` を呼んでも不正値を保持した provider が
-    // 構築されない。
+    // 不正な `HnswParams` は `ValidatedHnswParams::new` の時点で拒否され、
+    // `HnswSearchProvider::new` へは到達しない（型で保証。codex-review P1 指摘・
+    // Issue #407・PR #433 追記）。`HnswSearchProvider::new` 自身は
+    // `ValidatedHnswParams` 以外を受け取れないためコンパイルもできない。
     #[test]
-    fn new_rejects_invalid_params() {
+    fn validated_hnsw_params_new_rejects_invalid_params() {
         let invalid = HnswParams {
             m: 1, // HnswParams::validate は m < 2 を拒否する
             ..HnswParams::default()
         };
-        assert!(HnswSearchProvider::new(invalid).is_err());
+        assert!(ValidatedHnswParams::new(invalid).is_err());
     }
 }

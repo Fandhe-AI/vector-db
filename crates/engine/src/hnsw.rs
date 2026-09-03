@@ -180,6 +180,51 @@ impl HnswParams {
     }
 }
 
+/// [`HnswParams::validate`] を通過済みであることを型で保証するラッパー
+/// （codex-review P1 指摘・Issue #407・PR #433 追記）。
+///
+/// フィールドは private のため、[`Self::new`]（[`HnswParams::validate`] を必ず経由する）
+/// 以外の経路では構築できない。`crate::search_engine::SearchEngineKind::Hnsw` の
+/// payload をこの型にすることで、不正な `HnswParams` を保持した `SearchEngineKind`・
+/// [`crate::hnsw::provider::HnswSearchProvider`] がそもそも型として存在しえなくなる
+/// （実行時エラー分類の流用・偽装ではなく、型システムで到達不能にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedHnswParams(HnswParams);
+
+impl ValidatedHnswParams {
+    /// `params` を [`HnswParams::validate`] で検証し、通過した場合のみ構築する。
+    pub fn new(params: HnswParams) -> Result<Self, HnswError> {
+        params.validate()?;
+        Ok(Self(params))
+    }
+
+    /// 検証済みの内部値を返す（`m`／`ef_construction`／`ef_search` フィールドへの
+    /// 読み取りアクセス用。書き込みは許さない＝再検証なしに値を変更できない）。
+    pub fn get(&self) -> HnswParams {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedHnswParams {
+    type Target = HnswParams;
+    fn deref(&self) -> &HnswParams {
+        &self.0
+    }
+}
+
+impl Default for ValidatedHnswParams {
+    /// `HnswParams::default()` は本モジュールのテスト
+    /// （`hnsw_default_params_pass_validation`／`search_engine.rs::
+    /// hnsw_default_params_pass_validation`）で常に検証を通過することを固定済みの
+    /// 定数のため、untrusted 入力経路ではなく `.expect` の使用が
+    /// `coding-rust.md` の禁止規約（受信データ経路での `unwrap`/`expect` 禁止）に
+    /// 抵触しない。
+    fn default() -> Self {
+        ValidatedHnswParams::new(HnswParams::default())
+            .expect("HnswParams::default() is a fixed constant known to pass validate()")
+    }
+}
+
 /// [`HnswIndex::build`] の失敗要因。`Display`／`std::error::Error` を実装し
 /// ライブラリコードとして panic せず `Result` で契約する（coding-rust.md）。
 /// ベクトル値そのものは含めない（テナント情報・行データを含まない索引という

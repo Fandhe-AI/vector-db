@@ -4,7 +4,7 @@
 //! （`engine::hnsw::provider::HnswSearchProvider`・`engine::kernel::*`）でのみ検証する。
 
 use engine::hnsw::provider::HnswSearchProvider;
-use engine::hnsw::HnswParams;
+use engine::hnsw::{HnswParams, ValidatedHnswParams};
 use engine::kernel::{CpuScalarProvider, KernelError, SearchInput, SearchProvider};
 
 fn corpus(n: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
@@ -23,7 +23,7 @@ fn corpus(n: usize, dim: usize) -> (Vec<u64>, Vec<f32>) {
 // SearchProvider trait 実装として登録できること（object-safety・注入点の型適合）。
 #[test]
 fn hnsw_provider_is_object_safe_search_provider() {
-    let provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+    let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
     let _boxed: Box<dyn SearchProvider> = Box::new(provider);
 }
 
@@ -33,7 +33,7 @@ fn hnsw_provider_is_object_safe_search_provider() {
 // フォールバック」参照）。
 #[test]
 fn hnsw_provider_input_validation_matches_provider_contract() {
-    let provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+    let provider = HnswSearchProvider::new(ValidatedHnswParams::default());
     let (ids, vectors) = corpus(5, 4);
 
     // 次元不一致。
@@ -87,7 +87,7 @@ fn hnsw_provider_matches_cpu_scalar_reference_via_public_api() {
     let (ids, vectors) = corpus(30, dim);
     let query = vec![0.1_f32, -0.2, 0.05, 0.3];
 
-    let hnsw_provider = HnswSearchProvider::new(HnswParams::default()).unwrap();
+    let hnsw_provider = HnswSearchProvider::new(ValidatedHnswParams::default());
     let reference = CpuScalarProvider;
 
     for k in [1usize, 5, 10, 30] {
@@ -120,7 +120,7 @@ fn hnsw_provider_params_and_effective_ef_public_contract() {
         ef_construction: 80,
         ef_search: 20,
     };
-    let provider = HnswSearchProvider::new(params).unwrap();
+    let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
     assert_eq!(provider.params(), params);
 
     assert_eq!(provider.effective_ef(5), 20); // k <= ef_search
@@ -131,14 +131,15 @@ fn hnsw_provider_params_and_effective_ef_public_contract() {
     ); // untrusted k は MAX_EF でクランプ
 }
 
-// `HnswSearchProvider::new` 自身が `HnswParams::validate` を通すこと（codex-review
-// P1 指摘・Issue #407 追記）: `crate::hnsw::provider` は公開モジュールのため
-// `search_engine::build_validated` を経由しない直接構築も外部から到達しうる。
+// 不正な `HnswParams` は `ValidatedHnswParams::new`（外部公開 API）の時点で
+// 拒否され、`HnswSearchProvider::new` へは到達しない（codex-review P1 指摘・
+// Issue #407・PR #433 追記。`HnswSearchProvider::new` は `ValidatedHnswParams`
+// 以外を受け取れないため、この不変条件は型で保証される）。
 #[test]
-fn hnsw_provider_new_rejects_invalid_params_via_public_api() {
+fn validated_hnsw_params_new_rejects_invalid_params_via_public_api() {
     let invalid = HnswParams {
         m: 1, // HnswParams::validate は m < 2 を拒否する
         ..HnswParams::default()
     };
-    assert!(HnswSearchProvider::new(invalid).is_err());
+    assert!(ValidatedHnswParams::new(invalid).is_err());
 }

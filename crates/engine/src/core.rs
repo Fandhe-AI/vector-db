@@ -857,8 +857,14 @@ impl std::error::Error for CoreError {}
 pub enum OpenWithEngineError {
     /// `Storage::open` が失敗した（詳細は [`StorageError`]）。
     Storage(StorageError),
-    /// `kind` の [`crate::hnsw::HnswParams::validate`] が拒否した（詳細は
-    /// [`crate::search_engine::SearchEngineError`]）。
+    /// `kind`（`SearchEngineKind::Hnsw`）の検証エラー（詳細は
+    /// [`crate::search_engine::SearchEngineError`]）。`SearchEngineKind::Hnsw` は
+    /// [`crate::hnsw::ValidatedHnswParams`] を保持し検証済みであることが型で
+    /// 保証されているため（`search_engine.rs` モジュールドキュメント「不正な
+    /// `HnswParams` を型で到達不能にする」節。codex-review P1 指摘・Issue #407・
+    /// PR #433 追記）、[`EngineCore::open_with_engine`] 自体はこの variant を
+    /// 返さない。未検証の `HnswParams` を検証する入口は
+    /// [`crate::search_engine::hnsw_kind`] であり、そちらで先に拒否される。
     SearchEngine(crate::search_engine::SearchEngineError),
 }
 
@@ -1107,13 +1113,12 @@ impl EngineCore {
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         // `open_with_engine`（`OpenWithEngineError` を返す opt-in 経路）へは
-        // 委譲しない: 既定 kind（`default_kind()`）は常に
-        // `HnswParams::validate` を要さない `ParallelBruteForce` のため
-        // `SearchEngineError` 系の失敗は構造的に発生せず、`build_unchecked` 相当の
-        // infallible な `search_engine::default_engine()` を直接使うことで
-        // `CoreError` 側の型を一切変えずに済む（codex-review P1 指摘・Issue #407
-        // 追記。`OpenWithEngineError` 新設の経緯は
-        // `docs/design/hnsw-search-engine-wiring.md` 参照）。
+        // 委譲しない: `search_engine::default_engine()` は infallible（`build` と
+        // 同じく `SearchEngineKind` が保証する検証済み値しか受け取らない。
+        // `search_engine.rs` モジュールドキュメント参照）なので、`CoreError` 側の
+        // 型を一切変えずに済む（codex-review P1 指摘・Issue #407 追記。
+        // `OpenWithEngineError` 新設の経緯は `docs/design/hnsw-search-engine-wiring.md`
+        // 参照）。
         let provider = search_engine::default_engine();
         let storage = Storage::open(path)?;
         Ok(Self::assemble(
@@ -1143,11 +1148,12 @@ impl EngineCore {
     /// とおり、本関数の呼び出し元がプロセス起動時に明示指定する以外の経路
     /// （環境変数・SQL 構文・セッション変数）は持たない）。
     ///
-    /// `kind` が `SearchEngineKind::Hnsw(params)` で `params` が
-    /// [`crate::hnsw::HnswParams::validate`] を拒否する値の場合、`EngineCore` は
-    /// 構築されず [`OpenWithEngineError`] として fail-closed に拒否する
-    /// （[`crate::search_engine::build_validated`] 経由。不正パラメータを保持した
-    /// `EngineCore` が生存する状態を構造的に作らない）。
+    /// `kind`（`SearchEngineKind::Hnsw` の場合は
+    /// [`crate::hnsw::ValidatedHnswParams`] を保持）は型で検証済みであることが
+    /// 保証されているため（`search_engine.rs` モジュールドキュメント参照）、
+    /// 本関数自体は Hnsw 検証を理由に失敗しない。未検証の `HnswParams` を渡したい
+    /// 呼び出し元は、先に [`crate::search_engine::hnsw_kind`] で `kind` を得ること
+    /// （fail-closed に拒否されれば `EngineCore` は構築されない）。
     ///
     /// 戻り値の型は既存の公開 [`CoreError`] ではなく専用の [`OpenWithEngineError`]
     /// とする（`CoreError` は既に公開済みの `#[non_exhaustive]` を付けない enum
@@ -1160,11 +1166,7 @@ impl EngineCore {
         path: impl AsRef<Path>,
         kind: crate::search_engine::SearchEngineKind,
     ) -> Result<Self, OpenWithEngineError> {
-        // fail-closed: 不正な `HnswParams` は `Storage::open`（ファイル
-        // オープン・ロック取得、場合により空 DB ファイル作成を伴う）より前に
-        // 検証して弾く（codex-review P2 指摘・Issue #407 追記）。
-        let provider =
-            search_engine::build_validated(kind).map_err(OpenWithEngineError::SearchEngine)?;
+        let provider = search_engine::build(kind);
         let storage = Storage::open(path).map_err(OpenWithEngineError::Storage)?;
         Ok(Self::assemble(storage, provider, Some(kind)))
     }
@@ -1187,16 +1189,18 @@ impl EngineCore {
         Self::assemble(storage, provider, None)
     }
 
-    /// [`Self::from_storage`] の `kind` 版（Issue #407・opt-in 経路）。`kind` が
-    /// `SearchEngineKind::Hnsw(params)` で `params` が不正な場合は
-    /// [`crate::search_engine::SearchEngineError`] を返し `EngineCore` を構築しない
-    /// （[`Self::open_with_engine`] と同じ fail-closed 契約）。
+    /// [`Self::from_storage`] の `kind` 版（Issue #407・opt-in 経路）。`kind`
+    /// （`SearchEngineKind::Hnsw` の場合は [`crate::hnsw::ValidatedHnswParams`] を
+    /// 保持）は型で検証済みであることが保証されているため、本関数は infallible
+    /// （[`Self::open_with_engine`] と異なり `Storage::open` のような他の失敗要因も
+    /// 持たない）。未検証の `HnswParams` を渡したい呼び出し元は、先に
+    /// [`crate::search_engine::hnsw_kind`] で `kind` を得ること。
     pub fn from_storage_with_engine(
         storage: Storage,
         kind: crate::search_engine::SearchEngineKind,
-    ) -> Result<Self, crate::search_engine::SearchEngineError> {
-        let provider = search_engine::build_validated(kind)?;
-        Ok(Self::assemble(storage, provider, Some(kind)))
+    ) -> Self {
+        let provider = search_engine::build(kind);
+        Self::assemble(storage, provider, Some(kind))
     }
 
     /// [`Self::with_provider`]／[`Self::open_with_engine`]／[`Self::from_storage`]／

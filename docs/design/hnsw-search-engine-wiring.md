@@ -27,52 +27,28 @@ B 案（条件付き opt-in・自作 HNSW・依存追加なし）の Phase 3 分
 - `EXPLAIN` へのエンジン種別露出: #411
 - Recall ゲート接続: #412
 
-他案の検討経緯（`build` の公開性・互換ラッパーの要否・エラー型設計の代替案等）
-は private spec 側（ポインタ表記）に記録する。
-
 ## 設計
 
-### `SearchEngineKind::Hnsw(HnswParams)`
+### `SearchEngineKind::Hnsw(ValidatedHnswParams)`（型で不正値を到達不能にする）
 
-`HnswParams`（`hnsw.rs`。`Copy`・`Eq`）をそのまま variant ペイロードとする
-（検証用の newtype は導入しない）。`build(kind)` は infallible のまま維持し、
-不正パラメータの拒否は呼び出し境界（`build_validated`）に置く——
-「parse, don't validate」を型ではなく呼び出し規約で表現する:
+`SearchEngineKind::Hnsw` は `HnswParams` ではなく `hnsw.rs::ValidatedHnswParams`
+（private フィールドの newtype）を保持する。`ValidatedHnswParams::new(params)`
+（`HnswParams::validate` を必ず経由する）以外の経路では構築できないため、
+不正な `HnswParams` を保持した `SearchEngineKind::Hnsw`・
+`HnswSearchProvider`・`EngineCore` はそもそも型として存在しえない。
 
 ```rust
-fn build_unchecked(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
-pub fn build_validated(kind: SearchEngineKind)
-    -> Result<Box<dyn SearchProvider>, SearchEngineError>; // Hnsw のみ validate() を通す
-pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // 旧公開シグネチャの互換ラッパー
+pub fn hnsw_kind(params: HnswParams) -> Result<SearchEngineKind, SearchEngineError>; // 唯一の検証入口
+pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // infallible（Err を返す必要がない）
 ```
 
-`build_unchecked` を直接呼ぶ経路（`default_engine`）は不正値を作れない値
-（`CpuScalarBruteForce`／`ParallelBruteForce`／検証済み `HnswParams`）でのみ
-呼ばれる契約とし、untrusted な値から `SearchEngineKind::Hnsw` を組み立てる
-crate 内部の経路（`core.rs::EngineCore::open_with_engine`／
-`from_storage_with_engine`）は必ず `build_validated` を経由する。これが HNSW
-構築の正規経路であり、不正な `HnswParams` は構築時点で `SearchEngineError`
-として fail-closed に拒否され、不正な状態の `EngineCore` は構築されない。
-
-crate 外の呼び出し元向けには、旧公開シグネチャと同一の `pub fn build` を
-互換ラッパーとして維持する。`build_validated` の結果が `Err`（不正な
-`HnswParams`）の場合、`.expect`/`.unwrap` に頼らないだけでなく、要求した
-エンジンが実際には選ばれなかったことを呼び出し元が観測できない既定
-エンジンへの黙った置換（fail-open）もしない。代わりに
-`search_engine::InvalidEngineProvider`（crate 内部）を返す。構築自体は
-infallible な戻り値契約（`Box<dyn SearchProvider>`）を保ったまま、`search()`
-が呼ばれるたびに必ず既存 variant `kernel::KernelError::WorkerPanicked` を
-返す（公開・非 `#[non_exhaustive]` の `KernelError` へ新規 variant を追加する
-と後方互換性を破壊するため、既存 3 variant——`DimMismatch`／
-`NonFiniteQuery`／`WorkerPanicked`——のみで表現する。`WorkerPanicked` の
-「検索を安全に実行できない内部状態のため、部分結果を返さず検索全体を失敗
-として呼び出し元へ伝播させる」という既存の意味論が最も近いため転用する）。
-
-拒否理由（`SearchEngineError` の `Display` 文字列）は `WorkerPanicked` が
-unit variant であるため `KernelError` 経由では呼び出し元へ伝わらず、
-`InvalidEngineProvider` 側にも保持しない。理由を観測したい呼び出し元は
-`build_validated`（構築時にエラーを返し `SearchEngineError` の詳細を観測
-できる、HNSW 構築の正規経路）を使う。
+untrusted な値（設定値・外部入力）から `SearchEngineKind::Hnsw` を得たい
+呼び出し元は `hnsw_kind` を使う。不正な `HnswParams` はここで
+`SearchEngineError` として fail-closed に拒否され、`SearchEngineKind::Hnsw`
+自体が構築されない。一度 `SearchEngineKind::Hnsw` を得れば、`build`・
+`core.rs::EngineCore::open_with_engine`／`from_storage_with_engine` は
+Hnsw 検証を理由に失敗しない（`open_with_engine` は `Storage::open` の失敗
+のみが残る）。
 
 ### `FromStr`／設定文字列パーサは追加しない
 
@@ -93,16 +69,27 @@ pub enum SearchEngineError {
 ```
 
 `wire_code()`（SQLSTATE 風コード）は導入していない。本 Issue は wire／SQL
-表層への露出を持たない（`build_validated` の呼び出し元は `core.rs` の 2 関数
-のみ）ため、正式な `ErrorClass` 登録・`error_response.rs` への伝播・
+表層への露出を持たない（`hnsw_kind` の呼び出し元は `core.rs` の opt-in
+経路のみ）ため、正式な `ErrorClass` 登録・`error_response.rs` への伝播・
 `wire_code()` の追加は spec 側のビヘイビア ID 確定後の別タスクへ申し送る。
+
+### `ValidatedHnswParams`（`hnsw.rs`）
+
+```rust
+pub struct ValidatedHnswParams(HnswParams); // フィールド private
+impl ValidatedHnswParams {
+    pub fn new(params: HnswParams) -> Result<Self, HnswError>; // 唯一の構築経路
+    pub fn get(&self) -> HnswParams;
+}
+impl Deref for ValidatedHnswParams { type Target = HnswParams; .. }
+```
 
 ### `HnswSearchProvider`（`hnsw/provider.rs`）: 全件 brute-force フォールバック
 
 ```rust
-pub struct HnswSearchProvider { /* private: HnswParams, ParallelSearchProvider */ }
+pub struct HnswSearchProvider { /* private: ValidatedHnswParams, ParallelSearchProvider */ }
 impl HnswSearchProvider {
-    pub fn new(params: HnswParams) -> Result<Self, crate::hnsw::HnswError>; // 自身で validate
+    pub fn new(params: ValidatedHnswParams) -> Self; // infallible（検証済み型のみ受け取る）
     pub fn params(&self) -> HnswParams;
     pub fn effective_ef(&self, k: usize) -> usize; // ef_search.max(k).min(MAX_EF)。
     // k 自体はクランプしない — untrusted な k の上限保証は
@@ -137,15 +124,14 @@ max(k).min(MAX_EF)` を返す役割を本タスクで先に固定した。戻り
 
 - フィールド追加: `search_engine_kind: Option<SearchEngineKind>`
 - `EngineCore::open_with_engine(path, kind) -> Result<Self,
-  OpenWithEngineError>`（新設の専用エラー型。次節参照）
-- `EngineCore::from_storage_with_engine(storage, kind)
-  -> Result<Self, SearchEngineError>`
+  OpenWithEngineError>`（新設の専用エラー型。次節参照。`kind` は型で検証済み
+  のため、`Err` は `Storage::open` の失敗のみに由来する）
+- `EngineCore::from_storage_with_engine(storage, kind) -> Self`（`kind` が
+  型で検証済みのため infallible）
 - `EngineCore::search_engine_kind(&self) -> Option<SearchEngineKind>`
 - `EngineCore::open(path)` は内部で `search_engine::default_engine()`
   （infallible）を直接使い、`search_engine_kind()` は常に
-  `Some(default_kind())` を返す（既定 provider・既定エンジンの動作は不変。
-  既定 kind は常に `HnswParams::validate` を要さないため失敗系が構造的に発生
-  せず、`open` の戻り値型 `CoreError` は変更していない）
+  `Some(default_kind())` を返す（既定 provider・既定エンジンの動作は不変）
 - `with_provider`／`from_storage`（既存 API・シグネチャ不変）は `kind` を
   受け取らないため `search_engine_kind()` は常に `None`
 
@@ -157,23 +143,20 @@ max(k).min(MAX_EF)` を返す役割を本タスクで先に固定した。戻り
 
 ### `OpenWithEngineError`
 
-`open_with_engine` の失敗（不正な `HnswParams`）は、既存 `CoreError`
-（`#[non_exhaustive]` を付けない既存方針）へ variant を追加せず、独立の
-戻り値型 `OpenWithEngineError`（`Storage(StorageError)` /
+`open_with_engine` の失敗は、既存 `CoreError`（`#[non_exhaustive]` を
+付けない既存方針）へ variant を追加せず、独立の戻り値型
+`OpenWithEngineError`（`Storage(StorageError)` /
 `SearchEngine(SearchEngineError)` の 2 variant。`CoreError` への暗黙 `From`
 は用意しない）として新設した。`open_with_engine` 自体が本 Issue で新設する
 API のため、新規関数の戻り値型を選ぶこと自体は破壊的変更に当たらない。
+`kind` は型で検証済みのため、`open_with_engine` が実際に `Err` を返すのは
+`Storage::open` が失敗した場合（`Storage` variant）のみで、`SearchEngine`
+variant は現状の呼び出し経路では到達しない（将来 Hnsw 以外の検証を要する
+variant が `SearchEngineKind` に追加された場合に備えて型は残す）。
 
 - `EngineCore::open`（既存 API）は `search_engine::default_engine()`
-  （`build_unchecked(default_kind())` と同じ infallible 経路）を直接呼び、
-  `open_with_engine` へは委譲しない。既定 kind は常に検証を要さないため、
-  `open` の戻り値型 `Result<Self, CoreError>` は変更していない
-- `EngineCore::open_with_engine` は `build_validated(kind)` を
-  `Storage::open`（ファイルオープン・ロック取得を伴う）より先に呼ぶ。
-  不正な `HnswParams` の場合にストレージ側の副作用を発生させない
-  fail-closed の順序とするため（`SearchEngineKind` は `Copy` のため所有権の
-  問題は生じない）。`from_storage_with_engine` は呼び出し元が既に開いた
-  `Storage` の所有権を受け取る設計のためこの順序制約は適用されない
+  （`build(default_kind())` と同じ infallible 経路）を直接呼び、
+  `open_with_engine` へは委譲しない
 - `crates/engine/api/core_api.snapshot`（`scripts/check_core_api.sh`）の
   追跡対象は `VectorCore`／`SearchProvider` trait とその参照型に限られ、
   `search_engine::build` のような自由関数・`CoreError` 以外の新設エラー型は
@@ -190,13 +173,11 @@ API のため、新規関数の戻り値型を選ぶこと自体は破壊的変�
   （同点タイブレークを含む）で既定エンジンと Top-k が完全一致すること
   （全件フォールバック契約）を
   `hnsw_407_opt_in_engine_selected_and_matches_default_via_fallback` で検証
-- 不正パラメータ（`m=1`）の fail-closed 拒否を
-  `hnsw_407_invalid_params_rejected_fail_closed` で検証
-- `build` 互換ラッパーが不正な `HnswParams` に対してパニックせず
-  fail-closed provider を返し、`search()` が `KernelError::WorkerPanicked`
-  を返すことを
-  `build_compat_wrapper_returns_fail_closed_provider_on_invalid_hnsw_params_without_panicking`
-  で固定
+- 不正パラメータ（`m=1`）の fail-closed 拒否を、唯一の検証入口
+  `search_engine::hnsw_kind` が `Err` を返すことで
+  `hnsw_407_invalid_params_rejected_fail_closed` で検証（`SearchEngineKind::
+  Hnsw` 自体に不正値が到達しえないため、`open_with_engine`／
+  `from_storage_with_engine` 側でのアサーションは不要になった）
 - `HnswSearchProvider` 単体の入力検証・順序規約・`CpuScalarProvider` との
   bit 単位一致は `crates/engine/src/hnsw/provider.rs` の in-module テストと
   `crates/engine/tests/hnsw_provider.rs`（クレート外部公開 API のみで検証）の

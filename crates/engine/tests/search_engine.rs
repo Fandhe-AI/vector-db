@@ -111,16 +111,14 @@ fn core9_build_variants_agree_on_same_input() {
     let storage_cpu = seed_storage(&dir_cpu);
     let core_cpu = EngineCore::from_storage(
         storage_cpu,
-        search_engine::build_validated(SearchEngineKind::CpuScalarBruteForce)
-            .expect("CpuScalarBruteForce always validates"),
+        search_engine::build(SearchEngineKind::CpuScalarBruteForce),
     );
 
     let dir_parallel = TempDir::new("core9-build-parallel");
     let storage_parallel = seed_storage(&dir_parallel);
     let core_parallel = EngineCore::from_storage(
         storage_parallel,
-        search_engine::build_validated(SearchEngineKind::ParallelBruteForce)
-            .expect("ParallelBruteForce always validates"),
+        search_engine::build(SearchEngineKind::ParallelBruteForce),
     );
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
@@ -219,9 +217,9 @@ fn hnsw_407_with_provider_has_no_recorded_kind() {
 fn hnsw_407_opt_in_engine_selected_and_matches_default_via_fallback() {
     let dir_hnsw = TempDir::new("hnsw-407-optin-hnsw");
     let storage_hnsw = seed_storage(&dir_hnsw);
-    let kind = SearchEngineKind::Hnsw(engine::hnsw::HnswParams::default());
-    let core_hnsw =
-        EngineCore::from_storage_with_engine(storage_hnsw, kind).expect("valid hnsw params");
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core_hnsw = EngineCore::from_storage_with_engine(storage_hnsw, kind);
     assert_eq!(core_hnsw.search_engine_kind(), Some(kind));
 
     let dir_default = TempDir::new("hnsw-407-optin-default");
@@ -248,14 +246,18 @@ fn hnsw_407_opt_in_engine_selected_and_matches_default_via_fallback() {
 #[test]
 fn hnsw_407_open_with_engine_records_kind() {
     let dir = TempDir::new("hnsw-407-open-with-engine");
-    let kind = SearchEngineKind::Hnsw(engine::hnsw::HnswParams::default());
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
     let core = EngineCore::open_with_engine(dir.db_path(), kind).expect("valid hnsw params");
     assert_eq!(core.search_engine_kind(), Some(kind));
 }
 
-// Issue #407: 不正な HNSW パラメータ（`m=1`）を指定すると `EngineCore` が構築されず
-// fail-closed に拒否されることを、`open_with_engine`／`from_storage_with_engine`
-// 双方で確認する。
+// Issue #407・PR #433 追記: 不正な HNSW パラメータ（`m=1`）は
+// `SearchEngineKind::Hnsw` へすら到達できず、唯一の検証入口である
+// `search_engine::hnsw_kind` の時点で fail-closed に拒否されることを固定する
+// （codex-review P1 指摘。`open_with_engine`／`from_storage_with_engine` は
+// 検証済みの `SearchEngineKind` しか受け取れないため、ここで拒否された `kind` を
+// 渡すコード自体がコンパイルできない）。
 #[test]
 fn hnsw_407_invalid_params_rejected_fail_closed() {
     let invalid = engine::hnsw::HnswParams {
@@ -263,13 +265,8 @@ fn hnsw_407_invalid_params_rejected_fail_closed() {
         ..engine::hnsw::HnswParams::default()
     };
 
-    let dir = TempDir::new("hnsw-407-invalid-open-with-engine");
-    let open_result = EngineCore::open_with_engine(dir.db_path(), SearchEngineKind::Hnsw(invalid));
-    assert!(open_result.is_err(), "invalid m=1 must be rejected");
-
-    let dir2 = TempDir::new("hnsw-407-invalid-from-storage-with-engine");
-    let storage = seed_storage(&dir2);
-    let from_storage_result =
-        EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(invalid));
-    assert!(from_storage_result.is_err(), "invalid m=1 must be rejected");
+    assert!(
+        search_engine::hnsw_kind(invalid).is_err(),
+        "invalid m=1 must be rejected"
+    );
 }

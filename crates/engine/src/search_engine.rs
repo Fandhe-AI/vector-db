@@ -5,7 +5,7 @@
 //! 差し替え可能なインターフェース越しに呼び出す」という差し替え点は、独立の trait 階層を
 //! 新設せず CORE-13 の provider 注入機構（`SearchProvider` trait・TASK-124 実装済み）へ
 //! 一本化する。将来の ANN 実装は本モジュールの [`SearchEngineKind`] に選択肢を追加し、
-//! 新しい `SearchProvider` 実装を返す分岐を [`build_unchecked`] に加えるだけで、`core.rs` 側の
+//! 新しい `SearchProvider` 実装を返す分岐を [`build`] に加えるだけで、`core.rs` 側の
 //! コア API（`EngineCore`／`VectorCore`）を変更せずに追加できる。
 //!
 //! エンジンの選択はコード上の明示指定（[`SearchEngineKind`] の値）のみで決まる。
@@ -34,48 +34,30 @@
 //! （世代整合キャッシュが無く索引済み集合と `SearchInput` の差分を判定できないため。
 //! 索引の実利用は #408 の担当。詳細は `hnsw/provider.rs` モジュールドキュメント参照）。
 //!
-//! 不正な `HnswParams`（[`crate::hnsw::HnswParams::validate`] が拒否する値）は
-//! `SearchEngineKind::Hnsw` 自体には現れない（`open_with_engine` 等の呼び出し時点で
-//! [`SearchEngineError`] として fail-closed に拒否され、`EngineCore` は構築されない）。
-//! この不変条件は本モジュールの [`build_validated`] だけでなく、`crate::hnsw` が
-//! 公開モジュール（`lib.rs::pub mod hnsw`）であるために本モジュールを経由せず直接
-//! 到達しうる [`crate::hnsw::provider::HnswSearchProvider::new`] 自身の検証でも
-//! 二重に維持する（codex-review P1 指摘・Issue #407 追記。`hnsw/provider.rs`
-//! モジュールドキュメント参照）。infallible な [`build_unchecked`] 自体は `pub(crate)`
-//! に留め、crate 外からエラーを観測したい呼び出し元は必ず検証を行う
-//! [`build_validated`] を経由する（公開の [`build`] は互換ラッパー。次節参照）。
+//! ## 不正な `HnswParams` を型で到達不能にする（codex-review P1 指摘・Issue #407・PR #433 追記）
 //!
-//! ## 公開 `build` API の互換維持（codex-review P1 指摘・Issue #407 追記）
+//! [`SearchEngineKind::Hnsw`] は `HnswParams` ではなく
+//! [`crate::hnsw::ValidatedHnswParams`] を保持する。`ValidatedHnswParams` は
+//! フィールドが private で、[`crate::hnsw::HnswParams::validate`] を必ず経由する
+//! [`crate::hnsw::ValidatedHnswParams::new`] 以外の経路では構築できない。そのため
+//! 不正な `HnswParams` を保持した `SearchEngineKind::Hnsw`・
+//! [`crate::hnsw::provider::HnswSearchProvider`]・`EngineCore` はそもそも型として
+//! 存在しえず、[`build`] は常に成功する infallible な関数になる。
 //!
-//! `SearchEngineKind::Hnsw` 追加に伴い、旧 `main` の `pub fn build(SearchEngineKind)
-//! -> Box<dyn SearchProvider>` を一度 `pub(crate)` へ縮小する案を検討したが、AGENTS.md
-//! 「公開 API・エラー契約の互換性（P1）」（公開 API の破壊的変更は spec 側の対応する
-//! 定義変更と対にする規約）に抵触するため、破壊的変更を伴わない方式へ変更した:
-//! infallible な内部実装は [`build_unchecked`]（`pub(crate)`。呼び出し元が事前検証済みの
-//! 値を渡す前提）へ改称のうえ非公開化し、旧シグネチャそのままの [`build`] を公開
-//! 互換ラッパーとして維持する。[`build`] は未検証の `HnswParams` を渡された場合でも
-//! `HnswSearchProvider::new` の検証を経ない構築（かつて `.expect(...)` によるパニックへ
-//! 帰結しうる経路だった）はせず、[`build_validated`] を内部で呼ぶ。拒否された値は
-//! **黙って [`default_kind`] へ置換しない**（codex-review P1 指摘・PR #433 追記: 既定エンジンへの
-//! 無言フォールバックは、呼び出し元が要求したエンジンが実際には選ばれなかったことを観測
-//! できない fail-open だった）。代わりに [`InvalidEngineProvider`]（crate 内部）を返す。
-//! これは `search()` が呼ばれるたびに [`crate::kernel::KernelError::WorkerPanicked`] を
-//! 返すだけの provider で、`Box<dyn SearchProvider>` を返す infallible な構築自体は維持しつつ、
-//! 実際の検索実行時に fail-closed にエラーを伝播させる。`KernelError` は公開・
-//! `#[non_exhaustive]` でない enum のため新規 variant の追加は破壊的変更（AGENTS.md P1）で
-//! あり、`build`／`KernelError` の既存契約は変更しない（codex-review P1 指摘・PR #433
-//! 差し戻し）。`WorkerPanicked` を「検索を安全に実行できない内部状態のため、部分結果を
-//! 返さず検索全体を失敗として呼び出し元へ伝播させる」という既存の意味論の範囲内で転用し、
-//! 拒否理由（[`SearchEngineError`] の `Display` 文字列）は [`InvalidEngineProvider`] が
-//! 保持するのみで `KernelError` へは載せない。これにより
-//! `.claude/rules/coding-rust.md`（`unwrap`/`expect` を受信データ経路で禁止する方針）を満たし、
-//! 外部呼び出し元の既存コンパイルも壊さない。構築時点でエラーを観測したい新規呼び出し元は
-//! [`build_validated`] を使うこと。詳細・経緯は
-//! `docs/design/hnsw-search-engine-wiring.md`「変更履歴」節参照。
+//! untrusted な `HnswParams`（設定値・外部入力）から `SearchEngineKind::Hnsw` を
+//! 得たい呼び出し元は、検証が必要になる唯一の入口である [`hnsw_kind`] を使う。
+//! [`hnsw_kind`] が返す [`SearchEngineError`] が「構築できなかった」ことを表現する
+//! 唯一のエラー型であり、検証を通過した後の [`build`]・
+//! `core.rs::EngineCore::open_with_engine`／`from_storage_with_engine` は
+//! （`Storage::open` 等 Hnsw 検証と無関係な失敗要因を除き）到達不能な `Err` を
+//! 抱えない。以前検討した「黙って既定エンジンへ縮退する」「`KernelError::
+//! WorkerPanicked` を設定エラー用に転用する」はいずれも fail-open・エラー分類の
+//! 偽装にあたるため採らない（判断の経緯は `docs/design/hnsw-search-engine-wiring.md`
+//! 参照。本コメントには経緯を再掲しない）。
 
 use crate::hnsw::provider::HnswSearchProvider;
-use crate::hnsw::HnswParams;
-use crate::kernel::{CandidateHit, CpuScalarProvider, KernelError, SearchInput, SearchProvider};
+use crate::hnsw::{HnswParams, ValidatedHnswParams};
+use crate::kernel::{CpuScalarProvider, SearchProvider};
 use crate::parallel_search::ParallelSearchProvider;
 use std::fmt;
 
@@ -94,14 +76,14 @@ pub enum SearchEngineKind {
     ParallelBruteForce,
     /// HNSW 近似最近傍探索（`hnsw.rs::HnswIndex`、Issue #403 ADR B 案）。opt-in
     /// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節参照）。保持する
-    /// `HnswParams` は構築前に [`SearchEngineError`] として検証済み（このモジュールの
-    /// 呼び出し元、[`build_validated`] を経由する限り不正値は到達しない。
-    /// `crate::hnsw::provider::HnswSearchProvider::new` 自身も同じ検証を行う二重防御に
-    /// ついてはモジュールドキュメント参照）。
-    Hnsw(HnswParams),
+    /// [`crate::hnsw::ValidatedHnswParams`] は型として検証済みであることが
+    /// 保証されている（モジュールドキュメント「不正な `HnswParams` を型で
+    /// 到達不能にする」節参照）。
+    Hnsw(ValidatedHnswParams),
 }
 
-/// `SearchEngineKind::Hnsw` の構築が失敗した理由。
+/// 未検証 `HnswParams` から `SearchEngineKind`／`SearchProvider` を構築しようとして
+/// 失敗した理由。
 ///
 /// TASK-152・ERR-2 の分類リストへの新規登録・`wire_code()` の公開は行わない
 /// （codex-review P1 指摘・Issue #407 追記）: 本 variant を SQLSTATE 風コードで
@@ -159,122 +141,38 @@ impl fmt::Display for SearchEngineKind {
     }
 }
 
-/// `kind` に対応する `SearchProvider` 実装を構築する（crate 内部専用・infallible）。
+/// 未検証の `HnswParams` から検証済み `SearchEngineKind::Hnsw` を構築する唯一の入口
+/// （codex-review P1 指摘・Issue #407・PR #433 追記）。
 ///
-/// `Hnsw` の `HnswParams` は事前検証済みであることを呼び出し元が保証する契約。
-/// この契約を型で強制するため `pub(crate)` に限定し、`build_unchecked` という
-/// 関数名で「未検証の値を渡してはいけない」ことを明示する（codex-review P1 指摘・
-/// Issue #407 追記の経緯で旧 `build` から改称。旧 `pub fn build` の互換シグネチャは
-/// 下記 [`build`]（公開・fail-closed フォールバック版）が引き継ぐ）。untrusted な
+/// `params` が [`HnswParams::validate`] を拒否する値の場合は [`SearchEngineError`] を
+/// 返し、通過した場合のみ [`SearchEngineKind::Hnsw`] を返す。untrusted な
 /// 文字列・設定値から `SearchEngineKind::Hnsw` を組み立てる経路
-/// （`core.rs::EngineCore::open_with_engine` 等）を含め、crate 外から検証済みの
-/// provider を構築する経路は必ず [`build_validated`] を使う。
+/// （`core.rs::EngineCore::open_with_engine` 等の呼び出し元）は必ずこの関数を経由する。
+/// 一度 [`SearchEngineKind::Hnsw`] が構築されれば、その値を渡す [`build`]・
+/// `open_with_engine`／`from_storage_with_engine` は Hnsw 検証を理由に失敗しない
+/// （検証は型 [`crate::hnsw::ValidatedHnswParams`] が保証する）。
+pub fn hnsw_kind(params: HnswParams) -> Result<SearchEngineKind, SearchEngineError> {
+    let validated =
+        ValidatedHnswParams::new(params).map_err(SearchEngineError::InvalidHnswParams)?;
+    Ok(SearchEngineKind::Hnsw(validated))
+}
+
+/// `kind` に対応する `SearchProvider` 実装を構築する（infallible）。
+///
+/// `SearchEngineKind::Hnsw` が保持する [`crate::hnsw::ValidatedHnswParams`] は
+/// 構築時点で検証済みであることが型で保証されているため（モジュールドキュメント
+/// 「不正な `HnswParams` を型で到達不能にする」節）、本関数は `Err` を返す必要が
+/// ない。未検証の `HnswParams` から `SearchEngineKind::Hnsw` を得たい場合は
+/// [`hnsw_kind`] を先に呼ぶこと。
 ///
 /// 呼び出し元（`core.rs::EngineCore::open` 等）はここで返る `Box<dyn SearchProvider>` を
 /// そのまま `EngineCore::with_provider` へ渡す想定（object-safe な trait のため
 /// ジェネリクスなしで受け渡しできる）。
-fn build_unchecked(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
+pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     match kind {
         SearchEngineKind::CpuScalarBruteForce => Box::new(CpuScalarProvider),
         SearchEngineKind::ParallelBruteForce => Box::new(ParallelSearchProvider),
-        SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params).expect(
-            "build_unchecked() の Hnsw 分岐は build_validated 経由でのみ到達し、その時点で params は検証済み",
-        )),
-    }
-}
-
-/// [`build_unchecked`] の検証付き版。`kind` が `Hnsw(params)` の場合のみ
-/// [`HnswParams::validate`] を通し、失敗を [`SearchEngineError`] として fail-closed に
-/// 返す（`Hnsw` 以外の variant は現時点で検証すべきパラメータを持たないため常に成功）。
-/// 新規呼び出し元が `SearchEngineKind` から `Box<dyn SearchProvider>` を得る際に
-/// 推奨する経路（[`default_engine`] は常に検証を要さない [`default_kind`] を経由する
-/// ため対象外）。
-///
-/// `core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`
-/// （Issue #407 で追加）が唯一の呼び出し元で、不正な `HnswParams` を持つ
-/// `EngineCore` が構築される経路を構造的に無くす。
-pub fn build_validated(
-    kind: SearchEngineKind,
-) -> Result<Box<dyn SearchProvider>, SearchEngineError> {
-    if let SearchEngineKind::Hnsw(params) = kind {
-        params
-            .validate()
-            .map_err(SearchEngineError::InvalidHnswParams)?;
-    }
-    Ok(build_unchecked(kind))
-}
-
-/// 旧 `pub fn build(SearchEngineKind) -> Box<dyn SearchProvider>`（本 Issue 以前の
-/// `main` 時点の公開 API）と同一シグネチャを保つ互換ラッパー
-/// （codex-review P1 指摘・Issue #407 追記への対応。AGENTS.md「公開 API・エラー契約の
-/// 互換性（P1）」を満たすため、公開 API の破壊的変更を伴わない形へ変更した）。
-///
-/// `SearchEngineKind::Hnsw(HnswParams)` も公開のため、外部 crate は未検証の
-/// `HnswParams` を直接本関数へ渡しうる。旧 API はエラーを返せない infallible 契約
-/// だったため、[`HnswParams::validate`] が拒否する値を渡された場合に
-/// `.unwrap`/`.expect` でパニックさせる互換ラッパーは選ばない（受信データ経路での
-/// `unwrap`/`expect` 禁止方針・`.claude/rules/coding-rust.md`）。加えて、要求された
-/// エンジンが構築できなかった事実を呼び出し元が観測できない **黙った既定エンジンへの
-/// 置換もしない**（codex-review P1 指摘・PR #433 追記。旧実装は [`default_kind`] へ
-/// フォールバックしていたが、これは fail-open だった: 呼び出し元は `Box<dyn
-/// SearchProvider>` を受け取れてしまい、要求と異なるエンジン（総当たり）が黙って
-/// 選ばれたことを知る手段が無かった）。
-///
-/// 拒否された `kind` に対しては [`InvalidEngineProvider`] を返す。`build` 自体は
-/// infallible な戻り値契約（`Box<dyn SearchProvider>`）を維持したまま、実際に
-/// `search()` が呼ばれた時点で必ず
-/// [`crate::kernel::KernelError::WorkerPanicked`] を返し、要求したエンジンが
-/// 選ばれなかったことを fail-closed に伝える（公開・非 `#[non_exhaustive]` の
-/// `KernelError` へ新規 variant を追加しない制約下での既存 variant 転用。
-/// モジュールドキュメント「公開 `build` API の互換維持」節参照）。構築時点で
-/// エラーを観測したい場合は [`build_validated`] を使うこと。
-pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
-    match build_validated(kind) {
-        Ok(provider) => provider,
-        Err(err) => Box::new(InvalidEngineProvider::new(err)),
-    }
-}
-
-/// [`build`] が [`build_validated`] の検証失敗を受けて返す fail-closed provider
-/// （codex-review P1 指摘・PR #433 追記）。
-///
-/// 構築（[`build`] 呼び出し）自体は成功させたまま、`search()` を呼ぶたびに必ず
-/// [`crate::kernel::KernelError::WorkerPanicked`] を返す。既定エンジン
-/// （[`ParallelSearchProvider`]）へ黙って置換しないことで、呼び出し元が要求した
-/// エンジン（例: 不正な `HnswParams` を持つ `Hnsw`）が実際には選ばれなかったことを
-/// `search()` の戻り値から観測できるようにする。
-///
-/// `WorkerPanicked` を返す選択について: `KernelError` は公開・非 `#[non_exhaustive]`
-/// の enum であり、variant 追加は破壊的変更（AGENTS.md P1・codex-review 指摘・
-/// PR #433 差し戻し）にあたるため新規 variant は追加しない。既存 3 variant
-/// （`DimMismatch`／`NonFiniteQuery`／`WorkerPanicked`）のうち、`DimMismatch`・
-/// `NonFiniteQuery` はいずれも「クエリ入力そのものの検証」に固有の意味論で
-/// 本ケース（構築時に拒否された `SearchEngineKind` を理由に検索全体を拒否する）
-/// には当てはまらない。`WorkerPanicked` は「検索を安全に実行できない内部状態の
-/// ため、部分結果を返さず検索全体を失敗として呼び出し元へ伝播させる」という
-/// 既存の意味論（`kernel.rs::KernelError::WorkerPanicked` のドキュメント参照）を
-/// 持ち、拒否された設定のまま検索を続行しない・fail-open にしないという本ケースの
-/// 要件と一致するため転用する。
-#[derive(Debug, Clone, Copy)]
-struct InvalidEngineProvider;
-
-impl InvalidEngineProvider {
-    /// 拒否理由（`err`）は `KernelError::WorkerPanicked` が unit variant で
-    /// 呼び出し元へ伝えられないため保持しない（コンパイル時に警告なく破棄する
-    /// ことを明示するため、フィールドへ格納せず引数として受け取って捨てる）。
-    /// 構築時点で理由を観測したい呼び出し元は [`build_validated`] を使うこと。
-    fn new(_err: SearchEngineError) -> Self {
-        InvalidEngineProvider
-    }
-}
-
-impl SearchProvider for InvalidEngineProvider {
-    /// `input` の内容に関わらず常に `Err` を返す（fail-closed）。破棄した検証エラーの
-    /// 理由は `KernelError` へは載せず（`WorkerPanicked` は unit variant のため）、
-    /// 代わりに検索全体を失敗として呼び出し元へ伝播させることで拒否された設定の
-    /// まま検索が続行されない契約を維持する。
-    fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
-        Err(KernelError::WorkerPanicked)
+        SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params)),
     }
 }
 
@@ -292,7 +190,7 @@ pub fn default_kind() -> SearchEngineKind {
 /// `ParallelSearchProvider` を直接生成していたときと同一で、性能・結果の回帰は
 /// 発生しない。
 pub fn default_engine() -> Box<dyn SearchProvider> {
-    build_unchecked(default_kind())
+    build(default_kind())
 }
 
 #[cfg(test)]
@@ -305,7 +203,8 @@ mod tests {
     fn build_and_default_return_boxed_search_provider() {
         let _cpu: Box<dyn SearchProvider> = build(SearchEngineKind::CpuScalarBruteForce);
         let _parallel: Box<dyn SearchProvider> = build(SearchEngineKind::ParallelBruteForce);
-        let _hnsw: Box<dyn SearchProvider> = build(SearchEngineKind::Hnsw(HnswParams::default()));
+        let _hnsw: Box<dyn SearchProvider> =
+            build(SearchEngineKind::Hnsw(ValidatedHnswParams::default()));
         let _default: Box<dyn SearchProvider> = default_engine();
     }
 
@@ -318,72 +217,29 @@ mod tests {
     #[test]
     fn hnsw_default_params_pass_validation() {
         assert!(HnswParams::default().validate().is_ok());
-        assert!(build_validated(SearchEngineKind::Hnsw(HnswParams::default())).is_ok());
+        assert!(hnsw_kind(HnswParams::default()).is_ok());
     }
 
-    // 公開互換ラッパー `build` の回帰（codex-review P1 指摘・Issue #407 追記）。
-    // 旧 `main` の `pub fn build(SearchEngineKind) -> Box<dyn SearchProvider>` と
-    // 同一シグネチャで呼べる（コンパイル可能性そのものが外部呼び出し元との互換性の
-    // 証跡）ことに加え、未検証の不正 `HnswParams` を渡してもパニックせず
-    // fail-closed に `default_kind`（`ParallelBruteForce`）へフォールバックすることを
-    // 固定する。
+    // `hnsw_kind` が唯一の検証入口であることの回帰（codex-review P1 指摘・Issue #407・
+    // PR #433 追記）。不正な `HnswParams` は `SearchEngineKind::Hnsw` へすら
+    // 到達できず、`hnsw_kind` の時点で拒否される。
     #[test]
-    fn build_compat_wrapper_returns_fail_closed_provider_on_invalid_hnsw_params_without_panicking()
-    {
-        let invalid_params = HnswParams {
-            m: 0,
-            ..HnswParams::default()
-        };
-        assert!(invalid_params.validate().is_err());
-
-        // `build`（旧公開シグネチャ）は infallible な戻り値契約を維持したまま、
-        // パニックせずに `SearchProvider` を返す。
-        let provider: Box<dyn SearchProvider> = build(SearchEngineKind::Hnsw(invalid_params));
-
-        // codex-review P1 指摘（PR #433。差し戻し後は既存 `KernelError::WorkerPanicked`
-        // を転用）の回帰: 拒否された `Hnsw` は黙って `ParallelBruteForce` へ置換されない。
-        // `search()` は常に `KernelError::WorkerPanicked` を返し、要求したエンジンが
-        // 選ばれなかったことを呼び出し元が観測できることを固定する。
-        let ids = [1u64];
-        let vectors = [0.0f32, 0.0];
-        let query = [0.0f32, 0.0];
-        let input = SearchInput {
-            ids: &ids,
-            vectors: &vectors,
-            dim: 2,
-            query: &query,
-            k: 1,
-        };
-        let err = provider
-            .search(input)
-            .expect_err("must not fall back to brute-force");
-        assert!(
-            matches!(err, KernelError::WorkerPanicked),
-            "expected WorkerPanicked, got {err:?}"
-        );
-    }
-
-    // 有効な `Hnsw` パラメータでは `build` が `build_validated` と同じ経路を通り、
-    // Hnsw provider を構築できることの回帰。
-    #[test]
-    fn build_compat_wrapper_accepts_valid_hnsw_params() {
-        let _provider: Box<dyn SearchProvider> =
-            build(SearchEngineKind::Hnsw(HnswParams::default()));
-    }
-
-    #[test]
-    fn build_validated_rejects_invalid_hnsw_params() {
+    fn hnsw_kind_rejects_invalid_params() {
         let invalid = HnswParams {
             m: 1, // HnswParams::validate は m < 2 を拒否する
             ..HnswParams::default()
         };
-        // `Box<dyn SearchProvider>` は `Debug` を実装しないため `expect_err` は使えず、
-        // `match` で `Err` 側だけを取り出す。
-        let err = match build_validated(SearchEngineKind::Hnsw(invalid)) {
+        let err = match hnsw_kind(invalid) {
             Ok(_) => panic!("m=1 must be rejected"),
             Err(e) => e,
         };
         assert!(matches!(err, SearchEngineError::InvalidHnswParams(_)));
+    }
+
+    #[test]
+    fn hnsw_kind_accepts_valid_params() {
+        let kind = hnsw_kind(HnswParams::default()).expect("default params must validate");
+        let _provider: Box<dyn SearchProvider> = build(kind);
     }
 
     // `SearchEngineError::source()` が内包 `HnswError` を返すことの固定
@@ -407,32 +263,16 @@ mod tests {
         );
     }
 
-    // `build`（crate 内部専用）に直接 Hnsw(invalid_params) を渡すコードは crate 内に
-    // 存在しない・存在させないという不変条件を、`build_validated` を経由した場合のみ
-    // 検証が効くことの確認で固定する（codex-review P1 指摘・Issue #407 追記）。
-    #[test]
-    fn hnsw_provider_new_rejects_invalid_params_directly() {
-        let invalid = HnswParams {
-            m: 1,
-            ..HnswParams::default()
-        };
-        assert!(HnswSearchProvider::new(invalid).is_err());
-    }
-
-    #[test]
-    fn build_validated_never_validates_non_hnsw_kinds() {
-        // CpuScalarBruteForce / ParallelBruteForce は検証すべきパラメータを持たず常に成功。
-        assert!(build_validated(SearchEngineKind::CpuScalarBruteForce).is_ok());
-        assert!(build_validated(SearchEngineKind::ParallelBruteForce).is_ok());
-    }
-
     #[test]
     fn display_hnsw_includes_params() {
-        let kind = SearchEngineKind::Hnsw(HnswParams {
-            m: 32,
-            ef_construction: 200,
-            ef_search: 128,
-        });
+        let kind = SearchEngineKind::Hnsw(
+            ValidatedHnswParams::new(HnswParams {
+                m: 32,
+                ef_construction: 200,
+                ef_search: 128,
+            })
+            .unwrap(),
+        );
         assert_eq!(
             kind.to_string(),
             "hnsw(m=32,ef_construction=200,ef_search=128)"
