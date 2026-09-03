@@ -53,6 +53,7 @@ vacuous pass（結果が偶然一致するだけで実際にはキャッシュ�
 | `tie_group_cut_by_k_yields_smallest_doc_ids_and_prefix_consistency` | 同点グループを `k` で切ると id 昇順の先頭 `k` 件のみが残ること・`top(k1)` が `top(k2)`（k1 ≤ k2）の前方一致になること・`top(k)` の反復呼び出しが冪等であること |
 | `results_are_independent_of_build_order_and_visible_set_representation` | 投入順（整列順・決定的シャッフル・逆順）を変えても `search_within` の (doc_id, score) 列がビット一致すること。可視集合を部分（同点グループ中央域を不可視化）にした場合も、不可視域を飛び越えて id 昇順が保たれること |
 | `hybrid_sparse_tie_group_across_pool_boundary_is_deterministic_over_multiple_refetch_rounds` | `pool_depth=8` で疎側再取得ループが複数ラウンド（16→32→64→…）発火する構成（全 300 件が同一融合スコアの同点グループ）で、`CpuScalarProvider`/`ParallelSearchProvider` 双方・20 回反復にわたり `hybrid_search` の結果がビット一致し、`TieRank::GroupEnd`（既定）により境界同点グループが分断されず id 昇順の先頭 k 件で安定すること |
+| `hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing_dense_group` | 疎側のみで一致する巨大同点グループ（20 件・`pool_depth*2` を跨ぐ）と、密側のみで一致する競合グループ（14 件）を競合させる構成で、境界同点グループ完全化（`complete_boundary_tie_group`）が正しく機能すれば疎側グループの一律順位が競合グループに劣るため密側競合グループが top-k を独占することを、`CpuScalarProvider`/`ParallelSearchProvider` 双方で検証する。境界完全化を経由せず疎側が早期打ち切りされる退行が起きると、疎側同点グループが競合グループを押しのけて top-k を独占してしまい本テストが red になる（境界完全化が vacuous でなく load-bearing であることの証拠） |
 
 `docs/design/rrf-tie-break-determinism.md` へも本検証へのポインタと、#391・#392 が
 導入した `// sort-determinism: allow` マーカー付き不安定ソート API を「例外として
@@ -126,7 +127,7 @@ RECALL_VERBOSE=1 QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 \
 - 3 ゲートすべて green（層 A・層 B とも）: 満たす
 - 実測値の doc への記録: 満たす（上表。閾値そのものは非公開のため記載しない）
 - 追加ケースのテスト green: 満たす（`sparse_cache_recall.rs` 全 5 本・
-  `sparse_determinism.rs` 全 4 本）
+  `sparse_determinism.rs` 全 5 本）
 - production コード無変更: 満たす（`git diff --stat origin/main -- crates/engine/src
   crates/wire-server/src` が空であることを確認済み）
 
