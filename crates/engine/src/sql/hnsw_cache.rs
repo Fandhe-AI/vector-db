@@ -824,19 +824,33 @@ fn record_overlay_for(
         // 続けて `search_with_overlay` を呼ぶ）。
         return;
     }
-    // 既存エントリはこの時点では base 分のみ（またはそれ以下）しか
-    // `HnswCacheEntry::approx_heap_bytes` に計上されていないため、overlay 単体の
-    // バイト量を追加分として渡し、総バイト量上限超過時のみ他エントリの LRU
-    // eviction で空きを作る（`evict_for_extra_bytes`。`record_base` と異なり
-    // エントリ数はこの呼び出しで増えないため、エントリ数上限は判定条件に
-    // 含めない。Cursor Bugbot 指摘対応: `evict_for_capacity` をそのまま使うと
-    // キャッシュが既に満杯なだけで overlay 更新のたびに無関係な別エントリが
-    // 巻き添えで追い出されていた）。このエントリ自身が LRU の対象に選ばれ追い出
-    // される可能性はあるが、その場合は下の `find` が失敗し overlay を反映しない
+    // 対象エントリが既に overlay を保持している場合（世代進行に伴う再計算等）、
+    // `HnswCacheEntry::approx_heap_bytes` はその旧 overlay 分を含んだ値を
+    // 返すため、`evict_while` が合算する `total_bytes` にも旧 overlay が
+    // 計上済みである。ここで新 overlay の全量をそのまま追加分として渡すと
+    // 旧 overlay 分を二重計上してしまい、世代更新のたびに無関係エントリや
+    // 更新対象自身を過剰に追い出し、次回クエリで高価な HNSW 再構築を強制し
+    // 得る（codex-review P2 指摘対応）。旧 overlay 分を差し引いた純増分のみを
+    // 渡すことで二重計上を避ける（`record_base` と異なりエントリ数はこの
+    // 呼び出しで増えないため、エントリ数上限は判定条件に含めない。
+    // Cursor Bugbot 指摘対応: `evict_for_capacity` をそのまま使うとキャッシュが
+    // 既に満杯なだけで overlay 更新のたびに無関係な別エントリが巻き添えで
+    // 追い出されていた）。このエントリ自身が LRU の対象に選ばれ追い出される
+    // 可能性はあるが、その場合は下の `find` が失敗し overlay を反映しない
     // だけであり、容量上限を超えて常駐することはない（fail-closed）。
-    access
-        .cache
-        .evict_for_extra_bytes(&mut guard, overlay_bytes);
+    let existing_overlay_bytes = guard
+        .entries
+        .iter()
+        .find(|e| {
+            e.table == table
+                && e.built_ctx == base.built_ctx
+                && e.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, base))
+        })
+        .and_then(|e| e.overlay.as_ref())
+        .map(|o| o.approx_heap_bytes())
+        .unwrap_or(0);
+    let extra_bytes = overlay_bytes.saturating_sub(existing_overlay_bytes);
+    access.cache.evict_for_extra_bytes(&mut guard, extra_bytes);
     if let Some(entry) = guard.entries.iter_mut().find(|e| {
         e.table == table
             && e.built_ctx == base.built_ctx
