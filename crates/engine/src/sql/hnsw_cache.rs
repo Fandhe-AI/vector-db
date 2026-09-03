@@ -295,17 +295,39 @@ fn vectors_bit_equal(a: &[f32], b: &[f32]) -> bool {
 struct HnswCacheEntry {
     table: String,
     built_ctx: PolicyContext,
-    base: Arc<IndexedBase>,
+    /// 索引済みベース。`None` は「このテーブル・ctx では一度も構築に成功して
+    /// いない」状態（初回構築が失敗した直後。`build_failed_generation` の負の
+    /// キャッシュを保持する場所として本エントリ自体は必要なため、ベースなしでも
+    /// エントリを作る。`base` が `Some` の場合の契約は従来どおり: `build`（新規・
+    /// 再構築の両方）に成功するたびに置き換わる）。
+    base: Option<Arc<IndexedBase>>,
     /// 現在保持している最新のオーバーレイ（`base.built_table_generation` より
     /// 新しい世代のもの。`None` は「`base` の世代からまだ一度もオーバーレイを
-    /// 計算していない」状態）。
+    /// 計算していない」状態、または `base` 自体が `None`）。
     overlay: Option<Arc<Overlay>>,
     /// この世代では構築（新規・再構築）に失敗し、以後の探索は brute-force へ
     /// 縮退中であることを示す負のキャッシュ。`base`・`overlay` はこの失敗前の
-    /// 値のまま温存し、世代が進めば再挑戦できるようにする（`docs/design/
-    /// hnsw-generation-cache.md`「構築失敗時の負のキャッシュ」節参照）。
+    /// 値のまま温存し（`base` が元々 `None` なら `None` のまま）、世代が進めば
+    /// 再挑戦できるようにする（`docs/design/hnsw-generation-cache.md`「構築失敗時の
+    /// 負のキャッシュ」節参照）。
     build_failed_generation: Option<u64>,
     last_used: u64,
+}
+
+impl HnswCacheEntry {
+    /// 容量判定用の概算バイト量（`base`・`overlay` それぞれが `Some` の分のみ）。
+    fn approx_heap_bytes(&self) -> usize {
+        self.base
+            .as_ref()
+            .map(|b| b.approx_heap_bytes())
+            .unwrap_or(0)
+            .saturating_add(
+                self.overlay
+                    .as_ref()
+                    .map(|o| o.approx_heap_bytes())
+                    .unwrap_or(0),
+            )
+    }
 }
 
 /// ロックが保護する可変状態。
@@ -395,24 +417,28 @@ impl HnswIndexCache {
         if entry.build_failed_generation == Some(current_generation) {
             return Lookup::BuildFailedThisGeneration;
         }
+        let Some(base) = entry.base.as_ref() else {
+            // 過去に構築成功したことがない（初回失敗のみを負のキャッシュとして
+            // 保持しているエントリ）。現世代では失敗していない（上のチェックを
+            // 通過済み）ため、新規構築を試みさせる。
+            drop(guard);
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return Lookup::Miss;
+        };
         if let Some(overlay) = &entry.overlay {
             if overlay.generation == current_generation {
-                let base = Arc::clone(&entry.base);
+                let base = Arc::clone(base);
                 let overlay = Arc::clone(overlay);
                 drop(guard);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Lookup::Ready(base, overlay);
             }
         }
-        if entry.base.built_table_generation == current_generation && entry.overlay.is_none() {
-            // ベース構築直後（オーバーレイ未計算）。ベースの世代自体が現世代と
-            // 一致するため、恒等オーバーレイ（差分なし）を計算すれば `Ready`。
-            let base = Arc::clone(&entry.base);
-            drop(guard);
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return Lookup::NeedOverlay(base);
-        }
-        let base = Arc::clone(&entry.base);
+        // ベースの世代自体が現世代と一致し、かつオーバーレイ未計算の場合も
+        // （恒等オーバーレイを計算すれば `Ready` になる）、世代がさらに進んで
+        // オーバーレイが古い場合も、いずれも `Overlay::compute` を 1 回行う必要が
+        // ある点は同じため `NeedOverlay` で統一する。
+        let base = Arc::clone(base);
         drop(guard);
         self.misses.fetch_add(1, Ordering::Relaxed);
         Lookup::NeedOverlay(base)
@@ -450,7 +476,7 @@ impl HnswIndexCache {
         guard.entries.push(HnswCacheEntry {
             table: table.to_string(),
             built_ctx: base.built_ctx.clone(),
-            base: Arc::clone(&base),
+            base: Some(Arc::clone(&base)),
             overlay: None,
             build_failed_generation: None,
             last_used: seq,
@@ -466,14 +492,7 @@ impl HnswIndexCache {
         let mut total_bytes: usize = guard
             .entries
             .iter()
-            .map(|e| {
-                e.base.approx_heap_bytes().saturating_add(
-                    e.overlay
-                        .as_ref()
-                        .map(|o| o.approx_heap_bytes())
-                        .unwrap_or(0),
-                )
-            })
+            .map(HnswCacheEntry::approx_heap_bytes)
             .fold(0usize, |acc, n| acc.saturating_add(n));
         while guard.entries.len() >= MAX_HNSW_CACHE_ENTRIES
             || total_bytes.saturating_add(incoming_bytes) > MAX_HNSW_CACHE_TOTAL_BYTES
@@ -488,14 +507,7 @@ impl HnswIndexCache {
                 return;
             };
             let removed = guard.entries.remove(idx);
-            let removed_bytes = removed.base.approx_heap_bytes().saturating_add(
-                removed
-                    .overlay
-                    .as_ref()
-                    .map(|o| o.approx_heap_bytes())
-                    .unwrap_or(0),
-            );
-            total_bytes = total_bytes.saturating_sub(removed_bytes);
+            total_bytes = total_bytes.saturating_sub(removed.approx_heap_bytes());
         }
     }
 
@@ -698,11 +710,24 @@ fn record_build_failed(
         .find(|e| e.table == table && e.built_ctx == *ctx)
     {
         entry.build_failed_generation = Some(generation);
+        return;
     }
-    // 既存エントリが無い場合（初回構築からの失敗）は負のキャッシュを持つ場所が
-    // ないため記録しない。この世代は毎クエリ brute-force へ縮退し続けるが、
-    // テーブル規模が小さいうちに構築が失敗する状況は fail-closed の範囲内であり、
-    // 次の世代（書き込み）で構築を再試行できる。
+    // 既存エントリが無い場合（一度も構築成功したことがないテーブル・ctx での
+    // 初回失敗）: `base: None` の負のキャッシュ専用エントリを新設する。これを
+    // 省略すると、初回構築が失敗するたびに毎クエリ `IndexedBase::build`
+    // （索引構築本体・決して安価ではない）を再試行し続けてしまう（同一世代内の
+    // 再試行連打を防ぐという本節の目的そのものを一度も構築成功していないテーブルで
+    // 満たせなくなる）。
+    access.cache.evict_for_capacity(&mut guard, 0);
+    let seq = access.cache.seq.fetch_add(1, Ordering::Relaxed);
+    guard.entries.push(HnswCacheEntry {
+        table: table.to_string(),
+        built_ctx: ctx.clone(),
+        base: None,
+        overlay: None,
+        build_failed_generation: Some(generation),
+        last_used: seq,
+    });
 }
 
 fn record_overlay_for(
@@ -723,11 +748,11 @@ fn record_overlay_for(
     if overlay.generation != current_generation {
         return;
     }
-    if let Some(entry) = guard
-        .entries
-        .iter_mut()
-        .find(|e| e.table == table && e.built_ctx == base.built_ctx && Arc::ptr_eq(&e.base, base))
-    {
+    if let Some(entry) = guard.entries.iter_mut().find(|e| {
+        e.table == table
+            && e.built_ctx == base.built_ctx
+            && e.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, base))
+    }) {
         entry.overlay = Some(overlay);
         entry.build_failed_generation = None;
     }
