@@ -381,7 +381,7 @@ impl HnswIndexCache {
     /// `storage` は現状の実装では未参照（`sql::arena_cache::SqlArenaCache::lookup`・
     /// `sql::sparse_cache::SparseIndexCache::lookup` と異なり、世代不一致時の
     /// エントリ即時破棄をここでは行わない。破棄は `record_base`（新規ベース登録時の
-    /// テーブル限定置換）・`evict_for_capacity`（LRU）・`evict_table`（規模縮小時）に
+    /// テーブル限定置換）・`evict_for_capacity`（LRU）・`evict_entry`（規模縮小時）に
     /// 集約している）。呼び出し規約を他 2 キャッシュと揃えるため引数として残す。
     fn lookup(
         &self,
@@ -464,6 +464,17 @@ impl HnswIndexCache {
         if base.built_table_generation != current_generation {
             return base;
         }
+        let own_bytes = base.approx_heap_bytes();
+        if own_bytes > MAX_HNSW_CACHE_TOTAL_BYTES {
+            // 単体で総量上限を超えるベースは常駐させない（`sql::sparse_cache::
+            // SparseIndexCache::insert`／`sql::arena_cache::SqlArenaCache::insert`
+            // と同じ DoS 対策契約。codex-review P1 指摘対応: これを省略すると
+            // `evict_for_capacity` が全エントリを追い出しても空きが作れないまま
+            // 呼び出し元が無条件に push しており、単一テナントの過大な索引が
+            // 容量上限を超えて常駐し得た）。呼び出し元はこのクエリのスナップショット
+            // から構築した `base` をそのまま使ってよい。
+            return base;
+        }
         if let Some(pos) = guard
             .entries
             .iter()
@@ -471,7 +482,7 @@ impl HnswIndexCache {
         {
             guard.entries.remove(pos);
         }
-        self.evict_for_capacity(&mut guard, base.approx_heap_bytes());
+        self.evict_for_capacity(&mut guard, own_bytes);
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         guard.entries.push(HnswCacheEntry {
             table: table.to_string(),
@@ -511,11 +522,18 @@ impl HnswIndexCache {
         }
     }
 
-    /// 指定テーブルのエントリをすべて破棄する（テーブルが `MIN_INDEXED_ROWS`
-    /// 未満へ縮小した場合の後始末。`(table, ctx)` の全 ctx 分をまとめて破棄する）。
-    fn evict_table(&self, table: &str) {
+    /// 指定 `(table, ctx)` のエントリのみを破棄する（当該テナントから見た
+    /// `arena.len()`〔RLS 可視行数〕が `MIN_INDEXED_ROWS` 未満へ縮小した場合の
+    /// 後始末）。Cursor Bugbot 指摘対応: 以前は `table` 一致のみで全 `ctx` 分を
+    /// まとめて破棄しており、可視行数が少ない/0 件のテナントのクエリが同一
+    /// テーブルの他テナントの構築済み索引まで巻き添えで破棄し、繰り返しフル
+    /// リビルドを強制していた。`arena.len()` はテナントごとの RLS フィルタ後の
+    /// 値であり、他テナントの可視行数とは独立なため `ctx` も一致条件に含める。
+    fn evict_entry(&self, table: &str, ctx: &PolicyContext) {
         if let Ok(mut guard) = self.state.write() {
-            guard.entries.retain(|e| e.table != table);
+            guard
+                .entries
+                .retain(|e| !(e.table == table && e.built_ctx == *ctx));
         }
     }
 
@@ -594,7 +612,7 @@ pub(crate) fn search_or_fallback(
     };
 
     if n < MIN_INDEXED_ROWS {
-        access.cache.evict_table(table);
+        access.cache.evict_entry(table, ctx);
         return full_scan(access.cache);
     }
 
@@ -748,6 +766,26 @@ fn record_overlay_for(
     if overlay.generation != current_generation {
         return;
     }
+    let overlay_bytes = overlay.approx_heap_bytes();
+    let entry_total_bytes = base.approx_heap_bytes().saturating_add(overlay_bytes);
+    if entry_total_bytes > MAX_HNSW_CACHE_TOTAL_BYTES {
+        // base + overlay の合計だけで総量上限を超える場合は overlay を常駐させ
+        // ない（`record_base` と同じ DoS 対策契約。codex-review P1 指摘対応:
+        // これを省略すると overlay 追加後の合計容量が再判定されず、テナント・
+        // テーブルごとの overlay 差分（`delta_vectors` 等）の蓄積で容量上限を
+        // 超えて常駐し得た）。呼び出し元はこのクエリで計算した `overlay` を
+        // その場の探索にそのまま使ってよい（`search_or_fallback` は
+        // `record_overlay_for` の戻り値を見ず、呼び出し元が保持する `overlay` で
+        // 続けて `search_with_overlay` を呼ぶ）。
+        return;
+    }
+    // 既存エントリはこの時点では base 分のみ（またはそれ以下）しか
+    // `HnswCacheEntry::approx_heap_bytes` に計上されていないため、overlay 単体の
+    // バイト量を追加分として渡し、他エントリの LRU eviction で空きを作る
+    // （`record_base` と同じ契約）。このエントリ自身が LRU の対象に選ばれ追い出
+    // される可能性はあるが、その場合は下の `find` が失敗し overlay を反映しない
+    // だけであり、容量上限を超えて常駐することはない（fail-closed）。
+    access.cache.evict_for_capacity(&mut guard, overlay_bytes);
     if let Some(entry) = guard.entries.iter_mut().find(|e| {
         e.table == table
             && e.built_ctx == base.built_ctx
@@ -1024,8 +1062,11 @@ mod tests {
     }
 
     #[test]
-    fn evict_table_removes_all_ctx_entries_for_that_table() {
-        let path = unique_db_path("hnsw-cache-evict-table");
+    fn evict_entry_removes_only_the_matching_ctx_entry_for_that_table() {
+        // Cursor Bugbot 指摘対応（PR #434）: 可視行数が少ない/0 件のテナントの
+        // クエリで `evict_entry` が呼ばれても、同一テーブルの他テナントの
+        // 構築済みエントリは温存されることを固定する回帰テスト。
+        let path = unique_db_path("hnsw-cache-evict-entry");
         let _cleanup = CleanupGuard(path.clone());
         let storage = Storage::open(&path).expect("open storage");
         create_table(&storage, "docs", 4);
@@ -1043,7 +1084,9 @@ mod tests {
             cache.record_base(&storage, "docs", built);
         }
         assert_eq!(cache.stats().entries, 2);
-        cache.evict_table("docs");
+        cache.evict_entry("docs", &c1);
+        assert_eq!(cache.stats().entries, 1);
+        cache.evict_entry("docs", &c2);
         assert_eq!(cache.stats().entries, 0);
     }
 

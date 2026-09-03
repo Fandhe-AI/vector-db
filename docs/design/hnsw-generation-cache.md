@@ -66,8 +66,7 @@ Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql
   （`VectorCore` trait には載せない固有 API。テナント ID・行 ID 等の機微情報は
   含まない）
 
-### 定数（本リポジトリの実装既定値。#409 の可視カーディナリティ推定への置換まで
-固定値運用）
+### 定数（本リポジトリの実装既定値。#409 の可視カーディナリティ推定への置換まで固定値運用）
 
 | 定数 | 値 | 意図 |
 | ---- | -- | ---- |
@@ -79,8 +78,9 @@ Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql
 
 ## 探索フロー（`search_or_fallback`）
 
-1. `n = arena.len()`。`MIN_INDEXED_ROWS` 未満なら該当 `(table, *)` エントリを
-   `evict_table` し、全件 brute-force
+1. `n = arena.len()`。`MIN_INDEXED_ROWS` 未満なら該当 `(table, ctx)` エントリを
+   `evict_entry` し、全件 brute-force（PR #434 Cursor Bugbot 指摘対応: 同一
+   テーブルの他 `ctx`〔他テナント〕のエントリは巻き添え破棄しない）
 2. `lookup` → `Ready(base, overlay)` / `NeedOverlay(base)` /
    `BuildFailedThisGeneration` / `Miss`
 3. `Miss` → `IndexedBase::build`（`HnswIndex::build_parallel`）→
@@ -186,7 +186,7 @@ SqlArenaCache` と同じ性質）——いずれの計算結果も同じ世代�
 
 - 単体（`crates/engine/src/sql/hnsw_cache.rs` in-module）: 世代競合時の
   fail-closed（`record_base` の stale 拒否・cross-table 非破壊）・テナント境界・
-  `evict_table`・`Overlay::compute` の分類（新規・削除・内容変更）
+  `evict_entry`・`Overlay::compute` の分類（新規・削除・内容変更）
 - 結合（`crates/engine/tests/hnsw_cache.rs`）: 構築 → 差分 brute-force →
   再構築 → update/delete の段階遷移で既定エンジン対照の Recall@10 ≥ 0.9（本
   リポジトリの回帰基準。層 A・縮小規模フィクスチャ 1,200〜1,440 行・dim 16
