@@ -736,12 +736,14 @@ pub struct SparseIndex {
     /// 不変条件を構築時に保証する（[`SparseIndex::with_params`] が新語の intern の
     /// たびに `push(0)` して同期を保つ）。
     doc_freq: Vec<u32>,
-    /// `DocId` → `docs` 内のインデックス。[`SparseIndex::search_within`] が
-    /// `visible_ids`（呼び出し元の可視集合）から該当文書へ `O(1)` で辿るために使う
-    /// （Issue #36 codex-review P0 指摘対応。`docs` は構築時の入力順であり `doc_id` で
-    /// ソートされていないため、この逆引きマップなしでは可視集合ごとに線形走査が
-    /// 必要になる）。値は構築時に自分自身が割り当てた `docs` のインデックスのみを
-    /// 保持するため、`search_within` からの参照は常に範囲内である。
+    /// `DocId` → `doc_idx`（`doc_len`/`doc_ids`/`postings` 内側要素の添字空間）の
+    /// 逆引き。[`VisibleBitmap::build`] が `visible_ids`（呼び出し元の可視集合）から
+    /// 該当文書へ `O(1)` で辿るために使う（Issue #36 codex-review P0 指摘対応。
+    /// 構築時の入力順は `doc_id` でソートされていないため、この逆引きマップなしでは
+    /// 可視集合ごとに線形走査が必要になる）。値は構築時に自分自身が割り当てた
+    /// `doc_idx` のみを保持するため、参照は常に `doc_len`/`doc_ids` の範囲内である
+    /// （Issue #390。`docs: Vec<DocEntry>` 撤去後は `doc_len`/`doc_ids`/`postings` が
+    /// 文書ごとの一次情報であり、`id_index` はそれらへの入口を担う）。
     id_index: HashMap<DocId, usize>,
     /// [`TermId`] を添字とする転置索引（posting list。Issue #389・親 Issue #386）。
     /// `postings[t]` は `TermId(t)` が出現する文書の `(doc_idx, tf)` の並びであり、
