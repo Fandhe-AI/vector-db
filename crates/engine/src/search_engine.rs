@@ -59,9 +59,15 @@
 //! **黙って [`default_kind`] へ置換しない**（codex-review P1 指摘・PR #433 追記: 既定エンジンへの
 //! 無言フォールバックは、呼び出し元が要求したエンジンが実際には選ばれなかったことを観測
 //! できない fail-open だった）。代わりに [`InvalidEngineProvider`]（crate 内部）を返す。
-//! これは `search()` が呼ばれるたびに [`crate::kernel::KernelError::InvalidEngineConfig`] を
+//! これは `search()` が呼ばれるたびに [`crate::kernel::KernelError::WorkerPanicked`] を
 //! 返すだけの provider で、`Box<dyn SearchProvider>` を返す infallible な構築自体は維持しつつ、
-//! 実際の検索実行時に fail-closed にエラーを伝播させる。これにより
+//! 実際の検索実行時に fail-closed にエラーを伝播させる。`KernelError` は公開・
+//! `#[non_exhaustive]` でない enum のため新規 variant の追加は破壊的変更（AGENTS.md P1）で
+//! あり、`build`／`KernelError` の既存契約は変更しない（codex-review P1 指摘・PR #433
+//! 差し戻し）。`WorkerPanicked` を「検索を安全に実行できない内部状態のため、部分結果を
+//! 返さず検索全体を失敗として呼び出し元へ伝播させる」という既存の意味論の範囲内で転用し、
+//! 拒否理由（[`SearchEngineError`] の `Display` 文字列）は [`InvalidEngineProvider`] が
+//! 保持するのみで `KernelError` へは載せない。これにより
 //! `.claude/rules/coding-rust.md`（`unwrap`/`expect` を受信データ経路で禁止する方針）を満たし、
 //! 外部呼び出し元の既存コンパイルも壊さない。構築時点でエラーを観測したい新規呼び出し元は
 //! [`build_validated`] を使うこと。詳細・経緯は
@@ -217,9 +223,11 @@ pub fn build_validated(
 /// 拒否された `kind` に対しては [`InvalidEngineProvider`] を返す。`build` 自体は
 /// infallible な戻り値契約（`Box<dyn SearchProvider>`）を維持したまま、実際に
 /// `search()` が呼ばれた時点で必ず
-/// [`crate::kernel::KernelError::InvalidEngineConfig`] を返し、要求したエンジンが
-/// 選ばれなかったことを fail-closed に伝える。構築時点でエラーを観測したい場合は
-/// [`build_validated`] を使うこと。
+/// [`crate::kernel::KernelError::WorkerPanicked`] を返し、要求したエンジンが
+/// 選ばれなかったことを fail-closed に伝える（公開・非 `#[non_exhaustive]` の
+/// `KernelError` へ新規 variant を追加しない制約下での既存 variant 転用。
+/// モジュールドキュメント「公開 `build` API の互換維持」節参照）。構築時点で
+/// エラーを観測したい場合は [`build_validated`] を使うこと。
 pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     match build_validated(kind) {
         Ok(provider) => provider,
@@ -231,32 +239,42 @@ pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
 /// （codex-review P1 指摘・PR #433 追記）。
 ///
 /// 構築（[`build`] 呼び出し）自体は成功させたまま、`search()` を呼ぶたびに必ず
-/// [`crate::kernel::KernelError::InvalidEngineConfig`] を返す。既定エンジン
+/// [`crate::kernel::KernelError::WorkerPanicked`] を返す。既定エンジン
 /// （[`ParallelSearchProvider`]）へ黙って置換しないことで、呼び出し元が要求した
 /// エンジン（例: 不正な `HnswParams` を持つ `Hnsw`）が実際には選ばれなかったことを
 /// `search()` の戻り値から観測できるようにする。
-#[derive(Debug, Clone)]
-struct InvalidEngineProvider {
-    /// [`SearchEngineError`] の `Display` 文字列。`search()` のたびに
-    /// `KernelError::InvalidEngineConfig` へ詰め直して返す。
-    reason: String,
-}
+///
+/// `WorkerPanicked` を返す選択について: `KernelError` は公開・非 `#[non_exhaustive]`
+/// の enum であり、variant 追加は破壊的変更（AGENTS.md P1・codex-review 指摘・
+/// PR #433 差し戻し）にあたるため新規 variant は追加しない。既存 3 variant
+/// （`DimMismatch`／`NonFiniteQuery`／`WorkerPanicked`）のうち、`DimMismatch`・
+/// `NonFiniteQuery` はいずれも「クエリ入力そのものの検証」に固有の意味論で
+/// 本ケース（構築時に拒否された `SearchEngineKind` を理由に検索全体を拒否する）
+/// には当てはまらない。`WorkerPanicked` は「検索を安全に実行できない内部状態の
+/// ため、部分結果を返さず検索全体を失敗として呼び出し元へ伝播させる」という
+/// 既存の意味論（`kernel.rs::KernelError::WorkerPanicked` のドキュメント参照）を
+/// 持ち、拒否された設定のまま検索を続行しない・fail-open にしないという本ケースの
+/// 要件と一致するため転用する。
+#[derive(Debug, Clone, Copy)]
+struct InvalidEngineProvider;
 
 impl InvalidEngineProvider {
-    fn new(err: SearchEngineError) -> Self {
-        InvalidEngineProvider {
-            reason: err.to_string(),
-        }
+    /// 拒否理由（`err`）は `KernelError::WorkerPanicked` が unit variant で
+    /// 呼び出し元へ伝えられないため保持しない（コンパイル時に警告なく破棄する
+    /// ことを明示するため、フィールドへ格納せず引数として受け取って捨てる）。
+    /// 構築時点で理由を観測したい呼び出し元は [`build_validated`] を使うこと。
+    fn new(_err: SearchEngineError) -> Self {
+        InvalidEngineProvider
     }
 }
 
 impl SearchProvider for InvalidEngineProvider {
     /// `input` の内容に関わらず常に `Err` を返す（fail-closed）。破棄した検証エラーの
-    /// 理由を都度 `KernelError::InvalidEngineConfig` として呼び出し元へ伝播させる。
+    /// 理由は `KernelError` へは載せず（`WorkerPanicked` は unit variant のため）、
+    /// 代わりに検索全体を失敗として呼び出し元へ伝播させることで拒否された設定の
+    /// まま検索が続行されない契約を維持する。
     fn search(&self, _input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
-        Err(KernelError::InvalidEngineConfig {
-            reason: self.reason.clone(),
-        })
+        Err(KernelError::WorkerPanicked)
     }
 }
 
@@ -322,9 +340,9 @@ mod tests {
         // パニックせずに `SearchProvider` を返す。
         let provider: Box<dyn SearchProvider> = build(SearchEngineKind::Hnsw(invalid_params));
 
-        // codex-review P1 指摘（PR #433）の回帰: 拒否された `Hnsw` は黙って
-        // `ParallelBruteForce` へ置換されない。`search()` は常に
-        // `KernelError::InvalidEngineConfig` を返し、要求したエンジンが
+        // codex-review P1 指摘（PR #433。差し戻し後は既存 `KernelError::WorkerPanicked`
+        // を転用）の回帰: 拒否された `Hnsw` は黙って `ParallelBruteForce` へ置換されない。
+        // `search()` は常に `KernelError::WorkerPanicked` を返し、要求したエンジンが
         // 選ばれなかったことを呼び出し元が観測できることを固定する。
         let ids = [1u64];
         let vectors = [0.0f32, 0.0];
@@ -340,8 +358,8 @@ mod tests {
             .search(input)
             .expect_err("must not fall back to brute-force");
         assert!(
-            matches!(err, KernelError::InvalidEngineConfig { .. }),
-            "expected InvalidEngineConfig, got {err:?}"
+            matches!(err, KernelError::WorkerPanicked),
+            "expected WorkerPanicked, got {err:?}"
         );
     }
 

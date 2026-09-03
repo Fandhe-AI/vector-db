@@ -63,8 +63,10 @@ crate 外の呼び出し元向けには、旧公開シグネチャと同一の `
 エンジンへの黙った置換（fail-open）もしない**（codex-review P1 指摘・
 PR #433 追記）。代わりに `search_engine::InvalidEngineProvider`（crate 内部）
 を返す。構築自体は infallible な戻り値契約（`Box<dyn SearchProvider>`）を
-保ったまま、`search()` が呼ばれるたびに必ず
-`kernel::KernelError::InvalidEngineConfig` を返す。経緯は「変更履歴」節参照。
+保ったまま、`search()` が呼ばれるたびに必ず既存 variant
+`kernel::KernelError::WorkerPanicked` を返す（公開・非 `#[non_exhaustive]` の
+`KernelError` へ新規 variant を追加すると後方互換性を破壊するため、4 巡目で
+追加した専用 variant は 5 巡目で撤回した）。経緯は「変更履歴」節参照。
 
 ### `FromStr`／設定文字列パーサは追加しない
 
@@ -396,6 +398,36 @@ spec 側変更が存在しない）ことを指摘され、破壊的変更を伴
   の戻り値型変更（`OpenWithEngineError` 新設）のみ（`effective_ef` の
   クランプ計算式自体は変更していない。修正はドキュメンテーションコメントと
   `docs/design/hnsw-search-engine-wiring.md` 本文のみ）
+
+### `KernelError::InvalidEngineConfig` 撤回・既存 variant への転用（codex-review P1 指摘・PR #433 6 巡目）
+
+4 巡目で `kernel::KernelError`（公開・非 `#[non_exhaustive]`）へ追加した
+`InvalidEngineConfig { reason: String }` variant は、AGENTS.md「公開 API・
+エラー契約の互換性（P1）」に抵触する後方互換性の破壊だった（`#[non_exhaustive]`
+を後付けしても既存 match 式の網羅性が変わる問題は解消しない）と指摘され、
+撤回した。
+
+- `kernel.rs::KernelError` は 3 variant（`DimMismatch`／`NonFiniteQuery`／
+  `WorkerPanicked`）のみの契約へ戻し、`InvalidEngineConfig` の追加を撤回した
+  （`kernel.rs` は origin/main と同一内容に復元）
+- `search_engine::InvalidEngineProvider::search` は代わりに既存 variant
+  `KernelError::WorkerPanicked` を返す。3 variant のうち `DimMismatch`・
+  `NonFiniteQuery` はクエリ入力自体の検証に固有の意味論で本ケース（構築時に
+  拒否された `SearchEngineKind` を理由に検索全体を拒否する）には当てはまらず、
+  `WorkerPanicked` の「検索を安全に実行できない内部状態のため、部分結果を
+  返さず検索全体を失敗として呼び出し元へ伝播させる」という既存の意味論が
+  最も近いため転用する
+- 拒否理由（`SearchEngineError` の `Display` 文字列）は `WorkerPanicked` が
+  unit variant であるため `KernelError` 経由では呼び出し元へ伝わらず、
+  `InvalidEngineProvider` 側にも保持しない（未使用フィールドを残さない。
+  `dead_code` 警告の温存で `-D warnings` を破らないため）。理由を観測したい
+  呼び出し元は引き続き `build_validated`（構築時にエラーを返し
+  `SearchEngineError` の詳細を観測できる、HNSW 構築の正規経路）を使う
+- `crates/engine/src/search_engine.rs` のテスト
+  `build_compat_wrapper_returns_fail_closed_provider_on_invalid_hnsw_params_without_panicking`
+  のアサーションを `KernelError::WorkerPanicked` へ更新した
+- CI `core-api-check`（`scripts/check_core_api.sh`）が本撤回により再び green
+  になることを確認した
 
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 

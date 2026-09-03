@@ -87,14 +87,6 @@ pub enum KernelError {
     /// 消える（実質 fail-open）ため、検索全体を失敗として呼び出し元へ伝播させる
     /// （Issue #34 レビュー指摘対応）。
     WorkerPanicked,
-    /// `search_engine.rs::build`（旧公開 infallible シグネチャ）が要求された
-    /// `SearchEngineKind`（例: 不正な `HnswParams` を持つ `Hnsw`）の構築を
-    /// `build_validated` で拒否した際、黙って既定エンジンへ置換する代わりに
-    /// `search_engine.rs::InvalidEngineProvider` が `search()` 呼び出しのたびに
-    /// 返す（codex-review P1 指摘・PR #433 追記。fail-closed。要求したエンジンが
-    /// 選ばれなかったことを呼び出し元が `search()` の戻り値から観測できるようにする）。
-    /// `reason` は `search_engine.rs::SearchEngineError` の `Display` 文字列。
-    InvalidEngineConfig { reason: String },
 }
 
 impl fmt::Display for KernelError {
@@ -107,12 +99,6 @@ impl fmt::Display for KernelError {
             KernelError::NonFiniteQuery => write!(f, "kernel query contains non-finite value"),
             KernelError::WorkerPanicked => {
                 write!(f, "kernel search worker thread panicked")
-            }
-            KernelError::InvalidEngineConfig { reason } => {
-                write!(
-                    f,
-                    "search engine config invalid, refusing to search: {reason}"
-                )
             }
         }
     }
