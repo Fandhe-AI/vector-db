@@ -654,12 +654,50 @@ mod parallel_build_invariants {
     /// 構築入力に非有限値由来のオーバーフロースコアを混入させた場合、
     /// 並列ワーカーの `Err` が停止フラグ経由で正しく伝播し、panic せず
     /// `Err` を返すことを確認する（実装計画 §6.2 の失敗伝播テスト）。
+    ///
+    /// PR #431 codex-review（Cursor Bugbot）Medium 指摘の回帰: 旧実装は
+    /// 全件（先頭 [`SEQUENTIAL_PREFIX_NODES`] 件を含む）がオーバーフローを
+    /// 誘発するコーパスだったため、逐次プレフィックス挿入（`insert_node_
+    /// locked` を単一スレッドで直列に呼ぶループ）の時点で既に `Err` が
+    /// 返り、並列ワーカーループ・`first_error` mutex・`stop` フラグが
+    /// 一度も実行されないまま失敗していた。逐次プレフィックス分をゼロ
+    /// ベクトル（互いの `dot` は常に厳密に `0.0` で有限。`0.0 * 有限値`
+    /// は常に `0.0`）にし、並列フェーズでのみ挿入される後半だけをオーバー
+    /// フロー誘発ベクトルに変えることで、逐次プレフィックスは必ず成功し、
+    /// 並列ワーカーが挿入中に初めて `NonFiniteScore` を検出して `stop`
+    /// フラグを立てる経路を実際に通す。
+    ///
+    /// 決定性の根拠: `search_layer_locked` はタイスコア（ここでは全ゼロ
+    /// ベクトル同士の `dot == 0.0`）では `strictly_farther` による打ち切り
+    /// が働かず、到達可能な全ノードを走査し尽くすまで探索を続ける
+    /// （同関数の実装参照）。オーバーフロー誘発ベクトルは十分な数
+    /// （`OVERFLOW_TAIL_NODES`。並列スレッド数より十分大きく取り、初回の
+    /// 数件が真に並行して衝突なく挿入され得ても後続では既に確定済みの
+    /// オーバーフローノードが必ずグラフへ連結済みになるようにする）だけ
+    /// 混入するため、後続の挿入が全ゼロ成分を辿るいずれかの経路で先行
+    /// オーバーフローノードへ到達し、`score_of` がその場で `Err` を返す。
+    ///
+    /// この `Err` がワーカー段（逐次プレフィックス段ではなく）由来である
+    /// ことは構造的に保証される: `build_parallel_graph`（本テストが呼ぶ
+    /// `HnswIndex::build_with_threads` の内部実装）は逐次プレフィックス
+    /// ループを `?` で早期リターンするため、そこで失敗すれば並列スコープへ
+    /// 到達しない。かつ、逐次プレフィックス後始末（`repair_reachability`
+    /// を含む `freeze`）はワーカーの `first_error` が `None` の場合にしか
+    /// 呼ばれない。したがって `NonFiniteScore` を観測できるのは、逐次
+    /// プレフィックス（本テストではゼロベクトルのみで常に有限）か、
+    /// ワーカーの `insert_node_locked` 呼び出しのいずれかに限られ、前者を
+    /// 排除した本テストでは後者からの伝播であることが保証される。
     #[test]
     fn parallel_build_propagates_worker_errors_without_panicking() {
+        const OVERFLOW_TAIL_NODES: usize = 64;
+
         let dim = 4usize;
         let big = f32::MAX / 2.0;
-        let rows = SEQUENTIAL_PREFIX_NODES + 100;
-        let vectors: Vec<f32> = (0..rows).flat_map(|_| vec![big; dim]).collect();
+        let mut vectors: Vec<f32> =
+            Vec::with_capacity((SEQUENTIAL_PREFIX_NODES + OVERFLOW_TAIL_NODES) * dim);
+        vectors.extend(std::iter::repeat_n(0.0f32, SEQUENTIAL_PREFIX_NODES * dim));
+        vectors.extend(std::iter::repeat_n(big, OVERFLOW_TAIL_NODES * dim));
+
         let err = HnswIndex::build_with_threads(HnswParams::default(), dim as u32, &vectors, 1, 4)
             .expect_err("overflowing dot product must be rejected even in the parallel path");
         assert!(

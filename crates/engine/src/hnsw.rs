@@ -1449,11 +1449,29 @@ fn select_neighbors_heuristic_free(
 
 /// [`HnswIndex::shrink_links`] と並列構築の `BuildGraph::shrink_links` の
 /// 双方から共有される、縮退の計算のみを行う純粋関数（読み書き分離）。
-/// `current_links` の要素数が `limit` 以下なら `Ok(None)`（変更不要）。
-/// 超えていれば `Ok(Some(new_links))` を返す。`protect` を強制的に残す
-/// 契約・順序規約は [`HnswIndex::shrink_links`] のドキュメンテーション
-/// コメント参照。呼び出し元（逐次経路は `&mut self.nodes` への 2 回の
-/// アクセス、並列経路は 1 回の書き込みロック内）が書き戻しを担う。
+/// `current_links` の要素数が `limit` 以下かつ `protect` を含む（または
+/// `node == protect`）なら `Ok(None)`（変更不要）。それ以外は
+/// `Ok(Some(new_links))` を返す。`protect` を強制的に残す契約・順序規約は
+/// [`HnswIndex::shrink_links`] のドキュメンテーションコメント参照。
+/// 呼び出し元（逐次経路は `&mut self.nodes` への 2 回のアクセス、並列
+/// 経路は 1 回の書き込みロック内）が書き戻しを担う。
+///
+/// PR #431 codex-review（Cursor Bugbot）Medium 指摘の修正: 並列構築
+/// （`BuildGraph::shrink_links`）では `connect(node, protect, level)` と
+/// この関数を呼ぶ `shrink_links(node, level, protect)` が別々のロック
+/// 獲得（[`BuildGraph::connect`]・[`BuildGraph::shrink_links`]）であるため、
+/// その間に別ワーカーが同じ `node` へ異なる `protect` で `shrink_links` を
+/// 実行し、こちらの `protect` を `current_links` から先に落とすレースが
+/// 起こり得る。旧実装は「`protect` は `current_links`（延いては `scored`）
+/// に必ず含まれる」という、逐次構築（`HnswIndex::insert_node`。同一スレッド
+/// 内で `connect` 直後に `shrink_links` が走り割り込みが無い）でのみ成立する
+/// 前提に依存しており、`protect` を明示的に `push` した直後に
+/// `scored`（`current_links` 由来。`protect` を含まない場合がある）で
+/// 再フィルタしてしまい `push` した `protect` を再び落としていた。
+/// 本実装は `protect` が `current_links` に無い場合も `node_vector`
+/// から直接そのスコアを算出し、`protect` を含む完全なスコア表
+/// （`all_scored`）で再フィルタすることで、`protect` が最終的な
+/// 結果集合（`limit` 件以内）に必ず残ることを保証する。
 fn compute_shrink(
     current_links: &[u32],
     node: u32,
@@ -1462,7 +1480,8 @@ fn compute_shrink(
     limit: usize,
     protect: u32,
 ) -> Result<Option<Vec<u32>>, HnswError> {
-    if current_links.len() <= limit {
+    let protect_present = node == protect || current_links.contains(&protect);
+    if current_links.len() <= limit && protect_present {
         return Ok(None);
     }
 
@@ -1481,19 +1500,35 @@ fn compute_shrink(
     let mut shrunk = select_neighbors_heuristic_free(&scored, limit, dim, vectors)?;
     // `node == protect`（自己ループ）は `connect` が張らないため起こらないが、
     // 呼び出し契約が壊れても panic せず何もしない防御的分岐にしておく。
-    // `protect` は直前に `connect(node, protect, level)` で張られたばかりの
-    // 隣接であり、上の `scored` 構築元 `current_links` に必ず含まれる。
     if node != protect && !shrunk.contains(&protect) {
         if shrunk.len() >= limit {
+            // `select_neighbors_heuristic_free` は高々 `limit` 件しか返さない
+            // ため、この分岐に来る時点で `shrunk.len() == limit` であり、
             // `limit >= 2`（`HnswParams::validate` の `m >= 2` から層 0 も
             // 層 1 以上も導出される）なので `pop` は必ず要素を持つ。
             shrunk.pop();
         }
         shrunk.push(protect);
-        // 差し替え後も次数上限超過検出時と同じ「スコア降順・同点は id 昇順」
-        // の順序（モジュール冒頭の順序規約）を保つ。`scored` は既に同じ規約で
-        // ソート済みなので、その並び順を基準にフィルタし直すだけでよい。
-        shrunk = scored
+        // `protect` が `current_links`（延いては `scored`）に無い場合が
+        // あり得るため（上記ドキュメンテーションコメント参照）、`scored`
+        // をそのまま並び順の基準にはできない。`protect` 自身のスコアを
+        // 直接算出し、`scored` に無ければ補ったうえで、差し替え後も
+        // 「スコア降順・同点は id 昇順」の順序（モジュール冒頭の順序規約）
+        // を保つよう並び替える。
+        let mut all_scored = scored.clone();
+        if !all_scored.iter().any(|s| s.node == protect) {
+            let protect_vec = node_vector(vectors, dim, protect)?;
+            let protect_score = dot(node_vec, protect_vec);
+            if !protect_score.is_finite() {
+                return Err(HnswError::NonFiniteScore { node: protect });
+            }
+            all_scored.push(ScoredNode {
+                node: protect,
+                score: protect_score,
+            });
+        }
+        all_scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+        shrunk = all_scored
             .iter()
             .filter(|s| shrunk.contains(&s.node))
             .map(|s| s.node)
@@ -1892,5 +1927,60 @@ mod tests {
             "search must be based solely on the build-time snapshot, unaffected by \
              the caller mutating or dropping its own copy of the vectors buffer"
         );
+    }
+
+    /// PR #431 codex-review（Cursor Bugbot）Medium 指摘の回帰: `protect` が
+    /// `current_links` に含まれない状態（並列構築で他ワーカーが先に
+    /// `protect` への逆方向リンクを縮退させてしまうレース。`compute_shrink`
+    /// のドキュメンテーションコメント参照）でも、`compute_shrink` の結果
+    /// 集合には必ず `protect` が含まれ、かつ `limit` 件を超えないことを
+    /// 固定する。
+    #[test]
+    fn compute_shrink_always_retains_protect_even_when_absent_from_current_links() {
+        let dim = 1usize;
+        // ノード 0（自分自身）とノード 1..=5 の 1 次元ベクトルを用意する。
+        // `protect`（ノード 6）は `current_links` に含めない
+        // （＝並列構築下で既に他ワーカーに縮退されてしまった状況を模す）。
+        let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let current_links: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let limit = 3usize;
+        let protect = 6u32;
+
+        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
+            .expect("finite 1-d vectors must not overflow")
+            .expect("current_links.len() > limit must trigger a shrink");
+
+        assert!(
+            shrunk.contains(&protect),
+            "protect must survive the shrink even when absent from current_links, got {shrunk:?}"
+        );
+        assert!(
+            shrunk.len() <= limit,
+            "shrink result must not exceed the degree limit, got {shrunk:?}"
+        );
+    }
+
+    /// 上記の派生ケース: `current_links.len() <= limit` でも `protect` が
+    /// 欠けていれば `Ok(None)`（変更不要）を返してはならない——`None` は
+    /// 呼び出し元に「既存のリンクのままでよい」と伝えるため、`protect` が
+    /// 欠けたまま何も書き戻されないと `protect` は永久に失われる。
+    #[test]
+    fn compute_shrink_adds_protect_when_missing_even_under_the_degree_limit() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 6.0];
+        let current_links: Vec<u32> = vec![1, 2];
+        let limit = 3usize;
+        let protect = 3u32;
+
+        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
+            .expect("finite 1-d vectors must not overflow")
+            .expect("protect missing from current_links must not short-circuit to Ok(None)");
+
+        assert!(
+            shrunk.contains(&protect),
+            "protect must be added even when current_links is already within the degree limit, \
+             got {shrunk:?}"
+        );
+        assert!(shrunk.len() <= limit, "got {shrunk:?}");
     }
 }
