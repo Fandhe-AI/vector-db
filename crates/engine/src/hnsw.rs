@@ -2,11 +2,13 @@
 //! CORE-9・CORE-10。ポインタ: `docs/design/ann-index-adoption.md`「実装ガイド（B 案）」節）。
 //!
 //! 本モジュールの範囲は**グラフ構築（Algorithm 1〜4 相当）＋ ef-探索 top-k 検索
-//! （Algorithm 5 相当。[`HnswIndex::search`]。#405 で追加）**。並列構築・
-//! `search_engine.rs` への `SearchEngineKind::Hnsw` 結線・世代整合キャッシュ・
-//! RLS 統合・永続化はいずれも別タスク（#406〜#409）の担当であり、本モジュールは
-//! 触れない。ADR（`docs/design/ann-index-adoption.md`）の「非契約的な実装詳細」
-//! 区分に基づき、spec 側の確定を待たずに着手している。
+//! （Algorithm 5 相当。[`HnswIndex::search`]。#405 で追加）＋ 並列構築（#406）＋
+//! `search_engine.rs` への `SearchEngineKind::Hnsw` 結線（[`provider`] サブモジュール、
+//! #407）**。世代整合キャッシュ・RLS 統合・永続化はいずれも別タスク（#408〜#409）の
+//! 担当であり、本モジュールは触れない（`provider` は本タスク時点、索引を保持せず
+//! 全件 brute-force フォールバックする——詳細は `provider` モジュールドキュメント
+//! 参照）。ADR（`docs/design/ann-index-adoption.md`）の「非契約的な実装詳細」区分に
+//! 基づき、spec 側の確定を待たずに着手している。
 //!
 //! # ベクトルの所有方針（codex-review PR #430 P1 指摘への対応で変更）
 //!
@@ -81,6 +83,11 @@ use std::sync::Arc;
 use crate::kernel::dot;
 
 mod parallel_build;
+/// `kernel.rs::SearchProvider` への結線（Issue #407・`search_engine.rs::
+/// SearchEngineKind::Hnsw` の構築先）。本タスク時点は全件 brute-force
+/// フォールバック（詳細は `provider` モジュールドキュメント参照）。
+pub mod provider;
+pub use provider::HnswSearchProvider;
 
 /// 次数上限の安全上限（DoS 防止。`HnswParams::validate` が `m` をこの値以下に
 /// 制限する）。
@@ -170,6 +177,51 @@ impl HnswParams {
             });
         }
         Ok(())
+    }
+}
+
+/// [`HnswParams::validate`] を通過済みであることを型で保証するラッパー
+/// （codex-review P1 指摘・Issue #407・PR #433 追記）。
+///
+/// フィールドは private のため、[`Self::new`]（[`HnswParams::validate`] を必ず経由する）
+/// 以外の経路では構築できない。`crate::search_engine::SearchEngineKind::Hnsw` の
+/// payload をこの型にすることで、不正な `HnswParams` を保持した `SearchEngineKind`・
+/// [`crate::hnsw::provider::HnswSearchProvider`] がそもそも型として存在しえなくなる
+/// （実行時エラー分類の流用・偽装ではなく、型システムで到達不能にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedHnswParams(HnswParams);
+
+impl ValidatedHnswParams {
+    /// `params` を [`HnswParams::validate`] で検証し、通過した場合のみ構築する。
+    pub fn new(params: HnswParams) -> Result<Self, HnswError> {
+        params.validate()?;
+        Ok(Self(params))
+    }
+
+    /// 検証済みの内部値を返す（`m`／`ef_construction`／`ef_search` フィールドへの
+    /// 読み取りアクセス用。書き込みは許さない＝再検証なしに値を変更できない）。
+    pub fn get(&self) -> HnswParams {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedHnswParams {
+    type Target = HnswParams;
+    fn deref(&self) -> &HnswParams {
+        &self.0
+    }
+}
+
+impl Default for ValidatedHnswParams {
+    /// `HnswParams::default()` は本モジュールのテスト
+    /// （`hnsw_default_params_pass_validation`／`search_engine.rs::
+    /// hnsw_default_params_pass_validation`）で常に検証を通過することを固定済みの
+    /// 定数のため、untrusted 入力経路ではなく `.expect` の使用が
+    /// `coding-rust.md` の禁止規約（受信データ経路での `unwrap`/`expect` 禁止）に
+    /// 抵触しない。
+    fn default() -> Self {
+        ValidatedHnswParams::new(HnswParams::default())
+            .expect("HnswParams::default() is a fixed constant known to pass validate()")
     }
 }
 

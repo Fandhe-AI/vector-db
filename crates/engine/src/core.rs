@@ -843,6 +843,49 @@ impl std::fmt::Display for CoreError {
 
 impl std::error::Error for CoreError {}
 
+/// [`EngineCore::open_with_engine`] 専用のエラー型（Issue #407・ANN opt-in 結線）。
+///
+/// `open_with_engine` は本 Issue で新設する API のため、既に公開済みの
+/// [`CoreError`]（`#[non_exhaustive]` を付けない既存方針。新規 variant 追加は
+/// 既存利用者の網羅的 `match` を壊す破壊的変更になる）へ variant を追加せず、
+/// 独立の型として新設した（codex-review P1 指摘・Issue #407 追記。AGENTS.md
+/// 「公開 API・エラー契約の互換性（P1）」が要求する spec 側の対応する定義変更が
+/// 無いまま `CoreError` を破壊的変更するのを避けるため）。`CoreError` への
+/// 暗黙 `From` 変換は用意しない（`?` 経由で意図せず `CoreError` 側へ新しい
+/// エラー経路が生まれるのを防ぐ）。
+#[derive(Debug)]
+pub enum OpenWithEngineError {
+    /// `Storage::open` が失敗した（詳細は [`StorageError`]）。
+    Storage(StorageError),
+    /// `kind`（`SearchEngineKind::Hnsw`）の検証エラー（詳細は
+    /// [`crate::search_engine::SearchEngineError`]）。`SearchEngineKind::Hnsw` は
+    /// [`crate::hnsw::ValidatedHnswParams`] を保持し検証済みであることが型で
+    /// 保証されているため（`search_engine.rs` モジュールドキュメント「不正な
+    /// `HnswParams` を型で到達不能にする」節。codex-review P1 指摘・Issue #407・
+    /// PR #433 追記）、[`EngineCore::open_with_engine`] 自体はこの variant を
+    /// 返さない。未検証の `HnswParams` を検証する入口は
+    /// [`crate::search_engine::hnsw_kind`] であり、そちらで先に拒否される。
+    SearchEngine(crate::search_engine::SearchEngineError),
+}
+
+impl std::fmt::Display for OpenWithEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenWithEngineError::Storage(e) => write!(f, "core storage error: {e}"),
+            OpenWithEngineError::SearchEngine(e) => write!(f, "core search engine error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenWithEngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenWithEngineError::Storage(e) => Some(e),
+            OpenWithEngineError::SearchEngine(e) => Some(e),
+        }
+    }
+}
+
 impl From<DispatchError> for CoreError {
     fn from(e: DispatchError) -> Self {
         CoreError::Dispatch(e)
@@ -1021,6 +1064,14 @@ pub struct EngineCore {
     /// デコード）を同一テーブル世代内で再利用する（詳細は
     /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
     sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
+    /// 構築時に明示指定された [`crate::search_engine::SearchEngineKind`]（Issue #407）。
+    /// [`Self::open_with_engine`]／[`Self::from_storage_with_engine`] 経由なら
+    /// `Some(kind)`、任意 provider を直接注入する [`Self::with_provider`]／
+    /// [`Self::from_storage`] 経由（`kind` と `provider` の対応をこの構造体自身は
+    /// 検証できない）なら `None`。`#[non_exhaustive]` な `SearchEngineKind` を返す
+    /// 診断用のアクセサ（[`Self::search_engine_kind`]）で、#411 の `EXPLAIN` 露出が
+    /// 参照する契約点。
+    search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1061,30 +1112,63 @@ impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::with_provider(path, search_engine::default_engine())
+        // `open_with_engine`（`OpenWithEngineError` を返す opt-in 経路）へは
+        // 委譲しない: `search_engine::default_engine()` は infallible（`build` と
+        // 同じく `SearchEngineKind` が保証する検証済み値しか受け取らない。
+        // `search_engine.rs` モジュールドキュメント参照）なので、`CoreError` 側の
+        // 型を一切変えずに済む（codex-review P1 指摘・Issue #407 追記。
+        // `OpenWithEngineError` 新設の経緯は `docs/design/hnsw-search-engine-wiring.md`
+        // 参照）。
+        let provider = search_engine::default_engine();
+        let storage = Storage::open(path)?;
+        Ok(Self::assemble(
+            storage,
+            provider,
+            Some(search_engine::default_kind()),
+        ))
     }
 
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。
+    ///
+    /// `provider` は呼び出し元が直接組み立てた値であり、対応する
+    /// [`crate::search_engine::SearchEngineKind`] を構造的に持たないため
+    /// [`Self::search_engine_kind`] は常に `None` を返す（Issue #407。opt-in で
+    /// `kind` を伴う構築は [`Self::open_with_engine`] を使う）。
     pub fn with_provider(
         path: impl AsRef<Path>,
         provider: Box<dyn SearchProvider>,
     ) -> Result<Self, CoreError> {
         let storage = Storage::open(path)?;
-        Ok(Self {
-            storage,
-            provider,
-            prefilter_cache: PrefilterCache::new(),
-            precision_policy: crate::precision::PrecisionPolicy::default(),
-            embedder: None,
-            query_planner: None,
-            incremental_config: crate::incremental::IncrementalConfig::default(),
-            ledger_mode: LedgerMode::default(),
-            batch_limits: crate::batch_limits::BatchLimits::default(),
-            dictionary_cache: DictionaryCache::new(),
-            dictionary_config: crate::dictionary::DictionaryConfig::default(),
-            sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
-            sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
-        })
+        Ok(Self::assemble(storage, provider, None))
+    }
+
+    /// 指定パスの `redb` データベースを開き、`kind` が構築する検索エンジンを
+    /// 注入した `EngineCore` を構築する（Issue #407・opt-in 経路。ADR
+    /// `docs/design/ann-index-adoption.md` B 案「テーブル単位カタログ属性は対象外」の
+    /// とおり、本関数の呼び出し元がプロセス起動時に明示指定する以外の経路
+    /// （環境変数・SQL 構文・セッション変数）は持たない）。
+    ///
+    /// `kind`（`SearchEngineKind::Hnsw` の場合は
+    /// [`crate::hnsw::ValidatedHnswParams`] を保持）は型で検証済みであることが
+    /// 保証されているため（`search_engine.rs` モジュールドキュメント参照）、
+    /// 本関数自体は Hnsw 検証を理由に失敗しない。未検証の `HnswParams` を渡したい
+    /// 呼び出し元は、先に [`crate::search_engine::hnsw_kind`] で `kind` を得ること
+    /// （fail-closed に拒否されれば `EngineCore` は構築されない）。
+    ///
+    /// 戻り値の型は既存の公開 [`CoreError`] ではなく専用の [`OpenWithEngineError`]
+    /// とする（`CoreError` は既に公開済みの `#[non_exhaustive]` を付けない enum
+    /// であり、本関数のためだけに新規 variant を追加すると既存利用者の網羅的
+    /// `match` を壊す破壊的変更になる。本関数自体は Issue #407 で新設する API
+    /// のため、独立の戻り値型を選ぶこと自体は破壊的変更に当たらない。
+    /// codex-review P1 指摘・Issue #407 追記。経緯は
+    /// `docs/design/hnsw-search-engine-wiring.md` 参照）。
+    pub fn open_with_engine(
+        path: impl AsRef<Path>,
+        kind: crate::search_engine::SearchEngineKind,
+    ) -> Result<Self, OpenWithEngineError> {
+        let provider = search_engine::build(kind);
+        let storage = Storage::open(path).map_err(OpenWithEngineError::Storage)?;
+        Ok(Self::assemble(storage, provider, Some(kind)))
     }
 
     /// 既に開いた `Storage` の所有権を受け取って構築する（呼び出し元がテーブル作成・
@@ -1098,7 +1182,38 @@ impl EngineCore {
     /// [`VectorCore::search`] が経由する [`crate::policy::PolicyContext::is_visible`] の
     /// 単一照合パスだけが `Storage` への到達経路になる（security.md P0「テナント分離の
     /// 検査を外す/緩める/バイパス経路を作らない」）。
+    ///
+    /// [`Self::with_provider`] と同じ理由で [`Self::search_engine_kind`] は常に
+    /// `None`（Issue #407。`kind` を伴う構築は [`Self::from_storage_with_engine`]）。
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
+        Self::assemble(storage, provider, None)
+    }
+
+    /// [`Self::from_storage`] の `kind` 版（Issue #407・opt-in 経路）。`kind`
+    /// （`SearchEngineKind::Hnsw` の場合は [`crate::hnsw::ValidatedHnswParams`] を
+    /// 保持）は型で検証済みであることが保証されているため、本関数は infallible
+    /// （[`Self::open_with_engine`] と異なり `Storage::open` のような他の失敗要因も
+    /// 持たない）。未検証の `HnswParams` を渡したい呼び出し元は、先に
+    /// [`crate::search_engine::hnsw_kind`] で `kind` を得ること。
+    pub fn from_storage_with_engine(
+        storage: Storage,
+        kind: crate::search_engine::SearchEngineKind,
+    ) -> Self {
+        let provider = search_engine::build(kind);
+        Self::assemble(storage, provider, Some(kind))
+    }
+
+    /// [`Self::with_provider`]／[`Self::open_with_engine`]／[`Self::from_storage`]／
+    /// [`Self::from_storage_with_engine`] が共有する構築処理。フィールド初期値は
+    /// 4 経路すべてで同一であり（`storage`・`provider`・`search_engine_kind` 以外は
+    /// すべて既定値）、重複する struct literal を 1 箇所へ集約する
+    /// （Issue #407。以前は `with_provider`／`from_storage` の 2 箇所に同一の
+    /// struct literal があった）。
+    fn assemble(
+        storage: Storage,
+        provider: Box<dyn SearchProvider>,
+        search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
+    ) -> Self {
         Self {
             storage,
             provider,
@@ -1113,7 +1228,18 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
+            search_engine_kind,
         }
+    }
+
+    /// 構築時に明示指定された [`crate::search_engine::SearchEngineKind`] を返す
+    /// （Issue #407。[`Self::open`]／[`Self::open_with_engine`] 経由なら値を持ち、
+    /// [`Self::with_provider`]／[`Self::from_storage`] 経由（provider を直接注入し
+    /// `kind` との対応を検証できない）なら `None`。`VectorCore` trait には載せない
+    /// 固有メソッド（`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ
+    /// 方針）。#411 の `EXPLAIN` 露出が参照する契約点）。
+    pub fn search_engine_kind(&self) -> Option<crate::search_engine::SearchEngineKind> {
+        self.search_engine_kind
     }
 
     /// [`PrefilterCache`] の現在の統計を返す（TASK-169。テスト・運用観測用）。
@@ -4962,4 +5088,45 @@ mod tests {
     // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::tempdir;
+
+    // `OpenWithEngineError::source()` が両 variant で内包エラーを返すことの固定
+    // （codex-review P2 指摘・PR #433 追記。空の `impl Error` により `source()` が
+    // 常に `None` を返し、`std::error::Error` のエラーチェーンを辿れなかった不備の
+    // 回帰防止）。
+    #[test]
+    fn open_with_engine_error_source_returns_storage_error() {
+        use std::error::Error as _;
+        let inner = StorageError::NotFound(42);
+        let err = OpenWithEngineError::Storage(inner);
+        let source = err.source().expect("Storage variant must expose a source");
+        assert_eq!(
+            source.to_string(),
+            StorageError::NotFound(42).to_string(),
+            "source() must return the wrapped StorageError"
+        );
+    }
+
+    #[test]
+    fn open_with_engine_error_source_returns_search_engine_error() {
+        use std::error::Error as _;
+        let inner = crate::search_engine::SearchEngineError::InvalidHnswParams(
+            crate::hnsw::HnswError::InvalidParams {
+                reason: "test reason",
+            },
+        );
+        let err = OpenWithEngineError::SearchEngine(inner);
+        let source = err
+            .source()
+            .expect("SearchEngine variant must expose a source");
+        assert_eq!(
+            source.to_string(),
+            crate::search_engine::SearchEngineError::InvalidHnswParams(
+                crate::hnsw::HnswError::InvalidParams {
+                    reason: "test reason",
+                }
+            )
+            .to_string(),
+            "source() must return the wrapped SearchEngineError"
+        );
+    }
 }

@@ -12,7 +12,8 @@
 採用が判断された B 案（条件付き opt-in・自作 HNSW・依存追加なし）の実装分解の
 うち、本タスクは**探索 API のみ**（Malkov & Yashunin 2016 の Algorithm 5
 相当）を扱う。`search_engine.rs::SearchEngineKind` への variant 追加・
-`core.rs`／`sql/` 結線（#407）、並列構築（#406）、世代整合キャッシュ（#408）、
+`core.rs`／`sql/` 結線（#407・実装済み。`docs/design/hnsw-search-engine-wiring.md`）、
+並列構築（#406）、世代整合キャッシュ（#408）、
 RLS 統合・切替（#409／#410）、`EXPLAIN` 露出（#411）、Recall ゲート接続
 （#412）、前後比較（#413）、永続化はいずれも別タスクの担当であり、本タスクは
 `hnsw.rs` 内部に閉じた実装（wire／SQL に露出しない・`wire_code` を新設しない）
@@ -47,8 +48,8 @@ impl HnswIndex {
 - `ef` は `search` の明示引数であり、`HnswIndex::params().ef_search`
   （`HnswParams` に保持されたビルド時の既定値）を暗黙に読んで代用すること
   はしない。`params().ef_search` は呼び出し元が渡すべき「推奨値」の位置づけ
-  に留め、実際に使う `ef` を選ぶ責務は呼び出し元（#407 の provider 結線）に
-  残す。
+  に留め、実際に使う `ef` を選ぶ責務は呼び出し元（#407 の provider 結線。
+  `hnsw/provider.rs::HnswSearchProvider::effective_ef`。実装済み）に残す。
 - **ベクトルの所有方針（codex-review PR #430 P1 指摘への対応で変更）**:
   当初は `build` と同様 `search` にも `vectors: &[f32]` を渡す借用契約
   だったが、長さのみの照合ではサイズが同じまま内容を書き換えた・行順を
@@ -170,8 +171,9 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
 
 ## #405〜#408 への申し送り
 
-- `HnswSearchScratch` は呼び出し元（#407 の provider 結線）がスレッドごと
-  に 1 つ所有し、クエリをまたいで再利用する契約
+- `HnswSearchScratch` は呼び出し元（#407 の provider 結線。実装済みだが
+  スクラッチの再利用自体は #408 の索引実利用結線で行う）がスレッドごとに
+  1 つ所有し、クエリをまたいで再利用する契約
 - `id` は `build` 時に渡した `vectors` 上のノード番号であり、呼び出し元が
   RLS 事前フィルタ後の縮約ベクトル集合を構築・渡す前提（`kernel.rs::
   SearchInput` と同じ境界。`PolicyContext::is_visible` 単一照合パスは

@@ -177,3 +177,96 @@ fn core9_mock_ann_provider_is_actually_invoked_through_injection_point() {
         "注入した MockAnnProvider::search が呼ばれていない"
     );
 }
+
+// Issue #407 受け入れ条件 (a): 既定エンジンが不変であることを `EngineCore::open` の
+// 実体（`search_engine_kind()`）で固定する。`search_engine::default_kind()` も
+// 同値であることを併せて確認し、既定値の源泉が [`search_engine::default_kind`]
+// 1 箇所へ集約されていることを検証する。
+#[test]
+fn hnsw_407_default_engine_kind_is_unchanged() {
+    let dir = TempDir::new("hnsw-407-default-kind");
+    let core = EngineCore::open(dir.db_path()).expect("open default engine");
+    assert_eq!(
+        core.search_engine_kind(),
+        Some(SearchEngineKind::ParallelBruteForce)
+    );
+    assert_eq!(
+        search_engine::default_kind(),
+        SearchEngineKind::ParallelBruteForce
+    );
+}
+
+// Issue #407 受け入れ条件 (a) 続き: `open_with_engine` に既定 kind を明示的に渡した
+// 場合でも、既定 provider（`ParallelSearchProvider`）と検索結果が一致することを確認する
+// （既定経路そのものの回帰が無いことの確認。`with_provider` 経由〔`kind` 不明〕は
+// `None` を返す非対称性も併せて固定する）。
+#[test]
+fn hnsw_407_with_provider_has_no_recorded_kind() {
+    let dir = TempDir::new("hnsw-407-with-provider-kind");
+    let storage = seed_storage(&dir);
+    let core = EngineCore::from_storage(storage, search_engine::default_engine());
+    assert_eq!(core.search_engine_kind(), None);
+}
+
+// Issue #407 受け入れ条件 (b): opt-in（`SearchEngineKind::Hnsw`）を明示指定すると
+// `search_engine_kind()` がその値を返し、かつ同一入力に対する Top-k
+// （同点タイブレーク含む）が既定エンジンと完全一致すること（本タスク時点の
+// 全件 brute-force フォールバック契約。`hnsw/provider.rs` モジュールドキュメント
+// 「本タスク時点の契約」節）を確認する。
+#[test]
+fn hnsw_407_opt_in_engine_selected_and_matches_default_via_fallback() {
+    let dir_hnsw = TempDir::new("hnsw-407-optin-hnsw");
+    let storage_hnsw = seed_storage(&dir_hnsw);
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core_hnsw = EngineCore::from_storage_with_engine(storage_hnsw, kind);
+    assert_eq!(core_hnsw.search_engine_kind(), Some(kind));
+
+    let dir_default = TempDir::new("hnsw-407-optin-default");
+    let storage_default = seed_storage(&dir_default);
+    let core_default = EngineCore::from_storage(storage_default, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    // タイブレーク（id=5 と id=6 の同点）を Top-k 境界に含めるクエリ。
+    let query = [1.0, 1.0, 0.0];
+
+    let hits_hnsw = core_hnsw
+        .search(&ctx, "docs", &query, 6)
+        .expect("hnsw opt-in search");
+    let hits_default = core_default
+        .search(&ctx, "docs", &query, 6)
+        .expect("default engine search");
+
+    assert_eq!(hits_hnsw, hits_default);
+}
+
+// Issue #407: `open_with_engine` を通した opt-in 構築でも `search_engine_kind()` が
+// 正しく反映されることを、`from_storage_with_engine` とは別のコンストラクタ経路で
+// 確認する。
+#[test]
+fn hnsw_407_open_with_engine_records_kind() {
+    let dir = TempDir::new("hnsw-407-open-with-engine");
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::open_with_engine(dir.db_path(), kind).expect("valid hnsw params");
+    assert_eq!(core.search_engine_kind(), Some(kind));
+}
+
+// Issue #407・PR #433 追記: 不正な HNSW パラメータ（`m=1`）は
+// `SearchEngineKind::Hnsw` へすら到達できず、唯一の検証入口である
+// `search_engine::hnsw_kind` の時点で fail-closed に拒否されることを固定する
+// （codex-review P1 指摘。`open_with_engine`／`from_storage_with_engine` は
+// 検証済みの `SearchEngineKind` しか受け取れないため、ここで拒否された `kind` を
+// 渡すコード自体がコンパイルできない）。
+#[test]
+fn hnsw_407_invalid_params_rejected_fail_closed() {
+    let invalid = engine::hnsw::HnswParams {
+        m: 1,
+        ..engine::hnsw::HnswParams::default()
+    };
+
+    assert!(
+        search_engine::hnsw_kind(invalid).is_err(),
+        "invalid m=1 must be rejected"
+    );
+}

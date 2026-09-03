@@ -18,7 +18,8 @@
 短縮が必要になる。
 
 本タスクは**構築の並列化のみ**を扱う。`search_engine.rs::SearchEngineKind`
-への結線（#407）、世代整合キャッシュ（#408）、RLS 統合・切替（#409／#410）、
+への結線（#407・実装済み。`docs/design/hnsw-search-engine-wiring.md`）、
+世代整合キャッシュ（#408）、RLS 統合・切替（#409／#410）、
 `EXPLAIN` 露出（#411）、Recall ゲート接続（#412）、前後比較（#413）、永続化は
 いずれも別タスクの担当であり、本タスクは `hnsw.rs`／`hnsw/parallel_build.rs`
 内部に閉じた実装（wire／SQL に露出しない・`wire_code` を新設しない）に留める。
@@ -212,4 +213,4 @@ bench-hnsw-parallel-build` を承認済み計測環境で実行して補うこ�
   計測していない（本タスクの受け入れ条件は「スレッド数に応じた短縮」の
   確認までで、内訳分析は対象外）
 - `build_parallel` を `HnswIndex::build` の既定にする判断・
-  `SearchEngineKind::Hnsw` 結線（#407）・世代整合キャッシュ（#408）
+  `SearchEngineKind::Hnsw` 結線（#407・実装済み）・世代整合キャッシュ（#408）
