@@ -65,11 +65,14 @@
 `avg_doc_len`／`doc_freq` を一切参照しない構成を維持した（テナント境界の
 維持契約。詳細は次節）。
 
-**採用**。時間計算量は `O(Q + Σ_{t∈Q}|postings(t)| + M log k)`
-（`Q`: クエリの一意語数、`Σ|postings(t)|`: クエリ語の出現延べ件数、`M`: スコア
-`> 0` の一致文書数）となり、コーパス文書数 `N` そのものに比例しなくなった
-（ただしスコアアキュムレータの確保・ゼロ初期化自体は呼び出しごとに `O(N)`。
-「スコープ外・申し送り」節参照）。
+**採用**。時間計算量は `O(|visible_ids| + Σ_{t∈Q}|postings(t)| + M log k)`
+（`|visible_ids|`: 可視集合を `VisibleBitmap` へ変換する走査コスト、
+`Σ|postings(t)|`: クエリ語の出現延べ件数（posting へのスコアリング走査コスト）、
+`M`: スコア `> 0` の一致文書数）であり、**posting へのスコアリング走査のみ**が
+コーパス全体の線形走査（旧 `docs: Vec<DocEntry>` 方式）から脱却した。可視集合
+走査 `O(|visible_ids|)`、およびスコアアキュムレータの確保・ゼロ初期化
+（呼び出しごとに `O(N)`。`N`: コーパス文書数）は引き続き残る（「スコープ外・
+申し送り」節参照）。
 
 ### #391: 文書長クラス表＋`select_nth_unstable_by` 型 Top-k
 
@@ -114,8 +117,10 @@ tantivy が採用する 256 段ロッシー fieldnorm 量子化（ヒープ削�
 確保量（`words` の長さ）はインデックス側の文書数（`MAX_CORPUS_DOCS` 以下で
 有界）のみで決まり、untrusted な `visible_ids` の大きさで増幅しない。
 
-計算量: `O(Q + Σ_{t∈Q}|postings(t)| + M log k)`（呼び出しごとのスコア
-アキュムレータ確保 `O(N)` は除く）。メモリ: `approx_heap_bytes()`（下記
+計算量: `O(|visible_ids| + Σ_{t∈Q}|postings(t)| + M log k)`
+（可視集合走査 `O(|visible_ids|)`・呼び出しごとのスコアアキュムレータ確保
+`O(N)` を含む。`sparse.rs::search_within` のドキュメンテーションコメントと
+一致）。メモリ: `approx_heap_bytes()`（下記
 「前後比較」節の `bench-hybrid-profile` 実測値を参照）。
 
 ## 維持した契約
