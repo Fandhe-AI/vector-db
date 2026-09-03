@@ -1217,14 +1217,14 @@ impl HnswIndex {
     /// [`greedy_descend`](Self::greedy_descend) で降下したのち、層 0 を幅
     /// `ef.max(k)` で [`search_layer`](Self::search_layer) によりビーム探索し、
     /// 上位 `k` 件を返す。結果は `kernel.rs::CandidateHit` と同じ順序規約
-    /// （スコア降順・同点は id 昇順）で、`id` は `vectors` 上のノード番号
-    /// （0 始まり）を `u64` 化したもの。
+    /// （スコア降順・同点は id 昇順）で、`id` は内部スナップショット
+    /// （`self.vectors`）上のノード番号（0 始まり）を `u64` 化したもの。
     ///
-    /// `vectors` は [`build`](Self::build) と同じ row-major 連続バッファの
-    /// 借用契約（モジュール冒頭「ベクトルの所有方針」節）で、`vectors.len()
-    /// == self.len() * dim` を毎回検証する（呼び出し元がビルド後にベクトル
-    /// 集合を差し替えてしまう事故を検出する唯一の手段）。`scratch` は
-    /// クエリをまたいで呼び出し元が再利用する [`HnswSearchScratch`]。
+    /// ベクトル本体は引数で受け取らず、[`build`](Self::build) 時に取得した
+    /// 内部スナップショット（`self.vectors`。row-major 連続バッファ、
+    /// `self.vectors.len() == self.len() * dim`。モジュール冒頭「ベクトルの
+    /// 所有方針」節）のみを参照する。`scratch` は クエリをまたいで呼び出し元が
+    /// 再利用する [`HnswSearchScratch`]。
     ///
     /// 決定性の保証範囲は「同一索引・同一クエリ・任意のスクラッチ状態で
     /// 結果が再現する」までであり、総当たり経路（`kernel.rs`）が持つ境界
