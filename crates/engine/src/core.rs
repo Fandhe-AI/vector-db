@@ -871,7 +871,14 @@ impl std::fmt::Display for OpenWithEngineError {
     }
 }
 
-impl std::error::Error for OpenWithEngineError {}
+impl std::error::Error for OpenWithEngineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenWithEngineError::Storage(e) => Some(e),
+            OpenWithEngineError::SearchEngine(e) => Some(e),
+        }
+    }
+}
 
 impl From<DispatchError> for CoreError {
     fn from(e: DispatchError) -> Self {
@@ -5077,4 +5084,45 @@ mod tests {
     // 一時ディレクトリ（`TempDir` / `tempdir()`）は Issue #173 で
     // `crate::test_util::temp_db` へ一本化した（旧: このモジュール内の複製）。
     use crate::test_util::temp_db::tempdir;
+
+    // `OpenWithEngineError::source()` が両 variant で内包エラーを返すことの固定
+    // （codex-review P2 指摘・PR #433 追記。空の `impl Error` により `source()` が
+    // 常に `None` を返し、`std::error::Error` のエラーチェーンを辿れなかった不備の
+    // 回帰防止）。
+    #[test]
+    fn open_with_engine_error_source_returns_storage_error() {
+        use std::error::Error as _;
+        let inner = StorageError::NotFound(42);
+        let err = OpenWithEngineError::Storage(inner);
+        let source = err.source().expect("Storage variant must expose a source");
+        assert_eq!(
+            source.to_string(),
+            StorageError::NotFound(42).to_string(),
+            "source() must return the wrapped StorageError"
+        );
+    }
+
+    #[test]
+    fn open_with_engine_error_source_returns_search_engine_error() {
+        use std::error::Error as _;
+        let inner = crate::search_engine::SearchEngineError::InvalidHnswParams(
+            crate::hnsw::HnswError::InvalidParams {
+                reason: "test reason",
+            },
+        );
+        let err = OpenWithEngineError::SearchEngine(inner);
+        let source = err
+            .source()
+            .expect("SearchEngine variant must expose a source");
+        assert_eq!(
+            source.to_string(),
+            crate::search_engine::SearchEngineError::InvalidHnswParams(
+                crate::hnsw::HnswError::InvalidParams {
+                    reason: "test reason",
+                }
+            )
+            .to_string(),
+            "source() must return the wrapped SearchEngineError"
+        );
+    }
 }
