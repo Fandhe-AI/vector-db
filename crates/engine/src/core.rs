@@ -1118,8 +1118,11 @@ impl EngineCore {
         path: impl AsRef<Path>,
         kind: crate::search_engine::SearchEngineKind,
     ) -> Result<Self, CoreError> {
-        let storage = Storage::open(path)?;
+        // fail-closed: 不正な `HnswParams` は `Storage::open`（ファイル
+        // オープン・ロック取得、場合により空 DB ファイル作成を伴う）より前に
+        // 検証して弾く（codex-review P2 指摘・Issue #407 追記）。
         let provider = search_engine::build_validated(kind)?;
+        let storage = Storage::open(path)?;
         Ok(Self::assemble(storage, provider, Some(kind)))
     }
 

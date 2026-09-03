@@ -115,8 +115,12 @@ impl SearchProvider for HnswSearchProvider {
 倒し「索引済み集合は常に空」＝全件フォールバックとして実装した。
 
 `effective_ef` は #408 が索引探索（`HnswIndex::search(query, k,
-self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、untrusted な
-`k` を `MAX_EF` でクランプする役割のみを本タスクで先に固定した。
+self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、構築時
+パラメータ `ef_search` を `MAX_EF` へクランプする役割のみを本タスクで先に
+固定した（`k` 自体はクランプしない。untrusted な `k` の上限保証は
+`HnswIndex::search` 自身の `k > MAX_EF` fail-closed 検証が担う。詳細・
+訂正経緯は「変更履歴」節「`HnswSearchProvider::effective_ef` の契約訂正」
+参照）。
 
 ### `core.rs::EngineCore` の opt-in 構築 API
 
@@ -283,6 +287,25 @@ spec 側変更が存在しない）ことを指摘され、破壊的変更を伴
 
 2 巡目の変更履歴（直前の節）は判断の推移の記録として残し、削除・書き換えは
 行わない。
+
+### `open_with_engine` の検証順序訂正と `effective_ef` 記述の再訂正（codex-review P2 指摘・PR #433 4 巡目）
+
+- `EngineCore::open_with_engine` が `Storage::open`（ファイルオープン・ロック
+  取得、場合により空 DB ファイル作成を伴う）の**後**に `build_validated(kind)`
+  を実行しており、不正な `HnswParams` でも先にストレージ側の副作用が発生して
+  いた（fail-closed 方針との不整合）。検証順序を入れ替え、`build_validated`
+  を `Storage::open` より前に呼ぶよう修正した（`SearchEngineKind` は `Copy`
+  のため所有権の問題は生じない）。`from_storage_with_engine` は呼び出し元が
+  既に開いた `Storage` の所有権を受け取る設計のためこの問題は無く、変更対象
+  外
+- 「設計」節（`### HnswSearchProvider`）内の `effective_ef` 説明が、直前の
+  「`effective_ef` の契約訂正」節（本節の直前）での訂正後も「`k` を `MAX_EF`
+  でクランプする」という誤った記述のまま残っていた。`ef_search`（構築時
+  パラメータ）を `MAX_EF` へクランプするだけで `k` 自体はクランプしない旨・
+  `k` の上限保証は `HnswIndex::search` 自身の `k > MAX_EF` fail-closed 検証が
+  担う旨を明記し、97 行目・236〜253 行目の記述と整合させた
+- production コードの変更は `open_with_engine` の検証順序入れ替えのみ
+  （`effective_ef` のクランプ計算式自体は変更していない）
 
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 
