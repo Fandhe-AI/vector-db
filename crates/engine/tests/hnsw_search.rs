@@ -13,7 +13,9 @@
 
 use std::collections::HashSet;
 
-use engine::hnsw::{HnswError, HnswIndex, HnswParams, HnswSearchScratch, MAX_EF};
+use engine::hnsw::{
+    HnswError, HnswIndex, HnswParams, HnswSearchScratch, MAX_EF, SEQUENTIAL_PREFIX_NODES,
+};
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 
 /// 決定的シードの xorshift64*（`crates/engine/tests/hnsw.rs::TestRng` と同
@@ -205,6 +207,35 @@ fn recall_at_10_meets_threshold_on_small_fixture() {
         recall256 >= 0.99,
         "Recall@10(ef=256) = {recall256} must be >= 0.99 (small fixture regression guard)"
     );
+}
+
+/// HNSW 構築の並列化（Issue #406）の受け入れ条件 (a): 並列構築版の Recall@10
+/// が逐次構築版と同水準（`parallel >= sequential - 0.02`。実装計画 §6.3
+/// 層 A）であることを、同一フィクスチャ・同一クエリ集合で確認する。
+/// `n > SEQUENTIAL_PREFIX_NODES` を満たす規模でなければ並列フェーズが
+/// 起動しない（`build_with_threads` が `build` へ縮退する）ため、行数を
+/// 確保する。
+#[test]
+fn parallel_build_recall_at_10_matches_sequential_build_within_margin() {
+    let dim = 32;
+    let rows = SEQUENTIAL_PREFIX_NODES + 1_800;
+    let vectors = gen_clustered_corpus(0xA5A5_1234_1111, dim, rows, 20);
+    let params = HnswParams::default();
+    let seed = 0xF00D_1234_5678;
+    let queries = gen_queries(0xA5A5_1234_1111, 0x51DE_0004, dim, 20, 100);
+
+    let sequential = HnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
+    let parallel = HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, 4).unwrap();
+
+    for ef in [64usize, 256] {
+        let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
+        let par_recall = recall_at_10(&parallel, &vectors, dim, rows, ef, &queries);
+        assert!(
+            par_recall >= seq_recall - 0.02,
+            "ef={ef} parallel Recall@10={par_recall} must be within 0.02 of \
+             sequential Recall@10={seq_recall}"
+        );
+    }
 }
 
 // --------------------------------------------------
@@ -480,4 +511,29 @@ fn search_rejects_k_beyond_max_ef() {
         .search(&query, MAX_EF + 1, 64, &mut scratch)
         .unwrap_err();
     assert!(matches!(err, HnswError::InvalidParams { .. }));
+}
+
+/// 並列構築版の索引に対する探索も、逐次構築版と同じ決定性契約（同一索引・
+/// 同一クエリ・任意のスクラッチ状態で結果が完全一致する）を満たすことを
+/// 確認する（並列構築が変えるのはグラフの**構築時の形状**のみで、構築後の
+/// 探索の決定性は構築方式に依らず不変。実装計画 §6.3）。
+#[test]
+fn search_on_parallel_built_index_is_deterministic_across_repeated_calls() {
+    let dim = 16;
+    let rows = SEQUENTIAL_PREFIX_NODES + 400;
+    let vectors = gen_clustered_corpus(0x1357_9BDF_2222, dim, rows, 10);
+    let index =
+        HnswIndex::build_with_threads(HnswParams::default(), dim as u32, &vectors, 0x2468_ACE1, 4)
+            .unwrap();
+    let query = gen_query(0x1357_9BDF_2222, 0x0BAD_F00E, dim, 10);
+
+    let mut scratch = HnswSearchScratch::default();
+    let first = index.search(&query, 10, 64, &mut scratch).unwrap();
+    for _ in 0..2 {
+        let again = index.search(&query, 10, 64, &mut scratch).unwrap();
+        assert_eq!(first, again);
+    }
+    let mut fresh_scratch = HnswSearchScratch::default();
+    let with_fresh_scratch = index.search(&query, 10, 64, &mut fresh_scratch).unwrap();
+    assert_eq!(first, with_fresh_scratch);
 }

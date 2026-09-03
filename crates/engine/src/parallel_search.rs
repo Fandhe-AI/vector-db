@@ -24,12 +24,19 @@
 //! 「不安全な設計｜無制限リソース確保（DoS）」）。予算を確保できない分は
 //! スレッドを追加せず単一スレッド相当まで縮退させるのみで、行の選出対象からの除外は
 //! 一切発生しない（[`ParallelSearchProvider::search`] 参照）。
+//!
+//! `thread_count_for`・[`WorkerBudgetGuard`]・[`MAX_THREADS_PER_QUERY`] は
+//! `pub(crate)` として `hnsw::parallel_build`（HNSW 構築の並列化。Issue #406）
+//! からも共有する——検索・構築の双方で「並列度の決め方」「プロセス全体の
+//! ワーカー予算調停」を単一の実装に統一するため（構築側は `MAX_BUILD_THREADS`
+//! という別名の定数で同値を持つ）。本モジュール自身の並列検索の挙動・
+//! エラー契約は変わらない。
 
 use crate::kernel::{CandidateHit, KernelError, SearchInput, SearchProvider, TopKSelector};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// クエリ 1 件あたりのスレッド数上限（CORE-3 の並列度の趣旨に対応）。
-const MAX_THREADS_PER_QUERY: usize = 16;
+pub(crate) const MAX_THREADS_PER_QUERY: usize = 16;
 
 /// プロセス全体で共有するワーカースレッド予算。`MAX_THREADS_PER_QUERY` はクエリ単独の
 /// 上限に過ぎず、同時実行クエリの数だけスレッド総数が積み上がり得るため、
@@ -45,10 +52,10 @@ static GLOBAL_WORKER_BUDGET: AtomicUsize = AtomicUsize::new(0);
 /// [`GLOBAL_WORKER_BUDGET`] から `desired` 件までの追加ワーカー枠を確保し、確保できた
 /// 件数（0 件の場合もあり得る）を返す `RAII` ガード。ガードの `Drop` で必ず解放するため、
 /// 途中で `?` によるアーリーリターンやワーカー panic が起きても予算がリークしない。
-struct WorkerBudgetGuard(usize);
+pub(crate) struct WorkerBudgetGuard(usize);
 
 impl WorkerBudgetGuard {
-    fn acquire(desired: usize) -> Self {
+    pub(crate) fn acquire(desired: usize) -> Self {
         let mut reserved = 0usize;
         let _ = GLOBAL_WORKER_BUDGET.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
             let available = MAX_TOTAL_EXTRA_WORKER_THREADS.saturating_sub(cur);
@@ -58,7 +65,7 @@ impl WorkerBudgetGuard {
         Self(reserved)
     }
 
-    fn granted(&self) -> usize {
+    pub(crate) fn granted(&self) -> usize {
         self.0
     }
 }
@@ -224,7 +231,7 @@ fn join_all_or_panicked(
 
 /// 利用可能な並列度を [`MAX_THREADS_PER_QUERY`] でクランプし、担当行数が
 /// [`MIN_ROWS_PER_THREAD`] を割り込まない範囲に収める。
-fn thread_count_for(row_count: usize) -> usize {
+pub(crate) fn thread_count_for(row_count: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)

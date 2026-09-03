@@ -80,6 +80,8 @@ use std::sync::Arc;
 
 use crate::kernel::dot;
 
+mod parallel_build;
+
 /// 次数上限の安全上限（DoS 防止。`HnswParams::validate` が `m` をこの値以下に
 /// 制限する）。
 pub const MAX_M: usize = 128;
@@ -96,6 +98,16 @@ pub const MAX_HNSW_NODES: usize = 1_000_000;
 /// オーダーで極小確率の外れ値しか生じないが、上限を設けないと未検証の外れ値が
 /// `Vec` のネストを無制限に増やしうるため fail-closed に固定する）。
 pub const MAX_LEVEL: usize = 32;
+
+/// 並列構築（[`HnswIndex::build_with_threads`]・[`HnswIndex::build_parallel`]。
+/// Issue #406）で逐次に構築する先頭ノード数（qdrant 方式。孤立成分の発生を
+/// 防ぐ。本リポ採用値・非規範）。`parallel_build` モジュールの並列フェーズは
+/// この件数を超えるノードのみを対象にする。
+pub const SEQUENTIAL_PREFIX_NODES: usize = 256;
+
+/// 並列構築のスレッド数上限（`parallel_search::MAX_THREADS_PER_QUERY` と同値。
+/// [`HnswIndex::build_parallel`] が決める並列度もこの上限でクランプされる）。
+pub const MAX_BUILD_THREADS: usize = 16;
 
 /// HNSW 構築パラメータ。
 ///
@@ -198,6 +210,13 @@ pub enum HnswError {
     /// untrusted 入力を `total_cmp` の順序に委ねず事前拒否する）で、探索段の
     /// 入口で検証する。
     NonFiniteQuery,
+    /// [`HnswIndex::build_with_threads`]／[`HnswIndex::build_parallel`]
+    /// （Issue #406）の構築ワーカーが panic した、またはノード単位ロック
+    /// （`parallel_build::BuildGraph::links`）・エントリポイントロック
+    /// （`parallel_build::BuildGraph::entry`）が poison した。全ハンドルを
+    /// join したうえで fail-closed に拒否し、部分的に結線された索引を
+    /// `Ok` で返さない（モジュール冒頭「失敗契約」参照）。
+    WorkerPanicked,
 }
 
 impl fmt::Display for HnswError {
@@ -228,6 +247,12 @@ impl fmt::Display for HnswError {
                 "hnsw search query dim mismatch: expected={expected} found={found}"
             ),
             HnswError::NonFiniteQuery => write!(f, "hnsw search query contains non-finite value"),
+            HnswError::WorkerPanicked => {
+                write!(
+                    f,
+                    "hnsw parallel build worker panicked or a lock was poisoned"
+                )
+            }
         }
     }
 }
@@ -480,37 +505,8 @@ impl HnswIndex {
         vectors: &[f32],
         seed: u64,
     ) -> Result<Self, HnswError> {
-        params.validate()?;
-
-        if dim == 0 {
-            return Err(HnswError::DimMismatch {
-                dim,
-                len: vectors.len(),
-            });
-        }
         let dim_usize = dim as usize;
-        if !vectors.len().is_multiple_of(dim_usize) {
-            return Err(HnswError::DimMismatch {
-                dim,
-                len: vectors.len(),
-            });
-        }
-        let n = vectors.len() / dim_usize;
-        if n > MAX_HNSW_NODES {
-            return Err(HnswError::TooManyNodes { nodes: n });
-        }
-        // ノード id を u32 で表現できることを構築前に確定させる（MAX_HNSW_NODES は
-        // u32::MAX よりずっと小さいため通常は失敗しないが、上限定数の将来変更に
-        // 備えて明示的に検証する。coding-rust.md: `checked_*`／`try_into` の使用）。
-        if u32::try_from(n).is_err() {
-            return Err(HnswError::CapacityOverflow);
-        }
-
-        for (node_idx, chunk) in vectors.chunks_exact(dim_usize).enumerate() {
-            if chunk.iter().any(|v| !v.is_finite()) {
-                return Err(HnswError::NonFiniteVector { node: node_idx });
-            }
-        }
+        let n = validate_build_input(&params, dim, vectors)?;
 
         // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
         // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
@@ -544,6 +540,92 @@ impl HnswIndex {
         index.repair_reachability(dim_usize, vectors)?;
 
         Ok(index)
+    }
+
+    /// [`build`](Self::build) と同じグラフを、要素単位ロック（ノードごとの
+    /// `RwLock`）とエントリポイント更新のみの排他で並列構築する（Issue #406・
+    /// 親 #402。pgvector `hnswbuild.c` のロック粒度設計・qdrant の逐次
+    /// プレフィックス方式を参考にした。手法名のみ参照でコード転記はしない）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の場合は
+    /// [`build`](Self::build) と完全に同一のグラフを返す（内部実装は
+    /// `parallel_build::build_parallel_graph` に委譲せず [`build`](Self::build)
+    /// をそのまま呼ぶ）。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`]
+    /// の場合、先頭 [`SEQUENTIAL_PREFIX_NODES`] 件は逐次挿入し、残りを
+    /// `AtomicUsize` によるワークスティール方式で並列挿入する——挿入順が
+    /// 非決定的になるため、構築されるグラフの**形状**は同一 `seed` でも
+    /// run-to-run で変わり得る（レベル割当は並列フェーズ開始前に `seed` から
+    /// 逐次確定するため不変。[`HnswIndex::search`] の決定性契約「同一索引・
+    /// 同一クエリで再現」自体は不変。詳細は `docs/design/hnsw-parallel-build.md`
+    /// 参照）。
+    ///
+    /// # エラー
+    ///
+    /// `threads == 0` または `threads > `[`MAX_BUILD_THREADS`] は
+    /// [`HnswError::InvalidParams`]。構築ワーカーの panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]（fail-closed。部分的に結線された索引を
+    /// `Ok` で返さない）。
+    pub fn build_with_threads(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<Self, HnswError> {
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build(params, dim, vectors, seed);
+        }
+        parallel_build::build_parallel_graph(params, dim, vectors, seed, threads, n)
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
+    /// [`crate::parallel_search::ParallelSearchProvider`] と同じ決定方法
+    /// （`thread_count_for` による行数依存の並列度算出・プロセス全体の
+    /// `WorkerBudgetGuard` による同時実行間の調停）で自動的に決める（Issue
+    /// #406 要件 5。#407／#408 の既定結線先はこちら）。決定された並列度が
+    /// 1 以下、またはグローバル予算を確保できなかった場合は
+    /// [`build`](Self::build)（逐次・完全決定的）へ縮退する（`ParallelSearchProvider`
+    /// と同じ「並列度を落とすだけで失敗させない」縮退規則）。
+    ///
+    /// `thread_count_for` は検索側の `MIN_ROWS_PER_THREAD`（1,024）を
+    /// 1 スレッドあたりの担当行数の下限として使う（`available_parallelism`
+    /// と `row_count / MIN_ROWS_PER_THREAD` の小さい方）ため、実質的な並列化
+    /// 閾値は `MIN_ROWS_PER_THREAD * 2`（2,048。`available_parallelism >= 2`
+    /// の環境で `desired >= 2` になる最小の `n`）であり、本メソッドが別途
+    /// 課す [`SEQUENTIAL_PREFIX_NODES`]（256）より大きい。したがって
+    /// `n` が 257..2047 の範囲では [`build_with_threads`](Self::
+    /// build_with_threads) に明示的なスレッド数を渡せば並列化されるが、
+    /// 本メソッドは検索側の閾値をそのまま流用する設計判断により逐次へ
+    /// 縮退する（構築 1 ノードあたりのコストは検索 1 クエリの `dot` 計算
+    /// より大幅に重いため、この閾値が構築にとって保守的すぎる可能性は
+    /// 残るが、#407／#408 が実運用で結線する際に単一の決定方法を共有する
+    /// 利点を優先した。見直しが必要になれば構築専用の閾値を別途持たせる）。
+    pub fn build_parallel(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+    ) -> Result<Self, HnswError> {
+        let n = validate_build_input(&params, dim, vectors)?;
+        let desired = crate::parallel_search::thread_count_for(n).min(MAX_BUILD_THREADS);
+        if desired <= 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            return Self::build(params, dim, vectors, seed);
+        }
+        let guard = crate::parallel_search::WorkerBudgetGuard::acquire(desired);
+        let granted = guard.granted();
+        if granted <= 1 {
+            drop(guard);
+            return Self::build(params, dim, vectors, seed);
+        }
+        let result = Self::build_with_threads(params, dim, vectors, seed, granted);
+        drop(guard);
+        result
     }
 
     /// 全ノード挿入後の決定的な後始末パス。`insert_node`／`shrink_links` の
@@ -983,55 +1065,10 @@ impl HnswIndex {
         dim: usize,
         vectors: &[f32],
     ) -> Result<Vec<u32>, HnswError> {
-        const KEEP_PRUNED_CONNECTIONS: bool = true;
-
-        // 候補は search_layer が既にスコア降順で返すため、優先度付きキューへ
-        // 詰め直す代わりにそのまま消費できるが、Algorithm 4 の記法に合わせて
-        // 「未処理候補」を降順に保った Vec として扱う。
-        let working: Vec<ScoredNode> = candidates.to_vec();
-
-        let mut selected: Vec<ScoredNode> = Vec::new();
-        let mut discarded: Vec<ScoredNode> = Vec::new();
-
-        for cand in working {
-            if selected.len() >= m {
-                break;
-            }
-            let cand_vec = node_vector(vectors, dim, cand.node)?;
-            // 「候補が既選択集合のどの要素よりも近い場合のみ採用する」枝刈り規則
-            // （Algorithm 4）。dot は大きいほど近いため `>` が「より近い」の向き。
-            let mut keep = true;
-            for &sel in &selected {
-                let sel_vec = node_vector(vectors, dim, sel.node)?;
-                let d_to_selected = dot(cand_vec, sel_vec);
-                if !d_to_selected.is_finite() {
-                    return Err(HnswError::NonFiniteScore { node: cand.node });
-                }
-                if d_to_selected > cand.score {
-                    keep = false;
-                    break;
-                }
-            }
-            if keep {
-                selected.push(cand);
-            } else {
-                discarded.push(cand);
-            }
-        }
-
-        if KEEP_PRUNED_CONNECTIONS {
-            let mut i = 0;
-            while selected.len() < m {
-                let Some(extra) = discarded.get(i) else {
-                    break;
-                };
-                selected.push(*extra);
-                i += 1;
-            }
-        }
-
-        selected.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
-        Ok(selected.into_iter().map(|s| s.node).collect())
+        // 本体は `self` を一切参照しない純粋関数（`select_neighbors_heuristic_free`）
+        // へ切り出し済み。並列構築（`parallel_build`。Issue #406）の
+        // `BuildGraph` からも同じ実装を共有する。
+        select_neighbors_heuristic_free(candidates, m, dim, vectors)
     }
 
     /// `from -> to` への単方向リンクを層 `level` へ追加する（重複・自己ループは
@@ -1084,59 +1121,23 @@ impl HnswIndex {
         protect: u32,
     ) -> Result<(), HnswError> {
         let limit = max_degree_for(&self.params, level);
-        let current_len = self
-            .nodes
-            .get(node as usize)
-            .and_then(|n| n.links.get(level))
-            .map(|l| l.len())
-            .unwrap_or(0);
-        if current_len <= limit {
-            return Ok(());
-        }
-
-        let node_vec = node_vector(vectors, dim, node)?;
-        let neighbor_ids: Vec<u32> = self
+        let current_links: Vec<u32> = self
             .nodes
             .get(node as usize)
             .and_then(|n| n.links.get(level))
             .cloned()
             .unwrap_or_default();
-
-        let mut scored: Vec<ScoredNode> = Vec::with_capacity(neighbor_ids.len());
-        for id in neighbor_ids {
-            let v = node_vector(vectors, dim, id)?;
-            let d = dot(node_vec, v);
-            if !d.is_finite() {
-                return Err(HnswError::NonFiniteScore { node: id });
-            }
-            scored.push(ScoredNode { node: id, score: d });
-        }
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
-
-        let mut shrunk = self.select_neighbors_heuristic(&scored, limit, dim, vectors)?;
-        // `node == protect`（自己ループ）は `connect` が張らないため起こらないが、
-        // 呼び出し契約が壊れても panic せず何もしない防御的分岐にしておく。
-        // `protect` は直前に `connect(node, protect, level)` で張られたばかりの
-        // 隣接であり、上の `scored` 構築元 `neighbor_ids` に必ず含まれる。
-        if node != protect && !shrunk.contains(&protect) {
-            if shrunk.len() >= limit {
-                // `limit >= 2`（`HnswParams::validate` の `m >= 2` から層 0 も
-                // 層 1 以上も導出される）なので `pop` は必ず要素を持つ。
-                shrunk.pop();
-            }
-            shrunk.push(protect);
-            // 差し替え後も次数上限超過検出時と同じ「スコア降順・同点は id 昇順」
-            // の順序（モジュール冒頭の順序規約）を保つ。`scored` は既に同じ規約で
-            // ソート済みなので、その並び順を基準にフィルタし直すだけでよい。
-            shrunk = scored
-                .iter()
-                .filter(|s| shrunk.contains(&s.node))
-                .map(|s| s.node)
-                .collect();
-        }
-        if let Some(n) = self.nodes.get_mut(node as usize) {
-            if let Some(links) = n.links.get_mut(level) {
-                *links = shrunk;
+        // 縮退の計算本体（読み取り→再選択）は `compute_shrink` という純粋関数に
+        // 切り出し済み。並列構築（`parallel_build`。Issue #406）は書き込みロック
+        // 1 回の中で「現在のリンクを読む→`compute_shrink`→書き戻す」を原子的に
+        // 行うことで同じ計算を共有する（`docs/design/hnsw-parallel-build.md`
+        // 参照）。逐次経路（本メソッド）はロック不要のため読み→計算→書き込みを
+        // そのまま `self.nodes` への 2 回のアクセスとして行う。
+        if let Some(shrunk) = compute_shrink(&current_links, node, dim, vectors, limit, protect)? {
+            if let Some(n) = self.nodes.get_mut(node as usize) {
+                if let Some(links) = n.links.get_mut(level) {
+                    *links = shrunk;
+                }
             }
         }
         Ok(())
@@ -1154,12 +1155,8 @@ impl HnswIndex {
         dim: usize,
         vectors: &[f32],
     ) -> Result<f32, HnswError> {
-        let v = node_vector(vectors, dim, node)?;
-        let d = dot(v, query);
-        if !d.is_finite() {
-            return Err(HnswError::NonFiniteScore { node });
-        }
-        Ok(d)
+        // 並列構築（`parallel_build`）と共有する純粋関数へ委譲する。
+        score_of(vectors, dim, node, query)
     }
 
     /// 構築済みパラメータを返す。
@@ -1328,6 +1325,216 @@ fn node_vector(vectors: &[f32], dim: usize, node: u32) -> Result<&[f32], HnswErr
         .ok_or(HnswError::CapacityOverflow)?;
     let end = start.checked_add(dim).ok_or(HnswError::CapacityOverflow)?;
     vectors.get(start..end).ok_or(HnswError::CapacityOverflow)
+}
+
+/// `build`（`HnswParams::validate` → 次元整合 → ノード数上限 → 非有限値の
+/// 検証順序。モジュール `build` ドキュメンテーションコメント参照）と
+/// `build_with_threads`／`build_parallel`（Issue #406）が共有する入力検証。
+/// 検証済みノード数 `n` を返す。
+fn validate_build_input(
+    params: &HnswParams,
+    dim: u32,
+    vectors: &[f32],
+) -> Result<usize, HnswError> {
+    params.validate()?;
+
+    if dim == 0 {
+        return Err(HnswError::DimMismatch {
+            dim,
+            len: vectors.len(),
+        });
+    }
+    let dim_usize = dim as usize;
+    if !vectors.len().is_multiple_of(dim_usize) {
+        return Err(HnswError::DimMismatch {
+            dim,
+            len: vectors.len(),
+        });
+    }
+    let n = vectors.len() / dim_usize;
+    if n > MAX_HNSW_NODES {
+        return Err(HnswError::TooManyNodes { nodes: n });
+    }
+    // ノード id を u32 で表現できることを構築前に確定させる（MAX_HNSW_NODES は
+    // u32::MAX よりずっと小さいため通常は失敗しないが、上限定数の将来変更に
+    // 備えて明示的に検証する。coding-rust.md: `checked_*`／`try_into` の使用）。
+    if u32::try_from(n).is_err() {
+        return Err(HnswError::CapacityOverflow);
+    }
+
+    for (node_idx, chunk) in vectors.chunks_exact(dim_usize).enumerate() {
+        if chunk.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::NonFiniteVector { node: node_idx });
+        }
+    }
+
+    Ok(n)
+}
+
+/// `dot(node, query)`。[`HnswIndex::score`] と並列構築（`parallel_build`。
+/// Issue #406）の `BuildGraph` の双方から共有される純粋関数（`self` を
+/// 参照しないため元々自然にジェネリック化できた）。境界検証は
+/// [`node_vector`] が担う。結果が非有限なら `NonFiniteScore` として拒否する
+/// （モジュール冒頭「順序規約」節参照）。
+fn score_of(vectors: &[f32], dim: usize, node: u32, query: &[f32]) -> Result<f32, HnswError> {
+    let v = node_vector(vectors, dim, node)?;
+    let d = dot(v, query);
+    if !d.is_finite() {
+        return Err(HnswError::NonFiniteScore { node });
+    }
+    Ok(d)
+}
+
+/// 近傍選択ヒューリスティック（Algorithm 4）の本体。[`HnswIndex::
+/// select_neighbors_heuristic`] と並列構築の `BuildGraph` の双方から共有される
+/// 純粋関数。既定は `extend_candidates=false`・`keep_pruned_connections=true`
+/// （余った枠を枝刈り済み候補で埋め、次数を確保する）。この既定の採用理由は
+/// `docs/design/hnsw-graph-construction.md` に記録する。
+fn select_neighbors_heuristic_free(
+    candidates: &[ScoredNode],
+    m: usize,
+    dim: usize,
+    vectors: &[f32],
+) -> Result<Vec<u32>, HnswError> {
+    const KEEP_PRUNED_CONNECTIONS: bool = true;
+
+    // 候補は search_layer が既にスコア降順で返すため、優先度付きキューへ
+    // 詰め直す代わりにそのまま消費できるが、Algorithm 4 の記法に合わせて
+    // 「未処理候補」を降順に保った Vec として扱う。
+    let working: Vec<ScoredNode> = candidates.to_vec();
+
+    let mut selected: Vec<ScoredNode> = Vec::new();
+    let mut discarded: Vec<ScoredNode> = Vec::new();
+
+    for cand in working {
+        if selected.len() >= m {
+            break;
+        }
+        let cand_vec = node_vector(vectors, dim, cand.node)?;
+        // 「候補が既選択集合のどの要素よりも近い場合のみ採用する」枝刈り規則
+        // （Algorithm 4）。dot は大きいほど近いため `>` が「より近い」の向き。
+        let mut keep = true;
+        for &sel in &selected {
+            let sel_vec = node_vector(vectors, dim, sel.node)?;
+            let d_to_selected = dot(cand_vec, sel_vec);
+            if !d_to_selected.is_finite() {
+                return Err(HnswError::NonFiniteScore { node: cand.node });
+            }
+            if d_to_selected > cand.score {
+                keep = false;
+                break;
+            }
+        }
+        if keep {
+            selected.push(cand);
+        } else {
+            discarded.push(cand);
+        }
+    }
+
+    if KEEP_PRUNED_CONNECTIONS {
+        let mut i = 0;
+        while selected.len() < m {
+            let Some(extra) = discarded.get(i) else {
+                break;
+            };
+            selected.push(*extra);
+            i += 1;
+        }
+    }
+
+    selected.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+    Ok(selected.into_iter().map(|s| s.node).collect())
+}
+
+/// [`HnswIndex::shrink_links`] と並列構築の `BuildGraph::shrink_links` の
+/// 双方から共有される、縮退の計算のみを行う純粋関数（読み書き分離）。
+/// `current_links` の要素数が `limit` 以下かつ `protect` を含む（または
+/// `node == protect`）なら `Ok(None)`（変更不要）。それ以外は
+/// `Ok(Some(new_links))` を返す。`protect` を強制的に残す契約・順序規約は
+/// [`HnswIndex::shrink_links`] のドキュメンテーションコメント参照。
+/// 呼び出し元（逐次経路は `&mut self.nodes` への 2 回のアクセス、並列
+/// 経路は 1 回の書き込みロック内）が書き戻しを担う。
+///
+/// PR #431 codex-review（Cursor Bugbot）Medium 指摘の修正: 並列構築
+/// （`BuildGraph::shrink_links`）では `connect(node, protect, level)` と
+/// この関数を呼ぶ `shrink_links(node, level, protect)` が別々のロック
+/// 獲得（[`BuildGraph::connect`]・[`BuildGraph::shrink_links`]）であるため、
+/// その間に別ワーカーが同じ `node` へ異なる `protect` で `shrink_links` を
+/// 実行し、こちらの `protect` を `current_links` から先に落とすレースが
+/// 起こり得る。旧実装は「`protect` は `current_links`（延いては `scored`）
+/// に必ず含まれる」という、逐次構築（`HnswIndex::insert_node`。同一スレッド
+/// 内で `connect` 直後に `shrink_links` が走り割り込みが無い）でのみ成立する
+/// 前提に依存しており、`protect` を明示的に `push` した直後に
+/// `scored`（`current_links` 由来。`protect` を含まない場合がある）で
+/// 再フィルタしてしまい `push` した `protect` を再び落としていた。
+/// 本実装は `protect` が `current_links` に無い場合も `node_vector`
+/// から直接そのスコアを算出し、`protect` を含む完全なスコア表
+/// （`all_scored`）で再フィルタすることで、`protect` が最終的な
+/// 結果集合（`limit` 件以内）に必ず残ることを保証する。
+fn compute_shrink(
+    current_links: &[u32],
+    node: u32,
+    dim: usize,
+    vectors: &[f32],
+    limit: usize,
+    protect: u32,
+) -> Result<Option<Vec<u32>>, HnswError> {
+    let protect_present = node == protect || current_links.contains(&protect);
+    if current_links.len() <= limit && protect_present {
+        return Ok(None);
+    }
+
+    let node_vec = node_vector(vectors, dim, node)?;
+    let mut scored: Vec<ScoredNode> = Vec::with_capacity(current_links.len());
+    for &id in current_links {
+        let v = node_vector(vectors, dim, id)?;
+        let d = dot(node_vec, v);
+        if !d.is_finite() {
+            return Err(HnswError::NonFiniteScore { node: id });
+        }
+        scored.push(ScoredNode { node: id, score: d });
+    }
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+
+    let mut shrunk = select_neighbors_heuristic_free(&scored, limit, dim, vectors)?;
+    // `node == protect`（自己ループ）は `connect` が張らないため起こらないが、
+    // 呼び出し契約が壊れても panic せず何もしない防御的分岐にしておく。
+    if node != protect && !shrunk.contains(&protect) {
+        if shrunk.len() >= limit {
+            // `select_neighbors_heuristic_free` は高々 `limit` 件しか返さない
+            // ため、この分岐に来る時点で `shrunk.len() == limit` であり、
+            // `limit >= 2`（`HnswParams::validate` の `m >= 2` から層 0 も
+            // 層 1 以上も導出される）なので `pop` は必ず要素を持つ。
+            shrunk.pop();
+        }
+        shrunk.push(protect);
+        // `protect` が `current_links`（延いては `scored`）に無い場合が
+        // あり得るため（上記ドキュメンテーションコメント参照）、`scored`
+        // をそのまま並び順の基準にはできない。`protect` 自身のスコアを
+        // 直接算出し、`scored` に無ければ補ったうえで、差し替え後も
+        // 「スコア降順・同点は id 昇順」の順序（モジュール冒頭の順序規約）
+        // を保つよう並び替える。
+        let mut all_scored = scored.clone();
+        if !all_scored.iter().any(|s| s.node == protect) {
+            let protect_vec = node_vector(vectors, dim, protect)?;
+            let protect_score = dot(node_vec, protect_vec);
+            if !protect_score.is_finite() {
+                return Err(HnswError::NonFiniteScore { node: protect });
+            }
+            all_scored.push(ScoredNode {
+                node: protect,
+                score: protect_score,
+            });
+        }
+        all_scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.node.cmp(&b.node)));
+        shrunk = all_scored
+            .iter()
+            .filter(|s| shrunk.contains(&s.node))
+            .map(|s| s.node)
+            .collect();
+    }
+    Ok(Some(shrunk))
 }
 
 #[cfg(test)]
@@ -1720,5 +1927,60 @@ mod tests {
             "search must be based solely on the build-time snapshot, unaffected by \
              the caller mutating or dropping its own copy of the vectors buffer"
         );
+    }
+
+    /// PR #431 codex-review（Cursor Bugbot）Medium 指摘の回帰: `protect` が
+    /// `current_links` に含まれない状態（並列構築で他ワーカーが先に
+    /// `protect` への逆方向リンクを縮退させてしまうレース。`compute_shrink`
+    /// のドキュメンテーションコメント参照）でも、`compute_shrink` の結果
+    /// 集合には必ず `protect` が含まれ、かつ `limit` 件を超えないことを
+    /// 固定する。
+    #[test]
+    fn compute_shrink_always_retains_protect_even_when_absent_from_current_links() {
+        let dim = 1usize;
+        // ノード 0（自分自身）とノード 1..=5 の 1 次元ベクトルを用意する。
+        // `protect`（ノード 6）は `current_links` に含めない
+        // （＝並列構築下で既に他ワーカーに縮退されてしまった状況を模す）。
+        let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let current_links: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let limit = 3usize;
+        let protect = 6u32;
+
+        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
+            .expect("finite 1-d vectors must not overflow")
+            .expect("current_links.len() > limit must trigger a shrink");
+
+        assert!(
+            shrunk.contains(&protect),
+            "protect must survive the shrink even when absent from current_links, got {shrunk:?}"
+        );
+        assert!(
+            shrunk.len() <= limit,
+            "shrink result must not exceed the degree limit, got {shrunk:?}"
+        );
+    }
+
+    /// 上記の派生ケース: `current_links.len() <= limit` でも `protect` が
+    /// 欠けていれば `Ok(None)`（変更不要）を返してはならない——`None` は
+    /// 呼び出し元に「既存のリンクのままでよい」と伝えるため、`protect` が
+    /// 欠けたまま何も書き戻されないと `protect` は永久に失われる。
+    #[test]
+    fn compute_shrink_adds_protect_when_missing_even_under_the_degree_limit() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 6.0];
+        let current_links: Vec<u32> = vec![1, 2];
+        let limit = 3usize;
+        let protect = 3u32;
+
+        let shrunk = compute_shrink(&current_links, 0, dim, &vectors, limit, protect)
+            .expect("finite 1-d vectors must not overflow")
+            .expect("protect missing from current_links must not short-circuit to Ok(None)");
+
+        assert!(
+            shrunk.contains(&protect),
+            "protect must be added even when current_links is already within the degree limit, \
+             got {shrunk:?}"
+        );
+        assert!(shrunk.len() <= limit, "got {shrunk:?}");
     }
 }

@@ -366,6 +366,18 @@ else
 endif
 
 # --------------------------------------------------
+# HNSW 構築の並列化（Issue #406・親 #402。crates/engine/benches/hnsw_parallel_build_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hnsw-parallel-build
+bench-hnsw-parallel-build: ## Issue #406（HNSW 構築の並列化の受け入れ条件 (b): 100k 点で構築時間がスレッド数に応じて短縮することの実測記録）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_PARALLEL_ROWS／BENCH_HNSW_PARALLEL_THREADS で規模・スレッド数ラダーを上書き可）
+ifdef HAS_CARGO
+	cargo bench --bench hnsw_parallel_build_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-parallel-build をスキップ"
+endif
+
+# --------------------------------------------------
 # HNSW 探索（ef ビーム探索・top-k）の brute-force 対照 Recall 受け入れ条件（TASK-132・Issue #405。crates/engine/tests/hnsw_search.rs）
 # --------------------------------------------------
 
