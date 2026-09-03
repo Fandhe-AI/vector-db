@@ -661,7 +661,7 @@ fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
             assert_eq!(
                 row.id % 2,
                 1,
-                "row {} does not satisfy tag='x' (1-indexed even rows are tag='x')",
+                "row {} does not satisfy tag='x' (1-indexed odd rows are tag='x')",
                 row.id
             );
         }
