@@ -1072,6 +1072,24 @@ pub struct EngineCore {
     /// 診断用のアクセサ（[`Self::search_engine_kind`]）で、#411 の `EXPLAIN` 露出が
     /// 参照する契約点。
     search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
+    /// `search_engine_kind == Some(SearchEngineKind::Hnsw(..))` の場合にのみ構築する
+    /// HNSW 索引のテーブル世代整合キャッシュ（Issue #408・親 #402・前提 #404〜#407）。
+    /// [`Self::execute_validated_in_session`] の `Statement::Select` アームがこれを
+    /// 経由して `Ranking::Distance`（フィルタなし）クエリの DISTANCE 段を索引探索へ
+    /// 載せ替える。`SearchEngineKind::Hnsw` 以外（既定エンジン・`with_provider` 等）
+    /// では `None` のまま（常に従来どおり全件 brute-force。詳細は
+    /// `sql::hnsw_cache::HnswIndexCache` のドキュメント参照）。
+    hnsw_state: Option<HnswEngineState>,
+}
+/// [`EngineCore::hnsw_state`] が保持する状態束（Issue #408）。`provider` は
+/// [`crate::hnsw::provider::HnswSearchProvider`]（`Copy`）のコピーであり、
+/// `sql::hnsw_cache::search_or_fallback` が `effective_ef`／構築パラメータへ
+/// アクセスするために使う（`self.provider`〔`Box<dyn SearchProvider>`〕とは別に
+/// 具体型のコピーを保持する。`Box<dyn SearchProvider>` からは `HnswSearchProvider`
+/// 固有のメソッドへダウンキャストできないため）。
+struct HnswEngineState {
+    provider: crate::hnsw::provider::HnswSearchProvider,
+    cache: crate::sql::hnsw_cache::HnswIndexCache,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1214,6 +1232,18 @@ impl EngineCore {
         provider: Box<dyn SearchProvider>,
         search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
     ) -> Self {
+        // Issue #408: `SearchEngineKind::Hnsw` が明示指定された経路（`open_with_engine`・
+        // `from_storage_with_engine`）でのみキャッシュ状態を構築する。既定エンジン・
+        // `with_provider`／`from_storage`（`kind` 不明）は `None` のまま（従来どおり
+        // 全件 brute-force。`sql::exec::execute_statement_with_cache` は `hnsw_cache`
+        // が `None` の場合キャッシュへ一切触れない）。
+        let hnsw_state = match &search_engine_kind {
+            Some(crate::search_engine::SearchEngineKind::Hnsw(params)) => Some(HnswEngineState {
+                provider: crate::hnsw::provider::HnswSearchProvider::new(*params),
+                cache: crate::sql::hnsw_cache::HnswIndexCache::new(),
+            }),
+            _ => None,
+        };
         Self {
             storage,
             provider,
@@ -1229,6 +1259,7 @@ impl EngineCore {
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
             search_engine_kind,
+            hnsw_state,
         }
     }
 
@@ -1263,6 +1294,18 @@ impl EngineCore {
     /// （`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ方針）。
     pub fn sql_arena_cache_stats(&self) -> crate::sql::arena_cache::SqlArenaCacheStats {
         self.sql_arena_cache.stats()
+    }
+
+    /// `sql::hnsw_cache::HnswIndexCache` の現在の統計を返す（Issue #408。
+    /// テスト・運用観測用）。`search_engine_kind` が `SearchEngineKind::Hnsw` 以外
+    /// （`hnsw_state` が `None`）の場合は既定値（すべて 0）を返す。テナント ID・
+    /// 行 ID 等の機微情報は含まない。`VectorCore` trait には載せない固有メソッド
+    /// （`core_api.snapshot` の対象外。`sql_arena_cache_stats` と同じ方針）。
+    pub fn hnsw_index_cache_stats(&self) -> crate::sql::hnsw_cache::HnswIndexCacheStats {
+        self.hnsw_state
+            .as_ref()
+            .map(|s| s.cache.stats())
+            .unwrap_or_default()
     }
 
     /// `precision` モードの実行契約に使う [`crate::precision::PrecisionPolicy`] を
@@ -2211,6 +2254,17 @@ impl EngineCore {
                         storage: &self.storage,
                         cache: &self.sql_arena_cache,
                     }),
+                    // Issue #408: `SearchEngineKind::Hnsw` opt-in 構築時のみ
+                    // `Some`（`hnsw_state`）。フィルタなし `Ranking::Distance` の
+                    // DISTANCE 段を索引済みノード＋未索引分 brute-force の併用へ
+                    // 載せ替える（詳細は `sql::hnsw_cache` のドキュメント参照）。
+                    self.hnsw_state
+                        .as_ref()
+                        .map(|s| crate::sql::hnsw_cache::HnswCacheAccess {
+                            storage: &self.storage,
+                            cache: &s.cache,
+                            provider: s.provider,
+                        }),
                 )?;
                 Ok(crate::sql::SqlOutcome::Query(result))
             }
@@ -4426,6 +4480,7 @@ mod tests {
                 storage: &core.storage,
                 cache: &core.sql_arena_cache,
             }),
+            None,
         )
         .expect("execute_statement should succeed");
         let row = result

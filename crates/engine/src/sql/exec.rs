@@ -372,11 +372,19 @@ fn map_hybrid_error(e: HybridError) -> SqlSurfaceError {
 /// `core.rs::EngineCore::execute_validated_in_session` の `Statement::Select`
 /// アーム（`USING PLAN` 展開経由を含む）からの crate 内呼び出し専用とする。
 ///
-/// `sparse_cache`・`arena_cache` の 2 引数を追加した結果 `clippy::too_many_arguments`
-/// の閾値（7）を超える。両キャッシュアクセス束は意味の異なる独立したオプション
-/// パラメータであり、1 つの構造体へまとめると「呼ばれない方にも常に `None` を
-/// 明示する」契約が読み取りにくくなるため、`pub(crate)` 専用の内部関数としてここで
-/// 許容する（公開 API である [`execute_statement`] は従来どおり 6 引数のまま）。
+/// `hnsw_cache`（Issue #408・[`crate::sql::hnsw_cache::HnswIndexCache`]）は
+/// `Ranking::Distance` かつ `bound.metadata_filters`・`bound.expr_filters` がともに
+/// 空のクエリに限り経由する（詳細は `sql/hnsw_cache.rs` モジュールドキュメントの
+/// 「適用条件」参照）。それ以外のクエリ（hybrid・フィルタ付き DISTANCE）は本関数内で
+/// 一切参照しない。`None` を渡した場合はキャッシュを一切経由せず、常に全件
+/// brute-force で探索する（下記 [`execute_statement`] 参照）。
+///
+/// `sparse_cache`・`arena_cache`・`hnsw_cache` の 3 引数を追加した結果
+/// `clippy::too_many_arguments` の閾値（7）を超える。3 キャッシュアクセス束は意味の
+/// 異なる独立したオプションパラメータであり、1 つの構造体へまとめると「呼ばれない
+/// 方にも常に `None` を明示する」契約が読み取りにくくなるため、`pub(crate)` 専用の
+/// 内部関数としてここで許容する（公開 API である [`execute_statement`] は従来どおり
+/// 6 引数のまま）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_statement_with_cache(
     read_txn: &redb::ReadTransaction,
@@ -387,6 +395,7 @@ pub(crate) fn execute_statement_with_cache(
     precision_policy: &crate::precision::PrecisionPolicy,
     sparse_cache: Option<crate::sql::sparse_cache::SparseCacheAccess<'_>>,
     arena_cache: Option<crate::sql::arena_cache::ArenaCacheAccess<'_>>,
+    hnsw_cache: Option<crate::sql::hnsw_cache::HnswCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-162（対象ビヘイビア SEARCH-9）: `precision` の実行契約本体は
     // `crate::precision`（確信度判定・空集合 fail-closed 応答の純粋関数群）に
@@ -427,6 +436,11 @@ pub(crate) fn execute_statement_with_cache(
     // 冒頭ドキュメント参照）の場合はキャッシュを一切経由しない。
     let filters_empty = bound.metadata_filters.is_empty() && bound.expr_filters.is_empty();
     let sparse_cache_eligible = sparse_cache.is_some() && is_hybrid && filters_empty;
+    // Issue #408: `HnswIndexCache` の適用条件は `Ranking::Distance`（hybrid でない）
+    // かつフィルタなし。`sparse_cache_eligible` の hybrid 版と対称の条件（`sql/
+    // hnsw_cache.rs` モジュールドキュメント「適用条件」参照）。`hnsw_cache` が
+    // `None`（`execute_statement` 経由・フィルタ付き DISTANCE）の場合は経由しない。
+    let hnsw_cache_eligible = hnsw_cache.is_some() && !is_hybrid && filters_empty;
     // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
     // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
     // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール
@@ -894,14 +908,46 @@ pub(crate) fn execute_statement_with_cache(
     } else {
         match &bound.ranking {
             Ranking::Distance { query } => {
-                let input = SearchInput {
-                    ids: &slot_ids,
-                    vectors: arena.vectors(),
-                    dim: arena.dim(),
-                    query,
-                    k: k_eff,
+                // Issue #408: `hnsw_cache`（フィルタなし DISTANCE クエリに限る。
+                // 呼び出し元の適用条件は `hnsw_cache_eligible` 参照）が `Some` の
+                // 場合、索引済みノード＋未索引分 brute-force の併用経路を試みる。
+                // `None`（`execute_statement` 経由・フィルタ付きクエリ）の場合は
+                // 従来どおり全件 brute-force のみ。
+                let raw = if hnsw_cache_eligible {
+                    match hnsw_cache.as_ref() {
+                        Some(access) => crate::sql::hnsw_cache::search_or_fallback(
+                            access,
+                            read_txn,
+                            &bound.table,
+                            ctx,
+                            arena,
+                            &slot_ids,
+                            provider,
+                            query,
+                            k_eff,
+                        )
+                        .map_err(map_kernel_error)?,
+                        None => {
+                            let input = SearchInput {
+                                ids: &slot_ids,
+                                vectors: arena.vectors(),
+                                dim: arena.dim(),
+                                query,
+                                k: k_eff,
+                            };
+                            provider.search(input).map_err(map_kernel_error)?
+                        }
+                    }
+                } else {
+                    let input = SearchInput {
+                        ids: &slot_ids,
+                        vectors: arena.vectors(),
+                        dim: arena.dim(),
+                        query,
+                        k: k_eff,
+                    };
+                    provider.search(input).map_err(map_kernel_error)?
                 };
-                let raw = provider.search(input).map_err(map_kernel_error)?;
                 if !core::provider_result_is_valid(&raw, k_eff, &visible_id_counts) {
                     return Err(SqlSurfaceError::Internal {
                         detail: "search provider returned a result violating the top-k contract"
@@ -1236,6 +1282,7 @@ pub fn execute_statement(
         schema,
         bound,
         precision_policy,
+        None,
         None,
         None,
     )
