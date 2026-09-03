@@ -101,12 +101,30 @@ id 昇順」で事前ソート済みであることを検証し（`is_sorted_des
   同点グループ内の全メンバーへ同一の RRF 順位（＝同一の寄与）を割り当てた**後**の
   最終整列は、従来どおり融合スコア降順・同点 id 昇順の安定ソートで確定する。
 
+## 追記（Issue #393）: 疎（BM25）側の転置索引化に伴う不安定ソート API 導入
+
+`SparseIndex` の転置索引化（Issue #386 Phase 1）のうち、文書長クラス別テーブル参照 +
+2k バッファ選出（Issue #391）・再取得ループの再スコアリング回避（Issue #392）で、
+`sparse.rs::Candidate`（スコア `total_cmp` + `doc_id` 昇順の明示的タイブレークを持つ
+全順序型）に対する `select_nth_unstable_by`／`sort_unstable_by` を `// sort-determinism:
+allow` マーカー付きで導入した（上表「疎（BM25）Top-k」行の `sort_by` は当時の記述であり、
+現在は `TopKSelector::shrink_to_k_eff`・`SparseScored::top` がこの 2 API を使う）。
+`Candidate::Ord` が同点の相対順序も含めて一意に定まる全順序であるため、不安定な選出・
+整列でも最終的な id 順は変わらず、本 ADR の同点タイブレーク契約（安定ソート＋id 昇順）は
+弱まらない。この判断の固定テストは `crates/engine/tests/sparse_determinism.rs`
+（Issue #393。`search_within`/`score_within().top(k)` のビット一致・同点グループの
+前方一致契約・投入順非依存・`hybrid_search` の疎側境界同点グループ決定性を検証）を
+参照。
+
 ## 例外として許容する箇所
 
 - `storage.rs` の整数 id 列に対する `sort_unstable`（比較関数を渡さない版）。id は
   全順序を持ち、同一 id の重複が意味を持つペイロードでもないため、不安定ソートでも
   結果の並びは一意に定まる。`scripts/check_sort_determinism.sh` はこのケースを検知
   対象パターン（比較関数を伴う `_by`/`_by_key` 系のみ）から除外している。
+- `sparse.rs::TopKSelector::shrink_to_k_eff`・`SparseScored::top` の
+  `select_nth_unstable_by`／`sort_unstable_by`（`// sort-determinism: allow` マーカー
+  付き。Issue #391・#392）。上記「追記（Issue #393）」節参照。
 
 ## スコープ外・申し送り
 

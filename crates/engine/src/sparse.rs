@@ -36,13 +36,17 @@
 //! `["caf", "s"]`）。この分割により生じた偽トークンは `term_freq`・`doc_freq`・
 //! `doc_len` の統計を汚染しうる。
 //!
-//! [`SparseIndex::search`] は文書集合への線形走査で実装するが、クエリ語の辞書
-//! （[`TermId`]）lookup は走査に入る前に一度だけ `O(Q)` で済ませ（Issue #388・term
-//! インターニング）、走査中は各文書について `TermId` へ写像済みのクエリ語集合
-//! （最大 `Q` 語）を各文書の `term_freq`（`TermId` 昇順ソート済み）へ二分探索する
-//! ため、時間計算量は文書数のみに比例するのではなく `O(Q + N * Q * log T_d + M log k)`
-//! （`N`: コーパス文書数、`Q`: クエリの一意語数、`T_d`: 各文書の一意語数、`M`: スコア
-//! `> 0` の一致文書数）である。長いクエリは `N * Q` の積として CPU コストを増幅するため、一意語数の上限を
+//! [`SparseIndex::search`]／[`SparseIndex::search_within`] はいずれも文書集合を
+//! 線形走査しない（Issue #390。可視ビットマップ＋posting 走査 1 パス化）。クエリ語の
+//! 辞書（[`TermId`]）lookup を走査に入る前に一度だけ `O(Q)` で済ませ（Issue #388・
+//! term インターニング）、共通コア（`score_by_postings`）がクエリ語ごとに転置索引
+//! （`postings[t]`。Issue #389）だけを辿ってスコアを積むため、時間計算量は
+//! `O(Q + Σ_{t∈Q} |postings(t)| + M log k)`（`Q`: クエリの一意語数、
+//! `Σ|postings(t)|`: クエリ語の出現延べ件数、`M`: スコア `> 0` の一致文書数）で
+//! あり、コーパス文書数 `N` そのものには比例しない（ただしスコアアキュムレータの
+//! 確保・ゼロ初期化自体は呼び出しごとに `O(N)`。[`SparseIndex::score_by_postings`]
+//! のドキュメンテーションコメント参照。Issue #390 レビュー指摘）。長いクエリは
+//! 走査対象の posting list 数を増幅するため、一意語数の上限を
 //! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。ただし
 //! `tokenize()` 自体はクエリのバイト長に比例したコストを持つため、一意語数の少ない
 //! 繰り返し入力（同じ語や区切り文字の反復）はこの検証だけでは防げない。そのため
@@ -76,10 +80,8 @@
 //! オーバーフローを未定義動作にしない。`tokenize()` 内の添字アクセスは事前の
 //! ループ境界チェックにより範囲内が証明可能（panic しない）。
 
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
@@ -320,6 +322,17 @@ pub enum SparseError {
     /// それまでのトークン数の累計を `saturating_add` で求めて判定し、超過した時点で
     /// fail-closed に拒否する。
     TooManyTokens { total: usize, max: usize },
+    /// 文書長クラス表（Issue #391・[`SparseIndex::len_classes`]／`doc_len_class`）の
+    /// 構築時に不変条件が満たされなかった。`len_classes` は `doc_len_by_idx` の値
+    /// 集合そのものから作るため理論上到達不能だが、`unwrap`/`expect` で処理せず
+    /// fail-closed に構築を拒否する（`.claude/rules/coding-rust.md`）。
+    ///
+    /// `SparseError` は `#[non_exhaustive]` を持たない既公開 enum であり
+    /// （`docs/design/error-enum-non-exhaustive-policy.md`）、本 variant の追加は
+    /// 同 ADR の方針（既公開エラー enum への `#[non_exhaustive]` 後付け不採用）
+    /// どおりソース非互換な破壊的変更として扱う（コミットの `BREAKING CHANGE:`
+    /// フッタで明示する）。
+    LenClassBuildFailed,
 }
 
 impl std::fmt::Display for SparseError {
@@ -353,6 +366,12 @@ impl std::fmt::Display for SparseError {
             SparseError::TooManyTokens { total, max } => {
                 write!(f, "too many tokens in corpus: {total} (max {max})")
             }
+            SparseError::LenClassBuildFailed => {
+                write!(
+                    f,
+                    "internal invariant violated: doc length class table build failed"
+                )
+            }
         }
     }
 }
@@ -371,12 +390,10 @@ pub struct ScoredDoc {
 /// [`SparseIndex::search`] が Top-k 選出中に走査する 1 件の候補。
 ///
 /// `Ord` は最終的な検索結果の順序契約（スコア降順、同点は `doc_id` 昇順）で
-/// 「大きい方が良い」を表すよう実装する。`BinaryHeap<Reverse<Candidate>>` に載せることで
-/// 現在の k 件中「最も悪い」候補を `O(log k)` で特定・入れ替えでき、スコア計算済みの
-/// 候補（`M` 件、`M` はスコア `> 0` の一致文書数）から Top-k を選ぶ部分を
-/// `O(M log k)` 時間・`O(k)` 追加メモリで完結させる（全一致候補を `Vec` に蓄積してから
-/// 全体ソートする場合の `O(M log M)` 時間・`O(M)` 追加メモリより小さい。BM25 スコア
-/// 計算自体の計算量は [`SparseIndex::search`] のドキュメントを参照）。
+/// 「大きい方が良い」を表すよう実装する。[`TopKSelector`]（Issue #391）が
+/// この全順序だけを根拠に Top-k 集合を確定するため、選出アルゴリズムを
+/// 差し替えても出力される集合・順序は変わらない（BM25 スコア計算自体の
+/// 計算量は [`SparseIndex::search`] のドキュメントを参照）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Candidate {
     score: f64,
@@ -399,6 +416,183 @@ impl Ord for Candidate {
         self.score
             .total_cmp(&other.score)
             .then_with(|| other.doc_id.cmp(&self.doc_id))
+    }
+}
+
+/// [`SparseIndex::score_by_postings`] が posting 走査で見つかった候補
+/// （スコア `> 0` の一致文書、`touched`）から Top-k を選び出すセレクタ
+/// （Issue #391。tantivy の `TopNComputer` を参考にした「2k 件バッファ＋
+/// `select_nth_unstable_by`」方式）。`BinaryHeap<Reverse<Candidate>>` への
+/// 逐次 `O(log k)` 挿入の代わりに、バッファが `2 * k_eff` 件に達するたびに
+/// [`slice::select_nth_unstable_by`] で上位 `k_eff` 件へ切り詰め、`threshold`
+/// （切り詰め後の最下位候補）以下の以降の候補を `O(1)` で棄却する。出力する
+/// Top-k 集合・順序は [`Candidate`] の全順序で一意に決まるため、選出方式の
+/// 違いは結果に影響しない（旧 `BinaryHeap` 実装とビット一致・集合一致。
+/// `crates/engine/tests/hybrid_profile_accept.rs::
+/// profile_sparse_index_replica_matches_real_search_within` で検証）。
+struct TopKSelector {
+    /// `k.min(M)`（`M` はスコア `> 0` の一致文書数）。呼び出し元が事前に
+    /// 有界化した値を渡す契約とし、本セレクタ自身は `k`／`M` を知らない。
+    k_eff: usize,
+    /// 保持中の候補（未整列）。容量は `2 * k_eff` で有界
+    /// （untrusted な `k`／`M` からの無制限確保を避ける。
+    /// `.claude/rules/coding-rust.md`）。
+    buffer: Vec<Candidate>,
+    /// 直近の切り詰め後、保持中で最も「悪い」候補（`k_eff` 番目に良い候補）。
+    /// これ以下の候補は Top-k に入り得ないため `push` で即座に棄却する。
+    threshold: Option<Candidate>,
+}
+
+impl TopKSelector {
+    fn new(k_eff: usize) -> Self {
+        Self {
+            k_eff,
+            // `2 * k_eff` は `k_eff <= touched.len()`（呼び出し元契約）かつ
+            // `touched.len() <= self.doc_ids.len() <= MAX_CORPUS_DOCS` で有界。
+            buffer: Vec::with_capacity(k_eff.saturating_mul(2)),
+            threshold: None,
+        }
+    }
+
+    /// 候補を 1 件追加する。`k_eff == 0` なら常に無視する。既に確定した
+    /// `threshold` 以下（同点で `doc_id` が同等以上に悪い場合を含む）の候補は
+    /// Top-k に入り得ないため `O(1)` で棄却する。
+    fn push(&mut self, candidate: Candidate) {
+        if self.k_eff == 0 {
+            return;
+        }
+        if let Some(threshold) = self.threshold {
+            if candidate <= threshold {
+                return;
+            }
+        }
+        self.buffer.push(candidate);
+        if self.buffer.len() >= self.k_eff.saturating_mul(2) {
+            self.shrink_to_k_eff();
+        }
+    }
+
+    /// バッファを上位 `k_eff` 件へ切り詰め、`threshold` を更新する。
+    /// `select_nth_unstable_by` は `k_eff >= 1` かつ `k_eff - 1` がバッファの
+    /// 範囲内の場合のみ呼ぶ（範囲外呼び出しは panic するため、事前条件を
+    /// 満たさない場合は無音で何もしない。呼び出し元は条件を満たす場合のみ
+    /// 呼ぶため到達しないが、fail-closed のため防御する）。
+    fn shrink_to_k_eff(&mut self) {
+        if self.k_eff == 0 || self.k_eff > self.buffer.len() {
+            return;
+        }
+        // `Candidate::Ord` の「大きい方が良い」を降順に並べる比較器（`b.cmp(a)`）。
+        // 添字 `k_eff - 1` の要素はちょうど「上位 `k_eff` 件中で最も悪い候補」に
+        // なり、それより前は同等以上に良い・後は同等以下に悪いという整列条件を
+        // `select_nth_unstable_by` が保証する。
+        // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的タイブレークを含む
+        // 全順序（同点の doc_id が同一になることはない）ため、不安定な select_nth でも
+        // 相対順序の非決定性は生じない。
+        self.buffer
+            .select_nth_unstable_by(self.k_eff - 1, |a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+        self.buffer.truncate(self.k_eff);
+        self.threshold = self.buffer.get(self.k_eff - 1).copied();
+    }
+
+    /// 最終的な Top-k をスコア降順（同点は `doc_id` 昇順）で確定する。
+    fn into_sorted(mut self) -> Vec<Candidate> {
+        if self.buffer.len() > self.k_eff {
+            self.shrink_to_k_eff();
+        }
+        // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的タイブレークを含む
+        // 全順序のため、不安定ソートでも出力順序は決定的。
+        self.buffer.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+        self.buffer
+    }
+}
+
+/// [`SparseIndex::score_within`] が返す、1 クエリ分のスコア済み候補集合
+/// （Issue #392）。`hybrid.rs::sparse_refetch_loop`（疎側再取得ループ）は
+/// `fetch_k` を倍増させながら同じクエリを何度も評価するが、疎側（BM25）は
+/// 1 回の posting 走査でスコア `> 0` の全候補が確定するため、ラウンドごとに
+/// 必要なのは「同じスコア集合からより深い Top-k を切り出す」ことだけである。
+/// 本型はスコア計算そのもの（[`SparseIndex::score_pass`]）を 1 回だけ行い、
+/// [`Self::top`] の複数回呼び出しで前方一致な Top-k 拡張を提供することで、
+/// ラウンドごとの `acc: Vec<f64>` の `O(N)` 再確保・posting 再走査・Top-k
+/// 再選出を避ける。
+///
+/// `candidates` は [`Candidate`] の全順序（スコア降順・同点は `doc_id` 昇順）
+/// に従う Top-k 契約を構造的に保証する材料（スコア `> 0` の可視ヒット全件）で
+/// あり、[`Self::top`] は `candidates` の先頭 `sorted_len` 件がこの順序で
+/// 確定済みであるという不変条件を保ちながら未整列の尾部だけを段階的に
+/// 整列する。
+#[derive(Debug)]
+pub struct SparseScored {
+    candidates: Vec<Candidate>,
+    /// `candidates[..sorted_len]` は既にスコア降順（同点 `doc_id` 昇順）に
+    /// 確定済み。`sorted_len <= candidates.len()`（不変条件）。
+    sorted_len: usize,
+}
+
+impl SparseScored {
+    /// スコア `> 0` の可視ヒット総数（`M`）。
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// [`Self::len`] が `0` かどうか。
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+
+    /// スコア降順（同点は `doc_id` 昇順）で先頭 `k.min(self.len())` 件を返す
+    /// （[`SparseIndex::search_within`] と同一の順序契約）。
+    ///
+    /// 前方一致契約: `k1 <= k2` なら `top(k1)` は `top(k2)` の前方一致な
+    /// 部分列になる（[`Candidate`] の全順序に基づき同一の候補配列から切り出す
+    /// ため構造的に保証される）。冪等（同じ `k` を複数回呼んでも同じ列を返す）。
+    ///
+    /// `&mut self` である理由: 呼び出しごとに `candidates[sorted_len..]` を
+    /// 段階的に整列して `sorted_len` を前進させる in-place 分割方式のため
+    /// （`hybrid.rs::sparse_refetch_loop` は同一の `SparseScored` を再取得
+    /// ラウンドごとに `top` で呼び直す）。
+    ///
+    /// 確保量: 新規確保は行わず、返す `Vec<ScoredDoc>` の長さも `min(k,
+    /// self.len())` で有界（untrusted な `k` によって `M` を超えて増幅
+    /// しない。`.claude/rules/coding-rust.md`）。
+    pub fn top(&mut self, k: usize) -> Vec<ScoredDoc> {
+        let want = k.min(self.candidates.len());
+        if want == 0 {
+            return Vec::new();
+        }
+        if want > self.sorted_len {
+            let tail_start = self.sorted_len;
+            // `need` は尾部のうち今回新たに確定させたい件数（>= 1。
+            // `want > self.sorted_len` の分岐内のため常に正）。
+            let need = want - tail_start;
+            if let Some(tail) = self.candidates.get_mut(tail_start..) {
+                // `select_nth_unstable_by` は事前条件（添字 < スライス長）を
+                // 満たす場合のみ呼ぶ（`TopKSelector::shrink_to_k_eff` と同じ
+                // fail-closed な防御。範囲外なら何もしない＝下の `sort_unstable_by`
+                // だけで全尾部を整列することになり安全側に倒れる）。
+                if need >= 1 && need <= tail.len() {
+                    // Candidate::Ord はスコア total_cmp に doc_id 昇順の明示的
+                    // タイブレークを含む全順序（同点の doc_id が同一になることは
+                    // ない）ため、不安定な select_nth でも相対順序の非決定性は
+                    // 生じない（`TopKSelector::shrink_to_k_eff` と同じ根拠）。
+                    tail.select_nth_unstable_by(need - 1, |a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+                }
+            }
+            if let Some(newly_sorted) = self.candidates.get_mut(tail_start..want) {
+                // 同上の全順序により不安定ソートでも出力順序は決定的
+                // （`TopKSelector::into_sorted` と同じ根拠）。
+                newly_sorted.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+            }
+            self.sorted_len = want;
+        }
+        self.candidates
+            .get(..want)
+            .map(|s| {
+                s.iter()
+                    .map(|&Candidate { score, doc_id }| ScoredDoc { doc_id, score })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -519,34 +713,6 @@ pub fn tokenize_with_options(text: &str, remove_stopwords: bool) -> Vec<String> 
     tokens
 }
 
-/// 1 文書分の統計（トークン頻度・文書長）。
-#[derive(Debug)]
-struct DocEntry {
-    /// この統計が属する文書の ID（呼び出し側が割り当てた ID をそのまま保持する）。
-    doc_id: DocId,
-    /// [`TermId`] → 出現回数（Issue #388・term インターニング）。`TermId` 昇順に
-    /// ソート済み・重複なし（[`SparseIndex::with_params`] が構築時に保証する不変条件）。
-    /// この順序により [`Self::freq`] は `binary_search_by_key` で `O(log T_d)`
-    /// （`T_d`: この文書の一意語数）に検索できる。
-    term_freq: Vec<(TermId, u32)>,
-    /// この文書の総トークン数（`term_freq` の値の合計）。
-    doc_len: u32,
-}
-
-impl DocEntry {
-    /// この文書における `term_id` の出現回数（未出現なら `None`）。`term_freq` が
-    /// `TermId` 昇順ソート済みという不変条件（構築時に保証）に依存する二分探索。
-    fn freq(&self, term_id: TermId) -> Option<u32> {
-        // `binary_search_by_key` が `Ok(i)` を返す時点で `i` は必ず `term_freq` の
-        // 範囲内であることが保証されるため、`.get(i)` による再取得は不要（添字で
-        // 直接取り出す）。
-        self.term_freq
-            .binary_search_by_key(&term_id, |&(t, _)| t)
-            .ok()
-            .map(|i| self.term_freq[i].1)
-    }
-}
-
 /// BM25 Okapi による疎検索インデックス。
 ///
 /// `build`/`with_params` で構築後は不変（再構築のみで更新する）。storage/catalog との
@@ -561,8 +727,6 @@ pub struct SparseIndex {
     doc_count: u32,
     /// 平均文書長（`avgdl`）。
     avg_doc_len: f64,
-    /// 文書ごとの統計（構築時の入力順を保持。`search()` はこの順に線形走査する）。
-    docs: Vec<DocEntry>,
     /// build 時に確定した語彙の term 辞書（Issue #388・term インターニング）。
     /// `search`／`search_within` はクエリ語をこの辞書で [`TermId`] へ写像し、
     /// 未知語（辞書に存在しない語）は候補から除外する（旧実装で全文書 miss して
@@ -583,22 +747,116 @@ pub struct SparseIndex {
     /// `postings[t]` は `TermId(t)` が出現する文書の `(doc_idx, tf)` の並びであり、
     /// `doc_idx` 昇順・重複なしを構築時（[`SparseIndex::with_params`]）に保証する
     /// （ソートは行わず、文書を `doc_idx` 昇順に処理する構築順序自体がこの不変条件を
-    /// 満たす）。`doc_idx` は `docs`/`doc_len`/`doc_ids` の添字と対応する。
-    /// `search`/`search_within` は本 Issue では未参照（残置。#390 でクエリ語の
-    /// posting だけを辿る 1 パス方式へ切り替える際の下準備。可視集合への縮約は
-    /// #390 側で可視ビットマップにより維持する契約とする。SEARCH-1, SEARCH-3）。
+    /// 満たす）。`doc_idx` は `doc_len`/`doc_ids` の添字と対応する。
+    /// [`Self::score_by_postings`]（`search`/`search_within` が共有する 1 パス
+    /// 走査コア。Issue #390）がクエリ語ごとにこの posting list だけを辿って
+    /// スコアを積む主経路であり、全文書を線形走査する経路はもう存在しない。
     /// 不変条件は `postings.len() == doc_freq.len() == terms.ids.len()`・
     /// 各 `t` について `postings[t].len() == doc_freq[t] as usize`。
     postings: Vec<Vec<(u32, u32)>>,
-    /// `doc_idx` 添字の文書長配列（`docs[i].doc_len` の写し。Issue #389）。
-    /// `postings` 走査時に `docs[doc_idx]` へのランダムアクセス・二分探索を経ずに
-    /// 文書長正規化項（BM25 の `|d| / avgdl`）を得られるようにするための下準備で、
-    /// 本 Issue では未参照（#390 で使用）。
+    /// `doc_idx` 添字の文書長配列（Issue #389）。`postings` 走査時に文書長正規化項
+    /// （BM25 の `|d| / avgdl`）を `O(1)` で得るために [`Self::score_by_postings`]
+    /// が参照する（Issue #390）。
     doc_len: Vec<u32>,
-    /// `doc_idx` 添字の `DocId` 配列（`docs[i].doc_id` の写し。Issue #389）。
-    /// `postings` 走査結果（`doc_idx`）からスコア出力の `DocId` へ戻すための下準備で、
-    /// 本 Issue では未参照（#390 で使用）。
+    /// `doc_idx` 添字の `DocId` 配列（Issue #389）。`postings` 走査結果
+    /// （`doc_idx`）からスコア出力の `DocId` へ戻すために [`Self::score_by_postings`]
+    /// が参照する（Issue #390）。
     doc_ids: Vec<DocId>,
+    /// コーパス中に現れる文書長の相異なる値を昇順・重複なしで並べたクラス表
+    /// （Issue #391）。tantivy 型の fieldnorm 量子化に相当するが、段数を
+    /// 「相異なる文書長の個数」まで上げた厳密版であり、ロッシー量子化はしない
+    /// （production はビット一致契約を維持する。256 段ロッシー量子化の実験は
+    /// test-only。詳細は [`Self::score_by_postings`] のドキュメンテーション
+    /// コメントを参照）。不変条件: 昇順・重複なし。
+    len_classes: Vec<u32>,
+    /// `doc_idx` 添字で、その文書長が [`Self::len_classes`] の何番目かを指す
+    /// クラス添字配列（Issue #391）。不変条件:
+    /// `len_classes[doc_len_class[i]] == doc_len[i]`（`i` は `doc_idx`）。
+    doc_len_class: Vec<u32>,
+}
+
+/// [`SparseIndex::search_within`] が可視集合（`visible_ids`）を `doc_idx` 空間の
+/// ビットマップへ変換したもの（Issue #390）。RLS 相当のテナント境界縮約契約
+/// （[`SparseIndex::search_within`] のドキュメント参照）を保つため、統計の母数
+/// （`n`・文書長合計）もこのビットマップ構築と同じ 1 回の走査で確定させ、
+/// インデックス全体の `doc_count`/`avg_doc_len`/`doc_freq` を一切参照しない。
+///
+/// 確保量（`words` の長さ）はインデックス側の文書数（[`MAX_CORPUS_DOCS`] 以下で
+/// 有界）でのみ決まり、untrusted な `visible_ids` の大きさで増幅しない
+/// （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の増幅防止）。
+struct VisibleBitmap {
+    /// `doc_idx / 64` を添字とするビット集合。ビット `doc_idx % 64` が立っている
+    /// 文書が可視。
+    words: Vec<u64>,
+    /// 可視文書数（`words` の立っているビット数）。
+    n: usize,
+    /// 可視文書の文書長合計（`avg_doc_len = total_len / n` の分子）。
+    total_len: u64,
+}
+
+impl VisibleBitmap {
+    /// `visible_ids` に含まれ、かつ `index` の構築時コーパスに実在する文書だけを
+    /// ビットマップへ立てる。`id_index` に無い id（構築時のコーパス外）は
+    /// `search_within` の既存契約どおり無音で無視する。
+    fn build(index: &SparseIndex, visible_ids: &BTreeSet<DocId>) -> Self {
+        let word_count = index.doc_ids.len().div_ceil(64);
+        let mut words = vec![0u64; word_count];
+        let mut n = 0usize;
+        let mut total_len: u64 = 0;
+        for id in visible_ids {
+            // `id_index` は構築時に自分自身が割り当てた `doc_idx` のみを保持する
+            // 不変条件があるため理論上 `words` の範囲内に収まるが、fail-closed の
+            // ため `.get_mut()` で明示的に防御し、範囲外なら当該 id を無視する。
+            let Some(&idx) = index.id_index.get(id) else {
+                continue;
+            };
+            let Some(word) = words.get_mut(idx / 64) else {
+                continue;
+            };
+            *word |= 1u64 << (idx % 64);
+            n = n.saturating_add(1);
+            let doc_len = index.doc_len.get(idx).copied().unwrap_or(0);
+            total_len = total_len.saturating_add(u64::from(doc_len));
+        }
+        Self {
+            words,
+            n,
+            total_len,
+        }
+    }
+
+    /// `doc_idx` が可視ビットマップに含まれるか（範囲外は `false`。fail-closed）。
+    fn contains(&self, doc_idx: u32) -> bool {
+        let idx = doc_idx as usize;
+        match self.words.get(idx / 64) {
+            Some(word) => word & (1u64 << (idx % 64)) != 0,
+            None => false,
+        }
+    }
+}
+
+/// [`SparseIndex::score_by_postings`] が母数（N・avgdl・df の算出方法）をどこから
+/// 得るかを切り替えるための内部区分（Issue #390）。`search`（[`Self::All`]）は
+/// インデックス全体を、`search_within`（[`Self::Visible`]）は可視ビットマップに
+/// 縮約した部分集合を、それぞれ母数とする。
+enum ScoreScope<'a> {
+    /// インデックス全体（`self.doc_count`/`self.avg_doc_len`/`self.doc_freq`）を
+    /// 母数とする（[`SparseIndex::search`]）。
+    All,
+    /// 可視ビットマップに縮約した部分集合を母数とする
+    /// （[`SparseIndex::search_within`]。RLS 相当のテナント境界縮約契約）。
+    Visible(&'a VisibleBitmap),
+}
+
+/// [`SparseIndex::score_pass`] の出力（Issue #392）。`acc` はコーパス全体の
+/// `doc_idx` を添字とするスコアアキュムレータ（`> 0.0` の要素がヒット）、
+/// `touched` はヒットした `doc_idx` を初回加算順（決定的）に記録した列。
+/// この 2 つだけでスコア `> 0` の全候補を復元できるため、[`SparseIndex::
+/// score_by_postings`]・[`SparseIndex::score_within`] の両方がこの中間表現を
+/// 共有する。
+struct ScorePass {
+    acc: Vec<f64>,
+    touched: Vec<u32>,
 }
 
 // `doc_idx`（`docs`/`doc_len`/`doc_ids`/`postings` 内側要素の添字）を `u32` で
@@ -649,11 +907,10 @@ impl SparseIndex {
             });
         }
 
-        let mut entries: Vec<DocEntry> = Vec::with_capacity(docs.len());
-        // `DocId` → `entries` インデックスの逆引き（Issue #389: `HashMap` 化）。
-        // 従来の重複検査専用 `seen_ids: BTreeMap<DocId, ()>` を統合し、重複判定と
-        // 逆引き構築を 1 マップで兼ねる（`O(1)` 化・マップ 1 本削減）。挿入時に
-        // 既存キーがあれば重複 `DocId` として拒否する（判定順序は従来どおり最優先）。
+        // `DocId` → `doc_idx` の逆引き（Issue #389: `HashMap` 化）。従来の重複検査
+        // 専用 `seen_ids: BTreeMap<DocId, ()>` を統合し、重複判定と逆引き構築を
+        // 1 マップで兼ねる（`O(1)` 化・マップ 1 本削減）。挿入時に既存キーがあれば
+        // 重複 `DocId` として拒否する（判定順序は従来どおり最優先）。
         let mut id_index: HashMap<DocId, usize> = HashMap::with_capacity(docs.len());
         let mut terms = TermDictionary::default();
         // [`TermId`] を添字とする df。`terms.intern()` が新語を採番するたびに `push(0)`
@@ -662,8 +919,9 @@ impl SparseIndex {
         // [`TermId`] を添字とする posting list（Issue #389）。`doc_freq` と同じ
         // タイミング（新語 intern 時）で `push(Vec::new())` し長さを同期させる。
         let mut postings: Vec<Vec<(u32, u32)>> = Vec::new();
-        // `doc_idx` 添字の文書長・`DocId` 配列（Issue #389）。`entries` と同時に push
-        // するため長さは常に `entries.len()` と一致する。
+        // `doc_idx` 添字の文書長・`DocId` 配列（Issue #389）。`id_index` と同時に
+        // push するため長さは常に `doc_len_by_idx.len()` と一致する（Issue #390で
+        // `DocEntry`/`entries` を撤去し、この 2 配列が文書ごとの一次情報になった）。
         let mut doc_len_by_idx: Vec<u32> = Vec::with_capacity(docs.len());
         let mut doc_ids_by_idx: Vec<DocId> = Vec::with_capacity(docs.len());
         let mut total_len: u64 = 0;
@@ -678,10 +936,10 @@ impl SparseIndex {
         let mut corpus_tokens_seen: usize = 0;
 
         for &(doc_id, text) in docs {
-            // `entries.len()` は現在の文書に割り当てる `doc_idx`。挿入前に確定させる
-            // ことで、これから push する `entries`/`doc_len_by_idx`/`doc_ids_by_idx`
+            // `doc_len_by_idx.len()` は現在の文書に割り当てる `doc_idx`。挿入前に
+            // 確定させることで、これから push する `doc_len_by_idx`/`doc_ids_by_idx`
             // すべてに対応する添字を一貫して使える（Issue #389）。
-            let doc_idx = entries.len();
+            let doc_idx = doc_len_by_idx.len();
             if id_index.insert(doc_id, doc_idx).is_some() {
                 return Err(SparseError::DuplicateDocId(doc_id));
             }
@@ -733,7 +991,7 @@ impl SparseIndex {
             }
 
             // `TermId` 昇順にソートしランレングス圧縮して `(TermId, count)` へ畳み込む
-            // （`DocEntry::term_freq` の不変条件: ソート済み・重複なし）。同時に
+            // （`term_freq` は各語 1 エントリへ圧縮済み・`TermId` 昇順）。同時に
             // `doc_freq`（この文書に出現した語のみ 1 件ずつ加算）を更新する。
             ids.sort_unstable();
             let mut term_freq: Vec<(TermId, u32)> = Vec::with_capacity(ids.len());
@@ -776,11 +1034,6 @@ impl SparseIndex {
 
             doc_len_by_idx.push(doc_len);
             doc_ids_by_idx.push(doc_id);
-            entries.push(DocEntry {
-                doc_id,
-                term_freq,
-                doc_len,
-            });
         }
 
         // 語彙数分の `postings[t]` は `term_freq` と同じ理由（コメント参照）で成長
@@ -790,23 +1043,51 @@ impl SparseIndex {
             list.shrink_to_fit();
         }
 
-        // `entries.len() == docs.len()` であり、`docs.is_empty()` は関数冒頭で拒否済みの
-        // ため、ここでの `doc_count` は必ず 1 以上（0 除算にはならない）。
-        let doc_count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        // `doc_len_by_idx.len() == docs.len()` であり、`docs.is_empty()` は関数冒頭で
+        // 拒否済みのため、ここでの `doc_count` は必ず 1 以上（0 除算にはならない）。
+        let doc_count = u32::try_from(doc_len_by_idx.len()).unwrap_or(u32::MAX);
         let avg_doc_len = total_len as f64 / f64::from(doc_count);
+
+        // 文書長クラス表の構築（Issue #391）。`doc_len_by_idx` の相異なる値を
+        // 昇順・重複なしに並べたものが `len_classes`。各文書の `doc_len_class` は
+        // その値が `len_classes` の何番目にあるかを二分探索で求める。`doc_len_by_idx`
+        // の各値は必ず `len_classes` 内に存在する（`len_classes` はその値集合から
+        // 直接作っているため）ので `binary_search` は理論上常に `Ok` を返すが、
+        // untrusted 入力由来の値を `unwrap`/`expect` で扱わない方針
+        // （`.claude/rules/coding-rust.md`）に従い、`Err` 側も添字 0 へ落とさず
+        // 構築失敗として拒否する（fail-closed）。
+        let mut len_classes: Vec<u32> = doc_len_by_idx.clone();
+        len_classes.sort_unstable();
+        len_classes.dedup();
+        len_classes.shrink_to_fit();
+        let mut doc_len_class: Vec<u32> = Vec::with_capacity(doc_len_by_idx.len());
+        for &len in &doc_len_by_idx {
+            let Ok(class_idx) = len_classes.binary_search(&len) else {
+                // 構築ロジック上到達不能（`len_classes` は `doc_len_by_idx` の値集合
+                // そのものから作られる）。到達した場合は不変条件が壊れている証拠
+                // であり、無音の既定値へ倒さず明示的に拒否する。
+                return Err(SparseError::LenClassBuildFailed);
+            };
+            let Ok(class_idx_u32) = u32::try_from(class_idx) else {
+                return Err(SparseError::LenClassBuildFailed);
+            };
+            doc_len_class.push(class_idx_u32);
+        }
+        doc_len_class.shrink_to_fit();
 
         Ok(SparseIndex {
             k1,
             b,
             doc_count,
             avg_doc_len,
-            docs: entries,
             terms,
             doc_freq,
             id_index,
             postings,
             doc_len: doc_len_by_idx,
             doc_ids: doc_ids_by_idx,
+            len_classes,
+            doc_len_class,
         })
     }
 
@@ -824,20 +1105,24 @@ impl SparseIndex {
     /// 実装上もバイト長検証 → `tokenize()` → 一意語数検証の全経路を終えてから
     /// `k == 0` を判定する順序を維持する。
     ///
-    /// 計算量: クエリ語の辞書 lookup（[`TermId`] への写像）を走査に入る前に一度だけ
-    /// `O(Q)` で行い（Issue #388・term インターニング）、コーパスの全文書（`N` 件）
-    /// について `TermId` へ写像済みのクエリ語集合（`Q` 語）を各文書の `term_freq`
-    /// （`TermId` 昇順ソート済み・一意語数 `T_d`）へ二分探索するため `O(N * Q * log T_d)`、
-    /// その上でスコア `> 0` の一致文書（`M` 件）から Top-k をヒープ選出するため
-    /// `O(M log k)` を要する（合計 `O(Q + N * Q * log T_d + M log k)`）。クエリの一意語数
-    /// `Q` が大きいほどコーパス全体との積で処理コストが増幅するため、`Q` が
-    /// [`MAX_QUERY_TERMS`] を超える場合は走査に入る前に
-    /// [`SparseError::TooManyQueryTerms`] で拒否する。また `tokenize()` はクエリ全体を
-    /// 走査してアロケーションを行うため、一意語数の少ない繰り返し入力（同じ語や区切り
-    /// 文字の反復）でもバイト長に比例したコストがかかる。そのためクエリのバイト長が
-    /// [`MAX_QUERY_BYTES`] を超える場合は、`tokenize()` を呼ぶ前に
-    /// [`SparseError::QueryTooLong`] で拒否する（両者とも fail-closed。
+    /// 計算量（Issue #390。可視ビットマップ＋posting 走査 1 パス化）: クエリ語の辞書
+    /// lookup（[`TermId`] への写像）を走査に入る前に一度だけ `O(Q)` で行い
+    /// （Issue #388・term インターニング）、その後は文書を線形走査せずクエリ語ごとに
+    /// [`Self::postings`] だけを辿る（[`Self::score_by_postings`]）ため
+    /// `O(Q + Σ_{t∈Q} |postings(t)| + M log k)`（`Σ|postings(t)|`: クエリ語の出現
+    /// 延べ件数、`M`: スコア `> 0` の一致文書数）。クエリの一意語数 `Q` が大きいほど
+    /// 走査対象の posting list 数が増えるため、`Q` が [`MAX_QUERY_TERMS`] を超える
+    /// 場合は走査に入る前に [`SparseError::TooManyQueryTerms`] で拒否する。また
+    /// `tokenize()` はクエリ全体を走査してアロケーションを行うため、一意語数の少ない
+    /// 繰り返し入力（同じ語や区切り文字の反復）でもバイト長に比例したコストがかかる。
+    /// そのためクエリのバイト長が [`MAX_QUERY_BYTES`] を超える場合は、`tokenize()` を
+    /// 呼ぶ前に [`SparseError::QueryTooLong`] で拒否する（両者とも fail-closed。
     /// `.claude/rules/coding-rust.md`: untrusted 入力の長さは上限検証してから処理する）。
+    /// 上記はスコア計算対象の走査量に関する計算量であり、[`Self::score_by_postings`]
+    /// が呼び出しごとに確保するスコアアキュムレータそのものは `O(N)`（コーパス文書数）
+    /// で確保・ゼロ初期化される。詳細・N 非依存化していない理由は
+    /// [`Self::score_by_postings`] のドキュメンテーションコメントを参照
+    /// （Issue #390 レビュー指摘）。
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredDoc>, SparseError> {
         // アロケーションを伴う `tokenize()` を呼ぶ前に、バイト長（`str::len()`。文字列を
         // 走査しない `O(1)` 操作）で untrusted なクエリを検証する。一意語数の検証
@@ -892,74 +1177,15 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
 
-        // 現在の Top-k 候補を保持する固定サイズ（最大 k 件）のヒープ。`Reverse` により
-        // `Candidate` の自然順序（大きい方が良い）に対する min-heap として働くため、
-        // `heap.peek()` は常に「保持中で最も悪い」候補を指す。悪い候補から順に入れ替える
-        // ことで、スコア計算済みの候補から Top-k を選ぶ部分を全件バッファリング＋全体
-        // ソートではなく `O(M log k)` に抑える（`M`: スコア `> 0` の一致文書数）。
-        let heap_capacity = k.min(self.docs.len());
-        let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
-        for doc in &self.docs {
-            let mut score = 0.0f64;
-            for &term in &query_ids {
-                let Some(f) = doc.freq(term) else {
-                    continue;
-                };
-                // `term` はこの `doc` の `term_freq` に存在する（`f` を得た時点の前提）ため、
-                // build() 側で同じ `term` が必ず `doc_freq` にも計上済みであり、`df >= 1` が
-                // 保証される。`unwrap_or(0)` は `doc_freq` の型契約を壊さないための防御的
-                // フォールバックであり、この呼び出し経路では実質到達しない。
-                let df = self.doc_freq.get(term.0 as usize).copied().unwrap_or(0);
-                let idf = self.idf(df);
-                let numerator = f64::from(f) * (self.k1 + 1.0);
-                let len_norm = 1.0 - self.b
-                    + self.b * (f64::from(doc.doc_len) / self.avg_doc_len.max(f64::MIN_POSITIVE));
-                let denominator = f64::from(f) + self.k1 * len_norm;
-                // `f >= 1`（`term_freq` にヒットした時点で出現回数は 1 以上）かつ `k1 >= 0`・
-                // `len_norm >= 0`（`b` は `[0.0, 1.0]` に検証済みのため）であり、
-                // `denominator = f + k1 * len_norm >= f >= 1.0` となる。よってこのガードは
-                // 実質到達しない（0 以下になる入力の組み合わせは構築時に拒否済み）。
-                if denominator > 0.0 {
-                    score += idf * (numerator / denominator);
-                }
-            }
-            if score > 0.0 {
-                let candidate = Candidate {
-                    score,
-                    doc_id: doc.doc_id,
-                };
-                if heap.len() < k {
-                    heap.push(Reverse(candidate));
-                } else if let Some(Reverse(worst)) = heap.peek() {
-                    if candidate > *worst {
-                        heap.pop();
-                        heap.push(Reverse(candidate));
-                    }
-                }
-            }
-        }
-
-        // ヒープの走査順は決定的な出力順を保証しないため、最終結果はスコア降順・
-        // 同点は doc_id 昇順で明示的にソートし直す（決定的タイブレーク。再現性確保）。
-        let mut scored: Vec<ScoredDoc> = heap
-            .into_iter()
-            .map(|Reverse(Candidate { score, doc_id })| ScoredDoc { doc_id, score })
-            .collect();
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
-        Ok(scored)
+        Ok(self.score_by_postings(&query_ids, ScoreScope::All, k))
     }
 
     /// `idf(t) = ln( (N - df + 0.5) / (df + 0.5) + 1 )`。`+ 1` により常に非負となるため、
-    /// 負の IDF に対する特別な補正処理は不要（モジュールコメントの式を参照）。
-    /// インデックス全体（`self.doc_count`）を母数とする。可視集合へ縮約した母数を使う
-    /// 場合は [`Self::idf_for`] を直接呼ぶ（[`Self::search_within`] 参照）。
-    fn idf(&self, df: u32) -> f64 {
-        Self::idf_for(f64::from(self.doc_count), df)
-    }
-
-    /// [`Self::idf`] の母数 `n`（文書数）を外部から指定できる版。`search()` は
-    /// インデックス全体の `self.doc_count` を、`search_within()` は可視集合に縮約した
-    /// 部分集合の文書数を、それぞれ `n` として渡すことで同一の IDF 計算式を共有する。
+    /// 負の IDF に対する特別な補正処理は不要（モジュールコメントの式を参照）。母数
+    /// `n`（文書数）を外部から指定できる版で、[`Self::score_by_postings`] が
+    /// [`ScoreScope::All`] ではインデックス全体の `self.doc_count` を、
+    /// [`ScoreScope::Visible`] では可視ビットマップに縮約した部分集合の文書数を、
+    /// それぞれ `n` として渡すことで同一の IDF 計算式を共有する（Issue #390）。
     fn idf_for(n: f64, df: u32) -> f64 {
         let df = f64::from(df);
         ((n - df + 0.5) / (df + 0.5) + 1.0).ln()
@@ -977,7 +1203,10 @@ impl SparseIndex {
     /// （統計計算・候補選出そのものを可視集合へ限定する必要がある）。
     ///
     /// 本メソッドは統計（文書数・平均文書長・df）と Top-k のヒープ選出の両方を
-    /// `visible_ids` に含まれる文書だけへ限定して計算し直す。`visible_ids` に
+    /// `visible_ids` に含まれる文書だけへ限定して計算し直す（Issue #390。可視
+    /// ビットマップ [`VisibleBitmap`] へ縮約したうえで [`Self::score_by_postings`]
+    /// を [`ScoreScope::Visible`] で呼び、`self.doc_count`/`self.avg_doc_len`/
+    /// `self.doc_freq`〔インデックス全体の統計〕を一切参照しない）。`visible_ids` に
     /// 含まれるがインデックス構築時のコーパスに存在しない id は無視する
     /// （該当文書が単に存在しないものとして扱うだけであり、可視性判定そのものを
     /// 緩めるものではない。可視性判定自体は `visible_ids` を渡す呼び出し元
@@ -985,6 +1214,21 @@ impl SparseIndex {
     ///
     /// クエリのバイト長・一意語数検証、`k == 0`・無トークンクエリでの空結果、
     /// 同点 `doc_id` 昇順のタイブレークといった契約は [`Self::search`] と同一。
+    ///
+    /// 計算量（Issue #390）: [`VisibleBitmap::build`] が可視集合を `doc_idx`
+    /// ビットマップへ変換する `O(|visible_ids|)` に加え、[`Self::score_by_postings`]
+    /// がクエリ語ごとに [`Self::postings`] を辿って可視ビットで絞り込むため
+    /// `O(|visible_ids| + Σ_{t∈Q} |postings(t)| + M log k)`（[`Self::search`] の
+    /// 計算量コメント参照）。可視集合の大きさに関わらずビットマップの確保量は
+    /// インデックス側の文書数（[`MAX_CORPUS_DOCS`] 以下）で有界。ただし
+    /// [`Self::score_by_postings`] のスコアアキュムレータ確保・ゼロ初期化自体は
+    /// `search()` と同じく呼び出しごとに `O(N)`（詳細は同メソッドのドキュメンテー
+    /// ションコメント参照）であり、`search_within` は hybrid の疎側再取得ループ
+    /// から 1 クエリあたり複数回呼ばれる（Issue #387）ため、大規模コーパスでは
+    /// この `O(N)` 確保が無視できないコストになり得る。真に N 非依存化する
+    /// フォローアップ（呼び出し間でのアキュムレータ再利用等）は #392 領域の
+    /// 課題として `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節へ
+    /// 申し送る（Issue #390 レビュー指摘）。
     pub fn search_within(
         &self,
         query: &str,
@@ -1029,85 +1273,311 @@ impl SparseIndex {
             return Ok(Vec::new());
         }
 
-        // 可視文書のみへ縮約した部分集合。`id_index` は構築時に自分自身の `docs`
-        // インデックスのみを記録しているため範囲外を指すことはないが、`.get()` で
-        // 明示的に防御し、万一の不整合時は当該文書を候補から除外する
-        // （fail-closed。範囲外アクセスで panic させない）。
-        let subset: Vec<&DocEntry> = visible_ids
-            .iter()
-            .filter_map(|id| self.id_index.get(id))
-            .filter_map(|&idx| self.docs.get(idx))
-            .collect();
-
-        if subset.is_empty() {
+        // 可視集合を `doc_idx` ビットマップへ変換すると同時に、統計の母数
+        // （N・文書長合計）も可視部分集合のみから確定させる（Issue #390。
+        // インデックス全体の `self.doc_count`/`self.avg_doc_len`/`self.doc_freq`
+        // は一切参照しない。本メソッド追加の動機（b）を断つ）。
+        let bitmap = VisibleBitmap::build(self, visible_ids);
+        if bitmap.n == 0 {
             return Ok(Vec::new());
         }
 
-        // 統計（N・avgdl・df）は縮約後の部分集合のみから計算する。インデックス全体の
-        // `self.doc_count`/`self.avg_doc_len`/`self.doc_freq`（可視集合外の文書を含む
-        // 統計）は一切参照しない。これにより不可視文書の内容・存在が可視文書の
-        // スコア・順位へ影響する経路（本メソッド追加の動機（b））を断つ。
-        let local_n = subset.len();
-        let local_total_len: u64 = subset.iter().map(|d| u64::from(d.doc_len)).sum();
-        let local_avg_doc_len = local_total_len as f64 / local_n as f64;
+        // 選出ロジック（ヒープ・タイブレーク）は `search()` と同一だが、母数を
+        // 可視ビットマップに限定することで、`visible_ids` 外の文書が Top-k の
+        // プールを占有できないようにする（本メソッド追加の動機（a））。
+        Ok(self.score_by_postings(&query_ids, ScoreScope::Visible(&bitmap), k))
+    }
 
-        // 可視部分集合内での df（クエリ語ごとに何件の可視文書が含むか）を数え直す
-        // （インデックス全体の `self.doc_freq` は使わない）。`query_ids` と同じ添字で
-        // 持つ（`zip` で対応付ける。Issue #388・term インターニング）。
-        let local_doc_freq: Vec<u32> = query_ids
-            .iter()
-            .map(|&term| {
-                let df = subset.iter().filter(|d| d.freq(term).is_some()).count();
-                // `df <= local_n <= self.docs.len() <= MAX_CORPUS_DOCS` であり `u32` へ
-                // 安全に収まるが、将来の変更に備え `try_from` 失敗時は飽和させる
-                // （coding-rust.md: 整数演算は checked/saturating を用いる）。
-                u32::try_from(df).unwrap_or(u32::MAX)
-            })
+    /// [`Self::search_within`] の「スコアリングと Top-k 選出を分離した」版
+    /// （Issue #392）。呼び出し元が渡す `k` に対して 1 回限りの Top-k を返す
+    /// `search_within` とは異なり、本メソッドは可視集合に縮約したスコア
+    /// `> 0` の全候補を 1 回のスコア計算（[`Self::score_pass`]）で確定させた
+    /// [`SparseScored`] を返し、呼び出し元は [`SparseScored::top`] を複数回
+    /// 呼んで `k` を伸ばしながら Top-k を切り出せる。
+    ///
+    /// `hybrid.rs::sparse_refetch_loop`（疎側再取得ループ。境界の同点グループ
+    /// 完全化のため `fetch_k` を倍増させながら同じクエリを再評価する）向けの
+    /// 最適化であり、`search_within` を単体で使う既存の呼び出し元
+    /// （`tests/hybrid.rs` の独立オラクル等）はそのまま `search_within` を
+    /// 使い続けられる（両者は別経路のまま残し、出力の一致は単体テストで
+    /// 固定する。両経路とも [`Self::score_pass`] を共有するため、ロジックの
+    /// 二重実装ではない）。
+    ///
+    /// 入力検証（クエリのバイト長・一意語数上限）・空結果ケース
+    /// （無トークンクエリ・空可視集合）・RLS 相当のテナント境界縮約契約
+    /// （統計母数・候補選出を `visible_ids` へ限定し、インデックス全体の
+    /// `self.doc_count`/`self.avg_doc_len`/`self.doc_freq` を参照しない）は
+    /// [`Self::search_within`] と同一（同メソッドのドキュメンテーション
+    /// コメント参照）。`k == 0` 判定は本メソッドには存在しない
+    /// （`k` を受け取らないため。[`SparseScored::top`] 側が `k == 0` を
+    /// 空 `Vec` として扱う）。
+    pub fn score_within(
+        &self,
+        query: &str,
+        visible_ids: &BTreeSet<DocId>,
+    ) -> Result<SparseScored, SparseError> {
+        if query.len() > MAX_QUERY_BYTES {
+            return Err(SparseError::QueryTooLong {
+                len: query.len(),
+                max: MAX_QUERY_BYTES,
+            });
+        }
+
+        let query_terms = tokenize(query);
+
+        let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
+        for t in &query_terms {
+            unique_terms.insert(t.clone(), ());
+        }
+
+        if unique_terms.len() > MAX_QUERY_TERMS {
+            return Err(SparseError::TooManyQueryTerms {
+                unique_terms: unique_terms.len(),
+                max: MAX_QUERY_TERMS,
+            });
+        }
+
+        let empty = || SparseScored {
+            candidates: Vec::new(),
+            sorted_len: 0,
+        };
+
+        if query_terms.is_empty() || visible_ids.is_empty() {
+            return Ok(empty());
+        }
+
+        let query_ids: Vec<TermId> = unique_terms
+            .keys()
+            .filter_map(|t| self.terms.lookup(t))
             .collect();
 
-        // 選出ロジック（ヒープ・タイブレーク）は `search()` と同一だが、母数を
-        // 可視部分集合（`local_n`・`local_avg_doc_len`・`local_doc_freq`）に限定する
-        // ことで、`visible_ids` 外の文書が Top-k のプールを占有できないようにする
-        // （本メソッド追加の動機（a））。
-        let heap_capacity = k.min(local_n);
-        let mut heap: BinaryHeap<Reverse<Candidate>> = BinaryHeap::with_capacity(heap_capacity);
-        for doc in &subset {
-            let mut score = 0.0f64;
-            for (&term, &df) in query_ids.iter().zip(local_doc_freq.iter()) {
-                let Some(f) = doc.freq(term) else {
+        if query_ids.is_empty() {
+            return Ok(empty());
+        }
+
+        let bitmap = VisibleBitmap::build(self, visible_ids);
+        if bitmap.n == 0 {
+            return Ok(empty());
+        }
+
+        let ScorePass { acc, touched } = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap));
+
+        // touched 順（決定的。posting 走査でヒットを初めて記録した順）のまま
+        // 候補列を材料化する。`SparseScored::top` はこの列を全順序
+        // （`Candidate::Ord`）に基づき整列するため、ここでの並び順自体は
+        // 最終的な出力順序に影響しない。
+        let mut candidates = Vec::with_capacity(touched.len());
+        for &doc_idx in &touched {
+            let idx = doc_idx as usize;
+            let Some(&score) = acc.get(idx) else {
+                continue;
+            };
+            if score > 0.0 {
+                let Some(&doc_id) = self.doc_ids.get(idx) else {
                     continue;
                 };
-                let idf = Self::idf_for(local_n as f64, df);
-                let numerator = f64::from(f) * (self.k1 + 1.0);
-                let len_norm = 1.0 - self.b
-                    + self.b * (f64::from(doc.doc_len) / local_avg_doc_len.max(f64::MIN_POSITIVE));
-                let denominator = f64::from(f) + self.k1 * len_norm;
-                if denominator > 0.0 {
-                    score += idf * (numerator / denominator);
-                }
+                candidates.push(Candidate { score, doc_id });
             }
+        }
+
+        Ok(SparseScored {
+            candidates,
+            sorted_len: 0,
+        })
+    }
+
+    /// `search`/`search_within` が共有する 1 パススコアリングコア（Issue #390。
+    /// 旧実装は可視部分集合へ縮約した文書配列を全件線形走査し、クエリ語ごとに
+    /// 各文書の `term_freq` を二分探索していたが、本関数はクエリ語ごとに
+    /// [`Self::postings`]（該当語が実際に出現する文書だけの一覧）だけを辿る。
+    ///
+    /// `scope` が [`ScoreScope::All`] なら `search()`（インデックス全体を母数）、
+    /// [`ScoreScope::Visible`] なら `search_within()`（可視ビットマップに縮約した
+    /// 部分集合を母数。RLS 相当のテナント境界縮約契約）として振る舞う。
+    ///
+    /// スコアのビット一致契約: 文書ごとの加算順は「クエリ語の辞書順・その文書に
+    /// 実際に出現した語のみ」であり、これは旧実装（文書を外側ループ・クエリ語を
+    /// 内側ループで辞書順走査）と同一の加算列になるため f64 の結果はビット一致
+    /// する（`query_ids` は呼び出し元で辞書順に構築済み。本関数はクエリ語を
+    /// 外側ループにするが、各文書のアキュムレータへは term 発生順に足し込むため、
+    /// 1 文書内で見た加算順序自体は変わらない）。
+    ///
+    /// 計算量の既知の限界（Issue #390 レビュー指摘）: 走査そのものは
+    /// `postings`/可視ビットマップだけを辿るため `search`/`search_within` の
+    /// ドキュメンテーションコメントが述べる `O(Q + Σ|postings(t)| + M log k)` に
+    /// 従うが、この計算量に届いていない箇所が 1 つある。`acc`（doc_idx を添字と
+    /// するスコアアキュムレータ）はコーパス全体の文書数 `N`（`self.doc_ids.len()`）
+    /// で毎回新規確保・ゼロ初期化しており、これは呼び出しごとに `O(N)` かかる。
+    /// 旧実装（可視部分集合を全件線形走査）からの退行ではなく改善だが、
+    /// 「N そのものには比例しない」という契約には届いていない。`search_within` は
+    /// hybrid の疎側再取得ループから 1 クエリあたり複数回呼ばれる（Issue #387）
+    /// ため、大規模コーパスでは無視できないコストになり得る。真に N 非依存化する
+    /// には呼び出し間で `acc` バッファを再利用し `touched` でタッチ済み要素のみ
+    /// リセットする方式等が考えられるが、`&self`（非 `&mut self`）シグネチャを
+    /// 維持したまま呼び出し間で状態を持ち越す設計変更を要するため、本 PR
+    /// （Issue #390。可視ビットマップ＋posting 走査 1 パス化）のスコープには含めず
+    /// フォローアップ課題として #392 領域・
+    /// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節へ申し送る。
+    ///
+    /// BM25 文書長正規化項のテーブル化・Top-k 選出方式（Issue #391。テーブル化を
+    /// 遅延キャッシュ方式へ改めた経緯は PR #426 の codex-review 指摘参照）:
+    /// ヒットごとの `len_norm`（`1-b+b*doc_len/avgdl` 由来の `k1 * len_norm`）は
+    /// クエリ内で `avgdl`（母数 `n`／`avg_doc_len`。[`ScoreScope`] により変わる）が
+    /// 確定した後は文書長のみに依存するため、文書長クラス（[`Self::len_classes`]）
+    /// ごとに実際にヒットループでタッチした時点で 1 回だけ計算し `HashMap` へ
+    /// キャッシュする（tantivy の fieldnorm 量子化に相当。ただし本実装はロッシー
+    /// 量子化をせず「相異なる文書長 = クラス」の厳密写像とする。式・演算順は旧来の
+    /// インライン計算と完全に同一であるため `denominator` は旧実装とビット一致
+    /// する）。`len_classes` 全体を走査前に事前構築する方式では実際にヒットする
+    /// クラス数（<= M）に関わらず `len_classes.len()`（最悪 `O(N)`）分の計算が
+    /// 毎クエリ発生し、選択性の高いクエリで本関数の計算量契約から外れるため、
+    /// 遅延計算へ変更した。Top-k 選出は [`TopKSelector`]（2k バッファ＋
+    /// `select_nth_unstable_by`）を使う。いずれも `Candidate` の全順序によって
+    /// 出力集合・順序が一意に決まるため、旧実装（インライン計算＋
+    /// `BinaryHeap<Reverse<Candidate>>`）とは出力がビット一致・集合一致する。
+    fn score_by_postings(
+        &self,
+        query_ids: &[TermId],
+        scope: ScoreScope<'_>,
+        k: usize,
+    ) -> Vec<ScoredDoc> {
+        let ScorePass { acc, touched } = self.score_pass(query_ids, scope);
+
+        // Top-k 選出（Issue #391・[`TopKSelector`]）。`k_eff` はコーパス側で
+        // 有界な `touched.len()` と untrusted な `k` の小さい方であり、
+        // `TopKSelector` の確保量（`O(k_eff)`）を有界化する
+        // （`.claude/rules/coding-rust.md`: untrusted 入力によるリソース確保の
+        // 増幅防止）。
+        let k_eff = k.min(touched.len());
+        let mut selector = TopKSelector::new(k_eff);
+        for &doc_idx in &touched {
+            let idx = doc_idx as usize;
+            // `touched` は `acc.get_mut(idx)` が `Some` を返した添字のみを記録している
+            // ため理論上範囲内だが、`.claude/rules/coding-rust.md`（`[]` 禁止）に従い
+            // `.get()` で明示的に防御する（範囲外は fail-closed で候補から除外）。
+            let Some(&score) = acc.get(idx) else {
+                continue;
+            };
             if score > 0.0 {
-                let candidate = Candidate {
-                    score,
-                    doc_id: doc.doc_id,
+                let Some(&doc_id) = self.doc_ids.get(idx) else {
+                    continue;
                 };
-                if heap.len() < k {
-                    heap.push(Reverse(candidate));
-                } else if let Some(Reverse(worst)) = heap.peek() {
-                    if candidate > *worst {
-                        heap.pop();
-                        heap.push(Reverse(candidate));
+                selector.push(Candidate { score, doc_id });
+            }
+        }
+
+        selector
+            .into_sorted()
+            .into_iter()
+            .map(|Candidate { score, doc_id }| ScoredDoc { doc_id, score })
+            .collect()
+    }
+
+    /// [`Self::score_by_postings`]・[`Self::score_within`] が共有する 1 パス
+    /// スコア計算コア（Issue #392）。クエリ語の posting 走査によりスコア
+    /// `> 0` の全候補を求める処理そのものを切り出したもので、Top-k 選出方式
+    /// （[`TopKSelector`] による 1 回限りの選出か、[`SparseScored::top`] による
+    /// 複数ラウンドの前方一致な切り出しか）には関知しない。呼び出し元
+    /// （`hybrid.rs::sparse_refetch_loop`）が疎側再取得ループで `fetch_k` を
+    /// 倍増させながら同じクエリを何度も評価する際、本関数は 1 回だけ呼べば
+    /// 済む（スコア > 0 の候補集合はクエリ・可視集合が変わらない限り不変な
+    /// ため）。分離前は `search_within` を呼ぶたびに本関数相当の処理
+    /// （`acc: Vec<f64>` の `O(N)` 確保・ゼロ初期化を含む）をラウンドごとに
+    /// 繰り返していた。
+    fn score_pass(&self, query_ids: &[TermId], scope: ScoreScope<'_>) -> ScorePass {
+        let (n, avg_doc_len) = match scope {
+            ScoreScope::All => (f64::from(self.doc_count), self.avg_doc_len),
+            ScoreScope::Visible(bitmap) => {
+                (bitmap.n as f64, bitmap.total_len as f64 / bitmap.n as f64)
+            }
+        };
+
+        // BM25 の `k1 * (k1+1)` 側の定数。
+        // 文書長クラス別 `k1 * len_norm` テーブル値はクエリ内で `avgdl` が確定した
+        // 後は文書長のみに依存するため以前は `len_classes` 全体を走査して事前構築
+        // していたが（Issue #391）、これは実際にヒットする文書長クラス数（<= M）に
+        // 関わらず `len_classes.len()`（コーパス中の相異なる文書長数。最悪 `O(N)`）
+        // 分の計算を常に行ってしまい、選択性の高いクエリで `search`/`search_within`
+        // の `O(Q + Σ|postings(t)| + M log k)` 契約から外れるという codex-review
+        // 指摘（PR #426）に対応し、ヒットループ内で実際にタッチしたクラスのみを
+        // 遅延計算してキャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]`
+        // は旧実装の `self.k1 * len_norm` と同一算出）は不変のため `denominator` は
+        // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
+        // 一意な `f64`）ためスコア自体の決定性に影響しない。
+        let k1_plus_1 = self.k1 + 1.0;
+        let mut k1_len_norm_cache: HashMap<u32, f64> = HashMap::new();
+
+        // `doc_idx` を添字とするスコアアキュムレータ（f64。ビット一致契約のため
+        // f32 化はしない）。`idf`・分子は常に正であり、`denominator > 0.0` ガードを
+        // 満たす限り各項の加算は必ず正の寄与を持つため、`acc[idx] == 0.0` は
+        // 「まだこの文書へ加算していない」ことと同値（Issue #390 設計判断）。
+        // この性質を使い `touched` へ初めて触れた doc_idx だけを記録することで、
+        // 最終的な Top-k 選出をヒットした文書（`M` 件）だけへ限定する。
+        let mut acc: Vec<f64> = vec![0.0; self.doc_ids.len()];
+        let mut touched: Vec<u32> = Vec::new();
+        // term ごとの可視ヒット `(doc_idx, tf)` を集める使い回しスクラッチ
+        // （[`ScoreScope::Visible`] でのみ使用。`search` 1 呼び出しで 1 本を使い回す）。
+        let mut visible_hits: Vec<(u32, u32)> = Vec::new();
+
+        for &term in query_ids {
+            let Some(list) = self.postings.get(term.0 as usize) else {
+                continue;
+            };
+            let (df, hits): (u32, &[(u32, u32)]) = match scope {
+                ScoreScope::All => (
+                    self.doc_freq.get(term.0 as usize).copied().unwrap_or(0),
+                    list.as_slice(),
+                ),
+                ScoreScope::Visible(bitmap) => {
+                    visible_hits.clear();
+                    let mut count: u32 = 0;
+                    for &(doc_idx, tf) in list {
+                        if bitmap.contains(doc_idx) {
+                            visible_hits.push((doc_idx, tf));
+                            count = count.saturating_add(1);
+                        }
                     }
+                    (count, visible_hits.as_slice())
+                }
+            };
+            let idf = Self::idf_for(n, df);
+            for &(doc_idx, tf) in hits {
+                let idx = doc_idx as usize;
+                // `doc_len_class` は `doc_len` と同じ添字空間・同じ長さで build 時に
+                // 同期構築される（不変条件）。`.get()` で範囲外を防御しつつ、
+                // 対応するテーブル値をクラスごとに初回タッチ時のみ計算しキャッシュへ
+                // 記録する（範囲外は fail-closed で当該ヒットを棄却する）。
+                let Some(&class) = self.doc_len_class.get(idx) else {
+                    continue;
+                };
+                let Some(&len) = self.len_classes.get(class as usize) else {
+                    continue;
+                };
+                let kln = *k1_len_norm_cache.entry(class).or_insert_with(|| {
+                    self.k1
+                        * (1.0 - self.b
+                            + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
+                });
+                let f = f64::from(tf);
+                let numerator = f * k1_plus_1;
+                let denominator = f + kln;
+                // `f >= 1`（posting に載っている時点で出現回数は 1 以上）かつ
+                // `k1 >= 0`・`len_norm >= 0`（`b` は `[0.0, 1.0]` に構築時検証済み）
+                // であり、`denominator >= f >= 1.0` となる。このガードは実質到達
+                // しないが `search`/旧 `search_within` と同一の防御として残す。
+                if denominator > 0.0 {
+                    let Some(slot) = acc.get_mut(idx) else {
+                        continue;
+                    };
+                    if *slot == 0.0 {
+                        touched.push(doc_idx);
+                    }
+                    *slot += idf * (numerator / denominator);
                 }
             }
         }
 
-        let mut scored: Vec<ScoredDoc> = heap
-            .into_iter()
-            .map(|Reverse(Candidate { score, doc_id })| ScoredDoc { doc_id, score })
-            .collect();
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
-        Ok(scored)
+        ScorePass { acc, touched }
     }
 
     /// `HashMap` の 1 エントリあたりのアロケータ管理領域・制御バイト分の概算
@@ -1124,10 +1594,8 @@ impl SparseIndex {
     /// この `SparseIndex` が保持するヒープ確保分の概算バイト量（Issue #357・
     /// `sql/sparse_cache.rs::SparseIndexCache` の容量判定用）。`dictionary.rs::
     /// Dictionary::approx_heap_bytes` と同じ「厳密なメモリ計測ではなく DoS 対策の
-    /// ための粗い上限判定用」という位置づけの概算。Issue #389（転置索引・`doc_len`／
-    /// `doc_ids` 配列の追加、`id_index` の `HashMap` 化）で以下を再計上した:
-    /// `docs`（`Vec<DocEntry>` 自体の確保領域〔`capacity() * size_of::<DocEntry>()`〕
-    /// ＋各文書の `term_freq: Vec<(TermId, u32)>` の確保領域）・`terms`（辞書に保持
+    /// ための粗い上限判定用」という位置づけの概算。Issue #390 で `docs`
+    /// （`Vec<DocEntry>`）を撤去したため以下のみを計上する: `terms`（辞書に保持
     /// する `String` 語彙のキー容量＋`HashMap` のエントリ・容量余裕分）・`doc_freq`
     /// （`Vec<u32>` の確保領域）・`postings`（外側 `Vec<Vec<_>>` の確保領域＋各内側
     /// `Vec<(u32, u32)>` の確保領域）・`doc_len`／`doc_ids`（各 `Vec` の確保領域）・
@@ -1135,20 +1603,6 @@ impl SparseIndex {
     /// `String` は `len()` ではなく `capacity()` を使う（成長により確保容量が長さを
     /// 上回り得るため、下回らない側の概算にする）。
     pub fn approx_heap_bytes(&self) -> usize {
-        let docs_container = self
-            .docs
-            .capacity()
-            .saturating_mul(std::mem::size_of::<DocEntry>());
-        let docs_term_freq: usize = self
-            .docs
-            .iter()
-            .map(|d| {
-                d.term_freq
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(TermId, u32)>())
-            })
-            .fold(0usize, |acc, n| acc.saturating_add(n));
-        let docs = docs_container.saturating_add(docs_term_freq);
         let terms_keys: usize = self
             .terms
             .ids
@@ -1208,12 +1662,25 @@ impl SparseIndex {
             .capacity()
             .saturating_mul(std::mem::size_of::<(DocId, usize)>().saturating_add(1));
         let id_index = id_index_entries.saturating_add(id_index_table);
-        docs.saturating_add(terms)
+        // 文書長クラス表（Issue #391）: `len_classes`（相異なる文書長の値。通常
+        // `doc_len` より小さいが上限は同じ `MAX_CORPUS_DOCS` で有界）・
+        // `doc_len_class`（`doc_len` と同じ長さ・同じ要素サイズ `u32`）。
+        let len_classes: usize = self
+            .len_classes
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
+        let doc_len_class: usize = self
+            .doc_len_class
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
+        terms
             .saturating_add(doc_freq)
             .saturating_add(postings)
             .saturating_add(doc_len)
             .saturating_add(doc_ids)
             .saturating_add(id_index)
+            .saturating_add(len_classes)
+            .saturating_add(doc_len_class)
     }
 }
 
@@ -1528,6 +1995,77 @@ mod tests {
             .search_within("cat", 10, &visible)
             .expect("search_within ok");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn search_within_handles_visible_bitmap_word_boundary_at_64_docs() {
+        // [P0 相当の境界確認] `VisibleBitmap`（Issue #390）は `doc_idx` を 64 件単位
+        // の `u64` ワードへ詰める。ワード境界（doc_idx=63/64/65）をまたぐ可視集合で
+        // 取りこぼし・誤ヒットが無いことに加え、統計（N・avgdl・df）がビットマップ
+        // 経由でも正しく縮約されていることをスコアそのもので確認する。
+        //
+        // 全文書が同一本文（同点）だとメンバーシップ判定の bug がスコアへ現れず
+        // 検出できないため（advisor 指摘）、`generate_mixed_corpus`（tf・doc_len が
+        // 文書ごとに異なる決定的コーパス）を使い、境界をまたぐ可視集合の結果を
+        // 参照実装（`reference_search_top_k`）とスコアのビット一致まで突き合わせる。
+        let corpus = generate_mixed_corpus(100);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        // doc_id と doc_idx は挿入順に一致する。ワード境界（63/64/65）をまたぎ、
+        // かつ境界外（62・66）を可視集合から意図的に外して縮約の効き目も見る。
+        let visible: BTreeSet<u64> = [60u64, 61, 63, 64, 65, 67, 68].into_iter().collect();
+
+        let mut ref_docs: BTreeMap<DocId, (BTreeMap<String, u32>, u32)> = BTreeMap::new();
+        let mut ref_doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ref_total_len: u64 = 0;
+        for &(doc_id, text) in &refs {
+            if !visible.contains(&doc_id) {
+                continue;
+            }
+            let toks = tokenize(text);
+            let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in &toks {
+                *tf.entry(t.clone()).or_insert(0) += 1;
+            }
+            let doc_len = u32::try_from(toks.len()).unwrap();
+            ref_total_len += u64::from(doc_len);
+            for t in tf.keys() {
+                *ref_doc_freq.entry(t.clone()).or_insert(0) += 1;
+            }
+            ref_docs.insert(doc_id, (tf, doc_len));
+        }
+        let ref_n = visible.len() as f64;
+        let ref_avg_doc_len = ref_total_len as f64 / ref_n;
+        let stats = ReferenceCorpusStats {
+            doc_freq_all: &ref_doc_freq,
+            n: ref_n,
+            avg_doc_len: ref_avg_doc_len,
+            k1: DEFAULT_K1,
+            b: DEFAULT_B,
+        };
+
+        for query in ["alpha beta", "検索", "gamma delta epsilon"] {
+            let results = idx.search_within(query, 10, &visible).unwrap();
+            let expected_top_k = reference_search_top_k(query, &ref_docs, &stats, 10);
+            assert_eq!(
+                results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                expected_top_k.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                "query={query:?}: ワード境界をまたぐ可視集合での返却 doc_id が参照実装と一致しない"
+            );
+            for scored in &results {
+                let (tf, doc_len) = ref_docs.get(&scored.doc_id).unwrap();
+                let expected = reference_bm25_score(query, tf, *doc_len, &stats);
+                assert_eq!(
+                    scored.score.total_cmp(&expected),
+                    std::cmp::Ordering::Equal,
+                    "query={query:?} doc_id={} score={} expected={}",
+                    scored.doc_id,
+                    scored.score,
+                    expected
+                );
+            }
+        }
     }
 
     #[test]
@@ -2008,26 +2546,23 @@ mod tests {
     }
 
     #[test]
-    fn doc_entry_term_freq_is_sorted_by_term_id_without_duplicates() {
+    fn postings_reconstruct_correct_term_frequency_for_repeated_terms() {
+        // Issue #390 で `DocEntry`/`docs`（毎文書の `term_freq` 保持配列）を撤去した
+        // ため、この不変条件は `postings`（term 添字の転置索引）側から検証する。
         let docs = vec![
             (1u64, "alpha beta alpha gamma beta alpha"),
             (2u64, "beta gamma delta"),
         ];
         let idx = SparseIndex::build(&docs).unwrap();
-        for doc in &idx.docs {
-            let ids: Vec<TermId> = doc.term_freq.iter().map(|&(t, _)| t).collect();
-            let mut sorted = ids.clone();
-            sorted.sort_unstable();
-            sorted.dedup();
-            assert_eq!(
-                ids, sorted,
-                "term_freq は TermId 昇順ソート済み・重複なしという不変条件を持つ"
-            );
-        }
         // doc_id=1 の "alpha" は 3 回出現する。
-        let doc1 = idx.docs.iter().find(|d| d.doc_id == 1).unwrap();
+        let doc1_idx = *idx.id_index.get(&1u64).unwrap() as u32;
         let alpha_id = idx.terms.lookup("alpha").unwrap();
-        assert_eq!(doc1.freq(alpha_id), Some(3));
+        let list = &idx.postings[alpha_id.0 as usize];
+        let tf = list
+            .iter()
+            .find(|&&(d, _)| d == doc1_idx)
+            .map(|&(_, tf)| tf);
+        assert_eq!(tf, Some(3), "\"alpha\" は doc_id=1 に 3 回出現する");
     }
 
     #[test]
@@ -2126,64 +2661,65 @@ mod tests {
     }
 
     #[test]
-    fn postings_reconstruct_tf_and_df_matching_doc_entry_for_all_docs() {
+    fn postings_reconstruct_tf_and_df_matching_manual_tokenization_for_all_docs() {
+        // Issue #390 で `DocEntry`/`docs` を撤去したため、`postings` から復元した
+        // tf/df を `tokenize()` の手計算（`BTreeMap<String, u32>`）と直接突き合わせる。
         let corpus = generate_mixed_corpus(400);
         let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
         let idx = SparseIndex::build(&refs).unwrap();
 
-        // 総 posting 数 == Σ 各文書の term_freq.len()（双方向の突合の前提）。
-        let total_postings: usize = idx.postings.iter().map(std::vec::Vec::len).sum();
-        let total_term_freq_entries: usize = idx.docs.iter().map(|d| d.term_freq.len()).sum();
-        assert_eq!(total_postings, total_term_freq_entries);
-
-        for (term_id, list) in idx.postings.iter().enumerate() {
-            let term_id = TermId(term_id as u32);
-            // df との一致。
-            assert_eq!(
-                list.len(),
-                idx.doc_freq[term_id.0 as usize] as usize,
-                "postings[{}].len() は doc_freq[{}] と一致する",
-                term_id.0,
-                term_id.0
-            );
-            // postings → DocEntry 方向: 全 (doc_idx, tf) が該当文書の freq() と一致。
-            for &(doc_idx, tf) in list {
-                let doc = &idx.docs[doc_idx as usize];
+        // 総 posting 数 == Σ 各文書の一意語数（双方向の突合の前提。旧実装〔`DocEntry`
+        // 経由〕の同名アサーションと同じ独立したグローバル件数チェックを維持する。
+        // これが無いと「余分な posting が 1 件混入し `doc_freq` も同時にズレる」
+        // ような build のバグを、後段の per-term 突合だけでは検出できない
+        // （advisor 指摘。テスト弱体化の防止・`.claude/rules/coding-rust.md`）。
+        let mut total_expected_tf_entries: usize = 0;
+        for &(doc_id, text) in &refs {
+            let doc_idx = *idx.id_index.get(&doc_id).unwrap() as u32;
+            let mut expected_tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in tokenize(text) {
+                *expected_tf.entry(t).or_insert(0) += 1;
+            }
+            total_expected_tf_entries += expected_tf.len();
+            for (term, &expected_count) in &expected_tf {
+                let term_id = idx.terms.lookup(term).unwrap();
+                let list = &idx.postings[term_id.0 as usize];
+                let actual = list.iter().find(|&&(d, _)| d == doc_idx).map(|&(_, tf)| tf);
                 assert_eq!(
-                    doc.freq(term_id),
-                    Some(tf),
-                    "postings[{}] の (doc_idx={}, tf={}) は docs[{}].freq() と一致する",
-                    term_id.0,
-                    doc_idx,
-                    tf,
-                    doc_idx
+                    actual,
+                    Some(expected_count),
+                    "term={term:?} doc_id={doc_id} の tf が postings 復元値と一致しない"
                 );
             }
         }
-        // DocEntry → postings 方向: 全文書の term_freq が対応する postings 内に
-        // (doc_idx, tf) として存在する。
-        for (doc_idx, doc) in idx.docs.iter().enumerate() {
-            let doc_idx_u32 = doc_idx as u32;
-            for &(term_id, tf) in &doc.term_freq {
-                let list = &idx.postings[term_id.0 as usize];
-                assert!(
-                    list.contains(&(doc_idx_u32, tf)),
-                    "docs[{doc_idx}].term_freq の ({term_id:?}, {tf}) は postings 内に存在する"
-                );
-            }
+        let total_postings: usize = idx.postings.iter().map(std::vec::Vec::len).sum();
+        assert_eq!(
+            total_postings, total_expected_tf_entries,
+            "postings の総エントリ数は全文書の一意語数合計と一致する（余分な posting・欠落の検出）"
+        );
+        // df との一致: 各 term の postings.len() == doc_freq[term]。
+        for (term_id, list) in idx.postings.iter().enumerate() {
+            assert_eq!(
+                list.len(),
+                idx.doc_freq[term_id] as usize,
+                "postings[{term_id}].len() は doc_freq[{term_id}] と一致する"
+            );
         }
     }
 
     #[test]
-    fn doc_len_and_doc_ids_arrays_mirror_doc_entries() {
+    fn doc_len_and_doc_ids_arrays_match_input_order_and_token_counts() {
+        // Issue #390 で `DocEntry`/`docs` を撤去したため、`doc_len`/`doc_ids` は
+        // build 時の入力順（`refs`）・`tokenize()` の手計算長と直接突き合わせる。
         let corpus = generate_mixed_corpus(200);
         let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
         let idx = SparseIndex::build(&refs).unwrap();
-        assert_eq!(idx.doc_len.len(), idx.docs.len());
-        assert_eq!(idx.doc_ids.len(), idx.docs.len());
-        for (i, doc) in idx.docs.iter().enumerate() {
-            assert_eq!(idx.doc_len[i], doc.doc_len);
-            assert_eq!(idx.doc_ids[i], doc.doc_id);
+        assert_eq!(idx.doc_len.len(), refs.len());
+        assert_eq!(idx.doc_ids.len(), refs.len());
+        for (i, &(doc_id, text)) in refs.iter().enumerate() {
+            assert_eq!(idx.doc_ids[i], doc_id, "doc_ids は build 時の入力順を保つ");
+            let expected_len = u32::try_from(tokenize(text).len()).unwrap();
+            assert_eq!(idx.doc_len[i], expected_len);
         }
     }
 
@@ -2192,9 +2728,9 @@ mod tests {
         let corpus = generate_mixed_corpus(200);
         let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
         let idx = SparseIndex::build(&refs).unwrap();
-        assert_eq!(idx.id_index.len(), idx.docs.len());
-        for (i, doc) in idx.docs.iter().enumerate() {
-            assert_eq!(idx.id_index.get(&doc.doc_id), Some(&i));
+        assert_eq!(idx.id_index.len(), refs.len());
+        for (i, &(doc_id, _)) in refs.iter().enumerate() {
+            assert_eq!(idx.id_index.get(&doc_id), Some(&i));
         }
     }
 
@@ -2462,5 +2998,639 @@ mod tests {
             large_idx.approx_heap_bytes() > small_idx.approx_heap_bytes(),
             "語彙数の増加に伴い approx_heap_bytes は単調増加する"
         );
+    }
+
+    // --- 文書長クラス表・Top-k select_nth 型選出（Issue #391） ---
+
+    #[test]
+    fn len_classes_are_sorted_unique_and_map_back_to_doc_len() {
+        let corpus = generate_mixed_corpus(500);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        assert_eq!(
+            idx.doc_len.len(),
+            idx.doc_len_class.len(),
+            "doc_len_class は doc_len と同じ長さ（doc_idx 空間）を持つ"
+        );
+        // 昇順・重複なし。
+        let mut sorted = idx.len_classes.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            idx.len_classes, sorted,
+            "len_classes は昇順・重複なしの不変条件を持つ"
+        );
+        // 添字経由で doc_len を再現できる。
+        for (i, &doc_len) in idx.doc_len.iter().enumerate() {
+            let class = idx.doc_len_class[i];
+            assert_eq!(
+                idx.len_classes[class as usize], doc_len,
+                "doc_idx={i} の doc_len_class がクラス表経由で元の doc_len を再現しない"
+            );
+        }
+    }
+
+    #[test]
+    fn len_norm_table_reproduces_inline_formula_bitwise() {
+        // `score_by_postings` が構築する `k1_len_norm` テーブルはこのテストから
+        // 直接は見えないため、`doc_len_class` 経由の間接参照（`len_classes[class]`）
+        // が、各文書の `doc_len` を直接使った旧来のインライン計算式
+        // （`self.k1 * (1.0 - self.b + self.b * (doc_len / avgdl.max(MIN_POSITIVE)))`）
+        // とビット一致することを、文書ごとに `doc_len_class` 添字を経由して固定する
+        // （テーブル化の間接参照そのものを検証対象にする。式を 2 通りに書いて
+        // 比較するだけの自明比較にしない）。
+        let corpus = generate_mixed_corpus(300);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let avg_doc_len = idx.avg_doc_len;
+
+        let len_norm_of = |len: u32| -> f64 {
+            idx.k1 * (1.0 - idx.b + idx.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
+        };
+
+        for (doc_idx, &doc_len) in idx.doc_len.iter().enumerate() {
+            let class = idx.doc_len_class[doc_idx];
+            // クラス表経由（`doc_len_class[doc_idx]` → `len_classes[class]`）で
+            // 求めた長さが、文書自身の `doc_len` を直接使った値とビット一致するか。
+            let via_class = len_norm_of(idx.len_classes[class as usize]);
+            let via_doc_len = len_norm_of(doc_len);
+            assert_eq!(
+                via_class.total_cmp(&via_doc_len),
+                std::cmp::Ordering::Equal,
+                "doc_idx={doc_idx} doc_len={doc_len} class={class}: \
+                 doc_len_class 経由の k1*len_norm がインライン計算とビット一致しない"
+            );
+        }
+    }
+
+    #[test]
+    fn search_and_search_within_top_k_bit_identical_to_reference_on_mixed_corpus() {
+        let corpus = generate_mixed_corpus(2_000);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        // 参照実装用の全文書統計。
+        let mut ref_docs: BTreeMap<DocId, (BTreeMap<String, u32>, u32)> = BTreeMap::new();
+        let mut ref_doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ref_total_len: u64 = 0;
+        for &(doc_id, text) in &refs {
+            let toks = tokenize(text);
+            let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in &toks {
+                *tf.entry(t.clone()).or_insert(0) += 1;
+            }
+            let doc_len = u32::try_from(toks.len()).unwrap();
+            ref_total_len += u64::from(doc_len);
+            for t in tf.keys() {
+                *ref_doc_freq.entry(t.clone()).or_insert(0) += 1;
+            }
+            ref_docs.insert(doc_id, (tf, doc_len));
+        }
+        let ref_n = refs.len() as f64;
+        let ref_avg_doc_len = ref_total_len as f64 / ref_n;
+        let stats_all = ReferenceCorpusStats {
+            doc_freq_all: &ref_doc_freq,
+            n: ref_n,
+            avg_doc_len: ref_avg_doc_len,
+            k1: DEFAULT_K1,
+            b: DEFAULT_B,
+        };
+
+        // 可視部分集合（偶数 doc_id のみ）と、それに限定した参照統計。
+        let visible: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| id % 2 == 0)
+            .collect();
+        let mut ref_docs_visible: BTreeMap<DocId, (BTreeMap<String, u32>, u32)> = BTreeMap::new();
+        let mut ref_doc_freq_visible: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ref_total_len_visible: u64 = 0;
+        for &(doc_id, text) in &refs {
+            if !visible.contains(&doc_id) {
+                continue;
+            }
+            let toks = tokenize(text);
+            let mut tf: BTreeMap<String, u32> = BTreeMap::new();
+            for t in &toks {
+                *tf.entry(t.clone()).or_insert(0) += 1;
+            }
+            let doc_len = u32::try_from(toks.len()).unwrap();
+            ref_total_len_visible += u64::from(doc_len);
+            for t in tf.keys() {
+                *ref_doc_freq_visible.entry(t.clone()).or_insert(0) += 1;
+            }
+            ref_docs_visible.insert(doc_id, (tf, doc_len));
+        }
+        let ref_n_visible = visible.len() as f64;
+        let ref_avg_doc_len_visible = ref_total_len_visible as f64 / ref_n_visible;
+        let stats_visible = ReferenceCorpusStats {
+            doc_freq_all: &ref_doc_freq_visible,
+            n: ref_n_visible,
+            avg_doc_len: ref_avg_doc_len_visible,
+            k1: DEFAULT_K1,
+            b: DEFAULT_B,
+        };
+
+        let m = refs.len();
+        let ks = [1usize, 5, 20, 100, m / 2, m, m + 1];
+        for query in [
+            "alpha beta",
+            "検索 評価",
+            "alpha検索",
+            "gamma delta epsilon",
+        ] {
+            for &k in &ks {
+                // search（全体母数）。
+                let results = idx.search(query, k).unwrap();
+                let expected = reference_search_top_k(query, &ref_docs, &stats_all, k);
+                assert_eq!(
+                    results.len(),
+                    expected.len(),
+                    "search query={query:?} k={k}: 件数不一致"
+                );
+                assert_eq!(
+                    results.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                    expected.iter().map(|&(id, _)| id).collect::<Vec<_>>(),
+                    "search query={query:?} k={k}: doc_id 列不一致"
+                );
+                for (scored, &(_, exp_score)) in results.iter().zip(expected.iter()) {
+                    assert_eq!(
+                        scored.score.total_cmp(&exp_score),
+                        std::cmp::Ordering::Equal,
+                        "search query={query:?} k={k} doc_id={}: スコア不一致",
+                        scored.doc_id
+                    );
+                }
+
+                // search_within（可視部分集合母数）。
+                let results_within = idx.search_within(query, k, &visible).unwrap();
+                let expected_within =
+                    reference_search_top_k(query, &ref_docs_visible, &stats_visible, k);
+                assert_eq!(
+                    results_within.len(),
+                    expected_within.len(),
+                    "search_within query={query:?} k={k}: 件数不一致"
+                );
+                assert_eq!(
+                    results_within.iter().map(|s| s.doc_id).collect::<Vec<_>>(),
+                    expected_within
+                        .iter()
+                        .map(|&(id, _)| id)
+                        .collect::<Vec<_>>(),
+                    "search_within query={query:?} k={k}: doc_id 列不一致"
+                );
+                for (scored, &(_, exp_score)) in results_within.iter().zip(expected_within.iter()) {
+                    assert_eq!(
+                        scored.score.total_cmp(&exp_score),
+                        std::cmp::Ordering::Equal,
+                        "search_within query={query:?} k={k} doc_id={}: スコア不一致",
+                        scored.doc_id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn score_within_top_is_bit_identical_to_search_within_on_mixed_corpus() {
+        // `score_within(q, vis).top(k)` と `search_within(q, k, vis)` が同一の
+        // 出力（doc_id 列・スコアともビット一致）を返すことを固定する
+        // （Issue #392。両者は [`SparseIndex::score_pass`] を共有するが、
+        // Top-k 選出の実装〔`TopKSelector` 対 `SparseScored::top`〕が異なる
+        // ため、出力が一致することそのものが本テストの検証対象になる）。
+        let corpus = generate_mixed_corpus(2_000);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+
+        let visible: BTreeSet<DocId> = refs
+            .iter()
+            .map(|&(id, _)| id)
+            .filter(|id| id % 2 == 0)
+            .collect();
+        let m = visible.len();
+        // 疎側再取得ループの倍増スケジュール相当の値を含める（Issue #320・#392）。
+        let ks = [1usize, 5, 20, 100, m / 2, m, m + 1, 2, 4, 8, 16, 32, 64];
+        for query in [
+            "alpha beta",
+            "検索 評価",
+            "alpha検索",
+            "gamma delta epsilon",
+        ] {
+            let mut scored = idx.score_within(query, &visible).unwrap();
+            for &k in &ks {
+                let via_scored = scored.top(k);
+                let via_search_within = idx.search_within(query, k, &visible).unwrap();
+                assert_eq!(
+                    via_scored, via_search_within,
+                    "query={query:?} k={k}: score_within(..).top(k) と \
+                     search_within(.., k, ..) が一致しない"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_scored_top_is_prefix_consistent_and_idempotent() {
+        // `top(k1)` → `top(k2 > k1)` → `top(k1)` の順に呼んでも前方一致・
+        // 冪等であることを固定する（Issue #392。[`SparseScored::top`] の
+        // ドキュメンテーションコメントの契約）。
+        let corpus = generate_mixed_corpus(500);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+
+        let mut scored = idx.score_within("alpha beta", &visible).unwrap();
+        let m = scored.len();
+        assert!(m > 40, "テスト前提: 十分なヒット数が必要 (m={m})");
+
+        let k1 = 5usize;
+        let k2 = 40usize;
+        let top_k1_first = scored.top(k1);
+        let top_k2 = scored.top(k2);
+        let top_k1_again = scored.top(k1);
+
+        assert_eq!(
+            top_k1_first, top_k1_again,
+            "同じ k を複数回呼んでも同一列を返す（冪等性）"
+        );
+        assert_eq!(
+            top_k2[..k1],
+            top_k1_first[..],
+            "top(k1) は top(k2) の前方一致な部分列である"
+        );
+
+        // k > M（全ヒット数）は M 件で頭打ちになる。
+        let top_over = scored.top(m + 10);
+        assert_eq!(top_over.len(), m);
+        assert_eq!(&top_over[..k2], &top_k2[..]);
+    }
+
+    #[test]
+    fn sparse_scored_top_k_zero_and_empty_scored_return_empty() {
+        let corpus = generate_mixed_corpus(50);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+
+        let mut scored = idx.score_within("alpha beta", &visible).unwrap();
+        assert!(scored.top(0).is_empty());
+
+        // 未知語のみのクエリ・空可視集合はいずれも空の `SparseScored` を返す。
+        let mut scored_unknown = idx
+            .score_within("zzz_not_a_real_token_zzz", &visible)
+            .unwrap();
+        assert!(scored_unknown.is_empty());
+        assert!(scored_unknown.top(10).is_empty());
+
+        let mut scored_empty_visible = idx.score_within("alpha beta", &BTreeSet::new()).unwrap();
+        assert!(scored_empty_visible.is_empty());
+        assert!(scored_empty_visible.top(10).is_empty());
+    }
+
+    #[test]
+    fn score_within_input_validation_precedes_empty_cases() {
+        // `search_within_query_too_long_is_rejected_before_visible_ids_check`
+        // と対（Issue #392）。`QueryTooLong`・`TooManyQueryTerms` が空可視集合
+        // より優先して評価される契約は `score_within` でも同一。
+        let corpus = generate_mixed_corpus(20);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let empty_visible: BTreeSet<DocId> = BTreeSet::new();
+
+        let too_long_query = "a".repeat(MAX_QUERY_BYTES + 1);
+        let err = idx
+            .score_within(&too_long_query, &empty_visible)
+            .unwrap_err();
+        assert!(matches!(err, SparseError::QueryTooLong { .. }));
+
+        let too_many_terms_query = (0..=MAX_QUERY_TERMS)
+            .map(|i| format!("distinctterm{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let err = idx
+            .score_within(&too_many_terms_query, &empty_visible)
+            .unwrap_err();
+        assert!(matches!(err, SparseError::TooManyQueryTerms { .. }));
+    }
+
+    #[test]
+    fn score_within_statistics_are_isolated_from_invisible_docs() {
+        // `search_within_statistics_are_isolated_from_invisible_docs` と対
+        // （Issue #392）。可視部分集合（id=1 のみ "cat" を含む）を固定したまま
+        // 共有インデックスへ大量の不可視文書（"cat" を含むものを含む）を追加
+        // しても `score_within` のスコアが不変であること（RLS 相当のテナント
+        // 境界縮約契約の回帰。`doc_count`/`doc_freq` を通じた統計汚染の防止）。
+        let small_docs = vec![(1u64, "cat"), (2u64, "dog")];
+        let small_idx = SparseIndex::build(&small_docs).expect("build ok");
+        let visible: BTreeSet<u64> = [1u64].into_iter().collect();
+        let small_result = small_idx
+            .score_within("cat", &visible)
+            .expect("score_within ok")
+            .top(10);
+
+        let mut large_docs: Vec<(u64, &str)> = vec![(1u64, "cat"), (2u64, "dog")];
+        let filler: Vec<(u64, &str)> = (100u64..150).map(|id| (id, "cat cat cat")).collect();
+        large_docs.extend(filler.iter().copied());
+        let large_idx = SparseIndex::build(&large_docs).expect("build ok");
+        let large_result = large_idx
+            .score_within("cat", &visible)
+            .expect("score_within ok")
+            .top(10);
+
+        assert_eq!(
+            small_result, large_result,
+            "invisible corpus growth must not change visible-only score"
+        );
+    }
+
+    /// 決定的 xorshift による疑似乱数列（テスト専用。暗号用途ではない）。
+    fn xorshift_next(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// 決定的乱数で `Candidate` 列（同点を多数含む）を生成する。
+    fn generate_random_candidates(m: usize, seed: u64) -> Vec<Candidate> {
+        let mut state = seed;
+        (0..m)
+            .map(|i| {
+                // スコアの取り得る値を小さい集合に絞ることで同点を多発させる
+                // （境界の決定性テストが有効になる条件を作る）。
+                let bucket = xorshift_next(&mut state) % 10;
+                Candidate {
+                    score: bucket as f64,
+                    doc_id: i as u64,
+                }
+            })
+            .collect()
+    }
+
+    /// `TopKSelector` の出力が「全件を `Candidate::Ord` で降順ソートした先頭 k_eff 件」
+    /// と集合・順序ともに一致することを、`M`/`k` の境界（`M > 2k`・`M <= k`・
+    /// `k == 0`・`M == 0`）を網羅して確認する。
+    #[test]
+    fn top_k_selector_matches_full_sort_for_random_candidates() {
+        for &(m, k) in &[
+            (0usize, 5usize),
+            (5, 0),
+            (3, 10),
+            (10, 3),
+            (200, 7),
+            (200, 100),
+            (201, 201),
+        ] {
+            let candidates = generate_random_candidates(m, 0x9e37_79b9_7f4a_7c15 ^ (m as u64));
+            let k_eff = k.min(m);
+
+            let mut expected = candidates.clone();
+            // Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序のため、
+            // 不安定ソートでも期待値の順序は決定的。
+            expected.sort_unstable_by(|a, b| b.cmp(a)); // sort-determinism: allow Candidate::Ord は doc_id 昇順の明示的タイブレークを含む全順序
+            expected.truncate(k_eff);
+
+            let mut selector = TopKSelector::new(k_eff);
+            for &c in &candidates {
+                selector.push(c);
+            }
+            let actual = selector.into_sorted();
+
+            assert_eq!(
+                actual, expected,
+                "m={m} k={k}: TopKSelector の出力が全件ソート上位 k_eff 件と一致しない"
+            );
+        }
+    }
+
+    #[test]
+    fn top_k_selector_boundary_tie_group_prefers_smaller_doc_id() {
+        // 同点スコアの候補群が k の境界をまたぐケース。`Candidate::Ord` の
+        // タイブレーク（doc_id 昇順が「良い」）により、境界を跨ぐ同点グループの
+        // うち doc_id が小さい側だけが残ることを固定する（`hybrid.rs` の境界同点
+        // グループ完全化・再取得ループの前提契約）。
+        let mut candidates: Vec<Candidate> = (0..10u64)
+            .map(|doc_id| Candidate { score: 1.0, doc_id })
+            .collect();
+        // 非同点の高スコア候補を混ぜて「同点グループが境界に来る」状況を作る。
+        candidates.push(Candidate {
+            score: 5.0,
+            doc_id: 100,
+        });
+
+        let k_eff = 4; // 高スコア 1 件 + 同点グループの先頭 3 件（doc_id 0,1,2）。
+        let mut selector = TopKSelector::new(k_eff);
+        for &c in &candidates {
+            selector.push(c);
+        }
+        let actual = selector.into_sorted();
+
+        assert_eq!(actual.len(), k_eff);
+        assert_eq!(actual[0].doc_id, 100);
+        let tie_ids: Vec<u64> = actual[1..].iter().map(|c| c.doc_id).collect();
+        assert_eq!(
+            tie_ids,
+            vec![0, 1, 2],
+            "境界を跨ぐ同点グループは doc_id が小さい側だけが残る"
+        );
+    }
+
+    #[test]
+    fn search_within_top_k_cut_inside_tie_group_is_deterministic_and_prefix_consistent() {
+        // 同一スコアになる文書群を作り、k を増やしたときに結果が前方一致（prefix）
+        // で伸びることを確認する（`hybrid.rs::sparse_refetch_loop` の倍増再取得と
+        // 整合する契約）。全文書が同じ 1 語のみを含む文書は tf・doc_len が揃うため
+        // スコアが完全に一致する。
+        let docs: Vec<(DocId, String)> = (0..30u64).map(|id| (id, "alpha".to_string())).collect();
+        let refs: Vec<(DocId, &str)> = docs.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let visible: BTreeSet<DocId> = refs.iter().map(|&(id, _)| id).collect();
+
+        let mut prev: Vec<DocId> = Vec::new();
+        for k in [1usize, 5, 10, 20, 30, 31] {
+            let results = idx.search_within("alpha", k, &visible).unwrap();
+            let ids: Vec<DocId> = results.iter().map(|s| s.doc_id).collect();
+            assert!(
+                ids.starts_with(&prev),
+                "k={k}: 前回（k={}）の結果が今回の結果の前方一致になっていない: prev={prev:?} ids={ids:?}",
+                prev.len()
+            );
+            prev = ids;
+        }
+        assert_eq!(prev.len(), 30, "可視文書数を超える k は全件で頭打ちになる");
+    }
+
+    #[test]
+    fn search_within_len_norm_table_uses_visible_avgdl_only() {
+        // 可視外に極端な長さの文書を追加してもテーブル・スコアが不変であることを
+        // 確認する（RLS 縮約契約の回帰。可視部分集合の avgdl のみをテーブル構築に
+        // 使う契約が Issue #391 のテーブル化で崩れていないことの直接的な保証）。
+        let base_docs = vec![
+            (1u64, "alpha beta"),
+            (2u64, "alpha beta gamma"),
+            (3u64, "alpha"),
+        ];
+        let visible: BTreeSet<DocId> = [1u64, 2u64, 3u64].into_iter().collect();
+
+        let idx_base = SparseIndex::build(&base_docs).unwrap();
+        let baseline = idx_base.search_within("alpha", 10, &visible).unwrap();
+
+        // 可視外に極端に長い文書を大量に追加する（avgdl を大きく歪める）。
+        let mut extended_docs = base_docs.clone();
+        let long_text: String = "zeta ".repeat(500);
+        for extra_id in 100u64..110u64 {
+            extended_docs.push((extra_id, long_text.as_str()));
+        }
+        let idx_extended = SparseIndex::build(&extended_docs).unwrap();
+        let extended = idx_extended.search_within("alpha", 10, &visible).unwrap();
+
+        assert_eq!(
+            baseline, extended,
+            "可視外の文書長がテーブル・スコアへ影響してはならない（RLS 縮約契約）"
+        );
+    }
+
+    #[test]
+    fn approx_heap_bytes_accounts_len_class_arrays() {
+        // 文書長のバリエーションを増やすと len_classes/doc_len_class 分の増加により
+        // approx_heap_bytes は単調増加する（Issue #391）。
+        let uniform: Vec<(DocId, &str)> = (0..20u64).map(|id| (id, "alpha beta")).collect();
+        let varied: Vec<(DocId, &str)> = (0..20u64)
+            .map(|id| {
+                let text = match id % 4 {
+                    0 => "alpha",
+                    1 => "alpha beta",
+                    2 => "alpha beta gamma",
+                    _ => "alpha beta gamma delta epsilon zeta eta",
+                };
+                (id, text)
+            })
+            .collect();
+        let idx_uniform = SparseIndex::build(&uniform).unwrap();
+        let idx_varied = SparseIndex::build(&varied).unwrap();
+        assert!(
+            idx_varied.approx_heap_bytes() > idx_uniform.approx_heap_bytes(),
+            "len_classes/doc_len_class の増加分だけ approx_heap_bytes は単調増加する"
+        );
+    }
+
+    /// 256 段ロッシー fieldnorm 量子化を production クラス表（[`Self::len_classes`]。
+    /// 厳密写像）と比較する手動実験（Issue #391 Step 4）。tantivy のテーブル値は
+    /// 転記せず、本テストのみで完結する自作の代表値写像規則を使う。`--nocapture`
+    /// で変動件数（doc_id 列の不一致数・同点グループ構成の変化）を出力する。
+    /// `content_hash.rs` の手動実測 `#[ignore]` テストと同じ位置づけであり、CI の
+    /// 常時実行対象ではない。
+    ///
+    /// 判断（Issue #391）: production は本テストの結果によらず厳密クラス表
+    /// （`len_classes`）を採用し、256 段ロッシー量子化は不採用（Rejected）とする。
+    /// 理由はビット一致契約（`replica_matches_real`・Recall 層 A 固定値・
+    /// `sparse_cache_recall.rs` cold/hot 等価性が前提とする）に反すること自体であり、
+    /// 変動件数が 0 であっても採否は変わらない。性能上もクラス数に依存しないため
+    /// 厳密表に対する優位はない。詳細は
+    /// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #391」節参照。
+    #[test]
+    #[ignore = "手動実験専用。--ignored --nocapture で実行する"]
+    fn fieldnorm_256_quantization_rank_divergence_report() {
+        const QUANT_LEVELS: u32 = 256;
+
+        /// 文書長を 256 段の代表値へ写像する自作規則（test-only）。小さい長さは
+        /// 厳密に、以降は幾何的に粗くする単純な区分（外部実装の転記ではない）。
+        fn quantize_len(len: u32, max_len: u32) -> u32 {
+            if max_len == 0 || len == 0 {
+                return 0;
+            }
+            let ratio = f64::from(len) / f64::from(max_len.max(1));
+            let level = (ratio * f64::from(QUANT_LEVELS - 1)).round() as u32;
+            let level = level.min(QUANT_LEVELS - 1);
+            // レベルから代表長へ戻す（区分の中間的な長さを採用）。
+            ((f64::from(level) / f64::from(QUANT_LEVELS - 1)) * f64::from(max_len)).round() as u32
+        }
+
+        let corpus = generate_mixed_corpus(5_000);
+        let refs: Vec<(DocId, &str)> = corpus.iter().map(|(id, s)| (*id, s.as_str())).collect();
+        let idx = SparseIndex::build(&refs).unwrap();
+        let max_len = idx.doc_len.iter().copied().max().unwrap_or(0);
+
+        let queries = [
+            "alpha beta",
+            "検索",
+            "gamma delta",
+            "評価 東京都",
+            "epsilon",
+        ];
+        let ks = [10usize, 20, 100];
+
+        let mut total_compared = 0usize;
+        let mut total_diverged = 0usize;
+
+        for &query in &queries {
+            for &k in &ks {
+                // 厳密クラス表（production）の Top-k。
+                let precise = idx.search(query, k).unwrap();
+
+                // 代表値量子化版の Top-k を、production と同じ posting 走査ロジックを
+                // 手計算で再現して求める（`score_by_postings` の非公開実装は呼べない
+                // ため、同じ式・同じ選出規約をここで再構成する。ビット一致は目的とせず
+                // 「量子化による順位変動の有無」のみを測る）。
+                let query_terms = tokenize(query);
+                let mut unique_terms: BTreeMap<String, ()> = BTreeMap::new();
+                for t in &query_terms {
+                    unique_terms.insert(t.clone(), ());
+                }
+                let query_ids: Vec<TermId> = unique_terms
+                    .keys()
+                    .filter_map(|t| idx.terms.lookup(t))
+                    .collect();
+
+                let n = f64::from(idx.doc_count);
+                let avg_doc_len = idx.avg_doc_len;
+                let mut acc: BTreeMap<DocId, f64> = BTreeMap::new();
+                for &term in &query_ids {
+                    let Some(list) = idx.postings.get(term.0 as usize) else {
+                        continue;
+                    };
+                    let df = idx.doc_freq.get(term.0 as usize).copied().unwrap_or(0);
+                    let idf = SparseIndex::idf_for(n, df);
+                    for &(doc_idx, tf) in list {
+                        let raw_len = idx.doc_len[doc_idx as usize];
+                        let q_len = quantize_len(raw_len, max_len);
+                        let f = f64::from(tf);
+                        let numerator = f * (idx.k1 + 1.0);
+                        let len_norm = 1.0 - idx.b
+                            + idx.b * (f64::from(q_len) / avg_doc_len.max(f64::MIN_POSITIVE));
+                        let denominator = f + idx.k1 * len_norm;
+                        if denominator > 0.0 {
+                            let doc_id = idx.doc_ids[doc_idx as usize];
+                            *acc.entry(doc_id).or_insert(0.0) += idf * (numerator / denominator);
+                        }
+                    }
+                }
+                let mut quantized: Vec<(DocId, f64)> =
+                    acc.into_iter().filter(|&(_, s)| s > 0.0).collect();
+                quantized.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                quantized.truncate(k);
+
+                let precise_ids: Vec<DocId> = precise.iter().map(|s| s.doc_id).collect();
+                let quantized_ids: Vec<DocId> = quantized.iter().map(|&(id, _)| id).collect();
+
+                total_compared += 1;
+                if precise_ids != quantized_ids {
+                    total_diverged += 1;
+                }
+                println!(
+                    "query={query:?} k={k}: precise={precise_ids:?} quantized={quantized_ids:?} diverged={}",
+                    precise_ids != quantized_ids
+                );
+            }
+        }
+
+        println!(
+            "fieldnorm_256_quantization_rank_divergence_report: {total_diverged}/{total_compared} 件で Top-k の doc_id 列が量子化により変動"
+        );
+        // 本テストは実験レポートであり、変動件数の多寡そのものを合否条件にしない
+        // （production の採否判断はビット一致契約が根拠であり、変動件数の実測値に
+        // 依存しない。上記コメント参照）。ただし比較自体が実行されたことは確認する。
+        assert!(total_compared > 0);
     }
 }

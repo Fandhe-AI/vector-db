@@ -589,3 +589,400 @@ SparseIndexCache`（Issue #357）経由の構築機会も無い〕に加えて�
   実装のまま据え置いた（本 Issue でも変更していない）
 - 専有環境での再実測・真に隔離された RSS 増分の単独プロセス実測は
   オーナー／運用者判断で別途実施する
+
+## Issue #390: 可視ビットマップ＋posting 走査 1 パス化後の実測
+
+親 Issue #386（転置索引化）Phase 1 の最終タスクとして、`search`／
+`search_within`（`crates/engine/src/sparse.rs`）を Issue #389 で追加した
+転置索引（`postings`）へ切り替え、可視部分集合の全件線形走査（`docs: Vec<
+DocEntry>` を経由し各文書の `term_freq` を二分探索する方式）を、可視集合を
+`doc_idx` 空間のビットマップへ変換したうえでクエリ語ごとに `postings[t]`
+だけを辿る 1 パス走査（共通コア `score_by_postings`）へ置き換えた。
+`DocEntry`／`docs` フィールド自体を撤去し、`search`（`ScoreScope::All`）・
+`search_within`（`ScoreScope::Visible`。RLS 相当のテナント境界縮約契約は
+不変）の両方をこの共通コアへ統一した。スコアの f64 ビット一致は不変
+（`crates/engine/tests/hybrid_profile_accept.rs::profile_sparse_index_
+replica_matches_real_search_within`〔ベンチ起動時の忠実性検証としても実行〕・
+`tests/sparse_cache_recall.rs` の cold/hot 等価性・大規模段〔25,000 件〕・
+`tests/hybrid_recall.rs` 層 A 固定値アサーションで検証済み）。
+
+### 測定条件
+
+Issue #356・#387・#388・#389 と同一環境・同一コーパス・クエリ集合・
+プロトコル（25,000 行・dim 128・単一テナント・`MeasurementConfig::new(20,
+30, SEED)`）。非専有環境（並行エージェントあり）での 1 回実測であり、
+Issue #389 の実測値を参考基線として扱う。
+
+### 実測結果
+
+| 指標 | Issue #388/#389（参考基線） | 本実測（Issue #390） |
+| ---- | ---------------------------: | --------------------: |
+| `sparse_build_total` median | 48.1ms（#389） | 47.1ms（ノイズ帯内・不変。posting 走査化は build 経路を変更しないため想定どおり） |
+| `approx_heap_bytes()`（`SparseIndex` 保持時） | 19,553,564 バイト（約 18.65 MiB。#389） | 12,153,564 バイト（約 11.59 MiB。`docs: Vec<DocEntry>` 撤去分だけ縮小） |
+| `search_within_fetch_k=25000`（全可視集合。実 API・単発呼び出し） | 2.6〜3.4ms（#388） | median 1,267µs／p95 1,318µs（約 1.27〜1.32ms。基線比で概ね 2〜2.7 倍短縮） |
+| `hybrid_search_cached_index`（事前構築済み `SparseIndex`。実クエリ経由の hybrid 経路全体） | 25.3ms（#388） | median 9,699µs／p95 10,318µs（約 9.7〜10.3ms。基線比で概ね 2.5 倍短縮） |
+
+`search_within_fetch_k` は疎側再取得ループの各段（400〜25,000）でいずれも
+明確に短縮しており（例: `fetch_k=400` は median 478µs、`fetch_k=25000` は
+median 1,267µs で、可視集合サイズに対して準線形に近い伸び方を保っている）、
+可視集合の大きさに関わらず「密検索と同オーダー」（`sql_dense_knn` median
+6,152µs）を下回る水準まで達した。
+
+### 解釈
+
+- `search_within_fetch_k` の短縮は、旧実装（可視部分集合の全件線形走査＋
+  文書ごとの `term_freq` 二分探索）から「クエリ語ごとに posting list だけを
+  辿る」方式への計算量オーダーの変化（モジュール doc コメント参照）が
+  そのまま実測へ反映されたものと解釈できる
+- `hybrid_search_cached_index`（sparse index はキャッシュヒット・実際の
+  hybrid 検索経路。疎側再取得ループを含む）が 25.3ms → 9.7ms（概ね 2.5 倍）
+  短縮したことは、Issue #387 で確認した「疎側再取得ループが単発クエリ
+  レイテンシへ寄与する」構造（`sparse_refetch query=* calls=6〜7`）を踏まえ、
+  ループ 1 回あたりのコストが本 Issue の変更で大きく下がったことを裏付ける
+- `approx_heap_bytes()` の縮小（約 18.65 MiB → 約 11.59 MiB）は
+  `docs: Vec<DocEntry>`（各文書の `term_freq: Vec<(TermId, u32)>` を含む）
+  撤去分にほぼ相当する。`postings`・`doc_len`・`doc_ids` は既存のまま
+  （Issue #389 で構築済み）であり本 Issue では増減していない
+- `sparse_build_total` が変化しないのは想定どおり（本 Issue の変更対象は
+  `search`／`search_within` のみで、build 経路〔posting 構築含む〕は
+  Issue #389 のまま無変更）
+
+### 受け入れ条件との対応
+
+1. `search`／`search_within` を可視ビットマップ＋posting 走査の共通コアへ
+   統一し、`DocEntry`／`docs` を撤去した（`crates/engine/src/sparse.rs`）
+2. 旧実装（`BTreeMap<String,u32>` 参照実装・`harness/hybrid_profile.rs::
+   ProfileSparseIndex` 複製）との等価性を単体テスト（部分可視・境界値
+   ケース含む）・25,000 件規模の cold/hot 等価性テスト
+   （`tests/sparse_cache_recall.rs`）で固定した
+3. `make bench-hybrid-profile` を実行し、`search_within_fetch_k`・
+   `hybrid_search_cached_index`・`approx_heap_bytes` の前後比較を上表に
+   記録した（目標「密検索と同オーダー」を達成）
+4. Recall 層 A（固定値アサーション。`tests/hybrid_recall.rs`）は
+   green のまま不変（スコアのビット一致契約により構造的に不変）
+
+### 申し送り
+
+- ビットマップ構築（`VisibleBitmap::build`。`BTreeSet` 走査＋`HashMap`
+  lookup × 可視集合サイズ）が疎側再取得ループの各段で毎回再構築される点
+  （再取得ループ間でのビットマップ再利用）は #392 領域の判断材料として
+  申し送る
+- `score_by_postings`（`sparse.rs`）のスコアアキュムレータ `acc: Vec<f64>`
+  はコーパス全体の文書数 `N`（`self.doc_ids.len()`）で毎呼び出し新規確保・
+  ゼロ初期化しており、モジュール doc コメントが述べる「コーパス文書数 `N`
+  そのものには比例しない」計算量契約は走査量についてのみ成立し、この
+  確保・ゼロ初期化自体は `O(N)` のまま残っている（Issue #390 レビュー指摘。
+  旧実装からの退行ではなく改善だが契約には未到達）。`search_within` は
+  疎側再取得ループから 1 クエリあたり 6〜7 回呼ばれる（Issue #387）ため、
+  大規模コーパスでは無視できないコストになり得る。真に N 非依存化するには
+  呼び出し間で `acc` バッファを再利用し `touched` でタッチ済み要素のみ
+  リセットする方式等が考えられるが、現行の `&self`（非 `&mut self`）
+  シグネチャを維持したまま呼び出し間で状態を持ち越す設計変更を要するため、
+  ビットマップ再利用と合わせて #392 領域の判断材料として申し送る
+- `postings` の CSR 形・量子化・skip list への圧縮は引き続き #391 以降・
+  #394 の判断材料
+- 段別観測フック（`search_within` 内部の bitmap 構築／posting 走査／
+  Top-k 選出の内訳）は本 Issue では追加していない（`search_within_fetch_k`
+  の外形計測に留めた）。より細かい内訳が必要になった場合の追加ポイントは
+  `sparse.rs::score_by_postings` 内の各段
+- 専有環境での再実測はオーナー／運用者判断で別途実施する
+
+## Issue #391: 文書長クラス別テーブルと select_nth 型 Top-k 導入後の実測
+
+対応: Issue #391（`perf(engine): fieldnorm 量子化スコアテーブルと select_nth 型
+top-k を SparseIndex へ導入`）。前提: TASK-102・TASK-104、
+`docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3（判定内容・数値基準は
+spec 側が SSOT。本節も spec 由来の pass/fail 閾値を持たない情報提供専用の
+実測記録）。
+
+### 変更内容
+
+`crates/engine/src/sparse.rs::score_by_postings` のホットパスを 2 点変更した。
+
+1. **文書長正規化項のキャッシュ化**: BM25 の `k1 * len_norm`（`len_norm =
+   1-b+b*doc_len/avgdl`）はクエリ内で `avgdl` が確定した後は文書長のみに
+   依存するため、ヒットごとに再計算する代わりに、build 時に構築した文書長
+   クラス表（`len_classes: Vec<u32>`。コーパス中の相異なる文書長を昇順・
+   重複なしに並べたもの・`doc_len_class: Vec<u32>`。`doc_idx` → クラス添字）
+   をもとに、当初はクエリ時（`avgdl` 確定直後）に `len_classes` 全体を
+   走査して `k1_len_norm: Vec<f64>`（クラス数分）を一括構築する設計を
+   採ったが、これは実際にヒットする文書長クラス数（<= ヒット数 `M`）に
+   関わらず常に `len_classes.len()`（コーパス中の相異なる文書長数。最悪
+   `O(N)`）分の計算を行ってしまい、選択性の高いクエリで `search`/
+   `search_within` の走査量に比例する計算量契約から外れるという指摘
+   （PR #426 codex-review）を受け、ヒットループ内で実際にタッチした
+   クラスのみを `k1_len_norm_cache: HashMap<u32, f64>` へ遅延計算・
+   キャッシュする方式へ変更した。式・演算順（`k1_len_norm[c]` は旧実装の
+   `self.k1 * len_norm` と同一算出）は不変のため `denominator` は旧実装と
+   引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class`
+   → 一意な `f64`）ためスコア自体の決定性には影響しない
+2. **Top-k 選出の select_nth 型化**: `BinaryHeap<Reverse<Candidate>>` への
+   逐次 `O(log k)` 挿入を、tantivy の `TopNComputer` を参考にした
+   `TopKSelector`（2k 件バッファ＋`select_nth_unstable_by` による一括切り詰め
+   ＋`threshold` による早期棄却）へ置き換えた。出力する Top-k 集合・順序は
+   いずれも `Candidate` の全順序（スコア降順・同点は `doc_id` 昇順）だけで
+   一意に決まるため、選出アルゴリズムの違いは出力に影響しない
+
+`SparseIndex` の公開 API（`build`/`with_params`/`search`/`search_within`/
+`approx_heap_bytes`）シグネチャは無変更。新規エラー変種
+`SparseError::LenClassBuildFailed`（文書長クラス表構築の不変条件違反。
+構築ロジック上到達不能だが `unwrap`/`expect` を使わず fail-closed に拒否する
+防御）を追加したが、呼び出し側（`sql/exec.rs::map_hybrid_error`）はワイルド
+カード分岐で受けるため既存の分類・応答契約に影響しない。
+
+### 受け入れ条件 1（ビット一致）の検証
+
+`crates/engine/src/sparse.rs` 内の単体テストに以下を追加し、いずれも green
+であることを確認した（詳細な観点は各テスト名を参照）。
+
+- `len_classes_are_sorted_unique_and_map_back_to_doc_len`
+- `len_norm_table_reproduces_inline_formula_bitwise`
+- `search_and_search_within_top_k_bit_identical_to_reference_on_mixed_corpus`
+  （2,000 件規模の混成コーパス・複数クエリ・`k ∈ {1, 5, 20, 100, M/2, M, M+1}`
+  で `search`／`search_within` 双方が参照実装〔`BTreeMap` 手計算〕とビット一致）
+- `top_k_selector_matches_full_sort_for_random_candidates`（`M`/`k` の境界
+  `M > 2k`・`M <= k`・`k == 0`・`M == 0` を網羅）
+- `top_k_selector_boundary_tie_group_prefers_smaller_doc_id`
+- `search_within_top_k_cut_inside_tie_group_is_deterministic_and_prefix_consistent`
+  （`hybrid.rs::sparse_refetch_loop` の倍増再取得と整合する前方一致契約）
+- `search_within_len_norm_table_uses_visible_avgdl_only`（RLS 縮約契約の回帰。
+  可視外の文書長がテーブル・スコアへ影響しないことを固定）
+- `approx_heap_bytes_accounts_len_class_arrays`
+
+既存のビット一致テスト（`search_score_is_bit_identical_to_reference_
+btreemap_implementation`・`search_within_score_is_bit_identical_to_reference_
+for_visible_subset`・`search_selection_boundary_prefers_smaller_doc_id_on_
+tie`・`search_tie_breaks_by_doc_id_ascending`）・`hybrid_profile_accept.rs::
+profile_sparse_index_replica_matches_real_search_within`（ベンチ起動時
+fail-closed の忠実性検証）・`sparse_cache_recall.rs`（cold/hot 等価性）・
+`hybrid_recall.rs` 層 A の固定値アサーション（`hits20 == 182`・
+`sparse_hits20 == 166`・大規模段 `hits20 == 385`/`hits100 == 648`）は無変更で
+green のまま（スコアのビット一致契約により構造的に不変）。
+
+**256 段ロッシー量子化の実験（Step 4・不採用判断）**: `sparse.rs` 内の
+`#[ignore]` 手動実験テスト `fieldnorm_256_quantization_rank_divergence_
+report`（`crates/engine/src/sparse.rs` 内 test-only。tantivy の実装・テーブル
+値は転記せず自作の代表値写像規則のみを使う）で、production の厳密クラス表と
+256 段代表値写像を 5,000 件規模のコーパス・複数クエリ・複数 `k` で比較できる
+ようにした。5 クエリ × 3 段の `k`（10・20・100）＝ 15 組の比較で、実測は
+「0/15 件で Top-k の doc_id 列が量子化により変動」（本開発環境・1 回実測。
+決定的フィクスチャのため再現性はある）だった。production は本実験の結果
+によらず厳密クラス表（`len_classes`）を採用し、256 段ロッシー量子化は
+不採用（Rejected）と判断する。理由はビット一致契約（`replica_matches_real`・
+Recall 層 A 固定値・`sparse_cache_recall.rs` cold/hot 等価性が前提とする）に
+反すること自体であり、変動件数が実測どおり 0 であっても判断は変わらない
+（Issue #391 実装計画の「変動が 0 だった場合も同じ結論とし、その事実を記録
+する」方針どおり）。性能面でも、テーブル参照コストはクラス数に依存しない
+ため厳密表（クラス数 = 相異なる文書長の個数、通常は文書数以下）に対する
+優位はない。
+
+### 受け入れ条件 3（前後比較）の実測
+
+`make bench-hybrid-profile`（`cargo bench --bench hybrid_profile_bench -p
+engine --features bench-internals`）を本開発環境（非専有・並行エージェント
+あり）で本変更の前後（before: 本 Issue の変更を `git stash` で除いた状態・
+after: 本 Issue の変更を適用した状態）それぞれ 1 回ずつ実行した。
+
+| 指標 | before | after |
+| ---- | -----: | ----: |
+| `hybrid_search_cached_index` p95 | 10,602µs | 9,014µs |
+| `hybrid_search_cached_index` median | 9,785µs | 8,288µs |
+| `search_within_fetch_k=25000`（全可視集合）p95 | 1,317µs | 813µs |
+| `search_within_fetch_k=25000`（全可視集合）median | 1,289µs | 798µs |
+| `sparse_index_resident` `approx_heap_bytes()` | 12,153,564 | 12,253,568 |
+
+`search_within_fetch_k` の他段（400〜12,800）も一様に短縮しており
+（例: `fetch_k=12800` median 1,102µs → 637µs）、Top-k 選出の
+`select_nth_unstable_by` 化・文書長正規化項テーブル化の効果は `k`（フェッチ
+件数）が大きいほど顕著に表れている。`sparse_build_total`（build 経路。本
+Issue は `score_by_postings` のみを変更対象とし build 側の文書長クラス表
+構築コスト自体は変更していない）は before/after で誤差の範囲（47,476µs →
+47,091µs）に留まり、想定どおり変化していない。
+
+`approx_heap_bytes()` はクラス表 2 本（`len_classes`・`doc_len_class`）の追加
+分だけわずかに増加した（+100,004 bytes ≈ +97.7 KiB。25,000 件規模コーパス
+での実測）。文書長のバリエーションが多いほど `len_classes` が大きくなるため
+この増加量はコーパス依存だが、`search_within_fetch_k` の短縮幅（数百µs〜
+数百µs、大きな `k` ほど拡大）に対して無視できる規模と判断する。
+
+### 受け入れ条件との対応
+
+1. §「受け入れ条件 1（ビット一致）の検証」参照。決定的フィクスチャで
+   Top-k・同点グループは導入前と一致することを機械検証した（不一致は
+   検出されなかった）
+2. Recall 層 A は green のまま不変（スコアのビット一致契約により構造的に
+   不変）。層 B（`recall.yml`。environment `recall-gate` の secrets 閾値）は
+   ローカルで実行できないため、マージ後の `workflow_dispatch` 実測は
+   引き続き管理者作業として申し送る
+3. §「受け入れ条件 3（前後比較）の実測」参照
+
+### 申し送り
+
+- `acc: Vec<f64>` の `O(N)` 確保・`VisibleBitmap` の再取得ループ間再利用は
+  引き続き #392 領域の判断材料
+- posting の CSR 化・量子化・skip list への圧縮は引き続き #394 の判断材料
+- 専有環境での `bench-hybrid-profile` 再実測はオーナー／運用者判断で別途実施
+- 256 段ロッシー fieldnorm 量子化は本 Issue で不採用と判断した（理由は上記
+  「256 段ロッシー量子化の実験」節参照）。将来スコア型・ビット一致契約自体を
+  見直す場合の再検討ポイントとして記録する
+
+## Issue #392: 疎側再取得ループの再スコアリング回避後の実測
+
+対応: Issue #392（`perf(engine): 境界同点グループ再取得ループで疎側の
+再スコアリングを回避`）。前提: TASK-102・TASK-104、
+`docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3（判定内容・数値基準は
+spec 側が SSOT。本節も spec 由来の pass/fail 閾値を持たない情報提供専用の
+実測記録）。関連: Issue #387（本節が言及する `sparse_refetch_observed` の
+導入元）・Issue #390 申し送り（「真に N 非依存化するフォローアップ」として
+本 Issue を予告していた記述）・CORE-7（`hybrid_search` を通らない測定経路の
+ため本変更の影響を受けない。`docs/design/hybrid-refetch-latency.md` 参照）。
+
+### 変更内容
+
+`hybrid.rs::sparse_refetch_loop`（疎側再取得ループ。境界同点グループ完全化
+のため `fetch_k` を倍増させながら同じクエリを複数回再評価する。Issue #320）
+が各ラウンドで `SparseIndex::search_within` を呼び直していたのを、
+`SparseIndex::score_within`（新設）を 1 回だけ呼んでスコア `> 0` の全候補
+（`SparseScored`）を確定させ、各ラウンドは `SparseScored::top`（新設）で
+その候補集合から前方一致な Top-k を切り出す方式へ変更した。
+
+- `sparse.rs::score_pass`（新設・private）: `score_by_postings` から
+  「posting 走査によるスコアアキュムレータ（`acc: Vec<f64>`）・タッチ済み
+  `doc_idx` 列（`touched`）の構築」部分を切り出した共通コア。`score_by_
+  postings`（`search`/`search_within` が使う 1 回限りの Top-k 選出）・
+  `score_within`（新設）の両方がこれを共有する
+- `sparse.rs::SparseScored`（新設・公開型）: `score_within` が返すスコア
+  済み候補集合。`top(k)` は `candidates` の先頭 `sorted_len` 件が
+  `Candidate` の全順序（スコア降順・同点 `doc_id` 昇順）で確定済みという
+  不変条件を保ちながら、未整列の尾部だけを `select_nth_unstable_by`＋
+  `sort_unstable_by` で段階的に整列する（`TopKSelector` と同じ選出方式・
+  同じ sort-determinism マーカー運用）。前方一致・冪等性はこの構造その
+  ものから導かれる（同一の候補配列から切り出すため）
+- `sparse.rs::score_within`（新設・公開）: 入力検証・空結果ケース・RLS
+  相当のテナント境界縮約契約（統計母数・候補選出を可視集合へ限定し、
+  インデックス全体の統計を参照しない）は `search_within` と同一。`k` を
+  受け取らず `SparseScored` を返す点のみが異なる
+- `hybrid.rs::sparse_refetch_loop`: ループ前に `score_within` を 1 回呼び、
+  ループ内の `search_within` 呼び出しを `SparseScored::top` へ置換。
+  `fetch_k` のスケジュール（`record_fetch_k` の列）・`TooManyCandidates`
+  長さ検証・`validate_extended_pool`・`exhaustive` 判定・
+  `resolve_boundary_tie_group`／`exclude_undetermined_boundary_group`・
+  `MAX_FETCH_K` はいずれも 1 行も変更していない。密側再取得ループ・
+  `complete_boundary_tie_group(_by)` も無変更
+
+`SparseIndex` の既存公開 API（`build`/`with_params`/`search`/
+`search_within`/`approx_heap_bytes`）シグネチャは無変更。新規公開面は
+`SparseScored`・`score_within` のみの追加であり、既存呼び出し元
+（`tests/hybrid.rs` の独立オラクル等）は `search_within` を使い続けられる。
+
+### 受け入れ条件（等価性）の検証
+
+`crates/engine/src/sparse.rs` 内の単体テストに以下を追加し、いずれも green
+であることを確認した。
+
+- `score_within_top_is_bit_identical_to_search_within_on_mixed_corpus`
+  （2,000 件規模の混成コーパス・複数クエリ・`k ∈ {1, 5, 20, 100, M/2, M,
+  M+1}` と疎側再取得ループの倍増スケジュール相当の値で `score_within(q,
+  vis).top(k)` と `search_within(q, k, vis)` がビット一致）
+- `sparse_scored_top_is_prefix_consistent_and_idempotent`（前方一致・冪等
+  性・`k > M` での頭打ちを固定）
+- `sparse_scored_top_k_zero_and_empty_scored_return_empty`
+- `score_within_input_validation_precedes_empty_cases`（`QueryTooLong`・
+  `TooManyQueryTerms` が空可視集合より優先する契約が `search_within` と
+  同一であることの回帰）
+- `score_within_statistics_are_isolated_from_invisible_docs`（RLS 縮約契約
+  の回帰。`search_within_statistics_are_isolated_from_invisible_docs` と
+  同型のシナリオを `score_within` で固定）
+
+`crates/engine/src/hybrid.rs` 内の単体テストに以下を追加した。
+
+- `sparse_refetch_loop_matches_per_round_search_within_oracle`: 本 Issue
+  導入前の実装（各ラウンドで `search_within` を呼び直す）をテスト内に
+  独立再実装したオラクルと、現行の `sparse_refetch_loop` が通常コーパス・
+  全件同点コーパス・境界同点コーパス（`hybrid_search_boosted_sparse_
+  tie_group_across_pool_boundary_is_id_independent` と同型）の 3 種で
+  `(hits, sparse_limit)` を完全一致で返すことを固定
+
+既存テスト（`tests/hybrid.rs` の独立オラクル、`tests/hybrid_recall.rs` 層 A
+固定値、`tests/sparse_cache_recall.rs` cold/hot 等価性、
+`tests/hybrid_profile_accept.rs`〔`--features bench-internals`〕、
+`tests/soft_boost.rs`・`tests/plan_rls_boost.rs`）はすべて無変更で green の
+まま（等価性契約により構造的に不変）。
+
+### 実測
+
+本開発環境（非専有・並行エージェントあり）で `make bench-hybrid-profile`・
+`make bench-hybrid` を before（`origin/main` 9fd5afe。本 Issue の変更を含ま
+ない）・after（本 Issue の変更を適用した状態）それぞれ 1 回ずつ実行した
+（25,000 件規模コーパス・`fetch_k` 倍増スケジュールは同一〔400→800→…→25000。
+7 ラウンド〕）。
+
+| 指標 | before | after |
+| ---- | -----: | ----: |
+| `hybrid_search_cached_index`（実 hybrid 経路。cached index）p95 | 11,601µs | 6,320µs |
+| `hybrid_search_cached_index` median | 11,020µs | 5,571µs |
+| 疎側再取得ループ累積コスト median | 6,416µs（推定） | 3,427µs（実測） |
+
+疎側再取得ループ累積コストは before/after で測定方法が異なる点に注意
+（本 Issue によりベンチ側の計測手段自体が変わったため）: before は
+`sparse_refetch_summary` の `estimated_cumulative_mixed_median_us`
+（各ラウンドの `search_within` 単体実測 median を実スケジュールに沿って
+合算した推定値。旧実装では疎側再取得ループそのものを直接計測する手段が
+無かった）、after は `sparse_refetch_loop`（`sparse_refetch_observed` に
+よる、疎側再取得ループ本体そのものの実測値）。
+
+`hybrid_search_cached_index`（実際に production が通る hybrid 検索経路
+そのもの）は median で約 1.98 倍（11,020µs → 5,571µs）短縮した。疎側再取得
+ループの累積コストも約 1.87 倍（6,416µs → 3,427µs）縮小しており、
+`hybrid_search_cached_index` の短縮幅の大半をこの疎側最適化が占める
+（密側再取得ループ・`complete_boundary_tie_group` は無変更のため寄与しない）。
+
+`make bench-hybrid`（Issue #324・同点誘発コーパス〔m=6,400 規模〕での A/B）
+は次の通り、非劣化を確認した（本ベンチのコーパス規模は
+`bench-hybrid-profile` の 25,000 件より小さく、`acc: Vec<f64>` の `O(N)`
+再確保削減の絶対効果が相対的に小さいため、この規模では改善幅が測定ノイズと
+同程度に留まる。CORE-7 は `hybrid_search` を通らないため測定経路として
+本変更の影響を受けない）。
+
+| 指標 | before | after |
+| ---- | -----: | ----: |
+| `large_tie_refetch` p95 | 6,292µs | 6,800µs |
+| `large_tie_refetch` median | 5,467µs | 5,393µs |
+| `large_no_refetch` p95 | 872µs | 1,361µs |
+| `large_no_refetch` median | 823µs | 846µs |
+
+`large_no_refetch`（再取得ループを 1 ラウンドで終える経路。本 Issue が変更
+した再取得ループのコード自体は通るが `score_within`→`top` 1 回のみで
+旧実装の `search_within` 1 回呼び出しと理論上ほぼ等価）の差分は non-tie 系
+の実行に対する測定環境（非専有）のノイズの範囲と判断する。
+
+### 受け入れ条件との対応
+
+1. §「受け入れ条件（等価性）の検証」参照。決定的フィクスチャで融合結果・
+   境界同点グループが導入前と一致することを機械検証した（不一致は
+   検出されなかった）
+2. `make bench-hybrid`（同点誘発コーパス側 `*_tie_refetch` 段）は非劣化
+   （§「実測」参照。改善方向のシグナルは `bench-hybrid-profile`〔25,000 件
+   規模〕側でより明確に確認できた）
+3. Recall 層 A は green のまま不変（等価性契約により構造的に不変）。層 B
+   （`recall.yml`。environment `recall-gate` の secrets 閾値）はローカルで
+   実行できないため、マージ後の `workflow_dispatch` 実測は引き続き管理者
+   作業として申し送る
+
+### 申し送り
+
+- 密側再取得ループの同種最適化は本 Issue のスコープ外（Issue 本文どおり）
+- クエリ単位で残る `acc: Vec<f64>` の `O(N)` 確保 1 回（呼び出し間バッファ
+  再利用は `&self`（非 `&mut self`）シグネチャ変更を要するため別途）
+- posting の CSR 化・圧縮は引き続き #394 の判断材料
+- 専有環境での再実測・層 B `recall.yml` の実測は引き続きオーナー／管理者
+  作業
+
+## Issue #394: Phase 1 通し前後比較へのポインタ
+
+本ドキュメントの各節（#387〜#392）はサブ Issue 単位の隣接差分実測である。
+Phase 1 全体（`8bfaaa4`〔#388 直前〕→ 導入後）を通した設計判断の集約・
+`feature_bench` 13 フェーズの前後比較・`bench-hybrid-profile` 段別の通し
+前後比較・外部実装（tantivy・qdrant）参照の整理は
+`docs/design/sparse-inverted-index.md`（Issue #394）に記録した。数値の
+二重管理を避けるため、本ドキュメントへの転記はしない。
