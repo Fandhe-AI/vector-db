@@ -5,7 +5,7 @@
 //! 差し替え可能なインターフェース越しに呼び出す」という差し替え点は、独立の trait 階層を
 //! 新設せず CORE-13 の provider 注入機構（`SearchProvider` trait・TASK-124 実装済み）へ
 //! 一本化する。将来の ANN 実装は本モジュールの [`SearchEngineKind`] に選択肢を追加し、
-//! 新しい `SearchProvider` 実装を返す分岐を [`build`] に加えるだけで、`core.rs` 側の
+//! 新しい `SearchProvider` 実装を返す分岐を [`build_unchecked`] に加えるだけで、`core.rs` 側の
 //! コア API（`EngineCore`／`VectorCore`）を変更せずに追加できる。
 //!
 //! エンジンの選択はコード上の明示指定（[`SearchEngineKind`] の値）のみで決まる。
@@ -41,25 +41,26 @@
 //! 公開モジュール（`lib.rs::pub mod hnsw`）であるために本モジュールを経由せず直接
 //! 到達しうる [`crate::hnsw::provider::HnswSearchProvider::new`] 自身の検証でも
 //! 二重に維持する（codex-review P1 指摘・Issue #407 追記。`hnsw/provider.rs`
-//! モジュールドキュメント参照）。infallible な [`build`] 自体は `pub(crate)` に留め、
-//! 外部呼び出し元は必ず検証を行う [`build_validated`] を経由する。
+//! モジュールドキュメント参照）。infallible な [`build_unchecked`] 自体は `pub(crate)`
+//! に留め、crate 外からエラーを観測したい呼び出し元は必ず検証を行う
+//! [`build_validated`] を経由する（公開の [`build`] は互換ラッパー。次節参照）。
 //!
-//! ## 破壊的変更（`build` の公開性・codex-review P1 指摘・Issue #407 追記）
+//! ## 公開 `build` API の互換維持（codex-review P1 指摘・Issue #407 追記）
 //!
-//! `build` は本 Issue 以前（`main`）では `pub fn` だった。`SearchEngineKind::Hnsw`
-//! 追加に伴い `pub(crate)` へ縮小したのは意図的な破壊的変更であり、互換ラッパーとして
-//! 旧シグネチャの `pub fn build` を残す選択肢は採らない: `build` は infallible な
-//! 契約（呼び出し元が事前検証済みの値を渡す前提）を保つ設計であり、`pub` のまま
-//! 残すと外部呼び出し元が未検証の `HnswParams` を直接 `SearchEngineKind::Hnsw` へ
-//! 詰めて渡せてしまい、`HnswSearchProvider::new` の検証を経ない構築経路（かつては
-//! `.expect(...)` によるパニックへ帰結しうる経路だった）を公開 API として残すことに
-//! なる。ライブラリ利用側の untrusted な設定値がプロセスパニックへ直結する互換ラッパーは
-//! `.claude/rules/coding-rust.md`（`unwrap`/`expect` を受信データ経路で禁止する方針）の
-//! 精神に反するため、`build` を非公開化し `Result` を返す [`build_validated`] のみを
-//! crate 外 API として残す方を選んだ。この破壊的変更は本 Issue（#407）のスコープ内
-//! （既存 spec ビヘイビア ID に対応する変更ではなく、本 Issue で新設する opt-in API の
-//! 一部）であり、`docs/design/hnsw-search-engine-wiring.md`「変更履歴」節に対応する
-//! 記録を残す。
+//! `SearchEngineKind::Hnsw` 追加に伴い、旧 `main` の `pub fn build(SearchEngineKind)
+//! -> Box<dyn SearchProvider>` を一度 `pub(crate)` へ縮小する案を検討したが、AGENTS.md
+//! 「公開 API・エラー契約の互換性（P1）」（公開 API の破壊的変更は spec 側の対応する
+//! 定義変更と対にする規約）に抵触するため、破壊的変更を伴わない方式へ変更した:
+//! infallible な内部実装は [`build_unchecked`]（`pub(crate)`。呼び出し元が事前検証済みの
+//! 値を渡す前提）へ改称のうえ非公開化し、旧シグネチャそのままの [`build`] を公開
+//! 互換ラッパーとして維持する。[`build`] は未検証の `HnswParams` を渡された場合でも
+//! `HnswSearchProvider::new` の検証を経ない構築（かつて `.expect(...)` によるパニックへ
+//! 帰結しうる経路だった）はせず、[`build_validated`] を内部で呼び、拒否された値は
+//! [`default_kind`]（[`SearchEngineKind::ParallelBruteForce`]）へ fail-closed に
+//! フォールバックする。これにより `.claude/rules/coding-rust.md`（`unwrap`/`expect` を
+//! 受信データ経路で禁止する方針）を満たしつつ、外部呼び出し元の既存コンパイルを壊さない。
+//! エラーを観測したい新規呼び出し元は [`build_validated`] を使うこと。詳細・経緯は
+//! `docs/design/hnsw-search-engine-wiring.md`「変更履歴」節参照。
 
 use crate::hnsw::provider::HnswSearchProvider;
 use crate::hnsw::HnswParams;
@@ -137,37 +138,36 @@ impl fmt::Display for SearchEngineKind {
     }
 }
 
-/// `kind` に対応する `SearchProvider` 実装を構築する（crate 内部専用）。
+/// `kind` に対応する `SearchProvider` 実装を構築する（crate 内部専用・infallible）。
 ///
-/// `Hnsw` の `HnswParams` は事前検証済みであることを呼び出し元が保証する契約
-/// （本関数は infallible）。この契約を型で強制するため公開 API からは外し
-/// `pub(crate)` に限定する（codex-review P1 指摘・Issue #407 追記: 本関数が
-/// `pub` のままだと、`SearchEngineKind::Hnsw(HnswParams)` も `pub` である以上、
-/// 外部 crate が未検証の `HnswParams` を直接 `build` へ渡して不正値を保持した
-/// provider を構築できてしまい、モジュールドキュメントの「不正値は到達しない」
-/// 契約と矛盾する）。untrusted な文字列・設定値から `SearchEngineKind::Hnsw` を
-/// 組み立てる経路（`core.rs::EngineCore::open_with_engine` 等）を含め、crate 外から
-/// provider を構築する唯一の経路は必ず検証を行う [`build_validated`] とする。
+/// `Hnsw` の `HnswParams` は事前検証済みであることを呼び出し元が保証する契約。
+/// この契約を型で強制するため `pub(crate)` に限定し、`build_unchecked` という
+/// 関数名で「未検証の値を渡してはいけない」ことを明示する（codex-review P1 指摘・
+/// Issue #407 追記の経緯で旧 `build` から改称。旧 `pub fn build` の互換シグネチャは
+/// 下記 [`build`]（公開・fail-closed フォールバック版）が引き継ぐ）。untrusted な
+/// 文字列・設定値から `SearchEngineKind::Hnsw` を組み立てる経路
+/// （`core.rs::EngineCore::open_with_engine` 等）を含め、crate 外から検証済みの
+/// provider を構築する経路は必ず [`build_validated`] を使う。
 ///
 /// 呼び出し元（`core.rs::EngineCore::open` 等）はここで返る `Box<dyn SearchProvider>` を
 /// そのまま `EngineCore::with_provider` へ渡す想定（object-safe な trait のため
 /// ジェネリクスなしで受け渡しできる）。
-fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
+fn build_unchecked(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     match kind {
         SearchEngineKind::CpuScalarBruteForce => Box::new(CpuScalarProvider),
         SearchEngineKind::ParallelBruteForce => Box::new(ParallelSearchProvider),
         SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params).expect(
-            "build() の Hnsw 分岐は build_validated 経由でのみ到達し、その時点で params は検証済み",
+            "build_unchecked() の Hnsw 分岐は build_validated 経由でのみ到達し、その時点で params は検証済み",
         )),
     }
 }
 
-/// [`build`] の検証付き版。`kind` が `Hnsw(params)` の場合のみ
+/// [`build_unchecked`] の検証付き版。`kind` が `Hnsw(params)` の場合のみ
 /// [`HnswParams::validate`] を通し、失敗を [`SearchEngineError`] として fail-closed に
 /// 返す（`Hnsw` 以外の variant は現時点で検証すべきパラメータを持たないため常に成功）。
-/// 非公開の [`build`] を crate 外から呼ぶ唯一の経路であり、`SearchEngineKind` から
-/// `Box<dyn SearchProvider>` を得る公開 API はこの関数のみ（[`default_engine`] は
-/// 常に検証を要さない [`default_kind`] を経由するため対象外）。
+/// 新規呼び出し元が `SearchEngineKind` から `Box<dyn SearchProvider>` を得る際に
+/// 推奨する経路（[`default_engine`] は常に検証を要さない [`default_kind`] を経由する
+/// ため対象外）。
 ///
 /// `core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`
 /// （Issue #407 で追加）が唯一の呼び出し元で、不正な `HnswParams` を持つ
@@ -180,7 +180,24 @@ pub fn build_validated(
             .validate()
             .map_err(SearchEngineError::InvalidHnswParams)?;
     }
-    Ok(build(kind))
+    Ok(build_unchecked(kind))
+}
+
+/// 旧 `pub fn build(SearchEngineKind) -> Box<dyn SearchProvider>`（本 Issue 以前の
+/// `main` 時点の公開 API）と同一シグネチャを保つ互換ラッパー
+/// （codex-review P1 指摘・Issue #407 追記への対応。AGENTS.md「公開 API・エラー契約の
+/// 互換性（P1）」を満たすため、公開 API の破壊的変更を伴わない形へ変更した）。
+///
+/// `SearchEngineKind::Hnsw(HnswParams)` も公開のため、外部 crate は未検証の
+/// `HnswParams` を直接本関数へ渡しうる。旧 API はエラーを返せない infallible 契約
+/// だったため、[`HnswParams::validate`] が拒否する値を渡された場合に
+/// `.unwrap`/`.expect` でパニックさせる互換ラッパーは選ばず（受信データ経路での
+/// `unwrap`/`expect` 禁止方針・`.claude/rules/coding-rust.md`）、[`default_kind`]
+/// （[`SearchEngineKind::ParallelBruteForce`]）へ fail-closed にフォールバックし
+/// infallible 契約を維持する。呼び出し元がエラーを観測したい場合は
+/// [`build_validated`] を使うこと。
+pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
+    build_validated(kind).unwrap_or_else(|_| build_unchecked(default_kind()))
 }
 
 /// 既定の検索エンジン種別（`ParallelBruteForce`）。[`EngineCore::open`]
@@ -197,7 +214,7 @@ pub fn default_kind() -> SearchEngineKind {
 /// `ParallelSearchProvider` を直接生成していたときと同一で、性能・結果の回帰は
 /// 発生しない。
 pub fn default_engine() -> Box<dyn SearchProvider> {
-    build(default_kind())
+    build_unchecked(default_kind())
 }
 
 #[cfg(test)]
@@ -224,6 +241,33 @@ mod tests {
     fn hnsw_default_params_pass_validation() {
         assert!(HnswParams::default().validate().is_ok());
         assert!(build_validated(SearchEngineKind::Hnsw(HnswParams::default())).is_ok());
+    }
+
+    // 公開互換ラッパー `build` の回帰（codex-review P1 指摘・Issue #407 追記）。
+    // 旧 `main` の `pub fn build(SearchEngineKind) -> Box<dyn SearchProvider>` と
+    // 同一シグネチャで呼べる（コンパイル可能性そのものが外部呼び出し元との互換性の
+    // 証跡）ことに加え、未検証の不正 `HnswParams` を渡してもパニックせず
+    // fail-closed に `default_kind`（`ParallelBruteForce`）へフォールバックすることを
+    // 固定する。
+    #[test]
+    fn build_compat_wrapper_falls_back_on_invalid_hnsw_params_without_panicking() {
+        let invalid_params = HnswParams {
+            m: 0,
+            ..HnswParams::default()
+        };
+        assert!(invalid_params.validate().is_err());
+
+        // `build`（旧公開シグネチャ）は infallible な戻り値契約を維持したまま、
+        // パニックせずに何らかの `SearchProvider` を返す。
+        let _provider: Box<dyn SearchProvider> = build(SearchEngineKind::Hnsw(invalid_params));
+    }
+
+    // 有効な `Hnsw` パラメータでは `build` が `build_validated` と同じ経路を通り、
+    // Hnsw provider を構築できることの回帰。
+    #[test]
+    fn build_compat_wrapper_accepts_valid_hnsw_params() {
+        let _provider: Box<dyn SearchProvider> =
+            build(SearchEngineKind::Hnsw(HnswParams::default()));
     }
 
     #[test]
