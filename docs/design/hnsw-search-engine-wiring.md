@@ -38,10 +38,13 @@ infallible のまま維持し、不正パラメータの拒否は呼び出し境
 呼び出し規約で表現する:
 
 ```rust
-pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // infallible
+fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
 pub fn build_validated(kind: SearchEngineKind)
     -> Result<Box<dyn SearchProvider>, SearchEngineError>; // Hnsw のみ validate() を通す
 ```
+
+（`build` の可視性は初版実装から `pub(crate)` へ変更されている。経緯は
+「変更履歴」節参照）
 
 `build` を直接呼ぶ経路（`default_engine`・既存の `SearchEngineKind::build`
 呼び出しテスト）は不正値を作れない値（`CpuScalarBruteForce`／
@@ -59,34 +62,35 @@ CLI・`EXPLAIN`）はいずれも本 Issue のスコープ外であり、実装�
 `Display` のみを実装した。`FromStr` は呼び出し元が実際にできる #411 以降で
 必要になれば追加する。
 
-### `SearchEngineError` と `22023`
+### `SearchEngineError`
 
 ```rust
 #[non_exhaustive]
 pub enum SearchEngineError {
     InvalidHnswParams(crate::hnsw::HnswError),
 }
-pub const INVALID_ENGINE_SPEC_WIRE_CODE: &str = "22023";
 ```
 
-`22023` は TASK-101（RECOVER-10）が既に `error_format::ErrorClass::
+`wire_code()`（SQLSTATE 風コード `22023` を返す案）は導入していない。`22023` は
+TASK-101（RECOVER-10）が既に `error_format::ErrorClass::
 OperationIdContentMismatch` として ERR-2 表へ登録済みのコードであり、ERR-2 の
 「分類 ⇔ `wire_code` 一意対応」契約（`wire_codes_are_pairwise_distinct` テスト）
 を壊さずに本 variant 専用の新分類を `ErrorClass` へ追加することはできない。
 本 Issue は wire／SQL 表層への露出を持たない（`build_validated` の呼び出し元は
 `core.rs` の 2 関数のみ）ため、`ErrorClass` への正式登録・`error_response.rs`
-への伝播は spec 側のビヘイビア ID 確定後の別タスクへ申し送る。単体テストで
-`ErrorClass::from_wire_code(err.wire_code()).is_some()` を固定し、返す文字列が
-ERR-2 表の既存の既知コードであることだけを保証する。
+への伝播・`wire_code()` の追加は spec 側のビヘイビア ID 確定後の別タスクへ
+申し送る（経緯は「変更履歴」節参照）。
 
 ### `HnswSearchProvider`（`hnsw/provider.rs`）: 全件 brute-force フォールバック
 
 ```rust
 pub struct HnswSearchProvider { /* private: HnswParams, ParallelSearchProvider */ }
 impl HnswSearchProvider {
-    pub fn new(params: HnswParams) -> Self;      // infallible（検証済み値を想定）
+    pub fn new(params: HnswParams) -> Result<Self, crate::hnsw::HnswError>; // 自身で validate
     pub fn params(&self) -> HnswParams;
-    pub fn effective_ef(&self, k: usize) -> usize; // ef_search.max(k).min(MAX_EF)
+    pub fn effective_ef(&self, k: usize) -> usize; // ef_search.max(k).min(MAX_EF)。
+    // k 自体はクランプしない — untrusted な k の上限保証は
+    // HnswIndex::search 自身の k > MAX_EF fail-closed 検証が担う（「変更履歴」節参照）。
 }
 impl SearchProvider for HnswSearchProvider {
     fn search(&self, input: SearchInput<'_>) -> Result<Vec<CandidateHit>, KernelError> {
@@ -157,9 +161,17 @@ self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、u
   `crates/engine/tests/hnsw_provider.rs`（クレート外部公開 API のみで検証）の
   双方で固定
 
-## 追記（codex-review P1 対応・PR #433）
+## 変更履歴
 
-初版実装（上記「設計」節）には 2 件の P1 指摘があり、いずれも対応済み。
+上記「設計」節は最終実装の状態を記す（初版実装からの差分を含めて反映済み）。
+本節は初版実装（Issue #407 初回 PR）からの変更点と、その理由をレビュー対応の
+記録として残す（コード例は最終実装で上書きされているため、本節のコード例は
+あくまで「そのラウンド時点での変更差分」の記録であり、最終シグネチャは
+「設計」節を参照する）。
+
+### codex-review P1 対応（PR #433 初回ラウンド）
+
+初版実装には 2 件の P1 指摘があり、いずれも対応済み。
 
 1. **`build` の公開性**: `SearchEngineKind::Hnsw(HnswParams)` が `pub` である
    以上、`build(kind)` も `pub` のままだと外部 crate が未検証の `HnswParams`
@@ -184,26 +196,60 @@ self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、u
    `ErrorClass` 登録は spec 側のビヘイビア ID 確定後の別タスクへ申し送る
    （変更なし）。
 
-対応後の公開シグネチャ:
+対応後の公開シグネチャは「設計」節参照。
 
-```rust
-// search_engine.rs（build は pub(crate)。build_validated のみ crate 外から呼べる）
-fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
-pub fn build_validated(kind: SearchEngineKind)
-    -> Result<Box<dyn SearchProvider>, SearchEngineError>;
+### `build` の可視性変更は正式な破壊的変更（codex-review P1 指摘・PR #433 2 巡目）
 
-pub enum SearchEngineError {
-    InvalidHnswParams(crate::hnsw::HnswError),
-    // wire_code() は持たない（上記 3.）
-}
+上記 1. で `build` を `pub` → `pub(crate)` へ変更した際、互換ラッパー
+（旧シグネチャの `pub fn build` を残す）か正式な破壊的変更としての告知かの
+どちらも行っていなかった（`main` では `build` は `pub fn` であり、`SearchEngineKind::
+Hnsw` 追加以前から存在する非 Hnsw 用途の呼び出し元にも影響しうる可視性変更
+だった）。
 
-// hnsw/provider.rs
-impl HnswSearchProvider {
-    pub fn new(params: HnswParams) -> Result<Self, crate::hnsw::HnswError>; // 自身で validate
-    pub fn params(&self) -> HnswParams;
-    pub fn effective_ef(&self, k: usize) -> usize;
-}
-```
+互換ラッパーは採らない: `build` は「呼び出し元が事前検証済みの値を渡す」
+ことを前提にした infallible 契約であり、`pub` のまま残すと外部呼び出し元が
+未検証の `HnswParams` を直接 `SearchEngineKind::Hnsw` へ詰めて渡せてしまい、
+`HnswSearchProvider::new` の検証を経ない構築経路（`.expect(...)` によるパニックへ
+帰結しうる経路）を公開 API として残すことになる。`.claude/rules/coding-rust.md`
+の「受信データ経路での `unwrap`/`expect` 禁止」の精神に反するため、正式な
+破壊的変更として次のとおり確定した:
+
+- `search_engine.rs` モジュールドキュメントへ「破壊的変更（`build` の公開性）」
+  節を追加し、変更理由と互換ラッパーを採らない判断を明記した
+  （`crates/engine/src/search_engine.rs` 冒頭）
+- 本 Issue（#407）が新設する opt-in API（`SearchEngineKind::Hnsw`・
+  `build_validated`・`open_with_engine`／`from_storage_with_engine`）の一部として
+  行う変更であり、既存 spec ビヘイビア ID に対応する変更ではない
+  （`build` 自体はビヘイビア定義を持たない実装内部の構築関数のため）
+- `crates/engine/api/core_api.snapshot`（`scripts/check_core_api.sh`）の追跡対象は
+  `VectorCore`／`SearchProvider` trait とその参照型に限られ `search_engine::build`
+  のような自由関数は対象外のため、本スナップショットの更新は不要（対象範囲は
+  `scripts/check_core_api.sh` 冒頭コメント参照）
+
+### `HnswSearchProvider::effective_ef` の契約訂正（codex-review P2 指摘・PR #433 2 巡目）
+
+`effective_ef` のドキュメンテーションコメントは「untrusted な `k` が `MAX_EF`
+を超えて索引側へ渡らないようにクランプする」と記していたが、実装は
+`self.params.ef_search.max(k).min(MAX_EF)`——**`ef_search`（構築時パラメータ）
+側を `MAX_EF` へクランプするだけで `k` 自体には触れない**。`#408` の契約どおり
+`HnswIndex::search(query, k, self.effective_ef(k), scratch)` と呼ぶと、
+`HnswIndex::search` 内部で `ef.max(k)` が計算され、`effective_ef` が返した
+クランプ済み `ef` は `k` が大きければ再び `k` まで戻る。
+
+ただし `HnswIndex::search` は `ef.max(k)` を計算する**前**に `k > MAX_EF` を
+fail-closed で拒否する（`hnsw.rs::HnswIndex::search` 既存実装）ため、
+untrusted な `k` に対する実際の上限保証はこの拒否が担っており、現状の呼び出し
+経路（#408 未実装のため本 Issue 時点では到達しない）でも資源消費上の実害はない。
+ただし `effective_ef` のドキュメンテーションコメントが実装しない契約を主張して
+いた点は誤りのため、次のとおり訂正した:
+
+- `effective_ef` は「`ef_search` を `MAX_EF` へクランプするだけで `k` には触れない」
+  ことを明記
+- untrusted な `k` の上限保証は `HnswIndex::search` 自身の `k > MAX_EF` 検証が担う
+  ことを明記し、`effective_ef` 側の記述と重複しない形で「設計」節・
+  `hnsw/provider.rs` モジュールドキュメントへ反映
+- production コードの挙動（クランプ計算式）自体は変更していない
+  （ドキュメンテーションコメントのみの訂正）
 
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 

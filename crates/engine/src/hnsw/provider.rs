@@ -27,7 +27,10 @@
 //!    `HnswIndex::search(query, k, self.effective_ef(k), scratch)` の形で呼び、
 //!    [`HnswSearchScratch`](crate::hnsw::HnswSearchScratch) は呼び出しスレッドごとに
 //!    呼び出し元が所有する（`hnsw.rs` モジュールドキュメント「ベクトルの所有方針」・
-//!    `docs/design/hnsw-search.md` の申し送りを踏襲）。
+//!    `docs/design/hnsw-search.md` の申し送りを踏襲）。untrusted な `k` の上限保証は
+//!    [`HnswSearchProvider::effective_ef`] ではなく `HnswIndex::search` 自身の
+//!    `k > MAX_EF` fail-closed 検証が担う（[`HnswSearchProvider::effective_ef`] の
+//!    ドキュメンテーションコメント参照。codex-review P2 指摘・Issue #407 追記）。
 //! 3. 索引側 hit と brute-force 側（未索引分）hit の Top-k マージは、
 //!    `kernel.rs::TopKSelector` と同じ順序規約（スコア `total_cmp` 降順・同点 id
 //!    昇順）を保った安定マージで行う（`sort_unstable` 系は
@@ -72,12 +75,24 @@ impl HnswSearchProvider {
         self.params
     }
 
-    /// `k` 件の Top-k を得るために使う実効 `ef`（探索候補幅）。
+    /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値
+    /// （構築時 `params.ef_search` の [`MAX_EF`] クランプ。codex-review P2 指摘・
+    /// Issue #407 追記で契約を訂正）。
     ///
-    /// `HnswIndex::search` 自身も `ef.max(k)` へ引き上げる（`hnsw.rs` 参照）ため、
-    /// 本メソッドの主眼は untrusted な `k`（wire 経由で到達しうる `SearchInput::k`）が
-    /// [`MAX_EF`] を超えて索引側へ渡らないようにクランプすることにある（#408 が
-    /// このメソッドを呼ぶ契約。モジュールドキュメント「seam」節 2. 参照）。
+    /// **本メソッドは `k` をクランプしない**（`k` はそのまま `HnswIndex::search` の
+    /// `k` 引数へ渡る値であり、本メソッドの戻り値はその `k` に一切影響しない）。
+    /// `HnswIndex::search` 自身が `ef.max(k)` へ引き上げるため、本メソッドが返す
+    /// `ef` を [`MAX_EF`] へクランプしても、`k` 自体が [`MAX_EF`] を超えていれば
+    /// 実効 `ef`（`ef.max(k)`）は再び `k` まで戻る——ただしこの経路は
+    /// `HnswIndex::search` 自身の `k > MAX_EF` 検証（`hnsw.rs::HnswIndex::search`
+    /// の実装。`ef.max(k)` を計算する**前**に fail-closed で
+    /// `Err(HnswError::InvalidParams)` を返す）に必ず先に捕まるため到達しない。
+    /// untrusted な `k`（wire 経由で到達しうる `SearchInput::k`）に対する
+    /// 実際の上限保証は本メソッドではなく、この `HnswIndex::search` 側の検証が
+    /// 担う（#408 がこのメソッドを呼ぶ契約。モジュールドキュメント「seam」節 2.
+    /// 参照。本メソッドの役割は構築時パラメータ `ef_search` 側の異常値
+    /// （untrusted 入力ではない `HnswParams::validate` 済みの構成値）を
+    /// [`MAX_EF`] 内へ収めることに限られる）。
     pub fn effective_ef(&self, k: usize) -> usize {
         self.params.ef_search.max(k).min(MAX_EF)
     }

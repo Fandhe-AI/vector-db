@@ -43,6 +43,23 @@
 //! 二重に維持する（codex-review P1 指摘・Issue #407 追記。`hnsw/provider.rs`
 //! モジュールドキュメント参照）。infallible な [`build`] 自体は `pub(crate)` に留め、
 //! 外部呼び出し元は必ず検証を行う [`build_validated`] を経由する。
+//!
+//! ## 破壊的変更（`build` の公開性・codex-review P1 指摘・Issue #407 追記）
+//!
+//! `build` は本 Issue 以前（`main`）では `pub fn` だった。`SearchEngineKind::Hnsw`
+//! 追加に伴い `pub(crate)` へ縮小したのは意図的な破壊的変更であり、互換ラッパーとして
+//! 旧シグネチャの `pub fn build` を残す選択肢は採らない: `build` は infallible な
+//! 契約（呼び出し元が事前検証済みの値を渡す前提）を保つ設計であり、`pub` のまま
+//! 残すと外部呼び出し元が未検証の `HnswParams` を直接 `SearchEngineKind::Hnsw` へ
+//! 詰めて渡せてしまい、`HnswSearchProvider::new` の検証を経ない構築経路（かつては
+//! `.expect(...)` によるパニックへ帰結しうる経路だった）を公開 API として残すことに
+//! なる。ライブラリ利用側の untrusted な設定値がプロセスパニックへ直結する互換ラッパーは
+//! `.claude/rules/coding-rust.md`（`unwrap`/`expect` を受信データ経路で禁止する方針）の
+//! 精神に反するため、`build` を非公開化し `Result` を返す [`build_validated`] のみを
+//! crate 外 API として残す方を選んだ。この破壊的変更は本 Issue（#407）のスコープ内
+//! （既存 spec ビヘイビア ID に対応する変更ではなく、本 Issue で新設する opt-in API の
+//! 一部）であり、`docs/design/hnsw-search-engine-wiring.md`「変更履歴」節に対応する
+//! 記録を残す。
 
 use crate::hnsw::provider::HnswSearchProvider;
 use crate::hnsw::HnswParams;
