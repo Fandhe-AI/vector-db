@@ -299,3 +299,15 @@ test = false
 name = "hnsw_build_bench"
 harness = false
 test = false
+
+[[bench]]
+# HNSW 構築の並列化（Issue #406・親 #402）の受け入れ条件 (b): 100k 点で構築
+# 時間がスレッド数に応じて短縮することを記録する実測入口。
+# `engine::hnsw::HnswIndex::build_with_threads` をスレッド数ラダーで計測し、
+# `speedup = median(1) / median(threads)` を出す。spec 由来の pass/fail 閾値は
+# 持たない情報提供専用ベンチのため `.github/workflows/*` へは配線しない。
+# harness = false / test = false は他ベンチと同一方針。`make
+# bench-hnsw-parallel-build`（Makefile）から実行する。
+name = "hnsw_parallel_build_bench"
+harness = false
+test = false

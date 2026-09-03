@@ -7,7 +7,10 @@
 //! 受け入れ条件 (b)（構築計算量が N log N にほぼ従うことの簡易ベンチ確認）は
 //! `benches/hnsw_build_bench.rs`・`tests/hnsw_build_accept.rs` が担う。
 
-use engine::hnsw::{HnswError, HnswIndex, HnswParams, MAX_EF, MAX_HNSW_NODES, MAX_LEVEL, MAX_M};
+use engine::hnsw::{
+    HnswError, HnswIndex, HnswParams, MAX_BUILD_THREADS, MAX_EF, MAX_HNSW_NODES, MAX_LEVEL, MAX_M,
+    SEQUENTIAL_PREFIX_NODES,
+};
 
 /// 決定的シードの xorshift64*（`benches/harness/rng.rs::DeterministicRng` と同
 /// アルゴリズム。結合テストは crate 外の公開 API のみを使う流儀のため、bench
@@ -511,4 +514,157 @@ fn build_rejects_node_count_beyond_max_hnsw_nodes() {
         HnswIndex::build(HnswParams::default(), 1, &vectors, 1),
         Err(HnswError::TooManyNodes { .. })
     ));
+}
+
+/// HNSW 構築の並列化（Issue #406）の不変条件テスト。要素単位 `RwLock`・
+/// エントリポイント更新のみ排他という設計が、逐次構築と同じ次数上限・
+/// 連結性・レベル割当を維持することを検証する（実装計画 §6.2）。
+mod parallel_build_invariants {
+    use super::*;
+
+    /// `n > SEQUENTIAL_PREFIX_NODES` を満たす規模のコーパスを生成する
+    /// （`gen_corpus`／`gen_duplicate_heavy_corpus` はそのまま再利用する）。
+    const PARALLEL_ROWS: usize = SEQUENTIAL_PREFIX_NODES + 800;
+
+    #[test]
+    fn build_with_threads_zero_or_over_max_is_rejected() {
+        let vectors = gen_corpus(1, 4, 10);
+        assert!(matches!(
+            HnswIndex::build_with_threads(HnswParams::default(), 4, &vectors, 1, 0),
+            Err(HnswError::InvalidParams { .. })
+        ));
+        assert!(matches!(
+            HnswIndex::build_with_threads(
+                HnswParams::default(),
+                4,
+                &vectors,
+                1,
+                MAX_BUILD_THREADS + 1
+            ),
+            Err(HnswError::InvalidParams { .. })
+        ));
+    }
+
+    /// 全ノードのレベル割当（`seed` 由来）はスレッド数に依らず不変
+    /// （要件 4）。並列フェーズは挿入順序のみを非決定化し、レベル割当は
+    /// 並列フェーズ開始前に逐次確定するため、`threads` を変えてもレベル
+    /// 列は完全一致する。
+    #[test]
+    fn levels_are_invariant_across_thread_counts() {
+        let dim = 8usize;
+        let vectors = gen_corpus(0x5EED_5EED, dim, PARALLEL_ROWS);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let seed = 123u64;
+
+        let seq = HnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
+        for threads in [2usize, 4, 8] {
+            let par =
+                HnswIndex::build_with_threads(params, dim as u32, &vectors, seed, threads).unwrap();
+            assert_eq!(seq.len(), par.len());
+            for node in 0..seq.len() as u32 {
+                assert_eq!(
+                    seq.level_of(node),
+                    par.level_of(node),
+                    "threads={threads} node={node}"
+                );
+            }
+            // `repair_reachability` は `0..=level_of(entry_point)` の層しか
+            // 走査しない（`hnsw.rs::repair_reachability` のドキュメンテーション
+            // コメント参照）ため、並列フェーズのエントリポイント更新競合
+            // （`parallel_build::BuildGraph::try_promote_entry`）が、真の
+            // 最大レベルより低いノードをエントリポイントに残してしまうと、
+            // それより高いレベルのノードが後始末の対象から漏れて到達不能に
+            // なりかねない。全ノードのレベルがエントリポイントのレベルを
+            // 超えないこと（＝エントリポイントが常に真の最大レベルを保持
+            // すること）を明示的に固定する。
+            let max_level = par.max_level().unwrap();
+            for node in 0..par.len() as u32 {
+                assert!(
+                    par.level_of(node).unwrap() <= max_level,
+                    "threads={threads} node={node} level exceeds entry point's max_level"
+                );
+            }
+        }
+    }
+
+    /// `threads = 4` で複数 seed × 複数 `(dim, rows, m)` を構築し、次数上限・
+    /// 自己ループなし・重複なし・隣接先の層整合・エントリポイントからの
+    /// 全層連結性を検証する（CI runner のコア数に依存させないよう `threads`
+    /// は固定値で指定する）。
+    #[test]
+    fn parallel_build_maintains_degree_and_connectivity_invariants() {
+        struct Config {
+            dim: usize,
+            rows: usize,
+            m: usize,
+        }
+        let configs = [
+            Config {
+                dim: 8,
+                rows: SEQUENTIAL_PREFIX_NODES + 300,
+                m: 6,
+            },
+            Config {
+                dim: 16,
+                rows: SEQUENTIAL_PREFIX_NODES + 700,
+                m: 10,
+            },
+        ];
+        for (ci, cfg) in configs.iter().enumerate() {
+            for seed_idx in 0..4u64 {
+                let seed = (0xB0B0_0000_0000_0000u64) ^ ((ci as u64) << 32) ^ seed_idx;
+                let vectors = gen_corpus(seed ^ 0x2222_2222, cfg.dim, cfg.rows);
+                let params = HnswParams {
+                    m: cfg.m,
+                    ef_construction: 48,
+                    ef_search: 24,
+                };
+                let index =
+                    HnswIndex::build_with_threads(params, cfg.dim as u32, &vectors, seed, 4)
+                        .expect("parallel build should succeed");
+                assert_degree_and_wellformed_invariants(&index);
+                assert_fully_connected_from_entry(&index);
+            }
+        }
+    }
+
+    /// 重複ヘビーコーパス（完全同点スコアを誘発）でも並列構築が次数上限・
+    /// 連結性を破らないことを確認する（`tests/hnsw.rs` の逐次版
+    /// `degree_limits_are_respected_on_duplicate_heavy_corpus` の並列版）。
+    #[test]
+    fn parallel_build_on_duplicate_heavy_corpus_maintains_invariants() {
+        let params = HnswParams {
+            m: 6,
+            ef_construction: 32,
+            ef_search: 16,
+        };
+        for seed in 0..4u64 {
+            let vectors = gen_duplicate_heavy_corpus(seed, 12, PARALLEL_ROWS, 5);
+            let index = HnswIndex::build_with_threads(params, 12, &vectors, seed, 4)
+                .expect("parallel build should succeed");
+            assert_degree_and_wellformed_invariants(&index);
+            assert_fully_connected_from_entry(&index);
+        }
+    }
+
+    /// 構築入力に非有限値由来のオーバーフロースコアを混入させた場合、
+    /// 並列ワーカーの `Err` が停止フラグ経由で正しく伝播し、panic せず
+    /// `Err` を返すことを確認する（実装計画 §6.2 の失敗伝播テスト）。
+    #[test]
+    fn parallel_build_propagates_worker_errors_without_panicking() {
+        let dim = 4usize;
+        let big = f32::MAX / 2.0;
+        let rows = SEQUENTIAL_PREFIX_NODES + 100;
+        let vectors: Vec<f32> = (0..rows).flat_map(|_| vec![big; dim]).collect();
+        let err = HnswIndex::build_with_threads(HnswParams::default(), dim as u32, &vectors, 1, 4)
+            .expect_err("overflowing dot product must be rejected even in the parallel path");
+        assert!(
+            matches!(err, HnswError::NonFiniteScore { .. }),
+            "expected NonFiniteScore, got {err:?}"
+        );
+    }
 }
