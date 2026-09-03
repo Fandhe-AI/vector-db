@@ -35,7 +35,7 @@ query-planning）の層 A 固定値アサーションが転置索引化後も不
 | ------ | -------- |
 | `cold_and_hot_hybrid_results_match_under_partial_visibility_and_never_leak_invisible_rows` | RLS 部分可視。4 群（tenant-a Public/Private・tenant-b Public/Private、b-Private はほぼ全語彙対を高密度にカバー）を投入し、2 文脈（Public のみ／自テナント Private も可視）で cold/hot 完全一致・結果が可視集合の部分集合であること・文脈ごとに別キャッシュエントリ（`misses == 2`）になることを検証。さらに **統計縮約オラクル**（不可視行を一切含まない対照 DB で同一クエリを実行し、結果 id 列が完全一致すること）で df・N・avgdl の不可視行からの漏えいが無いことを固定 |
 | `cold_and_hot_hybrid_results_match_for_unknown_terms_only_query` | コーパス語彙に存在しない ASCII トークンのみのクエリ文字列。cold/hot 完全一致・LIMIT 件数を密のみで満たすこと・純密クエリ（`ORDER BY embedding <=> ...`）の Top-20 と完全一致することを検証（疎チャネル無信号時の RRF 単一チャネル縮退が密順位の単調写像になる構造的性質） |
-| `cold_and_hot_hybrid_results_match_for_empty_query_text` | `hybrid_rrf(embedding, '<vec>', body, '')`。実測した契約は `Ok`（密のみ縮退）。cold/hot 完全一致を Ok/Err いずれの分岐でも検証（Err なら `wire_code` 一致まで） |
+| `cold_and_hot_hybrid_results_match_for_empty_query_text` | `hybrid_rrf(embedding, '<vec>', body, '')`。実測した契約は `Ok`（密のみ縮退）。テストは `Ok` を必須契約として `expect` で固定し（`Err` は即座に失敗）、cold/hot 完全一致を検証 |
 
 いずれも `sparse_index_cache_stats()` の `hits`/`misses` を同時にアサートし、
 vacuous pass（結果が偶然一致するだけで実際にはキャッシュ非経由）を防ぐ既存方針
