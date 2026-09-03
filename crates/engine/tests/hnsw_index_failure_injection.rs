@@ -208,8 +208,9 @@ fn build_failure_degrades_to_brute_force_and_recovers_after_poison_removed() {
     let stats1 = core.hnsw_index_cache_stats();
     assert_eq!(stats1.build_failures, 1);
     assert_eq!(
-        stats1.builds, 0,
-        "a failed build must not count as a success"
+        stats1.builds, 1,
+        "builds counts every IndexedBase::build attempt, including failed ones \
+         (Issue #408 codex-review P2 fix: build_failures alone under-reported attempts)"
     );
 
     // 同一世代内の 2 回目の SELECT は再試行しない（負のキャッシュ）。
@@ -219,6 +220,10 @@ fn build_failure_degrades_to_brute_force_and_recovers_after_poison_removed() {
     assert_eq!(
         stats2.build_failures, 1,
         "the same generation must not retry the failed build"
+    );
+    assert_eq!(
+        stats2.builds, 1,
+        "the negative cache must prevent a second build attempt in the same generation"
     );
 
     // 再オープンしても同様（負のキャッシュは EngineCore インスタンスに閉じる
@@ -230,6 +235,10 @@ fn build_failure_degrades_to_brute_force_and_recovers_after_poison_removed() {
     assert_eq!(got3, want);
     let stats3 = core2.hnsw_index_cache_stats();
     assert_eq!(stats3.build_failures, 1);
+    assert_eq!(
+        stats3.builds, 1,
+        "reopening starts a fresh cache instance, so this is its own first (failed) attempt"
+    );
 
     // コミット済み行が欠落・重複なく読めることも確認する（RECOVER-9 系の既存
     // 注入試験と同じ観点）。
@@ -253,8 +262,9 @@ fn build_failure_degrades_to_brute_force_and_recovers_after_poison_removed() {
     );
     let stats4 = core2.hnsw_index_cache_stats();
     assert_eq!(
-        stats4.builds, 1,
-        "the next generation (poison removed) must build the index successfully"
+        stats4.builds, 2,
+        "the next generation (poison removed) must attempt and succeed a build on top of \
+         the earlier failed attempt (1 failed + 1 succeeded)"
     );
     assert_eq!(stats4.build_failures, 1, "no new failures after recovery");
 }

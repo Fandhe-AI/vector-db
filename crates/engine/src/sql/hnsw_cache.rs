@@ -99,7 +99,8 @@ pub struct HnswIndexCacheStats {
     pub hits: u64,
     /// 索引が存在しない・世代が離れすぎている等でミスした回数。
     pub misses: u64,
-    /// `IndexedBase::build`（新規構築・再構築の両方）を呼んだ回数。
+    /// `IndexedBase::build`（新規構築・再構築の両方）を呼んだ回数（成功・失敗を
+    /// 問わず、`search_or_fallback` が構築を試みた時点で計上する）。
     pub builds: u64,
     /// 構築失敗（`HnswError`）でこの世代は brute-force へ縮退した回数。
     pub build_failures: u64,
@@ -467,7 +468,6 @@ impl HnswIndexCache {
     /// SqlArenaCache::insert` と同じ fail-closed 契約）。
     fn record_base(&self, storage: &Storage, table: &str, base: IndexedBase) -> Arc<IndexedBase> {
         let base = Arc::new(base);
-        self.builds.fetch_add(1, Ordering::Relaxed);
         let Ok(mut guard) = self.state.write() else {
             return base;
         };
@@ -707,6 +707,7 @@ pub(crate) fn search_or_fallback(
             else {
                 return full_scan(access.cache);
             };
+            access.cache.builds.fetch_add(1, Ordering::Relaxed);
             match IndexedBase::build(
                 arena,
                 access.provider.params(),
@@ -728,13 +729,14 @@ pub(crate) fn search_or_fallback(
     let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
         return full_scan(access.cache);
     };
-    if base.arena_len_mismatch_guard(arena) {
+    if base.arena_identity_mismatch_guard(arena, ctx) {
         // 呼び出し元の適用条件（フィルタなし DISTANCE）が正しく守られていれば
         // 起こらないはずの不整合。fail-closed に全件へ縮退する。
         return full_scan(access.cache);
     }
     let overlay = Overlay::compute(&base, arena, current_generation);
     if overlay.needs_rebuild(n) {
+        access.cache.builds.fetch_add(1, Ordering::Relaxed);
         match IndexedBase::build(
             arena,
             access.provider.params(),
@@ -777,11 +779,26 @@ pub(crate) fn search_or_fallback(
 }
 
 impl IndexedBase {
-    /// `arena` が本ベースの構築時と同じ長さの世代整合ビューであることの簡易確認
-    /// （`Overlay::compute` は `arena.len()` を走査するため、`base` 自体が別テーブル
-    /// 由来である等の取り違えを事前に弾く防御。通常経路では発生しない）。
-    fn arena_len_mismatch_guard(&self, _arena: &VectorArena) -> bool {
-        false
+    /// `arena`・`ctx` が本ベースの構築時と取り違えられていないことの検証
+    /// （`Overlay::compute` は `arena` の全スロットを本ベースのノードキー・
+    /// 次元と突き合わせて走査するため、`base` 自体が別テーブル・別テナント
+    /// 由来のまま渡された場合に不整合な写像を作ってしまう）。
+    ///
+    /// 実際に検証可能な 2 つの不変条件で判定する（`Ready`/`NeedOverlay` に
+    /// 到達する経路では `lookup` が `(table, ctx)` の完全一致でエントリを
+    /// 選んでいるため通常は発生しないが、fail-closed の最終防御として
+    /// 冗長に確認する。security.md P0「テナント分離の検査を外す/緩める/
+    /// バイパス経路を作らない」）:
+    /// - `self.index.dim()` と `arena.dim()` が一致すること（別テーブル・
+    ///   別次元のアリーナ取り違えを検出する）
+    /// - `self.built_ctx` と `ctx` が一致すること（別テナント・別可視性の
+    ///   `PolicyContext` 取り違えを検出する。`PolicyContext` の `PartialEq`
+    ///   はテナント ID・許可可視性集合の完全一致を要求する）
+    ///
+    /// 一致していれば `false`（検証通過）、いずれか不一致なら `true`
+    /// （呼び出し元は全件 brute-force へ縮退する）を返す。
+    fn arena_identity_mismatch_guard(&self, arena: &VectorArena, ctx: &PolicyContext) -> bool {
+        self.index.dim() != arena.dim() || self.built_ctx != *ctx
     }
 }
 
@@ -876,6 +893,20 @@ fn record_overlay_for(
         // その場の探索にそのまま使ってよい（`search_or_fallback` は
         // `record_overlay_for` の戻り値を見ず、呼び出し元が保持する `overlay` で
         // 続けて `search_with_overlay` を呼ぶ）。
+        //
+        // 常駐させないだけでは終わらせず、`record_base`〔単体超過〕・
+        // `record_build_failed`〔構築失敗〕と同じ負のキャッシュへ「この世代は
+        // キャッシュ不可」と記録する（Bugbot "Oversized overlay skips negative
+        // cache" 指摘対応: 記録を省略すると次回参照が再び `NeedOverlay` となり、
+        // `search_or_fallback` が同一世代内の毎クエリで `Overlay::compute`
+        // 〔delta_slots・delta_vectors の再構築を伴う〕をやり直してしまう）。
+        mark_uncacheable_in_guard(
+            access.cache,
+            &mut guard,
+            table,
+            &base.built_ctx,
+            current_generation,
+        );
         return;
     }
     // 対象エントリが既に overlay を保持している場合（世代進行に伴う再計算等）、
@@ -1502,6 +1533,179 @@ mod tests {
         match cache.lookup(&storage, &read_txn3, "docs", &c) {
             Lookup::Miss => {}
             _ => panic!("世代が進んだ後は再構築を試みられるよう Miss を返すべき"),
+        }
+    }
+
+    #[test]
+    fn arena_identity_mismatch_guard_detects_dim_and_ctx_mismatch() {
+        // codex-review P2 指摘対応（PR #434「アリーナ不整合ガードが常に無効」）:
+        // 旧実装は引数を無視して常に `false` を返し、呼び出し元の fail-closed
+        // 分岐に決して到達しなかった。dim 不一致（別テーブル取り違え）・
+        // `PolicyContext` 不一致（別テナント取り違え）のいずれも検出することを
+        // 固定する。
+        let path = unique_db_path("hnsw-cache-arena-identity-guard");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs4", 4);
+        create_table(&storage, "docs8", 8);
+        let c_a = ctx("tenant-a");
+        let c_b = ctx("tenant-b");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen4 = crate::catalog::table_generation_in_txn(&read_txn, "docs4").unwrap();
+        let arena4 = build_arena(&read_txn, "docs4", &c_a);
+        let base = IndexedBase::build(
+            &arena4,
+            crate::hnsw::HnswParams::default(),
+            c_a.clone(),
+            gen4,
+        )
+        .expect("build");
+
+        // dim・ctx とも本ベースの構築時と一致: 検証通過（fail-closed 分岐に入らない）。
+        assert!(!base.arena_identity_mismatch_guard(&arena4, &c_a));
+
+        // dim 不一致（別テーブル由来のアリーナ取り違え）。
+        let arena8 = build_arena(&read_txn, "docs8", &c_a);
+        assert!(base.arena_identity_mismatch_guard(&arena8, &c_a));
+
+        // ctx 不一致（別テナント取り違え）。
+        assert!(base.arena_identity_mismatch_guard(&arena4, &c_b));
+    }
+
+    #[test]
+    fn builds_stat_counts_failed_build_attempts() {
+        // codex-review P2 指摘対応（PR #434「builds が失敗した構築試行を計上
+        // しない」）: 旧実装は `record_base`（構築成功後）でのみ `builds` を
+        // 加算しており、`IndexedBase::build` が `HnswError` で失敗した場合は
+        // `build_failures` のみ計上され `builds` は増えなかった。NaN
+        // embedding を含む `MIN_INDEXED_ROWS` 件のコーパスで構築を確実に
+        // 失敗させ、失敗試行も `builds` に計上されることを固定する
+        // （`search_or_fallback` 自体は brute-force へ縮退し `Ok` を返す）。
+        let path = unique_db_path("hnsw-cache-builds-count-failure");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| {
+                if i == 0 {
+                    [f32::NAN, 0.0, 0.0, 0.0]
+                } else {
+                    [i as f32, 0.0, 0.0, 0.0]
+                }
+            })
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id =
+            crate::recovery::required_op_id::OperationId::parse("hnsw-cache-builds-count-failure")
+                .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(arena.len() >= MIN_INDEXED_ROWS);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let provider = crate::kernel::CpuScalarProvider;
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let result = search_or_fallback(
+            &access, &read_txn, "docs", &c, &arena, &slot_ids, &provider, &query, 1,
+        );
+        assert!(
+            result.is_ok(),
+            "NaN 混入コーパスは構築失敗後 brute-force へ縮退し、クエリ自体は成功する"
+        );
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.builds, 1,
+            "失敗した構築試行も builds に計上されるべき（旧実装は 0 のままだった）"
+        );
+        assert_eq!(stats.build_failures, 1);
+    }
+
+    #[test]
+    fn record_overlay_for_marks_uncacheable_when_oversized() {
+        // Cursor Bugbot 指摘対応（PR #434「Oversized overlay skips negative
+        // cache」）: `record_overlay_for` は base+overlay の合計が
+        // `MAX_HNSW_CACHE_TOTAL_BYTES` を超える overlay を常駐させないだけで
+        // 負のキャッシュへ記録していなかったため、次回 lookup が再び
+        // `NeedOverlay` となり毎クエリ `Overlay::compute` を再実行してしまって
+        // いた。`record_base`・`record_build_failed` と同じ負のキャッシュへ
+        // 記録し、以後同一世代の lookup が `BuildFailedThisGeneration`
+        // （overlay 再計算なし）を返すことを固定する。
+        let path = unique_db_path("hnsw-cache-overlay-oversized");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let built = IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
+            .expect("build");
+        let base = cache.record_base(&storage, "docs", built);
+        assert_eq!(cache.stats().entries, 1);
+
+        // `MAX_HNSW_CACHE_TOTAL_BYTES` を超える容量を持つ overlay を偽装する。
+        // `Vec::with_capacity` は要素を書き込まない限り仮想メモリの予約に
+        // 留まる（`len` は 0 のまま）ため、実メモリを消費せず `capacity()` の
+        // みを大きくできる。
+        let oversized_len = (MAX_HNSW_CACHE_TOTAL_BYTES / std::mem::size_of::<f32>()) + 1_000_000;
+        let delta_vectors: Vec<f32> = Vec::with_capacity(oversized_len);
+        let overlay = Arc::new(Overlay {
+            generation: gen,
+            arena_len: arena.len(),
+            slot_of_node: (0..base.index.len() as u32).collect(),
+            stale_nodes: 0,
+            delta_slots: Vec::new(),
+            delta_vectors,
+        });
+        assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
+
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        record_overlay_for(&access, "docs", &base, overlay);
+
+        // 負のキャッシュ専用の新規エントリは追加しない（`record_base` が既に
+        // 作った `(table, ctx)` のエントリへ `build_failed_generation` を
+        // 上書きするだけ）。
+        assert_eq!(cache.stats().entries, 1);
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        match cache.lookup(&storage, &read_txn2, "docs", &c) {
+            Lookup::BuildFailedThisGeneration => {}
+            _ => panic!(
+                "oversized overlay を破棄した世代は BuildFailedThisGeneration を返し、\
+                 毎クエリの Overlay::compute 再計算を避けなければならない"
+            ),
         }
     }
 }
