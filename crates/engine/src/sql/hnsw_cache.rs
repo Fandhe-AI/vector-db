@@ -610,6 +610,33 @@ impl HnswIndexCache {
         }
     }
 
+    /// [`IndexedBase::arena_identity_mismatch_guard`] が不整合を検出した特定の
+    /// `(table, ctx)` エントリのみを破棄する（Cursor Bugbot 指摘対応: 以前は
+    /// ガード検出時にこのクエリを brute-force へ縮退させるだけで不整合な
+    /// `IndexedBase` をキャッシュへ温存していたため、`lookup` が同一エントリへ
+    /// `NeedOverlay` を返し続け、同じ `(table, ctx)` の以後の全クエリが同じ
+    /// ガードへ当たり続け ANN 経路が実質的に無効化されたままになっていた。
+    /// 破棄した次回の `lookup` は `Miss` となり、`search_or_fallback` が新規
+    /// 構築を試みて ANN 経路へ復帰できる）。
+    ///
+    /// `base`（呼び出し元がガード検出直前に手にしていた不整合な `IndexedBase`）
+    /// の `Arc` ポインタと一致するエントリのみを対象にする。世代チェックを
+    /// 経由せず（この `base` はそもそも現在のアリーナと同定できない壊れた
+    /// 状態であり保護すべき正当な理由がない）、かつ `Arc::ptr_eq` で対象を
+    /// 厳密に絞ることで、並行して別スレッドが同じ `(table, ctx)` を正しい
+    /// `base` へ差し替え済みだった場合にそれを巻き添えで破棄しない
+    /// （テナント境界・fail-closed 契約は維持: 破棄対象は呼び出し元が既に
+    /// 特定した自テーブル・自テナントのエントリ 1 件に限る）。
+    fn evict_entry_if_mismatched(&self, table: &str, ctx: &PolicyContext, base: &Arc<IndexedBase>) {
+        if let Ok(mut guard) = self.state.write() {
+            guard.entries.retain(|e| {
+                !(e.table == table
+                    && e.built_ctx == *ctx
+                    && e.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, base)))
+            });
+        }
+    }
+
     pub(crate) fn stats(&self) -> HnswIndexCacheStats {
         let entries = self.state.read().map(|g| g.entries.len()).unwrap_or(0);
         HnswIndexCacheStats {
@@ -731,7 +758,14 @@ pub(crate) fn search_or_fallback(
     };
     if base.arena_identity_mismatch_guard(arena, ctx) {
         // 呼び出し元の適用条件（フィルタなし DISTANCE）が正しく守られていれば
-        // 起こらないはずの不整合。fail-closed に全件へ縮退する。
+        // 起こらないはずの不整合。fail-closed に全件へ縮退するだけでなく、
+        // 不整合な `base` を保持するエントリ自体をキャッシュから退避する
+        // （Cursor Bugbot 指摘対応「Guard disables ANN without recovery」:
+        // 退避しないと `lookup` が同じ `(table, ctx)` に対し `NeedOverlay` を
+        // 返し続け、以後の全クエリが同じガードに当たり続けて ANN 経路が
+        // 再構築されないまま無効化されてしまう）。退避対象はこの `(table,
+        // ctx)` の当該エントリのみで、他テナント・他テーブルへは波及しない。
+        access.cache.evict_entry_if_mismatched(table, ctx, &base);
         return full_scan(access.cache);
     }
     let overlay = Overlay::compute(&base, arena, current_generation);
@@ -1707,5 +1741,162 @@ mod tests {
                  毎クエリの Overlay::compute 再計算を避けなければならない"
             ),
         }
+    }
+
+    #[test]
+    fn arena_identity_mismatch_guard_evicts_entry_and_recovers_ann_next_query() {
+        // Cursor Bugbot 指摘対応（PR #434「Guard disables ANN without
+        // recovery」）: `arena_identity_mismatch_guard` が検出した不整合な
+        // `IndexedBase` を退避せずに brute-force へ縮退するだけだと、`lookup`
+        // が同じエントリへ `NeedOverlay` を返し続け、以後の全クエリが同じ
+        // ガードに当たり ANN 経路が再構築されないまま無効化され続ける。
+        // dim 不整合の base を仕込んだ後、ガード経路を通った次のクエリでは
+        // 再構築（builds 増加）され ANN 経路が復帰することを固定する。
+        let path = unique_db_path("hnsw-cache-guard-recovery");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        create_table(&storage, "aux", 8);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        // `docs`（dim=4）に索引化対象の行数を投入する。
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| [i as f32, 0.0, 0.0, 0.0])
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id =
+            crate::recovery::required_op_id::OperationId::parse("hnsw-cache-guard-recovery")
+                .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        // `aux`（dim=8）から構築した `IndexedBase` を、`docs` の現世代番号を
+        // 偽って `(table="docs", ctx=c)` のエントリとして登録する。これは
+        // 「呼び出し元の適用条件が正しく守られていれば起こらないはずの不整合」
+        // （モジュールドキュメント参照）を意図的に再現するための細工であり、
+        // `arena_identity_mismatch_guard` の fail-closed 検出そのものが本テストの
+        // 対象。
+        let read_txn = storage.db().begin_read().unwrap();
+        let docs_gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let aux_arena = build_arena(&read_txn, "aux", &c);
+        let mismatched_base = IndexedBase::build(
+            &aux_arena,
+            crate::hnsw::HnswParams::default(),
+            c.clone(),
+            docs_gen,
+        )
+        .expect("build mismatched base");
+        cache.record_base(&storage, "docs", mismatched_base);
+        assert_eq!(
+            cache.stats().entries,
+            1,
+            "細工した不整合エントリが登録される"
+        );
+
+        let docs_arena = build_arena(&read_txn, "docs", &c);
+        assert!(docs_arena.len() >= MIN_INDEXED_ROWS);
+        assert_ne!(
+            docs_arena.dim(),
+            8,
+            "docs アリーナと細工した base の次元が不整合であることが前提"
+        );
+        let slot_ids: Vec<u64> = (0..docs_arena.len() as u64).collect();
+
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let provider = crate::kernel::CpuScalarProvider;
+        let query = [1.0, 0.0, 0.0, 0.0];
+
+        // 1 回目: ガードが不整合を検出し brute-force へ縮退する。このとき
+        // 不整合エントリはキャッシュから退避され、`builds` は増加しない
+        // （新規構築はまだ試みていない）。
+        let first = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &docs_arena,
+            &slot_ids,
+            &provider,
+            &query,
+            1,
+        );
+        assert!(first.is_ok(), "ガード経路でも brute-force で成功応答を返す");
+        assert_eq!(
+            cache.stats().entries,
+            0,
+            "不整合エントリはガード検出時にキャッシュから退避される"
+        );
+        assert_eq!(
+            cache.stats().builds,
+            0,
+            "ガード検出のみでは新規構築を試みない"
+        );
+
+        // 2 回目: エントリが退避済みのため `lookup` は `Miss` を返し、正しい
+        // dim（4）で新規構築される（ANN 経路の再構築発火）。
+        let second = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &docs_arena,
+            &slot_ids,
+            &provider,
+            &query,
+            1,
+        );
+        assert!(second.is_ok());
+        let stats_after_rebuild = cache.stats();
+        assert_eq!(
+            stats_after_rebuild.builds, 1,
+            "退避後の次クエリで再構築が発火する（builds 増加）"
+        );
+        assert_eq!(
+            stats_after_rebuild.entries, 1,
+            "正しい dim の base が再登録される"
+        );
+
+        // 3 回目: 再構築済みの正しい base に対し、現世代のオーバーレイが
+        // ない状態から `NeedOverlay` → `Ready` へ到達し、ガードは再発火せず
+        // ANN 経路（索引探索）が復帰していることを確認する。
+        let third = search_or_fallback(
+            &access,
+            &read_txn,
+            "docs",
+            &c,
+            &docs_arena,
+            &slot_ids,
+            &provider,
+            &query,
+            1,
+        );
+        assert!(third.is_ok());
+        let stats_final = cache.stats();
+        assert_eq!(
+            stats_final.builds, 1,
+            "3 回目は既存の正しい base を再利用し、再構築は発生しない"
+        );
+        assert!(
+            stats_final.hits >= 1,
+            "ANN 経路（索引探索・縮退なし）が復帰していることを固定する"
+        );
     }
 }
