@@ -392,10 +392,16 @@ impl HnswIndexCache {
     ) -> Lookup {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let Ok(mut guard) = self.state.write() else {
+            // ロック毒化: エントリの有無を判定できないため fail-closed に Miss
+            // 扱いとする（codex-review P2 指摘対応: 以前はこの経路が misses に
+            // 計上されず、通常の未登録エントリの初回ミスと合わせて実際のミス
+            // 発生回数を過小報告していた）。
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return Lookup::Miss;
         };
         let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table)
         else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return Lookup::Miss;
         };
         let Some(position) = guard
@@ -403,6 +409,10 @@ impl HnswIndexCache {
             .iter()
             .position(|e| e.table == table && e.built_ctx == *ctx)
         else {
+            // 対象 `(table, ctx)` のエントリが一度も登録されていない、最も一般的な
+            // 初回ミス（codex-review P2 指摘対応）。
+            drop(guard);
+            self.misses.fetch_add(1, Ordering::Relaxed);
             return Lookup::Miss;
         };
         if let Some(entry) = guard.entries.get_mut(position) {
@@ -430,7 +440,14 @@ impl HnswIndexCache {
                 let base = Arc::clone(base);
                 let overlay = Arc::clone(overlay);
                 drop(guard);
-                self.hits.fetch_add(1, Ordering::Relaxed);
+                // `hits` はここでは加算しない（codex-review P2 指摘対応）。
+                // `Ready` はあくまで索引済みベース＋オーバーレイが揃っている
+                // ことの通知であり、その後 `search_with_overlay` が
+                // `k + stale_nodes > MAX_EF`・写像検証失敗・索引探索エラー等で
+                // brute-force に縮退した場合、`hits`（実際に探索できた回数）と
+                // `fallbacks`（縮退した回数）の両方に同一呼び出しが二重計上され
+                // てしまう。`hits` は `search_with_overlay` が縮退なしで完了した
+                // 時点でのみ加算する（呼び出し元 `search_or_fallback` 参照）。
                 return Lookup::Ready(base, overlay);
             }
         }
@@ -495,17 +512,44 @@ impl HnswIndexCache {
         base
     }
 
+    /// 新規エントリ追加前に呼ぶ（`record_base`／`record_build_failed` からのみ）。
+    /// エントリ数上限・総バイト量上限の両方で LRU eviction する。
     fn evict_for_capacity(
         &self,
         guard: &mut std::sync::RwLockWriteGuard<'_, HnswCacheState>,
         incoming_bytes: usize,
+    ) {
+        self.evict_while(guard, incoming_bytes, true);
+    }
+
+    /// 既存エントリの overlay 更新前に呼ぶ（`record_overlay_for` からのみ）。
+    /// エントリ数はこの呼び出しでは増えないため、総バイト量上限のみで
+    /// eviction する（Cursor Bugbot 指摘対応: `evict_for_capacity` をそのまま
+    /// 使うと、overlay 更新はエントリを追加しないにもかかわらず
+    /// `entries.len() >= MAX_HNSW_CACHE_ENTRIES`（キャッシュが既に満杯）の
+    /// 条件だけでエビクトが発火し、build・rebuild・世代 overlay のたびに
+    /// 無関係な別 `(table, ctx)` の索引エントリが巻き添えで追い出され、次回
+    /// ミスして再構築を強制されていた）。
+    fn evict_for_extra_bytes(
+        &self,
+        guard: &mut std::sync::RwLockWriteGuard<'_, HnswCacheState>,
+        incoming_bytes: usize,
+    ) {
+        self.evict_while(guard, incoming_bytes, false);
+    }
+
+    fn evict_while(
+        &self,
+        guard: &mut std::sync::RwLockWriteGuard<'_, HnswCacheState>,
+        incoming_bytes: usize,
+        check_entry_count: bool,
     ) {
         let mut total_bytes: usize = guard
             .entries
             .iter()
             .map(HnswCacheEntry::approx_heap_bytes)
             .fold(0usize, |acc, n| acc.saturating_add(n));
-        while guard.entries.len() >= MAX_HNSW_CACHE_ENTRIES
+        while (check_entry_count && guard.entries.len() >= MAX_HNSW_CACHE_ENTRIES)
             || total_bytes.saturating_add(incoming_bytes) > MAX_HNSW_CACHE_TOTAL_BYTES
         {
             let victim = guard
@@ -619,7 +663,7 @@ pub(crate) fn search_or_fallback(
     let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
         Lookup::BuildFailedThisGeneration => return full_scan(access.cache),
         Lookup::Ready(base, overlay) => {
-            return search_with_overlay(access, base, overlay, provider, arena, query, k);
+            return search_with_overlay(access, base, overlay, provider, arena, query, k, true);
         }
         Lookup::NeedOverlay(base) => base,
         Lookup::Miss => {
@@ -681,6 +725,7 @@ pub(crate) fn search_or_fallback(
                     arena,
                     query,
                     k,
+                    false,
                 );
             }
             Err(_) => {
@@ -692,7 +737,7 @@ pub(crate) fn search_or_fallback(
     }
     let overlay = Arc::new(overlay);
     record_overlay_for(access, table, &base, Arc::clone(&overlay));
-    search_with_overlay(access, base, overlay, provider, arena, query, k)
+    search_with_overlay(access, base, overlay, provider, arena, query, k, false)
 }
 
 impl IndexedBase {
@@ -781,11 +826,17 @@ fn record_overlay_for(
     }
     // 既存エントリはこの時点では base 分のみ（またはそれ以下）しか
     // `HnswCacheEntry::approx_heap_bytes` に計上されていないため、overlay 単体の
-    // バイト量を追加分として渡し、他エントリの LRU eviction で空きを作る
-    // （`record_base` と同じ契約）。このエントリ自身が LRU の対象に選ばれ追い出
+    // バイト量を追加分として渡し、総バイト量上限超過時のみ他エントリの LRU
+    // eviction で空きを作る（`evict_for_extra_bytes`。`record_base` と異なり
+    // エントリ数はこの呼び出しで増えないため、エントリ数上限は判定条件に
+    // 含めない。Cursor Bugbot 指摘対応: `evict_for_capacity` をそのまま使うと
+    // キャッシュが既に満杯なだけで overlay 更新のたびに無関係な別エントリが
+    // 巻き添えで追い出されていた）。このエントリ自身が LRU の対象に選ばれ追い出
     // される可能性はあるが、その場合は下の `find` が失敗し overlay を反映しない
     // だけであり、容量上限を超えて常駐することはない（fail-closed）。
-    access.cache.evict_for_capacity(&mut guard, overlay_bytes);
+    access
+        .cache
+        .evict_for_extra_bytes(&mut guard, overlay_bytes);
     if let Some(entry) = guard.entries.iter_mut().find(|e| {
         e.table == table
             && e.built_ctx == base.built_ctx
@@ -798,6 +849,18 @@ fn record_overlay_for(
 
 /// [`Lookup::Ready`]（または `NeedOverlay` から新規計算した直後）に共通する索引
 /// 探索＋未索引分 brute-force のマージ本体。
+/// `from_ready` は呼び出し元が [`Lookup::Ready`] から到達したか（`true`）、
+/// `NeedOverlay` から新規計算したオーバーレイで到達したか（`false`）を示す
+/// （codex-review P2 指摘対応）。`hits`（統計上の契約:「索引済みノードを実際に
+/// 探索できた回数（`Ready` 到達かつ縮退なし）」）は `from_ready` かつ本関数が
+/// brute-force へ一切縮退せず完了した場合にのみここで加算する。`lookup` 側で
+/// `Ready` 到達の時点で先に加算すると、本関数がその後 `k + stale_nodes > MAX_EF`・
+/// 写像検証失敗・索引探索エラー等で縮退した場合に `hits` と `fallbacks` の両方へ
+/// 同一呼び出しが二重計上されてしまう。
+///
+/// 引数 8 個は `clippy::too_many_arguments`（閾値 7）を超えるが、`search_or_fallback`
+/// と同じ方針（本ファイル内 `#[allow(clippy::too_many_arguments)]` 参照）で許容する。
+#[allow(clippy::too_many_arguments)]
 fn search_with_overlay(
     access: &HnswCacheAccess<'_>,
     base: Arc<IndexedBase>,
@@ -806,6 +869,7 @@ fn search_with_overlay(
     arena: &VectorArena,
     query: &[f32],
     k: usize,
+    from_ready: bool,
 ) -> Result<Vec<CandidateHit>, KernelError> {
     if overlay.arena_len != arena.len() {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -877,6 +941,12 @@ fn search_with_overlay(
     mapped.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
     mapped.dedup_by(|a, b| a.id == b.id);
     mapped.truncate(k);
+    if from_ready {
+        // ここへ到達するのは、上記のいずれの縮退分岐（`fallbacks` 加算）も通らず
+        // 索引探索が完了した場合のみ。`Ready` 到達かつ縮退なしという `hits` の
+        // 契約はこの時点で初めて確定する。
+        access.cache.hits.fetch_add(1, Ordering::Relaxed);
+    }
     Ok(mapped)
 }
 
@@ -1141,5 +1211,133 @@ mod tests {
         // このミニチュアフィクスチャでは再構築閾値を超える（`needs_rebuild` の
         // 挙動自体は `search_or_fallback` の rebuild 分岐で結合テストする）。
         assert!(overlay.needs_rebuild(arena1.len()));
+    }
+
+    #[test]
+    fn lookup_counts_miss_for_unregistered_entry() {
+        // codex-review P2 指摘対応（PR #434）: 対象 `(table, ctx)` のエントリが
+        // 一度も登録されていない、最も一般的な初回ミスが `misses` に計上され
+        // ないまま返っていた（旧実装）ことの回帰固定。
+        let path = unique_db_path("hnsw-cache-miss-count");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        assert!(matches!(
+            cache.lookup(&storage, &read_txn, "docs", &c),
+            Lookup::Miss
+        ));
+        assert_eq!(cache.stats().misses, 1);
+    }
+
+    #[test]
+    fn search_with_overlay_does_not_double_count_hits_on_fallback() {
+        // codex-review P2 指摘対応（PR #434）: `Lookup::Ready` 到達の時点で
+        // `hits` を先に加算していたため、その後 `search_with_overlay` が
+        // 縮退（本テストでは `overlay.arena_len` を意図的に不一致にして最初の
+        // 縮退分岐を発火させる）した場合、`hits` と `fallbacks` の両方に同一
+        // 呼び出しが二重計上されていた（旧実装では hits == 1 になっていた）。
+        let path = unique_db_path("hnsw-cache-hits-fallback");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        seed_row(&storage, "docs", 1, "tenant-a", &[1.0, 0.0, 0.0, 0.0]);
+        seed_row(&storage, "docs", 2, "tenant-a", &[0.0, 1.0, 0.0, 0.0]);
+        let c = ctx("tenant-a");
+        let cache = HnswIndexCache::new();
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let base = IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
+            .expect("build");
+        let base = Arc::new(base);
+
+        let overlay = Arc::new(Overlay {
+            generation: gen,
+            arena_len: arena.len() + 1,
+            slot_of_node: (0..base.index.len() as u32).collect(),
+            stale_nodes: 0,
+            delta_slots: Vec::new(),
+            delta_vectors: Vec::new(),
+        });
+
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let provider = crate::kernel::CpuScalarProvider;
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let result =
+            search_with_overlay(&access, base, overlay, &provider, &arena, &query, 1, true)
+                .expect("fallback search succeeds");
+        assert_eq!(result.len(), 1);
+
+        let stats = cache.stats();
+        assert_eq!(stats.fallbacks, 1, "縮退は 1 回のみ計上される");
+        assert_eq!(
+            stats.hits, 0,
+            "縮退した呼び出しは hits に計上されない（旧実装は 1 になっていた）"
+        );
+    }
+
+    #[test]
+    fn record_overlay_for_does_not_evict_unrelated_entries_when_cache_is_at_entry_capacity() {
+        // Cursor Bugbot 指摘対応（PR #434）: overlay 更新はエントリを追加しない
+        // にもかかわらず、以前は `entries.len() >= MAX_HNSW_CACHE_ENTRIES`
+        // （キャッシュが既に満杯）という条件だけで build・rebuild・世代 overlay
+        // のたびに無関係な別 `(table, ctx)` の索引エントリが巻き添えで追い出され
+        // ていた。エントリ数がちょうど上限に達している状態で overlay 更新して
+        // も、総バイト量が上限を超えない限りエントリ数が変わらないことを固定する。
+        let path = unique_db_path("hnsw-cache-overlay-no-evict");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let mut bases = Vec::new();
+        for i in 0..MAX_HNSW_CACHE_ENTRIES {
+            let table = format!("docs_{i}");
+            create_table(&storage, &table, 4);
+            let read_txn = storage.db().begin_read().unwrap();
+            let gen = crate::catalog::table_generation_in_txn(&read_txn, &table).unwrap();
+            let arena = build_arena(&read_txn, &table, &c);
+            let built =
+                IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
+                    .expect("build");
+            let base = cache.record_base(&storage, &table, built);
+            bases.push((table, base));
+        }
+        assert_eq!(cache.stats().entries, MAX_HNSW_CACHE_ENTRIES);
+
+        let (table0, base0) = &bases[0];
+        let gen0 =
+            crate::catalog::table_generation_in_txn(&storage.db().begin_read().unwrap(), table0)
+                .unwrap();
+        let overlay = Arc::new(Overlay {
+            generation: gen0,
+            arena_len: base0.index.len(),
+            slot_of_node: (0..base0.index.len() as u32).collect(),
+            stale_nodes: 0,
+            delta_slots: Vec::new(),
+            delta_vectors: Vec::new(),
+        });
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        record_overlay_for(&access, table0, base0, overlay);
+
+        assert_eq!(
+            cache.stats().entries,
+            MAX_HNSW_CACHE_ENTRIES,
+            "overlay 更新だけではエントリ数が変わらないため、他エントリを巻き添えで \
+             追い出してはならない"
+        );
     }
 }
