@@ -440,7 +440,14 @@ pub(crate) fn execute_statement_with_cache(
     // かつフィルタなし。`sparse_cache_eligible` の hybrid 版と対称の条件（`sql/
     // hnsw_cache.rs` モジュールドキュメント「適用条件」参照）。`hnsw_cache` が
     // `None`（`execute_statement` 経由・フィルタ付き DISTANCE）の場合は経由しない。
-    let hnsw_cache_eligible = hnsw_cache.is_some() && !is_hybrid && filters_empty;
+    // Issue #408 追記（Bugbot High 指摘）: `precision` モードは対象外とする。
+    // `precision::apply_gate`（本ファイル下部）は DISTANCE 段が返す近似 Top-2 の
+    // マージンで確信度ゲートを評価するため、ANN（HNSW）の近似近傍を渡すと真の
+    // 最近傍を取りこぼしてマージンを過大評価し、SEARCH-9 が要求する「確信度不足
+    // 時は空集合の fail-closed 応答」を満たせない可能性がある
+    // （TASK-162・SEARCH-9）。`precision` では従来どおり厳密 brute-force 経路
+    // （`hnsw_cache_eligible == false` の分岐）でゲートを評価する。
+    let hnsw_cache_eligible = hnsw_cache.is_some() && !is_hybrid && filters_empty && !is_precision;
     // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
     // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
     // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール

@@ -12,6 +12,9 @@
 //!   結果へ混入しない・エントリが ctx ごとに独立していること。
 //! - フィルタ付き（`WHERE`）・hybrid クエリは `HnswIndexCache` を経由せず、常に
 //!   既定エンジンと完全一致すること（適用条件の遵守）。
+//! - `precision` モードのフィルタなし DISTANCE クエリは `HnswIndexCache` を経由
+//!   せず（Bugbot 指摘。TASK-162・SEARCH-9）、既定エンジンの確信度ゲート判定と
+//!   完全一致すること。
 //! - Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql` 表層専用の
 //!   段階化。既存 Issue #407 の契約を維持）。
 
@@ -518,5 +521,97 @@ fn rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback() {
     assert_eq!(
         stats.entries, 0,
         "Rust API search must never populate HnswIndexCache (SQL-surface-only wiring)"
+    );
+}
+
+/// `precision` モードのフィルタなし DISTANCE クエリ（Bugbot High 指摘。TASK-162・
+/// SEARCH-9）: `HnswIndexCache` を経由せず、既定エンジン（brute-force）の確信度
+/// ゲート判定と完全一致すること。索引済みノードの近似近傍を渡すと Top-2 マージン
+/// を誤って過大評価し、確信度不足時に空集合を返すべき応答が非空になり得るため。
+#[test]
+fn precision_mode_bypasses_cache_and_matches_default_engine_gate_decision() {
+    let dir = unique_db_path("hnsw-cache-precision-hnsw");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    // クラスタ構造ありコーパス（既存フィクスチャと同型）。クラスタ内の点同士は
+    // 僅差になりやすく、precision の確信度ゲートが非自明に働く条件を作る。
+    let vectors = gen_clustered_corpus(11, DIM as usize, BASE_ROWS, 12);
+    seed_rows(&storage, "tenant-a", 1, &vectors, "precision-hnsw");
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-precision-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(&ref_storage, "tenant-a", 1, &vectors, "precision-ref");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // クラスタ中心そのものをクエリに使い、クラスタ内の複数点が僅差で並ぶ状況を
+    // 誘発する（`sql_precision_mode.rs` のクラスタ内クエリと同じ方針）。
+    let queries: Vec<Vec<f32>> = (0..10)
+        .map(|i| vectors[i * (BASE_ROWS / 10)].clone())
+        .collect();
+
+    for q in &queries {
+        let sql = format!(
+            "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 3 USING MODE 'precision'",
+            vec_literal(q)
+        );
+        let got = core
+            .execute_sql(&ctx, &sql)
+            .expect("precision query on hnsw core should succeed")
+            .rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("precision query on ref core should succeed")
+            .rows;
+        assert_eq!(
+            got.iter().map(|r| r.id).collect::<Vec<_>>(),
+            want.iter().map(|r| r.id).collect::<Vec<_>>(),
+            "precision mode must match the default engine's gate decision exactly \
+             (query={q:?})"
+        );
+    }
+
+    let stats = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats.entries, 0,
+        "precision mode must never populate HnswIndexCache"
+    );
+    assert_eq!(
+        stats.hits, 0,
+        "precision mode must never hit HnswIndexCache"
+    );
+    assert_eq!(
+        stats.misses, 0,
+        "precision mode must not even attempt an HnswIndexCache lookup"
+    );
+    assert_eq!(
+        stats.builds, 0,
+        "precision mode must not trigger HnswIndexCache builds"
+    );
+
+    // 対照: 同一テーブル・同一 core で `recall`（既定）モードのクエリを 1 回発行
+    // すると `HnswIndexCache` が実際に使われる（本テストのアサーションが cache
+    // 自体の機能不全ではなく、precision モードの適用除外を検証していることの
+    // 裏付け）。
+    let recall_sql = format!(
+        "SELECT id FROM docs ORDER BY embedding <=> '{}' LIMIT 3",
+        vec_literal(&queries[0])
+    );
+    core.execute_sql(&ctx, &recall_sql)
+        .expect("recall query should succeed");
+    let stats_after_recall = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats_after_recall.builds, 1,
+        "recall mode on the same table must still populate HnswIndexCache"
     );
 }
