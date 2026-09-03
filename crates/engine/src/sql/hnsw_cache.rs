@@ -490,6 +490,15 @@ impl HnswIndexCache {
             // 呼び出し元が無条件に push しており、単一テナントの過大な索引が
             // 容量上限を超えて常駐し得た）。呼び出し元はこのクエリのスナップショット
             // から構築した `base` をそのまま使ってよい。
+            //
+            // 常駐させないだけでは終わらせず、`build_failed_generation` と同じ
+            // 負のキャッシュへ「この世代はキャッシュ不可」と記録する（Cursor
+            // Bugbot 指摘対応: 記録を省略すると次回参照が再び `Miss` となり、
+            // `search_or_fallback` が同一世代内の毎クエリで `IndexedBase::build`
+            // 〔HNSW グラフ全体の構築。brute-force より遥かに高価〕をやり直して
+            // しまう。世代が進めばテーブル規模の変化次第で再度キャッシュ可能に
+            // なりうるため、失敗記録と同じく世代限定の一時的な縮退として扱う）。
+            mark_uncacheable_in_guard(self, &mut guard, table, &base.built_ctx, current_generation);
             return base;
         }
         if let Some(pos) = guard
@@ -573,11 +582,31 @@ impl HnswIndexCache {
     /// テーブルの他テナントの構築済み索引まで巻き添えで破棄し、繰り返しフル
     /// リビルドを強制していた。`arena.len()` はテナントごとの RLS フィルタ後の
     /// 値であり、他テナントの可視行数とは独立なため `ctx` も一致条件に含める。
-    fn evict_entry(&self, table: &str, ctx: &PolicyContext) {
+    ///
+    /// `current_generation`（呼び出し元のクエリが見ているテーブル世代）より
+    /// **新しい**世代のエントリは破棄しない（Cursor Bugbot 指摘対応: 世代チェック
+    /// なしに呼んでいた旧実装では、可視行数が少ない/0 件のクエリが、並行して
+    /// 別クエリが構築した「より大きい世代」の索引済みエントリまで巻き添えで
+    /// 追い出し、次回の別クエリで高価な HNSW 再構築を強制し得た）。エントリの
+    /// 世代は overlay があればその世代、無ければベースの構築世代、ベースも無い
+    /// 〔負のキャッシュのみ〕場合は `build_failed_generation` の順に判定する。
+    fn evict_entry(&self, table: &str, ctx: &PolicyContext, current_generation: u64) {
         if let Ok(mut guard) = self.state.write() {
-            guard
-                .entries
-                .retain(|e| !(e.table == table && e.built_ctx == *ctx));
+            guard.entries.retain(|e| {
+                if e.table != table || e.built_ctx != *ctx {
+                    return true;
+                }
+                let entry_generation = e
+                    .overlay
+                    .as_ref()
+                    .map(|o| o.generation)
+                    .or_else(|| e.base.as_ref().map(|b| b.built_table_generation))
+                    .or(e.build_failed_generation);
+                // 世代が判定できない（全フィールド None。通常発生しない）場合は
+                // 保護対象が無いとみなし破棄する（fail-closed に「破棄する」側へ
+                // 倒す。破棄しても次回参照時に再構築されるだけで安全側）。
+                entry_generation.is_some_and(|g| g > current_generation)
+            });
         }
     }
 
@@ -656,7 +685,14 @@ pub(crate) fn search_or_fallback(
     };
 
     if n < MIN_INDEXED_ROWS {
-        access.cache.evict_entry(table, ctx);
+        // 現在のクエリが見ている世代より新しいエントリは巻き添えにしない
+        // （`evict_entry` ドキュメント参照）。世代が判定できない場合は
+        // eviction 自体をスキップする（fail-closed。誤って破棄する側へは
+        // 倒さない——判定不能を「保護すべき新しい世代ではない」とみなして
+        // 破棄すると、並行クエリが構築した索引を無条件で失わせてしまう）。
+        if let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) {
+            access.cache.evict_entry(table, ctx, current_generation);
+        }
         return full_scan(access.cache);
     }
 
@@ -767,6 +803,24 @@ fn record_build_failed(
     if current_generation != generation {
         return;
     }
+    mark_uncacheable_in_guard(access.cache, &mut guard, table, ctx, generation);
+}
+
+/// `(table, ctx)` の指定世代 `generation` を「この世代は brute-force へ縮退中」の
+/// 負のキャッシュとして記録する（`record_build_failed`〔構築失敗〕・
+/// `HnswIndexCache::record_base`〔構築成功したが単体で `MAX_HNSW_CACHE_TOTAL_BYTES`
+/// を超えキャッシュ不可〕の共通処理）。既存エントリがあれば `base`／`overlay` は
+/// 温存したまま `build_failed_generation` のみ更新し、無ければ `base: None` の
+/// 負のキャッシュ専用エントリを新設する。世代が進めば次回参照時に再度構築を
+/// 試行できる（`docs/design/hnsw-generation-cache.md`「構築失敗時の負のキャッシュ」
+/// 節参照）。呼び出し元は書き込みロック `guard` を既に保持している前提。
+fn mark_uncacheable_in_guard(
+    cache: &HnswIndexCache,
+    guard: &mut std::sync::RwLockWriteGuard<'_, HnswCacheState>,
+    table: &str,
+    ctx: &PolicyContext,
+    generation: u64,
+) {
     if let Some(entry) = guard
         .entries
         .iter_mut()
@@ -776,13 +830,13 @@ fn record_build_failed(
         return;
     }
     // 既存エントリが無い場合（一度も構築成功したことがないテーブル・ctx での
-    // 初回失敗）: `base: None` の負のキャッシュ専用エントリを新設する。これを
-    // 省略すると、初回構築が失敗するたびに毎クエリ `IndexedBase::build`
+    // 初回失敗、またはキャッシュ不可判定）: `base: None` の負のキャッシュ専用
+    // エントリを新設する。これを省略すると、毎クエリ `IndexedBase::build`
     // （索引構築本体・決して安価ではない）を再試行し続けてしまう（同一世代内の
     // 再試行連打を防ぐという本節の目的そのものを一度も構築成功していないテーブルで
     // 満たせなくなる）。
-    access.cache.evict_for_capacity(&mut guard, 0);
-    let seq = access.cache.seq.fetch_add(1, Ordering::Relaxed);
+    cache.evict_for_capacity(guard, 0);
+    let seq = cache.seq.fetch_add(1, Ordering::Relaxed);
     guard.entries.push(HnswCacheEntry {
         table: table.to_string(),
         built_ctx: ctx.clone(),
@@ -1157,10 +1211,12 @@ mod tests {
         let cache = HnswIndexCache::new();
         let c1 = ctx("tenant-a");
         let c2 = ctx("tenant-b");
+        let mut built_generation = 0u64;
 
         for c in [&c1, &c2] {
             let read_txn = storage.db().begin_read().unwrap();
             let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+            built_generation = gen;
             let arena = build_arena(&read_txn, "docs", c);
             let built =
                 IndexedBase::build(&arena, crate::hnsw::HnswParams::default(), c.clone(), gen)
@@ -1168,9 +1224,52 @@ mod tests {
             cache.record_base(&storage, "docs", built);
         }
         assert_eq!(cache.stats().entries, 2);
-        cache.evict_entry("docs", &c1);
+        // 現在のクエリが見ている世代（`built_generation`）以下のエントリのみが
+        // 破棄対象になる契約を固定する（Cursor Bugbot 指摘対応・PR #434）。
+        cache.evict_entry("docs", &c1, built_generation);
         assert_eq!(cache.stats().entries, 1);
-        cache.evict_entry("docs", &c2);
+        cache.evict_entry("docs", &c2, built_generation);
+        assert_eq!(cache.stats().entries, 0);
+    }
+
+    #[test]
+    fn evict_entry_does_not_evict_a_newer_generation_entry() {
+        // Cursor Bugbot 指摘対応（PR #434）: 可視行数が縮小した古い世代のクエリが
+        // `evict_entry` を呼んでも、並行して別クエリが構築した「より新しい世代」
+        // のエントリは巻き添えで破棄されないことを固定する回帰テスト。
+        let path = unique_db_path("hnsw-cache-evict-entry-generation");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let old_generation = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        let built = IndexedBase::build(
+            &arena,
+            crate::hnsw::HnswParams::default(),
+            c.clone(),
+            old_generation,
+        )
+        .expect("build");
+        cache.record_base(&storage, "docs", built);
+        assert_eq!(cache.stats().entries, 1);
+
+        // このエントリより古い世代（`old_generation` 未満）を「現在のクエリの
+        // 世代」として `evict_entry` を呼んでも、より新しいエントリは保護され
+        // 破棄されない。
+        let stale_current_generation = old_generation.saturating_sub(1);
+        cache.evict_entry("docs", &c, stale_current_generation);
+        assert_eq!(
+            cache.stats().entries,
+            1,
+            "より新しい世代のエントリが誤って破棄された"
+        );
+
+        // 現在のクエリの世代がエントリの世代以上であれば、通常どおり破棄される。
+        cache.evict_entry("docs", &c, old_generation);
         assert_eq!(cache.stats().entries, 0);
     }
 
@@ -1353,5 +1452,56 @@ mod tests {
             "overlay 更新だけではエントリ数が変わらないため、他エントリを巻き添えで \
              追い出してはならない"
         );
+    }
+
+    #[test]
+    fn mark_uncacheable_in_guard_causes_lookup_to_report_build_failed_this_generation() {
+        // Cursor Bugbot 指摘対応（PR #434・"Uncacheable HNSW rebuilt every query"）:
+        // `record_base` が単体で `MAX_HNSW_CACHE_TOTAL_BYTES` を超えるベースを
+        // 拒否する経路（`mark_uncacheable_in_guard` 呼び出し）と、既存の
+        // `record_build_failed`（構築失敗）は同じ負のキャッシュ機構を共有する
+        // （リファクタで抽出済み）。実際に 1GiB 超のベースを構築する重量級テストの
+        // 代わりに、共有機構そのものを直接検証する: 一度 `mark_uncacheable_in_guard`
+        // で「この世代はキャッシュ不可」と記録すれば、以後同一世代内の `lookup` は
+        // 毎回 `BuildFailedThisGeneration` を返し、`search_or_fallback` は
+        // `IndexedBase::build`（HNSW グラフ全体の構築）を再試行しない
+        // （呼び出し元は `full_scan` へ直行する）。
+        let path = unique_db_path("hnsw-cache-mark-uncacheable");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let cache = HnswIndexCache::new();
+        let c = ctx("tenant-a");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let gen = crate::catalog::table_generation_in_txn(&read_txn, "docs").unwrap();
+
+        // まだエントリが無い状態からの記録（初回構築成功時点で単体超過と判明した
+        // ケース、または一度も構築成功していないテーブルでの初回失敗ケースに対応）。
+        {
+            let mut guard = cache.state.write().unwrap();
+            mark_uncacheable_in_guard(&cache, &mut guard, "docs", &c, gen);
+        }
+        assert_eq!(cache.stats().entries, 1);
+
+        let read_txn2 = storage.db().begin_read().unwrap();
+        match cache.lookup(&storage, &read_txn2, "docs", &c) {
+            Lookup::BuildFailedThisGeneration => {}
+            _ => panic!(
+                "同一世代内の lookup は BuildFailedThisGeneration を返し、\
+                 毎クエリのフル再構築を避けなければならない"
+            ),
+        }
+
+        // 世代が進めば負のキャッシュは新しい世代には適用されず、再挑戦できる
+        // （`docs/design/hnsw-generation-cache.md`「構築失敗時の負のキャッシュ」節）。
+        let write_txn = storage.db().begin_write().unwrap();
+        crate::catalog::bump_table_generation_in_txn(&write_txn, "docs").unwrap();
+        crate::recovery::commit_boundary::commit(write_txn).unwrap();
+        let read_txn3 = storage.db().begin_read().unwrap();
+        match cache.lookup(&storage, &read_txn3, "docs", &c) {
+            Lookup::Miss => {}
+            _ => panic!("世代が進んだ後は再構築を試みられるよう Miss を返すべき"),
+        }
     }
 }
