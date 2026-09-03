@@ -185,14 +185,28 @@ variant が `SearchEngineKind` に追加された場合に備えて型は残す�
 - CI `core-api-check`（`scripts/check_core_api.sh`）が green であることを
   確認済み
 
-## #408 が接続する索引経路の seam（本タスクでは実装しない）
+## #408 が接続した索引経路の seam（実装済み）
 
-1. 索引済み集合と `SearchInput` の差分を判定する世代整合キャッシュは、
-   provider の外側（`core.rs`／`sql` 側のテーブル世代整合機構）が持つ
+上記 3 点は Issue #408（`sql::hnsw_cache::HnswIndexCache`。詳細は
+`docs/design/hnsw-generation-cache.md` 参照）で SQL 表層の `Ranking::Distance`
+（フィルタなし）クエリに限り接続済み:
+
+1. 索引済み集合と `SearchInput` の差分を判定する世代整合キャッシュ
+   （`sql::hnsw_cache::HnswIndexCache`。`(table, ctx)` × テーブル単位世代キー）を
+   `HnswSearchProvider`（本 provider）の外側、`sql::exec::
+   execute_statement_with_cache` から `core.rs::EngineCore::hnsw_state` 経由で
+   接続した。`HnswSearchProvider::search` 自体（本ファイル）は無変更のまま
+   （常に `ParallelSearchProvider` へ委譲する全件フォールバック）——索引経路は
+   `sql::hnsw_cache` が provider の**外側**から `HnswIndex::search` を直接呼ぶ形
+   （下記 2.）で実現し、`SearchProvider` trait には一切触れない
 2. 索引側の探索は `HnswIndex::search(query, k, self.effective_ef(k),
-   scratch)` を使い、`HnswSearchScratch` は呼び出しスレッドごとに呼び出し元が
-   所有する
+   scratch)` を使い、`HnswSearchScratch` は呼び出しスレッドごとに
+   `thread_local!` で所有する
 3. 索引側 hit と brute-force 側（未索引分）hit の Top-k マージは
    `kernel.rs::TopKSelector` と同じ順序規約（スコア `total_cmp` 降順・同点 id
-   昇順）を保った安定マージで行う（`sort_unstable` 系は
-   `scripts/check_sort_determinism.sh` が禁止）
+   昇順）を保った `sort_by`（安定ソート）で行う（`sort_unstable` 系は
+   `scripts/check_sort_determinism.sh` が禁止。CI green を確認済み）
+
+Rust API（`VectorCore::search`）・フィルタ付きクエリ・hybrid クエリは本 seam を
+経由せず、`HnswSearchProvider::search` の全件フォールバックのまま（段階化は
+維持。`docs/design/hnsw-generation-cache.md`「スコープ外・申し送り」参照）。
