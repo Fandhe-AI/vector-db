@@ -80,7 +80,6 @@ pub enum CoreError {
     QueryPlanning(crate::query_planner::PlanError),
     EmbedderUnavailable,
     QueryEmbedding(crate::embedding::EmbedError),
-    InvalidSearchEngine(crate::search_engine::SearchEngineError),
 }
 
 # source: crates/engine/src/kernel.rs :: SearchHit

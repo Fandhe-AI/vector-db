@@ -75,24 +75,26 @@ impl HnswSearchProvider {
         self.params
     }
 
-    /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値
-    /// （構築時 `params.ef_search` の [`MAX_EF`] クランプ。codex-review P2 指摘・
-    /// Issue #407 追記で契約を訂正）。
+    /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値を返す
+    /// （`self.params.ef_search.max(k).min(MAX_EF)`）。
     ///
-    /// **本メソッドは `k` をクランプしない**（`k` はそのまま `HnswIndex::search` の
-    /// `k` 引数へ渡る値であり、本メソッドの戻り値はその `k` に一切影響しない）。
-    /// `HnswIndex::search` 自身が `ef.max(k)` へ引き上げるため、本メソッドが返す
-    /// `ef` を [`MAX_EF`] へクランプしても、`k` 自体が [`MAX_EF`] を超えていれば
-    /// 実効 `ef`（`ef.max(k)`）は再び `k` まで戻る——ただしこの経路は
-    /// `HnswIndex::search` 自身の `k > MAX_EF` 検証（`hnsw.rs::HnswIndex::search`
-    /// の実装。`ef.max(k)` を計算する**前**に fail-closed で
-    /// `Err(HnswError::InvalidParams)` を返す）に必ず先に捕まるため到達しない。
-    /// untrusted な `k`（wire 経由で到達しうる `SearchInput::k`）に対する
-    /// 実際の上限保証は本メソッドではなく、この `HnswIndex::search` 側の検証が
-    /// 担う（#408 がこのメソッドを呼ぶ契約。モジュールドキュメント「seam」節 2.
-    /// 参照。本メソッドの役割は構築時パラメータ `ef_search` 側の異常値
-    /// （untrusted 入力ではない `HnswParams::validate` 済みの構成値）を
-    /// [`MAX_EF`] 内へ収めることに限られる）。
+    /// **戻り値は `k` に依存する**（例: 構築時 `ef_search=32` で `k=64` を渡すと
+    /// `64` を返す。codex-review P2 指摘・Issue #407 追記で「戻り値は `k` に
+    /// 一切影響されない」という誤記載を訂正した）。ただし本メソッドが行うのは
+    /// 「`k` との `max` を取ったうえで [`MAX_EF`] へクランプする」ことだけで、
+    /// **引数 `k` 自体を書き換えて `HnswIndex::search` へ渡すわけではない**
+    /// （`k` はそのまま呼び出し元から `HnswIndex::search` の `k` 引数へ渡る）。
+    /// `HnswIndex::search` 自身も内部で同じ `ef.max(k)` を計算するため
+    /// （`hnsw.rs::HnswIndex::search` の実装）、本メソッドの戻り値をそのまま
+    /// `ef` として渡しても渡さなくても実効 `ef` は同じ値に揃う。本メソッドの
+    /// 主な役割は構築時パラメータ `ef_search`（untrusted 入力ではない
+    /// `HnswParams::validate` 済みの構成値）を [`MAX_EF`] 内へ収めることにある。
+    ///
+    /// untrusted な `k`（wire 経由で到達しうる `SearchInput::k`）に対する実際の
+    /// 上限保証は本メソッドではなく、`HnswIndex::search` 自身の検証が担う
+    /// （`ef.max(k)` を計算する**前**に `k > MAX_EF` を fail-closed で
+    /// `Err(HnswError::InvalidParams)` として拒否する。#408 がこのメソッドを
+    /// 呼ぶ契約。モジュールドキュメント「seam」節 2. 参照）。
     pub fn effective_ef(&self, k: usize) -> usize {
         self.params.ef_search.max(k).min(MAX_EF)
     }

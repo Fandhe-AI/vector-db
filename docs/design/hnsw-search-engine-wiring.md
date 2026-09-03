@@ -115,9 +115,10 @@ impl SearchProvider for HnswSearchProvider {
 倒し「索引済み集合は常に空」＝全件フォールバックとして実装した。
 
 `effective_ef` は #408 が索引探索（`HnswIndex::search(query, k,
-self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、構築時
-パラメータ `ef_search` を `MAX_EF` へクランプする役割のみを本タスクで先に
-固定した（`k` 自体はクランプしない。untrusted な `k` の上限保証は
+self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、`ef_search.
+max(k).min(MAX_EF)` を返す役割を本タスクで先に固定した（戻り値は `k` に
+依存する。ただし引数 `k` 自体は書き換えない——`k` はそのまま
+`HnswIndex::search` の `k` 引数へ渡る値であり、untrusted な `k` の上限保証は
 `HnswIndex::search` 自身の `k > MAX_EF` fail-closed 検証が担う。詳細・
 訂正経緯は「変更履歴」節「`HnswSearchProvider::effective_ef` の契約訂正」
 参照）。
@@ -125,14 +126,18 @@ self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、�
 ### `core.rs::EngineCore` の opt-in 構築 API
 
 - フィールド追加: `search_engine_kind: Option<SearchEngineKind>`
-- `EngineCore::open_with_engine(path, kind) -> Result<Self, CoreError>`
+- `EngineCore::open_with_engine(path, kind) -> Result<Self,
+  OpenWithEngineError>`（新設の専用エラー型。次節参照）
 - `EngineCore::from_storage_with_engine(storage, kind)
   -> Result<Self, SearchEngineError>`
 - `EngineCore::search_engine_kind(&self) -> Option<SearchEngineKind>`
-- `EngineCore::open(path)` は `open_with_engine(path,
-  search_engine::default_kind())` へ委譲するよう変更（既定 provider・
-  既定エンジンの動作は不変。`search_engine_kind()` が常に
-  `Some(ParallelBruteForce)` を返すようになった点のみが観測可能な差分）
+- `EngineCore::open(path)` は内部で `search_engine::default_engine()`
+  （infallible）を直接使い、`search_engine_kind()` は常に
+  `Some(default_kind())` を返す（既定 provider・既定エンジンの動作は不変。
+  `open_with_engine` の `OpenWithEngineError` 経路へは委譲しない——既定
+  kind は常に `HnswParams::validate` を要さないため失敗系が構造的に発生
+  せず、委譲すると `open` の戻り値型 `CoreError` を変えずに済ませられなく
+  なる。次節「`OpenWithEngineError` の新設（破壊的変更の回避）」参照）
 - `with_provider`／`from_storage`（既存 API・シグネチャ不変）は `kind` を
   受け取らないため `search_engine_kind()` は常に `None`
 
@@ -142,15 +147,36 @@ self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、�
 （以前は `with_provider`／`from_storage` の 2 箇所に同一の struct literal が
 重複していた）。
 
-### `CoreError::InvalidSearchEngine`（破壊的変更）
+### `OpenWithEngineError` の新設（破壊的変更の回避。codex-review P1 指摘・PR #433 5 巡目）
 
-`open_with_engine` の失敗（不正な `HnswParams`）を伝える先として、
+初版実装は `open_with_engine` の失敗（不正な `HnswParams`）を伝える先として
 `CoreError`（`#[non_exhaustive]` を付けない既存方針。`QueryPlannerUnavailable`・
 `EmbedderUnavailable` 等の追加と同じ前例）へ `InvalidSearchEngine
-(SearchEngineError)` variant を追加した。既存の網羅的 `match` を壊す破壊的
-変更であることは `CoreError` 冒頭ドキュメントの既存注記のとおりで、
-`crates/engine/api/core_api.snapshot` を `scripts/check_core_api.sh --update`
-で更新しコミットに含めた。
+(SearchEngineError)` variant を追加していたが、AGENTS.md「公開 API・エラー
+契約の互換性（P1）」——公開 API の破壊的変更は spec 側の対応する定義変更と
+対にする規約——を満たしていなかった（`InvalidSearchEngine` は
+`docs/spec` のビヘイビア ID に対応しない実装内部のエラーであり、対にすべき
+spec 側変更が存在しない。`build` の可視性変更（後述の「3 巡目」節）と同型の
+問題）。
+
+`build` のときと異なり、`open_with_engine` 自体が本 Issue で新設する API の
+ため、`CoreError` へ variant を追加せず [`OpenWithEngineError`] という独立の
+戻り値型（`Storage(StorageError)` / `SearchEngine(SearchEngineError)` の
+2 variant。`CoreError` への暗黙 `From` は用意しない）を新設する方式へ変更した
+——新規関数の戻り値型を選ぶこと自体は破壊的変更に当たらないため。
+
+- `EngineCore::open`（既存 API）は `open_with_engine` へ委譲する実装を撤回し、
+  `search_engine::default_engine()`（`build_unchecked(default_kind())` と
+  同じ infallible 経路。`default_engine` 自体の既存経路）を直接呼ぶ実装へ
+  戻した。既定 kind は常に検証を要さないため、`open` の戻り値型
+  `Result<Self, CoreError>` は変更していない
+- `crates/engine/api/core_api.snapshot` から `CoreError::InvalidSearchEngine`
+  を除去し（`scripts/check_core_api.sh --update` で再生成）、初版実装で
+  積んだ `CoreError` への破壊的変更を撤回した
+- `crates/engine/tests/search_engine.rs` の既存テストは `.expect`/`.is_err()`
+  のみで戻り値の具体的な型を検査しないため、`open_with_engine` の戻り値型
+  変更（`CoreError` → `OpenWithEngineError`）はテスト側の変更なしにコンパイル
+  可能
 
 ## フォールバック等価性・受け入れ条件の検証
 
@@ -306,6 +332,33 @@ spec 側変更が存在しない）ことを指摘され、破壊的変更を伴
   担う旨を明記し、97 行目・236〜253 行目の記述と整合させた
 - production コードの変更は `open_with_engine` の検証順序入れ替えのみ
   （`effective_ef` のクランプ計算式自体は変更していない）
+
+### `CoreError::InvalidSearchEngine` 撤回・`effective_ef` docstring の再訂正（codex-review P1・P2 指摘・PR #433 5 巡目）
+
+1. **P1: `CoreError::InvalidSearchEngine`（破壊的変更）の撤回**。「`core.rs::
+   EngineCore` の opt-in 構築 API」節の直後、旧「`CoreError::
+   InvalidSearchEngine`（破壊的変更）」節に記していた対応（`CoreError` への
+   variant 追加を「既存注記のとおりの前例」として正当化する記述）は
+   AGENTS.md「公開 API・エラー契約の互換性（P1）」を満たしていなかった
+   （`QueryPlannerUnavailable` 等の前例はいずれも spec 側ビヘイビア
+   〔PLAN-1・PLAN-10 等〕に対応する追加だが、`InvalidSearchEngine` は対応する
+   spec 側変更を持たない）。「`build` の公開互換ラッパーへの再変更」節（3 巡目）
+   と同じ理由・同じ解決方針で、`CoreError` を変更せず `OpenWithEngineError`
+   （`open_with_engine` 専用の新設エラー型）へ切り替えた。詳細は「`core.rs::
+   EngineCore` の opt-in 構築 API」節直後の「`OpenWithEngineError` の新設
+   （破壊的変更の回避）」節参照
+2. **P2: `effective_ef` docstring の再々訂正**。2 巡目・4 巡目で「`k` を
+   クランプしない」ことは正しく訂正済みだったが、「本メソッドの戻り値はその
+   `k` に一切影響しない」という一文が残っており、実装
+   （`ef_search.max(k).min(MAX_EF)`）と矛盾していた（`k` をクランプしない
+   ことと、戻り値が `k` に依存しないことは別の主張であり、後者は誤り）。
+   `hnsw/provider.rs::HnswSearchProvider::effective_ef` の docstring から
+   誤った一文を削除し、「戻り値は `k` に依存する」ことを明記したうえで、
+   「`k` 自体は書き換えない」という正しい主張だけを残した
+- production コードの変更は `core.rs::EngineCore::open`／`open_with_engine`
+  の戻り値型変更（`OpenWithEngineError` 新設）のみ（`effective_ef` の
+  クランプ計算式自体は変更していない。修正はドキュメンテーションコメントと
+  `docs/design/hnsw-search-engine-wiring.md` 本文のみ）
 
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 

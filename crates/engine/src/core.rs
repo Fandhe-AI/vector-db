@@ -810,13 +810,6 @@ pub enum CoreError {
     /// （テーブル宣言次元と embedder 次元の不一致・埋め込みサービスの不正応答等。
     /// 詳細は [`crate::embedding::EmbedError`]）。
     QueryEmbedding(crate::embedding::EmbedError),
-    /// [`Self::open_with_engine`]（Issue #407・ANN opt-in 結線）に渡した
-    /// `SearchEngineKind::Hnsw(params)` の `params` が
-    /// [`crate::hnsw::HnswParams::validate`] を拒否した（詳細は
-    /// [`crate::search_engine::SearchEngineError`]）。既存の網羅的 `match` を壊す
-    /// 破壊的変更であることは本 enum 冒頭ドキュメントの既存注記のとおり
-    /// （`QueryPlannerUnavailable` 等と同じ前例）。
-    InvalidSearchEngine(crate::search_engine::SearchEngineError),
 }
 
 impl std::fmt::Display for CoreError {
@@ -844,18 +837,41 @@ impl std::fmt::Display for CoreError {
             CoreError::QueryPlanning(e) => write!(f, "core query planning error: {e}"),
             CoreError::EmbedderUnavailable => write!(f, "no embedder configured"),
             CoreError::QueryEmbedding(e) => write!(f, "core query embedding error: {e}"),
-            CoreError::InvalidSearchEngine(e) => write!(f, "core search engine error: {e}"),
         }
     }
 }
 
 impl std::error::Error for CoreError {}
 
-impl From<crate::search_engine::SearchEngineError> for CoreError {
-    fn from(e: crate::search_engine::SearchEngineError) -> Self {
-        CoreError::InvalidSearchEngine(e)
+/// [`EngineCore::open_with_engine`] 専用のエラー型（Issue #407・ANN opt-in 結線）。
+///
+/// `open_with_engine` は本 Issue で新設する API のため、既に公開済みの
+/// [`CoreError`]（`#[non_exhaustive]` を付けない既存方針。新規 variant 追加は
+/// 既存利用者の網羅的 `match` を壊す破壊的変更になる）へ variant を追加せず、
+/// 独立の型として新設した（codex-review P1 指摘・Issue #407 追記。AGENTS.md
+/// 「公開 API・エラー契約の互換性（P1）」が要求する spec 側の対応する定義変更が
+/// 無いまま `CoreError` を破壊的変更するのを避けるため）。`CoreError` への
+/// 暗黙 `From` 変換は用意しない（`?` 経由で意図せず `CoreError` 側へ新しい
+/// エラー経路が生まれるのを防ぐ）。
+#[derive(Debug)]
+pub enum OpenWithEngineError {
+    /// `Storage::open` が失敗した（詳細は [`StorageError`]）。
+    Storage(StorageError),
+    /// `kind` の [`crate::hnsw::HnswParams::validate`] が拒否した（詳細は
+    /// [`crate::search_engine::SearchEngineError`]）。
+    SearchEngine(crate::search_engine::SearchEngineError),
+}
+
+impl std::fmt::Display for OpenWithEngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenWithEngineError::Storage(e) => write!(f, "core storage error: {e}"),
+            OpenWithEngineError::SearchEngine(e) => write!(f, "core search engine error: {e}"),
+        }
     }
 }
+
+impl std::error::Error for OpenWithEngineError {}
 
 impl From<DispatchError> for CoreError {
     fn from(e: DispatchError) -> Self {
@@ -1083,10 +1099,21 @@ impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        // `search_engine::default_kind()` を明示的に渡すことで、既定経路でも
-        // `search_engine_kind()` が `Some(default_kind())` を返す（Issue #407。
-        // 既定 kind は常に検証を通るため `open_with_engine` の失敗系は到達しない）。
-        Self::open_with_engine(path, search_engine::default_kind())
+        // `open_with_engine`（`OpenWithEngineError` を返す opt-in 経路）へは
+        // 委譲しない: 既定 kind（`default_kind()`）は常に
+        // `HnswParams::validate` を要さない `ParallelBruteForce` のため
+        // `SearchEngineError` 系の失敗は構造的に発生せず、`build_unchecked` 相当の
+        // infallible な `search_engine::default_engine()` を直接使うことで
+        // `CoreError` 側の型を一切変えずに済む（codex-review P1 指摘・Issue #407
+        // 追記。`OpenWithEngineError` 新設の経緯は
+        // `docs/design/hnsw-search-engine-wiring.md` 参照）。
+        let provider = search_engine::default_engine();
+        let storage = Storage::open(path)?;
+        Ok(Self::assemble(
+            storage,
+            provider,
+            Some(search_engine::default_kind()),
+        ))
     }
 
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。
@@ -1111,18 +1138,27 @@ impl EngineCore {
     ///
     /// `kind` が `SearchEngineKind::Hnsw(params)` で `params` が
     /// [`crate::hnsw::HnswParams::validate`] を拒否する値の場合、`EngineCore` は
-    /// 構築されず [`CoreError`] として fail-closed に拒否する
+    /// 構築されず [`OpenWithEngineError`] として fail-closed に拒否する
     /// （[`crate::search_engine::build_validated`] 経由。不正パラメータを保持した
     /// `EngineCore` が生存する状態を構造的に作らない）。
+    ///
+    /// 戻り値の型は既存の公開 [`CoreError`] ではなく専用の [`OpenWithEngineError`]
+    /// とする（`CoreError` は既に公開済みの `#[non_exhaustive]` を付けない enum
+    /// であり、本関数のためだけに新規 variant を追加すると既存利用者の網羅的
+    /// `match` を壊す破壊的変更になる。本関数自体は Issue #407 で新設する API
+    /// のため、独立の戻り値型を選ぶこと自体は破壊的変更に当たらない。
+    /// codex-review P1 指摘・Issue #407 追記。経緯は
+    /// `docs/design/hnsw-search-engine-wiring.md` 参照）。
     pub fn open_with_engine(
         path: impl AsRef<Path>,
         kind: crate::search_engine::SearchEngineKind,
-    ) -> Result<Self, CoreError> {
+    ) -> Result<Self, OpenWithEngineError> {
         // fail-closed: 不正な `HnswParams` は `Storage::open`（ファイル
         // オープン・ロック取得、場合により空 DB ファイル作成を伴う）より前に
         // 検証して弾く（codex-review P2 指摘・Issue #407 追記）。
-        let provider = search_engine::build_validated(kind)?;
-        let storage = Storage::open(path)?;
+        let provider =
+            search_engine::build_validated(kind).map_err(OpenWithEngineError::SearchEngine)?;
+        let storage = Storage::open(path).map_err(OpenWithEngineError::Storage)?;
         Ok(Self::assemble(storage, provider, Some(kind)))
     }
 
