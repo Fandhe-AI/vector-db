@@ -373,6 +373,99 @@ impl PrefilterSnapshot {
         Ok(hits)
     }
 
+    /// [`Self::search_with`] の HNSW 世代整合キャッシュ結線版（Issue #409）。
+    /// `core.rs::EngineCore::search_with_snapshot` が `hnsw_state`（`SearchEngineKind::
+    /// Hnsw` opt-in 構築時のみ `Some`）を保持する場合にこちらを呼ぶ。
+    ///
+    /// 契約は [`Self::search_with`] と同一（`ctx` 完全一致・`k`／`query` 検証・
+    /// provider 呼び出し前後のストレージ世代照合・`provider_result_is_valid` に
+    /// よる Top-k 契約検証）で、探索本体だけが異なる: `provider.search` を直接
+    /// 呼ぶ代わりに、本スナップショットの可視全集合アリーナ（`FullVisible` 形状。
+    /// `sql::exec::execute_statement_with_cache` のフィルタなし DISTANCE クエリと
+    /// 同じ形状）を `sql::hnsw_cache::search_or_fallback` へ渡し、索引済みノード＋
+    /// 未索引分 brute-force の併用探索を試みる。HNSW 索引固有のエラー・写像検証
+    /// 失敗はすべて `search_or_fallback` 内部で当該呼び出しの brute-force 縮退へ
+    /// 吸収され、本メソッドへは伝播しない（`sql::hnsw_cache` モジュールドキュメント
+    /// 「fail-closed 契約」節）。
+    ///
+    /// テナント境界は [`Self::search_with`] と同じ多層防御で維持する:
+    /// (1) 索引構築入力は本スナップショットの構築時点で `ctx` 可視行のみ
+    /// （`Self::build`）、(2) `search_or_fallback` 内部のスロット写像・キー照合・
+    /// `kernel::dot` 再計算、(3) 本メソッドの `provider_result_is_valid`。
+    /// `sql::hnsw_cache::HnswIndexCache` は `(table, ctx)` 単位で世代整合キャッシュ
+    /// されるため、他テナント・他ポリシーの索引を取り違えて参照することはない。
+    pub(crate) fn search_with_hnsw(
+        &self,
+        storage: &Storage,
+        ctx: &PolicyContext,
+        access: &crate::sql::hnsw_cache::HnswCacheAccess<'_>,
+        provider: &dyn SearchProvider,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<SearchHit>, RlsError> {
+        if ctx != &self.built_ctx {
+            return Err(RlsError::ContextMismatch);
+        }
+        validate_search_k(k).map_err(|k| RlsError::InvalidK { k })?;
+
+        if query.len() != self.arena.dim() as usize {
+            return Err(RlsError::Kernel(KernelError::DimMismatch {
+                expected: self.arena.dim(),
+                found: query.len(),
+            }));
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(RlsError::Kernel(KernelError::NonFiniteQuery));
+        }
+
+        // 事前の失効検出（[`Self::search_with`] と同一契約）。
+        let pre_generation = storage
+            .current_generation()
+            .map_err(|_| RlsError::IndexStale)?;
+        if pre_generation != self.built_generation {
+            return Err(RlsError::IndexStale);
+        }
+
+        // `search_or_fallback` はテーブル世代を `read_txn` から読むため、ここで
+        // 1 つ開いて渡す（`storage.current_generation`〔上記の世代照合〕とは
+        // 別の読み取りだが、間に書き込みが挟まっても不整合にはならない——世代が
+        // 進んでいれば `search_or_fallback` はキャッシュミス・世代不一致として
+        // fail-closed に brute-force へ縮退するだけで、事後の世代照合〔下記〕が
+        // 最終防御として機能する）。
+        let read_txn = storage
+            .db()
+            .begin_read()
+            .map_err(|_| RlsError::IndexStale)?;
+        let raw = crate::sql::hnsw_cache::search_or_fallback(
+            access,
+            &read_txn,
+            self.arena.table_name(),
+            ctx,
+            &self.arena,
+            &self.slot_ids,
+            provider,
+            query,
+            k,
+        )
+        .map_err(RlsError::Kernel)?;
+
+        if !provider_result_is_valid(&raw, k, &self.visible_id_counts) {
+            return Err(RlsError::ProviderResultRejected);
+        }
+        let hits = crate::core::resolve_slot_hits(&self.arena, &raw)
+            .ok_or(RlsError::ProviderResultRejected)?;
+
+        // 事後の失効再検証（[`Self::search_with`] と同一契約）。
+        let post_generation = storage
+            .current_generation()
+            .map_err(|_| RlsError::IndexStale)?;
+        if post_generation != self.built_generation {
+            return Err(RlsError::IndexStale);
+        }
+
+        Ok(hits)
+    }
+
     /// インデックスが保持する可視行数を返す。`ctx` は構築時 `PolicyContext` と完全一致
     /// していなければ [`RlsError::ContextMismatch`]（存在情報を漏らさない。security.md P0）。
     pub(crate) fn len(&self, ctx: &PolicyContext) -> Result<usize, RlsError> {

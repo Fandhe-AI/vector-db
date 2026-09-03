@@ -446,8 +446,32 @@ pub(crate) fn execute_statement_with_cache(
     // 最近傍を取りこぼしてマージンを過大評価し、SEARCH-9 が要求する「確信度不足
     // 時は空集合の fail-closed 応答」を満たせない可能性がある
     // （TASK-162・SEARCH-9）。`precision` では従来どおり厳密 brute-force 経路
-    // （`hnsw_cache_eligible == false` の分岐）でゲートを評価する。
-    let hnsw_cache_eligible = hnsw_cache.is_some() && !is_hybrid && filters_empty && !is_precision;
+    // （`hnsw_full_visible_eligible`／`hnsw_subset_eligible` いずれも `false`
+    // の分岐）でゲートを評価する。
+    //
+    // Issue #409: 上記フィルタなし DISTANCE（`FullVisible` 形状）に加え、
+    // SCALAR 事前フィルタ付き DISTANCE（`Subset` 形状。`!filters_empty &&
+    // plan.scalar_prefilter`）も候補マスク付き ANN 経路へ載せる
+    // （`sql::hnsw_cache::search_subset_or_fallback`）。DISTANCE 先行・SCALAR
+    // 事後フィルタ（`!plan.scalar_prefilter`）の場合はフィルタの有無に関わらず
+    // アリーナが可視全集合のままであり（`on_visible_row` が等価条件を判定せず
+    // 素通しする。上のコメント「DISTANCE 先行時」参照）、`FullVisible` の不変
+    // 条件（索引済みベースの `IndexedBase::build` 入力と一致するアリーナ）を
+    // そのまま満たすため `filters_empty` を要求しない。逆に `!filters_empty &&
+    // plan.scalar_prefilter` はアリーナが WHERE 適用後の**真部分集合**になり、
+    // `FullVisible` の索引済みベースをそのまま探索対象にはできないため
+    // `Subset` 形状（per-query 写像・キャッシュ非登録）へ回す
+    // （`sql::hnsw_cache` モジュールドキュメント「適用条件」・
+    // `docs/design/hnsw-rls-cardinality-switch.md` 参照）。
+    let hnsw_full_visible_eligible = hnsw_cache.is_some()
+        && !is_hybrid
+        && !is_precision
+        && (filters_empty || !plan.scalar_prefilter);
+    let hnsw_subset_eligible = hnsw_cache.is_some()
+        && !is_hybrid
+        && !is_precision
+        && !filters_empty
+        && plan.scalar_prefilter;
     // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
     // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
     // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール
@@ -915,14 +939,40 @@ pub(crate) fn execute_statement_with_cache(
     } else {
         match &bound.ranking {
             Ranking::Distance { query } => {
-                // Issue #408: `hnsw_cache`（フィルタなし DISTANCE クエリに限る。
-                // 呼び出し元の適用条件は `hnsw_cache_eligible` 参照）が `Some` の
-                // 場合、索引済みノード＋未索引分 brute-force の併用経路を試みる。
-                // `None`（`execute_statement` 経由・フィルタ付きクエリ）の場合は
-                // 従来どおり全件 brute-force のみ。
-                let raw = if hnsw_cache_eligible {
+                // Issue #408・#409: `hnsw_cache`（`None` の場合は `execute_statement`
+                // 経由。従来どおり全件 brute-force のみ）が `Some` の場合、適用条件
+                // （`hnsw_full_visible_eligible`／`hnsw_subset_eligible` 参照）に応じて
+                // `FullVisible`（索引済みノード＋未索引分 brute-force の併用。#408）
+                // または `Subset`（per-query 写像・キャッシュ非登録。#409）の経路を
+                // 試みる。
+                let raw = if hnsw_full_visible_eligible {
                     match hnsw_cache.as_ref() {
                         Some(access) => crate::sql::hnsw_cache::search_or_fallback(
+                            access,
+                            read_txn,
+                            &bound.table,
+                            ctx,
+                            arena,
+                            &slot_ids,
+                            provider,
+                            query,
+                            k_eff,
+                        )
+                        .map_err(map_kernel_error)?,
+                        None => {
+                            let input = SearchInput {
+                                ids: &slot_ids,
+                                vectors: arena.vectors(),
+                                dim: arena.dim(),
+                                query,
+                                k: k_eff,
+                            };
+                            provider.search(input).map_err(map_kernel_error)?
+                        }
+                    }
+                } else if hnsw_subset_eligible {
+                    match hnsw_cache.as_ref() {
+                        Some(access) => crate::sql::hnsw_cache::search_subset_or_fallback(
                             access,
                             read_txn,
                             &bound.table,

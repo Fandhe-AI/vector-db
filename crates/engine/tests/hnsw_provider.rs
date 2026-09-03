@@ -119,6 +119,7 @@ fn hnsw_provider_params_and_effective_ef_public_contract() {
         m: 12,
         ef_construction: 80,
         ef_search: 20,
+        ..HnswParams::default()
     };
     let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
     assert_eq!(provider.params(), params);

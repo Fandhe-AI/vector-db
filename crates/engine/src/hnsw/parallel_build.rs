@@ -554,6 +554,7 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 32,
+            ..HnswParams::default()
         };
         let sequential = PubHnswIndex::build(params, dim as u32, &vectors, 7).unwrap();
         let parallel =

@@ -259,6 +259,7 @@ mod tests {
                 m: 16,
                 ef_construction: 100,
                 ef_search: 10,
+                ..HnswParams::default()
             })
             .unwrap(),
         );
@@ -272,6 +273,7 @@ mod tests {
                 m: 16,
                 ef_construction: 100,
                 ef_search: MAX_EF,
+                ..HnswParams::default()
             })
             .unwrap(),
         );
@@ -285,6 +287,7 @@ mod tests {
             m: 8,
             ef_construction: 50,
             ef_search: 32,
+            ..HnswParams::default()
         };
         let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
         assert_eq!(provider.params(), params);

@@ -487,16 +487,33 @@ fn filtered_and_hybrid_queries_bypass_cache_and_match_default_engine() {
     );
 }
 
-/// Rust API（`VectorCore::search`）は本キャッシュを経由せず、既定エンジンと完全
-/// 一致する（Issue #407 の契約を維持。`sql::hnsw_cache` は SQL 表層専用）。
+/// Rust API（`VectorCore::search`）は Issue #409 で HNSW 世代整合キャッシュへ結線
+/// された（`rls.rs::PrefilterSnapshot::search_with_hnsw`）。本テストの契約は
+/// Issue #407〜#408 時点の「常にキャッシュを迂回し既定エンジンと完全一致する」
+/// から、「既定エンジン対照 Recall@10 が本リポの回帰基準（0.9 目安）以上・
+/// 可視外テナントの id が混入しない・実際にキャッシュ経路が働いたこと
+/// （`hits >= 1`）」へ意図的に反転する（契約変更であり、アサーション弱体化では
+/// ない。旧テストは ANN 経路が一切使われないことを固定していたが、Issue #409
+/// はまさにその迂回を解消することが目的のため、ANN 特有の近似性を許容する
+/// Recall 基準へ揃える必要がある。詳細は `docs/design/hnsw-rls-cardinality-switch.md`
+/// 参照）。
 #[test]
-fn rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback() {
+fn rust_api_search_uses_hnsw_cache_and_matches_default_engine_recall() {
     let dir = unique_db_path("hnsw-cache-rust-api-hnsw");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
     storage.create_table(&schema(DIM)).expect("create table");
     let vectors = gen_clustered_corpus(7, DIM as usize, BASE_ROWS, 6);
     seed_rows(&storage, "tenant-a", 1, &vectors, "rust-api");
+    // tenant-b の private 行（不可視）。可視外混入がないことの検証対象。
+    let other_vectors = gen_clustered_corpus(70, DIM as usize, 64, 4);
+    seed_rows(
+        &storage,
+        "tenant-b",
+        BASE_ROWS as u64 + 1,
+        &other_vectors,
+        "rust-api-other-tenant",
+    );
     let kind =
         search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
     let core = EngineCore::from_storage_with_engine(storage, kind);
@@ -511,16 +528,160 @@ fn rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback() {
     let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
-    let got = core.search(&ctx, "docs", &vectors[0], 10).expect("search");
-    let want = ref_core
-        .search(&ctx, "docs", &vectors[0], 10)
-        .expect("search (ref)");
-    assert_eq!(got, want);
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let got = core.search(&ctx, "docs", query, K).expect("search");
+        let want = ref_core
+            .search(&ctx, "docs", query, K)
+            .expect("search (ref)");
+        // 可視外テナント（tenant-b）の id が一切混入しないこと（TABLE-12・
+        // security.md P0「テナント境界」）。
+        for hit in &got {
+            assert_eq!(
+                hit.tenant_id, "tenant-a",
+                "search must never return a row from an invisible tenant"
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|h| h.id).collect();
+        total_hits += got.iter().filter(|h| want_ids.contains(&h.id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "recall@{K} against the default-engine reference must be >= 0.9 (got {recall})"
+    );
 
     let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.hits + stats.plain_scans + stats.masked_short > 0,
+        "Rust API search must exercise the HnswIndexCache path (non-vacuous)"
+    );
+}
+
+/// SCALAR 事前フィルタ付き DISTANCE（`Subset` 形状。Issue #409）: フィルタなし
+/// クエリが先に索引を構築した後、選択率 50% の `WHERE` 付きクエリが per-query
+/// 写像（`sql::hnsw_cache::search_subset_or_fallback`）で候補マスク付き ANN
+/// 探索を経由し、既定エンジン対照 Recall@10 が本リポの回帰基準（0.9 目安）以上
+/// であること・`WHERE` を満たさない行が混入しないこと・実際に `Subset` 経路が
+/// 動いたこと（`subset_searches > 0`）・`Subset` 経路がキャッシュへエントリを
+/// 追加しないこと（§`search_subset_or_fallback` ドキュメンテーションコメント
+/// 「3.」）を固定する。
+#[test]
+fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
+    let dir = unique_db_path("hnsw-cache-subset-hnsw");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    let schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+    storage.create_table(&schema).expect("create table");
+
+    let vectors = gen_clustered_corpus(9, DIM as usize, BASE_ROWS, 6);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let op_id = OperationId::parse("hnsw-cache-subset").expect("valid operation_id");
+    let metadata_x = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[
+            engine::row_codec::Value::Null,
+            engine::row_codec::Value::Text("x".to_string()),
+        ],
+    )
+    .expect("encode tag=x metadata");
+    let metadata_y = engine::row_codec::encode_scalar_columns(
+        &schema,
+        &[
+            engine::row_codec::Value::Null,
+            engine::row_codec::Value::Text("y".to_string()),
+        ],
+    )
+    .expect("encode tag=y metadata");
+    let rows: Vec<(u64, RowInput<'_>)> = vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let metadata = if i % 2 == 0 {
+                metadata_x.as_slice()
+            } else {
+                metadata_y.as_slice()
+            };
+            (
+                i as u64 + 1,
+                RowInput {
+                    tenant_id: "tenant-a",
+                    visibility: Visibility::Public,
+                    embedding: v.as_slice(),
+                    metadata,
+                },
+            )
+        })
+        .collect();
+    engine::tenant::insert_rows(&storage, "docs", &ctx, &rows, &op_id).expect("seed rows");
+
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-subset-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage.create_table(&schema).expect("create ref table");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx, &rows, &op_id).expect("seed ref rows");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    // フィルタなしクエリを 1 本先に投げ、`FullVisible` 経路に索引を構築させる
+    // （`Subset` 経路は `Lookup::Miss` では構築せず plain scan へ縮退する契約
+    // ——§`search_subset_or_fallback` ドキュメンテーションコメント「2.」）。
+    let _ = query_ids(&core, &ctx, &vectors[0], 10);
+    let baseline_entries = core.hnsw_index_cache_stats().entries;
+    assert_eq!(baseline_entries, 1, "unfiltered query must build one entry");
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &vectors[i * (BASE_ROWS / QUERIES)];
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY embedding <=> '{}' LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx, &sql).expect("filtered query").rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("filtered query (ref)")
+            .rows;
+        // WHERE を満たさない行（tag='y', id が奇数）が混入しないこと。
+        for row in &got {
+            assert_eq!(
+                row.id % 2,
+                1,
+                "row {} does not satisfy tag='x' (1-indexed even rows are tag='x')",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "filtered DISTANCE recall@{K} against the default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.subset_searches > 0,
+        "Subset shape must be exercised (non-vacuous)"
+    );
     assert_eq!(
-        stats.entries, 0,
-        "Rust API search must never populate HnswIndexCache (SQL-surface-only wiring)"
+        stats.entries, baseline_entries,
+        "Subset shape must never register a cache entry"
     );
 }
 

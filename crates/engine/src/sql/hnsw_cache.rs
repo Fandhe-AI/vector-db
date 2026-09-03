@@ -113,8 +113,21 @@ pub struct HnswIndexCacheStats {
     /// 未索引分（`Overlay::delta_slots`）を brute-force で補った呼び出し回数。
     pub delta_searches: u64,
     /// 索引を使わず全件 brute-force へ縮退した回数（`MIN_INDEXED_ROWS` 未満・
-    /// `k_idx > MAX_EF`・写像検証失敗・索引探索エラーを含む）。
+    /// 写像検証失敗・索引探索エラーを含む。`plain_scans`〔可視カーディナリティ
+    /// 比が閾値未満〕・`masked_short`〔マスク付き探索の結果不足〕もこの内数）。
     pub fallbacks: u64,
+    /// 可視カーディナリティ比（`visible_in_index / index.len()`）が
+    /// `HnswParams::full_scan_ratio` 未満で plain scan（アリーナ全体の
+    /// brute-force）を選んだ回数（Issue #409。`fallbacks` の内数）。
+    pub plain_scans: u64,
+    /// マスク付き探索（[`crate::hnsw::HnswIndex::search_masked`]）の結果件数が
+    /// `min(k, visible_in_index)` に満たず plain scan へ縮退した回数（Issue #409。
+    /// `fallbacks` の内数）。
+    pub masked_short: u64,
+    /// `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE。Issue #409）でマスク付き
+    /// 探索が縮退なしで完走した回数。`hits` とは独立に数える（`hits` は
+    /// `FullVisible` 形状の `Ready` 到達かつ縮退なしの定義を変えない）。
+    pub subset_searches: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
@@ -204,6 +217,17 @@ struct Overlay {
     /// `delta_slots` と 1 対 1 対応する embedding（row-major・
     /// `delta_vectors.len() == delta_slots.len() * dim`）。
     delta_vectors: Vec<f32>,
+    /// `slot_of_node[node] != STALE_SLOT` を表す候補マスク（Issue #409）。
+    /// `crate::hnsw::HnswIndex::search_masked` へそのまま渡し、失効ノードが
+    /// 探索結果へ混入することを構造的に防ぐ（従来の `k + stale_nodes` オーバー
+    /// フェッチ方式は `k_idx > MAX_EF` で全件 brute-force へ縮退していた——
+    /// `docs/design/hnsw-generation-cache.md`「既知の限界」節の申し送りを
+    /// 本フィールドで解消する）。
+    visible_mask: crate::hnsw::NodeMask,
+    /// 索引ノードのうち現アリーナのスロットへ写像できたノード数
+    /// （`base.index.len() - stale_nodes` と一致）。可視カーディナリティ切替
+    /// （`sql::hnsw_cache::search_with_overlay`）の分子に使う。
+    visible_in_index: usize,
 }
 
 impl Overlay {
@@ -250,6 +274,17 @@ impl Overlay {
         }
         let stale_nodes = slot_of_node.iter().filter(|&&s| s == STALE_SLOT).count();
         let _ = dim; // 将来の整合検証用に保持（現状は arena.vector の長さで既に保証済み）。
+        let mut visible_mask = crate::hnsw::NodeMask::new(base.index.len());
+        for (node, &slot) in slot_of_node.iter().enumerate() {
+            if slot != STALE_SLOT {
+                // `base.index.len() <= MAX_HNSW_NODES <= u32::MAX` 前提（`IndexedBase::build`
+                // のノード番号割当と同じ不変条件）。
+                if let Ok(node_u32) = u32::try_from(node) {
+                    visible_mask.set(node_u32);
+                }
+            }
+        }
+        let visible_in_index = base.index.len().saturating_sub(stale_nodes);
         Overlay {
             generation,
             arena_len: arena.len(),
@@ -257,6 +292,8 @@ impl Overlay {
             stale_nodes,
             delta_slots,
             delta_vectors,
+            visible_mask,
+            visible_in_index,
         }
     }
 
@@ -282,7 +319,13 @@ impl Overlay {
             .delta_vectors
             .capacity()
             .saturating_mul(std::mem::size_of::<f32>());
-        a.saturating_add(b).saturating_add(c)
+        // `NodeMask` は `u64` の語配列（1 ノード 1 ビット）。
+        let d = self
+            .visible_mask
+            .len()
+            .div_ceil(64)
+            .saturating_mul(std::mem::size_of::<u64>());
+        a.saturating_add(b).saturating_add(c).saturating_add(d)
     }
 }
 
@@ -353,6 +396,9 @@ pub(crate) struct HnswIndexCache {
     rebuilds: AtomicU64,
     delta_searches: AtomicU64,
     fallbacks: AtomicU64,
+    plain_scans: AtomicU64,
+    masked_short: AtomicU64,
+    subset_searches: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -380,6 +426,9 @@ impl HnswIndexCache {
             rebuilds: AtomicU64::new(0),
             delta_searches: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
+            plain_scans: AtomicU64::new(0),
+            masked_short: AtomicU64::new(0),
+            subset_searches: AtomicU64::new(0),
         }
     }
 
@@ -651,6 +700,9 @@ impl HnswIndexCache {
             rebuilds: self.rebuilds.load(Ordering::Relaxed),
             delta_searches: self.delta_searches.load(Ordering::Relaxed),
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
+            plain_scans: self.plain_scans.load(Ordering::Relaxed),
+            masked_short: self.masked_short.load(Ordering::Relaxed),
+            subset_searches: self.subset_searches.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -730,7 +782,16 @@ pub(crate) fn search_or_fallback(
     let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
         Lookup::BuildFailedThisGeneration => return full_scan(access.cache),
         Lookup::Ready(base, overlay) => {
-            return search_with_overlay(access, base, overlay, provider, arena, query, k, true);
+            return search_with_overlay(
+                access,
+                base,
+                overlay,
+                provider,
+                arena,
+                query,
+                k,
+                OverlaySuccessStat::Hits,
+            );
         }
         Lookup::NeedOverlay(base) => base,
         Lookup::Miss => {
@@ -784,6 +845,12 @@ pub(crate) fn search_or_fallback(
             Ok(built) => {
                 access.cache.rebuilds.fetch_add(1, Ordering::Relaxed);
                 let new_base = access.cache.record_base(access.storage, table, built);
+                let mut identity_mask = crate::hnsw::NodeMask::new(new_base.index.len());
+                for node in 0..new_base.index.len() {
+                    if let Ok(node_u32) = u32::try_from(node) {
+                        identity_mask.set(node_u32);
+                    }
+                }
                 let identity_overlay = Arc::new(Overlay {
                     generation: current_generation,
                     arena_len: arena.len(),
@@ -791,6 +858,8 @@ pub(crate) fn search_or_fallback(
                     stale_nodes: 0,
                     delta_slots: Vec::new(),
                     delta_vectors: Vec::new(),
+                    visible_mask: identity_mask,
+                    visible_in_index: new_base.index.len(),
                 });
                 record_overlay_for(access, table, &new_base, Arc::clone(&identity_overlay));
                 return search_with_overlay(
@@ -801,7 +870,7 @@ pub(crate) fn search_or_fallback(
                     arena,
                     query,
                     k,
-                    false,
+                    OverlaySuccessStat::None,
                 );
             }
             Err(_) => {
@@ -813,7 +882,93 @@ pub(crate) fn search_or_fallback(
     }
     let overlay = Arc::new(overlay);
     record_overlay_for(access, table, &base, Arc::clone(&overlay));
-    search_with_overlay(access, base, overlay, provider, arena, query, k, false)
+    search_with_overlay(
+        access,
+        base,
+        overlay,
+        provider,
+        arena,
+        query,
+        k,
+        OverlaySuccessStat::None,
+    )
+}
+
+/// `Subset` 形状（Issue #409。SCALAR 事前フィルタ付き DISTANCE。`sql::exec::
+/// execute_statement_with_cache` の適用条件は §モジュールドキュメント
+/// 「適用条件」節・`docs/design/hnsw-rls-cardinality-switch.md` 参照）の索引済み
+/// 探索＋未索引分 brute-force 併用。`FullVisible`（[`search_or_fallback`]）との
+/// 違いは 3 点（いずれも「アリーナが可視全集合ではなく WHERE 適用後の部分集合」
+/// という前提の違いから来る）:
+///
+/// 1. `arena.len() < MIN_INDEXED_ROWS` でもエントリを evict しない（フィルタで
+///    絞られた行数が少ないことは「テーブル自体が小規模」を意味しない）。
+/// 2. `Lookup::Miss`（索引未構築）では新規構築を試みず、常に plain scan へ縮退
+///    する（`base` はフィルタなしクエリが可視全集合から構築する契約——部分集合
+///    アリーナから `IndexedBase::build` を呼ぶと以後の `FullVisible` 経路が
+///    誤った base を再利用してしまう）。
+/// 3. per-query の `Overlay::compute` 結果を [`record_overlay_for`] へ登録しない
+///    （`needs_rebuild` も評価しない）——WHERE で除外された行が churn に見えて
+///    無用な再構築を誘発したり、`FullVisible` の次クエリが参照するはずの
+///    キャッシュ済みオーバーレイを汚したりしないようにする。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_subset_or_fallback(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    provider: &dyn SearchProvider,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    let full_scan = |cache: &HnswIndexCache| -> Result<Vec<CandidateHit>, KernelError> {
+        cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        let input = SearchInput {
+            ids: slot_ids,
+            vectors: arena.vectors(),
+            dim: arena.dim(),
+            query,
+            k,
+        };
+        provider.search(input)
+    };
+
+    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+        Lookup::BuildFailedThisGeneration | Lookup::Miss => return full_scan(access.cache),
+        Lookup::Ready(base, _full_arena_overlay) => base,
+        Lookup::NeedOverlay(base) => base,
+    };
+
+    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
+        return full_scan(access.cache);
+    };
+    if base.arena_identity_mismatch_guard(arena, ctx) {
+        // `FullVisible` 経路（`search_or_fallback`）と異なり、ここでは巻き添えを
+        // 避けるためエントリを退避しない（この不整合は通常発生しない防御的
+        // 経路であり、`FullVisible` クエリが正しく参照し続けられる余地を
+        // 残す。§本関数ドキュメンテーションコメント参照）。
+        return full_scan(access.cache);
+    }
+
+    // per-query の写像を計算する（キャッシュへは登録しない。§本関数
+    // ドキュメンテーションコメント参照）。`Overlay::compute` は「渡された
+    // arena のスロット番号系列に対する索引済みノードの写像」を汎用的に計算
+    // するため、可視全集合ではなく WHERE 適用後の部分集合アリーナを渡しても
+    // そのまま正しく動く（部分集合に含まれない索引済みノードは自然に
+    // `STALE_SLOT` として除外される）。
+    let overlay = Arc::new(Overlay::compute(&base, arena, current_generation));
+    search_with_overlay(
+        access,
+        base,
+        overlay,
+        provider,
+        arena,
+        query,
+        k,
+        OverlaySuccessStat::SubsetSearches,
+    )
 }
 
 impl IndexedBase {
@@ -984,16 +1139,31 @@ fn record_overlay_for(
     }
 }
 
+/// [`search_with_overlay`] が完了時に成功統計をどこへ加算するか（Issue #409）。
+/// `NeedOverlay`（再構築直後）経路からは `None` を渡し従来どおり計上しない。
+#[derive(Clone, Copy)]
+enum OverlaySuccessStat {
+    /// `FullVisible` 形状・`Lookup::Ready` 到達（`hits` の既存契約を変えない）。
+    Hits,
+    /// `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE。Issue #409）。
+    SubsetSearches,
+    /// 再構築直後の恒等オーバーレイ等、成功統計を計上しない経路。
+    None,
+}
+
 /// [`Lookup::Ready`]（または `NeedOverlay` から新規計算した直後）に共通する索引
-/// 探索＋未索引分 brute-force のマージ本体。
-/// `from_ready` は呼び出し元が [`Lookup::Ready`] から到達したか（`true`）、
-/// `NeedOverlay` から新規計算したオーバーレイで到達したか（`false`）を示す
-/// （codex-review P2 指摘対応）。`hits`（統計上の契約:「索引済みノードを実際に
-/// 探索できた回数（`Ready` 到達かつ縮退なし）」）は `from_ready` かつ本関数が
-/// brute-force へ一切縮退せず完了した場合にのみここで加算する。`lookup` 側で
-/// `Ready` 到達の時点で先に加算すると、本関数がその後 `k + stale_nodes > MAX_EF`・
-/// 写像検証失敗・索引探索エラー等で縮退した場合に `hits` と `fallbacks` の両方へ
-/// 同一呼び出しが二重計上されてしまう。
+/// 探索＋未索引分 brute-force のマージ本体（Issue #409 で「可視候補数 ÷ 索引
+/// ノード数」の比による plain scan／マスク付き ANN 探索の切替へ書き換え。
+/// 旧実装の `k + stale_nodes` オーバーフェッチ〔`k_idx > MAX_EF` で即座に全件
+/// brute-force へ縮退〕は撤去し、`Overlay::visible_mask` を
+/// `crate::hnsw::HnswIndex::search_masked` へ渡すことで失効ノードを構造的に
+/// 除外する。詳細は `docs/design/hnsw-rls-cardinality-switch.md` 参照）。
+///
+/// `success_stat` は本関数が縮退なしで完了した場合にどの統計を加算するかを
+/// 指定する（[`OverlaySuccessStat`] 参照。codex-review P2 指摘対応の延長:
+/// `lookup` 側で先に加算すると、本関数がその後の分岐で縮退した場合に成功統計と
+/// `fallbacks` の両方へ同一呼び出しが二重計上されてしまうため、常に本関数の
+/// 末尾でのみ確定させる）。
 ///
 /// 引数 8 個は `clippy::too_many_arguments`（閾値 7）を超えるが、`search_or_fallback`
 /// と同じ方針（本ファイル内 `#[allow(clippy::too_many_arguments)]` 参照）で許容する。
@@ -1006,21 +1176,39 @@ fn search_with_overlay(
     arena: &VectorArena,
     query: &[f32],
     k: usize,
-    from_ready: bool,
+    success_stat: OverlaySuccessStat,
 ) -> Result<Vec<CandidateHit>, KernelError> {
     if overlay.arena_len != arena.len() {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }
-    let k_idx = k.saturating_add(overlay.stale_nodes);
-    if k_idx > crate::hnsw::MAX_EF {
+
+    // 可視カーディナリティ切替（Issue #409・`HnswParams::full_scan_ratio`）:
+    // `visible_in_index / index.len() < full_scan_ratio` なら plain scan
+    // （アリーナ全体の brute-force）。整数比較 `visible_in_index * den <
+    // index.len() * num` で丸め誤差を避け、`checked_mul` のオーバーフロー時は
+    // fail-closed に plain scan へ倒す（比較不能を「索引を信用しない」側へ）。
+    let ratio = access.provider.params().full_scan_ratio;
+    let index_len = base.index.len();
+    let visible_in_index = overlay.visible_in_index;
+    let below_ratio = match (
+        (visible_in_index as u64).checked_mul(ratio.denominator as u64),
+        (index_len as u64).checked_mul(ratio.numerator as u64),
+    ) {
+        (Some(lhs), Some(rhs)) => lhs < rhs,
+        _ => true,
+    };
+    if index_len == 0 || below_ratio {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }
-    let ef = access.provider.effective_ef(k_idx);
+
+    let ef = access.provider.effective_ef(k);
     let index_hits = SEARCH_SCRATCH.with(|scratch| {
         let mut scratch = scratch.borrow_mut();
-        base.index.search(query, k_idx, ef, &mut scratch)
+        base.index
+            .search_masked(query, k, ef, Some(&overlay.visible_mask), &mut scratch)
     });
     let index_hits = match index_hits {
         Ok(hits) => hits,
@@ -1030,6 +1218,18 @@ fn search_with_overlay(
         }
     };
 
+    // マスク付き探索の結果件数が「可視ノード数と要求 k の小さい方」に満たない
+    // 場合、ビーム幅内でグラフ探索が可視ノードを十分辿り切れなかったことを
+    // 意味する（§`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
+    // `#410` の担当である `ef` 拡張再探索は行わず、fail-closed に plain scan へ
+    // 縮退して k 件充足を保証する。
+    let expected = k.min(visible_in_index);
+    if index_hits.len() < expected {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access.cache.masked_short.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+
     let mut mapped: Vec<CandidateHit> = Vec::with_capacity(index_hits.len());
     for hit in index_hits {
         let node = hit.id as u32;
@@ -1038,7 +1238,13 @@ fn search_with_overlay(
             return full_scan_with_arena(provider, arena, query, k);
         };
         if slot == STALE_SLOT {
-            continue;
+            // `search_masked` はマスク受理ノードのみを結果に含むはずであり、
+            // 通常この分岐には到達しない（`overlay.visible_mask` は
+            // `slot_of_node[node] != STALE_SLOT` のノードのみを受理する）。
+            // マスクとオーバーレイの不整合という想定外事態を fail-closed に
+            // 全件 brute-force へ倒す（黙って握りつぶさない）。
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            return full_scan_with_arena(provider, arena, query, k);
         }
         let slot_usize = slot as usize;
         let Some(node_key) = base.node_keys.get(node as usize) else {
@@ -1078,11 +1284,16 @@ fn search_with_overlay(
     mapped.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
     mapped.dedup_by(|a, b| a.id == b.id);
     mapped.truncate(k);
-    if from_ready {
+    match success_stat {
         // ここへ到達するのは、上記のいずれの縮退分岐（`fallbacks` 加算）も通らず
-        // 索引探索が完了した場合のみ。`Ready` 到達かつ縮退なしという `hits` の
-        // 契約はこの時点で初めて確定する。
-        access.cache.hits.fetch_add(1, Ordering::Relaxed);
+        // 索引探索が完了した場合のみ。成功統計の契約はこの時点で初めて確定する。
+        OverlaySuccessStat::Hits => {
+            access.cache.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        OverlaySuccessStat::SubsetSearches => {
+            access.cache.subset_searches.fetch_add(1, Ordering::Relaxed);
+        }
+        OverlaySuccessStat::None => {}
     }
     Ok(mapped)
 }
@@ -1114,6 +1325,19 @@ mod tests {
     use crate::rls::ImplicitRlsHook;
     use crate::storage::{RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// 恒等マスク（全ノード受理）＋全ノード可視の `visible_in_index` を返す
+    /// テスト専用ヘルパ（Issue #409 で `Overlay` に追加した 2 フィールドを
+    /// 「未失効の索引をそのまま使う」テストで簡潔に埋めるため）。
+    fn identity_mask_and_visible(base: &IndexedBase) -> (crate::hnsw::NodeMask, usize) {
+        let mut mask = crate::hnsw::NodeMask::new(base.index.len());
+        for node in 0..base.index.len() {
+            if let Ok(node_u32) = u32::try_from(node) {
+                mask.set(node_u32);
+            }
+        }
+        (mask, base.index.len())
+    }
 
     fn ctx(tenant: &str) -> PolicyContext {
         PolicyContext::new(tenant).expect("valid tenant")
@@ -1438,6 +1662,7 @@ mod tests {
             .expect("build");
         let base = Arc::new(base);
 
+        let (visible_mask, visible_in_index) = identity_mask_and_visible(&base);
         let overlay = Arc::new(Overlay {
             generation: gen,
             arena_len: arena.len() + 1,
@@ -1445,6 +1670,8 @@ mod tests {
             stale_nodes: 0,
             delta_slots: Vec::new(),
             delta_vectors: Vec::new(),
+            visible_mask,
+            visible_in_index,
         });
 
         let access = HnswCacheAccess {
@@ -1454,9 +1681,17 @@ mod tests {
         };
         let provider = crate::kernel::CpuScalarProvider;
         let query = [1.0, 0.0, 0.0, 0.0];
-        let result =
-            search_with_overlay(&access, base, overlay, &provider, &arena, &query, 1, true)
-                .expect("fallback search succeeds");
+        let result = search_with_overlay(
+            &access,
+            base,
+            overlay,
+            &provider,
+            &arena,
+            &query,
+            1,
+            OverlaySuccessStat::Hits,
+        )
+        .expect("fallback search succeeds");
         assert_eq!(result.len(), 1);
 
         let stats = cache.stats();
@@ -1500,6 +1735,7 @@ mod tests {
         let gen0 =
             crate::catalog::table_generation_in_txn(&storage.db().begin_read().unwrap(), table0)
                 .unwrap();
+        let (visible_mask, visible_in_index) = identity_mask_and_visible(base0);
         let overlay = Arc::new(Overlay {
             generation: gen0,
             arena_len: base0.index.len(),
@@ -1507,6 +1743,8 @@ mod tests {
             stale_nodes: 0,
             delta_slots: Vec::new(),
             delta_vectors: Vec::new(),
+            visible_mask,
+            visible_in_index,
         });
         let access = HnswCacheAccess {
             storage: &storage,
@@ -1715,6 +1953,7 @@ mod tests {
         // みを大きくできる。
         let oversized_len = (MAX_HNSW_CACHE_TOTAL_BYTES / std::mem::size_of::<f32>()) + 1_000_000;
         let delta_vectors: Vec<f32> = Vec::with_capacity(oversized_len);
+        let (visible_mask, visible_in_index) = identity_mask_and_visible(&base);
         let overlay = Arc::new(Overlay {
             generation: gen,
             arena_len: arena.len(),
@@ -1722,6 +1961,8 @@ mod tests {
             stale_nodes: 0,
             delta_slots: Vec::new(),
             delta_vectors,
+            visible_mask,
+            visible_in_index,
         });
         assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
 

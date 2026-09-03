@@ -185,6 +185,7 @@ fn same_seed_produces_identical_graph() {
         m: 8,
         ef_construction: 40,
         ef_search: 20,
+        ..HnswParams::default()
     };
     let (_, index_a) = build_fixture(params, 42);
     let (_, index_b) = build_fixture(params, 42);
@@ -207,6 +208,7 @@ fn different_seed_yields_a_different_graph() {
         m: 8,
         ef_construction: 40,
         ef_search: 20,
+        ..HnswParams::default()
     };
     let (_, index_a) = build_fixture(params, 1);
     let (_, index_b) = build_fixture(params, 2);
@@ -244,6 +246,7 @@ fn layer_structure_invariants_hold() {
         m: 8,
         ef_construction: 40,
         ef_search: 20,
+        ..HnswParams::default()
     };
     let (_, index) = build_fixture(params, 7);
 
@@ -325,6 +328,7 @@ fn degree_limits_are_respected_and_links_are_well_formed() {
         m: 6,
         ef_construction: 32,
         ef_search: 16,
+        ..HnswParams::default()
     };
     let (_, index) = build_fixture(params, 11);
 
@@ -346,6 +350,7 @@ fn degree_limits_are_respected_on_duplicate_heavy_corpus() {
         m: 6,
         ef_construction: 32,
         ef_search: 16,
+        ..HnswParams::default()
     };
     for seed in 0..10u64 {
         let vectors = gen_duplicate_heavy_corpus(seed, 12, 400, 5);
@@ -378,6 +383,7 @@ fn each_layer_is_connected_from_the_entry_point() {
         m: 8,
         ef_construction: 48,
         ef_search: 24,
+        ..HnswParams::default()
     };
     let (_, index) = build_fixture(params, 55);
     let entry = index.entry_point().unwrap();
@@ -485,6 +491,7 @@ fn randomized_configs_and_duplicate_heavy_corpus_stay_fully_connected() {
                 m: cfg.m,
                 ef_construction: 48,
                 ef_search: 24,
+                ..HnswParams::default()
             };
             let index = HnswIndex::build(params, cfg.dim as u32, &vectors, seed)
                 .expect("build should succeed");
@@ -498,6 +505,7 @@ fn randomized_configs_and_duplicate_heavy_corpus_stay_fully_connected() {
             m: 6,
             ef_construction: 32,
             ef_search: 16,
+            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, 12, &vectors, seed).expect("build should succeed");
         assert_fully_connected_from_entry(&index);
@@ -557,6 +565,7 @@ mod parallel_build_invariants {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
+            ..HnswParams::default()
         };
         let seed = 123u64;
 
@@ -622,6 +631,7 @@ mod parallel_build_invariants {
                     m: cfg.m,
                     ef_construction: 48,
                     ef_search: 24,
+                    ..HnswParams::default()
                 };
                 let index =
                     HnswIndex::build_with_threads(params, cfg.dim as u32, &vectors, seed, 4)
@@ -641,6 +651,7 @@ mod parallel_build_invariants {
             m: 6,
             ef_construction: 32,
             ef_search: 16,
+            ..HnswParams::default()
         };
         for seed in 0..4u64 {
             let vectors = gen_duplicate_heavy_corpus(seed, 12, PARALLEL_ROWS, 5);

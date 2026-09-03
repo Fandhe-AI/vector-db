@@ -116,10 +116,30 @@ pub const SEQUENTIAL_PREFIX_NODES: usize = 256;
 /// [`HnswIndex::build_parallel`] が決める並列度もこの上限でクランプされる）。
 pub const MAX_BUILD_THREADS: usize = 16;
 
+/// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
+/// 両立しない（`f32` は `Eq` を実装しない）ため、Issue #401 の `REBUILD_DELTA_RATIO`
+/// （`(u64, u64)` タプル）と同じ発想で構造体化した（Issue #409。`sql::hnsw_cache`
+/// の可視カーディナリティ切替閾値 `HnswParams::full_scan_ratio` に使う）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ratio {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+impl fmt::Display for Ratio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.numerator, self.denominator)
+    }
+}
+
 /// HNSW 構築パラメータ。
 ///
 /// 既定値（`M=16`／`ef_construction=100`／`ef_search=64`）は ADR 起票 Issue #403
 /// に記載の本リポ採用値（非規範的な実装既定値。spec 側の確定値ではない）。
+/// `full_scan_ratio`（既定 1/10）は Issue #409 の可視カーディナリティ切替
+/// 閾値で、`sql::hnsw_cache::HnswIndexCache` が「可視候補数 ÷ 索引ノード数」の
+/// 比がこの値未満なら plain scan（brute-force）、以上ならマスク付き ANN 探索を
+/// 選ぶ判定に使う（本リポの実装既定値。非規範）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswParams {
     /// 挿入後に各ノードが層 1 以上で保持する隣接数の目安（層 0 は `2*m` まで許容する。
@@ -129,6 +149,8 @@ pub struct HnswParams {
     pub ef_construction: usize,
     /// 探索時の候補幅（本モジュールでは構築後のパラメータ保持のみ。実際の探索は #405）。
     pub ef_search: usize,
+    /// 可視カーディナリティ切替の閾値比（Issue #409）。`sql::hnsw_cache` 参照。
+    pub full_scan_ratio: Ratio,
 }
 
 impl Default for HnswParams {
@@ -137,6 +159,10 @@ impl Default for HnswParams {
             m: 16,
             ef_construction: 100,
             ef_search: 64,
+            full_scan_ratio: Ratio {
+                numerator: 1,
+                denominator: 10,
+            },
         }
     }
 }
@@ -174,6 +200,16 @@ impl HnswParams {
         if self.ef_search > MAX_EF {
             return Err(HnswError::InvalidParams {
                 reason: "ef_search exceeds MAX_EF",
+            });
+        }
+        if self.full_scan_ratio.denominator == 0 {
+            return Err(HnswError::InvalidParams {
+                reason: "full_scan_ratio denominator must be >= 1",
+            });
+        }
+        if self.full_scan_ratio.numerator > self.full_scan_ratio.denominator {
+            return Err(HnswError::InvalidParams {
+                reason: "full_scan_ratio numerator must not exceed denominator",
             });
         }
         Ok(())
@@ -520,6 +556,75 @@ impl VisitedSet for VisitedBitmap {
 
     fn mark_visited(&mut self, id: usize) -> Option<bool> {
         VisitedBitmap::mark_visited(self, id)
+    }
+}
+
+/// [`HnswIndex::search_masked`]（Issue #409）が受け取る候補マスク。索引ノード
+/// （`build` 時に割り当てたノード番号）のうち、結果集合へ含めてよいものを
+/// 1 ビット 1 ノードで表す。§`search_layer` ドキュメンテーションコメント
+/// 「候補マスク」の位置づけ参照——テナント境界ではなく、`sql::hnsw_cache` が
+/// クエリ時点の候補集合（アリーナ）と索引ノードの差分を表現する装置。
+///
+/// `VisitedBitmap` と同型だが役割が異なる（訪問済み管理 ≠ 受理可否）ため
+/// 別の型として持つ。
+#[derive(Debug, Clone)]
+pub struct NodeMask {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl NodeMask {
+    /// `len` ノード分（すべて false）で初期化する。
+    pub fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    /// `node` を受理対象に加える。範囲外は無視する（呼び出し元が索引の
+    /// `len()` 以内の値のみを渡す契約。fail-closed に「何も起きない」側へ倒す）。
+    pub fn set(&mut self, node: u32) {
+        let idx = node as usize;
+        if idx >= self.len {
+            return;
+        }
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        if let Some(word) = self.words.get_mut(word_idx) {
+            *word |= 1u64 << bit_idx;
+        }
+    }
+
+    /// `node` が受理対象か（範囲外は `false`。`unwrap`/`[]` を使わない）。
+    pub fn get(&self, node: u32) -> bool {
+        let idx = node as usize;
+        if idx >= self.len {
+            return false;
+        }
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        match self.words.get(word_idx) {
+            Some(word) => (*word & (1u64 << bit_idx)) != 0,
+            None => false,
+        }
+    }
+
+    /// マスクが表すノード総数（構築時の索引ノード数と一致する契約。
+    /// [`HnswIndex::search_masked`] がこの値と `self.len()` の不一致を
+    /// `HnswError::InvalidParams` として拒否する）。
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// マスクが空（`len == 0`）か。
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// 受理対象に設定されているノード数。
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
     }
 }
 
@@ -934,6 +1039,7 @@ impl HnswIndex {
                 dim,
                 vectors,
                 visited,
+                None,
             )?;
             // 層 0 は次数上限が最大 2*m まで許容される（`shrink_links` が参照する
             // `max_degree_for` 側で扱う）が、新規ノード自身の選択本数は Algorithm 1
@@ -1014,7 +1120,17 @@ impl HnswIndex {
     /// 方式の [`VisitedBitmap`] を渡し、両者は `V: VisitedSet` のジェネリック
     /// パラメータとして本関数に共有される。各呼び出しの先頭で `reset` するだけ
     /// でよい契約は変わらない。
-    #[allow(clippy::too_many_arguments)] // visited 追加で 8 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
+    /// `accept`（Issue #409。`sql::hnsw_cache::search_with_overlay` のマスク付き
+    /// 探索から渡される）が `Some` の場合、候補ヒープ（`candidates`）は従来どおり
+    /// 全ノードを対象に拡張するが、結果ヒープ（`results`）へは `accept` が
+    /// 受理するノードのみを積む。`None`（既存の呼び出し元。`search`・構築経路）
+    /// では常に受理したのと同じ振る舞いになり、`search_layer` はビット同一の
+    /// 結果を返す（`crate::hnsw::tests::search_masked_none_matches_search` 参照）。
+    /// このマスクは §モジュールドキュメント「候補マスク」節のとおりテナント境界
+    /// ではなく、クエリ時点の候補集合（アリーナ）と索引ノードの差分を表す装置に
+    /// すぎない（実テナント境界は索引構築入力・呼び出し元の `provider_result_is_valid`・
+    /// `RlsSafetyNet` の多層防御が担う。`sql::hnsw_cache` モジュールドキュメント参照）。
+    #[allow(clippy::too_many_arguments)] // visited・accept 追加で 9 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
     pub(crate) fn search_layer<V: VisitedSet>(
         &self,
         entry_points: Vec<u32>,
@@ -1024,11 +1140,13 @@ impl HnswIndex {
         dim: usize,
         vectors: &[f32],
         visited: &mut V,
+        accept: Option<&NodeMask>,
     ) -> Result<Vec<ScoredNode>, HnswError> {
         visited.reset(self.nodes.len());
         let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
         // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
         let mut results: BinaryHeap<std::cmp::Reverse<ScoredNode>> = BinaryHeap::new();
+        let is_accepted = |node: u32| accept.map(|m| m.get(node)).unwrap_or(true);
 
         for ep in entry_points {
             match visited.mark_visited(ep as usize) {
@@ -1039,7 +1157,9 @@ impl HnswIndex {
             let score = self.score(ep, query, dim, vectors)?;
             let scored = ScoredNode { node: ep, score };
             candidates.push(scored);
-            results.push(std::cmp::Reverse(scored));
+            if is_accepted(ep) {
+                results.push(std::cmp::Reverse(scored));
+            }
         }
 
         while let Some(top_candidate) = candidates.pop() {
@@ -1079,7 +1199,12 @@ impl HnswIndex {
                     };
                     // 受理判定も打ち切り判定と同じ理由でスコアのみの比較に限定
                     // する（`scored` が `worst` とスコア同点なら、id 順の複合
-                    // 順序で「劣る」と判定されても受理する）。
+                    // 順序で「劣る」と判定されても受理する）。`worst_ok` は結果
+                    // ヒープの現在の最悪値との比較のみで決まり、`accept` の
+                    // 受理可否とは独立（マスク外ノードでも `worst_ok` を満たせば
+                    // 候補ヒープには積み、その先の未訪問隣接（マスク内かもしれない）
+                    // への探索を続ける。`accept` は結果ヒープへ積むかどうかのみを
+                    // 絞る。§`search_layer` ドキュメンテーションコメント参照）。
                     let worst_ok = match results.peek() {
                         Some(std::cmp::Reverse(worst)) => {
                             results.len() < ef
@@ -1089,9 +1214,11 @@ impl HnswIndex {
                     };
                     if worst_ok {
                         candidates.push(scored);
-                        results.push(std::cmp::Reverse(scored));
-                        if results.len() > ef {
-                            results.pop();
+                        if is_accepted(neighbor) {
+                            results.push(std::cmp::Reverse(scored));
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
@@ -1338,6 +1465,32 @@ impl HnswIndex {
         ef: usize,
         scratch: &mut HnswSearchScratch,
     ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        self.search_masked(query, k, ef, None, scratch)
+    }
+
+    /// [`Self::search`] のマスク付き版（Issue #409）。`mask` が `Some` の場合、
+    /// 層 0 のビーム探索（[`Self::search_layer`]）へ候補マスクとして渡し、
+    /// 結果は `mask` が受理するノードに限られる。`None` の場合は [`Self::search`]
+    /// とビット同一の結果を返す（`crate::hnsw::tests::search_masked_none_matches_search`
+    /// で機械検証）。
+    ///
+    /// 上位層の貪欲降下（[`Self::greedy_descend`]）はマスクを一切参照しない
+    /// （§`search_layer` ドキュメンテーションコメント参照。マスクは層 0 の
+    /// 結果受理のみに影響する）。
+    ///
+    /// # エラー
+    ///
+    /// [`Self::search`] と同じ検証順序に加え、`mask.len() != self.len()`
+    /// （索引のノード数と不一致）は [`HnswError::InvalidParams`] として拒否する
+    /// （fail-closed。呼び出し元が古い索引世代のマスクを渡す事故を検出する）。
+    pub fn search_masked(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        mask: Option<&NodeMask>,
+        scratch: &mut HnswSearchScratch,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
         let dim_usize = self.dim as usize;
         if query.len() != dim_usize {
             return Err(HnswError::QueryDimMismatch {
@@ -1357,6 +1510,13 @@ impl HnswIndex {
             return Err(HnswError::InvalidParams {
                 reason: "k exceeds MAX_EF",
             });
+        }
+        if let Some(m) = mask {
+            if m.len() != self.nodes.len() {
+                return Err(HnswError::InvalidParams {
+                    reason: "mask length does not match index node count",
+                });
+            }
         }
         if k == 0 || self.nodes.is_empty() {
             return Ok(Vec::new());
@@ -1390,6 +1550,7 @@ impl HnswIndex {
             dim_usize,
             &self.vectors,
             &mut scratch.visited,
+            mask,
         )?;
 
         let out: Vec<crate::kernel::CandidateHit> = results
@@ -1852,6 +2013,7 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
+            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 99).unwrap();
 
@@ -1882,6 +2044,7 @@ mod tests {
                     dim,
                     &vectors,
                     &mut visited,
+                    None,
                 )
                 .unwrap();
             if found.iter().any(|c| c.node == true_nearest) {
@@ -1935,7 +2098,7 @@ mod tests {
         let query = [1.0f32];
         let mut visited = VisitedScratch::default();
         let results = index
-            .search_layer(vec![0], &query, 1, 0, dim, &vectors, &mut visited)
+            .search_layer(vec![0], &query, 1, 0, dim, &vectors, &mut visited, None)
             .expect("search_layer should succeed");
         assert_eq!(
             results.iter().map(|s| s.node).collect::<Vec<_>>(),
@@ -2009,6 +2172,103 @@ mod tests {
             "search must beam through the tied-score node to reach node 2, then \
              fall back to node 0 (score 10.0) as the 2nd best"
         );
+    }
+
+    #[test]
+    fn search_masked_none_matches_search() {
+        let dim = 8usize;
+        let vectors = gen_corpus(7, dim, 200);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 7).unwrap();
+        let query = gen_corpus(999, dim, 1);
+        let mut scratch_a = HnswSearchScratch::default();
+        let mut scratch_b = HnswSearchScratch::default();
+        let via_search = index.search(&query, 10, 40, &mut scratch_a).unwrap();
+        let via_masked = index
+            .search_masked(&query, 10, 40, None, &mut scratch_b)
+            .unwrap();
+        assert_eq!(via_search, via_masked);
+    }
+
+    #[test]
+    fn search_masked_results_are_subset_of_mask() {
+        let dim = 8usize;
+        let n = 200;
+        let vectors = gen_corpus(11, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 11).unwrap();
+        let mut mask = NodeMask::new(index.len());
+        // 偶数ノードのみ受理する（密度 50%）。
+        for node in 0..index.len() {
+            if node % 2 == 0 {
+                mask.set(node as u32);
+            }
+        }
+        let query = gen_corpus(1234, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let results = index
+            .search_masked(&query, 20, 80, Some(&mask), &mut scratch)
+            .unwrap();
+        assert!(!results.is_empty(), "masked search should find some hits");
+        for hit in &results {
+            assert!(
+                mask.get(hit.id as u32),
+                "hit {} must be within the mask",
+                hit.id
+            );
+        }
+    }
+
+    #[test]
+    fn search_masked_all_false_returns_empty() {
+        let dim = 8usize;
+        let n = 100;
+        let vectors = gen_corpus(3, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 3).unwrap();
+        let mask = NodeMask::new(index.len());
+        let query = gen_corpus(55, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let results = index
+            .search_masked(&query, 10, 40, Some(&mask), &mut scratch)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_masked_rejects_length_mismatch() {
+        let dim = 4usize;
+        let vectors = gen_corpus(2, dim, 50);
+        let params = HnswParams {
+            m: 6,
+            ef_construction: 32,
+            ef_search: 16,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 2).unwrap();
+        // 索引のノード数より短いマスクは拒否される（fail-closed）。
+        let mask = NodeMask::new(index.len().saturating_sub(1));
+        let query = gen_corpus(8, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let err = index
+            .search_masked(&query, 5, 20, Some(&mask), &mut scratch)
+            .unwrap_err();
+        assert!(matches!(err, HnswError::InvalidParams { .. }));
     }
 
     /// codex-review PR #430 P1 指摘への対応で `HnswIndex` は `build` 時の
