@@ -157,6 +157,54 @@ self.effective_ef(k), scratch)`）を呼ぶ際に使う契約関数として、u
   `crates/engine/tests/hnsw_provider.rs`（クレート外部公開 API のみで検証）の
   双方で固定
 
+## 追記（codex-review P1 対応・PR #433）
+
+初版実装（上記「設計」節）には 2 件の P1 指摘があり、いずれも対応済み。
+
+1. **`build` の公開性**: `SearchEngineKind::Hnsw(HnswParams)` が `pub` である
+   以上、`build(kind)` も `pub` のままだと外部 crate が未検証の `HnswParams`
+   を直接渡して不正値を保持した provider を構築できてしまい、「`build_validated`
+   を経由する限り不正値は到達しない」という契約と矛盾していた。`build` を
+   `pub(crate)` へ変更し、crate 外から provider を構築する経路を
+   `build_validated` の 1 本へ絞った。
+2. **`HnswSearchProvider::new` の公開性**: `crate::hnsw` は公開モジュール
+   （`lib.rs::pub mod hnsw`）のため、`search_engine::build_validated` を経由
+   しない `HnswSearchProvider::new(params)` の直接呼び出しも外部から到達し、
+   (1) と同じ問題を作れた。`new` は `pub` のまま維持しつつ（`hnsw_provider.rs`
+   の既存契約テストが「外部利用者と同じ到達性」を意図的に検証しているため）、
+   `Self::new(params) -> Result<Self, HnswError>` へ変更し `HnswParams::validate`
+   を内部で通すようにした——検証を `search_engine.rs` 側の呼び出し規約ではなく
+   provider 自身の契約として持たせ、どちらの経路から構築しても不正値を拒否する。
+3. **`wire_code()` の削除**: `SearchEngineError::wire_code()` が返していた
+   `22023` は TASK-101（RECOVER-10）の `ErrorClass::OperationIdContentMismatch`
+   が既に占有する値の流用であり、ERR-2 の「分類 ⇔ `wire_code` 一意対応」契約
+   （`error_format.rs::wire_codes_are_pairwise_distinct`）の外側でコードが衝突
+   していた。本 Issue は wire／SQL 表層への露出を持たないため、`wire_code()`・
+   `INVALID_ENGINE_SPEC_WIRE_CODE` を削除し公開しないことにした。正式な
+   `ErrorClass` 登録は spec 側のビヘイビア ID 確定後の別タスクへ申し送る
+   （変更なし）。
+
+対応後の公開シグネチャ:
+
+```rust
+// search_engine.rs（build は pub(crate)。build_validated のみ crate 外から呼べる）
+fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
+pub fn build_validated(kind: SearchEngineKind)
+    -> Result<Box<dyn SearchProvider>, SearchEngineError>;
+
+pub enum SearchEngineError {
+    InvalidHnswParams(crate::hnsw::HnswError),
+    // wire_code() は持たない（上記 3.）
+}
+
+// hnsw/provider.rs
+impl HnswSearchProvider {
+    pub fn new(params: HnswParams) -> Result<Self, crate::hnsw::HnswError>; // 自身で validate
+    pub fn params(&self) -> HnswParams;
+    pub fn effective_ef(&self, k: usize) -> usize;
+}
+```
+
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 
 1. 索引済み集合と `SearchInput` の差分を判定する世代整合キャッシュは、

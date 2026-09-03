@@ -111,14 +111,16 @@ fn core9_build_variants_agree_on_same_input() {
     let storage_cpu = seed_storage(&dir_cpu);
     let core_cpu = EngineCore::from_storage(
         storage_cpu,
-        search_engine::build(SearchEngineKind::CpuScalarBruteForce),
+        search_engine::build_validated(SearchEngineKind::CpuScalarBruteForce)
+            .expect("CpuScalarBruteForce always validates"),
     );
 
     let dir_parallel = TempDir::new("core9-build-parallel");
     let storage_parallel = seed_storage(&dir_parallel);
     let core_parallel = EngineCore::from_storage(
         storage_parallel,
-        search_engine::build(SearchEngineKind::ParallelBruteForce),
+        search_engine::build_validated(SearchEngineKind::ParallelBruteForce)
+            .expect("ParallelBruteForce always validates"),
     );
 
     let ctx = PolicyContext::new("tenant-a").expect("valid tenant");

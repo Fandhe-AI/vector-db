@@ -37,6 +37,12 @@
 //! 不正な `HnswParams`（[`crate::hnsw::HnswParams::validate`] が拒否する値）は
 //! `SearchEngineKind::Hnsw` 自体には現れない（`open_with_engine` 等の呼び出し時点で
 //! [`SearchEngineError`] として fail-closed に拒否され、`EngineCore` は構築されない）。
+//! この不変条件は本モジュールの [`build_validated`] だけでなく、`crate::hnsw` が
+//! 公開モジュール（`lib.rs::pub mod hnsw`）であるために本モジュールを経由せず直接
+//! 到達しうる [`crate::hnsw::provider::HnswSearchProvider::new`] 自身の検証でも
+//! 二重に維持する（codex-review P1 指摘・Issue #407 追記。`hnsw/provider.rs`
+//! モジュールドキュメント参照）。infallible な [`build`] 自体は `pub(crate)` に留め、
+//! 外部呼び出し元は必ず検証を行う [`build_validated`] を経由する。
 
 use crate::hnsw::provider::HnswSearchProvider;
 use crate::hnsw::HnswParams;
@@ -60,39 +66,29 @@ pub enum SearchEngineKind {
     /// HNSW 近似最近傍探索（`hnsw.rs::HnswIndex`、Issue #403 ADR B 案）。opt-in
     /// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節参照）。保持する
     /// `HnswParams` は構築前に [`SearchEngineError`] として検証済み（このモジュールの
-    /// 呼び出し元、`build`／`build_validated` を経由する限り不正値は到達しない）。
+    /// 呼び出し元、[`build_validated`] を経由する限り不正値は到達しない。
+    /// `crate::hnsw::provider::HnswSearchProvider::new` 自身も同じ検証を行う二重防御に
+    /// ついてはモジュールドキュメント参照）。
     Hnsw(HnswParams),
 }
 
-/// `SearchEngineKind::Hnsw` の構築が失敗した理由（`22023` 相当。TASK-152・ERR-2 の
-/// 分類リストへの新規登録は行わない——本 variant が返す `22023` は既存分類
+/// `SearchEngineKind::Hnsw` の構築が失敗した理由。
+///
+/// TASK-152・ERR-2 の分類リストへの新規登録・`wire_code()` の公開は行わない
+/// （codex-review P1 指摘・Issue #407 追記）: 本 variant を SQLSTATE 風コードで
+/// 表すなら `22023` が字面上は近いが、その値は既存分類
 /// `error_format::ErrorClass::OperationIdContentMismatch`（TASK-101・RECOVER-10）が
-/// 既に占有しており、ERR-2 の「分類 ⇔ `wire_code` 一意対応」契約
-/// （`error_format.rs::wire_codes_are_pairwise_distinct`）を壊さずに本 variant 用の
-/// 新分類を追加することはできない。本 Issue は wire／SQL 表層への露出を持たず
-/// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節）、`22023` の正式な
-/// `ErrorClass` 登録・`wire-server` への伝播は spec 側のビヘイビア ID 確定後の
+/// 既に占有しており、流用すると ERR-2 の「分類 ⇔ `wire_code` 一意対応」契約
+/// （`error_format.rs::wire_codes_are_pairwise_distinct`）が保証する一意性の外側で
+/// コードが衝突する。本 Issue は wire／SQL 表層への露出を持たない
+/// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節）ため、正式な
+/// `ErrorClass` 登録・`wire_code()` の追加は spec 側のビヘイビア ID 確定後の
 /// 別タスクへ申し送る（`docs/design/hnsw-search-engine-wiring.md` 参照）。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchEngineError {
     /// [`HnswParams::validate`] が拒否した。
     InvalidHnswParams(crate::hnsw::HnswError),
-}
-
-/// [`SearchEngineError`] が返す SQLSTATE 風コード。ERR-2 表の既存分類
-/// （`OperationIdContentMismatch`）と同じ値を返す定数であり、`ErrorClass` への
-/// 新規登録ではない（[`SearchEngineError`] ドキュメント参照）。
-pub const INVALID_ENGINE_SPEC_WIRE_CODE: &str = "22023";
-
-impl SearchEngineError {
-    /// SQLSTATE 風コード。全 variant がこの定数を返す（[`INVALID_ENGINE_SPEC_WIRE_CODE`]
-    /// ドキュメント参照）。
-    pub const fn wire_code(&self) -> &'static str {
-        match self {
-            SearchEngineError::InvalidHnswParams(_) => INVALID_ENGINE_SPEC_WIRE_CODE,
-        }
-    }
 }
 
 impl fmt::Display for SearchEngineError {
@@ -124,28 +120,37 @@ impl fmt::Display for SearchEngineKind {
     }
 }
 
-/// `kind` に対応する `SearchProvider` 実装を構築する。
+/// `kind` に対応する `SearchProvider` 実装を構築する（crate 内部専用）。
 ///
 /// `Hnsw` の `HnswParams` は事前検証済みであることを呼び出し元が保証する契約
-/// （[`build`] は infallible）。untrusted な文字列・設定値から `SearchEngineKind::Hnsw`
-/// を組み立てる経路（`core.rs::EngineCore::open_with_engine` 等）は必ず
-/// [`build_validated`] を経由し、[`SearchEngineError`] で fail-closed に拒否してから
-/// [`build`] を呼ぶ。
+/// （本関数は infallible）。この契約を型で強制するため公開 API からは外し
+/// `pub(crate)` に限定する（codex-review P1 指摘・Issue #407 追記: 本関数が
+/// `pub` のままだと、`SearchEngineKind::Hnsw(HnswParams)` も `pub` である以上、
+/// 外部 crate が未検証の `HnswParams` を直接 `build` へ渡して不正値を保持した
+/// provider を構築できてしまい、モジュールドキュメントの「不正値は到達しない」
+/// 契約と矛盾する）。untrusted な文字列・設定値から `SearchEngineKind::Hnsw` を
+/// 組み立てる経路（`core.rs::EngineCore::open_with_engine` 等）を含め、crate 外から
+/// provider を構築する唯一の経路は必ず検証を行う [`build_validated`] とする。
 ///
 /// 呼び出し元（`core.rs::EngineCore::open` 等）はここで返る `Box<dyn SearchProvider>` を
 /// そのまま `EngineCore::with_provider` へ渡す想定（object-safe な trait のため
 /// ジェネリクスなしで受け渡しできる）。
-pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
+fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     match kind {
         SearchEngineKind::CpuScalarBruteForce => Box::new(CpuScalarProvider),
         SearchEngineKind::ParallelBruteForce => Box::new(ParallelSearchProvider),
-        SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params)),
+        SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params).expect(
+            "build() の Hnsw 分岐は build_validated 経由でのみ到達し、その時点で params は検証済み",
+        )),
     }
 }
 
 /// [`build`] の検証付き版。`kind` が `Hnsw(params)` の場合のみ
 /// [`HnswParams::validate`] を通し、失敗を [`SearchEngineError`] として fail-closed に
 /// 返す（`Hnsw` 以外の variant は現時点で検証すべきパラメータを持たないため常に成功）。
+/// 非公開の [`build`] を crate 外から呼ぶ唯一の経路であり、`SearchEngineKind` から
+/// `Box<dyn SearchProvider>` を得る公開 API はこの関数のみ（[`default_engine`] は
+/// 常に検証を要さない [`default_kind`] を経由するため対象外）。
 ///
 /// `core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`
 /// （Issue #407 で追加）が唯一の呼び出し元で、不正な `HnswParams` を持つ
@@ -216,12 +221,19 @@ mod tests {
             Ok(_) => panic!("m=1 must be rejected"),
             Err(e) => e,
         };
-        assert_eq!(err.wire_code(), "22023");
         assert!(matches!(err, SearchEngineError::InvalidHnswParams(_)));
-        // wire_code は ERR-2 表の既存分類（OperationIdContentMismatch）に逆引きできる
-        // 既知のコードであることを固定する（新分類は追加しない。モジュールドキュメント
-        // 「ANN（HNSW）の opt-in 結線」節参照）。
-        assert!(crate::error_format::ErrorClass::from_wire_code(err.wire_code()).is_some());
+    }
+
+    // `build`（crate 内部専用）に直接 Hnsw(invalid_params) を渡すコードは crate 内に
+    // 存在しない・存在させないという不変条件を、`build_validated` を経由した場合のみ
+    // 検証が効くことの確認で固定する（codex-review P1 指摘・Issue #407 追記）。
+    #[test]
+    fn hnsw_provider_new_rejects_invalid_params_directly() {
+        let invalid = HnswParams {
+            m: 1,
+            ..HnswParams::default()
+        };
+        assert!(HnswSearchProvider::new(invalid).is_err());
     }
 
     #[test]
