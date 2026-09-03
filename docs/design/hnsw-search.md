@@ -29,7 +29,6 @@ impl HnswIndex {
         query: &[f32],
         k: usize,
         ef: usize,
-        vectors: &[f32],
         scratch: &mut HnswSearchScratch,
     ) -> Result<Vec<engine::kernel::CandidateHit>, HnswError>;
 }
@@ -40,7 +39,8 @@ impl HnswIndex {
   `ef.max(k)` で `search_layer`（Algorithm 2・`pub(crate)`）によりビーム探索
   → 上位 `k` 件を返す。
 - 結果は `kernel.rs::CandidateHit` と同じ順序規約（スコア降順・同点は id
-  昇順）。`id` は `vectors` 上のノード番号（0 始まり）を `u64` 化したもの。
+  昇順）。`id` は `build` 時に渡された `vectors` 上のノード番号（0 始まり）
+  を `u64` 化したもの。
 - 実効 ef を `ef.max(k)` へ引き上げるのは、`k > ef` のときに結果集合が `k`
   件に満たない事故を防ぐため（hnswlib 等の一般的慣行）。`ef`・`k` は共に
   呼び出し前に `MAX_EF` 以下と検証済みのため `ef_eff` も `MAX_EF` 以下。
@@ -49,6 +49,23 @@ impl HnswIndex {
   はしない。`params().ef_search` は呼び出し元が渡すべき「推奨値」の位置づけ
   に留め、実際に使う `ef` を選ぶ責務は呼び出し元（#407 の provider 結線）に
   残す。
+- **ベクトルの所有方針（codex-review PR #430 P1 指摘への対応で変更）**:
+  当初は `build` と同様 `search` にも `vectors: &[f32]` を渡す借用契約
+  だったが、長さのみの照合ではサイズが同じまま内容を書き換えた・行順を
+  入れ替えたバッファを正常入力として受理してしまう問題があった（初出時
+  の対応であるサンプリング・フィンガープリント照合も、サンプリング対象
+  外の位置への書き換えは検出できない構造的な穴が残ると指摘された）。
+  `HnswIndex::build` が完了時に `vectors` の内容を `Arc<[f32]>` として
+  1 回コピーし `HnswIndex` 自身に所有させる設計へ変更し、`search` は
+  この不変スナップショットのみを参照する（呼び出し元からベクトルを
+  受け取る経路自体を廃した）。結果として「別バッファが渡される」という
+  入力のクラスが存在しなくなり、長さ・内容の不一致を照合する必要が
+  なくなった。トレードオフとして `build` 呼び出しごとに `n * dim * 4`
+  バイトの追加コピーが恒久的に発生する（旧設計が避けていたコスト）。
+  `arena.rs::VectorArena` が `vectors: Vec<f32>` のまま（`Arc` 化して
+  いない）ため、この追加コピーを `Arc::clone`（参照カウントの増分のみ）
+  へ縮退できるかは #408（世代整合キャッシュ）・#406（並列構築）側の
+  設計課題として申し送る（詳細は `hnsw.rs` モジュール冒頭コメント参照）。
 
 ## 検証順序（fail-closed）
 
@@ -57,23 +74,15 @@ impl HnswIndex {
    （`kernel.rs::KernelError::NonFiniteQuery` と同じ理由。`total_cmp` は
    NaN を最大値扱いするため、事前に拒否しないと不正なクエリ 1 件が top-k を
    恒久的に占有し得る）
-3. `vectors.len() != len() * dim` → `HnswError::VectorsLenMismatch { expected, found }`
-   （呼び出し元がビルド後にベクトル集合を差し替えてしまう事故の一次検出。
-   `hnsw-graph-construction.md`「ベクトルの所有方針」節と同じ契約）
-4. `vectors` のサンプリング・フィンガープリントが `build` 時の値と不一致
-   → `HnswError::VectorsContentMismatch`（codex-review PR #430 P1 指摘への
-   対応で追加。長さは同じでも内容を書き換えた・行順を入れ替えたバッファは
-   3 の長さ照合をすり抜けるため、`hnsw.rs::compute_vectors_fingerprint` で
-   決定的に選んだ一部ノードの内容を `build` 時・`search` 時それぞれで
-   混合し照合する。全ノードを走査する完全照合は探索コストを O(N×dim) へ
-   膨らませ ANN の準線形性を打ち消すため採らず、事故検出の確率を長さ照合
-   のみの場合より引き上げる多層防御と位置づける——悪意ある入力からの
-   防御ではなく、呼び出し元の実装ミスの検出が目的。生成・安定 ID による
-   確実な検出は #408 の世代整合キャッシュの担当）
-5. `ef == 0 || ef > MAX_EF || k > MAX_EF` → `HnswError::InvalidParams`
+3. `ef == 0 || ef > MAX_EF || k > MAX_EF` → `HnswError::InvalidParams`
    （`MAX_EF` を上限に流用し、untrusted な呼び出し元が無制限の候補集合を
    要求できないようにする）
-6. `k == 0` または空索引 → `Ok(Vec::new())`
+4. `k == 0` または空索引 → `Ok(Vec::new())`
+
+`vectors` を呼び出し元から受け取らない設計（上記「ベクトルの所有方針」節）
+のため、旧 `HnswError::VectorsLenMismatch`・`HnswError::VectorsContentMismatch`
+は本タスク（#405）の対応で撤去した——検出すべき不一致の入力クラス自体が
+存在しない。
 
 ## visited 集合の 2 実装
 
@@ -163,12 +172,15 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
 
 - `HnswSearchScratch` は呼び出し元（#407 の provider 結線）がスレッドごと
   に 1 つ所有し、クエリをまたいで再利用する契約
-- `id` は `vectors` 上のノード番号であり、呼び出し元が RLS 事前フィルタ後
-  の縮約ベクトル集合を構築・渡す前提（`kernel.rs::SearchInput` と同じ境界。
-  `PolicyContext::is_visible` 単一照合パスは #409／#410 が維持する）
+- `id` は `build` 時に渡した `vectors` 上のノード番号であり、呼び出し元が
+  RLS 事前フィルタ後の縮約ベクトル集合を構築・渡す前提（`kernel.rs::
+  SearchInput` と同じ境界。`PolicyContext::is_visible` 単一照合パスは
+  #409／#410 が維持する）
 - 決定性の保証範囲（上記節）は spec 側未確定のため、#409 以降で規範化する
   場合はこの記録を出発点にすること
-- `HnswError::VectorsContentMismatch`（サンプリング・フィンガープリント
-  照合。codex-review PR #430 P1 指摘対応）は長さ照合だけでは検出できない
-  同サイズの差し替え・並べ替え事故への多層防御であり、生成・安定 ID による
-  確実な検出（#408 の世代整合キャッシュが担う想定）を代替するものではない
+- `HnswIndex` は `build` 完了時に `vectors` を `Arc<[f32]>` として所有する
+  （「ベクトルの所有方針」節。codex-review PR #430 P1 指摘対応）。#408 の
+  世代整合キャッシュ・#406 の並列構築を設計する際は、`arena.rs::
+  VectorArena` 側が `vectors` を最初から `Arc<[f32]>` として持てるかを
+  検討すること——`build` 時のコピーを `Arc::clone`（参照カウントの増分の
+  み）へ縮退できる可能性がある

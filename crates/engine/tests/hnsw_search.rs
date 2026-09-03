@@ -173,7 +173,7 @@ fn recall_at_10(
         let brute_ids: HashSet<u64> = brute.iter().map(|h| h.id).collect();
 
         let hnsw = index
-            .search(query, 10, ef, vectors, &mut scratch)
+            .search(query, 10, ef, &mut scratch)
             .expect("hnsw search must succeed");
         let hit = hnsw.iter().filter(|h| brute_ids.contains(&h.id)).count();
         hits_total += hit;
@@ -284,13 +284,9 @@ fn search_is_deterministic_across_repeated_calls_and_fresh_scratch() {
     let query = gen_query(0x1357_9BDF, 0x0BAD_F00D, dim, 10);
 
     let mut scratch = HnswSearchScratch::default();
-    let first = index
-        .search(&query, 10, 64, &vectors, &mut scratch)
-        .unwrap();
+    let first = index.search(&query, 10, 64, &mut scratch).unwrap();
     for _ in 0..2 {
-        let again = index
-            .search(&query, 10, 64, &vectors, &mut scratch)
-            .unwrap();
+        let again = index.search(&query, 10, 64, &mut scratch).unwrap();
         assert_eq!(
             first, again,
             "同一スクラッチでの反復呼び出しは完全一致するはず"
@@ -298,9 +294,7 @@ fn search_is_deterministic_across_repeated_calls_and_fresh_scratch() {
     }
 
     let mut fresh_scratch = HnswSearchScratch::default();
-    let with_fresh_scratch = index
-        .search(&query, 10, 64, &vectors, &mut fresh_scratch)
-        .unwrap();
+    let with_fresh_scratch = index.search(&query, 10, 64, &mut fresh_scratch).unwrap();
     assert_eq!(
         first, with_fresh_scratch,
         "新規スクラッチでも結果は同一（スクラッチ状態に非依存）であるべき"
@@ -310,7 +304,7 @@ fn search_is_deterministic_across_repeated_calls_and_fresh_scratch() {
         HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 0x2468_ACE0).unwrap();
     let mut rebuilt_scratch = HnswSearchScratch::default();
     let with_rebuilt_index = rebuilt
-        .search(&query, 10, 64, &vectors, &mut rebuilt_scratch)
+        .search(&query, 10, 64, &mut rebuilt_scratch)
         .unwrap();
     assert_eq!(
         first, with_rebuilt_index,
@@ -345,12 +339,8 @@ fn search_is_deterministic_and_tie_ordered_on_duplicate_heavy_corpus() {
     let query = centers[0].clone();
 
     let mut scratch = HnswSearchScratch::default();
-    let first = index
-        .search(&query, 10, 64, &vectors, &mut scratch)
-        .unwrap();
-    let again = index
-        .search(&query, 10, 64, &vectors, &mut scratch)
-        .unwrap();
+    let first = index.search(&query, 10, 64, &mut scratch).unwrap();
+    let again = index.search(&query, 10, 64, &mut scratch).unwrap();
     assert_eq!(
         first, again,
         "重複ヘビーコーパスでも反復呼び出しは完全一致するはず"
@@ -379,14 +369,12 @@ fn small_index() -> (Vec<f32>, HnswIndex) {
 
 #[test]
 fn search_result_length_and_id_bounds_and_score_order_hold() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let dim = 8;
     let rows = 200;
     let query = gen_query(0x9999_0000, 0xAAAA_1111, dim, 8);
     let mut scratch = HnswSearchScratch::default();
-    let results = index
-        .search(&query, 10, 64, &vectors, &mut scratch)
-        .unwrap();
+    let results = index.search(&query, 10, 64, &mut scratch).unwrap();
 
     assert!(results.len() <= 10);
     let mut seen = HashSet::new();
@@ -407,22 +395,22 @@ fn search_result_length_and_id_bounds_and_score_order_hold() {
 
 #[test]
 fn search_with_k_greater_than_ef_uses_effective_ef_and_returns_k_hits() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let dim = 8;
     let query = gen_query(0x9999_0000, 0xBBBB_2222, dim, 8);
     let mut scratch = HnswSearchScratch::default();
     // k=20 > ef=1: 実効 ef は `ef.max(k)` へ引き上げられるため k 件返るはず。
-    let results = index.search(&query, 20, 1, &vectors, &mut scratch).unwrap();
+    let results = index.search(&query, 20, 1, &mut scratch).unwrap();
     assert_eq!(results.len(), 20);
 }
 
 #[test]
 fn search_with_k_zero_returns_empty() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let dim = 8;
     let query = gen_query(0x9999_0000, 0xCCCC_3333, dim, 8);
     let mut scratch = HnswSearchScratch::default();
-    let results = index.search(&query, 0, 64, &vectors, &mut scratch).unwrap();
+    let results = index.search(&query, 0, 64, &mut scratch).unwrap();
     assert!(results.is_empty());
 }
 
@@ -432,17 +420,17 @@ fn search_on_empty_index_returns_empty() {
     let index = HnswIndex::build(HnswParams::default(), dim as u32, &[], 1).unwrap();
     let query = gen_query(0xDDDD_4444, 0xDDDD_4444, dim, 1);
     let mut scratch = HnswSearchScratch::default();
-    let results = index.search(&query, 10, 64, &[], &mut scratch).unwrap();
+    let results = index.search(&query, 10, 64, &mut scratch).unwrap();
     assert!(results.is_empty());
 }
 
 #[test]
 fn search_rejects_query_dim_mismatch() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let mut scratch = HnswSearchScratch::default();
     let wrong_dim_query = vec![0.0f32; 4]; // index dim は 8
     let err = index
-        .search(&wrong_dim_query, 10, 64, &vectors, &mut scratch)
+        .search(&wrong_dim_query, 10, 64, &mut scratch)
         .unwrap_err();
     assert_eq!(
         err,
@@ -455,63 +443,41 @@ fn search_rejects_query_dim_mismatch() {
 
 #[test]
 fn search_rejects_non_finite_query() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let mut scratch = HnswSearchScratch::default();
     let mut query = gen_query(0x9999_0000, 0xEEEE_5555, 8, 8);
     query[0] = f32::NAN;
-    let err = index
-        .search(&query, 10, 64, &vectors, &mut scratch)
-        .unwrap_err();
+    let err = index.search(&query, 10, 64, &mut scratch).unwrap_err();
     assert_eq!(err, HnswError::NonFiniteQuery);
 }
 
 #[test]
-fn search_rejects_vectors_len_mismatch() {
-    let (vectors, index) = small_index();
-    let query = gen_query(0x9999_0000, 0xFFFF_6666, 8, 8);
-    let mut scratch = HnswSearchScratch::default();
-    let truncated = &vectors[..vectors.len() - 8];
-    let err = index
-        .search(&query, 10, 64, truncated, &mut scratch)
-        .unwrap_err();
-    assert_eq!(
-        err,
-        HnswError::VectorsLenMismatch {
-            expected: vectors.len(),
-            found: truncated.len()
-        }
-    );
-}
-
-#[test]
 fn search_rejects_ef_zero() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let query = gen_query(0x9999_0000, 0x1111_7777, 8, 8);
     let mut scratch = HnswSearchScratch::default();
-    let err = index
-        .search(&query, 10, 0, &vectors, &mut scratch)
-        .unwrap_err();
+    let err = index.search(&query, 10, 0, &mut scratch).unwrap_err();
     assert!(matches!(err, HnswError::InvalidParams { .. }));
 }
 
 #[test]
 fn search_rejects_ef_beyond_max_ef() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let query = gen_query(0x9999_0000, 0x2222_8888, 8, 8);
     let mut scratch = HnswSearchScratch::default();
     let err = index
-        .search(&query, 10, MAX_EF + 1, &vectors, &mut scratch)
+        .search(&query, 10, MAX_EF + 1, &mut scratch)
         .unwrap_err();
     assert!(matches!(err, HnswError::InvalidParams { .. }));
 }
 
 #[test]
 fn search_rejects_k_beyond_max_ef() {
-    let (vectors, index) = small_index();
+    let (_, index) = small_index();
     let query = gen_query(0x9999_0000, 0x3333_9999, 8, 8);
     let mut scratch = HnswSearchScratch::default();
     let err = index
-        .search(&query, MAX_EF + 1, 64, &vectors, &mut scratch)
+        .search(&query, MAX_EF + 1, 64, &mut scratch)
         .unwrap_err();
     assert!(matches!(err, HnswError::InvalidParams { .. }));
 }
