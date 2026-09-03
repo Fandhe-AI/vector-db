@@ -286,31 +286,53 @@ fn hybrid_sparse_tie_group_across_pool_boundary_is_deterministic_over_multiple_r
         );
     }
 }
-// --- 5（codex-review 指摘対応・PR #428・Medium）: 上のテスト 4 は tie group の
-// 全 300 件が同一本文のため、疎側境界同点グループの完全化（`sparse_refetch_loop`
-// の複数ラウンド発火・`TieRank::GroupEnd` によるグループ末尾順位の割当）を
-// スキップする退行が起きても、密側の（同じく全件同点な）タイブレークだけで
-// id 昇順 1..=8 が再現できてしまい、いずれの経路でも結果が一致する
-// vacuous pass になっていた（bugbot 指摘）。
+// --- 5（codex-review 指摘対応・PR #428・Medium。さらに bugbot 再指摘・PR #428
+// レビュースレッド対応）: 当初のテスト 4 は tie group の全 300 件が同一本文の
+// ため、疎側境界同点グループの完全化（`sparse_refetch_loop` の複数ラウンド
+// 発火・`TieRank::GroupEnd` によるグループ末尾順位の割当）をスキップする
+// 退行が起きても、密側の（同じく全件同点な）タイブレークだけで id 昇順 1..=8
+// が再現できてしまい、いずれの経路でも結果が一致する vacuous pass になって
+// いた。
 //
-// 本テストは、疎側でのみ一致する巨大な同点グループ（`tie_group_size=20`。
-// `pool_depth=8` を跨ぎ、`sparse_refetch_loop` の複数ラウンド発火を要する
-// 大きさ）と、疎側では一切一致しないが密側で優位な「競合グループ」
-// （8 件、id 昇順にわずかに減衰する密スコアで密ランクを確定）を対置する。
+// 続く 1 回目の対策（競合する密優位グループの追加。id 昇順にわずかに減衰する
+// 密スコア＝競合グループ内で密ランクが 1..=8 と個別に確定する構成）もなお
+// vacuous だった: `pool_depth=8` に対し疎側の早期打ち切り（不完全な取得分
+// だけで `TieRank::GroupEnd` を確定してしまう退行。最悪でもグループ末尾順位
+// `pool_depth*2=16` 止まり・RRF `1/76`）は、競合グループの個々の密ランク
+// 1..=8（RRF 最良 `1/61`〜最悪 `1/68`）のどれにも勝てない。密側の「同点で
+// ないランク付け」を「疎側のグループ一律順位」と比較する限り、疎側の退行が
+// どれだけ悪化しても競合側の**個々の最良ランク**（`1/61`）を超えることは
+// 構造上あり得ない（同点グループの一律順位は `1..=pool_depth*2` の**先頭**
+// ではなく末尾側の順位しか取り得ないため）。
 //
-// 正しい完全化（`TieRank::GroupEnd`）の下では、疎側の巨大同点グループは
-// グループ末尾順位（20 件全体の末尾＝低優先度）を割り当てられるため RRF
-// 融合スコアが低く抑えられ、密側でのみ強い競合グループが最終 top-k を
-// 独占する（実測: id 501..=508）。もし境界同点グループの完全化が壊れて
-// 位置ベースの強い順位（先頭で観測できた数件に 1..8 相当の順位）を誤って
-// 割り当てる退行が起きれば、疎側同点グループの一部（id 1..=8 相当）が
-// 競合グループを押しのけて結果に混入し、本テストが red になる
-// （fixture の構造そのものが「密側の同点タイブレーク」に依存しないため、
-// テスト 4 とは異なり vacuous にならない）。
+// 本テスト（2 回目の対策）は、密側の競合グループもまた**互いに同点**にする
+// ことで「密側もグループ一律順位」に揃え、疎側のグループ一律順位と直接比較
+// 可能にする。`pool_depth=P`・疎側 tie group サイズ `G`・密側競合グループ
+// サイズ `C` を `2*P < C < G` を満たすよう選ぶ（本テストは `P=4`・`G=20`・
+// `C=14`）:
+// - 正しい完全化（`sparse_refetch_loop` が `fetch_k` を `8→16→32` と伸ばし
+//   `G=20` 件全体を捕捉）の下では、疎側同点グループの一律順位は `G=20`
+//   （RRF `1/80`）に確定し、密側競合グループの一律順位 `C=14`（RRF `1/74`）
+//   に劣るため、競合グループが最終 top-k（`k=4`）を独占する（実測:
+//   id 501..=504）。
+// - もし疎側の早期打ち切り退行（1 ラウンド目 `fetch_k=2*P=8` で確定してしまい
+//   `G=20` まで伸ばさない）が起きれば、疎側同点グループの一律順位は `2*P=8`
+//   （RRF `1/68`）へ**改善**し、`C=14`（RRF `1/74`）を上回るため、疎側同点
+//   グループ全体が競合グループを押しのけて top-k を独占する（本テストが red
+//   になる想定挙動: id 1..=4）。
+//
+// `k=4 <= pool_depth=4` の契約（[`hybrid_search`] は `k > cfg.pool_depth()`
+// を `HybridError::InvalidK` で拒否）を保ったまま、密側競合グループ自身も
+// `pool_depth` を跨ぐ同点グループとして境界完全化（[`complete_boundary_tie_group`]）
+// を経由する（`C=14 > P=4` のため密側も 1 ラウンド分の再取得を要する。密側の
+// 再取得自体は本テストの主眼ではないが、密側の同点タイブレークが id 依存に
+// ならないことは同時に検証される）。
 #[test]
 fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing_dense_group() {
+    let pool_depth = 4usize;
     let tie_group_size = 20u64;
-    let competitor_size = 8u64;
+    let competitor_size = 14u64;
+    let k = 4usize;
 
     let mut ids: Vec<u64> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
@@ -318,22 +340,27 @@ fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing
 
     // 疎側でのみ一致する巨大同点グループ。密側は完全に無関係な方向 [0,1]
     // （クエリ [1,0] との内積が 0）で全件同一のため、密側は本グループを
-    // 一切優遇しない。
+    // 一切優遇しない。`tie_group_size=20` は `pool_depth*2=8` を跨ぎ、
+    // `sparse_refetch_loop` が `fetch_k` を複数ラウンド（8→16→32）伸ばして
+    // 初めて全件を捕捉できる大きさ。
     for id in 1..=tie_group_size {
         ids.push(id);
         texts.push("anchor anchor anchor".to_string());
         vectors.push(0.0);
         vectors.push(1.0);
     }
-    // 密側でのみ強く一致する競合グループ。疎側は "anchor" と無関係のため
-    // BM25 score が 0 になり疎チャネルから除外される（`zero_is_no_signal`）。
-    // id 昇順にわずかに減衰するスコアを割り当て、密側自身の同点を避けて
-    // 密ランクを id 昇順（501 が最上位）に確定させる。
+    // 密側でのみ一致する競合グループ。疎側は "anchor" と無関係のため BM25
+    // score が 0 になり疎チャネルから除外される（`zero_is_no_signal`）。
+    // 密側は全件同一スコア（クエリ [1,0] との内積が 1.0 で完全一致）に
+    // 揃えることで、密側もまた `TieRank::GroupEnd` による一律順位
+    // （`competitor_size=14`）を割り当てられる構成にする。`competitor_size=14`
+    // は `pool_depth*2=8` より大きいため密側の境界完全化（1 ラウンド分の
+    // 再取得）も経由する。
     for i in 0..competitor_size {
         let id = 501 + i;
         ids.push(id);
         texts.push("unrelated filler text".to_string());
-        vectors.push(1.0 - 0.001 * (i as f32));
+        vectors.push(1.0);
         vectors.push(0.0);
     }
 
@@ -344,16 +371,17 @@ fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing
         .collect();
     let index = SparseIndex::build(&refs).expect("sparse index build ok");
 
-    let cfg = RrfConfig::new(60.0, 1.0, 1.0, 8).expect("valid rrf config (small pool_depth)");
+    let cfg =
+        RrfConfig::new(60.0, 1.0, 1.0, pool_depth).expect("valid rrf config (small pool_depth)");
 
     let input_scalar = SearchInput {
         ids: &ids,
         vectors: &vectors,
         dim: 2,
         query: &[1.0, 0.0],
-        k: 8,
+        k,
     };
-    let scalar_hits = hybrid_search(&CpuScalarProvider, input_scalar, &index, "anchor", 8, &cfg)
+    let scalar_hits = hybrid_search(&CpuScalarProvider, input_scalar, &index, "anchor", k, &cfg)
         .expect("hybrid_search (scalar) ok");
 
     let input_parallel = SearchInput {
@@ -361,14 +389,14 @@ fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing
         vectors: &vectors,
         dim: 2,
         query: &[1.0, 0.0],
-        k: 8,
+        k,
     };
     let parallel_hits = hybrid_search(
         &ParallelSearchProvider,
         input_parallel,
         &index,
         "anchor",
-        8,
+        k,
         &cfg,
     )
     .expect("hybrid_search (parallel) ok");
@@ -379,10 +407,14 @@ fn hybrid_sparse_tie_group_boundary_completion_is_load_bearing_against_competing
     );
 
     let result_ids: Vec<u64> = scalar_hits.iter().map(|h| h.id).collect();
-    let expected: Vec<u64> = (501u64..(501 + competitor_size)).collect();
+    let expected: Vec<u64> = (501u64..(501 + k as u64)).collect();
     assert_eq!(
         result_ids, expected,
-        "疎側巨大同点グループの境界完全化が正しければ、密側でのみ優位な競合グループが \
-         top-k を独占するはず（疎側同点グループの一部が混入した場合は境界完全化の退行）"
+        "疎側巨大同点グループの境界完全化（fetch_k を tie_group_size まで伸ばし \
+         グループ末尾順位 20 を確定）が正しければ、密側同点競合グループ（一律順位 14） \
+         が最終 top-k を独占するはず。疎側が早期打ち切り（fetch_k=pool_depth*2=8 で \
+         確定）していれば、疎側の一律順位が 8（RRF 1/68）へ改善し密側（RRF 1/74）を \
+         上回るため疎側同点グループが混入し、本アサーションが red になる \
+         （境界完全化の退行を実際に検出できる構成）"
     );
 }
