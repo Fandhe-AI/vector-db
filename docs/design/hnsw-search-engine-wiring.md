@@ -38,20 +38,25 @@ infallible のまま維持し、不正パラメータの拒否は呼び出し境
 呼び出し規約で表現する:
 
 ```rust
-fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
+fn build_unchecked(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // pub(crate)・infallible
 pub fn build_validated(kind: SearchEngineKind)
     -> Result<Box<dyn SearchProvider>, SearchEngineError>; // Hnsw のみ validate() を通す
+pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // 旧公開シグネチャの互換ラッパー
 ```
 
-（`build` の可視性は初版実装から `pub(crate)` へ変更されている。経緯は
-「変更履歴」節参照）
+（infallible な内部実装は初版実装の `build` から `build_unchecked` へ改称・
+`pub(crate)` 化されており、旧 `pub fn build` のシグネチャは互換ラッパーの
+`build` が引き継ぐ。経緯は「変更履歴」節参照）
 
-`build` を直接呼ぶ経路（`default_engine`・既存の `SearchEngineKind::build`
-呼び出しテスト）は不正値を作れない値（`CpuScalarBruteForce`／
-`ParallelBruteForce`／検証済み `HnswParams`）でのみ呼ばれる契約とし、
-untrusted な値から `SearchEngineKind::Hnsw` を組み立てる唯一の経路
-（`core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`）は
-必ず `build_validated` を経由する。
+`build_unchecked` を直接呼ぶ経路（`default_engine`）は不正値を作れない値
+（`CpuScalarBruteForce`／`ParallelBruteForce`／検証済み `HnswParams`）でのみ
+呼ばれる契約とし、untrusted な値から `SearchEngineKind::Hnsw` を組み立てる
+crate 内部の経路（`core.rs::EngineCore::open_with_engine`／
+`from_storage_with_engine`）は必ず `build_validated` を経由する。crate 外の
+呼び出し元向けには、旧公開シグネチャと同一の `pub fn build` を互換ラッパーと
+して維持し、`build_validated` の結果が `Err`（不正な `HnswParams`）の場合は
+`.expect`/`.unwrap` に頼らず `default_kind()`（`ParallelBruteForce`）へ
+fail-closed にフォールバックする（経緯は「変更履歴」節参照）。
 
 ### `FromStr`／設定文字列パーサは追加しない
 
@@ -250,6 +255,34 @@ untrusted な `k` に対する実際の上限保証はこの拒否が担って�
   `hnsw/provider.rs` モジュールドキュメントへ反映
 - production コードの挙動（クランプ計算式）自体は変更していない
   （ドキュメンテーションコメントのみの訂正）
+
+### `build` の公開互換ラッパーへの再変更（codex-review P1 指摘・PR #433 3 巡目）
+
+2 巡目で確定した「正式な破壊的変更（互換ラッパーを採らない）」判断は、
+AGENTS.md「公開 API・エラー契約の互換性（P1）」——公開 API の破壊的変更は
+spec 側の対応する定義変更と対にする規約——を満たしていなかった（`build` は
+`docs/spec` のビヘイビア ID に対応しない実装内部の構築関数であり、対にすべき
+spec 側変更が存在しない）ことを指摘され、破壊的変更を伴わない方式へ再度
+変更した。
+
+- infallible な内部実装（旧 `build`）を `build_unchecked`（`pub(crate)`）へ
+  改称し、`SearchEngineError` を経由しない不正値の到達を型でなく命名で
+  明示する
+- 旧 `pub fn build(SearchEngineKind) -> Box<dyn SearchProvider>` と同一
+  シグネチャの `build` を公開互換ラッパーとして維持し、外部 crate の既存
+  呼び出しをコンパイル可能に保つ
+- `build`（互換ラッパー）は内部で `build_validated` を呼び、拒否された
+  `HnswParams`（`m=0` 等）に対しては `.expect`/`.unwrap` によるパニックへ
+  頼らず `default_kind()`（`ParallelBruteForce`）へ fail-closed に
+  フォールバックする——2 巡目で懸念していた「未検証の到達がパニックへ
+  帰結する」経路を、パニックではなく安全な既定エンジンへの縮退として解消した
+- `crates/engine/src/search_engine.rs` の
+  `build_compat_wrapper_falls_back_on_invalid_hnsw_params_without_panicking`・
+  `build_compat_wrapper_accepts_valid_hnsw_params` で、旧シグネチャでの
+  呼び出し可能性（コンパイル可能性）とフォールバック挙動を固定した
+
+2 巡目の変更履歴（直前の節）は判断の推移の記録として残し、削除・書き換えは
+行わない。
 
 ## #408 が接続する索引経路の seam（本タスクでは実装しない）
 
