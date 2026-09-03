@@ -13,16 +13,18 @@
 //! モジュールドキュメント参照）で補う。
 //!
 //! **適用条件**（呼び出し元 `sql::exec::execute_statement_with_cache` が判定する。
-//! 本モジュールはここでは判定しない）: `Ranking::Distance` かつ `bound.
-//! metadata_filters`・`bound.expr_filters` がともに空のクエリに限る。この条件下では
-//! アリーナが「RLS 可視行の全集合」になり、同一 `(table, ctx)` の同一テーブル世代
-//! 内であればスロット割当まで含めて再現される（`sql::sparse_cache` の適用条件と
-//! 同じ不変条件に依拠する）。フィルタ付きクエリ・hybrid の密側は対象外
-//! （#409／#410 の担当）。加えて `bound.mode`（`sql::mode::SearchMode::Precision`。
-//! `USING PLAN` 経由の推定を含む）が `precision` のクエリも対象外（TASK-162・
-//! SEARCH-9。`precision::apply_gate` の確信度ゲートは DISTANCE 段の Top-2 マージン
-//! を厳密順位に基づいて評価する必要があり、ANN の近似近傍では真の最近傍の
-//! 取りこぼしによりマージンを過大評価しうるため、常に厳密 brute-force 経路を使う）。
+//! 本モジュールはここでは判定しない）: `Ranking::Distance` のクエリに限る。
+//! `bound.metadata_filters`・`bound.expr_filters` がともに空の場合はアリーナが
+//! 「RLS 可視行の全集合」になり、同一 `(table, ctx)` の同一テーブル世代内であれば
+//! スロット割当まで含めて再現される（`sql::sparse_cache` の適用条件と同じ不変条件
+//! に依拠する）。SCALAR 事前フィルタが付く場合は [`search_subset_or_fallback`] が
+//! 担う `Subset` 形状（Issue #409。per-query 写像でキャッシュには登録しない）
+//! として扱う。hybrid の密側は対象外（#410 の担当）。加えて `bound.mode`
+//! （`sql::mode::SearchMode::Precision`。`USING PLAN` 経由の推定を含む）が
+//! `precision` のクエリも対象外（TASK-162・SEARCH-9。`precision::apply_gate` の
+//! 確信度ゲートは DISTANCE 段の Top-2 マージンを厳密順位に基づいて評価する必要が
+//! あり、ANN の近似近傍では真の最近傍の取りこぼしによりマージンを過大評価しうる
+//! ため、常に厳密 brute-force 経路を使う）。
 //!
 //! **fail-closed 契約**（[`HnswIndexCache::lookup`]／[`HnswIndexCache::record_base`]／
 //! `record_overlay_for`／`record_build_failed`（本モジュール内 free function）で
