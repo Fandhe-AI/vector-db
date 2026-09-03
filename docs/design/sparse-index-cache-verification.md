@@ -203,3 +203,10 @@ cargo test -p engine --test hybrid_recall --test rerank_recall \
 # 前後比較（feature_bench。release ビルド）
 cargo run --release -p engine --example feature_bench
 ```
+
+## 追記（Issue #393）
+
+`SparseIndex` の転置索引化（Issue #386 Phase 1・#388〜#392）後も本検証設計が
+維持されることを、RLS 部分可視・未知語のみクエリ・空クエリの追加ケースと
+疎側決定性契約の固定テストで再確認した。詳細は
+`docs/design/sparse-inverted-index-recall-verification.md` 参照。
