@@ -51,9 +51,7 @@
 は `TermId(t)` の出現文書を `doc_idx` 昇順・重複なしで保持する（ソートは行わず、
 構築順序自体〔文書を `doc_idx` 昇順に処理する〕がこの不変条件を満たす）。
 
-**採用（非圧縮 `Vec` 表現）**。圧縮（可変長整数・delta encoding）や skip list
-（tantivy・qdrant 等が実装する枝刈り高速化）は本 Issue のスコープ外として
-見送った（「スコープ外・申し送り」節参照）。不変条件は
+**採用（非圧縮 `Vec` 表現）**。不変条件は
 `postings.len() == doc_freq.len() == terms.len()`・
 `postings[t].len() == doc_freq[t] as usize`（構築時に保証）。
 
@@ -84,12 +82,9 @@
 `TopKSelector`（2k バッファ＋`select_nth_unstable_by` による Top-k 選出。tantivy
 の `TopNComputer` を参考にした決定的タイブレーク付き構成）を導入した。
 
-tantivy が採用する 256 段ロッシー fieldnorm 量子化（ヒープ削減効果が大きい
-一方、文書長正規化項に丸め誤差を導入する）は **不採用（Rejected）** と判断した。
 本リポの疎スコアは f64 ビット一致を production の契約として維持しており
-（`docs/design/rrf-tie-break-determinism.md`）、ロッシー量子化はこの契約に反する
-ため、段数をコーパス中の相異なる文書長数まで上げた厳密なクラス表を採用した
-（256 段ロッシー版は test-only の実験に留める）。
+（`docs/design/rrf-tie-break-determinism.md`）、段数をコーパス中の相異なる
+文書長数まで上げた厳密なクラス表を採用した。
 
 ### #392: 疎側再取得ループの再スコアリング回避
 
@@ -146,8 +141,7 @@ tantivy が採用する 256 段ロッシー fieldnorm 量子化（ヒープ削�
   `sparse-inverted-index-recall-verification.md`（Issue #393）の疎側決定性
   固定テストを参照。
 - **スコアの f64 ビット一致**: 旧実装との等価性は参照実装比較テストで固定
-  （`sparse-inverted-index-recall-verification.md` 参照）。256 段ロッシー量子化
-  を不採用としたのもこの契約の維持が理由。
+  （`sparse-inverted-index-recall-verification.md` 参照）。
 - **`SparseIndexCache` の世代整合・fail-closed**（Issue #357）: 転置索引化は
   キャッシュ対象のデータ構造の内部変更であり、`sql/sparse_cache.rs` の
   キャッシュ契約（テーブル世代不一致時の fail-closed 拒否）はそのまま維持。
@@ -164,10 +158,8 @@ tantivy が採用する 256 段ロッシー fieldnorm 量子化（ヒープ削�
 
 | 実装 | ライセンス | 参考にした手法 | 採否 |
 | ---- | ---------- | --------------- | ---- |
-| tantivy | MIT | posting list（転置索引）構造 | 採用（非圧縮 `Vec`。圧縮・skip list は未採用） |
-| tantivy | MIT | BM25 fieldnorm 256 段ロッシー量子化＋term 別スコア表 | **不採用**（ロッシー量子化はスコアの f64 ビット一致契約に反する。厳密な文書長クラス表へ置換。#391） |
+| tantivy | MIT | posting list（転置索引）構造 | 採用（非圧縮 `Vec`） |
 | tantivy | MIT | `TopNComputer`（2k バッファ＋`select_nth`型 Top-k） | 採用（決定的タイブレーク付き。#391） |
-| qdrant | Apache-2.0 | 疎索引の枝刈り（posting 走査の早期打ち切り系） | **未採用**（Phase 1 は全 posting の 1 パス走査で目標到達。枝刈りは決定性・RLS 縮約統計との整合検討を要するため申し送り） |
 
 （`docs/design/ann-index-adoption.md`・`scalar-secondary-index.md` が qdrant を
 Apache-2.0 表記で参照している既存の先例と表記を揃えた）
@@ -313,8 +305,7 @@ warmup 20・計測 30。`GITHUB_ACTIONS` 下は fail-closed 拒否のため未�
 
 ## スコープ外・申し送り
 
-- posting list の CSR 化・圧縮（可変長整数・delta encoding）・skip list
-  （tantivy・qdrant が実装する枝刈り高速化）は未着手
+- posting list の CSR 化・圧縮（可変長整数・delta encoding）・枝刈り高速化は未着手
 - `VisibleBitmap` はクエリ（`search_within` 呼び出し）ごとに再構築しており、
   ループ間での再利用はしていない
 - クエリ呼び出しごとのスコアアキュムレータ確保（`O(N)`）は残っている
