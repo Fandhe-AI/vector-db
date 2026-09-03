@@ -810,6 +810,13 @@ pub enum CoreError {
     /// （テーブル宣言次元と embedder 次元の不一致・埋め込みサービスの不正応答等。
     /// 詳細は [`crate::embedding::EmbedError`]）。
     QueryEmbedding(crate::embedding::EmbedError),
+    /// [`Self::open_with_engine`]（Issue #407・ANN opt-in 結線）に渡した
+    /// `SearchEngineKind::Hnsw(params)` の `params` が
+    /// [`crate::hnsw::HnswParams::validate`] を拒否した（詳細は
+    /// [`crate::search_engine::SearchEngineError`]）。既存の網羅的 `match` を壊す
+    /// 破壊的変更であることは本 enum 冒頭ドキュメントの既存注記のとおり
+    /// （`QueryPlannerUnavailable` 等と同じ前例）。
+    InvalidSearchEngine(crate::search_engine::SearchEngineError),
 }
 
 impl std::fmt::Display for CoreError {
@@ -837,11 +844,18 @@ impl std::fmt::Display for CoreError {
             CoreError::QueryPlanning(e) => write!(f, "core query planning error: {e}"),
             CoreError::EmbedderUnavailable => write!(f, "no embedder configured"),
             CoreError::QueryEmbedding(e) => write!(f, "core query embedding error: {e}"),
+            CoreError::InvalidSearchEngine(e) => write!(f, "core search engine error: {e}"),
         }
     }
 }
 
 impl std::error::Error for CoreError {}
+
+impl From<crate::search_engine::SearchEngineError> for CoreError {
+    fn from(e: crate::search_engine::SearchEngineError) -> Self {
+        CoreError::InvalidSearchEngine(e)
+    }
+}
 
 impl From<DispatchError> for CoreError {
     fn from(e: DispatchError) -> Self {
@@ -1021,6 +1035,14 @@ pub struct EngineCore {
     /// デコード）を同一テーブル世代内で再利用する（詳細は
     /// `sql::arena_cache::SqlArenaCache` のドキュメント参照）。
     sql_arena_cache: crate::sql::arena_cache::SqlArenaCache,
+    /// 構築時に明示指定された [`crate::search_engine::SearchEngineKind`]（Issue #407）。
+    /// [`Self::open_with_engine`]／[`Self::from_storage_with_engine`] 経由なら
+    /// `Some(kind)`、任意 provider を直接注入する [`Self::with_provider`]／
+    /// [`Self::from_storage`] 経由（`kind` と `provider` の対応をこの構造体自身は
+    /// 検証できない）なら `None`。`#[non_exhaustive]` な `SearchEngineKind` を返す
+    /// 診断用のアクセサ（[`Self::search_engine_kind`]）で、#411 の `EXPLAIN` 露出が
+    /// 参照する契約点。
+    search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
 }
 
 /// [`EngineCore::dictionary_snapshot`] が要求する `path`/`body` 列
@@ -1061,30 +1083,44 @@ impl EngineCore {
     /// 指定パスの `redb` データベースを開き、既定の検索エンジン
     /// （[`crate::search_engine::default_engine`]）を注入した `EngineCore` を構築する。
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoreError> {
-        Self::with_provider(path, search_engine::default_engine())
+        // `search_engine::default_kind()` を明示的に渡すことで、既定経路でも
+        // `search_engine_kind()` が `Some(default_kind())` を返す（Issue #407。
+        // 既定 kind は常に検証を通るため `open_with_engine` の失敗系は到達しない）。
+        Self::open_with_engine(path, search_engine::default_kind())
     }
 
     /// 検索 provider を差し替えて構築する（テスト・将来の GPU/ANN provider 導入用）。
+    ///
+    /// `provider` は呼び出し元が直接組み立てた値であり、対応する
+    /// [`crate::search_engine::SearchEngineKind`] を構造的に持たないため
+    /// [`Self::search_engine_kind`] は常に `None` を返す（Issue #407。opt-in で
+    /// `kind` を伴う構築は [`Self::open_with_engine`] を使う）。
     pub fn with_provider(
         path: impl AsRef<Path>,
         provider: Box<dyn SearchProvider>,
     ) -> Result<Self, CoreError> {
         let storage = Storage::open(path)?;
-        Ok(Self {
-            storage,
-            provider,
-            prefilter_cache: PrefilterCache::new(),
-            precision_policy: crate::precision::PrecisionPolicy::default(),
-            embedder: None,
-            query_planner: None,
-            incremental_config: crate::incremental::IncrementalConfig::default(),
-            ledger_mode: LedgerMode::default(),
-            batch_limits: crate::batch_limits::BatchLimits::default(),
-            dictionary_cache: DictionaryCache::new(),
-            dictionary_config: crate::dictionary::DictionaryConfig::default(),
-            sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
-            sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
-        })
+        Ok(Self::assemble(storage, provider, None))
+    }
+
+    /// 指定パスの `redb` データベースを開き、`kind` が構築する検索エンジンを
+    /// 注入した `EngineCore` を構築する（Issue #407・opt-in 経路。ADR
+    /// `docs/design/ann-index-adoption.md` B 案「テーブル単位カタログ属性は対象外」の
+    /// とおり、本関数の呼び出し元がプロセス起動時に明示指定する以外の経路
+    /// （環境変数・SQL 構文・セッション変数）は持たない）。
+    ///
+    /// `kind` が `SearchEngineKind::Hnsw(params)` で `params` が
+    /// [`crate::hnsw::HnswParams::validate`] を拒否する値の場合、`EngineCore` は
+    /// 構築されず [`CoreError`] として fail-closed に拒否する
+    /// （[`crate::search_engine::build_validated`] 経由。不正パラメータを保持した
+    /// `EngineCore` が生存する状態を構造的に作らない）。
+    pub fn open_with_engine(
+        path: impl AsRef<Path>,
+        kind: crate::search_engine::SearchEngineKind,
+    ) -> Result<Self, CoreError> {
+        let storage = Storage::open(path)?;
+        let provider = search_engine::build_validated(kind)?;
+        Ok(Self::assemble(storage, provider, Some(kind)))
     }
 
     /// 既に開いた `Storage` の所有権を受け取って構築する（呼び出し元がテーブル作成・
@@ -1098,7 +1134,36 @@ impl EngineCore {
     /// [`VectorCore::search`] が経由する [`crate::policy::PolicyContext::is_visible`] の
     /// 単一照合パスだけが `Storage` への到達経路になる（security.md P0「テナント分離の
     /// 検査を外す/緩める/バイパス経路を作らない」）。
+    ///
+    /// [`Self::with_provider`] と同じ理由で [`Self::search_engine_kind`] は常に
+    /// `None`（Issue #407。`kind` を伴う構築は [`Self::from_storage_with_engine`]）。
     pub fn from_storage(storage: Storage, provider: Box<dyn SearchProvider>) -> Self {
+        Self::assemble(storage, provider, None)
+    }
+
+    /// [`Self::from_storage`] の `kind` 版（Issue #407・opt-in 経路）。`kind` が
+    /// `SearchEngineKind::Hnsw(params)` で `params` が不正な場合は
+    /// [`crate::search_engine::SearchEngineError`] を返し `EngineCore` を構築しない
+    /// （[`Self::open_with_engine`] と同じ fail-closed 契約）。
+    pub fn from_storage_with_engine(
+        storage: Storage,
+        kind: crate::search_engine::SearchEngineKind,
+    ) -> Result<Self, crate::search_engine::SearchEngineError> {
+        let provider = search_engine::build_validated(kind)?;
+        Ok(Self::assemble(storage, provider, Some(kind)))
+    }
+
+    /// [`Self::with_provider`]／[`Self::open_with_engine`]／[`Self::from_storage`]／
+    /// [`Self::from_storage_with_engine`] が共有する構築処理。フィールド初期値は
+    /// 4 経路すべてで同一であり（`storage`・`provider`・`search_engine_kind` 以外は
+    /// すべて既定値）、重複する struct literal を 1 箇所へ集約する
+    /// （Issue #407。以前は `with_provider`／`from_storage` の 2 箇所に同一の
+    /// struct literal があった）。
+    fn assemble(
+        storage: Storage,
+        provider: Box<dyn SearchProvider>,
+        search_engine_kind: Option<crate::search_engine::SearchEngineKind>,
+    ) -> Self {
         Self {
             storage,
             provider,
@@ -1113,7 +1178,18 @@ impl EngineCore {
             dictionary_config: crate::dictionary::DictionaryConfig::default(),
             sparse_index_cache: crate::sql::sparse_cache::SparseIndexCache::new(),
             sql_arena_cache: crate::sql::arena_cache::SqlArenaCache::new(),
+            search_engine_kind,
         }
+    }
+
+    /// 構築時に明示指定された [`crate::search_engine::SearchEngineKind`] を返す
+    /// （Issue #407。[`Self::open`]／[`Self::open_with_engine`] 経由なら値を持ち、
+    /// [`Self::with_provider`]／[`Self::from_storage`] 経由（provider を直接注入し
+    /// `kind` との対応を検証できない）なら `None`。`VectorCore` trait には載せない
+    /// 固有メソッド（`core_api.snapshot` の対象外。`prefilter_cache_stats` と同じ
+    /// 方針）。#411 の `EXPLAIN` 露出が参照する契約点）。
+    pub fn search_engine_kind(&self) -> Option<crate::search_engine::SearchEngineKind> {
+        self.search_engine_kind
     }
 
     /// [`PrefilterCache`] の現在の統計を返す（TASK-169。テスト・運用観測用）。

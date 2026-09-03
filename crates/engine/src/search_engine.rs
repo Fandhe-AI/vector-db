@@ -19,11 +19,32 @@
 //! の実装、`dispatch.rs` モジュールドキュメント参照）。SIMD 幅ごとに異なる provider を
 //! 構築する配線（[`SearchEngineKind`] への variant 追加を伴う）は TASK-156・CORE-14 の
 //! 管轄。
+//!
+//! # ANN（HNSW）の opt-in 結線（Issue #407・ADR `docs/design/ann-index-adoption.md` B 案）
+//!
+//! [`SearchEngineKind::Hnsw`] は #404〜#406 で実装した `hnsw.rs::HnswIndex` を選ぶ
+//! variant で、`core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`
+//! （本 Issue で追加）を明示的に呼んだ場合のみ選択される opt-in 経路であり、
+//! [`default_kind`]／[`default_engine`]（既定は不変。[`SearchEngineKind::ParallelBruteForce`]）
+//! には影響しない。テーブル単位カタログ属性・wire-server CLI からの露出は対象外
+//! （ADR「判断確定後のスコープ外」節、および本 Issue のスコープ外事項）。
+//!
+//! 本 Issue 時点では [`hnsw::provider::HnswSearchProvider`](crate::hnsw::provider::HnswSearchProvider)
+//! は索引を構築・保持せず、`ParallelSearchProvider` へ全件フォールバックする
+//! （世代整合キャッシュが無く索引済み集合と `SearchInput` の差分を判定できないため。
+//! 索引の実利用は #408 の担当。詳細は `hnsw/provider.rs` モジュールドキュメント参照）。
+//!
+//! 不正な `HnswParams`（[`crate::hnsw::HnswParams::validate`] が拒否する値）は
+//! `SearchEngineKind::Hnsw` 自体には現れない（`open_with_engine` 等の呼び出し時点で
+//! [`SearchEngineError`] として fail-closed に拒否され、`EngineCore` は構築されない）。
 
+use crate::hnsw::provider::HnswSearchProvider;
+use crate::hnsw::HnswParams;
 use crate::kernel::{CpuScalarProvider, SearchProvider};
 use crate::parallel_search::ParallelSearchProvider;
+use std::fmt;
 
-/// 選択可能な検索エンジン（総当たり系のみ。将来の ANN 追加に備え非網羅とする）。
+/// 選択可能な検索エンジン。
 ///
 /// 各 variant はいずれも `kernel.rs::SearchProvider` の実装を返す（CORE-13 の
 /// 単一 trait 階層への一本化。本モジュールは新規 trait を定義しない）。
@@ -36,9 +57,80 @@ pub enum SearchEngineKind {
     /// マルチスレッド並列の総当たり Top-k（[`crate::parallel_search::ParallelSearchProvider`]、
     /// TASK-126）。既定エンジン（[`default_engine`] 参照）。
     ParallelBruteForce,
+    /// HNSW 近似最近傍探索（`hnsw.rs::HnswIndex`、Issue #403 ADR B 案）。opt-in
+    /// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節参照）。保持する
+    /// `HnswParams` は構築前に [`SearchEngineError`] として検証済み（このモジュールの
+    /// 呼び出し元、`build`／`build_validated` を経由する限り不正値は到達しない）。
+    Hnsw(HnswParams),
+}
+
+/// `SearchEngineKind::Hnsw` の構築が失敗した理由（`22023` 相当。TASK-152・ERR-2 の
+/// 分類リストへの新規登録は行わない——本 variant が返す `22023` は既存分類
+/// `error_format::ErrorClass::OperationIdContentMismatch`（TASK-101・RECOVER-10）が
+/// 既に占有しており、ERR-2 の「分類 ⇔ `wire_code` 一意対応」契約
+/// （`error_format.rs::wire_codes_are_pairwise_distinct`）を壊さずに本 variant 用の
+/// 新分類を追加することはできない。本 Issue は wire／SQL 表層への露出を持たず
+/// （モジュールドキュメント「ANN（HNSW）の opt-in 結線」節）、`22023` の正式な
+/// `ErrorClass` 登録・`wire-server` への伝播は spec 側のビヘイビア ID 確定後の
+/// 別タスクへ申し送る（`docs/design/hnsw-search-engine-wiring.md` 参照）。
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchEngineError {
+    /// [`HnswParams::validate`] が拒否した。
+    InvalidHnswParams(crate::hnsw::HnswError),
+}
+
+/// [`SearchEngineError`] が返す SQLSTATE 風コード。ERR-2 表の既存分類
+/// （`OperationIdContentMismatch`）と同じ値を返す定数であり、`ErrorClass` への
+/// 新規登録ではない（[`SearchEngineError`] ドキュメント参照）。
+pub const INVALID_ENGINE_SPEC_WIRE_CODE: &str = "22023";
+
+impl SearchEngineError {
+    /// SQLSTATE 風コード。全 variant がこの定数を返す（[`INVALID_ENGINE_SPEC_WIRE_CODE`]
+    /// ドキュメント参照）。
+    pub const fn wire_code(&self) -> &'static str {
+        match self {
+            SearchEngineError::InvalidHnswParams(_) => INVALID_ENGINE_SPEC_WIRE_CODE,
+        }
+    }
+}
+
+impl fmt::Display for SearchEngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchEngineError::InvalidHnswParams(err) => {
+                write!(f, "invalid HNSW search engine params: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SearchEngineError {}
+
+impl fmt::Display for SearchEngineKind {
+    /// 診断・`EXPLAIN`（#411 の担当。本 Issue は表示専用の生成元のみ用意する）向けの
+    /// 人間可読表現。`FromStr` の対は本 Issue 時点で呼び出し元が存在しないため設けない
+    /// （untrusted 文字列パーサを使う先が無いまま追加しない）。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SearchEngineKind::CpuScalarBruteForce => write!(f, "cpu_scalar_brute_force"),
+            SearchEngineKind::ParallelBruteForce => write!(f, "parallel_brute_force"),
+            SearchEngineKind::Hnsw(params) => write!(
+                f,
+                "hnsw(m={},ef_construction={},ef_search={})",
+                params.m, params.ef_construction, params.ef_search
+            ),
+        }
+    }
 }
 
 /// `kind` に対応する `SearchProvider` 実装を構築する。
+///
+/// `Hnsw` の `HnswParams` は事前検証済みであることを呼び出し元が保証する契約
+/// （[`build`] は infallible）。untrusted な文字列・設定値から `SearchEngineKind::Hnsw`
+/// を組み立てる経路（`core.rs::EngineCore::open_with_engine` 等）は必ず
+/// [`build_validated`] を経由し、[`SearchEngineError`] で fail-closed に拒否してから
+/// [`build`] を呼ぶ。
 ///
 /// 呼び出し元（`core.rs::EngineCore::open` 等）はここで返る `Box<dyn SearchProvider>` を
 /// そのまま `EngineCore::with_provider` へ渡す想定（object-safe な trait のため
@@ -47,16 +139,43 @@ pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider> {
     match kind {
         SearchEngineKind::CpuScalarBruteForce => Box::new(CpuScalarProvider),
         SearchEngineKind::ParallelBruteForce => Box::new(ParallelSearchProvider),
+        SearchEngineKind::Hnsw(params) => Box::new(HnswSearchProvider::new(params)),
     }
+}
+
+/// [`build`] の検証付き版。`kind` が `Hnsw(params)` の場合のみ
+/// [`HnswParams::validate`] を通し、失敗を [`SearchEngineError`] として fail-closed に
+/// 返す（`Hnsw` 以外の variant は現時点で検証すべきパラメータを持たないため常に成功）。
+///
+/// `core.rs::EngineCore::open_with_engine`／`from_storage_with_engine`
+/// （Issue #407 で追加）が唯一の呼び出し元で、不正な `HnswParams` を持つ
+/// `EngineCore` が構築される経路を構造的に無くす。
+pub fn build_validated(
+    kind: SearchEngineKind,
+) -> Result<Box<dyn SearchProvider>, SearchEngineError> {
+    if let SearchEngineKind::Hnsw(params) = kind {
+        params
+            .validate()
+            .map_err(SearchEngineError::InvalidHnswParams)?;
+    }
+    Ok(build(kind))
+}
+
+/// 既定の検索エンジン種別（`ParallelBruteForce`）。[`EngineCore::open`]
+/// （`core.rs`）・[`default_engine`] が参照する唯一の既定値の源泉であり、
+/// 既定エンジンを固定するテストはこの関数の戻り値を検証する。
+pub fn default_kind() -> SearchEngineKind {
+    SearchEngineKind::ParallelBruteForce
 }
 
 /// 既定の検索エンジンを構築する（`EngineCore::open` から呼ばれる既定経路）。
 ///
-/// 現時点の既定は [`SearchEngineKind::ParallelBruteForce`]（マルチスレッド並列総当たり）。
-/// 挙動は `EngineCore::open` が従来 `ParallelSearchProvider` を直接生成していたときと同一で、
-/// 性能・結果の回帰は発生しない。
+/// 現時点の既定は [`default_kind`]（[`SearchEngineKind::ParallelBruteForce`]、
+/// マルチスレッド並列総当たり）。挙動は `EngineCore::open` が従来
+/// `ParallelSearchProvider` を直接生成していたときと同一で、性能・結果の回帰は
+/// 発生しない。
 pub fn default_engine() -> Box<dyn SearchProvider> {
-    build(SearchEngineKind::ParallelBruteForce)
+    build(default_kind())
 }
 
 #[cfg(test)]
@@ -69,6 +188,67 @@ mod tests {
     fn build_and_default_return_boxed_search_provider() {
         let _cpu: Box<dyn SearchProvider> = build(SearchEngineKind::CpuScalarBruteForce);
         let _parallel: Box<dyn SearchProvider> = build(SearchEngineKind::ParallelBruteForce);
+        let _hnsw: Box<dyn SearchProvider> = build(SearchEngineKind::Hnsw(HnswParams::default()));
         let _default: Box<dyn SearchProvider> = default_engine();
+    }
+
+    // 既定エンジン不変（受け入れ条件 (a) の型レベル部分）。
+    #[test]
+    fn default_kind_is_parallel_brute_force() {
+        assert_eq!(default_kind(), SearchEngineKind::ParallelBruteForce);
+    }
+
+    #[test]
+    fn hnsw_default_params_pass_validation() {
+        assert!(HnswParams::default().validate().is_ok());
+        assert!(build_validated(SearchEngineKind::Hnsw(HnswParams::default())).is_ok());
+    }
+
+    #[test]
+    fn build_validated_rejects_invalid_hnsw_params() {
+        let invalid = HnswParams {
+            m: 1, // HnswParams::validate は m < 2 を拒否する
+            ..HnswParams::default()
+        };
+        // `Box<dyn SearchProvider>` は `Debug` を実装しないため `expect_err` は使えず、
+        // `match` で `Err` 側だけを取り出す。
+        let err = match build_validated(SearchEngineKind::Hnsw(invalid)) {
+            Ok(_) => panic!("m=1 must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.wire_code(), "22023");
+        assert!(matches!(err, SearchEngineError::InvalidHnswParams(_)));
+        // wire_code は ERR-2 表の既存分類（OperationIdContentMismatch）に逆引きできる
+        // 既知のコードであることを固定する（新分類は追加しない。モジュールドキュメント
+        // 「ANN（HNSW）の opt-in 結線」節参照）。
+        assert!(crate::error_format::ErrorClass::from_wire_code(err.wire_code()).is_some());
+    }
+
+    #[test]
+    fn build_validated_never_validates_non_hnsw_kinds() {
+        // CpuScalarBruteForce / ParallelBruteForce は検証すべきパラメータを持たず常に成功。
+        assert!(build_validated(SearchEngineKind::CpuScalarBruteForce).is_ok());
+        assert!(build_validated(SearchEngineKind::ParallelBruteForce).is_ok());
+    }
+
+    #[test]
+    fn display_hnsw_includes_params() {
+        let kind = SearchEngineKind::Hnsw(HnswParams {
+            m: 32,
+            ef_construction: 200,
+            ef_search: 128,
+        });
+        assert_eq!(
+            kind.to_string(),
+            "hnsw(m=32,ef_construction=200,ef_search=128)"
+        );
+        assert_eq!(
+            SearchEngineKind::ParallelBruteForce.to_string(),
+            "parallel_brute_force"
+        );
+        assert_eq!(
+            SearchEngineKind::CpuScalarBruteForce.to_string(),
+            "cpu_scalar_brute_force"
+        );
     }
 }

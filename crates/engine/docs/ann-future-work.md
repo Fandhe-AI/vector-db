@@ -51,6 +51,17 @@ ANN 導入時に個別に検証が必要である。
 `SearchEngineKind` へ ANN variant を追加するタスク（CORE-9 の拡張点を実際に
 行使するタイミング）の着手時。
 
+Issue #407 で `SearchEngineKind::Hnsw` variant・`build` 結線・`EngineCore`
+構築時 opt-in（`open_with_engine`／`from_storage_with_engine`）を追加し、この
+トリガー条件に到達した。ただし #407 の `HnswSearchProvider`
+（`crates/engine/src/hnsw/provider.rs`）は本メモが挙げる再評価観点（事前
+フィルタとの組み合わせ・可視率帯ごとの再現率等）に触れる索引探索を一切行わず、
+常に総当たり系 `ParallelSearchProvider` へ委譲する（全件 brute-force
+フォールバック）。RLS（`rls.rs::PrefilterIndex`）との実質的な組み合わせ・
+本メモの再評価は、索引を実際に探索へ使うタスク（世代整合キャッシュの #408、
+RLS 統合・切替の #409／#410）が担う（詳細は
+`docs/design/hnsw-search-engine-wiring.md` 参照）。
+
 ## スコープ外
 
 本メモの時点では ANN の実装・具体的な方式決定は行わない。数値的な受け入れ
