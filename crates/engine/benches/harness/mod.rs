@@ -59,6 +59,7 @@ pub mod hybrid_latency;
 // のため、モジュール自体は無条件でコンパイルする。`sparse_refetch_observed`
 // に依存する関数（`sparse_refetch_schedule`）のみモジュール内で個別に
 // `#[cfg(feature = "bench-internals")]` を付ける。
+pub mod hnsw_build;
 pub mod hybrid_profile;
 pub mod ingest_profile;
 pub mod knn_profile;

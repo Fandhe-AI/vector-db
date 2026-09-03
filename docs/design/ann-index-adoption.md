@@ -20,7 +20,8 @@
   `docs/design/precision-confidence-gate.md`・
   `docs/design/knn-stage-profile.md`・`docs/design/knn-two-stage-topk.md`・
   `docs/design/dot-kernel-multi-accumulator.md`・
-  `docs/design/sql-arena-generation-cache.md`・`docs/design/sparse-index-cache.md`
+  `docs/design/sql-arena-generation-cache.md`・`docs/design/sparse-index-cache.md`・
+  `docs/design/hnsw-graph-construction.md`
 
 ## 目的・位置づけ
 

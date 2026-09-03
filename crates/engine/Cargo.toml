@@ -286,3 +286,16 @@ test = false
 name = "ingest_profile_bench"
 harness = false
 test = false
+
+[[bench]]
+# TASK-132（Issue #404。HNSW グラフ構築の受け入れ条件 (b): 構築計算量が規模に
+# 対してほぼ N log N であることの簡易ベンチ確認）の実測入口。
+# `engine::hnsw::HnswIndex::build` を dim=64・rows=[2_000, 8_000, 32_000] で計測し、
+# 隣接規模点対の log-log 傾き（実効指数）を出す。spec 由来の pass/fail 閾値は
+# 持たない情報提供専用ベンチのため `.github/workflows/*` へは配線しない。
+# harness = false / test = false は上記ベンチと同一方針。`make bench-hnsw-build`
+# （Makefile）から実行する。判定ロジック自体（時間非依存）は harness/hnsw_build.rs
+# にあり tests/hnsw_build_accept.rs で make ci 側から回帰検証する。
+name = "hnsw_build_bench"
+harness = false
+test = false

@@ -354,6 +354,18 @@ else
 endif
 
 # --------------------------------------------------
+# HNSW グラフ構築の N log N スケーリング確認ベンチ（TASK-132・Issue #404。crates/engine/benches/hnsw_build_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hnsw-build
+bench-hnsw-build: ## TASK-132（Issue #404。HNSW グラフ構築の受け入れ条件 (b): 構築計算量が規模に対してほぼ N log N であることの簡易ベンチ確認）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+ifdef HAS_CARGO
+	cargo bench --bench hnsw_build_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-build をスキップ"
+endif
+
+# --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------
 
