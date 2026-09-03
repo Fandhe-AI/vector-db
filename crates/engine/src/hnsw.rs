@@ -1,23 +1,40 @@
 //! HNSW（Hierarchical Navigable Small World）グラフの構築（TASK-132・対象ビヘイビア:
 //! CORE-9・CORE-10。ポインタ: `docs/design/ann-index-adoption.md`「実装ガイド（B 案）」節）。
 //!
-//! 本モジュールの範囲は**グラフ構築のみ**（Malkov & Yashunin 2016 の Algorithm 1〜4 相当）。
-//! 探索 API（`ef_search` を使った top-k 探索）・並列構築・`search_engine.rs` への
-//! `SearchEngineKind::Hnsw` 結線・世代整合キャッシュ・RLS 統合・永続化はいずれも
-//! 別タスク（#405〜#409）の担当であり、本モジュールは触れない。ADR
-//! （`docs/design/ann-index-adoption.md`）の「非契約的な実装詳細」区分に基づき、
-//! spec 側の確定を待たずに着手している。
+//! 本モジュールの範囲は**グラフ構築（Algorithm 1〜4 相当）＋ ef-探索 top-k 検索
+//! （Algorithm 5 相当。[`HnswIndex::search`]。#405 で追加）**。並列構築・
+//! `search_engine.rs` への `SearchEngineKind::Hnsw` 結線・世代整合キャッシュ・
+//! RLS 統合・永続化はいずれも別タスク（#406〜#409）の担当であり、本モジュールは
+//! 触れない。ADR（`docs/design/ann-index-adoption.md`）の「非契約的な実装詳細」
+//! 区分に基づき、spec 側の確定を待たずに着手している。
 //!
-//! # ベクトルの所有方針（#405・#408 への申し送り）
+//! # ベクトルの所有方針（codex-review PR #430 P1 指摘への対応で変更）
 //!
-//! [`HnswIndex`] はグラフ（隣接リスト・レベル・エントリポイント）のみを保持し、
-//! ベクトル本体は複製しない。呼び出し元（`arena.rs::VectorArena` や #408 の
-//! 世代整合キャッシュ）が row-major 連続バッファとして所有し続け、[`HnswIndex::build`]
-//! へは `&[f32]` で借用のみ渡す契約とする。768 次元 × 100 万行では複製だけで
-//! 3 GB 級になるため、この方針はメモリ効率上の要請である。探索 API（#405）も
-//! 同じ `vectors: &[f32]` を受け取り、`len() * dim() == vectors.len()` を毎回
-//! 検証する（fail-closed。呼び出し元がビルド後にベクトル集合を差し替えてしまう
-//! 事故を検出する唯一の手段が長さ照合であるため）。
+//! [`HnswIndex::build`] は `&[f32]`（`arena.rs::VectorArena` 等が所有する
+//! row-major 連続バッファ）を借用してグラフ（隣接リスト・レベル・
+//! エントリポイント）を構築するが、構築完了時にその内容を `Arc<[f32]>`
+//! として 1 回だけコピーし [`HnswIndex`] 自身に**所有**させる。
+//! [`HnswIndex::search`] はもはや `vectors` を引数に取らず、常にこの
+//! 内部スナップショットを参照する——旧設計（呼び出し元がビルド後も
+//! バッファを所有し続け、`search` へ毎回 `&[f32]` で貸し出す）では、
+//! 呼び出し元が構築後にバッファを書き換える・行順を入れ替える・別の
+//! バッファへ差し替えるといった事故を `search` 側が検出できるかは
+//! 長さ照合とサンプリングに依存し、サンプリング対象外の位置への
+//! 書き換えは正常入力として静かに受理されグラフと `vectors` の対応が
+//! 崩れたまま誤った top-k を返しかねなかった（初出時の対応:
+//! サンプリング・フィンガープリント照合。指摘: そのサンプリング自体が
+//! 検出漏れの余地を残す）。`HnswIndex` が唯一の正本を所有する設計へ
+//! 変更したことで、`search` に「別バッファが渡される」という入力の
+//! クラス自体が存在しなくなり、照合ロジックなしに構造的に防げる。
+//!
+//! この設計変更により `build` 呼び出し 1 回あたり `n * dim * 4` バイトの
+//! 追加コピーが恒久的に発生する（768 次元 × 100 万行で 3 GB 級。旧設計が
+//! 避けていたコスト）。トレードオフとして受け入れた判断であり、#408 の
+//! 世代整合キャッシュ・#406 の並列構築で `VectorArena` 側が最初から
+//! `Arc<[f32]>` を持つ構成に変えられれば、このコピーは `Arc::clone`
+//! （参照カウントの増分のみ）に縮退できる——`arena.rs::VectorArena` は
+//! 本 Issue 時点で `vectors: Vec<f32>` のまま（`Arc` 化していない）ため、
+//! この縮退は #408 側の設計課題として申し送る。
 //!
 //! # 距離カーネル
 //!
@@ -59,6 +76,7 @@
 
 use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::kernel::dot;
 
@@ -172,6 +190,14 @@ pub enum HnswError {
     NonFiniteScore { node: u32 },
     /// オフセット・容量計算が `usize`／`u32` の範囲を超えた。
     CapacityOverflow,
+    /// [`HnswIndex::search`]（#405）のクエリベクトルの次元が索引の次元
+    /// （[`HnswIndex::dim`]）と一致しない。
+    QueryDimMismatch { expected: u32, found: usize },
+    /// [`HnswIndex::search`] のクエリベクトルに NaN／Inf が含まれる。
+    /// `kernel.rs::KernelError::NonFiniteQuery` と同じ理由（wire 経由の
+    /// untrusted 入力を `total_cmp` の順序に委ねず事前拒否する）で、探索段の
+    /// 入口で検証する。
+    NonFiniteQuery,
 }
 
 impl fmt::Display for HnswError {
@@ -197,6 +223,11 @@ impl fmt::Display for HnswError {
                 write!(f, "dot product score for node {node} is non-finite")
             }
             HnswError::CapacityOverflow => write!(f, "capacity computation overflowed"),
+            HnswError::QueryDimMismatch { expected, found } => write!(
+                f,
+                "hnsw search query dim mismatch: expected={expected} found={found}"
+            ),
+            HnswError::NonFiniteQuery => write!(f, "hnsw search query contains non-finite value"),
         }
     }
 }
@@ -289,14 +320,20 @@ struct Node {
     links: Vec<Vec<u32>>,
 }
 
-/// 構築済み HNSW グラフ。ベクトル本体を保持しない（[`HnswIndex::build`] の
-/// 呼び出し元が所有し続ける借用契約。モジュール冒頭コメント参照）。
+/// 構築済み HNSW グラフ。`build` 完了時に渡された `vectors` の内容を
+/// `Arc<[f32]>` として所有する（モジュール冒頭「ベクトルの所有方針」節・
+/// codex-review PR #430 P1 指摘対応）。`search` は呼び出し元からベクトルを
+/// 受け取らず、常にこの不変スナップショットのみを参照するため、長さ・
+/// 内容が食い違うバッファが渡されるという事故のクラス自体が存在しない。
 #[derive(Debug)]
 pub struct HnswIndex {
     params: HnswParams,
     dim: u32,
     nodes: Vec<Node>,
     entry_point: Option<u32>,
+    /// `build` 時点の `vectors`（row-major・`len() == nodes.len() * dim`）の
+    /// 不変スナップショット。`search` はこれを `node_vector` で参照する。
+    vectors: Arc<[f32]>,
 }
 
 /// `search_layer` が呼び出しをまたいで再利用する visited 集合（世代カウンタ
@@ -335,6 +372,88 @@ impl VisitedScratch {
         *slot = self.current;
         Some(already)
     }
+}
+
+/// [`search_layer`](HnswIndex::search_layer) が visited 集合として要求する
+/// 最小インターフェース（#405）。構築経路（[`VisitedScratch`]。世代カウンタ
+/// 方式で挿入ごとの O(N) 初期化コストを避ける）と探索経路（[`VisitedBitmap`]。
+/// 1 ノード 1 bit でクエリ間の長期保持スクラッチに適する）の 2 実装を同じ
+/// `search_layer` から共有するための境界。選定理由の詳細は
+/// `docs/design/hnsw-search.md` 参照。
+pub(crate) trait VisitedSet {
+    /// 呼び出しに先立ちリセットする。`len` は索引の現在のノード数。
+    fn reset(&mut self, len: usize);
+    /// `id` を訪問済みとして記録する。戻り値・範囲外時の扱いは各実装の
+    /// `mark_visited` に合わせる（`Some(既訪問か)`／範囲外は `None`）。
+    fn mark_visited(&mut self, id: usize) -> Option<bool>;
+}
+
+impl VisitedSet for VisitedScratch {
+    fn reset(&mut self, len: usize) {
+        VisitedScratch::reset(self, len);
+    }
+
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        VisitedScratch::mark_visited(self, id)
+    }
+}
+
+/// [`HnswIndex::search`]（#405）専用の visited 集合（1 ノード 1 bit の
+/// ビットマップ方式）。[`VisitedScratch`] の世代カウンタ方式は構築経路の
+/// O(N^2) 初期化回避を目的に導入されたものだが、探索経路はクエリごとに
+/// 呼ばれ [`HnswSearchScratch`] としてスレッドごとに長期保持される想定のため、
+/// メモリ効率（epoch 方式の 8 分の 1）を優先してビットマップを採用する
+/// （選定理由の詳細は `docs/design/hnsw-search.md` 参照）。
+#[derive(Debug, Default)]
+struct VisitedBitmap {
+    words: Vec<u64>,
+}
+
+impl VisitedBitmap {
+    /// `len` ノード分を保持できるよう語数を伸長したうえで全ビットをクリア
+    /// する（縮小はしない。呼び出し元が同一スクラッチを異なる索引規模へ
+    /// 使い回す想定のため、再確保コストより多少の未使用メモリを許容する）。
+    fn reset(&mut self, len: usize) {
+        let words_needed = len.div_ceil(64);
+        if self.words.len() < words_needed {
+            self.words.resize(words_needed, 0);
+        }
+        for w in self.words.iter_mut() {
+            *w = 0;
+        }
+    }
+
+    /// `id` を訪問済みとして記録する。範囲外の `id` は `None`（呼び出し元は
+    /// untrusted 添字アクセスをせず `continue` する。coding-rust.md）。
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        let word_idx = id / 64;
+        let bit_idx = id % 64;
+        let word = self.words.get_mut(word_idx)?;
+        let mask = 1u64 << bit_idx;
+        let already = (*word & mask) != 0;
+        *word |= mask;
+        Some(already)
+    }
+}
+
+impl VisitedSet for VisitedBitmap {
+    fn reset(&mut self, len: usize) {
+        VisitedBitmap::reset(self, len);
+    }
+
+    fn mark_visited(&mut self, id: usize) -> Option<bool> {
+        VisitedBitmap::mark_visited(self, id)
+    }
+}
+
+/// [`HnswIndex::search`]（#405）の呼び出しをまたいで再利用するスクラッチ。
+/// 呼び出し元（将来の provider）がスレッドごとに 1 つ所有し、クエリごとに
+/// 使い回す想定（モジュール冒頭「ベクトルの所有方針」節と同じ、確保コストを
+/// 呼び出し元へ償却させる方針）。`Default` から始めれば初回呼び出しで索引
+/// 規模に応じて自動的に伸長する。
+#[derive(Debug, Default)]
+pub struct HnswSearchScratch {
+    visited: VisitedBitmap,
 }
 
 /// 層 `level` におけるノードの隣接リスト最大次数を返す（層 0 は `2*m`、
@@ -393,11 +512,17 @@ impl HnswIndex {
             }
         }
 
+        // `vectors` の不変スナップショットを取り、以降 `search` はこれのみを
+        // 参照する（モジュール冒頭「ベクトルの所有方針」節・codex-review PR
+        // #430 P1 指摘対応。呼び出し元が構築後に借用元バッファを書き換えても
+        // この Arc の中身は変化しない）。
+        let owned_vectors: Arc<[f32]> = Arc::from(vectors);
         let mut index = HnswIndex {
             params,
             dim,
             nodes: Vec::with_capacity(n),
             entry_point: None,
+            vectors: owned_vectors,
         };
         if n == 0 {
             return Ok(index);
@@ -747,13 +872,16 @@ impl HnswIndex {
     /// できるようにする。
     ///
     /// `visited` は呼び出し元（`insert_node`／`build` あるいはテスト）が
-    /// 全呼び出しをまたいで所有する [`VisitedScratch`]。挿入ごとに新規の
-    /// `Vec<bool>` を確保しゼロ初期化していた旧実装は、`build` が挿入ごとに
-    /// 少なくとも層 0 で本関数を呼ぶため合計 O(N^2) の初期化コストになって
-    /// いた（codex-review #423 P1 指摘）。世代カウンタ方式のスクラッチへ
-    /// 切り替え、各呼び出しの先頭で `reset` するだけに変更した。
+    /// 全呼び出しをまたいで所有する visited 集合（[`VisitedSet`]）。挿入ごとに
+    /// 新規の `Vec<bool>` を確保しゼロ初期化していた旧実装は、`build` が
+    /// 挿入ごとに少なくとも層 0 で本関数を呼ぶため合計 O(N^2) の初期化コスト
+    /// になっていた（codex-review #423 P1 指摘）。構築経路は世代カウンタ方式の
+    /// [`VisitedScratch`]、探索経路（#405・[`HnswIndex::search`]）はビットマップ
+    /// 方式の [`VisitedBitmap`] を渡し、両者は `V: VisitedSet` のジェネリック
+    /// パラメータとして本関数に共有される。各呼び出しの先頭で `reset` するだけ
+    /// でよい契約は変わらない。
     #[allow(clippy::too_many_arguments)] // visited 追加で 8 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
-    pub(crate) fn search_layer(
+    pub(crate) fn search_layer<V: VisitedSet>(
         &self,
         entry_points: Vec<u32>,
         query: &[f32],
@@ -761,7 +889,7 @@ impl HnswIndex {
         level: usize,
         dim: usize,
         vectors: &[f32],
-        visited: &mut VisitedScratch,
+        visited: &mut V,
     ) -> Result<Vec<ScoredNode>, HnswError> {
         visited.reset(self.nodes.len());
         let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
@@ -1083,6 +1211,110 @@ impl HnswIndex {
     pub fn max_degree(&self, level: usize) -> usize {
         max_degree_for(&self.params, level)
     }
+
+    /// ef-探索 top-k 検索（Malkov & Yashunin 2016 Algorithm 5 相当。TASK-132・
+    /// CORE-9・CORE-10。#405 の担当範囲）。上位層を `ef=1` の
+    /// [`greedy_descend`](Self::greedy_descend) で降下したのち、層 0 を幅
+    /// `ef.max(k)` で [`search_layer`](Self::search_layer) によりビーム探索し、
+    /// 上位 `k` 件を返す。結果は `kernel.rs::CandidateHit` と同じ順序規約
+    /// （スコア降順・同点は id 昇順）で、`id` は内部スナップショット
+    /// （`self.vectors`）上のノード番号（0 始まり）を `u64` 化したもの。
+    ///
+    /// ベクトル本体は引数で受け取らず、[`build`](Self::build) 時に取得した
+    /// 内部スナップショット（`self.vectors`。row-major 連続バッファ、
+    /// `self.vectors.len() == self.len() * dim`。モジュール冒頭「ベクトルの
+    /// 所有方針」節）のみを参照する。`scratch` は クエリをまたいで呼び出し元が
+    /// 再利用する [`HnswSearchScratch`]。
+    ///
+    /// 決定性の保証範囲は「同一索引・同一クエリ・任意のスクラッチ状態で
+    /// 結果が再現する」までであり、総当たり経路（`kernel.rs`）が持つ境界
+    /// 同点グループの完全化までは保証しない（spec 側の規範化は #405 の
+    /// 担当外。詳細は `docs/design/hnsw-search.md` 参照）。
+    ///
+    /// # エラー
+    ///
+    /// 検証順序は次のとおり（すべて fail-closed）: クエリ次元不一致
+    /// （[`HnswError::QueryDimMismatch`]）→ クエリの非有限値
+    /// （[`HnswError::NonFiniteQuery`]。`kernel.rs::KernelError::NonFiniteQuery`
+    /// と同じ理由で `total_cmp` の順序に委ねず事前拒否する）→ `ef`／`k` の
+    /// 上限超過（[`HnswError::InvalidParams`]。`MAX_EF` を上限に流用し、
+    /// untrusted な呼び出し元が無制限の候補集合を要求できないようにする）。
+    /// `k == 0` または空索引は空の `Ok(Vec::new())` を返す。ベクトル本体は
+    /// `build` 時に取得した内部スナップショット（`self.vectors`）を使うため、
+    /// 呼び出し元がベクトル集合を渡す経路が存在せず、長さ・内容の不一致
+    /// エラーはそもそも構造的に発生しない（モジュール冒頭「ベクトルの
+    /// 所有方針」節・codex-review PR #430 P1 指摘対応）。
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        scratch: &mut HnswSearchScratch,
+    ) -> Result<Vec<crate::kernel::CandidateHit>, HnswError> {
+        let dim_usize = self.dim as usize;
+        if query.len() != dim_usize {
+            return Err(HnswError::QueryDimMismatch {
+                expected: self.dim,
+                found: query.len(),
+            });
+        }
+        if query.iter().any(|v| !v.is_finite()) {
+            return Err(HnswError::NonFiniteQuery);
+        }
+        if ef == 0 || ef > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "ef must be in 1..=MAX_EF",
+            });
+        }
+        if k > MAX_EF {
+            return Err(HnswError::InvalidParams {
+                reason: "k exceeds MAX_EF",
+            });
+        }
+        if k == 0 || self.nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let Some(entry) = self.entry_point else {
+            return Ok(Vec::new());
+        };
+        let Some(top_level) = self.max_level() else {
+            return Ok(Vec::new());
+        };
+
+        let mut nearest = entry;
+        if top_level > 0 {
+            for l in (1..=top_level).rev() {
+                nearest = self.greedy_descend(nearest, query, l, dim_usize, &self.vectors)?;
+            }
+        }
+
+        // k > ef のとき結果集合が k 件に満たない事故を防ぐため、実効 ef を
+        // `ef.max(k)` へ引き上げる（hnswlib 等の一般的慣行。詳細は
+        // `docs/design/hnsw-search.md` 参照）。ef・k は共に上で MAX_EF 以下と
+        // 検証済みのため `ef_eff` も MAX_EF 以下。
+        let ef_eff = ef.max(k);
+
+        let results = self.search_layer(
+            vec![nearest],
+            query,
+            ef_eff,
+            0,
+            dim_usize,
+            &self.vectors,
+            &mut scratch.visited,
+        )?;
+
+        let out: Vec<crate::kernel::CandidateHit> = results
+            .into_iter()
+            .take(k)
+            .map(|s| crate::kernel::CandidateHit {
+                id: s.node as u64,
+                score: s.score,
+            })
+            .collect();
+        Ok(out)
+    }
 }
 
 /// row-major バッファから `node` 番目のベクトルスライスを取り出す。範囲外
@@ -1229,6 +1461,10 @@ mod tests {
                 },
             ],
             entry_point: Some(0),
+            // 本テストは select_neighbors_heuristic を直接呼ぶのみで search() を
+            // 経由しないため、`vectors` の内容は使われない（プレースホルダで
+            // 十分）。
+            vectors: Arc::from(vectors.clone()),
         };
         let query = &[1.0f32, 0.0f32];
         let candidates = vec![
@@ -1366,6 +1602,10 @@ mod tests {
                 },
             ],
             entry_point: Some(0),
+            // 本テストは search_layer を直接呼ぶのみで search() を経由しない
+            // ため、`vectors` フィールドの内容は使われない（プレースホルダで
+            // 十分）。
+            vectors: Arc::from(vectors.clone()),
         };
         let query = [1.0f32];
         let mut visited = VisitedScratch::default();
@@ -1378,6 +1618,107 @@ mod tests {
             "search_layer must traverse through a tied-score node to reach a \
              strictly closer one; an id-tiebreak (complex-order) stopping or \
              admission predicate would stop at the tie and miss node 2"
+        );
+    }
+
+    #[test]
+    fn visited_bitmap_reset_clears_all_bits_and_only_grows() {
+        let mut bm = VisitedBitmap::default();
+        bm.reset(10);
+        assert_eq!(bm.mark_visited(3), Some(false));
+        assert_eq!(bm.mark_visited(3), Some(true));
+        // 伸長のみで縮めない: 一旦 200 まで広げてから 5 へ縮めても、以前確保した
+        // 語も次の reset で全クリアされる（縮小しないことの安全側確認）。
+        bm.reset(200);
+        assert_eq!(bm.mark_visited(150), Some(false));
+        bm.reset(5);
+        assert_eq!(
+            bm.mark_visited(150),
+            Some(false),
+            "reset は全クリアなので縮小後の呼び出しでも既訪問と誤判定してはならない"
+        );
+    }
+
+    #[test]
+    fn visited_bitmap_out_of_range_id_returns_none() {
+        let mut bm = VisitedBitmap::default();
+        bm.reset(10);
+        assert_eq!(bm.mark_visited(999), None);
+    }
+
+    /// 手作りの最小グラフ（`search_layer_continues_through_tied_score_candidates_
+    /// to_find_a_strictly_closer_node` と同じ 3 ノード構成）で、上位層の貪欲降下
+    /// →層 0 のビーム探索という `search` の経路が正しく動作することを確認する。
+    #[test]
+    fn search_finds_expected_top_k_on_minimal_graph() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![10.0, 10.0, 20.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+            // search() は `self.vectors`（build 時の不変スナップショット）を
+            // 参照するため、struct literal でも同じ内容を設定する。
+            vectors: Arc::from(vectors.clone()),
+        };
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+        let results = index.search(&query, 2, 1, &mut scratch).unwrap();
+        assert_eq!(
+            results.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![2, 0],
+            "search must beam through the tied-score node to reach node 2, then \
+             fall back to node 0 (score 10.0) as the 2nd best"
+        );
+    }
+
+    /// codex-review PR #430 P1 指摘への対応で `HnswIndex` は `build` 時の
+    /// `vectors` を `Arc<[f32]>` として所有するよう変更した（モジュール冒頭
+    /// 「ベクトルの所有方針」節）。呼び出し元が `build` に渡した元のバッファ
+    /// （`Vec<f32>`）を構築後に書き換えても、`search` は build 時点で取得した
+    /// 不変スナップショットのみを参照するため一切影響を受けないことを固定する
+    /// ——旧設計（`search` へ毎回 `&[f32]` を渡す方式）ではサンプリング対象外
+    /// の書き換えが静かに受理され得たが、この設計では「別バッファが search に
+    /// 渡される」という入力のクラス自体が存在しない。
+    #[test]
+    fn search_is_unaffected_by_mutations_to_the_caller_owned_build_buffer() {
+        let dim = 8usize;
+        let rows = 50usize;
+        let mut vectors = gen_corpus(0xAAAA_1111, dim, rows);
+        let index =
+            HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 0xBBBB_2222).unwrap();
+
+        let query: Vec<f32> = vectors[0..dim].to_vec();
+        let mut scratch = HnswSearchScratch::default();
+        let before = index.search(&query, 5, 32, &mut scratch).unwrap();
+
+        // ノード 0 とノード 1 の行を入れ替え、さらにノード 40（サンプリング
+        // 方式なら見逃しうる位置）の要素も書き換える。呼び出し元が所有する
+        // `vectors` を直接破壊しているが、index はこのバッファを一切参照しない。
+        let (front, back) = vectors.split_at_mut(dim);
+        front[..dim].swap_with_slice(&mut back[..dim]);
+        vectors[40 * dim] += 1.0;
+        drop(vectors); // index が自身のスナップショットのみで完結することを明示する。
+
+        let after = index.search(&query, 5, 32, &mut scratch).unwrap();
+        assert_eq!(
+            before, after,
+            "search must be based solely on the build-time snapshot, unaffected by \
+             the caller mutating or dropping its own copy of the vectors buffer"
         );
     }
 }
