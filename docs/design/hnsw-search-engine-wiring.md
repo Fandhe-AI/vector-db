@@ -52,11 +52,19 @@ pub fn build(kind: SearchEngineKind) -> Box<dyn SearchProvider>; // 旧公開シ
 （`CpuScalarBruteForce`／`ParallelBruteForce`／検証済み `HnswParams`）でのみ
 呼ばれる契約とし、untrusted な値から `SearchEngineKind::Hnsw` を組み立てる
 crate 内部の経路（`core.rs::EngineCore::open_with_engine`／
-`from_storage_with_engine`）は必ず `build_validated` を経由する。crate 外の
-呼び出し元向けには、旧公開シグネチャと同一の `pub fn build` を互換ラッパーと
-して維持し、`build_validated` の結果が `Err`（不正な `HnswParams`）の場合は
-`.expect`/`.unwrap` に頼らず `default_kind()`（`ParallelBruteForce`）へ
-fail-closed にフォールバックする（経緯は「変更履歴」節参照）。
+`from_storage_with_engine`）は必ず `build_validated` を経由する。これが HNSW
+構築の正規経路であり、不正な `HnswParams` は構築時点で `SearchEngineError`
+として fail-closed に拒否され、不正な状態の `EngineCore` は構築されない。
+
+crate 外の呼び出し元向けには、旧公開シグネチャと同一の `pub fn build` を
+互換ラッパーとして維持する。`build_validated` の結果が `Err`（不正な
+`HnswParams`）の場合、`.expect`/`.unwrap` に頼らないだけでなく、要求した
+エンジンが実際には選ばれなかったことを呼び出し元が観測できない**既定
+エンジンへの黙った置換（fail-open）もしない**（codex-review P1 指摘・
+PR #433 追記）。代わりに `search_engine::InvalidEngineProvider`（crate 内部）
+を返す。構築自体は infallible な戻り値契約（`Box<dyn SearchProvider>`）を
+保ったまま、`search()` が呼ばれるたびに必ず
+`kernel::KernelError::InvalidEngineConfig` を返す。経緯は「変更履歴」節参照。
 
 ### `FromStr`／設定文字列パーサは追加しない
 
@@ -312,6 +320,34 @@ spec 側変更が存在しない）ことを指摘され、破壊的変更を伴
   呼び出し可能性（コンパイル可能性）とフォールバック挙動を固定した
 
 2 巡目の変更履歴（直前の節）は判断の推移の記録として残し、削除・書き換えは
+行わない。
+
+### `build` 互換ラッパーの既定エンジンへの黙った置換を撤回（codex-review P1 指摘・PR #433 4 巡目）
+
+3 巡目で採った「`build_validated` の拒否を `default_kind()`
+（`ParallelBruteForce`）へフォールバックする」設計は、パニックは避けたものの
+別の fail-open を生んでいた: 呼び出し元が明示的に `SearchEngineKind::Hnsw`
+を要求したにも関わらず、不正な `HnswParams` の場合は黙って総当たり実装へ
+差し替えられ、要求したエンジンが選ばれなかったことを `build` の戻り値
+（`Box<dyn SearchProvider>`）から観測する手段が無かった。
+
+- `search_engine::InvalidEngineProvider`（`pub(crate)`）を新設。
+  `build_validated` が `Err` を返した場合、`build` はこの provider を返す
+- `InvalidEngineProvider::search` は `input` の内容に関わらず常に
+  `kernel::KernelError::InvalidEngineConfig { reason }` を返す
+  （`reason` は `SearchEngineError` の `Display` 文字列）
+- `build` 自体は引き続き infallible な戻り値契約（`Box<dyn SearchProvider>`）
+  を維持し、外部呼び出し元の既存コンパイルは壊さない。エラーの観測点が
+  「構築時」から「`search()` 呼び出し時」へ移るだけで、`build_validated`
+  （構築時にエラーを返す）が引き続き HNSW 構築の正規経路であることは不変
+- `kernel::KernelError` に `InvalidEngineConfig { reason: String }`
+  variant を追加（`search_engine.rs` からのみ生成される）
+- `crates/engine/src/search_engine.rs` のテストを
+  `build_compat_wrapper_returns_fail_closed_provider_on_invalid_hnsw_params_without_panicking`
+  へ改称し、`search()` が `KernelError::InvalidEngineConfig` を返す（＝
+  `ParallelBruteForce` へフォールバックしない）ことを固定した
+
+3 巡目の変更履歴（直前の節）は判断の推移の記録として残し、削除・書き換えは
 行わない。
 
 ### `open_with_engine` の検証順序訂正と `effective_ef` 記述の再訂正（codex-review P2 指摘・PR #433 4 巡目）
