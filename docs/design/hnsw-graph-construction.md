@@ -212,17 +212,23 @@ id 昇順」を踏襲する。ソートは安定ソート（`sort_by`）のみ�
 `docs/design/dot-kernel-multi-accumulator.md` 等と同じ交互実行方式で
 再測定することを推奨する。
 
-## #405〜#408 への申し送り
+## #405 の実装状況・#406〜#408 への申し送り
 
+- 探索 API（`ef_search` を使った top-k 探索）は #405 で実装済み。詳細は
+  `docs/design/hnsw-search.md` 参照（`HnswIndex::search`・`HnswSearchScratch`・
+  ビットマップ方式 visited 集合・実測 Recall 表）
 - ベクトルは借用のみで複製しない契約（上記「ベクトルの所有方針」節）を
-  探索 API（#405）・世代整合キャッシュ（#408）でも維持すること
-- `search_layer`（Algorithm 2 相当）は `pub(crate)` で実装済みのため、
-  #405 は `ef_search` を渡してそのまま再利用できる。visited 集合は既に
-  `VisitedScratch`（`epoch: Vec<u64>` の世代カウンタ方式。`build` が全挿入を
-  またいで 1 つのインスタンスを使い回す）で呼び出しごとの新規確保を避けて
-  いるため、#405（クエリ多発経路）でも同様に `VisitedScratch` を呼び出し元
-  （検索器）が所有し呼び出し間で再利用すること
+  世代整合キャッシュ（#408）でも維持すること
+- `search_layer`（Algorithm 2 相当）は `pub(crate)` のまま、visited 集合の
+  実装を `VisitedSet` trait でジェネリック化し、構築経路（`VisitedScratch`。
+  世代カウンタ方式）・探索経路（`VisitedBitmap`。1 ノード 1 bit）の双方から
+  共有する構成へ変更した（#405）
 - `insert_node` は探索段（不変参照）と結線段（可変）を関数分離してある。
   #406（並列構築）が要素単位ロックへ差し替える際にこの境界を流用できる
 - 近傍選択ヒューリスティックの既定（`extend_candidates=false`）は #405 の
-  Recall 実測に基づいて見直す余地がある（上記「近傍選択ヒューリスティック」節）
+  クラスタ構造ありフィクスチャでの実測（10k×dim128・ef=64/256 で
+  Recall@10 = 1.0000）では見直しを要さなかった。同じ規模での一様乱数のみの
+  コーパス（informational 参考値）では ef=64 で 0.6410 まで低下しており、
+  埋め込み分布がクラスタ構造から離れる場合の見直し余地は引き続き残る
+  （詳細は `docs/design/hnsw-search.md`「実測 Recall」節・上記「近傍選択
+  ヒューリスティック」節）

@@ -366,6 +366,18 @@ else
 endif
 
 # --------------------------------------------------
+# HNSW 探索（ef ビーム探索・top-k）の brute-force 対照 Recall 受け入れ条件（TASK-132・Issue #405。crates/engine/tests/hnsw_search.rs）
+# --------------------------------------------------
+
+.PHONY: hnsw-search-recall
+hnsw-search-recall: ## TASK-132（Issue #405。HNSW 探索の受け入れ条件 (a): 10k×dim128 の決定的フィクスチャで Recall@10（ef=64/256）が brute-force 対照で閾値以上であることを実測する）を実行する（debug では構築に約 110s かかるため #[ignore]・release 実行専用。ci には含めない。実測値は標準出力へ出す）
+ifdef HAS_CARGO
+	cargo test --release -p engine --test hnsw_search -- --ignored --nocapture
+else
+	@echo "skip: Cargo.toml 未追加のため hnsw-search-recall をスキップ"
+endif
+
+# --------------------------------------------------
 # 疎索引キャッシュ cold/hot 等価性の大規模段（Issue #358。crates/engine/tests/sparse_cache_recall.rs）
 # --------------------------------------------------
 
