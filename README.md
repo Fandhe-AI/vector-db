@@ -23,6 +23,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **検索結果順序**: スコア順 Top-k・RRF 融合結果はいずれもスコア降順・同点は id 昇順で決定的（判断根拠は [`docs/design/rrf-tie-break-determinism.md`](docs/design/rrf-tie-break-determinism.md)）。ただし複数テナントを 1 バッチで扱うバッチ検索経路（`batch_search.rs`）では、同点タイブレークは常駐行列の行スロット昇順であり、行を `(tenant_id, id)` キー順（`Storage` の行キー順）で常駐行列へ渡すという事前条件のもとで `(tenant_id, id)` 昇順になる（単一テナント内では従来どおり id 昇順。CPU 経路・GPU 経路とも同一）
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
 - **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ
+- **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（コーパス文書数に線形走査しない。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -186,6 +187,26 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 のため `.github/workflows/*` へは配線せず、手動実行専用です。`GITHUB_ACTIONS` が
 設定された実行環境では起動直後に fail-closed で拒否します。実測結果・設計は
 `docs/design/hybrid-refetch-latency.md` を参照してください。
+
+### hybrid_rrf 段別内訳プロファイルと転置索引化の前後比較（Issue #356・#387・#394）
+
+`make bench-hybrid-profile`（`crates/engine/benches/hybrid_profile_bench.rs`・
+`--features bench-internals`）は、hybrid 検索（`sql/exec.rs` の
+`Ranking::Hybrid` 分岐）を SQL 実行・`SparseIndex::build`・
+`hybrid_search_boosted`（cached index）・疎側再取得ループ・`search_within` の
+段別に分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供専用の
+ベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
+`GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
+
+`cargo run --release -p engine --example feature_bench` は SQL 表層・ベクトル
+検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を
+横断的に計測し JSON を stdout へ出力します（依存追加なし・std のみ）。
+
+hybrid 疎索引の転置索引化（Issue #386 Phase 1・#388〜#392）の設計判断・
+データ構造・維持契約・外部実装参照（tantivy・qdrant）、および上記 2 つの
+計測ツールによる Phase 1 導入前後の通し比較は
+[`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)
+を参照してください。
 
 ### ingest 段別内訳プロファイル（Issue #396）
 

@@ -977,3 +977,12 @@ spec 側が SSOT。本節も spec 由来の pass/fail 閾値を持たない情�
 - posting の CSR 化・圧縮は引き続き #394 の判断材料
 - 専有環境での再実測・層 B `recall.yml` の実測は引き続きオーナー／管理者
   作業
+
+## Issue #394: Phase 1 通し前後比較へのポインタ
+
+本ドキュメントの各節（#387〜#392）はサブ Issue 単位の隣接差分実測である。
+Phase 1 全体（`8bfaaa4`〔#388 直前〕→ 導入後）を通した設計判断の集約・
+`feature_bench` 13 フェーズの前後比較・`bench-hybrid-profile` 段別の通し
+前後比較・外部実装（tantivy・qdrant）参照の整理は
+`docs/design/sparse-inverted-index.md`（Issue #394）に記録した。数値の
+二重管理を避けるため、本ドキュメントへの転記はしない。

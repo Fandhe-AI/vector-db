@@ -139,6 +139,7 @@ RECALL_VERBOSE=1 QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT=0.001 \
   RLS/決定性検証: 対象外（`tests/sparse_cache.rs::where_filtered_hybrid_query_does_not_use_sparse_cache`
   が非経由であることのみ既存で固定済み）
 - `feature_bench`・`bench-hybrid-profile` 等の性能前後比較: Issue #394 の範囲
+  （記録先: `docs/design/sparse-inverted-index.md`）
 - 3 クライアント wire e2e: 対象外
 
 ## 参照
