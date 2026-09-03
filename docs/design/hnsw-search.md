@@ -58,12 +58,22 @@ impl HnswIndex {
    NaN を最大値扱いするため、事前に拒否しないと不正なクエリ 1 件が top-k を
    恒久的に占有し得る）
 3. `vectors.len() != len() * dim` → `HnswError::VectorsLenMismatch { expected, found }`
-   （呼び出し元がビルド後にベクトル集合を差し替えてしまう事故の検出。
+   （呼び出し元がビルド後にベクトル集合を差し替えてしまう事故の一次検出。
    `hnsw-graph-construction.md`「ベクトルの所有方針」節と同じ契約）
-4. `ef == 0 || ef > MAX_EF || k > MAX_EF` → `HnswError::InvalidParams`
+4. `vectors` のサンプリング・フィンガープリントが `build` 時の値と不一致
+   → `HnswError::VectorsContentMismatch`（codex-review PR #430 P1 指摘への
+   対応で追加。長さは同じでも内容を書き換えた・行順を入れ替えたバッファは
+   3 の長さ照合をすり抜けるため、`hnsw.rs::compute_vectors_fingerprint` で
+   決定的に選んだ一部ノードの内容を `build` 時・`search` 時それぞれで
+   混合し照合する。全ノードを走査する完全照合は探索コストを O(N×dim) へ
+   膨らませ ANN の準線形性を打ち消すため採らず、事故検出の確率を長さ照合
+   のみの場合より引き上げる多層防御と位置づける——悪意ある入力からの
+   防御ではなく、呼び出し元の実装ミスの検出が目的。生成・安定 ID による
+   確実な検出は #408 の世代整合キャッシュの担当）
+5. `ef == 0 || ef > MAX_EF || k > MAX_EF` → `HnswError::InvalidParams`
    （`MAX_EF` を上限に流用し、untrusted な呼び出し元が無制限の候補集合を
    要求できないようにする）
-5. `k == 0` または空索引 → `Ok(Vec::new())`
+6. `k == 0` または空索引 → `Ok(Vec::new())`
 
 ## visited 集合の 2 実装
 
@@ -158,3 +168,7 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
   `PolicyContext::is_visible` 単一照合パスは #409／#410 が維持する）
 - 決定性の保証範囲（上記節）は spec 側未確定のため、#409 以降で規範化する
   場合はこの記録を出発点にすること
+- `HnswError::VectorsContentMismatch`（サンプリング・フィンガープリント
+  照合。codex-review PR #430 P1 指摘対応）は長さ照合だけでは検出できない
+  同サイズの差し替え・並べ替え事故への多層防御であり、生成・安定 ID による
+  確実な検出（#408 の世代整合キャッシュが担う想定）を代替するものではない

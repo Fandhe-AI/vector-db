@@ -17,7 +17,18 @@
 //! みを渡す契約とする。768 次元 × 100 万行では複製だけで 3 GB 級になるため、
 //! この方針はメモリ効率上の要請である。両 API とも `len() * dim() ==
 //! vectors.len()` を毎回検証する（fail-closed。呼び出し元がビルド後にベクトル
-//! 集合を差し替えてしまう事故を検出する唯一の手段が長さ照合であるため）。
+//! 集合を差し替えてしまう事故の一次検出）。長さが同じでも内容が異なる
+//! （行順を入れ替えた、または要素を書き換えた）バッファは長さ照合だけでは
+//! すり抜けるため、[`HnswIndex::search`] はさらに [`compute_vectors_fingerprint`]
+//! によるサンプリング・フィンガープリントを [`HnswIndex::build`] 時の値と
+//! 照合し、不一致なら [`HnswError::VectorsContentMismatch`] として拒否する
+//! （codex-review PR #430 P1 指摘。全要素を走査する完全な内容照合は
+//! O(N×dim) となり ANN 索引の準線形探索という利点を打ち消すため採らず、
+//! 決定的に選んだ一部ノードのみをサンプリングする——事故の検出率と探索
+//! コストの折り合いを取る設計判断であり、悪意ある入力からの防御を意図した
+//! ものではない（本モジュールは wire／SQL に露出しない内部 API。モジュール
+//! 冒頭の担当範囲節参照）。生成・安定 ID による確実な検出は #408 の世代
+//! 整合キャッシュの担当とする）。
 //!
 //! # 距離カーネル
 //!
@@ -185,6 +196,12 @@ pub enum HnswError {
     /// 差し替えてしまった事故を検出する（モジュール冒頭「ベクトルの所有方針」
     /// 節）。
     VectorsLenMismatch { expected: usize, found: usize },
+    /// [`HnswIndex::search`] へ渡された `vectors` は長さこそ一致するが、
+    /// [`compute_vectors_fingerprint`] によるサンプリング・フィンガー
+    /// プリントが [`HnswIndex::build`] 時と一致しない。呼び出し元が構築後に
+    /// バッファの内容を書き換えた、または行順を入れ替えたことを示す
+    /// （モジュール冒頭「ベクトルの所有方針」節・codex-review PR #430 P1 指摘）。
+    VectorsContentMismatch,
 }
 
 impl fmt::Display for HnswError {
@@ -218,6 +235,10 @@ impl fmt::Display for HnswError {
             HnswError::VectorsLenMismatch { expected, found } => write!(
                 f,
                 "hnsw search vectors length mismatch: expected={expected} found={found}"
+            ),
+            HnswError::VectorsContentMismatch => write!(
+                f,
+                "hnsw search vectors content fingerprint mismatch (buffer was replaced or reordered after build)"
             ),
         }
     }
@@ -319,6 +340,13 @@ pub struct HnswIndex {
     dim: u32,
     nodes: Vec<Node>,
     entry_point: Option<u32>,
+    /// [`HnswIndex::build`] に渡された `vectors` から
+    /// [`compute_vectors_fingerprint`] で算出したサンプリング・フィンガー
+    /// プリント。[`HnswIndex::search`] は同じ関数で再計算した値と照合し、
+    /// 長さは同じでも内容が異なる（差し替え・行順入替済みの）バッファを
+    /// 検出する（codex-review PR #430 P1 指摘。長さ照合のみでは同一長の
+    /// 差し替え・並べ替えを見逃す）。
+    content_fingerprint: u64,
 }
 
 /// `search_layer` が呼び出しをまたいで再利用する visited 集合（世代カウンタ
@@ -497,11 +525,13 @@ impl HnswIndex {
             }
         }
 
+        let content_fingerprint = compute_vectors_fingerprint(vectors, dim_usize);
         let mut index = HnswIndex {
             params,
             dim,
             nodes: Vec::with_capacity(n),
             entry_point: None,
+            content_fingerprint,
         };
         if n == 0 {
             return Ok(index);
@@ -1216,7 +1246,9 @@ impl HnswIndex {
     /// （[`HnswError::QueryDimMismatch`]）→ クエリの非有限値
     /// （[`HnswError::NonFiniteQuery`]。`kernel.rs::KernelError::NonFiniteQuery`
     /// と同じ理由で `total_cmp` の順序に委ねず事前拒否する）→ `vectors` の
-    /// 長さ不一致（[`HnswError::VectorsLenMismatch`]）→ `ef`／`k` の上限超過
+    /// 長さ不一致（[`HnswError::VectorsLenMismatch`]）→ `vectors` の内容
+    /// フィンガープリント不一致（[`HnswError::VectorsContentMismatch`]。
+    /// モジュール冒頭「ベクトルの所有方針」節参照）→ `ef`／`k` の上限超過
     /// （[`HnswError::InvalidParams`]。`MAX_EF` を上限に流用し、untrusted な
     /// 呼び出し元が無制限の候補集合を要求できないようにする）。`k == 0` また
     /// は空索引は空の `Ok(Vec::new())` を返す。
@@ -1248,6 +1280,9 @@ impl HnswIndex {
                 expected: expected_vectors_len,
                 found: vectors.len(),
             });
+        }
+        if compute_vectors_fingerprint(vectors, dim_usize) != self.content_fingerprint {
+            return Err(HnswError::VectorsContentMismatch);
         }
         if ef == 0 || ef > MAX_EF {
             return Err(HnswError::InvalidParams {
@@ -1316,6 +1351,69 @@ fn node_vector(vectors: &[f32], dim: usize, node: u32) -> Result<&[f32], HnswErr
         .ok_or(HnswError::CapacityOverflow)?;
     let end = start.checked_add(dim).ok_or(HnswError::CapacityOverflow)?;
     vectors.get(start..end).ok_or(HnswError::CapacityOverflow)
+}
+
+/// 探索が上限に使うサンプル数（`node_vector` を呼ぶ回数の上限）。索引が
+/// これより大きくても、フィンガープリント計算そのものは O(N×dim) へ膨らませない
+/// （モジュール冒頭「ベクトルの所有方針」節参照）。
+const FINGERPRINT_SAMPLE_LIMIT: usize = 32;
+
+/// [`HnswIndex::build`]・[`HnswIndex::search`] の双方が呼ぶ、`vectors` の
+/// row-major バッファから決定的に選んだノードだけをサンプリングして混合する
+/// 軽量フィンガープリント。`vectors.len() == n * dim`（呼び出し元が長さ照合を
+/// 済ませている）を前提とする——`dim == 0` または `vectors` が空なら
+/// サンプルなしで `0` を返す。
+///
+/// 全ノードを走査する完全な内容照合ではなく、`n` を超えない一定件数だけを
+/// [0, n) へ均等分散させてサンプリングする設計とし、探索コストを
+/// `search`（グラフを辿る準線形探索）と同じ桁数に保つ（`compute_vectors_
+/// fingerprint` 自体は高々 `FINGERPRINT_SAMPLE_LIMIT` 回の `node_vector`
+/// 呼び出しのみ）。そのため「サンプリングされなかった位置だけを差し替えた」
+/// バッファは理論上すり抜け得る——完全な保証ではなく、事故検出の確率を
+/// 長さ照合のみの場合より大きく引き上げる多層防御である（呼び出し元が
+/// バッファを差し替える「事故」の検出が目的であり、悪意ある入力からの
+/// 防御を意図したものではない。モジュール冒頭コメント参照）。非暗号な
+/// 撹拌のみを使う（`assign_level` の xorshift64* と同じ理由でセキュリティ
+/// 用途に転用しない）。
+fn compute_vectors_fingerprint(vectors: &[f32], dim: usize) -> u64 {
+    if dim == 0 || vectors.is_empty() {
+        return 0;
+    }
+    let n = vectors.len() / dim;
+    if n == 0 {
+        return 0;
+    }
+    let sample_count = n.min(FINGERPRINT_SAMPLE_LIMIT);
+    // 撹拌定数は FNV-1a のオフセット基底・素数を流用する（暗号強度は不要。
+    // 十分にビットを散らせれば足りる）。
+    let mut hash: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    for s in 0..sample_count {
+        // [0, n-1] へ均等分散させる整数演算のみのインデックス選択（浮動小数点を
+        // 使わず決定的）。sample_count == 1 なら常にノード 0 のみを見る。
+        let idx = if sample_count <= 1 {
+            0
+        } else {
+            (s * (n - 1)) / (sample_count - 1)
+        };
+        let Ok(idx_u32) = u32::try_from(idx) else {
+            continue; // n <= MAX_HNSW_NODES < u32::MAX のため到達しない防御的分岐。
+        };
+        let Ok(chunk) = node_vector(vectors, dim, idx_u32) else {
+            continue; // idx < n が保証されているため到達しない防御的分岐。
+        };
+        // ノード番号自体も撹拌へ含める。値の並べ替え（同じベクトル集合の
+        // 行入替）はサンプル位置ごとの値が変わるため、これだけでも検出できる。
+        hash ^= (idx as u64).wrapping_mul(PRIME);
+        hash = hash.rotate_left(13).wrapping_add(PRIME);
+        for v in chunk {
+            hash ^= u64::from(v.to_bits());
+            hash = hash.wrapping_mul(PRIME).rotate_left(17);
+        }
+    }
+    hash ^= (dim as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    hash ^= (n as u64).rotate_left(31);
+    hash
 }
 
 #[cfg(test)]
@@ -1449,6 +1547,10 @@ mod tests {
                 },
             ],
             entry_point: Some(0),
+            // 本テストは select_neighbors_heuristic を直接呼ぶのみで search() を
+            // 経由しないため、フィンガープリント照合の対象にならない（プレース
+            // ホルダで十分）。
+            content_fingerprint: 0,
         };
         let query = &[1.0f32, 0.0f32];
         let candidates = vec![
@@ -1586,6 +1688,10 @@ mod tests {
                 },
             ],
             entry_point: Some(0),
+            // 本テストは search_layer を直接呼ぶのみで search() を経由しない
+            // ため、フィンガープリント照合の対象にならない（プレースホルダで
+            // 十分）。
+            content_fingerprint: 0,
         };
         let query = [1.0f32];
         let mut visited = VisitedScratch::default();
@@ -1651,6 +1757,9 @@ mod tests {
                 },
             ],
             entry_point: Some(0),
+            // search() を呼ぶため、渡す vectors から build() と同じ関数で
+            // 計算した正しいフィンガープリントを設定する必要がある。
+            content_fingerprint: compute_vectors_fingerprint(&vectors, dim),
         };
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
@@ -1660,6 +1769,76 @@ mod tests {
             vec![2, 0],
             "search must beam through the tied-score node to reach node 2, then \
              fall back to node 0 (score 10.0) as the 2nd best"
+        );
+    }
+
+    /// codex-review PR #430 P1 指摘: `search` が `vectors.len() == len() * dim`
+    /// の長さ照合のみだと、同サイズのまま内容を書き換えた・行順を入れ替えた
+    /// バッファを正常入力として受理してしまい、グラフのトポロジーとスコア
+    /// 対象が食い違ったまま低 recall・誤った top-k を静かに返しかねない。
+    /// フィンガープリント照合の導入によりこの差し替え・並べ替えが
+    /// `VectorsContentMismatch` として拒否されることを固定する。
+    #[test]
+    fn search_rejects_same_size_vectors_buffer_with_swapped_rows() {
+        let dim = 8usize;
+        let rows = 50usize;
+        let vectors = gen_corpus(0xAAAA_1111, dim, rows);
+        let index =
+            HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 0xBBBB_2222).unwrap();
+
+        // 差し替え前は当然 search が成功する。
+        let query = &vectors[0..dim];
+        let mut scratch = HnswSearchScratch::default();
+        assert!(index.search(query, 5, 32, &vectors, &mut scratch).is_ok());
+
+        // ノード 0 とノード 1 の行を入れ替える（長さは不変・内容のみ変わる）。
+        // フィンガープリントはノード 0 を常にサンプリングするため、この
+        // 入替は必ず検出される（`compute_vectors_fingerprint` のドキュメント
+        // コメント参照）。
+        let mut swapped = vectors.clone();
+        let (front, back) = swapped.split_at_mut(dim);
+        front[..dim].swap_with_slice(&mut back[..dim]);
+        assert_eq!(
+            swapped.len(),
+            vectors.len(),
+            "swap must not change the buffer length"
+        );
+
+        let err = index
+            .search(query, 5, 32, &swapped, &mut scratch)
+            .expect_err("row-swapped buffer of identical length must be rejected");
+        assert!(
+            matches!(err, HnswError::VectorsContentMismatch),
+            "expected VectorsContentMismatch, got {err:?}"
+        );
+    }
+
+    /// 上記に加え、行順は保ったまま 1 要素だけ書き換えた場合も同様に検出
+    /// されることを固定する（差し替え検出がノード単位の丸ごと置換に限らない
+    /// ことの確認）。
+    #[test]
+    fn search_rejects_same_size_vectors_buffer_with_mutated_element() {
+        let dim = 8usize;
+        let rows = 50usize;
+        let vectors = gen_corpus(0xCCCC_3333, dim, rows);
+        let index =
+            HnswIndex::build(HnswParams::default(), dim as u32, &vectors, 0xDDDD_4444).unwrap();
+
+        let query = &vectors[0..dim];
+        let mut scratch = HnswSearchScratch::default();
+        assert!(index.search(query, 5, 32, &vectors, &mut scratch).is_ok());
+
+        let mut mutated = vectors.clone();
+        // ノード 0（フィンガープリントが必ずサンプリングする位置）の
+        // 先頭要素だけを書き換える。
+        mutated[0] += 1.0;
+
+        let err = index
+            .search(query, 5, 32, &mutated, &mut scratch)
+            .expect_err("content-mutated buffer of identical length must be rejected");
+        assert!(
+            matches!(err, HnswError::VectorsContentMismatch),
+            "expected VectorsContentMismatch, got {err:?}"
         );
     }
 }
