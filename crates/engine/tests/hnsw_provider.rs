@@ -115,11 +115,10 @@ fn hnsw_provider_matches_cpu_scalar_reference_via_public_api() {
 // （#408 が使う契約関数。`effective_ef` の境界: k<ef／k>ef／k>MAX_EF）。
 #[test]
 fn hnsw_provider_params_and_effective_ef_public_contract() {
-    let params = HnswParams {
-        m: 12,
-        ef_construction: 80,
-        ef_search: 20,
-    };
+    let params = HnswParams::default()
+        .with_m(12)
+        .with_ef_construction(80)
+        .with_ef_search(20);
     let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
     assert_eq!(provider.params(), params);
 
@@ -137,9 +136,6 @@ fn hnsw_provider_params_and_effective_ef_public_contract() {
 // 以外を受け取れないため、この不変条件は型で保証される）。
 #[test]
 fn validated_hnsw_params_new_rejects_invalid_params_via_public_api() {
-    let invalid = HnswParams {
-        m: 1, // HnswParams::validate は m < 2 を拒否する
-        ..HnswParams::default()
-    };
+    let invalid = HnswParams::default().with_m(1); // HnswParams::validate は m < 2 を拒否する
     assert!(ValidatedHnswParams::new(invalid).is_err());
 }

@@ -2728,7 +2728,34 @@ impl EngineCore {
         k: usize,
         snapshot: Arc<PrefilterSnapshot>,
     ) -> Result<Vec<SearchHit>, CoreError> {
-        match snapshot.search_with(&self.storage, ctx, self.provider.as_ref(), query, k) {
+        // Issue #409: `hnsw_state`（`SearchEngineKind::Hnsw` opt-in 構築時のみ
+        // `Some`。TASK-131・CORE-9）が張られている場合、`sql::exec` のフィルタ
+        // なし DISTANCE クエリ（`FullVisible` 形状）と同じ HNSW 世代整合キャッシュ
+        // 結線を Rust API（`VectorCore::search`）経由の検索へも適用する
+        // （`rls.rs::PrefilterSnapshot::search_with_hnsw` のドキュメント参照。
+        // テナント境界・fail-closed 契約は `search_with` と同一のまま不変）。
+        // 契約変更の経緯（旧: Rust API は常にキャッシュを迂回していた）は
+        // `tests/hnsw_cache.rs::rust_api_search_bypasses_cache_and_matches_default_engine_via_fallback`
+        // の docstring・`docs/design/hnsw-rls-cardinality-switch.md` 参照。
+        let result = match &self.hnsw_state {
+            Some(state) => {
+                let access = crate::sql::hnsw_cache::HnswCacheAccess {
+                    storage: &self.storage,
+                    cache: &state.cache,
+                    provider: state.provider,
+                };
+                snapshot.search_with_hnsw(
+                    &self.storage,
+                    ctx,
+                    &access,
+                    self.provider.as_ref(),
+                    query,
+                    k,
+                )
+            }
+            None => snapshot.search_with(&self.storage, ctx, self.provider.as_ref(), query, k),
+        };
+        match result {
             Ok(hits) => Ok(hits),
             Err(RlsError::IndexStale) | Err(RlsError::ContextMismatch) => {
                 self.prefilter_cache.evict(table, &snapshot);

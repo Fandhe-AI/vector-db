@@ -159,28 +159,44 @@ SqlArenaCache` と同じ性質）——いずれの計算結果も同じ世代�
   構築失敗の負のキャッシュで再構築連打を防止、`k + stale > MAX_EF` は厳密探索
   （全件 brute-force）へ縮退
 - **依存**: 追加なし（自作 HNSW・`std` のみ）
+- **呼び出し元スナップショットとの世代整合**: `search_or_fallback` は
+  `read_txn` から読んだテーブル世代を信頼して索引を構築・登録するため、
+  呼び出し元が渡す `arena` がその世代のスナップショットであることを保証する
+  責務は呼び出し元にある。`rls.rs::PrefilterSnapshot::search_with_hnsw` は
+  `read_txn` のテーブル世代と `built_table_generation`（スナップショット構築
+  時に読んだテーブル世代）を照合し、不一致なら本モジュールを呼ばず
+  brute-force へ縮退する（Issue #409 codex-review P1 指摘・PR #435）
 
-## 既知の限界（申し送り）
+## 既知の限界（申し送り。Issue #409 で解消済みの項目は取り消し線）
 
-`k_idx = k + stale_nodes` が `MAX_EF`（10,000）を超えると全件 brute-force へ
+~~`k_idx = k + stale_nodes` が `MAX_EF`（10,000）を超えると全件 brute-force へ
 縮退する（fail-closed に正確な結果を返すため正しい挙動だが、`stale_nodes` が
 1 万を超える状況は `REBUILD_DELTA_RATIO`（1/10）の下では行数 10 万件規模の
 テーブルへの中程度の churn で到達しうる）。つまり大規模かつ churn の多いテーブル
-では、再構築が発火するまで ANN 経路が実質的に効かない期間が生じる。#409
-（可視カーディナリティ推定への閾値置換）での見直しに申し送る。
+では、再構築が発火するまで ANN 経路が実質的に効かない期間が生じる。~~
+Issue #409 で `k + stale_nodes` オーバーフェッチ方式を撤去し、`Overlay::visible_mask`
+（候補マスク。`crate::hnsw::NodeMask`）を `HnswIndex::search_masked` へ渡す方式へ
+置き換えた。詳細は `docs/design/hnsw-rls-cardinality-switch.md` 参照。
 
 ## スコープ外・申し送り
 
-- Rust API `VectorCore::search`（`PrefilterSnapshot`・ストレージ全体世代）への
-  索引結線
-- hybrid 密側・フィルタ付きクエリの ANN 化（#409／#410）
+- ~~Rust API `VectorCore::search`（`PrefilterSnapshot`・ストレージ全体世代）への
+  索引結線~~ Issue #409 で `rls.rs::PrefilterSnapshot::search_with_hnsw` として
+  結線済み（`FullVisible` 形状のみ。`SearchTimeFilter` は対象外のまま）
+- ~~hybrid 密側・フィルタ付きクエリの ANN 化（#409／#410）~~ SCALAR 事前フィルタ
+  付き DISTANCE（`Subset` 形状）は Issue #409 で結線済み。hybrid 密側・境界
+  再取得ループとの相互作用は引き続き #410 の担当
 - `EXPLAIN` 露出（#411）
 - Recall ゲート同一閾値検証（#412）・前後比較実測（#413）
 - `VectorArena` の `Arc<[f32]>` 化による `HnswIndex::build` 時コピー縮退
   （#404〜#406 からの申し送りを継続）
 - 索引の非同期（バックグラウンド）構築・永続化
-- `MIN_INDEXED_ROWS`／`REBUILD_DELTA_RATIO` の可視カーディナリティ推定への置換
-  （#409）
+- ~~`MIN_INDEXED_ROWS`／`REBUILD_DELTA_RATIO` の可視カーディナリティ推定への置換
+  （#409）~~ Issue #409 は「探索方式判定」（可視カーディナリティ比による
+  plain scan／マスク付き ANN 切替）のみを可視カーディナリティ推定へ置き換えた。
+  「再構築判定」（`MIN_INDEXED_ROWS`／`REBUILD_DELTA_RATIO`）は本 Issue のスコープ
+  外のまま固定値運用を継続する（`docs/design/hnsw-rls-cardinality-switch.md`
+  参照）
 
 ## 検証
 

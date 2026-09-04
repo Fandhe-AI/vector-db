@@ -139,8 +139,11 @@ impl fmt::Display for SearchEngineKind {
             SearchEngineKind::ParallelBruteForce => write!(f, "parallel_brute_force"),
             SearchEngineKind::Hnsw(params) => write!(
                 f,
-                "hnsw(m={},ef_construction={},ef_search={})",
-                params.m, params.ef_construction, params.ef_search
+                "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={})",
+                params.m,
+                params.ef_construction,
+                params.ef_search,
+                params.full_scan_ratio()
             ),
         }
     }
@@ -280,7 +283,7 @@ mod tests {
         );
         assert_eq!(
             kind.to_string(),
-            "hnsw(m=32,ef_construction=200,ef_search=128)"
+            "hnsw(m=32,ef_construction=200,ef_search=128,full_scan_ratio=1/10)"
         );
         assert_eq!(
             SearchEngineKind::ParallelBruteForce.to_string(),
