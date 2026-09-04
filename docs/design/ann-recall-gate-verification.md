@@ -213,5 +213,4 @@ resend_does_not_touch_other_tenants_same_path_rows` と同方針）を固定し�
 - `full_scan_ratio`／`MAX_EF`／`ef_search` 既定値の再調整と前後比較（#413）
 - `tests/rls_generalized.rs`／`tests/plan_rls_boost.rs` への HNSW variant
   追加（#409 申し送り）
-- `recall.yml` の `recall_engine=hnsw` 入力での実 `workflow_dispatch` 疎通
-  確認（マージ後の管理者作業）
+- `recall.yml` の `hnsw` matrix job（`strategy.matrix.recall_engine: [brute_force, hnsw]`。PR #438 で `workflow_dispatch.inputs.recall_engine` から変更）の実 `workflow_dispatch`／`schedule` 疎通確認（マージ後の管理者作業）

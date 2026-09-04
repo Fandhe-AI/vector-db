@@ -97,10 +97,11 @@ repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml
 受け入れ条件 3。`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine`）
 も同様に非機密の opt-in フラグ（値は `brute_force`／`hnsw` の 2 択で数値基準を
 含まない）であり、`BENCH_CORE6`／`BENCH_CORE16` と同じ扱いで secrets 化しない。
-`recall.yml` は `workflow_dispatch.inputs.recall_engine`（`type: choice`。既定
-`brute_force`）を 3 gate step の `env:` へそのまま渡す。`schedule` 実行では
-`inputs` が存在しないため空文字列に解決され、`RecallEngine::from_env` の契約
-（未設定・空文字列は `BruteForce`）により既定経路のまま評価される。
+`recall.yml` は `strategy.matrix.recall_engine`（`[brute_force, hnsw]`）で
+job を 2 系列に固定し、各 job が `matrix.recall_engine` を 3 gate step の
+`env:` へそのまま渡す。`workflow_dispatch`・`schedule` いずれのトリガでも
+両エンジンの job が毎回実行される（旧来の `workflow_dispatch.inputs.recall_engine`
+は撤去済み。Issue #412 PR #438）。
 
 ### Environment `recall-gate` secrets（`.github/workflows/recall.yml`）
 
