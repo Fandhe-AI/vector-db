@@ -250,8 +250,9 @@ Issue 起票時の作業内容に「訪問済みビットマップの引き継�
 - ~~`EXPLAIN` へのエンジン種別・ラウンド数・縮退有無の露出（#411）~~ エンジン種別・
   静的な ANN 適用判定のみ実装済み（ラウンド数・実行時縮退結果は引き続き非露出。
   `docs/design/explain-search-engine-exposure.md` 参照）
-- Recall 3 ゲートの ANN 同一閾値検証（#412）・前後比較と `full_scan_ratio`
-  ／`MAX_EF` 既定値の再調整（#413）
+- ~~Recall 3 ゲートの ANN 同一閾値検証（#412）~~ 実装済み。
+  `docs/design/ann-recall-gate-verification.md` 参照。前後比較と
+  `full_scan_ratio`／`MAX_EF` 既定値の再調整（#413）は継続
 - `precision` モード hybrid の ANN 化（確信度ゲート契約の再設計が前提）
 - `SearchTimeFilter` 経路・Rust API `hybrid` 相当 API の結線
 - Phase B（再開型スキャン）の再検討（実測に基づく必要性の確認後）

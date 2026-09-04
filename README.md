@@ -333,6 +333,20 @@ gh secret set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 
 挙動（opt-in・strict モード・`pull_request` 非対応の理由）は上記「Recall 回帰ハーネスの repo secrets」と同一です。ローカルの `make query-planning-regression`（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS` を注入しない）で未設定のまま実行すると「ゲート未設定＝明示的に対象外」を出力して成功終了し、`recall.yml` からの実行（`QUERY_PLANNING_RECALL_REQUIRE_THRESHOLDS=1` を常時注入）では未設定も fail-closed でテスト失敗とします。出力は対象名と pass/fail のみで、実測値は上記と同じ `RECALL_VERBOSE=1` opt-in でのみ確認できます。
 
+### ANN opt-in 時の Recall ゲート実測（Issue #412）
+
+3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱いで、`.github/workflows/recall.yml` の `workflow_dispatch` 入力からもそのまま渡す）で測定対象の検索エンジンを選べます。既定（未設定・空文字列・`brute_force`）は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。
+
+```bash
+RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make recall-regression
+RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make rerank-regression
+RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make query-planning-regression
+# CI から手動実行する場合
+gh workflow run recall.yml --ref main -f recall_engine=hnsw
+```
+
+各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください。
+
 ### `precision` 評価ハーネス（TASK-163）
 
 `crates/engine/tests/precision_eval.rs` は `precision` モード（TASK-162）の

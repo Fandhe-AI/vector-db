@@ -317,7 +317,8 @@ current_generation` による事前・事後の失効照合とは独立した読
   結線した（`sql::hnsw_hybrid::HnswDenseProvider`）。詳細は
   `docs/design/hnsw-hybrid-iterative-scan.md` 参照
 - ~~`EXPLAIN` へのエンジン種別・縮退有無の露出: #411~~ 実装済み（縮退有無は静的判定のみ・実行時縮退は非露出）。`docs/design/explain-search-engine-exposure.md` 参照
-- Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412
+- ~~Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412~~
+  実装済み。`docs/design/ann-recall-gate-verification.md` 参照
 - `full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413
 - `SearchTimeFilter` 経路の ANN 化（設計上対象外）
 - `Subset` 形状で base 未構築時の非同期／バックグラウンド構築（現状は plain

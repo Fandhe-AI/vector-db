@@ -86,6 +86,21 @@ use engine::query_planner::{render_full_prompt, LlmClient, PlanError, QueryExpan
 use engine::sparse::SparseIndex;
 use std::collections::{BTreeMap, BTreeSet};
 
+// `recall_engine` fixture（下記）が `super::temp_db` を参照するため、取り込み側
+// である本ファイルでクレートルートに 1 回だけ宣言する（`rerank_recall.rs` と
+// 同じ理由・同じ取り込み方式。`recall_engine.rs` 自身が `mod temp_db` を宣言
+// すると同一物理ファイルの二重 `mod` になり `clippy::duplicate_mod` に抵触する
+// ため、宣言はここへ一本化する）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+
+// ANN opt-in（Issue #412）検索エンジン切替 fixture。既定（`RecallEngine::
+// BruteForce`）では本モジュールの型を一切構築せず、以下の層 A・既存層 B の
+// 実測値・固定値アサーションに影響を与えない。
+#[path = "fixtures/recall_engine.rs"]
+mod recall_engine;
+use recall_engine::{AnnStats, RecallEngine, SqlHybridFixture};
+
 // ---------- 決定的擬似乱数（xorshift64*。外部クレート不使用。hybrid_recall.rs と同一実装） ----------
 
 /// コーパス生成専用の決定的擬似乱数生成器（`hybrid_recall.rs::Xorshift64` と同一実装。
@@ -624,6 +639,79 @@ fn measure_category_recall(
     measure_category_recall_with_client(docs, pairs, vocab_size, baseline_query_fn, &MockLlmClient)
 }
 
+/// `MIN_INDEXED_ROWS`（`sql::hnsw_cache.rs` の非公開定数）の値。`hybrid_recall.rs::
+/// MIN_INDEXED_ROWS` と同じ値の複製（Issue #412）。
+const MIN_INDEXED_ROWS: usize = 1_024;
+
+/// ANN opt-in（[`RecallEngine::Hnsw`]）版の [`measure_category_recall_with_client`]
+/// （Issue #412）。baseline・after のいずれも [`SqlHybridFixture`]（SQL 表層
+/// `EngineCore::execute_sql` 経由）で Top-20 を取得する点のみが異なり、
+/// カテゴリ集計ロジックは同一。
+fn measure_category_recall_via_hnsw(
+    docs: &[Doc],
+    pairs: &[PairQa],
+    vocab_size: usize,
+    baseline_query_fn: impl Fn(usize, &PairQa) -> (String, Vec<f32>),
+    client: &dyn LlmClient,
+) -> (CategoryRecallResult, AnnStats) {
+    let rows: Vec<(u64, Vec<f32>, String)> = docs
+        .iter()
+        .map(|d| (d.id, d.vector.clone(), d.text.clone()))
+        .collect();
+    let fixture = SqlHybridFixture::new(vocab_size as u32, &rows, RecallEngine::Hnsw);
+
+    let mut total_correct = 0usize;
+    let mut baseline_hits20 = 0usize;
+    let mut after_hits20 = 0usize;
+    let mut ceil20 = 0usize;
+
+    for pair in pairs {
+        total_correct += pair.correct.len();
+        ceil20 += pair.correct.len().min(20);
+
+        let (baseline_text, baseline_vector) = baseline_query_fn(vocab_size, pair);
+        let baseline_hits = fixture.hybrid_top(&baseline_vector, &baseline_text, 20);
+        baseline_hits20 += baseline_hits
+            .iter()
+            .filter(|(id, _)| pair.correct.contains(id))
+            .count();
+
+        let (after_text, after_vector) =
+            expand_and_reconstruct_with(client, vocab_size, &baseline_text);
+        let after_hits = fixture.hybrid_top(&after_vector, &after_text, 20);
+        after_hits20 += after_hits
+            .iter()
+            .filter(|(id, _)| pair.correct.contains(id))
+            .count();
+    }
+
+    fixture.assert_ann_non_vacuous(docs.len() >= MIN_INDEXED_ROWS);
+    let stats = fixture.stats();
+    (
+        CategoryRecallResult {
+            total_correct,
+            baseline_hits20,
+            after_hits20,
+            ceil20,
+        },
+        stats,
+    )
+}
+
+/// 非 vacuous 統計を数値を含まない形式でログへ出す（`hybrid_recall.rs::
+/// print_ann_stats` と同型の複製）。
+fn print_ann_stats(gate: &str, stats: &AnnStats) {
+    println!(
+        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        stats.builds,
+        stats.build_failures,
+        stats.rebuilds,
+        stats.hybrid_dense_searches,
+        stats.hybrid_queries,
+        stats.ef_cap_fallbacks,
+    );
+}
+
 // ---------- 層 A: 相対関係による回帰トラッキング（PR CI 常時実行） ----------
 
 const NUM_DOCS: usize = 4_000;
@@ -1100,8 +1188,46 @@ fn query_planning_recall_threshold_gate() {
     }
 
     let (docs, pairs) = generate_corpus(SEED, NUM_DOCS, NUM_PAIRS, VOCAB_SIZE);
-    let direct = measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline);
-    let intent = measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline);
+    // ANN opt-in（Issue #412・R1）。`NUM_DOCS`（4,000）は `MIN_INDEXED_ROWS`
+    // （1,024）を上回るため `RecallEngine::Hnsw` は実際に索引を構築する
+    // （`measure_category_recall_via_hnsw` の非 vacuous 検証で `builds >= 1` を
+    // 固定）。
+    let engine = RecallEngine::from_env();
+    println!(
+        "query_planning_recall_threshold_gate: engine={}",
+        engine.token()
+    );
+    let (direct, intent) = match engine {
+        RecallEngine::BruteForce => (
+            measure_category_recall(&docs, &pairs, VOCAB_SIZE, direct_baseline),
+            measure_category_recall(&docs, &pairs, VOCAB_SIZE, intent_baseline),
+        ),
+        RecallEngine::Hnsw => {
+            let (direct, direct_stats) = measure_category_recall_via_hnsw(
+                &docs,
+                &pairs,
+                VOCAB_SIZE,
+                direct_baseline,
+                &MockLlmClient,
+            );
+            print_ann_stats(
+                "query_planning_recall_threshold_gate(direct)",
+                &direct_stats,
+            );
+            let (intent, intent_stats) = measure_category_recall_via_hnsw(
+                &docs,
+                &pairs,
+                VOCAB_SIZE,
+                intent_baseline,
+                &MockLlmClient,
+            );
+            print_ann_stats(
+                "query_planning_recall_threshold_gate(intent)",
+                &intent_stats,
+            );
+            (direct, intent)
+        }
+    };
     let intent_improvement = intent.after_recall20() - intent.baseline_recall20();
     let direct_after_recall20 = direct.after_recall20();
 
@@ -1151,13 +1277,29 @@ fn query_planning_recall_threshold_gate() {
             // `NoisyLlmClient` は intent の言い換え語彙の半数のみ写像するため、
             // measure_category_recall はこの副検査専用にここでのみ実行する
             // （oracle 写像の上記 2 検査と生成コストを共有しない独立経路）。
-            let intent_degraded = measure_category_recall_with_client(
-                &docs,
-                &pairs,
-                VOCAB_SIZE,
-                intent_baseline,
-                &NoisyLlmClient,
-            );
+            let intent_degraded = match engine {
+                RecallEngine::BruteForce => measure_category_recall_with_client(
+                    &docs,
+                    &pairs,
+                    VOCAB_SIZE,
+                    intent_baseline,
+                    &NoisyLlmClient,
+                ),
+                RecallEngine::Hnsw => {
+                    let (r, stats) = measure_category_recall_via_hnsw(
+                        &docs,
+                        &pairs,
+                        VOCAB_SIZE,
+                        intent_baseline,
+                        &NoisyLlmClient,
+                    );
+                    print_ann_stats(
+                        "query_planning_recall_threshold_gate(intent_degraded)",
+                        &stats,
+                    );
+                    r
+                }
+            };
             let intent_improvement_degraded =
                 intent_degraded.after_recall20() - intent_degraded.baseline_recall20();
             let pass_degraded = intent_improvement_degraded >= min;
@@ -1215,7 +1357,31 @@ fn query_planning_recall_large_scale_threshold_gate() {
         LARGE_NUM_PAIRS,
         LARGE_VOCAB_SIZE,
     );
-    let direct = measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline);
+    // ANN opt-in（Issue #412・R1）。`LARGE_NUM_DOCS`（40,000）は
+    // `MIN_INDEXED_ROWS`（1,024）を大きく上回るため `RecallEngine::Hnsw` は
+    // 実際に索引を構築する（`measure_category_recall_via_hnsw` の非 vacuous
+    // 検証で `builds >= 1` を固定）。
+    let engine = RecallEngine::from_env();
+    println!(
+        "query_planning_recall_large_scale_threshold_gate: engine={}",
+        engine.token()
+    );
+    let direct = match engine {
+        RecallEngine::BruteForce => {
+            measure_category_recall(&docs, &pairs, LARGE_VOCAB_SIZE, direct_baseline)
+        }
+        RecallEngine::Hnsw => {
+            let (r, stats) = measure_category_recall_via_hnsw(
+                &docs,
+                &pairs,
+                LARGE_VOCAB_SIZE,
+                direct_baseline,
+                &MockLlmClient,
+            );
+            print_ann_stats("query_planning_recall_large_scale_threshold_gate", &stats);
+            r
+        }
+    };
     let direct_after_recall20 = direct.after_recall20();
     let pass = direct_after_recall20 >= min;
     println!("query_planning_recall_large_scale_threshold_gate: pass={pass}");

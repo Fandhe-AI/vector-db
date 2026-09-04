@@ -70,6 +70,21 @@ use engine::rerank::{rerank_candidates, LexicalOverlapReranker, RerankCandidate,
 use engine::sparse::SparseIndex;
 use std::collections::{BTreeMap, BTreeSet};
 
+// `recall_engine` fixture（下記）が `super::temp_db` を参照するため、取り込み側
+// である本ファイルでクレートルートに 1 回だけ宣言する
+// （`tests/hnsw_cache.rs` 等と同じ取り込み方式。`recall_engine.rs` 自身が
+// `mod temp_db` を宣言すると同一物理ファイルの二重 `mod` になり
+// `clippy::duplicate_mod` に抵触するため、宣言はここへ一本化する）。
+#[path = "../src/test_util/temp_db.rs"]
+mod temp_db;
+
+// ANN opt-in（Issue #412）検索エンジン切替 fixture。既定（`RecallEngine::
+// BruteForce`）では本モジュールの型を一切構築せず、以下の層 A・既存層 B の
+// 実測値・固定値アサーションに影響を与えない。
+#[path = "fixtures/recall_engine.rs"]
+mod recall_engine;
+use recall_engine::{AnnStats, RecallEngine, SqlHybridFixture};
+
 // ---------- 決定的擬似乱数（xorshift64*。外部クレート不使用。hybrid_recall.rs と同一実装） ----------
 
 /// コーパス生成専用の決定的擬似乱数生成器（`hybrid_recall.rs::Xorshift64` と同一実装。
@@ -488,6 +503,113 @@ fn measure_rerank_recall(docs: &[Doc], qa: &[QaCase]) -> RerankRecallResult {
         ceil100,
         ceil200,
     }
+}
+
+/// `MIN_INDEXED_ROWS`（`sql::hnsw_cache.rs` の非公開定数）の値。`hybrid_recall.rs::
+/// MIN_INDEXED_ROWS` と同じ値の複製（Issue #412）。
+const MIN_INDEXED_ROWS: usize = 1_024;
+
+/// ANN opt-in（[`RecallEngine::Hnsw`]）版の [`measure_rerank_recall`]（Issue #412）。
+/// 候補プール（200 件）を [`SqlHybridFixture`]（SQL 表層 `EngineCore::execute_sql`
+/// 経由）から取得する点のみが異なり、baseline／after／補助計測の集計ロジックは
+/// 同一（`RerankCandidate::fused_score` は `sql/exec.rs` の hybrid 分岐が書き込む
+/// `ResultRow::score`＝RRF 融合スコアであり、in-memory 版の `h.score` と同じ意味）。
+fn measure_rerank_recall_via_hnsw(docs: &[Doc], qa: &[QaCase]) -> (RerankRecallResult, AnnStats) {
+    let dim = docs.first().map_or(0, |d| d.vector.len());
+    let rows: Vec<(u64, Vec<f32>, String)> = docs
+        .iter()
+        .map(|d| (d.id, d.vector.clone(), d.text.clone()))
+        .collect();
+    let fixture = SqlHybridFixture::new(dim as u32, &rows, RecallEngine::Hnsw);
+    let rerank_cfg = RerankConfig::default();
+    let reranker = LexicalOverlapReranker::default();
+    let doc_text_by_id: BTreeMap<u64, &str> =
+        docs.iter().map(|d| (d.id, d.text.as_str())).collect();
+
+    let mut total_correct = 0usize;
+    let mut baseline_hits20 = 0usize;
+    let mut after_hits20 = 0usize;
+    let mut pool_hits100 = 0usize;
+    let mut pool_hits200 = 0usize;
+    let mut pool_ceiling_hits20 = 0usize;
+    let mut ceil20 = 0usize;
+    let mut ceil100 = 0usize;
+    let mut ceil200 = 0usize;
+
+    for case in qa {
+        total_correct += case.correct.len();
+        ceil20 += case.correct.len().min(20);
+        ceil100 += case.correct.len().min(100);
+        ceil200 += case.correct.len().min(200);
+
+        // 候補プール（融合スコア降順・同点 id 昇順。`hybrid_top` の契約は
+        // `hybrid_search` と同一 `RrfConfig::default()`＝pool_depth 200 の SQL
+        // 表層分岐が返す順序と一致する）。
+        let pool = fixture.hybrid_top(&case.query_vector, &case.query_text, 200);
+
+        baseline_hits20 += pool
+            .iter()
+            .take(20)
+            .filter(|(id, _)| case.correct.contains(id))
+            .count();
+        pool_hits100 += pool
+            .iter()
+            .take(100)
+            .filter(|(id, _)| case.correct.contains(id))
+            .count();
+        let pool_hits_this_case = pool
+            .iter()
+            .filter(|(id, _)| case.correct.contains(id))
+            .count();
+        pool_hits200 += pool_hits_this_case;
+        pool_ceiling_hits20 += pool_hits_this_case.min(20);
+
+        let candidates: Vec<RerankCandidate<'_>> = pool
+            .iter()
+            .map(|(id, score)| RerankCandidate {
+                id: *id,
+                fused_score: *score,
+                text: doc_text_by_id.get(id).copied().unwrap_or(""),
+            })
+            .collect();
+        let reranked = rerank_candidates(&reranker, &case.query_text, &candidates, &rerank_cfg)
+            .expect("rerank_candidates ok");
+        after_hits20 += reranked
+            .iter()
+            .filter(|h| case.correct.contains(&h.id))
+            .count();
+    }
+
+    fixture.assert_ann_non_vacuous(docs.len() >= MIN_INDEXED_ROWS);
+    let stats = fixture.stats();
+    (
+        RerankRecallResult {
+            total_correct,
+            baseline_hits20,
+            after_hits20,
+            pool_hits100,
+            pool_hits200,
+            pool_ceiling_hits20,
+            ceil20,
+            ceil100,
+            ceil200,
+        },
+        stats,
+    )
+}
+
+/// 非 vacuous 統計を数値を含まない形式でログへ出す（`hybrid_recall.rs::
+/// print_ann_stats` と同型の複製）。
+fn print_ann_stats(gate: &str, stats: &AnnStats) {
+    println!(
+        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        stats.builds,
+        stats.build_failures,
+        stats.rebuilds,
+        stats.hybrid_dense_searches,
+        stats.hybrid_queries,
+        stats.ef_cap_fallbacks,
+    );
 }
 
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（`hybrid_recall.rs::
@@ -941,7 +1063,23 @@ fn rerank_recall_large_scale_threshold_gate() {
         LARGE_NUM_QUERIES,
         LARGE_VOCAB_SIZE,
     );
-    let r = measure_rerank_recall(&docs, &qa);
+    // ANN opt-in（Issue #412・R1）。`LARGE_NUM_DOCS`（20,000）は
+    // `MIN_INDEXED_ROWS`（1,024）を上回るため `RecallEngine::Hnsw` は実際に
+    // 索引を構築する（`measure_rerank_recall_via_hnsw` の非 vacuous 検証で
+    // `builds >= 1` を固定）。
+    let engine = RecallEngine::from_env();
+    let r = match engine {
+        RecallEngine::BruteForce => measure_rerank_recall(&docs, &qa),
+        RecallEngine::Hnsw => {
+            let (r, stats) = measure_rerank_recall_via_hnsw(&docs, &qa);
+            print_ann_stats("rerank_recall_large_scale_threshold_gate", &stats);
+            r
+        }
+    };
+    println!(
+        "rerank_recall_large_scale_threshold_gate: engine={}",
+        engine.token()
+    );
     let after_recall20 = r.after_recall20();
 
     // ブロッキング条件: (1) after_recall@20 が RERANK_RECALL_MIN_R20_LARGE 以上、

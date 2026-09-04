@@ -93,8 +93,26 @@ name: Recall
 # resolve_gate_threshold` 参照。ローカル `make recall-regression` にはこのフラグを
 # 注入しないため、そちらは従来どおり未設定を opt-in で「対象外」として成功終了する。
 # PR #147 codex-review P1 継続指摘対応）。
+# `recall_engine`（Issue #412。ADR `docs/design/ann-index-adoption.md` B 案
+# 〔Issue #403 Accepted〕の受け入れ条件 3）: 3 ゲートが測定する検索エンジンを
+# 選ぶ非機密の opt-in フラグ（`BENCH_CORE6`/`BENCH_CORE16` と同じ扱い。
+# `docs/design/ci-gate-variables.md` 参照）。既定 `brute_force` は既存の
+# in-memory 測定経路をそのまま通し、実測値・閾値判定に一切影響しない。`hnsw`
+# は SQL 表層 `EngineCore::from_storage_with_engine` 経由の ANN opt-in 経路
+# （`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine`）で同一閾値を
+# 判定する。`schedule` トリガでは `inputs` が存在しないため式が空文字列に解決され、
+# 各ゲートは未設定を「既定 brute_force」として扱う
+# （`RecallEngine::from_env` の契約）。
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      recall_engine:
+        description: "検索エンジン（既定 brute_force。hnsw で ANN opt-in 経路を測定）"
+        type: choice
+        options:
+          - brute_force
+          - hnsw
+        default: brute_force
   schedule:
     - cron: "0 4 * * 1"
 
@@ -178,6 +196,10 @@ jobs:
           HYBRID_RECALL_MIN_R20_SMALL: ${{ secrets.HYBRID_RECALL_MIN_R20_SMALL }}
           HYBRID_RECALL_MIN_R20_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R20_LARGE }}
           HYBRID_RECALL_MIN_R100_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R100_LARGE }}
+          # 非機密 opt-in（冒頭コメント参照）。`inputs.recall_engine` を `run:` へ
+          # 直接展開せず `env:` 経由で渡す（式インジェクション回避の定石。末尾の
+          # `Evaluate recall gates` step と同方針）。
+          RECALL_ENGINE: ${{ inputs.recall_engine }}
         run: make recall-regression
       - name: Run rerank-regression
         id: rerank
@@ -217,6 +239,8 @@ jobs:
         env:
           RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
           RERANK_RECALL_MIN_R20_LARGE: ${{ secrets.RERANK_RECALL_MIN_R20_LARGE }}
+          # 非機密 opt-in（冒頭コメント参照）。
+          RECALL_ENGINE: ${{ inputs.recall_engine }}
         run: make rerank-regression
       - name: Run query-planning-regression
         id: query_planning
@@ -265,6 +289,8 @@ jobs:
             secrets.QUERY_PLANNING_RECALL_MIN_INTENT_IMPROVEMENT_DEGRADED }}
           QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE: ${{
             secrets.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
+          # 非機密 opt-in（冒頭コメント参照）。
+          RECALL_ENGINE: ${{ inputs.recall_engine }}
         run: make query-planning-regression
       - name: Evaluate recall gates
         # 3 つの gate step（hybrid / rerank / query_planning）は `continue-on-error: true`
