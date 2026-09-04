@@ -277,11 +277,15 @@ impl PrefilterSnapshot {
         // テーブル単位世代も同じ順序（アリーナ構築前）で読む。`search_with_hnsw` が
         // `search_or_fallback` へ渡す `read_txn` の世代と、この `arena` を束縛した
         // 世代とを一致させるための基準値（[`Self::built_table_generation`] ドキュメント
-        // 参照）。読み取り失敗は `ArenaError::Catalog` 経由で `RlsError::Arena` へ丸める
+        // 参照）。テーブル不存在は `build_filtered` と同じく [`RlsError::NotFound`] へ
+        // 丸め込む（存在情報を漏らさない fail-closed 契約を世代読み取り経路でも維持）。
+        // それ以外の読み取り失敗は `ArenaError::Catalog` 経由で `RlsError::Arena` へ丸める
         // （既存の `From<ArenaError> for RlsError` を再利用し、専用 variant を増やさない）。
-        let built_table_generation = storage
-            .table_generation(table)
-            .map_err(ArenaError::Catalog)?;
+        let built_table_generation = match storage.table_generation(table) {
+            Ok(g) => g,
+            Err(CatalogError::TableNotFound(_)) => return Err(RlsError::NotFound),
+            Err(e) => return Err(ArenaError::Catalog(e).into()),
+        };
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
         }) {
@@ -1172,6 +1176,25 @@ mod tests {
         let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
 
         let result = PrefilterIndex::build(&storage, "no_such_table", &ctx);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("missing table must be rejected"),
+        };
+        assert!(matches!(err, RlsError::NotFound));
+        assert_eq!(err.to_string(), "not found");
+        assert!(!err.to_string().contains("no_such_table"));
+    }
+
+    // `PrefilterSnapshot::build` はアリーナ構築前にテーブル単位世代を読むが、その経路でも
+    // テーブル不存在は `RlsError::NotFound` へ丸め込まれ、`RlsError::Arena` 経由で存在情報を
+    // 漏らさない（PR #435 Bugbot 指摘対応）。
+    #[test]
+    fn snapshot_build_returns_not_found_without_leaking_table_name_for_missing_table() {
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+        let result = PrefilterSnapshot::build(&storage, "no_such_table", &ctx);
         let err = match result {
             Err(e) => e,
             Ok(_) => panic!("missing table must be rejected"),
