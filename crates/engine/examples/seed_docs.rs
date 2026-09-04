@@ -217,6 +217,30 @@ fn vec_literal(v: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// テーブルを作成する。既存の場合はカタログのスキーマが期待値と完全一致するときだけ
+/// 再利用し、不一致なら fail-closed に終了する（`insert_rows` は embedding 次元しか
+/// 検証しないため、スカラー列の型・順序の不一致をここで塞ぐ）。
+fn create_or_verify_table(storage: &Storage, schema: &TableSchema) -> bool {
+    match storage.create_table(schema) {
+        Ok(()) => false,
+        Err(CatalogError::TableAlreadyExists(_)) => {
+            let existing = storage
+                .get_table_schema(&schema.name)
+                .expect("get_table_schema");
+            if &existing != schema {
+                eprintln!(
+                    "error: table {} already exists with a different schema; \
+                     use a new <db> path or the same <dim>",
+                    schema.name
+                );
+                std::process::exit(2);
+            }
+            true
+        }
+        Err(e) => panic!("create table {}: {e}", schema.name),
+    }
+}
+
 /// 実行全体の `<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
 /// 再実行時は台帳の内容照合で「同一（再開）／不一致（停止）」を処理開始前に判定する。
 fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, dim: u32) {
@@ -227,10 +251,7 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
             ColumnDef::new("params", ColumnType::Text, false),
         ],
     );
-    match storage.create_table(&schema) {
-        Ok(()) | Err(CatalogError::TableAlreadyExists(_)) => {}
-        Err(e) => panic!("create table seed_meta: {e}"),
-    }
+    create_or_verify_table(storage, &schema);
     let params = format!("rows={rows};dim={dim}");
     let meta = encode_scalar_columns(
         &schema,
@@ -309,20 +330,8 @@ fn main() {
                     ColumnDef::new("body", ColumnType::Text, false),
                 ],
             );
-            match storage.create_table(&schema) {
-                Ok(()) => {}
-                Err(CatalogError::TableAlreadyExists(_)) => {
-                    let existing = storage.get_table_schema("docs").expect("get_table_schema");
-                    if existing != schema {
-                        eprintln!(
-                            "error: table docs already exists with a different schema; \
-                             use a new <db> path or the same <dim>"
-                        );
-                        std::process::exit(2);
-                    }
-                    eprintln!("resuming: table docs exists; batches already recorded are skipped");
-                }
-                Err(e) => panic!("create table: {e}"),
+            if create_or_verify_table(&storage, &schema) {
+                eprintln!("resuming: table docs exists; batches already recorded are skipped");
             }
             let ctx_a = PolicyContext::new("tenant-a").expect("ctx");
             record_or_verify_run_meta(&storage, &ctx_a, rows, dim);
