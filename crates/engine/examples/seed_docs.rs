@@ -234,8 +234,9 @@ fn main() {
             let rows: u64 = rows.parse().expect("rows");
             let dim: u32 = dim.parse().expect("dim");
             // バッチ単位でテナントを固定し 10 バッチごとに 1 バッチを tenant-b へ割り当てる。
-            // 少量投入でも必ず両テナントが作られるよう、バッチ幅は「行数の 1/10（切り上げ）」
-            // を上限 1,000 で丸めた値とし、10 バッチ未満にしかならない行数（rows < 10）は拒否する。
+            // 少量投入でも必ず両テナントが作られるよう、バッチ幅は「行数の 1/10（切り捨て）」
+            // を上限 1,000 で丸めた値とする（`rows >= 10` なら総バッチ数は必ず 10 以上になり、
+            // 10 バッチ目〔`batch_no == 9`〕が存在する）。`rows < 10` は拒否する。
             if rows < 10 {
                 eprintln!("error: rows must be >= 10 so that both tenants receive documents");
                 std::process::exit(2);
@@ -255,10 +256,11 @@ fn main() {
             let ctx_a = PolicyContext::new("tenant-a").expect("ctx");
             let ctx_b = PolicyContext::new("tenant-b").expect("ctx");
             let mut rng = Lcg(20260831);
-            let batch = rows.div_ceil(10).clamp(1, 1000);
+            let batch = (rows / 10).clamp(1, 1000);
             let start = Instant::now();
             let mut id = 1u64;
             let mut batch_no = 0u64;
+            let (mut rows_a, mut rows_b) = (0u64, 0u64);
             while id <= rows {
                 let end = (id + batch - 1).min(rows);
                 // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）
@@ -327,6 +329,11 @@ fn main() {
                 let op = OperationId::parse(&format!("seed-batch-{batch_no}")).expect("op");
                 engine::tenant::insert_rows(&storage, "docs", ctx, &inputs, &op)
                     .expect("insert_rows");
+                if tenant_tag == "b" {
+                    rows_b += end - id + 1;
+                } else {
+                    rows_a += end - id + 1;
+                }
                 batch_no += 1;
                 id = end + 1;
                 if batch_no.is_multiple_of(10) {
@@ -338,7 +345,7 @@ fn main() {
                 }
             }
             eprintln!(
-                "done: {rows} rows, dim {dim}, {:.1}s",
+                "done: {rows} rows (tenant-a {rows_a}, tenant-b {rows_b}), dim {dim}, {:.1}s",
                 start.elapsed().as_secs_f64()
             );
         }
