@@ -10,8 +10,12 @@
 //!   を固定する。
 //! - R4: テナント境界（`(table, ctx)` 完全一致キー）。他テナントの private 行が
 //!   結果へ混入しない・エントリが ctx ごとに独立していること。
-//! - フィルタ付き（`WHERE`）・hybrid クエリは `HnswIndexCache` を経由せず、常に
-//!   既定エンジンと完全一致すること（適用条件の遵守）。
+//! - フィルタ付き（`WHERE`）DISTANCE クエリは `HnswIndexCache` の `FullVisible`
+//!   エントリを占有せず、既定エンジンと完全一致すること（適用条件の遵守）。
+//! - hybrid クエリの密側再取得ループ（`sql::hnsw_hybrid::HnswDenseProvider`。
+//!   Issue #410）は既定エンジン対照 Recall@10 が本リポの回帰基準（0.9 目安）
+//!   以上・可視外テナント非混入・実際に索引経路が非 vacuous に使われること
+//!   （`hybrid_dense_searches > 0`）を満たすこと。
 //! - `precision` モードのフィルタなし DISTANCE クエリは `HnswIndexCache` を経由
 //!   せず（Bugbot 指摘。TASK-162・SEARCH-9）、既定エンジンの確信度ゲート判定と
 //!   完全一致すること。
@@ -22,6 +26,7 @@ use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::{EngineCore, VectorCore};
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
+use engine::row_codec::Value;
 use engine::search_engine;
 use engine::storage::{RowInput, Storage, Visibility};
 
@@ -406,10 +411,19 @@ fn r4_tenant_isolation_never_leaks_across_ctx() {
     );
 }
 
-/// フィルタ付き（`WHERE`）・hybrid クエリは `HnswIndexCache` を経由せず、常に
-/// 既定エンジンと完全一致すること（適用条件の遵守）。
+/// フィルタ付き（`WHERE`）DISTANCE クエリは `HnswIndexCache` の `FullVisible`
+/// エントリを一切占有しない（`entries == 0`。`Subset` 形状〔#409〕の別経路を
+/// 使うため。`filtered_distance_uses_subset_shape_and_matches_default_engine_recall`
+/// が `Subset` 経路自体の Recall を検証する）。hybrid クエリの契約は
+/// `hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall`
+/// （Issue #410 で新設。以前は本テストが「hybrid も含め常にキャッシュを迂回する」
+/// ことを主張していたが、実際には hybrid の SQL を一切実行しておらずその主張は
+/// 検証されていなかった。Issue #410 で hybrid 密側再取得ループを `sql::
+/// hnsw_hybrid::HnswDenseProvider` 経由で結線したことにより、そもそも
+/// 「hybrid は迂回する」という主張自体が成り立たなくなったため、本テストの
+/// docstring・関数名から hybrid への言及を除いた）。
 #[test]
-fn filtered_and_hybrid_queries_bypass_cache_and_match_default_engine() {
+fn filtered_distance_bypasses_full_visible_entries_and_matches_default_engine() {
     let dir = unique_db_path("hnsw-cache-bypass-hnsw");
     let _cleanup = CleanupGuard(dir.clone());
     let storage = Storage::open(&dir).expect("open storage");
@@ -484,6 +498,261 @@ fn filtered_and_hybrid_queries_bypass_cache_and_match_default_engine() {
     assert_eq!(
         stats.entries, 0,
         "filtered queries must never populate HnswIndexCache"
+    );
+}
+
+/// hybrid クエリ（`ORDER BY HYBRID(...)`）の密側再取得ループ（Issue #410。
+/// `sql::hnsw_hybrid::HnswDenseProvider`）が実際に非 vacuous に使われ、
+/// 既定エンジン対照 Recall@10 が本リポの回帰基準（0.9 目安）以上・可視外
+/// テナントの id が非混入であることを固定する（以前は hybrid が
+/// `HnswIndexCache` を一切経由しない設計だったが、本 Issue で密側のみ結線した。
+/// 疎索引側は Issue #357 の `SparseIndexCache` が別途担うため対象外）。
+/// クラスタ語彙をキーワードに埋め込み、密・疎の両チャネルが同じクラスタへ
+/// 一致するようクエリを組み立てる（`default_preset.rs::hybrid_corpus` と同じ
+/// 「密・疎ともに当たる文書を作る」設計方針。ANN の近似性を許容するため
+/// 完全一致ではなく Recall 基準で判定する）。
+#[test]
+fn hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall() {
+    const HYBRID_DIM: u32 = 16;
+    const CLUSTERS: usize = 6;
+    let hybrid_schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(HYBRID_DIM), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+        ],
+    );
+
+    fn seed_hybrid_rows(
+        storage: &Storage,
+        tenant: &str,
+        start_id: u64,
+        vectors: &[Vec<f32>],
+        visibility: Visibility,
+    ) {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        for (i, v) in vectors.iter().enumerate() {
+            let id = start_id + i as u64;
+            let cluster = i % CLUSTERS;
+            let body = format!("clusterword{cluster} filler text for hybrid recall fixture");
+            let op_id =
+                OperationId::parse(&format!("hnsw-hybrid-seed-{tenant}-{id}")).expect("op id");
+            engine::tenant::insert_typed_row(
+                storage,
+                "docs",
+                &ctx,
+                id,
+                visibility,
+                &[Value::Vector(v.clone()), Value::Text(body)],
+                &op_id,
+            )
+            .unwrap_or_else(|e| panic!("insert hybrid row id={id} failed: {e}"));
+        }
+    }
+
+    let vectors = gen_clustered_corpus(11, HYBRID_DIM as usize, BASE_ROWS, CLUSTERS);
+
+    let dir = unique_db_path("hnsw-cache-hybrid-hnsw");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&hybrid_schema).expect("create table");
+    seed_hybrid_rows(&storage, "tenant-a", 1, &vectors, Visibility::Public);
+    // tenant-b の private 行（不可視）。可視外混入がないことの検証対象。
+    // `Visibility::Public` はテナントをまたいで可視になる（`PolicyContext::
+    // is_visible` の契約。TABLE-9）ため、非漏えいを意味のある形で検証するには
+    // `Private` を使う必要がある（`Public` のままだと tenant-a の ctx から
+    // 正規に見えてしまい、テナント境界の検証にならない。R4
+    // `r4_tenant_isolation_never_leaks_across_ctx` と同じ方針）。
+    let other_vectors = gen_clustered_corpus(97, HYBRID_DIM as usize, 64, CLUSTERS);
+    seed_hybrid_rows(
+        &storage,
+        "tenant-b",
+        BASE_ROWS as u64 + 1,
+        &other_vectors,
+        Visibility::Private,
+    );
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-hybrid-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&hybrid_schema)
+        .expect("create ref table");
+    seed_hybrid_rows(&ref_storage, "tenant-a", 1, &vectors, Visibility::Public);
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    const K: usize = 10;
+    let mut total_hits = 0usize;
+    let mut total_want = 0usize;
+    for (cluster, query) in vectors.iter().enumerate().take(CLUSTERS) {
+        let sql = format!(
+            "SELECT id FROM docs ORDER BY HYBRID(embedding, '{}', body, 'clusterword{cluster}') LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core.execute_sql(&ctx, &sql).expect("hybrid query").rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("hybrid query (ref)")
+            .rows;
+        // RLS（対象ビヘイビア RLS-1〜4）自体が tenant-a の可視集合以外を
+        // `execute_sql` へ一切渡さないため、可視外テナントの id 範囲
+        // （`BASE_ROWS + 1 ..`。tenant-b の行）が含まれないことで非漏えいを
+        // 固定する（`ResultRow` は `tenant_id` を保持しない設計のため、
+        // R4（`r4_tenant_isolation_never_leaks_across_ctx`）と同じ id 範囲判定
+        // 方式を使う）。
+        for row in &got {
+            assert!(
+                row.id <= BASE_ROWS as u64,
+                "hybrid search must never return a row from an invisible tenant (id={})",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+        total_want += want_ids.len();
+    }
+    let recall = total_hits as f64 / total_want.max(1) as f64;
+    assert!(
+        recall >= 0.9,
+        "hybrid recall@{K} against the default-engine reference must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.hybrid_dense_searches > 0,
+        "hybrid queries must exercise HnswDenseProvider (non-vacuous)"
+    );
+    assert!(
+        stats.hybrid_queries > 0 && stats.hybrid_rounds_max > 0,
+        "hybrid per-query round accounting must be non-vacuous"
+    );
+}
+
+/// SCALAR 事前フィルタ付き hybrid（`Subset` 形状。`hnsw_hybrid_subset_eligible`。
+/// Issue #410）: `WHERE` 付き hybrid クエリが `prepare_subset` 経由の per-query
+/// 写像で候補マスク付き ANN 探索を経由し、既定エンジン対照 Recall@10 が本リポの
+/// 回帰基準（0.9 目安）以上であること・`WHERE` を満たさない行が混入しないこと・
+/// 実際に `Subset` 経路が非 vacuous に動いたこと（`subset_searches > 0` **かつ**
+/// `hybrid_dense_searches > 0`）を固定する。`hnsw_hybrid_full_visible_eligible`
+/// 版（`hybrid_queries_use_hnsw_dense_provider_and_match_default_engine_recall`）
+/// と異なり `sql/exec.rs` の `hnsw_hybrid_subset_eligible` 分岐（新設・
+/// `prepare_subset` 呼び出し）はこのテストでしか経由しないため、経路自体が
+/// 生きていることを固定する目的を持つ。
+#[test]
+fn hybrid_queries_use_subset_shape_and_match_default_engine_recall() {
+    const HYBRID_DIM: u32 = 16;
+    const CLUSTERS: usize = 6;
+    let hybrid_schema = TableSchema::new(
+        "docs",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(HYBRID_DIM), false),
+            ColumnDef::new("body", ColumnType::Text, false),
+            ColumnDef::new("tag", ColumnType::Text, false),
+        ],
+    );
+
+    fn seed_hybrid_rows_with_tag(storage: &Storage, tenant: &str, vectors: &[Vec<f32>]) {
+        let ctx = PolicyContext::new(tenant).expect("valid tenant");
+        for (i, v) in vectors.iter().enumerate() {
+            let id = i as u64 + 1;
+            let cluster = i % CLUSTERS;
+            let body = format!("clusterword{cluster} filler text for hybrid subset fixture");
+            // 選択率 50%（偶奇）の `WHERE tag = 'x'`。
+            let tag = if i % 2 == 0 { "x" } else { "y" };
+            let op_id = OperationId::parse(&format!("hnsw-hybrid-subset-seed-{tenant}-{id}"))
+                .expect("op id");
+            engine::tenant::insert_typed_row(
+                storage,
+                "docs",
+                &ctx,
+                id,
+                Visibility::Public,
+                &[
+                    Value::Vector(v.clone()),
+                    Value::Text(body),
+                    Value::Text(tag.to_string()),
+                ],
+                &op_id,
+            )
+            .unwrap_or_else(|e| panic!("insert hybrid subset row id={id} failed: {e}"));
+        }
+    }
+
+    let vectors = gen_clustered_corpus(9, HYBRID_DIM as usize, BASE_ROWS, CLUSTERS);
+
+    let dir = unique_db_path("hnsw-cache-hybrid-subset-hnsw");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&hybrid_schema).expect("create table");
+    seed_hybrid_rows_with_tag(&storage, "tenant-a", &vectors);
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-hybrid-subset-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&hybrid_schema)
+        .expect("create ref table");
+    seed_hybrid_rows_with_tag(&ref_storage, "tenant-a", &vectors);
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // フィルタなしクエリを 1 本先に投げ、`FullVisible` 経路に索引を構築させる
+    // （`Subset` 経路は `Lookup::Miss` では構築せず plain scan へ縮退する契約——
+    // `filtered_distance_uses_subset_shape_and_matches_default_engine_recall`
+    // と同じ理由。§`prepare_subset` ドキュメンテーションコメント「2.」）。
+    let _ = query_ids(&core, &ctx, &vectors[0], 10);
+
+    const K: usize = 10;
+    let mut total_hits = 0usize;
+    let mut total_want = 0usize;
+    for (cluster, query) in vectors.iter().enumerate().take(CLUSTERS) {
+        let sql = format!(
+            "SELECT id FROM docs WHERE tag = 'x' ORDER BY HYBRID(embedding, '{}', body, 'clusterword{cluster}') LIMIT {K}",
+            vec_literal(query)
+        );
+        let got = core
+            .execute_sql(&ctx, &sql)
+            .expect("hybrid subset query")
+            .rows;
+        let want = ref_core
+            .execute_sql(&ctx, &sql)
+            .expect("hybrid subset query (ref)")
+            .rows;
+        // WHERE を満たさない行（tag='y'。1-indexed の偶数 id）が混入しないこと。
+        for row in &got {
+            assert_eq!(
+                row.id % 2,
+                1,
+                "row {} does not satisfy tag='x' (1-indexed odd rows are tag='x')",
+                row.id
+            );
+        }
+        let want_ids: std::collections::HashSet<u64> = want.iter().map(|r| r.id).collect();
+        total_hits += got.iter().filter(|r| want_ids.contains(&r.id)).count();
+        total_want += want_ids.len();
+    }
+    let recall = total_hits as f64 / total_want.max(1) as f64;
+    assert!(
+        recall >= 0.9,
+        "hybrid subset recall@{K} against the default-engine reference must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.subset_searches > 0,
+        "Subset shape must be exercised for hybrid queries (non-vacuous)"
+    );
+    assert!(
+        stats.hybrid_dense_searches > 0,
+        "hybrid Subset queries must exercise HnswDenseProvider (non-vacuous)"
     );
 }
 

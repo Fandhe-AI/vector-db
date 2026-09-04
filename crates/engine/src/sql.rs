@@ -95,6 +95,7 @@ pub(crate) mod explain;
 pub(crate) mod expr_program;
 pub mod group_by;
 pub(crate) mod hnsw_cache;
+pub(crate) mod hnsw_hybrid;
 pub mod lexer;
 pub mod mode;
 pub mod parser;
