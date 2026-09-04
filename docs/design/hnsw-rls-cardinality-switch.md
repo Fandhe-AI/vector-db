@@ -60,13 +60,26 @@ P0 安全側の確定事項として維持している。本実装は **ADR と 
 
 ### 候補マスク（`crate::hnsw::NodeMask`・`HnswIndex::search_masked`）
 
-`hnsw.rs::search_layer` は受理述語 `Option<&NodeMask>` を受け取る。候補ヒープ
-（探索の拡張先を決める）は従来どおり全ノードを対象に拡張するが、結果ヒープ
-（最終的な Top-k 候補）へは `accept` が受理するノードのみを積む。`None`（既存
-呼び出し元）はビット同一の結果を返す（`hnsw::tests::search_masked_none_matches_search`
-で機械検証）。停止条件は変更していない（`results.len() >= ef && strictly_farther`
-の場合のみ打ち切る。マスクにより結果ヒープが `ef` に届きにくい場合は自然に
-探索が長く続く——`|W| < ef` の間は打ち切らない、という標準的な扱い）。
+`hnsw.rs::search_layer` は受理述語 `Option<&NodeMask>` を受け取る。初出実装
+（本 Issue 初版）は候補ヒープ（探索の拡張先を決める）を全ノード対象に拡張し、
+結果ヒープ（最終的な Top-k 候補）へのみ `accept` を適用していたが、これは
+「非受理ノードのベクトルが探索経路（打ち切り判定・以降の隣接探索）へ影響
+しない」という上記「ADR との整合」節の主張と矛盾していた（codex-review
+P0 指摘・Issue #431）。是正後は `accept` が受理しないノードを候補ヒープへも
+一切積まない——訪問済みマークは付けるが `self.score`（当該ノードのベクトルへ
+のアクセス）自体を行わず、その隣接ノードへの探索も行わない。上位層の貪欲
+降下（`HnswIndex::greedy_descend_masked`）も同様にマスクを適用し、降下の
+起点自体が非受理なら空の結果を返す（`sql::hnsw_cache::search_with_overlay`
+の `masked_short` 経由で plain scan へ縮退する）。`None`（既存呼び出し元）は
+ビット同一の結果を返す（`hnsw::tests::search_masked_none_matches_search` で
+機械検証）。停止条件（`results.len() >= ef && strictly_farther` の場合のみ
+打ち切る）は変更していない。
+
+この是正により、マスク密度が低い（`stale_nodes`／WHERE 除外行が多い）クエリ
+ほど探索がグラフの非受理ノードで分断されやすくなり、`masked_short` 経由の
+plain scan 縮退が起きやすくなる（性能上のトレードオフであり、`docs/design/
+ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」節が定める P0
+安全条件を優先した結果。filter-aware な専用探索方式は #410 以降の検討課題）。
 
 `HnswIndex::search`（既存公開 API）は `search_masked(.., None, ..)` へ委譲する
 薄いラッパーへ変更した。挙動・公開シグネチャは不変。

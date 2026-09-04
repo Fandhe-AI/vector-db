@@ -559,11 +559,14 @@ impl VisitedSet for VisitedBitmap {
     }
 }
 
-/// [`HnswIndex::search_masked`]（Issue #409）が受け取る候補マスク。索引ノード
-/// （`build` 時に割り当てたノード番号）のうち、結果集合へ含めてよいものを
-/// 1 ビット 1 ノードで表す。§`search_layer` ドキュメンテーションコメント
-/// 「候補マスク」の位置づけ参照——テナント境界ではなく、`sql::hnsw_cache` が
-/// クエリ時点の候補集合（アリーナ）と索引ノードの差分を表現する装置。
+/// [`HnswIndex::search_masked`]（Issue #409。Issue #431 是正で意味を拡張）が
+/// 受け取る候補マスク。索引ノード（`build` 時に割り当てたノード番号）のうち、
+/// 探索経路（貪欲降下・ビーム探索の候補集合展開）へ使ってよいもの＝結果集合へ
+/// 含めてよいものを 1 ビット 1 ノードで表す（`docs/design/ann-index-adoption.md`
+/// 「RLS／フィルタとの相互作用と折衷案」節の「非可視ノードを探索経路として通過
+/// させる設計は不採用」という P0 安全条件により、候補・結果の受理は同一マスクで
+/// 統一する）。テナント境界そのものではなく、`sql::hnsw_cache` がクエリ時点の
+/// 候補集合（アリーナ）と索引ノードの差分を表現する装置。
 ///
 /// `VisitedBitmap` と同型だが役割が異なる（訪問済み管理 ≠ 受理可否）ため
 /// 別の型として持つ。
@@ -1106,6 +1109,67 @@ impl HnswIndex {
         Ok(current)
     }
 
+    /// [`Self::greedy_descend`] のマスク付き版（Issue #431・codex-review P0
+    /// 是正）。構築経路（`insert_node`）はマスクを持たないため引き続き
+    /// `greedy_descend` を直接使い、本関数は探索経路（[`Self::search_masked`]）
+    /// 専用とする。
+    ///
+    /// `mask` が `Some` の場合、`mask` が受理しないノードのスコアは一切計算
+    /// しない（`self.score` を呼ばない＝当該ノードのベクトルへ触れない）。
+    /// `start` 自身が非受理なら降下を行わず `Ok(None)` を返す（呼び出し元は
+    /// この層より下へ安全に進められる `nearest` を持たないため、探索全体を
+    /// 打ち切る——`sql::hnsw_cache::search_with_overlay` の `masked_short` 経由で
+    /// plain scan へ縮退する）。`start` が受理される場合は隣接ノードのうち
+    /// 受理されるものだけを候補として貪欲降下する（非受理ノードは経路上の
+    /// 中継点としても使わない）。
+    ///
+    /// `mask` が `None` の場合は常に受理したとみなし、`greedy_descend` と同じ
+    /// 計算列（呼び出し順序込み）を辿るため、[`Self::search_masked`] が
+    /// `mask: None` で呼んだときに [`Self::search`] とビット同一の結果を返す
+    /// 契約（`crate::hnsw::tests::search_masked_none_matches_search`）を崩さない。
+    fn greedy_descend_masked(
+        &self,
+        start: u32,
+        query: &[f32],
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        mask: Option<&NodeMask>,
+    ) -> Result<Option<u32>, HnswError> {
+        let is_ok = |node: u32| mask.map(|m| m.get(node)).unwrap_or(true);
+        if !is_ok(start) {
+            return Ok(None);
+        }
+        let mut current = start;
+        let mut current_best = ScoredNode {
+            node: current,
+            score: self.score(current, query, dim, vectors)?,
+        };
+        loop {
+            let mut improved = false;
+            if let Some(neighbors) = self.neighbors(level, current) {
+                for &cand in neighbors {
+                    if !is_ok(cand) {
+                        continue;
+                    }
+                    let cand_scored = ScoredNode {
+                        node: cand,
+                        score: self.score(cand, query, dim, vectors)?,
+                    };
+                    if cand_scored > current_best {
+                        current = cand;
+                        current_best = cand_scored;
+                        improved = true;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        Ok(Some(current))
+    }
+
     /// `search_layer`（Algorithm 2）。層 `level` 上で `entry_points` から出発し、
     /// 幅 `ef` の貪欲拡張探索を行い、`dot` 降順（同点は id 昇順）に並んだ最大 `ef`
     /// 件の候補を返す。`pub(crate)` にして #405（探索 API）が `ef_search` で再利用
@@ -1121,15 +1185,24 @@ impl HnswIndex {
     /// パラメータとして本関数に共有される。各呼び出しの先頭で `reset` するだけ
     /// でよい契約は変わらない。
     /// `accept`（Issue #409。`sql::hnsw_cache::search_with_overlay` のマスク付き
-    /// 探索から渡される）が `Some` の場合、候補ヒープ（`candidates`）は従来どおり
-    /// 全ノードを対象に拡張するが、結果ヒープ（`results`）へは `accept` が
-    /// 受理するノードのみを積む。`None`（既存の呼び出し元。`search`・構築経路）
-    /// では常に受理したのと同じ振る舞いになり、`search_layer` はビット同一の
-    /// 結果を返す（`crate::hnsw::tests::search_masked_none_matches_search` 参照）。
-    /// このマスクは §モジュールドキュメント「候補マスク」節のとおりテナント境界
-    /// ではなく、クエリ時点の候補集合（アリーナ）と索引ノードの差分を表す装置に
-    /// すぎない（実テナント境界は索引構築入力・呼び出し元の `provider_result_is_valid`・
-    /// `RlsSafetyNet` の多層防御が担う。`sql::hnsw_cache` モジュールドキュメント参照）。
+    /// 探索から渡される）が `Some` の場合、`accept` が受理しないノードは候補ヒープ
+    /// （`candidates`）へも一切積まない——訪問済みマークは付けるが、スコア計算
+    /// （`self.score`。索引ノードのベクトルへのアクセスを伴う）自体を行わず、
+    /// その隣接ノードへの探索も一切行わない（Issue #431・codex-review P0 是正。
+    /// 旧実装は結果ヒープのみをマスクし候補ヒープは全ノードへ拡張していたため、
+    /// 非受理ノード（削除・不可視化・キー変更で失効したノード）が探索経路
+    /// （打ち切り判定の基準となる `results` の充足・以降の隣接探索）へ影響して
+    /// いた。`docs/design/ann-index-adoption.md`「RLS／フィルタとの相互作用と
+    /// 折衷案」節が定める「非可視ノードを探索経路として通過させる設計は不採用」
+    /// という P0 安全条件に反していたため、`accept` を候補ヒープの受理判定にも
+    /// 適用する形へ統一した）。`None`（既存の呼び出し元。`search`・構築経路）では
+    /// 常に受理したのと同じ振る舞いになり、`search_layer` はビット同一の結果を
+    /// 返す（`crate::hnsw::tests::search_masked_none_matches_search` 参照）。
+    /// このマスクはテナント境界そのものではなく、クエリ時点の候補集合（アリーナ）
+    /// と索引ノードの差分を表す装置だが、上記の是正後は非受理ノードのベクトルへ
+    /// 一切触れない（実テナント境界は索引構築入力・呼び出し元の
+    /// `provider_result_is_valid`・`RlsSafetyNet` の多層防御が担う。
+    /// `sql::hnsw_cache` モジュールドキュメント参照）。
     #[allow(clippy::too_many_arguments)] // visited・accept 追加で 9 引数。既存の precision.rs・arena.rs と同じ方針で許容する。
     pub(crate) fn search_layer<V: VisitedSet>(
         &self,
@@ -1154,12 +1227,16 @@ impl HnswIndex {
                 Some(false) => {}
                 None => continue,
             }
+            if !is_accepted(ep) {
+                // 非受理（stale・不可視）ノードは候補ヒープへも一切積まない
+                // （§関数ドキュメンテーションコメント参照。訪問済みマークのみ
+                // 付けてスコア計算・以降の探索を行わない）。
+                continue;
+            }
             let score = self.score(ep, query, dim, vectors)?;
             let scored = ScoredNode { node: ep, score };
             candidates.push(scored);
-            if is_accepted(ep) {
-                results.push(std::cmp::Reverse(scored));
-            }
+            results.push(std::cmp::Reverse(scored));
         }
 
         while let Some(top_candidate) = candidates.pop() {
@@ -1192,19 +1269,24 @@ impl HnswIndex {
                     if already {
                         continue;
                     }
+                    if !is_accepted(neighbor) {
+                        // 非受理ノードは訪問済みにするのみで候補ヒープへは
+                        // 積まない（Issue #431 是正。§関数ドキュメンテーション
+                        // コメント参照）。スコア計算（このノードのベクトルへの
+                        // アクセス）自体を行わず、この隣接ノード経由でのさらに
+                        // 先の探索も一切行わない。
+                        continue;
+                    }
                     let neighbor_score = self.score(neighbor, query, dim, vectors)?;
                     let scored = ScoredNode {
                         node: neighbor,
                         score: neighbor_score,
                     };
-                    // 受理判定も打ち切り判定と同じ理由でスコアのみの比較に限定
-                    // する（`scored` が `worst` とスコア同点なら、id 順の複合
-                    // 順序で「劣る」と判定されても受理する）。`worst_ok` は結果
-                    // ヒープの現在の最悪値との比較のみで決まり、`accept` の
-                    // 受理可否とは独立（マスク外ノードでも `worst_ok` を満たせば
-                    // 候補ヒープには積み、その先の未訪問隣接（マスク内かもしれない）
-                    // への探索を続ける。`accept` は結果ヒープへ積むかどうかのみを
-                    // 絞る。§`search_layer` ドキュメンテーションコメント参照）。
+                    // 打ち切り判定と同じ理由でスコアのみの比較に限定する
+                    // （`scored` が `worst` とスコア同点なら、id 順の複合順序で
+                    // 「劣る」と判定されても受理する）。`worst_ok` を満たす
+                    // 隣接ノードは（上の `is_accepted` チェックを通過済みのため）
+                    // 候補ヒープ・結果ヒープの双方へ積む。
                     let worst_ok = match results.peek() {
                         Some(std::cmp::Reverse(worst)) => {
                             results.len() < ef
@@ -1214,11 +1296,9 @@ impl HnswIndex {
                     };
                     if worst_ok {
                         candidates.push(scored);
-                        if is_accepted(neighbor) {
-                            results.push(std::cmp::Reverse(scored));
-                            if results.len() > ef {
-                                results.pop();
-                            }
+                        results.push(std::cmp::Reverse(scored));
+                        if results.len() > ef {
+                            results.pop();
                         }
                     }
                 }
@@ -1468,15 +1548,19 @@ impl HnswIndex {
         self.search_masked(query, k, ef, None, scratch)
     }
 
-    /// [`Self::search`] のマスク付き版（Issue #409）。`mask` が `Some` の場合、
-    /// 層 0 のビーム探索（[`Self::search_layer`]）へ候補マスクとして渡し、
-    /// 結果は `mask` が受理するノードに限られる。`None` の場合は [`Self::search`]
-    /// とビット同一の結果を返す（`crate::hnsw::tests::search_masked_none_matches_search`
-    /// で機械検証）。
-    ///
-    /// 上位層の貪欲降下（[`Self::greedy_descend`]）はマスクを一切参照しない
-    /// （§`search_layer` ドキュメンテーションコメント参照。マスクは層 0 の
-    /// 結果受理のみに影響する）。
+    /// [`Self::search`] のマスク付き版（Issue #409。Issue #431・codex-review P0
+    /// 是正で上位層の貪欲降下も含めマスクを一貫適用する形へ変更）。`mask` が
+    /// `Some` の場合、上位層の貪欲降下（[`Self::greedy_descend_masked`]）・
+    /// 層 0 のビーム探索（[`Self::search_layer`]）のいずれも `mask` を候補マスク
+    /// として渡し、`mask` が受理しないノード（削除・不可視化・キー変更で失効した
+    /// ノード）は探索経路のどの段階でも一切スコア計算・探索の起点として使わない
+    /// （`docs/design/ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」
+    /// 節の P0 安全条件）。上位層の降下で受理ノードへ到達できない場合（貪欲降下の
+    /// 起点自体が非受理）は空の結果を返し（`Ok(Vec::new())`）、呼び出し元
+    /// （`sql::hnsw_cache::search_with_overlay`）が `masked_short` として
+    /// plain scan へ縮退する。`None` の場合は [`Self::search`] とビット同一の
+    /// 結果を返す（`crate::hnsw::tests::search_masked_none_matches_search` で
+    /// 機械検証）。
     ///
     /// # エラー
     ///
@@ -1532,7 +1616,21 @@ impl HnswIndex {
         let mut nearest = entry;
         if top_level > 0 {
             for l in (1..=top_level).rev() {
-                nearest = self.greedy_descend(nearest, query, l, dim_usize, &self.vectors)?;
+                nearest = match self.greedy_descend_masked(
+                    nearest,
+                    query,
+                    l,
+                    dim_usize,
+                    &self.vectors,
+                    mask,
+                )? {
+                    Some(n) => n,
+                    // 非受理ノードを経由しないと降下を続けられない: この層より下へ
+                    // 安全に進められる `nearest` が存在しないため、探索全体を
+                    // fail-closed に打ち切る（§本関数ドキュメンテーションコメント
+                    // 参照）。
+                    None => return Ok(Vec::new()),
+                };
             }
         }
 
@@ -2109,6 +2207,69 @@ mod tests {
         );
     }
 
+    /// Issue #431（codex-review P0 是正）の回帰テスト: 非受理（stale・不可視）
+    /// ノードが探索経路の中継点として使われず、そのノード経由でしか到達
+    /// できない受理ノードは結果に現れないことを確認する。
+    ///
+    /// `node0 -> node1 -> node2` の一本道（`node0`・`node2` 間に直接リンクは
+    /// 張らない）を作り、`node1` を非受理としてマスクする。マスクなし
+    /// （`None`）では `node1` を中継して最良スコアの `node2` を発見できるが、
+    /// マスクありでは `node1` が候補ヒープへ一切積まれなくなったため
+    /// （§`search_layer` ドキュメンテーションコメント参照）`node2` へは
+    /// 到達できず、エントリポイント自身の `node0` のみが結果に残る。
+    #[test]
+    fn search_masked_does_not_traverse_through_a_rejected_bridge_node() {
+        let dim = 1usize;
+        // dim=1 の `dot(v, q) = v[0] * q[0]` なので `q=[1.0]` のときスコアは
+        // ノード値そのもの。node2 が最良スコアだが node1 経由でしか到達できない。
+        let vectors: Vec<f32> = vec![10.0, 15.0, 20.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+            vectors: Arc::from(vectors),
+        };
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+
+        let unmasked = index
+            .search_masked(&query, 3, 10, None, &mut scratch)
+            .expect("unmasked search should succeed");
+        assert_eq!(
+            unmasked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![2, 1, 0],
+            "unmasked search must traverse node0 -> node1 -> node2 and rank by score"
+        );
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        // node1（橋渡しノード）は非受理のまま。
+        mask.set(2);
+        let masked = index
+            .search_masked(&query, 3, 10, Some(&mask), &mut scratch)
+            .expect("masked search should succeed");
+        assert_eq!(
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![0],
+            "masked search must not traverse through the rejected bridge node1, \
+             so node2 (reachable only via node1) must not appear in the results"
+        );
+    }
+
     #[test]
     fn visited_bitmap_reset_clears_all_bits_and_only_grows() {
         let mut bm = VisitedBitmap::default();
@@ -2214,6 +2375,16 @@ mod tests {
                 mask.set(node as u32);
             }
         }
+        // Issue #431 是正により、探索経路（貪欲降下・ビーム探索の候補展開）は
+        // マスク外ノードを一切通過しなくなった。エントリポイント自身が非受理だと
+        // 降下の起点を持てず即座に空集合を返す契約（§`search_masked` ドキュメン
+        // テーションコメント参照）のため、本テストが検証したい「受理ノードの
+        // 部分集合が返る」性質を確認するにはエントリポイントを受理側へ含める
+        // 必要がある（受理側の連結性そのものはテストの関心事ではない）。
+        let entry = index
+            .entry_point()
+            .expect("non-empty index has an entry point");
+        mask.set(entry);
         let query = gen_corpus(1234, dim, 1);
         let mut scratch = HnswSearchScratch::default();
         let results = index
