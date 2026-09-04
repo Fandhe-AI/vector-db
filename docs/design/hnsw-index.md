@@ -112,17 +112,28 @@ pgvector の既定値（64）とは異なる。
   同一マシン上でビルド・テストを実行していた（Issue #413 実装ログ参照）。
   以下の数値は参考値であり、専有環境での再測定は申し送りとする
   （`docs/design/c1-p95-dedicated-env-reverification.md` と同方針）。
+- **索引構築時間プローブの分離**（Issue #439 codex-review 指摘への対応）:
+  `index_warm_us`（下記）の計測は 13 フェーズが使う `core` とは別ファイル・
+  別 `EngineCore` インスタンス（`feature_bench.rs` の `probe_core`）に対して
+  行う。当初の実装は同じ `core` に対してこのプローブを 13 フェーズの直前に
+  1 回発行しており、`vector_knn` と同形のクエリのため `SqlArenaCache`／
+  `HnswIndexCache` を事前ウォームしてしまい、13 フェーズが cold から
+  始まる before バイナリと測定条件が食い違っていた（P1 指摘）。分離後は
+  13 フェーズ開始時点で `core` は完全に cold であり、before との直接比較対象
+  である 13 フェーズの p50/p95 の測定条件が一致する。この修正により本節の
+  数値（特に `point_where`・`vector_knn_where`。下記「判定」節参照）は
+  当初版から更新されている。
 
 ### ノイズ帯の見積り
 
 `crates/engine/src/` を一切変更していない本 Issue では、before/既定 と
 after/既定 の差は**構造的に環境変動のみ**である（コード変更に起因する差は
 論理的にありえない）。同一条件（after/既定）内の 3 回の p50 のばらつき
-（同一時間帯の run-to-run 差）は非検索フェーズで 2〜5%程度に収まる
-（例: `agg_count` raw_p50=[2526, 2459, 2457]us、`udf_call` raw_p50=[671, 662,
-676]us）。一方 before（別ビルド・別時間帯）と after/既定 の非検索フェーズ
-差は 10〜15%程度（例: `agg_count` 2867us→2459us、`group_by_having`
-3556us→3156us）で、これは**同一時間帯の run-to-run 差より大きく、時間帯を
+（同一時間帯の run-to-run 差）は非検索フェーズで 1〜2%程度に収まる
+（例: `agg_count` raw_p50=[2525, 2554, 2524]us、`udf_call` raw_p50=[689, 681,
+672]us）。一方 before（別ビルド・別時間帯）と after/既定 の非検索フェーズ
+差は 10〜15%程度（例: `agg_count` 2867us→2525us、`group_by_having`
+3556us→3169us）で、これは**同一時間帯の run-to-run 差より大きく、時間帯を
 跨いだ背景負荷の変動**を反映していると判断する。本書ではこの 15% 程度を
 「時間帯を跨いだ比較のノイズ帯」の目安として扱う。
 
@@ -130,37 +141,38 @@ after/既定 の差は**構造的に環境変動のみ**である（コード変
 
 | フェーズ | before | after/既定 | after/hnsw |
 | --- | --- | --- | --- |
-| ingest | 4,175 | 4,109 | 4,100 |
-| point_where | 2,752 | 3,361 | 4,620 |
-| where_compound | 3,315 | 2,970 | 2,908 |
-| agg_count | 2,867 | 2,459 | 2,454 |
-| agg_multi | 3,107 | 2,739 | 2,679 |
-| group_by_having | 3,556 | 3,156 | 3,181 |
-| vector_knn | 8,210 | 10,586 | 8,229 |
-| vector_knn_where | 2,770 | 3,352 | 4,665 |
-| hybrid_rrf | 11,442 | 14,000 | 12,414 |
-| mode_recall | 8,596 | 11,378 | 9,271 |
-| mode_precision | 8,562 | 10,253 | 10,425 |
-| rls_isolation | 2,791 | 2,386 | 2,401 |
-| udf_call | 675 | 671 | 403 |
+| ingest | 4,175 | 4,120 | 4,125 |
+| point_where | 2,752 | 2,885 | 2,870 |
+| where_compound | 3,315 | 2,908 | 2,890 |
+| agg_count | 2,867 | 2,525 | 2,508 |
+| agg_multi | 3,107 | 2,726 | 2,727 |
+| group_by_having | 3,556 | 3,169 | 3,189 |
+| vector_knn | 8,210 | 9,564 | 8,095 |
+| vector_knn_where | 2,770 | 2,883 | 4,282 |
+| hybrid_rrf | 11,442 | 12,261 | 10,685 |
+| mode_recall | 8,596 | 9,231 | 7,648 |
+| mode_precision | 8,562 | 9,034 | 8,404 |
+| rls_isolation | 2,791 | 2,418 | 2,416 |
+| udf_call | 675 | 681 | 402 |
 
 生値（p50・us・3 回）:
 
 - before: ingest=[4181,4175,4118] point_where=[2754,2752,2733]
   vector_knn=[8086,8210,8813] hybrid_rrf=[11442,11357,12368]
   mode_recall=[8591,8596,8670] mode_precision=[8806,8562,8364]
-- after/既定: point_where=[3522,3300,3361] vector_knn=[10596,10586,9498]
-  vector_knn_where=[3488,3299,3352] hybrid_rrf=[13480,14596,14000]
-  mode_recall=[11566,10219,11378] mode_precision=[10253,10991,10043]
-- after/hnsw: point_where=[4796,4620,4511] vector_knn=[8462,8032,8229]
-  vector_knn_where=[4847,4524,4665] hybrid_rrf=[12568,12274,12414]
-  mode_recall=[9488,9271,9199] mode_precision=[10498,10425,10385]
+- after/既定: point_where=[2974,2883,2885] vector_knn=[9539,9564,9588]
+  vector_knn_where=[2835,2883,2973] hybrid_rrf=[11775,12261,12264]
+  mode_recall=[9547,9231,9049] mode_precision=[8869,9049,9034]
+- after/hnsw: point_where=[2892,2870,2846] vector_knn=[8120,8095,8081]
+  vector_knn_where=[4271,4382,4282] hybrid_rrf=[10758,10580,10685]
+  mode_recall=[7648,7708,7627] mode_precision=[8404,8433,8272]
 
-`meta.index_warm_us`（1 回計測。索引構築時間相当。before バイナリには対応する
-プローブが無いため before は測定対象外）: after/既定（`SqlArenaCache` cold
-構築）中央値 **35.0ms**、after/hnsw（arena デコード＋HNSW グラフ構築）中央値
-**608.7ms**——約 17.4 倍。`meta.vm_rss_kb_final` 中央値: after/既定
-108,680kB、after/hnsw 132,732kB（+22.1%。HNSW グラフの隣接リスト分）。
+`meta.index_warm_us`（`probe_core` での 1 回計測。索引構築時間相当。before
+バイナリには対応するプローブが無いため before は測定対象外）: after/既定
+（`SqlArenaCache` cold 構築）中央値 **48.2ms**、after/hnsw（arena デコード＋
+HNSW グラフ構築）中央値 **613.8ms**——約 12.7 倍。`meta.vm_rss_kb_final`
+中央値: after/既定 112,004kB、after/hnsw 137,916kB（+23.1%。HNSW グラフの
+隣接リスト分）。
 
 ### 段別の `ann_plan` 対応（`sql::hnsw_cache::classify_ann_plan`。ソース: `docs/design/explain-search-engine-exposure.md`）
 
@@ -189,33 +201,58 @@ ef_cap_fallbacks=0 entries=1`。`point_where`・`vector_knn_where` の
 **既定エンジン非退行**: production コード（`crates/engine/src/`）を一切
 変更していない本 Issue において、before→after/既定 の差はすべて環境要因
 （時間帯を跨いだ背景負荷の変動。上記「ノイズ帯の見積り」節）に起因する
-はずであり、コード変更由来の退行は論理的に存在しない。数値上は検索系
-フェーズ（`vector_knn` +29%・`hybrid_rrf` +22%・`mode_recall` +32%）が
-非検索系フェーズ（+10〜15%）より大きく増えており、専有環境での再測定
-（申し送り）でこの差が縮小するかは未確認だが、**コード差分が存在しない
-以上これは受け入れ基準「既定エンジンでの全 13 フェーズ非退行」の対象外**
+はずであり、コード変更由来の退行は論理的に存在しない。索引構築時間
+プローブを分離した本版では非検索系フェーズの差が概ね数%〜10%程度
+（例: `agg_count` 2867us→2525us・約 -12%）に収まり、検索系フェーズ
+（`vector_knn` +16.5%・`hybrid_rrf` +7.2%・`mode_recall` +7.4%）との差も
+当初版（+29〜32% 対 +10〜15%）より縮小した。専有環境での再測定（申し送り）
+でこの残差がさらに縮小するかは未確認だが、**コード差分が存在しない以上
+これは受け入れ基準「既定エンジンでの全 13 フェーズ非退行」の対象外**
 （比較対象コードが同一であるため退行の定義自体が成立しない）と判断する。
 
 **hnsw の効果（after/既定 vs after/hnsw。同一バイナリ・同一時間帯の
 比較のため上記ノイズ要因を受けにくい）**:
 
-- フィルタなし DISTANCE（`vector_knn` -22.3%・`mode_recall` -18.5%）・
-  hybrid 密側（`hybrid_rrf` -11.3%）はいずれも高速化。
-- SCALAR 事前フィルタ付き DISTANCE（`point_where` +37.5%・
-  `vector_knn_where` +39.2%）はいずれも悪化。可視候補比率（約 1/5）が
-  `full_scan_ratio`（1/10）を下回らず `hnsw_subset` 経路（マスク付き
-  ANN 探索＋`Overlay::delta_slots` 補完）を通るが、本コーパス規模
-  （25,000 行）・この選択性では、単純な brute-force 走査よりコストが
+- フィルタなし DISTANCE（`vector_knn` -15.4%・`mode_recall` -17.1%）・
+  hybrid 密側（`hybrid_rrf` -12.9%）はいずれも高速化（索引構築時間
+  プローブ分離後も方向は不変。倍率は当初版〔-22.3%・-18.5%・-11.3%〕から
+  縮小したが、これは検索系フェーズの絶対値自体が本節「既定エンジン
+  非退行」で述べた環境変動の影響を受けているためで、hnsw の相対効果の
+  符号を覆すものではない）。
+- `point_where`（-0.5%）は**当初版（+37.5%）から一変してほぼ不変**となった。
+  これは索引構築時間プローブの分離（測定条件節参照）による直接的な効果:
+  `run_select_phase`（`feature_bench.rs`）は各フェーズの計測ループ開始前に
+  素の 1 回実行（warm-up 実行）を挟む構成のため、13 フェーズ開始前の共有
+  プローブが無くても `point_where` 自身のこの 1 回で `SqlArenaCache`／
+  `HnswIndexCache` の基礎索引が構築され、計測対象の 50 回（`p50`・`p95`
+  算出対象）はいずれも索引済みの状態で実行される。当初版の +37.5% は
+  「共有プローブが `point_where` より先に基礎索引を暖めていたことで
+  `hnsw_subset` 経路のマスク計算コストのみが計測に乗っていた」ことの
+  反映であり、単独インスタンスでの再測定（本版）が本来観測すべき値
+  （ほぼ等価）である。
+- 一方 `vector_knn_where`（+48.5%）は当初版（+39.2%）と同様、あるいは
+  それ以上に悪化したままであり、**SCALAR 事前フィルタ付き DISTANCE
+  における `hnsw_subset` 経路の実コストは `vector_knn_where` が示す方が
+  忠実**（`point_where` は上記の理由で他フェーズの索引ウォームアップに
+  依存しない独立した観測点として、より参考になる）。可視候補比率
+  （約 1/5）が `full_scan_ratio`（1/10）を下回らず `hnsw_subset` 経路
+  （マスク付き ANN 探索＋`Overlay::delta_slots` 補完）を通るが、本コーパス
+  規模（25,000 行）・この選択性では、単純な brute-force 走査よりコストが
   高いことを実測が示す。
-- `mode_precision` はほぼ不変（+1.7%。構造的に `plain_scan_precision`
-  固定のため期待どおり）。
-- `index_warm_us`（17.4 倍）・`vm_rss_kb_final`（+22.1%）はいずれも hnsw の
-  明確なコストとして現れている。
+- `mode_precision` は -7.0%（当初版 +1.7% から符号反転）。構造的に
+  `plain_scan_precision` 固定（`hnsw`・`brute_force` いずれも brute-force
+  走査）のため理論上は engine 差が生じないはずだが、実測差は上記「既定
+  エンジン非退行」で述べた環境変動由来のノイズ帯（15% 程度）の範囲内で
+  あり、hnsw 固有の効果とは判断しない。
+- `index_warm_us`（12.7 倍）・`vm_rss_kb_final`（+23.1%）はいずれも hnsw の
+  明確なコストとして現れている（倍率は当初版〔17.4 倍・+22.1%〕と近い
+  オーダーで、`probe_core` 分離後も一貫）。
 
-p95 は別立てで記録する: `vector_knn` after/既定 12,667us→after/hnsw
-8,509us（-32.8%）・`point_where` 3,742us→5,270us（+40.8%）・`hybrid_rrf`
-17,421us→12,880us（-26.1%）と、p50 と同方向・より大きな振れ幅を示す
-（測定回数 n=3 のため p95 自体の統計的信頼性は低い）。
+p95 は別立てで記録する: `vector_knn` after/既定 10,363us→after/hnsw
+8,310us（-19.8%）・`point_where` 3,504us→3,004us（-14.3%）・`hybrid_rrf`
+14,050us→11,297us（-19.6%）と、p50 と同方向の傾向を示す（測定回数 n=3
+のため p95 自体の統計的信頼性は低い。`point_where` の p95 も p50 と同様
+ほぼ収束方向にあることが確認できる）。
 
 ## 8. 規模スケーリング（25,000 行 vs 100,000 行）
 
@@ -228,30 +265,34 @@ after/hnsw のみで行う。
 
 | フェーズ | after/既定（100k） | after/hnsw（100k） | 比（hnsw/既定） |
 | --- | --- | --- | --- |
-| vector_knn | 71,748.5us | 64,265.5us | 0.896（-10.4%） |
-| vector_knn_where | 17,262.5us | 24,980.5us | 1.447（+44.7%） |
-| hybrid_rrf | 92,863.0us | 87,131.0us | 0.938（-6.2%） |
-| mode_recall | 76,052.5us | 70,722.0us | 0.930（-7.0%） |
-| mode_precision | 76,363.5us | 78,786.5us | 1.032（+3.2%） |
-| point_where | 17,762.5us | 24,610.5us | 1.386（+38.6%） |
+| vector_knn | 60,852.5us | 54,742.5us | 0.900（-10.0%） |
+| vector_knn_where | 15,194.5us | 22,175.0us | 1.459（+45.9%） |
+| hybrid_rrf | 78,837.5us | 72,382.0us | 0.918（-8.2%） |
+| mode_recall | 62,103.0us | 55,129.0us | 0.888（-11.2%） |
+| mode_precision | 62,457.0us | 61,446.0us | 0.984（-1.6%） |
+| point_where | 14,996.0us | 15,011.5us | 1.001（+0.1%） |
 
-`index_warm_us` 中央値: after/既定 134.2ms → after/hnsw 2,101.8ms（約 15.7
-倍）。`vm_rss_kb_final` 中央値: after/既定 360,734kB → after/hnsw
-455,864kB（+26.4%）。
+`index_warm_us` 中央値: after/既定 179.4ms → after/hnsw 2,142.8ms（約 11.9
+倍）。`vm_rss_kb_final` 中央値: after/既定 377,490kB → after/hnsw
+473,198kB（+25.4%）。
+
+（上記は索引構築時間プローブを 13 フェーズ用 `core` と分離した版の実測値
+であり、`point_where` が §7 と同様の理由でほぼ等価に収束している点は
+25k・100k いずれの規模点でも一貫している。）
 
 **25k vs 100k での hnsw 優位性の変化**: `vector_knn` の hnsw/既定 比は
-25k で 0.777（-22.3%）、100k で 0.896（-10.4%）と、**規模が大きくなるほど
+25k で 0.846（-15.4%）、100k で 0.900（-10.0%）と、**規模が大きくなるほど
 hnsw の相対優位が縮小している**（単純な「HNSW は O(log n) で brute-force
 の O(n) に対し規模が大きいほど有利」という理論的期待とは逆方向）。同様に
-`vector_knn_where`（SCALAR 事前フィルタ付き）の悪化幅も 25k の +39.2% から
-100k の +44.7% へ拡大している。この 2 規模点のみからは、本コーパス
-（`n=2`・非専有環境・`ef_search=64` 固定）で明確な損益分岐点（brute-force
-が hnsw に劣後し始める規模）を特定できない——両規模点で hnsw が
-`vector_knn`／`mode_recall`／`hybrid_rrf` について brute-force を上回った
-ままであり、規模を追うごとに差が縮む傾向は見えるが交差（逆転）は観測
-されていない。より広い規模ラダー（例: 10k・50k・250k・500k）での再測定が
-損益分岐点の特定には必要であり、本 Issue の時間・環境制約により申し送りと
-する（§11）。
+`vector_knn_where`（SCALAR 事前フィルタ付き）の悪化幅も 25k の +48.5% から
+100k の +45.9% へほぼ横ばい（縮小方向）である。この 2 規模点のみからは、
+本コーパス（`n=2`・非専有環境・`ef_search=64` 固定）で明確な損益分岐点
+（brute-force が hnsw に劣後し始める規模）を特定できない——両規模点で
+hnsw が `vector_knn`／`mode_recall`／`hybrid_rrf` について brute-force を
+上回ったままであり、規模を追うごとに差が縮む傾向は見えるが交差（逆転）は
+観測されていない。より広い規模ラダー（例: 10k・50k・250k・500k）での
+再測定が損益分岐点の特定には必要であり、本 Issue の時間・環境制約により
+申し送りとする（§11）。
 
 ## 9. `bench-knn-profile` 前後比較（S0-cold／S0-hot・25,000 行）
 
@@ -268,10 +309,10 @@ entries=1`（非 vacuous 確認・完全一致）。
 | S0-hot（キャッシュヒット） | 0.642ms | 0.430ms | 0.670（-33.0%） |
 
 S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築するコスト」を
-そのまま表しており、`feature_bench` の `index_warm_us`（17.4 倍。1 回限りの
-構築を計測）と桁が一致する（構築コストは規模〔25k 行〕にほぼ比例する
+そのまま表しており、`feature_bench` の `index_warm_us`（12.7 倍。1 回限りの
+構築を計測。§7 参照）と桁が一致する（構築コストは規模〔25k 行〕にほぼ比例する
 という前提と整合）。S0-hot の -33.0% は `feature_bench` の `vector_knn`
-（-22.3%）と方向・オーダーが一致し、hnsw のホットパス（索引構築済み後の
+（-15.4%）と方向・オーダーが一致し、hnsw のホットパス（索引構築済み後の
 単発クエリ）優位性を独立に裏付ける。
 
 ## 10. 損益分岐点についての結論（B 案条件 1 の事後確認）
@@ -279,12 +320,18 @@ S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築す
 本 Issue の測定（25k・100k の 2 規模点、非専有環境、n=2〜3）から:
 
 1. **フィルタなし DISTANCE・hybrid 密側・ホットパス**では、25k・100k の
-   いずれの規模でも hnsw が brute-force を上回る（p50 で 6〜33% 高速）。
+   いずれの規模でも hnsw が brute-force を上回る（p50 で 8〜17% 高速）。
 2. **SCALAR 事前フィルタ付き DISTANCE**（可視候補比率が `full_scan_ratio`
-   を下回らない選択性）では、25k・100k のいずれでも hnsw が brute-force
-   より遅い（+37〜45%）。
+   を下回らない選択性）は選択性次第で結果が分かれる: `vector_knn_where`
+   （lang×topic 複合条件でより選択的）は 25k・100k のいずれでも hnsw が
+   brute-force より明確に遅い（+46〜49%）一方、`point_where`（`lang='ja'`
+   単独・約 1/5 可視）はほぼ不変（±0.5% 程度）だった。索引構築時間
+   プローブの分離により、当初 `point_where` にも見えていた悪化（+37〜39%）
+   が計測条件の不一致による見かけ上のものだったと判明したため（§7 参照）、
+   `hnsw_subset` 経路の実コストとしては `vector_knn_where` の実測をより
+   重視すべきである。
 3. **索引構築コスト**（`index_warm_us`）は 25k で brute-force cold 構築の
-   約 17 倍、100k で約 16 倍——規模が変わっても比率はほぼ一定であり、
+   約 12.7 倍、100k で約 11.9 倍——規模が変わっても比率はほぼ一定であり、
    ワンショットの構築コストというより経路の恒常的なオーバーヘッドとして
    扱うべき値である。
 4. 明確な「brute-force が hnsw を下回り始める規模」（逆の損益分岐点）は

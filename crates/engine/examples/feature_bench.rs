@@ -744,21 +744,8 @@ fn main() {
     )];
     let rows_after_ingest_bytes = db_file_size_bytes(&db_path);
 
-    // `insert_rows` で書き込み済みの `Storage` を `EngineCore` へ引き渡す
-    // （`EngineCore::open` による同一ファイルへの二重オープンを避ける。
-    // `from_storage` は所有権移動のみでテナント境界の迂回経路を新設しない）。
-    let core = match engine_choice {
-        BenchEngine::BruteForce => {
-            EngineCore::from_storage(storage, engine::search_engine::default_engine())
-        }
-        BenchEngine::Hnsw => {
-            let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
-                .expect("valid HnswParams::default()");
-            EngineCore::from_storage_with_engine(storage, kind)
-        }
-    };
-
-    // クエリベクトル・クエリ文の周回プール。
+    // クエリベクトル・クエリ文の周回プール（`core` の構築に先立って用意する。
+    // 索引構築時間プローブ〔下記〕が `qv0` を必要とするため）。
     let query_vecs: Vec<Vec<f32>> = QUERY_TEXTS
         .iter()
         .map(|t| {
@@ -772,14 +759,41 @@ fn main() {
     let qv1 = vec_literal(&query_vecs[1 % query_vecs.len()]);
     let qv2 = vec_literal(&query_vecs[2 % query_vecs.len()]);
 
-    // 索引構築時間の一発計測（Issue #413 設計判断 4）。`vector_knn` と同形の
-    // クエリを計測フェーズ開始前に 1 回だけ実行し、hnsw では arena デコード＋
-    // HNSW 構築、brute_force では `SqlArenaCache`（Issue #363）の cold 構築に
-    // 相当する経過時間を記録する。before バイナリ（`0803a8c`）にはこの段が無く
-    // 3 条件間の直接比較対象は 13 フェーズの p50/p95 のみであることを
-    // `docs/design/hnsw-index.md`「測定条件」に明記する。
+    // 索引構築時間の一発計測（Issue #413 設計判断 4。Issue #439 codex-review
+    // 指摘への対応で計測対象インスタンスを分離）。`vector_knn` と同形のクエリを
+    // 実行し、hnsw では arena デコード＋HNSW 構築、brute_force では
+    // `SqlArenaCache`（Issue #363）の cold 構築に相当する経過時間を記録する。
+    //
+    // 計測は ingest 済み db ファイルを複製した**別ファイル・別 `EngineCore`
+    // インスタンス**（`probe_core`）に対して行い、13 フェーズの実行に使う
+    // `core` のキャッシュ・索引状態には一切触れない。これにより after/既定・
+    // after/hnsw いずれも 13 フェーズ開始時点で cold のまま揃い、事前ウォーム
+    // アップを持たない before バイナリ（`0803a8c`）と 13 フェーズの測定条件が
+    // 一致する（比較対象は 13 フェーズの p50/p95 のみであることを
+    // `docs/design/hnsw-index.md`「測定条件」に明記する）。
+    let probe_db_path = {
+        let mut p = db_path.clone();
+        let mut file_name = p.file_name().expect("db_path has file name").to_os_string();
+        file_name.push("-probe");
+        p.set_file_name(file_name);
+        p
+    };
+    std::fs::copy(&db_path, &probe_db_path)
+        .unwrap_or_else(|e| fail_bench("probe db copy failed", &format!("{e}")));
+    let _cleanup_probe = CleanupGuard(probe_db_path.clone());
+    let probe_storage = Storage::open(&probe_db_path).expect("open probe storage");
+    let probe_core = match engine_choice {
+        BenchEngine::BruteForce => {
+            EngineCore::from_storage(probe_storage, engine::search_engine::default_engine())
+        }
+        BenchEngine::Hnsw => {
+            let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+                .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(probe_storage, kind)
+        }
+    };
     let index_warm_start = Instant::now();
-    let index_warm_probe = core.execute_sql(
+    let index_warm_probe = probe_core.execute_sql(
         &ctx_a_full,
         &format!("SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10"),
     );
@@ -787,6 +801,24 @@ fn main() {
     if let Err(e) = index_warm_probe {
         fail_bench("index warm-up probe query failed", &format!("{e:?}"));
     }
+    drop(probe_core);
+    let _ = std::fs::remove_file(&probe_db_path);
+
+    // `insert_rows` で書き込み済みの `Storage` を `EngineCore` へ引き渡す
+    // （`EngineCore::open` による同一ファイルへの二重オープンを避ける。
+    // `from_storage` は所有権移動のみでテナント境界の迂回経路を新設しない）。
+    // 上記プローブとは独立のインスタンスであり、13 フェーズはこの `core` が
+    // cold な状態から開始する。
+    let core = match engine_choice {
+        BenchEngine::BruteForce => {
+            EngineCore::from_storage(storage, engine::search_engine::default_engine())
+        }
+        BenchEngine::Hnsw => {
+            let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+                .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(storage, kind)
+        }
+    };
 
     // 許可リスト構文（`sql::allowlist`）は非集計 `SELECT` に `ORDER BY` を必須と
     // するため（`LIMIT` 単体では受理されない）、`WHERE` フィルタの効果を見るために
