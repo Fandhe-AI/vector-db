@@ -65,8 +65,8 @@ fail-closed の最終防御）に留まり、「`ef` 拡張で結果不足を解
 
 `hybrid.rs::hybrid_search_boosted` の密側再取得ループは、境界同点グループが
 未確定（`TieBoundary::Undetermined`）の間 `dense_fetch_k` を
-`pool_depth * 2` から倍増しつつ `provider.search` を呼び直す（Issue #310・
-#320。`docs/design/hybrid-recall-regression.md`「Issue #310」節・
+`pool_depth * 2` から倍増しつつ `provider.search` を呼び直す（Issue #310・#320。
+`docs/design/hybrid-recall-regression.md`「Issue #310」節・
 `docs/design/rrf-tie-break-determinism.md` 参照）。この `dense_fetch_k` の
 単調倍増そのものが iterative scan の実体であり、Issue #410 の役割は
 「各ラウンドの `provider.search` を HNSW 索引経由にする」ことに絞られる。
