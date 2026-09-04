@@ -264,6 +264,7 @@ current_generation` による事前・事後の失効照合とは独立した読
 | インジェクション | SQL 文字列を組み立てる箇所なし |
 | 不安全な設計／DoS | `NodeMask` は索引ノード数分のビット（最大 `MAX_HNSW_NODES / 8` バイト程度）。整数演算は `checked_*`／`saturating_*`。`ef`・`k` の上限は既存どおり `MAX_EF` |
 | 脆弱な依存 | 依存追加なし。`unsafe` なし |
+| 世代整合（キャッシュ誤登録防止） | `rls.rs::PrefilterSnapshot::search_with_hnsw` は `read_txn` のテーブル世代がスナップショット構築時のテーブル世代（`built_table_generation`）と一致する場合のみ `search_or_fallback` を呼ぶ。不一致時（構築後・`read_txn` オープン前に書き込みが割り込んだ場合を含む）はキャッシュへ一切触れず brute-force へ縮退し、旧アリーナから構築した索引が新世代のエントリとして誤登録される事故を防ぐ |
 
 ## 検証
 

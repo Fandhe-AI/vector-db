@@ -252,6 +252,14 @@ pub(crate) struct PrefilterSnapshot {
     /// 構築時に読んだストレージ世代（[`Storage::current_generation`]）。
     /// [`Self::search_with`] の失効検出に使う。
     built_generation: u64,
+    /// 構築時に読んだテーブル単位世代（[`crate::catalog::table_generation_in_txn`]。
+    /// `arena` を読んだのと同じ順序（世代読み取り → アリーナ構築）で束縛する。
+    /// [`Self::search_with_hnsw`] が `search_or_fallback` へ渡す `read_txn` の
+    /// テーブル世代と照合し、`arena`（このスナップショット）と `read_txn` の
+    /// スナップショットが同一世代であることを保証する（Issue #409 codex-review P1。
+    /// `docs/design/hnsw-generation-cache.md`「呼び出し元スナップショットとの世代整合」
+    /// 節参照）。
+    built_table_generation: u64,
 }
 
 impl PrefilterSnapshot {
@@ -266,6 +274,14 @@ impl PrefilterSnapshot {
         // 世代を先に読んでからアリーナを構築する（アリーナ構築中に別の書き込みが
         // コミットされても、その変更を見落とさない方向の順序。`search_with` の doc 参照）。
         let built_generation = storage.current_generation()?;
+        // テーブル単位世代も同じ順序（アリーナ構築前）で読む。`search_with_hnsw` が
+        // `search_or_fallback` へ渡す `read_txn` の世代と、この `arena` を束縛した
+        // 世代とを一致させるための基準値（[`Self::built_table_generation`] ドキュメント
+        // 参照）。読み取り失敗は `ArenaError::Catalog` 経由で `RlsError::Arena` へ丸める
+        // （既存の `From<ArenaError> for RlsError` を再利用し、専用 variant を増やさない）。
+        let built_table_generation = storage
+            .table_generation(table)
+            .map_err(ArenaError::Catalog)?;
         let arena = match VectorArena::build_filtered(storage, table, |tenant, visibility| {
             ctx.is_visible(tenant, visibility)
         }) {
@@ -283,6 +299,7 @@ impl PrefilterSnapshot {
             visible_id_counts,
             built_ctx: ctx.clone(),
             built_generation,
+            built_table_generation,
         })
     }
 
@@ -428,26 +445,51 @@ impl PrefilterSnapshot {
 
         // `search_or_fallback` はテーブル世代を `read_txn` から読むため、ここで
         // 1 つ開いて渡す（`storage.current_generation`〔上記の世代照合〕とは
-        // 別の読み取りだが、間に書き込みが挟まっても不整合にはならない——世代が
-        // 進んでいれば `search_or_fallback` はキャッシュミス・世代不一致として
-        // fail-closed に brute-force へ縮退するだけで、事後の世代照合〔下記〕が
-        // 最終防御として機能する）。
+        // 別の読み取り）。
         let read_txn = storage
             .db()
             .begin_read()
             .map_err(|_| RlsError::IndexStale)?;
-        let raw = crate::sql::hnsw_cache::search_or_fallback(
-            access,
-            &read_txn,
-            self.arena.table_name(),
-            ctx,
-            &self.arena,
-            &self.slot_ids,
-            provider,
-            query,
-            k,
-        )
-        .map_err(RlsError::Kernel)?;
+
+        // `self.arena` は `built_table_generation` 時点のスナップショットで固定
+        // されている。`pre_generation` 確認（上記）から `read_txn` を開くまでの間に
+        // 別の書き込みがコミットされていると、`read_txn` は新世代を見るのに
+        // `self.arena` は旧世代のままという不整合が起こり得る。この状態のまま
+        // `search_or_fallback` を呼ぶと、同関数は `read_txn` から得た新世代番号を
+        // 使って旧アリーナから索引を構築・登録してしまい、事後の世代照合
+        // （下記）でこの呼び出し自体は `IndexStale` にできても、誤登録した
+        // キャッシュエントリは残ってしまう（次の新世代クエリが `Lookup::Ready` で
+        // 誤って再利用し得る。codex-review P1 指摘・Issue #409）。そのため
+        // `read_txn` のテーブル世代を `built_table_generation` と直接照合し、
+        // 一致する場合のみキャッシュ経由の探索を行う。不一致時はキャッシュへ
+        // 一切触れず、`search_with` と同じ brute-force 経路へ縮退する
+        // （この呼び出しの結果は後述の事後照合でどのみち `IndexStale` になる
+        // 見込みが高いが、無駄な索引構築を避けるためここで早期に切り替える）。
+        let read_txn_table_generation =
+            crate::catalog::table_generation_in_txn(&read_txn, self.arena.table_name());
+        let raw = if read_txn_table_generation.ok() == Some(self.built_table_generation) {
+            crate::sql::hnsw_cache::search_or_fallback(
+                access,
+                &read_txn,
+                self.arena.table_name(),
+                ctx,
+                &self.arena,
+                &self.slot_ids,
+                provider,
+                query,
+                k,
+            )
+            .map_err(RlsError::Kernel)?
+        } else {
+            let input = SearchInput {
+                ids: &self.slot_ids,
+                vectors: self.arena.vectors(),
+                dim: self.arena.dim(),
+                query,
+                k,
+            };
+            provider.search(input)?
+        };
 
         if !provider_result_is_valid(&raw, k, &self.visible_id_counts) {
             return Err(RlsError::ProviderResultRejected);
@@ -2695,6 +2737,124 @@ mod tests {
             }
         }
         assert_eq!(hook.context() as *const PolicyContext, &ctx as *const _);
+    }
+
+    // codex-review P1 指摘（Issue #409・PR #435）: `search_with_hnsw` の事前世代
+    // 照合（`pre_generation`）通過後・`read_txn` を開くまでの間に別の書き込みが
+    // コミットされると、`self.arena` は旧世代のまま `read_txn` だけが新世代を
+    // 観測する不整合が起こり得る。この状態のまま `search_or_fallback` を呼ぶと
+    // 旧アリーナから構築した索引が新世代のエントリとして誤登録され、事後照合で
+    // 今回の呼び出し自体は失効させても誤登録キャッシュは残ってしまう。実際の
+    // スレッド間レースは非決定的なため、ここでは `PrefilterSnapshot` の
+    // フィールドを直接構築してレース着地後と同じ状態（グローバル世代は最新に
+    // 一致・`built_table_generation` だけが構築時点のまま乖離）を決定的に
+    // 再現する。修正後は `search_or_fallback` を呼ばず brute-force へ縮退し、
+    // キャッシュへ一切登録しないことを固定する。
+    #[test]
+    fn search_with_hnsw_falls_back_without_registering_cache_when_read_txn_table_generation_diverges_from_snapshot(
+    ) {
+        use crate::hnsw::provider::HnswSearchProvider;
+        use crate::hnsw::{HnswParams, ValidatedHnswParams};
+        use crate::sql::hnsw_cache::{HnswCacheAccess, HnswIndexCache};
+
+        const DIM: usize = 8;
+        // `sql::hnsw_cache::MIN_INDEXED_ROWS`（1,024）超で索引構築対象になる行数。
+        const ROWS: usize = 1_100;
+
+        let dir = tempdir();
+        let storage = open_storage(dir.path());
+        storage
+            .create_table(&schema_for("docs", DIM as u32))
+            .expect("create table");
+
+        for i in 0..ROWS {
+            let mut v = vec![0.0f32; DIM];
+            v[i % DIM] = 1.0;
+            insert(
+                &storage,
+                "docs",
+                i as u64,
+                "tenant-a",
+                Visibility::Public,
+                &v,
+            );
+        }
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let snapshot = PrefilterSnapshot::build(&storage, "docs", &ctx).expect("build snapshot");
+
+        // 別トランザクションで同一行数の更新（行 0 の embedding を差し替え）を
+        // commit し、テーブル世代・グローバル世代を進める。`snapshot` は
+        // 更新前のベクトルのまま固定される。
+        let mut updated = vec![0.0f32; DIM];
+        updated[0] = -1.0;
+        insert(
+            &storage,
+            "docs",
+            0,
+            "tenant-a",
+            Visibility::Public,
+            &updated,
+        );
+
+        let current_generation = storage.current_generation().expect("current generation");
+        let current_table_generation = {
+            let read_txn = storage.db().begin_read().expect("begin read");
+            crate::catalog::table_generation_in_txn(&read_txn, "docs").expect("table generation")
+        };
+        assert_ne!(current_table_generation, snapshot.built_table_generation);
+
+        // レース着地後の状態を直接構築する: 事前世代照合（グローバル世代）は
+        // 通過させつつ、`built_table_generation` だけをスナップショット構築時点の
+        // まま残す。
+        let racy_snapshot = PrefilterSnapshot {
+            arena: snapshot.arena,
+            slot_ids: snapshot.slot_ids.clone(),
+            visible_id_counts: snapshot.visible_id_counts.clone(),
+            built_ctx: snapshot.built_ctx.clone(),
+            built_generation: current_generation,
+            built_table_generation: snapshot.built_table_generation,
+        };
+
+        let params = ValidatedHnswParams::new(HnswParams::default()).expect("valid hnsw params");
+        let hnsw_provider = HnswSearchProvider::new(params);
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: hnsw_provider,
+        };
+        let cpu = CpuScalarProvider;
+
+        let query = vec![1.0f32; DIM];
+        let hits = racy_snapshot
+            .search_with_hnsw(&storage, &ctx, &access, &cpu, &query, 5)
+            .expect("search succeeds via brute-force fallback");
+        assert_eq!(hits.len(), 5);
+
+        // brute-force 縮退が使われ、旧世代の `racy_snapshot.arena` から構築した
+        // 索引が新テーブル世代のエントリとしてキャッシュへ登録されていないこと
+        // （修正前は `builds`/`entries` が非 0 になり得た）。
+        let stats = cache.stats();
+        assert_eq!(stats.builds, 0);
+        assert_eq!(stats.entries, 0);
+
+        // 縮退経路の結果が `racy_snapshot.arena`（旧世代スナップショット）上の
+        // brute-force と一致すること（不可視行を含まない・テナント境界を
+        // 破らないことも `resolve_slot_hits` の写像を経由して確認する）。
+        let expected_raw = {
+            let input = SearchInput {
+                ids: &racy_snapshot.slot_ids,
+                vectors: racy_snapshot.arena.vectors(),
+                dim: racy_snapshot.arena.dim(),
+                query: &query,
+                k: 5,
+            };
+            cpu.search(input).expect("cpu search")
+        };
+        let expected_hits = crate::core::resolve_slot_hits(&racy_snapshot.arena, &expected_raw)
+            .expect("resolve slot hits");
+        assert_eq!(hits, expected_hits);
     }
 
     // TASK-137: fail-closed の回帰確認。

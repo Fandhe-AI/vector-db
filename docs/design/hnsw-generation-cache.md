@@ -159,6 +159,13 @@ SqlArenaCache` と同じ性質）——いずれの計算結果も同じ世代�
   構築失敗の負のキャッシュで再構築連打を防止、`k + stale > MAX_EF` は厳密探索
   （全件 brute-force）へ縮退
 - **依存**: 追加なし（自作 HNSW・`std` のみ）
+- **呼び出し元スナップショットとの世代整合**: `search_or_fallback` は
+  `read_txn` から読んだテーブル世代を信頼して索引を構築・登録するため、
+  呼び出し元が渡す `arena` がその世代のスナップショットであることを保証する
+  責務は呼び出し元にある。`rls.rs::PrefilterSnapshot::search_with_hnsw` は
+  `read_txn` のテーブル世代と `built_table_generation`（スナップショット構築
+  時に読んだテーブル世代）を照合し、不一致なら本モジュールを呼ばず
+  brute-force へ縮退する（Issue #409 codex-review P1 指摘・PR #435）
 
 ## 既知の限界（申し送り。Issue #409 で解消済みの項目は取り消し線）
 
