@@ -954,6 +954,227 @@ fn filtered_distance_uses_subset_shape_and_matches_default_engine_recall() {
     );
 }
 
+/// 可視カーディナリティ比が `full_scan_ratio` 以上（既定 1/10。構築直後は
+/// `visible_in_index == index.len()` で比 1.0）の場合、`FullVisible` 形状は
+/// マスク付き ANN 探索（`search_masked`）側を選び、`plain_scans` を一切
+/// 計上しないまま既定エンジン（brute-force）と同水準の Recall@10 を維持する
+/// こと（Issue #409 受入基準 2「切替閾値の前後で結果が brute-force と同水準」の
+/// ANN 側）。tenant-b の private 行が tenant-a の結果へ混入しないことも併せて
+/// 固定する。
+#[test]
+fn full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants() {
+    let dir = unique_db_path("hnsw-cache-ratio-ann");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    let a_vectors = gen_clustered_corpus(41, DIM as usize, BASE_ROWS, 10);
+    seed_rows(&storage, "tenant-a", 1, &a_vectors, "ratio-ann-a");
+    // tenant-b の private 行（id 空間を tenant-a と分離し、混入の有無を id 範囲
+    // だけで判定できるようにする）。
+    let b_vectors = gen_clustered_corpus(42, DIM as usize, 100, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-ratio-ann-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    // 既定の `full_scan_ratio`（1/10）をそのまま使う。
+    let params = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params");
+    let kind = engine::search_engine::SearchEngineKind::Hnsw(params);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-ratio-ann-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(&ref_storage, "tenant-a", 1, &a_vectors, "ratio-ann-ref-a");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &rows_b, &op_b)
+        .expect("seed ref tenant-b");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &a_vectors[i * (BASE_ROWS / QUERIES)];
+        let got = query_ids(&core, &ctx_a, query, K);
+        let want = query_ids(&ref_core, &ctx_a, query, K);
+        for id in &got {
+            assert!(
+                *id <= BASE_ROWS as u64,
+                "tenant-a result must not include tenant-b row id {id}"
+            );
+        }
+        let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+        total_hits += got.iter().filter(|id| want_set.contains(id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.9,
+        "ANN-side (ratio >= threshold) recall@{K} against default engine must be >= 0.9 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.hits > 0,
+        "ANN-side masked search must be exercised (non-vacuous)"
+    );
+    assert_eq!(
+        stats.plain_scans, 0,
+        "ratio >= full_scan_ratio must never fall back to plain scan"
+    );
+}
+
+/// 可視カーディナリティ比が `full_scan_ratio` 未満（構築後に少数行を削除し
+/// `visible_in_index / index.len()` を閾値未満まで下げるが、再構築閾値
+/// `REBUILD_DELTA_RATIO`〔1/10〕は超えない churn 幅に収める）の場合、
+/// `FullVisible` 形状は plain scan（アリーナ全体の brute-force）側を選び、
+/// 既定エンジンと完全一致する結果を返すこと（Issue #409 受入基準 2 の plain
+/// scan 側）。tenant-b の private 行が混入しないことも併せて固定する。
+#[test]
+fn full_scan_ratio_plain_scan_side_matches_brute_force_and_never_leaks_across_tenants() {
+    let dir = unique_db_path("hnsw-cache-ratio-plain");
+    let _cleanup = CleanupGuard(dir.clone());
+    let storage = Storage::open(&dir).expect("open storage");
+    storage.create_table(&schema(DIM)).expect("create table");
+
+    let a_vectors = gen_clustered_corpus(51, DIM as usize, BASE_ROWS, 10);
+    seed_rows(&storage, "tenant-a", 1, &a_vectors, "ratio-plain-a");
+    let b_vectors = gen_clustered_corpus(52, DIM as usize, 100, 4);
+    let ctx_b =
+        PolicyContext::with_visibilities("tenant-b", [Visibility::Private]).expect("valid tenant");
+    let rows_b: Vec<(u64, RowInput<'_>)> = b_vectors
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            (
+                BASE_ROWS as u64 + 1 + i as u64,
+                RowInput {
+                    tenant_id: "tenant-b",
+                    visibility: Visibility::Private,
+                    embedding: v.as_slice(),
+                    metadata: &[],
+                },
+            )
+        })
+        .collect();
+    let op_b = OperationId::parse("hnsw-cache-ratio-plain-b").expect("valid operation_id");
+    engine::tenant::insert_rows(&storage, "docs", &ctx_b, &rows_b, &op_b).expect("seed tenant-b");
+
+    // `full_scan_ratio` を 95/100 まで引き上げる。削除する行の churn 比（後述）を
+    // `REBUILD_DELTA_RATIO`（1/10）以下に収めつつ、可視カーディナリティ比を
+    // この閾値未満まで下げて plain scan 側を踏ませる。
+    let ratio = engine::hnsw::Ratio {
+        numerator: 95,
+        denominator: 100,
+    };
+    let params = engine::hnsw::ValidatedHnswParams::new(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params")
+        .with_full_scan_ratio(ratio)
+        .expect("valid full_scan_ratio");
+    let kind = engine::search_engine::SearchEngineKind::Hnsw(params);
+    let core = EngineCore::from_storage_with_engine(storage, kind);
+
+    let ref_dir = unique_db_path("hnsw-cache-ratio-plain-ref");
+    let _ref_cleanup = CleanupGuard(ref_dir.clone());
+    let ref_storage = Storage::open(&ref_dir).expect("open ref storage");
+    ref_storage
+        .create_table(&schema(DIM))
+        .expect("create ref table");
+    seed_rows(&ref_storage, "tenant-a", 1, &a_vectors, "ratio-plain-ref-a");
+    engine::tenant::insert_rows(&ref_storage, "docs", &ctx_b, &rows_b, &op_b)
+        .expect("seed ref tenant-b");
+    let ref_core = EngineCore::from_storage(ref_storage, search_engine::default_engine());
+
+    let ctx_a = PolicyContext::new("tenant-a").expect("valid tenant");
+
+    // 索引を構築させる（フィルタなしクエリを 1 本）。
+    let _ = query_ids(&core, &ctx_a, &a_vectors[0], 10);
+    let stats_after_build = core.hnsw_index_cache_stats();
+    assert_eq!(
+        stats_after_build.builds, 1,
+        "unfiltered query must build once"
+    );
+
+    // BASE_ROWS の 6%（72 行、id の末尾側でクエリに使わない範囲）を削除する。
+    // churn 比 0.06 は `REBUILD_DELTA_RATIO`（0.1）以下のため再構築は起きず、
+    // `visible_in_index / index.len()` = 0.94 だけが `full_scan_ratio`（0.95）
+    // 未満まで下がる。
+    let delete_count = (BASE_ROWS * 6) / 100;
+    let delete_start = BASE_ROWS - delete_count;
+    for i in delete_start..BASE_ROWS {
+        let id = i as u64 + 1;
+        let op = OperationId::parse(&format!("hnsw-cache-ratio-plain-del-{i}"))
+            .expect("valid operation_id");
+        core.delete_row(&ctx_a, "docs", id, Some(&op))
+            .expect("delete row on hnsw core");
+        ref_core
+            .delete_row(&ctx_a, "docs", id, Some(&op))
+            .expect("delete row on ref core");
+    }
+
+    const K: usize = 10;
+    const QUERIES: usize = 20;
+    // クエリは削除していない前半範囲からのみ選ぶ（削除済み行を指すクエリを
+    // 避け、比較の焦点を切替判定そのものへ絞る）。
+    let mut total_hits = 0usize;
+    for i in 0..QUERIES {
+        let query = &a_vectors[i * (delete_start / QUERIES)];
+        let got = query_ids(&core, &ctx_a, query, K);
+        let want = query_ids(&ref_core, &ctx_a, query, K);
+        for id in &got {
+            assert!(
+                *id <= BASE_ROWS as u64,
+                "tenant-a result must not include tenant-b row id {id}"
+            );
+            assert!(
+                *id < delete_start as u64 + 1,
+                "deleted row {id} must not appear in results"
+            );
+        }
+        let want_set: std::collections::HashSet<u64> = want.iter().copied().collect();
+        total_hits += got.iter().filter(|id| want_set.contains(id)).count();
+    }
+    let recall = total_hits as f64 / (QUERIES * K) as f64;
+    assert!(
+        recall >= 0.99,
+        "plain-scan-side (ratio < threshold) recall@{K} against default engine must be >= 0.99 (got {recall})"
+    );
+
+    let stats = core.hnsw_index_cache_stats();
+    assert!(
+        stats.plain_scans > 0,
+        "ratio < full_scan_ratio must exercise the plain scan path (non-vacuous)"
+    );
+    assert_eq!(
+        stats.builds, 1,
+        "churn within REBUILD_DELTA_RATIO must not trigger a rebuild"
+    );
+    assert_eq!(
+        stats.subset_searches, 0,
+        "unfiltered FullVisible queries must never use the Subset shape counter"
+    );
+}
+
 /// `precision` モードのフィルタなし DISTANCE クエリ（Bugbot High 指摘。TASK-162・
 /// SEARCH-9）: `HnswIndexCache` を経由せず、既定エンジン（brute-force）の確信度
 /// ゲート判定と完全一致すること。索引済みノードの近似近傍を渡すと Top-2 マージン

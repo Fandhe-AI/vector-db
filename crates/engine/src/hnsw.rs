@@ -2265,6 +2265,55 @@ mod tests {
         .is_err());
     }
 
+    /// `full_scan_ratio` の既定値・不正比拒否（Issue #409。`sql::hnsw_cache::
+    /// search_with_overlay` が可視カーディナリティ切替の判定に使う比率）。
+    /// 分母 0・分子 > 分母は `HnswError::InvalidParams` で fail-closed に拒否される
+    /// ことを固定する（`sql::hnsw_cache` 側の閾値前後テストは
+    /// `tests/hnsw_cache.rs` を参照）。
+    #[test]
+    fn full_scan_ratio_defaults_and_rejects_invalid_ratios() {
+        let v = ValidatedHnswParams::new(HnswParams::default()).expect("valid params");
+        assert_eq!(
+            v.full_scan_ratio(),
+            Ratio {
+                numerator: 1,
+                denominator: 10
+            },
+            "full_scan_ratio must default to 1/10"
+        );
+
+        assert!(
+            v.with_full_scan_ratio(Ratio {
+                numerator: 0,
+                denominator: 0,
+            })
+            .is_err(),
+            "denominator == 0 must be rejected"
+        );
+        assert!(
+            v.with_full_scan_ratio(Ratio {
+                numerator: 11,
+                denominator: 10,
+            })
+            .is_err(),
+            "numerator > denominator must be rejected"
+        );
+
+        let replaced = v
+            .with_full_scan_ratio(Ratio {
+                numerator: 9,
+                denominator: 10,
+            })
+            .expect("valid ratio must be accepted");
+        assert_eq!(
+            replaced.full_scan_ratio(),
+            Ratio {
+                numerator: 9,
+                denominator: 10
+            }
+        );
+    }
+
     #[test]
     fn assign_level_is_deterministic_for_same_seed() {
         let m = 16;
