@@ -73,7 +73,7 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
 | -- | -- | -- |
 | `engine: <token>` | 常時 | `parallel_brute_force` / `cpu_scalar_brute_force` / `hnsw` / `(custom_provider)`（`search_engine_kind() == None`。`with_provider`／`from_storage` 経由） |
 | `hnsw_params: m=<m>,ef_construction=<ef_c>,ef_search=<ef_s>` | `engine: hnsw` のときのみ | 構築時の静的設定値のみ（`full_scan_ratio` は含まない） |
-| `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` |
+| `ann_plan: <token>` | 常時 | `plain_scan_engine` / `plain_scan_precision` / `hnsw_full_visible` / `hnsw_subset` / `unknown_custom_provider`（`engine: (custom_provider)` のときのみ。PR #437 追記） |
 
 `engine` の文字列化は `SearchEngineKind` の既存 `Display`（`full_scan_ratio` を
 含む診断・ログ向け表現）をそのまま使わず、`sql/explain.rs` に専用の網羅 `match`
@@ -117,6 +117,20 @@ exec.rs`（`ORDER BY` 経路の `HINT ORDER` を受理する）からは到達�
   「判断確定後のスコープ外」節）
 - `SearchEngineError` の `ErrorClass`／`wire_code` 正式登録（spec 側ビヘイビア ID
   確定後）
+
+## 追記（PR #437・codex-review P1 指摘対応）
+
+`EngineCore::with_provider`／`from_storage` 経由でカスタム `SearchProvider` を
+注入した場合（`search_engine_kind() == None`）、`EngineCore` は実際に ANN か
+brute-force かを判別できない。従来はこの場合も `hnsw_enabled == false` を
+`classify_ann_plan` へそのまま渡していたため `ann_plan: plain_scan_engine`
+（厳密 brute-force と確定）を返してしまい、`engine: (custom_provider)`
+（実行方式不明）と矛盾する誤表示だった。`AnnShapeInput` へ `engine_kind_unknown`
+フィールドを追加し、`search_engine_kind().is_none()` の場合は新設した
+`AnnPlan::UnknownCustomProvider`（`ann_plan: unknown_custom_provider`）を返す
+よう分岐した。`sql::exec` 側の 4 boolean 導出（`hnsw_full_visible_eligible` 等）
+は `engine_kind_unknown` を参照しない（常に `false` を渡す）ため実行時の適用
+条件は無変更。
 
 ## ポインタ
 

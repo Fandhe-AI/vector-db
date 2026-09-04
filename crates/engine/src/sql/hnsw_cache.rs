@@ -1528,7 +1528,8 @@ fn full_scan_with_arena(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnnPlan {
     /// エンジンが `SearchEngineKind::Hnsw` でない（`hnsw_cache` が `None`）ため
-    /// 常に全件 brute-force。
+    /// 常に全件 brute-force。`SearchEngineKind` が既知（`CpuScalarBruteForce`／
+    /// `ParallelBruteForce`）の場合のみこの分類を返す。
     PlainScanEngine,
     /// HNSW だが `precision` モード（TASK-162・SEARCH-9）のため厳密 brute-force。
     PlainScanPrecision,
@@ -1538,6 +1539,15 @@ pub(crate) enum AnnPlan {
     /// 索引経路・`Subset` 形状（SCALAR 事前フィルタ付き。per-query 写像・
     /// キャッシュ非登録）。
     HnswSubset,
+    /// `EngineCore::search_engine_kind()` が `None`（`with_provider`／
+    /// `from_storage` 経由でカスタム [`crate::kernel::SearchProvider`] を直接
+    /// 注入した構築経路。`kind` と provider の対応をこの構造体自身は検証
+    /// できない）ため、実際に ANN か brute-force かを `EngineCore` 側からは
+    /// 判別できない（codex-review P1 指摘・PR #437。`hnsw_enabled == false` を
+    /// 「厳密 brute-force と確定している」`PlainScanEngine` へ丸めてしまうと、
+    /// カスタム provider が内部で ANN 相当の近似探索を行っていても `EXPLAIN`
+    /// が plain scan と誤断定する）。
+    UnknownCustomProvider,
 }
 
 /// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
@@ -1547,6 +1557,16 @@ pub(crate) struct AnnShapeInput {
     /// `hnsw_cache.is_some()`（`EngineCore::hnsw_state` の有無。
     /// `SearchEngineKind::Hnsw` opt-in 構築時のみ `true`）。
     pub(crate) hnsw_enabled: bool,
+    /// `EngineCore::search_engine_kind().is_none()`（`with_provider`／
+    /// `from_storage` 経由でカスタム provider を直接注入した構築経路。
+    /// Issue #411 追記・codex-review P1 指摘・PR #437）。`hnsw_enabled == false`
+    /// の場合のみ参照し、`true` を「実行方式が不明」（[`AnnPlan::
+    /// UnknownCustomProvider`]）、`false` を「エンジン種別は既知で brute-force
+    /// と確定している」（[`AnnPlan::PlainScanEngine`]）に振り分ける。`sql::exec`
+    /// の 4 boolean（`hnsw_full_visible_eligible` 等）はこの分岐に依存しない
+    /// （`UnknownCustomProvider` も `PlainScanEngine` も等しく `HnswFullVisible`／
+    /// `HnswSubset` ではないため）ため、`sql::exec` は常に `false` を渡してよい。
+    pub(crate) engine_kind_unknown: bool,
     /// `Ranking::Hybrid` かどうか。分類本体（[`classify_ann_plan`]）は
     /// `is_hybrid` を参照しない（`FullVisible`／`Subset` の形状判定自体は
     /// `Ranking` の種別に依存しないため。上記コメント「Issue #410」参照）。
@@ -1567,7 +1587,11 @@ pub(crate) struct AnnShapeInput {
 /// [`tests::classify_ann_plan_matches_exec_eligibility_truth_table`] で固定する。
 pub(crate) fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
     if !input.hnsw_enabled {
-        return AnnPlan::PlainScanEngine;
+        return if input.engine_kind_unknown {
+            AnnPlan::UnknownCustomProvider
+        } else {
+            AnnPlan::PlainScanEngine
+        };
     }
     if input.is_precision {
         return AnnPlan::PlainScanPrecision;
@@ -1622,6 +1646,7 @@ mod tests {
 
                             let plan = classify_ann_plan(AnnShapeInput {
                                 hnsw_enabled,
+                                engine_kind_unknown: false,
                                 is_hybrid,
                                 is_precision,
                                 filters_empty,
@@ -1669,6 +1694,7 @@ mod tests {
     fn classify_ann_plan_plain_scan_engine_when_hnsw_disabled() {
         let plan = classify_ann_plan(AnnShapeInput {
             hnsw_enabled: false,
+            engine_kind_unknown: false,
             is_hybrid: false,
             is_precision: false,
             filters_empty: true,
@@ -1677,10 +1703,29 @@ mod tests {
         assert_eq!(plan, AnnPlan::PlainScanEngine);
     }
 
+    /// codex-review P1 指摘対応（PR #437）: `hnsw_enabled == false` かつ
+    /// `engine_kind_unknown == true`（`EngineCore::search_engine_kind()` が
+    /// `None` を返す `with_provider`／`from_storage` 経由）では、実際に ANN か
+    /// brute-force かを判別できないため `PlainScanEngine`（厳密 brute-force と
+    /// 確定）ではなく `UnknownCustomProvider` を返すことを固定する。
+    #[test]
+    fn classify_ann_plan_unknown_custom_provider_when_engine_kind_unknown() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: false,
+            engine_kind_unknown: true,
+            is_hybrid: false,
+            is_precision: false,
+            filters_empty: true,
+            scalar_prefilter: false,
+        });
+        assert_eq!(plan, AnnPlan::UnknownCustomProvider);
+    }
+
     #[test]
     fn classify_ann_plan_plain_scan_precision_when_precision_mode() {
         let plan = classify_ann_plan(AnnShapeInput {
             hnsw_enabled: true,
+            engine_kind_unknown: false,
             is_hybrid: false,
             is_precision: true,
             filters_empty: true,
@@ -1693,6 +1738,7 @@ mod tests {
     fn classify_ann_plan_hnsw_full_visible_when_filters_empty() {
         let plan = classify_ann_plan(AnnShapeInput {
             hnsw_enabled: true,
+            engine_kind_unknown: false,
             is_hybrid: false,
             is_precision: false,
             filters_empty: true,
@@ -1705,6 +1751,7 @@ mod tests {
     fn classify_ann_plan_hnsw_subset_when_scalar_prefilter() {
         let plan = classify_ann_plan(AnnShapeInput {
             hnsw_enabled: true,
+            engine_kind_unknown: false,
             is_hybrid: false,
             is_precision: false,
             filters_empty: false,

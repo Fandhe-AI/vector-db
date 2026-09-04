@@ -2442,6 +2442,20 @@ impl EngineCore {
                 let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
                     crate::sql::hnsw_cache::AnnShapeInput {
                         hnsw_enabled: self.hnsw_state.is_some(),
+                        // codex-review P1 指摘対応（PR #437）: `with_provider`／
+                        // `from_storage` 経由でカスタム provider を注入した場合
+                        // （`self.search_engine_kind() == None`）、`EngineCore`
+                        // は実行方式が ANN か brute-force かを判別できない。
+                        // `hnsw_enabled == false` を無条件に「厳密 brute-force
+                        // と確定している」`AnnPlan::PlainScanEngine` へ丸めると、
+                        // `engine: (custom_provider)` としながら実行方式を
+                        // plain scan と断定してしまい誤表示になる（既知の
+                        // `SearchEngineKind::CpuScalarBruteForce`／
+                        // `ParallelBruteForce` は `PlainScanEngine` のまま
+                        // 正確）。ここで `search_engine_kind().is_none()` を
+                        // 併せて渡し、`classify_ann_plan` 側で
+                        // `AnnPlan::UnknownCustomProvider` へ振り分ける。
+                        engine_kind_unknown: self.search_engine_kind().is_none(),
                         is_hybrid: true,
                         is_precision: planned.mode().mode()
                             == crate::sql::mode::SearchMode::Precision,

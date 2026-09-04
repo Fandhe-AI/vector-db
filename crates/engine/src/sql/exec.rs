@@ -471,6 +471,13 @@ pub(crate) fn execute_statement_with_cache(
     let ann_plan =
         crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
             hnsw_enabled: hnsw_cache.is_some(),
+            // Issue #411 追記（codex-review P1 指摘・PR #437）:
+            // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
+            // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
+            // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
+            // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
+            // `false`（「エンジン種別は既知」）を渡す。
+            engine_kind_unknown: false,
             is_hybrid,
             is_precision,
             filters_empty,

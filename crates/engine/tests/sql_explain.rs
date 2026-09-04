@@ -191,11 +191,11 @@ fn explain_reports_search_terms_and_hints_and_mode() {
             "mode: recall".to_string(),
             "mode_source: default".to_string(),
             // Issue #411: `EngineCore::from_storage`（provider を直接注入・
-            // `kind` 不明）経由のため `engine: (custom_provider)`。既定エンジン
-            // opt-in（`SearchEngineKind::Hnsw` 以外）はいずれも `ann_plan:
-            // plain_scan_engine`。
+            // `kind` 不明）経由のため `engine: (custom_provider)`。codex-review
+            // P1 指摘対応（PR #437）: 実行方式を判別できないため `ann_plan:` も
+            // `unknown_custom_provider`。
             "engine: (custom_provider)".to_string(),
-            "ann_plan: plain_scan_engine".to_string(),
+            "ann_plan: unknown_custom_provider".to_string(),
         ]
     );
 }
@@ -229,7 +229,7 @@ fn explain_uses_none_label_for_absent_hints() {
             "mode: recall".to_string(),
             "mode_source: default".to_string(),
             "engine: (custom_provider)".to_string(),
-            "ann_plan: plain_scan_engine".to_string(),
+            "ann_plan: unknown_custom_provider".to_string(),
         ]
     );
 }
@@ -654,9 +654,12 @@ fn seeded_hnsw_core(path: &std::path::Path) -> EngineCore {
 }
 
 #[test]
-fn explain_reports_custom_provider_engine_and_plain_scan_engine_ann_plan() {
+fn explain_reports_custom_provider_engine_and_unknown_custom_provider_ann_plan() {
     // `EngineCore::from_storage`（provider 直接注入・`kind` 不明）は
     // `search_engine_kind() == None` となり `engine: (custom_provider)` を返す。
+    // codex-review P1 指摘対応（PR #437）: 実際に ANN か brute-force かを
+    // `EngineCore` 側から判別できないため、`ann_plan:` も
+    // `unknown_custom_provider`（`plain_scan_engine` へ丸めない）。
     let path = unique_db_path("sql-explain-engine-custom-provider");
     let _guard = CleanupGuard(path.clone());
     let storage = seeded_storage(&path);
@@ -677,7 +680,7 @@ fn explain_reports_custom_provider_engine_and_plain_scan_engine_ann_plan() {
 
     let lines = explain_result_lines(outcome);
     assert_eq!(lines[lines.len() - 2], "engine: (custom_provider)");
-    assert_eq!(lines[lines.len() - 1], "ann_plan: plain_scan_engine");
+    assert_eq!(lines[lines.len() - 1], "ann_plan: unknown_custom_provider");
 }
 
 #[test]
@@ -872,6 +875,7 @@ fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
         "plain_scan_precision",
         "hnsw_full_visible",
         "hnsw_subset",
+        "unknown_custom_provider",
     ];
 
     let path = unique_db_path("sql-explain-hnsw-closed-vocab");

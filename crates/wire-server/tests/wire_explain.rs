@@ -121,8 +121,10 @@ fn explain_returns_query_plan_column_and_expected_rows() {
         "mode_source: default",
         // Issue #411: `new_core_with_docs_table` は `EngineCore::from_storage`
         // （provider 直接注入・`kind` 不明）経由のため `engine: (custom_provider)`。
+        // codex-review P1 指摘対応（PR #437）: 実行方式を判別できないため
+        // `ann_plan:` も `unknown_custom_provider`。
         "engine: (custom_provider)",
-        "ann_plan: plain_scan_engine",
+        "ann_plan: unknown_custom_provider",
     ];
     for expected in expected_lines {
         let row = read_data_row(&mut stream);
@@ -154,7 +156,7 @@ fn explain_reports_query_clause_mode_source() {
     assert_eq!(rows[4], "mode: precision");
     assert_eq!(rows[5], "mode_source: query_clause");
     assert_eq!(rows[6], "engine: (custom_provider)");
-    assert_eq!(rows[7], "ann_plan: plain_scan_engine");
+    assert_eq!(rows[7], "ann_plan: unknown_custom_provider");
 
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);

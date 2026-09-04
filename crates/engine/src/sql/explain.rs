@@ -83,6 +83,11 @@ fn ann_plan_token(plan: AnnPlan) -> &'static str {
         AnnPlan::PlainScanPrecision => "plain_scan_precision",
         AnnPlan::HnswFullVisible => "hnsw_full_visible",
         AnnPlan::HnswSubset => "hnsw_subset",
+        // codex-review P1 指摘対応（PR #437）: `engine: (custom_provider)`
+        // （`kind == None`）のときに限り到達する。実際に ANN か brute-force
+        // かを `EngineCore` 側から判別できない旨を明示し、`plain_scan_engine`
+        // （厳密 brute-force と確定）と区別する。
+        AnnPlan::UnknownCustomProvider => "unknown_custom_provider",
     }
 }
 
@@ -258,16 +263,23 @@ mod tests {
             QueryExpansion::default(),
             ResolvedMode::new(SearchMode::Recall, ModeSource::Default),
         );
+        // codex-review P1 指摘対応（PR #437）: `kind == None` の実運用ペアリングは
+        // `AnnPlan::UnknownCustomProvider`（`core.rs` の `EXPLAIN` アームが
+        // `engine_kind_unknown: self.search_engine_kind().is_none()` を渡すことで
+        // 到達する）。
         let engine = ExplainEngine {
             kind: None,
-            ann_plan: AnnPlan::PlainScanEngine,
+            ann_plan: AnnPlan::UnknownCustomProvider,
         };
 
         let result = build_explain_result(&planned, &engine);
 
         let last = result.rows.len() - 1;
         assert_eq!(cell_text(&result, last - 1), "engine: (custom_provider)");
-        assert_eq!(cell_text(&result, last), "ann_plan: plain_scan_engine");
+        assert_eq!(
+            cell_text(&result, last),
+            "ann_plan: unknown_custom_provider"
+        );
     }
 
     #[test]
@@ -297,12 +309,13 @@ mod tests {
     }
 
     #[test]
-    fn build_explain_result_reports_all_four_ann_plan_tokens() {
+    fn build_explain_result_reports_all_five_ann_plan_tokens() {
         for (plan, expected) in [
             (AnnPlan::PlainScanEngine, "plain_scan_engine"),
             (AnnPlan::PlainScanPrecision, "plain_scan_precision"),
             (AnnPlan::HnswFullVisible, "hnsw_full_visible"),
             (AnnPlan::HnswSubset, "hnsw_subset"),
+            (AnnPlan::UnknownCustomProvider, "unknown_custom_provider"),
         ] {
             let planned = PlannedQuery::new(
                 QueryExpansion::default(),
@@ -335,6 +348,7 @@ mod tests {
             "plain_scan_precision",
             "hnsw_full_visible",
             "hnsw_subset",
+            "unknown_custom_provider",
         ];
 
         let hnsw_params = ValidatedHnswParams::new(HnswParams::default())
@@ -360,7 +374,12 @@ mod tests {
                 Some(SearchEngineKind::Hnsw(hnsw_params)),
                 AnnPlan::PlainScanPrecision,
             ),
-            (None, AnnPlan::PlainScanEngine),
+            // codex-review P1 指摘対応（PR #437）: `kind == None`（`with_provider`／
+            // `from_storage` 経由）の実運用ペアリングは `AnnPlan::
+            // UnknownCustomProvider`（`core.rs` の `EXPLAIN` アームが
+            // `engine_kind_unknown: self.search_engine_kind().is_none()` を渡す
+            // ことで到達する）。
+            (None, AnnPlan::UnknownCustomProvider),
         ] {
             let planned = PlannedQuery::new(
                 QueryExpansion::default(),
