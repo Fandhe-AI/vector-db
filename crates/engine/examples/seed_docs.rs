@@ -7,12 +7,20 @@
 //! クエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
 //! 引数はローカル運用者の入力であり wire 経由の untrusted 入力ではないため、
 //! 解析失敗は `expect` で即終了させる。
-use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+//!
+//! 中断からの再開: 合成文書は決定的（固定シード）で、バッチごとの `operation_id`
+//! （`seed-batch-<n>`）も決定的なため、同じ `<rows> <dim>` で再実行すると既存の
+//! `docs` テーブル（スキーマ一致時のみ再利用）へ未投入バッチだけを追加する。
+//! 投入済みバッチは台帳の同一内容再送（`DuplicateOperationId`）として検出しスキップ
+//! する。`<rows>` や `<dim>` を変えて再実行した場合は内容不一致
+//! （`OperationIdContentMismatch`）またはスキーマ不一致として fail-closed に停止する。
+use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::embedding::{Embedder, HashingEmbedder};
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::{encode_scalar_columns, Value};
 use engine::storage::{RowInput, Storage, Visibility};
+use engine::tenant::TenantWriteError;
 use std::time::Instant;
 
 struct Lcg(u64);
@@ -252,7 +260,21 @@ fn main() {
                     ColumnDef::new("body", ColumnType::Text, false),
                 ],
             );
-            storage.create_table(&schema).expect("create table");
+            match storage.create_table(&schema) {
+                Ok(()) => {}
+                Err(CatalogError::TableAlreadyExists(_)) => {
+                    let existing = storage.get_table_schema("docs").expect("get_table_schema");
+                    if existing != schema {
+                        eprintln!(
+                            "error: table docs already exists with a different schema; \
+                             use a new <db> path or the same <dim>"
+                        );
+                        std::process::exit(2);
+                    }
+                    eprintln!("resuming: table docs exists; batches already recorded are skipped");
+                }
+                Err(e) => panic!("create table: {e}"),
+            }
             let ctx_a = PolicyContext::new("tenant-a").expect("ctx");
             let ctx_b = PolicyContext::new("tenant-b").expect("ctx");
             let mut rng = Lcg(20260831);
@@ -327,8 +349,20 @@ fn main() {
                     })
                     .collect();
                 let op = OperationId::parse(&format!("seed-batch-{batch_no}")).expect("op");
-                engine::tenant::insert_rows(&storage, "docs", ctx, &inputs, &op)
-                    .expect("insert_rows");
+                match engine::tenant::insert_rows(&storage, "docs", ctx, &inputs, &op) {
+                    Ok(()) => {}
+                    Err(TenantWriteError::DuplicateOperationId) => {
+                        eprintln!("skip: batch {batch_no} already recorded");
+                    }
+                    Err(TenantWriteError::OperationIdContentMismatch) => {
+                        eprintln!(
+                            "error: batch {batch_no} was recorded with different content; \
+                             rerun with the same <rows> <dim> or use a new <db> path"
+                        );
+                        std::process::exit(2);
+                    }
+                    Err(e) => panic!("insert_rows: {e}"),
+                }
                 if tenant_tag == "b" {
                     rows_b += end - id + 1;
                 } else {
