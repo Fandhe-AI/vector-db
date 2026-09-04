@@ -24,6 +24,7 @@ Rust 製のローカルファースト・vector 特化クエリ DB の実装リ�
 - **依存最小方針**: 依存の追加・更新は必ずユーザー承認を経て行い、`=x.y.z` 完全固定で管理する
 - **バッチ検索の GPU 経路**: 一括インデクシング専用のバッチ検索（TASK-128〜130）は `wgpu`（=30.0.1・依存追加はオーナー承認済み〔2026-08-26〕）による実 GPU バックエンドを持ち、初期化失敗・実行時エラー時は CPU-SIMD 経路へ fail-closed に縮退する（詳細: [`docs/design/gpu-batch-wgpu-enablement.md`](docs/design/gpu-batch-wgpu-enablement.md)）。単発クエリ経路は引き続き CPU-SIMD のみ
 - **hybrid 検索の疎索引**: BM25 疎索引（`SparseIndex`）は転置索引（posting list）＋可視ビットマップ 1 パス走査方式で、RLS 可視集合へ統計（df・N・avgdl）自体を縮約する fail-closed 設計（posting へのスコアリング走査のみがコーパス文書数への線形走査から脱却し、可視集合走査 `O(|visible_ids|)`・スコアアキュムレータ初期化 `O(N)` は残る。詳細: [`docs/design/sparse-inverted-index.md`](docs/design/sparse-inverted-index.md)）
+- **ANN 索引（opt-in）**: 既定の検索エンジンは厳密最近傍（brute-force）のまま不変。`SearchEngineKind::Hnsw`（自作 HNSW・依存追加なし）を明示的に選択したときのみ opt-in で有効化される（ADR: [`docs/design/ann-index-adoption.md`](docs/design/ann-index-adoption.md) B 案）。適用状況は `EXPLAIN` の `engine:`／`ann_plan:` 行で確認できる。前後比較・opt-in 手順の詳細は下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照
 
 詳細なビヘイビア（106 件・12 領域）は spec リポの [`04-behavior/`](https://github.com/Fandhe-AI/vector-db-spec/tree/main/04-behavior) を唯一の正（SSOT）とします。
 
@@ -200,7 +201,9 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 
 `cargo run --release -p engine --example feature_bench` は SQL 表層・ベクトル
 検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を
-横断的に計測し JSON を stdout へ出力します（依存追加なし・std のみ）。
+横断的に計測し JSON を stdout へ出力します（依存追加なし・std のみ。
+`BENCH_FEATURE_ENGINE`／`BENCH_FEATURE_SCALE` による ANN opt-in・規模上書きは
+下記「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節を参照）。
 
 hybrid 疎索引の転置索引化（Issue #386 Phase 1・#388〜#392）の設計判断・
 データ構造・維持契約・外部実装参照（tantivy・qdrant）、および上記 2 つの
@@ -346,6 +349,28 @@ gh workflow run recall.yml --ref main
 ```
 
 各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください。
+
+### ANN（HNSW）opt-in 手順と前後比較（Issue #413）
+
+ANN opt-in は現状 Rust API のみです（`wire-server` の CLI フラグ・テーブルカタログ属性による opt-in 露出は未実装）。
+
+```rust
+let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())?;
+let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
+```
+
+`crates/engine/examples/feature_bench.rs`（13 フェーズ通し計測）・`crates/engine/benches/knn_profile_bench.rs`（`make bench-knn-profile`）は、いずれも ANN opt-in・規模スケールを env 変数で切り替えられます。
+
+- `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）。未知値は fail-closed で拒否
+- `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
+
+```bash
+BENCH_FEATURE_ENGINE=hnsw cargo run --release -p engine --example feature_bench
+BENCH_FEATURE_ENGINE=hnsw BENCH_FEATURE_SCALE=4 cargo run --release -p engine --example feature_bench  # 100,000 行
+BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
+```
+
+既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
 
 ### `precision` 評価ハーネス（TASK-163）
 

@@ -283,7 +283,7 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 | `PolicyContext::is_visible` 単一照合パス・fail-closed の維持 | #409・#410（RLS 切替契約は spec 側 TASK・ビヘイビア ID 確定後に着手） |
 | SEARCH 系 Recall ゲートを ANN 有効経路でも同一閾値で通過 | #412（実装済み。`recall.yml` への機械判定可能な接続を含む。「実装ガイド」節の対応表「Recall 受け入れ・継続的ゲート接続」行参照。詳細・実測は `docs/design/ann-recall-gate-verification.md` 参照） |
 | TASK-121 系増分回帰の ANN 対応 | #408・#412（実装済み。`docs/design/ann-recall-gate-verification.md`「TASK-121 系」節） |
-| （B 案条件 1）損益分岐点の実測 | #413（事後の前後比較） |
+| （B 案条件 1）損益分岐点の実測 | #413（実施済み。`docs/design/hnsw-index.md` 参照。フィルタの選択性が損益分岐の主要因で、行数規模〔25k〜100k〕は副次的という所見。専有環境・広い規模ラダーでの再測定は同 doc「スコープ外・申し送り」節へ申し送り） |
 | 基盤（HNSW 構築・探索・並列化） | #404・#405・#406 |
 
 ## 参照した外部実装（手法名・ライセンスのみ・コード転記なし）
@@ -311,7 +311,7 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 - HNSW 索引の永続化（「実装ガイド」の対応表「永続化」行参照）
 - テーブル単位カタログ属性による opt-in・`wire-server` CLI オプション露出
 - pure Rust ANN クレート（`hnsw_rs`・`instant-distance` 等）の個別評価
-- README「実装方針（要点）」の opt-in 手順・公開境界拡張（#413 が担当）
+- README「実装方針（要点）」の opt-in 手順・公開境界拡張（#413 が担当。実施済み。README「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節参照）
 - CLAUDE.md の `- ステータス:` 行が 2 本重複し内容が一部乖離している件の
   統合（本 Issue のスコープ外。両行を同一内容へ更新するに留める）
 
