@@ -124,8 +124,14 @@ pub struct HnswIndexCacheStats {
     pub plain_scans: u64,
     /// マスク付き探索（[`crate::hnsw::HnswIndex::search_masked`]）の結果件数が
     /// `min(k, visible_in_index)` に満たず plain scan へ縮退した回数（Issue #409。
-    /// `fallbacks` の内数）。
+    /// `fallbacks` の内数）。`mask_splits_graph` とは互いに排他（分断検知時は
+    /// `search_masked` 自体を呼ばないため、本フィールドには計上されない）。
     pub masked_short: u64,
+    /// マスクの受理ノードが複数の連結成分に分かれ、`search_masked` を呼ぶ前に
+    /// plain scan へ縮退した回数（`crate::hnsw::HnswIndex::is_mask_fully_reachable`
+    /// による世代毎 1 回の分断検査。codex-review P2・Cursor Bugbot High 指摘対応・
+    /// PR #435。`fallbacks` の内数。`masked_short` とは互いに排他）。
+    pub mask_splits_graph: u64,
     /// `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE。Issue #409）でマスク付き
     /// 探索が縮退なしで完走した回数。`hits` とは独立に数える（`hits` は
     /// `FullVisible` 形状の `Ready` 到達かつ縮退なしの定義を変えない）。
@@ -230,6 +236,17 @@ struct Overlay {
     /// （`base.index.len() - stale_nodes` と一致）。可視カーディナリティ切替
     /// （`sql::hnsw_cache::search_with_overlay`）の分子に使う。
     visible_in_index: usize,
+    /// `visible_mask` の受理ノード全体が、単一 entry point からの誘導部分
+    /// グラフ（層 0）から到達可能かどうか（`false` = 到達可能・分断なし。
+    /// `crate::hnsw::HnswIndex::is_mask_fully_reachable` を本フィールド計算
+    /// 時に 1 回だけ呼ぶ——`Overlay::compute` 自体が既に `visible_mask` の
+    /// 構築で O(N) を要するため、追加で 1 回呼んでも漸近コストは増えない。
+    /// クエリ毎の全域 BFS を避けるための償却（Cursor Bugbot High 指摘・
+    /// codex-review P2 指摘・PR #435。詳細は `docs/design/
+    /// hnsw-rls-cardinality-switch.md`「masked_short」節参照）。`true` なら
+    /// `search_with_overlay` は `search_masked` を呼ばず直接 plain scan へ
+    /// 縮退する。
+    mask_splits_graph: bool,
 }
 
 impl Overlay {
@@ -287,6 +304,13 @@ impl Overlay {
             }
         }
         let visible_in_index = base.index.len().saturating_sub(stale_nodes);
+        // 世代（マスク）が変わるたび 1 回だけの分断検査（§`mask_splits_graph`
+        // ドキュメンテーションコメント参照）。`visible_in_index == 0` なら
+        // マスクの受理ノードが 0 件で `is_mask_fully_reachable` が自明に
+        // `true`（分断なし）を返すため、`search_with_overlay` 側の可視
+        // カーディナリティ切替（`index_len == 0 || below_ratio`）が先に
+        // plain scan を選ぶ既存契約と矛盾しない。
+        let mask_splits_graph = !base.index.is_mask_fully_reachable(&visible_mask);
         Overlay {
             generation,
             arena_len: arena.len(),
@@ -296,6 +320,7 @@ impl Overlay {
             delta_vectors,
             visible_mask,
             visible_in_index,
+            mask_splits_graph,
         }
     }
 
@@ -400,6 +425,7 @@ pub(crate) struct HnswIndexCache {
     fallbacks: AtomicU64,
     plain_scans: AtomicU64,
     masked_short: AtomicU64,
+    mask_splits_graph: AtomicU64,
     subset_searches: AtomicU64,
 }
 
@@ -430,6 +456,7 @@ impl HnswIndexCache {
             fallbacks: AtomicU64::new(0),
             plain_scans: AtomicU64::new(0),
             masked_short: AtomicU64::new(0),
+            mask_splits_graph: AtomicU64::new(0),
             subset_searches: AtomicU64::new(0),
         }
     }
@@ -704,6 +731,7 @@ impl HnswIndexCache {
             fallbacks: self.fallbacks.load(Ordering::Relaxed),
             plain_scans: self.plain_scans.load(Ordering::Relaxed),
             masked_short: self.masked_short.load(Ordering::Relaxed),
+            mask_splits_graph: self.mask_splits_graph.load(Ordering::Relaxed),
             subset_searches: self.subset_searches.load(Ordering::Relaxed),
             entries,
         }
@@ -853,6 +881,11 @@ pub(crate) fn search_or_fallback(
                         identity_mask.set(node_u32);
                     }
                 }
+                // 恒等マスク（全ノード受理）でも分断検査は省略しない
+                // （§`Overlay::mask_splits_graph` ドキュメンテーションコメント
+                // 参照。`repair_reachability` が層 0 の entry point 起点到達性を
+                // 保証する契約に依拠しすぎず、構築直後の索引でも実際に検証する）。
+                let identity_splits_graph = !new_base.index.is_mask_fully_reachable(&identity_mask);
                 let identity_overlay = Arc::new(Overlay {
                     generation: current_generation,
                     arena_len: arena.len(),
@@ -862,6 +895,7 @@ pub(crate) fn search_or_fallback(
                     delta_vectors: Vec::new(),
                     visible_mask: identity_mask,
                     visible_in_index: new_base.index.len(),
+                    mask_splits_graph: identity_splits_graph,
                 });
                 record_overlay_for(access, table, &new_base, Arc::clone(&identity_overlay));
                 return search_with_overlay(
@@ -1203,6 +1237,21 @@ fn search_with_overlay(
     if index_len == 0 || below_ratio {
         access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
         access.cache.plain_scans.fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+
+    // マスクが複数の連結成分に分かれ、単一 entry point からの探索では受理
+    // ノード全体を辿り切れないことが `Overlay::compute`（世代毎に 1 回）で
+    // 判明済みの場合、`search_masked` 自体を呼ばず直ちに plain scan へ縮退
+    // する（Cursor Bugbot High／codex-review P2 指摘・PR #435。§`Overlay::
+    // mask_splits_graph` ドキュメンテーションコメント参照。`masked_short` と
+    // 区別できるよう独立カウンタへ計上する）。
+    if overlay.mask_splits_graph {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .mask_splits_graph
+            .fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }
 
@@ -1674,6 +1723,7 @@ mod tests {
             delta_vectors: Vec::new(),
             visible_mask,
             visible_in_index,
+            mask_splits_graph: false,
         });
 
         let access = HnswCacheAccess {
@@ -1747,6 +1797,7 @@ mod tests {
             delta_vectors: Vec::new(),
             visible_mask,
             visible_in_index,
+            mask_splits_graph: false,
         });
         let access = HnswCacheAccess {
             storage: &storage,
@@ -1924,6 +1975,107 @@ mod tests {
         assert_eq!(stats.build_failures, 1);
     }
 
+    /// 恒等マスク（warm `FullVisible`。フィルタなし DISTANCE で可視行全体が
+    /// そのままアリーナになる形状）＋ `repair_reachability` 済みグラフでは、
+    /// [`crate::hnsw::HnswIndex::is_mask_fully_reachable`]（`Overlay::compute`
+    /// が世代毎に 1 回だけ呼ぶ分断検査）が「分断なし」と判定し、`search_masked`
+    /// によるマスク付き ANN 探索がクエリ毎に実際に使われる（`masked_short`・
+    /// `mask_splits_graph` いずれにも計上されず plain scan へ縮退しない）ことを
+    /// 固定する（Cursor Bugbot High／codex-review P2 指摘対応・PR #435）。
+    ///
+    /// 1 回目のクエリは `Lookup::Miss` から新規構築（`Overlay::compute` 経由の
+    /// 恒等オーバーレイ。`search_or_fallback` の `NeedOverlay` 相当分岐）、
+    /// 2 回目は `Lookup::Ready`（`hits` 計上経路）を通し、いずれも ANN 経路が
+    /// 使われることを確認する——このテストが red になる場合、
+    /// `repair_reachability` は層 0 の entry point 起点到達性を保証していない
+    /// ことになる（本関数末尾のコメント参照）。
+    #[test]
+    fn is_mask_fully_reachable_accepts_identity_mask_on_a_repaired_graph_and_ann_path_is_used() {
+        let path = unique_db_path("hnsw-cache-identity-mask-ann-path");
+        let _cleanup = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage, "docs", 4);
+        let c = ctx("tenant-a");
+
+        // MIN_INDEXED_ROWS 件・複数層が生じ得る規模のコーパス（HNSW_BUILD_SEED
+        // に基づく決定的なレベル割当で、この件数なら通常複数層になる）。
+        let embeddings: Vec<[f32; 4]> = (0..MIN_INDEXED_ROWS)
+            .map(|i| {
+                [
+                    (i as f32) * 0.001,
+                    ((i * 7) % 997) as f32 * 0.001,
+                    ((i * 13) % 991) as f32 * 0.001,
+                    ((i * 29) % 983) as f32 * 0.001,
+                ]
+            })
+            .collect();
+        let rows: Vec<(u64, RowInput<'_>)> = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                (
+                    i as u64,
+                    RowInput {
+                        tenant_id: "tenant-a",
+                        visibility: Visibility::Public,
+                        embedding: e.as_slice(),
+                        metadata: &[],
+                    },
+                )
+            })
+            .collect();
+        let op_id =
+            crate::recovery::required_op_id::OperationId::parse("hnsw-cache-identity-mask-ann")
+                .expect("valid operation_id");
+        crate::tenant::insert_rows(&storage, "docs", &c, &rows, &op_id).expect("bulk insert");
+
+        let read_txn = storage.db().begin_read().unwrap();
+        let arena = build_arena(&read_txn, "docs", &c);
+        assert!(arena.len() >= MIN_INDEXED_ROWS);
+        let slot_ids: Vec<u64> = (0..arena.len() as u64).collect();
+
+        let cache = HnswIndexCache::new();
+        let access = HnswCacheAccess {
+            storage: &storage,
+            cache: &cache,
+            provider: HnswSearchProvider::new(crate::hnsw::ValidatedHnswParams::default()),
+        };
+        let provider = crate::kernel::CpuScalarProvider;
+        let query = [0.5, 0.25, 0.1, 0.9];
+
+        let first = search_or_fallback(
+            &access, &read_txn, "docs", &c, &arena, &slot_ids, &provider, &query, 10,
+        );
+        assert!(
+            first.is_ok(),
+            "warm-up query (Miss -> build) should succeed"
+        );
+
+        let second = search_or_fallback(
+            &access, &read_txn, "docs", &c, &arena, &slot_ids, &provider, &query, 10,
+        );
+        assert!(second.is_ok(), "second query (Ready) should succeed");
+
+        let stats = cache.stats();
+        assert!(
+            stats.hits >= 1,
+            "identity mask must be judged fully reachable (mask_splits_graph == \
+             false) so the Ready-path query reaches the ANN search_masked call \
+             instead of degrading to plain scan; if this fails, \
+             repair_reachability does not guarantee level-0 entry-point-anchored \
+             reachability and the graph-split detection must descend through \
+             levels instead of a level-0-only BFS"
+        );
+        assert_eq!(
+            stats.mask_splits_graph, 0,
+            "identity mask on a repaired graph must not be reported as split"
+        );
+        assert_eq!(
+            stats.masked_short, 0,
+            "ANN search must complete without falling short on this corpus"
+        );
+    }
+
     #[test]
     fn record_overlay_for_marks_uncacheable_when_oversized() {
         // Cursor Bugbot 指摘対応（PR #434「Oversized overlay skips negative
@@ -1965,6 +2117,7 @@ mod tests {
             delta_vectors,
             visible_mask,
             visible_in_index,
+            mask_splits_graph: false,
         });
         assert!(overlay.approx_heap_bytes() > MAX_HNSW_CACHE_TOTAL_BYTES);
 

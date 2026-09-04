@@ -1233,30 +1233,71 @@ impl HnswIndex {
         best.map(|(id, _)| id)
     }
 
-    /// [`Self::search_masked`] の到達可能性検証（codex-review P2 指摘対応・
-    /// PR #435）。単一 entry point からの誘導部分グラフ探索では、候補マスクが
-    /// 複数の連結成分に分かれている場合、entry 側の成分だけで結果件数
-    /// （`min(k, visible_in_index)`）が満たされてしまい、探索が一度も訪れて
-    /// いない別成分により近い受理ノードが存在していても、件数検査
-    /// （`sql::hnsw_cache::search_with_overlay` の `masked_short`）を素通り
-    /// してしまう。本関数は層 0 の隣接リストのみを辿る BFS（ベクトルへの
-    /// アクセス・スコア計算は一切行わない、辺の走査のみ）で `start` から
-    /// 到達可能な受理ノード数を数え、`target` 件（＝マスクの受理ノード総数）
-    /// に達した時点で早期終了する。辿るのは実探索
-    /// （[`Self::search_layer`]／[`Self::greedy_descend_masked`]）と同じ規約
-    /// ——非受理ノードは訪問済みにするのみで、その先の隣接ノードへは一切
-    /// 辿らない（Issue #431 是正・`search_masked_does_not_traverse_through_
-    /// a_rejected_bridge_node` で固定した契約と同じ）——に限定し、実探索が
-    /// 構造的に到達できないノードを「到達可能」と誤判定しないようにする。
+    /// [`Self::search_masked`]・[`Self::is_mask_fully_reachable`] が共有する
+    /// 探索起点選択（codex-review P2 指摘対応・PR #435 で分離）。固定
+    /// entry point（[`Self::entry_point`]）が `mask` に受理されていればそれを、
+    /// されていなければ [`Self::find_alternate_entry`] が選ぶ代替起点を返す。
+    /// 受理ノードが 1 つも無ければ `None`。
     ///
-    /// 戻り値が `target` 未満なら、`start` から到達不能な受理ノードがマスク中に
-    /// 存在する（＝マスクが複数の連結成分に分かれている）ことが確定し、呼び
-    /// 出し元は件数検査の結果に関わらず「探索が尽くされていない」と判断すべき
-    /// （`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
-    /// `visited` は呼び出し元が所有する [`HnswSearchScratch::visited`] を再利用
-    /// する（本関数の呼び出し直後に `search_layer` が同じスクラッチを
-    /// リセットしてから使うため、ここでの破壊的変更は後続へ影響しない）。
-    fn accepted_reachable_at_least(
+    /// 到達可能性の検査（`is_mask_fully_reachable`）と実探索
+    /// （`search_masked`）が異なる起点を使うと、検査が「探索が実際に使う
+    /// 起点」とは無関係な結果を返しかねない（Cursor Bugbot High 指摘・
+    /// PR #435）。本関数を両者から呼ぶことで起点選択を構造的に一致させる。
+    fn search_entry_for_mask(&self, mask: &NodeMask) -> Option<u32> {
+        match self.entry_point {
+            Some(e) if mask.get(e) => Some(e),
+            Some(_) => self.find_alternate_entry(mask),
+            None => None,
+        }
+    }
+
+    /// マスクの受理ノード全体が、[`Self::search_entry_for_mask`] が選ぶ単一
+    /// entry point からの誘導部分グラフ（層 0 の隣接リストのみを辿る。
+    /// ベクトルへのアクセス・スコア計算は一切行わない）から到達可能かどうかを
+    /// 判定する（codex-review P2 指摘対応・PR #435）。
+    ///
+    /// マスクが複数の連結成分に分かれている場合、単一 entry point からの
+    /// 探索は entry 側の成分にしか到達できず、`search_masked` の件数検査
+    /// （`sql::hnsw_cache::search_with_overlay` の `masked_short`）だけでは
+    /// 「別成分により近い受理ノードを一度も探索していない」ケースを
+    /// 検出できない。本関数はその分断の有無を判定する。
+    ///
+    /// **クエリ毎には呼ばない契約**（Cursor Bugbot High 指摘・PR #435:
+    /// 旧実装は `search_masked` からクエリ毎に層 0 の全受理ノード BFS を
+    /// 呼んでおり、サブ線形探索の前に必ず O(V+E) の全域探索が発生していた）。
+    /// 呼び出し元（`sql::hnsw_cache::Overlay::compute`）はマスクが変わる
+    /// たび（世代が進むたび）1 回だけ本関数を呼び、結果を `Overlay` へ
+    /// キャッシュする——`Overlay::compute` はマスク自体の構築で既に
+    /// O(N) を要するため、本関数を追加で 1 回呼んでも漸近コストは増えない。
+    ///
+    /// 辿るのは実探索（[`Self::search_layer`]／[`Self::greedy_descend_masked`]）
+    /// と同じ規約——非受理ノードは訪問済みにするのみで、その先の隣接ノードへ
+    /// は一切辿らない（Issue #431 是正・`search_masked_does_not_traverse_
+    /// through_a_rejected_bridge_node` で固定した契約と同じ）——に限定し、
+    /// 実探索が構造的に到達できないノードを「到達可能」と誤判定しないように
+    /// する。
+    pub(crate) fn is_mask_fully_reachable(&self, mask: &NodeMask) -> bool {
+        let target = mask.count_ones();
+        if target == 0 {
+            return true;
+        }
+        let Some(start) = self.search_entry_for_mask(mask) else {
+            // 受理ノードが 1 つ以上あるのに起点が選べない防御的分岐
+            // （`search_entry_for_mask` は受理ノードが 1 つでもあれば
+            // `find_alternate_entry` で必ず見つけるはず）。fail-closed に
+            // 「到達不能」とみなす。
+            return false;
+        };
+        let mut visited = VisitedBitmap::default();
+        self.accepted_reachable_count(start, mask, target, &mut visited) >= target
+    }
+
+    /// [`Self::is_mask_fully_reachable`] の BFS 本体。層 0 の隣接リストのみを
+    /// 辿る BFS（辺の走査のみ）で `start` から到達可能な受理ノード数を数え、
+    /// `target` 件に達した時点で早期終了する。`visited` は呼び出し元が
+    /// 所有するスクラッチ（本関数専用に確保する使い捨て。呼び出し頻度が
+    /// クエリ毎ではなく世代毎のため、`HnswSearchScratch` を共有する必要はない）。
+    fn accepted_reachable_count(
         &self,
         start: u32,
         mask: &NodeMask,
@@ -1693,7 +1734,7 @@ impl HnswIndex {
     /// 節の P0 安全条件）。
     ///
     /// 固定 entry point（[`Self::entry_point`]）自体が `mask` に非受理の場合、
-    /// 直ちに空集合へ縮退せず、[`Self::find_alternate_entry`] で受理ノードの
+    /// 直ちに空集合へ縮退せず、[`Self::search_entry_for_mask`] で受理ノードの
     /// 中から代替探索起点（受理ノードのうちレベル最大・同点は id 最小）を選び、
     /// その代替起点が存在する最上層から通常どおり降下する（可視カーディナリティ
     /// が `full_scan_ratio` 以上で ANN 経路を選ぶ設計—Issue #409—と整合させる
@@ -1702,13 +1743,14 @@ impl HnswIndex {
     /// （`Ok(Vec::new())`）、呼び出し元（`sql::hnsw_cache::search_with_overlay`）
     /// が `masked_short` として plain scan へ縮退する。
     ///
-    /// 選んだ探索起点（`nearest`）が属する連結成分だけでは受理ノードを
-    /// すべて覆えない場合——マスクが複数の連結成分に分かれ、`nearest` から
-    /// 到達不能な受理ノードが存在する場合——も同様に空集合を返す
-    /// （[`Self::accepted_reachable_at_least`] による到達可能性検証。
-    /// codex-review P2 指摘対応・PR #435）。結果件数がたまたま `k` を
-    /// 満たしても、探索が一度も訪れていない別成分により近い候補が存在する
-    /// 可能性を排除できないため、件数のみでの十分性判定はしない。
+    /// マスクが複数の連結成分に分かれ、選んだ探索起点の成分だけでは受理ノード
+    /// を覆い切れない場合の検出は本関数の責務ではない
+    /// （Cursor Bugbot High 指摘・PR #435: クエリ毎に層 0 の全受理ノード BFS を
+    /// 行うとサブ線形探索の前に必ず O(V+E) が発生し ANN の目的を損なう）。
+    /// 呼び出し元（`sql::hnsw_cache::Overlay::compute`）が世代（マスク）が
+    /// 変わるたび 1 回だけ [`Self::is_mask_fully_reachable`] を呼び、分断が
+    /// あれば本関数自体を呼ばず plain scan へ縮退する契約になっている
+    /// （`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
     ///
     /// `None` の場合は [`Self::search`] とビット同一の結果を返す
     /// （`crate::hnsw::tests::search_masked_none_matches_search` で機械検証）。
@@ -1766,11 +1808,15 @@ impl HnswIndex {
 
         // 固定 entry point が非受理なら、受理ノードの中から代替探索起点を選ぶ
         // （codex-review P2 指摘対応。§本関数ドキュメンテーションコメント参照）。
-        // 代替起点は自身が存在する最上層（`alt_level <= top_level`。全ノードは
-        // 層 0..=自身の level に存在するため）までしか降下できないので、以降の
-        // 降下ループの上限もそれに合わせて縮める。
+        // `search_entry_for_mask` は [`Self::is_mask_fully_reachable`] と同じ
+        // 起点選択を共有する（検査と探索で起点を一致させる。Cursor Bugbot
+        // High 指摘・PR #435）。代替起点は自身が存在する最上層
+        // （`alt_level <= top_level`。全ノードは層 0..=自身の level に存在
+        // するため）までしか降下できないので、以降の降下ループの上限も
+        // それに合わせて縮める。
         let (mut nearest, effective_top) = match mask {
-            Some(m) if !m.get(entry) => match self.find_alternate_entry(m) {
+            Some(m) => match self.search_entry_for_mask(m) {
+                Some(start) if start == entry => (start, top_level),
                 Some(alt) => {
                     let alt_level = self.level_of(alt).unwrap_or(0);
                     (alt, top_level.min(alt_level))
@@ -1779,7 +1825,7 @@ impl HnswIndex {
                 // plain scan への縮退に委ねる。
                 None => return Ok(Vec::new()),
             },
-            _ => (entry, top_level),
+            None => (entry, top_level),
         };
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
@@ -1801,23 +1847,10 @@ impl HnswIndex {
             }
         }
 
-        // マスクが複数の連結成分に分かれ、`nearest` から到達不能な受理ノードが
-        // 存在する場合、以降のビーム探索が結果件数を満たしても「別成分により
-        // 近い候補を一切探索していない」可能性を排除できない（codex-review
-        // P2 指摘対応・PR #435。§`accepted_reachable_at_least` ドキュメンテー
-        // ションコメント参照）。件数検査を待たず空集合を返し、呼び出し元
-        // （`sql::hnsw_cache::search_with_overlay`）の `masked_short` 経由の
-        // plain scan 縮退へ委ねる。
-        if let Some(m) = mask {
-            let target = m.count_ones();
-            if target > 0 {
-                let reachable =
-                    self.accepted_reachable_at_least(nearest, m, target, &mut scratch.visited);
-                if reachable < target {
-                    return Ok(Vec::new());
-                }
-            }
-        }
+        // 連結成分の分断検出は呼び出し元（`sql::hnsw_cache::Overlay::compute`）が
+        // [`Self::is_mask_fully_reachable`] で世代毎に 1 回だけ行う契約
+        // （§本関数ドキュメンテーションコメント参照）。ここではクエリ毎の
+        // 全域 BFS を行わない。
 
         // k > ef のとき結果集合が k 件に満たない事故を防ぐため、実効 ef を
         // `ef.max(k)` へ引き上げる（hnswlib 等の一般的慣行。詳細は
@@ -2401,14 +2434,19 @@ mod tests {
     /// （`None`）では `node1` を中継して最良スコアの `node2` を発見できるが、
     /// マスクありでは `node1` が候補ヒープへ一切積まれなくなったため
     /// （§`search_layer` ドキュメンテーションコメント参照）`node2` へは
-    /// 到達できない。この状態は「マスクが `node0` と `node2` の 2 つの連結
-    /// 成分に分断されている」ことと同義であり、`node0` だけを返すと
-    /// `node0` より真に近い `node2`（マスク受理済み）を一切探索しないまま
-    /// 結果を確定してしまう recall バグになる。[`HnswIndex::
-    /// accepted_reachable_at_least`] による到達可能性検証（codex-review P2
-    /// 指摘対応・PR #435）が `node2` への到達不能を検出し、`node0` 単体の
-    /// 部分結果ではなく空集合（`masked_short` 経由の plain scan 縮退へ委ねる
-    /// 契約）を返すことを固定する。
+    /// 到達できず、`node0` 単体の部分結果を返す。
+    ///
+    /// このマスクは「`node0` と `node2` の 2 つの連結成分に分断されている」
+    /// 状態でもあり、`node0` だけを完全な top-k として返すと `node0` より
+    /// 真に近い `node2`（マスク受理済み）を一切探索しないまま結果を確定して
+    /// しまう recall バグになる——その分断検出は本関数の責務ではなく、
+    /// 呼び出し元（`sql::hnsw_cache::Overlay::compute`）が世代毎に 1 回
+    /// [`HnswIndex::is_mask_fully_reachable`] を呼んで検出し、`search_masked`
+    /// 自体を呼ばず plain scan へ縮退する契約になっている（クエリ毎の全域
+    /// BFS を避けるため。Cursor Bugbot High 指摘・PR #435）。同じグラフで
+    /// `is_mask_fully_reachable` が分断を検出することは
+    /// `is_mask_fully_reachable_detects_unreachable_component_even_when_
+    /// reachable_component_satisfies_k` で固定する。
     #[test]
     fn search_masked_does_not_traverse_through_a_rejected_bridge_node() {
         let dim = 1usize;
@@ -2455,12 +2493,20 @@ mod tests {
             .search_masked(&query, 3, 10, Some(&mask), &mut scratch)
             .expect("masked search should succeed");
         assert_eq!(
-            masked,
-            Vec::new(),
-            "masked search must not traverse through the rejected bridge node1, and \
-             since node2 (mask-accepted, unreachable without node1) may be strictly \
-             closer than node0, returning node0 alone as a complete answer would be a \
-             silent recall bug; the caller must instead fall back to plain scan"
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![0],
+            "masked search must not traverse through the rejected bridge node1, so \
+             node2 (mask-accepted, unreachable without node1) must not appear; the \
+             graph-split detection that prevents this partial result from being \
+             treated as a complete top-k is the caller's responsibility (§this \
+             function's doc comment), not search_masked's"
+        );
+
+        // 同じグラフで分断検出（呼び出し元の責務）が正しく機能することを固定する。
+        assert!(
+            !index.is_mask_fully_reachable(&mask),
+            "node2 is mask-accepted but unreachable from node0 without traversing \
+             the rejected bridge node1, so the mask must be reported as split"
         );
     }
 
@@ -2669,24 +2715,98 @@ mod tests {
         }
     }
 
-    /// codex-review P2 指摘の中核シナリオ（PR #435）: マスクが複数の連結成分に
-    /// 分かれ、かつ **entry 側の成分だけで結果件数 `k` を満たしてしまう**場合
-    /// （`search_masked_does_not_traverse_through_a_rejected_bridge_node` の
-    /// ケースは `k` が成分サイズを上回り件数検査でも検出できたが、本ケースは
-    /// 件数検査だけでは検出できない）。
+    /// [`HnswIndex::search_entry_for_mask`] を [`HnswIndex::search_masked`]（探索）
+    /// と [`HnswIndex::is_mask_fully_reachable`]（分断検査）の双方が共有して
+    /// いることの回帰テスト（Cursor Bugbot High 指摘・PR #435）。固定 entry
+    /// point（`node0`）を非受理にし、代替起点として選ばれるはずの `node1` を
+    /// 起点とする一本道 `node1 -> node2 -> node3`（全て受理）だけをマスクに
+    /// 含める。もし検査側が代替起点選択を共有せず誤って `node0`（非受理）
+    /// から辿ろうとすれば、`is_mask_fully_reachable` の内部 BFS は開始点が
+    /// 非受理のため直ちに 0 件を返し、分断なしのマスクを「分断あり」と
+    /// 誤検知して不要な plain scan を招く。共有選択が機能していれば、
+    /// 検査は `search_masked` と同じ `node1` から辿り、分断なしと正しく
+    /// 判定する。
+    #[test]
+    fn is_mask_fully_reachable_uses_the_same_alternate_entry_as_search_masked() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![0.0, 1.0, 2.0, 3.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                // node0: entry point（マスクで非受理にする）。他ノードとは
+                // 無関係な孤立ノードにしておき、誤って起点に使われた場合の
+                // 挙動が明確になるようにする。
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![3]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+            vectors: Arc::from(vectors),
+        };
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(1);
+        mask.set(2);
+        mask.set(3);
+        // node0（entry point）は非受理のまま。
+
+        assert!(
+            index.is_mask_fully_reachable(&mask),
+            "the mask's accepted nodes (1, 2, 3) form a single chain reachable from \
+             the shared alternate entry point (node1); if the reachability check used \
+             a different (rejected) start node it would wrongly report a split"
+        );
+
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+        let results = index
+            .search_masked(&query, 3, 10, Some(&mask), &mut scratch)
+            .expect("masked search should succeed");
+        assert_eq!(
+            results.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "search_masked must reach all three accepted nodes via the same \
+             alternate entry point the reachability check used"
+        );
+    }
+
+    /// codex-review P2 指摘の中核シナリオ（PR #435。呼び出し元側の分断検査へ
+    /// 移設した際に overlay 時判定のテストへ書き換え）: マスクが複数の連結
+    /// 成分に分かれ、かつ **entry 側の成分だけで結果件数 `k` を満たして
+    /// しまう**場合（`search_masked_does_not_traverse_through_a_rejected_
+    /// bridge_node` のケースは `k` が成分サイズを上回り件数検査でも検出
+    /// できたが、本ケースは件数検査だけでは検出できない）。
     ///
     /// entry 側成分 `{node0(entry), node1, node2}`（`0 -> 1 -> 2` の一本道、
     /// スコアは 1.0/2.0/3.0）はすべて受理され、`k=2` の結果件数は成分内だけで
     /// 満たせる。一方、entry 側成分と辺で一切繋がっていない孤立ノード
     /// `node3`（スコア 100.0・受理済み）がクエリに最も近い真の正解だが、
     /// 単一 entry point からの誘導部分グラフ探索では構造的に到達不能。
-    /// [`HnswIndex::accepted_reachable_at_least`] による到達可能性検証が
+    /// [`HnswIndex::is_mask_fully_reachable`]（`sql::hnsw_cache::Overlay::
+    /// compute` が世代毎に 1 回呼ぶ、`search_masked` とは独立の分断検査）が
     /// 「entry 側成分（3 件）だけではマスクの受理ノード総数（4 件）を覆え
-    /// ない」ことを検出し、`node1`・`node2` だけの部分結果（件数検査は通過
-    /// するが node3 を取りこぼす recall バグ）ではなく空集合を返すことを
-    /// 固定する。
+    /// ない」ことを検出することを固定する。`search_masked` 自体はこの検査を
+    /// 行わないため、`node1`・`node2` だけの部分結果を返す（件数検査は通過
+    /// するが node3 を取りこぼす——この recall バグを実際に防ぐのは呼び
+    /// 出し元が `is_mask_fully_reachable` を見て `search_masked` 自体を
+    /// 呼ばない判断をすること）。
     #[test]
-    fn search_masked_detects_unreachable_component_even_when_reachable_component_satisfies_k() {
+    fn is_mask_fully_reachable_detects_unreachable_component_even_when_reachable_component_satisfies_k(
+    ) {
         let dim = 1usize;
         let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 100.0];
         let index = HnswIndex {
@@ -2717,27 +2837,35 @@ mod tests {
         let query = [1.0f32];
         let mut scratch = HnswSearchScratch::default();
 
-        // マスクなしなら node3（辺で到達できないため実際には brute-force 経由
-        // でしか見つからない）を除く全ノードをスコア降順で返す。ここでは前提
-        // 確認として、マスク付き探索の対象になる「entry 側成分内の順位」を
-        // 確認するに留める。
         let mut mask = NodeMask::new(index.len());
         mask.set(0);
         mask.set(1);
         mask.set(2);
         mask.set(3); // node3 も受理（到達不能なだけで RLS 上は可視）。
 
+        // 分断検査（呼び出し元の責務）は「entry 側成分だけで k を満たす」
+        // ケースでも到達不能な node3 を正しく検出する。
+        assert!(
+            !index.is_mask_fully_reachable(&mask),
+            "node3 is mask-accepted but structurally unreachable from the single \
+             entry point, so the mask must be reported as split even though the \
+             reachable component alone would satisfy k=2"
+        );
+
+        // `search_masked` 自体はこの検査を行わないため、entry 側成分内の
+        // 部分結果（node3 を欠く）をそのまま返す——この防止は呼び出し元が
+        // 上記の `is_mask_fully_reachable` を見て `search_masked` を呼ばない
+        // 判断をすることで実現される（§本関数ドキュメンテーションコメント
+        // 参照）。
         let masked = index
             .search_masked(&query, 2, 10, Some(&mask), &mut scratch)
             .expect("masked search should succeed");
         assert_eq!(
-            masked,
-            Vec::new(),
-            "reachable component alone satisfies k=2 (node1, node2), but node3 \
-             (mask-accepted, strictly closer, unreachable from the chosen entry) is \
-             never explored; returning the reachable component's hits as a complete \
-             top-k would be a silent recall bug that a count-only sufficiency check \
-             cannot detect"
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![2, 1],
+            "search_masked itself only explores the entry-reachable component and \
+             returns its top-k (node2, node1); node3 is absent because search_masked \
+             does not perform graph-split detection"
         );
     }
 

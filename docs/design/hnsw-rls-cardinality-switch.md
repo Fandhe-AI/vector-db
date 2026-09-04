@@ -94,14 +94,36 @@ ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」節�
 recall バグを是正した——マスクが複数の連結成分に分かれ、かつ探索起点側の
 成分だけで結果件数を満たせてしまう場合、件数検査は通過するが、探索が
 一度も訪れていない別成分により近い受理ノードを取りこぼす可能性がある。
-`HnswIndex::search_masked` は、実探索が層 0 で使う起点から辿った先に、
-[`HnswIndex::accepted_reachable_at_least`]（層 0 の隣接リストのみを辿る
-BFS。非受理ノードを中継点に使わない実探索と同じ規約。ベクトルアクセス・
-スコア計算は行わない）でマスクの受理ノード総数を覆えるかを検証し、覆え
-なければ結果件数に関わらず空集合を返す（呼び出し元の `masked_short` 経由
-plain scan 縮退へ委ねる）。連結性が保証できないマスクは常に安全側
-（plain scan）へ倒す、という判断で、multi-entry-point 探索の実装は見送った
-（filter-aware な専用探索方式の検討は引き続き #410 の担当）。
+
+分断検出は **`sql::hnsw_cache::Overlay::compute` が世代（マスク）が変わる
+たび 1 回だけ**行う契約とし、`search_masked` 自体はクエリ毎の全域探索を
+行わない。`HnswIndex::is_mask_fully_reachable`（`hnsw.rs`）が、
+`search_masked` と同じ起点選択（`search_entry_for_mask`。固定 entry point
+が受理されていればそれを、されていなければ `find_alternate_entry` が選ぶ
+代替起点を、検査・探索の双方が共有する——分断検査が探索とは異なる起点を
+使って誤判定することを避けるため）から、層 0 の隣接リストのみを辿る BFS
+（非受理ノードを中継点に使わない実探索と同じ規約。ベクトルアクセス・
+スコア計算は行わない）でマスクの受理ノード総数を覆えるかを判定し、結果を
+`Overlay::mask_splits_graph: bool` として保持する。`Overlay::compute` は
+`visible_mask` 自体の構築で既に O(N) を要するため、本判定を追加で 1 回
+行っても漸近コストは変わらない（`Subset` 形状はクエリ毎に `Overlay::
+compute` を呼ぶため判定もクエリ毎になるが、これはマスク構築自体がクエリ毎
+に O(N) であることに起因するもので本判定固有の追加コストではない）。
+`search_with_overlay` は `overlay.mask_splits_graph` が `true` なら
+`search_masked` 自体を呼ばず直ちに plain scan へ縮退する（統計
+`mask_splits_graph`。`masked_short` とは互いに排他）。連結性が保証できない
+マスクは常に安全側（plain scan）へ倒す、という判断で、multi-entry-point
+探索の実装は見送った（filter-aware な専用探索方式の検討は引き続き #410
+の担当）。
+
+恒等マスク（warm `FullVisible`。フィルタなし DISTANCE で可視行全体が
+そのままアリーナになる形状）に対する実測（`crates/engine/src/sql/
+hnsw_cache.rs::tests::
+is_mask_fully_reachable_accepts_identity_mask_on_a_repaired_graph_and_ann_path_is_used`）
+では、`repair_reachability`（`hnsw.rs::HnswIndex::repair_reachability`。
+`build`/`build_parallel` が構築末尾で適用する）が層 0 の entry point 起点
+到達性を保証しており、`mask_splits_graph` は `false`（ANN 経路が使われる）
+と確認できた。
 
 `HnswIndex::search`（既存公開 API）は `search_masked(.., None, ..)` へ委譲する
 薄いラッパーへ変更した。挙動・公開シグネチャは不変。
@@ -133,19 +155,25 @@ plain scan 縮退へ委ねる）。連結性が保証できないマスクは常
 ### 切替規則（本リポ実装既定値）
 
 `Overlay::compute` は失効判定に加え、`visible_mask: NodeMask`（`slot_of_node[node]
-!= STALE_SLOT` を表す）・`visible_in_index: usize`（= `index.len() - stale_nodes`）
-を計算する。`search_with_overlay`（`sql/hnsw_cache.rs`）はこれを使って:
+!= STALE_SLOT` を表す）・`visible_in_index: usize`（= `index.len() - stale_nodes`）・
+`mask_splits_graph: bool`（`HnswIndex::is_mask_fully_reachable(&visible_mask)`
+の否定。§前節参照）を計算する。`search_with_overlay`（`sql/hnsw_cache.rs`）は
+これを使って:
 
 1. `visible_in_index / index.len() < full_scan_ratio`
    （整数比較 `visible_in_index * denominator < index.len() * numerator`。
    `u64` の `checked_mul`。オーバーフロー時は fail-closed に plain scan）
    → plain scan（アリーナ全体の brute-force。統計 `plain_scans`）
-2. それ以外 → `HnswIndex::search_masked(query, k, ef, Some(&visible_mask), scratch)`
-3. マスク付き探索の結果件数が `min(k, visible_in_index)` 未満（ビーム幅内で
+2. `overlay.mask_splits_graph` が `true`（マスクが複数の連結成分に分かれ、
+   探索起点の成分だけでは受理ノード全体を覆えないと `Overlay::compute` 時点で
+   判明済み）→ `search_masked` 自体を呼ばず plain scan へ縮退（統計
+   `mask_splits_graph`）
+3. それ以外 → `HnswIndex::search_masked(query, k, ef, Some(&visible_mask), scratch)`
+4. マスク付き探索の結果件数が `min(k, visible_in_index)` 未満（ビーム幅内で
    可視ノードを辿り切れなかった）→ 当該クエリのみ plain scan へ縮退（統計
    `masked_short`。**`ef` 拡張による再探索は #410 の担当**。本 Issue は
    fail-closed 縮退で k 件充足を保証する）
-4. 索引ヒットのスロット写像・キー照合・`kernel::dot` 再計算・未索引分
+5. 索引ヒットのスロット写像・キー照合・`kernel::dot` 再計算・未索引分
    （`delta_slots`）の brute-force 併合は #408 と同じ
 
 `k + stale_nodes` のオーバーフェッチ・`k_idx > MAX_EF` 縮退は撤去した
@@ -218,7 +246,7 @@ current_generation` による事前・事後の失効照合とは独立した読
 | ---- | -------- |
 | `crates/engine/src/hnsw.rs` | `Ratio`・`HnswParams::full_scan_ratio`・`validate` 拡張。`NodeMask`。`search_layer` の受理述語。`HnswIndex::search_masked`（`search` はこれへ委譲） |
 | `crates/engine/src/search_engine.rs` | `Display` に `full_scan_ratio` を追記 |
-| `crates/engine/src/sql/hnsw_cache.rs` | `Overlay::visible_mask`／`visible_in_index`。`search_with_overlay` を可視カーディナリティ切替へ書き換え（`k + stale` 撤去）。`search_subset_or_fallback`（新設）。統計 `plain_scans`・`masked_short`・`subset_searches` |
+| `crates/engine/src/sql/hnsw_cache.rs` | `Overlay::visible_mask`／`visible_in_index`／`mask_splits_graph`。`search_with_overlay` を可視カーディナリティ切替へ書き換え（`k + stale` 撤去）。`search_subset_or_fallback`（新設）。統計 `plain_scans`・`mask_splits_graph`・`masked_short`・`subset_searches` |
 | `crates/engine/src/sql/exec.rs` | `hnsw_full_visible_eligible`／`hnsw_subset_eligible` の 2 条件・DISTANCE 段の形状別ディスパッチ |
 | `crates/engine/src/rls.rs` | `PrefilterSnapshot::search_with_hnsw` |
 | `crates/engine/src/core.rs` | `search_with_snapshot` の `hnsw_state` 分岐 |
