@@ -116,6 +116,23 @@ compute` を呼ぶため判定もクエリ毎になるが、これはマスク�
 探索の実装は見送った（filter-aware な専用探索方式の検討は引き続き #410
 の担当）。
 
+`is_mask_fully_reachable` が「分断なし」と判定した場合でも、
+`search_masked`（`hnsw.rs`）自体の層 0 探索が到達可能性を検査した起点と
+異なる起点だけを使うと recall が壊れうる（codex-review P1 指摘・PR #435
+是正）。`search_masked` は上位層の貪欲降下でクエリ依存の別ノードへ移動
+するため、`is_mask_fully_reachable` が検査に使った起点（`search_entry_
+for_mask` の戻り値）と、降下後に層 0 探索へ渡す起点が一致するとは限ら
+ない。層 0 の隣接は枝刈りで有向になり得るため、検査済み起点からは全受理
+ノードへ到達できても降下後ノードからは一部の成分（別成分のより近い候補を
+含む）へ到達できない場合があった。是正後は `search_masked` が層 0 探索の
+初期候補集合へ検査済み起点を（降下後ノードと異なる場合）必ず含める——
+検査済み起点から到達可能なことは `is_mask_fully_reachable` が保証済みの
+ため、この 2 起点を初期候補にする限り「分断なし」と判定されたマスクに
+ついて受理ノード全件への到達可能性が構造的に保証される。マスクが
+`None` の場合（検査済み起点・降下後起点が共に固定 entry point で一致）は
+従来どおり単一起点のままで、`HnswIndex::search` とのビット同一契約
+（`hnsw::tests::search_masked_none_matches_search`）は変わらない。
+
 恒等マスク（warm `FullVisible`。フィルタなし DISTANCE で可視行全体が
 そのままアリーナになる形状）に対する実測（`crates/engine/src/sql/
 hnsw_cache.rs::tests::

@@ -1300,6 +1300,15 @@ impl HnswIndex {
     /// through_a_rejected_bridge_node` で固定した契約と同じ）——に限定し、
     /// 実探索が構造的に到達できないノードを「到達可能」と誤判定しないように
     /// する。
+    ///
+    /// **本関数が検査に使う起点は、[`Self::search_masked`] が層 0 探索の
+    /// 初期候補集合へ必ず含める起点と同一でなければならない**（codex-review
+    /// P1 指摘対応・PR #435）。層 0 の隣接は枝刈りで有向になり得るため、
+    /// クエリ依存の貪欲降下が着地した別ノードだけを起点に層 0 探索を始めると、
+    /// 本関数が「到達可能」と判定した成分へ実探索が構造的に届かない場合が
+    /// ある。両者が同じ起点を層 0 探索へ持ち込む限り、本関数が真を返す
+    /// マスクについて `search_masked` が受理ノード全件へ到達できることが
+    /// 保証される。
     pub(crate) fn is_mask_fully_reachable(&self, mask: &NodeMask) -> bool {
         let target = mask.count_ones();
         if target == 0 {
@@ -1776,6 +1785,18 @@ impl HnswIndex {
     /// あれば本関数自体を呼ばず plain scan へ縮退する契約になっている
     /// （`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
     ///
+    /// 層 0 探索の初期候補には、[`Self::search_entry_for_mask`] が選び
+    /// [`Self::is_mask_fully_reachable`] が到達可能性を検査した起点
+    /// （`checked_entry`）を、クエリ依存の多層貪欲降下が着地したノード
+    /// （`nearest`）と併せて必ず含める（codex-review P1 指摘対応・
+    /// PR #435）。層 0 の隣接は枝刈りで有向になり得るため、降下後ノード
+    /// だけを初期候補にすると、検査済み起点からは到達できていた成分へ
+    /// 降下後ノードからは辿り着けない場合があり、`is_mask_fully_reachable`
+    /// が「分断なし」と判定したマスクでも一部の受理ノード（別成分のより
+    /// 近い候補を含む）を取りこぼしかねない。両者が異なる場合のみ 2 起点を
+    /// 渡すため、`mask` が `None`（`checked_entry == nearest == entry`）
+    /// のときは従来どおり単一起点のままで下記のビット同一契約を崩さない。
+    ///
     /// `None` の場合は [`Self::search`] とビット同一の結果を返す
     /// （`crate::hnsw::tests::search_masked_none_matches_search` で機械検証）。
     ///
@@ -1838,18 +1859,29 @@ impl HnswIndex {
         // （`alt_level <= top_level`。全ノードは層 0..=自身の level に存在
         // するため）までしか降下できないので、以降の降下ループの上限も
         // それに合わせて縮める。
-        let (mut nearest, effective_top) = match mask {
+        // `checked_entry` は `is_mask_fully_reachable` が到達可能性を検査した
+        // のと同じ起点（`search_entry_for_mask` の戻り値）を保持する
+        // （codex-review P1 指摘対応・PR #435）。`nearest` はこの後の多層
+        // 貪欲降下でクエリ依存の別ノードへ移動するため、両者は一致すると
+        // 限らない。層 0 の隣接は枝刈りで有向になり得るので、降下後ノード
+        // だけを層 0 探索の初期候補にすると、検査済み起点からは到達できて
+        // いた成分へ降下後ノードからは辿り着けない場合がある——検査で
+        // 「分断なし」と判定されたにもかかわらず、実探索が構造的に一部の
+        // 受理ノードを取りこぼす（本関数の呼び出し元は `is_mask_fully_
+        // reachable` が真のときのみ `search_masked` を呼ぶ契約のため、この
+        // 食い違いは fail-closed 側で吸収されず recall バグとして顕在化する）。
+        let (mut nearest, effective_top, checked_entry) = match mask {
             Some(m) => match self.search_entry_for_mask(m) {
-                Some(start) if start == entry => (start, top_level),
+                Some(start) if start == entry => (start, top_level, start),
                 Some(alt) => {
                     let alt_level = self.level_of(alt).unwrap_or(0);
-                    (alt, top_level.min(alt_level))
+                    (alt, top_level.min(alt_level), alt)
                 }
                 // 受理ノードが 1 つも無い: ANN 経路では応答不能なので
                 // plain scan への縮退に委ねる。
                 None => return Ok(Vec::new()),
             },
-            None => (entry, top_level),
+            None => (entry, top_level, entry),
         };
         if effective_top > 0 {
             for l in (1..=effective_top).rev() {
@@ -1882,8 +1914,19 @@ impl HnswIndex {
         // 検証済みのため `ef_eff` も MAX_EF 以下。
         let ef_eff = ef.max(k);
 
+        // 層 0 探索の初期候補には降下後ノード（`nearest`）に加え、`mask` が
+        // `Some` かつ両者が異なる場合は検査済み起点（`checked_entry`）も
+        // 必ず含める（§上の `checked_entry` コメント参照）。`mask` が `None`
+        // のときは `checked_entry == nearest == entry` なので従来どおり単一
+        // 起点となり、[`Self::search`] とのビット同一契約
+        // （`search_masked_none_matches_search`）は変わらない。
+        let level0_entry_points = if mask.is_some() && checked_entry != nearest {
+            vec![nearest, checked_entry]
+        } else {
+            vec![nearest]
+        };
         let results = self.search_layer(
-            vec![nearest],
+            level0_entry_points,
             query,
             ef_eff,
             0,
@@ -2800,6 +2843,85 @@ mod tests {
             vec![3, 2, 1],
             "search_masked must reach all three accepted nodes via the same \
              alternate entry point the reachability check used"
+        );
+    }
+
+    /// codex-review P1 指摘の中核シナリオ（PR #435）: 到達可能性を検査した
+    /// 起点（[`HnswIndex::search_entry_for_mask`] が選ぶ `node0`）と、クエリ
+    /// 依存の多層貪欲降下が層 0 探索へ渡す起点（`node2`）が異なり、かつ層 0
+    /// の隣接が有向（`node0 -> {node1, node2}` だが `node2` に出辺なし）な
+    /// 場合を手作りグラフで再現する。
+    ///
+    /// - `node0`（entry・level1）はクエリスコア 5.0、level1 の隣接が
+    ///   `node2`（level1・スコア 10.0）のみで、貪欲降下は必ず `node0` から
+    ///   `node2` へ移動する。
+    /// - `node0` の層 0 隣接は `{node1, node2}` を直接含むが、`node2` の層 0
+    ///   隣接は空——`node2` を唯一の起点にして層 0 探索を始めると `node1`
+    ///   （クエリに最も近い・スコア 100.0）へ構造的に到達できない。
+    /// - `is_mask_fully_reachable` は検査済み起点 `node0` から辿るため
+    ///   `node1`／`node2` いずれにも到達でき、マスクは「分断なし」と判定
+    ///   される（呼び出し元は `search_masked` を素通しで呼ぶ契約）。
+    ///
+    /// 修正前は層 0 探索の初期候補が降下後ノード `node2` のみだったため、
+    /// 分断なしと判定されたにもかかわらず最も近い `node1` を取りこぼした。
+    /// 本テストは層 0 探索の初期候補へ検査済み起点 `node0` を必ず含める
+    /// ことで `node1` が結果に現れることを固定する。
+    #[test]
+    fn search_masked_includes_checked_entry_as_level0_seed_when_descent_lands_elsewhere() {
+        let dim = 1usize;
+        // dot(v, q) = v[0] * q[0]、q=[1.0] なのでスコアは値そのもの。
+        let vectors: Vec<f32> = vec![5.0, 100.0, 10.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                // node0: entry。level1 隣接は node2（スコア上位のため貪欲降下
+                // は必ずここへ移動する）。level0 隣接は node1・node2 の両方
+                // （有向: node2 側からの逆辺は無い）。
+                Node {
+                    level: 1,
+                    links: vec![vec![1, 2], vec![2]],
+                },
+                // node1: クエリに最も近い（スコア 100.0）。level0 隣接なし
+                // （孤立扱いで十分。node0 からの片道到達だけを検証する）。
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+                // node2: 貪欲降下の着地点。level0 隣接なし（node1 へは辿れ
+                // ない）。level1 隣接なし（降下はここで停止する）。
+                Node {
+                    level: 1,
+                    links: vec![Vec::new(), Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+            vectors: Arc::from(vectors),
+        };
+
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        mask.set(1);
+        mask.set(2);
+
+        assert!(
+            index.is_mask_fully_reachable(&mask),
+            "all three accepted nodes must be reachable from the checked entry \
+             (node0), which has direct level-0 edges to both node1 and node2"
+        );
+
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+        let masked = index
+            .search_masked(&query, 3, 10, Some(&mask), &mut scratch)
+            .expect("masked search should succeed");
+        assert_eq!(
+            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![1, 2, 0],
+            "search_masked must seed level-0 search with the checked entry \
+             (node0) in addition to the post-descent node (node2), so node1 \
+             (reachable only via node0's directed level-0 edge) must not be \
+             dropped even though is_mask_fully_reachable reports no split"
         );
     }
 
