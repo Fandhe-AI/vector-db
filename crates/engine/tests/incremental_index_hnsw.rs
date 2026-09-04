@@ -367,7 +367,18 @@ fn ann_incremental_states_match_default_engine_self_retrieval() {
 
     // ---------- 状態 3: 再構築（さらに多数のファイルを置換。stale+delta 比が
     // 1/10 を超え再構築が起こるはず） ----------
-    let rebuild_targets: Vec<usize> = (1000..1000 + (FILE_COUNT / 8)).collect(); // 約 12.5%
+    // 開始位置は既存 ID 範囲（`0..FILE_COUNT`）に収まるよう固定する。以前は
+    // `1000..1000 + (FILE_COUNT / 8)` で `FILE_COUNT`（1,100）を超えて
+    // `1137` まで走査しており、`FILE_COUNT` を超える 37 件（1100〜1136）は
+    // 既存ファイルの置換ではなく新規挿入になっていたため、「137 ファイルの
+    // 置換で stale+delta 比が閾値を超え再構築が起こる」という意図した
+    // fixture になっていなかった（codex-review P2・Cursor Bugbot 指摘・
+    // Issue #412 PR #438）。`REBUILD_START` は overlay 済みの
+    // `overlay_targets`（0, 500, 999）と重複しない範囲に固定する。
+    const REBUILD_START: usize = 200;
+    const REBUILD_COUNT: usize = FILE_COUNT / 8; // 約 12.5%
+    const _: () = assert!(REBUILD_START + REBUILD_COUNT <= FILE_COUNT);
+    let rebuild_targets: Vec<usize> = (REBUILD_START..REBUILD_START + REBUILD_COUNT).collect();
     for &i in &rebuild_targets {
         replace_file(&ann_core, &ctx, i, "rebuilt", &format!("rebuild-ann-{i}"));
         replace_file(

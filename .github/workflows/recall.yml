@@ -96,35 +96,29 @@ name: Recall
 # `recall_engine`（Issue #412。ADR `docs/design/ann-index-adoption.md` B 案
 # 〔Issue #403 Accepted〕の受け入れ条件 3）: 3 ゲートが測定する検索エンジンを
 # 選ぶ非機密の opt-in フラグ（`BENCH_CORE6`/`BENCH_CORE16` と同じ扱い。
-# `docs/design/ci-gate-variables.md` 参照）。既定 `brute_force` は既存の
-# in-memory 測定経路をそのまま通し、実測値・閾値判定に一切影響しない。`hnsw`
-# は SQL 表層 `EngineCore::from_storage_with_engine` 経由の ANN opt-in 経路
-# （`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine`）で同一閾値を
-# 判定する。`schedule` トリガでは `inputs` が存在しないため式が空文字列に解決され、
-# 各ゲートは未設定を「既定 brute_force」として扱う
-# （`RecallEngine::from_env` の契約）。
+# `docs/design/ci-gate-variables.md` 参照）。`brute_force` は既存の in-memory
+# 測定経路をそのまま通し、実測値・閾値判定に一切影響しない。`hnsw` は SQL 表層
+# `EngineCore::from_storage_with_engine` 経由の ANN opt-in 経路（`crates/engine/
+# tests/fixtures/recall_engine.rs::RecallEngine`）で同一閾値を判定する。
+#
+# 以前は `workflow_dispatch` の `inputs.recall_engine`（単一選択・既定
+# `brute_force`）を `env:` へ素通しし、`schedule` トリガでは `inputs` が存在
+# しないため式が常に空文字列に解決 → `RecallEngine::from_env` が既定
+# `brute_force` を選ぶ実装だった。これにより週次 `schedule` 実行では HNSW
+# 経路が一度も測定されず、ADR の受け入れ条件「Recall ゲートを ANN 有効経路でも
+# 同一閾値で通過」を継続的に検証できていなかった（codex-review P1 指摘・
+# Issue #412 PR #438）。そのため `strategy.matrix.recall_engine` で
+# `brute_force`/`hnsw` を job ごとに固定 2 系列とし、`workflow_dispatch`・
+# `schedule` いずれのトリガでも両エンジンを毎回同一閾値でゲートする（選択式の
+# `inputs.recall_engine` は撤去。手動実行時に片方のエンジンだけを検証したい
+# 場合は GitHub UI の re-run で個別の matrix job を再実行すればよい）。
 on:
-  workflow_dispatch:
-    inputs:
-      recall_engine:
-        description: "検索エンジン（既定 brute_force。hnsw で ANN opt-in 経路を測定）"
-        type: choice
-        options:
-          - brute_force
-          - hnsw
-        default: brute_force
+  workflow_dispatch: {}
   schedule:
     - cron: "0 4 * * 1"
 
 permissions:
   contents: read
-
-concurrency:
-  # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に含めて
-  # 同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針。`pull_request`
-  # トリガは持たないため PR 番号ベースの group 分けは不要）。
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   # --------------------------------------------------
@@ -137,6 +131,23 @@ jobs:
     # （冒頭コメント参照。spec 閾値を任意 ref の書き換えコードへ渡さないための
     # fail-closed な制約）。
     if: github.ref == 'refs/heads/main'
+    strategy:
+      # `brute_force`/`hnsw` の 2 系列を独立 job として毎回両方ゲートする
+      # （冒頭コメント参照。Issue #412 受け入れ条件 3・codex-review P1 指摘対応）。
+      # 一方が fail してももう一方は評価を継続する。
+      fail-fast: false
+      matrix:
+        recall_engine: [brute_force, hnsw]
+    concurrency:
+      # workflow_dispatch は任意の ref を選択して起動できるため、ref を group に
+      # 含めて同一 ref の重複実行のみキャンセル対象にする（bench.yml と同一方針。
+      # `pull_request` トリガは持たないため PR 番号ベースの group 分けは不要）。
+      # `matrix` context は workflow レベルの `concurrency:` からは参照できない
+      # （job レベル限定。actionlint 指摘）ため、job レベルの `concurrency:` として
+      # 定義し `matrix.recall_engine` を group に含めることで、同一 ref 上で並列
+      # 実行する brute_force/hnsw の 2 job が互いをキャンセルし合わないようにする。
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.recall_engine }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # environment 保護（deployment branch policy で main のみに制限。
@@ -196,10 +207,10 @@ jobs:
           HYBRID_RECALL_MIN_R20_SMALL: ${{ secrets.HYBRID_RECALL_MIN_R20_SMALL }}
           HYBRID_RECALL_MIN_R20_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R20_LARGE }}
           HYBRID_RECALL_MIN_R100_LARGE: ${{ secrets.HYBRID_RECALL_MIN_R100_LARGE }}
-          # 非機密 opt-in（冒頭コメント参照）。`inputs.recall_engine` を `run:` へ
+          # 非機密 opt-in（冒頭コメント参照）。`matrix.recall_engine` を `run:` へ
           # 直接展開せず `env:` 経由で渡す（式インジェクション回避の定石。末尾の
           # `Evaluate recall gates` step と同方針）。
-          RECALL_ENGINE: ${{ inputs.recall_engine }}
+          RECALL_ENGINE: ${{ matrix.recall_engine }}
         run: make recall-regression
       - name: Run rerank-regression
         id: rerank
@@ -240,7 +251,7 @@ jobs:
           RERANK_RECALL_REQUIRE_THRESHOLDS: "1"
           RERANK_RECALL_MIN_R20_LARGE: ${{ secrets.RERANK_RECALL_MIN_R20_LARGE }}
           # 非機密 opt-in（冒頭コメント参照）。
-          RECALL_ENGINE: ${{ inputs.recall_engine }}
+          RECALL_ENGINE: ${{ matrix.recall_engine }}
         run: make rerank-regression
       - name: Run query-planning-regression
         id: query_planning
@@ -290,7 +301,7 @@ jobs:
           QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE: ${{
             secrets.QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE }}
           # 非機密 opt-in（冒頭コメント参照）。
-          RECALL_ENGINE: ${{ inputs.recall_engine }}
+          RECALL_ENGINE: ${{ matrix.recall_engine }}
         run: make query-planning-regression
       - name: Evaluate recall gates
         # 3 つの gate step（hybrid / rerank / query_planning）は `continue-on-error: true`

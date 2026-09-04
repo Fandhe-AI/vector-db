@@ -335,14 +335,14 @@ gh secret set QUERY_PLANNING_RECALL_MIN_R20_DIRECT_LARGE --env recall-gate
 
 ### ANN opt-in 時の Recall ゲート実測（Issue #412）
 
-3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱いで、`.github/workflows/recall.yml` の `workflow_dispatch` 入力からもそのまま渡す）で測定対象の検索エンジンを選べます。既定（未設定・空文字列・`brute_force`）は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。
+3 つの Recall 閾値ゲート（hybrid・rerank・query-planning）は `RECALL_ENGINE` 環境変数（非機密の opt-in フラグ。値そのものは閾値ではないため secrets ではなく repo variables 相当の扱い）で測定対象の検索エンジンを選べます。`brute_force` は従来どおり `engine::hybrid::hybrid_search` を in-memory 配列に対して直接呼ぶ既存経路で、実測値・固定値アサーションに一切影響しません。`hnsw` を指定すると、SQL 表層（`EngineCore::from_storage_with_engine` ＋ `ORDER BY HYBRID(...)`）経由の ANN opt-in 経路（ADR `docs/design/ann-index-adoption.md` B 案）で同一の閾値を判定します——ANN の実装 seam（`sql::hnsw_cache`／`sql::hnsw_hybrid`）は結合テストから直接は触れない `pub(crate)` のため、SQL 表層を通すのが production API 経由で ANN 経路へ到達する唯一の方法です（`crates/engine/tests/fixtures/recall_engine.rs` 参照）。`.github/workflows/recall.yml` は `strategy.matrix.recall_engine: [brute_force, hnsw]` で両エンジンを常に独立 job としてゲートします（`workflow_dispatch`・週次 `schedule` いずれのトリガでも同じ。以前の選択式 `workflow_dispatch` 入力は `schedule` 実行で `hnsw` が測定されない抜け穴になっていたため撤去しました。Issue #412）。
 
 ```bash
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make recall-regression
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make rerank-regression
 RECALL_ENGINE=hnsw RECALL_VERBOSE=1 make query-planning-regression
-# CI から手動実行する場合
-gh workflow run recall.yml --ref main -f recall_engine=hnsw
+# CI から手動実行する場合（brute_force/hnsw 両 matrix job が起動します）
+gh workflow run recall.yml --ref main
 ```
 
 各ゲートのコーパス規模が `MIN_INDEXED_ROWS`（ANN 索引の下限行数。`sql::hnsw_cache.rs` の非公開定数）を下回る段（hybrid の小規模段のみ・400 件）は、`RECALL_ENGINE=hnsw` を指定しても構造的に brute-force のまま索引を構築しません（そのようにゲート側が非 vacuous 検証で固定しています）。それ以外の段（hybrid・query-planning の各小規模段は 4,000 件以上、大規模段は 20,000〜40,000 件）は実際に HNSW 索引を構築して測定します。検証設計・実測結果は `docs/design/ann-recall-gate-verification.md` を参照してください。

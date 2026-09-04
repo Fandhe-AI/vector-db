@@ -62,8 +62,8 @@ fixture 自体の層 A テストとして以下を固定した:
    `hybrid_search`」の結果と完全一致すること**（`sql_default_engine_hybrid_
    top_matches_in_memory_hybrid_search`）。ANN 有効時の Recall 差分が SQL 表層
    自体の違いではなく検索エンジンの違いにのみ起因することの前提を担保する
-3. 非 vacuous ガードの正負両方（`MIN_INDEXED_ROWS`〔1,024〕以上で `builds
-   >= 1`、未満で `builds == 0`）
+3. 非 vacuous ガードの正負両方（`MIN_INDEXED_ROWS`〔1,024〕以上で
+   `builds >= 1`、未満で `builds == 0`）
 
 ## 3 ゲートへの結線
 
@@ -90,17 +90,23 @@ hybrid 小規模段以外はすべて `MIN_INDEXED_ROWS` を上回り、`RecallE
 ANN 通過とは数えない（測定経路自体は SQL 表層を経由するため無意味ではないが、
 索引構築の検証にはならない）。
 
-`recall.yml` は `workflow_dispatch.inputs.recall_engine`（`type: choice`。既定
-`brute_force`）を追加し、3 gate step の `env:` へ `RECALL_ENGINE` として渡す
-（`inputs.recall_engine` を `run:` へ直接展開せず `env:` 経由。式インジェクション
-回避の定石）。`schedule` トリガでは `inputs` が存在しないため空文字列に解決
-され、`RecallEngine::from_env` の契約により既定 `brute_force` のまま評価
-される。`RECALL_ENGINE` 自体は非機密の opt-in フラグ（`BENCH_CORE6`等と同じ
-扱い）であり secrets 化しない（`docs/design/ci-gate-variables.md` 参照）。
+`recall.yml` は `recall-regression` job に `strategy.matrix.recall_engine:
+[brute_force, hnsw]` を追加し、3 gate step の `env:` へ `RECALL_ENGINE` として
+`matrix.recall_engine` を渡す（`run:` へ直接展開せず `env:` 経由。式インジェク
+ション回避の定石）。当初は `workflow_dispatch.inputs.recall_engine`（`type:
+choice`。既定 `brute_force`）の単一選択式で、`schedule` トリガでは `inputs`
+が存在せず式が空文字列に解決 → `RecallEngine::from_env` の契約で既定
+`brute_force` のまま評価される実装だった。これは週次 `schedule` 実行で HNSW
+経路が一度も測定されないことを意味し、ADR の受け入れ条件「Recall ゲートを
+ANN 有効経路でも同一閾値で通過」を継続的には保証できていなかった
+（codex-review P1 指摘・Issue #412 PR #438）。`matrix` 化により
+`workflow_dispatch`・`schedule` いずれのトリガでも `brute_force`/`hnsw` の
+2 系列が独立 job として毎回両方ゲートされる（`fail-fast: false` で片方の
+fail がもう片方の評価を止めない）。`RECALL_ENGINE` 自体は非機密の opt-in
+フラグ（`BENCH_CORE6`等と同じ扱い）であり secrets 化しない
+（`docs/design/ci-gate-variables.md` 参照）。
 
-## 実測結果（ローカル `--release`。閾値は private spec から環境変数へ注入し
-値は本 doc に転記しない。ここに記載する Recall 実測値・統計カウンタは
-オーナー判断〔2026-08-29〕により公開可）
+## 実測結果（ローカル `--release`。閾値は private spec から環境変数へ注入し値は本 doc に転記しない。ここに記載する Recall 実測値・統計カウンタはオーナー判断〔2026-08-29〕により公開可）
 
 `RECALL_VERBOSE=1` opt-in で `brute_force` と `hnsw` を交互に 1 回ずつ実行し、
 測定値を比較した。
