@@ -68,12 +68,20 @@ P0 安全側の確定事項として維持している。本実装は **ADR と 
 P0 指摘・Issue #431）。是正後は `accept` が受理しないノードを候補ヒープへも
 一切積まない——訪問済みマークは付けるが `self.score`（当該ノードのベクトルへ
 のアクセス）自体を行わず、その隣接ノードへの探索も行わない。上位層の貪欲
-降下（`HnswIndex::greedy_descend_masked`）も同様にマスクを適用し、降下の
-起点自体が非受理なら空の結果を返す（`sql::hnsw_cache::search_with_overlay`
-の `masked_short` 経由で plain scan へ縮退する）。`None`（既存呼び出し元）は
-ビット同一の結果を返す（`hnsw::tests::search_masked_none_matches_search` で
-機械検証）。停止条件（`results.len() >= ef && strictly_farther` の場合のみ
-打ち切る）は変更していない。
+降下（`HnswIndex::greedy_descend_masked`）も同様にマスクを適用する。
+固定 entry point（索引全体で 1 点）自体が非受理の場合、初版は直ちに空の
+結果を返していたが、これだと entry point 1 点の非受理（RLS フィルタ・行
+削除で偶然除外される等）だけで次の索引再構築まで ANN 経路が無条件に無効化
+され、「可視カーディナリティが `full_scan_ratio` 以上なら ANN を使う」という
+本 Issue の切替設計と整合しない（codex-review P2 指摘・PR #435）。是正後は
+`HnswIndex::find_alternate_entry` が受理ノードの中からレベル最大のものを
+代替探索起点として選び、その起点が存在する最上層から通常どおり降下する。
+受理ノードが 1 つも無い場合のみ空の結果を返す（`sql::hnsw_cache::
+search_with_overlay` の `masked_short` 経由で plain scan へ縮退する）。
+`None`（既存呼び出し元）はビット同一の結果を返す
+（`hnsw::tests::search_masked_none_matches_search` で機械検証）。停止条件
+（`results.len() >= ef && strictly_farther` の場合のみ打ち切る）は変更して
+いない。
 
 この是正により、マスク密度が低い（`stale_nodes`／WHERE 除外行が多い）クエリ
 ほど探索がグラフの非受理ノードで分断されやすくなり、`masked_short` 経由の

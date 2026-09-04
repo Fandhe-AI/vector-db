@@ -1170,6 +1170,34 @@ impl HnswIndex {
         Ok(Some(current))
     }
 
+    /// [`Self::search_masked`] 用: 固定 entry point（[`Self::entry_point`]）が
+    /// `mask` に非受理のときの代替探索起点選択（codex-review P2 指摘対応。
+    /// `search_masked` ドキュメンテーションコメント参照）。全ノードを 1 度だけ
+    /// 線形走査し、`mask` が受理するノードのうちレベル最大のもの（同点は id
+    /// 最小。決定性を保つため）を返す。受理ノードが 1 つも無ければ `None`。
+    ///
+    /// entry point の非受理は探索経路上の他ノードの受理可否とは独立事象（RLS
+    /// フィルタ・行削除で entry point だけが偶然除外される場合を含む）なので、
+    /// この走査コストは fixed entry point 1 点の非受理だけで索引全体を次の
+    /// 再構築まで brute-force へ縮退させる事故を避けるための対価として許容する
+    /// （このパス自体、entry point が非受理の場合にのみ発生する）。
+    fn find_alternate_entry(&self, mask: &NodeMask) -> Option<u32> {
+        let mut best: Option<(u32, usize)> = None;
+        for (idx, node) in self.nodes.iter().enumerate() {
+            let Ok(id) = u32::try_from(idx) else {
+                continue;
+            };
+            if !mask.get(id) {
+                continue;
+            }
+            match best {
+                Some((_, best_level)) if best_level >= node.level => {}
+                _ => best = Some((id, node.level)),
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     /// `search_layer`（Algorithm 2）。層 `level` 上で `entry_points` から出発し、
     /// 幅 `ef` の貪欲拡張探索を行い、`dot` 降順（同点は id 昇順）に並んだ最大 `ef`
     /// 件の候補を返す。`pub(crate)` にして #405（探索 API）が `ef_search` で再利用
@@ -1549,18 +1577,27 @@ impl HnswIndex {
     }
 
     /// [`Self::search`] のマスク付き版（Issue #409。Issue #431・codex-review P0
-    /// 是正で上位層の貪欲降下も含めマスクを一貫適用する形へ変更）。`mask` が
-    /// `Some` の場合、上位層の貪欲降下（[`Self::greedy_descend_masked`]）・
-    /// 層 0 のビーム探索（[`Self::search_layer`]）のいずれも `mask` を候補マスク
-    /// として渡し、`mask` が受理しないノード（削除・不可視化・キー変更で失効した
-    /// ノード）は探索経路のどの段階でも一切スコア計算・探索の起点として使わない
+    /// 是正で上位層の貪欲降下も含めマスクを一貫適用する形へ変更。さらに
+    /// codex-review P2 指摘対応で固定 entry point 自体が非受理の場合の代替
+    /// 探索起点選択を追加）。`mask` が `Some` の場合、上位層の貪欲降下
+    /// （[`Self::greedy_descend_masked`]）・層 0 のビーム探索
+    /// （[`Self::search_layer`]）のいずれも `mask` を候補マスクとして渡し、
+    /// `mask` が受理しないノード（削除・不可視化・キー変更で失効したノード）は
+    /// 探索経路のどの段階でも一切スコア計算・探索の起点として使わない
     /// （`docs/design/ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」
-    /// 節の P0 安全条件）。上位層の降下で受理ノードへ到達できない場合（貪欲降下の
-    /// 起点自体が非受理）は空の結果を返し（`Ok(Vec::new())`）、呼び出し元
-    /// （`sql::hnsw_cache::search_with_overlay`）が `masked_short` として
-    /// plain scan へ縮退する。`None` の場合は [`Self::search`] とビット同一の
-    /// 結果を返す（`crate::hnsw::tests::search_masked_none_matches_search` で
-    /// 機械検証）。
+    /// 節の P0 安全条件）。
+    ///
+    /// 固定 entry point（[`Self::entry_point`]）自体が `mask` に非受理の場合、
+    /// 直ちに空集合へ縮退せず、[`Self::find_alternate_entry`] で受理ノードの
+    /// 中から代替探索起点（受理ノードのうちレベル最大・同点は id 最小）を選び、
+    /// その代替起点が存在する最上層から通常どおり降下する（可視カーディナリティ
+    /// が `full_scan_ratio` 以上で ANN 経路を選ぶ設計—Issue #409—と整合させる
+    /// ため、entry point 1 点の非受理だけで索引全体が次の再構築まで無効化される
+    /// 事故を避ける）。受理ノードが 1 つも無い場合のみ空の結果を返し
+    /// （`Ok(Vec::new())`）、呼び出し元（`sql::hnsw_cache::search_with_overlay`）
+    /// が `masked_short` として plain scan へ縮退する。`None` の場合は
+    /// [`Self::search`] とビット同一の結果を返す
+    /// （`crate::hnsw::tests::search_masked_none_matches_search` で機械検証）。
     ///
     /// # エラー
     ///
@@ -1613,9 +1650,25 @@ impl HnswIndex {
             return Ok(Vec::new());
         };
 
-        let mut nearest = entry;
-        if top_level > 0 {
-            for l in (1..=top_level).rev() {
+        // 固定 entry point が非受理なら、受理ノードの中から代替探索起点を選ぶ
+        // （codex-review P2 指摘対応。§本関数ドキュメンテーションコメント参照）。
+        // 代替起点は自身が存在する最上層（`alt_level <= top_level`。全ノードは
+        // 層 0..=自身の level に存在するため）までしか降下できないので、以降の
+        // 降下ループの上限もそれに合わせて縮める。
+        let (mut nearest, effective_top) = match mask {
+            Some(m) if !m.get(entry) => match self.find_alternate_entry(m) {
+                Some(alt) => {
+                    let alt_level = self.level_of(alt).unwrap_or(0);
+                    (alt, top_level.min(alt_level))
+                }
+                // 受理ノードが 1 つも無い: ANN 経路では応答不能なので
+                // plain scan への縮退に委ねる。
+                None => return Ok(Vec::new()),
+            },
+            _ => (entry, top_level),
+        };
+        if effective_top > 0 {
+            for l in (1..=effective_top).rev() {
                 nearest = match self.greedy_descend_masked(
                     nearest,
                     query,
@@ -1625,10 +1678,10 @@ impl HnswIndex {
                     mask,
                 )? {
                     Some(n) => n,
-                    // 非受理ノードを経由しないと降下を続けられない: この層より下へ
-                    // 安全に進められる `nearest` が存在しないため、探索全体を
-                    // fail-closed に打ち切る（§本関数ドキュメンテーションコメント
-                    // 参照）。
+                    // 到達しない防御的分岐: `nearest` は代替起点選択の時点で
+                    // 受理済みであることを検証しており、`greedy_descend_masked`
+                    // は受理済みの候補へしか `current` を進めないため、以降の
+                    // 呼び出しでも常に受理済みノードを渡している。
                     None => return Ok(Vec::new()),
                 };
             }
@@ -2376,15 +2429,16 @@ mod tests {
             }
         }
         // Issue #431 是正により、探索経路（貪欲降下・ビーム探索の候補展開）は
-        // マスク外ノードを一切通過しなくなった。エントリポイント自身が非受理だと
-        // 降下の起点を持てず即座に空集合を返す契約（§`search_masked` ドキュメン
-        // テーションコメント参照）のため、本テストが検証したい「受理ノードの
-        // 部分集合が返る」性質を確認するにはエントリポイントを受理側へ含める
-        // 必要がある（受理側の連結性そのものはテストの関心事ではない）。
+        // マスク外ノードを一切通過しなくなった。エントリポイント自身が非受理でも
+        // 代替探索起点選択（codex-review P2 指摘対応・§`search_masked` ドキュメン
+        // テーションコメント参照）により空集合へは縮退しなくなったため、本テスト
+        // ではエントリポイントを意図的に mask から外したまま「受理ノードの
+        // 部分集合が返る」性質を検証する（代替起点選択の直接的な検証は
+        // `search_masked_falls_back_to_alternate_entry_when_fixed_entry_masked_out`）。
         let entry = index
             .entry_point()
             .expect("non-empty index has an entry point");
-        mask.set(entry);
+        let _ = entry;
         let query = gen_corpus(1234, dim, 1);
         let mut scratch = HnswSearchScratch::default();
         let results = index
@@ -2419,6 +2473,59 @@ mod tests {
             .search_masked(&query, 10, 40, Some(&mask), &mut scratch)
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    /// codex-review P2 指摘対応（§`search_masked` ドキュメンテーションコメント
+    /// 「固定 entry point 自体が `mask` に非受理の場合」節）: 固定 entry point
+    /// だけをマスク外にし、他の受理ノードは十分に残す（密度 99%）。旧実装では
+    /// entry point の非受理だけで貪欲降下の起点を持てず直ちに空集合を返して
+    /// いたが、代替探索起点選択（[`HnswIndex::find_alternate_entry`]）により
+    /// 受理ノードから探索できることを確認する。
+    #[test]
+    fn search_masked_falls_back_to_alternate_entry_when_fixed_entry_masked_out() {
+        let dim = 8usize;
+        let n = 300;
+        let vectors = gen_corpus(21, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+            ..HnswParams::default()
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 21).unwrap();
+        let entry = index
+            .entry_point()
+            .expect("non-empty index has an entry point");
+
+        // 固定 entry point だけを非受理にし、他の全ノードを受理する
+        // （`NodeMask` に unset API は無いため、entry を除いて `set` する）。
+        let mut mask = NodeMask::new(index.len());
+        for node in 0..index.len() as u32 {
+            if node != entry {
+                mask.set(node);
+            }
+        }
+        assert!(!mask.get(entry), "fixed entry point must be masked out");
+
+        let query = gen_corpus(4321, dim, 1);
+        let mut scratch = HnswSearchScratch::default();
+        let results = index
+            .search_masked(&query, 20, 80, Some(&mask), &mut scratch)
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "masked search must fall back to an alternate entry point instead of \
+             degrading to an empty result solely because the fixed entry point is \
+             masked out"
+        );
+        for hit in &results {
+            assert!(
+                mask.get(hit.id as u32),
+                "hit {} must be within the mask (never the excluded entry point {entry})",
+                hit.id
+            );
+            assert_ne!(hit.id as u32, entry);
+        }
     }
 
     #[test]
