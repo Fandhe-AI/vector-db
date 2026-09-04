@@ -89,6 +89,20 @@ plain scan 縮退が起きやすくなる（性能上のトレードオフであ
 ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」節が定める P0
 安全条件を優先した結果。filter-aware な専用探索方式は #410 以降の検討課題）。
 
+さらに codex-review P2 指摘対応（PR #435）で、`masked_short` の件数検査
+（`min(k, visible_in_index)` 未満なら plain scan）だけでは検出できない
+recall バグを是正した——マスクが複数の連結成分に分かれ、かつ探索起点側の
+成分だけで結果件数を満たせてしまう場合、件数検査は通過するが、探索が
+一度も訪れていない別成分により近い受理ノードを取りこぼす可能性がある。
+`HnswIndex::search_masked` は、実探索が層 0 で使う起点から辿った先に、
+[`HnswIndex::accepted_reachable_at_least`]（層 0 の隣接リストのみを辿る
+BFS。非受理ノードを中継点に使わない実探索と同じ規約。ベクトルアクセス・
+スコア計算は行わない）でマスクの受理ノード総数を覆えるかを検証し、覆え
+なければ結果件数に関わらず空集合を返す（呼び出し元の `masked_short` 経由
+plain scan 縮退へ委ねる）。連結性が保証できないマスクは常に安全側
+（plain scan）へ倒す、という判断で、multi-entry-point 探索の実装は見送った
+（filter-aware な専用探索方式の検討は引き続き #410 の担当）。
+
 `HnswIndex::search`（既存公開 API）は `search_masked(.., None, ..)` へ委譲する
 薄いラッパーへ変更した。挙動・公開シグネチャは不変。
 

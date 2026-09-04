@@ -1198,6 +1198,76 @@ impl HnswIndex {
         best.map(|(id, _)| id)
     }
 
+    /// [`Self::search_masked`] の到達可能性検証（codex-review P2 指摘対応・
+    /// PR #435）。単一 entry point からの誘導部分グラフ探索では、候補マスクが
+    /// 複数の連結成分に分かれている場合、entry 側の成分だけで結果件数
+    /// （`min(k, visible_in_index)`）が満たされてしまい、探索が一度も訪れて
+    /// いない別成分により近い受理ノードが存在していても、件数検査
+    /// （`sql::hnsw_cache::search_with_overlay` の `masked_short`）を素通り
+    /// してしまう。本関数は層 0 の隣接リストのみを辿る BFS（ベクトルへの
+    /// アクセス・スコア計算は一切行わない、辺の走査のみ）で `start` から
+    /// 到達可能な受理ノード数を数え、`target` 件（＝マスクの受理ノード総数）
+    /// に達した時点で早期終了する。辿るのは実探索
+    /// （[`Self::search_layer`]／[`Self::greedy_descend_masked`]）と同じ規約
+    /// ——非受理ノードは訪問済みにするのみで、その先の隣接ノードへは一切
+    /// 辿らない（Issue #431 是正・`search_masked_does_not_traverse_through_
+    /// a_rejected_bridge_node` で固定した契約と同じ）——に限定し、実探索が
+    /// 構造的に到達できないノードを「到達可能」と誤判定しないようにする。
+    ///
+    /// 戻り値が `target` 未満なら、`start` から到達不能な受理ノードがマスク中に
+    /// 存在する（＝マスクが複数の連結成分に分かれている）ことが確定し、呼び
+    /// 出し元は件数検査の結果に関わらず「探索が尽くされていない」と判断すべき
+    /// （`docs/design/hnsw-rls-cardinality-switch.md`「masked_short」節）。
+    /// `visited` は呼び出し元が所有する [`HnswSearchScratch::visited`] を再利用
+    /// する（本関数の呼び出し直後に `search_layer` が同じスクラッチを
+    /// リセットしてから使うため、ここでの破壊的変更は後続へ影響しない）。
+    fn accepted_reachable_at_least(
+        &self,
+        start: u32,
+        mask: &NodeMask,
+        target: usize,
+        visited: &mut VisitedBitmap,
+    ) -> usize {
+        visited.reset(self.nodes.len());
+        if visited.mark_visited(start as usize) != Some(false) {
+            return 0;
+        }
+        if !mask.get(start) {
+            // 非受理ノードを起点に辿ることはない契約（呼び出し元は受理済みの
+            // `nearest` のみを渡す）。防御的に「到達可能な受理ノード 0 件」を
+            // 返す。
+            return 0;
+        }
+        let mut count = 1usize;
+        if count >= target {
+            return count;
+        }
+        let mut queue: VecDeque<u32> = VecDeque::new();
+        queue.push_back(start);
+        while let Some(node) = queue.pop_front() {
+            let Some(neighbors) = self.neighbors(0, node) else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                match visited.mark_visited(neighbor as usize) {
+                    Some(false) => {}
+                    _ => continue,
+                }
+                if !mask.get(neighbor) {
+                    // 非受理ノードはここで打ち切り、この先へは辿らない
+                    // （§本関数ドキュメンテーションコメント参照）。
+                    continue;
+                }
+                count = count.saturating_add(1);
+                if count >= target {
+                    return count;
+                }
+                queue.push_back(neighbor);
+            }
+        }
+        count
+    }
+
     /// `search_layer`（Algorithm 2）。層 `level` 上で `entry_points` から出発し、
     /// 幅 `ef` の貪欲拡張探索を行い、`dot` 降順（同点は id 昇順）に並んだ最大 `ef`
     /// 件の候補を返す。`pub(crate)` にして #405（探索 API）が `ef_search` で再利用
@@ -1595,8 +1665,17 @@ impl HnswIndex {
     /// ため、entry point 1 点の非受理だけで索引全体が次の再構築まで無効化される
     /// 事故を避ける）。受理ノードが 1 つも無い場合のみ空の結果を返し
     /// （`Ok(Vec::new())`）、呼び出し元（`sql::hnsw_cache::search_with_overlay`）
-    /// が `masked_short` として plain scan へ縮退する。`None` の場合は
-    /// [`Self::search`] とビット同一の結果を返す
+    /// が `masked_short` として plain scan へ縮退する。
+    ///
+    /// 選んだ探索起点（`nearest`）が属する連結成分だけでは受理ノードを
+    /// すべて覆えない場合——マスクが複数の連結成分に分かれ、`nearest` から
+    /// 到達不能な受理ノードが存在する場合——も同様に空集合を返す
+    /// （[`Self::accepted_reachable_at_least`] による到達可能性検証。
+    /// codex-review P2 指摘対応・PR #435）。結果件数がたまたま `k` を
+    /// 満たしても、探索が一度も訪れていない別成分により近い候補が存在する
+    /// 可能性を排除できないため、件数のみでの十分性判定はしない。
+    ///
+    /// `None` の場合は [`Self::search`] とビット同一の結果を返す
     /// （`crate::hnsw::tests::search_masked_none_matches_search` で機械検証）。
     ///
     /// # エラー
@@ -1684,6 +1763,24 @@ impl HnswIndex {
                     // 呼び出しでも常に受理済みノードを渡している。
                     None => return Ok(Vec::new()),
                 };
+            }
+        }
+
+        // マスクが複数の連結成分に分かれ、`nearest` から到達不能な受理ノードが
+        // 存在する場合、以降のビーム探索が結果件数を満たしても「別成分により
+        // 近い候補を一切探索していない」可能性を排除できない（codex-review
+        // P2 指摘対応・PR #435。§`accepted_reachable_at_least` ドキュメンテー
+        // ションコメント参照）。件数検査を待たず空集合を返し、呼び出し元
+        // （`sql::hnsw_cache::search_with_overlay`）の `masked_short` 経由の
+        // plain scan 縮退へ委ねる。
+        if let Some(m) = mask {
+            let target = m.count_ones();
+            if target > 0 {
+                let reachable =
+                    self.accepted_reachable_at_least(nearest, m, target, &mut scratch.visited);
+                if reachable < target {
+                    return Ok(Vec::new());
+                }
             }
         }
 
@@ -2269,7 +2366,14 @@ mod tests {
     /// （`None`）では `node1` を中継して最良スコアの `node2` を発見できるが、
     /// マスクありでは `node1` が候補ヒープへ一切積まれなくなったため
     /// （§`search_layer` ドキュメンテーションコメント参照）`node2` へは
-    /// 到達できず、エントリポイント自身の `node0` のみが結果に残る。
+    /// 到達できない。この状態は「マスクが `node0` と `node2` の 2 つの連結
+    /// 成分に分断されている」ことと同義であり、`node0` だけを返すと
+    /// `node0` より真に近い `node2`（マスク受理済み）を一切探索しないまま
+    /// 結果を確定してしまう recall バグになる。[`HnswIndex::
+    /// accepted_reachable_at_least`] による到達可能性検証（codex-review P2
+    /// 指摘対応・PR #435）が `node2` への到達不能を検出し、`node0` 単体の
+    /// 部分結果ではなく空集合（`masked_short` 経由の plain scan 縮退へ委ねる
+    /// 契約）を返すことを固定する。
     #[test]
     fn search_masked_does_not_traverse_through_a_rejected_bridge_node() {
         let dim = 1usize;
@@ -2316,10 +2420,12 @@ mod tests {
             .search_masked(&query, 3, 10, Some(&mask), &mut scratch)
             .expect("masked search should succeed");
         assert_eq!(
-            masked.iter().map(|h| h.id).collect::<Vec<_>>(),
-            vec![0],
-            "masked search must not traverse through the rejected bridge node1, \
-             so node2 (reachable only via node1) must not appear in the results"
+            masked,
+            Vec::new(),
+            "masked search must not traverse through the rejected bridge node1, and \
+             since node2 (mask-accepted, unreachable without node1) may be strictly \
+             closer than node0, returning node0 alone as a complete answer would be a \
+             silent recall bug; the caller must instead fall back to plain scan"
         );
     }
 
@@ -2526,6 +2632,78 @@ mod tests {
             );
             assert_ne!(hit.id as u32, entry);
         }
+    }
+
+    /// codex-review P2 指摘の中核シナリオ（PR #435）: マスクが複数の連結成分に
+    /// 分かれ、かつ **entry 側の成分だけで結果件数 `k` を満たしてしまう**場合
+    /// （`search_masked_does_not_traverse_through_a_rejected_bridge_node` の
+    /// ケースは `k` が成分サイズを上回り件数検査でも検出できたが、本ケースは
+    /// 件数検査だけでは検出できない）。
+    ///
+    /// entry 側成分 `{node0(entry), node1, node2}`（`0 -> 1 -> 2` の一本道、
+    /// スコアは 1.0/2.0/3.0）はすべて受理され、`k=2` の結果件数は成分内だけで
+    /// 満たせる。一方、entry 側成分と辺で一切繋がっていない孤立ノード
+    /// `node3`（スコア 100.0・受理済み）がクエリに最も近い真の正解だが、
+    /// 単一 entry point からの誘導部分グラフ探索では構造的に到達不能。
+    /// [`HnswIndex::accepted_reachable_at_least`] による到達可能性検証が
+    /// 「entry 側成分（3 件）だけではマスクの受理ノード総数（4 件）を覆え
+    /// ない」ことを検出し、`node1`・`node2` だけの部分結果（件数検査は通過
+    /// するが node3 を取りこぼす recall バグ）ではなく空集合を返すことを
+    /// 固定する。
+    #[test]
+    fn search_masked_detects_unreachable_component_even_when_reachable_component_satisfies_k() {
+        let dim = 1usize;
+        let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 100.0];
+        let index = HnswIndex {
+            params: HnswParams::default(),
+            dim: dim as u32,
+            nodes: vec![
+                Node {
+                    level: 0,
+                    links: vec![vec![1]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![vec![2]],
+                },
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+                // node3: entry 側成分とは辺を一切持たない孤立ノード（スコア最良）。
+                Node {
+                    level: 0,
+                    links: vec![Vec::new()],
+                },
+            ],
+            entry_point: Some(0),
+            vectors: Arc::from(vectors),
+        };
+        let query = [1.0f32];
+        let mut scratch = HnswSearchScratch::default();
+
+        // マスクなしなら node3（辺で到達できないため実際には brute-force 経由
+        // でしか見つからない）を除く全ノードをスコア降順で返す。ここでは前提
+        // 確認として、マスク付き探索の対象になる「entry 側成分内の順位」を
+        // 確認するに留める。
+        let mut mask = NodeMask::new(index.len());
+        mask.set(0);
+        mask.set(1);
+        mask.set(2);
+        mask.set(3); // node3 も受理（到達不能なだけで RLS 上は可視）。
+
+        let masked = index
+            .search_masked(&query, 2, 10, Some(&mask), &mut scratch)
+            .expect("masked search should succeed");
+        assert_eq!(
+            masked,
+            Vec::new(),
+            "reachable component alone satisfies k=2 (node1, node2), but node3 \
+             (mask-accepted, strictly closer, unreachable from the chosen entry) is \
+             never explored; returning the reachable component's hits as a complete \
+             top-k would be a silent recall bug that a count-only sufficiency check \
+             cannot detect"
+        );
     }
 
     #[test]
