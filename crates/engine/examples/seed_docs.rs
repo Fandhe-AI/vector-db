@@ -12,8 +12,10 @@
 //! （`seed-batch-<n>`）も決定的なため、同じ `<rows> <dim>` で再実行すると既存の
 //! `docs` テーブル（スキーマ一致時のみ再利用）へ未投入バッチだけを追加する。
 //! 投入済みバッチは台帳の同一内容再送（`DuplicateOperationId`）として検出しスキップ
-//! する。`<rows>` や `<dim>` を変えて再実行した場合は内容不一致
-//! （`OperationIdContentMismatch`）またはスキーマ不一致として fail-closed に停止する。
+//! する。実行全体の `<rows> <dim>` は補助テーブル `seed_meta` へ固定 `operation_id`
+//! （`seed-meta`）の 1 行として最初に記録し、再実行時は同じ台帳照合で
+//! 「同一内容（再開）／内容不一致（fail-closed に停止）」を処理開始前に判定する。
+//! `<dim>` の変更は `docs` のスキーマ不一致としても停止する。
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::embedding::{Embedder, HashingEmbedder};
 use engine::policy::PolicyContext;
@@ -215,6 +217,53 @@ fn vec_literal(v: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// 実行全体の `<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
+/// 再実行時は台帳の内容照合で「同一（再開）／不一致（停止）」を処理開始前に判定する。
+fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, dim: u32) {
+    let schema = TableSchema::new(
+        "seed_meta",
+        vec![
+            ColumnDef::new("embedding", ColumnType::Vector(1), false),
+            ColumnDef::new("params", ColumnType::Text, false),
+        ],
+    );
+    match storage.create_table(&schema) {
+        Ok(()) | Err(CatalogError::TableAlreadyExists(_)) => {}
+        Err(e) => panic!("create table seed_meta: {e}"),
+    }
+    let params = format!("rows={rows};dim={dim}");
+    let meta = encode_scalar_columns(
+        &schema,
+        &[Value::Vector(vec![0.0]), Value::Text(params.clone())],
+    )
+    .expect("encode seed_meta");
+    let embedding = [0.0f32];
+    let inputs = [(
+        1u64,
+        RowInput {
+            tenant_id: ctx.tenant_id(),
+            visibility: Visibility::Public,
+            embedding: &embedding,
+            metadata: &meta,
+        },
+    )];
+    let op = OperationId::parse("seed-meta").expect("op");
+    match engine::tenant::insert_rows(storage, "seed_meta", ctx, &inputs, &op) {
+        Ok(()) => {}
+        Err(TenantWriteError::DuplicateOperationId) => {
+            eprintln!("resuming: run metadata matches ({params})");
+        }
+        Err(TenantWriteError::OperationIdContentMismatch) => {
+            eprintln!(
+                "error: this db was seeded with different <rows> <dim>; \
+                 rerun with the original values or use a new <db> path"
+            );
+            std::process::exit(2);
+        }
+        Err(e) => panic!("insert seed_meta: {e}"),
+    }
+}
+
 /// 使い方を表示して終了する（引数不足・不明なサブコマンド）。
 fn usage() -> ! {
     eprintln!("usage: seed_docs seed <db> <rows> <dim> | embed <dim> <text...>");
@@ -276,6 +325,7 @@ fn main() {
                 Err(e) => panic!("create table: {e}"),
             }
             let ctx_a = PolicyContext::new("tenant-a").expect("ctx");
+            record_or_verify_run_meta(&storage, &ctx_a, rows, dim);
             let ctx_b = PolicyContext::new("tenant-b").expect("ctx");
             let mut rng = Lcg(20260831);
             let batch = (rows / 10).clamp(1, 1000);
@@ -284,7 +334,9 @@ fn main() {
             let mut batch_no = 0u64;
             let (mut rows_a, mut rows_b) = (0u64, 0u64);
             while id <= rows {
-                let end = (id + batch - 1).min(rows);
+                // `id <= rows` のため `rows - id` は非負で、`end <= rows` が保証される
+                // （`id + batch - 1` の直接加算は `rows` が `u64::MAX` 付近でオーバーフローする）。
+                let end = id + (batch - 1).min(rows - id);
                 // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）
                 let (ctx, tenant_tag) = if batch_no % 10 == 9 {
                     (&ctx_b, "b")
@@ -369,6 +421,9 @@ fn main() {
                     rows_a += end - id + 1;
                 }
                 batch_no += 1;
+                if end == rows {
+                    break;
+                }
                 id = end + 1;
                 if batch_no.is_multiple_of(10) {
                     eprintln!(
