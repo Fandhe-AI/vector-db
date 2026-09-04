@@ -305,6 +305,19 @@ current_generation` による事前・事後の失効照合とは独立した読
   WHERE を満たさない行の非混入・`subset_searches > 0`（非 vacuous）・キャッシュ
   非登録（`stats.entries` がフィルタなしクエリのベースラインから変化しない）。
   Rust API 結線の Recall@10 ≥ 0.9・可視外テナント非混入・非 vacuous
+- 結合（`full_scan_ratio_ann_side_matches_brute_force_and_never_leaks_across_tenants`／
+  `full_scan_ratio_plain_scan_side_matches_brute_force_and_never_leaks_across_tenants`。
+  Issue #409 申し送り。受入基準 2「切替閾値の前後で結果が brute-force と同水準」
+  の直接検証）: `FullVisible` 形状で可視カーディナリティ比が `full_scan_ratio`
+  以上（既定 1/10・削除なし）の場合は ANN 側（`stats.hits > 0`・
+  `stats.plain_scans == 0`）、比を `full_scan_ratio`（95/100 へ引き上げ）未満へ
+  下げた場合（`REBUILD_DELTA_RATIO`〔1/10〕を超えない churn 幅の削除で誘発し
+  再構築とは区別する）は plain scan 側（`stats.plain_scans > 0`・
+  `stats.builds` 不変）を踏むこと、いずれも既定エンジン対照 Recall@10 ≥ 0.9
+  （plain scan 側は ≥ 0.99）・可視外テナント行および削除済み行の非混入を固定
+- 単体（`hnsw.rs` in-module。`full_scan_ratio_defaults_and_rejects_invalid_ratios`）:
+  `full_scan_ratio` の既定値 1/10・分母 0／分子 > 分母の `HnswError::InvalidParams`
+  拒否
 - `make core-api-check`（`SearchProvider`/`VectorCore` trait 差分ゼロ）・
   `make sort-determinism-check` green
 
