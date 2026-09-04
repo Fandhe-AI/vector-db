@@ -6,7 +6,8 @@ HnswIndexCache`）・#409（`docs/design/hnsw-rls-cardinality-switch.md`）。�
 RLS-1〜4・TASK-138・TASK-139。ADR: `docs/design/ann-index-adoption.md`
 （Accepted・B 案）。本ドキュメントが定める閾値・ラウンド上限・統計名はいずれも
 本リポの実装既定値（非規範）であり、`wire_code` の新設・`EXPLAIN` への露出
-（#411）は行わない。
+（#411）は行わない（#411 は実装済みだが、ラウンド数・実行時縮退結果は
+引き続き非露出。`docs/design/explain-search-engine-exposure.md` 参照）。
 
 ## 背景・目的
 
@@ -246,7 +247,9 @@ Issue 起票時の作業内容に「訪問済みビットマップの引き継�
 
 ## 将来の拡張・申し送り（本 Issue のスコープ外）
 
-- `EXPLAIN` へのエンジン種別・ラウンド数・縮退有無の露出（#411）
+- ~~`EXPLAIN` へのエンジン種別・ラウンド数・縮退有無の露出（#411）~~ エンジン種別・
+  静的な ANN 適用判定のみ実装済み（ラウンド数・実行時縮退結果は引き続き非露出。
+  `docs/design/explain-search-engine-exposure.md` 参照）
 - Recall 3 ゲートの ANN 同一閾値検証（#412）・前後比較と `full_scan_ratio`
   ／`MAX_EF` 既定値の再調整（#413）
 - `precision` モード hybrid の ANN 化（確信度ゲート契約の再設計が前提）

@@ -39,6 +39,11 @@ impl LlmClient for StubLlmClient {
 
 const EXPANSION_RESPONSE: &str =
     r#"{"search_terms": ["alpha", "beta"], "path_hint": "docs/", "kind_hint": "fn"}"#;
+/// Issue #411 の HNSW opt-in テストで使う、検索語・ソフトヒントを持たない展開結果
+/// （行数を固定しやすくするため。`crates/engine/tests/sql_explain.rs::
+/// EXPANSION_RESPONSE_NO_HINTS` と同構成）。
+const EXPANSION_RESPONSE_NO_HINTS: &str =
+    r#"{"search_terms": [], "path_hint": null, "kind_hint": null}"#;
 
 fn new_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
     let path = temp_db::unique_db_path("wire-explain-docs");
@@ -114,6 +119,10 @@ fn explain_returns_query_plan_column_and_expected_rows() {
         "kind_hint: fn",
         "mode: recall",
         "mode_source: default",
+        // Issue #411: `new_core_with_docs_table` は `EngineCore::from_storage`
+        // （provider 直接注入・`kind` 不明）経由のため `engine: (custom_provider)`。
+        "engine: (custom_provider)",
+        "ann_plan: plain_scan_engine",
     ];
     for expected in expected_lines {
         let row = read_data_row(&mut stream);
@@ -138,12 +147,14 @@ fn explain_reports_query_clause_mode_source() {
     );
 
     let _columns = read_row_description(&mut stream);
-    let mut last_two = Vec::new();
-    for _ in 0..6 {
-        last_two.push(read_data_row(&mut stream)[0].clone().expect("cell"));
+    let mut rows = Vec::new();
+    for _ in 0..8 {
+        rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
     }
-    assert_eq!(last_two[4], "mode: precision");
-    assert_eq!(last_two[5], "mode_source: query_clause");
+    assert_eq!(rows[4], "mode: precision");
+    assert_eq!(rows[5], "mode_source: query_clause");
+    assert_eq!(rows[6], "engine: (custom_provider)");
+    assert_eq!(rows[7], "ann_plan: plain_scan_engine");
 
     assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
@@ -161,5 +172,102 @@ fn explain_rejects_plain_select_without_using_plan() {
         "EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 10",
     );
     expect_error_response_with_sqlstate(&mut stream, "42601");
+    read_ready_for_query(&mut stream);
+}
+
+fn new_hnsw_core_with_docs_table() -> (Arc<EngineCore>, temp_db::CleanupGuard) {
+    let path = temp_db::unique_db_path("wire-explain-hnsw-docs");
+    let guard = temp_db::CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    storage
+        .create_table(&TableSchema::new(
+            "docs",
+            vec![
+                ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                ColumnDef::new("path", ColumnType::Text, false),
+                ColumnDef::new("body", ColumnType::Text, false),
+            ],
+        ))
+        .expect("create table");
+
+    let ctx =
+        PolicyContext::with_visibilities("tenant-a", [Visibility::Public, Visibility::Private])
+            .expect("valid tenant");
+    engine::tenant::insert_typed_row(
+        &storage,
+        "docs",
+        &ctx,
+        1,
+        Visibility::Public,
+        &[
+            Value::Vector(vec![1.0, 0.0]),
+            Value::Text("docs/a.md".to_string()),
+            Value::Text("alpha content".to_string()),
+        ],
+        &engine::recovery::required_op_id::OperationId::parse("test-op")
+            .expect("valid operation_id"),
+    )
+    .expect("insert row");
+
+    let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+        .expect("valid hnsw params");
+    let core = EngineCore::from_storage_with_engine(storage, kind).with_query_planner(Box::new(
+        StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        },
+    ));
+    (Arc::new(core), guard)
+}
+
+/// Issue #411: HNSW opt-in エンジンでは `engine: hnsw`・`hnsw_params:`（既定値）・
+/// `ann_plan: hnsw_full_visible`（`WHERE` なし）を返す。
+#[test]
+fn explain_reports_hnsw_engine_and_full_visible_ann_plan() {
+    let (core, _guard) = new_hnsw_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+    );
+
+    let _columns = read_row_description(&mut stream);
+    let mut rows = Vec::new();
+    for _ in 0..7 {
+        rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
+    }
+    assert_eq!(rows[4], "engine: hnsw");
+    assert_eq!(
+        rows[5],
+        "hnsw_params: m=16,ef_construction=100,ef_search=64"
+    );
+    assert_eq!(rows[6], "ann_plan: hnsw_full_visible");
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
+    read_ready_for_query(&mut stream);
+}
+
+/// Issue #411: HNSW opt-in でも `USING MODE 'precision'` は
+/// `ann_plan: plain_scan_precision`（TASK-162・SEARCH-9。厳密 brute-force 経路
+/// を常に使う）。
+#[test]
+fn explain_reports_plain_scan_precision_ann_plan_for_hnsw_precision_mode() {
+    let (core, _guard) = new_hnsw_core_with_docs_table();
+    let (mut stream, _users_path) = spawn_with_alice(core);
+
+    send_simple_query(
+        &mut stream,
+        "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'precision'",
+    );
+
+    let _columns = read_row_description(&mut stream);
+    let mut rows = Vec::new();
+    for _ in 0..7 {
+        rows.push(read_data_row(&mut stream)[0].clone().expect("cell"));
+    }
+    assert_eq!(rows[4], "engine: hnsw");
+    assert_eq!(rows[6], "ann_plan: plain_scan_precision");
+
+    assert_eq!(read_command_complete(&mut stream), "EXPLAIN");
     read_ready_for_query(&mut stream);
 }

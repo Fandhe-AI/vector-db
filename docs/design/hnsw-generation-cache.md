@@ -191,7 +191,7 @@ Issue #409 で `k + stale_nodes` オーバーフェッチ方式を撤去し、`O
   付き DISTANCE（`Subset` 形状）は Issue #409 で、hybrid 密側再取得ループへの
   結線は Issue #410（`sql::hnsw_hybrid::HnswDenseProvider`）で結線済み。詳細は
   `docs/design/hnsw-hybrid-iterative-scan.md` 参照
-- `EXPLAIN` 露出（#411）
+- ~~`EXPLAIN` 露出（#411）~~ 実装済み。`docs/design/explain-search-engine-exposure.md` 参照
 - Recall ゲート同一閾値検証（#412）・前後比較実測（#413）
 - `VectorArena` の `Arc<[f32]>` 化による `HnswIndex::build` 時コピー縮退
   （#404〜#406 からの申し送りを継続）

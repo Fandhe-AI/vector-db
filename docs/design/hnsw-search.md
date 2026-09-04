@@ -14,7 +14,8 @@
 相当）を扱う。`search_engine.rs::SearchEngineKind` への variant 追加・
 `core.rs`／`sql/` 結線（#407・実装済み。`docs/design/hnsw-search-engine-wiring.md`）、
 並列構築（#406）、世代整合キャッシュ（#408）、
-RLS 統合・切替（#409／#410）、`EXPLAIN` 露出（#411）、Recall ゲート接続
+RLS 統合・切替（#409／#410）、`EXPLAIN` 露出
+（#411・実装済み。`docs/design/explain-search-engine-exposure.md` 参照）、Recall ゲート接続
 （#412）、前後比較（#413）、永続化はいずれも別タスクの担当であり、本タスクは
 `hnsw.rs` 内部に閉じた実装（wire／SQL に露出しない・`wire_code` を新設しない）
 に留める。
