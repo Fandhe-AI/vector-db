@@ -38,9 +38,13 @@ bound.expr_filters.is_empty()`（`sql::sparse_cache::SparseIndexCache` の hybri
 版適用条件と対称）。この条件下ではアリーナが「RLS 可視行の全集合」となり、同一
 `(table, ctx, 世代)` でスロット割当まで決定的に再現される（redb 走査順・RLS
 判定の純粋性に依存する既存不変条件。`sql::sparse_cache` の適用条件と同根）。
-フィルタ付きクエリ（#409／#410 の filter-aware 探索の担当）・hybrid の密側
-（#410 の決定性契約の担当）・`precision_completeness_unbounded == true` の経路
-（`sql::exec.rs` が DISTANCE 段自体を実行しない）は従来どおり全件 brute-force。
+フィルタ付きクエリ・hybrid の密側・`precision_completeness_unbounded == true`
+の経路（`sql::exec.rs` が DISTANCE 段自体を実行しない）は従来どおり全件
+brute-force——**本 Issue（#408）時点の適用条件**。フィルタ付きクエリ（`Subset`
+形状）は Issue #409、hybrid の密側（`sql::hnsw_hybrid::HnswDenseProvider`）は
+Issue #410 でそれぞれ別経路として結線済み（`precision` は対象外のまま）。
+詳細は `docs/design/hnsw-rls-cardinality-switch.md`・
+`docs/design/hnsw-hybrid-iterative-scan.md` 参照。
 
 Rust API（`VectorCore::search`）は本キャッシュを経由しない（`sql::sparse_cache`・
 `sql::arena_cache` と同じ段階化。`PrefilterSnapshot`・ストレージ全体世代への
@@ -184,8 +188,9 @@ Issue #409 で `k + stale_nodes` オーバーフェッチ方式を撤去し、`O
   索引結線~~ Issue #409 で `rls.rs::PrefilterSnapshot::search_with_hnsw` として
   結線済み（`FullVisible` 形状のみ。`SearchTimeFilter` は対象外のまま）
 - ~~hybrid 密側・フィルタ付きクエリの ANN 化（#409／#410）~~ SCALAR 事前フィルタ
-  付き DISTANCE（`Subset` 形状）は Issue #409 で結線済み。hybrid 密側・境界
-  再取得ループとの相互作用は引き続き #410 の担当
+  付き DISTANCE（`Subset` 形状）は Issue #409 で、hybrid 密側再取得ループへの
+  結線は Issue #410（`sql::hnsw_hybrid::HnswDenseProvider`）で結線済み。詳細は
+  `docs/design/hnsw-hybrid-iterative-scan.md` 参照
 - `EXPLAIN` 露出（#411）
 - Recall ゲート同一閾値検証（#412）・前後比較実測（#413）
 - `VectorArena` の `Arc<[f32]>` 化による `HnswIndex::build` 時コピー縮退

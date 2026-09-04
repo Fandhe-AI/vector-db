@@ -472,6 +472,25 @@ pub(crate) fn execute_statement_with_cache(
         && !is_precision
         && !filters_empty
         && plan.scalar_prefilter;
+    // Issue #410: hybrid 密側の再取得ループ（`hybrid.rs::hybrid_search_boosted`
+    // の `dense_fetch_k` 倍増ループ）向けの適用条件。`hnsw_full_visible_eligible`／
+    // `hnsw_subset_eligible` と対称だが `is_hybrid` を要求する点のみが異なる
+    // （`FullVisible`／`Subset` の形状判定自体は DISTANCE と同じロジックを流用
+    // できる——両方とも「アリーナが可視全集合か WHERE 適用後の部分集合か」の
+    // 判定であり `Ranking` の種別に依存しない）。`precision` を除外する理由は
+    // DISTANCE と同じ（`precision_policy.hybrid()` の確信度ゲートは厳密順位を
+    // 前提とするため。TASK-162・SEARCH-9）。実際の結線は `sql::hnsw_hybrid::
+    // HnswDenseProvider` を介して行う（`hybrid.rs`・`SearchProvider` trait は
+    // 無変更）。詳細は `docs/design/hnsw-hybrid-iterative-scan.md` 参照。
+    let hnsw_hybrid_full_visible_eligible = hnsw_cache.is_some()
+        && is_hybrid
+        && !is_precision
+        && (filters_empty || !plan.scalar_prefilter);
+    let hnsw_hybrid_subset_eligible = hnsw_cache.is_some()
+        && is_hybrid
+        && !is_precision
+        && !filters_empty
+        && plan.scalar_prefilter;
     // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
     // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
     // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール
@@ -1032,6 +1051,52 @@ pub(crate) fn execute_statement_with_cache(
                     query,
                     k: k_eff,
                 };
+                // Issue #410: hybrid 密側の再取得ループ（下記の密のみ縮退経路・
+                // `hybrid::hybrid_search` の両方）へ HNSW を結線するアダプタ。
+                // `hnsw_hybrid_full_visible_eligible`／`hnsw_hybrid_subset_eligible`
+                // のいずれかが真かつ `hnsw_cache` が `Some` の場合のみ構築する。
+                // `prepare_full_visible`／`prepare_subset`（`Overlay::compute`／
+                // `IndexedBase::build` を伴う重い解決）はここで 1 回だけ呼び、
+                // 複数ラウンドにわたる `k` 依存の探索は `HnswDenseProvider::search`
+                // が都度 `search_prepared` で担う（`sql::hnsw_hybrid` モジュール
+                // ドキュメント参照）。`hybrid.rs`・`SearchProvider` trait は無変更。
+                let hnsw_dense_provider: Option<crate::sql::hnsw_hybrid::HnswDenseProvider<'_>> =
+                    if hnsw_hybrid_full_visible_eligible {
+                        hnsw_cache.as_ref().map(|access| {
+                            let prepared = crate::sql::hnsw_cache::prepare_full_visible(
+                                access,
+                                read_txn,
+                                &bound.table,
+                                ctx,
+                                arena,
+                            );
+                            crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                access, arena, &slot_ids, provider, prepared,
+                            )
+                        })
+                    } else if hnsw_hybrid_subset_eligible {
+                        hnsw_cache.as_ref().map(|access| {
+                            let prepared = crate::sql::hnsw_cache::prepare_subset(
+                                access,
+                                read_txn,
+                                &bound.table,
+                                ctx,
+                                arena,
+                            );
+                            crate::sql::hnsw_hybrid::HnswDenseProvider::new(
+                                access, arena, &slot_ids, provider, prepared,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                // 索引経路が適用条件を満たさない・`hnsw_cache` が `None`（
+                // `SearchEngineKind::Hnsw` opt-in 構築時以外）のいずれの場合も
+                // `provider`（従来どおり全件 brute-force）へフォールバックする。
+                let dense_provider: &dyn SearchProvider = match &hnsw_dense_provider {
+                    Some(adapter) => adapter,
+                    None => provider,
+                };
                 // Issue #357: キャッシュヒット済みの索引があればそれをそのまま使う。
                 // ミスの場合のみ `sparse_docs`（このクエリのスナップショットから
                 // 蓄積した本文）から新規構築し、`sparse_cache_eligible` なら
@@ -1091,7 +1156,9 @@ pub(crate) fn execute_statement_with_cache(
                             query,
                             k: cfg.pool_depth(),
                         };
-                        let dense_hits = provider.search(dense_input).map_err(map_kernel_error)?;
+                        let dense_hits = dense_provider
+                            .search(dense_input)
+                            .map_err(map_kernel_error)?;
                         // 可視集合への包含判定（件数ではなく所属のみを見るため多重集合の
                         // キー存在で判定する。TABLE-12 の重複 id については
                         // `core::provider_result_is_valid` のドキュメント参照）。
@@ -1110,10 +1177,16 @@ pub(crate) fn execute_statement_with_cache(
                         fused
                     }
                     Some(idx) => {
-                        hybrid::hybrid_search(provider, input, idx, query_text, k_eff, &cfg)
+                        hybrid::hybrid_search(dense_provider, input, idx, query_text, k_eff, &cfg)
                             .map_err(map_hybrid_error)?
                     }
                 };
+                // このクエリで観測された密側再取得ラウンド数を `HnswIndexCache` の
+                // 統計へ反映する（索引経路が一度も使われなかった場合は no-op。
+                // §`HnswDenseProvider::finish` ドキュメンテーションコメント参照）。
+                if let Some(adapter) = &hnsw_dense_provider {
+                    adapter.finish();
+                }
                 fused.into_iter().map(|h| (h.id, h.score)).collect()
             }
         }

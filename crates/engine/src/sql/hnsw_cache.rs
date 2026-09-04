@@ -19,7 +19,12 @@
 //! スロット割当まで含めて再現される（`sql::sparse_cache` の適用条件と同じ不変条件
 //! に依拠する）。SCALAR 事前フィルタが付く場合は [`search_subset_or_fallback`] が
 //! 担う `Subset` 形状（Issue #409。per-query 写像でキャッシュには登録しない）
-//! として扱う。hybrid の密側は対象外（#410 の担当）。加えて `bound.mode`
+//! として扱う。hybrid の密側（`Ranking::Hybrid`）は本モジュールの
+//! `search_or_fallback`／`search_subset_or_fallback` からは呼ばれず、`sql::
+//! hnsw_hybrid::HnswDenseProvider`（Issue #410）が [`prepare_full_visible`]／
+//! [`prepare_subset`]・[`search_prepared`] を直接呼ぶ別経路として結線される
+//! （詳細は `sql::hnsw_hybrid` モジュールドキュメント・
+//! `docs/design/hnsw-hybrid-iterative-scan.md` 参照）。加えて `bound.mode`
 //! （`sql::mode::SearchMode::Precision`。`USING PLAN` 経由の推定を含む）が
 //! `precision` のクエリも対象外（TASK-162・SEARCH-9。`precision::apply_gate` の
 //! 確信度ゲートは DISTANCE 段の Top-2 マージンを厳密順位に基づいて評価する必要が
@@ -136,12 +141,29 @@ pub struct HnswIndexCacheStats {
     /// 探索が縮退なしで完走した回数。`hits` とは独立に数える（`hits` は
     /// `FullVisible` 形状の `Ready` 到達かつ縮退なしの定義を変えない）。
     pub subset_searches: u64,
+    /// `search_masked` を呼ばず（`k > MAX_EF`）直ちに plain scan へ縮退した回数
+    /// （Issue #410。`fallbacks` の内数。`masked_short`／`mask_splits_graph` とは
+    /// 互いに排他。hybrid 密側再取得ループが `fetch_k` を [`crate::hnsw::MAX_EF`]
+    /// 超まで倍増した場合に到達しうる。DISTANCE 単発クエリでは `k_eff` が
+    /// `core::MAX_SEARCH_K` で有界化されているため通常到達しない）。
+    pub ef_cap_fallbacks: u64,
+    /// hybrid 密側の再取得ラウンド（`sql::hnsw_hybrid::HnswDenseProvider`）
+    /// として本キャッシュへ探索を委ねた回数（Issue #410。1 クエリで複数ラウンド
+    /// 呼ばれうるため `hybrid_queries` 以上になる）。
+    pub hybrid_dense_searches: u64,
+    /// hybrid 密側アダプタが `prepare_*` を実行したクエリ数（Issue #410。
+    /// `hybrid_dense_searches / hybrid_queries` が 1 クエリあたりの平均ラウンド数）。
+    pub hybrid_queries: u64,
+    /// 1 クエリ内で観測された hybrid 密側再取得ラウンド数の最大値（Issue #410。
+    /// `hybrid.rs::hybrid_search_boosted` の `dense_cap`／`MAX_FETCH_K` により
+    /// 高々 `⌈log2(dense_cap / (2·pool_depth))⌉ + 1` に有界。停止性の観測用）。
+    pub hybrid_rounds_max: u64,
     /// 現在キャッシュが保持しているエントリ数。
     pub entries: usize,
 }
 
 /// 世代 `built_table_generation` の可視行全体から構築した索引済みベース。
-struct IndexedBase {
+pub(crate) struct IndexedBase {
     index: Arc<HnswIndex>,
     /// `index` のノード番号 → 構築時点のキー（`(tenant_id, id)`）。
     node_keys: Vec<RowKey>,
@@ -211,7 +233,7 @@ impl IndexedBase {
 }
 
 /// 世代 `generation` の `arena` に対する `base` の差分オーバーレイ。
-struct Overlay {
+pub(crate) struct Overlay {
     generation: u64,
     /// 計算時点の `arena.len()`（`search_or_fallback` が使用時に再検証する）。
     arena_len: usize,
@@ -427,6 +449,10 @@ pub(crate) struct HnswIndexCache {
     masked_short: AtomicU64,
     mask_splits_graph: AtomicU64,
     subset_searches: AtomicU64,
+    ef_cap_fallbacks: AtomicU64,
+    hybrid_dense_searches: AtomicU64,
+    hybrid_queries: AtomicU64,
+    hybrid_rounds_max: AtomicU64,
 }
 
 /// [`HnswIndexCache::lookup`] の結果。
@@ -458,6 +484,37 @@ impl HnswIndexCache {
             masked_short: AtomicU64::new(0),
             mask_splits_graph: AtomicU64::new(0),
             subset_searches: AtomicU64::new(0),
+            ef_cap_fallbacks: AtomicU64::new(0),
+            hybrid_dense_searches: AtomicU64::new(0),
+            hybrid_queries: AtomicU64::new(0),
+            hybrid_rounds_max: AtomicU64::new(0),
+        }
+    }
+
+    /// hybrid 密側再取得ループの 1 ラウンドとして本キャッシュへ探索を委ねた
+    /// ことを記録する（Issue #410。`sql::hnsw_hybrid::HnswDenseProvider::search`
+    /// から呼ばれる。統計はテナント ID・行 ID を含まない best-effort カウンタ）。
+    pub(crate) fn record_hybrid_dense_search(&self) {
+        self.hybrid_dense_searches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// hybrid 密側アダプタが 1 クエリの寿命を終えた時点でラウンド数を記録する
+    /// （`hybrid_queries` を 1 加算し、`hybrid_rounds_max` をこのクエリの
+    /// ラウンド数で更新する。CAS ループは `Relaxed` の best-effort 統計のため
+    /// 競合時は緩く失敗を許容する）。
+    pub(crate) fn record_hybrid_query_rounds(&self, rounds: u64) {
+        self.hybrid_queries.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.hybrid_rounds_max.load(Ordering::Relaxed);
+        while rounds > current {
+            match self.hybrid_rounds_max.compare_exchange_weak(
+                current,
+                rounds,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -733,6 +790,10 @@ impl HnswIndexCache {
             masked_short: self.masked_short.load(Ordering::Relaxed),
             mask_splits_graph: self.mask_splits_graph.load(Ordering::Relaxed),
             subset_searches: self.subset_searches.load(Ordering::Relaxed),
+            ef_cap_fallbacks: self.ef_cap_fallbacks.load(Ordering::Relaxed),
+            hybrid_dense_searches: self.hybrid_dense_searches.load(Ordering::Relaxed),
+            hybrid_queries: self.hybrid_queries.load(Ordering::Relaxed),
+            hybrid_rounds_max: self.hybrid_rounds_max.load(Ordering::Relaxed),
             entries,
         }
     }
@@ -754,49 +815,48 @@ pub(crate) struct HnswCacheAccess<'a> {
     pub(crate) provider: HnswSearchProvider,
 }
 
-/// DISTANCE 段の索引済み探索＋未索引分 brute-force 併用の本体（Issue #408）。
+/// [`search_or_fallback`]／[`search_subset_or_fallback`] の「索引・オーバーレイの
+/// 解決」段（世代整合キャッシュの lookup／構築／再構築を伴う O(N) 相当の重い処理）
+/// と「Top-k 探索」段（`k` に依存し軽い）を分離するための中間表現（Issue #410）。
 ///
-/// `provider`（`&dyn SearchProvider`。呼び出し元がこのクエリ全体で使っている
-/// provider をそのまま渡す）は、索引を使わない全件 brute-force・未索引分の
-/// brute-force の両方に使う（`HnswSearchProvider::search` は常に
-/// `ParallelSearchProvider` へ委譲するため、索引側 hit と同じ意味論のスコアが返る）。
+/// hybrid 密側再取得ループ（`sql::hnsw_hybrid::HnswDenseProvider`）は同一クエリで
+/// `k`（＝ `fetch_k`）だけを変えて複数ラウンド探索するため、ラウンドごとに
+/// `Overlay::compute`／`IndexedBase::build` をやり直すと brute-force より重くなる。
+/// `prepare_full_visible`／`prepare_subset` で 1 回だけこの解決を行い、
+/// [`search_prepared`] をラウンド数分呼ぶことで解決結果を再利用する。
+pub(crate) enum PreparedHnswSearch {
+    /// 索引済みベース＋現世代のオーバーレイが揃っている（[`search_with_overlay`]
+    /// をそのまま呼べる）。
+    Indexed {
+        base: Arc<IndexedBase>,
+        overlay: Arc<Overlay>,
+        success_stat: OverlaySuccessStat,
+    },
+    /// 索引を使わず全件 brute-force とする（`MIN_INDEXED_ROWS` 未満・構築/再構築
+    /// 失敗・写像不整合のいずれか。[`search_prepared`] が呼ばれるたびに `fallbacks`
+    /// を 1 加算する——各呼び出しは実際に一度ずつ brute-force 探索を行うラウンドの
+    /// ため、解決時ではなく探索時に計上する）。
+    FullScan,
+}
+
+/// `FullVisible` 形状（Issue #408。フィルタなし DISTANCE・hybrid 密側）の
+/// 索引・オーバーレイ解決段。[`search_or_fallback`] のラッパーと hybrid 密側
+/// アダプタ（`sql::hnsw_hybrid::HnswDenseProvider`）の双方から呼ばれる。
 ///
-/// 戻り値は `KernelError` のみ（HNSW 索引固有のエラー・写像検証失敗はすべて当該
-/// クエリの brute-force 縮退として吸収し、呼び出し元へは伝播させない。呼び出し元
-/// `sql::exec::execute_statement_with_cache` は既存の `Ranking::Distance` 分岐と
-/// 同じ `map_kernel_error` でエラー処理できる）。
-///
-/// 引数 9 個は `clippy::too_many_arguments`（閾値 7）を超えるが、`access`
-/// （キャッシュ・provider 束）と個々のクエリ実行時値（`read_txn`／`table`／
-/// `ctx`／`arena`／`slot_ids`／`provider`／`query`／`k`）はいずれも意味の異なる
-/// 独立した入力であり、`sql::exec::execute_statement_with_cache` の内部専用
-/// （`pub(crate)`）関数としてここで許容する（`sql::arena_cache`／`sql::sparse_cache`
-/// が `execute_statement_with_cache` 自体で同じ許容をしているのと同じ理由）。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn search_or_fallback(
+/// 引数・戻り値の意味は元の `search_or_fallback`（Issue #408 実装）から解決部分
+/// のみを切り出したもの。統計計上（`builds`／`rebuilds`／`build_failures`／
+/// `evict_entry`／`record_overlay_for`）は解決時点で確定する内容のみ行い、
+/// `fallbacks`／`hits`／`subset_searches` 等の探索結果依存の統計は
+/// [`search_with_overlay`]／[`search_prepared`] 側に残す（元実装と計上箇所を
+/// 変えない）。
+pub(crate) fn prepare_full_visible(
     access: &HnswCacheAccess<'_>,
     read_txn: &redb::ReadTransaction,
     table: &str,
     ctx: &PolicyContext,
     arena: &VectorArena,
-    slot_ids: &[u64],
-    provider: &dyn SearchProvider,
-    query: &[f32],
-    k: usize,
-) -> Result<Vec<CandidateHit>, KernelError> {
+) -> PreparedHnswSearch {
     let n = arena.len();
-    let full_scan = |cache: &HnswIndexCache| -> Result<Vec<CandidateHit>, KernelError> {
-        cache.fallbacks.fetch_add(1, Ordering::Relaxed);
-        let input = SearchInput {
-            ids: slot_ids,
-            vectors: arena.vectors(),
-            dim: arena.dim(),
-            query,
-            k,
-        };
-        provider.search(input)
-    };
-
     if n < MIN_INDEXED_ROWS {
         // 現在のクエリが見ている世代より新しいエントリは巻き添えにしない
         // （`evict_entry` ドキュメント参照）。世代が判定できない場合は
@@ -806,28 +866,23 @@ pub(crate) fn search_or_fallback(
         if let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) {
             access.cache.evict_entry(table, ctx, current_generation);
         }
-        return full_scan(access.cache);
+        return PreparedHnswSearch::FullScan;
     }
 
     let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
-        Lookup::BuildFailedThisGeneration => return full_scan(access.cache),
+        Lookup::BuildFailedThisGeneration => return PreparedHnswSearch::FullScan,
         Lookup::Ready(base, overlay) => {
-            return search_with_overlay(
-                access,
+            return PreparedHnswSearch::Indexed {
                 base,
                 overlay,
-                provider,
-                arena,
-                query,
-                k,
-                OverlaySuccessStat::Hits,
-            );
+                success_stat: OverlaySuccessStat::Hits,
+            };
         }
         Lookup::NeedOverlay(base) => base,
         Lookup::Miss => {
             let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table)
             else {
-                return full_scan(access.cache);
+                return PreparedHnswSearch::FullScan;
             };
             access.cache.builds.fetch_add(1, Ordering::Relaxed);
             match IndexedBase::build(
@@ -840,7 +895,7 @@ pub(crate) fn search_or_fallback(
                 Err(_) => {
                     access.cache.build_failures.fetch_add(1, Ordering::Relaxed);
                     record_build_failed(access, table, ctx, current_generation);
-                    return full_scan(access.cache);
+                    return PreparedHnswSearch::FullScan;
                 }
             }
         }
@@ -849,7 +904,7 @@ pub(crate) fn search_or_fallback(
     // ここへ到達するのは `NeedOverlay`（既存ベースに現世代のオーバーレイがまだ
     // ない）経路のみ。`Overlay::compute` を 1 回行い、差分比率次第で再構築する。
     let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
-        return full_scan(access.cache);
+        return PreparedHnswSearch::FullScan;
     };
     if base.arena_identity_mismatch_guard(arena, ctx) {
         // 呼び出し元の適用条件（フィルタなし DISTANCE）が正しく守られていれば
@@ -861,7 +916,7 @@ pub(crate) fn search_or_fallback(
         // 再構築されないまま無効化されてしまう）。退避対象はこの `(table,
         // ctx)` の当該エントリのみで、他テナント・他テーブルへは波及しない。
         access.cache.evict_entry_if_mismatched(table, ctx, &base);
-        return full_scan(access.cache);
+        return PreparedHnswSearch::FullScan;
     }
     let overlay = Overlay::compute(&base, arena, current_generation);
     if overlay.needs_rebuild(n) {
@@ -898,55 +953,164 @@ pub(crate) fn search_or_fallback(
                     mask_splits_graph: identity_splits_graph,
                 });
                 record_overlay_for(access, table, &new_base, Arc::clone(&identity_overlay));
-                return search_with_overlay(
-                    access,
-                    new_base,
-                    identity_overlay,
-                    provider,
-                    arena,
-                    query,
-                    k,
-                    OverlaySuccessStat::None,
-                );
+                PreparedHnswSearch::Indexed {
+                    base: new_base,
+                    overlay: identity_overlay,
+                    success_stat: OverlaySuccessStat::None,
+                }
             }
             Err(_) => {
                 access.cache.build_failures.fetch_add(1, Ordering::Relaxed);
                 record_build_failed(access, table, ctx, current_generation);
-                return full_scan(access.cache);
+                PreparedHnswSearch::FullScan
             }
         }
+    } else {
+        let overlay = Arc::new(overlay);
+        record_overlay_for(access, table, &base, Arc::clone(&overlay));
+        PreparedHnswSearch::Indexed {
+            base,
+            overlay,
+            success_stat: OverlaySuccessStat::None,
+        }
     }
-    let overlay = Arc::new(overlay);
-    record_overlay_for(access, table, &base, Arc::clone(&overlay));
-    search_with_overlay(
-        access,
-        base,
-        overlay,
-        provider,
-        arena,
-        query,
-        k,
-        OverlaySuccessStat::None,
-    )
+}
+
+/// [`PreparedHnswSearch`] を使って 1 ラウンド分の Top-k 探索を行う（Issue #410）。
+/// `Indexed` なら [`search_with_overlay`] へ、`FullScan` なら `slot_ids` を使う
+/// 全件 brute-force へディスパッチする（`fallbacks` はここで加算する。§
+/// [`PreparedHnswSearch::FullScan`] ドキュメンテーションコメント参照）。
+pub(crate) fn search_prepared(
+    access: &HnswCacheAccess<'_>,
+    prepared: &PreparedHnswSearch,
+    provider: &dyn SearchProvider,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    match prepared {
+        PreparedHnswSearch::Indexed {
+            base,
+            overlay,
+            success_stat,
+        } => search_with_overlay(
+            access,
+            Arc::clone(base),
+            Arc::clone(overlay),
+            provider,
+            arena,
+            query,
+            k,
+            *success_stat,
+        ),
+        PreparedHnswSearch::FullScan => {
+            access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+            let input = SearchInput {
+                ids: slot_ids,
+                vectors: arena.vectors(),
+                dim: arena.dim(),
+                query,
+                k,
+            };
+            provider.search(input)
+        }
+    }
+}
+
+/// DISTANCE 段の索引済み探索＋未索引分 brute-force 併用の本体（Issue #408。
+/// Issue #410 で「解決」（[`prepare_full_visible`]）と「探索」（[`search_prepared`]）
+/// を分離した薄いラッパーへ書き換えた。単発の DISTANCE クエリでは解決・探索を
+/// それぞれ 1 回ずつ呼ぶだけであり、統計・戻り値・エラー契約は分離前と同一）。
+///
+/// 戻り値は `KernelError` のみ（HNSW 索引固有のエラー・写像検証失敗はすべて当該
+/// クエリの brute-force 縮退として吸収し、呼び出し元へは伝播させない。呼び出し元
+/// `sql::exec::execute_statement_with_cache` は既存の `Ranking::Distance` 分岐と
+/// 同じ `map_kernel_error` でエラー処理できる）。
+///
+/// 引数 9 個は `clippy::too_many_arguments`（閾値 7）を超えるが、`access`
+/// （キャッシュ・provider 束）と個々のクエリ実行時値（`read_txn`／`table`／
+/// `ctx`／`arena`／`slot_ids`／`provider`／`query`／`k`）はいずれも意味の異なる
+/// 独立した入力であり、`sql::exec::execute_statement_with_cache` の内部専用
+/// （`pub(crate)`）関数としてここで許容する（`sql::arena_cache`／`sql::sparse_cache`
+/// が `execute_statement_with_cache` 自体で同じ許容をしているのと同じ理由）。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_or_fallback(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    arena: &VectorArena,
+    slot_ids: &[u64],
+    provider: &dyn SearchProvider,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<CandidateHit>, KernelError> {
+    let prepared = prepare_full_visible(access, read_txn, table, ctx, arena);
+    search_prepared(access, &prepared, provider, arena, slot_ids, query, k)
 }
 
 /// `Subset` 形状（Issue #409。SCALAR 事前フィルタ付き DISTANCE。`sql::exec::
 /// execute_statement_with_cache` の適用条件は §モジュールドキュメント
-/// 「適用条件」節・`docs/design/hnsw-rls-cardinality-switch.md` 参照）の索引済み
-/// 探索＋未索引分 brute-force 併用。`FullVisible`（[`search_or_fallback`]）との
-/// 違いは 3 点（いずれも「アリーナが可視全集合ではなく WHERE 適用後の部分集合」
-/// という前提の違いから来る）:
+/// 「適用条件」節・`docs/design/hnsw-rls-cardinality-switch.md` 参照）の索引・
+/// オーバーレイ解決段（Issue #410 で [`prepare_full_visible`] と対称の形へ分離）。
+/// `FullVisible`（[`prepare_full_visible`]）との違いは 3 点（いずれも「アリーナが
+/// 可視全集合ではなく WHERE 適用後の部分集合」という前提の違いから来る）:
 ///
 /// 1. `arena.len() < MIN_INDEXED_ROWS` でもエントリを evict しない（フィルタで
 ///    絞られた行数が少ないことは「テーブル自体が小規模」を意味しない）。
-/// 2. `Lookup::Miss`（索引未構築）では新規構築を試みず、常に plain scan へ縮退
+/// 2. `Lookup::Miss`（索引未構築）では新規構築を試みず、常に `FullScan` へ縮退
 ///    する（`base` はフィルタなしクエリが可視全集合から構築する契約——部分集合
 ///    アリーナから `IndexedBase::build` を呼ぶと以後の `FullVisible` 経路が
 ///    誤った base を再利用してしまう）。
 /// 3. per-query の `Overlay::compute` 結果を [`record_overlay_for`] へ登録しない
 ///    （`needs_rebuild` も評価しない）——WHERE で除外された行が churn に見えて
 ///    無用な再構築を誘発したり、`FullVisible` の次クエリが参照するはずの
-///    キャッシュ済みオーバーレイを汚したりしないようにする。
+///    キャッシュ済みオーバーレイを汚したりしないようにする。`Overlay::compute`
+///    自体は `k` に依存しないため、hybrid 密側再取得ループの複数ラウンドでも
+///    1 回の呼び出し結果をそのまま使い回せる。
+pub(crate) fn prepare_subset(
+    access: &HnswCacheAccess<'_>,
+    read_txn: &redb::ReadTransaction,
+    table: &str,
+    ctx: &PolicyContext,
+    arena: &VectorArena,
+) -> PreparedHnswSearch {
+    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
+        Lookup::BuildFailedThisGeneration | Lookup::Miss => return PreparedHnswSearch::FullScan,
+        Lookup::Ready(base, _full_arena_overlay) => base,
+        Lookup::NeedOverlay(base) => base,
+    };
+
+    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
+        return PreparedHnswSearch::FullScan;
+    };
+    if base.arena_identity_mismatch_guard(arena, ctx) {
+        // `FullVisible` 経路（`prepare_full_visible`）と異なり、ここでは巻き添えを
+        // 避けるためエントリを退避しない（この不整合は通常発生しない防御的
+        // 経路であり、`FullVisible` クエリが正しく参照し続けられる余地を
+        // 残す。§本関数ドキュメンテーションコメント参照）。
+        return PreparedHnswSearch::FullScan;
+    }
+
+    // per-query の写像を計算する（キャッシュへは登録しない。§本関数
+    // ドキュメンテーションコメント参照）。`Overlay::compute` は「渡された
+    // arena のスロット番号系列に対する索引済みノードの写像」を汎用的に計算
+    // するため、可視全集合ではなく WHERE 適用後の部分集合アリーナを渡しても
+    // そのまま正しく動く（部分集合に含まれない索引済みノードは自然に
+    // `STALE_SLOT` として除外される）。
+    let overlay = Arc::new(Overlay::compute(&base, arena, current_generation));
+    PreparedHnswSearch::Indexed {
+        base,
+        overlay,
+        success_stat: OverlaySuccessStat::SubsetSearches,
+    }
+}
+
+/// `Subset` 形状（Issue #409）の索引済み探索＋未索引分 brute-force 併用の本体
+/// （Issue #410 で [`prepare_subset`]／[`search_prepared`] への薄いラッパーへ
+/// 書き換えた。単発の DISTANCE クエリでは解決・探索をそれぞれ 1 回ずつ呼ぶだけ
+/// であり、統計・戻り値・エラー契約は分離前と同一）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn search_subset_or_fallback(
     access: &HnswCacheAccess<'_>,
@@ -959,52 +1123,8 @@ pub(crate) fn search_subset_or_fallback(
     query: &[f32],
     k: usize,
 ) -> Result<Vec<CandidateHit>, KernelError> {
-    let full_scan = |cache: &HnswIndexCache| -> Result<Vec<CandidateHit>, KernelError> {
-        cache.fallbacks.fetch_add(1, Ordering::Relaxed);
-        let input = SearchInput {
-            ids: slot_ids,
-            vectors: arena.vectors(),
-            dim: arena.dim(),
-            query,
-            k,
-        };
-        provider.search(input)
-    };
-
-    let base = match access.cache.lookup(access.storage, read_txn, table, ctx) {
-        Lookup::BuildFailedThisGeneration | Lookup::Miss => return full_scan(access.cache),
-        Lookup::Ready(base, _full_arena_overlay) => base,
-        Lookup::NeedOverlay(base) => base,
-    };
-
-    let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table) else {
-        return full_scan(access.cache);
-    };
-    if base.arena_identity_mismatch_guard(arena, ctx) {
-        // `FullVisible` 経路（`search_or_fallback`）と異なり、ここでは巻き添えを
-        // 避けるためエントリを退避しない（この不整合は通常発生しない防御的
-        // 経路であり、`FullVisible` クエリが正しく参照し続けられる余地を
-        // 残す。§本関数ドキュメンテーションコメント参照）。
-        return full_scan(access.cache);
-    }
-
-    // per-query の写像を計算する（キャッシュへは登録しない。§本関数
-    // ドキュメンテーションコメント参照）。`Overlay::compute` は「渡された
-    // arena のスロット番号系列に対する索引済みノードの写像」を汎用的に計算
-    // するため、可視全集合ではなく WHERE 適用後の部分集合アリーナを渡しても
-    // そのまま正しく動く（部分集合に含まれない索引済みノードは自然に
-    // `STALE_SLOT` として除外される）。
-    let overlay = Arc::new(Overlay::compute(&base, arena, current_generation));
-    search_with_overlay(
-        access,
-        base,
-        overlay,
-        provider,
-        arena,
-        query,
-        k,
-        OverlaySuccessStat::SubsetSearches,
-    )
+    let prepared = prepare_subset(access, read_txn, table, ctx, arena);
+    search_prepared(access, &prepared, provider, arena, slot_ids, query, k)
 }
 
 impl IndexedBase {
@@ -1178,7 +1298,7 @@ fn record_overlay_for(
 /// [`search_with_overlay`] が完了時に成功統計をどこへ加算するか（Issue #409）。
 /// `NeedOverlay`（再構築直後）経路からは `None` を渡し従来どおり計上しない。
 #[derive(Clone, Copy)]
-enum OverlaySuccessStat {
+pub(crate) enum OverlaySuccessStat {
     /// `FullVisible` 形状・`Lookup::Ready` 到達（`hits` の既存契約を変えない）。
     Hits,
     /// `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE。Issue #409）。
@@ -1251,6 +1371,23 @@ fn search_with_overlay(
         access
             .cache
             .mask_splits_graph
+            .fetch_add(1, Ordering::Relaxed);
+        return full_scan_with_arena(provider, arena, query, k);
+    }
+
+    // hybrid 密側再取得ループ（Issue #410。`sql::hnsw_hybrid::HnswDenseProvider`）
+    // は `fetch_k`（＝ここでの `k`）を [`crate::hnsw::MAX_EF`] 超まで倍増しうる
+    // （`hybrid.rs::MAX_FETCH_K` は `MAX_EF` の 4 倍）。`search_masked` 自身も
+    // `k > MAX_EF` を `HnswError::InvalidParams` として拒否するが、その `Err`
+    // 分岐を汎用 `fallbacks` としてしか区別できない（`HnswError::InvalidParams`
+    // の `reason` 文字列比較で判別すると実装詳細への依存になる）ため、ここで
+    // 検証順序を先取りして `ef_cap_fallbacks` を独立計上する（`search_masked`
+    // 自体は呼ばない。呼んでも同じ結果に帰着するが二重検証を避ける）。
+    if k > crate::hnsw::MAX_EF {
+        access.cache.fallbacks.fetch_add(1, Ordering::Relaxed);
+        access
+            .cache
+            .ef_cap_fallbacks
             .fetch_add(1, Ordering::Relaxed);
         return full_scan_with_arena(provider, arena, query, k);
     }

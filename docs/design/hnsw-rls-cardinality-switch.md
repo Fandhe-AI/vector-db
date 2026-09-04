@@ -87,7 +87,9 @@ search_with_overlay` の `masked_short` 経由で plain scan へ縮退する）�
 ほど探索がグラフの非受理ノードで分断されやすくなり、`masked_short` 経由の
 plain scan 縮退が起きやすくなる（性能上のトレードオフであり、`docs/design/
 ann-index-adoption.md`「RLS／フィルタとの相互作用と折衷案」節が定める P0
-安全条件を優先した結果。filter-aware な専用探索方式は #410 以降の検討課題）。
+安全条件を優先した結果。filter-aware な専用探索方式は将来検討課題のまま
+（Issue #410 は本節の課題には対応せず、hybrid 密側再取得ループへの結線
+〔`docs/design/hnsw-hybrid-iterative-scan.md`〕を実装した）。
 
 さらに codex-review P2 指摘対応（PR #435）で、`masked_short` の件数検査
 （`min(k, visible_in_index)` 未満なら plain scan）だけでは検出できない
@@ -113,8 +115,8 @@ compute` を呼ぶため判定もクエリ毎になるが、これはマスク�
 `search_masked` 自体を呼ばず直ちに plain scan へ縮退する（統計
 `mask_splits_graph`。`masked_short` とは互いに排他）。連結性が保証できない
 マスクは常に安全側（plain scan）へ倒す、という判断で、multi-entry-point
-探索の実装は見送った（filter-aware な専用探索方式の検討は引き続き #410
-の担当）。
+探索の実装は見送った（filter-aware な専用探索方式の検討は将来課題のまま。
+Issue #410 はこの方式を実装していない）。
 
 `is_mask_fully_reachable` が「分断なし」と判定した場合でも、
 `search_masked`（`hnsw.rs`）自体の層 0 探索が到達可能性を検査した起点と
@@ -158,9 +160,12 @@ is_mask_fully_reachable_accepts_identity_mask_on_a_repaired_graph_and_ann_path_i
 | `FullVisible` | `Ranking::Distance` ∧ `!precision` ∧ (`filters_empty` ∨ `!plan.scalar_prefilter`) | ctx 可視全集合（#408 の不変条件と同じ） | `search_or_fallback`（世代キャッシュ済み `Overlay`） |
 | `Subset` | `Ranking::Distance` ∧ `!precision` ∧ `!filters_empty` ∧ `plan.scalar_prefilter` | ctx 可視全集合の**真部分集合**（WHERE 適用後） | `search_subset_or_fallback`（per-query 写像・キャッシュ非登録） |
 
-除外（従来どおり全件 brute-force）: hybrid の密側（#410 の担当）・`precision`
-モード（TASK-162・SEARCH-9。ANN の近似近傍が確信度ゲートのマージン判定を
-過大評価しうるため）。
+除外（従来どおり全件 brute-force）: `precision` モード（TASK-162・SEARCH-9。
+ANN の近似近傍が確信度ゲートのマージン判定を過大評価しうるため）。hybrid の
+密側は Issue #410（`sql::hnsw_hybrid::HnswDenseProvider`）で結線済み——上表と
+同じ `FullVisible`／`Subset` 形状判定を流用し、再取得ループの各ラウンドで
+`search_prepared` を呼ぶ。詳細は `docs/design/hnsw-hybrid-iterative-scan.md`
+参照。
 
 `FullVisible` に `!plan.scalar_prefilter` を含めるのは、DISTANCE 先行・SCALAR
 事後フィルタの recall モードでは `k_eff = bound.limit`（`sql/exec.rs`
@@ -188,8 +193,11 @@ is_mask_fully_reachable_accepts_identity_mask_on_a_repaired_graph_and_ann_path_i
 3. それ以外 → `HnswIndex::search_masked(query, k, ef, Some(&visible_mask), scratch)`
 4. マスク付き探索の結果件数が `min(k, visible_in_index)` 未満（ビーム幅内で
    可視ノードを辿り切れなかった）→ 当該クエリのみ plain scan へ縮退（統計
-   `masked_short`。**`ef` 拡張による再探索は #410 の担当**。本 Issue は
-   fail-closed 縮退で k 件充足を保証する）
+   `masked_short`。fail-closed 縮退で k 件充足を保証する。**`ef` の段階的拡張
+   自体は本 Issue（#409）の担当ではなく追加しない**——Issue #410 の調査で
+   `mask_splits_graph == false` のとき本分岐が構造的に到達不能であることが
+   判明したため。詳細・証明は `docs/design/hnsw-hybrid-iterative-scan.md`
+   「DISTANCE 経路の `masked_short` 到達不能性」節参照）
 5. 索引ヒットのスロット写像・キー照合・`kernel::dot` 再計算・未索引分
    （`delta_slots`）の brute-force 併合は #408 と同じ
 
@@ -301,8 +309,12 @@ current_generation` による事前・事後の失効照合とは独立した読
 
 ## スコープ外・申し送り
 
-- 不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
-  `complete_boundary_tie_group` の相互作用: #410
+- ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
+  `complete_boundary_tie_group` の相互作用~~ Issue #410 で対応済み——DISTANCE
+  経路の `ef` 倍増再探索は構造的に到達不能と判明したため追加せず、hybrid
+  密側再取得ループの `fetch_k` 倍増自体が iterative scan として機能する形で
+  結線した（`sql::hnsw_hybrid::HnswDenseProvider`）。詳細は
+  `docs/design/hnsw-hybrid-iterative-scan.md` 参照
 - `EXPLAIN` へのエンジン種別・縮退有無の露出: #411
 - Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412
 - `full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413
