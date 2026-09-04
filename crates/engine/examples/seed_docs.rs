@@ -2,8 +2,8 @@
 //!
 //! wire-server を起動して psql 等の実クライアントから `USING PLAN` や hybrid 検索を
 //! 手で叩く際に、`docs` テーブルへ合成コーパスを用意するために使う。
-//! `seed <db> <rows> <dim>` で 2 テナント（`tenant-a`／`tenant-b`）分の合成文書を
-//! Public 可視で投入し、`embed <dim> <text>` で同じ `HashingEmbedder` による
+//! `seed <db> <rows> <dim>` で 2 テナント（`tenant-a`／`tenant-b`。行数を問わず
+//! 約 1 割のバッチが `tenant-b`。`rows < 10` は拒否）分の合成文書を Public 可視で投入し、`embed <dim> <text>` で同じ `HashingEmbedder` による
 //! クエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
 //! 引数はローカル運用者の入力であり wire 経由の untrusted 入力ではないため、
 //! 解析失敗は `expect` で即終了させる。
@@ -233,6 +233,13 @@ fn main() {
             };
             let rows: u64 = rows.parse().expect("rows");
             let dim: u32 = dim.parse().expect("dim");
+            // バッチ単位でテナントを固定し 10 バッチごとに 1 バッチを tenant-b へ割り当てる。
+            // 少量投入でも必ず両テナントが作られるよう、バッチ幅は「行数の 1/10（切り上げ）」
+            // を上限 1,000 で丸めた値とし、10 バッチ未満にしかならない行数（rows < 10）は拒否する。
+            if rows < 10 {
+                eprintln!("error: rows must be >= 10 so that both tenants receive documents");
+                std::process::exit(2);
+            }
             let embedder = HashingEmbedder::new(dim).expect("embedder");
             let storage = Storage::open(db).expect("open");
             let schema = TableSchema::new(
@@ -248,7 +255,7 @@ fn main() {
             let ctx_a = PolicyContext::new("tenant-a").expect("ctx");
             let ctx_b = PolicyContext::new("tenant-b").expect("ctx");
             let mut rng = Lcg(20260831);
-            let batch = 1000u64;
+            let batch = rows.div_ceil(10).clamp(1, 1000);
             let start = Instant::now();
             let mut id = 1u64;
             let mut batch_no = 0u64;
