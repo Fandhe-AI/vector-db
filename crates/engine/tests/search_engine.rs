@@ -260,10 +260,7 @@ fn hnsw_407_open_with_engine_records_kind() {
 // 渡すコード自体がコンパイルできない）。
 #[test]
 fn hnsw_407_invalid_params_rejected_fail_closed() {
-    let invalid = engine::hnsw::HnswParams {
-        m: 1,
-        ..engine::hnsw::HnswParams::default()
-    };
+    let invalid = engine::hnsw::HnswParams::default().with_m(1);
 
     assert!(
         search_engine::hnsw_kind(invalid).is_err(),

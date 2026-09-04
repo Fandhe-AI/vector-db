@@ -140,7 +140,15 @@ impl fmt::Display for Ratio {
 /// 閾値で、`sql::hnsw_cache::HnswIndexCache` が「可視候補数 ÷ 索引ノード数」の
 /// 比がこの値未満なら plain scan（brute-force）、以上ならマスク付き ANN 探索を
 /// 選ぶ判定に使う（本リポの実装既定値。非規範）。
+///
+/// `#[non_exhaustive]`（codex-review P1 指摘・Issue #409・PR #435 追記）:
+/// クレート外からの完全な構造体リテラル構築を禁止し、`Default` + 構造体更新
+/// 構文（`..HnswParams::default()`）を強制する。本フィールド追加（`full_scan_ratio`）
+/// のような将来のフィールド追加が既存呼び出し元のコンパイルを破壊しない
+/// ことを型で保証する（本クレート内は同一クレート特権によりこの制約を受けない
+/// ため、既存の内部呼び出し元は無変更）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HnswParams {
     /// 挿入後に各ノードが層 1 以上で保持する隣接数の目安（層 0 は `2*m` まで許容する。
     /// Malkov & Yashunin 2016 の記法と同じ）。
@@ -213,6 +221,33 @@ impl HnswParams {
             });
         }
         Ok(())
+    }
+
+    /// `m` だけを差し替えたコピーを返す（codex-review P1 指摘対応・Issue #409・
+    /// PR #435 追記）。`#[non_exhaustive]` により他クレートからは構造体
+    /// リテラル（`..Default::default()` の構造体更新構文含む）で構築できない
+    /// ため、`HnswParams::default()` と組み合わせて使うビルダー用アクセサ。
+    pub fn with_m(mut self, m: usize) -> Self {
+        self.m = m;
+        self
+    }
+
+    /// `ef_construction` だけを差し替えたコピーを返す（[`Self::with_m`] 参照）。
+    pub fn with_ef_construction(mut self, ef_construction: usize) -> Self {
+        self.ef_construction = ef_construction;
+        self
+    }
+
+    /// `ef_search` だけを差し替えたコピーを返す（[`Self::with_m`] 参照）。
+    pub fn with_ef_search(mut self, ef_search: usize) -> Self {
+        self.ef_search = ef_search;
+        self
+    }
+
+    /// `full_scan_ratio` だけを差し替えたコピーを返す（[`Self::with_m`] 参照）。
+    pub fn with_full_scan_ratio(mut self, full_scan_ratio: Ratio) -> Self {
+        self.full_scan_ratio = full_scan_ratio;
+        self
     }
 }
 
