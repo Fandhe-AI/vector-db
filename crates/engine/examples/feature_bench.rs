@@ -14,6 +14,24 @@
 //! Issue #344/#355 の Recall/性能受け入れ基準の実測（`hybrid_rrf` 288.6ms 等）を
 //! 出した計測 example。以前は git 追跡外だったため before/after の再現性が無く
 //! （PR #374 の ADR 参照）、Issue #358 で `crates/engine/examples/` へ追跡化した。
+//!
+//! # ANN opt-in・規模スケール（Issue #413）
+//!
+//! `BENCH_FEATURE_ENGINE`（`unset`／`""`／`brute_force` → 既定エンジン、`hnsw` →
+//! `search_engine::hnsw_kind(HnswParams::default())` opt-in・Issue #403 B 案）・
+//! `BENCH_FEATURE_SCALE`（正整数倍率。既定 1 = `ROWS_A`＋`ROWS_B` 合計 25,000 行、
+//! 4 = 100,000 行。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound）で
+//! `docs/design/hnsw-index.md` の前後比較を測定する。パースは
+//! `benches/harness/bench_engine.rs`（`#[path]` で本ファイルへ単一ファイル取り込み。
+//! `harness::` ツリー全体は取り込まない）を fail-closed に用いる。JSON の 13
+//! フェーズの名前・順序・フィールドは engine・scale を問わず不変（追加情報は
+//! `meta` にのみ追加する）。engine=hnsw のときは全フェーズ計測後に
+//! `EngineCore::hnsw_index_cache_stats()` が `builds>=1 && hits>0` を満たすことを
+//! 検証し（非 vacuous 確認）、満たさなければ `fail_bench` で終了する。
+
+#[path = "../benches/harness/bench_engine.rs"]
+mod bench_engine;
+use bench_engine::BenchEngine;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
@@ -29,8 +47,12 @@ use std::hint::black_box;
 use std::time::Instant;
 
 const DIM: u32 = 128;
-const ROWS_A: u64 = 20_000;
-const ROWS_B: u64 = 5_000;
+/// scale=1（既定）時の tenant-a・tenant-b 投入行数。[`main`] が
+/// `BENCH_FEATURE_SCALE` 倍率をこの基準値へ掛けて実行時の行数を決める
+/// （Issue #413。`ROWS_A`・`ROWS_B` の定数名は既存 doc コメント・実測記録との
+/// 対応づけのため残す）。
+const ROWS_A_BASE: u64 = 20_000;
+const ROWS_B_BASE: u64 = 5_000;
 /// tenant-a 投入時に Private 可視性を割り当てる周期（[`run_ingest`] の
 /// `make_batch` 呼び出しに使う）。RLS 境界確認（[`run_rls_isolation_phase`]）が
 /// tenant-a の期待 Public/Private 件数をこの定数から導出するため、投入側と
@@ -363,14 +385,18 @@ fn insert_batch(
     start.elapsed().as_micros() as u64
 }
 
-/// フェーズ 1: `insert_rows` によるバッチ投入（ROWS_A 行を tenant-a・10% Private、
-/// ROWS_B 行を tenant-b・全 Public）。バッチ毎レイテンシとスループットを計測する。
+/// フェーズ 1: `insert_rows` によるバッチ投入（`rows_a` 行を tenant-a・10%
+/// Private、`rows_b` 行を tenant-b・全 Public）。バッチ毎レイテンシと
+/// スループットを計測する。`rows_a`／`rows_b` は [`main`] が `BENCH_FEATURE_SCALE`
+/// 倍率を `ROWS_A_BASE`／`ROWS_B_BASE` へ掛けて決める実行時行数（Issue #413）。
 fn run_ingest(
     storage: &Storage,
     schema: &TableSchema,
     embedder: &HashingEmbedder,
     ctx_a: &PolicyContext,
     ctx_b: &PolicyContext,
+    rows_a: u64,
+    rows_b: u64,
 ) -> PhaseStat {
     let cpu_before = read_proc_stats().cpu_ticks;
     let mut samples = Vec::new();
@@ -378,8 +404,8 @@ fn run_ingest(
     let mut batch_no: u64 = 0;
 
     let mut id = 1u64;
-    while id <= ROWS_A {
-        let end = (id + BATCH_SIZE - 1).min(ROWS_A);
+    while id <= rows_a {
+        let end = (id + BATCH_SIZE - 1).min(rows_a);
         let (ids, viss, embs, encoded) =
             make_batch(schema, embedder, id, end, Some(TENANT_A_PRIVATE_EVERY_N));
         let us = insert_batch(
@@ -397,8 +423,8 @@ fn run_ingest(
         id = end + 1;
     }
 
-    let mut id = ROWS_A + 1;
-    let end_b = ROWS_A + ROWS_B;
+    let mut id = rows_a + 1;
+    let end_b = rows_a + rows_b;
     while id <= end_b {
         let end = (id + BATCH_SIZE - 1).min(end_b);
         let (ids, viss, embs, encoded) = make_batch(schema, embedder, id, end, None);
@@ -582,21 +608,23 @@ fn run_rls_isolation_phase(
     ctx_a_public: &PolicyContext,
     ctx_a_full: &PolicyContext,
     ctx_b: &PolicyContext,
+    rows_a: u64,
+    rows_b: u64,
 ) -> PhaseStat {
     let sql = "SELECT COUNT(*) FROM docs";
     let count_a_public = count_visible_rows_or_fail(core, ctx_a_public, sql, "tenant-a public");
     let count_a_full = count_visible_rows_or_fail(core, ctx_a_full, sql, "tenant-a full");
     let count_b = count_visible_rows_or_fail(core, ctx_b, sql, "tenant-b public");
 
-    // fixture（run_ingest）の期待件数。tenant-a は ROWS_A 行中
+    // fixture（run_ingest）の期待件数。tenant-a は rows_a 行中
     // id % TENANT_A_PRIVATE_EVERY_N == 0 のみ Private（make_batch 参照）、
-    // tenant-b は ROWS_B 行すべて Public。
-    let expected_private_a = ROWS_A / TENANT_A_PRIVATE_EVERY_N;
-    let expected_public_a = ROWS_A - expected_private_a;
+    // tenant-b は rows_b 行すべて Public。
+    let expected_private_a = rows_a / TENANT_A_PRIVATE_EVERY_N;
+    let expected_public_a = rows_a - expected_private_a;
     // Public は全テナントから見えるグローバルプール（上記ドキュメンテーション
     // コメント参照）のため、Public を許可する ctx（tenant-a Public のみ・
     // tenant-b）はいずれも tenant-a と tenant-b の Public 行合計を見る。
-    let expected_public_global = expected_public_a + ROWS_B;
+    let expected_public_global = expected_public_a + rows_b;
     let expected_full_a = expected_public_global + expected_private_a;
 
     // fail-closed: 件数が 1 つでも期待値とずれたら、それを `no_leak:false` として
@@ -646,7 +674,27 @@ fn db_file_size_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// `hnsw::MAX_HNSW_NODES`（1,000,000）を `ROWS_A_BASE + ROWS_B_BASE`（25,000）で
+/// 割った最大倍率。`BENCH_FEATURE_SCALE` の上限として `bench_engine::parse_scale`
+/// へ渡す（Issue #413）。
+const MAX_FEATURE_SCALE: u64 = engine::hnsw::MAX_HNSW_NODES as u64 / (ROWS_A_BASE + ROWS_B_BASE);
+
 fn main() {
+    let engine_choice = match bench_engine::read_env_var("BENCH_FEATURE_ENGINE")
+        .and_then(|raw| bench_engine::parse_engine(raw.as_deref()))
+    {
+        Ok(e) => e,
+        Err(e) => fail_bench("BENCH_FEATURE_ENGINE", &e.to_string()),
+    };
+    let scale = match bench_engine::read_env_var("BENCH_FEATURE_SCALE")
+        .and_then(|raw| bench_engine::parse_scale(raw.as_deref(), MAX_FEATURE_SCALE))
+    {
+        Ok(s) => s,
+        Err(e) => fail_bench("BENCH_FEATURE_SCALE", &e.to_string()),
+    };
+    let rows_a = ROWS_A_BASE * scale;
+    let rows_b = ROWS_B_BASE * scale;
+
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
         "vector-db-feature-bench-{}-{:x}.redb",
@@ -691,15 +739,13 @@ fn main() {
         &embedder,
         &ctx_a_public,
         &ctx_b,
+        rows_a,
+        rows_b,
     )];
     let rows_after_ingest_bytes = db_file_size_bytes(&db_path);
 
-    // `insert_rows` で書き込み済みの `Storage` を `EngineCore` へ引き渡す
-    // （`EngineCore::open` による同一ファイルへの二重オープンを避ける。
-    // `from_storage` は所有権移動のみでテナント境界の迂回経路を新設しない）。
-    let core = EngineCore::from_storage(storage, engine::search_engine::default_engine());
-
-    // クエリベクトル・クエリ文の周回プール。
+    // クエリベクトル・クエリ文の周回プール（`core` の構築に先立って用意する。
+    // 索引構築時間プローブ〔下記〕が `qv0` を必要とするため）。
     let query_vecs: Vec<Vec<f32>> = QUERY_TEXTS
         .iter()
         .map(|t| {
@@ -712,6 +758,67 @@ fn main() {
     let qv0 = vec_literal(&query_vecs[0]);
     let qv1 = vec_literal(&query_vecs[1 % query_vecs.len()]);
     let qv2 = vec_literal(&query_vecs[2 % query_vecs.len()]);
+
+    // 索引構築時間の一発計測（Issue #413 設計判断 4。Issue #439 codex-review
+    // 指摘への対応で計測対象インスタンスを分離）。`vector_knn` と同形のクエリを
+    // 実行し、hnsw では arena デコード＋HNSW 構築、brute_force では
+    // `SqlArenaCache`（Issue #363）の cold 構築に相当する経過時間を記録する。
+    //
+    // 計測は ingest 済み db ファイルを複製した**別ファイル・別 `EngineCore`
+    // インスタンス**（`probe_core`）に対して行い、13 フェーズの実行に使う
+    // `core` のキャッシュ・索引状態には一切触れない。これにより after/既定・
+    // after/hnsw いずれも 13 フェーズ開始時点で cold のまま揃い、事前ウォーム
+    // アップを持たない before バイナリ（`0803a8c`）と 13 フェーズの測定条件が
+    // 一致する（比較対象は 13 フェーズの p50/p95 のみであることを
+    // `docs/design/hnsw-index.md`「測定条件」に明記する）。
+    let probe_db_path = {
+        let mut p = db_path.clone();
+        let mut file_name = p.file_name().expect("db_path has file name").to_os_string();
+        file_name.push("-probe");
+        p.set_file_name(file_name);
+        p
+    };
+    std::fs::copy(&db_path, &probe_db_path)
+        .unwrap_or_else(|e| fail_bench("probe db copy failed", &format!("{e}")));
+    let _cleanup_probe = CleanupGuard(probe_db_path.clone());
+    let probe_storage = Storage::open(&probe_db_path).expect("open probe storage");
+    let probe_core = match engine_choice {
+        BenchEngine::BruteForce => {
+            EngineCore::from_storage(probe_storage, engine::search_engine::default_engine())
+        }
+        BenchEngine::Hnsw => {
+            let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+                .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(probe_storage, kind)
+        }
+    };
+    let index_warm_start = Instant::now();
+    let index_warm_probe = probe_core.execute_sql(
+        &ctx_a_full,
+        &format!("SELECT * FROM docs ORDER BY embedding <=> '{qv0}' LIMIT 10"),
+    );
+    let index_warm_us = index_warm_start.elapsed().as_micros() as u64;
+    if let Err(e) = index_warm_probe {
+        fail_bench("index warm-up probe query failed", &format!("{e:?}"));
+    }
+    drop(probe_core);
+    let _ = std::fs::remove_file(&probe_db_path);
+
+    // `insert_rows` で書き込み済みの `Storage` を `EngineCore` へ引き渡す
+    // （`EngineCore::open` による同一ファイルへの二重オープンを避ける。
+    // `from_storage` は所有権移動のみでテナント境界の迂回経路を新設しない）。
+    // 上記プローブとは独立のインスタンスであり、13 フェーズはこの `core` が
+    // cold な状態から開始する。
+    let core = match engine_choice {
+        BenchEngine::BruteForce => {
+            EngineCore::from_storage(storage, engine::search_engine::default_engine())
+        }
+        BenchEngine::Hnsw => {
+            let kind = engine::search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+                .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(storage, kind)
+        }
+    };
 
     // 許可リスト構文（`sql::allowlist`）は非集計 `SELECT` に `ORDER BY` を必須と
     // するため（`LIMIT` 単体では受理されない）、`WHERE` フィルタの効果を見るために
@@ -787,8 +894,50 @@ fn main() {
         &ctx_a_public,
         &ctx_a_full,
         &ctx_b,
+        rows_a,
+        rows_b,
     ));
     phases.push(run_udf_phase(&core, &ctx_a_full, &qv0));
+
+    // 非 vacuous 確認（Issue #413 設計判断 5）。hnsw opt-in 時、全フェーズ計測後に
+    // 索引が実際に構築・使用されたことを固定する（構築失敗→負のキャッシュ→
+    // 黙って brute-force で「ANN 計測」を誤報告する経路を防ぐ。
+    // `ann-recall-gate-verification.md` の `builds=1` 確認と同じ原則）。
+    // brute_force では `hnsw_index_cache_stats()` は常に全欄 0（索引を一切
+    // 構築しない構造）のため統計出力・アサートの対象外とする。
+    let hnsw_stats_json = match engine_choice {
+        BenchEngine::Hnsw => {
+            let s = core.hnsw_index_cache_stats();
+            if s.builds == 0 || s.hits == 0 {
+                fail_bench(
+                    "ANN non-vacuous check",
+                    &format!(
+                        "hnsw engine did not build/hit an index: builds={} hits={}",
+                        s.builds, s.hits
+                    ),
+                );
+            }
+            format!(
+                "\"builds\":{},\"build_failures\":{},\"rebuilds\":{},\"hits\":{},\
+                 \"misses\":{},\"fallbacks\":{},\"plain_scans\":{},\
+                 \"subset_searches\":{},\"hybrid_dense_searches\":{},\
+                 \"hybrid_queries\":{},\"ef_cap_fallbacks\":{},\"entries\":{}",
+                s.builds,
+                s.build_failures,
+                s.rebuilds,
+                s.hits,
+                s.misses,
+                s.fallbacks,
+                s.plain_scans,
+                s.subset_searches,
+                s.hybrid_dense_searches,
+                s.hybrid_queries,
+                s.ef_cap_fallbacks,
+                s.entries,
+            )
+        }
+        BenchEngine::BruteForce => String::new(),
+    };
 
     let final_db_bytes = db_file_size_bytes(&db_path);
     let final_proc = read_proc_stats();
@@ -796,14 +945,24 @@ fn main() {
     let mut out = String::new();
     out.push_str("{\"meta\":{");
     out.push_str(&format!(
-        "\"rows_tenant_a\":{ROWS_A},\"rows_tenant_b\":{ROWS_B},\"dim\":{DIM},\
+        "\"rows_tenant_a\":{rows_a},\"rows_tenant_b\":{rows_b},\"dim\":{DIM},\
          \"batch_size\":{BATCH_SIZE},\"warmup\":{WARMUP},\"iters\":{ITERS},\
          \"db_bytes_after_ingest\":{rows_after_ingest_bytes},\
          \"db_bytes_final\":{final_db_bytes},\
          \"vm_rss_kb_final\":{},\"vm_hwm_kb_final\":{},\
-         \"label\":\"feature_bench\"",
-        final_proc.vm_rss_kb, final_proc.vm_hwm_kb,
+         \"label\":\"feature_bench\",\
+         \"engine\":\"{}\",\"scale\":{scale},\"rows_total\":{},\
+         \"index_warm_us\":{index_warm_us}",
+        final_proc.vm_rss_kb,
+        final_proc.vm_hwm_kb,
+        engine_choice.token(),
+        rows_a + rows_b,
     ));
+    if !hnsw_stats_json.is_empty() {
+        out.push_str(",\"hnsw_stats\":{");
+        out.push_str(&hnsw_stats_json);
+        out.push('}');
+    }
     out.push_str("},\"phases\":[");
     for (i, p) in phases.iter().enumerate() {
         if i > 0 {
