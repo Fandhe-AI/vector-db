@@ -350,16 +350,37 @@ fn ann_incremental_states_match_default_engine_self_retrieval() {
     // 依存するため、「索引のみで完結せず何らかの overlay 関連経路を経由した」ことを
     // 3 カウンタの和で固定する（黙って `builds`／`rebuilds` の非変化だけを見ると、
     // 索引が実質的に無視されて毎回全件 brute-force に縮退していても検出できない
-    // ため、非ゼロを要求する）。
-    let overlay_engaged = stats2.delta_searches + stats2.plain_scans + stats2.fallbacks;
+    // ため、非ゼロを要求する）。`stats1`（状態 1 終了時点。初回構築の
+    // self-retrieval 検証クエリを含む）はこの時点で既に非ゼロになりうるため、
+    // 絶対値ではなく `stats1` からの増分で判定する（さもないと overlay 経路が
+    // 一度も発火しなくても状態 1 の累積値だけで通ってしまう vacuous な検証になる。
+    // codex-review P2・Cursor Bugbot 指摘・Issue #412 PR #438）。
+    let overlay_engaged = (stats2.delta_searches - stats1.delta_searches)
+        + (stats2.plain_scans - stats1.plain_scans)
+        + (stats2.fallbacks - stats1.fallbacks);
     assert!(
         overlay_engaged > 0,
-        "overlay queries must exercise some overlay/fallback path (delta_searches={} plain_scans={} fallbacks={})",
-        stats2.delta_searches, stats2.plain_scans, stats2.fallbacks
+        "overlay queries must exercise some overlay/fallback path beyond the state-1 baseline \
+         (delta_searches {}->{} plain_scans {}->{} fallbacks {}->{})",
+        stats1.delta_searches,
+        stats2.delta_searches,
+        stats1.plain_scans,
+        stats2.plain_scans,
+        stats1.fallbacks,
+        stats2.fallbacks
     );
 
-    // 既存（未置換）チャンクの自己検索到達率は overlay 後も非劣化。
-    let ann_rate_after_overlay = self_retrieval_rate(&ann_core, &ctx, &sample, "orig");
+    // 既存（未置換）チャンクの自己検索到達率は overlay 後も非劣化。overlay
+    // 対象ファイル（`overlay_targets`）はもう marker="orig" を含まないため
+    // `sample` から除外する（含めたままだと「未変更チャンクの取得」検証で
+    // なくなり、約 5% の許容予算を「置換済みファイルの orig 不在」という別の
+    // 理由で圧迫しうる。Cursor Bugbot 指摘・Issue #412 PR #438）。
+    let untouched_sample: Vec<usize> = sample
+        .iter()
+        .copied()
+        .filter(|i| !overlay_targets.contains(i))
+        .collect();
+    let ann_rate_after_overlay = self_retrieval_rate(&ann_core, &ctx, &untouched_sample, "orig");
     assert!(
         ann_rate_after_overlay >= initial_rate - 0.05,
         "overlay must not degrade self-retrieval on untouched chunks: before={initial_rate} after={ann_rate_after_overlay}"
