@@ -24,7 +24,7 @@ B 案（条件付き opt-in・自作 HNSW・依存追加なし）の Phase 3 分
 - 索引の実利用（世代整合キャッシュ・未索引差分の brute-force 併用・Top-k
   マージ）: #408
 - RLS 事前フィルタとの切替: #409・#410
-- `EXPLAIN` へのエンジン種別露出: #411
+- ~~`EXPLAIN` へのエンジン種別露出: #411~~ 実装済み。`docs/design/explain-search-engine-exposure.md` 参照
 - Recall ゲート接続: #412
 
 ## 設計
@@ -56,8 +56,11 @@ Hnsw 検証を理由に失敗しない（`open_with_engine` は `Storage::open` 
 形式）を検討したが、`FromStr` の呼び出し元（wire-server CLI・`EXPLAIN`）は
 いずれも本 Issue のスコープ外であり、呼び出し元が存在しない untrusted
 文字列パーサを production へ追加しないという判断により `Display` のみを
-実装した。`FromStr` は呼び出し元が実際にできる #411 以降で必要になれば
-追加する。
+実装した。`FromStr` は呼び出し元が実際にできれば追加する方針だったが、
+Issue #411（実装済み）の `EXPLAIN` 露出は専用の網羅 `match`（`sql/explain.rs::
+engine_token`／`ann_plan_token`）で閉じた語彙へ変換するのみで、untrusted
+文字列からの逆変換（`FromStr`）を必要としなかったため、依然として未追加
+のまま（`docs/design/explain-search-engine-exposure.md` 参照）。
 
 ### `SearchEngineError`
 

@@ -5,7 +5,8 @@ HnswIndexCache`、`docs/design/hnsw-generation-cache.md`）。対象ビヘイビ
 （ポインタのみ）: CORE-9・CORE-10・TASK-132・RLS-1〜4・RLS-8（TASK-138）・
 TASK-139。ADR: `docs/design/ann-index-adoption.md`（Accepted・B 案）。本ドキュメント
 が定める閾値・切替規則・マスク契約はいずれも**本リポの実装既定値（非規範）**
-であり、`wire_code` の新設・`EXPLAIN` への露出は行わない（#411 の担当）。
+であり、`wire_code` の新設・`EXPLAIN` への露出は行わない（#411 の担当。実装済み。
+`docs/design/explain-search-engine-exposure.md` 参照）。
 
 ## 背景・目的
 
@@ -287,7 +288,7 @@ current_generation` による事前・事後の失効照合とは独立した読
 | 観点 | 対応 |
 | ---- | ---- |
 | アクセス制御の不備／テナント境界（P0） | 索引は ctx 可視アリーナのみから構築（不変）。マスクは同一 ctx 内の候補差分のみを表し、他テナント行はグラフに存在しない。索引ヒットは現世代スロットへの写像・`(tenant_id, id)` キー照合・スコア再計算を経て返し、`provider_result_is_valid`・`RlsSafetyNet` の多層防御を維持。`PolicyContext::is_visible` に新規比較ロジックを追加していない |
-| 存在情報の副次漏えい | 切替判定・マスク密度・統計はいずれも ctx 自身の可視集合と自身の索引のみから導出され、他テナント行数に依存しない。`EXPLAIN` へは露出しない（#411 の担当） |
+| 存在情報の副次漏えい | 切替判定・マスク密度・統計はいずれも ctx 自身の可視集合と自身の索引のみから導出され、他テナント行数に依存しない。`EXPLAIN` へは露出しない（#411 の担当。実装済みの `EXPLAIN` 露出自体もこれらの数値を露出しない方針を継承。`docs/design/explain-search-engine-exposure.md` 参照） |
 | fail-closed のエラー契約 | HNSW 固有エラー・マスク長不一致・写像検証失敗・結果不足はいずれも当該クエリの brute-force 縮退へ吸収し呼び出し元へ伝播させない。不正 `full_scan_ratio` は `ValidatedHnswParams::with_full_scan_ratio` で拒否する |
 | インジェクション | SQL 文字列を組み立てる箇所なし |
 | 不安全な設計／DoS | `NodeMask` は索引ノード数分のビット（最大 `MAX_HNSW_NODES / 8` バイト程度）。整数演算は `checked_*`／`saturating_*`。`ef`・`k` の上限は既存どおり `MAX_EF` |
@@ -315,7 +316,7 @@ current_generation` による事前・事後の失効照合とは独立した読
   密側再取得ループの `fetch_k` 倍増自体が iterative scan として機能する形で
   結線した（`sql::hnsw_hybrid::HnswDenseProvider`）。詳細は
   `docs/design/hnsw-hybrid-iterative-scan.md` 参照
-- `EXPLAIN` へのエンジン種別・縮退有無の露出: #411
+- ~~`EXPLAIN` へのエンジン種別・縮退有無の露出: #411~~ 実装済み（縮退有無は静的判定のみ・実行時縮退は非露出）。`docs/design/explain-search-engine-exposure.md` 参照
 - Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412
 - `full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413
 - `SearchTimeFilter` 経路の ANN 化（設計上対象外）

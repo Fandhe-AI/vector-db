@@ -278,7 +278,7 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 | 受け入れ基準 | 対応タスク |
 | ---- | ---- |
 | 既定エンジン不変・ANN は明示選択のみ | #407（実装済み。`22023` の `ErrorClass` 正式登録は spec 側 TASK・ビヘイビア ID 確定後に着手） |
-| `EXPLAIN` へエンジン種別露出 | #411 |
+| `EXPLAIN` へエンジン種別露出 | #411（実装済み。`docs/design/explain-search-engine-exposure.md` 参照） |
 | 決定性契約（同点規約・境界完全化 or 代替契約）の明文化 | #403（本書）・#405・#410（spec 側 TASK・ビヘイビア ID 確定後に着手） |
 | `PolicyContext::is_visible` 単一照合パス・fail-closed の維持 | #409・#410（RLS 切替契約は spec 側 TASK・ビヘイビア ID 確定後に着手） |
 | SEARCH 系 Recall ゲートを ANN 有効経路でも同一閾値で通過 | #412（`recall.yml` への機械判定可能な接続を含む。「実装ガイド」節の対応表「Recall 受け入れ・継続的ゲート接続」行参照） |

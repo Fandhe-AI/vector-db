@@ -2160,7 +2160,10 @@ impl EngineCore {
                     // I/O（`plan_using_plan_expansion`）より前に完結させる（多層防御
                     // として I/O 後の再束縛でも同じ検証を通す。詳細は
                     // [`crate::sql::using_plan::pre_check_bindable`] のドキュメント参照）。
-                    crate::sql::using_plan::pre_check_bindable(
+                    // `Select` アームは形状情報（`PreCheckShape`）を使わない
+                    // （`EXPLAIN` 用の `ann_plan:` 判定は `Statement::Explain`
+                    // アームのみが必要とする。Issue #411）。
+                    let _ = crate::sql::using_plan::pre_check_bindable(
                         &validated,
                         &pre_check_schema,
                         session.udfs(),
@@ -2366,7 +2369,12 @@ impl EngineCore {
                 // PLAN(...)` なら `22000`（未知列・型不正 WHERE・未登録 UDF）で
                 // 拒否されるはずのクエリが、`EXPLAIN` 経由では LLM I/O まで実行した
                 // うえで成功してしまっていた。
-                crate::sql::using_plan::pre_check_bindable(
+                // 戻り値（`PreCheckShape::filters_empty`）は `EXPLAIN` の
+                // `ann_plan:` 行（Issue #411・`sql::hnsw_cache::classify_ann_plan`）
+                // が要求する形状情報。`WHERE` 句の構造のみから決まる純粋に構文的な
+                // 値であり、以下の LLM I/O・世代照合の影響を受けないため、ここで
+                // 確定させたまま最後まで使い回してよい。
+                let pre_check_shape = crate::sql::using_plan::pre_check_bindable(
                     &validated,
                     &pre_check_schema,
                     session.udfs(),
@@ -2421,7 +2429,48 @@ impl EngineCore {
                 dictionary_required_columns(&post_check_schema)
                     .map_err(crate::sql::allowlist::SqlSurfaceError::invalid_input)?;
 
-                let result = crate::sql::explain::build_explain_result(&planned);
+                // Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の入力を
+                // 組み立てる。`EXPLAIN` は `USING PLAN` 専用（`using_plan::
+                // bind_expansion` は常に `Ranking::Hybrid` を構成する）ため
+                // `is_hybrid` は常に `true`。`hnsw_enabled`（`self.hnsw_state`）は
+                // 実行時に executor が経由する索引キャッシュそのものの有無であり、
+                // `search_engine_kind() == Some(Hnsw(_))` と同値であることは
+                // `explain_hnsw_enabled_matches_hnsw_state_presence` で固定する。
+                // `EXPLAIN` はこの判定のためだけに `hnsw_state` の `lookup`／
+                // `prepare_*`（索引構築・統計加算という副作用を持つ）を一切呼ばず、
+                // `is_some()` の有無だけを見る（検索本体を実行しない契約は不変）。
+                let ann_plan = crate::sql::hnsw_cache::classify_ann_plan(
+                    crate::sql::hnsw_cache::AnnShapeInput {
+                        hnsw_enabled: self.hnsw_state.is_some(),
+                        // codex-review P1 指摘対応（PR #437）: `with_provider`／
+                        // `from_storage` 経由でカスタム provider を注入した場合
+                        // （`self.search_engine_kind() == None`）、`EngineCore`
+                        // は実行方式が ANN か brute-force かを判別できない。
+                        // `hnsw_enabled == false` を無条件に「厳密 brute-force
+                        // と確定している」`AnnPlan::PlainScanEngine` へ丸めると、
+                        // `engine: (custom_provider)` としながら実行方式を
+                        // plain scan と断定してしまい誤表示になる（既知の
+                        // `SearchEngineKind::CpuScalarBruteForce`／
+                        // `ParallelBruteForce` は `PlainScanEngine` のまま
+                        // 正確）。ここで `search_engine_kind().is_none()` を
+                        // 併せて渡し、`classify_ann_plan` 側で
+                        // `AnnPlan::UnknownCustomProvider` へ振り分ける。
+                        engine_kind_unknown: self.search_engine_kind().is_none(),
+                        is_hybrid: true,
+                        is_precision: planned.mode().mode()
+                            == crate::sql::mode::SearchMode::Precision,
+                        filters_empty: pre_check_shape.filters_empty,
+                        scalar_prefilter: crate::sql::plan::ExecutionPlan::from_evaluation_order(
+                            validated.evaluation_order(),
+                        )
+                        .scalar_prefilter,
+                    },
+                );
+                let explain_engine = crate::sql::explain::ExplainEngine {
+                    kind: self.search_engine_kind(),
+                    ann_plan,
+                };
+                let result = crate::sql::explain::build_explain_result(&planned, &explain_engine);
                 Ok(crate::sql::SqlOutcome::Explain(result))
             }
         }
@@ -5210,5 +5259,64 @@ mod tests {
             .to_string(),
             "source() must return the wrapped SearchEngineError"
         );
+    }
+
+    /// Issue #411: `Statement::Explain` アームは `self.hnsw_state.is_some()` を
+    /// `EXPLAIN` の `ann_plan:` 判定（`AnnShapeInput::hnsw_enabled`）の源泉に
+    /// 使う。この値が `search_engine_kind() == Some(SearchEngineKind::Hnsw(_))`
+    /// と常に同値であること（`Self::assemble` の構築規則。`hnsw_state` は
+    /// private フィールドのためこの in-module テストでのみ検証できる）を
+    /// 4 経路（`open`／`with_provider`／`open_with_engine`／`from_storage`／
+    /// `from_storage_with_engine`）全てで固定する。
+    #[test]
+    fn hnsw_state_presence_matches_hnsw_search_engine_kind() {
+        let dir = tempdir();
+
+        let default_core = new_core(dir.path());
+        assert_eq!(
+            default_core.hnsw_state.is_some(),
+            matches!(
+                default_core.search_engine_kind(),
+                Some(crate::search_engine::SearchEngineKind::Hnsw(_))
+            )
+        );
+
+        let provider_core = EngineCore::with_provider(
+            dir.path().join("provider.redb"),
+            Box::new(crate::kernel::CpuScalarProvider),
+        )
+        .expect("open with_provider core");
+        assert!(provider_core.hnsw_state.is_none());
+        assert!(!matches!(
+            provider_core.search_engine_kind(),
+            Some(crate::search_engine::SearchEngineKind::Hnsw(_))
+        ));
+
+        let hnsw_params = crate::hnsw::ValidatedHnswParams::new(crate::hnsw::HnswParams::default())
+            .expect("valid hnsw params");
+        let hnsw_kind = crate::search_engine::SearchEngineKind::Hnsw(hnsw_params);
+        let hnsw_core = EngineCore::open_with_engine(dir.path().join("hnsw.redb"), hnsw_kind)
+            .expect("open_with_engine core");
+        assert!(hnsw_core.hnsw_state.is_some());
+        assert!(matches!(
+            hnsw_core.search_engine_kind(),
+            Some(crate::search_engine::SearchEngineKind::Hnsw(_))
+        ));
+
+        let storage = crate::storage::Storage::open(dir.path().join("from-storage.redb"))
+            .expect("open storage");
+        let from_storage_core =
+            EngineCore::from_storage(storage, Box::new(crate::kernel::CpuScalarProvider));
+        assert!(from_storage_core.hnsw_state.is_none());
+        assert!(from_storage_core.search_engine_kind().is_none());
+
+        let storage2 = crate::storage::Storage::open(dir.path().join("from-storage-hnsw.redb"))
+            .expect("open storage");
+        let from_storage_hnsw_core = EngineCore::from_storage_with_engine(storage2, hnsw_kind);
+        assert!(from_storage_hnsw_core.hnsw_state.is_some());
+        assert!(matches!(
+            from_storage_hnsw_core.search_engine_kind(),
+            Some(crate::search_engine::SearchEngineKind::Hnsw(_))
+        ));
     }
 }

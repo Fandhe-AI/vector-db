@@ -31,6 +31,12 @@
 //! あり、ANN の近似近傍では真の最近傍の取りこぼしによりマージンを過大評価しうる
 //! ため、常に厳密 brute-force 経路を使う）。
 //!
+//! 上記適用条件（DISTANCE の `FullVisible`／`Subset` 判定、および hybrid 密側の
+//! 対称条件）の判定本体は [`classify_ann_plan`]（Issue #411）に集約する。
+//! `sql::exec` の 4 boolean はいずれもこの関数の戻り値から導出し、`sql::explain`
+//! （`EXPLAIN` の `ann_plan:` 行）も同じ関数を呼ぶ——「並行する推測」ではなく
+//! 単一実装の共有により、`EXPLAIN` の回答が executor の実際の判定と乖離しない。
+//!
 //! **fail-closed 契約**（[`HnswIndexCache::lookup`]／[`HnswIndexCache::record_base`]／
 //! `record_overlay_for`／`record_build_failed`（本モジュール内 free function）で
 //! 非対称。`sql::arena_cache`・`sql::sparse_cache` と同型。Issue #280 の統一方針を
@@ -1506,6 +1512,97 @@ fn full_scan_with_arena(
     provider.search(input)
 }
 
+/// ANN（HNSW）経路の静的な適用判定（Issue #411。`sql::exec` の 4 条件
+/// （`hnsw_full_visible_eligible`／`hnsw_subset_eligible`／
+/// `hnsw_hybrid_full_visible_eligible`／`hnsw_hybrid_subset_eligible`）と
+/// `sql::explain` が同一の実装を共有するための単一情報源）。
+///
+/// `sql::exec` 側は本関数の戻り値と `is_hybrid` の真偽から 4 boolean を導出する
+/// （`!is_hybrid && plan == FullVisible` のように組み合わせる。導出が現行の 4 式と
+/// ビット一致することは in-module テスト [`tests::classify_ann_plan_matches_exec_eligibility_truth_table`]
+/// で固定する）。`sql::explain::build_explain_result` は `EXPLAIN` が検索本体を
+/// 実行しない契約（モジュールドキュメント冒頭参照）を保つため、実行時の縮退結果
+/// ではなくクエリ形状とエンジン設定から決まるこの**静的判定**をそのまま報告する
+/// （実行時 fail-closed 縮退・hybrid 再取得ラウンド数は対象外。
+/// `docs/design/explain-search-engine-exposure.md` 参照）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnnPlan {
+    /// エンジンが `SearchEngineKind::Hnsw` でない（`hnsw_cache` が `None`）ため
+    /// 常に全件 brute-force。`SearchEngineKind` が既知（`CpuScalarBruteForce`／
+    /// `ParallelBruteForce`）の場合のみこの分類を返す。
+    PlainScanEngine,
+    /// HNSW だが `precision` モード（TASK-162・SEARCH-9）のため厳密 brute-force。
+    PlainScanPrecision,
+    /// 索引経路・`FullVisible` 形状（フィルタなし、または DISTANCE 先行で
+    /// SCALAR 条件を事後判定する形。上記コメント「Issue #409」参照）。
+    HnswFullVisible,
+    /// 索引経路・`Subset` 形状（SCALAR 事前フィルタ付き。per-query 写像・
+    /// キャッシュ非登録）。
+    HnswSubset,
+    /// `EngineCore::search_engine_kind()` が `None`（`with_provider`／
+    /// `from_storage` 経由でカスタム [`crate::kernel::SearchProvider`] を直接
+    /// 注入した構築経路。`kind` と provider の対応をこの構造体自身は検証
+    /// できない）ため、実際に ANN か brute-force かを `EngineCore` 側からは
+    /// 判別できない（codex-review P1 指摘・PR #437。`hnsw_enabled == false` を
+    /// 「厳密 brute-force と確定している」`PlainScanEngine` へ丸めてしまうと、
+    /// カスタム provider が内部で ANN 相当の近似探索を行っていても `EXPLAIN`
+    /// が plain scan と誤断定する）。
+    UnknownCustomProvider,
+}
+
+/// [`classify_ann_plan`] の入力（`sql::exec::execute_statement_with_cache` と
+/// `sql::explain` 双方が同じ形へ組み立てる）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnnShapeInput {
+    /// `hnsw_cache.is_some()`（`EngineCore::hnsw_state` の有無。
+    /// `SearchEngineKind::Hnsw` opt-in 構築時のみ `true`）。
+    pub(crate) hnsw_enabled: bool,
+    /// `EngineCore::search_engine_kind().is_none()`（`with_provider`／
+    /// `from_storage` 経由でカスタム provider を直接注入した構築経路。
+    /// Issue #411 追記・codex-review P1 指摘・PR #437）。`hnsw_enabled == false`
+    /// の場合のみ参照し、`true` を「実行方式が不明」（[`AnnPlan::
+    /// UnknownCustomProvider`]）、`false` を「エンジン種別は既知で brute-force
+    /// と確定している」（[`AnnPlan::PlainScanEngine`]）に振り分ける。`sql::exec`
+    /// の 4 boolean（`hnsw_full_visible_eligible` 等）はこの分岐に依存しない
+    /// （`UnknownCustomProvider` も `PlainScanEngine` も等しく `HnswFullVisible`／
+    /// `HnswSubset` ではないため）ため、`sql::exec` は常に `false` を渡してよい。
+    pub(crate) engine_kind_unknown: bool,
+    /// `Ranking::Hybrid` かどうか。分類本体（[`classify_ann_plan`]）は
+    /// `is_hybrid` を参照しない（`FullVisible`／`Subset` の形状判定自体は
+    /// `Ranking` の種別に依存しないため。上記コメント「Issue #410」参照）。
+    /// `sql::exec` 側の 4 boolean 導出・判別テストが 1 つの構造体から
+    /// 4 通りすべてを再現できるように、この構造体に残す。
+    pub(crate) is_hybrid: bool,
+    /// `bound.mode`（`USING PLAN` 経由の推定を含む）が `precision` か。
+    pub(crate) is_precision: bool,
+    /// `bound.metadata_filters` と `bound.expr_filters` がともに空か。
+    pub(crate) filters_empty: bool,
+    /// `ExecutionPlan::from_evaluation_order(..).scalar_prefilter`
+    /// （SCALAR 段が DISTANCE 段より先に評価されるか）。
+    pub(crate) scalar_prefilter: bool,
+}
+
+/// [`AnnShapeInput`] から [`AnnPlan`] を決定する（純粋関数・副作用なし）。
+/// `sql::exec` の現行 4 式と同値であることは
+/// [`tests::classify_ann_plan_matches_exec_eligibility_truth_table`] で固定する。
+pub(crate) fn classify_ann_plan(input: AnnShapeInput) -> AnnPlan {
+    if !input.hnsw_enabled {
+        return if input.engine_kind_unknown {
+            AnnPlan::UnknownCustomProvider
+        } else {
+            AnnPlan::PlainScanEngine
+        };
+    }
+    if input.is_precision {
+        return AnnPlan::PlainScanPrecision;
+    }
+    if input.filters_empty || !input.scalar_prefilter {
+        AnnPlan::HnswFullVisible
+    } else {
+        AnnPlan::HnswSubset
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,6 +1610,155 @@ mod tests {
     use crate::rls::ImplicitRlsHook;
     use crate::storage::{RowInput, Storage, Visibility};
     use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+    /// [`classify_ann_plan`] からの導出（`!is_hybrid && plan == FullVisible` 等）が
+    /// `sql::exec::execute_statement_with_cache` の現行 4 式とビット一致することを
+    /// 32 通り（2^5: hnsw_enabled・is_hybrid・is_precision・filters_empty・
+    /// scalar_prefilter）全数で固定する（Issue #411）。旧式はここに複製し、
+    /// `sql/exec.rs` 側は本関数呼び出しへ置換済み（二重管理を避けるため、
+    /// `exec.rs` を読む代わりにこの固定テストが両者の同値性を保証する）。
+    #[test]
+    fn classify_ann_plan_matches_exec_eligibility_truth_table() {
+        for hnsw_enabled in [false, true] {
+            for is_hybrid in [false, true] {
+                for is_precision in [false, true] {
+                    for filters_empty in [false, true] {
+                        for scalar_prefilter in [false, true] {
+                            // `sql/exec.rs` の現行 4 式（置換前のオリジナル）。
+                            let expected_full_visible = hnsw_enabled
+                                && !is_hybrid
+                                && !is_precision
+                                && (filters_empty || !scalar_prefilter);
+                            let expected_subset = hnsw_enabled
+                                && !is_hybrid
+                                && !is_precision
+                                && !filters_empty
+                                && scalar_prefilter;
+                            let expected_hybrid_full_visible = hnsw_enabled
+                                && is_hybrid
+                                && !is_precision
+                                && (filters_empty || !scalar_prefilter);
+                            let expected_hybrid_subset = hnsw_enabled
+                                && is_hybrid
+                                && !is_precision
+                                && !filters_empty
+                                && scalar_prefilter;
+
+                            let plan = classify_ann_plan(AnnShapeInput {
+                                hnsw_enabled,
+                                engine_kind_unknown: false,
+                                is_hybrid,
+                                is_precision,
+                                filters_empty,
+                                scalar_prefilter,
+                            });
+
+                            let got_full_visible = !is_hybrid && plan == AnnPlan::HnswFullVisible;
+                            let got_subset = !is_hybrid && plan == AnnPlan::HnswSubset;
+                            let got_hybrid_full_visible =
+                                is_hybrid && plan == AnnPlan::HnswFullVisible;
+                            let got_hybrid_subset = is_hybrid && plan == AnnPlan::HnswSubset;
+
+                            assert_eq!(
+                                got_full_visible, expected_full_visible,
+                                "hnsw_enabled={hnsw_enabled} is_hybrid={is_hybrid} \
+                                 is_precision={is_precision} filters_empty={filters_empty} \
+                                 scalar_prefilter={scalar_prefilter}"
+                            );
+                            assert_eq!(
+                                got_subset, expected_subset,
+                                "hnsw_enabled={hnsw_enabled} is_hybrid={is_hybrid} \
+                                 is_precision={is_precision} filters_empty={filters_empty} \
+                                 scalar_prefilter={scalar_prefilter}"
+                            );
+                            assert_eq!(
+                                got_hybrid_full_visible, expected_hybrid_full_visible,
+                                "hnsw_enabled={hnsw_enabled} is_hybrid={is_hybrid} \
+                                 is_precision={is_precision} filters_empty={filters_empty} \
+                                 scalar_prefilter={scalar_prefilter}"
+                            );
+                            assert_eq!(
+                                got_hybrid_subset, expected_hybrid_subset,
+                                "hnsw_enabled={hnsw_enabled} is_hybrid={is_hybrid} \
+                                 is_precision={is_precision} filters_empty={filters_empty} \
+                                 scalar_prefilter={scalar_prefilter}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classify_ann_plan_plain_scan_engine_when_hnsw_disabled() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: false,
+            engine_kind_unknown: false,
+            is_hybrid: false,
+            is_precision: false,
+            filters_empty: true,
+            scalar_prefilter: false,
+        });
+        assert_eq!(plan, AnnPlan::PlainScanEngine);
+    }
+
+    /// codex-review P1 指摘対応（PR #437）: `hnsw_enabled == false` かつ
+    /// `engine_kind_unknown == true`（`EngineCore::search_engine_kind()` が
+    /// `None` を返す `with_provider`／`from_storage` 経由）では、実際に ANN か
+    /// brute-force かを判別できないため `PlainScanEngine`（厳密 brute-force と
+    /// 確定）ではなく `UnknownCustomProvider` を返すことを固定する。
+    #[test]
+    fn classify_ann_plan_unknown_custom_provider_when_engine_kind_unknown() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: false,
+            engine_kind_unknown: true,
+            is_hybrid: false,
+            is_precision: false,
+            filters_empty: true,
+            scalar_prefilter: false,
+        });
+        assert_eq!(plan, AnnPlan::UnknownCustomProvider);
+    }
+
+    #[test]
+    fn classify_ann_plan_plain_scan_precision_when_precision_mode() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: true,
+            engine_kind_unknown: false,
+            is_hybrid: false,
+            is_precision: true,
+            filters_empty: true,
+            scalar_prefilter: false,
+        });
+        assert_eq!(plan, AnnPlan::PlainScanPrecision);
+    }
+
+    #[test]
+    fn classify_ann_plan_hnsw_full_visible_when_filters_empty() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: true,
+            engine_kind_unknown: false,
+            is_hybrid: false,
+            is_precision: false,
+            filters_empty: true,
+            scalar_prefilter: false,
+        });
+        assert_eq!(plan, AnnPlan::HnswFullVisible);
+    }
+
+    #[test]
+    fn classify_ann_plan_hnsw_subset_when_scalar_prefilter() {
+        let plan = classify_ann_plan(AnnShapeInput {
+            hnsw_enabled: true,
+            engine_kind_unknown: false,
+            is_hybrid: false,
+            is_precision: false,
+            filters_empty: false,
+            scalar_prefilter: true,
+        });
+        assert_eq!(plan, AnnPlan::HnswSubset);
+    }
 
     /// 恒等マスク（全ノード受理）＋全ノード可視の `visible_in_index` を返す
     /// テスト専用ヘルパ（Issue #409 で `Overlay` に追加した 2 フィールドを

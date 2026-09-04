@@ -118,7 +118,7 @@ pub(crate) fn pre_check_bindable(
     stmt: &ValidatedStatement,
     schema: &TableSchema,
     udfs: &crate::sql::udf_call::UdfRegistry,
-) -> Result<(), SqlSurfaceError> {
+) -> Result<PreCheckShape, SqlSurfaceError> {
     if let Some(literal) = stmt.search_mode() {
         crate::sql::mode::SearchMode::parse_literal(literal)?;
     }
@@ -126,8 +126,27 @@ pub(crate) fn pre_check_bindable(
 
     let mut node_budget = crate::sql::udf_call::MAX_EXPR_NODES;
     parser::bind_projection(stmt.projection(), schema, udfs, &mut node_budget)?;
-    parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
-    Ok(())
+    let (metadata_filters, expr_filters, _rls_predicate_present) =
+        parser::bind_where_predicates(stmt.where_predicates(), schema, udfs, &mut node_budget)?;
+    Ok(PreCheckShape {
+        filters_empty: metadata_filters.is_empty() && expr_filters.is_empty(),
+    })
+}
+
+/// [`pre_check_bindable`] が束縛結果自体は破棄しつつ、`EXPLAIN`（Issue #411・
+/// `sql::explain`）の ANN 静的判定（`sql::hnsw_cache::classify_ann_plan`）が
+/// 必要とする形状情報のみを持ち帰るための最小限の戻り値。
+///
+/// `WHERE visible()`（[`crate::sql::parser::WherePredicate::PredicateCall`]）は
+/// `bind_where_predicates` の `rls_predicate_present` フラグを立てるだけで
+/// `metadata_filters`／`expr_filters` を増やさないため、`stmt.where_predicates()`
+/// が非空でも `filters_empty` は `true` になりうる（`sql::exec` の
+/// `bound.metadata_filters.is_empty() && bound.expr_filters.is_empty()` と
+/// 同じ定義。呼び出し元 `core.rs` はこの値を `stmt.where_predicates().is_empty()`
+/// で代替してはならない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreCheckShape {
+    pub(crate) filters_empty: bool,
 }
 
 /// `stmt`（`using_plan()` が `Some` である前提）・展開結果 `expansion`・埋め込み

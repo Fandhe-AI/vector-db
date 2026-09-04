@@ -16,6 +16,7 @@ use engine::policy::PolicyContext;
 use engine::query_planner::{LlmClient, PlanError};
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
+use engine::search_engine;
 use engine::sql::exec::{Cell, ColumnMeta};
 use engine::sql::mode::SessionState;
 use engine::sql::SqlOutcome;
@@ -189,6 +190,12 @@ fn explain_reports_search_terms_and_hints_and_mode() {
             "kind_hint: fn".to_string(),
             "mode: recall".to_string(),
             "mode_source: default".to_string(),
+            // Issue #411: `EngineCore::from_storage`（provider を直接注入・
+            // `kind` 不明）経由のため `engine: (custom_provider)`。codex-review
+            // P1 指摘対応（PR #437）: 実行方式を判別できないため `ann_plan:` も
+            // `unknown_custom_provider`。
+            "engine: (custom_provider)".to_string(),
+            "ann_plan: unknown_custom_provider".to_string(),
         ]
     );
 }
@@ -221,6 +228,8 @@ fn explain_uses_none_label_for_absent_hints() {
             "kind_hint: (none)".to_string(),
             "mode: recall".to_string(),
             "mode_source: default".to_string(),
+            "engine: (custom_provider)".to_string(),
+            "ann_plan: unknown_custom_provider".to_string(),
         ]
     );
 }
@@ -246,8 +255,8 @@ fn explain_reports_mode_source_query_clause() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 2], "mode: precision");
-    assert_eq!(lines[lines.len() - 1], "mode_source: query_clause");
+    assert_eq!(lines[lines.len() - 4], "mode: precision");
+    assert_eq!(lines[lines.len() - 3], "mode_source: query_clause");
 }
 
 #[test]
@@ -278,8 +287,8 @@ fn explain_reports_mode_source_session_variable() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 2], "mode: precision");
-    assert_eq!(lines[lines.len() - 1], "mode_source: session_variable");
+    assert_eq!(lines[lines.len() - 4], "mode: precision");
+    assert_eq!(lines[lines.len() - 3], "mode_source: session_variable");
 }
 
 #[test]
@@ -303,8 +312,8 @@ fn explain_reports_mode_source_planner_estimate() {
         .expect("EXPLAIN should succeed");
 
     let lines = explain_result_lines(outcome);
-    assert_eq!(lines[lines.len() - 2], "mode: precision");
-    assert_eq!(lines[lines.len() - 1], "mode_source: planner_estimate");
+    assert_eq!(lines[lines.len() - 4], "mode: precision");
+    assert_eq!(lines[lines.len() - 3], "mode_source: planner_estimate");
 }
 
 #[test]
@@ -631,4 +640,284 @@ fn explain_does_not_write_or_execute_search() {
         other => panic!("expected Cell::Integer, got {other:?}"),
     };
     assert_eq!(count_before, 1, "EXPLAIN must not write or delete rows");
+}
+
+// --- Issue #411: `engine:`／`hnsw_params:`／`ann_plan:` 行の受け入れテスト --------
+
+/// `SearchEngineKind::Hnsw` opt-in で構築した `EngineCore` を返す（`from_storage`
+/// 経由の各テストと同様、`seeded_storage` の 1 行を種にする）。
+fn seeded_hnsw_core(path: &std::path::Path) -> EngineCore {
+    let storage = seeded_storage(path);
+    let kind =
+        search_engine::hnsw_kind(engine::hnsw::HnswParams::default()).expect("valid hnsw params");
+    EngineCore::from_storage_with_engine(storage, kind)
+}
+
+#[test]
+fn explain_reports_custom_provider_engine_and_unknown_custom_provider_ann_plan() {
+    // `EngineCore::from_storage`（provider 直接注入・`kind` 不明）は
+    // `search_engine_kind() == None` となり `engine: (custom_provider)` を返す。
+    // codex-review P1 指摘対応（PR #437）: 実際に ANN か brute-force かを
+    // `EngineCore` 側から判別できないため、`ann_plan:` も
+    // `unknown_custom_provider`（`plain_scan_engine` へ丸めない）。
+    let path = unique_db_path("sql-explain-engine-custom-provider");
+    let _guard = CleanupGuard(path.clone());
+    let storage = seeded_storage(&path);
+    let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider)).with_query_planner(
+        Box::new(StubLlmClient {
+            response: EXPANSION_RESPONSE_NO_HINTS,
+        }),
+    );
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    assert_eq!(lines[lines.len() - 2], "engine: (custom_provider)");
+    assert_eq!(lines[lines.len() - 1], "ann_plan: unknown_custom_provider");
+}
+
+#[test]
+fn explain_reports_hnsw_engine_params_and_full_visible_ann_plan_without_filter() {
+    // HNSW opt-in・`WHERE` なし → `ann_plan: hnsw_full_visible`
+    // （`sql::hnsw_cache::classify_ann_plan` の `filters_empty` 分岐）。
+    let path = unique_db_path("sql-explain-hnsw-full-visible");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    assert_eq!(lines[lines.len() - 3], "engine: hnsw");
+    assert_eq!(
+        lines[lines.len() - 2],
+        "hnsw_params: m=16,ef_construction=100,ef_search=64"
+    );
+    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_full_visible");
+}
+
+#[test]
+fn explain_reports_hnsw_subset_ann_plan_with_default_scalar_first_where() {
+    // HNSW opt-in・等価 `WHERE`・既定 HINT ORDER（SCALAR 先行）
+    // → `ann_plan: hnsw_subset`。
+    let path = unique_db_path("sql-explain-hnsw-subset");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE path = 'docs/a.md' USING PLAN('find content') LIMIT 10",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_subset");
+}
+
+#[test]
+fn explain_rejects_hint_order_combined_with_using_plan() {
+    // `sql::allowlist::parse_select_shape` は `USING PLAN` 経路で `HINT ORDER(...)`
+    // を構造上受理しない（ランキング自体を展開結果が決めるため。上記コメント
+    // 参照）。`EXPLAIN` も同じ許可リスト検証を通るため、`stmt.evaluation_order()`
+    // は `USING PLAN` を伴う限り常に `EvaluationOrder::DEFAULT`（SCALAR 先行）
+    // であり、`ann_plan:` の `scalar_prefilter` 分岐で `false`（DISTANCE 先行）
+    // 側には到達しない。この判別テストで両者の前提が食い違わないことを固定する。
+    let path = unique_db_path("sql-explain-hnsw-hint-order-rejected");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let err = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE path = 'docs/a.md' USING PLAN('find content') \
+             LIMIT 10 HINT ORDER(DISTANCE, SCALAR, RLS)",
+        )
+        .expect_err("HINT ORDER combined with USING PLAN must be rejected");
+    assert_eq!(err.wire_code(), "42601");
+}
+
+#[test]
+fn explain_reports_hnsw_full_visible_ann_plan_with_only_visible_predicate() {
+    // `WHERE visible()`（`WherePredicate::PredicateCall`）は `metadata_filters`／
+    // `expr_filters` を増やさないため、`stmt.where_predicates()` が非空でも
+    // `filters_empty == true` になる（`sql::using_plan::PreCheckShape` ドキュメント
+    // 参照）。`stmt.where_predicates().is_empty()` へ代替していないことの固定。
+    let path = unique_db_path("sql-explain-hnsw-visible-predicate");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs WHERE visible() USING PLAN('find content') LIMIT 10",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    assert_eq!(lines[lines.len() - 1], "ann_plan: hnsw_full_visible");
+}
+
+#[test]
+fn explain_reports_plain_scan_precision_ann_plan_for_precision_mode() {
+    // HNSW opt-in でも `precision` モードは常に厳密 brute-force
+    // （TASK-162・SEARCH-9。`docs/design/explain-search-engine-exposure.md` 参照）。
+    let path = unique_db_path("sql-explain-hnsw-precision");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10 USING MODE 'precision'",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    assert_eq!(lines[lines.len() - 1], "ann_plan: plain_scan_precision");
+}
+
+#[test]
+fn explain_does_not_touch_hnsw_index_cache() {
+    // `EXPLAIN` は検索本体を実行しない契約（`explain_does_not_write_or_execute_search`
+    // と同じ方針）を HNSW opt-in エンジンでも維持することを、`hnsw_index_cache_stats`
+    // が実行前後で全 0 のまま（`lookup`／`prepare_*` を一切呼ばない）で固定する。
+    let path = unique_db_path("sql-explain-hnsw-no-index-touch");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE,
+    }));
+
+    let before = format!("{:?}", core.hnsw_index_cache_stats());
+
+    core.execute_sql_in_session(
+        &ctx("tenant-a"),
+        &mut SessionState::default(),
+        "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+    )
+    .expect("EXPLAIN should succeed");
+
+    let after = core.hnsw_index_cache_stats();
+    assert_eq!(
+        before,
+        format!("{after:?}"),
+        "EXPLAIN must not touch HnswIndexCache (no build/lookup side effects)"
+    );
+    // `sql::hnsw_cache` は `pub(crate)`（`HnswIndexCacheStats::default()` を
+    // 外部クレートからは名指しできない）ため、フィールド和がゼロであることで
+    // 「全 0」を確認する（全フィールドが `u64`／`usize` のため和 0 は全 0 と同値）。
+    let total = after.hits
+        + after.misses
+        + after.builds
+        + after.build_failures
+        + after.rebuilds
+        + after.delta_searches
+        + after.fallbacks
+        + after.plain_scans
+        + after.masked_short
+        + after.mask_splits_graph
+        + after.subset_searches
+        + after.ef_cap_fallbacks
+        + after.hybrid_dense_searches
+        + after.hybrid_queries
+        + after.hybrid_rounds_max
+        + after.entries as u64;
+    assert_eq!(
+        total, 0,
+        "HnswIndexCache must remain untouched (all-zero stats) after EXPLAIN: {after:?}"
+    );
+}
+
+#[test]
+fn explain_new_rows_use_closed_vocabulary_and_default_hnsw_params() {
+    // Issue #411 要件 3: 新規行（`engine:`／`hnsw_params:`／`ann_plan:`）が閉じた
+    // 語彙集合の要素のみで構成され、可視カーディナリティ・行数等データ由来の値を
+    // 含まないことを既定エンジン・HNSW opt-in の両方で機械的に固定する。
+    const ENGINE_TOKENS: &[&str] = &[
+        "cpu_scalar_brute_force",
+        "parallel_brute_force",
+        "hnsw",
+        "(custom_provider)",
+    ];
+    const ANN_PLAN_TOKENS: &[&str] = &[
+        "plain_scan_engine",
+        "plain_scan_precision",
+        "hnsw_full_visible",
+        "hnsw_subset",
+        "unknown_custom_provider",
+    ];
+
+    let path = unique_db_path("sql-explain-hnsw-closed-vocab");
+    let _guard = CleanupGuard(path.clone());
+    let core = seeded_hnsw_core(&path).with_query_planner(Box::new(StubLlmClient {
+        response: EXPANSION_RESPONSE_NO_HINTS,
+    }));
+
+    let mut session = SessionState::default();
+    let outcome = core
+        .execute_sql_in_session(
+            &ctx("tenant-a"),
+            &mut session,
+            "EXPLAIN SELECT id FROM docs USING PLAN('find content') LIMIT 10",
+        )
+        .expect("EXPLAIN should succeed");
+
+    let lines = explain_result_lines(outcome);
+    let engine_line = lines
+        .iter()
+        .find(|l| l.starts_with("engine: "))
+        .expect("engine line present");
+    assert!(
+        ENGINE_TOKENS
+            .iter()
+            .any(|t| engine_line == &format!("engine: {t}")),
+        "unexpected engine token: {engine_line}"
+    );
+    let ann_plan_line = lines
+        .iter()
+        .find(|l| l.starts_with("ann_plan: "))
+        .expect("ann_plan line present");
+    assert!(
+        ANN_PLAN_TOKENS
+            .iter()
+            .any(|t| ann_plan_line == &format!("ann_plan: {t}")),
+        "unexpected ann_plan token: {ann_plan_line}"
+    );
+    let hnsw_params_line = lines.iter().find(|l| l.starts_with("hnsw_params: "));
+    assert_eq!(
+        hnsw_params_line,
+        Some(&"hnsw_params: m=16,ef_construction=100,ef_search=64".to_string()),
+        "default HnswParams must round-trip exactly through EXPLAIN"
+    );
 }

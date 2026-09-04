@@ -463,15 +463,30 @@ pub(crate) fn execute_statement_with_cache(
     // `Subset` 形状（per-query 写像・キャッシュ非登録）へ回す
     // （`sql::hnsw_cache` モジュールドキュメント「適用条件」・
     // `docs/design/hnsw-rls-cardinality-switch.md` 参照）。
-    let hnsw_full_visible_eligible = hnsw_cache.is_some()
-        && !is_hybrid
-        && !is_precision
-        && (filters_empty || !plan.scalar_prefilter);
-    let hnsw_subset_eligible = hnsw_cache.is_some()
-        && !is_hybrid
-        && !is_precision
-        && !filters_empty
-        && plan.scalar_prefilter;
+    // Issue #411: 判定本体は `sql::hnsw_cache::classify_ann_plan` に集約した
+    // （`EXPLAIN` の `ann_plan:` 行が同じ関数を呼ぶ単一情報源。上記コメント
+    // 「Issue #408」「Issue #409」の適用条件そのものは不変）。ここでは
+    // `AnnShapeInput` を組み立てて分類し、`is_hybrid` で 4 boolean へ振り分ける
+    // だけに簡素化する。
+    let ann_plan =
+        crate::sql::hnsw_cache::classify_ann_plan(crate::sql::hnsw_cache::AnnShapeInput {
+            hnsw_enabled: hnsw_cache.is_some(),
+            // Issue #411 追記（codex-review P1 指摘・PR #437）:
+            // `sql::exec` の 4 boolean は `AnnPlan::UnknownCustomProvider` と
+            // `AnnPlan::PlainScanEngine` のどちらであっても等しく `false`
+            // （いずれも `HnswFullVisible`／`HnswSubset` ではない）ため、この
+            // 判別は `EXPLAIN`（`core.rs`）専用の表示情報。ここでは常に
+            // `false`（「エンジン種別は既知」）を渡す。
+            engine_kind_unknown: false,
+            is_hybrid,
+            is_precision,
+            filters_empty,
+            scalar_prefilter: plan.scalar_prefilter,
+        });
+    let hnsw_full_visible_eligible =
+        !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;
+    let hnsw_subset_eligible =
+        !is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswSubset;
     // Issue #410: hybrid 密側の再取得ループ（`hybrid.rs::hybrid_search_boosted`
     // の `dense_fetch_k` 倍増ループ）向けの適用条件。`hnsw_full_visible_eligible`／
     // `hnsw_subset_eligible` と対称だが `is_hybrid` を要求する点のみが異なる
@@ -482,15 +497,10 @@ pub(crate) fn execute_statement_with_cache(
     // 前提とするため。TASK-162・SEARCH-9）。実際の結線は `sql::hnsw_hybrid::
     // HnswDenseProvider` を介して行う（`hybrid.rs`・`SearchProvider` trait は
     // 無変更）。詳細は `docs/design/hnsw-hybrid-iterative-scan.md` 参照。
-    let hnsw_hybrid_full_visible_eligible = hnsw_cache.is_some()
-        && is_hybrid
-        && !is_precision
-        && (filters_empty || !plan.scalar_prefilter);
-    let hnsw_hybrid_subset_eligible = hnsw_cache.is_some()
-        && is_hybrid
-        && !is_precision
-        && !filters_empty
-        && plan.scalar_prefilter;
+    let hnsw_hybrid_full_visible_eligible =
+        is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswFullVisible;
+    let hnsw_hybrid_subset_eligible =
+        is_hybrid && ann_plan == crate::sql::hnsw_cache::AnnPlan::HnswSubset;
     // `sparse_cache_eligible` を満たす場合、`is_hybrid` の定義から
     // `text_column_index` は必ず `Some`（`Ranking::Hybrid` 分岐由来）。キャッシュ
     // キーに `text_column_index` を含める理由は `sql/sparse_cache.rs` モジュール

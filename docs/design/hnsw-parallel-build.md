@@ -20,7 +20,8 @@
 本タスクは**構築の並列化のみ**を扱う。`search_engine.rs::SearchEngineKind`
 への結線（#407・実装済み。`docs/design/hnsw-search-engine-wiring.md`）、
 世代整合キャッシュ（#408）、RLS 統合・切替（#409／#410）、
-`EXPLAIN` 露出（#411）、Recall ゲート接続（#412）、前後比較（#413）、永続化は
+`EXPLAIN` 露出（#411・実装済み。`docs/design/explain-search-engine-exposure.md`
+参照）、Recall ゲート接続（#412）、前後比較（#413）、永続化は
 いずれも別タスクの担当であり、本タスクは `hnsw.rs`／`hnsw/parallel_build.rs`
 内部に閉じた実装（wire／SQL に露出しない・`wire_code` を新設しない）に留める。
 
