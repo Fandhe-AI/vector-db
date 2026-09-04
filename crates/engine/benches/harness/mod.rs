@@ -46,6 +46,7 @@
 // 個別に import する。
 pub mod ab;
 pub mod accept;
+pub mod bench_engine;
 #[cfg(feature = "contrast-bench")]
 pub mod contrast;
 pub mod dot_kernel;

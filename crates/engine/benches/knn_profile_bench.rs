@@ -144,6 +144,22 @@ fn fail_closed(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
+/// S0-cold／S0-hot が使う `EngineCore` を `knn_engine`（`BENCH_KNN_PROFILE_ENGINE`。
+/// Issue #413）に応じて構築する。S1〜S5' は生 redb 走査・provider 直呼び等の
+/// エンジン非依存経路のため本関数を使わない。
+fn build_core_for(knn_engine: harness::bench_engine::BenchEngine, storage: Storage) -> EngineCore {
+    match knn_engine {
+        harness::bench_engine::BenchEngine::BruteForce => {
+            EngineCore::from_storage(storage, search_engine::default_engine())
+        }
+        harness::bench_engine::BenchEngine::Hnsw => {
+            let kind = search_engine::hnsw_kind(engine::hnsw::HnswParams::default())
+                .expect("valid HnswParams::default()");
+            EngineCore::from_storage_with_engine(storage, kind)
+        }
+    }
+}
+
 /// 段間差分（[`stage_diff_ns_per_row`]）の結果を出力する。S1〜S4・S5prime-S5_scalar
 /// はいずれも段ごとに独立した `run` 呼び出し（別トランザクション・別 warmup/
 /// サンプル列）による中央値どうしの比較であり、測定ノイズにより逆転しうる
@@ -166,12 +182,23 @@ fn main() {
         fail_closed(e);
     }
 
+    // ANN opt-in（Issue #413）。`BENCH_KNN_PROFILE_ENGINE` は S0-cold／S0-hot
+    // （SQL 表層 e2e）の `EngineCore` 構築にのみ効く。S1〜S5' は構造的にエンジン
+    // 非依存（生 redb 走査・`VectorArena::build_filtered`・provider 直呼び）の
+    // ため変更しない（S5 を hnsw として提示しない。モジュール冒頭コメント参照）。
+    let knn_engine = match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_ENGINE")
+        .and_then(|raw| harness::bench_engine::parse_engine(raw.as_deref()))
+    {
+        Ok(e) => e,
+        Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_ENGINE: {e}")),
+    };
+
     println!(
         "{}",
         EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
     );
-    println!("knn_profile_bench: rows={TOTAL_ROWS} dim={DIM} top_k={TOP_K} (tenant_a={TENANT_A_ROWS} tenant_b={TENANT_B_ROWS})");
-    println!("knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。");
+    println!("knn_profile_bench: rows={TOTAL_ROWS} dim={DIM} top_k={TOP_K} (tenant_a={TENANT_A_ROWS} tenant_b={TENANT_B_ROWS}) engine={}", knn_engine.token());
+    println!("knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。BENCH_KNN_PROFILE_ENGINE=hnsw のときは S0-cold/S0-hot の EngineCore を hnsw opt-in（Issue #403 B 案）で構築する（S1〜S5' は非対象）。");
 
     // --- データ投入: 一時 DB へテナント A・B の行を投入する ---
     let path = unique_db_path("issue362-knn-profile");
@@ -358,7 +385,7 @@ fn main() {
     // 束ねる契約のため使えず、本段のみ独自の warmup/計測ループを持つ。
     for _ in 0..config.warmup_iterations() {
         let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold warmup");
-        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let cold_core = build_core_for(knn_engine, cold_storage);
         black_box(
             cold_core
                 .execute_sql(&policy_ctx, &sql)
@@ -370,7 +397,7 @@ fn main() {
     let mut s0_cold_last_result_len: Option<usize> = None;
     for _ in 0..config.measured_iterations() {
         let cold_storage = Storage::open(&path).expect("reopen storage for S0-cold measurement");
-        let cold_core = EngineCore::from_storage(cold_storage, search_engine::default_engine());
+        let cold_core = build_core_for(knn_engine, cold_storage);
         let start = Instant::now();
         let result = black_box(
             cold_core
@@ -396,7 +423,7 @@ fn main() {
 
     // --- S0-hot/S0': SQL 表層 e2e（単一 `EngineCore` を使い回すホットパス）。----
     let storage = Storage::open(&path).expect("reopen storage for S0-hot/S0'");
-    let core = EngineCore::from_storage(storage, search_engine::default_engine());
+    let core = build_core_for(knn_engine, storage);
     let s0_hot = run(&config, || {
         core.execute_sql(&policy_ctx, &sql)
             .expect("execute_sql must succeed for well-formed synthetic KNN query")
@@ -414,6 +441,24 @@ fn main() {
         fail_closed(format!(
             "S0-hot result row count mismatch: expected {TOP_K}, got {s0_hot_result_len}"
         ));
+    }
+
+    // 非 vacuous 確認（Issue #413。`feature_bench.rs` と同じ原則）。hnsw opt-in
+    // 時は S0-hot 測定後に索引が実際に構築・使用されたことを固定し、満たさなけ
+    // れば `fail_closed` する。brute_force では統計を出力しない
+    // （`hnsw_index_cache_stats()` は常に全欄 0）。
+    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+        let s = core.hnsw_index_cache_stats();
+        println!(
+            "knn_profile_bench: hnsw_stats builds={} build_failures={} hits={} misses={} fallbacks={} entries={}",
+            s.builds, s.build_failures, s.hits, s.misses, s.fallbacks, s.entries
+        );
+        if s.builds == 0 || s.hits == 0 {
+            fail_closed(format!(
+                "ANN non-vacuous check failed: builds={} hits={}",
+                s.builds, s.hits
+            ));
+        }
     }
 
     let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
