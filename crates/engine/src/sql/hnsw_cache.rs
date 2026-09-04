@@ -119,7 +119,7 @@ pub struct HnswIndexCacheStats {
     /// 比が閾値未満〕・`masked_short`〔マスク付き探索の結果不足〕もこの内数）。
     pub fallbacks: u64,
     /// 可視カーディナリティ比（`visible_in_index / index.len()`）が
-    /// `HnswParams::full_scan_ratio` 未満で plain scan（アリーナ全体の
+    /// `ValidatedHnswParams::full_scan_ratio` 未満で plain scan（アリーナ全体の
     /// brute-force）を選んだ回数（Issue #409。`fallbacks` の内数）。
     pub plain_scans: u64,
     /// マスク付き探索（[`crate::hnsw::HnswIndex::search_masked`]）の結果件数が
@@ -1219,12 +1219,12 @@ fn search_with_overlay(
         return full_scan_with_arena(provider, arena, query, k);
     }
 
-    // 可視カーディナリティ切替（Issue #409・`HnswParams::full_scan_ratio`）:
+    // 可視カーディナリティ切替（Issue #409・`ValidatedHnswParams::full_scan_ratio`）:
     // `visible_in_index / index.len() < full_scan_ratio` なら plain scan
     // （アリーナ全体の brute-force）。整数比較 `visible_in_index * den <
     // index.len() * num` で丸め誤差を避け、`checked_mul` のオーバーフロー時は
     // fail-closed に plain scan へ倒す（比較不能を「索引を信用しない」側へ）。
-    let ratio = access.provider.params().full_scan_ratio;
+    let ratio = access.provider.full_scan_ratio();
     let index_len = base.index.len();
     let visible_in_index = overlay.visible_in_index;
     let below_ratio = match (

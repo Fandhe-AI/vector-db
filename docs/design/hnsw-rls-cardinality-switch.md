@@ -181,11 +181,14 @@ is_mask_fully_reachable_accepts_identity_mask_on_a_repaired_graph_and_ann_path_i
 `MIN_INDEXED_ROWS`／`REBUILD_DELTA_RATIO` は本 Issue では据え置く（「再構築
 判定」と「探索方式判定」を分離した、という位置づけで記録する）。
 
-`HnswParams::full_scan_ratio`（`Ratio { numerator, denominator }`。既定
-`1/10`）は `f32` が `Copy + Eq` を満たさず `HnswParams` の derive と両立しない
-ため整数比で表現した（`sql/hnsw_cache.rs::REBUILD_DELTA_RATIO` と同型）。
-`HnswParams::validate` が `denominator >= 1`・`numerator <= denominator` を
-fail-closed に検査する。
+`ValidatedHnswParams::full_scan_ratio`（`Ratio { numerator, denominator }`。
+既定 `1/10`）は `f32` が `Copy + Eq` を満たさず `HnswParams` の derive と両立
+しないため整数比で表現した（`sql/hnsw_cache.rs::REBUILD_DELTA_RATIO` と同型）。
+`HnswParams` へ直接フィールド追加すると既存の外部構造体リテラルを破壊する
+（codex-review P1 指摘・PR #435 是正）ため、`full_scan_ratio` は
+`ValidatedHnswParams`（`HnswParams::validate` を必ず経由する private フィールド
+を持つラッパー）側に置き、`ValidatedHnswParams::with_full_scan_ratio` が
+`denominator >= 1`・`numerator <= denominator` を fail-closed に検査する。
 
 ### `Subset` 形状の per-query 写像（キャッシュ非登録）
 
@@ -244,7 +247,7 @@ current_generation` による事前・事後の失効照合とは独立した読
 
 | パス | 変更内容 |
 | ---- | -------- |
-| `crates/engine/src/hnsw.rs` | `Ratio`・`HnswParams::full_scan_ratio`・`validate` 拡張。`NodeMask`。`search_layer` の受理述語。`HnswIndex::search_masked`（`search` はこれへ委譲） |
+| `crates/engine/src/hnsw.rs` | `Ratio`・`ValidatedHnswParams::full_scan_ratio`（`with_full_scan_ratio` 経由の private フィールド）。`NodeMask`。`search_layer` の受理述語。`HnswIndex::search_masked`（`search` はこれへ委譲） |
 | `crates/engine/src/search_engine.rs` | `Display` に `full_scan_ratio` を追記 |
 | `crates/engine/src/sql/hnsw_cache.rs` | `Overlay::visible_mask`／`visible_in_index`／`mask_splits_graph`。`search_with_overlay` を可視カーディナリティ切替へ書き換え（`k + stale` 撤去）。`search_subset_or_fallback`（新設）。統計 `plain_scans`・`mask_splits_graph`・`masked_short`・`subset_searches` |
 | `crates/engine/src/sql/exec.rs` | `hnsw_full_visible_eligible`／`hnsw_subset_eligible` の 2 条件・DISTANCE 段の形状別ディスパッチ |
@@ -260,7 +263,7 @@ current_generation` による事前・事後の失効照合とは独立した読
 | ---- | ---- |
 | アクセス制御の不備／テナント境界（P0） | 索引は ctx 可視アリーナのみから構築（不変）。マスクは同一 ctx 内の候補差分のみを表し、他テナント行はグラフに存在しない。索引ヒットは現世代スロットへの写像・`(tenant_id, id)` キー照合・スコア再計算を経て返し、`provider_result_is_valid`・`RlsSafetyNet` の多層防御を維持。`PolicyContext::is_visible` に新規比較ロジックを追加していない |
 | 存在情報の副次漏えい | 切替判定・マスク密度・統計はいずれも ctx 自身の可視集合と自身の索引のみから導出され、他テナント行数に依存しない。`EXPLAIN` へは露出しない（#411 の担当） |
-| fail-closed のエラー契約 | HNSW 固有エラー・マスク長不一致・写像検証失敗・結果不足はいずれも当該クエリの brute-force 縮退へ吸収し呼び出し元へ伝播させない。不正 `full_scan_ratio` は `hnsw_kind`（唯一の検証入口）で拒否する |
+| fail-closed のエラー契約 | HNSW 固有エラー・マスク長不一致・写像検証失敗・結果不足はいずれも当該クエリの brute-force 縮退へ吸収し呼び出し元へ伝播させない。不正 `full_scan_ratio` は `ValidatedHnswParams::with_full_scan_ratio` で拒否する |
 | インジェクション | SQL 文字列を組み立てる箇所なし |
 | 不安全な設計／DoS | `NodeMask` は索引ノード数分のビット（最大 `MAX_HNSW_NODES / 8` バイト程度）。整数演算は `checked_*`／`saturating_*`。`ef`・`k` の上限は既存どおり `MAX_EF` |
 | 脆弱な依存 | 依存追加なし。`unsafe` なし |

@@ -140,7 +140,10 @@ impl fmt::Display for SearchEngineKind {
             SearchEngineKind::Hnsw(params) => write!(
                 f,
                 "hnsw(m={},ef_construction={},ef_search={},full_scan_ratio={})",
-                params.m, params.ef_construction, params.ef_search, params.full_scan_ratio
+                params.m,
+                params.ef_construction,
+                params.ef_search,
+                params.full_scan_ratio()
             ),
         }
     }
@@ -275,7 +278,6 @@ mod tests {
                 m: 32,
                 ef_construction: 200,
                 ef_search: 128,
-                ..HnswParams::default()
             })
             .unwrap(),
         );

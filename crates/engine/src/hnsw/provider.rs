@@ -82,6 +82,16 @@ impl HnswSearchProvider {
         self.params.get()
     }
 
+    /// 可視カーディナリティ切替の閾値比を返す（Issue #409。
+    /// `sql::hnsw_cache::search_with_overlay` が plain scan／マスク付き ANN 探索の
+    /// 切替判定に使う。`full_scan_ratio` は [`HnswParams`] ではなく
+    /// [`ValidatedHnswParams`] の private フィールドとして保持する設計
+    /// （`hnsw.rs::ValidatedHnswParams` モジュールドキュメント参照）ため、
+    /// `HnswParams` を経由せず本 provider 経由でのみ読み取れる）。
+    pub fn full_scan_ratio(&self) -> crate::hnsw::Ratio {
+        self.params.full_scan_ratio()
+    }
+
     /// `k` 件の Top-k を得るために `HnswIndex::search` の `ef` 引数へ渡す値を返す
     /// （`self.params.ef_search.max(k).min(MAX_EF)`）。
     ///
@@ -259,7 +269,6 @@ mod tests {
                 m: 16,
                 ef_construction: 100,
                 ef_search: 10,
-                ..HnswParams::default()
             })
             .unwrap(),
         );
@@ -273,7 +282,6 @@ mod tests {
                 m: 16,
                 ef_construction: 100,
                 ef_search: MAX_EF,
-                ..HnswParams::default()
             })
             .unwrap(),
         );
@@ -287,7 +295,6 @@ mod tests {
             m: 8,
             ef_construction: 50,
             ef_search: 32,
-            ..HnswParams::default()
         };
         let provider = HnswSearchProvider::new(ValidatedHnswParams::new(params).unwrap());
         assert_eq!(provider.params(), params);

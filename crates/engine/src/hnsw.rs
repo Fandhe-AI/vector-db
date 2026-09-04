@@ -119,7 +119,7 @@ pub const MAX_BUILD_THREADS: usize = 16;
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
 /// 両立しない（`f32` は `Eq` を実装しない）ため、Issue #401 の `REBUILD_DELTA_RATIO`
 /// （`(u64, u64)` タプル）と同じ発想で構造体化した（Issue #409。`sql::hnsw_cache`
-/// の可視カーディナリティ切替閾値 `HnswParams::full_scan_ratio` に使う）。
+/// の可視カーディナリティ切替閾値 `ValidatedHnswParams::full_scan_ratio` に使う）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ratio {
     pub numerator: u32,
@@ -136,19 +136,16 @@ impl fmt::Display for Ratio {
 ///
 /// 既定値（`M=16`／`ef_construction=100`／`ef_search=64`）は ADR 起票 Issue #403
 /// に記載の本リポ採用値（非規範的な実装既定値。spec 側の確定値ではない）。
-/// `full_scan_ratio`（既定 1/10）は Issue #409 の可視カーディナリティ切替
-/// 閾値で、`sql::hnsw_cache::HnswIndexCache` が「可視候補数 ÷ 索引ノード数」の
-/// 比がこの値未満なら plain scan（brute-force）、以上ならマスク付き ANN 探索を
-/// 選ぶ判定に使う（本リポの実装既定値。非規範）。
 ///
-/// `#[non_exhaustive]`（codex-review P1 指摘・Issue #409・PR #435 追記）:
-/// クレート外からの完全な構造体リテラル構築を禁止し、`Default` + 構造体更新
-/// 構文（`..HnswParams::default()`）を強制する。本フィールド追加（`full_scan_ratio`）
-/// のような将来のフィールド追加が既存呼び出し元のコンパイルを破壊しない
-/// ことを型で保証する（本クレート内は同一クレート特権によりこの制約を受けない
-/// ため、既存の内部呼び出し元は無変更）。
+/// `#[non_exhaustive]` は付与しない（codex-review P1 指摘・Issue #409・PR #435）:
+/// 既に公開済みの本構造体へ後付けで `#[non_exhaustive]` を付けると、外部クレートが
+/// 既存フィールドで構築する構造体リテラル（構造体更新構文を使わないもの含む）が
+/// コンパイル不能になり、それ自体が破壊的変更になる（`docs/design/
+/// error-enum-non-exhaustive-policy.md` と同じ判断）。可視カーディナリティ切替の
+/// 閾値比（Issue #409）は本構造体へフィールド追加せず、検証済みラッパー
+/// [`ValidatedHnswParams`] の private フィールド（`full_scan_ratio`）として持たせる
+/// ことで、本構造体の公開フィールド集合は変更しない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct HnswParams {
     /// 挿入後に各ノードが層 1 以上で保持する隣接数の目安（層 0 は `2*m` まで許容する。
     /// Malkov & Yashunin 2016 の記法と同じ）。
@@ -157,8 +154,6 @@ pub struct HnswParams {
     pub ef_construction: usize,
     /// 探索時の候補幅（本モジュールでは構築後のパラメータ保持のみ。実際の探索は #405）。
     pub ef_search: usize,
-    /// 可視カーディナリティ切替の閾値比（Issue #409）。`sql::hnsw_cache` 参照。
-    pub full_scan_ratio: Ratio,
 }
 
 impl Default for HnswParams {
@@ -167,10 +162,6 @@ impl Default for HnswParams {
             m: 16,
             ef_construction: 100,
             ef_search: 64,
-            full_scan_ratio: Ratio {
-                numerator: 1,
-                denominator: 10,
-            },
         }
     }
 }
@@ -210,23 +201,12 @@ impl HnswParams {
                 reason: "ef_search exceeds MAX_EF",
             });
         }
-        if self.full_scan_ratio.denominator == 0 {
-            return Err(HnswError::InvalidParams {
-                reason: "full_scan_ratio denominator must be >= 1",
-            });
-        }
-        if self.full_scan_ratio.numerator > self.full_scan_ratio.denominator {
-            return Err(HnswError::InvalidParams {
-                reason: "full_scan_ratio numerator must not exceed denominator",
-            });
-        }
         Ok(())
     }
 
-    /// `m` だけを差し替えたコピーを返す（codex-review P1 指摘対応・Issue #409・
-    /// PR #435 追記）。`#[non_exhaustive]` により他クレートからは構造体
-    /// リテラル（`..Default::default()` の構造体更新構文含む）で構築できない
-    /// ため、`HnswParams::default()` と組み合わせて使うビルダー用アクセサ。
+    /// `m` だけを差し替えたコピーを返す（`HnswParams::default()` と組み合わせて
+    /// 使うビルダー用アクセサ。構造体リテラル `..HnswParams::default()` と等価だが
+    /// 呼び出し元の記述を短くする）。
     pub fn with_m(mut self, m: usize) -> Self {
         self.m = m;
         self
@@ -243,12 +223,6 @@ impl HnswParams {
         self.ef_search = ef_search;
         self
     }
-
-    /// `full_scan_ratio` だけを差し替えたコピーを返す（[`Self::with_m`] 参照）。
-    pub fn with_full_scan_ratio(mut self, full_scan_ratio: Ratio) -> Self {
-        self.full_scan_ratio = full_scan_ratio;
-        self
-    }
 }
 
 /// [`HnswParams::validate`] を通過済みであることを型で保証するラッパー
@@ -259,27 +233,77 @@ impl HnswParams {
 /// payload をこの型にすることで、不正な `HnswParams` を保持した `SearchEngineKind`・
 /// [`crate::hnsw::provider::HnswSearchProvider`] がそもそも型として存在しえなくなる
 /// （実行時エラー分類の流用・偽装ではなく、型システムで到達不能にする）。
+///
+/// 可視カーディナリティ切替の閾値比 `full_scan_ratio`（Issue #409。既定 1/10。
+/// `sql::hnsw_cache::HnswIndexCache` が「可視候補数 ÷ 索引ノード数」の比が
+/// この値未満なら plain scan、以上ならマスク付き ANN 探索を選ぶ判定に使う）は
+/// 本ラッパーの private フィールドとして持つ（codex-review P1 指摘・Issue #409・
+/// PR #435 是正）。[`HnswParams`] へ直接フィールド追加すると、既に公開済みの
+/// 同構造体を使う外部クレートの構造体リテラルを破壊する（`#[non_exhaustive]`
+/// 後付けも同様に破壊的。`docs/design/error-enum-non-exhaustive-policy.md` と
+/// 同じ判断）ため、`ValidatedHnswParams` は元々 [`Self::new`] 経由でしか構築
+/// できない private フィールドの型であることを利用し、フィールド追加を非破壊に
+/// 収める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ValidatedHnswParams(HnswParams);
+pub struct ValidatedHnswParams {
+    params: HnswParams,
+    full_scan_ratio: Ratio,
+}
+
+/// [`ValidatedHnswParams`] の `full_scan_ratio` 既定値（1/10。Issue #409）。
+const DEFAULT_FULL_SCAN_RATIO: Ratio = Ratio {
+    numerator: 1,
+    denominator: 10,
+};
 
 impl ValidatedHnswParams {
     /// `params` を [`HnswParams::validate`] で検証し、通過した場合のみ構築する。
+    /// `full_scan_ratio` は既定値（[`DEFAULT_FULL_SCAN_RATIO`]）で初期化される。
+    /// 差し替えたい場合は [`Self::with_full_scan_ratio`] を使う。
     pub fn new(params: HnswParams) -> Result<Self, HnswError> {
         params.validate()?;
-        Ok(Self(params))
+        Ok(Self {
+            params,
+            full_scan_ratio: DEFAULT_FULL_SCAN_RATIO,
+        })
     }
 
     /// 検証済みの内部値を返す（`m`／`ef_construction`／`ef_search` フィールドへの
     /// 読み取りアクセス用。書き込みは許さない＝再検証なしに値を変更できない）。
     pub fn get(&self) -> HnswParams {
-        self.0
+        self.params
+    }
+
+    /// `full_scan_ratio` を返す（`sql::hnsw_cache::search_with_overlay` が可視
+    /// カーディナリティ切替の判定に使う。Issue #409）。
+    pub fn full_scan_ratio(&self) -> Ratio {
+        self.full_scan_ratio
+    }
+
+    /// `full_scan_ratio` だけを差し替えたコピーを返す。`ratio.denominator == 0`・
+    /// `ratio.numerator > ratio.denominator` は [`HnswError::InvalidParams`] として
+    /// 拒否する（元 `HnswParams::validate` が担っていた検証をここへ移設。
+    /// Issue #409・codex-review P1 是正・PR #435）。
+    pub fn with_full_scan_ratio(mut self, ratio: Ratio) -> Result<Self, HnswError> {
+        if ratio.denominator == 0 {
+            return Err(HnswError::InvalidParams {
+                reason: "full_scan_ratio denominator must be >= 1",
+            });
+        }
+        if ratio.numerator > ratio.denominator {
+            return Err(HnswError::InvalidParams {
+                reason: "full_scan_ratio numerator must not exceed denominator",
+            });
+        }
+        self.full_scan_ratio = ratio;
+        Ok(self)
     }
 }
 
 impl std::ops::Deref for ValidatedHnswParams {
     type Target = HnswParams;
     fn deref(&self) -> &HnswParams {
-        &self.0
+        &self.params
     }
 }
 
@@ -2329,7 +2353,6 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 99).unwrap();
 
@@ -2583,7 +2606,6 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 7).unwrap();
         let query = gen_corpus(999, dim, 1);
@@ -2605,7 +2627,6 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 11).unwrap();
         let mut mask = NodeMask::new(index.len());
@@ -2650,7 +2671,6 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 3).unwrap();
         let mask = NodeMask::new(index.len());
@@ -2677,7 +2697,6 @@ mod tests {
             m: 8,
             ef_construction: 40,
             ef_search: 20,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 21).unwrap();
         let entry = index
@@ -2877,7 +2896,6 @@ mod tests {
             m: 6,
             ef_construction: 32,
             ef_search: 16,
-            ..HnswParams::default()
         };
         let index = HnswIndex::build(params, dim as u32, &vectors, 2).unwrap();
         // 索引のノード数より短いマスクは拒否される（fail-closed）。
