@@ -108,6 +108,13 @@ use std::collections::{BTreeMap, BTreeSet};
 mod temp_db;
 use temp_db::{unique_db_path, CleanupGuard};
 
+// ANN opt-in（Issue #412）検索エンジン切替 fixture。既定（`RecallEngine::
+// BruteForce`）では本モジュールの型を一切構築せず、以下の層 A・既存層 B の
+// 実測値・固定値アサーションに影響を与えない。
+#[path = "fixtures/recall_engine.rs"]
+mod recall_engine;
+use recall_engine::{AnnStats, RecallEngine, SqlHybridFixture};
+
 // ---------- 決定的擬似乱数（xorshift64*。外部クレート不使用。cjk_tokenizer_impact.rs と同一実装） ----------
 
 /// コーパス生成専用の決定的擬似乱数生成器（テスト再現性のため外部の乱数クレートは
@@ -832,6 +839,90 @@ fn measure_recall(docs: &[Doc], qa: &[QaCase]) -> RecallResult {
     measure_recall_with(docs, qa, QuerySource::Baseline)
 }
 
+/// `MIN_INDEXED_ROWS`（`sql::hnsw_cache.rs` の非公開定数）の値。ANN opt-in が
+/// 実際に索引を構築する下限行数（Issue #412）。当該定数自体は `pub(crate)` の
+/// ため結合テストから参照できず、`tests/hnsw_cache.rs`・`tests/recall_engine_
+/// fixture.rs` と同じ値をここへ複製する。
+const MIN_INDEXED_ROWS: usize = 1_024;
+
+/// ANN opt-in（[`RecallEngine::Hnsw`]）測定経路（Issue #412）。[`SqlHybridFixture`]
+/// （SQL 表層 `EngineCore::execute_sql` 経由。既定エンジン測定が使う
+/// [`measure_recall_against`]（in-memory `hybrid_search` 直接呼び出し）とは別の
+/// production 経路）で Top-100 を取得し、[`RecallResult`] と同じ分母規約
+/// （`ceil20`/`ceil100`）で集計する。`docs.len() >= MIN_INDEXED_ROWS` の場合は
+/// 非 vacuous（実際に索引構築・hybrid 密側再取得ループが索引経路を通ったこと）
+/// を、未満の場合は逆に索引が構築されていないこと（構造的に brute-force。
+/// ANN 通過とは数えない）を固定する。
+fn measure_recall_via_hnsw(
+    docs: &[Doc],
+    qa: &[QaCase],
+    source: QuerySource<'_>,
+) -> (RecallResult, AnnStats) {
+    let dim = docs.first().map_or(0, |d| d.vector.len());
+    let rows: Vec<(u64, Vec<f32>, String)> = docs
+        .iter()
+        .map(|d| (d.id, d.vector.clone(), d.text.clone()))
+        .collect();
+    let fixture = SqlHybridFixture::new(dim as u32, &rows, RecallEngine::Hnsw);
+
+    let mut total_correct = 0usize;
+    let mut hits20 = 0usize;
+    let mut hits100 = 0usize;
+    let mut ceil20 = 0usize;
+    let mut ceil100 = 0usize;
+
+    for case in qa {
+        total_correct += case.correct.len();
+        ceil20 += case.correct.len().min(20);
+        ceil100 += case.correct.len().min(100);
+
+        let (query_text, query_vector): (String, Vec<f32>) = match &source {
+            QuerySource::Baseline => (case.query_text.clone(), case.query_vector.clone()),
+            QuerySource::Expanded(planner) => {
+                expand_and_reconstruct_with(planner, dim, &case.query_text)
+            }
+        };
+
+        let hits = fixture.hybrid_top(&query_vector, &query_text, 100);
+        hits20 += hits
+            .iter()
+            .take(20)
+            .filter(|(id, _)| case.correct.contains(id))
+            .count();
+        hits100 += hits
+            .iter()
+            .filter(|(id, _)| case.correct.contains(id))
+            .count();
+    }
+
+    fixture.assert_ann_non_vacuous(docs.len() >= MIN_INDEXED_ROWS);
+    let stats = fixture.stats();
+    (
+        RecallResult {
+            total_correct,
+            hits20,
+            hits100,
+            ceil20,
+            ceil100,
+        },
+        stats,
+    )
+}
+
+/// 非 vacuous 統計を数値を含まない形式でログへ出す（`gate` はテスト名。
+/// spec-confidentiality の許可範囲内で、閾値・実測 Recall は含めない）。
+fn print_ann_stats(gate: &str, stats: &AnnStats) {
+    println!(
+        "{gate}: engine=hnsw builds={} build_failures={} rebuilds={} hybrid_dense_searches={} hybrid_queries={} ef_cap_fallbacks={}",
+        stats.builds,
+        stats.build_failures,
+        stats.rebuilds,
+        stats.hybrid_dense_searches,
+        stats.hybrid_queries,
+        stats.ef_cap_fallbacks,
+    );
+}
+
 /// コーパスが `sparse.rs` の各上限に収まることを検証する（健全性チェック。テスト
 /// ハーネス自身にも「無制限なコーパス生成を許さない」設計指針を適用する）。
 fn assert_corpus_within_limits(docs: &[Doc]) {
@@ -1377,10 +1468,27 @@ fn hybrid_recall_small_scale_threshold_gate() {
         SMALL_NUM_QUERIES,
         SMALL_VOCAB_SIZE,
     );
-    let r = measure_recall(&docs, &qa);
+    // ANN opt-in（Issue #412・R1）。`SMALL_NUM_DOCS`（400）は `MIN_INDEXED_ROWS`
+    // （1,024）未満のため、`RecallEngine::Hnsw` を指定しても構造的に brute-force
+    // のまま（`measure_recall_via_hnsw` が非 vacuous 検証で `builds == 0` を固定
+    // する）。ANN 通過とは数えないが、SQL 表層経由の測定経路自体は既定と同じ
+    // ように検証できる。
+    let engine = RecallEngine::from_env();
+    let r = match engine {
+        RecallEngine::BruteForce => measure_recall(&docs, &qa),
+        RecallEngine::Hnsw => {
+            let (r, stats) = measure_recall_via_hnsw(&docs, &qa, QuerySource::Baseline);
+            print_ann_stats("hybrid_recall_small_scale_threshold_gate", &stats);
+            r
+        }
+    };
     let recall20 = r.recall20();
     let pass = recall20 >= min_r20;
 
+    println!(
+        "hybrid_recall_small_scale_threshold_gate: engine={}",
+        engine.token()
+    );
     println!(
         "{}",
         render_gate_line(
@@ -1463,7 +1571,28 @@ fn hybrid_recall_large_scale_threshold_gate() {
     );
     let intent_qa: Vec<QaCase> = qa.iter().map(to_intent_query).collect();
     let planner_fixture = PlannerFixture::new();
-    let r = measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture));
+    // ANN opt-in（Issue #412・R1）。`LARGE_NUM_DOCS`（20,000）は
+    // `MIN_INDEXED_ROWS`（1,024）を大きく上回るため、`RecallEngine::Hnsw` は
+    // 実際に索引を構築する（`measure_recall_via_hnsw` の非 vacuous 検証で
+    // `builds >= 1` を固定）。`build_parallel` はこの規模では並列構築される
+    // ため索引グラフ自体は run-to-run で変わりうるが、本ゲートは固定値では
+    // なく閾値比較のみを判定するため影響しない。
+    let engine = RecallEngine::from_env();
+    let r = match engine {
+        RecallEngine::BruteForce => {
+            measure_recall_with(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture))
+        }
+        RecallEngine::Hnsw => {
+            let (r, stats) =
+                measure_recall_via_hnsw(&docs, &intent_qa, QuerySource::Expanded(&planner_fixture));
+            print_ann_stats("hybrid_recall_large_scale_threshold_gate", &stats);
+            r
+        }
+    };
+    println!(
+        "hybrid_recall_large_scale_threshold_gate: engine={}",
+        engine.token()
+    );
     let recall20 = r.recall20();
     let recall100 = r.recall100();
 

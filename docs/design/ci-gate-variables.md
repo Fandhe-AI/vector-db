@@ -93,6 +93,16 @@ repo variables（`vars.*`）のまま維持する（`.github/workflows/bench.yml
 参照）も同様に非機密であり、`bench.yml` へは注入しない（`BENCH_VERBOSE` と
 同じく手動実行〔`make bench-batch`〕専用の opt-in とし CI では設定しない）。
 
+`RECALL_ENGINE`（Issue #412・ADR `docs/design/ann-index-adoption.md` B 案の
+受け入れ条件 3。`crates/engine/tests/fixtures/recall_engine.rs::RecallEngine`）
+も同様に非機密の opt-in フラグ（値は `brute_force`／`hnsw` の 2 択で数値基準を
+含まない）であり、`BENCH_CORE6`／`BENCH_CORE16` と同じ扱いで secrets 化しない。
+`recall.yml` は `strategy.matrix.recall_engine`（`[brute_force, hnsw]`）で
+job を 2 系列に固定し、各 job が `matrix.recall_engine` を 3 gate step の
+`env:` へそのまま渡す。`workflow_dispatch`・`schedule` いずれのトリガでも
+両エンジンの job が毎回実行される（旧来の `workflow_dispatch.inputs.recall_engine`
+は撤去済み。Issue #412 PR #438）。
+
 ### Environment `recall-gate` secrets（`.github/workflows/recall.yml`）
 
 | secret | spec ポインタ | 受理形式 |

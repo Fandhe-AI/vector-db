@@ -257,8 +257,8 @@ ANN は本質的に recall と探索コストのトレードオフを導入す�
 | 既定パラメータ・並列構築 | #404〜#406 | （非契約的な実装詳細。既存の依存最小方針・`unsafe` 原則禁止の範囲で Phase 3 実装時に確定） |
 | 決定性 | #405・#410・#411 | 同点規約・境界完全化の要否 |
 | RLS 事前フィルタとの切替 | #409（可視カーディナリティ切替・`FullVisible`/`Subset` 形状・Rust API 結線を実装済み。`docs/design/hnsw-rls-cardinality-switch.md`）・#410（境界再取得・hybrid 密側の残課題） | 非可視ノードの探索経路上の扱い・切替条件 |
-| 増分更新（挿入・削除） | #408（実装済み。`docs/design/hnsw-generation-cache.md`）・#412 | 挿入 delta・削除時の索引再構築要否を含む検索結果契約 |
-| Recall 受け入れ・継続的ゲート接続 | #412 | 既存 SEARCH 系ゲートとの閾値同一性・接続方式 |
+| 増分更新（挿入・削除） | #408（実装済み。`docs/design/hnsw-generation-cache.md`）・#412（実装済み。`docs/design/ann-recall-gate-verification.md`「TASK-121 系」節） | 挿入 delta・削除時の索引再構築要否を含む検索結果契約 |
+| Recall 受け入れ・継続的ゲート接続 | #412（実装済み。`docs/design/ann-recall-gate-verification.md`） | 既存 SEARCH 系ゲートとの閾値同一性・接続方式 |
 | 永続化 | 初期スコープ外 | 「判断確定後のスコープ外」節参照 |
 
 既定パラメータ・並列構築方式（`std::thread` ベース・`unsafe` 不使用）は
@@ -281,8 +281,8 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 | `EXPLAIN` へエンジン種別露出 | #411（実装済み。`docs/design/explain-search-engine-exposure.md` 参照） |
 | 決定性契約（同点規約・境界完全化 or 代替契約）の明文化 | #403（本書）・#405・#410（spec 側 TASK・ビヘイビア ID 確定後に着手） |
 | `PolicyContext::is_visible` 単一照合パス・fail-closed の維持 | #409・#410（RLS 切替契約は spec 側 TASK・ビヘイビア ID 確定後に着手） |
-| SEARCH 系 Recall ゲートを ANN 有効経路でも同一閾値で通過 | #412（`recall.yml` への機械判定可能な接続を含む。「実装ガイド」節の対応表「Recall 受け入れ・継続的ゲート接続」行参照） |
-| TASK-121 系増分回帰の ANN 対応 | #408・#412 |
+| SEARCH 系 Recall ゲートを ANN 有効経路でも同一閾値で通過 | #412（実装済み。`recall.yml` への機械判定可能な接続を含む。「実装ガイド」節の対応表「Recall 受け入れ・継続的ゲート接続」行参照。詳細・実測は `docs/design/ann-recall-gate-verification.md` 参照） |
+| TASK-121 系増分回帰の ANN 対応 | #408・#412（実装済み。`docs/design/ann-recall-gate-verification.md`「TASK-121 系」節） |
 | （B 案条件 1）損益分岐点の実測 | #413（事後の前後比較） |
 | 基盤（HNSW 構築・探索・並列化） | #404・#405・#406 |
 
