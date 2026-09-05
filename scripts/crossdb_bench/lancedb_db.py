@@ -236,17 +236,18 @@ def _run_with_storage(storage_dir: str, args, docs: list[dict], queries: list[di
         qt = sql_escape_literal(queries[i].get("text", ""))
         # 例外は伝播させ、呼び出し側でフェーズ全体を unsupported として記録する
         # （空配列に変換すると失敗が正常なレイテンシとして残るため）。
-        rows = (
+        q = (
             tbl.search(query_type="hybrid")
             .vector(qv)
             .text(qt)
             # 通常 KNN と同じく内積に統一する（未指定だと exact 構成では既定の L2 になる）。
             .metric("dot")
             .where(public_filter)
-            .limit(10)
-            .select(["id"])
-            .to_list()
         )
+        # 通常 KNN（`knn`／`knn_where`）と同じ探索幅 ef=64 に揃える（meta.index の記録値と一致させる）。
+        if args.config == "hnsw":
+            q = q.ef(64)
+        rows = q.limit(10).select(["id"]).to_list()
         return [r["id"] for r in rows]
 
     idxs = list(range(len(query_vecs)))
