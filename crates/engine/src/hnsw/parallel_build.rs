@@ -102,6 +102,24 @@ fn read_worker_entry_promotions() -> u64 {
     ENTRY_PROMOTION_COUNT.with(|cell| cell.get())
 }
 
+/// [`LINK_LOCK_STATS`]／[`ENTRY_PROMOTION_COUNT`] を「現在この関数を呼んで
+/// いるスレッド」についてゼロへ戻す。[`build_parallel_graph_observed`] が
+/// 逐次プレフィックス挿入（呼び出し元スレッドで実行される。`observe=true`
+/// のため `insert_node_locked` 経由でこの TLS へ書き込む）を始める直前に
+/// 一度だけ呼ぶ。
+///
+/// ワーカースレッドは `thread::scope` が呼び出しのたびに新規生成する OS
+/// スレッドであり TLS は常に初期値ゼロから始まるため（[`read_worker_lock_stats`]
+/// のドキュメンテーションコメント参照）、現状ワーカー統計へ他スレッド・
+/// 他呼び出しの残留値が混入する経路は無い。本関数はその不変条件を
+/// 「呼び出し元スレッドが本モジュールの計装付き経路を過去に直接叩いていた
+/// 場合でも常に成立する」形で構造的に固定する防御的な処置であり、実際に
+/// 混入するバグを修正するものではない。
+fn reset_observation_tls() {
+    LINK_LOCK_STATS.with(|cell| cell.set((0, 0)));
+    ENTRY_PROMOTION_COUNT.with(|cell| cell.set(0));
+}
+
 /// 並列構築中の共有グラフ状態。ノード単位 `RwLock` で隣接リストを保護し、
 /// エントリポイントのみ別ロックで排他する（モジュール冒頭「ロック
 /// 不変条件」）。`levels` は並列フェーズ開始前に確定し以後不変（ロック不要）。
@@ -610,6 +628,11 @@ pub(crate) fn build_parallel_graph_observed(
     threads: usize,
     n: usize,
 ) -> Result<(HnswIndex, HnswBuildProfile), HnswError> {
+    // 呼び出し元スレッドの TLS 統計を必ずゼロから始める（`reset_observation_tls`
+    // のドキュメンテーションコメント参照。逐次プレフィックス挿入はこの直後に
+    // 呼び出し元スレッドで実行される）。
+    reset_observation_tls();
+
     let dim_usize = dim as usize;
 
     let level_assign_start = Instant::now();
@@ -1113,6 +1136,170 @@ mod tests {
         assert_eq!(
             PubHnswIndex::build_with_threads(params, 3, &vectors, 1, 4).unwrap_err(),
             PubHnswIndex::build_with_threads_observed(params, 3, &vectors, 1, 4).unwrap_err()
+        );
+    }
+
+    // --------------------------------------------------
+    // `LINK_LOCK_STATS`／`ENTRY_PROMOTION_COUNT`（thread_local!）が呼び出し間・
+    // スレッド間で混入しないことの固定テスト。
+    // --------------------------------------------------
+
+    /// `assign_level` を用いて実装（[`build_parallel_graph_observed`]）と同じ
+    /// 手順でレベル列を再現し、並列フェーズでのエントリ昇格回数の期待値を
+    /// 独立に計算し直す。
+    ///
+    /// エントリ昇格は「現在のエントリレベルより高いレベルのノードが現れた
+    /// ときのみ発生する」ため、逐次プレフィックス終了時点の最大レベルを
+    /// `l_prefix` とすると、並列フェーズ側で `l_prefix` を上回る**相異なる**
+    /// レベル値の個数が 0 個ならば並列フェーズでの昇格は必ず 0 回、1 個
+    /// ならば（その値を持つノードが複数あっても最初の 1 件だけが成功する
+    /// ため）必ず 1 回になり、いずれもワークスティールの完了順序に依存
+    /// しない絶対値になる（2 個以上だと実際の完了順序に依存し非決定的に
+    /// なり得るため、本ヘルパーで事前に fixture 側から除外する）。
+    fn expected_entry_promotions(seed: u64, m: usize, n: usize) -> u64 {
+        let mut rng = DeterministicRng::new(seed);
+        let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, m)).collect();
+        let prefix_end = super::super::SEQUENTIAL_PREFIX_NODES.min(n);
+        let l_prefix = levels[..prefix_end].iter().copied().max().unwrap_or(0);
+        let mut distinct: Vec<usize> = levels[prefix_end..]
+            .iter()
+            .copied()
+            .filter(|&level| level > l_prefix)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        distinct.len() as u64
+    }
+
+    /// `expected_entry_promotions` が完了順序非依存で確定する（`<= 1`）
+    /// fixture を、決定的な seed の探索で見つける。見つからない場合は
+    /// テスト fixture 自体の不備として明示的に panic させる
+    /// （vacuous pass 防止）。
+    fn find_deterministic_promotion_seed(base: u64, m: usize, n: usize) -> (u64, u64) {
+        for candidate in 0..500u64 {
+            let seed = base ^ candidate;
+            let expected = expected_entry_promotions(seed, m, n);
+            if expected <= 1 {
+                return (seed, expected);
+            }
+        }
+        panic!("failed to find a seed with a deterministic (<=1) parallel-phase promotion count");
+    }
+
+    /// 同一スレッドで `build_with_threads_observed` を連続 2 回呼んでも、
+    /// 前回呼び出しの残留値がワーカー統計（挿入件数合計・ロック統計・
+    /// エントリ昇格回数）へ混入しないことを固定する。
+    ///
+    /// `Σ entry_promotions` はワークスティールの完了順序に依存し得る値
+    /// なので「1 回目 == 2 回目」の比較だけでは非決定性由来の偶然一致とも
+    /// 区別できない。そこで `expected_entry_promotions` で完了順序非依存に
+    /// 確定する fixture を選び、両回とも**その絶対値**と一致することまで
+    /// 検証する（TLS 混入があれば絶対値からずれて検出できる）。
+    #[test]
+    fn build_with_threads_observed_repeated_calls_do_not_leak_tls_across_calls() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let m = 8usize;
+        let params = HnswParams {
+            m,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let threads = 4usize;
+
+        let (seed, expected) = find_deterministic_promotion_seed(0x9E37_79B9_0000_0000u64, m, rows);
+        let vectors = gen_clustered_corpus(seed, dim, rows, 20);
+
+        let assert_profile = |profile: &HnswBuildProfile, label: &str| {
+            assert_eq!(profile.workers.len(), threads, "{label}: workers.len()");
+            let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+            assert_eq!(
+                total_inserted,
+                (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64,
+                "{label}: Σ inserted_nodes"
+            );
+            for w in &profile.workers {
+                assert!(
+                    w.link_lock_blocked <= w.link_lock_acquired,
+                    "{label}: link_lock_blocked <= link_lock_acquired"
+                );
+            }
+            let total_promotions: u64 = profile.workers.iter().map(|w| w.entry_promotions).sum();
+            assert_eq!(
+                total_promotions, expected,
+                "{label}: Σ entry_promotions が期待値（完了順序非依存の絶対値）と \
+                 一致しない（呼び出し元スレッドの TLS 残値混入の疑い）"
+            );
+        };
+
+        let (_, profile1) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+        assert_profile(&profile1, "call1");
+
+        let (_, profile2) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+        assert_profile(&profile2, "call2");
+    }
+
+    /// 呼び出し元スレッド（このテスト関数自身のスレッド）の TLS 統計を
+    /// 意図的に大きな値へ汚してから `build_with_threads_observed` を呼び、
+    /// 汚染値がワーカー統計へ一切混入しないことを固定する。
+    ///
+    /// [`build_with_threads_observed_repeated_calls_do_not_leak_tls_across_calls`]
+    /// が「自然に生じる残留（逐次プレフィックス分）が混入しないか」を見るのに
+    /// 対し、本テストは「呼び出し元スレッドの TLS に何が残っていても混入しない」
+    /// ことを不自然に大きい値で判別しやすくして直接検証する。
+    #[test]
+    fn build_with_threads_observed_worker_stats_are_unaffected_by_caller_thread_tls_pollution() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let m = 8usize;
+        let params = HnswParams {
+            m,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let threads = 4usize;
+
+        let (seed, expected) = find_deterministic_promotion_seed(0x1357_9BDF_0000_0000u64, m, rows);
+        let vectors = gen_clustered_corpus(seed, dim, rows, 20);
+
+        // 呼び出し元スレッドの TLS を、ワーカー統計に混ざれば一発で判別できる
+        // 桁の値へ汚染する。
+        const POLLUTION: u64 = 1_000_000;
+        for _ in 0..POLLUTION {
+            record_lock_attempt(true);
+        }
+        for _ in 0..POLLUTION {
+            record_entry_promotion();
+        }
+
+        let (_, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+
+        assert_eq!(profile.workers.len(), threads);
+        let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+        assert_eq!(
+            total_inserted,
+            (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64
+        );
+        for w in &profile.workers {
+            assert!(
+                w.link_lock_acquired < POLLUTION,
+                "worker link_lock_acquired={} が呼び出し元スレッドの汚染値と \
+                 同オーダーになっており混入の疑いがある",
+                w.link_lock_acquired
+            );
+            assert!(w.link_lock_blocked <= w.link_lock_acquired);
+        }
+        let total_promotions: u64 = profile.workers.iter().map(|w| w.entry_promotions).sum();
+        assert_eq!(
+            total_promotions, expected,
+            "呼び出し元スレッドで汚染した entry_promotions がワーカー統計へ \
+             混入した疑い"
         );
     }
 }
