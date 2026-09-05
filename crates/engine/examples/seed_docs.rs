@@ -23,9 +23,11 @@
 //! （`seed-batch-<n>`）も決定的なため、同じ `<rows> <dim>` で再実行すると既存の
 //! `docs` テーブル（スキーマ一致時のみ再利用）へ未投入バッチだけを追加する。
 //! 投入済みバッチは台帳の同一内容再送（`DuplicateOperationId`）として検出しスキップ
-//! する。実行全体の `<rows> <dim>` は補助テーブル `seed_meta` へ固定 `operation_id`
-//! （`seed-meta`）の 1 行として最初に記録し、再実行時は同じ台帳照合で
-//! 「同一内容（再開）／内容不一致（fail-closed に停止）」を処理開始前に判定する。
+//! する。実行全体の生成形式バージョン（`SEED_FORMAT_VERSION`）と `<rows> <dim>` は
+//! 補助テーブル `seed_meta` へ固定 `operation_id`（`seed-meta`）の 1 行として最初に
+//! 記録し、再実行時は同じ台帳照合で「同一内容（再開）／内容不一致（fail-closed に
+//! 停止）」を処理開始前に判定する。生成内容が変わる改訂（tenant-b 行の Private 化等）
+//! はバージョンを進めるため、旧形式の DB へは再開できず新しい `<db>` を生成する。
 //! `<dim>` の変更は `docs` のスキーマ不一致としても停止する。
 //!
 //! `export <db> <out.jsonl>` は、他 DB（pgvector・sqlite-vec・Qdrant 等）との横断
@@ -298,7 +300,12 @@ fn create_or_verify_table(storage: &Storage, schema: &TableSchema) -> bool {
     }
 }
 
-/// 実行全体の `<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
+/// 合成文書の生成形式バージョン。生成内容が変わる改訂（例: tenant-b 行を Private で
+/// 投入する変更）で 1 つ進め、旧形式で作った DB への再開を `seed_meta` の照合で
+/// 処理開始前に拒否する。
+const SEED_FORMAT_VERSION: u32 = 2;
+
+/// 実行全体の生成形式・`<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
 /// 再実行時は台帳の内容照合で「同一（再開）／不一致（停止）」を処理開始前に判定する。
 fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, dim: u32) {
     let schema = TableSchema::new(
@@ -309,7 +316,10 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
         ],
     );
     create_or_verify_table(storage, &schema);
-    let params = format!("rows={rows};dim={dim}");
+    // 生成形式のバージョンも照合対象に含める。tenant-b 行の Public→Private 変更のように
+    // 同じ `<rows> <dim>` でも生成内容が変わる改訂では、旧形式 DB への再開を最初の
+    // バッチの内容不一致で失敗させるのではなく、処理開始前にここで検出して停止する。
+    let params = format!("format={SEED_FORMAT_VERSION};rows={rows};dim={dim}");
     let meta = encode_scalar_columns(
         &schema,
         &[Value::Vector(vec![0.0]), Value::Text(params.clone())],
@@ -333,8 +343,9 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
         }
         Err(TenantWriteError::OperationIdContentMismatch) => {
             eprintln!(
-                "error: this db was seeded with different <rows> <dim>; \
-                 rerun with the original values or use a new <db> path"
+                "error: this db was seeded with different <rows> <dim> or an older \
+                 seed format (current: format={SEED_FORMAT_VERSION}); rerun with the \
+                 original values on the same format or use a new <db> path"
             );
             std::process::exit(2);
         }
