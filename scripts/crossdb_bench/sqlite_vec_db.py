@@ -146,7 +146,9 @@ def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict], fts5_available: boo
     return {"rows": len(docs), "seconds": elapsed, "rows_per_sec": len(docs) / elapsed if elapsed > 0 else None}
 
 
-def _ingest_single_stmt(conn: sqlite3.Connection, dim: int, n_rows: int = 1000) -> dict:
+def _ingest_single_stmt(
+    conn: sqlite3.Connection, dim: int, fts5_available: bool, n_rows: int = 1000
+) -> dict:
     import random
 
     t0 = time.perf_counter()
@@ -165,7 +167,10 @@ def _ingest_single_stmt(conn: sqlite3.Connection, dim: int, n_rows: int = 1000) 
             "INSERT INTO vec_docs (rowid, embedding, visibility, tenant, lang, topic) VALUES (?, ?, ?, ?, ?, ?)",
             (rid, _pack(emb), "private", TENANT_VISIBLE, lang, topic),
         )
-        cur.execute("INSERT INTO docs_fts (rowid, body) VALUES (?, ?)", (rid, body))
+        # FTS5 未搭載時は `docs_fts` 自体が無い（`_setup_schema`）ため FTS への投入を
+        # 省略し、hybrid 以外のフェーズは継続する（`_ingest_bulk` と同じ契約）。
+        if fts5_available:
+            cur.execute("INSERT INTO docs_fts (rowid, body) VALUES (?, ?)", (rid, body))
         # pgvector（autocommit）・self（文ごとに永続化）と粒度を揃え、1 行（vec0 + FTS の
         # 2 文）ごとに commit する。
         conn.commit()
@@ -449,7 +454,7 @@ def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
     # ingest_single_stmt はテーブルへ合成行（乱数ベクトル）を追加するため、
     # 他フェーズ（特に vector_knn の recall 検算）を汚染しないよう最後に実行する
     # （self_db.py と同じ順序方針）。
-    phases["ingest_single_stmt"] = _ingest_single_stmt(conn, dim)
+    phases["ingest_single_stmt"] = _ingest_single_stmt(conn, dim, fts5_available)
 
     meta = build_meta(
         db="sqlite_vec",

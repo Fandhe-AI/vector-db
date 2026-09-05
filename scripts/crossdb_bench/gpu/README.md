@@ -128,8 +128,9 @@ scripts/crossdb_bench/gpu/containers_gpu.sh down qdrant_gpu
 ```
 
 `containers_gpu.sh up qdrant_gpu` は起動直後に `docker logs` を確認し、
-`Found GPU device` 行が無ければ標準エラーへ警告を出す（fail-closed。GPU が
-実際には使われていないのに GPU 実測として扱わないため）。
+`Create GPU device` 行が無ければ標準エラーへ警告を出す（fail-closed。`Found GPU device`
+は列挙のみで CPU エミュレータも含むため初期化の証拠にせず、GPU が実際には
+使われていないのに GPU 実測として扱わない）。
 `qdrant_gpu_build_bench.py --container-name` 側でも同じログを結果 JSON の
 `results[].gpu_log_signal` へ記録する。
 

@@ -325,8 +325,8 @@ rows × batch × 4 バイト）がボトルネックと推定される。GPU 上
 投入中は索引構築を止め（`indexing_threshold` を行数より大きく設定）、投入完了後に
 閾値を下げて構築を開始した時点から green・全件 indexed までを計時する。100k で GPU
 5.0 s vs CPU 3.0 s、500k で 21.1 s vs 20.6 s と、この規模・この VM では GPU 索引構築
-の利得は無い（GPU 使用はコンテナログの `Found GPU device`／`Create GPU device` で
-確認）。探索 p50 は同水準（GPU は構築のみ）。
+の利得は無い（GPU 使用はコンテナログの `Create GPU device`〔初期化〕で確認。
+`Found GPU device` は列挙のみで証拠にしない）。探索 p50 は同水準（GPU は構築のみ）。
 
 ### 結論
 

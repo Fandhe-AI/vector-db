@@ -12,7 +12,7 @@
 # （CPU 用は 16333/16334）ので、両ハーネスを同じ環境で使う場合は注意すること。
 #
 # GPU 版は `qdrant/qdrant:gpu-nvidia-latest` を `--gpus all` + `QDRANT__GPU__INDEXING=1`
-# で起動する。起動ログの "Found GPU device" 行で実際に GPU が認識されたかを
+# で起動する。起動ログの "Create GPU device" 行で実際に GPU が初期化されたかを
 # 呼び出し側（qdrant_gpu_build_bench.py）が確認する契約。
 #
 # `docker rm -f` で毎回冪等に扱う（既存コンテナが残っていても事故らない）。
@@ -71,10 +71,11 @@ up_gpu() {
     -p 127.0.0.1:${HOST_PORT_GRPC}:6334 \
     "${QDRANT_IMAGE_GPU}" >/dev/null
   wait_ready bench-qdrant-gpu
-  if docker logs bench-qdrant-gpu 2>&1 | grep -qi "found gpu device"; then
-    echo "bench-qdrant-gpu: GPU device recognized (Found GPU device)"
+  # 'Found GPU device' は列挙のみ（CPU エミュレータも含む）。初期化の証拠は 'Create GPU device'。
+  if docker logs bench-qdrant-gpu 2>&1 | grep -qi "create gpu device"; then
+    echo "bench-qdrant-gpu: GPU device initialized (Create GPU device)"
   else
-    echo "bench-qdrant-gpu: WARNING - 'Found GPU device' not seen in logs (fail-closed: GPU 未使用の可能性)" >&2
+    echo "bench-qdrant-gpu: WARNING - 'Create GPU device' not seen in logs (fail-closed: GPU 未初期化の可能性)" >&2
   fi
 }
 

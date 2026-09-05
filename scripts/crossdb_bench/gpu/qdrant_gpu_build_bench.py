@@ -266,7 +266,10 @@ def gpu_log_signal(container_name: str) -> dict[str, Any]:
     lower = logs.lower()
     found_gpu = "found gpu device" in lower
     create_gpu = "create gpu device" in lower
-    if found_gpu or create_gpu:
+    # 'Found GPU device' はフィルタ適用前の列挙ログで CPU エミュレータも含む。
+    # GPU が実際に初期化された証拠は 'Create GPU device' のみとし、列挙だけでは
+    # gpu_used=true にしない（Qdrant 公式 docs「Running with GPU」の区別に従う）。
+    if create_gpu:
         return {
             "container": container_name,
             "checked": True,
@@ -278,7 +281,11 @@ def gpu_log_signal(container_name: str) -> dict[str, Any]:
         "container": container_name,
         "checked": True,
         "gpu_used": False,
-        "warning": "GPU 未使用（'Found GPU device'/'Create GPU device' ログなし。fail-closed 記録）",
+        "found_gpu_device_line": found_gpu,
+        "create_gpu_device_line": create_gpu,
+        "warning": (
+            "GPU 未初期化（'Create GPU device' ログなし。'Found GPU device' は列挙のみで初期化の証拠にならない。fail-closed 記録）"
+        ),
     }
 
 
