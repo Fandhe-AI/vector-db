@@ -386,6 +386,16 @@ else
 endif
 
 # --------------------------------------------------
+# 他 DB との機能別横断ベンチ（scripts/crossdb_bench/。Python ハーネス・Cargo 依存追加なし。docs/design/crossdb-bench.md）
+# --------------------------------------------------
+
+.PHONY: bench-crossdb
+bench-crossdb: ## self（wire-server 経由）と pgvector / sqlite-vec / Qdrant / LanceDB / MySQL を機能別に比較する（Docker・Python venv・`cargo build --release -p wire-server`・seed_docs 生成 fixture が必要。CROSSDB_DIR〔fixture ディレクトリ〕と CROSSDB_PYTHON〔venv の python〕を必須指定。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+	@test -n "$(CROSSDB_DIR)" || { echo "CROSSDB_DIR を指定してください（fixture ディレクトリ）"; exit 1; }
+	@test -n "$(CROSSDB_PYTHON)" || { echo "CROSSDB_PYTHON を指定してください（venv の python）"; exit 1; }
+	CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" bash scripts/crossdb_bench/run_all.sh
+
+# --------------------------------------------------
 # 自作 HNSW と外部フレームワーク usearch の構築時間・Recall・探索レイテンシ比較（Issue #402 系 ADR の実測補強。crates/engine/benches/hnsw_compare_bench.rs）
 # --------------------------------------------------
 

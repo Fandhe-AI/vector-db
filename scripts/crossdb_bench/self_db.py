@@ -146,7 +146,15 @@ def run(args, queries: list[dict]) -> dict:
     ——wire-server は既存 redb をそのまま開くため再投入しない）。
     """
     workdir = args.workdir
-    server = SelfServer(db_path=args.rows_file, workdir=workdir)
+    # 計測は redb を書き換える（ingest_single_stmt が行と operation_id 台帳を追加する）
+    # ため、渡された fixture を直接開かず作業コピーに対して実行する。コピーしないと
+    # 2 回目以降の実行で同一 operation_id の再送が内容不一致として拒否され
+    # （TASK-101・RECOVER-10 の契約どおり）、可視行数も毎回増えて比較できなくなる。
+    import shutil
+
+    work_db = os.path.join(workdir, "self_bench_work.redb")
+    shutil.copyfile(args.rows_file, work_db)
+    server = SelfServer(db_path=work_db, workdir=workdir)
     server.start()
     try:
         conn_a = server.connect(USER_A)
