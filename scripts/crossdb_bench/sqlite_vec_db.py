@@ -48,6 +48,22 @@ def _pack(vec: list[float]) -> bytes:
     return sqlite_vec.serialize_float32(vec)
 
 
+def _is_unsupported_fts5_error(e: sqlite3.Error) -> bool:
+    """FTS5/vec0 の機能未対応を示す `sqlite3.OperationalError` か判定する
+    （実機で確認済みの文言: FTS5 拡張未同梱の "no such module: fts5"、MATCH
+    構文が受理されない "fts5: syntax error"、vec0 auxiliary 列を KNN の
+    WHERE に使った "illegal where constraint"）。ロック・I/O 障害等の実行
+    障害まで unsupported へ丸めて成功扱いにしない（codex-review P1）ため、
+    これらに一致しない例外は呼び出し元で再送出する。"""
+    msg = str(e).lower()
+    unsupported_markers = (
+        "no such module: fts5",
+        "fts5: syntax error",
+        "illegal where constraint",
+    )
+    return any(marker in msg for marker in unsupported_markers)
+
+
 def _setup_schema(conn: sqlite3.Connection, dim: int) -> None:
     cur = conn.cursor()
     cur.execute(
@@ -246,7 +262,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     try:
         stats, _ = measure(hybrid, idxs)
         phases["hybrid_rrf"] = stats
-    except sqlite3.Error as e:
+    except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
+        if not _is_unsupported_fts5_error(e):
+            raise
         phases["hybrid_rrf"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
     # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
@@ -318,7 +336,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             "rows_returned": len(last),
             "candidate_pool": bulk_hybrid_pool,
         }
-    except sqlite3.Error as e:
+    except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
+        if not _is_unsupported_fts5_error(e):
+            raise
         phases["bulk_hybrid_k200"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
     def scan_nosort(_):

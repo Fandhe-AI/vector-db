@@ -27,6 +27,19 @@ from common import TENANT_VISIBLE, build_meta, measure, sql_escape_literal, unsu
 TABLE = "docs"
 
 
+def _is_unsupported_feature_error(e: Exception) -> bool:
+    """LanceDB（pyo3 経由の lance-core）が機能未対応を示す例外か判定する。
+    `NotImplementedError`、またはメッセージに "not supported"／"not
+    implemented"／"unsupported" を含む場合のみ未対応とみなす。接続断・
+    タイムアウト・ストレージ障害等の実行障害まで unsupported へ丸めて
+    成功扱いにしない（codex-review P1）ため、判別できない例外は呼び出し元で
+    再送出する。"""
+    if isinstance(e, NotImplementedError):
+        return True
+    msg = str(e).lower()
+    return "not supported" in msg or "not implemented" in msg or "unsupported" in msg
+
+
 def _connect(workdir: str) -> lancedb.DBConnection:
     return lancedb.connect(f"{workdir}/lancedb")
 
@@ -114,7 +127,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         # 0.38.0 でも動作する（実機確認）。hybrid フェーズが使う FTS 索引をここで作る。
         # 失敗は握りつぶさず hybrid フェーズを理由付き unsupported にする。
         tbl.create_fts_index("body", replace=True)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 - 機能未対応のみ捕捉し、それ以外は再送出する
+        if not _is_unsupported_feature_error(e):
+            raise
         fts_error = repr(e)
 
     public_filter = "visibility = 'public'"
@@ -166,7 +181,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     def agg_multi(_):
         ids = scan_ids(public_filter)
         if not ids:
-            return (0, 0, None, None, None)
+            # 可視集合が空のときの SUM/AVG/MIN/MAX は PostgreSQL/SQLite/MySQL の
+            # `SUM(id)` 等と同じく NULL（COUNT のみ 0）に揃える（codex-review P2）。
+            return (0, None, None, None, None)
         return (len(ids), sum(ids), sum(ids) / len(ids), min(ids), max(ids))
 
     stats, last = measure(agg_multi, [None])
@@ -217,7 +234,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         try:
             stats, last = measure(hybrid, idxs)
             phases["hybrid_rrf"] = stats
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - 機能未対応のみ捕捉し、それ以外は再送出する
+            if not _is_unsupported_feature_error(e):
+                raise
             phases["hybrid_rrf"] = unsupported(f"hybrid search failed: {e!r}")
 
     # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
@@ -266,7 +285,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         try:
             stats, last = measure(bulk_hybrid, idxs)
             phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last), "ef": bulk_ef(200)}
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - 機能未対応のみ捕捉し、それ以外は再送出する
+            if not _is_unsupported_feature_error(e):
+                raise
             phases["bulk_hybrid_k200"] = unsupported(f"hybrid search failed: {e!r}")
 
     # ベクトルなしの where スキャン（ORDER BY なし）。
@@ -303,7 +324,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     try:
         stats, last = measure(explain, query_vecs)
         phases["explain"] = {**stats, "sample_output": last}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 - 機能未対応のみ捕捉し、それ以外は再送出する
+        if not _is_unsupported_feature_error(e):
+            raise
         phases["explain"] = unsupported(f"explain_plan failed: {e!r}")
 
     # ingest_single_stmt はテーブルへ合成行（乱数ベクトル）を追加するため、

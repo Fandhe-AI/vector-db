@@ -273,7 +273,12 @@ pub fn format_unavailable_line(
 /// （比較対象を持たない候補はすべて疑わしいとみなす fail-closed 側の扱い）。
 /// `candidate` が `baseline` より短い場合は欠落件数を、同一 id の重複返却は
 /// その重複件数を、境界スコアより高い baseline の id が `candidate` に無い場合は
-/// その件数を、それぞれ不一致に加算する（同点による置換は境界上の結果に限る）。
+/// その件数を、`candidate` が `baseline` より長い場合はその超過件数を、それぞれ
+/// 不一致に加算する（同点による置換は境界上の結果に限る。件数超過は境界同点の
+/// 水増しであっても Top-k の契約〔`baseline.len()` 件を超えない〕に反するため
+/// 許容しない。codex-review P2 指摘: 超過分のみでは
+/// `baseline=[(1,3),(2,2),(3,1)]`・`candidate=baseline + [(4,1)]` が不一致 0 に
+/// なっていた）。
 pub fn count_boundary_tolerant_mismatches(
     baseline: &[(u64, f32)],
     candidate: &[(u64, f32)],
@@ -309,5 +314,9 @@ pub fn count_boundary_tolerant_mismatches(
     // 候補が短い場合の欠落件数と、境界より上位の id の欠落は同じ取りこぼしを別の
     // 側面から数えている（空の候補では両方が計上される）ため、二重計上せず大きい方を
     // 採る。
-    extra + duplicates + missing.max(dropped_above_boundary)
+    //
+    // `candidate` が `baseline` より長い場合の超過件数。境界同点の水増しは
+    // `extra`（スコアが境界未満）では捕捉できないため独立に加算する。
+    let excess = candidate.len().saturating_sub(baseline.len());
+    extra + duplicates + missing.max(dropped_above_boundary) + excess
 }

@@ -189,6 +189,16 @@ fn mismatches_count_duplicate_ids_in_candidate() {
     assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
 }
 
+#[test]
+fn mismatches_count_excess_candidates_beyond_baseline_length() {
+    // codex-review P2: baseline の全件を含み境界同点の id=4 を 1 件追加しただけの
+    // candidate（境界スコア未満ではないため `extra` に捕捉されない）が、件数超過
+    // チェック無しでは不一致 0 になっていた。件数超過は不一致として計上する。
+    let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
+    let candidate = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0), (4, 1.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+}
+
 // ---------------------------------------------------------------------
 // 出力整形
 // ---------------------------------------------------------------------

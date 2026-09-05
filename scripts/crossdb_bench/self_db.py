@@ -47,6 +47,17 @@ USER_B = "bench_b"
 PASSWORD = "bench"
 
 
+def _is_allowlist_syntax_rejection(e: Exception) -> bool:
+    """SQL 表層の許可リスト構文拒否（`crates/engine/src/sql/allowlist.rs`
+    `SqlSurfaceError::UnsupportedSyntax`。wire_code `42601`・メッセージ先頭
+    "unsupported SQL syntax"）と判定できる例外か。接続断・タイムアウト・
+    ストレージ障害等の実行障害まで unsupported へ丸めて成功扱いにしない
+    ため（codex-review P1）、この判定に一致しない例外は呼び出し元で
+    再送出する。"""
+    sqlstate = getattr(e, "sqlstate", None)
+    return sqlstate == "42601" or "unsupported SQL syntax" in str(e)
+
+
 def _hash_password(binary: str, password: str) -> str:
     """`wire-server hash-password` サブコマンドで phc 文字列を得る（平文はここでのみ扱う）。"""
     proc = subprocess.run(
@@ -399,12 +410,11 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             # 許可リストの構文拒否（`42601`・"unsupported SQL syntax"）以外の例外
             # （接続断・タイムアウト等）を「想定内の拒否」として記録すると fail-open に
             # なるため、拒否以外はそのまま再送出して計測全体を失敗させる。
-            sqlstate = getattr(e, "sqlstate", None)
-            if sqlstate != "42601" and "unsupported SQL syntax" not in str(e):
+            if not _is_allowlist_syntax_rejection(e):
                 raise
             phases["scan_where_nosort_k500"] = unsupported(
                 "SQL surface requires ORDER BY <distance> or USING PLAN for "
-                f"row-returning SELECT (sqlstate={sqlstate}): {e!r}"
+                f"row-returning SELECT (sqlstate={getattr(e, 'sqlstate', None)}): {e!r}"
             )
         if accepted:
             # 許可リストが将来受理するようになった場合は通常フェーズとして計測する
@@ -455,7 +465,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
 
             stats, _ = measure(udf_call, [None])
             phases["udf_call"] = stats
-        except Exception as e:  # noqa: BLE001 - wire 経由 CREATE FUNCTION 不許可の可能性を記録
+        except Exception as e:  # noqa: BLE001 - 許可リスト構文拒否のみ unsupported とする
+            # 接続断・タイムアウト等の実行障害を unsupported へ丸めない
+            # （codex-review P1）。許可リスト拒否（`42601`）と確認できない例外は
+            # 再送出して計測全体を失敗させる。
+            if not _is_allowlist_syntax_rejection(e):
+                raise
             phases["udf_call"] = unsupported(
                 f"CREATE FUNCTION が wire 経由で失敗: {e!r}"
             )
@@ -472,7 +487,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
             with conn_a.cursor() as cur:
                 cur.execute(f"EXPLAIN SELECT id FROM docs ORDER BY embedding <=> '{query_vecs[0]}' LIMIT 10")
             phases["explain"] = unsupported("到達しないはずの分岐（EXPLAIN が成功した）")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001 - 許可リスト構文拒否のみ unsupported とする
+            # 接続断・タイムアウト等の実行障害を unsupported へ丸めない
+            # （codex-review P1）。許可リスト拒否（`42601`）と確認できない例外は
+            # 再送出して計測全体を失敗させる。
+            if not _is_allowlist_syntax_rejection(e):
+                raise
             phases["explain"] = unsupported(
                 f"EXPLAIN は `USING PLAN(...)` 文にのみ対応（許可リスト拒否を実機確認）: {e!r}"
             )
@@ -512,7 +532,12 @@ def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
                 for n in range(n_ingest):
                     cur.execute(make_row_sql(n))
                     rows_ok += 1
-        except Exception as e:  # noqa: BLE001 - 失敗時はエラーコードを記録して N/A
+        except Exception as e:  # noqa: BLE001 - 許可リスト構文拒否のみ unsupported とする
+            # 接続断・タイムアウト・重複 id・ストレージ障害等の実行障害を
+            # unsupported へ丸めない（codex-review P1）。許可リスト拒否
+            # （`42601`）と確認できない例外は再送出して計測全体を失敗させる。
+            if not _is_allowlist_syntax_rejection(e):
+                raise
             ingest_error = repr(e)
         t1 = time.perf_counter()
         if ingest_error is not None:
