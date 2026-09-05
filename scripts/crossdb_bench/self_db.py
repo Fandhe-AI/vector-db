@@ -94,6 +94,12 @@ class SelfServer:
         self.workdir = workdir
         self.binary = binary or self._default_binary()
         self.proc: subprocess.Popen | None = None
+        # 子プロセスの stdout/stderr の書き出し先（ファイル）。パイプ（`subprocess.PIPE`）
+        # を使うと、誰も読み取らない間に OS のパイプバッファが満杯になって
+        # wire-server の `eprintln` がブロックしデッドロックし得る（Bugbot 指摘）ため、
+        # 必ずファイルへ落とし、起動失敗時の診断はファイルを読み戻す。
+        self.log_path: str | None = None
+        self._log_file = None
         # 認証ファイル用の作業サブディレクトリ。`start()` でポート検査を通過した後に
         # 初めて作成する（起動を拒否する経路ではファイルを一切生成しない）。
         self.auth_dir: str | None = None
@@ -132,6 +138,11 @@ class SelfServer:
         with open(self.users_path, "w", encoding="utf-8") as f:
             f.write(f"{USER_A}:{TENANT_VISIBLE}:{phc_a}\n")
             f.write(f"{USER_B}:{TENANT_OTHER}:{phc_b}\n")
+        # stdout/stderr はパイプではなくファイルへ書く（パイプは読み手が居ないと
+        # バッファ満杯で子プロセスがブロックする）。認証サブディレクトリと同じ
+        # 一時領域に置き、`stop()` で一緒に削除する。
+        self.log_path = os.path.join(self.auth_dir, "wire-server.log")
+        self._log_file = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [
                 self.binary,
@@ -142,9 +153,8 @@ class SelfServer:
                 "--bind",
                 f"{BIND_HOST}:{BIND_PORT}",
             ],
-            stdout=subprocess.PIPE,
+            stdout=self._log_file,
             stderr=subprocess.STDOUT,
-            text=True,
         )
         atexit.register(self.stop)
         # 子プロセスの生存を確認しながら LISTEN を待つ（bind 失敗等で子が終了した
@@ -152,7 +162,7 @@ class SelfServer:
         deadline = time.time() + 30.0
         while True:
             if self.proc.poll() is not None:
-                out = self.proc.stdout.read() if self.proc.stdout else ""
+                out = self._read_log_tail()
                 # stop() が self.proc を None にするため、終了コードは先に控える
                 # （診断に必要な終了コードと出力をエラーメッセージから落とさない）。
                 code = self.proc.returncode
@@ -171,16 +181,40 @@ class SelfServer:
         # 軽く待つ（psycopg 側の接続リトライは別途 connect() 呼び出し元が担う）。
         time.sleep(0.3)
 
+    def _read_log_tail(self, max_bytes: int = 64 * 1024) -> str:
+        """子プロセスのログファイル末尾（既定 64 KiB）を診断用に読み戻す。
+        ファイルが無い・読めない場合は空文字（診断を理由に起動失敗の例外を隠さない）。"""
+        if self.log_path is None:
+            return ""
+        try:
+            if self._log_file is not None:
+                self._log_file.flush()
+            with open(self.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max_bytes))
+                return f.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def stop(self) -> None:
-        """子プロセスを停止し、認証サブディレクトリを削除する（多重呼び出し可。
-        `run()` の finally と atexit の双方から呼ばれる）。"""
+        """子プロセスを停止し、認証サブディレクトリ（ログファイル含む）を削除する
+        （多重呼び出し可。`run()` の finally と atexit の双方から呼ばれる）。"""
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+                self.proc.wait(timeout=5.0)
         self.proc = None
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+        self._log_file = None
+        self.log_path = None
         if self.auth_dir is not None and os.path.isdir(self.auth_dir):
             shutil.rmtree(self.auth_dir, ignore_errors=True)
         self.auth_dir = None
