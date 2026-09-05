@@ -142,10 +142,13 @@ class SelfServer:
         while True:
             if self.proc.poll() is not None:
                 out = self.proc.stdout.read() if self.proc.stdout else ""
+                # stop() が self.proc を None にするため、終了コードは先に控える
+                # （診断に必要な終了コードと出力をエラーメッセージから落とさない）。
+                code = self.proc.returncode
                 # 起動失敗でも認証サブディレクトリを残さない。
                 self.stop()
                 raise RuntimeError(
-                    f"wire-server exited during startup (code {self.proc.returncode}): {out.strip()}"
+                    f"wire-server exited during startup (code {code}): {out.strip()}"
                 )
             if _port_is_listening(BIND_HOST, BIND_PORT):
                 break
@@ -220,11 +223,25 @@ def run(args, queries: list[dict]) -> dict:
     # ため、渡された fixture を直接開かず作業コピーに対して実行する。コピーしないと
     # 2 回目以降の実行で同一 operation_id の再送が内容不一致として拒否され
     # （TASK-101・RECOVER-10 の契約どおり）、可視行数も毎回増えて比較できなくなる。
+    # 作業コピーは実行ごとに一意なサブディレクトリへ置く。固定パスだと同じ
+    # workdir で二重起動した 2 回目の copyfile が、1 回目の wire-server が開いて
+    # いる DB を切り詰めて破壊する（ポート占有検査はコピー後の start() 内のため
+    # 防げない）。計測後は作業コピーごと削除する。
     os.makedirs(workdir, exist_ok=True)
-    work_db = os.path.join(workdir, "self_bench_work.redb")
+    run_dir = tempfile.mkdtemp(prefix=f"self_bench_work_{os.getpid()}_", dir=workdir)
+    work_db = os.path.join(run_dir, "self_bench_work.redb")
     shutil.copyfile(args.rows_file, work_db)
     server = SelfServer(db_path=work_db, workdir=workdir)
-    server.start()
+    try:
+        server.start()
+        return _run_phases(args, queries, server)
+    finally:
+        server.stop()
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _run_phases(args, queries: list[dict], server: SelfServer) -> dict:
+    """起動済み wire-server に対して全フェーズを実行する（`run` から呼ばれる）。"""
     try:
         conn_a = server.connect(USER_A)
         phases: dict = {}
