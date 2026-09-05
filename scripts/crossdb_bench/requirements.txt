@@ -1,0 +1,11 @@
+# crossdb_bench 用 Python 依存（venv へ `pip install -r requirements.txt`）。
+# 完全固定（==）。導入済み venv の `pip freeze` 実測版に合わせている。
+psycopg==3.3.5
+psycopg-binary==3.3.5
+pgvector==0.5.0
+sqlite-vec==0.1.9
+qdrant-client==1.19.0
+lancedb==0.38.0
+pyarrow==25.0.1
+mysql-connector-python==26.7.0
+numpy==2.5.2

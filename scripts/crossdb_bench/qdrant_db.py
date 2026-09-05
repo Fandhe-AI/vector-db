@@ -1,0 +1,223 @@
+"""Qdrant（`qdrant/qdrant:latest`、127.0.0.1:16333/16334）の機能別ベンチマーク実装。
+
+gRPC 経由（`prefer_grpc=True`）で接続する。距離指標は自作 DB の `<=>`
+（内積）に合わせ `Distance.DOT` を使う。RLS 相当は、自作 DB の現行契約
+（実機確認: どのテナントの wire セッションからも `visibility = 'public'` の
+行のみが可視。private 行は所有テナント自身からも不可視）に合わせ、payload
+の `visibility` フィールドへの `Filter` で模する（`tenant` では絞り込まず、
+payload index も visibility へ作成する）。
+
+集計は `count` のみをネイティブ機能として計測し、GROUP BY・hybrid は
+疎ベクトルを自前生成すると自作 DB の BM25 系 hybrid と非等価になるため
+task 指示どおり N/A とする。
+"""
+
+from __future__ import annotations
+
+import time
+
+from qdrant_client import QdrantClient, models
+
+from common import TENANT_VISIBLE, build_meta, measure, unsupported
+
+HOST = "127.0.0.1"
+HTTP_PORT = 16333
+GRPC_PORT = 16334
+COLLECTION = "docs"
+
+
+def _connect() -> QdrantClient:
+    return QdrantClient(host=HOST, port=HTTP_PORT, grpc_port=GRPC_PORT, prefer_grpc=True)
+
+
+def _setup_collection(client: QdrantClient, dim: int, config: str) -> None:
+    if client.collection_exists(COLLECTION):
+        client.delete_collection(COLLECTION)
+    hnsw_config = None
+    if config == "hnsw":
+        hnsw_config = models.HnswConfigDiff(m=16, ef_construct=100)
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=models.VectorParams(size=dim, distance=models.Distance.DOT),
+        hnsw_config=hnsw_config,
+    )
+    client.create_payload_index(COLLECTION, "visibility", field_schema=models.PayloadSchemaType.KEYWORD)
+    client.create_payload_index(COLLECTION, "lang", field_schema=models.PayloadSchemaType.KEYWORD)
+
+
+def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
+    t0 = time.perf_counter()
+    batch = 500
+    for i in range(0, len(docs), batch):
+        chunk = docs[i : i + batch]
+        client.upsert(
+            collection_name=COLLECTION,
+            points=models.Batch(
+                ids=[d["id"] for d in chunk],
+                vectors=[d["embedding"] for d in chunk],
+                payloads=[
+                    {
+                        "tenant": d["tenant"],
+                        # 旧フィクスチャ（visibility 未導入）との互換のため
+                        # 欠落時は fail-closed で private 扱いにする。
+                        "visibility": d.get("visibility", "private"),
+                        "lang": d["lang"],
+                        "topic": d.get("topic", ""),
+                    }
+                    for d in chunk
+                ],
+            ),
+        )
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    return {"rows": len(docs), "seconds": elapsed, "rows_per_sec": len(docs) / elapsed if elapsed > 0 else None}
+
+
+def _ingest_single_stmt(client: QdrantClient, dim: int, n_rows: int = 1000) -> dict:
+    import random
+
+    t0 = time.perf_counter()
+    for n in range(n_rows):
+        rid = 10_000_000 + n
+        emb = [random.random() * 2 - 1 for _ in range(dim)]
+        lang = "ja" if n % 2 == 0 else "en"
+        topic = f"topic-{n % 20:02d}"
+        client.upsert(
+            collection_name=COLLECTION,
+            points=[
+                models.PointStruct(
+                    id=rid,
+                    vector=emb,
+                    payload={
+                        "tenant": TENANT_VISIBLE,
+                        "visibility": "private",
+                        "lang": lang,
+                        "topic": topic,
+                    },
+                )
+            ],
+        )
+    t1 = time.perf_counter()
+    elapsed = t1 - t0
+    return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
+
+
+def run(args, docs: list[dict], queries: list[dict]) -> dict:
+    client = _connect()
+    dim = len(docs[0]["embedding"]) if docs else 128
+    _setup_collection(client, dim, args.config)
+    phases: dict = {}
+    phases["ingest_bulk"] = _ingest_bulk(client, docs)
+    
+    public_only_filter = models.Filter(
+        must=[models.FieldCondition(key="visibility", match=models.MatchValue(value="public"))]
+    )
+    public_only_lang_ja_filter = models.Filter(
+        must=[
+            models.FieldCondition(key="visibility", match=models.MatchValue(value="public")),
+            models.FieldCondition(key="lang", match=models.MatchValue(value="ja")),
+        ]
+    )
+    search_params = None
+    if args.config == "hnsw":
+        search_params = models.SearchParams(hnsw_ef=64, exact=False)
+    else:
+        search_params = models.SearchParams(exact=True)
+
+    def knn(qv):
+        res = client.query_points(
+            collection_name=COLLECTION,
+            query=qv,
+            query_filter=public_only_filter,
+            search_params=search_params,
+            limit=10,
+            with_payload=False,
+        )
+        return [p.id for p in res.points]
+
+    query_vecs = [q["embedding"] for q in queries]
+    stats, _ = measure(knn, query_vecs)
+    knn_ids_all = [knn(qv) for qv in query_vecs]
+    phases["vector_knn"] = {**stats, "ids_per_query": knn_ids_all}
+
+    def knn_where(qv):
+        res = client.query_points(
+            collection_name=COLLECTION,
+            query=qv,
+            query_filter=public_only_lang_ja_filter,
+            search_params=search_params,
+            limit=10,
+            with_payload=False,
+        )
+        return [p.id for p in res.points]
+
+    stats, _ = measure(knn_where, query_vecs)
+    phases["vector_knn_where"] = stats
+    phases["point_where"] = {"note": "vector_knn_where と同一クエリ形のため統合", **stats}
+
+    def compound_count(_):
+        f = models.Filter(
+            must=[
+                models.FieldCondition(key="visibility", match=models.MatchValue(value="public")),
+                models.FieldCondition(key="lang", match=models.MatchValue(value="ja")),
+                models.FieldCondition(key="id", range=models.Range(gt=100)),
+            ]
+        )
+        return client.count(COLLECTION, count_filter=f, exact=True).count
+
+    stats, last = measure(compound_count, [None])
+    phases["where_compound_count"] = {**stats, "result": last}
+
+    def agg_count(_):
+        return client.count(COLLECTION, count_filter=public_only_filter, exact=True).count
+
+    stats, last = measure(agg_count, [None])
+    phases["agg_count"] = {**stats, "result": last}
+
+    phases["agg_multi"] = unsupported("Qdrant に SUM/AVG/MIN/MAX 相当の集計 API が無い（count のみ）")
+    phases["group_by_having"] = unsupported("Qdrant に GROUP BY/HAVING 相当の API が無い")
+    phases["hybrid_rrf"] = unsupported(
+        "疎ベクトルを自前生成すると自作 DB の BM25 系 hybrid と非等価なため対象外（task 指示）"
+    )
+    phases["mode_recall"] = unsupported("Qdrant にモード切替（recall/precision）の概念が無い")
+    phases["mode_precision"] = unsupported("Qdrant にモード切替（recall/precision）の概念が無い")
+    phases["udf_call"] = unsupported("自作 DB の宣言的 UDF 呼び出し相当の機能が無い")
+
+    # Qdrant には自作 DB の wire セッションに相当するテナント別接続の概念が
+    # 無いため、tenant-b「セッション」を模す接続は作らず、同じ public-only
+    # フィルタを再実行して agg_count と同値になることの一致確認とする
+    # （自作 DB は tenant-a・tenant-b いずれのセッションでも `visibility =
+    # 'public'` の行のみ可視という現行契約——実機確認済み）。
+    def rls_count(_):
+        return client.count(COLLECTION, count_filter=public_only_filter, exact=True).count
+
+    stats, last = measure(rls_count, [None])
+    phases["rls_isolation"] = {
+        **stats,
+        "tenant_b_count": last,
+        "note": "Qdrant にテナント別セッションの概念が無いため agg_count と同一フィルタで再実行（値の一致確認用）",
+    }
+
+    phases["explain"] = unsupported("Qdrant に EXPLAIN 相当の API が無い")
+
+    info = client.get_collection(COLLECTION)
+    # ingest_single_stmt はテーブルへ合成行（乱数ベクトル）を追加するため、
+    # 他フェーズ（特に vector_knn の recall 検算）を汚染しないよう最後に実行する
+    # （self_db.py と同じ順序方針）。
+    phases["ingest_single_stmt"] = _ingest_single_stmt(client, dim)
+
+    meta = build_meta(
+        db="qdrant",
+        version="qdrant/qdrant:latest（docker inspect の digest を別途記録）",
+        connection="gRPC",
+        config=args.config,
+        rows=len(docs),
+        dim=dim,
+        extra={
+            "distance": "DOT",
+            "hnsw_config": {"m": 16, "ef_construct": 100} if args.config == "hnsw" else None,
+            "search_params": "hnsw_ef=64" if args.config == "hnsw" else "exact=True",
+            "points_count": info.points_count,
+        },
+    )
+    return {"meta": meta, "phases": phases}

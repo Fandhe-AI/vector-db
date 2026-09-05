@@ -1,0 +1,26 @@
+# bench-faiss-gpu: FAISS GPU 検索ベンチ（faiss_batch_bench.py）実行用イメージ。
+#
+# ホストの Python 3.14 環境には faiss-gpu の wheel が存在しないため、
+# python:3.12-slim 上に faiss-gpu-cu12 を導入したコンテナ内で実行する。
+# `docker run --gpus all` で RTX 3060 を渡す前提（CUDA 13.2 ドライバ導入済み
+# ホストで動作確認済み・faiss.get_num_gpus() == 1）。
+#
+# ビルド:
+#   docker build -t bench-faiss-gpu -f scripts/crossdb_bench/gpu/Dockerfile.faiss \
+#       scripts/crossdb_bench/gpu
+FROM python:3.12-slim
+RUN pip install --no-cache-dir faiss-gpu-cu12==1.14.1.post1 numpy==2.3.5 || pip install --no-cache-dir faiss-gpu-cu12 numpy
+
+# CPU 経路のスレッド既定値。実測（rows=20000, dim=128, batch 1/8/64/256。
+# README「CPU 経路の BLAS/OMP スレッド競合」節参照）で、FAISS の CPU 検索は
+# nq>=faiss.cvar.distance_compute_blas_threshold（既定 20）で BLAS(sgemm) 経路へ
+# 切り替わり、slim イメージの OpenBLAS スレッドと OMP スレッドが競合して
+# batch>=64 相当の nq で p50 が 115ms 超まで悪化する事象を確認した。
+# OPENBLAS_NUM_THREADS=1 単独では改善せず、faiss_batch_bench.py 側の
+# --blas-threshold（既定 1<<30 で BLAS 経路を無効化）と組み合わせて初めて
+# batch=1/8 の水準を保ったまま batch=64/256 も 9-17ms 程度まで改善する
+# （batch=64: 115971us→8988us、batch=256: 115150us→16969us）。
+# ここでは「両方を掛け合わせた最速条件」をイメージ既定値として焼き込む。
+# `docker run -e OPENBLAS_NUM_THREADS=... ` で上書き可能。
+ENV OMP_NUM_THREADS=12
+ENV OPENBLAS_NUM_THREADS=1
