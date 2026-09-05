@@ -272,7 +272,8 @@ pub fn format_unavailable_line(
 /// 空であれば不一致 0、そうでなければ `candidate` の全件を不一致として数える
 /// （比較対象を持たない候補はすべて疑わしいとみなす fail-closed 側の扱い）。
 /// `candidate` が `baseline` より短い場合は欠落件数を、同一 id の重複返却は
-/// その重複件数を、それぞれ不一致に加算する。
+/// その重複件数を、境界スコアより高い baseline の id が `candidate` に無い場合は
+/// その件数を、それぞれ不一致に加算する（同点による置換は境界上の結果に限る）。
 pub fn count_boundary_tolerant_mismatches(
     baseline: &[(u64, f32)],
     candidate: &[(u64, f32)],
@@ -296,5 +297,14 @@ pub fn count_boundary_tolerant_mismatches(
     // 同一 id の重複返却も不一致（Top-k は id の集合として一意であるべき）。
     let mut seen = std::collections::HashSet::with_capacity(candidate.len());
     let duplicates = candidate.iter().filter(|(id, _)| !seen.insert(*id)).count();
-    extra + missing + duplicates
+    // 同点による置換は境界スコア上の結果に限る。境界より高いスコアを持つ baseline の
+    // id は必ず candidate に含まれていなければならず、欠けていれば不一致に数える
+    // （件数差だけでは、境界同点の候補が上位 id を置き換えた取りこぼしを見逃す）。
+    let candidate_ids: std::collections::HashSet<u64> =
+        candidate.iter().map(|(id, _)| *id).collect();
+    let dropped_above_boundary = baseline
+        .iter()
+        .filter(|(id, score)| *score > boundary_score && !candidate_ids.contains(id))
+        .count();
+    extra + missing + duplicates + dropped_above_boundary
 }

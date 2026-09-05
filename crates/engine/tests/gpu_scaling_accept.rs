@@ -170,6 +170,18 @@ fn mismatches_count_missing_hits_when_candidate_is_shorter_than_baseline() {
 }
 
 #[test]
+fn mismatches_count_baseline_ids_above_boundary_missing_from_candidate() {
+    // 境界スコア（1.0）と同点の id=9 が、境界より上位の id=2（2.0）を置き換えている。
+    // 件数は一致し id=9 は同点許容の対象だが、上位 id の欠落は不一致に数える。
+    let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
+    let candidate = vec![(1u64, 3.0f32), (3, 1.0), (9, 1.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+    // 境界上（1.0）の id=3 が同点の id=9 に置き換わるだけなら許容する。
+    let candidate = vec![(1u64, 3.0f32), (2, 2.0), (9, 1.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 0);
+}
+
+#[test]
 fn mismatches_count_duplicate_ids_in_candidate() {
     let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
     // 長さは一致するが id=1 が重複しており id=3 が欠けている → 重複 1 件。
