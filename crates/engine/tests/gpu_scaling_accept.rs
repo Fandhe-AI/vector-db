@@ -169,6 +169,14 @@ fn mismatches_count_missing_hits_when_candidate_is_shorter_than_baseline() {
     assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 2);
 }
 
+#[test]
+fn mismatches_count_duplicate_ids_in_candidate() {
+    let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
+    // 長さは一致するが id=1 が重複しており id=3 が欠けている → 重複 1 件。
+    let candidate = vec![(1u64, 3.0f32), (1, 3.0), (2, 2.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+}
+
 // ---------------------------------------------------------------------
 // 出力整形
 // ---------------------------------------------------------------------

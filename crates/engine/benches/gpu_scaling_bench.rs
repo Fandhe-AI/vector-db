@@ -46,7 +46,7 @@ use harness::gpu_scaling::{
     parse_dims, parse_measured_iterations, parse_rows, parse_top_k, read_env_var, speedup_ratio,
     GpuScalingResult,
 };
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run_fallible, MeasurementConfig, TrialFailure};
 use harness::rng::DeterministicRng;
 
 use engine::batch_fallback::BatchBackend;
@@ -442,9 +442,25 @@ fn main() {
                     }
                 };
 
-                let cpu_measurement = run(&measure_config, || cpu_engine.batch_search(&queries));
-                let f16_measurement = run(&measure_config, || gpu_f16.batch_search(&queries));
-                let f32_measurement = run(&measure_config, || gpu_f32.batch_search(&queries));
+                // 各試行の `batch_search` が `Err` を返した場合（事前確認後の GPU 転送
+                // 失敗等）は失敗処理の所要時間を正常サンプルに混ぜず、`Fatal` として
+                // この規模点の計測失敗へ伝播する（除外・埋め合わせはしない）。
+                fn fatal<E>(_: &E) -> TrialFailure {
+                    TrialFailure::Fatal
+                }
+                let cpu_measurement = run_fallible(
+                    &measure_config,
+                    0,
+                    || cpu_engine.batch_search(&queries),
+                    fatal,
+                )
+                .map(|m| m.measurement);
+                let f16_measurement =
+                    run_fallible(&measure_config, 0, || gpu_f16.batch_search(&queries), fatal)
+                        .map(|m| m.measurement);
+                let f32_measurement =
+                    run_fallible(&measure_config, 0, || gpu_f32.batch_search(&queries), fatal)
+                        .map(|m| m.measurement);
 
                 let (cpu_measurement, f16_measurement, f32_measurement) =
                     match (cpu_measurement, f16_measurement, f32_measurement) {
