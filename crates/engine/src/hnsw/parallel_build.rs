@@ -40,14 +40,104 @@
 //! ロック poison はいずれも [`super::HnswError::WorkerPanicked`] へ変換し、
 //! 部分的に結線された索引を `Ok` で返さない。
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::Instant;
 
 use super::{
     assign_level, compute_shrink, max_degree_for, node_vector, score_of,
-    select_neighbors_heuristic_free, DeterministicRng, HnswError, HnswIndex, HnswParams, Node,
-    ScoredNode, VisitedScratch,
+    select_neighbors_heuristic_free, DeterministicRng, HnswBuildProfile, HnswError, HnswIndex,
+    HnswParams, HnswWorkerStats, Node, ScoredNode, VisitedScratch,
 };
+
+thread_local! {
+    /// 現在のスレッドが [`BuildGraph::read_links`]／[`BuildGraph::write_links`]
+    /// へ行った取得試行の内訳（`(blocked, acquired)`。Issue #406 追記:
+    /// 8→12 スレッド頭打ち要因の切り分け計測）。`BuildGraph::observe` が
+    /// `false` の呼び出し（`build_parallel_graph` が使う非観測 production
+    /// 経路）は [`BuildGraph::read_links`]／[`BuildGraph::write_links`] が
+    /// この TLS に一切触れない分岐へ入るため、非観測経路には計装の影響
+    /// （`try_read`/`try_write` → block の二段化・TLS 書き込み）が及ばない
+    /// （レビュー指摘 P1-A の修正。修正前は経路を問わず常に加算していた）。
+    /// `observe == true`（[`build_parallel_graph_observed`]）の場合のみ
+    /// 加算され、ワーカー終了直前に [`read_worker_lock_stats`] で読む。
+    static LINK_LOCK_STATS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// 現在のスレッドが [`BuildGraph::read_links`]／[`BuildGraph::write_links`]
+    /// でブロックする取得（`try_read`/`try_write` の `WouldBlock` 後の
+    /// `read()`／`write()`）に落ちたときのみ累積する、ロックが実際に取れる
+    /// までの待ち時間（[`HnswWorkerStats::link_lock_wait`] のドキュメンテー
+    /// ションコメント参照。codex-review P2 指摘・PR #445）。
+    static LINK_LOCK_WAIT: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::ZERO) };
+    /// 現在のスレッドが [`BuildGraph::try_promote_entry`] で実際にエントリ
+    /// ポイントを更新した回数。`observe == true` の場合のみ加算される
+    /// （用途・非観測経路への非影響は上記と同様）。
+    static ENTRY_PROMOTION_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// [`LINK_LOCK_STATS`] へ 1 回分の取得試行を記録する（`observe == true` の
+/// 呼び出し元からのみ呼ばれる）。`blocked`: `try_read`／`try_write` が
+/// `WouldBlock` を返しブロックする取得へ落ちたか。poison 検出時（呼び出し元が
+/// `Err(HnswError::WorkerPanicked)` を返す分岐）も「取得を試みた」事実として
+/// `blocked=false` で記録する（レビュー指摘 P2: 修正前は poison 分岐が未計上
+/// で `link_lock_acquired` が過小になり得た）。
+fn record_lock_attempt(blocked: bool) {
+    LINK_LOCK_STATS.with(|cell| {
+        let (blocked_count, acquired_count) = cell.get();
+        cell.set((
+            blocked_count.saturating_add(u64::from(blocked)),
+            acquired_count.saturating_add(1),
+        ));
+    });
+}
+
+/// [`LINK_LOCK_WAIT`] へブロックする取得 1 回分の待ち時間を加算する
+/// （`record_lock_attempt(true)` と対になる呼び出し元からのみ呼ばれる）。
+fn record_lock_wait(duration: std::time::Duration) {
+    LINK_LOCK_WAIT.with(|cell| cell.set(cell.get().saturating_add(duration)));
+}
+
+/// [`ENTRY_PROMOTION_COUNT`] を 1 件加算する。
+fn record_entry_promotion() {
+    ENTRY_PROMOTION_COUNT.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// 現在のスレッドの累積ロック統計・昇格回数を読む（リセットしない）。
+/// [`build_parallel_graph_observed`] のワーカーは `thread::scope` が起動する
+/// 新規 OS スレッドであり、呼び出し前の値は常にゼロ（本関数はワーカー終了
+/// 直前に一度だけ読む前提。他スレッドの値と混ざらない）。
+fn read_worker_lock_stats() -> (u64, u64) {
+    LINK_LOCK_STATS.with(|cell| cell.get())
+}
+
+/// 現在のスレッドの累積ロック待ち時間を読む（リセットしない。
+/// [`read_worker_lock_stats`] と同じ「ワーカー終了直前に一度だけ読む」前提）。
+fn read_worker_lock_wait() -> std::time::Duration {
+    LINK_LOCK_WAIT.with(|cell| cell.get())
+}
+
+fn read_worker_entry_promotions() -> u64 {
+    ENTRY_PROMOTION_COUNT.with(|cell| cell.get())
+}
+
+/// [`LINK_LOCK_STATS`]／[`ENTRY_PROMOTION_COUNT`] を「現在この関数を呼んで
+/// いるスレッド」についてゼロへ戻す。[`build_parallel_graph_observed`] が
+/// 逐次プレフィックス挿入（呼び出し元スレッドで実行される。`observe=true`
+/// のため `insert_node_locked` 経由でこの TLS へ書き込む）を始める直前に
+/// 一度だけ呼ぶ。
+///
+/// ワーカースレッドは `thread::scope` が呼び出しのたびに新規生成する OS
+/// スレッドであり TLS は常に初期値ゼロから始まるため（[`read_worker_lock_stats`]
+/// のドキュメンテーションコメント参照）、現状ワーカー統計へ他スレッド・
+/// 他呼び出しの残留値が混入する経路は無い。本関数はその不変条件を
+/// 「呼び出し元スレッドが本モジュールの計装付き経路を過去に直接叩いていた
+/// 場合でも常に成立する」形で構造的に固定する防御的な処置であり、実際に
+/// 混入するバグを修正するものではない。
+fn reset_observation_tls() {
+    LINK_LOCK_STATS.with(|cell| cell.set((0, 0)));
+    LINK_LOCK_WAIT.with(|cell| cell.set(std::time::Duration::ZERO));
+    ENTRY_PROMOTION_COUNT.with(|cell| cell.set(0));
+}
 
 /// 並列構築中の共有グラフ状態。ノード単位 `RwLock` で隣接リストを保護し、
 /// エントリポイントのみ別ロックで排他する（モジュール冒頭「ロック
@@ -59,10 +149,24 @@ struct BuildGraph {
     levels: Vec<usize>,
     links: Vec<RwLock<Vec<Vec<u32>>>>,
     entry: RwLock<Option<u32>>,
+    /// `true` のとき [`Self::read_links`]／[`Self::write_links`]／
+    /// [`Self::try_promote_entry`] が計装（`try_read`/`try_write` → block の
+    /// 二段取得・TLS への統計記録）を行う（[`build_parallel_graph_observed`]
+    /// が使う）。`false`（[`build_parallel_graph`] が使う production 経路）
+    /// では計装を一切経由しない直接 `.read()`／`.write()` 呼び出しになり、
+    /// 計装導入前と挙動が完全に同一であることを構造的に保証する
+    /// （レビュー指摘 P1-A）。
+    observe: bool,
 }
 
 impl BuildGraph {
-    fn new(params: HnswParams, dim: usize, vectors: Arc<[f32]>, levels: Vec<usize>) -> Self {
+    fn new(
+        params: HnswParams,
+        dim: usize,
+        vectors: Arc<[f32]>,
+        levels: Vec<usize>,
+        observe: bool,
+    ) -> Self {
         let links = levels
             .iter()
             .map(|&level| RwLock::new(vec![Vec::new(); level + 1]))
@@ -74,6 +178,7 @@ impl BuildGraph {
             levels,
             links,
             entry: RwLock::new(None),
+            observe,
         }
     }
 
@@ -81,20 +186,72 @@ impl BuildGraph {
         self.levels.len()
     }
 
+    /// ノード `node` の隣接リストへの読み取りロックを取得する。
+    ///
+    /// `self.observe == false`（[`build_parallel_graph`] の production 経路）
+    /// では計装を一切経由せず直接 `.read()` を呼ぶ——計装導入前と完全に
+    /// 同一の取得方法・poison 判定になる（レビュー指摘 P1-A）。
+    ///
+    /// `self.observe == true`（[`build_parallel_graph_observed`]）の場合のみ、
+    /// まず `try_read` を試み、成功すればブロックなしの取得として記録し、
+    /// `WouldBlock` の場合のみブロックする `read()` へ二段目として落ちる。
+    /// この二段化はロック待ち時間の計測精度のためのものであり、production
+    /// 経路（`observe == false`）に対して「厳密にロック取得順序・待ち時間が
+    /// 同一」であることは主張しない（取得結果・poison 判定のみ同一）。
     fn read_links(&self, node: u32) -> Result<RwLockReadGuard<'_, Vec<Vec<u32>>>, HnswError> {
-        self.links
+        let lock = self
+            .links
             .get(node as usize)
-            .ok_or(HnswError::CapacityOverflow)?
-            .read()
-            .map_err(|_| HnswError::WorkerPanicked)
+            .ok_or(HnswError::CapacityOverflow)?;
+        if !self.observe {
+            return lock.read().map_err(|_| HnswError::WorkerPanicked);
+        }
+        match lock.try_read() {
+            Ok(guard) => {
+                record_lock_attempt(false);
+                Ok(guard)
+            }
+            Err(TryLockError::WouldBlock) => {
+                record_lock_attempt(true);
+                let wait_start = Instant::now();
+                let result = lock.read().map_err(|_| HnswError::WorkerPanicked);
+                record_lock_wait(wait_start.elapsed());
+                result
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                record_lock_attempt(false);
+                Err(HnswError::WorkerPanicked)
+            }
+        }
     }
 
+    /// [`Self::read_links`] の書き込みロック版。`observe` による分岐・
+    /// 二段取得の契約は同一。
     fn write_links(&self, node: u32) -> Result<RwLockWriteGuard<'_, Vec<Vec<u32>>>, HnswError> {
-        self.links
+        let lock = self
+            .links
             .get(node as usize)
-            .ok_or(HnswError::CapacityOverflow)?
-            .write()
-            .map_err(|_| HnswError::WorkerPanicked)
+            .ok_or(HnswError::CapacityOverflow)?;
+        if !self.observe {
+            return lock.write().map_err(|_| HnswError::WorkerPanicked);
+        }
+        match lock.try_write() {
+            Ok(guard) => {
+                record_lock_attempt(false);
+                Ok(guard)
+            }
+            Err(TryLockError::WouldBlock) => {
+                record_lock_attempt(true);
+                let wait_start = Instant::now();
+                let result = lock.write().map_err(|_| HnswError::WorkerPanicked);
+                record_lock_wait(wait_start.elapsed());
+                result
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                record_lock_attempt(false);
+                Err(HnswError::WorkerPanicked)
+            }
+        }
     }
 
     /// 層 `level` におけるノード `node` の隣接 id 集合をロック下で複製して
@@ -151,6 +308,9 @@ impl BuildGraph {
         };
         if should_update {
             *guard = Some(node_id);
+            if self.observe {
+                record_entry_promotion();
+            }
         }
         Ok(())
     }
@@ -391,7 +551,7 @@ pub(crate) fn build_parallel_graph(
     let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, params.m)).collect();
 
     let owned_vectors: Arc<[f32]> = Arc::from(vectors);
-    let graph = BuildGraph::new(params, dim_usize, owned_vectors.clone(), levels);
+    let graph = BuildGraph::new(params, dim_usize, owned_vectors.clone(), levels, false);
 
     let prefix_end = super::SEQUENTIAL_PREFIX_NODES.min(n);
     let mut seq_visited = VisitedScratch::default();
@@ -466,17 +626,175 @@ pub(crate) fn build_parallel_graph(
     freeze(graph, params, dim, vectors, dim_usize, owned_vectors)
 }
 
-/// 並列フェーズ完了後の `BuildGraph` を [`super::HnswIndex`] へ凍結する。
+/// [`super::HnswIndex::build_with_threads_observed`] から呼ばれる、
+/// [`build_parallel_graph`] と段の区切りを揃えた観測版（Issue #406 追記:
+/// 8→12 スレッド頭打ち要因の切り分け計測）。
+///
+/// アルゴリズム本体（レベル割当・逐次プレフィックス挿入・ワークスティール
+/// 並列挿入・凍結・修復）は [`build_parallel_graph`] と共有する関数
+/// （`insert_node_locked`・`assemble_graph`・`HnswIndex::repair_reachability`）
+/// をそのまま呼ぶ。各段の前後に `Instant::now()` を置いて壁時間を記録する点、
+/// ワーカー closure の戻り値を [`HnswWorkerStats`] にする点に加えて、
+/// `BuildGraph::new` へ `observe=true` を渡すことでノードロック取得を
+/// `try_read`/`try_write` → block の二段化にしロック統計を TLS へ記録する
+/// （`BuildGraph::observe` のドキュメンテーションコメント参照。レビュー
+/// 指摘 P1-A の修正により、この二段化・TLS 記録は本関数からのみ有効になり
+/// [`build_parallel_graph`] には一切波及しない）。したがって「アルゴリズム
+/// 本体を共有する」とは主張できても、ロック取得順序・待ち時間まで
+/// [`build_parallel_graph`] と厳密に同一であるとは主張しない
+/// （[`super::HnswIndex::build_with_threads_observed`] のドキュメンテーション
+/// コメントも参照）。エラー分岐（`WorkerPanicked` の判定・`first_error` の
+/// 伝播）のロジックは完全に同一。
+pub(crate) fn build_parallel_graph_observed(
+    params: HnswParams,
+    dim: u32,
+    vectors: &[f32],
+    seed: u64,
+    threads: usize,
+    n: usize,
+) -> Result<(HnswIndex, HnswBuildProfile), HnswError> {
+    // 呼び出し元スレッドの TLS 統計を必ずゼロから始める（`reset_observation_tls`
+    // のドキュメンテーションコメント参照。逐次プレフィックス挿入はこの直後に
+    // 呼び出し元スレッドで実行される）。
+    reset_observation_tls();
+
+    let dim_usize = dim as usize;
+
+    let level_assign_start = Instant::now();
+    let mut rng = DeterministicRng::new(seed);
+    let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, params.m)).collect();
+    let level_assign = level_assign_start.elapsed();
+
+    let owned_vectors: Arc<[f32]> = Arc::from(vectors);
+    let graph = BuildGraph::new(params, dim_usize, owned_vectors.clone(), levels, true);
+
+    let prefix_start = Instant::now();
+    let prefix_end = super::SEQUENTIAL_PREFIX_NODES.min(n);
+    let mut seq_visited = VisitedScratch::default();
+    for node_idx in 0..prefix_end {
+        let node_id = node_idx as u32;
+        if node_idx == 0 {
+            graph.try_promote_entry(node_id, graph.levels[0])?;
+            continue;
+        }
+        insert_node_locked(&graph, node_id, &mut seq_visited)?;
+    }
+    let sequential_prefix = prefix_start.elapsed();
+
+    let next = AtomicUsize::new(prefix_end);
+    let stop = AtomicBool::new(false);
+    let first_error: Mutex<Option<HnswError>> = Mutex::new(None);
+
+    let parallel_start = Instant::now();
+    // 全ハンドルを必ず join してから判定する（[`build_parallel_graph`] と
+    // 同一の失敗契約）。各ワーカーはループ全体の壁時間・挿入件数・ロック
+    // 統計・エントリ昇格回数を [`HnswWorkerStats`] として戻り値で返す
+    // （共有 atomic ではなくワーカーローカルに集計する。モジュール冒頭
+    // `LINK_LOCK_STATS`／`ENTRY_PROMOTION_COUNT` のドキュメンテーション
+    // コメント参照）。
+    let (any_panicked, workers) = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let graph_ref = &graph;
+            let next_ref = &next;
+            let stop_ref = &stop;
+            let first_error_ref = &first_error;
+            handles.push(scope.spawn(move || -> HnswWorkerStats {
+                let busy_start = Instant::now();
+                let mut visited = VisitedScratch::default();
+                let mut inserted_nodes: u64 = 0;
+                loop {
+                    if stop_ref.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let i = next_ref.fetch_add(1, Ordering::SeqCst);
+                    if i >= n {
+                        break;
+                    }
+                    let node_id = i as u32;
+                    match insert_node_locked(graph_ref, node_id, &mut visited) {
+                        Ok(()) => inserted_nodes = inserted_nodes.saturating_add(1),
+                        Err(e) => {
+                            let mut fe = first_error_ref
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            if fe.is_none() {
+                                *fe = Some(e);
+                            }
+                            stop_ref.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                let busy = busy_start.elapsed();
+                let (link_lock_blocked, link_lock_acquired) = read_worker_lock_stats();
+                let link_lock_wait = read_worker_lock_wait();
+                let entry_promotions = read_worker_entry_promotions();
+                HnswWorkerStats {
+                    inserted_nodes,
+                    busy,
+                    link_lock_blocked,
+                    link_lock_acquired,
+                    link_lock_wait,
+                    entry_promotions,
+                }
+            }));
+        }
+        let mut any_panicked = false;
+        let mut workers = Vec::with_capacity(threads);
+        for h in handles {
+            match h.join() {
+                Ok(stats) => workers.push(stats),
+                Err(_) => any_panicked = true,
+            }
+        }
+        (any_panicked, workers)
+    });
+    let parallel_phase = parallel_start.elapsed();
+
+    if any_panicked {
+        return Err(HnswError::WorkerPanicked);
+    }
+    if let Some(e) = first_error
+        .into_inner()
+        .unwrap_or_else(|poison| poison.into_inner())
+    {
+        return Err(e);
+    }
+
+    let freeze_start = Instant::now();
+    let mut index = assemble_graph(graph, params, dim, owned_vectors)?;
+    let freeze = freeze_start.elapsed();
+
+    let repair_start = Instant::now();
+    index.repair_reachability(dim_usize, vectors)?;
+    let repair_reachability = repair_start.elapsed();
+
+    let profile = HnswBuildProfile {
+        level_assign,
+        sequential_prefix,
+        parallel_phase,
+        freeze,
+        repair_reachability,
+        // `total` は呼び出し元（`HnswIndex::build_with_threads_observed`）が
+        // 検証・エラー分岐を含む呼び出し全体で計測し直して埋める。
+        total: std::time::Duration::ZERO,
+        workers,
+    };
+    Ok((index, profile))
+}
+
+/// 並列フェーズ完了後の `BuildGraph` を [`super::HnswIndex`] の内部表現へ
+/// 組み立て直す（`repair_reachability` を呼ばない構造的な組み立てのみ。
+/// Issue #406 追記で [`build_parallel_graph_observed`] が「凍結」段と
+/// 「修復」段の壁時間を分けて計測できるよう [`freeze`] から切り出した——
+/// [`freeze`] の外部から見た挙動はこの切り出し前後で変わらない）。
 /// 各ノードの `RwLock` を `into_inner` で消費し（`Vec<Node>` への再コピー
-/// なし）、最後に既存の逐次後始末（`repair_reachability`。並列フェーズが
-/// 生みうる上位層の到達不能ノードを閉じる。モジュール冒頭「決定性の範囲」
-/// 節参照）を実行する。
-fn freeze(
+/// なし）。
+fn assemble_graph(
     graph: BuildGraph,
     params: HnswParams,
     dim: u32,
-    original_vectors: &[f32],
-    dim_usize: usize,
     owned_vectors: Arc<[f32]>,
 ) -> Result<HnswIndex, HnswError> {
     let entry_point = graph
@@ -491,13 +809,28 @@ fn freeze(
         nodes.push(Node { level, links });
     }
 
-    let mut index = HnswIndex {
+    Ok(HnswIndex {
         params,
         dim,
         nodes,
         entry_point,
         vectors: owned_vectors,
-    };
+    })
+}
+
+/// 並列フェーズ完了後の `BuildGraph` を [`super::HnswIndex`] へ凍結する
+/// ([`assemble_graph`] による構造的な組み立て)。最後に既存の逐次後始末
+/// （`repair_reachability`。並列フェーズが生みうる上位層の到達不能ノードを
+/// 閉じる。モジュール冒頭「決定性の範囲」節参照）を実行する。
+fn freeze(
+    graph: BuildGraph,
+    params: HnswParams,
+    dim: u32,
+    original_vectors: &[f32],
+    dim_usize: usize,
+    owned_vectors: Arc<[f32]>,
+) -> Result<HnswIndex, HnswError> {
+    let mut index = assemble_graph(graph, params, dim, owned_vectors)?;
     index.repair_reachability(dim_usize, original_vectors)?;
     Ok(index)
 }
@@ -529,7 +862,7 @@ mod tests {
         let dim = 4usize;
         let vectors: Vec<f32> = vec![0.0; dim * 3];
         let owned: Arc<[f32]> = Arc::from(vectors.as_slice());
-        let graph = BuildGraph::new(params, dim, owned.clone(), vec![0, 0, 0]);
+        let graph = BuildGraph::new(params, dim, owned.clone(), vec![0, 0, 0], false);
 
         // 意図的にロック保持中に panic させ poison を作る（`catch_unwind` で
         // テストプロセス自体を落とさずに済ませる）。
@@ -604,5 +937,405 @@ mod tests {
         for node in 0..rows as u32 {
             assert_eq!(sequential.level_of(node), parallel.level_of(node));
         }
+    }
+
+    // --------------------------------------------------
+    // Issue #406 レビュー指摘 P1-B: `build_with_threads_observed` の契約テスト
+    // （縮退経路の完全一致・並列経路のワーカー統計整合・エラー契約の共有）
+    // --------------------------------------------------
+
+    fn normalize(v: &mut [f32]) {
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in v.iter_mut() {
+                *x /= norm;
+            }
+        }
+    }
+
+    /// `tests/hnsw_search.rs::gen_clustered_corpus` と同じ発想の、緩い
+    /// クラスタ構造を持つ L2 正規化済み決定的コーパス（`src` 内部テストは
+    /// crate 内部の `DeterministicRng` のみを使う流儀のため独立に複製する）。
+    fn gen_clustered_corpus(seed: u64, dim: usize, rows: usize, clusters: usize) -> Vec<f32> {
+        let mut center_rng = DeterministicRng::new(seed ^ 0xC1C1_C1C1_C1C1_C1C1);
+        let next_unit = |rng: &mut DeterministicRng| -> f32 {
+            let bits = rng.next_u64() >> 40;
+            (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+            .map(|_| (0..dim).map(|_| next_unit(&mut center_rng)).collect())
+            .collect();
+        let mut rng = DeterministicRng::new(seed);
+        let mut out = Vec::with_capacity(rows * dim);
+        for i in 0..rows {
+            let center = &centers[i % centers.len()];
+            let mut v: Vec<f32> = center
+                .iter()
+                .map(|c| c + next_unit(&mut rng) * 0.2)
+                .collect();
+            normalize(&mut v);
+            out.extend(v);
+        }
+        out
+    }
+
+    fn gen_queries(seed: u64, dim: usize, clusters: usize, count: usize) -> Vec<Vec<f32>> {
+        let mut center_rng = DeterministicRng::new(seed ^ 0xC1C1_C1C1_C1C1_C1C1);
+        let next_unit = |rng: &mut DeterministicRng| -> f32 {
+            let bits = rng.next_u64() >> 40;
+            (bits as f32) / (1u32 << 24) as f32 * 2.0 - 1.0
+        };
+        let centers: Vec<Vec<f32>> = (0..clusters.max(1))
+            .map(|_| (0..dim).map(|_| next_unit(&mut center_rng)).collect())
+            .collect();
+        (0..count)
+            .map(|i| {
+                let mut rng = DeterministicRng::new(seed.wrapping_add(i as u64 + 1));
+                let center = &centers[i % centers.len()];
+                let mut v: Vec<f32> = center
+                    .iter()
+                    .map(|c| c + next_unit(&mut rng) * 0.2)
+                    .collect();
+                normalize(&mut v);
+                v
+            })
+            .collect()
+    }
+
+    /// brute-force（`CpuScalarProvider`。production の総当たりカーネル）対照で
+    /// Recall@10 を計測する（`tests/hnsw_search.rs::recall_at_10` と同じ発想）。
+    fn recall_at_10(
+        index: &PubHnswIndex,
+        vectors: &[f32],
+        dim: usize,
+        rows: usize,
+        ef: usize,
+        queries: &[Vec<f32>],
+    ) -> f64 {
+        use crate::hnsw::HnswSearchScratch;
+        use crate::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+        use std::collections::HashSet;
+
+        let ids: Vec<u64> = (0..rows as u64).collect();
+        let provider = CpuScalarProvider;
+        let mut scratch = HnswSearchScratch::default();
+        let mut hits_total = 0usize;
+        for query in queries {
+            let brute = provider
+                .search(SearchInput {
+                    ids: &ids,
+                    vectors,
+                    dim: dim as u32,
+                    query,
+                    k: 10,
+                })
+                .expect("brute-force search must succeed");
+            let brute_ids: HashSet<u64> = brute.iter().map(|h| h.id).collect();
+
+            let hnsw = index
+                .search(query, 10, ef, &mut scratch)
+                .expect("hnsw search must succeed");
+            let hit = hnsw.iter().filter(|h| brute_ids.contains(&h.id)).count();
+            hits_total += hit;
+        }
+        hits_total as f64 / (queries.len() as f64 * 10.0)
+    }
+
+    /// 縮退経路（`n <= SEQUENTIAL_PREFIX_NODES`）では `build_with_threads_observed`
+    /// が `build` と完全に同一のグラフを返し、`workers` が空・`parallel_phase`
+    /// がゼロであることを確認する（レビュー指摘 P1-B）。
+    #[test]
+    fn build_with_threads_observed_degenerate_path_matches_build_exactly() {
+        let dim = 4usize;
+        let rows = 100usize; // < SEQUENTIAL_PREFIX_NODES(256)
+        let vectors = gen_corpus(0xAAAA, dim, rows);
+        let params = HnswParams::default();
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, 3).unwrap();
+        let (observed, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, 3, 4).unwrap();
+
+        assert_eq!(sequential.entry_point(), observed.entry_point());
+        assert_eq!(sequential.max_level(), observed.max_level());
+        for node in 0..rows as u32 {
+            assert_eq!(sequential.level_of(node), observed.level_of(node));
+            let seq_level = sequential.level_of(node).unwrap();
+            for level in 0..=seq_level {
+                assert_eq!(
+                    sequential.neighbors(level, node),
+                    observed.neighbors(level, node),
+                    "node={node} level={level}"
+                );
+            }
+        }
+        assert!(profile.workers.is_empty());
+        assert_eq!(profile.parallel_phase, std::time::Duration::ZERO);
+        assert!(profile.sequential_prefix > std::time::Duration::ZERO || rows == 0);
+        assert!(profile.total >= profile.sequential_prefix);
+    }
+
+    /// 並列経路（`threads >= 2` かつ `n > SEQUENTIAL_PREFIX_NODES`）では、
+    /// ワーカー統計の内訳（挿入件数の合計・ロック統計の整合・段別壁時間の
+    /// 内訳）が非 vacuous であり、既定エンジン対照 Recall@10 が逐次構築と
+    /// 同水準（`tests/hnsw_search.rs::parallel_build_recall_at_10_matches_
+    /// sequential_build_within_margin` と同じ `-0.02` マージン）であることを
+    /// 確認する（レビュー指摘 P1-B）。
+    #[test]
+    fn build_with_threads_observed_parallel_path_reports_consistent_worker_stats() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let clusters = 20usize;
+        let vectors = gen_clustered_corpus(0xB0B0_1234, dim, rows, clusters);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let seed = 0x1122_3344_5566;
+        let threads = 4usize;
+
+        let sequential = PubHnswIndex::build(params, dim as u32, &vectors, seed).unwrap();
+        let (observed, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+
+        assert_eq!(profile.workers.len(), threads);
+        let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+        assert_eq!(
+            total_inserted,
+            (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64
+        );
+        for w in &profile.workers {
+            assert!(w.link_lock_blocked <= w.link_lock_acquired);
+            // ロック待ち時間はワーカーループ全体の壁時間（`busy`）の内訳の
+            // 一部であり、これを超えることはない（codex-review P2 指摘・
+            // PR #445）。
+            assert!(
+                w.link_lock_wait <= w.busy,
+                "link_lock_wait={:?} busy={:?}",
+                w.link_lock_wait,
+                w.busy
+            );
+        }
+        let total_acquired: u64 = profile.workers.iter().map(|w| w.link_lock_acquired).sum();
+        assert!(total_acquired > 0);
+        assert!(
+            profile.total
+                >= profile.level_assign
+                    + profile.sequential_prefix
+                    + profile.parallel_phase
+                    + profile.freeze
+                    + profile.repair_reachability
+        );
+
+        let queries = gen_queries(0x51DE_0007, dim, clusters, 100);
+        for ef in [64usize, 256] {
+            let seq_recall = recall_at_10(&sequential, &vectors, dim, rows, ef, &queries);
+            let obs_recall = recall_at_10(&observed, &vectors, dim, rows, ef, &queries);
+            assert!(
+                obs_recall >= seq_recall - 0.02,
+                "ef={ef} observed Recall@10={obs_recall} must be within 0.02 of \
+                 sequential Recall@10={seq_recall}"
+            );
+        }
+    }
+
+    /// `threads==0`／`threads > MAX_BUILD_THREADS`・非有限値のエラー契約が
+    /// `build_with_threads` と同一の variant を返すことを確認する
+    /// （レビュー指摘 P1-B）。
+    #[test]
+    fn build_with_threads_observed_shares_error_contract_with_build_with_threads() {
+        let params = HnswParams::default();
+        let vectors = gen_corpus(1, 4, 10);
+        assert!(matches!(
+            PubHnswIndex::build_with_threads_observed(params, 4, &vectors, 1, 0).unwrap_err(),
+            HnswError::InvalidParams { .. }
+        ));
+        assert!(matches!(
+            PubHnswIndex::build_with_threads_observed(
+                params,
+                4,
+                &vectors,
+                1,
+                MAX_BUILD_THREADS + 1
+            )
+            .unwrap_err(),
+            HnswError::InvalidParams { .. }
+        ));
+
+        let mut bad_vectors = gen_corpus(2, 4, 300);
+        bad_vectors[0] = f32::NAN;
+        assert_eq!(
+            PubHnswIndex::build_with_threads(params, 4, &bad_vectors, 1, 4).unwrap_err(),
+            PubHnswIndex::build_with_threads_observed(params, 4, &bad_vectors, 1, 4).unwrap_err()
+        );
+
+        assert_eq!(
+            PubHnswIndex::build_with_threads(params, 3, &vectors, 1, 4).unwrap_err(),
+            PubHnswIndex::build_with_threads_observed(params, 3, &vectors, 1, 4).unwrap_err()
+        );
+    }
+
+    // --------------------------------------------------
+    // `LINK_LOCK_STATS`／`ENTRY_PROMOTION_COUNT`（thread_local!）が呼び出し間・
+    // スレッド間で混入しないことの固定テスト。
+    // --------------------------------------------------
+
+    /// `assign_level` を用いて実装（[`build_parallel_graph_observed`]）と同じ
+    /// 手順でレベル列を再現し、並列フェーズでのエントリ昇格回数の期待値を
+    /// 独立に計算し直す。
+    ///
+    /// エントリ昇格は「現在のエントリレベルより高いレベルのノードが現れた
+    /// ときのみ発生する」ため、逐次プレフィックス終了時点の最大レベルを
+    /// `l_prefix` とすると、並列フェーズ側で `l_prefix` を上回る**相異なる**
+    /// レベル値の個数が 0 個ならば並列フェーズでの昇格は必ず 0 回、1 個
+    /// ならば（その値を持つノードが複数あっても最初の 1 件だけが成功する
+    /// ため）必ず 1 回になり、いずれもワークスティールの完了順序に依存
+    /// しない絶対値になる（2 個以上だと実際の完了順序に依存し非決定的に
+    /// なり得るため、本ヘルパーで事前に fixture 側から除外する）。
+    fn expected_entry_promotions(seed: u64, m: usize, n: usize) -> u64 {
+        let mut rng = DeterministicRng::new(seed);
+        let levels: Vec<usize> = (0..n).map(|_| assign_level(&mut rng, m)).collect();
+        let prefix_end = super::super::SEQUENTIAL_PREFIX_NODES.min(n);
+        let l_prefix = levels[..prefix_end].iter().copied().max().unwrap_or(0);
+        let mut distinct: Vec<usize> = levels[prefix_end..]
+            .iter()
+            .copied()
+            .filter(|&level| level > l_prefix)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        distinct.len() as u64
+    }
+
+    /// `expected_entry_promotions` が完了順序非依存で確定する（`<= 1`）
+    /// fixture を、決定的な seed の探索で見つける。見つからない場合は
+    /// テスト fixture 自体の不備として明示的に panic させる
+    /// （vacuous pass 防止）。
+    fn find_deterministic_promotion_seed(base: u64, m: usize, n: usize) -> (u64, u64) {
+        for candidate in 0..500u64 {
+            let seed = base ^ candidate;
+            let expected = expected_entry_promotions(seed, m, n);
+            if expected <= 1 {
+                return (seed, expected);
+            }
+        }
+        panic!("failed to find a seed with a deterministic (<=1) parallel-phase promotion count");
+    }
+
+    /// 同一スレッドで `build_with_threads_observed` を連続 2 回呼んでも、
+    /// 前回呼び出しの残留値がワーカー統計（挿入件数合計・ロック統計・
+    /// エントリ昇格回数）へ混入しないことを固定する。
+    ///
+    /// `Σ entry_promotions` はワークスティールの完了順序に依存し得る値
+    /// なので「1 回目 == 2 回目」の比較だけでは非決定性由来の偶然一致とも
+    /// 区別できない。そこで `expected_entry_promotions` で完了順序非依存に
+    /// 確定する fixture を選び、両回とも**その絶対値**と一致することまで
+    /// 検証する（TLS 混入があれば絶対値からずれて検出できる）。
+    #[test]
+    fn build_with_threads_observed_repeated_calls_do_not_leak_tls_across_calls() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let m = 8usize;
+        let params = HnswParams {
+            m,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let threads = 4usize;
+
+        let (seed, expected) = find_deterministic_promotion_seed(0x9E37_79B9_0000_0000u64, m, rows);
+        let vectors = gen_clustered_corpus(seed, dim, rows, 20);
+
+        let assert_profile = |profile: &HnswBuildProfile, label: &str| {
+            assert_eq!(profile.workers.len(), threads, "{label}: workers.len()");
+            let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+            assert_eq!(
+                total_inserted,
+                (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64,
+                "{label}: Σ inserted_nodes"
+            );
+            for w in &profile.workers {
+                assert!(
+                    w.link_lock_blocked <= w.link_lock_acquired,
+                    "{label}: link_lock_blocked <= link_lock_acquired"
+                );
+            }
+            let total_promotions: u64 = profile.workers.iter().map(|w| w.entry_promotions).sum();
+            assert_eq!(
+                total_promotions, expected,
+                "{label}: Σ entry_promotions が期待値（完了順序非依存の絶対値）と \
+                 一致しない（呼び出し元スレッドの TLS 残値混入の疑い）"
+            );
+        };
+
+        let (_, profile1) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+        assert_profile(&profile1, "call1");
+
+        let (_, profile2) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+        assert_profile(&profile2, "call2");
+    }
+
+    /// 呼び出し元スレッド（このテスト関数自身のスレッド）の TLS 統計を
+    /// 意図的に大きな値へ汚してから `build_with_threads_observed` を呼び、
+    /// 汚染値がワーカー統計へ一切混入しないことを固定する。
+    ///
+    /// [`build_with_threads_observed_repeated_calls_do_not_leak_tls_across_calls`]
+    /// が「自然に生じる残留（逐次プレフィックス分）が混入しないか」を見るのに
+    /// 対し、本テストは「呼び出し元スレッドの TLS に何が残っていても混入しない」
+    /// ことを不自然に大きい値で判別しやすくして直接検証する。
+    #[test]
+    fn build_with_threads_observed_worker_stats_are_unaffected_by_caller_thread_tls_pollution() {
+        let dim = 16usize;
+        let rows = super::super::SEQUENTIAL_PREFIX_NODES + 1_200;
+        let m = 8usize;
+        let params = HnswParams {
+            m,
+            ef_construction: 40,
+            ef_search: 32,
+        };
+        let threads = 4usize;
+
+        let (seed, expected) = find_deterministic_promotion_seed(0x1357_9BDF_0000_0000u64, m, rows);
+        let vectors = gen_clustered_corpus(seed, dim, rows, 20);
+
+        // 呼び出し元スレッドの TLS を、ワーカー統計に混ざれば一発で判別できる
+        // 桁の値へ汚染する。
+        const POLLUTION: u64 = 1_000_000;
+        for _ in 0..POLLUTION {
+            record_lock_attempt(true);
+        }
+        for _ in 0..POLLUTION {
+            record_entry_promotion();
+        }
+
+        let (_, profile) =
+            PubHnswIndex::build_with_threads_observed(params, dim as u32, &vectors, seed, threads)
+                .unwrap();
+
+        assert_eq!(profile.workers.len(), threads);
+        let total_inserted: u64 = profile.workers.iter().map(|w| w.inserted_nodes).sum();
+        assert_eq!(
+            total_inserted,
+            (rows - super::super::SEQUENTIAL_PREFIX_NODES) as u64
+        );
+        for w in &profile.workers {
+            assert!(
+                w.link_lock_acquired < POLLUTION,
+                "worker link_lock_acquired={} が呼び出し元スレッドの汚染値と \
+                 同オーダーになっており混入の疑いがある",
+                w.link_lock_acquired
+            );
+            assert!(w.link_lock_blocked <= w.link_lock_acquired);
+        }
+        let total_promotions: u64 = profile.workers.iter().map(|w| w.entry_promotions).sum();
+        assert_eq!(
+            total_promotions, expected,
+            "呼び出し元スレッドで汚染した entry_promotions がワーカー統計へ \
+             混入した疑い"
+        );
     }
 }

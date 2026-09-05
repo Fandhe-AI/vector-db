@@ -140,6 +140,14 @@ no-op（逐次経路との性能差は生じない）。
 | `crates/engine/tests/hnsw_search.rs` | 受け入れ条件 (a): 逐次 vs 並列（`threads=4`）の Recall@10 が `parallel >= sequential - 0.02` であることの層 A テスト、並列構築索引に対する探索決定性テスト |
 | `crates/engine/benches/hnsw_parallel_build_bench.rs`（新規） | 受け入れ条件 (b): rows（既定 100,000・`BENCH_HNSW_PARALLEL_ROWS` で上書き可）× スレッド数ラダー（既定 `[1, 2, 4, .., available_parallelism]`・`BENCH_HNSW_PARALLEL_THREADS` で上書き可）で構築時間中央値・speedup を計測する手動専用ベンチ |
 | `crates/engine/Cargo.toml`・`Makefile` | `[[bench]] name = "hnsw_parallel_build_bench"`（`harness = false`／`test = false`）・`make bench-hnsw-parallel-build` ターゲット（`ci` 非包含・CI ワークフロー非配線） |
+| `crates/engine/src/hnsw.rs`（Issue #406 追記） | 段別プロファイル観測用フック `build_with_threads_observed`（`build_with_threads` 本体は無変更） |
+| `crates/engine/benches/hnsw_parallel_build_bench.rs`（Issue #406 追記） | 段別内訳（`level`／`prefix`／`parallel`／`freeze`／`repair`）・ワーカー統計（`inserted`／`busy`／`lock_blocked_ratio`／`entry_promotions`）・対照負荷 `dot_scan` の計測を追加 |
+| `crates/engine/benches/harness/hnsw_parallel_profile.rs`（新規・Issue #406 追記） | 段別内訳・ワーカー統計・対照負荷の計測ハーネス |
+| `crates/engine/benches/hnsw_compare_bench.rs`（新規・Issue #406 追記） | usearch（`=2.26.1`）との構築時間・Recall@10・探索レイテンシ比較。手動専用（`make bench-hnsw-compare`） |
+| `crates/engine/benches/harness/hnsw_compare.rs`（新規・Issue #406 追記） | usearch 比較の計測ハーネス（パラメータ等価表・並列 add 方式） |
+| `crates/engine/tests/hnsw_parallel_profile_accept.rs`（新規・Issue #406 追記） | 段別プロファイル観測用フックの受け入れテスト |
+| `crates/engine/tests/hnsw_compare_accept.rs`（新規・Issue #406 追記） | usearch 比較ハーネスの受け入れテスト |
+| `Makefile`（Issue #406 追記） | `make bench-hnsw-compare` ターゲット（`ci` 非包含・CI ワークフロー非配線） |
 
 ## 検証
 
@@ -186,11 +194,13 @@ dim=64・既定パラメータ。各点 warmup 20 回・計測 20 回の中央�
 100k 点でもスレッド数に応じて構築時間が短縮することを確認した（受け入れ
 条件 (b)。実装時点の `threads=1` 基準点 11,707.7 ms とも同水準）。
 speedup は 4 スレッドまでほぼ線形（3.1〜3.5x）で、8→12 スレッドでは
-2 回とも約 2.1 s に収束し、伸びが頭打ちになる。頭打ちの要因として、
-凍結後に単一スレッドで走る `repair_reachability`（本タスクの範囲外）の
-相対比重の増加と、`SEQUENTIAL_PREFIX_NODES` 分の逐次プレフィックス構築、
-および 12 論理コア（物理コアは半数）での SMT 分の実効並列度の低さが
-考えられるが、段別の内訳は計測していない（「スコープ外・申し送り」節）。
+2 回とも約 2.1 s に収束し、伸びが頭打ちになる。頭打ちの要因の段別内訳は
+下記「Issue #406 追記（2026-09-05）」節で実測した（`repair_reachability`
+の単一スレッド後始末が支配的で、当初の推定にあった「12 論理コア
+（物理コアは半数）での SMT」という記述は、ゲスト内 `lscpu` が
+`Thread(s) per core: 1` を報告しており誤りだったため訂正する。ホスト側の
+物理コア共有の有無はゲストから直接は観測できず、対照負荷の speedup 天井
+からの間接推定に留まる）。
 2 回の実測差（`threads=8` で 2,112 ms vs 2,548 ms）は共有環境の
 run-to-run 変動の範囲として扱い、閾値判定には用いない（本ベンチは
 情報提供専用で spec 閾値を持たない）。
@@ -202,6 +212,237 @@ run-to-run 変動の範囲として扱い、閾値判定には用いない（本
 | 1 | 263.6 ms | 1.000x |
 | 2 | 158.1 ms | 1.668x |
 | 4 | 88.0 ms | 2.995x |
+
+### Issue #406 追記（2026-09-05）: 8→12 スレッド頭打ちの段別内訳
+
+「受け入れ条件 (b)」で観測した 8→12 スレッドの伸び悩みについて、構築の
+各段（レベル割当・逐次プレフィックス・並列挿入・凍結・`repair_reachability`）
+を計測できる観測用フック `HnswIndex::build_with_threads_observed`
+（本 PR で追加。`build_with_threads` の挙動・ロック取得方式は不変で、
+計装分岐は `observe=false` の production 経路では無効）を用いて段別内訳を実測した。
+
+**計測方法修正前の実測は破棄した**（codex-review 指摘対応。以下は
+計測方法修正後の再実測のみを記載する）。
+
+計測方法の修正点は次のとおり:
+
+- 段別中央値・ワーカー統計を warmup 除外の計測 20 回のみから算出する
+  （修正前は warmup を含めていた疑いがあり除外を明示化）
+- 並列段（`parallel_speedup`）と対照負荷 `dot_scan` の speedup を同一基準
+  （threads=2）で正規化し、`parallel_vs_control` として比較可能にする
+  （修正前の「並列段の単一スレッド換算 speedup」は定義上 `dot_scan` 側と
+  基準が揃っておらず比較の妥当性が不明瞭だった）
+- usearch 比較（`make bench-hnsw-compare`）で索引の drop（解放）を
+  計測区間外へ移し、構築時間のみを比較する
+- ワーカー統計にロック累積待ち時間（`lock_wait[sum/max]`・
+  `lock_wait_share`＝Σ待ち時間÷Σbusy）を追加し、`lock_blocked_ratio`
+  （試行回数ベース）だけでは見えない競合の重みを可視化する
+- 段別中央値（`level`／`prefix`／`parallel`／`freeze`／`repair`／`total`）の
+  定義を `stats::summarize` と同じ線形補間方式へ統一する（codex-review
+  追加指摘対応。修正前は段によって中央値の算出方法が揃っておらず、
+  高負荷下では `prefix` の中央値が `total` の中央値を上回る逆転が
+  起こり得た）
+- `serial_share`（≒ `repair` の `total` に対する比率）・`total_speedup` の
+  分母を、索引の drop（解放）を含まない `HnswBuildProfile.total` の
+  中央値へ変更する（codex-review 追加指摘対応。外側 `protocol::run` が
+  計測する壁時計値は索引 drop を含み構築本体の比較には適さないため、
+  `wall_median_with_drop` として参考値に降格する）
+
+計測条件: `BENCH_HNSW_PARALLEL_THREADS=1,2,4,8,12
+make bench-hnsw-parallel-build`、rows=100,000・dim=64・既定パラメータ、
+各点 warmup 20 回・計測 20 回の中央値を 2 回実測（run5・run6。
+2026-09-05）。環境は「受け入れ条件 (b)」と同一の QEMU ゲスト
+（`lscpu`: `Thread(s) per core: 1`・1 ソケット 12 コア・L3 16 MiB・
+NUMA 1 ノード、x86_64 AVX2+FMA）。run5 は loadavg 約 2.0〜5.6 で推移し、
+run6 は threads=1 計測時のみ loadavg 7.2 とやや高いがそれ以外は
+2.0〜6.1 で推移した。中央値定義を統一した結果、`prefix <= total` が
+両回とも成立する（threads=1 の `serial_share` は run5・run6 とも 99.98%）。
+
+#### 段別内訳（run5）
+
+| threads | total | level | prefix | parallel | freeze | repair | serial_share | parallel_speedup | total_speedup | wall_median_with_drop |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9,900.758 ms | 0.000 ms | 9,898.685 ms | 0.000 ms | 0.000 ms | 0.000 ms | 99.98% | 1.000x | 1.000x | 9,907.346 ms |
+| 2 | 5,242.254 ms | 1.043 ms | 6.035 ms | 5,010.945 ms | 0.701 ms | 222.199 ms | 4.39% | 1.000x | 1.889x | 5,247.828 ms |
+| 4 | 3,051.402 ms | 1.044 ms | 6.051 ms | 2,606.770 ms | 0.586 ms | 426.828 ms | 14.24% | 1.922x | 3.245x | 3,057.302 ms |
+| 8 | 2,087.887 ms | 1.044 ms | 6.031 ms | 1,440.116 ms | 0.537 ms | 635.401 ms | 30.80% | 3.480x | 4.742x | 2,093.610 ms |
+| 12 | 2,069.589 ms | 1.045 ms | 6.056 ms | 1,245.159 ms | 0.581 ms | 808.091 ms | 39.42% | 4.024x | 4.784x | 2,075.526 ms |
+
+#### 段別内訳（run6）
+
+| threads | total | level | prefix | parallel | freeze | repair | serial_share | parallel_speedup | total_speedup | wall_median_with_drop |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 9,859.958 ms | 0.000 ms | 9,857.940 ms | 0.000 ms | 0.000 ms | 0.000 ms | 99.98% | 1.000x | 1.000x | 9,866.442 ms |
+| 2 | 5,237.350 ms | 1.043 ms | 6.049 ms | 5,006.212 ms | 0.657 ms | 220.616 ms | 4.36% | 1.000x | 1.883x | 5,242.796 ms |
+| 4 | 3,030.780 ms | 1.045 ms | 6.049 ms | 2,591.570 ms | 0.674 ms | 423.653 ms | 14.23% | 1.932x | 3.253x | 3,036.301 ms |
+| 8 | 2,068.200 ms | 1.042 ms | 6.060 ms | 1,436.720 ms | 0.543 ms | 620.578 ms | 30.38% | 3.484x | 4.767x | 2,074.091 ms |
+| 12 | 2,062.867 ms | 1.042 ms | 6.042 ms | 1,243.845 ms | 0.607 ms | 804.320 ms | 39.36% | 4.025x | 4.780x | 2,068.870 ms |
+
+`parallel_speedup` は `parallel_base_threads=2` を基準（threads=2 が
+1.000x）とした並列挿入段のみの speedup（`level`／`prefix`／`freeze` は
+スレッド数に依らずほぼ一定のため対象外）。`wall_median_with_drop` は
+外側 `protocol::run` が計測した壁時計中央値（索引 drop を含む）の
+参考値であり、`serial_share`／`total_speedup` の算出には用いない。
+
+#### ワーカー統計（run5）
+
+| threads | inserted[min/med/max] | busy[min/med/max] | lock_blocked | lock_wait[sum/max] | lock_wait_share |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 49,689/49,872/50,055 | 5,004.098/5,004.142/5,004.186 ms | 0.00% | 0.462/0.306 ms | 0.00% |
+| 4 | 24,750/24,935/25,124 | 2,609.740/2,609.814/2,609.878 ms | 0.01% | 1.258/0.367 ms | 0.01% |
+| 8 | 7,217/13,196/13,367 | 1,442.451/1,442.552/1,442.857 ms | 0.01% | 6.958/1.566 ms | 0.06% |
+| 12 | 7,635/8,270/9,152 | 1,255.706/1,256.101/1,256.438 ms | 0.02% | 507.774/67.137 ms | 3.37% |
+
+#### ワーカー統計（run6）
+
+| threads | inserted[min/med/max] | busy[min/med/max] | lock_blocked | lock_wait[sum/max] | lock_wait_share |
+| --- | --- | --- | --- | --- | --- |
+| 2 | 49,788/49,872/49,956 | 5,006.804/5,006.865/5,006.926 ms | 0.00% | 0.406/0.222 ms | 0.00% |
+| 4 | 24,818/24,962/25,003 | 2,576.142/2,576.173/2,576.261 ms | 0.01% | 1.365/0.422 ms | 0.01% |
+| 8 | 7,328/13,220/13,372 | 1,434.457/1,434.645/1,434.847 ms | 0.02% | 5.852/0.876 ms | 0.05% |
+| 12 | 7,440/8,483/9,009 | 1,243.319/1,243.640/1,243.830 ms | 0.02% | 462.682/45.972 ms | 3.10% |
+
+`lock_wait_share` は Σ`lock_wait` ÷ Σ`busy` で定義する
+（`lock_blocked_ratio` の試行回数ベース比率とは異なる指標）。
+`entry_promotions`（エントリポイント更新回数）は全点・両回とも 3 で不変だった。
+
+#### 対照負荷（`dot_scan`）との比較
+
+`dot_scan` は共有可変状態を持たない、コーパス全行とクエリ行の内積走査
+（64 パス）で、ハードウェアの並列度天井の参考値として計測している。
+`parallel_vs_control` は `parallel_speedup / (control_median(threads=2)
+/ control_median(threads=T))` で定義し、並列挿入段と対照負荷の伸びを
+同一基準（threads=2）に正規化した比（1.0 なら並列段が対照負荷と同じ
+伸び方をしている）。`speedup_ref(basis=threads=1)` は参考値として
+threads=1 基準の素の speedup も併記する。
+
+| threads | run5 dot_scan median | run5 speedup_ref(基準 threads=1・参考) | run5 parallel_vs_control(基準 threads=2) | run6 dot_scan median | run6 speedup_ref(基準 threads=1・参考) | run6 parallel_vs_control(基準 threads=2) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 49.487 ms | 1.000x | — | 46.491 ms | 1.000x | — |
+| 2 | 26.775 ms | 1.848x | 1.000 | 25.582 ms | 1.817x | 1.000 |
+| 4 | 12.837 ms | 3.855x | 0.922 | 11.430 ms | 4.067x | 0.863 |
+| 8 | 8.977 ms | 5.513x | 1.167 | 6.921 ms | 6.717x | 0.943 |
+| 12 | 6.006 ms | 8.240x | 0.903 | 6.051 ms | 7.683x | 0.952 |
+
+threads=1 は並列段自体が存在しない（`build_with_threads(.., 1)` は
+逐次経路そのもの）ため `parallel_vs_control` は算出しない。
+
+#### 所見
+
+1. **主因は `repair_reachability`（凍結後・単一スレッドの後始末）**。
+   2→4→8→12 スレッドで 222→427→635→808 ms（run5）／
+   221→424→621→804 ms（run6）と単調増加し、12 スレッドでは total の
+   約 39.4%（`serial_share`）を占める。並列度が上がるほど上位層の
+   到達不能ノードが増え修復量が増える構造（`hnsw.rs::repair_reachability`
+   は各反復で BFS と到達済み全ノードとの dot 計算を伴う。反復上限
+   `PRECISE_REPAIR_CAP` は本タスクの実装既定値）。8→12 の差分は
+   run5・run6 とも並列段の短縮（約 −195 ms／−193 ms）を repair の増加
+   （約 +173 ms／+184 ms）がほぼ相殺し、total は横ばい
+   （run5: 2,088→2,070 ms・run6: 2,068→2,063 ms）。計測方法修正後の
+   再実測 2 回とも「8→12 で伸びない」現象が再現した。
+2. **逐次プレフィックス（256 件・約 6 ms）・レベル割当（約 1 ms）・
+   凍結（1 ms 未満）はいずれも合計 8 ms 未満で無視できる**。旧来の
+   「逐次プレフィックスが要因候補」という推定は否定できる。
+3. **ロック競合は試行回数ベースでは軽微だが、累積待ち時間で見ると
+   12 スレッドで無視できない水準になる**。`lock_blocked_ratio` は全点で
+   0.00〜0.02% に留まるが、累積待ち時間で見ると 8 スレッドまでは
+   Σ6〜7 ms（busy 比 0.05〜0.06%）に対し、12 スレッドでは
+   Σ463〜508 ms（busy 比 3.10〜3.37%・ワーカー最大待ち時間 46〜67 ms）
+   へ急増し、12 スレッドで初めて無視できない競合が現れる。ただし
+   並列段全体（約 1,245〜1,256 ms）の 3% 程度に留まり、主因ではない。
+4. **並列段は対照負荷にほぼ追随している**。同一基準（threads=2）で
+   正規化した `parallel_vs_control` は 4/8/12 スレッドで
+   0.92/1.17/0.90（run5）・0.86/0.94/0.95（run6）とおおむね 1.0 に
+   収まる。参考値（threads=1 基準の `speedup_ref`）では、12 スレッドの
+   対照負荷 speedup は run5 で 8.2x・run6 で 7.7x であり、12 vCPU の
+   天井に対し並列段自体はほぼ追随していると言える。
+5. **ワーカー間の挿入件数に偏りがあるが busy 時間はほぼ揃う**。
+   8 スレッドで min 約 7.2〜7.3k・max 約 13.4k、12 スレッドで
+   7.4k〜9.2k の範囲に偏るのに対し、busy はワーカー間でほぼ等しい
+   （ワークスティール方式のため終了時点が揃う）。偏り自体は vCPU
+   ごとの実効速度差（ホスト側スケジューリング）を示唆するが、ゲスト内
+   からは要因を切り分けて検証できない。
+6. 改善余地として `repair_reachability` の並列化、または挿入時の上位層
+   リンク保証による到達不能ノード発生自体の抑制が考えられるが、本追記の
+   スコープでは実装しない（別 Issue 起票の要否はオーナー判断）。
+
+注記: run6 の threads=1 点は loadavg 7.2 とやや高い環境で計測している
+が、`total` の中央値は静かな環境の run5（9,900.758 ms）とほぼ同値
+（9,859.958 ms）であり、代表性に問題はない。
+
+### 外部フレームワークとの構築比較（usearch）
+
+usearch（`=2.26.1`。承認済み optional 依存・`contrast-bench` feature、
+Issue #176）を用いた `make bench-hnsw-compare`
+（`crates/engine/benches/hnsw_compare_bench.rs`。`BENCH_HNSW_COMPARE_THREADS`
+でスレッド数ラダーを上書き可）で、自作 `HnswIndex` との構築時間・
+Recall@10・探索レイテンシを比較した。パラメータは可能な範囲で等価に
+揃えている（自作 `m=16`／`ef_construction=100`／`ef_search=64` ↔
+usearch `connectivity=16`／`expansion_add=100`／`expansion_search=64`、
+いずれも内積・F32・`multi=false`）。usearch のパラメータの意味は
+`usearch` クレート（`rust/lib.rs`）のドキュメンテーションコメントで
+確認できた範囲に限る。usearch の並列構築は
+`reserve_capacity_and_threads(rows, threads)` で容量・スレッド数を
+確保したうえで `threads` 本のワーカーへ行を静的分割して `add` する
+方式で、`Index` の生成（`reserve` を含む）を計測区間に含めている
+（自作側の `build_with_threads` も呼び出しから返却までを計測しており
+条件は揃っている）。**計測方法修正（codex-review 指摘対応）により、
+索引の drop（解放）は計測区間外へ移した**（修正前は解放コストが
+build 側の計測に混入していた疑いがあったため）。さらに探索レイテンシは
+codex-review 指摘（従来は先頭 20 クエリのみを計測しておりクエリ集合の
+一部にしか代表性が無かった）を受けて、warmup 後の本計測を全 200 クエリ
+（`queries` の値）を均等に評価する方式（計測回数はクエリ数の整数倍）へ
+修正している。
+
+探索レイテンシ計測修正後の再実測 2 回（run7・run8。2026-09-05。上記
+「Issue #406 追記」節と同一環境）:
+
+| threads | run7 自作 build median | run7 usearch build median | run7 self/usearch | run8 自作 build median | run8 usearch build median | run8 self/usearch |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 10,420.7 ms | 11,360.4 ms | 0.917x | 10,408.2 ms | 11,378.4 ms | 0.915x |
+| 2 | 5,493.1 ms | 5,822.8 ms | 0.943x | 5,509.6 ms | 5,847.6 ms | 0.942x |
+| 4 | 3,188.9 ms | 2,954.8 ms | 1.079x | 3,170.4 ms | 2,963.3 ms | 1.070x |
+| 8 | 2,103.2 ms | 2,462.1 ms | 0.854x | 2,128.4 ms | 2,408.4 ms | 0.884x |
+| 12 | 2,148.3 ms | 1,707.8 ms | 1.258x | 2,136.8 ms | 1,721.7 ms | 1.241x |
+
+run8 は計測開始時 loadavg 9.55（前ランの後始末が末尾で並走した影響と
+見られる）とやや高い環境だったが、build median・比とも run7 とほぼ
+一致しており代表性に問題はない。
+
+Recall@10（100,000 点・dim=64・クエリ 200 件。コーパスは
+`harness/hnsw_build::generate_corpus` の一様乱数生成で、クラスタ構造を
+持たない HNSW にとって最難条件の一つ）:
+
+| engine | threads | recall@10 |
+| --- | --- | --- |
+| self | 1 | 0.5145（run7・run8 とも同値） |
+| self | 12 | 0.5165（run7）／0.5180（run8） |
+| usearch | 12 | 0.5175（run7）／0.5220（run8） |
+
+探索レイテンシ中央値（threads=12 で構築した索引・ef_search=64。全 200
+クエリを均等評価した本計測値）: 自作 66.228〜67.080 µs、usearch
+76.151〜77.136 µs。
+
+所見:
+
+- 構築時間は自作／usearch でおおむね同水準（self/usearch 比
+  0.85〜1.26 倍）。1・2・8 スレッドでは自作が速く、4・12 スレッドでは
+  usearch が速い。12 スレッドで usearch が 6.6x まで speedup する一方、
+  自作は 4.9x で頭打ちになる差は、上記「Issue #406 追記」節で実測した
+  `repair_reachability`（凍結後・単一スレッド）の相対比重増加で説明が
+  つく（usearch 側に相当する凍結後の単一スレッド段があるかは未調査）。
+- Recall@10 は自作 0.51〜0.52・usearch 0.52 で同水準。この値は
+  `docs/design/hnsw-search.md` に記録した一様乱数コーパスの informational
+  参考値（10,000 点・ef=64 で 0.6410）と整合する低さであり、クラスタ
+  構造ありフィクスチャでの受け入れ判定（Recall@10 ≥ 0.95〜0.99）とは
+  別物である点に注意する。
+- 探索レイテンシ中央値は自作 66〜67 µs・usearch 76〜77 µs で自作が
+  やや速いが、いずれも同水準の範囲にある。
+- 追加の比較候補として `hnsw_rs`（`=0.3.4`。MIT OR Apache-2.0・純 Rust・
+  `rayon` に依存）を第一候補として挙げる。`instant-distance` はアーカイブ
+  済み、`faiss` はネイティブ C++ ビルドが必須なため候補から外した。
+  依存追加はユーザー承認が必要なため、追加比較の実施はオーナー判断
+  待ちとする。
 
 ### 単一スレッド経路の非退行
 
@@ -215,9 +456,19 @@ run-to-run 変動の範囲として扱い、閾値判定には用いない（本
 
 - `VectorArena` の `Arc<[f32]>` 化によるコピー縮退（#408 の設計課題として
   引き続き申し送る。`hnsw.rs` モジュール冒頭「ベクトルの所有方針」節参照）
-- `search_layer_locked` の隣接コピー方式（並列経路専用。逐次経路の
-  `search_layer` は無変更）が並列構築時間へ与える影響の定量的な内訳は
-  計測していない（本タスクの受け入れ条件は「スレッド数に応じた短縮」の
-  確認までで、内訳分析は対象外）
+- ~~`search_layer_locked` の隣接コピー方式が並列構築時間へ与える影響の
+  定量的な内訳は計測していない~~ → Issue #406 追記（2026-09-05）で
+  段別内訳を実測済み（上記「Issue #406 追記」節）。支配的な要因は
+  `search_layer_locked` の隣接コピー自体ではなく `repair_reachability`
+  （凍結後・単一スレッドの後始末）と判明した
+- `repair_reachability` の並列化、または挿入時の上位層リンク保証による
+  到達不能ノード発生自体の抑制は未実装（Issue #406 追記の所見 6。
+  別 Issue 起票の要否はオーナー判断）
+- ホスト側の物理コア共有（SMT・vCPU ピニング等）の有無はゲスト内から
+  直接検証できない（Issue #406 追記の所見 5。対照負荷の speedup 天井
+  からの間接推定に留まる）
+- 外部フレームワーク比較の追加候補（`hnsw_rs =0.3.4` 等）は依存追加の
+  ためユーザー承認待ち（Issue #406 追記「外部フレームワークとの構築
+  比較」節）
 - `build_parallel` を `HnswIndex::build` の既定にする判断・
   `SearchEngineKind::Hnsw` 結線（#407・実装済み）・世代整合キャッシュ（#408）

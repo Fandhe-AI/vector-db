@@ -116,6 +116,68 @@ pub const SEQUENTIAL_PREFIX_NODES: usize = 256;
 /// [`HnswIndex::build_parallel`] が決める並列度もこの上限でクランプされる）。
 pub const MAX_BUILD_THREADS: usize = 16;
 
+/// [`HnswIndex::build_with_threads_observed`] が返す並列構築の段別プロファイル
+/// （Issue #406 追記: 8→12 スレッド頭打ち要因の切り分け計測）。
+///
+/// レベル割当・逐次プレフィックス・凍結・`repair_reachability` はいずれも
+/// スレッド数に依らず単一スレッドで実行される段であり、これらの合計
+/// （`sequential_prefix` 等）が `total` に占める比率（Amdahl の法則でいう
+/// 逐次割合）が頭打ちの構造要因かどうかを、実際に並列化される
+/// `parallel_phase` と切り分けて確認できるようにする。合否閾値は持たない
+/// 情報提供専用の実測値（`.claude/rules/spec-confidentiality.md` オーナー
+/// 判断範囲・数値基準/実測値は公開可）。
+#[derive(Debug, Clone, Default)]
+pub struct HnswBuildProfile {
+    /// レベル割当（`seed` からの逐次確定。並列フェーズ開始前）。
+    pub level_assign: std::time::Duration,
+    /// 先頭 [`SEQUENTIAL_PREFIX_NODES`] 件の逐次挿入（縮退経路ではここへ
+    /// `total` 相当の全量を積む。[`HnswIndex::build_with_threads_observed`]
+    /// 参照）。
+    pub sequential_prefix: std::time::Duration,
+    /// `thread::scope` による並列挿入フェーズ全体の壁時間（ワーカー起動〜
+    /// 全 join 完了まで）。縮退経路では 0（ワーカーが存在しないため）。
+    pub parallel_phase: std::time::Duration,
+    /// 並列フェーズ完了後、`RwLock` を解いて [`HnswIndex`] の内部表現へ
+    /// 組み立て直す段（`repair_reachability` を含まない）。
+    pub freeze: std::time::Duration,
+    /// 全ノード挿入後の到達性修復パス（単一スレッド。モジュール内
+    /// `repair_reachability` のドキュメンテーションコメント参照）。
+    pub repair_reachability: std::time::Duration,
+    /// `build_with_threads_observed` 呼び出し全体の壁時間（上記各段の合計
+    /// より長くなり得る——検証・エラー分岐等の測定対象外区間を含むため）。
+    pub total: std::time::Duration,
+    /// 並列フェーズの各ワーカースレッドの観測値。縮退経路では空。
+    pub workers: Vec<HnswWorkerStats>,
+}
+
+/// 並列構築フェーズにおける 1 ワーカースレッドの観測値（Issue #406 追記）。
+#[derive(Debug, Clone, Default)]
+pub struct HnswWorkerStats {
+    /// このワーカーが実際に挿入したノード数（ワークスティールのため
+    /// ワーカー間で不均等になり得る）。
+    pub inserted_nodes: u64,
+    /// このワーカーのループ全体（`fetch_add` によるノード取得を含む）の壁時間。
+    pub busy: std::time::Duration,
+    /// `BuildGraph::read_links`／`write_links` で `try_read`／`try_write` が
+    /// `WouldBlock` を返し、ブロックする取得（`read`／`write`）へ落ちた回数。
+    pub link_lock_blocked: u64,
+    /// `BuildGraph::read_links`／`write_links` の取得試行総数
+    /// （`link_lock_blocked` 込み）。
+    pub link_lock_acquired: u64,
+    /// `link_lock_blocked` に数えた取得（`try_read`／`try_write` が
+    /// `WouldBlock` を返しブロックする取得へ落ちた場合）のみ、実際に
+    /// ロックが取れるまで `Instant` で計測した待ち時間の累積
+    /// （codex-review P2 指摘・PR #445: ロック競合が頭打ちの主要因かどうかを
+    /// `busy` に対する割合で判定できるようにする。観測版
+    /// `build_parallel_graph_observed` 限定の計装であり、成功する
+    /// `try_read`／`try_write` 経路には追加の `Instant::now()` 呼び出しを
+    /// 乗せない）。
+    pub link_lock_wait: std::time::Duration,
+    /// このワーカーが `try_promote_entry` で実際にエントリポイントを
+    /// 更新した回数。
+    pub entry_promotions: u64,
+}
+
 /// 整数比（`u32/u32`）。`f32` は `HnswParams` の `Copy + PartialEq + Eq` derive と
 /// 両立しない（`f32` は `Eq` を実装しない）ため、Issue #401 の `REBUILD_DELTA_RATIO`
 /// （`(u64, u64)` タプル）と同じ発想で構造体化した（Issue #409。`sql::hnsw_cache`
@@ -801,6 +863,77 @@ impl HnswIndex {
             return Self::build(params, dim, vectors, seed);
         }
         parallel_build::build_parallel_graph(params, dim, vectors, seed, threads, n)
+    }
+
+    /// [`build_with_threads`](Self::build_with_threads) と同一アルゴリズム・
+    /// 同一エラー契約を共有しつつ、段別の壁時間・ワーカー統計
+    /// （[`HnswBuildProfile`]）を合わせて返す観測版（Issue #406 追記:
+    /// 8→12 スレッド頭打ち要因の切り分け計測。`docs/design/
+    /// hnsw-parallel-build.md` 参照）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) をそのまま呼ぶ）に限り
+    /// [`build_with_threads`](Self::build_with_threads) と完全に同一のグラフを
+    /// 返す。`threads >= 2` かつ `n > `[`SEQUENTIAL_PREFIX_NODES`] の並列経路は
+    /// ワークスティールに依存するため、[`build_with_threads`]
+    /// (Self::build_with_threads) と同様グラフの**形状**が run-to-run で
+    /// 変わり得る（この非決定性自体は観測の有無に関わらない
+    /// `build_with_threads` 既存の契約。モジュール `parallel_build` 冒頭
+    /// 「決定性の範囲」節参照）。
+    ///
+    /// 呼び出し先（`parallel_build::build_parallel_graph_observed`）は
+    /// `build_parallel_graph` と別の実装だが、ノード挿入・凍結・修復の
+    /// アルゴリズム本体（`insert_node_locked`・`assemble_graph`・
+    /// `repair_reachability`）は完全に共有する関数をそのまま呼ぶ。ただし
+    /// 段別計測のため `BuildGraph` のノードロック取得を `try_read`/
+    /// `try_write` → block の二段化にする計装を追加しており、この計装は
+    /// 観測版（`observe=true`）のみに閉じ、非観測版
+    /// （[`build_with_threads`](Self::build_with_threads) が使う
+    /// `observe=false`）には一切波及しない（`parallel_build::BuildGraph::
+    /// observe` 参照。レビュー指摘 P1-A）。したがって
+    /// `build_with_threads_one_matches_sequential_build_exactly` 等の既存
+    /// 完全一致テストは非観測版のみを対象にするため無変更のまま green だが、
+    /// 「ロック取得順序・待ち時間まで非観測版と厳密に同一」であることは
+    /// 主張しない（グラフの構築結果・poison 判定は同一）。
+    ///
+    /// `threads == 1` または `n <= `[`SEQUENTIAL_PREFIX_NODES`] の縮退経路
+    /// （[`build`](Self::build) を呼ぶ）では、計測できる段の区切りが
+    /// 存在しないため所要時間の全量を `sequential_prefix` へ積み、
+    /// `workers` は空のままにする（縮退の事実がプロファイルから分かる）。
+    ///
+    /// # エラー
+    ///
+    /// [`build_with_threads`](Self::build_with_threads) と同一（`threads` の
+    /// 範囲外は [`HnswError::InvalidParams`]、ワーカー panic・ロック poison は
+    /// [`HnswError::WorkerPanicked`]）。
+    pub fn build_with_threads_observed(
+        params: HnswParams,
+        dim: u32,
+        vectors: &[f32],
+        seed: u64,
+        threads: usize,
+    ) -> Result<(Self, HnswBuildProfile), HnswError> {
+        let total_start = std::time::Instant::now();
+        if threads == 0 || threads > MAX_BUILD_THREADS {
+            return Err(HnswError::InvalidParams {
+                reason: "threads must be in 1..=MAX_BUILD_THREADS",
+            });
+        }
+        let n = validate_build_input(&params, dim, vectors)?;
+        if threads == 1 || n <= SEQUENTIAL_PREFIX_NODES {
+            let seq_start = std::time::Instant::now();
+            let index = Self::build(params, dim, vectors, seed)?;
+            let profile = HnswBuildProfile {
+                sequential_prefix: seq_start.elapsed(),
+                total: total_start.elapsed(),
+                ..HnswBuildProfile::default()
+            };
+            return Ok((index, profile));
+        }
+        let (index, mut profile) =
+            parallel_build::build_parallel_graph_observed(params, dim, vectors, seed, threads, n)?;
+        profile.total = total_start.elapsed();
+        Ok((index, profile))
     }
 
     /// [`build_with_threads`](Self::build_with_threads) のスレッド数を
