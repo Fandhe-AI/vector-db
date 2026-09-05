@@ -31,7 +31,7 @@ CORE-5 のビヘイビア詳細（`docs/spec/04-behavior/core-engine.md` CORE-5�
 | 候補 | 総当たり API | ライセンス | 推移的依存 | 判定 |
 | --- | --- | --- | --- | --- |
 | **usearch** | `Index::exact_search`（公式 API） | Apache-2.0 | 約 25 | **採用** |
-| hnsw_rs / instant-distance | なし（HNSW のみ） | MIT/Apache-2.0 系 | 小〜中 | 不可（比較不成立） |
+| hnsw_rs / instant-distance | なし（HNSW のみ） | MIT/Apache-2.0 系 | 小〜中 | 不可（比較不成立。ただし hnsw_rs は Issue #406 追記で HNSW-vs-HNSW 対照ベンチとして実測済み・撤去済み 2026-09-05） |
 | arroy | なし（Annoy 近似）＋ LMDB C ビルド | MIT | 中 | 不可 |
 | lancedb | あり | Apache-2.0 | 数百（arrow/datafusion/tokio 等） | 不可（依存最小方針に反する） |
 | faiss | あり | MIT/Apache-2.0 | システム libfaiss 必須 | 不可（ホステッド runner で不成立） |

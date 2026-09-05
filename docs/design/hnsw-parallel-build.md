@@ -148,9 +148,9 @@ no-op（逐次経路との性能差は生じない）。
 | `crates/engine/tests/hnsw_parallel_profile_accept.rs`（新規・Issue #406 追記） | 段別プロファイル観測用フックの受け入れテスト |
 | `crates/engine/tests/hnsw_compare_accept.rs`（新規・Issue #406 追記） | usearch 比較ハーネスの受け入れテスト |
 | `Makefile`（Issue #406 追記） | `make bench-hnsw-compare` ターゲット（`ci` 非包含・CI ワークフロー非配線） |
-| `crates/engine/Cargo.toml`（Issue #406 追記・2026-09-05） | `hnsw_rs` `=0.3.4`（`contrast-bench` feature 限定・optional・オーナー承認済み）を追加 |
-| `deny.toml`（Issue #406 追記・2026-09-05） | `RUSTSEC-2025-0141`（`bincode` 1.3.3・unmaintained。`hnsw_rs` の dump/reload 経路のみが依存し本ベンチでは未使用）の ignore を追加 |
-| `crates/engine/benches/hnsw_compare_bench.rs`・`crates/engine/benches/harness/hnsw_compare.rs`（Issue #406 追記・2026-09-05） | 対照エンジンを usearch から usearch・`hnsw_rs` の 2 エンジンへ拡張し、3 エンジン共通でコーパスを L2 正規化する方式へ変更 |
+| `crates/engine/Cargo.toml`（Issue #406 追記・2026-09-05） | `hnsw_rs` `=0.3.4` 追加は撤去済み（2026-09-05・理由: 実測で構築 3.4〜4.8 倍・探索約 5 倍遅く、対照は usearch で足りる。`deny.toml` ignore・計測時間倍増も解消） |
+| `deny.toml`（Issue #406 追記・2026-09-05） | `RUSTSEC-2025-0141`（`bincode` 1.3.3・unmaintained）の ignore 追加は撤去済み（2026-09-05。`hnsw_rs` の dump/reload 経路のみが依存し本ベンチでは未使用だったため） |
+| `crates/engine/benches/hnsw_compare_bench.rs`・`crates/engine/benches/harness/hnsw_compare.rs`（Issue #406 追記・2026-09-05） | 3 エンジン対比実装は撤去済み（2026-09-05）。現在は usearch のみを対照とし、L2 正規化コーパス方式は維持 |
 
 ## 検証
 
@@ -445,9 +445,9 @@ Recall@10（100,000 点・dim=64・クエリ 200 件。コーパスは
 上記 run7・run8 は usearch のみを対照とし、コーパスは正規化していない
 （内積カーネルをそのまま用いる本リポの既定と揃えた条件）。以下の
 run9・run10 はこの条件から変更し、hnsw_rs を追加した 3 エンジン比較の
-実測である点に注意する（旧実測との直接比較はできない）。
+実測である点に注意する（旧実測との直接比較はできない）。**現在の `make bench-hnsw-compare` は hnsw_rs を撤去済み（2026-09-05）で、自作・usearch 2 エンジン・L2 正規化コーパス方式を維持している**ため、本ドキュメントの run9・run10 実測値は参考値として扱い、現行ベンチとの直接比較には用いないこと。
 
-#### hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較（Issue #406 追記・2026-09-05）
+#### hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較（Issue #406 追記・2026-09-05）— 撤去済み（2026-09-05）
 
 対照エンジンとして `hnsw_rs`（`=0.3.4`。MIT OR Apache-2.0・純 Rust・
 `contrast-bench` feature 限定・optional 依存・オーナー承認済み
@@ -467,7 +467,7 @@ run9・run10 はこの条件から変更し、hnsw_rs を追加した 3 エン�
 
 deny.toml へ `RUSTSEC-2025-0141`（`bincode` 1.3.3・unmaintained。
 `hnsw_rs` の dump/reload 経路のみが依存し本ベンチでは未使用）の ignore
-を追加した。
+を追加（撤去済み。2026-09-05）。
 
 100,000 点・dim=64 での構築時間中央値（QEMU ゲスト・12 vCPU・
 AVX2+FMA。上記「Issue #406 追記」節と同一環境）を 2 回実測した
@@ -546,9 +546,6 @@ threads=8 の self が run9 より速い等の run-to-run 差がある点に注�
 - ホスト側の物理コア共有（SMT・vCPU ピニング等）の有無はゲスト内から
   直接検証できない（Issue #406 追記の所見 5。対照負荷の speedup 天井
   からの間接推定に留まる）
-- `hnsw_rs =0.3.4` を加えた 3 エンジン比較を実施済み（Issue #406 追記
-  「hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較」節）。パラメータの
-  厳密な等価性検証・差分の深掘りは Issue #446（ルート）〜#450 の
-  ツリーへ申し送り
+- `hnsw_rs =0.3.4` を加えた 3 エンジン比較の実施・撤去済み（Issue #406 追記・2026-09-05。理由・実測値は本セクション「hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較」節参照）
 - `build_parallel` を `HnswIndex::build` の既定にする判断・
   `SearchEngineKind::Hnsw` 結線（#407・実装済み）・世代整合キャッシュ（#408）

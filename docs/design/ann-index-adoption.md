@@ -79,8 +79,7 @@ AGENTS.md「spec（SSOT）との整合」）、本書はそれらを本リポジ
   （`contrast-bench` feature 限定の optional 依存・Apache-2.0・オーナー承認
   済み〔2026-08-26〕）。usearch 本体は HNSW 実装だが、この承認は「総当たり
   対照としての利用」に限定されたものであり、ANN 方式としての採用可否を評価
-  したものではない。ANN 候補としての評価（`hnsw_rs`／`instant-distance` 等の
-  pure Rust クレートを含む）はこれまで行われていない。
+  したものではない。pure Rust 対照ベンチ（`hnsw_rs`）の実測は Issue #406 追記で完了・撤去済み（2026-09-05。詳細は `docs/design/hnsw-parallel-build.md` 参照）。production ANN 採用可否の評価は依然未実施。
 - 公開済みの実測値として、大規模段（20,000 件）ハイブリッド経路の p95 が
   通常コーパスで約 5.6 ms であることや、C1（100,000 行×768 次元）p95 が
   専有環境で閾値僅差の fail 状態にあることが `docs/design` に記録されている
@@ -310,7 +309,7 @@ RLS 事前フィルタとの切替（4 列目）については、「事後フ�
 
 - HNSW 索引の永続化（「実装ガイド」の対応表「永続化」行参照）
 - テーブル単位カタログ属性による opt-in・`wire-server` CLI オプション露出
-- pure Rust ANN クレート（`hnsw_rs`・`instant-distance` 等）の個別評価
+- pure Rust ANN クレート（`hnsw_rs`・`instant-distance` 等）の個別評価は Issue #406 追記で実測・撤去済み（2026-09-05。詳細は `docs/design/hnsw-parallel-build.md` 参照）。production 採用可否の評価は依然未実施
 - README「実装方針（要点）」の opt-in 手順・公開境界拡張（#413 が担当。実施済み。README「ANN（HNSW）opt-in 手順と前後比較（Issue #413）」節参照）
 - CLAUDE.md の `- ステータス:` 行が 2 本重複し内容が一部乖離している件の
   統合（本 Issue のスコープ外。両行を同一内容へ更新するに留める）
