@@ -47,7 +47,9 @@ scripts/crossdb_bench/containers.sh down mysql
 （pgvector・Qdrant と同じ up/down 管理。`down mysql` も `docker rm -f` で
 コンテナごと破棄する）。
 
-sqlite-vec・LanceDB は in-process（コンテナ不要）。self は `run.py` が
+sqlite-vec・LanceDB は in-process（コンテナ不要）。sqlite-vec は他 DB（永続ストレージ）
+と投入速度の比較条件を揃えるため `--workdir` 配下のファイルベース DB を使う
+（`:memory:` ではない。非永続だった旧実装の数値との比較は不可）。self は `run.py` が
 `wire-server` を子プロセスとして起動・停止する。
 
 **計測中は対象 DB 以外のコンテナを止めること**（公平な比較のため。CPU・メモリの
@@ -96,7 +98,8 @@ scripts/crossdb_bench/containers.sh up pgvector
 python scripts/crossdb_bench/run.py --db pgvector --config hnsw \
   --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
 
-# sqlite-vec（exact 固定。--config は受け付けるが無視して meta に exact と記録する）
+# sqlite-vec（exact 固定。--config は受け付けるが無視して meta に exact と記録する。
+#   ファイルベース DB を --workdir 配下の専用一時ディレクトリに作り終了時に削除する）
 python scripts/crossdb_bench/run.py --db sqlite_vec --config exact \
   --rows-file "$S/docs25k.jsonl" --queries-file "$S/queries200.jsonl"
 
@@ -168,7 +171,8 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 ## 公平性についての注記
 
 - **接続経路の違い**: self・pgvector・MySQL は loopback TCP、sqlite-vec・
-  LanceDB は in-process、Qdrant は gRPC。経路の違い自体もレイテンシに寄与する
+  LanceDB は in-process（sqlite-vec はファイルベース DB。`:memory:` ではない）、
+  Qdrant は gRPC。経路の違い自体もレイテンシに寄与する
   ため、`meta.connection` に必ず記録し、横並び比較の際はこの違いを踏まえて
   読む。
 - **exact / ANN の区別**: `--config exact` は索引なし全件探索、`--config hnsw`

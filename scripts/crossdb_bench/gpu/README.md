@@ -13,8 +13,19 @@ private spec（`docs/spec`）の内容は参照しない。Cargo 依存は増や
 - イメージ
   - `bench-faiss-gpu`（`Dockerfile.faiss` からビルド。python:3.12-slim +
     `faiss-gpu-cu12==1.14.1.post1` + numpy）
-  - `qdrant/qdrant:latest`（CPU 版）
-  - `qdrant/qdrant:gpu-nvidia-latest`（GPU 版・索引構築のみ GPU 利用）
+  - `qdrant/qdrant:v1.19.1`（CPU 版）
+  - `qdrant/qdrant:v1.19.1-gpu-nvidia`（GPU 版・索引構築のみ GPU 利用）
+
+    CPU 版・GPU 版は `latest`／`gpu-nvidia-latest` のように独立にタグが動くと
+    異なる Qdrant バージョンを比較してしまう事故が起きるため、同一リリース
+    番号へ固定している（`containers_gpu.sh` の `QDRANT_VERSION` 変数・環境変数
+    `QDRANT_VERSION` で上書き可。両者を変える場合は必ず両方揃えて更新すること。
+    codex-review P2 指摘）。`qdrant_gpu_build_bench.py` は計測前に両イメージの
+    バージョンラベル・接続中サーバーの実バージョン（`client.info().version`）が
+    一致することを確認し、不一致・未取得（イメージ未 pull 等）は
+    `RuntimeError` で fail-closed にする。結果 JSON の `meta.qdrant_server_version`・
+    `meta.qdrant_cpu_image`・`meta.qdrant_gpu_image`（バージョン・digest）に
+    実測値を記録する。
 - ホスト venv（`qdrant-client`・numpy。`scripts/crossdb_bench/requirements.txt` の
   範囲で足りる。ホストの Python 3.14 には faiss-gpu の wheel が無いため FAISS 側は
   必ずコンテナ内で実行する）
@@ -22,8 +33,10 @@ private spec（`docs/spec`）の内容は参照しない。Cargo 依存は増や
 ```bash
 docker build -t bench-faiss-gpu -f scripts/crossdb_bench/gpu/Dockerfile.faiss \
     scripts/crossdb_bench/gpu
-docker pull qdrant/qdrant:latest
-docker pull qdrant/qdrant:gpu-nvidia-latest
+# CPU/GPU 両方のバージョン検証（qdrant_gpu_build_bench.py）に必要なため、
+# 実行前に両方のイメージを pull しておくこと。
+docker pull qdrant/qdrant:v1.19.1
+docker pull qdrant/qdrant:v1.19.1-gpu-nvidia
 ```
 
 ## 1. FAISS（CPU / GPU f32 / GPU f16）

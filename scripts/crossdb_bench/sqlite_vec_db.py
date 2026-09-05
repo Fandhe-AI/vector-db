@@ -23,7 +23,10 @@ exact のみ（vec0 は他 ANN 索引構成を持たない。`--config` は無�
 
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
+import tempfile
 import time
 
 import sqlite_vec
@@ -36,8 +39,13 @@ from common import (
 )
 
 
-def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
+def _connect(db_path: str) -> sqlite3.Connection:
+    """ファイルベースの sqlite DB へ接続する（永続ストレージ前提の他 DB と
+    投入速度の比較条件を揃えるため in-memory ではなくファイルを使う。
+    codex-review P2 指摘）。PRAGMA は変更せず SQLite の既定
+    （`journal_mode=DELETE`・`synchronous=FULL` 相当）のまま運用し、他 DB の
+    既定 durability 設定と揃える意図を維持する。"""
+    conn = sqlite3.connect(db_path)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
@@ -158,7 +166,21 @@ def _fts5_quote(text: str) -> str:
 
 
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
-    conn = _connect()
+    # 他 DB（永続ストレージ）と条件を揃えるため、`--workdir` 配下の専用一時
+    # ディレクトリにファイルベースの DB を作る。終了時（正常・異常いずれも）
+    # 削除する（codex-review P2 指摘）。
+    workdir = getattr(args, "workdir", None) or tempfile.gettempdir()
+    os.makedirs(workdir, exist_ok=True)
+    run_dir = tempfile.mkdtemp(prefix=f"sqlite_vec_bench_{os.getpid()}_", dir=workdir)
+    db_path = os.path.join(run_dir, "sqlite_vec_bench.db")
+    try:
+        return _run_with_db(db_path, docs, queries)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
+    conn = _connect(db_path)
     dim = len(docs[0]["embedding"]) if docs else 128
     _setup_schema(conn, dim)
     phases: dict = {}
@@ -389,6 +411,8 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     cur = conn.cursor()
     cur.execute("SELECT vec_version()")
     vec_version = cur.fetchone()[0]
+    journal_mode = cur.execute("PRAGMA journal_mode").fetchone()[0]
+    synchronous = cur.execute("PRAGMA synchronous").fetchone()[0]
 
     # ingest_single_stmt はテーブルへ合成行（乱数ベクトル）を追加するため、
     # 他フェーズ（特に vector_knn の recall 検算）を汚染しないよう最後に実行する
@@ -405,6 +429,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         extra={
             "index": "exact (vec0 brute-force)",
             "distance_metric_note": "内積 distance_metric 非対応のためコサイン距離で近似",
+            "storage": "file",
+            "journal_mode": journal_mode,
+            "synchronous": synchronous,
         },
     )
     conn.close()

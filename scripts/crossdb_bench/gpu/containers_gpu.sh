@@ -23,6 +23,17 @@ set -euo pipefail
 HOST_PORT_HTTP="${CROSSDB_QDRANT_HTTP_PORT:-17333}"
 HOST_PORT_GRPC="${CROSSDB_QDRANT_GRPC_PORT:-17334}"
 
+# CPU 版・GPU 版のイメージタグを同一リリース番号へ固定する（codex-review P2 指摘。
+# `latest`／`gpu-nvidia-latest` は独立にタグが動くため、CPU/GPU で異なる Qdrant
+# バージョンを比較してしまう事故を防ぐ）。実バージョンは
+# `docker image inspect qdrant/qdrant:latest --format '{{index .Config.Labels
+# "org.opencontainers.image.version"}}'`（2026-09-05 時点で v1.19.1）で確認し、
+# Docker Hub 上で同一リリースの `v1.19.1` と `v1.19.1-gpu-nvidia` のイメージ digest が
+# ローカル `latest`／`gpu-nvidia-latest` の digest とそれぞれ一致することを確認済み。
+QDRANT_VERSION="${QDRANT_VERSION:-v1.19.1}"
+QDRANT_IMAGE_CPU="qdrant/qdrant:${QDRANT_VERSION}"
+QDRANT_IMAGE_GPU="qdrant/qdrant:${QDRANT_VERSION}-gpu-nvidia"
+
 usage() {
   echo "usage: $0 up|down <qdrant_cpu|qdrant_gpu>" >&2
   exit 1
@@ -48,7 +59,7 @@ up_cpu() {
   docker run -d --name bench-qdrant-cpu-gpucmp \
     -p 127.0.0.1:${HOST_PORT_HTTP}:6333 \
     -p 127.0.0.1:${HOST_PORT_GRPC}:6334 \
-    qdrant/qdrant:latest >/dev/null
+    "${QDRANT_IMAGE_CPU}" >/dev/null
   wait_ready bench-qdrant-cpu-gpucmp
 }
 
@@ -58,7 +69,7 @@ up_gpu() {
     -e QDRANT__GPU__INDEXING=1 \
     -p 127.0.0.1:${HOST_PORT_HTTP}:6333 \
     -p 127.0.0.1:${HOST_PORT_GRPC}:6334 \
-    qdrant/qdrant:gpu-nvidia-latest >/dev/null
+    "${QDRANT_IMAGE_GPU}" >/dev/null
   wait_ready bench-qdrant-gpu
   if docker logs bench-qdrant-gpu 2>&1 | grep -qi "found gpu device"; then
     echo "bench-qdrant-gpu: GPU device recognized (Found GPU device)"

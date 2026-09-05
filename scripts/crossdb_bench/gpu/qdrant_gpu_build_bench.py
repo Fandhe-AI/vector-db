@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -48,6 +49,13 @@ HOST = "127.0.0.1"
 HTTP_PORT = env_port("CROSSDB_QDRANT_HTTP_PORT", 17333)
 GRPC_PORT = env_port("CROSSDB_QDRANT_GRPC_PORT", 17334)
 COLLECTION = "gpu_build_bench"
+
+# CPU 版・GPU 版のイメージタグ（containers_gpu.sh の QDRANT_VERSION と同じ値を
+# 既定にする。相互に独立したタグ解決による版ずれを防ぐための固定運用——
+# codex-review P2 指摘）。
+QDRANT_VERSION = os.environ.get("QDRANT_VERSION", "v1.19.1")
+QDRANT_IMAGE_CPU = f"qdrant/qdrant:{QDRANT_VERSION}"
+QDRANT_IMAGE_GPU = f"qdrant/qdrant:{QDRANT_VERSION}-gpu-nvidia"
 # 投入中の索引構築を止めるための閾値（KB 単位。既定グリッドの最大行数×dim×4 バイトを
 # 十分上回る値）。
 INDEXING_DISABLED_THRESHOLD = 10_000_000_000
@@ -164,6 +172,79 @@ def measure_search(client: QdrantClient, queries: np.ndarray) -> dict[str, Any]:
     }
 
 
+def _docker_image_inspect(image: str, go_template: str) -> str:
+    """`docker image inspect <image> --format <go_template>` の標準出力（改行除去）を返す。
+
+    ローカルに未取得のイメージ・docker 未導入環境では `RuntimeError` を送出する
+    （バージョン検証は fail-closed。取得できないまま検証をスキップして CPU/GPU の
+    版ずれを見逃さない——codex-review P2 指摘）。
+    """
+    try:
+        out = subprocess.run(
+            ["docker", "image", "inspect", image, "--format", go_template],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"docker image inspect failed for {image!r}: {exc}") from exc
+    if out.returncode != 0 or not out.stdout.strip():
+        raise RuntimeError(
+            f"docker image inspect failed for {image!r} (rc={out.returncode}): {out.stderr.strip()}"
+        )
+    return out.stdout.strip()
+
+
+def image_version_and_digest(image: str) -> dict[str, str]:
+    """イメージタグから OCI ラベルのバージョンと RepoDigest を取得する。"""
+    version = _docker_image_inspect(
+        image, '{{index .Config.Labels "org.opencontainers.image.version"}}'
+    )
+    digest = _docker_image_inspect(image, "{{index .RepoDigests 0}}")
+    return {"image": image, "version": version, "digest": digest}
+
+
+def _normalize_version(v: str) -> str:
+    """`v1.19.1` 形式のタグ由来バージョンと `1.19.1` 形式のサーバー応答バージョンを
+    比較できるよう先頭の `v` を取り除く。"""
+    return re.sub(r"^v", "", v.strip())
+
+
+def verify_cpu_gpu_versions(client: QdrantClient) -> dict[str, Any]:
+    """CPU 版・GPU 版イメージのバージョンが一致し、かつ現在接続中のサーバーの
+    実バージョン（`client.info().version`）ともに一致することを確認する。
+
+    どちらか一方でも取得できない・一致しない場合は `RuntimeError` で fail-closed
+    にする（サーバーバージョンを記録しないまま CPU/GPU 比較結果を成功扱いに
+    しない——codex-review P2 指摘）。結果 JSON の meta へ両バージョン・digest を
+    記録するため、検証結果をそのまま返す。
+    """
+    cpu_image_info = image_version_and_digest(QDRANT_IMAGE_CPU)
+    gpu_image_info = image_version_and_digest(QDRANT_IMAGE_GPU)
+    cpu_version = _normalize_version(cpu_image_info["version"])
+    gpu_version = _normalize_version(gpu_image_info["version"])
+    if cpu_version != gpu_version:
+        raise RuntimeError(
+            "Qdrant CPU/GPU image version mismatch: "
+            f"cpu={cpu_image_info!r} gpu={gpu_image_info!r}"
+        )
+
+    server_version = _normalize_version(client.info().version)
+    if server_version != cpu_version:
+        raise RuntimeError(
+            "Running Qdrant server version does not match pinned CPU/GPU image version: "
+            f"server={server_version!r} pinned={cpu_version!r} "
+            f"(cpu_image={cpu_image_info!r}, gpu_image={gpu_image_info!r})"
+        )
+
+    return {
+        "server_version": server_version,
+        "cpu_image": cpu_image_info,
+        "gpu_image": gpu_image_info,
+    }
+
+
 def gpu_log_signal(container_name: str) -> dict[str, Any]:
     """`docker logs <container_name>` から GPU 索引構築の認識ログを探す。
 
@@ -238,6 +319,12 @@ def main() -> int:
 
     client = connect()
 
+    # 計測前に CPU/GPU 両イメージのバージョン一致・現在接続中サーバーとの一致を
+    # 検証する（不一致・取得失敗は RuntimeError で fail-closed。codex-review P2
+    # 指摘。containers_gpu.sh 側の QDRANT_VERSION 固定と対になる検証）。
+    version_check = verify_cpu_gpu_versions(client)
+    print(f"[qdrant_gpu_build_bench] version_check={version_check}", file=sys.stderr)
+
     meta: dict[str, Any] = {
         "generated_at_unix": time.time(),
         "label": args.label,
@@ -245,6 +332,9 @@ def main() -> int:
         "host_port_grpc": GRPC_PORT,
         "seed": SEED,
         "n_queries": N_QUERIES,
+        "qdrant_server_version": version_check["server_version"],
+        "qdrant_cpu_image": version_check["cpu_image"],
+        "qdrant_gpu_image": version_check["gpu_image"],
     }
     print(f"[qdrant_gpu_build_bench] meta={meta}", file=sys.stderr)
 

@@ -113,15 +113,44 @@ def recall_at_k_tie_tolerant(
     returned_ids_per_query: list[list[int]], tie_sets: list[set[int]], k: int = 10
 ) -> float:
     """同点許容版 Recall@k。返却 id 列のうち「k 位のスコア以上の全文書」集合に
-    含まれる件数を k で割った値の平均を返す（同点境界の順序差を許容する）。"""
+    含まれる件数を、strict 版（`recall_at_k`）と同じ分母定義——
+    `min(k, 可視文書数)`——で割った値の平均を返す（同点境界の順序差を許容する）。
+
+    可視文書数が k 未満の場合、`tie_set` は可視文書全件（`build_ground_truth`
+    が `kth_score` を可視件数-1 番目のスコアとして計算するため tie_mask が
+    全件に一致する）と一致するため `len(tie_set)` がそのまま可視文書数になる。
+    可視文書数が k 以上の場合は `tie_set` の要素数が k 以上になるため
+    `min(k, len(tie_set))` は k に収束する。つまり `min(k, len(tie_set))` は
+    常に strict 版の分母 `min(k, 可視文書数)` と一致する（両版の分母定義を
+    同一にする補正。詳細はモジュール docstring の「同点許容の Recall@10」節）。
+    """
     if not tie_sets:
         return float("nan")
     scores = []
     for returned, tie_set in zip(returned_ids_per_query, tie_sets):
         if not tie_set:
             continue
+        denom = min(k, len(tie_set))
+        if denom == 0:
+            continue
         hit = len(set(returned) & tie_set)
-        scores.append(min(hit, k) / k)
+        scores.append(min(hit, denom) / denom)
     if not scores:
         return float("nan")
     return sum(scores) / len(scores)
+
+
+if __name__ == "__main__":
+    # 自己テスト: 可視 9 行・k=10 のとき strict/tie-tolerant 両版の分母が
+    # min(k, 可視件数) = 9 に揃い、可視 9 行を全件返せば両版とも 1.0 になる
+    # ことを確認する（codex-review P2 指摘の分母不整合の再発防止）。
+    visible_ids = list(range(9))
+    ground_truth = [visible_ids]
+    tie_sets = [set(visible_ids)]
+    returned = [visible_ids]
+
+    strict = recall_at_k(returned, ground_truth)
+    tie_tolerant = recall_at_k_tie_tolerant(returned, tie_sets, k=10)
+    assert strict == 1.0, f"strict recall expected 1.0, got {strict}"
+    assert tie_tolerant == 1.0, f"tie-tolerant recall expected 1.0, got {tie_tolerant}"
+    print("recall.py self-test OK: visible=9, k=10 -> strict=1.0, tie_tolerant=1.0")

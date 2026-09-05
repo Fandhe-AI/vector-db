@@ -30,7 +30,7 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 | GPU | NVIDIA GeForce RTX 3060 12 GB（PCIe パススルー）・driver 595.71.05・CUDA 13.2・nvidia-container-toolkit 1.19.1 |
 | self | `wire-server`（release ビルド・`cef02bc` 時点。loopback TCP・簡易クエリプロトコル・psycopg 3.3.5） |
 | pgvector | `pgvector/pgvector:pg17`（PostgreSQL 17.11・pgvector 0.8.6。`<#>`。HNSW m=16 / ef_construction=100 / ef_search=64） |
-| sqlite-vec | sqlite3 3.46.1・sqlite-vec 0.1.9（in-process・vec0 brute-force・cosine 近似〔内積指標なし〕） |
+| sqlite-vec | sqlite3 3.46.1・sqlite-vec 0.1.9（in-process・ファイルベース DB・vec0 brute-force・cosine 近似〔内積指標なし〕） |
 | Qdrant | `qdrant/qdrant:latest`（gRPC・Distance.DOT・exact / HNSW） |
 | LanceDB | lancedb 0.38.0（in-process・`metric="dot"`・exact / IVF_HNSW_FLAT m=16 ef_construction=100 ef=64） |
 | MySQL | `mysql:9`（9.7.2 Community。`VECTOR` 型は作れるが `DISTANCE()`／`VECTOR_DISTANCE` が無く〔ERROR 1305〕、`CREATE VECTOR INDEX` は構文エラー〔HeatWave 限定〕のため KNN 系は n/a） |
@@ -46,6 +46,12 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 
 - **接続経路が異なる**: self・pgvector・MySQL は loopback TCP、sqlite-vec・LanceDB は
   in-process、Qdrant は gRPC。in-process の数値は往復コストを含まない。
+- **永続化条件**: sqlite-vec は当初 `:memory:`（非永続）で他 DB（永続ストレージ）と
+  投入速度の比較条件が揃っていなかったため、`--workdir` 配下のファイルベース DB へ
+  変更した（codex-review P2 指摘。PRAGMA は SQLite 既定〔`journal_mode=DELETE`・
+  `synchronous=FULL` 相当〕のまま）。本ドキュメントの sqlite-vec の投入系数値
+  （`ingest_bulk`・`ingest_single_stmt`）はファイルベース化前（in-memory）の値であり、
+  ファイルベース化後の再計測は次回実行時に行う。
 - **可視性モデル**: self の wire セッションは現行契約でどのテナントからも
   `visibility = 'public'` の行のみ可視（private は所有テナント自身からも不可視）。
   他 DB は RLS を持たないため `visibility` 列を持たせ毎クエリに
@@ -96,6 +102,9 @@ self の `ingest_bulk` は wire に COPY 相当が無く（`EngineCore::execute_
 は Rust API のみ）n/a。`ingest_single_stmt` は行形 INSERT を `USING OPERATION_ID`
 付きで 1,000 行送る（commit 粒度は全 DB とも 1 文ごと〔pgvector は autocommit、MySQL・
 sqlite-vec は 1 文ごとに commit、Qdrant は `wait=True`、LanceDB は 1 行ずつ `add`〕。7,473 rows/s。pgvector 1,601・Qdrant 1,081 rows/s より速く、in-process の sqlite-vec 11.7k rows/s には及ばない）。
+
+sqlite-vec の `ingest_bulk`／`ingest_single_stmt` はファイルベース化前
+（`:memory:`）の値（「公平性の注記」節参照）。再計測は次回実行時。
 
 ### 所見
 
