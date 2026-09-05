@@ -7,8 +7,9 @@
 //!
 //! # コーパス正規化は 3 エンジン共通
 //!
-//! hnsw_rs 側は `anndists::dist::distances::DistDot` が単位ベクトルを前提に
-//! `assert!(dot >= 0.)` する（`harness::hnsw_compare::hnsw_rs_adapter` の
+//! hnsw_rs 側は `anndists::dist::distances::DistDot`（`simdeez_f` feature 経由
+//! では `dist::disteez::distance_dot_f32_simdeez`）が単位ベクトルを前提に
+//! `assert!(dot <= 1.000002)` する（`harness::hnsw_compare::hnsw_rs_adapter` の
 //! モジュールコメント参照）ため単位ノルムが必須だが、本ベンチはベンチ冒頭で
 //! [`harness::hnsw_compare::l2_normalize_corpus`] を 1 回だけ呼び出し、
 //! self（`kernel::dot`）・usearch（`MetricKind::IP`）・hnsw_rs（`DistDot`）

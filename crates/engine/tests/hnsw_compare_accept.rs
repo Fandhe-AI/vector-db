@@ -324,6 +324,28 @@ fn l2_normalize_corpus_rejects_zero_norm_row() {
     assert_eq!(err, HnswCompareBenchError::ZeroNormRow(1));
 }
 
+#[test]
+fn l2_normalize_corpus_rejects_zero_dimension() {
+    // `dim == 0` を許すと 0 除算・空行の反復という未定義な挙動を招くため
+    // fail-closed で拒否する契約（codex-review 指摘。是正前は `dim.max(1)`
+    // で黙って 1 次元コーパス扱いへ丸められていた）。
+    let vectors: Vec<f32> = vec![1.0, 2.0, 3.0];
+    let err = l2_normalize_corpus(&vectors, 0).unwrap_err();
+    assert_eq!(err, HnswCompareBenchError::ZeroDimension);
+}
+
+#[test]
+fn l2_normalize_corpus_rejects_length_not_multiple_of_dim() {
+    // `vectors.len()` が `dim` の倍数でない場合、末尾行が不完全なまま黙って
+    // 切り捨てられる契約違反を検出し fail-closed で拒否する。
+    let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+    let err = l2_normalize_corpus(&vectors, 3).unwrap_err();
+    assert_eq!(
+        err,
+        HnswCompareBenchError::CorpusLengthNotMultipleOfDim { len: 5, dim: 3 }
+    );
+}
+
 // --------------------------------------------------
 // usearch 依存部分（`contrast-bench` feature 限定）
 // --------------------------------------------------

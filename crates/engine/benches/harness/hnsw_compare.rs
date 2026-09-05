@@ -67,6 +67,13 @@ pub enum HnswCompareBenchError {
     /// [`l2_normalize_corpus`] でノルムが 0（全成分 0）の行を検出した
     /// （fail-closed。当該行のインデックスを保持する）。
     ZeroNormRow(usize),
+    /// [`l2_normalize_corpus`] に `dim == 0` が渡された（0 除算・空行反復の
+    /// 未定義な挙動を招くため fail-closed で拒否する）。
+    ZeroDimension,
+    /// [`l2_normalize_corpus`] に渡した `vectors` の長さが `dim` の倍数でない
+    /// （row-major フラットバッファの契約違反。末尾行が不完全なまま黙って
+    /// 切り捨てるのではなく fail-closed で拒否する。`len`・`dim` を保持する）。
+    CorpusLengthNotMultipleOfDim { len: usize, dim: usize },
 }
 
 impl fmt::Display for HnswCompareBenchError {
@@ -84,6 +91,15 @@ impl fmt::Display for HnswCompareBenchError {
                 f,
                 "corpus row {row} has zero L2 norm and cannot be normalized \
                  (refusing rather than dividing by zero / emitting NaN)"
+            ),
+            HnswCompareBenchError::ZeroDimension => write!(
+                f,
+                "l2_normalize_corpus refuses dim == 0 (would divide by zero / iterate empty rows)"
+            ),
+            HnswCompareBenchError::CorpusLengthNotMultipleOfDim { len, dim } => write!(
+                f,
+                "l2_normalize_corpus refuses vectors.len()={len} that is not a multiple of \
+                 dim={dim} (would silently drop a trailing partial row)"
             ),
         }
     }
@@ -379,10 +395,26 @@ pub fn render_header_line(rows: usize, dim: usize, queries: usize, ladder: &[usi
 /// （`harness::hnsw_build::generate_corpus`）では実質発生しないが、決定的
 /// とはいえ生成器の変更で発生しうるため呼び出し元（`hnsw_compare_bench.rs`）
 /// はこの `Err` を握りつぶさず `exit(1)` する契約とする。
+///
+/// `dim == 0`（0 除算・空行の反復という未定義な挙動を招く）・`vectors.len()`
+/// が `dim` の倍数でない（末尾行が不完全なまま黙って切り捨てられる）場合も
+/// 同様に fail-closed で拒否する（[`HnswCompareBenchError::ZeroDimension`]・
+/// [`HnswCompareBenchError::CorpusLengthNotMultipleOfDim`]。codex-review
+/// 指摘: 是正前は `dim.max(1)` で `dim == 0` を黙って `1` へ丸めており、
+/// 呼び出し元の設定ミスがサイレントに別の意味（1 次元コーパス）へ化けて
+/// いた）。
 pub fn l2_normalize_corpus(vectors: &[f32], dim: usize) -> Result<Vec<f32>, HnswCompareBenchError> {
-    let step = dim.max(1);
+    if dim == 0 {
+        return Err(HnswCompareBenchError::ZeroDimension);
+    }
+    if !vectors.len().is_multiple_of(dim) {
+        return Err(HnswCompareBenchError::CorpusLengthNotMultipleOfDim {
+            len: vectors.len(),
+            dim,
+        });
+    }
     let mut out = Vec::with_capacity(vectors.len());
-    for (row_idx, chunk) in vectors.chunks(step).enumerate() {
+    for (row_idx, chunk) in vectors.chunks(dim).enumerate() {
         let norm_sq: f32 = chunk.iter().map(|v| v * v).sum();
         let norm = norm_sq.sqrt();
         if norm > 0.0 {
@@ -546,10 +578,13 @@ pub mod hnsw_rs_adapter {
     //! # DistDot の単位ベクトル前提
     //!
     //! `anndists =0.1.5`（hnsw_rs の推移依存）の `dist::distances::DistDot::eval`
-    //! （`src/dist/distances.rs` 258-281 行目付近）は `1 - dot(va, vb)` を返し、
-    //! コーシー・シュワルツにより単位ベクトル同士の内積が高々 1 であることを
-    //! 前提に `assert!(dot >= 0.)`（`scalar_dot_f32`。同ファイル 272-281 行目）
-    //! で検証する。本ベンチのコーパス（`harness::hnsw_build::generate_corpus`。
+    //! は `Cargo.toml` で有効化した `simdeez_f` feature 経由で
+    //! `dist::disteez::distance_dot_f32_simdeez`（`src/dist/disteez.rs`
+    //! 76-101 行目。x86_64 AVX2/SSE2 検出時の実行経路）へディスパッチする。
+    //! この関数はコーシー・シュワルツにより単位ベクトル同士の内積が高々 1で
+    //! あることを前提に `assert!(dot <= 1.000002)`（同ファイル 100 行目。
+    //! SIMD 累積の丸め誤差を許容する閾値）で検証する。本ベンチのコーパス
+    //! （`harness::hnsw_build::generate_corpus`。
     //! 各成分が `[-1, 1)` の一様乱数でノルムは不揃い）を無正規化のまま渡すと
     //! 内積が 1 を超えて assert パニック（プロセス強制終了）になりうる。
     //! hnsw_rs 公式サンプル `examples/ann-glove25-angular.rs`
@@ -581,6 +616,25 @@ pub mod hnsw_rs_adapter {
     //! `PointIndexation`）のみで構成されるため自動導出で `Sync` になり、
     //! `&Hnsw` を複数スレッドから安全に共有できる（コンパイラが検証する。
     //! 本コードは `unsafe` を書かない）。
+    //!
+    //! # `set_searching_mode` を呼ばない理由
+    //!
+    //! `Hnsw::set_searching_mode`（`src/hnsw.rs` 825-831 行目）は「並列挿入と
+    //! 並列探索を別スレッドで同時に行うことはできないため、並列挿入後に
+    //! 探索を有効化するにはこのフラグを立てる必要がある」とドキュメント化
+    //! されている。しかし registry ソース（`hnsw_rs =0.3.4`）を確認すると、
+    //! セットされる `searching` フィールド（`src/hnsw.rs` 755 行目）は
+    //! `set_searching_mode` 内で書き込まれる以外どこからも読み出されておらず
+    //! （`grep -rn "\.searching\b" src/` で `src/hnsw.rs:831` の代入 1 箇所の
+    //! みヒット。0.3.4 時点では `search`／`knn_search` の実装がこのフラグを
+    //! 一切参照しない）、呼んでも呼ばなくても本バージョンの探索結果・
+    //! 挙動に差は生じない。加えて本ベンチは
+    //! [`build_hnsw_rs_index`]（構築用の `std::thread::scope` が関数内で
+    //! 完全に `join` してから戻る）が返った後にのみ探索を行い、構築スレッドと
+    //! 探索スレッドが同時に走ることはない——この関数が想定する「並列挿入と
+    //! 並列探索の同時実行」という状況そのものが本ベンチには存在しない。
+    //! 以上 2 点（0.3.4 では無効なフラグ・本ベンチの構築/探索が時間的に
+    //! 排他）から、`set_searching_mode` の呼び出しは省略する。
 
     use super::super::stats::BenchError;
     use super::partition_rows;
@@ -671,6 +725,15 @@ pub mod hnsw_rs_adapter {
     /// （`src/hnsw.rs` `knn_search` 内 `neighbours_heap.into_sorted_vec()` の
     /// コメント「go from heap of points with negative dist to a sorted vec of
     /// increasing points」）のため、呼び出し元での並べ替えは不要。
+    ///
+    /// `Hnsw::search` 自体は `Result` を返さず（`DataId`＝`usize` から
+    /// `u64` への変換も本プラットフォーム〔64bit〕では常に無損失）、現状の
+    /// 実装が実際に `Err` を返すことはない。それでも `Result` を返す設計に
+    /// しているのは、呼び出し元（`hnsw_compare_bench.rs`）が
+    /// [`super::usearch_adapter::usearch_search_topk`]（実際に `Err` を
+    /// 返しうる）と同じ `match` パターンで両エンジンを対称に扱えるようにする
+    /// ためであり、将来 hnsw_rs 側の失敗系（例: 検索対象インデックスの
+    /// 不整合検出）を追加する余地も確保する。
     pub fn hnsw_rs_search_topk(
         index: &Hnsw<'_, f32, DistDot>,
         query: &[f32],

@@ -382,7 +382,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hnsw-compare
-bench-hnsw-compare: ## 自作 HNSW と usearch・hnsw_rs（=0.3.4）の構築時間（スレッド数ラダー）・Recall@10・探索レイテンシを同一条件で比較する（`contrast-bench` feature 限定・C++17 コンパイラが必要。hnsw_rs 側は DistDot の単位ベクトル前提により L2 正規化済みコーパスで評価するため Recall@10 の基準が usearch/self とは異なる点に注意。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_COMPARE_ROWS／BENCH_HNSW_COMPARE_DIM／BENCH_HNSW_COMPARE_THREADS／BENCH_HNSW_COMPARE_QUERIES で条件を上書き可）
+bench-hnsw-compare: ## 自作 HNSW と usearch・hnsw_rs（=0.3.4）の構築時間（スレッド数ラダー）・Recall@10・探索レイテンシを同一条件で比較する（`contrast-bench` feature 限定・C++17 コンパイラが必要。self・usearch・hnsw_rs の 3 エンジンとも同一の L2 正規化済みコーパス・クエリで評価するため Recall@10 を単純比較できる〔hnsw_rs の DistDot が単位ベクトルを前提とするため導入した正規化を 3 エンジン共通へ拡張済み〕。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_COMPARE_ROWS／BENCH_HNSW_COMPARE_DIM／BENCH_HNSW_COMPARE_THREADS／BENCH_HNSW_COMPARE_QUERIES で条件を上書き可）
 ifdef HAS_CARGO
 	cargo bench --bench hnsw_compare_bench -p engine --features contrast-bench
 else
