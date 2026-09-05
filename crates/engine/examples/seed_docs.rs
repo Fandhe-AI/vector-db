@@ -16,13 +16,23 @@
 //! （`seed-meta`）の 1 行として最初に記録し、再実行時は同じ台帳照合で
 //! 「同一内容（再開）／内容不一致（fail-closed に停止）」を処理開始前に判定する。
 //! `<dim>` の変更は `docs` のスキーマ不一致としても停止する。
+//!
+//! `export <db> <out.jsonl>` は、他 DB（pgvector・sqlite-vec・Qdrant 等）との横断
+//! ベンチ用に `seed` が投入した `docs` テーブルの全行（両テナント）を id 昇順の
+//! JSON Lines へ書き出す。RLS 相当のポリシー評価を経由せず `Storage::scan` で
+//! 生の行ストアを直接読む（本ツールはローカル運用者向けのエクスポート専用であり、
+//! テナント境界の強制はしない。wire 経由の読み取り経路とは別物）。
+//! `queries <dim> <n> <out.jsonl>` は `seed` と同じ文生成器を別シードで駆動し、
+//! 決定的な検索クエリ n 件を埋め込みつきで書き出す。
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::embedding::{Embedder, HashingEmbedder};
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
-use engine::row_codec::{encode_scalar_columns, Value};
+use engine::row_codec::{decode_scalar_columns, encode_scalar_columns, Value};
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::TenantWriteError;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 struct Lcg(u64);
@@ -217,6 +227,41 @@ fn vec_literal(v: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// `out` の末尾へ JSON 文字列リテラル（引用符込み）として `s` をエスケープ出力する
+/// （`export`／`queries` サブコマンド専用の手書き JSON 出力。依存追加なしのため
+/// `serde_json` は使わない。リクエスト組み立て専用の最小エスケーパで応答パースは
+/// 対象外という点で `query_planner.rs::json_write_escaped_string` と同じ設計）。
+fn json_write_escaped_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// `out` の末尾へ embedding を JSON 配列として書き出す。`{:?}` の丸め表示ではなく
+/// `f32` の `Display`（最短往復表現）で書き出し、他 DB 側での再解釈精度を落とさない。
+fn json_write_embedding(out: &mut String, v: &[f32]) {
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{x}"));
+    }
+    out.push(']');
+}
+
 /// テーブルを作成する。既存の場合はカタログのスキーマが期待値と完全一致するときだけ
 /// 再利用し、不一致なら fail-closed に終了する（`insert_rows` は embedding 次元しか
 /// 検証しないため、スカラー列の型・順序の不一致をここで塞ぐ）。
@@ -287,8 +332,109 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
 
 /// 使い方を表示して終了する（引数不足・不明なサブコマンド）。
 fn usage() -> ! {
-    eprintln!("usage: seed_docs seed <db> <rows> <dim> | embed <dim> <text...>");
+    eprintln!(
+        "usage: seed_docs seed <db> <rows> <dim> | embed <dim> <text...> \
+         | export <db> <out.jsonl> | queries <dim> <n> <out.jsonl>"
+    );
     std::process::exit(2);
+}
+
+/// `docs` テーブルの全行（両テナント）を id 昇順の JSON Lines で `out` へ書き出す
+/// （他 DB との横断ベンチ用。`seed` サブコマンドが投入したコーパスをそのまま流用する）。
+/// RLS 相当のポリシー評価を経由しない `Storage::scan` で行ストアを直接読む
+/// （本ツールはローカル運用者向けのエクスポート専用。wire 経由の読み取りではない）。
+fn run_export(db: &str, out_path: &str) {
+    let storage = Storage::open(db).expect("open");
+    let schema = storage.get_table_schema("docs").expect("get_table_schema");
+    // ユーザーテーブル（`docs`）は物理テーブルがテーブル名ごとに分かれるため
+    // （`catalog.rs::user_rows_table_def`）、汎用の `Storage::scan`（固定名 "rows"
+    // テーブル専用。本ツールでは未使用）ではなく `Storage::scan_table_page` の
+    // ページングを cursor が尽きるまで繰り返して全行を集める。ページ内は
+    // `(tenant_id, id)` 昇順だがページをまたぐと単純な id 順にならないため、
+    // 全ページ収集後に id で明示的にソートする。
+    let mut rows = Vec::new();
+    let mut after: Option<(String, u64)> = None;
+    loop {
+        let after_ref = after.as_ref().map(|(t, i)| (t.as_str(), *i));
+        let (page, next) = storage
+            .scan_table_page("docs", after_ref, 10_000)
+            .expect("scan_table_page");
+        rows.extend(page);
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    rows.sort_by_key(|r| r.id);
+    let file = File::create(out_path).expect("create out file");
+    let mut w = BufWriter::new(file);
+    for row in &rows {
+        let values = decode_scalar_columns(&schema, &row.metadata).expect("decode metadata");
+        // スキーマ列順は `embedding, lang, topic, body`（`seed` 参照）。embedding の
+        // 位置は `decode_scalar_columns` の契約により常に `Value::Null` のダミーで、
+        // 実体は `row.embedding` から取る。
+        let (lang, topic, body) = match (values.get(1), values.get(2), values.get(3)) {
+            (Some(Value::Text(l)), Some(Value::Text(t)), Some(Value::Text(b))) => (l, t, b),
+            _ => panic!("unexpected docs schema for row {}", row.id),
+        };
+        let mut line = String::new();
+        line.push('{');
+        line.push_str(&format!("\"id\":{}", row.id));
+        line.push_str(",\"tenant\":");
+        json_write_escaped_string(&mut line, &row.tenant_id);
+        line.push_str(",\"lang\":");
+        json_write_escaped_string(&mut line, lang);
+        line.push_str(",\"topic\":");
+        json_write_escaped_string(&mut line, topic);
+        line.push_str(",\"body\":");
+        json_write_escaped_string(&mut line, body);
+        line.push_str(",\"embedding\":");
+        json_write_embedding(&mut line, &row.embedding);
+        line.push('}');
+        writeln!(w, "{line}").expect("write line");
+    }
+    w.flush().expect("flush");
+    eprintln!("done: exported {} rows to {out_path}", rows.len());
+}
+
+/// `seed` と同じ文生成器を別シード（`queries` 専用の固定シード）で駆動し、決定的な
+/// 検索クエリ n 件を生成して `HashingEmbedder` で埋め込み、JSON Lines へ書き出す。
+/// `seed` の文書生成（本文の合成）とは独立した rng ストリームを使うため、生成される
+/// クエリ集合は `<rows>` に依存せず再現可能。
+fn run_queries(dim: u32, n: u64, out_path: &str) {
+    let embedder = HashingEmbedder::new(dim).expect("embedder");
+    let mut rng = Lcg(20260905);
+    let file = File::create(out_path).expect("create out file");
+    let mut w = BufWriter::new(file);
+    for _ in 0..n {
+        let (topic, en, ja) = rng.pick(TOPICS);
+        let is_ja = rng.next().is_multiple_of(3);
+        let text = if is_ja {
+            let a = rng.pick(ja);
+            let b = rng.pick(ja);
+            render(rng.pick(JA_TPL), topic, a, b)
+        } else {
+            let a = rng.pick(en);
+            let b = rng.pick(en);
+            render(rng.pick(EN_TPL), topic, a, b)
+        };
+        let lang = if is_ja { "ja" } else { "en" };
+        let embedding = embedder.embed_batch(&[text.as_str()]).expect("embed");
+        let mut line = String::new();
+        line.push('{');
+        line.push_str("\"text\":");
+        json_write_escaped_string(&mut line, &text);
+        line.push_str(",\"lang\":");
+        json_write_escaped_string(&mut line, lang);
+        line.push_str(",\"topic\":");
+        json_write_escaped_string(&mut line, topic);
+        line.push_str(",\"embedding\":");
+        json_write_embedding(&mut line, &embedding[0]);
+        line.push('}');
+        writeln!(w, "{line}").expect("write line");
+    }
+    w.flush().expect("flush");
+    eprintln!("done: wrote {n} queries to {out_path}");
 }
 
 fn main() {
@@ -446,6 +592,21 @@ fn main() {
                 "done: {rows} rows (tenant-a {rows_a}, tenant-b {rows_b}), dim {dim}, {:.1}s",
                 start.elapsed().as_secs_f64()
             );
+        }
+        Some("export") => {
+            let (Some(db), Some(out_path)) = (args.get(2), args.get(3)) else {
+                usage()
+            };
+            run_export(db, out_path);
+        }
+        Some("queries") => {
+            let (Some(dim), Some(n), Some(out_path)) = (args.get(2), args.get(3), args.get(4))
+            else {
+                usage()
+            };
+            let dim: u32 = dim.parse().expect("dim");
+            let n: u64 = n.parse().expect("n");
+            run_queries(dim, n, out_path);
         }
         _ => usage(),
     }
