@@ -22,19 +22,40 @@ use std::time::Duration;
 
 use engine::hnsw::{HnswBuildProfile, HnswWorkerStats};
 
-/// `Duration` のスライスから中央値を返す（偶数個は下位側の値を採用）。
-/// 対象は計測回数と同程度の小さな配列のため、都度ソートする単純な実装で足りる
-/// （`harness::stats` のような要約統計一式は必要としない）。
+use super::stats;
+
+/// 昇順ソート済み `f64` 列の中央値を線形補間で返す（`harness::stats::summarize`
+/// の `percentile(sorted, 0.5)` と同一の補間規則。codex-review P2 指摘・PR #445:
+/// 従来は偶数個のとき中央 2 件の上側 `sorted[len/2]` を採用しており、`total` の
+/// 中央値（`stats::summarize` 経由・補間あり）と定義が食い違っていたため、
+/// `serial_share`・`parallel_vs_control` が歪む要因になっていた）。
+/// `sorted` が空の場合の呼び出しは想定しない（呼び出し元で空チェック済み）。
+fn interpolated_median_f64(sorted: &[f64]) -> f64 {
+    let last_index = sorted.len().saturating_sub(1);
+    let rank = 0.5 * last_index as f64;
+    let lower_index = rank.floor() as usize;
+    let upper_index = rank.ceil() as usize;
+    let lower = sorted.get(lower_index).copied().unwrap_or_default();
+    let upper = sorted.get(upper_index).copied().unwrap_or_default();
+    if lower_index == upper_index {
+        return lower;
+    }
+    let frac = rank - lower_index as f64;
+    lower + (upper - lower) * frac
+}
+
+/// `Duration` のスライスから中央値を返す（線形補間。`stats::summarize` の
+/// `median` と同一の値になる——`stats::summarize` をそのまま呼ぶ）。
 pub fn median_duration(values: &[Duration]) -> Option<Duration> {
     if values.is_empty() {
         return None;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort();
-    sorted.get(sorted.len() / 2).copied()
+    stats::summarize(values).ok().map(|s| s.median)
 }
 
 /// `u64` のスライスから `(min, median, max)` を返す。空なら `None`。
+/// 中央値は [`interpolated_median_f64`] と同一の補間規則（`stats::summarize`
+/// の `percentile` と同一の式を `f64` 空間で適用し、最も近い整数へ丸める）。
 pub fn min_median_max_u64(values: &[u64]) -> Option<(u64, u64, u64)> {
     if values.is_empty() {
         return None;
@@ -43,11 +64,13 @@ pub fn min_median_max_u64(values: &[u64]) -> Option<(u64, u64, u64)> {
     sorted.sort_unstable();
     let min = *sorted.first()?;
     let max = *sorted.last()?;
-    let median = *sorted.get(sorted.len() / 2)?;
+    let as_f64: Vec<f64> = sorted.iter().map(|&v| v as f64).collect();
+    let median = interpolated_median_f64(&as_f64).round() as u64;
     Some((min, median, max))
 }
 
-/// `Duration` のスライスから `(min, median, max)` を返す。
+/// `Duration` のスライスから `(min, median, max)` を返す。中央値は
+/// `stats::summarize` と同一の線形補間規則。
 pub fn min_median_max_duration(values: &[Duration]) -> Option<(Duration, Duration, Duration)> {
     if values.is_empty() {
         return None;
@@ -56,7 +79,7 @@ pub fn min_median_max_duration(values: &[Duration]) -> Option<(Duration, Duratio
     sorted.sort();
     let min = *sorted.first()?;
     let max = *sorted.last()?;
-    let median = *sorted.get(sorted.len() / 2)?;
+    let median = stats::summarize(&sorted).ok()?.median;
     Some((min, median, max))
 }
 

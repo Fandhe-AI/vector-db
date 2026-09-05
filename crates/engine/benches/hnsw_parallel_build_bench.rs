@@ -104,7 +104,9 @@ fn resolve_thread_ladder() -> Vec<usize> {
 }
 
 /// `threads` での構築を `protocol::run` の下限（warmup・計測いずれも 20 回）で
-/// 計測し、`run` 自身の外部計測（`total_median`）と、各試行内で
+/// 計測し、`run` 自身の外部計測（`wall_median`。索引の drop を含む壁時間。
+/// codex-review P2 指摘・PR #445 対応で `serial_share`・`total_speedup` の
+/// 分母には使わない——下記コメント参照）と、各試行内で
 /// `build_with_threads_observed` が返した [`HnswBuildProfile`] 一式
 /// （`Mutex<Vec<_>>` へ push して閉包の外へ回収する）を返す。
 fn measure_threads_profiled(
@@ -133,6 +135,13 @@ fn measure_threads_profiled(
     // なる。段別中央値・ワーカー統計は計測フェーズの標本のみから算出する
     // （codex-review P1 指摘・PR #445）。
     let measured = measured_tail(&collected, config.measured_iterations() as usize).to_vec();
+    // `measurement.summary.median`（`wall_median`）は `run` のクロージャ内で
+    // 生成された `HnswIndex` の drop（索引破棄）まで含む壁時間であり、
+    // `HnswBuildProfile.total`（構築のみの壁時間）より長くなり得る。
+    // `serial_share`・`total_speedup` の分母に使うと構築中の逐次割合を
+    // 過小評価する（codex-review P2 指摘・PR #445）ため、呼び出し元へは
+    // 参考値として返すのみに留め、実際の分母には `measured` から算出した
+    // `HnswBuildProfile.total` の中央値を使わせる。
     Ok((measurement.summary.median, measured))
 }
 
@@ -267,7 +276,18 @@ fn main() {
         let mut parallel_speedup_for_ceiling: Option<f64> = None;
 
         match measure_threads_profiled(&corpus, params, threads) {
-            Ok((total_median, profiles)) => {
+            Ok((wall_median, profiles)) => {
+                // `serial_share`・`total_speedup` の分母は外側 `run` の
+                // `wall_median`（索引 drop を含む）ではなく、計測標本ごとの
+                // `HnswBuildProfile.total`（構築のみの壁時間）の中央値を使う
+                // （codex-review P2 指摘・PR #445）。`threads==1` の縮退経路
+                // （`build_with_threads_observed` 参照）でも `total` は
+                // 構築全量の壁時間を持つため、そのまま分母に使える。
+                let total_median =
+                    min_median_max_duration(&profiles.iter().map(|p| p.total).collect::<Vec<_>>())
+                        .map(|(_, med, _)| med)
+                        .unwrap_or_default();
+
                 if threads == 1 {
                     baseline_total = Some(total_median);
                 }
@@ -329,13 +349,14 @@ fn main() {
                 .unwrap_or(f64::NAN);
 
                 println!(
-                    "hnsw_parallel_build: threads={threads} total={:.3}ms level={:.3}ms prefix={:.3}ms parallel={:.3}ms freeze={:.3}ms repair={:.3}ms serial_share={share:.2}% parallel_speedup={parallel_speedup:.3}x total_speedup={total_speedup:.3}x",
+                    "hnsw_parallel_build: threads={threads} total={:.3}ms level={:.3}ms prefix={:.3}ms parallel={:.3}ms freeze={:.3}ms repair={:.3}ms serial_share={share:.2}% parallel_speedup={parallel_speedup:.3}x total_speedup={total_speedup:.3}x wall_median_with_drop={:.3}ms",
                     total_median.as_secs_f64() * 1000.0,
                     level_assign.as_secs_f64() * 1000.0,
                     sequential_prefix.as_secs_f64() * 1000.0,
                     parallel_phase.as_secs_f64() * 1000.0,
                     freeze.as_secs_f64() * 1000.0,
                     repair.as_secs_f64() * 1000.0,
+                    wall_median.as_secs_f64() * 1000.0,
                 );
 
                 if let Some(representative) = pick_representative(&profiles) {

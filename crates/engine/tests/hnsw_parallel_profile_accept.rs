@@ -32,15 +32,18 @@ fn median_duration_odd_count_picks_middle_value() {
 }
 
 #[test]
-fn median_duration_even_count_picks_lower_of_middle_pair() {
-    // 4 要素ソート後 [10, 20, 30, 40] の中央値は下位側 (index len/2 = 2) を採用する。
+fn median_duration_even_count_interpolates_middle_pair() {
+    // 4 要素ソート後 [10, 20, 30, 40] の中央値は中央 2 件 (20, 30) の線形補間
+    // (`stats::summarize` と同一の規則) で 25ms になる（codex-review P2
+    // 指摘・PR #445: 従来は中央 2 件の上側 30ms を採用しており、`total` の
+    // 中央値〔`stats::summarize` 経由・補間あり〕と定義が食い違っていた）。
     let values = vec![
         Duration::from_millis(40),
         Duration::from_millis(10),
         Duration::from_millis(30),
         Duration::from_millis(20),
     ];
-    assert_eq!(median_duration(&values), Some(Duration::from_millis(30)));
+    assert_eq!(median_duration(&values), Some(Duration::from_millis(25)));
 }
 
 #[test]
@@ -64,6 +67,16 @@ fn min_median_max_u64_empty_is_none() {
 }
 
 #[test]
+fn min_median_max_u64_even_count_interpolates_median() {
+    // ソート後 [1, 3, 5, 9] の中央値は中央 2 件 (3, 5) の補間で 4
+    // （`stats::summarize` と同一の補間規則を `f64` 空間で適用し四捨五入）。
+    let (min, median, max) = min_median_max_u64(&[9, 1, 5, 3]).unwrap();
+    assert_eq!(min, 1);
+    assert_eq!(median, 4);
+    assert_eq!(max, 9);
+}
+
+#[test]
 fn min_median_max_duration_reports_all_three() {
     let values = vec![
         Duration::from_millis(5),
@@ -74,6 +87,22 @@ fn min_median_max_duration_reports_all_three() {
     assert_eq!(min, Duration::from_millis(1));
     assert_eq!(median, Duration::from_millis(3));
     assert_eq!(max, Duration::from_millis(5));
+}
+
+#[test]
+fn min_median_max_duration_even_count_interpolates_median() {
+    // 4 要素ソート後 [10, 20, 30, 40] の中央値は中央 2 件 (20, 30) の線形補間で
+    // 25ms（`median_duration_even_count_interpolates_middle_pair` と同一の規則）。
+    let values = vec![
+        Duration::from_millis(40),
+        Duration::from_millis(10),
+        Duration::from_millis(30),
+        Duration::from_millis(20),
+    ];
+    let (min, median, max) = min_median_max_duration(&values).unwrap();
+    assert_eq!(min, Duration::from_millis(10));
+    assert_eq!(median, Duration::from_millis(25));
+    assert_eq!(max, Duration::from_millis(40));
 }
 
 // --- serial_share ---
@@ -171,9 +200,13 @@ fn pick_representative_selects_profile_closest_to_median_total() {
         profile_with_total(21),
         profile_with_total(100),
     ];
-    // 中央値 (4 要素・下位側採用) は sorted [10, 20, 21, 100] の index 2 = 21。
+    // 中央値 (4 要素・線形補間) は sorted [10, 20, 21, 100] の中央 2 件 (20, 21)
+    // の補間で 20.5ms。20ms・21ms が同じ距離 (0.5ms) で並ぶため、入力順で
+    // 先に現れる 20ms を代表実行として選ぶ（`min_by_key` の決定的タイブレーク。
+    // codex-review P2 指摘・PR #445 で `median_duration` を補間規則へ統一した
+    // ことに伴う期待値更新）。
     let picked = pick_representative(&profiles).unwrap();
-    assert_eq!(picked.total, Duration::from_millis(21));
+    assert_eq!(picked.total, Duration::from_millis(20));
 }
 
 #[test]
