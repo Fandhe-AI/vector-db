@@ -23,6 +23,7 @@ import psycopg
 from pgvector.psycopg import register_vector
 
 from common import (
+    doc_visibility,
     TENANT_VISIBLE,
     build_meta,
     env_port,
@@ -89,7 +90,7 @@ def _ingest_bulk(conn: psycopg.Connection, docs: list[dict]) -> dict:
                         d["tenant"],
                         # 旧フィクスチャ（visibility 未導入）との互換のため
                         # 欠落時は fail-closed で private 扱いにする。
-                        d.get("visibility", "private"),
+                        doc_visibility(d),
                         d["lang"],
                         d.get("topic", ""),
                         d["body"],

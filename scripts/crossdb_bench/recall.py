@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from common import TENANT_VISIBLE, load_jsonl
+from common import doc_visibility, load_jsonl
 
 # float32 の総和順序差に起因する同点境界の見落としを防ぐための許容誤差。
 # モジュール docstring の「同点判定には小さな許容誤差」を参照。
@@ -44,11 +44,9 @@ TIE_EPSILON = 1e-4
 
 
 def _visible_mask(docs: list[dict]) -> list[bool]:
-    has_visibility_field = any("visibility" in d for d in docs)
-    if has_visibility_field:
-        return [d.get("visibility") == "public" for d in docs]
-    # 旧フィクスチャ互換（visibility 未導入時のみ）: 従来どおり tenant-a 一致。
-    return [d.get("tenant") == TENANT_VISIBLE for d in docs]
+    # 投入側（各 `*_db.py`）と同じ `common.doc_visibility` で判定し、旧フィクスチャ
+    # （visibility 未導入）の欠落値の扱いを両側で統一する。
+    return [doc_visibility(d) == "public" for d in docs]
 
 
 def build_ground_truth(

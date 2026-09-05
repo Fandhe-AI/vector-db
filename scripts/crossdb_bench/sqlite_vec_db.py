@@ -32,6 +32,7 @@ import time
 import sqlite_vec
 
 from common import (
+    doc_visibility,
     TENANT_VISIBLE,
     build_meta,
     measure,
@@ -95,7 +96,7 @@ def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict]) -> dict:
         [
             # 旧フィクスチャ（visibility 未導入）との互換のため欠落時は
             # fail-closed で private 扱いにする。
-            (d["id"], d["tenant"], d.get("visibility", "private"), d["lang"], d.get("topic", ""), d["body"])
+            (d["id"], d["tenant"], doc_visibility(d), d["lang"], d.get("topic", ""), d["body"])
             for d in docs
         ],
     )
@@ -105,7 +106,7 @@ def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict]) -> dict:
             (
                 d["id"],
                 _pack(d["embedding"]),
-                d.get("visibility", "private"),
+                doc_visibility(d),
                 d["tenant"],
                 d["lang"],
                 d.get("topic", ""),

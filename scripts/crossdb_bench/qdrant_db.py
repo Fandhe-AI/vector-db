@@ -20,7 +20,7 @@ import time
 
 from qdrant_client import QdrantClient, models
 
-from common import TENANT_VISIBLE, build_meta, env_port, measure, unsupported
+from common import doc_visibility, TENANT_VISIBLE, build_meta, env_port, measure, unsupported
 
 HOST = "127.0.0.1"
 # 既定値 16333/16334 は containers.sh の `${CROSSDB_QDRANT_HTTP_PORT:-16333}`／
@@ -99,7 +99,7 @@ def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
                         "tenant": d["tenant"],
                         # 旧フィクスチャ（visibility 未導入）との互換のため
                         # 欠落時は fail-closed で private 扱いにする。
-                        "visibility": d.get("visibility", "private"),
+                        "visibility": doc_visibility(d),
                         "lang": d["lang"],
                         "topic": d.get("topic", ""),
                         # 広域取得（bulk_* フェーズ）が id と本文を返すために保持する。

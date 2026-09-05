@@ -27,6 +27,21 @@ ITERS = 50
 TENANT_VISIBLE = "tenant-a"
 TENANT_OTHER = "tenant-b"
 
+def doc_visibility(doc: dict) -> str:
+    """フィクスチャ行の可視性を返す（投入側・正解生成側で共有する唯一の判定）。
+
+    `visibility` キーがあればその値、無い旧フィクスチャ（visibility 未導入）では
+    `tenant == TENANT_VISIBLE` を public、それ以外を private とみなす。投入側が
+    欠落値を無条件に private として保存すると、正解生成（`recall.py`）が
+    tenant-a を可視とみなす契約と食い違い、空結果を非空の正解集合と比較して
+    Recall=0 を記録してしまう（codex-review 指摘）ため、両側で本関数を使う。
+    """
+    vis = doc.get("visibility")
+    if vis is not None:
+        return str(vis)
+    return "public" if doc.get("tenant") == TENANT_VISIBLE else "private"
+
+
 def public_only_where(table_alias: str = "") -> str:
     """RLS 相当の可視性フィルタ SQL 断片を組み立てる。
 

@@ -22,7 +22,7 @@ import time
 
 import lancedb
 
-from common import TENANT_VISIBLE, build_meta, measure, sql_escape_literal, unsupported
+from common import doc_visibility, TENANT_VISIBLE, build_meta, measure, sql_escape_literal, unsupported
 
 TABLE = "docs"
 
@@ -54,7 +54,7 @@ def _setup_table(db: lancedb.DBConnection, docs: list[dict]):
             "tenant": d["tenant"],
             # 旧フィクスチャ（visibility 未導入）との互換のため欠落時は
             # fail-closed で private 扱いにする。
-            "visibility": d.get("visibility", "private"),
+            "visibility": doc_visibility(d),
             "lang": d["lang"],
             "topic": d.get("topic", ""),
             "body": d["body"],

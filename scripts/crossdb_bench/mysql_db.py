@@ -21,7 +21,7 @@ import time
 
 import mysql.connector
 
-from common import TENANT_VISIBLE, build_meta, env_port, measure, unsupported, vec_literal
+from common import doc_visibility, TENANT_VISIBLE, build_meta, env_port, measure, unsupported, vec_literal
 
 HOST = "127.0.0.1"
 # 既定値 33306 は containers.sh の `${CROSSDB_MYSQL_PORT:-33306}` と一致させること。
@@ -71,7 +71,7 @@ def _ingest_bulk(conn, docs: list[dict]) -> dict:
                 d["tenant"],
                 # 旧フィクスチャ（visibility 未導入）との互換のため欠落時は
                 # fail-closed で private 扱いにする。
-                d.get("visibility", "private"),
+                doc_visibility(d),
                 d["lang"],
                 d.get("topic", ""),
                 d["body"],

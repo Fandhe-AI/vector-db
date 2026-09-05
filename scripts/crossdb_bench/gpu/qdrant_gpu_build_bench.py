@@ -126,8 +126,12 @@ def upsert_all(client: QdrantClient, corpus: np.ndarray, batch: int = 1_000) -> 
     return {"rows": rows, "seconds": elapsed, "rows_per_sec": rows / elapsed if elapsed > 0 else None}
 
 
-def wait_indexed(client: QdrantClient, rows: int) -> dict[str, Any]:
-    t0 = time.perf_counter()
+def wait_indexed(client: QdrantClient, rows: int, t0: float) -> dict[str, Any]:
+    """`t0`（`enable_indexing` 送信直前の時刻）から green かつ全件 indexed までを計時する。
+
+    開始要求の同期応答中に進んだ構築を含めるため、計時開始は呼び出し側が
+    `enable_indexing` の直前に取る（codex-review 指摘）。
+    """
     last_info = None
     while True:
         info = client.get_collection(COLLECTION)
@@ -283,8 +287,9 @@ def run_one(client: QdrantClient, rows: int, dim: int, container_name: str | Non
 
     setup_collection(client, dim)
     upsert_result = upsert_all(client, corpus)
+    t_index0 = time.perf_counter()
     enable_indexing(client)
-    index_result = wait_indexed(client, rows)
+    index_result = wait_indexed(client, rows, t_index0)
     search_result = measure_search(client, queries)
 
     entry: dict[str, Any] = {
