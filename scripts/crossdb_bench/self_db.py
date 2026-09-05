@@ -175,6 +175,14 @@ def run(args, queries: list[dict]) -> dict:
     `run(args, docs, queries)` とは引数の意味が異なる。docs jsonl は不要
     ——wire-server は既存 redb をそのまま開くため再投入しない）。
     """
+    # self は既定エンジン（brute-force）のみを wire 経由で計測できる（ANN opt-in は
+    # wire から選択できない）。hnsw 構成を受理して exact と同じ経路の結果を
+    # self_hnsw.json として保存すると比較結果を誤認させるため拒否する。
+    if args.config != "exact":
+        raise ValueError(
+            f"self supports only --config exact (got {args.config!r}); "
+            "ANN opt-in is not selectable over the wire protocol"
+        )
     workdir = args.workdir
     # 計測は redb を書き換える（ingest_single_stmt が行と operation_id 台帳を追加する）
     # ため、渡された fixture を直接開かず作業コピーに対して実行する。コピーしないと

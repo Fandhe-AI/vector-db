@@ -125,6 +125,15 @@ def _ingest_single_stmt(conn: sqlite3.Connection, dim: int, n_rows: int = 1000) 
     return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
 
 
+def _fts5_quote(text: str) -> str:
+    """自然文を FTS5 の語句クエリへ変換する（各語を二重引用符で囲み、内部の引用符は
+    二重化。空文字なら 1 件も一致しない語句を返す）。"""
+    terms = [t for t in text.split() if t]
+    if not terms:
+        return '""'
+    return " ".join('"' + t.replace('"', '""') + '"' for t in terms)
+
+
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
     conn = _connect()
     dim = len(docs[0]["embedding"]) if docs else 128
@@ -208,16 +217,15 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             (_pack(qv),),
         )
         knn_ids = [r[0] for r in cur.fetchall()]
-        try:
-            cur.execute(
-                "SELECT docs_fts.rowid FROM docs_fts JOIN docs ON docs.id = docs_fts.rowid "
-                "WHERE docs_fts MATCH ? AND docs.visibility = 'public' ORDER BY bm25(docs_fts) LIMIT 50",
-                (qt,),
-            )
-            fts_ids = [r[0] for r in cur.fetchall()]
-        except sqlite3.OperationalError:
-            # FTS5 のクエリ構文エラー（記号混入等）は空集合扱いにして KNN 側のみで融合する。
-            fts_ids = []
+        # 自然文をそのまま MATCH に渡すとピリオド等が FTS5 構文として解釈され構文エラーに
+        # なる。各語を二重引用符で囲んだ語句の並び（暗黙 AND）へ変換し、失敗は握りつぶさず
+        # 伝播させる（呼び出し側でフェーズ全体を理由付き unsupported にする）。
+        cur.execute(
+            "SELECT docs_fts.rowid FROM docs_fts JOIN docs ON docs.id = docs_fts.rowid "
+            "WHERE docs_fts MATCH ? AND docs.visibility = 'public' ORDER BY bm25(docs_fts) LIMIT 50",
+            (_fts5_quote(qt),),
+        )
+        fts_ids = [r[0] for r in cur.fetchall()]
         # RRF(k=60) を Python 側で計算（sqlite-vec/FTS5 にネイティブ融合機能は無い）。
         scores: dict[int, float] = {}
         for rank, rid in enumerate(knn_ids, start=1):
@@ -228,8 +236,11 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         return [rid for rid, _ in top]
 
     idxs = list(range(len(query_vecs)))
-    stats, _ = measure(hybrid, idxs)
-    phases["hybrid_rrf"] = stats
+    try:
+        stats, _ = measure(hybrid, idxs)
+        phases["hybrid_rrf"] = stats
+    except sqlite3.Error as e:
+        phases["hybrid_rrf"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
     phases["mode_recall"] = unsupported("sqlite-vec にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("sqlite-vec にモード切替（recall/precision）の概念が無い")

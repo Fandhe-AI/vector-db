@@ -27,7 +27,9 @@ up_pgvector() {
     pgvector/pgvector:pg17 >/dev/null
   echo "bench-pgvector: waiting for readiness..."
   for _ in $(seq 1 60); do
-    if docker exec bench-pgvector pg_isready -U postgres >/dev/null 2>&1; then
+    # -h 127.0.0.1 で TCP listener を確認する（Unix socket だけを見る既定形では
+    # 初期化用の一時 PostgreSQL でも成功してしまい、直後の接続が拒否されうる）。
+    if docker exec bench-pgvector pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then
       echo "bench-pgvector: ready"
       return 0
     fi
