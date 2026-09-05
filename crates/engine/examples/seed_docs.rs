@@ -3,8 +3,19 @@
 //! wire-server を起動して psql 等の実クライアントから `USING PLAN` や hybrid 検索を
 //! 手で叩く際に、`docs` テーブルへ合成コーパスを用意するために使う。
 //! `seed <db> <rows> <dim>` で 2 テナント（`tenant-a`／`tenant-b`。行数を問わず
-//! 約 1 割のバッチが `tenant-b`。`rows < 10` は拒否）分の合成文書を Public 可視で投入し、`embed <dim> <text>` で同じ `HashingEmbedder` による
-//! クエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
+//! 約 1 割のバッチが `tenant-b`。`rows < 10` は拒否）分の合成文書を投入する。
+//! `tenant-a` の行は `Visibility::Public`、`tenant-b` の行は `Visibility::Private`
+//! で投入し、他 DB 横断ベンチで RLS 相当のテナント境界を比較できるようにする
+//! （両可視性を混在させることで「全行 Public」だった旧挙動との差を作る）。
+//! ただし wire-server の既定認証経路（`auth::verify` → `PolicyContext::new`）は
+//! `Public` のみを許可可視性とし、`Private` 行は所有テナント自身にも wire 越しには
+//! 見えない（`crates/wire-server/src/simple_query.rs` 冒頭コメント・
+//! `wire1_three_tenant_visibility_public_shared_private_hidden` 参照。ポインタ:
+//! RLS-6/RLS-7）。そのため wire 経由の可視行数は tenant-a・tenant-b のどちらの
+//! セッションでも `tenant-a` の `Public` 行数のみになり、`tenant-b` 自身の
+//! `Private` 行は含まれない（Rust API から `PolicyContext::with_visibilities` で
+//! `Private` を明示許可すれば別途確認できる）。`embed <dim> <text>` で同じ
+//! `HashingEmbedder` によるクエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
 //! 引数はローカル運用者の入力であり wire 経由の untrusted 入力ではないため、
 //! 解析失敗は `expect` で即終了させる。
 //!
@@ -18,10 +29,11 @@
 //! `<dim>` の変更は `docs` のスキーマ不一致としても停止する。
 //!
 //! `export <db> <out.jsonl>` は、他 DB（pgvector・sqlite-vec・Qdrant 等）との横断
-//! ベンチ用に `seed` が投入した `docs` テーブルの全行（両テナント）を id 昇順の
-//! JSON Lines へ書き出す。RLS 相当のポリシー評価を経由せず `Storage::scan` で
-//! 生の行ストアを直接読む（本ツールはローカル運用者向けのエクスポート専用であり、
-//! テナント境界の強制はしない。wire 経由の読み取り経路とは別物）。
+//! ベンチ用に `seed` が投入した `docs` テーブルの全行（両テナント・両可視性）を
+//! id 昇順の JSON Lines（各行に `"visibility":"public"|"private"` を含む）へ
+//! 書き出す。RLS 相当のポリシー評価を経由せず `Storage::scan` で生の行ストアを
+//! 直接読む（本ツールはローカル運用者向けのエクスポート専用であり、テナント境界の
+//! 強制はしない。wire 経由の読み取り経路とは別物）。
 //! `queries <dim> <n> <out.jsonl>` は `seed` と同じ文生成器を別シードで駆動し、
 //! 決定的な検索クエリ n 件を埋め込みつきで書き出す。
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
@@ -382,6 +394,12 @@ fn run_export(db: &str, out_path: &str) {
         line.push_str(&format!("\"id\":{}", row.id));
         line.push_str(",\"tenant\":");
         json_write_escaped_string(&mut line, &row.tenant_id);
+        line.push_str(",\"visibility\":");
+        let visibility_str = match row.visibility {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        };
+        json_write_escaped_string(&mut line, visibility_str);
         line.push_str(",\"lang\":");
         json_write_escaped_string(&mut line, lang);
         line.push_str(",\"topic\":");
@@ -492,11 +510,14 @@ fn main() {
                 // `id <= rows` のため `rows - id` は非負で、`end <= rows` が保証される
                 // （`id + batch - 1` の直接加算は `rows` が `u64::MAX` 付近でオーバーフローする）。
                 let end = id + (batch - 1).min(rows - id);
-                // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）
-                let (ctx, tenant_tag) = if batch_no % 10 == 9 {
-                    (&ctx_b, "b")
+                // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）。
+                // tenant-a は Public、tenant-b は Private で投入し、RLS 相当の
+                // テナント境界を他 DB と比較できるようにする（モジュール冒頭コメント
+                // 参照。wire 経由では Private 行は所有テナントにも見えない）。
+                let (ctx, tenant_tag, visibility) = if batch_no % 10 == 9 {
+                    (&ctx_b, "b", Visibility::Private)
                 } else {
-                    (&ctx_a, "a")
+                    (&ctx_a, "a", Visibility::Public)
                 };
                 let mut bodies = Vec::new();
                 let mut metas: Vec<(u64, String, String)> = Vec::new();
@@ -548,7 +569,7 @@ fn main() {
                             *i,
                             RowInput {
                                 tenant_id: ctx.tenant_id(),
-                                visibility: Visibility::Public,
+                                visibility,
                                 embedding: emb,
                                 metadata: meta,
                             },
