@@ -369,7 +369,10 @@ def run(args, queries: list[dict]) -> dict:
         )
 
         # --- ingest_single_stmt: 行形 INSERT を 1,000 行単文で送る ---
-        rng_dim = DIM
+        # 投入ベクトルの次元はクエリ fixture（`queries200.jsonl`）の embedding から
+        # 取る。DIM（128）固定にすると 128 以外で seed した redb では列型
+        # `Vector(dim)` と不一致になり投入が全件拒否される（codex-review P2）。
+        rng_dim = len(queries[0]["embedding"]) if queries else DIM
 
         def make_row_sql(n: int) -> str:
             import random
@@ -423,6 +426,7 @@ def run(args, queries: list[dict]) -> dict:
             connection="loopback TCP (psycopg simple query protocol)",
             config=args.config,
             rows=rows_visible,
+            dim=rng_dim,
         )
         return {"meta": meta, "phases": phases}
     finally:
