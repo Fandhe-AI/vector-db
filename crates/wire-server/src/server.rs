@@ -10,6 +10,10 @@
 //!
 //! 対応: TASK-67 の review 是正（loopback bind の TOCTOU 排除。TASK-70 で
 //! [`crate::bind_guard`] へ移設・拡張）。TASK-69（WIRE-5, WIRE-6。接続資源保護）。
+//!
+//! ソケットオプション方針: accept 直後に全接続へ `TCP_NODELAY` を設定し、
+//! Nagle アルゴリズムを無効化する（簡易クエリ応答の複数 `write_all` 分割と
+//! delayed ACK の相互作用による遅延を避けるため）。
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -197,6 +201,19 @@ fn accept_loop_inner(
 
         if let Err(e) = limits::apply_read_timeout(&stream, read_timeout) {
             eprintln!("wire-server: failed to configure connection timeouts: {e}");
+            // `permit` はここでスコープを抜けて解放される。
+            continue;
+        }
+
+        // TCP_NODELAY を有効化する（Nagle アルゴリズムの無効化）。
+        // PostgreSQL 本体・libpq も同様に接続へ TCP_NODELAY を設定する慣行があり、
+        // 簡易クエリ応答は複数の小さな `write_all`（RowDescription・DataRow・
+        // CommandComplete・ReadyForQuery 等）に分かれて送出されるため、Nagle
+        // アルゴリズムと受信側の delayed ACK が相互作用し 40ms 級の余計な遅延が
+        // 発生しうる。失敗時は `apply_read_timeout` と同様に当該接続をスキップする
+        // （fail-closed。ソケットオプション設定に失敗した接続を放置しない）。
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("wire-server: failed to set TCP_NODELAY: {e}");
             // `permit` はここでスコープを抜けて解放される。
             continue;
         }
