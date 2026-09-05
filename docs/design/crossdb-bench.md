@@ -177,7 +177,7 @@ k を変えて切り分けた（`scratchpad` 上の ad-hoc 計測・50 反復・
   4.2 ms で pgvector（5.0 ms）と同等以上であり、スカラー列投影を Top-k 確定後の
   k 行に限定できれば `id, body` k=1000 も 5 ms 前後（`id` 4.2 ms ＋ 124 KB の本文
   送出）まで下がる余地がある。この改善は production コード（`sql/exec.rs`）の変更を
-  伴うため本 PR の対象外とし、別 Issue の候補として申し送る。
+  伴うため本 PR の対象外とし、Issue #453 として起票した。
 - **フィルタ＋ソート（既存 DB 型の使い方）でも self は中位〜下位。** k=10 の
   `vector_knn_where` は self 2.8 ms に対し Qdrant 0.6〜0.7 ms・sqlite-vec 1.8 ms・
   pgvector 2.2 ms。k=200 の `bulk_knn_where_k200` は self 4.7 ms に対し pgvector 2.4〜2.5 ms・
@@ -186,7 +186,8 @@ k を変えて切り分けた（`scratchpad` 上の ad-hoc 計測・50 反復・
   約 2 ms 分乗っている。
 - **ソートなしのスカラーフィルタ取得は self に経路が無い。** 他 DB は 0.24 ms
   （sqlite-vec）〜4.9 ms（Qdrant scroll）で 500 行を返す。設計思想どおりの
-  「フィルタのみで広く返す」経路を SQL 表層へ加えるかは spec 側の判断事項。
+  「フィルタのみで広く返す」経路は、オーナー確認（2026-09-05）を経て
+  広域取得／従来型の 2 モード構想として Issue #454 に起票した（spec 側の定義が前提）。
 - **ベクトル検索の本体は速い。** `SELECT id` の k=10 0.7 ms・k=1000 4.2 ms は brute-force
   ながら Qdrant exact と同等で、投影・フィルタ経路のオーバーヘッドを取り除けば広域取得
   でも上位に入る見込み。
@@ -334,8 +335,7 @@ GPU 経路は in-process API（`engine::gpu_batch`）のみで SQL／wire から
 - SQL 表層のフィルタ付き経路・集計の wire 越し 2.7〜6 ms は、in-process との差分を
   wire 側（応答組み立て・テキスト化）と SQL 側で切り分ける profiling が未実施。
 - スカラー列投影時の全行デコード（`sql/exec.rs::on_visible_row` の `scan_scalar_columns`）
-  を Top-k 確定後の k 行へ遅延させる改善は production 変更のため別 Issue 候補（上記
-  「self の投影コスト切り分け」節）。ORDER BY なしのフィルタのみ行取得の SQL 表層追加は
-  spec 側判断。
+  を Top-k 確定後の k 行へ遅延させる改善は Issue #453（上記「self の投影コスト切り分け」節）。
+  ORDER BY なしのフィルタのみ行取得（広域取得モード）の SQL 表層追加は Issue #454。
 - engine GPU 経路の大バッチ頭打ち（Top-k の GPU 化・転送量削減）は別タスク。
 - 本計測は共有 VM（loadavg 約 2）での単発実測であり、専有環境での再測定は未実施。
