@@ -72,7 +72,7 @@ use harness::hnsw_compare::{
     render_self_params_line, render_usearch_params_line, resolve_dim, resolve_queries,
     resolve_rows, resolve_thread_ladder, speedup, EF_SEARCH, TOP_K,
 };
-use harness::protocol::{run, MeasurementConfig};
+use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
 use engine::hnsw::{HnswIndex, HnswParams, HnswSearchScratch};
 use engine::isa;
@@ -83,6 +83,13 @@ fn running_under_github_actions() -> bool {
 }
 
 /// engine 側 1 スレッド数点の構築時間中央値を計測する。
+///
+/// `protocol::run` は戻り値（構築済み索引）を計測区間の内側で drop する契約
+/// （`protocol.rs::run` モジュールコメント）のため、索引解放コストが
+/// `build_median` へ混入する（codex-review P2 指摘・PR #445）。索引の drop を
+/// 計測区間の外側へ追い出す [`run_bounded_retain`]（`retain_capacity=1`。
+/// 直前 1 件だけを保持し、次の反復で新しい索引と入れ替える際に古い索引を
+/// 計測区間の外側で drop する）を使う。
 fn measure_self_build(
     corpus: &[f32],
     dim: usize,
@@ -91,7 +98,7 @@ fn measure_self_build(
 ) -> Result<std::time::Duration, String> {
     let config = MeasurementConfig::new(20, 20, 0xC0FF_EE00 ^ threads as u64)
         .map_err(|e| format!("threads={threads}: {e}"))?;
-    let measurement = run(&config, || {
+    let (measurement, _retained) = run_bounded_retain(&config, 1, || {
         HnswIndex::build_with_threads(params, dim as u32, corpus, 1, threads)
             .expect("self build should succeed on well-formed corpus")
     })
@@ -100,6 +107,9 @@ fn measure_self_build(
 }
 
 /// usearch 側 1 スレッド数点の構築時間中央値を計測する。
+///
+/// [`measure_self_build`] と同じ理由で [`run_bounded_retain`] を使い、
+/// usearch 側索引の解放コストも計測区間の外側へ追い出す。
 fn measure_usearch_build(
     rows: usize,
     dim: usize,
@@ -108,7 +118,7 @@ fn measure_usearch_build(
 ) -> Result<std::time::Duration, String> {
     let config = MeasurementConfig::new(20, 20, 0xBEEF_0000 ^ threads as u64)
         .map_err(|e| format!("threads={threads}: {e}"))?;
-    let measurement = run(&config, || {
+    let (measurement, _retained) = run_bounded_retain(&config, 1, || {
         build_usearch_index_parallel(rows, dim, corpus, threads)
             .expect("usearch parallel build should succeed on well-formed corpus")
     })

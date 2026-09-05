@@ -164,6 +164,15 @@ pub struct HnswWorkerStats {
     /// `BuildGraph::read_links`／`write_links` の取得試行総数
     /// （`link_lock_blocked` 込み）。
     pub link_lock_acquired: u64,
+    /// `link_lock_blocked` に数えた取得（`try_read`／`try_write` が
+    /// `WouldBlock` を返しブロックする取得へ落ちた場合）のみ、実際に
+    /// ロックが取れるまで `Instant` で計測した待ち時間の累積
+    /// （codex-review P2 指摘・PR #445: ロック競合が頭打ちの主要因かどうかを
+    /// `busy` に対する割合で判定できるようにする。観測版
+    /// `build_parallel_graph_observed` 限定の計装であり、成功する
+    /// `try_read`／`try_write` 経路には追加の `Instant::now()` 呼び出しを
+    /// 乗せない）。
+    pub link_lock_wait: std::time::Duration,
     /// このワーカーが `try_promote_entry` で実際にエントリポイントを
     /// 更新した回数。
     pub entry_promotions: u64,

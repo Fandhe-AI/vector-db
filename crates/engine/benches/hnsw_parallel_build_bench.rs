@@ -36,7 +36,8 @@ use std::time::Duration;
 
 use harness::env_report::EnvReport;
 use harness::hnsw_parallel_profile::{
-    aggregate_lock_blocked_ratio, min_median_max_duration, min_median_max_u64, pick_representative,
+    aggregate_lock_blocked_ratio, aggregate_lock_wait, lock_wait_share, measured_tail,
+    min_median_max_duration, min_median_max_u64, parallel_vs_control_ceiling, pick_representative,
     serial_share, speedup, total_entry_promotions,
 };
 use harness::proc_stats::read_vm_rss_kb;
@@ -126,7 +127,13 @@ fn measure_threads_profiled(
     })
     .map_err(|e| format!("threads={threads}: {e}"))?;
     let collected = profiles.into_inner().unwrap_or_default();
-    Ok((measurement.summary.median, collected))
+    // `run` は warmup→計測の順にクロージャを呼ぶため（`protocol.rs::run` の
+    // モジュールコメント・実装参照）、`collected` は先頭 `warmup_iterations`
+    // 件が warmup 標本・末尾 `measured_iterations` 件が計測標本という並びに
+    // なる。段別中央値・ワーカー統計は計測フェーズの標本のみから算出する
+    // （codex-review P1 指摘・PR #445）。
+    let measured = measured_tail(&collected, config.measured_iterations() as usize).to_vec();
+    Ok((measurement.summary.median, measured))
 }
 
 /// 対照負荷のパス数。1 パス（100k×dim64 ≈ 数 ms）ではスレッド生成・join の
@@ -244,6 +251,11 @@ fn main() {
     let mut baseline_total: Option<Duration> = None;
     let mut baseline_control: Option<Duration> = None;
     let mut parallel_phase_base: Option<Duration> = None;
+    // `control_speedup`（下記の参考行）とは異なり、`parallel_speedup` と同一の
+    // 基準スレッド数（`parallel_base_threads`）を基準にした対照負荷の
+    // 高速化率。`parallel_vs_control` ceiling をこの基準で正規化する
+    // （codex-review P1 指摘・PR #445）。
+    let mut control_median_base: Option<Duration> = None;
     let mut had_error = false;
 
     for &threads in &ladder {
@@ -337,16 +349,22 @@ fn main() {
                     let lock_blocked_ratio = aggregate_lock_blocked_ratio(workers)
                         .map(|r| r * 100.0)
                         .unwrap_or(f64::NAN);
+                    let (lock_wait_sum, lock_wait_max) = aggregate_lock_wait(workers);
+                    let lock_wait_share_pct = lock_wait_share(workers)
+                        .map(|r| r * 100.0)
+                        .unwrap_or(f64::NAN);
                     let promotions = total_entry_promotions(workers);
 
                     match (inserted_line, busy_line) {
                         (Some((imin, imed, imax)), Some((bmin, bmed, bmax))) => {
                             println!(
-                                "hnsw_parallel_build: threads={threads} workers={} inserted[min/med/max]={imin}/{imed}/{imax} busy[min/med/max]={:.3}/{:.3}/{:.3}ms lock_blocked_ratio={lock_blocked_ratio:.2}% entry_promotions={promotions}",
+                                "hnsw_parallel_build: threads={threads} workers={} inserted[min/med/max]={imin}/{imed}/{imax} busy[min/med/max]={:.3}/{:.3}/{:.3}ms lock_blocked_ratio={lock_blocked_ratio:.2}% lock_wait[sum/max]={:.3}/{:.3}ms lock_wait_share={lock_wait_share_pct:.2}% entry_promotions={promotions}",
                                 workers.len(),
                                 bmin.as_secs_f64() * 1000.0,
                                 bmed.as_secs_f64() * 1000.0,
                                 bmax.as_secs_f64() * 1000.0,
+                                lock_wait_sum.as_secs_f64() * 1000.0,
+                                lock_wait_max.as_secs_f64() * 1000.0,
                             );
                         }
                         _ => {
@@ -368,23 +386,47 @@ fn main() {
                 if threads == 1 {
                     baseline_control = Some(control_median);
                 }
-                let control_speedup = baseline_control
+                // 参考値: threads=1 基準の対照負荷 speedup（従来どおりの基準。
+                // `parallel_speedup` の基準〔`parallel_base_threads`〕とは
+                // 異なるため、そのままでは ceiling の分母として使わない）。
+                let control_speedup_ref = baseline_control
                     .map(|b| b.as_secs_f64() / control_median.as_secs_f64())
                     .unwrap_or(1.0);
                 println!(
-                    "hnsw_parallel_build: control=dot_scan threads={threads} median={:.3}ms speedup={control_speedup:.3}x",
+                    "hnsw_parallel_build: control=dot_scan threads={threads} median={:.3}ms speedup_ref(basis=threads=1)={control_speedup_ref:.3}x",
                     control_median.as_secs_f64() * 1000.0
                 );
 
+                if parallel_base_threads == Some(threads) {
+                    control_median_base = Some(control_median);
+                }
+                // `parallel_speedup` と同一基準（`parallel_base_threads`）の
+                // 対照負荷 speedup。基準点が未計測（`control_median_base`
+                // 未設定）の場合は比較不能として `None`（codex-review P1
+                // 指摘・PR #445: 従来は threads=1 基準の speedup をそのまま
+                // ceiling の分母に使っており、線形スケール時でも 0.5 に
+                // 系統的にずれていた）。
+                let control_speedup_rel =
+                    control_median_base.and_then(|base| speedup(base, control_median));
+
                 if let Some(parallel_speedup) = parallel_speedup_for_ceiling {
-                    let ceiling = if control_speedup != 0.0 {
-                        parallel_speedup / control_speedup
-                    } else {
-                        f64::NAN
-                    };
-                    println!(
-                        "hnsw_parallel_build: ceiling threads={threads} parallel_vs_control={ceiling:.3}"
-                    );
+                    match parallel_vs_control_ceiling(
+                        Some(parallel_speedup),
+                        control_speedup_rel,
+                    ) {
+                        Some(ceiling) => println!(
+                            "hnsw_parallel_build: ceiling threads={threads} basis=threads={} parallel_vs_control={ceiling:.3}",
+                            parallel_base_threads
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                        ),
+                        None => println!(
+                            "hnsw_parallel_build: ceiling threads={threads} basis=threads={} parallel_vs_control=n/a",
+                            parallel_base_threads
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                        ),
+                    }
                 }
             }
             Err(e) => {

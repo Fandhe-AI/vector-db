@@ -63,6 +63,12 @@ thread_local! {
     /// `observe == true`（[`build_parallel_graph_observed`]）の場合のみ
     /// 加算され、ワーカー終了直前に [`read_worker_lock_stats`] で読む。
     static LINK_LOCK_STATS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// 現在のスレッドが [`BuildGraph::read_links`]／[`BuildGraph::write_links`]
+    /// でブロックする取得（`try_read`/`try_write` の `WouldBlock` 後の
+    /// `read()`／`write()`）に落ちたときのみ累積する、ロックが実際に取れる
+    /// までの待ち時間（[`HnswWorkerStats::link_lock_wait`] のドキュメンテー
+    /// ションコメント参照。codex-review P2 指摘・PR #445）。
+    static LINK_LOCK_WAIT: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::ZERO) };
     /// 現在のスレッドが [`BuildGraph::try_promote_entry`] で実際にエントリ
     /// ポイントを更新した回数。`observe == true` の場合のみ加算される
     /// （用途・非観測経路への非影響は上記と同様）。
@@ -85,6 +91,12 @@ fn record_lock_attempt(blocked: bool) {
     });
 }
 
+/// [`LINK_LOCK_WAIT`] へブロックする取得 1 回分の待ち時間を加算する
+/// （`record_lock_attempt(true)` と対になる呼び出し元からのみ呼ばれる）。
+fn record_lock_wait(duration: std::time::Duration) {
+    LINK_LOCK_WAIT.with(|cell| cell.set(cell.get().saturating_add(duration)));
+}
+
 /// [`ENTRY_PROMOTION_COUNT`] を 1 件加算する。
 fn record_entry_promotion() {
     ENTRY_PROMOTION_COUNT.with(|cell| cell.set(cell.get().saturating_add(1)));
@@ -96,6 +108,12 @@ fn record_entry_promotion() {
 /// 直前に一度だけ読む前提。他スレッドの値と混ざらない）。
 fn read_worker_lock_stats() -> (u64, u64) {
     LINK_LOCK_STATS.with(|cell| cell.get())
+}
+
+/// 現在のスレッドの累積ロック待ち時間を読む（リセットしない。
+/// [`read_worker_lock_stats`] と同じ「ワーカー終了直前に一度だけ読む」前提）。
+fn read_worker_lock_wait() -> std::time::Duration {
+    LINK_LOCK_WAIT.with(|cell| cell.get())
 }
 
 fn read_worker_entry_promotions() -> u64 {
@@ -117,6 +135,7 @@ fn read_worker_entry_promotions() -> u64 {
 /// 混入するバグを修正するものではない。
 fn reset_observation_tls() {
     LINK_LOCK_STATS.with(|cell| cell.set((0, 0)));
+    LINK_LOCK_WAIT.with(|cell| cell.set(std::time::Duration::ZERO));
     ENTRY_PROMOTION_COUNT.with(|cell| cell.set(0));
 }
 
@@ -194,7 +213,10 @@ impl BuildGraph {
             }
             Err(TryLockError::WouldBlock) => {
                 record_lock_attempt(true);
-                lock.read().map_err(|_| HnswError::WorkerPanicked)
+                let wait_start = Instant::now();
+                let result = lock.read().map_err(|_| HnswError::WorkerPanicked);
+                record_lock_wait(wait_start.elapsed());
+                result
             }
             Err(TryLockError::Poisoned(_)) => {
                 record_lock_attempt(false);
@@ -220,7 +242,10 @@ impl BuildGraph {
             }
             Err(TryLockError::WouldBlock) => {
                 record_lock_attempt(true);
-                lock.write().map_err(|_| HnswError::WorkerPanicked)
+                let wait_start = Instant::now();
+                let result = lock.write().map_err(|_| HnswError::WorkerPanicked);
+                record_lock_wait(wait_start.elapsed());
+                result
             }
             Err(TryLockError::Poisoned(_)) => {
                 record_lock_attempt(false);
@@ -703,12 +728,14 @@ pub(crate) fn build_parallel_graph_observed(
                 }
                 let busy = busy_start.elapsed();
                 let (link_lock_blocked, link_lock_acquired) = read_worker_lock_stats();
+                let link_lock_wait = read_worker_lock_wait();
                 let entry_promotions = read_worker_entry_promotions();
                 HnswWorkerStats {
                     inserted_nodes,
                     busy,
                     link_lock_blocked,
                     link_lock_acquired,
+                    link_lock_wait,
                     entry_promotions,
                 }
             }));
@@ -1079,6 +1106,15 @@ mod tests {
         );
         for w in &profile.workers {
             assert!(w.link_lock_blocked <= w.link_lock_acquired);
+            // ロック待ち時間はワーカーループ全体の壁時間（`busy`）の内訳の
+            // 一部であり、これを超えることはない（codex-review P2 指摘・
+            // PR #445）。
+            assert!(
+                w.link_lock_wait <= w.busy,
+                "link_lock_wait={:?} busy={:?}",
+                w.link_lock_wait,
+                w.busy
+            );
         }
         let total_acquired: u64 = profile.workers.iter().map(|w| w.link_lock_acquired).sum();
         assert!(total_acquired > 0);

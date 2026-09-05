@@ -107,6 +107,80 @@ pub fn total_entry_promotions(workers: &[HnswWorkerStats]) -> u64 {
     workers.iter().map(|w| w.entry_promotions).sum()
 }
 
+/// ワーカー群の `link_lock_wait`（ブロックする取得に落ちた場合のみ累積される
+/// 待ち時間。`HnswWorkerStats::link_lock_wait` 参照）の合計と最大値
+/// （`(sum, max)`）。`workers` が空なら双方 `Duration::ZERO`。
+pub fn aggregate_lock_wait(workers: &[HnswWorkerStats]) -> (Duration, Duration) {
+    let sum: Duration = workers.iter().map(|w| w.link_lock_wait).sum();
+    let max: Duration = workers
+        .iter()
+        .map(|w| w.link_lock_wait)
+        .max()
+        .unwrap_or(Duration::ZERO);
+    (sum, max)
+}
+
+/// ロック待ち時間がワーカーのループ全体（`busy`）に占める割合
+/// （Σ`link_lock_wait` ÷ Σ`busy`）。ロック競合が頭打ちの主要因かどうかを
+/// 判定する根拠値（codex-review P2 指摘・PR #445: 従来の
+/// `aggregate_lock_blocked_ratio`〔取得試行に対する回数の比率〕だけでは
+/// 「ブロックした回数は多いが待ち時間は無視できる」ケースと「回数は
+/// 少ないが長時間ブロックする」ケースを区別できないため、実測待ち時間を
+/// 直接 `busy` に対する割合として出す）。Σ`busy` が 0 の場合は `None`。
+pub fn lock_wait_share(workers: &[HnswWorkerStats]) -> Option<f64> {
+    let total_busy: Duration = workers.iter().map(|w| w.busy).sum();
+    if total_busy.is_zero() {
+        return None;
+    }
+    let total_wait: Duration = workers.iter().map(|w| w.link_lock_wait).sum();
+    Some(total_wait.as_secs_f64() / total_busy.as_secs_f64())
+}
+
+/// `protocol::run` は warmup フェーズ→計測フェーズの順に `workload` を呼ぶ
+/// （`harness/protocol.rs::run` の実装・モジュールコメント参照）。呼び出し側が
+/// `workload` 内で副作用として蓄積した標本列（例: 本ベンチが
+/// `Mutex<Vec<HnswBuildProfile>>` へ push する構築プロファイル）は、
+/// 呼び出し順そのままに「先頭 `warmup_iterations` 件が warmup 標本・
+/// 末尾 `measured_iterations` 件が計測標本」という並びになる。段別中央値・
+/// serial_share・ワーカー統計は計測フェーズの標本のみから算出すべきなので、
+/// 本関数で末尾 `measured_iterations` 件へ限定する（codex-review P1 指摘・
+/// PR #445。修正前は warmup 標本込みの全件から中央値等を計算しており、
+/// warmup 回数ぶん標本が水増しされていた）。
+///
+/// 蓄積件数が `measured_iterations` 未満の場合（呼び出し漏れ等の想定外の
+/// 状態）は空スライスを返す（fail-closed。呼び出し側は「集計不能」として
+/// 扱う——`min_median_max_duration` 等は空スライスに対して `None` を返す）。
+pub fn measured_tail<T>(all: &[T], measured_iterations: usize) -> &[T] {
+    if measured_iterations == 0 || all.len() < measured_iterations {
+        return &[];
+    }
+    &all[all.len() - measured_iterations..]
+}
+
+/// `parallel_speedup`（基準 `parallel_base_threads` に対する `parallel_phase`
+/// の高速化率）と `control_speedup_rel`（同じ基準スレッド数に対する対照負荷の
+/// 高速化率）を同一基準で正規化した比較値を返す（codex-review P1 指摘・
+/// PR #445: 従来は `parallel_speedup` が `threads>=2` の最小点基準、
+/// `control_speedup` が `threads=1` 基準という異なる基準同士を割っていたため、
+/// 対照負荷が理想的な線形スケールでも `parallel_vs_control` が 1.0 から
+/// 系統的にずれていた）。
+///
+/// どちらかが計測不能（`None`）の場合は `None`（呼び出し側は `n/a` として
+/// 出力する）。基準点で対照負荷が退化してゼロ除算になる場合
+/// （`control_speedup_rel == 0.0`）は `Some(f64::NAN)`。
+pub fn parallel_vs_control_ceiling(
+    parallel_speedup: Option<f64>,
+    control_speedup_rel: Option<f64>,
+) -> Option<f64> {
+    let parallel_speedup = parallel_speedup?;
+    let control_speedup_rel = control_speedup_rel?;
+    if control_speedup_rel == 0.0 {
+        Some(f64::NAN)
+    } else {
+        Some(parallel_speedup / control_speedup_rel)
+    }
+}
+
 /// 複数実行分の [`HnswBuildProfile`] のうち、`total` が中央値に最も近い 1 件を
 /// 「代表実行」として選ぶ（ワーカー内訳はスレッド数ぶんの要素を持つため、
 /// 複数実行をまたいで平坦化するのではなく 1 実行の内訳を代表させる方が
