@@ -182,6 +182,7 @@ def run(args, queries: list[dict]) -> dict:
     # （TASK-101・RECOVER-10 の契約どおり）、可視行数も毎回増えて比較できなくなる。
     import shutil
 
+    os.makedirs(workdir, exist_ok=True)
     work_db = os.path.join(workdir, "self_bench_work.redb")
     shutil.copyfile(args.rows_file, work_db)
     server = SelfServer(db_path=work_db, workdir=workdir)

@@ -9,7 +9,9 @@
 #   docker build -t bench-faiss-gpu -f scripts/crossdb_bench/gpu/Dockerfile.faiss \
 #       scripts/crossdb_bench/gpu
 FROM python:3.12-slim
-RUN pip install --no-cache-dir faiss-gpu-cu12==1.14.1.post1 numpy==2.3.5 || pip install --no-cache-dir faiss-gpu-cu12 numpy
+# 固定版が取得できない場合はビルドを失敗させる（別版へ黙って切り替えると
+# 文書に記載した条件で再現できない）。
+RUN pip install --no-cache-dir faiss-gpu-cu12==1.14.1.post1 numpy==2.3.5
 
 # CPU 経路のスレッド既定値。実測（rows=20000, dim=128, batch 1/8/64/256。
 # README「CPU 経路の BLAS/OMP スレッド競合」節参照）で、FAISS の CPU 検索は

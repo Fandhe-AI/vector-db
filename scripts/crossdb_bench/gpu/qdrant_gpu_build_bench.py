@@ -11,9 +11,10 @@ CPU 版・GPU 版で差が無いことの確認用に付随計測する（本命
 手順:
   1. 決定的合成データ（seed 固定・一様乱数 f32）を `rows` 件生成
   2. hnsw_config（m=16, ef_construct=100）・optimizers_config（indexing_threshold
-     を小さくして即座に最適化＝索引構築を始めさせる）で collection を作成
+     を行数より大きくし、投入中は索引構築を走らせない）で collection を作成
   3. batch=1,000・wait=True で upsert（この所要時間を「upsert 時間」として記録）
-  4. upsert 完了時刻を起点に、collection status が green かつ
+  4. indexing_threshold を 1 へ更新して索引構築を開始し、その時刻を起点に
+     collection status が green かつ
      indexed_vectors_count == rows になるまで 0.5 秒間隔でポーリング
      （この所要時間を「索引構築時間」として記録）
   5. 決定的クエリ 200 本で query_points（hnsw_ef=64, limit=10）の p50/p95 を計測
@@ -38,6 +39,9 @@ HOST = "127.0.0.1"
 HTTP_PORT = 17333
 GRPC_PORT = 17334
 COLLECTION = "gpu_build_bench"
+# 投入中の索引構築を止めるための閾値（KB 単位。既定グリッドの最大行数×dim×4 バイトを
+# 十分上回る値）。
+INDEXING_DISABLED_THRESHOLD = 10_000_000_000
 
 DEFAULT_ROWS_GRID = (100_000, 500_000)
 DEFAULT_DIM = 128
@@ -74,8 +78,18 @@ def setup_collection(client: QdrantClient, dim: int) -> None:
         collection_name=COLLECTION,
         vectors_config=models.VectorParams(size=dim, distance=models.Distance.DOT),
         hnsw_config=models.HnswConfigDiff(m=16, ef_construct=100),
-        # indexing_threshold を小さくし、upsert 直後から索引構築が始まるようにする
-        # （既定値だと少量データでは最適化がスキップされ、構築時間が測れないため）。
+        # 投入中は索引構築を走らせない（indexing_threshold を行数より十分大きく取る）。
+        # 投入完了後に `enable_indexing` で閾値を下げて構築を開始し、その時点から
+        # green かつ全件 indexed までを「索引構築時間」として計時する。投入中から
+        # 構築を進めると、投入速度の差で CPU/GPU の構築時間比較が歪む。
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=INDEXING_DISABLED_THRESHOLD),
+    )
+
+
+def enable_indexing(client: QdrantClient) -> None:
+    """投入完了後に indexing_threshold を下げ、索引構築（最適化）を開始させる。"""
+    client.update_collection(
+        collection_name=COLLECTION,
         optimizers_config=models.OptimizersConfigDiff(indexing_threshold=1),
     )
 
@@ -179,6 +193,7 @@ def run_one(client: QdrantClient, rows: int, dim: int, container_name: str | Non
 
     setup_collection(client, dim)
     upsert_result = upsert_all(client, corpus)
+    enable_indexing(client)
     index_result = wait_indexed(client, rows)
     search_result = measure_search(client, queries)
 

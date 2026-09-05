@@ -108,12 +108,14 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             ef_construction=100,
             replace=True,
         )
+    fts_error: str | None = None
     try:
         # `create_fts_index` は 0.25 以降非推奨（`create_index(config=FTS())` が推奨）だが
         # 0.38.0 でも動作する（実機確認）。hybrid フェーズが使う FTS 索引をここで作る。
+        # 失敗は握りつぶさず hybrid フェーズを理由付き unsupported にする。
         tbl.create_fts_index("body", replace=True)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        fts_error = repr(e)
 
     public_filter = "visibility = 'public'"
     public_lang_filter = "visibility = 'public' AND lang = 'ja'"
@@ -187,23 +189,28 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     def hybrid(i):
         qv = query_vecs[i]
         qt = sql_escape_literal(queries[i].get("text", ""))
-        try:
-            rows = (
-                tbl.search(query_type="hybrid")
-                .vector(qv)
-                .text(qt)
-                .where(public_filter)
-                .limit(10)
-                .select(["id"])
-                .to_list()
-            )
-            return [r["id"] for r in rows]
-        except Exception:
-            return []
+        # 例外は伝播させ、呼び出し側でフェーズ全体を unsupported として記録する
+        # （空配列に変換すると失敗が正常なレイテンシとして残るため）。
+        rows = (
+            tbl.search(query_type="hybrid")
+            .vector(qv)
+            .text(qt)
+            .where(public_filter)
+            .limit(10)
+            .select(["id"])
+            .to_list()
+        )
+        return [r["id"] for r in rows]
 
     idxs = list(range(len(query_vecs)))
-    stats, last = measure(hybrid, idxs)
-    phases["hybrid_rrf"] = stats
+    if fts_error is not None:
+        phases["hybrid_rrf"] = unsupported(f"FTS index creation failed: {fts_error}")
+    else:
+        try:
+            stats, last = measure(hybrid, idxs)
+            phases["hybrid_rrf"] = stats
+        except Exception as e:  # noqa: BLE001
+            phases["hybrid_rrf"] = unsupported(f"hybrid search failed: {e!r}")
 
     phases["mode_recall"] = unsupported("LanceDB にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("LanceDB にモード切替（recall/precision）の概念が無い")
@@ -226,13 +233,13 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
 
     def explain(qv):
         q = tbl.search(qv, vector_column_name="vector").metric("dot").where(public_filter).limit(10)
-        try:
-            return q.explain_plan(True)
-        except Exception as e:  # noqa: BLE001
-            return repr(e)
+        return q.explain_plan(True)
 
-    stats, last = measure(explain, query_vecs)
-    phases["explain"] = {**stats, "sample_output": last}
+    try:
+        stats, last = measure(explain, query_vecs)
+        phases["explain"] = {**stats, "sample_output": last}
+    except Exception as e:  # noqa: BLE001
+        phases["explain"] = unsupported(f"explain_plan failed: {e!r}")
 
     # ingest_single_stmt はテーブルへ合成行（乱数ベクトル）を追加するため、
     # 他フェーズ（特に vector_knn の recall 検算）を汚染しないよう最後に実行する
