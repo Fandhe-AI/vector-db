@@ -51,7 +51,8 @@ use harness::rng::DeterministicRng;
 
 use engine::batch_fallback::BatchBackend;
 use engine::batch_search::{
-    BatchEngine, BatchQuery, ResidentMatrix, MAX_BATCH_ROWS, MAX_BATCH_TOTAL_BYTES, MAX_BATCH_WORK,
+    BatchEngine, BatchQuery, ResidentMatrix, MAX_BATCH_QUERIES, MAX_BATCH_ROWS,
+    MAX_BATCH_TOTAL_BYTES, MAX_BATCH_WORK,
 };
 use engine::gpu_batch::{GpuBatchBackend, GpuF32ContrastBackend};
 use engine::kernel::SearchHit;
@@ -254,6 +255,20 @@ fn main() {
             for &batch in &config.batches {
                 seed = seed.saturating_add(1);
                 let k = config.top_k;
+
+                if batch > MAX_BATCH_QUERIES {
+                    println!(
+                        "{}",
+                        format_skip_line(
+                            rows,
+                            dim,
+                            batch,
+                            k,
+                            "batch exceeds engine::batch_search::MAX_BATCH_QUERIES"
+                        )
+                    );
+                    continue;
+                }
 
                 if rows > MAX_BATCH_ROWS {
                     println!(
