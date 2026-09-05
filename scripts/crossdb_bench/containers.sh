@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # crossdb_bench: 対照 DB（pgvector・Qdrant・MySQL）の Docker コンテナ起動・停止。
 #
-# ポートは scripts/crossdb_bench/README.md 記載の固定値（他コンテナと衝突しないよう
-# 127.0.0.1 の非既定ポートへ bind する）。`docker rm -f` で毎回冪等に扱う
-# （既存コンテナが残っていても事故らない）。
+# ポートは 127.0.0.1 の非既定ポートへ bind する（他コンテナと衝突しないため）。
+# 環境変数で上書きでき、接続側の Python（pgvector_db.py・qdrant_db.py・mysql_db.py。
+# `common.env_port`）が同じ変数名・同じ既定値を読む契約（README「環境変数」参照）。
+# ここで `${VAR:-default}` に書く既定値は Python 側の `env_port(name, default)` の
+# default と必ず一致させること（両側で別サーバーを見てしまう事故を防ぐ）。
+# `docker rm -f` で毎回冪等に扱う（既存コンテナが残っていても事故らない）。
 #
 # 計測中は対象 DB 以外のコンテナを止めること（CLAUDE.md の指示どおり、公平な
 # 計測のため他コンテナと競合させない）。
@@ -18,12 +21,19 @@ cmd="${1:-}"
 db="${2:-}"
 [ -n "$cmd" ] && [ -n "$db" ] || usage
 
+# 接続側 Python の既定値（pgvector_db.py 15433・qdrant_db.py 16333/16334・
+# mysql_db.py 33306）と同じ値を既定にする。
+PG_PORT="${CROSSDB_PG_PORT:-15433}"
+QDRANT_HTTP_PORT="${CROSSDB_QDRANT_HTTP_PORT:-16333}"
+QDRANT_GRPC_PORT="${CROSSDB_QDRANT_GRPC_PORT:-16334}"
+MYSQL_PORT="${CROSSDB_MYSQL_PORT:-33306}"
+
 up_pgvector() {
   docker rm -f bench-pgvector >/dev/null 2>&1 || true
   docker run -d --name bench-pgvector \
     -e POSTGRES_PASSWORD=bench \
     -e POSTGRES_DB=bench \
-    -p 127.0.0.1:15433:5432 \
+    -p "127.0.0.1:${PG_PORT}:5432" \
     pgvector/pgvector:pg17 >/dev/null
   echo "bench-pgvector: waiting for readiness..."
   for _ in $(seq 1 60); do
@@ -42,12 +52,12 @@ up_pgvector() {
 up_qdrant() {
   docker rm -f bench-qdrant >/dev/null 2>&1 || true
   docker run -d --name bench-qdrant \
-    -p 127.0.0.1:16333:6333 \
-    -p 127.0.0.1:16334:6334 \
+    -p "127.0.0.1:${QDRANT_HTTP_PORT}:6333" \
+    -p "127.0.0.1:${QDRANT_GRPC_PORT}:6334" \
     qdrant/qdrant:latest >/dev/null
   echo "bench-qdrant: waiting for readiness..."
   for _ in $(seq 1 60); do
-    if curl -sf http://127.0.0.1:16333/readyz >/dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:${QDRANT_HTTP_PORT}/readyz" >/dev/null 2>&1; then
       echo "bench-qdrant: ready"
       return 0
     fi
@@ -62,7 +72,7 @@ up_mysql() {
   docker run -d --name bench-mysql \
     -e MYSQL_ROOT_PASSWORD=bench \
     -e MYSQL_DATABASE=bench \
-    -p 127.0.0.1:33306:3306 \
+    -p "127.0.0.1:${MYSQL_PORT}:3306" \
     mysql:9 >/dev/null
   echo "bench-mysql: waiting for readiness..."
 

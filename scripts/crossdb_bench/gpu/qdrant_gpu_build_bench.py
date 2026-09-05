@@ -35,9 +35,18 @@ from typing import Any
 import numpy as np
 from qdrant_client import QdrantClient, models
 
+# 親ディレクトリ（scripts/crossdb_bench）の common.py から env_port を借りる。
+# 本スクリプトは単体実行（`python scripts/crossdb_bench/gpu/...py`）される前提で
+# パッケージ化していないため、sys.path へ親を足してから import する。
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from common import env_port  # noqa: E402
+
 HOST = "127.0.0.1"
-HTTP_PORT = 17333
-GRPC_PORT = 17334
+# 既定値 17333/17334 は containers_gpu.sh の `${CROSSDB_QDRANT_HTTP_PORT:-17333}`／
+# `${CROSSDB_QDRANT_GRPC_PORT:-17334}` と一致させること。変数名は CPU 用
+# qdrant_db.py と共通だが既定値は異なる（CPU 用は 16333/16334）。
+HTTP_PORT = env_port("CROSSDB_QDRANT_HTTP_PORT", 17333)
+GRPC_PORT = env_port("CROSSDB_QDRANT_GRPC_PORT", 17334)
 COLLECTION = "gpu_build_bench"
 # 投入中の索引構築を止めるための閾値（KB 単位。既定グリッドの最大行数×dim×4 バイトを
 # 十分上回る値）。

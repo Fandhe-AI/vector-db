@@ -1,4 +1,6 @@
-"""pgvector（`pgvector/pgvector:pg17`、127.0.0.1:15433）の機能別ベンチマーク実装。
+"""pgvector（`pgvector/pgvector:pg17`、127.0.0.1:15433 既定。環境変数
+`CROSSDB_PG_PORT` で上書き可。`containers.sh` と同じ変数を読む）の機能別
+ベンチマーク実装。
 
 自作 DB の `<=>` が内積（`crates/engine/src/kernel.rs` 参照。値が大きいほど
 上位）であるため、pgvector 側も同じ指標の `<#>`（負の内積。ORDER BY 昇順で
@@ -23,6 +25,7 @@ from pgvector.psycopg import register_vector
 from common import (
     TENANT_VISIBLE,
     build_meta,
+    env_port,
     load_jsonl,
     measure,
     public_only_where,
@@ -32,7 +35,8 @@ from common import (
 )
 
 HOST = "127.0.0.1"
-PORT = 15433
+# 既定値 15433 は containers.sh の `${CROSSDB_PG_PORT:-15433}` と一致させること。
+PORT = env_port("CROSSDB_PG_PORT", 15433)
 DBNAME = "bench"
 USER = "postgres"
 PASSWORD = "bench"

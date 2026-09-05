@@ -1,4 +1,6 @@
-"""Qdrant（`qdrant/qdrant:latest`、127.0.0.1:16333/16334）の機能別ベンチマーク実装。
+"""Qdrant（`qdrant/qdrant:latest`、127.0.0.1:16333/16334 既定。環境変数
+`CROSSDB_QDRANT_HTTP_PORT`／`CROSSDB_QDRANT_GRPC_PORT` で上書き可。
+`containers.sh` と同じ変数を読む）の機能別ベンチマーク実装。
 
 gRPC 経由（`prefer_grpc=True`）で接続する。距離指標は自作 DB の `<=>`
 （内積）に合わせ `Distance.DOT` を使う。RLS 相当は、自作 DB の現行契約
@@ -18,11 +20,14 @@ import time
 
 from qdrant_client import QdrantClient, models
 
-from common import TENANT_VISIBLE, build_meta, measure, unsupported
+from common import TENANT_VISIBLE, build_meta, env_port, measure, unsupported
 
 HOST = "127.0.0.1"
-HTTP_PORT = 16333
-GRPC_PORT = 16334
+# 既定値 16333/16334 は containers.sh の `${CROSSDB_QDRANT_HTTP_PORT:-16333}`／
+# `${CROSSDB_QDRANT_GRPC_PORT:-16334}` と一致させること。gpu/ 配下の Qdrant GPU
+# ベンチも同じ変数名を読むが既定値は 17333/17334（別コンテナ・別ポート）。
+HTTP_PORT = env_port("CROSSDB_QDRANT_HTTP_PORT", 16333)
+GRPC_PORT = env_port("CROSSDB_QDRANT_GRPC_PORT", 16334)
 COLLECTION = "docs"
 
 
@@ -318,9 +323,14 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     # （self_db.py と同じ順序方針）。
     phases["ingest_single_stmt"] = _ingest_single_stmt(client, dim)
 
+    # 実行した Qdrant の実バージョンをサーバー自身に問い合わせて記録する
+    # （`client.info()` → `VersionInfo.version`。イメージタグ `latest` は時点で
+    # 中身が変わるため固定文言では再現性が担保できない）。取得失敗は握りつぶさず
+    # 伝播させ、バージョン不明の結果を書き出さない（fail-closed）。
+    server_version = client.info().version
     meta = build_meta(
         db="qdrant",
-        version="qdrant/qdrant:latest（docker inspect の digest を別途記録）",
+        version=f"qdrant {server_version} (image qdrant/qdrant:latest)",
         connection="gRPC",
         config=args.config,
         rows=len(docs),

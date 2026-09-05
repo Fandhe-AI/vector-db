@@ -94,7 +94,11 @@ FAISS 既定の BLAS 経路をそのまま計測したい場合は `--blas-thres
 ## 2. Qdrant（索引構築 CPU vs GPU）
 
 コンテナは `containers_gpu.sh` で個別に用意する（CPU 版・GPU 版は同じポート
-17333/17334 を使うため、同時に両方は起動しない）。
+17333/17334〔既定〕を使うため、同時に両方は起動しない）。ポートは環境変数
+`CROSSDB_QDRANT_HTTP_PORT`／`CROSSDB_QDRANT_GRPC_PORT` で上書きでき、起動側
+（`containers_gpu.sh`）と接続側（`qdrant_gpu_build_bench.py`）が同じ既定値
+（17333/17334）を読む。変数名は `../containers.sh`・`../qdrant_db.py` と共通だが
+そちらの既定値は 16333/16334 である点に注意。
 
 ```bash
 # CPU 版

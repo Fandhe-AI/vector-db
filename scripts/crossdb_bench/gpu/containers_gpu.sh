@@ -4,8 +4,12 @@
 # scripts/crossdb_bench/containers.sh（既存・CPU の qdrant/pgvector 用。他 agent が
 # 編集中のため触らない）とはポート・コンテナ名を分離している。qdrant_gpu_build_bench.py
 # が「索引構築を GPU で行う版」と「CPU 版」を同一ホストで並行比較できるように、
-# CPU 版はポート 17333/17334、GPU 版は別コンテナ名で同じく 17333/17334 を使う
+# CPU 版はポート 17333/17334（既定）、GPU 版は別コンテナ名で同じく 17333/17334 を使う
 # （同時起動はしない前提。両方同時に立てたい場合はポートを分ける運用に変更すること）。
+# ポートは環境変数 CROSSDB_QDRANT_HTTP_PORT／CROSSDB_QDRANT_GRPC_PORT で上書きでき、
+# 接続側 qdrant_gpu_build_bench.py（`common.env_port`）が同じ変数名・同じ既定値
+# （17333/17334）を読む。変数名は CPU 用 containers.sh と共通だが既定値は異なる
+# （CPU 用は 16333/16334）ので、両ハーネスを同じ環境で使う場合は注意すること。
 #
 # GPU 版は `qdrant/qdrant:gpu-nvidia-latest` を `--gpus all` + `QDRANT__GPU__INDEXING=1`
 # で起動する。起動ログの "Found GPU device" 行で実際に GPU が認識されたかを
@@ -15,8 +19,9 @@
 # 計測中は対象コンテナ以外を止めること（CPU・メモリの競合を避けるため）。
 set -euo pipefail
 
-HOST_PORT_HTTP=17333
-HOST_PORT_GRPC=17334
+# 既定値 17333/17334 は qdrant_gpu_build_bench.py の env_port の default と一致させること。
+HOST_PORT_HTTP="${CROSSDB_QDRANT_HTTP_PORT:-17333}"
+HOST_PORT_GRPC="${CROSSDB_QDRANT_GRPC_PORT:-17334}"
 
 usage() {
   echo "usage: $0 up|down <qdrant_cpu|qdrant_gpu>" >&2

@@ -42,7 +42,7 @@ scripts/crossdb_bench/containers.sh down mysql
 ```
 
 `up mysql` は `mysql:9` イメージからコンテナ名 `bench-mysql`
-（127.0.0.1:33306、`MYSQL_ROOT_PASSWORD=bench`・`MYSQL_DATABASE=bench`）を
+（127.0.0.1:33306 既定、`MYSQL_ROOT_PASSWORD=bench`・`MYSQL_DATABASE=bench`）を
 `docker rm -f` で毎回冪等に作り直し、`mysqladmin ping` で起動を待つ
 （pgvector・Qdrant と同じ up/down 管理。`down mysql` も `docker rm -f` で
 コンテナごと破棄する）。
@@ -52,6 +52,31 @@ sqlite-vec・LanceDB は in-process（コンテナ不要）。self は `run.py` 
 
 **計測中は対象 DB 以外のコンテナを止めること**（公平な比較のため。CPU・メモリの
 競合を避ける）。
+
+### 環境変数（接続先ポート）
+
+各 DB のポートは以下の環境変数で上書きできる。起動側（`containers.sh`／
+`gpu/containers_gpu.sh`）と接続側（各 `*_db.py`・`gpu/qdrant_gpu_build_bench.py`。
+`common.env_port`）が同じ変数名・同じ既定値を読む。Python 側は 1〜65535 の整数
+以外（空文字は未設定扱い）を `ValueError` で拒否する（fail-closed）。
+
+| 環境変数 | 既定値 | 対象 |
+| -------- | ------ | ---- |
+| `CROSSDB_SELF_PORT` | 15432 | self（`run.py` が起動する `wire-server` の bind ポート） |
+| `CROSSDB_PG_PORT` | 15433 | pgvector（`containers.sh up pgvector`・`pgvector_db.py`） |
+| `CROSSDB_QDRANT_HTTP_PORT` | 16333（gpu/ は 17333） | Qdrant HTTP（`containers.sh up qdrant`・`qdrant_db.py`。`gpu/containers_gpu.sh`・`gpu/qdrant_gpu_build_bench.py` も同じ変数名を読むが既定値は 17333） |
+| `CROSSDB_QDRANT_GRPC_PORT` | 16334（gpu/ は 17334） | Qdrant gRPC（同上。gpu/ の既定値は 17334） |
+| `CROSSDB_MYSQL_PORT` | 33306 | MySQL（`containers.sh up mysql`・`mysql_db.py`） |
+
+```bash
+CROSSDB_PG_PORT=25433 scripts/crossdb_bench/containers.sh up pgvector
+CROSSDB_PG_PORT=25433 python scripts/crossdb_bench/run.py --db pgvector --config exact ...
+```
+
+self の `run.py --db self` は認証ファイル `users.txt` を `--workdir`
+（既定: `--rows-file` の親ディレクトリ）直下ではなく、その配下に毎回新規作成する
+一意なサブディレクトリ `self_bench_auth_<pid>_*/` へ生成し、停止時に削除する
+（`--workdir` 直下に既存の `users.txt` があっても上書きしない）。
 
 ## 実行
 

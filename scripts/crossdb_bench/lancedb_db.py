@@ -154,8 +154,13 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     stats, last = measure(agg_count, [None])
     phases["agg_count"] = {**stats, "result": last}
 
+    # 集計系の走査は全件を対象にする。`limit(1_000_000)` のような固定上限は入力が
+    # それを超えると黙って部分集計になる（codex-review P2）ため、`limit(None)`
+    # （上限なし）を使う。venv の lancedb 0.38.0 で `QueryBuilder.limit(None)` が
+    # 受理され、既定上限（10 件）を超える全行が返ることを実機確認済み。
+    # よって「agg_count の実測件数が上限超なら ValueError」の代替案は不要。
     def scan_ids(filter_str: str) -> list[int]:
-        rows = tbl.search().where(filter_str).select(["id"]).limit(1_000_000).to_arrow().to_pylist()
+        rows = tbl.search().where(filter_str).select(["id"]).limit(None).to_arrow().to_pylist()
         return [r["id"] for r in rows]
 
     def agg_multi(_):
@@ -172,7 +177,8 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             tbl.search()
             .where(public_filter)
             .select(["lang"])
-            .limit(1_000_000)
+            # 全件走査（上記 scan_ids と同じ理由で上限なし）。
+            .limit(None)
             .to_arrow()
             .to_pylist()
         )

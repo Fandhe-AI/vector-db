@@ -1,4 +1,5 @@
-"""MySQL 9.7.2 Community（`bench-mysql` コンテナ、127.0.0.1:33306）の機能別
+"""MySQL 9.7.2 Community（`bench-mysql` コンテナ、127.0.0.1:33306 既定。環境変数
+`CROSSDB_MYSQL_PORT` で上書き可。`containers.sh` と同じ変数を読む）の機能別
 ベンチマーク実装。
 
 実機確認済み: `VECTOR(128)` 列自体は作成・`STRING_TO_VECTOR()`/`VECTOR_TO_STRING()`
@@ -20,10 +21,11 @@ import time
 
 import mysql.connector
 
-from common import TENANT_VISIBLE, build_meta, measure, unsupported, vec_literal
+from common import TENANT_VISIBLE, build_meta, env_port, measure, unsupported, vec_literal
 
 HOST = "127.0.0.1"
-PORT = 33306
+# 既定値 33306 は containers.sh の `${CROSSDB_MYSQL_PORT:-33306}` と一致させること。
+PORT = env_port("CROSSDB_MYSQL_PORT", 33306)
 USER = "root"
 PASSWORD = "bench"
 DATABASE = "bench"

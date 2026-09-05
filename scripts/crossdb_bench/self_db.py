@@ -7,13 +7,20 @@
 
 RLS 相当のテナント境界は wire 接続ユーザーのテナントで自動適用される
 （`bench` = tenant-a、`bench_b` = tenant-b の 2 ユーザーを users.txt に登録する）。
+users.txt はベンチ専用の一意な作業サブディレクトリ（`<workdir>/self_bench_auth_*`）
+へ生成し、`--workdir`（既定: 入力 redb の親ディレクトリ）直下に既存の
+`users.txt` があっても触らない（codex-review P1）。
+
+接続先ポートは環境変数 `CROSSDB_SELF_PORT`（既定 15432）で上書きできる。
 """
 
 from __future__ import annotations
 
 import atexit
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 
 import psycopg
@@ -23,6 +30,7 @@ from common import (
     TENANT_OTHER,
     TENANT_VISIBLE,
     build_meta,
+    env_port,
     measure,
     sql_escape_literal,
     unsupported,
@@ -31,7 +39,9 @@ from common import (
 )
 
 BIND_HOST = "127.0.0.1"
-BIND_PORT = 15432
+# wire-server 子プロセスの bind ポート。self はコンテナではなく本モジュールが
+# 自ら起動するため、起動側・接続側とも同じこの値を使う（`CROSSDB_SELF_PORT`）。
+BIND_PORT = env_port("CROSSDB_SELF_PORT", 15432)
 USER_A = "bench"
 USER_B = "bench_b"
 PASSWORD = "bench"
@@ -61,14 +71,22 @@ def _port_is_listening(host: str, port: int) -> bool:
 
 
 class SelfServer:
-    """wire-server 子プロセスのライフサイクル管理（起動・users.txt 生成・停止）。"""
+    """wire-server 子プロセスのライフサイクル管理（起動・users.txt 生成・停止）。
+
+    users.txt は `start()` 時に `<workdir>/self_bench_auth_<一意名>/users.txt` として
+    新規作成し、`stop()` でサブディレクトリごと削除する。`workdir` 直下の
+    既存ファイル（特に `users.txt`）には一切触れない。
+    """
 
     def __init__(self, db_path: str, workdir: str, binary: str | None = None):
         self.db_path = db_path
         self.workdir = workdir
         self.binary = binary or self._default_binary()
         self.proc: subprocess.Popen | None = None
-        self.users_path = os.path.join(workdir, "users.txt")
+        # 認証ファイル用の作業サブディレクトリ。`start()` でポート検査を通過した後に
+        # 初めて作成する（起動を拒否する経路ではファイルを一切生成しない）。
+        self.auth_dir: str | None = None
+        self.users_path: str | None = None
 
     @staticmethod
     def _default_binary() -> str:
@@ -83,20 +101,26 @@ class SelfServer:
                 f"wire-server binary not found: {self.binary}"
                 "（`cargo build --release -p wire-server` を先に実行）"
             )
-        phc_a = _hash_password(self.binary, PASSWORD)
-        phc_b = _hash_password(self.binary, PASSWORD)
-        os.makedirs(self.workdir, exist_ok=True)
-        with open(self.users_path, "w", encoding="utf-8") as f:
-            f.write(f"{USER_A}:{TENANT_VISIBLE}:{phc_a}\n")
-            f.write(f"{USER_B}:{TENANT_OTHER}:{phc_b}\n")
-
         # 起動前にポートが既に LISTEN していれば別プロセス（前回の残骸等）であり、
         # そのまま進むと wait_for_port が成功して別サーバーを計測してしまうため拒否する。
+        # 認証ファイルの生成はこの検査の後に行う（拒否経路で何も書き残さない）。
         if _port_is_listening(BIND_HOST, BIND_PORT):
             raise RuntimeError(
                 f"{BIND_HOST}:{BIND_PORT} is already in use; refusing to start wire-server "
                 "(another process may be listening)"
             )
+        phc_a = _hash_password(self.binary, PASSWORD)
+        phc_b = _hash_password(self.binary, PASSWORD)
+        os.makedirs(self.workdir, exist_ok=True)
+        # ベンチ専用の一意なサブディレクトリを新規作成（既存があれば衝突せず別名になる。
+        # `mkdtemp` は既存ディレクトリを再利用しない＝`exist_ok=False` 相当で、
+        # パスワードハッシュを置くため権限も 0700 になる）。workdir 直下の既存
+        # `users.txt` は上書きしない。
+        self.auth_dir = tempfile.mkdtemp(prefix=f"self_bench_auth_{os.getpid()}_", dir=self.workdir)
+        self.users_path = os.path.join(self.auth_dir, "users.txt")
+        with open(self.users_path, "w", encoding="utf-8") as f:
+            f.write(f"{USER_A}:{TENANT_VISIBLE}:{phc_a}\n")
+            f.write(f"{USER_B}:{TENANT_OTHER}:{phc_b}\n")
         self.proc = subprocess.Popen(
             [
                 self.binary,
@@ -118,6 +142,8 @@ class SelfServer:
         while True:
             if self.proc.poll() is not None:
                 out = self.proc.stdout.read() if self.proc.stdout else ""
+                # 起動失敗でも認証サブディレクトリを残さない。
+                self.stop()
                 raise RuntimeError(
                     f"wire-server exited during startup (code {self.proc.returncode}): {out.strip()}"
                 )
@@ -132,6 +158,8 @@ class SelfServer:
         time.sleep(0.3)
 
     def stop(self) -> None:
+        """子プロセスを停止し、認証サブディレクトリを削除する（多重呼び出し可。
+        `run()` の finally と atexit の双方から呼ばれる）。"""
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:
@@ -139,6 +167,10 @@ class SelfServer:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc = None
+        if self.auth_dir is not None and os.path.isdir(self.auth_dir):
+            shutil.rmtree(self.auth_dir, ignore_errors=True)
+        self.auth_dir = None
+        self.users_path = None
 
     def connect(self, user: str = USER_A) -> psycopg.Connection:
         conn = psycopg.connect(
@@ -188,8 +220,6 @@ def run(args, queries: list[dict]) -> dict:
     # ため、渡された fixture を直接開かず作業コピーに対して実行する。コピーしないと
     # 2 回目以降の実行で同一 operation_id の再送が内容不一致として拒否され
     # （TASK-101・RECOVER-10 の契約どおり）、可視行数も毎回増えて比較できなくなる。
-    import shutil
-
     os.makedirs(workdir, exist_ok=True)
     work_db = os.path.join(workdir, "self_bench_work.redb")
     shutil.copyfile(args.rows_file, work_db)

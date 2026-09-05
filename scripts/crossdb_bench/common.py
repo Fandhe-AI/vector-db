@@ -46,6 +46,29 @@ def public_only_where(table_alias: str = "") -> str:
 DIM = 128
 
 
+def env_port(name: str, default: int) -> int:
+    """環境変数 `name` から接続先ポートを読む（未設定・空文字なら `default`）。
+
+    起動側（`containers.sh`／`gpu/containers_gpu.sh` の `${NAME:-default}`）と
+    接続側（各 `*_db.py`）が同じ変数名・同じ既定値を読む契約の Python 側実装。
+    shell の `${VAR:-default}` は「未設定」と「空文字」のどちらも既定値へ倒すため、
+    ここでも空文字を未設定と同じに扱い両側の解釈を揃える。それ以外の値は
+    1〜65535 の整数のみ受理し、不正値は黙って既定へ倒さず `ValueError` で
+    fail-closed に拒否する（別サーバーを計測してしまう事故を防ぐ）。
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    # `int()` は前後の空白・符号・`_` 区切りを受理してしまうため、ASCII 十進数字
+    # だけの文字列に限定してから変換する。
+    if not (raw.isascii() and raw.isdigit()):
+        raise ValueError(f"{name} must be an integer port (1-65535), got {raw!r}")
+    port = int(raw, 10)
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be within 1-65535, got {port}")
+    return port
+
+
 def load_jsonl(path: str) -> list[dict]:
     """1 行 1 JSON のフィクスチャファイルを読み込む（docs25k.jsonl・queries200.jsonl 共通）。"""
     rows = []
