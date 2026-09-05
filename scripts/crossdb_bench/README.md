@@ -115,7 +115,7 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 ## フェーズ一覧
 
 `crates/engine/examples/feature_bench.rs` の 13 フェーズに対応させたうえで、
-`recall_at_10`（正解集合との突き合わせ）を追加した 15 種類。DB がその機能を
+`recall_at_10`（正解集合との突き合わせ）と広域取得 5 種を追加した 20 種類。DB がその機能を
 持たない場合は `{"unsupported": true, "reason": "..."}` を記録する
 （fail-closed。黙って欠落させない）。
 
@@ -135,6 +135,10 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
 | `udf_call` | 宣言的 UDF 呼び出し（self のみ） |
 | `explain` | `EXPLAIN` |
 | `recall_at_10` | `docs25k.jsonl` の public 行から numpy で計算した内積正解との突き合わせ（同点許容。下記「Recall@10 の算出方法」参照） |
+| `bulk_knn_k200` / `bulk_knn_k1000` | 広域取得: フィルタなし Top-200／Top-1000 を `id, body` 込みで返す（LLM へ丸ごと渡す用途。ANN 構成は候補幅を max(64, k) へ引き上げて計測し `ef_search`／`hnsw_ef`／`ef` を記録） |
+| `bulk_knn_where_k200` | 広域取得: `lang = 'ja'` フィルタ付き Top-200（`id, body`） |
+| `bulk_hybrid_k200` | 広域取得: hybrid RRF の Top-200（`id, body`。pgvector・sqlite-vec は候補プールを 200 へ拡大し `candidate_pool` を記録） |
+| `scan_where_nosort_k500` | ORDER BY なしのスカラーフィルタのみ LIMIT 500（`id, body`）。self の SQL 表層は行取得 SELECT に `ORDER BY <距離>` か `USING PLAN` を必須とするため実行して拒否を捕捉し unsupported を記録 |
 
 ## 公平性についての注記
 

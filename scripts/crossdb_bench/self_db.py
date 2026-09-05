@@ -297,6 +297,74 @@ def run(args, queries: list[dict]) -> dict:
         stats, _ = measure(mode_query("precision"), query_vecs)
         phases["mode_precision"] = stats
 
+        # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
+        # LLM のコンテキストへ丸ごと渡す想定のため、本文（body）の送出コストを
+        # 含めて計測する。LIMIT の上限は `crates/engine/src/core.rs::MAX_SEARCH_K`
+        # （10,000）のため 1,000 は受理される。`rows_returned` は最終呼び出しで
+        # 実際に返った行数（k と一致しなければ経路側の打ち切りを疑う）。
+        def _exec_rows(sql: str) -> list:
+            with conn_a.cursor() as cur:
+                cur.execute(sql)
+                return cur.fetchall()
+
+        def bulk_knn(k: int):
+            def _run(qv):
+                return _exec_rows(
+                    f"SELECT id, body FROM docs ORDER BY embedding <=> '{qv}' LIMIT {k}"
+                )
+
+            return _run
+
+        for k in (200, 1000):
+            stats, last = measure(bulk_knn(k), query_vecs)
+            phases[f"bulk_knn_k{k}"] = {**stats, "k": k, "rows_returned": len(last)}
+
+        def bulk_knn_where(qv):
+            return _exec_rows(
+                f"SELECT id, body FROM docs WHERE lang = 'ja' "
+                f"ORDER BY embedding <=> '{qv}' LIMIT 200"
+            )
+
+        stats, last = measure(bulk_knn_where, query_vecs)
+        phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
+
+        def bulk_hybrid(i):
+            qv, qt = query_vecs[i], query_texts[i]
+            return _exec_rows(
+                f"SELECT id, body FROM docs ORDER BY hybrid_rrf(embedding, '{qv}', "
+                f"body, '{qt}') LIMIT 200"
+            )
+
+        stats, last = measure(bulk_hybrid, idxs)
+        phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
+
+        # ORDER BY なしの行取得は SQL 表層の許可リスト
+        # （`crates/engine/src/sql/allowlist.rs::parse_select_shape`）が
+        # `ORDER BY <distance>` か `USING PLAN` を必須とするため受理されない。
+        # 推測で unsupported にせず、実際に 1 回実行して拒否を確認したうえで記録する
+        # （explain フェーズと同じく、拒否応答は接続を切断しない）。
+        nosort_sql = "SELECT id, body FROM docs WHERE lang = 'ja' LIMIT 500"
+        try:
+            _exec_rows(nosort_sql)
+            accepted = True
+        except Exception as e:  # noqa: BLE001 - 許可リスト拒否かどうかを下で検証する
+            accepted = False
+            # 許可リストの構文拒否（`42601`・"unsupported SQL syntax"）以外の例外
+            # （接続断・タイムアウト等）を「想定内の拒否」として記録すると fail-open に
+            # なるため、拒否以外はそのまま再送出して計測全体を失敗させる。
+            sqlstate = getattr(e, "sqlstate", None)
+            if sqlstate != "42601" and "unsupported SQL syntax" not in str(e):
+                raise
+            phases["scan_where_nosort_k500"] = unsupported(
+                "SQL surface requires ORDER BY <distance> or USING PLAN for "
+                f"row-returning SELECT (sqlstate={sqlstate}): {e!r}"
+            )
+        if accepted:
+            # 許可リストが将来受理するようになった場合は通常フェーズとして計測する
+            # （unsupported に丸めると仕様変更に気づけない）。
+            stats, last = measure(lambda _: _exec_rows(nosort_sql), [None])
+            phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
+
         # --- rls_isolation（tenant-b 接続で COUNT） ---
         # 実機確認済みの現行契約: 自作 DB はどのテナントの wire セッションから
         # も `visibility = 'public'` の行のみが可視であり、private 行は所有

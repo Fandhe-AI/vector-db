@@ -250,6 +250,112 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     stats, _ = measure(hybrid, idxs)
     phases["hybrid_rrf"] = stats
 
+    # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
+    # LLM のコンテキストへ丸ごと渡す想定のため本文（body）の送出コストを含める。
+    # hnsw 構成では `hnsw.ef_search`（既定 64）が返却上限になり LIMIT 200/1000 でも
+    # 最大 64 行しか返らない（実機確認）ため、bulk フェーズの間だけ 1000 へ引き上げ、
+    # 終了後に元の 64 へ戻す（exact 構成では ef_search は無関係）。なお hnsw では
+    # `visibility = 'public'` の事後フィルタ分だけ ef_search 上限から目減りするため
+    # k=1000 で `rows_returned < k` になり得る。隠さずそのまま記録する。
+    def exec_rows(sql: str) -> list:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()
+
+    # ef_search は Qdrant（hnsw_ef）・LanceDB（ef）と同じ規則 max(64, k) で
+    # フェーズごとに設定する（DB 間で候補幅を揃え、ef の差が性能差に見えないようにする）。
+    def bulk_ef(k: int):
+        return max(64, k) if args.config == "hnsw" else None
+
+    def set_ef(k: int) -> dict:
+        ef = bulk_ef(k)
+        if ef is not None:
+            with conn.cursor() as cur:
+                cur.execute(f"SET hnsw.ef_search = {int(ef)}")
+        return {"ef_search": ef}
+
+    try:
+
+        def bulk_knn(k: int):
+            def _run(qv):
+                return exec_rows(
+                    f"SELECT id, body FROM docs WHERE {public_only_where()} "
+                    f"ORDER BY embedding <#> '{qv}' LIMIT {k}"
+                )
+
+            return _run
+
+        for k in (200, 1000):
+            ef_note = set_ef(k)
+            stats, last = measure(bulk_knn(k), query_vecs)
+            phases[f"bulk_knn_k{k}"] = {**stats, "k": k, "rows_returned": len(last), **ef_note}
+
+        def bulk_knn_where(qv):
+            return exec_rows(
+                f"SELECT id, body FROM docs WHERE {public_only_where()} AND lang = 'ja' "
+                f"ORDER BY embedding <#> '{qv}' LIMIT 200"
+            )
+
+        ef_note = set_ef(200)
+        stats, last = measure(bulk_knn_where, query_vecs)
+        phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last), **ef_note}
+
+        # hybrid_rrf と同じ RRF 形。候補プールが各 50 のままでは融合後の総数が
+        # 最大 100 行にとどまり LIMIT 200 を満たせないため、両プールを 200 へ広げる。
+        bulk_hybrid_pool = 200
+
+        def bulk_hybrid(i):
+            qv, qt = query_vecs[i], query_texts[i]
+            vis = public_only_where()
+            sql = f"""
+            WITH knn AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY embedding <#> '{qv}') AS rnk
+                FROM docs WHERE {vis}
+                ORDER BY embedding <#> '{qv}' LIMIT {bulk_hybrid_pool}
+            ),
+            fts AS (
+                SELECT id, ROW_NUMBER() OVER (
+                    ORDER BY ts_rank(body_tsv, plainto_tsquery('english', '{qt}')) DESC
+                ) AS rnk
+                FROM docs
+                WHERE {vis}
+                  AND body_tsv @@ plainto_tsquery('english', '{qt}')
+                ORDER BY ts_rank(body_tsv, plainto_tsquery('english', '{qt}')) DESC
+                LIMIT {bulk_hybrid_pool}
+            ),
+            fused AS (
+                SELECT COALESCE(knn.id, fts.id) AS id,
+                       COALESCE(1.0 / (60 + knn.rnk), 0) + COALESCE(1.0 / (60 + fts.rnk), 0) AS score
+                FROM knn FULL OUTER JOIN fts ON knn.id = fts.id
+                ORDER BY score DESC LIMIT 200
+            )
+            SELECT fused.id, docs.body FROM fused JOIN docs ON docs.id = fused.id
+            ORDER BY fused.score DESC
+            """
+            return exec_rows(sql)
+
+        ef_note = set_ef(bulk_hybrid_pool)
+        stats, last = measure(bulk_hybrid, idxs)
+        phases["bulk_hybrid_k200"] = {
+            **stats,
+            "k": 200,
+            "rows_returned": len(last),
+            "candidate_pool": bulk_hybrid_pool,
+            **ef_note,
+        }
+
+        def scan_nosort(_):
+            return exec_rows(
+                f"SELECT id, body FROM docs WHERE {public_only_where()} AND lang = 'ja' LIMIT 500"
+            )
+
+        stats, last = measure(scan_nosort, [None])
+        phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
+    finally:
+        if args.config == "hnsw":
+            with conn.cursor() as cur:
+                cur.execute("SET hnsw.ef_search = 64")
+
     phases["mode_recall"] = unsupported("pgvector にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("pgvector にモード切替（recall/precision）の概念が無い")
     phases["udf_call"] = unsupported(

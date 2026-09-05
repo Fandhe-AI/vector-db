@@ -249,6 +249,88 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     except sqlite3.Error as e:
         phases["hybrid_rrf"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
+    # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
+    # LLM のコンテキストへ丸ごと渡す想定のため本文（body）の送出コストを含める。
+    # vec0 の KNN（MATCH + k）はサブクエリに閉じ込め、body は外側で docs と JOIN する
+    # （MATCH を含む FROM へ直接 JOIN すると計画が KNN でなくなり得るため）。
+    def bulk_knn(k: int, lang_ja: bool):
+        lang_clause = " AND lang = 'ja'" if lang_ja else ""
+
+        def _run(qv):
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT v.rowid, docs.body FROM ("
+                "SELECT rowid, distance FROM vec_docs WHERE embedding MATCH ? AND k = ? "
+                f"AND visibility = 'public'{lang_clause}"
+                ") AS v JOIN docs ON docs.id = v.rowid ORDER BY v.distance",
+                (_pack(qv), k),
+            )
+            return cur.fetchall()
+
+        return _run
+
+    for k in (200, 1000):
+        stats, last = measure(bulk_knn(k, lang_ja=False), query_vecs)
+        phases[f"bulk_knn_k{k}"] = {**stats, "k": k, "rows_returned": len(last)}
+
+    stats, last = measure(bulk_knn(200, lang_ja=True), query_vecs)
+    phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last)}
+
+    # hybrid_rrf と同じ RRF 形。候補プールが各 50 のままでは融合後の総数が最大 100 に
+    # とどまり Top-200 を満たせないため両プールを 200 へ広げ、融合後に body を 1 回の
+    # `IN (...)` で取り出す（本文取得コストも計測区間に含める）。
+    bulk_hybrid_pool = 200
+
+    def bulk_hybrid(i):
+        qv = query_vecs[i]
+        qt = queries[i].get("text", "")
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT rowid FROM vec_docs WHERE embedding MATCH ? AND k = ? "
+            "AND visibility = 'public' ORDER BY distance",
+            (_pack(qv), bulk_hybrid_pool),
+        )
+        knn_ids = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT docs_fts.rowid FROM docs_fts JOIN docs ON docs.id = docs_fts.rowid "
+            "WHERE docs_fts MATCH ? AND docs.visibility = 'public' ORDER BY bm25(docs_fts) LIMIT ?",
+            (_fts5_quote(qt), bulk_hybrid_pool),
+        )
+        fts_ids = [r[0] for r in cur.fetchall()]
+        scores: dict[int, float] = {}
+        for rank, rid in enumerate(knn_ids, start=1):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (60 + rank)
+        for rank, rid in enumerate(fts_ids, start=1):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (60 + rank)
+        top = [rid for rid, _ in sorted(scores.items(), key=lambda kv: -kv[1])[:200]]
+        if not top:
+            return []
+        placeholders = ",".join("?" for _ in top)
+        cur.execute(f"SELECT id, body FROM docs WHERE id IN ({placeholders})", top)
+        body_by_id = {r[0]: r[1] for r in cur.fetchall()}
+        return [(rid, body_by_id.get(rid)) for rid in top]
+
+    try:
+        stats, last = measure(bulk_hybrid, idxs)
+        phases["bulk_hybrid_k200"] = {
+            **stats,
+            "k": 200,
+            "rows_returned": len(last),
+            "candidate_pool": bulk_hybrid_pool,
+        }
+    except sqlite3.Error as e:
+        phases["bulk_hybrid_k200"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
+
+    def scan_nosort(_):
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, body FROM docs WHERE visibility = 'public' AND lang = 'ja' LIMIT 500"
+        )
+        return cur.fetchall()
+
+    stats, last = measure(scan_nosort, [None])
+    phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
+
     phases["mode_recall"] = unsupported("sqlite-vec にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("sqlite-vec にモード切替（recall/precision）の概念が無い")
     phases["udf_call"] = unsupported(

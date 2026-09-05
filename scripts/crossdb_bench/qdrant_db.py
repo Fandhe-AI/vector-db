@@ -97,6 +97,10 @@ def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
                         "visibility": d.get("visibility", "private"),
                         "lang": d["lang"],
                         "topic": d.get("topic", ""),
+                        # 広域取得（bulk_* フェーズ）が id と本文を返すために保持する。
+                        # 他 DB は当初から body 列を投入しており、投入量の公平性は
+                        # むしろ揃う方向（結果 JSON の note にも記録する）。
+                        "body": d["body"],
                     }
                     for d in chunk
                 ],
@@ -104,7 +108,12 @@ def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
         )
     t1 = time.perf_counter()
     elapsed = t1 - t0
-    return {"rows": len(docs), "seconds": elapsed, "rows_per_sec": len(docs) / elapsed if elapsed > 0 else None}
+    return {
+        "rows": len(docs),
+        "seconds": elapsed,
+        "rows_per_sec": len(docs) / elapsed if elapsed > 0 else None,
+        "note": "payload に body を追加（bulk_* フェーズの本文返却用。他 DB の投入内容と同等化）",
+    }
 
 
 def _ingest_single_stmt(client: QdrantClient, dim: int, n_rows: int = 1000) -> dict:
@@ -127,13 +136,19 @@ def _ingest_single_stmt(client: QdrantClient, dim: int, n_rows: int = 1000) -> d
                         "visibility": "private",
                         "lang": lang,
                         "topic": topic,
+                        "body": f"crossdb bench ingest row {n}",
                     },
                 )
             ],
         )
     t1 = time.perf_counter()
     elapsed = t1 - t0
-    return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
+    return {
+        "rows": n_rows,
+        "seconds": elapsed,
+        "rows_per_sec": n_rows / elapsed if elapsed > 0 else None,
+        "note": "payload に body を追加（bulk_* フェーズの本文返却用。他 DB の投入内容と同等化）",
+    }
 
 
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
@@ -219,6 +234,66 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     phases["mode_recall"] = unsupported("Qdrant にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("Qdrant にモード切替（recall/precision）の概念が無い")
     phases["udf_call"] = unsupported("自作 DB の宣言的 UDF 呼び出し相当の機能が無い")
+
+    # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
+    # LLM のコンテキストへ丸ごと渡す想定のため本文（payload の body）の送出コストを
+    # 含める。hnsw 構成では hnsw_ef（64）が limit を下回ると返却が目減りし得るため
+    # bulk フェーズでは ef を max(64, k) へ引き上げ、結果に記録する。
+    def bulk_search_params(k: int):
+        if args.config == "hnsw":
+            return models.SearchParams(hnsw_ef=max(64, k), exact=False), max(64, k)
+        return models.SearchParams(exact=True), None
+
+    def bulk_knn(k: int, flt):
+        params, _ = bulk_search_params(k)
+
+        def _run(qv):
+            res = client.query_points(
+                collection_name=COLLECTION,
+                query=qv,
+                query_filter=flt,
+                search_params=params,
+                limit=k,
+                with_payload=["id", "body"],
+            )
+            return [(p.id, p.payload.get("body")) for p in res.points]
+
+        return _run
+
+    for k in (200, 1000):
+        stats, last = measure(bulk_knn(k, public_only_filter), query_vecs)
+        phases[f"bulk_knn_k{k}"] = {
+            **stats,
+            "k": k,
+            "rows_returned": len(last),
+            "hnsw_ef": bulk_search_params(k)[1],
+        }
+
+    stats, last = measure(bulk_knn(200, public_only_lang_ja_filter), query_vecs)
+    phases["bulk_knn_where_k200"] = {
+        **stats,
+        "k": 200,
+        "rows_returned": len(last),
+        "hnsw_ef": bulk_search_params(200)[1],
+    }
+
+    phases["bulk_hybrid_k200"] = unsupported(
+        "疎ベクトルを自前生成すると自作 DB の BM25 系 hybrid と非等価なため対象外（task 指示）"
+    )
+
+    # ORDER BY なしの WHERE スキャン相当は scroll API（ベクトル非返却・payload のみ）。
+    def scan_nosort(_):
+        points, _next = client.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=public_only_lang_ja_filter,
+            limit=500,
+            with_payload=["id", "body"],
+            with_vectors=False,
+        )
+        return [(p.id, p.payload.get("body")) for p in points]
+
+    stats, last = measure(scan_nosort, [None])
+    phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
 
     # Qdrant には自作 DB の wire セッションに相当するテナント別接続の概念が
     # 無いため、tenant-b「セッション」を模す接続は作らず、同じ public-only

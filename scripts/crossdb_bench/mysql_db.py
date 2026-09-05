@@ -176,6 +176,24 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     stats, last = measure(group_by, [None])
     phases["group_by_having"] = {**stats, "result": last}
 
+    # --- 広域取得（bulk fetch） ---
+    # KNN 関数が存在しないため類似度順の Top-N は成立せず、既存の理由をそのまま流用する。
+    # ORDER BY なしの WHERE スキャンのみ実行可能（id と body を返し本文送出コストを含める）。
+    phases["bulk_knn_k200"] = unsupported(knn_reason)
+    phases["bulk_knn_k1000"] = unsupported(knn_reason)
+    phases["bulk_knn_where_k200"] = unsupported(knn_reason)
+    phases["bulk_hybrid_k200"] = unsupported(knn_reason + "（hybrid は KNN 側が成立しないため対象外）")
+
+    def scan_nosort(_):
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, body FROM docs WHERE visibility = 'public' AND lang = 'ja' LIMIT 500"
+        )
+        return cur.fetchall()
+
+    stats, last = measure(scan_nosort, [None])
+    phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
+
     # MySQL には自作 DB の wire セッションに相当するテナント別接続の概念が
     # 無いため、tenant-b「セッション」を模す接続は作らず、同じ public-only
     # フィルタを再実行して agg_count と同値になることの一致確認とする

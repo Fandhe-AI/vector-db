@@ -214,6 +214,63 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
         except Exception as e:  # noqa: BLE001
             phases["hybrid_rrf"] = unsupported(f"hybrid search failed: {e!r}")
 
+    # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
+    # LLM のコンテキストへ丸ごと渡す想定のため本文（body）の送出コストを含める。
+    # hnsw 構成では ef（64）が limit を下回ると返却が目減りし得るため bulk フェーズ
+    # では ef を max(64, k) へ引き上げ、結果に記録する。
+    def bulk_ef(k: int):
+        return max(64, k) if args.config == "hnsw" else None
+
+    def bulk_knn(k: int, filter_str: str):
+        def _run(qv):
+            q = tbl.search(qv, vector_column_name="vector").metric("dot").where(filter_str).limit(k)
+            if args.config == "hnsw":
+                q = q.ef(bulk_ef(k))
+            return [(r["id"], r["body"]) for r in q.select(["id", "body"]).to_list()]
+
+        return _run
+
+    for k in (200, 1000):
+        stats, last = measure(bulk_knn(k, public_filter), query_vecs)
+        phases[f"bulk_knn_k{k}"] = {**stats, "k": k, "rows_returned": len(last), "ef": bulk_ef(k)}
+
+    stats, last = measure(bulk_knn(200, public_lang_filter), query_vecs)
+    phases["bulk_knn_where_k200"] = {**stats, "k": 200, "rows_returned": len(last), "ef": bulk_ef(200)}
+
+    def bulk_hybrid(i):
+        qv = query_vecs[i]
+        qt = sql_escape_literal(queries[i].get("text", ""))
+        q = (
+            tbl.search(query_type="hybrid")
+            .vector(qv)
+            .text(qt)
+            .metric("dot")
+            .where(public_filter)
+            .limit(200)
+        )
+        if args.config == "hnsw":
+            # bulk_knn と同じく密側の候補幅を k 以上へ引き上げる
+            q = q.ef(bulk_ef(200))
+        rows = q.select(["id", "body"]).to_list()
+        return [(r["id"], r["body"]) for r in rows]
+
+    if fts_error is not None:
+        phases["bulk_hybrid_k200"] = unsupported(f"FTS index creation failed: {fts_error}")
+    else:
+        try:
+            stats, last = measure(bulk_hybrid, idxs)
+            phases["bulk_hybrid_k200"] = {**stats, "k": 200, "rows_returned": len(last), "ef": bulk_ef(200)}
+        except Exception as e:  # noqa: BLE001
+            phases["bulk_hybrid_k200"] = unsupported(f"hybrid search failed: {e!r}")
+
+    # ベクトルなしの where スキャン（ORDER BY なし）。
+    def scan_nosort(_):
+        rows = tbl.search().where(public_lang_filter).limit(500).select(["id", "body"]).to_list()
+        return [(r["id"], r["body"]) for r in rows]
+
+    stats, last = measure(scan_nosort, [None])
+    phases["scan_where_nosort_k500"] = {**stats, "k": 500, "rows_returned": len(last)}
+
     phases["mode_recall"] = unsupported("LanceDB にモード切替（recall/precision）の概念が無い")
     phases["mode_precision"] = unsupported("LanceDB にモード切替（recall/precision）の概念が無い")
     phases["udf_call"] = unsupported("自作 DB の宣言的 UDF 呼び出し相当の機能が無い")
