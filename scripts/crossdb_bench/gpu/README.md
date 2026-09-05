@@ -101,8 +101,9 @@ batch=1/8 を A 相当に保ったまま batch=64/256 も 9-17ms 程度に抑え
   （`FAISS_BLAS_THRESHOLD` 環境変数でも上書き可）
 
 FAISS 既定の BLAS 経路をそのまま計測したい場合は `--blas-threshold 20` を渡す。
-結果 JSON の `meta.cpu_condition`（`"blas_disabled"` / `"blas_default_threshold_20"`）
-でどちらの条件が使われたかを確認できる。
+結果 JSON の `meta.cpu_condition`（`"blas_disabled"` / `"blas_default_threshold_20"` /
+それ以外の任意値は `"blas_custom_threshold_<n>"`）でどの条件が使われたかを確認できる
+（既定 20 ちょうどの場合だけ既定ラベルになり、他の値は既定条件と区別される）。
 
 ## 2. Qdrant（索引構築 CPU vs GPU）
 

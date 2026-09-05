@@ -110,6 +110,24 @@ def measure_search(index: Any, queries: np.ndarray, batch: int, k: int) -> dict[
     return latency_stats(latencies_us, batch)
 
 
+# FAISS 既定の `distance_compute_blas_threshold`（faiss.cvar の初期値。README 参照）。
+FAISS_DEFAULT_BLAS_THRESHOLD = 20
+# この値以上を「BLAS 経路無効化」とみなす（`--blas-threshold` の既定値 1<<30 と同じ）。
+BLAS_DISABLED_THRESHOLD = 1 << 30
+
+
+def cpu_condition_label(blas_threshold: int) -> str:
+    """結果 JSON の `meta.cpu_condition` ラベル。README の比較条件の識別に使うため、
+    FAISS 既定値（20）ちょうどの場合だけ `blas_default_threshold_20` とし、それ以外の
+    任意値は `blas_custom_threshold_<n>` として既定条件と区別する（codex-review P2 指摘。
+    例えば 1 を渡すと batch=1 から BLAS 経路になり既定 20 とは別条件）。"""
+    if blas_threshold >= BLAS_DISABLED_THRESHOLD:
+        return "blas_disabled"
+    if blas_threshold == FAISS_DEFAULT_BLAS_THRESHOLD:
+        return "blas_default_threshold_20"
+    return f"blas_custom_threshold_{blas_threshold}"
+
+
 def build_cpu_index(corpus: np.ndarray, dim: int, omp_threads: int, blas_threshold: int | None):
     """CPU 経路の `IndexFlatIP` を構築する。
 
@@ -242,9 +260,7 @@ def main() -> int:
         "omp_num_threads": args.omp_threads,
         "openblas_num_threads_env": os.environ.get("OPENBLAS_NUM_THREADS"),
         "cpu_blas_threshold": args.blas_threshold,
-        "cpu_condition": (
-            "blas_disabled" if args.blas_threshold >= (1 << 30) else "blas_default_threshold_20"
-        ),
+        "cpu_condition": cpu_condition_label(args.blas_threshold),
         "seed": SEED,
         "k": K,
         "batch_grid": list(BATCH_GRID),
