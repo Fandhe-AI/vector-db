@@ -25,19 +25,8 @@ ignore = [
     # 実行時コードを含まず、advisory 種別も unmaintained のみ（既知の脆弱性
     # advisory ではない）。オーナー承認済み（2026-08-30・Issue #333 再 open
     # コメント）。解消予定: `tokenizers` が `paste` 非依存の新版を出すまで、または
-    # 別クレートへの置き換えが承認されるまで（追跡: Issue #333）。2026-09-05 追記:
-    # 対照エンジン `hnsw_rs`（`contrast-bench` feature・`simdeez_f` feature 経由の
-    # `simdeez`）からも同じ `paste` へ推移的に到達する（同じく proc-macro 専用）。
+    # 別クレートへの置き換えが承認されるまで（追跡: Issue #333）。
     { id = "RUSTSEC-2024-0436", reason = "paste is a compile-time-only proc-macro crate (transitive dep of tokenizers); unmaintained advisory only, no known vulnerability. Owner-approved 2026-08-30 (Issue #333)." },
-    # RUSTSEC-2025-0141（`bincode` 1.3.3・unmaintained）: PR #445 の報告への回答で
-    # 承認（2026-09-05）された対照エンジン `hnsw_rs`（`contrast-bench` feature 限定・
-    # bench 専用 optional 依存）の推移的依存。`bincode` は hnsw_rs の索引ダンプ／
-    # リロード経路でのみ使われ、本リポの比較ベンチはその経路を呼ばない。advisory
-    # 種別も unmaintained のみ（既知の脆弱性 advisory ではない）。解消予定: `hnsw_rs`
-    # が `bincode` 非依存の新版を出すまで、または比較ベンチから `hnsw_rs` を外す判断
-    # がされるまで（追跡: Issue #406 / PR #445 の後続 PR〔bench/hnsw-rs-compare
-    # ブランチ〕）。
-    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is a transitive dep of hnsw_rs (bench-only optional, contrast-bench feature); used only in hnsw_rs dump/reload paths the bench never calls; unmaintained advisory only, no known vulnerability. Dependency owner-approved 2026-09-05 (PR #445 follow-up)." },
 ]
 
 [licenses]
