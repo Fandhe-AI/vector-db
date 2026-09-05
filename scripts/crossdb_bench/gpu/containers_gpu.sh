@@ -72,7 +72,8 @@ up_gpu() {
     "${QDRANT_IMAGE_GPU}" >/dev/null
   wait_ready bench-qdrant-gpu
   # 'Found GPU device' は列挙のみ（CPU エミュレータも含む）。初期化の証拠は 'Create GPU device'。
-  if docker logs bench-qdrant-gpu 2>&1 | grep -qi "create gpu device"; then
+  # "Failed to create GPU device" も同じ語を含むため失敗行を除外する。
+  if docker logs bench-qdrant-gpu 2>&1 | grep -i "create gpu device" | grep -qiv "failed"; then
     echo "bench-qdrant-gpu: GPU device initialized (Create GPU device)"
   else
     echo "bench-qdrant-gpu: WARNING - 'Create GPU device' not seen in logs (fail-closed: GPU 未初期化の可能性)" >&2
