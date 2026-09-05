@@ -47,6 +47,13 @@ def _setup_collection(client: QdrantClient, dim: int, config: str) -> None:
         # （実機確認: status=green のまま indexed_vectors_count=0）。hnsw 構成では閾値を
         # 下げて全セグメントを索引化させ、_wait_indexed で完了を確認してから計測する。
         optimizers_config = models.OptimizersConfigDiff(indexing_threshold=1)
+    else:
+        # exact 構成は「索引なし全件探索」が比較条件（README）。検索側の `exact=True` は
+        # 索引構築そのものを止めないため、既定のままだとセグメントが閾値を超えた時点で
+        # HNSW のバックグラウンド構築が走り、その負荷が検索計測へ混入する。公式手順
+        # （optimizer ドキュメント）どおり indexing_threshold=0 で自動構築を無効化する
+        # （codex-review P2 指摘）。
+        optimizers_config = models.OptimizersConfigDiff(indexing_threshold=0)
     client.create_collection(
         collection_name=COLLECTION,
         vectors_config=models.VectorParams(size=dim, distance=models.Distance.DOT),

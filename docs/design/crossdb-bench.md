@@ -61,7 +61,9 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
   self は既定エンジン（brute-force）のみ計測した（ANN opt-in は wire から選択できない）。
   Qdrant の `hnsw` は `indexing_threshold` を下げて全セグメントを索引化し、status green
   かつ `indexed_vectors_count` が全件に達したことを確認してから計測する（既定閾値では
-  25,000 行・dim 128 は各セグメントが閾値未満のまま HNSW が構築されない）。LanceDB の
+  25,000 行・dim 128 は各セグメントが閾値未満のまま HNSW が構築されない）。逆に `exact`
+  は `indexing_threshold=0` で自動構築を無効化し、検索側の `exact=True` だけでは止まらない
+  バックグラウンド構築の負荷が計測へ混入しないようにする。LanceDB の
   hybrid もベクトル側は `metric="dot"` を明示している。sqlite-vec の hybrid は FTS5 の
   `MATCH` に自然文をそのまま渡すと構文エラーになるため、各語を二重引用符で囲んだ語句
   クエリへ変換している。

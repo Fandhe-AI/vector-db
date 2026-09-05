@@ -177,7 +177,9 @@ tenant-a=public・tenant-b=private が連続した区間にまとまっている
   読む。
 - **exact / ANN の区別**: `--config exact` は索引なし全件探索、`--config hnsw`
   は各 DB の近似最近傍索引を使う。両者は精度・速度のトレードオフが異なるため
-  同じ表で比較する際は必ず `config` を添えて読む。
+  同じ表で比較する際は必ず `config` を添えて読む。Qdrant の `exact` は
+  `indexing_threshold=0` で HNSW の自動構築を無効化する（検索側 `exact=True` は
+  構築を止めないため、既定のままだとバックグラウンド構築の負荷が混入し得る）。
 - **既定設定のまま**: 各 DB は README に明記した索引パラメータ（pgvector
   m=16/ef_construction=100/ef_search=64、Qdrant 同様、LanceDB
   IVF_HNSW_FLAT m=16/ef_construction=100/ef=64）以外は既定値のまま変更していない
