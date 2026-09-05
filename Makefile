@@ -377,6 +377,14 @@ else
 	@echo "skip: Cargo.toml 未追加のため bench-hnsw-parallel-build をスキップ"
 endif
 
+.PHONY: bench-gpu-scaling
+bench-gpu-scaling: ## GPU バッチ検索（engine::gpu_batch）が CPU-SIMD バッチ経路に対してどの規模・バッチサイズから優位になるかを実測する（時間依存・GPU 実機必須・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_GPU_SCALING_ROWS／BENCH_GPU_SCALING_DIMS／BENCH_GPU_SCALING_BATCH／BENCH_GPU_SCALING_TOPK／BENCH_GPU_SCALING_ITERS で規模・バッチ・k・反復回数を上書き可）
+ifdef HAS_CARGO
+	cargo bench --bench gpu_scaling_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-gpu-scaling をスキップ"
+endif
+
 # --------------------------------------------------
 # 自作 HNSW と外部フレームワーク usearch の構築時間・Recall・探索レイテンシ比較（Issue #402 系 ADR の実測補強。crates/engine/benches/hnsw_compare_bench.rs）
 # --------------------------------------------------

@@ -330,3 +330,20 @@ name = "hnsw_compare_bench"
 harness = false
 test = false
 required-features = ["contrast-bench"]
+
+[[bench]]
+# GPU バッチ検索（`engine::gpu_batch`。TASK-128〜130・Issue #178 ポインタ）が
+# CPU-SIMD バッチ経路（`engine::batch_search::BatchEngine`）に対してどの規模・
+# バッチサイズから優位になるかを、`BENCH_GPU_SCALING_ROWS`/
+# `BENCH_GPU_SCALING_DIMS`/`BENCH_GPU_SCALING_BATCH` の直積で掃引して実測する
+# 手動専用ベンチ。`batch_bench.rs`（固定規模の CORE-6/CORE-16 ゲート）とは別に、
+# spec 由来の pass/fail 閾値を持たない情報提供専用の測定ツールとして追加した
+# （`hnsw_parallel_build_bench.rs` と同じ位置づけ。`.github/workflows/*` へは
+# 配線しない）。harness = false / test = false は他ベンチと同一方針。`make
+# bench-gpu-scaling`（Makefile）から実行する。判定ロジックを持たないため
+# 専用の accept.rs は無く、env パース・出力整形・同点許容つき不一致検知のみ
+# `harness/gpu_scaling.rs` に切り出し `tests/gpu_scaling_accept.rs`
+# （`make ci` 対象）で回帰検証する。
+name = "gpu_scaling_bench"
+harness = false
+test = false
