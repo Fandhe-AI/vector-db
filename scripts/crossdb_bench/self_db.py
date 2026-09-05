@@ -49,6 +49,17 @@ def _hash_password(binary: str, password: str) -> str:
     return proc.stdout.strip()
 
 
+def _port_is_listening(host: str, port: int) -> bool:
+    """`host:port` が現在 TCP 接続を受理するかを 1 回だけ確認する（待機しない）。"""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 class SelfServer:
     """wire-server 子プロセスのライフサイクル管理（起動・users.txt 生成・停止）。"""
 
@@ -79,6 +90,13 @@ class SelfServer:
             f.write(f"{USER_A}:{TENANT_VISIBLE}:{phc_a}\n")
             f.write(f"{USER_B}:{TENANT_OTHER}:{phc_b}\n")
 
+        # 起動前にポートが既に LISTEN していれば別プロセス（前回の残骸等）であり、
+        # そのまま進むと wait_for_port が成功して別サーバーを計測してしまうため拒否する。
+        if _port_is_listening(BIND_HOST, BIND_PORT):
+            raise RuntimeError(
+                f"{BIND_HOST}:{BIND_PORT} is already in use; refusing to start wire-server "
+                "(another process may be listening)"
+            )
         self.proc = subprocess.Popen(
             [
                 self.binary,
@@ -94,9 +112,21 @@ class SelfServer:
             text=True,
         )
         atexit.register(self.stop)
-        if not wait_for_port(BIND_HOST, BIND_PORT, timeout_s=30.0):
-            self.stop()
-            raise RuntimeError("wire-server did not start listening within timeout")
+        # 子プロセスの生存を確認しながら LISTEN を待つ（bind 失敗等で子が終了した
+        # 場合は出力を添えて即座に失敗させる。ポート待ちだけでは検出できない）。
+        deadline = time.time() + 30.0
+        while True:
+            if self.proc.poll() is not None:
+                out = self.proc.stdout.read() if self.proc.stdout else ""
+                raise RuntimeError(
+                    f"wire-server exited during startup (code {self.proc.returncode}): {out.strip()}"
+                )
+            if _port_is_listening(BIND_HOST, BIND_PORT):
+                break
+            if time.time() > deadline:
+                self.stop()
+                raise RuntimeError("wire-server did not start listening within timeout")
+            time.sleep(0.2)
         # 起動直後の TCP accept 可能とクエリ受理可能の間には短いラグがあり得るため
         # 軽く待つ（psycopg 側の接続リトライは別途 connect() 呼び出し元が担う）。
         time.sleep(0.3)

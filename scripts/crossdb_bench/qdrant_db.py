@@ -57,6 +57,11 @@ def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
                 vectors=[d["embedding"] for d in chunk],
                 payloads=[
                     {
+                        # where_compound_count の `id > 100` 範囲条件は payload の
+                        # `id` を参照する（Qdrant の point id には Range 条件を
+                        # 適用できないため）。欠落すると条件が 1 件も一致せず
+                        # COUNT が 0 になり他 DB と比較不能になる。
+                        "id": d["id"],
                         "tenant": d["tenant"],
                         # 旧フィクスチャ（visibility 未導入）との互換のため
                         # 欠落時は fail-closed で private 扱いにする。
