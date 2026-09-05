@@ -271,6 +271,7 @@ pub fn format_unavailable_line(
 /// `gpu_scaling_bench.rs` 側で保証する）。`baseline` が空の場合、`candidate` も
 /// 空であれば不一致 0、そうでなければ `candidate` の全件を不一致として数える
 /// （比較対象を持たない候補はすべて疑わしいとみなす fail-closed 側の扱い）。
+/// `candidate` が `baseline` より短い場合は欠落件数も不一致に加算する。
 pub fn count_boundary_tolerant_mismatches(
     baseline: &[(u64, f32)],
     candidate: &[(u64, f32)],
@@ -283,8 +284,13 @@ pub fn count_boundary_tolerant_mismatches(
         .map(|(_, score)| *score)
         .fold(f32::INFINITY, f32::min);
     let baseline_ids: std::collections::HashSet<u64> = baseline.iter().map(|(id, _)| *id).collect();
-    candidate
+    let extra = candidate
         .iter()
         .filter(|(id, score)| !baseline_ids.contains(id) && *score < boundary_score)
-        .count()
+        .count();
+    // 候補が基準より少ない（Top-k が欠けている・空である）場合、その欠落分も
+    // 不一致として数える。余分な候補だけを数えると GPU 経路が結果を取りこぼした
+    // ときに `mismatch=0` と報告してしまう（fail-closed）。
+    let missing = baseline.len().saturating_sub(candidate.len());
+    extra + missing
 }

@@ -156,6 +156,19 @@ fn mismatches_with_empty_baseline_counts_all_candidates_fail_closed() {
     assert_eq!(count_boundary_tolerant_mismatches(&baseline, &[]), 0);
 }
 
+#[test]
+fn mismatches_count_missing_hits_when_candidate_is_shorter_than_baseline() {
+    // GPU 経路が Top-k を取りこぼした（候補が短い・空）場合も欠落分を不一致に
+    // 数える。余分な候補だけを数えると取りこぼしが `mismatch=0` に見えてしまう。
+    let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
+    let candidate = vec![(1u64, 3.0f32), (2, 2.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &[]), 3);
+    // 欠落と境界未満の余分な候補は加算される。
+    let candidate = vec![(1u64, 3.0f32), (9, 0.5)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 2);
+}
+
 // ---------------------------------------------------------------------
 // 出力整形
 // ---------------------------------------------------------------------
