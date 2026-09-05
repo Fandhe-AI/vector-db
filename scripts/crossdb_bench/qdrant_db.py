@@ -108,7 +108,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     _setup_collection(client, dim, args.config)
     phases: dict = {}
     phases["ingest_bulk"] = _ingest_bulk(client, docs)
-    
+
     public_only_filter = models.Filter(
         must=[models.FieldCondition(key="visibility", match=models.MatchValue(value="public"))]
     )

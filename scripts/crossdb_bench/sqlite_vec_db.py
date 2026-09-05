@@ -131,7 +131,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     _setup_schema(conn, dim)
     phases: dict = {}
     phases["ingest_bulk"] = _ingest_bulk(conn, docs)
-    
+
     def knn(qv):
         cur = conn.cursor()
         cur.execute(

@@ -112,7 +112,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     _setup_schema(conn, dim)
     phases: dict = {}
     phases["ingest_bulk"] = _ingest_bulk(conn, docs)
-    
+
     knn_reason = (
         "VECTOR 型は作成できるが KNN 用の DISTANCE() 関数が存在しない"
         "（実機確認: ERROR 1305 (42000): FUNCTION bench.DISTANCE does not exist）"

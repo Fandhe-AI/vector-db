@@ -139,7 +139,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
 
     _setup_schema(conn, dim)
     phases["ingest_bulk"] = _ingest_bulk(conn, docs)
-    
+
     if args.config == "hnsw":
         _build_hnsw_index(conn)
 
