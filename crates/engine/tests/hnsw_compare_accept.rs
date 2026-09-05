@@ -15,11 +15,13 @@
 mod harness;
 
 use harness::hnsw_compare::{
-    average_recall_at_k, parse_dim, parse_queries, parse_rows, parse_thread_ladder, partition_rows,
-    ratio_self_over_usearch, refuse_under_github_actions, render_build_line, render_header_line,
-    render_latency_line, render_ratio_line, render_recall_line, render_self_params_line,
-    render_usearch_params_line, speedup, HnswCompareBenchError, ALLOWED_DIMS, DEFAULT_DIM,
-    DEFAULT_QUERIES, DEFAULT_ROWS, MAX_QUERIES_GUARD, MAX_ROWS_GUARD,
+    average_recall_at_k, l2_normalize_corpus, parse_dim, parse_queries, parse_rows,
+    parse_thread_ladder, partition_rows, ratio_self_over_hnsw_rs, ratio_self_over_usearch,
+    refuse_under_github_actions, render_build_line, render_header_line, render_hnsw_rs_params_line,
+    render_latency_line, render_ratio_line, render_ratio_self_over_hnsw_rs_line,
+    render_recall_line, render_self_params_line, render_usearch_params_line, speedup,
+    HnswCompareBenchError, ALLOWED_DIMS, DEFAULT_DIM, DEFAULT_QUERIES, DEFAULT_ROWS,
+    MAX_QUERIES_GUARD, MAX_ROWS_GUARD,
 };
 use std::time::Duration;
 
@@ -187,6 +189,21 @@ fn ratio_self_over_usearch_rejects_zero_usearch_median() {
     assert_eq!(err, HnswCompareBenchError::InsufficientSamples);
 }
 
+// --- ratio_self_over_hnsw_rs ---
+
+#[test]
+fn ratio_self_over_hnsw_rs_computes_expected_value() {
+    let ratio =
+        ratio_self_over_hnsw_rs(Duration::from_millis(50), Duration::from_millis(25)).unwrap();
+    assert!((ratio - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn ratio_self_over_hnsw_rs_rejects_zero_hnsw_rs_median() {
+    let err = ratio_self_over_hnsw_rs(Duration::from_millis(50), Duration::ZERO).unwrap_err();
+    assert_eq!(err, HnswCompareBenchError::InsufficientSamples);
+}
+
 // --- average_recall_at_k ---
 
 #[test]
@@ -258,6 +275,7 @@ fn render_lines_contain_expected_tokens() {
     assert!(header.contains("rows=1000"));
     assert!(header.contains("dim=64"));
     assert!(header.contains("queries=50"));
+    assert!(header.contains("corpus=l2_normalized"));
 
     let self_params = render_self_params_line(16, 100, 64);
     assert!(self_params.contains("engine=self"));
@@ -266,6 +284,66 @@ fn render_lines_contain_expected_tokens() {
     let usearch_params = render_usearch_params_line(16, 100, 64);
     assert!(usearch_params.contains("engine=usearch"));
     assert!(usearch_params.contains("connectivity=16"));
+
+    let hnsw_rs_ratio = render_ratio_self_over_hnsw_rs_line(4, 1.25);
+    assert!(hnsw_rs_ratio.contains("self_over_hnsw_rs=1.250x"));
+
+    let hnsw_rs_params = render_hnsw_rs_params_line(16, 100, 64, 9);
+    assert!(hnsw_rs_params.contains("engine=hnsw_rs"));
+    assert!(hnsw_rs_params.contains("max_nb_connection=16"));
+    assert!(hnsw_rs_params.contains("max_layer=9"));
+    assert!(hnsw_rs_params.contains("dist=DistDot(simdeez_f)"));
+}
+
+// --- l2_normalize_corpus（feature 非依存の共通正規化ヘルパ） ---
+
+#[test]
+fn l2_normalize_corpus_produces_unit_norm_rows() {
+    // dim=3 の 2 行（ノルムが不揃い）を正規化し、各行のノルムが 1 になることを
+    // 確認する（3 エンジン共通の正規化契約。`hnsw_compare.rs` モジュール
+    // コメント「3 エンジン（self・usearch・hnsw_rs）共通のコーパス正規化
+    // ヘルパ」参照）。
+    let vectors: Vec<f32> = vec![3.0, 4.0, 0.0, 1.0, 2.0, 2.0];
+    let normalized = l2_normalize_corpus(&vectors, 3).expect("non-zero rows normalize");
+    assert_eq!(normalized.len(), vectors.len());
+    for row in normalized.chunks(3) {
+        let norm_sq: f32 = row.iter().map(|v| v * v).sum();
+        assert!(
+            (norm_sq.sqrt() - 1.0).abs() < 1e-5,
+            "normalized row must have unit L2 norm, got {norm_sq}"
+        );
+    }
+}
+
+#[test]
+fn l2_normalize_corpus_rejects_zero_norm_row() {
+    // 2 行目が全成分 0（ノルム 0）のケースは 0 除算・NaN 混入を招くため
+    // fail-closed で拒否する契約（`HnswCompareBenchError::ZeroNormRow`）。
+    let vectors: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0];
+    let err = l2_normalize_corpus(&vectors, 2).unwrap_err();
+    assert_eq!(err, HnswCompareBenchError::ZeroNormRow(1));
+}
+
+#[test]
+fn l2_normalize_corpus_rejects_zero_dimension() {
+    // `dim == 0` を許すと 0 除算・空行の反復という未定義な挙動を招くため
+    // fail-closed で拒否する契約（codex-review 指摘。是正前は `dim.max(1)`
+    // で黙って 1 次元コーパス扱いへ丸められていた）。
+    let vectors: Vec<f32> = vec![1.0, 2.0, 3.0];
+    let err = l2_normalize_corpus(&vectors, 0).unwrap_err();
+    assert_eq!(err, HnswCompareBenchError::ZeroDimension);
+}
+
+#[test]
+fn l2_normalize_corpus_rejects_length_not_multiple_of_dim() {
+    // `vectors.len()` が `dim` の倍数でない場合、末尾行が不完全なまま黙って
+    // 切り捨てられる契約違反を検出し fail-closed で拒否する。
+    let vectors: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+    let err = l2_normalize_corpus(&vectors, 3).unwrap_err();
+    assert_eq!(
+        err,
+        HnswCompareBenchError::CorpusLengthNotMultipleOfDim { len: 5, dim: 3 }
+    );
 }
 
 // --------------------------------------------------
@@ -362,5 +440,120 @@ mod usearch_adapter_tests {
         let index = build_usearch_index_parallel(4, DIM, &vectors, 8)
             .expect("build with more threads than rows should still succeed");
         assert_eq!(index.size(), 4);
+    }
+}
+
+// --------------------------------------------------
+// hnsw_rs 依存部分（`contrast-bench` feature 限定）
+// --------------------------------------------------
+
+#[cfg(feature = "contrast-bench")]
+mod hnsw_rs_adapter_tests {
+    use super::harness::hnsw_compare::hnsw_rs_adapter::{
+        build_hnsw_rs_index, hnsw_rs_search_topk, max_layer_for, EF_CONSTRUCTION, MAX_NB_CONNECTION,
+    };
+    use super::harness::hnsw_compare::l2_normalize_corpus;
+    use super::harness::rng::DeterministicRng;
+    use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
+
+    const ROWS: usize = 300;
+    const DIM: usize = 16;
+    const TOP_K: usize = 5;
+    const EF_SEARCH: usize = 64;
+
+    #[test]
+    fn max_layer_for_matches_official_example_formula() {
+        // `examples/ann-glove25-angular.rs` 87 行目
+        // `16.min((nb_elem as f32).ln().trunc() as usize)` と同一式であることを固定する。
+        assert_eq!(max_layer_for(0), 1);
+        assert_eq!(max_layer_for(1), 1);
+        let expected = 16usize.min((ROWS as f32).ln().trunc() as usize);
+        assert_eq!(max_layer_for(ROWS), expected.max(1));
+    }
+
+    // 共通正規化ヘルパ（`l2_normalize_corpus` のノルム 1・ゼロベクトル拒否）の
+    // 単体テストは feature 非依存の `l2_normalize_corpus_*` テストへ統合済み
+    // （このモジュールは hnsw_rs アダプタの配線確認に専念する）。
+
+    #[test]
+    fn build_hnsw_rs_index_with_multiple_threads_matches_single_thread_recall() {
+        let mut rng = DeterministicRng::new(13);
+        let mut vectors = Vec::with_capacity(ROWS * DIM);
+        for _ in 0..ROWS {
+            vectors.extend(rng.next_vector(DIM));
+        }
+        let query = rng.next_vector(DIM);
+
+        let normalized_vectors =
+            l2_normalize_corpus(&vectors, DIM).expect("uniform random rows normalize");
+        let normalized_query =
+            l2_normalize_corpus(&query, DIM).expect("uniform random query normalizes");
+
+        let single = build_hnsw_rs_index(ROWS, DIM, &normalized_vectors, 1);
+        let parallel = build_hnsw_rs_index(ROWS, DIM, &normalized_vectors, 4);
+
+        let ids: Vec<u64> = (0..ROWS as u64).collect();
+        let reference = CpuScalarProvider
+            .search(SearchInput {
+                ids: &ids,
+                vectors: &normalized_vectors,
+                dim: DIM as u32,
+                query: &normalized_query,
+                k: TOP_K,
+            })
+            .expect("normalized brute-force reference search succeeds");
+        let expected: Vec<u64> = reference.into_iter().map(|hit| hit.id).collect();
+
+        let single_topk = hnsw_rs_search_topk(&single, &normalized_query, TOP_K, EF_SEARCH)
+            .expect("single-threaded hnsw_rs search succeeds");
+        let parallel_topk = hnsw_rs_search_topk(&parallel, &normalized_query, TOP_K, EF_SEARCH)
+            .expect("parallel hnsw_rs search succeeds");
+
+        // hnsw_rs は近似探索のため厳密一致は要求しないが、この小規模フィクスチャ
+        // （300 点・16 次元）では上位 5 件が正規化済み brute-force 対照の
+        // Recall@5 >= 0.8（TOP_K - 1 件以上一致）となることを配線確認として使う
+        // （`usearch_adapter_tests` と同一方針）。並列構築でも単発構築と
+        // 同水準の Recall であることをあわせて確認する。
+        let single_hits = single_topk
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+        let parallel_hits = parallel_topk
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+        assert!(
+            single_hits >= TOP_K - 1,
+            "single-threaded hnsw_rs top-{TOP_K} should closely match normalized brute-force reference"
+        );
+        assert!(
+            parallel_hits >= TOP_K - 1,
+            "parallel hnsw_rs top-{TOP_K} should closely match normalized brute-force reference"
+        );
+    }
+
+    #[test]
+    fn build_hnsw_rs_index_rejects_thread_count_wider_than_rows_gracefully() {
+        let mut rng = DeterministicRng::new(5);
+        let mut vectors = Vec::with_capacity(4 * DIM);
+        for _ in 0..4 {
+            vectors.extend(rng.next_vector(DIM));
+        }
+        let normalized_vectors =
+            l2_normalize_corpus(&vectors, DIM).expect("uniform random rows normalize");
+        // rows(4) < threads(8) でも一部ワーカーの担当範囲が空になるだけで
+        // 失敗しないことを確認する（`partition_rows` が空範囲を許すため）。
+        let index = build_hnsw_rs_index(4, DIM, &normalized_vectors, 8);
+        let query = l2_normalize_corpus(&rng.next_vector(DIM), DIM)
+            .expect("uniform random query normalizes");
+        let hits = hnsw_rs_search_topk(&index, &query, 2, EF_SEARCH)
+            .expect("search on small index should still succeed");
+        assert!(!hits.is_empty());
+    }
+
+    #[test]
+    fn hnsw_rs_constants_match_engine_defaults() {
+        assert_eq!(MAX_NB_CONNECTION, 16);
+        assert_eq!(EF_CONSTRUCTION, 100);
     }
 }

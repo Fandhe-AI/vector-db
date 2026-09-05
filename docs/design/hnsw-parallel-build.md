@@ -148,6 +148,9 @@ no-op（逐次経路との性能差は生じない）。
 | `crates/engine/tests/hnsw_parallel_profile_accept.rs`（新規・Issue #406 追記） | 段別プロファイル観測用フックの受け入れテスト |
 | `crates/engine/tests/hnsw_compare_accept.rs`（新規・Issue #406 追記） | usearch 比較ハーネスの受け入れテスト |
 | `Makefile`（Issue #406 追記） | `make bench-hnsw-compare` ターゲット（`ci` 非包含・CI ワークフロー非配線） |
+| `crates/engine/Cargo.toml`（Issue #406 追記・2026-09-05） | `hnsw_rs` `=0.3.4`（`contrast-bench` feature 限定・optional・オーナー承認済み）を追加 |
+| `deny.toml`（Issue #406 追記・2026-09-05） | `RUSTSEC-2025-0141`（`bincode` 1.3.3・unmaintained。`hnsw_rs` の dump/reload 経路のみが依存し本ベンチでは未使用）の ignore を追加 |
+| `crates/engine/benches/hnsw_compare_bench.rs`・`crates/engine/benches/harness/hnsw_compare.rs`（Issue #406 追記・2026-09-05） | 対照エンジンを usearch から usearch・`hnsw_rs` の 2 エンジンへ拡張し、3 エンジン共通でコーパスを L2 正規化する方式へ変更 |
 
 ## 検証
 
@@ -438,11 +441,87 @@ Recall@10（100,000 点・dim=64・クエリ 200 件。コーパスは
   別物である点に注意する。
 - 探索レイテンシ中央値は自作 66〜67 µs・usearch 76〜77 µs で自作が
   やや速いが、いずれも同水準の範囲にある。
-- 追加の比較候補として `hnsw_rs`（`=0.3.4`。MIT OR Apache-2.0・純 Rust・
-  `rayon` に依存）を第一候補として挙げる。`instant-distance` はアーカイブ
-  済み、`faiss` はネイティブ C++ ビルドが必須なため候補から外した。
-  依存追加はユーザー承認が必要なため、追加比較の実施はオーナー判断
-  待ちとする。
+
+上記 run7・run8 は usearch のみを対照とし、コーパスは正規化していない
+（内積カーネルをそのまま用いる本リポの既定と揃えた条件）。以下の
+run9・run10 はこの条件から変更し、hnsw_rs を追加した 3 エンジン比較の
+実測である点に注意する（旧実測との直接比較はできない）。
+
+#### hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較（Issue #406 追記・2026-09-05）
+
+対照エンジンとして `hnsw_rs`（`=0.3.4`。MIT OR Apache-2.0・純 Rust・
+`contrast-bench` feature 限定・optional 依存・オーナー承認済み
+〔2026-09-05〕）を追加した。`instant-distance` はアーカイブ済み、
+`faiss` はネイティブ C++ ビルドが必須なため引き続き候補から外している。
+`hnsw_rs` は `simdeez_f` feature を有効化し、距離関数に `DistDot`
+（`1 - dot`。単位ベクトル前提）を用いるため、自作・usearch・hnsw_rs の
+3 エンジン共通で**コーパスを L2 正規化**する方式へ統一した（run7・run8
+時点の非正規化コーパスとは条件が異なる）。並列構築はいずれも
+`std::thread::scope` による静的分割ワーカーから `insert`／`add` を並行
+呼び出しする方式で揃え、`hnsw_rs` は `Hnsw` が `Sync` のため `&self`
+参照での挿入を用いる。パラメータ対応は自作 `m=16`／`ef_construction=100`
+／`ef_search=64` ↔ usearch `connectivity=16`／`expansion_add=100`
+／`expansion_search=64`（内積・F32・`multi=false`）↔ hnsw_rs
+`max_nb_connection=16`／`ef_construction=100`／`ef_search=64`
+／`max_layer=11`／`dist=DistDot`（`simdeez_f`）。
+
+deny.toml へ `RUSTSEC-2025-0141`（`bincode` 1.3.3・unmaintained。
+`hnsw_rs` の dump/reload 経路のみが依存し本ベンチでは未使用）の ignore
+を追加した。
+
+100,000 点・dim=64 での構築時間中央値（QEMU ゲスト・12 vCPU・
+AVX2+FMA。上記「Issue #406 追記」節と同一環境）を 2 回実測した
+（run9・run10。2026-09-05）:
+
+##### run9
+
+| threads | self median (speedup) | usearch median (speedup) | hnsw_rs median (speedup) |
+| --- | --- | --- | --- |
+| 1 | 9,947.1 ms (1.000x) | 10,664.6 ms (1.000x) | 42,616.6 ms (1.000x) |
+| 2 | 5,233.3 ms (1.901x) | 5,410.8 ms (1.971x) | 21,512.2 ms (1.981x) |
+| 4 | 3,022.6 ms (3.291x) | 2,791.8 ms (3.820x) | 11,703.1 ms (3.641x) |
+| 8 | 2,347.3 ms (4.238x) | 2,448.0 ms (4.356x) | 9,703.1 ms (4.392x) |
+| 12 | 1,922.5 ms (5.174x) | 1,607.6 ms (6.634x) | 6,662.9 ms (6.396x) |
+
+self/usearch 比: 0.933x／0.967x／1.083x／0.959x／1.196x（threads
+1/2/4/8/12）。self/hnsw_rs 比: 0.233x／0.243x／0.258x／0.242x／0.289x。
+
+Recall@10: self（threads=1）0.4905・self（12）0.4955・usearch（12）
+0.4935・hnsw_rs（12）0.5460。探索レイテンシ中央値: self 73.1 µs・
+usearch 76.0 µs・hnsw_rs 347.8 µs。
+
+##### run10
+
+| threads | self median (speedup) | usearch median (speedup) | hnsw_rs median (speedup) |
+| --- | --- | --- | --- |
+| 1 | 9,958.3 ms (1.000x) | 10,642.3 ms (1.000x) | 42,387.5 ms (1.000x) |
+| 2 | 5,219.7 ms (1.908x) | 5,403.3 ms (1.970x) | 21,559.2 ms (1.966x) |
+| 4 | 2,997.2 ms (3.323x) | 2,758.4 ms (3.858x) | 11,518.0 ms (3.680x) |
+| 8 | 1,930.9 ms (5.157x) | 2,173.9 ms (4.895x) | 9,199.2 ms (4.608x) |
+| 12 | 1,901.7 ms (5.237x) | 1,575.1 ms (6.757x) | 6,532.5 ms (6.489x) |
+
+self/usearch 比: 0.936x／0.966x／1.087x／0.888x／1.207x。self/hnsw_rs
+比: 0.235x／0.242x／0.260x／0.210x／0.291x。
+
+Recall@10: self（1）0.4905・self（12）0.5090・usearch（12）0.4985・
+hnsw_rs（12）0.5480。探索レイテンシ中央値: self 65.5 µs・usearch
+76.5 µs・hnsw_rs 357.6 µs。
+
+run10 は開始時 loadavg 8.96（run9 直後の連続実行）とやや高く、
+threads=8 の self が run9 より速い等の run-to-run 差がある点に注意する。
+
+所見:
+
+- 構築時間は自作と usearch が同水準（self/usearch 比 0.89〜1.21x）で
+  あるのに対し、hnsw_rs は 3.4〜4.8 倍遅い。
+- スレッドスケーリングは 12 スレッドで usearch 6.6〜6.8x・hnsw_rs
+  6.4〜6.5x に対し自作は 5.2x に留まり、8→12 の頭打ち（上記「Issue #406
+  追記」節で実測した `repair_reachability` 起因）は自作に固有の傾向
+  である。
+- Recall@10 は hnsw_rs が自作・usearch より約 +0.05 高いが、探索
+  レイテンシは自作・usearch の約 5 倍（348〜358 µs 対 66〜77 µs）。
+- パラメータの厳密な等価性・差の深掘りは本追記のスコープ外とし、
+  Issue #446（ルート）〜#450 のツリーへ申し送る。
 
 ### 単一スレッド経路の非退行
 
@@ -467,8 +546,9 @@ Recall@10（100,000 点・dim=64・クエリ 200 件。コーパスは
 - ホスト側の物理コア共有（SMT・vCPU ピニング等）の有無はゲスト内から
   直接検証できない（Issue #406 追記の所見 5。対照負荷の speedup 天井
   からの間接推定に留まる）
-- 外部フレームワーク比較の追加候補（`hnsw_rs =0.3.4` 等）は依存追加の
-  ためユーザー承認待ち（Issue #406 追記「外部フレームワークとの構築
-  比較」節）
+- `hnsw_rs =0.3.4` を加えた 3 エンジン比較を実施済み（Issue #406 追記
+  「hnsw_rs（`=0.3.4`）を加えた 3 エンジン比較」節）。パラメータの
+  厳密な等価性検証・差分の深掘りは Issue #446（ルート）〜#450 の
+  ツリーへ申し送り
 - `build_parallel` を `HnswIndex::build` の既定にする判断・
   `SearchEngineKind::Hnsw` 結線（#407・実装済み）・世代整合キャッシュ（#408）

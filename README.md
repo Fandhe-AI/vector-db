@@ -372,7 +372,7 @@ BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
 
-HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
+HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch・`hnsw_rs`〔`=0.3.4`・`contrast-bench` feature 限定〕との構築時間・Recall@10・探索レイテンシ比較。3 エンジン共通でコーパスを L2 正規化）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
 ### `precision` 評価ハーネス（TASK-163）
 

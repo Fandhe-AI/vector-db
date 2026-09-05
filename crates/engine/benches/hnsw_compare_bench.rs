@@ -1,8 +1,26 @@
 //! 自作 HNSW（`engine::hnsw::HnswIndex`）と外部フレームワーク usearch（承認済み
-//! optional 依存 `usearch =2.26.1`・`contrast-bench` feature 限定）の構築時間
-//! （スレッド数ラダー）・Recall@10・探索レイテンシを同一条件で比較する手動専用
-//! ベンチ（Issue #402 系 ADR `docs/design/ann-index-adoption.md` の実測補強。
-//! `docs/spec/05-tasks.md` TASK-132 のポインタ）。
+//! optional 依存 `usearch =2.26.1`）・hnsw_rs（承認済み optional 依存
+//! `hnsw_rs =0.3.4`。2026-09-05 承認。いずれも `contrast-bench` feature 限定）の
+//! 構築時間（スレッド数ラダー）・Recall@10・探索レイテンシを同一条件で比較する
+//! 手動専用ベンチ（Issue #402 系 ADR `docs/design/ann-index-adoption.md` の
+//! 実測補強。`docs/spec/05-tasks.md` TASK-132 のポインタ）。
+//!
+//! # コーパス正規化は 3 エンジン共通
+//!
+//! hnsw_rs 側は `anndists::dist::distances::DistDot`（`simdeez_f` feature 経由
+//! では `dist::disteez::distance_dot_f32_simdeez`）が単位ベクトルを前提に
+//! `assert!(dot <= 1.000002)` する（`harness::hnsw_compare::hnsw_rs_adapter` の
+//! モジュールコメント参照）ため単位ノルムが必須だが、本ベンチはベンチ冒頭で
+//! [`harness::hnsw_compare::l2_normalize_corpus`] を 1 回だけ呼び出し、
+//! self（`kernel::dot`）・usearch（`MetricKind::IP`）・hnsw_rs（`DistDot`）
+//! の 3 エンジンすべてへ同じ正規化済みコーパス・クエリを渡す。正規化後は
+//! 内積の最大化とコサイン類似度の最大化が一致するため、3 エンジンの
+//! Recall@10・構築時間はすべて同一入力に基づく数値として単純比較できる
+//! （出力ヘッダの `corpus=l2_normalized` 参照。PR #445 時点〔hnsw_rs だけ
+//! 正規化・self/usearch は無正規化という非対称条件〕の実測値とは比較条件が
+//! 異なるため、当時の数値と本ベンチの数値を直接比較しない）。ゼロベクトル
+//! （正規化不能な行）が生成された場合は fail-closed でベンチを中断する
+//! （`std::process::exit(1)`）。
 //!
 //! # CI に配線しない・`GITHUB_ACTIONS` 下は拒否
 //!
@@ -42,13 +60,16 @@
 //!   `harness::hnsw_compare::usearch_adapter::usearch_index_options` の
 //!   ドキュメンテーションコメント参照。
 //! - Recall@10: ラダー最大スレッド数で構築した各索引について、全クエリで
-//!   Top-10 を取り brute-force（`engine::kernel::CpuScalarProvider`。内積
-//!   最大）対照で Recall@10 平均を出す（`harness::accept::recall_at_k` は
-//!   id の集合演算のみで判定するため、同点近傍の内部順序入れ替わりは
-//!   Recall を過小評価しない。連続一様分布の合成ベクトルでは Top-k 境界での
-//!   完全な同点はほぼ発生しないため、本ベンチでは同点の特別扱いをしない）。
-//!   engine 側は threads=1（逐次 `build` と同一グラフ）でも Recall@10 を
-//!   出し、並列構築で Recall が落ちていないことをあわせて記録する。
+//!   Top-10 を取り、同じ正規化済みコーパス・クエリに対する単一の
+//!   brute-force（`engine::kernel::CpuScalarProvider`。内積最大）対照で
+//!   Recall@10 平均を出す（`harness::accept::recall_at_k` は id の集合演算
+//!   のみで判定するため、同点近傍の内部順序入れ替わりは Recall を過小評価
+//!   しない。連続一様分布の合成ベクトルでは Top-k 境界での完全な同点は
+//!   ほぼ発生しないため、本ベンチでは同点の特別扱いをしない）。3 エンジン
+//!   とも同じ brute-force 対照・同じ正規化済み入力を使うため Recall@10 の
+//!   数値をそのまま比較できる。engine 側は threads=1（逐次 `build` と同一
+//!   グラフ）でも Recall@10 を出し、並列構築で Recall が落ちていないことを
+//!   あわせて記録する。
 //! - 探索レイテンシ（参考値・合否閾値なし）: 同じクエリ集合を巡回して 1
 //!   クエリあたりの中央値 µs を両者で出す（engine 側は
 //!   `HnswSearchScratch` を再利用、usearch 側は `search(query, 10)`）。
@@ -63,14 +84,19 @@ mod harness;
 
 use harness::env_report::EnvReport;
 use harness::hnsw_build::generate_corpus;
+use harness::hnsw_compare::hnsw_rs_adapter::{
+    build_hnsw_rs_index, hnsw_rs_search_topk, max_layer_for,
+    EF_CONSTRUCTION as HNSW_RS_EF_CONSTRUCTION, MAX_NB_CONNECTION as HNSW_RS_MAX_NB_CONNECTION,
+};
 use harness::hnsw_compare::usearch_adapter::{
     build_usearch_index_parallel, usearch_index_options, usearch_search_topk,
 };
 use harness::hnsw_compare::{
-    average_recall_at_k, ratio_self_over_usearch, refuse_under_github_actions, render_build_line,
-    render_header_line, render_latency_line, render_ratio_line, render_recall_line,
-    render_self_params_line, render_usearch_params_line, resolve_dim, resolve_queries,
-    resolve_rows, resolve_thread_ladder, speedup, EF_SEARCH, TOP_K,
+    average_recall_at_k, l2_normalize_corpus, ratio_self_over_hnsw_rs, ratio_self_over_usearch,
+    refuse_under_github_actions, render_build_line, render_header_line, render_hnsw_rs_params_line,
+    render_latency_line, render_ratio_line, render_ratio_self_over_hnsw_rs_line,
+    render_recall_line, render_self_params_line, render_usearch_params_line, resolve_dim,
+    resolve_queries, resolve_rows, resolve_thread_ladder, speedup, EF_SEARCH, TOP_K,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 
@@ -126,6 +152,27 @@ fn measure_usearch_build(
     Ok(measurement.summary.median)
 }
 
+/// hnsw_rs 側 1 スレッド数点の構築時間中央値を計測する。`normalized_corpus`
+/// は呼び出し元が [`l2_normalize_corpus`] 済みのものを渡す契約（`hnsw_rs_adapter`
+/// モジュールコメント「DistDot の単位ベクトル前提」参照）。
+///
+/// [`measure_self_build`] と同じ理由で [`run_bounded_retain`] を使い、
+/// hnsw_rs 側索引の解放コストも計測区間の外側へ追い出す。
+fn measure_hnsw_rs_build(
+    rows: usize,
+    dim: usize,
+    normalized_corpus: &[f32],
+    threads: usize,
+) -> Result<std::time::Duration, String> {
+    let config = MeasurementConfig::new(20, 20, 0xFEED_0000 ^ threads as u64)
+        .map_err(|e| format!("threads={threads}: {e}"))?;
+    let (measurement, _retained) = run_bounded_retain(&config, 1, || {
+        build_hnsw_rs_index(rows, dim, normalized_corpus, threads)
+    })
+    .map_err(|e| format!("threads={threads}: {e}"))?;
+    Ok(measurement.summary.median)
+}
+
 /// 探索レイテンシ計測の回数: クエリ数の整数倍で protocol 下限（20）以上の
 /// 最小値。`queries` 本を `qi % len` で巡回するため、この回数なら本計測中に
 /// 全クエリが同じ回数ずつ評価される。
@@ -166,8 +213,18 @@ fn main() {
             usearch_options.expansion_search,
         )
     );
+    let hnsw_rs_max_layer = max_layer_for(rows);
+    println!(
+        "{}",
+        render_hnsw_rs_params_line(
+            HNSW_RS_MAX_NB_CONNECTION,
+            HNSW_RS_EF_CONSTRUCTION,
+            EF_SEARCH,
+            hnsw_rs_max_layer,
+        )
+    );
 
-    let corpus = match generate_corpus(0xC0BA_1234 ^ rows as u64, dim, rows) {
+    let raw_corpus = match generate_corpus(0xC0BA_1234 ^ rows as u64, dim, rows) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("hnsw_compare_bench: corpus generation failed: {e}");
@@ -176,10 +233,30 @@ fn main() {
     };
     // クエリはコーパスとは別シードで、同じ生成器（`generate_corpus`）から
     // 「行数 = クエリ数」として生成する（モジュールコメント参照）。
-    let query_flat = match generate_corpus(0xC0BA_9999 ^ queries_count as u64, dim, queries_count) {
+    let raw_query_flat =
+        match generate_corpus(0xC0BA_9999 ^ queries_count as u64, dim, queries_count) {
+            Ok(q) => q,
+            Err(e) => {
+                eprintln!("hnsw_compare_bench: query generation failed: {e}");
+                std::process::exit(1);
+            }
+        };
+
+    // 3 エンジン（self・usearch・hnsw_rs）すべてを同一条件で比較するため、
+    // コーパス・クエリをベンチ冒頭で 1 回だけ L2 正規化し、以降は全エンジンへ
+    // 同じ正規化済みバッファを渡す（モジュールコメント「コーパス正規化は
+    // 3 エンジン共通」参照。ゼロベクトル検出時は fail-closed で中断する）。
+    let corpus = match l2_normalize_corpus(&raw_corpus, dim) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hnsw_compare_bench: corpus normalization failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let query_flat = match l2_normalize_corpus(&raw_query_flat, dim) {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("hnsw_compare_bench: query generation failed: {e}");
+            eprintln!("hnsw_compare_bench: query normalization failed: {e}");
             std::process::exit(1);
         }
     };
@@ -188,6 +265,7 @@ fn main() {
     let mut had_error = false;
     let mut self_baseline: Option<std::time::Duration> = None;
     let mut usearch_baseline: Option<std::time::Duration> = None;
+    let mut hnsw_rs_baseline: Option<std::time::Duration> = None;
     let mut max_threads = 1usize;
 
     for &threads in &ladder {
@@ -231,6 +309,43 @@ fn main() {
                                 had_error = true;
                             }
                         }
+
+                        match measure_hnsw_rs_build(rows, dim, &corpus, threads) {
+                            Ok(hnsw_rs_median) => {
+                                if threads == 1 {
+                                    hnsw_rs_baseline = Some(hnsw_rs_median);
+                                }
+                                match speedup(hnsw_rs_baseline, hnsw_rs_median) {
+                                    Ok(sp) => println!(
+                                        "{}",
+                                        render_build_line("hnsw_rs", threads, hnsw_rs_median, sp)
+                                    ),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "hnsw_compare_bench: hnsw_rs speedup threads={threads}: {e}"
+                                        );
+                                        had_error = true;
+                                    }
+                                }
+
+                                match ratio_self_over_hnsw_rs(median, hnsw_rs_median) {
+                                    Ok(ratio) => println!(
+                                        "{}",
+                                        render_ratio_self_over_hnsw_rs_line(threads, ratio)
+                                    ),
+                                    Err(e) => {
+                                        eprintln!(
+                                            "hnsw_compare_bench: hnsw_rs ratio threads={threads}: {e}"
+                                        );
+                                        had_error = true;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("hnsw_compare_bench: {e}");
+                                had_error = true;
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("hnsw_compare_bench: {e}");
@@ -249,10 +364,14 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Recall@10: ラダー最大スレッド数の索引（engine・usearch とも）を
-    // brute-force（`CpuScalarProvider`）対照で評価する。engine は threads=1
-    // （逐次 `build` と同一グラフ）でも評価し、並列構築で Recall が落ちて
-    // いないことをあわせて記録する（モジュールコメント参照）。
+    // Recall@10: ラダー最大スレッド数の索引（engine・usearch・hnsw_rs とも）を
+    // 単一の brute-force（`CpuScalarProvider`）対照で評価する。3 エンジンとも
+    // 同じ正規化済みコーパス・クエリを使うため brute-force 対照も 1 つで済む
+    // （モジュールコメント「コーパス正規化は 3 エンジン共通」参照。是正前
+    // 〔PR #445〕は hnsw_rs 用に別の正規化済み brute-force 対照を取り直して
+    // いたが、コーパスが全エンジン共通になったため不要になった）。engine は
+    // threads=1（逐次 `build` と同一グラフ）でも評価し、並列構築で Recall が
+    // 落ちていないことをあわせて記録する。
     let ids: Vec<u64> = (0..rows as u64).collect();
     let brute = CpuScalarProvider;
     let mut brute_topk: Vec<Vec<u64>> = Vec::with_capacity(queries.len());
@@ -297,6 +416,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let hnsw_rs_index_max = build_hnsw_rs_index(rows, dim, &corpus, max_threads.max(1));
 
     let mut recall_had_error = false;
     let mut self_seq_pairs = Vec::with_capacity(queries.len());
@@ -366,6 +486,26 @@ fn main() {
         }
     }
 
+    // hnsw_rs の Recall@10 も self・usearch と同じ正規化済みコーパス・クエリ・
+    // `brute_topk` 基準（モジュールコメント参照。3 エンジンとも同一入力）。
+    let mut hnsw_rs_pairs = Vec::with_capacity(queries.len());
+    for (i, query) in queries.iter().enumerate() {
+        match hnsw_rs_search_topk(&hnsw_rs_index_max, query, TOP_K, EF_SEARCH) {
+            Ok(hit_ids) => hnsw_rs_pairs.push((brute_topk[i].clone(), hit_ids)),
+            Err(e) => {
+                eprintln!("hnsw_compare_bench: hnsw_rs search failed: {e}");
+                recall_had_error = true;
+            }
+        }
+    }
+    match average_recall_at_k(&hnsw_rs_pairs) {
+        Ok(recall) => println!("{}", render_recall_line("hnsw_rs", max_threads, recall)),
+        Err(e) => {
+            eprintln!("hnsw_compare_bench: hnsw_rs recall: {e}");
+            recall_had_error = true;
+        }
+    }
+
     if recall_had_error {
         std::process::exit(1);
     }
@@ -415,6 +555,23 @@ fn main() {
         Ok(m) => println!("{}", render_latency_line("usearch", m.summary.median)),
         Err(e) => {
             eprintln!("hnsw_compare_bench: usearch search latency: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    // hnsw_rs も self・usearch と同じ正規化済みクエリ・`latency_config` を使う。
+    let mut hnsw_rs_qi = 0usize;
+    let hnsw_rs_latency = run(&latency_config, || {
+        let query = queries[hnsw_rs_qi % queries.len()];
+        hnsw_rs_qi += 1;
+        hnsw_rs_search_topk(&hnsw_rs_index_max, query, TOP_K, EF_SEARCH)
+            .expect("hnsw_rs search must succeed for well-formed synthetic input")
+            .len()
+    });
+    match hnsw_rs_latency {
+        Ok(m) => println!("{}", render_latency_line("hnsw_rs", m.summary.median)),
+        Err(e) => {
+            eprintln!("hnsw_compare_bench: hnsw_rs search latency: {e}");
             std::process::exit(1);
         }
     }
