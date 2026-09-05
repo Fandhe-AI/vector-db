@@ -63,14 +63,44 @@ up_mysql() {
     -p 127.0.0.1:33306:3306 \
     mysql:9 >/dev/null
   echo "bench-mysql: waiting for readiness..."
-  for _ in $(seq 1 60); do
-    if docker exec bench-mysql mysqladmin ping -uroot -pbench --silent >/dev/null 2>&1; then
-      echo "bench-mysql: ready"
-      return 0
+
+  # 二段判定（実機確認済みの事象への対処）: MySQL の公式イメージは初期化時、
+  # 「初期化スクリプト実行用の一時サーバーを起動 → 実行 → 一時サーバーを停止
+  # → 本番サーバーを起動」という手順を踏み、`docker logs` に
+  # "ready for connections" が計 2 回出力される（1 回目が一時サーバー、
+  # 2 回目が port 3306 で listen する本番サーバー）。1 回目だけを見て
+  # ready と判定すると、直後の接続が一時サーバー停止のタイミングと競合し
+  # `2013 Lost connection ... reading initial communication packet` で
+  # 失敗する（25k 本計測 `mysql exact` で実機確認）。そのため 1 段目で
+  # ログに 2 回出るまで待ち、2 段目で `mysqladmin ping` が 3 秒間隔で
+  # 2 回連続成功するまで待つ（起動直後の瞬間的な接続断の再発防止）。
+  ready_count=0
+  for _ in $(seq 1 90); do
+    ready_count=$(docker logs bench-mysql 2>&1 | grep -c "ready for connections" || true)
+    if [ "${ready_count:-0}" -ge 2 ]; then
+      break
     fi
     sleep 1
   done
-  echo "bench-mysql: timed out waiting for readiness" >&2
+  if [ "${ready_count:-0}" -lt 2 ]; then
+    echo "bench-mysql: timed out waiting for 'ready for connections' x2 in logs" >&2
+    exit 1
+  fi
+
+  ok_count=0
+  for _ in $(seq 1 60); do
+    if docker exec bench-mysql mysqladmin ping -uroot -pbench --silent >/dev/null 2>&1; then
+      ok_count=$((ok_count + 1))
+      if [ "$ok_count" -ge 2 ]; then
+        echo "bench-mysql: ready"
+        return 0
+      fi
+    else
+      ok_count=0
+    fi
+    sleep 3
+  done
+  echo "bench-mysql: timed out waiting for 2 consecutive successful mysqladmin ping" >&2
   exit 1
 }
 
