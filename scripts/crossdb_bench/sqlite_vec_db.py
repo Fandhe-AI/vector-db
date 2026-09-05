@@ -119,10 +119,17 @@ def _ingest_single_stmt(conn: sqlite3.Connection, dim: int, n_rows: int = 1000) 
             (rid, _pack(emb), "private", TENANT_VISIBLE, lang, topic),
         )
         cur.execute("INSERT INTO docs_fts (rowid, body) VALUES (?, ?)", (rid, body))
-    conn.commit()
+        # pgvector（autocommit）・self（文ごとに永続化）と粒度を揃え、1 行（vec0 + FTS の
+        # 2 文）ごとに commit する。
+        conn.commit()
     t1 = time.perf_counter()
     elapsed = t1 - t0
-    return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
+    return {
+        "rows": n_rows,
+        "seconds": elapsed,
+        "rows_per_sec": n_rows / elapsed if elapsed > 0 else None,
+        "commit_granularity": "per_row",
+    }
 
 
 def _fts5_quote(text: str) -> str:

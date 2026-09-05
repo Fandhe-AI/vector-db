@@ -120,7 +120,12 @@ def _ingest_single_stmt(conn: psycopg.Connection, dim: int, n_rows: int = 1000) 
             )
     t1 = time.perf_counter()
     elapsed = t1 - t0
-    return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
+    return {
+        "rows": n_rows,
+        "seconds": elapsed,
+        "rows_per_sec": n_rows / elapsed if elapsed > 0 else None,
+        "commit_granularity": "per_statement (autocommit)",
+    }
 
 
 def _build_hnsw_index(conn: psycopg.Connection) -> None:

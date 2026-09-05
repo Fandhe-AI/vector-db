@@ -407,6 +407,7 @@ def run(args, queries: list[dict]) -> dict:
                 "rows": rows_ok,
                 "seconds": elapsed,
                 "rows_per_sec": rows_ok / elapsed if elapsed > 0 else None,
+                "commit_granularity": "per_statement",
             }
 
         # COUNT(*) は wire 経由ではテキスト表現で返る（psycopg が INT8 として

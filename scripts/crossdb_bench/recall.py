@@ -66,11 +66,15 @@ def build_ground_truth(
     docs = load_jsonl(docs_path)
     mask = _visible_mask(docs)
     visible = [d for d, m in zip(docs, mask) if m]
+    strict_top_k: list[list[int]] = []
+    tie_sets: list[set[int]] = []
+    if not visible:
+        # 可視行が無い場合は行列積へ進まない（`np.array([])` は形状 (0,) になり
+        # `mat @ qv` が次元不一致で失敗する）。各クエリの正解集合は空。
+        return [[] for _ in queries], [set() for _ in queries]
     ids = np.array([d["id"] for d in visible], dtype=np.int64)
     mat = np.array([d["embedding"] for d in visible], dtype=np.float32)  # (N, dim)
 
-    strict_top_k: list[list[int]] = []
-    tie_sets: list[set[int]] = []
     for q in queries:
         qv = np.array(q["embedding"], dtype=np.float32)
         scores = mat @ qv  # 内積

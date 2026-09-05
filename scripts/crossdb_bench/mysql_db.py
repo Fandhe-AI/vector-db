@@ -100,10 +100,16 @@ def _ingest_single_stmt(conn, dim: int, n_rows: int = 1000) -> dict:
             "VALUES (%s, %s, %s, %s, %s, %s, STRING_TO_VECTOR(%s))",
             (rid, TENANT_VISIBLE, "private", lang, topic, body, emb),
         )
-    conn.commit()
+        # pgvector（autocommit）・self（文ごとに永続化）と粒度を揃え、1 文ごとに commit する。
+        conn.commit()
     t1 = time.perf_counter()
     elapsed = t1 - t0
-    return {"rows": n_rows, "seconds": elapsed, "rows_per_sec": n_rows / elapsed if elapsed > 0 else None}
+    return {
+        "rows": n_rows,
+        "seconds": elapsed,
+        "rows_per_sec": n_rows / elapsed if elapsed > 0 else None,
+        "commit_granularity": "per_statement",
+    }
 
 
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
