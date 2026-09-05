@@ -34,15 +34,44 @@ def _setup_collection(client: QdrantClient, dim: int, config: str) -> None:
     if client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
     hnsw_config = None
+    optimizers_config = None
     if config == "hnsw":
         hnsw_config = models.HnswConfigDiff(m=16, ef_construct=100)
+        # 既定の indexing_threshold（10,000 KB）はセグメント単位に適用され、25,000 行・
+        # dim 128 では各セグメントが閾値未満のまま HNSW が一度も構築されない
+        # （実機確認: status=green のまま indexed_vectors_count=0）。hnsw 構成では閾値を
+        # 下げて全セグメントを索引化させ、_wait_indexed で完了を確認してから計測する。
+        optimizers_config = models.OptimizersConfigDiff(indexing_threshold=1)
     client.create_collection(
         collection_name=COLLECTION,
         vectors_config=models.VectorParams(size=dim, distance=models.Distance.DOT),
         hnsw_config=hnsw_config,
+        optimizers_config=optimizers_config,
     )
     client.create_payload_index(COLLECTION, "visibility", field_schema=models.PayloadSchemaType.KEYWORD)
     client.create_payload_index(COLLECTION, "lang", field_schema=models.PayloadSchemaType.KEYWORD)
+
+
+def _wait_indexed(client: QdrantClient, rows: int, timeout_s: float = 300.0) -> dict:
+    """HNSW 構成では collection status が green かつ indexed_vectors_count >= rows に
+    なるまで待つ。未索引セグメントの全走査や構築中の負荷を hnsw の性能として記録しない
+    ため、タイムアウト時は計測を拒否する（fail-closed）。"""
+    t0 = time.perf_counter()
+    while True:
+        info = client.get_collection(COLLECTION)
+        indexed = info.indexed_vectors_count or 0
+        if str(info.status) == "green" and indexed >= rows:
+            return {
+                "seconds": time.perf_counter() - t0,
+                "final_status": str(info.status),
+                "indexed_vectors_count": indexed,
+            }
+        if time.perf_counter() - t0 > timeout_s:
+            raise TimeoutError(
+                f"qdrant index build did not complete within {timeout_s:.0f}s "
+                f"(status={info.status}, indexed={indexed}/{rows})"
+            )
+        time.sleep(0.5)
 
 
 def _ingest_bulk(client: QdrantClient, docs: list[dict]) -> dict:
@@ -113,6 +142,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
     _setup_collection(client, dim, args.config)
     phases: dict = {}
     phases["ingest_bulk"] = _ingest_bulk(client, docs)
+    if args.config == "hnsw":
+        # 投入直後は HNSW 構築が非同期に進行中のため、完了を確認してから計測へ進む。
+        phases["index_build"] = _wait_indexed(client, len(docs))
 
     public_only_filter = models.Filter(
         must=[models.FieldCondition(key="visibility", match=models.MatchValue(value="public"))]

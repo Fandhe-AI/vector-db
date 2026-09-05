@@ -195,6 +195,8 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             tbl.search(query_type="hybrid")
             .vector(qv)
             .text(qt)
+            # 通常 KNN と同じく内積に統一する（未指定だと exact 構成では既定の L2 になる）。
+            .metric("dot")
             .where(public_filter)
             .limit(10)
             .select(["id"])

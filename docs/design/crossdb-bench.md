@@ -53,6 +53,10 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
   （テナント列では絞らない。ポリシーエンジンの比較ではない）。
 - **exact / ANN**: `exact` は索引なし全件探索、`hnsw` は各 DB の近似索引。
   self は既定エンジン（brute-force）のみ計測した（ANN opt-in は wire から選択できない）。
+  Qdrant の `hnsw` は `indexing_threshold` を下げて全セグメントを索引化し、status green
+  かつ `indexed_vectors_count` が全件に達したことを確認してから計測する（既定閾値では
+  25,000 行・dim 128 は各セグメントが閾値未満のまま HNSW が構築されない）。LanceDB の
+  hybrid もベクトル側は `metric="dot"` を明示している。
 - **Recall@10**: 合成 embedding は内積の同点が多いため、主指標 `recall_at_10` は
   「真スコアが 10 位のスコア以上の全文書」を正解集合とする同点許容版
   （`TIE_EPSILON = 1e-4`）。厳密一致版は `recall_at_10_strict` として併記する。
@@ -61,18 +65,18 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
 
 | フェーズ | self (wire) | pgvector exact | pgvector HNSW | sqlite-vec | Qdrant exact | Qdrant HNSW | LanceDB exact | LanceDB HNSW | MySQL |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `vector_knn` | 732 / 1147 | 3666 / 3894 | 3555 / 4144 | 1935 / 1978 | 689 / 766 | 664 / 737 | 9544 / 12235 | 2826 / 3666 | n/a |
-| `vector_knn_where` | 2899 / 3047 | 2107 / 2231 | 2120 / 2294 | 1845 / 1869 | 635 / 711 | 562 / 683 | 8761 / 9910 | 4122 / 6440 | n/a |
-| `where_compound_count` | 3966 / 4261 | 1606 / 1723 | 1583 / 1637 | 945 / 959 | 5598 / 6451 | 5842 / 8351 | 931 / 1108 | 1273 / 1592 | 3021 / 3228 |
-| `agg_count` | 3569 / 3807 | 1676 / 1869 | 1632 / 1804 | 615 / 634 | 1783 / 2429 | 1824 / 2411 | 626 / 760 | 1035 / 1134 | 1799 / 1913 |
-| `agg_multi` | 3822 / 4094 | 1951 / 2038 | 1898 / 1957 | 1747 / 1795 | n/a | n/a | 7443 / 9176 | 8630 / 11369 | 2513 / 2624 |
-| `group_by_having` | 4031 / 4409 | 2921 / 3105 | 2816 / 3007 | 2740 / 2776 | n/a | n/a | 10967 / 14961 | 10259 / 14047 | 16664 / 17386 |
-| `hybrid_rrf` | 5932 / 8500 | 4634 / 5111 | 4744 / 5380 | 2589 / 2872 | n/a | n/a | 11459 / 15358 | 4652 / 5233 | n/a |
+| `vector_knn` | 732 / 1147 | 3666 / 3894 | 3555 / 4144 | 1935 / 1978 | 757 / 972 | 588 / 650 | 9024 / 17139 | 2592 / 3107 | n/a |
+| `vector_knn_where` | 2899 / 3047 | 2107 / 2231 | 2120 / 2294 | 1845 / 1869 | 631 / 842 | 574 / 639 | 8174 / 10800 | 4099 / 4821 | n/a |
+| `where_compound_count` | 3966 / 4261 | 1606 / 1723 | 1583 / 1637 | 945 / 959 | 5860 / 8597 | 5267 / 5640 | 967 / 1101 | 1072 / 1355 | 3021 / 3228 |
+| `agg_count` | 3569 / 3807 | 1676 / 1869 | 1632 / 1804 | 615 / 634 | 1872 / 2494 | 1368 / 1677 | 684 / 866 | 732 / 896 | 1799 / 1913 |
+| `agg_multi` | 3822 / 4094 | 1951 / 2038 | 1898 / 1957 | 1747 / 1795 | n/a | n/a | 7446 / 9673 | 7912 / 12148 | 2513 / 2624 |
+| `group_by_having` | 4031 / 4409 | 2921 / 3105 | 2816 / 3007 | 2740 / 2776 | n/a | n/a | 8286 / 10368 | 8492 / 12623 | 16664 / 17386 |
+| `hybrid_rrf` | 5932 / 8500 | 4634 / 5111 | 4744 / 5380 | 2589 / 2872 | n/a | n/a | 10308 / 12652 | 4165 / 4914 | n/a |
 | `mode_recall` | 745 / 1152 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | `mode_precision` | 685 / 782 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
 | `udf_call` | 750 / 1178 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a |
-| `rls_isolation` | 3580 / 3950 | 1686 / 1887 | 1620 / 1694 | 622 / 641 | 1696 / 2322 | 1833 / 2408 | 873 / 1004 | 837 / 957 | 1793 / 1914 |
-| `explain` | n/a | 135 / 147 | 100 / 233 | 4 / 5 | n/a | n/a | 1086 / 1318 | 543 / 782 | 134 / 154 |
+| `rls_isolation` | 3580 / 3950 | 1686 / 1887 | 1620 / 1694 | 622 / 641 | 1822 / 2587 | 1311 / 1525 | 665 / 894 | 654 / 871 | 1793 / 1914 |
+| `explain` | n/a | 135 / 147 | 100 / 233 | 4 / 5 | n/a | n/a | 1079 / 1306 | 602 / 736 | 134 / 154 |
 
 n/a は当該 DB にその機能が無い（または wire から到達できない）ことを示し、結果 JSON には
 `unsupported` と理由を fail-closed で記録している。`mode_recall`／`mode_precision`
@@ -81,10 +85,10 @@ n/a は当該 DB にその機能が無い（または wire から到達できな
 
 | 指標 | self (wire) | pgvector exact | pgvector HNSW | sqlite-vec | Qdrant exact | Qdrant HNSW | LanceDB exact | LanceDB HNSW | MySQL |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ingest_bulk` | n/a | 0.47 s（52,741 rows/s） | 0.48 s（51,735 rows/s） | 0.26 s（95,525 rows/s） | 1.96 s（12,745 rows/s） | 2.00 s（12,505 rows/s） | 0.20 s（126,586 rows/s） | 0.18 s（140,091 rows/s） | 1.58 s（15,781 rows/s） |
-| `ingest_single_stmt` | 0.13 s（7,473 rows/s） | 0.62 s（1,601 rows/s） | 1.32 s（757 rows/s） | 0.01 s（67,242 rows/s） | 0.82 s（1,221 rows/s） | 0.86 s（1,167 rows/s） | 1.66 s（602 rows/s） | 1.59 s（627 rows/s） | 0.14 s（7,059 rows/s） |
-| `recall_at_10` | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.8070 | n/a |
-| `recall_at_10_strict` | 0.9995 | 0.9865 | 0.9865 | 0.9740 | 0.7565 | 0.7565 | 0.9990 | 0.6005 | n/a |
+| `ingest_bulk` | n/a | 0.47 s（52,741 rows/s） | 0.48 s（51,735 rows/s） | 0.26 s（95,525 rows/s） | 2.07 s（12,078 rows/s） | 2.08 s（12,021 rows/s） | 0.15 s（172,225 rows/s） | 0.15 s（162,838 rows/s） | 1.58 s（15,781 rows/s） |
+| `ingest_single_stmt` | 0.13 s（7,473 rows/s） | 0.62 s（1,601 rows/s） | 1.32 s（757 rows/s） | 0.01 s（67,242 rows/s） | 0.92 s（1,081 rows/s） | 1.49 s（671 rows/s） | 1.38 s（726 rows/s） | 1.41 s（709 rows/s） | 0.14 s（7,059 rows/s） |
+| `recall_at_10` | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.8325 | n/a |
+| `recall_at_10_strict` | 0.9995 | 0.9865 | 0.9865 | 0.9740 | 0.7490 | 0.7915 | 0.9990 | 0.6060 | n/a |
 
 self の `ingest_bulk` は wire に COPY 相当が無く（`EngineCore::execute_insert_sql_batch`
 は Rust API のみ）n/a。`ingest_single_stmt` は行形 INSERT を `USING OPERATION_ID`
@@ -92,17 +96,18 @@ self の `ingest_bulk` は wire に COPY 相当が無く（`EngineCore::execute_
 
 ### 所見
 
-- **フィルタなし KNN（exact）**: self 732 µs（p50）は Qdrant exact 689 µs と同等で、
-  pgvector exact 3,666 µs・sqlite-vec 1,935 µs・LanceDB exact 9,544 µs より速い。
+- **フィルタなし KNN（exact）**: self 732 µs（p50）は Qdrant exact 757 µs と同等で、
+  pgvector exact 3,666 µs・sqlite-vec 1,935 µs・LanceDB exact 9,024 µs より速い。
   Recall@10（同点許容）は self を含む exact 全構成で 1.0。
 - **フィルタ付き KNN・集計・GROUP BY・hybrid**: self は 2.9〜5.9 ms で、pgvector
   （1.6〜4.7 ms）・sqlite-vec（0.6〜2.7 ms）より遅い。in-process の `feature_bench`
   では同種フェーズが 1 ms 台であり、差分の主因は wire 往復＋テキスト応答の組み立て
   と SQL 表層のフィルタ経路（`docs/design/c1-p95-dedicated-env-reverification.md`）。
   MySQL の `GROUP BY`/`HAVING` は 16.7 ms と突出して遅い。
-- **投入**: 一括投入は LanceDB（171k rows/s）＞ sqlite-vec ＞ pgvector ＞ MySQL ＞ Qdrant。
+- **投入**: 一括投入は LanceDB（172k rows/s）＞ sqlite-vec ＞ pgvector ＞ MySQL ＞ Qdrant。
 - **ANN の効果**: 25,000 行では pgvector HNSW と exact の差はほぼ無く（3.6 ms 前後）、
-  LanceDB HNSW は 9.5→2.8 ms と速くなる代わりに Recall@10 0.807 へ低下した。
+  LanceDB HNSW は 9.0→2.6 ms と速くなる代わりに Recall@10 0.833 へ低下した。Qdrant HNSW
+  （構築完了確認後）は 757→588 µs で Recall@10 1.0 を維持した。
 
 ## wire-server の 40 ms 下限と `TCP_NODELAY` 修正
 
