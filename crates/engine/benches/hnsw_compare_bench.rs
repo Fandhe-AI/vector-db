@@ -126,6 +126,16 @@ fn measure_usearch_build(
     Ok(measurement.summary.median)
 }
 
+/// 探索レイテンシ計測の回数: クエリ数の整数倍で protocol 下限（20）以上の
+/// 最小値。`queries` 本を `qi % len` で巡回するため、この回数なら本計測中に
+/// 全クエリが同じ回数ずつ評価される。
+fn latency_iterations_for(query_count: usize) -> u32 {
+    const MIN_ITERATIONS: usize = 20;
+    let n = query_count.max(1);
+    let multiples = MIN_ITERATIONS.div_ceil(n).max(1);
+    u32::try_from(n.saturating_mul(multiples)).unwrap_or(u32::MAX)
+}
+
 fn main() {
     if let Err(e) = refuse_under_github_actions(running_under_github_actions()) {
         eprintln!("hnsw_compare_bench: {e}");
@@ -362,14 +372,19 @@ fn main() {
 
     // 探索レイテンシ（参考値）: 同じクエリ集合を巡回し、1 クエリあたりの
     // 所要時間中央値を両者で出す。合否閾値は持たない情報提供専用の計測。
+    // warmup・本計測とも回数をクエリ数の整数倍（protocol 下限 20 以上）に
+    // 合わせ、全クエリが均等に評価されるようにする（codex-review 指摘・PR #445。
+    // 固定 20 回では既定 queries=200 のうち 20 件しか計測されない）。
     let latency_index = self_index_max.as_ref().unwrap_or(&self_index_seq);
-    let latency_config = match MeasurementConfig::new(20, 20, 0xFACE_CAFE) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("hnsw_compare_bench: latency config: {e}");
-            std::process::exit(1);
-        }
-    };
+    let latency_iterations = latency_iterations_for(queries.len());
+    let latency_config =
+        match MeasurementConfig::new(latency_iterations, latency_iterations, 0xFACE_CAFE) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("hnsw_compare_bench: latency config: {e}");
+                std::process::exit(1);
+            }
+        };
 
     let mut self_qi = 0usize;
     let self_latency = run(&latency_config, || {
