@@ -306,5 +306,8 @@ pub fn count_boundary_tolerant_mismatches(
         .iter()
         .filter(|(id, score)| *score > boundary_score && !candidate_ids.contains(id))
         .count();
-    extra + missing + duplicates + dropped_above_boundary
+    // 候補が短い場合の欠落件数と、境界より上位の id の欠落は同じ取りこぼしを別の
+    // 側面から数えている（空の候補では両方が計上される）ため、二重計上せず大きい方を
+    // 採る。
+    extra + duplicates + missing.max(dropped_above_boundary)
 }
