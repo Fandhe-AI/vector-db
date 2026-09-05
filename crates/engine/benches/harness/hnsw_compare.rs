@@ -64,6 +64,9 @@ pub enum HnswCompareBenchError {
     RefusedUnderGitHubActions,
     /// 実効指数・比率計算に必要な所要時間が 0 以下、または分母が 0。
     InsufficientSamples,
+    /// [`l2_normalize_corpus`] でノルムが 0（全成分 0）の行を検出した
+    /// （fail-closed。当該行のインデックスを保持する）。
+    ZeroNormRow(usize),
 }
 
 impl fmt::Display for HnswCompareBenchError {
@@ -77,6 +80,11 @@ impl fmt::Display for HnswCompareBenchError {
             HnswCompareBenchError::InsufficientSamples => {
                 write!(f, "need positive, non-zero durations to compute a ratio")
             }
+            HnswCompareBenchError::ZeroNormRow(row) => write!(
+                f,
+                "corpus row {row} has zero L2 norm and cannot be normalized \
+                 (refusing rather than dividing by zero / emitting NaN)"
+            ),
         }
     }
 }
@@ -299,9 +307,91 @@ pub fn render_usearch_params_line(
     )
 }
 
-/// 実行条件のヘッダ 1 行分の出力整形。
+/// hnsw_rs 側パラメータ 1 行分の出力整形（`params engine=hnsw_rs ...`）。
+/// `max_layer` は [`hnsw_rs_adapter::max_layer_for`]（行数依存のためコーパス
+/// 行数が確定してから呼び出し元が計算する）の結果を渡す契約。
+/// `dist=DistDot(simdeez_f)` の `simdeez_f` は `Cargo.toml` で有効化した
+/// hnsw_rs（推移依存 `anndists`）の SIMD 距離計算 feature 名（実行時 CPU
+/// 検出。self 側 `isa.rs` の AVX2+FMA dot・usearch 側の SIMD 内蔵と対照条件を
+/// 揃える目的で有効化している）を明示し、比較条件の記録漏れを防ぐ。
+pub fn render_hnsw_rs_params_line(
+    max_nb_connection: usize,
+    ef_construction: usize,
+    ef_search: usize,
+    max_layer: usize,
+) -> String {
+    format!(
+        "hnsw_compare: params engine=hnsw_rs max_nb_connection={max_nb_connection} \
+         ef_construction={ef_construction} ef_search={ef_search} max_layer={max_layer} \
+         dist=DistDot(simdeez_f)"
+    )
+}
+
+/// 同一スレッド数点の「自作エンジン所要時間 ÷ hnsw_rs 所要時間」比率。
+/// [`ratio_self_over_usearch`] と同一の計算方針（1.0 未満は自作エンジンが
+/// 速いことを表す）だが、出力ラベル（`self_over_hnsw_rs`）を区別するため
+/// 独立した関数として持つ（呼び出し元 `hnsw_compare_bench.rs` の可読性のため）。
+pub fn ratio_self_over_hnsw_rs(
+    self_median: Duration,
+    hnsw_rs_median: Duration,
+) -> Result<f64, HnswCompareBenchError> {
+    let hnsw_rs_secs = hnsw_rs_median.as_secs_f64();
+    if hnsw_rs_secs <= 0.0 || self_median.as_secs_f64() <= 0.0 {
+        return Err(HnswCompareBenchError::InsufficientSamples);
+    }
+    Ok(self_median.as_secs_f64() / hnsw_rs_secs)
+}
+
+/// 同一スレッド数点の比率 1 行分の出力整形（`hnsw_compare: ratio threads=<T>
+/// self_over_hnsw_rs=<x>x`）。
+pub fn render_ratio_self_over_hnsw_rs_line(threads: usize, ratio: f64) -> String {
+    format!("hnsw_compare: ratio threads={threads} self_over_hnsw_rs={ratio:.3}x")
+}
+
+/// 実行条件のヘッダ 1 行分の出力整形。3 エンジン（self・usearch・hnsw_rs）は
+/// すべて [`l2_normalize_corpus`] 済みの同一コーパス・クエリで比較する
+/// （是正前〔PR #445〕は hnsw_rs だけが正規化済み・self/usearch は無正規化と
+/// いう非対称条件だったため実測値を単純比較できなかった。是正後の本行には
+/// 常に `corpus=l2_normalized` が付き、条件の違いを実測値の隣で明示する）。
 pub fn render_header_line(rows: usize, dim: usize, queries: usize, ladder: &[usize]) -> String {
-    format!("hnsw_compare: rows={rows} dim={dim} queries={queries} thread_ladder={ladder:?}")
+    format!(
+        "hnsw_compare: rows={rows} dim={dim} queries={queries} thread_ladder={ladder:?} \
+         corpus=l2_normalized"
+    )
+}
+
+/// 3 エンジン（self・usearch・hnsw_rs）共通のコーパス正規化ヘルパ。
+///
+/// `vectors`（`rows * dim` の row-major フラットバッファ）の各行を L2 単位
+/// ノルムへ正規化した新しいバッファを返す。正規化後は内積の最大化と
+/// コサイン類似度の最大化が一致するため、self（`kernel::dot`）・usearch
+/// （`MetricKind::IP`）・hnsw_rs（`DistDot`。単位ベクトル前提は
+/// `hnsw_rs_adapter` モジュールコメント「DistDot の単位ベクトル前提」参照）の
+/// いずれの距離契約も同時に満たす同一入力になる。
+///
+/// ベンチ冒頭で本関数を 1 回だけ呼び出し、以降は全エンジンへ同じ正規化済み
+/// コーパス・クエリを渡す契約にする（3 エンジンを同一入力で比較する
+/// ための是正。PR #445 時点は hnsw_rs だけ正規化していたため条件が異なっていた）。
+///
+/// ノルムが 0（全成分 0 の行）の場合は 0 除算・NaN 混入を招くため、
+/// その行を残すのではなく fail-closed で拒否する
+/// （[`HnswCompareBenchError::ZeroNormRow`]）。本ベンチの一様乱数コーパス
+/// （`harness::hnsw_build::generate_corpus`）では実質発生しないが、決定的
+/// とはいえ生成器の変更で発生しうるため呼び出し元（`hnsw_compare_bench.rs`）
+/// はこの `Err` を握りつぶさず `exit(1)` する契約とする。
+pub fn l2_normalize_corpus(vectors: &[f32], dim: usize) -> Result<Vec<f32>, HnswCompareBenchError> {
+    let step = dim.max(1);
+    let mut out = Vec::with_capacity(vectors.len());
+    for (row_idx, chunk) in vectors.chunks(step).enumerate() {
+        let norm_sq: f32 = chunk.iter().map(|v| v * v).sum();
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            out.extend(chunk.iter().map(|v| v / norm));
+        } else {
+            return Err(HnswCompareBenchError::ZeroNormRow(row_idx));
+        }
+    }
+    Ok(out)
 }
 
 /// `rows` 件を `threads` ワーカーへ連続範囲で静的分割した `[start, end)` の
@@ -444,5 +534,150 @@ pub mod usearch_adapter {
             .search(query, k)
             .map_err(|err| BenchError::ExternalEngine(format!("usearch search failed: {err}")))?;
         Ok(matches.keys)
+    }
+}
+
+#[cfg(feature = "contrast-bench")]
+pub mod hnsw_rs_adapter {
+    //! hnsw_rs（純 Rust HNSW。承認済み optional 依存 `hnsw_rs =0.3.4`・
+    //! `contrast-bench` feature 限定。オーナー承認 2026-09-05）依存部分。
+    //! [`super::usearch_adapter`] と同型の構築・探索アダプタを提供する。
+    //!
+    //! # DistDot の単位ベクトル前提
+    //!
+    //! `anndists =0.1.5`（hnsw_rs の推移依存）の `dist::distances::DistDot::eval`
+    //! （`src/dist/distances.rs` 258-281 行目付近）は `1 - dot(va, vb)` を返し、
+    //! コーシー・シュワルツにより単位ベクトル同士の内積が高々 1 であることを
+    //! 前提に `assert!(dot >= 0.)`（`scalar_dot_f32`。同ファイル 272-281 行目）
+    //! で検証する。本ベンチのコーパス（`harness::hnsw_build::generate_corpus`。
+    //! 各成分が `[-1, 1)` の一様乱数でノルムは不揃い）を無正規化のまま渡すと
+    //! 内積が 1 を超えて assert パニック（プロセス強制終了）になりうる。
+    //! hnsw_rs 公式サンプル `examples/ann-glove25-angular.rs`
+    //! （74-75 行目のコメント「pre normalisation to use Dot computations
+    //! instead of Cosine」・`anndata.do_l2_normalization()` 呼び出し）も
+    //! 同じ前提を裏付ける。
+    //!
+    //! そのため呼び出し元（`hnsw_compare_bench.rs`）はベンチ冒頭で
+    //! [`super::l2_normalize_corpus`] を 1 回呼び出し、self・usearch・hnsw_rs
+    //! の 3 エンジンすべてへ同じ正規化済みコーパス・クエリを渡す（是正前
+    //! 〔PR #445〕は hnsw_rs だけ正規化・self/usearch は無正規化という非対称
+    //! 条件だったため、3 エンジンの Recall・構築時間が同一入力に基づかず
+    //! 単純比較できなかった。是正後は正規化後の内積〔＝コサイン類似度〕の
+    //! 最大化が生内積の最大化と一致するため、usearch 側 `MetricKind::IP` の
+    //! 評価基盤とも一致する）。
+    //!
+    //! # スレッド数制御
+    //!
+    //! hnsw_rs はスレッド数を指定する公開 API を持たない。`parallel_insert`／
+    //! `parallel_insert_slice`（`src/hnsw.rs` 1212-1226 行目）は内部で rayon の
+    //! グローバルスレッドプールを暗黙に使うのみで、プロセス内で複数回異なる
+    //! スレッド数点を計測する用途には向かない。本クレート（`engine`）へ
+    //! `rayon` を直接依存として追加せずにスレッド数ラダーを計測するため、
+    //! `parallel_insert` は使わず `Hnsw::insert`（`&self` を取る。`src/hnsw.rs`
+    //! 1060-1067 行目）を [`super::partition_rows`] で分割した `threads` 本の
+    //! `std::thread::scope` ワーカーから直接呼び出す（usearch_adapter の
+    //! `build_usearch_index_parallel` と同型の構成）。`Hnsw<'_, f32, DistDot>`
+    //! は内部状態が `Arc<RwLock<..>>`（`src/hnsw.rs` 396-402 行目
+    //! `PointIndexation`）のみで構成されるため自動導出で `Sync` になり、
+    //! `&Hnsw` を複数スレッドから安全に共有できる（コンパイラが検証する。
+    //! 本コードは `unsafe` を書かない）。
+
+    use super::super::stats::BenchError;
+    use super::partition_rows;
+    use hnsw_rs::prelude::{DistDot, Hnsw, Neighbour};
+
+    /// engine 側 [`engine::hnsw::HnswParams::default`]（m=16）に対応させた
+    /// hnsw_rs 側の `max_nb_connection`。
+    pub const MAX_NB_CONNECTION: usize = 16;
+
+    /// engine 側 `HnswParams::default().ef_construction`（100）に対応させた
+    /// hnsw_rs 側の `ef_construction`。
+    pub const EF_CONSTRUCTION: usize = 100;
+
+    /// `max_layer` を hnsw_rs 公式サンプル（`examples/ann-glove25-angular.rs`
+    /// 87 行目 `let nb_layer = 16.min((nb_elem as f32).ln().trunc() as usize);`）
+    /// と同じ式で決める。`rows == 0` は `ln` が定義できないため 1 に倒す
+    /// （空コーパスは呼び出し元が別途拒否する契約）。
+    pub fn max_layer_for(rows: usize) -> usize {
+        if rows == 0 {
+            return 1;
+        }
+        let ln_rows = (rows as f32).ln().trunc();
+        if ln_rows < 1.0 {
+            1
+        } else {
+            16usize.min(ln_rows as usize)
+        }
+    }
+
+    /// `rows` 件の `normalized_vectors`（呼び出し元が [`super::l2_normalize_corpus`]
+    /// で正規化済みのものを渡す契約。正規化前のコーパスを渡すとモジュール
+    /// コメントの assert パニックを招きうる）から hnsw_rs の
+    /// `Hnsw<f32, DistDot>` を構築する。
+    ///
+    /// `threads == 1` は逐次 `insert` ループ、`threads >= 2` は
+    /// [`super::partition_rows`] による静的分割 + `std::thread::scope` の
+    /// 並列ワーカーから `insert` を呼ぶ（モジュールコメント「スレッド数制御」
+    /// 参照）。`usearch_adapter::build_usearch_index_parallel` と対称に
+    /// `Hnsw::new` からこの関数の内側で行い、呼び出し元の計測区間へ初期化
+    /// コストを含める。
+    pub fn build_hnsw_rs_index(
+        rows: usize,
+        dim: usize,
+        normalized_vectors: &[f32],
+        threads: usize,
+    ) -> Hnsw<'static, f32, DistDot> {
+        let max_layer = max_layer_for(rows);
+        let index = Hnsw::<f32, DistDot>::new(
+            MAX_NB_CONNECTION,
+            rows,
+            max_layer,
+            EF_CONSTRUCTION,
+            DistDot {},
+        );
+        let threads = threads.max(1);
+        if threads <= 1 {
+            for row in 0..rows {
+                let start = row * dim;
+                let end = start + dim;
+                if let Some(slice) = normalized_vectors.get(start..end) {
+                    index.insert((slice, row));
+                }
+            }
+        } else {
+            let ranges = partition_rows(rows, threads);
+            std::thread::scope(|scope| {
+                for (start, end) in ranges {
+                    let index_ref = &index;
+                    scope.spawn(move || {
+                        for row in start..end {
+                            let vec_start = row * dim;
+                            let vec_end = vec_start + dim;
+                            if let Some(slice) = normalized_vectors.get(vec_start..vec_end) {
+                                index_ref.insert((slice, row));
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        index
+    }
+
+    /// `query`（[`super::l2_normalize_corpus`] と同じ正規化を経た後の値を渡す契約）に
+    /// 対する Top-`k` 近似最近傍 id 列を、hnsw_rs の `search`（`Neighbour::d_id`
+    /// が挿入時に渡した行番号）で返す。`Hnsw::search` は既に距離昇順（＝
+    /// `DistDot` の契約上は類似度降順）で返す実装
+    /// （`src/hnsw.rs` `knn_search` 内 `neighbours_heap.into_sorted_vec()` の
+    /// コメント「go from heap of points with negative dist to a sorted vec of
+    /// increasing points」）のため、呼び出し元での並べ替えは不要。
+    pub fn hnsw_rs_search_topk(
+        index: &Hnsw<'_, f32, DistDot>,
+        query: &[f32],
+        knbn: usize,
+        ef_search: usize,
+    ) -> Result<Vec<u64>, BenchError> {
+        let neighbours: Vec<Neighbour> = index.search(query, knbn, ef_search);
+        Ok(neighbours.into_iter().map(|n| n.d_id as u64).collect())
     }
 }
