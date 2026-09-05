@@ -51,7 +51,7 @@ use harness::rng::DeterministicRng;
 
 use engine::batch_fallback::BatchBackend;
 use engine::batch_search::{
-    BatchEngine, BatchQuery, ResidentMatrix, MAX_BATCH_ROWS, MAX_BATCH_WORK,
+    BatchEngine, BatchQuery, ResidentMatrix, MAX_BATCH_ROWS, MAX_BATCH_TOTAL_BYTES, MAX_BATCH_WORK,
 };
 use engine::gpu_batch::{GpuBatchBackend, GpuF32ContrastBackend};
 use engine::kernel::SearchHit;
@@ -280,6 +280,30 @@ fn main() {
                                 batch,
                                 k,
                                 "rows * batch * dim exceeds MAX_BATCH_WORK"
+                            )
+                        );
+                        continue;
+                    }
+                }
+
+                // データ生成前にバイト量を検査する。`ResidentMatrix::build` の
+                // 1 GiB 上限（`MAX_BATCH_TOTAL_BYTES`）で拒否される組み合わせは f32 の
+                // コーパスを確保する前に除外し、実ページ確保時のメモリ不足でプロセスが
+                // 停止する前にスキップ行を出力する。
+                let dataset_bytes = rows
+                    .checked_mul(dim)
+                    .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()));
+                match dataset_bytes {
+                    Some(bytes) if bytes <= MAX_BATCH_TOTAL_BYTES => {}
+                    _ => {
+                        println!(
+                            "{}",
+                            format_skip_line(
+                                rows,
+                                dim,
+                                batch,
+                                k,
+                                "rows * dim * 4 bytes exceeds MAX_BATCH_TOTAL_BYTES"
                             )
                         );
                         continue;
