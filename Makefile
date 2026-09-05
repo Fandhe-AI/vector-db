@@ -378,6 +378,18 @@ else
 endif
 
 # --------------------------------------------------
+# 自作 HNSW と外部フレームワーク usearch の構築時間・Recall・探索レイテンシ比較（Issue #402 系 ADR の実測補強。crates/engine/benches/hnsw_compare_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hnsw-compare
+bench-hnsw-compare: ## 自作 HNSW と usearch の構築時間（スレッド数ラダー）・Recall@10・探索レイテンシを同一条件で比較する（`contrast-bench` feature 限定・C++17 コンパイラが必要。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_HNSW_COMPARE_ROWS／BENCH_HNSW_COMPARE_DIM／BENCH_HNSW_COMPARE_THREADS／BENCH_HNSW_COMPARE_QUERIES で条件を上書き可）
+ifdef HAS_CARGO
+	cargo bench --bench hnsw_compare_bench -p engine --features contrast-bench
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hnsw-compare をスキップ"
+endif
+
+# --------------------------------------------------
 # HNSW 探索（ef ビーム探索・top-k）の brute-force 対照 Recall 受け入れ条件（TASK-132・Issue #405。crates/engine/tests/hnsw_search.rs）
 # --------------------------------------------------
 
