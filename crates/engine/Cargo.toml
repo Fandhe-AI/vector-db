@@ -27,15 +27,6 @@ redb = "=4.2.0"
 # .claude/rules/dependency-policy.md に従い完全固定（=x.y.z）で管理する。
 usearch = { version = "=2.26.1", optional = true }
 
-# hnsw_rs（純 Rust の HNSW 実装。MIT OR Apache-2.0）。オーナー承認済み（2026-09-05。
-# PR #445 の最終報告への回答で承認）。目的は `hnsw_compare_bench.rs` から自作 HNSW
-# の構築時間・Recall の対照エンジンとして呼び出すことのみで、`src/` 配下は本依存に
-# 一切依存しない。usearch と同じく `optional = true` ＋ `contrast-bench` feature 限定。
-# hnsw_rs の default features は空（距離計算はスカラー）のため、自作側（`isa.rs` の
-# AVX2+FMA dot）・usearch（SIMD 内蔵）と対照条件を揃える目的で `simdeez_f`
-# （anndists の SIMD 距離計算。実行時 CPU 検出）を有効化する。完全固定（=x.y.z）。
-hnsw_rs = { version = "=0.3.4", optional = true, features = ["simdeez_f"] }
-
 # TASK-128〜130（Issue #178）: GPU バッチ経路（`gpu_batch.rs`）用の依存。
 # .claude/rules/dependency-policy.md の承認事項をここに記録する
 # （**オーナー承認済み: 2026-08-26。Issue #178 のコメントに承認記録あり**）。
@@ -91,7 +82,7 @@ tokenizers = { version = "=0.23.1", optional = true, default-features = false, f
 # feature。`test-support` feature 廃止時（本ファイル上部の redb dev-dependency コメント
 # 参照）と異なり、テナント境界・RLS 迂回 API は一切露出しない
 # （bench 専用の依存有効化のみで安全境界に触れない）。
-contrast-bench = ["dep:usearch", "dep:hnsw_rs"]
+contrast-bench = ["dep:usearch"]
 
 # Issue #333（SEARCH-7 方式変更）: `rerank::CrossEncoderReranker` の実 ONNX 推論
 # バックエンド（`src/rerank/cross_encoder_onnx.rs`）を有効化する feature。
@@ -339,3 +330,20 @@ name = "hnsw_compare_bench"
 harness = false
 test = false
 required-features = ["contrast-bench"]
+
+[[bench]]
+# GPU バッチ検索（`engine::gpu_batch`。TASK-128〜130・Issue #178 ポインタ）が
+# CPU-SIMD バッチ経路（`engine::batch_search::BatchEngine`）に対してどの規模・
+# バッチサイズから優位になるかを、`BENCH_GPU_SCALING_ROWS`/
+# `BENCH_GPU_SCALING_DIMS`/`BENCH_GPU_SCALING_BATCH` の直積で掃引して実測する
+# 手動専用ベンチ。`batch_bench.rs`（固定規模の CORE-6/CORE-16 ゲート）とは別に、
+# spec 由来の pass/fail 閾値を持たない情報提供専用の測定ツールとして追加した
+# （`hnsw_parallel_build_bench.rs` と同じ位置づけ。`.github/workflows/*` へは
+# 配線しない）。harness = false / test = false は他ベンチと同一方針。`make
+# bench-gpu-scaling`（Makefile）から実行する。判定ロジックを持たないため
+# 専用の accept.rs は無く、env パース・出力整形・同点許容つき不一致検知のみ
+# `harness/gpu_scaling.rs` に切り出し `tests/gpu_scaling_accept.rs`
+# （`make ci` 対象）で回帰検証する。
+name = "gpu_scaling_bench"
+harness = false
+test = false

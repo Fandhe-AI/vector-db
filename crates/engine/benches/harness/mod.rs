@@ -51,6 +51,7 @@ pub mod bench_engine;
 pub mod contrast;
 pub mod dot_kernel;
 pub mod env_report;
+pub mod gpu_scaling;
 pub mod hybrid_latency;
 // Issue #387 PR #416 codex-review P2 指摘対応（2 巡目）: `hybrid_profile` の
 // 大半（コーパス生成・SQL 文組み立て・tokenize 複製・fail-closed 判定等）は

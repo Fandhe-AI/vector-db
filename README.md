@@ -258,6 +258,31 @@ make rerank-cross-encoder-eval
 「Issue #333 追記」節を参照してください）。`GITHUB_ACTIONS` が設定された
 実行環境では起動直後に fail-closed で拒否します。
 
+### 他 DB との機能別横断ベンチ（`make bench-crossdb`）
+
+`scripts/crossdb_bench/`（Python ハーネス・Cargo 依存追加なし）を使い、自作 DB（wire-server 経由）と pgvector・sqlite-vec・Qdrant・LanceDB・MySQL の機能別（KNN・フィルタ付き KNN・集計・GROUP BY・hybrid・Recall@10 等）レイテンシを同一データセット（25,000 行・dim 128）上で比較します。計測ツールの Python 依存は `requirements.txt` で `==` 固定し、Cargo 依存は増やしていません。
+
+**前提環境**:
+
+- Docker
+- Python venv: `pip install -r scripts/crossdb_bench/requirements.txt`
+- `cargo build --release -p wire-server`
+- fixture 生成: `cargo run --release -p engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`
+
+**実行**:
+
+```bash
+export CROSSDB_DIR=<fixture ディレクトリ>
+export CROSSDB_PYTHON=<venv の python へのパス>
+make bench-crossdb
+```
+
+`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください。
+
+### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
+
+`engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。
+
 ### Recall 回帰ハーネスの repo secrets（TASK-104）
 
 secret ↔ spec ポインタの対応表・設定手順は `docs/design/ci-gate-variables.md`
@@ -372,7 +397,7 @@ BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。
 
-HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch・`hnsw_rs`〔`=0.3.4`・`contrast-bench` feature 限定〕との構築時間・Recall@10・探索レイテンシ比較。3 エンジン共通でコーパスを L2 正規化）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
+HNSW 構築の並列化（Issue #406）については `make bench-hnsw-parallel-build`（スレッド数ラダーでの構築時間・8→12 スレッド頭打ちの段別内訳）・`make bench-hnsw-compare`（usearch との構築時間・Recall@10・探索レイテンシ比較。L2 正規化コーパス方式を維持）で実測できます。いずれも手動専用ベンチで CI 非配線です。詳細・実測値は `docs/design/hnsw-parallel-build.md` を参照してください。
 
 ### `precision` 評価ハーネス（TASK-163）
 

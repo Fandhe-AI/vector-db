@@ -3,8 +3,19 @@
 //! wire-server を起動して psql 等の実クライアントから `USING PLAN` や hybrid 検索を
 //! 手で叩く際に、`docs` テーブルへ合成コーパスを用意するために使う。
 //! `seed <db> <rows> <dim>` で 2 テナント（`tenant-a`／`tenant-b`。行数を問わず
-//! 約 1 割のバッチが `tenant-b`。`rows < 10` は拒否）分の合成文書を Public 可視で投入し、`embed <dim> <text>` で同じ `HashingEmbedder` による
-//! クエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
+//! 約 1 割のバッチが `tenant-b`。`rows < 10` は拒否）分の合成文書を投入する。
+//! `tenant-a` の行は `Visibility::Public`、`tenant-b` の行は `Visibility::Private`
+//! で投入し、他 DB 横断ベンチで RLS 相当のテナント境界を比較できるようにする
+//! （両可視性を混在させることで「全行 Public」だった旧挙動との差を作る）。
+//! ただし wire-server の既定認証経路（`auth::verify` → `PolicyContext::new`）は
+//! `Public` のみを許可可視性とし、`Private` 行は所有テナント自身にも wire 越しには
+//! 見えない（`crates/wire-server/src/simple_query.rs` 冒頭コメント・
+//! `wire1_three_tenant_visibility_public_shared_private_hidden` 参照。ポインタ:
+//! RLS-6/RLS-7）。そのため wire 経由の可視行数は tenant-a・tenant-b のどちらの
+//! セッションでも `tenant-a` の `Public` 行数のみになり、`tenant-b` 自身の
+//! `Private` 行は含まれない（Rust API から `PolicyContext::with_visibilities` で
+//! `Private` を明示許可すれば別途確認できる）。`embed <dim> <text>` で同じ
+//! `HashingEmbedder` によるクエリベクトルのリテラル（SQL へ貼り付ける形式）を出力する。
 //! 引数はローカル運用者の入力であり wire 経由の untrusted 入力ではないため、
 //! 解析失敗は `expect` で即終了させる。
 //!
@@ -12,17 +23,30 @@
 //! （`seed-batch-<n>`）も決定的なため、同じ `<rows> <dim>` で再実行すると既存の
 //! `docs` テーブル（スキーマ一致時のみ再利用）へ未投入バッチだけを追加する。
 //! 投入済みバッチは台帳の同一内容再送（`DuplicateOperationId`）として検出しスキップ
-//! する。実行全体の `<rows> <dim>` は補助テーブル `seed_meta` へ固定 `operation_id`
-//! （`seed-meta`）の 1 行として最初に記録し、再実行時は同じ台帳照合で
-//! 「同一内容（再開）／内容不一致（fail-closed に停止）」を処理開始前に判定する。
+//! する。実行全体の生成形式バージョン（`SEED_FORMAT_VERSION`）と `<rows> <dim>` は
+//! 補助テーブル `seed_meta` へ固定 `operation_id`（`seed-meta`）の 1 行として最初に
+//! 記録し、再実行時は同じ台帳照合で「同一内容（再開）／内容不一致（fail-closed に
+//! 停止）」を処理開始前に判定する。生成内容が変わる改訂（tenant-b 行の Private 化等）
+//! はバージョンを進めるため、旧形式の DB へは再開できず新しい `<db>` を生成する。
 //! `<dim>` の変更は `docs` のスキーマ不一致としても停止する。
+//!
+//! `export <db> <out.jsonl>` は、他 DB（pgvector・sqlite-vec・Qdrant 等）との横断
+//! ベンチ用に `seed` が投入した `docs` テーブルの全行（両テナント・両可視性）を
+//! id 昇順の JSON Lines（各行に `"visibility":"public"|"private"` を含む）へ
+//! 書き出す。RLS 相当のポリシー評価を経由せず `Storage::scan` で生の行ストアを
+//! 直接読む（本ツールはローカル運用者向けのエクスポート専用であり、テナント境界の
+//! 強制はしない。wire 経由の読み取り経路とは別物）。
+//! `queries <dim> <n> <out.jsonl>` は `seed` と同じ文生成器を別シードで駆動し、
+//! 決定的な検索クエリ n 件を埋め込みつきで書き出す。
 use engine::catalog::{CatalogError, ColumnDef, ColumnType, TableSchema};
 use engine::embedding::{Embedder, HashingEmbedder};
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
-use engine::row_codec::{encode_scalar_columns, Value};
+use engine::row_codec::{decode_scalar_columns, encode_scalar_columns, Value};
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant::TenantWriteError;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 struct Lcg(u64);
@@ -217,6 +241,41 @@ fn vec_literal(v: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
+/// `out` の末尾へ JSON 文字列リテラル（引用符込み）として `s` をエスケープ出力する
+/// （`export`／`queries` サブコマンド専用の手書き JSON 出力。依存追加なしのため
+/// `serde_json` は使わない。リクエスト組み立て専用の最小エスケーパで応答パースは
+/// 対象外という点で `query_planner.rs::json_write_escaped_string` と同じ設計）。
+fn json_write_escaped_string(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// `out` の末尾へ embedding を JSON 配列として書き出す。`{:?}` の丸め表示ではなく
+/// `f32` の `Display`（最短往復表現）で書き出し、他 DB 側での再解釈精度を落とさない。
+fn json_write_embedding(out: &mut String, v: &[f32]) {
+    out.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{x}"));
+    }
+    out.push(']');
+}
+
 /// テーブルを作成する。既存の場合はカタログのスキーマが期待値と完全一致するときだけ
 /// 再利用し、不一致なら fail-closed に終了する（`insert_rows` は embedding 次元しか
 /// 検証しないため、スカラー列の型・順序の不一致をここで塞ぐ）。
@@ -241,7 +300,12 @@ fn create_or_verify_table(storage: &Storage, schema: &TableSchema) -> bool {
     }
 }
 
-/// 実行全体の `<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
+/// 合成文書の生成形式バージョン。生成内容が変わる改訂（例: tenant-b 行を Private で
+/// 投入する変更）で 1 つ進め、旧形式で作った DB への再開を `seed_meta` の照合で
+/// 処理開始前に拒否する。
+const SEED_FORMAT_VERSION: u32 = 2;
+
+/// 実行全体の生成形式・`<rows> <dim>` を補助テーブル `seed_meta` へ固定 `operation_id` で記録し、
 /// 再実行時は台帳の内容照合で「同一（再開）／不一致（停止）」を処理開始前に判定する。
 fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, dim: u32) {
     let schema = TableSchema::new(
@@ -252,7 +316,10 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
         ],
     );
     create_or_verify_table(storage, &schema);
-    let params = format!("rows={rows};dim={dim}");
+    // 生成形式のバージョンも照合対象に含める。tenant-b 行の Public→Private 変更のように
+    // 同じ `<rows> <dim>` でも生成内容が変わる改訂では、旧形式 DB への再開を最初の
+    // バッチの内容不一致で失敗させるのではなく、処理開始前にここで検出して停止する。
+    let params = format!("format={SEED_FORMAT_VERSION};rows={rows};dim={dim}");
     let meta = encode_scalar_columns(
         &schema,
         &[Value::Vector(vec![0.0]), Value::Text(params.clone())],
@@ -276,8 +343,9 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
         }
         Err(TenantWriteError::OperationIdContentMismatch) => {
             eprintln!(
-                "error: this db was seeded with different <rows> <dim>; \
-                 rerun with the original values or use a new <db> path"
+                "error: this db was seeded with different <rows> <dim> or an older \
+                 seed format (current: format={SEED_FORMAT_VERSION}); rerun with the \
+                 original values on the same format or use a new <db> path"
             );
             std::process::exit(2);
         }
@@ -287,8 +355,115 @@ fn record_or_verify_run_meta(storage: &Storage, ctx: &PolicyContext, rows: u64, 
 
 /// 使い方を表示して終了する（引数不足・不明なサブコマンド）。
 fn usage() -> ! {
-    eprintln!("usage: seed_docs seed <db> <rows> <dim> | embed <dim> <text...>");
+    eprintln!(
+        "usage: seed_docs seed <db> <rows> <dim> | embed <dim> <text...> \
+         | export <db> <out.jsonl> | queries <dim> <n> <out.jsonl>"
+    );
     std::process::exit(2);
+}
+
+/// `docs` テーブルの全行（両テナント）を id 昇順の JSON Lines で `out` へ書き出す
+/// （他 DB との横断ベンチ用。`seed` サブコマンドが投入したコーパスをそのまま流用する）。
+/// RLS 相当のポリシー評価を経由しない `Storage::scan` で行ストアを直接読む
+/// （本ツールはローカル運用者向けのエクスポート専用。wire 経由の読み取りではない）。
+fn run_export(db: &str, out_path: &str) {
+    let storage = Storage::open(db).expect("open");
+    let schema = storage.get_table_schema("docs").expect("get_table_schema");
+    // ユーザーテーブル（`docs`）は物理テーブルがテーブル名ごとに分かれるため
+    // （`catalog.rs::user_rows_table_def`）、汎用の `Storage::scan`（固定名 "rows"
+    // テーブル専用。本ツールでは未使用）ではなく `Storage::scan_table_page` の
+    // ページングを cursor が尽きるまで繰り返して全行を集める。ページ内は
+    // `(tenant_id, id)` 昇順だがページをまたぐと単純な id 順にならないため、
+    // 全ページ収集後に id で明示的にソートする。
+    let mut rows = Vec::new();
+    let mut after: Option<(String, u64)> = None;
+    loop {
+        let after_ref = after.as_ref().map(|(t, i)| (t.as_str(), *i));
+        let (page, next) = storage
+            .scan_table_page("docs", after_ref, 10_000)
+            .expect("scan_table_page");
+        rows.extend(page);
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => break,
+        }
+    }
+    rows.sort_by_key(|r| r.id);
+    let file = File::create(out_path).expect("create out file");
+    let mut w = BufWriter::new(file);
+    for row in &rows {
+        let values = decode_scalar_columns(&schema, &row.metadata).expect("decode metadata");
+        // スキーマ列順は `embedding, lang, topic, body`（`seed` 参照）。embedding の
+        // 位置は `decode_scalar_columns` の契約により常に `Value::Null` のダミーで、
+        // 実体は `row.embedding` から取る。
+        let (lang, topic, body) = match (values.get(1), values.get(2), values.get(3)) {
+            (Some(Value::Text(l)), Some(Value::Text(t)), Some(Value::Text(b))) => (l, t, b),
+            _ => panic!("unexpected docs schema for row {}", row.id),
+        };
+        let mut line = String::new();
+        line.push('{');
+        line.push_str(&format!("\"id\":{}", row.id));
+        line.push_str(",\"tenant\":");
+        json_write_escaped_string(&mut line, &row.tenant_id);
+        line.push_str(",\"visibility\":");
+        let visibility_str = match row.visibility {
+            Visibility::Public => "public",
+            Visibility::Private => "private",
+        };
+        json_write_escaped_string(&mut line, visibility_str);
+        line.push_str(",\"lang\":");
+        json_write_escaped_string(&mut line, lang);
+        line.push_str(",\"topic\":");
+        json_write_escaped_string(&mut line, topic);
+        line.push_str(",\"body\":");
+        json_write_escaped_string(&mut line, body);
+        line.push_str(",\"embedding\":");
+        json_write_embedding(&mut line, &row.embedding);
+        line.push('}');
+        writeln!(w, "{line}").expect("write line");
+    }
+    w.flush().expect("flush");
+    eprintln!("done: exported {} rows to {out_path}", rows.len());
+}
+
+/// `seed` と同じ文生成器を別シード（`queries` 専用の固定シード）で駆動し、決定的な
+/// 検索クエリ n 件を生成して `HashingEmbedder` で埋め込み、JSON Lines へ書き出す。
+/// `seed` の文書生成（本文の合成）とは独立した rng ストリームを使うため、生成される
+/// クエリ集合は `<rows>` に依存せず再現可能。
+fn run_queries(dim: u32, n: u64, out_path: &str) {
+    let embedder = HashingEmbedder::new(dim).expect("embedder");
+    let mut rng = Lcg(20260905);
+    let file = File::create(out_path).expect("create out file");
+    let mut w = BufWriter::new(file);
+    for _ in 0..n {
+        let (topic, en, ja) = rng.pick(TOPICS);
+        let is_ja = rng.next().is_multiple_of(3);
+        let text = if is_ja {
+            let a = rng.pick(ja);
+            let b = rng.pick(ja);
+            render(rng.pick(JA_TPL), topic, a, b)
+        } else {
+            let a = rng.pick(en);
+            let b = rng.pick(en);
+            render(rng.pick(EN_TPL), topic, a, b)
+        };
+        let lang = if is_ja { "ja" } else { "en" };
+        let embedding = embedder.embed_batch(&[text.as_str()]).expect("embed");
+        let mut line = String::new();
+        line.push('{');
+        line.push_str("\"text\":");
+        json_write_escaped_string(&mut line, &text);
+        line.push_str(",\"lang\":");
+        json_write_escaped_string(&mut line, lang);
+        line.push_str(",\"topic\":");
+        json_write_escaped_string(&mut line, topic);
+        line.push_str(",\"embedding\":");
+        json_write_embedding(&mut line, &embedding[0]);
+        line.push('}');
+        writeln!(w, "{line}").expect("write line");
+    }
+    w.flush().expect("flush");
+    eprintln!("done: wrote {n} queries to {out_path}");
 }
 
 fn main() {
@@ -346,11 +521,14 @@ fn main() {
                 // `id <= rows` のため `rows - id` は非負で、`end <= rows` が保証される
                 // （`id + batch - 1` の直接加算は `rows` が `u64::MAX` 付近でオーバーフローする）。
                 let end = id + (batch - 1).min(rows - id);
-                // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）
-                let (ctx, tenant_tag) = if batch_no % 10 == 9 {
-                    (&ctx_b, "b")
+                // 1 バッチ内はテナントを固定（末尾 1 桁バッチを tenant-b へ）。
+                // tenant-a は Public、tenant-b は Private で投入し、RLS 相当の
+                // テナント境界を他 DB と比較できるようにする（モジュール冒頭コメント
+                // 参照。wire 経由では Private 行は所有テナントにも見えない）。
+                let (ctx, tenant_tag, visibility) = if batch_no % 10 == 9 {
+                    (&ctx_b, "b", Visibility::Private)
                 } else {
-                    (&ctx_a, "a")
+                    (&ctx_a, "a", Visibility::Public)
                 };
                 let mut bodies = Vec::new();
                 let mut metas: Vec<(u64, String, String)> = Vec::new();
@@ -402,7 +580,7 @@ fn main() {
                             *i,
                             RowInput {
                                 tenant_id: ctx.tenant_id(),
-                                visibility: Visibility::Public,
+                                visibility,
                                 embedding: emb,
                                 metadata: meta,
                             },
@@ -446,6 +624,21 @@ fn main() {
                 "done: {rows} rows (tenant-a {rows_a}, tenant-b {rows_b}), dim {dim}, {:.1}s",
                 start.elapsed().as_secs_f64()
             );
+        }
+        Some("export") => {
+            let (Some(db), Some(out_path)) = (args.get(2), args.get(3)) else {
+                usage()
+            };
+            run_export(db, out_path);
+        }
+        Some("queries") => {
+            let (Some(dim), Some(n), Some(out_path)) = (args.get(2), args.get(3), args.get(4))
+            else {
+                usage()
+            };
+            let dim: u32 = dim.parse().expect("dim");
+            let n: u64 = n.parse().expect("n");
+            run_queries(dim, n, out_path);
         }
         _ => usage(),
     }
