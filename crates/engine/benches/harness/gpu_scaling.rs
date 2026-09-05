@@ -316,7 +316,13 @@ pub fn count_boundary_tolerant_mismatches(
     // 採る。
     //
     // `candidate` が `baseline` より長い場合の超過件数。境界同点の水増しは
-    // `extra`（スコアが境界未満）では捕捉できないため独立に加算する。
-    let excess = candidate.len().saturating_sub(baseline.len());
+    // `extra`（スコアが境界未満）でも `duplicates` でも捕捉できないため独立に
+    // 加算するが、超過分のうち既に `extra`・`duplicates` として数えた件数は
+    // 差し引く（Bugbot 指摘: 境界未満の余分な 1 件が `extra` と `excess` で
+    // 二重計上されていた）。
+    let excess = candidate
+        .len()
+        .saturating_sub(baseline.len())
+        .saturating_sub(extra + duplicates);
     extra + duplicates + missing.max(dropped_above_boundary) + excess
 }

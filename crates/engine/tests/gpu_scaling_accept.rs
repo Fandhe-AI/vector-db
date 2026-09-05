@@ -182,6 +182,21 @@ fn mismatches_count_baseline_ids_above_boundary_missing_from_candidate() {
 }
 
 #[test]
+fn mismatches_do_not_double_count_extras_or_duplicates_within_excess() {
+    let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
+    // 境界未満の余分な 1 件（`extra`）で候補が長くなった場合、超過分として
+    // 二重に数えない（Bugbot 指摘）。
+    let candidate = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0), (9, 0.5)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+    // 重複で候補が長くなった場合も同様に 1 件のみ。
+    let candidate = vec![(1u64, 3.0f32), (1, 3.0), (2, 2.0), (3, 1.0)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 1);
+    // 境界同点の水増し 1 件＋境界未満の余分 1 件は合計 2 件。
+    let candidate = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0), (4, 1.0), (9, 0.5)];
+    assert_eq!(count_boundary_tolerant_mismatches(&baseline, &candidate), 2);
+}
+
+#[test]
 fn mismatches_count_duplicate_ids_in_candidate() {
     let baseline = vec![(1u64, 3.0f32), (2, 2.0), (3, 1.0)];
     // 長さは一致するが id=1 が重複しており id=3 が欠けている → 重複 1 件。
