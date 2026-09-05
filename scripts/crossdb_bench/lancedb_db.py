@@ -14,10 +14,18 @@ RLS 相当は、自作 DB の現行契約（実機確認: どのテナントの 
 「to_pandas/DuckDB 相当があれば試し」に対応。venv に pandas が無いため
 pyarrow の `to_arrow()` を使う）。ネイティブ hybrid（FTS + ベクトル、既定
 reranker は RRF）を使う。
+
+ストレージは self_db.py・sqlite_vec_db.py と同様に `--workdir` 配下の実行ごと
+一意な一時ディレクトリへ隔離し、終了時（正常・異常いずれも）に削除する
+（固定パス `<workdir>/lancedb` だと再実行時に既存 `docs` テーブルを無条件削除
+してしまうため。codex-review P1）。
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
 import time
 
 import lancedb
@@ -40,8 +48,8 @@ def _is_unsupported_feature_error(e: Exception) -> bool:
     return "not supported" in msg or "not implemented" in msg or "unsupported" in msg
 
 
-def _connect(workdir: str) -> lancedb.DBConnection:
-    return lancedb.connect(f"{workdir}/lancedb")
+def _connect(storage_dir: str) -> lancedb.DBConnection:
+    return lancedb.connect(storage_dir)
 
 
 def _setup_table(db: lancedb.DBConnection, docs: list[dict]):
@@ -106,7 +114,21 @@ def _ingest_single_stmt(tbl, dim: int, n_rows: int = 1000) -> dict:
 
 
 def run(args, docs: list[dict], queries: list[dict]) -> dict:
-    db = _connect(args.workdir)
+    # 他 DB（self・sqlite_vec）と同じく、`--workdir` 配下の実行ごとに一意な
+    # 作業ディレクトリへ隔離する（codex-review P1）。固定パス `<workdir>/lancedb`
+    # だと再実行時に既存の `docs` テーブルを無条件削除してしまうため。
+    # 終了時（正常・異常いずれも）に自分が作成した領域だけを削除する。
+    workdir = getattr(args, "workdir", None) or tempfile.gettempdir()
+    os.makedirs(workdir, exist_ok=True)
+    storage_dir = tempfile.mkdtemp(prefix=f"lancedb_bench_{os.getpid()}_", dir=workdir)
+    try:
+        return _run_with_storage(storage_dir, args, docs, queries)
+    finally:
+        shutil.rmtree(storage_dir, ignore_errors=True)
+
+
+def _run_with_storage(storage_dir: str, args, docs: list[dict], queries: list[dict]) -> dict:
+    db = _connect(storage_dir)
     dim = len(docs[0]["embedding"]) if docs else 128
     phases: dict = {}
     tbl, ingest_stat = _ingest_bulk(db, docs)
@@ -345,6 +367,7 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
             "index": "IVF_HNSW_FLAT(m=16,ef_construction=100,ef=64)"
             if args.config == "hnsw"
             else "exact (no vector index)",
+            "storage": "per-run temp dir under --workdir (removed on exit)",
         },
     )
     return {"meta": meta, "phases": phases}

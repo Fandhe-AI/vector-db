@@ -66,8 +66,13 @@ spec の受け入れ基準（閾値）は本ドキュメントでは扱わない
   `MATCH` に自然文をそのまま渡すと構文エラーになるため、各語を二重引用符で囲んだ語句
   クエリへ変換している。
 - **Recall@10**: 合成 embedding は内積の同点が多いため、主指標 `recall_at_10` は
-  「真スコアが 10 位のスコア以上の全文書」を正解集合とする同点許容版
-  （`TIE_EPSILON = 1e-4`）。厳密一致版は `recall_at_10_strict` として併記する。
+  同点許容版（`TIE_EPSILON = 1e-4`）。正解集合を境界より厳密に上位の集合
+  `strict_above`（スコア > 境界スコア + ε）と境界での同点集合 `tie_boundary`
+  （|スコア − 境界スコア| ≤ ε）に分け、分子を
+  `|hits ∩ strict_above| + min(|hits ∩ tie_boundary|, k − |strict_above|)`、
+  分母を `min(k, 可視件数)` とする（`tie_boundary` からの充当を残り枠で頭打ち
+  にし、`strict_above` の欠落を `tie_boundary` の過剰一致で埋め合わせない。
+  codex-review 指摘対応）。厳密一致版は `recall_at_10_strict` として併記する。
 
 ## 横断ベンチ実測（25,000 行・dim 128・k=10）
 

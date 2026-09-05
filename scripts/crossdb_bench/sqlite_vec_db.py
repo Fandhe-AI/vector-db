@@ -19,6 +19,12 @@ WHERE 句に使える。
 として保持する）。
 
 exact のみ（vec0 は他 ANN 索引構成を持たない。`--config` は無視して exact 固定）。
+
+FTS5 拡張が同梱されていないビルドの SQLite では `docs_fts` の作成自体が
+`no such module: fts5` で失敗する。この場合はスキーマ作成時点で検出し
+（`_setup_schema` の戻り値 `fts5_available`）、FTS テーブルの作成・投入を
+省略したうえで hybrid 系フェーズ（`hybrid_rrf`・`bulk_hybrid_k200`）だけを
+unsupported として記録する。他フェーズは通常どおり計測する（codex-review P2）。
 """
 
 from __future__ import annotations
@@ -73,7 +79,15 @@ def _is_unsupported_fts5_error(e: sqlite3.Error) -> bool:
     return any(marker in msg for marker in unsupported_markers)
 
 
-def _setup_schema(conn: sqlite3.Connection, dim: int) -> None:
+def _setup_schema(conn: sqlite3.Connection, dim: int) -> bool:
+    """スキーマを作成し、FTS5 が使えたかどうかを返す。
+
+    リンクされた SQLite に FTS5 拡張が同梱されていない環境では
+    `CREATE VIRTUAL TABLE ... USING fts5(...)` 自体が `no such module: fts5`
+    で失敗する。この失敗をここで検出できないと計測全体が例外で終了する
+    （`_is_unsupported_fts5_error` は従来 hybrid フェーズでしか呼ばれておらず
+    到達不能だった。codex-review P2）ため、スキーマ作成時に検出し、未搭載
+    なら FTS テーブルの作成・投入を省略して呼び出し元へ知らせる。"""
     cur = conn.cursor()
     cur.execute(
         "CREATE TABLE docs (id INTEGER PRIMARY KEY, tenant TEXT, visibility TEXT, "
@@ -84,11 +98,18 @@ def _setup_schema(conn: sqlite3.Connection, dim: int) -> None:
         f"embedding float[{dim}] distance_metric=cosine, "
         f"visibility TEXT partition key, tenant TEXT, lang TEXT, topic TEXT)"
     )
-    cur.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(body, content='docs', content_rowid='id')")
+    fts5_available = True
+    try:
+        cur.execute("CREATE VIRTUAL TABLE docs_fts USING fts5(body, content='docs', content_rowid='id')")
+    except sqlite3.OperationalError as e:
+        if not _is_unsupported_fts5_error(e):
+            raise
+        fts5_available = False
     conn.commit()
+    return fts5_available
 
 
-def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict]) -> dict:
+def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict], fts5_available: bool) -> dict:
     t0 = time.perf_counter()
     cur = conn.cursor()
     cur.executemany(
@@ -114,10 +135,11 @@ def _ingest_bulk(conn: sqlite3.Connection, docs: list[dict]) -> dict:
             for d in docs
         ],
     )
-    cur.executemany(
-        "INSERT INTO docs_fts (rowid, body) VALUES (?, ?)",
-        [(d["id"], d["body"]) for d in docs],
-    )
+    if fts5_available:
+        cur.executemany(
+            "INSERT INTO docs_fts (rowid, body) VALUES (?, ?)",
+            [(d["id"], d["body"]) for d in docs],
+        )
     conn.commit()
     t1 = time.perf_counter()
     elapsed = t1 - t0
@@ -183,9 +205,9 @@ def run(args, docs: list[dict], queries: list[dict]) -> dict:
 def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
     conn = _connect(db_path)
     dim = len(docs[0]["embedding"]) if docs else 128
-    _setup_schema(conn, dim)
+    fts5_available = _setup_schema(conn, dim)
     phases: dict = {}
-    phases["ingest_bulk"] = _ingest_bulk(conn, docs)
+    phases["ingest_bulk"] = _ingest_bulk(conn, docs, fts5_available)
 
     def knn(qv):
         cur = conn.cursor()
@@ -282,13 +304,19 @@ def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
         return [rid for rid, _ in top]
 
     idxs = list(range(len(query_vecs)))
-    try:
-        stats, _ = measure(hybrid, idxs)
-        phases["hybrid_rrf"] = stats
-    except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
-        if not _is_unsupported_fts5_error(e):
-            raise
-        phases["hybrid_rrf"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
+    if not fts5_available:
+        # スキーマ作成時点で FTS5 未搭載と判明済み（`docs_fts` 自体が存在しない）
+        # ため hybrid フェーズだけを unsupported にし、他フェーズは通常どおり
+        # 計測する（codex-review P2）。
+        phases["hybrid_rrf"] = unsupported("FTS5 module not available (no such module: fts5)")
+    else:
+        try:
+            stats, _ = measure(hybrid, idxs)
+            phases["hybrid_rrf"] = stats
+        except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
+            if not _is_unsupported_fts5_error(e):
+                raise
+            phases["hybrid_rrf"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
     # --- 広域取得（bulk fetch）: id と body を Top-N でまとめて返す ---
     # LLM のコンテキストへ丸ごと渡す想定のため本文（body）の送出コストを含める。
@@ -351,18 +379,21 @@ def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
         body_by_id = {r[0]: r[1] for r in cur.fetchall()}
         return [(rid, body_by_id.get(rid)) for rid in top]
 
-    try:
-        stats, last = measure(bulk_hybrid, idxs)
-        phases["bulk_hybrid_k200"] = {
-            **stats,
-            "k": 200,
-            "rows_returned": len(last),
-            "candidate_pool": bulk_hybrid_pool,
-        }
-    except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
-        if not _is_unsupported_fts5_error(e):
-            raise
-        phases["bulk_hybrid_k200"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
+    if not fts5_available:
+        phases["bulk_hybrid_k200"] = unsupported("FTS5 module not available (no such module: fts5)")
+    else:
+        try:
+            stats, last = measure(bulk_hybrid, idxs)
+            phases["bulk_hybrid_k200"] = {
+                **stats,
+                "k": 200,
+                "rows_returned": len(last),
+                "candidate_pool": bulk_hybrid_pool,
+            }
+        except sqlite3.Error as e:  # 機能未対応のみ捕捉し、それ以外は再送出する
+            if not _is_unsupported_fts5_error(e):
+                raise
+            phases["bulk_hybrid_k200"] = unsupported(f"hybrid (FTS5 MATCH) failed: {e!r}")
 
     def scan_nosort(_):
         cur = conn.cursor()
@@ -433,6 +464,7 @@ def _run_with_db(db_path: str, docs: list[dict], queries: list[dict]) -> dict:
             "storage": "file",
             "journal_mode": journal_mode,
             "synchronous": synchronous,
+            "fts5_available": fts5_available,
         },
     )
     conn.close()

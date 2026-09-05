@@ -94,16 +94,16 @@ def main() -> int:
     knn_phase = phases.get("vector_knn", {})
     ids_per_query = knn_phase.get("ids_per_query") if isinstance(knn_phase, dict) else None
     if ids_per_query and os.path.exists(docs_file):
-        strict_top_k, tie_sets = build_ground_truth(docs_file, queries, k=10)
+        strict_top_k, tie_boundaries = build_ground_truth(docs_file, queries, k=10)
         recall_strict = recall_at_k(ids_per_query, strict_top_k)
-        recall_tie = recall_at_k_tie_tolerant(ids_per_query, tie_sets, k=10)
+        recall_tie = recall_at_k_tie_tolerant(ids_per_query, tie_boundaries, k=10)
         # recall_at_10 は同点許容版を主指標とする（同点境界の順序差で exact
         # 構成でも 1.0 にならない問題を解消するため）。従来の厳密一致値は
         # recall_at_10_strict として併記する。
         phases["recall_at_10"] = {
             "recall_at_10": recall_tie,
             "recall_at_10_strict": recall_strict,
-            "queries": len(tie_sets),
+            "queries": len(tie_boundaries),
         }
     else:
         phases["recall_at_10"] = {
