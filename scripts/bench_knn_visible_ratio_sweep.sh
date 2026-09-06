@@ -4,10 +4,13 @@
 #
 # `crates/engine/benches/knn_profile_bench.rs` の可視比率スイープ opt-in
 # （`BENCH_KNN_PROFILE_VISIBLE_RATIO`／`BENCH_KNN_PROFILE_FULL_SCAN_RATIO`／
-# `BENCH_KNN_PROFILE_SCALE`）を、scale × ratio × arm × pair の全組み合わせで
-# 交互実行し、各 run の stdout を個別ログへ保存する（計測規約
-# `docs/design/benchmark-judgement-policy.md` §3〜§5 の「交互 N≥5 ペア・
-# per-run 生データ必須」に従う）。集計・表への転記は本スクリプトの責務外
+# `BENCH_KNN_PROFILE_SCALE`）を、scale × ratio の各組み合わせについて
+# pair を外側・candidate を内側のループとして交互実行し、各 run の stdout を
+# 個別ログへ保存する（計測規約 `docs/design/benchmark-judgement-policy.md`
+# §3〜§5 の「交互 N≥5 ペア・per-run 生データ必須」に従う。ペアごとに
+# baseline→cand1→baseline→cand2→baseline→cand3 の輪番を繰り返す構造にし、
+# 特定の candidate だけを先に SWEEP_PAIRS 回連続実行してしまう時間方向の
+# 交絡を避ける）。集計・表への転記は本スクリプトの責務外
 # （実装者・運用者が `--summarize` で生成した一覧、または各ログを直接読んで行う）。
 #
 # 使い方: scripts/bench_knn_visible_ratio_sweep.sh [--summarize <dir>]
@@ -105,8 +108,13 @@ run_one() {
 cd "${REPO_ROOT}"
 for scale in "${SCALES[@]}"; do
   for ratio in "${RATIOS[@]}"; do
-    for candidate in "${CANDIDATES[@]}"; do
-      for pair in $(seq 1 "${SWEEP_PAIRS}"); do
+    # pair を外側、candidate を内側にする（計測規約 §3 の輪番
+    # baseline→cand1→baseline→cand2→baseline→cand3 をペアごとに繰り返す。
+    # candidate を外側にすると (baseline→候補1) を SWEEP_PAIRS 回連続
+    # 実行してから候補2 に進む形になり、輪番にならず時間方向の交絡が
+    # 生じる〔codex-review P1 指摘〕）。
+    for pair in $(seq 1 "${SWEEP_PAIRS}"); do
+      for candidate in "${CANDIDATES[@]}"; do
         echo "run: scale=${scale} ratio=${ratio} arm=baseline(for ${candidate}) pair=${pair}"
         run_one "${scale}" "${ratio}" "baseline" "baseline_for_${candidate}" "${pair}"
         echo "run: scale=${scale} ratio=${ratio} arm=${candidate} pair=${pair}"

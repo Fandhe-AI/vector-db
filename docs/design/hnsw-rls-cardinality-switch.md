@@ -344,8 +344,10 @@ current_generation` による事前・事後の失効照合とは独立した読
   baseline→hnsw_default→baseline→hnsw_force_ann→baseline→hnsw_force_plain。
   `docs/design/benchmark-judgement-policy.md` §3 の「3 候補以上の場合は
   baseline→cand1→baseline→cand2→…」に対応。`scripts/
-  bench_knn_visible_ratio_sweep.sh` が scale×ratio×candidate×pair の全組み
-  合わせでこの輪番を実行する）
+  bench_knn_visible_ratio_sweep.sh` は scale×ratio の組み合わせごとに
+  pair を外側・candidate を内側のループとし、ペアごとにこの輪番を
+  繰り返す〔特定の candidate だけを SWEEP_PAIRS 回連続実行してしまう
+  時間方向の交絡を避けるため〕）
 - **warm 手順**: `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE）は自身では
   索引を構築しない（`sql::hnsw_cache::prepare_subset`。既存の索引が
   `Ready`／`NeedOverlay` であればその base を再利用し per-query オーバーレイを
@@ -384,26 +386,30 @@ current_generation` による事前・事後の失効照合とは独立した読
 ### 実測結果
 
 各表は `S0_hot_where_subset`（対象。WHERE 述語付き DISTANCE クエリ）の
-min/median/max（単位 ms）・`ratio(median) = candidate median / baseline
-median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
-固定 ±5% 相対帯、および同一セッションの参照区間〔`S0_hot_sql_e2e`。
-フィルタなしクエリ〕の run-to-run 全幅 `(max-min)/min`。半幅ではなく
-規定どおり全幅を使う）・観測 arm（`sql::hnsw_cache::HnswIndexCacheStats`
-の Subset 系カウンタから分類）を示す。「判定」列は
-`|ratio(median) - 1.0|` が固定 ±5% 帯・参照区間の実測帯（baseline／candidate
-双方のうち大きい方）の**両方**を超えるかどうか。per-run 生データ（N=5 ペア
-それぞれの `S0_hot_where_subset` 中央値。単位 ms）は各表直下の折りたたみに
-記録する。
+min/median/max（単位 ms）・`ratio(min) = candidate min / baseline min`・
+`ratio(median) = candidate median / baseline median`・両ノイズ帯
+（`docs/design/benchmark-judgement-policy.md` §4: 固定 ±5% 相対帯、および
+同一セッションの参照区間〔`S0_hot_sql_e2e`。フィルタなしクエリ〕の
+run-to-run 全幅 `(max-min)/min`。半幅ではなく規定どおり全幅を使う）・
+観測 arm（`sql::hnsw_cache::HnswIndexCacheStats` の Subset 系カウンタから
+分類）を示す。**主統計量は `ratio(min)` とし `ratio(median)` は交差確認
+として併記する**（`docs/design/benchmark-judgement-policy.md` §3「レイテンシ・
+所要時間系の主統計量は min-of-N〔環境ノイズは加算方向のみという前提〕とし、
+median を交差確認として併記する」に従う）。「判定」列は `|ratio(min) - 1.0|`
+が固定 ±5% 帯・参照区間の実測帯（baseline／candidate 双方のうち大きい方）の
+**両方**を超えるかどうか（min を主統計量とした判定。median は交差確認
+専用であり判定には用いない）。per-run 生データ（N=5 ペアそれぞれの
+`S0_hot_where_subset` 中央値。単位 ms）は各表直下の折りたたみに記録する。
 
 #### scale=1（25,000 行）・candidate=`hnsw_default`
 
-| ratio | baseline min/median/max（ms） | `hnsw_default` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_default 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 2.023 / 2.158 / 2.285 | 5.319 / 6.278 / 7.212 | 2.91x | 54.7% | 4.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/4 | 1.205 / 1.43 / 3.084 | 3.207 / 3.978 / 8.107 | 2.78x | 106.9% | 40.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/10 | 0.887 / 0.953 / 1.483 | 1.489 / 1.514 / 1.571 | 1.59x | 6.9% | 3.1% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/20 | 0.652 / 0.661 / 0.686 | 0.822 / 0.843 / 0.898 | 1.28x | 23.8% | 3.8% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/50 | 0.536 / 0.549 / 0.554 | 0.615 / 0.617 / 0.636 | 1.12x | 43.5% | 2.6% | ノイズ帯内 | `plain_scan_ratio` |
+| ratio | baseline min/median/max（ms） | `hnsw_default` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_default 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 2.023 / 2.158 / 2.285 | 5.319 / 6.278 / 7.212 | 2.63x | 2.91x | 54.7% | 4.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/4 | 1.205 / 1.43 / 3.084 | 3.207 / 3.978 / 8.107 | 2.66x | 2.78x | 106.9% | 40.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/10 | 0.887 / 0.953 / 1.483 | 1.489 / 1.514 / 1.571 | 1.68x | 1.59x | 6.9% | 3.1% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/20 | 0.652 / 0.661 / 0.686 | 0.822 / 0.843 / 0.898 | 1.26x | 1.28x | 23.8% | 3.8% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| 1/50 | 0.536 / 0.549 / 0.554 | 0.615 / 0.617 / 0.636 | 1.15x | 1.12x | 43.5% | 2.6% | ノイズ帯内 | `plain_scan_ratio` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -417,13 +423,13 @@ median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
 
 #### scale=1（25,000 行）・candidate=`hnsw_force_ann`
 
-| ratio | baseline min/median/max（ms） | `hnsw_force_ann` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_ann 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 1.909 / 2.196 / 3.825 | 4.863 / 8.374 / 26.034 | 3.81x | 433.1% | 81.0% | ノイズ帯内 | `plain_scan_mask_split` |
-| 1/4 | 1.328 / 1.519 / 1.739 | 3.604 / 4.595 / 39.415 | 3.03x | 338.9% | 85.3% | ノイズ帯内 | `plain_scan_mask_split` |
-| 1/10 | 0.943 / 2.926 / 3.644 | 5.889 / 6.001 / 8.083 | 2.05x | 533.9% | 74.9% | ノイズ帯内 | `plain_scan_mask_split` |
-| 1/20 | 0.654 / 0.654 / 0.674 | 0.815 / 0.818 / 0.856 | 1.25x | 7.4% | 2.4% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/50 | 0.536 / 0.545 / 0.585 | 0.617 / 0.62 / 0.656 | 1.14x | 518.9% | 78.1% | ノイズ帯内 | `plain_scan_mask_split` |
+| ratio | baseline min/median/max（ms） | `hnsw_force_ann` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_ann 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 1.909 / 2.196 / 3.825 | 4.863 / 8.374 / 26.034 | 2.55x | 3.81x | 433.1% | 81.0% | ノイズ帯内 | `plain_scan_mask_split` |
+| 1/4 | 1.328 / 1.519 / 1.739 | 3.604 / 4.595 / 39.415 | 2.71x | 3.03x | 338.9% | 85.3% | ノイズ帯内 | `plain_scan_mask_split` |
+| 1/10 | 0.943 / 2.926 / 3.644 | 5.889 / 6.001 / 8.083 | 6.25x | 2.05x | 533.9% | 74.9% | ノイズ帯内 | `plain_scan_mask_split` |
+| 1/20 | 0.654 / 0.654 / 0.674 | 0.815 / 0.818 / 0.856 | 1.25x | 1.25x | 7.4% | 2.4% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/50 | 0.536 / 0.545 / 0.585 | 0.617 / 0.62 / 0.656 | 1.15x | 1.14x | 518.9% | 78.1% | ノイズ帯内 | `plain_scan_mask_split` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -437,13 +443,13 @@ median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
 
 #### scale=1（25,000 行）・candidate=`hnsw_force_plain`
 
-| ratio | baseline min/median/max（ms） | `hnsw_force_plain` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_plain 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 1.996 / 2.532 / 11.993 | 6.243 / 8.007 / 10.456 | 3.16x | 616.7% | 81.1% | ノイズ帯内 | `plain_scan_ratio` |
-| 1/4 | 1.17 / 1.19 / 8.422 | 3.056 / 3.135 / 4.478 | 2.63x | 674.5% | 2.5% | ノイズ帯内 | `plain_scan_ratio` |
-| 1/10 | 2 / 2.999 / 4.996 | 1.872 / 6.589 / 8.278 | 2.20x | 73.6% | 99.1% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/20 | 0.651 / 0.669 / 0.782 | 0.823 / 0.831 / 1.149 | 1.24x | 669.1% | 77.7% | ノイズ帯内 | `plain_scan_ratio` |
-| 1/50 | 0.534 / 0.538 / 0.548 | 0.615 / 0.615 / 0.636 | 1.14x | 30.7% | 3.8% | ノイズ帯内 | `plain_scan_ratio` |
+| ratio | baseline min/median/max（ms） | `hnsw_force_plain` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_plain 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 1.996 / 2.532 / 11.993 | 6.243 / 8.007 / 10.456 | 3.13x | 3.16x | 616.7% | 81.1% | ノイズ帯内 | `plain_scan_ratio` |
+| 1/4 | 1.17 / 1.19 / 8.422 | 3.056 / 3.135 / 4.478 | 2.61x | 2.63x | 674.5% | 2.5% | ノイズ帯内 | `plain_scan_ratio` |
+| 1/10 | 2 / 2.999 / 4.996 | 1.872 / 6.589 / 8.278 | 0.94x | 2.20x | 73.6% | 99.1% | ノイズ帯内 | `plain_scan_ratio` |
+| 1/20 | 0.651 / 0.669 / 0.782 | 0.823 / 0.831 / 1.149 | 1.26x | 1.24x | 669.1% | 77.7% | ノイズ帯内 | `plain_scan_ratio` |
+| 1/50 | 0.534 / 0.538 / 0.548 | 0.615 / 0.615 / 0.636 | 1.15x | 1.14x | 30.7% | 3.8% | ノイズ帯内 | `plain_scan_ratio` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -457,13 +463,13 @@ median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
 
 #### scale=4（100,000 行）・candidate=`hnsw_default`
 
-| ratio | baseline min/median/max（ms） | `hnsw_default` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_default 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 18.108 / 18.321 / 19.35 | 36.046 / 37.779 / 41.313 | 2.06x | 4.5% | 0.4% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/4 | 5.954 / 6.086 / 11.577 | 17.578 / 17.604 / 21.212 | 2.89x | 91.4% | 48.9% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/10 | 3.839 / 3.877 / 4.428 | 9.028 / 9.353 / 9.772 | 2.41x | 9.5% | 2.1% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/20 | 2.782 / 2.788 / 3.661 | 4.262 / 4.269 / 4.707 | 1.53x | 21.6% | 0.7% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/50 | 2.054 / 2.067 / 2.12 | 2.479 / 2.485 / 2.538 | 1.20x | 5.4% | 1.0% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| ratio | baseline min/median/max（ms） | `hnsw_default` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_default 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 18.108 / 18.321 / 19.35 | 36.046 / 37.779 / 41.313 | 1.99x | 2.06x | 4.5% | 0.4% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/4 | 5.954 / 6.086 / 11.577 | 17.578 / 17.604 / 21.212 | 2.95x | 2.89x | 91.4% | 48.9% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/10 | 3.839 / 3.877 / 4.428 | 9.028 / 9.353 / 9.772 | 2.35x | 2.41x | 9.5% | 2.1% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/20 | 2.782 / 2.788 / 3.661 | 4.262 / 4.269 / 4.707 | 1.53x | 1.53x | 21.6% | 0.7% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| 1/50 | 2.054 / 2.067 / 2.12 | 2.479 / 2.485 / 2.538 | 1.21x | 1.20x | 5.4% | 1.0% | 両ノイズ帯を超過 | `plain_scan_ratio` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -477,13 +483,13 @@ median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
 
 #### scale=4（100,000 行）・candidate=`hnsw_force_ann`
 
-| ratio | baseline min/median/max（ms） | `hnsw_force_ann` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_ann 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 17.563 / 18.557 / 19.435 | 35.778 / 37.987 / 40.134 | 2.05x | 9.6% | 10.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/4 | 5.921 / 5.939 / 6.071 | 17.602 / 17.691 / 17.89 | 2.98x | 8.3% | 0.9% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/10 | 3.82 / 3.887 / 4.467 | 9.238 / 9.287 / 10.047 | 2.39x | 6.2% | 5.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/20 | 2.747 / 2.79 / 2.821 | 4.211 / 4.298 / 5.008 | 1.54x | 4.1% | 1.6% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
-| 1/50 | 2.056 / 2.076 / 2.169 | 2.484 / 2.503 / 2.543 | 1.21x | 11.6% | 0.8% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| ratio | baseline min/median/max（ms） | `hnsw_force_ann` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_ann 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 17.563 / 18.557 / 19.435 | 35.778 / 37.987 / 40.134 | 2.04x | 2.05x | 9.6% | 10.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/4 | 5.921 / 5.939 / 6.071 | 17.602 / 17.691 / 17.89 | 2.97x | 2.98x | 8.3% | 0.9% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/10 | 3.82 / 3.887 / 4.467 | 9.238 / 9.287 / 10.047 | 2.42x | 2.39x | 6.2% | 5.2% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/20 | 2.747 / 2.79 / 2.821 | 4.211 / 4.298 / 5.008 | 1.53x | 1.54x | 4.1% | 1.6% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
+| 1/50 | 2.056 / 2.076 / 2.169 | 2.484 / 2.503 / 2.543 | 1.21x | 1.21x | 11.6% | 0.8% | 両ノイズ帯を超過 | `plain_scan_mask_split` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -497,13 +503,13 @@ median`・両ノイズ帯（`docs/design/benchmark-judgement-policy.md` §4:
 
 #### scale=4（100,000 行）・candidate=`hnsw_force_plain`
 
-| ratio | baseline min/median/max（ms） | `hnsw_force_plain` min/median/max（ms） | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_plain 参照区間帯（全幅） | 判定 | 観測 arm |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1/2 | 17.419 / 33.832 / 41.623 | 35.622 / 39.695 / 77.459 | 1.17x | 188.7% | 90.4% | ノイズ帯内 | `plain_scan_ratio` |
-| 1/4 | 5.897 / 5.925 / 6.035 | 17.396 / 17.647 / 20.51 | 2.98x | 30.8% | 4.5% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/10 | 3.832 / 4.393 / 4.925 | 9.02 / 10.021 / 10.985 | 2.28x | 16.6% | 5.5% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/20 | 2.75 / 2.773 / 2.87 | 4.112 / 4.143 / 4.704 | 1.49x | 8.3% | 1.3% | 両ノイズ帯を超過 | `plain_scan_ratio` |
-| 1/50 | 2.055 / 2.076 / 2.936 | 2.506 / 2.509 / 2.74 | 1.21x | 145.6% | 2.0% | ノイズ帯内 | `plain_scan_ratio` |
+| ratio | baseline min/median/max（ms） | `hnsw_force_plain` min/median/max（ms） | ratio(min) | ratio(median) | baseline 参照区間帯（全幅） | hnsw_force_plain 参照区間帯（全幅） | 判定 | 観測 arm |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/2 | 17.419 / 33.832 / 41.623 | 35.622 / 39.695 / 77.459 | 2.05x | 1.17x | 188.7% | 90.4% | ノイズ帯内 | `plain_scan_ratio` |
+| 1/4 | 5.897 / 5.925 / 6.035 | 17.396 / 17.647 / 20.51 | 2.95x | 2.98x | 30.8% | 4.5% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| 1/10 | 3.832 / 4.393 / 4.925 | 9.02 / 10.021 / 10.985 | 2.35x | 2.28x | 16.6% | 5.5% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| 1/20 | 2.75 / 2.773 / 2.87 | 4.112 / 4.143 / 4.704 | 1.50x | 1.49x | 8.3% | 1.3% | 両ノイズ帯を超過 | `plain_scan_ratio` |
+| 1/50 | 2.055 / 2.076 / 2.936 | 2.506 / 2.509 / 2.74 | 1.22x | 1.21x | 145.6% | 2.0% | ノイズ帯内 | `plain_scan_ratio` |
 
 <details><summary>per-run 生データ（N=5 ペア・単位 ms。`S0_hot_where_subset` の中央値）</summary>
 
@@ -548,10 +554,20 @@ HNSW の一般的な性質（グラフの疎な領域を均等マスクで間引
 
 `mask_splits_graph` 経路が発火している間、`hnsw_default` は一貫して
 baseline（`brute_force`）より遅い（`Overlay::compute`・分断検査・plain
-scan への縮退分のオーバーヘッドが乗る。上表「ratio(median)」列: 1/2〜1/10
-で約 1.6〜2.9 倍、いずれも両ノイズ帯を超過）。`plain_scan_ratio`
+scan への縮退分のオーバーヘッドが乗る。上表の主統計量「ratio(min)」列:
+1/2〜1/10 で約 1.7〜3.0 倍、いずれも両ノイズ帯を超過）。`plain_scan_ratio`
 （1/20・1/50）でも `hnsw_default` は baseline と同程度かやや遅い
-（1.12〜1.53 倍。scale=1・1/50 のみノイズ帯内、他は両ノイズ帯を超過）。
+（1.15〜1.53 倍。scale=1・1/50 のみノイズ帯内、他は両ノイズ帯を超過）。
+`hnsw_force_plain`（scale=1・1/10）の 1 点のみ、主統計量 `ratio(min)`
+（0.94x）では固定 ±5% 帯を超過するものの参照区間の実測帯（99.1%）以内に
+収まり判定は「ノイズ帯内」——中央値ベースの `ratio(median)`（2.20x・
+両ノイズ帯を超過）とは逆の判定になる。参照区間の run-to-run 幅が非常に
+大きい（baseline 73.6%・candidate 99.1%）測定点であり、外れ値の影響を
+受けやすい中央値では見かけ上大きな退行に見えるが、min-of-N（環境ノイズは
+基本的に加算方向にしか働かないという前提）で見ると両ノイズ帯を超える
+差は確認できない、という中央値・最小値の判定の乖離の実例になっている
+（本表の判定はすべて主統計量 `ratio(min)` に従う。中央値ベースでの旧判定は
+上記の 1 点のみ異なり、他の全測定点は両統計量で判定が一致する）。
 いずれの観測 arm でも本フィクスチャでは ANN opt-in が SCALAR 事前フィルタ
 付き DISTANCE を高速化する場面は確認できなかった——これは Issue #413 の
 所見（`hnsw_subset` 経路は 37〜45% 悪化）と整合する。
@@ -560,9 +576,9 @@ scan への縮退分のオーバーヘッドが乗る。上表「ratio(median)�
 
 - 本開発環境（共有 QEMU）の実測は、計測プロトコル自体は
   `docs/design/benchmark-judgement-policy.md` §3〜§4 の必須事項（交互
-  N=5 ペア・輪番・per-run 生データ保持・両ノイズ帯併記〔全幅〕）を満たすが、
-  §5 の証拠力区分では引き続き **参考値**。`full_scan_ratio` 既定値（1/10）
-  の変更根拠にはしない
+  N=5 ペア・輪番・per-run 生データ保持・主統計量 min-of-N＋median 交差確認・
+  両ノイズ帯併記〔全幅〕）を満たすが、§5 の証拠力区分では引き続き
+  **参考値**。`full_scan_ratio` 既定値（1/10）の変更根拠にはしない
 - 本フィクスチャ（均等分散マスク・一様乱数ベクトル）では `ann_masked`
   観測 arm に一度も到達しなかったため、「損益分岐点」自体を本節の実測から
   結論づけることはできない。後続実測はクラスタ寄りの可視集合構成
