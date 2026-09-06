@@ -67,7 +67,8 @@ load/store する」経路のみ。
 ゼロ・依存追加ゼロで実装できる可能性がある。**ただしこの畳み込みは LLVM の
 最適化挙動であって言語仕様の保証ではない**。採用する場合は
 `scripts/check_sort_determinism.sh` と同型の生成コード検査ガード（対象命令の
-不在をアセンブリで検査）を CI に置くことを推奨する（既起票 #467）。
+不在をアセンブリで検査）を CI に置くことを推奨する（既起票 #467 → 実装済み。
+`scripts/check_simd_codegen.sh`・`docs/design/simd-codegen-guard.md` 参照）。
 
 ### 0.4 `std::simd`（portable SIMD）は stable では使えない
 
