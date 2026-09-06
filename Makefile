@@ -201,10 +201,14 @@ else
 endif
 
 .PHONY: simd-codegen-check
-simd-codegen-check: ## SIMD カーネル生成コード検査ガード（Issue #467・TASK-156/CORE-14 ポインタ。要素ごと挿入命令の不在＋広幅 FMA の存在。core-api-check/sort-determinism-check と異なり cargo の release ビルド〔専用 target dir〕を伴う。x86_64 host 限定）
+simd-codegen-check: ## SIMD カーネル生成コード検査ガード（Issue #467・TASK-156/CORE-14 ポインタ。要素ごと挿入命令の不在＋広幅 FMA の存在。core-api-check/sort-determinism-check と異なり cargo の release ビルド〔専用 target dir〕を伴う。x86_64 host 限定。他アーキ（aarch64 ローカル環境等）では `make ci` を壊さないようスキップする〔Cursor Bugbot 指摘〕）
 ifdef HAS_CARGO
+ifeq ($(shell uname -m),x86_64)
 	scripts/check_simd_codegen.sh --self-test
 	scripts/check_simd_codegen.sh
+else
+	@echo "skip: x86_64 以外のホスト（$(shell uname -m)）のため simd-codegen-check をスキップ"
+endif
 else
 	@echo "skip: Cargo.toml 未追加のため simd-codegen-check をスキップ"
 endif

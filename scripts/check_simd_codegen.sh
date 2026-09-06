@@ -108,11 +108,33 @@ check_asm_file() {
     # パイプが壊れて SIGPIPE（終了コード 141）を受け取り、`pipefail` ＋
     # `set -e` の下でスクリプト全体が異常終了してしまう（マーカー以降も
     # フラグで抑制するだけにして最後まで読み切ることで回避する）。
+    #
+    # `.Lfunc_end` が見つからず EOF まで到達した場合、awk は単に `stop` が
+    # 立たないまま最後まで出力するため、body が空になるとは限らない（別関数の
+    # 本体まで跨いで抽出してしまい、その中の広幅 FMA を誤って対象関数の
+    # ものとしてカウントする恐れがある。fail-closed 契約に反する）。
+    # そこでマーカーを実際に検出できたかどうかを END ブロックで明示的な
+    # 番兵行として出力し、body の中身とは独立に判定する。
+    local raw
+    raw="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | awk '
+      /^\.Lfunc_end[0-9]+:/ { stop = 1; found = 1 }
+      !stop { print }
+      END { if (found) print "__SIMD_CODEGEN_FUNC_END_FOUND__"; else print "__SIMD_CODEGEN_FUNC_END_MISSING__" }
+    ')"
+
+    local sentinel
+    sentinel="$(printf '%s\n' "${raw}" | tail -n1)"
     local body
-    body="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | awk '/^\.Lfunc_end[0-9]+:/{stop=1} !stop{print}')"
+    body="$(printf '%s\n' "${raw}" | sed '$d')"
+
+    if [ "${sentinel}" != "__SIMD_CODEGEN_FUNC_END_FOUND__" ]; then
+      echo "ERROR: kernel '${kernel}': .Lfunc_end marker not found before EOF (fail-closed: cannot bound function body; refusing to count instructions that may belong to a different function)" >&2
+      overall_status=1
+      continue
+    fi
 
     if [ -z "${body}" ]; then
-      echo "ERROR: could not extract function body for kernel '${kernel}' (missing .Lfunc_end marker; fail-closed)" >&2
+      echo "ERROR: could not extract function body for kernel '${kernel}' (empty function body; fail-closed)" >&2
       overall_status=1
       continue
     fi
@@ -183,19 +205,30 @@ use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx2,fma")]
 pub fn dot_set_contig(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: `_mm256_setzero_ps` は引数を取らずレジスタをゼロ初期化するのみで
+    // メモリアクセスを伴わない。呼び出しは `#[target_feature(enable =
+    // "avx2,fma")]` 関数内で AVX2 が有効な前提の下にある。
     let mut acc = unsafe { _mm256_setzero_ps() };
     let (a_chunks, a_rem) = a.as_chunks::<8>();
     let (b_chunks, b_rem) = b.as_chunks::<8>();
     for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        // SAFETY: `_mm256_set_ps` はスカラー引数からレジスタへ値を詰めるのみで
+        // メモリアクセスを行わないため、`ac`/`bc` の要素数（`as_chunks::<8>`
+        // が保証する固定長 8）以外の前提は不要。
         let av = unsafe {
             _mm256_set_ps(ac[7], ac[6], ac[5], ac[4], ac[3], ac[2], ac[1], ac[0])
         };
         let bv = unsafe {
             _mm256_set_ps(bc[7], bc[6], bc[5], bc[4], bc[3], bc[2], bc[1], bc[0])
         };
+        // SAFETY: `_mm256_fmadd_ps` はレジスタ引数のみを取る演算命令で
+        // メモリアクセスを伴わず、AVX2/FMA が有効な前提下で常に安全。
         acc = unsafe { _mm256_fmadd_ps(av, bv, acc) };
     }
     let mut buf = [0f32; 8];
+    // SAFETY: `buf` は直前に確保した `[f32; 8]`（8 要素・16 バイトアライン
+    // 不要な `storeu`）であり、`_mm256_storeu_ps` が書き込む 8 要素（32
+    // バイト）分の有効な書き込み先である。
     unsafe { _mm256_storeu_ps(buf.as_mut_ptr(), acc) };
     let mut sum: f32 = buf.iter().sum();
     for (x, y) in a_rem.iter().zip(b_rem.iter()) {
@@ -212,19 +245,31 @@ use std::arch::x86_64::*;
 
 #[target_feature(enable = "avx2,fma")]
 pub fn dot_set_strided(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: `_mm256_setzero_ps` は引数を取らずレジスタをゼロ初期化するのみで
+    // メモリアクセスを伴わない。呼び出しは `#[target_feature(enable =
+    // "avx2,fma")]` 関数内で AVX2 が有効な前提の下にある。
     let mut acc = unsafe { _mm256_setzero_ps() };
     let (a_chunks, _) = a.as_chunks::<16>();
     let (b_chunks, _) = b.as_chunks::<16>();
     for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        // SAFETY: `_mm256_set_ps` はスカラー引数からレジスタへ値を詰めるのみで
+        // メモリアクセスを行わないため、`ac`/`bc` の要素数（`as_chunks::<16>`
+        // が保証する固定長 16。ここではストライドで一部要素のみ参照）以外の
+        // 前提は不要。
         let av = unsafe {
             _mm256_set_ps(ac[14], ac[12], ac[10], ac[8], ac[6], ac[4], ac[2], ac[0])
         };
         let bv = unsafe {
             _mm256_set_ps(bc[14], bc[12], bc[10], bc[8], bc[6], bc[4], bc[2], bc[0])
         };
+        // SAFETY: `_mm256_fmadd_ps` はレジスタ引数のみを取る演算命令で
+        // メモリアクセスを伴わず、AVX2/FMA が有効な前提下で常に安全。
         acc = unsafe { _mm256_fmadd_ps(av, bv, acc) };
     }
     let mut buf = [0f32; 8];
+    // SAFETY: `buf` は直前に確保した `[f32; 8]`（8 要素・16 バイトアライン
+    // 不要な `storeu`）であり、`_mm256_storeu_ps` が書き込む 8 要素（32
+    // バイト）分の有効な書き込み先である。
     unsafe { _mm256_storeu_ps(buf.as_mut_ptr(), acc) };
     buf.iter().sum()
 }
@@ -303,6 +348,31 @@ EOF
     fi
   fi
 
+  # ERROR fixture: `.Lfunc_end` マーカーが対象関数のシンボル解決後に一度も
+  # 出現しない（EOF まで読み切っても見つからない）ケース。マーカー不在を
+  # body の空/非空とは独立に検出できることを固定する（codex-review P1・
+  # Cursor Bugbot 指摘: awk がマーカー未検出でも本文を返すため、別関数の
+  # 命令列を対象関数のものとして誤カウントしうる fail-open だった）。
+  # pass fixture の `.s` からラベル行は残しつつ `.Lfunc_end` 行以降を丸ごと
+  # 除去し、「関数本体の途中で切れていて `.Lfunc_end` に到達しない」状態を
+  # 再現する。
+  awk '
+    /^\.Lfunc_end[0-9]+:/ { exit }
+    { print }
+  ' "${tmp}/pass_set_contig.s" >"${tmp}/truncated_no_func_end.s"
+
+  if check_asm_file "${tmp}/truncated_no_func_end.s" 7fixture dot_set_contig >"${tmp}/out_no_end.log" 2>&1; then
+    echo "FAIL: missing-.Lfunc_end case expected ERROR but check_asm_file passed" >&2
+    cat "${tmp}/out_no_end.log" >&2
+    failed=1
+  else
+    if ! grep -q "\.Lfunc_end marker not found" "${tmp}/out_no_end.log"; then
+      echo "FAIL: missing-.Lfunc_end case did not report the expected ERROR reason" >&2
+      cat "${tmp}/out_no_end.log" >&2
+      failed=1
+    fi
+  fi
+
   if [ "${failed}" -ne 0 ]; then
     echo "FAIL: scripts/check_simd_codegen.sh --self-test" >&2
     exit 1
@@ -340,8 +410,13 @@ if [ -d "${REPO_ROOT}/crates/engine/src/isa" ]; then
   done < <(find "${REPO_ROOT}/crates/engine/src/isa" -type f -name '*.rs')
 fi
 
+# `#[target_feature(...)]` と `fn` の間に他の属性（`#[inline(never)]` 等）や
+# `///`/`//` コメント行が挟まっていても抽出できるよう、その間を
+# `(?:属性行 | 行コメント)*` の反復として許容する（codex-review P1 指摘:
+# 直後の行に固定した旧正規表現では、間に別属性・コメントを挟む新規カーネルが
+# 登録漏れ検査を素通りしてしまっていた）。
 ACTUAL_KERNELS="$(perl -0777 -ne '
-  while (/#\[target_feature\([^)]*\)\]\s*\n\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?fn\s+([A-Za-z0-9_]+)/g) {
+  while (/#\[target_feature\([^)]*\)\]\s*(?:(?:#!?\[[^\]]*\]|\/\/[^\n]*)\s*)*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?fn\s+([A-Za-z0-9_]+)/g) {
     print "$1\n";
   }
 ' "${ISA_SOURCES[@]}" | sort -u)"
