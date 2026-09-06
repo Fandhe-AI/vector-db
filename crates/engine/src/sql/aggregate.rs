@@ -574,11 +574,25 @@ pub(crate) fn storage_internal(e: impl Into<StorageError>) -> SqlSurfaceError {
 /// が `schema` 取得と同一のトランザクションから渡す（既存の検索 SELECT 実行経路
 /// `sql::exec::execute_statement` と同じ「単一スナップショット」契約。Issue #56
 /// レビュー指摘対応の踏襲）。
-pub(crate) fn execute_aggregate(
+/// `Statement::Aggregate` の唯一の生産用エントリポイント（`core.rs`）は
+/// [`execute_aggregate_with_cache`] を使う（キャッシュを渡さない場合は `None`）。
+/// Issue #478: `GROUP BY` なし・`WHERE` なしの
+/// `DecodeTier::Fast`（`COUNT(*)`・`COUNT(id)`・`SUM`/`AVG`/`MIN`/`MAX(id)`）に
+/// 限り、`visible_cache`（`crate::sql::visible_cache::VisibleBitmapCache`）が
+/// 同一テーブル世代でヒットすれば `user_rows/{table}` を一切開かずに
+/// `visible_ids` を反復して集計する（A1〜A5 全段の省略。`core.rs::EngineCore`
+/// の `Statement::Aggregate` アームから渡される）。ミス時は従来どおり全行走査
+/// するが、その走査に相乗りしてスナップショットを構築し `insert` する
+/// （`DecodeTier::Fast` は PR #369 の契約によりこの走査で dim・metadata の構造
+/// 検証を毎行実施済みのため、構築コストは実質ゼロ）。`GROUP BY`（`sql::group_by`
+/// への分岐）・`DimAndScalar`/`Embedding` tier はこのキャッシュの対象外
+/// （詳細・スコープ判断は `docs/design/visible-bitmap-cache.md` 参照）。
+pub(crate) fn execute_aggregate_with_cache(
     read_txn: &redb::ReadTransaction,
     ctx: &PolicyContext,
     schema: &TableSchema,
     bound: &BoundAggregate,
+    visible_cache: Option<crate::sql::visible_cache::VisibleCacheAccess<'_>>,
 ) -> Result<QueryResult, SqlSurfaceError> {
     // TASK-167（SQL-14）: `GROUP BY` ありは複数行結果を返すため
     // `sql::group_by::execute_grouped_aggregate` へ分岐する（グループ表の有界化・
@@ -625,6 +639,38 @@ pub(crate) fn execute_aggregate(
         DecodeTier::Fast
     };
 
+    // Issue #478: `DecodeTier::Fast` に限り、同一テーブル世代で構築済みの可視
+    // `id` 集合がキャッシュにあれば `user_rows/{table}` を一切開かずに集計する
+    // （A1〜A5 全段の省略。モジュールドキュメント参照）。`expr_scratch` は
+    // `Accumulator::observe` の必須引数だが `Fast` 到達時の入力
+    // （`AllVisible`/`IdU64`）は `ScalarExpr` を持たないため未使用のまま渡す。
+    if tier == DecodeTier::Fast {
+        if let Some(access) = &visible_cache {
+            if let Some(snapshot) = access
+                .cache
+                .lookup(access.storage, read_txn, &bound.table, ctx)
+            {
+                let mut expr_scratch: Vec<StackValue> = Vec::new();
+                let empty_vector = RowVector {
+                    dim: 0,
+                    values: None,
+                };
+                for &id in snapshot.visible_ids() {
+                    for (accumulator, item) in accumulators.iter_mut().zip(&bound.items) {
+                        accumulator.observe(
+                            &item.input,
+                            id,
+                            &empty_vector,
+                            &[],
+                            &mut expr_scratch,
+                        )?;
+                    }
+                }
+                return Ok(finish_aggregate_result(accumulators, bound));
+            }
+        }
+    }
+
     let row_table_name = catalog::user_rows_table_name(&bound.table);
     let table = match read_txn.open_table(catalog::user_rows_table_def(&row_table_name)) {
         Ok(t) => Some(t),
@@ -657,6 +703,17 @@ pub(crate) fn execute_aggregate(
     // いた）。
     let mut expr_scratch: Vec<StackValue> = Vec::new();
 
+    // Issue #478: `DecodeTier::Fast` のミス時（上のキャッシュヒット判定で
+    // 早期リターンしなかった場合）は、この既存走査に相乗りして可視行の `id` を
+    // 記録する（同じ走査の中で `verify_row_key_tenant` 済みの行のみ記録するため
+    // 追加コストは実質ゼロ）。`Fast` 以外の tier ではキャッシュを構築しない
+    // （スコープ判断は `docs/design/visible-bitmap-cache.md` 参照）。
+    let mut visible_builder = if tier == DecodeTier::Fast && visible_cache.is_some() {
+        Some(crate::sql::visible_cache::VisibleSnapshotBuilder::new())
+    } else {
+        None
+    };
+
     if let Some(table) = table {
         'rows: for entry in table.iter().map_err(storage_internal)? {
             let (k, v) = entry.map_err(storage_internal)?;
@@ -684,6 +741,13 @@ pub(crate) fn execute_aggregate(
             // 踏襲）。以降の embedding・metadata デコードは `tier`（Issue #350）に
             // 応じて必要な範囲のみ行う。
             storage::verify_row_key_tenant(key_tenant, tenant_id).map_err(storage_internal)?;
+
+            // Issue #478: 可視行・TABLE-12 検査済みの `id` をキャッシュ構築用に
+            // 記録する（`visible_builder` は `DecodeTier::Fast` かつキャッシュ
+            // アクセスが渡された場合のみ `Some`）。
+            if let Some(builder) = visible_builder.as_mut() {
+                builder.mark_visible(id);
+            }
 
             // 可視行・必要時のみ（Issue #350: embedding 非参照集計のデコード
             // スキップと必要列限定デコード）: `tier` が要求する範囲だけ dim・
@@ -823,6 +887,28 @@ pub(crate) fn execute_aggregate(
         }
     }
 
+    // Issue #478: 走査が正常に完了した場合のみ、採取した可視 `id` 集合を
+    // キャッシュへ反映する（構築中にエラーで抜けた場合はここへ到達しないため
+    // 非登録のまま——キャッシュは常に検証済みの行だけを保持する）。世代の
+    // 読み取りに失敗した場合もキャッシュへ登録しないだけで、クエリ応答自体は
+    // 確定済みの集計結果をそのまま返す（fail-closed: 判定できないなら常駐
+    // させない。`sql/exec.rs` の `SqlArenaCache` 挿入と同じ方針）。
+    if let (Some(builder), Some(access)) = (visible_builder, &visible_cache) {
+        if let Ok(generation) = crate::catalog::table_generation_in_txn(read_txn, &bound.table) {
+            if let Some(snapshot) = builder.finish(ctx.clone(), generation) {
+                access
+                    .cache
+                    .insert(access.storage, &bound.table, ctx, snapshot);
+            }
+        }
+    }
+
+    Ok(finish_aggregate_result(accumulators, bound))
+}
+
+/// 確定した [`Accumulator`] 群から単一行の [`QueryResult`] を組み立てる
+/// （キャッシュヒット経路・従来の走査経路の両方が共有する終端処理。Issue #478）。
+fn finish_aggregate_result(accumulators: Vec<Accumulator>, bound: &BoundAggregate) -> QueryResult {
     let mut columns = Vec::with_capacity(bound.items.len());
     let mut cells = Vec::with_capacity(bound.items.len());
     for (accumulator, item) in accumulators.into_iter().zip(&bound.items) {
@@ -832,14 +918,14 @@ pub(crate) fn execute_aggregate(
         cells.push(accumulator.finish());
     }
 
-    Ok(QueryResult {
+    QueryResult {
         columns,
         rows: vec![ResultRow {
             id: 0,
             score: 0.0,
             cells,
         }],
-    })
+    }
 }
 
 #[cfg(test)]
@@ -996,14 +1082,14 @@ mod tests {
 
         // COUNT(embedding) は NULL 行（id=2）を数えない。
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
-        let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_vec)
+        let result = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None)
             .expect("COUNT(embedding) should succeed even with a NULL row present");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(1));
 
         // COUNT(*) は VECTOR 値を参照しないため、nullable 列の NULL 行があっても
         // 次元不一致（旧 XX000）を返さず両方の可視行を数える（本 PR の中心的指摘）。
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let result = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+        let result = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
             .expect("COUNT(*) must not fail on a nullable VECTOR column's NULL row");
         assert_eq!(result.rows[0].cells[0], Cell::Integer(2));
     }
@@ -1037,7 +1123,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
             .expect_err("key/header tenant mismatch must be rejected fail-closed");
         assert_eq!(err.wire_code(), "XX000");
     }
@@ -1074,7 +1160,7 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star)
+        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
             .expect_err("COUNT(*) fast path must fail closed on a corrupted embedding section");
         assert_eq!(err.wire_code(), "XX000");
     }
@@ -1106,7 +1192,8 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_vec = bound_single(AggregateFunc::Count, AggregateInput::VectorColumnPresence);
-        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_vec).unwrap_err();
+        let err =
+            execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_vec, None).unwrap_err();
         assert_eq!(err.wire_code(), "XX000");
     }
 
@@ -1157,7 +1244,8 @@ mod tests {
         let read_txn = storage.db().begin_read().expect("begin_read");
 
         let bound_star = bound_single(AggregateFunc::Count, AggregateInput::AllVisible);
-        let err = execute_aggregate(&read_txn, &ctx, &schema, &bound_star).expect_err(
+        let err = execute_aggregate_with_cache(&read_txn, &ctx, &schema, &bound_star, None)
+            .expect_err(
             "COUNT(*) must fail closed on corrupted metadata even with no scalar column referenced",
         );
         assert_eq!(err.wire_code(), "XX000");
