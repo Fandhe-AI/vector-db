@@ -121,7 +121,32 @@ def main() -> int:
         )
         return 1
     if args.expect_dim is not None:
-        actual_dim = query_dim if query_dim is not None else docs_dim
+        # --expect-dim 指定時は docs の存在・次元取得の成功も必須にする
+        # （codex-review P2 指摘・PR #557。queries 側の次元だけで判定すると、
+        # docs jsonl の export 忘れ（dim_source_docs が存在しない）でも
+        # query_dim が --expect-dim と一致していれば検査を素通りしてしまい、
+        # README の「docs／queries の次元を fail-closed に検証する」契約と
+        # 不一致になる。docs 未存在・次元取得失敗はいずれも非 0 終了で拒否する）。
+        if docs_dim is None:
+            reason = (
+                f"docs file not found: {dim_source_docs}"
+                if not os.path.exists(dim_source_docs)
+                else f"failed to determine embedding dim from docs file: {dim_source_docs}"
+            )
+            print(
+                f"error: --expect-dim {args.expect_dim} requires docs dim to be verified ({reason})",
+                file=sys.stderr,
+            )
+            return 1
+        if query_dim is not None and query_dim != docs_dim:
+            # ここへ到達するのは通常あり得ない（直前の mismatch チェックで
+            # 既に非 0 終了しているため）が、fail-closed の多重防御として残す。
+            print(
+                f"error: embedding dim mismatch between docs ({docs_dim}) and queries ({query_dim})",
+                file=sys.stderr,
+            )
+            return 1
+        actual_dim = docs_dim
         if actual_dim != args.expect_dim:
             print(
                 f"error: --expect-dim {args.expect_dim} does not match actual dim {actual_dim}",
