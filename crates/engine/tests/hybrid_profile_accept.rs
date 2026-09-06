@@ -30,14 +30,16 @@ mod harness;
 use std::collections::BTreeSet;
 
 use harness::hybrid_profile::{
-    boundary_tie_decision, build_actually_succeeds, collect_body_strings, dense_refetch_schedule,
-    fetch_cap, generate_corpus, generate_queries, initial_fetch_k, is_exhaustive, next_fetch_k,
-    refetch_schedule_matches_observed_calls, refuse_under_github_actions,
-    render_dense_refetch_line, render_memory_line, render_sparse_refetch_line,
-    render_sparse_refetch_summary_line, render_stage_line, replica_matches_real,
-    sql_dense_statement, sql_hybrid_statement, summarize_sparse_refetch, tokenize_only,
-    tokenize_term_doc_freq, tokenize_term_freq, ProfileError, ProfileSparseIndex, RefetchSchedule,
-    TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
+    boundary_tie_decision, bucket_diff, build_actually_succeeds, collect_body_strings,
+    dense_refetch_schedule, fetch_cap, generate_corpus, generate_queries, initial_fetch_k,
+    is_exhaustive, next_fetch_k, refetch_schedule_matches_observed_calls,
+    refuse_under_github_actions, render_baseline_bucket_line, render_dense_refetch_line,
+    render_memory_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
+    render_stage_line, replica_matches_real, sql_dense_statement,
+    sql_dense_statement_with_projection, sql_hybrid_statement,
+    sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
+    tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileError, ProfileSparseIndex,
+    RefetchSchedule, TieDecision, MAX_CORPUS_DOCS_GUARD, MAX_FETCH_K_MIRROR, MAX_POOL_DEPTH_MIRROR,
 };
 use harness::proc_stats::{parse_kb_line, read_vm_hwm_kb, read_vm_rss_kb};
 // `sparse_refetch_schedule` は `sparse_refetch_observed`（非既定 feature
@@ -222,6 +224,103 @@ fn sql_dense_statement_embeds_vector_literal() {
         sql_dense_statement("docs", "embedding", &[0.5, -0.5], 5).expect("well-formed statement");
     assert!(sql.contains("embedding <=> '[0.5,-0.5]'"));
     assert!(sql.contains("LIMIT 5"));
+}
+
+#[test]
+fn sql_hybrid_statement_with_projection_id_selects_id_only() {
+    let sql = sql_hybrid_statement_with_projection(
+        "docs",
+        "embedding",
+        "body",
+        &[1.0, 0.0],
+        "vector search",
+        10,
+        HybridProjection::Id,
+    )
+    .expect("well-formed statement");
+    assert!(sql.starts_with("SELECT id FROM docs"));
+    assert!(sql.contains("hybrid_rrf(embedding, '[1,0]', body, 'vector search')"));
+}
+
+#[test]
+fn sql_hybrid_statement_with_projection_star_matches_wrapper() {
+    let via_projection = sql_hybrid_statement_with_projection(
+        "docs",
+        "embedding",
+        "body",
+        &[1.0, 0.0],
+        "q",
+        10,
+        HybridProjection::Star,
+    )
+    .expect("well-formed statement");
+    let via_wrapper = sql_hybrid_statement("docs", "embedding", "body", &[1.0, 0.0], "q", 10)
+        .expect("well-formed statement");
+    assert_eq!(via_projection, via_wrapper);
+}
+
+#[test]
+fn sql_dense_statement_with_projection_id_selects_id_only() {
+    let sql = sql_dense_statement_with_projection(
+        "docs",
+        "embedding",
+        &[0.5, -0.5],
+        5,
+        HybridProjection::Id,
+    )
+    .expect("well-formed statement");
+    assert!(sql.starts_with("SELECT id FROM docs"));
+}
+
+#[test]
+fn sql_dense_statement_with_projection_star_matches_wrapper() {
+    let via_projection = sql_dense_statement_with_projection(
+        "docs",
+        "embedding",
+        &[0.5, -0.5],
+        5,
+        HybridProjection::Star,
+    )
+    .expect("well-formed statement");
+    let via_wrapper =
+        sql_dense_statement("docs", "embedding", &[0.5, -0.5], 5).expect("well-formed statement");
+    assert_eq!(via_projection, via_wrapper);
+}
+
+#[test]
+fn bucket_diff_returns_saturating_forward_diff() {
+    let from = std::time::Duration::from_micros(100);
+    let to = std::time::Duration::from_micros(150);
+    assert_eq!(
+        bucket_diff(from, to),
+        Some(std::time::Duration::from_micros(50))
+    );
+}
+
+#[test]
+fn bucket_diff_returns_none_when_inverted() {
+    let from = std::time::Duration::from_micros(150);
+    let to = std::time::Duration::from_micros(100);
+    assert_eq!(bucket_diff(from, to), None);
+}
+
+#[test]
+fn render_baseline_bucket_line_formats_present_values() {
+    let line =
+        render_baseline_bucket_line("sql_surface", Some(1234), Some(12.5), "within_noise_band");
+    assert_eq!(
+        line,
+        "baseline_bucket label=sql_surface diff=1234us ratio_of_b1=12.50% band=within_noise_band"
+    );
+}
+
+#[test]
+fn render_baseline_bucket_line_formats_inverted_diff() {
+    let line = render_baseline_bucket_line("dense", None, None, "above_noise_band");
+    assert_eq!(
+        line,
+        "baseline_bucket label=dense diff=n/a(inverted) ratio_of_b1=n/a band=above_noise_band"
+    );
 }
 
 #[test]

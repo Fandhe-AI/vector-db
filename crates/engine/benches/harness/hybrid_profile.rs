@@ -334,6 +334,52 @@ pub fn sql_hybrid_statement(
     query_text: &str,
     k: usize,
 ) -> Result<String, ProfileError> {
+    sql_hybrid_statement_with_projection(
+        table,
+        vector_column,
+        text_column,
+        query_vector,
+        query_text,
+        k,
+        HybridProjection::Star,
+    )
+}
+
+/// 投影種別（Issue #465）: crossdb 規範形（`SELECT id`。
+/// `scripts/crossdb_bench/self_db.py` の hybrid_rrf／C1 相当の投影）と
+/// 既存段（`SELECT *`。本文列 `body` を候補行分複製する投影）を区別する。
+/// wire 越し実測（`docs/design/crossdb-bench.md`）と engine 内 profile を同じ
+/// 投影コストの土俵で突き合わせるために追加した。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridProjection {
+    /// `SELECT id`（crossdb 規範形。本文列を複製しない）。
+    Id,
+    /// `SELECT *`（既存段。本文列を候補行分複製する）。
+    Star,
+}
+
+impl HybridProjection {
+    fn select_list(self) -> &'static str {
+        match self {
+            HybridProjection::Id => "id",
+            HybridProjection::Star => "*",
+        }
+    }
+}
+
+/// hybrid_rrf 経由のクエリ文字列を投影種別付きで組み立てる（Issue #465）:
+/// `SELECT <id|*> FROM <table> ORDER BY hybrid_rrf(<vector_column>, '<literal>',
+/// <text_column>, '<query_text>') LIMIT <k>`。[`sql_hybrid_statement`]
+/// （`HybridProjection::Star` 固定）はこの関数のラッパ。
+pub fn sql_hybrid_statement_with_projection(
+    table: &str,
+    vector_column: &str,
+    text_column: &str,
+    query_vector: &[f32],
+    query_text: &str,
+    k: usize,
+    projection: HybridProjection,
+) -> Result<String, ProfileError> {
     if !is_valid_identifier(table) {
         return Err(ProfileError::InvalidIdentifier("table"));
     }
@@ -345,8 +391,9 @@ pub fn sql_hybrid_statement(
     }
     validate_query_text(query_text)?;
     let literal = vector_literal(query_vector)?;
+    let select_list = projection.select_list();
     Ok(format!(
-        "SELECT * FROM {table} ORDER BY hybrid_rrf({vector_column}, '{literal}', {text_column}, '{query_text}') LIMIT {k}"
+        "SELECT {select_list} FROM {table} ORDER BY hybrid_rrf({vector_column}, '{literal}', {text_column}, '{query_text}') LIMIT {k}"
     ))
 }
 
@@ -359,6 +406,26 @@ pub fn sql_dense_statement(
     query_vector: &[f32],
     k: usize,
 ) -> Result<String, ProfileError> {
+    sql_dense_statement_with_projection(
+        table,
+        vector_column,
+        query_vector,
+        k,
+        HybridProjection::Star,
+    )
+}
+
+/// 密 KNN のみのクエリ文字列を投影種別付きで組み立てる（Issue #465）:
+/// `SELECT <id|*> FROM <table> ORDER BY <vector_column> <=> '<literal>' LIMIT
+/// <k>`。[`sql_dense_statement`]（`HybridProjection::Star` 固定）はこの関数の
+/// ラッパ。
+pub fn sql_dense_statement_with_projection(
+    table: &str,
+    vector_column: &str,
+    query_vector: &[f32],
+    k: usize,
+    projection: HybridProjection,
+) -> Result<String, ProfileError> {
     if !is_valid_identifier(table) {
         return Err(ProfileError::InvalidIdentifier("table"));
     }
@@ -366,9 +433,41 @@ pub fn sql_dense_statement(
         return Err(ProfileError::InvalidIdentifier("vector_column"));
     }
     let literal = vector_literal(query_vector)?;
+    let select_list = projection.select_list();
     Ok(format!(
-        "SELECT * FROM {table} ORDER BY {vector_column} <=> '{literal}' LIMIT {k}"
+        "SELECT {select_list} FROM {table} ORDER BY {vector_column} <=> '{literal}' LIMIT {k}"
     ))
+}
+
+/// 飽和差分（Issue #465）: `to − from` を、逆転（`to < from`。共有計測環境の
+/// ノイズで区間が意図した符号を持たない場合）なら `None` として返す
+/// （coding-rust.md「整数演算はオーバーフローを未定義動作にしない」に従い、
+/// `Duration::checked_sub` の意味論をそのまま公開する薄いラッパ）。
+pub fn bucket_diff(
+    from: std::time::Duration,
+    to: std::time::Duration,
+) -> Option<std::time::Duration> {
+    to.checked_sub(from)
+}
+
+/// 帰属表の 1 行を整形する（Issue #465）。`band` は呼び出し側が
+/// `scan_stage_profile::classify_against_bands` 等で算出した表示文字列を
+/// そのまま渡す（本モジュールは `scan_stage_profile` の型に依存しない）。
+pub fn render_baseline_bucket_line(
+    label: &str,
+    diff_us: Option<u128>,
+    ratio_pct: Option<f64>,
+    band: &str,
+) -> String {
+    let diff_field = match diff_us {
+        Some(us) => format!("{us}us"),
+        None => "n/a(inverted)".to_string(),
+    };
+    let ratio_field = match ratio_pct {
+        Some(pct) => format!("{pct:.2}%"),
+        None => "n/a".to_string(),
+    };
+    format!("baseline_bucket label={label} diff={diff_field} ratio_of_b1={ratio_field} band={band}")
 }
 
 // --- SparseIndex::build 内部 3 段の複製（`sparse.rs::with_params` の近似） -------

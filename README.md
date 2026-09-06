@@ -213,6 +213,14 @@ wire v3 経由（生バイトクライアント）での `USING PLAN` 実行契�
 段別に分解して実測します。spec 由来の pass/fail 閾値を持たない情報提供専用の
 ベンチのため `.github/workflows/*` へは配線せず、手動実行専用です。
 `GITHUB_ACTIONS` が設定された実行環境では起動直後に fail-closed で拒否します。
+`BENCH_HYBRID_PROFILE_ROUNDS`（既定 5・5〜50）で Issue #465 の最新基線ラウンド
+計測（SQL 表層・投影・密・疎・残差の帰属表）の交互実行回数、
+`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます（`docs/design/
+hybrid-rrf-latency-breakdown.md`「最新基線」節参照）。`make
+bench-hybrid-wire-profile`（`crates/wire-server/benches/
+hybrid_wire_profile_bench.rs`）は同 Issue で `hybrid_rrf` の engine 内 hybrid
+経路／SQL 表層／wire の 3 区分を切り分けます。`BENCH_HYBRID_WIRE_ROUNDS`
+（既定 5・5〜50）でラウンド数を指定できます。
 
 `cargo run --release -p engine --example feature_bench` は SQL 表層・ベクトル
 検索・RLS を含む 13 フェーズ（`ingest`・`hybrid_rrf`・`vector_knn` 等）を

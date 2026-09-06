@@ -367,6 +367,28 @@ SQL 表層が距離カーネル自体より支配的な区分であり、wire �
 フレーミング・応答エンコード）の寄与は 11.9% にとどまる。詳細な計測設計・
 fail-closed 検証・実測表は `docs/design/knn-wire-stage-profile.md` 参照。
 
+## `hybrid_rrf` 6,178µs の内訳（Issue #465）
+
+`hybrid_rrf`（self 6178/9100µs）の engine 内 hybrid 経路／SQL 表層／wire の
+3 区分と、engine 内部の B0s〜B8 段別内訳を `crates/engine/benches/
+hybrid_profile_bench.rs`（`make bench-hybrid-profile`）・`crates/wire-server/
+benches/hybrid_wire_profile_bench.rs`（`make bench-hybrid-wire-profile`）で
+実施した。共有開発環境（`BENCH_DEDICATED_ENV` 未設定・参考値）での実測要約
+（詳細・実測表・per-round 生データは `docs/design/hybrid-rrf-latency-breakdown.md`
+「最新基線」節が SSOT）:
+
+| 区分（wire 側 T1p〜T3） | 比率 |
+| --- | --- |
+| engine 内 hybrid（T1p） | 28.6% |
+| SQL 表層（T2−T1p） | 67.1%（参照区間帯超過） |
+| wire（T3−T2） | 4.3%（参照区間帯内） |
+
+engine 内部の B0s〜B8 段別内訳では SQL 表層固定コスト（B1−B4）と疎側再取得
+ループ（B5）がほぼ同水準（37〜39%）で並び最大区分であり、融合・境界同点
+グループ完全化を含む残差は 19% にとどまることを確認した。Phase 6（Issue #548）
+への引き継ぎ内容もあわせて同節に記録。production コード
+（`crates/engine/src/`・`crates/wire-server/src/`）は無変更。
+
 ## 申し送り
 
 - SQL 表層のフィルタ付き経路・集計の wire 越し 2.7〜6 ms は、in-process との差分を

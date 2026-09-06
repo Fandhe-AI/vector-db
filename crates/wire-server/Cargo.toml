@@ -31,3 +31,12 @@ engine = { path = "../engine" }
 name = "knn_wire_profile_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #465: `hybrid_rrf` 6,178µs（docs/design/crossdb-bench.md）の engine 内
+# hybrid 経路／SQL 表層／wire 内訳を切り分ける実測入口。knn_wire_profile_bench と
+# 同方針（harness = false / test = false・手動実行専用・make ci 対象外）だが、
+# `body` 列・SparseIndex を要する hybrid 固有コーパスのため独立させる。
+name = "hybrid_wire_profile_bench"
+harness = false
+test = false

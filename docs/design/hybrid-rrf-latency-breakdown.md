@@ -986,3 +986,103 @@ Phase 1 全体（`8bfaaa4`〔#388 直前〕→ 導入後）を通した設計判
 前後比較・外部実装（tantivy・qdrant）参照の整理は
 `docs/design/sparse-inverted-index.md`（Issue #394）に記録した。数値の
 二重管理を避けるため、本ドキュメントへの転記はしない。
+
+## 最新基線（2026-09-06・Issue #465）
+
+### 目的
+
+`docs/design/crossdb-bench.md` で `hybrid_rrf`（25,000 行・dim 128・wire 経由・
+p50）は self 6,178µs・最速の他 DB（sqlite-vec）3,508µs で約 1.8 倍遅いが、
+疎索引側の最適化（Issue #388〜#392）後の段別内訳が 1 つの基線として整理されて
+いなかった。本節は `bench-hybrid-profile`（engine 内 B0s〜B8）・
+`bench-hybrid-wire-profile`（engine/SQL 表層/wire T1p〜T3）の交互複数ラウンド
+実測（`docs/design/benchmark-judgement-policy.md` §3〜4 準拠）で最新基線を
+記録し、上位区分を Issue #548（Phase 6・上位 2 段の最適化）へ引き継ぐ。
+
+### 計測条件
+
+- commit: `ee99db3`（`origin/main` 分岐元。#552〜#555 適用済み）
+- 環境: `QEMU Virtual CPU version 2.5+`・12 vCPU・Avx2Fma・`loadavg` 約 1.2〜2.5
+  （`BENCH_DEDICATED_ENV` 未設定・共有環境の参考値。専有環境での再実測は運用者
+  判断）
+- rounds: `BENCH_HYBRID_PROFILE_ROUNDS=5`・`BENCH_HYBRID_WIRE_ROUNDS=5`（いずれも
+  規約下限）を各 2 回実行
+
+### engine 内段別（`bench-hybrid-profile` B0s〜B8。単一テナント・25,000 行・dim 128）
+
+per-round 生データ（1 回目の実測。単位 µs）:
+
+| round | B0s | B0 | B1 | B2 | B3 | B4 | B5 | B8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 329 | 447 | 9154 | 11178 | 652 | 5642 | 3439 | 93 |
+| 2 | 329 | 456 | 9560 | 11468 | 706 | 5578 | 3442 | 94 |
+| 3 | 322 | 440 | 9583 | 11248 | 692 | 5673 | 3454 | 95 |
+| 4 | 328 | 521 | 9809 | 11274 | 641 | 5595 | 3408 | 93 |
+| 5 | 324 | 598 | 9651 | 11726 | 683 | 5677 | 3445 | 94 |
+
+min-of-5／median-of-5（1 回目）: B0s(322/328) B0(440/456) B1(9154/9583)
+B2(11178/11274) B3(641/683) B4(5578/5642) B5(3408/3442) B8(93/94)。参照区間帯
+（B0s）2.20%。
+
+2 回目実測（min-of-5／median-of-5）: B0s(331/336) B0(458/481) B1(8898/9145)
+B2(10694/10876) B3(663/679) B4(5622/5658) B5(3452/3459) B8(94/95)。参照区間帯
+（B0s）4.01%。
+
+帰属表（min-of-5 基準。2 回とも同じ順位）:
+
+| 区分 | 1 回目 diff(ratio) | 2 回目 diff(ratio) | band |
+| --- | --- | --- | --- |
+| sql_surface(B1−B4) | 3576us(39.1%) | 3276us(36.8%) | above_noise_band |
+| sparse(B5) | 3408us(37.2%) | 3452us(38.8%) | above_noise_band |
+| residual(B4−B0−B5) | 1729us(18.9%) | 1710us(19.2%) | above_noise_band |
+| dense(B0) | 440us(4.8%) | 458us(5.2%) | within〜above（境界） |
+| visible_set_build(B8) | 93us(1.0%) | 94us(1.1%) | within_noise_band |
+| dense_fast_path_contrast(B3・informational) | 641us(7.0%) | 663us(7.5%) | above_noise_band |
+
+**上位 2 区分は sql_surface(B1−B4) と sparse(B5) がほぼ同水準（37〜39%）で
+並び、残差（19%）が僅差で 3 位**。B8（可視集合 `BTreeSet` 構築）はノイズ帯内
+（1%）で、B4−B0−B5 の残差の大半は「融合＋境界同点グループ完全化」（`rrf_fuse`
+本体・`complete_boundary_tie_group`）に帰属すると推定される（下限近似 B7 は
+本実測では計測しておらず今後の精査対象）。
+
+### wire／SQL 表層／engine 内訳（`bench-hybrid-wire-profile` T1p〜T3）
+
+単一テナント・25,000 行・dim 128（engine 側とはコーパスが異なるため絶対値は横比較しない）。
+
+| 段 | min-of-5 |
+| --- | --- |
+| T1p `hybrid_direct_cached_index` | 1.517ms |
+| T2 `sql_surface_hot` | 5.079ms |
+| T3 `wire_roundtrip` | 5.306ms |
+
+帰属: engine_hybrid(T1p)=1.517ms(28.6%)、sql_surface(T2−T1p)=3.562ms(67.1%・
+above_noise_band)、wire(T3−T2)=227us(4.3%・within_noise_band)。
+
+wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `execute_sql_in_session`
+のクエリパース・束縛・可視行走査（`on_visible_row`）まで含む一方、T1p は
+`hybrid_search` のみを直接計測するため——engine 内訳（B1−B4）と同じ「SQL 表層の
+固定コスト」を指すが、測定対象範囲が異なるため比率は単純合算できない。
+
+### Phase 6（Issue #548）への引き継ぎ
+
+- 上位候補は (1) SQL 表層固定コスト（`sql/exec.rs` の可視行走査・
+  `on_visible_row`）、(2) 疎側再取得ループ（`hybrid.rs::sparse_refetch_loop`。
+  BM25 アキュムレータ再利用は Issue #545・#546 が別途対応）——engine 内訳・
+  wire 内訳の双方で SQL 表層区分が最大かそれに準じる大きさであることが一致
+  している
+- 残差（融合＋境界同点グループ完全化。#548 タイトルが先取りする対象）は 3 位
+  （19%）にとどまり、B8（可視集合構築）はノイズ帯内。#548 の対象を融合のみに
+  限定せず SQL 表層固定コストも候補に含めるべきと申し送る
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での `ROUNDS=10` 再実測、`rrf_fuse_with_limits`
+  の下限近似（B7）実測、crossdb self の同一コミット再実行はオーナー／運用者
+  作業として申し送る
+
+### production コード無変更
+
+`crates/engine/src/`・`crates/wire-server/src/` は無変更。追加した計測ロジックは
+`crates/engine/benches/harness/hybrid_profile.rs`（`HybridProjection`・
+`sql_hybrid_statement_with_projection`・`bucket_diff`・
+`render_baseline_bucket_line`）・`crates/engine/benches/hybrid_profile_bench.rs`
+（B0s〜B8 ラウンド計測セクション）・`crates/wire-server/benches/harness/
+hybrid_wire.rs`（新設）・`crates/wire-server/benches/hybrid_wire_profile_bench.rs`
+（新設）のみ。

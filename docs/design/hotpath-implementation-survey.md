@@ -257,7 +257,10 @@ Qdrant HNSW に劣後する:
 
 内訳切り分け・dim=768 規模点追加・生成コード検査ガード・macOS 検出検証・計測規約
 は #463／#466／#467／#468／#462 として起票済み。`hybrid_rrf` 最新基線の再計測は
-Issue #465、intrinsics 導入方針 ADR は #508、行間マイクロカーネル／i8 VNNI／NEON
+Issue #465 として実施済み（SQL 表層固定コスト・疎側再取得ループがほぼ同水準
+〔37〜39%〕で最大区分。`docs/design/hybrid-rrf-latency-breakdown.md`「最新基線」
+節・Phase 6〔#548〕への引き継ぎ参照）。intrinsics 導入方針 ADR は #508、行間
+マイクロカーネル／i8 VNNI／NEON
 dotprod／分岐なし tail は #509／#520／#524／#527、GPU 側（マルチクエリ
 dispatch／GPU 側 Top-k／SHADER_F16／`dot4I8Packed`）は #531／#534／#538／#541 と
 して起票済み。広域取得モード（Top-k の k 規模拡大時の再検討先）は #454。
