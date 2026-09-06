@@ -246,6 +246,12 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 （CPU-SIMD f16 常駐・12 スレッド）を同一コーパス・同一クエリで比較する。
 `mismatch` は GPU と CPU の Top-k 結果の不一致数（全点 0）。
 
+**（2026-09-06 追記・Issue #532）** dispatch 構造を「1 dispatch = 1 クエリ」
+から「`PolicyContext` 単位にグループ化したクエリを最大 `GPU_QUERY_TILE_MAX`
+本まで 1 dispatch へタイル化」する方式へ変更した（`gpu_batch.rs::
+DOT_SHADER_WGSL`）。以下の実測表は変更前の数値のまま。変更後の前後比較・
+数値更新は依存先 Issue #533 で実施予定。
+
 | rows | dim | batch | CPU-SIMD | GPU f16 | GPU f32 | per-query CPU | per-query GPU f16 | speedup f16 (p95) |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 20,000 | 128 | 1 | 3676 | 180 | 207 | 3676 | 180 | 20.17x |
