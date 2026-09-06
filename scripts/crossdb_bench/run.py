@@ -95,6 +95,63 @@ def _peek_embedding_dim(jsonl_path: str) -> int | None:
     return None
 
 
+def _scan_docs_dim_streaming(jsonl_path: str) -> tuple[int | None, str | None]:
+    """`jsonl_path`（docs jsonl）を行単位ストリーミングで全件走査し、`embedding`
+    次元が全行で一致するかを検証する（codex-review P2 指摘・PR #557。従来の
+    `_peek_embedding_dim` は先頭の非空行だけを見ており、後続レコードだけ次元が
+    異なる fixture（dim 混在）を `--expect-dim` 検査が見逃していた。数万行でも
+    メモリに全件展開しない行単位読み込みを維持する）。
+
+    戻り値は `(確認できた次元, 不一致時のエラー理由)`。次元を 1 件も確認できな
+    かった場合は `(None, None)` を返す（呼び出し側で「取得失敗」として扱う）。
+    """
+    import json as _json
+
+    dim: int | None = None
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            doc = _json.loads(line)
+            embedding = doc.get("embedding")
+            if embedding is None:
+                continue
+            current = len(embedding)
+            if dim is None:
+                dim = current
+            elif current != dim:
+                return dim, (
+                    f"docs line {lineno} has embedding dim {current}, "
+                    f"expected {dim} (from an earlier line)"
+                )
+    return dim, None
+
+
+def _scan_queries_dim(queries: list[dict]) -> tuple[int | None, str | None]:
+    """読み込み済み `queries`（`load_jsonl` 済みのリスト）全件の `embedding`
+    次元が一致するかを検証する（codex-review P2 指摘・PR #557。従来は
+    `queries[0]` のみを見ており、後続クエリだけ次元が異なる fixture の
+    取り違えを見逃していた）。
+
+    戻り値は `(確認できた次元, 不一致時のエラー理由)`。
+    """
+    dim: int | None = None
+    for i, q in enumerate(queries):
+        embedding = q.get("embedding")
+        if embedding is None:
+            continue
+        current = len(embedding)
+        if dim is None:
+            dim = current
+        elif current != dim:
+            return dim, (
+                f"queries[{i}] has embedding dim {current}, "
+                f"expected {dim} (from an earlier query)"
+            )
+    return dim, None
+
+
 def main() -> int:
     args = parse_args()
     if args.out_dir is None:
@@ -121,13 +178,17 @@ def main() -> int:
         )
         return 1
     if args.expect_dim is not None:
-        # --expect-dim 指定時は docs の存在・次元取得の成功も必須にする
-        # （codex-review P2 指摘・PR #557。queries 側の次元だけで判定すると、
-        # docs jsonl の export 忘れ（dim_source_docs が存在しない）でも
-        # query_dim が --expect-dim と一致していれば検査を素通りしてしまい、
-        # README の「docs／queries の次元を fail-closed に検証する」契約と
-        # 不一致になる。docs 未存在・次元取得失敗はいずれも非 0 終了で拒否する）。
-        if docs_dim is None:
+        # --expect-dim 指定時は docs／queries 双方の全レコードを次元検証する
+        # （codex-review P2 指摘・PR #557。当初は queries[0] と docs 先頭の
+        # 非空行だけを見ており、後続レコードだけ次元が異なる fixture（dim 混在。
+        # 例: queries[0]=768 次元・2 件目以降=128 次元）を見逃していた。特に
+        # mysql アダプタのように queries を検索に使わない経路では、不一致の
+        # まま結果 JSON が書き出されてしまう。読み込み済み queries は全件、
+        # docs は行単位ストリーミングで全件検証することで検証漏れを防ぐ）。
+        docs_dim_full, docs_dim_err = _scan_docs_dim_streaming(dim_source_docs) if os.path.exists(
+            dim_source_docs
+        ) else (None, None)
+        if docs_dim_full is None:
             reason = (
                 f"docs file not found: {dim_source_docs}"
                 if not os.path.exists(dim_source_docs)
@@ -138,6 +199,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        if docs_dim_err is not None:
+            print(f"error: --expect-dim {args.expect_dim} rejected ({docs_dim_err})", file=sys.stderr)
+            return 1
         # queries 側も同様に次元検証を必須にする（codex-review P2 指摘・PR #557
         # r3943524978）。queries JSONL が空だと query_dim が None のまま docs_dim
         # だけで --expect-dim 判定を素通りしてしまい、mysql アダプタ等 queries を
@@ -145,22 +209,24 @@ def main() -> int:
         # 検出できずに adapter 呼び出しへ進んでしまう。README の「docs／queries の
         # 埋め込み長を fail-closed に検証する」契約に合わせ、queries 側の次元が
         # 取得できない場合も adapter 呼び出し前に非 0 終了で拒否する。
-        if query_dim is None:
+        query_dim_full, query_dim_err = _scan_queries_dim(queries)
+        if query_dim_full is None:
             print(
                 f"error: --expect-dim {args.expect_dim} requires queries dim to be verified "
                 f"(queries file is empty or has no embedding: {args.queries_file})",
                 file=sys.stderr,
             )
             return 1
-        if query_dim != docs_dim:
-            # ここへ到達するのは通常あり得ない（直前の mismatch チェックで
-            # 既に非 0 終了しているため）が、fail-closed の多重防御として残す。
+        if query_dim_err is not None:
+            print(f"error: --expect-dim {args.expect_dim} rejected ({query_dim_err})", file=sys.stderr)
+            return 1
+        if query_dim_full != docs_dim_full:
             print(
-                f"error: embedding dim mismatch between docs ({docs_dim}) and queries ({query_dim})",
+                f"error: embedding dim mismatch between docs ({docs_dim_full}) and queries ({query_dim_full})",
                 file=sys.stderr,
             )
             return 1
-        actual_dim = docs_dim
+        actual_dim = docs_dim_full
         if actual_dim != args.expect_dim:
             print(
                 f"error: --expect-dim {args.expect_dim} does not match actual dim {actual_dim}",
