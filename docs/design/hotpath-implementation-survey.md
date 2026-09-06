@@ -210,7 +210,7 @@ Top-k を取りこぼしうる）。したがって量子化が適用できる�
 | ---- | ---- | ---- | -------------- | ---------- |
 | BLAS(sgemm) 経路への閾値切替 | faiss `utils/distances.cpp` | クエリ数×次元の閾値で逐次／BLAS を切替 | 不採用。BLAS（OpenBLAS/MKL）の依存追加が必要で依存最小方針と衝突。ただし「規模の閾値でバッチ経路へ切り替える」設計パターン自体は `gpu_batch.rs` のバッチ判定の参考になる（依存非追加の範囲でパターンのみ） | MIT |
 | L2 の `‖x‖²+‖y‖²−2⟨x,y⟩` 分解 | faiss `exhaustive_L2sqr_blas_default_impl` | 事前計算ノルム＋sgemm 内積、丸め誤差の微小負値をクランプ | 対象外（本リポは内積のみ・cosine は正規化契約）。負値クランプという数値安定化パターンは将来 L2 系カーネル追加時の参考として記録 | MIT |
-| WarpSelect／BlockSelect（GPU 上 Top-k） | faiss `gpu/utils/{WarpSelectKernel,BlockSelectKernel,Select}.cuh` | ウォープ内シャッフルでビトニックマージ | 条件付き（移植困難）。CUDA 専用の warp shuffle に依存し `wgpu`/WGSL へ直接移植不可。WGSL `subgroup` 拡張なら原理的に可能だが `wgpu =30.0.1` 時点の対応状況と環境非依存方針（NVIDIA/AMD/Apple 混在）でハードルが高い。「GPU 上で Top-k まで完結させ全距離を CPU へ転送しない」方針自体は記録に値する | MIT |
+| WarpSelect／BlockSelect（GPU 上 Top-k） | faiss `gpu/utils/{WarpSelectKernel,BlockSelectKernel,Select}.cuh` | ウォープ内シャッフルでビトニックマージ | 条件付き（移植困難）。CUDA 専用の warp shuffle に依存し `wgpu`/WGSL へ直接移植不可。WGSL `subgroup` 拡張なら原理的に可能だが `wgpu =30.0.1` 時点の対応状況と環境非依存方針（NVIDIA/AMD/Apple 混在）でハードルが高い。「GPU 上で Top-k まで完結させ全距離を CPU へ転送しない」方針自体は記録に値する。wgpu での設計は [`gpu-batch-topk.md`](gpu-batch-topk.md)（#535） | MIT |
 | 距離計算と Top-k のタイル内融合 | faiss `utils/distances_fused/` | 実体は CPU 側 AVX-512 カーネル（GPU ではない）。小次元×Top-1 専用 | 不採用（誤読注意点として記録）。GPU タイル融合ではなく CPU 特殊ケース（小次元・Top-1 専用） | MIT |
 | `wgpu` による GPU バッチ検索 | 本リポ `gpu_batch.rs` | — | 既採用（TASK-128〜130・Issue #178。CORE-6/16 のベンチ配線・`GpuF32ContrastBackend` の f16/f32 常駐対照含む） | — |
 

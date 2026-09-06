@@ -399,6 +399,19 @@ else
 endif
 
 # --------------------------------------------------
+# wgpu アダプタの features／limits を出力する検出ツール
+# （Issue #535。crates/engine/examples/gpu_adapter_info.rs）
+# --------------------------------------------------
+
+.PHONY: gpu-adapter-info
+gpu-adapter-info: ## Issue #535（wgpu SUBGROUP 可用性設計）向けの adapter features／limits 表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/gpu-batch-topk.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example gpu_adapter_info
+else
+	@echo "skip: Cargo.toml 未追加のため gpu-adapter-info をスキップ"
+endif
+
+# --------------------------------------------------
 # 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
 # --------------------------------------------------
 
