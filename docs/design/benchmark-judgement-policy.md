@@ -162,8 +162,9 @@ p50 が before の ×1.05 以下、p95 が before の ×1.10 以下であれば�
 
 判定不能な種別で得られた数値は「参考値」として記録し、専有環境（または該当 ISA
 ／GPU を持つ環境）での再実測をオーナーへ申し送る。専有環境の確保自体は
-オーナー作業であり、本 doc の対象外とする（チップ別の手動計測手順は #469 を
-参照。#469 が策定次第、本 doc から相互リンクする）。
+オーナー作業であり、本 doc の対象外とする（チップ別の手動計測手順は
+README「チップ別カーネルの実測手順（Issue #469）」・`make bench-chip`・
+`docs/design/chip-kernel-guidelines.md` §7 を参照）。
 
 命令レベル最適化・キャッシュレイアウトの生成コード検査手順は
 `docs/design/hotpath-implementation-survey.md`・`docs/design/chip-kernel-guidelines.md`
@@ -228,9 +229,9 @@ before/after 比較を追加する場合は本 doc §7.2 のひな形に従い�
 
 - 専有環境（`BENCH_DEDICATED_ENV=1`）の確保自体はオーナー作業として従来どおり
   未実施のまま引き継ぐ。
-- `docs/design/hotpath-implementation-survey.md`・
-  `docs/design/chip-kernel-guidelines.md`（Issue #470 が作成予定）との相互リンク
-  化は、#470 マージ後に別途行う。
+- `docs/design/hotpath-implementation-survey.md`・`docs/design/chip-kernel-guidelines.md`
+  （Issue #470 で作成済み。チップ別手動計測の結果記録テンプレートは同 doc §7
+  ・Issue #469）との相互リンクは上記 §6 に反映済み。
 - 既存 ADR（#365・#366・#400・#401）本文の計測規約記述を本 doc への参照へ
   書き換える retro 編集は行わない。各 ADR は当時の計測記録として残置し、本 doc
   の §8 で吸収関係を示すに留める。

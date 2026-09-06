@@ -283,14 +283,14 @@ make rerank-cross-encoder-eval
 
 ### 他 DB との機能別横断ベンチ（`make bench-crossdb`）
 
-`scripts/crossdb_bench/`（Python ハーネス・Cargo 依存追加なし）を使い、自作 DB（wire-server 経由）と pgvector・sqlite-vec・Qdrant・LanceDB・MySQL の機能別（KNN・フィルタ付き KNN・集計・GROUP BY・hybrid・Recall@10 等）レイテンシを同一データセット（25,000 行・dim 128）上で比較します。計測ツールの Python 依存は `requirements.txt` で `==` 固定し、Cargo 依存は増やしていません。
+`scripts/crossdb_bench/`（Python ハーネス・Cargo 依存追加なし）を使い、自作 DB（wire-server 経由）と pgvector・sqlite-vec・Qdrant・LanceDB・MySQL の機能別（KNN・フィルタ付き KNN・集計・GROUP BY・hybrid・Recall@10 等）レイテンシを既定 dim 128・25,000 行のデータセット上で比較します（`CROSSDB_DIM` で dim=768 等へ切替可。Issue #466）。計測ツールの Python 依存は `requirements.txt` で `==` 固定し、Cargo 依存は増やしていません。
 
 **前提環境**:
 
 - Docker
 - Python venv: `pip install -r scripts/crossdb_bench/requirements.txt`
 - `cargo build --release -p wire-server`
-- fixture 生成: `cargo run --release -p engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`
+- fixture 生成: `cargo run --release -p engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`（dim=768 は `docs25k-d768.redb` のように `-d<dim>` 付きファイル名で生成し `seed`／`queries` の第 2 引数〔dim〕を 768 にする。下記「実行」参照）
 
 **実行**:
 
@@ -300,7 +300,20 @@ export CROSSDB_PYTHON=<venv の python へのパス>
 make bench-crossdb
 ```
 
-`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
+`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。`CROSSDB_DIM=768` を指定すると既定ファイル名を `docs25k-d768.{redb,jsonl}`／`queries200-d768.jsonl`、出力先を `$CROSSDB_DIR/results/d768`／`$CROSSDB_DIR/logs/d768` へ切り替え、`run.py --expect-dim 768` で docs／queries の埋め込み次元が一致することを fail-closed に検証します（`CROSSDB_REDB`／`CROSSDB_DOCS`／`CROSSDB_QUERIES` を明示すればこの既定より優先されます）。
+
+```bash
+# dim=768 の fixture を生成してから計測する例（Issue #466）
+S=$CROSSDB_DIR
+cargo run --release -p engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+CROSSDB_DIM=768 make bench-crossdb
+```
+
+同一ホストで他セッションの対照 DB コンテナ（既定名 `bench-pgvector`／`bench-qdrant`／`bench-mysql`）と並行計測したい場合は `CROSSDB_PG_CONTAINER`／`CROSSDB_QDRANT_CONTAINER`／`CROSSDB_MYSQL_CONTAINER`（Docker コンテナ名文字集合のみ許可・fail-closed）で別名を指定できます（ポートも `CROSSDB_*_PORT` で別値にしないと衝突するため両方指定してください。Issue #466。詳細は `scripts/crossdb_bench/README.md` 参照）。
+
+GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください（dim=768 基線は同ドキュメント参照）。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
 
@@ -309,6 +322,38 @@ make bench-crossdb
 ### 全行走査経路の段別プロファイル（Issue #464）
 
 `make bench-scan-stage-profile`（`crates/engine/benches/scan_stage_profile_bench.rs`）は、`docs/design/crossdb-bench.md` で self が最劣後する `agg_count`／`rls_isolation`／`vector_knn_where` の redb 全行走査・ヘッダデコード・RLS 判定（`PolicyContext::is_visible`＋TABLE-12 キー/ヘッダ整合検査）・dim/metadata デコード・`WHERE` 述語評価・arena 複製の段別内訳を切り分けます。`BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行・4＝100,000 行。1 プロセス = 1 規模点）で規模、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds/scale パース・段間差分・ノイズ帯判定・整合性検証）は `crates/engine/tests/scan_stage_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計・後続 Issue（#477・#471）への帰属分析の詳細は `docs/design/scan-stage-profile.md` を参照してください。
+
+### チップ別カーネルの実測手順（Issue #469）
+
+`make bench-chip`（`crates/engine/benches/chip_bench.rs`）は、`bench-dot-kernel`・`bench-knn-profile`・`feature_bench`（`BENCH_FEATURE_DIM=128`／`768`）の 4 ワークロードを 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・実行時検出 ISA・per-run 生データ・min/median・参照区間帯を `summary.json` へ出力します。
+
+> [!IMPORTANT]
+> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。
+
+前提: Linux／aarch64 Linux は `/proc/cpuinfo`（追加ツール不要）、macOS は Xcode Command Line Tools（`cargo`）と `sysctl`（標準搭載）のみで動作します。`contrast-bench` feature は使わないため C++17 コンパイラは不要です。
+
+実行例:
+
+- `make bench-chip`（既定 5 ラウンド・全 4 ワークロード）
+- `BENCH_CHIP_ROUNDS=1 BENCH_CHIP_WORKLOADS=dot_kernel make bench-chip`（スモーク実行。`BENCH_CHIP_ROUNDS` が `docs/design/benchmark-judgement-policy.md` の最小ペア数〔5〕未満の場合、`summary.json` の `meets_policy_min_rounds` が `false` になり参考値であることを自己ラベルします）
+- `BENCH_DEDICATED_ENV=1 make bench-chip`（専有環境自己申告。他の `bench-*` ターゲットと同じ自己申告のみで自動検出はしません）
+
+env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
+
+| 変数 | 既定 | 内容 |
+| ---- | ---- | ---- |
+| `BENCH_CHIP_ROUNDS` | 5 | ラウンド数（1〜50） |
+| `BENCH_CHIP_WORKLOADS` | 全 4 種 | `dot_kernel,knn_profile,feature_128,feature_768` のカンマ区切り部分集合 |
+| `BENCH_CHIP_OUT_DIR` | `target/bench-chip/<unix-ts>` | 出力先（既存の `summary.json` があれば上書き拒否） |
+| `BENCH_DEDICATED_ENV` | 未設定 | `1` で専有環境自己申告 |
+
+`BENCH_FEATURE_ENGINE`・`BENCH_KNN_PROFILE_ENGINE` 等、上記以外の `BENCH_*` env は親プロセスの環境をそのまま子プロセスへ継承します（`BENCH_FEATURE_DIM` のみ `feature_128`／`feature_768` ワークロードが上書きします）。
+
+出力は `<BENCH_CHIP_OUT_DIR>/summary.json`（CPU モデル名・関心 ISA フラグ・キャッシュ容量・実行時検出フラグ・build 情報・ラウンドごとの per-run ログパス・メトリクスごとの `values`／`min`／`median`／`max`／`reference_band_pct`）と、各 (round, workload) ごとの `round<N>_<workload>.{stdout,stderr}.log` です。すべて `<BENCH_CHIP_OUT_DIR>` からの相対パスで記録し、絶対パス・ホスト名・ユーザー名は含みません。本開発環境（QEMU・12 vCPU）での既定 5 ラウンド完走は数分程度でした（実測は環境依存）。
+
+**before/after の交互比較手順**（`docs/design/dot-kernel-multi-accumulator.md`「再現手順」と同型）: 変更前後のコミットをそれぞれ別の worktree（`CARGO_TARGET_DIR` を分離）でビルドし、`BENCH_CHIP_ROUNDS=1 BENCH_CHIP_OUT_DIR=<...>/pairN/{before,after}` を N ≥ 5 ペア交互実行してください。各 `summary.json` の値列を `docs/design/chip-kernel-guidelines.md` §7 の結果記録テンプレートへ転記し、min-of-N・median・ratio・参照区間帯を記録します。
+
+結果の記録先・公開境界: 実測値そのものは public な docs・Issue へ記録可能です（オーナー判断 2026-08-29・[spec-confidentiality](.claude/rules/spec-confidentiality.md)）。spec 由来の閾値は本リポジトリには記載しません。結果記録テンプレート・チップ別空テンプレート・`summary.json` キー一覧は `docs/design/chip-kernel-guidelines.md` §7 を参照してください。
 
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
@@ -419,11 +464,14 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 
 - `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）。未知値は fail-closed で拒否
 - `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
+- `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
 ```bash
 BENCH_FEATURE_ENGINE=hnsw cargo run --release -p engine --example feature_bench
 BENCH_FEATURE_ENGINE=hnsw BENCH_FEATURE_SCALE=4 cargo run --release -p engine --example feature_bench  # 100,000 行
 BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
+BENCH_FEATURE_DIM=768 cargo run --release -p engine --example feature_bench
+BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。

@@ -9,7 +9,7 @@
 #[path = "../benches/harness/mod.rs"]
 mod harness;
 
-use harness::bench_engine::{parse_engine, parse_scale, BenchEngine};
+use harness::bench_engine::{parse_dim, parse_engine, parse_scale, BenchEngine};
 
 #[test]
 fn parse_engine_accepts_unset_empty_and_brute_force_as_default() {
@@ -54,6 +54,25 @@ fn parse_scale_rejects_zero_non_numeric_and_over_bound_fail_closed() {
         }
         assert!(
             parse_scale(Some(raw), 40).is_err(),
+            "expected {raw:?} to be rejected"
+        );
+    }
+}
+
+#[test]
+fn parse_dim_defaults_and_accepts_within_bound() {
+    assert_eq!(parse_dim(None, 128, 4096), Ok(128));
+    assert_eq!(parse_dim(Some(""), 128, 4096), Ok(128));
+    assert_eq!(parse_dim(Some("768"), 128, 4096), Ok(768));
+    assert_eq!(parse_dim(Some(" 1536 "), 128, 4096), Ok(1536));
+    assert_eq!(parse_dim(Some("4096"), 128, 4096), Ok(4096));
+}
+
+#[test]
+fn parse_dim_rejects_zero_non_numeric_and_over_bound_fail_closed() {
+    for raw in ["0", "-1", "abc", "1.5", "4097", "128x"] {
+        assert!(
+            parse_dim(Some(raw), 128, 4096).is_err(),
             "expected {raw:?} to be rejected"
         );
     }

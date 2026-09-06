@@ -300,6 +300,110 @@ opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全
 - GPU／wgpu: https://docs.rs/wgpu/30.0.1/wgpu/struct.FeaturesWebGPU.html ／
   struct.FeaturesWGPU.html ／ gfx-rs/wgpu #7494・#7574・#7595
 
+## 7. 結果記録テンプレート（Issue #469）
+
+本開発環境（QEMU 仮想 CPU・AVX-512 なし・NEON なし。§0.6）では Phase 4 の
+採否判定に必要な実測ができないため、オーナー実機（Apple M／AMD Zen 4・5／
+Intel）での手動計測が必要になる。手順は README「チップ別カーネルの実測手順
+（Issue #469）」・`make bench-chip`（`crates/engine/benches/chip_bench.rs`）・
+`docs/design/benchmark-judgement-policy.md` §3〜§5 を参照。本節はその結果を
+チップ横断で比較可能な形式に揃えるための記録テンプレートである。
+
+### 7.1 環境記録表（1 計測 = 1 行）
+
+| チップ名／世代 | OS | 検出 ISA（`engine::isa`） | runtime_features 要点 | L1d／L2／L3 | nproc | rustc | commit（before/after） | dedicated_env_attested | rounds／meets_policy_min_rounds | loadavg 範囲 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| （未計測） | | | | | | | | | | |
+
+### 7.2 結果記録表（区間 ↔ policy §7.2 の列と 1:1）
+
+| 区間（`summary.json` メトリクスキー） | before min | before median | after min | after median | ratio (min-of-N) | 判定クラス（`classify_change(ratio, 0.05)`） | 参照区間帯（`reference_band_pct`） |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| （未計測） | | | | | | | | |
+
+### 7.3 参照区間の指定（施策別）
+
+dot カーネル変更（#517 等）の参照区間は、dot を通らない `feature_bench` フェーズ
+（例: `agg_count`・`explain`・`where_compound`）と `knn_profile` の
+`S1_redb_scan`／`S2_header_decode`（`chip_bench` の `knn_profile` ワークロードが
+同時に計測する）を用いる。f16 常駐・行間マイクロカーネル等、施策ごとの
+「対象区間 → 参照区間」対応は #509・#513・#517・#520・#524・#527 側で個別に
+定義し、本 doc へはポインタのみを残す。
+
+### 7.4 `summary.json` キー一覧
+
+`chip_bench` の出力スキーマ（`schema_version: 1`）。キー追加は minor 互換、
+既存キーの意味変更は `schema_version` を繰り上げる。
+
+- `rounds`／`policy_min_rounds`／`meets_policy_min_rounds`（`rounds` が
+  `docs/design/benchmark-judgement-policy.md` の最小ペア数〔5〕未満なら
+  `false`。参考値の自己ラベル）
+- `dedicated_env_attested`（`BENCH_DEDICATED_ENV=1` の自己申告。自動検出はしない）
+- `workloads`（実行したワークロードの固定順配列）
+- `build.{commit,dirty,rustc,host}`
+- `env.{os,arch,logical_cpus,detected_isa}`・`env.cpu.{model_name,flags,caches,sysctl}`・
+  `env.runtime_features`（`is_x86_feature_detected!`／
+  `is_aarch64_feature_detected!` の結果。#468 の材料であり本 doc は結論を書かない）
+- `runs[]`（`round`・`workload`・`loadavg_before`・`exit_code`・`stdout_log`）
+- `results.<workload>.metrics.<key>.{values,min,median,max,reference_band_pct}`
+  （`dot_kernel`: `<working_set>/dim=<n>/{ns_per_dot,median_ms}`・
+  `diagnostic_ab/simd_vs_scalar_ratio`。`knn_profile`:
+  `<stage>/{median_ms,ns_per_row}`。`feature_128`／`feature_768`:
+  `<phase>/{min_us,p50_us,p95_us}`）
+- `raw_logs_dir`（`<BENCH_CHIP_OUT_DIR>` からの相対パスのみ。絶対パス・
+  ホスト名・ユーザー名は含まない）
+
+### 7.5 チップ別空テンプレート
+
+以下はいずれも未計測（本 Issue の実装時点では起票のみ）。各小節の実測は
+オーナー実機での `make bench-chip` 実行後にオーナー／管理者が追記する。
+
+- **Apple M1／M2／M3／M4**（`sysctl machdep.cpu.brand_string`・
+  `hw.perflevel{0,1}.physicalcpu`・`hw.optional.arm.FEAT_*` を記録列に含める）
+- **AMD Zen 4**（Ryzen 7000／EPYC Genoa）
+- **AMD Zen 5**（デスクトップ／EPYC Turin／Ryzen AI 300 Strix Point）
+- **Intel Ice Lake-SP**
+- **Intel Sapphire Rapids／Emerald Rapids**
+- **Intel Alder Lake〜Arrow Lake**
+
+各小節共通の注記: 本開発環境（QEMU）の値は参考値であり production 変更の
+採否根拠にしない（`docs/design/benchmark-judgement-policy.md` §5）。macOS 上の
+`is_aarch64_feature_detected!` の実効性（true/false の実機確認）は Issue #468
+の担当。Phase 4 通しのチップ別前後比較・最速判定は Issue #530 の担当。
+
+### 7.6 本環境での完走記録（参考値）
+
+`make bench-chip`（既定 5 ラウンド・全 4 ワークロード）を本開発環境（QEMU
+仮想 CPU）で 1 回実行し、以下の環境ブロックを得た（実測値は公開可能な範囲
+——[spec-confidentiality](../../.claude/rules/spec-confidentiality.md) 参照
+——だが、共有 QEMU 環境の絶対値のため §7.5 の各チップ小節へは転記しない）。
+
+```json
+{
+  "os": "linux", "arch": "x86_64", "logical_cpus": 12, "detected_isa": "Avx2Fma",
+  "cpu": {
+    "model_name": "QEMU Virtual CPU version 2.5+",
+    "flags": ["fma", "sse4_2", "avx", "f16c", "avx2"],
+    "caches": [
+      {"level": 1, "type": "Data", "bytes": 32768},
+      {"level": 1, "type": "Instruction", "bytes": 32768},
+      {"level": 2, "type": "Unified", "bytes": 4194304},
+      {"level": 3, "type": "Unified", "bytes": 16777216}
+    ]
+  },
+  "runtime_features": {
+    "avx2": true, "fma": true, "f16c": true,
+    "avx512f": false, "avx512bw": false, "avx512vl": false,
+    "avx512vnni": false, "avx512bf16": false, "avx512fp16": false, "avxvnni": false
+  }
+}
+```
+
+`rounds: 5`・`meets_policy_min_rounds: true`。所要時間は本環境で数分程度
+（環境依存のため参考値）。全 4 ワークロード × 5 ラウンドが exit_code 0 で
+完走し、`summary.json`・per-run ログが `target/bench-chip/<unix-ts>/` に
+出力されることを確認した。
+
 ## 参照
 
 - spec ポインタ（本文非転記）: CORE-9／CORE-10／CORE-16／TASK-132

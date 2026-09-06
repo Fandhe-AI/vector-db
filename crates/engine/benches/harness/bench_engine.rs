@@ -6,7 +6,9 @@
 //! ゲート層 B の ANN opt-in・Issue #412）と同じ「未設定・空・既定トークンは既定へ、
 //! それ以外の未知値は fail-closed で拒否」の語彙・判定方針を、計測 example・bench
 //! 側の env 変数（`BENCH_FEATURE_ENGINE`／`BENCH_KNN_PROFILE_ENGINE`・
-//! `BENCH_FEATURE_SCALE`）向けに複製したもの。`ingest_profile_bench.rs::
+//! `BENCH_FEATURE_SCALE`・`BENCH_FEATURE_DIM`／`BENCH_KNN_PROFILE_DIM`〔Issue #466。
+//! dim=768／1536 が採否の判別変数になり得るため横断ベンチの規模点へ dim を追加〕）
+//! 向けに複製したもの。`ingest_profile_bench.rs::
 //! read_env_var` と同じ理由（`VarError::NotUnicode` を「未設定」へ黙って合流させ
 //! ない）で env 読み取りも本モジュールへ集約する。
 //!
@@ -105,6 +107,41 @@ pub fn parse_scale(raw: Option<&str>, max: u64) -> Result<u64, BenchEngineError>
         None | Some("") => 1,
         Some(s) => s
             .parse::<u64>()
+            .map_err(|_| err(format!("must be a positive integer (got {s:?})")))?,
+    };
+    if value == 0 {
+        return Err(err("must be >= 1 (got 0)"));
+    }
+    if value > max {
+        return Err(err(format!("must be <= {max} (got {value})")));
+    }
+    Ok(value)
+}
+
+/// `feature_bench.rs`／`knn_profile_bench.rs` の既定次元数（Issue #466）。
+/// `BENCH_FEATURE_DIM`／`BENCH_KNN_PROFILE_DIM` 未設定時の後方互換値。
+pub const DEFAULT_BENCH_DIM: u32 = 128;
+
+/// `parse_dim` が許容する次元数の上限（Issue #466）。`ingest_profile_bench.rs::
+/// parse_bounded_env`（`BENCH_INGEST_PROFILE_DIM`・`1..=4096`）と同値を踏襲する。
+/// `feature_bench` の最大規模（scale=4・`ROWS_A + ROWS_B` = 25,000 行/単位 × 4 ≒
+/// 100,000 行）× dim 4,096 × 4 バイト（f32）≒ 1.6 GiB の arena 確保が上限の目安。
+/// `storage::MAX_EMBEDDING_DIM`（65,536）まで許すと無制限確保に近い規模になり
+/// ベンチ実行環境の OOM を招きうるため、計測用途として現実的な範囲に絞る。
+pub const MAX_BENCH_DIM: u32 = 4_096;
+
+/// `raw`（`read_env_var` が返した値）から次元数を解決する（Issue #466。
+/// `parse_scale` と同じ契約: 前後の空白を許容し、未設定・空文字列は `default`、
+/// それ以外は `1..=max` の範囲の正整数のみを受理する fail-closed パーサ）。
+/// dim=768／1536 が Issue #365 の複数アキュムレータ化検討で採否の判別変数と
+/// 判明したため、`feature_bench`・`knn_profile_bench` の dim を可変化する
+/// 注入点として使う。
+pub fn parse_dim(raw: Option<&str>, default: u32, max: u32) -> Result<u32, BenchEngineError> {
+    let trimmed = raw.map(str::trim);
+    let value: u32 = match trimmed {
+        None | Some("") => return Ok(default),
+        Some(s) => s
+            .parse::<u32>()
             .map_err(|_| err(format!("must be a positive integer (got {s:?})")))?,
     };
     if value == 0 {

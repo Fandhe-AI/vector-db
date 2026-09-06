@@ -353,7 +353,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-knn-profile
-bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）
+bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる
 ifdef HAS_CARGO
 	cargo bench --bench knn_profile_bench -p engine
 else
@@ -395,6 +395,21 @@ ifdef HAS_CARGO
 	cargo bench --bench scan_stage_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-scan-stage-profile をスキップ"
+endif
+
+# --------------------------------------------------
+# チップ別手動計測（Issue #469。crates/engine/benches/chip_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-chip
+bench-chip: ## Issue #469（チップ別手動計測。bench-dot-kernel・bench-knn-profile・feature_bench〔dim 128／768〕を 1 ワークロード = 1 プロセスでラウンドロビン交互計測し CPU 情報付き summary.json を出力する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_CHIP_ROUNDS=<1-50>〔既定 5。5 未満は参考値として自己ラベル〕・BENCH_CHIP_WORKLOADS=<dot_kernel,knn_profile,feature_128,feature_768 の部分集合。既定は全 4 種〕・BENCH_CHIP_OUT_DIR〔既定 target/bench-chip/<unix-ts>〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる。実測手順は README「チップ別カーネルの実測手順」参照）
+ifdef HAS_CARGO
+	cargo bench --bench dot_kernel_bench -p engine --no-run
+	cargo bench --bench knn_profile_bench -p engine --no-run
+	cargo build --release -p engine --example feature_bench
+	cargo bench --bench chip_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-chip をスキップ"
 endif
 
 # --------------------------------------------------
@@ -446,7 +461,7 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-crossdb
-bench-crossdb: ## self（wire-server 経由）と pgvector / sqlite-vec / Qdrant / LanceDB / MySQL を機能別に比較する（Docker・Python venv・`cargo build --release -p wire-server`・seed_docs 生成 fixture が必要。CROSSDB_DIR〔fixture ディレクトリ〕と CROSSDB_PYTHON〔venv の python〕を必須指定。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-crossdb: ## self（wire-server 経由）と pgvector / sqlite-vec / Qdrant / LanceDB / MySQL を機能別に比較する（Docker・Python venv・`cargo build --release -p wire-server`・seed_docs 生成 fixture が必要。CROSSDB_DIR〔fixture ディレクトリ〕と CROSSDB_PYTHON〔venv の python〕を必須指定。任意 CROSSDB_DIM（十進数字のみ・例 768。Issue #466）で dim 別 fixture 名（docs25k-d<dim>.*／queries200-d<dim>.jsonl）・results/logs サブディレクトリへ切替。時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
 	@test -n "$(CROSSDB_DIR)" || { echo "CROSSDB_DIR を指定してください（fixture ディレクトリ）"; exit 1; }
 	@test -n "$(CROSSDB_PYTHON)" || { echo "CROSSDB_PYTHON を指定してください（venv の python）"; exit 1; }
 	CROSSDB_DIR="$(CROSSDB_DIR)" CROSSDB_PYTHON="$(CROSSDB_PYTHON)" bash scripts/crossdb_bench/run_all.sh

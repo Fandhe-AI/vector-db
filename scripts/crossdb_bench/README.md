@@ -75,6 +75,32 @@ CROSSDB_PG_PORT=25433 scripts/crossdb_bench/containers.sh up pgvector
 CROSSDB_PG_PORT=25433 python scripts/crossdb_bench/run.py --db pgvector --config exact ...
 ```
 
+### 環境変数（コンテナ名）
+
+`containers.sh` が起動する各コンテナの名前は既定で `bench-<db>` 固定だが、
+同一ホストで別セッションが同名コンテナを既に使っている場合、冪等化のための
+`docker rm -f` がその別セッションの状態を破壊してしまう（Issue #466。他 DB
+横断ベンチの実測中に外部 `bench-qdrant` を誤って削除しかけた事故の再発防止）。
+以下の環境変数で別名を指定できる（Docker のコンテナ名文字集合 `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`
+に適合しない値は `containers.sh` が fail-closed で拒否する）。名前だけ変えても
+既定ポートのままでは外部コンテナと衝突するため、上記のポート変数も必ず
+あわせて別値を指定すること。
+
+| 環境変数 | 既定値 | 対象 |
+| -------- | ------ | ---- |
+| `CROSSDB_PG_CONTAINER` | `bench-pgvector` | pgvector コンテナ名 |
+| `CROSSDB_QDRANT_CONTAINER` | `bench-qdrant` | Qdrant コンテナ名 |
+| `CROSSDB_MYSQL_CONTAINER` | `bench-mysql` | MySQL コンテナ名 |
+
+```bash
+# 外部 bench-qdrant（既定ポート）と衝突しない別名・別ポートで計測する例
+export CROSSDB_QDRANT_CONTAINER=bench-qdrant-466
+export CROSSDB_QDRANT_HTTP_PORT=26333 CROSSDB_QDRANT_GRPC_PORT=26334
+scripts/crossdb_bench/containers.sh up qdrant
+python scripts/crossdb_bench/run.py --db qdrant --config exact ...
+scripts/crossdb_bench/containers.sh down qdrant
+```
+
 self の `run.py --db self` は認証ファイル `users.txt` を `--workdir`
 （既定: `--rows-file` の親ディレクトリ）直下ではなく、その配下に毎回新規作成する
 一意なサブディレクトリ `self_bench_auth_<pid>_*/` へ生成し、停止時に削除する
@@ -120,6 +146,30 @@ python scripts/crossdb_bench/run.py --db mysql --config exact \
 
 結果は `<queries-file のディレクトリ>/results/<db>_<config>.json`
 （`--out-dir` で上書き可）に書き出される。
+
+### dim 別 fixture（Issue #466）
+
+dim=768／1536 が Issue #365（dot カーネル多アキュムレータ化検討）で採否の
+判別変数と判明したため、`docs25k.*`／`queries200.jsonl` 固定名とは別に
+`-d<dim>` サフィックス付き fixture を生成して計測できる。
+
+```bash
+cargo run --release -p engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+
+python scripts/crossdb_bench/run.py --db self --config exact \
+  --rows-file "$S/docs25k-d768.redb" --queries-file "$S/queries200-d768.jsonl" \
+  --out-dir "$S/results/d768" --expect-dim 768
+```
+
+`--docs-file` を省略した場合、self は `--rows-file` と同じ basename（拡張子
+のみ `.jsonl`）を自動探索する（`docs25k-d768.redb` → `docs25k-d768.jsonl`）。
+`--expect-dim` を指定すると docs／queries の埋め込み長がその値と一致することを
+fail-closed に検証する（不一致・fixture の取り違えは非 0 終了で拒否し、
+`unsupported` へ丸めない）。`make bench-crossdb` から一括実行する場合は
+`CROSSDB_DIM=768`（十進数字のみ）を指定すると上記のファイル名・出力先・
+`--expect-dim` を自動で組み立てる（Makefile「bench-crossdb」参照）。
 
 ### スモークテスト（2,000 行サブセット）
 
