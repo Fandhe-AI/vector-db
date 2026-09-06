@@ -283,7 +283,10 @@ fn runtime_features() -> Vec<(&'static str, bool)> {
         ("i8mm", std::arch::is_aarch64_feature_detected!("i8mm")),
         ("sve", std::arch::is_aarch64_feature_detected!("sve")),
         ("sve2", std::arch::is_aarch64_feature_detected!("sve2")),
-        ("sme", std::arch::is_aarch64_feature_detected!("sme")),
+        // "sme" は stable Rust では stdarch_aarch64_feature_detection
+        // （https://github.com/rust-lang/rust/issues/127764）が未安定のため
+        // is_aarch64_feature_detected! で検出できない（cross-check の aarch64
+        // クロスコンパイルで E0658）。安定化まで計測項目から除外する。
     ]
 }
 
@@ -479,8 +482,16 @@ fn main() {
             };
             let stdout_log = out_dir.join(format!("round{round}_{}.stdout.log", workload.token()));
             let stderr_log = out_dir.join(format!("round{round}_{}.stderr.log", workload.token()));
-            let _ = std::fs::write(&stdout_log, &outcome.stdout);
-            let _ = std::fs::write(&stderr_log, &outcome.stderr);
+            // per-run ログの保存失敗を握りつぶすと summary.json だけは正常生成され、
+            // 存在しないログを runs[].stdout_log が指したまま正常終了してしまう
+            // （codex-review 指摘）。書き込み結果を確認し失敗時は fail-closed で
+            // 異常終了する。
+            if let Err(e) = std::fs::write(&stdout_log, &outcome.stdout) {
+                fail_closed(format!("failed to write {}: {e}", stdout_log.display()));
+            }
+            if let Err(e) = std::fs::write(&stderr_log, &outcome.stderr) {
+                fail_closed(format!("failed to write {}: {e}", stderr_log.display()));
+            }
             println!(
                 "chip_bench: round={round}/{rounds} workload={} exit={}",
                 workload.token(),
@@ -702,10 +713,13 @@ fn main() {
         out.push_str("}}");
     }
     out.push_str("\n  },\n");
-    out.push_str(&format!(
-        "  \"raw_logs_dir\": \"{}\"\n",
-        json_escape(&out_dir_raw)
-    ));
+    // raw_logs_dir は summary.json 自身の位置からの相対パスのみを記録する
+    // （`runs[].stdout_log` と同じ基準）。per-run ログは out_dir 直下
+    // （summary.json と同じディレクトリ）に書くため常に "." であり、
+    // BENCH_CHIP_OUT_DIR に絶対パスを渡された場合でもユーザー名を含む
+    // ローカルパスが summary.json へ残らない
+    // （codex-review 指摘・chip-kernel-guidelines.md §7.4）。
+    out.push_str("  \"raw_logs_dir\": \".\"\n");
     out.push_str("}\n");
 
     let summary_path = out_dir.join("summary.json");
