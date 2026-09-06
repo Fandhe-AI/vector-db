@@ -119,6 +119,16 @@ impl RejectWorkerLimiter {
     }
 }
 
+/// 簡易クエリ応答（`RowDescription`/`DataRow`×N/`CommandComplete`/
+/// `ReadyForQuery`）を 1 回の write へ束ねる際の未送出バッファ上限
+/// （フラッシュ閾値。Issue #481）。
+///
+/// 「拒否」の上限ではない ―― `crate::response_buffer::ResponseBuffer` は
+/// この値を超えそうになったら、それまで積んだぶんを先に送出してから続ける
+/// （分割送出）。接続あたりの追加常駐メモリをこの値 + フレーム 1 個ぶんに
+/// 有界化し、[`MAX_CONNECTIONS`] 全体でも合計常駐メモリを有界に保つ。
+pub const MAX_RESPONSE_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// SQLSTATE `53300`（too_many_connections）。ポインタ:
 /// `docs/spec/04-behavior/error-format.md`。値は `engine::error_format::
 /// ErrorClass`（SSOT。TASK-152・ERR-2）由来（TASK-153・ERR-1 の分散定数 SSOT 化）。
