@@ -7,17 +7,27 @@ name: Detect features (Apple Silicon)
 # `is_aarch64_feature_detected!` マクロが Apple Silicon 上で実際にどう振る舞うかを
 # CI ログへ記録する。
 #
-# 情報提供専用（spec 由来の閾値を持たない）・必須チェックには含めない。secrets は
-# 使用しない。private submodule（docs/spec）は取得しない。実測結果は
+# 情報提供専用（spec 由来の閾値を持たない）。両ジョブは自動マージ運用の都合で必須
+# チェックへ登録するが、対象外 PR では skipped で合格扱いになる。secrets は使用しない。private submodule（docs/spec）は取得しない。実測結果は
 # `docs/design/chip-kernel-guidelines.md` の該当節へ手動で転記する運用とする
 # （README「実装方針（要点）」の #468 小節参照）。
 
-# トリガは workflow_dispatch のみとする。pull_request で起動すると、必須チェックに
-# 含めない本ジョブの check-run が PR の HEAD に付き、自動マージ運用（implement-issue-tree
-# の G0 ゲート＝必須外チェックの不在確認）を `isa.rs` 等を触る全 PR で止めてしまうため。
-# 実機検証が必要なときは Actions 画面または `gh workflow run detect-features.yml
-# --ref <branch>` で対象ブランチを指定して手動起動する。
+# トリガ設計: `pull_request` は paths フィルタを付けず全 PR で起動し、先頭の
+# `detect-changes` ジョブ（ubuntu・数秒）が PR の変更ファイル一覧から対象パス
+# （`isa.rs`・`detect_features.rs`・`tests/isa.rs`・本 workflow）の変更有無を判定する。
+# 実機検証本体の `detect-apple`（macos-latest）は対象パスが変更された PR と
+# `workflow_dispatch` でのみ実行し、それ以外の PR では skipped の check-run を残す。
+#
+# paths フィルタ方式（対象外 PR では check-run 自体が存在しない）を採らない理由:
+# 本リポの自動マージ運用（implement-issue-tree の G0 ゲート）は「PR HEAD 上の全
+# check-run が必須チェックに含まれる」かつ「全必須チェックの check-run が HEAD に
+# 存在する」ことを要求するため、両ジョブを必須チェックへ登録しつつ、対象外 PR でも
+# check-run（skipped）が常に存在する構成でなければ、`isa.rs` を触る PR か触らない PR の
+# どちらかで自動マージが止まる。skipped の check-run は GitHub の必須チェック判定で
+# 合格扱いになる。Apple Silicon 上の自動検証経路（AGENTS.md「CI・ワークフローの
+# 改変」の検証ジョブ非弱体化）は維持する。
 on:
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -28,7 +38,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 対象パスの変更有無を PR の変更ファイル一覧（REST API）から判定する。
+  # git の履歴取得（fetch-depth: 0）を避けて数秒で終える。workflow_dispatch では
+  # 判定を省略し常に実行対象とする。API 取得に失敗した場合は fail-closed で
+  # 「変更あり」と扱い、実機検証を省略しない。
+  detect-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.judge.outputs.changed }}
+    steps:
+      - name: Judge whether feature-detection paths changed
+        id: judge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "workflow_dispatch: run detect-apple unconditionally"
+            exit 0
+          fi
+          if ! files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename'); then
+            echo "failed to list PR files; fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=false
+          while IFS= read -r f; do
+            case "$f" in
+              crates/engine/examples/detect_features.rs|crates/engine/src/isa.rs|crates/engine/tests/isa.rs|.github/workflows/detect-features.yml)
+                changed=true ;;
+            esac
+          done <<< "$files"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "feature-detection paths changed: $changed"
+
   detect-apple:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == 'true'
     runs-on: macos-latest
     timeout-minutes: 30
     permissions:
