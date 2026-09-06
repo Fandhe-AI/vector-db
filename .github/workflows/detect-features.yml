@@ -65,8 +65,14 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # `cargo run` の失敗を確実にステップへ伝播させるため shell: bash を明示する
+      # （既定の shell 未指定では pipefail が有効にならず、パイプ末尾の `tee` が
+      # 成功する限り `cargo run` の失敗がマスクされ、検出表を取得できないまま
+      # workflow が成功し得る。codex-review 指摘）
       - name: Run detect_features example
+        shell: bash
         run: |
+          set -euo pipefail
           {
             echo "### detect_features 出力"
             echo '```'

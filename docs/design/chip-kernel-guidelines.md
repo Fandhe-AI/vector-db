@@ -212,9 +212,14 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 
 - NEON bf16（`vbfdotq_f32`）: stable docs に該当ページ無し。少なくとも 1.96 で
   は利用不可
-- SME／SME2 intrinsics: Rust に API 無し
-- `is_aarch64_feature_detected!` の macOS 上の実効性: §7（Issue #468）で静的解析・
-  実機検証を実施済み。既存 NEON 経路は Apple ターゲットで常に有効
+- SME／SME2 intrinsics: Rust に API 無し。実行時検出も std_detect 内部には
+  実装があるが、`is_aarch64_feature_detected!` マクロ経由の利用は
+  `stdarch_aarch64_feature_detection` 機能ゲート未安定のため stable では
+  コンパイル不可（`crates/engine/examples/detect_features.rs` で
+  `"n/a (unstable macro)"` 固定として実確認済み。§7.5 参照）
+- `is_aarch64_feature_detected!` の macOS 上の実効性: §7（Issue #468）で静的解析
+  済み・実機確認待ち（GitHub ホステッド `macos-latest` の workflow run 反映待ち。
+  §7.3 参照）。静的解析上は既存 NEON 経路が Apple ターゲットで常に有効
 
 ### 2-E. 候補クレート（情報のみ）
 
@@ -362,7 +367,12 @@ nightly-2026-07-15 rust-src で同一内容を確認）。
 - Darwin 向けの代替検出機構（環境変数上書き等）は不要と判断する。
   `neon`／`fp16`／`fhm`／`dotprod` はコンパイル時 target_feature 化により
   Apple ターゲットでは実行時 `false` になり得ない
-- `bf16`／`sme` は std の `sysctlbyname` 経由の実行時検出で足りる
+- `bf16` は std の `sysctlbyname` 経由の実行時検出（`is_aarch64_feature_detected!`
+  マクロ経由）で足りる。`sme`／`sme2` は std_detect 内部に実装があるのみで、
+  マクロ経由の利用は stable でコンパイル不可（`stdarch_aarch64_feature_detection`
+  未安定・§2-D 参照）。isa.rs から利用するには機能ゲート安定化を待つか、
+  マクロを介さず `sysctl`（macOS）等を直接呼ぶ代替実装が必要——後続作業として
+  申し送る
 - オーナー所有実機（特に M4 の SME 判定）での `make detect-features` 実行結果を
   §7.3 へ追記することが残作業
 
