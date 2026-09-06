@@ -75,6 +75,32 @@ CROSSDB_PG_PORT=25433 scripts/crossdb_bench/containers.sh up pgvector
 CROSSDB_PG_PORT=25433 python scripts/crossdb_bench/run.py --db pgvector --config exact ...
 ```
 
+### 環境変数（コンテナ名）
+
+`containers.sh` が起動する各コンテナの名前は既定で `bench-<db>` 固定だが、
+同一ホストで別セッションが同名コンテナを既に使っている場合、冪等化のための
+`docker rm -f` がその別セッションの状態を破壊してしまう（Issue #466。他 DB
+横断ベンチの実測中に外部 `bench-qdrant` を誤って削除しかけた事故の再発防止）。
+以下の環境変数で別名を指定できる（Docker のコンテナ名文字集合 `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`
+に適合しない値は `containers.sh` が fail-closed で拒否する）。名前だけ変えても
+既定ポートのままでは外部コンテナと衝突するため、上記のポート変数も必ず
+あわせて別値を指定すること。
+
+| 環境変数 | 既定値 | 対象 |
+| -------- | ------ | ---- |
+| `CROSSDB_PG_CONTAINER` | `bench-pgvector` | pgvector コンテナ名 |
+| `CROSSDB_QDRANT_CONTAINER` | `bench-qdrant` | Qdrant コンテナ名 |
+| `CROSSDB_MYSQL_CONTAINER` | `bench-mysql` | MySQL コンテナ名 |
+
+```bash
+# 外部 bench-qdrant（既定ポート）と衝突しない別名・別ポートで計測する例
+export CROSSDB_QDRANT_CONTAINER=bench-qdrant-466
+export CROSSDB_QDRANT_HTTP_PORT=26333 CROSSDB_QDRANT_GRPC_PORT=26334
+scripts/crossdb_bench/containers.sh up qdrant
+python scripts/crossdb_bench/run.py --db qdrant --config exact ...
+scripts/crossdb_bench/containers.sh down qdrant
+```
+
 self の `run.py --db self` は認証ファイル `users.txt` を `--workdir`
 （既定: `--rows-file` の親ディレクトリ）直下ではなく、その配下に毎回新規作成する
 一意なサブディレクトリ `self_bench_auth_<pid>_*/` へ生成し、停止時に削除する

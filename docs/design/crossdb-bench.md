@@ -419,11 +419,16 @@ Issue #365（isa.rs dot カーネルの複数アキュムレータ化検討）�
   `avx2 f16c fma`、`nproc` 12、`BENCH_DEDICATED_ENV` 未設定（共有 QEMU 環境。
   `docs/design/benchmark-judgement-policy.md` §5 により**参考値**。1 回実測・
   交互 N≥5 ペアなし）
-- 他 DB: pgvector `pg17`（Docker イメージ `pgvector/pgvector:pg17`）。索引
-  パラメータは dim=128 の既存計測と同一（既定値のまま。上記「公平性についての
-  注記」参照）。Qdrant は本計測環境に本ハーネス外の `bench-qdrant` コンテナが
-  常駐しており、`containers.sh up qdrant`（`docker rm -f` による冪等再作成）が
-  他セッションの状態を破壊するため今回は未実測（下記「申し送り」参照）
+- 他 DB: pgvector `pg17`（Docker イメージ `pgvector/pgvector:pg17`）・Qdrant
+  `1.19.1`（Docker イメージ `qdrant/qdrant:latest`）。索引パラメータは dim=128
+  の既存計測と同一（既定値のまま。上記「公平性についての注記」参照）
+- Qdrant は self／pgvector とは別セッションの実測（コミット・環境は同一。
+  `docs/design/benchmark-judgement-policy.md` §5 により同様に**参考値**）。
+  本計測環境に本ハーネス外の `bench-qdrant`（127.0.0.1:16333/16334）コンテナが
+  常駐していたため、`containers.sh` へ追加したコンテナ名・ポート上書き
+  （`CROSSDB_QDRANT_CONTAINER`／`CROSSDB_QDRANT_HTTP_PORT`／`CROSSDB_QDRANT_GRPC_PORT`。
+  Issue #466）を使い、別名・別ポートの `bench-qdrant-466`（127.0.0.1:26333/26334）
+  として並存させ、外部コンテナは一度も停止・削除せずに計測した
 
 ### `vector_knn`・`bulk_knn_k200`（p50/p95 µs）
 
@@ -432,34 +437,43 @@ Issue #365（isa.rs dot カーネルの複数アキュムレータ化検討）�
 | self (wire, exact) | 2222.2 | 2569.0 | 51696.3 | 54974.6 | 1.0000 |
 | pgvector (exact) | 33907.3 | 34976.3 | 35131.7 | 35629.0 | 1.0000 |
 | pgvector (hnsw) | 34509.7 | 35291.6 | 35097.2 | 36314.8 | 1.0000 |
+| Qdrant (exact) | 2195.2 | 2816.7 | 5355.7 | 7316.6 | n/a |
+| Qdrant (hnsw) | 1045.9 | 1763.3 | 3707.6 | 4143.1 | n/a |
+
+Qdrant の `recall_at_10` が `n/a` なのは dim=128 の既存計測（本 doc 冒頭の表）と
+同じ仕様で、本ハーネスの Qdrant アダプタが recall 計算を実装していないため
+（self／pgvector は fixture 内の ground truth 比較で算出）。
 
 dim=128 の同フェーズ実測値（参考。導出方法・環境が異なるため直接比較しない）は
 上記「`vector_knn` 786µs の内訳」節・`docs/design/knn-wire-stage-profile.md`
 参照。
 
-### `feature_bench` 13 フェーズ（同一バイナリ・同一環境での dim=128 vs dim=768。参考値）
+### `feature_bench` 13 フェーズ（同一バイナリ・同一環境での dim=128 vs dim=768 vs dim=1536。参考値）
 
-| フェーズ | dim=128 p50 (µs) | dim=768 p50 (µs) | 比 |
-| --- | --- | --- | --- |
-| ingest | 4089 | 14693 | 3.59x |
-| point_where | 2810 | 4577 | 1.63x |
-| where_compound | 2917 | 5460 | 1.87x |
-| agg_count | 2545 | 5105 | 2.01x |
-| agg_multi | 2745 | 5246 | 1.91x |
-| group_by_having | 3213 | 5568 | 1.73x |
-| vector_knn | 8608 | 48681 | 5.66x |
-| vector_knn_where | 2804 | 4938 | 1.76x |
-| hybrid_rrf | 11741 | 70275 | 5.99x |
-| mode_recall | 8713 | 50080 | 5.75x |
-| mode_precision | 8739 | 49311 | 5.64x |
-| rls_isolation | 2411 | 4915 | 2.04x |
-| udf_call | 678 | 2338 | 3.45x |
+| フェーズ | dim=128 p50 (µs) | dim=768 p50 (µs) | 128→768 比 | dim=1536 p50 (µs) | 768→1536 比 |
+| --- | --- | --- | --- | --- | --- |
+| ingest | 4089 | 14693 | 3.59x | 25450 | 1.73x |
+| point_where | 2810 | 4577 | 1.63x | 7163 | 1.57x |
+| where_compound | 2917 | 5460 | 1.87x | 5998 | 1.10x |
+| agg_count | 2545 | 5105 | 2.01x | 5445 | 1.07x |
+| agg_multi | 2745 | 5246 | 1.91x | 5574 | 1.06x |
+| group_by_having | 3213 | 5568 | 1.73x | 5825 | 1.05x |
+| vector_knn | 8608 | 48681 | 5.66x | 86572 | 1.78x |
+| vector_knn_where | 2804 | 4938 | 1.76x | 7292 | 1.48x |
+| hybrid_rrf | 11741 | 70275 | 5.99x | 119294 | 1.70x |
+| mode_recall | 8713 | 50080 | 5.75x | 86716 | 1.73x |
+| mode_precision | 8739 | 49311 | 5.64x | 86274 | 1.75x |
+| rls_isolation | 2411 | 4915 | 2.04x | 5341 | 1.09x |
+| udf_call | 678 | 2338 | 3.45x | 4460 | 1.91x |
 
 `vector_knn`・`hybrid_rrf`・`mode_recall`／`mode_precision`（いずれも距離計算・
-Top-k 選出を経由する）が dim 増加に対して最も敏感（5.6〜6.0 倍）。`ingest`・
-`agg_*`（embedding を主要コストとしない経路）は 2〜3.6 倍にとどまる。比は
-**参考値**（同一プロセス内の単発実測。`docs/design/benchmark-judgement-policy.md`
-の交互 N≥5 ペア方式ではない）。
+Top-k 選出を経由する）が dim 増加に対して最も敏感（128→768 で 5.6〜6.0 倍、
+768→1536 でも 1.7〜1.8 倍と他フェーズより明確に大きい）。`ingest`・`agg_*`
+（embedding を主要コストとしない経路）は 128→768 で 2〜3.6 倍、768→1536 では
+1.05〜1.1 倍程度まで鈍化する。比は**参考値**（同一プロセス内の単発実測。
+`docs/design/benchmark-judgement-policy.md` の交互 N≥5 ペア方式ではない）。
+dim=1536 は `feature_bench` の 1 回実測のみで、`knn_profile_bench`・crossdb
+横断ベンチでは未実測（下記「申し送り」参照）。
 
 ### `knn_profile_bench`（S0〜S5' 段別。dim=768・既定エンジン）
 
@@ -507,21 +521,34 @@ python scripts/crossdb_bench/run.py --db pgvector --config hnsw \
   --out-dir "$S/results/d768" --expect-dim 768
 scripts/crossdb_bench/containers.sh down pgvector
 
+# Qdrant は本ハーネス外の常駐コンテナ（既定名 bench-qdrant）と衝突しないよう、
+# コンテナ名・ポートを上書きして計測する（Issue #466）。
+export CROSSDB_QDRANT_CONTAINER=bench-qdrant-466
+export CROSSDB_QDRANT_HTTP_PORT=26333 CROSSDB_QDRANT_GRPC_PORT=26334
+scripts/crossdb_bench/containers.sh up qdrant
+python scripts/crossdb_bench/run.py --db qdrant --config exact   --rows-file "$S/docs25k-d768.jsonl" --queries-file "$S/queries200-d768.jsonl"   --docs-file "$S/docs25k-d768.jsonl" --out-dir "$S/results/d768" --expect-dim 768
+scripts/crossdb_bench/containers.sh down qdrant
+scripts/crossdb_bench/containers.sh up qdrant
+python scripts/crossdb_bench/run.py --db qdrant --config hnsw   --rows-file "$S/docs25k-d768.jsonl" --queries-file "$S/queries200-d768.jsonl"   --docs-file "$S/docs25k-d768.jsonl" --out-dir "$S/results/d768" --expect-dim 768
+scripts/crossdb_bench/containers.sh down qdrant
+unset CROSSDB_QDRANT_CONTAINER CROSSDB_QDRANT_HTTP_PORT CROSSDB_QDRANT_GRPC_PORT
+
 BENCH_FEATURE_DIM=768 cargo run --release -p engine --example feature_bench
 BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
-per-run 生データは `$CROSSDB_DIR/results/d768/{self_exact,pgvector_exact,pgvector_hnsw}.json`
-（`run_all.sh` 経由なら `CROSSDB_DIM=768 make bench-crossdb ...`）。
+per-run 生データは
+`$CROSSDB_DIR/results/d768/{self_exact,pgvector_exact,pgvector_hnsw,qdrant_exact,qdrant_hnsw}.json`
+（self／pgvector は `run_all.sh` 経由なら `CROSSDB_DIM=768 make bench-crossdb ...`。
+Qdrant は上記の別セッション実測のため `run_all.sh` には含まれない）。
 
 ### 申し送り
 
-- **Qdrant dim=768 は未実測**: 計測環境に本ハーネス外の `bench-qdrant`
-  コンテナが常駐しており、`run_all.sh`／`containers.sh up qdrant` の冪等
-  再作成（`docker rm -f`）が他セッションの状態を破壊するため見送った。
-- **dim=1536 は未実測**: `BENCH_FEATURE_DIM`／`BENCH_KNN_PROFILE_DIM`／
-  `CROSSDB_DIM` はいずれも dim=1536 を受理できるが（上限 4,096）、本 Issue の
-  実測は dim=768 のみで完了させた。
+- **dim=1536 は `feature_bench` のみ参考実測**: `BENCH_FEATURE_DIM`／
+  `BENCH_KNN_PROFILE_DIM`／`CROSSDB_DIM` はいずれも dim=1536 を受理できるが
+  （上限 4,096）、上記「`feature_bench` 13 フェーズ」節の 1 回実測のみで、
+  `knn_profile_bench`・crossdb 横断ベンチ（self／pgvector／Qdrant）は
+  dim=768 までで完了させた。
 - `scan_stage_profile_bench`／`knn_wire_profile_bench`／`hybrid_wire_profile_bench`・
   `batch_bench.rs`・`gpu/faiss_batch_bench.py` の `DIM_GRID` は dim 展開の対象外
   （本 Issue のスコープ外）。

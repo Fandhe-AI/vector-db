@@ -178,7 +178,7 @@ def main() -> int:
     # は `resolve_docs_file`）の docs を、他 DB は `--rows-file`（docs 本体）を
     # 突き合わせる（Issue #466。unsupported へ丸めず非 0 終了で拒否する）。
     dim_source_docs = resolve_docs_file(args) if args.db == "self" else args.rows_file
-    query_dim = len(queries[0]["embedding"]) if queries else None
+    query_dim = len(queries[0]["embedding"]) if queries and queries[0].get("embedding") is not None else None
     docs_dim = None
     if os.path.exists(dim_source_docs):
         docs_dim = _peek_embedding_dim(dim_source_docs)
@@ -199,6 +199,15 @@ def main() -> int:
         docs_dim_full, docs_dim_err = _scan_docs_dim_streaming(dim_source_docs) if os.path.exists(
             dim_source_docs
         ) else (None, None)
+        # docs_dim_err を docs_dim_full is None より先に判定する（Cursor Bugbot 指摘・
+        # PR #557 スレッド PRRT_kwDOUAKASM6fqypA）。先頭レコードの embedding が
+        # 欠落している場合、`_scan_docs_dim_streaming` は dim を 1 件も確定できない
+        # まま行番号付きの理由を docs_dim_err で返す（dim=None・err=行番号付き理由）。
+        # 逆順で判定すると「dim を確認できなかった」汎用メッセージに理由が
+        # 上書きされ、fixture 生成時のどの行が壊れているか運用者に伝わらなかった。
+        if docs_dim_err is not None:
+            print(f"error: --expect-dim {args.expect_dim} rejected ({docs_dim_err})", file=sys.stderr)
+            return 1
         if docs_dim_full is None:
             reason = (
                 f"docs file not found: {dim_source_docs}"
@@ -210,9 +219,6 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if docs_dim_err is not None:
-            print(f"error: --expect-dim {args.expect_dim} rejected ({docs_dim_err})", file=sys.stderr)
-            return 1
         # queries 側も同様に次元検証を必須にする（codex-review P2 指摘・PR #557
         # r3943524978）。queries JSONL が空だと query_dim が None のまま docs_dim
         # だけで --expect-dim 判定を素通りしてしまい、mysql アダプタ等 queries を
@@ -221,15 +227,17 @@ def main() -> int:
         # 埋め込み長を fail-closed に検証する」契約に合わせ、queries 側の次元が
         # 取得できない場合も adapter 呼び出し前に非 0 終了で拒否する。
         query_dim_full, query_dim_err = _scan_queries_dim(queries)
+        # docs 側と同型の理由で query_dim_err を先に判定する（Cursor Bugbot 指摘・
+        # PR #557 スレッド PRRT_kwDOUAKASM6fqypA）。
+        if query_dim_err is not None:
+            print(f"error: --expect-dim {args.expect_dim} rejected ({query_dim_err})", file=sys.stderr)
+            return 1
         if query_dim_full is None:
             print(
                 f"error: --expect-dim {args.expect_dim} requires queries dim to be verified "
                 f"(queries file is empty or has no embedding: {args.queries_file})",
                 file=sys.stderr,
             )
-            return 1
-        if query_dim_err is not None:
-            print(f"error: --expect-dim {args.expect_dim} rejected ({query_dim_err})", file=sys.stderr)
             return 1
         if query_dim_full != docs_dim_full:
             print(

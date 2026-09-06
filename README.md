@@ -311,6 +311,8 @@ cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries
 CROSSDB_DIM=768 make bench-crossdb
 ```
 
+同一ホストで他セッションの対照 DB コンテナ（既定名 `bench-pgvector`／`bench-qdrant`／`bench-mysql`）と並行計測したい場合は `CROSSDB_PG_CONTAINER`／`CROSSDB_QDRANT_CONTAINER`／`CROSSDB_MYSQL_CONTAINER`（Docker コンテナ名文字集合のみ許可・fail-closed）で別名を指定できます（ポートも `CROSSDB_*_PORT` で別値にしないと衝突するため両方指定してください。Issue #466。詳細は `scripts/crossdb_bench/README.md` 参照）。
+
 GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください（dim=768 基線は同ドキュメント参照）。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
