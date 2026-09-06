@@ -323,6 +323,10 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 
 `make bench-scan-stage-profile`（`crates/engine/benches/scan_stage_profile_bench.rs`）は、`docs/design/crossdb-bench.md` で self が最劣後する `agg_count`／`rls_isolation`／`vector_knn_where` の redb 全行走査・ヘッダデコード・RLS 判定（`PolicyContext::is_visible`＋TABLE-12 キー/ヘッダ整合検査）・dim/metadata デコード・`WHERE` 述語評価・arena 複製の段別内訳を切り分けます。`BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行・4＝100,000 行。1 プロセス = 1 規模点）で規模、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds/scale パース・段間差分・ノイズ帯判定・整合性検証）は `crates/engine/tests/scan_stage_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計・後続 Issue（#477・#471）への帰属分析の詳細は `docs/design/scan-stage-profile.md` を参照してください。
 
+### macOS 上の feature 検出の実機検証（Issue #468）
+
+`make detect-features`（`crates/engine/examples/detect_features.rs`）は `is_aarch64_feature_detected!`／`is_x86_feature_detected!` マクロの実効性（コンパイル時 `cfg!(target_feature)` 定数化・マクロ実行結果・macOS では `sysctl` 相互検証）を表として出力します。依存追加なし・検出結果の上書き機構なし（`isa.rs` の CORE-12 節と同じ fail-closed 方針）。Apple Silicon 実機での実測は `.github/workflows/detect-features.yml`（`pull_request` の paths 限定トリガ、または `workflow_dispatch` で GitHub ホステッド `macos-latest` runner 上で実行。情報提供専用・必須チェックには含めません）で行い、出力を `docs/design/chip-kernel-guidelines.md`「7. macOS 上の `is_aarch64_feature_detected!` 実効性」節へ転記する運用です。オーナー所有実機（M4 等）での追記も同ツールで行えます。
+
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。

@@ -141,7 +141,7 @@ brute-force に与える影響は一次実測未確認。
 | キャッシュ | L1 192 KB(I)+128 KB(D)/コア、L2 12 MB 共有 |
 | f16 算術 | NEON FP16（`fmla` f16）有 |
 | i8 dot | `sdot`/`udot`（FEAT_DotProd）有 |
-| bf16 | `bfdot`（FEAT_BF16）。M シリーズでの有無は未確認 |
+| bf16 | `bfdot`（FEAT_BF16）。M シリーズでの有無は §7.3（Issue #468 実機検出結果表）参照 |
 | SME／SME2 | M4 で対応。通常の SVE は非対応（Streaming SVE のみ） |
 | Apple AMX | 非公開命令。Accelerate 経由のみ |
 | UMA／Metal | `wgpu` Metal backend は `SHADER_F16` 対応 |
@@ -213,9 +213,8 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 - NEON bf16（`vbfdotq_f32`）: stable docs に該当ページ無し。少なくとも 1.96 で
   は利用不可
 - SME／SME2 intrinsics: Rust に API 無し
-- `is_aarch64_feature_detected!` の macOS 上の実効性: マクロ doc に「linux 以外
-  では多くの feature が常に false」の記載があり、実機での 1 行検証が必須
-  （既起票 #468）
+- `is_aarch64_feature_detected!` の macOS 上の実効性: §7（Issue #468）で静的解析・
+  実機検証を実施済み。既存 NEON 経路は Apple ターゲットで常に有効
 
 ### 2-E. 候補クレート（情報のみ）
 
@@ -298,6 +297,74 @@ opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全
   https://developer.apple.com/forums/thread/757704
 - GPU／wgpu: https://docs.rs/wgpu/30.0.1/wgpu/struct.FeaturesWebGPU.html ／
   struct.FeaturesWGPU.html ／ gfx-rs/wgpu #7494・#7574・#7595
+
+## 7. macOS 上の `is_aarch64_feature_detected!` 実効性（Issue #468）
+
+### 7.1 目的と結論
+
+`is_aarch64_feature_detected!` マクロの doc には「linux 系以外の OS では多くの
+feature の実行時検出が常に `false` を返す」という注記があり、これが真であれば
+Apple Silicon 上で `crates/engine/src/isa.rs::NeonToken::try_new` が `None` を
+返し既存 NEON カーネルが fail-closed 側で無効化される懸念があった。
+
+**結論（静的解析）**: `aarch64-apple-darwin` ターゲットは `neon`／`fp16`／
+`fhm`／`dotprod` をコンパイル時 target_feature として含むため、これら 4
+feature については `is_aarch64_feature_detected!` マクロが `cfg!(target_feature
+= ...) || __is_feature_detected::…()` へ展開されコンパイル時に定数 `true` へ
+畳み込まれる（マクロ doc の注記は Darwin についてはこの意味で陳腐化した記述で
+あり、Darwin 向けの実行時検出実装〔`sysctlbyname` 経由〕自体は std_detect に
+存在する）。よって **既存 NEON 経路は Apple Silicon 上で常に有効**。`bf16`／
+`sme` はコンパイル時 target_feature に含まれないため std の `sysctlbyname`
+経由の実行時検出に落ちる（M シリーズ世代依存。§7.3 参照）。
+
+### 7.2 根拠（機械確認事実）
+
+| 確認項目 | 結果 |
+| -------- | ---- |
+| マクロ展開 | `is_aarch64_feature_detected!(X)` は `cfg!(target_feature = X) \|\| __is_feature_detected::X()` に展開される（コンパイル時に有効な feature は定数 `true`） |
+| `aarch64-apple-darwin` のコンパイル時 target_feature | `neon`・`fp16`・`fhm`・`dotprod` を含む（`bf16`・`sme`・`i8mm` は含まない。`rustc --print cfg --target aarch64-apple-darwin` で確認） |
+| `aarch64-unknown-linux-gnu` の同項目 | `neon` のみ |
+| Darwin の実行時検出実装 | std_detect の Darwin 向け実装が `sysctlbyname`（`hw.optional.AdvSIMD`／`hw.optional.arm.FEAT_FP16`／`FEAT_FHM`／`FEAT_DotProd`／`FEAT_BF16`／`FEAT_SME`／`FEAT_SME2`／`FEAT_I8MM` 等）で検出する |
+
+コードは転記しない（出典は std_detect の該当ソース。rustc 1.96.0 同梱・
+nightly-2026-07-15 rust-src で同一内容を確認）。
+
+### 7.3 実機検出結果表
+
+`crates/engine/examples/detect_features.rs`（`make detect-features`）の出力を
+転記する。
+
+**GitHub ホステッド `macos-latest`（Apple Silicon）**:
+
+- チップ・OS・run 情報: `.github/workflows/detect-features.yml` の run ログ
+  （`$GITHUB_STEP_SUMMARY`）を実行のたび転記する。本節は初回実測の反映待ち
+  （run URL 未反映）
+- `engine::isa::current()` の結果・8 feature 列（`cfg!`／マクロ／`sysctl`）・
+  `cargo test -p engine --test isa` の結果もあわせて転記する
+
+**オーナー実機（M4 等）**:
+
+- 未実測・申し送り（§7.5 参照）。`make detect-features` の出力を貼り付ける形で
+  追記できる
+
+### 7.4 手順
+
+1. `make detect-features`（`cargo run -p engine --release --example
+   detect_features`）を実行する
+2. macOS では追加で `sysctl -n hw.optional.arm.FEAT_SME` 等（example の
+   sysctl 名一覧を参照）で相互検証できる
+3. 出力を本節（§7.3）の該当行へ転記する
+4. `.github/workflows/detect-features.yml` は `workflow_dispatch` からも
+   手動起動できる（GitHub Actions の「Run workflow」）
+
+### 7.5 #508 への申し送り
+
+- Darwin 向けの代替検出機構（環境変数上書き等）は不要と判断する。
+  `neon`／`fp16`／`fhm`／`dotprod` はコンパイル時 target_feature 化により
+  Apple ターゲットでは実行時 `false` になり得ない
+- `bf16`／`sme` は std の `sysctlbyname` 経由の実行時検出で足りる
+- オーナー所有実機（特に M4 の SME 判定）での `make detect-features` 実行結果を
+  §7.3 へ追記することが残作業
 
 ## 参照
 

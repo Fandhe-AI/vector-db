@@ -1,0 +1,80 @@
+name: Detect features (Apple Silicon)
+
+# Issue #468 の実機検証用 workflow。GitHub ホステッド Apple Silicon runner
+# （`macos-latest`。AGENTS.md「CI・ワークフローの改変」の runner 方針の範囲内で
+# GitHub ホステッドのみを使用）上で `crates/engine/examples/detect_features.rs`
+# （`make detect-features`）と `cargo test -p engine --test isa` を実行し、
+# `is_aarch64_feature_detected!` マクロが Apple Silicon 上で実際にどう振る舞うかを
+# CI ログへ記録する。
+#
+# 情報提供専用（spec 由来の閾値を持たない）・必須チェックには含めない。secrets は
+# 使用しない。private submodule（docs/spec）は取得しない。実測結果は
+# `docs/design/chip-kernel-guidelines.md` の該当節へ手動で転記する運用とする
+# （README「実装方針（要点）」の #468 小節参照）。
+
+on:
+  pull_request:
+    paths:
+      - crates/engine/examples/detect_features.rs
+      - crates/engine/src/isa.rs
+      - crates/engine/tests/isa.rs
+      - .github/workflows/detect-features.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-apple:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # 第三者 action は ci.yml と同一 SHA 固定で参照する（AGENTS.md「CI・ワークフローの
+      # 改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。private
+      # submodule（docs/spec）は取得しない
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # チップ世代の推測（M1／M2／…）を避け、実測でチップ・OS 版を記録する
+      - name: Report chip and sysctl feature flags
+        run: |
+          {
+            echo "### Apple Silicon 実機情報"
+            echo '```'
+            sysctl -n machdep.cpu.brand_string || true
+            uname -m
+            sw_vers
+            echo "--- sysctl feature flags ---"
+            sysctl hw.optional.AdvSIMD \
+              hw.optional.arm.FEAT_FP16 \
+              hw.optional.arm.FEAT_FHM \
+              hw.optional.arm.FEAT_DotProd \
+              hw.optional.arm.FEAT_BF16 \
+              hw.optional.arm.FEAT_I8MM \
+              hw.optional.arm.FEAT_SME \
+              hw.optional.arm.FEAT_SME2 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Run detect_features example
+        run: |
+          {
+            echo "### detect_features 出力"
+            echo '```'
+            cargo run -p engine --example detect_features
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # isa.rs の Neon 実行時検出（`is_aarch64_feature_detected!("neon")`）が
+      # 実機で肯定側に倒れることを直接検証する（tests/isa.rs 参照）
+      - name: Run isa tests
+        run: cargo test -p engine --test isa -- --nocapture
