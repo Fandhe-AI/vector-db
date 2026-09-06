@@ -202,14 +202,36 @@ fn main() {
     // 記録しておく（全件照会は所要時間を大きく伸ばすため、代表点のみとする）。
     let mut w0_sample_ops: Vec<String> = Vec::new();
     let mut s0_sample_ops: Vec<String> = Vec::new();
+    // ラウンド別測定値の出力行は、末尾の整合性検証（`operation_recorded`）が
+    // すべて通過するまで `println!` しない（モジュール冒頭コメント「fail-closed
+    // 検証」の契約。cursor-bot／codex-review 指摘: ループ内で即座に println! する
+    // と検証失敗〔fail_closed で process::exit〕より前に測定値が出力され得た）。
+    let mut round_output_lines: Vec<String> = Vec::new();
 
     for round in 0..rounds {
         // --- W0: wire_roundtrip ------------------------------------------------
         let w0_round_start_n = w0_next;
+        // SQL 文字列の組み立て（`make_stmt_sql`）は計測対象の wire 往復コストでは
+        // ないため、計測区間の外（ラウンド開始前）で本ラウンド分すべてを事前生成
+        // しておく（codex-review 指摘。計測区間に含めると W0・S0 双方へ同じ固定費が
+        // 混入し、`step_ratio_pct`（構成比）の分母を水増しして wire 寄与
+        // 〔W0−S0〕を相対的に過小評価する）。
+        let mut w0_stmts: std::collections::VecDeque<(String, String)> = (0..per_round)
+            .map(|i| {
+                make_stmt_sql(
+                    WIRE_ID_BASE,
+                    w0_round_start_n + i as u64,
+                    DIM,
+                    "ingest-wire-w0",
+                )
+            })
+            .collect();
         let measurement = run(&config, || {
             let n = w0_next;
             w0_next += 1;
-            let (sql, _op_id) = make_stmt_sql(WIRE_ID_BASE, n, DIM, "ingest-wire-w0");
+            let (sql, _op_id) = w0_stmts
+                .pop_front()
+                .unwrap_or_else(|| fail_closed(format!("W0 round={round} n={n}: precomputed SQL exhausted")));
             common::send_simple_query(&mut wire_stream, &sql);
             let tag = common::read_command_complete(&mut wire_stream);
             common::read_ready_for_query(&mut wire_stream);
@@ -229,17 +251,33 @@ fn main() {
         w0_round_medians.push(round_median);
         let round_p95 = p95_from_samples(&measurement.samples)
             .unwrap_or_else(|e| fail_closed(format!("W0 round={round}: p95: {e}")));
-        println!(
-            "{}",
-            render_tier_round_line("W0_wire_roundtrip", round, round_median, round_p95)
-        );
+        round_output_lines.push(render_tier_round_line(
+            "W0_wire_roundtrip",
+            round,
+            round_median,
+            round_p95,
+        ));
 
         // --- S0: sql_surface -----------------------------------------------------
         let s0_round_start_n = s0_next;
+        // W0 と同じ理由（SQL 生成コストの計測区間混入防止）で本ラウンド分を
+        // 事前生成する。
+        let mut s0_stmts: std::collections::VecDeque<(String, String)> = (0..per_round)
+            .map(|i| {
+                make_stmt_sql(
+                    SQL_ID_BASE,
+                    s0_round_start_n + i as u64,
+                    DIM,
+                    "ingest-wire-s0",
+                )
+            })
+            .collect();
         let measurement = run(&config, || {
             let n = s0_next;
             s0_next += 1;
-            let (sql, _op_id) = make_stmt_sql(SQL_ID_BASE, n, DIM, "ingest-wire-s0");
+            let (sql, _op_id) = s0_stmts.pop_front().unwrap_or_else(|| {
+                fail_closed(format!("S0 round={round} n={n}: precomputed SQL exhausted"))
+            });
             let outcome = core
                 .execute_sql_in_session(&ctx, &mut sql_session, &sql)
                 .expect("execute_sql_in_session for S0");
@@ -257,10 +295,12 @@ fn main() {
         s0_round_medians.push(round_median);
         let round_p95 = p95_from_samples(&measurement.samples)
             .unwrap_or_else(|e| fail_closed(format!("S0 round={round}: p95: {e}")));
-        println!(
-            "{}",
-            render_tier_round_line("S0_sql_surface", round, round_median, round_p95)
-        );
+        round_output_lines.push(render_tier_round_line(
+            "S0_sql_surface",
+            round,
+            round_median,
+            round_p95,
+        ));
     }
 
     // min-of-R は「ラウンド中央値どうしの最小」（`docs/design/
@@ -297,6 +337,11 @@ fn main() {
     );
 
     // --- 出力（整合性検証をすべて通過した後） ------------------------------------
+    // ラウンド別の tier 行はここでまとめて出力する（ループ内で即座に println! し
+    // ない理由はモジュール冒頭コメント・`round_output_lines` 定義箇所参照）。
+    for line in &round_output_lines {
+        println!("{line}");
+    }
     println!(
         "{}",
         render_tier_summary_line("W0_wire_roundtrip", w0_min_of_r, w0_median_of_r)

@@ -569,9 +569,14 @@ fn run_single_mode() {
         Ok(v) => v,
         Err(e) => fail_closed(e),
     };
-    if statements <= SINGLE_WARMUP_STATEMENTS.saturating_mul(2) {
+    // MIN_SINGLE_STATEMENTS（README・ingest-stage-profile.md で公開している
+    // 下限。現状 2,000 ＝ SINGLE_WARMUP_STATEMENTS の 2 倍）を計測フェーズ
+    // 長さ SINGLE_WARMUP_STATEMENTS 件以上を要求する下限としてそのまま
+    // 受理できるよう、境界を「未満のみ拒否」にする（`<=` だと
+    // MIN_SINGLE_STATEMENTS ちょうどが自己矛盾的に拒否されていた）。
+    if statements < SINGLE_WARMUP_STATEMENTS.saturating_mul(2) {
         fail_closed(format!(
-            "BENCH_INGEST_PROFILE_STATEMENTS={statements} too small relative to warmup {SINGLE_WARMUP_STATEMENTS} (need more than {} for a meaningful measured phase)",
+            "BENCH_INGEST_PROFILE_STATEMENTS={statements} too small relative to warmup {SINGLE_WARMUP_STATEMENTS} (need at least {} for a meaningful measured phase)",
             SINGLE_WARMUP_STATEMENTS * 2
         ));
     }

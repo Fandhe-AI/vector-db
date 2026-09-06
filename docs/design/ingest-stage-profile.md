@@ -450,7 +450,6 @@ before（`61fc943`）/after（`origin/main`）交互実測で記録した。前�
 バッファ二重基準と `batch_limits.rs`／行形 `insert_rows` の対比は
 `docs/design/ingest-write-path.md` を参照。
 
-
 ## Issue #484 追記: 単文 INSERT の段別プロファイル
 
 ### 目的
@@ -458,7 +457,7 @@ before（`61fc943`）/after（`origin/main`）交互実測で記録した。前�
 `docs/design/crossdb-bench.md`（25,000 行・dim 128・wire 経由・psycopg）で
 `ingest_single_stmt` は self 7,774 rows/s に対し sqlite-vec 11,604 rows/s と
 劣後している（親 Issue #483）。従来の `bench-ingest-profile`（Issue #396・
-#400。上記各節）は `tenant::insert_rows`（バッチ経路）の段別内訳しか持たず、
+Issue #400。上記各節）は `tenant::insert_rows`（バッチ経路）の段別内訳しか持たず、
 crossdb が実際に通る **単文経路**（wire 簡易クエリ → `EngineCore::
 execute_sql_in_session` → `execute_insert_sql`〔`validate_insert` →
 `get_table_schema` → `bind_insert_form`〕→ `sql::exec::execute_insert` →
@@ -485,8 +484,7 @@ INDEX-4・SQL-10 のポインタ参照）。
 
 ### 計測設計
 
-#### engine 側（`crates/engine/benches/ingest_profile_bench.rs`
-`BENCH_INGEST_PROFILE_MODE=single`）
+#### engine 側（`crates/engine/benches/ingest_profile_bench.rs` `BENCH_INGEST_PROFILE_MODE=single`）
 
 | tier | 内容 |
 | --- | --- |
@@ -525,8 +523,7 @@ engine 内部段 ＝ Σ(I1..I8)、残差 ＝ E0 − Σ(I1..I8)。
 1 行出力する。`BENCH_INGEST_PROFILE_INSERT_MODE=reserve`（Issue #400 の
 I6 A/B。batch モード専用機能）は single モードでは fail-closed に拒否する。
 
-#### wire-server 側（新規 `crates/wire-server/benches/
-ingest_wire_profile_bench.rs`）
+#### wire-server 側（新規 `crates/wire-server/benches/ingest_wire_profile_bench.rs`）
 
 同一プロセス内 in-process ループバックサーバーへ、engine 側と同じ
 `docs(embedding, body)` スキーマ・SQL 文形で単文 `INSERT` を投入し、wire

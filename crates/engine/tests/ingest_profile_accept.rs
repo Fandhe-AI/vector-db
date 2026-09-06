@@ -572,6 +572,13 @@ fn single_statement_constants_are_consistent() {
         assert!(DEFAULT_SINGLE_STATEMENTS <= MAX_SINGLE_STATEMENTS);
         assert!(DEFAULT_SINGLE_STATEMENTS > SINGLE_WARMUP_STATEMENTS * 2);
         assert!(MIN_SINGLE_STATEMENTS < MAX_SINGLE_STATEMENTS);
+        // README・ingest-stage-profile.md が公開している下限
+        // MIN_SINGLE_STATEMENTS が、run_single_mode の早期拒否ガード
+        // （計測フェーズ長 SINGLE_WARMUP_STATEMENTS 件以上を要求）で
+        // 実際に受理されることを固定する（codex-review・cursor-bot 指摘:
+        // 以前は `<=` 比較のため MIN_SINGLE_STATEMENTS ちょうどが
+        // 自己矛盾的に拒否されていた）。
+        assert!(MIN_SINGLE_STATEMENTS >= SINGLE_WARMUP_STATEMENTS * 2);
     }
 }
 
