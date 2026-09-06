@@ -895,6 +895,35 @@ struct ScoreScratch {
     /// 常に一致し、[`ScoreScratch::clear_len_norm_cache`] が `O(M)` での
     /// クリアに使う。
     touched_classes: Vec<u32>,
+    /// `doc_idx` を添字とする「このパスで既に `touched` へ記録したか」の
+    /// 世代カウンタ（`hnsw.rs::VisitedScratch` と同型の epoch 方式。codex-review
+    /// 指摘・PR #565）。`touched.push` の要否を `acc[idx] == 0.0` の判定から
+    /// 分離するために導入した。BM25 パラメータ（`k1`/`b`）は `with_params` で
+    /// 有限・非負値のみ受理するが、`k1` に極端な有限値（例: `f64::MAX` 近傍）を
+    /// 渡すと `kln`（`k1 * len_norm`）の計算が桁あふれし `f64::INFINITY` に
+    /// なり得る。この場合 `denominator = f + kln` も無限大となり
+    /// `idf * (numerator / denominator)` は有限値を無限大で割った `0.0` に
+    /// 潰れるため、「`acc[idx] == 0.0` ⇔ 未加算」という設計時の不変条件
+    /// （ドキュメンテーションコメント参照）が崩れ、同一 `doc_idx` への 2 回目
+    /// 以降の加算（別のクエリ語がヒットした場合）でも `*slot == 0.0` が
+    /// 成立し続けて `touched` へ重複記録され得る。`touched` はクエリ語数
+    /// （untrusted な `query_ids.len()`）に比例して際限なく伸び、`n` を
+    /// 超えて再確保され得る。以前（Issue #392 以前）は `ScorePass` の
+    /// 呼び出しごとに新規確保・破棄されていたためこの超過分は都度解放
+    /// されていたが、Issue #546 でスクラッチを索引の寿命内で使い回す
+    /// プール方式へ変更したことで、この超過確保分がプールに保持され
+    /// 続けてしまう（性能・保守性観点の指摘）。本フィールドは `acc` の値に
+    /// 一切依存せず `doc_idx` ごとに厳密に 1 回だけ `touched` へ記録する
+    /// ことを保証し、`touched.len()` を常に `n` 以下（[`ScoreScratch::new_for`]
+    /// が確保した容量以下）に有界化する。
+    visited_epoch: Vec<u64>,
+    /// [`Self::visited_epoch`] の現在値。[`SparseIndex::score_pass`] の呼び出し
+    /// ごとに 1 加算し、全要素を `O(N)` でクリアする代わりに世代比較で
+    /// 「今回のパスで訪問済みか」を `O(1)` 判定する（`hnsw.rs::VisitedScratch`
+    /// と同じ設計）。初期値 `0` は `visited_epoch`（`new_for` で全要素 `0`
+    /// 初期化）と衝突しないよう、`score_pass` は使用前に必ず `wrapping_add(1)`
+    /// してから比較する。
+    epoch: u64,
 }
 
 impl ScoreScratch {
@@ -921,6 +950,11 @@ impl ScoreScratch {
             // 超えないため、`touched`/`visible_hits` と同じ理由で容量を `n` へ
             // 固定する（Issue #546 レビュー指摘・PR #565）。
             touched_classes: Vec::with_capacity(n),
+            // `doc_idx` ごとに厳密 1 要素（`n` 個）の世代カウンタ。全要素 `0`
+            // 初期化のため `epoch` の初期値 `0` とは呼び出し前の
+            // `wrapping_add(1)` で確実に区別する（codex-review 指摘・PR #565）。
+            visited_epoch: vec![0; n],
+            epoch: 0,
         }
     }
 
@@ -1712,11 +1746,14 @@ impl SparseIndex {
         let k1_plus_1 = self.k1 + 1.0;
 
         // `doc_idx` を添字とするスコアアキュムレータ（f64。ビット一致契約のため
-        // f32 化はしない）。`idf`・分子は常に正であり、`denominator > 0.0` ガードを
-        // 満たす限り各項の加算は必ず正の寄与を持つため、`acc[idx] == 0.0` は
-        // 「まだこの文書へ加算していない」ことと同値（Issue #390 設計判断）。
-        // この性質を使い `touched` へ初めて触れた doc_idx だけを記録することで、
-        // 最終的な Top-k 選出をヒットした文書（`M` 件）だけへ限定する。
+        // f32 化はしない）。`idf`・分子は数学的には常に正で `denominator > 0.0`
+        // ガードを満たす限り各項の加算は正の寄与を持つ想定だったが（Issue #390
+        // 設計判断）、極端な BM25 パラメータでは寄与が `0.0` へ丸め込まれ得る
+        // ため（[`ScoreScratch::visited_epoch`] ドキュメンテーションコメント
+        // 参照。codex-review 指摘・PR #565）、`touched` への記録要否は
+        // `acc[idx] == 0.0` ではなく `visited_epoch` の世代比較で判定する。
+        // これにより `touched` へ初めて触れた doc_idx だけを記録し、最終的な
+        // Top-k 選出をヒットした文書（`M` 件）だけへ限定する。
         //
         // 索引の寿命内で使い回すスクラッチ（[`ScoreScratch`]。Issue #546）の
         // フィールドを直接使う。取り出した時点で全要素 `0.0`（Issue #390 の
@@ -1730,7 +1767,17 @@ impl SparseIndex {
             visible_hits,
             k1_len_norm_cache,
             touched_classes,
+            visited_epoch,
+            epoch,
         } = &mut scratch;
+
+        // このパス専用の世代へ進める（[`ScoreScratch::visited_epoch`]
+        // ドキュメンテーションコメント参照。codex-review 指摘・PR #565）。
+        // `wrapping_add` により `u64` を使い切っても panic せず次の世代へ
+        // 循環する（到達しない分岐だが `.claude/rules/coding-rust.md` の
+        // 整数演算規約に従い明示する）。
+        *epoch = epoch.wrapping_add(1);
+        let current_epoch = *epoch;
 
         for &term in query_ids {
             let Some(list) = self.postings.get(term.0 as usize) else {
@@ -1792,7 +1839,22 @@ impl SparseIndex {
                     let Some(slot) = acc.get_mut(idx) else {
                         continue;
                     };
-                    if *slot == 0.0 {
+                    // `touched` への記録要否は `acc[idx] == 0.0` の値そのものでは
+                    // なく `visited_epoch` の世代比較で判定する（codex-review
+                    // 指摘・PR #565。[`ScoreScratch::visited_epoch`] ドキュメン
+                    // テーションコメント参照）。`idf * (numerator / denominator)`
+                    // は数学的には常に正だが、極端な BM25 パラメータ
+                    // （`k1` が桁あふれを起こす有限値等）では `denominator` が
+                    // `f64::INFINITY` に発散し寄与が `0.0` へ丸め込まれ得るため、
+                    // `*slot == 0.0` を「未加算」の代理指標として使うと同一
+                    // `doc_idx` が複数回 `touched` へ積まれ、`n` を超えて
+                    // 再確保され得る。`visited_epoch` は `acc` の値に依存せず
+                    // `doc_idx` ごとに厳密 1 回だけ記録するためこれを防ぐ。
+                    let Some(epoch_slot) = visited_epoch.get_mut(idx) else {
+                        continue;
+                    };
+                    if *epoch_slot != current_epoch {
+                        *epoch_slot = current_epoch;
                         touched.push(doc_idx);
                     }
                     *slot += idf * (numerator / denominator);
@@ -1923,6 +1985,10 @@ impl SparseIndex {
         let scratch_touched = n.saturating_mul(std::mem::size_of::<u32>());
         let scratch_visible_hits = n.saturating_mul(std::mem::size_of::<(u32, u32)>());
         let scratch_touched_classes = n.saturating_mul(std::mem::size_of::<u32>());
+        // `touched` への重複記録防止用の世代カウンタ（[`ScoreScratch::
+        // visited_epoch`]。codex-review 指摘・PR #565）。`touched` と同じ `n`
+        // 要素だが `u64` のため 1 要素あたり 8 バイト。
+        let scratch_visited_epoch = n.saturating_mul(std::mem::size_of::<u64>());
         let scratch_len_norm_cache = self.len_classes.len().saturating_mul(
             std::mem::size_of::<(u32, f64)>().saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
         );
@@ -1930,6 +1996,7 @@ impl SparseIndex {
             .saturating_add(scratch_touched)
             .saturating_add(scratch_visible_hits)
             .saturating_add(scratch_touched_classes)
+            .saturating_add(scratch_visited_epoch)
             .saturating_add(scratch_len_norm_cache);
         let scratch_pool_upper_bound = scratch_one.saturating_mul(MAX_SCORE_SCRATCH_POOL);
         terms
@@ -2868,6 +2935,50 @@ mod tests {
             assert!(scratch.visible_hits.is_empty());
             assert!(scratch.k1_len_norm_cache.is_empty());
             assert!(scratch.touched_classes.is_empty());
+        }
+    }
+
+    #[test]
+    fn extreme_bm25_params_do_not_duplicate_touched_or_grow_scratch_beyond_corpus_size() {
+        // codex-review 指摘（Issue #546・PR #565）: `k1` に桁あふれを起こす
+        // 極端な有限値（`b=1.0` かつ文書長 > 平均文書長で `kln` が
+        // `f64::INFINITY` へ発散する組み合わせ）を渡すと、`idf * (numerator /
+        // denominator)` が `0.0` へ丸め込まれ、「`acc[idx] == 0.0` ⇔ 未加算」
+        // という旧来の判定方法が崩れる。この場合でも `touched`（延いては
+        // 索引の寿命内で使い回すスクラッチプールが保持する容量）が文書数
+        // `n` を超えて成長しない（`visited_epoch` による分離。[`ScoreScratch::
+        // visited_epoch`] 参照）ことと、Top-k 出力に同一 `doc_id` の重複が
+        // 生じないことを固定する。
+        let docs: Vec<(DocId, &str)> = vec![
+            // 複数の相異なるクエリ語すべてが同一文書にヒットする構成
+            // （旧実装ではこの文書の doc_idx が touched へ語数分だけ重複
+            // push され得た）。
+            (1, "alpha beta gamma delta epsilon zeta eta theta"),
+            (2, "alpha"),
+        ];
+        let idx = SparseIndex::with_params(&docs, 1e308, 1.0).unwrap();
+
+        for _ in 0..3 {
+            let results = idx
+                .search("alpha beta gamma delta epsilon zeta eta theta", 10)
+                .unwrap();
+            let doc_ids: Vec<DocId> = results.iter().map(|d| d.doc_id).collect();
+            let unique: BTreeSet<DocId> = doc_ids.iter().copied().collect();
+            assert_eq!(
+                doc_ids.len(),
+                unique.len(),
+                "Top-k 出力に同一 doc_id の重複がある: {doc_ids:?}"
+            );
+        }
+
+        let n = docs.len();
+        let pool = idx.scratch_pool.lock().unwrap();
+        for scratch in pool.iter() {
+            assert!(
+                scratch.touched.capacity() <= n,
+                "touched の容量が文書数 n={n} を超えて再確保された: capacity={}",
+                scratch.touched.capacity()
+            );
         }
     }
 
