@@ -276,25 +276,35 @@ fn main() {
     let mut t3_medians = Vec::with_capacity(rounds as usize);
     let mut round_lines: Vec<String> = Vec::new();
 
+    // 段ごとの計測反復回数（warmup + measured）。各ラウンドで各段がこの回数
+    // だけクエリプールを輪番するため、最終反復のインデックスは段をまたいで
+    // 一致する（下記ループ内コメント参照）。
+    let iterations_per_stage =
+        config.warmup_iterations() as usize + config.measured_iterations() as usize;
     let mut cursor: usize = 0;
-    let mut next_query = || {
-        let idx = cursor % QUERY_POOL;
-        cursor += 1;
-        idx
-    };
 
     for round in 1..=rounds {
-        // 本ラウンドの全 6 段（T1′/T1s/T1p/T2/T3e/T3）へ同一クエリを渡す
-        // （codex-review 指摘: 段ごとに `next_query()` を進めると各段が異なる
-        // クエリ列を測ることになり、モジュール冒頭コメントが宣言する
-        // 「同一 200 クエリベクトルを共有」に反する。ラウンド境界でのみ輪番を
-        // 進め、ラウンド内の全段は同一 idx を使う）。
-        let idx = next_query();
-        let query = &queries[idx];
-        let sql = &sqls[idx];
+        // 本ラウンドの各段（T1′/T1s/T1p/T2/T3e/T3）は、いずれも同じ開始点
+        // `round_start` から `iterations_per_stage` 回だけ独立にクエリプールを
+        // 輪番する（codex-review 指摘: ラウンド境界でのみ 1 クエリを進める
+        // 構成では、各段の `run()` が warmup・計測の全反復で同一クエリを
+        // 繰り返し測定クエリ数が rounds 件（既定 5・上限 50）に留まり、
+        // ラウンド間の入力差がノイズに混ざっていた。各段の全反復でクエリ集合を
+        // 一巡させることで、1 ラウンドあたり最大 `iterations_per_stage` 件・
+        // 全体で最大 `rounds * iterations_per_stage` 件のクエリを反映する）。
+        // 各段の反復回数・開始点が同一であるため、最終反復のインデックス
+        // （`round_last_idx`）は段をまたいで一致し、T1p・T2・T3 の id 完全一致
+        // 検証（本ループ末尾）はこの最終反復のクエリに対して行う。
+        let round_start = cursor;
+        let round_last_idx = (round_start + iterations_per_stage - 1) % QUERY_POOL;
+        cursor = (cursor + iterations_per_stage) % QUERY_POOL;
 
         // T1′: 距離カーネルのみ（Top-k なし）。
+        let mut t1_prime_cursor = round_start;
         let t1_prime = run(&config, || {
+            let idx = t1_prime_cursor % QUERY_POOL;
+            t1_prime_cursor += 1;
+            let query = &queries[idx];
             let mut acc = 0.0f32;
             let dim = arena.dim() as usize;
             for chunk in arena.vectors().chunks_exact(dim) {
@@ -311,9 +321,13 @@ fn main() {
         ));
         t1_prime_medians.push(t1_prime.summary.median);
 
-        // T1s: 単線 provider（距離＋Top-k）。同一クエリ（idx）を使用。
+        // T1s: 単線 provider（距離＋Top-k）。round_start から輪番。
+        let mut t1s_cursor = round_start;
         let mut t1s_ids: Option<Vec<u64>> = None;
         let t1s = run(&config, || {
+            let idx = t1s_cursor % QUERY_POOL;
+            t1s_cursor += 1;
+            let query = &queries[idx];
             let hits = scalar_provider
                 .search(SearchInput {
                     ids: arena.ids(),
@@ -335,9 +349,14 @@ fn main() {
         ));
         t1s_medians.push(t1s.summary.median);
 
-        // T1p: 並列 provider（production 既定）。同一クエリ（idx）を使用。
+        // T1p: 並列 provider（production 既定）。round_start から輪番（他段と
+        // 同一の開始点・反復回数のため、最終反復は round_last_idx に一致する）。
+        let mut t1p_cursor = round_start;
         let mut t1p_ids: Option<Vec<u64>> = None;
         let t1p = run(&config, || {
+            let idx = t1p_cursor % QUERY_POOL;
+            t1p_cursor += 1;
+            let query = &queries[idx];
             let hits = parallel_provider
                 .search(SearchInput {
                     ids: arena.ids(),
@@ -371,16 +390,21 @@ fn main() {
             }
         }
 
-        // T2: SQL 表層（wire と同じ入口。SqlArenaCache ウォーム済み）。同一
-        // クエリ（idx）の SQL を使用。応答エンコード用サンプル（T3e が使う
-        // `QueryResult`）はこの測定区間の外で別途 1 回だけ取得する
-        // （codex-review 指摘: 計測クロージャ内で毎反復 `result.clone()` すると
-        // SQL 表層区分〔T2〕にエンコード用複製コストが混入し過大評価・wire 側
-        // が過小評価されうる。測定クロージャは `execute_sql_in_session` の
-        // 戻り値をそのまま `black_box` へ渡すだけにする）。
+        // T2: SQL 表層（wire と同じ入口。SqlArenaCache ウォーム済み）。
+        // round_start から輪番（他段と同一の開始点・反復回数）。応答エンコード
+        // 用サンプル（T3e が使う `QueryResult`）はこの測定区間の外で別途 1 回
+        // だけ取得する（codex-review 指摘: 計測クロージャ内で毎反復
+        // `result.clone()` すると SQL 表層区分〔T2〕にエンコード用複製コストが
+        // 混入し過大評価・wire 側が過小評価されうる。測定クロージャは
+        // `execute_sql_in_session` の戻り値をそのまま `black_box` へ渡すだけに
+        // する）。
+        let mut t2_cursor = round_start;
         let mut t2_ids: Option<Vec<u64>> = None;
         let mut hot_session = SessionState::default();
         let t2 = run(&config, || {
+            let idx = t2_cursor % QUERY_POOL;
+            t2_cursor += 1;
+            let sql = &sqls[idx];
             let outcome = core
                 .execute_sql_in_session(&policy_ctx, &mut hot_session, sql)
                 .expect("sql_surface_hot query must succeed for well-formed synthetic input");
@@ -412,10 +436,12 @@ fn main() {
         }
 
         // T3e: 応答エンコードのみ（計測外で得た QueryResult に対して測る）。
-        // T2 の計測区間には含めず、ここで同一 SQL を 1 回だけ計測外に実行して
-        // サンプルを取得する（上記 T2 修正のコメント参照）。
+        // T2 の計測区間には含めず、ここで round_last_idx の SQL を 1 回だけ
+        // 計測外に実行してサンプルを取得する（上記 T2 修正のコメント参照。
+        // round_last_idx を使うのは、下記 T3 の最終反復・id 完全一致検証と
+        // 対象クエリを揃えるため）。
         let sample_result = match core
-            .execute_sql_in_session(&policy_ctx, &mut hot_session, sql)
+            .execute_sql_in_session(&policy_ctx, &mut hot_session, &sqls[round_last_idx])
             .expect("sample sql_surface_hot query must succeed for well-formed synthetic input")
         {
             SqlOutcome::Query(result) => result,
@@ -450,9 +476,13 @@ fn main() {
         t3e_medians.push(t3e.summary.median);
 
         // T3: wire e2e（in-process ループバックサーバーへの簡易クエリ往復）。
-        // 同一クエリ（idx）の SQL を使用。
+        // round_start から輪番（他段と同一の開始点・反復回数）。
+        let mut t3_cursor = round_start;
         let mut t3_ids: Option<Vec<u64>> = None;
         let t3 = run(&config, || {
+            let idx = t3_cursor % QUERY_POOL;
+            t3_cursor += 1;
+            let sql = &sqls[idx];
             let start = Instant::now();
             common::send_simple_query(&mut wire_stream, sql);
             let cols = common::read_row_description(&mut wire_stream);
@@ -505,11 +535,10 @@ fn main() {
             }
         }
 
-        // T1p・T2・T3 は本ラウンドで同一クエリ（idx）を測定したため、返却 id
+        // T1p・T2・T3 は本ラウンドで同一の開始点・反復回数からクエリプールを
+        // 輪番したため、最終反復（round_last_idx）のクエリに対する返却 id
         // 集合が完全一致するはずである（モジュール冒頭コメント「fail-closed
-        // 検証」の宣言どおり。上記修正前は段ごとに異なるクエリを輪番していた
-        // ため件数のみの検証に留めていたが、同一クエリ共有化に伴い完全一致
-        // 検証へ強化する——codex-review 指摘対応）。
+        // 検証」の宣言どおり）。
         let t1p_ids = t1p_ids.expect("t1p_ids populated by workload closure");
         let t2_ids = t2_ids.expect("t2_ids populated by workload closure");
         let t3_ids = t3_ids.expect("t3_ids populated by workload closure");
@@ -527,12 +556,12 @@ fn main() {
         }
         if t1p_ids != t2_ids {
             fail_closed(format!(
-                "id set mismatch for identical query (idx={idx}): provider_parallel={t1p_ids:?} sql_surface_hot={t2_ids:?}"
+                "id set mismatch for identical query (idx={round_last_idx}): provider_parallel={t1p_ids:?} sql_surface_hot={t2_ids:?}"
             ));
         }
         if t2_ids != t3_ids {
             fail_closed(format!(
-                "id set mismatch for identical query (idx={idx}): sql_surface_hot={t2_ids:?} wire_roundtrip={t3_ids:?}"
+                "id set mismatch for identical query (idx={round_last_idx}): sql_surface_hot={t2_ids:?} wire_roundtrip={t3_ids:?}"
             ));
         }
     }

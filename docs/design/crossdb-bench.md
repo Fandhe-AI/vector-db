@@ -351,17 +351,20 @@ GPU 経路は in-process API（`engine::gpu_batch`）のみで SQL／wire から
 `vector_knn`（self 786/1147µs）を wire／SQL 表層／距離カーネル・Top-k の 4 区分へ
 切り分ける実測を `crates/wire-server/benches/knn_wire_profile_bench.rs`
 （`make bench-knn-wire-profile`）で実施した。共有開発環境（`BENCH_DEDICATED_ENV`
-未設定・参考値）での 1 回の実測（min-of-5 中央値・T3 675.9µs に対する比率）:
+未設定・参考値）での 1 回の実測（min-of-5 どうし・T3 690.3µs に対する比率。
+最新の実測表・計測条件は `docs/design/knn-wire-stage-profile.md`「実測結果」節
+が SSOT。当所の数値はそこからの要約であり、両者が食い違う場合は
+`knn-wire-stage-profile.md` を正とする）:
 
 | 区分 | 比率 |
 | --- | --- |
-| SQL 表層 | 55.2% |
-| 距離カーネル | 30.1% |
-| wire | 12.2% |
-| Top-k（単線条件） | 1.1%（参照区間帯内） |
+| SQL 表層 | 55.4% |
+| 距離カーネル | 29.6% |
+| wire | 11.9%（参照区間帯内） |
+| Top-k（単線条件） | 1.8%（参照区間帯内） |
 
 SQL 表層が距離カーネル自体より支配的な区分であり、wire 区分（TCP 送受信・
-フレーミング・応答エンコード）の寄与は 12.2% にとどまる。詳細な計測設計・
+フレーミング・応答エンコード）の寄与は 11.9% にとどまる。詳細な計測設計・
 fail-closed 検証・実測表は `docs/design/knn-wire-stage-profile.md` 参照。
 
 ## 申し送り
