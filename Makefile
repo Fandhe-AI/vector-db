@@ -386,6 +386,19 @@ else
 endif
 
 # --------------------------------------------------
+# is_aarch64_feature_detected!／is_x86_feature_detected! の実効性を出力する検出ツール
+# （Issue #468。crates/engine/examples/detect_features.rs）
+# --------------------------------------------------
+
+.PHONY: detect-features
+detect-features: ## Issue #468（macOS 上の is_aarch64_feature_detected! 実効性検証）の feature 検出結果表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/chip-kernel-guidelines.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example detect_features
+else
+	@echo "skip: Cargo.toml 未追加のため detect-features をスキップ"
+endif
+
+# --------------------------------------------------
 # 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
 # --------------------------------------------------
 
