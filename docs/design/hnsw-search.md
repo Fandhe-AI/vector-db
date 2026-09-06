@@ -187,3 +187,41 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
   VectorArena` 側が `vectors` を最初から `Arc<[f32]>` として持てるかを
   検討すること——`build` 時のコピーを `Arc::clone`（参照カウントの増分の
   み）へ縮退できる可能性がある
+
+## 受理判定後 prefetch（Issue #490）
+
+`search_layer` の隣接ループへ、hnswlib `searchBaseLayerST` に倣うソフトウェア
+パイプライン先読みを追加した（`hnsw/prefetch.rs`）。隣接リストの先頭要素を
+ループ開始前に、以降は各反復で次の要素を先読みする（距離 1）。Issue #431
+是正で確立した「非受理（マスク外）ノードのベクトル・visited スロットには
+一切触れない」契約を守るため、先読みは `is_accepted` 判定を通過した後に
+のみ行う。
+
+### stable での制約
+
+新規 `unsafe` を追加しない制約下では、真の prefetch 命令
+（`core::arch::{x86_64,aarch64}` の `_mm_prefetch`／`_prefetch`）は
+`#[target_feature]` 付き関数の内側でのみ safe に呼べる（通常の fn から
+呼ぶと E0133）ため発行できない。`core::hint::prefetch_read`
+（`hint_prefetch` feature）も stable では未安定化。本実装は
+`core::hint::black_box` による早期 load（best-effort。真の prefetch より
+弱い保証）で代替し、差し替え箇所を `hnsw/prefetch.rs` の 2 関数
+（`touch_node_vector`・`touch_word`）に隔離した。
+
+### 検証構成
+
+`search_layer` の本体を `search_layer_with<V, P: PrefetchPolicy>` へ分離し
+（`search_layer` は production 用 `PipelinePrefetch` を渡す薄いラッパ）、
+`#[cfg(test)]` の `NoPrefetch`／`RecordingPrefetch` で以下を機械検証する
+（`hnsw.rs::tests`）:
+
+- prefetch の有無で `search_layer` の結果がビット同一（クラスタコーパス・
+  重複ヘビーコーパス・小 dim の 3 フィクスチャ × `ef ∈ {1, 10, 40}`）
+- `NodeMask` 付き探索（`Subset` 形状）でも同様にビット同一
+- 先読み要求されたノード id がすべて `NodeMask` の受理ノードであること
+  （P0 契約の直接検証。記録が非空であることも固定し vacuous pass を防止）
+
+`parallel_build.rs::search_layer_locked`（並列構築のロック対応版）・
+`greedy_descend`／`greedy_descend_masked`（上位層貪欲降下）・エントリ
+ポイントループへの先読みは本 Issue では未適用（#491 で効果確認後に別
+Issue で検討）。効果の前後比較・採否は #491 の担当。

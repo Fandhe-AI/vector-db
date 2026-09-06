@@ -83,6 +83,9 @@ use std::sync::Arc;
 use crate::kernel::dot;
 
 mod parallel_build;
+/// `search_layer` の隣接ループへ挿入する受理判定後 prefetch（Issue #490）。
+/// `pub(super)` 限定で本モジュール外へは公開しない。
+mod prefetch;
 /// `kernel.rs::SearchProvider` への結線（Issue #407・`search_engine.rs::
 /// SearchEngineKind::Hnsw` の構築先）。本タスク時点は全件 brute-force
 /// フォールバック（詳細は `provider` モジュールドキュメント参照）。
@@ -620,6 +623,10 @@ pub(crate) trait VisitedSet {
     /// `id` を訪問済みとして記録する。戻り値・範囲外時の扱いは各実装の
     /// `mark_visited` に合わせる（`Some(既訪問か)`／範囲外は `None`）。
     fn mark_visited(&mut self, id: usize) -> Option<bool>;
+    /// `id` の visited スロットを早期に load する（Issue #490。`search_layer`
+    /// の受理判定後 prefetch の一部）。読み取りのみ・状態変更なし・範囲外は
+    /// 何もしない（fail-closed）ため `&self` で足りる。
+    fn prefetch_slot(&self, id: usize);
 }
 
 impl VisitedSet for VisitedScratch {
@@ -629,6 +636,10 @@ impl VisitedSet for VisitedScratch {
 
     fn mark_visited(&mut self, id: usize) -> Option<bool> {
         VisitedScratch::mark_visited(self, id)
+    }
+
+    fn prefetch_slot(&self, id: usize) {
+        prefetch::touch_word(self.epoch.get(id));
     }
 }
 
@@ -677,6 +688,10 @@ impl VisitedSet for VisitedBitmap {
 
     fn mark_visited(&mut self, id: usize) -> Option<bool> {
         VisitedBitmap::mark_visited(self, id)
+    }
+
+    fn prefetch_slot(&self, id: usize) {
+        prefetch::touch_word(self.words.get(id / 64));
     }
 }
 
@@ -1555,6 +1570,44 @@ impl HnswIndex {
         visited: &mut V,
         accept: Option<&NodeMask>,
     ) -> Result<Vec<ScoredNode>, HnswError> {
+        // production 経路は常にパイプライン prefetch（Issue #490）。ビット
+        // 同一性・P0 契約（非受理ノード非先読み）の機械検証は
+        // `tests::search_layer_prefetch_*` が `search_layer_with` を
+        // `NoPrefetch`／`RecordingPrefetch` で直接呼んで行う。
+        self.search_layer_with(
+            entry_points,
+            query,
+            ef,
+            level,
+            dim,
+            vectors,
+            visited,
+            accept,
+            &prefetch::PipelinePrefetch,
+        )
+    }
+
+    /// [`Self::search_layer`] の本体。`prefetch`（Issue #490。
+    /// [`prefetch::PrefetchPolicy`]）を型パラメータ化し、production は
+    /// [`prefetch::PipelinePrefetch`]（ZST・単相化でコストゼロ）を、
+    /// テストは `NoPrefetch`／`RecordingPrefetch` を渡してビット同一性・
+    /// 「非受理ノードへは先読みしない」P0 契約を機械検証する。停止条件・
+    /// 受理判定・順序規約は [`Self::search_layer`] の既存契約から一切変更
+    /// していない（先読みは demand load の発行位置を早めるだけで、
+    /// 探索結果・比較順序には影響しない）。
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::hnsw) fn search_layer_with<V: VisitedSet, P: prefetch::PrefetchPolicy>(
+        &self,
+        entry_points: Vec<u32>,
+        query: &[f32],
+        ef: usize,
+        level: usize,
+        dim: usize,
+        vectors: &[f32],
+        visited: &mut V,
+        accept: Option<&NodeMask>,
+        prefetch: &P,
+    ) -> Result<Vec<ScoredNode>, HnswError> {
         visited.reset(self.nodes.len());
         let mut candidates: BinaryHeap<ScoredNode> = BinaryHeap::new();
         // 結果集合は最小ヒープとして扱いたいので `Reverse` で包む。
@@ -1601,7 +1654,25 @@ impl HnswIndex {
             }
 
             if let Some(neighbors) = self.neighbors(level, top_candidate.node) {
-                for &neighbor in neighbors {
+                // Issue #490: hnswlib `searchBaseLayerST` に倣うソフトウェア
+                // パイプライン先読み。隣接リストの先頭要素をループ開始前に、
+                // 以降は各反復 `j` の先頭で `j+1` 番目を先読みする（距離 1）。
+                // 受理判定後にのみ触れる P0 契約（Issue #431 是正。§関数
+                // ドキュメンテーションコメント参照）を守るため、`is_accepted`
+                // を通過したノードのみを先読み対象にする——`is_accepted` は
+                // `NodeMask::get` の純粋なビット判定で副作用を持たないため、
+                // 自身の反復時に再評価しても意味は変わらない。
+                if let Some(&first) = neighbors.first() {
+                    if is_accepted(first) {
+                        prefetch.prefetch_neighbor(first, visited, vectors, dim);
+                    }
+                }
+                for (j, &neighbor) in neighbors.iter().enumerate() {
+                    if let Some(&next) = neighbors.get(j + 1) {
+                        if is_accepted(next) {
+                            prefetch.prefetch_neighbor(next, visited, vectors, dim);
+                        }
+                    }
                     let already = match visited.mark_visited(neighbor as usize) {
                         Some(seen) => seen,
                         None => continue,
@@ -2321,6 +2392,37 @@ mod tests {
         out
     }
 
+    /// Issue #490: prefetch を一切行わない `PrefetchPolicy`（テスト専用）。
+    /// `PipelinePrefetch` とのビット同一性の対照として使う。production
+    /// バイナリには到達しない（`#[cfg(test)]` の `mod tests` 内限定）。
+    #[derive(Debug, Default, Clone, Copy)]
+    struct NoPrefetch;
+
+    impl prefetch::PrefetchPolicy for NoPrefetch {
+        fn prefetch_neighbor<V: VisitedSet>(
+            &self,
+            _node: u32,
+            _visited: &V,
+            _v: &[f32],
+            _d: usize,
+        ) {
+        }
+    }
+
+    /// Issue #490: 先読み要求されたノード id を記録する `PrefetchPolicy`
+    /// （テスト専用）。「受理判定後にのみ先読みする」P0 契約を、記録内容が
+    /// すべて `NodeMask` の受理ノードであることの直接検証で固定する。
+    #[derive(Debug, Default)]
+    struct RecordingPrefetch {
+        seen: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl prefetch::PrefetchPolicy for RecordingPrefetch {
+        fn prefetch_neighbor<V: VisitedSet>(&self, node: u32, _visited: &V, _v: &[f32], _d: usize) {
+            self.seen.borrow_mut().push(node);
+        }
+    }
+
     #[test]
     fn vector_returns_none_out_of_range_and_some_in_range() {
         let dim = 4u32;
@@ -2821,6 +2923,216 @@ mod tests {
             "search must beam through the tied-score node to reach node 2, then \
              fall back to node 0 (score 10.0) as the 2nd best"
         );
+    }
+
+    /// Issue #490: 受理判定後 prefetch の有無で `search_layer` の結果が
+    /// ビット同一であることを、複数フィクスチャ・複数 `ef` で機械検証する
+    /// （§`search_layer_with` ドキュメンテーションコメント参照）。
+    #[test]
+    fn search_layer_prefetch_is_bit_identical_to_no_prefetch() {
+        let dim = 8usize;
+        // クラスタ構造ありコーパス・重複ヘビーコーパス（同点誘発）・小 dim の
+        // 3 フィクスチャ。
+        let cluster = gen_corpus(41, dim, 300);
+        let mut duplicate_heavy = gen_corpus(43, dim, 20);
+        duplicate_heavy = duplicate_heavy
+            .iter()
+            .cycle()
+            .take(300 * dim)
+            .copied()
+            .collect();
+        let small_dim = gen_corpus(45, 2, 300);
+        let fixtures: [(&str, usize, &[f32]); 3] = [
+            ("cluster", dim, &cluster),
+            ("duplicate_heavy", dim, &duplicate_heavy),
+            ("small_dim", 2, &small_dim),
+        ];
+        for (name, fixture_dim, vectors) in fixtures {
+            let params = HnswParams {
+                m: 8,
+                ef_construction: 40,
+                ef_search: 20,
+            };
+            let index = HnswIndex::build(params, fixture_dim as u32, vectors, 7)
+                .unwrap_or_else(|e| panic!("build failed for fixture {name}: {e:?}"));
+            let entry = index.entry_point().expect("non-empty index has an entry");
+            let query = gen_corpus(99, fixture_dim, 1);
+            for &ef in &[1usize, 10, 40] {
+                let mut visited_no = VisitedScratch::default();
+                let via_no = index
+                    .search_layer_with(
+                        vec![entry],
+                        &query,
+                        ef,
+                        0,
+                        fixture_dim,
+                        vectors,
+                        &mut visited_no,
+                        None,
+                        &NoPrefetch,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!("search_layer_with(NoPrefetch) failed for {name}/ef={ef}: {e:?}")
+                    });
+                let mut visited_pipeline = VisitedScratch::default();
+                let via_pipeline = index
+                    .search_layer_with(
+                        vec![entry],
+                        &query,
+                        ef,
+                        0,
+                        fixture_dim,
+                        vectors,
+                        &mut visited_pipeline,
+                        None,
+                        &prefetch::PipelinePrefetch,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "search_layer_with(PipelinePrefetch) failed for {name}/ef={ef}: {e:?}"
+                        )
+                    });
+                assert_eq!(
+                    via_no.len(),
+                    via_pipeline.len(),
+                    "fixture {name}/ef={ef}: result length must match"
+                );
+                for (a, b) in via_no.iter().zip(via_pipeline.iter()) {
+                    assert_eq!(
+                        a.node, b.node,
+                        "fixture {name}/ef={ef}: node order must match"
+                    );
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "fixture {name}/ef={ef}: score must be bit-identical with/without prefetch"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #490: `NodeMask` によるフィルタあり探索（`Subset` 形状）でも
+    /// prefetch の有無でビット同一であることを検証する。
+    #[test]
+    fn search_layer_prefetch_with_mask_is_bit_identical() {
+        let dim = 8usize;
+        let n = 300;
+        let vectors = gen_corpus(51, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 51).unwrap();
+        let mut mask = NodeMask::new(index.len());
+        for node in 0..index.len() {
+            if node % 2 == 0 {
+                mask.set(node as u32);
+            }
+        }
+        // `search_layer_with` を直接呼ぶため、`search_masked` が持つ代替
+        // entry point 選択（非受理な固定 entry point からの縮退回避）は
+        // 経由しない。本テストの entry point は受理済みノード（偶数）を
+        // 直接選ぶことで、探索が空集合へ縮退せず非 vacuous な検証になる
+        // ようにする。
+        let entry = 0u32;
+        assert!(
+            mask.get(entry),
+            "test setup: entry point must be mask-accepted"
+        );
+        let query = gen_corpus(123, dim, 1);
+        let ef = 40usize;
+
+        let mut visited_no = VisitedScratch::default();
+        let via_no = index
+            .search_layer_with(
+                vec![entry],
+                &query,
+                ef,
+                0,
+                dim,
+                &vectors,
+                &mut visited_no,
+                Some(&mask),
+                &NoPrefetch,
+            )
+            .unwrap();
+        let mut visited_pipeline = VisitedScratch::default();
+        let via_pipeline = index
+            .search_layer_with(
+                vec![entry],
+                &query,
+                ef,
+                0,
+                dim,
+                &vectors,
+                &mut visited_pipeline,
+                Some(&mask),
+                &prefetch::PipelinePrefetch,
+            )
+            .unwrap();
+        assert_eq!(via_no, via_pipeline);
+        assert!(
+            !via_no.is_empty(),
+            "masked search should find some hits (non-vacuous)"
+        );
+    }
+
+    /// Issue #490 の P0 契約（非受理ノードのベクトル・visited スロットへは
+    /// 一切触れない）を、実際に先読み要求されたノード id を記録して直接
+    /// 検証する（`RecordingPrefetch`）。記録が空だと検証が vacuous になる
+    /// ため、非空であることもあわせて固定する。
+    #[test]
+    fn search_layer_prefetch_never_touches_rejected_nodes() {
+        let dim = 8usize;
+        let n = 300;
+        let vectors = gen_corpus(61, dim, n);
+        let params = HnswParams {
+            m: 8,
+            ef_construction: 40,
+            ef_search: 20,
+        };
+        let index = HnswIndex::build(params, dim as u32, &vectors, 61).unwrap();
+        let mut mask = NodeMask::new(index.len());
+        for node in 0..index.len() {
+            if node % 2 == 0 {
+                mask.set(node as u32);
+            }
+        }
+        // 上のテストと同じ理由（entry point は受理済みノードを直接選ぶ）。
+        let entry = 0u32;
+        assert!(
+            mask.get(entry),
+            "test setup: entry point must be mask-accepted"
+        );
+        let query = gen_corpus(321, dim, 1);
+        let recorder = RecordingPrefetch::default();
+        let mut visited = VisitedScratch::default();
+        let _ = index
+            .search_layer_with(
+                vec![entry],
+                &query,
+                40,
+                0,
+                dim,
+                &vectors,
+                &mut visited,
+                Some(&mask),
+                &recorder,
+            )
+            .unwrap();
+        let seen = recorder.seen.borrow();
+        assert!(
+            !seen.is_empty(),
+            "test must exercise at least one prefetch call (vacuous pass prevention)"
+        );
+        for &node in seen.iter() {
+            assert!(
+                mask.get(node),
+                "prefetch must never be requested for a mask-rejected node {node}"
+            );
+        }
     }
 
     #[test]
