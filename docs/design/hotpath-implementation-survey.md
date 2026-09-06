@@ -301,11 +301,16 @@ top-10 でカバーできていないギャップ:
 - `group_by_having`（3,948µs・1.4x）: 施策 #2（二次索引）で改善する見込みだが
   未検証
 
-計測カバレッジ: 全ベンチが dim=128 の単一点。
-[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)
-の実測表は同一変更が dim100 で悪化・dim1536 で改善と、dim が挙動の判別変数で
-あることを示している。現行ベンチ構成では dim 依存の施策（#8・#10）の採否を
-判定する能力が構造的に無く、dim=768 のベンチ点追加（既起票 #466）を推奨する。
+計測カバレッジ: 上記ギャップ（`hybrid_rrf`・`group_by_having`）の実測元である
+[`docs/design/crossdb-bench.md`](crossdb-bench.md) の横断 SQL ベンチ
+（self／pgvector／sqlite-vec／Qdrant／LanceDB／MySQL 比較。`scripts/crossdb_bench/`）
+は dim=128・25,000 行の単一点に限定されており、この横断比較の範囲では dim 依存の
+施策（#8・#10）の採否を判定する材料が無い。これはカーネル単体の計測資産の欠落
+ではない ── `crates/engine/benches/dot_kernel_bench.rs` は dim=[100, 128, 384, 768,
+1536] を、`crates/engine/benches/batch_bench.rs` も dim=256／768 の経路をそれぞれ
+既に計測している（[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)
+参照）。不足しているのは横断 SQL ベンチ側の dim 展開であり、`dim=768` のベンチ点
+追加（既起票 #466）は crossdb_bench 側の対応として推奨する。
 
 ## 12. 未調査の実装
 

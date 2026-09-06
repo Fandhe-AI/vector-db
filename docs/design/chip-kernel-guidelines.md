@@ -97,15 +97,23 @@ dot カーネルの A/B を交互実測したところ速度比が 1.01〜1.72x 
 
 | 世代 | 実効 FMA 構成 | 推奨レーン幅 | f16／bf16／i8 経路 | 注意点 |
 | ---- | ------------- | ------------ | ------------------- | ------ |
-| Ice Lake-SP | 1×512 FMA（port 5 の 512b FMA は SKU 依存） | 512 bit | VNNI（`vpdpbusd`）有。BF16 無し | ライセンス降周波は実質消滅 |
+| Ice Lake-SP | 1×512 FMA（port 5 の 512b FMA は SKU 依存） | 512 bit | VNNI（`vpdpbusd`）有。BF16 無し | サーバー向けは降周波あり（下記注記参照。クライアントの実測を一般化しない） |
 | Sapphire Rapids／Emerald Rapids | 2×512 FMA | 512 bit | VNNI・AVX-512 BF16（`vdpbf16ps`）・AMX（BF16/INT8 TMUL） | AMX は OS 有効化必須 |
 | Granite Rapids | 2×512 FMA | 512 bit | 上記＋AMX-FP16 | 同上 |
 | Alder Lake〜Arrow Lake（クライアント） | AVX-512 無し（fuse off） | 256 bit（AVX2+FMA） | AVX-VNNI（256bit）有。F16C 全世代有 | P/E コア混在。E コアへ移送されうる |
 | Diamond Rapids | AVX10.2-512 | 512 bit | AVX10.2 の新 AI データ型 | 未発売・未確認 |
 
-- 周波数低下: Ice Lake 以降は 1 コア稼働時の 512-bit 命令で約 100 MHz のみの
-  低下・それ以外は降周波なし（Travis Downs 実測、二次資料）。Ice
-  Lake／Rocket Lake 以降では AVX-512 の降周波はほぼ無視できるとされる
+- 周波数低下: 上記の「1 コア稼働時に約 100 MHz のみの低下」（Travis Downs
+  実測、二次資料）は **クライアント SKU**（Rocket Lake 等）での計測であり、
+  Ice Lake-SP を含む第3世代 Xeon Scalable（サーバー SKU）へそのまま
+  一般化できない。Intel の一次資料（Intel 64 and IA-32 Architectures
+  Optimization Reference Manual §4.2〜4.2.1 の AVX-512 Power License 記載）
+  によれば、サーバー SKU は依然として命令カテゴリ（Light／Heavy）・SKU・
+  同時稼働コア数に応じた Power Level（License 0〜2）遷移とそれに伴う
+  周波数低下を持つ。Ice Lake-SP の FMA カーネル設計では、クライアントの
+  「降周波はほぼ無視できる」という結論を流用せず、対象 SKU の稼働コア数・
+  命令の Light／Heavy 分類ごとに一次資料または自環境の実測で周波数レベルを
+  確認すること
 - AMX の OS 有効化（Linux）: `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`
   必須。XFD により既定無効
 - キャッシュ律速の目安（導出値・実測ではない）: dim=128 の f32 行は 512 B。
