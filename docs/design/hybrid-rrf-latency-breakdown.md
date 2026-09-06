@@ -1039,24 +1039,37 @@ min-of-5／median-of-5（2 回目）: B0s(322/338) B0(442/449) B1(9345/9410)
 B2(10902/11018) B3(627/652) B4(5570/5665) B5(3424/3449) B8(124/125)。参照区間帯
 （B0s）14.95%。
 
-帰属表（min-of-5 基準。2 回とも同じ順位）:
+帰属表（min-of-5 基準。2 回とも同じ順位。`ratio_of_b1` は表示専用で B1 min に
+対する構成比、`band` は
+[benchmark-judgement-policy.md](./benchmark-judgement-policy.md) §4 の「before
+を分母とする」規約に従い当該区間自身の before/after（`step_ratio_pct`）で
+判定する——構成比の表示と band 判定を分離しており、before/after の対を持つ
+sql_surface・projection のみ band を評価し、単独区分（dense/sparse/residual
+系）は比較元を持たないため band は n/a とする。PR #556 codex-review 指摘対応
+（[threadId PRRT_kwDOUAKASM6fqN7s]）で `hybrid_profile_bench.rs` を修正済み）:
 
-| 区分 | 1 回目 diff(ratio) | 2 回目 diff(ratio) | band |
-| --- | --- | --- | --- |
-| sql_surface(B1−B4) | 3313us(37.15%) | 3774us(40.39%) | above_noise_band |
-| sparse(B5) | 3417us(38.32%) | 3424us(36.64%) | above_noise_band |
-| residual(B4−B0−B5) | 1756us(19.69%) | 1704us(18.23%) | above_noise_band |
-| dense(B0) | 430us(4.82%) | 442us(4.73%) | within_noise_band |
-| visible_set_build(B8) | 124us(1.39%) | 124us(1.33%) | within_noise_band |
-| dense_fast_path_contrast(B3・informational) | 650us(7.29%) | 627us(6.71%) | within_noise_band |
+| 区分 | 1 回目 diff(ratio_of_b1) | 2 回目 diff(ratio_of_b1) | before→after step_ratio_pct（1 回目 / 2 回目） | band（1 回目 / 2 回目） |
+| --- | --- | --- | --- | --- |
+| sql_surface(B1−B4) | 3313us(37.15%) | 3774us(40.39%) | 59.12% / 67.77% | above_noise_band / above_noise_band |
+| projection(B2−B1) | 1955us(21.93%) | 1557us(16.66%) | 21.93% / 16.66% | above_noise_band / above_noise_band |
+| sparse(B5) | 3417us(38.32%) | 3424us(36.64%) | n/a（単独区分） | n/a |
+| residual(B4−B0−B5) | 1756us(19.69%) | 1704us(18.23%) | n/a（単独区分） | n/a |
+| dense(B0) | 430us(4.82%) | 442us(4.73%) | n/a（単独区分） | n/a |
+| visible_set_build(B8) | 124us(1.39%) | 124us(1.33%) | n/a（単独区分） | n/a |
+| dense_fast_path_contrast(B3・informational) | 650us(7.29%) | 627us(6.71%) | n/a（単独区分） | n/a |
 
 **上位 2 区分は sql_surface(B1−B4) と sparse(B5) がほぼ同水準（37〜40%）で
-並び、残差（18〜20%）が僅差で 3 位**。B8（可視集合 `BTreeSet` 構築）はノイズ帯内
-（1%台）で、B4−B0−B5 の残差の大半は「融合＋境界同点グループ完全化」（`rrf_fuse`
-本体・`complete_boundary_tie_group`）に帰属すると推定される（下限近似 B7 は
-本実測では計測しておらず今後の精査対象）。参照区間帯（B0s）は両回とも
-15〜17% と共有環境のノイズが大きく、dense(B0)・dense_fast_path_contrast(B3)
-の band 判定はこの参照帯に対して within（4〜7% < 15〜17%）となる。
+並び、残差（18〜20%）が僅差で 3 位**（この順位比較は表示用の `ratio_of_b1`
+＝ B1 min に対する構成比であり、band 判定とは別軸）。B8（可視集合
+`BTreeSet` 構築）は構成比が小さく（1%台）、B4−B0−B5 の残差の大半は「融合＋
+境界同点グループ完全化」（`rrf_fuse` 本体・`complete_boundary_tie_group`）に
+帰属すると推定される（下限近似 B7 は本実測では計測しておらず今後の精査対象）。
+before/after の対を持つ sql_surface・projection は、それぞれの区間自身の
+step_ratio_pct（59〜68%・17〜22%）が参照区間帯（B0s、両回とも 15〜17%）を
+明確に上回り above_noise_band となる。単独区分（dense/sparse/residual 系）は
+「B1 に対する構成比が参照帯を上回るか」という誤った判定基準を撤去したため
+band を n/a とし、`ratio_of_b1` の値は帰属の目安（informational）としてのみ
+扱う。
 
 ### wire／SQL 表層／engine 内訳（`bench-hybrid-wire-profile` T1p〜T3）
 

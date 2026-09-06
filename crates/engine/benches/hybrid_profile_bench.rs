@@ -1094,8 +1094,12 @@ fn main() {
         med_b8.as_micros(),
     );
 
-    // --- 帰属表（min-of-R 基準。ratio は B1 min に対する構成比、band は当該
-    // 区間自身の step_ratio_pct を固定 ±5%・参照区間帯の広い方と比較） ---
+    // --- 帰属表（min-of-R 基準。ratio_of_b1 は表示専用で B1 min に対する構成比を
+    // 示すが、band 判定はこれと分離し docs/design/benchmark-judgement-policy.md
+    // §4 の「before を分母とする」規約どおり、当該区間自身の before/after
+    // （`step_ratio_pct(before, after)`）を用いる。比較元となる before/after の
+    // 対を持たない単独区分（dense/sparse/residual 系・wire 側等）は band を
+    // n/a とする ---
     let sql_surface_diff = bucket_diff(min_b4, min_b1); // B1 - B4
     let projection_diff = bucket_diff(min_b1, min_b2); // B2 - B1
     let residual_diff = {
@@ -1105,32 +1109,44 @@ fn main() {
     let residual_minus_visible_diff = residual_diff.and_then(|d| bucket_diff(min_b8, d));
 
     let b1_us = min_b1.as_micros().max(1) as f64;
-    let render_bucket = |label: &str, diff: Option<std::time::Duration>| {
-        let diff_us = diff.map(|d| d.as_micros());
-        let ratio_pct = diff_us.map(|us| (us as f64 / b1_us) * 100.0);
-        let band = match diff {
-            Some(d) => match step_ratio_pct(min_b1, min_b1 + d) {
-                Ok(pct) => classify_against_bands(pct, ref_band_pct).to_string(),
-                Err(_) => "n/a".to_string(),
-            },
-            None => "n/a".to_string(),
+    let render_bucket =
+        |label: &str,
+         diff: Option<std::time::Duration>,
+         band_basis: Option<(std::time::Duration, std::time::Duration)>| {
+            let diff_us = diff.map(|d| d.as_micros());
+            let ratio_pct = diff_us.map(|us| (us as f64 / b1_us) * 100.0);
+            let band = match band_basis {
+                Some((before, after)) => match step_ratio_pct(before, after) {
+                    Ok(pct) => classify_against_bands(pct, ref_band_pct).to_string(),
+                    Err(_) => "n/a".to_string(),
+                },
+                None => "n/a".to_string(),
+            };
+            println!(
+                "{}",
+                render_baseline_bucket_line(label, diff_us, ratio_pct, &band)
+            );
         };
-        println!(
-            "{}",
-            render_baseline_bucket_line(label, diff_us, ratio_pct, &band)
-        );
-    };
-    render_bucket("sql_surface(B1-B4)", sql_surface_diff);
-    render_bucket("projection(B2-B1)", projection_diff);
-    render_bucket("dense(B0)", Some(min_b0));
-    render_bucket("sparse(B5)", Some(min_b5));
-    render_bucket("residual(B4-B0-B5)", residual_diff);
+    render_bucket(
+        "sql_surface(B1-B4)",
+        sql_surface_diff,
+        Some((min_b4, min_b1)),
+    );
+    render_bucket("projection(B2-B1)", projection_diff, Some((min_b1, min_b2)));
+    render_bucket("dense(B0)", Some(min_b0), None);
+    render_bucket("sparse(B5)", Some(min_b5), None);
+    render_bucket("residual(B4-B0-B5)", residual_diff, None);
     render_bucket(
         "residual_minus_visible_set_build(B4-B0-B5-B8)",
         residual_minus_visible_diff,
+        None,
     );
-    render_bucket("visible_set_build(B8)", Some(min_b8));
-    render_bucket("dense_fast_path_contrast(B3, informational)", Some(min_b3));
+    render_bucket("visible_set_build(B8)", Some(min_b8), None);
+    render_bucket(
+        "dense_fast_path_contrast(B3, informational)",
+        Some(min_b3),
+        None,
+    );
 
     println!(
         "hybrid_profile: baseline round measurement (Issue #465) done — see \
