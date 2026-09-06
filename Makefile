@@ -200,6 +200,15 @@ else
 	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
 endif
 
+.PHONY: simd-codegen-check
+simd-codegen-check: ## SIMD カーネル生成コード検査ガード（Issue #467・TASK-156/CORE-14 ポインタ。要素ごと挿入命令の不在＋広幅 FMA の存在。core-api-check/sort-determinism-check と異なり cargo の release ビルド〔専用 target dir〕を伴う。x86_64 host 限定）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --self-test
+	scripts/check_simd_codegen.sh
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check をスキップ"
+endif
+
 .PHONY: e2e-three-client
 e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
@@ -223,7 +232,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）

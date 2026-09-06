@@ -182,6 +182,32 @@ jobs:
         run: make sort-determinism-check
 
   # --------------------------------------------------
+  # simd-codegen-check（SIMD カーネルの生成コード検査ガード。対応 Issue #467・
+  # TASK-156/CORE-14 ポインタ）
+  # --------------------------------------------------
+  # `isa.rs` の x86_64 SIMD カーネル（`dot_avx2_fma`/`dot_avx512`）が Phase 4
+  # で intrinsics ベースの set 構築方式へ移行した際、ストライド・非連続要素からの
+  # 構築で要素ごと挿入命令（`vinsertps`/`vpinsr*`/`vunpck[lh]ps`）が生成コードへ
+  # 再混入していないかを `cargo rustc --emit asm` の実際の生成コードで検査する
+  # （scripts/check_simd_codegen.sh。core-api-check/sort-determinism-check とは
+  # 異なり cargo の release ビルドを伴うため専用ジョブとする）。第三者 action は
+  # 他ジョブと同一 SHA 固定を使う。aarch64（`dot_neon`）は baseline NEON のため
+  # 呼び出し元へインライン化されシンボルを持たず本ジョブの対象外（詳細・確認結果は
+  # docs/design/simd-codegen-guard.md 参照。CI 配線は別 ADR の判断事項）。
+  simd-codegen-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+      - name: Run simd-codegen-check
+        run: make simd-codegen-check
+
+  # --------------------------------------------------
   # cross-check（aarch64 クロスコンパイル確認。TASK-156・対象ビヘイビア CORE-14）
   # --------------------------------------------------
   # `isa.rs` の NEON カーネル（`#[cfg(target_arch = "aarch64")]`）が x86_64 の
