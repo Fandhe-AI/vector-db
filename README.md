@@ -357,7 +357,7 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 ### macOS 上の feature 検出の実機検証（Issue #468）
 
-`make detect-features`（`crates/engine/examples/detect_features.rs`）は `is_aarch64_feature_detected!`／`is_x86_feature_detected!` マクロの実効性（コンパイル時 `cfg!(target_feature)` 定数化・マクロ実行結果・macOS では `sysctl` 相互検証）を表として出力します。依存追加なし・検出結果の上書き機構なし（`isa.rs` の CORE-12 節と同じ fail-closed 方針）。Apple Silicon 実機での実測は `.github/workflows/detect-features.yml`（`pull_request` の paths 限定トリガ、または `workflow_dispatch` で GitHub ホステッド `macos-latest` runner 上で実行。情報提供専用・必須チェックには含めません）で行い、出力を `docs/design/chip-kernel-guidelines.md`「8. macOS 上の `is_aarch64_feature_detected!` 実効性」節へ転記します。GitHub ホステッド runner（macOS 26.5.2・仮想化）での実機確認は完了済みです（同節参照）。オーナー所有実機（M4 等）での追記も同ツールで行えます。
+`make detect-features`（`crates/engine/examples/detect_features.rs`）は `is_aarch64_feature_detected!`／`is_x86_feature_detected!` マクロの実効性（コンパイル時 `cfg!(target_feature)` 定数化・マクロ実行結果・macOS では `sysctl` 相互検証）を表として出力します。依存追加なし・検出結果の上書き機構なし（`isa.rs` の CORE-12 節と同じ fail-closed 方針）。Apple Silicon 実機での実測は `.github/workflows/detect-features.yml`（全 PR で起動する `detect-changes` ジョブが対象パス〔`isa.rs`・`detect_features.rs`・`tests/isa.rs`・同 workflow〕の変更有無を判定し、変更があった PR と `workflow_dispatch` でのみ `detect-apple` を GitHub ホステッド `macos-latest` runner 上で実行。対象外 PR では skipped の check-run を残します。情報提供専用ですが、自動マージ運用〔G0 ゲート〕の都合で両ジョブを必須チェックへ登録します）で行い、出力を `docs/design/chip-kernel-guidelines.md`「8. macOS 上の `is_aarch64_feature_detected!` 実効性」節へ転記します。GitHub ホステッド runner（macOS 26.5.2・仮想化）での実機確認は完了済みです（同節参照）。オーナー所有実機（M4 等）での追記も同ツールで行えます。
 
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
