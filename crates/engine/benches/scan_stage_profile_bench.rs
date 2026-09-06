@@ -398,15 +398,20 @@ fn main() {
     }
 
     // 計測外で `lang = 'ja'` の期待一致件数を求める（W2 の整合性検証に使う）。
+    // `expected_match_ids` は W1/W2 で実際に測定するコード経路（`scan_scalar_columns`
+    // ＋`matches_lang_filter`）を一切通さず、シード時に確定している「id → lang」の
+    // 対応規則（`LANGS[(id as usize) % LANGS.len()]`。上記シードループ参照）から
+    // 直接導出する。`scan_scalar_columns`／`matches_lang_filter` 自体に退行が
+    // 混入した場合でも、同じロジックで期待値を作ってしまうと W2 の整合性検証が
+    // 常に一致してしまい検出できない（P2 指摘・codex-review）ため、検証対象の
+    // ロジックから独立した根拠が必要。
     let filters = vec![build_lang_filter(&schema, "lang", TARGET_LANG)
         .expect("build_lang_filter must succeed for well-formed schema")];
-    let mut expected_match_ids: Vec<u64> = Vec::new();
-    for (idx, metadata) in captured_metadata.iter().enumerate() {
-        let scanned = scan_scalar_columns(&schema, metadata).expect("scan_scalar_columns");
-        if matches_lang_filter(&filters, &scanned) {
-            expected_match_ids.push(captured_ids[idx]);
-        }
-    }
+    let expected_match_ids: Vec<u64> = captured_ids
+        .iter()
+        .copied()
+        .filter(|id| LANGS[(*id as usize) % LANGS.len()] == TARGET_LANG)
+        .collect();
     if expected_match_ids.is_empty() {
         fail_closed("no rows matched lang = 'ja' in the synthetic corpus (fixture misconfigured)");
     }
@@ -546,6 +551,11 @@ fn main() {
                 matched_ids.push(captured_ids[idx]);
                 matched_vectors.extend_from_slice(arena.vector(idx).expect("arena vector"));
             }
+        }
+        if matched_ids != expected_match_ids {
+            fail_closed(format!(
+                "round {round}: W3/W4 matched id set diverged from independently derived expected_match_ids (predicate regression suspected)"
+            ));
         }
         let w4 = run(&config, || {
             parallel_provider
@@ -755,7 +765,7 @@ fn main() {
     let ref_band_pct = reference_band(&r_dot_rounds).unwrap_or(0.0) * 100.0;
 
     println!("--- per-round raw medians (ms) ---");
-    for (round, ((((((((a1, a2), a3), a4), a5), w1), w2), w3), w4)) in a1_rounds
+    for (round, (((((((((a1, a2), a3), a4), a5), w1), w2), w3), w4), r_dot)) in a1_rounds
         .iter()
         .zip(&a2_rounds)
         .zip(&a3_rounds)
@@ -765,10 +775,11 @@ fn main() {
         .zip(&w2_rounds)
         .zip(&w3_rounds)
         .zip(&w4_rounds)
+        .zip(&r_dot_rounds)
         .enumerate()
     {
         println!(
-            "round[{round}]: A1={:.3} A2={:.3} A3={:.3} A4={:.3} A5={:.3} W1={:.3} W2={:.3} W3={:.3} W4={:.3}",
+            "round[{round}]: A1={:.3} A2={:.3} A3={:.3} A4={:.3} A5={:.3} W1={:.3} W2={:.3} W3={:.3} W4={:.3} R_dot={:.3}",
             a1.as_secs_f64() * 1e3,
             a2.as_secs_f64() * 1e3,
             a3.as_secs_f64() * 1e3,
@@ -778,6 +789,7 @@ fn main() {
             w2.as_secs_f64() * 1e3,
             w3.as_secs_f64() * 1e3,
             w4.as_secs_f64() * 1e3,
+            r_dot.as_secs_f64() * 1e3,
         );
     }
 
@@ -939,8 +951,9 @@ fn main() {
     // だけでなく、dense 探索（距離計算・Top-k 選出）の候補集合サイズが異なる
     // ことによる処理量差も混入する（W3/W4 が示すとおり候補集合が小さいほど
     // 距離計算・Top-k コストは減る側に働くため、この raw diff を「WHERE 上乗せ」
-    // として単純に W1+W2+W3 の合計・残差の帰属に使うことはできない。候補集合を
-    // 揃えた比較は W 系列〔`W1`〜`W4`、いずれも一致行のみを対象〕・`R_dot`
+    // として単純に W3（W1・W2 を含む累積値。W1+W2+W3 のような加算は W1 分の
+    // scalar_scan コストを二重計上するため行わない）との比較・残差の帰属に
+    // 使うことはできない。候補集合を揃えた比較は W 系列〔`W1`〜`W4`、いずれも一致行のみを対象〕・`R_dot`
     // （全可視行対象の参照区間）側で行う。P2 指摘・詳細は
     // `docs/design/scan-stage-profile.md`「W0-hot と W0-nowhere の候補集合差」
     // 節を参照）。
