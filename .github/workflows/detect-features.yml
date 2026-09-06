@@ -68,7 +68,8 @@ jobs:
           fi
           # 改名（rename）は新パス `filename` に加えて旧パス `previous_filename` を持つ。
           # 対象ファイルを移動する PR で検証が skipped にならないよう新旧両方を照合する
-          if ! files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[] | .filename, (.previous_filename // empty)'); then
+          if ! files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+              --jq '.[] | .filename, (.previous_filename // empty)'); then
             echo "failed to list PR files; fail-closed to changed=true"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
