@@ -100,6 +100,9 @@ FallbackBatchEngine（batch_fallback.rs・CORE-8）
 - `unsafe`・`bytemuck` は使わない。バイト列変換は `to_ne_bytes`/
   `from_ne_bytes` のみ。バッファサイズは `checked_*`/`saturating_*` で導出する
 
+workgroup 内部分 Top-k（readback 量削減。段階的 fail-closed 縮退を含む）は
+[`gpu-batch-topk.md`](gpu-batch-topk.md) を参照（Issue #536 で実装）。
+
 ### 2.3 スコープ縮小事項（当初計画からの差分）
 
 実装時間の制約により、以下は当初計画（`BatchPlan` によるテナント別グループ
