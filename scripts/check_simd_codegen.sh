@@ -108,6 +108,13 @@ TARGET_DIR="${SIMD_CODEGEN_TARGET_DIR:-${REPO_ROOT}/target/simd-codegen}"
 # 関数だけをラベル〜`.cfi_endproc` 単位で抽出する。第 2 引数の module_segment は
 # 正規表現（perl 拡張）として扱う。
 #
+# ラベル行の判定は先頭の追加アンダースコア（`_`）を許容する: Mach-O（macOS。
+# aarch64-apple-darwin／x86_64-apple-darwin）では ELF/COFF と異なり全シンボルへ
+# リンカが追加のアンダースコアを 1 つ付与するため、legacy マングリング
+# `_ZN...` は `__ZN...`、v0 マングリング `_R...` は `__R...` としてアセンブリへ
+# 出力される（実体は同じシンボルであり、後続の module_segment 部分一致・
+# required_segments_for の照合はどちらの形式でも変わらず動作する）。
+#
 # 抽出結果は「関数名<TAB>命令行...（改行区切り）」のブロックを `\x01` 区切りで
 # 標準出力へ書き出す（呼び出し元がブロック単位で走査する）。
 extract_functions() {
@@ -133,7 +140,7 @@ extract_functions() {
         # そのまま読み捨て、次行から通常探索を継続する。
       }
     }
-    if (/^((?:_ZN|_R)[A-Za-z0-9_.\$]*):$/) {
+    if (/^(_?(?:_ZN|_R)[A-Za-z0-9_.\$]*):$/) {
       $name = $1;
       @lines = ();
       $state = "after_label";
@@ -563,7 +570,7 @@ self_test() {
     write_x86_64_fixtures "${scratch}"
 
     local asm
-    asm="$(compile_fixture "${scratch}/pass_set" "${scratch}/fx_pass_set.rs" "")" || { overall=1; asm=""; }
+    asm="$(compile_fixture "${scratch}/pass_set" "${scratch}/fx_pass_set.rs" "${TARGET}")" || { overall=1; asm=""; }
     if [ -n "${asm}" ]; then
       if run_scan "${asm}" x86_64 "isa_probe" "12dot_avx2_fma" >/dev/null; then
         echo "self-test ok: pass_set (element-wise set from contiguous chunk)"
@@ -573,7 +580,7 @@ self_test() {
       fi
     fi
 
-    asm="$(compile_fixture "${scratch}/pass_autovec" "${scratch}/fx_pass_autovec.rs" "")" || { overall=1; asm=""; }
+    asm="$(compile_fixture "${scratch}/pass_autovec" "${scratch}/fx_pass_autovec.rs" "${TARGET}")" || { overall=1; asm=""; }
     if [ -n "${asm}" ]; then
       if run_scan "${asm}" x86_64 "isa_probe" "12dot_avx2_fma" >/dev/null; then
         echo "self-test ok: pass_autovec (dot_lanes-equivalent auto-vectorization)"
@@ -583,7 +590,7 @@ self_test() {
       fi
     fi
 
-    asm="$(compile_fixture "${scratch}/fail_stride_set" "${scratch}/fx_fail_stride_set.rs" "")" || { overall=1; asm=""; }
+    asm="$(compile_fixture "${scratch}/fail_stride_set" "${scratch}/fx_fail_stride_set.rs" "${TARGET}")" || { overall=1; asm=""; }
     if [ -n "${asm}" ]; then
       if run_scan "${asm}" x86_64 "isa_probe" "12dot_avx2_fma" >/dev/null 2>&1; then
         echo "self-test FAILED: expected fail_stride_set to be rejected (vinsertps)" >&2
@@ -593,7 +600,7 @@ self_test() {
       fi
     fi
 
-    asm="$(compile_fixture "${scratch}/fail_stride_f16" "${scratch}/fx_fail_stride_f16.rs" "")" || { overall=1; asm=""; }
+    asm="$(compile_fixture "${scratch}/fail_stride_f16" "${scratch}/fx_fail_stride_f16.rs" "${TARGET}")" || { overall=1; asm=""; }
     if [ -n "${asm}" ]; then
       if run_scan "${asm}" x86_64 "isa_probe" "12dot_avx2_fma" >/dev/null 2>&1; then
         echo "self-test FAILED: expected fail_stride_f16 to be rejected (vpinsrw)" >&2
@@ -603,7 +610,7 @@ self_test() {
       fi
     fi
 
-    asm="$(compile_fixture "${scratch}/fail_missing_symbol" "${scratch}/fx_fail_missing_symbol.rs" "")" || { overall=1; asm=""; }
+    asm="$(compile_fixture "${scratch}/fail_missing_symbol" "${scratch}/fx_fail_missing_symbol.rs" "${TARGET}")" || { overall=1; asm=""; }
     if [ -n "${asm}" ]; then
       if run_scan "${asm}" x86_64 "isa_probe" "12dot_avx2_fma" >/dev/null 2>&1; then
         echo "self-test FAILED: expected fail_missing_symbol to be rejected (required symbol missing)" >&2
