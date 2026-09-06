@@ -229,3 +229,144 @@ Issue #405 の受け入れ条件（ef=64 で ≥0.95、ef=256 で ≥0.99）は�
 `greedy_descend`／`greedy_descend_masked`（上位層貪欲降下）・エントリ
 ポイントループへの先読みは本 Issue では未適用（#491 で効果確認後に別
 Issue で検討）。効果の前後比較・採否は #491 の担当。
+
+## Issue #491: 受理判定後 prefetch の前後比較と採否
+
+### 対象・方法
+
+- before: `4d2bd23`（`eabff3a` の親。prefetch 導入前）
+- after: `eabff3a`（`perf(engine): search_layer に受理判定後の隣接ベクトル・
+  visited prefetch を追加する (#574)`。#490 の実装）
+- `git diff 4d2bd23 eabff3a -- Cargo.lock crates/engine/Cargo.toml` は空
+  （同一 `Cargo.lock` で before/after をビルド。`docs/design/
+  benchmark-judgement-policy.md` §3 の要件）
+- 新設ベンチ 3 ファイル（`benches/hnsw_search_bench.rs`・
+  `benches/harness/hnsw_search_latency.rs`・`harness/mod.rs` の 1 行・
+  `Cargo.toml` の `[[bench]]`）だけを `git archive` した各コミットのツリー
+  へ個別に追加し、`CARGO_TARGET_DIR` を分離して `cargo bench --no-run` で
+  ビルドした 2 バイナリを、8 規模点（`{10k, 100k} 行 × {128, 768} 次元 ×
+  {マスクなし, 可視率 50%}`）それぞれについて交互 5 ペア（before→after を
+  1 ペアとして 5 回）起動した
+- 索引構築は逐次 `HnswIndex::build`（`build_with_threads` は使わない）。
+  同一シードなら before/after で完全に同一のグラフになるため、探索
+  レイテンシの差分が「同じグラフに対する prefetch の有無」だけに帰属する
+- コーパス・クエリは決定的 PRNG（`DeterministicRng`）で生成し L2 正規化
+  （`harness::hnsw_compare::l2_normalize_corpus` を再利用）。マスクは
+  `NodeMask` を可視率どおりベルヌーイ試行で決定的に生成（`Subset` 形状を
+  模す。RLS 事前フィルタ統合〔Issue #409〕の実運用条件）
+- 参照区間（変更を含まない区間）: 同一プロセス内の brute-force Top-k
+  （`engine::kernel::CpuScalarProvider`。`kernel.rs` は #490 で無変更）
+- min-of-N（N=5）・median を両方記録し、参照区間の実測ノイズ帯
+  （`(max − min) / min`）を判定材料として併記する
+  （`docs/design/benchmark-judgement-policy.md` §4）
+
+### 環境（policy §3）
+
+- CPU: `QEMU Virtual CPU version 2.5+`（KVM）・12 vCPU
+- 命令セットフラグ: `avx2` `fma` `f16c` あり・`avx512*` 無し（`lscpu` 全文で確認）
+- 負荷: 各 run 直前の `loadavg` は概ね 1.5〜4（別プロセスと共有・非専有。
+  `BENCH_DEDICATED_ENV` 未設定）
+- **判定不能な施策種別**: `docs/design/benchmark-judgement-policy.md` §6 は
+  「キャッシュ規模依存のレイアウト最適化（CSR 化・prefetch・チャンク連続
+  格納）」を本開発環境で構造的に判定不能な種別として既に列挙している
+  （関連 Issue #364・#489・#492）。本 Issue（#491）の対象（`search_layer`
+  への prefetch。Issue #490）も同一種別に該当する
+
+### 実測表（8 規模点。単位 µs。`ratio = after_min / before_min`）
+
+| 規模点 | before min | before median | after min | after median | ratio(min) | ratio(median) | 判定クラス（±5%） | 参照区間帯(before) | 参照区間帯(after) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 10k × dim128・マスクなし | 32.010 | 35.962 | 31.488 | 35.061 | 0.9837 | 0.9749 | Neutral | 25.62% | 22.10% |
+| 10k × dim128・可視率50% | 57.970 | 65.118 | 57.970 | 65.179 | 1.0000 | 1.0009 | Neutral | 27.34% | 120.53% |
+| 10k × dim768・マスクなし | 165.312 | 197.651 | 153.538 | 208.413 | 0.9288 | 1.0544 | Improved(min)/Neutral(median) | 24.76% | 116.83% |
+| 10k × dim768・可視率50% | 111.585 | 127.242 | 107.032 | 131.012 | 0.9592 | 1.0296 | Neutral | 54.92% | 44.44% |
+| 100k × dim128・マスクなし | 97.167 | 119.059 | 92.060 | 113.835 | 0.9474 | 0.9561 | Improved | 31.64% | 27.87% |
+| 100k × dim128・可視率50% | 433.367 | 464.756 | 426.396 | 459.998 | 0.9839 | 0.9898 | Neutral | 39.48% | 26.67% |
+| 100k × dim768・マスクなし | 370.097 | 463.861 | 363.885 | 463.039 | 0.9832 | 0.9982 | Neutral | 38.40% | 31.51% |
+| 100k × dim768・可視率50% | 573.329 | 633.558 | 555.634 | 612.037 | 0.9691 | 0.9660 | Neutral | 14.45% | 10.17% |
+
+per-run 生値（min_us・5 ペア）:
+
+```text
+10k_d128_none:    before=[32.177, 32.010, 32.579, 32.590, 32.227] after=[31.632, 31.590, 31.703, 31.488, 31.559]
+10k_d128_mask50:  before=[59.140, 59.080, 60.143, 60.376, 57.970] after=[58.705, 58.804, 58.437, 57.970, 59.143]
+10k_d768_none:    before=[165.336, 165.668, 169.904, 165.312, 193.131] after=[153.538, 169.878, 165.261, 178.058, 196.701]
+10k_d768_mask50:  before=[111.812, 127.515, 111.585, 165.583, 113.027] after=[124.302, 130.486, 113.255, 108.146, 107.032]
+100k_d128_none:   before=[99.082, 97.867, 97.167, 97.611, 99.308] after=[95.197, 92.060, 94.425, 95.129, 93.049]
+100k_d128_mask50: before=[435.929, 437.191, 433.367, 459.262, 441.618] after=[433.114, 426.396, 440.529, 439.705, 432.657]
+100k_d768_none:   before=[485.168, 382.000, 380.467, 370.097, 419.052] after=[392.358, 363.885, 373.470, 375.437, 390.999]
+100k_d768_mask50: before=[573.329, 578.636, 573.912, 576.224, 573.588] after=[571.055, 558.711, 555.634, 556.742, 556.348]
+```
+
+すべての可視率50%点で `masked_short_queries=0`（`k` 未満の返却は発生せず、
+非 vacuous な計測であることを確認）。
+
+### `make hnsw-search-recall` 不変確認（Recall@10。ef=64／256）
+
+| フィクスチャ | ef | before | after |
+| --- | --- | --- | --- |
+| クラスタ構造あり | 64 | 1.0000 | 1.0000 |
+| クラスタ構造あり | 256 | 1.0000 | 1.0000 |
+| 一様乱数（informational） | 64 | 0.6410 | 0.6410 |
+| 一様乱数（informational） | 256 | 0.9535 | 0.9535 |
+
+4 値とも完全一致（`hnsw.rs::tests::search_layer_prefetch_*` が固定するビット
+同一契約と整合。prefetch が探索結果に影響しないことを実データ規模でも確認）。
+
+### 判定と採否
+
+Issue #491 が要求する 2 条件——(a) 8 点いずれもノイズ帯内なら Rejected・撤回、
+(b) QEMU 共有環境の数値は採否根拠にしない——は本環境では同時に満たせない。
+`docs/design/benchmark-judgement-policy.md` §5 は共有 QEMU 環境で
+**Accepted を不可**、**Rejected は「両ノイズ帯（固定 ±5% 帯・参照区間実測帯）
+を超える一貫した悪化＋静的解析の裏付け」がある場合のみ可**と定める。
+
+実測は 8 点中 `Regressed`（固定 ±5% 帯かつ参照区間の実測帯を両方超える悪化）
+が 0 点、`Improved` が 2 点（`10k×dim768マスクなし`〔min のみ〕・
+`100k×dim128マスクなし`）、残り 6 点は `Neutral` で、悪化方向への一貫した
+シグナルは観測されなかった。したがって:
+
+- **Rejected（撤回）にはしない**: 悪化の一貫パターンが無く、撤回条件
+  （過半の点で `Regressed` が min-of-N・median 双方で一貫）を満たさない
+- **Accepted と断定もしない**: 「速そうなので Accepted」と書くことは
+  policy §5 で明確に禁止されている。参照区間帯が最大 120.53%（`10k×dim128
+  ・可視率50%` の after 側）に達するなど、この環境・この規模での run-to-run
+  変動そのものが対象区間の観測差分（`ratio` はおおむね 0.93〜1.05x）と
+  同程度かそれ以上あり、共有 QEMU 環境のノイズから prefetch の効果を
+  切り分けて確認できたとは言えない
+- **ステータス: 保留（production 無変更）。既にマージ済み・ビット同一性
+  検証済みのコード（#490）を、切り分けられていない数値だけで撤回するのは
+  非破壊側の判断ではないと判断した。専有実機（`BENCH_DEDICATED_ENV=1`）
+  での再実測をオーナーへ申し送る**
+
+### 申し送り
+
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での再実測手順: `make bench-hnsw-search`
+  に `BENCH_HNSW_SEARCH_ROWS`／`BENCH_HNSW_SEARCH_DIM`／`BENCH_HNSW_SEARCH_MASK`
+  を指定し、before/after バイナリ（`git archive <commit> | tar -x` で取り出し
+  た作業ツリーへ本 Issue の新設 3 ファイルを追加コピーし `cargo bench
+  --no-run` でビルドする）を交互 5 ペア以上で起動する。100k×768 の 1 点が
+  最も時間を要する（1 run あたり約 110 秒）
+- `search_layer_locked`（並列構築のロック対応版）・`greedy_descend`／
+  `greedy_descend_masked`（上位層貪欲降下）・エントリポイントループへの
+  prefetch 適用検討は別 Issue（本 Issue の対象外のまま）
+- 真の prefetch 命令（`_mm_prefetch`／`_prefetch`）への差し替えは新規
+  `unsafe` 1 箇所を要するオーナー承認事項であり、本実測は「現状の
+  `black_box` 方式に効果があるかどうか」の判断材料に留まる（効果を
+  確実に測れなかったこと自体は、真の prefetch 命令への投資判断を積極的に
+  後押しする根拠にはならない）
+
+### 再現方法
+
+```bash
+git fetch origin main
+git archive 4d2bd23 | tar -x -C /path/to/before
+git archive eabff3a | tar -x -C /path/to/after
+# 各ツリーへ benches/hnsw_search_bench.rs・benches/harness/hnsw_search_latency.rs・
+# harness/mod.rs の `pub mod hnsw_search_latency;` 追記・Cargo.toml の
+# [[bench]] 追記 を適用してから:
+CARGO_TARGET_DIR=/path/to/target-before cargo bench --bench hnsw_search_bench -p engine --no-run
+CARGO_TARGET_DIR=/path/to/target-after  cargo bench --bench hnsw_search_bench -p engine --no-run
+# 8 規模点 × 交互 5 ペアで両バイナリを起動（BENCH_HNSW_SEARCH_ROWS／
+# BENCH_HNSW_SEARCH_DIM／BENCH_HNSW_SEARCH_MASK を指定）
+```
