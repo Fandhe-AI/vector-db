@@ -101,6 +101,42 @@ impl std::fmt::Display for ScalarIndexBuildError {
 
 impl std::error::Error for ScalarIndexBuildError {}
 
+/// `s` の複製を、失敗しうるアロケーションとして構築する（codex-review P1
+/// 対応・PR #569。`String::to_string`/`String::clone` はグローバルアロケータの
+/// infallible な成長経路を辿り、失敗時は [`ScalarIndexBuildError::AllocationFailed`]
+/// へ変換されずプロセスを異常終了させ得るため、`try_reserve_exact` で確保して
+/// から `push_str` する明示的に fallible な経路に置き換える）。
+fn try_owned_string(s: &str) -> Result<String, ScalarIndexBuildError> {
+    let mut out = String::new();
+    out.try_reserve_exact(s.len())
+        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+    out.push_str(s);
+    Ok(out)
+}
+
+/// 1 件の文字列値を索引へ追加する際の概算バイト量（[`TextColumnIndex::
+/// approx_heap_bytes`] の `values`/`equality` の計上方法と揃える）。
+fn approx_string_entry_bytes(s: &str) -> usize {
+    s.len().saturating_add(std::mem::size_of::<String>())
+}
+
+/// 構築中の索引が確保しようとしている概算バイト量が [`MAX_SCALAR_INDEX_BYTES`]
+/// を超えないことを、実際に文字列を複製する（`to_string`/`clone` で新規確保が
+/// 起こる）**前**に検証する（codex-review P1 対応・PR #569。全構築完了後の
+/// [`ScalarIndex::approx_heap_bytes`] 判定だけでは、長い異なる `TEXT` 値を多数
+/// 含むスナップショットに対して判定前に上限超過分のメモリを確保してしまう）。
+/// `running` は呼び出し元が管理する累計カウンタで、本関数が返す `Ok` を受けて
+/// 呼び出し元が `additional` 分だけ加算する契約とする。
+fn check_scalar_index_budget(
+    running: usize,
+    additional: usize,
+) -> Result<(), ScalarIndexBuildError> {
+    if running.saturating_add(additional) > MAX_SCALAR_INDEX_BYTES {
+        return Err(ScalarIndexBuildError::TooLarge);
+    }
+    Ok(())
+}
+
 /// 1 つの `TEXT` 列に対する索引（等価直引き＋前方一致範囲走査の両方を支える
 /// 共有データ構造。モジュールドキュメント「データモデル」参照）。
 ///
@@ -213,6 +249,12 @@ impl ScalarIndex {
         let row_count = snapshot.arena().len();
         let column_count = schema.columns.len();
 
+        // 構築完了まで確保した（概算）文字列バイト量の累計。値の複製
+        // （`to_string`/`clone`）を行う**前**に [`check_scalar_index_budget`] で
+        // 検証してから加算する（codex-review P1 対応・PR #569。モジュール
+        // ドキュメント「fail-closed の適用範囲」参照）。
+        let mut approx_bytes: usize = 0;
+
         // 列ごとに (value, slot) を蓄積する作業領域（`TEXT` 列のみ `Some`）。
         let mut per_column: Vec<Option<Vec<(String, u32)>>> = Vec::new();
         per_column
@@ -237,9 +279,13 @@ impl ScalarIndex {
             for (col_index, value) in scanned.into_iter().enumerate() {
                 let Some(v) = value else { continue };
                 if let Some(Some(acc)) = per_column.get_mut(col_index) {
+                    let additional = approx_string_entry_bytes(v);
+                    check_scalar_index_budget(approx_bytes, additional)?;
+                    let owned = try_owned_string(v)?;
+                    approx_bytes = approx_bytes.saturating_add(additional);
                     acc.try_reserve(1)
                         .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-                    acc.push((v.to_string(), slot_u32));
+                    acc.push((owned, slot_u32));
                 }
             }
         }
@@ -253,10 +299,29 @@ impl ScalarIndex {
                 None => columns.push(None),
                 Some(mut pairs) => {
                     pairs.sort_unstable_by(cmp_value_then_slot); // sort-determinism: allow キーは (バイト列, スロット昇順) のタプルでスロットが全順序の明示的タイブレーク
+                                                                 // 重複排除後の値種類数は `pairs.len()`（行の重複値込みの総数）を
+                                                                 // 上回らないため、この上限で `values`/`offsets`/`equality` を
+                                                                 // 事前に一括確保し、高カーディナリティ列で値ごとに
+                                                                 // `try_reserve_exact(1)` を呼ぶ再確保コストを避ける
+                                                                 // （codex-review P2 対応・PR #569）。`slots` は値と無関係に
+                                                                 // 行数分（`pairs.len()`）で確定するため同様に一括確保する。
+                    let pair_count = pairs.len();
                     let mut values: Vec<String> = Vec::new();
+                    values
+                        .try_reserve_exact(pair_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     let mut offsets: Vec<u32> = Vec::new();
+                    offsets
+                        .try_reserve_exact(pair_count.saturating_add(1))
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     let mut slots: Vec<u32> = Vec::new();
+                    slots
+                        .try_reserve_exact(pair_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     let mut equality: HashMap<String, u32> = HashMap::new();
+                    equality
+                        .try_reserve(pair_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
                     offsets.push(0);
                     let mut iter = pairs.into_iter().peekable();
                     while let Some((value, slot)) = iter.next() {
@@ -283,10 +348,18 @@ impl ScalarIndex {
                         }
                         let value_index = u32::try_from(values.len())
                             .map_err(|_| ScalarIndexBuildError::SlotOverflow)?;
+                        // `equality` は `values` と同じ文字列を複製保持する
+                        // （[`TextColumnIndex::approx_heap_bytes`] の
+                        // `equality_bytes` 計上と対応）ため、複製前に同じ予算
+                        // 検証を経る（codex-review P1 対応・PR #569）。
+                        let additional = approx_string_entry_bytes(&value);
+                        check_scalar_index_budget(approx_bytes, additional)?;
+                        let equality_key = try_owned_string(&value)?;
+                        approx_bytes = approx_bytes.saturating_add(additional);
                         equality
                             .try_reserve(1)
                             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
-                        equality.insert(value.clone(), value_index);
+                        equality.insert(equality_key, value_index);
                         values
                             .try_reserve_exact(1)
                             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
@@ -492,21 +565,47 @@ impl ScalarIndexCache {
         ctx: &PolicyContext,
     ) -> Option<Arc<ScalarIndex>> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self.state.write().ok()?;
-        let current_generation = crate::catalog::table_generation_in_txn(read_txn, table).ok()?;
-        let position = guard
+        // 以下、ヒットで早期 `return` する 1 経路を除き `None` に到達する分岐
+        // （ロック毒化・世代読み取り失敗・未登録・世代不一致のいずれも）で
+        // `self.misses` を明示的に加算する（codex-review P2 対応・PR #569。
+        // 以前は `stats()` 側の `fetch_add(0)` のみで実質常にゼロだった）。
+        let Ok(mut guard) = self.state.write() else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Ok(current_generation) = crate::catalog::table_generation_in_txn(read_txn, table)
+        else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(position) = guard
             .entries
             .iter()
-            .position(|e| e.table == table && e.index.built_ctx == *ctx)?;
-        let built_generation = guard.entries.get(position)?.index.built_table_generation();
+            .position(|e| e.table == table && e.index.built_ctx == *ctx)
+        else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(built_generation) = guard
+            .entries
+            .get(position)
+            .map(|e| e.index.built_table_generation())
+        else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
         if built_generation == current_generation {
-            let entry = guard.entries.get_mut(position)?;
+            let Some(entry) = guard.entries.get_mut(position) else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
             entry.last_used = seq;
             let index = Arc::clone(&entry.index);
             drop(guard);
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(index);
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let Ok(true_current_generation) = storage.table_generation(table) else {
             return None;
         };
@@ -603,7 +702,6 @@ impl ScalarIndexCache {
     }
 
     pub(crate) fn stats(&self) -> ScalarIndexCacheStats {
-        self.misses.fetch_add(0, Ordering::Relaxed); // no-op（misses は現状 insert 起点で数えない。将来 lookup 側で加算する余地を残す）
         let entries = self.state.read().map(|g| g.entries.len()).unwrap_or(0);
         ScalarIndexCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -956,6 +1054,36 @@ mod tests {
         );
     }
 
+    // ---------- 容量検証ヘルパーの単体テスト（codex-review P1 対応・PR #569:
+    // 「確保前に容量を検証する」契約を、1 GiB 規模のデータを実際に確保せず
+    // 直接固定する） ----------
+
+    #[test]
+    fn check_scalar_index_budget_rejects_before_exceeding_limit() {
+        // 上限ちょうどまでは許可し、1 byte でも超えたら拒否する（境界値）。
+        assert!(check_scalar_index_budget(0, MAX_SCALAR_INDEX_BYTES).is_ok());
+        assert!(matches!(
+            check_scalar_index_budget(0, MAX_SCALAR_INDEX_BYTES + 1),
+            Err(ScalarIndexBuildError::TooLarge)
+        ));
+        assert!(matches!(
+            check_scalar_index_budget(MAX_SCALAR_INDEX_BYTES, 1),
+            Err(ScalarIndexBuildError::TooLarge)
+        ));
+        // `saturating_add` によるオーバーフロー耐性（巨大な累計値でもパニックしない）。
+        assert!(matches!(
+            check_scalar_index_budget(usize::MAX, 1),
+            Err(ScalarIndexBuildError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn try_owned_string_copies_content_without_infallible_allocation_path() {
+        let owned = try_owned_string("scalar-index").expect("small string must succeed");
+        assert_eq!(owned, "scalar-index");
+        assert_eq!(owned.capacity(), "scalar-index".len());
+    }
+
     // ---------- キャッシュ契約テスト（`arena_cache.rs`・`core.rs::PrefilterCache`
     // のテストを雛形に。世代整合・非対称 insert 契約を固定する） ----------
 
@@ -972,6 +1100,13 @@ mod tests {
         let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
         let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
 
+        // insert 前の初回 lookup は未登録によるミス（codex-review P2 対応・
+        // PR #569: `misses` が実際のミス経路で加算されることの回帰）。
+        let read_txn0 = storage.db().begin_read().expect("begin read");
+        let before_insert = cache.lookup(&storage, &read_txn0, "docs", &ctx_a);
+        assert!(before_insert.is_none());
+        assert_eq!(cache.stats().misses, 1);
+
         let inserted = cache
             .insert(&storage, "docs", &ctx_a, index)
             .expect("insert must succeed on fresh generation");
@@ -983,6 +1118,8 @@ mod tests {
             .expect("lookup must hit same generation");
         assert!(Arc::ptr_eq(&hit, &inserted));
         assert_eq!(cache.stats().hits, 1);
+        // ヒットでは加算されないため、直前のミス 1 件のまま変化しない。
+        assert_eq!(cache.stats().misses, 1);
 
         // 書き込みで世代を進めるとミスになり、stale eviction が発生する。
         insert(&storage, &ctx_a, 2, Some("y"), None, Visibility::Public);
@@ -990,6 +1127,7 @@ mod tests {
         let miss = cache.lookup(&storage, &read_txn2, "docs", &ctx_a);
         assert!(miss.is_none());
         assert_eq!(cache.stats().stale_evictions, 1);
+        assert_eq!(cache.stats().misses, 2);
     }
 
     #[test]
