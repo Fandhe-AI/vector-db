@@ -43,9 +43,12 @@
 //! （`postings[t]`。Issue #389）だけを辿ってスコアを積むため、時間計算量は
 //! `O(Q + Σ_{t∈Q} |postings(t)| + M log k)`（`Q`: クエリの一意語数、
 //! `Σ|postings(t)|`: クエリ語の出現延べ件数、`M`: スコア `> 0` の一致文書数）で
-//! あり、コーパス文書数 `N` そのものには比例しない（ただしスコアアキュムレータの
-//! 確保・ゼロ初期化自体は呼び出しごとに `O(N)`。[`SparseIndex::score_by_postings`]
-//! のドキュメンテーションコメント参照。Issue #390 レビュー指摘）。長いクエリは
+//! あり、コーパス文書数 `N` そのものには比例しない。スコアアキュムレータ
+//! （`acc`）の確保・ゼロ初期化は索引の寿命内で 1 回だけ `O(N)` で行い、以降の
+//! 呼び出しは索引が保持するスクラッチプールを再利用するため `O(N)` の確保は
+//! 発生しない（Issue #546。詳細は [`SparseIndex::score_by_postings`]・
+//! [`SparseIndex::score_pass`] のドキュメンテーションコメント参照。Issue #390
+//! レビュー指摘の解消）。長いクエリは
 //! 走査対象の posting list 数を増幅するため、一意語数の上限を
 //! `MAX_QUERY_TERMS` で検証し、超過時は `Err` を返す（fail-closed）。ただし
 //! `tokenize()` 自体はクエリのバイト長に比例したコストを持つため、一意語数の少ない
@@ -83,6 +86,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
 /// 文書 ID。[`SparseIndex`] は呼び出し側が割り当てた ID をそのまま透過的に扱う。
 pub type DocId = u64;
@@ -775,6 +780,18 @@ pub struct SparseIndex {
     /// クラス添字配列（Issue #391）。不変条件:
     /// `len_classes[doc_len_class[i]] == doc_len[i]`（`i` は `doc_idx`）。
     doc_len_class: Vec<u32>,
+    /// [`Self::score_pass`] が呼び出しのたびに新規確保していた `acc: Vec<f64>`
+    /// （コーパス全体の doc_idx 空間・O(N) 確保）を索引の寿命内で再利用するための
+    /// 有界プール（Issue #546。親 #545・#390 レビュー指摘「N 非依存化フォロー
+    /// アップ」への対応）。`SparseIndexCache`（`sql/sparse_cache.rs`・Issue #357）
+    /// が保持する `Arc<SparseIndex>` と寿命が一致するため、キャッシュされた索引が
+    /// 世代整合を保っている間はこのプールも使い回され、索引が失効・再構築される
+    /// たびにプールごと破棄される（「世代整合キャッシュ上の再利用バッファ」の
+    /// 実体）。`&self`（非 `&mut self`）を維持したまま呼び出し間で状態を持ち越す
+    /// ため `Mutex` で保護する（並行クエリからの同時アクセスに対応。プールが
+    /// 枯渇した場合は [`Self::acquire_scratch`] が新規確保へフォールバックする
+    /// ため正当性には影響しない）。
+    scratch_pool: Mutex<Vec<ScoreScratch>>,
 }
 
 /// [`SparseIndex::search_within`] が可視集合（`visible_ids`）を `doc_idx` 空間の
@@ -850,15 +867,160 @@ enum ScoreScope<'a> {
     Visible(&'a VisibleBitmap),
 }
 
+/// [`SparseIndex::score_pass`] が呼び出し間で使い回すスクラッチ一式（Issue #546。
+/// 親 #545・#390 レビュー指摘「N 非依存化フォローアップ」への対応）。
+///
+/// 不変条件（プールへ返却する時点・プールから取り出した直後のいずれでも成立）:
+/// `acc` の全要素は `0.0`、`touched`・`visible_hits`・`touched_classes` は空
+/// （`clear()` 済みで capacity は保持）、`k1_len_norm_cache` は空。
+/// [`SparseIndex::release_scratch`] がこの不変条件を回復してからプールへ戻す
+/// （`touched` に記録された `doc_idx` のみをゼロ戻しする。「`acc[idx] == 0.0`
+/// ⇔ 未加算」という [`SparseIndex::score_pass`] の不変条件により、`touched` に
+/// 載っていない要素は既に `0.0` であるため、全要素走査によるゼロクリアと結果は
+/// 同一）。`k1_len_norm_cache` も同様に `touched_classes`（初めて `entry` へ
+/// 挿入した文書長クラスを記録した列。Issue #546 レビュー指摘・PR #565: 巨大な
+/// `HashMap::clear()` は要素数でなく確保済み容量に比例するため、多数の相異なる
+/// 文書長クラスにヒットしたクエリの後で 1 件しかヒットしない後続クエリが返却
+/// されても容量分のコストを毎回払ってしまう）を使い、[`ScoreScratch::
+/// clear_len_norm_cache`] でタッチしたキーだけを `remove` することで
+/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する。
+#[derive(Debug)]
+struct ScoreScratch {
+    acc: Vec<f64>,
+    touched: Vec<u32>,
+    visible_hits: Vec<(u32, u32)>,
+    k1_len_norm_cache: HashMap<u32, f64>,
+    /// `k1_len_norm_cache` へ初めて挿入した文書長クラスを挿入順に記録した列
+    /// （Issue #546 レビュー指摘・PR #565）。`k1_len_norm_cache` のキー集合と
+    /// 常に一致し、[`ScoreScratch::clear_len_norm_cache`] が `O(M)` での
+    /// クリアに使う。
+    touched_classes: Vec<u32>,
+    /// `doc_idx` を添字とする「このパスで既に `touched` へ記録したか」の
+    /// 世代カウンタ（`hnsw.rs::VisitedScratch` と同型の epoch 方式。codex-review
+    /// 指摘・PR #565）。`touched.push` の要否を `acc[idx] == 0.0` の判定から
+    /// 分離するために導入した。BM25 パラメータ（`k1`/`b`）は `with_params` で
+    /// 有限・非負値のみ受理するが、`k1` に極端な有限値（例: `f64::MAX` 近傍）を
+    /// 渡すと `kln`（`k1 * len_norm`）の計算が桁あふれし `f64::INFINITY` に
+    /// なり得る。この場合 `denominator = f + kln` も無限大となり
+    /// `idf * (numerator / denominator)` は有限値を無限大で割った `0.0` に
+    /// 潰れるため、「`acc[idx] == 0.0` ⇔ 未加算」という設計時の不変条件
+    /// （ドキュメンテーションコメント参照）が崩れ、同一 `doc_idx` への 2 回目
+    /// 以降の加算（別のクエリ語がヒットした場合）でも `*slot == 0.0` が
+    /// 成立し続けて `touched` へ重複記録され得る。`touched` はクエリ語数
+    /// （untrusted な `query_ids.len()`）に比例して際限なく伸び、`n` を
+    /// 超えて再確保され得る。以前（Issue #392 以前）は `ScorePass` の
+    /// 呼び出しごとに新規確保・破棄されていたためこの超過分は都度解放
+    /// されていたが、Issue #546 でスクラッチを索引の寿命内で使い回す
+    /// プール方式へ変更したことで、この超過確保分がプールに保持され
+    /// 続けてしまう（性能・保守性観点の指摘）。本フィールドは `acc` の値に
+    /// 一切依存せず `doc_idx` ごとに厳密に 1 回だけ `touched` へ記録する
+    /// ことを保証し、`touched.len()` を常に `n` 以下（[`ScoreScratch::new_for`]
+    /// が確保した容量以下）に有界化する。
+    visited_epoch: Vec<u64>,
+    /// [`Self::visited_epoch`] の現在値。[`SparseIndex::score_pass`] の呼び出し
+    /// ごとに 1 加算し、全要素を `O(N)` でクリアする代わりに世代比較で
+    /// 「今回のパスで訪問済みか」を `O(1)` 判定する（`hnsw.rs::VisitedScratch`
+    /// と同じ設計）。初期値 `0` は `visited_epoch`（`new_for` で全要素 `0`
+    /// 初期化）と衝突しないよう、`score_pass` は使用前に必ず `wrapping_add(1)`
+    /// してから比較する。
+    epoch: u64,
+}
+
+impl ScoreScratch {
+    /// 索引の文書数 `n`（`doc_ids.len()`）に対応する全ゼロの新規スクラッチを
+    /// 確保する（[`SparseIndex::acquire_scratch`] のプール枯渇時フォールバック）。
+    ///
+    /// `touched`・`visible_hits` は `Vec::with_capacity(n)` で容量を `n` に
+    /// 固定する（codex-review 指摘・PR #565: 空 `Vec::new()` から `push` で
+    /// 成長させると標準ライブラリの倍々戦略により最終容量が要求長 `n` を
+    /// 超えうる〔`n` が 2 の冪+1 付近だと最大で概ね `2n` 弱まで〕。両フィールドの
+    /// 要素数は不変条件により常に `n` 以下（`touched` は相異なる `doc_idx` の
+    /// 集合、`visible_hits` は 1 つの posting list 長で抑えられ、いずれも
+    /// コーパス文書数 `n` を超えない）であるため、生成時に容量を `n` へ固定
+    /// すれば以後の `push` で `n` を超えて再確保されることはなく、
+    /// [`SparseIndex::approx_heap_bytes`] が計上する「容量 `n` ぶん」の
+    /// 見積もりと実際の確保量が常に一致する。
+    fn new_for(n: usize) -> Self {
+        Self {
+            acc: vec![0.0; n],
+            touched: Vec::with_capacity(n),
+            visible_hits: Vec::with_capacity(n),
+            k1_len_norm_cache: HashMap::new(),
+            // 相異なる文書長クラス数（`len_classes.len()`）は文書数 `n` を
+            // 超えないため、`touched`/`visible_hits` と同じ理由で容量を `n` へ
+            // 固定する（Issue #546 レビュー指摘・PR #565）。
+            touched_classes: Vec::with_capacity(n),
+            // `doc_idx` ごとに厳密 1 要素（`n` 個）の世代カウンタ。全要素 `0`
+            // 初期化のため `epoch` の初期値 `0` とは呼び出し前の
+            // `wrapping_add(1)` で確実に区別する（codex-review 指摘・PR #565）。
+            visited_epoch: vec![0; n],
+            epoch: 0,
+        }
+    }
+
+    /// `k1_len_norm_cache` を `touched_classes` に記録された文書長クラスだけを
+    /// `remove` することでクリアする（Issue #546 レビュー指摘・PR #565）。
+    /// `HashMap::clear()` は確保済み容量（過去に大きく育った制御領域）に比例する
+    /// 処理量になり得るため、実際にタッチしたキー集合（`O(M)`）だけを取り除く。
+    /// `touched_classes` は `k1_len_norm_cache` のキー集合と 1 対 1 に対応する
+    /// （挿入は必ず `entry().or_insert_with` の `Vacant` 分岐でのみ行われ、その
+    /// 場でだけ `touched_classes` へ記録するため）。
+    fn clear_len_norm_cache(&mut self) {
+        for class in self.touched_classes.drain(..) {
+            self.k1_len_norm_cache.remove(&class);
+        }
+    }
+}
+
 /// [`SparseIndex::score_pass`] の出力（Issue #392）。`acc` はコーパス全体の
 /// `doc_idx` を添字とするスコアアキュムレータ（`> 0.0` の要素がヒット）、
 /// `touched` はヒットした `doc_idx` を初回加算順（決定的）に記録した列。
 /// この 2 つだけでスコア `> 0` の全候補を復元できるため、[`SparseIndex::
 /// score_by_postings`]・[`SparseIndex::score_within`] の両方がこの中間表現を
 /// 共有する。
-struct ScorePass {
-    acc: Vec<f64>,
-    touched: Vec<u32>,
+///
+/// 本体は索引が所有するスクラッチプール（[`ScoreScratch`]。Issue #546）を
+/// 借りているだけのリースであり、`Drop` で索引のプールへ返却する
+/// （[`SparseIndex::release_scratch`]）。`acc()`/`touched()` の借用アクセサ経由で
+/// のみ中身を読む契約とし、値渡しでの分解（`let ScorePass { acc, touched } = ...`）
+/// はしない（返却時のゼロ戻し・プール再利用ができなくなるため）。
+struct ScorePass<'a> {
+    index: &'a SparseIndex,
+    // `release_scratch` を必ず一度だけ呼ぶため `Option` で保持し、`Drop` の中で
+    // `take()` する（構造体分解を禁じているため通常のフィールドアクセスでは
+    // 二重返却の心配はないが、`Drop::drop` は `&mut self` しか取れず所有権を
+    // 動かせないため `Option::take` が必要になる）。
+    scratch: Option<ScoreScratch>,
+}
+
+impl ScorePass<'_> {
+    /// スコアアキュムレータ（`doc_idx` を添字。`> 0.0` の要素がヒット）への
+    /// 借用アクセサ。
+    fn acc(&self) -> &[f64] {
+        match &self.scratch {
+            Some(s) => s.acc.as_slice(),
+            // `scratch` は `Drop` 実行時にのみ `None` になるため、通常の呼び出し
+            // 経路では到達しない。到達した場合も空スライスへ fail-closed で
+            // 倒し、`unwrap`/`expect`（`.claude/rules/coding-rust.md`）は使わない。
+            None => &[],
+        }
+    }
+
+    /// ヒットした `doc_idx` を初回加算順に記録した列への借用アクセサ。
+    fn touched(&self) -> &[u32] {
+        match &self.scratch {
+            Some(s) => s.touched.as_slice(),
+            None => &[],
+        }
+    }
+}
+
+impl Drop for ScorePass<'_> {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            self.index.release_scratch(scratch);
+        }
+    }
 }
 
 // `doc_idx`（`docs`/`doc_len`/`doc_ids`/`postings` 内側要素の添字）を `u32` で
@@ -867,7 +1029,61 @@ struct ScorePass {
 // `u32::try_from`）が理論上失敗しないことの根拠とする。
 const _: () = assert!(MAX_CORPUS_DOCS <= u32::MAX as usize);
 
+/// [`SparseIndex::scratch_pool`] が同時に保持するスクラッチの上限本数（Issue #546）。
+/// 並行クエリが同時に `score_pass` を呼ぶ本数を見込んだ有界値であり、これを
+/// 超える同時実行数はプール枯渇として新規確保へフォールバックする（正当性には
+/// 影響しない。`.claude/rules/coding-rust.md`: 無制限確保の禁止に従い、プール
+/// 自体のサイズはこの定数で常に有界）。
+const MAX_SCORE_SCRATCH_POOL: usize = 4;
+
 impl SparseIndex {
+    /// スクラッチプールから 1 本取り出す（[`Self::score_pass`] の入口）。プールが
+    /// 空、または取り出したスクラッチの `acc` 長がこの索引の文書数と不一致
+    /// （通常到達しないが、fail-closed のため明示的に検証する）の場合は
+    /// [`ScoreScratch::new_for`] で新規確保する。ロックは pop のみの短時間保持。
+    fn acquire_scratch(&self) -> ScoreScratch {
+        let n = self.doc_ids.len();
+        let popped = self
+            .scratch_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        match popped {
+            Some(s) if s.acc.len() == n => s,
+            _ => ScoreScratch::new_for(n),
+        }
+    }
+
+    /// スクラッチをプールへ返却する（[`ScorePass::drop`] から呼ばれる）。返却前に
+    /// `touched` に記録された `doc_idx` のみをゼロ戻しし（[`ScoreScratch`] の
+    /// 不変条件を回復）、`touched`/`visible_hits` は `clear()`（capacity は
+    /// 維持し次回確保コストを避ける）。`k1_len_norm_cache` は
+    /// [`ScoreScratch::clear_len_norm_cache`] で `touched_classes` に記録された
+    /// キーのみを `remove` する（Issue #546 レビュー指摘・PR #565: `HashMap::
+    /// clear()` は確保済み容量に比例するため、多数の文書長クラスにヒットした
+    /// 過去のクエリの容量が残ったまま `clear()` すると、後続の小さいクエリの
+    /// 返却コストまで肥大化する）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
+    /// 達していれば返却せず破棄する（有界プール）。ロックは push のみの短時間
+    /// 保持。
+    fn release_scratch(&self, mut scratch: ScoreScratch) {
+        for &doc_idx in &scratch.touched {
+            if let Some(slot) = scratch.acc.get_mut(doc_idx as usize) {
+                *slot = 0.0;
+            }
+        }
+        scratch.touched.clear();
+        scratch.visible_hits.clear();
+        scratch.clear_len_norm_cache();
+
+        let mut pool = self
+            .scratch_pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pool.len() < MAX_SCORE_SCRATCH_POOL {
+            pool.push(scratch);
+        }
+    }
+
     /// Okapi BM25 の既定パラメータ（`k1 = 1.2`, `b = 0.75`）でインデックスを構築する。
     pub fn build(docs: &[(DocId, &str)]) -> Result<Self, SparseError> {
         Self::with_params(docs, DEFAULT_K1, DEFAULT_B)
@@ -1090,6 +1306,7 @@ impl SparseIndex {
             doc_ids: doc_ids_by_idx,
             len_classes,
             doc_len_class,
+            scratch_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -1121,10 +1338,11 @@ impl SparseIndex {
     /// 呼ぶ前に [`SparseError::QueryTooLong`] で拒否する（両者とも fail-closed。
     /// `.claude/rules/coding-rust.md`: untrusted 入力の長さは上限検証してから処理する）。
     /// 上記はスコア計算対象の走査量に関する計算量であり、[`Self::score_by_postings`]
-    /// が呼び出しごとに確保するスコアアキュムレータそのものは `O(N)`（コーパス文書数）
-    /// で確保・ゼロ初期化される。詳細・N 非依存化していない理由は
-    /// [`Self::score_by_postings`] のドキュメンテーションコメントを参照
-    /// （Issue #390 レビュー指摘）。
+    /// が使うスコアアキュムレータの確保・ゼロ初期化（`O(N)`。コーパス文書数）は
+    /// 索引の寿命内で 1 回だけ発生し、以降の呼び出しは索引が保持するスクラッチ
+    /// プールを再利用する（Issue #546。詳細は [`Self::score_by_postings`]・
+    /// [`Self::score_pass`] のドキュメンテーションコメントを参照。Issue #390
+    /// レビュー指摘の解消）。
     pub fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredDoc>, SparseError> {
         // アロケーションを伴う `tokenize()` を呼ぶ前に、バイト長（`str::len()`。文字列を
         // 走査しない `O(1)` 操作）で untrusted なクエリを検証する。一意語数の検証
@@ -1222,15 +1440,13 @@ impl SparseIndex {
     /// がクエリ語ごとに [`Self::postings`] を辿って可視ビットで絞り込むため
     /// `O(|visible_ids| + Σ_{t∈Q} |postings(t)| + M log k)`（[`Self::search`] の
     /// 計算量コメント参照）。可視集合の大きさに関わらずビットマップの確保量は
-    /// インデックス側の文書数（[`MAX_CORPUS_DOCS`] 以下）で有界。ただし
-    /// [`Self::score_by_postings`] のスコアアキュムレータ確保・ゼロ初期化自体は
-    /// `search()` と同じく呼び出しごとに `O(N)`（詳細は同メソッドのドキュメンテー
-    /// ションコメント参照）であり、`search_within` は hybrid の疎側再取得ループ
-    /// から 1 クエリあたり複数回呼ばれる（Issue #387）ため、大規模コーパスでは
-    /// この `O(N)` 確保が無視できないコストになり得る。真に N 非依存化する
-    /// フォローアップ（呼び出し間でのアキュムレータ再利用等）は #392 領域の
-    /// 課題として `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節へ
-    /// 申し送る（Issue #390 レビュー指摘）。
+    /// インデックス側の文書数（[`MAX_CORPUS_DOCS`] 以下）で有界。
+    /// [`Self::score_by_postings`] のスコアアキュムレータ確保・ゼロ初期化
+    /// （`O(N)`）は索引の寿命内で 1 回だけ発生し、以降の呼び出しは索引が保持する
+    /// スクラッチプールを再利用する（Issue #546）ため、`search_within` が hybrid
+    /// の疎側再取得ループから 1 クエリあたり複数回呼ばれても（Issue #387）
+    /// この確保は繰り返し発生しない（詳細は同メソッド・[`Self::score_pass`] の
+    /// ドキュメンテーションコメント参照。Issue #390 レビュー指摘の解消）。
     pub fn search_within(
         &self,
         query: &str,
@@ -1362,14 +1578,16 @@ impl SparseIndex {
             return Ok(empty());
         }
 
-        let ScorePass { acc, touched } = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap));
+        let pass = self.score_pass(&query_ids, ScoreScope::Visible(&bitmap));
+        let acc = pass.acc();
+        let touched = pass.touched();
 
         // touched 順（決定的。posting 走査でヒットを初めて記録した順）のまま
         // 候補列を材料化する。`SparseScored::top` はこの列を全順序
         // （`Candidate::Ord`）に基づき整列するため、ここでの並び順自体は
         // 最終的な出力順序に影響しない。
         let mut candidates = Vec::with_capacity(touched.len());
-        for &doc_idx in &touched {
+        for &doc_idx in touched {
             let idx = doc_idx as usize;
             let Some(&score) = acc.get(idx) else {
                 continue;
@@ -1404,22 +1622,21 @@ impl SparseIndex {
     /// 外側ループにするが、各文書のアキュムレータへは term 発生順に足し込むため、
     /// 1 文書内で見た加算順序自体は変わらない）。
     ///
-    /// 計算量の既知の限界（Issue #390 レビュー指摘）: 走査そのものは
+    /// 計算量（Issue #390 レビュー指摘・Issue #546 で解消）: 走査そのものは
     /// `postings`/可視ビットマップだけを辿るため `search`/`search_within` の
     /// ドキュメンテーションコメントが述べる `O(Q + Σ|postings(t)| + M log k)` に
-    /// 従うが、この計算量に届いていない箇所が 1 つある。`acc`（doc_idx を添字と
-    /// するスコアアキュムレータ）はコーパス全体の文書数 `N`（`self.doc_ids.len()`）
-    /// で毎回新規確保・ゼロ初期化しており、これは呼び出しごとに `O(N)` かかる。
-    /// 旧実装（可視部分集合を全件線形走査）からの退行ではなく改善だが、
-    /// 「N そのものには比例しない」という契約には届いていない。`search_within` は
-    /// hybrid の疎側再取得ループから 1 クエリあたり複数回呼ばれる（Issue #387）
-    /// ため、大規模コーパスでは無視できないコストになり得る。真に N 非依存化する
-    /// には呼び出し間で `acc` バッファを再利用し `touched` でタッチ済み要素のみ
-    /// リセットする方式等が考えられるが、`&self`（非 `&mut self`）シグネチャを
-    /// 維持したまま呼び出し間で状態を持ち越す設計変更を要するため、本 PR
-    /// （Issue #390。可視ビットマップ＋posting 走査 1 パス化）のスコープには含めず
-    /// フォローアップ課題として #392 領域・
-    /// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #390」節へ申し送る。
+    /// 従う。`acc`（doc_idx を添字とするスコアアキュムレータ）はコーパス全体の
+    /// 文書数 `N`（`self.doc_ids.len()`）で確保・ゼロ初期化する必要があるが、
+    /// これは索引の寿命内で 1 回だけ発生する（[`SparseIndex::score_pass`] が
+    /// `&self`（非 `&mut self`）シグネチャを維持したまま索引が保持する有界
+    /// スクラッチプール〔[`ScoreScratch`]〕を呼び出し間で使い回し、`touched` で
+    /// タッチ済み要素のみをゼロ戻しして返却する）。`search_within` は hybrid の
+    /// 疎側再取得ループから 1 クエリあたり複数回呼ばれる（Issue #387）が、
+    /// 2 回目以降の呼び出しでは `O(N)` の確保・ゼロ初期化は発生しない。詳細・
+    /// 設計判断は [`SparseIndex::scratch_pool`] のドキュメンテーションコメント・
+    /// `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #546」節を参照
+    /// （旧来の申し送り〔Issue #390 レビュー指摘・#392 領域〕はこの Issue で
+    /// 解消した）。
     ///
     /// BM25 文書長正規化項のテーブル化・Top-k 選出方式（Issue #391。テーブル化を
     /// 遅延キャッシュ方式へ改めた経緯は PR #426 の codex-review 指摘参照）:
@@ -1443,7 +1660,9 @@ impl SparseIndex {
         scope: ScoreScope<'_>,
         k: usize,
     ) -> Vec<ScoredDoc> {
-        let ScorePass { acc, touched } = self.score_pass(query_ids, scope);
+        let pass = self.score_pass(query_ids, scope);
+        let acc = pass.acc();
+        let touched = pass.touched();
 
         // Top-k 選出（Issue #391・[`TopKSelector`]）。`k_eff` はコーパス側で
         // 有界な `touched.len()` と untrusted な `k` の小さい方であり、
@@ -1452,7 +1671,7 @@ impl SparseIndex {
         // 増幅防止）。
         let k_eff = k.min(touched.len());
         let mut selector = TopKSelector::new(k_eff);
-        for &doc_idx in &touched {
+        for &doc_idx in touched {
             let idx = doc_idx as usize;
             // `touched` は `acc.get_mut(idx)` が `Some` を返した添字のみを記録している
             // ため理論上範囲内だが、`.claude/rules/coding-rust.md`（`[]` 禁止）に従い
@@ -1486,13 +1705,31 @@ impl SparseIndex {
     /// ため）。分離前は `search_within` を呼ぶたびに本関数相当の処理
     /// （`acc: Vec<f64>` の `O(N)` 確保・ゼロ初期化を含む）をラウンドごとに
     /// 繰り返していた。
-    fn score_pass(&self, query_ids: &[TermId], scope: ScoreScope<'_>) -> ScorePass {
+    fn score_pass(&self, query_ids: &[TermId], scope: ScoreScope<'_>) -> ScorePass<'_> {
         let (n, avg_doc_len) = match scope {
             ScoreScope::All => (f64::from(self.doc_count), self.avg_doc_len),
             ScoreScope::Visible(bitmap) => {
                 (bitmap.n as f64, bitmap.total_len as f64 / bitmap.n as f64)
             }
         };
+
+        // 索引の寿命内で使い回すスクラッチを取り出す（Issue #546）。
+        // [`Self::acquire_scratch`]/[`Self::release_scratch`] の不変条件により
+        // `acc` は全要素 `0.0`・`touched`/`visible_hits`/`k1_len_norm_cache` は
+        // 空の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
+        // 縮退耐性として）ここでも軽量なフィールド（`touched`/`visible_hits`/
+        // `k1_len_norm_cache`。全要素走査を要する `acc` は対象外）を明示的に
+        // クリアし、母数の異なる前回パスの値が混入しないことを構造的に保証する
+        // （テナント縮約契約〔RLS 相当〕を壊さないための多重防御）。
+        // `k1_len_norm_cache` は `HashMap::clear()` ではなく
+        // [`ScoreScratch::clear_len_norm_cache`]（`touched_classes` に記録した
+        // キーのみ `remove`）を使う（Issue #546 レビュー指摘・PR #565: この
+        // 防御的クリアはパス毎に必ず実行されるため、`clear()` のまま残すと
+        // 確保済み容量に比例するコストを毎クエリ払ってしまう）。
+        let mut scratch = self.acquire_scratch();
+        scratch.touched.clear();
+        scratch.visible_hits.clear();
+        scratch.clear_len_norm_cache();
 
         // BM25 の `k1 * (k1+1)` 側の定数。
         // 文書長クラス別 `k1 * len_norm` テーブル値はクエリ内で `avgdl` が確定した
@@ -1507,19 +1744,40 @@ impl SparseIndex {
         // 引き続きビット一致する。`HashMap` のキー・値は決定的に定まる（`class` →
         // 一意な `f64`）ためスコア自体の決定性に影響しない。
         let k1_plus_1 = self.k1 + 1.0;
-        let mut k1_len_norm_cache: HashMap<u32, f64> = HashMap::new();
 
         // `doc_idx` を添字とするスコアアキュムレータ（f64。ビット一致契約のため
-        // f32 化はしない）。`idf`・分子は常に正であり、`denominator > 0.0` ガードを
-        // 満たす限り各項の加算は必ず正の寄与を持つため、`acc[idx] == 0.0` は
-        // 「まだこの文書へ加算していない」ことと同値（Issue #390 設計判断）。
-        // この性質を使い `touched` へ初めて触れた doc_idx だけを記録することで、
-        // 最終的な Top-k 選出をヒットした文書（`M` 件）だけへ限定する。
-        let mut acc: Vec<f64> = vec![0.0; self.doc_ids.len()];
-        let mut touched: Vec<u32> = Vec::new();
-        // term ごとの可視ヒット `(doc_idx, tf)` を集める使い回しスクラッチ
-        // （[`ScoreScope::Visible`] でのみ使用。`search` 1 呼び出しで 1 本を使い回す）。
-        let mut visible_hits: Vec<(u32, u32)> = Vec::new();
+        // f32 化はしない）。`idf`・分子は数学的には常に正で `denominator > 0.0`
+        // ガードを満たす限り各項の加算は正の寄与を持つ想定だったが（Issue #390
+        // 設計判断）、極端な BM25 パラメータでは寄与が `0.0` へ丸め込まれ得る
+        // ため（[`ScoreScratch::visited_epoch`] ドキュメンテーションコメント
+        // 参照。codex-review 指摘・PR #565）、`touched` への記録要否は
+        // `acc[idx] == 0.0` ではなく `visited_epoch` の世代比較で判定する。
+        // これにより `touched` へ初めて触れた doc_idx だけを記録し、最終的な
+        // Top-k 選出をヒットした文書（`M` 件）だけへ限定する。
+        //
+        // 索引の寿命内で使い回すスクラッチ（[`ScoreScratch`]。Issue #546）の
+        // フィールドを直接使う。取り出した時点で全要素 `0.0`（Issue #390 の
+        // 不変条件と同一）であり、以前は呼び出しのたびに `vec![0.0; N]` で
+        // 新規確保・ゼロ初期化していた（`O(N)`）ものを、索引と同寿命のバッファ
+        // 再利用へ置換した（詳細は [`SparseIndex::scratch_pool`] のドキュメント
+        // コメント参照）。
+        let ScoreScratch {
+            acc,
+            touched,
+            visible_hits,
+            k1_len_norm_cache,
+            touched_classes,
+            visited_epoch,
+            epoch,
+        } = &mut scratch;
+
+        // このパス専用の世代へ進める（[`ScoreScratch::visited_epoch`]
+        // ドキュメンテーションコメント参照。codex-review 指摘・PR #565）。
+        // `wrapping_add` により `u64` を使い切っても panic せず次の世代へ
+        // 循環する（到達しない分岐だが `.claude/rules/coding-rust.md` の
+        // 整数演算規約に従い明示する）。
+        *epoch = epoch.wrapping_add(1);
+        let current_epoch = *epoch;
 
         for &term in query_ids {
             let Some(list) = self.postings.get(term.0 as usize) else {
@@ -1555,11 +1813,21 @@ impl SparseIndex {
                 let Some(&len) = self.len_classes.get(class as usize) else {
                     continue;
                 };
-                let kln = *k1_len_norm_cache.entry(class).or_insert_with(|| {
-                    self.k1
-                        * (1.0 - self.b
-                            + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
-                });
+                // `entry` の `Vacant` 分岐でのみ新規キーを挿入し、その場で
+                // `touched_classes` へ記録する（Issue #546 レビュー指摘・
+                // PR #565）。`touched_classes` が `k1_len_norm_cache` のキー集合と
+                // 1 対 1 に対応するのはこの 1 箇所だけが挿入経路であるため。
+                let kln = match k1_len_norm_cache.entry(class) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let value = self.k1
+                            * (1.0 - self.b
+                                + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
+                        entry.insert(value);
+                        touched_classes.push(class);
+                        value
+                    }
+                };
                 let f = f64::from(tf);
                 let numerator = f * k1_plus_1;
                 let denominator = f + kln;
@@ -1571,7 +1839,22 @@ impl SparseIndex {
                     let Some(slot) = acc.get_mut(idx) else {
                         continue;
                     };
-                    if *slot == 0.0 {
+                    // `touched` への記録要否は `acc[idx] == 0.0` の値そのものでは
+                    // なく `visited_epoch` の世代比較で判定する（codex-review
+                    // 指摘・PR #565。[`ScoreScratch::visited_epoch`] ドキュメン
+                    // テーションコメント参照）。`idf * (numerator / denominator)`
+                    // は数学的には常に正だが、極端な BM25 パラメータ
+                    // （`k1` が桁あふれを起こす有限値等）では `denominator` が
+                    // `f64::INFINITY` に発散し寄与が `0.0` へ丸め込まれ得るため、
+                    // `*slot == 0.0` を「未加算」の代理指標として使うと同一
+                    // `doc_idx` が複数回 `touched` へ積まれ、`n` を超えて
+                    // 再確保され得る。`visited_epoch` は `acc` の値に依存せず
+                    // `doc_idx` ごとに厳密 1 回だけ記録するためこれを防ぐ。
+                    let Some(epoch_slot) = visited_epoch.get_mut(idx) else {
+                        continue;
+                    };
+                    if *epoch_slot != current_epoch {
+                        *epoch_slot = current_epoch;
                         touched.push(doc_idx);
                     }
                     *slot += idf * (numerator / denominator);
@@ -1579,7 +1862,10 @@ impl SparseIndex {
             }
         }
 
-        ScorePass { acc, touched }
+        ScorePass {
+            index: self,
+            scratch: Some(scratch),
+        }
     }
 
     /// `HashMap` の 1 エントリあたりのアロケータ管理領域・制御バイト分の概算
@@ -1675,6 +1961,44 @@ impl SparseIndex {
             .doc_len_class
             .capacity()
             .saturating_mul(std::mem::size_of::<u32>());
+        // スクラッチプール（[`ScoreScratch`]・Issue #546）の**決定的な上限値**を
+        // 加算する。実際のプール充填率（プールが空・部分充填・満杯のいずれか）に
+        // 依存させず、常に [`MAX_SCORE_SCRATCH_POOL`] 本ぶんの最悪確保量を計上する
+        // ことで、`SparseIndexCache::insert`（`sql/sparse_cache.rs`・Issue #357）が
+        // 挿入時点で 1 回だけ評価する容量判定（`MAX_SPARSE_CACHE_TOTAL_BYTES`）が
+        // 実確保量を下回らないようにする（Issue #357 レビュー指摘・codex-review P1:
+        // 過少計上によるこの容量判定の回避を防ぐ、という本関数の既存方針を踏襲）。
+        // 1 本あたり: `acc`（`Vec<f64>`。長さ `N`）・`touched`/`visible_hits`/
+        // `touched_classes` の容量（[`ScoreScratch::new_for`] が `Vec::
+        // with_capacity(N)` で `N` に固定するため実確保量と一致する。Issue #546
+        // レビュー指摘・PR #565: 以前は空 `Vec::new()` から `push` で育てており、
+        // 標準ライブラリの倍々戦略により最終容量が `N` を超えうる〔`N` が
+        // 2 の冪+1 付近だと最大で概ね `2N` 弱まで〕過小計上の余地があった）・
+        // `k1_len_norm_cache`（`HashMap<u32, f64>`。相異なる文書長クラス数 =
+        // `len_classes.len()` が上限）。`N = MAX_CORPUS_DOCS`（100,000）のとき
+        // 1 本あたり概算 (8 + 4 + 4 + 8) × 100,000 ≈ 2.4 MB、
+        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 9.6 MB／索引。
+        // `MAX_SPARSE_CACHE_TOTAL_BYTES`（= `MAX_ARENA_TOTAL_BYTES` = 1 GiB）に
+        // 対し十分小さい桁に収まる。
+        let n = self.doc_ids.len();
+        let scratch_acc = n.saturating_mul(std::mem::size_of::<f64>());
+        let scratch_touched = n.saturating_mul(std::mem::size_of::<u32>());
+        let scratch_visible_hits = n.saturating_mul(std::mem::size_of::<(u32, u32)>());
+        let scratch_touched_classes = n.saturating_mul(std::mem::size_of::<u32>());
+        // `touched` への重複記録防止用の世代カウンタ（[`ScoreScratch::
+        // visited_epoch`]。codex-review 指摘・PR #565）。`touched` と同じ `n`
+        // 要素だが `u64` のため 1 要素あたり 8 バイト。
+        let scratch_visited_epoch = n.saturating_mul(std::mem::size_of::<u64>());
+        let scratch_len_norm_cache = self.len_classes.len().saturating_mul(
+            std::mem::size_of::<(u32, f64)>().saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
+        );
+        let scratch_one = scratch_acc
+            .saturating_add(scratch_touched)
+            .saturating_add(scratch_visible_hits)
+            .saturating_add(scratch_touched_classes)
+            .saturating_add(scratch_visited_epoch)
+            .saturating_add(scratch_len_norm_cache);
+        let scratch_pool_upper_bound = scratch_one.saturating_mul(MAX_SCORE_SCRATCH_POOL);
         terms
             .saturating_add(doc_freq)
             .saturating_add(postings)
@@ -1683,6 +2007,7 @@ impl SparseIndex {
             .saturating_add(id_index)
             .saturating_add(len_classes)
             .saturating_add(doc_len_class)
+            .saturating_add(scratch_pool_upper_bound)
     }
 }
 
@@ -2508,6 +2833,241 @@ mod tests {
                 max: MAX_QUERY_TERMS,
             }
         );
+    }
+
+    // --- スコアスクラッチプール（Issue #546。acc: Vec<f64> の索引寿命内再利用） ---
+
+    #[test]
+    fn scratch_reuse_matches_fresh_index_bit_exact() {
+        // 同一索引を交互に異なるクエリ・可視集合（部分可視・全可視・未知語のみ・
+        // 空）で複数回叩き、都度 `SparseIndex::build` した「使い捨て」索引の結果と
+        // ビット一致することを確認する。プールからの取り出し・返却（ゼロ戻し）が
+        // 加算結果へ影響しないことの根拠。
+        let docs: Vec<(DocId, &str)> = vec![
+            (1, "alpha beta gamma"),
+            (2, "beta gamma delta"),
+            (3, "gamma delta epsilon"),
+            (4, "delta epsilon alpha"),
+            (5, "epsilon alpha beta"),
+        ];
+        let reused = SparseIndex::build(&docs).unwrap();
+
+        let all_ids: BTreeSet<DocId> = docs.iter().map(|(id, _)| *id).collect();
+        let partial_ids: BTreeSet<DocId> = [1u64, 3, 5].into_iter().collect();
+        let cases: Vec<(&str, &BTreeSet<DocId>)> = vec![
+            ("alpha beta", &all_ids),
+            ("gamma", &partial_ids),
+            ("zzz_unknown_term", &all_ids),
+            ("delta epsilon", &partial_ids),
+            ("alpha", &all_ids),
+        ];
+
+        for (query, visible) in &cases {
+            let fresh = SparseIndex::build(&docs).unwrap();
+
+            let reused_search = reused.search(query, 10).unwrap();
+            let fresh_search = fresh.search(query, 10).unwrap();
+            assert_eq!(
+                reused_search
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                fresh_search
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                "search が使い捨て索引とビット一致しない: query={query}"
+            );
+
+            let reused_within = reused.search_within(query, 10, visible).unwrap();
+            let fresh_within = fresh.search_within(query, 10, visible).unwrap();
+            assert_eq!(
+                reused_within
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                fresh_within
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                "search_within が使い捨て索引とビット一致しない: query={query}"
+            );
+
+            let mut reused_scored = reused.score_within(query, visible).unwrap();
+            let mut fresh_scored = fresh.score_within(query, visible).unwrap();
+            assert_eq!(
+                reused_scored
+                    .top(10)
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                fresh_scored
+                    .top(10)
+                    .iter()
+                    .map(|d| (d.doc_id, d.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                "score_within+top が使い捨て索引とビット一致しない: query={query}"
+            );
+        }
+    }
+
+    #[test]
+    fn scratch_pool_returns_all_zero_and_bounded() {
+        // ヒットありクエリを複数回実行した後、プール内に残る全スクラッチの
+        // `acc` が全ゼロ・`touched`/`visible_hits`/`k1_len_norm_cache` が空・
+        // プール長が MAX_SCORE_SCRATCH_POOL 以下であることを検証する
+        // （release_scratch がゼロ戻し・clear を確実に行っている根拠）。
+        let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        for _ in 0..5 {
+            let _ = idx.search("alpha beta gamma", 10).unwrap();
+        }
+
+        let pool = idx.scratch_pool.lock().unwrap();
+        assert!(pool.len() <= MAX_SCORE_SCRATCH_POOL);
+        for scratch in pool.iter() {
+            assert!(
+                scratch.acc.iter().all(|&v| v == 0.0),
+                "プールへ返却されたスクラッチの acc が全ゼロでない"
+            );
+            assert!(scratch.touched.is_empty());
+            assert!(scratch.visible_hits.is_empty());
+            assert!(scratch.k1_len_norm_cache.is_empty());
+            assert!(scratch.touched_classes.is_empty());
+        }
+    }
+
+    #[test]
+    fn extreme_bm25_params_do_not_duplicate_touched_or_grow_scratch_beyond_corpus_size() {
+        // codex-review 指摘（Issue #546・PR #565）: `k1` に桁あふれを起こす
+        // 極端な有限値（`b=1.0` かつ文書長 > 平均文書長で `kln` が
+        // `f64::INFINITY` へ発散する組み合わせ）を渡すと、`idf * (numerator /
+        // denominator)` が `0.0` へ丸め込まれ、「`acc[idx] == 0.0` ⇔ 未加算」
+        // という旧来の判定方法が崩れる。この場合でも `touched`（延いては
+        // 索引の寿命内で使い回すスクラッチプールが保持する容量）が文書数
+        // `n` を超えて成長しない（`visited_epoch` による分離。[`ScoreScratch::
+        // visited_epoch`] 参照）ことと、Top-k 出力に同一 `doc_id` の重複が
+        // 生じないことを固定する。
+        let docs: Vec<(DocId, &str)> = vec![
+            // 複数の相異なるクエリ語すべてが同一文書にヒットする構成
+            // （旧実装ではこの文書の doc_idx が touched へ語数分だけ重複
+            // push され得た）。
+            (1, "alpha beta gamma delta epsilon zeta eta theta"),
+            (2, "alpha"),
+        ];
+        let idx = SparseIndex::with_params(&docs, 1e308, 1.0).unwrap();
+
+        for _ in 0..3 {
+            let results = idx
+                .search("alpha beta gamma delta epsilon zeta eta theta", 10)
+                .unwrap();
+            let doc_ids: Vec<DocId> = results.iter().map(|d| d.doc_id).collect();
+            let unique: BTreeSet<DocId> = doc_ids.iter().copied().collect();
+            assert_eq!(
+                doc_ids.len(),
+                unique.len(),
+                "Top-k 出力に同一 doc_id の重複がある: {doc_ids:?}"
+            );
+        }
+
+        let n = docs.len();
+        let pool = idx.scratch_pool.lock().unwrap();
+        for scratch in pool.iter() {
+            assert!(
+                scratch.touched.capacity() <= n,
+                "touched の容量が文書数 n={n} を超えて再確保された: capacity={}",
+                scratch.touched.capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_queries_on_shared_index_are_bit_identical() {
+        // MAX_SCORE_SCRATCH_POOL を超えるスレッド数で同一索引を同時に叩き、
+        // プール枯渇時の新規確保フォールバックを踏んでもなお単一スレッド結果と
+        // ビット一致することを確認する（Mutex による排他・fail-closed な長さ
+        // 検証のいずれもスコアの正当性を損なわない）。
+        use std::sync::Arc;
+        use std::thread;
+
+        let docs: Vec<(DocId, &str)> = (0..50)
+            .map(|i| {
+                let text = match i % 3 {
+                    0 => "alpha beta gamma",
+                    1 => "beta gamma delta",
+                    _ => "gamma delta epsilon",
+                };
+                (i as DocId, text)
+            })
+            .collect();
+        let idx = Arc::new(SparseIndex::build(&docs).unwrap());
+
+        let expected = idx.search("alpha gamma epsilon", 20).unwrap();
+        let expected_bits: Vec<(DocId, u64)> = expected
+            .iter()
+            .map(|d| (d.doc_id, d.score.to_bits()))
+            .collect();
+
+        let thread_count = MAX_SCORE_SCRATCH_POOL + 2;
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let idx = Arc::clone(&idx);
+                thread::spawn(move || {
+                    let result = idx.search("alpha gamma epsilon", 20).unwrap();
+                    result
+                        .iter()
+                        .map(|d| (d.doc_id, d.score.to_bits()))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let actual_bits = handle.join().unwrap();
+            assert_eq!(actual_bits, expected_bits);
+        }
+    }
+
+    #[test]
+    fn acquire_rejects_scratch_with_mismatched_length() {
+        // プールへ長さ不一致の ScoreScratch を意図的に混入させても、
+        // acquire_scratch が fail-closed に破棄し新規確保へフォールバックする
+        // ため、結果は fresh 索引と一致する。
+        let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
+        let idx = SparseIndex::build(&docs).unwrap();
+
+        {
+            let mut pool = idx.scratch_pool.lock().unwrap();
+            pool.push(ScoreScratch::new_for(idx.doc_ids.len() + 1));
+        }
+
+        let result = idx.search("alpha beta", 10).unwrap();
+        let fresh = SparseIndex::build(&docs).unwrap();
+        let expected = fresh.search("alpha beta", 10).unwrap();
+        assert_eq!(
+            result
+                .iter()
+                .map(|d| (d.doc_id, d.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|d| (d.doc_id, d.score.to_bits()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn approx_heap_bytes_includes_scratch_pool_upper_bound() {
+        // approx_heap_bytes はスクラッチプールの決定的な上限値（プールの実際の
+        // 充填率に関わらず MAX_SCORE_SCRATCH_POOL 本ぶんの最悪確保量）を含む。
+        let docs: Vec<(DocId, &str)> = vec![(1, "alpha beta"), (2, "beta gamma")];
+        let idx = SparseIndex::build(&docs).unwrap();
+        let n = idx.doc_ids.len();
+        let lower_bound = n
+            .saturating_mul(std::mem::size_of::<f64>())
+            .saturating_mul(MAX_SCORE_SCRATCH_POOL);
+        assert!(idx.approx_heap_bytes() >= lower_bound);
     }
 
     // --- approx_heap_bytes（Issue #357・sql/sparse_cache.rs の容量判定用） ---

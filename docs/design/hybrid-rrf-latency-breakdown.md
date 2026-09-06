@@ -818,8 +818,9 @@ Issue は `score_by_postings` のみを変更対象とし build 側の文書長�
 
 ### 申し送り
 
-- `acc: Vec<f64>` の `O(N)` 確保・`VisibleBitmap` の再取得ループ間再利用は
-  引き続き #392 領域の判断材料
+- `acc: Vec<f64>` の `O(N)` 確保は Issue #546 で解消（索引の寿命内で再利用する
+  スクラッチプールへ置換。詳細は本ドキュメント「Issue #546」節参照）。
+  `VisibleBitmap` の再取得ループ間再利用は引き続き #392 領域の判断材料
 - posting の CSR 化・量子化・skip list への圧縮は引き続き #394 の判断材料
 - 専有環境での `bench-hybrid-profile` 再実測はオーナー／運用者判断で別途実施
 - 256 段ロッシー fieldnorm 量子化は本 Issue で不採用と判断した（理由は上記
@@ -1144,3 +1145,74 @@ wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `exe
 （B0s〜B8 ラウンド計測セクション）・`crates/wire-server/benches/harness/
 hybrid_wire.rs`（新設）・`crates/wire-server/benches/hybrid_wire_profile_bench.rs`
 （新設）のみ。
+
+## Issue #546: スコアアキュムレータの再利用（実測は #547）
+
+対応: Issue #546（`perf(engine): score_by_postings のアキュムレータを世代
+整合キャッシュ上の再利用バッファへ置換する`）。親 #545。前提: TASK-102、
+`docs/spec/04-behavior/search.md` SEARCH-1, SEARCH-3。関連: Issue #390
+レビュー指摘（「真に N 非依存化するフォローアップ」として本 Issue を予告して
+いた記述。上記「Issue #390」節「申し送り」参照）・Issue #357（`SparseIndexCache`
+のテーブル世代整合キャッシュ。本 Issue が再利用バッファの寿命源泉とする）。
+
+### 変更内容
+
+`sparse.rs::score_pass`（`search`/`search_within`/`score_within` が共有する
+1 パス BM25 スコアリングコア）が呼び出しのたびに新規確保・ゼロ初期化していた
+`acc: Vec<f64>`（コーパス全体の doc_idx 空間・長さ N）を、索引
+（`SparseIndex`）の寿命内で使い回す有界スクラッチプール（`ScoreScratch`・
+`MAX_SCORE_SCRATCH_POOL = 4`）へ置換した。プールは `SparseIndex` 自身が
+`Mutex<Vec<ScoreScratch>>` として保持する（`&self` シグネチャは無変更）ため、
+`SparseIndexCache`（Issue #357）が保持する `Arc<SparseIndex>` と寿命が一致し、
+索引が世代整合を保っている間はプールも使い回され、世代進行で索引が失効・
+再構築されればプールごと破棄される。
+
+- `score_pass` の戻り値をリース型 `ScorePass<'a>`（`Drop` でプールへ返却）へ
+  変更し、`score_by_postings`・`score_within` は借用アクセサ（`acc()`/
+  `touched()`）経由で読み取る
+- 返却時（`SparseIndex::release_scratch`）は `touched` に記録された `doc_idx`
+  のみをゼロ戻しする。「`acc[idx] == 0.0` ⇔ 未加算」という既存の不変条件
+  （Issue #390 設計判断）により、`touched` に載っていない要素は既に `0.0`
+  であるため、全要素走査によるゼロクリアと結果は同一であり、演算式・加算順は
+  一切変更していない（スコアの f64 ビット一致は不変）
+- プール取り出し時（`acquire_scratch`）は `acc` の長さが索引の文書数と一致
+  することを検証し、不一致（通常到達しない）は破棄して新規確保へ fail-closed
+  に倒す
+- `approx_heap_bytes()` へプールの**決定的な上限値**（`MAX_SCORE_SCRATCH_POOL`
+  本ぶんの最悪確保量。実際のプール充填率に依存しない）を加算し、
+  `SparseIndexCache::insert`（Issue #357）の容量判定
+  （`MAX_SPARSE_CACHE_TOTAL_BYTES` = 1 GiB）が実確保量を下回らないようにした
+
+### 設計判断（親 #545 の文言との関係）
+
+親 Issue #545 の文言は「可視集合サイズで確保」を示唆するが、この方式は
+クエリごとに `doc_idx → compact` 写像を可視集合サイズ分構築する必要があり、
+本 Issue（#546）のスコープでは「N 長バッファを索引の寿命内で再利用し、
+`touched` した要素のみゼロ戻しする」方式を採った。この方式でも初回のみ
+`O(N)`・以降は `O(M)`（M = ヒット文書数 ≤ 可視集合サイズ）となるため、
+親 Issue の狙い（確保コスト除去・ビット一致維持）は包含される。
+
+配置についても、`SparseIndexCache` 自体（`sql/sparse_cache.rs`）ではなく
+`SparseIndex` 内部にプールを持たせる方式を採った。キャッシュが保持する実体は
+`Arc<SparseIndex>` であり、`hybrid.rs`・`sql/exec.rs`・Rust API 経路はいずれも
+`&SparseIndex`／`&self` で接続されているため、`SparseIndex` 内部に置くことで
+「世代整合キャッシュ上の再利用バッファ」という要件をシグネチャ変更なしに
+満たせる（詳細は `sql/sparse_cache.rs` モジュール doc「スコアスクラッチ
+プールとの関係」節参照）。
+
+### 検証
+
+`crates/engine/tests/sparse_cache_recall.rs`・`crates/engine/tests/
+sparse_determinism.rs` は無変更のまま green（Recall 層 A 固定値アサーション・
+cold/hot 等価性・決定性契約は構造的に不変）。`sparse.rs` 内 unit test に
+交互呼び出しでのビット一致・プール返却時の全ゼロ／空検証・並行アクセス時の
+ビット一致・長さ不一致バッファの fail-closed 破棄・`approx_heap_bytes` の
+上限加算を固定するテストを追加した。
+
+### 申し送り
+
+前後比較実測（N=25k／100k・可視率 100%／10%・交互 min-of-N・ノイズ帯併記）と
+採否記録は Issue #547 の担当とし、本 PR では数値を記録しない。
+`approx_heap_bytes()` の表示値は上限加算分だけ増える（実 RSS は変わらない）
+ため、#547 が `bench-hybrid-profile` のメモリ計測を記録する際にはこの点を
+注記する必要がある。
