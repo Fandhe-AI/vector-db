@@ -1,8 +1,9 @@
 # ADR: wgpu での部分 Top-k（bitonic／radix select）と SUBGROUP 可用性
 
-- ステータス: Proposed（実装 #536・前後比較 #537 の実測で Accepted／Rejected を
-  確定する。オーナー承認ゲートではない——`docs/spec/05-tasks.md` TASK-128〜130
-  の実装契約に沿った設計判断のうえで、実測により方式の採否を決める性質のため）
+- ステータス: Implemented（#536 で共有メモリのみの bitonic 部分 Top-k を実装。
+  Accepted／Rejected の確定は #537 の前後比較実測で行う——オーナー承認ゲートで
+  はなく、`docs/spec/05-tasks.md` TASK-128〜130 の実装契約に沿った設計判断の
+  うえで実測により方式の採否を決める性質のため）
 - 対応: Issue #535（親 #534・Phase 5 親 #460・ルート #455）
 - 関連ポインタ: `docs/spec/04-behavior/core-engine.md`（CORE-6・CORE-8・
   CORE-16）・`docs/spec/05-tasks.md`（TASK-128・TASK-129・TASK-130）。
@@ -286,14 +287,63 @@ subgroup 組み込み（`subgroupMax`／`subgroupBallot`／`subgroupShuffleXor`�
 - **秘密情報**: 実測表にホスト名・パス・資格情報を含めない（GPU 名・
   ドライバ版のみを記録する）。
 
+## 実装記録（#536）
+
+決定 1〜3 を `crates/engine/src/gpu_batch.rs` に実装した。ADR からの意図的な
+差分は以下のとおり（`DOT_SHADER_TOPK_WGSL`/`DOT_SHADER_TOPK_F32_WGSL` の
+`topk_dot_shader!` マクロ doc に同内容を記載）。
+
+- **候補 B（subgroup shuffle 段）は実装しなかった。共有メモリ＋バリアのみ
+  （候補 A 相当）に統一した**。理由: naga 30.0.1 はバリアの一様性も
+  subgroup builtin の一様性も検証しない（§1.3）ため、`use_subgroup` の
+  分岐先で論理位置の取り違えが起きてもコンパイル時・CI では検知できず、
+  実機デバッグでしか発覚しないリスクを負う。本 Issue の主目的（readback
+  量を「クエリ本数 × 行数」比例から「ワークグループ数 × k_out」比例へ
+  削減する）は共有メモリのみの構成でも達成でき、正しさの検証可能性を
+  優先しこちらを採用した。`GpuContext`/`ContrastPipelines` に
+  `subgroup_supported` 等の判定フィールドは追加していない
+  （`select_readback_mode` は Top-k パイプライン可用性と `k` 上限のみで
+  判定する）。
+- **決定 2 の縮退条件を簡略化**: `SUBGROUP` 可用性・subgroup サイズ範囲の
+  判定は行わず、「Top-k パイプライン生成の成否」「タイル内クエリの `k`
+  最大値が `GPU_TOPK_OUT_MAX`（256）以下か」の 2 条件のみで
+  `GpuReadbackMode::FullScores`／`PartialTopK` を選ぶ（`select_readback_mode`）。
+  段階的 fail-closed 縮退（パイプライン未生成 → `init_gpu_context`/
+  `init_f32_contrast_pipeline` が独立 error scope で捕捉し `None` に吸収）
+  は維持している。
+- 決定 3 の定数・バッファ計画・readback 検証（`GpuTopKParams`・
+  `plan_partial_topk_chunk_rows`・`merge_partial_topk_readback`）は設計どおり
+  実装した。統計カウンタ `GpuBatchStats`/`GpuBatchStatsSnapshot`
+  （`partial_topk_dispatches`・`full_readback_dispatches`・
+  `full_readback_fallbacks`・`readback_bytes`）を新設し `stats()` で公開。
+- CORE-16 の公平性のため f32 常駐対照経路（`GpuF32ContrastBackend`）にも
+  同一の S1（Top-k 選出部。`topk_dot_shader!` マクロで S0 のみ差し替え）を
+  持つ Top-k パイプラインを用意した。
+
+本開発環境（NVIDIA GeForce RTX 3060・Vulkan backend）で Top-k パイプラインは
+問題なく生成・実行され（`probe_gpu_availability_debug_only` で確認）、実機
+結合テスト（`crates/engine/tests/gpu_batch.rs::topk_readback_bit_identity`）
+で既定の部分 Top-k 経路と `force_full_readback: true` の全量 readback 経路
+（`GpuSearchTestOptions`。`bench-internals` feature 限定）が
+`(id, score.to_bits())` 列としてビット同一であること、非有限スコア
+（65504 超の成分による f16 飽和 → `inf * 0.0` の NaN）を含む行が結果に
+混入しないこと、既定経路が `stats().partial_topk_dispatches > 0`・
+`full_readback_dispatches == 0` の非 vacuous な観測になることを確認した。
+
 ## スコープ外・申し送り
 
-- Top-k シェーダ本体・経路判定純関数・統計カウンタの実装は #536 の担当。
-  前後比較・readback バイト数の実測は #537 の担当。
-- 非対応 adapter の縮退先を「全量 readback」から「barrier-only bitonic
-  （候補 A）」へ昇格する案は、#537 の実測結果を見てから再検討する。
-- 候補 C（radix select）は k が Top-k 出力上限を超える場合向けの条件付き
-  候補として記録するに留める。
+- 前後比較・readback バイト数の実測は #537 の担当（`stats().readback_bytes`
+  が入力になる）。
+- **subgroup shuffle 段（決定 1「候補 B」）の追加**: #537 の実測で共有メモリ
+  のみの構成が readback 削減の目的に照らして十分と判断されればそのまま
+  close、レイテンシがなお課題なら shuffle 段の追加を再検討する。追加時は
+  `subgroup_size`/`num_subgroups`/`subgroup_id`/`subgroup_invocation_id`
+  builtin の一様性を実装者が手動で保証する設計注意点（§1.3・本 doc の
+  「実装記録」節）が前提になる。
+- 非対応 adapter の縮退先を「全量 readback」から昇格する案は本実装では
+  不要（barrier-only 構成をすでに既定の Top-k 経路として採用済み）。
+- 候補 C（radix select）は k が Top-k 出力上限（256）を超える場合向けの
+  条件付き候補として記録するに留める（現状は全量 readback へ縮退）。
 - `SHADER_F16`（#538）・整数ドット積系 feature（#541）・Apple UMA
   （#544）の実機確認は、本 doc の再現用 example（§6）の出力表を流用する。
 - wgpu 更新時（naga が `enable subgroups;` を実装した場合）の WGSL
