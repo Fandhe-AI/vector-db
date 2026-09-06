@@ -321,6 +321,141 @@ current_generation` による事前・事後の失効照合とは独立した読
 - `make core-api-check`（`SearchProvider`/`VectorCore` trait 差分ゼロ）・
   `make sort-determinism-check` green
 
+## 可視比率 × 行数の損益分岐点実測（Issue #487）
+
+### 目的
+
+`full_scan_ratio`（既定 1/10）の妥当性は Issue #413 の 1 点（`vector_knn_where`・
+`lang='ja'`≒1/5）の実測しか持たなかった（`docs/design/hnsw-index.md` §7〜§10）。
+本節は可視比率（1/2・1/4・1/10・1/20・1/50）× 行数（25k・100k）のスイープを
+`crates/engine/benches/knn_profile_bench.rs` の opt-in
+（`BENCH_KNN_PROFILE_VISIBLE_RATIO`／`BENCH_KNN_PROFILE_FULL_SCAN_RATIO`／
+`BENCH_KNN_PROFILE_SCALE`）で実測し、`full_scan_ratio` 既定値の再調整判断へ
+入力する。
+
+### 測定条件
+
+- **arm**: `brute_force`（対照。`Subset` 系カウンタを持たない）・`hnsw_default`
+  （`full_scan_ratio` 既定 1/10）・`hnsw_force_ann`（`FULL_SCAN_RATIO=0/1`。
+  閾値比較を常に ANN 側にする）・`hnsw_force_plain`（`FULL_SCAN_RATIO=1/1`。
+  可視行数が索引ノード数と完全一致しない限り常に plain scan 側にする）
+- **warm 手順**: `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE）は索引を
+  構築しない（`sql::hnsw_cache::prepare_subset` は常に `FullScan` へ縮退する。
+  Issue #410 の既存契約）ため、同一 `EngineCore` でまずフィルタなしクエリを
+  1 回発行して `FullVisible` 形状の索引を warm してから WHERE クエリを計測
+  する。warm 後 `builds == 0` は fail-closed（測定を中断する）
+- **S0-cold 非対象の理由**: `Subset` 形状は索引を再利用しない設計のため、
+  毎サンプル新規 `EngineCore` で測る S0-cold は「常に索引なし」を測るだけで
+  可視比率スイープの目的（索引 warm 済み状態での ANN／plain scan 切替）に
+  寄与しない
+- **コーパスの違い**: 本スイープは `knn_profile_bench.rs` 既存の一様乱数
+  ベクトル（`DeterministicRng`）を使う。`docs/design/hnsw-index.md` の
+  `feature_bench`（ハッシュ埋め込み）・`vector_knn_where`（`lang='ja'` 述語）
+  の数値とは直接比較できない
+- **可視集合の構成**: `bucket TEXT` 列を追加し `id % denominator == 0` を
+  `bucket='b0'` として WHERE 述語にする。可視集合は id 全域に均等に散らばる
+  （クラスタ構造を持たない、id 空間上「最も細かく分散した」マスク形状）
+- **実行環境**: 本開発環境（共有 QEMU 環境。`docs/design/
+  benchmark-judgement-policy.md` の証拠力区分では「参考値」）。専有環境
+  （`BENCH_DEDICATED_ENV=1`）での再実測は未実施——**本節の数値は
+  `full_scan_ratio` 既定値の変更根拠にはしない**
+- **実測方式**: `make bench-knn-visible-ratio`（`scripts/
+  bench_knn_visible_ratio_sweep.sh`）が scale×ratio×arm×pair の全 4 arm を
+  輪番実行する仕様だが、本節の数値は実装セッション内での時間制約により
+  `brute_force`／`hnsw_default` の 2 arm × N=3 ペア（scale=1・4 双方）の
+  縮小実測（`hnsw_force_ann`／`hnsw_force_plain` は scale=1 のみ 1 ペアの
+  補助実測。下記「force 系の補助実測」参照）。**計測規約の推奨 N≥5 に
+  未到達であり、この点も含めて参考値**である。専有環境での N≥5 本実測は
+  運用者作業として申し送る
+
+### 実測結果（scale=1・25,000 行）
+
+`S0_hot_where_subset`（対象）・`S0_hot_sql_e2e`（参照区間・フィルタなし）の
+中央値（3 ペアの min／median、単位 ms）と観測 arm:
+
+| ratio | 予測 arm | brute_force min/median | hnsw_default min/median | 観測 arm（hnsw） |
+| --- | --- | --- | --- | --- |
+| 1/2 | ann_masked | 1.974 / 2.047 | 5.070 / 5.444 | `plain_scan_mask_split` |
+| 1/4 | ann_masked | 1.368 / 1.406 | 3.601 / 3.748 | `plain_scan_mask_split` |
+| 1/10 | ann_masked | 0.897 / 0.932 | 1.501 / 1.545 | `plain_scan_mask_split` |
+| 1/20 | plain_scan_ratio | 0.648 / 0.652 | 0.802 / 0.805 | `plain_scan_ratio` |
+| 1/50 | plain_scan_ratio | 0.519 / 0.535 | 0.590 / 0.598 | `plain_scan_ratio` |
+
+参照区間（`S0_hot_sql_e2e`。フィルタなし・エンジンに関わらずほぼ一定である
+はずの基準線）: brute_force 0.644〜1.011ms（幅 約 ±22% 中央値比）、
+hnsw_default 0.423〜0.449ms（幅 約 ±3%）。`S0prime_count_star`（エンジン非
+依存の対照）は全 arm で 1.578〜1.737ms（幅 約 ±5%）。固定 ±5% 帯・この
+参照区間の実測帯のいずれよりも大きい差（1/2 で hnsw_default が brute_force
+の約 2.7 倍）はノイズでは説明できない。
+
+### 実測結果（scale=4・100,000 行）
+
+| ratio | 予測 arm | brute_force min/median | hnsw_default min/median | 観測 arm（hnsw） |
+| --- | --- | --- | --- | --- |
+| 1/2 | ann_masked | 18.020 / 18.603 | 36.057 / 36.114 | `plain_scan_mask_split` |
+| 1/4 | ann_masked | 6.085 / 6.169 | 18.087 / 18.100 | `plain_scan_mask_split` |
+| 1/10 | ann_masked | 4.014 / 4.114 | 9.810 / 10.016 | `plain_scan_mask_split` |
+| 1/20 | plain_scan_ratio | 3.458 / 7.534 | 9.960 / 10.540 | `plain_scan_ratio` |
+| 1/50 | plain_scan_ratio | 2.026 / 2.500 | 2.422 / 2.457 | `plain_scan_ratio` |
+
+25k 同様、1/2〜1/10 は `plain_scan_mask_split`、1/20〜1/50 は
+`plain_scan_ratio`（閾値比較どおり）。1/20 の brute_force min/median 幅が
+大きい（3.458〜8.419ms）のは共有環境のノイズと考えられ、この規模点だけで
+損益分岐の位置を断定しない。
+
+### 中心的な所見: 本フィクスチャでは「ann_masked」観測 arm に到達しない
+
+`full_scan_ratio` の閾値比較（`visible/index_len >= full_scan_ratio` なら
+ANN）が「ANN を選ぶはず」と予測する 1/2・1/4・1/10 のいずれでも、実際に
+選ばれたのは ANN 探索（`subset_searches`）ではなく `mask_splits_graph`
+（マスクの受理ノードが複数の連結成分に分かれ `search_masked` を呼ぶ前に
+plain scan へ縮退する経路。Issue #409 実装）だった。`id % N == 0` という
+均等分散マスクは、この一様乱数ベクトルの HNSW グラフ構造の下では
+`HnswIndex::is_mask_fully_reachable` の単一連結性検査を通過しない——つまり
+本スイープの可視集合構成は、`full_scan_ratio` 閾値そのものではなく
+「マスク分断」が全ての高可視比率点で先に発火する形状になっている。
+
+これは本フィクスチャ固有の設計上の限界であり、`full_scan_ratio` 既定値の
+妥当性そのものについては結論を出せない（`ann_masked` 経路の性能を一度も
+観測できていないため）。「均等分散マスクは分断しやすい」こと自体は
+HNSW の一般的な性質（グラフの疎な領域を均等マスクで間引くと連結性が
+失われやすい）と整合するが、`docs/design/hnsw-rls-cardinality-switch.md`
+の実運用シナリオ（RLS テナント境界・`WHERE` 述語）が想定する可視集合の
+形状（同一テナント・同一属性値のクラスタ）とは異なる可能性が高い。
+後続の実測はクラスタ寄りの可視集合構成（例: 連続 id 範囲・同一テナント）を
+検討すべきという申し送りとする。
+
+`mask_splits_graph` 経路が発火している間、`hnsw_default` は一貫して
+brute_force より遅い（`Overlay::compute`・分断検査・plain scan への縮退分の
+オーバーヘッドが乗る。1/2〜1/10 で約 1.6〜2.7 倍）。`plain_scan_ratio`
+（1/20・1/50）でも `hnsw_default` は brute_force と同程度かやや遅い
+（1/50 で約 1.1〜1.4 倍、1/20 は scale4 でノイズ帯内）。いずれの観測 arm
+でも本フィクスチャでは ANN opt-in が SCALAR 事前フィルタ付き DISTANCE を
+高速化する場面は確認できなかった——これは Issue #413 の所見
+（`hnsw_subset` 経路は 37〜45% 悪化）と整合する。
+
+### force 系の補助実測（scale=1・1 ペアのみ・参考）
+
+`hnsw_force_ann`（`FULL_SCAN_RATIO=0/1`。閾値を無視して常に ANN 側と判定）
+でも 1/2〜1/10 は同じく `plain_scan_mask_split` を観測した（`search_masked`
+自体を呼ぶ前に分断検査で縮退するため、`full_scan_ratio` の値を変えても
+挙動が変わらない）。`hnsw_force_plain`（`FULL_SCAN_RATIO=1/1`）は全 ratio で
+`plain_scan_ratio` を観測した（可視行数が索引ノード数と完全一致しない限り
+必ず plain scan 側になる、期待どおりの契約）。
+
+### 判断
+
+- 本開発環境（共有 QEMU・N=3 ペア）の実測は **参考値**。`full_scan_ratio`
+  既定値（1/10）の変更根拠にはしない
+- 本フィクスチャ（均等分散マスク・一様乱数ベクトル）では `ann_masked`
+  観測 arm に一度も到達しなかったため、「損益分岐点」自体を本節の実測から
+  結論づけることはできない。後続実測はクラスタ寄りの可視集合構成
+  （テナント単位・連続 id 範囲等）で `ann_masked` を実際に発火させたうえで
+  性能比較する設計に改める必要がある
+- 専有環境での N≥5 本実測、および `ann_masked` を発火させる可視集合構成の
+  設計は運用者・後続 Issue への申し送りとする（下記「スコープ外・申し送り」
+  参照）
+
 ## スコープ外・申し送り
 
 - ~~不足時の `ef` 倍増再探索（iterative scan）・hybrid 密側の ANN 化と
@@ -332,7 +467,12 @@ current_generation` による事前・事後の失効照合とは独立した読
 - ~~`EXPLAIN` へのエンジン種別・縮退有無の露出: #411~~ 実装済み（縮退有無は静的判定のみ・実行時縮退は非露出）。`docs/design/explain-search-engine-exposure.md` 参照
 - ~~Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412~~
   実装済み。`docs/design/ann-recall-gate-verification.md` 参照
-- `full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413
+- ~~`full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413~~
+  比率×行数スイープを Issue #487 で実測——本フィクスチャでは `ann_masked`
+  観測 arm に到達しなかったため既定値の妥当性そのものは未確定のまま。
+  「可視比率 × 行数の損益分岐点実測（Issue #487）」節参照。専有環境での
+  N≥5 本実測・`ann_masked` を発火させる可視集合構成（クラスタ寄り）の設計は
+  運用者・後続 Issue への申し送り
 - `SearchTimeFilter` 経路の ANN 化（設計上対象外）
 - `Subset` 形状で base 未構築時の非同期／バックグラウンド構築（現状は plain
   scan 縮退）
