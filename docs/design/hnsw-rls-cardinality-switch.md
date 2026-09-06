@@ -340,14 +340,19 @@ current_generation` による事前・事後の失効照合とは独立した読
   （`FULL_SCAN_RATIO=1/1`。可視行数が索引ノード数と完全一致しない限り常に
   plain scan 側にする）の 3 つ。`brute_force`（`Subset` 系カウンタを持たない
   対照。BENCH_KNN_PROFILE_ENGINE=brute_force）は各 candidate 共通の baseline
-  として、各 candidate の直前に必ず 1 回実行する（輪番:
-  baseline→hnsw_default→baseline→hnsw_force_ann→baseline→hnsw_force_plain。
-  `docs/design/benchmark-judgement-policy.md` §3 の「3 候補以上の場合は
-  baseline→cand1→baseline→cand2→…」に対応。`scripts/
-  bench_knn_visible_ratio_sweep.sh` は scale×ratio の組み合わせごとに
-  pair を外側・candidate を内側のループとし、ペアごとにこの輪番を
-  繰り返す〔特定の candidate だけを SWEEP_PAIRS 回連続実行してしまう
-  時間方向の交絡を避けるため〕）
+- **実行順（要訂正・codex-review 指摘）**: 下記「実測方式」に記す計測コミット
+  `06336219` 時点の `scripts/bench_knn_visible_ratio_sweep.sh` は、scale×ratio
+  の組み合わせごとに pair を外側・**arm（`brute_force`・`hnsw_default`・
+  `hnsw_force_ann`・`hnsw_force_plain` の 4 つ）を内側**のループとし、
+  1 ペアにつき `brute_force→hnsw_default→hnsw_force_ann→hnsw_force_plain` を
+  1 回ずつ実行する構成だった（各 candidate の直前に baseline を個別に挟む
+  輪番ではない）。「各 candidate の直前に必ず baseline を 1 回挟む」輪番
+  （baseline→hnsw_default→baseline→hnsw_force_ann→baseline→hnsw_force_plain）
+  は本 PR で `docs/design/benchmark-judgement-policy.md` §3 に合わせて
+  `scripts/bench_knn_visible_ratio_sweep.sh` を書き換えた**後**の構成であり、
+  下記の実測値（計測コミット `06336219`）はこの新しい輪番では**採取されて
+  いない**。実測値を新しい輪番で再取得するには専有環境での再実測が必要
+  （下記「スコープ外・申し送り」参照）
 - **warm 手順**: `Subset` 形状（SCALAR 事前フィルタ付き DISTANCE）は自身では
   索引を構築しない（`sql::hnsw_cache::prepare_subset`。既存の索引が
   `Ready`／`NeedOverlay` であればその base を再利用し per-query オーバーレイを
@@ -376,12 +381,21 @@ current_generation` による事前・事後の失効照合とは独立した読
   共有 QEMU 環境という証拠力区分の制約は別軸として残る）
 - **実測方式**: `make bench-knn-visible-ratio`（`SWEEP_PAIRS=5`。既定値・
   `docs/design/benchmark-judgement-policy.md` §3 の N≥5 必須要件を満たす
-  下限）で 3 candidate × 5 ratio × 2 scale の全組み合わせを baseline→
-  candidate の輪番で N=5 ペアずつ実行した（計測コミット
-  `06336219`）。生ログは `target/bench-knn-visible-ratio/1788722580/`
-  （ローカル・gitignore 対象のため、事後の再判定に必要な per-run 生データは
-  下記の各表・折りたたみ内へインライン記録する。恒久的な参照先はこの
-  ドキュメント本文そのもの）
+  下限）で 3 candidate × 5 ratio × 2 scale の全組み合わせを、計測コミット
+  `06336219` 時点の輪番（上記「実行順」参照。1 ペアにつき
+  `brute_force→hnsw_default→hnsw_force_ann→hnsw_force_plain` を 1 回ずつ）で
+  N=5 ペアずつ実行した。生ログは `target/bench-knn-visible-ratio/1788722580/`
+  （ローカル・gitignore 対象。当時のセッション終了後に破棄されており、
+  本ドキュメント作成後に取得し直すことはできない）。事後の再判定に必要な
+  per-run 生データのうち、`S0_hot_where_subset`（対象クエリ）の中央値は
+  下記の各表・折りたたみ内へインライン記録済みだが、**ノイズ帯算出の
+  参照区間である `S0_hot_sql_e2e`（フィルタなしクエリ）の per-run 生データは
+  当時記録しておらず、上記ログ破棄により事後の再構成もできない**
+  （codex-review P1/P2 指摘。以下の各表「参照区間帯（全幅）」列は生ログ
+  破棄前に算出済みの `(max-min)/min` 値のみを転記したものであり、算出元と
+  なった個々の run 値そのものは本ドキュメントにも残っていない。この
+  欠落は本節の実測を専有環境で再実施する際に是正する。「スコープ外・
+  申し送り」参照）
 
 ### 実測結果
 
@@ -574,11 +588,20 @@ scan への縮退分のオーバーヘッドが乗る。上表の主統計量「
 
 ### 判断
 
-- 本開発環境（共有 QEMU）の実測は、計測プロトコル自体は
-  `docs/design/benchmark-judgement-policy.md` §3〜§4 の必須事項（交互
-  N=5 ペア・輪番・per-run 生データ保持・主統計量 min-of-N＋median 交差確認・
-  両ノイズ帯併記〔全幅〕）を満たすが、§5 の証拠力区分では引き続き
-  **参考値**。`full_scan_ratio` 既定値（1/10）の変更根拠にはしない
+- 本開発環境（共有 QEMU）の実測は、`S0_hot_where_subset`（対象クエリ）の
+  per-run 生データは記録済みだが、**ノイズ帯算出の参照区間
+  （`S0_hot_sql_e2e`）の per-run 生データは未保存かつ生ログ破棄により
+  事後の再構成も不可**（上記「実測方式」参照。codex-review 指摘）であり、
+  かつ計測コミット `06336219` 時点の実行順は「上記「実行順」節で訂正した
+  とおり `docs/design/benchmark-judgement-policy.md` §3 の輪番方式（各
+  candidate の直前に baseline を個別に挟む）そのものでは実行されていない
+  （codex-review 指摘）。したがって `docs/design/benchmark-judgement-
+  policy.md` §3〜§4 の必須事項を**完全には満たしておらず**、§5 の証拠力
+  区分でも従来の「参考値」よりさらに一段弱い——`full_scan_ratio` 既定値
+  （1/10）の変更根拠にしないのは元より、本節の数値そのものを既存 arm
+  分類（`plain_scan_mask_split`／`plain_scan_ratio`）の定性的傾向の把握
+  以上には用いない。§3〜§4 を完全に満たす形での再実測は専有環境での
+  再実施時に行う（下記「スコープ外・申し送り」参照）
 - 本フィクスチャ（均等分散マスク・一様乱数ベクトル）では `ann_masked`
   観測 arm に一度も到達しなかったため、「損益分岐点」自体を本節の実測から
   結論づけることはできない。後続実測はクラスタ寄りの可視集合構成
@@ -601,12 +624,19 @@ scan への縮退分のオーバーヘッドが乗る。上表の主統計量「
 - ~~Recall 3 ゲートの ANN 同一閾値検証・TASK-121 系増分回帰: #412~~
   実装済み。`docs/design/ann-recall-gate-verification.md` 参照
 - ~~`full_scan_ratio` 既定値（1/10）の実測による再調整・前後比較: #413~~
-  比率×行数スイープを Issue #487 で実測（計測プロトコル自体は交互 N=5 ペア・
-  輪番・per-run 生データ保持を満たす）——本フィクスチャでは `ann_masked`
-  観測 arm に到達しなかったため既定値の妥当性そのものは未確定のまま。
-  「可視比率 × 行数の損益分岐点実測（Issue #487）」節参照。専有環境での
-  再実測・`ann_masked` を発火させる可視集合構成（クラスタ寄り）の設計は
-  運用者・後続 Issue への申し送り
+  比率×行数スイープを Issue #487 で実測（`S0_hot_where_subset` 対象クエリの
+  per-run 生データ保持は満たすが、`docs/design/benchmark-judgement-
+  policy.md` §3〜§4 を完全には満たさない——参照区間 `S0_hot_sql_e2e` の
+  per-run 生データ未保存〔生ログ破棄により再構成不可〕、および計測コミット
+  `06336219` 時点の実行順が §3 の輪番方式〔各 candidate の直前に baseline
+  を個別に挟む〕とは異なる回転方式だった点を codex-review 指摘で確認・
+  本文へ記録済み。詳細は「実行順（要訂正・codex-review 指摘）」「実測方式」
+  各節参照）——本フィクスチャでは `ann_masked` 観測 arm に到達しなかった
+  ため既定値の妥当性そのものは未確定のまま。「可視比率 × 行数の損益分岐点
+  実測（Issue #487）」節参照。専有環境での再実測（§3〜§4 を完全に満たす
+  形での参照区間 per-run 生データ保持・現行の輪番方式〔各 candidate の
+  直前に baseline を個別に挟む〕での再測定を含む）・`ann_masked` を発火
+  させる可視集合構成（クラスタ寄り）の設計は運用者・後続 Issue への申し送り
 - `SearchTimeFilter` 経路の ANN 化（設計上対象外）
 - `Subset` 形状で base 未構築時の非同期／バックグラウンド構築（現状は plain
   scan 縮退）

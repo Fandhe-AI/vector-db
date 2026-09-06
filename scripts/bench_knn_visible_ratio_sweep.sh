@@ -58,7 +58,7 @@ mkdir -p "${OUT_DIR}"
 
 {
   echo "commit=$(cd "${REPO_ROOT}" && git rev-parse HEAD)"
-  echo "nproc=$(nproc)"
+  echo "nproc=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
   echo "BENCH_DEDICATED_ENV=${BENCH_DEDICATED_ENV:-<unset>}"
   if [ -r /proc/cpuinfo ]; then
     echo "cpu_model=$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
