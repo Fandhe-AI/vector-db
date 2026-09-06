@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wire_server::auth::{argon2id, UserStore};
-use wire_server::limits::ConnectionLimiter;
+use wire_server::limits::{ConnectionLimiter, MAX_CONNECTIONS};
 
 /// `UserStore::load_from_file` は Argon2id パラメータが `RECOMMENDED_PARAMS` と
 /// 完全一致するレコードのみを受理するため、フィクスチャも本番既定値を使う
@@ -376,4 +376,55 @@ fn wire6_concurrent_burst_never_exceeds_max() {
         limiter.active() <= MAX,
         "active permits must never exceed max"
     );
+}
+
+/// production 定数 `MAX_CONNECTIONS`（64）そのもので accept ループを通し、
+/// 65 本目が `'E'`／`53300` で拒否されること（Issue #482。既存の
+/// `wire6_concurrent_burst_never_exceeds_max` はパラメータ化した小さい上限
+/// （4）でのみ検証しており、production 定数そのものでの回帰は本テストが
+/// 初めて固定する）。
+#[test]
+fn wire6_production_max_connections_rejects_the_65th_connection() {
+    let users_path = write_user_store_file(&[("alice", "tenant-a", "correct-horse")]);
+    let (addr, limiter) = spawn_server(&users_path, MAX_CONNECTIONS, Duration::from_secs(5));
+
+    let mut held: Vec<TcpStream> = Vec::with_capacity(MAX_CONNECTIONS);
+    for _ in 0..MAX_CONNECTIONS {
+        let mut stream = TcpStream::connect(addr).expect("connect within capacity");
+        assert_connection_accepted_and_idle(&mut stream);
+        held.push(stream);
+    }
+    assert_eq!(
+        limiter.active(),
+        MAX_CONNECTIONS,
+        "all MAX_CONNECTIONS slots must be occupied"
+    );
+
+    let mut extra = TcpStream::connect(addr).expect("connect the 65th");
+    let mut header = [0u8; 1];
+    extra.read_exact(&mut header).expect("read message type");
+    assert_eq!(
+        header[0], b'E',
+        "expected ErrorResponse for the 65th connection"
+    );
+    let mut len_buf = [0u8; 4];
+    extra.read_exact(&mut len_buf).expect("read length");
+    let len = i32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len - 4];
+    extra.read_exact(&mut body).expect("read body");
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains(wire_server::limits::SQLSTATE_TOO_MANY_CONNECTIONS),
+        "ErrorResponse must carry SQLSTATE 53300, got: {body_str:?}"
+    );
+    let mut trailing = [0u8; 1];
+    let n = extra.read(&mut trailing).unwrap_or(0);
+    assert_eq!(n, 0, "the 65th connection must be closed after rejection");
+
+    assert!(
+        limiter.active() <= MAX_CONNECTIONS,
+        "active permits must never exceed MAX_CONNECTIONS even after a rejection"
+    );
+
+    drop(held);
 }
