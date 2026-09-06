@@ -355,6 +355,10 @@ env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
 
 結果の記録先・公開境界: 実測値そのものは public な docs・Issue へ記録可能です（オーナー判断 2026-08-29・[spec-confidentiality](.claude/rules/spec-confidentiality.md)）。spec 由来の閾値は本リポジトリには記載しません。結果記録テンプレート・チップ別空テンプレート・`summary.json` キー一覧は `docs/design/chip-kernel-guidelines.md` §7 を参照してください。
 
+### macOS 上の feature 検出の実機検証（Issue #468）
+
+`make detect-features`（`crates/engine/examples/detect_features.rs`）は `is_aarch64_feature_detected!`／`is_x86_feature_detected!` マクロの実効性（コンパイル時 `cfg!(target_feature)` 定数化・マクロ実行結果・macOS では `sysctl` 相互検証）を表として出力します。依存追加なし・検出結果の上書き機構なし（`isa.rs` の CORE-12 節と同じ fail-closed 方針）。Apple Silicon 実機での実測は `.github/workflows/detect-features.yml`（`pull_request` の paths 限定トリガ、または `workflow_dispatch` で GitHub ホステッド `macos-latest` runner 上で実行。情報提供専用・必須チェックには含めません）で行い、出力を `docs/design/chip-kernel-guidelines.md`「8. macOS 上の `is_aarch64_feature_detected!` 実効性」節へ転記します。GitHub ホステッド runner（macOS 26.5.2・仮想化）での実機確認は完了済みです（同節参照）。オーナー所有実機（M4 等）での追記も同ツールで行えます。
+
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。

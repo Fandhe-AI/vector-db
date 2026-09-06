@@ -217,9 +217,9 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 定数 true を返す。`bf16` のみ sysctl 経由の実行時検出が必要で、
 `sme`／`sme2` は stable では検出マクロ自体が利用できない。結論として
 本 ADR の決定 3 が定義するトークン（`NeonFp16Token`・`NeonDotprodToken`）
-に対する代替検出機構の追加は不要である。詳細は macOS 実機検証 PR
-（マージ前は `origin/test/468-macos-feature-detect`）の
-`chip-kernel-guidelines.md` §7 を参照。
+に対する代替検出機構の追加は不要である。詳細は
+[`chip-kernel-guidelines.md`](chip-kernel-guidelines.md) §8
+（静的解析＋GitHub ホステッド Apple Silicon 実機で確認済み）を参照。
 
 ## 実装タスク対応表
 
@@ -257,9 +257,9 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 - `rust-toolchain.toml` の設定変更
 - aarch64 生成コードゲートの実装（Issue 起票はユーザー承認制のため本
   タスクでは起票せず、上表の提案に留める）
-- Issue #467（PR #558）・Issue #468（PR #559）のマージ後に確定する
-  参照パス（`docs/design/simd-codegen-guard.md`・
-  `chip-kernel-guidelines.md` §7 の番号整理）
+- Issue #467（PR #558）のマージ後に確定する参照パス
+  （`docs/design/simd-codegen-guard.md`）。Issue #468 側
+  （`chip-kernel-guidelines.md` §8 の番号整理）は整理済み
 - Apple 実機での intrinsics 生成コード実測
 
 ## 参照
