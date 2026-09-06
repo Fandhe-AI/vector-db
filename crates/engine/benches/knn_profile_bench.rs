@@ -948,11 +948,13 @@ fn observed_arm_label(
 /// DISTANCE（`sql::hnsw_cache` の `Subset` 形状）を発火させ、ANN（マスク付き
 /// 探索）と plain scan のどちらが選ばれたかを [`observed_arm_label`] で分類する。
 ///
-/// `Subset` 形状は索引を構築しない（`sql::hnsw_cache::prepare_subset` は常に
-/// `FullScan` へ縮退する。`hnsw_subset` 経路の索引再利用は #410 の対象外の
-/// ままであることのポインタ）ため、同一 `EngineCore` でまずフィルタなし
-/// クエリを 1 回発行して `FullVisible` 形状の索引を warm したうえで WHERE
-/// クエリを計測する。
+/// `Subset` 形状は自身では索引を構築しない（`sql::hnsw_cache::prepare_subset`。
+/// 既存の索引が `Ready`／`NeedOverlay` であればその base を再利用し per-query
+/// オーバーレイを計算して `Indexed` を返す。`Lookup::Miss`／
+/// `BuildFailedThisGeneration`——利用可能な索引が無い場合——のみ `FullScan` へ
+/// 縮退する）ため、同一 `EngineCore` でまずフィルタなしクエリを 1 回発行して
+/// `FullVisible` 形状の索引を warm し、`Subset` 経路が再利用できる base を
+/// 用意したうえで WHERE クエリを計測する。
 fn run_visible_ratio_sweep(
     knn_engine: harness::bench_engine::BenchEngine,
     dim: usize,
@@ -1141,6 +1143,21 @@ fn run_visible_ratio_sweep(
             "COUNT(*) value mismatch: expected {total_rows}, got {count_value}"
         ));
     }
+    // `builds_delta` 契約違反（Subset 形状が索引を再構築した）は、後続の
+    // S0_hot_* median/raw 出力より前に検査する（Cursor Bugbot 指摘。契約
+    // 違反時に測定値だけがログへ書かれ、失敗理由が読み取れなくなることを
+    // 防ぐ。`observed_arm_label` 分類・他カウンタの出力は builds_delta が
+    // 健全であることを前提にしてよいため、この検査だけを前倒しする）。
+    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+        let builds_delta = stats_after_subset
+            .builds
+            .saturating_sub(stats_before_subset.builds);
+        if builds_delta > 0 {
+            fail_closed(format!(
+                "Subset 形状は索引を再構築しない契約のはずが builds={builds_delta} を観測した（モジュール冒頭コメント参照）"
+            ));
+        }
+    }
 
     // --- 出力（fail-closed 検証をすべて終えたここまでの間、測定値は一切
     // println! していない。既定経路 main() と同じ契約）。---------------------
@@ -1209,9 +1226,8 @@ fn run_visible_ratio_sweep(
         // `HnswIndexCacheStats`（`sql::hnsw_cache`）は `pub(crate)` モジュール
         // 配下のため型名を bench 側に書けない（`observed_arm_label` 上部の
         // コメント参照）。フィールドごとの差分を個別のローカル変数に留める。
-        let builds_delta = stats_after_subset
-            .builds
-            .saturating_sub(stats_before_subset.builds);
+        // `builds_delta` の契約違反検査は既に上（`計測外での結果検証`）で
+        // 完了済み。
         let subset_searches_delta = stats_after_subset
             .subset_searches
             .saturating_sub(stats_before_subset.subset_searches);
@@ -1227,10 +1243,24 @@ fn run_visible_ratio_sweep(
         let fallbacks_delta = stats_after_subset
             .fallbacks
             .saturating_sub(stats_before_subset.fallbacks);
+        // `BENCH_KNN_PROFILE_ENGINE=hnsw` では 4 カウンタ全 0 は「このクエリが
+        // Subset 系のいずれの経路も通らなかった」ことを意味し、
+        // brute_force エンジンの `n/a` とは区別すべき vacuous な計測である
+        // （Cursor Bugbot 指摘。ラベルだけ `n/a (brute_force engine)` と出力
+        // されるとスイープが誤って green のまま通過してしまう）。
+        if subset_searches_delta == 0
+            && plain_scans_delta == 0
+            && mask_splits_graph_delta == 0
+            && masked_short_delta == 0
+        {
+            fail_closed(
+                "BENCH_KNN_PROFILE_ENGINE=hnsw だが Subset 系カウンタ（subset_searches/plain_scans/mask_splits_graph/masked_short）が全て 0 だった（vacuous な計測。hnsw_cache の適用条件から外れている可能性）"
+                    .to_string(),
+            );
+        }
         println!(
-            "knn_profile_bench: hnsw_stats(subset_delta) builds={} subset_searches={} plain_scans={} \
+            "knn_profile_bench: hnsw_stats(subset_delta) subset_searches={} plain_scans={} \
              mask_splits_graph={} masked_short={} fallbacks={}",
-            builds_delta,
             subset_searches_delta,
             plain_scans_delta,
             mask_splits_graph_delta,
@@ -1246,11 +1276,6 @@ fn run_visible_ratio_sweep(
                 masked_short_delta,
             )
         );
-        if builds_delta > 0 {
-            fail_closed(format!(
-                "Subset 形状は索引を再構築しない契約のはずが builds={builds_delta} を観測した（モジュール冒頭コメント参照）"
-            ));
-        }
     } else {
         println!(
             "knn_profile_bench: arm expected={expected_label} observed=n/a (brute_force engine)"
