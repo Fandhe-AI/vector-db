@@ -487,6 +487,22 @@ impl<'a> JsonParser<'a> {
         self.expect(b'"')?;
         let mut out = String::new();
         loop {
+            // エスケープなしの区間はバイト単位ではなく UTF-8 文字列スライスとして
+            // まとめて追記する（`"`／`\\` は ASCII のみが取り得るバイト値のため、
+            // 直前の区間の開始位置から現在位置までは常にコードポイント境界に
+            // 揃っており、有効な UTF-8 部分文字列として安全に切り出せる）。
+            let run_start = self.pos;
+            loop {
+                match self.peek() {
+                    Some(b'"') | Some(b'\\') | None => break,
+                    Some(_) => self.pos += 1,
+                }
+            }
+            if self.pos > run_start {
+                let slice = std::str::from_utf8(&self.bytes[run_start..self.pos])
+                    .map_err(|_| ChipError::ParseFailure("invalid utf-8 in string".to_string()))?;
+                out.push_str(slice);
+            }
             let b = self
                 .bump()
                 .ok_or_else(|| ChipError::ParseFailure("unterminated string".to_string()))?;
@@ -532,11 +548,7 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
-                other => {
-                    // 入力全体は UTF-8 前提（呼び出し元が String として渡す）。
-                    // マルチバイト文字はバイト単位でそのまま転写する。
-                    out.push(other as char);
-                }
+                _ => unreachable!("run loop only stops at '\"', '\\\\', or end of input"),
             }
         }
         Ok(out)

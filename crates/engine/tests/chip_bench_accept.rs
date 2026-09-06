@@ -197,6 +197,16 @@ fn parse_json_handles_nested_objects() {
 }
 
 #[test]
+fn parse_json_preserves_non_ascii_utf8_in_unescaped_strings() {
+    // 非エスケープ区間はバイト単位で `char` へ変換せず UTF-8 文字列スライスの
+    // まま保持する契約（codex-review 指摘。crates/engine/benches/harness/chip.rs）。
+    let text = r#"{"label":"日本語","mixed":"a日b語c"}"#;
+    let value = parse_json(text).unwrap();
+    assert_eq!(value.get("label").unwrap().as_str(), Some("日本語"));
+    assert_eq!(value.get("mixed").unwrap().as_str(), Some("a日b語c"));
+}
+
+#[test]
 fn parse_json_rejects_invalid_input() {
     assert!(parse_json("{").is_err());
     assert!(parse_json("").is_err());
