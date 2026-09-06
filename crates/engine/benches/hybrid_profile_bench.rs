@@ -787,7 +787,12 @@ fn main() {
          (set BENCH_HYBRID_PROFILE_ROUNDS=5..50 to override; set BENCH_DEDICATED_ENV=1 to \
          self-report a dedicated measurement environment)"
     );
-    let dedicated_env = std::env::var_os("BENCH_DEDICATED_ENV").is_some();
+    // 値の中身を確認せず存在のみで判定すると "0" や空文字でも専有環境扱いになる
+    // ため、他ベンチ（sql_c1_bench.rs・*_wire_profile_bench.rs）と同じ厳密一致
+    // 契約（trim 後 "1" のときのみ true）に揃える（codex-review P2 指摘・PR #556）。
+    let dedicated_env = std::env::var("BENCH_DEDICATED_ENV")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
     if !dedicated_env {
         println!(
             "hybrid_profile: BENCH_DEDICATED_ENV not set — the following baseline numbers are \

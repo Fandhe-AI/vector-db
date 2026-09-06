@@ -304,12 +304,12 @@ fn main() {
 
     let iterations_per_stage =
         config.warmup_iterations() as usize + config.measured_iterations() as usize;
-    let mut cursor: usize = 0;
+    // ラウンド間の環境ノイズ帯判定（T1p の中央値ばらつき）にクエリ内容差が
+    // 混入しないよう、全ラウンドで同一のクエリ部分集合（先頭 iterations_per_stage 件）
+    // を測定する（codex-review P2 指摘・PR #556）。
+    let round_start: usize = 0;
 
     for round in 1..=rounds {
-        let round_start = cursor;
-        cursor = (cursor + iterations_per_stage) % QUERY_POOL;
-
         // T1p: engine 内 hybrid 経路（直接 API・事前構築 SparseIndex）。
         let mut t1p_cursor = round_start;
         let mut t1p_ids_all: Vec<Vec<u64>> = Vec::with_capacity(iterations_per_stage);
