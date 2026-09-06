@@ -54,7 +54,7 @@ run() {
     expect_dim_args=(--expect-dim "$DIM")
   fi
   if ! "$V" "$B/run.py" --rows-file "$1" --queries-file "$QUERIES" --docs-file "$ROWS_JSONL" \
-    --out-dir "$RESULTS_DIR" --db "$2" --config "$3" "${expect_dim_args[@]}" \
+    --out-dir "$RESULTS_DIR" --db "$2" --config "$3" "${expect_dim_args[@]+"${expect_dim_args[@]}"}" \
     > "$LOGS_DIR/$2_$3.log" 2>&1; then
     echo "FAILED $2 $3 (see $LOGS_DIR/$2_$3.log)"
     FAILED+=("$2/$3")
