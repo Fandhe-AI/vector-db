@@ -102,6 +102,12 @@ def _scan_docs_dim_streaming(jsonl_path: str) -> tuple[int | None, str | None]:
     異なる fixture（dim 混在）を `--expect-dim` 検査が見逃していた。数万行でも
     メモリに全件展開しない行単位読み込みを維持する）。
 
+    `embedding` が欠落・null のレコードは黙って読み飛ばさず、行番号付きエラー
+    として拒否する（codex-review P2 指摘・PR #557。従来は `continue` で除外して
+    おり、queries を参照しない mysql アダプタ等では欠落を検知できないまま
+    adapter 呼び出し・結果 JSON の書き出しまで進んでしまっていた。README の
+    「docs／queries の埋め込み長を fail-closed に検証する」契約に合わせる）。
+
     戻り値は `(確認できた次元, 不一致時のエラー理由)`。次元を 1 件も確認できな
     かった場合は `(None, None)` を返す（呼び出し側で「取得失敗」として扱う）。
     """
@@ -116,7 +122,7 @@ def _scan_docs_dim_streaming(jsonl_path: str) -> tuple[int | None, str | None]:
             doc = _json.loads(line)
             embedding = doc.get("embedding")
             if embedding is None:
-                continue
+                return dim, f"docs line {lineno} is missing embedding (null or absent)"
             current = len(embedding)
             if dim is None:
                 dim = current
@@ -134,13 +140,18 @@ def _scan_queries_dim(queries: list[dict]) -> tuple[int | None, str | None]:
     `queries[0]` のみを見ており、後続クエリだけ次元が異なる fixture の
     取り違えを見逃していた）。
 
+    `embedding` が欠落・null のクエリは黙って読み飛ばさず、インデックス付き
+    エラーとして拒否する（codex-review P2 指摘・PR #557。`_scan_docs_dim_streaming`
+    と同型の理由。README の「docs／queries の埋め込み長を fail-closed に検証
+    する」契約に合わせる）。
+
     戻り値は `(確認できた次元, 不一致時のエラー理由)`。
     """
     dim: int | None = None
     for i, q in enumerate(queries):
         embedding = q.get("embedding")
         if embedding is None:
-            continue
+            return dim, f"queries[{i}] is missing embedding (null or absent)"
         current = len(embedding)
         if dim is None:
             dim = current
