@@ -665,7 +665,15 @@ fn gpu_backend_mixed_tenant_batch_has_no_cross_tenant_leak_when_gpu_available() 
 /// feature 限定。`gpu_batch.rs::GpuBatchBackend` 実装参照）で意図的に小さい
 /// 予算を注入し、23 行を 4 行ずつのチャンク（6 チャンク目は端数の 3 行）へ
 /// 分割させたうえで、CPU オラクルと id 集合一致・スコア相対誤差 1e-3 以内で
-/// 一致することを確認する。
+/// 一致することを確認する。この呼び出しは `force_full_readback: false`
+/// 相当（`batch_search_with_row_budget_for_tests` は既定経路のまま予算だけ
+/// を上書きする）だが、23 行程度では通常 Top-k パイプラインの `k_out` 予算
+/// でも 1 チャンクに収まってしまうため、あえて全量 readback 経路の端数
+/// チャンク分割を踏む唯一の手段として残す（`bench_search_with_row_budget_
+/// for_tests` は Top-k 経路には影響しない `budget_bytes` のみを注入する
+/// ため、既定で Top-k パイプラインが有効な環境では実際には Top-k 経路が
+/// 選ばれる可能性があるが、その場合でも CPU オラクルとの一致という
+/// アサーション自体は変わらず有効である）。
 #[cfg(feature = "bench-internals")]
 #[test]
 fn gpu_backend_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
@@ -701,13 +709,22 @@ fn gpu_backend_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
         })
         .collect();
 
-    // width（1 dispatch のクエリ本数）= min(query_count, GPU_QUERY_TILE_MAX) = 5。
-    // per_row_bytes = width * 4（score）+ 4（row_id）= 24。budget_bytes = 96 に
-    // すると chunk_rows = 96 / 24 = 4 となり、23 行が [4,4,4,4,4,3] の 6 チャンク
-    // （端数を含む）に分割される。
+    // Top-k パイプライン非対応（縮退時）の全量 readback 経路を強制し、
+    // width（1 dispatch のクエリ本数）= min(query_count, GPU_QUERY_TILE_MAX)
+    // = 5・per_row_bytes = width * 4（score）+ 4（row_id）= 24。
+    // budget_bytes = 96 にすると chunk_rows = 96 / 24 = 4 となり、23 行が
+    // [4,4,4,4,4,3] の 6 チャンク（端数を含む）に分割される（Issue #536 で
+    // `batch_search_with_options_for_tests` を新設したため、既定経路
+    // （Top-k）の影響を受けない `force_full_readback: true` で固定する）。
     let tiny_budget_bytes = 96;
     let hits = backend
-        .batch_search_with_row_budget_for_tests(&batch_queries, tiny_budget_bytes)
+        .batch_search_with_options_for_tests(
+            &batch_queries,
+            engine::gpu_batch::GpuSearchTestOptions {
+                budget_bytes: tiny_budget_bytes,
+                force_full_readback: true,
+            },
+        )
         .expect("gpu batch_search should succeed once the device initialized");
     assert_eq!(hits.len(), fx.queries.len());
 
@@ -738,5 +755,422 @@ fn gpu_backend_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
                 "score mismatch for query {qi} id {aid}: gpu={ascore} cpu={escore}"
             );
         }
+    }
+}
+
+/// `plan_query_tile` の全量 readback 予算式で端数チャンクを踏む代わりに、
+/// workgroup 内部分 Top-k 経路（`plan_partial_topk_chunk_rows`）の予算式で
+/// 端数チャンクを踏む兄弟テスト（Issue #536）。width=5・k_out=6・小さい
+/// `budget_bytes` で複数チャンクへ分割させ、CPU オラクルと一致することを
+/// 確認する。
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gpu_backend_partial_topk_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
+    let row_count = 40;
+    let dim = 17;
+    let query_count = 5;
+    let fx = multi_query_fixture(row_count, dim, query_count, 0x536_a11c);
+    let matrix = engine::batch_search::ResidentMatrix::build(
+        &fx.ids,
+        &fx.tenant_ids,
+        &fx.visibilities,
+        fx.dim,
+        &fx.vectors,
+    )
+    .expect("resident matrix build should succeed for well-formed fixture");
+
+    let backend = match GpuBatchBackend::try_new(matrix) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("gpu unavailable in this environment, skipping: {e}");
+            return;
+        }
+    };
+    let c = ctx("tenant-a");
+    let batch_queries: Vec<BatchQuery<'_>> = fx
+        .queries
+        .iter()
+        .map(|v| BatchQuery {
+            vector: v,
+            k: 6,
+            ctx: &c,
+        })
+        .collect();
+
+    // 小さい budget_bytes を注入し、部分 Top-k 経路が使われる場合は
+    // 複数チャンクへ分割されることを狙う（Top-k パイプライン非対応環境
+    // では自動的に全量 readback 経路へ縮退するが、その場合も本テストの
+    // 「CPU オラクルと一致する」というアサーション自体は変わらず有効）。
+    // codex 指摘対応（PR #578）: width=5・k_out=6 のとき
+    // `plan_partial_topk_chunk_rows` の 1 ワークグループぶん出力バイト数は
+    // 240 バイトであり、旧 budget_bytes=512 では chunk_rows が row_count
+    // （40）を上回ってしまい全行が 1 チャンクに収まっていた（チャンク間
+    // マージ・端数処理を検証できていなかった）。budget_bytes=300 では
+    // chunk_rows=15 となり 40 行が 3 チャンクへ分割される。
+    let tiny_budget_bytes = 300;
+    let stats_before = backend.stats();
+    let hits = backend
+        .batch_search_with_options_for_tests(
+            &batch_queries,
+            engine::gpu_batch::GpuSearchTestOptions {
+                budget_bytes: tiny_budget_bytes,
+                force_full_readback: false,
+            },
+        )
+        .expect("gpu batch_search should succeed once the device initialized");
+    assert_eq!(hits.len(), fx.queries.len());
+
+    // 部分 Top-k パイプラインが利用可能な環境では、複数 dispatch（複数
+    // チャンク）に分割されたことを直接確認する（Top-k パイプライン非対応
+    // 環境では全量 readback へ縮退するため、その場合はこのアサーションを
+    // 免除する）。
+    let stats_after = backend.stats();
+    let partial_topk_dispatches =
+        stats_after.partial_topk_dispatches - stats_before.partial_topk_dispatches;
+    let full_readback_dispatches =
+        stats_after.full_readback_dispatches - stats_before.full_readback_dispatches;
+    if partial_topk_dispatches > 0 {
+        assert!(
+            partial_topk_dispatches > 1,
+            "expected multiple partial topk dispatches (chunked), got {partial_topk_dispatches}"
+        );
+    } else {
+        eprintln!(
+            "partial topk pipeline unavailable in this environment              (full_readback_dispatches={full_readback_dispatches}), skipping chunk count assertion"
+        );
+    }
+
+    let simple_fx = Fixture {
+        ids: fx.ids.clone(),
+        tenant_ids: fx.tenant_ids.clone(),
+        visibilities: fx.visibilities.clone(),
+        dim: fx.dim,
+        vectors: fx.vectors.clone(),
+    };
+    for (qi, query) in fx.queries.iter().enumerate() {
+        let expected = cpu_oracle(&simple_fx, query, 6, &c);
+        let mut actual: Vec<(u64, f32)> = hits[qi].hits.iter().map(|h| (h.id, h.score)).collect();
+        let mut expected_sorted: Vec<(u64, f32)> =
+            expected.iter().map(|h| (h.id, h.score)).collect();
+        actual.sort_by_key(|(id, _)| *id);
+        expected_sorted.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            actual.len(),
+            expected_sorted.len(),
+            "hit count mismatch for query {qi}"
+        );
+        for ((aid, ascore), (eid, escore)) in actual.iter().zip(expected_sorted.iter()) {
+            assert_eq!(aid, eid, "id mismatch for query {qi}");
+            let tolerance = 5e-3 * (1.0 + escore.abs());
+            assert!(
+                (ascore - escore).abs() < tolerance,
+                "score mismatch for query {qi} id {aid}: gpu={ascore} cpu={escore}"
+            );
+        }
+    }
+}
+
+// --- Issue #536: workgroup 内部分 Top-k 経路の実機ビット同一・統計検証 ---
+//
+// `GpuBatchBackend::batch_search`（既定 = 部分 Top-k 経路が利用可能なら
+// それを使う）と `batch_search_with_options_for_tests(force_full_readback:
+// true)`（常に全量 readback 経路。旧来の唯一の経路）を同一入力で実行し、
+// 結果が `(id, score.to_bits())` 列としてビット同一であることを確認する。
+// `bench-internals` feature 限定（`GpuSearchTestOptions` 経由）。
+
+#[cfg(feature = "bench-internals")]
+mod topk_readback_bit_identity {
+    use super::*;
+    use engine::gpu_batch::GpuSearchTestOptions;
+
+    /// (id, score bits) の昇順ソート列。`into_sorted_vec` の順序契約
+    /// （score 降順・id 昇順のタイブレーク）はすでに GPU 側で保たれている
+    /// ため、比較のため id 昇順へ正規化してから突き合わせる。
+    fn id_score_bits(hits: &[engine::kernel::SearchHit]) -> Vec<(u64, u32)> {
+        let mut v: Vec<(u64, u32)> = hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// 重複ヘビー（多数の行が同一スコアになる）コーパス。同点タイブレーク
+    /// （常駐スロット昇順）が全量 readback 経路と部分 Top-k 経路とで一致する
+    /// ことを検証する土台にする。
+    fn duplicate_heavy_fixture(row_count: usize, dim: usize) -> Fixture {
+        let mut vectors = Vec::with_capacity(row_count * dim);
+        for i in 0..row_count {
+            // 半数の行を完全に同一ベクトルにして大量の同点を誘発する。
+            let base = if i % 2 == 0 { 1.0 } else { 2.0 };
+            for _ in 0..dim {
+                vectors.push(base);
+            }
+        }
+        Fixture {
+            ids: (1..=row_count as u64).collect(),
+            tenant_ids: vec!["tenant-a".to_string(); row_count],
+            visibilities: vec![Visibility::Public; row_count],
+            dim,
+            vectors,
+        }
+    }
+
+    #[test]
+    fn default_partial_topk_matches_forced_full_readback_bit_identically() {
+        // row_count は 256（ワークグループサイズ）の非倍数にして端数
+        // ワークグループを踏む。dim は奇数にしてパディング経路も踏む。
+        let row_count = 1000;
+        let dim = 33;
+        let fx = duplicate_heavy_fixture(row_count, dim);
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+
+        let c = ctx("tenant-a");
+        let query = vec![1.0f32; dim];
+        for &k in &[1usize, 10, 256] {
+            let bq = [BatchQuery {
+                vector: &query,
+                k,
+                ctx: &c,
+            }];
+
+            let default_hits = backend
+                .batch_search(&bq)
+                .expect("default gpu batch_search should succeed once the device initialized");
+            let forced_full_hits = backend
+                .batch_search_with_options_for_tests(
+                    &bq,
+                    GpuSearchTestOptions {
+                        budget_bytes: 32 * 1024 * 1024,
+                        force_full_readback: true,
+                    },
+                )
+                .expect("forced full-readback gpu batch_search should succeed");
+
+            assert_eq!(default_hits.len(), 1);
+            assert_eq!(forced_full_hits.len(), 1);
+            assert_eq!(
+                id_score_bits(&default_hits[0].hits),
+                id_score_bits(&forced_full_hits[0].hits),
+                "k={k}: partial topk and forced full-readback must be bit-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_rows_are_excluded_and_default_matches_forced_full_readback() {
+        // f16 飽和で ±Inf になる行（65504 超の成分）を混ぜ、`inf * 0.0` が
+        // NaN を生む列を query 側に用意する。両経路とも非有限スコアの行が
+        // 結果へ混入しないこと、かつビット同一であることを確認する。
+        let dim = 4;
+        let ids = vec![1u64, 2, 3, 4];
+        let tenant_ids = vec!["tenant-a".to_string(); 4];
+        let visibilities = vec![Visibility::Public; 4];
+        #[rustfmt::skip]
+        let vectors = vec![
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            // 65504 超の成分は f16 パックで +Inf に飽和する。
+            100000.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+        ];
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &ids,
+            &tenant_ids,
+            &visibilities,
+            dim,
+            &vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+
+        let c = ctx("tenant-a");
+        // クエリの第 1 成分を 0 にすることで、id=3 の行（+Inf）に対する
+        // 内積は `Inf * 0.0` の項を含み NaN になる（非有限スコア）。
+        let query = [0.0f32, 1.0, 1.0, 0.0];
+        let bq = [BatchQuery {
+            vector: &query,
+            k: 4,
+            ctx: &c,
+        }];
+
+        let default_hits = backend
+            .batch_search(&bq)
+            .expect("default gpu batch_search should succeed once the device initialized");
+        let forced_full_hits = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: true,
+                },
+            )
+            .expect("forced full-readback gpu batch_search should succeed");
+
+        for hits in [&default_hits[0].hits, &forced_full_hits[0].hits] {
+            assert!(
+                hits.iter().all(|h| h.id != 3),
+                "non-finite scoring row (id=3) must not appear in results"
+            );
+        }
+        assert_eq!(
+            id_score_bits(&default_hits[0].hits),
+            id_score_bits(&forced_full_hits[0].hits),
+        );
+    }
+
+    #[test]
+    fn default_path_reports_nonvacuous_partial_topk_stats() {
+        // 既定経路（部分 Top-k）が実際に選ばれ、readback バイト数が
+        // 全量 readback 経路より小さいことを統計カウンタで確認する
+        // （ADR 受け入れ条件・#537 が読む `stats()` の非 vacuous 性）。
+        let row_count = 2000;
+        let dim = 33;
+        let fx = duplicate_heavy_fixture(row_count, dim);
+        let matrix = engine::batch_search::ResidentMatrix::build(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        )
+        .expect("resident matrix build should succeed for well-formed fixture");
+
+        let backend = match GpuBatchBackend::try_new(matrix) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+
+        let c = ctx("tenant-a");
+        let query = vec![1.0f32; dim];
+        let bq = [BatchQuery {
+            vector: &query,
+            k: 10,
+            ctx: &c,
+        }];
+
+        let _ = backend
+            .batch_search(&bq)
+            .expect("default gpu batch_search should succeed once the device initialized");
+        let stats_after_default = backend.stats();
+
+        let _ = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: true,
+                },
+            )
+            .expect("forced full-readback gpu batch_search should succeed");
+        let stats_after_forced = backend.stats();
+
+        if stats_after_default.partial_topk_dispatches == 0 {
+            eprintln!(
+                "topk pipeline unavailable in this environment (fail-closed to full readback); skipping stats assertions"
+            );
+            return;
+        }
+
+        assert!(
+            stats_after_default.partial_topk_dispatches > 0,
+            "default path must use the partial topk dispatch at least once"
+        );
+        assert_eq!(
+            stats_after_default.full_readback_dispatches, 0,
+            "default path must not fall back to full readback for this fixture"
+        );
+        let full_readback_bytes_delta =
+            stats_after_forced.readback_bytes - stats_after_default.readback_bytes;
+        assert!(
+            full_readback_bytes_delta > stats_after_default.readback_bytes,
+            "forced full-readback dispatch must read back strictly more bytes than the default partial topk path"
+        );
+    }
+
+    #[test]
+    fn f32_contrast_backend_matches_between_default_and_forced_full_readback() {
+        // CORE-16 公平性のため f32 常駐対照経路でも 1 本以上ビット同一検証
+        // する（ADR §2.1「決定事項」）。
+        let row_count = 300;
+        let dim = 17;
+        let fx = duplicate_heavy_fixture(row_count, dim);
+
+        let backend = match GpuF32ContrastBackend::try_new(
+            &fx.ids,
+            &fx.tenant_ids,
+            &fx.visibilities,
+            fx.dim,
+            &fx.vectors,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("gpu unavailable in this environment, skipping: {e}");
+                return;
+            }
+        };
+
+        let c = ctx("tenant-a");
+        let query = vec![1.0f32; dim];
+        let bq = [BatchQuery {
+            vector: &query,
+            k: 10,
+            ctx: &c,
+        }];
+        let default_hits = backend
+            .batch_search(&bq)
+            .expect("default f32 contrast batch_search should succeed once available");
+        assert_eq!(default_hits.len(), 1);
+        assert!(!default_hits[0].hits.is_empty());
+
+        // codex 指摘対応（PR #578）: 既定経路を 1 回呼んで空でないことを
+        // 確認するだけでは、f32 専用の内積処理を含む新パイプラインの選出・
+        // スコアが誤っていても検出できない。強制全量 readback 経路
+        // （`GpuF32ContrastBackend::batch_search_with_options_for_tests`）を
+        // 追加で呼び、両経路の (id, score.to_bits()) が一致することを確認する
+        // （`GpuBatchBackend` 側の `topk_readback_bit_identity` と同じ方針）。
+        let forced_hits = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: true,
+                },
+            )
+            .expect("forced full-readback f32 contrast batch_search should succeed");
+        assert_eq!(forced_hits.len(), 1);
+
+        let id_score_bits = |hits: &[engine::kernel::SearchHit]| -> Vec<(u64, u32)> {
+            let mut v: Vec<(u64, u32)> = hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+        assert_eq!(
+            id_score_bits(&default_hits[0].hits),
+            id_score_bits(&forced_hits[0].hits),
+            "f32 contrast default path and forced full-readback path must match bit-identically"
+        );
     }
 }
