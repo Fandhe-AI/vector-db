@@ -73,6 +73,21 @@ fn try_accumulate_budget(current: usize, add: usize, cap: usize) -> Result<usize
     Ok(next)
 }
 
+/// `Computed` 列（式）が返した所有済みベクトルを累計予算へ計上する
+/// （codex-review P1 指摘対応: `Computed` 列のベクトル結果は `try_clone_embedding_for_budget`
+/// を通らないため、対策なしでは `VECTOR` 列直接投影と異なり `MAX_SCAN_RESULT_BYTES` を
+/// 迂回して無制限にメモリを蓄積できてしまう。`vec_div`/`vec_mul` 等 embedding と同じ
+/// 次元のベクトルを返す組み込み関数の結果を対象とする）。
+fn try_accumulate_vector_budget(
+    vector: Vec<f32>,
+    budget: &mut usize,
+    cap: usize,
+) -> Result<Vec<f32>, SqlSurfaceError> {
+    let bytes = vector.len().saturating_mul(std::mem::size_of::<f32>());
+    *budget = try_accumulate_budget(*budget, bytes, cap)?;
+    Ok(vector)
+}
+
 /// テキストセルの選択的複製（累計バイト量を確保前に検証。`String::try_reserve_exact`
 /// によりホスト側メモリ不足時も abort ではなく `Err` を返す）。
 fn try_alloc_text_for_budget(
@@ -235,11 +250,14 @@ pub(crate) fn execute_scan(
 
     // Issue #353 と同じく、`Computed` 列の式を行ループの外で 1 回だけステップ列
     // コンパイルする（行ループでの再帰評価をなくす）。
-    let computed_programs: Vec<Option<ExprProgram>> = bound
+    let computed_programs: Vec<Option<(ExprProgram, bool)>> = bound
         .projection
         .iter()
         .map(|col| match col {
-            ProjectedColumn::Computed { expr, .. } => Some(ExprProgram::compile(expr)),
+            ProjectedColumn::Computed { expr, .. } => Some((
+                ExprProgram::compile(expr),
+                udf_call::references_embedding(expr),
+            )),
             ProjectedColumn::Id | ProjectedColumn::Column { .. } => None,
         })
         .collect();
@@ -308,7 +326,17 @@ pub(crate) fn execute_scan(
                 continue;
             }
             for (expr, program) in bound.expr_filters.iter().zip(&bound.expr_filter_programs) {
-                let embedding: &[f32] = if udf_call::references_embedding(expr) {
+                let references_embedding = udf_call::references_embedding(expr);
+                // `dim == 0`（`VECTOR` 列が NULL。上記コメント参照）の行で embedding を
+                // 参照する式を評価すると、空スライスを実データと区別できず
+                // `vec_norm` 等が `0.0` を返し本来 NULL のはずの比較が意図せず
+                // マッチしてしまう（Cursor Bugbot 指摘）。SQL の NULL 比較は
+                // unknown → `WHERE` では偽と同義に扱われる契約に合わせ、embedding を
+                // 参照する式は NULL 行を評価せず無条件にこの行を除外する。
+                if references_embedding && dim == 0 {
+                    continue 'rows;
+                }
+                let embedding: &[f32] = if references_embedding {
                     match tier {
                         DecodeTier::Embedding => embedding_scratch.as_slice(),
                         DecodeTier::Fast | DecodeTier::DimAndScalar => {
@@ -385,23 +413,43 @@ pub(crate) fn execute_scan(
                         }
                     }
                     ProjectedColumn::Computed { .. } => {
-                        let program = computed_programs
+                        let (program, references_embedding) = computed_programs
                             .get(col_idx)
                             .and_then(|p| p.as_ref())
                             .ok_or_else(|| SqlSurfaceError::Internal {
                                 detail: "computed projection program missing at evaluation time"
                                     .to_string(),
                             })?;
-                        let embedding_for_eval: &[f32] = match tier {
-                            DecodeTier::Embedding => embedding_scratch.as_slice(),
-                            DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
-                        };
-                        match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
-                            ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
-                            ExprValue::Vector(v) => {
-                                cells.push(Cell::Vector(udf_call::into_owned_vector(v)?))
+                        // `dim == 0`（`VECTOR` 列が NULL）の行で embedding を参照する
+                        // 式を評価すると空スライスを実データと区別できず誤った数値
+                        // （例: `vec_norm` が `0.0`）を返してしまう（Cursor Bugbot
+                        // 指摘）。`ProjectedColumn::Column` の直接投影と同じく NULL を
+                        // 伝播させる。
+                        if *references_embedding && dim == 0 {
+                            cells.push(Cell::Null);
+                        } else {
+                            let embedding_for_eval: &[f32] = match tier {
+                                DecodeTier::Embedding => embedding_scratch.as_slice(),
+                                DecodeTier::Fast | DecodeTier::DimAndScalar => &[],
+                            };
+                            match program.eval(id, embedding_for_eval, &mut expr_scratch)? {
+                                ExprValue::Scalar(v) => cells.push(Cell::Float(v)),
+                                ExprValue::Vector(v) => {
+                                    // codex-review P1 指摘対応: `Computed` 列のベクトル
+                                    // 結果も `VECTOR` 列直接投影と同じ累計予算
+                                    // （`MAX_SCAN_RESULT_BYTES`）へ計上する。所有化
+                                    // （`into_owned_vector`）自体は `try_reserve_exact`
+                                    // 経由で単発の確保失敗には強いが、累計を見ないと
+                                    // 行数分の蓄積で予算を回避できてしまうため。
+                                    let owned = udf_call::into_owned_vector(v)?;
+                                    cells.push(Cell::Vector(try_accumulate_vector_budget(
+                                        owned,
+                                        &mut byte_budget,
+                                        MAX_SCAN_RESULT_BYTES,
+                                    )?));
+                                }
+                                ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                             }
-                            ExprValue::Bool(b) => cells.push(Cell::Bool(b)),
                         }
                     }
                 }
@@ -524,5 +572,156 @@ mod tests {
         let bound = bound_star_scan(3);
         let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// `vec_norm(embedding)` を投影する `Computed` 列を持つ `BoundScan` を組み立てる
+    /// （Cursor Bugbot 指摘の回帰テスト用ヘルパー）。
+    fn bound_scan_with_vec_norm_projection(limit: usize) -> BoundScan {
+        BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Computed {
+                    name: "n".to_string(),
+                    expr: udf_call::BoundExpr::Builtin {
+                        f: udf_call::BuiltinFn::VecNorm,
+                        args: vec![udf_call::BoundExpr::VectorRef],
+                    },
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit,
+        }
+    }
+
+    #[test]
+    fn computed_projection_is_null_for_unset_nullable_vector_column() {
+        // Cursor Bugbot 指摘の回帰テスト: `dim == 0`（NULL vector）の行で
+        // embedding を参照する `Computed` 式を評価すると、空スライスを実データと
+        // 区別できず `vec_norm` が `0.0` を返してしまっていた。正しくは
+        // `ProjectedColumn::Column` の直接投影と同じく `Cell::Null` を返す。
+        let path = unique_db_path("scan-computed-null-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[3.0, 4.0, 0.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let bound = bound_scan_with_vec_norm_projection(10);
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+
+        assert_eq!(result.rows.len(), 2);
+        let row1 = result.rows.iter().find(|r| r.id == 1).expect("row 1");
+        assert_eq!(row1.cells[1], Cell::Float(5.0));
+        let row2 = result.rows.iter().find(|r| r.id == 2).expect("row 2");
+        assert_eq!(
+            row2.cells[1],
+            Cell::Null,
+            "NULL vector 行の Computed 列は NULL を返すべき（0.0 に丸められてはならない）"
+        );
+    }
+
+    #[test]
+    fn where_expr_referencing_embedding_excludes_null_vector_rows() {
+        // Cursor Bugbot 指摘の回帰テスト: `WHERE vec_norm(embedding) = 0` は
+        // NULL vector 行（dim == 0）を「たまたま値が一致した」行として誤って
+        // マッチさせてはならない（SQL の NULL 比較は unknown → WHERE では偽）。
+        let path = unique_db_path("scan-where-null-vector");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[3.0, 4.0, 0.0]);
+        write_row_direct(&storage, "docs", "tenant-a", 2, &[]);
+
+        let expr = udf_call::BoundExpr::Binary {
+            op: udf_call::BinOp::Eq,
+            lhs: Box::new(udf_call::BoundExpr::Builtin {
+                f: udf_call::BuiltinFn::VecNorm,
+                args: vec![udf_call::BoundExpr::VectorRef],
+            }),
+            rhs: Box::new(udf_call::BoundExpr::Number(0.0)),
+        };
+        let program = ExprProgram::compile(&expr);
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![ProjectedColumn::Id],
+            metadata_filters: Vec::new(),
+            expr_filters: vec![expr],
+            expr_filter_programs: vec![program],
+            limit: 10,
+        };
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+
+        assert!(
+            result.rows.is_empty(),
+            "NULL vector 行が WHERE vec_norm(embedding) = 0 に誤ってマッチした: {:?}",
+            result.rows
+        );
+    }
+
+    #[test]
+    fn computed_vector_projection_accumulates_into_byte_budget() {
+        // codex-review P1 指摘の回帰テスト: `Computed` 列が返すベクトル結果
+        // （`vec_div(embedding, 1.0)`）は `VECTOR` 列直接投影と同じ累計予算
+        // （`MAX_SCAN_RESULT_BYTES`）を消費し、上限超過時は `54000` 相当の
+        // `payload_too_large` で拒否される必要がある。
+        let path = unique_db_path("scan-computed-vector-budget");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        let schema = nullable_vector_schema();
+        storage.create_table(&schema).expect("create table");
+        write_row_direct(&storage, "docs", "tenant-a", 1, &[1.0, 2.0, 3.0]);
+
+        let expr = udf_call::BoundExpr::Builtin {
+            f: udf_call::BuiltinFn::VecDiv,
+            args: vec![
+                udf_call::BoundExpr::VectorRef,
+                udf_call::BoundExpr::Number(1.0),
+            ],
+        };
+        let bound = BoundScan {
+            table: "docs".to_string(),
+            projection: vec![
+                ProjectedColumn::Id,
+                ProjectedColumn::Computed {
+                    name: "v".to_string(),
+                    expr,
+                },
+            ],
+            metadata_filters: Vec::new(),
+            expr_filters: Vec::new(),
+            expr_filter_programs: Vec::new(),
+            limit: 10,
+        };
+
+        let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+        let read_txn = storage.db().begin_read().expect("begin_read");
+
+        // 通常時（予算内）は成功する。
+        let result = execute_scan(&read_txn, &ctx, &schema, &bound).expect("scan should succeed");
+        assert_eq!(result.rows.len(), 1);
+
+        // 1 行あたりのベクトルサイズが `MAX_SCAN_RESULT_BYTES` を超える場合、
+        // `Computed` 列でも他セルと同様に拒否されることを確認する
+        // （budget ヘルパー自体の単体検証。行走査を経ずに直接ヘルパーを叩く）。
+        let huge = vec![0.0f32; (MAX_SCAN_RESULT_BYTES / std::mem::size_of::<f32>()) + 1];
+        let mut budget = 0usize;
+        let err = try_accumulate_vector_budget(huge, &mut budget, MAX_SCAN_RESULT_BYTES)
+            .expect_err("oversized vector must be rejected before accumulation");
+        match err {
+            SqlSurfaceError::PayloadTooLarge { .. } => {}
+            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        }
     }
 }
