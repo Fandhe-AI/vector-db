@@ -380,6 +380,21 @@ else
 endif
 
 # --------------------------------------------------
+# チップ別手動計測（Issue #469。crates/engine/benches/chip_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-chip
+bench-chip: ## Issue #469（チップ別手動計測。bench-dot-kernel・bench-knn-profile・feature_bench〔dim 128／768〕を 1 ワークロード = 1 プロセスでラウンドロビン交互計測し CPU 情報付き summary.json を出力する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。BENCH_CHIP_ROUNDS=<1-50>〔既定 5。5 未満は参考値として自己ラベル〕・BENCH_CHIP_WORKLOADS=<dot_kernel,knn_profile,feature_128,feature_768 の部分集合。既定は全 4 種〕・BENCH_CHIP_OUT_DIR〔既定 target/bench-chip/<unix-ts>〕・BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる。実測手順は README「チップ別カーネルの実測手順」参照）
+ifdef HAS_CARGO
+	cargo bench --bench dot_kernel_bench -p engine --no-run
+	cargo bench --bench knn_profile_bench -p engine --no-run
+	cargo build --release -p engine --example feature_bench
+	cargo bench --bench chip_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-chip をスキップ"
+endif
+
+# --------------------------------------------------
 # ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
 # --------------------------------------------------
 

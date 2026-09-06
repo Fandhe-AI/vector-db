@@ -47,6 +47,7 @@
 pub mod ab;
 pub mod accept;
 pub mod bench_engine;
+pub mod chip;
 #[cfg(feature = "contrast-bench")]
 pub mod contrast;
 pub mod dot_kernel;
