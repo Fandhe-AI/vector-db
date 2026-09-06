@@ -22,3 +22,12 @@ path = "src/main.rs"
 # ワークスペース内 private クレートへの path 依存（バージョン指定なし）。
 # deny.toml の [bans] allow-wildcard-paths = true が本パターンを許容する。
 engine = { path = "../engine" }
+
+[[bench]]
+# Issue #463: `vector_knn` 786µs（docs/design/crossdb-bench.md）の wire／SQL 表層／
+# 距離カーネル・Top-k 内訳を切り分ける実測入口。harness = false / test = false は
+# engine 側の性能系ベンチ（`crates/engine/benches/knn_profile_bench.rs` 等）と
+# 同一方針（外部依存追加なしの自作計測プロトコル・手動実行専用・make ci 対象外）。
+name = "knn_wire_profile_bench"
+harness = false
+test = false
