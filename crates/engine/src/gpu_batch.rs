@@ -56,6 +56,15 @@ use crate::policy::PolicyContext;
 const GPU_SCORE_BUFFER_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 const GPU_WORKGROUP_SIZE: u32 = 256;
 
+/// 1 dispatch にタイル化できる最大クエリ本数（Issue #532: 1 dispatch = 1
+/// クエリだった旧構造を、1 dispatch = 複数クエリへ変更する核となる定数）。
+/// [`DOT_SHADER_WGSL`]/[`DOT_SHADER_F32_WGSL`] のレジスタ配列
+/// `acc: array<f32, QUERY_TILE_MAX>` のサイズと一致していなければならない
+/// （`tests::dot_shader_wgsl_query_tile_max_matches_host_constant` で機械検証）。
+/// 値はレジスタ圧・タイル幅のトレードオフに基づく実装既定値であり、spec 由来の
+/// 数値ではない。
+const GPU_QUERY_TILE_MAX: usize = 16;
+
 /// GPU の submit 完了・readback・error scope 完了を待つ上限時間
 /// （codex/Bugbot 指摘対応: `PollType::wait_indefinitely()` と終了条件のない
 /// ループは、Metal 等でコマンド完了通知が停止した場合に永久に戻らず、
@@ -74,22 +83,37 @@ const GPU_POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(100
 const MAX_WORKGROUPS_PER_DIMENSION_FALLBACK: u32 = 65535;
 
 /// WGSL: 常駐行列の 1 行（f16 2 要素/u32 パック。`batch_search.rs::pack_f16x2`
-/// と同一表現）と 1 クエリベクトルの内積を計算する。`unpack2x16float` は WGSL
-/// コア機能（`shader-f16` 拡張は不要）で、`batch_search.rs::unpack_f16x2` と
-/// 同じビット解釈をとる（同モジュールのドキュメンテーションコメント参照）。
+/// と同一表現）と、1 dispatch にタイル化した最大 [`GPU_QUERY_TILE_MAX`] 本の
+/// クエリベクトルの内積を計算する（Issue #532: 1 dispatch = 1 クエリだった
+/// 旧構造を、1 dispatch = 複数クエリへ変更。CORE-6・8・16 ポインタ）。
+/// `unpack2x16float` は WGSL コア機能（`shader-f16` 拡張は不要）で、
+/// `batch_search.rs::unpack_f16x2` と同じビット解釈をとる。
 ///
-/// `params.row_stride` は「1 行あたりの `packed_rows` 要素数」（= `dim.div_ceil(2)`）
-/// を表す。[`DOT_SHADER_F32_WGSL`]（Issue #234・CORE-16 対照経路）と bind group
+/// 各スレッド（行 1 つを担当）は `packed_rows` の当該行を 1 回だけ読み、
+/// レジスタ配列 `acc`（要素数 `QUERY_TILE_MAX`。共有メモリは使わない設計上の
+/// 簡略化。§9 申し送り）へタイル内の全クエリ分を同時に積算する。これにより
+/// 常駐行列の HBM トラフィックはクエリ本数に比例せず、行 1 回読みをタイル幅
+/// 分のクエリで償却する（親 Issue #531 の目的である「行列トラフィックの
+/// Q 倍削減」の核）。
+///
+/// `params.row_stride` は「1 行あたりの `packed_rows` 要素数」（= `dim.div_ceil(2)`）、
+/// `params.query_stride` は「1 クエリあたりの `query` 配列要素数」
+/// （= `row_stride * 2`。f32 換算でパディング込み）を表す。`params.query_count`
+/// は本 dispatch が実際に処理するクエリ本数（`<= QUERY_TILE_MAX`）で、
+/// ホスト側（[`dispatch_dot_products`]）が保証し、シェーダ側でも `min` で
+/// クランプする（fail-closed。ホスト・シェーダ二重の範囲外アクセス防止）。
+/// [`DOT_SHADER_F32_WGSL`]（Issue #234・CORE-16 対照経路）と bind group
 /// layout（バインディング構成・各エントリの型）を共用するため `Params` の形は
-/// 揃えてあるが、`row_stride` の意味はシェーダごとに異なる（本シェーダでは
-/// 「u32 パック要素数」、f32 版では「f32 要素数 = dim」。[`dispatch_dot_products`]
-/// のドキュメンテーションコメント参照）。
+/// 揃えてあるが、`row_stride`/`query_stride` の意味はシェーダごとに異なる
+/// （本シェーダでは「u32 パック要素数」、f32 版では「f32 要素数 = dim」）。
 const DOT_SHADER_WGSL: &str = r#"
+const QUERY_TILE_MAX: u32 = 16u;
+
 struct Params {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    query_count: u32,
+    query_stride: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -104,9 +128,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.row_count) {
         return;
     }
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
     let row = row_ids[i];
     let row_base = row * params.row_stride;
-    var acc: f32 = 0.0;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        qi = qi + 1u;
+    }
+
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
@@ -114,10 +149,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let packed = packed_rows[row_base + j];
         let unpacked = unpack2x16float(packed);
-        acc = acc + unpacked.x * query[j * 2u] + unpacked.y * query[j * 2u + 1u];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            let qbase = q * params.query_stride + j * 2u;
+            acc[q] = acc[q] + unpacked.x * query[qbase] + unpacked.y * query[qbase + 1u];
+            q = q + 1u;
+        }
         j = j + 1u;
     }
-    scores[i] = acc;
+
+    var qo: u32 = 0u;
+    loop {
+        if (qo >= query_count) {
+            break;
+        }
+        scores[qo * params.row_count + i] = acc[qo];
+        qo = qo + 1u;
+    }
 }
 "#;
 
@@ -128,13 +179,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// 内積を計算する。バインディング構成（型・数）は [`DOT_SHADER_WGSL`] と同一の
 /// ため bind group layout を共用できる（WGSL の要素型 `array<u32>` vs
 /// `array<f32>` は wgpu のバインドグループレイアウト検証に現れない）。
-/// `params.row_stride` はここでは「1 行あたりの f32 要素数」= `dim` を表す。
+/// `params.row_stride`/`params.query_stride` はここでは「1 行・1 クエリあたりの
+/// f32 要素数」= `dim`（パディング無し）を表す。ディスパッチ構造・クエリタイル化
+/// （Issue #532）は [`DOT_SHADER_WGSL`] と同一の設計で、CORE-16 の A/B が
+/// 「f16 vs f32 常駐」の差のみを見るよう、両シェーダのタイル構造を意図的に
+/// 揃えている（行データの読み方だけが異なる）。
 const DOT_SHADER_F32_WGSL: &str = r#"
+const QUERY_TILE_MAX: u32 = 16u;
+
 struct Params {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    query_count: u32,
+    query_stride: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -149,18 +206,45 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.row_count) {
         return;
     }
+    let query_count = min(params.query_count, QUERY_TILE_MAX);
     let row = row_ids[i];
     let row_base = row * params.row_stride;
-    var acc: f32 = 0.0;
+
+    var acc: array<f32, QUERY_TILE_MAX>;
+    var qi: u32 = 0u;
+    loop {
+        if (qi >= QUERY_TILE_MAX) {
+            break;
+        }
+        acc[qi] = 0.0;
+        qi = qi + 1u;
+    }
+
     var j: u32 = 0u;
     loop {
         if (j >= params.row_stride) {
             break;
         }
-        acc = acc + rows[row_base + j] * query[j];
+        let v = rows[row_base + j];
+        var q: u32 = 0u;
+        loop {
+            if (q >= query_count) {
+                break;
+            }
+            acc[q] = acc[q] + v * query[q * params.query_stride + j];
+            q = q + 1u;
+        }
         j = j + 1u;
     }
-    scores[i] = acc;
+
+    var qo: u32 = 0u;
+    loop {
+        if (qo >= query_count) {
+            break;
+        }
+        scores[qo * params.row_count + i] = acc[qo];
+        qo = qo + 1u;
+    }
 }
 "#;
 
@@ -169,8 +253,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 struct GpuParams {
     row_stride: u32,
     row_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// 本 dispatch が処理するクエリ本数（`<= GPU_QUERY_TILE_MAX`。Issue #532）。
+    /// 旧 `_pad0` を転用（bind group layout・`GpuParams` のバイト長は不変）。
+    query_count: u32,
+    /// 1 クエリあたりの `query` 配列要素数（f16 経路: `row_stride * 2`、
+    /// f32 対照経路: `row_stride` と同値の `dim`）。旧 `_pad1` を転用。
+    query_stride: u32,
 }
 
 impl GpuParams {
@@ -183,8 +271,8 @@ impl GpuParams {
         try_reserve_bytes(&mut out, 16)?;
         out.extend_from_slice(&self.row_stride.to_ne_bytes());
         out.extend_from_slice(&self.row_count.to_ne_bytes());
-        out.extend_from_slice(&self._pad0.to_ne_bytes());
-        out.extend_from_slice(&self._pad1.to_ne_bytes());
+        out.extend_from_slice(&self.query_count.to_ne_bytes());
+        out.extend_from_slice(&self.query_stride.to_ne_bytes());
         Ok(out)
     }
 }
@@ -774,64 +862,183 @@ impl BatchBackend for GpuBatchBackend {
         let dim_half = dim.div_ceil(2);
         let query_stride = dim_half.saturating_mul(2);
 
-        // `Vec::with_capacity`（abort-on-OOM）ではなくフォールブル確保にする
-        // （CPU 経路 `run_batch_search` の `out` と同じ方針。Issue #178 レビュー指摘）。
-        let mut hits: Vec<BatchHit> = Vec::new();
-        try_reserve_exact(&mut hits, queries.len(), "gpu batch results")
-            .map_err(BatchExecError::Input)?;
-        for q in queries {
-            let reachable = gather_reachable_rows(&self.matrix, q.ctx)
-                .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+        let target = DotDispatchTarget {
+            pipeline: &ctx.pipeline,
+            row_buffer: &self.row_buffer,
+            bind_group_layout: self.bind_group_layout_ref(ctx),
+            row_stride: dim_half as u32,
+        };
 
-            let mut selector = TopKSelector::new(q.k);
+        run_tiled_batch_search(ctx, &self.matrix, queries, &target, query_stride)
+    }
+}
 
-            // 行数がバッファ予算を超える場合は複数回の dispatch に分割する
-            // （GPU_SCORE_BUFFER_BUDGET_BYTES ポインタ）。各チャンクは独立に
-            // 実行し、選出器へ逐次 push するため正しさに影響しない。
-            let chunk_rows = gpu_chunk_row_capacity(ctx);
-            let target = DotDispatchTarget {
-                pipeline: &ctx.pipeline,
-                row_buffer: &self.row_buffer,
-                bind_group_layout: self.bind_group_layout_ref(ctx),
-                row_stride: dim_half as u32,
-            };
-            for chunk in reachable.chunks(chunk_rows.max(1)) {
-                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
-                    .map_err(BatchExecError::Backend)?;
+/// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
+/// が共有する dispatch 本体（Issue #532・R1）。クエリを [`group_queries_by_ctx`]
+/// で `PolicyContext` 単位にグループ化し、グループごとに [`gather_reachable_rows`]
+/// を 1 回だけ実行したうえで、[`plan_query_tile`] が決めた幅 Q でクエリを
+/// タイル化し 1 dispatch へ束ねる。f16/f32 の差異は呼び出し元が組み立てる
+/// `target`・`query_stride` のみに閉じ込め、タイル化・グループ化のロジック
+/// 自体は両バックエンドで完全に共有する。
+///
+/// テナント境界（P0）: タイル内の全クエリが同一 `PolicyContext` であることは
+/// `group_queries_by_ctx` の構成上保証されるため、1 回の `gather_reachable_rows`
+/// 呼び出し結果をタイル内の全クエリで安全に共有できる（異なる可視性のクエリが
+/// 同じ行集合を参照する経路は作らない）。選出後の解決は既存どおり
+/// [`finalize_gpu_hits`]（`PolicyContext::is_visible` 単一照合パス）が
+/// クエリごとに独立して再検証する。
+fn run_tiled_batch_search(
+    ctx: &GpuContext,
+    matrix: &crate::batch_search::ResidentMatrix,
+    queries: &[BatchQuery<'_>],
+    target: &DotDispatchTarget<'_>,
+    query_stride: usize,
+) -> Result<Vec<BatchHit>, BatchExecError> {
+    let groups = group_queries_by_ctx(queries);
 
-                if scores.len() != chunk.len() {
+    // 結果は入力順で復元する（`Vec<Option<_>>` → 全件 `Some` 検証で
+    // fail-closed に欠落を検知する。§4.2 ポインタ）。
+    let mut results: Vec<Option<BatchHit>> = Vec::new();
+    try_reserve_exact(&mut results, queries.len(), "gpu tiled batch results")
+        .map_err(BatchExecError::Input)?;
+    results.resize_with(queries.len(), || None);
+
+    for group in &groups {
+        let Some(&first_idx) = group.first() else {
+            continue;
+        };
+        let group_ctx = queries.get(first_idx).map(|q| q.ctx).ok_or_else(|| {
+            BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                "query group index out of range".to_string(),
+            ))
+        })?;
+        let reachable = gather_reachable_rows(matrix, group_ctx)
+            .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+
+        let plan = plan_query_tile(
+            group.len(),
+            GPU_SCORE_BUFFER_BUDGET_BYTES,
+            ctx.max_workgroups_per_dimension,
+        );
+
+        for tile in group.chunks(plan.width.max(1)) {
+            let width = tile.len();
+
+            // タイル内の各クエリを `query_stride` へパディングして連結する
+            // （§4.2「行データを 1 回読みで償却」の前提: シェーダは同じ行
+            // データをタイル幅ぶんのクエリで再利用するため、クエリ側は
+            // 固定ストライドで並んでいる必要がある）。
+            let mut queries_concat: Vec<f32> = Vec::new();
+            try_reserve_f32(&mut queries_concat, width.saturating_mul(query_stride))
+                .map_err(BatchExecError::Backend)?;
+            for &qi in tile {
+                let vector = queries.get(qi).map(|q| q.vector).ok_or_else(|| {
+                    BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                        "query tile index out of range".to_string(),
+                    ))
+                })?;
+                let before = queries_concat.len();
+                queries_concat.extend_from_slice(vector);
+                let padded_len = before.saturating_add(query_stride);
+                queries_concat.resize(padded_len.max(queries_concat.len()), 0.0);
+            }
+
+            // クエリごとに独立した選出器（`Option` で保持し、確定後に
+            // `take` で 1 度だけ取り出す。`TopKSelector::into_sorted_vec`
+            // が `self` を消費するため）。
+            let mut selectors: Vec<Option<TopKSelector>> = Vec::new();
+            try_reserve_exact(&mut selectors, width, "gpu tile selectors")
+                .map_err(BatchExecError::Input)?;
+            for &qi in tile {
+                let k = queries.get(qi).map(|q| q.k).unwrap_or(0);
+                selectors.push(Some(TopKSelector::new(k)));
+            }
+
+            for chunk in reachable.chunks(plan.chunk_rows.max(1)) {
+                let scores =
+                    dispatch_dot_products(ctx, target, chunk, &queries_concat, width, query_stride)
+                        .map_err(BatchExecError::Backend)?;
+
+                let expected_len = chunk.len().saturating_mul(width);
+                if scores.len() != expected_len {
                     return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
                         "readback length mismatch".to_string(),
                     )));
                 }
-                for (&row_idx, &score) in chunk.iter().zip(scores.iter()) {
-                    if !score.is_finite() {
+                for (qpos, selector_slot) in selectors.iter_mut().enumerate() {
+                    let Some(selector) = selector_slot.as_mut() else {
                         continue;
+                    };
+                    let base = qpos.saturating_mul(chunk.len());
+                    for (offset, &row_idx) in chunk.iter().enumerate() {
+                        let Some(&score) = scores.get(base + offset) else {
+                            continue;
+                        };
+                        if !score.is_finite() {
+                            continue;
+                        }
+                        // 候補識別子は「行 id」ではなく常駐行列のスロット番号
+                        // （`gather_reachable_rows` が返す行 index）を使う。
+                        // `TopKSelector` の同点タイブレークは候補識別子の
+                        // 昇順であり、CPU 経路（`batch_search.rs::
+                        // run_batch_search`）はスロット昇順を契約としている
+                        // ため（`batch_fallback.rs::revalidate_primary_hits`
+                        // の順序検証 (4) が同じ基準で判定する）、ここで行 id
+                        // を使うと同点時に順序契約違反となり正当な結果まで
+                        // `PrimaryResultRejected` で拒否される（PR #205/#228
+                        // の `(tenant_id, id)` 統一に追随。Issue #178）。
+                        selector.push(CandidateHit {
+                            id: u64::from(row_idx),
+                            score,
+                        });
                     }
-                    // 候補識別子は「行 id」ではなく常駐行列のスロット番号
-                    // （`gather_reachable_rows` が返す行 index）を使う。
-                    // `TopKSelector` の同点タイブレークは候補識別子の昇順で
-                    // あり、CPU 経路（`batch_search.rs::run_batch_search`）は
-                    // スロット昇順を契約としているため（`batch_fallback.rs::
-                    // revalidate_primary_hits` の順序検証 (4) が同じ基準で
-                    // 判定する）、ここで行 id を使うと同点時に順序契約違反と
-                    // なり正当な結果まで `PrimaryResultRejected` で拒否される
-                    // （PR #205/#228 の `(tenant_id, id)` 統一に追随。Issue #178）。
-                    selector.push(CandidateHit {
-                        id: u64::from(row_idx),
-                        score,
-                    });
                 }
             }
 
-            hits.push(BatchHit {
-                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
-                    .map_err(BatchExecError::Input)?,
-            });
+            for (qpos, &qi) in tile.iter().enumerate() {
+                let Some(selector) = selectors.get_mut(qpos).and_then(Option::take) else {
+                    return Err(BatchExecError::Backend(
+                        BatchBackendError::KernelLaunchFailed(
+                            "query tile selector missing".to_string(),
+                        ),
+                    ));
+                };
+                let q_ctx = queries.get(qi).map(|q| q.ctx).ok_or_else(|| {
+                    BatchExecError::Backend(BatchBackendError::KernelLaunchFailed(
+                        "query tile index out of range".to_string(),
+                    ))
+                })?;
+                let hit = BatchHit {
+                    hits: finalize_gpu_hits(matrix, q_ctx, &selector.into_sorted_vec())
+                        .map_err(BatchExecError::Input)?,
+                };
+                if let Some(slot) = results.get_mut(qi) {
+                    *slot = Some(hit);
+                }
+            }
         }
-
-        Ok(hits)
     }
+
+    // 入力順で全クエリ分の結果が揃っていることを検証する（fail-closed:
+    // グループ化・タイル化の実装バグで一部クエリが取りこぼされた場合、
+    // 部分結果を返さず backend エラーとして CPU 縮退〔CORE-8〕へ倒す）。
+    let mut hits: Vec<BatchHit> = Vec::new();
+    try_reserve_exact(&mut hits, results.len(), "gpu tiled batch results (final)")
+        .map_err(BatchExecError::Input)?;
+    for slot in results {
+        match slot {
+            Some(hit) => hits.push(hit),
+            None => {
+                return Err(BatchExecError::Backend(
+                    BatchBackendError::KernelLaunchFailed(
+                        "query result missing after tiled dispatch".to_string(),
+                    ),
+                ))
+            }
+        }
+    }
+
+    Ok(hits)
 }
 
 /// GPU 側で選出した候補（常駐行列のスロット番号 + スコア）を、テナント修飾済みの
@@ -1032,60 +1239,68 @@ impl BatchBackend for GpuF32ContrastBackend {
         let row_stride = dim as u32;
         let query_stride = dim;
 
-        let mut hits: Vec<BatchHit> = Vec::new();
-        try_reserve_exact(&mut hits, queries.len(), "gpu f32 contrast results")
-            .map_err(BatchExecError::Input)?;
-        for q in queries {
-            let reachable = gather_reachable_rows(&self.matrix, q.ctx)
-                .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
+        let target = DotDispatchTarget {
+            pipeline,
+            row_buffer: &self.row_buffer,
+            bind_group_layout: &ctx.bind_group_layout,
+            row_stride,
+        };
 
-            let mut selector = TopKSelector::new(q.k);
-
-            let chunk_rows = gpu_chunk_row_capacity(ctx);
-            let target = DotDispatchTarget {
-                pipeline,
-                row_buffer: &self.row_buffer,
-                bind_group_layout: &ctx.bind_group_layout,
-                row_stride,
-            };
-            for chunk in reachable.chunks(chunk_rows.max(1)) {
-                let scores = dispatch_dot_products(ctx, &target, chunk, q.vector, query_stride)
-                    .map_err(BatchExecError::Backend)?;
-
-                if scores.len() != chunk.len() {
-                    return Err(BatchExecError::Backend(BatchBackendError::TransferFailed(
-                        "readback length mismatch".to_string(),
-                    )));
-                }
-                for (&row_idx, &score) in chunk.iter().zip(scores.iter()) {
-                    if !score.is_finite() {
-                        continue;
-                    }
-                    selector.push(CandidateHit {
-                        id: u64::from(row_idx),
-                        score,
-                    });
-                }
-            }
-
-            hits.push(BatchHit {
-                hits: finalize_gpu_hits(&self.matrix, q.ctx, &selector.into_sorted_vec())
-                    .map_err(BatchExecError::Input)?,
-            });
-        }
-
-        Ok(hits)
+        run_tiled_batch_search(ctx, &self.matrix, queries, &target, query_stride)
     }
 }
 
-/// 1 チャンクあたりの最大行数（スコア + 行 index バッファの合計が
-/// [`GPU_SCORE_BUFFER_BUDGET_BYTES`] に収まり、かつ dispatch のワークグループ数が
-/// adapter の上限内に収まるように決める）。
-fn gpu_chunk_row_capacity(ctx: &GpuContext) -> usize {
-    let by_budget = GPU_SCORE_BUFFER_BUDGET_BYTES / 8; // scores(f32) + row_ids(u32) = 8 bytes/row
+/// [`GpuBatchBackend::batch_search`]/[`GpuF32ContrastBackend::batch_search`]
+/// が 1 dispatch へタイル化するクエリ本数（`width`）と、そのタイルで 1 回の
+/// dispatch に含める行チャンク行数（`chunk_rows`）の組（Issue #532・R3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueryTilePlan {
+    width: usize,
+    chunk_rows: usize,
+}
+
+/// [`QueryTilePlan`] を fail-closed に決める純関数（GPU デバイス非依存。
+/// `checked_*`/`saturating_*` のみで導出し、`group_len == 0` 以外は必ず
+/// `width >= 1`・`chunk_rows >= 1` を返す）。
+///
+/// `width` は「このグループのクエリ本数」と [`GPU_QUERY_TILE_MAX`] の小さい方。
+/// `chunk_rows` は 1 回の dispatch のスコア + 行 index バッファ合計が
+/// `budget_bytes`（[`GPU_SCORE_BUFFER_BUDGET_BYTES`] ポインタ）に収まり、かつ
+/// dispatch のワークグループ数が adapter の
+/// `max_workgroups_per_dimension` 内に収まるように決める（`width == 1` の
+/// 場合、旧 `gpu_chunk_row_capacity` と同一の値になることを単体テストで固定）。
+fn plan_query_tile(
+    group_len: usize,
+    budget_bytes: usize,
+    max_workgroups_per_dimension: u32,
+) -> QueryTilePlan {
+    let width = group_len.clamp(1, GPU_QUERY_TILE_MAX);
+    // 1 行あたりのバイト数: scores（`width` クエリ分の f32）+ row_ids（u32 1 個）。
+    let per_row_bytes = (width as u64).saturating_mul(4).saturating_add(4).max(1);
+    let by_budget = usize::try_from(budget_bytes as u64 / per_row_bytes).unwrap_or(usize::MAX);
     let by_workgroups =
-        (ctx.max_workgroups_per_dimension as usize).saturating_mul(GPU_WORKGROUP_SIZE as usize);
-    by_budget.min(by_workgroups).max(1)
+        (max_workgroups_per_dimension as usize).saturating_mul(GPU_WORKGROUP_SIZE as usize);
+    let chunk_rows = by_budget.min(by_workgroups).max(1);
+    QueryTilePlan { width, chunk_rows }
+}
+
+/// クエリ列を `PolicyContext` の等価性（CORE-2 の単一照合パスが参照する
+/// `tenant_id`／`visibilities` の組。`policy.rs::PolicyContext` は
+/// `PartialEq`/`Eq` を derive 済み）でグループ化し、入力順を保った index 列を
+/// 返す（Issue #532・R1: タイル内の全クエリが同一可視性集合を共有することを
+/// 構造的に保証し、`gather_reachable_rows` をグループ単位で 1 回だけ実行する
+/// ための下ごしらえ）。件数は [`crate::batch_search::MAX_BATCH_QUERIES`]
+/// （4,096）以下であることが呼び出し元（`validate_batch_queries`）で
+/// 保証されるため、O(グループ数 × クエリ数) の線形走査で十分。
+fn group_queries_by_ctx(queries: &[BatchQuery<'_>]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(&PolicyContext, Vec<usize>)> = Vec::new();
+    for (idx, q) in queries.iter().enumerate() {
+        match groups.iter_mut().find(|(ctx, _)| *ctx == q.ctx) {
+            Some((_, members)) => members.push(idx),
+            None => groups.push((q.ctx, vec![idx])),
+        }
+    }
+    groups.into_iter().map(|(_, members)| members).collect()
 }
 
 /// [`GpuBatchBackend::batch_search`] の dispatch 前総量ガード本体。
@@ -1217,24 +1432,41 @@ fn dispatch_dot_products(
     ctx: &GpuContext,
     target: &DotDispatchTarget<'_>,
     row_indices: &[u32],
-    query: &[f32],
+    queries_concat: &[f32],
+    query_count: usize,
     query_stride: usize,
 ) -> Result<Vec<f32>, BatchBackendError> {
-    if row_indices.is_empty() {
+    if row_indices.is_empty() || query_count == 0 {
         return Ok(Vec::new());
     }
+    // ホスト側の呼び出し規約違反（シェーダの `array<f32, QUERY_TILE_MAX>` を
+    // 超えるクエリ本数）は fail-closed に拒否する。シェーダ側も `min` で
+    // クランプするが、ここで弾くことでレジスタ配列の範囲外アクセスに
+    // 依存しない二重の防御にする（Issue #532・R3）。
+    if query_count > GPU_QUERY_TILE_MAX {
+        return Err(BatchBackendError::KernelLaunchFailed(
+            "query tile width exceeds GPU_QUERY_TILE_MAX".to_string(),
+        ));
+    }
+    // `queries_concat` は呼び出し元（`run_tiled_batch_search`）が各クエリを
+    // `query_stride` へパディング済みで連結したバッファである契約
+    // （長さ不整合は呼び出し元の実装バグを示すため、GPU に触れる前に拒否する）。
+    let expected_query_len = query_count.checked_mul(query_stride).ok_or_else(|| {
+        BatchBackendError::KernelLaunchFailed("query buffer size overflow".to_string())
+    })?;
+    if queries_concat.len() != expected_query_len {
+        return Err(BatchBackendError::TransferFailed(
+            "query buffer length does not match query_count * query_stride".to_string(),
+        ));
+    }
     let row_count = row_indices.len() as u32;
-
-    let mut padded_query: Vec<f32> = Vec::new();
-    try_reserve_f32(&mut padded_query, query_stride)?;
-    padded_query.extend_from_slice(query);
-    padded_query.resize(query_stride, 0.0);
+    let query_count_u32 = query_count as u32;
 
     let params = GpuParams {
         row_stride: target.row_stride,
         row_count,
-        _pad0: 0,
-        _pad1: 0,
+        query_count: query_count_u32,
+        query_stride: query_stride as u32,
     };
 
     // ステージング用バイト列（ホスト側の確保）は error scope を push する**前**に
@@ -1245,7 +1477,7 @@ fn dispatch_dot_products(
     // scope の内側へ入れる必要はそもそもない）。
     let params_bytes = params.to_ne_bytes_vec()?;
     let row_ids_bytes = bytes_of_u32_slice(row_indices)?;
-    let query_bytes = bytes_of_f32_slice(&padded_query)?;
+    let query_bytes = bytes_of_f32_slice(queries_concat)?;
 
     // バッファ・bind group の生成もすべて error scope の内側で行う
     // （codex/Bugbot P1 指摘対応: 以前は encoder 直前で push していたため、
@@ -1277,7 +1509,11 @@ fn dispatch_dot_products(
     });
     ctx.queue.write_buffer(&query_buffer, 0, &query_bytes);
 
-    let scores_bytes = (row_indices.len() as u64).saturating_mul(4);
+    // スコアバッファは「行 × クエリタイル幅」（`scores[q * row_count + i]`
+    // レイアウト。`DOT_SHADER_WGSL`/`DOT_SHADER_F32_WGSL` doc 参照）。
+    let scores_bytes = (row_indices.len() as u64)
+        .saturating_mul(query_count as u64)
+        .saturating_mul(4);
     let scores_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("batch dot product scores"),
         size: scores_bytes,
@@ -1449,6 +1685,121 @@ mod tests {
     // GPU デバイスに依存しない純粋関数のみをここで検証する。デバイス初期化を
     // 要するテスト（初期化失敗→縮退・実 GPU 分岐）は `tests/gpu_batch.rs`
     // （結合テスト。環境条件で両分岐を検証する。TASK-128 設計方針 §3.5）に置く。
+
+    // --- Issue #532: クエリタイル化（1 dispatch で複数クエリを処理）の純関数 ---
+
+    #[test]
+    fn dot_shader_wgsl_query_tile_max_matches_host_constant() {
+        // WGSL のレジスタ配列サイズ（`array<f32, QUERY_TILE_MAX>`）が
+        // ホスト側の `GPU_QUERY_TILE_MAX`（ホストが `dispatch_dot_products`
+        // で拒否する上限）とビットで一致することを固定する。値がずれると
+        // シェーダ側が `min` でクランプした本数しか計算しないのに対し
+        // ホストは超過分を範囲外アクセスとして readback してしまう。
+        let expected = format!("const QUERY_TILE_MAX: u32 = {GPU_QUERY_TILE_MAX}u;");
+        assert!(
+            DOT_SHADER_WGSL.contains(&expected),
+            "f16 shader must declare {expected}"
+        );
+        assert!(
+            DOT_SHADER_F32_WGSL.contains(&expected),
+            "f32 contrast shader must declare {expected}"
+        );
+    }
+
+    #[test]
+    fn plan_query_tile_single_query_matches_legacy_chunk_row_capacity() {
+        // width == 1（旧「1 dispatch = 1 クエリ」相当）のとき、旧
+        // `gpu_chunk_row_capacity` と同じ `chunk_rows`（32 MiB / 8 bytes/行）
+        // になることを固定し、単一クエリ経路の挙動が退行していないことを示す。
+        let plan = plan_query_tile(1, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert_eq!(plan.width, 1);
+        assert_eq!(plan.chunk_rows, GPU_SCORE_BUFFER_BUDGET_BYTES / 8);
+    }
+
+    #[test]
+    fn plan_query_tile_clamps_width_to_gpu_query_tile_max() {
+        let plan = plan_query_tile(100, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert_eq!(plan.width, GPU_QUERY_TILE_MAX);
+        assert!(plan.chunk_rows >= 1);
+    }
+
+    #[test]
+    fn plan_query_tile_shrinks_chunk_rows_as_width_grows() {
+        // タイル幅が広いほど 1 行あたりのスコアバイト数が増えるため、
+        // 同じバイト予算では収容できる行チャンクが小さくなる。
+        let narrow = plan_query_tile(1, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        let wide = plan_query_tile(GPU_QUERY_TILE_MAX, GPU_SCORE_BUFFER_BUDGET_BYTES, 65_535);
+        assert!(wide.chunk_rows < narrow.chunk_rows);
+    }
+
+    #[test]
+    fn plan_query_tile_never_returns_zero_even_under_a_tiny_workgroup_limit() {
+        // adapter の `max_workgroups_per_dimension` が極端に小さくても
+        // `chunk_rows >= 1` を維持し、0 行チャンクで無限ループにならない
+        // ことを固定する（fail-closed だが panic はしない）。
+        let plan = plan_query_tile(GPU_QUERY_TILE_MAX, GPU_SCORE_BUFFER_BUDGET_BYTES, 1);
+        assert_eq!(plan.width, GPU_QUERY_TILE_MAX);
+        assert!(plan.chunk_rows >= 1);
+    }
+
+    fn ctx_for(tenant: &str) -> PolicyContext {
+        PolicyContext::new(tenant).expect("valid tenant id")
+    }
+
+    #[test]
+    fn group_queries_by_ctx_preserves_input_order_within_each_group() {
+        let ctx_a = ctx_for("tenant-a");
+        let ctx_b = ctx_for("tenant-b");
+        let v = vec![0.0f32; 1];
+        let queries = vec![
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_a,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_b,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_a,
+            },
+        ];
+        let groups = group_queries_by_ctx(&queries);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], vec![0, 2]);
+        assert_eq!(groups[1], vec![1]);
+    }
+
+    #[test]
+    fn group_queries_by_ctx_splits_differing_visibility_even_for_the_same_tenant() {
+        // `PolicyContext` の等価性は tenant_id だけでなく可視性集合も見るため、
+        // 同一テナントでも可視性が異なれば別グループになる（タイル内で
+        // `gather_reachable_rows` の行集合を共有してよいのは完全に同じ ctx の
+        // クエリだけ、という R1 の前提を固定する）。
+        let ctx_private =
+            PolicyContext::with_visibilities("tenant-a", [Visibility::Private, Visibility::Public])
+                .expect("valid ctx");
+        let ctx_public = ctx_for("tenant-a");
+        let v = vec![0.0f32; 1];
+        let queries = vec![
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_private,
+            },
+            BatchQuery {
+                vector: &v,
+                k: 1,
+                ctx: &ctx_public,
+            },
+        ];
+        let groups = group_queries_by_ctx(&queries);
+        assert_eq!(groups, vec![vec![0], vec![1]]);
+    }
 
     #[test]
     fn bytes_of_u32_slice_round_trips_via_f32_vec_from_ne_bytes_is_not_applicable() {
