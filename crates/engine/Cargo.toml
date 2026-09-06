@@ -385,3 +385,19 @@ test = false
 name = "chip_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #491（受理判定後 prefetch〔Issue #490・PR #574〕の前後比較実測）の
+# 実測入口。`engine::hnsw::HnswIndex::search_masked` を 1 プロセス = 1 規模点
+# （`rows` × `dim` × マスク有無）で計測し、変更を含まない参照区間
+# （`engine::kernel::CpuScalarProvider` の brute-force Top-k）とあわせて
+# ノイズ帯を出力する。8 点（10k／100k・dim 128／768・マスク有無）の前後比較・
+# 採否判定は `make bench-hnsw-search` が before/after バイナリを交互起動して
+# シェル側で行う。spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため
+# `.github/workflows/*` へは配線しない。harness = false / test = false は他
+# ベンチと同一方針。判定ロジック自体（時間非依存）は
+# harness/hnsw_search_latency.rs にあり tests/hnsw_search_latency_accept.rs で
+# make ci 側から回帰検証する。詳細は `docs/design/hnsw-search.md` 参照。
+name = "hnsw_search_bench"
+harness = false
+test = false
