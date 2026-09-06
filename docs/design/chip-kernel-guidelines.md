@@ -1,0 +1,297 @@
+# チップ別カーネル設計指針と Rust stable での実現可能性
+
+- ステータス: 調査記録（Informational）。production コード無変更。toolchain
+  更新・intrinsics 導入方針の決定は #508 ADR（オーナー承認）が担う
+- 対応: Issue #470（Phase 1 親 #456・ルート #455）
+- 前提: `crates/engine/src/isa.rs`・`crates/engine/src/gpu_batch.rs`・
+  [`docs/design/knn-stage-profile.md`](knn-stage-profile.md)・
+  [`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)・
+  [`docs/design/core16-f16-resident-gate.md`](core16-f16-resident-gate.md)・
+  [`docs/design/gpu-batch-wgpu-enablement.md`](gpu-batch-wgpu-enablement.md)
+
+## 背景・目的
+
+[`docs/design/hotpath-implementation-survey.md`](hotpath-implementation-survey.md)
+の距離カーネル節が挙げる候補（f16 昇格・i8 VNNI・binary popcount・prefetch 等）
+は、いずれも `#[target_feature]` 付き fn 内での `std::arch` intrinsics 使用が
+前提になる。本 doc はチップ（Intel／AMD／Apple Silicon／ARM サーバー／GPU）別の
+設計指針と、Rust stable でどこまで実現できるかを 2026-09-05 時点で調査した
+記録として残す。「採用推奨」等の語はいずれも候補判定であり、承認・決定を
+意味しない。
+
+## 0. 機械検証した事実（2026-09-05・rustc 1.96.0）
+
+### 0.1 現行 isa.rs は intrinsics 不使用（前提の訂正）
+
+現行 `crates/engine/src/isa.rs` は `std::arch` intrinsics を一切使っていない。
+実体は `#[target_feature(enable=...)]` を付けた safe fn の中で
+`dot_lanes<const LANES>`（NEON=4／AVX2+FMA=8／AVX-512=16 のレーン幅ぶんの
+アキュムレータ配列 `[f32; LANES]`）を `f32::mul_add` で積むのみで、実 SIMD 化は
+LLVM の自動ベクトル化任せである。`unsafe` は ISA 検出の sealed トークン
+（`NeonToken`/`Avx2FmaToken`/`Avx512Token`）経由での `#[target_feature]` fn 呼び
+出し 3 箇所に限定される。したがって intrinsics 導入は「既存方針の延長」ではなく
+**初導入**であり、`unsafe` 面積とユーザー承認コストの評価はこれを前提にする。
+
+### 0.2 `#[target_feature]` fn 内での intrinsic 種別ごとの `unsafe` 要否
+
+rustc 1.96.0（`#[target_feature(enable="avx2,fma")]` 等の safe fn 内）で
+実コンパイル確認した結果:
+
+| intrinsic の種別 | `unsafe` 要否 | 例 |
+| ---------------- | ------------- | -- |
+| 算術・set・シャッフル・水平和 | 不要（safe） | `_mm256_fmadd_ps` / `_mm256_set_ps` / `_mm256_add_ps` / `_mm_hadd_ps` |
+| f16 昇格 | 不要（safe） | `_mm256_cvtph_ps` / `_mm_set_epi16` |
+| i8 VNNI 内積 | 不要（safe） | `_mm256_dpbusd_avx_epi32` |
+| binary popcount | 不要（safe） | `_mm512_popcnt_epi64` |
+| マスク演算・reduce | 不要（safe） | `_mm512_maskz_mov_ps` / `_mm512_reduce_add_ps` |
+| prefetch | 不要（safe） | `_mm_prefetch::<_MM_HINT_T0>(slice.as_ptr() as *const i8)` |
+| ポインタ load/store | 必要（unsafe） | `_mm256_loadu_ps` / `_mm256_storeu_ps`（E0133） |
+
+結論: ポインタを取る load/store 以外は、`#[target_feature]` fn の内側であれば
+すべて safe。新規 `unsafe` を要するのは「メモリからベクトルレジスタへ直接
+load/store する」経路のみ。
+
+### 0.3 `as_chunks` + `set` 構築による単一ロード命令への畳み込み
+
+`as_chunks::<N>()` で得た固定長配列の要素から `_mm256_set_ps(...)` /
+`_mm_set_epi16(...)` を構築すると、safe な経路のままロード相当の生成コードが
+得られる（-O, `--emit asm` で確認した自前コンパイル出力）:
+
+- f32: `set_ps` 8 個が単一の `vmovups (%rdi,%r8), %ymm4` へ畳み込まれる
+  （`vinsertps`/`vunpcklps` の残留は自前コンパイル出力上 0 個）
+- f16: `set_epi16` 8 個が `vcvtph2ps -16(%rdi,%r8), %ymm1`（メモリオペランド
+  付き 1 命令）へ畳み込まれる（`vpinsrw` の残留は自前コンパイル出力上 0 個）
+
+これにより f16／i8／binary／prefetch を含む特殊カーネルを、新規 `unsafe`
+ゼロ・依存追加ゼロで実装できる可能性がある。**ただしこの畳み込みは LLVM の
+最適化挙動であって言語仕様の保証ではない**。採用する場合は
+`scripts/check_sort_determinism.sh` と同型の生成コード検査ガード（対象命令の
+不在をアセンブリで検査）を CI に置くことを推奨する（既起票 #467）。
+
+### 0.4 `std::simd`（portable SIMD）は stable では使えない
+
+rustc 1.96.0 で `E0658: use of unstable library feature 'portable_simd'`
+（gate: `portable_simd`／rust-lang/rust #86656）。nightly 必須のため不採用。
+
+### 0.5 現行 `dot_lanes::<8>` は単一依存チェーン
+
+`LANES=8` は 1 ベクタレジスタ幅（＝アキュムレータ 1 本）に相当し、8 レーンは
+SIMD レーンであってアキュムレータの本数ではない。この構造的事実は
+[`docs/design/knn-stage-profile.md`](knn-stage-profile.md) の段別プロファイルと
+整合する。複数アキュムレータ化（ACC=2/4）の regime 別の効果は
+[`docs/design/dot-kernel-multi-accumulator.md`](dot-kernel-multi-accumulator.md)
+の実測表（cache 常駐と arena 規模で挙動が異なる）を参照。
+
+### 0.6 本開発環境は性能判定に使えない
+
+本開発環境（QEMU Virtual CPU 報告・L2 48MiB/L3 16MiB という非現実的な階層）で
+dot カーネルの A/B を交互実測したところ速度比が 1.01〜1.72x を無秩序に往復し、
+規模・次元と単調な関係を示さなかった。これは Issue #365・#366 が記録した
+「共有計測環境ではノイズと分離できない」という既往の結論と整合する。本 doc の
+チップ別指針・優先順は、専有環境での再実測（既起票 #462 の計測規約）を経て
+初めて採否判断の根拠になる。
+
+## 1. チップ別設計指針
+
+### 1-1. Intel
+
+| 世代 | 実効 FMA 構成 | 推奨レーン幅 | f16／bf16／i8 経路 | 注意点 |
+| ---- | ------------- | ------------ | ------------------- | ------ |
+| Ice Lake-SP | 1×512 FMA（port 5 の 512b FMA は SKU 依存） | 512 bit | VNNI（`vpdpbusd`）有。BF16 無し | ライセンス降周波は実質消滅 |
+| Sapphire Rapids／Emerald Rapids | 2×512 FMA | 512 bit | VNNI・AVX-512 BF16（`vdpbf16ps`）・AMX（BF16/INT8 TMUL） | AMX は OS 有効化必須 |
+| Granite Rapids | 2×512 FMA | 512 bit | 上記＋AMX-FP16 | 同上 |
+| Alder Lake〜Arrow Lake（クライアント） | AVX-512 無し（fuse off） | 256 bit（AVX2+FMA） | AVX-VNNI（256bit）有。F16C 全世代有 | P/E コア混在。E コアへ移送されうる |
+| Diamond Rapids | AVX10.2-512 | 512 bit | AVX10.2 の新 AI データ型 | 未発売・未確認 |
+
+- 周波数低下: Ice Lake 以降は 1 コア稼働時の 512-bit 命令で約 100 MHz のみの
+  低下・それ以外は降周波なし（Travis Downs 実測、二次資料）。Ice
+  Lake／Rocket Lake 以降では AVX-512 の降周波はほぼ無視できるとされる
+- AMX の OS 有効化（Linux）: `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)`
+  必須。XFD により既定無効
+- キャッシュ律速の目安（導出値・実測ではない）: dim=128 の f32 行は 512 B。
+  L2 1〜2 MB → 約 2,000〜4,000 行、L3 32〜120 MB → 約 65,000〜240,000 行で
+  L3 を溢れる。f16 なら 2 倍、i8 なら 4 倍。本リポの実測点（25k／100k 行）は
+  L2 を超え L3 境界を跨ぐ領域
+
+### 1-2. AMD
+
+| 世代 | AVX-512 データパス | 推奨レーン幅 | f16／bf16／i8 | 注意点 |
+| ---- | ------------------- | ------------ | -------------- | ------ |
+| Zen 3 | 無し | 256 bit | — | AVX2+FMA のみ |
+| Zen 4（Genoa／Ryzen 7000） | double-pump（256 bit HW へ 512 bit 命令を 2 サイクル投入）。load 1×512b/cycle・store 0.5×512b/cycle | 512 bit 命令可（降周波なし） | `avx512_bf16`・VNNI 有 | 「512 bit にすれば 2 倍」にはならない |
+| Zen 5 デスクトップ／Turin | フル 512 bit。4×512b EU、load 2×512b/cycle・store 1×512b/cycle | 512 bit | 同上 | Zen 4 比で load 帯域 2 倍 |
+| Zen 5 モバイル（Strix Point） | 256 bit のまま | 512 bit 命令可・実行幅 256 | 同上 | 「Zen 5 = フル 512」は半数の製品で誤り |
+
+AMD はライセンス降周波を持たずサーマルベースのみ。3D V-Cache・CCD 跨ぎ帯域が
+brute-force に与える影響は一次実測未確認。
+
+### 1-3. Apple Silicon
+
+| 項目 | 内容 |
+| ---- | ---- |
+| SIMD 実行 | Firestorm（M1 P コア）は 4 本の FP/SIMD ユニット（128 bit NEON）。8-wide decode（二次資料） |
+| キャッシュ | L1 192 KB(I)+128 KB(D)/コア、L2 12 MB 共有 |
+| f16 算術 | NEON FP16（`fmla` f16）有 |
+| i8 dot | `sdot`/`udot`（FEAT_DotProd）有 |
+| bf16 | `bfdot`（FEAT_BF16）。M シリーズでの有無は未確認 |
+| SME／SME2 | M4 で対応。通常の SVE は非対応（Streaming SVE のみ） |
+| Apple AMX | 非公開命令。Accelerate 経由のみ |
+| UMA／Metal | `wgpu` Metal backend は `SHADER_F16` 対応 |
+
+M4 の SME 有効ベクタ長・`fmopa` スループットは未確認。
+
+### 1-4. ARM サーバー
+
+| プラットフォーム | コア | ベクタ長 | 備考 |
+| ---------------- | ---- | -------- | ---- |
+| AWS Graviton3 | Neoverse V1 | SVE 256 bit | Graviton4 比 33% 多くロード可 |
+| AWS Graviton4 | Neoverse V2 | SVE2 128 bit | L2/コア 2 倍 |
+| NVIDIA Grace | Neoverse V2 | SVE2 128 bit | 詳細未確認 |
+| Ampere Altra | Neoverse N1 | SVE 非対応（NEON のみ） | — |
+| AmpereOne | 独自コア | SVE 対応状況未確認 | — |
+
+Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが同じ。SVE 化の
+利得は述語処理と可搬性にある。
+
+### 1-5. GPU（wgpu 30.0.1）
+
+| 項目 | 状況 |
+| ---- | ---- |
+| f16 算術 | `Features::SHADER_F16`（Vulkan／Metal／DX12／WebGPU）。WGSL `enable f16;` |
+| i8 dot | WGSL `dot4I8Packed`／`dot4U8Packed`。naga が全 backend 実装（SPIR-V／HLSL／Metal は専用命令、他は polyfill）。専用命令化は DX12 SM≥6.4／Vulkan `VK_KHR_shader_integer_dot_product` |
+| `NATIVE_PACKED_INTEGER_DOT_PRODUCT` | wgpu 30.0.1 の `FeaturesWGPU` 定数一覧で未確認。実機 `adapter.features()` で要確認 |
+| Subgroup | `Features::SUBGROUP`（Vulkan／DX12／Metal）。GPU 側 Top-k 縮約に有効 |
+| bf16 | 未確認 |
+
+## 2. Rust stable での実現可能性
+
+### 2-A. stable 1.96 以上で使える
+
+| 機能 | 代表 intrinsic | stable since | 検証 |
+| ---- | --------------- | ------------ | ---- |
+| safe fn への `#[target_feature]` | — | 1.86.0（`target_feature_11`） | §0.2 で実コンパイル確認済み |
+| F16C | `_mm256_cvtph_ps` | 1.68.0 | §0.2・§0.3 で実コンパイル確認済み |
+| AVX-512（F/BW/DQ/VL 等） | — | 1.89.0 | docs 参照 |
+| AVX-512 VNNI | `_mm512_dpbusd_epi32` | 1.89.0 | docs 参照 |
+| AVX-512 BF16 | `_mm512_dpbf16_ps` | 1.89.0 | docs 参照 |
+| AVX-VNNI（256 bit） | `_mm256_dpbusd_avx_epi32` | 1.89.0 | §0.2 で実コンパイル確認済み |
+| AVX-512 FP16 | `_mm512_fmadd_ph` | 1.94.0（`f16` プリミティブ依存分は除く） | docs 参照 |
+| NEON FP16 | `vfmaq_f16` | 1.94.0 | docs 参照 |
+| NEON FMLAL | `vfmlalq_low_f16` | 1.94.0 | docs 参照 |
+| 実行時検出（x86） | `is_x86_feature_detected!` | `avx512vnni`／`avx512bf16`／`avx512fp16`／`avxvnni`／`f16c`／`amx-*`／`avx10.*` を受理 | docs 参照 |
+| 実行時検出（aarch64） | `is_aarch64_feature_detected!` | `fp16`／`fhm`／`dotprod`／`bf16`／`i8mm`／`sve`／`sve2`／`sme`／`sme2` を受理 | docs 参照 |
+
+### 2-B. stable 1.98 で追加
+
+`rust-toolchain.toml` は `channel = "stable"`（浮動）で、機械検証は
+ローカル rustc 1.96.0 で行った。1.98 系の項目はリリースノート参照のみで
+ローカル未検証。toolchain 更新は本 Issue のスコープ外（#508 の対象）。
+
+| 機能 | 代表 intrinsic | stable since |
+| ---- | --------------- | ------------ |
+| NEON dot product（i8） | `vdotq_s32`／`vdotq_u32` | 1.98.0 |
+
+### 2-C. nightly のみ（不採用）
+
+| 機能 | gate |
+| ---- | ---- |
+| Intel AMX | `x86_amx_intrinsics`（rust-lang/rust #126622） |
+| AArch64 SVE／SVE2 | `stdarch_aarch64_sve`（#145052。2026 プロジェクトゴールでも nightly 継続の見込み） |
+| `f16` プリミティブ | #116909 |
+| `std::simd` | `portable_simd`（#86656。1.96 で E0658 を実機確認） |
+
+### 2-D. 未確認
+
+- NEON bf16（`vbfdotq_f32`）: stable docs に該当ページ無し。少なくとも 1.96 で
+  は利用不可
+- SME／SME2 intrinsics: Rust に API 無し
+- `is_aarch64_feature_detected!` の macOS 上の実効性: マクロ doc に「linux 以外
+  では多くの feature が常に false」の記載があり、実機での 1 行検証が必須
+  （既起票 #468）
+
+### 2-E. 候補クレート（情報のみ）
+
+依存の追加・更新は `.claude/rules/dependency-policy.md` によりユーザー承認制。
+本 Issue では依存を追加しない。
+
+| クレート | 版 | ライセンス | 備考 |
+| -------- | -- | ---------- | ---- |
+| simsimd | 6.5.16 | Apache-2.0 | C ビルド必須。推移的依存未確認 |
+| half | 2.7.1 | MIT OR Apache-2.0 | `f16` プリミティブ未安定のため CPU f16 経路の現実解 |
+| pulp | 0.22.3 | MIT | safe generic simd |
+| wide | 1.7.0 | Zlib OR Apache-2.0 OR MIT | — |
+| rayon | 1.12.0 | MIT OR Apache-2.0 | 自作 `parallel_search.rs` があるため不要 |
+
+## 3. 追加カーネルの優先順
+
+Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 常駐 dim<=384 で
+悪化）。残る有効なレバーは (a) 行間マイクロカーネル、(b) 格納精度の削減
+（メモリ律速側）、(c) blocking／prefetch。
+
+| 優先 | 施策 | 対象 | 根拠 | Rust | 既起票 |
+| ---- | ---- | ---- | ---- | ---- | ------ |
+| 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #509 |
+| 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #513 |
+| 3 | クライアント Intel の 256 bit 経路最適化 | Alder〜Arrow Lake | AVX-512 fuse off がクライアント主流 | stable 可 | #517 |
+| 4 | AVX-512 BF16／VNNI 量子化スキャン | SPR／GNR／Zen 4／5 | ANN 候補生成限定で f32 再計算（HNSW の rescoring 契約と同型） | stable 1.89 | #520 |
+| 5 | AVX-VNNI i8 | クライアント Intel | 4 の 256 bit 版 | stable 1.89 | #524 |
+| 6 | NEON `sdot`/`udot` i8 | Apple／Graviton／Grace | 4 の Arm 版 | stable 1.98 | #527 |
+| 7 | AVX-512 FP16 ネイティブ | SPR／GNR | 変換コストも省く。対応チップ限定 | stable 1.94 | #530 |
+| 8（低） | AMX／SME／SVE | SPR+／M4／Graviton | 細長い形状に不向き・OS 有効化・Rust API 不在 | nightly／不可 | — |
+
+## 4. GPU 経路（`gpu_batch.rs`）の改善候補
+
+| 優先 | 候補 | 内容 | 既起票 |
+| ---- | ---- | ---- | ------ |
+| 1 | マルチクエリ dispatch＋クエリの workgroup 常駐 | 現状はクエリごとに行列全体を再読み込み（行列トラフィック Q 倍） | #531 |
+| 2 | GPU 側 Top-k | 行数分の f32 全量 readback（最大 32 MiB）を k×workgroup 数へ。`SUBGROUP` で縮約 | #534 |
+| 3 | `SHADER_F16` ネイティブ f16 FMA | 現状は unpack して f32 演算。[`docs/design/core16-f16-resident-gate.md`](core16-f16-resident-gate.md) の環境依存があるため A/B 必須 | #538 |
+| 4 | i8 量子化＋`dot4I8Packed` | dim=128 が 32 words。`NATIVE_PACKED_INTEGER_DOT_PRODUCT` の有無は実機確認が要る | #541 |
+| 5 | Apple UMA ゼロコピー | [`docs/design/redb-insert-reserve-zero-copy.md`](redb-insert-reserve-zero-copy.md)（Issue #400）の先例に倣い静的確認を先に | #544 |
+
+## 5. 既 Rejected との関係
+
+Issue #365（行内複数アキュムレータ）は cache 常駐 dim<=384 で悪化したことを
+理由に不採用としたが、arena 規模かつ dim>=768 限定では改善が確認されている。
+本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517）や量子化
+opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全 dim 一律の複数
+アキュムレータ化」を再提案するものではない。詳細な対応表は
+[`docs/design/hotpath-implementation-survey.md`](hotpath-implementation-survey.md)
+§10 を参照。
+
+## 6. 出典
+
+- Rust: https://doc.rust-lang.org/std/arch/macro.is_x86_feature_detected.html ／
+  macro.is_aarch64_feature_detected.html ／
+  core/arch/x86_64/fn._mm512_dpbf16_ps.html ／ fn._mm512_dpbusd_epi32.html ／
+  fn._mm256_dpbusd_avx_epi32.html ／ fn._mm512_fmadd_ph.html ／
+  fn._mm256_cvtph_ps.html ／ core/arch/aarch64/fn.vdotq_s32.html ／
+  fn.vfmaq_f16.html ／ fn.vfmlalq_low_f16.html ／
+  https://releases.rs/docs/1.98.0/ ／ rust-lang/rust
+  #136058・#134090・#111137・#127213・#136306・#117224・#126622・#145052・
+  #116909・#86656 ／
+  https://rust-lang.github.io/rust-project-goals/2026/scalable-vectors.html
+- Intel: AVX10 技術資料（cdrdv2-public.intel.com/849709）／ Alder Lake AVX-512
+  fuse off（support article 000089918）／ AMX solution brief ／
+  https://docs.kernel.org/arch/x86/xstate.html ／
+  https://travisdowns.github.io/blog/2020/01/17/avxfreq1.html ／
+  https://travisdowns.github.io/blog/2020/08/19/icl-avx512-freq.html ／
+  https://chipsandcheese.com/p/a-peek-at-sapphire-rapids
+- AMD: https://www.amd.com/en/blogs/2026/understanding-avx-512---validating-usage-on-amd-epyc-.html ／
+  https://www.numberworld.org/blogs/2024_8_7_zen5_avx512_teardown/ ／
+  https://www.hwcooling.net/en/mobile-zen-5-is-here-ryzen-ai-300-strix-point-soc-detailed/ ／
+  https://chipsandcheese.com/p/zen-5s-avx-512-frequency-behavior
+- Arm／Apple: https://aws.github.io/graviton/ ／
+  https://www.lkuffo.com/graviton3-better-than-graviton4-vector-search/ ／
+  https://old.chipsandcheese.com/2024/07/22/arms-neoverse-v2-in-awss-graviton-4/ ／
+  https://dougallj.github.io/applecpu/firestorm.html ／
+  https://developer.apple.com/forums/thread/757704
+- GPU／wgpu: https://docs.rs/wgpu/30.0.1/wgpu/struct.FeaturesWebGPU.html ／
+  struct.FeaturesWGPU.html ／ gfx-rs/wgpu #7494・#7574・#7595
+
+## 参照
+
+- spec ポインタ（本文非転記）: CORE-9／CORE-10／CORE-16／TASK-132
+  （`docs/spec/04-behavior/core-engine.md`）
+- [`docs/design/hotpath-implementation-survey.md`](hotpath-implementation-survey.md)
+  （手法×実装×採否候補×ライセンスの表。§9・§10 の既起票／Rejected 対応表）
