@@ -407,6 +407,7 @@ dot カーネル変更（#517 等）の参照区間は、dot を通らない `fe
 （環境依存のため参考値）。全 4 ワークロード × 5 ラウンドが exit_code 0 で
 完走し、`summary.json`・per-run ログが `target/bench-chip/<unix-ts>/` に
 出力されることを確認した。
+
 ## 8. macOS 上の `is_aarch64_feature_detected!` 実効性（Issue #468）
 
 ### 8.1 目的と結論

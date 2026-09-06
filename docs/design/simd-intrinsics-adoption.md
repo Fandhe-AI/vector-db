@@ -218,7 +218,7 @@ target_feature として扱われるため `is_aarch64_feature_detected!` は
 `sme`／`sme2` は stable では検出マクロ自体が利用できない。結論として
 本 ADR の決定 3 が定義するトークン（`NeonFp16Token`・`NeonDotprodToken`）
 に対する代替検出機構の追加は不要である。詳細は
-[`chip-kernel-guidelines.md` §8](chip-kernel-guidelines.md#8-macos-上の-is_aarch64_feature_detected-実効性issue-468)
+[`chip-kernel-guidelines.md`](chip-kernel-guidelines.md) §8
 （静的解析＋GitHub ホステッド Apple Silicon 実機で確認済み）を参照。
 
 ## 実装タスク対応表
