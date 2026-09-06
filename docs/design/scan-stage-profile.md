@@ -53,7 +53,7 @@ crossdb の可視性モデル（`scripts/crossdb_bench/`）: tenant-a 23,000 行
 | W3 `arena_copy` | W2 一致行の embedding を連続 `Vec<f32>` へ複製 |
 | W4 `provider_search` | 一致行のみへ `ParallelSearchProvider::search`（k=10） |
 
-`W0c`（e2e cold・`SqlArenaCache` を毎サンプル空の状態から測る）・`W0h`（e2e hot）・`W0n`（`WHERE` なしの同形 KNN。cache fast path）を e2e として測定し、`W0h − W0n` を「SQL 表層内の `WHERE` 上乗せ」として報告する。`R_dot`（全可視行への逐次内積総和。Top-k なし）を参照区間（変更を含まない区間）として用い、複数ラウンド中央値の `(max-min)/min` をノイズ帯判定の実測帯とする（`docs/design/benchmark-judgement-policy.md` §4）。
+`W0c`（e2e cold・`SqlArenaCache` を毎サンプル空の状態から測る）・`W0h`（e2e hot）・`W0n`（`WHERE` なしの同形 KNN。cache fast path）を e2e として測定する。`R_dot`（全可視行への逐次内積総和。Top-k なし）を参照区間（変更を含まない区間）として用い、複数ラウンド中央値の `(max-min)/min` をノイズ帯判定の実測帯とする（`docs/design/benchmark-judgement-policy.md` §4）。`W0h` と `W0n` は dense 探索の候補集合サイズが異なる（`W0n` は可視行全体、`W0h` は事前フィルタ後の一致行のみ）ため、`W0h − W0n` を「SQL 表層内の `WHERE` 上乗せ」として単純に報告することはできない（詳細は下記「W0-hot と W0-nowhere の候補集合差」節）。候補集合を揃えた `WHERE` 上乗せの内訳は W1〜W3（一致行のみを対象とする一貫した集合）で測る。
 
 ## 測定設計
 
@@ -72,7 +72,9 @@ crossdb の可視性モデル（`scripts/crossdb_bench/`）: tenant-a 23,000 行
 
 ## 実測結果
 
-計測環境: 共有 QEMU 環境（`docs/design/benchmark-judgement-policy.md` §5 の区分に従い**参考値**。専有環境での再実測は運用者作業）。`lscpu` Model name: `QEMU Virtual CPU version 2.5+`・`nproc`=12・`isa=Avx2Fma`・計測時 `loadavg` ≈ 1.8〜2.5・`BENCH_DEDICATED_ENV` 未設定・計測コミット: `b827a2f09842c914667511df700d4deb031cfc96`（`origin/main`）。ラウンド数: 既定 5。
+計測環境: 共有 QEMU 環境（`docs/design/benchmark-judgement-policy.md` §5 の区分に従い**参考値**。専有環境での再実測は運用者作業）。`lscpu` Model name: `QEMU Virtual CPU version 2.5+`・`nproc`=12・`isa=Avx2Fma`・計測時 `loadavg` ≈ 1.6〜2.9・`BENCH_DEDICATED_ENV` 未設定。ラウンド数: 既定 5。
+
+**再測定の経緯**: 初回実測（本節旧版）は codex-review／Cursor Bugbot 指摘（PR #555・P1）により、`A4`／`A5` が `A3` と同じキー/ヘッダ tenant 整合検査（`verify_row_key_tenant_reimpl`）を省いており累積段契約（A3 ⊆ A4 ⊆ A5）が成立していなかったことが判明したため、`A4`／`A5` へ同検査を追加したうえで再測定した（初回実測で `A3→A4` の diff が `n/a（逆転）` になっていたのはこの欠落が原因——整合性検査を省くぶん `A4` が `A3` より速く見えていた）。下記は修正後の実測値。
 
 ### 25,000 行（`BENCH_SCAN_PROFILE_SCALE=1`。tenant-a 23,000・tenant-b 2,000）
 
@@ -80,33 +82,33 @@ per-round 生値（ms）:
 
 | round | A1 | A2 | A3 | A4 | A5 | W1 | W2 | W3 | W4 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 0.962 | 1.098 | 1.235 | 1.223 | 1.298 | 0.317 | 0.414 | 0.489 | 0.127 |
-| 1 | 0.964 | 1.093 | 1.232 | 1.222 | 1.301 | 0.320 | 0.415 | 0.491 | 0.113 |
-| 2 | 0.963 | 1.094 | 1.236 | 1.237 | 1.307 | 0.319 | 0.417 | 0.489 | 0.121 |
-| 3 | 0.961 | 1.116 | 1.239 | 1.224 | 1.311 | 0.320 | 0.415 | 0.491 | 0.092 |
-| 4 | 0.963 | 1.097 | 1.239 | 1.235 | 1.296 | 0.320 | 0.415 | 0.489 | 0.124 |
+| 0 | 0.971 | 1.098 | 1.235 | 1.377 | 1.449 | 0.316 | 0.410 | 0.486 | 0.095 |
+| 1 | 0.962 | 1.098 | 1.238 | 1.374 | 1.443 | 0.317 | 0.408 | 0.488 | 0.095 |
+| 2 | 0.970 | 1.163 | 1.333 | 1.453 | 1.517 | 0.322 | 0.419 | 0.526 | 0.095 |
+| 3 | 1.002 | 1.097 | 1.233 | 1.374 | 1.446 | 0.317 | 0.411 | 0.491 | 0.093 |
+| 4 | 1.002 | 1.115 | 1.235 | 1.381 | 1.448 | 0.318 | 0.409 | 0.490 | 0.093 |
 
 median-of-R（ms・min-of-R）・ns/row・段差分:
 
 | 段 | median | min-of-R | ns/row | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A1 redb_scan | 0.963 | 0.961 | 38.5 | — | — | — | — |
-| A2 header_decode | 1.097 | 1.093 | 43.9 | A1→A2 | 5.4 | 14.0% | within |
-| A3 rls_visible | 1.236 | 1.232 | 49.4 | A2→A3 | 5.6 | 12.7% | within |
-| A4 dim_meta_decode | 1.224 | 1.222 | 49.0 | A3→A4 | n/a（逆転） | — | — |
-| A5 scalar_validate | 1.301 | 1.296 | 52.0 | A4→A5 | 3.1 | 6.2% | within |
+| A1 redb_scan | 0.971 | 0.962 | 38.9 | — | — | — | — |
+| A2 header_decode | 1.098 | 1.097 | 43.9 | A1→A2 | 5.1 | 13.1% | within |
+| A3 rls_visible | 1.235 | 1.233 | 49.4 | A2→A3 | 5.5 | 12.4% | within |
+| A4 dim_meta_decode | 1.377 | 1.374 | 55.1 | A3→A4 | 5.7 | 11.5% | within |
+| A5 scalar_validate | 1.448 | 1.443 | 57.9 | A4→A5 | 2.9 | 5.2% | within |
 
-e2e: `A0a`（agg_count）median=1.581ms・`A0b`（rls_isolation）median=1.581ms（両者一致）。
+e2e: `A0a`（agg_count）median=1.580ms・`A0b`（rls_isolation）median=1.577ms（両者一致）。
 
 | 段 | median | min-of-R | ns/row（分母=可視 23,000 行） | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| W1 scalar_scan | 0.320 | 0.317 | 13.9 | — | — | — | — |
-| W2 predicate | 0.415 | 0.414 | 18.1 | W1→W2 | 4.2 | 30.0% | above |
-| W3 arena_copy | 0.489 | 0.489 | 21.3 | W2→W3 | 3.2 | 17.8% | above |
-| W4 provider_search（一致 4,600 行） | 0.121 | 0.092 | — | — | — | — | — |
-| R_dot（参照区間） | 0.198 | 0.195 | — | — | — | reference_band=17.0% | — |
+| W1 scalar_scan | 0.317 | 0.316 | 13.8 | — | — | — | — |
+| W2 predicate | 0.410 | 0.408 | 17.8 | W1→W2 | 4.0 | 29.2% | above |
+| W3 arena_copy | 0.490 | 0.486 | 21.3 | W2→W3 | 3.5 | 19.4% | above |
+| W4 provider_search（一致 4,600 行） | 0.095 | 0.093 | — | — | — | — | — |
+| R_dot（参照区間） | 0.231 | 0.205 | — | — | — | reference_band=13.5% | — |
 
-e2e: `W0-cold`=11.709ms・`W0-hot`=1.226ms・`W0-nowhere`=0.628ms。`W0-hot − W0-nowhere`（SQL 表層内の `WHERE` 上乗せ）= 0.598ms。
+e2e: `W0-cold`=11.918ms・`W0-hot`=1.118ms・`W0-nowhere`=0.597ms。raw diff（`W0-hot − W0-nowhere`）= 0.521ms（下記「W0-hot と W0-nowhere の候補集合差」節の注意を参照——このままでは「SQL 表層内の `WHERE` 上乗せ」として単純には解釈できない）。
 
 ### 100,000 行（`BENCH_SCAN_PROFILE_SCALE=4`。tenant-a 92,000・tenant-b 8,000）
 
@@ -114,38 +116,47 @@ per-round 生値（ms）:
 
 | round | A1 | A2 | A3 | A4 | A5 | W1 | W2 | W3 | W4 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 0 | 3.995 | 5.259 | 5.568 | 5.713 | 5.842 | 1.293 | 1.689 | 2.908 | 0.378 |
-| 1 | 3.991 | 4.999 | 5.603 | 5.667 | 5.863 | 1.290 | 1.695 | 2.891 | 0.245 |
-| 2 | 4.002 | 5.009 | 5.616 | 5.729 | 5.960 | 1.293 | 1.688 | 2.893 | 0.243 |
-| 3 | 4.026 | 5.002 | 5.633 | 5.689 | 5.905 | 1.290 | 1.690 | 2.922 | 0.250 |
-| 4 | 3.996 | 5.005 | 5.580 | 5.715 | 5.890 | 1.292 | 1.689 | 2.911 | 0.235 |
+| 0 | 4.209 | 4.895 | 5.745 | 6.230 | 6.477 | 1.278 | 1.810 | 3.263 | 0.359 |
+| 1 | 3.976 | 5.023 | 5.629 | 6.226 | 6.728 | 1.272 | 1.801 | 3.247 | 0.340 |
+| 2 | 3.975 | 5.066 | 5.658 | 6.223 | 6.470 | 1.274 | 1.809 | 3.325 | 0.360 |
+| 3 | 3.985 | 5.006 | 5.661 | 6.223 | 6.446 | 1.274 | 1.808 | 3.229 | 0.233 |
+| 4 | 3.977 | 4.984 | 5.621 | 6.261 | 6.491 | 1.271 | 1.812 | 3.233 | 0.234 |
 
 median-of-R（ms・min-of-R）・ns/row・段差分:
 
 | 段 | median | min-of-R | ns/row | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| A1 redb_scan | 3.996 | 3.991 | 40.0 | — | — | — | — |
-| A2 header_decode | 5.005 | 4.999 | 50.0 | A1→A2 | 10.1 | 25.2% | above |
-| A3 rls_visible | 5.603 | 5.568 | 56.0 | A2→A3 | 6.0 | 12.0% | above |
-| A4 dim_meta_decode | 5.713 | 5.667 | 57.1 | A3→A4 | 1.1 | 2.0% | within |
-| A5 scalar_validate | 5.890 | 5.842 | 58.9 | A4→A5 | 1.8 | 3.1% | within |
+| A1 redb_scan | 3.977 | 3.975 | 39.8 | — | — | — | — |
+| A2 header_decode | 5.006 | 4.895 | 50.1 | A1→A2 | 10.3 | 25.9% | above |
+| A3 rls_visible | 5.658 | 5.621 | 56.6 | A2→A3 | 6.5 | 13.0% | above |
+| A4 dim_meta_decode | 6.226 | 6.223 | 62.3 | A3→A4 | 5.7 | 10.1% | above |
+| A5 scalar_validate | 6.477 | 6.446 | 64.8 | A4→A5 | 2.5 | 4.0% | within |
 
-e2e: `A0a`（agg_count）median=7.265ms・`A0b`（rls_isolation）median=7.169ms。
+e2e: `A0a`（agg_count）median=7.088ms・`A0b`（rls_isolation）median=7.184ms。
 
 | 段 | median | min-of-R | ns/row（分母=可視 92,000 行） | 差分元 | diff ns/row | ratio | 帯判定 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| W1 scalar_scan | 1.292 | 1.290 | 14.0 | — | — | — | — |
-| W2 predicate | 1.689 | 1.688 | 18.4 | W1→W2 | 4.3 | 30.8% | above |
-| W3 arena_copy | 2.908 | 2.891 | 31.6 | W2→W3 | 13.3 | 72.2% | above |
-| W4 provider_search（一致 18,400 行） | 0.245 | 0.235 | — | — | — | — | — |
-| R_dot（参照区間） | 1.698 | 1.681 | — | — | — | reference_band=1.11% | — |
+| W1 scalar_scan | 1.274 | 1.271 | 13.8 | — | — | — | — |
+| W2 predicate | 1.809 | 1.801 | 19.7 | W1→W2 | 5.8 | 42.1% | above |
+| W3 arena_copy | 3.247 | 3.229 | 35.3 | W2→W3 | 15.6 | 79.5% | above |
+| W4 provider_search（一致 18,400 行） | 0.340 | 0.233 | — | — | — | — | — |
+| R_dot（参照区間） | 1.729 | 1.716 | — | — | — | reference_band=3.98% | — |
 
-e2e: `W0-cold`=74.308ms・`W0-hot`=6.508ms・`W0-nowhere`=3.256ms。`W0-hot − W0-nowhere` = 3.253ms。
+e2e: `W0-cold`=75.157ms・`W0-hot`=7.208ms・`W0-nowhere`=3.043ms。raw diff（`W0-hot − W0-nowhere`）= 4.165ms（下記「W0-hot と W0-nowhere の候補集合差」節の注意を参照）。
+
+### W0-hot と W0-nowhere の候補集合差（P2 指摘・codex-review）
+
+`W0-nowhere`（`WHERE` なし KNN）は可視行全体（tenant-a の `tenant_a_rows` 件）を dense 探索の候補集合とするのに対し、`W0-hot`（`WHERE lang='ja'`）は事前フィルタ後の一致行（約 20%）のみを候補集合とする。したがって raw diff `W0-hot − W0-nowhere` には次の 2 つの効果が混入する。
+
+1. **SQL 表層内の `WHERE` 上乗せ**（`scan_scalar_columns` による全可視行スキャン・述語判定・一致行の embedding 複製。W1〜W3 に相当）
+2. **dense 探索（距離計算・Top-k 選出）の候補集合サイズが小さくなることによる処理量の減少**（`W4`〔一致行のみ〕対 `R_dot`／`W0-nowhere` 内部の全可視行探索の差。候補が少ないほど計算量は減る側に働く）
+
+上記 2 つは符号が逆（1 は上乗せ・2 は削減）のため、raw diff を単純に「`WHERE` 上乗せ」として報告し、その値を W1+W2+W3 の合計と比較して残差をパース・束縛・キャッシュ照会等へ帰属することはできない（候補集合が揃っていない）。候補集合を揃えた比較は W 系列（`W1`〜`W4`、いずれも一致行のみを対象とする一貫した集合）・`R_dot`（全可視行を対象とする参照区間）側で行っており、これらの段別内訳が主たる分析対象である。raw diff（25k: 0.521ms・100k: 4.165ms）は「候補集合差を含む e2e 全体の差」という参考値としてのみ扱う。
 
 ### 実測からの所見
 
-- A 系列: `A1`（走査のみ）が総コストの 3〜4 割を占め、`A2`（ヘッダデコード）・`A3`（RLS 判定）が次点。`A4`（dim/metadata デコード）・`A5`（スカラー構造検証）の追加コストは相対的に小さい（100k 点で A3→A5 合計は A1→A3 合計の半分未満）。`agg_count`／`rls_isolation` の e2e（A0a/A0b）は両 ctx でほぼ同値（差 1%未満）——同一走査であるという設計時の仮説（§背景）を実測で確認した。
-- W 系列: `W3`（arena_copy）が規模とともに支配的になる（25k 点で W2 比 +17.8%、100k 点で W2 比 +72.2%）。一致行数（`lang='ja'` ≈ 20%）に比例して複製コストが伸びるため、規模が大きいほど `W3` の相対寄与が増す。`W0-hot − W0-nowhere`（SQL 表層内の `WHERE` 上乗せ全体）は 25k で 0.598ms・100k で 3.253ms であり、W1+W2+W3 の合計（25k: 0.489ms・100k: 2.908ms〔累積値としては W3 の median と同じ〕）に近い値で、残差はパース・束縛・キャッシュ照会等の付随コストと解釈できる。
+- A 系列: `A1`（走査のみ）が総コストの 3〜4 割を占め、`A2`（ヘッダデコード）・`A3`（RLS 判定）が次点。`A4`（dim/metadata デコード。A3 と同じキー/ヘッダ tenant 整合検査を含む）・`A5`（スカラー構造検証）の追加コストは A1〜A3 の合計より小さいが、`A3→A4` は両規模で `above_noise_band` であり無視できない（25k: +11.5%・100k: +10.1%）。`agg_count`／`rls_isolation` の e2e（A0a/A0b）は両 ctx でほぼ同値（差 1%未満）——同一走査であるという設計時の仮説（§背景）を実測で確認した。
+- W 系列: `W3`（arena_copy）が規模とともに支配的になる（25k 点で W2 比 +19.4%、100k 点で W2 比 +79.5%）。一致行数（`lang='ja'` ≈ 20%）に比例して複製コストが伸びるため、規模が大きいほど `W3` の相対寄与が増す。`W0-hot` と `W0-nowhere` は候補集合が異なるため両者の raw diff を「`WHERE` 上乗せ」として単純に解釈することはできない（詳細は前節「W0-hot と W0-nowhere の候補集合差」）。
 - `W0-cold`（`SqlArenaCache` を毎回空の状態から測る）は `W0-hot` の約 9〜11 倍——`SqlArenaCache`（Issue #363）のヒット有無がクエリ毎の redb 再デコードコストを大きく左右することを示す（`vector_knn_where` の crossdb 実測がどちらの状態に近いかは、crossdb ハーネスの接続再利用方針に依存するため本 Issue の対象外）。
 
 ## #477（可視ビットマップ世代整合キャッシュ）・#471（スカラー列二次索引）への帰属
@@ -159,7 +170,7 @@ e2e: `W0-cold`=74.308ms・`W0-hot`=6.508ms・`W0-nowhere`=3.256ms。`W0-hot − 
 | W3 一致行 arena 複製 | 不可 | 一部（候補集合縮小で複製量は減るが複製自体は残る） |
 | W4 距離＋Top-k／R_dot | 不可（参照区間） | 不可（参照区間） |
 
-**所見**: `agg_count`／`rls_isolation` は `WHERE` を持たず `on_visible_row` を通らないため、#471 が `agg_count` を対象に挙げている前提は本経路には当てはまらない（`where_compound_count` には当てはまる）。両フェーズの改善は #477 側の段（A1〜A5、実測では特に A1〜A3）に帰属する。`vector_knn_where` は `W0-hot − W0-nowhere` の上乗せのうち W1＋W2 の比率で #471 の効果上限を、`W0-cold − W0-hot` で `SqlArenaCache` の寄与を示す。
+**所見**: `agg_count`／`rls_isolation` は `WHERE` を持たず `on_visible_row` を通らないため、#471 が `agg_count` を対象に挙げている前提は本経路には当てはまらない（`where_compound_count` には当てはまる）。両フェーズの改善は #477 側の段（A1〜A5、実測では特に A1〜A3）に帰属する。`vector_knn_where` は候補集合を揃えた W1＋W2（`scan_scalar_columns`＋述語判定。dense 探索の候補集合サイズに依存しない）の比率で #471 の効果上限を、`W0-cold − W0-hot` で `SqlArenaCache` の寄与を示す（`W0-hot − W0-nowhere` の raw diff は前節の理由により #471／`SqlArenaCache` いずれの効果上限の根拠にも用いない）。
 
 ## `feature_bench` との差異
 

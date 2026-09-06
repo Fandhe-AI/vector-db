@@ -194,14 +194,18 @@ fn measure_a_series(
         visible
     };
 
-    // A4: A3 ＋ dim・metadata 借用デコード（可視行のみ）。
+    // A4: A3（RLS 判定＋キー/ヘッダ tenant 整合検査）＋ dim・metadata 借用デコード
+    // （可視行のみ）。累積段契約（A3 ⊆ A4 ⊆ A5）を保つため、A3 が行う
+    // `verify_row_key_tenant_reimpl` はここでも省略せず実行する（省略すると
+    // A4−A3 の差分がデコード追加コストではなく整合性検査コスト分だけ過小に
+    // 出てしまい、後続の性能改善の帰属を誤る）。
     let a4 = run(config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
         let mut checksum: u64 = 0;
         for entry in table.iter().expect("iter row table") {
-            let (_k, v) = entry.expect("iterate row entry");
+            let (k, v) = entry.expect("iterate row entry");
             let (tenant_id, is_public, _offset) =
                 harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
             let visibility = if is_public {
@@ -210,6 +214,9 @@ fn measure_a_series(
                 Visibility::Private
             };
             if is_visible(ctx, tenant_id, visibility) {
+                let (key_tenant, _id) = k.value();
+                verify_row_key_tenant_reimpl(key_tenant, tenant_id)
+                    .expect("row key tenant must match header tenant for well-formed rows");
                 let (dim, metadata) = decode_dim_and_metadata_reimpl(v.value())
                     .expect("dim/metadata decode must succeed for well-formed synthetic rows");
                 checksum = checksum.wrapping_add(std::hint::black_box(dim as u64));
@@ -221,14 +228,16 @@ fn measure_a_series(
     })
     .expect("measurement must satisfy protocol minimums");
 
-    // A5: A4 ＋ `row_codec::validate_scalar_columns`（可視行のみ）。
+    // A5: A4（キー/ヘッダ tenant 整合検査を含む）＋
+    // `row_codec::validate_scalar_columns`（可視行のみ）。A4 と同じ理由で
+    // `verify_row_key_tenant_reimpl` を省略しない。
     let a5 = run(config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
         let mut rows = 0usize;
         let mut checksum: u64 = 0;
         for entry in table.iter().expect("iter row table") {
-            let (_k, v) = entry.expect("iterate row entry");
+            let (k, v) = entry.expect("iterate row entry");
             let (tenant_id, is_public, _offset) =
                 harness::knn_profile::decode_header_reimpl(v.value()).expect("header decode");
             let visibility = if is_public {
@@ -237,6 +246,9 @@ fn measure_a_series(
                 Visibility::Private
             };
             if is_visible(ctx, tenant_id, visibility) {
+                let (key_tenant, _id) = k.value();
+                verify_row_key_tenant_reimpl(key_tenant, tenant_id)
+                    .expect("row key tenant must match header tenant for well-formed rows");
                 let (dim, metadata) =
                     decode_dim_and_metadata_reimpl(v.value()).expect("dim/metadata decode");
                 engine::row_codec::validate_scalar_columns(schema, metadata)
@@ -657,6 +669,23 @@ fn main() {
             w0_hot_result.rows.len()
         ));
     }
+    // cold 側と同じ「返却 id が lang='ja' の可視集合に含まれる」検証を hot 側にも
+    // 課す。cache ヒット経路（`SqlArenaCache`／`sql/hnsw_cache.rs` 等）はここでしか
+    // 通過せず、キャッシュヒット時にフィルタが未適用のまま別の行が返っても件数
+    // だけの確認では検出できない（P2 指摘）。
+    let w0_hot_ids: Vec<u64> = w0_hot_result
+        .rows
+        .iter()
+        .map(|row| match row.cells.first() {
+            Some(Cell::Integer(v)) => *v,
+            other => fail_closed(format!("W0-hot id cell type mismatch: got {other:?}")),
+        })
+        .collect();
+    if w0_hot_ids.iter().any(|id| !expected_match_ids.contains(id)) {
+        fail_closed(
+            "W0-hot returned an id outside the lang='ja' visible set (tenant/filter leak suspected, possibly via a stale cache hit)",
+        );
+    }
 
     let w0_nowhere = run(&config, || {
         core.execute_sql(&ctx_a, &sql_nowhere)
@@ -904,10 +933,21 @@ fn main() {
         "e2e(vector_knn/W0-nowhere, cache fast path): median={:.3}ms",
         w0_nowhere.summary.median.as_secs_f64() * 1e3
     );
+    // 注意: `W0-nowhere` は可視行全体（tenant_a_rows 件）を候補集合として
+    // dense 探索するのに対し、`W0-hot` は `lang='ja'` 一致行（約 20%）のみを
+    // 候補集合とする。したがってこの raw diff には「SQL 表層内の WHERE 上乗せ」
+    // だけでなく、dense 探索（距離計算・Top-k 選出）の候補集合サイズが異なる
+    // ことによる処理量差も混入する（W3/W4 が示すとおり候補集合が小さいほど
+    // 距離計算・Top-k コストは減る側に働くため、この raw diff を「WHERE 上乗せ」
+    // として単純に W1+W2+W3 の合計・残差の帰属に使うことはできない。候補集合を
+    // 揃えた比較は W 系列〔`W1`〜`W4`、いずれも一致行のみを対象〕・`R_dot`
+    // （全可視行対象の参照区間）側で行う。P2 指摘・詳細は
+    // `docs/design/scan-stage-profile.md`「W0-hot と W0-nowhere の候補集合差」
+    // 節を参照）。
     let where_overhead_diff = w0_hot.summary.median.checked_sub(w0_nowhere.summary.median);
     match where_overhead_diff {
         Some(d) => println!(
-            "diff(W0-nowhere->W0-hot, WHERE overhead in SQL surface): {:.3}ms",
+            "diff(W0-nowhere->W0-hot, raw diff; conflates WHERE overhead with reduced dense candidate set size, see docs): {:.3}ms",
             d.as_secs_f64() * 1e3
         ),
         None => println!(
