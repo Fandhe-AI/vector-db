@@ -579,6 +579,21 @@ pub(crate) fn execute_statement_with_cache(
         needed_column_indices.extend(bound.metadata_filters.iter().map(|f| f.column_index()));
     }
 
+    // Issue #453（SQL-1・SQL-3。ポインタ: `docs/spec/04-behavior/sql-surface.md`
+    // SQL-1・SQL-3、`docs/design/crossdb-bench.md`「self の投影コスト切り分け」節）:
+    // `WHERE`（メタデータフィルタ・式述語）も hybrid（疎コーパス蓄積に本文列を
+    // 要する）も絡まないクエリでスカラー列を投影する場合に限り、`on_visible_row`
+    // での毎行 `scan_scalar_columns`（構造検証＋`Text` 列の `String` 複製）を
+    // 省略し、`RlsSafetyNet::apply` 通過後の Top-k（またはそれ以下）の行だけへ
+    // 遅延させる（下記 `project_rows` の `ScalarSource::Deferred` 参照）。この
+    // 3 条件が成り立つ場合、SCALAR 段は `HINT ORDER` の内容に関係なく事前・事後
+    // いずれの等価条件判定も持たない恒等写像になるため、遅延しても既存の実行順序
+    // 契約（モジュールドキュメント「RLS → SCALAR → DISTANCE」）を変えない。
+    let defer_projection = bound.metadata_filters.is_empty()
+        && bound.expr_filters.is_empty()
+        && !is_hybrid
+        && !needed_column_indices.is_empty();
+
     // `candidate_columns` に保持する Text 値の実バイト数に加え、行ごとに必ず確保する
     // `Vec<Value>` 自体の構造体サイズも累計する（[`MAX_CANDIDATE_SCALAR_BYTES`] の
     // ドキュメント参照。投影列を持たない `SELECT id ...` でも候補行数に比例して
@@ -604,6 +619,18 @@ pub(crate) fn execute_statement_with_cache(
                           embedding: &[f32],
                           metadata: &[u8]|
      -> std::result::Result<bool, ArenaError> {
+        // Issue #453: `defer_projection` が真の場合（`WHERE`・式述語・hybrid の
+        // いずれも絡まずスカラー列を投影するクエリ）、SCALAR 段は恒等写像であり
+        // ここで判定すべきフィルタが存在しない。`scan_scalar_columns`（構造検証＋
+        // `Text` 列の `String` 複製）を全可視行に適用するコストを避けるため、
+        // ここでは一切走査せず可視行をそのまま通過させる。投影に必要なスカラー
+        // 列の取得・デコードは `RlsSafetyNet::apply` 通過後の Top-k 行に限って
+        // `project_rows` の `ScalarSource::Deferred` が行う（下記参照）。
+        if defer_projection {
+            debug_assert_eq!(candidate_columns.len(), slot);
+            candidate_columns.push(Vec::new());
+            return Ok(true);
+        }
         // Issue #56 レビュー指摘対応・codex P1: 旧実装は `decode_scalar_columns` で
         // 全 `Text` 列を無条件に `to_string()` 確保してから、投影に不要な列を
         // 捨てていた。最大長 `Text` 列を多数持つスキーマでは `SELECT id` のような
@@ -738,16 +765,23 @@ pub(crate) fn execute_statement_with_cache(
     // 直接借用する（Issue #363 追補: `build_from_cached_rls_rows` 経由の複製でも
     // redb 走査・デコードは避けられるが、行数が多いテーブルではこの per-row
     // コピー自体が支配的コストになることが実測〔`make bench-c1` 相当〕で判明した）。
-    // 4 条件がすべて成り立つ場合のみ SCALAR 段が恒等写像になる（`on_visible_row`
+    // 3 条件がすべて成り立つ場合のみ SCALAR 段が恒等写像になる（`on_visible_row`
     // の実装〔本関数冒頭〕参照）: (a) メタデータフィルタなし (b) 式述語なし
-    // (c) hybrid でない（疎コーパス蓄積が不要） (d) 投影が候補スカラー列を
-    // 一切参照しない（`needed_column_indices` が空）。この場合 `HINT ORDER` の
-    // 内容（`plan.scalar_prefilter`）によらず結果は変わらない（SCALAR 段が
-    // 空判定である以上、先行でも後行でも同じ）。
-    let cache_fast_path_eligible = bound.metadata_filters.is_empty()
-        && bound.expr_filters.is_empty()
-        && !is_hybrid
-        && needed_column_indices.is_empty();
+    // (c) hybrid でない（疎コーパス蓄積が不要）。この場合 `HINT ORDER` の内容
+    // （`plan.scalar_prefilter`）によらず結果は変わらない（SCALAR 段が空判定で
+    // ある以上、先行でも後行でも同じ）。
+    //
+    // Issue #453 以前は「投影が候補スカラー列を一切参照しない
+    // （`needed_column_indices` が空）」も 4 つ目の条件だった。投影列を参照する
+    // クエリはこの高速経路から外れ、`SELECT id ...`（Issue #314）以外は毎回
+    // `build_from_cached_rls_rows` 経由の全行再構築を経ていた。`defer_projection`
+    // （投影で参照するスカラー列のデコード自体を Top-k 確定後へ遅延する。上記
+    // ドキュメント参照）の導入により、投影列の有無は SCALAR 段の恒等写像性に
+    // 影響しなくなった（`defer_projection` が真のとき `on_visible_row` は
+    // `needed_column_indices` の中身に関係なく空 `Vec` を積むだけの早期リターンに
+    // なる）ため、この条件は不要になり撤去した。
+    let cache_fast_path_eligible =
+        bound.metadata_filters.is_empty() && bound.expr_filters.is_empty() && !is_hybrid;
 
     let rls_hook = ImplicitRlsHook::new(ctx);
     // 借用元を関数スコープ末尾まで生かすための保持先（`arena` はこのいずれかを
@@ -795,7 +829,26 @@ pub(crate) fn execute_statement_with_cache(
                     for _ in 0..snapshot.arena().len() {
                         candidate_columns.push(Vec::new());
                     }
-                    cache_hit_snapshot.insert(snapshot).arena()
+                    // Issue #453: `cache_hit_snapshot` を `.insert()`（排他借用）
+                    // ではなく通常代入 + `.as_ref()`（共有借用）で埋める。投影段
+                    // （`defer_projection`）が Top-k 確定後に `cache_hit_snapshot`
+                    // の `metadata()` を再度参照するため、`arena` 変数の生存期間中
+                    // ずっと排他借用が居座る `.insert()` の戻り値を使うと、後続の
+                    // 共有借用（`scalar_source` の組み立て）と競合する（E0502）。
+                    // 共有借用同士は共存できるためこの形にする。
+                    cache_hit_snapshot = Some(snapshot);
+                    cache_hit_snapshot
+                        .as_ref()
+                        .ok_or_else(|| {
+                            map_arena_error(
+                                &bound.table,
+                                ArenaError::AllocationFailed(
+                                    "cache hit snapshot missing immediately after assignment"
+                                        .to_string(),
+                                ),
+                            )
+                        })?
+                        .arena()
                 } else {
                     // ヒットだが SCALAR 段に実質的な処理がある: 従来どおり
                     // キャッシュ済みスナップショットへ `on_visible_row` を
@@ -1370,12 +1423,44 @@ pub(crate) fn execute_statement_with_cache(
         Some((tenant, visibility))
     });
 
+    // Issue #453: `defer_projection` が真のとき、`candidate_columns` は
+    // 全スロットぶん空 `Vec` が積まれているだけ（`on_visible_row` の早期リターン・
+    // 高速経路の空 `Vec` 埋めのいずれか）で使えない。投影で参照する列のマスクと、
+    // Top-k 行の metadata 取得元（キャッシュヒットなら `SqlArenaSnapshot`、
+    // それ以外は候補選択と同一 `read_txn` 上での行テーブル再取得）を
+    // `project_rows` へ渡す。
+    let needed_mask: Vec<bool> = if defer_projection {
+        let mut mask = vec![false; schema.columns.len()];
+        for idx in &needed_column_indices {
+            if let Some(slot) = mask.get_mut(*idx) {
+                *slot = true;
+            }
+        }
+        mask
+    } else {
+        Vec::new()
+    };
+    let scalar_source = if defer_projection {
+        match &cache_hit_snapshot {
+            Some(snapshot) => {
+                ScalarSource::Deferred(DeferredScalars::Snapshot(snapshot.metadata()))
+            }
+            None => ScalarSource::Deferred(DeferredScalars::Redb {
+                read_txn,
+                row_table_name: crate::catalog::user_rows_table_name(&bound.table),
+            }),
+        }
+    } else {
+        ScalarSource::Eager(&candidate_columns)
+    };
+
     let rows = project_rows(
         verified,
         &bound.projection,
         schema,
         arena,
-        &candidate_columns,
+        scalar_source,
+        &needed_mask,
     )?;
 
     let columns = bound
@@ -1428,21 +1513,181 @@ pub fn execute_statement(
     )
 }
 
+/// 投影段（TASK-136・RLS-5）が参照するスカラー列の取得元（Issue #453）。
+///
+/// `Eager` は従来どおり `on_visible_row` が全可視行分あらかじめ複製しておいた
+/// [`Value`] を参照するだけ（`WHERE`・式述語・hybrid のいずれかが絡むクエリ）。
+/// `Deferred` は SCALAR 段の走査・複製そのものを省略しており、`project_rows` の
+/// 行ループが `RlsSafetyNet::apply` 通過後の Top-k 行に限って必要列だけを都度
+/// デコードする（`defer_projection` のドキュメント参照。`sql::exec` モジュール
+/// 冒頭）。
+enum ScalarSource<'a> {
+    Eager(&'a [Vec<Value>]),
+    Deferred(DeferredScalars<'a>),
+}
+
+/// 1 行分のスカラー列（[`ScalarSource`] のどちらから取得したかを吸収する）。
+/// `Eager` は `candidate_columns` を借用するだけ、`Deferred` は
+/// [`decode_deferred_scalars`]／[`decode_deferred_scalars_from_redb`] が返す
+/// 新規複製の `Vec<Value>` を保持する。
+enum RowScalars<'a> {
+    Borrowed(&'a [Value]),
+    Owned(Vec<Value>),
+}
+
+impl RowScalars<'_> {
+    fn get(&self, index: usize) -> Option<&Value> {
+        match self {
+            RowScalars::Borrowed(values) => values.get(index),
+            RowScalars::Owned(values) => values.get(index),
+        }
+    }
+}
+
+/// [`ScalarSource::Deferred`] の 2 通りの取得元（いずれも候補選択と同一
+/// スナップショットに閉じる。モジュールドキュメント「単一スナップショット」契約
+/// 参照）。
+enum DeferredScalars<'a> {
+    /// キャッシュヒット時（`cache_fast_path_eligible`）。応答 `arena` が
+    /// `snapshot.arena()` の直接借用であるため、スロット添字が
+    /// `SqlArenaSnapshot::metadata()` とそのまま一致する。
+    Snapshot(&'a [Vec<u8>]),
+    /// キャッシュミス／`arena_cache == None`（公開ラッパー `execute_statement`）。
+    /// 候補選択に使ったのと同一の `read_txn` 上で行テーブルを再度開き、
+    /// `(tenant_id, id)` の複合キーで metadata を再取得する（TABLE-12）。
+    Redb {
+        read_txn: &'a redb::ReadTransaction,
+        row_table_name: String,
+    },
+}
+
+/// [`ScalarSource::Deferred`] の metadata バイト列から、`needed_mask` で示された
+/// 列だけを [`Value`] として複製する（`row_codec::scan_scalar_columns_masked` の
+/// マスク契約: マスク外列も UTF-8 妥当性検証は行うが `&str` 化・複製は省略する。
+/// PR #369 の契約はここでも弱めない）。`budget`（呼び出し元が Top-k 全体で使い回す
+/// 累計カウンタ）は [`MAX_CANDIDATE_SCALAR_BYTES`] を超えたら確保前に fail-closed
+/// で拒否する（`try_alloc_text_for_budget` と同じ契約。Top-k 行だけが対象のため
+/// 実際の複製量は従来の全可視行版よりも小さくなる）。
+fn decode_deferred_scalars(
+    schema: &TableSchema,
+    metadata: &[u8],
+    needed_mask: &[bool],
+    budget: &mut usize,
+) -> Result<Vec<Value>, SqlSurfaceError> {
+    let scanned = row_codec::scan_scalar_columns_masked(schema, metadata, Some(needed_mask))
+        .map_err(SqlSurfaceError::from)?;
+    let mut out = Vec::with_capacity(scanned.len());
+    for (idx, slot) in scanned.into_iter().enumerate() {
+        if !needed_mask.get(idx).copied().unwrap_or(false) {
+            out.push(Value::Null);
+            continue;
+        }
+        match slot {
+            None => out.push(Value::Null),
+            Some(t) => {
+                let owned = try_alloc_text_for_budget(t, budget, MAX_CANDIDATE_SCALAR_BYTES)
+                    .map_err(|_| {
+                        SqlSurfaceError::payload_too_large(
+                            "deferred scalar projection exceeds candidate budget",
+                        )
+                    })?;
+                out.push(Value::Text(owned));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// [`ScalarSource::Deferred(DeferredScalars::Redb { .. })`] 専用: `slot` に対応する
+/// 行を `(tenant_id, id)` の複合キーで再取得し、metadata を
+/// [`decode_deferred_scalars`] へ渡す。TABLE-12 のキー/ヘッダ tenant 整合検査
+/// （`storage::verify_row_key_tenant`）をここで行う——候補選択のアリーナ構築経路
+/// （`arena.rs`）はこの照合を行わないため、遅延投影の再取得側で defense-in-depth
+/// として追加する（受け入れ条件 2「現状どおり維持」を弱めず、むしろ強化する）。
+/// 行欠落・デコード失敗・tenant 不整合はいずれも当該行を黙ってスキップせず
+/// `SqlSurfaceError::Internal`（固定文言。テナント・id を含めない）として
+/// クエリ全体を fail-closed に拒否する。
+#[allow(clippy::too_many_arguments)]
+fn decode_deferred_scalars_from_redb(
+    table: &redb::ReadOnlyTable<(&'static str, u64), &'static [u8]>,
+    schema: &TableSchema,
+    arena: &VectorArena,
+    slot: usize,
+    row_id: u64,
+    needed_mask: &[bool],
+    budget: &mut usize,
+) -> Result<Vec<Value>, SqlSurfaceError> {
+    let key_tenant = arena
+        .tenant_id(slot)
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "candidate arena index out of range".to_string(),
+        })?;
+    let guard = table
+        .get((key_tenant, row_id))
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "deferred scalar projection lookup failed".to_string(),
+        })?
+        .ok_or_else(|| SqlSurfaceError::Internal {
+            detail: "deferred scalar projection row not found".to_string(),
+        })?;
+    let buf = guard.value();
+    let (header_tenant, _visibility) = crate::storage::decode_row_tenant_and_visibility(buf)
+        .map_err(|_| SqlSurfaceError::Internal {
+            detail: "deferred scalar projection header decode failed".to_string(),
+        })?;
+    crate::storage::verify_row_key_tenant(key_tenant, header_tenant).map_err(|_| {
+        SqlSurfaceError::Internal {
+            detail: "deferred scalar projection tenant mismatch".to_string(),
+        }
+    })?;
+    let metadata = crate::storage::decode_row_metadata_borrowed(buf).map_err(|_| {
+        SqlSurfaceError::Internal {
+            detail: "deferred scalar projection metadata decode failed".to_string(),
+        }
+    })?;
+    decode_deferred_scalars(schema, metadata, needed_mask, budget)
+}
+
 /// 投影段（TASK-136・RLS-5）。引数を [`RlsVerifiedHits`]（witness 型）に固定する
 /// ことで、[`RlsSafetyNet::apply`] を経由しない生の `Vec<(u64, f64)>` から本関数へ
 /// 到達する経路を型として作れなくする（`execute_statement` からのみ呼ばれる）。
 /// `storage` への再取得は行わず、候補選択（`build_filtered_with_rows`）と同一
 /// スナップショットで保持しておいた embedding（`arena`）・デコード済みスカラー列
-/// （`candidate_columns`）から返却行を構築する（候補選択後に対象行が更新・削除
+/// （`scalar_source`）から返却行を構築する（候補選択後に対象行が更新・削除
 /// されても、投影は候補選択時点の値を返すため、RLS・スカラー WHERE・embedding が
-/// 候補選択と投影とで食い違うことはない）。
+/// 候補選択と投影とで食い違うことはない）。`scalar_source` が
+/// [`ScalarSource::Deferred`] の場合のみ Top-k 確定後にここで再取得・デコードが
+/// 発生する（`needed_mask` はその場合にのみ意味を持ち、`Eager` では無視する）。
 fn project_rows(
     verified: RlsVerifiedHits,
     projection: &[ProjectedColumn],
     schema: &TableSchema,
     arena: &VectorArena,
-    candidate_columns: &[Vec<Value>],
+    scalar_source: ScalarSource<'_>,
+    needed_mask: &[bool],
 ) -> Result<Vec<ResultRow>, SqlSurfaceError> {
+    // `ScalarSource::Deferred(DeferredScalars::Redb { .. })` のときだけ行テーブルを
+    // 1 回開く。行を 1 件も持たないテーブル（`user_rows/{table}` 未作成）は
+    // `TableDoesNotExist` になるが、この場合ヒットも必ず 0 件（可視行が存在
+    // しなければ候補も存在しない）なので、下の行ループで実際に参照されることは
+    // ない。ここでは `None` として通し、実際に参照されたときにだけ
+    // fail-closed に拒否する（`redb_table.as_ref().ok_or_else(...)` 参照）。
+    let redb_table = match &scalar_source {
+        ScalarSource::Deferred(DeferredScalars::Redb {
+            read_txn,
+            row_table_name,
+        }) => match read_txn.open_table(crate::catalog::user_rows_table_def(row_table_name)) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(_) => {
+                return Err(SqlSurfaceError::Internal {
+                    detail: "deferred scalar projection table open failed".to_string(),
+                })
+            }
+        },
+        ScalarSource::Eager(_) | ScalarSource::Deferred(DeferredScalars::Snapshot(_)) => None,
+    };
+    let mut deferred_budget: usize = 0;
     let hits = verified.into_hits();
     let mut rows = Vec::with_capacity(hits.len());
     // Issue #353: `ProjectedColumn`（`pub` enum）の形状は変えず、`Computed` 列の
@@ -1473,18 +1718,58 @@ fn project_rows(
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "candidate arena index out of range".to_string(),
             })?;
-        let decoded = candidate_columns
-            .get(slot)
-            .ok_or_else(|| SqlSurfaceError::Internal {
-                detail: "search hit is missing from candidate scalar columns".to_string(),
-            })?;
-        // クライアントへ返す id は本来の行 `id`（スロット番号ではない）。
+        // クライアントへ返す id は本来の行 `id`（スロット番号ではない）。`decoded`
+        // の取得元によっては（`Deferred(Redb)`）行の再取得キーとしても使うため
+        // `decoded` の前に確定させる。
         let id = *arena
             .ids()
             .get(slot)
             .ok_or_else(|| SqlSurfaceError::Internal {
                 detail: "candidate arena index out of range".to_string(),
             })?;
+        // Issue #453: `Eager` は `on_visible_row` が全可視行分あらかじめ複製して
+        // おいた値を借用するだけ（従来どおり）。`Deferred` はここで初めて
+        // metadata を取得し、投影に必要な列だけをデコードする（Top-k 確定後の
+        // 行だけが対象になるため、`WHERE`・hybrid が絡まないクエリでは全可視行
+        // 分のデコードコストが `limit` に依存しない固定コストではなくなる）。
+        let decoded: RowScalars<'_> = match &scalar_source {
+            ScalarSource::Eager(candidate_columns) => {
+                RowScalars::Borrowed(candidate_columns.get(slot).ok_or_else(|| {
+                    SqlSurfaceError::Internal {
+                        detail: "search hit is missing from candidate scalar columns".to_string(),
+                    }
+                })?)
+            }
+            ScalarSource::Deferred(DeferredScalars::Snapshot(metadata)) => {
+                let meta = metadata
+                    .get(slot)
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "search hit is missing from candidate scalar columns".to_string(),
+                    })?;
+                RowScalars::Owned(decode_deferred_scalars(
+                    schema,
+                    meta,
+                    needed_mask,
+                    &mut deferred_budget,
+                )?)
+            }
+            ScalarSource::Deferred(DeferredScalars::Redb { .. }) => {
+                let table = redb_table
+                    .as_ref()
+                    .ok_or_else(|| SqlSurfaceError::Internal {
+                        detail: "deferred scalar projection table missing".to_string(),
+                    })?;
+                RowScalars::Owned(decode_deferred_scalars_from_redb(
+                    table,
+                    schema,
+                    arena,
+                    slot,
+                    id,
+                    needed_mask,
+                    &mut deferred_budget,
+                )?)
+            }
+        };
         let mut cells = Vec::with_capacity(projection.len());
         for (col_idx, col) in projection.iter().enumerate() {
             match col {
@@ -1901,5 +2186,176 @@ mod tests {
     fn try_clone_text_handles_empty_string() {
         let cloned = try_clone_text("").expect("empty copy must succeed");
         assert!(cloned.is_empty());
+    }
+
+    // Issue #453・3.5 節「契約上の注記」の回帰テスト: `defer_projection` は
+    // Top-k 確定後の行だけをデコードするため、Top-k **に含まれない**可視行の
+    // スカラーペイロード破損は当該クエリでは検出されなくなる（`SELECT id` 高速
+    // 経路・Issue #314・#363 と同じ既存の挙動）。一方 Top-k **に含まれる**行の
+    // 破損は従来どおり fail-closed に検出する。`catalog::user_rows_table_def` は
+    // `pub(crate)` のため結合テスト（`tests/`）からは直接行を破損できず、本テストは
+    // crate 内単体テストとして `arena.rs::tests` の破損注入手法（生の write
+    // トランザクションで `encode_row` 済みバイト列を直接書き込む）を踏襲する。
+    mod deferred_projection_corruption {
+        use crate::catalog::{self, ColumnDef, ColumnType, TableSchema};
+        use crate::core::EngineCore;
+        use crate::kernel::CpuScalarProvider;
+        use crate::policy::PolicyContext;
+        use crate::recovery::required_op_id::OperationId;
+        use crate::row_codec::Value;
+        use crate::sql::allowlist::SqlSurfaceError;
+        use crate::storage::{RowInput, Storage, Visibility};
+        use crate::test_util::temp_db::{unique_db_path, CleanupGuard};
+
+        const TENANT: &str = "tenant-a";
+
+        fn op_id(label: &str) -> OperationId {
+            OperationId::parse(label).expect("valid operation id")
+        }
+
+        fn schema() -> TableSchema {
+            TableSchema::new(
+                "docs",
+                vec![
+                    ColumnDef::new("embedding", ColumnType::Vector(2), false),
+                    ColumnDef::new("body", ColumnType::Text, false),
+                ],
+            )
+        }
+
+        /// `id` の行を正規の `insert_typed_row` 経由で投入したうえで、その
+        /// metadata（`body` 列のペイロード）だけを不正 UTF-8 へ書き換えた raw
+        /// バイト列で直接上書きする（`arena.rs::tests` の次元不一致注入と同じ、
+        /// 検証を経由しない生の write トランザクション）。
+        fn seed_then_corrupt_body(
+            storage: &Storage,
+            ctx: &PolicyContext,
+            id: u64,
+            embedding: [f32; 2],
+            seed_label: &str,
+        ) {
+            crate::tenant::insert_typed_row(
+                storage,
+                "docs",
+                ctx,
+                id,
+                Visibility::Public,
+                &[
+                    Value::Vector(embedding.to_vec()),
+                    Value::Text("placeholder".to_string()),
+                ],
+                &op_id(seed_label),
+            )
+            .expect("seed row before corruption");
+
+            let mut metadata = crate::row_codec::encode_scalar_columns(
+                &schema(),
+                &[Value::Null, Value::Text("placeholder".to_string())],
+            )
+            .expect("encode scalar metadata");
+            // `metadata` レイアウト: [presence=NULL (embedding列はスキップされる
+            // ため実際は body 列の presence から始まる)] presence(1) + len(4 LE) +
+            // text_bytes。`encode_scalar_columns` は VECTOR 列をスキップするため
+            // 先頭バイトは body 列の presence タグ（`PRESENCE_VALUE`）になる。
+            // 末尾のテキストバイトの 1 バイトを不正な UTF-8 継続バイトへ書き換える
+            // （宣言長・presence タグは変えないため構造検証自体は通り、UTF-8
+            // 検証でのみ失敗する）。
+            let last = metadata.len() - 1;
+            metadata[last] = 0xFF;
+
+            let encoded = crate::storage::encode_row(&RowInput {
+                tenant_id: TENANT,
+                visibility: Visibility::Public,
+                embedding: &embedding,
+                metadata: &metadata,
+            })
+            .expect("encode corrupted row");
+
+            let write_txn = storage.db().begin_write().expect("begin_write");
+            {
+                let row_table_name = catalog::user_rows_table_name("docs");
+                let mut row_table = write_txn
+                    .open_table(catalog::user_rows_table_def(&row_table_name))
+                    .expect("open row table");
+                row_table
+                    .insert((TENANT, id), encoded.as_slice())
+                    .expect("overwrite row with corrupted metadata");
+            }
+            write_txn.commit().expect("commit corrupted row");
+        }
+
+        #[test]
+        fn corrupted_row_outside_top_k_is_not_detected_and_query_succeeds() {
+            let path = unique_db_path("deferred-projection-corrupt-outside-topk");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage.create_table(&schema()).expect("create table");
+            let ctx = PolicyContext::new(TENANT).expect("valid tenant");
+
+            // id=1 は距離最小（Top-1）、id=2 は破損させたうえで距離最大（Top-k
+            // 圏外）に置く。`LIMIT 1` で Top-k に含まれない id=2 の破損が
+            // 観測されないことを固定する。
+            crate::tenant::insert_typed_row(
+                &storage,
+                "docs",
+                &ctx,
+                1,
+                Visibility::Public,
+                &[
+                    Value::Vector(vec![1.0, 0.0]),
+                    Value::Text("winner".to_string()),
+                ],
+                &op_id("outside-topk-1"),
+            )
+            .expect("insert winning row");
+            seed_then_corrupt_body(&storage, &ctx, 2, [0.0, 1.0], "outside-topk-2");
+
+            let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+            let result = core
+                .execute_sql(
+                    &ctx,
+                    "SELECT id, body FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
+                )
+                .expect("query must succeed: corrupted row is outside top-k");
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].id, 1);
+        }
+
+        #[test]
+        fn corrupted_row_inside_top_k_is_rejected_fail_closed() {
+            let path = unique_db_path("deferred-projection-corrupt-inside-topk");
+            let _guard = CleanupGuard(path.clone());
+            let storage = Storage::open(&path).expect("open storage");
+            storage.create_table(&schema()).expect("create table");
+            let ctx = PolicyContext::new(TENANT).expect("valid tenant");
+
+            // id=1 を破損させたうえで距離最小（Top-1 圏内）に置く。
+            seed_then_corrupt_body(&storage, &ctx, 1, [1.0, 0.0], "inside-topk-1");
+            crate::tenant::insert_typed_row(
+                &storage,
+                "docs",
+                &ctx,
+                2,
+                Visibility::Public,
+                &[
+                    Value::Vector(vec![0.0, 1.0]),
+                    Value::Text("loser".to_string()),
+                ],
+                &op_id("inside-topk-2"),
+            )
+            .expect("insert losing row");
+
+            let core = EngineCore::from_storage(storage, Box::new(CpuScalarProvider));
+            let err = core
+                .execute_sql(
+                    &ctx,
+                    "SELECT id, body FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 1",
+                )
+                .expect_err("query must fail: corrupted row is inside top-k");
+            assert!(
+                matches!(err, SqlSurfaceError::Internal { .. }),
+                "corruption must be rejected fail-closed as an internal error, got {err:?}"
+            );
+        }
     }
 }
