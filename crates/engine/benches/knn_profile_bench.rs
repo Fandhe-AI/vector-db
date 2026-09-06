@@ -101,7 +101,7 @@ use harness::knn_profile::{
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
 use harness::rng::DeterministicRng;
-use harness::sql_c1::{c1_statement, vector_literal};
+use harness::sql_c1::{c1_statement, c1_where_statement, vector_literal};
 use harness::stats;
 
 use std::hint::black_box;
@@ -109,11 +109,13 @@ use std::time::{Duration, Instant};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::hnsw::{HnswParams, Ratio, ValidatedHnswParams};
 use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
-use engine::search_engine;
+use engine::row_codec::{encode_scalar_columns, Value as RowValue};
+use engine::search_engine::{self, SearchEngineKind};
 use engine::sql::exec::Cell;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::{arena::VectorArena, tenant};
@@ -132,6 +134,17 @@ const TENANT_B: &str = "tenant-b";
 const TENANT_B_ROWS: usize = 5_000;
 const TOTAL_ROWS: usize = TENANT_A_ROWS + TENANT_B_ROWS;
 const TOP_K: usize = 10;
+
+/// `BENCH_KNN_PROFILE_VISIBLE_RATIO` が受理する分母の上限（Issue #487）。行数
+/// スケール上限（[`MAX_SWEEP_SCALE`]）× [`TOTAL_ROWS`] でも可視行数が [`TOP_K`]
+/// 未満に潰れない範囲を確保しつつ、無制限な `bucket` 列挙の生成を防ぐ。
+const MAX_VISIBLE_RATIO_DENOMINATOR: u32 = 1_000;
+
+/// `BENCH_KNN_PROFILE_SCALE`（Issue #487。スイープ専用。既定経路の行数は不変）の
+/// 上限倍率。`TOTAL_ROWS * MAX_SWEEP_SCALE` が `hnsw::MAX_HNSW_NODES`
+/// （1,000,000）ちょうどになる値とし、`harness::bench_engine::parse_scale` と
+/// 同じ「呼び出し元が上限を計算して渡す」契約に従う。
+const MAX_SWEEP_SCALE: u64 = 40;
 const TABLE: &str = "docs";
 const COLUMN: &str = "embedding";
 const SEED_BATCH_ROWS: usize = 5_000;
@@ -209,6 +222,47 @@ fn main() {
             Ok(d) => d as usize,
             Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_DIM: {e}")),
         };
+
+    // 可視比率 × 行数の損益分岐点スイープ（Issue #487）。`BENCH_KNN_PROFILE_
+    // VISIBLE_RATIO` 未設定（既定）時は本節が一切分岐せず、以降の出力・処理は
+    // 本 Issue 導入前と完全に同一のまま進む（既定経路の出力不変を保つ設計）。
+    let full_scan_ratio_override =
+        match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_FULL_SCAN_RATIO")
+            .and_then(|raw| harness::bench_engine::parse_full_scan_ratio(raw.as_deref()))
+        {
+            Ok(v) => v,
+            Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_FULL_SCAN_RATIO: {e}")),
+        };
+    if full_scan_ratio_override.is_some()
+        && !matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw)
+    {
+        fail_closed("BENCH_KNN_PROFILE_FULL_SCAN_RATIO requires BENCH_KNN_PROFILE_ENGINE=hnsw");
+    }
+    let visible_ratio_denominator = match harness::bench_engine::read_env_var(
+        "BENCH_KNN_PROFILE_VISIBLE_RATIO",
+    )
+    .and_then(|raw| {
+        harness::bench_engine::parse_visible_ratio(raw.as_deref(), MAX_VISIBLE_RATIO_DENOMINATOR)
+    }) {
+        Ok(v) => v,
+        Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_VISIBLE_RATIO: {e}")),
+    };
+    let sweep_scale: u64 = match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_SCALE")
+        .and_then(|raw| harness::bench_engine::parse_scale(raw.as_deref(), MAX_SWEEP_SCALE))
+    {
+        Ok(v) => v,
+        Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_SCALE: {e}")),
+    };
+    if let Some(denominator) = visible_ratio_denominator {
+        run_visible_ratio_sweep(
+            knn_engine,
+            dim,
+            denominator,
+            full_scan_ratio_override,
+            sweep_scale,
+        );
+        return;
+    }
 
     println!(
         "{}",
@@ -824,6 +878,386 @@ fn main() {
     );
 
     println!("knn_profile_bench: consistency checks passed (S1..S3 row counts, S0 result count, S0' COUNT(*) value, S3 vs VectorArena cross-check)");
+}
+
+/// `knn_engine`（`BENCH_KNN_PROFILE_FULL_SCAN_RATIO` override 対応）で
+/// [`EngineCore`] を構築する（[`run_visible_ratio_sweep`] 専用。既定経路の
+/// `build_core_for` は override を持たないため共有しない）。
+fn build_core_for_sweep(
+    knn_engine: harness::bench_engine::BenchEngine,
+    storage: Storage,
+    full_scan_ratio_override: Option<(u32, u32)>,
+) -> EngineCore {
+    match knn_engine {
+        harness::bench_engine::BenchEngine::BruteForce => {
+            EngineCore::from_storage(storage, search_engine::default_engine())
+        }
+        harness::bench_engine::BenchEngine::Hnsw => {
+            let mut validated = ValidatedHnswParams::new(HnswParams::default())
+                .expect("valid HnswParams::default()");
+            if let Some((numerator, denominator)) = full_scan_ratio_override {
+                validated = validated
+                    .with_full_scan_ratio(Ratio {
+                        numerator,
+                        denominator,
+                    })
+                    .expect("BENCH_KNN_PROFILE_FULL_SCAN_RATIO already validated by harness::bench_engine::parse_full_scan_ratio");
+            }
+            EngineCore::from_storage_with_engine(storage, SearchEngineKind::Hnsw(validated))
+        }
+    }
+}
+
+/// `sql::hnsw_cache::HnswIndexCacheStats` の Subset 系カウンタから、このクエリで
+/// 実際に選ばれた経路を分類する（Issue #487。doc 表「観測 arm」列のラベル）。
+/// 呼び出し前後の差分（delta）を渡す契約——累積値をそのまま渡すと、warm-up の
+/// フィルタなしクエリ由来の `hits`／`builds` 増分と混ざる。
+// `HnswIndexCacheStats`（`sql::hnsw_cache`）は `pub(crate)` モジュール配下のため
+// bench（`engine` クレート外部）からは型名を書けない。カウンタを個別の `u64`
+// として受け渡す（`core.hnsw_index_cache_stats()` 自体は `pub fn` のため呼び出し・
+// フィールアクセスは可能——型を明示的に書けないだけ）。
+fn observed_arm_label(
+    subset_searches_delta: u64,
+    plain_scans_delta: u64,
+    mask_splits_graph_delta: u64,
+    masked_short_delta: u64,
+) -> &'static str {
+    // 互いに排他な 4 カウンタ（`hnsw_cache.rs` のドキュメンテーションコメント
+    // 参照）のうち、非 0 のものを優先順位付きで採用する。全 0 は
+    // brute_force エンジン（Subset 系カウンタを一切持たない）を表す。
+    if subset_searches_delta > 0 {
+        "ann_masked"
+    } else if plain_scans_delta > 0 {
+        "plain_scan_ratio"
+    } else if mask_splits_graph_delta > 0 {
+        "plain_scan_mask_split"
+    } else if masked_short_delta > 0 {
+        "plain_scan_masked_short"
+    } else {
+        "n/a (brute_force engine)"
+    }
+}
+
+/// 可視比率 × 行数の損益分岐点スイープ（Issue #487。ADR
+/// `docs/design/hnsw-rls-cardinality-switch.md`「スコープ外・申し送り」の
+/// `full_scan_ratio` 再調整項目への実測入力）。
+///
+/// `main` から `BENCH_KNN_PROFILE_VISIBLE_RATIO` が設定されている場合にのみ
+/// 呼ばれ、既定経路（S0-cold〜residual の段別プロファイル。本関数とは無関係）
+/// とは完全に独立した投入・warm・計測フローを持つ。SCALAR 事前フィルタ付き
+/// DISTANCE（`sql::hnsw_cache` の `Subset` 形状）を発火させ、ANN（マスク付き
+/// 探索）と plain scan のどちらが選ばれたかを [`observed_arm_label`] で分類する。
+///
+/// `Subset` 形状は索引を構築しない（`sql::hnsw_cache::prepare_subset` は常に
+/// `FullScan` へ縮退する。`hnsw_subset` 経路の索引再利用は #410 の対象外の
+/// ままであることのポインタ）ため、同一 `EngineCore` でまずフィルタなし
+/// クエリを 1 回発行して `FullVisible` 形状の索引を warm したうえで WHERE
+/// クエリを計測する。
+fn run_visible_ratio_sweep(
+    knn_engine: harness::bench_engine::BenchEngine,
+    dim: usize,
+    denominator: u32,
+    full_scan_ratio_override: Option<(u32, u32)>,
+    scale: u64,
+) {
+    const BUCKET_COLUMN: &str = "bucket";
+
+    let tenant_a_rows = TENANT_A_ROWS as u64 * scale;
+    let tenant_b_rows = TENANT_B_ROWS as u64 * scale;
+    let total_rows = tenant_a_rows + tenant_b_rows;
+    if !total_rows.is_multiple_of(denominator as u64) {
+        fail_closed(format!(
+            "BENCH_KNN_PROFILE_VISIBLE_RATIO=1/{denominator} does not evenly divide total_rows={total_rows} (scale={scale}); pick a denominator that divides {TOTAL_ROWS}*scale exactly"
+        ));
+    }
+    let visible_rows = total_rows / denominator as u64;
+    if visible_rows == 0 {
+        fail_closed(format!(
+            "BENCH_KNN_PROFILE_VISIBLE_RATIO=1/{denominator} yields 0 visible rows for total_rows={total_rows}"
+        ));
+    }
+
+    let effective_full_scan_ratio = full_scan_ratio_override.unwrap_or_else(|| {
+        let default = ValidatedHnswParams::default().full_scan_ratio();
+        (default.numerator, default.denominator)
+    });
+
+    println!(
+        "knn_profile_bench: visible_ratio_sweep total_rows={total_rows} dim={dim} top_k={TOP_K} \
+         denominator={denominator} visible_rows={visible_rows} engine={} full_scan_ratio={}/{} \
+         (Issue #487。S0-cold・S1〜S5' は非対象。QEMU 共有開発環境での実測は参考値——\
+         docs/design/hnsw-rls-cardinality-switch.md 参照)",
+        knn_engine.token(),
+        effective_full_scan_ratio.0,
+        effective_full_scan_ratio.1,
+    );
+
+    let path = unique_db_path("issue487-knn-visible-ratio-sweep");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage for sweep seeding");
+    let schema = TableSchema::new(
+        TABLE,
+        vec![
+            ColumnDef::new(COLUMN, ColumnType::Vector(dim as u32), false),
+            ColumnDef::new(BUCKET_COLUMN, ColumnType::Text, false),
+        ],
+    );
+    storage
+        .create_table(&schema)
+        .expect("create table for sweep seeding");
+
+    let mut rng = DeterministicRng::new(1);
+    let mut next_id: u64 = 0;
+    for (tenant_id, count) in [(TENANT_A, tenant_a_rows), (TENANT_B, tenant_b_rows)] {
+        let ctx = PolicyContext::new(tenant_id).expect("valid tenant id");
+        let mut remaining = count;
+        while remaining > 0 {
+            let batch_len = (SEED_BATCH_ROWS as u64).min(remaining);
+            let mut batch_vectors: Vec<Vec<f32>> = Vec::with_capacity(batch_len as usize);
+            let mut batch_metadata: Vec<Vec<u8>> = Vec::with_capacity(batch_len as usize);
+            for i in 0..batch_len {
+                batch_vectors.push(rng.next_vector(dim));
+                let id = next_id + i;
+                let bucket = format!("b{}", id % denominator as u64);
+                let values = [RowValue::Null, RowValue::Text(bucket)];
+                batch_metadata.push(
+                    encode_scalar_columns(&schema, &values)
+                        .expect("bucket value must encode within TEXT column limits"),
+                );
+            }
+            let rows: Vec<(u64, RowInput<'_>)> = (0..batch_len as usize)
+                .map(|i| {
+                    let id = next_id + i as u64;
+                    (
+                        id,
+                        RowInput {
+                            tenant_id,
+                            visibility: Visibility::Public,
+                            embedding: &batch_vectors[i],
+                            metadata: &batch_metadata[i],
+                        },
+                    )
+                })
+                .collect();
+            let op_id = OperationId::parse(&format!("sweep-{tenant_id}-{next_id}"))
+                .expect("valid operation_id");
+            tenant::insert_rows(&storage, TABLE, &ctx, &rows, &op_id).expect("seed batch insert");
+            next_id += batch_len;
+            remaining -= batch_len;
+        }
+    }
+    if next_id != total_rows {
+        fail_closed(format!(
+            "sweep seeded row count mismatch: expected {total_rows}, got {next_id}"
+        ));
+    }
+
+    let policy_ctx = PolicyContext::new(TENANT_A).expect("valid tenant id");
+    let query = rng.next_vector(dim);
+    let literal = vector_literal(&query).expect("finite query vector");
+    let filterless_sql = c1_statement(TABLE, COLUMN, &literal, TOP_K)
+        .expect("well-formed C1 statement from validated identifiers");
+    let where_sql = c1_where_statement(TABLE, COLUMN, BUCKET_COLUMN, "b0", &literal, TOP_K)
+        .expect("well-formed WHERE statement from validated identifiers/tokens");
+
+    let core = build_core_for_sweep(knn_engine, storage, full_scan_ratio_override);
+
+    // --- warm: `FullVisible` 形状の索引を 1 回構築する（`Subset` 形状は索引を
+    // 構築しないため。モジュール冒頭コメント参照）。--------------------------
+    let _ = core
+        .execute_sql(&policy_ctx, &filterless_sql)
+        .expect("warm-up query must succeed");
+    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+        let warm_stats = core.hnsw_index_cache_stats();
+        if warm_stats.builds == 0 {
+            fail_closed(format!(
+                "warm-up did not build the FullVisible HNSW index (builds={})",
+                warm_stats.builds
+            ));
+        }
+    }
+
+    let config = MeasurementConfig::new(20, 20, 1).expect("protocol minimums satisfied");
+
+    // --- 参照区間: フィルタなし SQL 表層 e2e（`S0prime_count_star` と並ぶ
+    // run-to-run 実測ノイズ帯の基準。`docs/design/benchmark-judgement-policy.md`
+    // §4）。---------------------------------------------------------------
+    let reference = run(&config, || {
+        core.execute_sql(&policy_ctx, &filterless_sql)
+            .expect("execute_sql must succeed for filterless reference query")
+    })
+    .expect("measurement must satisfy protocol minimums");
+
+    let stats_before_subset = core.hnsw_index_cache_stats();
+
+    // --- 対象: SCALAR 事前フィルタ付き DISTANCE（`Subset` 形状）。-----------
+    let subset = run(&config, || {
+        core.execute_sql(&policy_ctx, &where_sql)
+            .expect("execute_sql must succeed for WHERE subset query")
+    })
+    .expect("measurement must satisfy protocol minimums");
+
+    let stats_after_subset = core.hnsw_index_cache_stats();
+
+    // --- 参照区間: `COUNT(*)`（エンジン非依存の run-to-run ノイズ帯基準）。--
+    let count_sql = format!("SELECT COUNT(*) FROM {TABLE}");
+    let count_reference = run(&config, || {
+        core.execute_sql(&policy_ctx, &count_sql)
+            .expect("execute_sql must succeed for COUNT(*) query")
+    })
+    .expect("measurement must satisfy protocol minimums");
+
+    // --- 計測外での結果検証（fail-closed）。---------------------------------
+    let where_result = core
+        .execute_sql(&policy_ctx, &where_sql)
+        .expect("execute_sql must succeed for WHERE subset query");
+    let expected_rows = (TOP_K as u64).min(visible_rows) as usize;
+    if where_result.rows.len() != expected_rows {
+        fail_closed(format!(
+            "WHERE subset result row count mismatch: expected {expected_rows}, got {}",
+            where_result.rows.len()
+        ));
+    }
+    for row in &where_result.rows {
+        let id = match row.cells.first() {
+            Some(Cell::Integer(v)) => *v,
+            other => fail_closed(format!("WHERE subset id cell type mismatch: got {other:?}")),
+        };
+        if !id.is_multiple_of(denominator as u64) {
+            fail_closed(format!(
+                "WHERE subset returned a row outside the filtered bucket: id={id} denominator={denominator}"
+            ));
+        }
+    }
+    let count_result = core
+        .execute_sql(&policy_ctx, &count_sql)
+        .expect("execute_sql must succeed for COUNT(*) query");
+    let count_value = match count_result.rows.first().and_then(|r| r.cells.first()) {
+        Some(Cell::Integer(v)) => *v,
+        other => fail_closed(format!("COUNT(*) cell type mismatch: got {other:?}")),
+    };
+    if count_value != total_rows {
+        fail_closed(format!(
+            "COUNT(*) value mismatch: expected {total_rows}, got {count_value}"
+        ));
+    }
+
+    // --- 出力（fail-closed 検証をすべて終えたここまでの間、測定値は一切
+    // println! していない。既定経路 main() と同じ契約）。---------------------
+    println!(
+        "{}",
+        render_stage_line(
+            "S0_hot_sql_e2e",
+            total_rows as usize,
+            reference.summary.median,
+            ns_per_row(reference.summary.median, total_rows as usize).expect("total_rows > 0"),
+        )
+    );
+    println!(
+        "raw(S0_hot_sql_e2e): samples_ms={:?}",
+        reference
+            .samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect::<Vec<f64>>()
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S0_hot_where_subset",
+            total_rows as usize,
+            subset.summary.median,
+            ns_per_row(subset.summary.median, total_rows as usize).expect("total_rows > 0"),
+        )
+    );
+    println!(
+        "raw(S0_hot_where_subset): samples_ms={:?}",
+        subset
+            .samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect::<Vec<f64>>()
+    );
+    println!(
+        "{}",
+        render_stage_line(
+            "S0prime_count_star",
+            total_rows as usize,
+            count_reference.summary.median,
+            ns_per_row(count_reference.summary.median, total_rows as usize)
+                .expect("total_rows > 0"),
+        )
+    );
+    println!(
+        "raw(S0prime_count_star): samples_ms={:?}",
+        count_reference
+            .samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1e3)
+            .collect::<Vec<f64>>()
+    );
+
+    let expected =
+        harness::bench_engine::expected_arm(visible_rows, total_rows, effective_full_scan_ratio)
+            .expect("visible_rows/total_rows/full_scan_ratio must not overflow at this scale");
+    let expected_label = match expected {
+        harness::bench_engine::ExpectedArm::AnnMasked => "ann_masked",
+        harness::bench_engine::ExpectedArm::PlainScanRatio => "plain_scan_ratio",
+    };
+
+    if matches!(knn_engine, harness::bench_engine::BenchEngine::Hnsw) {
+        // `HnswIndexCacheStats`（`sql::hnsw_cache`）は `pub(crate)` モジュール
+        // 配下のため型名を bench 側に書けない（`observed_arm_label` 上部の
+        // コメント参照）。フィールドごとの差分を個別のローカル変数に留める。
+        let builds_delta = stats_after_subset
+            .builds
+            .saturating_sub(stats_before_subset.builds);
+        let subset_searches_delta = stats_after_subset
+            .subset_searches
+            .saturating_sub(stats_before_subset.subset_searches);
+        let plain_scans_delta = stats_after_subset
+            .plain_scans
+            .saturating_sub(stats_before_subset.plain_scans);
+        let mask_splits_graph_delta = stats_after_subset
+            .mask_splits_graph
+            .saturating_sub(stats_before_subset.mask_splits_graph);
+        let masked_short_delta = stats_after_subset
+            .masked_short
+            .saturating_sub(stats_before_subset.masked_short);
+        let fallbacks_delta = stats_after_subset
+            .fallbacks
+            .saturating_sub(stats_before_subset.fallbacks);
+        println!(
+            "knn_profile_bench: hnsw_stats(subset_delta) builds={} subset_searches={} plain_scans={} \
+             mask_splits_graph={} masked_short={} fallbacks={}",
+            builds_delta,
+            subset_searches_delta,
+            plain_scans_delta,
+            mask_splits_graph_delta,
+            masked_short_delta,
+            fallbacks_delta,
+        );
+        println!(
+            "knn_profile_bench: arm expected={expected_label} observed={}",
+            observed_arm_label(
+                subset_searches_delta,
+                plain_scans_delta,
+                mask_splits_graph_delta,
+                masked_short_delta,
+            )
+        );
+        if builds_delta > 0 {
+            fail_closed(format!(
+                "Subset 形状は索引を再構築しない契約のはずが builds={builds_delta} を観測した（モジュール冒頭コメント参照）"
+            ));
+        }
+    } else {
+        println!(
+            "knn_profile_bench: arm expected={expected_label} observed=n/a (brute_force engine)"
+        );
+    }
+
+    println!("knn_profile_bench: visible_ratio_sweep consistency checks passed (WHERE result count/bucket membership, COUNT(*) value)");
 }
 
 /// [`engine::isa::current().dot`] を呼ぶだけの薄いラッパー。`#[inline(never)]` に

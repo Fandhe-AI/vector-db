@@ -335,11 +335,19 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-knn-profile
-bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる
+bench-knn-profile: ## Issue #362（KNN 経路の段別内訳プロファイル。走査・デコード・arena 構築・距離計算の切り分け）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_PROFILE_ENGINE=brute_force|hnsw（既定 brute_force・Issue #413）で S0-cold/S0-hot の検索エンジンを ANN opt-in（Issue #403 B 案）へ切り替えられる（S1〜S5' は非対象）。BENCH_KNN_PROFILE_DIM=<1-4096>（既定 128・Issue #466）でベクトル次元数を上書きできる。BENCH_KNN_PROFILE_VISIBLE_RATIO=1/<N>（Issue #487）で可視比率スイープへ切り替わる（S1〜S5' 非対象。BENCH_KNN_PROFILE_FULL_SCAN_RATIO=<num>/<den>〔engine=hnsw 限定〕・BENCH_KNN_PROFILE_SCALE=<1-40> と併用可）
 ifdef HAS_CARGO
 	cargo bench --bench knn_profile_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-knn-profile をスキップ"
+endif
+
+.PHONY: bench-knn-visible-ratio
+bench-knn-visible-ratio: ## Issue #487（可視比率〔1/2・1/4・1/10・1/20・1/50〕× 行数〔25k・100k〕での hnsw_subset と plain scan の損益分岐点を交互 N≥5 ペアで計測する）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用。SWEEP_PAIRS=<N>〔既定 5〕でペア数を上書きできる。ログは target/bench-knn-visible-ratio/<unix-ts>/ 配下）
+ifdef HAS_CARGO
+	scripts/bench_knn_visible_ratio_sweep.sh
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-visible-ratio をスキップ"
 endif
 
 # --------------------------------------------------
