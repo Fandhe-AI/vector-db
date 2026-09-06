@@ -74,6 +74,20 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # List pull requests files はページングしても最大 3000 件までしか返さない。
+          # PR の changed_files（総数）と取得した新パス件数が一致しない不完全な一覧では
+          # 対象パスが取得範囲外にある可能性があるため、fail-closed で「変更あり」と扱う
+          if ! expected=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files'); then
+            echo "failed to read changed_files; fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fetched=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' | wc -l)
+          if [ "$fetched" -ne "$expected" ] || [ "$expected" -ge 3000 ]; then
+            echo "file list incomplete (fetched=$fetched, changed_files=$expected); fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           changed=false
           while IFS= read -r f; do
             case "$f" in
