@@ -161,6 +161,30 @@ fn text_column_reservation_bytes(pair_count: usize) -> usize {
         .saturating_add(equality_bytes)
 }
 
+/// 行走査中に `TEXT` 列ごとの作業領域 `acc: Vec<(String, u32)>`
+/// （[`ScalarIndex::build`]）が確保する**タプル全体**の容量分バイト量
+/// （codex-review P1 対応・PR #569 未解決分）。
+///
+/// 修正前は `acc` へ 1 件ずつ `try_reserve(1)` してから `push` しており、
+/// 予算計上も文字列本体長＋`String` 構造体サイズ（[`approx_string_entry_bytes`]）
+/// のみで、(1) タプルの `u32` 分・アラインメント詰め物と (2) `try_reserve` の
+/// 内部成長戦略（要求量ちょうどではなく現容量の倍増などで余剰確保され得る）の
+/// 双方が計上から漏れていた。64bit 環境で全行・全 `TEXT` 列が空文字列の場合、
+/// 文字列本体バイトは 0 で予算上「ほぼ無料」に見える一方、`acc` 自体の確保
+/// 容量（タプル構造体サイズ×要素数、かつ倍増成長の余剰込み）は無視できない
+/// 量に達し、既存の行数・列数・スナップショット容量上限内の入力でも
+/// [`MAX_SCALAR_INDEX_BYTES`] 判定より前に未検証の大容量確保が起こり得た。
+///
+/// 本関数は列ごとに `acc` の必要行数上限（1 行につき列あたり高々 1 値なので
+/// `row_count` が上限）を**確保前に一括**でバイト量へ変換し、
+/// [`check_scalar_index_budget`] で検証してから
+/// `Vec::try_reserve_exact(row_count)` する契約にすることで、成長戦略の余剰
+/// 確保そのものを起こさせない（倍増ではなく厳密量の 1 回確保に固定するため、
+/// 見積りバイト量と実確保バイト量が一致する）。
+fn per_column_accumulator_reservation_bytes(row_count: usize) -> usize {
+    row_count.saturating_mul(std::mem::size_of::<(String, u32)>())
+}
+
 /// 1 つの `TEXT` 列に対する索引（等価直引き＋前方一致範囲走査の両方を支える
 /// 共有データ構造。モジュールドキュメント「データモデル」参照）。
 ///
@@ -319,7 +343,22 @@ impl ScalarIndex {
             .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
         for column in &schema.columns {
             match column.ty {
-                ColumnType::Text => per_column.push(Some(Vec::new())),
+                ColumnType::Text => {
+                    // `acc` は 1 行につき列あたり高々 1 値しか追加されないため
+                    // `row_count` が確保上限になる。倍増などの成長戦略による
+                    // 余剰確保を避けるため、行走査を始める前に必要量ちょうどを
+                    // 一括で `try_reserve_exact` し、その容量分（タプル全体の
+                    // サイズ）を確保前にバイト予算へ計上する（codex-review P1
+                    // 対応・PR #569 未解決分。`per_column_accumulator_reservation_bytes`
+                    // 参照）。
+                    let reservation_bytes = per_column_accumulator_reservation_bytes(row_count);
+                    check_scalar_index_budget(approx_bytes, reservation_bytes)?;
+                    approx_bytes = approx_bytes.saturating_add(reservation_bytes);
+                    let mut acc: Vec<(String, u32)> = Vec::new();
+                    acc.try_reserve_exact(row_count)
+                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    per_column.push(Some(acc));
+                }
                 ColumnType::Vector(_) => per_column.push(None),
             }
         }
@@ -336,12 +375,18 @@ impl ScalarIndex {
             for (col_index, value) in scanned.into_iter().enumerate() {
                 let Some(v) = value else { continue };
                 if let Some(Some(acc)) = per_column.get_mut(col_index) {
-                    let additional = approx_string_entry_bytes(v);
+                    // タプル・`Vec` の確保容量分は上記の事前一括確保
+                    // （`per_column_accumulator_reservation_bytes`）で
+                    // 既に予算計上済みのため、ここでは文字列本体（ヒープ）の
+                    // バイト量のみを追加計上する（二重計上を避ける）。
+                    let additional = v.len();
                     check_scalar_index_budget(approx_bytes, additional)?;
                     let owned = try_owned_string(v)?;
                     approx_bytes = approx_bytes.saturating_add(additional);
-                    acc.try_reserve(1)
-                        .map_err(|_| ScalarIndexBuildError::AllocationFailed)?;
+                    // `acc` は列ごとに `row_count` ちょうどの容量を
+                    // 事前に厳密確保済みで、1 行につき列あたり高々 1 回しか
+                    // push されないため、この push が容量を超えて再確保
+                    // （＝未計上の追加確保）を起こすことはない。
                     acc.push((owned, slot_u32));
                 }
             }
@@ -1167,6 +1212,61 @@ mod tests {
         // 想定し、確保**前**の予算検証でバイパスされないことを固定する。
         let huge_pair_count = MAX_SCALAR_INDEX_BYTES; // 明らかに 1 GiB を超える確保容量になる件数
         let reservation_bytes = text_column_reservation_bytes(huge_pair_count);
+        assert!(reservation_bytes > MAX_SCALAR_INDEX_BYTES);
+        assert!(matches!(
+            check_scalar_index_budget(0, reservation_bytes),
+            Err(ScalarIndexBuildError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn build_handles_empty_string_text_values_via_preallocated_accumulator() {
+        // codex-review P1 指摘（PR #569 未解決分）の是正後も、空文字列 `TEXT`
+        // 値を含む通常規模の入力で正しく構築できることを固定する
+        // （`acc` の事前一括確保が実データの push を壊していないことの確認）。
+        let path = unique_db_path("scalar-index-empty-values");
+        let _guard = CleanupGuard(path.clone());
+        let storage = Storage::open(&path).expect("open storage");
+        create_table(&storage);
+        let ctx_a = ctx("tenant-a");
+        insert(&storage, &ctx_a, 1, Some(""), Some(""), Visibility::Public);
+        insert(&storage, &ctx_a, 2, Some(""), None, Visibility::Public);
+        insert(&storage, &ctx_a, 3, Some("x"), None, Visibility::Public);
+
+        let (snapshot, schema) = snapshot_from(&storage, &ctx_a);
+        let index = ScalarIndex::build(&schema, &snapshot).expect("build index");
+        assert_eq!(index.row_count(), 3);
+        let empty_matches = index.candidates_for(&MetadataFilter_equals(&schema, "kind", ""));
+        let mut empty_slots = empty_matches.expect("index available");
+        empty_slots.sort_unstable();
+        assert_eq!(empty_slots, vec![0, 1]);
+        assert_eq!(
+            index.candidates_for(&MetadataFilter_equals(&schema, "kind", "x")),
+            Some(vec![2])
+        );
+    }
+
+    #[test]
+    fn per_column_accumulator_reservation_bytes_scales_with_row_count() {
+        // acc: Vec<(String, u32)> の確保上限は列あたり高々 row_count 件
+        // （1 行につき列あたり高々 1 値）。タプル全体のサイズ（アラインメント
+        // 詰め物込み）で計上されることを固定する（codex-review P1 対応・
+        // PR #569 未解決分）。
+        assert_eq!(per_column_accumulator_reservation_bytes(0), 0);
+        let row_count = 1_000;
+        assert_eq!(
+            per_column_accumulator_reservation_bytes(row_count),
+            row_count.saturating_mul(std::mem::size_of::<(String, u32)>())
+        );
+    }
+
+    #[test]
+    fn per_column_accumulator_reservation_bytes_budget_rejects_before_row_scan() {
+        // 100 万行 × 全列空文字列のような「文字列本体はほぼ無料だが acc 自体の
+        // 確保容量が大きい」入力で、確保**前**の予算検証がバイパスされない
+        // ことを固定する（codex-review P1 指摘: scalar_index.rs:343）。
+        let huge_row_count = MAX_SCALAR_INDEX_BYTES; // 明らかに上限を超える確保容量になる行数
+        let reservation_bytes = per_column_accumulator_reservation_bytes(huge_row_count);
         assert!(reservation_bytes > MAX_SCALAR_INDEX_BYTES);
         assert!(matches!(
             check_scalar_index_budget(0, reservation_bytes),
