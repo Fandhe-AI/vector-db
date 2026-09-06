@@ -28,6 +28,7 @@ Phase 3（#404〜#412・すべて merged。ベース `40cc024`）で自作 HNSW 
 | #410 | hybrid 密側 iterative scan | `docs/design/hnsw-hybrid-iterative-scan.md` |
 | #411 | `EXPLAIN` 露出 | `docs/design/explain-search-engine-exposure.md` |
 | #412 | Recall ゲート同一閾値検証・TASK-121 系拡張 | `docs/design/ann-recall-gate-verification.md` |
+| #492（#493〜#495） | 凍結後 CSR 化（設計・実装・前後比較） | 本書§14（#493） |
 
 ## 3. データ構造・パラメータ既定値（本リポ実装既定値）
 
@@ -352,6 +353,8 @@ S0-cold の 22.9 倍は「毎サンプル HNSW グラフをゼロから構築す
   スタブの注入を要する実測は時間制約により未実施
 - `HnswParams` の非既定値（`ef_search` 等）のスイープ
 - `contrast_bench`（usearch）への HNSW 対照経路追加
+- 凍結後 CSR 化の実装（#494）・前後比較実測（#495）——設計は本書§14
+  （Issue #493）
 
 ## 12. 再現方法
 
@@ -384,3 +387,283 @@ BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
 - `docs/design/explain-search-engine-exposure.md`（`EXPLAIN` 露出仕様）
 - `docs/design/c1-p95-dedicated-env-reverification.md`（非専有環境の扱いの
   先例）
+
+## 14. 凍結後 CSR 化の設計（Issue #493）
+
+- **ステータス**: Proposed（設計メモ。実装は #494・前後比較実測は #495。本節
+  自体は本書冒頭ステータス「Accepted（記録専用・#413）」とは独立に扱う）
+- **親**: #492（HNSW 隣接リストの CSR 化）／Phase 3 親 #458／ルート #455
+- **依存**: `docs/design/benchmark-judgement-policy.md`（#462）
+- **関連ポインタ（spec・本文は転記しない）**: TASK-132・CORE-9・CORE-10
+
+### 14.1 現状の構造と問題
+
+`crates/engine/src/hnsw.rs::Node { level: usize, links: Vec<Vec<u32>> }`・
+`HnswIndex { params, dim, nodes: Vec<Node>, entry_point, vectors: Arc<[f32]> }`
+がノード単位の可変長隣接リストを保持する。隣接アクセスは
+`HnswIndex::neighbors(level, node) -> Option<&[u32]>` に集約されており、
+`search_layer`・`greedy_descend`・`greedy_descend_masked`・
+`accepted_reachable_count`・`bfs_reachable`・`repair_reachability` の 6 箇所
+が呼ぶ。`links` を直接触るのは `connect`・`shrink_links`・`insert_node`・
+`approx_heap_bytes`・`neighbors` の 5 箇所のみ。
+
+| 問題 | 内容 |
+| --- | --- |
+| ヒープ確保回数 | ノード × (level+1) 個の `Vec<u32>` それぞれが個別確保（ヘッダ 24B＋データ） |
+| 容量スラック | `push` の倍化戦略により実次数より大きい容量を確保し得る |
+| 間接参照 | `nodes[node]` → `links[level]` → ヒープの 2 段間接参照で、探索の隣接走査ごとにプリフェッチ不能 |
+
+`docs/design/hotpath-implementation-survey.md` §3「HNSW グラフ」の CSR 型
+フラット隣接配列（faiss `impl/HNSW.h`・MIT）が「採用推奨」としており、#492
+が実装を追跡する。
+
+### 14.2 2 相構成（構築は可変長・凍結時に平坦化）
+
+並列構築（#406・`hnsw/parallel_build.rs::BuildGraph`）はノード単位
+`RwLock<Vec<Vec<u32>>>` への可変長追記・`shrink_links` による in-place 縮退
+を前提とし、凍結後に走る `repair_reachability`（`connect`／`shrink_links` で
+隣接を書き換える）も可変表現を要する。したがって CSR は**構築中は維持でき
+ず**、修復まで完了した後に平坦化する 2 相構成を取る。
+
+| 経路 | 相 1: 可変長構築 | 相 2: 修復 | 相 3: 凍結（平坦化） |
+| --- | --- | --- | --- |
+| `build`（逐次） | `Vec<Node>` へ `insert_node`（`connect`／`shrink_links`） | `repair_reachability`（可変表現上） | 最後に CSR へ平坦化 |
+| `build_with_threads(threads>=2, n>SEQUENTIAL_PREFIX_NODES)` | `BuildGraph`（ノード単位 `RwLock<Vec<Vec<u32>>>`） | `freeze`＝組み立て（ロック解除・`Vec<Node>` 化）→ `repair_reachability` | 最後に CSR へ平坦化 |
+| `build_with_threads(1)`／`n<=SEQUENTIAL_PREFIX_NODES`／`build_parallel` 縮退 | `build` をそのまま呼ぶ | 同左 | 同左 |
+
+`HnswIndex` の実行時表現は **CSR の 1 種類のみ**にする（逐次経路だけ
+`Vec<Vec<u32>>` を残す案は表現が 2 つ併存し `search_layer` の分岐・テスト
+行列が倍になるため不採用）。平坦化は `repair_reachability` を含む全ての可変
+操作の**後**に置く（`repair_reachability` は `connect`／`shrink_links` を
+呼ぶため CSR 上では実行できない）。#446 ツリー（#447 観測フック・#448 上位
+層リンク保証・#449 修復並列化）はいずれも相 1〜2 の内部改善であり、相 3 が
+最終段である限り衝突しない——この stage 順序の固定を #494・#449 双方の契約
+とする。
+
+可変相の型は現行 `Vec<Node>` を「ビルダー表現」として残す（型名の変更は #494
+の裁量）。`insert_node`・`connect`・`shrink_links`・`repair_reachability`・
+`bfs_reachable` はこの可変表現のメソッドへ移り、
+`HnswIndex` は凍結済み CSR とパラメータ・`entry_point`・`vectors` のみを持つ。
+
+### 14.3 CSR レイアウト
+
+```text
+struct CsrGraph {
+    levels:    Vec<u8>,     // ノードごとのレベル（MAX_LEVEL=32 のため u8 で足りる）
+    node_base: Vec<u32>,    // ノードごとの offsets 先頭添字（len = n + 1）
+    offsets:   Vec<u32>,    // (node, level) ごとの links 先頭添字（len = 総 (node, level) 数 + 1）
+    links:     Vec<u32>,    // 全ノード・全レベルの隣接 id を連結（ノード昇順→レベル昇順、各リスト内は構築時の順序を保持）
+}
+// neighbors(level, node):
+//   node < n かつ level <= levels[node] のとき
+//   links[offsets[node_base[node] + level] .. offsets[node_base[node] + level + 1]]
+//   （添字はすべて get()・checked_add。範囲外は None）
+```
+
+**exact-length CSR（パディングなし）を採用する。** faiss の固定スロット＋
+番兵（`-1`）方式は構築中の in-place 更新を許す代わりに `max_degree − 実次数`
+分を空費し、番兵のため id 型を符号付きにするか `u32::MAX` を予約する必要が
+ある。本リポの凍結後索引は読み取り専用（#408 の世代整合キャッシュは差分を
+brute-force overlay で補い、索引本体は再構築で更新する）で in-place 更新が
+不要なため、exact-length が適合する。不採用の他レイアウト（`survey.md` §3
+の記録を参照。再論しない）: hnswlib の level0 インターリーブ（`Arc<[f32]>`
+を別途一括所有する設計と重複）、usearch の可変長 tape（アンアラインドアク
+セス＝`unsafe`）、qdrant のビット詰め（永続化未実装のため時期尚早）。
+
+**offset 幅の判断**: 理論上限は
+`MAX_HNSW_NODES × (2·MAX_M + MAX_LEVEL·MAX_M)` = 1,000,000 ×
+(256 + 32×128) ≈ 4.35×10^9 で `u32::MAX`（約 4.29×10^9）を超え得る。選択肢
+は (a) `usize` offsets（上限問題なし・8 B/要素）、(b) `u32` offsets ＋
+`checked_add` 累積で超過時は既存の `HnswError::CapacityOverflow` を返す
+fail-closed（新 variant 不要・panic 経路なし）。**(b) を採用する**——実運用
+でこの上限に達する索引は links だけで 17 GB を超え非現実的であり、`u32` で
+`node_base`／`offsets` のキャッシュ占有を半減できる。到達し得ない分岐を残さ
+ない方針との整合は「`checked_add` は untrusted 入力サイズに対する
+fail-closed 検証であって dead branch ではない」と位置づける。`levels` の
+`u8` 化は `assign_level` が `MAX_LEVEL` で上限を持つため安全（変換は
+`u8::try_from` で fail-closed）。総 (node, level) 数 `Σ(level+1)` は
+`n × (MAX_LEVEL+1)` ≤ 3.3×10^7 で `u32` に収まる（同じく `checked_add`）。
+
+### 14.4 `search_layer` を 2 表現で共有する方式
+
+構築中の `insert_node` は `search_layer`／`greedy_descend` を**可変表現**に
+対して呼び、凍結後の `search`／`search_masked` は **CSR** に対して呼ぶ。
+
+**採用: 隣接アクセス trait によるジェネリック化**（既存の `VisitedSet` trait
+と同型のパターン）。例: `trait Adjacency { fn neighbors(&self, level: usize,
+node: u32) -> Option<&[u32]>; fn node_count(&self) -> usize; }` を可変表現と
+`CsrGraph` の双方に実装し、`search_layer<V: VisitedSet, A: Adjacency>`・
+`greedy_descend`・`greedy_descend_masked`・`accepted_reachable_count`・
+`find_alternate_entry`・`search_entry_for_mask` をジェネリック化する。モノモ
+ーフィゼーションにより探索経路は CSR 専用コードになり、動的ディスパッチを
+持ち込まない。
+
+不採用: enum ディスパッチ（探索ホットループに毎回の分岐が入る）、実装の複製
+（停止条件・受理判定〔PR #423／#431 是正〕の二重管理になる）。
+`parallel_build::search_layer_locked`／`greedy_descend_locked`（ロック下で
+隣接をコピーする別実装）は本設計の対象外・無変更。
+
+`search_layer` の内部実装 `search_layer_with<V: VisitedSet, P:
+prefetch::PrefetchPolicy>`（#490・`hnsw/prefetch.rs`。§14.7 参照）は既に
+2 個のジェネリックパラメータを持つ。本設計で `A: Adjacency` を追加する場合は
+`search_layer_with<V, P, A>` の 3 パラメータになる——`search_layer<V:
+VisitedSet>` という**公開シグネチャ**は変えず（§14.8 の不変性の範囲）、
+内部の `search_layer_with` 呼び出し側のみが影響を受ける。
+
+### 14.5 決定性契約への影響
+
+1. **平坦化は「修復済み可変グラフ」の純粋関数であり順序保存**とする。ノード
+   昇順・レベル昇順に連結し、**各隣接リスト内の要素順を一切並べ替えない**
+   （ソート・正規化を禁止）。`search_layer` は隣接を走査順に `candidates`／
+   `results` へ積み、同点スコア時の `ef` 打ち切り・`results.pop()` の追い出
+   し対象は走査順に依存するため、リスト内順序の変更は同点境界で探索集合を
+   変え得る。
+2. 順序保存により `neighbors()` の返すスライスは平坦化前後でバイト同一
+   → `search`／`search_masked` の結果はビット同一 →
+   **公開 API 経由の結合テスト**（`tests/hnsw.rs` の不変条件・
+   `tests/hnsw_search.rs` の Recall／決定性・`tests/hnsw_cache.rs`・`rls.rs`
+   の HNSW 系・
+   `parallel_build.rs::build_with_threads_one_matches_sequential_build_exactly`）
+   は無変更で green になる——これが #494 の受け入れ条件「既存の全 HNSW
+   テストが無変更で green」「`build` 逐次経路のグラフ（平坦化前）が不変」の
+   根拠。ただし private 関数を直接呼ぶモジュール内単体テスト（`freeze` を
+   直接呼ぶもの・`HnswBuildProfile` を参照するもの）は `freeze` のシグネチ
+   ャ・プロファイルのフィールド追加に伴う**呼び出し形の追随編集**が必要に
+   なり得る（アサーション内容は変えない）。「無変更」の主張は公開 API 経由
+   のテストに限定する。
+3. `build_with_threads(1)`／`n<=SEQUENTIAL_PREFIX_NODES` の完全一致契約:
+   縮退経路は引き続き `build` をそのまま呼ぶため、同一の平坦化関数を通り
+   構造的に同一。`threads>=2` 経路のグラフ**形状**の run-to-run 非決定性
+   （`docs/design/hnsw-parallel-build.md` 冒頭「決定性の範囲」）は本設計で
+   変わらない（平坦化は形状を変えない）。
+4. `docs/design/hnsw-search.md`「決定性の保証範囲」（同一索引・同一クエリ・
+   任意スクラッチで再現／境界同点グループ完全化は非保証）・
+   `docs/design/rrf-tie-break-determinism.md`（スコア降順・id 昇順）は不変。
+   RLS 事前フィルタ統合（#409。索引は ctx 可視アリーナのみから構築・
+   `NodeMask` は候補差分）も表現非依存で不変。
+5. **可変相のアルゴリズム**（`insert_node`・`connect`・`shrink_links`・
+   `repair_reachability`・`select_neighbors_heuristic_free`・
+   `compute_shrink`）は**コード無変更**とする（`&mut self` の対象型が変わ
+   るだけ）。#494 の制約として明記する。
+
+### 14.6 メモリ見積り（100k 点・M=16。式＋数値。実測は参考値）
+
+`assign_level` は `P(level ≥ l) = M^{-l}` の幾何分布 → 期待 (node, level) 数
+= `n × M/(M−1)` = 100,000 × 16/15 ≈ **106,700**（上位層ノード ≈ 6,700）。
+
+| 表現 | グラフ部の合計上界（式） | 概算値 | ヒープ確保回数 |
+| --- | --- | --- | --- |
+| 現行（`Vec<Vec<u32>>`） | `Node` 本体 100,000×32B ＋ レベル別 `Vec<u32>` ヘッダ 106,700×24B ＋ links 容量上界 100,000×32×4B + 6,700×16×4B | 3.2MB + 2.56MB + 13.2MB ≈ **19MB** | ≈ 206,700 回（初回確保のみ。`push` 倍化に伴う再確保は含まず） |
+| CSR | `links` 実次数合計 ＋ `offsets`(106,701×4B) ＋ `node_base`(100,001×4B) ＋ `levels`(100,000×1B) | 13.2MB + 0.43MB + 0.4MB + 0.1MB ≈ **14.1MB** | 4 回 |
+
+削減見込みはグラフ部で約 5MB（≈ 26%）＋確保回数の 5 桁削減。ベクトル本体
+（`Arc<[f32]>`。dim=128 で 100,000×128×4B = 51.2MB）は不変のため、索引全体
+では約 70MB → 65MB（≈ 7%）。本書§7 の実測（25k 行・dim 128 で RSS +23.1%）
+のうちグラフ部が占める割合の目安として参考にする。
+
+実測の位置づけ: 既存 API `HnswIndex::approx_heap_bytes()` と
+`bench-hnsw-parallel-build` の RSS 出力で現行値を**参考値**として取得して
+よい（`docs/design/benchmark-judgement-policy.md` §6 は CSR 化を本 QEMU
+環境で判定不能な種別に列挙しているため、採否根拠にはしない。本格的な前後
+比較は #495）。`approx_heap_bytes` 自体は #494 で CSR 向けに書き換えが必要
+（`approx_heap_bytes_at_least_covers_raw_vector_storage` テストは green の
+まま維持する）。
+
+### 14.7 探索経路の変更点
+
+- `neighbors()`: `nodes[node].links[level]` の 2 段間接参照 →
+  `node_base[node]`・`offsets[b+level]`・`offsets[b+level+1]` の 3 ロード＋
+  連続スライス（すべて `get()`／`checked_add`）。`level_of` は
+  `levels[node]` の 1 ロード。`max_level`・`entry_point`・`len`・`dim`・
+  `params`・`vector`・`max_degree` は不変。
+- #490（`hnsw/prefetch.rs`。本節執筆時点で origin/main へ merge 済み）は
+  受理判定通過後の隣接ノードの**ベクトル・visited スロット**を
+  `core::hint::black_box` による早期 load（stable では `#[target_feature]`
+  外から真の prefetch 命令を safe に呼べない制約のための best-effort 代替。
+  `hnsw/prefetch.rs` 冒頭コメント参照）で先読み済みだが、**次候補自身の
+  links 範囲**（隣接リストの走査に必要なアドレス）はまだ prefetch 対象に
+  含まれていない——現行 `Vec<Vec<u32>>` では `nodes[node].links[level]` が
+  2 段間接参照でありアドレスを事前計算できないため。CSR 化により
+  `node_base[node]`・`offsets[b+level]` の 2 ロードだけで次候補の links 範囲
+  アドレスが確定するため、この不足分（links 範囲の prefetch）を追加する余地
+  が生まれる。真の prefetch 命令への切替可否は本設計の対象外（#490 の
+  「stable での制約」節と同じ制約が CSR 化でも変わらず残る）。PR #431 の P0
+  契約（非受理ノードのベクトルへ一切触れない）は CSR 化で変わらず、prefetch
+  は可視判定後にのみ置けるという制約（`survey.md` §3 の記載）もそのまま
+  維持する。`search_layer_with<V: VisitedSet, P: PrefetchPolicy>` へ §14.4 の
+  `A: Adjacency` を足す場合は `search_layer_with<V, P, A>` の 3 パラメータに
+  なる（`search_layer<V: VisitedSet>` という公開シグネチャ自体は変えず、
+  内部の `search_layer_with` 側にのみ影響する）。
+- 将来の永続化（ADR 申し送り）では連続配列 4 本をそのまま書き出せる（qdrant
+  型ビット詰めはその時点で再検討する）。
+- `HnswBuildProfile`: 現行 `freeze` 段は「`RwLock` を解いて組み立てる段
+  （`repair` を含まない・実測 1ms 未満）」と定義済み。平坦化は O(総 links)
+  のコピーを伴い `freeze` の意味が変わるため、**新フィールド
+  `flatten: Duration` を追加**し、stage 順序を `level_assign →
+  sequential_prefix → parallel_phase → freeze（assemble）→
+  repair_reachability → flatten` と定義する。逐次縮退経路では従来どおり全
+  量を `sequential_prefix` へ積む。#495 は `flatten` を独立段として記録す
+  る。互換性の注記: `HnswBuildProfile` は `pub` struct で `#[non_exhaustive]`
+  が付いていない（`derive(Debug, Clone, Default)` のみ）。crate 内の構築箇
+  所（`hnsw.rs`・`parallel_build.rs`）は `..Default::default()` で非破壊だ
+  が、`pub` フィールド追加は外部の構造体リテラル／網羅的 destructure に対し
+  てソース非互換になり得る。リポ内の唯一の外部構造体リテラル
+  （`tests/hnsw_parallel_profile_accept.rs`）は `..HnswBuildProfile::default()`
+  を使っており（本節記述時点で確認済み）、`benches/hnsw_parallel_build_bench.rs`
+  はフィールド読み取りのみのためリポ内は追随編集不要。それでも `pub` フィ
+  ールド追加は公開 API 上のソース非互換になり得るため、#494 の PR では
+  Breaking changes 節で明示する（`docs/design/error-enum-non-exhaustive-policy.md`
+  と同方針。`#[non_exhaustive]` の後付けはしない）。
+
+### 14.8 公開 API の不変性（#494 の「探索 API は不変」の根拠）
+
+不変: `HnswIndex::{build, build_with_threads, build_with_threads_observed,
+build_parallel, search, search_masked, neighbors, level_of, max_level,
+entry_point, max_degree, len, is_empty, dim, params, vector,
+approx_heap_bytes}`・`pub(crate) is_mask_fully_reachable`・
+`HnswSearchScratch`・`NodeMask`・`HnswError`（variant 追加なし）。呼び出し元
+（`sql/hnsw_cache.rs`・`sql/hnsw_hybrid.rs`・
+`rls.rs::PrefilterSnapshot::search_with_hnsw`・`hnsw/provider.rs`・
+`tests/hnsw*.rs`・`benches/hnsw_*`）は無変更で通る。
+
+### 14.9 #494 向けテスト計画（列挙のみ・本 Issue では実装しない）
+
+1. 平坦化ラウンドトリップ: 可変表現のスナップショット（全 (node, level) の
+   `Vec<u32>`）と CSR の `neighbors()` が全件・順序込みで一致（`pub(crate)`
+   の平坦化関数を単体テストから直接呼ぶ）。「平坦化前のグラフ不変」を検証
+   可能にする唯一の経路。
+2. 既存回帰: `tests/hnsw.rs`（次数上限・自己ループ・重複・層整合・連結性）、
+   `parallel_build.rs` の `threads=1` 完全一致、`tests/hnsw_search.rs` の
+   Recall／決定性、`tests/hnsw_cache.rs`・`hnsw_hybrid_refetch.rs`・
+   `incremental_index_hnsw.rs`・`rls.rs` の HNSW 系——**公開 API 経由のテス
+   トはすべて無変更で green** を受け入れ条件とする（private 関数を直接呼ぶ
+   モジュール内単体テストは §14.5 項 2 のとおり呼び出し形の追随のみ許容し、
+   アサーションは変えない）。
+3. fail-closed: offsets 累積の `checked_add` ヘルパ単体テスト（`u32` 超過で
+   `CapacityOverflow`）、`levels` の `u8::try_from`。
+4. `approx_heap_bytes` の下限テスト維持＋ CSR 4 配列の `capacity` を計上す
+   る新算式の単体テスト。
+5. `clippy -D warnings`・新規 `unsafe` ゼロ。
+
+### 14.10 リスク・申し送り
+
+- 平坦化コピーが構築時間へ加算される（100k 点で数 ms〜十数 ms の見込み。
+  #495 で `flatten` 段として実測）。
+- `search_layer` のジェネリック化で `hnsw.rs` の関数シグネチャが増える
+  （`pub(crate)` のみ。外部 API 影響なし）。
+- #449（修復並列化）と #494 が `freeze` 周辺を同時に触る可能性 → §14.2 の
+  stage 順序を先に固定して衝突を回避する。
+- 実測値はすべて共有 QEMU 環境の参考値
+  （`docs/design/benchmark-judgement-policy.md` §5〜6）。
+
+### 14.11 参照
+
+- `docs/design/hotpath-implementation-survey.md`（§3「HNSW グラフ」・
+  §9-#5）
+- `docs/design/chip-kernel-guidelines.md`（§0.2・prefetch の safe/unsafe 境
+  界）
+- `docs/design/benchmark-judgement-policy.md`（§5〜6・専有環境判定不能な施
+  策種別）
+- `docs/design/hnsw-parallel-build.md`（並列構築・決定性の範囲）
+- `docs/design/hnsw-search.md`（決定性の保証範囲）
+- `docs/design/hnsw-graph-construction.md`（データ構造・API）
