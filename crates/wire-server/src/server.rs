@@ -12,8 +12,13 @@
 //! [`crate::bind_guard`] へ移設・拡張）。TASK-69（WIRE-5, WIRE-6。接続資源保護）。
 //!
 //! ソケットオプション方針: accept 直後に全接続へ `TCP_NODELAY` を設定し、
-//! Nagle アルゴリズムを無効化する（簡易クエリ応答の複数 `write_all` 分割と
-//! delayed ACK の相互作用による遅延を避けるため）。
+//! Nagle アルゴリズムを無効化する。簡易クエリ応答は原則
+//! `crate::response_buffer::ResponseBuffer` により 1 回の `write_all` へ
+//! 束ねられる（Issue #481）が、応答合計が
+//! `crate::limits::MAX_RESPONSE_BUFFER_BYTES` を超える場合の分割送出・
+//! `SET`/`INSERT` 等の `CommandComplete` + `ReadyForQuery`（2 write。本 Issue の
+//! 対象外）では引き続き複数 `write_all` に分かれるため、delayed ACK との
+//! 相互作用による遅延を避ける本設定を維持する。
 
 use std::net::TcpListener;
 use std::sync::Arc;
