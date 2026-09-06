@@ -141,7 +141,7 @@ PolicyContext)` × テーブル単位世代キーで `sql::arena_cache::SqlArena
 | --- | --- | --- |
 | データモデル | `(tenant_id, value_key, id)`／`(value_key, tenant_id, id)` の 2 テーブル | `sql::arena_cache::SqlArenaSnapshot`（RLS 可視行のみ）の metadata から `row_codec::scan_scalar_columns` で構築する派生構造。等価: `HashMap<Text, Vec<slot>>`（slot 昇順）、前方一致（＋`id` 比較の任意拡張）: `(value, slot)` の整列配列を二分探索でレンジ走査 |
 | 一貫性 | 行書き込みと同一 `write_txn`・DDL 8 項目の同期契約（後述「候補 A を採る場合の契約」節）・`table_generation_bump_coverage.rs` 対象拡大が必要 | 書き込み経路は**無変更**。`catalog::table_generation_in_txn` の世代が進めば失効し次クエリで再構築（`SqlArenaCache`・`sql::sparse_cache::SparseIndexCache`・`sql::hnsw_cache::HnswIndexCache` と同型） |
-| RLS 境界 | 索引ヒットは候補であり `is_visible` 再適用必須。Index-P 由来統計のみ横断保持 | 索引は ctx 可視行のみから構築されるため候補 ⊆ 可視集合が構造的に成立。統計は per-ctx のみ。他テナント `Private` 行の存在・分布・処理時間への影響が構造的に無い（`sql-arena-generation-cache.md`「安全性」節と同じ論法） |
+| RLS 境界 | 索引ヒットは候補であり `is_visible` 再適用必須。Index-P 由来統計のみ横断保持 | 索引は ctx 可視行のみから構築されるため候補 ⊆ 可視集合が構造的に成立。統計は per-ctx のみで、他テナント `Private` 行の存在・分布が候補集合・統計値へ混入することは無い（`sql-arena-generation-cache.md`「安全性」節と同じ論法）。**ただし処理時間の独立性は保証しない**——採用するテーブル単位世代キャッシュでは他テナントの `Private` 行の書き込みでも同じテーブルの世代が進み `SqlArenaCache`／本索引ともにミスして再構築が必要になり、cold 時の構築は不可視行を含む全行走査であるため、他テナントの書き込み頻度・データ量は本索引の cold/hot 発生率・構築コストという処理時間の観点には影響しうる |
 | write amplification | 列数 ×（1〜2）倍の追加書き込み | 0（読み取り側の初回構築コスト O(N) のみ） |
 | メモリ | redb ページ（永続） | 索引バイト量を容量上限に計上（既存 `SqlArenaCache` 容量上限と同桁の独立上限、または共有上限。「採用案の確定仕様」節） |
 | 対応可能な述語 | 等価・前方一致 | 等価・前方一致・`id` 比較（現行許可リストで索引可能な形の全部） |
@@ -251,7 +251,9 @@ Issue #473〜#476 はこの節の契約に従う。
   `full_scan_ratio` と同型の整数比。既定 1/10 の先例あり・Issue #409）を超える
   場合は全走査へフォールバックする。既定値は #474 で仮置きし #476 で実測確定する。
   統計は per-ctx 索引自身のカーディナリティのみ（他テナントの `Private` 行の
-  存在・分布・処理時間への影響が構造的に無い設計を維持する）
+  存在・分布が統計値へ混入することは無い設計を維持する。ただし「RLS 境界」節の
+  注記のとおり、テーブル単位世代キャッシュである以上、他テナントの `Private` 行
+  書き込みによる世代進行は cold/hot 発生率という処理時間の観点には影響しうる）
 - **集計・`GROUP BY` 経路（#475）**: `sql/aggregate.rs`・`sql/group_by.rs` は現状
   redb 直走査のため、兄弟 Issue #477 の `VisibleBitmapCache`（RLS 可視性の権威）を
   下層、本索引（可視スナップショットの派生）を上層とする層分担を定義する。
