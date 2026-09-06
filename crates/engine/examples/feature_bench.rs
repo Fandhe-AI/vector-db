@@ -28,6 +28,13 @@
 //! `meta` にのみ追加する）。engine=hnsw のときは全フェーズ計測後に
 //! `EngineCore::hnsw_index_cache_stats()` が `builds>=1 && hits>0` を満たすことを
 //! 検証し（非 vacuous 確認）、満たさなければ `fail_bench` で終了する。
+//!
+//! `BENCH_FEATURE_DIM`（正整数・既定 128・上限 `bench_engine::MAX_BENCH_DIM`。
+//! Issue #466）でベクトル次元数を上書きできる。dim=768／1536 が Issue #365
+//! （dot カーネル多アキュムレータ化検討）で採否の判別変数と判明したため、
+//! 横断 SQL ベンチ側にも dim を可変にする規模点を用意する。パースは
+//! `bench_engine::parse_dim` を fail-closed に用い、`meta.dim` は既存キーの
+//! まま値のみが変わる（JSON の形は不変）。
 
 #[path = "../benches/harness/bench_engine.rs"]
 mod bench_engine;
@@ -46,7 +53,6 @@ use engine::storage::{RowInput, Storage, Visibility};
 use std::hint::black_box;
 use std::time::Instant;
 
-const DIM: u32 = 128;
 /// scale=1（既定）時の tenant-a・tenant-b 投入行数。[`main`] が
 /// `BENCH_FEATURE_SCALE` 倍率をこの基準値へ掛けて実行時の行数を決める
 /// （Issue #413。`ROWS_A`・`ROWS_B` の定数名は既存 doc コメント・実測記録との
@@ -694,6 +700,16 @@ fn main() {
     };
     let rows_a = ROWS_A_BASE * scale;
     let rows_b = ROWS_B_BASE * scale;
+    let dim: u32 = match bench_engine::read_env_var("BENCH_FEATURE_DIM").and_then(|raw| {
+        bench_engine::parse_dim(
+            raw.as_deref(),
+            bench_engine::DEFAULT_BENCH_DIM,
+            bench_engine::MAX_BENCH_DIM,
+        )
+    }) {
+        Ok(d) => d,
+        Err(e) => fail_bench("BENCH_FEATURE_DIM", &e.to_string()),
+    };
 
     let mut db_path = std::env::temp_dir();
     db_path.push(format!(
@@ -713,11 +729,11 @@ fn main() {
     }
     let _cleanup = CleanupGuard(db_path.clone());
 
-    let embedder = HashingEmbedder::new(DIM).expect("valid embedder dim");
+    let embedder = HashingEmbedder::new(dim).expect("valid embedder dim");
     let schema = TableSchema::new(
         "docs",
         vec![
-            ColumnDef::new("embedding", ColumnType::Vector(DIM), false),
+            ColumnDef::new("embedding", ColumnType::Vector(dim), false),
             ColumnDef::new("lang", ColumnType::Text, false),
             ColumnDef::new("topic", ColumnType::Text, false),
             ColumnDef::new("body", ColumnType::Text, false),
@@ -755,6 +771,18 @@ fn main() {
                 .remove(0)
         })
         .collect();
+    // 埋め込み器の出力次元と schema の `dim` が食い違ったまま計測を続けると、
+    // ベクトルカーネルへ形の合わない入力を渡すことになるため即座に止める
+    // （Issue #466。`BENCH_FEATURE_DIM` 上書き経路の fail-closed 検査）。
+    if query_vecs[0].len() != dim as usize {
+        fail_bench(
+            "BENCH_FEATURE_DIM",
+            &format!(
+                "query embedding dim mismatch: expected {dim}, got {}",
+                query_vecs[0].len()
+            ),
+        );
+    }
     let qv0 = vec_literal(&query_vecs[0]);
     let qv1 = vec_literal(&query_vecs[1 % query_vecs.len()]);
     let qv2 = vec_literal(&query_vecs[2 % query_vecs.len()]);
@@ -945,7 +973,7 @@ fn main() {
     let mut out = String::new();
     out.push_str("{\"meta\":{");
     out.push_str(&format!(
-        "\"rows_tenant_a\":{rows_a},\"rows_tenant_b\":{rows_b},\"dim\":{DIM},\
+        "\"rows_tenant_a\":{rows_a},\"rows_tenant_b\":{rows_b},\"dim\":{dim},\
          \"batch_size\":{BATCH_SIZE},\"warmup\":{WARMUP},\"iters\":{ITERS},\
          \"db_bytes_after_ingest\":{rows_after_ingest_bytes},\
          \"db_bytes_final\":{final_db_bytes},\

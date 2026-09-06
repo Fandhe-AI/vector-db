@@ -58,6 +58,11 @@ def public_only_where(table_alias: str = "") -> str:
     return f"{prefix}visibility = 'public'"
 
 
+# フィクスチャ（docs/queries jsonl）から dim を導出できないときのフォールバック
+# 既定値（Issue #466 以前からの値をそのまま維持）。`self_db.py::rng_dim` が
+# queries から次元数を得られない場合にのみ参照する。dim=768／1536 等の切替は
+# `seed_docs`（`crates/engine/examples/seed_docs.rs`）が生成する fixture 側の
+# 埋め込み長で決まり、本定数は実測経路の主たる dim 指定手段ではない。
 DIM = 128
 
 
