@@ -1,0 +1,159 @@
+name: Detect features (Apple Silicon)
+
+# Issue #468 の実機検証用 workflow。GitHub ホステッド Apple Silicon runner
+# （`macos-latest`。AGENTS.md「CI・ワークフローの改変」の runner 方針の範囲内で
+# GitHub ホステッドのみを使用）上で `crates/engine/examples/detect_features.rs`
+# （`make detect-features`）と `cargo test -p engine --test isa` を実行し、
+# `is_aarch64_feature_detected!` マクロが Apple Silicon 上で実際にどう振る舞うかを
+# CI ログへ記録する。
+#
+# 情報提供専用（spec 由来の閾値を持たない）。両ジョブは自動マージ運用の都合で必須
+# チェックへ登録するが、対象外 PR では skipped で合格扱いになる。secrets は使用しない。private submodule（docs/spec）は取得しない。実測結果は
+# `docs/design/chip-kernel-guidelines.md` の該当節へ手動で転記する運用とする
+# （README「実装方針（要点）」の #468 小節参照）。
+
+# トリガ設計: `pull_request` は paths フィルタを付けず全 PR で起動し、先頭の
+# `detect-changes` ジョブ（ubuntu・数秒）が PR の変更ファイル一覧から対象パス
+# （`isa.rs`・`detect_features.rs`・`tests/isa.rs`・本 workflow）の変更有無を判定する。
+# 実機検証本体の `detect-apple`（macos-latest）は対象パスが変更された PR と
+# `workflow_dispatch` でのみ実行し、それ以外の PR では skipped の check-run を残す。
+#
+# paths フィルタ方式（対象外 PR では check-run 自体が存在しない）を採らない理由:
+# 本リポの自動マージ運用（implement-issue-tree の G0 ゲート）は「PR HEAD 上の全
+# check-run が必須チェックに含まれる」かつ「全必須チェックの check-run が HEAD に
+# 存在する」ことを要求するため、両ジョブを必須チェックへ登録しつつ、対象外 PR でも
+# check-run（skipped）が常に存在する構成でなければ、`isa.rs` を触る PR か触らない PR の
+# どちらかで自動マージが止まる。skipped の check-run は GitHub の必須チェック判定で
+# 合格扱いになる。Apple Silicon 上の自動検証経路（AGENTS.md「CI・ワークフローの
+# 改変」の検証ジョブ非弱体化）は維持する。
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 対象パスの変更有無を PR の変更ファイル一覧（REST API）から判定する。
+  # git の履歴取得（fetch-depth: 0）を避けて数秒で終える。workflow_dispatch では
+  # 判定を省略し常に実行対象とする。API 取得に失敗した場合は fail-closed で
+  # 「変更あり」と扱い、実機検証を省略しない。
+  detect-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      changed: ${{ steps.judge.outputs.changed }}
+    steps:
+      - name: Judge whether feature-detection paths changed
+        id: judge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "workflow_dispatch: run detect-apple unconditionally"
+            exit 0
+          fi
+          # 変更ファイル一覧は 1 回だけ取得し、件数照合と対象パス照合の両方に使う。
+          # 改名（rename）は新パス `filename` に加えて旧パス `previous_filename` を持つため、
+          # 対象ファイルを移動する PR で検証が skipped にならないよう新旧両方を照合する。
+          # API 呼び出し（一覧・件数とも）の失敗は fail-closed で「変更あり」と扱う
+          if ! listing=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --slurp); then
+            echo "failed to list PR files; fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! expected=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files'); then
+            echo "failed to read changed_files; fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # List pull requests files はページングしても最大 3000 件までしか返さない。
+          # PR の changed_files（総数）と取得件数が一致しない不完全な一覧では対象パスが
+          # 取得範囲外にある可能性があるため、fail-closed で「変更あり」と扱う
+          fetched=$(jq 'map(length) | add // 0' <<< "$listing")
+          if [ "$fetched" -ne "$expected" ] || [ "$expected" -ge 3000 ]; then
+            echo "file list incomplete (fetched=$fetched, changed_files=$expected); fail-closed to changed=true"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(jq -r '.[][] | .filename, (.previous_filename // empty)' <<< "$listing")
+          changed=false
+          while IFS= read -r f; do
+            case "$f" in
+              crates/engine/examples/detect_features.rs|crates/engine/src/isa.rs|crates/engine/tests/isa.rs|.github/workflows/detect-features.yml)
+                changed=true ;;
+            esac
+          done <<< "$files"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "feature-detection paths changed: $changed"
+
+  detect-apple:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.changed == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # 第三者 action は ci.yml と同一 SHA 固定で参照する（AGENTS.md「CI・ワークフローの
+      # 改変（P1）」。`@latest` が許されるのは Fandhe-AI/actions のみ）。private
+      # submodule（docs/spec）は取得しない
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Install Rust toolchain (rust-toolchain.toml)
+        run: rustup show
+
+      # チップ世代の推測（M1／M2／…）を避け、実測でチップ・OS 版を記録する
+      - name: Report chip and sysctl feature flags
+        run: |
+          {
+            echo "### Apple Silicon 実機情報"
+            echo '```'
+            sysctl -n machdep.cpu.brand_string || true
+            uname -m
+            sw_vers
+            echo "--- sysctl feature flags ---"
+            sysctl hw.optional.AdvSIMD \
+              hw.optional.arm.FEAT_FP16 \
+              hw.optional.arm.FEAT_FHM \
+              hw.optional.arm.FEAT_DotProd \
+              hw.optional.arm.FEAT_BF16 \
+              hw.optional.arm.FEAT_I8MM \
+              hw.optional.arm.FEAT_SME \
+              hw.optional.arm.FEAT_SME2 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # `cargo run` の失敗を確実にステップへ伝播させるため shell: bash を明示する
+      # （既定の shell 未指定では pipefail が有効にならず、パイプ末尾の `tee` が
+      # 成功する限り `cargo run` の失敗がマスクされ、検出表を取得できないまま
+      # workflow が成功し得る。codex-review 指摘）
+      - name: Run detect_features example
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "### detect_features 出力"
+            echo '```'
+            cargo run -p engine --example detect_features
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # isa.rs の Neon 実行時検出（`is_aarch64_feature_detected!("neon")`）が
+      # 実機で肯定側に倒れることを直接検証する（tests/isa.rs 参照）
+      - name: Run isa tests
+        run: cargo test -p engine --test isa -- --nocapture

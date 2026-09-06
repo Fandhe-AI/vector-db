@@ -200,6 +200,24 @@ else
 	@echo "skip: Cargo.toml 未追加のため check-cross をスキップ"
 endif
 
+.PHONY: simd-codegen-check
+simd-codegen-check: ## SIMD カーネル（isa.rs）の生成コード検査。要素ごと挿入命令の不在を --emit asm で機械検査（Issue #467・TASK-156 関連。engine の release ビルドを伴う）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --self-test
+	scripts/check_simd_codegen.sh
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check をスキップ"
+endif
+
+.PHONY: simd-codegen-check-cross
+simd-codegen-check-cross: ## simd-codegen-check の aarch64 版（cross-check ジョブから実行。要 aarch64-unknown-linux-gnu target。リンク不要）
+ifdef HAS_CARGO
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu --self-test
+	scripts/check_simd_codegen.sh --target aarch64-unknown-linux-gnu
+else
+	@echo "skip: Cargo.toml 未追加のため simd-codegen-check-cross をスキップ"
+endif
+
 .PHONY: e2e-three-client
 e2e-three-client: ## TASK-73（WIRE-1）/TASK-82（SQL-5〜7,9,10）/TASK-165（SQL-12・SEARCH-9）/TASK-168（SQL-13・SQL-14）psql/psycopg/pg 実クライアント統合テスト（opt-in・`ci` には含めない。要 psql・python3+psycopg・node+pg。PSQL_BIN/PYTHON_BIN/NODE_BIN で上書き可）
 ifdef HAS_CARGO
@@ -223,7 +241,7 @@ else
 endif
 
 .PHONY: ci
-ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check deny ## CI（ci.yml）と同等のチェックを一括実行する
+ci: lint-docs fmt-check lint test crash-test crash-test-interrupt crash-test-cross-table core-api-check sort-determinism-check simd-codegen-check deny ## CI（ci.yml）と同等のチェックを一括実行する
 
 # --------------------------------------------------
 # 性能・Recall 受け入れ基準の回帰ベンチ（TASK-127。crates/engine/benches/simd_bench.rs）
@@ -365,6 +383,19 @@ ifdef HAS_CARGO
 	cargo bench --bench dot_kernel_bench -p engine
 else
 	@echo "skip: Cargo.toml 未追加のため bench-dot-kernel をスキップ"
+endif
+
+# --------------------------------------------------
+# is_aarch64_feature_detected!／is_x86_feature_detected! の実効性を出力する検出ツール
+# （Issue #468。crates/engine/examples/detect_features.rs）
+# --------------------------------------------------
+
+.PHONY: detect-features
+detect-features: ## Issue #468（macOS 上の is_aarch64_feature_detected! 実効性検証）の feature 検出結果表を出力する（時間非依存・spec 閾値なしの情報提供専用のため ci には含めない。手動実行専用。出力は docs/design/chip-kernel-guidelines.md へ転記する運用）
+ifdef HAS_CARGO
+	cargo run -p engine --release --example detect_features
+else
+	@echo "skip: Cargo.toml 未追加のため detect-features をスキップ"
 endif
 
 # --------------------------------------------------
