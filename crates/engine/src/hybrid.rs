@@ -518,27 +518,73 @@ pub(crate) fn rrf_fuse_with_limits(
 
     // 融合マップの要素数は高々 `dense_limit + sparse_limit`（境界同点グループ完全化の
     // 再取得により `pool_depth` を超えうるが、[`MAX_FETCH_K`] を上回ることはない
-    // 上記の長さ検証で保証済み）に有界。id をキーにした
-    // `BTreeMap` を使うことで、出現順・ハッシュ実装に依存しない決定的な走査順序を
-    // 保証する（同点タイブレークの安定性に寄与）。
-    let mut scores: BTreeMap<u64, f64> = BTreeMap::new();
-
-    accumulate_ranked(
+    // 上記の長さ検証で保証済み）に有界。
+    //
+    // Issue #549（対象ビヘイビア: SEARCH-1・SEARCH-3。TASK-104・TASK-84 ポインタ）:
+    // 以前は id をキーにした `BTreeMap` へ `entry().or_insert(0.0)` で加算していたが、
+    // ノード確保が毎クエリで多数発生していた。ここでは寄与（`weight / (k_const +
+    // rank)`）を「位置」に対して 1 回だけ計算する位置索引方式へ置換する: `contrib`
+    // （長さ `n_d + n_s`。dense は `[0..n_d)`、sparse は `[n_d..)`）に各位置の寄与を
+    // 書き込み（[`compute_contributions`]。密・疎いずれの位置も一意で重複しないため
+    // 加算ではなく単純代入で足りる）、`index`（`(id, pos)` の全順序タプル。id は
+    // 呼び出し元定義の任意 `u64` のため id を直接添字にする表は作らない
+    // ── 添字化は untrusted な id に比例した無制限確保になる。coding-rust.md
+    // 「長さフィールドは上限検証してからアロケーションに使う」）を id 昇順へ
+    // 比較関数なし `sort_unstable()`（`(u64, usize)` の `Ord` は既に id 優先の
+    // 全順序で `pos` が一意のため同点は生じない。`scripts/check_sort_determinism.sh`
+    // の許容例外 ── `docs/design/rrf-tie-break-determinism.md`「例外として許容する
+    // 箇所」参照）で整列してから、id が等しい連続区間（`dense`・`sparse` それぞれの
+    // 契約によりこの区間は高々 dense 側 1 件・sparse 側 1 件）の寄与を合算する。
+    // 演算順（各位置の寄与を求めてから加算する順序）は旧 `BTreeMap` 版の
+    // `or_insert(0.0)` → `+= dense 寄与` → `+= sparse 寄与`（`rrf_fuse_with_limits` が
+    // dense を先に呼んだ後 sparse を呼ぶため）と完全に同一であり、スコアは
+    // ビット同一になる（`#[cfg(test)] rrf_fuse_reference_with_limits` との等価性は
+    // `mod tests` で機械検証）。
+    let n_d = dense.len();
+    let n_s = sparse.len();
+    let mut contrib = vec![0.0_f64; n_d + n_s];
+    compute_contributions(
         dense,
         |h| (f64::from(h.score), h.id),
         cfg.k_const(),
         cfg.dense_weight(),
         cfg.tie_rank(),
-        &mut scores,
+        &mut contrib[0..n_d],
     );
-    accumulate_ranked(
+    compute_contributions(
         sparse,
         |d| (d.score, d.doc_id),
         cfg.k_const(),
         cfg.sparse_weight(),
         cfg.tie_rank(),
-        &mut scores,
+        &mut contrib[n_d..],
     );
+
+    let mut index: Vec<(u64, usize)> = Vec::with_capacity(n_d + n_s);
+    for (pos, hit) in dense.iter().enumerate() {
+        index.push((hit.id, pos));
+    }
+    for (pos, doc) in sparse.iter().enumerate() {
+        index.push((doc.doc_id, n_d + pos));
+    }
+    // タプルの `Ord`（id 優先・`pos` は同一 id 内で一意）に従う比較関数なしの
+    // `sort_unstable()`。`(id, pos)` は要素ごとに一意のため `sort_unstable` の
+    // 不安定性（同値要素の順序不定）は観測されない。
+    index.sort_unstable();
+
+    let mut merged: Vec<HybridHit> = Vec::with_capacity(index.len());
+    let mut i = 0usize;
+    while i < index.len() {
+        let id = index[i].0;
+        let mut score = 0.0_f64;
+        let mut j = i;
+        while j < index.len() && index[j].0 == id {
+            score += contrib[index[j].1];
+            j += 1;
+        }
+        merged.push(HybridHit { id, score });
+        i = j;
+    }
 
     // 融合後の有限性検証（3 回目の codex-review P1 指摘対応。[`HybridError::NonFiniteScore`]
     // のドキュメント参照）。`RrfConfig::new` は重み（`dense_weight`/`sparse_weight`）の
@@ -546,15 +592,17 @@ pub(crate) fn rrf_fuse_with_limits(
     // （`weight / (k_const + rank)`）が有限でも、同一 id が密・疎双方の上位順位に
     // 現れて寄与を加算した結果が `f64::MAX` を超えて `+Inf` へオーバーフローしうる。
     // 融合前の入力検証（有限性・ソート順・重複）だけでは検知できないため、加算後の
-    // `scores` に対して独立に検証する。
-    if scores.values().any(|score| !score.is_finite()) {
+    // `merged` に対して独立に検証する。
+    if merged.iter().any(|hit| !hit.score.is_finite()) {
         return Err(HybridError::NonFiniteScore);
     }
 
-    let mut out: Vec<HybridHit> = scores
-        .into_iter()
-        .map(|(id, score)| HybridHit { id, score })
-        .collect();
+    // 最終スコアソートは安定ソート `sort_by` を維持する（`docs/design/
+    // rrf-tie-break-determinism.md` の不変条件）。ただし比較器 `b.score.total_cmp(&a.score)
+    // .then(a.id.cmp(&b.id))` は id が一意である限り同値要素を生まない全順序のため、
+    // `merged` を安定ソートへ渡す前の走査順序（本実装では id 昇順）自体は出力に
+    // 影響しない。
+    let mut out = merged;
     out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
     Ok(out)
 }
@@ -587,14 +635,16 @@ fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
 /// 複数回出現するかを判定する。[`accumulate_ranked`] 側では検査しない（[`rrf_fuse`]
 /// が呼び出し元であり、有限性・ソート順の検証と同じ「全件」スコープで一度だけ
 /// 検査する設計）。
+///
+/// Issue #549: `BTreeSet` へ全件挿入する版（ノード確保がリストの件数だけ発生する）から、
+/// 単一の `Vec` へ収集して比較関数なし `sort_unstable()` の後に隣接比較する版へ置換
+/// （bool の戻り値契約・呼び出し位置は不変。`scripts/check_sort_determinism.sh` の
+/// 許容例外については [`rrf_fuse_with_limits`] 内の `index.sort_unstable()` コメント
+/// 参照）。
 fn has_duplicate_id(ids: impl Iterator<Item = u64>) -> bool {
-    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-    for id in ids {
-        if !seen.insert(id) {
-            return true;
-        }
-    }
-    false
+    let mut sorted: Vec<u64> = ids.collect();
+    sorted.sort_unstable();
+    sorted.windows(2).any(|pair| pair[0] == pair[1])
 }
 
 /// [`hybrid_search_boosted`] が拡張取得列（`fetch_k` 件。`cfg.pool_depth()` を超え
@@ -761,18 +811,20 @@ fn exclude_undetermined_boundary_group<T>(
     items
 }
 
-/// [`rrf_fuse`] の内部ヘルパ。1 つのランク付き列（呼び出し元で既に長さ検証済み。
-/// [`HybridError::TooManyCandidates`] のドキュメント参照）を RRF スコアへ変換し、
-/// `scores` へ加算する。密・疎の両リストから同じロジックで呼ばれることで加算順序を
-/// 一本化する。呼び出し元（[`rrf_fuse`]）が [`has_duplicate_id`] で入力リスト全体の
-/// 重複なしを事前に検証済みのため、本関数自体は重複検知を行わない。
+/// [`rrf_fuse_with_limits`] の内部ヘルパ（Issue #549）。1 つのランク付き列（呼び出し元で
+/// 既に長さ検証済み。[`HybridError::TooManyCandidates`] のドキュメント参照）の
+/// 各位置（`items` の添字。呼び出し元の位置索引 `contrib` の対応区間）へ RRF の
+/// 寄与（`weight / (k_const + rank)`）を書き込む。密・疎の両リストは呼び出し元が
+/// `contrib` の別区間（重ならない）へ振り分けて呼ぶため、`or_insert` 相当の初期化・
+/// 同一位置への加算は不要（各位置は必ず 1 回だけ書き込まれる）。id ごとの合算
+/// （同一 id が密・疎双方に出現する場合の加算）は呼び出し元（[`rrf_fuse_with_limits`]）が
+/// 位置索引 `index` を id 昇順に整列したうえで別途行う。
 ///
 /// 1-based の**位置順位**（`items` に現れる並び順がそのまま順位になる。`items` の
 /// 並び順は provider/index が定める「スコア降順、同点は候補識別子昇順」
 /// （[`is_sorted_desc_id_asc`] が検証する契約）に従う）を、同点グループ内の全要素へも
-/// 個別に割り当てる。`key` は `(score, id)` を返すが、本関数はこのうち `id`（順位の
-/// 加算先）のみを使い、`score` 自体は同点判定に使わない（呼び出し元 [`rrf_fuse`] が
-/// スコアの有限性・ソート順を事前検証済みのため）。
+/// 個別に割り当てる。`key` は `(score, id)` を返すが、本関数は同点判定にのみ
+/// `score` を使い、`id` 自体は使わない（id ごとの合算は呼び出し元が担う）。
 ///
 /// 同点グループへ割り当てる順位は `tie_rank`（[`TieRank`]。Issue #310 で
 /// [`TieRank::Positional`]／[`TieRank::GroupEnd`] の 2 規約を確定。詳細な導出は
@@ -780,24 +832,25 @@ fn exclude_undetermined_boundary_group<T>(
 /// が決める。`items` は呼び出し元（[`rrf_fuse_with_limits`]）がスコアの有限性・
 /// ソート順（[`is_sorted_desc_id_asc`]）を検証済みのため、同点判定は
 /// `f64::total_cmp` の `Equal` のみで行う（NaN は事前拒否済みで全順序上も安全）。
-fn accumulate_ranked<T>(
+/// `contrib.len()` は `items.len()` と一致する契約（呼び出し元が保証。違反時は
+/// パニックせず該当範囲を書き込まないだけに留める防御的な実装にはしない ──
+/// 呼び出し元が本モジュール内に閉じているため `debug_assert_eq!` で早期検知する）。
+fn compute_contributions<T>(
     items: &[T],
     key: impl Fn(&T) -> (f64, u64),
     k_const: f64,
     weight: f64,
     tie_rank: TieRank,
-    scores: &mut BTreeMap<u64, f64>,
+    contrib: &mut [f64],
 ) {
+    debug_assert_eq!(items.len(), contrib.len());
     match tie_rank {
         TieRank::Positional => {
-            for (idx, item) in items.iter().enumerate() {
+            for (idx, slot) in contrib.iter_mut().enumerate() {
                 // 1-based 順位。`idx` は `items.len() <= pool_depth <= MAX_POOL_DEPTH`
                 // に収まるため `as f64` 変換で精度は失われない。
                 let rank = (idx as f64) + 1.0;
-                let contribution = weight / (k_const + rank);
-                let (_, id) = key(item);
-                let entry = scores.entry(id).or_insert(0.0);
-                *entry += contribution;
+                *slot = weight / (k_const + rank);
             }
         }
         TieRank::GroupEnd => {
@@ -820,6 +873,53 @@ fn accumulate_ranked<T>(
                 // 「末尾の次」のインデックスのため、そのまま 1-based 順位に一致する。
                 let rank = end as f64;
                 let contribution = weight / (k_const + rank);
+                for slot in &mut contrib[idx..end] {
+                    *slot = contribution;
+                }
+                idx = end;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+/// Issue #549 の等価性検証専用の参照実装（`content_hash.rs`・Issue #399 の先例に
+/// 倣い、置換前の実装を逐語コピーで残置）。production 経路（[`rrf_fuse_with_limits`]・
+/// [`compute_contributions`]）が返す融合結果と本関数がビット同一であることを
+/// `mod tests` の `rrf_fuse_with_limits_matches_reference_bitwise` 系で機械検証する。
+/// production コードからは呼ばれない。
+fn accumulate_ranked_reference<T>(
+    items: &[T],
+    key: impl Fn(&T) -> (f64, u64),
+    k_const: f64,
+    weight: f64,
+    tie_rank: TieRank,
+    scores: &mut BTreeMap<u64, f64>,
+) {
+    match tie_rank {
+        TieRank::Positional => {
+            for (idx, item) in items.iter().enumerate() {
+                let rank = (idx as f64) + 1.0;
+                let contribution = weight / (k_const + rank);
+                let (_, id) = key(item);
+                let entry = scores.entry(id).or_insert(0.0);
+                *entry += contribution;
+            }
+        }
+        TieRank::GroupEnd => {
+            let mut idx = 0usize;
+            while idx < items.len() {
+                let (group_score, _) = key(&items[idx]);
+                let mut end = idx + 1;
+                while end < items.len() {
+                    let (score, _) = key(&items[end]);
+                    if score.total_cmp(&group_score) != std::cmp::Ordering::Equal {
+                        break;
+                    }
+                    end += 1;
+                }
+                let rank = end as f64;
+                let contribution = weight / (k_const + rank);
                 for item in &items[idx..end] {
                     let (_, id) = key(item);
                     let entry = scores.entry(id).or_insert(0.0);
@@ -829,6 +929,82 @@ fn accumulate_ranked<T>(
             }
         }
     }
+}
+
+#[cfg(test)]
+/// Issue #549 の等価性検証専用の参照実装。置換前の `rrf_fuse_with_limits` 融合コア
+/// （`has_duplicate_id` ×2 → `BTreeMap` 累積 → 有限性 → `collect` → `sort_by`）を
+/// 逐語コピーで残置する。`dense_limit`/`sparse_limit` の意味・検証順序は production 側
+/// （[`rrf_fuse_with_limits`]）と完全に同一。production コードからは呼ばれない。
+fn rrf_fuse_reference_with_limits(
+    dense: &[CandidateHit],
+    dense_limit: usize,
+    sparse: &[ScoredDoc],
+    sparse_limit: usize,
+    cfg: &RrfConfig,
+) -> Result<Vec<HybridHit>, HybridError> {
+    if dense_limit > MAX_FETCH_K || sparse_limit > MAX_FETCH_K {
+        return Err(HybridError::InvalidConfig);
+    }
+    if dense.len() > dense_limit {
+        return Err(HybridError::TooManyCandidates {
+            len: dense.len(),
+            max: dense_limit,
+        });
+    }
+    if sparse.len() > sparse_limit {
+        return Err(HybridError::TooManyCandidates {
+            len: sparse.len(),
+            max: sparse_limit,
+        });
+    }
+    if dense.iter().any(|h| !h.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+    if sparse.iter().any(|d| !d.score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+    if !is_sorted_desc_id_asc(dense.iter().map(|h| (f64::from(h.score), h.id))) {
+        return Err(HybridError::UnsortedInput);
+    }
+    if !is_sorted_desc_id_asc(sparse.iter().map(|d| (d.score, d.doc_id))) {
+        return Err(HybridError::UnsortedInput);
+    }
+    if has_duplicate_id(dense.iter().map(|h| h.id)) {
+        return Err(HybridError::DuplicateId);
+    }
+    if has_duplicate_id(sparse.iter().map(|d| d.doc_id)) {
+        return Err(HybridError::DuplicateId);
+    }
+
+    let mut scores: BTreeMap<u64, f64> = BTreeMap::new();
+    accumulate_ranked_reference(
+        dense,
+        |h| (f64::from(h.score), h.id),
+        cfg.k_const(),
+        cfg.dense_weight(),
+        cfg.tie_rank(),
+        &mut scores,
+    );
+    accumulate_ranked_reference(
+        sparse,
+        |d| (d.score, d.doc_id),
+        cfg.k_const(),
+        cfg.sparse_weight(),
+        cfg.tie_rank(),
+        &mut scores,
+    );
+
+    if scores.values().any(|score| !score.is_finite()) {
+        return Err(HybridError::NonFiniteScore);
+    }
+
+    let mut out: Vec<HybridHit> = scores
+        .into_iter()
+        .map(|(id, score)| HybridHit { id, score })
+        .collect();
+    out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    Ok(out)
 }
 
 /// ソフトブースト（TASK-111・PLAN-1）でヒント種別 1 件一致あたりに加点する既定値。
@@ -1241,7 +1417,16 @@ pub fn apply_soft_boost(
         return Err(HybridError::NonFiniteScore);
     }
 
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    // Issue #549: production 経路（`rules.is_empty()` の `hybrid_search`／
+    // `hybrid_search_boosted` 呼び出し）では加点が一切適用されず `hits` は呼び出し元
+    // （`rrf_fuse_with_limits`）が既に融合スコア降順・同点 id 昇順へ整列済みのまま
+    // 渡ってくる。既に整列済みの入力に対する安定ソートは恒等写像であり、
+    // 再ソートのスクラッチ確保は観測不能な形で省略できる（`rules.is_empty()` 自体で
+    // 分岐すると、未整列入力＋空 `rules` という契約違反ケースの挙動まで変えてしまう
+    // ため、`rules` の有無ではなく実際の整列状態で判定する）。
+    if !is_sorted_desc_id_asc(hits.iter().map(|h| (h.score, h.id))) {
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+    }
     Ok(())
 }
 
@@ -1749,6 +1934,240 @@ mod tests {
 
     fn doc(doc_id: u64, score: f64) -> ScoredDoc {
         ScoredDoc { doc_id, score }
+    }
+
+    // ---------- Issue #549: 融合コア置換の等価性検証専用ヘルパ ----------
+    //
+    // `rrf_fuse_with_limits`（位置索引方式）と `rrf_fuse_reference_with_limits`
+    // （置換前の `BTreeMap` 累積方式）がビット同一の結果を返すことを、決定的擬似
+    // 乱数生成器（xorshift64*。外部クレート不使用。`tests/hybrid_recall.rs::Xorshift64`
+    // と同一実装）で構成した多様な入力（同点グループ・重み/`k_const` の極端値・
+    // 密疎の部分/完全重複・片側空・`dense_limit != sparse_limit`）で機械検証する。
+
+    /// コーパス生成専用の決定的擬似乱数生成器（`tests/hybrid_recall.rs::Xorshift64`
+    /// と同一実装。依存最小方針のため外部乱数クレートは使わない）。
+    struct Xorshift64 {
+        state: u64,
+    }
+
+    impl Xorshift64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed.max(1) }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn next_range(&mut self, n: usize) -> usize {
+            if n == 0 {
+                return 0;
+            }
+            (self.next_u64() % (n as u64)) as usize
+        }
+    }
+
+    /// `id_space` 未満の一意な id を `n` 個（`n <= id_space`。呼び出し元がテスト内で
+    /// 保証）サンプルする（Fisher-Yates の部分適用）。
+    fn sample_unique_ids(rng: &mut Xorshift64, id_space: u64, n: usize) -> Vec<u64> {
+        let mut pool: Vec<u64> = (0..id_space).collect();
+        let take = n.min(pool.len());
+        for i in 0..take {
+            let j = i + rng.next_range(pool.len() - i);
+            pool.swap(i, j);
+        }
+        pool.truncate(take);
+        pool
+    }
+
+    /// `ids` に対し、`distinct_levels` 段の同点グループへランダムに振り分けた
+    /// スコア（`level_gap` 刻み）を持つ `CandidateHit` 列を、`rrf_fuse_with_limits`
+    /// が要求する契約（スコア降順・同点 id 昇順）へ整列して返す。
+    fn gen_dense(
+        rng: &mut Xorshift64,
+        ids: &[u64],
+        distinct_levels: usize,
+        level_gap: f64,
+    ) -> Vec<CandidateHit> {
+        let levels = distinct_levels.max(1);
+        let mut items: Vec<CandidateHit> = ids
+            .iter()
+            .map(|&id| {
+                let level = rng.next_range(levels);
+                let score = ((levels - level) as f64) * level_gap;
+                CandidateHit {
+                    id,
+                    score: score as f32,
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        items
+    }
+
+    /// [`gen_dense`] の疎版（`ScoredDoc`・`f64` スコア）。
+    fn gen_sparse(
+        rng: &mut Xorshift64,
+        ids: &[u64],
+        distinct_levels: usize,
+        level_gap: f64,
+    ) -> Vec<ScoredDoc> {
+        let levels = distinct_levels.max(1);
+        let mut items: Vec<ScoredDoc> = ids
+            .iter()
+            .map(|&doc_id| {
+                let level = rng.next_range(levels);
+                let score = ((levels - level) as f64) * level_gap;
+                ScoredDoc { doc_id, score }
+            })
+            .collect();
+        items.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+        items
+    }
+
+    #[test]
+    fn rrf_fuse_with_limits_matches_reference_bitwise() {
+        let mut rng = Xorshift64::new(0x5eed_5eed_5eed_5eedu64);
+        for trial in 0..400usize {
+            let tie_rank = if trial % 2 == 0 {
+                TieRank::GroupEnd
+            } else {
+                TieRank::Positional
+            };
+            // 密・疎の件数（片側 0 件＝空を含む）。
+            let n_d = rng.next_range(25);
+            let n_s = rng.next_range(25);
+            // id 空間を狭く保つことで密・疎間の id 重複（部分/完全重複）を頻発させる。
+            let id_space = ((n_d + n_s).max(1) as u64) + 3;
+            let dense_ids = sample_unique_ids(&mut rng, id_space, n_d);
+            let sparse_ids = sample_unique_ids(&mut rng, id_space, n_s);
+            // 同点グループの段数を小さくして境界を跨ぐ同点を頻発させる。
+            let levels = 1 + rng.next_range(4);
+            let dense = gen_dense(&mut rng, &dense_ids, levels, 0.001);
+            let sparse = gen_sparse(&mut rng, &sparse_ids, levels, 0.001);
+
+            // `k_const`/重みの通常値と極端値（同点グループを潰す巨大 `k_const`、
+            // オーバーフローを誘発しうる巨大重み）を混在させる。
+            let k_const = match trial % 5 {
+                0 => 1.0e18,
+                _ => 60.0,
+            };
+            let dense_weight = if trial % 7 == 0 { 1.0e300 } else { 1.0 };
+            let sparse_weight = if trial % 11 == 0 { 1.0e300 } else { 1.0 };
+            let cfg = RrfConfig::new(k_const, dense_weight, sparse_weight, MAX_POOL_DEPTH)
+                .expect("finite positive config values")
+                .with_tie_rank(tie_rank);
+
+            // `dense_limit != sparse_limit` を含む: 通常は各リスト自身の長さちょうど
+            // （エラーにならない）だが、一部の試行では小さめの上限を渡し
+            // `TooManyCandidates` の一致も検証する。
+            let dense_limit = if trial % 13 == 0 && !dense.is_empty() {
+                dense.len() - 1
+            } else {
+                dense.len()
+            };
+            let sparse_limit = if trial % 17 == 0 && !sparse.is_empty() {
+                sparse.len() - 1
+            } else {
+                sparse.len()
+            };
+
+            let got = rrf_fuse_with_limits(&dense, dense_limit, &sparse, sparse_limit, &cfg);
+            let want =
+                rrf_fuse_reference_with_limits(&dense, dense_limit, &sparse, sparse_limit, &cfg);
+
+            match (got, want) {
+                (Ok(g), Ok(w)) => {
+                    assert_eq!(g.len(), w.len(), "trial {trial}: result length mismatch");
+                    for (idx, (gi, wi)) in g.iter().zip(w.iter()).enumerate() {
+                        assert_eq!(gi.id, wi.id, "trial {trial} pos {idx}: id mismatch");
+                        assert_eq!(
+                            gi.score.to_bits(),
+                            wi.score.to_bits(),
+                            "trial {trial} pos {idx}: score not bit-identical (got {} want {})",
+                            gi.score,
+                            wi.score
+                        );
+                    }
+                }
+                (Err(ge), Err(we)) => {
+                    assert_eq!(ge, we, "trial {trial}: error variant mismatch");
+                }
+                (got, want) => {
+                    panic!("trial {trial}: result kind mismatch: got {got:?} want {want:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_with_limits_matches_reference_bitwise_on_full_id_overlap() {
+        // 密・疎が完全に同一の id 集合を持つ（全件が両チャネルへ寄与を加算する）
+        // 退行を専用に固定する。
+        let mut rng = Xorshift64::new(0x1234_5678_9abc_def1u64);
+        let ids = sample_unique_ids(&mut rng, 64, 40);
+        let dense = gen_dense(&mut rng, &ids, 6, 0.01);
+        let mut sparse_ids = ids.clone();
+        sparse_ids.sort_unstable();
+        let sparse = gen_sparse(&mut rng, &sparse_ids, 6, 0.01);
+        for tie_rank in [TieRank::GroupEnd, TieRank::Positional] {
+            let cfg = RrfConfig::new(60.0, 1.0, 1.0, MAX_POOL_DEPTH)
+                .unwrap()
+                .with_tie_rank(tie_rank);
+            let got =
+                rrf_fuse_with_limits(&dense, dense.len(), &sparse, sparse.len(), &cfg).unwrap();
+            let want =
+                rrf_fuse_reference_with_limits(&dense, dense.len(), &sparse, sparse.len(), &cfg)
+                    .unwrap();
+            assert_eq!(got.len(), want.len());
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert_eq!(g.id, w.id);
+                assert_eq!(g.score.to_bits(), w.score.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_priority_duplicate_id_over_post_fusion_non_finite_score() {
+        // 重複 id と融合後 +Inf を同時に含む入力で `DuplicateId` が返ること
+        // （検証順序: 長さ → 有限性(入力) → ソート順 → 重複 → 融合後有限性）を、
+        // 置換後の実装でも固定する。
+        let dense = vec![hit(1, 10.0), hit(1, 5.0)];
+        let sparse: Vec<ScoredDoc> = vec![];
+        let cfg = RrfConfig::new(1.0, f64::MAX, f64::MAX, MAX_POOL_DEPTH).unwrap();
+        let got = rrf_fuse_with_limits(&dense, dense.len(), &sparse, sparse.len(), &cfg);
+        assert_eq!(got, Err(HybridError::DuplicateId));
+    }
+
+    #[test]
+    fn apply_soft_boost_skips_resort_when_hits_already_sorted_and_rules_empty() {
+        // production 経路（空 `rules`）で既に整列済みの `hits` を渡した場合、
+        // 再ソートは省略されるが内容・順序は不変（観測不能な省略であることの固定）。
+        let mut hits = vec![hit_h(1, 3.0), hit_h(2, 2.0), hit_h(3, 1.0)];
+        let expected = hits.clone();
+        let cfg = RrfConfig::default();
+        apply_soft_boost(&mut hits, &[], &cfg).unwrap();
+        assert_eq!(hits, expected);
+    }
+
+    #[test]
+    fn apply_soft_boost_still_sorts_unsorted_input_with_empty_rules() {
+        // 未整列入力＋空 `rules` という契約違反ケースでも、従来どおり整列される
+        // （3.3 の省略は「整列済みなら省略」であって「rules が空なら省略」では
+        // ないことを固定する）。
+        let mut hits = vec![hit_h(3, 1.0), hit_h(1, 3.0), hit_h(2, 2.0)];
+        let cfg = RrfConfig::default();
+        apply_soft_boost(&mut hits, &[], &cfg).unwrap();
+        assert_eq!(hits, vec![hit_h(1, 3.0), hit_h(2, 2.0), hit_h(3, 1.0)]);
+    }
+
+    fn hit_h(id: u64, score: f64) -> HybridHit {
+        HybridHit { id, score }
     }
 
     #[test]
