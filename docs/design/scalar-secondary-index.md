@@ -195,8 +195,23 @@ Issue #473〜#476 はこの節の契約に従う。
   `COUNT(*)` は索引対応述語のみで `WHERE` が構成される場合（`where_compound_count`
   の `id > 100 AND lang = 'ja'` 部分）に候補件数を直接返す fast path を許容する。
   `GROUP BY` キー列が索引列なら等価索引のキー列挙でグループ列挙できる
-  （`group_by_having` の `GROUP BY lang` はこの形に該当する）。TABLE-12 のキー／
-  ヘッダ tenant 整合検査は索引構築時に全件実施し省略しない
+  （`group_by_having` の `GROUP BY lang` はこの形に該当する）。ただし本索引は
+  NULL 値のエントリを作らない設計（前掲）のため、等価索引のキー列挙だけでは
+  `lang IS NULL` に相当する NULL グループを列挙できない——既存
+  `group_by.rs` は NULL キーを `null_group` として単一グループに集計し
+  `HAVING` 判定（例: `HAVING COUNT(*) > 1`）の対象に含めるため、索引経路の
+  キー列挙をそのままグループ集合として使うと NULL グループが結果から欠落
+  しうる。この fast path は**索引が保持する非 NULL キーの列挙に加え、
+  「NULL 値の可視行が 1 件以上存在するか」を索引と同一世代で判定できる
+  場合に限り `null_group` を候補集合の末尾へ補って**成立させる（候補
+  補完不能な場合——索引が非 NULL 専用でありこの判定手段を持たない構築
+  時点では——`GROUP BY` fast path 自体を不採用とし、`sql/group_by.rs` の
+  既存の全走査（`VisibleBitmapCache` 下層のみを経由する経路）へ縮退する。
+  索引経路を使うかどうかの選択自体が fail-closed 側に倒れ、NULL グループを
+  欠落させたまま返す経路は作らない。この判定手段の具体化（索引メタデータへ
+  の NULL 件数フィールド追加か、`VisibleBitmapCache` 側からの補完か）は
+  #475 の実装時に確定する。TABLE-12 のキー／ヘッダ tenant 整合検査は索引
+  構築時に全件実施し省略しない
 - **`EXPLAIN`（#474）**: `sql::hnsw_cache::classify_ann_plan`（Issue #411）と同型の
   純粋関数 `classify_scalar_plan` を単一情報源にし `scalar_plan:`（例:
   `plain_scan`／`index_equality`／`index_prefix`／`index_conjunction`）を静的判定
