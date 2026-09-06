@@ -122,10 +122,19 @@ check_asm_file() {
     symbol="$(printf '%s\n' "${label_lines}" | head -n1 | cut -d: -f2-)"
     symbol="${symbol%:}"
 
+    # `.size` 行番号の探索は awk に対象ファイルを直接読ませ、`tail | awk` の
+    # パイプ経由にしない（codex-review P1 指摘）。パイプ越しだと、マッチ行で
+    # awk が `exit` して入力を読み切る前に stdin を閉じるため、まだ後続行を
+    # 書き込もうとしている上流の `tail` が SIGPIPE（exit 141）を受け取り、
+    # `set -euo pipefail` 下ではこのコマンド置換の失敗としてスクリプト全体が
+    # 即終了してしまう（正常な生成コードに対しても CI ガードを機能不全に
+    # する不具合だった）。awk 単体がファイルを直接読む方式なら早期終了させる
+    # 上流プロセスが存在せず、この SIGPIPE は構造的に発生しない。
     local size_lineno
-    size_lineno="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | awk -v sym="${symbol}" '
-      index($0, ".size") > 0 && index($0, sym ",") > 0 { print NR; exit }
-    ')"
+    size_lineno="$(awk -v sym="${symbol}" -v start="$((label_lineno + 1))" '
+      NR < start { next }
+      index($0, ".size") > 0 && index($0, sym ",") > 0 { print NR - start + 1; exit }
+    ' "${asm_file}")"
 
     if [ -z "${size_lineno}" ]; then
       echo "ERROR: kernel '${kernel}': .size directive for symbol not found before EOF (fail-closed: cannot bound function body; refusing to count instructions that may belong to a different function)" >&2
