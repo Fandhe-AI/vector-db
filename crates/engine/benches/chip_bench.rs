@@ -26,7 +26,7 @@
 mod harness;
 
 use harness::chip::{
-    aggregate, dedicated_env_attested, json_escape, json_number, parse_cache_size,
+    aggregate, dedicated_env_attested, json_escape, json_number, json_number_opt, parse_cache_size,
     parse_dot_kernel_diag_line, parse_dot_kernel_line, parse_feature_bench_output,
     parse_knn_stage_line, parse_proc_cpuinfo, parse_rounds, parse_sysctl_lines, parse_workloads,
     refuse_under_github_actions, ChipError, DotKernelDiag, MetricSeries, Workload,
@@ -707,7 +707,7 @@ fn main() {
                 json_number(series.min),
                 json_number(series.median),
                 json_number(series.max),
-                json_number(series.reference_band_pct)
+                json_number_opt(series.reference_band_pct)
             ));
         }
         out.push_str("}}");

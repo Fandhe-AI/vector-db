@@ -262,13 +262,30 @@ fn aggregate_computes_min_median_max_and_reference_band() {
     assert_eq!(series.min, 10.0);
     assert_eq!(series.median, 20.0);
     assert_eq!(series.max, 30.0);
-    assert_eq!(series.reference_band_pct, 200.0);
+    assert_eq!(series.reference_band_pct, Some(200.0));
 }
 
 #[test]
 fn aggregate_computes_median_for_even_length() {
     let series = aggregate(&[10.0, 20.0, 30.0, 40.0]).unwrap();
     assert_eq!(series.median, 25.0);
+}
+
+#[test]
+fn aggregate_reference_band_pct_is_none_when_min_is_zero() {
+    // codex-review 指摘（PR #560）: min が 0 の系列は分母ゼロで算出不能。
+    // ばらつきが実際に 0 な `Some(0.0)` と区別できるよう `None` を返す。
+    let series = aggregate(&[0.0, 1.0]).unwrap();
+    assert_eq!(series.min, 0.0);
+    assert_eq!(series.reference_band_pct, None);
+}
+
+#[test]
+fn aggregate_reference_band_pct_is_some_zero_when_no_variance() {
+    // min == max（かつ非ゼロ）はばらつきが実際に 0 のケースであり、
+    // 算出不能（None）とは区別して `Some(0.0)` を返す。
+    let series = aggregate(&[5.0, 5.0, 5.0]).unwrap();
+    assert_eq!(series.reference_band_pct, Some(0.0));
 }
 
 #[test]

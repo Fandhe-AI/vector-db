@@ -705,9 +705,10 @@ pub struct MetricSeries {
     pub median: f64,
     pub max: f64,
     /// `(max - min) / min * 100`（`docs/design/benchmark-judgement-policy.md`
-    /// §4 の参照区間帯の式と同名で記録する）。`min` が 0 の場合は `0.0`
-    /// （ゼロ割回避。実測値がすべて 0 の縮退ケース）。
-    pub reference_band_pct: f64,
+    /// §4 の参照区間帯の式と同名で記録する）。`min` が 0 の場合はゼロ除算で
+    /// 算出不能なため `None`（ばらつきが実際に 0 な `Some(0.0)` とは区別する。
+    /// codex-review 指摘: PR #560）。
+    pub reference_band_pct: Option<f64>,
 }
 
 /// `values`（空でない前提。空は `Err`）から [`MetricSeries`] を作る。
@@ -728,9 +729,9 @@ pub fn aggregate(values: &[f64]) -> Result<MetricSeries, ChipError> {
     let min = sorted[0];
     let max = sorted[n - 1];
     let reference_band_pct = if min != 0.0 {
-        (max - min) / min * 100.0
+        Some((max - min) / min * 100.0)
     } else {
-        0.0
+        None
     };
     Ok(MetricSeries {
         values: values.to_vec(),
@@ -859,5 +860,14 @@ pub fn json_number(value: f64) -> String {
         format!("{value:.6}")
     } else {
         "null".to_string()
+    }
+}
+
+/// `Option<f64>` を JSON 数値として整形する（`None` は `null`。`min` が 0 で
+/// `reference_band_pct` が算出不能な場合に使う）。
+pub fn json_number_opt(value: Option<f64>) -> String {
+    match value {
+        Some(v) => json_number(v),
+        None => "null".to_string(),
     }
 }
