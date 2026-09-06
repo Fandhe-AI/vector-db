@@ -84,11 +84,30 @@ TABLE-12 検査を実施済みの走査に相乗りするだけなので、追�
 `tests/sql_aggregate.rs`・`tests/sql_group_by.rs`・`tests/sql_arena_cache.rs`
 は無変更のまま green（受け入れ条件 (b)）。
 
+### 前後比較実測（受け入れ条件 (a) 補足）
+
+共有計測環境での 1 回実測（`make bench-scan-stage-profile`。
+`BENCH_SCAN_PROFILE_ROUNDS` 既定 5・`BENCH_SCAN_PROFILE_SCALE` 既定 1＝
+25,000 行）で、e2e の `agg_count`／`rls_isolation`（`EngineCore::execute_sql`
+経由の `SELECT COUNT(*)`。ラウンドを跨いで同一 `EngineCore` を使い回すため
+2 回目以降は本キャッシュのヒット経路を測る）を導入前（`origin/main`）・
+導入後（本ブランチ）で比較した。
+
+| 測定点 | 導入前 median | 導入後 median |
+| ------ | -------------: | -------------: |
+| `agg_count`（A0a, ctx=tenant-a） | 1.598ms | 0.050ms |
+| `rls_isolation`（A0b, ctx=tenant-b） | 1.625ms | 0.050ms |
+
+両測定点とも約 32 倍高速化しており、Issue #464 で最劣後と特定された
+全行走査（A1〜A5 相当）がヒット時に完全に省略されていることを裏づける。
+共有環境での単発実測（交互 min-of-N ではない）につき、専有環境での正式な
+交互比較実測はオーナー／運用者作業として引き続き申し送る。
+
 ## スコープ外（申し送り）
 
 - `DimAndScalar`／`Embedding` tier・`GROUP BY` 集計への拡張
 - SELECT（DISTANCE/hybrid）経路への結線（`SqlArenaCache` が既に担う範囲との
   重複度の評価を含む）
 - `sparse.rs::VisibleBitmap` との表現共有（添字空間・責務が異なるため不採用）
-- 前後比較の正式実測（`make bench-scan-stage-profile` での `agg_count`／
-  `rls_isolation` 改善幅の交互 min-of-N 実測。手動計測はオーナー／運用者作業）
+- 専有環境での交互 min-of-N 実測（上記は共有環境での単発実測。手動計測は
+  オーナー／運用者作業）
