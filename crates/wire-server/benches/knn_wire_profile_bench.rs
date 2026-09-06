@@ -350,9 +350,13 @@ fn main() {
         t1s_medians.push(t1s.summary.median);
 
         // T1p: 並列 provider（production 既定）。round_start から輪番（他段と
-        // 同一の開始点・反復回数のため、最終反復は round_last_idx に一致する）。
+        // 同一の開始点・反復回数のため、各反復のクエリは T2・T3 の同一反復目と
+        // 一致する）。返却 id は反復ごとに `t1p_ids_all` へ追記し、計測区間の
+        // 最後の反復だけでなく全反復（warmup 含む）を検証対象にする
+        // （codex-review 指摘: 最終反復のみの検証では途中反復の不一致・可視外
+        // 混入を見逃す）。
         let mut t1p_cursor = round_start;
-        let mut t1p_ids: Option<Vec<u64>> = None;
+        let mut t1p_ids_all: Vec<Vec<u64>> = Vec::with_capacity(iterations_per_stage);
         let t1p = run(&config, || {
             let idx = t1p_cursor % QUERY_POOL;
             t1p_cursor += 1;
@@ -366,7 +370,7 @@ fn main() {
                     k: TOP_K,
                 })
                 .expect("parallel search must succeed for well-formed synthetic input");
-            t1p_ids = Some(sorted_ids(hits.iter().map(|h| h.id).collect()));
+            t1p_ids_all.push(sorted_ids(hits.iter().map(|h| h.id).collect()));
             black_box(hits)
         })
         .expect("measurement must satisfy protocol minimums");
@@ -378,15 +382,15 @@ fn main() {
         ));
         t1p_medians.push(t1p.summary.median);
 
-        // 可視外テナント（tenant-b・id >= TENANT_A_ROWS）が混入しないことを検査。
-        for id in t1p_ids
-            .as_ref()
-            .expect("t1p_ids populated by workload closure")
-        {
-            if *id as usize >= TENANT_A_ROWS {
-                fail_closed(format!(
-                    "tenant boundary violation: provider_parallel returned invisible id {id}"
-                ));
+        // 可視外テナント（tenant-b・id >= TENANT_A_ROWS）が混入しないことを、
+        // 本ラウンドの全反復（warmup 含む）について検査する。
+        for ids in &t1p_ids_all {
+            for id in ids {
+                if *id as usize >= TENANT_A_ROWS {
+                    fail_closed(format!(
+                        "tenant boundary violation: provider_parallel returned invisible id {id}"
+                    ));
+                }
             }
         }
 
@@ -399,7 +403,7 @@ fn main() {
         // `execute_sql_in_session` の戻り値をそのまま `black_box` へ渡すだけに
         // する）。
         let mut t2_cursor = round_start;
-        let mut t2_ids: Option<Vec<u64>> = None;
+        let mut t2_ids_all: Vec<Vec<u64>> = Vec::with_capacity(iterations_per_stage);
         let mut hot_session = SessionState::default();
         let t2 = run(&config, || {
             let idx = t2_cursor % QUERY_POOL;
@@ -410,7 +414,7 @@ fn main() {
                 .expect("sql_surface_hot query must succeed for well-formed synthetic input");
             match outcome {
                 SqlOutcome::Query(result) => {
-                    t2_ids = Some(sorted_ids(result.rows.iter().map(|r| r.id).collect()));
+                    t2_ids_all.push(sorted_ids(result.rows.iter().map(|r| r.id).collect()));
                     black_box(result)
                 }
                 other => fail_closed(format!("unexpected sql_surface_hot outcome: {other:?}")),
@@ -424,14 +428,14 @@ fn main() {
             harness::accept::p95_from_samples(&t2.samples).expect("non-empty sample set"),
         ));
         t2_medians.push(t2.summary.median);
-        for id in t2_ids
-            .as_ref()
-            .expect("t2_ids populated by workload closure")
-        {
-            if *id as usize >= TENANT_A_ROWS {
-                fail_closed(format!(
-                    "tenant boundary violation: sql_surface_hot returned invisible id {id}"
-                ));
+        // 可視外テナントが混入しないことを、本ラウンドの全反復について検査する。
+        for ids in &t2_ids_all {
+            for id in ids {
+                if *id as usize >= TENANT_A_ROWS {
+                    fail_closed(format!(
+                        "tenant boundary violation: sql_surface_hot returned invisible id {id}"
+                    ));
+                }
             }
         }
 
@@ -478,7 +482,7 @@ fn main() {
         // T3: wire e2e（in-process ループバックサーバーへの簡易クエリ往復）。
         // round_start から輪番（他段と同一の開始点・反復回数）。
         let mut t3_cursor = round_start;
-        let mut t3_ids: Option<Vec<u64>> = None;
+        let mut t3_ids_all: Vec<Vec<u64>> = Vec::with_capacity(iterations_per_stage);
         let t3 = run(&config, || {
             let idx = t3_cursor % QUERY_POOL;
             t3_cursor += 1;
@@ -506,7 +510,7 @@ fn main() {
             }
             let _ = common::read_command_complete(&mut wire_stream);
             common::read_ready_for_query(&mut wire_stream);
-            t3_ids = Some(sorted_ids(ids));
+            t3_ids_all.push(sorted_ids(ids));
             // `Instant::elapsed()` は `black_box` に渡す戻り値とは無関係に
             // ここで確定させる（`protocol::run` はクロージャの戻り値のみを
             // 計測対象とする契約のため、往復そのものの経過時間を戻り値として
@@ -524,45 +528,63 @@ fn main() {
             harness::accept::p95_from_samples(&t3.samples).expect("non-empty sample set"),
         ));
         t3_medians.push(t3.summary.median);
-        for id in t3_ids
-            .as_ref()
-            .expect("t3_ids populated by workload closure")
-        {
-            if *id as usize >= TENANT_A_ROWS {
-                fail_closed(format!(
-                    "tenant boundary violation: wire_roundtrip returned invisible id {id}"
-                ));
+        // 可視外テナントが混入しないことを、本ラウンドの全反復について検査する。
+        for ids in &t3_ids_all {
+            for id in ids {
+                if *id as usize >= TENANT_A_ROWS {
+                    fail_closed(format!(
+                        "tenant boundary violation: wire_roundtrip returned invisible id {id}"
+                    ));
+                }
             }
         }
 
         // T1p・T2・T3 は本ラウンドで同一の開始点・反復回数からクエリプールを
-        // 輪番したため、最終反復（round_last_idx）のクエリに対する返却 id
-        // 集合が完全一致するはずである（モジュール冒頭コメント「fail-closed
-        // 検証」の宣言どおり）。
-        let t1p_ids = t1p_ids.expect("t1p_ids populated by workload closure");
-        let t2_ids = t2_ids.expect("t2_ids populated by workload closure");
-        let t3_ids = t3_ids.expect("t3_ids populated by workload closure");
-        for (label, ids) in [
-            ("provider_parallel", &t1p_ids),
-            ("sql_surface_hot", &t2_ids),
-            ("wire_roundtrip", &t3_ids),
-        ] {
-            if ids.len() != TOP_K {
+        // 輪番したため、反復インデックスが同じであれば同一クエリに対する
+        // 呼び出しであり、返却 id 集合は完全一致するはずである（モジュール
+        // 冒頭コメント「fail-closed 検証」の宣言どおり）。codex-review 指摘
+        // （PRRT_kwDOUAKASM6fph58）: 以前は最終反復のみを検証しており、途中
+        // 反復の不一致・可視外混入を見逃していた。ここでは各段が収集した
+        // 全反復（warmup 含む・`iterations_per_stage` 件）を突き合わせる。
+        if t1p_ids_all.len() != iterations_per_stage
+            || t2_ids_all.len() != iterations_per_stage
+            || t3_ids_all.len() != iterations_per_stage
+        {
+            fail_closed(format!(
+                "iteration count mismatch: expected {iterations_per_stage} per stage, got \
+                 provider_parallel={} sql_surface_hot={} wire_roundtrip={}",
+                t1p_ids_all.len(),
+                t2_ids_all.len(),
+                t3_ids_all.len()
+            ));
+        }
+        for iter_idx in 0..iterations_per_stage {
+            let query_idx = (round_start + iter_idx) % QUERY_POOL;
+            let t1p_ids = &t1p_ids_all[iter_idx];
+            let t2_ids = &t2_ids_all[iter_idx];
+            let t3_ids = &t3_ids_all[iter_idx];
+            for (label, ids) in [
+                ("provider_parallel", t1p_ids),
+                ("sql_surface_hot", t2_ids),
+                ("wire_roundtrip", t3_ids),
+            ] {
+                if ids.len() != TOP_K {
+                    fail_closed(format!(
+                        "{label}: expected {TOP_K} result rows, got {} (idx={query_idx})",
+                        ids.len()
+                    ));
+                }
+            }
+            if t1p_ids != t2_ids {
                 fail_closed(format!(
-                    "{label}: expected {TOP_K} result rows, got {}",
-                    ids.len()
+                    "id set mismatch for identical query (idx={query_idx}): provider_parallel={t1p_ids:?} sql_surface_hot={t2_ids:?}"
                 ));
             }
-        }
-        if t1p_ids != t2_ids {
-            fail_closed(format!(
-                "id set mismatch for identical query (idx={round_last_idx}): provider_parallel={t1p_ids:?} sql_surface_hot={t2_ids:?}"
-            ));
-        }
-        if t2_ids != t3_ids {
-            fail_closed(format!(
-                "id set mismatch for identical query (idx={round_last_idx}): sql_surface_hot={t2_ids:?} wire_roundtrip={t3_ids:?}"
-            ));
+            if t2_ids != t3_ids {
+                fail_closed(format!(
+                    "id set mismatch for identical query (idx={query_idx}): sql_surface_hot={t2_ids:?} wire_roundtrip={t3_ids:?}"
+                ));
+            }
         }
     }
 
