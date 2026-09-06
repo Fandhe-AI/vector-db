@@ -636,7 +636,7 @@ fn is_sorted_desc_id_asc(items: impl Iterator<Item = (f64, u64)>) -> bool {
 /// が呼び出し元であり、有限性・ソート順の検証と同じ「全件」スコープで一度だけ
 /// 検査する設計）。
 ///
-/// Issue #549: `BTreeSet` へ全件挿入する版（ノード確保がリストの件数だけ発生する）から、
+/// Issue #549: `BTreeSet` へ全件挿入する版（挿入が B-tree ノードの新規確保・分割を伴いうる）から、
 /// 単一の `Vec` へ収集して比較関数なし `sort_unstable()` の後に隣接比較する版へ置換
 /// （bool の戻り値契約・呼び出し位置は不変。`scripts/check_sort_determinism.sh` の
 /// 許容例外については [`rrf_fuse_with_limits`] 内の `index.sort_unstable()` コメント

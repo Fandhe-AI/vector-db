@@ -1251,7 +1251,7 @@ TASK-104・TASK-84。
   同値要素を生まない全順序のため、`merged` を渡す前の走査順序（本実装では id
   昇順）自体は出力に影響しない
 - `has_duplicate_id`（`validate_extended_pool` からも使用）を、`BTreeSet` への
-  全件挿入（ノード確保がリスト件数だけ発生）から、`Vec` へ収集して比較関数
+  全件挿入（要素追加が B-tree ノードの新規確保・分割を伴いうる）から、`Vec` へ収集して比較関数
   なし `sort_unstable()` の後に隣接比較する版へ置換（bool の戻り値契約・
   呼び出し位置は不変）
 - `apply_soft_boost` の末尾の再ソートを、`hits` が既に融合スコア降順・同点 id
@@ -1298,13 +1298,16 @@ sparse_determinism.rs`・`tests/hybrid.rs`・`tests/sql_surface.rs` 等は無変
 
 | 箇所 | 変更前 | 変更後 |
 | --- | --- | --- |
-| 融合コア | `BTreeSet`×2（重複検査）＋ `BTreeMap`（累積。ノード確保多数）＋ `collect` の `Vec`＋ソートのスクラッチ | `has_duplicate_id` の `Vec`×2 ＋ `contrib: Vec<f64>` ＋ `index: Vec<(u64,usize)>` ＋ `merged: Vec<HybridHit>` ＋ソートのスクラッチ（いずれも単一 `Vec`・事前確保サイズ既知） |
+| 融合コア | `BTreeSet`×2（重複検査）＋ `BTreeMap`（累積。挿入に応じた B-tree ノード確保・分割）＋ `collect` の `Vec`＋ソートのスクラッチ | `has_duplicate_id` の `Vec`×2 ＋ `contrib: Vec<f64>` ＋ `index: Vec<(u64,usize)>` ＋ `merged: Vec<HybridHit>` ＋ソートのスクラッチ（いずれも単一 `Vec`・事前確保サイズ既知） |
 | `validate_extended_pool`（境界同点グループ完全化の再取得ラウンドごと） | `BTreeSet`×2 | `Vec<u64>`×2（`has_duplicate_id` 経由） |
 | `apply_soft_boost`（production の空 `rules` 呼び出し） | 常に `sort_by` のスクラッチ確保 | 既整列時は確保 0 |
 
-`BTreeMap`/`BTreeSet` の各要素はノードごとに個別ヒープ確保されるのに対し、
-置換後は要素数が確定した単一 `Vec` の確保に集約される（`Vec` 自体も 1 回の
-連続領域確保で済む）。
+`BTreeMap`/`BTreeSet` は 1 ノードに複数要素を格納するため確保回数は要素数と
+一致しない（要素ごとに個別ヒープ確保されるわけではない）。ただし挿入に伴う
+ノードの新規確保・分割・再配置は要素数に対して非ゼロかつ事前に見積もれない
+回数発生し、確保サイズも実行時の木の形状に依存する。これに対し置換後は
+要素数が確定した単一 `Vec` の確保に集約される（`Vec` 自体も 1 回の連続領域
+確保で済む）。
 
 ### 参考値（単一バイナリ内 A/B・B7 下限近似。採否記録は #550／#547 の担当）
 
