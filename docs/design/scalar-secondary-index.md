@@ -1,20 +1,42 @@
 # ADR: スカラー列二次索引の設計検討（Issue #359）
 
-- ステータス: Proposed
-- 対応: Issue #359（親 #348「中期構造（二次索引・パースキャッシュ）検討」の子。
-  ルート #344「参照 DB 比較に基づく性能改善トラッキング」配下）
+- ステータス: Accepted 提案（オーナー承認待ち。Issue #472 へのオーナー承認コメントを
+  もって Accepted 確定。承認コメントが残るまで #473 以降は着手しない。判断記録は
+  「判断記録（オーナー記入欄）」節参照）
+- 対応: Issue #359（データモデル・一貫性・RLS 境界の確定は Issue #472。
+  親 #471〔スカラー列二次索引・Phase 2〕→ 親 #457〔Phase 2〕→ ルート #455。
+  #472 → #473 → #474 → #475 → #476 の直列依存）
 - 関連ポインタ: `docs/spec/04-behavior/data-model.md`（TABLE-12）・
-  `docs/spec/04-behavior/rls.md`・`docs/spec/05-tasks.md`（TASK-75・TASK-89/133 系）。
+  `docs/spec/04-behavior/rls.md`・`docs/spec/05-tasks.md`（TASK-75・TASK-89/133 系・
+  SQL-6・SQL-13・SQL-14・TASK-147・TASK-162）。
   spec 本文は転記しない（[spec-confidentiality](../../.claude/rules/spec-confidentiality.md)）
-- 関連コード: `crates/engine/src/catalog.rs`（テーブルスコープ行ストア
-  `user_rows_table_def(user_rows_table_name(...))`・`TABLE_GENERATION_TABLE`）・
-  `crates/engine/src/arena.rs`（`build_filtered_with_rows`）・
-  `crates/engine/src/declarative_filter.rs`・`crates/engine/src/sql/plan.rs`
-  （`ExecutionPlan`）・`crates/engine/src/policy.rs`（`PolicyContext::is_visible`）
+- 関連コード: `crates/engine/src/catalog.rs`（`ColumnType`・テーブルスコープ行ストア
+  `user_rows_table_def(user_rows_table_name(...))`・`TABLE_GENERATION_TABLE`・
+  `table_generation_in_txn`）・`crates/engine/src/arena.rs`（`build_filtered_with_rows`）・
+  `crates/engine/src/declarative_filter.rs`・`crates/engine/src/sql/allowlist.rs`
+  （`WherePredicate`）・`crates/engine/src/sql/udf_call.rs`（`BoundExpr`）・
+  `crates/engine/src/sql/plan.rs`（`ExecutionPlan`）・
+  `crates/engine/src/policy.rs`（`PolicyContext::is_visible`）・
+  `crates/engine/src/sql/arena_cache.rs`（`SqlArenaCache`・Issue #363）・
+  `crates/engine/src/sql/sparse_cache.rs`（`SparseIndexCache`・Issue #357）・
+  `crates/engine/src/sql/hnsw_cache.rs`（`HnswIndexCache`・`classify_ann_plan`・
+  Issue #408・#411）・`crates/engine/src/hnsw.rs`（`Ratio`・`full_scan_ratio`・
+  Issue #409）
 - 関連 Issue: #360（パースキャッシュ検討・兄弟）・#363（VectorArena 世代整合キャッシュ）・
-  #367（ANN 索引採否検討）
+  #367（ANN 索引採否検討）・#464（段別プロファイル実測）・#477（可視ビットマップ
+  世代整合キャッシュ・兄弟 Phase 2 Issue）
+- 関連 doc: `docs/design/scan-stage-profile.md`（Issue #464。本 ADR の実測根拠）・
+  `docs/design/sql-arena-generation-cache.md`（#363）・
+  `docs/design/sparse-index-cache.md`（#357）・
+  `docs/design/hnsw-generation-cache.md`（#408）・
+  `docs/design/hnsw-rls-cardinality-switch.md`（#409）・
+  `docs/design/explain-search-engine-exposure.md`（#411）・
+  `docs/design/benchmark-judgement-policy.md`（§5・§7.1・§7.2）・
+  `docs/design/hotpath-implementation-survey.md`（§5・§9-#2）・
+  `docs/design/table-generation-rejection-granularity.md`（Issue #285）
 - 本 ADR は**設計検討のみ**であり、実装コード（`crates/`）は含まない。実装タスクの
-  起票は本 ADR の承認後、別途ユーザー承認を経て行う
+  起票は Issue #473〜#476 として既に完了しており（親 #471 配下）、本 ADR はそれらが
+  従う契約を確定する
   （[out-of-scope-tracking](../../.claude/rules/out-of-scope-tracking.md)）
 
 ## 背景
@@ -43,60 +65,182 @@ Phase 1（#345 配下）で行ったデコード段の最適化（`storage::deco
 本 ADR では設計概念（選択度推定に基づく索引経路 / 全走査経路の切替）の要約のみを用い、
 コードの転記は行わない。
 
-## 現状の物理構造（事実整理）
+### 許可リスト述語の事実整理（本 ADR 確定時点での制約）
 
-- SQL テーブルごとの行ストアは `catalog.rs::user_rows_table_def(user_rows_table_name(table_name))`
-  （複合キー `(tenant_id, id)` の動的 `redb::TableDefinition`。テーブル名は
-  `user_rows_table_name` が `table_name` から解決する）で、値は `tenant_id` /
-  `visibility` / embedding / metadata を同居させた v2 行エンコーディング。
-  `storage.rs::ROWS_TABLE`（固定テーブル名 `rows`）は**旧・非テーブルスコープ API 専用**
-  の別テーブルであり、本 ADR の索引対象（SQL 表層の `WHERE` 評価が使う行ストア）では
-  ない——本 ADR の対象外とする
-- `WHERE` 評価は `arena.rs::build_filtered_with_rows` が担い、RLS 述語 `predicate`
-  （`tenant_id`・`visibility` のみで判定）→ SCALAR フック `on_visible_row`（等価・前方
-  一致）の順で固定。不可視行は `on_visible_row` に到達しない
-- 実行計画順序は `sql/plan.rs::ExecutionPlan`（`RLS`・`SCALAR`・`DISTANCE` の順列を型で
-  検証）が決め、`scalar_prefilter` が `true` の場合は DISTANCE 段より前に SCALAR 段を
-  適用し、`false` の場合は DISTANCE 段後の事後フィルタとして適用する
-- テーブル単位の世代カウンタ `catalog.rs::TABLE_GENERATION_TABLE` は `tenant.rs` /
-  `catalog.rs` の書き込み系関数群すべてでバンプされ、呼び忘れはソース走査テスト
-  `crates/engine/tests/table_generation_bump_coverage.rs` が構造的に検出する
+`sql/allowlist.rs::WherePredicate` が受理する形状は `Equality`（`col = '<lit>'`）・
+`Prefix`（`col LIKE '<p>%'`）・`Expression`（比較演算子 `> < >= <= =` を頂点に持つ
+`Expr::Binary` のみ）・`PredicateCall`（`visible()` 等、空引数）の 4 種であり、
+**`IN`・`BETWEEN` 構文は現行許可リストに存在しない**。`sql/udf_call.rs::BoundExpr`
+（`Expression` 側の束縛先）も `Number`・`IdRef`（疑似列 `id`）・`VectorRef`・
+`Builtin`・`Binary`・`WasmCall` のみで**`Text` 列参照は含まれない**——`Expression`
+形状での範囲比較は疑似列 `id`（例: `id > 100`）に限られる。加えて
+`catalog.rs::ColumnType` は `Text` と `Vector(u32)` の 2 種のみで、索引対象になり
+得るスカラー列は `Text` 列に限られる（数値範囲索引の対象列がそもそも存在しない）。
 
-本リポには行数依存の走査コストを定量測定する常設ベンチが現時点で存在しない
-（計画時点で参照された `feature_bench.rs` は本リポに未実装。既存の測定資産は
-`crates/engine/examples/multi_dim_bench.rs` / `high_dim_bench.rs` /
-`concurrent_write_bench.rs`、および `crates/engine/benches/` 配下のベンチ群）。損益分岐
-点の実測は本 ADR の対象外とし、「コスト見積り・索引選択」節ではパラメトリックな見積りに留める。
+この事実は本 ADR が定める索引の対応述語（「採用案（候補 B）の確定仕様」節）を
+「等価・前方一致・（`id` 疑似列限定の）比較」に限定する根拠であり、`IN`／
+`BETWEEN` を含む索引対応の拡張は許可リスト・構文自体の spec 側確定を前提とする
+（「spec 側への申し送り」節）。
+
+### 実クエリ形状（Issue #464 実測が使うクエリ・本 ADR のコスト見積りの根拠）
+
+`scripts/crossdb_bench/self_db.py` の各フェーズは次の SQL 文字列を固定して計測して
+いる（本 ADR が「索引対応述語 AND 残余述語」規則を検討する直接の入力）:
+
+| フェーズ | クエリ |
+| -------- | ------ |
+| `vector_knn_where` | `SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding <=> '<vec>' LIMIT 10` |
+| `where_compound_count` | `SELECT COUNT(*) FROM docs WHERE visible() AND id > 100 AND lang = 'ja'` |
+| `group_by_having` | `SELECT lang, COUNT(*) AS n FROM docs GROUP BY lang HAVING n > 1 ORDER BY n DESC LIMIT 5` |
+| `agg_count` | `SELECT COUNT(*) FROM docs`（`WHERE` を持たない） |
+
+`where_compound_count` は `visible()`（`PredicateCall`。索引対象外・残余述語）・
+`id > 100`（`Expression`。疑似列 `id` の比較のみ索引対応し得る）・`lang = 'ja'`
+（`Equality`。索引対応）の AND 結合であり、「索引対応述語で候補スロット集合を
+得て、残余述語は候補のみに評価する」規則の実例になる。
+
+`agg_count`・`rls_isolation`（`SELECT COUNT(*) FROM docs`。`WHERE` を持たない）は
+`sql/aggregate.rs`・`sql/group_by.rs` の `on_visible_row` を通らないため、本 ADR
+（`WHERE` スカラー条件の索引化）の対象**外**である——両フェーズの改善は兄弟 Issue #477
+（可視ビットマップ世代整合キャッシュ）が対象にする（「Issue #464 実測の反映」節参照）。
+
+`sql/aggregate.rs`・`sql/group_by.rs` は現状 `sql::arena_cache::SqlArenaCache` を
+経由せず毎クエリ redb を全行走査する。「採用案（候補 B）の確定仕様」節の集計・
+`GROUP BY` 経路がこの構造を前提に索引と `VisibleBitmapCache`（#477）の層分担を
+定義する。
 
 ## 索引データモデル（redb 上の設計比較）
 
+### 候補比較（候補 A: redb 永続二次テーブル vs 候補 B: メモリ常駐世代整合キャッシュ）
+
+Issue #472 の調査で、後続実装 Issue（#473〜#476）が前提とする方式（`(table,
+PolicyContext)` × テーブル単位世代キーで `sql::arena_cache::SqlArenaCache`
+〔#363〕と同型の fail-closed 契約を持つ索引キャッシュを可視アリーナから構築する
+＝メモリ常駐方式）と、本 ADR の初版（Proposed 時点）が前提としていた redb 永続
+二次テーブル方式が乖離していることが判明した。両者を候補として比較し採用案を
+確定する。
+
+| 観点 | 候補 A: redb 永続二次テーブル（Index-T/Index-P 二層。後述） | 候補 B: メモリ常駐・テーブル世代整合キャッシュ |
+| --- | --- | --- |
+| データモデル | `(tenant_id, value_key, id)`／`(value_key, tenant_id, id)` の 2 テーブル | `sql::arena_cache::SqlArenaSnapshot`（RLS 可視行のみ）の metadata から `row_codec::scan_scalar_columns` で構築する派生構造。等価: `HashMap<Text, Vec<slot>>`（slot 昇順）、前方一致（＋`id` 比較の任意拡張）: `(value, slot)` の整列配列を二分探索でレンジ走査 |
+| 一貫性 | 行書き込みと同一 `write_txn`・DDL 8 項目の同期契約（後述「候補 A を採る場合の契約」節）・`table_generation_bump_coverage.rs` 対象拡大が必要 | 書き込み経路は**無変更**。`catalog::table_generation_in_txn` の世代が進めば失効し次クエリで再構築（`SqlArenaCache`・`sql::sparse_cache::SparseIndexCache`・`sql::hnsw_cache::HnswIndexCache` と同型） |
+| RLS 境界 | 索引ヒットは候補であり `is_visible` 再適用必須。Index-P 由来統計のみ横断保持 | 索引は ctx 可視行のみから構築されるため候補 ⊆ 可視集合が構造的に成立。統計は per-ctx のみ。他テナント `Private` 行の存在・分布・処理時間への影響が構造的に無い（`sql-arena-generation-cache.md`「安全性」節と同じ論法） |
+| write amplification | 列数 ×（1〜2）倍の追加書き込み | 0（読み取り側の初回構築コスト O(N) のみ） |
+| メモリ | redb ページ（永続） | 索引バイト量を容量上限に計上（既存 `SqlArenaCache` 容量上限と同桁の独立上限、または共有上限。「採用案の確定仕様」節） |
+| 対応可能な述語 | 等価・前方一致 | 等価・前方一致・`id` 比較（現行許可リストで索引可能な形の全部） |
+| Issue #464 実測との整合 | W1〜W3（後述）を省けるが A1〜A5（redb 走査。`agg_count`／`rls_isolation` 側）は残る | 同左。加えて `W0-cold`（11.9ms 相当）→`W0-hot`（1.1ms 相当）差が示すとおりスナップショット常駐が前提のため候補 B は既存 `SqlArenaCache` と自然に同居する |
+| 採否 | **見送り**（Rejected ではなく再評価条件付き。「見送りの再評価条件」参照） | **採用案** |
+
+**採用理由**:
+
+1. production 書き込み経路・DDL 契約・`operation_id` 台帳（TASK-101・RECOVER-10）に
+   新しい不変条件を持ち込まない
+2. `sql::arena_cache::SqlArenaCache`（#363）・`sql::sparse_cache::SparseIndexCache`
+   （#357）・`sql::hnsw_cache::HnswIndexCache`（#408）で確立済みの `(table, ctx)` ×
+   テーブル単位世代の fail-closed 契約をそのまま再利用でき、RLS 境界の論証が既存
+   3 件の doc と同一構造になる（新しい安全性論証を 1 から組み立てる必要がない）
+3. Issue #464 の段別帰属表で本 Issue（#471）が省き得る段は W1〜W3 のみであり
+   （「Issue #464 実測の反映」節）、候補 B で十分到達できる。候補 A が追加で
+   省ける段（A1〜A5・`agg_count`／`rls_isolation` 経路）は本 ADR の対象クエリ
+   （`WHERE` を持つもの）には現れない
+
+**見送りの再評価条件**: 可視行集合がメモリ上限を超える規模、または cold クエリ
+（`SqlArenaCache` が毎回無効化される書き込み頻発ワークロード）が支配的になり
+スナップショット常駐が成立しなくなった場合に候補 A を再検討する。
+
+以降「索引データモデル」「一貫性」「RLS 境界」の既存節は**候補 A を採る場合の
+契約（見送り時点の設計記録として保存）**として残し、採用案（候補 B）の確定仕様は
+次節にまとめる。
+
+## 採用案（候補 B: メモリ常駐・テーブル世代整合キャッシュ）の確定仕様
+
+Issue #473〜#476 はこの節の契約に従う。
+
+- **キー**: `(table, PolicyContext)` 完全一致 × `catalog::table_generation_in_txn`
+  の世代。`PolicyContext` の `Eq` がテナント ID・許可可視性集合の値比較であること
+  （`policy.rs`）に依拠する——既存 `SqlArenaCache`・`SparseIndexCache`・
+  `HnswIndexCache` と同一のキー形状であり、ctx が 1 bit でも異なれば別エントリに
+  なる（security.md P0「テナント分離の検査を外す/緩める/バイパス経路を作らない」）
+- **構築元**: `SqlArenaSnapshot` の metadata（RLS 段適用済み）。索引はスナップ
+  ショットの**派生データ**であり、スナップショットと同じ世代で生成・失効する。
+  NULL 値はエントリを作らない（索引は「値が存在する行」のみを列挙し、NULL 述語は
+  従来どおり全走査にフォールバックする）。`Text` 値は無加工（`Equality` は完全
+  一致、`Prefix` はバイト列前方一致）で `declarative_filter::MetadataFilter::matches`
+  と同一判定になることを不変条件にする（`row_codec::scan_scalar_columns` の借用
+  結果からの複製量は容量上限で検証する）
+- **`insert` 契約（`SqlArenaCache` との意図的な非対称）**: 世代競合時は `None` で
+  拒否する（`core.rs::PrefilterCache` と同じ fail-closed 契約・Issue #280）。
+  `SqlArenaCache::insert` が世代競合時も呼び出し元へ常に構築済み `Arc` を返すのは
+  「呼び出し元が自分の `read_txn` の結果をそのまま使う」ためだが、索引は候補集合
+  の**正しさ**が世代に結び付く派生データであり、競合時は索引経路を使わず全走査へ
+  縮退するのが fail-closed 側であるため、この非対称を意図的に選ぶ
+- **述語適用規則**: 索引対応述語（`Equality`・`Prefix`・疑似列 `id` の
+  `Expression` 比較）ごとに候補スロット集合（昇順）を得て AND は交差（マージ）、
+  残余述語（`PredicateCall`・`Text` 列参照を含む `Expression`）は候補のみに
+  `sql/expr_program.rs`（Issue #353）で評価する。`where_compound_count`
+  （`visible() AND id > 100 AND lang = 'ja'`）はこの規則の実例——`lang = 'ja'`
+  （`Equality`）と `id > 100`（`Expression`・疑似列 `id`）の交差を候補集合とし、
+  `visible()` は候補のみへ適用する。`sql/plan.rs::ExecutionPlan` の
+  `scalar_prefilter`（SCALAR 段を DISTANCE 段より先に適用するか）の意味・
+  `precision` モードの契約（TASK-162）は不変。DISTANCE 先行（`!scalar_prefilter`）
+  の事後フィルタ経路は索引対象外（候補集合が可視全集合のため索引を引く意味が無い）
+- **選択度切替**: 索引ヒット件数 ÷ 可視行数の比が閾値（`hnsw.rs::Ratio`／
+  `full_scan_ratio` と同型の整数比。既定 1/10 の先例あり・Issue #409）を超える
+  場合は全走査へフォールバックする。既定値は #474 で仮置きし #476 で実測確定する。
+  統計は per-ctx 索引自身のカーディナリティのみ（他テナントの `Private` 行の
+  存在・分布・処理時間への影響が構造的に無い設計を維持する）
+- **集計・`GROUP BY` 経路（#475）**: `sql/aggregate.rs`・`sql/group_by.rs` は現状
+  redb 直走査のため、兄弟 Issue #477 の `VisibleBitmapCache`（RLS 可視性の権威）を
+  下層、本索引（可視スナップショットの派生）を上層とする層分担を定義する。
+  `COUNT(*)` は索引対応述語のみで `WHERE` が構成される場合（`where_compound_count`
+  の `id > 100 AND lang = 'ja'` 部分）に候補件数を直接返す fast path を許容する。
+  `GROUP BY` キー列が索引列なら等価索引のキー列挙でグループ列挙できる
+  （`group_by_having` の `GROUP BY lang` はこの形に該当する）。TABLE-12 のキー／
+  ヘッダ tenant 整合検査は索引構築時に全件実施し省略しない
+- **`EXPLAIN`（#474）**: `sql::hnsw_cache::classify_ann_plan`（Issue #411）と同型の
+  純粋関数 `classify_scalar_plan` を単一情報源にし `scalar_plan:`（例:
+  `plain_scan`／`index_equality`／`index_prefix`／`index_conjunction`）を静的判定
+  として追記する。件数・カーディナリティ・閾値比較結果は非露出のまま
+  （`explain-search-engine-exposure.md` の非露出方針を踏襲する）
+- **容量・DoS**: エントリ数上限・総バイト上限・LRU・stale 一括破棄を
+  `SqlArenaCache` と同手順で持つ。untrusted 由来の値長は既存の行エンコード上限で
+  既に検証済みである
+- **失敗時**: 構築失敗・容量超過・世代競合はいずれも「索引不使用（全走査）」へ
+  縮退する。stale な索引で応答する経路を作らない
+
+## 候補 A を採る場合の契約（見送り。設計記録として保存）
+
+以下は候補 A（redb 永続二次テーブル）の物理設計・一貫性・RLS 境界の詳細である。
+「見送りの再評価条件」に該当し候補 A へ切り替える場合、この節を実装契約の
+出発点とする。
+
+### 物理キー案（旧「A 案／B 案」を A-1／A-2 へ改名）
+
 | 案 | 構造 | 特徴 |
 | -- | ---- | ---- |
-| A 案 | 列ごとの `MultimapTable<(tenant_id, value_key), id>` | 等価条件のヒット列挙に直接対応。前方一致には別途レンジスキャン可能な構造が要る |
-| B 案 | 複合キー `TableDefinition<(tenant_id, value_key, id), ()>` | redb のタプルキーは辞書式全順序を持つため、`(tenant_id, prefix..)` によるレンジスキャンで等価・前方一致の双方に対応できる |
+| A-1 | 列ごとの `MultimapTable<(tenant_id, value_key), id>` | 等価条件のヒット列挙に直接対応。前方一致には別途レンジスキャン可能な構造が要る |
+| A-2 | 複合キー `TableDefinition<(tenant_id, value_key, id), ()>` | redb のタプルキーは辞書式全順序を持つため、`(tenant_id, prefix..)` によるレンジスキャンで等価・前方一致の双方に対応できる |
 
-B 案は前方一致（`declarative_filter.rs::starts_with` / `parse_prefix_pattern`）への
-拡張性で A 案に優位なため、**推奨は B 案**とする。ただし最終選定は実装フェーズの
-プロトタイプ計測（「実装フェーズのタスク分解案」節のタスク (1)）で確定する。
+A-2 は前方一致（`declarative_filter.rs::starts_with` / `parse_prefix_pattern`）への
+拡張性で A-1 に優位なため、**推奨は A-2** とする。ただし最終選定は実装フェーズの
+プロトタイプ計測で確定する。
 
-**索引は単一テーブルではなく二層構成とする**（後述の RLS 境界レビューで判明した
-不整合の是正。詳細は「RLS 境界」節参照）:
+**索引は単一テーブルではなく二層構成とする**（RLS 境界レビューで判明した不整合の
+是正）:
 
 | 層 | キー | 収録対象 | 用途 |
 | -- | ---- | -------- | ---- |
-| 自テナント索引（Index-T） | `(tenant_id, value_key, id)` | そのテナントが所有する全行（`Public`・`Private` 問わず） | `is_owner` と同じテナント境界でレンジスキャンを閉じる。既存 B 案どおり |
+| 自テナント索引（Index-T） | `(tenant_id, value_key, id)` | そのテナントが所有する全行（`Public`・`Private` 問わず） | `is_owner` と同じテナント境界でレンジスキャンを閉じる。A-2 どおり |
 | Public 横断索引（Index-P） | `(value_key, tenant_id, id)` | `visibility = Public` の行のみ（全テナント） | `policy.rs::PolicyContext::is_visible` が定義するとおり `Public` 行は元々全テナントから可視のため、この層への収録・横断スキャンは新たな漏えいを生まない |
 
 `WHERE` 条件の索引経路は Index-T（自テナント prefix scan）と Index-P（value_key
 prefix scan）の**和集合**を候補として返す。行ストア（`catalog.rs::user_rows_table_def
 (user_rows_table_name(...))`）の物理キーが `(tenant_id, id)` の複合キーであるとおり
-`id` はテナント内でのみ
-一意な識別子であるため、和集合の重複排除は `id` 単独ではなく `(tenant_id, id)`
-の組で行う（`id` 単独で dedup すると異なるテナントの別行を同一視しうる）。両層
-とも索引ヒット後の可視性再判定（`is_visible` の再適用）は必須で変わらない
-（後述）。`Private` 行のエントリは Index-T にのみ存在し、Index-P には一切現れ
-ない——他テナントの `Private` 行の存在・分布は索引のどの層からも観測できない
-設計とする。
+`id` はテナント内でのみ一意な識別子であるため、和集合の重複排除は `id` 単独ではなく
+`(tenant_id, id)` の組で行う（`id` 単独で dedup すると異なるテナントの別行を同一視
+しうる）。両層とも索引ヒット後の可視性再判定（`is_visible` の再適用）は必須で変わ
+らない。`Private` 行のエントリは Index-T にのみ存在し、Index-P には一切現れない
+——他テナントの `Private` 行の存在・分布は索引のどの層からも観測できない設計とする。
 
 設計上の留意点:
 
@@ -104,18 +248,15 @@ prefix scan）の**和集合**を候補として返す。行ストア（`catalog
   意味的順序と一致する形）が必要。キー長には上限を設け、untrusted 由来の値をそのまま
   無制限にキーへ連結しない（`coding-rust.md` の untrusted 入力規約——長さ上限検証後に
   アロケーションする）
-- NULL 値は索引エントリを作らない（索引は「値が存在する行」のみを列挙し、NULL 述語は
-  従来どおり全走査にフォールバックする）
+- NULL 値は索引エントリを作らない
 - `visibility` が `Private` → `Public` へ更新される場合（更新経路が存在する場合）は
   Index-P への新規挿入を、`Public` → `Private` の場合は Index-P からの削除を、行の
   値更新と同一 write txn 内で行う。Index-T のエントリは可視性変更の影響を受けない
-  （テナント所有権は不変のため）
-- 索引対象列の宣言方式は、全 `Text` 列を自動索引化する案と、`CREATE INDEX` 相当の宣言
-  的構文を SQL 表層へ追加する案がある。本リポの SQL 表層は許可リスト検証方式
-  （TASK-74）を採用しているため、将来構文を追加する場合も**許可リストへの追加**として
-  設計し、未検証入力を SQL 文字列へ連結する経路は作らない
+- 索引対象列の宣言方式は、全 `Text` 列を自動索引化する案と、`CREATE INDEX` 相当の
+  宣言的構文を SQL 表層へ追加する案がある。将来構文を追加する場合も**許可リストへの
+  追加**として設計し、未検証入力を SQL 文字列へ連結する経路は作らない
 
-## 一貫性（DML 反映・世代整合）
+### 一貫性（DML 反映・世代整合）
 
 索引エントリの更新は、対応する行の `user_rows_table_def(user_rows_table_name(...))`
 への書き込みと**同一の `redb::WriteTransaction` 内**でコミットする。redb の write txn は
@@ -125,188 +266,148 @@ prefix scan）の**和集合**を候補として返す。行ストア（`catalog
 具体的なハザードと対応方針:
 
 1. **同一パス置換の索引残留**: `incremental.rs::index_file` / `index_file_batch`
-   （416 行目 / 502 行目）はファイル形 `INSERT` を同一パスで置換書き込みする。旧行を
-   置換する際、旧索引エントリを**先に削除してから**新索引エントリを挿入しないと、
-   古いキーで索引を引いた際に既に置換済みの行を指す stale-positive エントリが残る。
-   これは Index-T・Index-P（旧行が `Public` だった場合）の両方に適用される。実装
-   タスクでは「同一パス置換」経路を索引更新の必須テストケースに含める
-2. **世代バンプの網羅漏れ**: `catalog.rs::bump_table_generation_in_txn`（703 行目）を
-   呼ぶべき書き込み系関数の一覧は `crates/engine/tests/table_generation_bump_coverage.rs`
-   がソース走査で網羅性を検証している。索引専用の新しい書き込みパス（索引の再構築・
-   個別エントリ更新）を追加する場合、このカバレッジ検査対象へ含める
-3. **既存データからの索引ビルドと途中失敗**: テーブルに既存データがある状態で索引を
-   後付けする再構築処理は、`crates/engine/tests/index_failure_injection.rs` の方針
-   （commit 前失敗・再構築処理そのものの途中失敗——`arena.rs` の
-   `build_filtered_with_limits_failure_mid_rebuild_*` 系）に倣い、途中失敗時にコミット
+   はファイル形 `INSERT` を同一パスで置換書き込みする。旧行を置換する際、旧索引
+   エントリを**先に削除してから**新索引エントリを挿入しないと、古いキーで索引を
+   引いた際に既に置換済みの行を指す stale-positive エントリが残る。これは
+   Index-T・Index-P（旧行が `Public` だった場合）の両方に適用される
+2. **世代バンプの網羅漏れ**: `catalog.rs::bump_table_generation_in_txn` を呼ぶべき
+   書き込み系関数の一覧は `crates/engine/tests/table_generation_bump_coverage.rs`
+   がソース走査で網羅性を検証している。索引専用の新しい書き込みパスもこのカバレッジ
+   検査対象へ含める
+3. **既存データからの索引ビルドと途中失敗**: `crates/engine/tests/index_failure_injection.rs`
+   の方針（commit 前失敗・再構築処理そのものの途中失敗）に倣い、途中失敗時にコミット
    済み行が壊れない fail-closed 契約を注入試験で固定する
-4. **索引の鮮度判定と既存キャッシュ機構**: `core.rs::PrefilterCache` は世代競合を
-   `DictionaryCache` と同じ fail-closed 契約（世代不一致時は `None` で拒否・Issue #280）
-   に統一済み。索引の鮮度判定もこの既存機構へ相乗りし、索引専用の別系統世代カウンタを
-   新設しない方針とする（テーブル単位世代カウンタの拒否粒度は Issue #285 で現状維持が
-   確定済み・`docs/design/table-generation-rejection-granularity.md`）
+4. **索引の鮮度判定と既存キャッシュ機構**: `core.rs::PrefilterCache` の fail-closed
+   契約（Issue #280）へ相乗りし、索引専用の別系統世代カウンタを新設しない
 5. **`operation_id` 台帳との独立性**: 索引更新は `operation_id` 再送契約（TASK-101・
-   RECOVER-10 系）の対象である行データの内容とは独立した副次構造であり、索引の存在・
-   不在は `operation_id` の重複判定（`23505` / `22023`）に影響を与えない設計とする
-6. **DDL（`DROP TABLE`）時の索引破棄**: 現行 `catalog.rs::Storage::drop_table`
-   （776 行目〜）は、`CATALOG_TABLE` からのスキーマ削除・行テーブル
-   （`user_rows_table_name` が返す名前の `delete_table`）・`recovery::ledger` の
-   テーブル分エントリ削除・`bump_table_generation_in_txn` を同一
-   `write_txn`・単一 `commit_boundary::commit` で行っている（索引はまだ実装されて
-   いないため、現行コードにこれ以上の破棄対象は無い）。索引導入後は、この同一
-   `write_txn` 内に **Index-T・Index-P の両テーブルおよびカーディナリティ統計
-   （テナント横断で保持する Index-P 由来統計を含む）の破棄**を追加することを不変
-   条件とする。索引・統計の破棄が行テーブル削除より後続の別 txn・別 commit に
-   分離されると、`drop_table` 後に同名テーブルが再作成された場合、旧
-   `(tenant_id, id)` を指す stale-positive エントリが新テーブルの索引経路へ紛れ込み、
-   誤った検索結果に加え旧テナントデータの存在情報漏えい（RLS 境界の実質的な迂回）
-   につながる。「行テーブル・Index-T・Index-P・カーディナリティ統計を同一 write txn
-   で破棄する」契約は、行データの `write_txn` 統一契約（本節冒頭）と同格の不変条件
-   として扱う
-7. **DDL（`ALTER TABLE ADD COLUMN`）時の索引同期**: 現行 `catalog.rs::Storage::
-   alter_table_add_column`（808 行目〜）は `CATALOG_TABLE` のスキーマ更新と
-   `bump_table_generation_in_txn` のみを同一 `write_txn` で行い、既存行
-   （`user_rows_table_def(user_rows_table_name(...))`）のバイト列には一切触れない
-   （追加列は暗黙 nullable）。索引対象は
-   列名または `MetadataFilter::column_index` で指定される以上、列追加時点では
-   当該列の索引エントリは存在しない（既存行はその列を持たないため対象が無く、
-   索引未構築自体は false-negative を生まない）。ただし列追加後の `INSERT` が
-   新列へ値を書く際は、行データの `write_txn` 統一契約（本節冒頭）に従い当該列の
-   索引エントリを同一 `write_txn` で作成することを不変条件とする。列追加操作
-   そのものは世代バンプ（項目 2）により `PrefilterCache` 等の古いキャッシュを
-   無効化するため、索引カタログ側の追加処理は不要（新列に対応する索引の有無は
-   索引カタログのメタデータ次第であり、索引宣言方式〔タスク (1)〕確定後に
-   「未索引列への `INSERT` は索引を持たない列として全走査へフォールバックする」
-   契約を明文化する）
-8. **列削除・列名変更 DDL**: 現行 `catalog.rs` には列を削除する経路・列名を変更する
-   経路は存在しない（`alter_table_add_column` による列追加のみが唯一のスキーマ変更
-   DDL であり、`ALTER TABLE DROP COLUMN` 相当・列リネーム相当は本リポ未実装。SQL
-   表層の許可リストにも該当構文は無い）。これらの経路を将来導入する場合は、行
-   データの `write_txn` 統一契約（本節冒頭）に従い、次を同一 `write_txn`・単一
-   commit で行うことを不変条件とする: (a) 列削除では当該列に対応する Index-T・
-   Index-P の全エントリおよびカーディナリティ統計を破棄する（残すと、削除された
-   はずの列値で索引を引いた際に旧エントリが stale-positive として候補に残る）、
-   (b) 列名変更では索引カタログ（列名または `column_index` から索引を引くための
-   対応表）を新列名へ同一 txn 内で書き換える（索引データそのもの——`value_key` は
-   列値のエンコードでありインデックス構造自体は列名に依存しない前提——は再構築
-   不要だが、索引カタログの対応関係だけが旧列名を指したままだと索引経路が
-   誤った列の索引を引く、または新列名を未索引列と誤認して索引経路の候補から
-   落ちる false-negative になる）。列削除・列名変更 DDL の導入時は、この契約を
-   本項目の改訂として反映してから実装に着手する
+   RECOVER-10 系）と独立であり、索引の存在・不在は重複判定（`23505` / `22023`）に
+   影響を与えない
+6. **DDL（`DROP TABLE`）時の索引破棄**: 行テーブル・Index-T・Index-P・カーディナリ
+   ティ統計を同一 `write_txn`・単一 `commit_boundary::commit` で破棄する。分離される
+   と、`drop_table` 後に同名テーブルが再作成された場合、旧 `(tenant_id, id)` を指す
+   stale-positive エントリが新テーブルの索引経路へ紛れ込み、誤った検索結果に加え
+   旧テナントデータの存在情報漏えい（RLS 境界の実質的な迂回）につながる
+7. **DDL（`ALTER TABLE ADD COLUMN`）時の索引同期**: 列追加時点では当該列の索引
+   エントリは存在しない（既存行はその列を持たないため false-negative を生まない）。
+   列追加後の `INSERT` が新列へ値を書く際は当該列の索引エントリを同一 `write_txn`
+   で作成する
+8. **列削除・列名変更 DDL**: 現行未実装。導入時は (a) 列削除で当該列の Index-T・
+   Index-P 全エントリとカーディナリティ統計を同一 `write_txn` で破棄する、(b) 列名
+   変更で索引カタログを新列名へ同一 txn 内で書き換える契約を適用する
 
-## RLS 境界
+### RLS 境界
 
-索引ヒット後も可視性判定を必ず再適用し、索引を RLS のバイパス経路にしない
-（fail-closed。`security.md` P0）。
+`policy.rs::PolicyContext::is_visible` は許可可視性集合による絞り込み → 「同一
+テナントの行」または「`Public` 行（テナント問わず）」判定の二段である。索引データ
+モデルの Index-T／Index-P 二層分離により、索引経路は両層の和集合を候補として返す
+ことで全走査経路と同じ範囲を候補として網羅する。`allowed_visibilities` による絞り
+込みは索引側では行わないため、和集合は可視集合そのものではなく上位集合（候補）で
+あり、候補に対しては**必ず** `is_visible` を再適用する。カーディナリティ統計も
+Index-T／Index-P の分離をそのまま踏襲し、`Private` 行の分布を横断集計する統計・
+「非権威的ヒント」であっても `Private` 行に由来するテナント横断統計を経路選択へ
+用いる設計は採用しない。
 
-### 索引経路と全走査経路の結果一致（Index-T / Index-P の二層構成）
+## Issue #464 実測の反映（コスト見積り節の書き換え）
 
-`policy.rs::PolicyContext::is_visible`（142 行目）は、まず構築時に決まる
-`allowed_visibilities`（許可可視性集合。既定は `Public` のみ、`Private` を見せる
-には構築時の明示付与が要る）で行の可視性ラベルを絞り込み、そのうえで「同一テナ
-ントの行」または「`Public` 行（テナント問わず）」を可視と判定する二段の判定
-である。索引キーの先頭に `tenant_id` を置いて単一テーブルでレンジスキャンを
-テナント内に閉じる設計（旧案）では、後段の判定のうち他テナントの `Public` 行に
-対応する索引エントリが構造的に存在せず、索引経路が全走査経路
-（`build_filtered_with_rows` の `predicate` は `is_visible` を行単位でそのまま
-評価する）と異なる結果セットを返しうる。そのため索引データモデルを次の二層に
-分離する（「索引データモデル」節参照）:
+`docs/design/scan-stage-profile.md`（25k／100k・共有 QEMU・参考値）が `vector_knn_where`
+を W1（`scalar_scan`）⊆ W2（`predicate`）⊆ W3（`arena_copy`）の累積段に分解した:
 
-- **Index-T**（自テナント索引・`(tenant_id, value_key, id)`）: レンジスキャンを
-  物理的にテナント内へ閉じる。従来案どおり他テナントの索引エントリへは到達しない
-- **Index-P**（Public 横断索引・`(value_key, tenant_id, id)`）: `visibility =
-  Public` の行のみを収録し、`value_key` を先頭キーとして**全テナントを横断**して
-  レンジスキャンする
+| 段 | 内容 | 25k（ns/row・累積） | 100k（ns/row・累積） |
+| -- | ---- | -------------------- | ---------------------- |
+| W1 `scalar_scan` | 可視行の metadata へ `row_codec::scan_scalar_columns` | 13.8 | 13.8 |
+| W2 `predicate` | W1 ＋ `lang = 'ja'` 判定（`declarative_filter::matches_all`） | 17.8 | 19.7 |
+| W3 `arena_copy` | W2 一致行の embedding を連続 `Vec<f32>` へ複製 | 21.3 | 35.3 |
 
-索引経路は両層の和集合を候補として返すことで、全走査経路と同じ「自テナント全体 +
-他テナント `Public`」の範囲を候補として網羅する。ただし `allowed_visibilities` に
-よる絞り込みは索引側では行わないため、和集合は**可視集合そのものではなく上位
-集合（候補）**であり、候補に対しては**索引では代替せず必ず** `is_visible` を
-再適用する（索引ヒットは「候補」であって「可視である保証」ではない、という二段
-構えを設計上の不変条件とする）。エラー・空結果経由で他テナントの存在情報を漏ら
-さない契約（`wire_code` 設計）は索引導入後も維持する。
+`agg_count`／`rls_isolation`（`WHERE` を持たない）は `on_visible_row` を通らず、
+これらの改善は #477 側の段（A1〜A5。実測では特に A1〜A3）に帰属する——**本 ADR
+（#471）が `agg_count` を対象に挙げていた旧記述は誤りであり、対象フェーズを
+`vector_knn_where`・`where_compound_count`・`group_by_having` へ訂正する**。
 
-### カーディナリティ統計・タイミングのクロステナント漏えい防止
+`crossdb-bench.md`（25,000 行・dim 128・wire 経由・p50）の該当フェーズ実測値
+（self、参考値）: `vector_knn_where` 2,819µs・`where_compound_count` 3,903µs・
+`group_by_having` 3,948µs。
 
-Index-P への横断到達は `Public` 行に限られるが、`Public` 行の存在自体はテナント
-横断で既に可視な情報であり（`is_visible` の定義そのもの）、これを索引が横断的に
-扱っても新たな情報漏えいにはならない。一方 `Private` 行のカーディナリティ・分布は
-Index-T にのみ反映され、Index-P・その統計のいずれからも観測できない——**選択度
-推定の統計もこの二層分離をそのまま踏襲し、Index-T 由来の統計は自テナント内でのみ
-参照し、Index-P 由来の統計（`Public` 行限定）のみをテナント横断で保持・参照する**。
-`Private` 行の分布を横断集計する統計・「非権威的ヒント」であっても `Private` 行に
-由来するテナント横断統計を経路選択（索引経路 vs 全走査経路）へ用いる設計は採用しな
-い。索引経路・全走査経路のいずれを選んでも「その選択が他テナントの `Private` 行の
-分布に依存する」観測可能な差（処理時間・レイテンシを含む）が生じないことを、実装
-フェーズの RLS 不変テスト（「実装フェーズのタスク分解案」節のタスク (5)）で選択度推定込みで検証する。
+**#471 の効果上限の見積り**: 候補集合を揃えた W2（W1 の `scan_scalar_columns` を
+累積で含んだうえで述語判定まで終えた値。dense 探索の候補集合サイズに依存しない）
+の累積値——25k: 17.8 ns/row・100k: 19.7 ns/row——を可視行数に乗じた値を、索引化に
+よって省略し得るコストの上限とする（`W1` を別途加算すると `W1` 分のコストを二重
+計上するため `W2` を単独の累積値として用いる）。`W3`（arena 複製）は候補集合
+縮小分のみが索引化の恩恵になり、複製処理自体は残る（「候補 A を採る場合の契約」
+節と対比した表の W3 行「一部」を参照）。
 
-## コスト見積り・索引選択
+**候補 B の損益**: 初回構築 O(N)（W1 相当）を同一世代内のクエリ回数で償却する。
+世代進行のたびに再構築されるため「書き込み頻度 ≫ 読み取り頻度」のワークロードでは
+無効化（全走査縮退）が妥当——`SqlArenaCache` と同じ性質である。`W0-cold`（`SqlArenaCache`
+を毎回空の状態から測る）が `W0-hot` の約 9〜11 倍というスナップショット常駐の効果
+（`scan-stage-profile.md`）は、候補 B が `SqlArenaCache` と同居することで索引側にも
+及ぶ。
 
-- 全走査経路: O(N) × (デコード + 比較) の逐次アクセス
-- 索引経路: O(log N + K) × (ランダム行フェッチ + 可視性再判定 + デコード)。ここで
-  K は索引がヒットする行数（選択度 s に対し K ≈ s × N）
-
-索引経路はシーケンシャルアクセスをランダムアクセスへ置き換えるため、単純な演算量
-比較だけでなく I/O パターンの違いを含めた損益分岐選択度 s\* が存在し、s\* は 1 よりも
-十分小さい値になる（低選択性条件——ヒット率が高い条件——では全走査の方が有利）。この
-s\* の具体値は実装フェーズでの実測が必要であり、本 ADR では以下の設計方針のみを定める:
-
-- **選択度推定による経路切替**（Issue コメントで補足された要件）: Qdrant の
-  `query_estimator.rs` 等に見られる「カーディナリティ推定値に基づき索引経路と全走査
-  経路を切り替える」という設計概念を採用する。Index-T・Index-P それぞれにごく軽量な
-  カーディナリティカウンタ（列値ごとの概算出現数。Index-T はテナント単位、Index-P は
-  `Public` 行限定でテナント横断）を保持し、推定選択度が閾値 s\* を上回る場合は索引を
-  使わず全走査へフォールバックする（統計のテナント境界は「RLS 境界」節の分離方針に
-  従う）
-- この切替は `sql/plan.rs::ExecutionPlan` の枠組みに「SCALAR 事前フィルタの候補列挙
-  手段」として統合する位置づけとし、`scalar_prefilter` の意味（DISTANCE 段より先に
-  SCALAR 段を適用するか）自体は変更しない。`precision` モードの契約（空集合応答等・
-  TASK-162）も変更しない
-- 書き込み側のコストは索引列数・索引層数に比例する write amplification として見積
-  もる。`Private` 行は列ごとに Index-T のみ（列数分）、`Public` 行は列ごとに
-  Index-T・Index-P の両方（列数の 2 倍）の追加エントリ書き込みが発生する
-
-数値基準（具体的な s\* や break-even 行数）は実装フェーズでのベンチ実測（「実装フェーズの
-タスク分解案」節のタスク (6)）で確定する。行数が少ない環境では、索引の維持コスト（write amplification・
-実装複雑度）がメリットを上回る可能性があり、優先度判断はその実測後に行う。
+**数値の位置づけ**: 上記はいずれも共有 QEMU 環境での「帰属・上限見積り」であり、
+採否根拠ではない（`benchmark-judgement-policy.md` §5「共有計測環境の数値は帰属分析
+には使えるが perf 動機の production 変更の採用根拠には使えない」）。before/after の
+採否判定・選択度閾値 s\* の確定は #474／#476 で同 policy §7.1／§7.2 テンプレート
+（min-of-N・N≥5・参照区間・固定帯 ±5%）に従い専有環境で行う。
 
 ## 代替案の比較
 
 | 代替案 | 概要 | 本 ADR の結論 |
 | ------ | ---- | -------------- |
-| 現状維持 | 索引を導入せず全走査のみ | 行数が増えた場合の性能天井を左右するため、設計整理自体は先行して行う価値がある（実装着手は別判断） |
-| #363（VectorArena 世代整合キャッシュ）との統合 | `VectorArena` 構築結果自体をキャッシュする方向 | 目的が異なる（索引は走査行数の削減、#363 はアリーナ再構築の削減）。相互に排他ではなく併用可能。重複回避のため、索引導入時は #363 のキャッシュ無効化条件と整合させる（世代機構を共有する設計・「一貫性（DML 反映・世代整合）」節参照） |
-| zone map / bloom filter 等の軽量代替 | 列値の範囲・存在有無のみを粗く記録し、行単位索引より軽量に走査対象を絞る | 等価条件の完全な絞り込みはできない（偽陽性を許容し全走査は残る）。実装コストは低いが本 Issue の受け入れ条件（高選択性等価条件での絞り込み）を完全には満たさないため、B 案の補助的な最適化候補として位置づけるに留める |
+| 現状維持 | 索引を導入せず全走査のみ | 行数が増えた場合の性能天井を左右するため、設計整理自体は先行して行う価値がある |
+| #363（VectorArena 世代整合キャッシュ）との統合 | `VectorArena` 構築結果自体をキャッシュする方向 | 目的が異なる（索引は走査行数の削減、#363 はアリーナ再構築の削減）。採用案（候補 B）は #363 の `SqlArenaSnapshot` を構築元として直接利用するため、排他ではなく積極的に併用する設計とした |
+| zone map / bloom filter 等の軽量代替 | 列値の範囲・存在有無のみを粗く記録し、行単位索引より軽量に走査対象を絞る | 等価条件の完全な絞り込みはできない（偽陽性を許容し全走査は残る）。採用案（候補 B）の等価索引で高選択性条件を完全に絞り込めるため、補助的な最適化候補としての優先度は下げる |
 
-## 実装フェーズのタスク分解案
+## 実装タスクの対応表
 
-| # | タスク | 依存 | 見積り（目安） |
-| - | ------ | ---- | -------------- |
-| 1 | 索引テーブルの物理設計確定＋プロトタイプ計測（A 案 / B 案、Index-T / Index-P 二層構成比較） | 本 ADR 承認 | 中 |
-| 2 | 索引テーブルの物理実装＋ DML（`INSERT` / 削除 / 同一パス置換 / 可視性変更）同期反映（Index-T・Index-P 両層）＋ 全 DDL 経路（`catalog.rs::Storage::drop_table` の Index-T・Index-P・カーディナリティ統計の同一 write txn 破棄、`alter_table_add_column` 後の新列 `INSERT` に対する索引エントリ同期作成。列削除・列名変更 DDL は現状未実装のため、導入時に「一貫性」節項目 8 の同一 write txn 破棄／索引カタログ書き換え契約を適用する） | (1) | 大 |
-| 3 | 既存データからの索引ビルド＋世代整合（`PrefilterCache` 相乗り）＋途中失敗の fail-closed 注入試験 | (2) | 中 |
-| 4 | `ExecutionPlan` への経路統合＋ Index-T/Index-P 和集合の候補列挙＋カーディナリティ推定による索引経路 / 全走査経路の選択度切替 | (2) | 大 |
-| 5 | RLS 不変テスト（索引ヒット後の可視性再判定・テナント境界・索引経路と全走査経路の結果一致・`DROP TABLE` 後の同名テーブル再作成で旧索引エントリが候補に復活しないこと・`ALTER TABLE ADD COLUMN` 後の新列 `INSERT` が索引経路の候補から漏れないこと）＋統計・処理時間経由のクロステナント（`Private` 行）漏えい防止検証 | (3)(4) | 中 |
-| 6 | ベンチによる損益分岐選択度 s\* の実測・行数スケーリング測定 | (4) | 中 |
+| 旧タスク（Proposed 版） | 対応 Issue | 備考 |
+| ---------------------- | ---------- | ---- |
+| (1) 物理設計確定・プロトタイプ | #472（本 ADR） | 候補 B 採用により redb 物理設計（候補 A）は不要になった |
+| (2) DML 同期・(3) 既存データからの索引ビルド | #473 | 候補 B では「世代整合キャッシュの構築」に集約される。DML 同期・途中失敗注入は構造的に消滅する（構築失敗は全走査縮退で済む） |
+| (4) `ExecutionPlan` 統合・選択度切替 | #474（`WHERE` 経路）・#475（集計・`GROUP BY` 経路） | `classify_scalar_plan`・`EXPLAIN` 露出を含む |
+| (5) RLS 不変テスト | #476（`tests/scalar_index_rls.rs` 相当。統計縮約オラクル・Issue #393 型） | `DROP TABLE` 再作成・`ADD COLUMN` 後 `INSERT` のケースは候補 B では世代バンプで自動失効するが回帰テストとしては維持する |
+| (6) 損益分岐実測 | #476 | `benchmark-judgement-policy.md` §7 テンプレートに従う |
 
-実装タスクの Issue 起票は本 ADR の承認後、ユーザー承認を経て別途行う
-（本 ADR・本 PR では起票しない）。
+spec 側への申し送り（ポインタのみ）: `IN`／`BETWEEN` 構文の要否・ビヘイビア ID、
+`EXPLAIN` の `scalar_plan:` 行の契約化（SQL-6 系）、索引対象列の宣言方式
+（`CREATE INDEX` 相当）は本 ADR で決めない。
+
+## 判断記録（オーナー記入欄）
+
+| 項目 | 内容 |
+| ---- | ---- |
+| 判断 | 候補 B（メモリ常駐・テーブル世代整合キャッシュ）を採用案として確定する |
+| 根拠 | 「候補比較」節の採用理由 1〜3（production 契約への非干渉・既存 fail-closed 契約の再利用・Issue #464 実測が示す効果上限との整合） |
+| 条件 | 「見送りの再評価条件」（可視行集合がメモリ上限超過、または cold クエリ支配的） |
+| 判断日 | Issue #472 の承認コメント日付を転記（本 ADR 単独では確定しない） |
+| 記入者 | Issue #472 の承認コメント投稿者を転記（本 ADR 単独では確定しない） |
 
 ## スコープ外
 
-- `crates/` 配下のコード変更・索引の実装そのもの
-- 実装タスクの Issue 起票
-- 索引対象列の宣言構文（`CREATE INDEX` 相当）の具体的な文法確定
-- 損益分岐選択度 s\* の具体的な数値の確定（実装フェーズでの実測が必要）
-- #360（パースキャッシュ）・#363（VectorArena 世代整合キャッシュ）・#367（ANN 索引
-  採否検討）そのものの設計（関係の整理・重複回避の言及に留める）
+- `crates/` 配下のコード変更・索引の実装そのもの（#473〜#476 が担当）
+- オーナー承認コメントの取得（オーナー作業。承認前は #473 をブロックする）
+- `IN`／`BETWEEN` 構文・索引宣言構文（`CREATE INDEX` 相当）・`EXPLAIN` の
+  `scalar_plan:` 契約の spec 側確定
+- 選択度閾値（`full_scan_ratio` 型の比）の具体的な数値の確定（#474／#476 での
+  専有環境実測が必要）
+- `core.rs::PrefilterCache` のテーブル単位世代への統一（#363 由来の申し送りを継承。
+  本 Issue は `sql::arena_cache::SqlArenaCache` 経路の追加のみを対象とする）
+- #360（パースキャッシュ）・#367（ANN 索引採否検討）・#477（可視ビットマップ
+  世代整合キャッシュ）そのものの設計（関係の整理・層分担の言及に留める）
 
 ## 参照
 
 - `docs/spec/04-behavior/data-model.md`（TABLE-12）
 - `docs/spec/04-behavior/rls.md`
-- `docs/spec/05-tasks.md`（TASK-75・TASK-89/133 系）
+- `docs/spec/05-tasks.md`（TASK-75・TASK-89/133 系・SQL-6・SQL-13・SQL-14・TASK-147・TASK-162）
 - PostgreSQL `access/nbtree/`（PostgreSQL License）
 - SQLite `where.c` / `wherecode.c`（Public Domain）
 - Qdrant `lib/segment/src/index/field_index/`・`query_estimator.rs`（Apache-2.0）
 - `docs/design/table-generation-rejection-granularity.md`（Issue #285）
 - `docs/design/plan-rls-boost-interaction.md`（TASK-139）
+- `docs/design/scan-stage-profile.md`（Issue #464）
+- `docs/design/sql-arena-generation-cache.md`（Issue #363）
+- `docs/design/sparse-index-cache.md`（Issue #357）
+- `docs/design/hnsw-generation-cache.md`（Issue #408）
+- `docs/design/hnsw-rls-cardinality-switch.md`（Issue #409）
+- `docs/design/explain-search-engine-exposure.md`（Issue #411）
+- `docs/design/benchmark-judgement-policy.md`
+- `docs/design/hotpath-implementation-survey.md`
