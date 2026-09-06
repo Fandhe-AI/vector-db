@@ -355,6 +355,18 @@ else
 endif
 
 # --------------------------------------------------
+# 全行走査経路（agg_count／rls_isolation／vector_knn_where）の段別内訳プロファイル（Issue #464。crates/engine/benches/scan_stage_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-scan-stage-profile
+bench-scan-stage-profile: ## Issue #464（docs/design/crossdb-bench.md で self が最劣後する agg_count／rls_isolation／vector_knn_where の redb 全行走査・ヘッダデコード・RLS 判定・dim/metadata デコード・WHERE 述語評価の段別内訳を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_SCAN_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_SCAN_PROFILE_SCALE=<1-4>（既定 1＝25,000 行・4＝100,000 行）で規模、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（1 プロセス = 1 規模点）
+ifdef HAS_CARGO
+	cargo bench --bench scan_stage_profile_bench -p engine
+else
+	@echo "skip: Cargo.toml 未追加のため bench-scan-stage-profile をスキップ"
+endif
+
+# --------------------------------------------------
 # ingest 経路の段別内訳プロファイル（Issue #396。crates/engine/benches/ingest_profile_bench.rs）
 # --------------------------------------------------
 
