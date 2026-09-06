@@ -149,7 +149,9 @@ fn main() {
             "rows/rounds = {per_round} statements per round is below the protocol minimum 40 (increase BENCH_INGEST_WIRE_ROWS or decrease BENCH_INGEST_WIRE_ROUNDS)"
         ));
     }
-    let dedicated_env = std::env::var_os("BENCH_DEDICATED_ENV").is_some();
+    let dedicated_env = std::env::var("BENCH_DEDICATED_ENV")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
 
     println!(
         "{}",
@@ -184,10 +186,6 @@ fn main() {
 
     let users_path = common::write_user_store_file(&[("bench", TENANT, "bench")]);
     let addr = common::spawn_server_with_engine(&users_path, Arc::clone(&core));
-    let mut wire_stream = common::authenticate_to_ready_for_query(addr, "bench", "bench");
-    wire_stream
-        .set_nodelay(true)
-        .expect("set TCP_NODELAY on client socket");
 
     let config = MeasurementConfig::new(20, (per_round - 20) as u32, 1)
         .expect("protocol minimums satisfied");
@@ -210,6 +208,19 @@ fn main() {
 
     for round in 0..rounds {
         // --- W0: wire_roundtrip ------------------------------------------------
+        // 各ラウンド開始直前（計測区間外）で wire 接続を張り直す（codex-review
+        // 指摘 P1）。`spawn_server_with_engine` のサーバー側読み取りタイムアウトは
+        // 5 秒固定であり、直前の S0（`execute_sql_in_session` 直呼び出しで wire を
+        // 一切使わない区間）が 5 秒を超えるストレージ・設定では、単一接続を全
+        // ラウンドで使い回すとアイドルのまま S0 中にサーバー側がタイムアウトで
+        // 接続を切断し、直後の W0 が失敗する。ラウンドごとに再接続することで
+        // アイドル時間を S0 区間からゼロへ落とし、この失敗経路を構造的に排除する
+        // （再接続自体は計測区間の外・`run` 呼び出しより前で行うため W0 の
+        // 計測値には混入しない）。
+        let mut wire_stream = common::authenticate_to_ready_for_query(addr, "bench", "bench");
+        wire_stream
+            .set_nodelay(true)
+            .expect("set TCP_NODELAY on client socket");
         let w0_round_start_n = w0_next;
         // SQL 文字列の組み立て（`make_stmt_sql`）は計測対象の wire 往復コストでは
         // ないため、計測区間の外（ラウンド開始前）で本ラウンド分すべてを事前生成
