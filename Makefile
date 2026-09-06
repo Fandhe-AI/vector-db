@@ -330,6 +330,19 @@ else
 endif
 
 # --------------------------------------------------
+# vector_knn 786us の wire／SQL 表層／距離カーネル・Top-k 内訳プロファイル
+# （Issue #463。crates/wire-server/benches/knn_wire_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-knn-wire-profile
+bench-knn-wire-profile: ## Issue #463（`vector_knn` 786µs〔docs/design/crossdb-bench.md〕の wire／SQL 表層／距離カーネル・Top-k 内訳を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_KNN_WIRE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる
+ifdef HAS_CARGO
+	cargo bench --bench knn_wire_profile_bench -p wire-server
+else
+	@echo "skip: Cargo.toml 未追加のため bench-knn-wire-profile をスキップ"
+endif
+
+# --------------------------------------------------
 # isa.rs dot カーネルの複数アキュムレータ化マイクロベンチ（Issue #365。crates/engine/benches/dot_kernel_bench.rs）
 # --------------------------------------------------
 
