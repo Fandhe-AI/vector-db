@@ -71,16 +71,33 @@ Phase 1（#345 配下）で行ったデコード段の最適化（`storage::deco
 `Prefix`（`col LIKE '<p>%'`）・`Expression`（比較演算子 `> < >= <= =` を頂点に持つ
 `Expr::Binary` のみ）・`PredicateCall`（`visible()` 等、空引数）の 4 種であり、
 **`IN`・`BETWEEN` 構文は現行許可リストに存在しない**。`sql/udf_call.rs::BoundExpr`
-（`Expression` 側の束縛先）も `Number`・`IdRef`（疑似列 `id`）・`VectorRef`・
-`Builtin`・`Binary`・`WasmCall` のみで**`Text` 列参照は含まれない**——`Expression`
-形状での範囲比較は疑似列 `id`（例: `id > 100`）に限られる。加えて
-`catalog.rs::ColumnType` は `Text` と `Vector(u32)` の 2 種のみで、索引対象になり
-得るスカラー列は `Text` 列に限られる（数値範囲索引の対象列がそもそも存在しない）。
+（`Expression` 側の束縛先）は `Number`・`IdRef`（疑似列 `id`）・`VectorRef`・
+`Builtin`・`Binary`・`WasmCall` を取り得る（`Text` 列参照は含まれない）。
+
+**訂正（Issue #472 レビュー指摘）**: 本 ADR の初版は「`Expression` 形状での範囲比較は
+疑似列 `id` に限られる」と記していたが、これは誤り——`crates/engine/tests/sql_udf_call.rs`
+の `equality_predicate_and_expr_predicate_combine_in_the_same_where_clause`
+（`WHERE lang = 'ja' AND vec_norm(embedding) > 2.0 ORDER BY ...`、同ファイル
+373 行目付近）が示すとおり、`Expression` は `VectorRef`・
+`Builtin`（`vec_norm` 等）を頂点に持つ比較も受理し、**現行許可リストで実際に成立する
+`Expression` は疑似列 `id` の比較に限られない**。加えて `catalog.rs::ColumnType` は
+`Text` と `Vector(u32)` の 2 種のみで、**等価・前方一致索引の対象になり得るスカラー
+列は `Text` 列に限られる**——`Expression` 形状の比較は列型を問わず幅広く成立しうる
+一方、それを二次索引で高速化できるのは疑似列 `id` の単純比較（後述「索引対応述語の
+狭い定義」）だけであり、「`Expression` の構文上の広さ」と「索引が対応できる範囲の
+狭さ」は別の話である。この区別を「採用案（候補 B）の確定仕様」節の索引対応述語の
+定義（狭義の限定列挙）に反映する。
 
 この事実は本 ADR が定める索引の対応述語（「採用案（候補 B）の確定仕様」節）を
-「等価・前方一致・（`id` 疑似列限定の）比較」に限定する根拠であり、`IN`／
+「等価・前方一致・（`id` 疑似列限定の狭義比較のみ）」に限定する根拠であり、`IN`／
 `BETWEEN` を含む索引対応の拡張は許可リスト・構文自体の spec 側確定を前提とする
-（「spec 側への申し送り」節）。
+（「spec 側への申し送り」節）。**索引対応述語として明示的に判定できない `Expression`
+（`Builtin`・`WasmCall`・`VectorRef` を含む式、`IdRef` と数値リテラルの単純比較の
+形に一致しない式のすべて）は、候補削減を一切行わず既存評価器（`sql/expr_program.rs`）
+へそのまま渡す残余述語として扱う——列挙による許可制（明示的に索引対応と判定できた
+ものだけを索引対応とし、それ以外はすべて残余）であり、除外による拒否制（残余の形状を
+列挙し、それ以外を索引対応とみなす）ではない。この規則は「索引対応述語の狭い定義」
+節・「述語適用規則」節で確定する。
 
 ### 実クエリ形状（Issue #464 実測が使うクエリ・本 ADR のコスト見積りの根拠）
 
@@ -174,16 +191,62 @@ Issue #473〜#476 はこの節の契約に従う。
   「呼び出し元が自分の `read_txn` の結果をそのまま使う」ためだが、索引は候補集合
   の**正しさ**が世代に結び付く派生データであり、競合時は索引経路を使わず全走査へ
   縮退するのが fail-closed 側であるため、この非対称を意図的に選ぶ
-- **述語適用規則**: 索引対応述語（`Equality`・`Prefix`・疑似列 `id` の
-  `Expression` 比較）ごとに候補スロット集合（昇順）を得て AND は交差（マージ）、
-  残余述語（`PredicateCall`・`Text` 列参照を含む `Expression`）は候補のみに
-  `sql/expr_program.rs`（Issue #353）で評価する。`where_compound_count`
+- **索引対応述語の狭い定義**（Issue #472 レビュー指摘 (1) を反映。「許可リスト述語の
+  事実整理」節の訂正の帰結）: 索引対応述語は次の 2 形のみとし、列挙による許可制で
+  判定する——(i) `Equality`（`Text` 列 `=` リテラル）・`Prefix`（`Text` 列
+  `LIKE '<p>%'`）、(ii) `Expression` のうち `BoundExpr::Binary` の直下がちょうど
+  `IdRef` 1 個と `Number` リテラル 1 個（左右どちらの位置でも可）からなる単純比較
+  （`id > 100`・`100 < id` 等）**のみ**。この 2 形に構文的に一致しない `Expression`
+  はすべて——`Builtin`（`vec_norm(embedding) > 2.0` 等）・`WasmCall`・`VectorRef` を
+  含む式、`IdRef`/`Number` 以外の項を持つ `Binary`、ネストした算術式——例外なく
+  残余述語として扱う。索引対応かどうかを「残余の形状を列挙し、それ以外を索引対応と
+  みなす」除外制では判定しない（誤って新しい `BoundExpr` variant や複雑な式を
+  索引対応と誤判定する経路を作らないため）。
+- **述語適用規則**: 索引対応述語（上記の狭い定義に一致するもの）ごとに候補スロット
+  集合（昇順）を得て AND は交差（マージ）、残余述語（`PredicateCall`、および上記の
+  狭い定義に一致しない `Expression` すべて）は候補のみに `sql/expr_program.rs`
+  （Issue #353）で評価する。`where_compound_count`
   （`visible() AND id > 100 AND lang = 'ja'`）はこの規則の実例——`lang = 'ja'`
-  （`Equality`）と `id > 100`（`Expression`・疑似列 `id`）の交差を候補集合とし、
-  `visible()` は候補のみへ適用する。`sql/plan.rs::ExecutionPlan` の
-  `scalar_prefilter`（SCALAR 段を DISTANCE 段より先に適用するか）の意味・
+  （`Equality`）と `id > 100`（`Expression`・`IdRef` と `Number` の単純比較）の
+  交差を候補集合とし、`visible()` は候補のみへ適用する。`sql/plan.rs::ExecutionPlan`
+  の `scalar_prefilter`（SCALAR 段を DISTANCE 段より先に適用するか）の意味・
   `precision` モードの契約（TASK-162）は不変。DISTANCE 先行（`!scalar_prefilter`）
   の事後フィルタ経路は索引対象外（候補集合が可視全集合のため索引を引く意味が無い）
+- **エラー契約の維持（Issue #472 レビュー指摘 (2)）**: 現行の逐次評価
+  （`sql/expr_program.rs` の「評価順序の保存」節が定める、`WHERE` の複数述語を
+  `Vec<BoundExpr>` として宣言順に AND 短絡評価する契約）では、エラーを起こしうる
+  述語（0 除算・非有限値化・`id_as_finite_scalar` の `id > 2^53` 拒否等）が宣言順で
+  先に来れば、後続の索引対応述語の真偽に関わらず評価されエラーになりうる
+  （例: `WHERE 1/0 > 0 AND id < 0` は `id < 0` が u64 の `id` に対し常に偽でも、
+  宣言順で先に評価される `1/0 > 0` が可視行 1 件につき必ず `22000` を返す。
+  `crates/engine/tests/sql_udf_call.rs` の `constant_subexpression_error_still_fails_a_query_with_a_visible_row`
+  参照）。索引による AND 候補削減は「索引対応述語をすべて先に評価して候補を絞り、
+  残余述語は候補のみに評価する」規則であり、宣言順を無視して索引対応述語を先に
+  評価する——これは残余述語がエラーを起こしうる場合、宣言順評価では発生していた
+  はずのエラーを索引経路が黙って握りつぶし得ることを意味し、fail-closed の趣旨に
+  反する。この非等価を避けるため、索引による候補削減（AND 交差・COUNT 直接返却の
+  いずれも）は**残余述語がすべてエラーを起こし得ないと構造的に保証できる場合に
+  限り**適用する。現行許可リストで残余述語になり得るのは `PredicateCall`
+  （`visible()` など。空引数でエラーパスを持たない）と、上記「索引対応述語の狭い
+  定義」に一致しない `Expression`（`Builtin`・`WasmCall`・算術式等、0 除算・非有限
+  値化・WASM 実行時エラー等のエラーパスを持ちうる）の 2 種であり、**残余述語に
+  `PredicateCall` 以外（エラーを起こしうる `Expression`）が 1 つでも含まれる場合は
+  索引による候補削減を行わず、全走査＋既存の宣言順逐次評価（`sql/expr_program.rs`）
+  へ縮退する**。残余述語が `PredicateCall` のみ（`where_compound_count` の
+  `visible()` はこの形）の場合に限り、索引対応述語の交差で得た候補へ `PredicateCall`
+  を適用する規則を適用してよい。この判定（残余述語の集合からエラー起因の
+  `Expression` の有無を静的に確認する）は #474／#475 の実装契約とする。
+  加えて、索引対応述語のうち `id` の単純比較（`IdRef`/`Number`）を索引化する際は、
+  各候補行の `id` に対し `sql/udf_call.rs::id_as_finite_scalar`（`id > 2^53` を
+  `22000` で拒否）と同一の検査を索引構築・候補判定の経路でも必ず適用する——`u64` の
+  `id` を直接比較する高速経路（f64 変換を経ない比較）で `id_as_finite_scalar` の
+  検査を省略すると、`id > 2^53` の行が索引経由では黙って通過し得るため、現行の
+  逐次評価（`eval` が毎行 `IdRef` を `id_as_finite_scalar` 経由で評価する）が
+  与える `22000` の fail-closed 契約を破る。集計の `COUNT(*)` fast path
+  （候補件数を直接返す経路。下記「集計・`GROUP BY` 経路」参照）は、この
+  `id_as_finite_scalar` 相当の検査を経ていない候補（索引構築時に検査済みでない、
+  または索引構築後にテーブルへ `id > 2^53` の行が追加された等）を含む可能性がある
+  世代では使わず、通常の全走査＋逐次評価へ縮退する。
 - **選択度切替**: 索引ヒット件数 ÷ 可視行数の比が閾値（`hnsw.rs::Ratio`／
   `full_scan_ratio` と同型の整数比。既定 1/10 の先例あり・Issue #409）を超える
   場合は全走査へフォールバックする。既定値は #474 で仮置きし #476 で実測確定する。
