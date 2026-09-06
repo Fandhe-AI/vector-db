@@ -159,6 +159,20 @@ BENCH_SQL_C1_MAX_P95_MS=<spec 値> BENCH_SQL_C1_MIN_RECALL=<spec 値> BENCH_DEDI
 
 出力された実測値は非公開記録先へ保存し、public な資産（ADR・PR・Issue・コミットメッセージ）へは転記しないでください。
 
+### 性能判定の計測規約（Issue #462）
+
+perf 系 ADR・Issue が個別に定めてきた計測規約（交互実行・統計量・ノイズ帯の
+定義）を `docs/design/benchmark-judgement-policy.md` に集約しています。要点:
+
+- before/after を**交互に N ≥ 5 ペア**実行し、per-run 生データを必ず残す
+- 統計量は **min-of-N と median の両方**を併記する
+- ノイズ帯は固定相対帯（±5%）と参照区間の実測帯の**両方**を超えることを判定に
+  効かせる条件とする
+- 共有 QEMU 本環境の絶対値は production 変更の採否・絶対閾値ゲートの確定根拠に
+  はできない（`BENCH_DEDICATED_ENV=1` は自己申告のみで自動検出はしない）
+- 後続 perf Issue がそのまま使える受け入れ条件テンプレート（crossdb フェーズ名の
+  固定語彙を含む）を同 doc に収録
+
 ### ティア別レイテンシ受け入れ基準の実測手順（TASK-116）
 
 `make bench-tier`（`crates/engine/benches/tier_latency_bench.rs`）は TASK-116（対象ビヘイビア: `docs/spec/04-behavior/query-planning.md` PLAN-4・PLAN-6・PLAN-7。判定内容・測定段階・数値基準は spec 側が SSOT であり本リポジトリには記載しません）の受け入れ基準を実測します。常駐 Ollama への実接続が前提です。
@@ -278,7 +292,7 @@ export CROSSDB_PYTHON=<venv の python へのパス>
 make bench-crossdb
 ```
 
-`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください。
+`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
