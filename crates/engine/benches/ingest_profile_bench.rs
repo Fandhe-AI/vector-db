@@ -81,22 +81,31 @@ mod harness;
 
 use harness::env_report::EnvReport;
 use harness::ingest_profile::{
-    content_hash_insert_batch_reimpl, decode_ledger_entry_v2_reimpl, encode_row_reimpl,
-    last_op_entry_reimpl, ledger_entry_v2_reimpl, ns_per_row, parse_bounded_env, parse_insert_mode,
-    refuse_under_github_actions, render_stage_line, residual_ns_per_row, sum_durations,
-    IngestProfileError, InsertMode, StageId, StageSamples,
+    content_hash_insert_batch_reimpl, content_hash_typed_insert_reimpl,
+    decode_ledger_entry_v2_reimpl, encode_row_reimpl, last_op_entry_reimpl, ledger_entry_v2_reimpl,
+    ns_per_row, parse_bounded_env, parse_insert_mode, parse_profile_mode,
+    refuse_under_github_actions, render_stage_line, residual_ns_per_row, rows_per_sec,
+    sum_durations, IngestProfileError, InsertMode, ProfileMode, StageId, StageSamples,
+    DEFAULT_SINGLE_STATEMENTS, MAX_SINGLE_STATEMENTS, MIN_SINGLE_STATEMENTS,
+    SINGLE_WARMUP_STATEMENTS,
 };
 use harness::protocol::MeasurementConfig;
 use harness::rng::DeterministicRng;
+use harness::sql_c1::vector_literal;
 use harness::stats;
 
 use std::collections::HashSet;
 use std::time::Instant;
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
+use engine::core::EngineCore;
 use engine::policy::PolicyContext;
-use engine::recovery::required_op_id::OperationId;
+use engine::recovery::required_op_id::{LedgerMode, OperationId};
 use engine::row_codec::{encode_scalar_columns, Value};
+use engine::sql::allowlist::validate_insert;
+use engine::sql::mode::SessionState;
+use engine::sql::parser::{bind_insert_form, BoundInsertForm};
+use engine::sql::SqlOutcome;
 use engine::storage::{RowInput, Storage, Visibility};
 use engine::tenant;
 
@@ -203,11 +212,31 @@ fn schema(dim: usize) -> TableSchema {
     )
 }
 
+/// エントリポイント（Issue #484）: `BENCH_INGEST_PROFILE_MODE` で `batch`
+/// （既定・Issue #396 の既存挙動。[`run_batch_mode`]）／`single`（crossdb ベンチが
+/// 通る単文 wire 経路の段別内訳。[`run_single_mode`]）を切り替える。
+/// `GITHUB_ACTIONS` 拒否はモード分岐より前に行う（両モード共通の安全弁）。
 fn main() {
     if let Err(e) = refuse_under_github_actions(std::env::var_os("GITHUB_ACTIONS").is_some()) {
         fail_closed(e);
     }
+    let mode_raw = match read_env_var("BENCH_INGEST_PROFILE_MODE") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let mode = match parse_profile_mode(mode_raw.as_deref()) {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    match mode {
+        ProfileMode::Batch => run_batch_mode(),
+        ProfileMode::Single => run_single_mode(),
+    }
+}
 
+/// Issue #396 の既存モード（既定）。`engine::tenant::insert_rows`（複数行 1 write
+/// txn）の段別内訳を計測する。モジュール冒頭コメント参照。
+fn run_batch_mode() {
     let rows_raw = match read_env_var("BENCH_INGEST_PROFILE_ROWS") {
         Ok(v) => v,
         Err(e) => fail_closed(e),
@@ -495,6 +524,576 @@ fn main() {
     }
 
     println!("ingest_profile_bench: OK");
+}
+/// crossdb ベンチ（`docs/design/crossdb-bench.md`）が実際に通る単文 `INSERT`
+/// 経路（wire 簡易クエリ → `EngineCore::execute_sql_in_session` →
+/// `execute_insert_sql`〔`validate_insert` → `get_table_schema` →
+/// `bind_insert_form`〕→ `sql::exec::execute_insert` →
+/// `tenant::insert_typed_row_unchecked`〔1 文 1 write txn〕）の段別内訳を計測する
+/// （Issue #484。親 Issue #483）。`docs/design/ingest-stage-profile.md`
+/// 「Issue #484 追記」節の判断により、production への計測フック追加は行わず
+/// （`bench-internals` feature 限定であっても `crates/engine/src/` の変更に
+/// 変わりないため。CLAUDE.md ステータス行の production 定義に従う）、
+/// 公開 API のみを使う tier（P0/E0/S0）と生 redb レプリカ（I1〜I8）の組み合わせで
+/// 内訳を得る（`run_batch_mode` と同じ測定設計方針）。
+///
+/// tier:
+/// - P0 `parse_bind`: `validate_insert` → `get_table_schema` → `bind_insert_form`
+///   （書き込みなし。パース・束縛だけを単独計測する）
+/// - E0 `typed_row_api`: `tenant::insert_typed_row`（Rust API 経由の単文 e2e）
+/// - S0 `sql_surface`: `EngineCore::execute_sql_in_session`（wire と同一入口）
+/// - I1〜I8: 生 redb レプリカ（`insert_typed_row_unchecked` と同順序の再現。
+///   `StageId`・ラベルは `run_batch_mode` と共有するが、single モードでは
+///   「バッチ内 id 重複検出」に相当する処理が無いため I1 の内容は
+///   「VECTOR 列位置探索 ＋ `validate_embedding_dim`」に読み替える
+///   （`run_replica_single` のコメント参照）。
+///
+/// P0/E0/S0/レプリカはそれぞれ別々の一時 DB で単独計測する（redb は書き込み
+/// 可能ハンドルを同一プロセスから同時に複数開けないため。`run_batch_mode` の
+/// E0 とレプリカの関係と同じ制約。§3.3「クレート境界」参照）。
+///
+/// 帰属: パース・束縛 ≒ S0 − E0（P0 の直接計測値と突き合わせて妥当性確認）、
+/// engine 内部段 ＝ Σ(I1..I8)、残差 ＝ E0 − Σ(I1..I8)。
+fn run_single_mode() {
+    let statements_raw = match read_env_var("BENCH_INGEST_PROFILE_STATEMENTS") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let statements = match parse_bounded_env(
+        "BENCH_INGEST_PROFILE_STATEMENTS",
+        statements_raw.as_deref(),
+        DEFAULT_SINGLE_STATEMENTS,
+        MIN_SINGLE_STATEMENTS,
+        MAX_SINGLE_STATEMENTS,
+    ) {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    if statements <= SINGLE_WARMUP_STATEMENTS.saturating_mul(2) {
+        fail_closed(format!(
+            "BENCH_INGEST_PROFILE_STATEMENTS={statements} too small relative to warmup {SINGLE_WARMUP_STATEMENTS} (need more than {} for a meaningful measured phase)",
+            SINGLE_WARMUP_STATEMENTS * 2
+        ));
+    }
+    match read_env_var("BENCH_INGEST_PROFILE_ROWS") {
+        Ok(Some(_)) => {
+            println!("ingest_profile_bench: BENCH_INGEST_PROFILE_ROWS is ignored in single mode");
+        }
+        Ok(None) => {}
+        Err(e) => fail_closed(e),
+    }
+    let dim_raw = match read_env_var("BENCH_INGEST_PROFILE_DIM") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    let dim = match parse_bounded_env(
+        "BENCH_INGEST_PROFILE_DIM",
+        dim_raw.as_deref(),
+        128,
+        1,
+        4_096,
+    ) {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    // single モードは I6 の insert/reserve A/B（`run_batch_mode` 専用機能）に
+    // 対応しない。未設定・明示 "insert" のみ受理し、"reserve" は fail-closed に
+    // 拒否する（黙って batch モード用の値を無視しない。coding-rust.md
+    // 「untrusted 入力の扱い」）。
+    let insert_mode_raw = match read_env_var("BENCH_INGEST_PROFILE_INSERT_MODE") {
+        Ok(v) => v,
+        Err(e) => fail_closed(e),
+    };
+    match insert_mode_raw.as_deref() {
+        None | Some("insert") => {}
+        Some(other) => fail_closed(format!(
+            "BENCH_INGEST_PROFILE_INSERT_MODE={other:?} is not supported in single mode (only \"insert\" or unset)"
+        )),
+    }
+
+    println!(
+        "{}",
+        EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
+    );
+    println!(
+        "ingest_profile_bench: mode=single statements={statements} dim={dim} tenant={TENANT} table={TABLE}"
+    );
+
+    let warmup = SINGLE_WARMUP_STATEMENTS as u64;
+    let total_stmts = statements as u64;
+    let table_schema = schema(dim);
+    let ctx = PolicyContext::new(TENANT).expect("valid tenant id");
+
+    // --- P0: parse_bind（読み取り専用。書き込みを一切行わない） -----------------
+    let p0_path = unique_db_path("issue484-ingest-single-p0");
+    let _p0_guard = CleanupGuard(p0_path.clone());
+    let (p0_summary, p0_total, p0_min) = {
+        let p0_storage = Storage::open(&p0_path).expect("open P0 storage");
+        p0_storage
+            .create_table(&table_schema)
+            .expect("create P0 table");
+        let mut samples = Vec::with_capacity((total_stmts - warmup) as usize);
+        for n in 0..total_stmts {
+            let row = make_single_row(1, n, dim);
+            let literal = vector_literal(&row.embedding).expect("vector_literal for P0");
+            let sql = single_stmt_sql(
+                row.id,
+                literal.as_str(),
+                &row.body,
+                &format!("ingest-single-p0-{n}"),
+            );
+            let t = Instant::now();
+            let validated = validate_insert(&sql, &p0_storage, LedgerMode::default())
+                .expect("validate_insert for P0");
+            let schema_for_bind = p0_storage
+                .get_table_schema(&validated.table_name)
+                .expect("get_table_schema for P0");
+            let bound =
+                bind_insert_form(&validated, &schema_for_bind).expect("bind_insert_form for P0");
+            let elapsed = t.elapsed();
+            if !matches!(bound, BoundInsertForm::Row(_)) {
+                fail_closed("P0: expected row-form INSERT binding");
+            }
+            if n >= warmup {
+                samples.push(elapsed);
+            }
+        }
+        drop(p0_storage);
+        let min = samples.iter().copied().min().unwrap_or_else(|| {
+            fail_closed("P0 samples must be non-empty (protocol minimums satisfied)")
+        });
+        let summary = stats::summarize(&samples)
+            .unwrap_or_else(|e| fail_closed(format!("P0 summarize failed: {e}")));
+        let total = sum_durations(&samples);
+        (summary, total, min)
+    };
+
+    // --- E0: tenant::insert_typed_row（Rust API 経由の単文 e2e） -----------------
+    let e0_path = unique_db_path("issue484-ingest-single-e0");
+    let _e0_guard = CleanupGuard(e0_path.clone());
+    let (e0_summary, e0_total, e0_min) = {
+        let e0_storage = Storage::open(&e0_path).expect("open E0 storage");
+        e0_storage
+            .create_table(&table_schema)
+            .expect("create E0 table");
+        let mut samples = Vec::with_capacity((total_stmts - warmup) as usize);
+        for n in 0..total_stmts {
+            let row = make_single_row(1, n, dim);
+            let op_id = OperationId::parse(&format!("ingest-single-e0-{n}"))
+                .expect("valid operation id for E0");
+            let values = vec![
+                Value::Vector(row.embedding.clone()),
+                Value::Text(row.body.clone()),
+            ];
+            let t = Instant::now();
+            tenant::insert_typed_row(
+                &e0_storage,
+                TABLE,
+                &ctx,
+                row.id,
+                Visibility::Private,
+                &values,
+                &op_id,
+            )
+            .expect("insert_typed_row for E0");
+            let elapsed = t.elapsed();
+            if n >= warmup {
+                samples.push(elapsed);
+            }
+        }
+        // 整合性検証（後段）のため read-only 再オープンする前に書き込みハンドルを
+        // 解放する（`run_batch_mode` の E0 と同じ理由。redb は同一プロセスから
+        // 書き込みハンドルを同時に複数開けない）。
+        drop(e0_storage);
+        let min = samples.iter().copied().min().unwrap_or_else(|| {
+            fail_closed("E0 samples must be non-empty (protocol minimums satisfied)")
+        });
+        let summary = stats::summarize(&samples)
+            .unwrap_or_else(|e| fail_closed(format!("E0 summarize failed: {e}")));
+        let total = sum_durations(&samples);
+        (summary, total, min)
+    };
+
+    // --- S0: EngineCore::execute_sql_in_session（wire と同一入口） --------------
+    let s0_path = unique_db_path("issue484-ingest-single-s0");
+    let _s0_guard = CleanupGuard(s0_path.clone());
+    let (s0_summary, s0_total, s0_min) = {
+        let s0_storage = Storage::open(&s0_path).expect("open S0 storage");
+        s0_storage
+            .create_table(&table_schema)
+            .expect("create S0 table");
+        let core = EngineCore::from_storage(s0_storage, engine::search_engine::default_engine());
+        let mut session = SessionState::default();
+        let mut samples = Vec::with_capacity((total_stmts - warmup) as usize);
+        for n in 0..total_stmts {
+            let row = make_single_row(1, n, dim);
+            let literal = vector_literal(&row.embedding).expect("vector_literal for S0");
+            let sql = single_stmt_sql(
+                row.id,
+                literal.as_str(),
+                &row.body,
+                &format!("ingest-single-s0-{n}"),
+            );
+            let t = Instant::now();
+            let outcome = core
+                .execute_sql_in_session(&ctx, &mut session, &sql)
+                .expect("execute_sql_in_session for S0");
+            let elapsed = t.elapsed();
+            match outcome {
+                SqlOutcome::Insert(o) if o.rows_affected == 1 => {}
+                other => fail_closed(format!("S0: unexpected outcome for n={n}: {other:?}")),
+            }
+            if n >= warmup {
+                samples.push(elapsed);
+            }
+        }
+        let min = samples.iter().copied().min().unwrap_or_else(|| {
+            fail_closed("S0 samples must be non-empty (protocol minimums satisfied)")
+        });
+        let summary = stats::summarize(&samples)
+            .unwrap_or_else(|e| fail_closed(format!("S0 summarize failed: {e}")));
+        let total = sum_durations(&samples);
+        (summary, total, min)
+    };
+
+    // --- レプリカ: 生 redb による段別計装（I1〜I8） -----------------------------
+    let replica_path = unique_db_path("issue484-ingest-single-replica");
+    let _replica_guard = CleanupGuard(replica_path.clone());
+    let replica_db = Database::create(&replica_path).expect("create replica db");
+    let mut stage_samples = StageSamples::new();
+    for n in 0..total_stmts {
+        let row = make_single_row(1, n, dim);
+        if n < warmup {
+            run_replica_single(&replica_db, &table_schema, &row, n, None);
+        } else {
+            run_replica_single(
+                &replica_db,
+                &table_schema,
+                &row,
+                n,
+                Some(&mut stage_samples),
+            );
+        }
+    }
+    let mut stage_lines: Vec<String> = Vec::with_capacity(StageId::ALL.len() + 3);
+    let mut stage_medians = Vec::with_capacity(StageId::ALL.len());
+    for stage in StageId::ALL {
+        let samples = stage_samples.samples_for(stage);
+        let summary = stats::summarize(samples)
+            .unwrap_or_else(|e| fail_closed(format!("stage {:?} summarize failed: {e}", stage)));
+        stage_lines.push(render_stage_line(
+            stage.label(),
+            1,
+            summary.median,
+            summary.median.as_secs_f64() * 1e9,
+        ));
+        stage_medians.push(summary.median);
+    }
+    let stage_sum = sum_durations(&stage_medians);
+
+    // --- 整合性検証（fail-closed。すべて通過するまで測定値を出力しない） -----------
+    // 1. user_rows/docs のバイト単位一致（E0 ↔ レプリカ。encode_row_reimpl の
+    //    ドリフト検出。`run_batch_mode` の整合性検証 1 と同型）。
+    let e0_db = Database::open(&e0_path).expect("reopen E0 db read-only for integrity check");
+    let e0_read = e0_db.begin_read().expect("begin_read on E0 db");
+    let replica_read = replica_db
+        .begin_read()
+        .expect("begin_read on replica db for integrity check");
+    let e0_rows = collect_row_table(&e0_read);
+    let replica_rows = collect_row_table(&replica_read);
+    let expected_count = total_stmts as usize;
+    if e0_rows.len() != expected_count {
+        fail_closed(format!(
+            "E0 row count mismatch: expected {expected_count}, got {}",
+            e0_rows.len()
+        ));
+    }
+    if replica_rows.len() != expected_count {
+        fail_closed(format!(
+            "replica row count mismatch: expected {expected_count}, got {}",
+            replica_rows.len()
+        ));
+    }
+    if e0_rows != replica_rows {
+        fail_closed(
+            "user_rows/docs entries differ between E0 and replica DBs (encode_row_reimpl drift)",
+        );
+    }
+    println!("integrity: user_rows/docs byte-identical across E0/replica (count={expected_count})");
+
+    // 2. table_generation（E0 は create_table 分 +1、レプリカはカタログ層を
+    //    再現しないため投入文数のまま。`run_batch_mode` の整合性検証 3 と同型）。
+    let e0_gen = read_table_generation(&e0_read);
+    let replica_gen = read_table_generation(&replica_read);
+    let expected_e0_gen = total_stmts + 1;
+    if e0_gen != expected_e0_gen {
+        fail_closed(format!(
+            "E0 table_generation mismatch: expected {expected_e0_gen}, got {e0_gen}"
+        ));
+    }
+    if replica_gen != total_stmts {
+        fail_closed(format!(
+            "replica table_generation mismatch: expected {total_stmts}, got {replica_gen}"
+        ));
+    }
+    println!(
+        "integrity: table_generation == {expected_e0_gen} (E0, includes create_table) / {total_stmts} (replica)"
+    );
+
+    // 3. op_ledger の content_hash ↔ content_hash_typed_insert_reimpl（計測フェーズの
+    //    先頭 200 件をサンプル照合する。全件照合は本ベンチの所要時間を大きく
+    //    伸ばす一方、ドリフトが有れば同一形式のエントリすべてに現れるため、
+    //    サンプルで十分検出できる）。
+    let e0_ledger = e0_read
+        .open_table(OP_LEDGER_TABLE)
+        .expect("open op_ledger table on E0 db");
+    let sample_count = (total_stmts - warmup).min(200);
+    for i in 0..sample_count {
+        let n = warmup + i;
+        let row = make_single_row(1, n, dim);
+        let op_label = format!("ingest-single-e0-{n}");
+        let key = (TENANT, TABLE, op_label.as_str());
+        let stored = e0_ledger
+            .get(key)
+            .expect("read op_ledger entry on E0 db")
+            .unwrap_or_else(|| fail_closed(format!("E0 op_ledger entry missing for n={n}")));
+        let stored_hash = decode_ledger_entry_v2_reimpl(stored.value())
+            .unwrap_or_else(|e| fail_closed(format!("E0 op_ledger entry decode failed: {e}")));
+        let recomputed = content_hash_typed_insert_reimpl(
+            row.id,
+            false,
+            &row.embedding,
+            &[("body", Some(row.body.as_str()))],
+        )
+        .expect("content_hash_typed_insert_reimpl for cross-check");
+        if recomputed != stored_hash {
+            fail_closed(format!(
+                "content_hash mismatch for E0 n={n} (content_hash_typed_insert_reimpl drift)"
+            ));
+        }
+    }
+    println!(
+        "integrity: op_ledger content_hash matches content_hash_typed_insert_reimpl for {sample_count} sampled measured statements (E0)"
+    );
+    drop(e0_read);
+    drop(e0_db);
+    drop(replica_read);
+    drop(replica_db);
+
+    // --- 出力（整合性検証をすべて通過した後） ------------------------------------
+    let measured = (total_stmts - warmup) as usize;
+    let p0_rps = rows_per_sec(measured, p0_total).unwrap_or(f64::NAN);
+    let e0_rps = rows_per_sec(measured, e0_total).unwrap_or(f64::NAN);
+    let s0_rps = rows_per_sec(measured, s0_total).unwrap_or(f64::NAN);
+    println!(
+        "tier(P0_parse_bind): stmts={measured} min={:.3}ms median={:.3}ms rows_per_sec={p0_rps:.1}",
+        p0_min.as_secs_f64() * 1e3,
+        p0_summary.median.as_secs_f64() * 1e3
+    );
+    println!(
+        "tier(E0_typed_row_api): stmts={measured} min={:.3}ms median={:.3}ms rows_per_sec={e0_rps:.1}",
+        e0_min.as_secs_f64() * 1e3,
+        e0_summary.median.as_secs_f64() * 1e3
+    );
+    println!(
+        "tier(S0_sql_surface): stmts={measured} min={:.3}ms median={:.3}ms rows_per_sec={s0_rps:.1}",
+        s0_min.as_secs_f64() * 1e3,
+        s0_summary.median.as_secs_f64() * 1e3
+    );
+    for line in &stage_lines {
+        println!("{line}");
+    }
+    println!(
+        "stage(SUM_I1_I8): stmts=1 median={:.3}ms",
+        stage_sum.as_secs_f64() * 1e3
+    );
+    match e0_summary.median.checked_sub(stage_sum) {
+        Some(residual) => println!(
+            "residual(E0-SUM): median={:.3}ms (schema fetch / commit_boundary guard / abstraction overhead)",
+            residual.as_secs_f64() * 1e3
+        ),
+        None => println!(
+            "residual(E0-SUM): n/a (Σ(I1..I8) の中央値が E0 の中央値を上回った。独立計測どうしの比較のため測定ノイズにより逆転しうる)"
+        ),
+    }
+    match s0_summary.median.checked_sub(e0_summary.median) {
+        Some(diff) => println!(
+            "attribution(S0-E0, parse/bind/dispatch informational): median={:.3}ms (P0 direct measurement: {:.3}ms)",
+            diff.as_secs_f64() * 1e3,
+            p0_summary.median.as_secs_f64() * 1e3
+        ),
+        None => println!(
+            "attribution(S0-E0): n/a (S0 の中央値が E0 の中央値を下回った。独立計測どうしの比較のため測定ノイズにより逆転しうる)"
+        ),
+    }
+
+    println!("ingest_profile_bench: OK");
+}
+
+/// single モード 1 文分の合成入力（決定的に再生成する。メモリに保持しない）。
+struct SingleRow {
+    id: u64,
+    embedding: Vec<f32>,
+    body: String,
+}
+
+/// 文番号 `n`（0 起点）から 1 文分の入力を決定的に再生成する（P0/E0/S0/レプリカの
+/// 4 tier すべてが同一の `seed_base` から同一内容を再生成し、一致させる）。
+fn make_single_row(seed_base: u64, n: u64, dim: usize) -> SingleRow {
+    let mut rng = DeterministicRng::new(seed_base.wrapping_add(n));
+    SingleRow {
+        id: n + 1,
+        embedding: rng.next_vector(dim),
+        body: format!("ingest single stmt bench row {n}"),
+    }
+}
+
+/// single モードの規範形 `INSERT` 文を組み立てる（`docs/spec/04-behavior/
+/// sql-surface.md` SQL-10 の行形 `INSERT ... USING OPERATION_ID` 構文）。
+/// `id`・`op_label` はベンチ内部の `u64`／決定的な数値サフィックス付き固定語彙、
+/// `literal` は [`vector_literal`]（検証済み型 `VectorLiteral`）、`body` は
+/// [`make_single_row`] が生成する固定書式の文字列のみから構成し、外部・untrusted
+/// 入力を連結しない（coding-rust.md「SQL 文字列の組み立てに未検証入力を連結しない」）。
+fn single_stmt_sql(id: u64, literal: &str, body: &str, op_label: &str) -> String {
+    format!(
+        "INSERT INTO docs (id, embedding, body) VALUES ({id}, '{literal}', '{body}') USING OPERATION_ID '{op_label}'"
+    )
+}
+
+/// レプリカ 1 文分を `insert_typed_row_unchecked` と同順序（I1..I8）で再現する
+/// （single モード版。`run_replica_batch` のバッチ版と対をなす）。
+///
+/// production の `insert_typed_row_unchecked` はバッチ内 id 重複検出を持たない
+/// （1 文 1 行のため対象が存在しない）ため、I1 の内容は「VECTOR 列位置探索 ＋
+/// `values.get(vector_idx)` の参照 ＋ `validate_embedding_dim`」に読み替える
+/// （production では該当処理がスキーマ取得直後・encode 共有化前に行われる。
+/// `tenant.rs::insert_typed_row_unchecked` 参照）。
+fn run_replica_single(
+    db: &Database,
+    table_schema: &TableSchema,
+    row: &SingleRow,
+    n: u64,
+    mut stage_samples: Option<&mut StageSamples>,
+) {
+    // I1: VECTOR 列位置探索 ＋ validate_embedding_dim。
+    let t = Instant::now();
+    let vector_idx = table_schema
+        .columns
+        .iter()
+        .position(|c| matches!(c.ty, ColumnType::Vector(_)))
+        .expect("schema has a VECTOR column");
+    std::hint::black_box(vector_idx);
+    table_schema
+        .validate_embedding_dim(row.embedding.len())
+        .expect("validate_embedding_dim for I1");
+    record(&mut stage_samples, StageId::Precheck, t.elapsed());
+
+    // I2: begin_write。
+    let t = Instant::now();
+    let write_txn = db
+        .begin_write()
+        .expect("begin_write for replica single stmt");
+    record(&mut stage_samples, StageId::BeginWrite, t.elapsed());
+
+    // I5: encode（storage::encode_row 相当。行ごとに 1 回のみ。I3・I6 の双方が
+    // この結果を共有する。`run_replica_batch` の I5 と同じ設計）。
+    let t = Instant::now();
+    let metadata = encode_scalar_columns(
+        table_schema,
+        &[
+            Value::Vector(row.embedding.clone()),
+            Value::Text(row.body.clone()),
+        ],
+    )
+    .expect("encode_scalar_columns for I5");
+    let row_encoded = encode_row_reimpl(TENANT, false, &row.embedding, &metadata)
+        .expect("encode_row_reimpl for I5");
+    record(&mut stage_samples, StageId::Encode, t.elapsed());
+
+    // I3: content_hash（`for_typed_insert` 再実装。I5 のエンコード済みバイト列
+    // ではなく、生の embedding・非 VECTOR 列値から直接計算する契約
+    // （`content_hash_typed_insert_reimpl` ドキュメント参照）。
+    let t = Instant::now();
+    let hash = content_hash_typed_insert_reimpl(
+        row.id,
+        false,
+        &row.embedding,
+        &[("body", Some(row.body.as_str()))],
+    )
+    .expect("content_hash_typed_insert_reimpl for I3");
+    record(&mut stage_samples, StageId::ContentHash, t.elapsed());
+
+    // I4: 台帳記録。
+    let t = Instant::now();
+    let op_label = format!("ingest-single-replica-{n}");
+    {
+        let mut ledger_table = write_txn
+            .open_table(OP_LEDGER_TABLE)
+            .expect("open op_ledger table for I4");
+        let key = (TENANT, TABLE, op_label.as_str());
+        if ledger_table
+            .get(key)
+            .expect("read op_ledger for I4")
+            .is_some()
+        {
+            fail_closed(format!("unexpected duplicate op_ledger key for n={n}"));
+        }
+        ledger_table
+            .insert(key, ledger_entry_v2_reimpl(&hash).as_slice())
+            .expect("insert op_ledger entry for I4");
+    }
+    {
+        let mut last_op_table = write_txn
+            .open_table(LAST_OP_TABLE)
+            .expect("open last_op table for I4");
+        last_op_table
+            .insert((TENANT, TABLE), last_op_entry_reimpl(&op_label).as_slice())
+            .expect("insert last_op entry for I4");
+    }
+    record(&mut stage_samples, StageId::Ledger, t.elapsed());
+
+    // I6: redb insert（`insert_unique_row` 相当。戻り値が `None` であることを検査）。
+    let t = Instant::now();
+    {
+        let mut row_table = write_txn
+            .open_table(ROW_TABLE)
+            .expect("open user_rows/docs table for I6");
+        let prev = row_table
+            .insert((TENANT, row.id), row_encoded.as_slice())
+            .expect("insert row for I6");
+        if prev.is_some() {
+            fail_closed(format!(
+                "unexpected existing row for id={} (I6 uniqueness check)",
+                row.id
+            ));
+        }
+    }
+    record(&mut stage_samples, StageId::RedbInsert, t.elapsed());
+
+    // I7: 世代更新。
+    let t = Instant::now();
+    {
+        let mut gen_table = write_txn
+            .open_table(TABLE_GENERATION_TABLE)
+            .expect("open table_generation table for I7");
+        let current = gen_table
+            .get(TABLE)
+            .expect("read table_generation for I7")
+            .map(|v| v.value())
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .expect("table_generation counter overflow");
+        gen_table
+            .insert(TABLE, next)
+            .expect("insert table_generation for I7");
+    }
+    record(&mut stage_samples, StageId::GenerationBump, t.elapsed());
+
+    // I8: commit。
+    let t = Instant::now();
+    write_txn.commit().expect("commit for I8");
+    record(&mut stage_samples, StageId::Commit, t.elapsed());
 }
 
 /// E0: `insert_rows` 1 バッチ分を計測する。`op_id` はレプリカ側の台帳キーと
