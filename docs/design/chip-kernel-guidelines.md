@@ -1,7 +1,8 @@
 # チップ別カーネル設計指針と Rust stable での実現可能性
 
 - ステータス: 調査記録（Informational）。production コード無変更。toolchain
-  更新・intrinsics 導入方針の決定は #508 ADR（オーナー承認）が担う
+  更新・intrinsics 導入方針の決定は [#508 ADR](simd-intrinsics-adoption.md)
+  （オーナー承認）が担う
 - 対応: Issue #470（Phase 1 親 #456・ルート #455）
 - 前提: `crates/engine/src/isa.rs`・`crates/engine/src/gpu_batch.rs`・
   [`docs/design/knn-stage-profile.md`](knn-stage-profile.md)・
