@@ -801,7 +801,14 @@ fn gpu_backend_partial_topk_fractional_row_chunk_matches_cpu_oracle_when_gpu_ava
     // 複数チャンクへ分割されることを狙う（Top-k パイプライン非対応環境
     // では自動的に全量 readback 経路へ縮退するが、その場合も本テストの
     // 「CPU オラクルと一致する」というアサーション自体は変わらず有効）。
-    let tiny_budget_bytes = 512;
+    // codex 指摘対応（PR #578）: width=5・k_out=6 のとき
+    // `plan_partial_topk_chunk_rows` の 1 ワークグループぶん出力バイト数は
+    // 240 バイトであり、旧 budget_bytes=512 では chunk_rows が row_count
+    // （40）を上回ってしまい全行が 1 チャンクに収まっていた（チャンク間
+    // マージ・端数処理を検証できていなかった）。budget_bytes=300 では
+    // chunk_rows=15 となり 40 行が 3 チャンクへ分割される。
+    let tiny_budget_bytes = 300;
+    let stats_before = backend.stats();
     let hits = backend
         .batch_search_with_options_for_tests(
             &batch_queries,
@@ -812,6 +819,26 @@ fn gpu_backend_partial_topk_fractional_row_chunk_matches_cpu_oracle_when_gpu_ava
         )
         .expect("gpu batch_search should succeed once the device initialized");
     assert_eq!(hits.len(), fx.queries.len());
+
+    // 部分 Top-k パイプラインが利用可能な環境では、複数 dispatch（複数
+    // チャンク）に分割されたことを直接確認する（Top-k パイプライン非対応
+    // 環境では全量 readback へ縮退するため、その場合はこのアサーションを
+    // 免除する）。
+    let stats_after = backend.stats();
+    let partial_topk_dispatches =
+        stats_after.partial_topk_dispatches - stats_before.partial_topk_dispatches;
+    let full_readback_dispatches =
+        stats_after.full_readback_dispatches - stats_before.full_readback_dispatches;
+    if partial_topk_dispatches > 0 {
+        assert!(
+            partial_topk_dispatches > 1,
+            "expected multiple partial topk dispatches (chunked), got {partial_topk_dispatches}"
+        );
+    } else {
+        eprintln!(
+            "partial topk pipeline unavailable in this environment              (full_readback_dispatches={full_readback_dispatches}), skipping chunk count assertion"
+        );
+    }
 
     let simple_fx = Fixture {
         ids: fx.ids.clone(),
@@ -1117,5 +1144,33 @@ mod topk_readback_bit_identity {
             .expect("default f32 contrast batch_search should succeed once available");
         assert_eq!(default_hits.len(), 1);
         assert!(!default_hits[0].hits.is_empty());
+
+        // codex 指摘対応（PR #578）: 既定経路を 1 回呼んで空でないことを
+        // 確認するだけでは、f32 専用の内積処理を含む新パイプラインの選出・
+        // スコアが誤っていても検出できない。強制全量 readback 経路
+        // （`GpuF32ContrastBackend::batch_search_with_options_for_tests`）を
+        // 追加で呼び、両経路の (id, score.to_bits()) が一致することを確認する
+        // （`GpuBatchBackend` 側の `topk_readback_bit_identity` と同じ方針）。
+        let forced_hits = backend
+            .batch_search_with_options_for_tests(
+                &bq,
+                GpuSearchTestOptions {
+                    budget_bytes: 32 * 1024 * 1024,
+                    force_full_readback: true,
+                },
+            )
+            .expect("forced full-readback f32 contrast batch_search should succeed");
+        assert_eq!(forced_hits.len(), 1);
+
+        let id_score_bits = |hits: &[engine::kernel::SearchHit]| -> Vec<(u64, u32)> {
+            let mut v: Vec<(u64, u32)> = hits.iter().map(|h| (h.id, h.score.to_bits())).collect();
+            v.sort_by_key(|(id, _)| *id);
+            v
+        };
+        assert_eq!(
+            id_score_bits(&default_hits[0].hits),
+            id_score_bits(&forced_hits[0].hits),
+            "f32 contrast default path and forced full-readback path must match bit-identically"
+        );
     }
 }

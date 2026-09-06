@@ -1979,8 +1979,21 @@ impl GpuF32ContrastBackend {
     }
 }
 
-impl BatchBackend for GpuF32ContrastBackend {
-    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+impl GpuF32ContrastBackend {
+    /// [`GpuBatchBackend::batch_search_with_budget_and_mode`] の f32 対照
+    /// 経路版（Issue #536・PR #578 codex 指摘対応）。`batch_search`（trait
+    /// 実装。既定 budget・既定の readback 方式選択）と
+    /// [`Self::batch_search_with_options_for_tests`]（テスト・ベンチ専用に
+    /// budget・`force_full_readback` を注入する経路）の両方から呼ばれる
+    /// 内部共通経路にすることで、既定経路と強制全量 readback 経路が実 GPU
+    /// dispatch を通じて完全に同一の可視性判定・スコア計算パスを通ることを
+    /// 保証する（[`GpuBatchBackend`] と同じ方針）。
+    fn batch_search_with_budget_and_mode(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+        force_full_readback: bool,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
         if self.device_lost.load(Ordering::SeqCst) {
             return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
                 "gpu device lost".to_string(),
@@ -2034,11 +2047,36 @@ impl BatchBackend for GpuF32ContrastBackend {
             &target,
             query_stride,
             RunTiledBatchSearchOptions {
-                budget_bytes: GPU_SCORE_BUFFER_BUDGET_BYTES,
-                force_full_readback: false,
+                budget_bytes,
+                force_full_readback,
                 stats: &self.stats,
             },
         )
+    }
+
+    /// **テスト・ベンチ専用**（Issue #536・PR #578 codex 指摘対応）。
+    /// [`GpuBatchBackend::batch_search_with_options_for_tests`] の f32
+    /// 対照経路版で、「常に全量 readback 経路を使う」強制フラグを注入し、
+    /// f32 対照経路でも既定経路と強制全量 readback 経路の結果が実 GPU
+    /// dispatch 経由でビット同一であることを結合テストから検証できる
+    /// ようにする（`tests/gpu_batch.rs`）。
+    #[cfg(feature = "bench-internals")]
+    pub fn batch_search_with_options_for_tests(
+        &self,
+        queries: &[BatchQuery<'_>],
+        options: GpuSearchTestOptions,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(
+            queries,
+            options.budget_bytes,
+            options.force_full_readback,
+        )
+    }
+}
+
+impl BatchBackend for GpuF32ContrastBackend {
+    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget_and_mode(queries, GPU_SCORE_BUFFER_BUDGET_BYTES, false)
     }
 }
 
@@ -2478,7 +2516,17 @@ fn wait_and_read_buffer(
         let view = slice.get_mapped_range().map_err(|e| {
             BatchBackendError::TransferFailed(format!("get_mapped_range failed: {e}"))
         })?;
-        view.to_vec()
+        // codex 指摘対応（PR #578）: `view.to_vec()` はマップ領域と同サイズの
+        // ヒープ確保に失敗すると abort し、CORE-8 の CPU 縮退（呼び出し元が
+        // `Err` を受け取って `FallbackBatchEngine` へ移る経路）へ戻れない。
+        // `try_reserve_bytes` でフォールブルに確保してから `copy_from_slice`
+        // する（[`f32_vec_from_ne_bytes`] 等と同じ fail-closed 契約）。
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(view.len()).map_err(|_| {
+            BatchBackendError::TransferFailed("readback buffer allocation failed".to_string())
+        })?;
+        buf.extend_from_slice(&view);
+        buf
     };
     readback_buffer.unmap();
     Ok(bytes)
