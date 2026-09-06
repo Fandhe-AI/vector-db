@@ -81,6 +81,17 @@ fn main() {
     };
 
     let info = adapter.get_info();
+
+    // `gpu_batch.rs::init_gpu_context` と同じ契約: lavapipe 等のソフトウェア
+    // adapter は「GPU 搭載環境」の代替にならないため拒否する。これを省くと
+    // GPU 非搭載でもソフトウェア adapter が使える環境で本ツールが正常終了
+    // してしまい、冒頭コメントが謳う「GPU 非搭載環境では非 0 終了」の契約に
+    // 反する（本番経路と診断ツールで adapter 受理条件を一致させる）。
+    if info.device_type == wgpu::DeviceType::Cpu {
+        eprintln!("error: adapter is a software (CPU) implementation");
+        std::process::exit(1);
+    }
+
     let features = adapter.features();
     let limits = adapter.limits();
 

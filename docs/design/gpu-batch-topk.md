@@ -130,9 +130,19 @@ subgroup 組み込み（`subgroupMax`／`subgroupBallot`／`subgroupShuffleXor`�
   サイズ)` 件を `(score, slot)` のペアとして降順で出力し、ホストは
   `Q × ワークグループ数 × K_OUT` 件だけを readback して既存
   `TopKSelector` へ push する（`finalize_gpu_hits` は無変更）。
-- 全順序は「score 降順、同点は slot 昇順」。比較述語は
-  `a.score > b.score || (a.score == b.score && a.slot < b.slot)` とし、
-  `MinHeapItem::cmp` と一致させる。
+- 全順序は「score 降順、同点は slot 昇順」。ただし `MinHeapItem::cmp`
+  が使う `f32::total_cmp` は IEEE 754 の `==`/`>` とは異なり `-0.0` と
+  `+0.0` を区別する全順序（`total_cmp` は `-0.0 < +0.0`）を定めるため、
+  素朴な `a.score > b.score || (a.score == b.score && ...)` は符号付き
+  ゼロを同点として扱ってしまい `MinHeapItem::cmp` と一致しない。GPU 側
+  (WGSL) には `total_cmp` 相当の組み込みが無いため、各候補のスコアを
+  `total_cmp` と同じ単調な符号付き整数キー（IEEE754 ビットパターンに
+  対し、符号ビットが立っていれば全ビット反転、立っていなければ符号
+  ビットのみ立てる変換）へ変換したうえで整数比較する。比較述語は
+  `key(a.score) > key(b.score) || (key(a.score) == key(b.score) &&
+  a.slot < b.slot)` とし、この `key` 変換を CPU 側の `total_cmp` と
+  ビット単位で一致させることで、GPU 側の部分ソートと
+  `MinHeapItem::cmp` を符号付きゼロも含めて完全に一致させる。
 - 番兵（`i >= row_count` のレーン・非有限スコア）は `score = 負の無限大`・
   `slot` を無効値とし、ホスト側で無効値または非有限スコアを skip する
   （`TopKSelector::push` の非有限無視と二重防御になる）。
