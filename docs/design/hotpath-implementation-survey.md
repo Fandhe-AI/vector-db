@@ -198,7 +198,7 @@ Top-k を取りこぼしうる）。したがって量子化が適用できる�
 | fieldnorm 256 段ロッシー量子化 | tantivy `fieldnorm/code.rs` | 1 byte・256 段の固定テーブル | 既検討・不採用（Issue #391）。ビット一致契約違反そのものが理由。本リポは非ロッシーな厳密クラス表を採用済み | MIT |
 | BM25 tf 事前計算テーブル | tantivy `query/bm25.rs::compute_tf_cache` | fieldnorm_id 0..256 についてスコア項を事前計算 | 既採用（Issue #391 の `len_classes`/`doc_len_class`）。本リポは非ロッシーで段数を実際に出現する文書長の個数まで上げた厳密版であり、決定性契約への適合はより厳密 | MIT |
 | Top-k 閾値の走査側への伝播 | tantivy `Weight::for_each_pruning` | コールバックが新閾値を返しスキップに使う | 条件付き（優先度低）。等号を含む形なら決定性契約と両立し得るが、本リポは既に 1 パス posting 走査（Issue #392）でスキップ余地が小さい | MIT |
-| DAAT（アキュムレータを持たない） | tantivy `term_scorer.rs`／`BufferedUnionScorer` | `DocSet` のみ実装し OR は doc 昇順マージでその場加算。N 長配列の確保・ゼロ初期化が一切ない | 条件付き（§9-#6 の軽量版を推奨）。本リポは `score_by_postings` で毎クエリ N 長 `Vec<f64>` を確保・ゼロ初期化する。DAAT 完全移行は構造変更コストが大きいが「可視集合サイズで確保する／`touched` のみクリアして使い回す」だけで解消でき、スコアはビット一致のまま | MIT |
+| DAAT（アキュムレータを持たない） | tantivy `term_scorer.rs`／`BufferedUnionScorer` | `DocSet` のみ実装し OR は doc 昇順マージでその場加算。N 長配列の確保・ゼロ初期化が一切ない | 条件付き（§9-#6 の軽量版を Issue #546 で実装済み）。DAAT 完全移行（本手法そのもの）は構造変更コストが大きいため引き続き不採用のまま、`score_by_postings` の `acc: Vec<f64>` を索引の寿命内で再利用するスクラッチプールへ置換し「毎クエリ N 長確保・ゼロ初期化」を解消した（詳細は `docs/design/hybrid-rrf-latency-breakdown.md`「Issue #546」節参照）。スコアはビット一致のまま | MIT |
 | `max_next_weight` による posting 要素単位 pruning | qdrant `sparse/index/search_context.rs` | 後方要素の重み最大値を前方へ伝播し安全な区間だけシーク | 不採用。BM25 ではなく非負重み疎ベクトル（SPLADE 等）前提。block-max WAND と同型の縮約契約懸念を抱え実装コストも高い | Apache-2.0 |
 | mmap 圧縮 inverted index | qdrant `InvertedIndexCompressed{ImmutableRam,Mmap}` | — | 不採用。本リポは redb ＋世代キャッシュ方式で完結しており別レイヤ | Apache-2.0 |
 
@@ -249,7 +249,7 @@ Qdrant HNSW に劣後する:
 | 3c | hybrid 密側再取得の破棄候補ヒープ保持化（pgvector 型） | 中。3a/3b とは別経路。SCALAR 事前フィルタ付き DISTANCE 経路には再取得ループ自体が存在しない（Issue #410: `masked_short` は構造的に到達不能）ためこの施策は `hnsw_subset` 退行には効かない | 中 | 不要 | 不要 | 既起票 #503 |
 | 4 | `repair_reachability` の並列化 | 中（実測根拠あり）。HNSW 構築の 8→12 スレッド頭打ちの主因（12 スレッド時に total の 39.4% を占める単一スレッド後始末段。usearch に対し 1.24〜1.26x 遅い唯一の敗因。探索は既に usearch より速い：65.5µs vs 76.5µs） | 中 | 不要 | 不要 | 既起票 #446 ツリー（#447〜#450。並列化本体は #449） |
 | 5 | HNSW 隣接リストの CSR 化 | 中（実測根拠なし・構造推論）。`Vec<Vec<u32>>` のノード×レベル分のヒープ確保・間接参照を単一 `Vec<u32>`+offsets へ | 中 | 不要 | 不要 | 既起票 #492 |
-| 6 | BM25 アキュムレータを可視集合サイズで確保 | 小（N と可視率に依存）。`score_by_postings` の `vec![0.0; N]` を実作業量 O(可視ヒット数) に合わせる。RLS で可視集合が小さいテナントほど効く。スコアはビット一致のまま | 小 | 不要 | 不要 | 既起票 #545（Phase 6） |
+| 6 | BM25 アキュムレータを可視集合サイズで確保 | 小（N と可視率に依存）。`score_by_postings` の `vec![0.0; N]` を実作業量 O(可視ヒット数) に合わせる。RLS で可視集合が小さいテナントほど効く。スコアはビット一致のまま | 小 | 不要 | 不要 | #546 で実装（索引寿命内の再利用バッファ方式。実測は #547） |
 | 7 | `search_layer` への prefetch 導入 | 中。hnswlib 型ソフトウェアパイプライン。新規 `unsafe` ゼロで実装可能 | 小〜中 | 不要 | 不要 | 既起票 #489 |
 | 8 | f16 常駐＋f32 再スコア（ANN opt-in 経路限定） | 中。移動バイト半減。新規 `unsafe` ゼロ。候補集合が変わるため既定 brute-force 経路には適用不可 | 中 | 不要 | 不要 | 既起票 #513 |
 | 9 | visited のサイズ閾値切替（密ビットマップ ↔ `HashSet`） | 小〜中。可視カーディナリティが索引ノード数に対し極小のとき全ノード分の確保・走査を回避 | 小 | 不要 | 不要 | 既起票 #496 |
