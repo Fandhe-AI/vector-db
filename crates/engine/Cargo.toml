@@ -367,3 +367,21 @@ test = false
 name = "scan_stage_profile_bench"
 harness = false
 test = false
+
+[[bench]]
+# Issue #469（親 #456・ルート #455。ポインタ: CORE-9／CORE-10／CORE-16／
+# TASK-132）の実測入口。本開発環境（QEMU 仮想 CPU）では Phase 4 チップ最適
+# カーネルの採否判定に必要な実測ができないため、オーナー実機（Apple M／AMD
+# Zen 4・5／Intel）での手動計測を 1 コマンドで回せるようにするオーケストレータ。
+# `dot_kernel_bench`・`knn_profile_bench`・`feature_bench`（dim=128／768）を
+# 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・
+# 実行時検出 ISA・per-run 生データ・min/median/参照区間帯を summary.json へ
+# 出力する。spec 由来の pass/fail 閾値は持たない情報提供専用ベンチのため
+# `.github/workflows/*` へは配線しない。harness = false / test = false は
+# 他ベンチと同一方針。`make bench-chip`（Makefile）から実行する。判定ロジック
+# 自体（時間非依存）は harness/chip.rs にあり tests/chip_bench_accept.rs で
+# make ci 側から回帰検証する。結果記録テンプレートは
+# `docs/design/chip-kernel-guidelines.md` §7 参照。
+name = "chip_bench"
+harness = false
+test = false

@@ -323,6 +323,38 @@ GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README
 
 `make bench-scan-stage-profile`（`crates/engine/benches/scan_stage_profile_bench.rs`）は、`docs/design/crossdb-bench.md` で self が最劣後する `agg_count`／`rls_isolation`／`vector_knn_where` の redb 全行走査・ヘッダデコード・RLS 判定（`PolicyContext::is_visible`＋TABLE-12 キー/ヘッダ整合検査）・dim/metadata デコード・`WHERE` 述語評価・arena 複製の段別内訳を切り分けます。`BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行・4＝100,000 行。1 プロセス = 1 規模点）で規模、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds/scale パース・段間差分・ノイズ帯判定・整合性検証）は `crates/engine/tests/scan_stage_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計・後続 Issue（#477・#471）への帰属分析の詳細は `docs/design/scan-stage-profile.md` を参照してください。
 
+### チップ別カーネルの実測手順（Issue #469）
+
+`make bench-chip`（`crates/engine/benches/chip_bench.rs`）は、`bench-dot-kernel`・`bench-knn-profile`・`feature_bench`（`BENCH_FEATURE_DIM=128`／`768`）の 4 ワークロードを 1 ワークロード = 1 子プロセスとしてラウンドロビン交互計測し、CPU 情報・実行時検出 ISA・per-run 生データ・min/median・参照区間帯を `summary.json` へ出力します。
+
+> [!IMPORTANT]
+> `.github/workflows/*` には配線しません。`bench-tier`（TASK-116）と同じ理由（AGENTS.md「CI・ワークフローの改変（P1）」）で、Phase 4（チップ最適カーネル）の採否判定に必要な AVX-512／NEON／実キャッシュ階層は本開発環境（QEMU 仮想 CPU）では実測できず、オーナー実機（Apple M／AMD Zen 4・5／Intel）での手動実行が正式な入口です。
+
+前提: Linux／aarch64 Linux は `/proc/cpuinfo`（追加ツール不要）、macOS は Xcode Command Line Tools（`cargo`）と `sysctl`（標準搭載）のみで動作します。`contrast-bench` feature は使わないため C++17 コンパイラは不要です。
+
+実行例:
+
+- `make bench-chip`（既定 5 ラウンド・全 4 ワークロード）
+- `BENCH_CHIP_ROUNDS=1 BENCH_CHIP_WORKLOADS=dot_kernel make bench-chip`（スモーク実行。`BENCH_CHIP_ROUNDS` が `docs/design/benchmark-judgement-policy.md` の最小ペア数〔5〕未満の場合、`summary.json` の `meets_policy_min_rounds` が `false` になり参考値であることを自己ラベルします）
+- `BENCH_DEDICATED_ENV=1 make bench-chip`（専有環境自己申告。他の `bench-*` ターゲットと同じ自己申告のみで自動検出はしません）
+
+env 変数（すべて fail-closed パース。不正値は非ゼロ終了）:
+
+| 変数 | 既定 | 内容 |
+| ---- | ---- | ---- |
+| `BENCH_CHIP_ROUNDS` | 5 | ラウンド数（1〜50） |
+| `BENCH_CHIP_WORKLOADS` | 全 4 種 | `dot_kernel,knn_profile,feature_128,feature_768` のカンマ区切り部分集合 |
+| `BENCH_CHIP_OUT_DIR` | `target/bench-chip/<unix-ts>` | 出力先（既存の `summary.json` があれば上書き拒否） |
+| `BENCH_DEDICATED_ENV` | 未設定 | `1` で専有環境自己申告 |
+
+`BENCH_FEATURE_ENGINE`・`BENCH_KNN_PROFILE_ENGINE` 等、上記以外の `BENCH_*` env は親プロセスの環境をそのまま子プロセスへ継承します（`BENCH_FEATURE_DIM` のみ `feature_128`／`feature_768` ワークロードが上書きします）。
+
+出力は `<BENCH_CHIP_OUT_DIR>/summary.json`（CPU モデル名・関心 ISA フラグ・キャッシュ容量・実行時検出フラグ・build 情報・ラウンドごとの per-run ログパス・メトリクスごとの `values`／`min`／`median`／`max`／`reference_band_pct`）と、各 (round, workload) ごとの `round<N>_<workload>.{stdout,stderr}.log` です。すべて `<BENCH_CHIP_OUT_DIR>` からの相対パスで記録し、絶対パス・ホスト名・ユーザー名は含みません。本開発環境（QEMU・12 vCPU）での既定 5 ラウンド完走は数分程度でした（実測は環境依存）。
+
+**before/after の交互比較手順**（`docs/design/dot-kernel-multi-accumulator.md`「再現手順」と同型）: 変更前後のコミットをそれぞれ別の worktree（`CARGO_TARGET_DIR` を分離）でビルドし、`BENCH_CHIP_ROUNDS=1 BENCH_CHIP_OUT_DIR=<...>/pairN/{before,after}` を N ≥ 5 ペア交互実行してください。各 `summary.json` の値列を `docs/design/chip-kernel-guidelines.md` §7 の結果記録テンプレートへ転記し、min-of-N・median・ratio・参照区間帯を記録します。
+
+結果の記録先・公開境界: 実測値そのものは public な docs・Issue へ記録可能です（オーナー判断 2026-08-29・[spec-confidentiality](.claude/rules/spec-confidentiality.md)）。spec 由来の閾値は本リポジトリには記載しません。結果記録テンプレート・チップ別空テンプレート・`summary.json` キー一覧は `docs/design/chip-kernel-guidelines.md` §7 を参照してください。
+
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。
