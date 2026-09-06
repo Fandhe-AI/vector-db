@@ -1,7 +1,9 @@
 # 簡易クエリ応答の単一バッファ組み立て・1 回 write 送出
 
-- ステータス: Proposed（実装済み・共有環境参考値あり。専有環境再実測はオーナー作業。
-  `docs/design/benchmark-judgement-policy.md` §5 の環境適格性区分に従う）
+- ステータス: Proposed（実装済み・共有環境参考値あり。受け入れ条件 (a) は
+  `docs/design/benchmark-judgement-policy.md` §3・§4 の必須計測プロトコルを
+  充足しておらず評価保留。専有環境再実測はオーナー作業。同 §5 の環境適格性
+  区分に従う）
 - 対応: Issue #481（`perf(wire): DataRow 群を単一バッファへ組み立てて 1 回の write
   で送出する`）。依存: Issue #463（`docs/design/knn-wire-stage-profile.md`）
 - 前提: `docs/spec/04-behavior/wire-protocol.md` WIRE-1（ポインタ）
@@ -104,17 +106,17 @@ write_ready_for_query` にのみ存在し、`ResponseBuffer` へ他フレーム�
   および応答合計が `MAX_RESPONSE_BUFFER_BYTES`（1 MiB）を跨ぐケース
   （約 2 MiB）でも分割送出を経て全行が届くことを確認。
 
-## 実測（受け入れ条件 (a)）
+## 参考実測（規約未充足・受け入れ条件 (a) の評価は保留）
 
 `crates/wire-server/tests/wire_bulk_response.rs::
 wire_bulk_select_latency_measurement`（`#[ignore]`・手動専用）で、
 `bulk_knn_k1000` 相当（`id, body`・本文約 200B・k=1,000・全件同一近傍方向の
 25,000 行規模を模した 1,000 行コーパス）の wire 往復レイテンシを before/after
-交互 3 ペア実測した（`cargo test --release -p wire-server --test
+3 ペア実測した（`cargo test --release -p wire-server --test
 wire_bulk_response -- --ignored --nocapture wire_bulk_select_latency_measurement`。
 各ペア 20 往復・中央値採用。before は本 PR の `crates/wire-server/src/` 変更のみ
 `git stash` で除去した状態＝依存 Issue #463 時点の `origin/main`
-`c636a81`。after は本 PR の作業ブランチ）。
+`c636a81`。after は本 PR の作業ブランチの未コミット作業ツリー）。
 
 | ペア | before median (us) | after median (us) | before min (us) | after min (us) |
 | --- | --- | --- | --- | --- |
@@ -124,20 +126,57 @@ wire_bulk_response -- --ignored --nocapture wire_bulk_select_latency_measurement
 
 median の ratio（after/median ÷ before/median）はいずれのペアも約 0.685
 （3 ペアとも 2164〜2171us で安定、before も 3161〜3164us で安定）で、
-`docs/design/benchmark-judgement-policy.md` の固定 ±5% 帯を明確に超える改善
-（約 -31%）。参照区間（本 PR で変更しない SQL 表層・engine 側の処理）の
-run-to-run 幅は before/after 双方の中央値がほぼ同一水準で安定していることから
-（3 ペアの median 幅は before 3161〜3164us・after 2164〜2171us といずれも 1%
-未満に収まる）、ノイズ帯より十分大きい差分と判断する。
+`docs/design/benchmark-judgement-policy.md` §4 の固定相対帯 ±5% は明確に
+超える（`classify_change` 上は `Improved`、約 -31%）。
+
+**ただし本節の計測は `benchmark-judgement-policy.md` の必須プロトコルを
+充足しておらず、受け入れ条件 (a) の評価は保留とする**（規約は「規約を満たす
+計測を整備するか、未充足を明示して評価を保留する」ことを求めており、後者を
+選択した）。未充足の項目は次のとおり。
+
+- **§3（計測プロトコル）**:
+  - ペア数が 3 で、必須の `N ≥ 5` を満たさない。
+  - 各ペアの生データは 20 往復の中央値・最小値のみを保持し、20 回の
+    per-run 値列そのものは記録・保存していない（事後の再判定ができない）。
+  - after 側の計測対象は本 PR の作業ブランチの**未コミット作業ツリー**であり、
+    再現可能な commit hash を記録していない（before の `c636a81` も
+    `git stash` による差分除去であって、クリーンな checkout ではない。
+    「ビルド条件の統一」の観点でも申し送り事項とする）。
+  - `lscpu` の命令セットフラグ・`nproc`・各 run 時点の `loadavg`・同時実行
+    プロセスの有無・`BENCH_DEDICATED_ENV` の設定有無を記録していない。
+- **§4（ノイズ帯の定義）**:
+  - 追加ハーネスはクエリ送出〜`ReadyForQuery`（＝本 PR の変更を含む対象区間
+    そのもの）のみを計時しており、**本 PR で変更しない区間（参照区間）を
+    独立に計測していない**。上記「median の ratio」段落より前の版では
+    対象区間自身の中央値の安定度（3164〜3164us 等）を参照区間の代用として
+    ノイズ帯を推定していたが、これは §4 が定義する「変更を含まない参照区間の
+    run-to-run 幅」ではないため撤回する。
+  - 実測帯（`reference_band`）が未算出のため、§4 が要求する「固定相対帯・
+    実測帯の両方を超えること」を判定できない。固定相対帯（約 -31%）のみが
+    判明している状態であり、実測帯側は「未計測」として扱う。
 
 計測環境: 共有 QEMU 開発環境（`QEMU Virtual CPU version 2.5+`・12 vCPU）。
 `docs/design/benchmark-judgement-policy.md` §5 の環境適格性区分に従い、本節の
-数値は**参考値**として記録する。専有環境（`BENCH_DEDICATED_ENV=1` 相当）での
-再実測・本 ADR の Accepted 判定はオーナー作業として申し送る。
+数値は**参考値**として記録する（同区分の表のとおり、共有 QEMU 環境は
+「perf 動機の production 変更の採用（Accepted）」の採否根拠には**不可**であり、
+上記の規約未充足を解消しても本節単独では Accepted 判定の根拠にならない）。
 
 行数比例のシステムコール削減という構造的な改善（k=1,000 なら 1,003 回の
 `write_all` → 応答合計が 1 MiB 以下なら 1 回）は環境に依存しない設計上の効果
-であり、共有環境の実測もこれと整合する方向（約 31% 短縮）を示している。
+であり、共有環境の参考実測もこれと整合する方向（約 31% 短縮）を示しているが、
+上記のとおり規約上の実測帯判定・N≥5 ペアでの裏付けは行えていない。
+
+再実測（オーナー作業）は次を満たすこと:
+
+- before/after ともに `git stash` ではなくクリーンな commit hash から
+  ビルドし、両者の hash を記録する。
+- 交互 5 ペア以上・各ペアの 20 往復 per-run 値列を保持する。
+- 参照区間として、本 PR で変更しない区間（例: 同一セッションでの `SET`
+  応答〔`CommandComplete` + `ReadyForQuery` の 2 write。本 PR ではスコープ外
+  として無変更〕の wire 往復、または SQL 表層・engine 側処理のみを計時する
+  区間）を独立に計測し、`reference_band` を算出する。
+- `lscpu` 命令セットフラグ・`nproc`・各 run の `loadavg`・同時実行プロセスの
+  有無・`BENCH_DEDICATED_ENV` の設定有無を記録する。
 
 ## スコープ外・申し送り
 
