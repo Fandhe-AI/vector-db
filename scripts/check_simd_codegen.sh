@@ -23,8 +23,9 @@
 #   2. `cargo rustc --release -p engine --lib -- --emit asm` を専用
 #      `CARGO_TARGET_DIR` でビルドし、生成された単一の `.s` ファイルから
 #      各カーネル関数のシンボルを mangled 名（legacy/v0 両対応）で解決する。
-#   3. 関数本体（ラベル行 〜 `.Lfunc_end`）を抽出し、禁止命令（要素ごと挿入）
-#      が 0 件・広幅 FMA（非 vacuous 検査）が 1 件以上であることを確認する。
+#   3. 関数本体（ラベル行 〜 対象シンボルを参照する `.size` ディレクティブ
+#      直前）を抽出し、禁止命令（要素ごと挿入）が 0 件・広幅 FMA（非 vacuous
+#      検査）が 1 件以上であることを確認する。
 #
 # `--self-test` は検査ロジック自体の回帰テスト。cargo を使わず `rustc -O
 # --crate-type lib --emit asm` で用意した fixture に対し、pass/fail/ERROR の
@@ -103,35 +104,37 @@ check_asm_file() {
     local label_lineno
     label_lineno="$(printf '%s\n' "${label_lines}" | head -n1 | cut -d: -f1)"
 
-    # ラベル行の次行から最初の `.Lfunc_end<N>:` までを関数本体として抽出する。
-    # awk 側で `exit` して早期に標準入力を閉じると、`tail` がまだ書き込み中の
-    # パイプが壊れて SIGPIPE（終了コード 141）を受け取り、`pipefail` ＋
-    # `set -e` の下でスクリプト全体が異常終了してしまう（マーカー以降も
-    # フラグで抑制するだけにして最後まで読み切ることで回避する）。
+    # ラベル行の次行から、対象シンボルを参照する `.size` ディレクティブ
+    # （LLVM が各関数の直後に `.Lfunc_end<N>:` に続けて出力する
+    # `.size <symbol>, .Lfunc_end<N>-<symbol>`）までを関数本体として抽出する。
     #
-    # `.Lfunc_end` が見つからず EOF まで到達した場合、awk は単に `stop` が
-    # 立たないまま最後まで出力するため、body が空になるとは限らない（別関数の
-    # 本体まで跨いで抽出してしまい、その中の広幅 FMA を誤って対象関数の
-    # ものとしてカウントする恐れがある。fail-closed 契約に反する）。
-    # そこでマーカーを実際に検出できたかどうかを END ブロックで明示的な
-    # 番兵行として出力し、body の中身とは独立に判定する。
-    local raw
-    raw="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | awk '
-      /^\.Lfunc_end[0-9]+:/ { stop = 1; found = 1 }
-      !stop { print }
-      END { if (found) print "__SIMD_CODEGEN_FUNC_END_FOUND__"; else print "__SIMD_CODEGEN_FUNC_END_MISSING__" }
+    # 単純に「次に現れる `.Lfunc_end[0-9]+:` まで」を境界にすると、対象関数
+    # 自身の `.Lfunc_end` が何らかの理由で欠落していた場合に、後続関数の
+    # `.Lfunc_end` を対象関数のものと取り違えて境界採用してしまい、後続関数
+    # の命令列（広幅 FMA を含みうる）を対象関数の本体として誤カウントし
+    # fail-open な誤 PASS を招く（codex-review P1 指摘）。`.size` ディレクティブ
+    # は対象シンボルの完全一致（ハッシュ付き mangled 名込み）を伴うため、これを
+    # 境界確定の拠り所にすることで「後続関数の終了マーカーへの誤合流」を
+    # 構造的に排除する（`index()` によるリテラル部分文字列照合のため、
+    # mangled 名に含まれる `.`/`$` を正規表現メタ文字としてエスケープする
+    # 必要が無い）。
+    local symbol
+    symbol="$(printf '%s\n' "${label_lines}" | head -n1 | cut -d: -f2-)"
+    symbol="${symbol%:}"
+
+    local size_lineno
+    size_lineno="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | awk -v sym="${symbol}" '
+      index($0, ".size") > 0 && index($0, sym ",") > 0 { print NR; exit }
     ')"
 
-    local sentinel
-    sentinel="$(printf '%s\n' "${raw}" | tail -n1)"
-    local body
-    body="$(printf '%s\n' "${raw}" | sed '$d')"
-
-    if [ "${sentinel}" != "__SIMD_CODEGEN_FUNC_END_FOUND__" ]; then
-      echo "ERROR: kernel '${kernel}': .Lfunc_end marker not found before EOF (fail-closed: cannot bound function body; refusing to count instructions that may belong to a different function)" >&2
+    if [ -z "${size_lineno}" ]; then
+      echo "ERROR: kernel '${kernel}': .size directive for symbol not found before EOF (fail-closed: cannot bound function body; refusing to count instructions that may belong to a different function)" >&2
       overall_status=1
       continue
     fi
+
+    local body
+    body="$(tail -n "+$((label_lineno + 1))" "${asm_file}" | head -n "$((size_lineno - 1))" | grep -vE '^\.Lfunc_end[0-9]+:' || true)"
 
     if [ -z "${body}" ]; then
       echo "ERROR: could not extract function body for kernel '${kernel}' (empty function body; fail-closed)" >&2
@@ -348,14 +351,15 @@ EOF
     fi
   fi
 
-  # ERROR fixture: `.Lfunc_end` マーカーが対象関数のシンボル解決後に一度も
-  # 出現しない（EOF まで読み切っても見つからない）ケース。マーカー不在を
-  # body の空/非空とは独立に検出できることを固定する（codex-review P1・
-  # Cursor Bugbot 指摘: awk がマーカー未検出でも本文を返すため、別関数の
-  # 命令列を対象関数のものとして誤カウントしうる fail-open だった）。
-  # pass fixture の `.s` からラベル行は残しつつ `.Lfunc_end` 行以降を丸ごと
-  # 除去し、「関数本体の途中で切れていて `.Lfunc_end` に到達しない」状態を
-  # 再現する。
+  # ERROR fixture: `.size` ディレクティブ（対象シンボルの完全一致で境界を
+  # 確定する拠り所）が対象関数のシンボル解決後に一度も出現しない（EOF まで
+  # 読み切っても見つからない）ケース。境界不在を body の空/非空とは独立に
+  # 検出できることを固定する（codex-review P1・Cursor Bugbot 指摘: 旧実装は
+  # 単純な `.Lfunc_end` マーカーの有無だけを見ており、マーカー未検出でも
+  # 本文を返すため別関数の命令列を対象関数のものとして誤カウントしうる
+  # fail-open だった）。pass fixture の `.s` からラベル行は残しつつ
+  # `.Lfunc_end` 行以降（`.size` ディレクティブを含む）を丸ごと除去し、
+  # 「関数本体の途中で切れていて境界に到達しない」状態を再現する。
   awk '
     /^\.Lfunc_end[0-9]+:/ { exit }
     { print }
@@ -366,9 +370,37 @@ EOF
     cat "${tmp}/out_no_end.log" >&2
     failed=1
   else
-    if ! grep -q "\.Lfunc_end marker not found" "${tmp}/out_no_end.log"; then
+    if ! grep -q "\.size directive for symbol not found" "${tmp}/out_no_end.log"; then
       echo "FAIL: missing-.Lfunc_end case did not report the expected ERROR reason" >&2
       cat "${tmp}/out_no_end.log" >&2
+      failed=1
+    fi
+  fi
+
+  # ERROR fixture（codex-review P1 の核心シナリオ）: 対象関数自身の
+  # `.Lfunc_end`／`.size` が欠落した状態のまま、直後に「広幅 FMA を持つ別の
+  # 関数」の完全な本体（自身の `.Lfunc_end`／`.size` 込み）が連結されている
+  # ケース。旧実装（単純に「次に現れる `.Lfunc_end[0-9]+:` まで」を境界と
+  # する方式）では、後続関数の `.Lfunc_end` を対象関数のものと誤認して境界
+  # 採用し、対象関数自体は広幅 FMA を持たないにもかかわらず後続関数の広幅
+  # FMA を巻き込んで非 vacuous 検査を誤って PASS させてしまう
+  # （fail-open）。新実装は対象シンボルの `.size` ディレクティブの完全一致
+  # を境界確定の拠り所とするため、対象シンボルの `.size` が現れないこの
+  # ケースは ERROR（fail-closed）として拒否されなければならない。
+  awk '
+    /^\.Lfunc_end[0-9]+:/ { exit }
+    { print }
+  ' "${tmp}/fail_no_wide_fma.s" >"${tmp}/no_end_truncated_scalar.s"
+  cat "${tmp}/no_end_truncated_scalar.s" "${tmp}/pass_set_contig.s" >"${tmp}/cross_function_leak.s"
+
+  if check_asm_file "${tmp}/cross_function_leak.s" 7fixture dot_scalar_only >"${tmp}/out_cross_leak.log" 2>&1; then
+    echo "FAIL: cross_function_leak fixture expected ERROR (fail-closed; must not adopt a later function's .Lfunc_end/wide FMA as the target's own) but check_asm_file passed" >&2
+    cat "${tmp}/out_cross_leak.log" >&2
+    failed=1
+  else
+    if ! grep -q "\.size directive for symbol not found" "${tmp}/out_cross_leak.log"; then
+      echo "FAIL: cross_function_leak fixture did not report the expected .size-boundary ERROR reason" >&2
+      cat "${tmp}/out_cross_leak.log" >&2
       failed=1
     fi
   fi
