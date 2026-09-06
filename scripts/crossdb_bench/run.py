@@ -138,7 +138,21 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if query_dim is not None and query_dim != docs_dim:
+        # queries 側も同様に次元検証を必須にする（codex-review P2 指摘・PR #557
+        # r3943524978）。queries JSONL が空だと query_dim が None のまま docs_dim
+        # だけで --expect-dim 判定を素通りしてしまい、mysql アダプタ等 queries を
+        # 参照しない db モジュールでは不正な queries フィクスチャ（空・取り違え）を
+        # 検出できずに adapter 呼び出しへ進んでしまう。README の「docs／queries の
+        # 埋め込み長を fail-closed に検証する」契約に合わせ、queries 側の次元が
+        # 取得できない場合も adapter 呼び出し前に非 0 終了で拒否する。
+        if query_dim is None:
+            print(
+                f"error: --expect-dim {args.expect_dim} requires queries dim to be verified "
+                f"(queries file is empty or has no embedding: {args.queries_file})",
+                file=sys.stderr,
+            )
+            return 1
+        if query_dim != docs_dim:
             # ここへ到達するのは通常あり得ない（直前の mismatch チェックで
             # 既に非 0 終了しているため）が、fail-closed の多重防御として残す。
             print(
