@@ -26,7 +26,7 @@ RRF 融合スコアの同点タイブレークに関する非決定性の懸念�
 | 密 Top-k 選出 | `kernel.rs`（`MinHeapItem::cmp`・`TopKSelector::into_sorted_vec`） | ヒープ比較・最終ソートともスコアは `total_cmp`、同点は id 昇順でタイブレーク。最終整列は安定ソート（`sort_by`） |
 | 並列・バッチ選出 | `parallel_search.rs`・`batch_search.rs` | いずれも `TopKSelector` を共用するため分割数・スレッド数に依存しない |
 | 疎（BM25）Top-k | `sparse.rs`（`Candidate::cmp`） | `total_cmp` + `doc_id` 昇順、`sort_by`（安定） |
-| RRF 融合 | `hybrid.rs`（`rrf_fuse`） | 累積は `HashMap` ではなく `BTreeMap`（走査順序が id 昇順で決定的）。最終整列は `sort_by`（安定）+ スコア降順・id 昇順タイブレーク |
+| RRF 融合 | `hybrid.rs`（`rrf_fuse`） | 当時（本 ADR 作成時点）は累積が `HashMap` ではなく `BTreeMap`（走査順序が id 昇順で決定的）だった。Issue #549 で id ソート済み位置索引（`(id, pos)` タプルの比較関数なし `sort_unstable()`。後述「追記（Issue #549）」節参照）へ置換したが、最終整列は変わらず `sort_by`（安定）+ スコア降順・id 昇順タイブレーク |
 | 融合結果の `LIMIT` 適用 | `hybrid.rs`（`hybrid_search`） | `rrf_fuse` が返す順序をそのまま `truncate(k)` するのみで、`truncate` 自体は順序を変えない |
 | 再ランク | `rerank.rs` | 同様に `BTreeMap` 累積 + `sort_by_key`（安定） |
 | SQL-4 実行 | `sql/exec.rs` | `hybrid_search`/`rrf_fuse` の順序をそのまま `LIMIT` 相当の件数へ切り詰めるのみ |
@@ -86,8 +86,9 @@ id 昇順」で事前ソート済みであることを検証し（`is_sorted_des
   `FallbackBatchEngine::revalidate_primary_hits` の順序検証で機械的に担保される。
 - スコアの比較には（NaN を含む非全順序を扱う場合）`total_cmp` を使い、非有限値は
   比較前に事前拒否する（`hybrid.rs`・`kernel.rs`・`sparse.rs` の既存契約と同じ）。
-- RRF 等の融合スコアを id ごとに累積する構造は `HashMap` ではなく `BTreeMap`（または
-  他の決定的走査順序を持つ構造）を使う。
+- RRF 等の融合スコアを id ごとに累積する構造は、`HashMap`（走査順序が非決定的）を
+  使わず決定的走査順序を持つ構造を使う（`BTreeMap`、または Issue #549 の id
+  ソート済み位置索引のように id 昇順へ明示的に整列した構造）。
 - `LIMIT`/`k` による切り詰め（`truncate`）は、切り詰め前の順序が上記契約を満たして
   いる限り、それ自体は非決定性を生まない（`truncate` は要素の順序を変更しない）。
   ただし切り詰め前の順序が同点タイブレークを欠いていれば、どの位置で切っても
@@ -97,7 +98,8 @@ id 昇順」で事前ソート済みであることを検証し（`is_sorted_des
   `pool_depth` 境界で同点グループを分断しない（`complete_boundary_tie_group`。
   Issue #310。詳細は `docs/design/hybrid-recall-regression.md`「Issue #310: engine
   側改善」節参照）。この規約変更は上記の同点**タイブレーク**契約（安定ソート・
-  id 昇順・`total_cmp`・`BTreeMap` 累積）を弱めない: `accumulate_ranked` が
+  id 昇順・`total_cmp`・決定的走査順序を持つ累積構造）を弱めない:
+  `compute_contributions`（Issue #549 以前は `accumulate_ranked`）が
   同点グループ内の全メンバーへ同一の RRF 順位（＝同一の寄与）を割り当てた**後**の
   最終整列は、従来どおり融合スコア降順・同点 id 昇順の安定ソートで確定する。
 
@@ -116,12 +118,34 @@ allow` マーカー付きで導入した（上表「疎（BM25）Top-k」行の 
 前方一致契約・投入順非依存・`hybrid_search` の疎側境界同点グループ決定性を検証）を
 参照。
 
+## 追記（Issue #549）: RRF 融合コアの id 写像を位置索引方式へ置換
+
+`hybrid.rs::rrf_fuse_with_limits` の融合コアが、id をキーにした `BTreeMap`
+累積（ノード確保を伴う）から、検証済み長さの位置索引方式（`compute_contributions`
+が密・疎それぞれの寄与を位置ごとに `contrib: Vec<f64>` へ書き込み、`index:
+Vec<(u64, usize)>` を比較関数なし `sort_unstable()` で id 昇順へ整列してから
+等 id 区間を合算する）へ置換された（詳細・等価性検証は `docs/design/
+hybrid-rrf-latency-breakdown.md`「Issue #549」節参照）。
+
+`index.sort_unstable()` は `(id, pos)` タプルの `Ord`（id 優先・`pos` は同一 id
+内で一意）に従う比較関数なしの呼び出しであり、`(id, pos)` が要素ごとに一意な
+ため不安定性（同値要素の相対順序不定）は観測されない。`scripts/
+check_sort_determinism.sh` の検知対象（`sort_unstable_by`/`sort_unstable_by_key`/
+`select_nth_unstable_by(_key)` への識別子参照）には比較関数なしの `sort_unstable`
+は含まれないため、`storage.rs` の整数 id 列と同じ「許可が必要な正当ケース」の
+枠組みに入る（下記「例外として許容する箇所」参照）。最終スコアソート
+（`out.sort_by`）は本 Issue でも安定ソートのまま変更していない。
+
 ## 例外として許容する箇所
 
 - `storage.rs` の整数 id 列に対する `sort_unstable`（比較関数を渡さない版）。id は
   全順序を持ち、同一 id の重複が意味を持つペイロードでもないため、不安定ソートでも
   結果の並びは一意に定まる。`scripts/check_sort_determinism.sh` はこのケースを検知
   対象パターン（比較関数を伴う `_by`/`_by_key` 系のみ）から除外している。
+- `hybrid.rs::rrf_fuse_with_limits` の `index: Vec<(u64, usize)>` に対する
+  `sort_unstable`（比較関数を渡さない版。Issue #549）。`(id, pos)` は要素ごとに
+  一意なタプルであり、上記の `storage.rs` と同じ理由で不安定性は観測されない。
+  上記「追記（Issue #549）」節参照。
 - `sparse.rs::TopKSelector::shrink_to_k_eff`・`SparseScored::top` の
   `select_nth_unstable_by`／`sort_unstable_by`（`// sort-determinism: allow` マーカー
   付き。Issue #391・#392）。上記「追記（Issue #393）」節参照。
