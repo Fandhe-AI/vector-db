@@ -49,16 +49,50 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--out-dir", default=None, help="結果 JSON の出力先（既定: <queries-file と同じディレクトリ>/results）")
     p.add_argument("--workdir", default=None, help="作業用一時ディレクトリ（既定: --rows-file と同じディレクトリ）")
+    p.add_argument(
+        "--expect-dim",
+        type=int,
+        default=None,
+        help="docs／queries の埋め込み長がこの値と一致することを要求する（Issue #466。"
+        "dim 別 fixture を取り違えたまま計測を続けさせず、不一致は非 0 終了で拒否する）",
+    )
     return p.parse_args()
 
 
 def resolve_docs_file(args: argparse.Namespace) -> str:
+    """recall ground truth 計算用の docs jsonl パスを決める。
+
+    self は `--rows-file`（redb）と対になる docs jsonl を `--docs-file` 省略時に
+    自動探索する。dim 別 fixture（`docs25k-d768.redb` 等）でも見つけられるよう、
+    固定名 `docs25k.jsonl` ではなく `--rows-file` と同じ basename（拡張子のみ
+    `.jsonl` へ）を使う（Issue #466。`docs25k.redb` → `docs25k.jsonl` は従来どおり
+    同じ結果になるため後方互換）。
+    """
     if args.docs_file:
         return args.docs_file
     if args.db == "self":
-        candidate = os.path.join(os.path.dirname(os.path.abspath(args.rows_file)), "docs25k.jsonl")
+        base = os.path.splitext(os.path.basename(args.rows_file))[0]
+        candidate = os.path.join(os.path.dirname(os.path.abspath(args.rows_file)), f"{base}.jsonl")
         return candidate
     return args.rows_file
+
+
+def _peek_embedding_dim(jsonl_path: str) -> int | None:
+    """`jsonl_path`（docs25k.jsonl 等）の先頭 1 行だけを読み `embedding` の長さを
+    返す（Issue #466。dim 一致検査のためだけに数万行のフィクスチャ全体を
+    `load_jsonl` で読み込むのは dim=768／1536 で数百 MB になり無駄なため、
+    行単位で最初の非空行のみをパースする）。"""
+    import json as _json
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            doc = _json.loads(line)
+            embedding = doc.get("embedding")
+            return len(embedding) if embedding is not None else None
+    return None
 
 
 def main() -> int:
@@ -69,6 +103,31 @@ def main() -> int:
         args.workdir = os.path.dirname(os.path.abspath(args.rows_file))
 
     queries = load_jsonl(args.queries_file)
+
+    # docs／queries の埋め込み長が食い違ったまま計測を続けると、dim 別 fixture
+    # の取り違え（例: dim=128 の docs に dim=768 の queries）を検出できないまま
+    # 不正な結果 JSON を書き出してしまう。self は queries と `--docs-file`（省略時
+    # は `resolve_docs_file`）の docs を、他 DB は `--rows-file`（docs 本体）を
+    # 突き合わせる（Issue #466。unsupported へ丸めず非 0 終了で拒否する）。
+    dim_source_docs = resolve_docs_file(args) if args.db == "self" else args.rows_file
+    query_dim = len(queries[0]["embedding"]) if queries else None
+    docs_dim = None
+    if os.path.exists(dim_source_docs):
+        docs_dim = _peek_embedding_dim(dim_source_docs)
+    if query_dim is not None and docs_dim is not None and query_dim != docs_dim:
+        print(
+            f"error: embedding dim mismatch between docs ({docs_dim}) and queries ({query_dim})",
+            file=sys.stderr,
+        )
+        return 1
+    if args.expect_dim is not None:
+        actual_dim = query_dim if query_dim is not None else docs_dim
+        if actual_dim != args.expect_dim:
+            print(
+                f"error: --expect-dim {args.expect_dim} does not match actual dim {actual_dim}",
+                file=sys.stderr,
+            )
+            return 1
 
     if args.db == "self":
         import self_db

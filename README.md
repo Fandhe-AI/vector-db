@@ -283,14 +283,14 @@ make rerank-cross-encoder-eval
 
 ### 他 DB との機能別横断ベンチ（`make bench-crossdb`）
 
-`scripts/crossdb_bench/`（Python ハーネス・Cargo 依存追加なし）を使い、自作 DB（wire-server 経由）と pgvector・sqlite-vec・Qdrant・LanceDB・MySQL の機能別（KNN・フィルタ付き KNN・集計・GROUP BY・hybrid・Recall@10 等）レイテンシを同一データセット（25,000 行・dim 128）上で比較します。計測ツールの Python 依存は `requirements.txt` で `==` 固定し、Cargo 依存は増やしていません。
+`scripts/crossdb_bench/`（Python ハーネス・Cargo 依存追加なし）を使い、自作 DB（wire-server 経由）と pgvector・sqlite-vec・Qdrant・LanceDB・MySQL の機能別（KNN・フィルタ付き KNN・集計・GROUP BY・hybrid・Recall@10 等）レイテンシを既定 dim 128・25,000 行のデータセット上で比較します（`CROSSDB_DIM` で dim=768 等へ切替可。Issue #466）。計測ツールの Python 依存は `requirements.txt` で `==` 固定し、Cargo 依存は増やしていません。
 
 **前提環境**:
 
 - Docker
 - Python venv: `pip install -r scripts/crossdb_bench/requirements.txt`
 - `cargo build --release -p wire-server`
-- fixture 生成: `cargo run --release -p engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`
+- fixture 生成: `cargo run --release -p engine --example seed_docs -- seed <out.redb> 25000 128` → `export <db> <docs.jsonl>` → `queries 128 200 <queries.jsonl>`（dim=768 は `docs25k-d768.redb` のように `-d<dim>` 付きファイル名で生成し `seed`／`queries` の第 2 引数〔dim〕を 768 にする。下記「実行」参照）
 
 **実行**:
 
@@ -300,7 +300,18 @@ export CROSSDB_PYTHON=<venv の python へのパス>
 make bench-crossdb
 ```
 
-`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
+`scripts/crossdb_bench/run_all.sh` を呼び出し、対象外のコンテナは自動停止、結果は `$CROSSDB_DIR/results/<db>_<config>.json` に保存されます。`CROSSDB_DIM=768` を指定すると既定ファイル名を `docs25k-d768.{redb,jsonl}`／`queries200-d768.jsonl`、出力先を `$CROSSDB_DIR/results/d768`／`$CROSSDB_DIR/logs/d768` へ切り替え、`run.py --expect-dim 768` で docs／queries の埋め込み次元が一致することを fail-closed に検証します（`CROSSDB_REDB`／`CROSSDB_DOCS`／`CROSSDB_QUERIES` を明示すればこの既定より優先されます）。
+
+```bash
+# dim=768 の fixture を生成してから計測する例（Issue #466）
+S=$CROSSDB_DIR
+cargo run --release -p engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+CROSSDB_DIM=768 make bench-crossdb
+```
+
+GPU 対照（FAISS・Qdrant GPU）の詳細は `scripts/crossdb_bench/gpu/README.md` を参照してください。spec 由来の閾値なし、情報提供専用・手動実行・CI 非配線です。計測結果・所見は `docs/design/crossdb-bench.md` を参照してください（dim=768 基線は同ドキュメント参照）。後続 Issue が self との前後比較を行う際の受け入れ条件テンプレート（統計量・ノイズ帯・記入例）は `docs/design/benchmark-judgement-policy.md` を参照してください。
 
 ### `vector_knn` の wire／SQL／カーネル内訳プロファイル（Issue #463）
 
@@ -419,11 +430,14 @@ let core = engine::core::EngineCore::from_storage_with_engine(storage, kind);
 
 - `BENCH_FEATURE_ENGINE` / `BENCH_KNN_PROFILE_ENGINE`: 未設定・空・`brute_force`（既定）／`hnsw`（`HnswParams::default()` で opt-in）。未知値は fail-closed で拒否
 - `BENCH_FEATURE_SCALE`（`feature_bench` のみ）: 正整数倍率。既定 1（25,000 行）。`hnsw::MAX_HNSW_NODES` を超えない範囲で bound
+- `BENCH_FEATURE_DIM` / `BENCH_KNN_PROFILE_DIM`（Issue #466）: 正整数・既定 128・上限 4,096。dim=768／1536 が Issue #365 で採否の判別変数と判明したため、横断 SQL ベンチ側にも dim を可変にする規模点を用意したもの。未知値・0・上限超過は fail-closed で拒否
 
 ```bash
 BENCH_FEATURE_ENGINE=hnsw cargo run --release -p engine --example feature_bench
 BENCH_FEATURE_ENGINE=hnsw BENCH_FEATURE_SCALE=4 cargo run --release -p engine --example feature_bench  # 100,000 行
 BENCH_KNN_PROFILE_ENGINE=hnsw make bench-knn-profile
+BENCH_FEATURE_DIM=768 cargo run --release -p engine --example feature_bench
+BENCH_KNN_PROFILE_DIM=768 make bench-knn-profile
 ```
 
 既定エンジン（brute-force）との前後比較・25k/100k の規模スケーリング実測・参照した外部実装（qdrant・pgvector・usearch）の既定値・損益分岐点についての所見は `docs/design/hnsw-index.md` を参照してください。

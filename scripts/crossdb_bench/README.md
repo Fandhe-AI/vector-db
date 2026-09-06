@@ -121,6 +121,30 @@ python scripts/crossdb_bench/run.py --db mysql --config exact \
 結果は `<queries-file のディレクトリ>/results/<db>_<config>.json`
 （`--out-dir` で上書き可）に書き出される。
 
+### dim 別 fixture（Issue #466）
+
+dim=768／1536 が Issue #365（dot カーネル多アキュムレータ化検討）で採否の
+判別変数と判明したため、`docs25k.*`／`queries200.jsonl` 固定名とは別に
+`-d<dim>` サフィックス付き fixture を生成して計測できる。
+
+```bash
+cargo run --release -p engine --example seed_docs -- seed "$S/docs25k-d768.redb" 25000 768
+cargo run --release -p engine --example seed_docs -- export "$S/docs25k-d768.redb" "$S/docs25k-d768.jsonl"
+cargo run --release -p engine --example seed_docs -- queries 768 200 "$S/queries200-d768.jsonl"
+
+python scripts/crossdb_bench/run.py --db self --config exact \
+  --rows-file "$S/docs25k-d768.redb" --queries-file "$S/queries200-d768.jsonl" \
+  --out-dir "$S/results/d768" --expect-dim 768
+```
+
+`--docs-file` を省略した場合、self は `--rows-file` と同じ basename（拡張子
+のみ `.jsonl`）を自動探索する（`docs25k-d768.redb` → `docs25k-d768.jsonl`）。
+`--expect-dim` を指定すると docs／queries の埋め込み長がその値と一致することを
+fail-closed に検証する（不一致・fixture の取り違えは非 0 終了で拒否し、
+`unsupported` へ丸めない）。`make bench-crossdb` から一括実行する場合は
+`CROSSDB_DIM=768`（十進数字のみ）を指定すると上記のファイル名・出力先・
+`--expect-dim` を自動で組み立てる（Makefile「bench-crossdb」参照）。
+
 ### スモークテスト（2,000 行サブセット）
 
 25,000 行の本計測前に、まず小規模で全フェーズが動く／`unsupported` が正しく

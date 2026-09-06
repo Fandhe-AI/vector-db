@@ -84,6 +84,11 @@
 //! bench-knn-profile`（Makefile）から実行する。判定ロジック自体（時間非依存）は
 //! `harness::knn_profile` にあり `tests/knn_profile_accept.rs` で `make ci` 側から
 //! 回帰検証する。
+//!
+//! 既定 dim128（`harness::bench_engine::DEFAULT_BENCH_DIM`）。`BENCH_KNN_PROFILE_DIM`
+//! （正整数・上限 `harness::bench_engine::MAX_BENCH_DIM`。Issue #466）で上書きできる。
+//! dim=768／1536 が Issue #365 で採否の判別変数と判明したため、S0〜S5' すべての
+//! 段が同じベクトル次元数で測れるようにする。
 
 #[allow(dead_code)]
 mod harness;
@@ -121,7 +126,6 @@ use temp_db::{unique_db_path, CleanupGuard};
 
 /// feature_bench の `vector_knn` フェーズ実測条件を再現する規模（Issue #362。
 /// テナント A 20,000 行 ＋ テナント B 5,000 行 ＝ 計 25,000 行）。
-const DIM: usize = 128;
 const TENANT_A: &str = "tenant-a";
 const TENANT_A_ROWS: usize = 20_000;
 const TENANT_B: &str = "tenant-b";
@@ -193,11 +197,24 @@ fn main() {
         Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_ENGINE: {e}")),
     };
 
+    // ベクトル次元数（Issue #466）。S1〜S5' も含め本ファイル全体で同じ値を使う。
+    let dim: usize =
+        match harness::bench_engine::read_env_var("BENCH_KNN_PROFILE_DIM").and_then(|raw| {
+            harness::bench_engine::parse_dim(
+                raw.as_deref(),
+                harness::bench_engine::DEFAULT_BENCH_DIM,
+                harness::bench_engine::MAX_BENCH_DIM,
+            )
+        }) {
+            Ok(d) => d as usize,
+            Err(e) => fail_closed(format!("BENCH_KNN_PROFILE_DIM: {e}")),
+        };
+
     println!(
         "{}",
         EnvReport::capture(format!("{:?}", engine::isa::current().isa()))
     );
-    println!("knn_profile_bench: rows={TOTAL_ROWS} dim={DIM} top_k={TOP_K} (tenant_a={TENANT_A_ROWS} tenant_b={TENANT_B_ROWS}) engine={}", knn_engine.token());
+    println!("knn_profile_bench: rows={TOTAL_ROWS} dim={dim} top_k={TOP_K} (tenant_a={TENANT_A_ROWS} tenant_b={TENANT_B_ROWS}) engine={}", knn_engine.token());
     println!("knn_profile_bench: SQL 表層は PrefilterCache を経由しない（core.rs は EngineCore::search 専用）が SqlArenaCache（Issue #363）は経由する。S0-cold は毎サンプル新規 EngineCore で SqlArenaCache を空の状態から測る。既定 provider は ParallelSearchProvider、対照は CpuScalarProvider。BENCH_KNN_PROFILE_ENGINE=hnsw のときは S0-cold/S0-hot の EngineCore を hnsw opt-in（Issue #403 B 案）で構築する（S1〜S5' は非対象）。");
 
     // --- データ投入: 一時 DB へテナント A・B の行を投入する ---
@@ -209,7 +226,7 @@ fn main() {
             TABLE,
             vec![ColumnDef::new(
                 COLUMN,
-                ColumnType::Vector(DIM as u32),
+                ColumnType::Vector(dim as u32),
                 false,
             )],
         ))
@@ -224,7 +241,7 @@ fn main() {
             let batch_len = SEED_BATCH_ROWS.min(remaining);
             let mut batch_vectors: Vec<Vec<f32>> = Vec::with_capacity(batch_len);
             for _ in 0..batch_len {
-                batch_vectors.push(rng.next_vector(DIM));
+                batch_vectors.push(rng.next_vector(dim));
             }
             let rows: Vec<(u64, RowInput<'_>)> = (0..batch_len)
                 .map(|i| {
@@ -265,7 +282,7 @@ fn main() {
     // 単一クエリ（テナント A の可視ベクトルからの近傍探索。RLS は Public のため
     // テナント B の行も可視）。S0〜S5 を通じて同一クエリベクトルを使い、段間で
     // 比較可能にする。
-    let query = rng.next_vector(DIM);
+    let query = rng.next_vector(dim);
 
     // --- S4/S5/S5': pub API（`&storage` 使用）。--------------------------------
     // S4 は「arena 構築の実コスト」のみを対象とする。`harness::protocol::run` は
@@ -589,7 +606,7 @@ fn main() {
     // ため、f32 由来値は `f32::to_bits`（ビット列の再解釈。丸め等の追加浮動小数点
     // 演算を持ち込まない）で `u32` へ変換したうえで `u64` へ拡張する
     // （codex-review P2-1 指摘・PR #378）。
-    let mut scratch: Vec<f32> = Vec::with_capacity(DIM);
+    let mut scratch: Vec<f32> = Vec::with_capacity(dim);
     let s3 = run(&config, || {
         let read_txn = db.begin_read().expect("begin read txn");
         let table = read_txn.open_table(ROW_TABLE).expect("open row table");
@@ -608,7 +625,7 @@ fn main() {
         (rows, checksum)
     })
     .expect("measurement must satisfy protocol minimums");
-    let mut s3_scratch: Vec<f32> = Vec::with_capacity(DIM);
+    let mut s3_scratch: Vec<f32> = Vec::with_capacity(dim);
     let mut s3_rows = 0usize;
     // 突き合わせ対象の 1 件（行 id・ベンチ内デコード結果）。`Storage::scan()`
     // は `ROWS_TABLE`（"rows"）のみを走査し、本ベンチが `tenant::insert_rows`
