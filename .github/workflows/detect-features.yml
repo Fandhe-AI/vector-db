@@ -12,13 +12,12 @@ name: Detect features (Apple Silicon)
 # `docs/design/chip-kernel-guidelines.md` の該当節へ手動で転記する運用とする
 # （README「実装方針（要点）」の #468 小節参照）。
 
+# トリガは workflow_dispatch のみとする。pull_request で起動すると、必須チェックに
+# 含めない本ジョブの check-run が PR の HEAD に付き、自動マージ運用（implement-issue-tree
+# の G0 ゲート＝必須外チェックの不在確認）を `isa.rs` 等を触る全 PR で止めてしまうため。
+# 実機検証が必要なときは Actions 画面または `gh workflow run detect-features.yml
+# --ref <branch>` で対象ブランチを指定して手動起動する。
 on:
-  pull_request:
-    paths:
-      - crates/engine/examples/detect_features.rs
-      - crates/engine/src/isa.rs
-      - crates/engine/tests/isa.rs
-      - .github/workflows/detect-features.yml
   workflow_dispatch:
 
 permissions:
