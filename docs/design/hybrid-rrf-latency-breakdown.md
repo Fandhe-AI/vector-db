@@ -986,3 +986,161 @@ Phase 1 全体（`8bfaaa4`〔#388 直前〕→ 導入後）を通した設計判
 前後比較・外部実装（tantivy・qdrant）参照の整理は
 `docs/design/sparse-inverted-index.md`（Issue #394）に記録した。数値の
 二重管理を避けるため、本ドキュメントへの転記はしない。
+
+## 最新基線（2026-09-06・Issue #465）
+
+### 目的
+
+`docs/design/crossdb-bench.md` で `hybrid_rrf`（25,000 行・dim 128・wire 経由・
+p50）は self 6,178µs・最速の他 DB（sqlite-vec）3,508µs で約 1.8 倍遅いが、
+疎索引側の最適化（Issue #388〜#392）後の段別内訳が 1 つの基線として整理されて
+いなかった。本節は `bench-hybrid-profile`（engine 内 B0s〜B8）・
+`bench-hybrid-wire-profile`（engine/SQL 表層/wire T1p〜T3）の交互複数ラウンド
+実測（`docs/design/benchmark-judgement-policy.md` §3〜4 準拠）で最新基線を
+記録し、上位区分を Issue #548（Phase 6・上位 2 段の最適化）へ引き継ぐ。
+
+### 計測条件
+
+- commit: `ee99db3`（`origin/main` 分岐元。#552〜#555 適用済み）
+- 環境: `QEMU Virtual CPU version 2.5+`・12 vCPU・Avx2Fma・`loadavg` 約 1.2〜2.5
+  （`BENCH_DEDICATED_ENV` 未設定・共有環境の参考値。専有環境での再実測は運用者
+  判断）
+- rounds: `BENCH_HYBRID_PROFILE_ROUNDS=5`・`BENCH_HYBRID_WIRE_ROUNDS=5`（いずれも
+  規約下限）を各 2 回実行
+- `bench-hybrid-wire-profile` は PR #556（codex-review P1/P2 指摘対応）で各ラウンドが同一のクエリ部分集合（先頭 iterations_per_stage 件）を測定するよう修正済み（修正前はラウンドごとに異なる 50 クエリを計測しており、T1p のラウンド間変動を環境ノイズ帯として使う際にクエリ内容差が混入していた）。本節の数値はこの修正後の実測
+
+### engine 内段別（`bench-hybrid-profile` B0s〜B8。単一テナント・25,000 行・dim 128）
+
+per-round 生データ（1 回目の実測。単位 µs）:
+
+| round | B0s | B0 | B1 | B2 | B3 | B4 | B5 | B8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 378 | 619 | 8917 | 10872 | 978 | 5605 | 3417 | 124 |
+| 2 | 322 | 431 | 9769 | 10884 | 684 | 5777 | 3441 | 125 |
+| 3 | 374 | 457 | 9620 | 10773 | 741 | 5629 | 3429 | 124 |
+| 4 | 325 | 430 | 9030 | 10746 | 996 | 5677 | 3425 | 125 |
+| 5 | 331 | 436 | 9184 | 10885 | 650 | 5604 | 3417 | 124 |
+
+min-of-5／median-of-5（1 回目）: B0s(322/331) B0(430/436) B1(8917/9184)
+B2(10746/10872) B3(650/741) B4(5604/5629) B5(3417/3425) B8(124/124)。参照区間帯
+（B0s）17.37%。
+
+per-round 生データ（2 回目の実測。単位 µs）:
+
+| round | B0s | B0 | B1 | B2 | B3 | B4 | B5 | B8 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 338 | 506 | 9439 | 11018 | 627 | 5570 | 3449 | 125 |
+| 2 | 323 | 442 | 9378 | 10970 | 652 | 5876 | 3458 | 126 |
+| 3 | 371 | 449 | 9484 | 11035 | 647 | 5690 | 3478 | 126 |
+| 4 | 368 | 443 | 9345 | 11329 | 656 | 5665 | 3428 | 125 |
+| 5 | 322 | 538 | 9410 | 10902 | 653 | 5614 | 3424 | 124 |
+
+min-of-5／median-of-5（2 回目）: B0s(322/338) B0(442/449) B1(9345/9410)
+B2(10902/11018) B3(627/652) B4(5570/5665) B5(3424/3449) B8(124/125)。参照区間帯
+（B0s）14.95%。
+
+帰属表（min-of-5 基準。2 回とも同じ順位。`ratio_of_b1` は表示専用で B1 min に
+対する構成比、`band` は
+[benchmark-judgement-policy.md](./benchmark-judgement-policy.md) §4 の「before
+を分母とする」規約に従い当該区間自身の before/after（`step_ratio_pct`）で
+判定する——構成比の表示と band 判定を分離しており、before/after の対を持つ
+sql_surface・projection のみ band を評価し、単独区分（dense/sparse/residual
+系）は比較元を持たないため band は n/a とする。PR #556 codex-review 指摘対応
+（[threadId PRRT_kwDOUAKASM6fqN7s]）で `hybrid_profile_bench.rs` を修正済み）:
+
+| 区分 | 1 回目 diff(ratio_of_b1) | 2 回目 diff(ratio_of_b1) | before→after step_ratio_pct（1 回目 / 2 回目） | band（1 回目 / 2 回目） |
+| --- | --- | --- | --- | --- |
+| sql_surface(B1−B4) | 3313us(37.15%) | 3774us(40.39%) | 59.12% / 67.77% | above_noise_band / above_noise_band |
+| projection(B2−B1) | 1955us(21.93%) | 1557us(16.66%) | 21.93% / 16.66% | above_noise_band / above_noise_band |
+| sparse(B5) | 3417us(38.32%) | 3424us(36.64%) | n/a（単独区分） | n/a |
+| residual(B4−B0−B5) | 1756us(19.69%) | 1704us(18.23%) | n/a（単独区分） | n/a |
+| dense(B0) | 430us(4.82%) | 442us(4.73%) | n/a（単独区分） | n/a |
+| visible_set_build(B8) | 124us(1.39%) | 124us(1.33%) | n/a（単独区分） | n/a |
+| dense_fast_path_contrast(B3・informational) | 650us(7.29%) | 627us(6.71%) | n/a（単独区分） | n/a |
+
+**上位 2 区分は sql_surface(B1−B4) と sparse(B5) がほぼ同水準（37〜40%）で
+並び、残差（18〜20%）が僅差で 3 位**（この順位比較は表示用の `ratio_of_b1`
+＝ B1 min に対する構成比であり、band 判定とは別軸）。B8（可視集合
+`BTreeSet` 構築）は構成比が小さく（1%台）、B4−B0−B5 の残差の大半は「融合＋
+境界同点グループ完全化」（`rrf_fuse` 本体・`complete_boundary_tie_group`）に
+帰属すると推定される（下限近似 B7 は本実測では計測しておらず今後の精査対象）。
+before/after の対を持つ sql_surface・projection は、それぞれの区間自身の
+step_ratio_pct（59〜68%・17〜22%）が参照区間帯（B0s、両回とも 15〜17%）を
+明確に上回り above_noise_band となる。単独区分（dense/sparse/residual 系）は
+「B1 に対する構成比が参照帯を上回るか」という誤った判定基準を撤去したため
+band を n/a とし、`ratio_of_b1` の値は帰属の目安（informational）としてのみ
+扱う。
+
+### wire／SQL 表層／engine 内訳（`bench-hybrid-wire-profile` T1p〜T3）
+
+単一テナント・25,000 行・dim 128（engine 側とはコーパスが異なるため絶対値は横比較しない）。
+
+per-round 生データ（1 回目の実測。単位 ms。p95 も併記）:
+
+| round | T1p median | T1p p95 | T2 median | T2 p95 | T3 median | T3 p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.559 | 1.755 | 5.260 | 9.451 | 5.548 | 8.573 |
+| 2 | 1.537 | 2.319 | 5.234 | 7.396 | 5.496 | 9.717 |
+| 3 | 1.546 | 1.654 | 5.234 | 5.379 | 5.402 | 5.637 |
+| 4 | 1.533 | 1.678 | 5.196 | 5.317 | 5.442 | 5.990 |
+| 5 | 1.550 | 2.407 | 5.178 | 5.294 | 5.475 | 5.776 |
+
+min-of-5／median-of-5（1 回目）: T1p(1.533/1.546) T2(5.178/5.234)
+T3(5.402/5.475)。参照区間帯（T1p の複数ラウンド中央値の振れ）1.73%。
+
+per-round 生データ（2 回目の実測。単位 ms。p95 も併記）:
+
+| round | T1p median | T1p p95 | T2 median | T2 p95 | T3 median | T3 p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 2.418 | 2.548 | 5.268 | 6.795 | 5.675 | 9.813 |
+| 2 | 1.565 | 2.409 | 5.234 | 5.678 | 5.347 | 5.498 |
+| 3 | 2.433 | 2.634 | 5.308 | 9.523 | 5.490 | 6.897 |
+| 4 | 1.576 | 2.249 | 5.580 | 9.836 | 5.422 | 5.607 |
+| 5 | 1.597 | 1.774 | 5.228 | 6.583 | 5.403 | 6.178 |
+
+min-of-5／median-of-5（2 回目）: T1p(1.565/1.597) T2(5.228/5.268)
+T3(5.347/5.422)。参照区間帯（T1p の複数ラウンド中央値の振れ）55.44%——
+round1・round3 の T1p が他ラウンドの約 1.5〜1.6 倍（2.4ms 台）へ振れており、
+共有環境のスレッドスケジューリング由来のノイズが 1 回目より大きい。
+
+帰属表（min-of-5 基準）:
+
+| 区分 | 1 回目 diff(ratio) | 2 回目 diff(ratio) | 1 回目 band | 2 回目 band |
+| --- | --- | --- | --- | --- |
+| engine_hybrid(T1p) | 1.533ms(28.37%) | 1.565ms(29.27%) | n/a（基準ゼロ） | n/a（基準ゼロ） |
+| sql_surface(T2−T1p) | 3.646ms(67.49%) | 3.663ms(68.49%) | above_noise_band | above_noise_band |
+| wire(T3−T2) | 223us(4.14%) | 120us(2.24%) | within_noise_band | within_noise_band |
+
+2 回とも sql_surface(T2−T1p) が支配的（67〜68%）で 1 位、wire(T3−T2) はノイズ帯
+内にとどまる点は一致する。2 回目は参照区間帯自体が 55.44% と大きいため、
+wire(T3−T2) の band 判定はこの回に限り目安（参照帯が広く within/above の境界の
+実質的な判別力が下がる）として扱う。
+
+wire 側の SQL 表層区分（T2−T1p）が最大となるのは、T2 が `execute_sql_in_session`
+のクエリパース・束縛・可視行走査（`on_visible_row`）まで含む一方、T1p は
+`hybrid_search` のみを直接計測するため——engine 内訳（B1−B4）と同じ「SQL 表層の
+固定コスト」を指すが、測定対象範囲が異なるため比率は単純合算できない。
+
+### Phase 6（Issue #548）への引き継ぎ
+
+- 上位候補は (1) SQL 表層固定コスト（`sql/exec.rs` の可視行走査・
+  `on_visible_row`）、(2) 疎側再取得ループ（`hybrid.rs::sparse_refetch_loop`。
+  BM25 アキュムレータ再利用は Issue #545・#546 が別途対応）——engine 内訳・
+  wire 内訳の双方で SQL 表層区分が最大かそれに準じる大きさであることが一致
+  している
+- 残差（融合＋境界同点グループ完全化。#548 タイトルが先取りする対象）は 3 位
+  （19%）にとどまり、B8（可視集合構築）はノイズ帯内。#548 の対象を融合のみに
+  限定せず SQL 表層固定コストも候補に含めるべきと申し送る
+- 専有環境（`BENCH_DEDICATED_ENV=1`）での `ROUNDS=10` 再実測、`rrf_fuse_with_limits`
+  の下限近似（B7）実測、crossdb self の同一コミット再実行はオーナー／運用者
+  作業として申し送る
+
+### production コード無変更
+
+`crates/engine/src/`・`crates/wire-server/src/` は無変更。追加した計測ロジックは
+`crates/engine/benches/harness/hybrid_profile.rs`（`HybridProjection`・
+`sql_hybrid_statement_with_projection`・`bucket_diff`・
+`render_baseline_bucket_line`）・`crates/engine/benches/hybrid_profile_bench.rs`
+（B0s〜B8 ラウンド計測セクション）・`crates/wire-server/benches/harness/
+hybrid_wire.rs`（新設）・`crates/wire-server/benches/hybrid_wire_profile_bench.rs`
+（新設）のみ。

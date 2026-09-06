@@ -310,11 +310,24 @@ endif
 # --------------------------------------------------
 
 .PHONY: bench-hybrid-profile
-bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）
+bench-hybrid-profile: ## Issue #356（親 Issue #355。hybrid_rrf クエリの段別内訳プロファイル切り分け。SEARCH-1・SEARCH-3 関連ポインタ）＋ Issue #387（search_within の段別・疎側再取得発火回数）＋ Issue #465（Issue #392 適用後の最新基線ラウンド計測）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_PROFILE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる（Issue #465）
 ifdef HAS_CARGO
 	cargo bench --bench hybrid_profile_bench -p engine --features bench-internals
 else
 	@echo "skip: Cargo.toml 未追加のため bench-hybrid-profile をスキップ"
+endif
+
+# --------------------------------------------------
+# hybrid_rrf の wire／SQL 表層／engine 内訳プロファイル
+# （Issue #465。crates/wire-server/benches/hybrid_wire_profile_bench.rs）
+# --------------------------------------------------
+
+.PHONY: bench-hybrid-wire-profile
+bench-hybrid-wire-profile: ## Issue #465（`hybrid_rrf` 6,178µs〔docs/design/crossdb-bench.md〕の engine 内 hybrid 経路／SQL 表層／wire 内訳を切り分ける）を実行する（時間依存・spec 閾値を持たない情報提供専用のため ci には含めない。CI ワークフローにも配線しない。手動実行専用）。BENCH_HYBRID_WIRE_ROUNDS=<5-50>（既定 5）でラウンド数、BENCH_DEDICATED_ENV=1 で専有環境自己申告を指定できる
+ifdef HAS_CARGO
+	cargo bench --bench hybrid_wire_profile_bench -p wire-server
+else
+	@echo "skip: Cargo.toml 未追加のため bench-hybrid-wire-profile をスキップ"
 endif
 
 # --------------------------------------------------

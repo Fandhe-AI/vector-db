@@ -81,19 +81,26 @@ use std::collections::BTreeSet;
 use harness::env_report::EnvReport;
 use harness::hybrid_latency::RefetchTrackingProvider;
 use harness::hybrid_profile::{
-    collect_body_strings, dense_refetch_schedule, fetch_cap, generate_corpus, generate_queries,
-    initial_fetch_k, refetch_schedule_matches_observed_calls, refuse_under_github_actions,
-    render_dense_refetch_line, render_sparse_refetch_line, render_sparse_refetch_summary_line,
-    render_stage_line, replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
-    sql_hybrid_statement, summarize_sparse_refetch, tokenize_only, tokenize_term_doc_freq,
-    tokenize_term_freq, ProfileSparseIndex, SQL_DEFAULT_HYBRID_POOL_DEPTH,
+    bucket_diff, collect_body_strings, dense_refetch_schedule, fetch_cap, generate_corpus,
+    generate_queries, initial_fetch_k, refetch_schedule_matches_observed_calls,
+    refuse_under_github_actions, render_baseline_bucket_line, render_dense_refetch_line,
+    render_sparse_refetch_line, render_sparse_refetch_summary_line, render_stage_line,
+    replica_matches_real, sparse_refetch_schedule, sql_dense_statement,
+    sql_dense_statement_with_projection, sql_hybrid_statement,
+    sql_hybrid_statement_with_projection, summarize_sparse_refetch, tokenize_only,
+    tokenize_term_doc_freq, tokenize_term_freq, HybridProjection, ProfileSparseIndex,
+    SQL_DEFAULT_HYBRID_POOL_DEPTH,
 };
 use harness::protocol::{run, run_bounded_retain, MeasurementConfig};
+use harness::scan_stage_profile::{
+    classify_against_bands, median_of, min_of, parse_rounds, reference_band, step_ratio_pct,
+    ScanStageError,
+};
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
 use engine::hybrid::{hybrid_search, sparse_refetch_observed, RrfConfig};
-use engine::kernel::SearchInput;
+use engine::kernel::{CpuScalarProvider, SearchInput, SearchProvider};
 use engine::parallel_search::ParallelSearchProvider;
 use engine::policy::PolicyContext;
 use engine::row_codec::{encode_scalar_columns, Value};
@@ -748,6 +755,404 @@ fn main() {
             )
         );
     }
+
+    // =========================================================================
+    // Issue #465: hybrid_rrf 最新基線のラウンド計測（Issue #392 適用後）
+    // =========================================================================
+    //
+    // 上記の単一パス段（Issue #356〜#392）はいずれも 1 回分の warmup+計測のみで
+    // あり、共有計測環境のノイズを考慮した交互複数ラウンド計測になっていない。
+    // 本節は `docs/design/benchmark-judgement-policy.md` の計測規約（交互
+    // N≥5・min-of-R と median-of-R の併記・参照区間帯併記）に沿って B0s〜B8 の
+    // 段を `BENCH_HYBRID_PROFILE_ROUNDS` ラウンド交互計測し、帰属表（SQL 表層・
+    // 投影・密・疎・残差の内訳）を出力する。既存の単一パス段は無変更のまま
+    // 残す（Issue #356〜#392 節との比較可能性維持）。
+    //
+    // 参照区間には `CpuScalarProvider::search`（単線・決定的）を使う。
+    // `ParallelSearchProvider`（B0）はスレッドスケジューリングに依存し
+    // ラウンド間で振れやすいため参照区間には使わない
+    // （`docs/design/knn-wire-stage-profile.md` T1′ と同じ理由）。
+    let rounds_env = std::env::var("BENCH_HYBRID_PROFILE_ROUNDS").ok();
+    let rounds = match parse_rounds(rounds_env.as_deref()) {
+        Ok(r) => r,
+        Err(ScanStageError::InvalidRounds(reason)) => {
+            fail_closed(format!("invalid BENCH_HYBRID_PROFILE_ROUNDS: {reason}"))
+        }
+        Err(e) => fail_closed(format!(
+            "BENCH_HYBRID_PROFILE_ROUNDS validation failed: {e}"
+        )),
+    };
+    println!(
+        "hybrid_profile: baseline round measurement (Issue #465) starting — rounds={rounds} \
+         (set BENCH_HYBRID_PROFILE_ROUNDS=5..50 to override; set BENCH_DEDICATED_ENV=1 to \
+         self-report a dedicated measurement environment)"
+    );
+    // 値の中身を確認せず存在のみで判定すると "0" や空文字でも専有環境扱いになる
+    // ため、他ベンチ（sql_c1_bench.rs・*_wire_profile_bench.rs）と同じ厳密一致
+    // 契約（trim 後 "1" のときのみ true）に揃える（codex-review P2 指摘・PR #556）。
+    let dedicated_env = std::env::var("BENCH_DEDICATED_ENV")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if !dedicated_env {
+        println!(
+            "hybrid_profile: BENCH_DEDICATED_ENV not set — the following baseline numbers are \
+             shared-environment reference values only, not a basis for accept/reject decisions \
+             (docs/design/benchmark-judgement-policy.md)"
+        );
+    }
+
+    let dense_fetch_k = initial_fetch_k(pool_depth, fetch_cap(visible.len()));
+    let mut b0s_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b0_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b1_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b2_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b3_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b4_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b5_round_medians = Vec::with_capacity(rounds as usize);
+    let mut b8_round_medians = Vec::with_capacity(rounds as usize);
+
+    // fail-closed 整合性検証: B1（SQL hybrid・SELECT id）が返す id 集合が
+    // B4（直接 API・hybrid_search）と一致することを、ラウンドループの前に
+    // 1 回（queries[0]）だけ確認する（計測区間には混ぜない）。SQL 表層と
+    // 直接 API 呼び出しが同じ融合結果を返すことの構造的な裏付けであり、
+    // 不一致は投影・束縛経路の不整合を示すため fail-closed に打ち切る。
+    {
+        let q = &queries[0];
+        let sql = sql_hybrid_statement_with_projection(
+            TABLE,
+            VECTOR_COLUMN,
+            TEXT_COLUMN,
+            &q.vector,
+            &q.text,
+            TOP_K,
+            HybridProjection::Id,
+        )
+        .unwrap_or_else(|e| fail_closed(format!("B1 fidelity statement build failed: {e}")));
+        let result = core
+            .execute_sql(&ctx, &sql)
+            .unwrap_or_else(|e| fail_closed(format!("B1 fidelity execute_sql failed: {e}")));
+        let mut b1_ids: Vec<u64> = result.rows.iter().map(|row| row.id).collect();
+        b1_ids.sort_unstable();
+        let input = SearchInput {
+            ids: &corpus.ids,
+            vectors: &corpus.vectors,
+            dim: corpus.dim,
+            query: &q.vector,
+            k: TOP_K,
+        };
+        let hits = hybrid_search(
+            &ParallelSearchProvider,
+            input,
+            &sparse_index,
+            &q.text,
+            TOP_K,
+            &cfg,
+        )
+        .unwrap_or_else(|e| fail_closed(format!("B4 fidelity hybrid_search failed: {e}")));
+        let mut b4_ids: Vec<u64> = hits.iter().map(|hit| hit.id).collect();
+        b4_ids.sort_unstable();
+        if b1_ids != b4_ids {
+            fail_closed(format!(
+                "B1(sql_hybrid_select_id)/B4(hybrid_search_cached_index) id set mismatch: \
+                 sql={b1_ids:?} direct={b4_ids:?}"
+            ));
+        }
+        if b1_ids.len() != TOP_K {
+            fail_closed(format!(
+                "B1/B4 fidelity: expected {TOP_K} ids, got {}",
+                b1_ids.len()
+            ));
+        }
+    }
+
+    for round in 0..rounds {
+        println!("hybrid_profile: baseline round {}/{rounds}", round + 1);
+
+        // B0s_dense_scalar_ref: 参照区間（単線・決定的）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let input = SearchInput {
+                ids: &corpus.ids,
+                vectors: &corpus.vectors,
+                dim: corpus.dim,
+                query: &q.vector,
+                k: dense_fetch_k,
+            };
+            CpuScalarProvider
+                .search(input)
+                .unwrap_or_else(|e| fail_closed(format!("B0s dense_scalar_ref failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B0s measurement failed: {e}")));
+        b0s_round_medians.push(m.summary.median);
+
+        // B0_dense_provider_pool: 密側の実効値（production 既定 provider）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let input = SearchInput {
+                ids: &corpus.ids,
+                vectors: &corpus.vectors,
+                dim: corpus.dim,
+                query: &q.vector,
+                k: dense_fetch_k,
+            };
+            ParallelSearchProvider
+                .search(input)
+                .unwrap_or_else(|e| fail_closed(format!("B0 dense_provider_pool failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B0 measurement failed: {e}")));
+        b0_round_medians.push(m.summary.median);
+
+        // B1_sql_hybrid_select_id: crossdb 規範形（SQL 表層 e2e の上限）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let sql = sql_hybrid_statement_with_projection(
+                TABLE,
+                VECTOR_COLUMN,
+                TEXT_COLUMN,
+                &q.vector,
+                &q.text,
+                TOP_K,
+                HybridProjection::Id,
+            )
+            .unwrap_or_else(|e| fail_closed(format!("B1 statement build failed: {e}")));
+            core.execute_sql(&ctx, &sql)
+                .unwrap_or_else(|e| fail_closed(format!("B1 execute_sql failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B1 measurement failed: {e}")));
+        b1_round_medians.push(m.summary.median);
+
+        // B2_sql_hybrid_select_star: 既存段と同じ投影（本文複製あり）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let sql =
+                sql_hybrid_statement(TABLE, VECTOR_COLUMN, TEXT_COLUMN, &q.vector, &q.text, TOP_K)
+                    .unwrap_or_else(|e| fail_closed(format!("B2 statement build failed: {e}")));
+            core.execute_sql(&ctx, &sql)
+                .unwrap_or_else(|e| fail_closed(format!("B2 execute_sql failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B2 measurement failed: {e}")));
+        b2_round_medians.push(m.summary.median);
+
+        // B3_sql_dense_select_id: fast path 対照（informational）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let sql = sql_dense_statement_with_projection(
+                TABLE,
+                VECTOR_COLUMN,
+                &q.vector,
+                TOP_K,
+                HybridProjection::Id,
+            )
+            .unwrap_or_else(|e| fail_closed(format!("B3 statement build failed: {e}")));
+            core.execute_sql(&ctx, &sql)
+                .unwrap_or_else(|e| fail_closed(format!("B3 execute_sql failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B3 measurement failed: {e}")));
+        b3_round_medians.push(m.summary.median);
+
+        // B4_hybrid_search_cached_index: engine 内 hybrid 経路（直接 API）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            let input = SearchInput {
+                ids: &corpus.ids,
+                vectors: &corpus.vectors,
+                dim: corpus.dim,
+                query: &q.vector,
+                k: TOP_K,
+            };
+            hybrid_search(
+                &ParallelSearchProvider,
+                input,
+                &sparse_index,
+                &q.text,
+                TOP_K,
+                &cfg,
+            )
+            .unwrap_or_else(|e| fail_closed(format!("B4 hybrid_search failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B4 measurement failed: {e}")));
+        b4_round_medians.push(m.summary.median);
+
+        // B5_sparse_refetch_loop: 疎側再取得ループ本体（既存フック共用）。
+        let mut query_idx = 0usize;
+        let m = run(&config, || {
+            let q = &queries[query_idx % queries.len()];
+            query_idx += 1;
+            sparse_refetch_observed(&sparse_index, &q.text, &visible, &cfg)
+                .unwrap_or_else(|e| fail_closed(format!("B5 sparse_refetch_observed failed: {e}")))
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B5 measurement failed: {e}")));
+        b5_round_medians.push(m.summary.median);
+
+        // B8_visible_set_build: 残差内訳（可視集合 BTreeSet 構築。std 操作のみ）。
+        let m = run(&config, || {
+            corpus.ids.iter().copied().collect::<BTreeSet<u64>>()
+        })
+        .unwrap_or_else(|e| fail_closed(format!("B8 measurement failed: {e}")));
+        b8_round_medians.push(m.summary.median);
+    }
+
+    // --- per-round 生データ（計測規約 §3: per-run 生データ必須） ---
+    for (round, (((((((b0s, b0), b1), b2), b3), b4), b5), b8)) in b0s_round_medians
+        .iter()
+        .zip(&b0_round_medians)
+        .zip(&b1_round_medians)
+        .zip(&b2_round_medians)
+        .zip(&b3_round_medians)
+        .zip(&b4_round_medians)
+        .zip(&b5_round_medians)
+        .zip(&b8_round_medians)
+        .enumerate()
+    {
+        println!(
+            "hybrid_profile: baseline_round_raw round={} B0s={}us B0={}us B1={}us B2={}us \
+             B3={}us B4={}us B5={}us B8={}us",
+            round + 1,
+            b0s.as_micros(),
+            b0.as_micros(),
+            b1.as_micros(),
+            b2.as_micros(),
+            b3.as_micros(),
+            b4.as_micros(),
+            b5.as_micros(),
+            b8.as_micros(),
+        );
+    }
+
+    let ref_band_ratio = reference_band(&b0s_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("reference_band computation failed: {e}")));
+    let ref_band_pct = ref_band_ratio * 100.0;
+    println!(
+        "hybrid_profile: baseline reference_band(B0s)={ref_band_pct:.2}% \
+         (dedicated_env={dedicated_env})"
+    );
+
+    let min_b0s = min_of(&b0s_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B0s) failed: {e}")));
+    let med_b0s = median_of(&b0s_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B0s) failed: {e}")));
+    let min_b0 = min_of(&b0_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B0) failed: {e}")));
+    let med_b0 = median_of(&b0_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B0) failed: {e}")));
+    let min_b1 = min_of(&b1_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B1) failed: {e}")));
+    let med_b1 = median_of(&b1_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B1) failed: {e}")));
+    let min_b2 = min_of(&b2_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B2) failed: {e}")));
+    let med_b2 = median_of(&b2_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B2) failed: {e}")));
+    let min_b3 = min_of(&b3_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B3) failed: {e}")));
+    let med_b3 = median_of(&b3_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B3) failed: {e}")));
+    let min_b4 = min_of(&b4_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B4) failed: {e}")));
+    let med_b4 = median_of(&b4_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B4) failed: {e}")));
+    let min_b5 = min_of(&b5_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B5) failed: {e}")));
+    let med_b5 = median_of(&b5_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B5) failed: {e}")));
+    let min_b8 = min_of(&b8_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("min_of(B8) failed: {e}")));
+    let med_b8 = median_of(&b8_round_medians)
+        .unwrap_or_else(|e| fail_closed(format!("median_of(B8) failed: {e}")));
+
+    println!(
+        "hybrid_profile: baseline_summary B0s(min={}us,median={}us) B0(min={}us,median={}us) \
+         B1(min={}us,median={}us) B2(min={}us,median={}us) B3(min={}us,median={}us) \
+         B4(min={}us,median={}us) B5(min={}us,median={}us) B8(min={}us,median={}us)",
+        min_b0s.as_micros(),
+        med_b0s.as_micros(),
+        min_b0.as_micros(),
+        med_b0.as_micros(),
+        min_b1.as_micros(),
+        med_b1.as_micros(),
+        min_b2.as_micros(),
+        med_b2.as_micros(),
+        min_b3.as_micros(),
+        med_b3.as_micros(),
+        min_b4.as_micros(),
+        med_b4.as_micros(),
+        min_b5.as_micros(),
+        med_b5.as_micros(),
+        min_b8.as_micros(),
+        med_b8.as_micros(),
+    );
+
+    // --- 帰属表（min-of-R 基準。ratio_of_b1 は表示専用で B1 min に対する構成比を
+    // 示すが、band 判定はこれと分離し docs/design/benchmark-judgement-policy.md
+    // §4 の「before を分母とする」規約どおり、当該区間自身の before/after
+    // （`step_ratio_pct(before, after)`）を用いる。比較元となる before/after の
+    // 対を持たない単独区分（dense/sparse/residual 系・wire 側等）は band を
+    // n/a とする ---
+    let sql_surface_diff = bucket_diff(min_b4, min_b1); // B1 - B4
+    let projection_diff = bucket_diff(min_b1, min_b2); // B2 - B1
+    let residual_diff = {
+        // B4 - B0 - B5（飽和差分の連鎖。どこかで逆転したら以降は None）
+        bucket_diff(min_b0, min_b4).and_then(|d| bucket_diff(min_b5, d))
+    };
+    let residual_minus_visible_diff = residual_diff.and_then(|d| bucket_diff(min_b8, d));
+
+    let b1_us = min_b1.as_micros().max(1) as f64;
+    let render_bucket =
+        |label: &str,
+         diff: Option<std::time::Duration>,
+         band_basis: Option<(std::time::Duration, std::time::Duration)>| {
+            let diff_us = diff.map(|d| d.as_micros());
+            let ratio_pct = diff_us.map(|us| (us as f64 / b1_us) * 100.0);
+            let band = match band_basis {
+                Some((before, after)) => match step_ratio_pct(before, after) {
+                    Ok(pct) => classify_against_bands(pct, ref_band_pct).to_string(),
+                    Err(_) => "n/a".to_string(),
+                },
+                None => "n/a".to_string(),
+            };
+            println!(
+                "{}",
+                render_baseline_bucket_line(label, diff_us, ratio_pct, &band)
+            );
+        };
+    render_bucket(
+        "sql_surface(B1-B4)",
+        sql_surface_diff,
+        Some((min_b4, min_b1)),
+    );
+    render_bucket("projection(B2-B1)", projection_diff, Some((min_b1, min_b2)));
+    render_bucket("dense(B0)", Some(min_b0), None);
+    render_bucket("sparse(B5)", Some(min_b5), None);
+    render_bucket("residual(B4-B0-B5)", residual_diff, None);
+    render_bucket(
+        "residual_minus_visible_set_build(B4-B0-B5-B8)",
+        residual_minus_visible_diff,
+        None,
+    );
+    render_bucket("visible_set_build(B8)", Some(min_b8), None);
+    render_bucket(
+        "dense_fast_path_contrast(B3, informational)",
+        Some(min_b3),
+        None,
+    );
+
+    println!(
+        "hybrid_profile: baseline round measurement (Issue #465) done — see \
+         docs/design/hybrid-rrf-latency-breakdown.md \"最新基線\" section for the transcribed \
+         attribution table and top-2-stage identification handed to Issue #548"
+    );
 
     println!(
         "hybrid_profile: done (see docs/design/hybrid-rrf-latency-breakdown.md for the \
