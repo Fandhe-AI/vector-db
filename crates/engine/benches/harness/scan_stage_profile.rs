@@ -1,0 +1,454 @@
+//! `agg_count`／`rls_isolation`／`vector_knn_where`（`docs/design/crossdb-bench.md`）
+//! の段別プロファイル（Issue #464。親 #456・ルート #455）向けの時間非依存ロジック。
+//!
+//! `scan_stage_profile_bench.rs`（実測本体・時間依存。`required-features =
+//! ["bench-internals"]`）と `tests/scan_stage_profile_accept.rs`（`make ci` 対象の
+//! 回帰。既定 feature でコンパイル）の双方から `#[path]` で取り込む。実測タイマー
+//! （`std::time::Instant`）には依存しない純関数のみを置く（`knn_wire.rs`
+//! （Issue #463）・`knn_profile.rs`（Issue #362）と同じ分離方針）。
+//!
+//! # 背景（測定対象の実行経路）
+//!
+//! - `agg_count`／`rls_isolation`（`SELECT COUNT(*) FROM docs`）は
+//!   `sql/aggregate.rs::execute_aggregate` を通り、`SqlArenaCache` を経由せず
+//!   毎クエリ redb を全行走査する。行ループは `redb 走査 → ヘッダデコード →
+//!   RLS 判定（`PolicyContext::is_visible` ＋ TABLE-12 キー/ヘッダ tenant 整合検査）
+//!   → dim/metadata 借用デコード（`DecodeTier::Fast` でも構造検証は行う。
+//!   `docs/design/aggregate-decode-skip.md`）→ `validate_scalar_columns` →
+//!   accumulator」の順（`sql/aggregate.rs` 冒頭コメント参照）。crossdb の可視性
+//!   モデル（tenant-a 23,000 行 Public・tenant-b 2,000 行 Private。wire セッションは
+//!   Public のみ可視）では `agg_count`（tenant-a 接続）と `rls_isolation`
+//!   （tenant-b 接続）は同一の `COUNT(*)`＝23,000 を返す同一走査であり、差は
+//!   `PolicyContext` のテナント文字列のみ。
+//! - `vector_knn_where`（`SELECT id FROM docs WHERE lang = 'ja' ORDER BY embedding
+//!   <=> '<vec>' LIMIT 10`）は `sql/exec.rs::execute_statement_with_cache` を通り、
+//!   `WHERE` があるため `cache_fast_path_eligible = false`。`SqlArenaCache`
+//!   ヒット時は全可視行に対し `on_visible_row`（`row_codec::scan_scalar_columns`
+//!   で全列を借用スキャン → `matches_all`）を呼び、一致行の embedding のみを
+//!   新規 arena へ複製したうえで `provider.search`（距離＋Top-k）を呼ぶ。
+//!
+//! # 段（stage）の定義
+//!
+//! A 系列（`agg_count`／`rls_isolation`。入れ子: A1 ⊆ A2 ⊆ A3 ⊆ A4 ⊆ A5）:
+//!
+//! | 段 | 内容 |
+//! | --- | --- |
+//! | A1 `redb_scan` | 生 `redb::Database` 再オープンで行テーブルを per-entry 走査するのみ |
+//! | A2 `header_decode` | A1 ＋ ヘッダデコード（[`super::knn_profile::decode_header_reimpl`]） |
+//! | A3 `rls_visible` | A2 ＋ `PolicyContext::is_visible`（不可視行は除外）＋ キー/ヘッダ tenant 整合検査 |
+//! | A4 `dim_meta_decode` | A3 ＋ dim・metadata 借用デコード（[`decode_dim_and_metadata_reimpl`]） |
+//! | A5 `scalar_validate` | A4 ＋ `row_codec::validate_scalar_columns` |
+//!
+//! W 系列（`vector_knn_where`。入れ子: W1 ⊆ W2 ⊆ W3。W4 は別経路）:
+//!
+//! | 段 | 内容 |
+//! | --- | --- |
+//! | W1 `scalar_scan` | 可視行の metadata へ `row_codec::scan_scalar_columns` |
+//! | W2 `predicate` | W1 ＋ `lang = 'ja'` 判定（`declarative_filter::matches_all`） |
+//! | W3 `arena_copy` | W2 一致行の embedding を連続 `Vec<f32>` へ複製 |
+//! | W4 `provider_search` | 一致行のみへ `SearchProvider::search`（k=10） |
+//!
+//! ドリフト対策・fail-closed 検証・整合性検証は
+//! `docs/design/scan-stage-profile.md` を正本とする。
+//!
+//! `std`・`engine::row_codec`・`engine::policy`・`engine::storage::Visibility` の
+//! pub API のみに依存する（`super::knn_profile` は `std` のみ依存のため取り込み可能）。
+
+use std::fmt;
+use std::time::Duration;
+
+use engine::declarative_filter::{self, DeclarativeFilter, MetadataFilter};
+use engine::policy::PolicyContext;
+use engine::row_codec;
+
+use super::knn_profile::{decode_header_reimpl, KnnProfileError};
+
+/// [`decode_dim_and_metadata_reimpl`] が拒否する上限（`storage.rs::MAX_EMBEDDING_DIM`・
+/// `MAX_METADATA_LEN` と同種の防御をベンチ内デコード再実装側にも独立に持たせる。
+/// `knn_profile.rs::MAX_REIMPL_DIM`／`MAX_REIMPL_METADATA_LEN` と同値）。
+pub use super::knn_profile::{MAX_REIMPL_DIM, MAX_REIMPL_METADATA_LEN};
+
+/// 本モジュールのエラー型（`knn_profile.rs::KnnProfileError`・`knn_wire.rs::
+/// KnnWireError` と同じ理由で独立させる）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScanStageError {
+    /// `GITHUB_ACTIONS` 環境下での実行が拒否された。
+    RefusedUnderGitHubActions,
+    /// `BENCH_SCAN_PROFILE_ROUNDS` の値が数値として解釈できない、または範囲外だった。
+    InvalidRounds(String),
+    /// `BENCH_SCAN_PROFILE_SCALE` の値が不正だった。
+    InvalidScale(String),
+    /// ベンチ内デコード再実装が行バイト列を解釈できなかった（破損・レイアウト
+    /// ドリフトのいずれか）。
+    Codec(String),
+    /// 整合性検証（行数・可視行数・COUNT 期待値・id 境界等）が不成立だった。
+    ConsistencyViolation(String),
+    /// 統計計算対象のサンプル列が空だった。
+    EmptySamples,
+    /// 比率計算の分母が 0 で NaN／inf 化する状態だった。
+    DegenerateRatio(&'static str),
+}
+
+impl fmt::Display for ScanStageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScanStageError::RefusedUnderGitHubActions => write!(
+                f,
+                "scan_stage_profile_bench refuses to run under GitHub Actions (GITHUB_ACTIONS is set); this bench is manual-only and not wired into any workflow"
+            ),
+            ScanStageError::InvalidRounds(reason) => {
+                write!(f, "invalid BENCH_SCAN_PROFILE_ROUNDS: {reason}")
+            }
+            ScanStageError::InvalidScale(reason) => {
+                write!(f, "invalid BENCH_SCAN_PROFILE_SCALE: {reason}")
+            }
+            ScanStageError::Codec(msg) => write!(f, "row decode failed: {msg}"),
+            ScanStageError::ConsistencyViolation(msg) => {
+                write!(f, "consistency check failed: {msg}")
+            }
+            ScanStageError::EmptySamples => write!(f, "empty sample set"),
+            ScanStageError::DegenerateRatio(reason) => write!(f, "degenerate ratio: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for ScanStageError {}
+
+impl From<KnnProfileError> for ScanStageError {
+    fn from(e: KnnProfileError) -> Self {
+        ScanStageError::Codec(e.to_string())
+    }
+}
+
+/// `GITHUB_ACTIONS` 下での実行を拒否する（`knn_profile.rs::refuse_under_github_actions`
+/// と同一パターン）。
+pub fn refuse_under_github_actions(under_github_actions: bool) -> Result<(), ScanStageError> {
+    if under_github_actions {
+        return Err(ScanStageError::RefusedUnderGitHubActions);
+    }
+    Ok(())
+}
+
+/// ラウンド数の下限・上限・既定値（`knn_wire.rs::{MIN,MAX,DEFAULT}_ROUNDS` と
+/// 同値・同じ根拠: `docs/design/benchmark-judgement-policy.md` §3「交互実行
+/// min-of-N（N≥5）」）。
+pub const MIN_ROUNDS: u32 = 5;
+pub const MAX_ROUNDS: u32 = 50;
+pub const DEFAULT_ROUNDS: u32 = 5;
+
+/// `BENCH_SCAN_PROFILE_ROUNDS` を fail-closed にパースする
+/// （`knn_wire.rs::parse_rounds` と同型）。
+pub fn parse_rounds(raw: Option<&str>) -> Result<u32, ScanStageError> {
+    let raw = match raw {
+        None => return Ok(DEFAULT_ROUNDS),
+        Some(raw) => raw,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(DEFAULT_ROUNDS);
+    }
+    let value: u32 = trimmed
+        .parse()
+        .map_err(|_| ScanStageError::InvalidRounds(format!("{raw:?} is not a valid u32")))?;
+    if value < MIN_ROUNDS {
+        return Err(ScanStageError::InvalidRounds(format!(
+            "{value} is below the protocol minimum {MIN_ROUNDS}"
+        )));
+    }
+    if value > MAX_ROUNDS {
+        return Err(ScanStageError::InvalidRounds(format!(
+            "{value} exceeds the protocol maximum {MAX_ROUNDS}"
+        )));
+    }
+    Ok(value)
+}
+
+/// 規模倍率の上限（`bench_engine.rs::parse_scale` を薄くラップする。
+/// 1 倍＝25,000 行・4 倍＝100,000 行を許容する Issue #464 の受け入れ条件に合わせ
+/// 上限を 4 とする）。
+pub const MAX_SCALE: u64 = 4;
+
+/// `BENCH_SCAN_PROFILE_SCALE` を fail-closed にパースする
+/// （`bench_engine.rs::parse_scale` へ委譲し、エラー型のみ本モジュール向けに
+/// 変換する）。
+pub fn parse_scale(raw: Option<&str>) -> Result<u64, ScanStageError> {
+    super::bench_engine::parse_scale(raw, MAX_SCALE)
+        .map_err(|e| ScanStageError::InvalidScale(e.to_string()))
+}
+
+/// A4 段（dim・metadata 借用デコード）の再実装本体。[`super::knn_profile::
+/// decode_row_reimpl`] と同じ検証順序・エラー条件を踏襲しつつ、embedding の
+/// f32 変換（ヒープ確保を伴う `out_embedding.push` ループ）を行わず、embedding
+/// バイト範囲の境界検証のみで読み飛ばす（`storage.rs::
+/// decode_row_dim_and_metadata_borrowed` が「embedding をデコードせず dim と
+/// metadata borrowed slice のみを返す」設計であるのに対応する再実装。当該関数は
+/// `pub(crate)` のためベンチから直接呼べない。モジュール冒頭コメント参照）。
+///
+/// 戻り値は `(dim, metadata)`。`metadata` は `buf` を借用した slice
+/// （ヒープアロケーションを伴わない）。
+pub fn decode_dim_and_metadata_reimpl(buf: &[u8]) -> Result<(u32, &[u8]), ScanStageError> {
+    let (_tenant_id, _is_public, mut offset) = decode_header_reimpl(buf)?;
+
+    let dim_end = offset
+        .checked_add(4)
+        .ok_or_else(|| ScanStageError::Codec("offset overflow at dim".to_string()))?;
+    let dim_bytes = buf
+        .get(offset..dim_end)
+        .ok_or_else(|| ScanStageError::Codec("truncated at dim".to_string()))?;
+    let dim_arr: [u8; 4] = dim_bytes
+        .try_into()
+        .map_err(|_| ScanStageError::Codec("dim is not 4 bytes".to_string()))?;
+    let dim = u32::from_le_bytes(dim_arr);
+    if dim > MAX_REIMPL_DIM {
+        return Err(ScanStageError::Codec(format!(
+            "dim {dim} exceeds reimpl limit {MAX_REIMPL_DIM}"
+        )));
+    }
+    offset = dim_end;
+
+    let embedding_bytes_len = (dim as usize)
+        .checked_mul(4)
+        .ok_or_else(|| ScanStageError::Codec("embedding byte length overflow".to_string()))?;
+    let embedding_end = offset
+        .checked_add(embedding_bytes_len)
+        .ok_or_else(|| ScanStageError::Codec("offset overflow at embedding".to_string()))?;
+    if buf.get(offset..embedding_end).is_none() {
+        return Err(ScanStageError::Codec("truncated at embedding".to_string()));
+    }
+    offset = embedding_end;
+
+    let metadata_len_end = offset
+        .checked_add(4)
+        .ok_or_else(|| ScanStageError::Codec("offset overflow at metadata_len".to_string()))?;
+    let metadata_len_bytes = buf
+        .get(offset..metadata_len_end)
+        .ok_or_else(|| ScanStageError::Codec("truncated at metadata_len".to_string()))?;
+    let metadata_len_arr: [u8; 4] = metadata_len_bytes
+        .try_into()
+        .map_err(|_| ScanStageError::Codec("metadata_len is not 4 bytes".to_string()))?;
+    let metadata_len = u32::from_le_bytes(metadata_len_arr);
+    if metadata_len > MAX_REIMPL_METADATA_LEN {
+        return Err(ScanStageError::Codec(format!(
+            "metadata_len {metadata_len} exceeds reimpl limit {MAX_REIMPL_METADATA_LEN}"
+        )));
+    }
+    offset = metadata_len_end;
+
+    let metadata_end = offset
+        .checked_add(metadata_len as usize)
+        .ok_or_else(|| ScanStageError::Codec("offset overflow at metadata".to_string()))?;
+    let metadata = buf
+        .get(offset..metadata_end)
+        .ok_or_else(|| ScanStageError::Codec("row buffer truncated at metadata".to_string()))?;
+    if metadata_end != buf.len() {
+        return Err(ScanStageError::Codec(
+            "row buffer has trailing bytes beyond declared metadata length".to_string(),
+        ));
+    }
+
+    Ok((dim, metadata))
+}
+
+/// `storage.rs::verify_row_key_tenant`（`pub(crate)`）の再実装（A3 段。
+/// キー側 tenant とヘッダ側 tenant の単純な等値検査で、`pub(crate)` API を
+/// 経由しない）。不一致は TABLE-12 の整合性違反として `Err` にする。
+pub fn verify_row_key_tenant_reimpl(
+    key_tenant: &str,
+    header_tenant: &str,
+) -> Result<(), ScanStageError> {
+    if key_tenant != header_tenant {
+        return Err(ScanStageError::Codec(format!(
+            "row key tenant {key_tenant:?} does not match header tenant {header_tenant:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// `lang = 'ja'` 相当の束縛済みメタデータフィルタを構築する（W2 段。
+/// `declarative_filter::DeclarativeFilter::equals` → `bind` の pub API 経由）。
+pub fn build_lang_filter(
+    schema: &engine::catalog::TableSchema,
+    column: &str,
+    value: &str,
+) -> Result<MetadataFilter, ScanStageError> {
+    DeclarativeFilter::equals(column, value)
+        .bind(schema)
+        .map_err(|e| ScanStageError::Codec(e.to_string()))
+}
+
+/// W2 段本体: `scan_scalar_columns` 済みの値へ `filters` を適用する薄いラッパー
+/// （`declarative_filter::matches_all` そのもの。呼び出し側の可読性のため
+/// 名前だけ用意する）。
+pub fn matches_lang_filter(filters: &[MetadataFilter], scanned: &[Option<&str>]) -> bool {
+    declarative_filter::matches_all(filters, scanned)
+}
+
+/// W1 段本体: `row_codec::scan_scalar_columns` の薄いラッパー（pub API を直接
+/// 呼ぶだけだが、呼び出し側の意図を明確にするため名前を用意する）。
+pub fn scan_scalar_columns<'a>(
+    schema: &engine::catalog::TableSchema,
+    metadata: &'a [u8],
+) -> Result<Vec<Option<&'a str>>, ScanStageError> {
+    row_codec::scan_scalar_columns(schema, metadata)
+        .map_err(|e| ScanStageError::Codec(e.to_string()))
+}
+
+/// [`PolicyContext::is_visible`] の薄いラッパー（A3 段の可読性のため）。
+pub fn is_visible(
+    ctx: &PolicyContext,
+    row_tenant: &str,
+    row_visibility: engine::storage::Visibility,
+) -> bool {
+    ctx.is_visible(row_tenant, row_visibility)
+}
+
+/// 1 段あたりの ns/行換算（`knn_profile.rs::ns_per_row` と同型）。
+pub fn ns_per_row(total: Duration, rows: usize) -> Result<f64, ScanStageError> {
+    if rows == 0 {
+        return Err(ScanStageError::ConsistencyViolation(
+            "cannot compute ns/row for zero rows".to_string(),
+        ));
+    }
+    Ok(total.as_secs_f64() * 1e9 / rows as f64)
+}
+
+/// 2 段間の差分を ns/行へ換算する（`knn_profile.rs::stage_diff_ns_per_row` と同型。
+/// 入れ子な累積段どうしの比較であり、逆転は測定異常として `Err` を返す）。
+pub fn stage_diff_ns_per_row(
+    earlier: Duration,
+    later: Duration,
+    rows: usize,
+    earlier_name: &'static str,
+    later_name: &'static str,
+) -> Result<f64, ScanStageError> {
+    let diff = later.checked_sub(earlier).ok_or_else(|| {
+        ScanStageError::ConsistencyViolation(format!(
+            "stage timings are not monotonically non-decreasing: {earlier_name} > {later_name}"
+        ))
+    })?;
+    ns_per_row(diff, rows)
+}
+
+/// 所要時間列の最小値（min-of-N。`knn_wire.rs::min_of` と同型）。
+pub fn min_of(samples: &[Duration]) -> Result<Duration, ScanStageError> {
+    samples
+        .iter()
+        .copied()
+        .min()
+        .ok_or(ScanStageError::EmptySamples)
+}
+
+/// 所要時間列の中央値（median-of-N。`knn_wire.rs::median_of` と同型）。
+pub fn median_of(samples: &[Duration]) -> Result<Duration, ScanStageError> {
+    if samples.is_empty() {
+        return Err(ScanStageError::EmptySamples);
+    }
+    let mut sorted: Vec<Duration> = samples.to_vec();
+    sorted.sort_unstable();
+    let mid = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        Ok((sorted[mid - 1] + sorted[mid]) / 2)
+    } else {
+        Ok(sorted[mid])
+    }
+}
+
+/// 参照区間帯（`knn_wire.rs::reference_band` と同型）: 変更を含まない区間
+/// （本ベンチでは距離カーネルのみの R_dot）の複数ラウンド中央値列から
+/// `(max - min) / min` を算出する。
+pub fn reference_band(round_medians: &[Duration]) -> Result<f64, ScanStageError> {
+    let min = min_of(round_medians)?;
+    let max = round_medians
+        .iter()
+        .copied()
+        .max()
+        .ok_or(ScanStageError::EmptySamples)?;
+    if min.is_zero() {
+        return Err(ScanStageError::DegenerateRatio(
+            "reference_band: min of round medians is zero",
+        ));
+    }
+    Ok((max.as_secs_f64() - min.as_secs_f64()) / min.as_secs_f64())
+}
+
+/// 固定 ±5% 帯（`knn_wire.rs::FIXED_BAND_PCT` と同値）。
+pub const FIXED_BAND_PCT: f64 = 5.0;
+
+/// ノイズ帯判定（`knn_wire.rs::BandClass`／`classify_against_bands` と同型）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandClass {
+    WithinNoiseBand,
+    AboveNoiseBand,
+}
+
+impl fmt::Display for BandClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BandClass::WithinNoiseBand => write!(f, "within_noise_band"),
+            BandClass::AboveNoiseBand => write!(f, "above_noise_band"),
+        }
+    }
+}
+
+pub fn classify_against_bands(diff_ratio_pct: f64, reference_band_pct: f64) -> BandClass {
+    let band = FIXED_BAND_PCT.max(reference_band_pct);
+    if diff_ratio_pct.abs() <= band {
+        BandClass::WithinNoiseBand
+    } else {
+        BandClass::AboveNoiseBand
+    }
+}
+
+/// 対象区間自身の増分率 `|to/from - 1| * 100`（`knn_wire.rs::step_ratio_pct` と同型）。
+pub fn step_ratio_pct(from: Duration, to: Duration) -> Result<f64, ScanStageError> {
+    if from.is_zero() {
+        return Err(ScanStageError::DegenerateRatio(
+            "step_ratio_pct: from duration is zero",
+        ));
+    }
+    Ok((to.as_secs_f64() / from.as_secs_f64() - 1.0) * 100.0)
+}
+
+/// 走査行数がすべて一致することを検証する（`knn_profile.rs::
+/// assert_scan_row_counts_match` と同型）。
+pub fn assert_scan_row_counts_match(
+    counts: &[(&'static str, usize)],
+) -> Result<(), ScanStageError> {
+    let Some((_, first)) = counts.first() else {
+        return Ok(());
+    };
+    for (name, count) in counts {
+        if count != first {
+            return Err(ScanStageError::ConsistencyViolation(format!(
+                "row count mismatch at stage {name}: expected {first}, got {count}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 1 段の実測結果を人間可読な 1 行へ整形する（`knn_profile.rs::render_stage_line`
+/// と同型。本ベンチは spec 由来の閾値を持たない情報提供専用のため、実測値を
+/// そのまま出力してよい）。
+pub fn render_stage_line(name: &str, rows: usize, median: Duration, ns_per_row: f64) -> String {
+    format!(
+        "stage({name}): rows={rows} median={:.3}ms ns_per_row={ns_per_row:.1}",
+        median.as_secs_f64() * 1e3
+    )
+}
+
+/// 段間差分の結果を 1 行へ整形する（`knn_profile.rs::render_diff_line` と同型）。
+pub fn render_diff_line(from: &str, to: &str, diff_ns_per_row: f64) -> String {
+    format!("diff({from}->{to}): ns_per_row={diff_ns_per_row:.1}")
+}
+
+/// 区分（bucket）1 行の描画（`knn_wire.rs::render_bucket_line` に相当。W 系列の
+/// 「どの段が占有率何%か」を示す出力用）。
+pub fn render_bucket_line(
+    label: &str,
+    diff_ns_per_row: f64,
+    ratio_pct: f64,
+    band: BandClass,
+) -> String {
+    format!("bucket({label}): ns_per_row={diff_ns_per_row:.1} ratio={ratio_pct:.2}% band={band}")
+}

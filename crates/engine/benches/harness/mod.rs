@@ -72,6 +72,7 @@ pub mod proc_stats;
 pub mod protocol;
 pub mod rng;
 pub mod scalar_reference;
+pub mod scan_stage_profile;
 pub mod sql_c1;
 pub mod stats;
 pub mod tier;

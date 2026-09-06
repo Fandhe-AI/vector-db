@@ -298,6 +298,10 @@ make bench-crossdb
 
 `make bench-knn-wire-profile`（`crates/wire-server/benches/knn_wire_profile_bench.rs`）は、`docs/design/crossdb-bench.md` の `vector_knn` 786µs を wire／SQL 表層／距離カーネル・Top-k の 4 区分へ切り分けます。`BENCH_KNN_WIRE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds パース・帰属計算・ノイズ帯判定）は `crates/wire-server/tests/knn_wire_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計の詳細は `docs/design/knn-wire-stage-profile.md` を参照してください。
 
+### 全行走査経路の段別プロファイル（Issue #464）
+
+`make bench-scan-stage-profile`（`crates/engine/benches/scan_stage_profile_bench.rs`）は、`docs/design/crossdb-bench.md` で self が最劣後する `agg_count`／`rls_isolation`／`vector_knn_where` の redb 全行走査・ヘッダデコード・RLS 判定（`PolicyContext::is_visible`＋TABLE-12 キー/ヘッダ整合検査）・dim/metadata デコード・`WHERE` 述語評価・arena 複製の段別内訳を切り分けます。`BENCH_SCAN_PROFILE_ROUNDS`（既定 5・5〜50）でラウンド数、`BENCH_SCAN_PROFILE_SCALE`（既定 1＝25,000 行・4＝100,000 行。1 プロセス = 1 規模点）で規模、`BENCH_DEDICATED_ENV=1` で専有環境自己申告を指定できます。spec 由来の閾値なし・情報提供専用・手動実行・CI 非配線（`GITHUB_ACTIONS` 環境下では起動直後に拒否します）。判定ロジック自体（rounds/scale パース・段間差分・ノイズ帯判定・整合性検証）は `crates/engine/tests/scan_stage_profile_accept.rs` で `make ci` から回帰検証します。実測結果・計測設計・後続 Issue（#477・#471）への帰属分析の詳細は `docs/design/scan-stage-profile.md` を参照してください。
+
 ### GPU バッチ検索の規模スイープ（`make bench-gpu-scaling`）
 
 `engine::gpu_batch`（f16 常駐）と CPU-SIMD バッチ経路の規模 × バッチサイズ別比較を行います。`BENCH_GPU_SCALING_ROWS`／`DIMS`／`BATCH`／`TOPK`／`ITERS` で計測条件を上書きできます。GPU 実機必須・手動実行専用ベンチで CI 非配線です。実測結果は `docs/design/crossdb-bench.md`「GPU」節を参照してください。
