@@ -871,29 +871,69 @@ enum ScoreScope<'a> {
 /// 親 #545・#390 レビュー指摘「N 非依存化フォローアップ」への対応）。
 ///
 /// 不変条件（プールへ返却する時点・プールから取り出した直後のいずれでも成立）:
-/// `acc` の全要素は `0.0`、`touched`・`visible_hits` は空（`clear()` 済みで
-/// capacity は保持）、`k1_len_norm_cache` は空。[`SparseIndex::release_scratch`]
-/// がこの不変条件を回復してからプールへ戻す（`touched` に記録された `doc_idx`
-/// のみをゼロ戻しする。「`acc[idx] == 0.0` ⇔ 未加算」という [`SparseIndex::
-/// score_pass`] の不変条件により、`touched` に載っていない要素は既に `0.0`
-/// であるため、全要素走査によるゼロクリアと結果は同一）。
+/// `acc` の全要素は `0.0`、`touched`・`visible_hits`・`touched_classes` は空
+/// （`clear()` 済みで capacity は保持）、`k1_len_norm_cache` は空。
+/// [`SparseIndex::release_scratch`] がこの不変条件を回復してからプールへ戻す
+/// （`touched` に記録された `doc_idx` のみをゼロ戻しする。「`acc[idx] == 0.0`
+/// ⇔ 未加算」という [`SparseIndex::score_pass`] の不変条件により、`touched` に
+/// 載っていない要素は既に `0.0` であるため、全要素走査によるゼロクリアと結果は
+/// 同一）。`k1_len_norm_cache` も同様に `touched_classes`（初めて `entry` へ
+/// 挿入した文書長クラスを記録した列。Issue #546 レビュー指摘・PR #565: 巨大な
+/// `HashMap::clear()` は要素数でなく確保済み容量に比例するため、多数の相異なる
+/// 文書長クラスにヒットしたクエリの後で 1 件しかヒットしない後続クエリが返却
+/// されても容量分のコストを毎回払ってしまう）を使い、[`ScoreScratch::
+/// clear_len_norm_cache`] でタッチしたキーだけを `remove` することで
+/// `O(M)`（`M` = そのパスで実際にタッチした文書長クラス数）を維持する。
 #[derive(Debug)]
 struct ScoreScratch {
     acc: Vec<f64>,
     touched: Vec<u32>,
     visible_hits: Vec<(u32, u32)>,
     k1_len_norm_cache: HashMap<u32, f64>,
+    /// `k1_len_norm_cache` へ初めて挿入した文書長クラスを挿入順に記録した列
+    /// （Issue #546 レビュー指摘・PR #565）。`k1_len_norm_cache` のキー集合と
+    /// 常に一致し、[`ScoreScratch::clear_len_norm_cache`] が `O(M)` での
+    /// クリアに使う。
+    touched_classes: Vec<u32>,
 }
 
 impl ScoreScratch {
     /// 索引の文書数 `n`（`doc_ids.len()`）に対応する全ゼロの新規スクラッチを
     /// 確保する（[`SparseIndex::acquire_scratch`] のプール枯渇時フォールバック）。
+    ///
+    /// `touched`・`visible_hits` は `Vec::with_capacity(n)` で容量を `n` に
+    /// 固定する（codex-review 指摘・PR #565: 空 `Vec::new()` から `push` で
+    /// 成長させると標準ライブラリの倍々戦略により最終容量が要求長 `n` を
+    /// 超えうる〔`n` が 2 の冪+1 付近だと最大で概ね `2n` 弱まで〕。両フィールドの
+    /// 要素数は不変条件により常に `n` 以下（`touched` は相異なる `doc_idx` の
+    /// 集合、`visible_hits` は 1 つの posting list 長で抑えられ、いずれも
+    /// コーパス文書数 `n` を超えない）であるため、生成時に容量を `n` へ固定
+    /// すれば以後の `push` で `n` を超えて再確保されることはなく、
+    /// [`SparseIndex::approx_heap_bytes`] が計上する「容量 `n` ぶん」の
+    /// 見積もりと実際の確保量が常に一致する。
     fn new_for(n: usize) -> Self {
         Self {
             acc: vec![0.0; n],
-            touched: Vec::new(),
-            visible_hits: Vec::new(),
+            touched: Vec::with_capacity(n),
+            visible_hits: Vec::with_capacity(n),
             k1_len_norm_cache: HashMap::new(),
+            // 相異なる文書長クラス数（`len_classes.len()`）は文書数 `n` を
+            // 超えないため、`touched`/`visible_hits` と同じ理由で容量を `n` へ
+            // 固定する（Issue #546 レビュー指摘・PR #565）。
+            touched_classes: Vec::with_capacity(n),
+        }
+    }
+
+    /// `k1_len_norm_cache` を `touched_classes` に記録された文書長クラスだけを
+    /// `remove` することでクリアする（Issue #546 レビュー指摘・PR #565）。
+    /// `HashMap::clear()` は確保済み容量（過去に大きく育った制御領域）に比例する
+    /// 処理量になり得るため、実際にタッチしたキー集合（`O(M)`）だけを取り除く。
+    /// `touched_classes` は `k1_len_norm_cache` のキー集合と 1 対 1 に対応する
+    /// （挿入は必ず `entry().or_insert_with` の `Vacant` 分岐でのみ行われ、その
+    /// 場でだけ `touched_classes` へ記録するため）。
+    fn clear_len_norm_cache(&mut self) {
+        for class in self.touched_classes.drain(..) {
+            self.k1_len_norm_cache.remove(&class);
         }
     }
 }
@@ -982,10 +1022,15 @@ impl SparseIndex {
 
     /// スクラッチをプールへ返却する（[`ScorePass::drop`] から呼ばれる）。返却前に
     /// `touched` に記録された `doc_idx` のみをゼロ戻しし（[`ScoreScratch`] の
-    /// 不変条件を回復）、`touched`/`visible_hits`/`k1_len_norm_cache` は
-    /// `clear()`（capacity は維持し次回確保コストを避ける）。プールが
-    /// [`MAX_SCORE_SCRATCH_POOL`] に達していれば返却せず破棄する（有界プール）。
-    /// ロックは push のみの短時間保持。
+    /// 不変条件を回復）、`touched`/`visible_hits` は `clear()`（capacity は
+    /// 維持し次回確保コストを避ける）。`k1_len_norm_cache` は
+    /// [`ScoreScratch::clear_len_norm_cache`] で `touched_classes` に記録された
+    /// キーのみを `remove` する（Issue #546 レビュー指摘・PR #565: `HashMap::
+    /// clear()` は確保済み容量に比例するため、多数の文書長クラスにヒットした
+    /// 過去のクエリの容量が残ったまま `clear()` すると、後続の小さいクエリの
+    /// 返却コストまで肥大化する）。プールが [`MAX_SCORE_SCRATCH_POOL`] に
+    /// 達していれば返却せず破棄する（有界プール）。ロックは push のみの短時間
+    /// 保持。
     fn release_scratch(&self, mut scratch: ScoreScratch) {
         for &doc_idx in &scratch.touched {
             if let Some(slot) = scratch.acc.get_mut(doc_idx as usize) {
@@ -994,7 +1039,7 @@ impl SparseIndex {
         }
         scratch.touched.clear();
         scratch.visible_hits.clear();
-        scratch.k1_len_norm_cache.clear();
+        scratch.clear_len_norm_cache();
 
         let mut pool = self
             .scratch_pool
@@ -1640,12 +1685,17 @@ impl SparseIndex {
         // 空の状態で渡ってくるが、防御的に（呼び出し元・プール実装の変更に対する
         // 縮退耐性として）ここでも軽量なフィールド（`touched`/`visible_hits`/
         // `k1_len_norm_cache`。全要素走査を要する `acc` は対象外）を明示的に
-        // `clear()` し、母数の異なる前回パスの値が混入しないことを構造的に保証する
+        // クリアし、母数の異なる前回パスの値が混入しないことを構造的に保証する
         // （テナント縮約契約〔RLS 相当〕を壊さないための多重防御）。
+        // `k1_len_norm_cache` は `HashMap::clear()` ではなく
+        // [`ScoreScratch::clear_len_norm_cache`]（`touched_classes` に記録した
+        // キーのみ `remove`）を使う（Issue #546 レビュー指摘・PR #565: この
+        // 防御的クリアはパス毎に必ず実行されるため、`clear()` のまま残すと
+        // 確保済み容量に比例するコストを毎クエリ払ってしまう）。
         let mut scratch = self.acquire_scratch();
         scratch.touched.clear();
         scratch.visible_hits.clear();
-        scratch.k1_len_norm_cache.clear();
+        scratch.clear_len_norm_cache();
 
         // BM25 の `k1 * (k1+1)` 側の定数。
         // 文書長クラス別 `k1 * len_norm` テーブル値はクエリ内で `avgdl` が確定した
@@ -1679,6 +1729,7 @@ impl SparseIndex {
             touched,
             visible_hits,
             k1_len_norm_cache,
+            touched_classes,
         } = &mut scratch;
 
         for &term in query_ids {
@@ -1715,11 +1766,21 @@ impl SparseIndex {
                 let Some(&len) = self.len_classes.get(class as usize) else {
                     continue;
                 };
-                let kln = *k1_len_norm_cache.entry(class).or_insert_with(|| {
-                    self.k1
-                        * (1.0 - self.b
-                            + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)))
-                });
+                // `entry` の `Vacant` 分岐でのみ新規キーを挿入し、その場で
+                // `touched_classes` へ記録する（Issue #546 レビュー指摘・
+                // PR #565）。`touched_classes` が `k1_len_norm_cache` のキー集合と
+                // 1 対 1 に対応するのはこの 1 箇所だけが挿入経路であるため。
+                let kln = match k1_len_norm_cache.entry(class) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let value = self.k1
+                            * (1.0 - self.b
+                                + self.b * (f64::from(len) / avg_doc_len.max(f64::MIN_POSITIVE)));
+                        entry.insert(value);
+                        touched_classes.push(class);
+                        value
+                    }
+                };
                 let f = f64::from(tf);
                 let numerator = f * k1_plus_1;
                 let denominator = f + kln;
@@ -1845,24 +1906,30 @@ impl SparseIndex {
         // 挿入時点で 1 回だけ評価する容量判定（`MAX_SPARSE_CACHE_TOTAL_BYTES`）が
         // 実確保量を下回らないようにする（Issue #357 レビュー指摘・codex-review P1:
         // 過少計上によるこの容量判定の回避を防ぐ、という本関数の既存方針を踏襲）。
-        // 1 本あたり: `acc`（`Vec<f64>`。長さ `N`）・`touched`/`visible_hits` の
-        // 最悪ケース容量（`touched` は `N` 件、`visible_hits` は 1 term の posting
-        // list 長で `N` を超えないため、いずれも `N` を上限として計上）・
+        // 1 本あたり: `acc`（`Vec<f64>`。長さ `N`）・`touched`/`visible_hits`/
+        // `touched_classes` の容量（[`ScoreScratch::new_for`] が `Vec::
+        // with_capacity(N)` で `N` に固定するため実確保量と一致する。Issue #546
+        // レビュー指摘・PR #565: 以前は空 `Vec::new()` から `push` で育てており、
+        // 標準ライブラリの倍々戦略により最終容量が `N` を超えうる〔`N` が
+        // 2 の冪+1 付近だと最大で概ね `2N` 弱まで〕過小計上の余地があった）・
         // `k1_len_norm_cache`（`HashMap<u32, f64>`。相異なる文書長クラス数 =
         // `len_classes.len()` が上限）。`N = MAX_CORPUS_DOCS`（100,000）のとき
-        // 1 本あたり概算 (8 + 4 + 8) × 100,000 ≈ 2.0 MB、
-        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 8 MB／索引。`MAX_SPARSE_CACHE_TOTAL_BYTES`
-        // （= `MAX_ARENA_TOTAL_BYTES` = 1 GiB）に対し十分小さい桁に収まる。
+        // 1 本あたり概算 (8 + 4 + 4 + 8) × 100,000 ≈ 2.4 MB、
+        // `MAX_SCORE_SCRATCH_POOL`（4 本）で約 9.6 MB／索引。
+        // `MAX_SPARSE_CACHE_TOTAL_BYTES`（= `MAX_ARENA_TOTAL_BYTES` = 1 GiB）に
+        // 対し十分小さい桁に収まる。
         let n = self.doc_ids.len();
         let scratch_acc = n.saturating_mul(std::mem::size_of::<f64>());
         let scratch_touched = n.saturating_mul(std::mem::size_of::<u32>());
         let scratch_visible_hits = n.saturating_mul(std::mem::size_of::<(u32, u32)>());
+        let scratch_touched_classes = n.saturating_mul(std::mem::size_of::<u32>());
         let scratch_len_norm_cache = self.len_classes.len().saturating_mul(
             std::mem::size_of::<(u32, f64)>().saturating_add(Self::HASHMAP_ENTRY_OVERHEAD_BYTES),
         );
         let scratch_one = scratch_acc
             .saturating_add(scratch_touched)
             .saturating_add(scratch_visible_hits)
+            .saturating_add(scratch_touched_classes)
             .saturating_add(scratch_len_norm_cache);
         let scratch_pool_upper_bound = scratch_one.saturating_mul(MAX_SCORE_SCRATCH_POOL);
         terms
@@ -2800,6 +2867,7 @@ mod tests {
             assert!(scratch.touched.is_empty());
             assert!(scratch.visible_hits.is_empty());
             assert!(scratch.k1_len_norm_cache.is_empty());
+            assert!(scratch.touched_classes.is_empty());
         }
     }
 
