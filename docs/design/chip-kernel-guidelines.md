@@ -45,7 +45,7 @@ rustc 1.96.0（`#[target_feature(enable="avx2,fma")]` 等の safe fn 内）で
 | i8 VNNI 内積 | 不要（safe） | `_mm256_dpbusd_avx_epi32` |
 | binary popcount | 不要（safe） | `_mm512_popcnt_epi64` |
 | マスク演算・reduce | 不要（safe） | `_mm512_maskz_mov_ps` / `_mm512_reduce_add_ps` |
-| prefetch | 不要（safe） | `_mm_prefetch::<_MM_HINT_T0>(slice.as_ptr() as *const i8)` |
+| prefetch | 不要（safe） | `_mm_prefetch::<_MM_HINT_T0>(slice.as_ptr() as *const i8)`（`#[target_feature]` fn の内側限定。通常の fn から直接呼ぶと E0133。呼び出し元が新規 `unsafe` を追加できない場合は `core::hint::black_box` による早期 load で代替する——`core::hint::prefetch_read`〔`hint_prefetch` feature〕は stable 未安定化。Issue #490 で機械検証・`hnsw/prefetch.rs` に適用） |
 | ポインタ load/store | 必要（unsafe） | `_mm256_loadu_ps` / `_mm256_storeu_ps`（E0133） |
 
 結論: ポインタを取る load/store 以外は、`#[target_feature]` fn の内側であれば
