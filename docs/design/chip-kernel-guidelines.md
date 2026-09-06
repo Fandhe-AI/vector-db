@@ -224,19 +224,20 @@ Graviton4／Grace は SVE2 でも 128 bit のため NEON と理論ピークが�
 
 ## 3. 追加カーネルの優先順
 
-Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 常駐 dim<=384 で
-悪化）。残る有効なレバーは (a) 行間マイクロカーネル、(b) 格納精度の削減
-（メモリ律速側）、(c) blocking／prefetch。
+Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 常駐 dim100/dim128
+の小次元で悪化。dim384 は cache 常駐で改善・arena 規模で非劣化）。残る有効な
+レバーは (a) 行間マイクロカーネル、(b) 格納精度の削減（メモリ律速側）、
+(c) blocking／prefetch。
 
 | 優先 | 施策 | 対象 | 根拠 | Rust | 既起票 |
 | ---- | ---- | ---- | ---- | ---- | ------ |
-| 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #509 |
-| 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #513 |
-| 3 | クライアント Intel の 256 bit 経路最適化 | Alder〜Arrow Lake | AVX-512 fuse off がクライアント主流 | stable 可 | #517 |
+| 1 | CPU f16 常駐＋F16C／NEON FP16 デコード | 全 | GPU 側の f16x2 常駐表現を CPU 側でも読めば arena 半減。L3 溢れ点が拡大 | stable 可 | #513 |
+| 2 | 行間マイクロカーネル（4〜8 行 × 1 クエリ） | 全 | #365 が潰したのは行内 ILP。行間の load 削減は別軸。Zen 5 の load 2×512b で特に効く | stable 可 | #509 |
+| 3 | クライアント Intel の 256 bit 経路最適化 | Alder〜Arrow Lake | AVX-512 fuse off がクライアント主流。#520 の AVX-VNNI（256 bit）側に含まれる | stable 可 | #520 |
 | 4 | AVX-512 BF16／VNNI 量子化スキャン | SPR／GNR／Zen 4／5 | ANN 候補生成限定で f32 再計算（HNSW の rescoring 契約と同型） | stable 1.89 | #520 |
-| 5 | AVX-VNNI i8 | クライアント Intel | 4 の 256 bit 版 | stable 1.89 | #524 |
-| 6 | NEON `sdot`/`udot` i8 | Apple／Graviton／Grace | 4 の Arm 版 | stable 1.98 | #527 |
-| 7 | AVX-512 FP16 ネイティブ | SPR／GNR | 変換コストも省く。対応チップ限定 | stable 1.94 | #530 |
+| 5 | AVX-VNNI i8 | クライアント Intel | 4 と同一 Issue（#520）の 256 bit 版 | stable 1.89 | #520 |
+| 6 | NEON `sdot`/`udot` i8 | Apple／Graviton／Grace | 4 の Arm 版 | stable 1.98 | #524 |
+| 7 | AVX-512 FP16 ネイティブ | SPR／GNR | 変換コストも省く。対応チップ限定。#513（F16C デコード）とは別方式で未起票 | stable 1.94 | — |
 | 8（低） | AMX／SME／SVE | SPR+／M4／Graviton | 細長い形状に不向き・OS 有効化・Rust API 不在 | nightly／不可 | — |
 
 ## 4. GPU 経路（`gpu_batch.rs`）の改善候補
@@ -251,8 +252,9 @@ Issue #365 で行内マルチアキュムレータ化は不採用済み（cache 
 
 ## 5. 既 Rejected との関係
 
-Issue #365（行内複数アキュムレータ）は cache 常駐 dim<=384 で悪化したことを
-理由に不採用としたが、arena 規模かつ dim>=768 限定では改善が確認されている。
+Issue #365（行内複数アキュムレータ）は cache 常駐 dim100/dim128 の小次元で
+悪化したことを理由に不採用としたが（dim384 は cache 常駐で改善・arena 規模で
+非劣化）、arena 規模かつ dim>=768 限定では改善が確認されている。
 本 doc §3 の優先 1〜7 はいずれも dim>=768 限定ディスパッチ（#517）や量子化
 opt-in 経路（#520 等）に閉じており、#365 が不採用とした「全 dim 一律の複数
 アキュムレータ化」を再提案するものではない。詳細な対応表は
