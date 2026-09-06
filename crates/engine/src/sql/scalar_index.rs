@@ -213,24 +213,57 @@ impl TextColumnIndex {
     }
 
     /// この列が保持する文字列実体・補助配列の概算ヒープバイト量。
+    ///
+    /// `values`/`offsets`/`slots`/`equality` はいずれも構築時に
+    /// `try_reserve`/`try_reserve_exact` で重複排除前の `pair_count` 件分を
+    /// 一括確保するため、重複が多い列では実要素数（`len()`）が確保容量
+    /// （`capacity()`）を大きく下回る。`len()` だけを計上すると実際に確保
+    /// 済みのメモリを過小計上し、[`ScalarIndexCache`] の総量上限（1 GiB）に
+    /// よる追い出しが実メモリ量に対して働かなくなる（codex-review P1 対応・
+    /// PR #569 未解決分）。確保容量ベースで保守的に計上し、この値をキャッシュ
+    /// 登録・追い出し判定にも使う契約とする。
     fn approx_heap_bytes(&self) -> usize {
-        let values_bytes: usize = self
+        // `values: Vec<String>` は外側 Vec の確保容量（`String` 構造体サイズ
+        // 分）に加え、各 `String` 自身の確保容量（中身のバイト列）も計上する。
+        // 個々の `String` は `try_owned_string` で複製された時点の長さぴったり
+        // に確保される想定だが、`len()` ではなく `capacity()` を使うことで
+        // 標準ライブラリの確保戦略が変わっても過小計上側に倒れないようにする。
+        let values_outer_bytes = self
+            .values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<String>());
+        let values_inner_bytes: usize = self
             .values
             .iter()
-            .map(|v| v.len().saturating_add(std::mem::size_of::<String>()))
+            .map(String::capacity)
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        let values_bytes = values_outer_bytes.saturating_add(values_inner_bytes);
         let offsets_bytes = self
             .offsets
-            .len()
+            .capacity()
             .saturating_mul(std::mem::size_of::<u32>());
-        let slots_bytes = self.slots.len().saturating_mul(std::mem::size_of::<u32>());
+        let slots_bytes = self
+            .slots
+            .capacity()
+            .saturating_mul(std::mem::size_of::<u32>());
         // `HashMap` のキーは `values` と同じ文字列を複製保持する（`equality`
         // が値 → 添字の直引き専用であり `values` への参照を持たないため）。
-        let equality_bytes: usize = self
+        // 実要素分（キー文字列の確保容量＋エントリ構造体サイズ）に加え、
+        // `capacity()` が実要素数を上回る分（未使用バケット）もエントリ構造体
+        // サイズ分だけ保守的に計上する。
+        let equality_len = self.equality.len();
+        let equality_entries_bytes: usize = self
             .equality
             .keys()
-            .map(|k| k.len().saturating_add(std::mem::size_of::<(String, u32)>()))
+            .map(|k| {
+                k.capacity()
+                    .saturating_add(std::mem::size_of::<(String, u32)>())
+            })
             .fold(0usize, |acc, n| acc.saturating_add(n));
+        let equality_unused_slots = self.equality.capacity().saturating_sub(equality_len);
+        let equality_unused_bytes =
+            equality_unused_slots.saturating_mul(std::mem::size_of::<(String, u32)>());
+        let equality_bytes = equality_entries_bytes.saturating_add(equality_unused_bytes);
         values_bytes
             .saturating_add(offsets_bytes)
             .saturating_add(slots_bytes)
@@ -1139,6 +1172,52 @@ mod tests {
             check_scalar_index_budget(0, reservation_bytes),
             Err(ScalarIndexBuildError::TooLarge)
         ));
+    }
+
+    #[test]
+    fn text_column_index_approx_heap_bytes_counts_reserved_capacity_not_len() {
+        // codex-review P1 対応（PR #569）: `values`/`offsets`/`slots`/`equality`
+        // は重複排除前の pair_count 件分を一括確保するため、重複が多い列では
+        // `len()` が `capacity()` を大きく下回る。この回帰テストは `len()` を
+        // 使う実装（旧実装）だと小さく計上されるが `capacity()` ベースの実装
+        // では確保容量分がきちんと計上されることを固定する。
+        let pair_count = 1_000usize;
+        let mut values: Vec<String> = Vec::with_capacity(pair_count);
+        values.push("dup".to_string());
+        let mut offsets: Vec<u32> = Vec::with_capacity(pair_count.saturating_add(1));
+        offsets.push(0);
+        offsets.push(1);
+        let mut slots: Vec<u32> = Vec::with_capacity(pair_count);
+        slots.push(0);
+        let mut equality: HashMap<String, u32> = HashMap::with_capacity(pair_count);
+        equality.insert("dup".to_string(), 0);
+        let index = TextColumnIndex {
+            values,
+            offsets,
+            slots,
+            equality,
+        };
+
+        // `len()` ベースで計上した場合の下限（旧実装相当）。
+        let len_based_lower_bound = "dup".len()
+            + std::mem::size_of::<String>()
+            + 2 * std::mem::size_of::<u32>()
+            + std::mem::size_of::<u32>()
+            + ("dup".len() + std::mem::size_of::<(String, u32)>());
+
+        let actual = index.approx_heap_bytes();
+        assert!(
+            actual > len_based_lower_bound,
+            "capacity ベースの計上は len ベースの計上より大きいはず: actual={actual} len_based_lower_bound={len_based_lower_bound}"
+        );
+        // 確保容量（pair_count 件分）に見合う規模まで計上されていることを
+        // 大まかに確認する（下限は values/offsets/slots の capacity 分のみ。
+        // equality の未使用バケット分は HashMap の実装依存のため含めない）。
+        let capacity_floor = pair_count.saturating_mul(std::mem::size_of::<u32>()) * 2;
+        assert!(
+            actual >= capacity_floor,
+            "actual={actual} capacity_floor={capacity_floor}"
+        );
     }
 
     #[test]
