@@ -402,6 +402,10 @@ engine 内部の B0s〜B8 段別内訳では SQL 表層固定コスト（B1−B4
 への引き継ぎ内容もあわせて同節に記録。production コード
 （`crates/engine/src/`・`crates/wire-server/src/`）は無変更。
 
+Phase 6（#546・#549）を通しで前後比較した crossdb self（wire 経由）の
+`hybrid_rrf` 前後表は `docs/design/hybrid-rrf-phase6-before-after.md`
+（Issue #550）に記録した（数値は同 doc 参照。本節では転記しない）。
+
 ## dim=768 基線（Issue #466）
 
 ### 目的
