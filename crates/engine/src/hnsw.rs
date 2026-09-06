@@ -3079,10 +3079,14 @@ mod tests {
         );
     }
 
-    /// Issue #490 の P0 契約（非受理ノードのベクトル・visited スロットへは
-    /// 一切触れない）を、実際に先読み要求されたノード id を記録して直接
-    /// 検証する（`RecordingPrefetch`）。記録が空だと検証が vacuous になる
-    /// ため、非空であることもあわせて固定する。
+    /// Issue #490 の P0 契約（本 Issue で追加した先読み処理は非受理ノードの
+    /// ベクトル・visited スロットのいずれへも一切触れない）を、実際に
+    /// 先読み要求されたノード id を記録して直接検証する
+    /// （`RecordingPrefetch`）。通常探索が非受理ノードへも訪問済みマークを
+    /// 付ける既存契約（Issue #431・`search_layer` ドキュメンテーション
+    /// コメント参照）はこの検証の対象外——本テストは `prefetch_neighbor`
+    /// 呼び出しだけを記録し `visited.mark_visited` は見ない。記録が空だと
+    /// 検証が vacuous になるため、非空であることもあわせて固定する。
     #[test]
     fn search_layer_prefetch_never_touches_rejected_nodes() {
         let dim = 8usize;

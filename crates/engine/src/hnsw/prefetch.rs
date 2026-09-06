@@ -8,11 +8,17 @@
 //!
 //! # P0 契約: 受理判定後にのみ触れる
 //!
-//! Issue #431 是正により `search_layer` は非受理（マスク外）ノードのベクトル・
-//! visited スロットに一切触れない契約を持つ（`docs/design/hnsw-rls-cardinality-
-//! switch.md` 参照）。本モジュールの先読みは `search_layer` 側で
-//! `is_accepted` 判定を通過した後にのみ呼ばれる前提であり、モジュール自身は
-//! 受理判定を行わない（呼び出し位置がこの契約を守る責務を持つ）。
+//! Issue #431 是正により `search_layer` は非受理（マスク外）ノードのベクトルへ
+//! 一切触れない（`self.score` を呼ばず候補ヒープへも積まない）契約を持つ
+//! （`docs/design/hnsw-rls-cardinality-switch.md` 参照）。ただし visited
+//! スロットへの「訪問済みマーク」（`VisitedSet::mark_visited`）はこの契約の
+//! 対象外で、`search_layer_with` は受理判定より前に非受理ノードへも通常どおり
+//! マークを付ける（既存の探索契約。本 Issue で変更しない）。本モジュールが
+//! 追加する先読み（`touch_node_vector`・`touch_word` による読み出し専用の
+//! 早期 load）はベクトル・visited スロットのいずれについても非受理ノードへは
+//! 一切発行しない——`search_layer` 側で `is_accepted` 判定を通過した後にのみ
+//! 呼ばれる前提であり、モジュール自身は受理判定を行わない（呼び出し位置が
+//! この契約を守る責務を持つ）。
 //!
 //! # stable での制約（Issue #490 計画時点で機械検証済み）
 //!
