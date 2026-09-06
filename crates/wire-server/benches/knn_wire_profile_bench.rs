@@ -68,7 +68,7 @@ use harness::env_report::EnvReport;
 use harness::knn_wire::{
     bucket_diff, classify_against_bands, diff_ratio_pct, median_of, min_of, parse_rounds,
     reference_band, refuse_under_github_actions, render_bucket_line, render_reference_band_line,
-    render_tier_round_line, render_tier_summary_line,
+    render_tier_round_line, render_tier_summary_line, step_ratio_pct,
 };
 use harness::protocol::{run, MeasurementConfig};
 use harness::rng::DeterministicRng;
@@ -284,9 +284,16 @@ fn main() {
     };
 
     for round in 1..=rounds {
-        // T1′: 距離カーネルのみ（Top-k なし）。
+        // 本ラウンドの全 6 段（T1′/T1s/T1p/T2/T3e/T3）へ同一クエリを渡す
+        // （codex-review 指摘: 段ごとに `next_query()` を進めると各段が異なる
+        // クエリ列を測ることになり、モジュール冒頭コメントが宣言する
+        // 「同一 200 クエリベクトルを共有」に反する。ラウンド境界でのみ輪番を
+        // 進め、ラウンド内の全段は同一 idx を使う）。
         let idx = next_query();
         let query = &queries[idx];
+        let sql = &sqls[idx];
+
+        // T1′: 距離カーネルのみ（Top-k なし）。
         let t1_prime = run(&config, || {
             let mut acc = 0.0f32;
             let dim = arena.dim() as usize;
@@ -304,9 +311,7 @@ fn main() {
         ));
         t1_prime_medians.push(t1_prime.summary.median);
 
-        // T1s: 単線 provider（距離＋Top-k）。
-        let idx = next_query();
-        let query = &queries[idx];
+        // T1s: 単線 provider（距離＋Top-k）。同一クエリ（idx）を使用。
         let mut t1s_ids: Option<Vec<u64>> = None;
         let t1s = run(&config, || {
             let hits = scalar_provider
@@ -330,9 +335,7 @@ fn main() {
         ));
         t1s_medians.push(t1s.summary.median);
 
-        // T1p: 並列 provider（production 既定）。
-        let idx = next_query();
-        let query = &queries[idx];
+        // T1p: 並列 provider（production 既定）。同一クエリ（idx）を使用。
         let mut t1p_ids: Option<Vec<u64>> = None;
         let t1p = run(&config, || {
             let hits = parallel_provider
@@ -368,11 +371,14 @@ fn main() {
             }
         }
 
-        // T2: SQL 表層（wire と同じ入口。SqlArenaCache ウォーム済み）。
-        let idx = next_query();
-        let sql = &sqls[idx];
+        // T2: SQL 表層（wire と同じ入口。SqlArenaCache ウォーム済み）。同一
+        // クエリ（idx）の SQL を使用。応答エンコード用サンプル（T3e が使う
+        // `QueryResult`）はこの測定区間の外で別途 1 回だけ取得する
+        // （codex-review 指摘: 計測クロージャ内で毎反復 `result.clone()` すると
+        // SQL 表層区分〔T2〕にエンコード用複製コストが混入し過大評価・wire 側
+        // が過小評価されうる。測定クロージャは `execute_sql_in_session` の
+        // 戻り値をそのまま `black_box` へ渡すだけにする）。
         let mut t2_ids: Option<Vec<u64>> = None;
-        let mut t2_sample_result: Option<engine::sql::exec::QueryResult> = None;
         let mut hot_session = SessionState::default();
         let t2 = run(&config, || {
             let outcome = core
@@ -381,7 +387,6 @@ fn main() {
             match outcome {
                 SqlOutcome::Query(result) => {
                     t2_ids = Some(sorted_ids(result.rows.iter().map(|r| r.id).collect()));
-                    t2_sample_result = Some(result.clone());
                     black_box(result)
                 }
                 other => fail_closed(format!("unexpected sql_surface_hot outcome: {other:?}")),
@@ -407,7 +412,17 @@ fn main() {
         }
 
         // T3e: 応答エンコードのみ（計測外で得た QueryResult に対して測る）。
-        let sample_result = t2_sample_result.expect("t2_sample_result populated above");
+        // T2 の計測区間には含めず、ここで同一 SQL を 1 回だけ計測外に実行して
+        // サンプルを取得する（上記 T2 修正のコメント参照）。
+        let sample_result = match core
+            .execute_sql_in_session(&policy_ctx, &mut hot_session, sql)
+            .expect("sample sql_surface_hot query must succeed for well-formed synthetic input")
+        {
+            SqlOutcome::Query(result) => result,
+            other => fail_closed(format!(
+                "unexpected sample sql_surface_hot outcome: {other:?}"
+            )),
+        };
         let tag = format!("SELECT {}", sample_result.rows.len());
         let t3e = run(&config, || {
             let mut total = 0usize;
@@ -435,8 +450,7 @@ fn main() {
         t3e_medians.push(t3e.summary.median);
 
         // T3: wire e2e（in-process ループバックサーバーへの簡易クエリ往復）。
-        let idx = next_query();
-        let sql = &sqls[idx];
+        // 同一クエリ（idx）の SQL を使用。
         let mut t3_ids: Option<Vec<u64>> = None;
         let t3 = run(&config, || {
             let start = Instant::now();
@@ -491,21 +505,35 @@ fn main() {
             }
         }
 
-        // T1p/T2/T3 は同一クエリに対する探索ではない（クエリ輪番のため）。
-        // 行数の一致のみをクロスチェックする（id 集合の完全一致は同一クエリの
-        // T1p/T2/T3 呼び出し間でのみ意味を持つため、ここでは件数のみを検証する）。
+        // T1p・T2・T3 は本ラウンドで同一クエリ（idx）を測定したため、返却 id
+        // 集合が完全一致するはずである（モジュール冒頭コメント「fail-closed
+        // 検証」の宣言どおり。上記修正前は段ごとに異なるクエリを輪番していた
+        // ため件数のみの検証に留めていたが、同一クエリ共有化に伴い完全一致
+        // 検証へ強化する——codex-review 指摘対応）。
+        let t1p_ids = t1p_ids.expect("t1p_ids populated by workload closure");
+        let t2_ids = t2_ids.expect("t2_ids populated by workload closure");
+        let t3_ids = t3_ids.expect("t3_ids populated by workload closure");
         for (label, ids) in [
-            ("provider_parallel", t1p_ids.as_ref()),
-            ("sql_surface_hot", t2_ids.as_ref()),
-            ("wire_roundtrip", t3_ids.as_ref()),
+            ("provider_parallel", &t1p_ids),
+            ("sql_surface_hot", &t2_ids),
+            ("wire_roundtrip", &t3_ids),
         ] {
-            let ids = ids.expect("ids populated by workload closure");
             if ids.len() != TOP_K {
                 fail_closed(format!(
                     "{label}: expected {TOP_K} result rows, got {}",
                     ids.len()
                 ));
             }
+        }
+        if t1p_ids != t2_ids {
+            fail_closed(format!(
+                "id set mismatch for identical query (idx={idx}): provider_parallel={t1p_ids:?} sql_surface_hot={t2_ids:?}"
+            ));
+        }
+        if t2_ids != t3_ids {
+            fail_closed(format!(
+                "id set mismatch for identical query (idx={idx}): sql_surface_hot={t2_ids:?} wire_roundtrip={t3_ids:?}"
+            ));
         }
     }
 
@@ -561,16 +589,32 @@ fn main() {
     );
     println!("{}", render_reference_band_line(reference_band_pct));
 
-    // 4 区分内訳（min-of-R の中央値どうし。distance/topk は単線条件・SQL/wire は
-    // production 実効値〔parallel〕基準）。
+    // 4 区分内訳（分子・分母とも min-of-R で統一。distance/topk は単線条件・
+    // SQL/wire は production 実効値〔parallel〕基準。codex-review 指摘対応:
+    // 分子〔diff〕は min-of-R どうしの差分のため、分母の「全体構成比」にも
+    // min-of-R の `t3_min` を使う——旧実装は median-of-R の `t3_med` を分母に
+    // 使っており統計量が不統一だった）。
+    //
+    // `ratio`（全体構成比・`t3_min` に対する比率）と `band`（ノイズ判定）は
+    // 別の分母から算出する独立した値であり意図的に分離している
+    // （codex-review 指摘対応: `benchmark-judgement-policy.md` §4 が要求する
+    // ノイズ判定は「対象区間自身の相対増分 `|to/from-1|`」であって、全体への
+    // 構成比ではないため `ratio` をノイズ判定へ流用しない。`from` がゼロの
+    // 距離カーネル区分は増分率が定義できないため band を `None` とする）。
     let render_bucket = |label: &str, from: Duration, to: Duration| match bucket_diff(from, to) {
         Some(diff) => {
-            let ratio = diff_ratio_pct(diff, t3_med)
+            let ratio = diff_ratio_pct(diff, t3_min)
                 .unwrap_or_else(|e| fail_closed(format!("{label}: {e}")));
-            let band = classify_against_bands(ratio, reference_band_pct);
+            let band = if from.is_zero() {
+                None
+            } else {
+                let step_ratio = step_ratio_pct(from, to)
+                    .unwrap_or_else(|e| fail_closed(format!("{label}: {e}")));
+                Some(classify_against_bands(step_ratio, reference_band_pct))
+            };
             println!(
                 "{}",
-                render_bucket_line(label, Some(diff), Some(ratio), Some(band))
+                render_bucket_line(label, Some(diff), Some(ratio), band)
             );
         }
         None => println!("{}", render_bucket_line(label, None, None, None)),

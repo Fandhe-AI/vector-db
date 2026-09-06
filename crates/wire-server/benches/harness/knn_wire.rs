@@ -158,7 +158,11 @@ pub fn bucket_diff(from: Duration, to: Duration) -> Option<Duration> {
     to.checked_sub(from)
 }
 
-/// [`bucket_diff`] の結果を T3（wire e2e）の中央値に対する比率（%）へ変換する。
+/// [`bucket_diff`] の結果を T3（wire e2e）の min-of-R に対する比率（%）へ変換する
+/// （表示専用の「全体に占める構成比」。`total` には呼び出し元が min-of-R の
+/// 値〔`from`／`to` と同じ統計量〕を渡す契約——diff も min-of-R どうしの差分の
+/// ため、分子・分母の統計量を揃える。codex-review 指摘: 分母に median-of-R を
+/// 渡すと分子〔min-of-R 由来〕と統計量が食い違い比率が規約と不一致になる）。
 /// `total` が 0 だと除算不能なため `Err`。
 pub fn diff_ratio_pct(diff: Duration, total: Duration) -> Result<f64, KnnWireError> {
     if total.is_zero() {
@@ -167,6 +171,23 @@ pub fn diff_ratio_pct(diff: Duration, total: Duration) -> Result<f64, KnnWireErr
         ));
     }
     Ok(diff.as_secs_f64() / total.as_secs_f64() * 100.0)
+}
+
+/// 区分（bucket）自身のノイズ判定用の増分率 `|to/from - 1| * 100`
+/// （`docs/design/benchmark-judgement-policy.md` §4 が要求する「対象区間の
+/// 相対増分をノイズ帯と比較する」契約。[`diff_ratio_pct`] は全体〔T3〕に対する
+/// 構成比であり対象区間自身の増分率とは意味が異なるため、ノイズ判定には本関数を
+/// 使う——codex-review 指摘: 構成比をノイズ判定へ流用しない）。
+/// `from` が 0（距離カーネル区分のように基準点がゼロの場合）は比率が定義でき
+/// ないため `Err`。呼び出し元はこの場合ノイズ分類自体を行わず `None` として扱う
+/// （`render_bucket_line` の `band: None` 経路）。
+pub fn step_ratio_pct(from: Duration, to: Duration) -> Result<f64, KnnWireError> {
+    if from.is_zero() {
+        return Err(KnnWireError::DegenerateRatio(
+            "step_ratio_pct: from duration is zero",
+        ));
+    }
+    Ok((to.as_secs_f64() / from.as_secs_f64() - 1.0) * 100.0)
 }
 
 /// 段間差分がノイズ帯（固定 ±5% 帯・実測参照区間帯のいずれか広い方）以内かを
@@ -201,17 +222,24 @@ impl std::fmt::Display for BandClass {
     }
 }
 
-/// 4 区分内訳 1 行の描画。`diff` が `None`（測定ノイズによる逆転。[`bucket_diff`]
-/// 参照）の場合は数値を出さず `n/a` とする。
+/// 4 区分内訳 1 行の描画。`diff`／`ratio_pct` が `None`（測定ノイズによる逆転。
+/// [`bucket_diff`] 参照）の場合は数値を出さず `n/a` とする。`band` は `diff`・
+/// `ratio_pct` が揃っていても `None` になりうる（距離カーネル区分のように
+/// `from` がゼロで [`step_ratio_pct`] が定義できない場合。`ratio_pct` は全体
+/// 構成比の表示、`band` は対象区間自身の増分率によるノイズ判定であり分離した
+/// 情報源のため独立に欠落しうる——codex-review 指摘対応）。
 pub fn render_bucket_line(
     label: &str,
     diff: Option<Duration>,
     ratio_pct: Option<f64>,
     band: Option<BandClass>,
 ) -> String {
-    match (diff, ratio_pct, band) {
-        (Some(diff), Some(ratio_pct), Some(band)) => {
-            format!("bucket({label}): diff={diff:?} ratio={ratio_pct:.2}% band={band}")
+    match (diff, ratio_pct) {
+        (Some(diff), Some(ratio_pct)) => {
+            let band_str = band
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "n/a(no baseline for step ratio)".to_string());
+            format!("bucket({label}): diff={diff:?} ratio={ratio_pct:.2}% band={band_str}")
         }
         _ => format!(
             "bucket({label}): n/a (独立計測どうしの中央値比較のため測定ノイズにより逆転・未確定)"

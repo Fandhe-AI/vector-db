@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use harness::knn_wire::{
     bucket_diff, classify_against_bands, diff_ratio_pct, median_of, min_of, parse_rounds,
-    reference_band, refuse_under_github_actions, render_bucket_line, BandClass, KnnWireError,
-    DEFAULT_ROUNDS,
+    reference_band, refuse_under_github_actions, render_bucket_line, step_ratio_pct, BandClass,
+    KnnWireError, DEFAULT_ROUNDS,
 };
 
 #[test]
@@ -161,4 +161,35 @@ fn render_bucket_line_includes_diff_ratio_and_band() {
     assert!(line.contains("sql_surface"));
     assert!(line.contains("25.00%"));
     assert!(line.contains("within_noise_band"));
+}
+
+#[test]
+fn render_bucket_line_reports_no_baseline_band_when_from_is_zero() {
+    // 距離カーネル区分（`from=Duration::ZERO`）は diff/ratio はあるが
+    // step_ratio_pct が定義できないため band は None。
+    let line = render_bucket_line(
+        "kernel_distance_only",
+        Some(Duration::from_micros(200)),
+        Some(30.0),
+        None,
+    );
+    assert!(line.contains("kernel_distance_only"));
+    assert!(line.contains("30.00%"));
+    assert!(line.contains("n/a(no baseline for step ratio)"));
+}
+
+#[test]
+fn step_ratio_pct_computes_relative_increment_over_from() {
+    // 100us -> 130us は +30% の増分率（diff_ratio_pct の全体構成比とは異なる分母）。
+    let ratio = step_ratio_pct(Duration::from_micros(100), Duration::from_micros(130))
+        .expect("finite ratio");
+    assert!((ratio - 30.0).abs() < 1e-9, "ratio={ratio}");
+}
+
+#[test]
+fn step_ratio_pct_rejects_zero_from() {
+    assert!(matches!(
+        step_ratio_pct(Duration::ZERO, Duration::from_micros(10)),
+        Err(KnnWireError::DegenerateRatio(_))
+    ));
 }

@@ -98,59 +98,113 @@ crossdb（`scripts/crossdb_bench/self_db.py`）は別プロセスの release
 - T3 が `ErrorResponse`（`'E'`）を返さないこと（`common::read_row_description`
   等が `'T'`/`'D'`/`'C'`/`'Z'` 以外を受け取ると即座に fail-closed で打ち切る）。
 
+## 内訳比率の統計量・ノイズ判定の算出方法
+
+4 区分内訳の各行は 2 種類の比率を独立に算出する（レビュー指摘対応。旧版は
+両者を混同していた）。
+
+- **`ratio`（全体構成比）**: 分子は `bucket_diff(from, to)`（min-of-R どうしの
+  差分）、分母も同じ統計量（min-of-R）である `T3 wire_roundtrip` の
+  `min_of_r`（`t3_min`）。分子・分母の統計量を min-of-R に統一している
+  （旧版は分母に median-of-R の `t3_med` を使っており分子と統計量が
+  不一致だった）。表示専用の informational な値で合否判定には使わない。
+- **`band`（ノイズ判定）**: `docs/design/benchmark-judgement-policy.md` §4 が
+  要求する「対象区間自身の相対増分をノイズ帯と比較する」契約に従い、
+  `ratio` とは別に対象区間の `from`/`to`（いずれも min-of-R）から
+  `step_ratio = |to/from − 1| × 100` を算出し、これを固定 ±5% 帯・
+  参照区間帯（いずれか広い方）と比較する（`harness::knn_wire::
+  step_ratio_pct`／`classify_against_bands`）。距離カーネル区分は
+  `from = 0`（基準点なし）のため `step_ratio` が定義できず、`band` は
+  「n/a（no baseline for step ratio）」として分類対象外にする。
+
+各ラウンドは全 6 段（T1′/T1s/T1p/T2/T3e/T3）へ同一クエリ（200 クエリ
+プールから輪番）を渡す（レビュー指摘対応。旧版は段ごとに `next_query()` を
+進めており、既定 5 ラウンドでは各段が異なる 5 クエリしか測っておらず、
+モジュール冒頭コメントが宣言する「同一 200 クエリベクトルを共有」という
+契約と食い違っていた）。これにより T1p・T2・T3 の返却 id 集合が同一クエリに
+対して完全一致することを毎ラウンド検証できる（fail-closed 検証節参照）。
+
+また T3e（応答エンコードのみ）が使う `QueryResult` サンプルは、T2
+（`sql_surface_hot`）の計測区間の外で別途 1 回だけ取得する（レビュー指摘
+対応。旧版は T2 の計測クロージャ内で毎反復 `result.clone()` していたため、
+エンコード用複製コストが SQL 表層区分〔T2〕に混入し、SQL 表層を過大・wire
+区分を過小に見積もる懸念があった）。
+
 ## 実測結果（共有 QEMU 開発環境・参考値）
 
 `BENCH_DEDICATED_ENV` 未設定（専有環境の自己申告なし）での 1 回の実測。
 `docs/design/benchmark-judgement-policy.md` §5 の方針により、共有環境の数値は
-**採否根拠にしない**参考値として扱う。
+**採否根拠にしない**参考値として扱う。上記の統計量統一・同一クエリ共有化・
+T2 計測区間からのクローン除去（いずれもレビュー指摘対応）を反映した実装で
+再実測した値であり、旧版の数値（30.1%/55.2%/12.2% 等）とは前提が異なるため
+単純比較しない。
 
 環境: `os=linux arch=x86_64 logical_cpus=12 isa=Avx2Fma`（開発コンテナ内。
 `crossdb-bench.md` の RTX 3060 実機とは別セッションの CPU 実測）。
 
-`make bench-knn-wire-profile`（`BENCH_KNN_WIRE_ROUNDS=5`、既定）。min-of-5 の
-中央値（µs）:
+`make bench-knn-wire-profile`（`BENCH_KNN_WIRE_ROUNDS=5`、既定）。各ラウンドの
+median／p95（µs）:
 
-| 段 | min-of-5 median |
-| --- | --- |
-| T1′ `kernel_distance_only` | 206.3 |
-| T1s `provider_scalar` | 213.6 |
-| T1p `provider_parallel` | 214.4 |
-| T2 `sql_surface_hot` | 592.5 |
-| T3e `wire_encode_only`（informational） | 0.443 |
-| T3 `wire_roundtrip` | 675.9 |
+| round | T1′ median/p95 | T1s median/p95 | T1p median/p95 | T2 median/p95 | T3 median/p95 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 196.4 / 206.6 | 211.4 / 220.6 | 250.8 / 371.8 | 628.4 / 684.0 | 716.9 / 1028.1 |
+| 2 | 193.8 / 204.5 | 207.7 / 214.1 | 230.1 / 281.8 | 586.8 / 617.5 | 680.5 / 756.0 |
+| 3 | 194.6 / 203.0 | 213.9 / 222.1 | 362.4 / 467.6 | 619.9 / 967.7 | 673.1 / 748.7 |
+| 4 | 189.8 / 199.0 | 205.4 / 215.1 | 256.8 / 370.0 | 580.8 / 660.1 | 696.4 / 763.3 |
+| 5 | 201.3 / 257.1 | 215.2 / 224.8 | 340.4 / 399.8 | 640.6 / 961.8 | 691.9 / 741.9 |
 
-参照区間帯（T1′ の 5 ラウンド中央値の `(max-min)/min`）: 15.38%。
+min-of-5／median-of-5（µs）:
 
-4 区分内訳（`T3` の min-of-5 中央値 675.9µs に対する比率）:
+| 段 | min-of-5 | median-of-5 |
+| --- | --- | --- |
+| T1′ `kernel_distance_only` | 189.8 | 194.6 |
+| T1s `provider_scalar` | 205.4 | 211.4 |
+| T1p `provider_parallel` | 230.1 | 256.8 |
+| T2 `sql_surface_hot` | 580.8 | 619.9 |
+| T3e `wire_encode_only`（informational） | 0.472 | 0.480 |
+| T3 `wire_roundtrip` | 673.1 | 691.9 |
 
-| 区分 | diff | 比率 | 判定 |
+参照区間帯（T1′ の 5 ラウンド中央値の `(max-min)/min`）: 6.04%。
+
+4 区分内訳（`diff` は min-of-5 どうしの差分。`ratio` は `T3` の min-of-5
+`673.1µs` に対する構成比、`band` は各区分自身の `step_ratio_pct` による
+ノイズ判定。上記「内訳比率の統計量・ノイズ判定の算出方法」節参照）:
+
+| 区分 | diff | ratio（構成比） | band（ノイズ判定） |
 | --- | --- | --- | --- |
-| 距離カーネル（T1′） | 206.3µs | 30.1% | above_noise_band |
-| Top-k（単線条件。T1s − T1′） | 7.3µs | 1.1% | within_noise_band |
-| SQL 表層（T2 − T1p） | 378.1µs | 55.2% | above_noise_band |
-| wire（T3 − T2） | 83.4µs | 12.2% | within_noise_band |
+| 距離カーネル（T1′） | 189.8µs | 28.20% | n/a（no baseline for step ratio） |
+| Top-k（単線条件。T1s − T1′） | 15.6µs | 2.31% | above_noise_band |
+| SQL 表層（T2 − T1p） | 350.7µs | 52.10% | above_noise_band |
+| wire（T3 − T2） | 92.3µs | 13.72% | above_noise_band |
 
 **所見**:
 
-- **SQL 表層（T2 − T1p）が最大の区分**（55.2%）であり、距離カーネル自体
-  （30.1%）より支配的。`docs/design/knn-stage-profile.md`（Issue #362）の
+- **SQL 表層（T2 − T1p）が最大の区分**（52.10%）であり、距離カーネル自体
+  （28.20%）より支配的。`docs/design/knn-stage-profile.md`（Issue #362）の
   内訳（`SqlArenaCache` ヒット時オーバーヘッド・投影・境界チェック等）が
   crossdb 786µs の主要因の一つであることを裏付ける。Phase 4（チップ最適
-  カーネル）は距離カーネル自体を高速化しても、全体の 3 割強にしか効かない
+  カーネル）は距離カーネル自体を高速化しても、全体の 3 割弱にしか効かない
   ことを示唆する。
-- **wire 区分（T3 − T2）は 83.4µs（12.2%）**で、`wire_encode_only`
-  （0.443µs・T3 のほぼ 0%）と比べ極めて小さい。応答エンコード自体
+- **wire 区分（T3 − T2）は 92.3µs（13.72%）**で、`wire_encode_only`
+  （0.480µs・T3 のほぼ 0%）と比べ極めて小さい。応答エンコード自体
   （`RowDescription`/`DataRow`×10/`CommandComplete`）のコストは無視できるほど
   小さく、この区分の実体は TCP 送受信・フレーミング読み取り・スレッド切替
   （`crates/wire-server/src/simple_query.rs` の複数回 `write_all`）である
-  （モジュール冒頭コメント参照）。
-- 本ベンチの T3（675.9µs）は crossdb の self 786µs と同オーダーで、
-  in-process ループバック（本ベンチ）と別プロセス psycopg 接続（crossdb）の
-  差（約 110µs・14%）が「クライアント側（psycopg・プロセス間スケジューリング）」
-  の残差にあたる（「計測器の差異」節参照）。
-- Top-k（単線条件）は参照区間帯（15.38%）を下回るノイズ帯内であり、この
-  規模・環境では Top-k 選出自体のコストは統計的に有意な内訳として分離
-  できない。
+  （モジュール冒頭コメント参照）。ノイズ帯（6.04%・固定 5% のいずれか広い方）
+  を超えるため統計的に有意な区分として扱えるが、値そのものは小さい。
+- 本ベンチの T3（691.9µs・median-of-5）は crossdb の self 786µs と近い
+  オーダーだが、計測環境（本ベンチは開発コンテナ内 CPU 実測、crossdb は
+  RTX 3060 実機の別セッション）・コーパス生成・統計量（本ベンチは
+  min-of-R／median-of-R、crossdb 側 786µs は p50）がいずれも揃っていない
+  ため、両者の差（約 94〜113µs）を「クライアント側（psycopg・プロセス間
+  スケジューリング）」の残差と断定はしない。定量的な残差の帰属は、同一
+  コミット・同一環境で crossdb self を再実行する運用者作業に委ねる
+  （「スコープ外・申し送り」節参照）。
+- Top-k（単線条件。T1s − T1′）の `step_ratio`（`|t1s_min/t1_prime_min − 1|`
+  ≈ 8.2%。全体構成比 `ratio`＝2.31% とは分母が異なる別の値）は参照区間帯
+  （6.04%）を上回りノイズ帯外と判定されたが、絶対 diff（15.6µs）自体は
+  小さい。統計的な有意性の解釈は今後の複数回実測（`benchmark-judgement-
+  policy.md` §3 の交互 N≥5 ペア）で補強する。
 
 ## 同一コミット `bench-knn-profile`（Issue #362）との対照
 
