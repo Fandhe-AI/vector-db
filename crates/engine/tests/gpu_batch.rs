@@ -654,3 +654,89 @@ fn gpu_backend_mixed_tenant_batch_has_no_cross_tenant_leak_when_gpu_available() 
     hits2.sort_by_key(|(id, _)| *id);
     assert_eq!(hits0, hits2);
 }
+
+/// `plan_query_tile` の既定予算（`GPU_SCORE_BUFFER_BUDGET_BYTES` = 32MiB）は
+/// 通常のデバイス上では 1 タイル分の行がすべて 1 チャンクに収まってしまい
+/// （タイル幅 16・dim=131 なら約 49 万行まで無分割）、`gpu_backend_multi_tile_
+/// matches_cpu_oracle_when_gpu_available`（300 行）が検証できているのは
+/// クエリタイル分割だけで、行チャンク分割（複数チャンクにまたがるスコア
+/// 配置・`TopKSelector` への累積）は通っていなかった（Issue #532 codex-review
+/// P2 指摘対応）。`batch_search_with_row_budget_for_tests`（`bench-internals`
+/// feature 限定。`gpu_batch.rs::GpuBatchBackend` 実装参照）で意図的に小さい
+/// 予算を注入し、23 行を 4 行ずつのチャンク（6 チャンク目は端数の 3 行）へ
+/// 分割させたうえで、CPU オラクルと id 集合一致・スコア相対誤差 1e-3 以内で
+/// 一致することを確認する。
+#[cfg(feature = "bench-internals")]
+#[test]
+fn gpu_backend_fractional_row_chunk_matches_cpu_oracle_when_gpu_available() {
+    let row_count = 23;
+    let dim = 17;
+    let query_count = 5;
+    let fx = multi_query_fixture(row_count, dim, query_count, 0x532_c8ff);
+    let matrix = engine::batch_search::ResidentMatrix::build(
+        &fx.ids,
+        &fx.tenant_ids,
+        &fx.visibilities,
+        fx.dim,
+        &fx.vectors,
+    )
+    .expect("resident matrix build should succeed for well-formed fixture");
+
+    let backend = match GpuBatchBackend::try_new(matrix) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("gpu unavailable in this environment, skipping: {e}");
+            return;
+        }
+    };
+
+    let c = ctx("tenant-a");
+    let batch_queries: Vec<BatchQuery<'_>> = fx
+        .queries
+        .iter()
+        .map(|v| BatchQuery {
+            vector: v,
+            k: 6,
+            ctx: &c,
+        })
+        .collect();
+
+    // width（1 dispatch のクエリ本数）= min(query_count, GPU_QUERY_TILE_MAX) = 5。
+    // per_row_bytes = width * 4（score）+ 4（row_id）= 24。budget_bytes = 96 に
+    // すると chunk_rows = 96 / 24 = 4 となり、23 行が [4,4,4,4,4,3] の 6 チャンク
+    // （端数を含む）に分割される。
+    let tiny_budget_bytes = 96;
+    let hits = backend
+        .batch_search_with_row_budget_for_tests(&batch_queries, tiny_budget_bytes)
+        .expect("gpu batch_search should succeed once the device initialized");
+    assert_eq!(hits.len(), fx.queries.len());
+
+    let simple_fx = Fixture {
+        ids: fx.ids.clone(),
+        tenant_ids: fx.tenant_ids.clone(),
+        visibilities: fx.visibilities.clone(),
+        dim: fx.dim,
+        vectors: fx.vectors.clone(),
+    };
+    for (qi, query) in fx.queries.iter().enumerate() {
+        let expected = cpu_oracle(&simple_fx, query, 6, &c);
+        let mut actual: Vec<(u64, f32)> = hits[qi].hits.iter().map(|h| (h.id, h.score)).collect();
+        let mut expected_sorted: Vec<(u64, f32)> =
+            expected.iter().map(|h| (h.id, h.score)).collect();
+        actual.sort_by_key(|(id, _)| *id);
+        expected_sorted.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            actual.len(),
+            expected_sorted.len(),
+            "hit count mismatch for query {qi}"
+        );
+        for ((aid, ascore), (eid, escore)) in actual.iter().zip(expected_sorted.iter()) {
+            assert_eq!(aid, eid, "id mismatch for query {qi}");
+            let tolerance = 5e-3 * (1.0 + escore.abs());
+            assert!(
+                (ascore - escore).abs() < tolerance,
+                "score mismatch for query {qi} id {aid}: gpu={ascore} cpu={escore}"
+            );
+        }
+    }
+}

@@ -803,8 +803,19 @@ fn f32_vec_from_ne_bytes(bytes: &[u8]) -> Result<Vec<f32>, BatchBackendError> {
     Ok(out)
 }
 
-impl BatchBackend for GpuBatchBackend {
-    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+impl GpuBatchBackend {
+    /// [`BatchBackend::batch_search`] の実体。スコアバッファ予算
+    /// （`budget_bytes`）を呼び出し元から受け取る内部共通経路にし、
+    /// 既定の公開経路（trait 実装）は常に [`GPU_SCORE_BUFFER_BUDGET_BYTES`]
+    /// を使う。テスト・ベンチ専用に小さい予算を注入して行チャンク分割を
+    /// 強制する経路（[`Self::batch_search_with_row_budget_for_tests`]）と
+    /// 実装を共有するための分離（Issue #532 codex-review P2 指摘対応:
+    /// 端数を含む複数行チャンクを実 GPU dispatch 経由で検証できるようにする）。
+    fn batch_search_with_budget(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
         if self.device_lost.load(Ordering::SeqCst) {
             return Err(BatchExecError::Backend(BatchBackendError::DeviceLost(
                 "gpu device lost".to_string(),
@@ -869,7 +880,41 @@ impl BatchBackend for GpuBatchBackend {
             row_stride: dim_half as u32,
         };
 
-        run_tiled_batch_search(ctx, &self.matrix, queries, &target, query_stride)
+        run_tiled_batch_search(
+            ctx,
+            &self.matrix,
+            queries,
+            &target,
+            query_stride,
+            budget_bytes,
+        )
+    }
+
+    /// **テスト・ベンチ専用**。[`Self::batch_search_with_budget`] へ任意の
+    /// スコアバッファ予算を注入し、`GPU_SCORE_BUFFER_BUDGET_BYTES`（既定
+    /// 32MiB）では通常のデバイス上で発生しない行チャンク分割（端数を含む
+    /// 複数行チャンク）を実 GPU dispatch 経由で強制的に発生させる
+    /// （Issue #532 codex-review P2 指摘対応。`plan_query_tile` の単体テストは
+    /// 分割境界の算出だけを検証しており、実際の dispatch・readback・
+    /// `TopKSelector` への累積までは通していなかった）。非既定 feature
+    /// `bench-internals` でのみ公開する（`hybrid.rs::sparse_refetch_observed`
+    /// と同パターン。既定ビルド・`wire-server` からは到達不能で、テナント
+    /// 境界・RLS 迂回 API は一切露出しない——`budget_bytes` は dispatch を
+    /// 何回に分けるかだけを左右する純粋な性能パラメータであり、可視性判定・
+    /// スコア計算そのものには関与しない）。
+    #[cfg(feature = "bench-internals")]
+    pub fn batch_search_with_row_budget_for_tests(
+        &self,
+        queries: &[BatchQuery<'_>],
+        budget_bytes: usize,
+    ) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget(queries, budget_bytes)
+    }
+}
+
+impl BatchBackend for GpuBatchBackend {
+    fn batch_search(&self, queries: &[BatchQuery<'_>]) -> Result<Vec<BatchHit>, BatchExecError> {
+        self.batch_search_with_budget(queries, GPU_SCORE_BUFFER_BUDGET_BYTES)
     }
 }
 
@@ -893,6 +938,7 @@ fn run_tiled_batch_search(
     queries: &[BatchQuery<'_>],
     target: &DotDispatchTarget<'_>,
     query_stride: usize,
+    budget_bytes: usize,
 ) -> Result<Vec<BatchHit>, BatchExecError> {
     let groups = group_queries_by_ctx(queries);
 
@@ -915,11 +961,7 @@ fn run_tiled_batch_search(
         let reachable = gather_reachable_rows(matrix, group_ctx)
             .map_err(|e| BatchExecError::Input(e.into_batch_search_error()))?;
 
-        let plan = plan_query_tile(
-            group.len(),
-            GPU_SCORE_BUFFER_BUDGET_BYTES,
-            ctx.max_workgroups_per_dimension,
-        );
+        let plan = plan_query_tile(group.len(), budget_bytes, ctx.max_workgroups_per_dimension);
 
         for tile in group.chunks(plan.width.max(1)) {
             let width = tile.len();
@@ -1246,7 +1288,14 @@ impl BatchBackend for GpuF32ContrastBackend {
             row_stride,
         };
 
-        run_tiled_batch_search(ctx, &self.matrix, queries, &target, query_stride)
+        run_tiled_batch_search(
+            ctx,
+            &self.matrix,
+            queries,
+            &target,
+            query_stride,
+            GPU_SCORE_BUFFER_BUDGET_BYTES,
+        )
     }
 }
 
