@@ -286,13 +286,36 @@ run_scan() {
   fi
 
   # 必須シンボルの充足確認（vacuous pass 防止）。
+  # 照合対象は各ブロックの fn_name のみに限定する（命令本文まで含めて照合すると、
+  # 本来抽出すべき関数の本体抽出に失敗していても、別の関数本体に含まれる
+  # 呼び出し命令のシンボル名文字列だけで必須条件を満たしてしまい、未検査の
+  # カーネルを通過させ得るため。codex-review #566 P1 指摘）。
+  # また `grep -q` を `set -o pipefail` 下でパイプの受け手に使うと、一致を
+  # 見つけた時点で入力を読み切らずに終了し、書き手側の `echo`／ここでは
+  # ヒアストリング展開が SIGPIPE で失敗しうる（`blocks` がパイプ容量を超える
+  # 場合）。シンボルが実在するにもかかわらず判定全体が失敗する誤検出を避けるため、
+  # パイプを介さずシェル内の文字列一致（`fn_names` へ改行区切りで蓄積し `case`
+  # で判定）だけで照合する（codex-review #566 P2 指摘）。
+  local fn_names=$'\n'
+  local IFS_NAMES_OLD="${IFS}"
+  IFS=$'\x01'
+  local name_block
+  for name_block in ${blocks}; do
+    [ -z "${name_block}" ] && continue
+    fn_names+="${name_block%%$'\x02'*}"$'\n'
+  done
+  IFS="${IFS_NAMES_OLD}"
+
   local seg
   for seg in "${required_segments[@]}"; do
-    if ! echo "${blocks}" | grep -q "${seg}"; then
-      echo "ERROR: required symbol segment not found among scanned functions: ${seg}" >&2
-      echo "  (target=${arch_class} module_segment=${module_segment})" >&2
-      return 1
-    fi
+    case "${fn_names}" in
+      *"${seg}"*) ;;
+      *)
+        echo "ERROR: required symbol segment not found among scanned functions: ${seg}" >&2
+        echo "  (target=${arch_class} module_segment=${module_segment})" >&2
+        return 1
+        ;;
+    esac
   done
 
   local status=0
