@@ -236,6 +236,12 @@ psql の `SELECT COUNT(*)` は 45 ms → 約 3.7 ms。
 | `udf_call` | 41996 | 730 | 1149 |
 | `rls_isolation` | 44960 | 3552 | 3675 |
 
+**（2026-09-06 追記・Issue #481）** 簡易クエリ応答（`RowDescription`/`DataRow`×N/
+`CommandComplete`/`ReadyForQuery`）は原則 1 回の `write_all` へ束ねる方式へ変更した
+（`crate::response_buffer::ResponseBuffer`。上限 `MAX_RESPONSE_BUFFER_BYTES` 超過時は
+フレーム境界で分割送出）。上表の 4 回 `write_all` を前提とした記述はこの変更以前の
+挙動。詳細・実測は `docs/design/wire-response-buffering.md` 参照。
+
 ## GPU（NVIDIA GeForce RTX 3060）での高速化
 
 ### `engine::gpu_batch` vs CPU-SIMD バッチ（`make bench-gpu-scaling`）

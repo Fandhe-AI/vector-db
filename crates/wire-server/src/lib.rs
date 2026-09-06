@@ -23,6 +23,9 @@
 //!   `EmptyQueryResponse` のバイト列生成（純関数。TASK-73・WIRE-1）
 //! - [`error_response`][]: `engine::error_format::ErrorClass` → `ErrorResponse`
 //!   （'E'）バイト列への横断写像（TASK-153・ERR-1・`RECOVER-5` (3) ポインタ）
+//! - `response_buffer`（crate 内限定）: 簡易クエリ応答の `DataRow` 群を上限付き
+//!   バッファへ組み立て、1 回の `write_all` で送出するための組み立て器
+//!   （Issue #481）
 //!
 //! 対応: TASK-67（ポインタ: `docs/spec/05-tasks.md`。対象ビヘイビア WIRE-1, WIRE-2, WIRE-3）、
 //! TASK-68（対象ビヘイビア WIRE-4, WIRE-10）、TASK-69（対象ビヘイビア WIRE-5, WIRE-6）、
@@ -37,6 +40,7 @@ pub mod framing;
 pub mod handshake;
 pub mod limits;
 pub mod protocol_dispatch;
+pub(crate) mod response_buffer;
 pub mod result_encoder;
 pub mod server;
 pub mod simple_query;
