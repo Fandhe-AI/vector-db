@@ -10,16 +10,18 @@
 //!    混線しないこと。
 //! 2. cold（redb 再走査）・warm（`SqlArenaCache` ヒット・高速経路）・キャッシュ非経由
 //!    の公開ラッパー（`sql::exec::execute_statement`）の 3 経路が完全一致すること。
-//! 3. `USING MODE 'precision'`・HNSW opt-in エンジンでも遅延投影が同じ結果になる
-//!    こと（既定エンジン対照）。
+//! 3. `USING MODE 'precision'`・`SearchEngineKind::Hnsw` opt-in エンジンでも
+//!    遅延投影が同じ結果になること（既定エンジン対照）。
 //! 4. `WHERE` 付き（eager 経路のまま）の投影は本 Issue の変更で影響を受けないこと。
 
 use engine::catalog::{ColumnDef, ColumnType, TableSchema};
 use engine::core::EngineCore;
+use engine::hnsw::HnswParams;
 use engine::kernel::CpuScalarProvider;
 use engine::policy::PolicyContext;
 use engine::recovery::required_op_id::OperationId;
 use engine::row_codec::Value;
+use engine::search_engine;
 use engine::storage::{Storage, Visibility};
 
 #[path = "../src/test_util/temp_db.rs"]
@@ -249,6 +251,78 @@ fn deferred_projection_matches_under_precision_mode() {
         engine::sql::exec::Cell::Text(t) => assert_eq!(t, "winner"),
         other => panic!("expected Text cell, got {other:?}"),
     }
+}
+
+/// 契約 3（後半）: `SearchEngineKind::Hnsw` opt-in エンジンでも遅延投影が
+/// 既定エンジン対照と同じ結果になること（フィルタなし DISTANCE ＋スカラー列
+/// 投影の組み合わせ）。`defer_projection`／`project_rows` の分岐条件はエンジン
+/// 種別を一切参照しないが、実際に HNSW opt-in 経路（`sql::hnsw_cache`）と
+/// 遅延投影（`ScalarSource::Deferred`）を組み合わせて実行し固定する。
+#[test]
+fn deferred_projection_matches_under_hnsw_engine() {
+    let path = unique_db_path("sql-deferred-projection-hnsw");
+    let _guard = CleanupGuard(path.clone());
+    let storage = Storage::open(&path).expect("open storage");
+    create_docs_table(&storage);
+    let ctx = PolicyContext::new("tenant-a").expect("valid tenant");
+    let rows: [(u64, [f32; 2], &str); 6] = [
+        (1, [1.0, 0.0], "alpha"),
+        (2, [0.95, 0.05], "bravo"),
+        (3, [0.9, 0.1], "charlie"),
+        (4, [0.2, 0.8], "delta"),
+        (5, [0.1, 0.9], "echo"),
+        (6, [0.0, 1.0], "foxtrot"),
+    ];
+    for (id, emb, body) in rows {
+        insert_row(
+            &storage,
+            &ctx,
+            id,
+            emb,
+            body,
+            Visibility::Public,
+            &format!("hnsw-seed-{id}"),
+        );
+    }
+
+    let sql = "SELECT id, body FROM docs ORDER BY embedding <=> '[1.0,0.0]' LIMIT 4";
+
+    // 既定エンジン（brute-force）対照。
+    let ref_path = unique_db_path("sql-deferred-projection-hnsw-ref");
+    let _ref_guard = CleanupGuard(ref_path.clone());
+    let default_storage = Storage::open(&ref_path).expect("open ref storage");
+    create_docs_table(&default_storage);
+    for (id, emb, body) in rows {
+        insert_row(
+            &default_storage,
+            &ctx,
+            id,
+            emb,
+            body,
+            Visibility::Public,
+            &format!("hnsw-ref-seed-{id}"),
+        );
+    }
+    let default_core = EngineCore::from_storage(default_storage, Box::new(CpuScalarProvider));
+    let default_result = default_core
+        .execute_sql(&ctx, sql)
+        .expect("default engine query");
+
+    // `SearchEngineKind::Hnsw` opt-in エンジン。
+    let hnsw_kind = search_engine::hnsw_kind(HnswParams::default()).expect("valid hnsw params");
+    let hnsw_core = EngineCore::from_storage_with_engine(storage, hnsw_kind);
+    let hnsw_cold = hnsw_core.execute_sql(&ctx, sql).expect("hnsw cold query");
+    let hnsw_warm = hnsw_core.execute_sql(&ctx, sql).expect("hnsw warm query");
+
+    assert_eq!(
+        default_result, hnsw_cold,
+        "HNSW opt-in engine (cold) must match default engine for deferred projection"
+    );
+    assert_eq!(
+        hnsw_cold, hnsw_warm,
+        "HNSW opt-in engine cold/warm deferred projection must match exactly"
+    );
+    assert_eq!(hnsw_cold.rows.len(), 4);
 }
 
 /// 契約 4: `WHERE` 付き投影（eager 経路のまま。`defer_projection` の適用対象外）は
