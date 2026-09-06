@@ -66,28 +66,30 @@ jobs:
             echo "workflow_dispatch: run detect-apple unconditionally"
             exit 0
           fi
-          # 改名（rename）は新パス `filename` に加えて旧パス `previous_filename` を持つ。
-          # 対象ファイルを移動する PR で検証が skipped にならないよう新旧両方を照合する
-          if ! files=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
-              --jq '.[] | .filename, (.previous_filename // empty)'); then
+          # 変更ファイル一覧は 1 回だけ取得し、件数照合と対象パス照合の両方に使う。
+          # 改名（rename）は新パス `filename` に加えて旧パス `previous_filename` を持つため、
+          # 対象ファイルを移動する PR で検証が skipped にならないよう新旧両方を照合する。
+          # API 呼び出し（一覧・件数とも）の失敗は fail-closed で「変更あり」と扱う
+          if ! listing=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --slurp); then
             echo "failed to list PR files; fail-closed to changed=true"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # List pull requests files はページングしても最大 3000 件までしか返さない。
-          # PR の changed_files（総数）と取得した新パス件数が一致しない不完全な一覧では
-          # 対象パスが取得範囲外にある可能性があるため、fail-closed で「変更あり」と扱う
           if ! expected=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files'); then
             echo "failed to read changed_files; fail-closed to changed=true"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          fetched=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' | wc -l)
+          # List pull requests files はページングしても最大 3000 件までしか返さない。
+          # PR の changed_files（総数）と取得件数が一致しない不完全な一覧では対象パスが
+          # 取得範囲外にある可能性があるため、fail-closed で「変更あり」と扱う
+          fetched=$(jq 'map(length) | add // 0' <<< "$listing")
           if [ "$fetched" -ne "$expected" ] || [ "$expected" -ge 3000 ]; then
             echo "file list incomplete (fetched=$fetched, changed_files=$expected); fail-closed to changed=true"
             echo "changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          files=$(jq -r '.[][] | .filename, (.previous_filename // empty)' <<< "$listing")
           changed=false
           while IFS= read -r f; do
             case "$f" in
